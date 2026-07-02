@@ -1,0 +1,20 @@
+# v2.5 설계문서 1.8 확정 버전 기준. patch는 Cargo.lock으로 고정.
+[workspace]
+resolver = "3"
+members = ["crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+eframe = "0.35"
+egui = "0.35"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+directories = "6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"

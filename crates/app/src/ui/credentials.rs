@@ -27,6 +27,11 @@ impl CredentialsUi {
         }
     }
 
+    /// 다른 창(커넥터)이 credential을 추가했을 때 목록 캐시를 버린다.
+    pub fn invalidate_cache(&mut self) {
+        self.cached = None;
+    }
+
     pub fn toggle(&mut self) {
         if self.open {
             self.close();
@@ -162,6 +167,9 @@ impl CredentialsUi {
             anyhow::bail!("env var가 참조 중인 credential입니다 — 해당 변수를 먼저 삭제하세요");
         }
         store.delete_secret(id)?;
+        // OAuth credential은 refresh token이 별도 entry에 있다 (PR-18).
+        // delete_secret은 NoEntry를 성공으로 취급하므로 kind 무관하게 항상 시도.
+        store.delete_secret(&auth::refresh_entry_id(id))?;
         db.delete_credential(id)?; // env_vars FK는 backstop
         tracing::info!(credential_id = %id, "credential 삭제");
         self.cached = None;

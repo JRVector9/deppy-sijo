@@ -1,16 +1,18 @@
-//! Connector Center (설계문서 §3 ConnectorCenter, PR-17).
+//! Connector Center (설계문서 §3 ConnectorCenter, PR-17/PR-18).
 //! local MCP 서버를 카드로 나열하고 쉽게 추가 + 연결 상태를 표시한다.
 //! 연결 테스트(discover_tools)는 subprocess 왕복이라 백그라운드 스레드에서 돌리고,
 //! 결과는 채널로 받아 UI에 반영 + mcp_tools를 DB에 교체 저장한다.
-//! OAuth 커넥터는 placeholder (PR-18에서 활성화).
+//! OAuth 커넥터(PR-18): 브라우저 승인 대기가 길어 flow 전체를 백그라운드로 돌리고,
+//! 획득한 토큰은 UI 스레드에서 keyring 저장 + credentials 등록 + redaction 시드.
 
 use std::collections::HashMap;
 use std::sync::mpsc;
+use std::time::Duration;
 
 use mcp::{LocalMcpManager, McpServerConfig, McpServerRow, McpTool, McpToolRow};
-use secret::RedactionService;
+use secret::{KeyringSecretStore, RedactionService, SecretStore};
 
-use crate::storage::Db;
+use crate::storage::{CredentialMeta, Db};
 
 /// 서버별 연결 상태 (완료 기준: 연결 상태 표시).
 enum ConnStatus {
@@ -21,6 +23,16 @@ enum ConnStatus {
 
 /// 백그라운드 연결 테스트 결과: (server_id, 발견한 tools 또는 에러 문자열).
 type DiscoverResult = (String, Result<Vec<McpTool>, String>);
+
+/// OAuth flow 결과: 입력했던 label과 (토큰 또는 에러 문자열).
+type OAuthResult = (String, Result<auth::OAuthToken, String>);
+
+/// OAuth 연결 진행 상태.
+enum OAuthStatus {
+    Waiting,
+    Done(String),
+    Failed(String),
+}
 
 pub struct ConnectorsUi {
     redaction: RedactionService,
@@ -35,11 +47,22 @@ pub struct ConnectorsUi {
     status: HashMap<String, ConnStatus>,
     result_tx: mpsc::Sender<DiscoverResult>,
     result_rx: mpsc::Receiver<DiscoverResult>,
+    // OAuth 폼 (PR-18)
+    oauth_label: String,
+    oauth_auth_url: String,
+    oauth_token_url: String,
+    oauth_client_id: String,
+    /// 공백 구분
+    oauth_scopes: String,
+    oauth_status: Option<OAuthStatus>,
+    oauth_tx: mpsc::Sender<OAuthResult>,
+    oauth_rx: mpsc::Receiver<OAuthResult>,
 }
 
 impl ConnectorsUi {
     pub fn new(redaction: RedactionService) -> Self {
         let (result_tx, result_rx) = mpsc::channel();
+        let (oauth_tx, oauth_rx) = mpsc::channel();
         Self {
             redaction,
             open: false,
@@ -51,6 +74,14 @@ impl ConnectorsUi {
             status: HashMap::new(),
             result_tx,
             result_rx,
+            oauth_label: String::new(),
+            oauth_auth_url: String::new(),
+            oauth_token_url: String::new(),
+            oauth_client_id: String::new(),
+            oauth_scopes: String::new(),
+            oauth_status: None,
+            oauth_tx,
+            oauth_rx,
         }
     }
 
@@ -59,11 +90,13 @@ impl ConnectorsUi {
         self.error = None;
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, db: &mut Db) {
+    /// 새 credential이 등록됐으면 true (호출측이 자격증명 창 캐시를 무효화).
+    pub fn show(&mut self, ctx: &egui::Context, db: &mut Db) -> bool {
         // 백그라운드 결과는 창이 닫혀 있어도 소화한다 (다시 열 때 최신 상태)
         self.drain_results(db);
+        let credential_added = self.drain_oauth(db);
         if !self.open {
-            return;
+            return credential_added;
         }
         let mut open = true;
         egui::Window::new("연결")
@@ -71,6 +104,7 @@ impl ConnectorsUi {
             .resizable(false)
             .show(ctx, |ui| self.contents(ui, ctx, db));
         self.open = open;
+        credential_added
     }
 
     fn contents(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, db: &mut Db) {
@@ -119,12 +153,129 @@ impl ConnectorsUi {
             ui.colored_label(egui::Color32::RED, error);
         }
 
-        // OAuth placeholder (설계 PR-17: "OAuth placeholder") — PR-18에서 실제 flow
+        // OAuth 커넥터 (PR-18): external browser + PKCE + localhost callback
         ui.separator();
         ui.heading("OAuth 커넥터");
-        ui.add_enabled_ui(false, |ui| {
-            let _ = ui.button("원격 MCP 연결 (OAuth) — 준비 중");
+        ui.horizontal(|ui| {
+            ui.label("이름");
+            ui.text_edit_singleline(&mut self.oauth_label);
         });
+        ui.horizontal(|ui| {
+            ui.label("authorize URL");
+            ui.text_edit_singleline(&mut self.oauth_auth_url);
+        });
+        ui.horizontal(|ui| {
+            ui.label("token URL");
+            ui.text_edit_singleline(&mut self.oauth_token_url);
+        });
+        ui.horizontal(|ui| {
+            ui.label("client id");
+            ui.text_edit_singleline(&mut self.oauth_client_id);
+        });
+        ui.horizontal(|ui| {
+            ui.label("scopes (공백 구분)");
+            ui.text_edit_singleline(&mut self.oauth_scopes);
+        });
+        let waiting = matches!(self.oauth_status, Some(OAuthStatus::Waiting));
+        if ui
+            .add_enabled(!waiting, egui::Button::new("브라우저로 연결"))
+            .clicked()
+        {
+            self.start_oauth(ctx);
+        }
+        match &self.oauth_status {
+            None => {}
+            Some(OAuthStatus::Waiting) => {
+                ui.weak("브라우저에서 승인을 기다리는 중…");
+            }
+            Some(OAuthStatus::Done(label)) => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0x2e, 0xa0, 0x43),
+                    format!("● 연결됨 — '{label}' 토큰이 keyring에 저장되었습니다"),
+                );
+            }
+            Some(OAuthStatus::Failed(msg)) => {
+                ui.colored_label(egui::Color32::RED, format!("● 실패: {msg}"));
+            }
+        }
+    }
+
+    /// OAuth flow를 백그라운드로 시작한다 (브라우저 승인 대기까지 블로킹이므로).
+    fn start_oauth(&mut self, ctx: &egui::Context) {
+        let label = self.oauth_label.trim().to_owned();
+        if label.is_empty()
+            || self.oauth_auth_url.trim().is_empty()
+            || self.oauth_token_url.trim().is_empty()
+            || self.oauth_client_id.trim().is_empty()
+        {
+            self.oauth_status = Some(OAuthStatus::Failed(
+                "이름·authorize URL·token URL·client id는 필수입니다".to_owned(),
+            ));
+            return;
+        }
+        let config = auth::OAuthProviderConfig {
+            auth_url: self.oauth_auth_url.trim().to_owned(),
+            token_url: self.oauth_token_url.trim().to_owned(),
+            client_id: self.oauth_client_id.trim().to_owned(),
+            scopes: self
+                .oauth_scopes
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect(),
+        };
+        self.oauth_status = Some(OAuthStatus::Waiting);
+        let tx = self.oauth_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result =
+                auth::run_flow(&config, Duration::from_secs(180)).map_err(|e| format!("{e:#}"));
+            let _ = tx.send((label, result));
+            ctx.request_repaint();
+        });
+    }
+
+    /// OAuth 결과 반영: keyring 저장 → credentials 등록 → redaction 시드.
+    /// 중간 실패 시 keyring 고아 토큰을 지운다. credential을 추가했으면 true.
+    fn drain_oauth(&mut self, db: &Db) -> bool {
+        let mut added = false;
+        while let Ok((label, result)) = self.oauth_rx.try_recv() {
+            let token = match result {
+                Ok(token) => token,
+                Err(msg) => {
+                    self.oauth_status = Some(OAuthStatus::Failed(msg));
+                    continue;
+                }
+            };
+            let id = uuid::Uuid::new_v4().to_string();
+            let store = KeyringSecretStore;
+            if let Err(e) = auth::store_token(&store, &id, &token) {
+                self.oauth_status = Some(OAuthStatus::Failed(format!("keyring 저장 실패: {e:#}")));
+                continue;
+            }
+            let meta = CredentialMeta {
+                id: id.clone(),
+                provider: "oauth".to_owned(),
+                label: label.clone(),
+                credential_kind: "oauth_token".to_owned(),
+                masked_hint: Some(secret::masked_hint(token.access_token.expose())),
+            };
+            if let Err(e) = db.insert_credential(&meta) {
+                // 고아 토큰 정리 (access + refresh)
+                let _ = store.delete_secret(&id);
+                let _ = store.delete_secret(&auth::refresh_entry_id(&id));
+                self.oauth_status =
+                    Some(OAuthStatus::Failed(format!("credential 등록 실패: {e:#}")));
+                continue;
+            }
+            // 이후 세션 로그에 토큰이 찍히지 않도록 redaction에 등록 (§7)
+            self.redaction.register(&token.access_token);
+            if let Some(refresh) = &token.refresh_token {
+                self.redaction.register(refresh);
+            }
+            self.oauth_status = Some(OAuthStatus::Done(label));
+            added = true;
+        }
+        added
     }
 
     fn server_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, server: &McpServerRow) {

@@ -455,7 +455,12 @@ impl Worker {
                 // resolve는 worker 단일 스레드에서만 (1.4) — UI는 id만 넘긴다 (2.1).
                 for id in credential_ids {
                     match self.secret_store.get_secret(&id) {
-                        Ok(value) => self.redaction.register(&value),
+                        Ok(value) => {
+                            self.redaction.register(&value);
+                            // OAuth 토큰처럼 JSON blob으로 저장된 credential은
+                            // 개별 필드(access/refresh token)도 등록 (PR-18)
+                            self.redaction.register_json_fields(&value);
+                        }
                         Err(e) => {
                             tracing::warn!("redaction 시드 실패 (credential {id}): {e:#}")
                         }

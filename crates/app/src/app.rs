@@ -49,7 +49,14 @@ impl App {
         // (값 resolve는 worker에서 — UI는 metadata의 id만 읽는다)
         match db.list_credentials() {
             Ok(credentials) => {
-                let ids: Vec<String> = credentials.into_iter().map(|c| c.id).collect();
+                let mut ids: Vec<String> = Vec::with_capacity(credentials.len());
+                for c in credentials {
+                    // OAuth credential은 refresh token entry도 redaction 대상 (PR-18)
+                    if c.credential_kind == "oauth_token" {
+                        ids.push(auth::refresh_entry_id(&c.id));
+                    }
+                    ids.push(c.id);
+                }
                 if !ids.is_empty()
                     && let Err(e) = runtime.send_command(runtime::RuntimeCommand::SeedRedaction {
                         credential_ids: ids,
@@ -130,7 +137,12 @@ impl eframe::App for App {
         );
         self.credentials_ui
             .show(ui.ctx(), &self.db, &self.secret_store);
-        self.connectors_ui.show(ui.ctx(), &mut self.db);
+        if self.connectors_ui.show(ui.ctx(), &mut self.db) {
+            // OAuth로 credential이 추가됨 — 자격증명 창은 이번 프레임에 이미
+            // 그려졌으므로 캐시 무효화 후 다음 프레임을 예약해 즉시 반영한다
+            self.credentials_ui.invalidate_cache();
+            ui.ctx().request_repaint();
+        }
         self.env_profiles_ui
             .show(ui.ctx(), &mut self.db, &self.workspace_id);
         egui::CentralPanel::default().show(ui, |ui| {

@@ -56,6 +56,34 @@ impl RedactionService {
             .sort_by_key(|entry| std::cmp::Reverse(entry.len()));
     }
 
+    /// secret 값이 JSON이면(예: OAuth 토큰 blob — PR-18) 안의 문자열 필드들을
+    /// 개별 패턴으로도 등록한다. 로그에는 blob 전체가 아니라 access token 같은
+    /// 개별 값이 찍히기 때문. JSON이 아니면 아무것도 하지 않는다 (register와 병행 사용).
+    pub fn register_json_fields(&self, secret: &SecretString) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(secret.expose()) else {
+            return;
+        };
+        fn walk(value: &serde_json::Value, service: &RedactionService) {
+            match value {
+                serde_json::Value::String(s) => {
+                    service.register(&SecretString::new(s.clone()));
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        walk(item, service);
+                    }
+                }
+                serde_json::Value::Object(map) => {
+                    for item in map.values() {
+                        walk(item, service);
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk(&value, self);
+    }
+
     pub fn stream_redactor(&self) -> StreamRedactor {
         StreamRedactor {
             service: self.clone(),
@@ -293,6 +321,26 @@ mod tests {
         }
         out.extend(redactor.flush());
         out
+    }
+
+    #[test]
+    fn json_blob의_문자열_필드도_개별_등록() {
+        // OAuth 토큰 blob (PR-18): 로그에는 blob이 아닌 개별 토큰이 찍힌다
+        let service = RedactionService::new();
+        let blob = r#"{"access_token":"at-secret-12345","refresh_token":"rt-secret-67890","expires_in_secs":3600}"#;
+        service.register_json_fields(&SecretString::new(blob.to_owned()));
+        let mut r = service.stream_redactor();
+        let out = redact_all(
+            &mut r,
+            &[b"Authorization: Bearer at-secret-12345\nrt-secret-67890\n"],
+        );
+        assert_eq!(out, b"Authorization: Bearer [REDACTED]\n[REDACTED]\n");
+        // JSON이 아니면 아무것도 등록하지 않는다
+        let service = RedactionService::new();
+        service.register_json_fields(&SecretString::new("not json at all".to_owned()));
+        let mut r = service.stream_redactor();
+        let out = redact_all(&mut r, &[b"not json at all\n"]);
+        assert_eq!(out, b"not json at all\n");
     }
 
     #[test]

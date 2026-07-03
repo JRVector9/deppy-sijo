@@ -1,0 +1,17 @@
+# PR-18 OAuth PKCE Connector (설계문서 §1.5 v1+ OAuth, §9 Auth 모듈).
+# external browser + PKCE(필수) + state 검증 + localhost callback + keyring token.
+# UI 배선은 crates/app에서 — 이 crate는 flow 로직만.
+[package]
+name = "auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+oauth2 = { workspace = true }
+ureq = { workspace = true }
+secret = { path = "../secret" }

@@ -574,6 +574,13 @@ impl Worker {
                     self.emit_mux_and_watched();
                 }
             }
+            RuntimeCommand::RestoreWorkspace => {
+                // "완전히 빈 상태(세션 0)"일 때만 복원한다 — 시작 직후 SpawnShell/
+                // SpawnAgent가 먼저 처리돼 세션이 생겼으면 skip해 hybrid 상태를 막는다.
+                if self.sessions.is_empty() {
+                    self.restore_saved_layout();
+                }
+            }
         }
     }
 
@@ -616,6 +623,101 @@ impl Worker {
         self.mux.window.add_tab(tab.id.clone());
         self.mux.tabs.insert(tab.id.clone(), tab);
         self.mux.focus.focus(pane_id);
+    }
+
+    /// 복원(PR-14)이 spawn하는 fresh 셸의 scrollback 기본값 — 실제 config 값은
+    /// 복원 경로에 없어 app::config::TerminalConfig 기본값(10_000)과 맞춘 상수를 쓴다.
+    const RESTORE_SCROLLBACK_LINES: usize = 10_000;
+
+    /// 이전 실행이 저장한 mux layout을 복원한다 (설계문서 §11.1~11.5, §14, PR-14).
+    /// `RestoreWorkspace` 명령 핸들러가 빈 상태(세션 0)를 확인한 뒤 호출한다.
+    /// 저장된 tab이 없으면 아무 것도 하지 않는다(기존 빈 시작 동작 유지).
+    ///
+    /// agent 세션은 재실행하지 않는다 — 저장된 pane의 session_kind와 무관하게
+    /// 항상 fresh 셸만 spawn한다(agent 명령 재실행은 파괴적일 수 있다).
+    fn restore_saved_layout(&mut self) {
+        let (tabs, active_tab) = match &mut self.persist {
+            Some(pipe) => pipe.take_saved_layout(),
+            None => return,
+        };
+        if tabs.is_empty() {
+            return;
+        }
+        // 복원 tab/pane 제목의 "셸 N"/"에이전트 N" 최대 N 이상으로 counter를 전진 —
+        // tabs.len()만으로는 중간 tab을 닫았던 경우(셸 1·3만 남음) 다음 spawn이
+        // 기존 "셸 3"과 충돌한다 (codex 리뷰). id는 유일하지만 제목 정합을 위해.
+        let max_suffix = tabs
+            .iter()
+            .flat_map(|tab| {
+                std::iter::once(tab.title.as_str())
+                    .chain(tab.panes.iter().map(|p| p.title.as_str()))
+            })
+            .filter_map(title_suffix)
+            .max()
+            .unwrap_or(0);
+        for tab in tabs {
+            self.restore_tab(tab);
+        }
+        self.tab_counter = self.tab_counter.max(max_suffix);
+        if active_tab.is_some() {
+            self.mux.window.active_tab = active_tab;
+        }
+        self.mux.fix_focus();
+        self.emit_mux_and_watched();
+    }
+
+    /// 저장된 tab 하나를 재구성한다 — tab/pane id, layout 구조, active_pane은
+    /// 저장된 그대로 재사용한다(내부 일관성 + 재저장 시 같은 행을 갱신하기 위함).
+    fn restore_tab(&mut self, tab: persist::TabState) {
+        for pane in &tab.panes {
+            self.restore_pane(pane);
+        }
+        let restored = MuxTab {
+            id: tab.id,
+            title: tab.title,
+            layout: tab.layout,
+            active_pane: tab.active_pane,
+        };
+        self.mux.window.add_tab(restored.id.clone());
+        self.mux.tabs.insert(restored.id.clone(), restored);
+    }
+
+    /// 저장된 pane 하나에 fresh 셸을 spawn해 attach한다. spawn 실패 시에도 pane
+    /// 자체는 만든다(session_id 없이) — 기존 "세션을 잃은 pane" 모델과 동일하게
+    /// layout/tab 구조는 살아있게 한다.
+    fn restore_pane(&mut self, pane_state: &persist::PaneState) {
+        let mut pane = MuxPane::new(pane_state.id.clone(), pane_state.title.clone());
+        let id = SessionId(self.next_id);
+        self.next_id += 1;
+        match Session::spawn_with_spec(
+            id,
+            session::SessionKind::Shell,
+            &self.shell,
+            80,
+            24,
+            Self::RESTORE_SCROLLBACK_LINES,
+        ) {
+            Ok(new_session) => {
+                self.sessions.insert(id, new_session);
+                self.open_session_log(id);
+                pane.session_id = Some(id);
+                if let Some(pipe) = &mut self.persist {
+                    let args: Vec<String> = self.shell.args.clone();
+                    pipe.session_spawned(
+                        id,
+                        "shell",
+                        None,
+                        &pane_state.title,
+                        &self.shell.program,
+                        &args,
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(pane_id = %pane_state.id.0, "복원 중 셸 spawn 실패: {e:#}");
+            }
+        }
+        self.mux.panes.insert(pane_state.id.clone(), pane);
     }
 
     fn split_pane(
@@ -871,6 +973,11 @@ impl Worker {
             self.emit(event);
         }
     }
+}
+
+/// "셸 3" / "에이전트 12" 같은 제목에서 뒤의 숫자를 뽑는다 (복원 시 counter 전진용).
+fn title_suffix(title: &str) -> Option<u64> {
+    title.rsplit(' ').next()?.parse().ok()
 }
 
 #[cfg(test)]
@@ -1793,5 +1900,255 @@ mod tests {
         assert_eq!(persist::reconcile_orphan_sessions(&conn).unwrap(), 0);
         drop(conn);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 복원 UX (PR-14, 설계문서 §11.1~11.5·§14): 첫 worker가 만든 셸 2개 + split
+    /// 1개(tab 2개/pane 3개) 구조가 종료 후 새 worker 시작 시 fresh 셸로 복원되는지
+    /// 확인한다. 임시 파일 DB(WAL) — worker 자체 연결의 다중 프로세스 재시작 시나리오를
+    /// in-memory보다 정확히 재현한다.
+    #[cfg(unix)]
+    #[test]
+    fn 재시작시_저장된_layout이_복원된다() {
+        init_mock_store();
+        let dir = std::env::temp_dir().join(format!("deppy-rtrestore-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("metadata.sqlite3");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT, path TEXT,
+                     created_at TEXT DEFAULT '', updated_at TEXT DEFAULT '');
+                 CREATE TABLE agent_configs (id TEXT PRIMARY KEY);
+                 INSERT INTO workspaces (id) VALUES ('ws-restore');",
+            )
+            .unwrap();
+            conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+        }
+        let persist_config = || crate::persistence::PersistConfig {
+            db_path: db_path.clone(),
+            workspace_id: "ws-restore".into(),
+        };
+
+        // 첫 worker: 셸 2개 spawn 후 하나를 분할 → tab 2개(pane 2개 + pane 1개).
+        {
+            let client = InProcessRuntimeClient::with_shell(
+                5,
+                test_store(),
+                test_logs_root("restore-1"),
+                RedactionService::new(),
+                spec("/bin/cat", &[]),
+                Some(persist_config()),
+            );
+            let mut probe = Probe::new(client.subscribe());
+            for _ in 0..2 {
+                client
+                    .send_command(RuntimeCommand::SpawnShell {
+                        cols: 80,
+                        rows: 24,
+                        scrollback_lines: 100,
+                    })
+                    .unwrap();
+            }
+            let mux = probe.wait_for(Duration::from_secs(15), |e| match e {
+                RuntimeEvent::MuxUpdated { snapshot } if snapshot.tabs.len() == 2 => {
+                    Some(snapshot.clone())
+                }
+                _ => None,
+            });
+            let tab_a = mux.tabs[0].id.clone();
+            let pane_a = mux.tabs[0].panes[0].id.clone();
+            // 분할 대상 tab을 먼저 활성화한다 — 복원 후 active_tab이 이 tab을
+            // 가리키는지 결정적으로 검증하기 위함.
+            client
+                .send_command(RuntimeCommand::SelectTab { tab: tab_a.clone() })
+                .unwrap();
+            client
+                .send_command(RuntimeCommand::SplitPane {
+                    pane: pane_a,
+                    direction: SplitDirection::Horizontal,
+                    scrollback_lines: 100,
+                })
+                .unwrap();
+            let tab_a_wait = tab_a.clone();
+            probe.wait_for(Duration::from_secs(15), move |e| match e {
+                RuntimeEvent::MuxUpdated { snapshot }
+                    if snapshot.active_tab == Some(tab_a_wait.clone())
+                        && snapshot
+                            .tabs
+                            .iter()
+                            .find(|t| t.id == tab_a_wait)
+                            .is_some_and(|t| t.panes.len() == 2) =>
+                {
+                    Some(())
+                }
+                _ => None,
+            });
+            // client가 스코프를 벗어나며 Drop → shutdown()이 worker join까지 동기 대기
+            // (그 전에 이미 마지막 emit_mux_snapshot이 DB에 커밋된 뒤였다).
+        }
+
+        // 새 worker: 같은 DB로 시작 → subscribe 후 RestoreWorkspace를 보내야 복원된다.
+        let client2 = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("restore-2"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(persist_config()),
+        );
+        let mut probe2 = Probe::new(client2.subscribe());
+        client2
+            .send_command(RuntimeCommand::RestoreWorkspace)
+            .unwrap();
+        let mux = probe2.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::MuxUpdated { snapshot } if snapshot.tabs.len() == 2 => {
+                Some(snapshot.clone())
+            }
+            _ => None,
+        });
+        // tab 구성: 분할된 tab(pane 2개) + 단일 tab(pane 1개) — 순서 무관하게 확인
+        let mut pane_counts: Vec<usize> = mux.tabs.iter().map(|t| t.panes.len()).collect();
+        pane_counts.sort_unstable();
+        assert_eq!(
+            pane_counts,
+            vec![1, 2],
+            "복원된 tab/pane 구성이 저장 시와 다름"
+        );
+
+        // 분할했던 tab이 active로 복원됨
+        let active = mux.active_tab.clone().expect("active_tab이 복원돼야 함");
+        let active_tab = mux.tabs.iter().find(|t| t.id == active).unwrap();
+        assert_eq!(active_tab.panes.len(), 2);
+
+        // 복원된 pane마다 fresh 셸 세션이 attach — active tab의 두 pane 모두
+        // session_id를 갖고, 그 세션들의 Viewport가 (watched pane라) 도착해야 한다.
+        let restored_sessions: Vec<SessionId> = active_tab
+            .panes
+            .iter()
+            .map(|p| {
+                p.session_id
+                    .expect("복원된 pane에 fresh 세션이 attach돼야 함")
+            })
+            .collect();
+        assert_eq!(restored_sessions.len(), 2);
+        for session in restored_sessions {
+            probe2.wait_for(Duration::from_secs(15), move |e| match e {
+                RuntimeEvent::Viewport { session: s, .. } if *s == session => Some(()),
+                _ => None,
+            });
+        }
+
+        drop(client2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 회귀 (codex 리뷰 P2): RestoreWorkspace가 "빈 상태"에서만 복원한다.
+    /// SpawnShell이 먼저 처리돼 세션이 생긴 뒤 온 RestoreWorkspace는 skip돼야
+    /// 저장 layout이 새 세션 위에 덧붙는 hybrid 상태를 만들지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn title_suffix_파싱() {
+        assert_eq!(super::title_suffix("셸 3"), Some(3));
+        assert_eq!(super::title_suffix("에이전트 12"), Some(12));
+        assert_eq!(super::title_suffix("셸"), None);
+        assert_eq!(super::title_suffix("이름 없음"), None);
+        // 복원 counter 전진: "셸 1"·"셸 3"만 남아도(중간 닫힘) max는 3
+        let titles = ["셸 1", "셸 3"];
+        let max = titles.iter().filter_map(|t| super::title_suffix(t)).max();
+        assert_eq!(max, Some(3));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn restore는_세션이_있으면_skip한다() {
+        init_mock_store();
+        let dir = std::env::temp_dir().join(format!("deppy-rtskip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("metadata.sqlite3");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT, path TEXT,
+                     created_at TEXT DEFAULT '', updated_at TEXT DEFAULT '');
+                 CREATE TABLE agent_configs (id TEXT PRIMARY KEY);
+                 INSERT INTO workspaces (id) VALUES ('ws-skip');",
+            )
+            .unwrap();
+            conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+        }
+        let persist_config = || crate::persistence::PersistConfig {
+            db_path: db_path.clone(),
+            workspace_id: "ws-skip".into(),
+        };
+
+        // 첫 worker: tab 2개 저장 (셸 2개).
+        {
+            let client = InProcessRuntimeClient::with_shell(
+                5,
+                test_store(),
+                test_logs_root("skip-1"),
+                RedactionService::new(),
+                spec("/bin/cat", &[]),
+                Some(persist_config()),
+            );
+            let mut probe = Probe::new(client.subscribe());
+            for _ in 0..2 {
+                client
+                    .send_command(RuntimeCommand::SpawnShell {
+                        cols: 80,
+                        rows: 24,
+                        scrollback_lines: 100,
+                    })
+                    .unwrap();
+            }
+            probe.wait_for(Duration::from_secs(15), |e| match e {
+                RuntimeEvent::MuxUpdated { snapshot } if snapshot.tabs.len() == 2 => Some(()),
+                _ => None,
+            });
+        }
+
+        // 새 worker: SpawnShell을 먼저 보내고 그 다음 RestoreWorkspace를 보낸다.
+        // 세션이 이미 있으므로 복원은 skip → tab은 방금 만든 1개만 남아야 한다.
+        let client2 = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("skip-2"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(persist_config()),
+        );
+        let mut probe2 = Probe::new(client2.subscribe());
+        client2
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        // 새 셸 tab 1개 관측
+        probe2.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::MuxUpdated { snapshot } if snapshot.tabs.len() == 1 => Some(()),
+            _ => None,
+        });
+        client2
+            .send_command(RuntimeCommand::RestoreWorkspace)
+            .unwrap();
+        // restore가 skip되므로 tab 수가 2 이상으로 늘지 않는다. 명령 처리가
+        // 확실히 끝나도록 뒤따르는 무해한 명령(SelectTab 없이 재확인)으로 배출을 유도.
+        std::thread::sleep(Duration::from_millis(200));
+        probe2.seen.extend(probe2.rx.drain());
+        let max_tabs = probe2
+            .seen
+            .iter()
+            .filter_map(|e| match e {
+                RuntimeEvent::MuxUpdated { snapshot } => Some(snapshot.tabs.len()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        assert_eq!(max_tabs, 1, "세션이 있는데 복원이 실행돼 tab이 덧붙었다");
+
+        drop(client2);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

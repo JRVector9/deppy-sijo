@@ -52,6 +52,12 @@ impl App {
             }),
         );
         let runtime_events = runtime.subscribe();
+        // 이전 실행의 mux layout 복원 (PR-14) — subscribe 직후 1회 보내
+        // subscribe→restore 순서와 "빈 상태" 전제를 코드로 보장한다. perf 하네스가
+        // 세션을 만들기 전에 보내야 worker가 복원을 skip하지 않는다.
+        if let Err(e) = runtime.send_command(runtime::RuntimeCommand::RestoreWorkspace) {
+            tracing::warn!("workspace 복원 명령 전송 실패: {e:#}");
+        }
         // 이전 실행에서 저장한 credential도 로그 redaction 대상으로 시드
         // (값 resolve는 worker에서 — UI는 metadata의 id만 읽는다)
         match db.list_credentials() {

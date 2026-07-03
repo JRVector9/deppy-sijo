@@ -71,4 +71,9 @@ pub enum RuntimeCommand {
     FocusPane {
         pane: MuxPaneId,
     },
+    /// 이전 실행이 저장한 mux layout을 복원한다 (PR-14, 설계문서 §11.1~11.5·§14).
+    /// 앱이 subscribe 직후 1회 보낸다 — subscribe→restore 순서와 "빈 상태" 전제를
+    /// 코드로 보장하기 위해 worker 자율 복원이 아닌 명시적 명령으로 트리거한다.
+    /// worker는 세션이 하나도 없을 때만 복원한다(이미 SpawnShell 등이 처리됐으면 skip).
+    RestoreWorkspace,
 }

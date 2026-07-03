@@ -3,15 +3,16 @@
 //! 세션 spawn/exit과 mux 구조 변경을 저장한다. 저장은 best-effort:
 //! 실패는 warn으로 남기고 런타임 동작을 막지 않는다.
 //!
-//! 복원 UX(이전 layout 재구성 + respawn 의미론)는 이번 스코프 밖 —
-//! 여기서 저장한 상태를 앱 시작 시 reconcile(PR-14)이 exited로 정리하고,
-//! layout은 복원 기능이 소비할 수 있게 남는다.
+//! 복원 UX(PR-14, §14): 이전 실행이 저장한 tab/pane 구조는 [`PersistPipe::open`]이
+//! 읽어두고, worker가 [`PersistPipe::take_saved_layout`]으로 시작 시 한 번 소비한다
+//! (in_process.rs의 `Worker::restore_saved_layout`). agent 세션 재실행은 하지
+//! 않는다 — 복원은 항상 fresh 셸만 spawn한다(안전 요구사항).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use deppy_core::{MuxWindowId, SessionId};
+use deppy_core::{MuxTabId, MuxWindowId, SessionId};
 use persist::{PaneState, SessionRow, TabState, WindowState};
 
 /// InProcessRuntimeClient 생성 시 넘기는 영속 설정. None이면 영속 없음(테스트).
@@ -30,6 +31,10 @@ pub(crate) struct PersistPipe {
     window_id: MuxWindowId,
     /// runtime SessionId(u64, 실행마다 리셋) → 영속 행 (id는 UUID)
     rows: HashMap<SessionId, SessionRow>,
+    /// 이전 실행이 저장한 tab 구조 — worker 시작 시 [`Self::take_saved_layout`]으로
+    /// 한 번만 소비된다(복원 완료 후에는 빈 Vec).
+    restored_tabs: Vec<TabState>,
+    restored_active_tab: Option<MuxTabId>,
 }
 
 impl PersistPipe {
@@ -39,17 +44,32 @@ impl PersistPipe {
         // 앱의 Db::open과 같은 연결 규약 (§11.9). 스키마는 앱이 이미 마이그레이션했다.
         conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
         conn.pragma_update(None, "foreign_keys", true)?;
-        // 이전 실행의 window 행을 재사용 (없으면 새로)
-        let window_id = persist::load_window_layouts(&conn, &config.workspace_id)
+        // 이전 실행의 window 행을 재사용 (없으면 새로) — tab/pane 구조는 복원 UX(PR-14)가
+        // take_saved_layout으로 소비한다.
+        let previous = persist::load_window_layouts(&conn, &config.workspace_id)
             .ok()
-            .and_then(|windows| windows.into_iter().next().map(|w| w.id))
-            .unwrap_or_else(MuxWindowId::new);
+            .and_then(|windows| windows.into_iter().next());
+        let (window_id, restored_tabs, restored_active_tab) = match previous {
+            Some(w) => (w.id, w.tabs, w.active_tab),
+            None => (MuxWindowId::new(), Vec::new(), None),
+        };
         Ok(Self {
             conn,
             workspace_id: config.workspace_id.clone(),
             window_id,
             rows: HashMap::new(),
+            restored_tabs,
+            restored_active_tab,
         })
+    }
+
+    /// 이전 실행에서 저장된 tab/pane 구조를 반환한다 — worker 시작 시 정확히
+    /// 한 번 소비된다(재호출 시 빈 결과). 저장된 window/tab이 없으면 (빈 Vec, None).
+    pub(crate) fn take_saved_layout(&mut self) -> (Vec<TabState>, Option<MuxTabId>) {
+        (
+            std::mem::take(&mut self.restored_tabs),
+            self.restored_active_tab.take(),
+        )
     }
 
     /// 세션 spawn 기록. agent kind면 agent_id 필수 (스키마 CHECK).

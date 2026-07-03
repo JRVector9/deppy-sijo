@@ -1,8 +1,6 @@
 use std::path::PathBuf;
 
-use runtime::{
-    InProcessRuntimeClient, RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream,
-};
+use runtime::{InProcessRuntimeClient, RuntimeCommandSink, RuntimeEventReceiver};
 
 use crate::config::Config;
 use std::sync::Arc;
@@ -29,6 +27,12 @@ pub struct App {
     frame_stats: crate::perf::FrameStats,
     /// worker에 마지막으로 보낸 render 활성 상태 (§14.1 Active↔Warm) — 전이 시에만 전송
     render_active: bool,
+    /// logic()에서 drain했지만 아직 ui()가 렌더에 소비하지 않은 이벤트 (§14.1 Warm:
+    /// 알림은 logic()에서 처리하고 렌더는 Active 복귀 시 ui()가 몰아서 소비).
+    pending_events: Vec<runtime::RuntimeEvent>,
+    /// 세션→제목 캐시 (MuxUpdated에서 누적) — Warm 동안 mux가 안 갱신돼도 알림 제목을
+    /// 해석하기 위함. exit 처리 후 제거해 live 세션으로 유계.
+    session_titles: std::collections::HashMap<runtime::SessionId, String>,
 }
 
 impl App {
@@ -39,6 +43,7 @@ impl App {
         workspace_id: String,
         logs_root: PathBuf,
         db_path: PathBuf,
+        egui_ctx: egui::Context,
     ) -> Self {
         // output_batch_ms는 시작 시 고정, scrollback_lines는 세션 spawn 시점에 전달
         let redaction = secret::RedactionService::new();
@@ -53,7 +58,12 @@ impl App {
                 workspace_id: workspace_id.clone(),
             }),
         );
-        let runtime_events = runtime.subscribe();
+        // 상태 이벤트 도착 시 UI를 깨운다 — 창이 숨겨져(Warm) 프레임이 멈춰도
+        // logic()이 돌아 알림/상태를 처리하도록 (§14.1). egui Context는 스레드 안전.
+        let runtime_events = runtime.subscribe_with_wake(std::sync::Arc::new({
+            let ctx = egui_ctx.clone();
+            move || ctx.request_repaint()
+        }));
         // 이전 실행의 mux layout 복원 (PR-14) — subscribe 직후 1회 보내
         // subscribe→restore 순서와 "빈 상태" 전제를 코드로 보장한다. perf 하네스가
         // 세션을 만들기 전에 보내야 worker가 복원을 skip하지 않는다.
@@ -120,6 +130,50 @@ impl App {
             runtime_events,
             frame_stats: crate::perf::FrameStats::new(),
             render_active: true,
+            pending_events: Vec::new(),
+            session_titles: std::collections::HashMap::new(),
+        }
+    }
+
+    /// MuxUpdated에서 제목을 누적하고, 상태/exit 이벤트를 알림으로 만든다.
+    /// logic()에서만 호출 — Warm 동안에도 알림이 즉시 생성된다 (§14.1).
+    fn process_notifications(&mut self, events: &[runtime::RuntimeEvent]) {
+        for event in events {
+            match event {
+                runtime::RuntimeEvent::MuxUpdated { snapshot } => {
+                    // MuxUpdated는 전체 mux 스냅샷 — 사라진 세션(수동 close 등 exit
+                    // 이벤트 없이 제거된 것 포함)을 정리해 캐시를 live 세션으로 유계.
+                    // exit은 detach MuxUpdated보다 먼저 emit되므로(archival) 종료 알림
+                    // 제목이 이보다 앞서 해석돼 안전하다.
+                    let present: std::collections::HashSet<runtime::SessionId> = snapshot
+                        .tabs
+                        .iter()
+                        .flat_map(|tab| &tab.panes)
+                        .filter_map(|pane| pane.session_id)
+                        .collect();
+                    self.session_titles
+                        .retain(|session, _| present.contains(session));
+                    for pane in snapshot.tabs.iter().flat_map(|tab| &tab.panes) {
+                        if let Some(session) = pane.session_id {
+                            self.session_titles.insert(session, pane.title.clone());
+                        }
+                    }
+                }
+                runtime::RuntimeEvent::SessionStatusChanged { session, status } => {
+                    if let Some(title) = self.session_titles.get(session).cloned() {
+                        self.notifications_ui.on_status(*session, *status, &title);
+                    }
+                }
+                // regex 없는 agent는 결과가 SessionExited로만 온다 (완료 기준: done/error)
+                runtime::RuntimeEvent::SessionExited { session, exit_code } => {
+                    if let Some(title) = self.session_titles.get(session).cloned() {
+                        self.notifications_ui.on_exit(*session, *exit_code, &title);
+                    }
+                    // 종료된 세션은 더 알림이 없다 — 캐시에서 제거해 유계 유지
+                    self.session_titles.remove(session);
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -152,6 +206,17 @@ impl eframe::App for App {
                 // (안 그러면 hidden 중 종료된 pane이 stale/"연결 중…"에 갇힐 수 있다)
                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
             }
+        }
+
+        // 이벤트 drain + 알림 생성은 non-render 경로인 여기서 한다 (§14.1 Warm:
+        // ui()가 스킵돼도 승인/완료/실패 알림은 유지). worker의 wake가 숨겨진 UI를
+        // 깨워 이 logic()을 돌린다. 렌더용으로는 pending_events에 쌓아 ui()가 소비한다.
+        let new_events = self.runtime_events.drain();
+        if !new_events.is_empty() {
+            self.process_notifications(&new_events);
+            self.pending_events.extend(new_events);
+            // 보이는 idle 상태에서도 새 출력/상태를 즉시 렌더하도록 프레임 예약
+            ctx.request_repaint();
         }
     }
 
@@ -189,8 +254,9 @@ impl eframe::App for App {
             });
         });
 
-        // 이벤트는 한 번 drain해서 agents/workspace가 같은 슬라이스를 본다
-        let events = self.runtime_events.drain();
+        // logic()이 drain해 쌓아둔 이벤트를 렌더에 소비한다 (알림은 logic()에서 이미 처리).
+        // Warm 동안 쌓였다면 Active 복귀 시 여기서 몰아 처리된다.
+        let events = std::mem::take(&mut self.pending_events);
         self.agents_ui.show(
             ui.ctx(),
             &self.db,
@@ -209,57 +275,13 @@ impl eframe::App for App {
         }
         self.env_profiles_ui
             .show(ui.ctx(), &mut self.db, &self.workspace_id);
-        // workspace.show가 이번 이벤트로 mux를 갱신하기 전의 스냅샷 — 알림 제목
-        // 해석의 fallback. 세션이 이번 tick에 detach(archive)/close되면 갱신된 mux엔
-        // 없지만, 종료 직전 제목은 이전 mux에 남아 있어 exit 알림 제목이 유실되지 않는다
-        // (codex 리뷰: exit과 detach MuxUpdated가 같은 drain에 겹치는 경우).
-        let mux_before = self.workspace_ui.mux().cloned();
         egui::CentralPanel::default().show(ui, |ui| {
             self.workspace_ui
                 .show(ui, &self.config.terminal, &self.runtime, &events);
         });
 
-        // 알림 센터: workspace가 mux를 갱신한 뒤 상태 이벤트를 알림으로 만든다.
-        // 배지는 이번 프레임 상단에서 이미 그려졌으므로, unread가 바뀌면 재도장한다.
+        // 알림 센터 렌더 (생성은 logic()에서 끝났다). 사라진 세션의 진행형 알림 정리.
         let mux = self.workspace_ui.mux().cloned();
-        let unread_before = self.notifications_ui.unread();
-        // 세션→제목 맵: 이전 mux + 이번 drain의 모든 MuxUpdated 스냅샷에서 수집한다.
-        // 세션이 한 batch 안에서 생성→종료→archive되어 최종 mux엔 없어도, 중간
-        // MuxUpdated 스냅샷에 제목이 남아 있어 exit 알림이 유실되지 않는다 (codex 리뷰).
-        let mut titles: std::collections::HashMap<runtime::SessionId, String> =
-            std::collections::HashMap::new();
-        let mut collect_titles = |snapshot: &runtime::MuxSnapshot| {
-            for pane in snapshot.tabs.iter().flat_map(|tab| &tab.panes) {
-                if let Some(session) = pane.session_id {
-                    titles.insert(session, pane.title.clone());
-                }
-            }
-        };
-        if let Some(mux) = &mux_before {
-            collect_titles(mux);
-        }
-        for event in &events {
-            if let runtime::RuntimeEvent::MuxUpdated { snapshot } = event {
-                collect_titles(snapshot);
-            }
-        }
-        for event in &events {
-            let title_of = |session| titles.get(&session).cloned();
-            match event {
-                runtime::RuntimeEvent::SessionStatusChanged { session, status } => {
-                    if let Some(title) = title_of(*session) {
-                        self.notifications_ui.on_status(*session, *status, &title);
-                    }
-                }
-                // regex 없는 agent는 결과가 SessionExited로만 온다 (완료 기준: done/error)
-                runtime::RuntimeEvent::SessionExited { session, exit_code } => {
-                    if let Some(title) = title_of(*session) {
-                        self.notifications_ui.on_exit(*session, *exit_code, &title);
-                    }
-                }
-                _ => {}
-            }
-        }
         if let Some(mux) = &mux {
             let alive: Vec<_> = mux
                 .tabs
@@ -272,8 +294,8 @@ impl eframe::App for App {
         let focused = self
             .notifications_ui
             .show(ui.ctx(), &self.runtime, mux.as_deref());
-        // 배지 변화(추가/pruning)·focus 명령 응답은 다음 프레임 반영 — 즉시 repaint
-        if focused || self.notifications_ui.unread() != unread_before {
+        // focus 명령 응답은 다음 프레임 반영 — 즉시 repaint
+        if focused {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(50));
         }

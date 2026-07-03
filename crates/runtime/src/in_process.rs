@@ -24,6 +24,9 @@ use crate::event::{RuntimeEvent, SpawnKind};
 struct Subscriber {
     events: Sender<RuntimeEvent>,
     viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>>,
+    /// 상태 이벤트(채널) 도착 시 소비자를 깨우는 콜백 — UI가 숨겨져(Warm) repaint가
+    /// 없을 때도 알림/상태를 처리하도록 (§14.1). Viewport(slot)에는 호출하지 않는다.
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 pub struct InProcessRuntimeClient {
@@ -160,6 +163,29 @@ impl RuntimeEventStream for InProcessRuntimeClient {
             .push(Subscriber {
                 events: tx,
                 viewports: Arc::clone(&viewports),
+                wake: None,
+            });
+        RuntimeEventReceiver {
+            events: rx,
+            viewports,
+        }
+    }
+}
+
+impl InProcessRuntimeClient {
+    /// 상태 이벤트 도착 시 `wake`를 호출하는 구독. UI가 숨겨져 프레임이 멈춰도
+    /// worker가 UI 스레드를 깨워 알림/상태를 처리하게 한다 (§14.1 Warm 알림 유지).
+    pub fn subscribe_with_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) -> RuntimeEventReceiver {
+        let (tx, rx) = channel();
+        let viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
+            Arc::default();
+        self.subscribers
+            .lock()
+            .expect("subscribers lock")
+            .push(Subscriber {
+                events: tx,
+                viewports: Arc::clone(&viewports),
+                wake: Some(wake),
             });
         RuntimeEventReceiver {
             events: rx,
@@ -363,8 +389,14 @@ impl Worker {
                         .expect("viewport slot lock")
                         .insert(*session, event.clone());
                     true
+                } else if subscriber.events.send(event.clone()).is_ok() {
+                    // 상태 이벤트가 채널에 들어감 — 숨겨진 UI도 깨워 처리하게 한다
+                    if let Some(wake) = &subscriber.wake {
+                        wake();
+                    }
+                    true
                 } else {
-                    subscriber.events.send(event.clone()).is_ok()
+                    false
                 }
             });
     }
@@ -2180,6 +2212,43 @@ mod tests {
     /// 회귀 (codex 리뷰 P2): RestoreWorkspace가 "빈 상태"에서만 복원한다.
     /// SpawnShell이 먼저 처리돼 세션이 생긴 뒤 온 RestoreWorkspace는 skip돼야
     /// 저장 layout이 새 세션 위에 덧붙는 hybrid 상태를 만들지 않는다.
+    /// §14.1 wake: 상태 이벤트가 채널에 들어갈 때 subscribe_with_wake의 콜백이
+    /// 호출된다 — UI가 숨겨져도 worker가 깨워 알림을 처리하게 하는 핵심.
+    #[cfg(unix)]
+    #[test]
+    fn subscribe_with_wake는_상태이벤트에_깨운다() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        init_mock_store();
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("wake"),
+            RedactionService::new(),
+            spec("/bin/sh", &["-c", "sleep 30"]),
+            None,
+        );
+        let woke = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&woke);
+        let rx = client.subscribe_with_wake(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        let mut probe = Probe::new(rx);
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |e| {
+            matches!(e, RuntimeEvent::ShellSpawned { .. }).then_some(())
+        });
+        assert!(
+            woke.load(Ordering::SeqCst) > 0,
+            "상태 이벤트가 wake 콜백을 호출해야 함"
+        );
+    }
+
     /// §14.1 Warm: 앱이 안 보일 때 snapshot 생성을 멈추되(Viewport 없음) 세션은 살아
     /// PTY/로그가 계속된다. Active 복귀 시 쌓인 화면이 즉시 다시 push된다.
     #[cfg(unix)]

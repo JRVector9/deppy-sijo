@@ -58,6 +58,7 @@ fn main() -> anyhow::Result<()> {
                 workspace_id,
                 logs_root,
                 db_path,
+                cc.egui_ctx.clone(),
             )))
         }),
     )

@@ -108,6 +108,7 @@ impl InProcessRuntimeClient {
                     tab_counter: 0,
                     persist: persist_pipe,
                     exited_order: std::collections::VecDeque::new(),
+                    hidden_scrollback: std::collections::HashSet::new(),
                 }
                 .run();
             })
@@ -196,6 +197,8 @@ struct Worker {
     persist: Option<crate::persistence::PersistPipe>,
     /// backend를 유지 중인 exited 세션들 (종료 순서 — 오래된 것이 앞). §14.3 cap.
     exited_order: std::collections::VecDeque<SessionId>,
+    /// 현재 hidden scrollback cap이 적용된 running 세션들 (§14.3) — 전이 감지용.
+    hidden_scrollback: std::collections::HashSet<SessionId>,
 }
 
 /// 세션 하나의 redaction 상태 + 로그 파일 (설계문서 7장).
@@ -541,6 +544,7 @@ impl Worker {
                 // Session drop → PtySession Drop이 process group 정리를 보장한다
                 self.sessions.remove(&session);
                 self.exited_order.retain(|s| *s != session);
+                self.hidden_scrollback.remove(&session);
                 self.detectors.remove(&session);
                 self.close_session_log(session, "killed", None);
                 if let Some(pipe) = &mut self.persist {
@@ -807,6 +811,7 @@ impl Worker {
             self.final_drain(session);
             self.sessions.remove(&session);
             self.exited_order.retain(|s| *s != session);
+            self.hidden_scrollback.remove(&session);
             self.detectors.remove(&session);
             self.close_session_log(session, "killed", None);
             if let Some(pipe) = &mut self.persist {
@@ -837,6 +842,7 @@ impl Worker {
                 self.final_drain(session);
                 self.sessions.remove(&session);
                 self.exited_order.retain(|s| *s != session);
+                self.hidden_scrollback.remove(&session);
                 self.detectors.remove(&session);
                 self.close_session_log(session, "killed", None);
                 if let Some(pipe) = &mut self.persist {
@@ -879,7 +885,9 @@ impl Worker {
     /// "slot에 Viewport가 있으면 그 세션의 Spawned가 같은 drain에 포함"이라는
     /// RuntimeEventReceiver::drain의 happens-before 계약이 유지된다 (codex 리뷰).
     fn emit_mux_snapshot(&mut self) {
-        // mux 구조가 바뀐 지점 — 영속 layout도 같은 시점에 저장 (§11.2~11.5)
+        // mux 구조가 바뀐 지점 — 가시성 전이에 맞춰 scrollback cap 조정 (§14.3)
+        self.reconcile_visibility();
+        // 영속 layout도 같은 시점에 저장 (§11.2~11.5)
         if let Some(pipe) = &mut self.persist {
             pipe.save_layout(&self.mux.window, &self.mux.tabs, &self.mux.panes);
         }
@@ -999,6 +1007,36 @@ impl Worker {
         }
     }
 
+    /// 가시성 전이에 맞춰 running 세션의 scrollback 상한을 조정한다 (§14.3):
+    /// visible(active tab)은 원래 값, hidden은 1,000줄. set_visible이 title 이벤트를
+    /// 유발하므로 실제 전이일 때만 호출한다. mux 변경마다 불린다.
+    fn reconcile_visibility(&mut self) {
+        let visible: std::collections::HashSet<SessionId> =
+            self.mux.watched_sessions().into_iter().collect();
+        // exited는 archival 소관 — running 세션만 대상
+        let running: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.lifecycle().is_running())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in running {
+            let is_visible = visible.contains(&id);
+            let was_hidden = self.hidden_scrollback.contains(&id);
+            if is_visible && was_hidden {
+                if let Some(s) = self.sessions.get_mut(&id) {
+                    s.set_visible(true);
+                }
+                self.hidden_scrollback.remove(&id);
+            } else if !is_visible && !was_hidden {
+                if let Some(s) = self.sessions.get_mut(&id) {
+                    s.set_visible(false);
+                }
+                self.hidden_scrollback.insert(id);
+            }
+        }
+    }
+
     /// exited backend 개수 cap 초과분을 archive한다 (§14.3). pump 시작 시 호출 —
     /// 이번 tick의 신규 exit보다 최소 한 tick 뒤에 archive되도록.
     /// backend를 drop하고, 아직 열려 있는 pane은 detach(session_id=None) +
@@ -1014,6 +1052,7 @@ impl Worker {
         for session in to_archive {
             self.sessions.remove(&session);
             self.exited_order.retain(|s| *s != session);
+            self.hidden_scrollback.remove(&session);
             for pane in self.mux.panes.values_mut() {
                 if pane.session_id == Some(session) {
                     pane.session_id = None;
@@ -2122,7 +2161,71 @@ mod tests {
     /// 회귀 (codex 리뷰 P2): RestoreWorkspace가 "빈 상태"에서만 복원한다.
     /// SpawnShell이 먼저 처리돼 세션이 생긴 뒤 온 RestoreWorkspace는 skip돼야
     /// 저장 layout이 새 세션 위에 덧붙는 hybrid 상태를 만들지 않는다.
+    /// §14.3 가시성 전이: 세션을 hidden(다른 tab)으로 보냈다가 다시 visible로
+    /// 되돌려도 세션이 살아 화면을 정상 렌더한다 (set_visible cap/uncap이 backend를
+    /// 깨지 않음). scrollback 크기 자체는 이벤트로 관측 불가 — 렌더 정상으로 검증.
     #[cfg(unix)]
+    #[test]
+    fn 가시성_전이_후_세션_렌더_유지() {
+        init_mock_store();
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("vis"),
+            RedactionService::new(),
+            spec("/bin/sh", &["-c", "printf VISMARKER; sleep 30"]),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        // A spawn (tab 1, visible)
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 5000,
+            })
+            .unwrap();
+        let mux_a = probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::MuxUpdated { snapshot } if snapshot.tabs.len() == 1 => {
+                Some(snapshot.clone())
+            }
+            _ => None,
+        });
+        let tab_a = mux_a.tabs[0].id.clone();
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::Viewport { snapshot, .. }
+                if snapshot_text(snapshot, 0).contains("VISMARKER") =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
+        // B spawn (tab 2 활성 → A hidden, reconcile이 A를 cap)
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 5000,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::MuxUpdated { snapshot } if snapshot.tabs.len() == 2 => Some(()),
+            _ => None,
+        });
+        // A tab으로 복귀 (A visible → reconcile uncap) → A의 Viewport에 VISMARKER 재도착
+        client
+            .send_command(RuntimeCommand::SelectTab { tab: tab_a.clone() })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::Viewport { snapshot, .. }
+                if snapshot_text(snapshot, 0).contains("VISMARKER") =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
+    }
+
     #[test]
     fn exited_archive_cap() {
         use std::collections::VecDeque;

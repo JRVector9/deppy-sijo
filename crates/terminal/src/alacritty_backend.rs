@@ -63,6 +63,9 @@ impl AlacrittyBackend {
     }
 }
 
+/// hidden 세션 scrollback 상한 (설계문서 §14.3). 원래 값이 이보다 작으면 원래 값.
+const HIDDEN_SCROLLBACK_LINES: usize = 1_000;
+
 fn new_term(
     cols: u16,
     rows: u16,
@@ -81,6 +84,20 @@ fn new_term(
 }
 
 impl TerminalBackend for AlacrittyBackend {
+    fn set_visible(&mut self, visible: bool) {
+        let history = if visible {
+            self.scrollback_lines
+        } else {
+            self.scrollback_lines.min(HIDDEN_SCROLLBACK_LINES)
+        };
+        // Config는 new_term과 동일하게 scrolling_history만 비-default —
+        // set_options가 grid.update_history로 ring buffer를 shrink/grow한다.
+        self.term.set_options(Config {
+            scrolling_history: history,
+            ..Config::default()
+        });
+    }
+
     fn feed(&mut self, bytes: &[u8]) -> anyhow::Result<TerminalChangeSet> {
         // 위치만 비교하면 DECTCEM(?25l/h) 가시성이나 DECSCUSR shape 변경을
         // 놓친다 (codex 리뷰) — dirty 기반 repaint가 cursor-only 변화를 못 본다
@@ -385,6 +402,40 @@ mod tests {
             .collect::<String>()
             .trim_end()
             .to_owned()
+    }
+
+    #[test]
+    fn hidden_visible_scrollback_cap() {
+        // 5000 scrollback으로 생성 후 ~2000줄 출력 → history 축적
+        let mut b = AlacrittyBackend::new(20, 5, 5000);
+        for i in 0..2000 {
+            feed(&mut b, format!("line{i}\r\n").as_bytes());
+        }
+        // 과거로 크게 스크롤하면 history 크기만큼만 (scroll_offset = display_offset)
+        b.scroll(10_000);
+        let visible_offset = b.viewport_snapshot().unwrap().scroll_offset;
+        assert!(
+            visible_offset > 1000,
+            "visible은 1000 넘게 스크롤 가능: {visible_offset}"
+        );
+
+        // hidden 전환 → scrollback 1,000 cap (§14.3)
+        b.set_visible(false);
+        b.scroll(10_000);
+        let hidden_offset = b.viewport_snapshot().unwrap().scroll_offset;
+        assert!(
+            hidden_offset <= 1000,
+            "hidden은 1000 이하로 제한: {hidden_offset}"
+        );
+
+        // visible 복귀 → cap 해제(잘린 내용은 복구 안 됨). 새 출력으로 다시 늘어난다
+        b.set_visible(true);
+        for i in 0..2000 {
+            feed(&mut b, format!("new{i}\r\n").as_bytes());
+        }
+        b.scroll(10_000);
+        let regrown = b.viewport_snapshot().unwrap().scroll_offset;
+        assert!(regrown > 1000, "visible 복귀 후 다시 1000 넘게: {regrown}");
     }
 
     #[test]

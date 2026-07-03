@@ -209,6 +209,11 @@ impl Session {
         self.backend.scroll(delta);
         self.dirty = true;
     }
+
+    /// 가시성에 따라 scrollback 상한 조정 (§14.3). 전이 시에만 호출할 것.
+    pub fn set_visible(&mut self, visible: bool) {
+        self.backend.set_visible(visible);
+    }
 }
 
 #[cfg(test)]

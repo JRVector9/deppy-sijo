@@ -23,7 +23,8 @@ pub struct Db {
 /// 4: sessions + mux_* (PR-14, persist crate DDL),
 /// 5: mcp_servers + mcp_tools (PR-15, mcp crate DDL),
 /// 6: tool_audit_logs (PR-16, audit crate DDL),
-/// 7: agent_configs.deleted_at (soft-delete — 세션 영속 FK와 공존).
+/// 7: agent_configs.deleted_at (soft-delete — 세션 영속 FK와 공존),
+/// 8: tool_permission_rules (PR-16 권한 규칙 영속).
 /// 4~6은 각 crate가 소유한 DDL 상수를 그대로 붙인다 (스키마 정의는 한 곳에서만).
 const MIGRATIONS: &[&str] = &[
     "
@@ -101,6 +102,19 @@ CREATE TABLE agent_configs (
     // 7: agent_configs soft-delete — sessions.agent_id FK(§11.1)가 실행 이력이
     //    있는 config의 물리 삭제를 막으므로, 삭제는 표시로 대체한다
     "ALTER TABLE agent_configs ADD COLUMN deleted_at TEXT;",
+    // 8: tool 권한 규칙 영속 (PR-16 — 재시작해도 Allow/Deny always가 유지되도록).
+    //    (server_id, tool_name)별 rule + 마지막 승인 schema hash. FK는 두지 않는다
+    //    (규칙은 문자열 키로 느슨히 연결 — orphan은 무해, 감사/로그와 동일한 관례).
+    "
+CREATE TABLE tool_permission_rules (
+    server_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    rule TEXT NOT NULL,
+    approved_schema_hash TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (server_id, tool_name)
+);
+",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -118,6 +132,16 @@ pub struct WorkspaceRow {
     pub id: String,
     pub name: String,
     pub created_at: String,
+}
+
+/// tool 권한 규칙 한 행 (PermissionPolicy 영속 — PR-16).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PermissionRuleRow {
+    pub server_id: String,
+    pub tool_name: String,
+    /// "allow" | "deny" | "ask" (audit::PermissionRule::as_str)
+    pub rule: String,
+    pub approved_schema_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -344,6 +368,43 @@ impl Db {
         mcp::list_tools_for_server(&self.conn, server_id)
     }
 
+    /// 저장된 tool 권한 규칙 전체 (앱 시작 시 PermissionPolicy로 로드).
+    pub fn list_permission_rules(&self) -> anyhow::Result<Vec<PermissionRuleRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT server_id, tool_name, rule, approved_schema_hash FROM tool_permission_rules",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PermissionRuleRow {
+                server_id: row.get(0)?,
+                tool_name: row.get(1)?,
+                rule: row.get(2)?,
+                approved_schema_hash: row.get(3)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// 권한 규칙 저장/갱신 (AllowAlways/DenyAlways 결정 시).
+    pub fn upsert_permission_rule(
+        &self,
+        server_id: &str,
+        tool_name: &str,
+        rule: &str,
+        approved_schema_hash: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO tool_permission_rules
+               (server_id, tool_name, rule, approved_schema_hash, updated_at)
+             VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+             ON CONFLICT(server_id, tool_name) DO UPDATE SET
+               rule = excluded.rule,
+               approved_schema_hash = excluded.approved_schema_hash,
+               updated_at = excluded.updated_at",
+            (server_id, tool_name, rule, approved_schema_hash),
+        )?;
+        Ok(())
+    }
+
     /// tool 실행 감사 기록 (PR-16). encryptor를 넘기면 전체 입력이 암호화 저장된다 (§7).
     pub fn record_tool_audit(
         &self,
@@ -563,6 +624,26 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 권한규칙_upsert_list_roundtrip() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_permission_rule("srv-1", "read_file", "allow", Some("a".repeat(64).as_str()))
+            .unwrap();
+        db.upsert_permission_rule("srv-1", "delete_file", "deny", None)
+            .unwrap();
+        // 같은 키 재저장은 갱신 (중복 아님)
+        db.upsert_permission_rule("srv-1", "read_file", "deny", None)
+            .unwrap();
+        let mut rows = db.list_permission_rules().unwrap();
+        rows.sort_by(|a, b| a.tool_name.cmp(&b.tool_name));
+        assert_eq!(rows.len(), 2);
+        let read = rows.iter().find(|r| r.tool_name == "read_file").unwrap();
+        assert_eq!(read.rule, "deny");
+        assert_eq!(read.approved_schema_hash, None);
+        let del = rows.iter().find(|r| r.tool_name == "delete_file").unwrap();
+        assert_eq!(del.rule, "deny");
+    }
 
     #[test]
     fn workspace_생성_목록_기본포함() {

@@ -14,6 +14,27 @@ pub enum PermissionRule {
     Ask,
 }
 
+impl PermissionRule {
+    /// 영속 문자열 (DB 저장/조회 양쪽에서 이것만 쓴다).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PermissionRule::Allow => "allow",
+            PermissionRule::Deny => "deny",
+            PermissionRule::Ask => "ask",
+        }
+    }
+
+    /// 영속 문자열에서 복원 — 알 수 없는 값은 None (호출측이 기본 Ask로 처리).
+    pub fn from_persisted(s: &str) -> Option<Self> {
+        match s {
+            "allow" => Some(PermissionRule::Allow),
+            "deny" => Some(PermissionRule::Deny),
+            "ask" => Some(PermissionRule::Ask),
+            _ => None,
+        }
+    }
+}
+
 /// approval dialog가 표시할 요청 model (dialog UI 자체는 crates/app 소관).
 #[derive(Clone, PartialEq, Eq)]
 pub struct ToolApprovalRequest {
@@ -128,6 +149,35 @@ impl PermissionPolicy {
             .unwrap_or_default()
     }
 
+    /// 마지막 승인 때의 schema hash (영속 저장용).
+    pub fn approved_hash(&self, server_id: &str, tool_name: &str) -> Option<&str> {
+        self.approved_schema
+            .get(&key(server_id, tool_name))
+            .map(String::as_str)
+    }
+
+    /// DB에서 로드한 규칙을 복원한다. set_rule과 달리 change-시-clear를 하지 않고
+    /// 승인 이력(hash)도 함께 설정한다. hash는 유효한 sha256 hex(64자)만 신뢰한다
+    /// (fail-closed — 기형 hash가 영구 승인이 되면 재승인 트리거 무력화).
+    pub fn load_rule(
+        &mut self,
+        server_id: &str,
+        tool_name: &str,
+        rule: PermissionRule,
+        approved_hash: Option<String>,
+    ) {
+        let key = key(server_id, tool_name);
+        self.rules.insert(key.clone(), rule);
+        match approved_hash {
+            Some(hash) if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) => {
+                self.approved_schema.insert(key, hash);
+            }
+            _ => {
+                self.approved_schema.remove(&key);
+            }
+        }
+    }
+
     /// 요청 평가 — 즉시 결정(Decided) 또는 approval dialog 필요(NeedsApproval).
     pub fn evaluate(&self, request: &ToolApprovalRequest) -> PolicyEvaluation {
         let key = key(&request.server_id, &request.tool_name);
@@ -193,6 +243,28 @@ mod tests {
             input_json: r#"{"path":"/tmp/x"}"#.into(),
             schema_hash: schema_hash.into(),
         }
+    }
+
+    #[test]
+    fn load_rule은_규칙과_승인이력을_복원한다() {
+        let mut policy = PermissionPolicy::new();
+        let hash = crate::schema_hash("schema-x");
+        policy.load_rule("srv", "tool", PermissionRule::Allow, Some(hash.clone()));
+        // 로드된 Allow + 일치 hash → 자동 허용 (재승인 불필요)
+        let req = ToolApprovalRequest {
+            server_id: "srv".into(),
+            tool_name: "tool".into(),
+            input_json: "{}".into(),
+            schema_hash: hash,
+        };
+        assert_eq!(
+            policy.evaluate(&req),
+            PolicyEvaluation::Decided(ToolDecision::PolicyAllow)
+        );
+        assert_eq!(policy.rule("srv", "tool"), PermissionRule::Allow);
+        // 기형 hash는 승인 이력으로 저장 안 됨 (fail-closed)
+        policy.load_rule("srv", "t2", PermissionRule::Allow, Some("short".into()));
+        assert_eq!(policy.approved_hash("srv", "t2"), None);
     }
 
     #[test]

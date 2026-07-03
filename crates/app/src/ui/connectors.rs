@@ -101,6 +101,8 @@ pub struct ConnectorsUi {
     invoke_tx: mpsc::Sender<InvokeResult>,
     invoke_rx: mpsc::Receiver<InvokeResult>,
     invoke_gen: u64,
+    /// 저장된 권한 규칙을 policy로 1회 로드했는지 (contents 최초 진입 시)
+    rules_loaded: bool,
 }
 
 impl ConnectorsUi {
@@ -132,6 +134,7 @@ impl ConnectorsUi {
             invoke_tx,
             invoke_rx,
             invoke_gen: 0,
+            rules_loaded: false,
         }
     }
 
@@ -184,6 +187,25 @@ impl ConnectorsUi {
         }
     }
 
+    /// 저장된 권한 규칙을 PermissionPolicy로 로드 (재시작해도 Allow/Deny always 유지).
+    fn load_permission_rules(&mut self, db: &Db) {
+        match db.list_permission_rules() {
+            Ok(rows) => {
+                for row in rows {
+                    if let Some(rule) = audit::PermissionRule::from_persisted(&row.rule) {
+                        self.policy.load_rule(
+                            &row.server_id,
+                            &row.tool_name,
+                            rule,
+                            row.approved_schema_hash,
+                        );
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("권한 규칙 로드 실패: {e:#}"),
+        }
+    }
+
     fn contents(
         &mut self,
         ui: &mut egui::Ui,
@@ -192,6 +214,10 @@ impl ConnectorsUi {
         workspace_id: &str,
         secret_store: &dyn SecretStore,
     ) {
+        if !self.rules_loaded {
+            self.load_permission_rules(db);
+            self.rules_loaded = true;
+        }
         let servers = match &self.cached {
             Some(list) => list.clone(),
             None => match db.list_mcp_servers() {
@@ -577,6 +603,22 @@ impl ConnectorsUi {
             Act::Decide(decision) => {
                 let request = request_of(&inv);
                 self.policy.apply_decision(&request, decision);
+                // Always 계열은 규칙이 바뀌므로 영속한다 (재시작해도 유지)
+                if matches!(
+                    decision,
+                    audit::ToolDecision::AllowAlways | audit::ToolDecision::DenyAlways
+                ) {
+                    let rule = self.policy.rule(&inv.server_id, &inv.tool_name);
+                    let hash = self.policy.approved_hash(&inv.server_id, &inv.tool_name);
+                    if let Err(e) = db.upsert_permission_rule(
+                        &inv.server_id,
+                        &inv.tool_name,
+                        rule.as_str(),
+                        hash,
+                    ) {
+                        tracing::warn!("권한 규칙 저장 실패: {e:#}");
+                    }
+                }
                 inv.phase = self.run_tool(&inv, db, workspace_id, secret_store, ctx, decision);
                 self.invoke = Some(inv);
             }

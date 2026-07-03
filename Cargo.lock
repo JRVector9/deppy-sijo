@@ -3212,6 +3212,7 @@ dependencies = [
  "anyhow",
  "deppy-core",
  "pty",
+ "regex",
  "terminal",
  "tracing",
 ]

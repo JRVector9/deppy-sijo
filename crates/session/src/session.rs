@@ -18,8 +18,10 @@ pub enum SessionKind {
 /// pump() 결과 — 호출측(runtime worker)이 이벤트 발행 여부를 결정한다.
 #[derive(Debug, PartialEq)]
 pub struct PumpResult {
-    /// 화면이 바뀌어 snapshot 재생성이 의미 있는가
+    /// 화면이 바뀌어 snapshot 재생성이 의미 있는가 (누적 — snapshot 시 소거)
     pub dirty: bool,
+    /// 이번 pump에서 새 출력이 있었는가 (비누적 — status 화면 스캔 게이트용)
+    pub produced_output: bool,
     /// 이번 pump에서 Running → Exited로 전이했는가
     pub just_exited: bool,
 }
@@ -123,6 +125,7 @@ impl Session {
         }
         PumpResult {
             dirty: self.dirty,
+            produced_output: fed > 0,
             just_exited,
         }
     }
@@ -140,6 +143,11 @@ impl Session {
 
     pub fn bracketed_paste(&self) -> bool {
         self.backend.bracketed_paste()
+    }
+
+    /// status detector용 경량 화면 텍스트 (snapshot 미생성 — PR-12 hidden 규칙).
+    pub fn screen_text(&self) -> String {
+        self.backend.screen_text()
     }
 
     pub fn write_input(&mut self, bytes: &[u8]) {

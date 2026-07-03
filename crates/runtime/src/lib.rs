@@ -12,3 +12,4 @@ pub use command::{MuxPaneId, MuxTabId, RuntimeCommand, SessionId, SplitDirection
 pub use event::{RuntimeEvent, SpawnKind};
 pub use in_process::InProcessRuntimeClient;
 pub use mux::{LayoutNode, MuxSnapshot, PaneSnapshot, TabSnapshot};
+pub use session::SessionStatus;

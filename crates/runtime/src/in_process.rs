@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use pty::CommandSpec;
 use secret::{RedactionService, SecretStore, StreamRedactor};
-use session::Session;
+use session::{Session, StatusDetector, StatusPatterns};
 use storage::SessionLogWriter;
 
 use crate::client::{RuntimeClient, RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream};
@@ -87,6 +87,7 @@ impl InProcessRuntimeClient {
                     next_id: 1,
                     sessions: std::collections::HashMap::new(),
                     logs: std::collections::HashMap::new(),
+                    detectors: std::collections::HashMap::new(),
                     logs_root,
                     redaction,
                     secret_store,
@@ -164,6 +165,8 @@ struct Worker {
     secret_store: Arc<dyn SecretStore>,
     /// 세션별 redacted 로그 (7장). raw 평문 로그는 만들지 않는다.
     logs: std::collections::HashMap<SessionId, SessionLog>,
+    /// 세션별 status detector (PR-12) — regex 있는 agent만
+    detectors: std::collections::HashMap<SessionId, StatusDetector>,
     logs_root: PathBuf,
     redaction: RedactionService,
     /// mux 상태 (PR-10) — layout source of truth. UI는 MuxUpdated 스냅샷만 본다.
@@ -363,6 +366,10 @@ impl Worker {
                 args,
                 env_plain,
                 env_secrets,
+                waiting_regex,
+                approval_regex,
+                error_regex,
+                done_regex,
             } => {
                 // secret은 여기(spawn 직전)에서만 resolve된다 — PR-09 완료 기준.
                 // 실패 시 아무것도 spawn하지 않는다 (부분 주입 금지).
@@ -401,6 +408,14 @@ impl Worker {
                 match session::spawn_agent(id, &spec, cols, rows, scrollback_lines) {
                     Ok(new_session) => {
                         self.sessions.insert(id, new_session);
+                        let patterns = StatusPatterns::compile(
+                            waiting_regex.as_deref(),
+                            approval_regex.as_deref(),
+                            error_regex.as_deref(),
+                            done_regex.as_deref(),
+                        );
+                        // regex가 없어도 idle heuristic(3단)은 동작해야 한다 — 상시 설치
+                        self.detectors.insert(id, StatusDetector::new(patterns));
                         self.open_session_log(id);
                         self.attach_in_new_tab(id, "에이전트");
                         self.emit_mux_and_watched();
@@ -415,6 +430,10 @@ impl Worker {
             RuntimeCommand::WriteInput { session, bytes } => {
                 if let Some(active) = self.sessions.get_mut(&session) {
                     active.write_input(&bytes);
+                    // 사용자 입력 = 화면 프롬프트에 대한 응답 신호 (status detector)
+                    if let Some(detector) = self.detectors.get_mut(&session) {
+                        detector.on_input();
+                    }
                 }
             }
             RuntimeCommand::Resize {
@@ -446,6 +465,7 @@ impl Worker {
             RuntimeCommand::KillSession { session } => {
                 // Session drop → PtySession Drop이 process group 정리를 보장한다
                 self.sessions.remove(&session);
+                self.detectors.remove(&session);
                 self.close_session_log(session, "killed", None);
                 // 세션을 잃은 pane은 attach 해제 (pane/session 분리 — 5.2)
                 for pane in self.mux.panes.values_mut() {
@@ -599,6 +619,7 @@ impl Worker {
             .and_then(|pane| pane.session_id)
         {
             self.sessions.remove(&session);
+            self.detectors.remove(&session);
             self.close_session_log(session, "killed", None);
         }
         self.mux.panes.remove(&pane_id);
@@ -623,6 +644,7 @@ impl Worker {
                 && let Some(session) = pane.session_id
             {
                 self.sessions.remove(&session);
+                self.detectors.remove(&session);
                 self.close_session_log(session, "killed", None);
             }
         }
@@ -661,6 +683,7 @@ impl Worker {
         let mut events = Vec::new();
         for active in self.sessions.values_mut() {
             let mut log = self.logs.get_mut(&active.id());
+            let mut detector = self.detectors.get_mut(&active.id());
             let result = active.pump(|chunk| {
                 if let Some(log) = log.as_mut() {
                     // redaction 후에만 디스크에 닿는다 (7장 — raw 평문 저장 금지)
@@ -669,7 +692,28 @@ impl Worker {
                         tracing::warn!("세션 로그 기록 실패: {e:#}");
                     }
                 }
+                if let Some(detector) = detector.as_mut() {
+                    detector.on_output(chunk); // 1단: stream line regex
+                }
             });
+            // 2·3단: 화면 텍스트 패턴 + idle — batch 주기, 경량 grid 조회
+            // (snapshot 미생성 — hidden 세션 규칙, PR-12).
+            // 종료된 세션은 감지 중단 — 단, 종료 tick에서는 마지막 출력의
+            // 상태(done/error 등)를 한 번 더 평가한다 (짧은 agent 대응).
+            // idle 오발은 없다: 방금 출력이 왔으므로 last_output이 신선하다.
+            if (active.lifecycle().is_running() || result.just_exited)
+                && let Some(detector) = self.detectors.get_mut(&active.id())
+            {
+                // 게이트는 "이번 tick의 새 출력" — 누적 dirty를 쓰면 hidden 세션이
+                // 매 tick 전체 grid를 스캔하게 된다 (hidden은 snapshot으로 dirty가 안 지워짐)
+                let screen = result.produced_output.then(|| active.screen_text());
+                if let Some(status) = detector.evaluate(screen.as_deref()) {
+                    events.push(RuntimeEvent::SessionStatusChanged {
+                        session: active.id(),
+                        status,
+                    });
+                }
+            }
             if result.dirty
                 && watched.contains(&active.id())
                 && let Some(snapshot) = active.take_snapshot()
@@ -700,6 +744,7 @@ impl Worker {
         for (session, exit_code) in exited {
             let detail = exit_code.map(|c| format!("exit code {c}"));
             self.close_session_log(session, "exited", detail.as_deref());
+            self.detectors.remove(&session);
         }
         for event in events {
             self.emit(event);
@@ -1175,6 +1220,10 @@ mod tests {
                 args: vec!["-c".into(), "echo P=$PLAIN_K S=$SECRET_K".into()],
                 env_plain: vec![("PLAIN_K".into(), "plain-v".into())],
                 env_secrets: vec![("SECRET_K".into(), "cred-agent-test".into())],
+                waiting_regex: None,
+                approval_regex: None,
+                error_regex: None,
+                done_regex: None,
             })
             .unwrap();
         probe.wait_for(Duration::from_secs(5), |e| match e {
@@ -1207,6 +1256,10 @@ mod tests {
                 args: vec!["누출되면 안 됨".into()],
                 env_plain: Vec::new(),
                 env_secrets: vec![("K".into(), "cred-없음".into())],
+                waiting_regex: None,
+                approval_regex: None,
+                error_regex: None,
+                done_regex: None,
             })
             .unwrap();
         // resolve 실패 → SpawnFailed, 메시지에 secret 값 없음 (credential id만)
@@ -1262,6 +1315,10 @@ mod tests {
                 ],
                 env_plain: Vec::new(),
                 env_secrets: vec![("SECRET_K".into(), "cred-log-scan".into())],
+                waiting_regex: None,
+                approval_regex: None,
+                error_regex: None,
+                done_regex: None,
             })
             .unwrap();
         let session = probe.wait_for(Duration::from_secs(5), |e| match e {
@@ -1360,6 +1417,141 @@ mod tests {
             }
             _ => None,
         });
+    }
+
+    /// agent spawn 공통 헬퍼 (status regex 지정)
+    #[cfg(unix)]
+    fn spawn_agent_cmd(script: &str, waiting: Option<&str>, done: Option<&str>) -> RuntimeCommand {
+        RuntimeCommand::SpawnAgent {
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 100,
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            env_plain: Vec::new(),
+            env_secrets: Vec::new(),
+            waiting_regex: waiting.map(str::to_owned),
+            approval_regex: None,
+            error_regex: None,
+            done_regex: done.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn status_stream_regex_감지() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("status-stream"),
+            RedactionService::new(),
+            pty::default_shell(),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(spawn_agent_cmd(
+                "echo START; echo WAITING_FOR_INPUT; sleep 2",
+                Some("WAITING_FOR_INPUT"),
+                None,
+            ))
+            .unwrap();
+        // 일반 출력의 line regex로 Waiting 감지 (완료 기준 1)
+        probe.wait_for(Duration::from_secs(5), |e| match e {
+            RuntimeEvent::SessionStatusChanged {
+                status: session::SessionStatus::Waiting,
+                ..
+            } => Some(()),
+            _ => None,
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn status_화면_패턴_hidden에서_snapshot_없이_감지() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("status-screen"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        // agent 먼저 spawn (개행 없는 TUI식 프롬프트 → stream 단계 미감지)
+        // 프롬프트는 1초 뒤 — 그 사이 셸 tab을 열어 agent를 hidden으로 만든다
+        client
+            .send_command(spawn_agent_cmd(
+                "sleep 1; printf 'PRESS_ANY_KEY'; sleep 3",
+                Some("PRESS_ANY_KEY"),
+                None,
+            ))
+            .unwrap();
+        let agent = probe.wait_for(Duration::from_secs(5), |e| match e {
+            RuntimeEvent::AgentSpawned { session } => Some(*session),
+            _ => None,
+        });
+        // 셸 tab을 하나 더 열어 agent tab을 hidden으로 만든다
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(5), |e| match e {
+            RuntimeEvent::ShellSpawned { .. } => Some(()),
+            _ => None,
+        });
+        probe.seen.clear(); // 이후 이벤트만 관찰
+        // hidden 상태에서 화면 텍스트 패턴으로 감지 (완료 기준 2)
+        let agent_id = agent;
+        probe.wait_for(Duration::from_secs(5), move |e| match e {
+            RuntimeEvent::SessionStatusChanged {
+                session,
+                status: session::SessionStatus::Waiting,
+            } if *session == agent_id => Some(()),
+            _ => None,
+        });
+        // 감지 기간 동안 hidden 세션의 Viewport는 미발행 (완료 기준 3)
+        assert!(
+            !probe
+                .seen
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::Viewport { session, .. } if *session == agent)),
+            "hidden 세션의 Viewport가 발행됨 (snapshot 생성 규칙 위반)"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn status_done과_exit_반영() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("status-done"),
+            RedactionService::new(),
+            pty::default_shell(),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(spawn_agent_cmd(
+                "echo ALL_TASKS_DONE; sleep 1",
+                None,
+                Some("ALL_TASKS_DONE"),
+            ))
+            .unwrap();
+        probe.wait_for(Duration::from_secs(5), |e| match e {
+            RuntimeEvent::SessionStatusChanged {
+                status: session::SessionStatus::Done,
+                ..
+            } => Some(()),
+            _ => None,
+        });
+        // process exit status 반영 (완료 기준 4 — portable-pty ExitStatus 경유)
+        let code = probe.wait_for(Duration::from_secs(10), |e| match e {
+            RuntimeEvent::SessionExited { exit_code, .. } => Some(*exit_code),
+            _ => None,
+        });
+        assert_eq!(code, Some(0));
     }
 
     #[test]

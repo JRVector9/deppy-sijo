@@ -115,6 +115,11 @@ pub struct AgentConfigRow {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
+    /// status detector regex (PR-12). 빈 문자열은 None으로 정규화.
+    pub waiting_regex: Option<String>,
+    pub approval_regex: Option<String>,
+    pub error_regex: Option<String>,
+    pub done_regex: Option<String>,
 }
 
 impl Db {
@@ -354,21 +359,38 @@ impl Db {
         Ok(())
     }
 
-    /// agent config 등록 (설계문서 PR-09). args는 array로만 저장한다 (완료 기준).
+    /// agent config 등록 (설계문서 PR-09/12). args는 array로만 저장한다 (완료 기준).
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_agent_config(
         &self,
         name: &str,
         command: &str,
         args: &[String],
+        waiting_regex: Option<&str>,
+        approval_regex: Option<&str>,
+        error_regex: Option<&str>,
+        done_regex: Option<&str>,
     ) -> anyhow::Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
         let args_json = serde_json::to_string(args)?;
         self.conn
             .execute(
-                "INSERT INTO agent_configs (id, name, command, args_json, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4,
+                "INSERT INTO agent_configs
+                   (id, name, command, args_json,
+                    waiting_regex, approval_regex, error_regex, done_regex,
+                    created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
                     strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-                (&id, name, command, &args_json),
+                (
+                    &id,
+                    name,
+                    command,
+                    &args_json,
+                    waiting_regex,
+                    approval_regex,
+                    error_regex,
+                    done_regex,
+                ),
             )
             .with_context(|| format!("agent config 저장 실패: {name}"))?;
         Ok(id)
@@ -376,7 +398,9 @@ impl Db {
 
     pub fn list_agent_configs(&self) -> anyhow::Result<Vec<AgentConfigRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, command, args_json FROM agent_configs ORDER BY created_at, id",
+            "SELECT id, name, command, args_json,
+                    waiting_regex, approval_regex, error_regex, done_regex
+             FROM agent_configs ORDER BY created_at, id",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -384,18 +408,26 @@ impl Db {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })?;
         // 손상 행 하나가 전체 목록을 죽이지 않게 skip + 경고 (원문은 로그에 남기지 않음)
         let mut out = Vec::new();
         for row in rows {
-            let (id, name, command, args_json) = row?;
+            let (id, name, command, args_json, waiting, approval, error, done) = row?;
             match serde_json::from_str(&args_json) {
                 Ok(args) => out.push(AgentConfigRow {
                     id,
                     name,
                     command,
                     args,
+                    waiting_regex: waiting.filter(|s| !s.is_empty()),
+                    approval_regex: approval.filter(|s| !s.is_empty()),
+                    error_regex: error.filter(|s| !s.is_empty()),
+                    done_regex: done.filter(|s| !s.is_empty()),
                 }),
                 Err(e) => tracing::warn!(agent_id = %id, "args_json 파싱 실패 — 행 무시: {e}"),
             }
@@ -589,6 +621,10 @@ mod tests {
                 "빌드 에이전트",
                 "cargo",
                 &["build".into(), "--release".into()],
+                Some("입력 대기"),
+                None,
+                Some("(?i)error"),
+                None,
             )
             .unwrap();
         let listed = db.list_agent_configs().unwrap();

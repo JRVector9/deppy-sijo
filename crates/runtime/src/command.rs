@@ -21,6 +21,11 @@ pub enum RuntimeCommand {
         env_plain: Vec<(String, String)>,
         /// (env key, credential_id)
         env_secrets: Vec<(String, String)>,
+        /// status detector regex (agent_configs *_regex — PR-12)
+        waiting_regex: Option<String>,
+        approval_regex: Option<String>,
+        error_regex: Option<String>,
+        done_regex: Option<String>,
     },
     WriteInput {
         session: SessionId,

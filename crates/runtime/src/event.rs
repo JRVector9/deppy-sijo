@@ -3,6 +3,7 @@ use std::sync::Arc;
 use terminal::TerminalViewportSnapshot;
 
 use mux::MuxSnapshot;
+use session::SessionStatus;
 
 use crate::command::SessionId;
 
@@ -42,5 +43,10 @@ pub enum RuntimeEvent {
     /// mux 구조(tab/pane/layout/focus) 변경 — UI는 이걸로만 배치를 그린다
     MuxUpdated {
         snapshot: Arc<MuxSnapshot>,
+    },
+    /// status detector 감지 결과 (PR-12) — batch 주기로 평가된다
+    SessionStatusChanged {
+        session: SessionId,
+        status: SessionStatus,
     },
 }

@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use runtime::{
-    LayoutNode, MuxSnapshot, RuntimeClient, RuntimeCommand, RuntimeEvent, SessionId, SpawnKind,
-    SplitDirection,
+    LayoutNode, MuxSnapshot, RuntimeClient, RuntimeCommand, RuntimeEvent, SessionId, SessionStatus,
+    SpawnKind, SplitDirection,
 };
 use terminal::{TerminalViewportSnapshot, input_mapper, renderer_egui};
 
@@ -40,6 +40,8 @@ struct SessionView {
     snapshot: Option<Arc<TerminalViewportSnapshot>>,
     bracketed_paste: bool,
     exit_code: Option<Option<u32>>,
+    /// status detector 감지 상태 (agent만, PR-12)
+    status: Option<SessionStatus>,
 }
 
 impl WorkspaceUi {
@@ -88,7 +90,17 @@ impl WorkspaceUi {
                 }
                 RuntimeEvent::SessionExited { session, exit_code } => {
                     if self.session_alive(*session) {
-                        self.sessions.entry(*session).or_default().exit_code = Some(*exit_code);
+                        let view = self.sessions.entry(*session).or_default();
+                        view.exit_code = Some(*exit_code);
+                        // 진행형 상태(⏳/✋)는 종료와 함께 무효 — 결과 상태(✅/❌)만 유지
+                        if matches!(
+                            view.status,
+                            Some(SessionStatus::Waiting)
+                                | Some(SessionStatus::NeedsApproval)
+                                | Some(SessionStatus::Running)
+                        ) {
+                            view.status = None;
+                        }
                     }
                 }
                 RuntimeEvent::SpawnFailed { kind, message } => {
@@ -100,6 +112,11 @@ impl WorkspaceUi {
                         SpawnKind::Agent => "에이전트",
                     };
                     self.error = Some(format!("{kind} 시작 실패: {message}"));
+                }
+                RuntimeEvent::SessionStatusChanged { session, status } => {
+                    if self.session_alive(*session) {
+                        self.sessions.entry(*session).or_default().status = Some(*status);
+                    }
                 }
                 RuntimeEvent::ShellSpawned { .. } => {
                     self.pending_spawns = self.pending_spawns.saturating_sub(1);
@@ -182,7 +199,19 @@ impl WorkspaceUi {
             if let Some(mux) = &mux {
                 for tab in &mux.tabs {
                     let active = mux.active_tab.as_ref() == Some(&tab.id);
-                    if ui.selectable_label(active, &tab.title).clicked() && !active {
+                    // tab 내 세션들의 감지 상태 요약 — 가장 주의가 필요한 상태 우선 (PR-12)
+                    let icon = tab
+                        .panes
+                        .iter()
+                        .filter_map(|pane| pane.session_id)
+                        .filter_map(|session| {
+                            self.sessions.get(&session).and_then(|view| view.status)
+                        })
+                        .max_by_key(|status| status.urgency())
+                        .map(status_icon)
+                        .unwrap_or("");
+                    let title = format!("{icon}{}", tab.title);
+                    if ui.selectable_label(active, title).clicked() && !active {
                         self.send(
                             client,
                             RuntimeCommand::SelectTab {
@@ -465,5 +494,16 @@ impl WorkspaceUi {
                 self.pending_spawns += 1;
             }
         }
+    }
+}
+
+/// 상태 → tab 제목 아이콘 (PR-12).
+fn status_icon(status: SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Running => "",
+        SessionStatus::Waiting => "⏳",
+        SessionStatus::NeedsApproval => "✋",
+        SessionStatus::Error => "❌",
+        SessionStatus::Done => "✅",
     }
 }

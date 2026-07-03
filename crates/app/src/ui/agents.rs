@@ -13,6 +13,11 @@ pub struct AgentsUi {
     command: String,
     /// 줄바꿈으로 구분해 args array로 저장한다 (셸 문자열 파싱 금지)
     args_input: String,
+    /// status detector regex 입력 (PR-12) — 비우면 미사용
+    waiting_regex: String,
+    approval_regex: String,
+    error_regex: String,
+    done_regex: String,
     /// 실행 시 적용할 env profile (None = profile 없이)
     run_profile: Option<String>,
     /// 응답(AgentSpawned/SpawnFailed)을 아직 못 받은 실행 수 — 폴링 유지
@@ -28,6 +33,10 @@ impl AgentsUi {
             name: String::new(),
             command: String::new(),
             args_input: String::new(),
+            waiting_regex: String::new(),
+            approval_regex: String::new(),
+            error_regex: String::new(),
+            done_regex: String::new(),
             run_profile: None,
             pending_launches: 0,
             error: None,
@@ -203,6 +212,19 @@ impl AgentsUi {
                 .desired_rows(3)
                 .font(egui::TextStyle::Monospace),
         );
+        ui.collapsing("상태 감지 regex (선택)", |ui| {
+            for (label, field) in [
+                ("waiting", &mut self.waiting_regex),
+                ("approval", &mut self.approval_regex),
+                ("error", &mut self.error_regex),
+                ("done", &mut self.done_regex),
+            ] {
+                ui.horizontal(|ui| {
+                    ui.label(label);
+                    ui.add(egui::TextEdit::singleline(field).font(egui::TextStyle::Monospace));
+                });
+            }
+        });
         let filled = !self.name.trim().is_empty() && !self.command.trim().is_empty();
         if ui.add_enabled(filled, egui::Button::new("등록")).clicked() {
             let args: Vec<String> = self
@@ -212,11 +234,27 @@ impl AgentsUi {
                 .filter(|line| !line.is_empty())
                 .map(str::to_owned)
                 .collect();
-            match db.insert_agent_config(self.name.trim(), self.command.trim(), &args) {
+            let opt = |s: &str| {
+                let t = s.trim();
+                (!t.is_empty()).then(|| t.to_owned())
+            };
+            match db.insert_agent_config(
+                self.name.trim(),
+                self.command.trim(),
+                &args,
+                opt(&self.waiting_regex).as_deref(),
+                opt(&self.approval_regex).as_deref(),
+                opt(&self.error_regex).as_deref(),
+                opt(&self.done_regex).as_deref(),
+            ) {
                 Ok(_) => {
                     self.name.clear();
                     self.command.clear();
                     self.args_input.clear();
+                    self.waiting_regex.clear();
+                    self.approval_regex.clear();
+                    self.error_regex.clear();
+                    self.done_regex.clear();
                     self.cached = None;
                     self.error = None;
                 }
@@ -258,6 +296,10 @@ impl AgentsUi {
             args: agent.args.clone(),
             env_plain,
             env_secrets,
+            waiting_regex: agent.waiting_regex.clone(),
+            approval_regex: agent.approval_regex.clone(),
+            error_regex: agent.error_regex.clone(),
+            done_regex: agent.done_regex.clone(),
         })?;
         Ok(())
     }

@@ -220,6 +220,38 @@ impl TerminalBackend for AlacrittyBackend {
     fn bracketed_paste(&self) -> bool {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
+
+    fn screen_text(&self) -> String {
+        // 셀 벡터/Arc 할당 없이 문자만 모은다 — snapshot이 아니다.
+        // display_iter는 스크롤된 viewport를 반영하므로 쓰지 않는다 —
+        // 사용자가 스크롤백을 보고 있어도 감지는 항상 live 화면 기준이어야 한다.
+        let grid = self.term.grid();
+        let cols = self.term.columns();
+        let rows = self.term.screen_lines();
+        let mut out = String::with_capacity(cols * rows);
+        for row in 0..rows {
+            if row > 0 {
+                out.push('\n');
+            }
+            let line = &grid[alacritty_terminal::index::Line(row as i32)];
+            for col in 0..cols {
+                let cell = &line[alacritty_terminal::index::Column(col)];
+                if !cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    // conceal(SGR 8)은 snapshot과 동일하게 공백 취급 —
+                    // 화면에 보이지 않는 텍스트로 상태를 감지하면 안 된다
+                    out.push(if cell.flags.contains(Flags::HIDDEN) {
+                        ' '
+                    } else {
+                        cell.c
+                    });
+                }
+            }
+        }
+        out
+    }
 }
 
 fn map_cursor_shape(shape: VteCursorShape) -> (CursorShape, bool) {
@@ -454,6 +486,15 @@ mod tests {
         assert!(!backend.viewport_snapshot().unwrap().is_alt_screen);
         feed(&mut backend, b"\x1b[?1049h");
         assert!(backend.viewport_snapshot().unwrap().is_alt_screen);
+    }
+
+    #[test]
+    fn screen_text_경량_조회() {
+        let mut backend = AlacrittyBackend::new(40, 5, 100);
+        feed(&mut backend, "줄1 WAITING\r\n줄2".as_bytes());
+        let text = backend.screen_text();
+        assert!(text.contains("줄1 WAITING"));
+        assert!(text.contains("줄2"));
     }
 
     #[test]

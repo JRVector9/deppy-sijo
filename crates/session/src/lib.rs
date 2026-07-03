@@ -8,8 +8,10 @@ mod agent_session;
 mod lifecycle;
 mod session;
 mod shell_session;
+mod status;
 
 pub use agent_session::spawn_agent;
 pub use lifecycle::SessionLifecycle;
 pub use session::{PumpResult, Session, SessionKind};
 pub use shell_session::spawn_shell;
+pub use status::{SessionStatus, StatusDetector, StatusPatterns};

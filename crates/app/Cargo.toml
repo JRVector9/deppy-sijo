@@ -1,5 +1,5 @@
 [package]
-name = "deppy-jelly"
+name = "deppy-sijo"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

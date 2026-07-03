@@ -13,7 +13,7 @@ pub struct AppPaths {
 impl AppPaths {
     pub fn init() -> anyhow::Result<Self> {
         // 번들 ID 규칙: app.vector9.<서비스명>
-        let dirs = ProjectDirs::from("app", "vector9", "deppy-jelly")
+        let dirs = ProjectDirs::from("app", "vector9", "deppy-sijo")
             .context("홈 디렉터리를 찾을 수 없음")?;
         let paths = Self {
             config_dir: dirs.config_dir().to_path_buf(),

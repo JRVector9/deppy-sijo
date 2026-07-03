@@ -17,7 +17,7 @@ fn main() -> anyhow::Result<()> {
     );
 
     eframe::run_native(
-        "Deppy Jelly",
+        "Deppy Sijo",
         eframe::NativeOptions::default(),
         Box::new(move |cc| {
             // 저장된 테마를 시작 시점에 적용

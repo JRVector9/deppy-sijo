@@ -118,7 +118,7 @@ mod tests {
     #[test]
     fn load_or_create_생성_후_재로드_일치() {
         let dir =
-            std::env::temp_dir().join(format!("deppy-jelly-config-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("deppy-sijo-config-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let created = Config::load_or_create(&dir).unwrap();
         let reloaded = Config::load_or_create(&dir).unwrap();

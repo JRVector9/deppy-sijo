@@ -1,0 +1,16 @@
+# PR-15 Local MCP Manager (설계문서 §1.5, §11.4-11.5).
+# stdio JSON-RPC MCP: initialize / tools/list. stdout는 valid MCP만, stderr는 capture+redaction.
+# 앱 마이그레이션 통합·UI 배선은 crates/app에서 (이 crate는 프로토콜/매니저 로직 + DDL 상수).
+[package]
+name = "mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+deppy-core = { path = "../core" }
+secret = { path = "../secret" }

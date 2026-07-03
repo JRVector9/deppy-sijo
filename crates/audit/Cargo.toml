@@ -1,0 +1,17 @@
+# PR-16 Tool Permission & Audit (설계문서 §11.7, §7).
+# permission policy / schema hash(sha256) / redacted audit log (encrypted blob은 선택).
+# 앱 마이그레이션 통합·approval dialog UI는 crates/app에서 (이 crate는 정책/해시/감사 로직 + DDL 상수).
+[package]
+name = "audit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+sha2 = { workspace = true }
+deppy-core = { path = "../core" }
+secret = { path = "../secret" }

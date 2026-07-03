@@ -1,0 +1,16 @@
+# PR-14 Workspace/Restore (설계문서 §11, §14.4 crash recovery).
+# SQLite 영속(mux layout / session metadata) + crash recovery.
+# 앱 마이그레이션 배열 통합·UI 배선은 crates/app에서 (이 crate는 순수 로직 + DDL 상수).
+[package]
+name = "persist"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+deppy-core = { path = "../core" }
+mux = { path = "../mux" }

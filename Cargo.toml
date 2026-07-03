@@ -4,8 +4,11 @@ resolver = "3"
 members = [
     "crates/platform",
     "crates/app",
+    "crates/audit",
     "crates/core",
+    "crates/mcp",
     "crates/mux",
+    "crates/persist",
     "crates/pty",
     "crates/runtime",
     "crates/secret",
@@ -39,3 +42,4 @@ keyring-core = "1"
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
 windows-native-keyring-store = "1"
 uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"

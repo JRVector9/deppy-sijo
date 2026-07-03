@@ -1,7 +1,8 @@
 //! Redacted tool audit log (설계문서 11.7). input_json 평문 저장 금지 —
 //! RedactionService를 통과한 텍스트만 input_redacted_json에 넣는다.
 //! input_encrypted_blob은 선택 기능(7장: AEAD + keyring key + key id) —
-//! v0에서는 미구현으로 항상 NULL이고 컬럼 구조만 확보한다 (PR-16 완료 기준).
+//! record_audit에 encryptor(SecretStore)를 넘기면 전체 원본 입력이 암호화 저장되고,
+//! None이면 NULL이다. 암호화 로직은 crate::crypto.
 
 use anyhow::Context;
 use rusqlite::Connection;
@@ -105,6 +106,9 @@ pub fn record_audit(
     conn: &Connection,
     redaction: &RedactionService,
     record: &AuditRecord<'_>,
+    // Some이면 전체(원본) 입력을 AEAD 암호화해 input_encrypted_blob에 저장한다 (7장,
+    // 선택 기능). None이면 blob은 NULL. 암호화 실패는 감사 저장을 막지 않는다(로그만).
+    encryptor: Option<&dyn secret::SecretStore>,
 ) -> anyhow::Result<String> {
     // 1차: key 이름 기반 마스킹 — RedactionService에 아직 등록되지 않은 secret 대비
     let keyed = match serde_json::from_str::<serde_json::Value>(record.input_json) {
@@ -122,6 +126,19 @@ pub fn record_audit(
     redacted.extend(redactor.flush());
     let input_redacted = String::from_utf8_lossy(&redacted).into_owned();
 
+    // 선택: 전체 원본 입력을 AEAD 암호화 (redacted와 별개로 사고 조사용 보존, 7장).
+    // 암호화 실패(keyring 미가용 등)는 감사 자체를 막지 않는다 — blob만 NULL로 둔다.
+    let encrypted_blob: Option<Vec<u8>> =
+        encryptor.and_then(
+            |store| match crate::encrypt_input(store, record.input_json) {
+                Ok(blob) => Some(blob),
+                Err(e) => {
+                    tracing::warn!("audit 입력 암호화 실패 (blob NULL로 저장): {e:#}");
+                    None
+                }
+            },
+        );
+
     let id = uuid::Uuid::new_v4().to_string();
     conn.execute(
         "INSERT INTO tool_audit_logs
@@ -136,8 +153,8 @@ pub fn record_audit(
             record.server_id,
             record.tool_name,
             &input_redacted,
-            // encrypted blob은 선택(7장) — v0 미구현, 항상 NULL
-            None::<Vec<u8>>,
+            // encrypted blob은 선택(7장) — encryptor 있으면 암호화된 원본, 없으면 NULL
+            encrypted_blob,
             record.decision.as_str(),
         ),
     )
@@ -147,7 +164,37 @@ pub fn record_audit(
 
 #[cfg(test)]
 mod tests {
-    use secret::SecretString;
+    use secret::{SecretStore, SecretString};
+    use std::sync::Mutex;
+
+    /// 테스트용 인메모리 SecretStore (keyring 불필요).
+    #[derive(Default)]
+    struct MemStore(Mutex<std::collections::HashMap<String, String>>);
+
+    impl SecretStore for MemStore {
+        fn set_secret(&self, id: &str, secret: &SecretString) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(id.to_owned(), secret.expose().to_owned());
+            Ok(())
+        }
+        fn get_secret(&self, id: &str) -> anyhow::Result<SecretString> {
+            self.0
+                .lock()
+                .unwrap()
+                .get(id)
+                .map(|v| SecretString::new(v.clone()))
+                .ok_or_else(|| anyhow::anyhow!("없음: {id}"))
+        }
+        fn delete_secret(&self, id: &str) -> anyhow::Result<()> {
+            self.0.lock().unwrap().remove(id);
+            Ok(())
+        }
+        fn has_secret(&self, id: &str) -> anyhow::Result<bool> {
+            Ok(self.0.lock().unwrap().contains_key(id))
+        }
+    }
 
     use super::*;
     use crate::MIGRATION_SQL;
@@ -182,7 +229,7 @@ mod tests {
         let conn = test_conn();
         // key 이름이 민감하지 않아도(1차 마스킹 미적용) 등록된 secret은 2차에서 치환된다
         let input = format!(r#"{{"url":"https://api.example.com","note":"use {SECRET} here"}}"#);
-        let id = record_audit(&conn, &service_with_secret(), &record(&input)).unwrap();
+        let id = record_audit(&conn, &service_with_secret(), &record(&input), None).unwrap();
 
         let stored: String = conn
             .query_row(
@@ -198,12 +245,13 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_blob은_v0에서_항상_null() {
+    fn encryptor_없으면_blob_null() {
         let conn = test_conn();
         let id = record_audit(
             &conn,
             &service_with_secret(),
             &record(r#"{"path":"/tmp/x"}"#),
+            None,
         )
         .unwrap();
         let blob: Option<Vec<u8>> = conn
@@ -214,6 +262,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(blob, None);
+    }
+
+    #[test]
+    fn encryptor_있으면_원본이_암호화_저장되고_복호된다() {
+        let conn = test_conn();
+        let store = MemStore::default();
+        let plain = r#"{"path":"/tmp/x","token":"sk-secret-xyz"}"#;
+        let id = record_audit(
+            &conn,
+            &RedactionService::new(),
+            &record(plain),
+            Some(&store),
+        )
+        .unwrap();
+        let blob: Vec<u8> = conn
+            .query_row(
+                "SELECT input_encrypted_blob FROM tool_audit_logs WHERE id = ?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // blob에 평문 secret이 없어야 하고, 복호 시 원본이 그대로 나와야 한다
+        assert!(!String::from_utf8_lossy(&blob).contains("sk-secret-xyz"));
+        assert_eq!(crate::decrypt_input(&store, &blob).unwrap(), plain);
     }
 
     #[test]
@@ -230,6 +302,7 @@ mod tests {
                 input_json: r#"{"path":"/tmp/x"}"#,
                 decision: ToolDecision::PolicyAllow,
             },
+            None,
         )
         .unwrap();
 
@@ -276,7 +349,7 @@ mod tests {
         // key는 민감하지 않게 두어 2차(등록 패턴 변형) 경로를 검증한다.
         let input =
             serde_json::to_string(&serde_json::json!({ "note": secret_with_quote })).unwrap();
-        let id = record_audit(&conn, &service, &record(&input)).unwrap();
+        let id = record_audit(&conn, &service, &record(&input), None).unwrap();
         let stored: String = conn
             .query_row(
                 "SELECT input_redacted_json FROM tool_audit_logs WHERE id = ?1",
@@ -298,7 +371,7 @@ mod tests {
             "nested": { "refresh_token": "unregistered-token-abc" },
             "list": [ { "password": "unregistered-pw-999" } ]
         }"#;
-        let id = record_audit(&conn, &RedactionService::new(), &record(input)).unwrap();
+        let id = record_audit(&conn, &RedactionService::new(), &record(input), None).unwrap();
         let stored: String = conn
             .query_row(
                 "SELECT input_redacted_json FROM tool_audit_logs WHERE id = ?1",
@@ -326,7 +399,7 @@ mod tests {
             "session_id": "variant-key-444",
             "OAuth-Token": "variant-key-555"
         }"#;
-        let id = record_audit(&conn, &RedactionService::new(), &record(input)).unwrap();
+        let id = record_audit(&conn, &RedactionService::new(), &record(input), None).unwrap();
         let stored: String = conn
             .query_row(
                 "SELECT input_redacted_json FROM tool_audit_logs WHERE id = ?1",
@@ -353,6 +426,7 @@ mod tests {
             &conn,
             &RedactionService::new(),
             &record("password=unregistered-pw-777"),
+            None,
         )
         .unwrap();
         let stored: String = conn

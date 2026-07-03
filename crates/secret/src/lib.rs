@@ -53,6 +53,9 @@ pub trait SecretStore: Send + Sync {
     /// spawn 직전 env 주입에서만 호출 (설계문서 6.3, PR-09)
     fn get_secret(&self, id: &str) -> anyhow::Result<SecretString>;
     fn delete_secret(&self, id: &str) -> anyhow::Result<()>;
+    /// secret 존재 여부. 확인된 부재는 Ok(false), 조회 오류(일시 장애 등)는 Err —
+    /// "없음"과 "오류"를 구별해야 하는 경로(암호화 키 get-or-create)에서 쓴다.
+    fn has_secret(&self, id: &str) -> anyhow::Result<bool>;
 }
 
 /// keyring-core 기본 store 기반 구현. 사용 전 플랫폼 store가
@@ -94,6 +97,16 @@ impl SecretStore for KeyringSecretStore {
             // 이미 없는 entry 삭제는 성공으로 취급 (metadata/keyring drift 복구 허용)
             Err(keyring_core::Error::NoEntry) => Ok(()),
             Err(e) => Err(e).with_context(|| format!("keyring 삭제 실패: {id}")),
+        }
+    }
+
+    fn has_secret(&self, id: &str) -> anyhow::Result<bool> {
+        let _serial = KEYRING_SERIAL.lock().expect("keyring serial lock");
+        match self.entry(id)?.get_password() {
+            Ok(_) => Ok(true),
+            // 확인된 부재만 false — 그 외 오류는 "없음"으로 오인하면 안 된다 (키 덮어쓰기 방지)
+            Err(keyring_core::Error::NoEntry) => Ok(false),
+            Err(e) => Err(e).with_context(|| format!("keyring 존재 확인 실패: {id}")),
         }
     }
 }

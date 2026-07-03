@@ -108,6 +108,9 @@ mod tests {
             fn delete_secret(&self, _id: &str) -> anyhow::Result<()> {
                 Ok(())
             }
+            fn has_secret(&self, id: &str) -> anyhow::Result<bool> {
+                Ok(self.0.lock().unwrap().contains_key(id))
+            }
         }
 
         let store = MemStore(Mutex::new(HashMap::new()));

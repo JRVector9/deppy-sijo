@@ -3,9 +3,11 @@
 //! approval dialog UI와 앱 마이그레이션 통합은 crates/app 소관 —
 //! 이 crate는 정책·해시·감사 로직 + dialog가 쓸 model 타입 + DDL 상수만 둔다.
 
+mod crypto;
 mod log;
 mod policy;
 
+pub use crypto::{decrypt_input, encrypt_input};
 pub use log::{AuditRecord, record_audit};
 pub use policy::{
     ApprovalReason, PermissionPolicy, PermissionRule, PolicyEvaluation, ToolApprovalRequest,

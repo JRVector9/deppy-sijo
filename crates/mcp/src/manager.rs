@@ -109,6 +109,19 @@ impl LocalMcpManager {
         connection.list_tools()
         // connection drop → 서버 프로세스 정리
     }
+
+    /// connect → tools/call → 연결 종료(kill/reap)까지 한 번에. `arguments`는 JSON object.
+    /// stdio 서버는 매 호출마다 새 subprocess를 띄운다 — MVP 단순화(영속 연결 아님).
+    pub fn call_tool(
+        &self,
+        config: &McpServerConfig,
+        name: &str,
+        arguments: Value,
+    ) -> anyhow::Result<Value> {
+        let mut connection = self.connect(config)?;
+        connection.call_tool(name, arguments)
+        // connection drop → 서버 프로세스 정리
+    }
 }
 
 /// initialize를 마친 stdio MCP 연결. drop 시 서버 프로세스를 kill + reap한다.
@@ -143,6 +156,14 @@ impl McpConnection {
             }
         }
         anyhow::bail!("tools/list 페이지가 {MAX_TOOL_PAGES}를 초과 — cursor 순환 의심");
+    }
+
+    /// tools/call 요청 → 결과 Value (content 배열 + 선택적 isError).
+    /// `arguments`는 JSON object여야 한다 (MCP 스펙). isError=true는 프로토콜
+    /// 오류가 아니라 tool이 보고한 실패이므로 결과를 그대로 돌려준다 — 판단은 호출측.
+    pub fn call_tool(&mut self, name: &str, arguments: Value) -> anyhow::Result<Value> {
+        self.client
+            .request("tools/call", json!({"name": name, "arguments": arguments}))
     }
 
     /// 지금까지 캡처된 redacted stderr 로그.
@@ -201,6 +222,28 @@ read -r _initialized
 read -r _list
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo_tool","description":"에코","inputSchema":{"type":"object","properties":{}}}]}}'
 "#;
+
+    // initialize(id=1) 후 tools/call(id=2)에 결과를 심는 목 서버
+    const CALL_SCRIPT: &str = r#"
+read -r _init
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"mock","version":"0.1"}}}'
+read -r _initialized
+read -r _call
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"hello world"}],"isError":false}}'
+"#;
+
+    #[test]
+    fn call_tool_왕복() {
+        let manager = manager();
+        let result = manager
+            .call_tool(&sh_config(CALL_SCRIPT), "echo_tool", json!({"msg": "hi"}))
+            .unwrap();
+        assert_eq!(
+            result.pointer("/content/0/text").and_then(Value::as_str),
+            Some("hello world")
+        );
+        assert_eq!(result.get("isError").and_then(Value::as_bool), Some(false));
+    }
 
     #[test]
     fn initialize_tools_list_왕복과_stderr_redaction() {

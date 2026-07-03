@@ -1,5 +1,7 @@
+# 설계문서 10장: session은 core/pty/terminal에만 의존한다.
+# secret 의존 금지(PR-08 완료 기준)를 매니페스트 수준에서 강제 — 추가하지 말 것.
 [package]
-name = "runtime"
+name = "session"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,5 +11,4 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 deppy-core = { path = "../core" }
 pty = { path = "../pty" }
-session = { path = "../session" }
 terminal = { path = "../terminal" }

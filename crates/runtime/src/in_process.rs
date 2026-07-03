@@ -1,26 +1,23 @@
-//! v0 구현체 (설계문서 2.3). worker thread가 PTY 세션과 terminal backend를
-//! 소유한다. 정식 Session Runtime 분리는 PR-08.
+//! v0 구현체 (설계문서 2.3). worker thread가 세션들을 소유한다.
+//! 세션 로직(PTY+terminal+lifecycle)은 session crate 소관 (PR-08).
 
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pty::{CommandSpec, PortablePtyBackend, PtyBackend, PtySession};
-use terminal::{AlacrittyBackend, TerminalBackend};
+use pty::CommandSpec;
+use session::Session;
 
 use crate::client::{RuntimeClient, RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream};
 use crate::command::{RuntimeCommand, SessionId};
 use crate::event::RuntimeEvent;
 
-/// 한 tick에 backend로 넘기는 PTY 출력 상한 (UI 프레임 독점 방지와 동일 취지)
-const FEED_PER_TICK_CAP: usize = 256 * 1024;
-
 /// 구독자 한 명의 송신측. 상태 이벤트(unbounded — 세션 수명당 상수 개수의
-/// 제어 이벤트라 누적 위험 없음)와 Viewport slot(최신본만 유지 — 14.5의
+/// 제어 이벤트라 누적 위험 없음)와 세션별 Viewport slot(최신본만 유지 — 14.5의
 /// output bounded 요구를 "누적 불가" 구조로 충족)을 분리한다 (8.2).
 struct Subscriber {
     events: Sender<RuntimeEvent>,
-    viewport: Arc<Mutex<Option<RuntimeEvent>>>,
+    viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>>,
 }
 
 pub struct InProcessRuntimeClient {
@@ -51,7 +48,7 @@ impl InProcessRuntimeClient {
                     batch: Duration::from_millis(output_batch_ms.max(1)),
                     shell,
                     next_id: 1,
-                    session: None,
+                    sessions: std::collections::HashMap::new(),
                 }
                 .run();
             })
@@ -94,32 +91,23 @@ impl RuntimeCommandSink for InProcessRuntimeClient {
 impl RuntimeEventStream for InProcessRuntimeClient {
     fn subscribe(&self) -> RuntimeEventReceiver {
         let (tx, rx) = channel();
-        let viewport: Arc<Mutex<Option<RuntimeEvent>>> = Arc::default();
+        let viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
+            Arc::default();
         self.subscribers
             .lock()
             .expect("subscribers lock")
             .push(Subscriber {
                 events: tx,
-                viewport: Arc::clone(&viewport),
+                viewports: Arc::clone(&viewports),
             });
         RuntimeEventReceiver {
             events: rx,
-            viewport,
+            viewports,
         }
     }
 }
 
 impl RuntimeClient for InProcessRuntimeClient {}
-
-struct ActiveSession {
-    id: SessionId,
-    /// 종료 후에는 None — backend는 scrollback 열람을 위해 유지한다
-    pty: Option<Box<dyn PtySession>>,
-    output: Receiver<Vec<u8>>,
-    backend: AlacrittyBackend,
-    /// 마지막 push 이후 화면 변경 여부
-    dirty: bool,
-}
 
 struct Worker {
     command_rx: Receiver<RuntimeCommand>,
@@ -127,7 +115,8 @@ struct Worker {
     batch: Duration,
     shell: CommandSpec,
     next_id: u64,
-    session: Option<ActiveSession>,
+    /// 다중 세션 (PR-08 Session Runtime). 세션 로직은 session crate 소관.
+    sessions: std::collections::HashMap<SessionId, Session>,
 }
 
 impl Worker {
@@ -145,9 +134,9 @@ impl Worker {
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break, // client drop → 종료
             }
-            self.pump_session();
+            self.pump_sessions();
         }
-        // session drop → PtySession Drop이 프로세스 정리
+        // sessions drop → PtySession Drop이 프로세스 정리
     }
 
     fn emit(&self, event: RuntimeEvent) {
@@ -159,11 +148,15 @@ impl Worker {
             .lock()
             .expect("subscribers lock")
             .retain(|subscriber| {
-                if matches!(event, RuntimeEvent::Viewport { .. }) {
-                    if Arc::strong_count(&subscriber.viewport) <= 1 {
+                if let RuntimeEvent::Viewport { session, .. } = &event {
+                    if Arc::strong_count(&subscriber.viewports) <= 1 {
                         return false;
                     }
-                    *subscriber.viewport.lock().expect("viewport slot lock") = Some(event.clone());
+                    subscriber
+                        .viewports
+                        .lock()
+                        .expect("viewport slot lock")
+                        .insert(*session, event.clone());
                     true
                 } else {
                     subscriber.events.send(event.clone()).is_ok()
@@ -177,13 +170,29 @@ impl Worker {
                 cols,
                 rows,
                 scrollback_lines,
-            } => self.spawn_shell(cols, rows, scrollback_lines),
+            } => {
+                let id = SessionId(self.next_id);
+                self.next_id += 1;
+                match Session::spawn_with_spec(
+                    id,
+                    session::SessionKind::Shell,
+                    &self.shell,
+                    cols,
+                    rows,
+                    scrollback_lines,
+                ) {
+                    Ok(new_session) => {
+                        self.sessions.insert(id, new_session);
+                        self.emit(RuntimeEvent::ShellSpawned { session: id });
+                    }
+                    Err(e) => self.emit(RuntimeEvent::SpawnFailed {
+                        message: format!("{e:#}"),
+                    }),
+                }
+            }
             RuntimeCommand::WriteInput { session, bytes } => {
-                if let Some(active) = self.session_mut(session)
-                    && let Some(pty) = &mut active.pty
-                    && let Err(e) = pty.write_input(&bytes)
-                {
-                    tracing::warn!("PTY 입력 실패: {e:#}");
+                if let Some(active) = self.sessions.get_mut(&session) {
+                    active.write_input(&bytes);
                 }
             }
             RuntimeCommand::Resize {
@@ -191,115 +200,47 @@ impl Worker {
                 cols,
                 rows,
             } => {
-                if let Some(active) = self.session_mut(session) {
-                    let _ = active.backend.resize(cols, rows);
-                    if let Some(pty) = &mut active.pty
-                        && let Err(e) = pty.resize(cols, rows)
-                    {
-                        tracing::warn!("PTY resize 실패: {e:#}");
-                    }
-                    active.dirty = true;
+                if let Some(active) = self.sessions.get_mut(&session) {
+                    active.resize(cols, rows);
                 }
             }
             RuntimeCommand::Scroll { session, delta } => {
-                if let Some(active) = self.session_mut(session) {
-                    active.backend.scroll(delta);
-                    active.dirty = true;
+                if let Some(active) = self.sessions.get_mut(&session) {
+                    active.scroll(delta);
                 }
             }
             RuntimeCommand::KillSession { session } => {
-                if self.session.as_ref().is_some_and(|a| a.id == session) {
-                    // Drop이 process group 정리를 보장한다
-                    self.session = None;
-                }
+                // Session drop → PtySession Drop이 process group 정리를 보장한다
+                self.sessions.remove(&session);
             }
         }
     }
 
-    fn session_mut(&mut self, id: SessionId) -> Option<&mut ActiveSession> {
-        self.session.as_mut().filter(|a| a.id == id)
-    }
-
-    fn spawn_shell(&mut self, cols: u16, rows: u16, scrollback_lines: usize) {
-        // v0: 단일 세션 — 기존 세션은 교체
-        self.session = None;
-        match PortablePtyBackend.spawn(&self.shell, cols, rows) {
-            Ok(mut pty) => {
-                let output = pty.take_output().expect("새 세션의 output 채널");
-                let id = SessionId(self.next_id);
-                self.next_id += 1;
-                self.session = Some(ActiveSession {
-                    id,
-                    pty: Some(pty),
-                    output,
-                    backend: AlacrittyBackend::new(cols, rows, scrollback_lines),
-                    dirty: true,
+    /// 모든 세션의 PTY 출력을 반영하고, 변경된 세션의 Viewport를 push한다.
+    fn pump_sessions(&mut self) {
+        let mut events = Vec::new();
+        for active in self.sessions.values_mut() {
+            let result = active.pump();
+            if result.dirty
+                && let Some(snapshot) = active.take_snapshot()
+            {
+                events.push(RuntimeEvent::Viewport {
+                    session: active.id(),
+                    snapshot: Arc::new(snapshot),
+                    bracketed_paste: active.bracketed_paste(),
                 });
-                self.emit(RuntimeEvent::ShellSpawned { session: id });
             }
-            Err(e) => self.emit(RuntimeEvent::SpawnFailed {
-                message: format!("{e:#}"),
-            }),
-        }
-    }
-
-    /// PTY 출력을 backend에 먹이고, 변경이 있으면 Viewport를 push한다.
-    fn pump_session(&mut self) {
-        let Some(active) = &mut self.session else {
-            return;
-        };
-        let mut fed = 0usize;
-        let mut eof = false;
-        while active.pty.is_some() {
-            if fed >= FEED_PER_TICK_CAP {
-                break; // 나머지는 다음 tick에서
-            }
-            match active.output.try_recv() {
-                Ok(chunk) => {
-                    fed += chunk.len();
-                    match active.backend.feed(&chunk) {
-                        Ok(changes) => {
-                            active.dirty = true;
-                            // 터미널 질의(DA 등) 응답 회신
-                            if !changes.pty_responses.is_empty()
-                                && let Some(pty) = &mut active.pty
-                                && let Err(e) = pty.write_input(&changes.pty_responses)
-                            {
-                                tracing::warn!("터미널 질의 응답 전송 실패: {e:#}");
-                            }
-                        }
-                        Err(e) => tracing::warn!("terminal feed 실패: {e:#}"),
-                    }
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    eof = true;
-                    break;
-                }
+            if result.just_exited
+                && let session::SessionLifecycle::Exited { exit_code } = active.lifecycle()
+            {
+                events.push(RuntimeEvent::SessionExited {
+                    session: active.id(),
+                    exit_code,
+                });
             }
         }
-        if active.dirty
-            && let Some(snapshot) = active.backend.viewport_snapshot()
-        {
-            let event = RuntimeEvent::Viewport {
-                session: active.id,
-                snapshot: Arc::new(snapshot),
-                bracketed_paste: active.backend.bracketed_paste(),
-            };
-            active.dirty = false;
+        for event in events {
             self.emit(event);
-        }
-        // EOF: 프로세스만 정리하고 backend는 유지 — 종료 후 scrollback 열람 가능
-        if eof && let Some(active) = &mut self.session {
-            let exit_code = active
-                .pty
-                .take()
-                .and_then(|mut pty| pty.try_exit_code().unwrap_or(None));
-            let id = active.id;
-            self.emit(RuntimeEvent::SessionExited {
-                session: id,
-                exit_code,
-            });
         }
     }
 }
@@ -313,6 +254,7 @@ mod tests {
         CommandSpec {
             program: program.into(),
             args: args.iter().map(|s| (*s).into()).collect(),
+            env: Vec::new(),
         }
     }
 
@@ -485,33 +427,46 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn 살아있는_세션_위에_spawn하면_교체() {
+    fn 다중_세션_동시_생존과_독립_입출력() {
         let client = InProcessRuntimeClient::with_shell(5, spec("/bin/cat", &[]));
         let mut probe = Probe::new(client.subscribe());
-        client
-            .send_command(RuntimeCommand::SpawnShell {
-                cols: 80,
-                rows: 24,
-                scrollback_lines: 100,
-            })
-            .unwrap();
-        let first = probe.wait_for(Duration::from_secs(5), |e| match e {
-            RuntimeEvent::ShellSpawned { session } => Some(*session),
-            _ => None,
-        });
-        // kill 없이 재spawn → 기존 세션(cat)은 Drop으로 정리되고 새 id 발급
-        client
-            .send_command(RuntimeCommand::SpawnShell {
-                cols: 80,
-                rows: 24,
-                scrollback_lines: 100,
-            })
-            .unwrap();
-        let second = probe.wait_for(Duration::from_secs(5), |e| match e {
-            RuntimeEvent::ShellSpawned { session } if *session != first => Some(*session),
-            _ => None,
-        });
-        assert_ne!(first, second);
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            client
+                .send_command(RuntimeCommand::SpawnShell {
+                    cols: 80,
+                    rows: 24,
+                    scrollback_lines: 100,
+                })
+                .unwrap();
+            let known = ids.clone();
+            let id = probe.wait_for(Duration::from_secs(5), move |e| match e {
+                RuntimeEvent::ShellSpawned { session } if !known.contains(session) => {
+                    Some(*session)
+                }
+                _ => None,
+            });
+            ids.push(id);
+        }
+        // 각 세션에 서로 다른 입력 → 각자의 Viewport에만 반영 (독립성)
+        for (i, id) in ids.iter().enumerate() {
+            client
+                .send_command(RuntimeCommand::WriteInput {
+                    session: *id,
+                    bytes: format!("mark-{i}\r").into_bytes(),
+                })
+                .unwrap();
+        }
+        for (i, id) in ids.iter().enumerate() {
+            let expect = format!("mark-{i}");
+            let id = *id;
+            probe.wait_for(Duration::from_secs(5), move |e| match e {
+                RuntimeEvent::Viewport {
+                    session, snapshot, ..
+                } if *session == id && snapshot_text(snapshot, 0).contains(&expect) => Some(()),
+                _ => None,
+            });
+        }
     }
 
     #[test]

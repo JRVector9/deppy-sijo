@@ -2959,6 +2959,7 @@ dependencies = [
  "anyhow",
  "deppy-core",
  "pty",
+ "session",
  "terminal",
  "tracing",
 ]
@@ -3170,6 +3171,17 @@ dependencies = [
  "cfg-if",
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "session"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "deppy-core",
+ "pty",
+ "terminal",
+ "tracing",
 ]
 
 [[package]]

@@ -260,7 +260,15 @@ impl ShellUi {
                 code.map_or("알 수 없음".into(), |c| c.to_string())
             ));
             if ui.button("다시 시작").clicked() {
-                self.view = None;
+                // 다중 세션 runtime — 종료된 세션도 명시적으로 정리해야 한다
+                if let Some(view) = self.view.take() {
+                    self.send(
+                        client,
+                        RuntimeCommand::KillSession {
+                            session: view.session,
+                        },
+                    );
+                }
                 self.send(
                     client,
                     RuntimeCommand::SpawnShell {

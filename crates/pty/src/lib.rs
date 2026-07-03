@@ -7,9 +7,12 @@ use std::sync::mpsc::{Receiver, sync_channel};
 use anyhow::Context;
 
 /// 실행할 프로그램. portable-pty CommandBuilder를 노출하지 않기 위한 최소 스펙.
+/// env 값에 secret 평문이 올 수 있다 — 절대 로그에 찍지 말 것 (Debug 미구현 이유).
 pub struct CommandSpec {
     pub program: String,
     pub args: Vec<String>,
+    /// 추가 환경변수 (상속 env 위에 덮어쓴다)
+    pub env: Vec<(String, String)>,
 }
 
 /// 플랫폼 기본 셸 (설계문서 PR-04: macOS zsh / Windows PowerShell).
@@ -21,6 +24,7 @@ pub fn default_shell() -> CommandSpec {
     CommandSpec {
         program,
         args: Vec::new(),
+        env: Vec::new(),
     }
 }
 
@@ -70,6 +74,9 @@ impl PtyBackend for PortablePtyBackend {
             .context("PTY 생성 실패")?;
         let mut builder = portable_pty::CommandBuilder::new(&cmd.program);
         builder.args(&cmd.args);
+        for (key, value) in &cmd.env {
+            builder.env(key, value);
+        }
         let child = pair
             .slave
             .spawn_command(builder)
@@ -169,6 +176,7 @@ mod tests {
                 &CommandSpec {
                     program: program.into(),
                     args: args.iter().map(|s| (*s).into()).collect(),
+                    env: Vec::new(),
                 },
                 80,
                 24,

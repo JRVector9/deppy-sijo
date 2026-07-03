@@ -13,7 +13,11 @@ pub struct Db {
 
 /// user_version 기반 forward-only 마이그레이션 (설계문서 11.9).
 /// 1: credentials (PR-02), 2: workspaces + env_profiles/env_vars (PR-03, 11.0/11.6),
-/// 3: agent_configs (PR-09, 11.0 — *_regex 컬럼은 PR-12 status detector가 소비)
+/// 3: agent_configs (PR-09, 11.0 — *_regex 컬럼은 PR-12 status detector가 소비),
+/// 4: sessions + mux_* (PR-14, persist crate DDL),
+/// 5: mcp_servers + mcp_tools (PR-15, mcp crate DDL),
+/// 6: tool_audit_logs (PR-16, audit crate DDL).
+/// 4~6은 각 crate가 소유한 DDL 상수를 그대로 붙인다 (스키마 정의는 한 곳에서만).
 const MIGRATIONS: &[&str] = &[
     "
 CREATE TABLE credentials (
@@ -84,6 +88,9 @@ CREATE TABLE agent_configs (
     updated_at TEXT NOT NULL
 );
 ",
+    persist::MIGRATION_SQL,
+    mcp::MIGRATION_SQL,
+    audit::MIGRATION_SQL,
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -248,6 +255,13 @@ impl Db {
             [&id],
         )?;
         Ok(id)
+    }
+
+    /// 앱 시작 시 crash recovery (설계문서 PR-14): 이전 실행이 남긴 세션 중
+    /// exited가 아닌 것을 모두 Exited로 마킹한다 — 재시작 후엔 그 프로세스가
+    /// 반드시 orphan(죽음)이기 때문. 반영된 행 수를 돌려준다.
+    pub fn reconcile_orphan_sessions(&self) -> anyhow::Result<usize> {
+        persist::reconcile_orphan_sessions(&self.conn)
     }
 
     /// env profile 생성. is_production은 kind에서 파생한다 (설계문서 6.4).

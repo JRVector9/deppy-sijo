@@ -1,68 +1,69 @@
 //! Crash recovery (PR-14 완료 기준): lock file 중복 실행 방지 /
 //! orphan session reconcile / log offset partial-write 보정.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
+use fs2::FileExt;
 use rusqlite::Connection;
 
 use crate::repo::SESSION_STATUS_EXITED;
 
-/// 중복 실행 방지 lock (PID file). 획득하면 파일에 이 프로세스의 PID가 기록되고
-/// drop 시 파일이 지워진다. 죽은 PID가 남긴 stale lock은 회수한다.
+/// 중복 실행 방지 lock (OS advisory file lock — unix flock / windows LockFileEx).
+/// 살아있는 동안 파일에 배타적 lock을 걸고, 진단용으로 PID를 기록한다.
 ///
-/// 한계: PID file 방식이라 stale 판정(read)과 제거(remove) 사이에 짧은 경쟁 창이 있다.
-/// create_new 재시도로 창을 좁히며, PID 재사용으로 무관한 프로세스가 그 PID를 쓰고
-/// 있으면 실행 중으로 오판할 수 있다 (보수적 — 중복 실행 방지 우선).
+/// PID file 방식과 달리 **크래시/강제 종료 시 OS가 lock을 자동 해제**하므로
+/// stale lock이 남지 않는다 (플랫폼 무관 — Windows 포함). PID 재사용 오판도 없다.
+/// lock 파일 자체는 재사용을 위해 남겨 두고, 획득 여부는 advisory lock으로만 판정한다.
 pub struct LockFile {
     path: PathBuf,
+    // File을 살려 두는 동안 advisory lock이 유지된다. drop되면 OS가 해제.
+    _file: File,
 }
 
 impl LockFile {
     pub fn acquire(path: &Path) -> anyhow::Result<Self> {
-        for _ in 0..3 {
-            match OpenOptions::new().write(true).create_new(true).open(path) {
-                Ok(mut file) => {
-                    file.write_all(std::process::id().to_string().as_bytes())
-                        .and_then(|()| file.sync_all())
-                        .with_context(|| format!("lock PID 기록 실패: {}", path.display()))?;
-                    return Ok(Self {
-                        path: path.to_path_buf(),
-                    });
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .with_context(|| format!("lock 파일 열기 실패: {}", path.display()))?;
+
+        // 비블로킹 배타 lock 시도. 이미 살아있는 인스턴스가 쥐고 있으면 WouldBlock.
+        match file.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                // 진단용으로 기존 holder PID를 읽어 메시지에 싣는다 (판정에는 안 쓴다)
+                let holder = fs::read_to_string(path).unwrap_or_default();
+                let holder = holder.trim();
+                if holder.is_empty() {
+                    bail!("이미 실행 중입니다 (lock: {})", path.display());
                 }
-                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                    let holder = fs::read_to_string(path).unwrap_or_default();
-                    match holder.trim().parse::<u32>() {
-                        // pid 0은 유효한 holder가 아니다 (unix kill(0,·)은 프로세스
-                        // 그룹 검사라 항상 성공 — 오판 방지 위해 stale로 취급)
-                        Ok(pid) if pid != 0 && pid_alive(pid) => {
-                            bail!("이미 실행 중입니다 (pid {pid}, lock: {})", path.display());
-                        }
-                        // 죽은 PID거나 파싱 불가(쓰다 만 파일) → stale, 회수 후 재시도
-                        _ => {
-                            tracing::warn!(lock = %path.display(), "stale lock 회수");
-                            match fs::remove_file(path) {
-                                Ok(()) => {}
-                                // 다른 프로세스가 먼저 회수 — 재시도에서 판가름
-                                Err(e) if e.kind() == ErrorKind::NotFound => {}
-                                Err(e) => {
-                                    return Err(e).with_context(|| {
-                                        format!("stale lock 제거 실패: {}", path.display())
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    return Err(e)
-                        .with_context(|| format!("lock 파일 생성 실패: {}", path.display()));
-                }
+                bail!(
+                    "이미 실행 중입니다 (pid {holder}, lock: {})",
+                    path.display()
+                );
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("lock 획득 실패: {}", path.display()));
             }
         }
-        bail!("lock 획득 재시도 초과: {}", path.display())
+
+        // 획득 성공 — 진단용 PID 기록 (이전 내용 덮어쓰기)
+        file.set_len(0)
+            .and_then(|()| file.seek(SeekFrom::Start(0)))
+            .and_then(|_| file.write_all(std::process::id().to_string().as_bytes()))
+            .and_then(|()| file.flush())
+            .with_context(|| format!("lock PID 기록 실패: {}", path.display()))?;
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            _file: file,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -72,26 +73,14 @@ impl LockFile {
 
 impl Drop for LockFile {
     fn drop(&mut self) {
-        if let Err(e) = fs::remove_file(&self.path) {
-            tracing::warn!(lock = %self.path.display(), "lock 해제 실패: {e}");
+        // advisory lock은 _file drop 시 OS가 해제한다. 파일은 best-effort로 지운다
+        // (남아 있어도 다음 실행이 lock을 다시 걸 수 있으므로 무해).
+        if let Err(e) = fs::remove_file(&self.path)
+            && e.kind() != ErrorKind::NotFound
+        {
+            tracing::warn!(lock = %self.path.display(), "lock 파일 제거 실패: {e}");
         }
     }
-}
-
-#[cfg(unix)]
-fn pid_alive(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false; // pid_t 범위 밖 — 실존할 수 없는 PID
-    };
-    // signal 0: 시그널을 보내지 않고 존재만 검사. EPERM은 존재하지만 권한 없음 → 살아있음
-    (unsafe { libc::kill(pid, 0) } == 0)
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(not(unix))]
-fn pid_alive(_pid: u32) -> bool {
-    // 비-unix에는 판별 수단을 넣지 않았다 — 중복 실행 방지를 우선해 살아있다고 간주
-    true
 }
 
 /// 앱 시작 시 orphan reconcile: exited가 아닌 status(running / waiting /
@@ -189,28 +178,24 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
-    fn stale_lock은_회수한다() {
+    fn stale_lock은_내용과_무관하게_재획득() {
+        // advisory lock 방식: 이전 실행이 남긴 lock 파일은 (그 프로세스가 죽어
+        // OS가 lock을 해제했으므로) 내용과 무관하게 즉시 다시 잡힌다 — 크래시로
+        // 남은 오래된 PID/쓰다 만 파일 모두 정상 회수. Windows 포함 전 플랫폼 동일.
         let dir = temp_dir("stale");
         let path = dir.join("app.lock");
 
-        // 죽은 PID (pid 상한을 훨씬 넘는 값 — linux pid_max 최대 2^22)
-        std::fs::write(&path, "2147000000").unwrap();
-        let lock = LockFile::acquire(&path).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            std::process::id().to_string()
-        );
-        drop(lock);
-
-        // 쓰다 만(파싱 불가) lock도 stale로 회수
-        std::fs::write(&path, "garbage").unwrap();
-        drop(LockFile::acquire(&path).unwrap());
-
-        // pid 0도 stale (kill(0,·)은 프로세스 그룹 검사라 생존 판정에 못 쓴다)
-        std::fs::write(&path, "0").unwrap();
-        drop(LockFile::acquire(&path).unwrap());
+        for leftover in ["2147000000", "garbage", "0", ""] {
+            std::fs::write(&path, leftover).unwrap();
+            let lock = LockFile::acquire(&path).unwrap();
+            // 획득하면 이 프로세스 PID로 갱신된다
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                std::process::id().to_string()
+            );
+            drop(lock);
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -89,4 +89,10 @@ CREATE TABLE mux_panes (
     FOREIGN KEY(tab_id) REFERENCES mux_tabs(id),
     FOREIGN KEY(session_id) REFERENCES sessions(id)
 );
+
+-- 복원 쿼리용 인덱스 (설계문서 §11.8)
+CREATE INDEX idx_sessions_workspace_id ON sessions(workspace_id);
+CREATE INDEX idx_mux_windows_workspace_id ON mux_windows(workspace_id);
+CREATE INDEX idx_mux_tabs_window_id ON mux_tabs(window_id);
+CREATE INDEX idx_mux_panes_session_id ON mux_panes(session_id);
 ";

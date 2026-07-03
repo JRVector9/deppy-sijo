@@ -16,7 +16,6 @@ rusqlite = { workspace = true }
 uuid = { workspace = true }
 deppy-core = { path = "../core" }
 mux = { path = "../mux" }
-
-# lock file의 PID 생존 검사 (kill signal 0)
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
+# OS advisory file lock — 크래시 시 OS가 자동 해제하므로 stale lock이 남지 않는다
+# (unix flock / windows LockFileEx). 모든 플랫폼 공통 동작.
+fs2 = "0.4"

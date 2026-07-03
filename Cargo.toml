@@ -1,7 +1,7 @@
 # v2.5 설계문서 1.8 확정 버전 기준. patch는 Cargo.lock으로 고정.
 [workspace]
 resolver = "3"
-members = ["crates/app", "crates/pty"]
+members = ["crates/app", "crates/pty", "crates/terminal"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,6 +20,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 rusqlite = { version = "0.40", features = ["bundled"] }
 portable-pty = "0.9"
+alacritty_terminal = "0.26"
 keyring-core = "1"
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
 windows-native-keyring-store = "1"

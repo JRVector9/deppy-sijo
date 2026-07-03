@@ -58,7 +58,7 @@ impl eframe::App for App {
             .show(ui.ctx(), &self.db, &self.secret_store);
         self.env_profiles_ui
             .show(ui.ctx(), &mut self.db, &self.workspace_id);
-        self.shell_ui.show(ui.ctx());
+        self.shell_ui.show(ui.ctx(), &self.config.terminal);
 
         let changed = ui::settings::show(ui.ctx(), &mut self.settings_open, &mut self.config);
         if changed {

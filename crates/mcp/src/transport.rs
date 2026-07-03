@@ -256,11 +256,12 @@ impl StdioClient {
                     bail!("{method} 응답 timeout ({:?})", self.request_timeout);
                 }
                 Err(RecvTimeoutError::Disconnected) => {
-                    let status = self.child.try_wait().ok().flatten();
-                    if status.is_some() {
-                        // reap 완료 — PID가 재사용될 수 있으므로 Drop에서 kill 금지
-                        self.reaped = true;
-                    }
+                    // stdout이 닫혔다 — 서버가 죽었거나 죽어가는 중. 이 자리에서
+                    // 그룹까지 정리한다. 순서가 핵심: killpg → reap.
+                    // reap 전(zombie) PID는 커널이 재사용하지 않으므로 killpg가 안전하고,
+                    // wrapper가 남긴 grandchild도 그룹 정리로 함께 끝난다 (codex 리뷰 2건 동시 해소)
+                    let status = kill_and_reap(&mut self.child);
+                    self.reaped = true;
                     bail!("MCP 서버가 {method} 응답 전에 종료됨 (exit: {status:?})");
                 }
             }
@@ -281,7 +282,10 @@ impl Drop for StdioClient {
 
 /// 서버 process group 전체를 SIGKILL 후 direct child를 reap한다.
 /// spawn에서 process_group(0)으로 분리했으므로 pgid == child pid.
-fn kill_and_reap(child: &mut Child) {
+/// killpg(그룹 정리) → kill → wait(reap) 순서 고정. reap 전에는 PID가
+/// 재사용되지 않으므로 이 순서에서만 killpg가 안전하다 — 호출측은 reap 이후
+/// (reaped=true) 다시 부르면 안 된다. wait 결과(exit status)를 돌려준다.
+fn kill_and_reap(child: &mut Child) -> Option<std::process::ExitStatus> {
     #[cfg(unix)]
     unsafe {
         libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
@@ -295,7 +299,7 @@ fn kill_and_reap(child: &mut Child) {
             .output();
     }
     let _ = child.kill();
-    let _ = child.wait(); // zombie 방지 reap
+    child.wait().ok() // zombie 방지 reap
 }
 
 /// response에서 result를 꺼낸다. error response는 에러로 변환.

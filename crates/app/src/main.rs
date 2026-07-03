@@ -35,8 +35,9 @@ fn main() -> anyhow::Result<()> {
     if reconciled > 0 {
         tracing::info!("이전 실행의 orphan 세션 {reconciled}건 Exited 처리");
     }
-    // 세션 로그 루트 (설계문서 7장: logs/<workspace_id>/<session_id>/)
-    let logs_root = paths.data_dir.join("logs").join(&workspace_id);
+    // 세션 로그 베이스 (설계문서 7장: logs/<workspace_id>/<session_id>/) —
+    // workspace별 하위 디렉터리는 App이 workspace_id로 만든다 (전환 지원).
+    let logs_base = paths.data_dir.join("logs");
     tracing::info!(
         config_dir = %paths.config_dir.display(),
         data_dir = %paths.data_dir.display(),
@@ -56,7 +57,7 @@ fn main() -> anyhow::Result<()> {
                 config_path,
                 db,
                 workspace_id,
-                logs_root,
+                logs_base,
                 db_path,
                 cc.egui_ctx.clone(),
             )))

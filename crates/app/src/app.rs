@@ -33,66 +33,41 @@ pub struct App {
     /// 세션→제목 캐시 (MuxUpdated에서 누적) — Warm 동안 mux가 안 갱신돼도 알림 제목을
     /// 해석하기 위함. exit 처리 후 제거해 live 세션으로 유계.
     session_titles: std::collections::HashMap<runtime::SessionId, String>,
+    // multi-workspace (Track 2): 활성 workspace 하나만 런타임 보유 — 전환 시 현재 워커를
+    // shutdown하고 대상 워커를 새로 만든다. 비활성 workspace는 DB metadata만(§14.1
+    // Suspended/Closed). Warm(비활성 계속 실행)은 워커-per-workspace 필요 — 후속.
+    egui_ctx: egui::Context,
+    db_path: PathBuf,
+    logs_base: PathBuf,
+    redaction: secret::RedactionService,
+    workspaces: Vec<crate::storage::WorkspaceRow>,
+    workspaces_open: bool,
+    new_workspace_name: String,
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
         config_path: PathBuf,
         db: Db,
         workspace_id: String,
-        logs_root: PathBuf,
+        logs_base: PathBuf,
         db_path: PathBuf,
         egui_ctx: egui::Context,
     ) -> Self {
         // output_batch_ms는 시작 시 고정, scrollback_lines는 세션 spawn 시점에 전달
         let redaction = secret::RedactionService::new();
-        let runtime = InProcessRuntimeClient::new(
-            config.performance.output_batch_ms,
-            Arc::new(KeyringSecretStore),
-            logs_root,
-            redaction.clone(),
-            // 세션/mux 영속 파이프라인 (runtime↔persist 배선)
-            Some(runtime::PersistConfig {
-                db_path,
-                workspace_id: workspace_id.clone(),
-            }),
+        let (runtime, runtime_events) = Self::make_runtime(
+            &config,
+            &logs_base,
+            &workspace_id,
+            &db_path,
+            &redaction,
+            &db,
+            &egui_ctx,
         );
-        // 상태 이벤트 도착 시 UI를 깨운다 — 창이 숨겨져(Warm) 프레임이 멈춰도
-        // logic()이 돌아 알림/상태를 처리하도록 (§14.1). egui Context는 스레드 안전.
-        let runtime_events = runtime.subscribe_with_wake(std::sync::Arc::new({
-            let ctx = egui_ctx.clone();
-            move || ctx.request_repaint()
-        }));
-        // 이전 실행의 mux layout 복원 (PR-14) — subscribe 직후 1회 보내
-        // subscribe→restore 순서와 "빈 상태" 전제를 코드로 보장한다. perf 하네스가
-        // 세션을 만들기 전에 보내야 worker가 복원을 skip하지 않는다.
-        if let Err(e) = runtime.send_command(runtime::RuntimeCommand::RestoreWorkspace) {
-            tracing::warn!("workspace 복원 명령 전송 실패: {e:#}");
-        }
-        // 이전 실행에서 저장한 credential도 로그 redaction 대상으로 시드
-        // (값 resolve는 worker에서 — UI는 metadata의 id만 읽는다)
-        match db.list_credentials() {
-            Ok(credentials) => {
-                let mut ids: Vec<String> = Vec::with_capacity(credentials.len());
-                for c in credentials {
-                    // OAuth credential은 refresh token entry도 redaction 대상 (PR-18)
-                    if c.credential_kind == "oauth_token" {
-                        ids.push(auth::refresh_entry_id(&c.id));
-                    }
-                    ids.push(c.id);
-                }
-                if !ids.is_empty()
-                    && let Err(e) = runtime.send_command(runtime::RuntimeCommand::SeedRedaction {
-                        credential_ids: ids,
-                    })
-                {
-                    tracing::warn!("redaction 시드 전송 실패: {e:#}");
-                }
-            }
-            Err(e) => tracing::warn!("credential 목록 조회 실패 (redaction 시드 생략): {e:#}"),
-        }
-        // PR-21 부하 하네스 (env로만 활성): hidden 10개 시나리오 자동 구성
+        // PR-21 부하 하네스 (env로만 활성): hidden 10개 시나리오 자동 구성 (기본 workspace만)
         if crate::perf::harness_enabled() {
             for i in 0..crate::perf::HARNESS_SESSIONS {
                 let (command, args) = crate::perf::harness_command(i);
@@ -122,7 +97,7 @@ impl App {
             secret_store: KeyringSecretStore,
             agents_ui: ui::agents::AgentsUi::new(),
             connectors_ui: ui::connectors::ConnectorsUi::new(redaction.clone()),
-            credentials_ui: ui::credentials::CredentialsUi::new(redaction),
+            credentials_ui: ui::credentials::CredentialsUi::new(redaction.clone()),
             env_profiles_ui: ui::env_profiles::EnvProfilesUi::new(),
             workspace_ui: ui::workspace::WorkspaceUi::new(),
             notifications_ui: ui::notifications::NotificationsUi::new(),
@@ -132,6 +107,166 @@ impl App {
             render_active: true,
             pending_events: Vec::new(),
             session_titles: std::collections::HashMap::new(),
+            egui_ctx,
+            db_path,
+            logs_base,
+            redaction,
+            workspaces: Vec::new(),
+            workspaces_open: false,
+            new_workspace_name: String::new(),
+        }
+    }
+
+    /// 한 workspace의 런타임 워커를 만든다: 생성 → wake 구독 → 저장 layout 복원 →
+    /// credential redaction 시드. (perf 하네스는 제외 — new()에서 기본 workspace만.)
+    #[allow(clippy::too_many_arguments)]
+    fn make_runtime(
+        config: &Config,
+        logs_base: &std::path::Path,
+        workspace_id: &str,
+        db_path: &std::path::Path,
+        redaction: &secret::RedactionService,
+        db: &Db,
+        egui_ctx: &egui::Context,
+    ) -> (InProcessRuntimeClient, RuntimeEventReceiver) {
+        // 세션 로그 루트: logs/<workspace_id>/ (설계문서 7장)
+        let logs_root = logs_base.join(workspace_id);
+        let runtime = InProcessRuntimeClient::new(
+            config.performance.output_batch_ms,
+            Arc::new(KeyringSecretStore),
+            logs_root,
+            redaction.clone(),
+            Some(runtime::PersistConfig {
+                db_path: db_path.to_path_buf(),
+                workspace_id: workspace_id.to_owned(),
+            }),
+        );
+        // 상태 이벤트 도착 시 UI를 깨운다 (§14.1 Warm 알림 유지). subscribe→restore 순서
+        // 를 코드로 보장하려 subscribe 직후 복원 명령을 보낸다.
+        let runtime_events = runtime.subscribe_with_wake(std::sync::Arc::new({
+            let ctx = egui_ctx.clone();
+            move || ctx.request_repaint()
+        }));
+        if let Err(e) = runtime.send_command(runtime::RuntimeCommand::RestoreWorkspace) {
+            tracing::warn!("workspace 복원 명령 전송 실패: {e:#}");
+        }
+        // 저장된 credential을 로그 redaction 대상으로 시드 (값 resolve는 worker에서)
+        match db.list_credentials() {
+            Ok(credentials) => {
+                let mut ids: Vec<String> = Vec::with_capacity(credentials.len());
+                for c in credentials {
+                    if c.credential_kind == "oauth_token" {
+                        ids.push(auth::refresh_entry_id(&c.id));
+                    }
+                    ids.push(c.id);
+                }
+                if !ids.is_empty()
+                    && let Err(e) = runtime.send_command(runtime::RuntimeCommand::SeedRedaction {
+                        credential_ids: ids,
+                    })
+                {
+                    tracing::warn!("redaction 시드 전송 실패: {e:#}");
+                }
+            }
+            Err(e) => tracing::warn!("credential 목록 조회 실패 (redaction 시드 생략): {e:#}"),
+        }
+        (runtime, runtime_events)
+    }
+
+    /// workspace 전환: 현재 워커를 shutdown(PTY reap 대기)한 뒤 대상 워커를 새로 만든다.
+    /// 비활성 workspace는 런타임을 갖지 않는다 (§14.1 Suspended/Closed — DB metadata만).
+    fn switch_workspace(&mut self, target_id: &str) {
+        if target_id == self.workspace_id {
+            return;
+        }
+        // 현재 워커 정리 — join까지 대기해 자식 프로세스 reap (on_exit과 동일)
+        self.runtime.shutdown();
+        // 옛 workspace의 세션은 워커가 죽어 더는 안 도므로 DB에서 exited로 정리한다.
+        // 새 워커 생성 '전에' 해야 새 워커가 spawn할 fresh 세션을 지우지 않는다 (codex 리뷰).
+        if let Err(e) = self.db.reconcile_orphan_sessions() {
+            tracing::warn!("workspace 전환 시 세션 reconcile 실패: {e:#}");
+        }
+        // 런타임에 묶인 pending 실행 상태 정리 (이전 워커의 응답을 못 받음) (codex 리뷰)
+        self.agents_ui.clear_pending();
+        let (runtime, runtime_events) = Self::make_runtime(
+            &self.config,
+            &self.logs_base,
+            target_id,
+            &self.db_path,
+            &self.redaction,
+            &self.db,
+            &self.egui_ctx,
+        );
+        self.runtime = runtime;
+        self.runtime_events = runtime_events;
+        self.workspace_id = target_id.to_owned();
+        // 워크스페이스별 UI 상태 초기화 (새 워커의 이벤트로 다시 채워진다)
+        self.workspace_ui = ui::workspace::WorkspaceUi::new();
+        self.notifications_ui = ui::notifications::NotificationsUi::new();
+        self.pending_events.clear();
+        self.session_titles.clear();
+        self.render_active = true;
+        self.egui_ctx.request_repaint();
+    }
+
+    fn refresh_workspaces(&mut self) {
+        match self.db.list_workspaces() {
+            Ok(list) => self.workspaces = list,
+            Err(e) => tracing::warn!("workspace 목록 조회 실패: {e:#}"),
+        }
+    }
+
+    /// 워크스페이스 목록 창: 전환/생성. 전환은 워커 shutdown+recreate라 창 closure 밖에서.
+    fn workspaces_window(&mut self, ctx: &egui::Context) {
+        if !self.workspaces_open {
+            return;
+        }
+        let mut open = true;
+        let mut switch_to: Option<String> = None;
+        let mut create = false;
+        egui::Window::new("워크스페이스")
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                for ws in &self.workspaces {
+                    ui.horizontal(|ui| {
+                        if ws.id == self.workspace_id {
+                            ui.strong(&ws.name);
+                            ui.weak("(현재)");
+                        } else {
+                            ui.label(&ws.name);
+                            if ui.button("전환").clicked() {
+                                switch_to = Some(ws.id.clone());
+                            }
+                        }
+                    });
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("새 워크스페이스");
+                    ui.text_edit_singleline(&mut self.new_workspace_name);
+                    if ui.button("생성").clicked() {
+                        create = true;
+                    }
+                });
+            });
+        self.workspaces_open = open;
+
+        if create {
+            let name = self.new_workspace_name.trim().to_owned();
+            if !name.is_empty() {
+                match self.db.create_workspace(&name) {
+                    Ok(id) => {
+                        self.new_workspace_name.clear();
+                        switch_to = Some(id); // 생성 후 바로 전환
+                    }
+                    Err(e) => tracing::warn!("workspace 생성 실패: {e:#}"),
+                }
+            }
+        }
+        if let Some(id) = switch_to {
+            self.switch_workspace(&id);
+            self.refresh_workspaces();
         }
     }
 
@@ -240,6 +375,12 @@ impl eframe::App for App {
                 if ui.button("에이전트").clicked() {
                     self.agents_ui.toggle();
                 }
+                if ui.button("워크스페이스").clicked() {
+                    self.workspaces_open = !self.workspaces_open;
+                    if self.workspaces_open {
+                        self.refresh_workspaces();
+                    }
+                }
                 let unread = self.notifications_ui.unread();
                 let label = if unread > 0 {
                     format!("알림 ({unread})")
@@ -253,6 +394,9 @@ impl eframe::App for App {
                 }
             });
         });
+
+        // 워크스페이스 전환/생성 (switch는 워커 shutdown+recreate라 window closure 밖에서)
+        self.workspaces_window(ui.ctx());
 
         // logic()이 drain해 쌓아둔 이벤트를 렌더에 소비한다 (알림은 logic()에서 이미 처리).
         // Warm 동안 쌓였다면 Active 복귀 시 여기서 몰아 처리된다.

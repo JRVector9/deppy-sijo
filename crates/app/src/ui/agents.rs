@@ -44,6 +44,13 @@ impl AgentsUi {
         }
     }
 
+    /// 런타임에 묶인 pending 실행 상태를 비운다 (workspace 전환으로 워커가 바뀔 때).
+    /// 안 하면 이전 워커의 AgentSpawned를 못 받아 pending_launches가 남아 50ms
+    /// repaint가 무한 예약된다 (codex 리뷰).
+    pub fn clear_pending(&mut self) {
+        self.pending_launches = 0;
+    }
+
     pub fn toggle(&mut self) {
         self.open = !self.open;
         if !self.open {

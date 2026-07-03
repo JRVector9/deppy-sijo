@@ -29,7 +29,8 @@ impl RedactionService {
         Self::default()
     }
 
-    /// secret과 그 변형(base64, URL-encoded, JSON-escaped)을 등록한다 (설계문서 7장).
+    /// secret과 그 변형(base64, URL-encoded/form-encoded, JSON-escaped)을
+    /// 등록한다 (설계문서 7장, corpus는 PR-22에서 확장).
     pub fn register(&self, secret: &SecretString) {
         let plain = secret.expose().as_bytes();
         if plain.len() < MIN_SECRET_LEN {
@@ -41,7 +42,22 @@ impl RedactionService {
             url_encode(plain, false).into_bytes(),
             url_encode(plain, true).into_bytes(), // 소문자 %xx 인코더 대응
             json_escape(secret.expose()).into_bytes(),
+            // \uXXXX 스타일 직렬화 대응 — hex 대·소문자 각각 (codex 리뷰)
+            json_escape_unicode(secret.expose(), false).into_bytes(),
+            json_escape_unicode(secret.expose(), true).into_bytes(),
         ];
+        // 스페이스를 +로 쓰는 form 인코더 대응. 방언마다 safe set이 다르다 —
+        // URLSearchParams(*safe/~enc), python·go quote_plus(~safe/*enc) 등 —
+        // 조합 전부를 등록한다 (dedup으로 실제 다른 것만 남는다. codex 리뷰 2건)
+        for tilde_safe in [false, true] {
+            for star_safe in [false, true] {
+                for lowercase in [false, true] {
+                    variants
+                        .push(form_encode(plain, lowercase, tilde_safe, star_safe).into_bytes());
+                }
+            }
+        }
+        variants.sort();
         variants.dedup();
         let mut patterns = self.inner.lock().expect("redaction patterns lock");
         for variant in variants.drain(..) {
@@ -292,6 +308,48 @@ fn url_encode(input: &[u8], lowercase: bool) -> String {
     out
 }
 
+/// application/x-www-form-urlencoded: 스페이스는 +. `~`/`*`의 safe 여부는
+/// 인코더 방언마다 다르므로(URLSearchParams vs quote_plus 등) 파라미터로 받아
+/// 조합 전부를 변형으로 만든다.
+fn form_encode(input: &[u8], lowercase: bool, tilde_safe: bool, star_safe: bool) -> String {
+    let mut out = String::with_capacity(input.len());
+    for &byte in input {
+        match byte {
+            b' ' => out.push('+'),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => out.push(byte as char),
+            b'~' if tilde_safe => out.push('~'),
+            b'*' if star_safe => out.push('*'),
+            _ if lowercase => out.push_str(&format!("%{byte:02x}")),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// 모든 비 ASCII-인쇄 문자를 \uXXXX로 쓰는 JSON 직렬화 스타일
+/// (일부 직렬화기는 ASCII-safe 모드로 이렇게 쓴다 — PR-18 리뷰 이연분).
+/// hex 대·소문자 표기가 모두 유효하므로 양쪽 변형을 만든다.
+fn json_escape_unicode(input: &str, uppercase: bool) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 || (c as u32) > 0x7e => {
+                for unit in c.encode_utf16(&mut [0u16; 2]) {
+                    if uppercase {
+                        out.push_str(&format!("\\u{unit:04X}"));
+                    } else {
+                        out.push_str(&format!("\\u{unit:04x}"));
+                    }
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn json_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for c in input.chars() {
@@ -324,6 +382,82 @@ mod tests {
         }
         out.extend(redactor.flush());
         out
+    }
+
+    /// PR-22 완료 기준: redaction corpus — 각 변형에 대한 fixture.
+    /// secret "pa ss+wörd\"x" 하나를 등록하고, 7장에서 요구하는 변형 각각이
+    /// 스트림에서 지워지는지 fixture 단위로 확인한다.
+    #[test]
+    fn redaction_corpus_변형_fixture() {
+        const SECRET: &str = "pa ss+w\u{00f6}rd\"x"; // 스페이스/+/비ASCII/따옴표 포함
+        let service = RedactionService::new();
+        service.register(&SecretString::new(SECRET.to_owned()));
+
+        let fixtures: Vec<(&str, Vec<u8>)> = vec![
+            ("plain", SECRET.as_bytes().to_vec()),
+            ("base64", base64_encode(SECRET.as_bytes()).into_bytes()),
+            (
+                "url-encoded 대문자",
+                url_encode(SECRET.as_bytes(), false).into_bytes(),
+            ),
+            (
+                "url-encoded 소문자",
+                url_encode(SECRET.as_bytes(), true).into_bytes(),
+            ),
+            (
+                "form-encoded URLSearchParams식 (+, *safe/~enc)",
+                form_encode(SECRET.as_bytes(), false, false, true).into_bytes(),
+            ),
+            (
+                "form-encoded quote_plus식 (+, ~safe/*enc, %xx)",
+                form_encode(SECRET.as_bytes(), true, true, false).into_bytes(),
+            ),
+            ("json-escaped", json_escape(SECRET).into_bytes()),
+            (
+                "json \\uxxxx",
+                json_escape_unicode(SECRET, false).into_bytes(),
+            ),
+            (
+                "json \\uXXXX",
+                json_escape_unicode(SECRET, true).into_bytes(),
+            ),
+        ];
+        for (name, encoded) in &fixtures {
+            // 한 덩어리
+            let mut r = service.stream_redactor();
+            let mut input = b"pre ".to_vec();
+            input.extend_from_slice(encoded);
+            input.extend_from_slice(b" post\n");
+            let out = redact_all(&mut r, &[&input]);
+            assert_eq!(out, b"pre [REDACTED] post\n", "fixture 실패: {name}");
+
+            // chunk 경계 분할 (변형 중간에서 쪼갬)
+            let mid = encoded.len() / 2;
+            let mut first = b"pre ".to_vec();
+            first.extend_from_slice(&encoded[..mid]);
+            let mut second = encoded[mid..].to_vec();
+            second.extend_from_slice(b" post\n");
+            let mut r = service.stream_redactor();
+            let out = redact_all(&mut r, &[&first, &second]);
+            assert_eq!(
+                out, b"pre [REDACTED] post\n",
+                "chunk 분할 fixture 실패: {name}"
+            );
+
+            // ANSI escape 삽입 (변형 중간에 SGR)
+            let mut ansi = b"pre ".to_vec();
+            ansi.extend_from_slice(&encoded[..mid]);
+            ansi.extend_from_slice(b"\x1b[31m");
+            ansi.extend_from_slice(&encoded[mid..]);
+            ansi.extend_from_slice(b" post\n");
+            let mut r = service.stream_redactor();
+            let out = redact_all(&mut r, &[&ansi]);
+            let text = String::from_utf8_lossy(&out);
+            assert!(
+                !text.contains("ss+w") && text.contains("[REDACTED]"),
+                "ANSI 삽입 fixture 실패: {name} → {text:?}"
+            );
+        }
     }
 
     #[test]

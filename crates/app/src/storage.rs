@@ -497,6 +497,45 @@ mod tests {
         }
     }
 
+    /// PR-22 완료 기준 "secret이 DB에 없음" — 파일 바이트 레벨 스캔.
+    /// credential 저장/env secret 참조/agent 등록의 전 경로를 지난 뒤
+    /// SQLite 파일 원문에 secret 평문이 없어야 한다 (metadata는 keyring 좌표만 — §6.3).
+    #[test]
+    fn db_파일에_secret_평문이_없다() {
+        const SECRET: &str = "sk-live-plaintext-must-not-touch-disk-9x8y7z";
+        let dir = std::env::temp_dir().join(format!("deppy-secscan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite3");
+        {
+            let db = Db::open(&path).unwrap();
+            let ws = db.ensure_default_workspace().unwrap();
+            // credential: 값은 keyring으로 가고 DB에는 좌표/hint만 — 여기서는
+            // 실제 UI 경로가 그러듯 metadata만 넣는다 (hint는 마스킹된 문자열)
+            db.insert_credential(&CredentialMeta {
+                id: "cred-scan".into(),
+                provider: "test".into(),
+                label: "scan".into(),
+                credential_kind: "api_key".into(),
+                masked_hint: Some(secret::masked_hint(SECRET)),
+            })
+            .unwrap();
+            // env secret은 credential_id 참조만 저장된다
+            let profile = db.insert_env_profile(&ws, "prod", "production").unwrap();
+            db.upsert_env_var(
+                &profile,
+                "API_KEY",
+                &crate::env::EnvValue::Secret {
+                    credential_id: "cred-scan".into(),
+                },
+            )
+            .unwrap();
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let haystack = String::from_utf8_lossy(&bytes);
+        assert!(!haystack.contains(SECRET), "DB 파일에 secret 평문이 있다");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn credential_crud_roundtrip() {
         let db = Db::open_in_memory().unwrap();

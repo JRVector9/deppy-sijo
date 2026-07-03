@@ -1,6 +1,4 @@
-/// runtime 내부 세션 식별자. 영속 id(sessions 테이블)와의 매핑은 PR-08.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SessionId(pub u64);
+pub use deppy_core::SessionId;
 
 /// UI → Runtime 명령 (설계문서 2.1). v0은 단일 셸 세션에 필요한 것만.
 #[derive(Debug, Clone, PartialEq)]

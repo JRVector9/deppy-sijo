@@ -804,6 +804,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
+name = "deppy-core"
+version = "0.1.0"
+dependencies = [
+ "uuid",
+]
+
+[[package]]
 name = "deppy-sijo"
 version = "0.1.0"
 dependencies = [
@@ -2027,6 +2034,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mux"
+version = "0.1.0"
+dependencies = [
+ "deppy-core",
+]
+
+[[package]]
 name = "naga"
 version = "29.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2943,6 +2957,7 @@ name = "runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "deppy-core",
  "pty",
  "terminal",
  "tracing",

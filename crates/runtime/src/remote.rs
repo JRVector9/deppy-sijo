@@ -30,6 +30,8 @@ pub struct RemoteRuntimeServer {
     stop: Arc<AtomicBool>,
     accept_thread: Option<JoinHandle<()>>,
     backend: Arc<InProcessRuntimeClient>,
+    /// 현재 처리 중인 접속 — shutdown이 reader를 깨울 수 있게 보관
+    active_conn: Arc<Mutex<Option<TcpStream>>>,
 }
 
 impl RemoteRuntimeServer {
@@ -40,9 +42,11 @@ impl RemoteRuntimeServer {
         let addr = listener.local_addr()?;
         let backend = Arc::new(backend);
         let stop = Arc::new(AtomicBool::new(false));
+        let active_conn: Arc<Mutex<Option<TcpStream>>> = Arc::default();
 
         let accept_backend = Arc::clone(&backend);
         let accept_stop = Arc::clone(&stop);
+        let accept_conn = Arc::clone(&active_conn);
         let accept_thread = std::thread::Builder::new()
             .name("remote-accept".into())
             .spawn(move || {
@@ -52,8 +56,20 @@ impl RemoteRuntimeServer {
                     }
                     match stream {
                         Ok(stream) => {
-                            // 스켈레톤: 한 번에 한 클라이언트 — 접속이 끝날 때까지 처리
+                            // 스켈레톤: 한 번에 한 클라이언트 — 접속이 끝날 때까지 처리.
+                            // shutdown이 유휴 reader를 깨울 수 있게 소켓을 먼저 등록하고,
+                            // 등록 후 stop을 재확인한다 — shutdown이 등록 직전에 지나갔으면
+                            // 여기서 직접 닫는다 (등록/확인 순서로 race 창을 닫는다)
+                            if let Ok(conn) = stream.try_clone() {
+                                *accept_conn.lock().expect("active conn lock") = Some(conn);
+                            }
+                            if accept_stop.load(Ordering::SeqCst) {
+                                let _ = stream.shutdown(Shutdown::Both);
+                                accept_conn.lock().expect("active conn lock").take();
+                                break;
+                            }
                             serve_connection(stream, &accept_backend, &accept_stop);
+                            accept_conn.lock().expect("active conn lock").take();
                         }
                         Err(e) => {
                             tracing::warn!("remote accept 실패: {e}");
@@ -68,6 +84,7 @@ impl RemoteRuntimeServer {
             stop,
             accept_thread: Some(accept_thread),
             backend,
+            active_conn,
         })
     }
 
@@ -78,6 +95,10 @@ impl RemoteRuntimeServer {
     /// accept 루프를 멈추고 worker까지 동기 종료한다.
     pub fn shutdown(mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        // 유휴 접속의 reader를 깨운다 (소켓을 닫아 EOF) — 없으면 accept 대기 중
+        if let Some(conn) = self.active_conn.lock().expect("active conn lock").take() {
+            let _ = conn.shutdown(Shutdown::Both);
+        }
         // blocking accept를 깨운다
         let _ = TcpStream::connect(self.addr);
         if let Some(handle) = self.accept_thread.take() {
@@ -220,24 +241,28 @@ impl RemoteRuntimeClient {
     }
 }
 
-/// InProcess worker의 emit과 같은 분배 규칙: Viewport는 세션별 최신본 slot,
-/// 상태 이벤트는 채널 — RuntimeEventReceiver::drain의 happens-before 계약 유지.
+/// InProcess worker의 emit과 같은 분배·정리 규칙: Viewport는 세션별 최신본 slot,
+/// 상태 이벤트는 채널. receiver가 drop된 구독자는 제거한다 — slot 경로는
+/// Arc strong_count(receiver도 slot Arc를 쥔다), 채널 경로는 send 실패로 판별.
 fn dispatch(subscribers: &Arc<Mutex<Vec<RemoteSubscriber>>>, event: RuntimeEvent) {
-    let subscribers = subscribers.lock().expect("remote subscribers lock");
-    for subscriber in subscribers.iter() {
-        match &event {
-            RuntimeEvent::Viewport { session, .. } => {
+    subscribers
+        .lock()
+        .expect("remote subscribers lock")
+        .retain(|subscriber| {
+            if let RuntimeEvent::Viewport { session, .. } = &event {
+                if Arc::strong_count(&subscriber.viewports) <= 1 {
+                    return false;
+                }
                 subscriber
                     .viewports
                     .lock()
                     .expect("remote viewport slot lock")
                     .insert(*session, event.clone());
+                true
+            } else {
+                subscriber.events.send(event.clone()).is_ok()
             }
-            _ => {
-                let _ = subscriber.events.send(event.clone());
-            }
-        }
-    }
+        });
 }
 
 impl RuntimeCommandSink for RemoteRuntimeClient {
@@ -390,6 +415,28 @@ mod tests {
 
         drop(client);
         server.shutdown();
+    }
+
+    /// 유휴 클라이언트가 붙어 있어도 shutdown은 블록되지 않는다 (codex 리뷰 회귀).
+    #[test]
+    fn 접속_유지_중_shutdown() {
+        let server = RemoteRuntimeServer::serve(test_backend("idle-shutdown"), 0).unwrap();
+        let client = RemoteRuntimeClient::attach(server.local_addr()).unwrap();
+        // 접속이 accept돼 reader가 붙을 때까지 잠깐 대기
+        std::thread::sleep(Duration::from_millis(200));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&done);
+        let handle = std::thread::spawn(move || {
+            server.shutdown();
+            flag.store(true, Ordering::SeqCst);
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "shutdown이 유휴 접속에 블록됨");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        handle.join().unwrap();
+        drop(client);
     }
 
     /// 프로토콜 위반(비-JSON 라인)은 접속 종료로 이어진다.

@@ -1,4 +1,5 @@
-pub use deppy_core::SessionId;
+pub use deppy_core::{MuxPaneId, MuxTabId, SessionId};
+pub use mux::SplitDirection;
 
 /// UI → Runtime 명령 (설계문서 2.1). v0은 단일 셸 세션에 필요한 것만.
 #[derive(Debug, Clone, PartialEq)]
@@ -37,5 +38,25 @@ pub enum RuntimeCommand {
     },
     KillSession {
         session: SessionId,
+    },
+    /// focused pane을 분할하고 새 셸 세션을 attach한다 (PR-10)
+    SplitPane {
+        pane: MuxPaneId,
+        direction: SplitDirection,
+        scrollback_lines: usize,
+    },
+    /// pane을 닫는다 — 세션 kill 포함. 마지막 pane이면 tab도 닫힌다
+    ClosePane {
+        pane: MuxPaneId,
+    },
+    CloseTab {
+        tab: MuxTabId,
+    },
+    SelectTab {
+        tab: MuxTabId,
+    },
+    /// active pane 변경 — Viewport push 대상(14.4)이 바뀐다
+    FocusPane {
+        pane: MuxPaneId,
     },
 }

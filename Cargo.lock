@@ -2964,6 +2964,7 @@ dependencies = [
  "anyhow",
  "deppy-core",
  "keyring-core",
+ "mux",
  "pty",
  "secret",
  "session",

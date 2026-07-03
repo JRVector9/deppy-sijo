@@ -8,6 +8,7 @@ license.workspace = true
 anyhow = { workspace = true }
 tracing = { workspace = true }
 deppy-core = { path = "../core" }
+mux = { path = "../mux" }
 pty = { path = "../pty" }
 secret = { path = "../secret" }
 session = { path = "../session" }

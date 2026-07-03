@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use terminal::TerminalViewportSnapshot;
 
+use mux::MuxSnapshot;
+
 use crate::command::SessionId;
 
 /// SpawnFailed의 출처 구분 — 셸/에이전트 UI가 서로의 실패를 오귀속하지 않게 한다.
@@ -36,5 +38,9 @@ pub enum RuntimeEvent {
     SessionExited {
         session: SessionId,
         exit_code: Option<u32>,
+    },
+    /// mux 구조(tab/pane/layout/focus) 변경 — UI는 이걸로만 배치를 그린다
+    MuxUpdated {
+        snapshot: Arc<MuxSnapshot>,
     },
 }

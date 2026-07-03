@@ -5,6 +5,7 @@
 mod focus;
 mod layout_tree;
 mod pane;
+mod snapshot;
 mod tab;
 mod window;
 mod workspace;
@@ -12,6 +13,7 @@ mod workspace;
 pub use focus::FocusManager;
 pub use layout_tree::{LayoutNode, RemovePane, SplitDirection};
 pub use pane::{MuxPane, PaneKind};
+pub use snapshot::{MuxSnapshot, PaneSnapshot, TabSnapshot};
 pub use tab::{ClosePane, MuxTab};
 pub use window::MuxWindow;
 pub use workspace::MuxWorkspace;

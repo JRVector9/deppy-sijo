@@ -19,7 +19,7 @@ pub struct App {
     agents_ui: ui::agents::AgentsUi,
     credentials_ui: ui::credentials::CredentialsUi,
     env_profiles_ui: ui::env_profiles::EnvProfilesUi,
-    shell_ui: ui::shell::ShellUi,
+    workspace_ui: ui::workspace::WorkspaceUi,
     runtime: InProcessRuntimeClient,
     runtime_events: RuntimeEventReceiver,
 }
@@ -42,7 +42,7 @@ impl App {
             agents_ui: ui::agents::AgentsUi::new(),
             credentials_ui: ui::credentials::CredentialsUi::new(),
             env_profiles_ui: ui::env_profiles::EnvProfilesUi::new(),
-            shell_ui: ui::shell::ShellUi::new(),
+            workspace_ui: ui::workspace::WorkspaceUi::new(),
             runtime,
             runtime_events,
         }
@@ -71,21 +71,27 @@ impl eframe::App for App {
                 if ui.button("에이전트").clicked() {
                     self.agents_ui.toggle();
                 }
-                if ui.button("셸").clicked() {
-                    self.shell_ui.toggle(&self.runtime);
-                }
             });
         });
-        egui::CentralPanel::default().show(ui, |_ui| {});
 
-        self.agents_ui.show(ui.ctx(), &self.db);
+        // 이벤트는 한 번 drain해서 agents/workspace가 같은 슬라이스를 본다
+        let events = self.runtime_events.drain();
+        self.agents_ui.show(
+            ui.ctx(),
+            &self.db,
+            &self.workspace_id,
+            &self.config.terminal,
+            &self.runtime,
+            &events,
+        );
         self.credentials_ui
             .show(ui.ctx(), &self.db, &self.secret_store);
         self.env_profiles_ui
             .show(ui.ctx(), &mut self.db, &self.workspace_id);
-        let events = self.runtime_events.drain();
-        self.shell_ui
-            .show(ui.ctx(), &self.config.terminal, &self.runtime, &events);
+        egui::CentralPanel::default().show(ui, |ui| {
+            self.workspace_ui
+                .show(ui, &self.config.terminal, &self.runtime, &events);
+        });
 
         let changed = ui::settings::show(ui.ctx(), &mut self.settings_open, &mut self.config);
         if changed {

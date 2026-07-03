@@ -257,6 +257,24 @@ impl Db {
         Ok(id)
     }
 
+    /// MCP 서버 목록 (Connector Center, PR-17). repo 로직은 mcp crate 소유.
+    pub fn list_mcp_servers(&self) -> anyhow::Result<Vec<mcp::McpServerRow>> {
+        mcp::list_servers(&self.conn)
+    }
+
+    pub fn insert_mcp_server(&self, row: &mcp::McpServerRow) -> anyhow::Result<()> {
+        mcp::insert_server(&self.conn, row)
+    }
+
+    /// 연결 테스트로 발견한 tools를 교체 저장 (PR-17).
+    pub fn replace_mcp_tools(
+        &mut self,
+        server_id: &str,
+        rows: &[mcp::McpToolRow],
+    ) -> anyhow::Result<()> {
+        mcp::replace_tools_for_server(&mut self.conn, server_id, rows)
+    }
+
     /// 앱 시작 시 crash recovery (설계문서 PR-14): 이전 실행이 남긴 세션 중
     /// exited가 아닌 것을 모두 Exited로 마킹한다 — 재시작 후엔 그 프로세스가
     /// 반드시 orphan(죽음)이기 때문. 반영된 행 수를 돌려준다.

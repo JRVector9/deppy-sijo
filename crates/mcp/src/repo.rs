@@ -112,6 +112,22 @@ pub fn insert_tool(conn: &Connection, row: &McpToolRow) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 서버의 tool 목록을 새 발견 결과로 원자적으로 교체한다 (재연결 시 중복 방지).
+/// rows의 server_id는 호출측이 일치시켜 넘긴다.
+pub fn replace_tools_for_server(
+    conn: &mut Connection,
+    server_id: &str,
+    rows: &[McpToolRow],
+) -> anyhow::Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM mcp_tools WHERE server_id = ?1", [server_id])
+        .with_context(|| format!("mcp_tools 삭제 실패: {server_id}"))?;
+    for row in rows {
+        insert_tool(&tx, row)?;
+    }
+    tx.commit().context("mcp_tools 교체 commit 실패")
+}
+
 pub fn list_tools_for_server(
     conn: &Connection,
     server_id: &str,
@@ -169,6 +185,34 @@ mod tests {
         let server = sample_server();
         insert_server(&conn, &server).unwrap();
         assert_eq!(list_servers(&conn).unwrap(), vec![server]);
+    }
+
+    #[test]
+    fn replace_tools는_기존을_지우고_교체() {
+        let mut conn = test_conn();
+        insert_server(&conn, &sample_server()).unwrap();
+        let tool = |id: &str, name: &str| McpToolRow {
+            id: id.to_owned(),
+            server_id: "srv-1".to_owned(),
+            name: name.to_owned(),
+            description: None,
+            input_schema_json: None,
+            trust_level: "unknown".to_owned(),
+            schema_hash: None,
+        };
+        replace_tools_for_server(&mut conn, "srv-1", &[tool("t1", "old")]).unwrap();
+        replace_tools_for_server(
+            &mut conn,
+            "srv-1",
+            &[tool("t2", "new_a"), tool("t3", "new_b")],
+        )
+        .unwrap();
+        let names: Vec<String> = list_tools_for_server(&conn, "srv-1")
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names, vec!["new_a", "new_b"]);
     }
 
     #[test]

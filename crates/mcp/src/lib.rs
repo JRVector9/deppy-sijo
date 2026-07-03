@@ -11,6 +11,7 @@ mod transport;
 pub use manager::{LocalMcpManager, McpConnection, McpServerConfig, McpTool, PROTOCOL_VERSION};
 pub use repo::{
     McpServerRow, McpToolRow, insert_server, insert_tool, list_servers, list_tools_for_server,
+    replace_tools_for_server,
 };
 
 /// §11.4 mcp_servers + §11.5 mcp_tools DDL (index는 §11.8).

@@ -19,6 +19,7 @@ pub struct App {
     workspace_id: String,
     secret_store: KeyringSecretStore,
     agents_ui: ui::agents::AgentsUi,
+    connectors_ui: ui::connectors::ConnectorsUi,
     credentials_ui: ui::credentials::CredentialsUi,
     env_profiles_ui: ui::env_profiles::EnvProfilesUi,
     workspace_ui: ui::workspace::WorkspaceUi,
@@ -67,6 +68,7 @@ impl App {
             workspace_id,
             secret_store: KeyringSecretStore,
             agents_ui: ui::agents::AgentsUi::new(),
+            connectors_ui: ui::connectors::ConnectorsUi::new(redaction.clone()),
             credentials_ui: ui::credentials::CredentialsUi::new(redaction),
             env_profiles_ui: ui::env_profiles::EnvProfilesUi::new(),
             workspace_ui: ui::workspace::WorkspaceUi::new(),
@@ -92,6 +94,9 @@ impl eframe::App for App {
                 }
                 if ui.button("자격증명").clicked() {
                     self.credentials_ui.toggle();
+                }
+                if ui.button("연결").clicked() {
+                    self.connectors_ui.toggle();
                 }
                 if ui.button("환경").clicked() {
                     self.env_profiles_ui.toggle();
@@ -125,6 +130,7 @@ impl eframe::App for App {
         );
         self.credentials_ui
             .show(ui.ctx(), &self.db, &self.secret_store);
+        self.connectors_ui.show(ui.ctx(), &mut self.db);
         self.env_profiles_ui
             .show(ui.ctx(), &mut self.db, &self.workspace_id);
         egui::CentralPanel::default().show(ui, |ui| {

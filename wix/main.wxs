@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  PR-20: Windows MSI (cargo-wix, WiX v3 문법 - GitHub Actions windows-latest 내장이
+  WiX v3 legacy뿐이라는 설계 메모 반영).
+
+  빌드(Windows에서): cargo install cargo-wix && cargo wix -p deppy-sijo
+  이 머신(macOS)에서는 빌드/설치 검증 불가 - Windows 검증 보류 목록에 있음.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+    <Product
+        Id="*"
+        Name="Deppy Sijo"
+        UpgradeCode="be58f23a-f2d5-45d8-9777-d94b6efa373d"
+        Manufacturer="vector9"
+        Language="1042"
+        Codepage="65001"
+        Version="$(var.Version)">
+
+        <Package
+            Id="*"
+            Keywords="Installer"
+            Manufacturer="vector9"
+            InstallerVersion="450"
+            Languages="1042"
+            Compressed="yes"
+            InstallScope="perMachine"
+            SummaryCodepage="65001" />
+
+        <MajorUpgrade
+            Schedule="afterInstallInitialize"
+            DowngradeErrorMessage="더 새 버전이 이미 설치되어 있습니다. 제거 후 다시 실행하세요." />
+
+        <Media Id="1" Cabinet="media1.cab" EmbedCab="yes" />
+
+        <Directory Id="TARGETDIR" Name="SourceDir">
+            <Directory Id="ProgramFiles64Folder" Name="PFiles">
+                <Directory Id="APPLICATIONFOLDER" Name="Deppy Sijo">
+                    <Component Id="binary0" Guid="*" Win64="yes">
+                        <File
+                            Id="exe0"
+                            Name="deppy-sijo.exe"
+                            DiskId="1"
+                            Source="$(var.CargoTargetBinDir)\deppy-sijo.exe"
+                            KeyPath="yes" />
+                    </Component>
+                </Directory>
+            </Directory>
+            <Directory Id="ProgramMenuFolder">
+                <Directory Id="ApplicationProgramsFolder" Name="Deppy Sijo">
+                    <Component Id="shortcut0" Guid="8f4f1f56-6dcb-4b7a-9c07-0c33e0dbb0aa">
+                        <Shortcut
+                            Id="startmenu0"
+                            Name="Deppy Sijo"
+                            Target="[APPLICATIONFOLDER]deppy-sijo.exe"
+                            WorkingDirectory="APPLICATIONFOLDER" />
+                        <RemoveFolder Id="rmApplicationProgramsFolder" On="uninstall" />
+                        <RegistryValue
+                            Root="HKCU"
+                            Key="Software\vector9\deppy-sijo"
+                            Name="installed"
+                            Type="integer"
+                            Value="1"
+                            KeyPath="yes" />
+                    </Component>
+                </Directory>
+            </Directory>
+        </Directory>
+
+        <Feature Id="MainProgram" Title="Deppy Sijo" Level="1" Absent="disallow">
+            <ComponentRef Id="binary0" />
+            <ComponentRef Id="shortcut0" />
+        </Feature>
+    </Product>
+</Wix>

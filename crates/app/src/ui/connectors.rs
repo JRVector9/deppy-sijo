@@ -426,7 +426,7 @@ impl ConnectorsUi {
                     self.start_discover(ctx, server);
                 }
             });
-            // 저장된 tool 목록 + 실행 버튼 (PR-16 도구 실행)
+            // 저장된 tool 목록 + 실행 버튼 + 현재 권한 규칙 (PR-16)
             if let Ok(tools) = db.list_mcp_tools(&server.id) {
                 for tool in tools {
                     ui.horizontal(|ui| {
@@ -437,6 +437,32 @@ impl ConnectorsUi {
                             .clicked()
                         {
                             self.begin_invoke(server, &tool);
+                        }
+                        // 현재 규칙 표시 + Ask 아니면 해제 버튼 (잘못 always한 것 되돌리기)
+                        let rule = self.policy.rule(&server.id, &tool.name);
+                        match rule {
+                            audit::PermissionRule::Allow => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(0x2e, 0xa0, 0x43),
+                                    "규칙: 항상 허용",
+                                );
+                            }
+                            audit::PermissionRule::Deny => {
+                                ui.colored_label(egui::Color32::RED, "규칙: 항상 거부");
+                            }
+                            audit::PermissionRule::Ask => {}
+                        }
+                        if rule != audit::PermissionRule::Ask
+                            && ui.small_button("규칙 해제").clicked()
+                        {
+                            self.policy.set_rule(
+                                &server.id,
+                                &tool.name,
+                                audit::PermissionRule::Ask,
+                            );
+                            if let Err(e) = db.delete_permission_rule(&server.id, &tool.name) {
+                                tracing::warn!("권한 규칙 삭제 실패: {e:#}");
+                            }
                         }
                     });
                 }

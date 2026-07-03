@@ -405,6 +405,15 @@ impl Db {
         Ok(())
     }
 
+    /// 권한 규칙 삭제 (Ask로 재설정 — 행이 없으면 기본값 Ask).
+    pub fn delete_permission_rule(&self, server_id: &str, tool_name: &str) -> anyhow::Result<()> {
+        self.conn.execute(
+            "DELETE FROM tool_permission_rules WHERE server_id = ?1 AND tool_name = ?2",
+            (server_id, tool_name),
+        )?;
+        Ok(())
+    }
+
     /// tool 실행 감사 기록 (PR-16). encryptor를 넘기면 전체 입력이 암호화 저장된다 (§7).
     pub fn record_tool_audit(
         &self,
@@ -643,6 +652,11 @@ mod tests {
         assert_eq!(read.approved_schema_hash, None);
         let del = rows.iter().find(|r| r.tool_name == "delete_file").unwrap();
         assert_eq!(del.rule, "deny");
+        // 삭제(Ask 재설정) → 행이 사라진다
+        db.delete_permission_rule("srv-1", "read_file").unwrap();
+        let after = db.list_permission_rules().unwrap();
+        assert_eq!(after.len(), 1);
+        assert!(after.iter().all(|r| r.tool_name != "read_file"));
     }
 
     #[test]

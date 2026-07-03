@@ -3,6 +3,12 @@
 //! newline-delimited JSON으로 loopback TCP에 실어 나른다.
 //! public remote는 아직 아니다: bind는 127.0.0.1 고정, attach는 loopback만 허용.
 //! (원격 인증/TLS/delta 스트림은 v1+ — §8.2 "Viewport는 terminal delta로 대체되는 자리")
+//!
+//! 신뢰 경계 주의 (public remote 전 필수 — codex 리뷰): SpawnAgent가 command/args/
+//! env/credential_id를 그대로 실어 나르므로, 이 프로토콜을 공개 네트워크에 내놓기
+//! 전에 인증·권한(capability) 레이어나 제한된 원격 명령 스키마가 반드시 선행해야 한다.
+//! 지금은 loopback 강제가 그 경계다. 와이어 값 검증(validate_command/validate_event)은
+//! 기형 peer 방어일 뿐 권한 통제가 아니다.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -21,6 +27,116 @@ use crate::in_process::InProcessRuntimeClient;
 
 /// 이벤트 pump 폴링 주기 — worker의 output batch와 별개인 전송 주기.
 const PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+/// NDJSON 한 라인 상한 — newline 없는 폭주 payload로 인한 무한 할당 방지.
+/// serde가 Vec<u8>을 JSON 숫자 배열로 encode해 3~4배 팽창하므로 (예: 수 MB 붙여넣기
+/// WriteInput), 정상 명령이 끊기지 않게 넉넉히 잡는다 (codex 리뷰). 팽창 없는
+/// 바이너리 프레이밍은 v1+ 와이어 포맷 교체(§8.2 terminal delta) 때 함께 간다.
+const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
+/// 원격 명령의 scrollback 상한 — 무제한 usize로 과대 할당을 요구하지 못하게.
+const MAX_SCROLLBACK_LINES: usize = 100_000;
+
+/// newline까지 한 줄을 읽되 상한을 넘으면 None (프로토콜 위반 취급).
+/// EOF/IO 에러도 None — 호출측은 접속을 끝낸다.
+fn read_line_capped(reader: &mut impl BufRead) -> Option<String> {
+    let mut buf = Vec::new();
+    loop {
+        let chunk = match reader.fill_buf() {
+            Ok([]) => return None, // EOF
+            Ok(chunk) => chunk,
+            Err(_) => return None,
+        };
+        if let Some(pos) = chunk.iter().position(|b| *b == b'\n') {
+            buf.extend_from_slice(&chunk[..pos]);
+            reader.consume(pos + 1);
+            return String::from_utf8(buf).ok();
+        }
+        buf.extend_from_slice(chunk);
+        let n = chunk.len();
+        reader.consume(n);
+        if buf.len() > MAX_LINE_BYTES {
+            return None;
+        }
+    }
+}
+
+/// 서버가 수신한 명령의 와이어 값 검증 (codex 리뷰: 악성/기형 클라이언트 방어).
+/// 터미널 모델은 내부에서 clamp하지만 PTY 경로는 원값을 받으므로 여기서 거른다.
+fn validate_command(command: &RuntimeCommand) -> Result<(), &'static str> {
+    match command {
+        RuntimeCommand::SpawnShell {
+            cols,
+            rows,
+            scrollback_lines,
+        }
+        | RuntimeCommand::SpawnAgent {
+            cols,
+            rows,
+            scrollback_lines,
+            ..
+        } => {
+            if *cols == 0 || *rows == 0 {
+                return Err("cols/rows는 0일 수 없음");
+            }
+            if *scrollback_lines > MAX_SCROLLBACK_LINES {
+                return Err("scrollback_lines 상한 초과");
+            }
+        }
+        RuntimeCommand::Resize { cols, rows, .. } => {
+            if *cols == 0 || *rows == 0 {
+                return Err("cols/rows는 0일 수 없음");
+            }
+        }
+        RuntimeCommand::SplitPane {
+            scrollback_lines, ..
+        } if *scrollback_lines > MAX_SCROLLBACK_LINES => {
+            return Err("scrollback_lines 상한 초과");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// 클라이언트가 수신한 이벤트의 와이어 값 검증 — 기형 스냅샷이 렌더러에
+/// 닿기 전에 거른다 (cols=0 나눗셈, 셀 수 불일치, 비정상 ratio).
+fn validate_event(event: &RuntimeEvent) -> Result<(), &'static str> {
+    match event {
+        RuntimeEvent::Viewport { snapshot, .. } => {
+            if snapshot.cols == 0 || snapshot.rows == 0 {
+                return Err("viewport cols/rows가 0");
+            }
+            let expected = snapshot.cols as usize * snapshot.rows as usize;
+            if snapshot.visible_cells.len() != expected {
+                return Err("visible_cells 크기가 cols*rows와 불일치");
+            }
+        }
+        RuntimeEvent::MuxUpdated { snapshot } => {
+            for tab in &snapshot.tabs {
+                if !layout_ratios_valid(&tab.layout) {
+                    return Err("layout ratio가 0..=1 finite 범위 밖");
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn layout_ratios_valid(node: &crate::LayoutNode) -> bool {
+    match node {
+        crate::LayoutNode::Pane(_) => true,
+        crate::LayoutNode::Split {
+            ratio,
+            first,
+            second,
+            ..
+        } => {
+            ratio.is_finite()
+                && (0.0..=1.0).contains(ratio)
+                && layout_ratios_valid(first)
+                && layout_ratios_valid(second)
+        }
+    }
+}
 
 /// in-process worker를 loopback TCP로 노출하는 서버.
 /// 클라이언트는 순차 처리(스켈레톤) — 접속당 reader(명령 수신)와
@@ -29,7 +145,7 @@ pub struct RemoteRuntimeServer {
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
     accept_thread: Option<JoinHandle<()>>,
-    backend: Arc<InProcessRuntimeClient>,
+    backend: Option<Arc<InProcessRuntimeClient>>,
     /// 현재 처리 중인 접속 — shutdown이 reader를 깨울 수 있게 보관
     active_conn: Arc<Mutex<Option<TcpStream>>>,
 }
@@ -83,7 +199,7 @@ impl RemoteRuntimeServer {
             addr,
             stop,
             accept_thread: Some(accept_thread),
-            backend,
+            backend: Some(backend),
             active_conn,
         })
     }
@@ -93,7 +209,11 @@ impl RemoteRuntimeServer {
     }
 
     /// accept 루프를 멈추고 worker까지 동기 종료한다.
-    pub fn shutdown(mut self) {
+    pub fn shutdown(self) {
+        drop(self); // 정리는 Drop 한 곳에서 — 에러 경로의 drop도 같은 계약을 탄다
+    }
+
+    fn shutdown_impl(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         // 유휴 접속의 reader를 깨운다 (소켓을 닫아 EOF) — 없으면 accept 대기 중
         if let Some(conn) = self.active_conn.lock().expect("active conn lock").take() {
@@ -105,9 +225,19 @@ impl RemoteRuntimeServer {
             let _ = handle.join();
         }
         // 접속 스레드가 모두 끝났으면 유일 소유자 — worker 정리
-        if let Ok(mut backend) = Arc::try_unwrap(self.backend) {
+        if let Some(backend) = self.backend.take()
+            && let Ok(mut backend) = Arc::try_unwrap(backend)
+        {
             backend.shutdown();
         }
+    }
+}
+
+// shutdown()을 부르지 않는 에러 경로에서도 소켓/스레드/worker가 정리되도록 —
+// InProcessRuntimeClient와 같은 수명 계약 (codex 리뷰 P1)
+impl Drop for RemoteRuntimeServer {
+    fn drop(&mut self) {
+        self.shutdown_impl();
     }
 }
 
@@ -127,13 +257,17 @@ fn serve_connection(
             return;
         }
     };
+    // 접속별 종료 신호 — idle pump는 write가 없어 소켓 닫힘을 못 보므로
+    // (write 에러로만 죽는다) reader 종료 경로가 이 플래그로 깨운다 (codex 리뷰)
+    let conn_done = Arc::new(AtomicBool::new(false));
+    let pump_done = Arc::clone(&conn_done);
     let pump_stop = Arc::clone(stop);
     let pump = std::thread::Builder::new()
         .name("remote-pump".into())
         .spawn(move || {
             let mut stream = pump_stream;
             loop {
-                if pump_stop.load(Ordering::SeqCst) {
+                if pump_stop.load(Ordering::SeqCst) || pump_done.load(Ordering::SeqCst) {
                     break;
                 }
                 for event in receiver.drain() {
@@ -159,17 +293,31 @@ fn serve_connection(
         return;
     };
 
-    let reader = BufReader::new(match stream.try_clone() {
+    let mut reader = BufReader::new(match stream.try_clone() {
         Ok(s) => s,
-        Err(_) => return,
-    });
-    for line in reader.lines() {
-        let Ok(line) = line else { break };
-        if line.trim().is_empty() {
-            continue;
+        Err(e) => {
+            // pump가 orphan되지 않게 소켓을 닫고 join까지 마친다 (codex 리뷰)
+            tracing::warn!("remote reader clone 실패: {e}");
+            conn_done.store(true, Ordering::SeqCst);
+            let _ = stream.shutdown(Shutdown::Both);
+            let _ = pump.join();
+            return;
         }
-        match serde_json::from_str::<RuntimeCommand>(&line) {
+    });
+    // 상한 초과/EOF/비-UTF8은 read_line_capped가 None — 접속 종료.
+    // 빈 라인 포함 모든 비정상 라인은 위반이다 (valid message만 허용).
+    while let Some(line) = read_line_capped(&mut reader) {
+        let parsed = if line.trim().is_empty() {
+            Err("빈 라인".to_owned())
+        } else {
+            serde_json::from_str::<RuntimeCommand>(&line).map_err(|e| e.to_string())
+        };
+        match parsed {
             Ok(command) => {
+                if let Err(reason) = validate_command(&command) {
+                    tracing::warn!("remote 명령 검증 실패({reason}), 접속 종료");
+                    break;
+                }
                 if backend.send_command(command).is_err() {
                     break; // worker 종료됨
                 }
@@ -181,7 +329,8 @@ fn serve_connection(
             }
         }
     }
-    // reader 종료 → pump도 정리 (소켓을 닫아 write 에러로 끝낸다)
+    // reader 종료 → pump도 정리 (플래그 + 소켓 닫기 — idle이어도 다음 tick에 끝난다)
+    conn_done.store(true, Ordering::SeqCst);
     let _ = stream.shutdown(Shutdown::Both);
     let _ = pump.join();
 }
@@ -215,21 +364,26 @@ impl RemoteRuntimeClient {
         let reader_thread = std::thread::Builder::new()
             .name("remote-events".into())
             .spawn(move || {
-                let reader = BufReader::new(reader_stream);
-                for line in reader.lines() {
-                    let Ok(line) = line else { break };
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    let event = match serde_json::from_str::<RuntimeEvent>(&line) {
-                        Ok(event) => event,
-                        Err(e) => {
-                            tracing::warn!("remote 이벤트 파싱 실패, 수신 중단: {e}");
-                            break;
-                        }
+                let mut reader = BufReader::new(reader_stream);
+                while let Some(line) = read_line_capped(&mut reader) {
+                    let event = if line.trim().is_empty() {
+                        None
+                    } else {
+                        serde_json::from_str::<RuntimeEvent>(&line).ok()
                     };
+                    let Some(event) = event else {
+                        tracing::warn!("remote 이벤트 프로토콜 위반 — 접속 종료");
+                        break;
+                    };
+                    if let Err(reason) = validate_event(&event) {
+                        tracing::warn!("remote 이벤트 검증 실패({reason}) — 접속 종료");
+                        break;
+                    }
                     dispatch(&reader_subscribers, event);
                 }
+                // 수신이 죽은 클라이언트가 명령 전송만 성공하는 반쪽 상태 방지 —
+                // 소켓을 양방향으로 닫아 이후 send_command도 실패하게 한다 (codex 리뷰)
+                let _ = reader.into_inner().shutdown(Shutdown::Both);
             })
             .context("remote reader thread 생성 실패")?;
 
@@ -437,6 +591,65 @@ mod tests {
         }
         handle.join().unwrap();
         drop(client);
+    }
+
+    #[test]
+    fn 와이어_검증_규칙() {
+        // 명령: cols/rows 0, scrollback 상한
+        assert!(
+            validate_command(&RuntimeCommand::SpawnShell {
+                cols: 0,
+                rows: 24,
+                scrollback_lines: 100
+            })
+            .is_err()
+        );
+        assert!(
+            validate_command(&RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: MAX_SCROLLBACK_LINES + 1
+            })
+            .is_err()
+        );
+        assert!(
+            validate_command(&RuntimeCommand::Resize {
+                session: SessionId(1),
+                cols: 80,
+                rows: 0
+            })
+            .is_err()
+        );
+        // 이벤트: 셀 수 불일치, 비정상 ratio
+        let bad_viewport = RuntimeEvent::Viewport {
+            session: SessionId(1),
+            snapshot: Arc::new(terminal::TerminalViewportSnapshot {
+                cols: 2,
+                rows: 2,
+                cursor: terminal::CursorSnapshot {
+                    col: 0,
+                    row: 0,
+                    shape: terminal::CursorShape::Block,
+                    visible: true,
+                },
+                visible_cells: Vec::new().into(),
+                dirty_ranges: Vec::new(),
+                title: None,
+                scroll_offset: 0,
+                is_alt_screen: false,
+            }),
+            bracketed_paste: false,
+        };
+        assert!(validate_event(&bad_viewport).is_err());
+        assert!(layout_ratios_valid(&crate::LayoutNode::Pane(
+            deppy_core::MuxPaneId::new()
+        )));
+        assert!(!layout_ratios_valid(&crate::LayoutNode::Split {
+            direction: crate::SplitDirection::Horizontal,
+            ratio: f32::NAN,
+            first: Box::new(crate::LayoutNode::Pane(deppy_core::MuxPaneId::new())),
+            second: Box::new(crate::LayoutNode::Pane(deppy_core::MuxPaneId::new())),
+        }));
     }
 
     /// 프로토콜 위반(비-JSON 라인)은 접속 종료로 이어진다.

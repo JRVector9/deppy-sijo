@@ -178,7 +178,7 @@ impl AgentsUi {
             });
         }
         if let Some(agent) = run_config {
-            if let Err(e) = self.run(db, config, client, &agent) {
+            if let Err(e) = self.run(db, config, client, &agent, workspace_id) {
                 self.error = Some(format!("{e:#}"));
             } else {
                 self.error = None;
@@ -238,6 +238,22 @@ impl AgentsUi {
                 let t = s.trim();
                 (!t.is_empty()).then(|| t.to_owned())
             };
+            // regex는 저장 전에 컴파일 검증 — 잘못된 패턴이 영속돼 매 spawn마다
+            // 조용히 무시되는 것 방지 (codex 리뷰. detector는 무시+warn이 계약)
+            for (kind, pattern) in [
+                ("waiting", &self.waiting_regex),
+                ("approval", &self.approval_regex),
+                ("error", &self.error_regex),
+                ("done", &self.done_regex),
+            ] {
+                let trimmed = pattern.trim();
+                if !trimmed.is_empty()
+                    && let Err(e) = regex::Regex::new(trimmed)
+                {
+                    self.error = Some(format!("{kind} regex 오류: {e}"));
+                    return;
+                }
+            }
             match db.insert_agent_config(
                 self.name.trim(),
                 self.command.trim(),
@@ -275,10 +291,22 @@ impl AgentsUi {
         config: &TerminalConfig,
         client: &dyn RuntimeClient,
         agent: &AgentConfigRow,
+        workspace_id: &str,
     ) -> anyhow::Result<()> {
         let mut env_plain = Vec::new();
         let mut env_secrets = Vec::new();
         if let Some(profile_id) = &self.run_profile {
+            // 선택된 profile이 **현재 workspace** 것인지 실행 직전에 검증한다 —
+            // workspace 전환 후 남은 이전 선택으로 다른 프로젝트의 credential이
+            // 주입되는 것 방지 (§6.1, codex P1)
+            let owned = db
+                .list_env_profiles(workspace_id)?
+                .iter()
+                .any(|p| &p.id == profile_id);
+            if !owned {
+                self.run_profile = None;
+                anyhow::bail!("선택된 profile이 현재 workspace에 없습니다 — 다시 선택하세요");
+            }
             for var in db.list_env_vars(profile_id)? {
                 match var.value {
                     EnvValue::Plain(value) => env_plain.push((var.key, value)),

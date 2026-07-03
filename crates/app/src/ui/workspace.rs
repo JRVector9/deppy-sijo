@@ -73,6 +73,21 @@ impl WorkspaceUi {
                         .collect();
                     self.sessions.retain(|id, _| alive.contains(id));
                     self.sent_sizes.retain(|id, _| alive.contains(id));
+                    // hidden(active tab 밖) 세션의 마지막 스냅샷은 버린다 —
+                    // §14.4 hidden render cache drop. tab 복귀 시 worker가
+                    // 전환 즉시 push하므로(emit_mux_and_watched) 공백은 짧다 (codex 리뷰)
+                    let visible: Vec<SessionId> = snapshot
+                        .tabs
+                        .iter()
+                        .filter(|tab| Some(&tab.id) == snapshot.active_tab.as_ref())
+                        .flat_map(|tab| &tab.panes)
+                        .filter_map(|pane| pane.session_id)
+                        .collect();
+                    for (id, view) in self.sessions.iter_mut() {
+                        if !visible.contains(id) {
+                            view.snapshot = None;
+                        }
+                    }
                     self.mux = Some(Arc::clone(snapshot));
                 }
                 RuntimeEvent::Viewport {
@@ -172,21 +187,29 @@ impl WorkspaceUi {
             return;
         };
 
-        // 실행 중인 세션이 있으면 출력 폴링 유지.
-        // 기준은 mux의 pane 목록 — 아직 Viewport 캐시가 없는 신규 세션도 running이다
-        let any_running = mux
+        // 실행 중인 세션이 있으면 출력 폴링 유지 — 단 visible(active tab)과
+        // hidden을 구분한다: hidden은 Viewport가 오지 않으므로 50ms 폴링이
+        // 화면에 주는 것이 없고 CPU만 쓴다. 상태/exit 이벤트 수신용으로
+        // 저빈도(500ms)면 충분하다 (codex 리뷰 — idle 셸 1개가 20Hz 영구 repaint).
+        let is_running = |view: Option<&SessionView>| view.is_none_or(|v| v.exit_code.is_none());
+        let visible_running = active_tab
+            .panes
+            .iter()
+            .filter_map(|pane| pane.session_id)
+            .any(|session| is_running(self.sessions.get(&session)));
+        let hidden_running = mux
             .tabs
             .iter()
+            .filter(|tab| Some(&tab.id) != mux.active_tab.as_ref())
             .flat_map(|tab| &tab.panes)
             .filter_map(|pane| pane.session_id)
-            .any(|session| {
-                self.sessions
-                    .get(&session)
-                    .is_none_or(|view| view.exit_code.is_none())
-            });
-        if any_running {
+            .any(|session| is_running(self.sessions.get(&session)));
+        if visible_running {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(50));
+        } else if hidden_running {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(500));
         }
 
         let rect = ui.available_rect_before_wrap();

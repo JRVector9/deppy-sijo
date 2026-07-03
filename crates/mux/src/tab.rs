@@ -47,7 +47,12 @@ impl MuxTab {
     pub fn close_pane(&mut self, target: &MuxPaneId) -> ClosePane {
         match self.layout.remove_pane(target) {
             RemovePane::Removed => {
-                if self.active_pane.as_ref() == Some(target) {
+                // 닫은 pane이 active였거나, (방어) active가 이미 layout 밖이면 보정
+                let active_valid = self
+                    .active_pane
+                    .as_ref()
+                    .is_some_and(|active| active != target && self.layout.contains(active));
+                if !active_valid {
                     self.active_pane = self.layout.panes().into_iter().next();
                 }
                 ClosePane::Closed

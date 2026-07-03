@@ -902,6 +902,7 @@ dependencies = [
  "mcp",
  "persist",
  "platform",
+ "regex",
  "runtime",
  "rusqlite",
  "secret",

@@ -24,7 +24,14 @@ pub fn draw(
 ) -> RenderOutput {
     let font_id = egui::FontId::monospace(font_size);
     let cell = cell_size(ui.ctx(), font_size);
-    let size = egui::vec2(cell.x * snapshot.cols as f32, cell.y * snapshot.rows as f32);
+    // hit-test/응답 rect는 pane 영역을 넘지 않게 clamp한다 — split/resize 직후
+    // stale(더 큰) snapshot이 이웃 pane의 클릭/스크롤을 가로채는 것 방지 (codex 리뷰).
+    // 넘치는 셀은 어차피 호출측 clip_rect로 잘린다.
+    let avail = ui.available_size();
+    let size = egui::vec2(
+        (cell.x * snapshot.cols as f32).min(avail.x.max(0.0)),
+        (cell.y * snapshot.rows as f32).min(avail.y.max(0.0)),
+    );
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let painter = ui.painter_at(rect);
     let origin = rect.min;

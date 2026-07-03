@@ -299,9 +299,16 @@ impl Worker {
             match self.command_rx.recv_timeout(self.batch) {
                 Ok(command) => {
                     self.handle_command(command);
-                    // 몰려온 명령은 한 번에 소화
-                    while let Ok(command) = self.command_rx.try_recv() {
+                    // 몰려온 명령은 한 번에 소화하되 상한을 둔다 — 명령 폭주
+                    // (paste/resize 연타)가 PTY pump·로그·상태 감지를 굶기지
+                    // 않게 한다. 남은 명령은 다음 tick이 즉시 이어받는다 (codex 리뷰)
+                    const COMMAND_BURST_CAP: usize = 128;
+                    let mut burst = 0;
+                    while burst < COMMAND_BURST_CAP
+                        && let Ok(command) = self.command_rx.try_recv()
+                    {
                         self.handle_command(command);
+                        burst += 1;
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -309,8 +316,13 @@ impl Worker {
             }
             self.pump_sessions();
         }
-        // 앱 종료: 열려 있는 로그의 redaction carry를 flush하고 마감한다
+        // 앱 종료: 남은 출력을 마지막으로 기록하고(로그 유실 방지 — codex 리뷰),
+        // 열려 있는 로그의 redaction carry를 flush해 마감한다
         // (shutdown()이 join하므로 여기까지 동기 보장)
+        let all_sessions: Vec<SessionId> = self.sessions.keys().copied().collect();
+        for session in all_sessions {
+            self.final_drain(session);
+        }
         let open_sessions: Vec<SessionId> = self.logs.keys().copied().collect();
         for session in open_sessions {
             self.close_session_log(session, "app-shutdown", None);
@@ -375,9 +387,12 @@ impl Worker {
                                 &args,
                             );
                         }
-                        // MuxUpdated를 먼저 — Spawned 수신 시점에 스냅샷이 항상 앞서 있다
-                        self.emit_mux_and_watched();
+                        // MuxUpdated → Spawned → Viewport(slot) 순서 —
+                        // drain의 happens-before 계약 (Viewport가 Spawned보다 먼저
+                        // slot에 들어가면 안 된다)
+                        self.emit_mux_snapshot();
                         self.emit(RuntimeEvent::ShellSpawned { session: id });
+                        self.push_watched_viewports();
                     }
                     Err(e) => self.emit(RuntimeEvent::SpawnFailed {
                         kind: SpawnKind::Shell,
@@ -463,8 +478,9 @@ impl Worker {
                                 &spec.args,
                             );
                         }
-                        self.emit_mux_and_watched();
+                        self.emit_mux_snapshot();
                         self.emit(RuntimeEvent::AgentSpawned { session: id });
+                        self.push_watched_viewports();
                     }
                     Err(e) => self.emit(RuntimeEvent::SpawnFailed {
                         kind: SpawnKind::Agent,
@@ -513,6 +529,7 @@ impl Worker {
                 }
             }
             RuntimeCommand::KillSession { session } => {
+                self.final_drain(session);
                 // Session drop → PtySession Drop이 process group 정리를 보장한다
                 self.sessions.remove(&session);
                 self.detectors.remove(&session);
@@ -654,8 +671,9 @@ impl Worker {
                     return;
                 }
                 self.mux.focus.focus(pane_id);
-                self.emit_mux_and_watched();
+                self.emit_mux_snapshot();
                 self.emit(RuntimeEvent::ShellSpawned { session: id });
+                self.push_watched_viewports();
             }
             Err(e) => self.emit(RuntimeEvent::SpawnFailed {
                 kind: SpawnKind::Shell,
@@ -675,6 +693,7 @@ impl Worker {
             .get(&pane_id)
             .and_then(|pane| pane.session_id)
         {
+            self.final_drain(session);
             self.sessions.remove(&session);
             self.detectors.remove(&session);
             self.close_session_log(session, "killed", None);
@@ -703,6 +722,7 @@ impl Worker {
             if let Some(pane) = self.mux.panes.remove(&pane_id)
                 && let Some(session) = pane.session_id
             {
+                self.final_drain(session);
                 self.sessions.remove(&session);
                 self.detectors.remove(&session);
                 self.close_session_log(session, "killed", None);
@@ -716,9 +736,36 @@ impl Worker {
         self.emit_mux_and_watched();
     }
 
+    /// 세션을 제거하기 전에 reader 채널에 남은 출력을 마지막으로 로그에 기록한다
+    /// (§14.5 log writer 보존 — kill/close 직전 출력 유실 방지, codex 리뷰).
+    /// redaction 경로는 pump_sessions의 콜백과 동일하다.
+    fn final_drain(&mut self, session: SessionId) {
+        let Some(active) = self.sessions.get_mut(&session) else {
+            return;
+        };
+        let mut log = self.logs.get_mut(&session);
+        let _ = active.pump(|chunk| {
+            if let Some(log) = log.as_mut() {
+                let redacted = log.redactor.redact_chunk(chunk);
+                if let Err(e) = log.writer.append_output(&redacted) {
+                    tracing::warn!("세션 로그 최종 기록 실패: {e:#}");
+                }
+            }
+        });
+    }
+
     /// mux 스냅샷을 push하고, visible(active tab) 세션들의 화면도 즉시 push한다
     /// (tab/포커스 전환 직후 stale 화면 방지).
     fn emit_mux_and_watched(&mut self) {
+        self.emit_mux_snapshot();
+        self.push_watched_viewports();
+    }
+
+    /// mux 스냅샷만 emit (+ 영속 저장). spawn 경로는 이걸 먼저 부르고
+    /// Spawned 이벤트를 보낸 뒤 [`Self::push_watched_viewports`]를 불러야
+    /// "slot에 Viewport가 있으면 그 세션의 Spawned가 같은 drain에 포함"이라는
+    /// RuntimeEventReceiver::drain의 happens-before 계약이 유지된다 (codex 리뷰).
+    fn emit_mux_snapshot(&mut self) {
         // mux 구조가 바뀐 지점 — 영속 layout도 같은 시점에 저장 (§11.2~11.5)
         if let Some(pipe) = &mut self.persist {
             pipe.save_layout(&self.mux.window, &self.mux.tabs, &self.mux.panes);
@@ -726,6 +773,9 @@ impl Worker {
         self.emit(RuntimeEvent::MuxUpdated {
             snapshot: Arc::new(self.mux.snapshot()),
         });
+    }
+
+    fn push_watched_viewports(&mut self) {
         let mut events = Vec::new();
         for session in self.mux.watched_sessions() {
             if let Some(active) = self.sessions.get_mut(&session)

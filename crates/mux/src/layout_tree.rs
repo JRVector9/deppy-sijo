@@ -30,7 +30,21 @@ pub enum RemovePane {
 
 impl LayoutNode {
     /// target pane 자리를 Split으로 바꾸고 new_pane을 두 번째 칸에 넣는다.
+    /// new_pane이 이미 트리에 있으면(=target과 같은 경우 포함) 거부한다 —
+    /// 중복 leaf가 생기면 remove_pane이 하나만 지워 dangling leaf가 남는다 (codex 리뷰).
     pub fn split_pane(
+        &mut self,
+        target: &MuxPaneId,
+        direction: SplitDirection,
+        new_pane: MuxPaneId,
+    ) -> bool {
+        if self.contains(&new_pane) {
+            return false;
+        }
+        self.split_pane_inner(target, direction, new_pane)
+    }
+
+    fn split_pane_inner(
         &mut self,
         target: &MuxPaneId,
         direction: SplitDirection,
@@ -48,8 +62,8 @@ impl LayoutNode {
             }
             LayoutNode::Pane(_) => false,
             LayoutNode::Split { first, second, .. } => {
-                first.split_pane(target, direction, new_pane.clone())
-                    || second.split_pane(target, direction, new_pane)
+                first.split_pane_inner(target, direction, new_pane.clone())
+                    || second.split_pane_inner(target, direction, new_pane)
             }
         }
     }
@@ -120,6 +134,18 @@ mod tests {
         assert_eq!(layout.panes(), vec![a.clone(), b.clone(), c.clone()]);
         // 없는 pane split은 실패
         assert!(!layout.split_pane(&pane(), SplitDirection::Horizontal, pane()));
+    }
+
+    #[test]
+    fn split은_중복_pane을_거부() {
+        let (a, b) = (pane(), pane());
+        let mut layout = LayoutNode::Pane(a.clone());
+        assert!(layout.split_pane(&a, SplitDirection::Horizontal, b.clone()));
+        // 이미 트리에 있는 b 재삽입 거부 → remove가 하나만 지워 dangling되는 것 방지
+        assert!(!layout.split_pane(&a, SplitDirection::Vertical, b.clone()));
+        // new_pane == target도 거부
+        assert!(!layout.split_pane(&a, SplitDirection::Vertical, a.clone()));
+        assert_eq!(layout.panes().len(), 2);
     }
 
     #[test]

@@ -49,6 +49,7 @@ pub fn show(ctx: &egui::Context, open: &mut bool, config: &mut Config) -> bool {
                             .range(16..=50),
                     )
                     .changed();
+                ui.weak("(앱 재시작 후 적용)");
             });
         });
     changed

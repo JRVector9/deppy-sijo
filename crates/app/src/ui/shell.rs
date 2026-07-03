@@ -92,7 +92,12 @@ impl ShellUi {
                 }
                 RuntimeEvent::SpawnFailed { message } => {
                     self.spawn_pending = false;
-                    self.error = Some(format!("셸 시작 실패: {message}"));
+                    if self.open {
+                        self.error = Some(format!("셸 시작 실패: {message}"));
+                    } else {
+                        // 창을 닫은 뒤 도착한 실패는 다음 오픈에 표시하지 않는다
+                        tracing::warn!("셸 시작 실패 (창 닫힘): {message}");
+                    }
                 }
                 RuntimeEvent::Viewport {
                     session,

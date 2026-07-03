@@ -15,9 +15,19 @@ use crate::event::RuntimeEvent;
 /// 한 tick에 backend로 넘기는 PTY 출력 상한 (UI 프레임 독점 방지와 동일 취지)
 const FEED_PER_TICK_CAP: usize = 256 * 1024;
 
+/// 구독자 한 명의 송신측. 상태 이벤트(unbounded — 세션 수명당 상수 개수의
+/// 제어 이벤트라 누적 위험 없음)와 Viewport slot(최신본만 유지 — 14.5의
+/// output bounded 요구를 "누적 불가" 구조로 충족)을 분리한다 (8.2).
+struct Subscriber {
+    events: Sender<RuntimeEvent>,
+    viewport: Arc<Mutex<Option<RuntimeEvent>>>,
+}
+
 pub struct InProcessRuntimeClient {
-    command_tx: Sender<RuntimeCommand>,
-    subscribers: Arc<Mutex<Vec<Sender<RuntimeEvent>>>>,
+    /// shutdown 시 None — drop되면 worker가 Disconnected로 종료한다
+    command_tx: Option<Sender<RuntimeCommand>>,
+    subscribers: Arc<Mutex<Vec<Subscriber>>>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl InProcessRuntimeClient {
@@ -30,9 +40,9 @@ impl InProcessRuntimeClient {
     /// 테스트용: 셸 대신 임의 명령을 spawn한다.
     pub fn with_shell(output_batch_ms: u64, shell: CommandSpec) -> Self {
         let (command_tx, command_rx) = channel();
-        let subscribers: Arc<Mutex<Vec<Sender<RuntimeEvent>>>> = Arc::default();
+        let subscribers: Arc<Mutex<Vec<Subscriber>>> = Arc::default();
         let worker_subscribers = Arc::clone(&subscribers);
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("runtime-worker".into())
             .spawn(move || {
                 Worker {
@@ -47,25 +57,55 @@ impl InProcessRuntimeClient {
             })
             .expect("runtime worker thread 생성");
         Self {
-            command_tx,
+            command_tx: Some(command_tx),
             subscribers,
+            worker: Some(worker),
         }
+    }
+
+    /// worker를 종료시키고 세션 정리(PtySession Drop)까지 동기적으로 기다린다.
+    /// 앱 종료 경로(on_exit)에서 호출 — main 리턴과 worker 정리 사이의
+    /// 스케줄링 경합으로 자식 프로세스가 reap되지 않는 문제 방지.
+    pub fn shutdown(&mut self) {
+        self.command_tx = None; // Disconnected → worker 루프 break
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            tracing::warn!("runtime worker join 실패 (panic)");
+        }
+    }
+}
+
+impl Drop for InProcessRuntimeClient {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
 impl RuntimeCommandSink for InProcessRuntimeClient {
     fn send_command(&self, command: RuntimeCommand) -> anyhow::Result<()> {
         self.command_tx
-            .send(command)
-            .map_err(|_| anyhow::anyhow!("runtime worker가 종료됨"))
+            .as_ref()
+            .and_then(|tx| tx.send(command).ok())
+            .ok_or_else(|| anyhow::anyhow!("runtime worker가 종료됨"))
     }
 }
 
 impl RuntimeEventStream for InProcessRuntimeClient {
     fn subscribe(&self) -> RuntimeEventReceiver {
         let (tx, rx) = channel();
-        self.subscribers.lock().expect("subscribers lock").push(tx);
-        rx
+        let viewport: Arc<Mutex<Option<RuntimeEvent>>> = Arc::default();
+        self.subscribers
+            .lock()
+            .expect("subscribers lock")
+            .push(Subscriber {
+                events: tx,
+                viewport: Arc::clone(&viewport),
+            });
+        RuntimeEventReceiver {
+            events: rx,
+            viewport,
+        }
     }
 }
 
@@ -83,7 +123,7 @@ struct ActiveSession {
 
 struct Worker {
     command_rx: Receiver<RuntimeCommand>,
-    subscribers: Arc<Mutex<Vec<Sender<RuntimeEvent>>>>,
+    subscribers: Arc<Mutex<Vec<Subscriber>>>,
     batch: Duration,
     shell: CommandSpec,
     next_id: u64,
@@ -111,11 +151,24 @@ impl Worker {
     }
 
     fn emit(&self, event: RuntimeEvent) {
-        // 죽은 구독자는 제거
+        // Viewport는 최신본 slot 덮어쓰기 (누적/유실/blocking 없음 — 느린 소비자도
+        // 재개 시 항상 최종 화면을 본다), 상태 이벤트는 채널 send.
+        // receiver가 drop된 구독자는 제거: slot 경로는 Arc strong_count로 판별
+        // (receiver도 slot Arc를 쥐므로 count 1이면 죽은 구독자), 채널 경로는 send 실패로.
         self.subscribers
             .lock()
             .expect("subscribers lock")
-            .retain(|tx| tx.send(event.clone()).is_ok());
+            .retain(|subscriber| {
+                if matches!(event, RuntimeEvent::Viewport { .. }) {
+                    if Arc::strong_count(&subscriber.viewport) <= 1 {
+                        return false;
+                    }
+                    *subscriber.viewport.lock().expect("viewport slot lock") = Some(event.clone());
+                    true
+                } else {
+                    subscriber.events.send(event.clone()).is_ok()
+                }
+            });
     }
 
     fn handle_command(&mut self, command: RuntimeCommand) {
@@ -263,21 +316,39 @@ mod tests {
         }
     }
 
-    /// 조건을 만족하는 이벤트가 올 때까지 수신 (timeout 시 panic).
-    fn wait_for<T>(
-        rx: &RuntimeEventReceiver,
-        timeout: Duration,
-        mut pick: impl FnMut(&RuntimeEvent) -> Option<T>,
-    ) -> T {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if let Ok(event) = rx.recv_timeout(Duration::from_millis(100))
-                && let Some(value) = pick(&event)
-            {
-                return value;
+    /// 수신한 이벤트를 버리지 않고 모아두는 테스트 헬퍼 —
+    /// 한 wait에서 드레인된 다른 이벤트를 다음 wait가 볼 수 있게 한다.
+    struct Probe {
+        rx: RuntimeEventReceiver,
+        seen: Vec<RuntimeEvent>,
+    }
+
+    impl Probe {
+        fn new(rx: RuntimeEventReceiver) -> Self {
+            Self {
+                rx,
+                seen: Vec::new(),
             }
         }
-        panic!("기다리던 이벤트가 오지 않음");
+
+        /// 조건을 만족하는 이벤트가 관측될 때까지 폴링 (timeout 시 panic).
+        fn wait_for<T>(
+            &mut self,
+            timeout: Duration,
+            mut pick: impl FnMut(&RuntimeEvent) -> Option<T>,
+        ) -> T {
+            let deadline = Instant::now() + timeout;
+            loop {
+                self.seen.extend(self.rx.drain());
+                if let Some(value) = self.seen.iter().find_map(&mut pick) {
+                    return value;
+                }
+                if Instant::now() >= deadline {
+                    panic!("기다리던 이벤트가 오지 않음");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
 
     fn snapshot_text(snapshot: &terminal::TerminalViewportSnapshot, row: usize) -> String {
@@ -295,7 +366,7 @@ mod tests {
     #[cfg(unix)]
     fn spawn_출력_종료_이벤트_흐름() {
         let client = InProcessRuntimeClient::with_shell(5, spec("/bin/echo", &["hi-runtime"]));
-        let rx = client.subscribe();
+        let mut probe = Probe::new(client.subscribe());
         client
             .send_command(RuntimeCommand::SpawnShell {
                 cols: 80,
@@ -303,12 +374,12 @@ mod tests {
                 scrollback_lines: 100,
             })
             .unwrap();
-        let session = wait_for(&rx, Duration::from_secs(5), |e| match e {
+        let session = probe.wait_for(Duration::from_secs(5), |e| match e {
             RuntimeEvent::ShellSpawned { session } => Some(*session),
             _ => None,
         });
         // 출력이 Viewport로 push된다
-        wait_for(&rx, Duration::from_secs(5), |e| match e {
+        probe.wait_for(Duration::from_secs(5), |e| match e {
             RuntimeEvent::Viewport { snapshot, .. }
                 if snapshot_text(snapshot, 0).contains("hi-runtime") =>
             {
@@ -317,7 +388,7 @@ mod tests {
             _ => None,
         });
         // echo 종료 → SessionExited
-        let (exited, code) = wait_for(&rx, Duration::from_secs(5), |e| match e {
+        let (exited, code) = probe.wait_for(Duration::from_secs(5), |e| match e {
             RuntimeEvent::SessionExited {
                 session, exit_code, ..
             } => Some((*session, *exit_code)),
@@ -331,7 +402,7 @@ mod tests {
     #[cfg(unix)]
     fn 입력과_kill() {
         let client = InProcessRuntimeClient::with_shell(5, spec("/bin/cat", &[]));
-        let rx = client.subscribe();
+        let mut probe = Probe::new(client.subscribe());
         client
             .send_command(RuntimeCommand::SpawnShell {
                 cols: 80,
@@ -339,7 +410,7 @@ mod tests {
                 scrollback_lines: 100,
             })
             .unwrap();
-        let session = wait_for(&rx, Duration::from_secs(5), |e| match e {
+        let session = probe.wait_for(Duration::from_secs(5), |e| match e {
             RuntimeEvent::ShellSpawned { session } => Some(*session),
             _ => None,
         });
@@ -349,7 +420,7 @@ mod tests {
                 bytes: b"ping\r".to_vec(),
             })
             .unwrap();
-        wait_for(&rx, Duration::from_secs(5), |e| match e {
+        probe.wait_for(Duration::from_secs(5), |e| match e {
             RuntimeEvent::Viewport { snapshot, .. }
                 if snapshot_text(snapshot, 0).contains("ping") =>
             {
@@ -369,8 +440,8 @@ mod tests {
                 scrollback_lines: 100,
             })
             .unwrap();
-        let new_session = wait_for(&rx, Duration::from_secs(5), |e| match e {
-            RuntimeEvent::ShellSpawned { session } => Some(*session),
+        let new_session = probe.wait_for(Duration::from_secs(5), |e| match e {
+            RuntimeEvent::ShellSpawned { session: s } if *s != session => Some(*s),
             _ => None,
         });
         assert_ne!(new_session, session);
@@ -380,7 +451,7 @@ mod tests {
     #[cfg(unix)]
     fn 종료_후에도_scrollback_열람_가능() {
         let client = InProcessRuntimeClient::with_shell(5, spec("/bin/echo", &["done"]));
-        let rx = client.subscribe();
+        let mut probe = Probe::new(client.subscribe());
         client
             .send_command(RuntimeCommand::SpawnShell {
                 cols: 80,
@@ -388,19 +459,21 @@ mod tests {
                 scrollback_lines: 100,
             })
             .unwrap();
-        let session = wait_for(&rx, Duration::from_secs(5), |e| match e {
+        let session = probe.wait_for(Duration::from_secs(5), |e| match e {
             RuntimeEvent::ShellSpawned { session } => Some(*session),
             _ => None,
         });
-        wait_for(&rx, Duration::from_secs(5), |e| match e {
+        probe.wait_for(Duration::from_secs(5), |e| match e {
             RuntimeEvent::SessionExited { .. } => Some(()),
             _ => None,
         });
         // backend가 유지되어 Scroll에 Viewport로 응답해야 한다
+        // (종료 전 Viewport와 구분하기 위해 관측 버퍼를 비운다)
+        probe.seen.clear();
         client
             .send_command(RuntimeCommand::Scroll { session, delta: 1 })
             .unwrap();
-        wait_for(&rx, Duration::from_secs(5), |e| match e {
+        probe.wait_for(Duration::from_secs(5), |e| match e {
             RuntimeEvent::Viewport { snapshot, .. }
                 if snapshot_text(snapshot, 0).contains("done") =>
             {
@@ -412,10 +485,9 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn 다중_구독자() {
-        let client = InProcessRuntimeClient::with_shell(5, spec("/bin/echo", &["multi"]));
-        let rx1 = client.subscribe();
-        let rx2 = client.subscribe();
+    fn 살아있는_세션_위에_spawn하면_교체() {
+        let client = InProcessRuntimeClient::with_shell(5, spec("/bin/cat", &[]));
+        let mut probe = Probe::new(client.subscribe());
         client
             .send_command(RuntimeCommand::SpawnShell {
                 cols: 80,
@@ -423,8 +495,58 @@ mod tests {
                 scrollback_lines: 100,
             })
             .unwrap();
-        for rx in [&rx1, &rx2] {
-            wait_for(rx, Duration::from_secs(5), |e| match e {
+        let first = probe.wait_for(Duration::from_secs(5), |e| match e {
+            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            _ => None,
+        });
+        // kill 없이 재spawn → 기존 세션(cat)은 Drop으로 정리되고 새 id 발급
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let second = probe.wait_for(Duration::from_secs(5), |e| match e {
+            RuntimeEvent::ShellSpawned { session } if *session != first => Some(*session),
+            _ => None,
+        });
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn spawn_실패_이벤트() {
+        let client =
+            InProcessRuntimeClient::with_shell(5, spec("/nonexistent-deppy-test-cmd", &[]));
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(5), |e| match e {
+            RuntimeEvent::SpawnFailed { .. } => Some(()),
+            _ => None,
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 다중_구독자() {
+        let client = InProcessRuntimeClient::with_shell(5, spec("/bin/echo", &["multi"]));
+        let mut probe1 = Probe::new(client.subscribe());
+        let mut probe2 = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        for probe in [&mut probe1, &mut probe2] {
+            probe.wait_for(Duration::from_secs(5), |e| match e {
                 RuntimeEvent::ShellSpawned { .. } => Some(()),
                 _ => None,
             });

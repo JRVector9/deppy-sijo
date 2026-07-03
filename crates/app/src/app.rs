@@ -43,6 +43,11 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self) {
+        // worker join까지 동기 대기 — 셸 자식 프로세스 정리(reap) 보장
+        self.runtime.shutdown();
+    }
+
     // egui 0.35부터 update(&Context) 대신 ui(&mut Ui) 시그니처를 쓴다.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::Panel::top("top_bar").show(ui, |ui| {
@@ -67,7 +72,7 @@ impl eframe::App for App {
             .show(ui.ctx(), &self.db, &self.secret_store);
         self.env_profiles_ui
             .show(ui.ctx(), &mut self.db, &self.workspace_id);
-        let events: Vec<_> = self.runtime_events.try_iter().collect();
+        let events = self.runtime_events.drain();
         self.shell_ui
             .show(ui.ctx(), &self.config.terminal, &self.runtime, &events);
 

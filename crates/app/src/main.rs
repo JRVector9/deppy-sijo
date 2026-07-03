@@ -3,7 +3,6 @@ mod config;
 mod env;
 mod fonts;
 mod paths;
-mod secret;
 mod storage;
 mod ui;
 

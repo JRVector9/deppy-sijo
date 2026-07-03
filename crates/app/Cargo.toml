@@ -9,20 +9,15 @@ eframe = { workspace = true }
 egui = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 toml = { workspace = true }
 directories = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 rusqlite = { workspace = true }
-keyring-core = { workspace = true }
 uuid = { workspace = true }
 runtime = { path = "../runtime" }
+secret = { path = "../secret" }
 terminal = { path = "../terminal" }
 
-# 플랫폼 keyring store (설계문서 1.4 — keyring = "3"/"4" 단일 crate 금지)
-[target.'cfg(target_os = "macos")'.dependencies]
-apple-native-keyring-store = { workspace = true }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-windows-native-keyring-store = { workspace = true }

@@ -9,6 +9,18 @@ pub enum RuntimeCommand {
         /// spawn 시점의 설정값 — 설정 변경이 다음 세션부터 반영되게 한다
         scrollback_lines: usize,
     },
+    /// agent command 실행 (설계문서 PR-09). secret env는 credential_id 참조로
+    /// 전달되고 worker가 spawn 직전에만 resolve한다 (6.3) — 값은 이 명령에 없다.
+    SpawnAgent {
+        cols: u16,
+        rows: u16,
+        scrollback_lines: usize,
+        command: String,
+        args: Vec<String>,
+        env_plain: Vec<(String, String)>,
+        /// (env key, credential_id)
+        env_secrets: Vec<(String, String)>,
+    },
     WriteInput {
         session: SessionId,
         bytes: Vec<u8>,

@@ -6,11 +6,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pty::CommandSpec;
+use secret::SecretStore;
 use session::Session;
 
 use crate::client::{RuntimeClient, RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream};
 use crate::command::{RuntimeCommand, SessionId};
-use crate::event::RuntimeEvent;
+use crate::event::{RuntimeEvent, SpawnKind};
 
 /// 구독자 한 명의 송신측. 상태 이벤트(unbounded — 세션 수명당 상수 개수의
 /// 제어 이벤트라 누적 위험 없음)와 세션별 Viewport slot(최신본만 유지 — 14.5의
@@ -30,12 +31,17 @@ pub struct InProcessRuntimeClient {
 impl InProcessRuntimeClient {
     /// `output_batch_ms`: Viewport push 주기 (설계문서 10.1, config.performance 소비).
     /// 시작 시점에 고정 — 변경은 앱 재시작 필요.
-    pub fn new(output_batch_ms: u64) -> Self {
-        Self::with_shell(output_batch_ms, pty::default_shell())
+    /// `secret_store`: SpawnAgent의 secret env를 spawn 직전에 resolve할 때만 사용 (6.3).
+    pub fn new(output_batch_ms: u64, secret_store: Arc<dyn SecretStore>) -> Self {
+        Self::with_shell(output_batch_ms, secret_store, pty::default_shell())
     }
 
     /// 테스트용: 셸 대신 임의 명령을 spawn한다.
-    pub fn with_shell(output_batch_ms: u64, shell: CommandSpec) -> Self {
+    pub fn with_shell(
+        output_batch_ms: u64,
+        secret_store: Arc<dyn SecretStore>,
+        shell: CommandSpec,
+    ) -> Self {
         let (command_tx, command_rx) = channel();
         let subscribers: Arc<Mutex<Vec<Subscriber>>> = Arc::default();
         let worker_subscribers = Arc::clone(&subscribers);
@@ -49,6 +55,7 @@ impl InProcessRuntimeClient {
                     shell,
                     next_id: 1,
                     sessions: std::collections::HashMap::new(),
+                    secret_store,
                 }
                 .run();
             })
@@ -117,6 +124,8 @@ struct Worker {
     next_id: u64,
     /// 다중 세션 (PR-08 Session Runtime). 세션 로직은 session crate 소관.
     sessions: std::collections::HashMap<SessionId, Session>,
+    /// spawn 직전 secret resolve 전용 (6.3). worker 단일 스레드 접근 (1.4).
+    secret_store: Arc<dyn SecretStore>,
 }
 
 impl Worker {
@@ -186,6 +195,64 @@ impl Worker {
                         self.emit(RuntimeEvent::ShellSpawned { session: id });
                     }
                     Err(e) => self.emit(RuntimeEvent::SpawnFailed {
+                        kind: SpawnKind::Shell,
+                        message: format!("{e:#}"),
+                    }),
+                }
+            }
+            RuntimeCommand::SpawnAgent {
+                cols,
+                rows,
+                scrollback_lines,
+                command,
+                args,
+                env_plain,
+                env_secrets,
+            } => {
+                // secret은 여기(spawn 직전)에서만 resolve된다 — PR-09 완료 기준.
+                // 실패 시 아무것도 spawn하지 않는다 (부분 주입 금지).
+                let mut env = env_plain;
+                let mut resolve_failed = None;
+                for (key, credential_id) in env_secrets {
+                    match self.secret_store.get_secret(&credential_id) {
+                        Ok(value) => env.push((key, value.expose().to_owned())),
+                        Err(e) => {
+                            // credential id만 로그 — secret 값/키 이름은 남기지 않는다
+                            resolve_failed = Some(format!(
+                                "secret resolve 실패 (credential {credential_id}): {e:#}"
+                            ));
+                            break;
+                        }
+                    }
+                }
+                if let Some(message) = resolve_failed {
+                    self.emit(RuntimeEvent::SpawnFailed {
+                        kind: SpawnKind::Agent,
+                        message,
+                    });
+                    return;
+                }
+                let spec = CommandSpec {
+                    program: command,
+                    args,
+                    env,
+                };
+                let id = SessionId(self.next_id);
+                self.next_id += 1;
+                match Session::spawn_with_spec(
+                    id,
+                    session::SessionKind::Agent,
+                    &spec,
+                    cols,
+                    rows,
+                    scrollback_lines,
+                ) {
+                    Ok(new_session) => {
+                        self.sessions.insert(id, new_session);
+                        self.emit(RuntimeEvent::AgentSpawned { session: id });
+                    }
+                    Err(e) => self.emit(RuntimeEvent::SpawnFailed {
+                        kind: SpawnKind::Agent,
                         message: format!("{e:#}"),
                     }),
                 }
@@ -250,6 +317,19 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
+    fn test_store() -> Arc<dyn SecretStore> {
+        Arc::new(secret::KeyringSecretStore)
+    }
+
+    /// mock keyring store는 test only (설계문서 1.4). 프로세스 전역 1회만 등록 —
+    /// 테스트별 재등록은 병렬 실행에서 이전 등록분의 secret을 날린다.
+    fn init_mock_store() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+        });
+    }
+
     fn spec(program: &str, args: &[&str]) -> CommandSpec {
         CommandSpec {
             program: program.into(),
@@ -307,7 +387,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn spawn_출력_종료_이벤트_흐름() {
-        let client = InProcessRuntimeClient::with_shell(5, spec("/bin/echo", &["hi-runtime"]));
+        let client =
+            InProcessRuntimeClient::with_shell(5, test_store(), spec("/bin/echo", &["hi-runtime"]));
         let mut probe = Probe::new(client.subscribe());
         client
             .send_command(RuntimeCommand::SpawnShell {
@@ -343,7 +424,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn 입력과_kill() {
-        let client = InProcessRuntimeClient::with_shell(5, spec("/bin/cat", &[]));
+        let client = InProcessRuntimeClient::with_shell(5, test_store(), spec("/bin/cat", &[]));
         let mut probe = Probe::new(client.subscribe());
         client
             .send_command(RuntimeCommand::SpawnShell {
@@ -392,7 +473,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn 종료_후에도_scrollback_열람_가능() {
-        let client = InProcessRuntimeClient::with_shell(5, spec("/bin/echo", &["done"]));
+        let client =
+            InProcessRuntimeClient::with_shell(5, test_store(), spec("/bin/echo", &["done"]));
         let mut probe = Probe::new(client.subscribe());
         client
             .send_command(RuntimeCommand::SpawnShell {
@@ -428,7 +510,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn 다중_세션_동시_생존과_독립_입출력() {
-        let client = InProcessRuntimeClient::with_shell(5, spec("/bin/cat", &[]));
+        let client = InProcessRuntimeClient::with_shell(5, test_store(), spec("/bin/cat", &[]));
         let mut probe = Probe::new(client.subscribe());
         let mut ids = Vec::new();
         for _ in 0..3 {
@@ -471,8 +553,11 @@ mod tests {
 
     #[test]
     fn spawn_실패_이벤트() {
-        let client =
-            InProcessRuntimeClient::with_shell(5, spec("/nonexistent-deppy-test-cmd", &[]));
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            spec("/nonexistent-deppy-test-cmd", &[]),
+        );
         let mut probe = Probe::new(client.subscribe());
         client
             .send_command(RuntimeCommand::SpawnShell {
@@ -482,15 +567,79 @@ mod tests {
             })
             .unwrap();
         probe.wait_for(Duration::from_secs(5), |e| match e {
-            RuntimeEvent::SpawnFailed { .. } => Some(()),
+            RuntimeEvent::SpawnFailed {
+                kind: SpawnKind::Shell,
+                ..
+            } => Some(()),
             _ => None,
         });
     }
 
     #[test]
     #[cfg(unix)]
+    fn spawn_agent_secret_env_주입() {
+        init_mock_store();
+        let store = test_store();
+        store
+            .set_secret(
+                "cred-agent-test",
+                &secret::SecretString::new("s3cret-value".into()),
+            )
+            .unwrap();
+
+        let client = InProcessRuntimeClient::with_shell(5, store, pty::default_shell());
+        let mut probe = Probe::new(client.subscribe());
+        // sh가 env를 출력 — plain + secret(spawn 직전 resolve) 주입 검증
+        client
+            .send_command(RuntimeCommand::SpawnAgent {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "echo P=$PLAIN_K S=$SECRET_K".into()],
+                env_plain: vec![("PLAIN_K".into(), "plain-v".into())],
+                env_secrets: vec![("SECRET_K".into(), "cred-agent-test".into())],
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(5), |e| match e {
+            RuntimeEvent::Viewport { snapshot, .. }
+                if snapshot_text(snapshot, 0).contains("P=plain-v S=s3cret-value") =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
+    }
+
+    #[test]
+    fn spawn_agent_resolve_실패시_spawn_안함() {
+        init_mock_store();
+        let client = InProcessRuntimeClient::with_shell(5, test_store(), pty::default_shell());
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnAgent {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                command: "/bin/echo".into(),
+                args: vec!["누출되면 안 됨".into()],
+                env_plain: Vec::new(),
+                env_secrets: vec![("K".into(), "cred-없음".into())],
+            })
+            .unwrap();
+        // resolve 실패 → SpawnFailed, 메시지에 secret 값 없음 (credential id만)
+        let message = probe.wait_for(Duration::from_secs(5), |e| match e {
+            RuntimeEvent::SpawnFailed { message, .. } => Some(message.clone()),
+            _ => None,
+        });
+        assert!(message.contains("cred-없음"));
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn 다중_구독자() {
-        let client = InProcessRuntimeClient::with_shell(5, spec("/bin/echo", &["multi"]));
+        let client =
+            InProcessRuntimeClient::with_shell(5, test_store(), spec("/bin/echo", &["multi"]));
         let mut probe1 = Probe::new(client.subscribe());
         let mut probe2 = Probe::new(client.subscribe());
         client

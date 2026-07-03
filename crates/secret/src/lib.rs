@@ -42,12 +42,11 @@ pub fn masked_hint(secret: &str) -> String {
 }
 
 /// secret 저장소 추상화 (설계문서 Secret 모듈).
-/// 접근 직렬화(설계문서 1.4): 현재는 UI 스레드 단일 접근만 존재한다.
-/// 멀티스레드 도입 시 단일 actor 경유로 제한할 것.
-pub trait SecretStore {
+/// 접근 직렬화(설계문서 1.4): 쓰기/삭제는 UI 스레드, 읽기(get)는 runtime
+/// worker 단일 스레드에서만 일어난다 — 동일 credential 동시 접근 없음.
+pub trait SecretStore: Send + Sync {
     fn set_secret(&self, id: &str, secret: &SecretString) -> anyhow::Result<()>;
-    // PR-03 secret env binding / PR-09 spawn 직전 env 주입에서 소비 (설계문서 6.3)
-    #[allow(dead_code)]
+    /// spawn 직전 env 주입에서만 호출 (설계문서 6.3, PR-09)
     fn get_secret(&self, id: &str) -> anyhow::Result<SecretString>;
     fn delete_secret(&self, id: &str) -> anyhow::Result<()>;
 }

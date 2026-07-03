@@ -9,5 +9,5 @@ mod in_process;
 
 pub use client::{RuntimeClient, RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream};
 pub use command::{RuntimeCommand, SessionId};
-pub use event::RuntimeEvent;
+pub use event::{RuntimeEvent, SpawnKind};
 pub use in_process::InProcessRuntimeClient;

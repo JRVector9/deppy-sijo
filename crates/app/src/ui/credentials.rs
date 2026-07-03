@@ -1,5 +1,5 @@
-use crate::secret::{self, SecretStore, SecretString};
 use crate::storage::{CredentialMeta, Db};
+use secret::{self, SecretStore, SecretString};
 
 /// 자격증명 관리 창 상태. secret 입력값은 추가 즉시 비운다.
 pub struct CredentialsUi {

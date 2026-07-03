@@ -12,7 +12,8 @@ pub struct Db {
 }
 
 /// user_version 기반 forward-only 마이그레이션 (설계문서 11.9).
-/// 1: credentials (PR-02), 2: workspaces + env_profiles/env_vars (PR-03, 11.0/11.6)
+/// 1: credentials (PR-02), 2: workspaces + env_profiles/env_vars (PR-03, 11.0/11.6),
+/// 3: agent_configs (PR-09, 11.0 — *_regex 컬럼은 PR-12 status detector가 소비)
 const MIGRATIONS: &[&str] = &[
     "
 CREATE TABLE credentials (
@@ -67,6 +68,22 @@ CREATE TABLE env_vars (
 
 CREATE INDEX idx_env_vars_profile_key ON env_vars(profile_id, key);
 ",
+    "
+CREATE TABLE agent_configs (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    command TEXT NOT NULL,
+    args_json TEXT NOT NULL,
+    env_json TEXT,
+    env_credentials_json TEXT,
+    waiting_regex TEXT,
+    approval_regex TEXT,
+    error_regex TEXT,
+    done_regex TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -90,6 +107,14 @@ pub struct EnvProfileRow {
 pub struct EnvVarRow {
     pub key: String,
     pub value: EnvValue,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentConfigRow {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
 }
 
 impl Db {
@@ -154,7 +179,7 @@ impl Db {
                     &meta.provider,
                     &meta.label,
                     &meta.credential_kind,
-                    crate::secret::KEYRING_SERVICE,
+                    secret::KEYRING_SERVICE,
                     &meta.id, // keyring username = credential id
                     &meta.masked_hint,
                 ),
@@ -326,6 +351,58 @@ impl Db {
                 [profile_id, key],
             )
             .with_context(|| format!("env var 삭제 실패: {key}"))?;
+        Ok(())
+    }
+
+    /// agent config 등록 (설계문서 PR-09). args는 array로만 저장한다 (완료 기준).
+    pub fn insert_agent_config(
+        &self,
+        name: &str,
+        command: &str,
+        args: &[String],
+    ) -> anyhow::Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let args_json = serde_json::to_string(args)?;
+        self.conn
+            .execute(
+                "INSERT INTO agent_configs (id, name, command, args_json, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4,
+                    strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                (&id, name, command, &args_json),
+            )
+            .with_context(|| format!("agent config 저장 실패: {name}"))?;
+        Ok(id)
+    }
+
+    pub fn list_agent_configs(&self) -> anyhow::Result<Vec<AgentConfigRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, command, args_json FROM agent_configs ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.map(|r| {
+            let (id, name, command, args_json) = r?;
+            Ok(AgentConfigRow {
+                id,
+                name,
+                command,
+                args: serde_json::from_str(&args_json)
+                    .with_context(|| format!("args_json 파싱 실패: {args_json}"))?,
+            })
+        })
+        .collect()
+    }
+
+    pub fn delete_agent_config(&self, id: &str) -> anyhow::Result<()> {
+        self.conn
+            .execute("DELETE FROM agent_configs WHERE id = ?1", [id])
+            .with_context(|| format!("agent config 삭제 실패: {id}"))?;
         Ok(())
     }
 }
@@ -501,6 +578,28 @@ mod tests {
     }
 
     #[test]
+    fn agent_config_crud와_args_array() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .insert_agent_config(
+                "빌드 에이전트",
+                "cargo",
+                &["build".into(), "--release".into()],
+            )
+            .unwrap();
+        let listed = db.list_agent_configs().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].command, "cargo");
+        // args는 array로 저장·복원된다 (완료 기준: 셸 문자열 금지)
+        assert_eq!(
+            listed[0].args,
+            vec!["build".to_owned(), "--release".to_owned()]
+        );
+        db.delete_agent_config(&id).unwrap();
+        assert!(db.list_agent_configs().unwrap().is_empty());
+    }
+
+    #[test]
     fn keyring_좌표가_기록된다() {
         let db = Db::open_in_memory().unwrap();
         db.insert_credential(&sample("cred-1")).unwrap();
@@ -512,7 +611,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(service, crate::secret::KEYRING_SERVICE);
+        assert_eq!(service, secret::KEYRING_SERVICE);
         assert_eq!(username, "cred-1");
     }
 }

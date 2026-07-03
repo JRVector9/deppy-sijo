@@ -90,7 +90,10 @@ impl ShellUi {
                         scroll_residual: 0.0,
                     });
                 }
-                RuntimeEvent::SpawnFailed { message } => {
+                RuntimeEvent::SpawnFailed { kind, message } => {
+                    if *kind != runtime::SpawnKind::Shell {
+                        continue; // agent 실패는 셸 창 소관이 아니다
+                    }
                     self.spawn_pending = false;
                     if self.open {
                         self.error = Some(format!("셸 시작 실패: {message}"));
@@ -109,6 +112,8 @@ impl ShellUi {
                         view.bracketed_paste = *bracketed_paste;
                     }
                 }
+                // agent 세션은 셸 창 소유가 아니다 (PR-10에서 pane이 소유)
+                RuntimeEvent::AgentSpawned { .. } => {}
                 RuntimeEvent::SessionExited { session, exit_code } => {
                     if let Some(view) = self.view.as_mut().filter(|v| v.session == *session) {
                         view.exit_code = Some(*exit_code);

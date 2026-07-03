@@ -3,9 +3,11 @@ use std::path::PathBuf;
 use runtime::{InProcessRuntimeClient, RuntimeEventReceiver, RuntimeEventStream};
 
 use crate::config::Config;
-use crate::secret::KeyringSecretStore;
+use std::sync::Arc;
+
 use crate::storage::Db;
 use crate::ui;
+use secret::KeyringSecretStore;
 
 pub struct App {
     config: Config,
@@ -14,6 +16,7 @@ pub struct App {
     db: Db,
     workspace_id: String,
     secret_store: KeyringSecretStore,
+    agents_ui: ui::agents::AgentsUi,
     credentials_ui: ui::credentials::CredentialsUi,
     env_profiles_ui: ui::env_profiles::EnvProfilesUi,
     shell_ui: ui::shell::ShellUi,
@@ -24,7 +27,10 @@ pub struct App {
 impl App {
     pub fn new(config: Config, config_path: PathBuf, db: Db, workspace_id: String) -> Self {
         // output_batch_ms는 시작 시 고정, scrollback_lines는 세션 spawn 시점에 전달
-        let runtime = InProcessRuntimeClient::new(config.performance.output_batch_ms);
+        let runtime = InProcessRuntimeClient::new(
+            config.performance.output_batch_ms,
+            Arc::new(KeyringSecretStore),
+        );
         let runtime_events = runtime.subscribe();
         Self {
             config,
@@ -33,6 +39,7 @@ impl App {
             db,
             workspace_id,
             secret_store: KeyringSecretStore,
+            agents_ui: ui::agents::AgentsUi::new(),
             credentials_ui: ui::credentials::CredentialsUi::new(),
             env_profiles_ui: ui::env_profiles::EnvProfilesUi::new(),
             shell_ui: ui::shell::ShellUi::new(),
@@ -61,6 +68,9 @@ impl eframe::App for App {
                 if ui.button("환경").clicked() {
                     self.env_profiles_ui.toggle();
                 }
+                if ui.button("에이전트").clicked() {
+                    self.agents_ui.toggle();
+                }
                 if ui.button("셸").clicked() {
                     self.shell_ui.toggle(&self.runtime);
                 }
@@ -68,6 +78,7 @@ impl eframe::App for App {
         });
         egui::CentralPanel::default().show(ui, |_ui| {});
 
+        self.agents_ui.show(ui.ctx(), &self.db);
         self.credentials_ui
             .show(ui.ctx(), &self.db, &self.secret_store);
         self.env_profiles_ui

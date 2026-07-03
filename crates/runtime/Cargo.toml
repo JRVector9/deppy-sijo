@@ -9,5 +9,9 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 deppy-core = { path = "../core" }
 pty = { path = "../pty" }
+secret = { path = "../secret" }
 session = { path = "../session" }
 terminal = { path = "../terminal" }
+
+[dev-dependencies]
+keyring-core = { workspace = true }

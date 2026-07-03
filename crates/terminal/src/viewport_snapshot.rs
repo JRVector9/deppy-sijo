@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 /// 설계문서 8.1 TerminalViewportSnapshot. UI가 보는 유일한 화면 상태.
+/// serde는 remote transport(PR-19) 직렬화용 — visible_cells의 Arc는 serde rc feature.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TerminalViewportSnapshot {
     pub cols: u16,
     pub rows: u16,
@@ -15,7 +17,7 @@ pub struct TerminalViewportSnapshot {
 }
 
 /// 색상은 backend에서 RGB로 해석을 끝낸다 — UI는 팔레트를 모른다.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TerminalCell {
     pub c: char,
     pub fg: [u8; 3],
@@ -26,7 +28,7 @@ pub struct TerminalCell {
     pub wide_spacer: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CursorSnapshot {
     pub col: u16,
     pub row: u16,
@@ -34,14 +36,14 @@ pub struct CursorSnapshot {
     pub visible: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum CursorShape {
     Block,
     Underline,
     Beam,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CellRange {
     pub start: usize,
     pub end: usize,

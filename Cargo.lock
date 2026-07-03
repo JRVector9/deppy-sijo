@@ -876,6 +876,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 name = "deppy-core"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "uuid",
 ]
 
@@ -2210,6 +2211,7 @@ name = "mux"
 version = "0.1.0"
 dependencies = [
  "deppy-core",
+ "serde",
 ]
 
 [[package]]
@@ -3245,6 +3247,8 @@ dependencies = [
  "mux",
  "pty",
  "secret",
+ "serde",
+ "serde_json",
  "session",
  "storage",
  "terminal",
@@ -3538,6 +3542,7 @@ dependencies = [
  "deppy-core",
  "pty",
  "regex",
+ "serde",
  "terminal",
  "tracing",
 ]
@@ -3857,6 +3862,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "egui",
+ "serde",
 ]
 
 [[package]]

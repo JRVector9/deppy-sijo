@@ -2,7 +2,7 @@ pub use deppy_core::{MuxPaneId, MuxTabId, SessionId};
 pub use mux::SplitDirection;
 
 /// UI → Runtime 명령 (설계문서 2.1). v0은 단일 셸 세션에 필요한 것만.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum RuntimeCommand {
     SpawnShell {
         cols: u16,

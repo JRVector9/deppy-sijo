@@ -1,7 +1,7 @@
 use deppy_core::MuxPaneId;
 
 /// 설계문서 5.3 LayoutTree. split 구조의 source of truth.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LayoutNode {
     Pane(MuxPaneId),
     Split {
@@ -12,7 +12,7 @@ pub enum LayoutNode {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SplitDirection {
     Horizontal,
     Vertical,

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+serde = { workspace = true }
 anyhow = { workspace = true }
 alacritty_terminal = { workspace = true }
 egui = { workspace = true }

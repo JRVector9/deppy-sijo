@@ -1,7 +1,7 @@
 //! 공유 id 타입 (설계문서 9장 core, 10장 의존 방향의 최하층).
 
 /// runtime 내부 세션 식별자. 영속 id(sessions 테이블)와의 매핑은 PR-08.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SessionId(pub u64);
 
 /// 영속 테이블(11장)이 TEXT UUID id를 쓰므로 mux 계열 id는 String UUID다 —
@@ -9,7 +9,7 @@ pub struct SessionId(pub u64);
 macro_rules! uuid_id {
     ($(#[$doc:meta])* $name:ident) => {
         $(#[$doc])*
-        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
         pub struct $name(pub String);
 
         impl $name {

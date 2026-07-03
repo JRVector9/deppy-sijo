@@ -153,7 +153,9 @@ impl CredentialsUi {
         };
         if let Err(e) = db.insert_credential(&meta) {
             // metadata 실패 시 keyring 고아 entry 방지 (rollback)
-            let _ = store.delete_secret(&id);
+            if let Err(rollback) = store.delete_secret(&id) {
+                tracing::warn!(credential_id = %id, "rollback 실패 — 고아 keyring entry: {rollback:#}");
+            }
             return Err(e);
         }
         tracing::info!(credential_id = %id, "credential 추가"); // secret 값은 로그 금지
@@ -164,16 +166,24 @@ impl CredentialsUi {
     }
 
     fn delete(&mut self, db: &Db, store: &dyn SecretStore, id: &str) -> anyhow::Result<()> {
-        // 참조 검사 먼저 — 어느 단계에서 실패해도 재시도 가능한 순서:
-        // keyring 실패 시 metadata 보존, DB 실패 시 delete_secret이 NoEntry 허용이라 재시도 수렴
+        // 순서 근거 (codex 리뷰 왕복):
+        // 1) 참조 검사 — 참조 중이면 아무것도 건드리지 않는다.
+        // 2) keyring 삭제 먼저 — 실패(잠긴 keychain 등)하면 metadata가 남아
+        //    있으므로 사용자가 재시도할 수 있다.
+        // 3) 조건부 DB 삭제 — 검사~삭제 사이에 참조가 생기는 rare race면
+        //    행이 남는데, secret은 이미 지워졌고(안전한 방향) delete_secret이
+        //    NoEntry를 성공으로 취급하므로 재시도가 수렴한다.
         if db.credential_in_use(id)? {
             anyhow::bail!("env var가 참조 중인 credential입니다 — 해당 변수를 먼저 삭제하세요");
         }
         store.delete_secret(id)?;
-        // OAuth credential은 refresh token이 별도 entry에 있다 (PR-18).
-        // delete_secret은 NoEntry를 성공으로 취급하므로 kind 무관하게 항상 시도.
+        // OAuth refresh token entry도 함께 (NoEntry는 성공 취급 — kind 무관 시도)
         store.delete_secret(&auth::refresh_entry_id(id))?;
-        db.delete_credential(id)?; // env_vars FK는 backstop
+        if !db.delete_credential_if_unused(id)? {
+            anyhow::bail!(
+                "삭제 중 env var 참조가 생겼습니다 — secret은 지워졌으니 변수 정리 후 다시 삭제하세요"
+            );
+        }
         tracing::info!(credential_id = %id, "credential 삭제");
         self.cached = None;
         Ok(())

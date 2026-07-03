@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tracing = { workspace = true }
 anyhow = { workspace = true }
 portable-pty = { workspace = true }
 

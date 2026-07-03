@@ -209,7 +209,7 @@ impl Db {
     }
 
     pub fn list_credentials(&self) -> anyhow::Result<Vec<CredentialMeta>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, provider, label, credential_kind, masked_hint
              FROM credentials ORDER BY created_at, id",
         )?;
@@ -225,21 +225,32 @@ impl Db {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    pub fn delete_credential(&self, id: &str) -> anyhow::Result<()> {
-        self.conn
-            .execute("DELETE FROM credentials WHERE id = ?1", [id])
+    /// 참조가 없을 때만 metadata 행을 지운다 — 확인과 삭제를 한 문장으로 묶어
+    /// "확인 후 삭제 사이에 참조가 생기는" TOCTOU를 없앤다 (codex 리뷰).
+    /// 지웠으면 true, 참조 중이거나 없는 id면 false.
+    pub fn delete_credential_if_unused(&self, id: &str) -> anyhow::Result<bool> {
+        let affected = self
+            .conn
+            .execute(
+                "DELETE FROM credentials WHERE id = ?1
+                   AND NOT EXISTS (SELECT 1 FROM env_vars WHERE credential_id = ?1)",
+                [id],
+            )
             .with_context(|| format!("credential 삭제 실패: {id}"))?;
-        Ok(())
+        Ok(affected == 1)
     }
 
-    /// env var가 이 credential을 참조 중인지 확인 (삭제 전 검사용).
+    /// env var가 이 credential을 참조 중인지 확인 (UI 에러 메시지 구분용).
     pub fn credential_in_use(&self, id: &str) -> anyhow::Result<bool> {
-        let count: i64 = self.conn.query_row(
-            "SELECT count(*) FROM env_vars WHERE credential_id = ?1",
-            [id],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
+        let exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM env_vars WHERE credential_id = ?1 LIMIT 1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(exists.is_some())
     }
 
     /// 기본 workspace를 보장하고 id를 돌려준다. 실제 workspace 관리는 PR-14.
@@ -310,7 +321,7 @@ impl Db {
     }
 
     pub fn list_env_profiles(&self, workspace_id: &str) -> anyhow::Result<Vec<EnvProfileRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, name, kind, is_production FROM env_profiles
              WHERE workspace_id = ?1 ORDER BY created_at, id",
         )?;
@@ -370,7 +381,7 @@ impl Db {
     }
 
     pub fn list_env_vars(&self, profile_id: &str) -> anyhow::Result<Vec<EnvVarRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT key, kind, plain_value, credential_id FROM env_vars
              WHERE profile_id = ?1 ORDER BY key",
         )?;
@@ -437,7 +448,7 @@ impl Db {
     }
 
     pub fn list_agent_configs(&self) -> anyhow::Result<Vec<AgentConfigRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, name, command, args_json,
                     waiting_regex, approval_regex, error_regex, done_regex
              FROM agent_configs ORDER BY created_at, id",
@@ -545,10 +556,12 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0], sample("cred-1"));
 
-        db.delete_credential("cred-1").unwrap();
+        assert!(db.delete_credential_if_unused("cred-1").unwrap());
         let listed = db.list_credentials().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, "cred-2");
+        // 없는 id는 false (참조 중과 동일하게 "안 지움")
+        assert!(!db.delete_credential_if_unused("cred-1").unwrap());
     }
 
     #[test]
@@ -651,12 +664,13 @@ mod tests {
             },
         )
         .unwrap();
-        // 참조 검사 + FK가 참조 중인 credential 삭제를 막는다 (keyring drift 방지의 전제)
+        // 원자 삭제: 참조 중이면 지우지 않는다 (확인+삭제 한 문장 — TOCTOU 없음)
         assert!(db.credential_in_use("cred-1").unwrap());
-        assert!(db.delete_credential("cred-1").is_err());
+        assert!(!db.delete_credential_if_unused("cred-1").unwrap());
+        assert_eq!(db.list_credentials().unwrap().len(), 1); // 그대로
         db.delete_env_var(&profile, "API_KEY").unwrap();
         assert!(!db.credential_in_use("cred-1").unwrap());
-        assert!(db.delete_credential("cred-1").is_ok());
+        assert!(db.delete_credential_if_unused("cred-1").unwrap());
     }
 
     #[test]

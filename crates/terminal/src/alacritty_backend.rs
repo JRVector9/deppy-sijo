@@ -82,7 +82,13 @@ fn new_term(
 
 impl TerminalBackend for AlacrittyBackend {
     fn feed(&mut self, bytes: &[u8]) -> anyhow::Result<TerminalChangeSet> {
-        let cursor_before = self.term.grid().cursor.point;
+        // 위치만 비교하면 DECTCEM(?25l/h) 가시성이나 DECSCUSR shape 변경을
+        // 놓친다 (codex 리뷰) — dirty 기반 repaint가 cursor-only 변화를 못 본다
+        let cursor_before = (
+            self.term.grid().cursor.point,
+            self.term.mode().contains(TermMode::SHOW_CURSOR),
+            self.term.cursor_style(),
+        );
         self.processor.advance(&mut self.term, bytes);
 
         let screen_lines = self.term.screen_lines();
@@ -122,7 +128,11 @@ impl TerminalBackend for AlacrittyBackend {
         }
         Ok(TerminalChangeSet {
             dirty_rows,
-            cursor_changed: self.term.grid().cursor.point != cursor_before,
+            cursor_changed: (
+                self.term.grid().cursor.point,
+                self.term.mode().contains(TermMode::SHOW_CURSOR),
+                self.term.cursor_style(),
+            ) != cursor_before,
             // title/bell 이벤트 소비는 PR-10/13에서
             title_changed: false,
             bell: false,
@@ -194,8 +204,10 @@ impl TerminalBackend for AlacrittyBackend {
             rows: rows as u16,
             cursor,
             visible_cells: cells.into(),
-            dirty_ranges: Vec::new(), // PR-21 렌더 최적화에서 채움
-            title: None,              // PR-10 tabs에서 listener 도입 시
+            // 항상 빈 값 — 아직 소비자(부분 렌더러)가 없다. 채우려면 스크롤/리플로우
+            // 좌표계와 함께 설계해야 하므로 부분 렌더 도입 시 같이 간다 (codex 리뷰 기록)
+            dirty_ranges: Vec::new(),
+            title: None, // PR-10 tabs에서 listener 도입 시
             scroll_offset: display_offset as i32,
             is_alt_screen: self.term.mode().contains(TermMode::ALT_SCREEN),
         })

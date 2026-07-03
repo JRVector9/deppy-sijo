@@ -14,6 +14,9 @@ pub struct EnvProfilesUi {
     error: Option<String>,
     profiles: Option<Vec<EnvProfileRow>>,
     vars: Option<Vec<EnvVarRow>>,
+    /// 캐시가 속한 workspace — 다른 workspace로 바뀌면 캐시/선택을 통째로 버린다
+    /// (§6.1 "프로젝트 A 키가 B에 들어감" 방지 — codex 리뷰)
+    cached_workspace: Option<String>,
 }
 
 impl EnvProfilesUi {
@@ -30,6 +33,7 @@ impl EnvProfilesUi {
             error: None,
             profiles: None,
             vars: None,
+            cached_workspace: None,
         }
     }
 
@@ -62,6 +66,14 @@ impl EnvProfilesUi {
         db: &mut Db,
         workspace_id: &str,
     ) -> anyhow::Result<()> {
+        if self.cached_workspace.as_deref() != Some(workspace_id) {
+            // workspace가 바뀌었다 — 이전 workspace의 profile/var/선택으로
+            // 조회·삭제·upsert하면 안 된다
+            self.profiles = None;
+            self.vars = None;
+            self.selected = None;
+            self.cached_workspace = Some(workspace_id.to_owned());
+        }
         let profiles = match &self.profiles {
             Some(p) => p.clone(),
             None => {
@@ -202,7 +214,12 @@ impl EnvProfilesUi {
                 ui.text_edit_singleline(&mut self.var_plain_value);
             });
         }
-        let filled = !self.var_key.trim().is_empty()
+        // key에 '='/NUL은 env로 전달 불가 (spawn 계층에서 깨진다 — codex 리뷰)
+        let key_valid = {
+            let key = self.var_key.trim();
+            !key.is_empty() && !key.contains('=') && !key.contains('\0')
+        };
+        let filled = key_valid
             && if self.var_is_secret {
                 self.var_credential_id.is_some()
             } else {
@@ -235,9 +252,14 @@ impl EnvProfilesUi {
                 vars: vars
                     .iter()
                     .filter_map(|v| {
-                        std::env::var(&v.key)
-                            .ok()
-                            .map(|val| (v.key.clone(), EnvValue::Plain(val)))
+                        // 충돌 감지(var_os)와 같은 기준 — 비-UTF8 값도 누락하지
+                        // 않는다 (lossy 표기. codex 리뷰)
+                        std::env::var_os(&v.key).map(|val| {
+                            (
+                                v.key.clone(),
+                                EnvValue::Plain(val.to_string_lossy().into_owned()),
+                            )
+                        })
                     })
                     .collect(),
             };

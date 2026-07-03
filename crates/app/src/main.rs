@@ -11,16 +11,18 @@ fn main() -> anyhow::Result<()> {
     let paths = paths::AppPaths::init()?;
     // guard가 drop되면 파일 로그 flush가 끊기므로 main 끝까지 유지한다.
     let _log_guard = init_logging(&paths);
+    // 중복 실행 방지 lock (설계문서 PR-14 crash recovery). config 로드/생성보다
+    // 먼저 잡는다 — 두 인스턴스의 config I/O 경쟁도 이 lock이 보호한다 (codex 리뷰).
+    // drop 시 자동 해제되므로 main 끝까지 살려 둔다.
+    let _run_lock = persist::LockFile::acquire(&paths.data_dir.join("deppy.lock"))
+        .map_err(|e| anyhow::anyhow!("이미 실행 중이거나 lock 획득 실패: {e:#}"))?;
+
     let config = config::Config::load_or_create(&paths.config_dir)?;
     let config_path = config::config_path(&paths.config_dir);
     // insecure fallback 금지(설계문서 1.4) — 등록 실패 시 credential 조작이 에러로 표면화된다
     if let Err(e) = secret::init_platform_store() {
         tracing::warn!("keyring store 초기화 실패 — 자격증명 기능 비활성: {e:#}");
     }
-    // 중복 실행 방지 lock (설계문서 PR-14 crash recovery). drop 시 자동 해제되므로
-    // main 끝까지 살려 둔다. 살아있는 다른 인스턴스가 잡고 있으면 여기서 종료된다.
-    let _run_lock = persist::LockFile::acquire(&paths.data_dir.join("deppy.lock"))
-        .map_err(|e| anyhow::anyhow!("이미 실행 중이거나 lock 획득 실패: {e:#}"))?;
 
     let db = storage::Db::open(&paths.data_dir.join("metadata.sqlite3"))?;
     let workspace_id = db.ensure_default_workspace()?;

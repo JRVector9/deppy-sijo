@@ -81,7 +81,12 @@ impl Config {
         if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("config 읽기 실패: {}", path.display()))?;
-            toml::from_str(&text).with_context(|| format!("config 파싱 실패: {}", path.display()))
+            let mut config: Self = toml::from_str(&text)
+                .with_context(|| format!("config 파싱 실패: {}", path.display()))?;
+            // TOML을 손으로 고친 경우 UI 위젯 범위 밖 값이 들어올 수 있다 —
+            // 로드 경계에서 정규화 (codex 리뷰: batch 0 = busy-poll, 폭주 scrollback)
+            config.normalize();
+            Ok(config)
         } else {
             let config = Self::default();
             config.save(&path)?;
@@ -89,15 +94,49 @@ impl Config {
         }
     }
 
+    /// 범위 밖 값을 안전 범위로 클램프한다 (settings UI 위젯 범위와 동일 기준).
+    fn normalize(&mut self) {
+        let t = &mut self.terminal;
+        t.font_size = if t.font_size.is_finite() {
+            t.font_size.clamp(8.0, 32.0)
+        } else {
+            TerminalConfig::default().font_size
+        };
+        t.scrollback_lines = t.scrollback_lines.clamp(100, 100_000);
+        self.performance.output_batch_ms = self.performance.output_batch_ms.clamp(1, 1_000);
+    }
+
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        std::fs::write(path, toml::to_string_pretty(self)?)
-            .with_context(|| format!("config 저장 실패: {}", path.display()))
+        // 임시 파일 + rename — 쓰기 중 크래시로 빈/부분 TOML이 남아
+        // 다음 시작이 파싱 실패로 죽는 것 방지 (codex 리뷰. rename은 동일
+        // 디렉터리 내에서 원자적)
+        let text = toml::to_string_pretty(self)?;
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, &text)
+            .with_context(|| format!("config 임시 저장 실패: {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("config 교체 실패: {}", path.display()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 손으로_고친_범위밖_config는_로드시_정규화() {
+        let dir = std::env::temp_dir().join(format!("deppy-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            config_path(&dir),
+            "[ui]\ntheme = \"dark\"\n[terminal]\nfont_size = 999.0\nscrollback_lines = 1\n[performance]\noutput_batch_ms = 0\n",
+        )
+        .unwrap();
+        let config = Config::load_or_create(&dir).unwrap();
+        assert_eq!(config.terminal.font_size, 32.0);
+        assert_eq!(config.terminal.scrollback_lines, 100);
+        assert_eq!(config.performance.output_batch_ms, 1); // 0이면 busy-poll
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn 기본값_roundtrip() {

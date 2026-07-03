@@ -1,8 +1,8 @@
 //! PTY 격리 crate (설계문서 1.2 / 9장).
 //! portable-pty 타입은 이 crate 밖으로 노출하지 않는다 — PtyBackend trait으로 감싼다.
 
-use std::io::Read;
-use std::sync::mpsc::{Receiver, sync_channel};
+use std::io::{Read, Write};
+use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
 
 use anyhow::Context;
 
@@ -48,9 +48,32 @@ pub struct PortablePtyBackend;
 struct PortablePtySession {
     // resize용으로만 유지. reader/writer는 이미 분리해서 보관한다.
     master: Box<dyn portable_pty::MasterPty + Send>,
-    writer: Box<dyn std::io::Write + Send>,
+    /// 입력은 writer 전용 스레드가 쓴다 — worker가 blocking write에 매달리지 않는다.
+    /// (출력 폭주로 child의 stdout이 막힌 상태에서 worker가 대량 paste를
+    /// 동기 write하면 reader(backpressure)와 맞물려 full-duplex deadlock — codex P1)
+    input_tx: Option<Sender<Vec<u8>>>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     output: Option<Receiver<Vec<u8>>>,
+}
+
+/// kill 후 reap을 폴링으로 — kill이 실패해도(권한/플랫폼 문제) 무한 wait에
+/// 매달리지 않는다 (codex P1: portable-pty 0.9 Windows kill 리스크).
+/// 제한 시간 내에 reap하지 못하면 leak을 감수하고 로그만 남긴다.
+fn kill_and_reap_bounded(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
+    let _ = child.kill();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return, // reap 완료
+            Ok(None) => {}
+            Err(_) => return, // 조회 불가 — 더 기다려도 알 수 없다
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!("PTY child가 kill 후에도 종료되지 않음 — reap 포기 (leak 감수)");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 fn pty_size(cols: u16, rows: u16) -> portable_pty::PtySize {
@@ -85,35 +108,75 @@ impl PtyBackend for PortablePtyBackend {
         // 비결정적 — spawn 직후 즉시 drop한다.
         drop(pair.slave);
 
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .context("PTY reader 생성 실패")?;
-        let writer = pair.master.take_writer().context("PTY writer 생성 실패")?;
+        // 여기부터 실패하면 child가 orphan으로 남는다 — 실패 경로에서 정리 (codex P2)
+        let mut child = child;
+        let mut reader = match pair.master.try_clone_reader() {
+            Ok(reader) => reader,
+            Err(e) => {
+                kill_and_reap_bounded(&mut child);
+                return Err(e).context("PTY reader 생성 실패");
+            }
+        };
+        let mut writer = match pair.master.take_writer() {
+            Ok(writer) => writer,
+            Err(e) => {
+                kill_and_reap_bounded(&mut child);
+                return Err(e).context("PTY writer 생성 실패");
+            }
+        };
 
         // bounded 채널: 소비가 느리면 reader thread가 send에서 블록 → PTY 버퍼가
         // 차고 child가 write에서 멈추는 표준 backpressure. 무한 메모리 증가 방지.
         let (tx, rx) = sync_channel(64);
-        std::thread::Builder::new()
-            .name("pty-reader".into())
-            .spawn(move || {
-                let mut buf = [0u8; 8192];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) | Err(_) => break, // EOF → 채널 drop으로 종료 전파
-                        Ok(n) => {
-                            if tx.send(buf[..n].to_vec()).is_err() {
-                                break; // 수신측이 사라짐
+        let reader_thread =
+            std::thread::Builder::new()
+                .name("pty-reader".into())
+                .spawn(move || {
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match reader.read(&mut buf) {
+                            Ok(0) | Err(_) => break, // EOF → 채널 drop으로 종료 전파
+                            Ok(n) => {
+                                if tx.send(buf[..n].to_vec()).is_err() {
+                                    break; // 수신측이 사라짐
+                                }
                             }
                         }
                     }
-                }
-            })
-            .context("PTY reader thread 생성 실패")?;
+                });
+        if let Err(e) = reader_thread {
+            kill_and_reap_bounded(&mut child);
+            return Err(e).context("PTY reader thread 생성 실패");
+        }
+
+        // 입력 전용 writer thread — write_input은 채널 send만 하고 즉시 리턴.
+        // 채널은 unbounded: 입력(타이핑/paste)은 출력과 달리 사용자 규모라
+        // 무한 누적 위험이 낮고, 여기서 backpressure를 주면 위 deadlock이 돌아온다.
+        let (input_tx, input_rx) = channel::<Vec<u8>>();
+        let writer_thread =
+            std::thread::Builder::new()
+                .name("pty-writer".into())
+                .spawn(move || {
+                    for bytes in input_rx {
+                        if writer
+                            .write_all(&bytes)
+                            .and_then(|()| writer.flush())
+                            .is_err()
+                        {
+                            // PTY가 닫힘 — 세션 종료 경로가 곧 정리한다
+                            tracing::debug!("PTY 입력 쓰기 실패 — writer 종료");
+                            break;
+                        }
+                    }
+                });
+        if let Err(e) = writer_thread {
+            kill_and_reap_bounded(&mut child);
+            return Err(e).context("PTY writer thread 생성 실패");
+        }
 
         Ok(Box::new(PortablePtySession {
             master: pair.master,
-            writer,
+            input_tx: Some(input_tx),
             child,
             output: Some(rx),
         }))
@@ -131,8 +194,14 @@ impl Drop for PortablePtySession {
         if let Some(pgid) = self.master.process_group_leader() {
             unsafe { libc::killpg(pgid, libc::SIGHUP) };
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait(); // zombie 방지 reap
+        // kill 실패해도 무한 wait에 매달리지 않는다 (bounded reap — codex P1)
+        kill_and_reap_bounded(&mut self.child);
+        // teardown 계약: input_tx drop → writer thread 종료(채널 닫힘),
+        // output Receiver drop(필드) → send 블록된 reader thread가 Err로 풀림,
+        // reader의 read 블록은 child 종료의 EOF로 풀린다. thread join은 하지
+        // 않는다 — SIGHUP을 무시한 grandchild가 slave를 쥐고 있으면 read가
+        // 안 끝날 수 있어, join이 오히려 Drop을 영구 블록시킨다 (detach가 안전).
+        drop(self.input_tx.take());
     }
 }
 
@@ -142,13 +211,20 @@ impl PtySession for PortablePtySession {
     }
 
     fn write_input(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
-        self.writer.write_all(bytes).context("PTY 입력 실패")?;
-        self.writer.flush().context("PTY flush 실패")
+        // writer thread로 위임 — worker가 blocking write에 매달리지 않는다.
+        // 쓰기 에러는 비동기(writer thread 로그)로 넘어간다: 여기서의 실패는
+        // "세션이 이미 끝남"뿐이다.
+        self.input_tx
+            .as_ref()
+            .context("PTY writer가 이미 종료됨")?
+            .send(bytes.to_vec())
+            .map_err(|_| anyhow::anyhow!("PTY writer가 이미 종료됨"))
     }
 
     fn resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()> {
+        // 0 크기는 PTY/터미널 계층에서 의미가 없다 — 경계에서 clamp (codex P3)
         self.master
-            .resize(pty_size(cols, rows))
+            .resize(pty_size(cols.max(1), rows.max(1)))
             .context("PTY resize 실패")
     }
 
@@ -161,6 +237,12 @@ impl PtySession for PortablePtySession {
     }
 
     fn kill(&mut self) -> anyhow::Result<()> {
+        // Drop과 같은 규약: process group에 SIGHUP까지 — grandchild job 포함
+        // (reap은 try_exit_code/Drop 경로가 담당. codex P2)
+        #[cfg(unix)]
+        if let Some(pgid) = self.master.process_group_leader() {
+            unsafe { libc::killpg(pgid, libc::SIGHUP) };
+        }
         self.child.kill().context("프로세스 kill 실패")
     }
 }
@@ -237,6 +319,23 @@ mod tests {
         }
         assert!(String::from_utf8_lossy(&out).contains("ping"));
         session.kill().unwrap();
+    }
+
+    /// codex P1 회귀: 출력 폭주(수신 미소비)로 backpressure가 걸린 상태에서
+    /// 대량 입력이 worker를 블록하면 full-duplex deadlock이었다 —
+    /// write_input은 이제 writer thread 위임이라 즉시 리턴해야 한다.
+    #[test]
+    fn 출력_폭주중_대량_입력이_블록되지_않는다() {
+        let mut session = spawn("/bin/cat", &[]);
+        let _rx = session.take_output().unwrap(); // 붙잡되 소비하지 않음
+        let big = vec![b'x'; 1024 * 1024];
+        let start = Instant::now();
+        session.write_input(&big).unwrap(); // cat echo → 채널/PTY 버퍼 포화 유도
+        session.write_input(&big).unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "write_input이 블록됨 (deadlock 재발)"
+        );
     }
 
     #[test]

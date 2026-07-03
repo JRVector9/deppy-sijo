@@ -73,13 +73,10 @@ impl LockFile {
 
 impl Drop for LockFile {
     fn drop(&mut self) {
-        // advisory lock은 _file drop 시 OS가 해제한다. 파일은 best-effort로 지운다
-        // (남아 있어도 다음 실행이 lock을 다시 걸 수 있으므로 무해).
-        if let Err(e) = fs::remove_file(&self.path)
-            && e.kind() != ErrorKind::NotFound
-        {
-            tracing::warn!(lock = %self.path.display(), "lock 파일 제거 실패: {e}");
-        }
+        // advisory lock은 _file drop 시 OS가 해제한다. 파일은 **지우지 않는다** —
+        // unix advisory lock은 inode 기준이라, unlink 후 새 프로세스가 같은 경로에
+        // 새 inode로 lock을 잡으면 아직 살아있는 이 프로세스와 중복 실행이 가능해진다
+        // (codex 리뷰 반영). 파일 잔존은 무해: 판정은 언제나 lock으로만 한다.
     }
 }
 

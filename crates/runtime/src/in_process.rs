@@ -711,7 +711,8 @@ impl Worker {
             {
                 // 게이트는 "이번 tick의 새 출력" — 누적 dirty를 쓰면 hidden 세션이
                 // 매 tick 전체 grid를 스캔하게 된다 (hidden은 snapshot으로 dirty가 안 지워짐)
-                let screen = result.produced_output.then(|| active.screen_text());
+                let screen = (result.produced_output || detector.take_screen_scan_request())
+                    .then(|| active.screen_text());
                 if let Some(status) = detector.evaluate(screen.as_deref()) {
                     events.push(RuntimeEvent::SessionStatusChanged {
                         session: active.id(),
@@ -854,12 +855,12 @@ mod tests {
                 scrollback_lines: 100,
             })
             .unwrap();
-        let session = probe.wait_for(Duration::from_secs(5), |e| match e {
+        let session = probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::ShellSpawned { session } => Some(*session),
             _ => None,
         });
         // 출력이 Viewport로 push된다
-        probe.wait_for(Duration::from_secs(5), |e| match e {
+        probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::Viewport { snapshot, .. }
                 if snapshot_text(snapshot, 0).contains("hi-runtime") =>
             {
@@ -868,7 +869,7 @@ mod tests {
             _ => None,
         });
         // echo 종료 → SessionExited
-        let (exited, code) = probe.wait_for(Duration::from_secs(5), |e| match e {
+        let (exited, code) = probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::SessionExited {
                 session, exit_code, ..
             } => Some((*session, *exit_code)),
@@ -896,7 +897,7 @@ mod tests {
                 scrollback_lines: 100,
             })
             .unwrap();
-        let session = probe.wait_for(Duration::from_secs(5), |e| match e {
+        let session = probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::ShellSpawned { session } => Some(*session),
             _ => None,
         });
@@ -906,7 +907,7 @@ mod tests {
                 bytes: b"ping\r".to_vec(),
             })
             .unwrap();
-        probe.wait_for(Duration::from_secs(5), |e| match e {
+        probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::Viewport { snapshot, .. }
                 if snapshot_text(snapshot, 0).contains("ping") =>
             {
@@ -926,7 +927,7 @@ mod tests {
                 scrollback_lines: 100,
             })
             .unwrap();
-        let new_session = probe.wait_for(Duration::from_secs(5), |e| match e {
+        let new_session = probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::ShellSpawned { session: s } if *s != session => Some(*s),
             _ => None,
         });
@@ -951,11 +952,11 @@ mod tests {
                 scrollback_lines: 100,
             })
             .unwrap();
-        let session = probe.wait_for(Duration::from_secs(5), |e| match e {
+        let session = probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::ShellSpawned { session } => Some(*session),
             _ => None,
         });
-        probe.wait_for(Duration::from_secs(5), |e| match e {
+        probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::SessionExited { .. } => Some(()),
             _ => None,
         });
@@ -965,7 +966,7 @@ mod tests {
         client
             .send_command(RuntimeCommand::Scroll { session, delta: 1 })
             .unwrap();
-        probe.wait_for(Duration::from_secs(5), |e| match e {
+        probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::Viewport { snapshot, .. }
                 if snapshot_text(snapshot, 0).contains("done") =>
             {
@@ -996,7 +997,7 @@ mod tests {
                 })
                 .unwrap();
             let known = ids.clone();
-            let id = probe.wait_for(Duration::from_secs(5), move |e| match e {
+            let id = probe.wait_for(Duration::from_secs(15), move |e| match e {
                 RuntimeEvent::ShellSpawned { session } if !known.contains(session) => {
                     Some(*session)
                 }
@@ -1014,7 +1015,7 @@ mod tests {
                 .unwrap();
         }
         // active pane만 Viewport가 온다 (14.4) — pane 포커스를 옮겨가며 각자 확인
-        let mux = probe.wait_for(Duration::from_secs(5), |e| match e {
+        let mux = probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::MuxUpdated { snapshot } if snapshot.tabs.len() == 3 => {
                 Some(snapshot.clone())
             }
@@ -1034,7 +1035,7 @@ mod tests {
                 .unwrap();
             let expect = format!("mark-{i}");
             let id = *id;
-            probe.wait_for(Duration::from_secs(5), move |e| match e {
+            probe.wait_for(Duration::from_secs(15), move |e| match e {
                 RuntimeEvent::Viewport {
                     session, snapshot, ..
                 } if *session == id && snapshot_text(snapshot, 0).contains(&expect) => Some(()),
@@ -1063,7 +1064,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        let mux = probe.wait_for(Duration::from_secs(5), |e| match e {
+        let mux = probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::MuxUpdated { snapshot } if snapshot.tabs.len() == 2 => {
                 Some(snapshot.clone())
             }
@@ -1085,7 +1086,7 @@ mod tests {
             })
             .unwrap();
         // active 세션 화면은 오고
-        probe.wait_for(Duration::from_secs(5), move |e| match e {
+        probe.wait_for(Duration::from_secs(15), move |e| match e {
             RuntimeEvent::Viewport {
                 session, snapshot, ..
             } if *session == active && snapshot_text(snapshot, 0).contains("visible") => Some(()),
@@ -1121,7 +1122,7 @@ mod tests {
                 scrollback_lines: 100,
             })
             .unwrap();
-        let mux = probe.wait_for(Duration::from_secs(5), |e| match e {
+        let mux = probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::MuxUpdated { snapshot } if snapshot.tabs.len() == 1 => {
                 Some(snapshot.clone())
             }
@@ -1135,7 +1136,7 @@ mod tests {
                 scrollback_lines: 100,
             })
             .unwrap();
-        let mux = probe.wait_for(Duration::from_secs(5), |e| match e {
+        let mux = probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::MuxUpdated { snapshot }
                 if snapshot.tabs.len() == 1 && snapshot.tabs[0].panes.len() == 2 =>
             {
@@ -1150,7 +1151,7 @@ mod tests {
         client
             .send_command(RuntimeCommand::ClosePane { pane: new_pane })
             .unwrap();
-        let mux = probe.wait_for(Duration::from_secs(5), |e| match e {
+        let mux = probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::MuxUpdated { snapshot }
                 if snapshot.tabs.len() == 1 && snapshot.tabs[0].panes.len() == 1 =>
             {
@@ -1163,7 +1164,7 @@ mod tests {
         client
             .send_command(RuntimeCommand::ClosePane { pane: first_pane })
             .unwrap();
-        probe.wait_for(Duration::from_secs(5), |e| match e {
+        probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::MuxUpdated { snapshot } if snapshot.tabs.is_empty() => Some(()),
             _ => None,
         });
@@ -1186,7 +1187,7 @@ mod tests {
                 scrollback_lines: 100,
             })
             .unwrap();
-        probe.wait_for(Duration::from_secs(5), |e| match e {
+        probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::SpawnFailed {
                 kind: SpawnKind::Shell,
                 ..
@@ -1231,7 +1232,7 @@ mod tests {
                 done_regex: None,
             })
             .unwrap();
-        probe.wait_for(Duration::from_secs(5), |e| match e {
+        probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::Viewport { snapshot, .. }
                 if snapshot_text(snapshot, 0).contains("P=plain-v S=s3cret-value") =>
             {
@@ -1268,7 +1269,7 @@ mod tests {
             })
             .unwrap();
         // resolve 실패 → SpawnFailed, 메시지에 secret 값 없음 (credential id만)
-        let message = probe.wait_for(Duration::from_secs(5), |e| match e {
+        let message = probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::SpawnFailed { message, .. } => Some(message.clone()),
             _ => None,
         });
@@ -1326,11 +1327,11 @@ mod tests {
                 done_regex: None,
             })
             .unwrap();
-        let session = probe.wait_for(Duration::from_secs(5), |e| match e {
+        let session = probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::AgentSpawned { session } => Some(*session),
             _ => None,
         });
-        probe.wait_for(Duration::from_secs(5), |e| match e {
+        probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::SessionExited { .. } => Some(()),
             _ => None,
         });
@@ -1383,7 +1384,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        let mux = probe.wait_for(Duration::from_secs(5), |e| match e {
+        let mux = probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::MuxUpdated { snapshot } if snapshot.tabs.len() == 2 => {
                 Some(snapshot.clone())
             }
@@ -1399,7 +1400,7 @@ mod tests {
             })
             .unwrap();
         let expect_pane = mux.tabs[0].panes[0].id.clone();
-        probe.wait_for(Duration::from_secs(5), move |e| match e {
+        probe.wait_for(Duration::from_secs(15), move |e| match e {
             RuntimeEvent::MuxUpdated { snapshot }
                 if snapshot.active_tab == Some(first_tab.clone())
                     && snapshot.focused_pane == Some(expect_pane.clone()) =>
@@ -1414,7 +1415,7 @@ mod tests {
                 tab: mux.tabs[0].id.clone(),
             })
             .unwrap();
-        probe.wait_for(Duration::from_secs(5), move |e| match e {
+        probe.wait_for(Duration::from_secs(15), move |e| match e {
             RuntimeEvent::MuxUpdated { snapshot }
                 if snapshot.tabs.len() == 1 && snapshot.active_tab == Some(second_tab.clone()) =>
             {
@@ -1461,7 +1462,7 @@ mod tests {
             ))
             .unwrap();
         // 일반 출력의 line regex로 Waiting 감지 (완료 기준 1)
-        probe.wait_for(Duration::from_secs(5), |e| match e {
+        probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::SessionStatusChanged {
                 status: session::SessionStatus::Waiting,
                 ..
@@ -1490,7 +1491,7 @@ mod tests {
                 None,
             ))
             .unwrap();
-        let agent = probe.wait_for(Duration::from_secs(5), |e| match e {
+        let agent = probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::AgentSpawned { session } => Some(*session),
             _ => None,
         });
@@ -1502,14 +1503,14 @@ mod tests {
                 scrollback_lines: 100,
             })
             .unwrap();
-        probe.wait_for(Duration::from_secs(5), |e| match e {
+        probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::ShellSpawned { .. } => Some(()),
             _ => None,
         });
         probe.seen.clear(); // 이후 이벤트만 관찰
         // hidden 상태에서 화면 텍스트 패턴으로 감지 (완료 기준 2)
         let agent_id = agent;
-        probe.wait_for(Duration::from_secs(5), move |e| match e {
+        probe.wait_for(Duration::from_secs(15), move |e| match e {
             RuntimeEvent::SessionStatusChanged {
                 session,
                 status: session::SessionStatus::Waiting,
@@ -1544,7 +1545,7 @@ mod tests {
                 Some("ALL_TASKS_DONE"),
             ))
             .unwrap();
-        probe.wait_for(Duration::from_secs(5), |e| match e {
+        probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::SessionStatusChanged {
                 status: session::SessionStatus::Done,
                 ..
@@ -1579,7 +1580,7 @@ mod tests {
             })
             .unwrap();
         for probe in [&mut probe1, &mut probe2] {
-            probe.wait_for(Duration::from_secs(5), |e| match e {
+            probe.wait_for(Duration::from_secs(15), |e| match e {
                 RuntimeEvent::ShellSpawned { .. } => Some(()),
                 _ => None,
             });

@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 /// agent의 감지 상태. Exited는 lifecycle 소관이라 여기 없다.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SessionStatus {
     Running,
     /// 입력 대기 (regex 매치 또는 idle heuristic)
@@ -68,14 +68,19 @@ impl StatusPatterns {
     /// 스캔 범위는 **마지막 비어있지 않은 5줄** — 활성 프롬프트가 사는 영역이다.
     /// 화면 전체를 보면 이미 응답한 옛 프롬프트가 계속 재감지되어
     /// 상태가 고착된다 (heuristic — 화면 중앙 고정 다이얼로그는 놓칠 수 있음).
-    /// 꼬리 5줄에서 매치된 상태 목록 (같은 상태가 여러 줄이면 중복 포함 — 개수 의미).
-    fn match_screen(&self, text: &str) -> Vec<SessionStatus> {
+    /// 꼬리 5줄에서 매치된 (상태, 라인 원문) 목록 — 라인 원문은 소비 판정
+    /// (echo 연장 vs 새 프롬프트 구분)에 쓴다.
+    fn match_screen(&self, text: &str) -> Vec<(SessionStatus, String)> {
         const SCAN_TAIL_LINES: usize = 5;
         text.lines()
             .rev()
             .filter(|line| !line.trim().is_empty())
             .take(SCAN_TAIL_LINES)
-            .filter_map(|line| self.match_text(line.trim_end()))
+            .filter_map(|line| {
+                let line = line.trim_end();
+                self.match_text(line)
+                    .map(|status| (status, line.to_owned()))
+            })
             .collect()
     }
 
@@ -112,6 +117,13 @@ const IDLE_THRESHOLD: Duration = Duration::from_secs(10);
 /// stream line 버퍼 상한 (개행 없는 폭주 출력 대비)
 const LINE_BUF_CAP: usize = 8 * 1024;
 
+/// 입력으로 응답 처리된 화면 프롬프트 하나 (같은 텍스트는 count로 합산).
+struct ConsumedPrompt {
+    status: SessionStatus,
+    prefix: String,
+    count: usize,
+}
+
 pub struct StatusDetector {
     patterns: StatusPatterns,
     /// 완성되지 않은 마지막 라인 (chunk 경계 대응).
@@ -122,17 +134,20 @@ pub struct StatusDetector {
     status: SessionStatus,
     /// 마지막으로 호출측에 보고한 상태 — evaluate가 변화 판정에 쓴다
     last_reported: SessionStatus,
-    /// 사용자 입력으로 "응답 처리된" 화면 매치 (상태 → 소비 시점의 화면 출현 개수).
-    /// 현재 개수가 이보다 크면(같은/다른 프롬프트가 새로 등장) 다시 활성.
-    /// echo로 프롬프트 라인 텍스트가 바뀌어도 개수는 그대로라 재발화하지 않는다.
-    consumed_counts: std::collections::HashMap<SessionStatus, usize>,
-    /// 직전 evaluate의 화면 매치 개수 (on_input 소비 기준)
-    last_screen_counts: std::collections::HashMap<SessionStatus, usize>,
+    /// 사용자 입력으로 "응답 처리된" 화면 프롬프트.
+    /// 라인 prefix 기준 — echo로 라인이 늘어난 것(prefix 연장)은 같은 프롬프트,
+    /// 다른 텍스트는 (같은 상태여도) 새 프롬프트로 재감지한다.
+    /// count는 같은 텍스트 반복 프롬프트(새 복사본) 구분용.
+    consumed: Vec<ConsumedPrompt>,
+    /// 직전 evaluate의 화면 매치 (on_input 소비 기준)
+    last_screen_matches: Vec<(SessionStatus, String)>,
     /// 현재 상태가 idle heuristic에서 온 것인가 (출력이 오면 해제되는 약한 신호)
     idle_waiting: bool,
     /// 현재 상태가 화면 패턴에서 온 것인가 (매치 라인이 화면에서 사라지면 해제 —
     /// 프롬프트 timeout/auto-continue 대응). stream/idle 유래면 false.
     screen_derived: bool,
+    /// 출력이 없어도 다음 tick에 화면 스캔이 필요함 (입력 직후 — worker가 소비)
+    screen_scan_requested: bool,
 }
 
 impl StatusDetector {
@@ -143,11 +158,17 @@ impl StatusDetector {
             last_output: Instant::now(),
             status: SessionStatus::Running,
             last_reported: SessionStatus::Running,
-            consumed_counts: std::collections::HashMap::new(),
-            last_screen_counts: std::collections::HashMap::new(),
+            consumed: Vec::new(),
+            last_screen_matches: Vec::new(),
             idle_waiting: false,
             screen_derived: false,
+            screen_scan_requested: false,
         }
+    }
+
+    /// 출력과 무관하게 화면 스캔이 예약돼 있으면 소비하고 true (입력 직후 케이스).
+    pub fn take_screen_scan_request(&mut self) -> bool {
+        std::mem::take(&mut self.screen_scan_requested)
     }
 
     pub fn status(&self) -> SessionStatus {
@@ -155,9 +176,26 @@ impl StatusDetector {
     }
 
     /// 사용자 입력 수신 — 현재 화면의 매치 프롬프트를 "응답됨"으로 소비한다.
-    /// 소비는 직전 evaluate가 기록한 화면 매치 개수 기준.
+    /// 소비 단위는 (상태, 라인 텍스트) — echo로 연장된 라인은 같은 프롬프트로 본다.
     pub fn on_input(&mut self) {
-        self.consumed_counts = self.last_screen_counts.clone();
+        self.consumed.clear();
+        for (status, line) in &self.last_screen_matches {
+            match self
+                .consumed
+                .iter_mut()
+                .find(|c| c.status == *status && c.prefix == *line)
+            {
+                Some(consumed) => consumed.count += 1,
+                None => self.consumed.push(ConsumedPrompt {
+                    status: *status,
+                    prefix: line.clone(),
+                    count: 1,
+                }),
+            }
+        }
+        // 응답이 화면을 다시 그리지 않아도(echo 없는 TUI) 다음 tick에 화면을
+        // 재확인해야 한다 — 새 프롬프트가 이미 떠 있을 수 있다 (worker가 소비)
+        self.screen_scan_requested = true;
         self.status = SessionStatus::Running;
         self.idle_waiting = false;
         self.screen_derived = false;
@@ -183,11 +221,10 @@ impl StatusDetector {
         while let Some(pos) = self.line_buf.iter().position(|b| *b == b'\n') {
             let line: Vec<u8> = self.line_buf.drain(..=pos).collect();
             let line = String::from_utf8_lossy(&line);
-            // >= : 같은 상태여도 stream 매치면 latch로 굳힌다 (화면에서 사라져도 유지).
-            // 우선순위는 상태별 고유값이라 다른 상태로의 다운그레이드는 없다.
-            if let Some(status) = self.patterns.match_text(line.trim_end())
-                && priority(status) >= priority(self.status)
-            {
+            // 시간상 나중의 stream 매치가 이전 상태를 대체한다 — 우선순위는
+            // "같은 화면의 동시 매치" 충돌용이지 시간축 규칙이 아니다
+            // (APPROVE? 다음 ALL DONE이 오면 최종 상태는 Done이어야 한다).
+            if let Some(status) = self.patterns.match_text(line.trim_end()) {
                 self.status = status;
                 self.screen_derived = false; // stream 유래로 전환 (latch)
             }
@@ -206,28 +243,42 @@ impl StatusDetector {
         // edge-trigger — 같은 프롬프트 라인이 화면에 남아 있어도 재발화하지 않는다
         // (응답 후 상태 고착 방지). 진짜 계속 대기 중이면 idle이 백스톱.
         if let Some(text) = screen_text {
-            let mut counts: std::collections::HashMap<SessionStatus, usize> =
-                std::collections::HashMap::new();
-            for status in self.patterns.match_screen(text) {
-                *counts.entry(status).or_insert(0) += 1;
-            }
-            self.last_screen_counts = counts.clone();
+            let matches = self.patterns.match_screen(text);
+            self.last_screen_matches = matches.clone();
             // level-trigger: 매치가 화면에 남아 있는 동안 상태 유지. 단 사용자 입력으로
-            // 소비된 개수만큼은 무시 — echo로 라인 텍스트가 바뀌어도 개수는 그대로라
-            // 고착 안 되고, 개수가 늘면(반복 프롬프트) 재활성.
+            // 소비된 프롬프트는 무시한다. 판정은 라인 prefix — echo로 연장된 라인
+            // ("APPROVE? [y/n]" → "APPROVE? [y/n] y")은 같은 프롬프트라 억제되고,
+            // 다른 텍스트의 프롬프트나 같은 텍스트의 새 복사본(count 초과)은 재감지.
+            let mut budgets: Vec<(usize, usize)> = self
+                .consumed
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (i, c.count))
+                .collect();
             let mut best: Option<SessionStatus> = None;
-            for (status, count) in &counts {
-                let consumed = self.consumed_counts.get(status).copied().unwrap_or(0);
-                if *count > consumed {
+            for (status, line) in &matches {
+                let suppressed = budgets.iter_mut().any(|(i, remaining)| {
+                    let c = &self.consumed[*i];
+                    if *remaining > 0 && c.status == *status && line.starts_with(&c.prefix) {
+                        *remaining -= 1;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if !suppressed {
                     best = Some(match best {
                         Some(prev) if priority(prev) >= priority(*status) => prev,
                         _ => *status,
                     });
                 }
             }
-            // 사라진 상태의 소비 기록 정리 (재등장 시 새 프롬프트)
-            self.consumed_counts
-                .retain(|status, _| counts.contains_key(status));
+            // 화면에서 연장조차 사라진 소비 기록은 정리 (재등장 시 새 프롬프트)
+            self.consumed.retain(|c| {
+                matches
+                    .iter()
+                    .any(|(status, line)| *status == c.status && line.starts_with(&c.prefix))
+            });
             if let Some(status) = best {
                 if priority(status) > priority(self.status) || self.screen_derived {
                     self.status = status;
@@ -423,6 +474,47 @@ mod tests {
         d2.last_output = Instant::now() - Duration::from_secs(11);
         d2.on_input();
         assert_eq!(d2.evaluate(None), None);
+    }
+
+    #[test]
+    fn 같은_상태의_다른_프롬프트는_소비와_무관하게_재감지() {
+        // codex P1: count 기반 소비는 "APPROVE A → 입력 → APPROVE B"를 놓쳤다
+        let p = StatusPatterns::compile(None, Some("APPROVE"), None, None);
+        let mut d = StatusDetector::new(p);
+        d.evaluate(Some("APPROVE write file A?"));
+        assert_eq!(d.status(), SessionStatus::NeedsApproval);
+        d.on_input(); // A에 응답
+        // echo 라인은 억제 → Running 복귀가 보고된다 (아이콘 해제)
+        assert_eq!(
+            d.evaluate(Some("APPROVE write file A? y")),
+            Some(SessionStatus::Running)
+        );
+        // 다른 텍스트의 새 approval 프롬프트 — 개수는 같아도 재감지돼야 한다
+        assert_eq!(
+            d.evaluate(Some("APPROVE delete file B?")),
+            Some(SessionStatus::NeedsApproval)
+        );
+    }
+
+    #[test]
+    fn 나중_stream_매치가_이전_상태를_대체() {
+        // codex P1: 우선순위 latch가 시간축을 무시해 approval 후 done이 씹혔다
+        let p = StatusPatterns::compile(None, Some("APPROVE\\?"), None, Some("ALL DONE"));
+        let mut d = StatusDetector::new(p);
+        d.on_output(b"APPROVE?\n");
+        assert_eq!(d.status(), SessionStatus::NeedsApproval);
+        d.on_output(b"ALL DONE\n");
+        assert_eq!(d.status(), SessionStatus::Done);
+    }
+
+    #[test]
+    fn 입력은_화면_재스캔을_예약() {
+        let p = StatusPatterns::compile(Some("WAIT"), None, None, None);
+        let mut d = StatusDetector::new(p);
+        assert!(!d.take_screen_scan_request());
+        d.on_input();
+        assert!(d.take_screen_scan_request());
+        assert!(!d.take_screen_scan_request()); // 1회성
     }
 
     #[test]

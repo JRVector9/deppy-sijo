@@ -23,11 +23,13 @@ fn main() -> anyhow::Result<()> {
 
     let db = storage::Db::open(&paths.data_dir.join("metadata.sqlite3"))?;
     let workspace_id = db.ensure_default_workspace()?;
-    // 이전 실행이 비정상 종료됐다면 남은 세션을 Exited로 정리 (crash recovery)
-    match db.reconcile_orphan_sessions() {
-        Ok(n) if n > 0 => tracing::info!("이전 실행의 orphan 세션 {n}건 Exited 처리"),
-        Ok(_) => {}
-        Err(e) => tracing::warn!("세션 reconcile 실패: {e:#}"),
+    // 이전 실행이 비정상 종료됐다면 남은 세션을 Exited로 정리 (crash recovery).
+    // 실패는 기동 중단 — 거짓 running 상태로 복원 UI가 뜨면 안 된다 (codex 리뷰 반영)
+    let reconciled = db
+        .reconcile_orphan_sessions()
+        .map_err(|e| anyhow::anyhow!("crash recovery(세션 reconcile) 실패: {e:#}"))?;
+    if reconciled > 0 {
+        tracing::info!("이전 실행의 orphan 세션 {reconciled}건 Exited 처리");
     }
     // 세션 로그 루트 (설계문서 7장: logs/<workspace_id>/<session_id>/)
     let logs_root = paths.data_dir.join("logs").join(&workspace_id);

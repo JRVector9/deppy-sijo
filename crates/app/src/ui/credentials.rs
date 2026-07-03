@@ -139,6 +139,9 @@ impl CredentialsUi {
         // 새 credential은 즉시 로그 redaction 대상 (7장). 입력값을 그대로 등록 —
         // UI가 get_secret을 부르는 게 아니다 (2.1 준수).
         self.redaction.register(&secret);
+        // JSON 형태 credential(service account 등)은 개별 필드가 로그에 찍힌다 —
+        // 필드 단위로도 등록 (JSON이 아니면 no-op. codex 리뷰 반영)
+        self.redaction.register_json_fields(&secret);
         let id = uuid::Uuid::new_v4().to_string();
         store.set_secret(&id, &secret)?;
         let meta = CredentialMeta {

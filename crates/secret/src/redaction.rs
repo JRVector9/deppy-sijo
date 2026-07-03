@@ -119,11 +119,14 @@ impl StreamRedactor {
             return std::mem::take(&mut redacted);
         }
         // stripped 기준 max_len-1 만큼을 carry로 남긴다.
-        // escape만 계속 오는 병리적 스트림으로 carry가 무한히 크지 않게 cap.
+        // escape만 계속 오는 병리적 스트림으로 carry가 무한히 크지 않게 cap하되,
+        // 등록된 가장 긴 secret은 반드시 담을 수 있어야 한다 (§7 lookbehind 규칙 —
+        // cap이 max_len보다 작으면 긴 secret이 chunk 분할로 우회된다. codex 리뷰)
         let keep_stripped = max_len.saturating_sub(1);
         let carry_start = origin_index_for_stripped_suffix(&redacted, keep_stripped);
-        const CARRY_CAP: usize = 16 * 1024;
-        let carry_start = carry_start.max(redacted.len().saturating_sub(CARRY_CAP));
+        const CARRY_CAP_FLOOR: usize = 16 * 1024;
+        let carry_cap = CARRY_CAP_FLOOR.max(max_len * 2);
+        let carry_start = carry_start.max(redacted.len().saturating_sub(carry_cap));
         let _ = stripped_len;
         self.carry = redacted.split_off(carry_start);
         redacted

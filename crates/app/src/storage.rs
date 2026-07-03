@@ -164,6 +164,14 @@ impl Db {
     fn migrate(mut conn: Connection) -> anyhow::Result<Self> {
         let version: usize =
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? as usize;
+        // forward-only (11.9): 이 바이너리보다 앞선 DB는 downgrade가 불가능하므로
+        // 조용히 실행하지 않고 기동을 중단한다 (codex 리뷰 반영)
+        anyhow::ensure!(
+            version <= MIGRATIONS.len(),
+            "DB user_version({version})이 이 버전이 아는 마이그레이션({})보다 앞서 있습니다 — \
+             더 새 버전의 앱이 만든 DB입니다",
+            MIGRATIONS.len()
+        );
         for (i, sql) in MIGRATIONS.iter().enumerate().skip(version) {
             // 스키마 변경과 user_version 갱신을 한 트랜잭션으로 묶어
             // 중단 시 절반만 적용된 상태를 막는다

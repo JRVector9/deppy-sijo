@@ -140,7 +140,7 @@ impl ConnectorsUi {
             ui.label("command");
             ui.text_edit_singleline(&mut self.command);
         });
-        ui.label("args (한 줄에 하나)");
+        ui.label("args (한 줄에 하나) — secret은 args가 아니라 자격증명/환경으로");
         ui.add(
             egui::TextEdit::multiline(&mut self.args_input)
                 .desired_rows(2)

@@ -150,8 +150,19 @@ impl PermissionPolicy {
         match decision {
             ToolDecision::AllowAlways => {
                 self.rules.insert(key.clone(), PermissionRule::Allow);
-                self.approved_schema
-                    .insert(key, request.schema_hash.clone());
+                // schema_hash는 이 crate의 schema_hash()가 만든 sha256 hex(64자)만
+                // 승인 토큰으로 신뢰한다 — 빈/기형 문자열이 영구 승인 키가 되면
+                // 재승인 트리거가 무력화된다 (codex 리뷰, fail-closed)
+                let hash = &request.schema_hash;
+                if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                    self.approved_schema.insert(key, hash.clone());
+                } else {
+                    self.approved_schema.remove(&key);
+                    tracing::warn!(
+                        tool = %request.tool_name,
+                        "기형 schema_hash — 승인 이력을 남기지 않음 (매번 재승인)"
+                    );
+                }
             }
             ToolDecision::DenyAlways => {
                 self.rules.insert(key.clone(), PermissionRule::Deny);
@@ -173,13 +184,29 @@ fn key(server_id: &str, tool_name: &str) -> (String, String) {
 mod tests {
     use super::*;
 
+    /// 라벨("hash-a")을 실제 형식(sha256 hex 64자)으로 변환 — fail-closed 검증 통과용.
     fn request(server_id: &str, tool_name: &str, schema_hash: &str) -> ToolApprovalRequest {
+        let schema_hash = &crate::schema_hash(schema_hash);
         ToolApprovalRequest {
             server_id: server_id.into(),
             tool_name: tool_name.into(),
             input_json: r#"{"path":"/tmp/x"}"#.into(),
             schema_hash: schema_hash.into(),
         }
+    }
+
+    #[test]
+    fn 기형_schema_hash는_영구_승인이_되지_않는다() {
+        // fail-closed (codex 리뷰): 빈/짧은 hash로 AllowAlways 해도 이력이 안 남아
+        // 다음 요청은 다시 승인을 요구한다
+        let mut policy = PermissionPolicy::new();
+        let mut req = request("srv-1", "read_file", "hash-a");
+        req.schema_hash = String::new(); // 기형
+        policy.apply_decision(&req, ToolDecision::AllowAlways);
+        assert!(matches!(
+            policy.evaluate(&req),
+            PolicyEvaluation::NeedsApproval(_)
+        ));
     }
 
     #[test]

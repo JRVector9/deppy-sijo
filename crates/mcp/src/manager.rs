@@ -80,15 +80,16 @@ impl LocalMcpManager {
             )
             .with_context(|| format!("MCP 서버 '{}' initialize 실패", config.name))?;
 
-        // 서버가 다른 개정판을 답해도 v0에서는 진행한다 — 기록만 남긴다 (§1.5)
+        // §1.5는 2025-11-25 개정판을 기준으로 명시한다 — 다른 개정판은
+        // 프로토콜 gate에서 거부한다 (codex 리뷰 반영: warn만으로는 기준 미달)
         let server_version = initialize_result
             .get("protocolVersion")
             .and_then(Value::as_str);
         if server_version != Some(PROTOCOL_VERSION) {
-            tracing::warn!(
-                server = %config.name,
-                ?server_version,
-                "MCP protocolVersion 불일치 — v0에서는 계속 진행"
+            anyhow::bail!(
+                "MCP 서버 '{}' protocolVersion 불일치: {:?} (기준 {PROTOCOL_VERSION})",
+                config.name,
+                server_version
             );
         }
 

@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, bail};
 use deppy_core::{MuxPaneId, MuxTabId, MuxWindowId};
 use mux::{LayoutNode, PaneKind};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::layout_json::{layout_from_json, layout_to_json};
 
@@ -151,6 +151,27 @@ pub fn save_window_layout(
         .with_context(|| format!("mux tab 저장 실패: {}", tab.id.0))?;
 
         for pane in &tab.panes {
+            // pane이 참조하는 session은 같은 workspace 것이어야 한다 — FK는
+            // 존재만 보장하므로 여기서 소속을 확인한다 (codex 리뷰 반영:
+            // window를 다른 workspace로 저장하면 복원이 세션을 못 찾는다)
+            if let Some(session_id) = &pane.session_id {
+                let session_ws: Option<String> = tx
+                    .query_row(
+                        "SELECT workspace_id FROM sessions WHERE id = ?1",
+                        [session_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .with_context(|| format!("pane session 조회 실패: {session_id}"))?;
+                if session_ws.as_deref() != Some(workspace_id) {
+                    bail!(
+                        "pane {}의 session {}이 workspace {}에 속하지 않음",
+                        pane.id.0,
+                        session_id,
+                        workspace_id
+                    );
+                }
+            }
             tx.execute(
                 "INSERT INTO mux_panes (id, workspace_id, tab_id, session_id, title, pane_kind, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6,
@@ -421,13 +442,16 @@ pub fn update_session_log_offset(
     session_id: &str,
     offset: u64,
 ) -> anyhow::Result<()> {
-    conn.execute(
-        "UPDATE sessions SET last_log_offset = ?2,
+    let affected = conn
+        .execute(
+            "UPDATE sessions SET last_log_offset = ?2,
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
          WHERE id = ?1",
-        (session_id, i64::try_from(offset).unwrap_or(i64::MAX)),
-    )
-    .with_context(|| format!("log offset 갱신 실패: {session_id}"))?;
+            (session_id, i64::try_from(offset).unwrap_or(i64::MAX)),
+        )
+        .with_context(|| format!("log offset 갱신 실패: {session_id}"))?;
+    // 없는 세션에 조용히 성공하면 offset 보정 실패가 숨는다 (codex 리뷰 반영)
+    anyhow::ensure!(affected == 1, "log offset 갱신 대상 없음: {session_id}");
     Ok(())
 }
 
@@ -568,9 +592,15 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!((tabs, layouts, panes), (1, 1, 3));
 
-        // 같은 window를 다른 workspace로 재저장하면 window 행도 함께 옮겨간다
+        // 다른 workspace로의 재저장은 pane이 참조하는 session의 소속과 어긋나므로
+        // 거부된다 (codex 리뷰 반영 — 복원 시 load_sessions와 불일치 방지).
+        // session까지 그 workspace로 옮긴 뒤에만 이동이 가능하다.
         conn.execute("INSERT INTO workspaces (id) VALUES ('ws-2')", [])
             .unwrap();
+        assert!(save_window_layout(&mut conn, "ws-2", &window).is_err());
+        let mut moved = sample_session("sess-1", SESSION_STATUS_RUNNING);
+        moved.workspace_id = "ws-2".to_owned();
+        upsert_session(&conn, &moved).unwrap();
         save_window_layout(&mut conn, "ws-2", &window).unwrap();
         assert!(load_window_layouts(&conn, "ws-1").unwrap().is_empty());
         assert_eq!(load_window_layouts(&conn, "ws-2").unwrap(), vec![window]);

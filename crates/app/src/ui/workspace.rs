@@ -92,14 +92,18 @@ impl WorkspaceUi {
                     if self.session_alive(*session) {
                         let view = self.sessions.entry(*session).or_default();
                         view.exit_code = Some(*exit_code);
-                        // 진행형 상태(⏳/✋)는 종료와 함께 무효 — 결과 상태(✅/❌)만 유지
-                        if matches!(
+                        // 진행형 상태(⏳/✋)는 종료와 함께 무효. 결과 상태(✅/❌)는
+                        // 유지하고, 없으면 exit code로 채운다 — 알림(on_exit)과
+                        // tab 아이콘이 같은 결과를 보여주도록 (codex 리뷰 반영).
+                        if !matches!(
                             view.status,
-                            Some(SessionStatus::Waiting)
-                                | Some(SessionStatus::NeedsApproval)
-                                | Some(SessionStatus::Running)
+                            Some(SessionStatus::Done) | Some(SessionStatus::Error)
                         ) {
-                            view.status = None;
+                            view.status = Some(if *exit_code == Some(0) {
+                                SessionStatus::Done
+                            } else {
+                                SessionStatus::Error
+                            });
                         }
                     }
                 }

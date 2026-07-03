@@ -52,6 +52,12 @@ const SENSITIVE_KEY_PARTS: &[&str] = &[
     "privatekey",
     "cookie",
     "session",
+    // §7 대상 보강 (codex 리뷰): 접속 문자열/bearer 계열
+    "bearer",
+    "databaseurl", // database_url — 키 정규화(구분자 제거)와 짝
+    "dburl",
+    "dsn",
+    "connectionstring",
 ];
 
 fn is_sensitive_key(key: &str) -> bool {

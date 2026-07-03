@@ -60,7 +60,9 @@ pub fn store_token(
         && let Err(e) = store.set_secret(&refresh_entry_id(credential_id), refresh)
     {
         // 부분 실패 시 access 고아 entry가 남지 않게 롤백 — 호출측은 id를 버린다
-        let _ = store.delete_secret(credential_id);
+        if let Err(rollback) = store.delete_secret(credential_id) {
+            tracing::warn!("access token 롤백 실패 (고아 keyring entry 가능): {rollback:#}");
+        }
         return Err(e);
     }
     Ok(())

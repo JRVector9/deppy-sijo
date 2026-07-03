@@ -47,6 +47,8 @@ pub(crate) struct StdioClient {
     stderr_log: SharedStderrLog,
     /// 위반 발생 후 이 연결은 재사용 금지 (stdout 신뢰 불가)
     violation: Option<String>,
+    /// try_wait로 이미 reap된 child — 이후 kill/killpg 금지 (PID 재사용 위험)
+    reaped: bool,
 }
 
 impl StdioClient {
@@ -82,6 +84,7 @@ impl StdioClient {
                 request_timeout,
                 stderr_log,
                 violation: None,
+                reaped: false,
             }),
             Err(error) => {
                 kill_and_reap(&mut child);
@@ -216,10 +219,24 @@ impl StdioClient {
             match self.events.recv_timeout(remaining) {
                 Ok(ReaderEvent::Message(value)) => {
                     if value.get("method").is_some() {
-                        // server발 request/notification (ping, logging 등).
-                        // valid MCP message이므로 위반은 아니다 — v0 discovery flow는
-                        // 짧게 살고 끝나므로 처리하지 않고 무시한다 (§1.5 v0 범위).
-                        tracing::debug!(?value, "server발 MCP 메시지 무시 (v0 미지원)");
+                        // server발 메시지. notification은 무시하되, id가 있는
+                        // request(ping 등)는 응답을 기다리며 교착할 수 있으므로
+                        // method-not-found로 회신한다 (codex 리뷰 반영).
+                        // 원문은 로그에 싣지 않는다 — params에 secret 가능 (§7).
+                        let request_method = value
+                            .get("method")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?")
+                            .to_owned();
+                        if let Some(request_id) = value.get("id").cloned() {
+                            let reply = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": request_id,
+                                "error": {"code": -32601, "message": "method not found"},
+                            });
+                            let _ = self.write_line(&reply);
+                        }
+                        tracing::debug!(method = %request_method, "server발 MCP 메시지 (v0 미지원)");
                         continue;
                     }
                     // response — 유일한 outstanding 요청의 id와 일치해야 한다
@@ -240,6 +257,10 @@ impl StdioClient {
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     let status = self.child.try_wait().ok().flatten();
+                    if status.is_some() {
+                        // reap 완료 — PID가 재사용될 수 있으므로 Drop에서 kill 금지
+                        self.reaped = true;
+                    }
                     bail!("MCP 서버가 {method} 응답 전에 종료됨 (exit: {status:?})");
                 }
             }
@@ -252,7 +273,9 @@ impl Drop for StdioClient {
     /// reader thread들은 pipe EOF로 스스로 끝난다.
     fn drop(&mut self) {
         drop(self.stdin.take()); // stdin 닫힘 → 서버 입장에서 정상 종료 신호
-        kill_and_reap(&mut self.child);
+        if !self.reaped {
+            kill_and_reap(&mut self.child);
+        }
     }
 }
 
@@ -262,6 +285,14 @@ fn kill_and_reap(child: &mut Child) {
     #[cfg(unix)]
     unsafe {
         libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        // process group이 없는 Windows에서 grandchild(wrapper가 띄운 실제 서버)까지
+        // 트리로 정리한다 (codex 리뷰 반영 — credential env를 가진 orphan 방지)
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .output();
     }
     let _ = child.kill();
     let _ = child.wait(); // zombie 방지 reap
@@ -361,7 +392,9 @@ fn validate_jsonrpc(line: &[u8]) -> Result<Value, String> {
 /// JSON-RPC id 타입 검사 — string 또는 number.
 /// null은 파싱 불가 요청에 대한 error response에서만 허용된다 (JSON-RPC 2.0).
 fn is_valid_id(id: &Value, allow_null: bool) -> bool {
-    id.is_string() || id.is_number() || (allow_null && id.is_null())
+    // number id는 클라이언트 상관 경로(as_u64)가 처리 가능한 비음수 정수만 허용 —
+    // 음수/분수 id가 "valid stdout"으로 통과한 뒤 상관 위반이 되는 것 방지 (codex 리뷰)
+    id.is_string() || id.as_u64().is_some() || (allow_null && id.is_null())
 }
 
 enum LineRead {

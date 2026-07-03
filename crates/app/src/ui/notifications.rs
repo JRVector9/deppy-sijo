@@ -74,13 +74,16 @@ impl NotificationsUi {
         } else {
             SessionStatus::Error
         };
-        // 이 세션의 "마지막 항목"이 같은 결과 상태일 때만 중복으로 본다.
+        // 이 세션의 "마지막 항목"이 같은 결과 상태일 때만 중복으로 본다 —
+        // 다른 세션의 알림이 사이에 끼어도 판정이 흔들리지 않게 세션 기준으로 찾는다.
         // (Running은 알림 항목이 아니므로 애초에 items에 없다 — 중간 재개는 다른
         //  상태 항목으로 남고, 그 뒤 exit은 정상적으로 새 알림이 된다)
         let dup = self
             .items
-            .last()
-            .is_some_and(|item| item.session == session && item.status == status);
+            .iter()
+            .rev()
+            .find(|item| item.session == session)
+            .is_some_and(|item| item.status == status);
         if !dup {
             self.on_status(session, status, title);
         }

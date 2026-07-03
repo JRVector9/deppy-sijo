@@ -26,6 +26,7 @@ pub struct App {
     notifications_ui: ui::notifications::NotificationsUi,
     runtime: InProcessRuntimeClient,
     runtime_events: RuntimeEventReceiver,
+    frame_stats: crate::perf::FrameStats,
 }
 
 impl App {
@@ -67,6 +68,26 @@ impl App {
             }
             Err(e) => tracing::warn!("credential 목록 조회 실패 (redaction 시드 생략): {e:#}"),
         }
+        // PR-21 부하 하네스 (env로만 활성): hidden 10개 시나리오 자동 구성
+        if crate::perf::harness_enabled() {
+            for i in 0..crate::perf::HARNESS_SESSIONS {
+                let (command, args) = crate::perf::harness_command(i);
+                let _ = runtime.send_command(runtime::RuntimeCommand::SpawnAgent {
+                    cols: 120,
+                    rows: 40,
+                    scrollback_lines: config.terminal.scrollback_lines as usize,
+                    command,
+                    args,
+                    env_plain: Vec::new(),
+                    env_secrets: Vec::new(),
+                    waiting_regex: None,
+                    approval_regex: None,
+                    error_regex: None,
+                    done_regex: None,
+                });
+            }
+        }
+
         Self {
             config,
             config_path,
@@ -82,6 +103,7 @@ impl App {
             notifications_ui: ui::notifications::NotificationsUi::new(),
             runtime,
             runtime_events,
+            frame_stats: crate::perf::FrameStats::new(),
         }
     }
 }
@@ -94,6 +116,7 @@ impl eframe::App for App {
 
     // egui 0.35부터 update(&Context) 대신 ui(&mut Ui) 시그니처를 쓴다.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.frame_stats.begin();
         egui::Panel::top("top_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("설정").clicked() {
@@ -198,6 +221,7 @@ impl eframe::App for App {
                 tracing::warn!("config 저장 실패: {e:#}");
             }
         }
+        self.frame_stats.end();
     }
 }
 

@@ -3,6 +3,7 @@ mod config;
 mod env;
 mod fonts;
 mod paths;
+mod perf;
 mod storage;
 mod ui;
 

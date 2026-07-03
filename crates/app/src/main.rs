@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod env;
 mod paths;
 mod secret;
 mod storage;
@@ -16,6 +17,7 @@ fn main() -> anyhow::Result<()> {
         tracing::warn!("keyring store 초기화 실패 — 자격증명 기능 비활성: {e:#}");
     }
     let db = storage::Db::open(&paths.data_dir.join("metadata.sqlite3"))?;
+    let workspace_id = db.ensure_default_workspace()?;
     tracing::info!(
         config_dir = %paths.config_dir.display(),
         data_dir = %paths.data_dir.display(),
@@ -29,7 +31,12 @@ fn main() -> anyhow::Result<()> {
         Box::new(move |cc| {
             // 저장된 테마를 시작 시점에 적용
             cc.egui_ctx.set_theme(config.ui.theme.to_egui());
-            Ok(Box::new(app::App::new(config, config_path, db)))
+            Ok(Box::new(app::App::new(
+                config,
+                config_path,
+                db,
+                workspace_id,
+            )))
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe 실행 실패: {e}"))

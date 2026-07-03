@@ -151,8 +151,13 @@ impl CredentialsUi {
     }
 
     fn delete(&mut self, db: &Db, store: &dyn SecretStore, id: &str) -> anyhow::Result<()> {
+        // 참조 검사 먼저 — 어느 단계에서 실패해도 재시도 가능한 순서:
+        // keyring 실패 시 metadata 보존, DB 실패 시 delete_secret이 NoEntry 허용이라 재시도 수렴
+        if db.credential_in_use(id)? {
+            anyhow::bail!("env var가 참조 중인 credential입니다 — 해당 변수를 먼저 삭제하세요");
+        }
         store.delete_secret(id)?;
-        db.delete_credential(id)?;
+        db.delete_credential(id)?; // env_vars FK는 backstop
         tracing::info!(credential_id = %id, "credential 삭제");
         self.cached = None;
         Ok(())

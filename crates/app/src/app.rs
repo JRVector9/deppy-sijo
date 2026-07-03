@@ -10,19 +10,23 @@ pub struct App {
     config_path: PathBuf,
     settings_open: bool,
     db: Db,
+    workspace_id: String,
     secret_store: KeyringSecretStore,
     credentials_ui: ui::credentials::CredentialsUi,
+    env_profiles_ui: ui::env_profiles::EnvProfilesUi,
 }
 
 impl App {
-    pub fn new(config: Config, config_path: PathBuf, db: Db) -> Self {
+    pub fn new(config: Config, config_path: PathBuf, db: Db, workspace_id: String) -> Self {
         Self {
             config,
             config_path,
             settings_open: false,
             db,
+            workspace_id,
             secret_store: KeyringSecretStore,
             credentials_ui: ui::credentials::CredentialsUi::new(),
+            env_profiles_ui: ui::env_profiles::EnvProfilesUi::new(),
         }
     }
 }
@@ -38,12 +42,17 @@ impl eframe::App for App {
                 if ui.button("자격증명").clicked() {
                     self.credentials_ui.toggle();
                 }
+                if ui.button("환경").clicked() {
+                    self.env_profiles_ui.toggle();
+                }
             });
         });
         egui::CentralPanel::default().show(ui, |_ui| {});
 
         self.credentials_ui
             .show(ui.ctx(), &self.db, &self.secret_store);
+        self.env_profiles_ui
+            .show(ui.ctx(), &mut self.db, &self.workspace_id);
 
         let changed = ui::settings::show(ui.ctx(), &mut self.settings_open, &mut self.config);
         if changed {

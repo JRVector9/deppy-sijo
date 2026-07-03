@@ -1,0 +1,289 @@
+use crate::env::{self, EnvLayer, EnvValue};
+use crate::storage::{CredentialMeta, Db, EnvProfileRow, EnvVarRow};
+
+/// 프로젝트 환경(env profile) 관리 창.
+pub struct EnvProfilesUi {
+    open: bool,
+    selected: Option<String>,
+    new_name: String,
+    new_kind: &'static str,
+    var_key: String,
+    var_is_secret: bool,
+    var_plain_value: String,
+    var_credential_id: Option<String>,
+    error: Option<String>,
+    profiles: Option<Vec<EnvProfileRow>>,
+    vars: Option<Vec<EnvVarRow>>,
+}
+
+impl EnvProfilesUi {
+    pub fn new() -> Self {
+        Self {
+            open: false,
+            selected: None,
+            new_name: String::new(),
+            new_kind: "local",
+            var_key: String::new(),
+            var_is_secret: false,
+            var_plain_value: String::new(),
+            var_credential_id: None,
+            error: None,
+            profiles: None,
+            vars: None,
+        }
+    }
+
+    pub fn toggle(&mut self) {
+        self.open = !self.open;
+    }
+
+    pub fn show(&mut self, ctx: &egui::Context, db: &mut Db, workspace_id: &str) {
+        if !self.open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("환경")
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                if let Err(e) = self.contents(ui, db, workspace_id) {
+                    self.error = Some(format!("{e:#}"));
+                }
+                if let Some(error) = &self.error {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+            });
+        self.open = open;
+    }
+
+    fn contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        db: &mut Db,
+        workspace_id: &str,
+    ) -> anyhow::Result<()> {
+        let profiles = match &self.profiles {
+            Some(p) => p.clone(),
+            None => {
+                let p = db.list_env_profiles(workspace_id)?;
+                self.profiles = Some(p.clone());
+                p
+            }
+        };
+
+        // ---- profile 목록 ----
+        if profiles.is_empty() {
+            ui.label("profile이 없습니다.");
+        }
+        let mut delete_profile = None;
+        for profile in &profiles {
+            ui.horizontal(|ui| {
+                let selected = self.selected.as_deref() == Some(profile.id.as_str());
+                let title = if profile.is_production {
+                    format!("⚠ {} ({})", profile.name, profile.kind)
+                } else {
+                    format!("{} ({})", profile.name, profile.kind)
+                };
+                if ui.selectable_label(selected, title).clicked() {
+                    self.selected = Some(profile.id.clone());
+                    self.vars = None;
+                }
+                if ui.button("삭제").clicked() {
+                    delete_profile = Some(profile.id.clone());
+                }
+            });
+        }
+        if let Some(id) = delete_profile {
+            db.delete_env_profile(&id)?;
+            if self.selected.as_deref() == Some(id.as_str()) {
+                self.selected = None;
+            }
+            self.profiles = None;
+            self.vars = None;
+            self.error = None;
+        }
+
+        // ---- profile 생성 ----
+        ui.horizontal(|ui| {
+            ui.label("이름");
+            ui.text_edit_singleline(&mut self.new_name);
+            for kind in ["local", "staging", "production", "custom"] {
+                ui.selectable_value(&mut self.new_kind, kind, kind);
+            }
+        });
+        let name_filled = !self.new_name.trim().is_empty();
+        if ui
+            .add_enabled(name_filled, egui::Button::new("profile 생성"))
+            .clicked()
+        {
+            db.insert_env_profile(workspace_id, self.new_name.trim(), self.new_kind)?;
+            self.new_name.clear();
+            self.profiles = None;
+            self.error = None;
+        }
+
+        // ---- 선택된 profile의 env vars ----
+        let Some(profile_id) = self.selected.clone() else {
+            return Ok(());
+        };
+        let Some(profile) = profiles.iter().find(|p| p.id == profile_id) else {
+            return Ok(());
+        };
+        ui.separator();
+        ui.heading(format!("{} 환경변수", profile.name));
+        if profile.is_production {
+            // production guard (설계문서 6.4) — spawn 직전 경고는 PR-09에서 이 플래그를 소비
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "⚠ production profile — 실행 전 경고 대상입니다",
+            );
+        }
+
+        let credentials = db.list_credentials()?;
+        let vars = match &self.vars {
+            Some(v) => v.clone(),
+            None => {
+                let v = db.list_env_vars(&profile_id)?;
+                self.vars = Some(v.clone());
+                v
+            }
+        };
+
+        let mut delete_key = None;
+        for var in &vars {
+            ui.horizontal(|ui| {
+                ui.label(describe_var(var, &credentials));
+                // OS env와 충돌하면 precedence 결과를 표시 (설계문서 6.2)
+                if std::env::var_os(&var.key).is_some() {
+                    ui.weak("OS env 덮어씀");
+                }
+                if ui.button("삭제").clicked() {
+                    delete_key = Some(var.key.clone());
+                }
+            });
+        }
+        if let Some(key) = delete_key {
+            db.delete_env_var(&profile_id, &key)?;
+            self.vars = None;
+            self.error = None;
+        }
+
+        // ---- env var 추가 ----
+        ui.horizontal(|ui| {
+            ui.label("key");
+            ui.text_edit_singleline(&mut self.var_key);
+            ui.selectable_value(&mut self.var_is_secret, false, "plain");
+            ui.selectable_value(&mut self.var_is_secret, true, "secret");
+        });
+        if self.var_is_secret {
+            ui.horizontal(|ui| {
+                ui.label("credential");
+                let current = self
+                    .var_credential_id
+                    .as_ref()
+                    .and_then(|id| credentials.iter().find(|c| &c.id == id))
+                    .map(|c| c.label.clone())
+                    .unwrap_or_else(|| "선택".into());
+                egui::ComboBox::from_id_salt("var_credential")
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        for cred in &credentials {
+                            ui.selectable_value(
+                                &mut self.var_credential_id,
+                                Some(cred.id.clone()),
+                                format!("{} ({})", cred.label, cred.provider),
+                            );
+                        }
+                    });
+            });
+        } else {
+            ui.horizontal(|ui| {
+                ui.label("value");
+                ui.text_edit_singleline(&mut self.var_plain_value);
+            });
+        }
+        let filled = !self.var_key.trim().is_empty()
+            && if self.var_is_secret {
+                self.var_credential_id.is_some()
+            } else {
+                true
+            };
+        if ui
+            .add_enabled(filled, egui::Button::new("변수 추가"))
+            .clicked()
+        {
+            let value = if self.var_is_secret {
+                EnvValue::Secret {
+                    credential_id: self.var_credential_id.clone().unwrap(),
+                }
+            } else {
+                EnvValue::Plain(self.var_plain_value.clone())
+            };
+            db.upsert_env_var(&profile_id, self.var_key.trim(), &value)?;
+            self.var_key.clear();
+            self.var_plain_value.clear();
+            self.vars = None;
+            self.error = None;
+        }
+
+        // ---- 적용 결과 미리보기 (EnvDiffPreview 최소형) ----
+        if !vars.is_empty() {
+            ui.separator();
+            ui.heading("적용 결과 미리보기");
+            let os_layer = EnvLayer {
+                name: "OS".into(),
+                vars: vars
+                    .iter()
+                    .filter_map(|v| {
+                        std::env::var(&v.key)
+                            .ok()
+                            .map(|val| (v.key.clone(), EnvValue::Plain(val)))
+                    })
+                    .collect(),
+            };
+            let profile_layer = EnvLayer {
+                name: profile.name.clone(),
+                vars: vars
+                    .iter()
+                    .map(|v| (v.key.clone(), v.value.clone()))
+                    .collect(),
+            };
+            for resolved in env::resolve(&[os_layer, profile_layer]) {
+                let conflict = if resolved.overridden.is_empty() {
+                    String::new()
+                } else {
+                    format!("  ({} 덮어씀)", resolved.overridden.join(", "))
+                };
+                ui.label(format!(
+                    "{} ← {}{}",
+                    display_value(&resolved.key, &resolved.value, &credentials),
+                    resolved.source,
+                    conflict
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 목록 표시용. secret은 credential 라벨/힌트만 노출한다.
+fn describe_var(var: &EnvVarRow, credentials: &[CredentialMeta]) -> String {
+    display_value(&var.key, &var.value, credentials)
+}
+
+fn display_value(key: &str, value: &EnvValue, credentials: &[CredentialMeta]) -> String {
+    match value {
+        EnvValue::Plain(v) => format!("{key} = {v}"),
+        EnvValue::Secret { credential_id } => {
+            let cred = credentials.iter().find(|c| &c.id == credential_id);
+            match cred {
+                Some(c) => format!(
+                    "{key} = [secret: {} {}]",
+                    c.label,
+                    c.masked_hint.as_deref().unwrap_or("")
+                ),
+                None => format!("{key} = [secret: 삭제된 credential]"),
+            }
+        }
+    }
+}

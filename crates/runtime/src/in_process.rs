@@ -109,6 +109,7 @@ impl InProcessRuntimeClient {
                     persist: persist_pipe,
                     exited_order: std::collections::VecDeque::new(),
                     hidden_scrollback: std::collections::HashSet::new(),
+                    render_active: true,
                 }
                 .run();
             })
@@ -199,6 +200,8 @@ struct Worker {
     exited_order: std::collections::VecDeque<SessionId>,
     /// 현재 hidden scrollback cap이 적용된 running 세션들 (§14.3) — 전이 감지용.
     hidden_scrollback: std::collections::HashSet<SessionId>,
+    /// Active면 visible pane snapshot 생성, false(Warm 등)면 중단 (§14.1). 세션은 유지.
+    render_active: bool,
 }
 
 /// 세션 하나의 redaction 상태 + 로그 파일 (설계문서 7장).
@@ -587,6 +590,18 @@ impl Worker {
                     self.emit_mux_and_watched();
                 }
             }
+            RuntimeCommand::SetWorkspaceState(state) => {
+                // §14.1: Active만 render/snapshot. Warm/Suspended/Closed는 snapshot 중단.
+                // (Suspended/Closed의 PTY 종료는 workspace-close 도입 시 — 지금은 유지)
+                let active = matches!(state, crate::command::WorkspaceRuntimeState::Active);
+                if active && !self.render_active {
+                    // Warm→Active 복귀: 쌓인 화면을 즉시 다시 push
+                    self.render_active = true;
+                    self.push_watched_viewports();
+                } else {
+                    self.render_active = active;
+                }
+            }
             RuntimeCommand::RestoreWorkspace => {
                 // "완전히 빈 상태(세션 0)"일 때만 복원한다 — 시작 직후 SpawnShell/
                 // SpawnAgent가 먼저 처리돼 세션이 생겼으면 skip해 hybrid 상태를 막는다.
@@ -897,6 +912,9 @@ impl Worker {
     }
 
     fn push_watched_viewports(&mut self) {
+        if !self.render_active {
+            return; // Warm 등 — snapshot 생성 금지 (§14.1). 세션 pump는 계속된다.
+        }
         let mut events = Vec::new();
         for session in self.mux.watched_sessions() {
             if let Some(active) = self.sessions.get_mut(&session)
@@ -958,7 +976,8 @@ impl Worker {
                     });
                 }
             }
-            if result.dirty
+            if self.render_active
+                && result.dirty
                 && watched.contains(&active.id())
                 && let Some(snapshot) = active.take_snapshot()
             {
@@ -1099,7 +1118,7 @@ fn exited_to_archive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::SplitDirection;
+    use crate::command::{SplitDirection, WorkspaceRuntimeState};
     use std::time::Instant;
 
     fn test_store() -> Arc<dyn SecretStore> {
@@ -2161,6 +2180,66 @@ mod tests {
     /// 회귀 (codex 리뷰 P2): RestoreWorkspace가 "빈 상태"에서만 복원한다.
     /// SpawnShell이 먼저 처리돼 세션이 생긴 뒤 온 RestoreWorkspace는 skip돼야
     /// 저장 layout이 새 세션 위에 덧붙는 hybrid 상태를 만들지 않는다.
+    /// §14.1 Warm: 앱이 안 보일 때 snapshot 생성을 멈추되(Viewport 없음) 세션은 살아
+    /// PTY/로그가 계속된다. Active 복귀 시 쌓인 화면이 즉시 다시 push된다.
+    #[cfg(unix)]
+    #[test]
+    fn warm에서_viewport_중단_active복귀시_재개() {
+        init_mock_store();
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("warm"),
+            RedactionService::new(),
+            spec("/bin/sh", &["-c", "printf WARMTEST; sleep 30"]),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        // Warm으로 전환 후 spawn — Viewport가 생성되면 안 된다
+        client
+            .send_command(RuntimeCommand::SetWorkspaceState(
+                WorkspaceRuntimeState::Warm,
+            ))
+            .unwrap();
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::ShellSpawned { .. } => Some(()),
+            _ => None,
+        });
+        // 세션이 WARMTEST를 출력할 시간을 준 뒤에도 Viewport는 없어야 한다
+        let until = Instant::now() + Duration::from_millis(800);
+        while Instant::now() < until {
+            probe.seen.extend(probe.rx.drain());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let warm_viewport = probe.seen.iter().any(|e| {
+            matches!(e, RuntimeEvent::Viewport { snapshot, .. }
+                if snapshot_text(snapshot, 0).contains("WARMTEST"))
+        });
+        assert!(!warm_viewport, "Warm 상태에서 Viewport가 생성됨");
+
+        // Active 복귀 → 쌓인 WARMTEST 화면이 Viewport로 도착
+        client
+            .send_command(RuntimeCommand::SetWorkspaceState(
+                WorkspaceRuntimeState::Active,
+            ))
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::Viewport { snapshot, .. }
+                if snapshot_text(snapshot, 0).contains("WARMTEST") =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
+    }
+
     /// §14.3 가시성 전이: 세션을 hidden(다른 tab)으로 보냈다가 다시 visible로
     /// 되돌려도 세션이 살아 화면을 정상 렌더한다 (set_visible cap/uncap이 backend를
     /// 깨지 않음). scrollback 크기 자체는 이벤트로 관측 불가 — 렌더 정상으로 검증.

@@ -1,6 +1,22 @@
 pub use deppy_core::{MuxPaneId, MuxTabId, SessionId};
 pub use mux::SplitDirection;
 
+/// workspace 런타임 상태 (설계문서 §14.1). 현재 단일 workspace 앱에서 실효 있는 전이는
+/// Active↔Warm(앱 최소화/가림 시 render/snapshot 중단, 세션은 유지). Suspended/Closed는
+/// workspace "닫기"(세션 종료)가 전제라 multi-workspace 관리 도입 시 완성된다 —
+/// worker는 Active가 아니면 snapshot 생성만 멈춘다(Warm 수준). 세션 kill은 안 한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum WorkspaceRuntimeState {
+    /// visible pane render + snapshot (§14.4/14.3은 이 안에서 이미 visible-only)
+    Active,
+    /// status/log tail만 — renderer/snapshot 금지, 세션(PTY)은 유지
+    Warm,
+    /// layout/session metadata만 — (workspace-close 전제, 현재 미도달)
+    Suspended,
+    /// DB metadata만 — (workspace-close 전제, 현재 미도달)
+    Closed,
+}
+
 /// UI → Runtime 명령 (설계문서 2.1). v0은 단일 셸 세션에 필요한 것만.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum RuntimeCommand {
@@ -76,4 +92,8 @@ pub enum RuntimeCommand {
     /// 코드로 보장하기 위해 worker 자율 복원이 아닌 명시적 명령으로 트리거한다.
     /// worker는 세션이 하나도 없을 때만 복원한다(이미 SpawnShell 등이 처리됐으면 skip).
     RestoreWorkspace,
+    /// workspace 런타임 상태 전환 (§14.1). Active면 snapshot 생성, 그 외는 중단.
+    /// **enum 끝에 append** — postcard는 variant를 index로 인코딩하므로 중간 삽입은
+    /// 기존 명령의 discriminant를 밀어 remote wire 호환을 깬다 (codex 리뷰).
+    SetWorkspaceState(WorkspaceRuntimeState),
 }

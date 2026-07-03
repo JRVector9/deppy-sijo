@@ -27,6 +27,8 @@ pub struct App {
     runtime: InProcessRuntimeClient,
     runtime_events: RuntimeEventReceiver,
     frame_stats: crate::perf::FrameStats,
+    /// worker에 마지막으로 보낸 render 활성 상태 (§14.1 Active↔Warm) — 전이 시에만 전송
+    render_active: bool,
 }
 
 impl App {
@@ -117,6 +119,7 @@ impl App {
             runtime,
             runtime_events,
             frame_stats: crate::perf::FrameStats::new(),
+            render_active: true,
         }
     }
 }
@@ -125,6 +128,31 @@ impl eframe::App for App {
     fn on_exit(&mut self) {
         // worker join까지 동기 대기 — 셸 자식 프로세스 정리(reap) 보장
         self.runtime.shutdown();
+    }
+
+    // §14.1 Active↔Warm: 창이 안 보이면(최소화/완전 가림) worker가 snapshot 생성을
+    // 멈추게 한다(세션은 유지). logic()은 창이 안 보여 ui()가 스킵될 때도 호출되므로
+    // 여기서 감지해야 전이를 놓치지 않는다 (eframe 0.35). `visible()`은 eframe이 ui()
+    // 스킵 판단에 쓰는 바로 그 신호(minimized OR occluded — macOS는 occluded로 갱신되어
+    // minimized 미갱신 문제를 피한다). None(미보고)이면 안전하게 Active 유지.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let want_active = ctx.input(|i| i.viewport().visible()) != Some(false);
+        if want_active != self.render_active {
+            self.render_active = want_active;
+            let state = if want_active {
+                runtime::WorkspaceRuntimeState::Active
+            } else {
+                runtime::WorkspaceRuntimeState::Warm
+            };
+            let _ = self
+                .runtime
+                .send_command(runtime::RuntimeCommand::SetWorkspaceState(state));
+            if want_active {
+                // 재개된 Viewport push는 비동기 — 다음 프레임을 예약해 드레인한다.
+                // (안 그러면 hidden 중 종료된 pane이 stale/"연결 중…"에 갇힐 수 있다)
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+        }
     }
 
     // egui 0.35부터 update(&Context) 대신 ui(&mut Ui) 시그니처를 쓴다.

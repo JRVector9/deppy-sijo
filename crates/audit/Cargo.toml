@@ -13,5 +13,6 @@ tracing = { workspace = true }
 serde_json = { workspace = true }
 rusqlite = { workspace = true }
 sha2 = { workspace = true }
+uuid = { workspace = true }
 deppy-core = { path = "../core" }
 secret = { path = "../secret" }

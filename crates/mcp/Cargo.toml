@@ -14,3 +14,7 @@ serde_json = { workspace = true }
 rusqlite = { workspace = true }
 deppy-core = { path = "../core" }
 secret = { path = "../secret" }
+
+# 종료 시 process group 정리(killpg)용 — pty crate와 동일 관행
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -473,6 +473,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2067,6 +2068,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "deppy-core",
+ "libc",
  "rusqlite",
  "secret",
  "serde_json",
@@ -2682,10 +2684,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "deppy-core",
+ "libc",
  "mux",
  "rusqlite",
+ "serde",
  "serde_json",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -14,6 +14,7 @@ pub struct App {
     secret_store: KeyringSecretStore,
     credentials_ui: ui::credentials::CredentialsUi,
     env_profiles_ui: ui::env_profiles::EnvProfilesUi,
+    shell_ui: ui::shell::ShellUi,
 }
 
 impl App {
@@ -27,6 +28,7 @@ impl App {
             secret_store: KeyringSecretStore,
             credentials_ui: ui::credentials::CredentialsUi::new(),
             env_profiles_ui: ui::env_profiles::EnvProfilesUi::new(),
+            shell_ui: ui::shell::ShellUi::new(),
         }
     }
 }
@@ -45,6 +47,9 @@ impl eframe::App for App {
                 if ui.button("환경").clicked() {
                     self.env_profiles_ui.toggle();
                 }
+                if ui.button("셸").clicked() {
+                    self.shell_ui.toggle();
+                }
             });
         });
         egui::CentralPanel::default().show(ui, |_ui| {});
@@ -53,6 +58,7 @@ impl eframe::App for App {
             .show(ui.ctx(), &self.db, &self.secret_store);
         self.env_profiles_ui
             .show(ui.ctx(), &mut self.db, &self.workspace_id);
+        self.shell_ui.show(ui.ctx());
 
         let changed = ui::settings::show(ui.ctx(), &mut self.settings_open, &mut self.config);
         if changed {

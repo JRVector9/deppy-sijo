@@ -17,6 +17,7 @@ tracing-appender = { workspace = true }
 rusqlite = { workspace = true }
 keyring-core = { workspace = true }
 uuid = { workspace = true }
+pty = { path = "../pty" }
 
 # 플랫폼 keyring store (설계문서 1.4 — keyring = "3"/"4" 단일 crate 금지)
 [target.'cfg(target_os = "macos")'.dependencies]

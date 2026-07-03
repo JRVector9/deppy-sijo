@@ -304,6 +304,21 @@ impl Db {
         mcp::replace_tools_for_server(&mut self.conn, server_id, rows)
     }
 
+    /// 저장된 tool 목록 (도구 실행 UI용).
+    pub fn list_mcp_tools(&self, server_id: &str) -> anyhow::Result<Vec<mcp::McpToolRow>> {
+        mcp::list_tools_for_server(&self.conn, server_id)
+    }
+
+    /// tool 실행 감사 기록 (PR-16). encryptor를 넘기면 전체 입력이 암호화 저장된다 (§7).
+    pub fn record_tool_audit(
+        &self,
+        record: &audit::AuditRecord<'_>,
+        redaction: &secret::RedactionService,
+        encryptor: Option<&dyn secret::SecretStore>,
+    ) -> anyhow::Result<String> {
+        audit::record_audit(&self.conn, redaction, record, encryptor)
+    }
+
     /// 앱 시작 시 crash recovery (설계문서 PR-14): 이전 실행이 남긴 세션 중
     /// exited가 아닌 것을 모두 Exited로 마킹한다 — 재시작 후엔 그 프로세스가
     /// 반드시 orphan(죽음)이기 때문. 반영된 행 수를 돌려준다.

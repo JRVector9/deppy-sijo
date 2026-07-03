@@ -267,7 +267,12 @@ impl eframe::App for App {
         );
         self.credentials_ui
             .show(ui.ctx(), &self.db, &self.secret_store);
-        if self.connectors_ui.show(ui.ctx(), &mut self.db) {
+        if self.connectors_ui.show(
+            ui.ctx(),
+            &mut self.db,
+            &self.workspace_id,
+            &self.secret_store,
+        ) {
             // OAuth로 credential이 추가됨 — 자격증명 창은 이번 프레임에 이미
             // 그려졌으므로 캐시 무효화 후 다음 프레임을 예약해 즉시 반영한다
             self.credentials_ui.invalidate_cache();

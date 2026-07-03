@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use runtime::{InProcessRuntimeClient, RuntimeEventReceiver, RuntimeEventStream};
+
 use crate::config::Config;
 use crate::secret::KeyringSecretStore;
 use crate::storage::Db;
@@ -15,10 +17,15 @@ pub struct App {
     credentials_ui: ui::credentials::CredentialsUi,
     env_profiles_ui: ui::env_profiles::EnvProfilesUi,
     shell_ui: ui::shell::ShellUi,
+    runtime: InProcessRuntimeClient,
+    runtime_events: RuntimeEventReceiver,
 }
 
 impl App {
     pub fn new(config: Config, config_path: PathBuf, db: Db, workspace_id: String) -> Self {
+        // output_batch_ms는 시작 시 고정, scrollback_lines는 세션 spawn 시점에 전달
+        let runtime = InProcessRuntimeClient::new(config.performance.output_batch_ms);
+        let runtime_events = runtime.subscribe();
         Self {
             config,
             config_path,
@@ -29,6 +36,8 @@ impl App {
             credentials_ui: ui::credentials::CredentialsUi::new(),
             env_profiles_ui: ui::env_profiles::EnvProfilesUi::new(),
             shell_ui: ui::shell::ShellUi::new(),
+            runtime,
+            runtime_events,
         }
     }
 }
@@ -48,7 +57,7 @@ impl eframe::App for App {
                     self.env_profiles_ui.toggle();
                 }
                 if ui.button("셸").clicked() {
-                    self.shell_ui.toggle();
+                    self.shell_ui.toggle(&self.runtime);
                 }
             });
         });
@@ -58,7 +67,9 @@ impl eframe::App for App {
             .show(ui.ctx(), &self.db, &self.secret_store);
         self.env_profiles_ui
             .show(ui.ctx(), &mut self.db, &self.workspace_id);
-        self.shell_ui.show(ui.ctx(), &self.config.terminal);
+        let events: Vec<_> = self.runtime_events.try_iter().collect();
+        self.shell_ui
+            .show(ui.ctx(), &self.config.terminal, &self.runtime, &events);
 
         let changed = ui::settings::show(ui.ctx(), &mut self.settings_open, &mut self.config);
         if changed {

@@ -1,7 +1,7 @@
 # v2.5 설계문서 1.8 확정 버전 기준. patch는 Cargo.lock으로 고정.
 [workspace]
 resolver = "3"
-members = ["crates/app", "crates/pty", "crates/terminal"]
+members = ["crates/app", "crates/pty", "crates/runtime", "crates/terminal"]
 
 [workspace.package]
 version = "0.1.0"

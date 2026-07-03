@@ -186,8 +186,10 @@ impl App {
         if let Err(e) = self.db.reconcile_orphan_sessions() {
             tracing::warn!("workspace 전환 시 세션 reconcile 실패: {e:#}");
         }
-        // 런타임에 묶인 pending 실행 상태 정리 (이전 워커의 응답을 못 받음) (codex 리뷰)
+        // 런타임에 묶인 pending 상태 정리 (이전 워커의 응답을 못 받음) (codex 리뷰).
+        // MCP invoke도 비운다 — A에서 연 실행/승인이 B의 workspace_id로 감사되면 안 된다.
         self.agents_ui.clear_pending();
+        self.connectors_ui.clear_invoke();
         let (runtime, runtime_events) = Self::make_runtime(
             &self.config,
             &self.logs_base,

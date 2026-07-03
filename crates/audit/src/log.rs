@@ -76,8 +76,15 @@ fn is_sensitive_key(key: &str) -> bool {
 fn mask_sensitive_keys(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
+            // 헤더류 {"name":"Authorization","value":"Bearer …"} 패턴 — name/key/header의
+            // 값이 민감하면 짝인 "value"를 마스킹한다 (미등록 secret 평문 저장 방지, codex 리뷰)
+            let paired_sensitive = map.iter().any(|(k, v)| {
+                matches!(k.to_ascii_lowercase().as_str(), "name" | "key" | "header")
+                    && v.as_str().is_some_and(is_sensitive_key)
+            });
             for (key, val) in map.iter_mut() {
-                if is_sensitive_key(key) {
+                if is_sensitive_key(key) || (paired_sensitive && key.eq_ignore_ascii_case("value"))
+                {
                     *val = serde_json::Value::String("[REDACTED]".into());
                 } else {
                     mask_sensitive_keys(val);
@@ -222,6 +229,24 @@ mod tests {
             input_json,
             decision: ToolDecision::AllowOnce,
         }
+    }
+
+    #[test]
+    fn 헤더류_name_value_쌍의_secret이_마스킹된다() {
+        let conn = test_conn();
+        // {"name":"Authorization","value":"Bearer 미등록토큰"} — value 키는 민감어가 아니고
+        // 값도 미등록이지만, 짝인 name이 민감하므로 value가 마스킹돼야 한다
+        let input = r#"{"headers":[{"name":"Authorization","value":"Bearer unregistered-xyz"}]}"#;
+        let id = record_audit(&conn, &RedactionService::new(), &record(input), None).unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT input_redacted_json FROM tool_audit_logs WHERE id = ?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!stored.contains("unregistered-xyz"), "{stored}");
+        assert!(stored.contains("[REDACTED]"), "{stored}");
     }
 
     #[test]

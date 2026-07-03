@@ -375,10 +375,12 @@ impl Worker {
         // 재개 시 항상 최종 화면을 본다), 상태 이벤트는 채널 send.
         // receiver가 drop된 구독자는 제거: slot 경로는 Arc strong_count로 판별
         // (receiver도 slot Arc를 쥐므로 count 1이면 죽은 구독자), 채널 경로는 send 실패로.
-        self.subscribers
-            .lock()
-            .expect("subscribers lock")
-            .retain(|subscriber| {
+        // wake 콜백은 subscribers 락을 놓은 뒤에 호출한다 — 콜백이 임의 Fn(공개
+        // subscribe_with_wake)이라 재진입 시 subscribers 락에서 데드락날 수 있다 (codex 리뷰).
+        let mut wakes: Vec<Arc<dyn Fn() + Send + Sync>> = Vec::new();
+        {
+            let mut subscribers = self.subscribers.lock().expect("subscribers lock");
+            subscribers.retain(|subscriber| {
                 if let RuntimeEvent::Viewport { session, .. } = &event {
                     if Arc::strong_count(&subscriber.viewports) <= 1 {
                         return false;
@@ -392,13 +394,17 @@ impl Worker {
                 } else if subscriber.events.send(event.clone()).is_ok() {
                     // 상태 이벤트가 채널에 들어감 — 숨겨진 UI도 깨워 처리하게 한다
                     if let Some(wake) = &subscriber.wake {
-                        wake();
+                        wakes.push(Arc::clone(wake));
                     }
                     true
                 } else {
                     false
                 }
             });
+        }
+        for wake in wakes {
+            wake();
+        }
     }
 
     fn handle_command(&mut self, command: RuntimeCommand) {

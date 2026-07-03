@@ -72,6 +72,10 @@ enum InvokeMsg {
 /// 백그라운드 결과: (실행 세대, 메시지). 세대가 일치할 때만 반영.
 type InvokeResult = (u64, InvokeMsg);
 
+/// tool 인자 JSON 최대 크기 — stdin pipe buffer(대체로 ≥64KB)보다 작게 잡아
+/// write_all이 서버 미독취 시에도 블록되지 않게 한다 (transport write hang 방지).
+const MAX_TOOL_INPUT: usize = 32 * 1024;
+
 pub struct ConnectorsUi {
     redaction: RedactionService,
     open: bool,
@@ -141,6 +145,12 @@ impl ConnectorsUi {
     pub fn toggle(&mut self) {
         self.open = !self.open;
         self.error = None;
+    }
+
+    /// 진행 중인 도구 실행 상태를 비운다 (workspace 전환 시 — A에서 연 invoke가 B에서
+    /// 실행/감사되지 않도록). 백그라운드 스레드는 계속 돌지만 결과는 세대 불일치로 무시된다.
+    pub fn clear_invoke(&mut self) {
+        self.invoke = None;
     }
 
     /// 새 credential이 등록됐으면 true (호출측이 자격증명 창 캐시를 무효화).
@@ -688,6 +698,15 @@ impl ConnectorsUi {
         ctx: &egui::Context,
         decision: audit::ToolDecision,
     ) -> InvokePhase {
+        // 인자 크기 상한 — 큰 JSON이 stdin pipe buffer를 채우면 write_all이 영구 블록돼
+        // UI가 Running에 갇힌다. 감사(redact/암호화/저장) '전에' 검사해 과대 입력이
+        // crypto/DB 자원을 소모하지 않게 한다 (codex 리뷰).
+        if inv.input.len() > MAX_TOOL_INPUT {
+            return InvokePhase::Failed(format!(
+                "인자가 너무 큽니다 (최대 {}KB)",
+                MAX_TOOL_INPUT / 1024
+            ));
+        }
         // 감사: redacted 저장 + 전체 원본 암호화(§7). 실패해도 실행 판단엔 영향 없음.
         let record = audit::AuditRecord {
             workspace_id: Some(workspace_id),

@@ -181,6 +181,11 @@ impl eframe::App for App {
         }
         self.env_profiles_ui
             .show(ui.ctx(), &mut self.db, &self.workspace_id);
+        // workspace.show가 이번 이벤트로 mux를 갱신하기 전의 스냅샷 — 알림 제목
+        // 해석의 fallback. 세션이 이번 tick에 detach(archive)/close되면 갱신된 mux엔
+        // 없지만, 종료 직전 제목은 이전 mux에 남아 있어 exit 알림 제목이 유실되지 않는다
+        // (codex 리뷰: exit과 detach MuxUpdated가 같은 drain에 겹치는 경우).
+        let mux_before = self.workspace_ui.mux().cloned();
         egui::CentralPanel::default().show(ui, |ui| {
             self.workspace_ui
                 .show(ui, &self.config.terminal, &self.runtime, &events);
@@ -190,9 +195,28 @@ impl eframe::App for App {
         // 배지는 이번 프레임 상단에서 이미 그려졌으므로, unread가 바뀌면 재도장한다.
         let mux = self.workspace_ui.mux().cloned();
         let unread_before = self.notifications_ui.unread();
+        // 세션→제목 맵: 이전 mux + 이번 drain의 모든 MuxUpdated 스냅샷에서 수집한다.
+        // 세션이 한 batch 안에서 생성→종료→archive되어 최종 mux엔 없어도, 중간
+        // MuxUpdated 스냅샷에 제목이 남아 있어 exit 알림이 유실되지 않는다 (codex 리뷰).
+        let mut titles: std::collections::HashMap<runtime::SessionId, String> =
+            std::collections::HashMap::new();
+        let mut collect_titles = |snapshot: &runtime::MuxSnapshot| {
+            for pane in snapshot.tabs.iter().flat_map(|tab| &tab.panes) {
+                if let Some(session) = pane.session_id {
+                    titles.insert(session, pane.title.clone());
+                }
+            }
+        };
+        if let Some(mux) = &mux_before {
+            collect_titles(mux);
+        }
         for event in &events {
-            // 이미 사라진 세션(닫기 직전 큐된 상태)은 유령 알림을 만들지 않는다
-            let title_of = |session| mux.as_ref().and_then(|mux| session_title(mux, session));
+            if let runtime::RuntimeEvent::MuxUpdated { snapshot } = event {
+                collect_titles(snapshot);
+            }
+        }
+        for event in &events {
+            let title_of = |session| titles.get(&session).cloned();
             match event {
                 runtime::RuntimeEvent::SessionStatusChanged { session, status } => {
                     if let Some(title) = title_of(*session) {
@@ -236,13 +260,4 @@ impl eframe::App for App {
         }
         self.frame_stats.end();
     }
-}
-
-/// 세션이 속한 pane의 제목 (알림 표시용).
-fn session_title(mux: &runtime::MuxSnapshot, session: runtime::SessionId) -> Option<String> {
-    mux.tabs
-        .iter()
-        .flat_map(|tab| &tab.panes)
-        .find(|pane| pane.session_id == Some(session))
-        .map(|pane| pane.title.clone())
 }

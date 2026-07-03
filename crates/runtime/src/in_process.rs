@@ -107,6 +107,7 @@ impl InProcessRuntimeClient {
                     mux: MuxState::new(),
                     tab_counter: 0,
                     persist: persist_pipe,
+                    exited_order: std::collections::VecDeque::new(),
                 }
                 .run();
             })
@@ -167,6 +168,11 @@ impl RuntimeEventStream for InProcessRuntimeClient {
 
 impl RuntimeClient for InProcessRuntimeClient {}
 
+/// exited 세션의 terminal backend(scrollback)를 유지하는 최대 개수 (§14.2/14.3).
+/// 초과분은 가장 오래 전에 종료된 것부터 backend를 drop해 메모리를 유계로 만든다
+/// (열려 있는 pane의 scrollback은 유지 — 시간 기반이 아니라 개수 LRU라 UX 안전).
+const MAX_EXITED_BACKENDS: usize = 24;
+
 struct Worker {
     command_rx: Receiver<RuntimeCommand>,
     subscribers: Arc<Mutex<Vec<Subscriber>>>,
@@ -188,6 +194,8 @@ struct Worker {
     tab_counter: u64,
     /// 세션/mux 영속 파이프 (설정 시에만 — 실패는 best-effort warn)
     persist: Option<crate::persistence::PersistPipe>,
+    /// backend를 유지 중인 exited 세션들 (종료 순서 — 오래된 것이 앞). §14.3 cap.
+    exited_order: std::collections::VecDeque<SessionId>,
 }
 
 /// 세션 하나의 redaction 상태 + 로그 파일 (설계문서 7장).
@@ -532,6 +540,7 @@ impl Worker {
                 self.final_drain(session);
                 // Session drop → PtySession Drop이 process group 정리를 보장한다
                 self.sessions.remove(&session);
+                self.exited_order.retain(|s| *s != session);
                 self.detectors.remove(&session);
                 self.close_session_log(session, "killed", None);
                 if let Some(pipe) = &mut self.persist {
@@ -797,6 +806,7 @@ impl Worker {
         {
             self.final_drain(session);
             self.sessions.remove(&session);
+            self.exited_order.retain(|s| *s != session);
             self.detectors.remove(&session);
             self.close_session_log(session, "killed", None);
             if let Some(pipe) = &mut self.persist {
@@ -826,6 +836,7 @@ impl Worker {
             {
                 self.final_drain(session);
                 self.sessions.remove(&session);
+                self.exited_order.retain(|s| *s != session);
                 self.detectors.remove(&session);
                 self.close_session_log(session, "killed", None);
                 if let Some(pipe) = &mut self.persist {
@@ -898,6 +909,11 @@ impl Worker {
     /// 모든 세션의 PTY 출력을 반영하고, active pane 세션만 Viewport를 push한다
     /// (14.4: hidden pane snapshot 생성 금지 — dirty는 유지되어 포커스 전환 시 따라잡는다).
     fn pump_sessions(&mut self) {
+        // 이전 tick까지 쌓인 exited 세션 중 cap 초과분을 먼저 archive한다.
+        // 이번 tick에 새로 종료되는 세션은 exited_order에 이번 tick 끝에 추가되므로
+        // 다음 tick에야 archive 대상이 된다 — SessionExited emit과 detach MuxUpdated가
+        // 서로 다른 tick(≈다른 UI drain)에 나뉘어, 알림/상태가 유실되지 않는다 (codex 리뷰).
+        self.archive_over_cap();
         let watched = self.mux.watched_sessions();
         let mut events = Vec::new();
         for active in self.sessions.values_mut() {
@@ -954,13 +970,16 @@ impl Worker {
             }
         }
         // 종료 세션의 로그 마감 (carry flush + exited 이벤트)
-        let exited: Vec<(SessionId, Option<u32>)> = events
+        let mut exited: Vec<(SessionId, Option<u32>)> = events
             .iter()
             .filter_map(|e| match e {
                 RuntimeEvent::SessionExited { session, exit_code } => Some((*session, *exit_code)),
                 _ => None,
             })
             .collect();
+        // 같은 tick에 여러 개 종료되면 HashMap 순회 순서라 비결정적 — SessionId(단조
+        // 증가 = spawn 순서)로 정렬해 결정적 LRU를 만든다 (오래된 것이 앞. codex 리뷰)
+        exited.sort_by_key(|(s, _)| s.0);
         for (session, exit_code) in exited {
             let detail = exit_code.map(|c| format!("exit code {c}"));
             self.close_session_log(session, "exited", detail.as_deref());
@@ -968,9 +987,42 @@ impl Worker {
             if let Some(pipe) = &mut self.persist {
                 pipe.session_exited(session);
             }
+            // scrollback 열람용으로 backend를 유지하되 개수를 유계로 (§14.3)
+            self.exited_order.push_back(session);
         }
+        // 이번 tick의 이벤트(SessionExited/Viewport 등)를 먼저 emit한다.
+        // archival의 detach MuxUpdated가 이보다 먼저 가면, 같은 tick에 cap 초과로
+        // 다수 종료 시 그 세션들이 mux에서 사라진 뒤 SessionExited가 도착해
+        // UI가 exit 상태/알림을 무시한다 (codex 리뷰) — 그래서 exit을 먼저 내보낸다.
         for event in events {
             self.emit(event);
+        }
+    }
+
+    /// exited backend 개수 cap 초과분을 archive한다 (§14.3). pump 시작 시 호출 —
+    /// 이번 tick의 신규 exit보다 최소 한 tick 뒤에 archive되도록.
+    /// backend를 drop하고, 아직 열려 있는 pane은 detach(session_id=None) +
+    /// MuxUpdated로 알린다(죽은 session_id를 가리킨 pane이 Viewport를 못 받아
+    /// "연결 중…"에 갇히는 것 방지 — codex 리뷰).
+    fn archive_over_cap(&mut self) {
+        // 현재 보이는(active tab의) pane 세션은 archive하지 않는다 — split이면
+        // 비포커스 pane도 화면에 있어 사용자가 그 scrollback을 보는 중일 수 있다
+        // (codex 리뷰: focused 하나만 제외하면 부족). watched = visible.
+        let visible = self.mux.watched_sessions();
+        let to_archive = exited_to_archive(&self.exited_order, MAX_EXITED_BACKENDS, &visible);
+        let mut detached_any = false;
+        for session in to_archive {
+            self.sessions.remove(&session);
+            self.exited_order.retain(|s| *s != session);
+            for pane in self.mux.panes.values_mut() {
+                if pane.session_id == Some(session) {
+                    pane.session_id = None;
+                    detached_any = true;
+                }
+            }
+        }
+        if detached_any {
+            self.emit_mux_snapshot();
         }
     }
 }
@@ -978,6 +1030,31 @@ impl Worker {
 /// "셸 3" / "에이전트 12" 같은 제목에서 뒤의 숫자를 뽑는다 (복원 시 counter 전진용).
 fn title_suffix(title: &str) -> Option<u64> {
     title.rsplit(' ').next()?.parse().ok()
+}
+
+/// exit 순서(오래된 것이 앞)에서 cap 초과분을 archive(backend drop) 대상으로 돌려준다
+/// (§14.3 exited backend 개수 유계). visible(active tab) 세션은 건너뛰되, 초과분을
+/// 채우기 위해 그다음 오래된 비-visible 세션을 계속 고른다 — visible을 나중에 필터링하면
+/// 부족분을 못 채워 cap을 넘긴다 (codex 리뷰). 순수 함수 — 단위 테스트 대상.
+fn exited_to_archive(
+    exited_order: &std::collections::VecDeque<SessionId>,
+    cap: usize,
+    visible: &[SessionId],
+) -> Vec<SessionId> {
+    let excess = exited_order.len().saturating_sub(cap);
+    if excess == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for session in exited_order {
+        if out.len() >= excess {
+            break;
+        }
+        if !visible.contains(session) {
+            out.push(*session);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -2045,6 +2122,42 @@ mod tests {
     /// 회귀 (codex 리뷰 P2): RestoreWorkspace가 "빈 상태"에서만 복원한다.
     /// SpawnShell이 먼저 처리돼 세션이 생긴 뒤 온 RestoreWorkspace는 skip돼야
     /// 저장 layout이 새 세션 위에 덧붙는 hybrid 상태를 만들지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn exited_archive_cap() {
+        use std::collections::VecDeque;
+        let ids: VecDeque<SessionId> = (1..=5).map(SessionId).collect();
+        let none: &[SessionId] = &[];
+        // cap 이하면 archive 없음
+        assert!(super::exited_to_archive(&ids, 5, none).is_empty());
+        assert!(super::exited_to_archive(&ids, 10, none).is_empty());
+        // cap 초과: 가장 오래된 것부터 (앞쪽) 초과분만
+        assert_eq!(
+            super::exited_to_archive(&ids, 3, none),
+            vec![SessionId(1), SessionId(2)]
+        );
+        assert_eq!(
+            super::exited_to_archive(&ids, 0, none),
+            (1..=5).map(SessionId).collect::<Vec<_>>()
+        );
+        assert!(super::exited_to_archive(&VecDeque::new(), 3, none).is_empty());
+        // visible은 건너뛰고 초과분을 다음 비-visible로 채운다 (cap 유지):
+        // 5개, cap 3, 초과 2. 가장 오래된 1이 visible → 2·3을 archive
+        assert_eq!(
+            super::exited_to_archive(&ids, 3, &[SessionId(1)]),
+            vec![SessionId(2), SessionId(3)]
+        );
+        // visible이 너무 많아 채울 수 없으면 있는 만큼만 (cap 초과 감수)
+        assert_eq!(
+            super::exited_to_archive(
+                &ids,
+                3,
+                &[SessionId(2), SessionId(3), SessionId(4), SessionId(5)]
+            ),
+            vec![SessionId(1)]
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn title_suffix_파싱() {

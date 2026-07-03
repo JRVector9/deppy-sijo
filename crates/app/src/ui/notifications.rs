@@ -91,7 +91,14 @@ impl NotificationsUi {
 
     /// 세션이 사라지면 관련 알림 정리 (unread는 items에서 파생되어 자동 정합).
     pub fn retain_sessions(&mut self, alive: &[SessionId]) {
-        self.items.retain(|item| alive.contains(&item.session));
+        // 결과 상태(Done/Error) 알림은 세션이 사라져도(닫힘/archive) 유지한다 —
+        // "끝났다/실패했다"는 사용자가 보고 싶은 기록이다. 진행형(Waiting/승인)만
+        // 세션이 없으면 더는 조치 불가라 정리한다 (codex 리뷰: archive된 exit 알림
+        // 이 즉시 pruning되던 문제). 총량은 on_status의 100개 cap이 유계로 만든다.
+        self.items.retain(|item| {
+            matches!(item.status, SessionStatus::Done | SessionStatus::Error)
+                || alive.contains(&item.session)
+        });
     }
 
     /// 알림 센터를 그린다. 세션 focus 명령을 보냈으면 true (호출측이 repaint 예약).
@@ -202,15 +209,17 @@ mod tests {
     }
 
     #[test]
-    fn 죽은_세션_알림_정리() {
+    fn retain은_결과상태_유지하고_진행형만_정리() {
         let mut n = NotificationsUi::new();
-        n.on_status(SessionId(1), SessionStatus::Done, "a");
-        n.on_status(SessionId(2), SessionStatus::Done, "b");
-        assert_eq!(n.unread(), 2);
-        n.retain_sessions(&[SessionId(2)]);
-        assert_eq!(n.items.len(), 1);
-        assert_eq!(n.items[0].session, SessionId(2));
-        assert_eq!(n.unread(), 1); // items에서 파생
+        n.on_status(SessionId(1), SessionStatus::Done, "a"); // 결과 → 유지
+        n.on_status(SessionId(2), SessionStatus::NeedsApproval, "b"); // 진행형 → 정리
+        n.on_status(SessionId(3), SessionStatus::Error, "c"); // 결과 → 유지
+        // 1·2 사라짐(닫힘/archive). Done(1)·Error(3)는 기록이라 유지, 승인(2)만 정리
+        n.retain_sessions(&[SessionId(3)]);
+        let sessions: Vec<_> = n.items.iter().map(|i| i.session).collect();
+        assert!(sessions.contains(&SessionId(1)));
+        assert!(sessions.contains(&SessionId(3)));
+        assert!(!sessions.contains(&SessionId(2)));
     }
 
     #[test]
@@ -245,9 +254,9 @@ mod tests {
         n.toggle(); // 열기 → 모두 읽음
         n.toggle(); // 닫기
         assert_eq!(n.unread(), 0);
-        n.on_status(SessionId(2), SessionStatus::Error, "new"); // 안 읽음 1
+        n.on_status(SessionId(2), SessionStatus::Waiting, "new"); // 진행형, 안 읽음 1
         assert_eq!(n.unread(), 1);
-        // session 2가 사라짐 → 안 읽은 항목 제거, 옛 읽은 항목(session 1)은 남아도 unread 0
+        // session 2(진행형)가 사라짐 → 정리되어 unread 0, 옛 읽은 Done(1)은 남아도 unread 0
         n.retain_sessions(&[SessionId(1)]);
         assert_eq!(n.unread(), 0);
     }

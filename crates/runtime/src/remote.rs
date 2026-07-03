@@ -1,8 +1,11 @@
-//! Remote Transport Skeleton (설계문서 PR-19, §8.2).
+//! Remote Transport (설계문서 PR-19 스켈레톤 + v1 auth/바이너리 프레이밍).
 //! localhost-only attach — InProcessRuntimeClient와 **같은 명령/이벤트 모델**을
-//! newline-delimited JSON으로 loopback TCP에 실어 나른다.
+//! length-prefixed 바이너리 프레임([u32 LE len][postcard])으로 loopback TCP에
+//! 실어 나른다 (JSON Vec<u8> 숫자 배열 팽창 해소).
+//! 인증: 서버가 실행마다 생성하는 토큰을 클라이언트가 첫 프레임으로 보낸다 —
+//! §1.5 "auth required by default". 불일치/무응답(5s)은 즉시 종료.
 //! public remote는 아직 아니다: bind는 127.0.0.1 고정, attach는 loopback만 허용.
-//! (원격 인증/TLS/delta 스트림은 v1+ — §8.2 "Viewport는 terminal delta로 대체되는 자리")
+//! (TLS/delta 스트림은 v1+ — §8.2 "Viewport는 terminal delta로 대체되는 자리")
 //!
 //! 신뢰 경계 주의 (public remote 전 필수 — codex 리뷰): SpawnAgent가 command/args/
 //! env/credential_id를 그대로 실어 나르므로, 이 프로토콜을 공개 네트워크에 내놓기
@@ -10,7 +13,7 @@
 //! 지금은 loopback 강제가 그 경계다. 와이어 값 검증(validate_command/validate_event)은
 //! 기형 peer 방어일 뿐 권한 통제가 아니다.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
@@ -27,36 +30,57 @@ use crate::in_process::InProcessRuntimeClient;
 
 /// 이벤트 pump 폴링 주기 — worker의 output batch와 별개인 전송 주기.
 const PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
-/// NDJSON 한 라인 상한 — newline 없는 폭주 payload로 인한 무한 할당 방지.
-/// serde가 Vec<u8>을 JSON 숫자 배열로 encode해 3~4배 팽창하므로 (예: 수 MB 붙여넣기
-/// WriteInput), 정상 명령이 끊기지 않게 넉넉히 잡는다 (codex 리뷰). 팽창 없는
-/// 바이너리 프레이밍은 v1+ 와이어 포맷 교체(§8.2 terminal delta) 때 함께 간다.
-const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
+/// 프레임 payload 상한 — 바이너리라 팽창이 없으므로(postcard) 원본 크기 기준.
+/// 대형 붙여넣기(수 MB)와 큰 viewport 스냅샷이 여유 있게 들어간다.
+const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// 원격 명령의 scrollback 상한 — 무제한 usize로 과대 할당을 요구하지 못하게.
 const MAX_SCROLLBACK_LINES: usize = 100_000;
+/// 인증 프레임 대기 상한 — 접속만 열고 침묵하는 peer가 서버를 잡아두지 못하게.
+const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// newline까지 한 줄을 읽되 상한을 넘으면 None (프로토콜 위반 취급).
-/// EOF/IO 에러도 None — 호출측은 접속을 끝낸다.
-fn read_line_capped(reader: &mut impl BufRead) -> Option<String> {
-    let mut buf = Vec::new();
-    loop {
-        let chunk = match reader.fill_buf() {
-            Ok([]) => return None, // EOF
-            Ok(chunk) => chunk,
-            Err(_) => return None,
-        };
-        if let Some(pos) = chunk.iter().position(|b| *b == b'\n') {
-            buf.extend_from_slice(&chunk[..pos]);
-            reader.consume(pos + 1);
-            return String::from_utf8(buf).ok();
-        }
-        buf.extend_from_slice(chunk);
-        let n = chunk.len();
-        reader.consume(n);
-        if buf.len() > MAX_LINE_BYTES {
-            return None;
-        }
+/// 프레임 하나를 쓴다: [u32 LE 길이][payload].
+/// 상한은 송신측에서도 강제 — 초과분을 보내 놓고 peer가 끊는 것보다
+/// 로컬에서 즉시 실패하는 쪽이 진단 가능하다 (codex 리뷰).
+fn write_frame(stream: &mut impl Write, payload: &[u8]) -> std::io::Result<()> {
+    if payload.len() > MAX_FRAME_BYTES {
+        return Err(std::io::Error::other(format!(
+            "frame이 상한({MAX_FRAME_BYTES}B)을 초과: {}B",
+            payload.len()
+        )));
     }
+    let len = u32::try_from(payload.len())
+        .map_err(|_| std::io::Error::other("frame이 u32 길이를 초과"))?;
+    stream.write_all(&len.to_le_bytes())?;
+    stream.write_all(payload)
+}
+
+/// 인증 성공 시 서버가 회신하는 ACK payload.
+const AUTH_ACK: &[u8] = b"ok";
+
+/// 프레임 하나를 읽는다. 상한 초과/EOF/IO 에러는 None — 호출측은 접속을 끝낸다.
+fn read_frame(reader: &mut impl Read) -> Option<Vec<u8>> {
+    let mut len_bytes = [0u8; 4];
+    reader.read_exact(&mut len_bytes).ok()?;
+    let len = u32::from_le_bytes(len_bytes) as usize;
+    if len > MAX_FRAME_BYTES {
+        return None; // 프로토콜 위반 — 폭주 할당 방지
+    }
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload).ok()?;
+    Some(payload)
+}
+
+/// 상수 시간 비교 — 토큰 길이/내용의 타이밍 누설 방지.
+fn token_matches(expected: &str, provided: &[u8]) -> bool {
+    let expected = expected.as_bytes();
+    if expected.len() != provided.len() {
+        return false;
+    }
+    expected
+        .iter()
+        .zip(provided)
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
 }
 
 /// 서버가 수신한 명령의 와이어 값 검증 (codex 리뷰: 악성/기형 클라이언트 방어).
@@ -148,6 +172,8 @@ pub struct RemoteRuntimeServer {
     backend: Option<Arc<InProcessRuntimeClient>>,
     /// 현재 처리 중인 접속 — shutdown이 reader를 깨울 수 있게 보관
     active_conn: Arc<Mutex<Option<TcpStream>>>,
+    /// 이 실행의 attach 토큰 — 클라이언트가 첫 프레임으로 제시해야 한다 (§1.5)
+    auth_token: String,
 }
 
 impl RemoteRuntimeServer {
@@ -159,6 +185,13 @@ impl RemoteRuntimeServer {
         let backend = Arc::new(backend);
         let stop = Arc::new(AtomicBool::new(false));
         let active_conn: Arc<Mutex<Option<TcpStream>>> = Arc::default();
+        // 실행마다 새 토큰 (uuid v4 ×2 ≈ 244bit 엔트로피)
+        let auth_token = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let accept_token = auth_token.clone();
 
         let accept_backend = Arc::clone(&backend);
         let accept_stop = Arc::clone(&stop);
@@ -184,7 +217,7 @@ impl RemoteRuntimeServer {
                                 accept_conn.lock().expect("active conn lock").take();
                                 break;
                             }
-                            serve_connection(stream, &accept_backend, &accept_stop);
+                            serve_connection(stream, &accept_backend, &accept_stop, &accept_token);
                             accept_conn.lock().expect("active conn lock").take();
                         }
                         Err(e) => {
@@ -201,11 +234,18 @@ impl RemoteRuntimeServer {
             accept_thread: Some(accept_thread),
             backend: Some(backend),
             active_conn,
+            auth_token,
         })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// attach에 필요한 토큰. 이 프로세스 밖으로 전달하는 방법(파일/클립보드 등)은
+    /// 소비자 몫 — 로그에는 찍지 말 것.
+    pub fn auth_token(&self) -> &str {
+        &self.auth_token
     }
 
     /// accept 루프를 멈추고 worker까지 동기 종료한다.
@@ -241,14 +281,37 @@ impl Drop for RemoteRuntimeServer {
     }
 }
 
-/// 한 클라이언트 접속을 처리한다: 이벤트 pump 스레드를 붙이고,
-/// 이 스레드는 명령 라인을 읽어 worker로 넘긴다. 파싱 불가 라인은
-/// 프로토콜 위반으로 접속을 끊는다 (mcp stdout 엄격성과 같은 태도).
+/// 한 클라이언트 접속을 처리한다: 첫 프레임으로 인증(§1.5 auth required),
+/// 통과하면 이벤트 pump 스레드를 붙이고 이 스레드는 명령 프레임을 읽어
+/// worker로 넘긴다. 기형 프레임은 프로토콜 위반으로 접속을 끊는다.
 fn serve_connection(
     stream: TcpStream,
     backend: &Arc<InProcessRuntimeClient>,
     stop: &Arc<AtomicBool>,
+    auth_token: &str,
 ) {
+    // 인증: 첫 프레임 = 토큰. 침묵 peer가 서버를 잡아두지 못하게 timeout.
+    let _ = stream.set_read_timeout(Some(AUTH_TIMEOUT));
+    {
+        let mut auth_reader = match stream.try_clone() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let authorized =
+            read_frame(&mut auth_reader).is_some_and(|frame| token_matches(auth_token, &frame));
+        if !authorized {
+            tracing::warn!("remote 인증 실패 — 접속 거부");
+            let _ = stream.shutdown(Shutdown::Both);
+            return;
+        }
+        // 성공 ACK — 클라이언트 attach가 인증 결과를 동기적으로 알 수 있게 (codex 리뷰)
+        if write_frame(&mut auth_reader, AUTH_ACK).is_err() {
+            let _ = stream.shutdown(Shutdown::Both);
+            return;
+        }
+    }
+    let _ = stream.set_read_timeout(None);
+
     let receiver = backend.subscribe();
     let pump_stream = match stream.try_clone() {
         Ok(s) => s,
@@ -271,19 +334,20 @@ fn serve_connection(
                     break;
                 }
                 for event in receiver.drain() {
-                    let json = match serde_json::to_string(&event) {
-                        Ok(json) => json,
+                    let payload = match postcard::to_allocvec(&event) {
+                        Ok(payload) => payload,
                         Err(e) => {
                             tracing::warn!("remote event 직렬화 실패: {e}");
                             continue;
                         }
                     };
-                    if stream
-                        .write_all(json.as_bytes())
-                        .and_then(|()| stream.write_all(b"\n"))
-                        .is_err()
-                    {
-                        return; // 클라이언트가 떠남
+                    if write_frame(&mut stream, &payload).is_err() {
+                        // 클라이언트가 떠났거나 프레임 상한 초과(로컬 에러) —
+                        // 어느 쪽이든 이 접속은 더 못 쓴다. 소켓을 닫아 reader도
+                        // 깨워 접속 전체를 정리한다 (codex 리뷰: pump만 죽고
+                        // 클라이언트가 이벤트 없이 붙어있는 반쪽 상태 방지)
+                        let _ = stream.shutdown(Shutdown::Both);
+                        return;
                     }
                 }
                 std::thread::sleep(PUMP_INTERVAL);
@@ -304,15 +368,9 @@ fn serve_connection(
             return;
         }
     });
-    // 상한 초과/EOF/비-UTF8은 read_line_capped가 None — 접속 종료.
-    // 빈 라인 포함 모든 비정상 라인은 위반이다 (valid message만 허용).
-    while let Some(line) = read_line_capped(&mut reader) {
-        let parsed = if line.trim().is_empty() {
-            Err("빈 라인".to_owned())
-        } else {
-            serde_json::from_str::<RuntimeCommand>(&line).map_err(|e| e.to_string())
-        };
-        match parsed {
+    // 상한 초과/EOF/기형 프레임은 None — 접속 종료 (valid frame만 허용).
+    while let Some(frame) = read_frame(&mut reader) {
+        match postcard::from_bytes::<RuntimeCommand>(&frame) {
             Ok(command) => {
                 if let Err(reason) = validate_command(&command) {
                     tracing::warn!("remote 명령 검증 실패({reason}), 접속 종료");
@@ -351,12 +409,26 @@ struct RemoteSubscriber {
 
 impl RemoteRuntimeClient {
     /// loopback 주소에만 attach한다 (완료 기준: localhost-only attach).
-    pub fn attach(addr: SocketAddr) -> anyhow::Result<Self> {
+    /// `token`은 서버의 [`RemoteRuntimeServer::auth_token`] — 첫 프레임으로 제시한다.
+    pub fn attach(addr: SocketAddr, token: &str) -> anyhow::Result<Self> {
         if !addr.ip().is_loopback() {
             bail!("remote attach는 localhost만 허용합니다 (public remote는 v1+): {addr}");
         }
-        let stream =
+        let mut stream =
             TcpStream::connect(addr).with_context(|| format!("remote 서버 연결 실패: {addr}"))?;
+        write_frame(&mut stream, token.as_bytes()).context("remote 인증 프레임 전송 실패")?;
+        // 서버 ACK를 기다린다 — 없으면 잘못된 토큰/거부 (attach가 Ok를 반환하고
+        // 나서야 끊긴 것을 아는 반쪽 상태 방지. codex 리뷰)
+        stream
+            .set_read_timeout(Some(AUTH_TIMEOUT))
+            .context("remote 인증 대기 설정 실패")?;
+        let acked = read_frame(&mut stream).is_some_and(|frame| frame == AUTH_ACK);
+        if !acked {
+            bail!("remote 인증 거부 — 토큰을 확인하세요");
+        }
+        stream
+            .set_read_timeout(None)
+            .context("remote 인증 대기 해제 실패")?;
         let subscribers: Arc<Mutex<Vec<RemoteSubscriber>>> = Arc::default();
 
         let reader_subscribers = Arc::clone(&subscribers);
@@ -365,13 +437,8 @@ impl RemoteRuntimeClient {
             .name("remote-events".into())
             .spawn(move || {
                 let mut reader = BufReader::new(reader_stream);
-                while let Some(line) = read_line_capped(&mut reader) {
-                    let event = if line.trim().is_empty() {
-                        None
-                    } else {
-                        serde_json::from_str::<RuntimeEvent>(&line).ok()
-                    };
-                    let Some(event) = event else {
+                while let Some(frame) = read_frame(&mut reader) {
+                    let Ok(event) = postcard::from_bytes::<RuntimeEvent>(&frame) else {
                         tracing::warn!("remote 이벤트 프로토콜 위반 — 접속 종료");
                         break;
                     };
@@ -421,12 +488,9 @@ fn dispatch(subscribers: &Arc<Mutex<Vec<RemoteSubscriber>>>, event: RuntimeEvent
 
 impl RuntimeCommandSink for RemoteRuntimeClient {
     fn send_command(&self, command: RuntimeCommand) -> anyhow::Result<()> {
-        let json = serde_json::to_string(&command).context("remote 명령 직렬화 실패")?;
+        let payload = postcard::to_allocvec(&command).context("remote 명령 직렬화 실패")?;
         let mut stream = self.writer.lock().expect("remote writer lock");
-        stream
-            .write_all(json.as_bytes())
-            .and_then(|()| stream.write_all(b"\n"))
-            .context("remote 명령 전송 실패")
+        write_frame(&mut *stream, &payload).context("remote 명령 전송 실패")
     }
 }
 
@@ -519,7 +583,7 @@ mod tests {
 
     #[test]
     fn 비loopback_attach는_거부() {
-        let Err(e) = RemoteRuntimeClient::attach("8.8.8.8:1".parse().unwrap()) else {
+        let Err(e) = RemoteRuntimeClient::attach("8.8.8.8:1".parse().unwrap(), "t") else {
             panic!("비loopback attach가 성공하면 안 된다");
         };
         assert!(format!("{e:#}").contains("localhost"));
@@ -531,7 +595,7 @@ mod tests {
     #[test]
     fn attach_명령_이벤트_왕복() {
         let server = RemoteRuntimeServer::serve(test_backend("roundtrip"), 0).unwrap();
-        let client = RemoteRuntimeClient::attach(server.local_addr()).unwrap();
+        let client = RemoteRuntimeClient::attach(server.local_addr(), server.auth_token()).unwrap();
         let rx = client.subscribe();
 
         client
@@ -572,11 +636,69 @@ mod tests {
         server.shutdown();
     }
 
+    /// §1.5 auth required: 잘못된 토큰은 attach가 이벤트를 받지 못하고 끊긴다.
+    #[test]
+    fn 잘못된_토큰은_거부() {
+        let server = RemoteRuntimeServer::serve(test_backend("badtoken"), 0).unwrap();
+        let mut raw = TcpStream::connect(server.local_addr()).unwrap();
+        write_frame(&mut raw, b"wrong-token").unwrap();
+        // 서버가 끊는다 — read가 EOF(0)
+        raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 16];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match std::io::Read::read(&mut raw, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            assert!(Instant::now() < deadline, "거부 대기 시간 초과");
+        }
+        server.shutdown();
+    }
+
+    /// 토큰 프레임 없이 침묵하는 peer는 timeout으로 정리된다 (서버 hang 없음).
+    #[test]
+    fn 무토큰_접속은_붙잡아두지_못한다() {
+        let server = RemoteRuntimeServer::serve(test_backend("silent"), 0).unwrap();
+        let _silent = TcpStream::connect(server.local_addr()).unwrap();
+        // AUTH_TIMEOUT(5s) 뒤에는 다음 클라이언트가 정상 attach 가능해야 한다
+        let start = Instant::now();
+        let client = loop {
+            match RemoteRuntimeClient::attach(server.local_addr(), server.auth_token()) {
+                Ok(client) => break client,
+                Err(_) => {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(15),
+                        "침묵 peer가 서버를 계속 점유"
+                    );
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        };
+        // attach 자체는 성공 — 명령이 실제로 통하는지까지 확인
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let rx = client.subscribe();
+        let mut seen = Vec::new();
+        wait_for(&rx, &mut seen, Duration::from_secs(15), |events| {
+            events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::ShellSpawned { .. }))
+        });
+        drop(client);
+        server.shutdown();
+    }
+
     /// 유휴 클라이언트가 붙어 있어도 shutdown은 블록되지 않는다 (codex 리뷰 회귀).
     #[test]
     fn 접속_유지_중_shutdown() {
         let server = RemoteRuntimeServer::serve(test_backend("idle-shutdown"), 0).unwrap();
-        let client = RemoteRuntimeClient::attach(server.local_addr()).unwrap();
+        let client = RemoteRuntimeClient::attach(server.local_addr(), server.auth_token()).unwrap();
         // 접속이 accept돼 reader가 붙을 때까지 잠깐 대기
         std::thread::sleep(Duration::from_millis(200));
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -653,12 +775,14 @@ mod tests {
         }));
     }
 
-    /// 프로토콜 위반(비-JSON 라인)은 접속 종료로 이어진다.
+    /// 프로토콜 위반(기형 프레임)은 접속 종료로 이어진다.
     #[test]
     fn 잘못된_명령_라인은_접속_종료() {
         let server = RemoteRuntimeServer::serve(test_backend("protocol"), 0).unwrap();
         let mut raw = TcpStream::connect(server.local_addr()).unwrap();
-        raw.write_all(b"not-json\n").unwrap();
+        // 정상 인증 후 postcard로 해석 불가한 프레임 전송
+        write_frame(&mut raw, server.auth_token().as_bytes()).unwrap();
+        write_frame(&mut raw, &[0xff; 64]).unwrap();
         // 서버가 접속을 닫으면 read가 EOF(0)로 끝난다
         raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut buf = [0u8; 256];

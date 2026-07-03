@@ -30,6 +30,9 @@ use crate::in_process::InProcessRuntimeClient;
 
 /// 이벤트 pump 폴링 주기 — worker의 output batch와 별개인 전송 주기.
 const PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+/// heartbeat 주기 — 이 시간 동안 보낼 이벤트가 없으면 길이 0 프레임(keepalive)을
+/// 보내 half-open(죽은) peer를 조기에 감지한다. write 실패 = 죽은 peer로 접속 정리.
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 /// 프레임 payload 상한 — 바이너리라 팽창이 없으므로(postcard) 원본 크기 기준.
 /// 대형 붙여넣기(수 MB)와 큰 viewport 스냅샷이 여유 있게 들어간다.
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -163,17 +166,26 @@ fn layout_ratios_valid(node: &crate::LayoutNode) -> bool {
 }
 
 /// in-process worker를 loopback TCP로 노출하는 서버.
-/// 클라이언트는 순차 처리(스켈레톤) — 접속당 reader(명령 수신)와
-/// pump(이벤트 송신) 스레드가 하나씩 붙는다.
+/// 접속마다 스레드를 띄워 여러 클라이언트를 동시에 처리한다 — 접속당
+/// reader(명령 수신)와 pump(이벤트 송신 + heartbeat) 스레드가 하나씩 붙는다.
 pub struct RemoteRuntimeServer {
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
     accept_thread: Option<JoinHandle<()>>,
     backend: Option<Arc<InProcessRuntimeClient>>,
-    /// 현재 처리 중인 접속 — shutdown이 reader를 깨울 수 있게 보관
-    active_conn: Arc<Mutex<Option<TcpStream>>>,
+    /// 살아있는 접속들 — shutdown이 전부 소켓 종료 + join할 수 있게 추적한다.
+    /// 접속 스레드는 끝날 때 스스로 자기 항목을 제거한다(자기 자신을 join하면
+    /// 데드락이므로 join 없이 remove만; drop되는 JoinHandle은 자동 detach라
+    /// 좀비 스레드가 남지 않는다).
+    connections: Arc<Mutex<Vec<ConnEntry>>>,
     /// 이 실행의 attach 토큰 — 클라이언트가 첫 프레임으로 제시해야 한다 (§1.5)
     auth_token: String,
+}
+
+/// 살아있는 접속 하나 — shutdown 시 소켓 종료 + join 대상.
+struct ConnEntry {
+    stream: TcpStream,
+    handle: JoinHandle<()>,
 }
 
 impl RemoteRuntimeServer {
@@ -184,7 +196,7 @@ impl RemoteRuntimeServer {
         let addr = listener.local_addr()?;
         let backend = Arc::new(backend);
         let stop = Arc::new(AtomicBool::new(false));
-        let active_conn: Arc<Mutex<Option<TcpStream>>> = Arc::default();
+        let connections: Arc<Mutex<Vec<ConnEntry>>> = Arc::default();
         // 실행마다 새 토큰 (uuid v4 ×2 ≈ 244bit 엔트로피)
         let auth_token = format!(
             "{}{}",
@@ -195,7 +207,7 @@ impl RemoteRuntimeServer {
 
         let accept_backend = Arc::clone(&backend);
         let accept_stop = Arc::clone(&stop);
-        let accept_conn = Arc::clone(&active_conn);
+        let accept_conns = Arc::clone(&connections);
         let accept_thread = std::thread::Builder::new()
             .name("remote-accept".into())
             .spawn(move || {
@@ -205,20 +217,59 @@ impl RemoteRuntimeServer {
                     }
                     match stream {
                         Ok(stream) => {
-                            // 스켈레톤: 한 번에 한 클라이언트 — 접속이 끝날 때까지 처리.
-                            // shutdown이 유휴 reader를 깨울 수 있게 소켓을 먼저 등록하고,
-                            // 등록 후 stop을 재확인한다 — shutdown이 등록 직전에 지나갔으면
-                            // 여기서 직접 닫는다 (등록/확인 순서로 race 창을 닫는다)
-                            if let Ok(conn) = stream.try_clone() {
-                                *accept_conn.lock().expect("active conn lock") = Some(conn);
-                            }
+                            // 접속마다 스레드를 띄워 동시 다중 클라이언트를 처리한다.
+                            // 등록과 stop 재확인을 같은 락(connections) 안에서 하므로
+                            // shutdown의 drain과 순서가 어느 쪽이든 race 창이 없다:
+                            // shutdown이 먼저 잠그면 여기서 stop=true를 보고 즉시 닫고,
+                            // 여기가 먼저 잠그고 등록하면 shutdown이 그다음에 잠가
+                            // 이 접속까지 포함해 정리한다.
+                            let shutdown_clone = match stream.try_clone() {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    tracing::warn!("remote stream clone 실패: {e}");
+                                    continue;
+                                }
+                            };
+                            let conn_backend = Arc::clone(&accept_backend);
+                            let conn_stop = Arc::clone(&accept_stop);
+                            let conn_token = accept_token.clone();
+                            let conn_conns = Arc::clone(&accept_conns);
+
+                            let mut conns = accept_conns.lock().expect("connections lock");
                             if accept_stop.load(Ordering::SeqCst) {
+                                drop(conns);
                                 let _ = stream.shutdown(Shutdown::Both);
-                                accept_conn.lock().expect("active conn lock").take();
-                                break;
+                                continue;
                             }
-                            serve_connection(stream, &accept_backend, &accept_stop, &accept_token);
-                            accept_conn.lock().expect("active conn lock").take();
+                            let handle = match std::thread::Builder::new()
+                                .name("remote-conn".into())
+                                .spawn(move || {
+                                    serve_connection(
+                                        stream,
+                                        &conn_backend,
+                                        &conn_stop,
+                                        &conn_token,
+                                    );
+                                    // 접속 종료 — 자기 항목을 스스로 제거(자기 join은
+                                    // 데드락이라 하지 않는다; drop되는 JoinHandle은
+                                    // 자동 detach라 좀비로 남지 않는다).
+                                    let id = std::thread::current().id();
+                                    conn_conns
+                                        .lock()
+                                        .expect("connections lock")
+                                        .retain(|c| c.handle.thread().id() != id);
+                                }) {
+                                Ok(handle) => handle,
+                                Err(e) => {
+                                    drop(conns);
+                                    tracing::warn!("remote 접속 스레드 생성 실패: {e}");
+                                    continue;
+                                }
+                            };
+                            conns.push(ConnEntry {
+                                stream: shutdown_clone,
+                                handle,
+                            });
                         }
                         Err(e) => {
                             tracing::warn!("remote accept 실패: {e}");
@@ -233,7 +284,7 @@ impl RemoteRuntimeServer {
             stop,
             accept_thread: Some(accept_thread),
             backend: Some(backend),
-            active_conn,
+            connections,
             auth_token,
         })
     }
@@ -255,9 +306,15 @@ impl RemoteRuntimeServer {
 
     fn shutdown_impl(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        // 유휴 접속의 reader를 깨운다 (소켓을 닫아 EOF) — 없으면 accept 대기 중
-        if let Some(conn) = self.active_conn.lock().expect("active conn lock").take() {
-            let _ = conn.shutdown(Shutdown::Both);
+        // 살아있는 접속을 모두 깨운다: 소켓을 먼저 다 닫아(유휴 reader도 EOF로
+        // 깨어나게) 두고 나서 join한다 — join 시점엔 이미 종료 신호가 갔으니
+        // 서로 블록하지 않는다.
+        let conns = std::mem::take(&mut *self.connections.lock().expect("connections lock"));
+        for conn in &conns {
+            let _ = conn.stream.shutdown(Shutdown::Both);
+        }
+        for conn in conns {
+            let _ = conn.handle.join();
         }
         // blocking accept를 깨운다
         let _ = TcpStream::connect(self.addr);
@@ -282,8 +339,9 @@ impl Drop for RemoteRuntimeServer {
 }
 
 /// 한 클라이언트 접속을 처리한다: 첫 프레임으로 인증(§1.5 auth required),
-/// 통과하면 이벤트 pump 스레드를 붙이고 이 스레드는 명령 프레임을 읽어
-/// worker로 넘긴다. 기형 프레임은 프로토콜 위반으로 접속을 끊는다.
+/// 통과하면 이벤트 pump 스레드를 붙이고(유휴 시 heartbeat로 half-open peer
+/// 감지) 이 스레드는 명령 프레임을 읽어 worker로 넘긴다. 기형 프레임은
+/// 프로토콜 위반으로 접속을 끊는다.
 fn serve_connection(
     stream: TcpStream,
     backend: &Arc<InProcessRuntimeClient>,
@@ -329,10 +387,12 @@ fn serve_connection(
         .name("remote-pump".into())
         .spawn(move || {
             let mut stream = pump_stream;
+            let mut last_activity = std::time::Instant::now();
             loop {
                 if pump_stop.load(Ordering::SeqCst) || pump_done.load(Ordering::SeqCst) {
                     break;
                 }
+                let mut sent_event = false;
                 for event in receiver.drain() {
                     let payload = match postcard::to_allocvec(&event) {
                         Ok(payload) => payload,
@@ -349,6 +409,19 @@ fn serve_connection(
                         let _ = stream.shutdown(Shutdown::Both);
                         return;
                     }
+                    sent_event = true;
+                }
+                if sent_event {
+                    last_activity = std::time::Instant::now();
+                } else if last_activity.elapsed() >= HEARTBEAT_INTERVAL {
+                    // 길이 0 프레임 = heartbeat. postcard로 직렬화된 RuntimeEvent는
+                    // 항상 길이 > 0이라 정상 이벤트 프레임과 명확히 구분된다.
+                    // write 실패는 죽은(half-open) peer — 접속을 정리한다.
+                    if write_frame(&mut stream, &[]).is_err() {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        return;
+                    }
+                    last_activity = std::time::Instant::now();
                 }
                 std::thread::sleep(PUMP_INTERVAL);
             }
@@ -438,6 +511,9 @@ impl RemoteRuntimeClient {
             .spawn(move || {
                 let mut reader = BufReader::new(reader_stream);
                 while let Some(frame) = read_frame(&mut reader) {
+                    if frame.is_empty() {
+                        continue; // heartbeat(길이 0 프레임) — 이벤트가 아닌 keepalive로 소비
+                    }
                     let Ok(event) = postcard::from_bytes::<RuntimeEvent>(&frame) else {
                         tracing::warn!("remote 이벤트 프로토콜 위반 — 접속 종료");
                         break;
@@ -714,6 +790,143 @@ mod tests {
         }
         handle.join().unwrap();
         drop(client);
+    }
+
+    /// 동시 접속: 두 클라이언트가 같은 runtime에 함께 attach해 있고, 한쪽이
+    /// 보낸 명령의 결과 이벤트를 양쪽 다 받는다 — 이전 스켈레톤은 accept 루프가
+    /// serve_connection을 인라인 호출해 한 번에 한 클라이언트만 처리했고,
+    /// 두 번째 attach는 첫 접속이 끝날 때까지 인증 ACK조차 못 받았다.
+    #[test]
+    fn 동시_두_클라이언트_모두_이벤트_수신() {
+        let server = RemoteRuntimeServer::serve(test_backend("dual"), 0).unwrap();
+        let client_a = RemoteRuntimeClient::attach(server.local_addr(), server.auth_token())
+            .expect("client_a attach");
+        let client_b = RemoteRuntimeClient::attach(server.local_addr(), server.auth_token())
+            .expect("client_b attach — 동시 다중 접속이 가능해야 한다");
+        let rx_a = client_a.subscribe();
+        let rx_b = client_b.subscribe();
+
+        client_a
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+
+        let assert_spawned_and_mux = |rx: &RuntimeEventReceiver| {
+            let mut seen = Vec::new();
+            wait_for(rx, &mut seen, Duration::from_secs(10), |events| {
+                events
+                    .iter()
+                    .any(|e| matches!(e, RuntimeEvent::ShellSpawned { .. }))
+                    && events
+                        .iter()
+                        .any(|e| matches!(e, RuntimeEvent::MuxUpdated { .. }))
+            });
+        };
+        assert_spawned_and_mux(&rx_a);
+        assert_spawned_and_mux(&rx_b);
+
+        drop(client_a);
+        drop(client_b);
+        server.shutdown();
+    }
+
+    /// 유휴 클라이언트 두 개가 동시에 붙어 있어도 shutdown이 블록되지 않는다
+    /// (다중 접속으로 일반화된 접속_유지_중_shutdown 회귀 테스트).
+    #[test]
+    fn 다중_접속_유지_중_shutdown() {
+        let server = RemoteRuntimeServer::serve(test_backend("multi-idle-shutdown"), 0).unwrap();
+        let client_a =
+            RemoteRuntimeClient::attach(server.local_addr(), server.auth_token()).unwrap();
+        let client_b =
+            RemoteRuntimeClient::attach(server.local_addr(), server.auth_token()).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&done);
+        let handle = std::thread::spawn(move || {
+            server.shutdown();
+            flag.store(true, Ordering::SeqCst);
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "shutdown이 다중 접속에 블록됨");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        handle.join().unwrap();
+        drop(client_a);
+        drop(client_b);
+    }
+
+    /// heartbeat: 유휴 접속에 HEARTBEAT_INTERVAL마다 길이 0 프레임이 온다 —
+    /// postcard RuntimeEvent는 항상 길이 > 0이라 정상 이벤트와 구분된다.
+    #[test]
+    fn 유휴_접속에_heartbeat_프레임() {
+        let server = RemoteRuntimeServer::serve(test_backend("heartbeat"), 0).unwrap();
+        let mut raw = TcpStream::connect(server.local_addr()).unwrap();
+        write_frame(&mut raw, server.auth_token().as_bytes()).unwrap();
+        raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let ack = read_frame(&mut raw).expect("auth ack 없음");
+        assert_eq!(ack, AUTH_ACK);
+
+        // HEARTBEAT_INTERVAL(15s) + 15s 여유
+        raw.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let frame = read_frame(&mut raw).expect("heartbeat 프레임을 받지 못함");
+        assert!(frame.is_empty(), "heartbeat 프레임은 길이 0이어야 한다");
+
+        server.shutdown();
+    }
+
+    /// 접속이 끊기면 서버가 접속 목록에서 자기 항목을 스스로 정리한다 —
+    /// 다중 접속 추적(connections)이 좀비 스레드/소켓을 남기지 않는지 확인.
+    /// (진짜 half-open — FIN/RST 없이 그냥 사라지는 네트워크 단절 — 은 같은
+    /// 머신 안의 유닛 테스트로 재현할 수 없다: OS는 프로세스가 죽어도 커널이
+    /// 소켓 fd를 정리하며 FIN을 보낸다. heartbeat이 그 상황에서 write 실패를
+    /// 일으킨다는 것은 위 유휴_접속에_heartbeat_프레임 테스트로 — 프레임이
+    /// 실제로 주기적으로 나간다는 것과, write_frame 실패 시 접속을 정리하는
+    /// 코드가 이벤트 프레임과 동일 경로라는 것으로 — 구조적으로 검증된다.)
+    #[test]
+    fn 접속_종료_후_목록에서_정리된다() {
+        let server = RemoteRuntimeServer::serve(test_backend("cleanup"), 0).unwrap();
+        let mut raw = TcpStream::connect(server.local_addr()).unwrap();
+        write_frame(&mut raw, server.auth_token().as_bytes()).unwrap();
+        raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ack = read_frame(&mut raw).expect("auth ack 없음");
+
+        // 접속이 목록에 등록될 때까지 대기
+        let reg_deadline = Instant::now() + Duration::from_secs(5);
+        while server
+            .connections
+            .lock()
+            .expect("connections lock")
+            .is_empty()
+        {
+            assert!(Instant::now() < reg_deadline, "접속이 목록에 등록되지 않음");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        drop(raw);
+
+        // 접속이 끊기면 곧바로(heartbeat 대기 없이) 목록에서 빠져야 한다
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if server
+                .connections
+                .lock()
+                .expect("connections lock")
+                .is_empty()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "종료된 접속이 목록에서 정리되지 않음"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        server.shutdown();
     }
 
     #[test]

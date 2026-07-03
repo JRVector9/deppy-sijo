@@ -715,17 +715,21 @@ impl ConnectorsUi {
             args: inv.args.clone(),
         };
         let manager = LocalMcpManager::new(self.redaction.clone());
+        let redaction = self.redaction.clone();
         let tx = self.invoke_tx.clone();
         let tool_name = inv.tool_name.clone();
         let generation = inv.generation;
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = manager
-                .call_tool(&config, &tool_name, arguments)
-                .map(|value| {
-                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
-                })
-                .map_err(|e| format!("{e:#}"));
+            // 결과/에러 문자열은 표시 전에 등록된 secret을 마스킹한다 (§7 유출 방지).
+            // 성공 결과와 에러 메시지(MCP 서버가 secret을 echo할 수 있음) 둘 다 대상.
+            let result = match manager.call_tool(&config, &tool_name, arguments) {
+                Ok(value) => Ok(redact_display(
+                    &redaction,
+                    &serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
+                )),
+                Err(e) => Err(redact_display(&redaction, &format!("{e:#}"))),
+            };
             let _ = tx.send((generation, InvokeMsg::Result(result)));
             ctx.request_repaint();
         });
@@ -815,6 +819,14 @@ impl ConnectorsUi {
 
 /// 발견한 tool을 저장용 행으로 변환한다. schema_hash는 여기서 계산해 기록 —
 /// PR-16 재승인 트리거(audit::PermissionPolicy)가 이 해시를 비교한다.
+/// 등록된 secret을 마스킹한다 (도구 결과/에러 표시 전 — 감사 로그와 동일 방어선).
+fn redact_display(redaction: &RedactionService, text: &str) -> String {
+    let mut redactor = redaction.stream_redactor();
+    let mut out = redactor.redact_chunk(text.as_bytes());
+    out.extend(redactor.flush());
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// invoke 상태에서 정책 평가용 요청 model을 만든다.
 fn request_of(inv: &ToolInvoke) -> audit::ToolApprovalRequest {
     audit::ToolApprovalRequest {

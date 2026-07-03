@@ -386,17 +386,21 @@ impl Db {
                 row.get::<_, String>(3)?,
             ))
         })?;
-        rows.map(|r| {
-            let (id, name, command, args_json) = r?;
-            Ok(AgentConfigRow {
-                id,
-                name,
-                command,
-                args: serde_json::from_str(&args_json)
-                    .with_context(|| format!("args_json 파싱 실패: {args_json}"))?,
-            })
-        })
-        .collect()
+        // 손상 행 하나가 전체 목록을 죽이지 않게 skip + 경고 (원문은 로그에 남기지 않음)
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, name, command, args_json) = row?;
+            match serde_json::from_str(&args_json) {
+                Ok(args) => out.push(AgentConfigRow {
+                    id,
+                    name,
+                    command,
+                    args,
+                }),
+                Err(e) => tracing::warn!(agent_id = %id, "args_json 파싱 실패 — 행 무시: {e}"),
+            }
+        }
+        Ok(out)
     }
 
     pub fn delete_agent_config(&self, id: &str) -> anyhow::Result<()> {

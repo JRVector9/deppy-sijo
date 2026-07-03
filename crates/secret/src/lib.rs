@@ -59,6 +59,10 @@ pub trait SecretStore: Send + Sync {
 /// `keyring_core::set_default_store`로 등록되어 있어야 한다.
 pub struct KeyringSecretStore;
 
+/// 설계문서 1.4: 동일 credential 멀티스레드 접근은 신뢰 불가 —
+/// UI(set/delete)와 runtime worker(get)가 겹치지 않도록 프로세스 전역 직렬화.
+static KEYRING_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl KeyringSecretStore {
     fn entry(&self, id: &str) -> anyhow::Result<keyring_core::Entry> {
         keyring_core::Entry::new(KEYRING_SERVICE, id)
@@ -68,12 +72,14 @@ impl KeyringSecretStore {
 
 impl SecretStore for KeyringSecretStore {
     fn set_secret(&self, id: &str, secret: &SecretString) -> anyhow::Result<()> {
+        let _serial = KEYRING_SERIAL.lock().expect("keyring serial lock");
         self.entry(id)?
             .set_password(secret.expose())
             .with_context(|| format!("keyring 저장 실패: {id}"))
     }
 
     fn get_secret(&self, id: &str) -> anyhow::Result<SecretString> {
+        let _serial = KEYRING_SERIAL.lock().expect("keyring serial lock");
         let password = self
             .entry(id)?
             .get_password()
@@ -82,6 +88,7 @@ impl SecretStore for KeyringSecretStore {
     }
 
     fn delete_secret(&self, id: &str) -> anyhow::Result<()> {
+        let _serial = KEYRING_SERIAL.lock().expect("keyring serial lock");
         match self.entry(id)?.delete_credential() {
             Ok(()) => Ok(()),
             // 이미 없는 entry 삭제는 성공으로 취급 (metadata/keyring drift 복구 허용)

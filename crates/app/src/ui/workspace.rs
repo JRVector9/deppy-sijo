@@ -24,6 +24,11 @@ pub struct WorkspaceUi {
     scroll_residual: f32,
     /// 이번 프레임에 명령을 보냈다 — 응답 이벤트 폴링을 위해 repaint 예약
     command_sent: bool,
+    /// mux focused_pane 변경 추적
+    last_focused_pane: Option<runtime::MuxPaneId>,
+    /// egui 포커스 동기화 대기 — 해당 pane이 실제로 그려질 때 소비된다
+    /// (MuxUpdated가 Viewport보다 먼저 오는 프레임에 요청이 유실되지 않게)
+    pending_focus: Option<runtime::MuxPaneId>,
     /// 응답(Spawned/Failed)을 아직 못 받은 셸 spawn 수 — 0이 될 때까지 계속 폴링
     pending_spawns: u32,
     error: Option<String>,
@@ -46,6 +51,8 @@ impl WorkspaceUi {
             sent_sizes: HashMap::new(),
             scroll_residual: 0.0,
             command_sent: false,
+            last_focused_pane: None,
+            pending_focus: None,
             pending_spawns: 0,
             error: None,
         }
@@ -127,6 +134,13 @@ impl WorkspaceUi {
             self.flush_command_repaint(ui.ctx());
             return;
         };
+        // mux 포커스가 바뀐 프레임: stale 조합/스크롤 잔여분 리셋 (세션 간 이월 방지)
+        if self.last_focused_pane != mux.focused_pane {
+            self.last_focused_pane = mux.focused_pane.clone();
+            self.pending_focus = mux.focused_pane.clone();
+            self.preedit.clear();
+            self.scroll_residual = 0.0;
+        }
         let Some(active_tab) = mux
             .active_tab
             .as_ref()
@@ -304,13 +318,13 @@ impl WorkspaceUi {
             return;
         };
 
-        // pane 크기 → cols/rows (변화 시에만 Resize — active pane만; 비활성은
-        // 마지막 스냅샷 그대로 두고 포커스 시 맞춘다)
+        // pane 크기 → cols/rows. visible pane 전부 대상 — split 직후 기존 pane의
+        // PTY 크기가 틀어지는 문제 방지 (runtime도 visible 세션을 모두 push한다)
         let cell = renderer_egui::cell_size(ui.ctx(), config.font_size);
         let avail = ui.available_size();
         let cols = ((avail.x / cell.x) as u16).clamp(10, 500);
         let rows = (((avail.y - cell.y) / cell.y) as u16).clamp(3, 200);
-        if focused && self.sent_sizes.get(&session) != Some(&(cols, rows)) {
+        if self.sent_sizes.get(&session) != Some(&(cols, rows)) {
             self.sent_sizes.insert(session, (cols, rows));
             self.send(
                 client,
@@ -342,6 +356,13 @@ impl WorkspaceUi {
                 egui::Stroke::new(1.0, egui::Color32::from_rgb(0x69, 0x9d, 0xe6)),
                 egui::StrokeKind::Outside,
             );
+        }
+        // pending 포커스는 pane이 실제로 그려진 이 시점에 1회 소비한다 —
+        // 매 프레임 요청은 다른 창 입력을 뺏고, "연결 중" 단계에서 소비하면
+        // 요청이 유실된다 (리뷰 반영).
+        if focused && self.pending_focus.as_ref() == Some(pane_id) {
+            self.pending_focus = None;
+            output.response.request_focus();
         }
         if output.response.clicked() {
             output.response.request_focus();

@@ -108,10 +108,17 @@ impl Session {
         }
         let mut just_exited = false;
         if eof && let Some(mut pty) = self.pty.take() {
-            // EOF: 프로세스만 정리, backend(scrollback)는 유지
-            self.lifecycle = SessionLifecycle::Exited {
-                exit_code: pty.try_exit_code().unwrap_or(None),
-            };
+            // EOF: 프로세스만 정리, backend(scrollback)는 유지.
+            // EOF 직후 wait이 아직 안 끝난 race 대비 — 짧게 재시도해 코드 유실 방지
+            let mut exit_code = None;
+            for _ in 0..20 {
+                exit_code = pty.try_exit_code().unwrap_or(None);
+                if exit_code.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            self.lifecycle = SessionLifecycle::Exited { exit_code };
             just_exited = true;
         }
         PumpResult {
@@ -120,11 +127,15 @@ impl Session {
         }
     }
 
-    /// snapshot을 만들고 dirty를 지운다. 호출 시점은 호출측이 결정 —
+    /// snapshot을 만들고 (성공 시에만) dirty를 지운다. 호출 시점은 호출측이 결정 —
     /// hidden pane에 대해 호출하지 않는 것이 14.4 규칙.
+    /// None(외부 surface 백엔드 등)일 때 dirty를 지우면 변경이 영구 미발행된다.
     pub fn take_snapshot(&mut self) -> Option<TerminalViewportSnapshot> {
-        self.dirty = false;
-        self.backend.viewport_snapshot()
+        let snapshot = self.backend.viewport_snapshot();
+        if snapshot.is_some() {
+            self.dirty = false;
+        }
+        snapshot
     }
 
     pub fn bracketed_paste(&self) -> bool {

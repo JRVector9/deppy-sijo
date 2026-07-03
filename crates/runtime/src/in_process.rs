@@ -195,12 +195,22 @@ impl MuxState {
         }
     }
 
-    /// active pane의 세션 — Viewport push 대상 (14.4: 이것만 snapshot 생성)
-    fn watched_session(&self) -> Option<SessionId> {
-        self.focus
-            .focused()
-            .and_then(|pane| self.panes.get(pane))
-            .and_then(|pane| pane.session_id)
+    /// visible(= active tab의) pane 세션들 — Viewport push 대상.
+    /// §14.4가 금지하는 것은 hidden pane snapshot이다: split로 화면에 보이는
+    /// 비포커스 pane은 visible이므로 갱신한다 (리뷰 반영 — 얼어붙은 pane 방지).
+    fn watched_sessions(&self) -> Vec<SessionId> {
+        self.window
+            .active_tab
+            .as_ref()
+            .and_then(|tab| self.tabs.get(tab))
+            .map(|tab| {
+                tab.panes()
+                    .iter()
+                    .filter_map(|pane| self.panes.get(pane))
+                    .filter_map(|pane| pane.session_id)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn tab_of_pane(&self, pane: &MuxPaneId) -> Option<MuxTabId> {
@@ -326,7 +336,7 @@ impl Worker {
                 match Session::spawn_with_spec(
                     id,
                     session::SessionKind::Shell,
-                    &self.shell,
+                    &self.shell, // 테스트 주입 가능해야 하므로 default_shell 헬퍼 대신 spec 직접
                     cols,
                     rows,
                     scrollback_lines,
@@ -388,14 +398,7 @@ impl Worker {
                 };
                 let id = SessionId(self.next_id);
                 self.next_id += 1;
-                match Session::spawn_with_spec(
-                    id,
-                    session::SessionKind::Agent,
-                    &spec,
-                    cols,
-                    rows,
-                    scrollback_lines,
-                ) {
+                match session::spawn_agent(id, &spec, cols, rows, scrollback_lines) {
                     Ok(new_session) => {
                         self.sessions.insert(id, new_session);
                         self.open_session_log(id);
@@ -552,12 +555,26 @@ impl Worker {
             Ok(new_session) => {
                 self.sessions.insert(id, new_session);
                 self.open_session_log(id);
+                self.tab_counter += 1;
                 let pane_id = MuxPaneId::new();
-                let mut pane = MuxPane::new(pane_id.clone(), "셸".into());
+                let mut pane = MuxPane::new(pane_id.clone(), format!("셸 {}", self.tab_counter));
                 pane.session_id = Some(id);
                 self.mux.panes.insert(pane_id.clone(), pane);
-                if let Some(tab) = self.mux.tabs.get_mut(&tab_id) {
-                    tab.split_pane(&target, direction, pane_id.clone());
+                let split_ok = self
+                    .mux
+                    .tabs
+                    .get_mut(&tab_id)
+                    .is_some_and(|tab| tab.split_pane(&target, direction, pane_id.clone()));
+                if !split_ok {
+                    // 방어: split 실패 시 고아 pane/세션을 남기지 않는다
+                    self.mux.panes.remove(&pane_id);
+                    self.sessions.remove(&id);
+                    self.close_session_log(id, "killed", None);
+                    self.emit(RuntimeEvent::SpawnFailed {
+                        kind: SpawnKind::Shell,
+                        message: "분할 실패 (대상 pane 소실)".into(),
+                    });
+                    return;
                 }
                 self.mux.focus.focus(pane_id);
                 self.emit_mux_and_watched();
@@ -614,21 +631,25 @@ impl Worker {
         self.emit_mux_and_watched();
     }
 
-    /// mux 스냅샷을 push하고, watched 세션의 화면도 즉시 push한다
-    /// (포커스 전환 직후 stale 화면 방지).
+    /// mux 스냅샷을 push하고, visible(active tab) 세션들의 화면도 즉시 push한다
+    /// (tab/포커스 전환 직후 stale 화면 방지).
     fn emit_mux_and_watched(&mut self) {
         self.emit(RuntimeEvent::MuxUpdated {
             snapshot: Arc::new(self.mux.snapshot()),
         });
-        if let Some(session) = self.mux.watched_session()
-            && let Some(active) = self.sessions.get_mut(&session)
-            && let Some(snapshot) = active.take_snapshot()
-        {
-            let event = RuntimeEvent::Viewport {
-                session,
-                snapshot: Arc::new(snapshot),
-                bracketed_paste: active.bracketed_paste(),
-            };
+        let mut events = Vec::new();
+        for session in self.mux.watched_sessions() {
+            if let Some(active) = self.sessions.get_mut(&session)
+                && let Some(snapshot) = active.take_snapshot()
+            {
+                events.push(RuntimeEvent::Viewport {
+                    session,
+                    snapshot: Arc::new(snapshot),
+                    bracketed_paste: active.bracketed_paste(),
+                });
+            }
+        }
+        for event in events {
             self.emit(event);
         }
     }
@@ -636,7 +657,7 @@ impl Worker {
     /// 모든 세션의 PTY 출력을 반영하고, active pane 세션만 Viewport를 push한다
     /// (14.4: hidden pane snapshot 생성 금지 — dirty는 유지되어 포커스 전환 시 따라잡는다).
     fn pump_sessions(&mut self) {
-        let watched = self.mux.watched_session();
+        let watched = self.mux.watched_sessions();
         let mut events = Vec::new();
         for active in self.sessions.values_mut() {
             let mut log = self.logs.get_mut(&active.id());
@@ -650,7 +671,7 @@ impl Worker {
                 }
             });
             if result.dirty
-                && watched == Some(active.id())
+                && watched.contains(&active.id())
                 && let Some(snapshot) = active.take_snapshot()
             {
                 events.push(RuntimeEvent::Viewport {
@@ -1194,6 +1215,16 @@ mod tests {
             _ => None,
         });
         assert!(message.contains("cred-없음"));
+        // 실패 시 아무것도 spawn되지 않아야 한다 (부분 주입 금지)
+        std::thread::sleep(Duration::from_millis(150));
+        probe.seen.extend(probe.rx.drain());
+        assert!(
+            !probe
+                .seen
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::AgentSpawned { .. })),
+            "resolve 실패 후 AgentSpawned가 발행됨"
+        );
     }
 
     #[test]
@@ -1268,6 +1299,67 @@ mod tests {
         let text = String::from_utf8_lossy(&ansi);
         assert!(text.contains("[REDACTED]"), "치환 마커 없음: {text}");
         std::fs::remove_dir_all(&logs_root).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn select_tab과_close_tab_흐름() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("tabs"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        for _ in 0..2 {
+            client
+                .send_command(RuntimeCommand::SpawnShell {
+                    cols: 80,
+                    rows: 24,
+                    scrollback_lines: 100,
+                })
+                .unwrap();
+        }
+        let mux = probe.wait_for(Duration::from_secs(5), |e| match e {
+            RuntimeEvent::MuxUpdated { snapshot } if snapshot.tabs.len() == 2 => {
+                Some(snapshot.clone())
+            }
+            _ => None,
+        });
+        let first_tab = mux.tabs[0].id.clone();
+        let second_tab = mux.tabs[1].id.clone();
+        assert_eq!(mux.active_tab, Some(second_tab.clone()));
+        // SelectTab → active 전환 + 그 tab의 pane으로 포커스
+        client
+            .send_command(RuntimeCommand::SelectTab {
+                tab: first_tab.clone(),
+            })
+            .unwrap();
+        let expect_pane = mux.tabs[0].panes[0].id.clone();
+        probe.wait_for(Duration::from_secs(5), move |e| match e {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot.active_tab == Some(first_tab.clone())
+                    && snapshot.focused_pane == Some(expect_pane.clone()) =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
+        // CloseTab → tab 제거 + 남은 tab으로 활성 전환
+        client
+            .send_command(RuntimeCommand::CloseTab {
+                tab: mux.tabs[0].id.clone(),
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(5), move |e| match e {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot.tabs.len() == 1 && snapshot.active_tab == Some(second_tab.clone()) =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
     }
 
     #[test]

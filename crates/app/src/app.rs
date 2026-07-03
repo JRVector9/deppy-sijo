@@ -36,6 +36,7 @@ impl App {
         db: Db,
         workspace_id: String,
         logs_root: PathBuf,
+        db_path: PathBuf,
     ) -> Self {
         // output_batch_ms는 시작 시 고정, scrollback_lines는 세션 spawn 시점에 전달
         let redaction = secret::RedactionService::new();
@@ -44,6 +45,11 @@ impl App {
             Arc::new(KeyringSecretStore),
             logs_root,
             redaction.clone(),
+            // 세션/mux 영속 파이프라인 (runtime↔persist 배선)
+            Some(runtime::PersistConfig {
+                db_path,
+                workspace_id: workspace_id.clone(),
+            }),
         );
         let runtime_events = runtime.subscribe();
         // 이전 실행에서 저장한 credential도 로그 redaction 대상으로 시드
@@ -73,6 +79,7 @@ impl App {
             for i in 0..crate::perf::HARNESS_SESSIONS {
                 let (command, args) = crate::perf::harness_command(i);
                 let _ = runtime.send_command(runtime::RuntimeCommand::SpawnAgent {
+                    agent_config_id: None,
                     cols: 120,
                     rows: 40,
                     scrollback_lines: config.terminal.scrollback_lines as usize,

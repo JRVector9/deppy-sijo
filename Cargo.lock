@@ -3246,7 +3246,9 @@ dependencies = [
  "deppy-core",
  "keyring-core",
  "mux",
+ "persist",
  "pty",
+ "rusqlite",
  "secret",
  "serde",
  "serde_json",
@@ -3254,6 +3256,7 @@ dependencies = [
  "storage",
  "terminal",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

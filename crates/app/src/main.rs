@@ -24,7 +24,8 @@ fn main() -> anyhow::Result<()> {
         tracing::warn!("keyring store 초기화 실패 — 자격증명 기능 비활성: {e:#}");
     }
 
-    let db = storage::Db::open(&paths.data_dir.join("metadata.sqlite3"))?;
+    let db_path = paths.data_dir.join("metadata.sqlite3");
+    let db = storage::Db::open(&db_path)?;
     let workspace_id = db.ensure_default_workspace()?;
     // 이전 실행이 비정상 종료됐다면 남은 세션을 Exited로 정리 (crash recovery).
     // 실패는 기동 중단 — 거짓 running 상태로 복원 UI가 뜨면 안 된다 (codex 리뷰 반영)
@@ -56,6 +57,7 @@ fn main() -> anyhow::Result<()> {
                 db,
                 workspace_id,
                 logs_root,
+                db_path,
             )))
         }),
     )

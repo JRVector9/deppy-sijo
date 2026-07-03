@@ -488,6 +488,7 @@ mod tests {
                 args: vec!["-c".into(), "echo remote-ok; sleep 5".into()],
                 env: Vec::new(),
             },
+            None,
         )
     }
 

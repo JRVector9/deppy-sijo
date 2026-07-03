@@ -44,6 +44,7 @@ impl InProcessRuntimeClient {
         secret_store: Arc<dyn SecretStore>,
         logs_root: PathBuf,
         redaction: RedactionService,
+        persist: Option<crate::persistence::PersistConfig>,
     ) -> Self {
         Self::with_shell(
             output_batch_ms,
@@ -51,6 +52,7 @@ impl InProcessRuntimeClient {
             logs_root,
             redaction,
             pty::default_shell(),
+            persist,
         )
     }
 
@@ -61,6 +63,7 @@ impl InProcessRuntimeClient {
         logs_root: PathBuf,
         redaction: RedactionService,
         shell: CommandSpec,
+        persist: Option<crate::persistence::PersistConfig>,
     ) -> Self {
         // 세션 id(u64)는 실행마다 1부터 다시 시작한다 — 이전 실행 로그에
         // append되지 않도록 실행(run) 단위 하위 디렉터리로 격리한다.
@@ -79,6 +82,16 @@ impl InProcessRuntimeClient {
         let worker = std::thread::Builder::new()
             .name("runtime-worker".into())
             .spawn(move || {
+                let persist_pipe =
+                    persist.as_ref().and_then(
+                        |config| match crate::persistence::PersistPipe::open(config) {
+                            Ok(pipe) => Some(pipe),
+                            Err(e) => {
+                                tracing::warn!("세션 영속 비활성 (DB 열기 실패): {e:#}");
+                                None
+                            }
+                        },
+                    );
                 Worker {
                     command_rx,
                     subscribers: worker_subscribers,
@@ -93,6 +106,7 @@ impl InProcessRuntimeClient {
                     secret_store,
                     mux: MuxState::new(),
                     tab_counter: 0,
+                    persist: persist_pipe,
                 }
                 .run();
             })
@@ -172,6 +186,8 @@ struct Worker {
     /// mux 상태 (PR-10) — layout source of truth. UI는 MuxUpdated 스냅샷만 본다.
     mux: MuxState,
     tab_counter: u64,
+    /// 세션/mux 영속 파이프 (설정 시에만 — 실패는 best-effort warn)
+    persist: Option<crate::persistence::PersistPipe>,
 }
 
 /// 세션 하나의 redaction 상태 + 로그 파일 (설계문서 7장).
@@ -348,6 +364,17 @@ impl Worker {
                         self.sessions.insert(id, new_session);
                         self.open_session_log(id);
                         self.attach_in_new_tab(id, "셸");
+                        if let Some(pipe) = &mut self.persist {
+                            let args: Vec<String> = self.shell.args.clone();
+                            pipe.session_spawned(
+                                id,
+                                "shell",
+                                None,
+                                "셸",
+                                &self.shell.program,
+                                &args,
+                            );
+                        }
                         // MuxUpdated를 먼저 — Spawned 수신 시점에 스냅샷이 항상 앞서 있다
                         self.emit_mux_and_watched();
                         self.emit(RuntimeEvent::ShellSpawned { session: id });
@@ -362,6 +389,7 @@ impl Worker {
                 cols,
                 rows,
                 scrollback_lines,
+                agent_config_id,
                 command,
                 args,
                 env_plain,
@@ -418,6 +446,23 @@ impl Worker {
                         self.detectors.insert(id, StatusDetector::new(patterns));
                         self.open_session_log(id);
                         self.attach_in_new_tab(id, "에이전트");
+                        if let Some(pipe) = &mut self.persist {
+                            // 스키마 CHECK: agent kind는 agent_id 필수 — config id가
+                            // 없는 spawn(perf 하네스 등)은 shell kind로 기록한다
+                            let kind = if agent_config_id.is_some() {
+                                "agent"
+                            } else {
+                                "shell"
+                            };
+                            pipe.session_spawned(
+                                id,
+                                kind,
+                                agent_config_id,
+                                "에이전트",
+                                &spec.program,
+                                &spec.args,
+                            );
+                        }
                         self.emit_mux_and_watched();
                         self.emit(RuntimeEvent::AgentSpawned { session: id });
                     }
@@ -472,6 +517,9 @@ impl Worker {
                 self.sessions.remove(&session);
                 self.detectors.remove(&session);
                 self.close_session_log(session, "killed", None);
+                if let Some(pipe) = &mut self.persist {
+                    pipe.session_exited(session);
+                }
                 // 세션을 잃은 pane은 attach 해제 (pane/session 분리 — 5.2)
                 for pane in self.mux.panes.values_mut() {
                     if pane.session_id == Some(session) {
@@ -580,6 +628,10 @@ impl Worker {
             Ok(new_session) => {
                 self.sessions.insert(id, new_session);
                 self.open_session_log(id);
+                if let Some(pipe) = &mut self.persist {
+                    let args: Vec<String> = self.shell.args.clone();
+                    pipe.session_spawned(id, "shell", None, "셸", &self.shell.program, &args);
+                }
                 self.tab_counter += 1;
                 let pane_id = MuxPaneId::new();
                 let mut pane = MuxPane::new(pane_id.clone(), format!("셸 {}", self.tab_counter));
@@ -626,6 +678,9 @@ impl Worker {
             self.sessions.remove(&session);
             self.detectors.remove(&session);
             self.close_session_log(session, "killed", None);
+            if let Some(pipe) = &mut self.persist {
+                pipe.session_exited(session);
+            }
         }
         self.mux.panes.remove(&pane_id);
         let last_pane = match self.mux.tabs.get_mut(&tab_id) {
@@ -651,6 +706,9 @@ impl Worker {
                 self.sessions.remove(&session);
                 self.detectors.remove(&session);
                 self.close_session_log(session, "killed", None);
+                if let Some(pipe) = &mut self.persist {
+                    pipe.session_exited(session);
+                }
             }
         }
         self.mux.window.close_tab(&tab_id);
@@ -661,6 +719,10 @@ impl Worker {
     /// mux 스냅샷을 push하고, visible(active tab) 세션들의 화면도 즉시 push한다
     /// (tab/포커스 전환 직후 stale 화면 방지).
     fn emit_mux_and_watched(&mut self) {
+        // mux 구조가 바뀐 지점 — 영속 layout도 같은 시점에 저장 (§11.2~11.5)
+        if let Some(pipe) = &mut self.persist {
+            pipe.save_layout(&self.mux.window, &self.mux.tabs, &self.mux.panes);
+        }
         self.emit(RuntimeEvent::MuxUpdated {
             snapshot: Arc::new(self.mux.snapshot()),
         });
@@ -751,6 +813,9 @@ impl Worker {
             let detail = exit_code.map(|c| format!("exit code {c}"));
             self.close_session_log(session, "exited", detail.as_deref());
             self.detectors.remove(&session);
+            if let Some(pipe) = &mut self.persist {
+                pipe.session_exited(session);
+            }
         }
         for event in events {
             self.emit(event);
@@ -846,6 +911,7 @@ mod tests {
             test_logs_root("t"),
             RedactionService::new(),
             spec("/bin/echo", &["hi-runtime"]),
+            None,
         );
         let mut probe = Probe::new(client.subscribe());
         client
@@ -888,6 +954,7 @@ mod tests {
             test_logs_root("t"),
             RedactionService::new(),
             spec("/bin/cat", &[]),
+            None,
         );
         let mut probe = Probe::new(client.subscribe());
         client
@@ -943,6 +1010,7 @@ mod tests {
             test_logs_root("t"),
             RedactionService::new(),
             spec("/bin/echo", &["done"]),
+            None,
         );
         let mut probe = Probe::new(client.subscribe());
         client
@@ -985,6 +1053,7 @@ mod tests {
             test_logs_root("t"),
             RedactionService::new(),
             spec("/bin/cat", &[]),
+            None,
         );
         let mut probe = Probe::new(client.subscribe());
         let mut ids = Vec::new();
@@ -1053,6 +1122,7 @@ mod tests {
             test_logs_root("t"),
             RedactionService::new(),
             spec("/bin/cat", &[]),
+            None,
         );
         let mut probe = Probe::new(client.subscribe());
         for _ in 0..2 {
@@ -1113,6 +1183,7 @@ mod tests {
             test_logs_root("t"),
             RedactionService::new(),
             spec("/bin/cat", &[]),
+            None,
         );
         let mut probe = Probe::new(client.subscribe());
         client
@@ -1178,6 +1249,7 @@ mod tests {
             test_logs_root("nofail"),
             RedactionService::new(),
             spec("/nonexistent-deppy-test-cmd", &[]),
+            None,
         );
         let mut probe = Probe::new(client.subscribe());
         client
@@ -1214,11 +1286,13 @@ mod tests {
             test_logs_root("agent"),
             RedactionService::new(),
             pty::default_shell(),
+            None,
         );
         let mut probe = Probe::new(client.subscribe());
         // sh가 env를 출력 — plain + secret(spawn 직전 resolve) 주입 검증
         client
             .send_command(RuntimeCommand::SpawnAgent {
+                agent_config_id: None,
                 cols: 80,
                 rows: 24,
                 scrollback_lines: 100,
@@ -1251,10 +1325,12 @@ mod tests {
             test_logs_root("fail"),
             RedactionService::new(),
             pty::default_shell(),
+            None,
         );
         let mut probe = Probe::new(client.subscribe());
         client
             .send_command(RuntimeCommand::SpawnAgent {
+                agent_config_id: None,
                 cols: 80,
                 rows: 24,
                 scrollback_lines: 100,
@@ -1306,11 +1382,13 @@ mod tests {
             logs_root.clone(),
             redaction,
             pty::default_shell(),
+            None,
         );
         let mut probe = Probe::new(client.subscribe());
         // secret env를 stdout으로 두 번 출력 (chunk 분할 가능성 포함)
         client
             .send_command(RuntimeCommand::SpawnAgent {
+                agent_config_id: None,
                 cols: 80,
                 rows: 24,
                 scrollback_lines: 100,
@@ -1373,6 +1451,7 @@ mod tests {
             test_logs_root("tabs"),
             RedactionService::new(),
             spec("/bin/cat", &[]),
+            None,
         );
         let mut probe = Probe::new(client.subscribe());
         for _ in 0..2 {
@@ -1429,6 +1508,7 @@ mod tests {
     #[cfg(unix)]
     fn spawn_agent_cmd(script: &str, waiting: Option<&str>, done: Option<&str>) -> RuntimeCommand {
         RuntimeCommand::SpawnAgent {
+            agent_config_id: None,
             cols: 80,
             rows: 24,
             scrollback_lines: 100,
@@ -1452,6 +1532,7 @@ mod tests {
             test_logs_root("status-stream"),
             RedactionService::new(),
             pty::default_shell(),
+            None,
         );
         let mut probe = Probe::new(client.subscribe());
         client
@@ -1480,6 +1561,7 @@ mod tests {
             test_logs_root("status-screen"),
             RedactionService::new(),
             spec("/bin/cat", &[]),
+            None,
         );
         let mut probe = Probe::new(client.subscribe());
         // agent 먼저 spawn (개행 없는 TUI식 프롬프트 → stream 단계 미감지)
@@ -1536,6 +1618,7 @@ mod tests {
             test_logs_root("status-done"),
             RedactionService::new(),
             pty::default_shell(),
+            None,
         );
         let mut probe = Probe::new(client.subscribe());
         client
@@ -1569,6 +1652,7 @@ mod tests {
             test_logs_root("t"),
             RedactionService::new(),
             spec("/bin/echo", &["multi"]),
+            None,
         );
         let mut probe1 = Probe::new(client.subscribe());
         let mut probe2 = Probe::new(client.subscribe());
@@ -1585,5 +1669,79 @@ mod tests {
                 _ => None,
             });
         }
+    }
+
+    /// 세션 영속 파이프라인 (runtime↔persist 배선): spawn→running 행,
+    /// exit→exited 행, mux layout 저장. 재시작 시 reconcile(PR-14)과 맞물린다.
+    #[cfg(unix)]
+    #[test]
+    fn 세션과_layout이_영속된다() {
+        init_mock_store();
+        let dir = std::env::temp_dir().join(format!("deppy-rtpersist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("metadata.sqlite3");
+        // 스키마 준비 (앱 마이그레이션 대행: workspaces + persist DDL)
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT, path TEXT,
+                     created_at TEXT DEFAULT '', updated_at TEXT DEFAULT '');
+                 CREATE TABLE agent_configs (id TEXT PRIMARY KEY);
+                 INSERT INTO workspaces (id) VALUES ('ws-rt');",
+            )
+            .unwrap();
+            conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+        }
+
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("persist"),
+            RedactionService::new(),
+            spec("/bin/echo", &["persist-ok"]),
+            Some(crate::persistence::PersistConfig {
+                db_path: db_path.clone(),
+                workspace_id: "ws-rt".into(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::SessionExited { .. } => Some(()),
+            _ => None,
+        });
+        // exit 기록이 pump에서 일어난 뒤 확인 — 약간의 여유
+        std::thread::sleep(Duration::from_millis(100));
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (kind, command, status): (String, String, String) = conn
+            .query_row(
+                "SELECT session_kind, command, status FROM sessions",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "shell");
+        assert_eq!(command, "/bin/echo");
+        assert_eq!(status, "exited");
+        // mux layout: window/tab/pane가 저장되고 pane이 영속 session id를 참조
+        let windows = persist::load_window_layouts(&conn, "ws-rt").unwrap();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].tabs.len(), 1);
+        let pane_session = windows[0].tabs[0].panes[0].session_id.clone().unwrap();
+        let persisted_id: String = conn
+            .query_row("SELECT id FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pane_session, persisted_id);
+        // 재시작 crash recovery와의 연동: exited라 reconcile 대상 아님 (멱등)
+        assert_eq!(persist::reconcile_orphan_sessions(&conn).unwrap(), 0);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

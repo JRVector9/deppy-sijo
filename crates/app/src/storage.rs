@@ -16,7 +16,8 @@ pub struct Db {
 /// 3: agent_configs (PR-09, 11.0 — *_regex 컬럼은 PR-12 status detector가 소비),
 /// 4: sessions + mux_* (PR-14, persist crate DDL),
 /// 5: mcp_servers + mcp_tools (PR-15, mcp crate DDL),
-/// 6: tool_audit_logs (PR-16, audit crate DDL).
+/// 6: tool_audit_logs (PR-16, audit crate DDL),
+/// 7: agent_configs.deleted_at (soft-delete — 세션 영속 FK와 공존).
 /// 4~6은 각 crate가 소유한 DDL 상수를 그대로 붙인다 (스키마 정의는 한 곳에서만).
 const MIGRATIONS: &[&str] = &[
     "
@@ -91,6 +92,9 @@ CREATE TABLE agent_configs (
     persist::MIGRATION_SQL,
     mcp::MIGRATION_SQL,
     audit::MIGRATION_SQL,
+    // 7: agent_configs soft-delete — sessions.agent_id FK(§11.1)가 실행 이력이
+    //    있는 config의 물리 삭제를 막으므로, 삭제는 표시로 대체한다
+    "ALTER TABLE agent_configs ADD COLUMN deleted_at TEXT;",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -451,7 +455,7 @@ impl Db {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, name, command, args_json,
                     waiting_regex, approval_regex, error_regex, done_regex
-             FROM agent_configs ORDER BY created_at, id",
+             FROM agent_configs WHERE deleted_at IS NULL ORDER BY created_at, id",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -486,9 +490,15 @@ impl Db {
         Ok(out)
     }
 
+    /// soft-delete — 실행 이력(sessions.agent_id FK)이 있어도 항상 성공한다.
     pub fn delete_agent_config(&self, id: &str) -> anyhow::Result<()> {
         self.conn
-            .execute("DELETE FROM agent_configs WHERE id = ?1", [id])
+            .execute(
+                "UPDATE agent_configs
+                 SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE id = ?1 AND deleted_at IS NULL",
+                [id],
+            )
             .with_context(|| format!("agent config 삭제 실패: {id}"))?;
         Ok(())
     }

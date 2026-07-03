@@ -16,6 +16,8 @@ pub enum RuntimeCommand {
         cols: u16,
         rows: u16,
         scrollback_lines: usize,
+        /// agent_configs.id — 세션 영속(§11.1 sessions.agent_id)에 기록된다
+        agent_config_id: Option<String>,
         command: String,
         args: Vec<String>,
         env_plain: Vec<(String, String)>,

@@ -7,6 +7,9 @@ license.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+rusqlite = { workspace = true }
+uuid = { workspace = true }
+persist = { path = "../persist" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 deppy-core = { path = "../core" }

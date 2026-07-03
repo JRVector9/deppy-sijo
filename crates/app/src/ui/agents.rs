@@ -289,6 +289,8 @@ impl AgentsUi {
             }
         }
         client.send_command(RuntimeCommand::SpawnAgent {
+            // 세션 영속(§11.1 sessions.agent_id)에 어느 agent 설정으로 spawn했는지 기록
+            agent_config_id: Some(agent.id.clone()),
             cols: 80,
             rows: 24,
             scrollback_lines: config.scrollback_lines as usize,

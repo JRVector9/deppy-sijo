@@ -1,20 +1,28 @@
 use std::path::PathBuf;
 
 use crate::config::Config;
+use crate::secret::KeyringSecretStore;
+use crate::storage::Db;
 use crate::ui;
 
 pub struct App {
     config: Config,
     config_path: PathBuf,
     settings_open: bool,
+    db: Db,
+    secret_store: KeyringSecretStore,
+    credentials_ui: ui::credentials::CredentialsUi,
 }
 
 impl App {
-    pub fn new(config: Config, config_path: PathBuf) -> Self {
+    pub fn new(config: Config, config_path: PathBuf, db: Db) -> Self {
         Self {
             config,
             config_path,
             settings_open: false,
+            db,
+            secret_store: KeyringSecretStore,
+            credentials_ui: ui::credentials::CredentialsUi::new(),
         }
     }
 }
@@ -27,9 +35,15 @@ impl eframe::App for App {
                 if ui.button("설정").clicked() {
                     self.settings_open = !self.settings_open;
                 }
+                if ui.button("자격증명").clicked() {
+                    self.credentials_ui.toggle();
+                }
             });
         });
         egui::CentralPanel::default().show(ui, |_ui| {});
+
+        self.credentials_ui
+            .show(ui.ctx(), &self.db, &self.secret_store);
 
         let changed = ui::settings::show(ui.ctx(), &mut self.settings_open, &mut self.config);
         if changed {

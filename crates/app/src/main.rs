@@ -1,6 +1,8 @@
 mod app;
 mod config;
 mod paths;
+mod secret;
+mod storage;
 mod ui;
 
 fn main() -> anyhow::Result<()> {
@@ -9,6 +11,11 @@ fn main() -> anyhow::Result<()> {
     let _log_guard = init_logging(&paths);
     let config = config::Config::load_or_create(&paths.config_dir)?;
     let config_path = config::config_path(&paths.config_dir);
+    // insecure fallback 금지(설계문서 1.4) — 등록 실패 시 credential 조작이 에러로 표면화된다
+    if let Err(e) = secret::init_platform_store() {
+        tracing::warn!("keyring store 초기화 실패 — 자격증명 기능 비활성: {e:#}");
+    }
+    let db = storage::Db::open(&paths.data_dir.join("metadata.sqlite3"))?;
     tracing::info!(
         config_dir = %paths.config_dir.display(),
         data_dir = %paths.data_dir.display(),
@@ -22,7 +29,7 @@ fn main() -> anyhow::Result<()> {
         Box::new(move |cc| {
             // 저장된 테마를 시작 시점에 적용
             cc.egui_ctx.set_theme(config.ui.theme.to_egui());
-            Ok(Box::new(app::App::new(config, config_path)))
+            Ok(Box::new(app::App::new(config, config_path, db)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe 실행 실패: {e}"))

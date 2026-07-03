@@ -908,6 +908,7 @@ dependencies = [
  "secret",
  "serde",
  "serde_json",
+ "storage",
  "terminal",
  "toml",
  "tracing",
@@ -3817,8 +3818,15 @@ name = "storage"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "audit",
  "deppy-core",
+ "mcp",
+ "persist",
+ "rusqlite",
+ "secret",
+ "serde_json",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -1,12 +1,6 @@
 use std::collections::BTreeMap;
 
-/// env 값. secret은 평문 대신 credentials.id만 참조한다 (설계문서 6.3).
-/// 평문 해석은 spawn 직전(PR-09)에만 일어난다.
-#[derive(Debug, Clone, PartialEq)]
-pub enum EnvValue {
-    Plain(String),
-    Secret { credential_id: String },
-}
+pub use storage::EnvValue;
 
 /// precedence 한 계층 (설계문서 6.2). resolve에는 낮음 → 높음 순으로 전달한다.
 pub struct EnvLayer {

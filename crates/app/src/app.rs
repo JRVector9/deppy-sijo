@@ -22,6 +22,7 @@ pub struct App {
     credentials_ui: ui::credentials::CredentialsUi,
     env_profiles_ui: ui::env_profiles::EnvProfilesUi,
     workspace_ui: ui::workspace::WorkspaceUi,
+    notifications_ui: ui::notifications::NotificationsUi,
     runtime: InProcessRuntimeClient,
     runtime_events: RuntimeEventReceiver,
 }
@@ -69,6 +70,7 @@ impl App {
             credentials_ui: ui::credentials::CredentialsUi::new(redaction),
             env_profiles_ui: ui::env_profiles::EnvProfilesUi::new(),
             workspace_ui: ui::workspace::WorkspaceUi::new(),
+            notifications_ui: ui::notifications::NotificationsUi::new(),
             runtime,
             runtime_events,
         }
@@ -97,6 +99,17 @@ impl eframe::App for App {
                 if ui.button("에이전트").clicked() {
                     self.agents_ui.toggle();
                 }
+                let unread = self.notifications_ui.unread();
+                let label = if unread > 0 {
+                    format!("알림 ({unread})")
+                } else {
+                    "알림".to_owned()
+                };
+                if ui.button(label).clicked() {
+                    // 열면 모두 읽음 → 배지가 이미 그려진 뒤라 다음 프레임에 갱신
+                    self.notifications_ui.toggle();
+                    ui.ctx().request_repaint();
+                }
             });
         });
 
@@ -119,6 +132,46 @@ impl eframe::App for App {
                 .show(ui, &self.config.terminal, &self.runtime, &events);
         });
 
+        // 알림 센터: workspace가 mux를 갱신한 뒤 상태 이벤트를 알림으로 만든다.
+        // 배지는 이번 프레임 상단에서 이미 그려졌으므로, unread가 바뀌면 재도장한다.
+        let mux = self.workspace_ui.mux().cloned();
+        let unread_before = self.notifications_ui.unread();
+        for event in &events {
+            // 이미 사라진 세션(닫기 직전 큐된 상태)은 유령 알림을 만들지 않는다
+            let title_of = |session| mux.as_ref().and_then(|mux| session_title(mux, session));
+            match event {
+                runtime::RuntimeEvent::SessionStatusChanged { session, status } => {
+                    if let Some(title) = title_of(*session) {
+                        self.notifications_ui.on_status(*session, *status, &title);
+                    }
+                }
+                // regex 없는 agent는 결과가 SessionExited로만 온다 (완료 기준: done/error)
+                runtime::RuntimeEvent::SessionExited { session, exit_code } => {
+                    if let Some(title) = title_of(*session) {
+                        self.notifications_ui.on_exit(*session, *exit_code, &title);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(mux) = &mux {
+            let alive: Vec<_> = mux
+                .tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .filter_map(|pane| pane.session_id)
+                .collect();
+            self.notifications_ui.retain_sessions(&alive);
+        }
+        let focused = self
+            .notifications_ui
+            .show(ui.ctx(), &self.runtime, mux.as_deref());
+        // 배지 변화(추가/pruning)·focus 명령 응답은 다음 프레임 반영 — 즉시 repaint
+        if focused || self.notifications_ui.unread() != unread_before {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
+        }
+
         let changed = ui::settings::show(ui.ctx(), &mut self.settings_open, &mut self.config);
         if changed {
             // hot reload: 테마는 즉시 적용
@@ -128,4 +181,13 @@ impl eframe::App for App {
             }
         }
     }
+}
+
+/// 세션이 속한 pane의 제목 (알림 표시용).
+fn session_title(mux: &runtime::MuxSnapshot, session: runtime::SessionId) -> Option<String> {
+    mux.tabs
+        .iter()
+        .flat_map(|tab| &tab.panes)
+        .find(|pane| pane.session_id == Some(session))
+        .map(|pane| pane.title.clone())
 }

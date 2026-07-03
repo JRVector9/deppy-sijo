@@ -17,6 +17,7 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 rusqlite = { workspace = true }
 uuid = { workspace = true }
+platform = { path = "../platform" }
 runtime = { path = "../runtime" }
 secret = { path = "../secret" }
 terminal = { path = "../terminal" }

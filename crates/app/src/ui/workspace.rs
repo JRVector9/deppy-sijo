@@ -472,6 +472,11 @@ impl WorkspaceUi {
         }
     }
 
+    /// 최신 mux 스냅샷 (알림 센터가 pane 조회·제목에 사용).
+    pub fn mux(&self) -> Option<&Arc<MuxSnapshot>> {
+        self.mux.as_ref()
+    }
+
     fn session_alive(&self, session: SessionId) -> bool {
         self.mux.as_ref().is_some_and(|mux| {
             mux.tabs

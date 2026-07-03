@@ -1,0 +1,10 @@
+# 설계문서 9장 Platform crate. PR-13은 OS notification만.
+[package]
+name = "platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tracing = { workspace = true }
+notify-rust = { workspace = true }

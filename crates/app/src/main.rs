@@ -1,12 +1,14 @@
 mod app;
 mod config;
 mod paths;
+mod ui;
 
 fn main() -> anyhow::Result<()> {
     let paths = paths::AppPaths::init()?;
     // guard가 drop되면 파일 로그 flush가 끊기므로 main 끝까지 유지한다.
     let _log_guard = init_logging(&paths);
     let config = config::Config::load_or_create(&paths.config_dir)?;
+    let config_path = config::config_path(&paths.config_dir);
     tracing::info!(
         config_dir = %paths.config_dir.display(),
         data_dir = %paths.data_dir.display(),
@@ -17,7 +19,11 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "Deppy Jelly",
         eframe::NativeOptions::default(),
-        Box::new(|_cc| Ok(Box::new(app::App::new(config)))),
+        Box::new(move |cc| {
+            // 저장된 테마를 시작 시점에 적용
+            cc.egui_ctx.set_theme(config.ui.theme.to_egui());
+            Ok(Box::new(app::App::new(config, config_path)))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("eframe 실행 실패: {e}"))
 }

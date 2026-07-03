@@ -87,6 +87,32 @@ remote attach skeleton
 - browser/remote client는 별도 client로 분리
 ```
 
+### egui 0.35 breaking change (2026-07-03 PR-00에서 실측 확인)
+
+eframe 0.35부터 App trait 시그니처가 변경되었다.
+웹 자료/예제/LLM 학습 데이터 대부분은 구 시그니처 기준이므로 구현 시 주의.
+
+```text
+구 (0.34 이하):
+  fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame)
+  egui::CentralPanel::default().show(ctx, |ui| ...)   // &Context를 받음
+
+신 (0.35):
+  fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame)
+  egui::CentralPanel::default().show(ui, |ui| ...)    // &mut Ui를 받음
+
+추가 (PR-01에서 실측 확인):
+  SidePanel / TopBottomPanel 타입이 제거되고 egui::Panel로 통합됨
+  → egui::Panel::top("id") / bottom / left / right 사용
+  egui::Window는 여전히 show(&Context, ...) — ui.ctx()로 접근
+
+적용 규칙:
+- 모든 UI 코드는 신 시그니처 기준으로 작성한다
+- Context가 필요하면 ui.ctx()로 접근한다 (request_repaint, set_theme 등)
+- PR-05 TerminalRenderer: 참고 구현 egui_term(1.7)은 egui 0.34 구 시그니처
+  기반이므로 렌더 루프를 그대로 복사하지 말고 &mut Ui 기준으로 이식한다
+```
+
 ## 1.2 portable-pty
 
 portable-pty는 시스템 PTY 인터페이스를 위한 cross-platform API이고, runtime에 따라 구현체를 선택할 수 있는 trait 구조를 제공한다. 예제도 `openpty`, `spawn_command`, reader/writer 구조를 사용한다.
@@ -1310,6 +1336,8 @@ PR-04~05에서 UI가 임시로 PTY/terminal에 직결하는 코드는
 ```text
 TerminalBackend trait, TerminalChangeSet, TerminalViewportSnapshot, egui renderer
 ```
+
+주의: renderer는 egui 0.35 신규 시그니처(App::ui / &mut Ui) 기준으로 작성한다 (1.1 참조).
 
 완료 기준:
 

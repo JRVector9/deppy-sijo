@@ -1,0 +1,11 @@
+# 설계문서 9장 storage crate — PR-11은 logs만. SQLite 이동은 PR-14에서.
+[package]
+name = "storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+deppy-core = { path = "../core" }

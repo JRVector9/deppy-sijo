@@ -7,9 +7,12 @@ use std::time::Duration;
 
 use deppy_core::{MuxPaneId, MuxTabId};
 use mux::{FocusManager, MuxPane, MuxSnapshot, MuxTab, MuxWindow, PaneSnapshot, TabSnapshot};
+use std::path::PathBuf;
+
 use pty::CommandSpec;
-use secret::SecretStore;
+use secret::{RedactionService, SecretStore, StreamRedactor};
 use session::Session;
+use storage::SessionLogWriter;
 
 use crate::client::{RuntimeClient, RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream};
 use crate::command::{RuntimeCommand, SessionId};
@@ -34,16 +37,42 @@ impl InProcessRuntimeClient {
     /// `output_batch_ms`: Viewport push 주기 (설계문서 10.1, config.performance 소비).
     /// 시작 시점에 고정 — 변경은 앱 재시작 필요.
     /// `secret_store`: SpawnAgent의 secret env를 spawn 직전에 resolve할 때만 사용 (6.3).
-    pub fn new(output_batch_ms: u64, secret_store: Arc<dyn SecretStore>) -> Self {
-        Self::with_shell(output_batch_ms, secret_store, pty::default_shell())
+    /// `logs_root`: 세션별 redacted 로그 디렉터리 (7장). `redaction`: 공유 레지스트리 —
+    /// UI(credential 저장)와 worker(spawn 주입)가 같은 인스턴스에 등록한다.
+    pub fn new(
+        output_batch_ms: u64,
+        secret_store: Arc<dyn SecretStore>,
+        logs_root: PathBuf,
+        redaction: RedactionService,
+    ) -> Self {
+        Self::with_shell(
+            output_batch_ms,
+            secret_store,
+            logs_root,
+            redaction,
+            pty::default_shell(),
+        )
     }
 
     /// 테스트용: 셸 대신 임의 명령을 spawn한다.
     pub fn with_shell(
         output_batch_ms: u64,
         secret_store: Arc<dyn SecretStore>,
+        logs_root: PathBuf,
+        redaction: RedactionService,
         shell: CommandSpec,
     ) -> Self {
+        // 세션 id(u64)는 실행마다 1부터 다시 시작한다 — 이전 실행 로그에
+        // append되지 않도록 실행(run) 단위 하위 디렉터리로 격리한다.
+        // (영속 세션 id 도입은 PR-14)
+        let run_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        // 같은 ms의 다중 인스턴스/테스트 충돌 방지: pid + 프로세스 내 카운터
+        static RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let logs_root = logs_root.join(format!("run-{run_ms}-{}-{seq}", std::process::id()));
         let (command_tx, command_rx) = channel();
         let subscribers: Arc<Mutex<Vec<Subscriber>>> = Arc::default();
         let worker_subscribers = Arc::clone(&subscribers);
@@ -57,6 +86,9 @@ impl InProcessRuntimeClient {
                     shell,
                     next_id: 1,
                     sessions: std::collections::HashMap::new(),
+                    logs: std::collections::HashMap::new(),
+                    logs_root,
+                    redaction,
                     secret_store,
                     mux: MuxState::new(),
                     tab_counter: 0,
@@ -130,9 +162,19 @@ struct Worker {
     sessions: std::collections::HashMap<SessionId, Session>,
     /// spawn 직전 secret resolve 전용 (6.3). worker 단일 스레드 접근 (1.4).
     secret_store: Arc<dyn SecretStore>,
+    /// 세션별 redacted 로그 (7장). raw 평문 로그는 만들지 않는다.
+    logs: std::collections::HashMap<SessionId, SessionLog>,
+    logs_root: PathBuf,
+    redaction: RedactionService,
     /// mux 상태 (PR-10) — layout source of truth. UI는 MuxUpdated 스냅샷만 본다.
     mux: MuxState,
     tab_counter: u64,
+}
+
+/// 세션 하나의 redaction 상태 + 로그 파일 (설계문서 7장).
+struct SessionLog {
+    redactor: StreamRedactor,
+    writer: SessionLogWriter,
 }
 
 /// worker가 소유하는 mux 상태 (설계문서 3장 Mux Runtime).
@@ -238,6 +280,12 @@ impl Worker {
             }
             self.pump_sessions();
         }
+        // 앱 종료: 열려 있는 로그의 redaction carry를 flush하고 마감한다
+        // (shutdown()이 join하므로 여기까지 동기 보장)
+        let open_sessions: Vec<SessionId> = self.logs.keys().copied().collect();
+        for session in open_sessions {
+            self.close_session_log(session, "app-shutdown", None);
+        }
         // sessions drop → PtySession Drop이 프로세스 정리
     }
 
@@ -285,6 +333,7 @@ impl Worker {
                 ) {
                     Ok(new_session) => {
                         self.sessions.insert(id, new_session);
+                        self.open_session_log(id);
                         self.attach_in_new_tab(id, "셸");
                         // MuxUpdated를 먼저 — Spawned 수신 시점에 스냅샷이 항상 앞서 있다
                         self.emit_mux_and_watched();
@@ -311,7 +360,11 @@ impl Worker {
                 let mut resolve_failed = None;
                 for (key, credential_id) in env_secrets {
                     match self.secret_store.get_secret(&credential_id) {
-                        Ok(value) => env.push((key, value.expose().to_owned())),
+                        Ok(value) => {
+                            // 주입되는 secret은 로그 redaction 대상으로 등록 (6.3/7장)
+                            self.redaction.register(&value);
+                            env.push((key, value.expose().to_owned()));
+                        }
                         Err(e) => {
                             // credential id만 로그 — secret 값/키 이름은 남기지 않는다
                             resolve_failed = Some(format!(
@@ -345,6 +398,7 @@ impl Worker {
                 ) {
                     Ok(new_session) => {
                         self.sessions.insert(id, new_session);
+                        self.open_session_log(id);
                         self.attach_in_new_tab(id, "에이전트");
                         self.emit_mux_and_watched();
                         self.emit(RuntimeEvent::AgentSpawned { session: id });
@@ -374,9 +428,22 @@ impl Worker {
                     active.scroll(delta);
                 }
             }
+            RuntimeCommand::SeedRedaction { credential_ids } => {
+                // 기존 저장 credential을 로그 redaction 대상으로 등록 (7장).
+                // resolve는 worker 단일 스레드에서만 (1.4) — UI는 id만 넘긴다 (2.1).
+                for id in credential_ids {
+                    match self.secret_store.get_secret(&id) {
+                        Ok(value) => self.redaction.register(&value),
+                        Err(e) => {
+                            tracing::warn!("redaction 시드 실패 (credential {id}): {e:#}")
+                        }
+                    }
+                }
+            }
             RuntimeCommand::KillSession { session } => {
                 // Session drop → PtySession Drop이 process group 정리를 보장한다
                 self.sessions.remove(&session);
+                self.close_session_log(session, "killed", None);
                 // 세션을 잃은 pane은 attach 해제 (pane/session 분리 — 5.2)
                 for pane in self.mux.panes.values_mut() {
                     if pane.session_id == Some(session) {
@@ -414,6 +481,33 @@ impl Worker {
                     self.emit_mux_and_watched();
                 }
             }
+        }
+    }
+
+    /// 세션 로그를 연다. 실패해도 세션은 계속 (로그만 없음 — warn).
+    fn open_session_log(&mut self, session: SessionId) {
+        match SessionLogWriter::open(&self.logs_root, session) {
+            Ok(mut writer) => {
+                let _ = writer.append_event("spawned", None);
+                self.logs.insert(
+                    session,
+                    SessionLog {
+                        redactor: self.redaction.stream_redactor(),
+                        writer,
+                    },
+                );
+            }
+            Err(e) => tracing::warn!("세션 로그 열기 실패: {e:#}"),
+        }
+    }
+
+    /// 세션 로그를 닫는다 — carry flush 후 종료 이벤트 기록.
+    fn close_session_log(&mut self, session: SessionId, event: &str, detail: Option<&str>) {
+        if let Some(mut log) = self.logs.remove(&session) {
+            let tail = log.redactor.flush();
+            let _ = log.writer.append_output(&tail);
+            let _ = log.writer.append_event(event, detail);
+            log.writer.flush();
         }
     }
 
@@ -457,6 +551,7 @@ impl Worker {
         ) {
             Ok(new_session) => {
                 self.sessions.insert(id, new_session);
+                self.open_session_log(id);
                 let pane_id = MuxPaneId::new();
                 let mut pane = MuxPane::new(pane_id.clone(), "셸".into());
                 pane.session_id = Some(id);
@@ -487,6 +582,7 @@ impl Worker {
             .and_then(|pane| pane.session_id)
         {
             self.sessions.remove(&session);
+            self.close_session_log(session, "killed", None);
         }
         self.mux.panes.remove(&pane_id);
         let last_pane = match self.mux.tabs.get_mut(&tab_id) {
@@ -510,6 +606,7 @@ impl Worker {
                 && let Some(session) = pane.session_id
             {
                 self.sessions.remove(&session);
+                self.close_session_log(session, "killed", None);
             }
         }
         self.mux.window.close_tab(&tab_id);
@@ -542,7 +639,16 @@ impl Worker {
         let watched = self.mux.watched_session();
         let mut events = Vec::new();
         for active in self.sessions.values_mut() {
-            let result = active.pump();
+            let mut log = self.logs.get_mut(&active.id());
+            let result = active.pump(|chunk| {
+                if let Some(log) = log.as_mut() {
+                    // redaction 후에만 디스크에 닿는다 (7장 — raw 평문 저장 금지)
+                    let redacted = log.redactor.redact_chunk(chunk);
+                    if let Err(e) = log.writer.append_output(&redacted) {
+                        tracing::warn!("세션 로그 기록 실패: {e:#}");
+                    }
+                }
+            });
             if result.dirty
                 && watched == Some(active.id())
                 && let Some(snapshot) = active.take_snapshot()
@@ -562,6 +668,18 @@ impl Worker {
                 });
             }
         }
+        // 종료 세션의 로그 마감 (carry flush + exited 이벤트)
+        let exited: Vec<(SessionId, Option<u32>)> = events
+            .iter()
+            .filter_map(|e| match e {
+                RuntimeEvent::SessionExited { session, exit_code } => Some((*session, *exit_code)),
+                _ => None,
+            })
+            .collect();
+        for (session, exit_code) in exited {
+            let detail = exit_code.map(|c| format!("exit code {c}"));
+            self.close_session_log(session, "exited", detail.as_deref());
+        }
         for event in events {
             self.emit(event);
         }
@@ -576,6 +694,12 @@ mod tests {
 
     fn test_store() -> Arc<dyn SecretStore> {
         Arc::new(secret::KeyringSecretStore)
+    }
+
+    fn test_logs_root(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("deppy-rt-logs-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     /// mock keyring store는 test only (설계문서 1.4). 프로세스 전역 1회만 등록 —
@@ -644,8 +768,13 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn spawn_출력_종료_이벤트_흐름() {
-        let client =
-            InProcessRuntimeClient::with_shell(5, test_store(), spec("/bin/echo", &["hi-runtime"]));
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("t"),
+            RedactionService::new(),
+            spec("/bin/echo", &["hi-runtime"]),
+        );
         let mut probe = Probe::new(client.subscribe());
         client
             .send_command(RuntimeCommand::SpawnShell {
@@ -681,7 +810,13 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn 입력과_kill() {
-        let client = InProcessRuntimeClient::with_shell(5, test_store(), spec("/bin/cat", &[]));
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("t"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+        );
         let mut probe = Probe::new(client.subscribe());
         client
             .send_command(RuntimeCommand::SpawnShell {
@@ -730,8 +865,13 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn 종료_후에도_scrollback_열람_가능() {
-        let client =
-            InProcessRuntimeClient::with_shell(5, test_store(), spec("/bin/echo", &["done"]));
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("t"),
+            RedactionService::new(),
+            spec("/bin/echo", &["done"]),
+        );
         let mut probe = Probe::new(client.subscribe());
         client
             .send_command(RuntimeCommand::SpawnShell {
@@ -767,7 +907,13 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn 다중_세션_동시_생존과_독립_입출력() {
-        let client = InProcessRuntimeClient::with_shell(5, test_store(), spec("/bin/cat", &[]));
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("t"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+        );
         let mut probe = Probe::new(client.subscribe());
         let mut ids = Vec::new();
         for _ in 0..3 {
@@ -829,7 +975,13 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn 비활성_pane은_viewport_push_안됨() {
-        let client = InProcessRuntimeClient::with_shell(5, test_store(), spec("/bin/cat", &[]));
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("t"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+        );
         let mut probe = Probe::new(client.subscribe());
         for _ in 0..2 {
             client
@@ -883,7 +1035,13 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn split과_close_pane_mux_흐름() {
-        let client = InProcessRuntimeClient::with_shell(5, test_store(), spec("/bin/cat", &[]));
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("t"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+        );
         let mut probe = Probe::new(client.subscribe());
         client
             .send_command(RuntimeCommand::SpawnShell {
@@ -945,6 +1103,8 @@ mod tests {
         let client = InProcessRuntimeClient::with_shell(
             5,
             test_store(),
+            test_logs_root("nofail"),
+            RedactionService::new(),
             spec("/nonexistent-deppy-test-cmd", &[]),
         );
         let mut probe = Probe::new(client.subscribe());
@@ -976,7 +1136,13 @@ mod tests {
             )
             .unwrap();
 
-        let client = InProcessRuntimeClient::with_shell(5, store, pty::default_shell());
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            store,
+            test_logs_root("agent"),
+            RedactionService::new(),
+            pty::default_shell(),
+        );
         let mut probe = Probe::new(client.subscribe());
         // sh가 env를 출력 — plain + secret(spawn 직전 resolve) 주입 검증
         client
@@ -1003,7 +1169,13 @@ mod tests {
     #[test]
     fn spawn_agent_resolve_실패시_spawn_안함() {
         init_mock_store();
-        let client = InProcessRuntimeClient::with_shell(5, test_store(), pty::default_shell());
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("fail"),
+            RedactionService::new(),
+            pty::default_shell(),
+        );
         let mut probe = Probe::new(client.subscribe());
         client
             .send_command(RuntimeCommand::SpawnAgent {
@@ -1026,9 +1198,88 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn 로그_secret_scan_평문_없음() {
+        // 완료 기준 (PR-11): 세션 로그 어디에도 secret 평문이 없어야 한다
+        init_mock_store();
+        let store = test_store();
+        store
+            .set_secret(
+                "cred-log-scan",
+                &secret::SecretString::new("scan-me-s3cret-XYZ".into()),
+            )
+            .unwrap();
+        let logs_root = test_logs_root("scan");
+        let redaction = RedactionService::new();
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            store,
+            logs_root.clone(),
+            redaction,
+            pty::default_shell(),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        // secret env를 stdout으로 두 번 출력 (chunk 분할 가능성 포함)
+        client
+            .send_command(RuntimeCommand::SpawnAgent {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                command: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "echo leak=$SECRET_K; printf '%s' $SECRET_K; echo".into(),
+                ],
+                env_plain: Vec::new(),
+                env_secrets: vec![("SECRET_K".into(), "cred-log-scan".into())],
+            })
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(5), |e| match e {
+            RuntimeEvent::AgentSpawned { session } => Some(*session),
+            _ => None,
+        });
+        probe.wait_for(Duration::from_secs(5), |e| match e {
+            RuntimeEvent::SessionExited { .. } => Some(()),
+            _ => None,
+        });
+        // exit 처리(로그 flush)까지 잠시 대기
+        std::thread::sleep(Duration::from_millis(200));
+        // with_shell이 run-<ms> 하위 디렉터리를 만든다 — 그 안에서 세션 디렉터리를 찾는다
+        let run_dir = std::fs::read_dir(&logs_root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().starts_with("run-"))
+            .expect("run 디렉터리 없음")
+            .path();
+        let dir = storage::SessionLogWriter::session_dir(&run_dir, session);
+        for file in [
+            "redacted.ansi.log",
+            "redacted.plain.txt",
+            "events.redacted.jsonl",
+        ] {
+            let bytes = std::fs::read(dir.join(file)).unwrap_or_default();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                !text.contains("scan-me-s3cret-XYZ"),
+                "{file}에 secret 평문 존재: {text}"
+            );
+        }
+        // 출력 자체는 기록되었고 치환 마커가 있어야 한다
+        let ansi = std::fs::read(dir.join("redacted.ansi.log")).unwrap();
+        let text = String::from_utf8_lossy(&ansi);
+        assert!(text.contains("[REDACTED]"), "치환 마커 없음: {text}");
+        std::fs::remove_dir_all(&logs_root).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn 다중_구독자() {
-        let client =
-            InProcessRuntimeClient::with_shell(5, test_store(), spec("/bin/echo", &["multi"]));
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("t"),
+            RedactionService::new(),
+            spec("/bin/echo", &["multi"]),
+        );
         let mut probe1 = Probe::new(client.subscribe());
         let mut probe2 = Probe::new(client.subscribe());
         client

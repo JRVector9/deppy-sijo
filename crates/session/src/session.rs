@@ -72,7 +72,9 @@ impl Session {
     }
 
     /// PTY 출력을 terminal backend에 반영한다. batch tick마다 호출.
-    pub fn pump(&mut self) -> PumpResult {
+    /// `on_output`은 raw chunk마다 불린다 — 로그/status detector는
+    /// backend 내부가 아니라 이 output stream 기반이다 (설계문서 4.1).
+    pub fn pump(&mut self, mut on_output: impl FnMut(&[u8])) -> PumpResult {
         let mut fed = 0usize;
         let mut eof = false;
         while self.pty.is_some() {
@@ -82,6 +84,7 @@ impl Session {
             match self.output.try_recv() {
                 Ok(chunk) => {
                     fed += chunk.len();
+                    on_output(&chunk);
                     match self.backend.feed(&chunk) {
                         Ok(changes) => {
                             self.dirty = true;
@@ -192,7 +195,7 @@ mod tests {
         assert!(session.lifecycle().is_running());
 
         let result = wait(Duration::from_secs(5), || {
-            let result = session.pump();
+            let result = session.pump(|_| {});
             result.just_exited.then_some(result)
         });
         assert!(result.just_exited);
@@ -217,11 +220,11 @@ mod tests {
             Session::spawn_with_spec(SessionId(2), SessionKind::Shell, &spec, 80, 24, 100).unwrap();
         session.write_input(b"ping\r");
         wait(Duration::from_secs(5), || {
-            session.pump();
+            session.pump(|_| {});
             let snapshot = session.take_snapshot().unwrap();
             row_text(&snapshot, 0).contains("ping").then_some(())
         });
         // snapshot 후 dirty가 지워진다
-        assert!(!session.pump().dirty);
+        assert!(!session.pump(|_| {}).dirty);
     }
 }

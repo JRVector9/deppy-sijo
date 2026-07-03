@@ -9,6 +9,7 @@ members = [
     "crates/runtime",
     "crates/secret",
     "crates/session",
+    "crates/storage",
     "crates/terminal",
 ]
 

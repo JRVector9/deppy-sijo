@@ -3,6 +3,7 @@ use secret::{self, SecretStore, SecretString};
 
 /// 자격증명 관리 창 상태. secret 입력값은 추가 즉시 비운다.
 pub struct CredentialsUi {
+    redaction: secret::RedactionService,
     open: bool,
     provider: String,
     label: String,
@@ -13,8 +14,9 @@ pub struct CredentialsUi {
 }
 
 impl CredentialsUi {
-    pub fn new() -> Self {
+    pub fn new(redaction: secret::RedactionService) -> Self {
         Self {
+            redaction,
             open: false,
             provider: String::new(),
             label: String::new(),
@@ -129,6 +131,9 @@ impl CredentialsUi {
     fn add(&mut self, db: &Db, store: &dyn SecretStore) -> anyhow::Result<()> {
         // 입력 평문은 SecretString으로 옮기고 입력창은 즉시 비운다
         let secret = SecretString::new(std::mem::take(&mut self.secret_input));
+        // 새 credential은 즉시 로그 redaction 대상 (7장). 입력값을 그대로 등록 —
+        // UI가 get_secret을 부르는 게 아니다 (2.1 준수).
+        self.redaction.register(&secret);
         let id = uuid::Uuid::new_v4().to_string();
         store.set_secret(&id, &secret)?;
         let meta = CredentialMeta {

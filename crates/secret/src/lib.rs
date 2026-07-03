@@ -1,3 +1,7 @@
+mod redaction;
+
+pub use redaction::{RedactionService, StreamRedactor};
+
 use anyhow::Context;
 
 /// keyring 좌표: service는 앱 번들 ID 고정, username은 credential id.

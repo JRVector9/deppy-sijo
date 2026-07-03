@@ -39,6 +39,11 @@ pub enum RuntimeCommand {
     KillSession {
         session: SessionId,
     },
+    /// 저장된 credential들을 로그 redaction 패턴으로 등록한다 (설계문서 7장).
+    /// 값은 worker가 keyring에서 읽는다 — 명령에는 id만 실린다.
+    SeedRedaction {
+        credential_ids: Vec<String>,
+    },
     /// focused pane을 분할하고 새 셸 세션을 attach한다 (PR-10)
     SplitPane {
         pane: MuxPaneId,

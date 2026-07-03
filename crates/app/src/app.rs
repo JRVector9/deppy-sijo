@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use runtime::{InProcessRuntimeClient, RuntimeEventReceiver, RuntimeEventStream};
+use runtime::{
+    InProcessRuntimeClient, RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream,
+};
 
 use crate::config::Config;
 use std::sync::Arc;
@@ -25,13 +27,37 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(config: Config, config_path: PathBuf, db: Db, workspace_id: String) -> Self {
+    pub fn new(
+        config: Config,
+        config_path: PathBuf,
+        db: Db,
+        workspace_id: String,
+        logs_root: PathBuf,
+    ) -> Self {
         // output_batch_ms는 시작 시 고정, scrollback_lines는 세션 spawn 시점에 전달
+        let redaction = secret::RedactionService::new();
         let runtime = InProcessRuntimeClient::new(
             config.performance.output_batch_ms,
             Arc::new(KeyringSecretStore),
+            logs_root,
+            redaction.clone(),
         );
         let runtime_events = runtime.subscribe();
+        // 이전 실행에서 저장한 credential도 로그 redaction 대상으로 시드
+        // (값 resolve는 worker에서 — UI는 metadata의 id만 읽는다)
+        match db.list_credentials() {
+            Ok(credentials) => {
+                let ids: Vec<String> = credentials.into_iter().map(|c| c.id).collect();
+                if !ids.is_empty()
+                    && let Err(e) = runtime.send_command(runtime::RuntimeCommand::SeedRedaction {
+                        credential_ids: ids,
+                    })
+                {
+                    tracing::warn!("redaction 시드 전송 실패: {e:#}");
+                }
+            }
+            Err(e) => tracing::warn!("credential 목록 조회 실패 (redaction 시드 생략): {e:#}"),
+        }
         Self {
             config,
             config_path,
@@ -40,7 +66,7 @@ impl App {
             workspace_id,
             secret_store: KeyringSecretStore,
             agents_ui: ui::agents::AgentsUi::new(),
-            credentials_ui: ui::credentials::CredentialsUi::new(),
+            credentials_ui: ui::credentials::CredentialsUi::new(redaction),
             env_profiles_ui: ui::env_profiles::EnvProfilesUi::new(),
             workspace_ui: ui::workspace::WorkspaceUi::new(),
             runtime,

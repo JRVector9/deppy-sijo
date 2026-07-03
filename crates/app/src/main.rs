@@ -18,6 +18,8 @@ fn main() -> anyhow::Result<()> {
     }
     let db = storage::Db::open(&paths.data_dir.join("metadata.sqlite3"))?;
     let workspace_id = db.ensure_default_workspace()?;
+    // 세션 로그 루트 (설계문서 7장: logs/<workspace_id>/<session_id>/)
+    let logs_root = paths.data_dir.join("logs").join(&workspace_id);
     tracing::info!(
         config_dir = %paths.config_dir.display(),
         data_dir = %paths.data_dir.display(),
@@ -37,6 +39,7 @@ fn main() -> anyhow::Result<()> {
                 config_path,
                 db,
                 workspace_id,
+                logs_root,
             )))
         }),
     )

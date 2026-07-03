@@ -2,7 +2,9 @@
 //! SQLite metadata·rotation·encrypted raw log(기본 비활성 — 7장)는 후속 PR.
 
 mod db;
-pub use db::{AgentConfigRow, CredentialMeta, Db, EnvProfileRow, EnvValue, EnvVarRow};
+pub use db::{
+    AgentConfigRow, CredentialMeta, Db, EnvProfileRow, EnvValue, EnvVarRow, WorkspaceRow,
+};
 
 mod logs;
 

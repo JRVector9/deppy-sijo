@@ -112,6 +112,14 @@ pub struct CredentialMeta {
     pub masked_hint: Option<String>,
 }
 
+/// workspace 한 행 (WorkspaceSidebar 표시용).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceRow {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnvProfileRow {
     pub id: String,
@@ -282,6 +290,33 @@ impl Db {
              VALUES (?1, 'default', '',
                 strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
             [&id],
+        )?;
+        Ok(id)
+    }
+
+    /// 모든 workspace 목록 (WorkspaceSidebar, 생성순).
+    pub fn list_workspaces(&self) -> anyhow::Result<Vec<WorkspaceRow>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, created_at FROM workspaces ORDER BY created_at")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(WorkspaceRow {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// 새 workspace 생성 — 생성된 id 반환.
+    pub fn create_workspace(&self, name: &str) -> anyhow::Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.conn.execute(
+            "INSERT INTO workspaces (id, name, path, created_at, updated_at)
+             VALUES (?1, ?2, '',
+                strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            (&id, name),
         )?;
         Ok(id)
     }
@@ -528,6 +563,20 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_생성_목록_기본포함() {
+        let db = Db::open_in_memory().unwrap();
+        let default_id = db.ensure_default_workspace().unwrap();
+        let a = db.create_workspace("프로젝트 A").unwrap();
+        let list = db.list_workspaces().unwrap();
+        // 기본 + 새 workspace 모두 목록에 (생성순)
+        let ids: Vec<_> = list.iter().map(|w| w.id.as_str()).collect();
+        assert!(ids.contains(&default_id.as_str()));
+        assert!(ids.contains(&a.as_str()));
+        let created = list.iter().find(|w| w.id == a).unwrap();
+        assert_eq!(created.name, "프로젝트 A");
+    }
 
     fn sample(id: &str) -> CredentialMeta {
         CredentialMeta {

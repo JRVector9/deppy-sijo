@@ -1133,6 +1133,41 @@ mod tests {
         assert!(!db.delete_credential_if_unused("cred-1").unwrap());
     }
 
+    fn 모든_버전_prefix에서_최신까지_마이그레이션되고_fk_정합(k: usize) {
+        // v2.8 §11.2 smoke-db-migrations: 임의 구버전(user_version=k) DB가 최신으로
+        // 올라가고 foreign_key_check가 깨끗해야 한다. 마이그레이션 재배열/번호 변경을
+        // 회귀로 잡는 가드 — registry 전환 시 legacy 슬롯 고정의 안전망.
+        let dir = std::env::temp_dir().join(format!("deppy-mig-prefix-{}-{k}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite3");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..k] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", k as i64).unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(Db::read_user_version(&db.conn).unwrap(), MIGRATIONS.len());
+        // FK 정합: 위반 행이 하나도 없어야 한다
+        let violations: i64 = db
+            .conn
+            .prepare("SELECT count(*) FROM pragma_foreign_key_check")
+            .unwrap()
+            .query_row([], |row| row.get(0))
+            .unwrap();
+        assert_eq!(violations, 0, "v{k}→최신 마이그레이션 후 FK 위반");
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn 전_버전_prefix_마이그레이션_스모크() {
+        for k in 0..=MIGRATIONS.len() {
+            모든_버전_prefix에서_최신까지_마이그레이션되고_fk_정합(k);
+        }
+    }
+
     #[test]
     fn 마이그레이션은_멱등() {
         let dir = std::env::temp_dir().join(format!("deppy-sijo-db-test-{}", std::process::id()));

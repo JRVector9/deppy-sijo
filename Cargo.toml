@@ -17,6 +17,7 @@ members = [
     "crates/session",
     "crates/storage",
     "crates/terminal",
+    "xtask",
 ]
 
 [workspace.package]

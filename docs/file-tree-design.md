@@ -64,7 +64,10 @@ struct FileTreeUi { root: PathBuf, tree: TreeNode, flat: Vec<RowRef> /*가시 �
 
 ## 6. UI 배치
 
-- 좌측 사이드바(기본 240px, 접기 버튼, egui `SidePanel::left` resizable). 헤더: workspace 이름 +
+- **환경설정 ON/OFF (확정 요구사항)**: `Config.ui.file_tree_enabled: bool`(serde 기본 `true`) +
+  설정 UI 체크박스("폴더 트리 사이드바"). **OFF면 Panel 자체를 만들지 않아 리소스 0** —
+  캐시도 해제(FileTreeUi 상태 drop). 즉시 적용(hot toggle, 테마와 동일 패턴).
+- 좌측 사이드바(기본 240px, 접기 버튼, egui `Panel::left` resizable — §9-1 API 정정). 헤더: workspace 이름 +
   새로고침/숨김토글. 트리 행: 들여쓰기 + ▸/▾ + 이름(파일은 아이콘 없이 이름만 — 외부 아이콘 의존 금지).
 - 컨텍스트 메뉴(우클릭): 새 폴더 / 이름 변경 / 삭제 / 경로 복사 / 터미널에 경로 붙여넣기(활성 세션에
   `RuntimeCommand::WriteInput`으로 경로 전송 — 유일한 runtime 접점).
@@ -74,7 +77,7 @@ struct FileTreeUi { root: PathBuf, tree: TreeNode, flat: Vec<RowRef> /*가시 �
 | PR | 내용 | 검증 |
 |---|---|---|
 | FT-0 | WorkspaceRow.path 노출 | storage 테스트 |
-| FT-1 | 읽기전용 트리 (lazy+가상화+새로고침+숨김토글+사이드바) | flat 평탄화/정렬 단위 테스트, frame p95 전후 비교(DEPPY_FRAME_STATS) |
+| FT-1 | 읽기전용 트리 (lazy+가상화+새로고침+숨김토글+사이드바+**설정 ON/OFF 토글**) | flat 평탄화/정렬 단위 테스트, frame p95 전후 비교(DEPPY_FRAME_STATS) |
 | FT-2 | DnD 이동 (가드 4종 + EXDEV 폴백 + 충돌 처리) | 이동 가드/폴백 단위 테스트(tempdir), 수동 스모크 |
 | FT-3 | 컨텍스트 메뉴 (새폴더/이름변경/휴지통 삭제/경로) | tempdir 단위 테스트 |
 | FT-4(선택) | notify(FSEvents) 실시간 갱신 | 워처 이벤트→부분 재나열 테스트 |

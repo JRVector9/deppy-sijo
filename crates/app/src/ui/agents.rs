@@ -25,6 +25,8 @@ pub struct AgentsUi {
     mcp_proxy_enabled: bool,
     /// 등록 시 프론트할 backend mcp_server id (체크 시에만 의미)
     mcp_proxy_server_id: Option<String>,
+    /// 등록 시 MCP config 주입 플래그 커스텀 (체크 시에만 의미). 비우면 기본 --mcp-config.
+    mcp_config_flag: String,
     /// 실행 시 적용할 env profile (None = profile 없이)
     run_profile: Option<String>,
     /// 응답(AgentSpawned/SpawnFailed)을 아직 못 받은 실행 수 — 폴링 유지
@@ -46,6 +48,7 @@ impl AgentsUi {
             done_regex: String::new(),
             mcp_proxy_enabled: false,
             mcp_proxy_server_id: None,
+            mcp_config_flag: String::new(),
             run_profile: None,
             pending_launches: 0,
             error: None,
@@ -278,11 +281,21 @@ impl AgentsUi {
                         }
                     });
             });
+            // 주입 플래그 커스텀 (고급): 에이전트마다 규약이 달라(--mcp-config 외) 이름만 바꾼다.
+            // 비우면 기본 --mcp-config. 경로는 항상 다음 arg로 붙는다(=path 규약은 후속 과제).
+            ui.horizontal(|ui| {
+                ui.label("설정 플래그 (고급, 비우면 --mcp-config)");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.mcp_config_flag)
+                        .font(egui::TextStyle::Monospace),
+                );
+            });
         }
         // proxy 미선택 상태 정합성: 체크 해제 시 선택 초기화, 저장된 backend가 목록에서
         // 사라졌으면(삭제) 선택을 비워 stale id 저장을 막는다.
         if !self.mcp_proxy_enabled {
             self.mcp_proxy_server_id = None;
+            self.mcp_config_flag.clear();
         } else if let Some(id) = &self.mcp_proxy_server_id
             && !servers.iter().any(|s| &s.id == id)
         {
@@ -291,10 +304,19 @@ impl AgentsUi {
 
         // 등록 가능 조건: 이름·command 필수. proxy 경유를 켰으면 backend 선택도 필수
         // (backend 없이 저장하면 spawn 시 라우팅할 대상이 없어 권한계층이 조용히 무력화됨).
+        // 설정 플래그도 켰을 때만 검사 — 비었으면 기본, 값이 있으면 '-'로 시작해야 한다.
         let proxy_ok = !self.mcp_proxy_enabled || self.mcp_proxy_server_id.is_some();
-        let filled = !self.name.trim().is_empty() && !self.command.trim().is_empty() && proxy_ok;
+        let flag_ok =
+            !self.mcp_proxy_enabled || validate_mcp_config_flag(&self.mcp_config_flag).is_ok();
+        let filled =
+            !self.name.trim().is_empty() && !self.command.trim().is_empty() && proxy_ok && flag_ok;
         if self.mcp_proxy_enabled && self.mcp_proxy_server_id.is_none() {
             ui.colored_label(ui.visuals().warn_fg_color, "backend를 선택하세요");
+        }
+        if self.mcp_proxy_enabled
+            && let Err(hint) = validate_mcp_config_flag(&self.mcp_config_flag)
+        {
+            ui.colored_label(ui.visuals().warn_fg_color, hint);
         }
         if ui.add_enabled(filled, egui::Button::new("등록")).clicked() {
             let args: Vec<String> = self
@@ -324,6 +346,15 @@ impl AgentsUi {
                     return;
                 }
             }
+            // 플래그는 proxy 경유를 켰을 때만 저장 — trim 후 None/Some (빈값은 DB에서 None 정규화).
+            // filled 조건에서 이미 유효성(-로 시작)을 강제했으므로 여기선 Ok만 취한다.
+            let mcp_config_flag = if self.mcp_proxy_enabled {
+                validate_mcp_config_flag(&self.mcp_config_flag)
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
             match db.insert_agent_config(
                 self.name.trim(),
                 self.command.trim(),
@@ -334,6 +365,7 @@ impl AgentsUi {
                 opt(&self.done_regex).as_deref(),
                 self.mcp_proxy_enabled,
                 self.mcp_proxy_server_id.as_deref(),
+                mcp_config_flag.as_deref(),
             ) {
                 Ok(_) => {
                     self.name.clear();
@@ -345,6 +377,7 @@ impl AgentsUi {
                     self.done_regex.clear();
                     self.mcp_proxy_enabled = false;
                     self.mcp_proxy_server_id = None;
+                    self.mcp_config_flag.clear();
                     self.cached = None;
                     self.error = None;
                 }
@@ -408,7 +441,10 @@ impl AgentsUi {
                 }
                 let proxy_bin = mcp_proxy_bin()?;
                 let path = write_mcp_proxy_config(&proxy_bin, db_path, &agent.id, server_id)?;
-                args.push("--mcp-config".to_owned());
+                // 에이전트별 커스텀 플래그(없으면 기본 --mcp-config). 플래그 이름만 바꾸며,
+                // 경로는 항상 다음 arg로 붙는다 — `--flag=path`처럼 등호로 합치는 규약은 후속 과제.
+                let flag = agent.mcp_config_flag.as_deref().unwrap_or("--mcp-config");
+                args.push(flag.to_owned());
                 args.push(path.to_string_lossy().into_owned());
             } else {
                 anyhow::bail!("권한계층 경유가 켜졌지만 backend가 선택되지 않았습니다");
@@ -431,6 +467,27 @@ impl AgentsUi {
         })?;
         Ok(())
     }
+}
+
+/// MCP config 주입 플래그 유효성 검사 (순수 함수로 분리해 단위 테스트 가능하게).
+/// 비었으면 Ok(None) — 기본 `--mcp-config`를 쓴다. 값이 있으면 앞뒤 공백을 trim한 뒤
+/// 반드시 `-`로 시작해야 Ok(Some(...)); 아니면 힌트 문자열을 담은 Err.
+fn validate_mcp_config_flag(raw: &str) -> Result<Option<String>, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if !trimmed.starts_with('-') {
+        return Err("설정 플래그는 '-'로 시작해야 합니다 (예: --mcp-config)");
+    }
+    // 단일 argv로 push되므로 공백 포함 값("--a --b")은 에이전트가 인식 못 하는 한 덩어리
+    // 플래그가 된다 — 플래그 '이름 하나'만 허용 (codex P2).
+    if trimmed.contains(char::is_whitespace) {
+        return Err(
+            "설정 플래그에 공백을 넣을 수 없습니다 — 플래그 이름 하나만 (예: --mcp-config)",
+        );
+    }
+    Ok(Some(trimmed.to_owned()))
 }
 
 /// deppy-mcp-proxy 바이너리 경로를 해석한다: 현재 실행 파일과 같은 디렉터리에 있으면
@@ -496,6 +553,38 @@ fn write_mcp_proxy_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_mcp_config_flag_규칙() {
+        // 내부 공백("--a --b" 주입류)은 거부 — 단일 argv라 한 덩어리 플래그가 됨 (codex P2)
+        assert!(validate_mcp_config_flag("--a --b").is_err());
+        assert!(validate_mcp_config_flag("--mcp-config /tmp/x").is_err());
+        // 빈값/공백 → None (기본 --mcp-config 사용)
+        assert_eq!(validate_mcp_config_flag(""), Ok(None));
+        assert_eq!(validate_mcp_config_flag("   "), Ok(None));
+        // 앞뒤 공백은 trim되고 '-'로 시작하면 통과
+        assert_eq!(
+            validate_mcp_config_flag("  --mcp-config-file  "),
+            Ok(Some("--mcp-config-file".to_owned()))
+        );
+        assert_eq!(validate_mcp_config_flag("-c"), Ok(Some("-c".to_owned())));
+        // '-'로 시작하지 않으면 거부
+        assert!(validate_mcp_config_flag("mcp-config").is_err());
+        assert!(validate_mcp_config_flag("config=path").is_err());
+    }
+
+    #[test]
+    fn 커스텀_플래그가_args에_반영된다() {
+        // run() 스폰 배선의 핵심: 커스텀 플래그가 있으면 그 이름을, 없으면 기본을 쓰고
+        // 경로는 항상 다음 arg로 붙는다.
+        let with_custom: Option<String> = Some("--mcp-config-file".to_owned());
+        assert_eq!(
+            with_custom.as_deref().unwrap_or("--mcp-config"),
+            "--mcp-config-file"
+        );
+        let default: Option<String> = None;
+        assert_eq!(default.as_deref().unwrap_or("--mcp-config"), "--mcp-config");
+    }
 
     #[test]
     fn mcp_proxy_config_json에_db경로와_server가_담긴다() {

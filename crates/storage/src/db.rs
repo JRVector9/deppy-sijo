@@ -28,6 +28,7 @@ pub struct Db {
 /// 9: pending_approvals (agent-proxy 1.5 — proxy↔GUI 라이브 승인 IPC 채널),
 /// 10: agent_configs.mcp_proxy_* (agent-proxy 배선 — spawn 시 .mcp.json 생성 +
 ///     --mcp-config로 에이전트를 deppy-mcp-proxy 권한계층에 태운다).
+/// 11: agent_configs.mcp_config_flag (에이전트별 주입 플래그 커스텀 — NULL=기본 --mcp-config).
 /// 4~6은 각 crate가 소유한 DDL 상수를 그대로 붙인다 (스키마 정의는 한 곳에서만).
 const MIGRATIONS: &[&str] = &[
     "
@@ -123,6 +124,10 @@ CREATE TABLE agent_configs (
 ALTER TABLE agent_configs ADD COLUMN mcp_proxy_enabled INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE agent_configs ADD COLUMN mcp_proxy_server_id TEXT;
 ",
+    // 11: agent_configs에 MCP config 주입 플래그 커스텀 컬럼 추가. NULL이면 기본 --mcp-config를
+    //     쓰고, 값이 있으면 그 플래그 이름으로 붙인다 (에이전트마다 다른 규약 대응). nullable —
+    //     기존 행/enabled 여부와 무관하게 NULL 허용(빈 문자열은 API 레벨에서 None으로 정규화).
+    "ALTER TABLE agent_configs ADD COLUMN mcp_config_flag TEXT;",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -174,6 +179,9 @@ pub struct AgentConfigRow {
     pub mcp_proxy_enabled: bool,
     /// 프론트할 backend mcp_server id (enabled일 때만 의미). None이면 미선택 — spawn은 미주입.
     pub mcp_proxy_server_id: Option<String>,
+    /// MCP config 주입 플래그 이름 커스텀 (migration 11). None/빈값이면 기본 `--mcp-config`.
+    /// 플래그 이름만 — 경로는 항상 다음 arg로 붙는다 (`--flag=path` 규약은 후속 과제).
+    pub mcp_config_flag: Option<String>,
 }
 
 impl Db {
@@ -577,17 +585,20 @@ impl Db {
         done_regex: Option<&str>,
         mcp_proxy_enabled: bool,
         mcp_proxy_server_id: Option<&str>,
+        mcp_config_flag: Option<&str>,
     ) -> anyhow::Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
         let args_json = serde_json::to_string(args)?;
+        // 빈 문자열은 None으로 정규화 (mcp_proxy_server_id와 동일 관례 — stale/빈값 저장 방지)
+        let mcp_config_flag = mcp_config_flag.filter(|s| !s.is_empty());
         self.conn
             .execute(
                 "INSERT INTO agent_configs
                    (id, name, command, args_json,
                     waiting_regex, approval_regex, error_regex, done_regex,
-                    mcp_proxy_enabled, mcp_proxy_server_id,
+                    mcp_proxy_enabled, mcp_proxy_server_id, mcp_config_flag,
                     created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                     strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
                 (
                     &id,
@@ -600,6 +611,7 @@ impl Db {
                     done_regex,
                     mcp_proxy_enabled as i64,
                     mcp_proxy_server_id,
+                    mcp_config_flag,
                 ),
             )
             .with_context(|| format!("agent config 저장 실패: {name}"))?;
@@ -610,7 +622,7 @@ impl Db {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, name, command, args_json,
                     waiting_regex, approval_regex, error_regex, done_regex,
-                    mcp_proxy_enabled, mcp_proxy_server_id
+                    mcp_proxy_enabled, mcp_proxy_server_id, mcp_config_flag
              FROM agent_configs WHERE deleted_at IS NULL ORDER BY created_at, id",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -625,13 +637,25 @@ impl Db {
                 row.get::<_, Option<String>>(7)?,
                 row.get::<_, i64>(8)?,
                 row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
             ))
         })?;
         // 손상 행 하나가 전체 목록을 죽이지 않게 skip + 경고 (원문은 로그에 남기지 않음)
         let mut out = Vec::new();
         for row in rows {
-            let (id, name, command, args_json, waiting, approval, error, done, proxy_on, proxy_srv) =
-                row?;
+            let (
+                id,
+                name,
+                command,
+                args_json,
+                waiting,
+                approval,
+                error,
+                done,
+                proxy_on,
+                proxy_srv,
+                config_flag,
+            ) = row?;
             match serde_json::from_str(&args_json) {
                 Ok(args) => out.push(AgentConfigRow {
                     id,
@@ -644,6 +668,7 @@ impl Db {
                     done_regex: done.filter(|s| !s.is_empty()),
                     mcp_proxy_enabled: proxy_on != 0,
                     mcp_proxy_server_id: proxy_srv.filter(|s| !s.is_empty()),
+                    mcp_config_flag: config_flag.filter(|s| !s.is_empty()),
                 }),
                 Err(e) => tracing::warn!(agent_id = %id, "args_json 파싱 실패 — 행 무시: {e}"),
             }
@@ -1140,6 +1165,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let listed = db.list_agent_configs().unwrap();
@@ -1153,6 +1179,8 @@ mod tests {
         // 기본(구식) insert는 proxy 미사용 (0/NULL)으로 복원된다
         assert!(!listed[0].mcp_proxy_enabled);
         assert_eq!(listed[0].mcp_proxy_server_id, None);
+        // 플래그 미지정은 None (기본 --mcp-config 사용을 의미)
+        assert_eq!(listed[0].mcp_config_flag, None);
         db.delete_agent_config(&id).unwrap();
         assert!(db.list_agent_configs().unwrap().is_empty());
     }
@@ -1170,6 +1198,7 @@ mod tests {
             None,
             true,
             Some("srv-backend"),
+            None,
         )
         .unwrap();
         let listed = db.list_agent_configs().unwrap();
@@ -1179,6 +1208,45 @@ mod tests {
             listed[0].mcp_proxy_server_id.as_deref(),
             Some("srv-backend")
         );
+    }
+
+    #[test]
+    fn agent_config_mcp_config_flag_roundtrip() {
+        let db = Db::open_in_memory().unwrap();
+        // Some(플래그): 저장·복원된다
+        db.insert_agent_config(
+            "커스텀 플래그",
+            "gemini",
+            &[],
+            None,
+            None,
+            None,
+            None,
+            true,
+            Some("srv-backend"),
+            Some("--mcp-config-file"),
+        )
+        .unwrap();
+        // 빈 문자열은 None으로 정규화된다 (mcp_proxy_server_id와 동일 관례)
+        db.insert_agent_config(
+            "빈 플래그",
+            "claude",
+            &[],
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            Some(""),
+        )
+        .unwrap();
+        let listed = db.list_agent_configs().unwrap();
+        assert_eq!(listed.len(), 2);
+        let custom = listed.iter().find(|r| r.name == "커스텀 플래그").unwrap();
+        assert_eq!(custom.mcp_config_flag.as_deref(), Some("--mcp-config-file"));
+        let empty = listed.iter().find(|r| r.name == "빈 플래그").unwrap();
+        assert_eq!(empty.mcp_config_flag, None);
     }
 
     #[test]
@@ -1198,11 +1266,47 @@ mod tests {
         let db = Db::open(&path).unwrap();
         assert_eq!(Db::read_user_version(&db.conn).unwrap(), MIGRATIONS.len());
         // 새 컬럼이 실제로 사용 가능 (insert/list round-trip)
-        db.insert_agent_config("a", "c", &[], None, None, None, None, true, Some("s"))
+        db.insert_agent_config("a", "c", &[], None, None, None, None, true, Some("s"), None)
             .unwrap();
         let listed = db.list_agent_configs().unwrap();
         assert!(listed[0].mcp_proxy_enabled);
         assert_eq!(listed[0].mcp_proxy_server_id.as_deref(), Some("s"));
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn v10에서_v11로_업그레이드된다() {
+        let dir = std::env::temp_dir().join(format!("deppy-mig-10to11-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite3");
+        // user_version=10 (mcp_config_flag 이전) 구버전 DB 구성
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..10] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 10).unwrap();
+        }
+        // 오픈 → IMMEDIATE 트랜잭션으로 migration 11 적용
+        let db = Db::open(&path).unwrap();
+        assert_eq!(Db::read_user_version(&db.conn).unwrap(), MIGRATIONS.len());
+        // 새 컬럼이 실제로 사용 가능 (insert/list round-trip)
+        db.insert_agent_config(
+            "a",
+            "c",
+            &[],
+            None,
+            None,
+            None,
+            None,
+            true,
+            Some("s"),
+            Some("--cfg"),
+        )
+        .unwrap();
+        let listed = db.list_agent_configs().unwrap();
+        assert_eq!(listed[0].mcp_config_flag.as_deref(), Some("--cfg"));
         drop(db);
         std::fs::remove_dir_all(&dir).unwrap();
     }

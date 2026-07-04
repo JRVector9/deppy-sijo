@@ -524,6 +524,11 @@ impl eframe::App for App {
                     &mut rt.session_titles,
                 );
                 rt.pending_events.extend(events);
+                // MuxUpdated는 매번 전체 스냅샷이라 오래된 건 최신에 완전히 대체된다.
+                // chatty한 warm 워커가 pending_events를 무한 누적하지 않도록 최신 하나만
+                // 남기고 합친다 (lifecycle/Viewport는 순서대로 보존 — replay 정확성).
+                // 새 이벤트가 들어온 이 분기에서만 호출돼 프레임마다 도는 걸 피한다.
+                coalesce_mux_updated(&mut rt.pending_events);
             }
         }
 
@@ -689,4 +694,201 @@ fn pane_of_session(
         .flat_map(|tab| &tab.panes)
         .find(|pane| pane.session_id == Some(session))
         .map(|pane| pane.id.clone())
+}
+
+/// warm workspace의 pending_events를 합쳐(coalesce) 재활성 replay를 정확+유계로 만든다.
+///
+/// replay 규칙(중요): pending_events는 재활성 시 workspace_ui.show()로 렌더 상태를
+/// 재구성한다. workspace_ui는 SessionExited/SessionStatusChanged를 "현재 mux에 그 세션이
+/// 있을 때만" 적용하고(session_alive 체크), MuxUpdated는 pane 구조(session_id/title)만
+/// 담아 status/exit은 lifecycle 이벤트로만 반영된다.
+///
+/// 그래서:
+/// 1) 최신 MuxUpdated 하나만 남기고 **맨 앞으로 옮긴다**(나머지 MuxUpdated 제거). replay가
+///    최신 mux로 현재 세션/pane을 먼저 확립한 뒤 lifecycle 이벤트가 자기 세션을 찾아
+///    적용된다 — 최신 mux 뒤에 남은 SessionExited가 session_alive를 통과해 종료 pane이
+///    running으로 남는 버그를 막는다. (mux에 없는 detach된 세션의 잔여 이벤트는 무시돼도
+///    화면에 안 나오니 무해.)
+/// 2) SessionStatusChanged는 세션별 최신 1개만 유지한다(status는 last-wins). detector의
+///    Running↔Waiting churn으로 무계 누적되던 것을 O(세션수)로 유계화. 유지분 상대 순서는
+///    보존.
+/// 3) SessionExited/ShellSpawned/AgentSpawned/SpawnFailed/Viewport는 전량 순서 보존.
+///
+/// 알림은 coalesce 전에 process_ws_notifications가 전량 소비하므로(렌더 replay 전용)
+/// 공격적으로 줄여도 알림엔 영향이 없다.
+fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) {
+    // 남길 최신 MuxUpdated(있으면) — 뽑아서 나중에 맨 앞에 재삽입.
+    let latest_mux = events
+        .iter()
+        .rposition(|e| matches!(e, runtime::RuntimeEvent::MuxUpdated { .. }))
+        .map(|i| events[i].clone());
+
+    // 세션별 마지막 StatusChanged의 원 인덱스 (나중 것이 이김 → 그 인덱스만 유지).
+    let mut latest_status_idx: std::collections::HashMap<runtime::SessionId, usize> =
+        std::collections::HashMap::new();
+    for (i, e) in events.iter().enumerate() {
+        if let runtime::RuntimeEvent::SessionStatusChanged { session, .. } = e {
+            latest_status_idx.insert(*session, i);
+        }
+    }
+
+    let mut idx = 0;
+    events.retain(|e| {
+        // retain은 원소를 원래 순서대로 한 번씩 방문 → idx로 원 위치를 추적한다.
+        let keep = match e {
+            // 모든 MuxUpdated 제거 (최신 하나는 아래서 맨 앞에 재삽입).
+            runtime::RuntimeEvent::MuxUpdated { .. } => false,
+            // 세션별 마지막 StatusChanged만 유지.
+            runtime::RuntimeEvent::SessionStatusChanged { session, .. } => {
+                latest_status_idx.get(session) == Some(&idx)
+            }
+            _ => true,
+        };
+        idx += 1;
+        keep
+    });
+
+    if let Some(mux) = latest_mux {
+        events.insert(0, mux);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 구분 가능한 최소 MuxUpdated 이벤트 (active_tab 태그로 스냅샷을 식별).
+    fn mux_event(tag: &str) -> runtime::RuntimeEvent {
+        runtime::RuntimeEvent::MuxUpdated {
+            snapshot: std::sync::Arc::new(runtime::MuxSnapshot {
+                tabs: Vec::new(),
+                active_tab: Some(runtime::MuxTabId(tag.to_owned())),
+                focused_pane: None,
+            }),
+        }
+    }
+
+    fn mux_tag(e: &runtime::RuntimeEvent) -> Option<&str> {
+        match e {
+            runtime::RuntimeEvent::MuxUpdated { snapshot } => {
+                snapshot.active_tab.as_ref().map(|t| t.0.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn coalesce_moves_latest_mux_to_front() {
+        let mut events = vec![
+            mux_event("a"),
+            runtime::RuntimeEvent::SessionStatusChanged {
+                session: runtime::SessionId(1),
+                status: runtime::SessionStatus::Running,
+            },
+            mux_event("b"),
+            runtime::RuntimeEvent::SessionExited {
+                session: runtime::SessionId(1),
+                exit_code: None,
+            },
+            mux_event("c"),
+        ];
+
+        coalesce_mux_updated(&mut events);
+
+        // 최신 mux(c)만 남아 맨 앞으로. 이전 mux(a, b) 제거. lifecycle는 순서 보존.
+        assert_eq!(events.len(), 3);
+        assert_eq!(mux_tag(&events[0]), Some("c"));
+        assert!(matches!(
+            events[1],
+            runtime::RuntimeEvent::SessionStatusChanged {
+                session: runtime::SessionId(1),
+                status: runtime::SessionStatus::Running,
+            }
+        ));
+        assert!(matches!(
+            events[2],
+            runtime::RuntimeEvent::SessionExited {
+                session: runtime::SessionId(1),
+                exit_code: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn coalesce_dedups_status_per_session() {
+        // 같은 세션의 status churn → 세션별 최신 1개만. 유지분 상대 순서 보존.
+        let mut events = vec![
+            runtime::RuntimeEvent::SessionStatusChanged {
+                session: runtime::SessionId(1),
+                status: runtime::SessionStatus::Running,
+            },
+            runtime::RuntimeEvent::SessionStatusChanged {
+                session: runtime::SessionId(1),
+                status: runtime::SessionStatus::Waiting,
+            },
+            runtime::RuntimeEvent::SessionStatusChanged {
+                session: runtime::SessionId(2),
+                status: runtime::SessionStatus::Running,
+            },
+        ];
+
+        coalesce_mux_updated(&mut events);
+
+        assert_eq!(events.len(), 2);
+        // 세션1은 최신(Waiting)만, 세션2는 그대로. 순서: 세션1 → 세션2.
+        assert!(matches!(
+            events[0],
+            runtime::RuntimeEvent::SessionStatusChanged {
+                session: runtime::SessionId(1),
+                status: runtime::SessionStatus::Waiting,
+            }
+        ));
+        assert!(matches!(
+            events[1],
+            runtime::RuntimeEvent::SessionStatusChanged {
+                session: runtime::SessionId(2),
+                status: runtime::SessionStatus::Running,
+            }
+        ));
+    }
+
+    #[test]
+    fn coalesce_exit_stays_after_mux_for_replay() {
+        // [MuxUpdated(세션X 도입), SessionExited(X)] → coalesce 후에도 exit이 mux 뒤에.
+        // (mux가 맨 앞으로 가므로 replay 시 X를 먼저 확립하고 exit이 적용됨.)
+        let mut events = vec![
+            mux_event("x"),
+            runtime::RuntimeEvent::SessionExited {
+                session: runtime::SessionId(9),
+                exit_code: Some(0),
+            },
+        ];
+
+        coalesce_mux_updated(&mut events);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(mux_tag(&events[0]), Some("x"));
+        assert!(matches!(
+            events[1],
+            runtime::RuntimeEvent::SessionExited {
+                session: runtime::SessionId(9),
+                exit_code: Some(0),
+            }
+        ));
+    }
+
+    #[test]
+    fn coalesce_noop_without_mux() {
+        let mut events = vec![
+            runtime::RuntimeEvent::ShellSpawned {
+                session: runtime::SessionId(7),
+            },
+            runtime::RuntimeEvent::SessionExited {
+                session: runtime::SessionId(7),
+                exit_code: Some(0),
+            },
+        ];
+        coalesce_mux_updated(&mut events);
+        assert_eq!(events.len(), 2);
+    }
 }

@@ -65,7 +65,11 @@ impl NotificationsUi {
             session,
             status,
             title: title.to_owned(),
-            read: self.open, // 센터가 열려 있으면 바로 읽음
+            // 생성 시엔 항상 안 읽음. on_status는 창이 숨겨져(minimized/occluded) ui()가
+            // 스킵돼도 logic()에서 호출되므로, 여기서 self.open으로 읽음 처리하면 사용자가
+            // 보지 못한 background 알림이 읽음이 돼 unread 신호를 잃는다. 실제 읽음은
+            // show()(=가시일 때만 호출)가 처리한다.
+            read: false,
         });
         // 최근 100개만 유지
         if self.items.len() > 100 {
@@ -134,6 +138,19 @@ impl NotificationsUi {
     pub fn show(&mut self, ctx: &egui::Context) -> Option<(String, SessionId)> {
         if !self.open {
             return None;
+        }
+        // show()는 ui()에서만 호출되고 ui()는 창이 가시일 때만 실행된다 — 즉 여기 도달했다는
+        // 건 센터가 열려 있고 화면에 보인다는 뜻이므로 표시된 항목을 읽음 처리한다. (센터가
+        // 열린 채 새 알림이 도착한 경우에도 다음 렌더에서 읽음 처리됨.)
+        let had_unread = self.items.iter().any(|item| !item.read);
+        for item in &mut self.items {
+            item.read = true;
+        }
+        // unread 뱃지는 이 프레임 앞서(상단바) 이미 그려졌다 — 방금 읽음으로 바꿨으면
+        // 다음 프레임에 뱃지가 갱신되도록 repaint를 요청한다(안 그러면 무관한 UI 활동
+        // 전까지 "알림 (1)"이 남는다).
+        if had_unread {
+            ctx.request_repaint();
         }
         let mut open = true;
         let mut clicked = None;
@@ -210,6 +227,16 @@ mod tests {
         assert!(!has("ws-a", 2, SessionStatus::Waiting));
         assert!(has("ws-b", 1, SessionStatus::Done));
         assert!(has("ws-b", 2, SessionStatus::Waiting));
+    }
+
+    #[test]
+    fn 센터가_열려있어도_생성시엔_안읽음() {
+        // 숨김 중 logic()에서 on_status가 호출될 수 있으므로 self.open으로 읽음 처리하면
+        // 안 된다 — 사용자가 본 시점(show=가시)에만 읽음. 생성 시엔 항상 unread.
+        let mut n = NotificationsUi::new();
+        n.toggle(); // open = true
+        n.on_status(WS, SessionId(1), SessionStatus::Done, "완료");
+        assert_eq!(n.unread(), 1);
     }
 
     #[test]

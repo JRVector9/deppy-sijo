@@ -17,6 +17,8 @@ deppy-core = { path = "../core" }
 mux = { path = "../mux" }
 pty = { path = "../pty" }
 secret = { path = "../secret" }
+rcgen = { workspace = true }
+sha2 = { workspace = true }
 session = { path = "../session" }
 storage = { path = "../storage" }
 terminal = { path = "../terminal" }

@@ -9,6 +9,7 @@ mod in_process;
 mod persistence;
 mod protocol;
 mod remote;
+pub mod tls_identity;
 
 pub use client::{RuntimeClient, RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream};
 pub use command::{

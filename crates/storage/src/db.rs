@@ -258,85 +258,24 @@ pub struct AgentConfigRow {
 }
 
 impl Db {
+    /// DB 열기 + 마이그레이션. infra(PRAGMA/백업/IMMEDIATE 러너)는 storage-core가 담당하고
+    /// (v2.8 §6.1), 이 crate는 **마이그레이션 원장(MIGRATIONS, v1..vN 순서 불변)** 조립과
+    /// 앱 수준 store/facade만 소유한다.
     pub fn open(path: &Path) -> anyhow::Result<Self> {
-        let conn = Connection::open(path)
-            .with_context(|| format!("SQLite 열기 실패: {}", path.display()))?;
-        // 설계문서 11.9: 모든 연결에 WAL + foreign_keys 강제
-        conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
-        conn.pragma_update(None, "foreign_keys", true)?;
-        // 워커 persist 연결과 동시 쓰기가 겹칠 때 SQLITE_BUSY로 실패하지 않게 대기 (codex 리뷰)
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-
-        // 설계문서 11.9: pending migration이 있으면 적용 전 파일 백업 (직전 1개 유지)
-        let version: usize =
-            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? as usize;
-        if version > 0 && version < MIGRATIONS.len() {
-            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
-            let backup = path.with_extension("sqlite3.bak");
-            std::fs::copy(path, &backup)
-                .with_context(|| format!("마이그레이션 전 백업 실패: {}", backup.display()))?;
-        }
-        Self::migrate(conn).with_context(|| {
-            format!(
-                "DB 마이그레이션 실패 — 백업: {}",
-                path.with_extension("sqlite3.bak").display()
-            )
-        })
+        let conn = storage_core::open_with_migrations(path, MIGRATIONS)?;
+        Ok(Self { conn })
     }
 
     #[cfg(test)]
     fn open_in_memory() -> anyhow::Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        conn.pragma_update(None, "foreign_keys", true)?;
-        Self::migrate(conn)
-    }
-
-    fn migrate(mut conn: Connection) -> anyhow::Result<Self> {
-        // 락 경합 최소화용 fast-path: 락 밖에서 한 번 읽어 이미 최신이면 트랜잭션 없이 리턴.
-        // (여기 값은 참고용 — 실제 결정은 아래 IMMEDIATE 락 안에서 다시 읽어 확정한다.)
-        let version = Self::read_user_version(&conn)?;
-        Self::ensure_not_ahead(version)?;
-        if version == MIGRATIONS.len() {
-            return Ok(Self { conn });
-        }
-
-        // 이제 DB를 두 프로세스(GUI + deppy-mcp-proxy)가 동시에 연다. 마이그레이션 결정과
-        // 실행을 하나의 write 트랜잭션으로 묶는다: BEGIN IMMEDIATE로 write 락을 먼저 잡고
-        // → 락 안에서 user_version을 다시 읽어 → 필요한 마이그레이션만 순서대로 실행 →
-        // user_version을 최종값으로 한 번 갱신 → 한 번에 COMMIT. 두 번째 프로세스는
-        // busy_timeout만큼 대기해 락을 얻은 뒤 최신 user_version을 보고 아무 것도 하지 않는다
-        // (stale 계획으로 DDL을 재실행하는 레이스 해소).
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        // 락 안에서 재확인 — 대기 중 다른 프로세스가 이미 올렸을 수 있다
-        let version = Self::read_user_version(&tx)?;
-        Self::ensure_not_ahead(version)?;
-        for (i, sql) in MIGRATIONS.iter().enumerate().skip(version) {
-            tx.execute_batch(sql)
-                .with_context(|| format!("마이그레이션 {} 실패", i + 1))?;
-        }
-        if version < MIGRATIONS.len() {
-            // 스키마 변경 전부와 user_version 갱신이 같은 트랜잭션이라, 중간에 실패하면
-            // user_version 포함 전부 롤백된다 (절반만 적용된 상태 방지)
-            tx.pragma_update(None, "user_version", MIGRATIONS.len() as i64)?;
-        }
-        tx.commit().context("마이그레이션 커밋 실패")?;
+        let conn = storage_core::open_in_memory_with_migrations(MIGRATIONS)?;
         Ok(Self { conn })
     }
 
+    /// 현재 user_version (테스트에서 마이그레이션 가드로 사용).
+    #[cfg(test)]
     fn read_user_version(conn: &Connection) -> anyhow::Result<usize> {
-        Ok(conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? as usize)
-    }
-
-    /// forward-only (11.9): 이 바이너리보다 앞선 DB는 downgrade가 불가능하므로
-    /// 조용히 실행하지 않고 기동을 중단한다 (codex 리뷰 반영).
-    fn ensure_not_ahead(version: usize) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            version <= MIGRATIONS.len(),
-            "DB user_version({version})이 이 버전이 아는 마이그레이션({})보다 앞서 있습니다 — \
-             더 새 버전의 앱이 만든 DB입니다",
-            MIGRATIONS.len()
-        );
-        Ok(())
+        storage_core::read_user_version(conn)
     }
 
     /// credential metadata 추가. created_at/updated_at은 SQLite가 UTC로 기록한다.

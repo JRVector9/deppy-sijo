@@ -3915,8 +3915,17 @@ dependencies = [
  "rusqlite",
  "secret",
  "serde_json",
+ "storage-core",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "storage-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rusqlite",
 ]
 
 [[package]]

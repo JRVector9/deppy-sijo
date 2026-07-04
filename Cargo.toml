@@ -16,6 +16,7 @@ members = [
     "crates/secret",
     "crates/session",
     "crates/storage",
+    "crates/storage-core",
     "crates/terminal",
     "xtask",
 ]

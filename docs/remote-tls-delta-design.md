@@ -106,8 +106,10 @@ loop {
 - `read_frame`을 `Frame|Timeout|Eof` 3-값으로 정제해야 한다(현재는 성공/None 2-값 — TLS의 WouldBlock 중간-record와 EOF를 구분).
 - **shutdown**: 다른 스레드는 TLS 상태를 만지지 않고, 접속 시작 시 떠둔 **raw `TcpStream` clone**에 `shutdown(Both)`만 호출(fd 레벨 — TLS 무관)해 poll 루프를 깨운다. `stop`/`conn_done` `AtomicBool`도 그대로.
 - **평문 loopback 경로**도 이 단일 I/O 스레드 모델로 **통일** 권장(코드 경로 이원화 제거). 현재의 2-스레드(reader+pump) 모델은 제거 가능하며, 단일 스레드가 오히려 단순하다. `connections` 추적/Drop 계약은 그대로 재사용.
+- **클라이언트도 동일하다(codex 지적).** `RemoteRuntimeClient`도 writer `TcpStream`과 reader clone으로 분할돼 있어(`remote.rs`의 writer/reader/heartbeat 경로), `StreamOwned` 단일 접속을 쓰면 **클라이언트도 “IO 스레드가 TLS 스트림 단독 소유, 명령·`RequestKeyframe`는 채널로 보냄”** 구조가 필요하다. 서버만 바꾸면 안 된다.
+- **단일 IO의 새 기아(starvation) 리스크(codex 지적).** 현재 reader 스레드는 pump write가 막혀도 명령을 계속 읽는다. 단일 IO가 `receiver.drain()`을 **전량 write한 뒤** read하면, 느린 클라이언트/큰 viewport에서 write 구간이 길어져 **수신 명령 처리가 굶는다**. 완화: 한 tick의 write를 **N프레임/바이트로 상한**하고 그 사이 짧은 read를 끼우거나, write 전 non-blocking read로 대기 명령을 먼저 흡수한다. `read_frame`의 3-값 정제(§위)와 함께 “timeout/EOF/protocol error를 모두 `None`으로 접지 않기”가 전제.
 
-이는 이 설계에서 가장 위험한 리팩터이므로 §5 구현 단계에서 별도 취급한다.
+이는 이 설계에서 가장 위험한 리팩터이므로 §5 구현 단계에서 별도 취급한다. 대안(제어/이벤트 2개 TLS 접속, `Connection` mutex+nonblocking, native-tls split)은 인증·상관·정리 복잡도나 사실상 이벤트 루프 재구현 때문에 **단일 IO owner가 최선**이다.
 
 ### 2.5 바인드 정책 · DNS rebinding / origin (§1.5)
 
@@ -360,8 +362,9 @@ fn diff(prev: &TerminalViewportSnapshot, cur: &TerminalViewportSnapshot) -> Opti
 각 단계는 “verify” 기준으로 독립 검증 가능하게 쪼갠다.
 
 ### 단계 A — 핸드셰이크 v2 + 코덱 버전닝 (TLS·delta 없음)
-- `ClientHello`/`ServerHello`, feature 협상, `WireMsg`/`WireCmd` 봉투 도입. 기능 비트 **모두 off면 오늘과 동일 동작**(전체 스냅샷).
-- **verify**: loopback attach/명령/이벤트 왕복(기존 테스트) 그대로 통과. 잘못된 magic/version/토큰 거부.
+- `ClientHello`/`ServerHello`, feature 협상, `WireMsg`/`WireCmd` 봉투 **정의**. 봉투는 협상 성공 시에만 프레이밍에 쓰인다.
+- **중요(codex 지적): 기능 off 경로는 봉투로 감싸지 않는다.** `FEAT_DELTA_VIEWPORT` 미협상이면 프레임은 **기존 `postcard(RuntimeCommand)`/`postcard(RuntimeEvent)` 그대로**(§3.2) — 오늘과 동일 바이트. 즉 단계 A가 “봉투 도입”이라 해서 off-path 프레임을 바꾸면 안 된다. 그래야 A를 delta/TLS 없이도 **독립 배포**할 수 있다.
+- **verify**: loopback attach/명령/이벤트 왕복(기존 테스트) 그대로 통과(off-path 바이트 불변). 잘못된 magic/version/토큰 거부.
 - **리스크: 낮음.** 두 기능의 공통 토대.
 
 ### 단계 B — Delta viewport (평문 loopback + 단계 A 위)
@@ -378,7 +381,12 @@ fn diff(prev: &TerminalViewportSnapshot, cur: &TerminalViewportSnapshot) -> Opti
 - **verify**: 비-loopback TLS attach 성공, 핀닝 불일치 거부, 잘못된 토큰 거부, shutdown이 유휴 TLS 접속에 블록 안 됨(기존 회귀 테스트의 TLS판).
 
 ### 순서 권장
-`A → (B ∥ C)`. B가 사용자 체감(대역폭) 이득이 크고 리스크가 낮으니 먼저, C는 C-1(독립) 선행 후 C-2(고위험)를 신중히.
+권장: **`A → 평문 단일 I/O 통일 → (B ∥ C)`** (codex 지적 반영).
+
+- 원안 `A → (B ∥ C)`는 **B와 C-2가 같은 `serve_connection`/클라이언트 IO 구조를 동시에 바꿔 충돌** 위험이 크다(B는 pump `drain` 송신 + 클라이언트 dispatch를, C-2는 같은 IO를 단일 스레드로).
+- 그래서 A 직후 **평문 loopback을 §2.4의 단일 I/O 스레드 모델로 먼저 통일**(서버+클라이언트)해 IO 경계를 한 번만 재편한다. 이 위에서 B(코덱/재구성)와 C(TLS 스트림 교체)는 서로 겹치지 않게 얹힌다.
+- C 내부: **C-1(인증서, 독립) 먼저**, 그다음 C-2(고위험). **C-2만으로 비-loopback을 열지 말 것** — 서버 인증(TOFU) 없는 노출은 위험하므로 **C-3 이후에만** C-4(비-loopback opt-in)를 활성화한다.
+- B는 사용자 체감(대역폭) 이득이 크고 평문 위에서 검증 가능하니 C와 병행/선행 무방.
 
 ---
 
@@ -408,4 +416,15 @@ fn diff(prev: &TerminalViewportSnapshot, cur: &TerminalViewportSnapshot) -> Opti
 7. **dirty_ranges 활용**: `feed()`의 per-row damage를 worker→snapshot으로 배관해 서버 memcmp를 생략하는 최적화(과보고 주의).
 8. **crypto provider**: `ring` 확정 권장(Windows 빌드). aws-lc-rs 성능이 필요해질 근거가 생기면 재검토.
 9. **mTLS 승격 경로**: 다중 신뢰 클라이언트 도입 시 토큰→클라이언트 인증서 전환의 마이그레이션.
-```
+
+---
+
+## 8. codex xhigh 검토 반영 (2026-07-04)
+
+이 문서는 codex-exec(gpt-5.5, xhigh)로 실제 코드(`remote.rs`/`in_process.rs`/`terminal`)에 비춰 검토했다. 결론: **방향은 타당, 구현 전 5개 보완 반영 완료**.
+
+1. **단계 A 봉투 범위 명확화** — delta 미협상 시 `WireMsg` 봉투를 쓰지 않고 기존 `RuntimeCommand`/`RuntimeEvent` 프레임을 그대로 유지(§3.2, §5 단계 A). A의 독립 배포 조건.
+2. **구현 순서 조정** — `A → 평문 단일 I/O 통일 → (B ∥ C)`. B와 C-2가 같은 `serve_connection`/클라이언트 IO를 건드려 충돌하므로 IO 경계를 먼저 한 번 재편(§5 순서 권장). C-2만으로 비-loopback 개방 금지(C-3 이후).
+3. **클라이언트도 단일 I/O 스레드 필요** — 서버뿐 아니라 `RemoteRuntimeClient`도 writer/reader 분할이라 TLS `StreamOwned`엔 동일 리팩터 필요(§2.4).
+4. **단일 I/O owner가 최선** — 2접속/mutex/native-tls 대안은 복잡도·이벤트루프 재구현 문제. shutdown용 raw `TcpStream` clone은 TLS에서도 유지 가능(§2.4).
+5. **단일 I/O 기아 리스크 문서화** — drain 전량 write 후 read 시 느린 클라이언트가 명령 처리를 굶길 수 있음 → write 상한/중간 read로 완화. `read_frame`은 timeout/EOF/protocol error를 구분(모두 `None`으로 접지 않기)(§2.4).

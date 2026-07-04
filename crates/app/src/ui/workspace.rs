@@ -403,16 +403,10 @@ impl WorkspaceUi {
         let preedit = (focused && !self.preedit.is_empty()).then_some(self.preedit.as_str());
         let output = renderer_egui::draw(ui, &snapshot, config.font_size, preedit);
 
-        // 포커스 표시. egui 포커스는 클릭 시에만 요청한다 —
-        // 매 프레임 request_focus는 다른 창(자격증명 등)의 입력 포커스를 뺏는다.
-        if focused {
-            ui.painter().rect_stroke(
-                output.response.rect,
-                0.0,
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(0x69, 0x9d, 0xe6)),
-                egui::StrokeKind::Outside,
-            );
-        }
+        // 포커스 pane 파란 테두리는 사용자 요청으로 제거(2026-07-04) — 단일 pane 사용 시
+        // 항상 보여 거슬림. 다중 pane에서 포커스 식별이 다시 필요해지면 "pane 2개 이상일
+        // 때만 표시" 조건으로 복원할 것.
+        // (egui 포커스는 클릭 시에만 요청한다 — 매 프레임 request_focus는 다른 창의 입력 포커스를 뺏는다.)
         // pending 포커스는 pane이 실제로 그려진 이 시점에 1회 소비한다 —
         // 매 프레임 요청은 다른 창 입력을 뺏고, "연결 중" 단계에서 소비하면
         // 요청이 유실된다 (리뷰 반영).

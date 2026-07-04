@@ -64,6 +64,7 @@ fn main() -> anyhow::Result<()> {
             // 저장된 테마를 시작 시점에 적용
             cc.egui_ctx.set_theme(config.ui.theme.to_egui());
             fonts::install_cjk_fallback(&cc.egui_ctx);
+            install_macos_menu();
             Ok(Box::new(app::App::new(
                 config,
                 config_path,
@@ -77,6 +78,52 @@ fn main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("eframe 실행 실패: {e}"))
 }
+
+/// macOS 네이티브 메뉴바 (2026-07-05 사용자 요청) — About/설정(⌘,)/종료(⌘Q).
+/// 이벤트는 app.rs가 MenuEvent::receiver로 폴링한다 ("settings" id).
+#[cfg(target_os = "macos")]
+fn install_macos_menu() {
+    use muda::accelerator::{Accelerator, Code, Modifiers};
+    let menu = muda::Menu::new();
+    let app_menu = muda::Submenu::new("Deppy Sijo", true);
+    let about = muda::PredefinedMenuItem::about(
+        Some("Deppy Sijo에 관하여"),
+        Some(muda::AboutMetadata {
+            name: Some("Deppy Sijo".into()),
+            version: Some(env!("CARGO_PKG_VERSION").into()),
+            ..Default::default()
+        }),
+    );
+    let settings = muda::MenuItem::with_id(
+        "settings",
+        "설정…",
+        true,
+        Some(Accelerator::new(Some(Modifiers::META), Code::Comma)),
+    );
+    let quit = muda::PredefinedMenuItem::quit(Some("Deppy Sijo 종료"));
+    let items: [&dyn muda::IsMenuItem; 5] = [
+        &about,
+        &muda::PredefinedMenuItem::separator(),
+        &settings,
+        &muda::PredefinedMenuItem::separator(),
+        &quit,
+    ];
+    if let Err(e) = app_menu.append_items(&items) {
+        tracing::warn!("메뉴 구성 실패: {e}");
+        return;
+    }
+    if let Err(e) = menu.append(&app_menu) {
+        tracing::warn!("메뉴 구성 실패: {e}");
+        return;
+    }
+    menu.init_for_nsapp();
+    // 메뉴는 앱 수명 내내 유지 — drop되면 NSMenu 항목이 사라진다
+    std::mem::forget(menu);
+    std::mem::forget(app_menu);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_macos_menu() {}
 
 fn init_logging(paths: &paths::AppPaths) -> tracing_appender::non_blocking::WorkerGuard {
     let file_appender = tracing_appender::rolling::daily(&paths.log_dir, "app.log");

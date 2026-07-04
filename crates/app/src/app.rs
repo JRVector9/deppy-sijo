@@ -757,6 +757,14 @@ impl eframe::App for App {
     // 스킵 판단에 쓰는 바로 그 신호(minimized OR occluded — macOS는 occluded로 갱신되어
     // minimized 미갱신 문제를 피한다). None(미보고)이면 안전하게 Active 유지.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // macOS 네이티브 메뉴 이벤트 (main.rs install_macos_menu)
+        #[cfg(target_os = "macos")]
+        while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
+            if event.id() == "settings" {
+                self.settings_open = true;
+            }
+        }
+
         // 오프스크린 방어: 실행 중 외부 모니터가 분리되면 창이 존재하지 않는 좌표에
         // 남아 "죽은 것처럼" 보인다 (2026-07-05 실증). 창이 어느 모니터에도 속하지
         // 않으면(monitor_size None — macOS는 완전 오프스크린 창의 screen이 nil)
@@ -778,6 +786,9 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
                 120.0, 60.0,
             )));
+            // 이동 직후 key window 상태가 흔들려 키 입력이 일시적으로 안 먹는 사례
+            // (2026-07-05 사용자 보고) — 창 포커스를 명시 재요청한다.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
 
         let want_active = ctx.input(|i| i.viewport().visible()) != Some(false);

@@ -34,6 +34,9 @@ pub struct WorkspaceUi {
     /// split 경계 드래그 중 로컬 미리보기 (path, ratio). 드래그 동안은 명령을 보내지
     /// 않고(매 프레임 DB 저장 방지) 릴리즈 시 1회 ResizeSplit을 보낸다.
     split_drag: Option<(Vec<u8>, f32)>,
+    /// 터미널 마우스 선택 (session, anchor 셀, head 셀 — 드래그 방향 그대로,
+    /// 렌더/복사 시 정규화). 새 출력(Viewport)이 오면 그 세션의 선택은 해제한다.
+    selection: Option<(SessionId, usize, usize)>,
     error: Option<String>,
 }
 
@@ -42,6 +45,8 @@ pub struct WorkspaceUi {
 struct SessionView {
     snapshot: Option<Arc<TerminalViewportSnapshot>>,
     bracketed_paste: bool,
+    /// 사이드바 세션 목록에 보여줄 최신 화면 요약 (마지막 비어있지 않은 행, ≤48자)
+    summary: String,
     exit_code: Option<Option<u32>>,
     /// status detector 감지 상태 (agent만, PR-12)
     status: Option<SessionStatus>,
@@ -60,6 +65,7 @@ impl WorkspaceUi {
             pending_focus: None,
             pending_spawns: 0,
             split_drag: None,
+            selection: None,
             error: None,
         }
     }
@@ -110,9 +116,14 @@ impl WorkspaceUi {
                     // pane 제거 후 도착한 stale Viewport가 캐시를 되살리면
                     // any_running이 영구 repaint를 유발한다 — mux에 살아있는 세션만
                     if self.session_alive(*session) {
+                        if self.selection.is_some_and(|(s, _, _)| s == *session) {
+                            self.selection = None; // 화면이 갱신되면 선택은 무효
+                        }
                         let view = self.sessions.entry(*session).or_default();
                         view.snapshot = Some(Arc::clone(snapshot));
                         view.bracketed_paste = *bracketed_paste;
+                        // 사이드바 세션 요약 — 마지막 비어있지 않은 행 (2026-07-05)
+                        view.summary = last_line_summary(snapshot);
                     }
                 }
                 RuntimeEvent::SessionExited { session, exit_code } => {
@@ -374,13 +385,16 @@ impl WorkspaceUi {
                         )
                     }
                 };
-                self.split_handle(ui, rect, gap_rect, *direction, gap, client, tab_id, path);
                 path.push(0);
                 self.render_node(ui, first_rect, first, mux, config, client, tab_id, path);
                 path.pop();
                 path.push(1);
                 self.render_node(ui, second_rect, second, mux, config, client, tab_id, path);
                 path.pop();
+                // 핸들은 자식 pane들 **뒤에** 등록 — egui 히트테스트는 나중 등록이
+                // 우선이라, ±2px 확장 히트영역이 터미널 선택 드래그에 밀리지 않는다
+                // (codex 리뷰: 가장자리에서 리사이즈 대신 선택이 잡히는 문제).
+                self.split_handle(ui, rect, gap_rect, *direction, gap, client, tab_id, path);
             }
         }
     }
@@ -528,7 +542,42 @@ impl WorkspaceUi {
         };
 
         let preedit = (focused && !self.preedit.is_empty()).then_some(self.preedit.as_str());
-        let output = renderer_egui::draw(ui, &snapshot, config.font_size, preedit);
+        // 이 세션의 선택 영역 (정규화)
+        let selection_range = self
+            .selection
+            .and_then(|(s, a, b)| (s == session).then_some((a.min(b), a.max(b))));
+        let output = renderer_egui::draw(ui, &snapshot, config.font_size, preedit, selection_range);
+
+        // 마우스 드래그 = 셀 선택 (2026-07-05 복사 지원). 파일트리 드래그(dnd payload)
+        // 중에는 선택을 시작하지 않는다.
+        if !egui::DragAndDrop::has_any_payload(ui.ctx()) {
+            let cell_at = |pos: egui::Pos2| -> usize {
+                let col = ((pos.x - output.origin.x) / output.cell_size.x)
+                    .floor()
+                    .clamp(0.0, snapshot.cols.saturating_sub(1) as f32)
+                    as usize;
+                let row = ((pos.y - output.origin.y) / output.cell_size.y)
+                    .floor()
+                    .clamp(0.0, snapshot.rows.saturating_sub(1) as f32)
+                    as usize;
+                row * snapshot.cols as usize + col
+            };
+            if output.response.drag_started()
+                && let Some(pos) = output.response.interact_pointer_pos()
+            {
+                let idx = cell_at(pos);
+                self.selection = Some((session, idx, idx));
+            } else if output.response.dragged()
+                && let Some(pos) = output.response.interact_pointer_pos()
+                && let Some((s, anchor, _)) = self.selection
+                && s == session
+            {
+                self.selection = Some((session, anchor, cell_at(pos)));
+            }
+        }
+        if output.response.clicked() {
+            self.selection = None; // 단순 클릭은 선택 해제
+        }
 
         // 포커스 pane 파란 테두리는 사용자 요청으로 제거(2026-07-04) — 단일 pane 사용 시
         // 항상 보여 거슬림. 다중 pane에서 포커스 식별이 다시 필요해지면 "pane 2개 이상일
@@ -574,6 +623,7 @@ impl WorkspaceUi {
         // 입력은 focused pane으로만
         if focused && output.response.has_focus() {
             let mut pending: Vec<u8> = Vec::new();
+            let mut copy_text: Option<String> = None;
             ui.input(|input| {
                 let modifiers = input.modifiers;
                 for event in &input.raw.events {
@@ -584,11 +634,24 @@ impl WorkspaceUi {
                     if let egui::Event::Ime(egui::ImeEvent::Commit(_)) = event {
                         self.preedit.clear();
                     }
+                    // Cmd+C(macOS)/Ctrl+C(그 외)의 Copy 이벤트: 선택이 있으면 복사가
+                    // 우선 — 이벤트를 소비해 ^C 전송(비macOS 매핑)을 막는다 (2026-07-05)
+                    if matches!(event, egui::Event::Copy)
+                        && let Some((sel_session, a, b)) = self.selection
+                        && sel_session == session
+                    {
+                        copy_text =
+                            Some(renderer_egui::selection_text(&snapshot, a.min(b), a.max(b)));
+                        continue;
+                    }
                     if let Some(bytes) = input_mapper::map_event(event, bracketed, &modifiers) {
                         pending.extend(bytes);
                     }
                 }
             });
+            if let Some(text) = copy_text {
+                ui.ctx().copy_text(text);
+            }
             if !pending.is_empty() {
                 self.send(
                     client,
@@ -698,11 +761,17 @@ impl WorkspaceUi {
                     .and_then(|v| v.status)
                     .map(status_icon)
                     .unwrap_or("");
+                let summary = pane
+                    .session_id
+                    .and_then(|s| self.sessions.get(&s))
+                    .map(|v| v.summary.clone())
+                    .unwrap_or_default();
                 crate::ui::file_tree::SessionEntry {
                     tab: tab.id.clone(),
                     pane: pane.id.clone(),
                     title: pane.title.clone(),
                     status,
+                    summary,
                     focused: mux.focused_pane.as_ref() == Some(&pane.id),
                 }
             })
@@ -739,6 +808,26 @@ impl WorkspaceUi {
 }
 
 /// 상태 → tab 제목 아이콘 (PR-12).
+/// 사이드바 세션 요약 — 화면의 마지막 비어있지 않은 행 (≤48자, 2026-07-05).
+fn last_line_summary(snapshot: &TerminalViewportSnapshot) -> String {
+    let cols = snapshot.cols as usize;
+    if cols == 0 {
+        return String::new();
+    }
+    for row in (0..snapshot.rows as usize).rev() {
+        let line: String = snapshot.visible_cells[row * cols..(row + 1) * cols]
+            .iter()
+            .filter(|c| !c.wide_spacer)
+            .map(|c| c.c)
+            .collect();
+        let line = line.trim();
+        if !line.is_empty() {
+            return line.chars().take(48).collect();
+        }
+    }
+    String::new()
+}
+
 fn status_icon(status: SessionStatus) -> &'static str {
     match status {
         SessionStatus::Running => "",

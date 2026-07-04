@@ -7,6 +7,8 @@ pub struct RenderOutput {
     pub response: egui::Response,
     /// 셀 하나의 화면 크기 — 호출측이 cols/rows 계산에 쓴다
     pub cell_size: egui::Vec2,
+    /// 그리드 좌상단 화면 좌표 — 호출측이 포인터→셀 변환(선택 드래그)에 쓴다
+    pub origin: egui::Pos2,
 }
 
 /// 주어진 폰트 크기의 셀 크기 (모노스페이스 'M' 폭 × 행 높이).
@@ -21,6 +23,8 @@ pub fn draw(
     snapshot: &TerminalViewportSnapshot,
     font_size: f32,
     preedit: Option<&str>,
+    // 선택 영역 (정규화된 선형 셀 인덱스, inclusive) — 셀 배경을 선택색으로 그린다
+    selection: Option<(usize, usize)>,
 ) -> RenderOutput {
     let font_id = egui::FontId::monospace(font_size);
     let cell = cell_size(ui.ctx(), font_size);
@@ -32,7 +36,8 @@ pub fn draw(
         (cell.x * snapshot.cols as f32).min(avail.x.max(0.0)),
         (cell.y * snapshot.rows as f32).min(avail.y.max(0.0)),
     );
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    // click_and_drag: 클릭=포커스, 드래그=선택 (2026-07-05 복사 지원)
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
     let painter = ui.painter_at(rect);
     let origin = rect.min;
 
@@ -47,7 +52,12 @@ pub fn draw(
         let (row, col) = (i / cols, i % cols);
         let pos = origin + egui::vec2(col as f32 * cell.x, row as f32 * cell.y);
         let width = if term_cell.wide { cell.x * 2.0 } else { cell.x };
-        let bg = rgb(term_cell.bg);
+        let selected = selection.is_some_and(|(a, b)| i >= a && i <= b);
+        let bg = if selected {
+            egui::Color32::from_rgb(0x2d, 0x4f, 0x77) // 선택 하이라이트
+        } else {
+            rgb(term_cell.bg)
+        };
         if bg != default_bg {
             painter.rect_filled(
                 egui::Rect::from_min_size(pos, egui::vec2(width, cell.y)),
@@ -121,9 +131,90 @@ pub fn draw(
     RenderOutput {
         response,
         cell_size: cell,
+        origin,
     }
+}
+
+/// 선택 범위(선형 인덱스, inclusive)의 텍스트를 추출한다 — 행마다 trailing 공백
+/// 제거 + 개행, wide_spacer는 건너뛴다 (복사용).
+pub fn selection_text(snapshot: &TerminalViewportSnapshot, start: usize, end: usize) -> String {
+    let cols = snapshot.cols as usize;
+    if cols == 0 {
+        return String::new();
+    }
+    let end = end.min(snapshot.visible_cells.len().saturating_sub(1));
+    if start > end {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut line = String::new();
+    let mut current_row = start / cols;
+    for i in start..=end {
+        let row = i / cols;
+        if row != current_row {
+            out.push_str(line.trim_end());
+            out.push('\n');
+            line.clear();
+            current_row = row;
+        }
+        let cell = &snapshot.visible_cells[i];
+        if !cell.wide_spacer {
+            line.push(cell.c);
+        }
+    }
+    out.push_str(line.trim_end());
+    out
 }
 
 fn rgb(c: [u8; 3]) -> egui::Color32 {
     egui::Color32::from_rgb(c[0], c[1], c[2])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::viewport_snapshot::{CursorShape, CursorSnapshot, TerminalCell};
+
+    fn snap(cols: u16, rows: u16, text: &[&str]) -> TerminalViewportSnapshot {
+        let mut cells = Vec::new();
+        for r in 0..rows as usize {
+            let line: Vec<char> = text.get(r).unwrap_or(&"").chars().collect();
+            for c in 0..cols as usize {
+                cells.push(TerminalCell {
+                    c: *line.get(c).unwrap_or(&' '),
+                    fg: [0xd8; 3],
+                    bg: [0x18, 0x18, 0x1c],
+                    wide: false,
+                    wide_spacer: false,
+                });
+            }
+        }
+        TerminalViewportSnapshot {
+            cols,
+            rows,
+            cursor: CursorSnapshot {
+                col: 0,
+                row: 0,
+                shape: CursorShape::Block,
+                visible: false,
+            },
+            visible_cells: cells.into(),
+            dirty_ranges: Vec::new(),
+            title: None,
+            scroll_offset: 0,
+            is_alt_screen: false,
+        }
+    }
+
+    #[test]
+    fn selection_text_행별_trailing_공백_제거와_개행() {
+        let s = snap(8, 3, &["hello", "world ok", "tail"]);
+        // 1행 전체 + 2행 전체 (인덱스 0..=15)
+        assert_eq!(selection_text(&s, 0, 15), "hello\nworld ok");
+        // 행 중간 → 다음 행 중간
+        assert_eq!(selection_text(&s, 2, 9), "llo\nwo");
+        // 범위 초과는 clamp, start>end는 빈 문자열
+        assert_eq!(selection_text(&s, 16, 999), "tail");
+        assert_eq!(selection_text(&s, 5, 2), "");
+    }
 }

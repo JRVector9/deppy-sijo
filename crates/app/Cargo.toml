@@ -36,4 +36,5 @@ notify = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 # renamex_np(RENAME_EXCL) — 덮어쓰기 금지 rename (§9-5 TOCTOU 회피)
 libc = { workspace = true }
+muda = "0.17"
 

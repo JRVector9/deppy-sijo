@@ -61,7 +61,7 @@ pub struct TerminalConfig {
 impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
-            font_size: 14.0,
+            font_size: 11.0,
             scrollback_lines: 10_000,
         }
     }

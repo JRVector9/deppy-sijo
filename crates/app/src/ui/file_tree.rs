@@ -15,6 +15,8 @@ pub struct SessionEntry {
     pub title: String,
     /// 상태 아이콘 (⏳/✋/✅/❌, 없으면 빈 문자열)
     pub status: &'static str,
+    /// 최신 화면 요약 (마지막 비어있지 않은 행 — 2026-07-05)
+    pub summary: String,
     pub focused: bool,
 }
 
@@ -408,6 +410,8 @@ impl FileTreeUi {
         egui::Panel::left("file_tree_panel")
             .resizable(true)
             .default_size(240.0)
+            // 내용이 안 보여도 좁힐 수 있게 — 최소폭 거의 0까지 허용 (2026-07-05 요청)
+            .size_range(egui::Rangef::new(28.0, f32::INFINITY))
             .show(ui, |ui| self.contents(ui, sessions))
             .inner
     }
@@ -441,6 +445,14 @@ impl FileTreeUi {
                     format!("{} {}", entry.status, entry.title)
                 };
                 let resp = ui.selectable_label(entry.focused, egui::RichText::new(label));
+                if !entry.summary.is_empty() {
+                    ui.indent(("session_summary", &entry.pane), |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&entry.summary).weak().small())
+                                .truncate(),
+                        );
+                    });
+                }
                 if resp.clicked() && !entry.focused {
                     action = Some(SidebarAction::FocusSession {
                         tab: entry.tab.clone(),

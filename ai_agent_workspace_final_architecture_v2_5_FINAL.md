@@ -1278,6 +1278,23 @@ PR-22 Security Hardening
 - mcp/auth/remote는 app UI 없이 테스트 가능해야 한다.
 ```
 
+## 9.4 현행 → 목표 구조 적용 방침 (2026-07-04 재검토)
+
+§9 폴더 트리는 **지향점(북극성)**이며, 작동 중인 코드를 즉시 갈아엎으라는 뜻이 아니다.
+현행(14 crates: app·core·runtime·mux·session·terminal·pty·**audit**·**persist**·storage·secret·mcp·auth·platform)과 목표(env·remote 추가, audit·persist 해체)의 갭 중 **crate 경계 대수술(Phase 1)은 무기한 보류**한다.
+
+**보류 근거:**
+- **의존성 순환**: 현재 `storage → mcp / audit / persist`(storage가 각 도메인의 SQL·row·함수를 끌어 씀). 목표는 반대 방향 `mcp → storage`인데, `storage → mcp`를 남긴 채 추가하면 crate 순환이 되어 **컴파일 불가**. 먼저 각 도메인의 SQL/row를 storage로 옮겨 `storage → mcp/audit/persist`를 끊고 나서야 역방향을 추가할 수 있는 다단계 수술이며, 매 단계 앱 전역 호출부를 고치면서 빌드를 green으로 유지해야 한다.
+- **완전 달성 불가**: persist 흡수 시 `storage → mux`(mux::LayoutNode 등)가 불가피 → §10의 "storage → core only"와 모순. 이상적 트리를 100% 달성할 수 없다.
+- **가치 대비 위험**: 사용자 가치 0(순수 조직 개편), 전역 회귀 위험 높음, audit/persist는 현재 응집·테스트 양호. simplicity-first(망가지지 않은 것 리팩토링 금지)에 반한다.
+
+**대신 채택하는 방침 (점진·기회주의):**
+- audit·persist crate는 **현행 유지**.
+- **안전한 것만**: app/ui 서브모듈화(§9.1의 settings/·connector_center/)는 해당 파일을 손볼 때 겸사겸사, crate 내 파일 분할은 코드가 커질 때.
+- `remote` crate 추출은 remote가 delta+TLS로 충분히 커진 뒤 판단(현재 `runtime/src/remote.rs`로 충분).
+- `env` crate는 env 도메인이 현재의 UI 1파일 규모를 넘어설 때.
+- `mcp ↔ storage` 역전·audit/persist 해체는 **구체적 필요가 생기기 전까진 하지 않는다**.
+
 ---
 
 ## 10. Crate 의존 방향

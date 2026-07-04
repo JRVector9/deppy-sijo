@@ -44,6 +44,9 @@ impl PersistPipe {
         // 앱의 Db::open과 같은 연결 규약 (§11.9). 스키마는 앱이 이미 마이그레이션했다.
         conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
         conn.pragma_update(None, "foreign_keys", true)?;
+        // 동시 writer(app Db·다른 workspace 워커 shutdown 정리)와 겹칠 때 SQLITE_BUSY로
+        // 쓰기가 유실되지 않게 대기·재시도한다 (codex 리뷰 — 전환 시 두 워커가 같은 파일에 씀).
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // 이전 실행의 window 행을 재사용 (없으면 새로) — tab/pane 구조는 복원 UX(PR-14)가
         // take_saved_layout으로 소비한다.
         let previous = persist::load_window_layouts(&conn, &config.workspace_id)

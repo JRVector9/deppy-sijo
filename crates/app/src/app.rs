@@ -43,6 +43,9 @@ pub struct App {
     workspaces: Vec<crate::storage::WorkspaceRow>,
     workspaces_open: bool,
     new_workspace_name: String,
+    /// 전환으로 background 정리 중인 옛 워커 shutdown 스레드들 (workspace_id, handle).
+    /// 앱 종료 시 join(자식 reap 보장) + 같은 workspace 재오픈 전 직렬화(layout 경합 방지).
+    pending_shutdowns: Vec<(String, std::thread::JoinHandle<()>)>,
 }
 
 impl App {
@@ -114,6 +117,7 @@ impl App {
             workspaces: Vec::new(),
             workspaces_open: false,
             new_workspace_name: String::new(),
+            pending_shutdowns: Vec::new(),
         }
     }
 
@@ -173,23 +177,21 @@ impl App {
         (runtime, runtime_events)
     }
 
-    /// workspace 전환: 현재 워커를 shutdown(PTY reap 대기)한 뒤 대상 워커를 새로 만든다.
-    /// 비활성 workspace는 런타임을 갖지 않는다 (§14.1 Suspended/Closed — DB metadata만).
+    /// workspace 전환: 대상 워커를 즉시 만들어 UI 응답성을 유지하고, **옛 워커는
+    /// 백그라운드 스레드에서** shutdown(join+PTY reap)한다 — UI 스레드가 수초 멈추지
+    /// 않게 (codex 리뷰). 비활성 workspace는 런타임을 갖지 않는다 (§14.1 Suspended/Closed).
     fn switch_workspace(&mut self, target_id: &str) {
         if target_id == self.workspace_id {
             return;
         }
-        // 현재 워커 정리 — join까지 대기해 자식 프로세스 reap (on_exit과 동일)
-        self.runtime.shutdown();
-        // 옛 workspace의 세션은 워커가 죽어 더는 안 도므로 DB에서 exited로 정리한다.
-        // 새 워커 생성 '전에' 해야 새 워커가 spawn할 fresh 세션을 지우지 않는다 (codex 리뷰).
-        if let Err(e) = self.db.reconcile_orphan_sessions() {
-            tracing::warn!("workspace 전환 시 세션 reconcile 실패: {e:#}");
-        }
-        // 런타임에 묶인 pending 상태 정리 (이전 워커의 응답을 못 받음) (codex 리뷰).
-        // MCP invoke도 비운다 — A에서 연 실행/승인이 B의 workspace_id로 감사되면 안 된다.
-        self.agents_ui.clear_pending();
-        self.connectors_ui.clear_invoke();
+        // 대상 workspace의 이전 워커가 아직 background 정리 중이면 먼저 끝낸다 — 안 그러면
+        // 옛 target 워커와 새 target 워커가 같은 window 행에 동시 save_layout해 layout이
+        // stale로 덮일 수 있다 (codex 리뷰). 다른 workspace 정리는 기다리지 않는다.
+        self.join_pending_shutdown(target_id);
+        let old_workspace_id = self.workspace_id.clone();
+        // 대상 워커를 먼저 만든다 (make_runtime은 블록하지 않음). 옛 워커와 잠시 공존하나
+        // persist workspace_id/PTY가 서로 달라 충돌 없음. 옛 워커의 세션 영속 상태는
+        // 워커가 shutdown 정리 시 스스로 exited로 마감한다 (자기 UUID 행만 — race 없음).
         let (runtime, runtime_events) = Self::make_runtime(
             &self.config,
             &self.logs_base,
@@ -199,9 +201,14 @@ impl App {
             &self.db,
             &self.egui_ctx,
         );
-        self.runtime = runtime;
+        // 옛 런타임을 꺼내 background 스레드에서 정리한다 (shutdown이 join으로 블록).
+        let old_runtime = std::mem::replace(&mut self.runtime, runtime);
         self.runtime_events = runtime_events;
         self.workspace_id = target_id.to_owned();
+        // 런타임에 묶인 pending 상태 정리 (이전 워커의 응답을 못 받음).
+        // MCP invoke도 비운다 — A에서 연 실행/승인이 B의 workspace_id로 감사되면 안 된다.
+        self.agents_ui.clear_pending();
+        self.connectors_ui.clear_invoke();
         // 워크스페이스별 UI 상태 초기화 (새 워커의 이벤트로 다시 채워진다)
         self.workspace_ui = ui::workspace::WorkspaceUi::new();
         self.notifications_ui = ui::notifications::NotificationsUi::new();
@@ -209,6 +216,29 @@ impl App {
         self.session_titles.clear();
         self.render_active = true;
         self.egui_ctx.request_repaint();
+
+        // 옛 워커는 background에서 shutdown(join+PTY reap + 세션 영속 마감)한다 —
+        // UI freeze의 원인이던 부분. 핸들을 보관해 앱 종료 시 join한다(자식 reap 보장).
+        self.pending_shutdowns.retain(|(_, h)| !h.is_finished());
+        let handle = std::thread::spawn(move || {
+            let mut old_runtime = old_runtime;
+            old_runtime.shutdown();
+        });
+        self.pending_shutdowns.push((old_workspace_id, handle));
+    }
+
+    /// 주어진 workspace의 대기 중 background shutdown들을 join한다 (같은 workspace 워커가
+    /// 동시에 두 개 살아 layout 행을 경합하지 않도록). 다른 workspace 것은 남겨 둔다.
+    fn join_pending_shutdown(&mut self, workspace_id: &str) {
+        let mut i = 0;
+        while i < self.pending_shutdowns.len() {
+            if self.pending_shutdowns[i].0 == workspace_id {
+                let (_, handle) = self.pending_shutdowns.remove(i);
+                let _ = handle.join();
+            } else {
+                i += 1;
+            }
+        }
     }
 
     fn refresh_workspaces(&mut self) {
@@ -317,8 +347,13 @@ impl App {
 
 impl eframe::App for App {
     fn on_exit(&mut self) {
-        // worker join까지 동기 대기 — 셸 자식 프로세스 정리(reap) 보장
+        // worker join까지 동기 대기 — 셸 자식 프로세스 정리(reap) 보장.
         self.runtime.shutdown();
+        // 전환으로 background 정리 중이던 옛 워커들도 끝까지 join한다 — detached
+        // 스레드는 프로세스 종료 시 join되지 않아 PTY reap이 중단될 수 있다 (codex 리뷰).
+        for (_, handle) in self.pending_shutdowns.drain(..) {
+            let _ = handle.join();
+        }
     }
 
     // §14.1 Active↔Warm: 창이 안 보이면(최소화/완전 가림) worker가 snapshot 생성을

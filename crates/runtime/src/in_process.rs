@@ -360,8 +360,17 @@ impl Worker {
         // 열려 있는 로그의 redaction carry를 flush해 마감한다
         // (shutdown()이 join하므로 여기까지 동기 보장)
         let all_sessions: Vec<SessionId> = self.sessions.keys().copied().collect();
-        for session in all_sessions {
-            self.final_drain(session);
+        for session in &all_sessions {
+            self.final_drain(*session);
+        }
+        // 이 워커의 세션들을 영속 상태에서 exited로 마감한다 — 워커가 죽은 뒤(전환/종료)
+        // running으로 남지 않도록. 각 세션은 자기 UUID 행만 건드리므로 다른 워커(같은
+        // workspace를 다시 연 경우 포함)의 세션과 충돌하지 않는다 (codex 리뷰). buffered
+        // 명령까지 위 루프에서 처리된 뒤이므로 spawn 누락도 없다.
+        if let Some(pipe) = &mut self.persist {
+            for session in &all_sessions {
+                pipe.session_exited(*session);
+            }
         }
         let open_sessions: Vec<SessionId> = self.logs.keys().copied().collect();
         for session in open_sessions {

@@ -178,6 +178,8 @@ impl Db {
         // 설계문서 11.9: 모든 연결에 WAL + foreign_keys 강제
         conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
         conn.pragma_update(None, "foreign_keys", true)?;
+        // 워커 persist 연결과 동시 쓰기가 겹칠 때 SQLITE_BUSY로 실패하지 않게 대기 (codex 리뷰)
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
         // 설계문서 11.9: pending migration이 있으면 적용 전 파일 백업 (직전 1개 유지)
         let version: usize =

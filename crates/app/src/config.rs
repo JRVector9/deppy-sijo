@@ -10,6 +10,7 @@ pub struct Config {
     pub ui: UiConfig,
     pub terminal: TerminalConfig,
     pub performance: PerformanceConfig,
+    pub remote: RemoteConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -68,6 +69,17 @@ impl Default for PerformanceConfig {
             output_batch_ms: 25,
         }
     }
+}
+
+/// remote TLS 서버 설정 (설계문서 remote-tls-delta §2.5 — GUI 배선).
+/// 기본은 비활성 — 원격 attach는 셸 접근 부여와 동등(§6)하므로 opt-in이다.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RemoteConfig {
+    /// 앱 시작 시 TLS 원격 서버를 자동 기동할지. 기본 false.
+    pub tls_enabled: bool,
+    /// bind 포트. 0이면 OS가 임의 할당(local_addr로 확인). 변경은 토글 off/on 후 적용.
+    pub port: u16,
 }
 
 pub fn config_path(config_dir: &Path) -> PathBuf {
@@ -152,6 +164,31 @@ mod tests {
         assert_eq!(parsed.ui.theme, Theme::Dark);
         assert_eq!(parsed.terminal.scrollback_lines, 10_000);
         assert_eq!(parsed.performance.output_batch_ms, 25);
+    }
+
+    #[test]
+    fn remote_config_기본값_비활성_포트0() {
+        let c = RemoteConfig::default();
+        assert!(!c.tls_enabled);
+        assert_eq!(c.port, 0);
+    }
+
+    #[test]
+    fn remote_누락시_기본값으로_채운다() {
+        // 옛 config(remote 섹션 없음)도 로드된다 (serde default).
+        let parsed: Config = toml::from_str("[ui]\ntheme = \"dark\"\n").unwrap();
+        assert!(!parsed.remote.tls_enabled);
+        assert_eq!(parsed.remote.port, 0);
+    }
+
+    #[test]
+    fn remote_config_roundtrip() {
+        let mut c = Config::default();
+        c.remote.tls_enabled = true;
+        c.remote.port = 7777;
+        let text = toml::to_string_pretty(&c).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed, c);
     }
 
     #[test]

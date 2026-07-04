@@ -26,6 +26,14 @@ struct WorkspaceRuntime {
     session_titles: std::collections::HashMap<runtime::SessionId, String>,
 }
 
+/// 실행 중인 remote TLS 서버 + 그 신원 지문(attach 클라이언트 대조용).
+/// 원격 worker는 server가 소유(move)한다 — 활성 workspace worker와 별개의 전용 worker라
+/// 수명이 서로 얽히지 않는다. Drop/shutdown이 accept 루프·접속·worker를 모두 정리한다.
+struct RemoteTlsState {
+    server: runtime::RemoteRuntimeServer,
+    fingerprint: String,
+}
+
 pub struct App {
     config: Config,
     config_path: PathBuf,
@@ -63,6 +71,14 @@ pub struct App {
     /// 전환으로 background 정리 중인 옛 워커 shutdown 스레드들 (workspace_id, handle).
     /// 앱 종료 시 join(자식 reap 보장) + 같은 workspace 재오픈 전 직렬화(layout 경합 방지).
     pending_shutdowns: Vec<(String, std::thread::JoinHandle<()>)>,
+    /// remote TLS 서버 (켜져 있을 때만 Some). 활성 workspace worker와 별개의 전용 worker를 노출.
+    remote: Option<RemoteTlsState>,
+    /// remote 시작 실패 시 settings에 표시할 에러 (best-effort — 앱은 계속, 크래시 금지).
+    remote_error: Option<String>,
+    /// settings의 토큰 표시(reveal) 토글. 토큰은 민감이라 기본 마스킹.
+    remote_reveal_token: bool,
+    /// known_hosts 표시 캐시 (settings 열 때 lazily 로드, 닫으면 None으로 리셋해 재로드).
+    known_hosts_cache: Option<Vec<(String, String)>>,
 }
 
 impl App {
@@ -110,7 +126,7 @@ impl App {
             }
         }
 
-        Self {
+        let mut app = Self {
             config,
             config_path,
             settings_open: false,
@@ -138,7 +154,23 @@ impl App {
             confirm_delete_ws: None,
             pending_focus: None,
             pending_shutdowns: Vec::new(),
+            remote: None,
+            remote_error: None,
+            remote_reveal_token: false,
+            known_hosts_cache: None,
+        };
+        // 시작 시 config가 remote를 켜 뒀으면 best-effort로 기동한다 (실패는 log + settings 표시,
+        // config는 그대로 두어 다음 실행에 재시도). 자동 시작은 config 저장을 유발하지 않는다.
+        if app.config.remote.tls_enabled {
+            match app.start_remote() {
+                Ok(state) => app.remote = Some(state),
+                Err(e) => {
+                    tracing::warn!("remote TLS 자동 시작 실패: {e:#}");
+                    app.remote_error = Some(format!("{e:#}"));
+                }
+            }
         }
+        app
     }
 
     /// warm 상태로 유지할 최대 workspace 수 (활성 제외). 저-RAM 정책상 작게 — 초과분은
@@ -183,6 +215,21 @@ impl App {
             tracing::warn!("workspace 복원 명령 전송 실패: {e:#}");
         }
         // 저장된 credential을 로그 redaction 대상으로 시드 (값 resolve는 worker에서)
+        Self::seed_redaction(&runtime, db);
+        WorkspaceRuntime {
+            id: workspace_id.to_owned(),
+            runtime,
+            events: runtime_events,
+            workspace_ui: ui::workspace::WorkspaceUi::new(),
+            render_active: true,
+            pending_events: Vec::new(),
+            session_titles: std::collections::HashMap::new(),
+        }
+    }
+
+    /// 저장된 credential id를 worker의 로그 redaction 대상으로 시드한다 (값 resolve는 worker).
+    /// 활성 workspace worker와 remote 전용 worker가 공유하는 시드 로직.
+    fn seed_redaction(runtime: &InProcessRuntimeClient, db: &Db) {
         match db.list_credentials() {
             Ok(credentials) => {
                 let mut ids: Vec<String> = Vec::with_capacity(credentials.len());
@@ -202,14 +249,100 @@ impl App {
             }
             Err(e) => tracing::warn!("credential 목록 조회 실패 (redaction 시드 생략): {e:#}"),
         }
-        WorkspaceRuntime {
-            id: workspace_id.to_owned(),
-            runtime,
-            events: runtime_events,
-            workspace_ui: ui::workspace::WorkspaceUi::new(),
-            render_active: true,
-            pending_events: Vec::new(),
-            session_titles: std::collections::HashMap::new(),
+    }
+
+    /// 앱 데이터 디렉터리 (db_path = `<data>/metadata.sqlite3` → parent). remote cert/known_hosts의 기준.
+    fn data_dir(&self) -> &std::path::Path {
+        self.db_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+    }
+
+    /// remote TLS 서버 신원 인증서 경로 (`<data>/remote-tls.crt` — tls_identity 관례, 키는 keyring).
+    fn cert_path(&self) -> PathBuf {
+        self.data_dir().join("remote-tls.crt")
+    }
+
+    /// 클라이언트 측 known_hosts 파일 경로 (`<data>/known_hosts`).
+    fn known_hosts_path(&self) -> PathBuf {
+        self.data_dir().join("known_hosts")
+    }
+
+    /// remote TLS 서버를 기동한다: 신원 로드/생성 → 전용 원격 worker(비영속) → loopback bind.
+    /// **원격 worker는 fresh empty 런타임**(원격 클라가 스스로 세션을 만든다) + PersistConfig=None
+    /// (원격 세션은 영속하지 않는다). 실패는 Err — 호출측이 표시하고 앱은 계속(크래시 금지).
+    fn start_remote(&self) -> anyhow::Result<RemoteTlsState> {
+        let identity =
+            runtime::tls_identity::get_or_create_identity(&self.secret_store, &self.cert_path())?;
+        let fingerprint = identity.fingerprint();
+        // 전용 원격 worker — logs는 logs_base/remote/ 하위(활성 workspace 로그와 분리).
+        let worker = InProcessRuntimeClient::new(
+            self.config.performance.output_batch_ms,
+            Arc::new(KeyringSecretStore),
+            self.logs_base.join("remote"),
+            self.redaction.clone(),
+            None, // 원격 세션은 영속하지 않는다
+        );
+        Self::seed_redaction(&worker, &self.db);
+        let addr =
+            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, self.config.remote.port));
+        // loopback 전용(allow_non_loopback=false) — 비-loopback 개방은 후속 UI(C-4 가드 유지).
+        let server = runtime::RemoteRuntimeServer::serve_tls(worker, addr, identity, false)?;
+        Ok(RemoteTlsState {
+            server,
+            fingerprint,
+        })
+    }
+
+    /// settings 체크 on: 서버를 켜고 성공 시 config에 의도를 영속한다(다음 실행 자동 시작).
+    fn remote_enable(&mut self) {
+        match self.start_remote() {
+            Ok(state) => {
+                self.remote = Some(state);
+                self.remote_error = None;
+                self.config.remote.tls_enabled = true;
+                if let Err(e) = self.config.save(&self.config_path) {
+                    tracing::warn!("config 저장 실패: {e:#}");
+                    // 서버는 켜졌지만 자동시작이 영속되지 않음 — 사용자에게 알린다.
+                    self.remote_error = Some(format!(
+                        "설정 저장 실패 — 다음 실행엔 자동시작 안 됨: {e:#}"
+                    ));
+                }
+            }
+            Err(e) => {
+                tracing::warn!("remote TLS 시작 실패: {e:#}");
+                self.remote_error = Some(format!("{e:#}"));
+            }
+        }
+    }
+
+    /// settings 체크 off: 서버를 정지(Drop이 accept/접속/worker 정리)하고 config에 영속한다.
+    fn remote_disable(&mut self) {
+        if let Some(state) = self.remote.take() {
+            state.server.shutdown();
+        }
+        self.remote_error = None;
+        self.config.remote.tls_enabled = false;
+        if let Err(e) = self.config.save(&self.config_path) {
+            tracing::warn!("config 저장 실패: {e:#}");
+            // 저장 실패를 조용히 넘기면 config.toml에 tls_enabled=true가 남아, 사용자가 껐다고
+            // 생각한 원격 서버(셸 접근 동등)가 다음 실행에 다시 자동시작된다 — 표면화 (codex P2).
+            self.remote_error = Some(format!(
+                "서버는 껐지만 설정 저장 실패 — 다음 실행에 다시 켜질 수 있습니다: {e:#}"
+            ));
+        }
+    }
+
+    /// known_hosts 파일을 (host, 지문) 목록으로 로드한다 (표시 전용 — 파일 없으면 빈 목록).
+    fn load_known_hosts(&self) -> Vec<(String, String)> {
+        let path = self.known_hosts_path();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => parse_known_hosts(&text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                tracing::warn!("known_hosts 읽기 실패: {e:#}");
+                Vec::new()
+            }
         }
     }
 
@@ -480,6 +613,10 @@ impl App {
 
 impl eframe::App for App {
     fn on_exit(&mut self) {
+        // remote TLS 서버를 먼저 정지 — accept 루프·접속·전용 worker(그 세션들 reap)를 정리한다.
+        if let Some(state) = self.remote.take() {
+            state.server.shutdown();
+        }
         // worker join까지 동기 대기 — 셸 자식 프로세스 정리(reap) 보장.
         self.active.runtime.shutdown();
         // warm 워커들도 종료 (계속 실행 중이던 세션들 reap).
@@ -734,16 +871,96 @@ impl eframe::App for App {
             ui.ctx().request_repaint();
         }
 
-        let changed = ui::settings::show(ui.ctx(), &mut self.settings_open, &mut self.config);
-        if changed {
+        // known_hosts는 settings 열 때 lazily 로드한다 (닫으면 아래서 None으로 리셋 → 재로드).
+        if self.settings_open && self.known_hosts_cache.is_none() {
+            let kh = self.load_known_hosts();
+            self.known_hosts_cache = Some(kh);
+        }
+        // Remote 뷰모델을 현재 상태에서 구성 (UI는 서버를 직접 만지지 않는다 — disjoint 필드 차용).
+        let remote_view = {
+            let (running, addr, fp, token) = match &self.remote {
+                Some(s) => (
+                    true,
+                    Some(s.server.local_addr().to_string()),
+                    Some(s.fingerprint.as_str()),
+                    Some(s.server.auth_token()),
+                ),
+                None => (false, None, None, None),
+            };
+            ui::settings::RemoteView {
+                running,
+                addr,
+                fingerprint: fp,
+                token,
+                error: self.remote_error.as_deref(),
+                known_hosts_path: self.known_hosts_path().display().to_string(),
+                known_hosts: self.known_hosts_cache.as_deref().unwrap_or(&[]),
+            }
+        };
+        let out = ui::settings::show(
+            ui.ctx(),
+            &mut self.settings_open,
+            &mut self.config,
+            &remote_view,
+            &mut self.remote_reveal_token,
+        );
+        if out.config_changed {
             // hot reload: 테마는 즉시 적용
             ui.ctx().set_theme(self.config.ui.theme.to_egui());
             if let Err(e) = self.config.save(&self.config_path) {
                 tracing::warn!("config 저장 실패: {e:#}");
+                // remote 포트 등은 접근 표면에 영향 — 저장 실패를 UI에도 남긴다 (codex xhigh Low).
+                self.remote_error = Some(format!("설정 저장 실패: {e:#}"));
             }
+        }
+        match out.remote_action {
+            ui::settings::RemoteAction::Start => self.remote_enable(),
+            ui::settings::RemoteAction::Stop => self.remote_disable(),
+            ui::settings::RemoteAction::Forget(host) => {
+                let path = self.known_hosts_path();
+                match runtime::known_hosts::KnownHosts::load(&path)
+                    .and_then(|mut kh| kh.forget(&host))
+                {
+                    Ok(()) => {}
+                    Err(e) => tracing::warn!("known_hosts forget 실패: {e:#}"),
+                }
+                self.known_hosts_cache = Some(self.load_known_hosts());
+            }
+            ui::settings::RemoteAction::None => {}
+        }
+        // settings가 닫혔으면 표시 상태를 리셋 — 다음에 열 때 known_hosts를 fresh 로드하고
+        // 토큰은 다시 마스킹한다.
+        if !self.settings_open {
+            self.known_hosts_cache = None;
+            self.remote_reveal_token = false;
         }
         self.frame_stats.end();
     }
+}
+
+/// known_hosts 파일 텍스트를 (host, 지문) 목록으로 파싱한다 (settings 표시 전용 —
+/// forget/pin은 runtime::known_hosts API로 처리). 포맷은 한 줄에 `host 지문`, `#` 주석·빈
+/// 줄은 스킵 (known_hosts 파일 계약과 동일). 파일 순서를 보존한다.
+fn parse_known_hosts(text: &str) -> Vec<(String, String)> {
+    // 표시도 KnownHosts::load와 같은 **effective view**를 쓴다 — host 중복은 last-wins,
+    // 지문은 소문자 정규화. 수동 편집으로 duplicate가 생겨도 실제 신뢰 판단과 다른 낡은
+    // 지문을 "신뢰 기록"처럼 보여주지 않는다 (codex xhigh Low).
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        if let (Some(host), Some(fp)) = (parts.next(), parts.next()) {
+            let fp = fp.to_ascii_lowercase();
+            match rows.iter_mut().find(|(h, _)| h == host) {
+                Some(row) => row.1 = fp, // last-wins (KnownHosts HashMap과 동일)
+                None => rows.push((host.to_owned(), fp)),
+            }
+        }
+    }
+    rows
 }
 
 /// 세션이 붙어 있는 pane id를 mux 스냅샷에서 찾는다 (알림 클릭 → focus용).
@@ -837,6 +1054,36 @@ mod tests {
             }
             _ => None,
         }
+    }
+
+    #[test]
+    fn parse_known_hosts_주석_빈줄_손상행_스킵하고_순서보존() {
+        let text = "# deppy remote TLS known_hosts\n\
+                    127.0.0.1:7777 aa:bb:cc\n\
+                    \n\
+                    host-only-no-fp\n\
+                    [::1]:9000 dd:ee:ff\n";
+        let rows = parse_known_hosts(text);
+        assert_eq!(
+            rows,
+            vec![
+                ("127.0.0.1:7777".to_owned(), "aa:bb:cc".to_owned()),
+                ("[::1]:9000".to_owned(), "dd:ee:ff".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_known_hosts_중복host는_last_wins_소문자정규화() {
+        // KnownHosts::load(HashMap)와 동일한 effective view — 낡은 지문을 표시하지 않는다
+        let text = "h:1 AA:BB
+h:2 cc:dd
+h:1 EE:FF
+";
+        let rows = parse_known_hosts(text);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&("h:1".to_owned(), "ee:ff".to_owned())));
+        assert!(rows.contains(&("h:2".to_owned(), "cc:dd".to_owned())));
     }
 
     #[test]

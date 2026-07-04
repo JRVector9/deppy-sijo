@@ -1,4 +1,4 @@
-# Crate 의존 그래프 (v2.8 PR-P0 기준선)
+# Crate 의존 그래프 (v2.8 V0~V2 적용 완료)
 
 작성: 2026-07-04. `cargo run -p xtask -- check-deps`가 이 문서의 금지 edge를 자동 검사한다.
 
@@ -15,18 +15,18 @@ mcp-proxy ▶ storage, mcp, audit, secret, auth, core
 mux/session/terminal/pty/platform/auth/secret/core: 하위 계층
 ```
 
-## 확인된 순환 위험 (2026-07-04 라이브 실증)
+## 순환 해소 실증 (2026-07-04, V2 후 smoke-test)
 
-`mcp`에 `storage` 의존을 추가하면:
+전환 전 `mcp → storage` 추가 시:
 
 ```text
 error: cyclic package dependency: package `mcp` depends on itself.
-  Cycle: storage → mcp → storage
 ```
 
-v2.5가 의도한 `mcp → storage` 방향은 현 구조에서 **컴파일 불가**. v2.8이 이를 해결한다.
+**V2(mcp-store 분리) 후 같은 실험 → 컴파일 성공(Finished).** `mcp → mcp-store`도 성공.
+순환은 구조적으로 소멸했고, runtime→store 직접 의존은 정책상 금지(xtask 가드)로만 남는다.
 
-## v2.8 전환 후 목표 그래프 (이 저장소 규모로 조정)
+## v2.8 전환 후 그래프 (V2에서 적용 완료 — 목표=현실)
 
 ```text
 storage-core           DB infra만 (conn/open/migration runner/backup) — 아무 도메인도 모름

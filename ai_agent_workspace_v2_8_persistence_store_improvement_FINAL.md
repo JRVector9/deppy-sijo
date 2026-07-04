@@ -1066,3 +1066,82 @@ storage → mux → storage
 ```
 
 따라서 v2.5 기준 개발을 계속하되, persistence 계층은 본 문서(v2.8)의 store crate 분리 계획을 우선 반영한다.
+
+
+---
+
+## 17. 구현 결과 (2026-07-04 — 본 문서 v2.8의 실제 반영 기록)
+
+V0~V2 + 파서 보완으로 **원래 오류가 해소·실증**되었다.
+
+### 17.1 해소 실증 (smoke-test)
+
+```text
+전환 전:  mcp에 storage 의존 추가 → error: cyclic package dependency (재현 확인)
+전환 후:  mcp → storage   추가 → 컴파일 성공 (Finished)
+          mcp → mcp-store 추가 → 컴파일 성공 (Finished)
+(둘 다 실증 후 원복 — v2.8 원칙상 runtime은 store를 직접 쓰지 않으며 xtask가 금지 edge로 가드)
+```
+
+### 17.2 구현된 것
+
+```text
+V0  xtask check-deps(금지 edge+순환 자동 검사, [dependencies]류 섹션의 ../ path만 edge로 파싱)
+    + storage '전_버전_prefix_마이그레이션_스모크'(모든 user_version k→최신 + foreign_key_check)
+    + docs/dependency-graph.md
+V1  storage-core 신설: open(PRAGMA WAL/foreign_keys/busy_timeout)/마이그레이션 전 백업/
+    IMMEDIATE 러너(2프로세스 동시 오픈 안전). storage는 위임.
+V2  mcp-store 신설: mcp SQL/Row(구 mcp/repo.rs) + tool_permission_rules + pending_approvals의
+    SQL/타입 소유(모든 함수 Connection 인자). storage→mcp(runtime) 절단.
+    storage는 재수출로 기존 storage:: 경로 호환 유지, Db 메서드는 mcp_store 위임.
+```
+
+### 17.3 본 문서 대비 채택된 편차 (근거 포함)
+
+```text
+1. §7.2 store별 migrations() concat → 폐기. 전역 version 원장(v1..v10 번호·내용 불변,
+   신규는 끝에 append)을 storage가 소유하고 storage-core 러너가 실행한다.
+   근거: 기존 사용자 DB(user_version=10)는 현행 순서로 적용돼 있어 재배열 시 파손.
+   가드: storage prefix 스모크 테스트 + codex 검수에서 v5/v8/v9 SQL SHA-256 일치 확인.
+
+2. *-model crate(mcp-model/mux-model/session-model/audit-model) → 생략.
+   근거: mux는 이미 순수 모델 crate, mcp의 Row(store)와 Config(runtime)는 이미 독립,
+   mcp-store는 rule을 문자열로만 다뤄 모델 공유가 불필요. 현 규모(1인 도구)에서 과분리.
+
+3. permission_policy의 mcp-runtime 이동(§4) → 보류(audit 잔류).
+   근거: PolicyEvaluation::Decided(ToolDecision) 강결합 + audit log가 ToolDecision을 사용 —
+   이동 시 audit→mcp 역결합 발생. audit는 하위층(core,secret만 의존)이라 어떤 순환에도
+   관여하지 않으므로 위치는 취향 문제. 필요해지면 ToolDecision 분리와 함께 재검토.
+
+4. mux-store/session-store/env-store 분리(§4, PR-P4/P5) → 보류.
+   근거: persist가 이미 그 역할(conn/tx 주입 자유함수, mux+session SQL)을 하고 있고
+   mux_panes.session_id FK로 두 store는 함께 설계해야 함. storage→persist는 조립 방향
+   (facade→store)이라 합법 DAG — 절단이 목표가 아니라 순환 봉인이 목표.
+
+5. audit-store 분리(§6.5, PR-P3) → 보류.
+   근거: audit는 이미 conn 주입 store+service 혼합이며 순환 무관. AEAD 키(keyring) 접근이
+   store crate로 들어가는 문제(§3.3 정신)는 분리 시 오히려 악화 — encryptor 주입 구조 유지.
+
+6. §8.2 workspace delete 예시(audit/mcp까지 삭제) → 채택 안 함(정책 확정).
+   현행 유지: audit 로그(감사 무결성)와 mcp_servers(전역 리소스)는 workspace 삭제 시 보존.
+
+7. storage facade(PR-P7 freeze/제거) → '조립자+앱 수준 store'로 재정의해 유지.
+   storage → storage-core·mcp-store·audit·persist 는 조립 방향 DAG로 합법(§5.2 금지는
+   storage-core 기준). credentials/workspaces/env/agent_configs는 특정 도메인 crate가
+   없으므로 storage가 소유한다(본 문서에 누락됐던 부분).
+
+8. 문서에 없던 현실 편입: mcp-proxy(bin)와 app이 storage(facade)로 DB에 접근하며,
+   pending_approvals(2프로세스 IPC)·tool_permission_rules는 mcp-store 소유로 정리했다.
+```
+
+### 17.4 최종 의존 방향 (실제 적용)
+
+```text
+storage-core → (없음: rusqlite/anyhow만)
+mcp-store    → storage-core는 불필요(Connection 인자) — rusqlite/serde_json만
+mcp(runtime) → core, secret                     ← 저장을 모름 (금지 edge 가드)
+audit        → core, secret
+persist      → core, mux
+storage      → storage-core, mcp-store, audit, persist, core, secret   (조립자/facade)
+app / mcp-proxy / runtime → storage(+개별 crate)  (최상층)
+```

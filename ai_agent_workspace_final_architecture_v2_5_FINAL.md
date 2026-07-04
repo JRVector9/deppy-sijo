@@ -1278,7 +1278,14 @@ PR-22 Security Hardening
 - mcp/auth/remote는 app UI 없이 테스트 가능해야 한다.
 ```
 
-## 9.4 현행 → 목표 구조 적용 방침 (2026-07-04 재검토)
+## 9.4 현행 → 목표 구조 적용 방침 (2026-07-04 재검토; 같은 날 v2.8로 부분 대체)
+
+> **갱신(2026-07-04)**: 아래 보류 판단 중 "순환 해소" 부분은
+> `ai_agent_workspace_v2_8_persistence_store_improvement_FINAL.md`(§17 구현 결과)로
+> **해소되었다** — storage-core/mcp-store 분리로 `mcp → storage` 추가가 더는 순환이
+> 아님을 smoke-test로 실증했고, xtask check-deps가 금지 edge를 자동 가드한다.
+> 나머지 보류(빈 파일 스캐폴딩 금지, *-model 생략, env/remote 추출 지연)는 유지.
+
 
 §9 폴더 트리는 **지향점(북극성)**이며, 작동 중인 코드를 즉시 갈아엎으라는 뜻이 아니다.
 현행(14 crates: app·core·runtime·mux·session·terminal·pty·**audit**·**persist**·storage·secret·mcp·auth·platform)과 목표(env·remote 추가, audit·persist 해체)의 갭 중 **crate 경계 대수술(Phase 1)은 무기한 보류**한다.

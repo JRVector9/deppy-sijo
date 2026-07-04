@@ -3,8 +3,8 @@
 
 mod db;
 pub use db::{
-    AgentConfigRow, CredentialMeta, Db, EnvProfileRow, EnvValue, EnvVarRow, PermissionRuleRow,
-    WorkspaceRow,
+    AgentConfigRow, ApprovalOutcome, ApprovalStatus, CredentialMeta, Db, EnvProfileRow, EnvValue,
+    EnvVarRow, PendingApprovalRow, PermissionRuleRow, WorkspaceRow,
 };
 
 mod logs;

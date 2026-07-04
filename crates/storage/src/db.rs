@@ -24,7 +24,8 @@ pub struct Db {
 /// 5: mcp_servers + mcp_tools (PR-15, mcp crate DDL),
 /// 6: tool_audit_logs (PR-16, audit crate DDL),
 /// 7: agent_configs.deleted_at (soft-delete — 세션 영속 FK와 공존),
-/// 8: tool_permission_rules (PR-16 권한 규칙 영속).
+/// 8: tool_permission_rules (PR-16 권한 규칙 영속),
+/// 9: pending_approvals (agent-proxy 1.5 — proxy↔GUI 라이브 승인 IPC 채널).
 /// 4~6은 각 crate가 소유한 DDL 상수를 그대로 붙인다 (스키마 정의는 한 곳에서만).
 const MIGRATIONS: &[&str] = &[
     "
@@ -115,6 +116,27 @@ CREATE TABLE tool_permission_rules (
     PRIMARY KEY (server_id, tool_name)
 );
 ",
+    // 9: pending_approvals (agent-proxy option 1.5). deppy-mcp-proxy가 Ask 규칙 tool을
+    //    만나면 이 표에 pending 행을 넣고 status를 폴링한다; GUI는 pending 행을 감시해
+    //    팝업을 띄우고 결정을 되쓴다. 두 프로세스가 같은 DB(WAL+busy_timeout)를 공유하는
+    //    IPC 채널. arguments_preview는 proxy가 redact를 끝낸 표시용 문자열만 담는다(원문 secret 금지).
+    //    권한 규칙(tool_permission_rules)과 마찬가지로 FK는 두지 않는다(문자열 키 느슨 연결).
+    "
+CREATE TABLE pending_approvals (
+    id TEXT PRIMARY KEY,
+    server_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    arguments_preview TEXT NOT NULL,
+    schema_hash TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    remember INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    resolved_at INTEGER,
+    CHECK (status IN ('pending', 'allowed', 'denied'))
+);
+
+CREATE INDEX idx_pending_approvals_status ON pending_approvals(status);
+",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -142,6 +164,56 @@ pub struct PermissionRuleRow {
     /// "allow" | "deny" | "ask" (audit::PermissionRule::as_str)
     pub rule: String,
     pub approved_schema_hash: Option<String>,
+}
+
+/// pending_approvals.status 값 (proxy가 폴링으로 읽는 상태).
+/// DB 문자열 'pending' | 'allowed' | 'denied'와 1:1 대응.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalStatus {
+    Pending,
+    Allowed,
+    Denied,
+}
+
+impl ApprovalStatus {
+    /// 영속 문자열 (저장/조회 양쪽에서 이것만 쓴다).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApprovalStatus::Pending => "pending",
+            ApprovalStatus::Allowed => "allowed",
+            ApprovalStatus::Denied => "denied",
+        }
+    }
+
+    /// 영속 문자열에서 복원 — 알 수 없는 값은 None (호출측이 fail-closed 처리).
+    pub fn from_persisted(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(ApprovalStatus::Pending),
+            "allowed" => Some(ApprovalStatus::Allowed),
+            "denied" => Some(ApprovalStatus::Denied),
+            _ => None,
+        }
+    }
+}
+
+/// poll_approval 결과 — 현재 상태 + "기억하기"(규칙 영속) 플래그.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApprovalOutcome {
+    pub status: ApprovalStatus,
+    /// true면 GUI가 이 결정을 PermissionRule로 영속하기로 표시했다.
+    pub remember: bool,
+}
+
+/// pending 상태 승인 요청 한 행 (GUI 목록/팝업용).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingApprovalRow {
+    pub id: String,
+    pub server_id: String,
+    pub tool_name: String,
+    /// 이미 redact된 표시용 미리보기 (원문 secret 아님).
+    pub arguments_preview: String,
+    pub schema_hash: Option<String>,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -206,27 +278,51 @@ impl Db {
     }
 
     fn migrate(mut conn: Connection) -> anyhow::Result<Self> {
-        let version: usize =
-            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? as usize;
-        // forward-only (11.9): 이 바이너리보다 앞선 DB는 downgrade가 불가능하므로
-        // 조용히 실행하지 않고 기동을 중단한다 (codex 리뷰 반영)
+        // 락 경합 최소화용 fast-path: 락 밖에서 한 번 읽어 이미 최신이면 트랜잭션 없이 리턴.
+        // (여기 값은 참고용 — 실제 결정은 아래 IMMEDIATE 락 안에서 다시 읽어 확정한다.)
+        let version = Self::read_user_version(&conn)?;
+        Self::ensure_not_ahead(version)?;
+        if version == MIGRATIONS.len() {
+            return Ok(Self { conn });
+        }
+
+        // 이제 DB를 두 프로세스(GUI + deppy-mcp-proxy)가 동시에 연다. 마이그레이션 결정과
+        // 실행을 하나의 write 트랜잭션으로 묶는다: BEGIN IMMEDIATE로 write 락을 먼저 잡고
+        // → 락 안에서 user_version을 다시 읽어 → 필요한 마이그레이션만 순서대로 실행 →
+        // user_version을 최종값으로 한 번 갱신 → 한 번에 COMMIT. 두 번째 프로세스는
+        // busy_timeout만큼 대기해 락을 얻은 뒤 최신 user_version을 보고 아무 것도 하지 않는다
+        // (stale 계획으로 DDL을 재실행하는 레이스 해소).
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // 락 안에서 재확인 — 대기 중 다른 프로세스가 이미 올렸을 수 있다
+        let version = Self::read_user_version(&tx)?;
+        Self::ensure_not_ahead(version)?;
+        for (i, sql) in MIGRATIONS.iter().enumerate().skip(version) {
+            tx.execute_batch(sql)
+                .with_context(|| format!("마이그레이션 {} 실패", i + 1))?;
+        }
+        if version < MIGRATIONS.len() {
+            // 스키마 변경 전부와 user_version 갱신이 같은 트랜잭션이라, 중간에 실패하면
+            // user_version 포함 전부 롤백된다 (절반만 적용된 상태 방지)
+            tx.pragma_update(None, "user_version", MIGRATIONS.len() as i64)?;
+        }
+        tx.commit().context("마이그레이션 커밋 실패")?;
+        Ok(Self { conn })
+    }
+
+    fn read_user_version(conn: &Connection) -> anyhow::Result<usize> {
+        Ok(conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))? as usize)
+    }
+
+    /// forward-only (11.9): 이 바이너리보다 앞선 DB는 downgrade가 불가능하므로
+    /// 조용히 실행하지 않고 기동을 중단한다 (codex 리뷰 반영).
+    fn ensure_not_ahead(version: usize) -> anyhow::Result<()> {
         anyhow::ensure!(
             version <= MIGRATIONS.len(),
             "DB user_version({version})이 이 버전이 아는 마이그레이션({})보다 앞서 있습니다 — \
              더 새 버전의 앱이 만든 DB입니다",
             MIGRATIONS.len()
         );
-        for (i, sql) in MIGRATIONS.iter().enumerate().skip(version) {
-            // 스키마 변경과 user_version 갱신을 한 트랜잭션으로 묶어
-            // 중단 시 절반만 적용된 상태를 막는다
-            let tx = conn.transaction()?;
-            tx.execute_batch(sql)
-                .with_context(|| format!("마이그레이션 {} 실패", i + 1))?;
-            tx.pragma_update(None, "user_version", i as i64 + 1)?;
-            tx.commit()
-                .with_context(|| format!("마이그레이션 {} 커밋 실패", i + 1))?;
-        }
-        Ok(Self { conn })
+        Ok(())
     }
 
     /// credential metadata 추가. created_at/updated_at은 SQLite가 UTC로 기록한다.
@@ -435,6 +531,103 @@ impl Db {
             "DELETE FROM tool_permission_rules WHERE server_id = ?1 AND tool_name = ?2",
             (server_id, tool_name),
         )?;
+        Ok(())
+    }
+
+    /// 라이브 승인 요청을 등록한다 (deppy-mcp-proxy → GUI). id는 호출측이 만든 UUID,
+    /// created_at은 호출측이 SystemTime으로 넘긴 unix seconds (테스트 결정성을 위해 내부에서
+    /// 시간을 읽지 않는다). arguments_preview는 proxy가 이미 redact한 표시용 문자열이어야 한다.
+    pub fn insert_pending_approval(
+        &self,
+        id: &str,
+        server_id: &str,
+        tool_name: &str,
+        arguments_preview: &str,
+        schema_hash: Option<&str>,
+        created_at: i64,
+    ) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO pending_approvals
+                   (id, server_id, tool_name, arguments_preview, schema_hash,
+                    status, remember, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6)",
+                (
+                    id,
+                    server_id,
+                    tool_name,
+                    arguments_preview,
+                    schema_hash,
+                    created_at,
+                ),
+            )
+            .with_context(|| format!("pending approval 저장 실패: {id}"))?;
+        Ok(())
+    }
+
+    /// 현재 상태를 폴링한다 (proxy가 반복 호출). 행이 없으면 Err —
+    /// proxy는 자신이 넣은 id를 폴링하므로, 없는 행은 예외 상황(정리/삭제)이고
+    /// fail-closed(거부/중단)로 다뤄야 한다. status 문자열이 기형이어도 Err.
+    pub fn poll_approval(&self, id: &str) -> anyhow::Result<ApprovalOutcome> {
+        let row: Option<(String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT status, remember FROM pending_approvals WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (status, remember) = row.with_context(|| format!("pending approval 없음: {id}"))?;
+        let status = ApprovalStatus::from_persisted(&status)
+            .with_context(|| format!("알 수 없는 approval status '{status}': {id}"))?;
+        Ok(ApprovalOutcome {
+            status,
+            remember: remember != 0,
+        })
+    }
+
+    /// pending 상태 요청만, 오래된 순으로 (GUI 목록). id는 tie-break(결정적 순서).
+    pub fn list_pending_approvals(&self) -> anyhow::Result<Vec<PendingApprovalRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, server_id, tool_name, arguments_preview, schema_hash, created_at
+             FROM pending_approvals WHERE status = 'pending' ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PendingApprovalRow {
+                id: row.get(0)?,
+                server_id: row.get(1)?,
+                tool_name: row.get(2)?,
+                arguments_preview: row.get(3)?,
+                schema_hash: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// GUI가 결정을 되쓴다. `WHERE id=? AND status='pending'` 단일 UPDATE로
+    /// 이미 해소된 행은 덮어쓰지 않는다(먼저 쓴 결정이 이긴다) — 없거나 이미
+    /// 해소된 id면 조용한 no-op(Ok). resolved_at은 호출측이 넘긴 unix seconds.
+    pub fn resolve_approval(
+        &self,
+        id: &str,
+        allowed: bool,
+        remember: bool,
+        resolved_at: i64,
+    ) -> anyhow::Result<()> {
+        let status = if allowed {
+            ApprovalStatus::Allowed
+        } else {
+            ApprovalStatus::Denied
+        };
+        self.conn
+            .execute(
+                "UPDATE pending_approvals
+                 SET status = ?2, remember = ?3, resolved_at = ?4
+                 WHERE id = ?1 AND status = 'pending'",
+                (id, status.as_str(), remember as i64, resolved_at),
+            )
+            .with_context(|| format!("approval 해소 실패: {id}"))?;
         Ok(())
     }
 
@@ -704,6 +897,92 @@ mod tests {
     }
 
     #[test]
+    fn pending_approval_insert_poll_resolve_라이프사이클() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_pending_approval("req-1", "srv-1", "read_file", "path=/tmp/x", Some("h"), 100)
+            .unwrap();
+        // insert 직후엔 pending
+        assert_eq!(
+            db.poll_approval("req-1").unwrap(),
+            ApprovalOutcome {
+                status: ApprovalStatus::Pending,
+                remember: false,
+            }
+        );
+        // allow + remember로 해소 → poll이 반영
+        db.resolve_approval("req-1", true, true, 200).unwrap();
+        assert_eq!(
+            db.poll_approval("req-1").unwrap(),
+            ApprovalOutcome {
+                status: ApprovalStatus::Allowed,
+                remember: true,
+            }
+        );
+
+        // deny 경로도 확인
+        db.insert_pending_approval("req-2", "srv-1", "delete_file", "path=/tmp/y", None, 101)
+            .unwrap();
+        db.resolve_approval("req-2", false, false, 201).unwrap();
+        assert_eq!(
+            db.poll_approval("req-2").unwrap(),
+            ApprovalOutcome {
+                status: ApprovalStatus::Denied,
+                remember: false,
+            }
+        );
+    }
+
+    #[test]
+    fn list_pending은_pending만_오래된순으로() {
+        let db = Db::open_in_memory().unwrap();
+        // 일부러 뒤섞인 created_at으로 넣어 정렬을 검증
+        db.insert_pending_approval("b", "srv", "t", "prev", None, 300)
+            .unwrap();
+        db.insert_pending_approval("a", "srv", "t", "prev", Some("hh"), 100)
+            .unwrap();
+        db.insert_pending_approval("c", "srv", "t", "prev", None, 200)
+            .unwrap();
+        // c를 해소하면 목록에서 빠진다
+        db.resolve_approval("c", true, false, 400).unwrap();
+
+        let rows = db.list_pending_approvals().unwrap();
+        let ids: Vec<_> = rows.iter().map(|r| r.id.as_str()).collect();
+        // pending인 a(100), b(300)만, 오래된 순 → a, b
+        assert_eq!(ids, vec!["a", "b"]);
+        assert_eq!(rows[0].schema_hash.as_deref(), Some("hh"));
+        assert_eq!(rows[1].schema_hash, None);
+        assert_eq!(rows[0].created_at, 100);
+    }
+
+    #[test]
+    fn resolve_두번은_먼저_쓴_결정을_안_덮는다() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_pending_approval("req", "srv", "t", "prev", None, 100)
+            .unwrap();
+        db.resolve_approval("req", true, true, 200).unwrap();
+        // 두 번째 해소(deny)는 no-op — 첫 결정(allow/remember) 유지
+        db.resolve_approval("req", false, false, 300).unwrap();
+        assert_eq!(
+            db.poll_approval("req").unwrap(),
+            ApprovalOutcome {
+                status: ApprovalStatus::Allowed,
+                remember: true,
+            }
+        );
+        // 이미 해소된 행은 목록에 없음
+        assert!(db.list_pending_approvals().unwrap().is_empty());
+    }
+
+    #[test]
+    fn poll_없는_id는_에러() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.poll_approval("nope").is_err());
+        // 없는 id resolve는 조용한 no-op (Ok) — 여전히 행이 없으니 poll은 에러
+        db.resolve_approval("nope", true, false, 100).unwrap();
+        assert!(db.poll_approval("nope").is_err());
+    }
+
+    #[test]
     fn workspace_생성_목록_기본포함() {
         let db = Db::open_in_memory().unwrap();
         let default_id = db.ensure_default_workspace().unwrap();
@@ -796,6 +1075,50 @@ mod tests {
         let db = Db::open(&path).unwrap();
         assert_eq!(db.list_credentials().unwrap().len(), 1);
         drop(db); // Windows: 파일 핸들을 닫아야 삭제 가능
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn 최신_db_재오픈은_마이그레이션_noop() {
+        let dir = std::env::temp_dir().join(format!("deppy-mig-noop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite3");
+        {
+            // 최초 오픈이 최신까지 마이그레이션
+            let db = Db::open(&path).unwrap();
+            assert_eq!(Db::read_user_version(&db.conn).unwrap(), MIGRATIONS.len());
+        }
+        // 재오픈: fast-path no-op, user_version 유지
+        let db = Db::open(&path).unwrap();
+        assert_eq!(Db::read_user_version(&db.conn).unwrap(), MIGRATIONS.len());
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn v8에서_v9로_업그레이드된다() {
+        let dir = std::env::temp_dir().join(format!("deppy-mig-8to9-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite3");
+        // user_version=8 (pending_approvals 이전) 구버전 DB 구성
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..8] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 8).unwrap();
+        }
+        // 오픈 → IMMEDIATE 트랜잭션으로 migration 9 적용
+        let db = Db::open(&path).unwrap();
+        assert_eq!(Db::read_user_version(&db.conn).unwrap(), MIGRATIONS.len());
+        // pending_approvals 테이블이 실제로 사용 가능
+        db.insert_pending_approval("r", "s", "t", "prev", None, 1)
+            .unwrap();
+        assert_eq!(
+            db.poll_approval("r").unwrap().status,
+            ApprovalStatus::Pending
+        );
+        drop(db);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

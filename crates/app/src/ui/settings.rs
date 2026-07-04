@@ -64,6 +64,10 @@ pub fn show(
                         .changed();
                 }
             });
+            // 폴더 트리 사이드바 ON/OFF (file-tree-design §6) — hot toggle, OFF면 리소스 0
+            changed |= ui
+                .checkbox(&mut config.ui.file_tree_enabled, "폴더 트리 사이드바")
+                .changed();
 
             ui.separator();
             ui.heading("Terminal");

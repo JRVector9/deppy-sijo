@@ -29,3 +29,11 @@ secret = { path = "../secret" }
 storage = { path = "../storage" }
 terminal = { path = "../terminal" }
 
+# 파일 트리 사이드바 (docs/file-tree-design.md)
+trash = { workspace = true }
+notify = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# renamex_np(RENAME_EXCL) — 덮어쓰기 금지 rename (§9-5 TOCTOU 회피)
+libc = { workspace = true }
+

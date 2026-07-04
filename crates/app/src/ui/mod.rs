@@ -3,6 +3,7 @@ pub mod approvals;
 pub mod connectors;
 pub mod credentials;
 pub mod env_profiles;
+pub mod file_tree;
 pub mod notifications;
 pub mod settings;
 pub mod workspace;

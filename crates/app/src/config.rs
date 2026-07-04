@@ -13,10 +13,21 @@ pub struct Config {
     pub remote: RemoteConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
     pub theme: Theme,
+    /// 폴더 트리 사이드바 ON/OFF (file-tree-design §6). OFF면 Panel 미생성 + 상태 drop.
+    pub file_tree_enabled: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            theme: Theme::default(),
+            file_tree_enabled: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -164,6 +175,18 @@ mod tests {
         assert_eq!(parsed.ui.theme, Theme::Dark);
         assert_eq!(parsed.terminal.scrollback_lines, 10_000);
         assert_eq!(parsed.performance.output_batch_ms, 25);
+        // 구 config(file_tree_enabled 없음)도 기본 true (§6 serde 기본)
+        assert!(parsed.ui.file_tree_enabled);
+    }
+
+    #[test]
+    fn 파일트리_토글_roundtrip() {
+        let mut c = Config::default();
+        assert!(c.ui.file_tree_enabled); // 기본 켜짐
+        c.ui.file_tree_enabled = false;
+        let text = toml::to_string_pretty(&c).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert!(!parsed.ui.file_tree_enabled);
     }
 
     #[test]

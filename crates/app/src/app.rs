@@ -64,6 +64,10 @@ pub struct App {
     workspaces: Vec<crate::storage::WorkspaceRow>,
     workspaces_open: bool,
     new_workspace_name: String,
+    /// 새 workspace 생성 시 함께 넣을 프로젝트 경로 (FT-0 — 빈 값 허용).
+    new_workspace_path: String,
+    /// 경로 편집 중인 workspace (id, 입력 버퍼) — 한 번에 한 행만.
+    edit_ws_path: Option<(String, String)>,
     /// 삭제 확인 대기 중인 workspace id (2단계 확인 — 실수 방지)
     confirm_delete_ws: Option<String>,
     /// 알림 클릭으로 다른 workspace 전환 후, mux 재구성되면 이동할 (workspace, session).
@@ -79,6 +83,8 @@ pub struct App {
     remote_reveal_token: bool,
     /// known_hosts 표시 캐시 (settings 열 때 lazily 로드, 닫으면 None으로 리셋해 재로드).
     known_hosts_cache: Option<Vec<(String, String)>>,
+    /// 폴더 트리 사이드바 (file-tree-design §6). OFF면 None — Panel 미생성 + 상태 drop(리소스 0).
+    file_tree: Option<ui::file_tree::FileTreeUi>,
 }
 
 impl App {
@@ -151,6 +157,8 @@ impl App {
             workspaces: Vec::new(),
             workspaces_open: false,
             new_workspace_name: String::new(),
+            new_workspace_path: String::new(),
+            edit_ws_path: None,
             confirm_delete_ws: None,
             pending_focus: None,
             pending_shutdowns: Vec::new(),
@@ -158,7 +166,13 @@ impl App {
             remote_error: None,
             remote_reveal_token: false,
             known_hosts_cache: None,
+            file_tree: None,
         };
+        // 파일 트리 헤더(workspace 이름) 표시용 — 시작 시 1회 로드
+        app.refresh_workspaces();
+        if app.config.ui.file_tree_enabled {
+            app.file_tree = Some(app.make_file_tree());
+        }
         // 시작 시 config가 remote를 켜 뒀으면 best-effort로 기동한다 (실패는 log + settings 표시,
         // config는 그대로 두어 다음 실행에 재시도). 자동 시작은 config 저장을 유발하지 않는다.
         if app.config.remote.tls_enabled {
@@ -406,6 +420,8 @@ impl App {
         // 모든 workspace 알림을 유지한다 (background 완료 통지·클릭 이동, codex 리뷰).
         self.agents_ui.clear_pending();
         self.connectors_ui.clear_invoke();
+        // 파일 트리 루트를 새 workspace path로 갱신 (FT-1)
+        self.refresh_file_tree_root();
         self.egui_ctx.request_repaint();
 
         self.evict_warm();
@@ -453,6 +469,32 @@ impl App {
         }
     }
 
+    /// 활성 workspace의 트리 루트 (path 미설정/조회 실패 → None → 안내 표시 §9-2).
+    fn active_tree_root(&self) -> Option<PathBuf> {
+        match self.db.workspace_path(&self.active.id) {
+            Ok(Some(path)) if !path.trim().is_empty() => Some(PathBuf::from(path)),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!("workspace 경로 조회 실패: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// 활성 workspace 기준으로 파일 트리 상태를 새로 만든다 (ON 전환/루트 변경 시).
+    fn make_file_tree(&self) -> ui::file_tree::FileTreeUi {
+        let mut tree = ui::file_tree::FileTreeUi::new(self.egui_ctx.clone());
+        tree.set_root(self.active_tree_root());
+        tree
+    }
+
+    /// 활성 workspace의 트리 루트가 바뀌었을 수 있을 때 (전환/경로 저장) 트리를 재구성한다.
+    fn refresh_file_tree_root(&mut self) {
+        if self.file_tree.is_some() {
+            self.file_tree = Some(self.make_file_tree());
+        }
+    }
+
     fn refresh_workspaces(&mut self) {
         match self.db.list_workspaces() {
             Ok(list) => self.workspaces = list,
@@ -471,6 +513,9 @@ impl App {
         let mut set_confirm: Option<String> = None;
         let mut cancel_confirm = false;
         let mut create = false;
+        // 경로 편집 상태를 잠시 꺼내 로컬로 다룬다 (workspaces 순회와 동시 &mut 회피)
+        let mut edit_ws_path = self.edit_ws_path.take();
+        let mut save_path: Option<(String, String)> = None;
         let deletable = self.workspaces.len() > 1; // 마지막 workspace는 삭제 불가
         egui::Window::new("워크스페이스")
             .open(&mut open)
@@ -502,6 +547,36 @@ impl App {
                             }
                         }
                     });
+                    // 프로젝트 경로 (FT-0): 표시 + 인라인 편집. 파일 트리의 루트가 된다.
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        match &mut edit_ws_path {
+                            Some((id, buffer)) if *id == ws.id => {
+                                ui.label("경로");
+                                ui.add(
+                                    egui::TextEdit::singleline(buffer)
+                                        .hint_text("/path/to/project")
+                                        .desired_width(260.0),
+                                );
+                                if ui.button("저장").clicked() {
+                                    save_path = Some((id.clone(), buffer.trim().to_owned()));
+                                    edit_ws_path = None;
+                                } else if ui.button("취소").clicked() {
+                                    edit_ws_path = None;
+                                }
+                            }
+                            _ => {
+                                if ws.path.is_empty() {
+                                    ui.weak("경로 미설정");
+                                } else {
+                                    ui.weak(&ws.path);
+                                }
+                                if ui.small_button("경로 편집").clicked() {
+                                    edit_ws_path = Some((ws.id.clone(), ws.path.clone()));
+                                }
+                            }
+                        }
+                    });
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -511,15 +586,45 @@ impl App {
                         create = true;
                     }
                 });
+                ui.horizontal(|ui| {
+                    ui.label("프로젝트 경로");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_workspace_path)
+                            .hint_text("(선택) /path/to/project")
+                            .desired_width(260.0),
+                    );
+                });
             });
         self.workspaces_open = open;
+        self.edit_ws_path = edit_ws_path;
+
+        if let Some((id, path)) = save_path {
+            match self.db.set_workspace_path(&id, &path) {
+                Ok(()) => {
+                    self.refresh_workspaces();
+                    // 활성 workspace의 경로가 바뀌면 트리 루트도 갱신 (FT-1)
+                    if id == self.active.id {
+                        self.refresh_file_tree_root();
+                    }
+                }
+                Err(e) => tracing::warn!("workspace 경로 저장 실패: {e:#}"),
+            }
+        }
 
         if create {
             let name = self.new_workspace_name.trim().to_owned();
             if !name.is_empty() {
                 match self.db.create_workspace(&name) {
                     Ok(id) => {
+                        // 경로가 입력됐으면 함께 저장 (FT-0 — 실패해도 생성은 유지)
+                        let path = self.new_workspace_path.trim();
+                        if !path.is_empty()
+                            && let Err(e) = self.db.set_workspace_path(&id, path)
+                        {
+                            tracing::warn!("workspace 경로 저장 실패: {e:#}");
+                        }
                         self.new_workspace_name.clear();
+                        self.new_workspace_path.clear();
                         switch_to = Some(id); // 생성 후 바로 전환
                     }
                     Err(e) => tracing::warn!("workspace 생성 실패: {e:#}"),
@@ -760,6 +865,47 @@ impl eframe::App for App {
             });
         });
 
+        // 폴더 트리 사이드바 (FT-1) — CentralPanel보다 먼저 배치해야 한다 (§9-1).
+        // OFF(None)면 Panel 자체를 만들지 않는다 (§6 리소스 0).
+        if self.file_tree.is_some() {
+            let title = self
+                .workspaces
+                .iter()
+                .find(|w| w.id == self.active.id)
+                .map(|w| w.name.clone())
+                .unwrap_or_else(|| "파일".to_owned());
+            let insert_path = self
+                .file_tree
+                .as_mut()
+                .and_then(|tree| tree.panel(ui, &title));
+            // "터미널에 경로 삽입" (FT-3): 포커스된 pane의 세션에 WriteInput —
+            // 파일 트리의 유일한 runtime 접점 (§6).
+            if let Some(path) = insert_path {
+                let session = self.active.workspace_ui.mux().and_then(|mux| {
+                    mux.focused_pane.as_ref().and_then(|focused| {
+                        mux.tabs
+                            .iter()
+                            .flat_map(|tab| &tab.panes)
+                            .find(|pane| &pane.id == focused)
+                            .and_then(|pane| pane.session_id)
+                    })
+                });
+                match session {
+                    Some(session) => {
+                        let bytes = ui::file_tree::shell_quote(&path).into_bytes();
+                        if let Err(e) = self
+                            .active
+                            .runtime
+                            .send_command(runtime::RuntimeCommand::WriteInput { session, bytes })
+                        {
+                            tracing::warn!("경로 삽입 실패: {e:#}");
+                        }
+                    }
+                    None => tracing::info!("경로 삽입: 활성 터미널 세션 없음 — 무시"),
+                }
+            }
+        }
+
         // 워크스페이스 전환/생성 (switch는 워커 shutdown+recreate라 window closure 밖에서)
         self.workspaces_window(ui.ctx());
 
@@ -907,6 +1053,14 @@ impl eframe::App for App {
         if out.config_changed {
             // hot reload: 테마는 즉시 적용
             ui.ctx().set_theme(self.config.ui.theme.to_egui());
+            // 폴더 트리 hot toggle (§6): OFF → 상태 drop(리소스 0), ON → 즉시 생성
+            if self.config.ui.file_tree_enabled != self.file_tree.is_some() {
+                self.file_tree = self
+                    .config
+                    .ui
+                    .file_tree_enabled
+                    .then(|| self.make_file_tree());
+            }
             if let Err(e) = self.config.save(&self.config_path) {
                 tracing::warn!("config 저장 실패: {e:#}");
                 // remote 포트 등은 접근 표면에 영향 — 저장 실패를 UI에도 남긴다 (codex xhigh Low).

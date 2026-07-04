@@ -144,6 +144,8 @@ pub struct CredentialMeta {
 pub struct WorkspaceRow {
     pub id: String,
     pub name: String,
+    /// 프로젝트 루트 경로 (파일 트리 FT-0). 빈 문자열 = 미설정 (기본/구 workspace).
+    pub path: String,
     pub created_at: String,
 }
 
@@ -300,15 +302,41 @@ impl Db {
     pub fn list_workspaces(&self) -> anyhow::Result<Vec<WorkspaceRow>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, name, created_at FROM workspaces ORDER BY created_at")?;
+            .prepare("SELECT id, name, path, created_at FROM workspaces ORDER BY created_at")?;
         let rows = stmt.query_map([], |row| {
             Ok(WorkspaceRow {
                 id: row.get(0)?,
                 name: row.get(1)?,
-                created_at: row.get(2)?,
+                path: row.get(2)?,
+                created_at: row.get(3)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// workspace의 프로젝트 경로를 설정한다 (FT-0 — 컬럼은 v2부터 존재, 값 채움만).
+    pub fn set_workspace_path(&self, id: &str, path: &str) -> anyhow::Result<()> {
+        let affected = self
+            .conn
+            .execute(
+                "UPDATE workspaces
+                 SET path = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE id = ?1",
+                (id, path),
+            )
+            .with_context(|| format!("workspace 경로 저장 실패: {id}"))?;
+        anyhow::ensure!(affected == 1, "workspace 없음: {id}");
+        Ok(())
+    }
+
+    /// workspace의 프로젝트 경로. 없는 id는 None, 미설정은 Some("").
+    pub fn workspace_path(&self, id: &str) -> anyhow::Result<Option<String>> {
+        self.conn
+            .query_row("SELECT path FROM workspaces WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(Into::into)
     }
 
     /// workspace + 그 자식 데이터(세션/mux/env)를 한 트랜잭션으로 삭제한다 (destructive).
@@ -862,6 +890,29 @@ mod tests {
         assert!(ids.contains(&a.as_str()));
         let created = list.iter().find(|w| w.id == a).unwrap();
         assert_eq!(created.name, "프로젝트 A");
+        // 생성 직후 path는 미설정(빈 문자열)
+        assert_eq!(created.path, "");
+    }
+
+    #[test]
+    fn workspace_path_설정_조회_roundtrip() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("트리 대상").unwrap();
+        // 미설정: Some("")
+        assert_eq!(db.workspace_path(&ws).unwrap().as_deref(), Some(""));
+        db.set_workspace_path(&ws, "/Users/me/projects/demo")
+            .unwrap();
+        assert_eq!(
+            db.workspace_path(&ws).unwrap().as_deref(),
+            Some("/Users/me/projects/demo")
+        );
+        // 목록에도 반영된다
+        let list = db.list_workspaces().unwrap();
+        let row = list.iter().find(|w| w.id == ws).unwrap();
+        assert_eq!(row.path, "/Users/me/projects/demo");
+        // 없는 id: set은 에러, 조회는 None
+        assert!(db.set_workspace_path("nope", "/x").is_err());
+        assert_eq!(db.workspace_path("nope").unwrap(), None);
     }
 
     fn sample(id: &str) -> CredentialMeta {

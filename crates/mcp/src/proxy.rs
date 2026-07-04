@@ -188,11 +188,13 @@ fn tools_call_response<F: ToolForwarder, H: PermissionHook>(
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return error_response(id, -32602, "tools/call: name 없음");
     };
-    // arguments는 JSON object 강제 — non-object/누락이면 permission hook을 우회하지
-    // 못하도록 -32602로 거부한다 (field-based 정책이 arguments를 object로 신뢰하도록).
+    // MCP CallToolRequest의 arguments는 optional object다. 누락/null은 no-arg tool 호출로
+    // 보고 빈 object로 정규화한다. 값이 있으면서 object가 아닌 경우(array/string 등)만,
+    // field-based permission hook 우회를 막기 위해 -32602로 거부한다.
     let arguments = match params.get("arguments") {
+        None | Some(Value::Null) => json!({}),
         Some(value) if value.is_object() => value.clone(),
-        _ => return error_response(id, -32602, "tools/call: arguments가 object 아님/누락"),
+        Some(_) => return error_response(id, -32602, "tools/call: arguments가 object 아님"),
     };
 
     match hook.check(name, &arguments) {
@@ -520,14 +522,25 @@ mod tests {
             Some(-32602)
         );
         assert_eq!(call_count.load(Ordering::SeqCst), 0);
+    }
 
-        // arguments 누락도 동일하게 -32602
-        let responses =
-            run_line(r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"x"}}"#);
-        assert_eq!(
-            responses[0].pointer("/error/code").and_then(Value::as_i64),
-            Some(-32602)
-        );
+    #[test]
+    fn arguments_누락은_no_arg_tool로_정상_포워딩() {
+        // MCP arguments는 optional — 누락/null이면 빈 object로 정규화되어 포워딩돼야 한다.
+        for params in [
+            r#"{"name":"x"}"#,
+            r#"{"name":"x","arguments":null}"#,
+            r#"{"name":"x","arguments":{}}"#,
+        ] {
+            let line =
+                format!(r#"{{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{params}}}"#);
+            let responses = run_line(&line);
+            assert!(
+                responses[0].pointer("/result").is_some(),
+                "누락/빈 arguments가 거부됨: {params}"
+            );
+            assert!(responses[0].pointer("/error").is_none());
+        }
     }
 
     #[test]

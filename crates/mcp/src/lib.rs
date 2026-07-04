@@ -5,10 +5,12 @@
 //! 프로토콜/매니저 로직 + DDL 상수 + repository 함수만 제공한다.
 
 mod manager;
+mod proxy;
 mod repo;
 mod transport;
 
 pub use manager::{LocalMcpManager, McpConnection, McpServerConfig, McpTool, PROTOCOL_VERSION};
+pub use proxy::{PermissionHook, ProxyDecision, ToolForwarder, run_proxy};
 pub use repo::{
     McpServerRow, McpToolRow, insert_server, insert_tool, list_servers, list_tools_for_server,
     replace_tools_for_server,

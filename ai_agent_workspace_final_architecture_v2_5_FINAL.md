@@ -818,83 +818,464 @@ remote:
 
 ---
 
-## 9. Crate 구조
+## 9. 폴더 트리 최종안
+
+이 절은 §3(최종 아키텍처)·§10(Crate 의존 방향)을 파일 레벨로 확정한 **목표(end-state) 폴더 구조**다. 현재 저장소는 여기서 부분적으로만 수렴한 상태이며, 수렴 방향과 crate 경계 규칙은 아래 원칙을 따른다.
+
+```text
+- app은 UI만 담당한다.
+- runtime은 UI와 실제 실행/runtime을 잇는 경계다.
+- mux는 workspace/tab/pane/layout/focus만 담당한다.
+- session은 실제 shell/agent/MCP session lifecycle만 담당한다.
+- terminal은 terminal backend abstraction만 담당한다.
+- pty는 portable-pty를 격리한다.
+- env는 project environment domain만 담당하고 storage 구현체를 직접 알지 않는다.
+- storage는 SQLite repository와 redacted log writer를 담당한다.
+- secret은 keyring/secret/redaction을 담당한다.
+- mcp/auth/remote/platform은 독립 crate로 둔다.
+```
+
+## 9.1 전체 폴더 트리
 
 ```text
 agent-workspace/
- ├─ crates/
- │   ├─ app/
- │   ├─ core/
- │   ├─ runtime/
- │   │   ├─ command.rs
- │   │   ├─ event.rs
- │   │   ├─ client.rs
- │   │   ├─ in_process.rs
- │   │   └─ router.rs
- │   │
- │   ├─ mux/
- │   │   ├─ workspace.rs
- │   │   ├─ window.rs
- │   │   ├─ tab.rs
- │   │   ├─ pane.rs
- │   │   ├─ layout_tree.rs
- │   │   ├─ focus.rs
- │   │   ├─ attach.rs
- │   │   ├─ events.rs
- │   │   └─ persistence.rs
- │   │
- │   ├─ session/
- │   │   ├─ session.rs
- │   │   ├─ lifecycle.rs
- │   │   ├─ agent_session.rs
- │   │   ├─ shell_session.rs
- │   │   ├─ mcp_session.rs
- │   │   ├─ io.rs
- │   │   └─ status.rs
- │   │
- │   ├─ terminal/
- │   │   ├─ backend.rs
- │   │   ├─ alacritty_backend.rs
- │   │   ├─ libghostty_backend.rs
- │   │   ├─ viewport_snapshot.rs
- │   │   ├─ change_set.rs
- │   │   ├─ renderer_egui.rs
- │   │   ├─ external_surface.rs
- │   │   ├─ input_mapper.rs
- │   │   └─ selection.rs
- │   │
- │   ├─ pty/
- │   ├─ env/
- │   │   ├─ profile.rs
- │   │   ├─ env_var.rs
- │   │   ├─ resolver.rs
- │   │   ├─ precedence.rs
- │   │   ├─ injection_policy.rs
- │   │   ├─ server_registry.rs
- │   │   ├─ dotenv_import.rs
- │   │   ├─ diff_preview.rs
- │   │   ├─ safety.rs
- │   │   └─ repository.rs
- │   │
- │   ├─ storage/
- │   │   ├─ repositories/
- │   │   │   ├─ env_profile_repo.rs
- │   │   │   ├─ env_var_repo.rs
- │   │   │   ├─ mux_repo.rs
- │   │   │   ├─ session_repo.rs
- │   │   │   └─ audit_repo.rs
- │   │   └─ logs/
- │   │       ├─ redacted_ansi_writer.rs
- │   │       ├─ redacted_plain_text_writer.rs
- │   │       ├─ redacted_event_writer.rs
- │   │       ├─ encrypted_raw_writer.rs
- │   │       └─ rotation.rs
- │   │
- │   ├─ secret/
- │   ├─ mcp/
- │   ├─ auth/
- │   ├─ remote/
- │   └─ platform/
+├─ Cargo.toml
+├─ Cargo.lock
+├─ rust-toolchain.toml
+├─ README.md
+├─ LICENSE
+├─ .gitignore
+├─ .cargo/
+│  └─ config.toml
+│
+├─ crates/
+│  ├─ app/
+│  │  ├─ Cargo.toml
+│  │  └─ src/
+│  │     ├─ main.rs
+│  │     ├─ app.rs
+│  │     ├─ state.rs
+│  │     ├─ update.rs
+│  │     ├─ theme.rs
+│  │     └─ ui/
+│  │        ├─ mod.rs
+│  │        ├─ workspace_sidebar.rs
+│  │        ├─ mux_tab_bar.rs
+│  │        ├─ mux_pane_view.rs
+│  │        ├─ terminal_surface_view.rs
+│  │        ├─ agent_status_bar.rs
+│  │        ├─ notification_center.rs
+│  │        ├─ command_palette.rs
+│  │        ├─ settings/
+│  │        │  ├─ mod.rs
+│  │        │  ├─ general.rs
+│  │        │  ├─ agents.rs
+│  │        │  ├─ credentials.rs
+│  │        │  ├─ project_env.rs
+│  │        │  ├─ terminal.rs
+│  │        │  ├─ performance.rs
+│  │        │  └─ security.rs
+│  │        └─ connector_center/
+│  │           ├─ mod.rs
+│  │           ├─ local_mcp.rs
+│  │           ├─ remote_mcp.rs
+│  │           ├─ oauth.rs
+│  │           └─ permissions.rs
+│  │
+│  ├─ core/
+│  │  ├─ Cargo.toml
+│  │  └─ src/
+│  │     ├─ lib.rs
+│  │     ├─ ids.rs
+│  │     ├─ events.rs
+│  │     ├─ errors.rs
+│  │     ├─ time.rs
+│  │     ├─ config.rs
+│  │     ├─ workspace.rs
+│  │     ├─ agent.rs
+│  │     ├─ command_registry.rs
+│  │     ├─ credential_registry.rs
+│  │     └─ status.rs
+│  │
+│  ├─ runtime/
+│  │  ├─ Cargo.toml
+│  │  └─ src/
+│  │     ├─ lib.rs
+│  │     ├─ command.rs
+│  │     ├─ event.rs
+│  │     ├─ client.rs
+│  │     ├─ in_process.rs
+│  │     ├─ router.rs
+│  │     ├─ supervisor.rs
+│  │     └─ resource_policy.rs
+│  │
+│  ├─ mux/
+│  │  ├─ Cargo.toml
+│  │  └─ src/
+│  │     ├─ lib.rs
+│  │     ├─ workspace.rs
+│  │     ├─ window.rs
+│  │     ├─ tab.rs
+│  │     ├─ pane.rs
+│  │     ├─ layout_tree.rs
+│  │     ├─ focus.rs
+│  │     ├─ attach.rs
+│  │     ├─ events.rs
+│  │     ├─ persistence.rs
+│  │     └─ resource_state.rs
+│  │
+│  ├─ session/
+│  │  ├─ Cargo.toml
+│  │  └─ src/
+│  │     ├─ lib.rs
+│  │     ├─ session.rs
+│  │     ├─ lifecycle.rs
+│  │     ├─ agent_session.rs
+│  │     ├─ shell_session.rs
+│  │     ├─ mcp_session.rs
+│  │     ├─ io.rs
+│  │     ├─ status.rs
+│  │     ├─ status_detector.rs
+│  │     ├─ output_batcher.rs
+│  │     └─ backpressure.rs
+│  │
+│  ├─ terminal/
+│  │  ├─ Cargo.toml
+│  │  └─ src/
+│  │     ├─ lib.rs
+│  │     ├─ backend.rs
+│  │     ├─ render_model.rs
+│  │     ├─ viewport_snapshot.rs
+│  │     ├─ change_set.rs
+│  │     ├─ input_mapper.rs
+│  │     ├─ selection.rs
+│  │     ├─ colors.rs
+│  │     ├─ external_surface.rs
+│  │     ├─ renderer_egui.rs
+│  │     ├─ backends/
+│  │     │  ├─ mod.rs
+│  │     │  ├─ alacritty/
+│  │     │  │  ├─ mod.rs
+│  │     │  │  ├─ backend.rs
+│  │     │  │  ├─ snapshot.rs
+│  │     │  │  └─ input.rs
+│  │     │  └─ libghostty/
+│  │     │     ├─ mod.rs
+│  │     │     ├─ ffi.rs
+│  │     │     ├─ backend.rs
+│  │     │     ├─ surface.rs
+│  │     │     └─ input.rs
+│  │     └─ tests/
+│  │        ├─ ansi_basic.rs
+│  │        ├─ resize.rs
+│  │        ├─ wide_char.rs
+│  │        ├─ bracketed_paste.rs
+│  │        └─ snapshot.rs
+│  │
+│  ├─ pty/
+│  │  ├─ Cargo.toml
+│  │  └─ src/
+│  │     ├─ lib.rs
+│  │     ├─ backend.rs
+│  │     ├─ portable_backend.rs
+│  │     ├─ spawn.rs
+│  │     ├─ reader_thread.rs
+│  │     ├─ writer_handle.rs
+│  │     ├─ resize.rs
+│  │     ├─ process_exit.rs
+│  │     └─ shell_defaults.rs
+│  │
+│  ├─ env/
+│  │  ├─ Cargo.toml
+│  │  └─ src/
+│  │     ├─ lib.rs
+│  │     ├─ profile.rs
+│  │     ├─ env_var.rs
+│  │     ├─ repository.rs
+│  │     ├─ resolver.rs
+│  │     ├─ precedence.rs
+│  │     ├─ injection_policy.rs
+│  │     ├─ server_registry.rs
+│  │     ├─ dotenv_import.rs
+│  │     ├─ dotenv_export.rs
+│  │     ├─ diff_preview.rs
+│  │     └─ safety.rs
+│  │
+│  ├─ storage/
+│  │  ├─ Cargo.toml
+│  │  └─ src/
+│  │     ├─ lib.rs
+│  │     ├─ db.rs
+│  │     ├─ migrations.rs
+│  │     ├─ schema.rs
+│  │     ├─ repositories/
+│  │     │  ├─ mod.rs
+│  │     │  ├─ workspace_repo.rs
+│  │     │  ├─ mux_repo.rs
+│  │     │  ├─ session_repo.rs
+│  │     │  ├─ agent_repo.rs
+│  │     │  ├─ credential_repo.rs
+│  │     │  ├─ env_profile_repo.rs
+│  │     │  ├─ env_var_repo.rs
+│  │     │  ├─ notification_repo.rs
+│  │     │  ├─ mcp_repo.rs
+│  │     │  └─ audit_repo.rs
+│  │     └─ logs/
+│  │        ├─ mod.rs
+│  │        ├─ redacted_ansi_writer.rs
+│  │        ├─ redacted_plain_text_writer.rs
+│  │        ├─ redacted_event_writer.rs
+│  │        ├─ encrypted_raw_writer.rs
+│  │        ├─ rotation.rs
+│  │        └─ scanner.rs
+│  │
+│  ├─ secret/
+│  │  ├─ Cargo.toml
+│  │  └─ src/
+│  │     ├─ lib.rs
+│  │     ├─ secret_string.rs
+│  │     ├─ secret_store.rs
+│  │     ├─ keyring_store.rs
+│  │     ├─ redaction.rs
+│  │     ├─ scanner.rs
+│  │     ├─ env_injection.rs
+│  │     └─ tests/
+│  │        ├─ redaction_tests.rs
+│  │        └─ no_plaintext_tests.rs
+│  │
+│  ├─ mcp/
+│  │  ├─ Cargo.toml
+│  │  └─ src/
+│  │     ├─ lib.rs
+│  │     ├─ local_server.rs
+│  │     ├─ remote_client.rs
+│  │     ├─ stdio_transport.rs
+│  │     ├─ streamable_http.rs
+│  │     ├─ jsonrpc.rs
+│  │     ├─ tool_registry.rs
+│  │     ├─ permission_policy.rs
+│  │     ├─ audit.rs
+│  │     └─ schema_hash.rs
+│  │
+│  ├─ auth/
+│  │  ├─ Cargo.toml
+│  │  └─ src/
+│  │     ├─ lib.rs
+│  │     ├─ oauth_pkce.rs
+│  │     ├─ callback_server.rs
+│  │     ├─ browser_launcher.rs
+│  │     ├─ state_store.rs
+│  │     └─ token_store.rs
+│  │
+│  ├─ remote/
+│  │  ├─ Cargo.toml
+│  │  └─ src/
+│  │     ├─ lib.rs
+│  │     ├─ headless_runtime.rs
+│  │     ├─ mux_server.rs
+│  │     ├─ attach_client.rs
+│  │     ├─ transport.rs
+│  │     ├─ protocol.rs
+│  │     ├─ websocket.rs
+│  │     └─ auth.rs
+│  │
+│  └─ platform/
+│     ├─ Cargo.toml
+│     └─ src/
+│        ├─ lib.rs
+│        ├─ dirs.rs
+│        ├─ notifications.rs
+│        ├─ clipboard.rs
+│        ├─ shell.rs
+│        ├─ process.rs
+│        ├─ browser.rs
+│        └─ os.rs
+│
+├─ migrations/
+│  ├─ 0001_initial.sql
+│  ├─ 0002_credentials.sql
+│  ├─ 0003_project_env.sql
+│  ├─ 0004_mux_layout.sql
+│  ├─ 0005_mcp.sql
+│  ├─ 0006_audit.sql
+│  └─ 0007_remote.sql
+│
+├─ packaging/
+│  ├─ windows/
+│  │  ├─ wix.toml
+│  │  ├─ product.wxs
+│  │  └─ assets/
+│  ├─ macos/
+│  │  ├─ bundle.toml
+│  │  ├─ entitlements.plist
+│  │  └─ assets/
+│  └─ linux/
+│     ├─ appimage/
+│     ├─ deb/
+│     └─ rpm/
+│
+├─ docs/
+│  ├─ architecture.md
+│  ├─ pr-plan.md
+│  ├─ mux.md
+│  ├─ project-env.md
+│  ├─ terminal-backend.md
+│  ├─ runtime-boundary.md
+│  ├─ remote.md
+│  ├─ mcp.md
+│  ├─ security.md
+│  ├─ performance.md
+│  └─ packaging.md
+│
+├─ fixtures/
+│  ├─ terminal/
+│  │  ├─ ansi_basic.txt
+│  │  ├─ wide_char.txt
+│  │  └─ tui_repaint.txt
+│  ├─ redaction/
+│  │  ├─ chunk_boundary.txt
+│  │  ├─ ansi_inserted_secret.txt
+│  │  ├─ base64_secret.txt
+│  │  ├─ url_encoded_secret.txt
+│  │  └─ json_escaped_secret.txt
+│  └─ mcp/
+│     ├─ initialize.json
+│     ├─ tools_list.json
+│     └─ tool_call.json
+│
+├─ xtask/
+│  ├─ Cargo.toml
+│  └─ src/
+│     ├─ main.rs
+│     ├─ check.rs
+│     ├─ package.rs
+│     ├─ smoke.rs
+│     ├─ perf.rs
+│     └─ security_scan.rs
+│
+└─ .github/
+   └─ workflows/
+      ├─ ci.yml
+      ├─ release-windows.yml
+      └─ release-macos.yml
+```
+
+## 9.2 PR별 주요 생성 경로
+
+```text
+PR-00 Project Bootstrap
+  Cargo.toml
+  rust-toolchain.toml
+  crates/app/
+  crates/core/
+  crates/platform/
+  xtask/
+
+PR-01 Settings Shell
+  crates/app/src/ui/settings/
+  crates/core/src/config.rs
+
+PR-02 Secret Store & Credential UI
+  crates/secret/
+  crates/storage/src/repositories/credential_repo.rs
+  crates/app/src/ui/settings/credentials.rs
+
+PR-03 Project Environment Manager
+  crates/env/
+  crates/storage/src/repositories/env_profile_repo.rs
+  crates/storage/src/repositories/env_var_repo.rs
+  crates/app/src/ui/settings/project_env.rs
+
+PR-04 Single Shell PTY
+  crates/pty/
+  crates/platform/src/shell.rs
+
+PR-05 Terminal Backend Abstraction + AlacrittyBackend
+  crates/terminal/
+  fixtures/terminal/
+
+PR-06 Runtime Boundary
+  crates/runtime/
+
+PR-07 Mux Runtime
+  crates/mux/
+
+PR-08 Session Runtime
+  crates/session/
+
+PR-09 Agent Command Registry
+  crates/core/src/agent.rs
+  crates/core/src/command_registry.rs
+  crates/app/src/ui/settings/agents.rs
+
+PR-10 Multi Session Tabs & Panes
+  crates/app/src/ui/mux_tab_bar.rs
+  crates/app/src/ui/mux_pane_view.rs
+  crates/app/src/ui/terminal_surface_view.rs
+
+PR-11 Append-only Redacted Logs
+  crates/storage/src/logs/
+  fixtures/redaction/
+
+PR-12 Status Detector
+  crates/session/src/status_detector.rs
+  crates/core/src/status.rs
+
+PR-13 Notifications
+  crates/platform/src/notifications.rs
+  crates/app/src/ui/notification_center.rs
+
+PR-14 Workspace / Restore
+  crates/storage/src/repositories/workspace_repo.rs
+  crates/storage/src/repositories/mux_repo.rs
+  migrations/0004_mux_layout.sql
+
+PR-15 Local MCP Manager
+  crates/mcp/
+  fixtures/mcp/
+
+PR-16 Tool Permission & Audit
+  crates/mcp/src/permission_policy.rs
+  crates/mcp/src/audit.rs
+  crates/storage/src/repositories/audit_repo.rs
+
+PR-17 Connector Center
+  crates/app/src/ui/connector_center/
+
+PR-18 OAuth PKCE Connector
+  crates/auth/
+
+PR-19 Remote Transport Skeleton
+  crates/remote/
+
+PR-20 Packaging
+  packaging/windows/
+  packaging/macos/
+  packaging/linux/
+
+PR-21 Performance Hardening
+  xtask/src/perf.rs
+  docs/performance.md
+
+PR-22 Security Hardening
+  xtask/src/security_scan.rs
+  docs/security.md
+  fixtures/redaction/
+```
+
+## 9.3 폴더 구조 관리 원칙
+
+```text
+- app crate는 UI만 갖는다.
+- runtime crate는 UI와 core runtime 사이의 유일한 경계다.
+- mux crate는 session process를 직접 실행하지 않는다.
+- session crate는 secret store를 직접 참조하지 않는다.
+- terminal crate는 pty를 직접 소유하지 않는다.
+- pty crate는 terminal backend를 모른다.
+- env crate는 storage 구현체를 모른다. repository trait만 가진다.
+- storage crate가 SQLite repository 구현체를 담당한다.
+- secret crate가 keyring/redaction/scanner를 담당한다.
+- mcp/auth/remote는 app UI 없이 테스트 가능해야 한다.
 ```
 
 ---

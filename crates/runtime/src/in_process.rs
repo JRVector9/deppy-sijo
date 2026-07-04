@@ -642,8 +642,11 @@ impl Worker {
                 // (Suspended/Closed의 PTY 종료는 workspace-close 도입 시 — 지금은 유지)
                 let active = matches!(state, crate::command::WorkspaceRuntimeState::Active);
                 if active && !self.render_active {
-                    // Warm→Active 복귀: 쌓인 화면을 즉시 다시 push
+                    // Warm→Active 복귀: 전체 mux 스냅샷 + 쌓인 화면을 즉시 다시 push.
+                    // workspace 전환 복귀 시 UI가 fresh workspace_ui를 만들 수 있으므로
+                    // tab/pane 구조(MuxUpdated)부터 다시 보내야 재구성된다 (워커-per-ws).
                     self.render_active = true;
+                    self.emit_mux_snapshot();
                     self.push_watched_viewports();
                 } else {
                     self.render_active = active;

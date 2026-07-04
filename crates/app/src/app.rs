@@ -40,6 +40,11 @@ pub struct App {
     frame_stats: crate::perf::FrameStats,
     /// 현재 활성(렌더되는) workspace의 런타임 상태.
     active: WorkspaceRuntime,
+    /// warm workspace들 (전환으로 물러났지만 워커는 계속 실행 — §14.1 Warm). 이벤트는
+    /// drain만 하고(채널 backup 방지) 렌더/알림은 안 한다. 재활성 시 즉시 복귀.
+    warm: std::collections::HashMap<String, WorkspaceRuntime>,
+    /// warm LRU 순서 (앞이 가장 오래됨) — MAX_WARM 초과 시 앞에서부터 Suspended(shutdown).
+    warm_order: Vec<String>,
     egui_ctx: egui::Context,
     db_path: PathBuf,
     logs_base: PathBuf,
@@ -111,6 +116,8 @@ impl App {
             env_profiles_ui: ui::env_profiles::EnvProfilesUi::new(),
             notifications_ui: ui::notifications::NotificationsUi::new(),
             active,
+            warm: std::collections::HashMap::new(),
+            warm_order: Vec::new(),
             frame_stats: crate::perf::FrameStats::new(),
             egui_ctx,
             db_path,
@@ -123,6 +130,10 @@ impl App {
             pending_shutdowns: Vec::new(),
         }
     }
+
+    /// warm 상태로 유지할 최대 workspace 수 (활성 제외). 저-RAM 정책상 작게 — 초과분은
+    /// Suspended(워커 shutdown). active + MAX_WARM개까지 워커가 동시 실행될 수 있다.
+    const MAX_WARM: usize = 2;
 
     /// 한 workspace의 런타임 워커를 만든다: 생성 → wake 구독 → 저장 layout 복원 →
     /// credential redaction 시드. (perf 하네스는 제외 — new()에서 기본 workspace만.)
@@ -188,48 +199,78 @@ impl App {
         }
     }
 
-    /// workspace 전환: 대상 워커를 즉시 만들어 UI 응답성을 유지하고, **옛 워커는
-    /// 백그라운드 스레드에서** shutdown(join+PTY reap)한다 — UI 스레드가 수초 멈추지
-    /// 않게 (codex 리뷰). 비활성 workspace는 런타임을 갖지 않는다 (§14.1 Suspended/Closed).
+    /// workspace 전환 (워커-per-workspace §14.1 Warm): 현재 활성 workspace는 Warm으로
+    /// 내려 워커를 계속 살려 둔다(에이전트 유지). 대상이 warm 풀에 있으면 재사용(즉시 복귀),
+    /// 없으면 새로 만든다. warm 풀이 MAX_WARM을 넘으면 가장 오래된 것을 Suspended(shutdown).
     fn switch_workspace(&mut self, target_id: &str) {
         if target_id == self.active.id {
             return;
         }
-        // 대상 workspace의 이전 워커가 아직 background 정리 중이면 먼저 끝낸다 — 안 그러면
-        // 옛 target 워커와 새 target 워커가 같은 window 행에 동시 save_layout해 layout이
-        // stale로 덮일 수 있다 (codex 리뷰). 다른 workspace 정리는 기다리지 않는다.
+        // 대상이 background 정리 중이면 먼저 끝낸다 (같은 window 행 경합 방지 — codex 리뷰).
         self.join_pending_shutdown(target_id);
-        let old_workspace_id = self.active.id.clone();
-        // 대상 워커를 먼저 만든다 (make_runtime은 블록하지 않음). 옛 워커와 잠시 공존하나
-        // persist workspace_id/PTY가 서로 달라 충돌 없음. 옛 워커의 세션 영속 상태는
-        // 워커가 shutdown 정리 시 스스로 exited로 마감한다 (자기 UUID 행만 — race 없음).
-        let new_rt = Self::make_runtime(
-            &self.config,
-            &self.logs_base,
-            target_id,
-            &self.db_path,
-            &self.redaction,
-            &self.db,
-            &self.egui_ctx,
-        );
-        // 활성 런타임 전체를 교체 — 새 WorkspaceRuntime은 fresh workspace_ui/pending/titles를
-        // 가지므로 별도 초기화가 필요 없다. 옛 것은 꺼내 background에서 정리한다.
-        let old = std::mem::replace(&mut self.active, new_rt);
-        // 런타임에 묶인 pending 상태 정리 (이전 워커의 응답을 못 받음).
-        // MCP invoke도 비운다 — A에서 연 실행/승인이 B의 workspace_id로 감사되면 안 된다.
+
+        // 대상 준비: warm 풀에 있으면 재사용, 없으면 새 워커.
+        let mut new_active = match self.warm.remove(target_id) {
+            Some(rt) => {
+                self.warm_order.retain(|id| id != target_id);
+                rt
+            }
+            None => Self::make_runtime(
+                &self.config,
+                &self.logs_base,
+                target_id,
+                &self.db_path,
+                &self.redaction,
+                &self.db,
+                &self.egui_ctx,
+            ),
+        };
+        // UI 상태는 리셋하지 않는다 — warm 재사용이면 그동안 누적된 pending_events(=lifecycle
+        // 이벤트 포함)를 그대로 ui()가 처리해 exit/status 상태를 재구성해야 하고, workspace_ui는
+        // 마지막 active 상태 + 아래 Active 재emit(전체 mux 스냅샷)으로 최신화된다. (새 워커는
+        // 이미 fresh + RestoreWorkspace라 리셋 불필요.)
+        new_active.render_active = true;
+        let _ = new_active
+            .runtime
+            .send_command(runtime::RuntimeCommand::SetWorkspaceState(
+                runtime::WorkspaceRuntimeState::Active,
+            ));
+
+        // 현재 활성을 Warm으로 내리고 warm 풀에 보관 (워커·세션 계속 실행).
+        let mut old = std::mem::replace(&mut self.active, new_active);
+        let _ = old
+            .runtime
+            .send_command(runtime::RuntimeCommand::SetWorkspaceState(
+                runtime::WorkspaceRuntimeState::Warm,
+            ));
+        old.render_active = false;
+        let old_id = old.id.clone();
+        self.warm.insert(old_id.clone(), old);
+        self.warm_order.push(old_id);
+
+        // pending 상태 정리 (이전 워커 응답 못 받음, 교차-ws 감사 방지)
         self.agents_ui.clear_pending();
         self.connectors_ui.clear_invoke();
         self.notifications_ui = ui::notifications::NotificationsUi::new();
         self.egui_ctx.request_repaint();
 
-        // 옛 워커는 background에서 shutdown(join+PTY reap + 세션 영속 마감)한다 —
-        // UI freeze의 원인이던 부분. 핸들을 보관해 앱 종료 시 join한다(자식 reap 보장).
-        self.pending_shutdowns.retain(|(_, h)| !h.is_finished());
-        let handle = std::thread::spawn(move || {
-            let mut old_runtime = old.runtime;
-            old_runtime.shutdown();
-        });
-        self.pending_shutdowns.push((old_workspace_id, handle));
+        self.evict_warm();
+    }
+
+    /// warm 풀이 MAX_WARM을 넘으면 가장 오래된 것부터 Suspended로 내린다 (워커 shutdown,
+    /// 세션 종료 — §14.1 Suspended). background 스레드에서 정리하고 on_exit에서 join.
+    fn evict_warm(&mut self) {
+        while self.warm_order.len() > Self::MAX_WARM {
+            let evict_id = self.warm_order.remove(0);
+            if let Some(rt) = self.warm.remove(&evict_id) {
+                self.pending_shutdowns.retain(|(_, h)| !h.is_finished());
+                let handle = std::thread::spawn(move || {
+                    let mut runtime = rt.runtime;
+                    runtime.shutdown();
+                });
+                self.pending_shutdowns.push((evict_id, handle));
+            }
+        }
     }
 
     /// 주어진 workspace의 대기 중 background shutdown들을 join한다 (같은 workspace 워커가
@@ -331,6 +372,12 @@ impl App {
             if id != self.active.id {
                 // 이 workspace의 background shutdown이 끝나길 먼저 기다린다 — 워커가
                 // persist/로그를 쓰는 중에 삭제하면 DB 행 재생성·로그 파일 경합이 난다.
+                // warm 풀에서 실행 중이면 먼저 동기 shutdown (워커 정지 후 삭제).
+                if let Some(rt) = self.warm.remove(&id) {
+                    self.warm_order.retain(|w| w != &id);
+                    let mut runtime = rt.runtime;
+                    runtime.shutdown();
+                }
                 self.join_pending_shutdown(&id);
                 match self.db.delete_workspace(&id) {
                     Ok(()) => {
@@ -404,6 +451,11 @@ impl eframe::App for App {
     fn on_exit(&mut self) {
         // worker join까지 동기 대기 — 셸 자식 프로세스 정리(reap) 보장.
         self.active.runtime.shutdown();
+        // warm 워커들도 종료 (계속 실행 중이던 세션들 reap).
+        for (_, rt) in self.warm.drain() {
+            let mut runtime = rt.runtime;
+            runtime.shutdown();
+        }
         // 전환으로 background 정리 중이던 옛 워커들도 끝까지 join한다 — detached
         // 스레드는 프로세스 종료 시 join되지 않아 PTY reap이 중단될 수 있다 (codex 리뷰).
         for (_, handle) in self.pending_shutdowns.drain(..) {
@@ -434,6 +486,15 @@ impl eframe::App for App {
                 // (안 그러면 hidden 중 종료된 pane이 stale/"연결 중…"에 갇힐 수 있다)
                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
             }
+        }
+
+        // warm 워커의 이벤트는 drain해서 그 워커의 pending_events에 '누적'한다 (버리지
+        // 않는다 — SessionExited/StatusChanged 같은 일회성 lifecycle 이벤트를 버리면
+        // 재활성 시 종료된 pane이 실행 중으로 보인다, codex 리뷰). 재활성 시 fresh가 아닌
+        // 이 누적분을 그대로 ui()가 처리해 상태를 재구성한다. 렌더/알림은 활성만.
+        for rt in self.warm.values_mut() {
+            let events = rt.events.drain();
+            rt.pending_events.extend(events);
         }
 
         // 이벤트 drain + 알림 생성은 non-render 경로인 여기서 한다 (§14.1 Warm:

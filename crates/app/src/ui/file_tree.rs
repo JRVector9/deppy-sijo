@@ -7,6 +7,28 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 
+/// 사이드바 세션 목록 항목 (§6 확장 — 좌측 패널은 트리+세션의 workspace 사이드바다,
+/// 2026-07-05). App이 WorkspaceUi 스냅샷에서 조립해 넘긴다.
+pub struct SessionEntry {
+    pub tab: runtime::MuxTabId,
+    pub pane: runtime::MuxPaneId,
+    pub title: String,
+    /// 상태 아이콘 (⏳/✋/✅/❌, 없으면 빈 문자열)
+    pub status: &'static str,
+    pub focused: bool,
+}
+
+/// 사이드바에서 App으로 올라가는 액션.
+pub enum SidebarAction {
+    /// 경로를 포커스된 터미널에 삽입 (FT-3)
+    InsertPath(PathBuf),
+    /// 세션 목록에서 선택 — 해당 tab/pane으로 전환
+    FocusSession {
+        tab: runtime::MuxTabId,
+        pane: runtime::MuxPaneId,
+    },
+}
+
 /// 트리 노드. `children == None`은 아직 나열 안 됨(lazy).
 /// 접으면 children을 버려 캐시는 항상 "펼친 노드"만 유지한다(§3 메모리 상한).
 struct TreeNode {
@@ -363,7 +385,7 @@ impl FileTreeUi {
     /// 좌측 사이드바 렌더 (§6 — `egui::Panel::left`, CentralPanel 앞에서 호출할 것 §9-1).
     /// 반환: "터미널에 경로 삽입" 요청 경로 (호출측 App이 WriteInput으로 전달 — §6
     /// 유일한 runtime 접점을 App에 남긴다).
-    pub fn panel(&mut self, ui: &mut egui::Ui, title: &str) -> Option<PathBuf> {
+    pub fn panel(&mut self, ui: &mut egui::Ui, sessions: &[SessionEntry]) -> Option<SidebarAction> {
         // 접힘 여부와 무관하게 배경 채널을 소비한다 (codex Med-2 — 접힌 채로 워처/조작
         // 채널이 무한 누적되거나 op 완료(in_flight/에러/영구삭제 확인)가 방치되는 것 방지).
         self.pump_watch_events(ui.ctx());
@@ -375,7 +397,7 @@ impl FileTreeUi {
                 .show(ui, |ui| {
                     if ui
                         .small_button("▸")
-                        .on_hover_text("폴더 트리 펼치기")
+                        .on_hover_text("사이드바 펼치기")
                         .clicked()
                     {
                         self.collapsed = false;
@@ -386,18 +408,65 @@ impl FileTreeUi {
         egui::Panel::left("file_tree_panel")
             .resizable(true)
             .default_size(240.0)
-            .show(ui, |ui| self.contents(ui, title))
+            .show(ui, |ui| self.contents(ui, sessions))
             .inner
     }
 
-    fn contents(&mut self, ui: &mut egui::Ui, title: &str) -> Option<PathBuf> {
-        // (워처/백그라운드 채널 수거는 panel()이 접힘 여부와 무관하게 이미 수행했다)
+    /// 루트 경로 표시용 — 홈은 `~`로 축약.
+    fn display_root(&self) -> String {
+        let Some(root) = &self.root else {
+            return String::new();
+        };
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        match home.as_deref().and_then(|h| root.strip_prefix(h).ok()) {
+            Some(rel) if rel.as_os_str().is_empty() => "~".to_owned(),
+            Some(rel) => format!("~/{}", rel.display()),
+            None => root.display().to_string(),
+        }
+    }
 
-        // 헤더: workspace 이름 + 새로고침/숨김 토글/접기 (§6). 헤더 전체가
+    fn contents(&mut self, ui: &mut egui::Ui, sessions: &[SessionEntry]) -> Option<SidebarAction> {
+        // (워처/백그라운드 채널 수거는 panel()이 접힘 여부와 무관하게 이미 수행했다)
+        let mut action: Option<SidebarAction> = None;
+
+        // ── 세션 목록 (workspace 사이드바 §6 확장, 2026-07-05) ──
+        // 현재 workspace의 셸/에이전트를 나열하고 클릭으로 전환한다.
+        if !sessions.is_empty() {
+            ui.add_space(2.0);
+            ui.weak("세션");
+            for entry in sessions {
+                let label = if entry.status.is_empty() {
+                    format!("▸ {}", entry.title)
+                } else {
+                    format!("{} {}", entry.status, entry.title)
+                };
+                let resp = ui.selectable_label(entry.focused, egui::RichText::new(label));
+                if resp.clicked() && !entry.focused {
+                    action = Some(SidebarAction::FocusSession {
+                        tab: entry.tab.clone(),
+                        pane: entry.pane.clone(),
+                    });
+                }
+            }
+            ui.add_space(4.0);
+            ui.separator();
+        }
+
+        // 헤더: 현재 루트 경로(~ 축약) + 새로고침/숨김 토글/접기 (§6). 헤더 전체가
         // 루트로의 드롭 대상이다 (§4 — 루트 영역 dnd_drop_zone).
+        let display_root = self.display_root();
         let (header, root_drop) = ui.dnd_drop_zone::<PathBuf, ()>(egui::Frame::default(), |ui| {
             ui.horizontal(|ui| {
-                ui.strong(title);
+                ui.label("📁");
+                // 우측 컨트롤(접기/새로고침/숨김) 폭을 예약 — 긴 경로가 버튼을
+                // 밀어내지 않게 truncate 라벨의 최대폭을 제한한다 (codex P2).
+                ui.scope(|ui| {
+                    ui.set_max_width((ui.available_width() - 110.0).max(40.0));
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&display_root).strong()).truncate(),
+                    )
+                    .on_hover_text(&display_root);
+                });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .small_button("◂")
@@ -431,11 +500,11 @@ impl FileTreeUi {
             // path 미설정 (§9-2 backfill 강제 없음) — 트리 대신 안내
             ui.weak("프로젝트 경로를 설정하세요");
             ui.weak("(워크스페이스 창 → 경로 편집)");
-            return None;
+            return action;
         }
         if let Some(err) = &self.root_error {
             ui.colored_label(ui.visuals().error_fg_color, err);
-            return None;
+            return action;
         }
 
         // 인라인 편집 상태를 로컬로 꺼낸다 (flat 순회와 동시 &mut 회피, FT-3)
@@ -524,6 +593,21 @@ impl FileTreeUi {
                         continue;
                     }
 
+                    // hover 하이라이트 — 위젯을 그리기 전에 예정 행 rect로 판정해
+                    // 텍스트 아래 배경으로 깐다 (위젯 등록 없이 포인터 포함 검사만).
+                    let row_top = ui.cursor().min.y;
+                    let hover_rect = egui::Rect::from_min_max(
+                        egui::pos2(ui.max_rect().left(), row_top),
+                        egui::pos2(ui.max_rect().right(), row_top + row_height),
+                    );
+                    if ui.rect_contains_pointer(hover_rect) {
+                        ui.painter().rect_filled(
+                            hover_rect,
+                            3.0,
+                            ui.visuals().widgets.hovered.weak_bg_fill,
+                        );
+                    }
+
                     // 행 전체 = 드래그 소스 (payload = 절대 경로, §4). Id는 path 기반(§9-6).
                     let drag_id = egui::Id::new(("file_tree_row", &row.path));
                     let egui::InnerResponse {
@@ -532,14 +616,21 @@ impl FileTreeUi {
                     } = ui.dnd_drag_source(drag_id, row.path.clone(), |ui| {
                         ui.horizontal(|ui| {
                             ui.add_space(row.depth as f32 * 12.0);
+                            // 디자인 (2026-07-05): 캐럿+아이콘+이름, 숨김 항목은 흐리게
                             let text = if row.is_dir {
-                                let caret = if row.expanded { "▾" } else { "▸" };
-                                format!("{caret} {}", row.name)
+                                let caret = if row.expanded { "▼" } else { "▶" };
+                                let icon = if row.expanded { "📂" } else { "📁" };
+                                format!("{caret} {icon} {}", row.name)
                             } else {
-                                format!("\u{2003}{}", row.name) // 파일은 아이콘 없이 이름만(들여쓰기 정렬용 공백)
+                                // 캐럿 자리 공백으로 들여쓰기 정렬
+                                format!("\u{2003} {} {}", file_icon(&row.name), row.name)
                             };
+                            let mut rich = egui::RichText::new(text);
+                            if row.name.starts_with('.') {
+                                rich = rich.weak().italics();
+                            }
                             ui.add(
-                                egui::Label::new(text)
+                                egui::Label::new(rich)
                                     .sense(egui::Sense::click())
                                     .truncate(),
                             )
@@ -676,7 +767,7 @@ impl FileTreeUi {
             None => {}
         }
         // 메뉴 동작 처리 (flat 순회 밖 — &mut self 필요 동작들)
-        let mut insert_path: Option<PathBuf> = None;
+
         match menu_action {
             Some(MenuAction::NewFolder(parent)) => {
                 edit = Some(EditState::NewFolder {
@@ -698,7 +789,7 @@ impl FileTreeUi {
             }
             Some(MenuAction::Delete(path)) => self.spawn_trash(path),
             Some(MenuAction::CopyPath(path)) => ui.ctx().copy_text(path.display().to_string()),
-            Some(MenuAction::InsertPath(path)) => insert_path = Some(path),
+            Some(MenuAction::InsertPath(path)) => action = Some(SidebarAction::InsertPath(path)),
             None => {}
         }
         self.edit = edit;
@@ -744,7 +835,7 @@ impl FileTreeUi {
                 }
             });
         }
-        insert_path
+        action
     }
 
     /// 새 폴더 생성 후 부모를 화면에 반영: 펼쳐져 있으면 재나열, 접혀 있으면 펼친다.
@@ -905,6 +996,16 @@ fn has_hidden_component(root: &std::path::Path, path: &std::path::Path) -> bool 
     rel.components().any(|c| {
         matches!(c, std::path::Component::Normal(name) if name.to_string_lossy().starts_with('.'))
     })
+}
+
+/// 파일 아이콘 — 확장자 몇 가지만 구분 (이미지/문서/그 외).
+fn file_icon(name: &str) -> &'static str {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "heic" => "🖼",
+        "md" | "markdown" => "📘",
+        _ => "📄",
+    }
 }
 
 fn relevant_fs_event(kind: &notify::EventKind) -> bool {
@@ -1633,7 +1734,7 @@ mod tests {
 
         // 접힘 상태로 panel 호출 — 렌더는 생략돼도 채널은 소비돼야 한다 (codex Med-2)
         egui::__run_test_ui(|ui| {
-            assert_eq!(tree.panel(ui, "ws"), None);
+            assert!(tree.panel(ui, &[]).is_none());
         });
 
         assert!(

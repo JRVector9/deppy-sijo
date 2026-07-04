@@ -321,13 +321,12 @@ impl WorkspaceUi {
                 // 덮어 그리지 않게 페인터 클립도 pane 영역으로 줄인다
                 child.set_clip_rect(rect.intersect(ui.clip_rect()));
                 self.render_pane(&mut child, pane_id, mux, config, client);
-                // 포커스된 pane 테두리 — 어느 작업영역이 입력을 받는지 표시
+                // 포커스된 pane 표시 — 상단 한 줄만 (전체 테두리는 시각적으로 과함,
+                // 2026-07-05 사용자 피드백)
                 if mux.focused_pane.as_ref() == Some(pane_id) {
-                    ui.painter().rect_stroke(
-                        rect,
-                        2.0,
-                        egui::Stroke::new(1.5, ui.visuals().selection.stroke.color),
-                        egui::StrokeKind::Inside,
+                    ui.painter().line_segment(
+                        [rect.left_top(), rect.right_top()],
+                        egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
                     );
                 }
             }
@@ -458,6 +457,45 @@ impl WorkspaceUi {
             return;
         };
         let focused = mux.focused_pane.as_ref() == Some(pane_id);
+        // pane 전체 배경 interact — 터미널 위젯보다 먼저 등록해 터미널 밖 영역과
+        // "세션 없음"/"연결 중"(스냅샷 지연) 상태에서도 우클릭 메뉴·드롭이 동작한다
+        // (codex P2). 터미널 위에서는 나중에 등록되는 터미널 위젯이 입력을 받는다.
+        let pane_rect = ui.max_rect();
+        let pane_resp = ui.interact(
+            pane_rect,
+            egui::Id::new(("pane_bg", pane_id)),
+            egui::Sense::click(),
+        );
+        if pane_resp.clicked() && !focused {
+            self.send(
+                client,
+                RuntimeCommand::FocusPane {
+                    pane: pane_id.clone(),
+                },
+            );
+        }
+        self.pane_context_menu(&pane_resp, pane_id, config, client);
+        if pane.session_id.is_some() {
+            if pane_resp
+                .dnd_hover_payload::<std::path::PathBuf>()
+                .is_some()
+            {
+                ui.painter().rect_stroke(
+                    pane_rect,
+                    2.0,
+                    egui::Stroke::new(1.5, ui.visuals().selection.stroke.color),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            if let (Some(session), Some(path)) = (
+                pane.session_id,
+                pane_resp.dnd_release_payload::<std::path::PathBuf>(),
+            ) {
+                let mut bytes = crate::ui::file_tree::shell_quote(&path).into_bytes();
+                bytes.push(b' ');
+                self.send(client, RuntimeCommand::WriteInput { session, bytes });
+            }
+        }
         let Some(session) = pane.session_id else {
             ui.label("(세션 없음)");
             return;
@@ -514,6 +552,24 @@ impl WorkspaceUi {
                 );
             }
         }
+
+        // 파일 트리에서 드래그한 경로를 터미널 위에 드롭 → 입력으로 삽입 (2026-07-05).
+        // hover 테두리는 위 pane 배경 경로가 pane_rect에 그린다.
+        if let Some(path) = output.response.dnd_release_payload::<std::path::PathBuf>() {
+            let mut bytes = crate::ui::file_tree::shell_quote(&path).into_bytes();
+            bytes.push(b' ');
+            self.send(client, RuntimeCommand::WriteInput { session, bytes });
+            if !focused {
+                self.send(
+                    client,
+                    RuntimeCommand::FocusPane {
+                        pane: pane_id.clone(),
+                    },
+                );
+            }
+        }
+        // 터미널 위 우클릭도 같은 메뉴 (터미널 위젯이 topmost라 배경 interact가 못 받음)
+        self.pane_context_menu(&output.response, pane_id, config, client);
 
         // 입력은 focused pane으로만
         if focused && output.response.has_focus() {
@@ -575,6 +631,50 @@ impl WorkspaceUi {
     /// 명령을 보냈거나 spawn 응답 대기 중이면 repaint를 예약한다 —
     /// 느린 spawn(keyring 등)도 응답 이벤트가 올 때까지 폴링이 끊기지 않는다.
     /// show()의 모든 return 경로에서 호출할 것.
+    /// pane 우클릭 메뉴 — 분할/닫기 (2026-07-05, 선택한 pane 단위 제어).
+    fn pane_context_menu(
+        &mut self,
+        resp: &egui::Response,
+        pane_id: &runtime::MuxPaneId,
+        config: &TerminalConfig,
+        client: &dyn RuntimeClient,
+    ) {
+        resp.context_menu(|ui| {
+            if ui.button("분할 │ (좌우)").clicked() {
+                self.send(
+                    client,
+                    RuntimeCommand::SplitPane {
+                        pane: pane_id.clone(),
+                        direction: SplitDirection::Horizontal,
+                        scrollback_lines: config.scrollback_lines as usize,
+                    },
+                );
+                ui.close();
+            }
+            if ui.button("분할 ─ (상하)").clicked() {
+                self.send(
+                    client,
+                    RuntimeCommand::SplitPane {
+                        pane: pane_id.clone(),
+                        direction: SplitDirection::Vertical,
+                        scrollback_lines: config.scrollback_lines as usize,
+                    },
+                );
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("pane 닫기").clicked() {
+                self.send(
+                    client,
+                    RuntimeCommand::ClosePane {
+                        pane: pane_id.clone(),
+                    },
+                );
+                ui.close();
+            }
+        });
+    }
+
     fn flush_command_repaint(&mut self, ctx: &egui::Context) {
         if self.command_sent || self.pending_spawns > 0 {
             self.command_sent = false;
@@ -583,6 +683,32 @@ impl WorkspaceUi {
     }
 
     /// 최신 mux 스냅샷 (알림 센터가 pane 조회·제목에 사용).
+    /// 사이드바 세션 목록용 항목 조립 (2026-07-05 — workspace 사이드바).
+    pub fn session_entries(&self) -> Vec<crate::ui::file_tree::SessionEntry> {
+        let Some(mux) = &self.mux else {
+            return Vec::new();
+        };
+        mux.tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter().map(move |pane| (tab, pane)))
+            .map(|(tab, pane)| {
+                let status = pane
+                    .session_id
+                    .and_then(|s| self.sessions.get(&s))
+                    .and_then(|v| v.status)
+                    .map(status_icon)
+                    .unwrap_or("");
+                crate::ui::file_tree::SessionEntry {
+                    tab: tab.id.clone(),
+                    pane: pane.id.clone(),
+                    title: pane.title.clone(),
+                    status,
+                    focused: mux.focused_pane.as_ref() == Some(&pane.id),
+                }
+            })
+            .collect()
+    }
+
     pub fn mux(&self) -> Option<&Arc<MuxSnapshot>> {
         self.mux.as_ref()
     }

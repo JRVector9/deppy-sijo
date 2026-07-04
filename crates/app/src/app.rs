@@ -906,41 +906,61 @@ impl eframe::App for App {
         // 폴더 트리 사이드바 (FT-1) — CentralPanel보다 먼저 배치해야 한다 (§9-1).
         // OFF(None)면 Panel 자체를 만들지 않는다 (§6 리소스 0).
         if self.file_tree.is_some() {
-            let title = self
-                .workspaces
-                .iter()
-                .find(|w| w.id == self.active.id)
-                .map(|w| w.name.clone())
-                .unwrap_or_else(|| "파일".to_owned());
-            let insert_path = self
+            let sessions = self.active.workspace_ui.session_entries();
+            let sidebar_action = self
                 .file_tree
                 .as_mut()
-                .and_then(|tree| tree.panel(ui, &title));
-            // "터미널에 경로 삽입" (FT-3): 포커스된 pane의 세션에 WriteInput —
-            // 파일 트리의 유일한 runtime 접점 (§6).
-            if let Some(path) = insert_path {
-                let session = self.active.workspace_ui.mux().and_then(|mux| {
-                    mux.focused_pane.as_ref().and_then(|focused| {
-                        mux.tabs
-                            .iter()
-                            .flat_map(|tab| &tab.panes)
-                            .find(|pane| &pane.id == focused)
-                            .and_then(|pane| pane.session_id)
-                    })
-                });
-                match session {
-                    Some(session) => {
-                        let bytes = ui::file_tree::shell_quote(&path).into_bytes();
-                        if let Err(e) = self
+                .and_then(|tree| tree.panel(ui, &sessions));
+            match sidebar_action {
+                // "터미널에 경로 삽입" (FT-3): 포커스된 pane의 세션에 WriteInput —
+                // 파일 트리의 유일한 runtime 접점 (§6).
+                Some(ui::file_tree::SidebarAction::InsertPath(path)) => {
+                    let session = self.active.workspace_ui.mux().and_then(|mux| {
+                        mux.focused_pane.as_ref().and_then(|focused| {
+                            mux.tabs
+                                .iter()
+                                .flat_map(|tab| &tab.panes)
+                                .find(|pane| &pane.id == focused)
+                                .and_then(|pane| pane.session_id)
+                        })
+                    });
+                    match session {
+                        Some(session) => {
+                            let bytes = ui::file_tree::shell_quote(&path).into_bytes();
+                            if let Err(e) = self.active.runtime.send_command(
+                                runtime::RuntimeCommand::WriteInput { session, bytes },
+                            ) {
+                                tracing::warn!("경로 삽입 실패: {e:#}");
+                            }
+                        }
+                        None => tracing::info!("경로 삽입: 활성 터미널 세션 없음 — 무시"),
+                    }
+                }
+                // 세션 목록 클릭 — 해당 tab/pane으로 전환 (workspace 사이드바)
+                Some(ui::file_tree::SidebarAction::FocusSession { tab, pane }) => {
+                    let is_active_tab = self
+                        .active
+                        .workspace_ui
+                        .mux()
+                        .and_then(|m| m.active_tab.clone())
+                        == Some(tab.clone());
+                    if !is_active_tab
+                        && let Err(e) = self
                             .active
                             .runtime
-                            .send_command(runtime::RuntimeCommand::WriteInput { session, bytes })
-                        {
-                            tracing::warn!("경로 삽입 실패: {e:#}");
-                        }
+                            .send_command(runtime::RuntimeCommand::SelectTab { tab })
+                    {
+                        tracing::warn!("탭 전환 실패: {e:#}");
                     }
-                    None => tracing::info!("경로 삽입: 활성 터미널 세션 없음 — 무시"),
+                    if let Err(e) = self
+                        .active
+                        .runtime
+                        .send_command(runtime::RuntimeCommand::FocusPane { pane })
+                    {
+                        tracing::warn!("pane 포커스 실패: {e:#}");
+                    }
                 }
+                None => {}
             }
         }
 

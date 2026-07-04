@@ -25,7 +25,8 @@ struct Subscriber {
     events: Sender<RuntimeEvent>,
     viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>>,
     /// 상태 이벤트(채널) 도착 시 소비자를 깨우는 콜백 — UI가 숨겨져(Warm) repaint가
-    /// 없을 때도 알림/상태를 처리하도록 (§14.1). Viewport(slot)에는 호출하지 않는다.
+    /// 없을 때도 알림/상태를 처리하도록 (§14.1). Viewport(slot)도 깨운다 — push가
+    /// dirty 게이트라 출력이 있을 때만 울리므로 idle 리페인트를 유발하지 않는다.
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -399,6 +400,13 @@ impl Worker {
                         .lock()
                         .expect("viewport slot lock")
                         .insert(*session, event.clone());
+                    // Viewport(출력)도 wake — push는 dirty(이번 tick 새 출력) 게이트라
+                    // idle엔 발생하지 않고, 출력 도착 시에만 UI를 깨운다. 이로써 UI측
+                    // 50ms 상시 폴링(가시+running 시 20fps 리페인트 = idle CPU ~10%)을
+                    // 제거할 수 있다 (가시 상태 상시 리페인트 원인 조사, 2026-07-04).
+                    if let Some(wake) = &subscriber.wake {
+                        wakes.push(Arc::clone(wake));
+                    }
                     true
                 } else if subscriber.events.send(event.clone()).is_ok() {
                     // 상태 이벤트가 채널에 들어감 — 숨겨진 UI도 깨워 처리하게 한다

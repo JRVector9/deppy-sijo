@@ -187,30 +187,11 @@ impl WorkspaceUi {
             return;
         };
 
-        // 실행 중인 세션이 있으면 출력 폴링 유지 — 단 visible(active tab)과
-        // hidden을 구분한다: hidden은 Viewport가 오지 않으므로 50ms 폴링이
-        // 화면에 주는 것이 없고 CPU만 쓴다. 상태/exit 이벤트 수신용으로
-        // 저빈도(500ms)면 충분하다 (codex 리뷰 — idle 셸 1개가 20Hz 영구 repaint).
-        let is_running = |view: Option<&SessionView>| view.is_none_or(|v| v.exit_code.is_none());
-        let visible_running = active_tab
-            .panes
-            .iter()
-            .filter_map(|pane| pane.session_id)
-            .any(|session| is_running(self.sessions.get(&session)));
-        let hidden_running = mux
-            .tabs
-            .iter()
-            .filter(|tab| Some(&tab.id) != mux.active_tab.as_ref())
-            .flat_map(|tab| &tab.panes)
-            .filter_map(|pane| pane.session_id)
-            .any(|session| is_running(self.sessions.get(&session)));
-        if visible_running {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(50));
-        } else if hidden_running {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(500));
-        }
+        // (출력/상태 폴링 제거 — 2026-07-04 상시 리페인트 원인 조사)
+        // 예전엔 "가시+실행 세션 = 50ms 폴링"으로 출력을 끌어왔다(wake가 Viewport를
+        // 깨우지 않던 시절의 안전망) → 가시 idle에서 20fps 리페인트로 CPU ~10%를 상시
+        // 소모했다. 이제 worker의 wake가 Viewport(dirty 게이트)·상태 이벤트 모두를
+        // 깨우므로 폴링이 불필요하다: 출력/상태가 있을 때만 프레임이 돈다.
 
         let rect = ui.available_rect_before_wrap();
         let layout = active_tab.layout.clone();

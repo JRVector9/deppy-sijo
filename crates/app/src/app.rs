@@ -484,6 +484,11 @@ impl App {
     /// 활성 workspace 기준으로 파일 트리 상태를 새로 만든다 (ON 전환/루트 변경 시).
     fn make_file_tree(&self) -> ui::file_tree::FileTreeUi {
         let mut tree = ui::file_tree::FileTreeUi::new(self.egui_ctx.clone());
+        // 앱 자신의 data dir(로그·DB·cert 등) 이벤트는 무시 — 로그 쓰기가 워처로 돌아와
+        // 리페인트를 유발하는 자기-루프 차단 (workspace 루트가 홈 등 넓은 경로일 때).
+        if let Some(data_dir) = self.db_path.parent() {
+            tree.set_watch_ignore(vec![data_dir.to_path_buf()]);
+        }
         tree.set_root(self.active_tree_root());
         tree
     }

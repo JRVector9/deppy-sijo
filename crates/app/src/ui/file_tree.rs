@@ -65,8 +65,19 @@ pub struct FileTreeUi {
     /// FSEvents 워처 (FT-4). Drop이 감시 스레드를 정리한다 — OFF 토글/workspace
     /// 전환/앱 종료 시 FileTreeUi가 drop되며 함께 정리된다.
     watcher: Option<notify::RecommendedWatcher>,
+    /// 현재 감시 중인 디렉터리 집합 = 루트 + 펼친 디렉터리 (각각 **비재귀**). 펼침/접힘에
+    /// 맞춰 sync_watches가 delta로 watch/unwatch한다 — 크고 바쁜 루트(홈, node_modules
+    /// 있는 프로젝트 등)를 재귀 감시할 때 FSEvents firehose로 앱이 유휴에도 3~5fps로
+    /// 영영 안 쉬던 문제를 구조적으로 제거(설계 §3 "펼치는 디렉터리만", 2026-07-04 조사).
+    watched_dirs: std::collections::HashSet<PathBuf>,
     /// 워처 이벤트로 재나열할 부모 디렉터리 채널 (워처 스레드 → UI).
     watch_rx: Option<Receiver<PathBuf>>,
+    /// 워처가 무시할 경로 prefix들 — 앱 자신의 data/log 디렉터리 등. 자기 로그 쓰기가
+    /// 이벤트로 돌아와 리페인트를 유발하는 자기-루프 차단 (리페인트 원인 조사 2026-07-04).
+    watch_ignore: std::sync::Arc<Vec<PathBuf>>,
+    /// 콜백 스레드와 공유하는 show_hidden — 숨김 경로 이벤트는 트리에 보이지도 않으므로
+    /// 무시한다 (홈 디렉터리 루트에서 ~/Library 등 잡음 이벤트 대량 차단).
+    watch_show_hidden: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 스로틀 창 안에 도착해 아직 재나열하지 않은 디렉터리 (dedup 집합 — codex Med-1).
     pending_watch: std::collections::HashSet<PathBuf>,
     /// 마지막 워처 일괄 재나열 시각 — WATCH_RELOAD_MS 미만이면 흡수만 하고 건너뛴다.
@@ -115,7 +126,10 @@ impl FileTreeUi {
             edit: None,
             confirm_delete: None,
             watcher: None,
+            watched_dirs: std::collections::HashSet::new(),
             watch_rx: None,
+            watch_ignore: std::sync::Arc::new(Vec::new()),
+            watch_show_hidden: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_watch: std::collections::HashSet::new(),
             last_watch_reload: std::time::Instant::now(),
         }
@@ -124,6 +138,11 @@ impl FileTreeUi {
     /// 루트 교체 (workspace 전환/경로 변경). 캐시를 버리고 루트만 다시 나열한다.
     /// 루트는 canonicalize해 보관한다 — 트리의 모든 행 경로가 canonical 기준이 되어
     /// 이동 가드(§9-4)·부분 재나열의 경로 비교가 일관된다.
+    /// 워처 무시 prefix 설정 (앱 data dir 등). set_root 이전에 호출.
+    pub fn set_watch_ignore(&mut self, prefixes: Vec<PathBuf>) {
+        self.watch_ignore = std::sync::Arc::new(prefixes);
+    }
+
     pub fn set_root(&mut self, root: Option<PathBuf>) {
         self.root = root.map(|r| r.canonicalize().unwrap_or(r));
         self.root_error = None;
@@ -141,13 +160,14 @@ impl FileTreeUi {
     /// 워처 일괄 재나열 최소 간격(ms) — 이벤트·프레임이 동시에 폭주해도 재나열은 ~3.3Hz.
     const WATCH_RELOAD_MS: u64 = 300;
 
-    /// 루트 감시 시작 (FT-4 — FSEvents/notify, 스레드 1개). 이벤트 도착 시 해당 부모
+    /// 감시자 생성 (FT-4 — FSEvents/notify, 스레드 1개). 실제 감시 대상 디렉터리는
+    /// sync_watches가 루트+펼친 디렉터리로 **비재귀** 등록한다. 이벤트 도착 시 해당 부모
     /// 디렉터리만 채널로 보내고 ~300ms 디바운스로 repaint를 예약한다(폭주 시 일괄 처리).
     /// idle에는 이벤트가 없어 repaint를 유발하지 않는다 (리소스 계약).
     fn start_watcher(&mut self) {
-        use notify::Watcher as _;
         self.watcher = None;
         self.watch_rx = None;
+        self.watched_dirs.clear();
         let Some(root) = self.root.clone() else {
             return;
         };
@@ -156,15 +176,34 @@ impl FileTreeUi {
         }
         let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
         let ctx = self.egui_ctx.clone();
+        let ignore = std::sync::Arc::clone(&self.watch_ignore);
+        let show_hidden = std::sync::Arc::clone(&self.watch_show_hidden);
+        let watch_root = root.clone();
         let handler = move |res: Result<notify::Event, notify::Error>| match res {
             Ok(event) => {
                 if !relevant_fs_event(&event.kind) {
                     return;
                 }
+                let mut sent = false;
                 for path in &event.paths {
+                    // 자기-루프/잡음 차단: 앱 data dir 등 무시 prefix 하위는 버린다.
+                    if ignore.iter().any(|p| path.starts_with(p)) {
+                        continue;
+                    }
+                    // 숨김 경로는 트리에 표시되지 않으므로(토글 off) 이벤트도 무의미 —
+                    // 홈 루트 감시 시 ~/Library, ~/.* 의 대량 이벤트를 여기서 거른다.
+                    if !show_hidden.load(std::sync::atomic::Ordering::Relaxed)
+                        && has_hidden_component(&watch_root, path)
+                    {
+                        continue;
+                    }
                     if let Some(parent) = path.parent() {
                         let _ = tx.send(parent.to_path_buf());
+                        sent = true;
                     }
+                }
+                if !sent {
+                    return; // 전부 걸러졌으면 리페인트도 깨우지 않는다 (유휴 유지)
                 }
                 // 디바운스 ~300ms: request_repaint_after는 가장 이른 예약만 유지되므로
                 // 이벤트 폭주 중에도 UI는 최대 ~3Hz로 일괄 재나열한다.
@@ -173,17 +212,46 @@ impl FileTreeUi {
             Err(e) => tracing::warn!("파일 감시 이벤트 오류: {e}"),
         };
         match notify::recommended_watcher(handler) {
-            Ok(mut watcher) => match watcher.watch(&root, notify::RecursiveMode::Recursive) {
-                Ok(()) => {
-                    self.watcher = Some(watcher);
-                    self.watch_rx = Some(rx);
-                }
-                Err(e) => {
-                    tracing::warn!("파일 감시 시작 실패 (수동 새로고침으로 동작): {e}");
-                }
-            },
+            Ok(watcher) => {
+                self.watcher = Some(watcher);
+                self.watch_rx = Some(rx);
+                self.sync_watches(); // 루트(+현재 펼침) 비재귀 등록
+            }
             Err(e) => tracing::warn!("파일 감시자 생성 실패 (수동 새로고침으로 동작): {e}"),
         }
+    }
+
+    /// 감시 대상을 현재 트리 상태(루트 + 펼친 디렉터리)와 동기화한다 — 각 디렉터리를
+    /// **비재귀**로 watch/unwatch(delta만). flat이 바뀔 때(펼침/접힘/재나열)마다 호출한다.
+    /// 재귀 감시를 피해 크고 바쁜 서브트리(예: 홈의 ~/Library)의 이벤트 firehose를 차단한다.
+    fn sync_watches(&mut self) {
+        use notify::Watcher as _;
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        // desired = 루트 + 그 직속 항목이 화면에 보이는(펼친) 디렉터리들.
+        let mut desired: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        desired.insert(root);
+        for row in &self.flat {
+            if row.is_dir && row.expanded {
+                desired.insert(row.path.clone());
+            }
+        }
+        if desired == self.watched_dirs {
+            return; // 변화 없음 — watch/unwatch 호출 자체를 생략(유휴 무비용)
+        }
+        let Some(watcher) = self.watcher.as_mut() else {
+            return; // 감시자 미생성 상태(refresh 중) — start_watcher가 이후 동기화한다
+        };
+        for dir in desired.difference(&self.watched_dirs) {
+            if let Err(e) = watcher.watch(dir, notify::RecursiveMode::NonRecursive) {
+                tracing::warn!("파일 감시 추가 실패 {}: {e}", dir.display());
+            }
+        }
+        for dir in self.watched_dirs.difference(&desired) {
+            let _ = watcher.unwatch(dir); // 접힌 디렉터리 — 실패는 무시(이미 사라졌을 수 있음)
+        }
+        self.watched_dirs = desired;
     }
 
     /// 워처 이벤트 수거 + 시간 스로틀 재나열 (FT-4, codex Med-1). 채널은 매 프레임
@@ -255,6 +323,8 @@ impl FileTreeUi {
         if let (Some(root), Some(children)) = (&self.root, &self.children) {
             flatten(children, root, 0, self.show_hidden, &mut self.flat);
         }
+        // 펼침/접힘/재나열로 가시 트리가 바뀌었으니 감시 대상도 맞춘다(delta, 비재귀).
+        self.sync_watches();
     }
 
     /// 디렉터리 행 클릭: 펼침 ↔ 접힘. 펼칠 때만 read_dir(lazy), 접으면 캐시 해제.
@@ -337,6 +407,9 @@ impl FileTreeUi {
                         .on_hover_text("숨김(.) 항목 표시");
                     if hidden.clicked() {
                         self.show_hidden = !self.show_hidden;
+                        // 워처 콜백 스레드와 동기화 (숨김 이벤트 필터)
+                        self.watch_show_hidden
+                            .store(self.show_hidden, std::sync::atomic::Ordering::Relaxed);
                         self.rebuild_flat();
                     }
                 });
@@ -789,6 +862,17 @@ fn parent_dirs(src: &Path, dst: &Path) -> Vec<PathBuf> {
 }
 
 /// 트리에 영향을 주는 fs 이벤트인지 (FT-4). Access(읽기 등) 이벤트는 잡음이라 무시.
+/// root 기준 상대 경로에 숨김(`.`) 컴포넌트가 있는가 — 표시되지 않는 서브트리의 이벤트 판별.
+fn has_hidden_component(root: &std::path::Path, path: &std::path::Path) -> bool {
+    let rel = match path.strip_prefix(root) {
+        Ok(rel) => rel,
+        Err(_) => return false, // 루트 밖(이상 케이스)은 거르지 않음 — 상위에서 ignore로 처리
+    };
+    rel.components().any(|c| {
+        matches!(c, std::path::Component::Normal(name) if name.to_string_lossy().starts_with('.'))
+    })
+}
+
 fn relevant_fs_event(kind: &notify::EventKind) -> bool {
     !matches!(kind, notify::EventKind::Access(_))
 }

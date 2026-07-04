@@ -327,8 +327,20 @@ impl App {
             self.confirm_delete_ws = None;
             // 활성 workspace는 삭제 목록에 뜨지 않으므로 여기 도달하지 않는다 (이중 방어)
             if id != self.workspace_id {
-                if let Err(e) = self.db.delete_workspace(&id) {
-                    tracing::warn!("workspace 삭제 실패: {e:#}");
+                // 이 workspace의 background shutdown이 끝나길 먼저 기다린다 — 워커가
+                // persist/로그를 쓰는 중에 삭제하면 DB 행 재생성·로그 파일 경합이 난다.
+                self.join_pending_shutdown(&id);
+                match self.db.delete_workspace(&id) {
+                    Ok(()) => {
+                        // 로그 디렉터리도 정리 (best-effort — redacted 로그, 실패해도 무해)
+                        let log_dir = self.logs_base.join(&id);
+                        if let Err(e) = std::fs::remove_dir_all(&log_dir)
+                            && e.kind() != std::io::ErrorKind::NotFound
+                        {
+                            tracing::warn!("workspace 로그 삭제 실패 {}: {e:#}", log_dir.display());
+                        }
+                    }
+                    Err(e) => tracing::warn!("workspace 삭제 실패: {e:#}"),
                 }
                 self.refresh_workspaces();
             }

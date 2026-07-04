@@ -5,8 +5,11 @@
 //! 인증/핸드셰이크(v2, protocol.rs): 클라이언트가 첫 프레임으로 ClientHello
 //! (매직/버전/features/토큰)를 보내고 서버가 ServerHello(버전/협상된 features)로
 //! 응답한다 — 토큰은 실행마다 생성, §1.5 "auth required by default". 매직/버전/토큰
-//! 불일치·무응답(5s)은 즉시 종료. **단계 A: delta 미협상이라 이벤트/명령 프레임은
-//! v1과 바이트 동일**(협상된 코덱 Plain).
+//! 불일치·무응답(5s)은 즉시 종료. **단계 B: 양측이 delta viewport를 광고하므로
+//! loopback은 Codec::Delta로 협상**된다 — pump는 세션별 last_sent 대비 viewport를
+//! keyframe/delta로, reader는 recon 상태로 재구성한다(§4). 2-스레드 구조(서버
+//! reader+pump / 클라이언트 writer+reader)는 그대로. delta 미협상 접속(Plain)은
+//! 여전히 v1과 바이트 동일.
 //! public remote는 아직 아니다: bind는 127.0.0.1 고정, attach는 loopback만 허용.
 //! (TLS/delta 스트림은 v1+ — §8.2 "Viewport는 terminal delta로 대체되는 자리")
 //!
@@ -16,6 +19,7 @@
 //! 지금은 loopback 강제가 그 경계다. 와이어 값 검증(validate_command/validate_event)은
 //! 기형 peer 방어일 뿐 권한 통제가 아니다.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,13 +29,16 @@ use std::thread::JoinHandle;
 
 use anyhow::{Context, bail};
 use deppy_core::SessionId;
+use terminal::TerminalViewportSnapshot;
 
 use crate::client::{RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream};
 use crate::command::RuntimeCommand;
 use crate::event::RuntimeEvent;
 use crate::in_process::InProcessRuntimeClient;
 use crate::protocol::{
-    CLIENT_FEATURES, ClientHello, Codec, PROTO_MAGIC, PROTO_VERSION, SERVER_FEATURES, ServerHello,
+    CLIENT_FEATURES, ClientHello, Codec, DecodedCommand, DecodedEvent, PROTO_MAGIC, PROTO_VERSION,
+    SERVER_FEATURES, ServerHello, WireMsg, diff_viewport, encode_request_keyframe, encode_wire_msg,
+    try_apply_delta,
 };
 
 /// 이벤트 pump 폴링 주기 — worker의 output batch와 별개인 전송 주기.
@@ -119,7 +126,7 @@ fn server_handshake(stream: &TcpStream, auth_token: &str) -> Option<Codec> {
         reject();
         return None;
     }
-    // features_ack = 서버 지원 ∩ 클라이언트 요청. 단계 A는 SERVER_FEATURES==0이라 항상 0.
+    // features_ack = 서버 지원 ∩ 클라이언트 요청. 양측이 delta를 광고하면 Codec::Delta.
     let features = SERVER_FEATURES & hello.features;
     let server_hello = ServerHello {
         proto_version: PROTO_VERSION,
@@ -422,19 +429,49 @@ fn serve_connection(
     let conn_done = Arc::new(AtomicBool::new(false));
     let pump_done = Arc::clone(&conn_done);
     let pump_stop = Arc::clone(stop);
+    // reader→pump keyframe 재동기화 채널 (§4.4-5): reader가 RequestKeyframe를 받으면
+    // 여기에 세션을 쌓고, pump는 tick마다 비우며 해당 세션의 last_sent baseline을 버려
+    // 다음 viewport가 keyframe이 되게 한다. 2-스레드 구조는 그대로 — pump가 last_sent를
+    // 단독 소유하므로 이 큐만 스레드 간 공유한다.
+    let keyframe_requests: Arc<Mutex<Vec<SessionId>>> = Arc::default();
+    let pump_keyframe_requests = Arc::clone(&keyframe_requests);
     let pump = std::thread::Builder::new()
         .name("remote-pump".into())
         .spawn(move || {
             let mut stream = pump_stream;
             let mut last_activity = std::time::Instant::now();
+            // 접속별 last_sent: 세션마다 (마지막 송신 seq, 그 스냅샷). Delta diff의 기준선.
+            // Plain 접속에서는 사용되지 않는다(viewport도 encode_event 경로).
+            let mut last_sent: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> =
+                HashMap::new();
             loop {
                 if pump_stop.load(Ordering::SeqCst) || pump_done.load(Ordering::SeqCst) {
                     break;
                 }
+                // RequestKeyframe로 온 세션은 baseline을 버려 다음 viewport가 keyframe이 되게 한다.
+                for session in pump_keyframe_requests
+                    .lock()
+                    .expect("keyframe req lock")
+                    .drain(..)
+                {
+                    last_sent.remove(&session);
+                }
                 let mut sent_event = false;
+                // 이 drain 배치 안에서 종료된 세션 (codex P2). drain()은 상태 이벤트를 먼저,
+                // viewport slot을 나중에 붙이므로(client.rs) 같은 배치의 SessionExited(X)가
+                // 뒤따르는 Viewport(X)보다 앞선다. 그 trailing viewport를 keyframe으로
+                // 인코딩하면 방금 지운 last_sent[X]가 되살아나므로, 종료된 세션의 viewport는
+                // baseline을 만들지 않는 plain full(WireMsg::Event)로 보낸다. 배치마다 리셋.
+                let mut exited_this_batch: HashSet<SessionId> = HashSet::new();
                 for event in receiver.drain() {
-                    // 접속 코덱으로 인코딩. 단계 A(Plain)는 postcard(RuntimeEvent)와 바이트 동일.
-                    let payload = match codec.encode_event(&event) {
+                    // 접속 코덱으로 인코딩. Delta는 viewport를 keyframe/delta로, 나머지는
+                    // WireMsg::Event로. Plain은 postcard(RuntimeEvent)와 바이트 동일.
+                    let payload = match encode_pump_frame(
+                        codec,
+                        &mut last_sent,
+                        &mut exited_this_batch,
+                        &event,
+                    ) {
                         Ok(payload) => payload,
                         Err(e) => {
                             tracing::warn!("remote event 직렬화 실패: {e}");
@@ -483,9 +520,9 @@ fn serve_connection(
     });
     // 상한 초과/EOF/기형 프레임은 None — 접속 종료 (valid frame만 허용).
     while let Some(frame) = read_frame(&mut reader) {
-        // 접속 코덱으로 디코딩. 단계 A(Plain)는 postcard(RuntimeCommand)와 바이트 동일.
+        // 접속 코덱으로 디코딩. Plain은 postcard(RuntimeCommand)와 바이트 동일.
         match codec.decode_command(&frame) {
-            Ok(command) => {
+            Ok(DecodedCommand::Command(command)) => {
                 if let Err(reason) = validate_command(&command) {
                     tracing::warn!("remote 명령 검증 실패({reason}), 접속 종료");
                     break;
@@ -493,6 +530,13 @@ fn serve_connection(
                 if backend.send_command(command).is_err() {
                     break; // worker 종료됨
                 }
+            }
+            Ok(DecodedCommand::RequestKeyframe(session)) => {
+                // pump가 다음 tick에 baseline을 버리고 keyframe을 보내게 한다 (§4.4-5).
+                keyframe_requests
+                    .lock()
+                    .expect("keyframe req lock")
+                    .push(session);
             }
             Err(e) => {
                 // 프로토콜 위반 — 이 접속을 신뢰하지 않는다
@@ -507,14 +551,107 @@ fn serve_connection(
     let _ = pump.join();
 }
 
+/// pump가 한 이벤트를 접속 코덱으로 프레임 payload로 만든다.
+/// Delta 접속의 viewport만 keyframe/delta 특수 처리(last_sent 갱신)하고, 나머지는
+/// 기존 [`Codec::encode_event`] 경로 그대로 — Plain은 이 경로에서도 바이트 동일.
+///
+/// `SessionExited`는 Delta 접속에서 그 세션의 baseline을 [`HashMap::remove`]하고
+/// `exited_this_batch`에 등록한다 — 장기 연결에서 종료된 세션의 snapshot Arc가 last_sent에
+/// 누적되지 않게 (codex P2). 이미 종료된 세션의 trailing Viewport(같은 drain 배치)는
+/// keyframe/delta가 아니라 plain full(`WireMsg::Event`)로 보내 baseline을 되살리지 않는다 —
+/// 최종 출력은 여전히 클라 slot에 전달된다.
+fn encode_pump_frame(
+    codec: Codec,
+    last_sent: &mut HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)>,
+    exited_this_batch: &mut HashSet<SessionId>,
+    event: &RuntimeEvent,
+) -> anyhow::Result<Vec<u8>> {
+    match (codec, event) {
+        (
+            Codec::Delta,
+            RuntimeEvent::Viewport {
+                session,
+                snapshot,
+                bracketed_paste,
+            },
+        ) => {
+            if exited_this_batch.contains(session) {
+                // 이 배치에서 이미 종료된 세션 — baseline을 만들지 않고 전체 스냅샷을 그대로.
+                codec.encode_event(event)
+            } else {
+                encode_viewport_frame(last_sent, *session, snapshot, *bracketed_paste)
+            }
+        }
+        (Codec::Delta, RuntimeEvent::SessionExited { session, .. }) => {
+            exited_this_batch.insert(*session);
+            last_sent.remove(session);
+            codec.encode_event(event)
+        }
+        _ => codec.encode_event(event),
+    }
+}
+
+/// Delta 접속에서 세션 viewport를 last_sent 대비 keyframe/delta로 인코딩하고 baseline을
+/// 갱신한다 (§4.4/§4.7). keyframe 조건: baseline 없음(신규/재구독/RequestKeyframe로 제거됨),
+/// 또는 diff가 폴백(차원·alt-screen 변경/heavy repaint)을 반환. seq는 (접속,세션)마다 단조 증가.
+fn encode_viewport_frame(
+    last_sent: &mut HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)>,
+    session: SessionId,
+    snapshot: &Arc<TerminalViewportSnapshot>,
+    bracketed_paste: bool,
+) -> anyhow::Result<Vec<u8>> {
+    let (wire, new_seq) = match last_sent.get(&session) {
+        Some((prev_seq, prev_snap)) => {
+            let seq = prev_seq + 1;
+            match diff_viewport(prev_snap, snapshot) {
+                Some(delta) => (
+                    WireMsg::ViewportDelta {
+                        session,
+                        seq,
+                        base_seq: *prev_seq,
+                        delta,
+                        bracketed_paste,
+                    },
+                    seq,
+                ),
+                // 차원/alt-screen 변경 또는 heavy repaint → keyframe 폴백.
+                None => (
+                    WireMsg::ViewportKeyframe {
+                        session,
+                        seq,
+                        snapshot: Arc::clone(snapshot),
+                        bracketed_paste,
+                    },
+                    seq,
+                ),
+            }
+        }
+        // baseline 없음 → keyframe(seq 0에서 시작).
+        None => (
+            WireMsg::ViewportKeyframe {
+                session,
+                seq: 0,
+                snapshot: Arc::clone(snapshot),
+                bracketed_paste,
+            },
+            0,
+        ),
+    };
+    let payload = encode_wire_msg(&wire)?;
+    last_sent.insert(session, (new_seq, Arc::clone(snapshot)));
+    Ok(payload)
+}
+
 /// loopback의 RemoteRuntimeServer에 attach하는 클라이언트.
 /// InProcessRuntimeClient와 같은 trait(RuntimeCommandSink/RuntimeEventStream)을
 /// 구현한다 — UI 입장에서 교체 가능 (완료 기준).
 pub struct RemoteRuntimeClient {
-    writer: Mutex<TcpStream>,
+    /// 명령 송신 채널. reader 스레드도 seq gap 시 RequestKeyframe를 이 뮤텍스로 보내므로
+    /// (send_command와 프레임이 뒤섞이지 않게 같은 락 공유) Arc다 — 2-스레드 구조는 그대로.
+    writer: Arc<Mutex<TcpStream>>,
     subscribers: Arc<Mutex<Vec<RemoteSubscriber>>>,
     reader_thread: Option<JoinHandle<()>>,
-    /// 핸드셰이크에서 협상된 접속 코덱 (§3.2). 단계 A는 항상 Plain.
+    /// 핸드셰이크에서 협상된 접속 코덱 (§3.2). loopback은 Delta.
     codec: Codec,
 }
 
@@ -563,30 +700,48 @@ impl RemoteRuntimeClient {
         if server_hello.features & !CLIENT_FEATURES != 0 {
             bail!("remote 서버가 미요청 feature를 ack — 협상 불변식 위반, 접속 거부");
         }
-        // 위 검사로 features ⊆ CLIENT_FEATURES 보장됨 → 코덱 확정 (§3.2). 단계 A는 항상 Plain.
+        // 위 검사로 features ⊆ CLIENT_FEATURES 보장됨 → 코덱 확정 (§3.2). loopback은 Delta.
         let codec = Codec::from_features(server_hello.features);
         let subscribers: Arc<Mutex<Vec<RemoteSubscriber>>> = Arc::default();
+        let writer = Arc::new(Mutex::new(stream));
 
         let reader_subscribers = Arc::clone(&subscribers);
-        let reader_stream = stream.try_clone().context("remote stream clone 실패")?;
+        let reader_writer = Arc::clone(&writer);
+        let reader_stream = writer
+            .lock()
+            .expect("remote writer lock")
+            .try_clone()
+            .context("remote stream clone 실패")?;
         let reader_thread = std::thread::Builder::new()
             .name("remote-events".into())
             .spawn(move || {
                 let mut reader = BufReader::new(reader_stream);
+                // 접속별 재구성 상태 (§4.3): 세션마다 (마지막 적용 seq, 현재 재구성본).
+                // reader가 TCP를 UI 소비와 무관하게 완전히 드레인하므로 delta는 여기서 유실되지 않고,
+                // slot에는 항상 "재구성된 전체 스냅샷"만 담긴다 — UI 계약(전체 Viewport)은 불변.
+                let mut recon: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> =
+                    HashMap::new();
+                // seq gap으로 keyframe을 이미 요청한 세션 — keyframe 도착 전까지 delta를 조용히 버려
+                // RequestKeyframe 폭주를 막는다.
+                let mut pending_keyframe: HashSet<SessionId> = HashSet::new();
                 while let Some(frame) = read_frame(&mut reader) {
                     if frame.is_empty() {
-                        continue; // heartbeat(길이 0 프레임) — 이벤트가 아닌 keepalive로 소비
+                        continue; // heartbeat(길이 0 프레임) — decode 전에 소비
                     }
-                    // 접속 코덱으로 디코딩. 단계 A(Plain)는 postcard(RuntimeEvent)와 바이트 동일.
-                    let Ok(event) = codec.decode_event(&frame) else {
+                    // 접속 코덱으로 디코딩. Plain은 postcard(RuntimeEvent)와 바이트 동일.
+                    let Ok(decoded) = codec.decode_event(&frame) else {
                         tracing::warn!("remote 이벤트 프로토콜 위반 — 접속 종료");
                         break;
                     };
-                    if let Err(reason) = validate_event(&event) {
-                        tracing::warn!("remote 이벤트 검증 실패({reason}) — 접속 종료");
+                    if !handle_decoded_event(
+                        decoded,
+                        &reader_subscribers,
+                        &reader_writer,
+                        &mut recon,
+                        &mut pending_keyframe,
+                    ) {
                         break;
                     }
-                    dispatch(&reader_subscribers, event);
                 }
                 // 수신이 죽은 클라이언트가 명령 전송만 성공하는 반쪽 상태 방지 —
                 // 소켓을 양방향으로 닫아 이후 send_command도 실패하게 한다 (codex 리뷰)
@@ -595,11 +750,122 @@ impl RemoteRuntimeClient {
             .context("remote reader thread 생성 실패")?;
 
         Ok(Self {
-            writer: Mutex::new(stream),
+            writer,
             subscribers,
             reader_thread: Some(reader_thread),
             codec,
         })
+    }
+}
+
+/// reader가 디코드한 이벤트 하나를 처리한다 (§4.3/§4.4). 재구성 후 항상 전체 Viewport를
+/// slot에 dispatch — UI는 변함없이 전체 스냅샷만 본다. `false`를 반환하면 접속을 끊는다
+/// (검증 실패/프로토콜 위반). keyframe/delta 재구성 상태(recon)와 재동기화 요청은
+/// 접속 단위(reader 스레드 소유)다.
+fn handle_decoded_event(
+    decoded: DecodedEvent,
+    subscribers: &Arc<Mutex<Vec<RemoteSubscriber>>>,
+    writer: &Mutex<TcpStream>,
+    recon: &mut HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)>,
+    pending_keyframe: &mut HashSet<SessionId>,
+) -> bool {
+    match decoded {
+        DecodedEvent::Event(event) => {
+            if let Err(reason) = validate_event(&event) {
+                tracing::warn!("remote 이벤트 검증 실패({reason}) — 접속 종료");
+                return false;
+            }
+            // 종료된 세션의 재구성 상태를 정리한다 — 장기 연결에서 baseline Arc/pending이
+            // 누적되지 않게 (codex P2). Viewport slot은 receiver.drain()이 프레임마다 비운다.
+            if let RuntimeEvent::SessionExited { session, .. } = &event {
+                recon.remove(session);
+                pending_keyframe.remove(session);
+            }
+            dispatch(subscribers, event);
+        }
+        DecodedEvent::Keyframe {
+            session,
+            seq,
+            snapshot,
+            bracketed_paste,
+        } => {
+            // 전체 기준선 — recon을 세팅하고 그대로 전체 Viewport로 emit.
+            let event = RuntimeEvent::Viewport {
+                session,
+                snapshot: Arc::clone(&snapshot),
+                bracketed_paste,
+            };
+            if let Err(reason) = validate_event(&event) {
+                tracing::warn!("remote keyframe 검증 실패({reason}) — 접속 종료");
+                return false;
+            }
+            recon.insert(session, (seq, snapshot));
+            pending_keyframe.remove(&session);
+            dispatch(subscribers, event);
+        }
+        DecodedEvent::Delta {
+            session,
+            seq,
+            base_seq,
+            delta,
+            bracketed_paste,
+        } => {
+            // base_seq가 현재 재구성 seq와 일치할 때만 적용을 시도한다. try_apply_delta는
+            // 적용 전에 차원/row-index/cells-len을 검증하므로(codex P1) 기형 delta도
+            // 패닉 없이 Err를 돌려준다. get으로 owned 결과만 뽑아 recon 재빌림 충돌을 피한다.
+            let applied = match recon.get(&session) {
+                Some((cur_seq, snap)) if *cur_seq == base_seq => {
+                    Some(try_apply_delta(snap, &delta))
+                }
+                _ => None, // seq gap(신뢰 TCP라 이론상 없지만 방어, §4.4)
+            };
+            match applied {
+                // 정상 적용 → 재구성본을 전체 Viewport로 emit.
+                Some(Ok(reconstructed)) => {
+                    let reconstructed = Arc::new(reconstructed);
+                    let event = RuntimeEvent::Viewport {
+                        session,
+                        snapshot: Arc::clone(&reconstructed),
+                        bracketed_paste,
+                    };
+                    if let Err(reason) = validate_event(&event) {
+                        tracing::warn!("remote delta 재구성 검증 실패({reason}) — 접속 종료");
+                        return false;
+                    }
+                    recon.insert(session, (seq, reconstructed));
+                    dispatch(subscribers, event);
+                }
+                // 기형 delta 또는 seq gap → 패닉/접속종료 대신 gap 복구 경로 재사용:
+                // baseline을 버리고 keyframe 요청, 이후 delta는 keyframe 도착까지 drop.
+                // 요청은 세션당 1회만(폭주 방지).
+                other => {
+                    if let Some(Err(reason)) = other {
+                        tracing::warn!("remote 기형 delta({reason}) — keyframe 재동기화");
+                    }
+                    recon.remove(&session);
+                    if pending_keyframe.insert(session) {
+                        request_keyframe(writer, session);
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// seq gap 재동기화(§4.4): reader 스레드가 RequestKeyframe 제어 프레임을 명령 채널로 보낸다.
+/// send_command와 같은 writer 뮤텍스를 잠가 프레임이 뒤섞이지 않는다. write 실패는 무시 —
+/// 접속이 죽는 중이면 reader가 곧 EOF로 정리한다.
+fn request_keyframe(writer: &Mutex<TcpStream>, session: SessionId) {
+    let payload = match encode_request_keyframe(session) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!("remote RequestKeyframe 직렬화 실패: {e}");
+            return;
+        }
+    };
+    if let Ok(mut stream) = writer.lock() {
+        let _ = write_frame(&mut *stream, &payload);
     }
 }
 
@@ -807,21 +1073,21 @@ mod tests {
         server.shutdown();
     }
 
-    /// v2 핸드셰이크 성공 + 기능 협상 교집합. 서버 지원 집합(SERVER_FEATURES=0)과의
-    /// 교집합이므로, 클라이언트가 아무것도 요청하지 않으면 빈 집합, delta를 요청해도
-    /// 서버 미지원이라 빈 집합이다.
+    /// v2 핸드셰이크 성공 + 기능 협상 교집합. 서버 지원 집합(SERVER_FEATURES=FEAT_DELTA_VIEWPORT)
+    /// 과의 교집합이므로, 클라이언트가 아무것도 요청하지 않으면 빈 집합(Plain), delta를 요청하면
+    /// delta가 협상된다(Delta).
     #[test]
     fn v2_핸드셰이크_성공_및_기능_협상() {
         let server = RemoteRuntimeServer::serve(test_backend("negotiate"), 0).unwrap();
 
-        // 요청 없음(features=0) → 빈 교집합
+        // 요청 없음(features=0) → 빈 교집합 (Plain)
         let mut raw = TcpStream::connect(server.local_addr()).unwrap();
         let hello =
             v2_handshake(&mut raw, server.auth_token().as_bytes(), 0).expect("ServerHello 없음");
         assert_eq!(hello.proto_version, PROTO_VERSION);
         assert_eq!(hello.features, 0, "요청 없으면 협상 결과는 비어야 한다");
 
-        // delta 요청 → 서버 미지원이라 여전히 빈 교집합
+        // delta 요청 → 서버도 지원하므로 delta 협상됨 (Delta)
         let mut raw2 = TcpStream::connect(server.local_addr()).unwrap();
         let hello2 = v2_handshake(
             &mut raw2,
@@ -830,8 +1096,8 @@ mod tests {
         )
         .expect("ServerHello 없음");
         assert_eq!(
-            hello2.features, 0,
-            "서버가 미지원하는 기능은 협상되지 않는다"
+            hello2.features, FEAT_DELTA_VIEWPORT,
+            "양측이 지원하는 delta는 협상된다"
         );
 
         server.shutdown();
@@ -875,7 +1141,7 @@ mod tests {
         let cmd_frame = postcard::to_allocvec(&command).unwrap();
         assert!(matches!(
             Codec::Plain.decode_command(&cmd_frame).unwrap(),
-            RuntimeCommand::SpawnAgent { cols: 80, .. }
+            DecodedCommand::Command(RuntimeCommand::SpawnAgent { cols: 80, .. })
         ));
     }
 
@@ -891,10 +1157,10 @@ mod tests {
             // ClientHello 프레임 소비(내용 무시).
             let mut reader = BufReader::new(sock.try_clone().unwrap());
             let _ = read_frame(&mut reader);
-            // 클라이언트가 요청하지 않은 FEAT_DELTA_VIEWPORT를 ack.
+            // 클라이언트가 요청하지 않은 미래 feature 비트(CLIENT_FEATURES 밖)를 ack.
             let hello = ServerHello {
                 proto_version: PROTO_VERSION,
-                features: FEAT_DELTA_VIEWPORT,
+                features: 1 << 31,
             };
             let payload = postcard::to_allocvec(&hello).unwrap();
             let _ = write_frame(&mut sock, &payload);
@@ -1218,5 +1484,567 @@ mod tests {
         }
         let _ = &mut deadline;
         server.shutdown();
+    }
+
+    // ---- delta viewport 스트리밍 (§4) ----
+
+    use crate::protocol::{RowPatch, ViewportDelta, try_apply_delta};
+    use terminal::{CursorShape, CursorSnapshot, TerminalCell};
+
+    fn cell(c: char) -> TerminalCell {
+        TerminalCell {
+            c,
+            fg: [10, 20, 30],
+            bg: [0, 0, 0],
+            wide: false,
+            wide_spacer: false,
+        }
+    }
+
+    /// cols*rows 그리드 스냅샷을 만든다. `lines[r]`의 각 문자가 셀이 되고 나머지는 공백으로 채운다.
+    fn make_snapshot(
+        cols: u16,
+        rows: u16,
+        lines: &[&str],
+        alt: bool,
+    ) -> Arc<TerminalViewportSnapshot> {
+        let mut cells = Vec::with_capacity(cols as usize * rows as usize);
+        for r in 0..rows as usize {
+            let chars: Vec<char> = lines.get(r).copied().unwrap_or("").chars().collect();
+            for c in 0..cols as usize {
+                cells.push(cell(chars.get(c).copied().unwrap_or(' ')));
+            }
+        }
+        Arc::new(TerminalViewportSnapshot {
+            cols,
+            rows,
+            cursor: CursorSnapshot {
+                col: 0,
+                row: 0,
+                shape: CursorShape::Block,
+                visible: true,
+            },
+            visible_cells: cells.into(),
+            dirty_ranges: Vec::new(),
+            title: None,
+            scroll_offset: 0,
+            is_alt_screen: alt,
+        })
+    }
+
+    /// 네트워크 없이 서버 encode(last_sent) → 클라이언트 reconstruct(recon) 파이프라인을 돈다.
+    /// round_trip은 매 tick의 재구성된 전체 스냅샷을 돌려준다 — source와 == 여야 한다(§4.8).
+    struct DeltaPipe {
+        last_sent: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)>,
+        recon: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)>,
+        keyframes: usize,
+        deltas: usize,
+        last_frame_len: usize,
+    }
+
+    impl DeltaPipe {
+        fn new() -> Self {
+            Self {
+                last_sent: HashMap::new(),
+                recon: HashMap::new(),
+                keyframes: 0,
+                deltas: 0,
+                last_frame_len: 0,
+            }
+        }
+
+        fn round_trip(
+            &mut self,
+            session: SessionId,
+            snap: &Arc<TerminalViewportSnapshot>,
+        ) -> TerminalViewportSnapshot {
+            let frame = encode_viewport_frame(&mut self.last_sent, session, snap, false).unwrap();
+            self.last_frame_len = frame.len();
+            match Codec::Delta.decode_event(&frame).unwrap() {
+                DecodedEvent::Keyframe {
+                    session,
+                    seq,
+                    snapshot,
+                    ..
+                } => {
+                    self.keyframes += 1;
+                    self.recon.insert(session, (seq, Arc::clone(&snapshot)));
+                    (*snapshot).clone()
+                }
+                DecodedEvent::Delta {
+                    session,
+                    seq,
+                    base_seq,
+                    delta,
+                    ..
+                } => {
+                    self.deltas += 1;
+                    let (cur_seq, prev) = self.recon.get(&session).expect("baseline 있어야 함");
+                    assert_eq!(*cur_seq, base_seq, "base_seq가 recon seq와 일치해야 한다");
+                    let new = try_apply_delta(prev, &delta).expect("정상 delta는 적용돼야 한다");
+                    self.recon.insert(session, (seq, Arc::new(new.clone())));
+                    new
+                }
+                DecodedEvent::Event(_) => panic!("viewport가 Event 봉투로 인코딩됨"),
+            }
+        }
+    }
+
+    /// §4.8 왕복 등가성: keyframe → 타이핑 delta들 → 재구성이 매 tick source와 셀 단위 동일.
+    #[test]
+    fn delta_왕복_등가성() {
+        let s = SessionId(1);
+        let mut pipe = DeltaPipe::new();
+
+        let snaps = [
+            make_snapshot(20, 5, &["hello", "world", "", "", ""], false),
+            make_snapshot(20, 5, &["hello!", "world", "", "", ""], false), // row 0 타이핑
+            make_snapshot(20, 5, &["hello!", "world", "line3", "", ""], false), // row 2 타이핑
+            make_snapshot(20, 5, &["hello!", "world", "line3", "", ""], false), // 변화 없음(헤더만)
+        ];
+        for snap in &snaps {
+            let recon = pipe.round_trip(s, snap);
+            assert_eq!(&recon, snap.as_ref(), "재구성이 source와 동일해야 한다");
+        }
+        assert_eq!(pipe.keyframes, 1, "첫 프레임만 keyframe");
+        assert_eq!(pipe.deltas, 3, "이후는 delta");
+    }
+
+    /// 타이핑 delta 프레임이 keyframe 프레임보다 훨씬 작다 (§4.6 대역폭 절감).
+    #[test]
+    fn 타이핑_delta가_keyframe보다_작다() {
+        let s = SessionId(1);
+        let mut pipe = DeltaPipe::new();
+        let base = make_snapshot(80, 24, &["prompt$ "], false);
+        pipe.round_trip(s, &base);
+        let keyframe_len = pipe.last_frame_len;
+
+        // 한 row에 한 글자 타이핑
+        let typed = make_snapshot(80, 24, &["prompt$ a"], false);
+        pipe.round_trip(s, &typed);
+        let delta_len = pipe.last_frame_len;
+
+        assert_eq!(pipe.deltas, 1, "타이핑은 delta여야 한다");
+        assert!(
+            delta_len * 5 < keyframe_len,
+            "타이핑 delta({delta_len}B)는 keyframe({keyframe_len}B)의 1/5 미만이어야 한다"
+        );
+    }
+
+    /// 리사이즈(차원 변경)는 keyframe 폴백 (§4.4-2), 재구성은 새 차원으로 정확.
+    #[test]
+    fn 리사이즈는_keyframe_폴백() {
+        let s = SessionId(1);
+        let mut pipe = DeltaPipe::new();
+        let a = make_snapshot(20, 5, &["hi"], false);
+        assert_eq!(&pipe.round_trip(s, &a), a.as_ref());
+        let b = make_snapshot(30, 5, &["hi there"], false); // cols 변경
+        assert_eq!(&pipe.round_trip(s, &b), b.as_ref());
+        assert_eq!(pipe.keyframes, 2, "리사이즈는 keyframe");
+        assert_eq!(pipe.deltas, 0);
+    }
+
+    /// alt-screen 토글은 keyframe 폴백 (§4.4-3).
+    #[test]
+    fn alt_screen_토글은_keyframe() {
+        let s = SessionId(1);
+        let mut pipe = DeltaPipe::new();
+        let a = make_snapshot(20, 5, &["main"], false);
+        pipe.round_trip(s, &a);
+        let b = make_snapshot(20, 5, &["vim"], true); // is_alt_screen 변경
+        assert_eq!(&pipe.round_trip(s, &b), b.as_ref());
+        assert_eq!(pipe.keyframes, 2, "alt-screen 토글은 keyframe");
+        assert_eq!(pipe.deltas, 0);
+    }
+
+    /// heavy repaint(전체의 60% 이상 변경)는 keyframe 폴백, 소량 변경은 delta (§4.4-4).
+    #[test]
+    fn heavy_repaint는_keyframe_폴백() {
+        let s = SessionId(1);
+        let mut pipe = DeltaPipe::new();
+        let base = make_snapshot(10, 10, &[""; 10], false);
+        pipe.round_trip(s, &base);
+
+        // 2/10 = 20% 변경 → delta
+        let light = make_snapshot(10, 10, &["a", "b"], false);
+        assert_eq!(&pipe.round_trip(s, &light), light.as_ref());
+        assert_eq!(pipe.deltas, 1, "20% 변경은 delta");
+
+        // 8/10 = 80% 변경 → keyframe 폴백
+        let heavy = make_snapshot(10, 10, &["1", "2", "3", "4", "5", "6", "7", "8"], false);
+        assert_eq!(&pipe.round_trip(s, &heavy), heavy.as_ref());
+        assert_eq!(pipe.keyframes, 2, "80% 변경은 keyframe 폴백");
+    }
+
+    /// gap 복구(§4.4): delta 유실로 base_seq가 앞서면 클라이언트가 keyframe을 요청하고,
+    /// 서버는 baseline을 버려 다음 프레임을 keyframe으로 보내 재구성이 복구된다.
+    #[test]
+    fn delta_gap_복구() {
+        let s = SessionId(1);
+        let mut last_sent: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> =
+            HashMap::new();
+        let mut recon: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> = HashMap::new();
+
+        // keyframe(seq 0) — 클라이언트 baseline 세팅
+        let s0 = make_snapshot(20, 5, &["a"], false);
+        let f0 = encode_viewport_frame(&mut last_sent, s, &s0, false).unwrap();
+        let DecodedEvent::Keyframe { seq, snapshot, .. } = Codec::Delta.decode_event(&f0).unwrap()
+        else {
+            panic!("첫 프레임은 keyframe");
+        };
+        recon.insert(s, (seq, snapshot));
+
+        // 서버가 delta(seq 1)를 보내지만 유실됐다고 가정 — 클라이언트는 못 받는다.
+        let s1 = make_snapshot(20, 5, &["ab"], false);
+        let _lost = encode_viewport_frame(&mut last_sent, s, &s1, false).unwrap();
+
+        // 다음 delta(seq 2, base_seq 1)가 도착 — 클라 recon seq는 0이라 gap.
+        let s2 = make_snapshot(20, 5, &["abc"], false);
+        let f2 = encode_viewport_frame(&mut last_sent, s, &s2, false).unwrap();
+        let DecodedEvent::Delta { base_seq, .. } = Codec::Delta.decode_event(&f2).unwrap() else {
+            panic!("seq 2는 delta");
+        };
+        let (cur_seq, _) = recon.get(&s).unwrap();
+        assert_ne!(*cur_seq, base_seq, "base_seq 불일치(gap) 감지");
+
+        // 클라이언트가 keyframe 요청 → 서버가 baseline 제거(RequestKeyframe 처리와 동일).
+        recon.remove(&s);
+        last_sent.remove(&s);
+
+        // 서버의 다음 viewport → baseline 없어 keyframe → 재구성 복구.
+        let s3 = make_snapshot(20, 5, &["recovered"], false);
+        let f3 = encode_viewport_frame(&mut last_sent, s, &s3, false).unwrap();
+        let DecodedEvent::Keyframe { snapshot, .. } = Codec::Delta.decode_event(&f3).unwrap()
+        else {
+            panic!("복구 프레임은 keyframe");
+        };
+        assert_eq!(
+            snapshot.as_ref(),
+            s3.as_ref(),
+            "keyframe 재구성이 source와 동일"
+        );
+    }
+
+    /// 클라이언트 reader가 gap을 만나면 RequestKeyframe 제어 프레임을 실제 소켓으로 보낸다.
+    /// handle_decoded_event의 gap 분기(§4.4)를 소켓 페어로 검증한다.
+    #[test]
+    fn gap시_request_keyframe_송신() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_sock = TcpStream::connect(addr).unwrap();
+        let (server_sock, _) = listener.accept().unwrap();
+        let writer = Mutex::new(client_sock);
+        let subscribers: Arc<Mutex<Vec<RemoteSubscriber>>> = Arc::default();
+
+        let s = SessionId(7);
+        // 클라이언트 recon seq를 5로 세팅.
+        let base = make_snapshot(10, 3, &["x"], false);
+        let mut recon: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> = HashMap::new();
+        recon.insert(s, (5, base.clone()));
+        let mut pending: HashSet<SessionId> = HashSet::new();
+
+        // base_seq 3 ≠ recon seq 5 → gap.
+        let changed = make_snapshot(10, 3, &["y"], false);
+        let delta = diff_viewport(&base, &changed).unwrap();
+        let cont = handle_decoded_event(
+            DecodedEvent::Delta {
+                session: s,
+                seq: 4,
+                base_seq: 3,
+                delta,
+                bracketed_paste: false,
+            },
+            &subscribers,
+            &writer,
+            &mut recon,
+            &mut pending,
+        );
+        assert!(cont, "gap은 접속을 끊지 않는다");
+        assert!(!recon.contains_key(&s), "gap 시 baseline을 버린다");
+        assert!(pending.contains(&s), "keyframe 요청 pending");
+
+        // 서버 소켓에서 RequestKeyframe 프레임을 읽어 확인.
+        let mut r = BufReader::new(server_sock);
+        let frame = read_frame(&mut r).expect("RequestKeyframe 프레임");
+        match Codec::Delta.decode_command(&frame).unwrap() {
+            DecodedCommand::RequestKeyframe(got) => assert_eq!(got, s),
+            _ => panic!("RequestKeyframe여야 한다"),
+        }
+    }
+
+    /// 소켓 페어 (클라이언트, 서버) — reader 경로 테스트에서 writer로 쓴다.
+    fn socket_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
+
+    /// try_apply_delta는 기형 delta(차원 불일치 / row 범위 밖 / cells 수 불일치)를 패닉 없이
+    /// Err로 거른다 (codex P1). 어떤 입력에도 인덱스 out-of-bounds가 없어야 한다.
+    #[test]
+    fn try_apply_delta_기형은_err() {
+        let base = make_snapshot(4, 2, &["ab", "cd"], false);
+        let ok_cursor = CursorSnapshot {
+            col: 0,
+            row: 0,
+            shape: CursorShape::Block,
+            visible: true,
+        };
+        let mk = |cols: u16, rows: u16, rows_patch: Vec<RowPatch>| ViewportDelta {
+            cols,
+            rows,
+            cursor: ok_cursor,
+            scroll_offset: 0,
+            is_alt_screen: false,
+            title: None,
+            changed_rows: rows_patch,
+        };
+
+        // 차원 불일치
+        assert!(try_apply_delta(&base, &mk(8, 2, vec![])).is_err());
+        // row 인덱스 범위 밖
+        assert!(
+            try_apply_delta(
+                &base,
+                &mk(
+                    4,
+                    2,
+                    vec![RowPatch {
+                        row: 9,
+                        cells: vec![cell('z'); 4]
+                    }]
+                )
+            )
+            .is_err()
+        );
+        // patch cells 수가 cols와 불일치
+        assert!(
+            try_apply_delta(
+                &base,
+                &mk(
+                    4,
+                    2,
+                    vec![RowPatch {
+                        row: 0,
+                        cells: vec![cell('z'); 2]
+                    }]
+                )
+            )
+            .is_err()
+        );
+        // 정상 delta는 Ok
+        assert!(
+            try_apply_delta(
+                &base,
+                &mk(
+                    4,
+                    2,
+                    vec![RowPatch {
+                        row: 1,
+                        cells: vec![cell('z'); 4]
+                    }]
+                )
+            )
+            .is_ok()
+        );
+    }
+
+    /// 원격 peer가 보낸 기형 delta를 reader가 받으면 패닉/접속종료 대신 baseline을 버리고
+    /// keyframe을 재요청한다 (codex P1). handle_decoded_event의 malformed 분기를 소켓 페어로 검증.
+    #[test]
+    fn 기형_delta는_패닉없이_keyframe재동기화() {
+        let (client_sock, server_sock) = socket_pair();
+        let writer = Mutex::new(client_sock);
+        let subscribers: Arc<Mutex<Vec<RemoteSubscriber>>> = Arc::default();
+
+        let s = SessionId(3);
+        // recon seq 0으로 baseline 세팅 — base_seq는 일치시키되 delta 내용만 기형으로.
+        let base = make_snapshot(10, 3, &["x"], false);
+        let mut recon: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> = HashMap::new();
+        recon.insert(s, (0, base));
+        let mut pending: HashSet<SessionId> = HashSet::new();
+
+        // base_seq 0(일치)이지만 row가 범위 밖 + cells 수 불일치 → try_apply_delta가 Err.
+        let malformed = ViewportDelta {
+            cols: 10,
+            rows: 3,
+            cursor: CursorSnapshot {
+                col: 0,
+                row: 0,
+                shape: CursorShape::Block,
+                visible: true,
+            },
+            scroll_offset: 0,
+            is_alt_screen: false,
+            title: None,
+            changed_rows: vec![RowPatch {
+                row: 99,
+                cells: vec![cell('z')],
+            }],
+        };
+        let cont = handle_decoded_event(
+            DecodedEvent::Delta {
+                session: s,
+                seq: 1,
+                base_seq: 0,
+                delta: malformed,
+                bracketed_paste: false,
+            },
+            &subscribers,
+            &writer,
+            &mut recon,
+            &mut pending,
+        );
+        assert!(cont, "기형 delta는 접속을 끊지 않는다");
+        assert!(!recon.contains_key(&s), "기형 delta 시 baseline을 버린다");
+        assert!(pending.contains(&s), "keyframe 재요청 pending");
+
+        let mut r = BufReader::new(server_sock);
+        let frame = read_frame(&mut r).expect("RequestKeyframe 프레임");
+        assert!(matches!(
+            Codec::Delta.decode_command(&frame).unwrap(),
+            DecodedCommand::RequestKeyframe(got) if got == s
+        ));
+    }
+
+    /// SessionExited는 서버 pump의 last_sent에서 그 세션 baseline을 제거한다 (codex P2).
+    #[test]
+    fn session_exited는_서버_last_sent_정리() {
+        let s = SessionId(5);
+        let mut last_sent: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> =
+            HashMap::new();
+        let snap = make_snapshot(10, 3, &["a"], false);
+        encode_viewport_frame(&mut last_sent, s, &snap, false).unwrap();
+        assert!(last_sent.contains_key(&s), "keyframe이 baseline을 남긴다");
+
+        let exit = RuntimeEvent::SessionExited {
+            session: s,
+            exit_code: Some(0),
+        };
+        let mut exited = HashSet::new();
+        encode_pump_frame(Codec::Delta, &mut last_sent, &mut exited, &exit).unwrap();
+        assert!(
+            !last_sent.contains_key(&s),
+            "SessionExited가 서버 baseline을 정리한다"
+        );
+        assert!(exited.contains(&s), "종료 세션이 배치 집합에 등록된다");
+    }
+
+    /// 같은 drain 배치의 [SessionExited(X), Viewport(X)]에서 trailing viewport가 종료 세션의
+    /// baseline을 되살리지 않는다 (codex P2). 그래도 최종 출력은 클라 slot에 emit된다.
+    #[test]
+    fn 종료_배치의_trailing_viewport는_baseline_되살리지_않는다() {
+        let s = SessionId(8);
+        // 이전 tick의 keyframe으로 양쪽에 baseline이 있었다고 가정.
+        let mut last_sent: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> =
+            HashMap::new();
+        let snap0 = make_snapshot(10, 3, &["a"], false);
+        encode_viewport_frame(&mut last_sent, s, &snap0, false).unwrap();
+        assert!(last_sent.contains_key(&s));
+
+        // 종료 tick: drain 순서대로 SessionExited(X) 먼저, Viewport(X) 나중.
+        let mut exited: HashSet<SessionId> = HashSet::new();
+        let exit_ev = RuntimeEvent::SessionExited {
+            session: s,
+            exit_code: Some(0),
+        };
+        let final_snap = make_snapshot(10, 3, &["bye"], false);
+        let vp_ev = RuntimeEvent::Viewport {
+            session: s,
+            snapshot: Arc::clone(&final_snap),
+            bracketed_paste: false,
+        };
+        let exit_frame =
+            encode_pump_frame(Codec::Delta, &mut last_sent, &mut exited, &exit_ev).unwrap();
+        let vp_frame =
+            encode_pump_frame(Codec::Delta, &mut last_sent, &mut exited, &vp_ev).unwrap();
+
+        // 서버: 종료 세션 baseline이 되살아나지 않는다.
+        assert!(
+            !last_sent.contains_key(&s),
+            "trailing viewport가 서버 baseline을 되살리면 안 된다"
+        );
+        // 종료 세션의 viewport는 keyframe/delta가 아니라 plain full(WireMsg::Event)로 나간다.
+        assert!(
+            matches!(
+                Codec::Delta.decode_event(&vp_frame).unwrap(),
+                DecodedEvent::Event(RuntimeEvent::Viewport { .. })
+            ),
+            "종료 세션 viewport는 plain Event여야 한다"
+        );
+
+        // 클라이언트: slot을 관찰할 실제 구독자 하나를 붙이고 두 프레임을 순서대로 처리한다.
+        let (client_sock, _server) = socket_pair();
+        let writer = Mutex::new(client_sock);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let slot: Arc<Mutex<HashMap<SessionId, RuntimeEvent>>> = Arc::default();
+        let subscribers: Arc<Mutex<Vec<RemoteSubscriber>>> =
+            Arc::new(Mutex::new(vec![RemoteSubscriber {
+                events: tx,
+                viewports: Arc::clone(&slot),
+            }]));
+        let mut recon: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> = HashMap::new();
+        recon.insert(s, (0, snap0)); // 클라도 baseline이 있었음
+        let mut pending: HashSet<SessionId> = HashSet::new();
+
+        let dec_exit = Codec::Delta.decode_event(&exit_frame).unwrap();
+        handle_decoded_event(dec_exit, &subscribers, &writer, &mut recon, &mut pending);
+        assert!(
+            !recon.contains_key(&s),
+            "SessionExited가 클라 recon을 정리한다"
+        );
+
+        let dec_vp = Codec::Delta.decode_event(&vp_frame).unwrap();
+        handle_decoded_event(dec_vp, &subscribers, &writer, &mut recon, &mut pending);
+        assert!(
+            !recon.contains_key(&s),
+            "trailing viewport가 클라 recon을 되살리면 안 된다"
+        );
+
+        // 그래도 최종 출력 viewport는 slot에 emit돼 화면에 보인다.
+        let emitted = slot.lock().unwrap();
+        match emitted.get(&s) {
+            Some(RuntimeEvent::Viewport { snapshot, .. }) => {
+                assert_eq!(
+                    snapshot.as_ref(),
+                    final_snap.as_ref(),
+                    "최종 viewport가 slot에 emit"
+                )
+            }
+            _ => panic!("최종 viewport가 slot에 emit돼야 한다"),
+        }
+    }
+
+    /// SessionExited는 클라이언트 reader의 recon/pending_keyframe에서 그 세션을 제거한다 (codex P2).
+    #[test]
+    fn session_exited는_클라_recon_정리() {
+        let (client_sock, _server) = socket_pair();
+        let writer = Mutex::new(client_sock);
+        let subscribers: Arc<Mutex<Vec<RemoteSubscriber>>> = Arc::default();
+
+        let s = SessionId(6);
+        let mut recon: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> = HashMap::new();
+        recon.insert(s, (2, make_snapshot(10, 3, &["a"], false)));
+        let mut pending: HashSet<SessionId> = HashSet::new();
+        pending.insert(s);
+
+        let cont = handle_decoded_event(
+            DecodedEvent::Event(RuntimeEvent::SessionExited {
+                session: s,
+                exit_code: None,
+            }),
+            &subscribers,
+            &writer,
+            &mut recon,
+            &mut pending,
+        );
+        assert!(cont);
+        assert!(
+            !recon.contains_key(&s),
+            "SessionExited가 클라 recon을 정리한다"
+        );
+        assert!(!pending.contains(&s), "SessionExited가 pending을 정리한다");
     }
 }

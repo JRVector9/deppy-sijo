@@ -8,7 +8,7 @@ mod log;
 mod policy;
 
 pub use crypto::{decrypt_input, encrypt_input};
-pub use log::{AuditRecord, record_audit};
+pub use log::{AuditRecord, mask_sensitive_keys, record_audit};
 pub use policy::{
     ApprovalReason, PermissionPolicy, PermissionRule, PolicyEvaluation, ToolApprovalRequest,
     ToolDecision,

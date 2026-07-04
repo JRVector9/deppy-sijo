@@ -72,8 +72,10 @@ fn is_sensitive_key(key: &str) -> bool {
         .any(|part| normalized.contains(part))
 }
 
-/// 민감 key의 값 전체(중첩 포함)를 "[REDACTED]" 문자열로 치환한다
-fn mask_sensitive_keys(value: &mut serde_json::Value) {
+/// 민감 key의 값 전체(중첩 포함)를 "[REDACTED]" 문자열로 치환한다.
+/// audit 로그뿐 아니라 proxy 승인 미리보기 등에서도 미등록 secret 평문 저장을 막기 위해
+/// 공개한다.
+pub fn mask_sensitive_keys(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
             // 헤더류 {"name":"Authorization","value":"Bearer …"} 패턴 — name/key/header의

@@ -48,19 +48,31 @@ impl DbPermissionHook {
         }
     }
 
-    /// (server_id, tool)의 현재 규칙을 DB에서 새로 읽는다. 행이 없거나 알 수 없는 문자열이면
-    /// 기본값 Ask. 조회 실패는 Err(호출측이 fail-closed 거부).
-    fn current_rule(&self, tool_name: &str) -> anyhow::Result<PermissionRule> {
+    /// (server_id, tool)의 현재 규칙과 규칙에 바인딩된 승인 schema_hash를 DB에서 새로 읽는다.
+    /// 행이 없거나 알 수 없는 문자열이면 기본값 (Ask, None). 조회 실패는 Err(fail-closed 거부).
+    fn current_rule(&self, tool_name: &str) -> anyhow::Result<(PermissionRule, Option<String>)> {
         let rules = self.db.list_permission_rules()?;
         Ok(rules
             .iter()
             .find(|r| r.server_id == self.server_id && r.tool_name == tool_name)
-            .and_then(|r| PermissionRule::from_persisted(&r.rule))
-            .unwrap_or_default())
+            .map(|r| {
+                (
+                    PermissionRule::from_persisted(&r.rule).unwrap_or_default(),
+                    r.approved_schema_hash.clone(),
+                )
+            })
+            .unwrap_or((PermissionRule::default(), None)))
     }
 
     /// 해당 tool의 저장된 input schema에서 schema_hash를 계산한다.
     /// tool 행/스키마가 없으면 None (pending은 schema_hash 없이 등록된다).
+    ///
+    /// 한계(문서화): 여기서 쓰는 스키마는 GUI tool 탐색이 채우는 **mcp_tools 캐시**다.
+    /// 백엔드가 캐시 갱신 없이 스키마를 바꾸면 이 해시가 낡아 SchemaChanged 재승인이
+    /// 다음 GUI 재탐색까지 늦어질 수 있다. 캐시가 없으면(None) Allow 자동통과는 성립하지
+    /// 않아(양쪽 Some 필요) fail-closed로 재승인한다. 매 호출 live 스키마 검증은 백엔드
+    /// 서브프로세스 spawn 비용 때문에 별도 후속으로 둔다(프록시 시작 시 캐시 동기 갱신은
+    /// initialize 블로킹·갱신 실패 시 fail-open 문제로 채택하지 않음, codex).
     fn schema_hash_for(&self, tool_name: &str) -> Option<String> {
         let tools = self.db.list_mcp_tools(&self.server_id).ok()?;
         let schema = tools
@@ -95,11 +107,13 @@ impl DbPermissionHook {
     }
 
     /// 인자 JSON을 redact + 길이 제한해 GUI 표시용 미리보기 문자열을 만든다.
-    /// 시드된 credential secret은 [REDACTED]로 치환된다. (한계: 미등록 secret은
-    /// RedactionService가 잡지 못하므로 절단에만 의존한다 — 원문 secret 노출 방지는
-    /// 등록된 값 기준. 자세한 한계는 크레이트 보고 참조.)
+    /// 2단 방어: (1) 민감 key(api_key/token/password 등)의 값을 key 기반으로 마스킹해
+    /// 미등록 secret이 pending_approvals.arguments_preview에 평문 저장되지 않게 하고(codex),
+    /// (2) 시드된 credential secret은 RedactionService가 [REDACTED]로 치환한다. 마지막에 절단.
     fn redact_preview(&self, arguments: &Value) -> String {
-        let raw = serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_owned());
+        let mut masked = arguments.clone();
+        audit::mask_sensitive_keys(&mut masked);
+        let raw = serde_json::to_string(&masked).unwrap_or_else(|_| "{}".to_owned());
         let mut redactor = self.redaction.stream_redactor();
         let mut bytes = redactor.redact_chunk(raw.as_bytes());
         bytes.extend(redactor.flush());
@@ -123,28 +137,42 @@ impl DbPermissionHook {
             now,
         ) {
             tracing::warn!(tool = %tool_name, "승인 요청 등록 실패: {e:#}");
+            // fail-closed도 결정이므로 감사에 남긴다 (best-effort, codex).
+            self.record(tool_name, arguments, ToolDecision::DenyOnce);
             return ProxyDecision::Deny("승인 요청 등록 실패 — 안전을 위해 거부됨".to_owned());
         }
 
         let deadline = Instant::now() + self.approval_timeout;
         loop {
-            std::thread::sleep(self.poll_interval);
+            // 항상 먼저 폴링해 '관측된 결정'(Allowed/Denied)을 존중한다 — sleep 중 도착한 승인을
+            // 스케줄러 레이스로 버리지 않도록(codex). deadline은 결정 수락 컷오프가 아니라
+            // Pending을 계속 기다리는 '대기 상한'이다: Pending인데 deadline을 넘겼을 때만 타임아웃.
             match self.db.poll_approval(&id) {
                 // 행 소실(정리/삭제)·기형 status → fail-closed 거부
                 Err(e) => {
                     tracing::warn!(tool = %tool_name, "승인 폴링 실패: {e:#}");
+                    self.record(tool_name, arguments, ToolDecision::DenyOnce);
                     return ProxyDecision::Deny(
                         "승인 상태 조회 실패 — 안전을 위해 거부됨".to_owned(),
                     );
                 }
                 Ok(outcome) => match outcome.status {
                     ApprovalStatus::Pending => {
-                        if Instant::now() >= deadline {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            // 타임아웃: 대기 행을 거부로 해소해 GUI가 만료 요청을 live 승인처럼
+                            // 띄우지 않게 한다 (first-writer-wins라 이미 해소됐으면 no-op).
+                            let _ = self.db.resolve_approval(&id, false, false, unix_secs());
                             self.record(tool_name, arguments, ToolDecision::DenyOnce);
                             return ProxyDecision::Deny(
                                 "승인 대기 시간 초과 — 안전을 위해 거부됨".to_owned(),
                             );
                         }
+                        // 남은 시간으로 clamp해 deadline을 크게 넘겨 자지 않는다
+                        std::thread::sleep(
+                            self.poll_interval
+                                .min(deadline.saturating_duration_since(now)),
+                        );
                     }
                     ApprovalStatus::Allowed => {
                         let decision = if outcome.remember {
@@ -189,7 +217,7 @@ impl DbPermissionHook {
 
 impl PermissionHook for DbPermissionHook {
     fn check(&self, tool_name: &str, arguments: &Value) -> ProxyDecision {
-        let rule = match self.current_rule(tool_name) {
+        let (rule, approved_hash) = match self.current_rule(tool_name) {
             Ok(rule) => rule,
             Err(e) => {
                 // 정책을 읽지 못하면 판단 불가 — fail-closed 거부 (감사도 DB 의존이라 생략)
@@ -199,8 +227,17 @@ impl PermissionHook for DbPermissionHook {
         };
         match rule {
             PermissionRule::Allow => {
-                self.record(tool_name, arguments, ToolDecision::PolicyAllow);
-                ProxyDecision::Allow
+                // 저장된 Allow는 승인 당시 schema_hash에 바인딩돼 있다. 현재 tool 스키마의 해시가
+                // 조회되고(Some) 그 값이 저장된 해시와 일치할 때만 자동 통과한다. 스키마를 못
+                // 구하거나(None) 바뀌면(불일치) 재승인(Ask)한다 — None==None으로 무기한 통과하던
+                // 문제 방지, SchemaChanged fail-closed 방어(codex).
+                let current_hash = self.schema_hash_for(tool_name);
+                if current_hash.is_some() && current_hash == approved_hash {
+                    self.record(tool_name, arguments, ToolDecision::PolicyAllow);
+                    ProxyDecision::Allow
+                } else {
+                    self.ask(tool_name, arguments)
+                }
             }
             PermissionRule::Deny => {
                 self.record(tool_name, arguments, ToolDecision::PolicyDeny);
@@ -264,17 +301,76 @@ mod tests {
             .unwrap()
     }
 
+    /// tool 스키마 행을 seed하고 그 schema_hash를 반환한다 (Allow 자동통과 조건 충족용).
+    fn seed_tool_schema(path: &Path, tool: &str, schema: &str) -> String {
+        let mut db = Db::open(path).unwrap();
+        // mcp_tools는 mcp_servers FK를 요구하므로 서버 행을 먼저 넣는다 (중복이면 무시)
+        let _ = db.insert_mcp_server(&mcp::McpServerRow {
+            id: "srv-1".to_owned(),
+            name: "srv-1".to_owned(),
+            kind: "stdio".to_owned(),
+            command: Some("echo".to_owned()),
+            args: Vec::new(),
+            url: None,
+            enabled: true,
+        });
+        db.replace_mcp_tools(
+            "srv-1",
+            &[mcp::McpToolRow {
+                id: format!("id-{tool}"),
+                server_id: "srv-1".to_owned(),
+                name: tool.to_owned(),
+                description: None,
+                input_schema_json: Some(schema.to_owned()),
+                trust_level: "unknown".to_owned(),
+                schema_hash: None,
+            }],
+        )
+        .unwrap();
+        audit::schema_hash(schema)
+    }
+
     #[test]
     fn allow_규칙은_allow이고_audit_기록() {
         let path = temp_db_path();
         let hook = hook_with(&path, Duration::from_millis(20), Duration::from_secs(5));
+        // Allow 자동통과는 tool 스키마 존재 + 규칙이 그 schema_hash에 바인딩됐을 때만
+        let hash = seed_tool_schema(&path, "read_file", r#"{"type":"object"}"#);
         hook.db
-            .upsert_permission_rule("srv-1", "read_file", "allow", None)
+            .upsert_permission_rule("srv-1", "read_file", "allow", Some(&hash))
             .unwrap();
 
         let decision = hook.check("read_file", &serde_json::json!({"path": "/tmp/x"}));
         assert!(matches!(decision, ProxyDecision::Allow));
         assert_eq!(audit_count(&path), 1);
+    }
+
+    #[test]
+    fn allow규칙_schema_hash_일치하면_통과_불일치면_재승인() {
+        let path = temp_db_path();
+        let hash = seed_tool_schema(&path, "read_file", r#"{"type":"object"}"#);
+        // 저장된 해시가 현재 스키마와 일치 → 통과
+        {
+            let hook = hook_with(&path, Duration::from_millis(20), Duration::from_secs(5));
+            hook.db
+                .upsert_permission_rule("srv-1", "read_file", "allow", Some(&hash))
+                .unwrap();
+            assert!(matches!(
+                hook.check("read_file", &serde_json::json!({})),
+                ProxyDecision::Allow
+            ));
+        }
+        // 저장된 해시가 옛것(불일치) → 자동통과 안 하고 재승인(짧은 timeout→Deny)
+        {
+            let hook = hook_with(&path, Duration::from_millis(20), Duration::from_millis(150));
+            hook.db
+                .upsert_permission_rule("srv-1", "read_file", "allow", Some("옛날해시"))
+                .unwrap();
+            assert!(matches!(
+                hook.check("read_file", &serde_json::json!({})),
+                ProxyDecision::Deny(_)
+            ));
+        }
     }
 
     #[test]
@@ -384,5 +480,48 @@ mod tests {
         let preview = hook.redact_preview(&serde_json::json!({ "v": long }));
         assert!(preview.chars().count() <= PREVIEW_MAX_CHARS + 1);
         assert!(preview.ends_with('…'));
+    }
+
+    #[test]
+    fn 프리뷰는_미등록_민감key값도_마스킹한다() {
+        let path = temp_db_path();
+        let hook = hook_with(&path, Duration::from_millis(20), Duration::from_secs(5));
+        // 등록 안 된 secret이라도 key 이름(api_key)으로 마스킹돼야 한다
+        let preview =
+            hook.redact_preview(&serde_json::json!({"api_key": "unregistered-secret-xyz"}));
+        assert!(!preview.contains("unregistered-secret-xyz"), "{preview}");
+        assert!(preview.contains("[REDACTED]"), "{preview}");
+    }
+
+    #[test]
+    fn allow규칙도_schema_hash_불일치면_자동통과_안한다() {
+        let path = temp_db_path();
+        // 승인 없이 짧게 타임아웃 → 재승인(ask) 경로로 빠지면 Deny로 관측된다
+        let hook = hook_with(&path, Duration::from_millis(20), Duration::from_millis(150));
+        // Allow 규칙이지만 옛 schema_hash에 바인딩. 현재 tool엔 스키마 행이 없어 hash=None →
+        // 불일치이므로 자동 통과가 아니라 재승인해야 한다.
+        hook.db
+            .upsert_permission_rule("srv-1", "read_file", "allow", Some("옛날해시"))
+            .unwrap();
+
+        let decision = hook.check("read_file", &serde_json::json!({"path": "/tmp/x"}));
+        assert!(
+            matches!(decision, ProxyDecision::Deny(_)),
+            "schema 불일치 Allow가 자동 통과됨"
+        );
+    }
+
+    #[test]
+    fn 타임아웃시_대기행이_거부로_해소된다() {
+        let path = temp_db_path();
+        let hook = hook_with(&path, Duration::from_millis(20), Duration::from_millis(150));
+
+        let decision = hook.check("read_file", &serde_json::json!({"path": "/tmp/x"}));
+        assert!(matches!(decision, ProxyDecision::Deny(_)));
+        // 타임아웃 후 pending 행이 남아 GUI가 만료 요청을 띄우면 안 된다 → 해소됨
+        assert!(
+            hook.db.list_pending_approvals().unwrap().is_empty(),
+            "타임아웃된 대기 행이 pending으로 남음"
+        );
     }
 }

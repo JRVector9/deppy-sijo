@@ -631,6 +631,27 @@ impl Db {
         Ok(())
     }
 
+    /// 크래시로 남은 orphan pending 승인 행을 정리한다: created_at이 `older_than_epoch_secs`
+    /// 보다 오래된 'pending' 행을 전부 'denied'로 표시(resolved_at 설정)한다. 반영된 행 수 반환.
+    /// 프록시가 시작 시 호출해 이전에 죽은 프록시가 남긴 죽은 팝업을 GUI에서 치운다.
+    /// 단일 UPDATE(WAL 안전). `status='pending'` 조건이라 이미 해소된 행은 건드리지 않는다.
+    pub fn expire_pending_approvals(
+        &self,
+        older_than_epoch_secs: i64,
+        resolved_at: i64,
+    ) -> anyhow::Result<usize> {
+        let affected = self
+            .conn
+            .execute(
+                "UPDATE pending_approvals
+                 SET status = 'denied', resolved_at = ?2
+                 WHERE status = 'pending' AND created_at < ?1",
+                (older_than_epoch_secs, resolved_at),
+            )
+            .context("orphan pending 승인 만료 실패")?;
+        Ok(affected)
+    }
+
     /// tool 실행 감사 기록 (PR-16). encryptor를 넘기면 전체 입력이 암호화 저장된다 (§7).
     pub fn record_tool_audit(
         &self,
@@ -971,6 +992,31 @@ mod tests {
         );
         // 이미 해소된 행은 목록에 없음
         assert!(db.list_pending_approvals().unwrap().is_empty());
+    }
+
+    #[test]
+    fn expire_pending은_오래된_행만_denied로_하고_멱등() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_pending_approval("old", "srv", "t", "prev", None, 100)
+            .unwrap();
+        db.insert_pending_approval("recent", "srv", "t", "prev", None, 1000)
+            .unwrap();
+        // cutoff=500 → old(100)만 만료, recent(1000)은 유지
+        assert_eq!(db.expire_pending_approvals(500, 600).unwrap(), 1);
+        let ids: Vec<_> = db
+            .list_pending_approvals()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, vec!["recent"]);
+        // old는 denied(resolved)로 전이
+        assert_eq!(
+            db.poll_approval("old").unwrap().status,
+            ApprovalStatus::Denied
+        );
+        // 멱등: 재호출은 더 이상 pending이 없어 0
+        assert_eq!(db.expire_pending_approvals(500, 700).unwrap(), 0);
     }
 
     #[test]

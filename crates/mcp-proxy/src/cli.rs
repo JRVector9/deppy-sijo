@@ -19,6 +19,10 @@ pub struct Cli {
 
 const DEFAULT_POLL_MS: u64 = 200;
 const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 120;
+/// 승인 대기 상한의 최댓값(초). 사람 승인엔 1시간이면 충분하고, orphan 정리 sweep이
+/// 살아있는 프록시의 pending을 오살하지 않도록 상한을 둔다 — orphan cutoff가 이 값과
+/// 같아, 어떤 live pending도 (나이 < 자기 timeout ≤ 이 상한 = cutoff)이라 안 쓸린다.
+pub const MAX_APPROVAL_TIMEOUT_SECS: u64 = 3600;
 
 impl Cli {
     /// process 인자에서 파싱 (main 진입점용).
@@ -59,6 +63,8 @@ impl Cli {
         if poll_ms == 0 {
             bail!("--poll-ms는 1 이상이어야 함 (busy-loop 방지)");
         }
+        // orphan sweep이 live pending을 오살하지 않도록 상한을 강제한다 (cutoff 불변식).
+        let approval_timeout_secs = approval_timeout_secs.min(MAX_APPROVAL_TIMEOUT_SECS);
 
         Ok(Self {
             db_path,

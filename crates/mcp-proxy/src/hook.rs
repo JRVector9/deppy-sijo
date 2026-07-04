@@ -4,10 +4,12 @@
 //!
 //! fail-closed 원칙: 정책 조회 실패·승인 행 소실·대기 시간 초과는 전부 **거부**로 처리한다.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use audit::{AuditRecord, PermissionRule, ToolDecision};
-use mcp::{PermissionHook, ProxyDecision};
+use mcp::{LocalMcpManager, McpServerConfig, PermissionHook, ProxyDecision};
 use secret::{KeyringSecretStore, RedactionService, SecretStore};
 use serde_json::Value;
 use storage::{ApprovalStatus, Db};
@@ -25,6 +27,12 @@ pub struct DbPermissionHook {
     store: KeyringSecretStore,
     poll_interval: Duration,
     approval_timeout: Duration,
+    /// live 스키마 검증용 백엔드 spec + manager (DB 캐시가 아니라 실제 백엔드에서 해시 계산).
+    manager: LocalMcpManager,
+    config: McpServerConfig,
+    /// live 스키마 해시 캐시 (tool_name → schema_hash). 프록시 세션당 최초 필요 시 한 번만
+    /// 백엔드를 discover해 채운다(성공 시). None = 아직 성공 discover 못 함(다음 호출에서 재시도).
+    schema_cache: Mutex<Option<HashMap<String, String>>>,
 }
 
 impl DbPermissionHook {
@@ -36,6 +44,8 @@ impl DbPermissionHook {
         keyring_ok: bool,
         poll_interval: Duration,
         approval_timeout: Duration,
+        manager: LocalMcpManager,
+        config: McpServerConfig,
     ) -> Self {
         Self {
             db,
@@ -45,6 +55,9 @@ impl DbPermissionHook {
             store: KeyringSecretStore,
             poll_interval,
             approval_timeout,
+            manager,
+            config,
+            schema_cache: Mutex::new(None),
         }
     }
 
@@ -64,22 +77,37 @@ impl DbPermissionHook {
             .unwrap_or((PermissionRule::default(), None)))
     }
 
-    /// 해당 tool의 저장된 input schema에서 schema_hash를 계산한다.
-    /// tool 행/스키마가 없으면 None (pending은 schema_hash 없이 등록된다).
+    /// 해당 tool의 **live 백엔드 스키마**에서 schema_hash를 계산한다 (DB 캐시가 아니라
+    /// 실제 백엔드를 discover). 백엔드는 이 프록시 세션의 고정된 subprocess spec이므로,
+    /// 최초 필요 시 한 번만 discover해 `HashMap<tool_name, schema_hash>`로 캐시하고
+    /// 이후 호출은 캐시를 재사용한다 — 호출마다 subprocess를 spawn하는 비용을 피하면서도,
+    /// 낡을 수 있는 DB 캐시(오래된 GUI 탐색 결과)에 의존하지 않는다.
     ///
-    /// 한계(문서화): 여기서 쓰는 스키마는 GUI tool 탐색이 채우는 **mcp_tools 캐시**다.
-    /// 백엔드가 캐시 갱신 없이 스키마를 바꾸면 이 해시가 낡아 SchemaChanged 재승인이
-    /// 다음 GUI 재탐색까지 늦어질 수 있다. 캐시가 없으면(None) Allow 자동통과는 성립하지
-    /// 않아(양쪽 Some 필요) fail-closed로 재승인한다. 매 호출 live 스키마 검증은 백엔드
-    /// 서브프로세스 spawn 비용 때문에 별도 후속으로 둔다(프록시 시작 시 캐시 동기 갱신은
-    /// initialize 블로킹·갱신 실패 시 fail-open 문제로 채택하지 않음, codex).
+    /// discover 실패 시 캐시하지 않고 None을 돌려준다(다음 호출에서 재시도). None이면
+    /// Allow 자동통과 조건(양쪽 Some 필요)이 성립하지 않아 fail-closed로 재승인(Ask)한다 —
+    /// 낡은 DB 캐시로 폴백하지 않는다.
+    ///
+    /// 잔여 한계: 세션 도중 백엔드 spec이 바뀌어 스키마가 달라지면(mid-session swap) 캐시가
+    /// 갱신되지 않아 재검출되지 않는다. 프록시는 per-session 프로세스라 허용 가능하다 —
+    /// 백엔드가 바뀌면 새 프록시 세션이 다시 discover한다.
     fn schema_hash_for(&self, tool_name: &str) -> Option<String> {
-        let tools = self.db.list_mcp_tools(&self.server_id).ok()?;
-        let schema = tools
-            .into_iter()
-            .find(|t| t.name == tool_name)?
-            .input_schema_json?;
-        Some(audit::schema_hash(&schema))
+        let mut cache = self.schema_cache.lock().unwrap();
+        if cache.is_none() {
+            match self.manager.discover_tools(&self.config) {
+                Ok(tools) => {
+                    let map = tools
+                        .into_iter()
+                        .map(|t| (t.name, audit::schema_hash(&t.input_schema_json)))
+                        .collect();
+                    *cache = Some(map);
+                }
+                Err(e) => {
+                    tracing::warn!(tool = %tool_name, "live 스키마 discover 실패 — 재승인 유도: {e:#}");
+                    return None; // 캐시하지 않음 → 다음 호출에서 재시도
+                }
+            }
+        }
+        cache.as_ref().and_then(|m| m.get(tool_name).cloned())
     }
 
     /// 감사 로그 한 건 기록. input_json 원문은 record_audit이 내부에서 redact/암호화한다.
@@ -283,7 +311,26 @@ mod tests {
         dir.join("metadata.sqlite3")
     }
 
+    /// 존재하지 않는 command를 가리키는 config — live discover가 항상 실패한다
+    /// (schema_hash_for → None). live 백엔드가 필요 없는 테스트의 기본값.
+    fn bad_config() -> McpServerConfig {
+        McpServerConfig {
+            name: "no-backend".to_owned(),
+            command: "/nonexistent/deppy-proxy-test-cmd".to_owned(),
+            args: Vec::new(),
+        }
+    }
+
     fn hook_with(path: &Path, poll: Duration, timeout: Duration) -> DbPermissionHook {
+        hook_with_config(path, poll, timeout, bad_config())
+    }
+
+    fn hook_with_config(
+        path: &Path,
+        poll: Duration,
+        timeout: Duration,
+        config: McpServerConfig,
+    ) -> DbPermissionHook {
         DbPermissionHook::new(
             Db::open(path).unwrap(),
             "srv-1".to_owned(),
@@ -291,6 +338,8 @@ mod tests {
             false, // keyring 없음 — encryptor None
             poll,
             timeout,
+            LocalMcpManager::new(RedactionService::new()),
+            config,
         )
     }
 
@@ -301,41 +350,44 @@ mod tests {
             .unwrap()
     }
 
-    /// tool 스키마 행을 seed하고 그 schema_hash를 반환한다 (Allow 자동통과 조건 충족용).
-    fn seed_tool_schema(path: &Path, tool: &str, schema: &str) -> String {
-        let mut db = Db::open(path).unwrap();
-        // mcp_tools는 mcp_servers FK를 요구하므로 서버 행을 먼저 넣는다 (중복이면 무시)
-        let _ = db.insert_mcp_server(&mcp::McpServerRow {
-            id: "srv-1".to_owned(),
-            name: "srv-1".to_owned(),
-            kind: "stdio".to_owned(),
-            command: Some("echo".to_owned()),
-            args: Vec::new(),
-            url: None,
-            enabled: true,
-        });
-        db.replace_mcp_tools(
-            "srv-1",
-            &[mcp::McpToolRow {
-                id: format!("id-{tool}"),
-                server_id: "srv-1".to_owned(),
-                name: tool.to_owned(),
-                description: None,
-                input_schema_json: Some(schema.to_owned()),
-                trust_level: "unknown".to_owned(),
-                schema_hash: None,
-            }],
+    /// initialize → tools/list로 tool 하나(주어진 name/inputSchema)를 내놓는 mock stdio
+    /// 백엔드 스크립트. manager.rs 목 서버와 동일한 핸드셰이크(2025-11-25 개정판).
+    #[cfg(unix)]
+    fn mock_backend_script(tool: &str, schema: &str) -> String {
+        format!(
+            "read -r _init\n\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"mock\",\"version\":\"0.1\"}}}}}}'\n\
+             read -r _initialized\n\
+             read -r _list\n\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"tools\":[{{\"name\":\"{tool}\",\"inputSchema\":{schema}}}]}}}}'\n"
         )
-        .unwrap();
-        audit::schema_hash(schema)
     }
 
+    /// 주어진 script를 `/bin/sh -c`로 실행하는 config.
+    #[cfg(unix)]
+    fn sh_config(script: String) -> McpServerConfig {
+        McpServerConfig {
+            name: "mock".to_owned(),
+            command: "/bin/sh".to_owned(),
+            args: vec!["-c".to_owned(), script],
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn allow_규칙은_allow이고_audit_기록() {
+    fn allow_규칙은_live_hash_일치시_allow이고_audit_기록() {
         let path = temp_db_path();
-        let hook = hook_with(&path, Duration::from_millis(20), Duration::from_secs(5));
-        // Allow 자동통과는 tool 스키마 존재 + 규칙이 그 schema_hash에 바인딩됐을 때만
-        let hash = seed_tool_schema(&path, "read_file", r#"{"type":"object"}"#);
+        // live 백엔드가 read_file(inputSchema={"type":"object"})을 내놓는다
+        let schema = r#"{"type":"object"}"#;
+        let config = sh_config(mock_backend_script("read_file", schema));
+        let hook = hook_with_config(
+            &path,
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+            config,
+        );
+        // Allow 규칙을 live 스키마 해시에 바인딩 → 자동 통과 조건 충족
+        let hash = audit::schema_hash(schema);
         hook.db
             .upsert_permission_rule("srv-1", "read_file", "allow", Some(&hash))
             .unwrap();
@@ -345,13 +397,21 @@ mod tests {
         assert_eq!(audit_count(&path), 1);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn allow규칙_schema_hash_일치하면_통과_불일치면_재승인() {
-        let path = temp_db_path();
-        let hash = seed_tool_schema(&path, "read_file", r#"{"type":"object"}"#);
-        // 저장된 해시가 현재 스키마와 일치 → 통과
+    fn allow규칙_live_hash_일치하면_통과_불일치면_재승인() {
+        let schema = r#"{"type":"object"}"#;
+        let hash = audit::schema_hash(schema);
+        // live 백엔드 해시가 저장 해시와 일치 → 통과
         {
-            let hook = hook_with(&path, Duration::from_millis(20), Duration::from_secs(5));
+            let path = temp_db_path();
+            let config = sh_config(mock_backend_script("read_file", schema));
+            let hook = hook_with_config(
+                &path,
+                Duration::from_millis(20),
+                Duration::from_secs(5),
+                config,
+            );
             hook.db
                 .upsert_permission_rule("srv-1", "read_file", "allow", Some(&hash))
                 .unwrap();
@@ -362,7 +422,14 @@ mod tests {
         }
         // 저장된 해시가 옛것(불일치) → 자동통과 안 하고 재승인(짧은 timeout→Deny)
         {
-            let hook = hook_with(&path, Duration::from_millis(20), Duration::from_millis(150));
+            let path = temp_db_path();
+            let config = sh_config(mock_backend_script("read_file", schema));
+            let hook = hook_with_config(
+                &path,
+                Duration::from_millis(20),
+                Duration::from_millis(150),
+                config,
+            );
             hook.db
                 .upsert_permission_rule("srv-1", "read_file", "allow", Some("옛날해시"))
                 .unwrap();
@@ -494,20 +561,21 @@ mod tests {
     }
 
     #[test]
-    fn allow규칙도_schema_hash_불일치면_자동통과_안한다() {
+    fn allow규칙도_live_discovery_실패면_자동통과_안하고_재승인() {
         let path = temp_db_path();
-        // 승인 없이 짧게 타임아웃 → 재승인(ask) 경로로 빠지면 Deny로 관측된다
+        // 승인 없이 짧게 타임아웃 → 재승인(ask) 경로로 빠지면 Deny로 관측된다.
+        // bad_config라 live discover가 실패 → schema_hash_for=None → 자동통과 조건 불성립.
         let hook = hook_with(&path, Duration::from_millis(20), Duration::from_millis(150));
-        // Allow 규칙이지만 옛 schema_hash에 바인딩. 현재 tool엔 스키마 행이 없어 hash=None →
-        // 불일치이므로 자동 통과가 아니라 재승인해야 한다.
+        // Allow 규칙이지만 live 스키마를 못 구하므로(None) 자동 통과가 아니라 재승인해야 한다
+        // (낡은 DB 캐시로 폴백하지 않고 fail-closed).
         hook.db
-            .upsert_permission_rule("srv-1", "read_file", "allow", Some("옛날해시"))
+            .upsert_permission_rule("srv-1", "read_file", "allow", Some("아무해시"))
             .unwrap();
 
         let decision = hook.check("read_file", &serde_json::json!({"path": "/tmp/x"}));
         assert!(
             matches!(decision, ProxyDecision::Deny(_)),
-            "schema 불일치 Allow가 자동 통과됨"
+            "live discovery 실패한 Allow가 자동 통과됨"
         );
     }
 
@@ -522,6 +590,69 @@ mod tests {
         assert!(
             hook.db.list_pending_approvals().unwrap().is_empty(),
             "타임아웃된 대기 행이 pending으로 남음"
+        );
+    }
+
+    /// live 스키마는 프록시 세션당 한 번만 discover된다(백엔드 subprocess spawn 1회).
+    /// 백엔드가 spawn될 때마다 카운터 파일에 한 줄을 남기고, Ask 경로를 2번 통과시킨 뒤
+    /// (각 check가 schema_hash_for를 호출) spawn이 정확히 1회임을 확인한다.
+    #[cfg(unix)]
+    #[test]
+    fn live_스키마는_세션당_한_번만_discover된다() {
+        let path = temp_db_path();
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        let counter =
+            std::env::temp_dir().join(format!("deppy-proxy-spawn-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_file(&counter);
+        // 백엔드 spawn마다 카운터에 한 줄 append 후 정상 핸드셰이크
+        let script = format!(
+            "echo x >> '{}'\n{}",
+            counter.display(),
+            mock_backend_script("read_file", r#"{"type":"object"}"#)
+        );
+        let hook = hook_with_config(
+            &path,
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+            sh_config(script),
+        );
+
+        // 백그라운드 GUI: 뜨는 pending을 allow로 해소한다(최대 2건).
+        let bg_path = path.clone();
+        let resolver = std::thread::spawn(move || {
+            let db = Db::open(&bg_path).unwrap();
+            let mut resolved = 0;
+            for _ in 0..2000 {
+                if let Some(p) = db.list_pending_approvals().unwrap().first() {
+                    db.resolve_approval(&p.id, true, false, unix_secs())
+                        .unwrap();
+                    resolved += 1;
+                    if resolved == 2 {
+                        return;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            panic!("2건의 pending을 해소하지 못함");
+        });
+
+        // 규칙 없음 → 두 번 다 Ask 경로(schema_hash_for 호출) → allow로 관측
+        assert!(matches!(
+            hook.check("read_file", &serde_json::json!({})),
+            ProxyDecision::Allow
+        ));
+        assert!(matches!(
+            hook.check("read_file", &serde_json::json!({})),
+            ProxyDecision::Allow
+        ));
+        resolver.join().unwrap();
+
+        // 두 번 check했지만 백엔드는 한 번만 spawn됐다(메모이제이션).
+        let spawns = std::fs::read_to_string(&counter).unwrap();
+        assert_eq!(
+            spawns.lines().count(),
+            1,
+            "백엔드가 여러 번 spawn됨(메모이제이션 실패): {spawns:?}"
         );
     }
 }

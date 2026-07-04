@@ -19,6 +19,12 @@ use crate::cli::Cli;
 use crate::forwarder::ManagerToolForwarder;
 use crate::hook::DbPermissionHook;
 
+/// orphan 판정 컷오프(초): created_at이 (now - 이 값)보다 오래된 pending은 죽은 프록시가
+/// 남긴 것으로 보고 시작 시 정리한다. **승인 대기 상한(MAX_APPROVAL_TIMEOUT_SECS)과 같게**
+/// 둬서, 살아있는 다른 프록시의 pending(나이 < 자기 timeout ≤ 상한 = cutoff)은 절대 안
+/// 쓸리게 한다 (codex — 짧은 고정 cutoff가 긴 timeout의 live pending을 오살하던 문제).
+const ORPHAN_CUTOFF_SECS: i64 = cli::MAX_APPROVAL_TIMEOUT_SECS as i64;
+
 fn main() -> anyhow::Result<()> {
     // stdout은 JSON-RPC 전용 → 로그는 stderr로만.
     tracing_subscriber::fmt()
@@ -53,8 +59,22 @@ fn main() -> anyhow::Result<()> {
         seed_redaction(&db, &redaction);
     }
 
+    // 이전에 크래시한 프록시가 남긴 orphan pending 승인을 정리한다 — GUI가 죽은 팝업을
+    // 띄우지 않게. best-effort(실패해도 서빙 계속). db를 hook으로 넘기기 전에 한다.
+    // cutoff(now-ORPHAN_CUTOFF_SECS)보다 최근 행(다른 살아있는 프록시)은 건드리지 않고,
+    // 이 프록시가 앞으로 넣을 행은 아직 없다.
+    let now = unix_secs();
+    match db.expire_pending_approvals(now - ORPHAN_CUTOFF_SECS, now) {
+        Ok(n) if n > 0 => tracing::info!("orphan pending 승인 {n}건 정리(이전 크래시 잔여)"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("orphan pending 승인 정리 실패(무시하고 계속): {e:#}"),
+    }
+
     // 백엔드 stderr redaction을 위해 manager도 같은 redaction을 공유한다.
+    // hook도 live 스키마 검증용으로 자신의 manager+config를 갖는다 (forwarder와 별개 인스턴스).
     let manager = LocalMcpManager::new(redaction.clone());
+    let hook_manager = LocalMcpManager::new(redaction.clone());
+    let hook_config = config.clone();
     let forwarder = ManagerToolForwarder::new(manager, config);
     let hook = DbPermissionHook::new(
         db,
@@ -63,11 +83,21 @@ fn main() -> anyhow::Result<()> {
         keyring_ok,
         cli.poll_interval,
         cli.approval_timeout,
+        hook_manager,
+        hook_config,
     );
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     run_proxy(stdin.lock(), stdout.lock(), forwarder, hook)
+}
+
+/// 현재 unix epoch seconds. 정상 시스템 시계에서 UNIX_EPOCH 이후이므로 0으로 폴백.
+fn unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// McpServerRow → LocalMcpManager가 spawn할 McpServerConfig.

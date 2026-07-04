@@ -8,4 +8,5 @@ license.workspace = true
 serde = { workspace = true }
 anyhow = { workspace = true }
 alacritty_terminal = { workspace = true }
+unicode-normalization = { workspace = true }
 egui = { workspace = true }

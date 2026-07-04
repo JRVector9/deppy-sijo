@@ -8,12 +8,36 @@ use alacritty_terminal::term::{Config, Term, TermDamage, TermMode, test::TermSiz
 use alacritty_terminal::vte::ansi::{
     Color, CursorShape as VteCursorShape, NamedColor, Processor, Rgb,
 };
+use unicode_normalization::UnicodeNormalization;
 
 use crate::backend::{TerminalBackend, TerminalExternalSurfaceHandle, TerminalRenderModel};
 use crate::change_set::TerminalChangeSet;
 use crate::viewport_snapshot::{
     CursorShape, CursorSnapshot, TerminalCell, TerminalViewportSnapshot,
 };
+
+/// 셀의 base char에 alacritty가 붙인 zerowidth(조합) 문자를 NFC로 합성한다.
+/// macOS 등은 파일명을 NFD(자소 분해)로 저장해, 한글은 초성만·악센트 라틴은 base만
+/// 보이던 문제를 해결한다. zerowidth가 없으면(대부분의 셀) base를 그대로 반환해
+/// 단일-char 셀 모델과 오버헤드를 유지한다. 합성이 단일 char로 안 되면(고아 조합/옛한글)
+/// 기존과 동일하게 base만 반환한다.
+fn composed_char(base: char, zerowidth: Option<&[char]>) -> char {
+    match zerowidth {
+        Some(zw) if !zw.is_empty() => {
+            let mut s = String::with_capacity(4);
+            s.push(base);
+            s.extend(zw.iter());
+            // 정확히 단일 char로 합성될 때만 사용한다. 다중 scalar로 남으면(쌓인 결합
+            // 기호 등) 셀은 한 글자만 담으므로 부분 합성 대신 base로 폴백한다.
+            let mut it = s.nfc();
+            match (it.next(), it.next()) {
+                (Some(c), None) => c,
+                _ => base,
+            }
+        }
+        _ => base,
+    }
+}
 
 /// 터미널 질의 응답을 수집한다 (PtyWrite + OSC 색상 질의).
 /// title/bell 이벤트는 PR-10/13에서 소비 예정 — 현재는 무시.
@@ -195,7 +219,7 @@ impl TerminalBackend for AlacrittyBackend {
                 c: if flags.contains(Flags::HIDDEN) {
                     ' '
                 } else {
-                    indexed.c
+                    composed_char(indexed.c, indexed.zerowidth())
                 },
                 fg,
                 bg,
@@ -274,7 +298,7 @@ impl TerminalBackend for AlacrittyBackend {
                     out.push(if cell.flags.contains(Flags::HIDDEN) {
                         ' '
                     } else {
-                        cell.c
+                        composed_char(cell.c, cell.zerowidth())
                     });
                 }
             }
@@ -465,6 +489,24 @@ mod tests {
         assert!(cell_at(&backend, 0, 1).wide_spacer);
         assert_eq!(cell_at(&backend, 0, 2).c, '나');
         assert_eq!(row_text(&backend, 0), "가나");
+    }
+
+    #[test]
+    fn nfd_한글_자소분해_입력을_음절로_합성() {
+        // macOS는 파일명을 NFD로 저장 — "스크린샷"이 초성만 보이던 문제.
+        // 한(ㅎ U+1112 + ㅏ U+1161 + ㄴ U+11AB), 글(ㄱ U+1100 + ㅡ U+1173 + ㄹ U+11AF)
+        let mut backend = AlacrittyBackend::new(80, 24, 100);
+        let nfd = "\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}";
+        feed(&mut backend, nfd.as_bytes());
+        // 조합 자모를 버리지 않고 NFC 음절로 합성돼야 한다
+        assert_eq!(cell_at(&backend, 0, 0).c, '한');
+        assert_eq!(cell_at(&backend, 0, 2).c, '글');
+        assert_eq!(row_text(&backend, 0), "한글");
+        // screen_text(상태감지 regex 경로)도 동일하게 합성
+        assert_eq!(
+            backend.screen_text().lines().next().unwrap().trim_end(),
+            "한글"
+        );
     }
 
     #[test]

@@ -135,18 +135,39 @@ fn local_dep_graph() -> anyhow::Result<BTreeMap<String, Vec<String>>> {
             .to_owned();
         let manifest = std::fs::read_to_string(dir.join("Cargo.toml"))
             .with_context(|| format!("{name}/Cargo.toml 읽기 실패"))?;
-        let deps = manifest
-            .lines()
-            .filter_map(|line| {
-                // `x = { path = "../y" }` / `path = "../y"` 패턴에서 y 추출
-                let (_, rest) = line.split_once("path")?;
-                let rest = rest.trim_start().strip_prefix('=')?.trim_start();
-                let rest = rest.strip_prefix('"')?;
-                let target = rest.split('"').next()?;
-                let dep_dir = Path::new(target).file_name()?.to_str()?;
-                Some(dep_dir.to_owned())
-            })
-            .collect();
+        // 의존 섹션([dependencies]/[dev-]/[build-]/target.*.dependencies) 안의,
+        // `../`로 시작하는 path만 edge로 본다 — `[[bin]] path = "src/main.rs"` 같은
+        // 비의존 라인 오탐 방지 (codex 리뷰).
+        let mut in_deps_section = false;
+        let mut deps = Vec::new();
+        for line in manifest.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_deps_section = trimmed.contains("dependencies");
+                continue;
+            }
+            if !in_deps_section {
+                continue;
+            }
+            let Some((_, rest)) = trimmed.split_once("path") else {
+                continue;
+            };
+            let Some(rest) = rest.trim_start().strip_prefix('=') else {
+                continue;
+            };
+            let Some(rest) = rest.trim_start().strip_prefix('"') else {
+                continue;
+            };
+            let Some(target) = rest.split('"').next() else {
+                continue;
+            };
+            if !target.starts_with("../") {
+                continue;
+            }
+            if let Some(dep_dir) = Path::new(target).file_name().and_then(|n| n.to_str()) {
+                deps.push(dep_dir.to_owned());
+            }
+        }
         graph.insert(name, deps);
     }
     Ok(graph)

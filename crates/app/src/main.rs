@@ -47,7 +47,19 @@ fn main() -> anyhow::Result<()> {
 
     eframe::run_native(
         "Deppy Sijo",
-        eframe::NativeOptions::default(),
+        eframe::NativeOptions {
+            // 창 위치/크기 영속 안 함 — 외부 모니터 분리 후 저장된 좌표로 복원되면
+            // 창이 화면 밖에 떠서 "앱이 죽은 것처럼" 보인다 (2026-07-05 실증:
+            // eframe 기본 복원은 현재 모니터 배치로 clamp되지 않았다). 위치 기억보다
+            // 항상 보이는 것이 우선. 런타임 분리는 app.rs 오프스크린 감지가 방어.
+            persist_window: false,
+            // 주 화면 중앙에 뜬다 — 위치 미지정이면 OS가 임의(보조 모니터 포함) 배치해
+            // 사용자가 창을 잃어버릴 수 있다 (2026-07-05: 왼쪽 외부 모니터에 떠서
+            // "앱이 죽은 줄" — 실은 정상 실행 중이었다).
+            centered: true,
+            viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 800.0]),
+            ..Default::default()
+        },
         Box::new(move |cc| {
             // 저장된 테마를 시작 시점에 적용
             cc.egui_ctx.set_theme(config.ui.theme.to_egui());

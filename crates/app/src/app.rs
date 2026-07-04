@@ -49,6 +49,10 @@ pub struct App {
     approvals_ui: ui::approvals::ApprovalsUi,
     /// 승인 목록 폴링 스로틀 — logic()이 매 프레임 돌아도 DB 조회는 ~500ms 간격으로.
     last_approval_poll: std::time::Instant,
+    /// 마지막 오프스크린 창 위치 보정 시각 (쿨다운용)
+    last_offscreen_fix: std::time::Instant,
+    /// 시작 시 창을 주 화면으로 1회 이동했다 (centered의 macOS 좌표 문제 우회)
+    startup_positioned: bool,
     frame_stats: crate::perf::FrameStats,
     /// 현재 활성(렌더되는) workspace의 런타임 상태.
     active: WorkspaceRuntime,
@@ -146,6 +150,8 @@ impl App {
             approvals_ui: ui::approvals::ApprovalsUi::new(),
             // 첫 폴링은 ~POLL 간격 뒤 (시작 시 500ms 지연은 허용 가능한 절충).
             last_approval_poll: std::time::Instant::now(),
+            last_offscreen_fix: std::time::Instant::now(),
+            startup_positioned: false,
             active,
             warm: std::collections::HashMap::new(),
             warm_order: Vec::new(),
@@ -751,6 +757,29 @@ impl eframe::App for App {
     // 스킵 판단에 쓰는 바로 그 신호(minimized OR occluded — macOS는 occluded로 갱신되어
     // minimized 미갱신 문제를 피한다). None(미보고)이면 안전하게 Active 유지.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 오프스크린 방어: 실행 중 외부 모니터가 분리되면 창이 존재하지 않는 좌표에
+        // 남아 "죽은 것처럼" 보인다 (2026-07-05 실증). 창이 어느 모니터에도 속하지
+        // 않으면(monitor_size None — macOS는 완전 오프스크린 창의 screen이 nil)
+        // 주 화면 안으로 옮긴다. 쿨다운 2s — 이동 반영 전 재발사 방지.
+        let offscreen =
+            ctx.input(|i| i.viewport().outer_rect.is_some() && i.viewport().monitor_size.is_none());
+        if offscreen && self.last_offscreen_fix.elapsed() >= std::time::Duration::from_secs(2) {
+            self.last_offscreen_fix = std::time::Instant::now();
+            tracing::warn!("창이 화면 밖 — 주 화면으로 이동");
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(80.0, 80.0)));
+        }
+        // 시작 위치 강제: 항상 주 화면에 뜬다. NativeOptions.centered는 주 화면 크기로
+        // 계산한 좌표를 macOS winit이 보조 모니터 로컬 좌표로 적용하는 문제가 있어
+        // (2026-07-05 실증: (255,137) 지정 → 왼쪽 모니터 -2303) 창 생성 후 런타임
+        // 명령으로 1회 이동한다 — 이 경로는 글로벌 좌표로 동작한다. 이후 사용자가
+        // 옮기는 위치는 존중(1회뿐, persist_window=false라 다음 시작도 여기부터).
+        if !self.startup_positioned && ctx.input(|i| i.viewport().outer_rect.is_some()) {
+            self.startup_positioned = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                120.0, 60.0,
+            )));
+        }
+
         let want_active = ctx.input(|i| i.viewport().visible()) != Some(false);
         if want_active != self.active.render_active {
             self.active.render_active = want_active;

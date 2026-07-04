@@ -1,0 +1,28 @@
+[package]
+name = "mcp-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 에이전트가 자신의 stdio MCP 서버로 spawn하는 브리지 바이너리 (agent-proxy 1.5).
+# deppy의 권한 정책을 적용하고 Ask tool은 공유 DB로 라이브 승인을 받은 뒤
+# 실제 백엔드 MCP 서버로 포워딩한다.
+[[bin]]
+name = "deppy-mcp-proxy"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+audit = { path = "../audit" }
+auth = { path = "../auth" }
+mcp = { path = "../mcp" }
+secret = { path = "../secret" }
+storage = { path = "../storage" }
+
+[dev-dependencies]
+# 테스트에서 audit 로그 행을 직접 세기 위한 raw 연결 (storage가 조회 API를 노출하지 않음)
+rusqlite = { workspace = true }

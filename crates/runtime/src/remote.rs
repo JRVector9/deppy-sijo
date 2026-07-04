@@ -2,8 +2,11 @@
 //! localhost-only attach — InProcessRuntimeClient와 **같은 명령/이벤트 모델**을
 //! length-prefixed 바이너리 프레임([u32 LE len][postcard])으로 loopback TCP에
 //! 실어 나른다 (JSON Vec<u8> 숫자 배열 팽창 해소).
-//! 인증: 서버가 실행마다 생성하는 토큰을 클라이언트가 첫 프레임으로 보낸다 —
-//! §1.5 "auth required by default". 불일치/무응답(5s)은 즉시 종료.
+//! 인증/핸드셰이크(v2, protocol.rs): 클라이언트가 첫 프레임으로 ClientHello
+//! (매직/버전/features/토큰)를 보내고 서버가 ServerHello(버전/협상된 features)로
+//! 응답한다 — 토큰은 실행마다 생성, §1.5 "auth required by default". 매직/버전/토큰
+//! 불일치·무응답(5s)은 즉시 종료. **단계 A: delta 미협상이라 이벤트/명령 프레임은
+//! v1과 바이트 동일**(협상된 코덱 Plain).
 //! public remote는 아직 아니다: bind는 127.0.0.1 고정, attach는 loopback만 허용.
 //! (TLS/delta 스트림은 v1+ — §8.2 "Viewport는 terminal delta로 대체되는 자리")
 //!
@@ -27,6 +30,9 @@ use crate::client::{RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream
 use crate::command::RuntimeCommand;
 use crate::event::RuntimeEvent;
 use crate::in_process::InProcessRuntimeClient;
+use crate::protocol::{
+    CLIENT_FEATURES, ClientHello, Codec, PROTO_MAGIC, PROTO_VERSION, SERVER_FEATURES, ServerHello,
+};
 
 /// 이벤트 pump 폴링 주기 — worker의 output batch와 별개인 전송 주기.
 const PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
@@ -57,9 +63,6 @@ fn write_frame(stream: &mut impl Write, payload: &[u8]) -> std::io::Result<()> {
     stream.write_all(payload)
 }
 
-/// 인증 성공 시 서버가 회신하는 ACK payload.
-const AUTH_ACK: &[u8] = b"ok";
-
 /// 프레임 하나를 읽는다. 상한 초과/EOF/IO 에러는 None — 호출측은 접속을 끝낸다.
 fn read_frame(reader: &mut impl Read) -> Option<Vec<u8>> {
     let mut len_bytes = [0u8; 4];
@@ -84,6 +87,58 @@ fn token_matches(expected: &str, provided: &[u8]) -> bool {
         .zip(provided)
         .fold(0u8, |acc, (a, b)| acc | (a ^ b))
         == 0
+}
+
+/// 서버측 핸드셰이크 v2 (§3.1): 첫 프레임 = [`ClientHello`].
+/// 매직/버전 검증 → 토큰 상수시간 비교 → features 교집합 → [`ServerHello`] 회신.
+/// 성공 시 협상된 접속 [`Codec`]을 반환한다. 실패(침묵/기형/구버전 프레임/토큰 불일치)는
+/// 소켓을 닫고 `None` — hang 없이 조기 거부한다(v1의 "인증 실패 = 즉시 종료" 계약 유지).
+fn server_handshake(stream: &TcpStream, auth_token: &str) -> Option<Codec> {
+    // 침묵 peer가 서버를 잡아두지 못하게 timeout (v1의 AUTH_TIMEOUT 계약).
+    let _ = stream.set_read_timeout(Some(AUTH_TIMEOUT));
+    let mut hs = stream.try_clone().ok()?;
+    let reject = || {
+        let _ = stream.shutdown(Shutdown::Both);
+    };
+    let Some(frame) = read_frame(&mut hs) else {
+        // 침묵/EOF/상한 초과 — 조기 종료
+        reject();
+        return None;
+    };
+    // 매직/버전 불일치 또는 기형(구버전 원시 토큰 프레임 포함)은 조기 거부 (hang 없음).
+    let hello = match postcard::from_bytes::<ClientHello>(&frame) {
+        Ok(hello) if hello.magic == PROTO_MAGIC && hello.proto_version == PROTO_VERSION => hello,
+        _ => {
+            tracing::warn!("remote 핸드셰이크 실패(매직/버전/기형) — 접속 거부");
+            reject();
+            return None;
+        }
+    };
+    if !token_matches(auth_token, &hello.token) {
+        tracing::warn!("remote 인증 실패 — 접속 거부");
+        reject();
+        return None;
+    }
+    // features_ack = 서버 지원 ∩ 클라이언트 요청. 단계 A는 SERVER_FEATURES==0이라 항상 0.
+    let features = SERVER_FEATURES & hello.features;
+    let server_hello = ServerHello {
+        proto_version: PROTO_VERSION,
+        features,
+    };
+    let payload = match postcard::to_allocvec(&server_hello) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!("remote ServerHello 직렬화 실패: {e}");
+            reject();
+            return None;
+        }
+    };
+    // ServerHello 회신 — 클라이언트 attach가 인증/협상 결과를 동기적으로 안다 (v1 ACK 계약 계승).
+    if write_frame(&mut hs, &payload).is_err() {
+        reject();
+        return None;
+    }
+    Some(Codec::from_features(features))
 }
 
 /// 서버가 수신한 명령의 와이어 값 검증 (codex 리뷰: 악성/기형 클라이언트 방어).
@@ -348,26 +403,10 @@ fn serve_connection(
     stop: &Arc<AtomicBool>,
     auth_token: &str,
 ) {
-    // 인증: 첫 프레임 = 토큰. 침묵 peer가 서버를 잡아두지 못하게 timeout.
-    let _ = stream.set_read_timeout(Some(AUTH_TIMEOUT));
-    {
-        let mut auth_reader = match stream.try_clone() {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let authorized =
-            read_frame(&mut auth_reader).is_some_and(|frame| token_matches(auth_token, &frame));
-        if !authorized {
-            tracing::warn!("remote 인증 실패 — 접속 거부");
-            let _ = stream.shutdown(Shutdown::Both);
-            return;
-        }
-        // 성공 ACK — 클라이언트 attach가 인증 결과를 동기적으로 알 수 있게 (codex 리뷰)
-        if write_frame(&mut auth_reader, AUTH_ACK).is_err() {
-            let _ = stream.shutdown(Shutdown::Both);
-            return;
-        }
-    }
+    // 핸드셰이크 v2: 첫 프레임 = ClientHello. 침묵 peer가 서버를 잡아두지 못하게 timeout.
+    let Some(codec) = server_handshake(&stream, auth_token) else {
+        return;
+    };
     let _ = stream.set_read_timeout(None);
 
     let receiver = backend.subscribe();
@@ -394,7 +433,8 @@ fn serve_connection(
                 }
                 let mut sent_event = false;
                 for event in receiver.drain() {
-                    let payload = match postcard::to_allocvec(&event) {
+                    // 접속 코덱으로 인코딩. 단계 A(Plain)는 postcard(RuntimeEvent)와 바이트 동일.
+                    let payload = match codec.encode_event(&event) {
                         Ok(payload) => payload,
                         Err(e) => {
                             tracing::warn!("remote event 직렬화 실패: {e}");
@@ -443,7 +483,8 @@ fn serve_connection(
     });
     // 상한 초과/EOF/기형 프레임은 None — 접속 종료 (valid frame만 허용).
     while let Some(frame) = read_frame(&mut reader) {
-        match postcard::from_bytes::<RuntimeCommand>(&frame) {
+        // 접속 코덱으로 디코딩. 단계 A(Plain)는 postcard(RuntimeCommand)와 바이트 동일.
+        match codec.decode_command(&frame) {
             Ok(command) => {
                 if let Err(reason) = validate_command(&command) {
                     tracing::warn!("remote 명령 검증 실패({reason}), 접속 종료");
@@ -473,6 +514,8 @@ pub struct RemoteRuntimeClient {
     writer: Mutex<TcpStream>,
     subscribers: Arc<Mutex<Vec<RemoteSubscriber>>>,
     reader_thread: Option<JoinHandle<()>>,
+    /// 핸드셰이크에서 협상된 접속 코덱 (§3.2). 단계 A는 항상 Plain.
+    codec: Codec,
 }
 
 struct RemoteSubscriber {
@@ -489,19 +532,39 @@ impl RemoteRuntimeClient {
         }
         let mut stream =
             TcpStream::connect(addr).with_context(|| format!("remote 서버 연결 실패: {addr}"))?;
-        write_frame(&mut stream, token.as_bytes()).context("remote 인증 프레임 전송 실패")?;
-        // 서버 ACK를 기다린다 — 없으면 잘못된 토큰/거부 (attach가 Ok를 반환하고
+        // 핸드셰이크 v2 (§3.1): ClientHello 송신 → ServerHello 대기. 토큰은 hello 안에 실린다.
+        let hello = ClientHello {
+            magic: PROTO_MAGIC,
+            proto_version: PROTO_VERSION,
+            features: CLIENT_FEATURES,
+            token: token.as_bytes().to_vec(),
+        };
+        let hello_payload =
+            postcard::to_allocvec(&hello).context("remote ClientHello 직렬화 실패")?;
+        write_frame(&mut stream, &hello_payload).context("remote 핸드셰이크 전송 실패")?;
+        // ServerHello를 기다린다 — 없으면 잘못된 토큰/거부 (attach가 Ok를 반환하고
         // 나서야 끊긴 것을 아는 반쪽 상태 방지. codex 리뷰)
         stream
             .set_read_timeout(Some(AUTH_TIMEOUT))
-            .context("remote 인증 대기 설정 실패")?;
-        let acked = read_frame(&mut stream).is_some_and(|frame| frame == AUTH_ACK);
-        if !acked {
+            .context("remote 핸드셰이크 대기 설정 실패")?;
+        let server_hello = read_frame(&mut stream)
+            .and_then(|frame| postcard::from_bytes::<ServerHello>(&frame).ok())
+            .filter(|hello| hello.proto_version == PROTO_VERSION);
+        let Some(server_hello) = server_hello else {
             bail!("remote 인증 거부 — 토큰을 확인하세요");
-        }
+        };
         stream
             .set_read_timeout(None)
-            .context("remote 인증 대기 해제 실패")?;
+            .context("remote 핸드셰이크 대기 해제 실패")?;
+        // 협상 불변식: agreed ⊆ 클라이언트 요청(CLIENT_FEATURES). 서버가 요청하지 않은
+        // bit를 ack하면 rogue/버그 서버다 — 이를 거부해 서버가 클라이언트에 미협상 코덱을
+        // 강제하지 못하게 한다 (codex 검수 P2). masking으로 무시만 하면, 서버가 그 기능으로
+        // 인코딩하는데 클라가 Plain으로 읽는 silent codec mismatch가 남으므로 거부가 더 방어적.
+        if server_hello.features & !CLIENT_FEATURES != 0 {
+            bail!("remote 서버가 미요청 feature를 ack — 협상 불변식 위반, 접속 거부");
+        }
+        // 위 검사로 features ⊆ CLIENT_FEATURES 보장됨 → 코덱 확정 (§3.2). 단계 A는 항상 Plain.
+        let codec = Codec::from_features(server_hello.features);
         let subscribers: Arc<Mutex<Vec<RemoteSubscriber>>> = Arc::default();
 
         let reader_subscribers = Arc::clone(&subscribers);
@@ -514,7 +577,8 @@ impl RemoteRuntimeClient {
                     if frame.is_empty() {
                         continue; // heartbeat(길이 0 프레임) — 이벤트가 아닌 keepalive로 소비
                     }
-                    let Ok(event) = postcard::from_bytes::<RuntimeEvent>(&frame) else {
+                    // 접속 코덱으로 디코딩. 단계 A(Plain)는 postcard(RuntimeEvent)와 바이트 동일.
+                    let Ok(event) = codec.decode_event(&frame) else {
                         tracing::warn!("remote 이벤트 프로토콜 위반 — 접속 종료");
                         break;
                     };
@@ -534,6 +598,7 @@ impl RemoteRuntimeClient {
             writer: Mutex::new(stream),
             subscribers,
             reader_thread: Some(reader_thread),
+            codec,
         })
     }
 }
@@ -564,7 +629,8 @@ fn dispatch(subscribers: &Arc<Mutex<Vec<RemoteSubscriber>>>, event: RuntimeEvent
 
 impl RuntimeCommandSink for RemoteRuntimeClient {
     fn send_command(&self, command: RuntimeCommand) -> anyhow::Result<()> {
-        let payload = postcard::to_allocvec(&command).context("remote 명령 직렬화 실패")?;
+        // 접속 코덱으로 인코딩. 단계 A(Plain)는 postcard(RuntimeCommand)와 바이트 동일.
+        let payload = self.codec.encode_command(&command)?;
         let mut stream = self.writer.lock().expect("remote writer lock");
         write_frame(&mut *stream, &payload).context("remote 명령 전송 실패")
     }
@@ -605,7 +671,24 @@ impl Drop for RemoteRuntimeClient {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::protocol::FEAT_DELTA_VIEWPORT;
     use std::time::{Duration, Instant};
+
+    /// v2 핸드셰이크를 수동으로 수행한다 (raw 소켓 테스트용):
+    /// ClientHello 송신 → ServerHello 디코드. 서버가 거부(소켓 종료)하면 None.
+    fn v2_handshake(raw: &mut TcpStream, token: &[u8], features: u32) -> Option<ServerHello> {
+        let hello = ClientHello {
+            magic: PROTO_MAGIC,
+            proto_version: PROTO_VERSION,
+            features,
+            token: token.to_vec(),
+        };
+        let payload = postcard::to_allocvec(&hello).unwrap();
+        write_frame(raw, &payload).unwrap();
+        raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let frame = read_frame(raw)?;
+        postcard::from_bytes::<ServerHello>(&frame).ok()
+    }
 
     fn init_mock_store() {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -712,23 +795,147 @@ mod tests {
         server.shutdown();
     }
 
-    /// §1.5 auth required: 잘못된 토큰은 attach가 이벤트를 받지 못하고 끊긴다.
+    /// §1.5 auth required: 매직/버전은 맞지만 토큰만 틀린 ClientHello는 ServerHello 없이 끊긴다.
     #[test]
     fn 잘못된_토큰은_거부() {
         let server = RemoteRuntimeServer::serve(test_backend("badtoken"), 0).unwrap();
         let mut raw = TcpStream::connect(server.local_addr()).unwrap();
-        write_frame(&mut raw, b"wrong-token").unwrap();
-        // 서버가 끊는다 — read가 EOF(0)
+        assert!(
+            v2_handshake(&mut raw, b"wrong-token", CLIENT_FEATURES).is_none(),
+            "잘못된 토큰은 ServerHello를 받지 못하고 끊겨야 한다"
+        );
+        server.shutdown();
+    }
+
+    /// v2 핸드셰이크 성공 + 기능 협상 교집합. 서버 지원 집합(SERVER_FEATURES=0)과의
+    /// 교집합이므로, 클라이언트가 아무것도 요청하지 않으면 빈 집합, delta를 요청해도
+    /// 서버 미지원이라 빈 집합이다.
+    #[test]
+    fn v2_핸드셰이크_성공_및_기능_협상() {
+        let server = RemoteRuntimeServer::serve(test_backend("negotiate"), 0).unwrap();
+
+        // 요청 없음(features=0) → 빈 교집합
+        let mut raw = TcpStream::connect(server.local_addr()).unwrap();
+        let hello =
+            v2_handshake(&mut raw, server.auth_token().as_bytes(), 0).expect("ServerHello 없음");
+        assert_eq!(hello.proto_version, PROTO_VERSION);
+        assert_eq!(hello.features, 0, "요청 없으면 협상 결과는 비어야 한다");
+
+        // delta 요청 → 서버 미지원이라 여전히 빈 교집합
+        let mut raw2 = TcpStream::connect(server.local_addr()).unwrap();
+        let hello2 = v2_handshake(
+            &mut raw2,
+            server.auth_token().as_bytes(),
+            FEAT_DELTA_VIEWPORT,
+        )
+        .expect("ServerHello 없음");
+        assert_eq!(
+            hello2.features, 0,
+            "서버가 미지원하는 기능은 협상되지 않는다"
+        );
+
+        server.shutdown();
+    }
+
+    /// 단계 A off-path 불변 (§3.2, §8 #1): delta 미협상(Plain 코덱)에서 이벤트/명령
+    /// 프레임은 봉투 없는 기존 `postcard(RuntimeCommand)`/`postcard(RuntimeEvent)`와
+    /// **바이트 동일**해야 한다. Plain 코덱을 A 이전 경로와 직접 대조해 못 박는다.
+    #[test]
+    fn plain_코덱은_기존_postcard와_바이트_동일() {
+        let command = RuntimeCommand::SpawnAgent {
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 100,
+            agent_config_id: Some("cfg-1".into()),
+            command: "claude".into(),
+            args: vec!["--foo".into()],
+            env_plain: vec![("K".into(), "V".into())],
+            env_secrets: vec![("S".into(), "cred-1".into())],
+            waiting_regex: None,
+            approval_regex: None,
+            error_regex: None,
+            done_regex: None,
+        };
+        assert_eq!(
+            Codec::Plain.encode_command(&command).unwrap(),
+            postcard::to_allocvec(&command).unwrap(),
+            "Plain 명령 프레임이 기존 postcard와 바이트 동일해야 한다"
+        );
+
+        let event = RuntimeEvent::ShellSpawned {
+            session: SessionId(7),
+        };
+        assert_eq!(
+            Codec::Plain.encode_event(&event).unwrap(),
+            postcard::to_allocvec(&event).unwrap(),
+            "Plain 이벤트 프레임이 기존 postcard와 바이트 동일해야 한다"
+        );
+
+        // 디코드도 기존 경로가 만든 프레임을 그대로 받아들인다(왕복).
+        let cmd_frame = postcard::to_allocvec(&command).unwrap();
+        assert!(matches!(
+            Codec::Plain.decode_command(&cmd_frame).unwrap(),
+            RuntimeCommand::SpawnAgent { cols: 80, .. }
+        ));
+    }
+
+    /// rogue/버그 서버가 클라이언트가 요청하지 않은 feature를 ack하면 클라이언트는
+    /// 협상 불변식(agreed ⊆ 요청) 위반으로 접속을 거부한다 — 서버가 클라이언트에
+    /// 미협상 코덱을 강제하지 못하게 (codex 검수 P2). off-path 불변의 클라이언트측 방어.
+    #[test]
+    fn 서버가_미요청_feature_ack하면_거부() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let rogue = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            // ClientHello 프레임 소비(내용 무시).
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            let _ = read_frame(&mut reader);
+            // 클라이언트가 요청하지 않은 FEAT_DELTA_VIEWPORT를 ack.
+            let hello = ServerHello {
+                proto_version: PROTO_VERSION,
+                features: FEAT_DELTA_VIEWPORT,
+            };
+            let payload = postcard::to_allocvec(&hello).unwrap();
+            let _ = write_frame(&mut sock, &payload);
+            // 클라이언트가 거부하고 끊을 때까지 잠깐 유지.
+            std::thread::sleep(Duration::from_millis(200));
+        });
+
+        let Err(err) = RemoteRuntimeClient::attach(addr, "tok") else {
+            panic!("미요청 feature ack은 거부돼야 한다");
+        };
+        assert!(
+            format!("{err:#}").contains("협상"),
+            "협상 불변식 위반 메시지여야 한다: {err:#}"
+        );
+        rogue.join().unwrap();
+    }
+
+    /// 구버전 v1 원시 토큰 프레임(=ClientHello 아님)은 hang 없이 조기 거부된다.
+    /// 매직/버전 prefix가 없어 postcard 디코드/매직 검증이 실패 → 즉시 종료(침묵 timeout 대기 아님).
+    #[test]
+    fn 구버전_첫_프레임은_hang없이_거부() {
+        let server = RemoteRuntimeServer::serve(test_backend("oldframe"), 0).unwrap();
+        let mut raw = TcpStream::connect(server.local_addr()).unwrap();
+        // v1 스타일: 매직 없는 원시 토큰 바이트 (hex라 매직 "DPRT"와 절대 일치 불가).
+        write_frame(&mut raw, server.auth_token().as_bytes()).unwrap();
         raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let start = Instant::now();
+        // 서버가 ServerHello 없이 끊는다 — read가 EOF(0)/에러로 끝난다.
         let mut buf = [0u8; 16];
-        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match std::io::Read::read(&mut raw, &mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }
-            assert!(Instant::now() < deadline, "거부 대기 시간 초과");
+            assert!(start.elapsed() < Duration::from_secs(10), "거부가 hang됨");
         }
+        // 조기 거부 확인 — 침묵 timeout(AUTH_TIMEOUT)까지 기다리지 않고 즉시 끊겨야 한다.
+        assert!(
+            start.elapsed() < AUTH_TIMEOUT,
+            "구버전 프레임은 즉시 거부돼야 한다(침묵 timeout 대기 아님)"
+        );
         server.shutdown();
     }
 
@@ -865,10 +1072,9 @@ mod tests {
     fn 유휴_접속에_heartbeat_프레임() {
         let server = RemoteRuntimeServer::serve(test_backend("heartbeat"), 0).unwrap();
         let mut raw = TcpStream::connect(server.local_addr()).unwrap();
-        write_frame(&mut raw, server.auth_token().as_bytes()).unwrap();
-        raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let ack = read_frame(&mut raw).expect("auth ack 없음");
-        assert_eq!(ack, AUTH_ACK);
+        let hello = v2_handshake(&mut raw, server.auth_token().as_bytes(), CLIENT_FEATURES)
+            .expect("ServerHello 없음");
+        assert_eq!(hello.proto_version, PROTO_VERSION);
 
         // HEARTBEAT_INTERVAL(15s) + 15s 여유
         raw.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
@@ -890,9 +1096,8 @@ mod tests {
     fn 접속_종료_후_목록에서_정리된다() {
         let server = RemoteRuntimeServer::serve(test_backend("cleanup"), 0).unwrap();
         let mut raw = TcpStream::connect(server.local_addr()).unwrap();
-        write_frame(&mut raw, server.auth_token().as_bytes()).unwrap();
-        raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let _ack = read_frame(&mut raw).expect("auth ack 없음");
+        let _hello = v2_handshake(&mut raw, server.auth_token().as_bytes(), CLIENT_FEATURES)
+            .expect("ServerHello 없음");
 
         // 접속이 목록에 등록될 때까지 대기
         let reg_deadline = Instant::now() + Duration::from_secs(5);
@@ -993,8 +1198,9 @@ mod tests {
     fn 잘못된_명령_라인은_접속_종료() {
         let server = RemoteRuntimeServer::serve(test_backend("protocol"), 0).unwrap();
         let mut raw = TcpStream::connect(server.local_addr()).unwrap();
-        // 정상 인증 후 postcard로 해석 불가한 프레임 전송
-        write_frame(&mut raw, server.auth_token().as_bytes()).unwrap();
+        // 정상 핸드셰이크 후 postcard로 해석 불가한 명령 프레임 전송
+        let _hello = v2_handshake(&mut raw, server.auth_token().as_bytes(), CLIENT_FEATURES)
+            .expect("ServerHello 없음");
         write_frame(&mut raw, &[0xff; 64]).unwrap();
         // 서버가 접속을 닫으면 read가 EOF(0)로 끝난다
         raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();

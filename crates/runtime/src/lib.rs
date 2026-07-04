@@ -7,6 +7,7 @@ mod command;
 mod event;
 mod in_process;
 mod persistence;
+mod protocol;
 mod remote;
 
 pub use client::{RuntimeClient, RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream};

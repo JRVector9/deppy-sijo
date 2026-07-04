@@ -2233,6 +2233,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcp-proxy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "audit",
+ "auth",
+ "mcp",
+ "rusqlite",
+ "secret",
+ "serde_json",
+ "storage",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

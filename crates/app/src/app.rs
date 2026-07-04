@@ -636,6 +636,7 @@ impl eframe::App for App {
             &self.config.terminal,
             &self.active.runtime,
             &events,
+            &self.db_path,
         );
         self.credentials_ui
             .show(ui.ctx(), &self.db, &self.secret_store);

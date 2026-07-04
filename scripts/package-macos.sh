@@ -20,6 +20,9 @@ rm -rf "$BUNDLE"
 mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
 
 cp "target/release/$BIN_NAME" "$BUNDLE/Contents/MacOS/$BIN_NAME"
+# agent-proxy 브리지 바이너리를 앱 옆에 함께 동봉한다 — mcp_proxy_bin()이 실행 파일
+# 옆에서 찾으므로, 권한계층 경유 스폰이 프록시를 확실히 찾게 한다 (codex).
+cp "target/release/deppy-mcp-proxy" "$BUNDLE/Contents/MacOS/deppy-mcp-proxy"
 
 cat > "$BUNDLE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

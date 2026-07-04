@@ -25,7 +25,9 @@ pub struct Db {
 /// 6: tool_audit_logs (PR-16, audit crate DDL),
 /// 7: agent_configs.deleted_at (soft-delete — 세션 영속 FK와 공존),
 /// 8: tool_permission_rules (PR-16 권한 규칙 영속),
-/// 9: pending_approvals (agent-proxy 1.5 — proxy↔GUI 라이브 승인 IPC 채널).
+/// 9: pending_approvals (agent-proxy 1.5 — proxy↔GUI 라이브 승인 IPC 채널),
+/// 10: agent_configs.mcp_proxy_* (agent-proxy 배선 — spawn 시 .mcp.json 생성 +
+///     --mcp-config로 에이전트를 deppy-mcp-proxy 권한계층에 태운다).
 /// 4~6은 각 crate가 소유한 DDL 상수를 그대로 붙인다 (스키마 정의는 한 곳에서만).
 const MIGRATIONS: &[&str] = &[
     "
@@ -137,6 +139,14 @@ CREATE TABLE pending_approvals (
 
 CREATE INDEX idx_pending_approvals_status ON pending_approvals(status);
 ",
+    // 10: agent_configs에 MCP proxy 배선 컬럼 추가. mcp_proxy_enabled=1이면 spawn 시
+    //     deppy-mcp-proxy를 프론트하는 .mcp.json을 생성해 --mcp-config로 붙인다.
+    //     mcp_proxy_server_id는 프론트할 backend mcp_server id (FK 없이 문자열 느슨 연결 —
+    //     tool_permission_rules/pending_approvals와 동일 관례; 서버가 지워지면 spawn 시 검증).
+    "
+ALTER TABLE agent_configs ADD COLUMN mcp_proxy_enabled INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE agent_configs ADD COLUMN mcp_proxy_server_id TEXT;
+",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -241,6 +251,10 @@ pub struct AgentConfigRow {
     pub approval_regex: Option<String>,
     pub error_regex: Option<String>,
     pub done_regex: Option<String>,
+    /// deppy-mcp-proxy 권한계층 경유 여부 (migration 10). true면 spawn 시 .mcp.json 생성.
+    pub mcp_proxy_enabled: bool,
+    /// 프론트할 backend mcp_server id (enabled일 때만 의미). None이면 미선택 — spawn은 미주입.
+    pub mcp_proxy_server_id: Option<String>,
 }
 
 impl Db {
@@ -789,6 +803,8 @@ impl Db {
         approval_regex: Option<&str>,
         error_regex: Option<&str>,
         done_regex: Option<&str>,
+        mcp_proxy_enabled: bool,
+        mcp_proxy_server_id: Option<&str>,
     ) -> anyhow::Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
         let args_json = serde_json::to_string(args)?;
@@ -797,8 +813,9 @@ impl Db {
                 "INSERT INTO agent_configs
                    (id, name, command, args_json,
                     waiting_regex, approval_regex, error_regex, done_regex,
+                    mcp_proxy_enabled, mcp_proxy_server_id,
                     created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                     strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
                 (
                     &id,
@@ -809,6 +826,8 @@ impl Db {
                     approval_regex,
                     error_regex,
                     done_regex,
+                    mcp_proxy_enabled as i64,
+                    mcp_proxy_server_id,
                 ),
             )
             .with_context(|| format!("agent config 저장 실패: {name}"))?;
@@ -818,7 +837,8 @@ impl Db {
     pub fn list_agent_configs(&self) -> anyhow::Result<Vec<AgentConfigRow>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, name, command, args_json,
-                    waiting_regex, approval_regex, error_regex, done_regex
+                    waiting_regex, approval_regex, error_regex, done_regex,
+                    mcp_proxy_enabled, mcp_proxy_server_id
              FROM agent_configs WHERE deleted_at IS NULL ORDER BY created_at, id",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -831,12 +851,15 @@ impl Db {
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, Option<String>>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         })?;
         // 손상 행 하나가 전체 목록을 죽이지 않게 skip + 경고 (원문은 로그에 남기지 않음)
         let mut out = Vec::new();
         for row in rows {
-            let (id, name, command, args_json, waiting, approval, error, done) = row?;
+            let (id, name, command, args_json, waiting, approval, error, done, proxy_on, proxy_srv) =
+                row?;
             match serde_json::from_str(&args_json) {
                 Ok(args) => out.push(AgentConfigRow {
                     id,
@@ -847,6 +870,8 @@ impl Db {
                     approval_regex: approval.filter(|s| !s.is_empty()),
                     error_regex: error.filter(|s| !s.is_empty()),
                     done_regex: done.filter(|s| !s.is_empty()),
+                    mcp_proxy_enabled: proxy_on != 0,
+                    mcp_proxy_server_id: proxy_srv.filter(|s| !s.is_empty()),
                 }),
                 Err(e) => tracing::warn!(agent_id = %id, "args_json 파싱 실패 — 행 무시: {e}"),
             }
@@ -1306,6 +1331,8 @@ mod tests {
                 None,
                 Some("(?i)error"),
                 None,
+                false,
+                None,
             )
             .unwrap();
         let listed = db.list_agent_configs().unwrap();
@@ -1316,8 +1343,61 @@ mod tests {
             listed[0].args,
             vec!["build".to_owned(), "--release".to_owned()]
         );
+        // 기본(구식) insert는 proxy 미사용 (0/NULL)으로 복원된다
+        assert!(!listed[0].mcp_proxy_enabled);
+        assert_eq!(listed[0].mcp_proxy_server_id, None);
         db.delete_agent_config(&id).unwrap();
         assert!(db.list_agent_configs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_config_mcp_proxy_필드_roundtrip() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_agent_config(
+            "프록시 에이전트",
+            "claude",
+            &["--dangerously".into()],
+            None,
+            None,
+            None,
+            None,
+            true,
+            Some("srv-backend"),
+        )
+        .unwrap();
+        let listed = db.list_agent_configs().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].mcp_proxy_enabled);
+        assert_eq!(
+            listed[0].mcp_proxy_server_id.as_deref(),
+            Some("srv-backend")
+        );
+    }
+
+    #[test]
+    fn v9에서_v10으로_업그레이드된다() {
+        let dir = std::env::temp_dir().join(format!("deppy-mig-9to10-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite3");
+        // user_version=9 (mcp_proxy_* 이전) 구버전 DB 구성
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..9] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 9).unwrap();
+        }
+        // 오픈 → IMMEDIATE 트랜잭션으로 migration 10 적용
+        let db = Db::open(&path).unwrap();
+        assert_eq!(Db::read_user_version(&db.conn).unwrap(), MIGRATIONS.len());
+        // 새 컬럼이 실제로 사용 가능 (insert/list round-trip)
+        db.insert_agent_config("a", "c", &[], None, None, None, None, true, Some("s"))
+            .unwrap();
+        let listed = db.list_agent_configs().unwrap();
+        assert!(listed[0].mcp_proxy_enabled);
+        assert_eq!(listed[0].mcp_proxy_server_id.as_deref(), Some("s"));
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

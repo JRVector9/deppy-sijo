@@ -561,12 +561,29 @@ impl RemoteRuntimeServer {
     /// 협상 코덱(loopback은 Delta) 프로토콜을 암호화 채널 위에서 그대로 돌린다.
     ///
     /// 평문 [`Self::serve`]와 프레이밍/토큰/코덱은 **동일** — TLS는 채널 보안만 얹는다(§2.3).
-    /// 비-loopback bind 정책/설정 UI(C-4)는 후속: 여기선 호출자가 주소를 책임진다.
+    ///
+    /// C-4 bind 정책(§2.5): 비-loopback bind는 `allow_non_loopback = true` **명시 opt-in**일
+    /// 때만 허용한다. 원격 attach는 SpawnAgent(임의 command/args/env)를 실을 수 있어
+    /// **셸 접근 부여와 동등**(§6) — 기본은 거부하고, opt-in 시에도 눈에 띄는 경고를 남긴다.
+    /// 공개 인터넷이 아니라 Tailscale/WireGuard 등 신뢰 경계 인터페이스 IP에 bind할 것.
     pub fn serve_tls(
         backend: InProcessRuntimeClient,
         addr: SocketAddr,
         identity: TlsIdentity,
+        allow_non_loopback: bool,
     ) -> anyhow::Result<Self> {
+        if !addr.ip().is_loopback() {
+            anyhow::ensure!(
+                allow_non_loopback,
+                "비-loopback bind({addr})는 allow_non_loopback 명시가 필요합니다 — \
+                 원격 노출은 셸 접근 부여와 동등(§6). 신뢰 경계(VPN) 인터페이스에만 여세요"
+            );
+            tracing::warn!(
+                %addr,
+                "remote TLS 서버를 비-loopback에 엽니다 — 토큰 보유자는 셸 접근과 동등한 \
+                 권한을 가집니다(§6). 신뢰 경계(VPN) 밖 노출 금지"
+            );
+        }
         let tls_config = Arc::new(build_server_config(&identity)?);
         let listener = TcpListener::bind(addr).context("remote TLS 서버 bind 실패")?;
         let addr = listener.local_addr()?;
@@ -1282,7 +1299,46 @@ impl RemoteRuntimeClient {
         token: &str,
         expected_fingerprint: &str,
     ) -> anyhow::Result<Self> {
-        let config = Arc::new(build_client_config(expected_fingerprint)?);
+        Self::attach_tls_inner(addr, token, Some(expected_fingerprint)).map(|(client, _)| client)
+    }
+
+    /// known_hosts 기반 TOFU attach (단계 C-3 잔여).
+    ///
+    /// - 저장된 핀이 있으면 그 지문으로 검증 attach → `TofuOutcome::Verified`.
+    ///   지문이 바뀌었으면 handshake가 실패하고 에러에 관찰 지문 + forget 안내가 담긴다.
+    /// - 항목이 없으면(first-use) **캡처 모드**로 접속해 관찰 지문을 즉시 핀한다 →
+    ///   `TofuOutcome::Pinned { fingerprint }`. **최초 접속은 무검증 창**(SSH TOFU와 동일
+    ///   한계, §6) — 반환된 지문을 사용자에게 보여주고 대역외 대조를 요구하는 것은 앱 UX 소관.
+    pub fn attach_tls_tofu(
+        addr: SocketAddr,
+        token: &str,
+        known_hosts: &mut crate::known_hosts::KnownHosts,
+    ) -> anyhow::Result<(Self, TofuOutcome)> {
+        let host = addr.to_string();
+        match known_hosts.lookup(&host).map(|s| s.to_owned()) {
+            Some(pinned) => {
+                let (client, _) = Self::attach_tls_inner(addr, token, Some(&pinned))?;
+                Ok((client, TofuOutcome::Verified))
+            }
+            None => {
+                let (client, observed) = Self::attach_tls_inner(addr, token, None)?;
+                let fingerprint =
+                    observed.context("TLS handshake가 끝났는데 관찰 지문이 없음 (내부 오류)")?;
+                known_hosts.pin(&host, &fingerprint)?;
+                Ok((client, TofuOutcome::Pinned { fingerprint }))
+            }
+        }
+    }
+
+    /// 공통 코어: expected가 Some이면 핀 검증, None이면 캡처 모드(first-use TOFU).
+    /// 성공 시 (클라이언트, 관찰 지문)을 돌려준다.
+    fn attach_tls_inner(
+        addr: SocketAddr,
+        token: &str,
+        expected_fingerprint: Option<&str>,
+    ) -> anyhow::Result<(Self, Option<String>)> {
+        let (config, observed) = build_client_config(expected_fingerprint)?;
+        let config = Arc::new(config);
         // ServerName은 검증기가 무시한다(TOFU). SNI/참조용 고정 더미(cert SAN과 동일).
         let server_name = ServerName::try_from("deppy-remote").expect("정적 server name");
         let mut conn: rustls::Connection = rustls::ClientConnection::new(config, server_name)
@@ -1310,32 +1366,50 @@ impl RemoteRuntimeClient {
             })
             .context("remote TLS IO thread 생성 실패")?;
 
-        Ok(Self {
-            transport: ClientTransport::Tls {
-                commands: cmd_tx,
-                shutdown,
+        let observed_fp = observed.lock().expect("observed lock").clone();
+        Ok((
+            Self {
+                transport: ClientTransport::Tls {
+                    commands: cmd_tx,
+                    shutdown,
+                },
+                subscribers,
+                reader_thread: Some(reader_thread),
+                codec,
             },
-            subscribers,
-            reader_thread: Some(reader_thread),
-            codec,
-        })
+            observed_fp,
+        ))
     }
+}
+
+/// attach_tls_tofu 결과 — 호출측 UX가 분기한다 (first-use면 지문 대역외 확인 안내).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TofuOutcome {
+    /// first-use: 관찰 지문을 새로 핀했다 — 사용자에게 보여주고 대조를 요구할 것.
+    Pinned { fingerprint: String },
+    /// 저장된 핀과 일치 확인.
+    Verified,
 }
 
 /// rustls `ClientConfig` — ring provider + 지문 핀닝 검증기(C-3 core). CA/hostname/만료를 무시하고
 /// SHA-256(cert DER) 지문 일치만으로 서버를 신뢰한다(TOFU).
-fn build_client_config(expected_fingerprint: &str) -> anyhow::Result<rustls::ClientConfig> {
+fn build_client_config(
+    expected_fingerprint: Option<&str>,
+) -> anyhow::Result<(rustls::ClientConfig, Arc<Mutex<Option<String>>>)> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let observed: Arc<Mutex<Option<String>>> = Arc::default();
     let verifier = Arc::new(FingerprintVerifier {
-        expected: expected_fingerprint.to_ascii_lowercase(),
+        expected: expected_fingerprint.map(str::to_ascii_lowercase),
+        observed: Arc::clone(&observed),
         supported: provider.signature_verification_algorithms,
     });
-    Ok(rustls::ClientConfig::builder_with_provider(provider)
+    let config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .context("rustls 클라이언트 프로토콜 버전 구성 실패")?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth())
+        .with_no_client_auth();
+    Ok((config, observed))
 }
 
 /// TOFU 지문 핀닝 검증기 (C-3 core, 설계 §2.2). 표준 PKI(CA 체인·hostname·만료) 대신
@@ -1343,8 +1417,12 @@ fn build_client_config(expected_fingerprint: &str) -> anyhow::Result<rustls::Cli
 /// 핀된 cert의 키를 실제로 보유한 peer만 통과시킨다(핀만 흉내낸 MITM 차단).
 #[derive(Debug)]
 struct FingerprintVerifier {
-    /// 소문자 정규화된 기대 지문("ab:cd:…").
-    expected: String,
+    /// 소문자 정규화된 기대 지문("ab:cd:…"). None = **캡처 모드**(first-use TOFU) —
+    /// 지문 대조 없이 통과시키되 관찰 지문만 기록한다. 캡처 모드 접속은 무검증 창이므로
+    /// attach_tls_tofu의 first-use 경로에서만 쓰고, 성공 시 즉시 pin한다.
+    expected: Option<String>,
+    /// handshake에서 관찰한 서버 cert 지문 — Mismatch 오류 표면화·first-use pin에 사용.
+    observed: Arc<Mutex<Option<String>>>,
     supported: WebPkiSupportedAlgorithms,
 }
 
@@ -1359,12 +1437,18 @@ impl ServerCertVerifier for FingerprintVerifier {
     ) -> Result<ServerCertVerified, rustls::Error> {
         // CA/hostname/만료는 무시(TOFU) — 지문만 대조.
         let got = crate::tls_identity::fingerprint(end_entity.as_ref());
-        if fingerprint_eq(got.as_bytes(), self.expected.as_bytes()) {
-            Ok(ServerCertVerified::assertion())
-        } else {
-            Err(rustls::Error::General(
-                "TLS 서버 인증서 지문 불일치 (TOFU 핀 실패)".into(),
-            ))
+        *self.observed.lock().expect("observed lock") = Some(got.clone());
+        match &self.expected {
+            // 캡처 모드(first-use TOFU): 통과 — 호출측이 관찰 지문을 pin한다.
+            None => Ok(ServerCertVerified::assertion()),
+            Some(expected) if fingerprint_eq(got.as_bytes(), expected.as_bytes()) => {
+                Ok(ServerCertVerified::assertion())
+            }
+            Some(_) => Err(rustls::Error::General(format!(
+                "TLS 서버 인증서 지문 불일치 (TOFU 핀 실패) — 관찰 지문: {got}. \
+                 서버가 바뀌었거나 중간자일 수 있습니다; 의도한 변경이면 known_hosts에서 \
+                 이 host를 제거(forget) 후 재접속해 다시 핀하세요"
+            ))),
         }
     }
 
@@ -2964,6 +3048,96 @@ mod tests {
         )
     }
 
+    /// C-3 잔여: known_hosts TOFU — first-use는 핀, 재접속은 검증, 지문 변경은 거부+복구.
+    #[test]
+    fn tofu_first_use핀_재접속검증_지문변경거부_forget복구() {
+        let kh_dir = std::env::temp_dir().join(format!("deppy-tofu-{}", std::process::id()));
+        std::fs::create_dir_all(&kh_dir).unwrap();
+        let kh_path = kh_dir.join("known_hosts");
+        let mut kh = crate::known_hosts::KnownHosts::load(&kh_path).unwrap();
+
+        let identity = test_identity();
+        let fp = identity.fingerprint();
+        let server = RemoteRuntimeServer::serve_tls(
+            test_backend("tofu"),
+            "127.0.0.1:0".parse().unwrap(),
+            identity,
+            false,
+        )
+        .unwrap();
+        let addr = server.local_addr();
+        let host = addr.to_string();
+
+        // first-use → Pinned(관찰 지문) + 파일 반영
+        let (client, outcome) =
+            RemoteRuntimeClient::attach_tls_tofu(addr, server.auth_token(), &mut kh).unwrap();
+        assert_eq!(
+            outcome,
+            TofuOutcome::Pinned {
+                fingerprint: fp.clone()
+            }
+        );
+        assert_eq!(kh.lookup(&host), Some(fp.as_str()));
+        drop(client);
+
+        // 재접속 → Verified (저장 핀으로 검증 attach)
+        let mut kh2 = crate::known_hosts::KnownHosts::load(&kh_path).unwrap();
+        let (client2, outcome2) =
+            RemoteRuntimeClient::attach_tls_tofu(addr, server.auth_token(), &mut kh2).unwrap();
+        assert_eq!(outcome2, TofuOutcome::Verified);
+        drop(client2);
+
+        // 지문 변경 시뮬레이션: 다른 identity의 서버 B에, A의 지문을 미리 핀해 두면
+        // Mismatch → handshake 거부, 에러에 관찰 지문+forget 안내가 담긴다.
+        let identity_b = test_identity();
+        let fp_b = identity_b.fingerprint();
+        let server_b = RemoteRuntimeServer::serve_tls(
+            test_backend("tofu-b"),
+            "127.0.0.1:0".parse().unwrap(),
+            identity_b,
+            false,
+        )
+        .unwrap();
+        let host_b = server_b.local_addr().to_string();
+        kh2.pin(&host_b, &fp).unwrap(); // 일부러 옛(A) 지문을 핀
+        let err = match RemoteRuntimeClient::attach_tls_tofu(
+            server_b.local_addr(),
+            server_b.auth_token(),
+            &mut kh2,
+        ) {
+            Ok(_) => panic!("지문 불일치인데 attach가 성공하면 안 된다"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("지문 불일치"), "{msg}");
+
+        // forget → 재-TOFU 성공(새 지문 핀)
+        kh2.forget(&host_b).unwrap();
+        let (_client3, outcome3) = RemoteRuntimeClient::attach_tls_tofu(
+            server_b.local_addr(),
+            server_b.auth_token(),
+            &mut kh2,
+        )
+        .unwrap();
+        assert_eq!(outcome3, TofuOutcome::Pinned { fingerprint: fp_b });
+        std::fs::remove_dir_all(&kh_dir).unwrap();
+    }
+
+    /// C-4: 비-loopback bind는 명시 opt-in 없이는 거부된다 (bind 전에 검증 — 소켓 안 열림).
+    #[test]
+    fn 비loopback_bind는_optin_없이_거부() {
+        let err = match RemoteRuntimeServer::serve_tls(
+            test_backend("c4-guard"),
+            "0.0.0.0:0".parse().unwrap(),
+            test_identity(),
+            false,
+        ) {
+            Ok(_) => panic!("opt-in 없는 비-loopback bind가 성공하면 안 된다"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("allow_non_loopback"), "{err:#}");
+    }
+
     /// TLS 왕복: 올바른 지문으로 attach_tls → SpawnShell 명령이 암호화 채널을 건너 worker에 닿고
     /// ShellSpawned/MuxUpdated/Viewport(재구성된 전체)가 되돌아온다 (평문 왕복의 TLS판, Delta 협상).
     #[test]
@@ -2974,6 +3148,7 @@ mod tests {
             test_backend("tls-roundtrip"),
             "127.0.0.1:0".parse().unwrap(),
             identity,
+            false,
         )
         .unwrap();
         let client =
@@ -3017,6 +3192,7 @@ mod tests {
             test_backend("tls-badfp"),
             "127.0.0.1:0".parse().unwrap(),
             identity,
+            false,
         )
         .unwrap();
 
@@ -3059,6 +3235,7 @@ mod tests {
             test_backend("tls-badtoken"),
             "127.0.0.1:0".parse().unwrap(),
             identity,
+            false,
         )
         .unwrap();
         assert!(
@@ -3083,6 +3260,7 @@ mod tests {
             test_backend("tls-idle"),
             "127.0.0.1:0".parse().unwrap(),
             identity,
+            false,
         )
         .unwrap();
         let client =
@@ -3143,9 +3321,13 @@ mod tests {
         );
         let identity = test_identity();
         let fp = identity.fingerprint();
-        let server =
-            RemoteRuntimeServer::serve_tls(backend, "127.0.0.1:0".parse().unwrap(), identity)
-                .unwrap();
+        let server = RemoteRuntimeServer::serve_tls(
+            backend,
+            "127.0.0.1:0".parse().unwrap(),
+            identity,
+            false,
+        )
+        .unwrap();
         let client =
             RemoteRuntimeClient::attach_tls(server.local_addr(), server.auth_token(), &fp).unwrap();
         let rx = client.subscribe();
@@ -3233,6 +3415,7 @@ mod tests {
             test_backend("tls-flood"),
             "127.0.0.1:0".parse().unwrap(),
             identity,
+            false,
         )
         .unwrap();
         let client =
@@ -3316,9 +3499,13 @@ mod tests {
         );
         let identity = test_identity();
         let fp = identity.fingerprint();
-        let server =
-            RemoteRuntimeServer::serve_tls(backend, "127.0.0.1:0".parse().unwrap(), identity)
-                .unwrap();
+        let server = RemoteRuntimeServer::serve_tls(
+            backend,
+            "127.0.0.1:0".parse().unwrap(),
+            identity,
+            false,
+        )
+        .unwrap();
         let client =
             RemoteRuntimeClient::attach_tls(server.local_addr(), server.auth_token(), &fp).unwrap();
         let rx = client.subscribe();
@@ -3367,6 +3554,7 @@ mod tests {
             test_backend("tls-oversize"),
             "127.0.0.1:0".parse().unwrap(),
             identity,
+            false,
         )
         .unwrap();
         let client =

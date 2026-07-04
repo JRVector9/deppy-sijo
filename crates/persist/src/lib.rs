@@ -8,7 +8,9 @@ mod recovery;
 mod repo;
 
 pub use layout_json::{layout_from_json, layout_to_json};
-pub use recovery::{LockFile, reconcile_orphan_sessions, validate_log_offset};
+pub use recovery::{
+    LockFile, delete_workspace_data, reconcile_orphan_sessions, validate_log_offset,
+};
 pub use repo::{
     PaneState, SESSION_STATUS_EXITED, SESSION_STATUS_RUNNING, SessionRow, TabState, WindowState,
     load_sessions, load_window_layouts, save_window_layout, update_session_log_offset,

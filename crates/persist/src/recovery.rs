@@ -94,6 +94,35 @@ pub fn reconcile_orphan_sessions(conn: &Connection) -> anyhow::Result<usize> {
     .context("orphan session reconcile 실패")
 }
 
+/// workspace 삭제 시 persist 소유 테이블(sessions, mux_*)의 해당 workspace 행을
+/// FK 순서로 지운다. 호출측이 트랜잭션으로 감싸 env/workspace 삭제와 원자화한다.
+/// mux_windows.active_tab_id ↔ mux_tabs 순환은 먼저 NULL로 끊는다.
+pub fn delete_workspace_data(conn: &Connection, workspace_id: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE mux_windows SET active_tab_id = NULL WHERE workspace_id = ?1",
+        [workspace_id],
+    )
+    .context("mux_windows active_tab_id 해제 실패")?;
+    // 자식 → 부모 순 (layouts→panes→tabs→windows, sessions는 panes가 참조하므로 그 뒤)
+    for (table, sql) in [
+        (
+            "mux_layouts",
+            "DELETE FROM mux_layouts WHERE workspace_id = ?1",
+        ),
+        ("mux_panes", "DELETE FROM mux_panes WHERE workspace_id = ?1"),
+        ("mux_tabs", "DELETE FROM mux_tabs WHERE workspace_id = ?1"),
+        (
+            "mux_windows",
+            "DELETE FROM mux_windows WHERE workspace_id = ?1",
+        ),
+        ("sessions", "DELETE FROM sessions WHERE workspace_id = ?1"),
+    ] {
+        conn.execute(sql, [workspace_id])
+            .with_context(|| format!("{table} 삭제 실패"))?;
+    }
+    Ok(())
+}
+
 /// 기록된 log offset을 실제 파일과 대조해 보정한다 (partial write 복구).
 /// 파일이 없으면 0, offset이 파일 길이 이내면 그대로, 파일이 offset보다 짧으면
 /// (crash로 offset 기록보다 로그가 덜 써진 것) 마지막 개행 직후 =
@@ -273,6 +302,20 @@ mod tests {
 
         drop(conn);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn delete_workspace_data는_해당_workspace_세션만_지운다() {
+        let conn = test_conn();
+        conn.execute("INSERT OR IGNORE INTO workspaces (id) VALUES ('ws-2')", [])
+            .unwrap();
+        upsert_session(&conn, &sample_session("s1", SESSION_STATUS_RUNNING)).unwrap(); // ws-1
+        let mut s2 = sample_session("s2", SESSION_STATUS_RUNNING);
+        s2.workspace_id = "ws-2".into();
+        upsert_session(&conn, &s2).unwrap();
+        delete_workspace_data(&conn, "ws-1").unwrap();
+        assert!(load_sessions(&conn, "ws-1").unwrap().is_empty());
+        assert_eq!(load_sessions(&conn, "ws-2").unwrap().len(), 1);
     }
 
     #[test]

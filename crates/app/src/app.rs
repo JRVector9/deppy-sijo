@@ -43,6 +43,8 @@ pub struct App {
     workspaces: Vec<crate::storage::WorkspaceRow>,
     workspaces_open: bool,
     new_workspace_name: String,
+    /// 삭제 확인 대기 중인 workspace id (2단계 확인 — 실수 방지)
+    confirm_delete_ws: Option<String>,
     /// 전환으로 background 정리 중인 옛 워커 shutdown 스레드들 (workspace_id, handle).
     /// 앱 종료 시 join(자식 reap 보장) + 같은 workspace 재오픈 전 직렬화(layout 경합 방지).
     pending_shutdowns: Vec<(String, std::thread::JoinHandle<()>)>,
@@ -117,6 +119,7 @@ impl App {
             workspaces: Vec::new(),
             workspaces_open: false,
             new_workspace_name: String::new(),
+            confirm_delete_ws: None,
             pending_shutdowns: Vec::new(),
         }
     }
@@ -255,7 +258,11 @@ impl App {
         }
         let mut open = true;
         let mut switch_to: Option<String> = None;
+        let mut delete_id: Option<String> = None;
+        let mut set_confirm: Option<String> = None;
+        let mut cancel_confirm = false;
         let mut create = false;
+        let deletable = self.workspaces.len() > 1; // 마지막 workspace는 삭제 불가
         egui::Window::new("워크스페이스")
             .open(&mut open)
             .resizable(false)
@@ -269,6 +276,20 @@ impl App {
                             ui.label(&ws.name);
                             if ui.button("전환").clicked() {
                                 switch_to = Some(ws.id.clone());
+                            }
+                            // 삭제 (활성/마지막 제외) — 2단계 확인
+                            if deletable {
+                                if self.confirm_delete_ws.as_deref() == Some(ws.id.as_str()) {
+                                    ui.colored_label(egui::Color32::RED, "세션·env 삭제?");
+                                    if ui.button("삭제").clicked() {
+                                        delete_id = Some(ws.id.clone());
+                                    }
+                                    if ui.button("취소").clicked() {
+                                        cancel_confirm = true;
+                                    }
+                                } else if ui.button("삭제").clicked() {
+                                    set_confirm = Some(ws.id.clone());
+                                }
                             }
                         }
                     });
@@ -296,7 +317,24 @@ impl App {
                 }
             }
         }
+        if cancel_confirm {
+            self.confirm_delete_ws = None;
+        }
+        if let Some(id) = set_confirm {
+            self.confirm_delete_ws = Some(id);
+        }
+        if let Some(id) = delete_id {
+            self.confirm_delete_ws = None;
+            // 활성 workspace는 삭제 목록에 뜨지 않으므로 여기 도달하지 않는다 (이중 방어)
+            if id != self.workspace_id {
+                if let Err(e) = self.db.delete_workspace(&id) {
+                    tracing::warn!("workspace 삭제 실패: {e:#}");
+                }
+                self.refresh_workspaces();
+            }
+        }
         if let Some(id) = switch_to {
+            self.confirm_delete_ws = None;
             self.switch_workspace(&id);
             self.refresh_workspaces();
         }

@@ -335,6 +335,28 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// workspace + 그 자식 데이터(세션/mux/env)를 한 트랜잭션으로 삭제한다 (destructive).
+    /// mcp_servers(전역)·감사 로그(FK 없음)는 남긴다. 활성/마지막 workspace 삭제 방지는
+    /// 호출측(UI) 책임.
+    pub fn delete_workspace(&mut self, workspace_id: &str) -> anyhow::Result<()> {
+        let tx = self.conn.transaction()?;
+        // persist 소유 테이블 (sessions, mux_*) — FK 순서
+        persist::delete_workspace_data(&tx, workspace_id)?;
+        // env (storage 소유): env_vars → env_profiles
+        tx.execute(
+            "DELETE FROM env_vars WHERE profile_id IN
+               (SELECT id FROM env_profiles WHERE workspace_id = ?1)",
+            [workspace_id],
+        )?;
+        tx.execute(
+            "DELETE FROM env_profiles WHERE workspace_id = ?1",
+            [workspace_id],
+        )?;
+        tx.execute("DELETE FROM workspaces WHERE id = ?1", [workspace_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// 새 workspace 생성 — 생성된 id 반환.
     pub fn create_workspace(&self, name: &str) -> anyhow::Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
@@ -635,6 +657,26 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delete_workspace는_자식env와_workspace만_지운다() {
+        let mut db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("삭제대상").unwrap();
+        let other = db.create_workspace("유지").unwrap();
+        let profile = db.insert_env_profile(&ws, "dev", "custom").unwrap();
+        db.upsert_env_var(&profile, "K", &EnvValue::Plain("v".into()))
+            .unwrap();
+        db.insert_env_profile(&other, "dev", "custom").unwrap();
+
+        db.delete_workspace(&ws).unwrap();
+        // 삭제 대상: workspace·env 모두 사라짐
+        assert!(db.list_workspaces().unwrap().iter().all(|w| w.id != ws));
+        assert!(db.list_env_profiles(&ws).unwrap().is_empty());
+        assert!(db.list_env_vars(&profile).unwrap().is_empty());
+        // 다른 workspace는 그대로
+        assert!(db.list_workspaces().unwrap().iter().any(|w| w.id == other));
+        assert_eq!(db.list_env_profiles(&other).unwrap().len(), 1);
+    }
 
     #[test]
     fn 권한규칙_upsert_list_roundtrip() {

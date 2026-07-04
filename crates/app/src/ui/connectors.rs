@@ -9,7 +9,8 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use mcp::{LocalMcpManager, McpServerConfig, McpServerRow, McpTool, McpToolRow};
+use mcp::{LocalMcpManager, McpServerConfig, McpTool};
+use mcp_store::{McpServerRow, McpToolRow};
 use secret::{KeyringSecretStore, RedactionService, SecretStore};
 
 use crate::storage::{CredentialMeta, Db};

@@ -947,6 +947,7 @@ dependencies = [
  "eframe",
  "egui",
  "mcp",
+ "mcp-store",
  "persist",
  "platform",
  "regex",
@@ -2240,6 +2241,7 @@ dependencies = [
  "audit",
  "auth",
  "mcp",
+ "mcp-store",
  "rusqlite",
  "secret",
  "serde_json",
@@ -2247,6 +2249,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "mcp-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rusqlite",
+ "serde_json",
 ]
 
 [[package]]
@@ -3910,7 +3921,7 @@ dependencies = [
  "anyhow",
  "audit",
  "deppy-core",
- "mcp",
+ "mcp-store",
  "persist",
  "rusqlite",
  "secret",

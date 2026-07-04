@@ -1,0 +1,528 @@
+//! mcp-store — MCP 영속 계층 (v2.8 §6.4).
+//!
+//! mcp_servers/mcp_tools + tool_permission_rules + pending_approvals의 SQL/Row를 소유한다.
+//! 모든 함수는 Connection을 인자로 받는다(연결/트랜잭션 소유는 호출측 — storage facade 또는
+//! persist orchestration). **mcp(runtime)를 모른다** — 규칙(rule)은 문자열("allow"/"deny"/
+//! "ask")로만 다루고 해석(PermissionRule)은 상위 계층 소관. audit도 모른다(금지 edge).
+//!
+//! 마이그레이션 원장: 이 crate는 SQL 상수만 제공하고, 전역 순서(v5/v8/v9 슬롯)는
+//! storage의 MIGRATIONS가 소유한다 (재배열 금지 — docs/dependency-graph.md).
+
+use anyhow::Context;
+use rusqlite::{Connection, OptionalExtension};
+
+/// §11.4 mcp_servers + §11.5 mcp_tools DDL — 전역 마이그레이션 v5 슬롯.
+pub const MIGRATION_SQL: &str = "
+CREATE TABLE mcp_servers (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    command TEXT,
+    args_json TEXT,
+    url TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE mcp_tools (
+    id TEXT PRIMARY KEY,
+    server_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT,
+    input_schema_json TEXT,
+    trust_level TEXT NOT NULL DEFAULT 'unknown',
+    schema_hash TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(server_id) REFERENCES mcp_servers(id)
+);
+
+CREATE INDEX idx_mcp_tools_server_name ON mcp_tools(server_id, name);
+";
+
+/// tool 권한 규칙 DDL (PR-16) — 전역 마이그레이션 v8 슬롯.
+pub const MIGRATION_TOOL_PERMISSION_RULES: &str = "
+CREATE TABLE tool_permission_rules (
+    server_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    rule TEXT NOT NULL,
+    approved_schema_hash TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (server_id, tool_name)
+);
+";
+
+/// pending_approvals DDL (agent-proxy 1.5 라이브 승인 IPC) — 전역 마이그레이션 v9 슬롯.
+pub const MIGRATION_PENDING_APPROVALS: &str = "
+CREATE TABLE pending_approvals (
+    id TEXT PRIMARY KEY,
+    server_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    arguments_preview TEXT NOT NULL,
+    schema_hash TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    remember INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    resolved_at INTEGER,
+    CHECK (status IN ('pending', 'allowed', 'denied'))
+);
+
+CREATE INDEX idx_pending_approvals_status ON pending_approvals(status);
+";
+
+/// tool 권한 규칙 한 행. rule은 영속 문자열("allow"|"deny"|"ask") — 해석은 상위 계층.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PermissionRuleRow {
+    pub server_id: String,
+    pub tool_name: String,
+    pub rule: String,
+    pub approved_schema_hash: Option<String>,
+}
+
+/// pending_approvals.status 값. DB 문자열 'pending' | 'allowed' | 'denied'와 1:1 대응.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalStatus {
+    Pending,
+    Allowed,
+    Denied,
+}
+
+impl ApprovalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApprovalStatus::Pending => "pending",
+            ApprovalStatus::Allowed => "allowed",
+            ApprovalStatus::Denied => "denied",
+        }
+    }
+
+    /// 영속 문자열에서 복원 — 알 수 없는 값은 None (호출측이 fail-closed 처리).
+    pub fn from_persisted(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(ApprovalStatus::Pending),
+            "allowed" => Some(ApprovalStatus::Allowed),
+            "denied" => Some(ApprovalStatus::Denied),
+            _ => None,
+        }
+    }
+}
+
+/// poll_approval 결과 — 현재 상태 + "기억하기"(규칙 영속) 플래그.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApprovalOutcome {
+    pub status: ApprovalStatus,
+    pub remember: bool,
+}
+
+/// pending 상태 승인 요청 한 행 (GUI 목록/팝업용).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingApprovalRow {
+    pub id: String,
+    pub server_id: String,
+    pub tool_name: String,
+    /// 이미 redact된 표시용 미리보기 (원문 secret 아님).
+    pub arguments_preview: String,
+    pub schema_hash: Option<String>,
+    pub created_at: i64,
+}
+
+pub fn list_permission_rules(conn: &Connection) -> anyhow::Result<Vec<PermissionRuleRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT server_id, tool_name, rule, approved_schema_hash FROM tool_permission_rules",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(PermissionRuleRow {
+            server_id: row.get(0)?,
+            tool_name: row.get(1)?,
+            rule: row.get(2)?,
+            approved_schema_hash: row.get(3)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// 권한 규칙 저장/갱신 (AllowAlways/DenyAlways 결정 시).
+pub fn upsert_permission_rule(
+    conn: &Connection,
+    server_id: &str,
+    tool_name: &str,
+    rule: &str,
+    approved_schema_hash: Option<&str>,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO tool_permission_rules
+           (server_id, tool_name, rule, approved_schema_hash, updated_at)
+         VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+         ON CONFLICT(server_id, tool_name) DO UPDATE SET
+           rule = excluded.rule,
+           approved_schema_hash = excluded.approved_schema_hash,
+           updated_at = excluded.updated_at",
+        (server_id, tool_name, rule, approved_schema_hash),
+    )?;
+    Ok(())
+}
+
+/// 권한 규칙 삭제 (Ask로 재설정 — 행이 없으면 기본값 Ask).
+pub fn delete_permission_rule(
+    conn: &Connection,
+    server_id: &str,
+    tool_name: &str,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM tool_permission_rules WHERE server_id = ?1 AND tool_name = ?2",
+        (server_id, tool_name),
+    )?;
+    Ok(())
+}
+
+/// 라이브 승인 요청을 등록한다 (deppy-mcp-proxy → GUI). id는 호출측이 만든 UUID,
+/// created_at은 호출측이 SystemTime으로 넘긴 unix seconds. arguments_preview는
+/// proxy가 이미 redact한 표시용 문자열이어야 한다.
+pub fn insert_pending_approval(
+    conn: &Connection,
+    id: &str,
+    server_id: &str,
+    tool_name: &str,
+    arguments_preview: &str,
+    schema_hash: Option<&str>,
+    created_at: i64,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO pending_approvals
+           (id, server_id, tool_name, arguments_preview, schema_hash,
+            status, remember, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6)",
+        (
+            id,
+            server_id,
+            tool_name,
+            arguments_preview,
+            schema_hash,
+            created_at,
+        ),
+    )
+    .with_context(|| format!("pending approval 저장 실패: {id}"))?;
+    Ok(())
+}
+
+/// 현재 상태를 폴링한다 (proxy가 반복 호출). 행이 없으면 Err — fail-closed.
+pub fn poll_approval(conn: &Connection, id: &str) -> anyhow::Result<ApprovalOutcome> {
+    let row: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT status, remember FROM pending_approvals WHERE id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (status, remember) = row.with_context(|| format!("pending approval 없음: {id}"))?;
+    let status = ApprovalStatus::from_persisted(&status)
+        .with_context(|| format!("알 수 없는 approval status '{status}': {id}"))?;
+    Ok(ApprovalOutcome {
+        status,
+        remember: remember != 0,
+    })
+}
+
+/// pending 상태 요청만, 오래된 순으로 (GUI 목록). id는 tie-break(결정적 순서).
+pub fn list_pending_approvals(conn: &Connection) -> anyhow::Result<Vec<PendingApprovalRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, server_id, tool_name, arguments_preview, schema_hash, created_at
+         FROM pending_approvals WHERE status = 'pending' ORDER BY created_at, id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(PendingApprovalRow {
+            id: row.get(0)?,
+            server_id: row.get(1)?,
+            tool_name: row.get(2)?,
+            arguments_preview: row.get(3)?,
+            schema_hash: row.get(4)?,
+            created_at: row.get(5)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// GUI가 결정을 되쓴다. first-writer-wins — 없거나 이미 해소된 id면 조용한 no-op(Ok).
+pub fn resolve_approval(
+    conn: &Connection,
+    id: &str,
+    allowed: bool,
+    remember: bool,
+    resolved_at: i64,
+) -> anyhow::Result<()> {
+    let status = if allowed {
+        ApprovalStatus::Allowed
+    } else {
+        ApprovalStatus::Denied
+    };
+    conn.execute(
+        "UPDATE pending_approvals
+         SET status = ?2, remember = ?3, resolved_at = ?4
+         WHERE id = ?1 AND status = 'pending'",
+        (id, status.as_str(), remember as i64, resolved_at),
+    )
+    .with_context(|| format!("approval 해소 실패: {id}"))?;
+    Ok(())
+}
+
+/// 크래시로 남은 orphan pending 승인 행 정리 — cutoff보다 오래된 pending을 denied로.
+pub fn expire_pending_approvals(
+    conn: &Connection,
+    older_than_epoch_secs: i64,
+    resolved_at: i64,
+) -> anyhow::Result<usize> {
+    let affected = conn
+        .execute(
+            "UPDATE pending_approvals
+             SET status = 'denied', resolved_at = ?2
+             WHERE status = 'pending' AND created_at < ?1",
+            (older_than_epoch_secs, resolved_at),
+        )
+        .context("orphan pending 승인 만료 실패")?;
+    Ok(affected)
+}
+
+/// §11.4 mcp_servers 한 행.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpServerRow {
+    pub id: String,
+    pub name: String,
+    /// v0는 'stdio'만 (§1.5) — 'http'는 v1+
+    pub kind: String,
+    pub command: Option<String>,
+    /// args_json 컬럼에 JSON 배열로 저장
+    pub args: Vec<String>,
+    pub url: Option<String>,
+    pub enabled: bool,
+}
+
+/// §11.5 mcp_tools 한 행.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpToolRow {
+    pub id: String,
+    pub server_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub input_schema_json: Option<String>,
+    /// 기본 'unknown' — 신뢰 승격/정책은 PR-16
+    pub trust_level: String,
+    /// PR-16 audit이 기록 — 여기서는 NULL 허용 통과만
+    pub schema_hash: Option<String>,
+}
+
+pub fn insert_server(conn: &Connection, row: &McpServerRow) -> anyhow::Result<()> {
+    let args_json = serde_json::to_string(&row.args)?;
+    conn.execute(
+        "INSERT INTO mcp_servers (id, name, kind, command, args_json, url, enabled, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+            strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        (
+            &row.id,
+            &row.name,
+            &row.kind,
+            &row.command,
+            &args_json,
+            &row.url,
+            row.enabled,
+        ),
+    )
+    .with_context(|| format!("mcp_server 저장 실패: {}", row.name))?;
+    Ok(())
+}
+
+pub fn list_servers(conn: &Connection) -> anyhow::Result<Vec<McpServerRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, kind, command, args_json, url, enabled
+         FROM mcp_servers ORDER BY created_at, id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, bool>(6)?,
+        ))
+    })?;
+    let mut servers = Vec::new();
+    for row in rows {
+        let (id, name, kind, command, args_json, url, enabled) = row?;
+        let args = match args_json {
+            Some(json) => {
+                serde_json::from_str(&json).with_context(|| format!("args_json 파싱 실패: {id}"))?
+            }
+            None => Vec::new(),
+        };
+        servers.push(McpServerRow {
+            id,
+            name,
+            kind,
+            command,
+            args,
+            url,
+            enabled,
+        });
+    }
+    Ok(servers)
+}
+
+pub fn insert_tool(conn: &Connection, row: &McpToolRow) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO mcp_tools
+           (id, server_id, name, description, input_schema_json, trust_level, schema_hash,
+            created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+            strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        (
+            &row.id,
+            &row.server_id,
+            &row.name,
+            &row.description,
+            &row.input_schema_json,
+            &row.trust_level,
+            &row.schema_hash,
+        ),
+    )
+    .with_context(|| format!("mcp_tool 저장 실패: {}", row.name))?;
+    Ok(())
+}
+
+/// 서버의 tool 목록을 새 발견 결과로 원자적으로 교체한다 (재연결 시 중복 방지).
+/// rows의 server_id는 호출측이 일치시켜 넘긴다.
+pub fn replace_tools_for_server(
+    conn: &mut Connection,
+    server_id: &str,
+    rows: &[McpToolRow],
+) -> anyhow::Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM mcp_tools WHERE server_id = ?1", [server_id])
+        .with_context(|| format!("mcp_tools 삭제 실패: {server_id}"))?;
+    for row in rows {
+        insert_tool(&tx, row)?;
+    }
+    tx.commit().context("mcp_tools 교체 commit 실패")
+}
+
+pub fn list_tools_for_server(
+    conn: &Connection,
+    server_id: &str,
+) -> anyhow::Result<Vec<McpToolRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, server_id, name, description, input_schema_json, trust_level, schema_hash
+         FROM mcp_tools WHERE server_id = ?1 ORDER BY name, id",
+    )?;
+    let rows = stmt.query_map([server_id], |row| {
+        Ok(McpToolRow {
+            id: row.get(0)?,
+            server_id: row.get(1)?,
+            name: row.get(2)?,
+            description: row.get(3)?,
+            input_schema_json: row.get(4)?,
+            trust_level: row.get(5)?,
+            schema_hash: row.get(6)?,
+        })
+    })?;
+    let mut tools = Vec::new();
+    for row in rows {
+        tools.push(row?);
+    }
+    Ok(tools)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MIGRATION_SQL;
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        // 앱은 모든 연결에 foreign_keys=ON을 강제한다 (§11.9) — 테스트도 동일 조건
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute_batch(MIGRATION_SQL).unwrap();
+        conn
+    }
+
+    fn sample_server() -> McpServerRow {
+        McpServerRow {
+            id: "srv-1".to_owned(),
+            name: "filesystem".to_owned(),
+            kind: "stdio".to_owned(),
+            command: Some("npx".to_owned()),
+            args: vec!["-y".to_owned(), "server-filesystem".to_owned()],
+            url: None,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn server_insert_list_roundtrip() {
+        let conn = test_conn();
+        let server = sample_server();
+        insert_server(&conn, &server).unwrap();
+        assert_eq!(list_servers(&conn).unwrap(), vec![server]);
+    }
+
+    #[test]
+    fn replace_tools는_기존을_지우고_교체() {
+        let mut conn = test_conn();
+        insert_server(&conn, &sample_server()).unwrap();
+        let tool = |id: &str, name: &str| McpToolRow {
+            id: id.to_owned(),
+            server_id: "srv-1".to_owned(),
+            name: name.to_owned(),
+            description: None,
+            input_schema_json: None,
+            trust_level: "unknown".to_owned(),
+            schema_hash: None,
+        };
+        replace_tools_for_server(&mut conn, "srv-1", &[tool("t1", "old")]).unwrap();
+        replace_tools_for_server(
+            &mut conn,
+            "srv-1",
+            &[tool("t2", "new_a"), tool("t3", "new_b")],
+        )
+        .unwrap();
+        let names: Vec<String> = list_tools_for_server(&conn, "srv-1")
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names, vec!["new_a", "new_b"]);
+    }
+
+    #[test]
+    fn tool_insert_list_roundtrip() {
+        let conn = test_conn();
+        insert_server(&conn, &sample_server()).unwrap();
+        let tool = McpToolRow {
+            id: "tool-1".to_owned(),
+            server_id: "srv-1".to_owned(),
+            name: "read_file".to_owned(),
+            description: Some("파일 읽기".to_owned()),
+            input_schema_json: Some(r#"{"type":"object"}"#.to_owned()),
+            trust_level: "unknown".to_owned(),
+            schema_hash: None, // PR-16 소관 — NULL 허용
+        };
+        insert_tool(&conn, &tool).unwrap();
+        assert_eq!(list_tools_for_server(&conn, "srv-1").unwrap(), vec![tool]);
+        assert!(list_tools_for_server(&conn, "srv-2").unwrap().is_empty());
+    }
+
+    #[test]
+    fn 없는_서버로_tool_insert는_fk_위반() {
+        let conn = test_conn();
+        let tool = McpToolRow {
+            id: "tool-x".to_owned(),
+            server_id: "no-such-server".to_owned(),
+            name: "x".to_owned(),
+            description: None,
+            input_schema_json: None,
+            trust_level: "unknown".to_owned(),
+            schema_hash: None,
+        };
+        assert!(insert_tool(&conn, &tool).is_err());
+    }
+}

@@ -20,6 +20,7 @@ tracing-subscriber = { workspace = true }
 audit = { path = "../audit" }
 auth = { path = "../auth" }
 mcp = { path = "../mcp" }
+mcp-store = { path = "../mcp-store" }
 secret = { path = "../secret" }
 storage = { path = "../storage" }
 

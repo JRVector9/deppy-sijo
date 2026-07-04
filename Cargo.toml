@@ -9,6 +9,7 @@ members = [
     "crates/core",
     "crates/mcp",
     "crates/mcp-proxy",
+    "crates/mcp-store",
     "crates/mux",
     "crates/persist",
     "crates/pty",

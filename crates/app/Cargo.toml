@@ -21,6 +21,7 @@ uuid = { workspace = true }
 audit = { path = "../audit" }
 auth = { path = "../auth" }
 mcp = { path = "../mcp" }
+mcp-store = { path = "../mcp-store" }
 persist = { path = "../persist" }
 platform = { path = "../platform" }
 runtime = { path = "../runtime" }

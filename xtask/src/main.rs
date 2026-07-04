@@ -53,6 +53,10 @@ const FORBIDDEN_EDGES: &[(&str, &str)] = &[
     ("mcp-store", "runtime"),
     ("mcp-store", "app"),
     ("mcp-store", "mcp"),
+    ("mcp-store", "audit"),
+    ("mcp-store", "secret"),
+    ("mcp-store", "storage"),
+    ("mcp-store", "persist"),
     ("persist", "runtime"),
     ("persist", "app"),
 ];

@@ -12,7 +12,8 @@ mod forwarder;
 mod hook;
 
 use anyhow::Context;
-use mcp::{LocalMcpManager, McpServerConfig, McpServerRow, run_proxy};
+use mcp::{LocalMcpManager, McpServerConfig, run_proxy};
+use mcp_store::McpServerRow;
 use secret::{KeyringSecretStore, RedactionService, SecretStore};
 
 use crate::cli::Cli;

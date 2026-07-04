@@ -100,7 +100,7 @@ CREATE TABLE agent_configs (
 );
 ",
     persist::MIGRATION_SQL,
-    mcp::MIGRATION_SQL,
+    mcp_store::MIGRATION_SQL,
     audit::MIGRATION_SQL,
     // 7: agent_configs soft-delete — sessions.agent_id FK(§11.1)가 실행 이력이
     //    있는 config의 물리 삭제를 막으므로, 삭제는 표시로 대체한다
@@ -108,37 +108,13 @@ CREATE TABLE agent_configs (
     // 8: tool 권한 규칙 영속 (PR-16 — 재시작해도 Allow/Deny always가 유지되도록).
     //    (server_id, tool_name)별 rule + 마지막 승인 schema hash. FK는 두지 않는다
     //    (규칙은 문자열 키로 느슨히 연결 — orphan은 무해, 감사/로그와 동일한 관례).
-    "
-CREATE TABLE tool_permission_rules (
-    server_id TEXT NOT NULL,
-    tool_name TEXT NOT NULL,
-    rule TEXT NOT NULL,
-    approved_schema_hash TEXT,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (server_id, tool_name)
-);
-",
+    mcp_store::MIGRATION_TOOL_PERMISSION_RULES,
     // 9: pending_approvals (agent-proxy option 1.5). deppy-mcp-proxy가 Ask 규칙 tool을
     //    만나면 이 표에 pending 행을 넣고 status를 폴링한다; GUI는 pending 행을 감시해
     //    팝업을 띄우고 결정을 되쓴다. 두 프로세스가 같은 DB(WAL+busy_timeout)를 공유하는
     //    IPC 채널. arguments_preview는 proxy가 redact를 끝낸 표시용 문자열만 담는다(원문 secret 금지).
     //    권한 규칙(tool_permission_rules)과 마찬가지로 FK는 두지 않는다(문자열 키 느슨 연결).
-    "
-CREATE TABLE pending_approvals (
-    id TEXT PRIMARY KEY,
-    server_id TEXT NOT NULL,
-    tool_name TEXT NOT NULL,
-    arguments_preview TEXT NOT NULL,
-    schema_hash TEXT,
-    status TEXT NOT NULL DEFAULT 'pending',
-    remember INTEGER NOT NULL DEFAULT 0,
-    created_at INTEGER NOT NULL,
-    resolved_at INTEGER,
-    CHECK (status IN ('pending', 'allowed', 'denied'))
-);
-
-CREATE INDEX idx_pending_approvals_status ON pending_approvals(status);
-",
+    mcp_store::MIGRATION_PENDING_APPROVALS,
     // 10: agent_configs에 MCP proxy 배선 컬럼 추가. mcp_proxy_enabled=1이면 spawn 시
     //     deppy-mcp-proxy를 프론트하는 .mcp.json을 생성해 --mcp-config로 붙인다.
     //     mcp_proxy_server_id는 프론트할 backend mcp_server id (FK 없이 문자열 느슨 연결 —
@@ -166,65 +142,8 @@ pub struct WorkspaceRow {
     pub created_at: String,
 }
 
-/// tool 권한 규칙 한 행 (PermissionPolicy 영속 — PR-16).
-#[derive(Debug, Clone, PartialEq)]
-pub struct PermissionRuleRow {
-    pub server_id: String,
-    pub tool_name: String,
-    /// "allow" | "deny" | "ask" (audit::PermissionRule::as_str)
-    pub rule: String,
-    pub approved_schema_hash: Option<String>,
-}
-
-/// pending_approvals.status 값 (proxy가 폴링으로 읽는 상태).
-/// DB 문자열 'pending' | 'allowed' | 'denied'와 1:1 대응.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApprovalStatus {
-    Pending,
-    Allowed,
-    Denied,
-}
-
-impl ApprovalStatus {
-    /// 영속 문자열 (저장/조회 양쪽에서 이것만 쓴다).
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ApprovalStatus::Pending => "pending",
-            ApprovalStatus::Allowed => "allowed",
-            ApprovalStatus::Denied => "denied",
-        }
-    }
-
-    /// 영속 문자열에서 복원 — 알 수 없는 값은 None (호출측이 fail-closed 처리).
-    pub fn from_persisted(s: &str) -> Option<Self> {
-        match s {
-            "pending" => Some(ApprovalStatus::Pending),
-            "allowed" => Some(ApprovalStatus::Allowed),
-            "denied" => Some(ApprovalStatus::Denied),
-            _ => None,
-        }
-    }
-}
-
-/// poll_approval 결과 — 현재 상태 + "기억하기"(규칙 영속) 플래그.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ApprovalOutcome {
-    pub status: ApprovalStatus,
-    /// true면 GUI가 이 결정을 PermissionRule로 영속하기로 표시했다.
-    pub remember: bool,
-}
-
-/// pending 상태 승인 요청 한 행 (GUI 목록/팝업용).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingApprovalRow {
-    pub id: String,
-    pub server_id: String,
-    pub tool_name: String,
-    /// 이미 redact된 표시용 미리보기 (원문 secret 아님).
-    pub arguments_preview: String,
-    pub schema_hash: Option<String>,
-    pub created_at: i64,
-}
+/// 권한 규칙/승인 IPC 타입은 mcp-store 소유(v2.8) — 기존 storage:: 경로 호환을 위해 재수출.
+pub use mcp_store::{ApprovalOutcome, ApprovalStatus, PendingApprovalRow, PermissionRuleRow};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnvProfileRow {
@@ -419,42 +338,31 @@ impl Db {
     }
 
     /// MCP 서버 목록 (Connector Center, PR-17). repo 로직은 mcp crate 소유.
-    pub fn list_mcp_servers(&self) -> anyhow::Result<Vec<mcp::McpServerRow>> {
-        mcp::list_servers(&self.conn)
+    pub fn list_mcp_servers(&self) -> anyhow::Result<Vec<mcp_store::McpServerRow>> {
+        mcp_store::list_servers(&self.conn)
     }
 
-    pub fn insert_mcp_server(&self, row: &mcp::McpServerRow) -> anyhow::Result<()> {
-        mcp::insert_server(&self.conn, row)
+    pub fn insert_mcp_server(&self, row: &mcp_store::McpServerRow) -> anyhow::Result<()> {
+        mcp_store::insert_server(&self.conn, row)
     }
 
     /// 연결 테스트로 발견한 tools를 교체 저장 (PR-17).
     pub fn replace_mcp_tools(
         &mut self,
         server_id: &str,
-        rows: &[mcp::McpToolRow],
+        rows: &[mcp_store::McpToolRow],
     ) -> anyhow::Result<()> {
-        mcp::replace_tools_for_server(&mut self.conn, server_id, rows)
+        mcp_store::replace_tools_for_server(&mut self.conn, server_id, rows)
     }
 
     /// 저장된 tool 목록 (도구 실행 UI용).
-    pub fn list_mcp_tools(&self, server_id: &str) -> anyhow::Result<Vec<mcp::McpToolRow>> {
-        mcp::list_tools_for_server(&self.conn, server_id)
+    pub fn list_mcp_tools(&self, server_id: &str) -> anyhow::Result<Vec<mcp_store::McpToolRow>> {
+        mcp_store::list_tools_for_server(&self.conn, server_id)
     }
 
     /// 저장된 tool 권한 규칙 전체 (앱 시작 시 PermissionPolicy로 로드).
     pub fn list_permission_rules(&self) -> anyhow::Result<Vec<PermissionRuleRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT server_id, tool_name, rule, approved_schema_hash FROM tool_permission_rules",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(PermissionRuleRow {
-                server_id: row.get(0)?,
-                tool_name: row.get(1)?,
-                rule: row.get(2)?,
-                approved_schema_hash: row.get(3)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        mcp_store::list_permission_rules(&self.conn)
     }
 
     /// 권한 규칙 저장/갱신 (AllowAlways/DenyAlways 결정 시).
@@ -465,31 +373,21 @@ impl Db {
         rule: &str,
         approved_schema_hash: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.conn.execute(
-            "INSERT INTO tool_permission_rules
-               (server_id, tool_name, rule, approved_schema_hash, updated_at)
-             VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-             ON CONFLICT(server_id, tool_name) DO UPDATE SET
-               rule = excluded.rule,
-               approved_schema_hash = excluded.approved_schema_hash,
-               updated_at = excluded.updated_at",
-            (server_id, tool_name, rule, approved_schema_hash),
-        )?;
-        Ok(())
+        mcp_store::upsert_permission_rule(
+            &self.conn,
+            server_id,
+            tool_name,
+            rule,
+            approved_schema_hash,
+        )
     }
 
     /// 권한 규칙 삭제 (Ask로 재설정 — 행이 없으면 기본값 Ask).
     pub fn delete_permission_rule(&self, server_id: &str, tool_name: &str) -> anyhow::Result<()> {
-        self.conn.execute(
-            "DELETE FROM tool_permission_rules WHERE server_id = ?1 AND tool_name = ?2",
-            (server_id, tool_name),
-        )?;
-        Ok(())
+        mcp_store::delete_permission_rule(&self.conn, server_id, tool_name)
     }
 
-    /// 라이브 승인 요청을 등록한다 (deppy-mcp-proxy → GUI). id는 호출측이 만든 UUID,
-    /// created_at은 호출측이 SystemTime으로 넘긴 unix seconds (테스트 결정성을 위해 내부에서
-    /// 시간을 읽지 않는다). arguments_preview는 proxy가 이미 redact한 표시용 문자열이어야 한다.
+    /// 라이브 승인 요청 등록 (deppy-mcp-proxy → GUI). 세부 계약은 mcp_store 문서 참조.
     pub fn insert_pending_approval(
         &self,
         id: &str,
@@ -499,68 +397,28 @@ impl Db {
         schema_hash: Option<&str>,
         created_at: i64,
     ) -> anyhow::Result<()> {
-        self.conn
-            .execute(
-                "INSERT INTO pending_approvals
-                   (id, server_id, tool_name, arguments_preview, schema_hash,
-                    status, remember, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6)",
-                (
-                    id,
-                    server_id,
-                    tool_name,
-                    arguments_preview,
-                    schema_hash,
-                    created_at,
-                ),
-            )
-            .with_context(|| format!("pending approval 저장 실패: {id}"))?;
-        Ok(())
+        mcp_store::insert_pending_approval(
+            &self.conn,
+            id,
+            server_id,
+            tool_name,
+            arguments_preview,
+            schema_hash,
+            created_at,
+        )
     }
 
-    /// 현재 상태를 폴링한다 (proxy가 반복 호출). 행이 없으면 Err —
-    /// proxy는 자신이 넣은 id를 폴링하므로, 없는 행은 예외 상황(정리/삭제)이고
-    /// fail-closed(거부/중단)로 다뤄야 한다. status 문자열이 기형이어도 Err.
+    /// 현재 상태 폴링 (proxy). 행 없음/기형 status는 Err — fail-closed.
     pub fn poll_approval(&self, id: &str) -> anyhow::Result<ApprovalOutcome> {
-        let row: Option<(String, i64)> = self
-            .conn
-            .query_row(
-                "SELECT status, remember FROM pending_approvals WHERE id = ?1",
-                [id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let (status, remember) = row.with_context(|| format!("pending approval 없음: {id}"))?;
-        let status = ApprovalStatus::from_persisted(&status)
-            .with_context(|| format!("알 수 없는 approval status '{status}': {id}"))?;
-        Ok(ApprovalOutcome {
-            status,
-            remember: remember != 0,
-        })
+        mcp_store::poll_approval(&self.conn, id)
     }
 
-    /// pending 상태 요청만, 오래된 순으로 (GUI 목록). id는 tie-break(결정적 순서).
+    /// pending 상태 요청만, 오래된 순으로 (GUI 목록).
     pub fn list_pending_approvals(&self) -> anyhow::Result<Vec<PendingApprovalRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, server_id, tool_name, arguments_preview, schema_hash, created_at
-             FROM pending_approvals WHERE status = 'pending' ORDER BY created_at, id",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(PendingApprovalRow {
-                id: row.get(0)?,
-                server_id: row.get(1)?,
-                tool_name: row.get(2)?,
-                arguments_preview: row.get(3)?,
-                schema_hash: row.get(4)?,
-                created_at: row.get(5)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        mcp_store::list_pending_approvals(&self.conn)
     }
 
-    /// GUI가 결정을 되쓴다. `WHERE id=? AND status='pending'` 단일 UPDATE로
-    /// 이미 해소된 행은 덮어쓰지 않는다(먼저 쓴 결정이 이긴다) — 없거나 이미
-    /// 해소된 id면 조용한 no-op(Ok). resolved_at은 호출측이 넘긴 unix seconds.
+    /// GUI가 결정을 되쓴다 — first-writer-wins, 이미 해소된 id는 조용한 no-op.
     pub fn resolve_approval(
         &self,
         id: &str,
@@ -568,41 +426,16 @@ impl Db {
         remember: bool,
         resolved_at: i64,
     ) -> anyhow::Result<()> {
-        let status = if allowed {
-            ApprovalStatus::Allowed
-        } else {
-            ApprovalStatus::Denied
-        };
-        self.conn
-            .execute(
-                "UPDATE pending_approvals
-                 SET status = ?2, remember = ?3, resolved_at = ?4
-                 WHERE id = ?1 AND status = 'pending'",
-                (id, status.as_str(), remember as i64, resolved_at),
-            )
-            .with_context(|| format!("approval 해소 실패: {id}"))?;
-        Ok(())
+        mcp_store::resolve_approval(&self.conn, id, allowed, remember, resolved_at)
     }
 
-    /// 크래시로 남은 orphan pending 승인 행을 정리한다: created_at이 `older_than_epoch_secs`
-    /// 보다 오래된 'pending' 행을 전부 'denied'로 표시(resolved_at 설정)한다. 반영된 행 수 반환.
-    /// 프록시가 시작 시 호출해 이전에 죽은 프록시가 남긴 죽은 팝업을 GUI에서 치운다.
-    /// 단일 UPDATE(WAL 안전). `status='pending'` 조건이라 이미 해소된 행은 건드리지 않는다.
+    /// 크래시 orphan pending 정리 — cutoff보다 오래된 pending을 denied로. 반영 행 수 반환.
     pub fn expire_pending_approvals(
         &self,
         older_than_epoch_secs: i64,
         resolved_at: i64,
     ) -> anyhow::Result<usize> {
-        let affected = self
-            .conn
-            .execute(
-                "UPDATE pending_approvals
-                 SET status = 'denied', resolved_at = ?2
-                 WHERE status = 'pending' AND created_at < ?1",
-                (older_than_epoch_secs, resolved_at),
-            )
-            .context("orphan pending 승인 만료 실패")?;
-        Ok(affected)
+        mcp_store::expire_pending_approvals(&self.conn, older_than_epoch_secs, resolved_at)
     }
 
     /// tool 실행 감사 기록 (PR-16). encryptor를 넘기면 전체 입력이 암호화 저장된다 (§7).

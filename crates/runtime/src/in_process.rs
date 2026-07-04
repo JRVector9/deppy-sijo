@@ -667,6 +667,16 @@ impl Worker {
                     self.restore_saved_layout();
                 }
             }
+            RuntimeCommand::ResizeSplit { tab, path, ratio } => {
+                if let Some(t) = self.mux.tabs.get_mut(&tab)
+                    && t.layout.set_split_ratio(&path, ratio)
+                {
+                    // 새 배치(구조)만 UI에 반영 — 드래그 중 매 프레임 올 수 있으므로
+                    // snapshot 강제 재생성(watched push)은 하지 않는다. pane 크기 변화에
+                    // 따른 PTY Resize는 UI가 렌더 시 cols/rows 변화를 감지해 보낸다.
+                    self.emit_mux_snapshot();
+                }
+            }
         }
     }
 

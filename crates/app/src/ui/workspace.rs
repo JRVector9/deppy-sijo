@@ -31,6 +31,9 @@ pub struct WorkspaceUi {
     pending_focus: Option<runtime::MuxPaneId>,
     /// 응답(Spawned/Failed)을 아직 못 받은 셸 spawn 수 — 0이 될 때까지 계속 폴링
     pending_spawns: u32,
+    /// split 경계 드래그 중 로컬 미리보기 (path, ratio). 드래그 동안은 명령을 보내지
+    /// 않고(매 프레임 DB 저장 방지) 릴리즈 시 1회 ResizeSplit을 보낸다.
+    split_drag: Option<(Vec<u8>, f32)>,
     error: Option<String>,
 }
 
@@ -56,6 +59,7 @@ impl WorkspaceUi {
             last_focused_pane: None,
             pending_focus: None,
             pending_spawns: 0,
+            split_drag: None,
             error: None,
         }
     }
@@ -87,6 +91,14 @@ impl WorkspaceUi {
                         if !visible.contains(id) {
                             view.snapshot = None;
                         }
+                    }
+                    // 드래그 중 tab 전환/분할 구조 변경이면 미리보기가 다른 split에
+                    // 잘못 적용될 수 있다 — 구조가 바뀌는 지점에서 정리 (codex 리뷰).
+                    // 리사이즈 자신의 MuxUpdated는 drag_stopped 이후라 잃을 상태가 없다.
+                    if self.mux.as_ref().map(|m| (&m.active_tab, &m.tabs))
+                        != Some((&snapshot.active_tab, &snapshot.tabs))
+                    {
+                        self.split_drag = None;
                     }
                     self.mux = Some(Arc::clone(snapshot));
                 }
@@ -195,7 +207,18 @@ impl WorkspaceUi {
 
         let rect = ui.available_rect_before_wrap();
         let layout = active_tab.layout.clone();
-        self.render_node(ui, rect, &layout, &mux, config, client);
+        let tab_id = active_tab.id.clone();
+        let mut split_path = Vec::new();
+        self.render_node(
+            ui,
+            rect,
+            &layout,
+            &mux,
+            config,
+            client,
+            &tab_id,
+            &mut split_path,
+        );
 
         // 응답(MuxUpdated/Viewport)을 다음 프레임에서 수신하도록 보장
         self.flush_command_repaint(ui.ctx());
@@ -279,6 +302,7 @@ impl WorkspaceUi {
 
     /// layout 트리를 rect 분할로 재귀 렌더한다.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn render_node(
         &mut self,
         ui: &mut egui::Ui,
@@ -287,6 +311,8 @@ impl WorkspaceUi {
         mux: &MuxSnapshot,
         config: &TerminalConfig,
         client: &dyn RuntimeClient,
+        tab_id: &runtime::MuxTabId,
+        path: &mut Vec<u8>,
     ) {
         match node {
             LayoutNode::Pane(pane_id) => {
@@ -295,6 +321,15 @@ impl WorkspaceUi {
                 // 덮어 그리지 않게 페인터 클립도 pane 영역으로 줄인다
                 child.set_clip_rect(rect.intersect(ui.clip_rect()));
                 self.render_pane(&mut child, pane_id, mux, config, client);
+                // 포커스된 pane 테두리 — 어느 작업영역이 입력을 받는지 표시
+                if mux.focused_pane.as_ref() == Some(pane_id) {
+                    ui.painter().rect_stroke(
+                        rect,
+                        2.0,
+                        egui::Stroke::new(1.5, ui.visuals().selection.stroke.color),
+                        egui::StrokeKind::Inside,
+                    );
+                }
             }
             LayoutNode::Split {
                 direction,
@@ -303,7 +338,12 @@ impl WorkspaceUi {
                 second,
             } => {
                 let gap = 4.0;
-                let (first_rect, second_rect) = match direction {
+                // 드래그 중이면 로컬 미리보기 ratio 사용 (릴리즈 시에만 명령 전송)
+                let ratio = match &self.split_drag {
+                    Some((drag_path, preview)) if drag_path == path => *preview,
+                    _ => *ratio,
+                };
+                let (first_rect, second_rect, gap_rect) = match direction {
                     SplitDirection::Horizontal => {
                         // 좌/우 분할
                         let split_x = rect.min.x + (rect.width() - gap) * ratio;
@@ -312,6 +352,10 @@ impl WorkspaceUi {
                             egui::Rect::from_min_max(
                                 egui::pos2(split_x + gap, rect.min.y),
                                 rect.max,
+                            ),
+                            egui::Rect::from_min_max(
+                                egui::pos2(split_x, rect.min.y),
+                                egui::pos2(split_x + gap, rect.max.y),
                             ),
                         )
                     }
@@ -324,12 +368,76 @@ impl WorkspaceUi {
                                 egui::pos2(rect.min.x, split_y + gap),
                                 rect.max,
                             ),
+                            egui::Rect::from_min_max(
+                                egui::pos2(rect.min.x, split_y),
+                                egui::pos2(rect.max.x, split_y + gap),
+                            ),
                         )
                     }
                 };
-                self.render_node(ui, first_rect, first, mux, config, client);
-                self.render_node(ui, second_rect, second, mux, config, client);
+                self.split_handle(ui, rect, gap_rect, *direction, gap, client, tab_id, path);
+                path.push(0);
+                self.render_node(ui, first_rect, first, mux, config, client, tab_id, path);
+                path.pop();
+                path.push(1);
+                self.render_node(ui, second_rect, second, mux, config, client, tab_id, path);
+                path.pop();
             }
+        }
+    }
+
+    /// split 경계 드래그 핸들 — 드래그 중엔 split_drag로 로컬 미리보기만 갱신하고,
+    /// 릴리즈 시 1회 ResizeSplit을 보낸다 (드래그 내내 DB 저장/이벤트 폭주 방지).
+    #[allow(clippy::too_many_arguments)]
+    fn split_handle(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        gap_rect: egui::Rect,
+        direction: SplitDirection,
+        gap: f32,
+        client: &dyn RuntimeClient,
+        tab_id: &runtime::MuxTabId,
+        path: &[u8],
+    ) {
+        // 4px 경계는 잡기 어려우니 히트 영역만 양쪽 2px씩 확장 (시각 폭은 그대로)
+        let hit_rect = gap_rect.expand2(match direction {
+            SplitDirection::Horizontal => egui::vec2(2.0, 0.0),
+            SplitDirection::Vertical => egui::vec2(0.0, 2.0),
+        });
+        let id = egui::Id::new(("split_handle", tab_id, path));
+        let resp = ui.interact(hit_rect, id, egui::Sense::drag());
+        let cursor = match direction {
+            SplitDirection::Horizontal => egui::CursorIcon::ResizeHorizontal,
+            SplitDirection::Vertical => egui::CursorIcon::ResizeVertical,
+        };
+        let resp = resp.on_hover_cursor(cursor);
+        if resp.hovered() || resp.dragged() {
+            ui.painter()
+                .rect_filled(gap_rect, 0.0, ui.visuals().selection.bg_fill);
+        }
+        if resp.dragged()
+            && let Some(pointer) = resp.interact_pointer_pos()
+        {
+            let ratio = match direction {
+                SplitDirection::Horizontal => (pointer.x - rect.min.x) / (rect.width() - gap),
+                SplitDirection::Vertical => (pointer.y - rect.min.y) / (rect.height() - gap),
+            }
+            .clamp(0.1, 0.9);
+            self.split_drag = Some((path.to_vec(), ratio));
+        }
+        if resp.drag_stopped()
+            && let Some((drag_path, ratio)) = self.split_drag.take()
+            && drag_path == path
+        {
+            self.send(
+                client,
+                RuntimeCommand::ResizeSplit {
+                    tab: tab_id.clone(),
+                    path: drag_path,
+                    ratio,
+                },
+            );
         }
     }
 

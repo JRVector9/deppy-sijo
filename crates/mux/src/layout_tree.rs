@@ -115,6 +115,37 @@ impl LayoutNode {
             }
         }
     }
+
+    /// 루트 기준 path(0=first, 1=second)로 내려가 그 Split의 ratio를 바꾼다 (마우스
+    /// 리사이즈). path가 Split이 아닌 곳을 가리키면 false — layout이 명령 전송 후
+    /// 바뀌었을 수 있다(stale 명령은 무해하게 무시). ratio는 pane이 사라지지 않게 clamp.
+    /// 원격/기형 명령 방어: non-finite ratio(NaN은 clamp를 통과한다)와 0/1 밖의
+    /// path byte는 거부한다 (codex 리뷰).
+    pub fn set_split_ratio(&mut self, path: &[u8], ratio: f32) -> bool {
+        if !ratio.is_finite() {
+            return false;
+        }
+        let mut node = self;
+        for step in path {
+            match node {
+                LayoutNode::Split { first, second, .. } => {
+                    node = match step {
+                        0 => first,
+                        1 => second,
+                        _ => return false,
+                    };
+                }
+                LayoutNode::Pane(_) => return false,
+            }
+        }
+        match node {
+            LayoutNode::Split { ratio: r, .. } => {
+                *r = ratio.clamp(0.1, 0.9);
+                true
+            }
+            LayoutNode::Pane(_) => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -134,6 +165,35 @@ mod tests {
         assert_eq!(layout.panes(), vec![a.clone(), b.clone(), c.clone()]);
         // 없는 pane split은 실패
         assert!(!layout.split_pane(&pane(), SplitDirection::Horizontal, pane()));
+    }
+
+    #[test]
+    fn set_split_ratio는_path로_찾고_clamp한다() {
+        let (a, b, c) = (pane(), pane(), pane());
+        let mut layout = LayoutNode::Pane(a.clone());
+        assert!(layout.split_pane(&a, SplitDirection::Horizontal, b.clone()));
+        assert!(layout.split_pane(&b, SplitDirection::Vertical, c.clone()));
+        // 루트 Split
+        assert!(layout.set_split_ratio(&[], 0.7));
+        // 두 번째 칸의 중첩 Split — clamp 하한
+        assert!(layout.set_split_ratio(&[1], 0.01));
+        match &layout {
+            LayoutNode::Split { ratio, second, .. } => {
+                assert!((ratio - 0.7).abs() < f32::EPSILON);
+                match second.as_ref() {
+                    LayoutNode::Split { ratio, .. } => assert!((ratio - 0.1).abs() < f32::EPSILON),
+                    _ => panic!("중첩 Split이어야 함"),
+                }
+            }
+            _ => panic!("루트는 Split이어야 함"),
+        }
+        // Pane을 가리키는 path / 너무 깊은 path는 거부
+        assert!(!layout.set_split_ratio(&[0], 0.5));
+        assert!(!layout.set_split_ratio(&[0, 0], 0.5));
+        // 기형 입력 방어: non-finite ratio(NaN은 clamp를 통과), 0/1 밖 path byte
+        assert!(!layout.set_split_ratio(&[], f32::NAN));
+        assert!(!layout.set_split_ratio(&[], f32::INFINITY));
+        assert!(!layout.set_split_ratio(&[2], 0.5));
     }
 
     #[test]

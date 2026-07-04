@@ -78,6 +78,12 @@ pub struct FileTreeUi {
     /// 콜백 스레드와 공유하는 show_hidden — 숨김 경로 이벤트는 트리에 보이지도 않으므로
     /// 무시한다 (홈 디렉터리 루트에서 ~/Library 등 잡음 이벤트 대량 차단).
     watch_show_hidden: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 실측 행높이 (show_rows 자기보정). show_rows는 "모든 행 = 선언 높이" 계약인데
+    /// 실제 행높이는 폰트 메트릭(한글 폰트 라인높이 등)에 따라 선언값과 어긋날 수 있고,
+    /// 어긋나면 스크롤 위치·가시 범위가 리빌드마다 밀려 클릭이 다른 행에 떨어진다
+    /// (2026-07-05 사용자 보고: 펼침 간헐 실패/재클릭 접힘 안 됨/위치 점프). 첫 프레임에
+    /// 실제 그린 행높이를 재서 다음 프레임부터 그 값을 쓴다.
+    measured_row_height: Option<f32>,
     /// 스로틀 창 안에 도착해 아직 재나열하지 않은 디렉터리 (dedup 집합 — codex Med-1).
     pending_watch: std::collections::HashSet<PathBuf>,
     /// 마지막 워처 일괄 재나열 시각 — WATCH_RELOAD_MS 미만이면 흡수만 하고 건너뛴다.
@@ -128,6 +134,7 @@ impl FileTreeUi {
             watcher: None,
             watched_dirs: std::collections::HashSet::new(),
             watch_rx: None,
+            measured_row_height: None,
             watch_ignore: std::sync::Arc::new(Vec::new()),
             watch_show_hidden: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_watch: std::collections::HashSet::new(),
@@ -476,11 +483,15 @@ impl FileTreeUi {
             });
         }
 
-        // 가상화: 고정 행높이 + path 기반 explicit Id (§9-6)
-        let row_height = ui.text_style_height(&egui::TextStyle::Body);
+        // 가상화: 고정 행높이 + path 기반 explicit Id (§9-6).
+        // 행높이는 실측 자기보정 — 선언값과 실제가 어긋나면 클릭 대상이 밀린다(필드 주석).
+        let row_height = self
+            .measured_row_height
+            .unwrap_or_else(|| ui.text_style_height(&egui::TextStyle::Body));
         let total = self.flat.len();
         let mut toggle: Option<PathBuf> = None;
         let mut drop_action: Option<(PathBuf, PathBuf)> = None; // (src, dst_dir)
+        let mut observed_row_height: Option<f32> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_rows(ui, row_height, total, |ui, range| {
@@ -535,27 +546,41 @@ impl FileTreeUi {
                         })
                         .inner
                     });
+                    // 행 전체(패널 폭)를 클릭/드롭/메뉴 대상으로 — 텍스트만 클릭 가능하면
+                    // 오클릭이 잦다 (2026-07-05 사용자 보고). 라벨보다 나중에 등록되므로
+                    // 클릭은 이 위젯이 받고, label_resp.clicked()와 OR로 합친다.
+                    let row_rect = egui::Rect::from_min_max(
+                        egui::pos2(ui.max_rect().left(), response.rect.min.y),
+                        egui::pos2(ui.max_rect().right(), response.rect.max.y),
+                    );
+                    let row_resp = ui.interact(row_rect, drag_id.with("row"), egui::Sense::click());
+                    // 행높이 실측 (드래그 중엔 행이 tooltip 레이어로 빠져 rect가 다름 — 제외)
+                    if observed_row_height.is_none()
+                        && !egui::DragAndDrop::has_any_payload(ui.ctx())
+                    {
+                        observed_row_height = Some(response.rect.height());
+                    }
                     if row.is_dir {
                         // 폴더 행 = 드롭 대상: hover 하이라이트 + release 처리 (§4)
-                        if let Some(hover) = response.dnd_hover_payload::<PathBuf>()
+                        if let Some(hover) = row_resp.dnd_hover_payload::<PathBuf>()
                             && hover.as_ref() != &row.path
                         {
                             ui.painter().rect_stroke(
-                                response.rect,
+                                row_rect,
                                 2.0,
                                 ui.visuals().widgets.active.bg_stroke,
                                 egui::StrokeKind::Inside,
                             );
                         }
-                        if let Some(payload) = response.dnd_release_payload::<PathBuf>() {
+                        if let Some(payload) = row_resp.dnd_release_payload::<PathBuf>() {
                             drop_action = Some(((*payload).clone(), row.path.clone()));
                         }
-                        if label_resp.clicked() {
+                        if row_resp.clicked() || label_resp.clicked() {
                             toggle = Some(row.path.clone());
                         }
                     }
-                    // 우클릭 컨텍스트 메뉴 (FT-3)
-                    label_resp.context_menu(|ui| {
+                    // 우클릭 컨텍스트 메뉴 (FT-3) — 행 전체에서 열리게 row_resp에 단다
+                    row_resp.context_menu(|ui| {
                         let new_folder_parent = if row.is_dir {
                             Some(row.path.clone())
                         } else {
@@ -592,6 +617,15 @@ impl FileTreeUi {
                     });
                 }
             });
+        // 행높이 자기보정: 실측이 사용값과 어긋나면 저장하고 즉시 한 프레임 재그리기
+        // (다음 프레임부터 스크롤 계산이 실제와 일치 — 클릭 밀림/위치 점프 방지)
+        if let Some(observed) = observed_row_height
+            && observed > 0.0
+            && (observed - row_height).abs() > 0.1
+        {
+            self.measured_row_height = Some(observed);
+            ui.ctx().request_repaint();
+        }
         if let Some(path) = toggle {
             self.toggle_dir(&path);
         }

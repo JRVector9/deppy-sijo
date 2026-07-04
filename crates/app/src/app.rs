@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use runtime::{InProcessRuntimeClient, RuntimeCommandSink, RuntimeEventReceiver};
 
@@ -473,7 +473,11 @@ impl App {
     fn active_tree_root(&self) -> Option<PathBuf> {
         match self.db.workspace_path(&self.active.id) {
             Ok(Some(path)) if !path.trim().is_empty() => Some(PathBuf::from(path)),
-            Ok(_) => None,
+            // 경로 미설정이면 데스크톱을 기본 루트로 보여준다 (2026-07-05 사용자 요청 —
+            // 빈 안내 화면 대신 바로 쓸 수 있는 트리). workspace 경로를 저장하면 그쪽 우선.
+            Ok(_) => directories::UserDirs::new()
+                .and_then(|d| d.desktop_dir().map(Path::to_path_buf))
+                .filter(|p| p.is_dir()),
             Err(e) => {
                 tracing::warn!("workspace 경로 조회 실패: {e:#}");
                 None

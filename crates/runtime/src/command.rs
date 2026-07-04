@@ -96,4 +96,12 @@ pub enum RuntimeCommand {
     /// **enum 끝에 append** — postcard는 variant를 index로 인코딩하므로 중간 삽입은
     /// 기존 명령의 discriminant를 밀어 remote wire 호환을 깬다 (codex 리뷰).
     SetWorkspaceState(WorkspaceRuntimeState),
+    /// split 경계 마우스 드래그 리사이즈 — tab layout 안 Split을 루트 기준
+    /// path(0=first/1=second)로 지정해 ratio를 바꾼다. stale path(레이아웃이 그 사이
+    /// 바뀜)는 무해하게 무시된다. (append-only — wire 호환)
+    ResizeSplit {
+        tab: MuxTabId,
+        path: Vec<u8>,
+        ratio: f32,
+    },
 }

@@ -54,6 +54,8 @@ pub struct App {
     new_workspace_name: String,
     /// 삭제 확인 대기 중인 workspace id (2단계 확인 — 실수 방지)
     confirm_delete_ws: Option<String>,
+    /// 알림 클릭으로 다른 workspace 전환 후, mux 재구성되면 이동할 (workspace, session).
+    pending_focus: Option<(String, runtime::SessionId)>,
     /// 전환으로 background 정리 중인 옛 워커 shutdown 스레드들 (workspace_id, handle).
     /// 앱 종료 시 join(자식 reap 보장) + 같은 workspace 재오픈 전 직렬화(layout 경합 방지).
     pending_shutdowns: Vec<(String, std::thread::JoinHandle<()>)>,
@@ -127,6 +129,7 @@ impl App {
             workspaces_open: false,
             new_workspace_name: String::new(),
             confirm_delete_ws: None,
+            pending_focus: None,
             pending_shutdowns: Vec::new(),
         }
     }
@@ -215,15 +218,21 @@ impl App {
                 self.warm_order.retain(|id| id != target_id);
                 rt
             }
-            None => Self::make_runtime(
-                &self.config,
-                &self.logs_base,
-                target_id,
-                &self.db_path,
-                &self.redaction,
-                &self.db,
-                &self.egui_ctx,
-            ),
+            None => {
+                // 새 워커는 SessionId를 1부터 다시 시작한다 — 이 workspace의 옛 워커
+                // lifetime에서 남은 알림을 지운다. 안 그러면 재사용된 SessionId의 완료
+                // 알림이 옛 항목과 dup으로 취급돼 안 뜬다 (codex 리뷰).
+                self.notifications_ui.prune_workspace(target_id);
+                Self::make_runtime(
+                    &self.config,
+                    &self.logs_base,
+                    target_id,
+                    &self.db_path,
+                    &self.redaction,
+                    &self.db,
+                    &self.egui_ctx,
+                )
+            }
         };
         // UI 상태는 리셋하지 않는다 — warm 재사용이면 그동안 누적된 pending_events(=lifecycle
         // 이벤트 포함)를 그대로 ui()가 처리해 exit/status 상태를 재구성해야 하고, workspace_ui는
@@ -248,10 +257,11 @@ impl App {
         self.warm.insert(old_id.clone(), old);
         self.warm_order.push(old_id);
 
-        // pending 상태 정리 (이전 워커 응답 못 받음, 교차-ws 감사 방지)
+        // pending 상태 정리 (이전 워커 응답 못 받음, 교차-ws 감사 방지).
+        // notifications는 리셋하지 않는다 — (ws, session)로 namespacing돼 전역 센터가
+        // 모든 workspace 알림을 유지한다 (background 완료 통지·클릭 이동, codex 리뷰).
         self.agents_ui.clear_pending();
         self.connectors_ui.clear_invoke();
-        self.notifications_ui = ui::notifications::NotificationsUi::new();
         self.egui_ctx.request_repaint();
 
         self.evict_warm();
@@ -262,7 +272,19 @@ impl App {
     fn evict_warm(&mut self) {
         while self.warm_order.len() > Self::MAX_WARM {
             let evict_id = self.warm_order.remove(0);
-            if let Some(rt) = self.warm.remove(&evict_id) {
+            if let Some(mut rt) = self.warm.remove(&evict_id) {
+                // 마지막으로 큐에 남은 이벤트를 처리해 방금 끝난 background 작업의 완료/오류
+                // 알림을 놓치지 않는다 (codex 리뷰 — 축출 시 receiver drop으로 유실되던 것).
+                let events = rt.events.drain();
+                Self::process_ws_notifications(
+                    &mut self.notifications_ui,
+                    &evict_id,
+                    &events,
+                    &mut rt.session_titles,
+                );
+                // 축출 = Suspended(워커 종료) — 그 workspace의 진행형 알림은 더는 조치
+                // 불가하므로 정리한다 (결과 알림은 기록이라 유지, codex 리뷰).
+                self.notifications_ui.prune_transient(&evict_id);
                 self.pending_shutdowns.retain(|(_, h)| !h.is_finished());
                 let handle = std::thread::spawn(move || {
                     let mut runtime = rt.runtime;
@@ -381,6 +403,7 @@ impl App {
                 self.join_pending_shutdown(&id);
                 match self.db.delete_workspace(&id) {
                     Ok(()) => {
+                        self.notifications_ui.prune_workspace(&id);
                         // 로그 디렉터리도 정리 (best-effort — redacted 로그, 실패해도 무해)
                         let log_dir = self.logs_base.join(&id);
                         if let Err(e) = std::fs::remove_dir_all(&log_dir)
@@ -401,45 +424,42 @@ impl App {
         }
     }
 
-    /// MuxUpdated에서 제목을 누적하고, 상태/exit 이벤트를 알림으로 만든다.
-    /// logic()에서만 호출 — Warm 동안에도 알림이 즉시 생성된다 (§14.1).
-    fn process_notifications(&mut self, events: &[runtime::RuntimeEvent]) {
+    /// 한 workspace의 이벤트에서 제목을 누적(session_titles)하고 상태/exit을 알림으로
+    /// 만든다. 알림은 (workspace_id, SessionId)로 식별 — 워커마다 SessionId가 리셋돼
+    /// 충돌하므로. 활성/warm 워커 모두 이걸 거쳐 background workspace 알림도 뜬다.
+    fn process_ws_notifications(
+        notifications: &mut ui::notifications::NotificationsUi,
+        workspace_id: &str,
+        events: &[runtime::RuntimeEvent],
+        session_titles: &mut std::collections::HashMap<runtime::SessionId, String>,
+    ) {
         for event in events {
             match event {
                 runtime::RuntimeEvent::MuxUpdated { snapshot } => {
-                    // MuxUpdated는 전체 mux 스냅샷 — 사라진 세션(수동 close 등 exit
-                    // 이벤트 없이 제거된 것 포함)을 정리해 캐시를 live 세션으로 유계.
-                    // exit은 detach MuxUpdated보다 먼저 emit되므로(archival) 종료 알림
-                    // 제목이 이보다 앞서 해석돼 안전하다.
                     let present: std::collections::HashSet<runtime::SessionId> = snapshot
                         .tabs
                         .iter()
                         .flat_map(|tab| &tab.panes)
                         .filter_map(|pane| pane.session_id)
                         .collect();
-                    self.active
-                        .session_titles
-                        .retain(|session, _| present.contains(session));
+                    session_titles.retain(|session, _| present.contains(session));
                     for pane in snapshot.tabs.iter().flat_map(|tab| &tab.panes) {
                         if let Some(session) = pane.session_id {
-                            self.active
-                                .session_titles
-                                .insert(session, pane.title.clone());
+                            session_titles.insert(session, pane.title.clone());
                         }
                     }
                 }
                 runtime::RuntimeEvent::SessionStatusChanged { session, status } => {
-                    if let Some(title) = self.active.session_titles.get(session).cloned() {
-                        self.notifications_ui.on_status(*session, *status, &title);
+                    if let Some(title) = session_titles.get(session).cloned() {
+                        notifications.on_status(workspace_id, *session, *status, &title);
                     }
                 }
                 // regex 없는 agent는 결과가 SessionExited로만 온다 (완료 기준: done/error)
                 runtime::RuntimeEvent::SessionExited { session, exit_code } => {
-                    if let Some(title) = self.active.session_titles.get(session).cloned() {
-                        self.notifications_ui.on_exit(*session, *exit_code, &title);
+                    if let Some(title) = session_titles.get(session).cloned() {
+                        notifications.on_exit(workspace_id, *session, *exit_code, &title);
                     }
-                    // 종료된 세션은 더 알림이 없다 — 캐시에서 제거해 유계 유지
-                    self.active.session_titles.remove(session);
+                    session_titles.remove(session);
                 }
                 _ => {}
             }
@@ -494,7 +514,17 @@ impl eframe::App for App {
         // 이 누적분을 그대로 ui()가 처리해 상태를 재구성한다. 렌더/알림은 활성만.
         for rt in self.warm.values_mut() {
             let events = rt.events.drain();
-            rt.pending_events.extend(events);
+            if !events.is_empty() {
+                // warm workspace도 알림은 만든다 (background 완료/승인 통지) — (ws, session)로
+                // 식별해 워커 간 SessionId 충돌을 피한다. 렌더용으로는 pending에 누적.
+                Self::process_ws_notifications(
+                    &mut self.notifications_ui,
+                    &rt.id,
+                    &events,
+                    &mut rt.session_titles,
+                );
+                rt.pending_events.extend(events);
+            }
         }
 
         // 이벤트 drain + 알림 생성은 non-render 경로인 여기서 한다 (§14.1 Warm:
@@ -502,7 +532,12 @@ impl eframe::App for App {
         // 깨워 이 logic()을 돌린다. 렌더용으로는 pending_events에 쌓아 ui()가 소비한다.
         let new_events = self.active.events.drain();
         if !new_events.is_empty() {
-            self.process_notifications(&new_events);
+            Self::process_ws_notifications(
+                &mut self.notifications_ui,
+                &self.active.id,
+                &new_events,
+                &mut self.active.session_titles,
+            );
             self.active.pending_events.extend(new_events);
             // 보이는 idle 상태에서도 새 출력/상태를 즉시 렌더하도록 프레임 예약
             ctx.request_repaint();
@@ -582,7 +617,8 @@ impl eframe::App for App {
                 .show(ui, &self.config.terminal, &self.active.runtime, &events);
         });
 
-        // 알림 센터 렌더 (생성은 logic()에서 끝났다). 사라진 세션의 진행형 알림 정리.
+        // 알림 센터 렌더 (생성은 logic()에서 끝났다). 활성 workspace의 사라진 세션의
+        // 진행형 알림 정리 (다른 workspace 건 alive를 알 수 없어 유지).
         let mux = self.active.workspace_ui.mux().cloned();
         if let Some(mux) = &mux {
             let alive: Vec<_> = mux
@@ -591,13 +627,42 @@ impl eframe::App for App {
                 .flat_map(|tab| &tab.panes)
                 .filter_map(|pane| pane.session_id)
                 .collect();
-            self.notifications_ui.retain_sessions(&alive);
+            self.notifications_ui
+                .retain_sessions(&self.active.id, &alive);
         }
-        let focused = self
-            .notifications_ui
-            .show(ui.ctx(), &self.active.runtime, mux.as_deref());
-        // focus 명령 응답은 다음 프레임 반영 — 즉시 repaint
-        if focused {
+        // 전환 후 대상 workspace의 mux가 재구성되면(재emit) 알림이 가리킨 세션 pane으로
+        // 이동한다 — 전환은 즉시지만 mux는 다음 몇 프레임에 채워지므로 pending으로 둔다.
+        if let Some((ws_id, session)) = self.pending_focus.clone() {
+            if ws_id != self.active.id {
+                self.pending_focus = None; // 다른 곳으로 전환됨 — 취소
+            } else if let Some(pane) = mux.as_ref().and_then(|m| pane_of_session(m, session)) {
+                let _ = self
+                    .active
+                    .runtime
+                    .send_command(runtime::RuntimeCommand::FocusPane { pane });
+                self.pending_focus = None;
+            }
+        }
+        // 클릭한 알림 → 활성 workspace면 pane focus, 아니면 그 workspace로 전환 후 focus 예약.
+        if let Some((ws_id, session)) = self.notifications_ui.show(ui.ctx()) {
+            if ws_id == self.active.id {
+                if let Some(pane) = mux.as_ref().and_then(|m| pane_of_session(m, session)) {
+                    let _ = self
+                        .active
+                        .runtime
+                        .send_command(runtime::RuntimeCommand::FocusPane { pane });
+                }
+            } else {
+                // warm 재사용이면 워커·SessionId가 그대로라 그 세션으로 focus 예약.
+                // 재생성(비-warm)이면 SessionId가 리셋돼 옛 id가 엉뚱한 셸을 잡을 수
+                // 있으므로 focus를 예약하지 않는다 (전환만, codex 리뷰).
+                let reused = self.warm.contains_key(&ws_id);
+                self.switch_workspace(&ws_id);
+                self.refresh_workspaces();
+                if reused {
+                    self.pending_focus = Some((ws_id, session));
+                }
+            }
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(50));
         }
@@ -612,4 +677,16 @@ impl eframe::App for App {
         }
         self.frame_stats.end();
     }
+}
+
+/// 세션이 붙어 있는 pane id를 mux 스냅샷에서 찾는다 (알림 클릭 → focus용).
+fn pane_of_session(
+    mux: &runtime::MuxSnapshot,
+    session: runtime::SessionId,
+) -> Option<runtime::MuxPaneId> {
+    mux.tabs
+        .iter()
+        .flat_map(|tab| &tab.panes)
+        .find(|pane| pane.session_id == Some(session))
+        .map(|pane| pane.id.clone())
 }

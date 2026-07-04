@@ -2,7 +2,7 @@
 //! waiting/needs-approval/error/done을 알림으로 만들고, OS 알림도 띄운다.
 //! 항목 클릭 시 해당 세션의 pane으로 focus 이동 (완료 기준: session focus).
 
-use runtime::{MuxSnapshot, RuntimeClient, RuntimeCommand, SessionId, SessionStatus};
+use runtime::{SessionId, SessionStatus};
 
 pub struct NotificationsUi {
     open: bool,
@@ -10,6 +10,8 @@ pub struct NotificationsUi {
 }
 
 struct NotificationItem {
+    /// 어느 workspace의 세션인지 — 워커마다 SessionId가 리셋돼 충돌하므로 함께 키로 쓴다.
+    workspace_id: String,
     session: SessionId,
     status: SessionStatus,
     title: String,
@@ -41,7 +43,13 @@ impl NotificationsUi {
 
     /// 상태 변경을 알림으로 만든다. Running 복귀는 알리지 않는다.
     /// `title`은 tab/세션 제목 (mux 스냅샷에서 조회).
-    pub fn on_status(&mut self, session: SessionId, status: SessionStatus, title: &str) {
+    pub fn on_status(
+        &mut self,
+        workspace_id: &str,
+        session: SessionId,
+        status: SessionStatus,
+        title: &str,
+    ) {
         let label = match status {
             SessionStatus::Waiting => "입력 대기",
             SessionStatus::NeedsApproval => "승인 필요",
@@ -53,6 +61,7 @@ impl NotificationsUi {
         platform::notify(&format!("{label}: {title}"), title);
         let _ = label;
         self.items.push(NotificationItem {
+            workspace_id: workspace_id.to_owned(),
             session,
             status,
             title: title.to_owned(),
@@ -68,7 +77,13 @@ impl NotificationsUi {
     /// 세션 종료 알림 (완료 기준: done/error). exit code로 Done/Error 결정.
     /// status detector가 방금(직전 항목으로) 같은 결과를 냈으면 중복 발화하지 않되,
     /// 그 사이에 다른 항목(Waiting/재개 등)이 끼었으면 exit은 새 알림으로 낸다.
-    pub fn on_exit(&mut self, session: SessionId, exit_code: Option<u32>, title: &str) {
+    pub fn on_exit(
+        &mut self,
+        workspace_id: &str,
+        session: SessionId,
+        exit_code: Option<u32>,
+        title: &str,
+    ) {
         let status = if exit_code == Some(0) {
             SessionStatus::Done
         } else {
@@ -82,37 +97,46 @@ impl NotificationsUi {
             .items
             .iter()
             .rev()
-            .find(|item| item.session == session)
+            .find(|item| item.workspace_id == workspace_id && item.session == session)
             .is_some_and(|item| item.status == status);
         if !dup {
-            self.on_status(session, status, title);
+            self.on_status(workspace_id, session, status, title);
         }
     }
 
-    /// 세션이 사라지면 관련 알림 정리 (unread는 items에서 파생되어 자동 정합).
-    pub fn retain_sessions(&mut self, alive: &[SessionId]) {
-        // 결과 상태(Done/Error) 알림은 세션이 사라져도(닫힘/archive) 유지한다 —
-        // "끝났다/실패했다"는 사용자가 보고 싶은 기록이다. 진행형(Waiting/승인)만
-        // 세션이 없으면 더는 조치 불가라 정리한다 (codex 리뷰: archive된 exit 알림
-        // 이 즉시 pruning되던 문제). 총량은 on_status의 100개 cap이 유계로 만든다.
+    /// workspace가 삭제되면 그 workspace의 모든 알림을 제거한다.
+    pub fn prune_workspace(&mut self, workspace_id: &str) {
+        self.items.retain(|item| item.workspace_id != workspace_id);
+    }
+
+    /// workspace가 Suspended(축출)되면 그 workspace의 진행형(Waiting/승인) 알림을 제거한다 —
+    /// 워커가 죽어 더는 조치 불가하므로. 결과(Done/Error)는 기록이라 유지한다.
+    pub fn prune_transient(&mut self, workspace_id: &str) {
+        self.items.retain(|item| {
+            item.workspace_id != workspace_id
+                || matches!(item.status, SessionStatus::Done | SessionStatus::Error)
+        });
+    }
+
+    /// 활성 workspace의 세션이 사라지면 그 workspace의 진행형 알림을 정리한다.
+    /// 결과 상태(Done/Error)는 기록이라 유지하고, 다른 workspace(warm 등)의 진행형은
+    /// alive를 알 수 없어 유지한다(총량은 on_status의 100개 cap으로 유계).
+    pub fn retain_sessions(&mut self, active_workspace_id: &str, alive: &[SessionId]) {
         self.items.retain(|item| {
             matches!(item.status, SessionStatus::Done | SessionStatus::Error)
+                || item.workspace_id != active_workspace_id
                 || alive.contains(&item.session)
         });
     }
 
-    /// 알림 센터를 그린다. 세션 focus 명령을 보냈으면 true (호출측이 repaint 예약).
-    pub fn show(
-        &mut self,
-        ctx: &egui::Context,
-        client: &dyn RuntimeClient,
-        mux: Option<&MuxSnapshot>,
-    ) -> bool {
+    /// 알림 센터를 그린다. 클릭한 항목의 (workspace_id, session)을 돌려준다 —
+    /// 호출측(App)이 활성 workspace면 pane focus, 아니면 그 workspace로 전환한다.
+    pub fn show(&mut self, ctx: &egui::Context) -> Option<(String, SessionId)> {
         if !self.open {
-            return false;
+            return None;
         }
         let mut open = true;
-        let mut focused = false;
+        let mut clicked = None;
         egui::Window::new("알림")
             .open(&mut open)
             .resizable(false)
@@ -123,39 +147,21 @@ impl NotificationsUi {
                 if !self.items.is_empty() && ui.button("모두 지우기").clicked() {
                     self.items.clear();
                 }
-                let mut focus_session = None;
                 // 최신 항목이 위로
                 for item in self.items.iter().rev() {
                     let icon = status_icon(item.status);
                     if ui
                         .button(format!("{icon} {}", item.title))
-                        .on_hover_text("클릭하면 해당 세션으로 이동")
+                        .on_hover_text("클릭하면 해당 workspace/세션으로 이동")
                         .clicked()
                     {
-                        focus_session = Some(item.session);
-                    }
-                }
-                // 클릭한 세션의 pane을 찾아 focus (완료 기준: session focus)
-                if let Some(session) = focus_session
-                    && let Some(pane) = mux.and_then(|mux| pane_of_session(mux, session))
-                {
-                    match client.send_command(RuntimeCommand::FocusPane { pane }) {
-                        Ok(()) => focused = true,
-                        Err(e) => tracing::warn!("알림 focus 이동 실패: {e:#}"),
+                        clicked = Some((item.workspace_id.clone(), item.session));
                     }
                 }
             });
         self.open = open;
-        focused
+        clicked
     }
-}
-
-fn pane_of_session(mux: &MuxSnapshot, session: SessionId) -> Option<runtime::MuxPaneId> {
-    mux.tabs
-        .iter()
-        .flat_map(|tab| &tab.panes)
-        .find(|pane| pane.session_id == Some(session))
-        .map(|pane| pane.id.clone())
 }
 
 fn status_icon(status: SessionStatus) -> &'static str {
@@ -171,51 +177,49 @@ fn status_icon(status: SessionStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use runtime::{MuxSnapshot, PaneSnapshot, TabSnapshot};
 
-    fn mux_with(session: SessionId, pane: runtime::MuxPaneId) -> MuxSnapshot {
-        MuxSnapshot {
-            tabs: vec![TabSnapshot {
-                id: runtime::MuxTabId::new(),
-                title: "탭".into(),
-                layout: runtime::LayoutNode::Pane(pane.clone()),
-                panes: vec![PaneSnapshot {
-                    id: pane,
-                    session_id: Some(session),
-                    title: "에이전트 1".into(),
-                }],
-            }],
-            active_tab: None,
-            focused_pane: None,
-        }
-    }
-
-    #[test]
-    fn 세션의_pane_조회() {
-        let session = SessionId(3);
-        let pane = runtime::MuxPaneId::new();
-        let mux = mux_with(session, pane.clone());
-        assert_eq!(pane_of_session(&mux, session), Some(pane));
-        assert_eq!(pane_of_session(&mux, SessionId(99)), None);
-    }
+    const WS: &str = "ws-1";
 
     #[test]
     fn running_복귀는_알림_아님() {
         let mut n = NotificationsUi::new();
-        n.on_status(SessionId(1), SessionStatus::Running, "t");
+        n.on_status(WS, SessionId(1), SessionStatus::Running, "t");
         assert_eq!(n.unread(), 0);
-        n.on_status(SessionId(1), SessionStatus::Error, "t");
+        n.on_status(WS, SessionId(1), SessionStatus::Error, "t");
         assert_eq!(n.unread(), 1);
+    }
+
+    #[test]
+    fn 다른_workspace의_같은_세션id는_별개_알림() {
+        let mut n = NotificationsUi::new();
+        // 워커마다 SessionId가 리셋되므로 (ws, session)로 구분돼야 한다
+        n.on_status("ws-a", SessionId(1), SessionStatus::Done, "A작업");
+        n.on_status("ws-b", SessionId(1), SessionStatus::Done, "B작업");
+        assert_eq!(n.items.len(), 2);
+        // 활성(ws-a) 기준 retain: ws-a의 진행형만 정리, ws-b(다른 workspace)는 유지
+        n.on_status("ws-a", SessionId(2), SessionStatus::Waiting, "A대기");
+        n.on_status("ws-b", SessionId(2), SessionStatus::Waiting, "B대기");
+        n.retain_sessions("ws-a", &[]); // ws-a에 alive 세션 없음
+        // ws-a의 Waiting(진행형)은 정리, Done(결과)은 유지, ws-b는 전부 유지
+        let has = |ws: &str, sess: u64, st: SessionStatus| {
+            n.items
+                .iter()
+                .any(|i| i.workspace_id == ws && i.session == SessionId(sess) && i.status == st)
+        };
+        assert!(has("ws-a", 1, SessionStatus::Done));
+        assert!(!has("ws-a", 2, SessionStatus::Waiting));
+        assert!(has("ws-b", 1, SessionStatus::Done));
+        assert!(has("ws-b", 2, SessionStatus::Waiting));
     }
 
     #[test]
     fn retain은_결과상태_유지하고_진행형만_정리() {
         let mut n = NotificationsUi::new();
-        n.on_status(SessionId(1), SessionStatus::Done, "a"); // 결과 → 유지
-        n.on_status(SessionId(2), SessionStatus::NeedsApproval, "b"); // 진행형 → 정리
-        n.on_status(SessionId(3), SessionStatus::Error, "c"); // 결과 → 유지
+        n.on_status(WS, SessionId(1), SessionStatus::Done, "a"); // 결과 → 유지
+        n.on_status(WS, SessionId(2), SessionStatus::NeedsApproval, "b"); // 진행형 → 정리
+        n.on_status(WS, SessionId(3), SessionStatus::Error, "c"); // 결과 → 유지
         // 1·2 사라짐(닫힘/archive). Done(1)·Error(3)는 기록이라 유지, 승인(2)만 정리
-        n.retain_sessions(&[SessionId(3)]);
+        n.retain_sessions(WS, &[SessionId(3)]);
         let sessions: Vec<_> = n.items.iter().map(|i| i.session).collect();
         assert!(sessions.contains(&SessionId(1)));
         assert!(sessions.contains(&SessionId(3)));
@@ -226,17 +230,17 @@ mod tests {
     fn exit_알림과_status_중복_방지() {
         let mut n = NotificationsUi::new();
         // status detector가 먼저 Done 감지 → 이후 exit(0)는 중복 발화 안 함
-        n.on_status(SessionId(1), SessionStatus::Done, "a");
-        n.on_exit(SessionId(1), Some(0), "a");
+        n.on_status(WS, SessionId(1), SessionStatus::Done, "a");
+        n.on_exit(WS, SessionId(1), Some(0), "a");
         assert_eq!(n.items.len(), 1);
         // regex 없는 agent: status 없이 exit만 → Done 알림 생성
-        n.on_exit(SessionId(2), Some(0), "b");
+        n.on_exit(WS, SessionId(2), Some(0), "b");
         assert_eq!(
             n.items.iter().filter(|i| i.session == SessionId(2)).count(),
             1
         );
         // 비정상 종료 → Error
-        n.on_exit(SessionId(3), Some(1), "c");
+        n.on_exit(WS, SessionId(3), Some(1), "c");
         assert!(matches!(
             n.items
                 .iter()
@@ -250,14 +254,14 @@ mod tests {
     #[test]
     fn unread는_읽은_옛항목과_무관하게_pruning에_정합() {
         let mut n = NotificationsUi::new();
-        n.on_status(SessionId(1), SessionStatus::Done, "old"); // 읽을 항목
+        n.on_status(WS, SessionId(1), SessionStatus::Done, "old"); // 읽을 항목
         n.toggle(); // 열기 → 모두 읽음
         n.toggle(); // 닫기
         assert_eq!(n.unread(), 0);
-        n.on_status(SessionId(2), SessionStatus::Waiting, "new"); // 진행형, 안 읽음 1
+        n.on_status(WS, SessionId(2), SessionStatus::Waiting, "new"); // 진행형, 안 읽음 1
         assert_eq!(n.unread(), 1);
         // session 2(진행형)가 사라짐 → 정리되어 unread 0, 옛 읽은 Done(1)은 남아도 unread 0
-        n.retain_sessions(&[SessionId(1)]);
+        n.retain_sessions(WS, &[SessionId(1)]);
         assert_eq!(n.unread(), 0);
     }
 }

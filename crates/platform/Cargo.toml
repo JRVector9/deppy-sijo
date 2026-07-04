@@ -7,4 +7,8 @@ license.workspace = true
 
 [dependencies]
 tracing = { workspace = true }
+
+# macOS는 osascript로 알림 — notify-rust(mac-notification-sys)는 번들 검색 실패 시
+# Finder 다이얼로그→취소→FFI panic→abort로 앱을 죽인다 (2026-07-05 크래시 실증)
+[target.'cfg(not(target_os = "macos"))'.dependencies]
 notify-rust = { workspace = true }

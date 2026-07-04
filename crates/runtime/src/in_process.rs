@@ -1089,8 +1089,38 @@ impl Worker {
         // archival의 detach MuxUpdated가 이보다 먼저 가면, 같은 tick에 cap 초과로
         // 다수 종료 시 그 세션들이 mux에서 사라진 뒤 SessionExited가 도착해
         // UI가 exit 상태/알림을 무시한다 (codex 리뷰) — 그래서 exit을 먼저 내보낸다.
+        let exited_sessions: Vec<SessionId> = events
+            .iter()
+            .filter_map(|e| match e {
+                RuntimeEvent::SessionExited { session, .. } => Some(*session),
+                _ => None,
+            })
+            .collect();
         for event in events {
             self.emit(event);
+        }
+        // 셸 세션 종료 → pane 자동 닫힘 (tmux 관례 — exit하면 pane이 접히고 이웃이
+        // 공간을 차지, 2026-07-05 사용자 요청). agent pane은 결과 상태(✅/❌)와
+        // scrollback을 봐야 하므로 유지한다. SessionExited emit **후**라 UI는 같은
+        // drain에서 exit 알림을 먼저 받고 MuxUpdated로 pane 제거를 본다 (채널 FIFO).
+        // close_pane의 세션 정리는 위 exited 처리와 겹쳐도 멱등(no-op)이다.
+        for session in exited_sessions {
+            let is_shell = self
+                .sessions
+                .get(&session)
+                .is_some_and(|s| s.kind() == session::SessionKind::Shell);
+            if !is_shell {
+                continue;
+            }
+            let pane = self
+                .mux
+                .panes
+                .values()
+                .find(|p| p.session_id == Some(session))
+                .map(|p| p.id.clone());
+            if let Some(pane) = pane {
+                self.close_pane(pane);
+            }
         }
     }
 
@@ -1364,24 +1394,22 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn 종료_후에도_scrollback_열람_가능() {
+        // agent 세션으로 검증 — 셸은 exit 시 pane이 자동으로 닫힌다(2026-07-05).
+        // §14.3 "종료 후 scrollback 열람" 계약은 pane이 유지되는 agent에 적용된다.
         let client = InProcessRuntimeClient::with_shell(
             5,
             test_store(),
             test_logs_root("t"),
             RedactionService::new(),
-            spec("/bin/echo", &["done"]),
+            spec("/bin/echo", &["unused"]),
             None,
         );
         let mut probe = Probe::new(client.subscribe());
         client
-            .send_command(RuntimeCommand::SpawnShell {
-                cols: 80,
-                rows: 24,
-                scrollback_lines: 100,
-            })
+            .send_command(spawn_agent_cmd("echo done", None, None))
             .unwrap();
         let session = probe.wait_for(Duration::from_secs(15), |e| match e {
-            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            RuntimeEvent::AgentSpawned { session } => Some(*session),
             _ => None,
         });
         probe.wait_for(Duration::from_secs(15), |e| match e {
@@ -1399,6 +1427,56 @@ mod tests {
                 if snapshot_text(snapshot, 0).contains("done") =>
             {
                 Some(())
+            }
+            _ => None,
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn 셸_exit시_pane_자동_닫힘_agent는_유지() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("t"),
+            RedactionService::new(),
+            spec("/bin/echo", &["bye"]),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        // agent(pane 유지 기대) + 셸(즉시 종료 — pane 자동 닫힘 기대)
+        client
+            .send_command(spawn_agent_cmd("sleep 5", None, None))
+            .unwrap();
+        let agent = probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::AgentSpawned { session } => Some(*session),
+            _ => None,
+        });
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let shell = probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            _ => None,
+        });
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::SessionExited { session, .. } if *session == shell => Some(()),
+            _ => None,
+        });
+        // exit 직후의 MuxUpdated에서 셸 pane은 사라지고 agent pane은 남는다
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::MuxUpdated { snapshot } => {
+                let sessions: Vec<_> = snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|t| &t.panes)
+                    .filter_map(|p| p.session_id)
+                    .collect();
+                (!sessions.contains(&shell) && sessions.contains(&agent)).then_some(())
             }
             _ => None,
         });
@@ -2065,12 +2143,11 @@ mod tests {
             }),
         );
         let mut probe = Probe::new(client.subscribe());
+        // agent 세션으로 검증 — 셸은 exit 시 pane이 자동으로 닫혀 layout에서 사라진다
+        // (2026-07-05). 영속 파이프라인(세션 행 + layout의 pane→세션 참조)은 pane이
+        // 유지되는 agent로 확인한다.
         client
-            .send_command(RuntimeCommand::SpawnShell {
-                cols: 80,
-                rows: 24,
-                scrollback_lines: 100,
-            })
+            .send_command(spawn_agent_cmd("echo persist-ok", None, None))
             .unwrap();
         probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::SessionExited { .. } => Some(()),
@@ -2087,8 +2164,10 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
+        // config id 없는 SpawnAgent는 스키마 CHECK(agent kind ⇒ agent_id 필수) 때문에
+        // "shell" kind로 기록된다 — 런타임 SessionKind는 Agent라 pane은 유지된다.
         assert_eq!(kind, "shell");
-        assert_eq!(command, "/bin/echo");
+        assert_eq!(command, "/bin/sh");
         assert_eq!(status, "exited");
         // mux layout: window/tab/pane가 저장되고 pane이 영속 session id를 참조
         let windows = persist::load_window_layouts(&conn, "ws-rt").unwrap();

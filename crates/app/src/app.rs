@@ -544,6 +544,12 @@ impl eframe::App for App {
                 &mut self.active.session_titles,
             );
             self.active.pending_events.extend(new_events);
+            // 창이 숨겨져(render_active=false) ui()가 스킵되면 active의 pending도 warm처럼
+            // 무한 누적된다 — 동일하게 coalesce로 유계화한다. 보일 때는 ui()가 매 프레임
+            // take()로 소비해 자라지 않으므로 coalesce가 불필요하다.
+            if !self.active.render_active {
+                coalesce_mux_updated(&mut self.active.pending_events);
+            }
             // 보이는 idle 상태에서도 새 출력/상태를 즉시 렌더하도록 프레임 예약
             ctx.request_repaint();
         }

@@ -19,16 +19,21 @@
 //! 지금은 loopback 강제가 그 경계다. 와이어 값 검증(validate_command/validate_event)은
 //! 기형 peer 방어일 뿐 권한 통제가 아니다.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use deppy_core::SessionId;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
+use rustls::{DigitallySignedStruct, SignatureScheme};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use terminal::TerminalViewportSnapshot;
 
 use crate::client::{RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream};
@@ -40,6 +45,7 @@ use crate::protocol::{
     SERVER_FEATURES, ServerHello, WireMsg, diff_viewport, encode_request_keyframe, encode_wire_msg,
     try_apply_delta,
 };
+use crate::tls_identity::TlsIdentity;
 
 /// 이벤트 pump 폴링 주기 — worker의 output batch와 별개인 전송 주기.
 const PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
@@ -53,6 +59,21 @@ const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SCROLLBACK_LINES: usize = 100_000;
 /// 인증 프레임 대기 상한 — 접속만 열고 침묵하는 peer가 서버를 잡아두지 못하게.
 const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// TLS 접속당 단일 I/O 루프가 아무 진전이 없을 때 다음 tick 전 짧게 재운다 —
+/// busy-spin(CPU 100%) 방지. 1~5ms 범위(설계 §2.4). read/write 어느 쪽도 블록하지 않는다.
+const TLS_IDLE_SLEEP: Duration = Duration::from_millis(2);
+/// TLS 핸드셰이크+hello 교환 상한 (TLS record + AUTH_TIMEOUT 여유). loopback에선 순식간.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// TLS 클라이언트 명령 송신 큐(sync_channel) 용량 — 명령은 순서 보존이 필수라 코얼레싱하지
+/// 않고, 유계는 이 채널 용량으로 강제한다. 초과 try_send는 Err(backpressure를 호출자에 surface).
+const TLS_CMD_QUEUE_CAP: usize = 256;
+/// IO 루프가 한 tick에 채널에서 흡수하는 명령 상한 — fast producer가 루프를 drain에
+/// 붙잡아 read/write 인터리브를 막지 못하게 한다(기아 방지).
+const TLS_CMD_DRAIN_MAX: usize = 64;
+/// 한 tick의 read 단계 상한 — read_tls+복호(+프레임 드레인)를 이 횟수까지만 반복하고
+/// write/drain 단계로 넘어간다(codex HIGH). peer가 소켓을 계속 readable하게 유지해도
+/// (고출력 스트림) 송신 경로가 굶지 않는다. 남은 수신분은 다음 tick이 이어받는다.
+const TLS_READ_STEPS_MAX: usize = 16;
 
 /// 프레임 하나를 쓴다: [u32 LE 길이][payload].
 /// 상한은 송신측에서도 강제 — 초과분을 보내 놓고 peer가 끊는 것보다
@@ -94,6 +115,172 @@ fn token_matches(expected: &str, provided: &[u8]) -> bool {
         .zip(provided)
         .fold(0u8, |acc, (a, b)| acc | (a ^ b))
         == 0
+}
+
+// ============================================================================
+// TLS 전송 (단계 C-2/C-3): 접속당 **단일 I/O 스레드 + non-blocking 상태기계**
+// ----------------------------------------------------------------------------
+// 왜 단일 스레드인가 (설계 §2.4): rustls `Connection`은 read/write 半으로 안전하게
+// 분할되지 않고 `try_clone`도 불가하므로, 평문의 reader/pump 2-스레드 모델을 TLS에는
+// 쓸 수 없다. 접속당 한 스레드가 rustls 스트림을 단독 소유하고 mini 이벤트 루프로
+// 양방향을 처리한다. **평문 loopback은 검증된 2-스레드 모델을 그대로 유지**(설계 §2.4의
+// "평문도 통일" 권고에서 의도적으로 이탈 — 기존 테스트/동작 무변경, T1 교훈).
+//
+// 기아/데드락 방지 (이전 리팩터 reject 교훈):
+//  - 나갈 프레임은 rustls writer에 버퍼링되고 `write_tls`로 소켓이 받는 만큼만 흘려보낸다.
+//    소켓 버퍼가 차면 `write_tls`가 WouldBlock → 미전송분은 rustls 안/앱 큐에 남겨두고,
+//    **write 진척과 무관하게 매 tick read를 먼저 수행**한다(명령 처리 기아 없음).
+//  - 앱 큐(`out`)는 "한 배치를 다 흘려보낸 뒤에만" 다음 배치를 drain해 메모리를 배치 1개로
+//    상한한다. drain을 미루는 동안 viewport는 receiver slot에서 latest-wins로 코얼레싱되고
+//    (§4.2 slot 모델), 수명 이벤트는 채널에 순서대로 남는다 → viewport backpressure 코얼레싱.
+//  - rustls 나가는 평문 버퍼 상한은 해제(`set_buffer_limit(None)`)한다: 한 viewport
+//    keyframe이 기본 상한(64KiB)을 넘어 write_all이 WriteZero로 실패하는 것을 막고, 메모리는
+//    위 배치-1 상한으로 앱계층에서 관리한다.
+
+/// [`FrameDecoder::advance`] 결과 — WouldBlock(중간 record)/EOF/완성 프레임을 구분한다
+/// (설계 §2.4: read_frame의 3-값 정제 — timeout/EOF/protocol error를 모두 None으로 접지 않기).
+enum FramePoll {
+    /// 완성된 프레임 하나(길이 0 = heartbeat 포함).
+    Frame(Vec<u8>),
+    /// 지금은 더 읽을 게 없다(WouldBlock/부분 프레임) — 다음 tick에 이어 읽는다.
+    Pending,
+    /// EOF 또는 프로토콜 위반(상한 초과) — 접속 종료.
+    Closed,
+}
+
+/// `[u32 LE len][payload]` 프레임을 **부분 진척을 tick 간 보존**하며 디코드한다.
+/// non-blocking 평문 스트림(`rustls::Connection::reader()`)에서 조각조각 읽어도 상태를 유지한다.
+struct FrameDecoder {
+    len_buf: [u8; 4],
+    len_filled: usize,
+    payload: Vec<u8>,
+    payload_filled: usize,
+    /// `None` = 아직 길이 4바이트 읽는 중, `Some(n)` = payload n바이트 읽는 중.
+    need: Option<usize>,
+}
+
+impl FrameDecoder {
+    fn new() -> Self {
+        Self {
+            len_buf: [0u8; 4],
+            len_filled: 0,
+            payload: Vec::new(),
+            payload_filled: 0,
+            need: None,
+        }
+    }
+
+    /// 준비된 만큼 읽어 프레임 하나가 완성되면 반환한다. WouldBlock이면 `Pending`(상태 보존),
+    /// EOF/상한 초과면 `Closed`. `r`은 WouldBlock을 돌려주는 non-blocking Read여야 한다.
+    fn advance(&mut self, r: &mut impl Read) -> FramePoll {
+        loop {
+            match self.need {
+                None => match r.read(&mut self.len_buf[self.len_filled..]) {
+                    Ok(0) => return FramePoll::Closed, // EOF
+                    Ok(n) => {
+                        self.len_filled += n;
+                        if self.len_filled == 4 {
+                            let len = u32::from_le_bytes(self.len_buf) as usize;
+                            if len > MAX_FRAME_BYTES {
+                                return FramePoll::Closed; // 프로토콜 위반 — 폭주 할당 방지
+                            }
+                            self.payload = vec![0u8; len];
+                            self.payload_filled = 0;
+                            self.need = Some(len);
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        return FramePoll::Pending;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => return FramePoll::Closed,
+                },
+                Some(need) => {
+                    if self.payload_filled >= need {
+                        // 완성 (길이 0 heartbeat도 여기서 즉시 반환).
+                        let frame = std::mem::take(&mut self.payload);
+                        self.need = None;
+                        self.len_filled = 0;
+                        self.payload_filled = 0;
+                        return FramePoll::Frame(frame);
+                    }
+                    match r.read(&mut self.payload[self.payload_filled..need]) {
+                        Ok(0) => return FramePoll::Closed, // EOF (부분 프레임 중 단절)
+                        Ok(n) => self.payload_filled += n,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            return FramePoll::Pending;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => return FramePoll::Closed,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// [`tls_pump_read`] 결과 — peer EOF와 정상 진행을 구분.
+enum PumpRead {
+    Ok,
+    Eof,
+}
+
+/// [`tls_read_step`] 결과 — 한 번의 read_tls로 진전(복호 평문 생김)/지금은 없음/EOF를 구분.
+enum ReadStep {
+    /// 소켓에서 TLS를 읽어 복호했다 — 평문 프레임을 드레인한 뒤 다시 읽어야 한다.
+    Progressed,
+    /// 지금 읽을 TLS 없음(WouldBlock) — 이 tick의 read 단계 종료.
+    Idle,
+    /// peer EOF.
+    Eof,
+}
+
+/// **한 번만** read_tls + process_new_packets 한다(루프 없음). 호출측이 read_tls 사이에 반드시
+/// 평문 프레임을 드레인하도록 강제 — 그래야 rustls received_plaintext 버퍼가 넘치지 않는다
+/// ("received plaintext buffer full" 방지: read를 끝없이 돌리지 않고 read↔drain을 교대한다).
+fn tls_read_step(conn: &mut rustls::Connection, sock: &mut TcpStream) -> std::io::Result<ReadStep> {
+    match conn.read_tls(sock) {
+        Ok(0) => Ok(ReadStep::Eof),
+        Ok(_) => {
+            conn.process_new_packets().map_err(std::io::Error::other)?;
+            Ok(ReadStep::Progressed)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(ReadStep::Idle),
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(ReadStep::Idle),
+        Err(e) => Err(e),
+    }
+}
+
+/// rustls 나갈 TLS 바이트를 소켓이 받는 만큼 흘려보낸다. 소켓 버퍼가 차면(WouldBlock)
+/// 남은 바이트는 rustls 안에 남기고 멈춘다 — **블록하지 않는다**(단일 IO 데드락 방지 핵심).
+fn tls_flush(conn: &mut rustls::Connection, sock: &mut TcpStream) -> std::io::Result<()> {
+    while conn.wants_write() {
+        match conn.write_tls(sock) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// 소켓에서 준비된 TLS 바이트를 흡수해 rustls 상태기계를 전진시킨다(handshake/app data).
+/// WouldBlock이면 "지금은 없음"으로 멈춘다. peer EOF는 [`PumpRead::Eof`].
+fn tls_pump_read(conn: &mut rustls::Connection, sock: &mut TcpStream) -> std::io::Result<PumpRead> {
+    loop {
+        match conn.read_tls(sock) {
+            Ok(0) => return Ok(PumpRead::Eof),
+            Ok(_) => {
+                // 매 read마다 처리해 rustls 내부 버퍼가 넘치지 않게 한다.
+                conn.process_new_packets().map_err(std::io::Error::other)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(PumpRead::Ok),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// 서버측 핸드셰이크 v2 (§3.1): 첫 프레임 = [`ClientHello`].
@@ -250,6 +437,90 @@ struct ConnEntry {
     handle: JoinHandle<()>,
 }
 
+/// 접속당 처리기 — 평문([`serve_connection`])과 TLS([`serve_connection_tls`])가 이 시그니처를
+/// 공유한다. accept 루프/등록/self-remove 골격은 하나로 두고 여기만 갈아끼운다.
+type ConnHandler =
+    Arc<dyn Fn(TcpStream, Arc<InProcessRuntimeClient>, Arc<AtomicBool>) + Send + Sync>;
+
+/// accept 루프를 스레드로 띄운다 — 접속마다 스레드를 붙이고, 등록/self-remove를 관리한다.
+/// 평문과 TLS가 이 골격을 공유하고 접속 처리 로직만 `handler`로 주입한다(§2.4 "IO 경계 1회 재편").
+/// `connections` 등록과 stop 재확인을 같은 락 안에서 하므로 shutdown drain과 race 창이 없다.
+fn spawn_accept(
+    listener: TcpListener,
+    backend: Arc<InProcessRuntimeClient>,
+    stop: Arc<AtomicBool>,
+    connections: Arc<Mutex<Vec<ConnEntry>>>,
+    handler: ConnHandler,
+) -> anyhow::Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("remote-accept".into())
+        .spawn(move || {
+            for stream in listener.incoming() {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                match stream {
+                    Ok(stream) => {
+                        // fd 레벨 shutdown용 clone — TLS에서도 raw 소켓 종료로 IO 루프를 깨운다(§2.4).
+                        let shutdown_clone = match stream.try_clone() {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::warn!("remote stream clone 실패: {e}");
+                                continue;
+                            }
+                        };
+                        let conn_backend = Arc::clone(&backend);
+                        let conn_stop = Arc::clone(&stop);
+                        let conn_conns = Arc::clone(&connections);
+                        let conn_handler = Arc::clone(&handler);
+
+                        let mut conns = connections.lock().expect("connections lock");
+                        if stop.load(Ordering::SeqCst) {
+                            drop(conns);
+                            let _ = stream.shutdown(Shutdown::Both);
+                            continue;
+                        }
+                        let handle = match std::thread::Builder::new()
+                            .name("remote-conn".into())
+                            .spawn(move || {
+                                conn_handler(stream, conn_backend, conn_stop);
+                                // 접속 종료 — 자기 항목을 스스로 제거(자기 join은 데드락).
+                                let id = std::thread::current().id();
+                                conn_conns
+                                    .lock()
+                                    .expect("connections lock")
+                                    .retain(|c| c.handle.thread().id() != id);
+                            }) {
+                            Ok(handle) => handle,
+                            Err(e) => {
+                                drop(conns);
+                                tracing::warn!("remote 접속 스레드 생성 실패: {e}");
+                                continue;
+                            }
+                        };
+                        conns.push(ConnEntry {
+                            stream: shutdown_clone,
+                            handle,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("remote accept 실패: {e}");
+                    }
+                }
+            }
+        })
+        .context("remote accept thread 생성 실패")
+}
+
+/// 실행마다 새 attach 토큰 (uuid v4 ×2 ≈ 244bit 엔트로피).
+fn new_auth_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
 impl RemoteRuntimeServer {
     /// 127.0.0.1에만 bind한다 (localhost-only는 함수 형태로 보장 — 주소를 받지 않는다).
     /// port 0이면 OS가 할당하고 [`Self::local_addr`]로 확인한다.
@@ -259,87 +530,68 @@ impl RemoteRuntimeServer {
         let backend = Arc::new(backend);
         let stop = Arc::new(AtomicBool::new(false));
         let connections: Arc<Mutex<Vec<ConnEntry>>> = Arc::default();
-        // 실행마다 새 토큰 (uuid v4 ×2 ≈ 244bit 엔트로피)
-        let auth_token = format!(
-            "{}{}",
-            uuid::Uuid::new_v4().simple(),
-            uuid::Uuid::new_v4().simple()
-        );
-        let accept_token = auth_token.clone();
+        let auth_token = new_auth_token();
 
-        let accept_backend = Arc::clone(&backend);
-        let accept_stop = Arc::clone(&stop);
-        let accept_conns = Arc::clone(&connections);
-        let accept_thread = std::thread::Builder::new()
-            .name("remote-accept".into())
-            .spawn(move || {
-                for stream in listener.incoming() {
-                    if accept_stop.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    match stream {
-                        Ok(stream) => {
-                            // 접속마다 스레드를 띄워 동시 다중 클라이언트를 처리한다.
-                            // 등록과 stop 재확인을 같은 락(connections) 안에서 하므로
-                            // shutdown의 drain과 순서가 어느 쪽이든 race 창이 없다:
-                            // shutdown이 먼저 잠그면 여기서 stop=true를 보고 즉시 닫고,
-                            // 여기가 먼저 잠그고 등록하면 shutdown이 그다음에 잠가
-                            // 이 접속까지 포함해 정리한다.
-                            let shutdown_clone = match stream.try_clone() {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    tracing::warn!("remote stream clone 실패: {e}");
-                                    continue;
-                                }
-                            };
-                            let conn_backend = Arc::clone(&accept_backend);
-                            let conn_stop = Arc::clone(&accept_stop);
-                            let conn_token = accept_token.clone();
-                            let conn_conns = Arc::clone(&accept_conns);
+        // 평문 접속 처리기 — 검증된 reader+pump 2-스레드 모델을 그대로 유지한다.
+        let conn_token = auth_token.clone();
+        let handler: ConnHandler = Arc::new(move |stream, backend, stop| {
+            serve_connection(stream, &backend, &stop, &conn_token)
+        });
+        let accept_thread = spawn_accept(
+            listener,
+            Arc::clone(&backend),
+            Arc::clone(&stop),
+            Arc::clone(&connections),
+            handler,
+        )?;
 
-                            let mut conns = accept_conns.lock().expect("connections lock");
-                            if accept_stop.load(Ordering::SeqCst) {
-                                drop(conns);
-                                let _ = stream.shutdown(Shutdown::Both);
-                                continue;
-                            }
-                            let handle = match std::thread::Builder::new()
-                                .name("remote-conn".into())
-                                .spawn(move || {
-                                    serve_connection(
-                                        stream,
-                                        &conn_backend,
-                                        &conn_stop,
-                                        &conn_token,
-                                    );
-                                    // 접속 종료 — 자기 항목을 스스로 제거(자기 join은
-                                    // 데드락이라 하지 않는다; drop되는 JoinHandle은
-                                    // 자동 detach라 좀비로 남지 않는다).
-                                    let id = std::thread::current().id();
-                                    conn_conns
-                                        .lock()
-                                        .expect("connections lock")
-                                        .retain(|c| c.handle.thread().id() != id);
-                                }) {
-                                Ok(handle) => handle,
-                                Err(e) => {
-                                    drop(conns);
-                                    tracing::warn!("remote 접속 스레드 생성 실패: {e}");
-                                    continue;
-                                }
-                            };
-                            conns.push(ConnEntry {
-                                stream: shutdown_clone,
-                                handle,
-                            });
-                        }
-                        Err(e) => {
-                            tracing::warn!("remote accept 실패: {e}");
-                        }
-                    }
-                }
-            })
-            .context("remote accept thread 생성 실패")?;
+        Ok(Self {
+            addr,
+            stop,
+            accept_thread: Some(accept_thread),
+            backend: Some(backend),
+            connections,
+            auth_token,
+        })
+    }
+
+    /// TLS 전송으로 노출한다 (단계 C-2). `addr`에 bind하고(호출자가 주소를 정한다 —
+    /// 테스트는 127.0.0.1:0), 접속마다 [`rustls::ServerConnection`](ring provider,
+    /// `identity`의 cert/key)을 세워 **접속당 단일 I/O 스레드**(§2.4)로 v2 핸드셰이크 +
+    /// 협상 코덱(loopback은 Delta) 프로토콜을 암호화 채널 위에서 그대로 돌린다.
+    ///
+    /// 평문 [`Self::serve`]와 프레이밍/토큰/코덱은 **동일** — TLS는 채널 보안만 얹는다(§2.3).
+    /// 비-loopback bind 정책/설정 UI(C-4)는 후속: 여기선 호출자가 주소를 책임진다.
+    pub fn serve_tls(
+        backend: InProcessRuntimeClient,
+        addr: SocketAddr,
+        identity: TlsIdentity,
+    ) -> anyhow::Result<Self> {
+        let tls_config = Arc::new(build_server_config(&identity)?);
+        let listener = TcpListener::bind(addr).context("remote TLS 서버 bind 실패")?;
+        let addr = listener.local_addr()?;
+        let backend = Arc::new(backend);
+        let stop = Arc::new(AtomicBool::new(false));
+        let connections: Arc<Mutex<Vec<ConnEntry>>> = Arc::default();
+        let auth_token = new_auth_token();
+
+        let conn_token = auth_token.clone();
+        let handler: ConnHandler = Arc::new(move |stream, backend, stop| {
+            serve_connection_tls(
+                stream,
+                Arc::clone(&tls_config),
+                &backend,
+                &stop,
+                &conn_token,
+            );
+        });
+        let accept_thread = spawn_accept(
+            listener,
+            Arc::clone(&backend),
+            Arc::clone(&stop),
+            Arc::clone(&connections),
+            handler,
+        )?;
 
         Ok(Self {
             addr,
@@ -551,6 +803,250 @@ fn serve_connection(
     let _ = pump.join();
 }
 
+/// rustls `ServerConfig` — ring provider(§2.1, aws-lc-rs 회피) + `identity`의 자기서명 cert/key.
+/// provider를 명시 주입해 프로세스 전역 default provider 설치 없이 동작한다(스레드 안전).
+fn build_server_config(identity: &TlsIdentity) -> anyhow::Result<rustls::ServerConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let cert = CertificateDer::from(identity.cert_der.clone());
+    // rcgen `serialize_der()`는 PKCS#8 DER를 준다.
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.key_der.clone()));
+    rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .context("rustls 서버 프로토콜 버전 구성 실패")?
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .context("rustls 서버 인증서 구성 실패")
+}
+
+/// TLS 접속 하나를 **접속당 단일 I/O 스레드**로 처리한다 (§2.4). 평문 [`serve_connection`]의
+/// reader/pump 2-스레드와 프로토콜(v2 hello + 협상 코덱)은 동일하나, rustls 스트림을 단독
+/// 소유하는 non-blocking mini 이벤트 루프로 양방향을 인터리브한다(기아/데드락 방지 — 위 모듈 주석).
+fn serve_connection_tls(
+    mut sock: TcpStream,
+    tls_config: Arc<rustls::ServerConfig>,
+    backend: &Arc<InProcessRuntimeClient>,
+    stop: &Arc<AtomicBool>,
+    auth_token: &str,
+) {
+    if sock.set_nonblocking(true).is_err() {
+        return;
+    }
+    let mut conn: rustls::Connection = match rustls::ServerConnection::new(tls_config) {
+        Ok(c) => c.into(),
+        Err(e) => {
+            tracing::warn!("rustls ServerConnection 생성 실패: {e}");
+            return;
+        }
+    };
+    // 나가는 평문 버퍼 상한 해제 — 큰 viewport keyframe(>64KiB)이 write_all에서 WriteZero로
+    // 실패하지 않게. 메모리는 앱계층 배치-1 상한으로 관리한다(모듈 주석).
+    conn.set_buffer_limit(None);
+
+    let mut dec = FrameDecoder::new();
+    // Phase 1: TLS 핸드셰이크 + ClientHello + ServerHello (AUTH/handshake timeout 안에서).
+    let Some(codec) = tls_server_handshake(&mut conn, &mut sock, &mut dec, auth_token, stop) else {
+        let _ = sock.shutdown(Shutdown::Both);
+        return;
+    };
+
+    // Phase 2: 명령/이벤트 루프. last_sent/keyframe_requests는 이 스레드 단독 소유(락 불필요).
+    let receiver = backend.subscribe();
+    let mut last_sent: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> = HashMap::new();
+    let mut keyframe_requests: Vec<SessionId> = Vec::new();
+    let mut out: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut last_activity = Instant::now();
+
+    'main: loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let mut progressed = false;
+
+        // (1) READ 먼저 — write 진척과 무관하게 명령을 흡수한다(기아 방지). read_tls와 프레임
+        //     드레인을 **교대**해 received_plaintext 버퍼 넘침을 막고, read 단계도 tick당
+        //     [`TLS_READ_STEPS_MAX`]로 상한한다(codex HIGH) — peer가 소켓을 계속 readable하게
+        //     유지해도 이벤트 송신/heartbeat 단계가 굶지 않는다. 남은 수신분은 다음 tick에.
+        let mut eof = false;
+        let mut read_steps = 0usize;
+        'read: loop {
+            // 준비된 평문 프레임을 먼저 비운다(버퍼 소비).
+            loop {
+                match dec.advance(&mut conn.reader()) {
+                    FramePoll::Frame(frame) => {
+                        progressed = true;
+                        if frame.is_empty() {
+                            continue; // heartbeat(클라가 보낼 일은 없으나 방어)
+                        }
+                        match codec.decode_command(&frame) {
+                            Ok(DecodedCommand::Command(command)) => {
+                                if let Err(reason) = validate_command(&command) {
+                                    tracing::warn!("remote 명령 검증 실패({reason}), 접속 종료");
+                                    break 'main;
+                                }
+                                if backend.send_command(command).is_err() {
+                                    break 'main; // worker 종료됨
+                                }
+                            }
+                            Ok(DecodedCommand::RequestKeyframe(session)) => {
+                                keyframe_requests.push(session);
+                            }
+                            Err(e) => {
+                                tracing::warn!("remote 명령 파싱 실패, 접속 종료: {e}");
+                                break 'main;
+                            }
+                        }
+                    }
+                    FramePoll::Pending => break,
+                    FramePoll::Closed => break 'main,
+                }
+            }
+            // 상한 도달 — write/drain 단계로 넘어간다(progressed라 sleep 없이 다음 tick 계속).
+            if read_steps >= TLS_READ_STEPS_MAX {
+                progressed = true;
+                break 'read;
+            }
+            // 그다음 TLS를 한 번 더 읽어 복호한다. 진전이 있으면 다시 드레인.
+            match tls_read_step(&mut conn, &mut sock) {
+                Ok(ReadStep::Progressed) => {
+                    read_steps += 1;
+                    continue 'read;
+                }
+                Ok(ReadStep::Idle) => break 'read,
+                Ok(ReadStep::Eof) => {
+                    eof = true;
+                    break 'read;
+                }
+                Err(_) => break 'main,
+            }
+        }
+
+        // (2) 나갈 배치 refill — 직전 배치를 소켓에 다 흘려보냈을 때만 다음을 drain한다.
+        //     그 사이 viewport는 receiver slot에서 latest-wins 코얼레싱(§4.2) → backpressure 상한.
+        if out.is_empty() && !conn.wants_write() {
+            for session in keyframe_requests.drain(..) {
+                last_sent.remove(&session);
+            }
+            let mut exited_this_batch: HashSet<SessionId> = HashSet::new();
+            for event in receiver.drain() {
+                match encode_pump_frame(codec, &mut last_sent, &mut exited_this_batch, &event) {
+                    Ok(payload) => out.push_back(payload),
+                    Err(e) => tracing::warn!("remote event 직렬화 실패: {e}"),
+                }
+            }
+        }
+
+        // (3) out을 한 프레임씩 rustls writer로 밀고 flush — 소켓 backpressure면 나머지는 out에 남긴다.
+        while let Some(front) = out.front() {
+            if write_frame(&mut conn.writer(), front).is_err() {
+                break 'main;
+            }
+            out.pop_front();
+            progressed = true;
+            if tls_flush(&mut conn, &mut sock).is_err() {
+                break 'main;
+            }
+            if conn.wants_write() {
+                break; // 소켓이 더 못 받음 — 남은 out은 다음 tick에
+            }
+        }
+        if tls_flush(&mut conn, &mut sock).is_err() {
+            break;
+        }
+
+        // (4) heartbeat — 유휴가 HEARTBEAT_INTERVAL 넘고 보낼 것도 없으면 길이 0 프레임.
+        if progressed {
+            last_activity = Instant::now();
+        } else if last_activity.elapsed() >= HEARTBEAT_INTERVAL
+            && out.is_empty()
+            && !conn.wants_write()
+        {
+            if write_frame(&mut conn.writer(), &[]).is_err()
+                || tls_flush(&mut conn, &mut sock).is_err()
+            {
+                break;
+            }
+            last_activity = Instant::now();
+        }
+
+        if eof {
+            break;
+        }
+        if !progressed {
+            std::thread::sleep(TLS_IDLE_SLEEP);
+        }
+    }
+
+    let _ = conn.write_tls(&mut sock); // best-effort: 남은 alert/데이터 flush
+    let _ = sock.shutdown(Shutdown::Both);
+}
+
+/// 서버 TLS 핸드셰이크: TLS record 핸드셰이크 완료 → ClientHello 프레임 수신(토큰 검증) →
+/// ServerHello 회신. [`TLS_HANDSHAKE_TIMEOUT`] 안에 못 끝내거나 매직/버전/토큰 불일치면 `None`.
+/// non-blocking 루프라 진전이 없을 때만 짧게 잔다(busy-spin 방지).
+fn tls_server_handshake(
+    conn: &mut rustls::Connection,
+    sock: &mut TcpStream,
+    dec: &mut FrameDecoder,
+    auth_token: &str,
+    stop: &Arc<AtomicBool>,
+) -> Option<Codec> {
+    let deadline = Instant::now() + TLS_HANDSHAKE_TIMEOUT;
+    // ClientHello 프레임을 받을 때까지 TLS I/O 구동.
+    let hello_frame = loop {
+        if stop.load(Ordering::SeqCst) || Instant::now() >= deadline {
+            return None;
+        }
+        if tls_flush(conn, sock).is_err() {
+            return None;
+        }
+        match tls_pump_read(conn, sock) {
+            Ok(PumpRead::Ok) => {}
+            Ok(PumpRead::Eof) | Err(_) => return None,
+        }
+        match dec.advance(&mut conn.reader()) {
+            FramePoll::Frame(frame) if !frame.is_empty() => break frame,
+            FramePoll::Frame(_) => {} // 길이 0(있을 리 없지만) 무시
+            FramePoll::Pending => std::thread::sleep(TLS_IDLE_SLEEP),
+            FramePoll::Closed => return None,
+        }
+    };
+
+    let hello = match postcard::from_bytes::<ClientHello>(&hello_frame) {
+        Ok(hello) if hello.magic == PROTO_MAGIC && hello.proto_version == PROTO_VERSION => hello,
+        _ => {
+            tracing::warn!("remote TLS 핸드셰이크 실패(매직/버전/기형) — 접속 거부");
+            return None;
+        }
+    };
+    if !token_matches(auth_token, &hello.token) {
+        tracing::warn!("remote TLS 인증 실패 — 접속 거부");
+        return None;
+    }
+    let features = SERVER_FEATURES & hello.features;
+    let server_hello = ServerHello {
+        proto_version: PROTO_VERSION,
+        features,
+    };
+    let payload = postcard::to_allocvec(&server_hello).ok()?;
+    if write_frame(&mut conn.writer(), &payload).is_err() {
+        return None;
+    }
+    // ServerHello가 소켓으로 완전히 나갈 때까지 flush.
+    loop {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        if tls_flush(conn, sock).is_err() {
+            return None;
+        }
+        if !conn.wants_write() {
+            break;
+        }
+        std::thread::sleep(TLS_IDLE_SLEEP);
+    }
+    Some(Codec::from_features(features))
+}
+
 /// pump가 한 이벤트를 접속 코덱으로 프레임 payload로 만든다.
 /// Delta 접속의 viewport만 keyframe/delta 특수 처리(last_sent 갱신)하고, 나머지는
 /// 기존 [`Codec::encode_event`] 경로 그대로 — Plain은 이 경로에서도 바이트 동일.
@@ -642,17 +1138,33 @@ fn encode_viewport_frame(
     Ok(payload)
 }
 
-/// loopback의 RemoteRuntimeServer에 attach하는 클라이언트.
+/// RemoteRuntimeServer에 attach하는 클라이언트.
 /// InProcessRuntimeClient와 같은 trait(RuntimeCommandSink/RuntimeEventStream)을
 /// 구현한다 — UI 입장에서 교체 가능 (완료 기준).
 pub struct RemoteRuntimeClient {
-    /// 명령 송신 채널. reader 스레드도 seq gap 시 RequestKeyframe를 이 뮤텍스로 보내므로
-    /// (send_command와 프레임이 뒤섞이지 않게 같은 락 공유) Arc다 — 2-스레드 구조는 그대로.
-    writer: Arc<Mutex<TcpStream>>,
+    /// 명령 송신 경로 — 평문은 소켓 직접 write, TLS는 IO 스레드로 채널 enqueue.
+    transport: ClientTransport,
     subscribers: Arc<Mutex<Vec<RemoteSubscriber>>>,
+    /// 평문은 reader 스레드, TLS는 단일 IO 스레드.
     reader_thread: Option<JoinHandle<()>>,
     /// 핸드셰이크에서 협상된 접속 코덱 (§3.2). loopback은 Delta.
     codec: Codec,
+}
+
+/// 클라이언트 명령 송신 경로. 평문은 검증된 소켓 직접 write(2-스레드), TLS는 rustls 스트림을
+/// 단독 소유한 IO 스레드로 인코딩된 프레임을 채널 enqueue(§2.4 클라이언트도 단일 IO 필요).
+enum ClientTransport {
+    /// 명령을 소켓에 직접 write. reader 스레드도 seq gap 시 같은 뮤텍스로 RequestKeyframe를 보낸다.
+    Plain(Arc<Mutex<TcpStream>>),
+    /// 인코딩된 명령 프레임을 IO 스레드로 보낸다. **유계 sync_channel**([`TLS_CMD_QUEUE_CAP`]) —
+    /// 큐가 가득 차면 try_send가 즉시 Err(backpressure surface, 블록/silent drop 없음),
+    /// IO 스레드가 죽어 Receiver가 drop되면 Disconnected Err — 그 죽음을 다음 호출에
+    /// surface한다(silent drop 금지, 설계 요구 #3).
+    Tls {
+        commands: std::sync::mpsc::SyncSender<Vec<u8>>,
+        /// fd 레벨 shutdown용 raw 소켓 clone — Drop이 IO 스레드를 깨운다.
+        shutdown: TcpStream,
+    },
 }
 
 struct RemoteSubscriber {
@@ -750,7 +1262,59 @@ impl RemoteRuntimeClient {
             .context("remote reader thread 생성 실패")?;
 
         Ok(Self {
-            writer,
+            transport: ClientTransport::Plain(writer),
+            subscribers,
+            reader_thread: Some(reader_thread),
+            codec,
+        })
+    }
+
+    /// TLS 서버에 attach한다 (단계 C-2 + C-3 core). `expected_fingerprint`는 서버 인증서의
+    /// SHA-256 지문("ab:cd:…", [`TlsIdentity::fingerprint`]) — 커스텀 검증기가 CA/hostname/만료
+    /// 대신 **지문 일치만** 확인한다(TOFU/SSH 모델, §2.2 · Open Question 2). 지문 불일치 →
+    /// TLS 핸드셰이크 실패 → attach Err. 잘못된 토큰 → ServerHello 없음 → attach Err.
+    ///
+    /// 이후 IO는 rustls 스트림을 단독 소유하는 **단일 스레드**(§2.4)가 담당한다:
+    /// 이벤트는 구독자 slot으로 재구성 dispatch, `RequestKeyframe` 재동기화 경로 보존,
+    /// heartbeat(길이 0 프레임) 소비. `known_hosts` 저장/UX는 후속(C-3 나머지) — 호출자가 지문을 준다.
+    pub fn attach_tls(
+        addr: SocketAddr,
+        token: &str,
+        expected_fingerprint: &str,
+    ) -> anyhow::Result<Self> {
+        let config = Arc::new(build_client_config(expected_fingerprint)?);
+        // ServerName은 검증기가 무시한다(TOFU). SNI/참조용 고정 더미(cert SAN과 동일).
+        let server_name = ServerName::try_from("deppy-remote").expect("정적 server name");
+        let mut conn: rustls::Connection = rustls::ClientConnection::new(config, server_name)
+            .context("rustls ClientConnection 생성 실패")?
+            .into();
+        conn.set_buffer_limit(None);
+        let mut sock =
+            TcpStream::connect(addr).with_context(|| format!("remote TLS 연결 실패: {addr}"))?;
+        sock.set_nonblocking(true)
+            .context("remote TLS non-blocking 설정 실패")?;
+
+        // 핸드셰이크 + hello를 호출 스레드에서 동기로 끝내 인증/지문 거부를 Err로 즉시 안다.
+        let mut dec = FrameDecoder::new();
+        let codec = tls_client_handshake(&mut conn, &mut sock, &mut dec, token)?;
+
+        let subscribers: Arc<Mutex<Vec<RemoteSubscriber>>> = Arc::default();
+        // 유계 채널 — 명령 outbound backpressure를 채널 용량으로 상한한다 (codex HIGH).
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(TLS_CMD_QUEUE_CAP);
+        let shutdown = sock.try_clone().context("remote TLS shutdown clone 실패")?;
+        let io_subscribers = Arc::clone(&subscribers);
+        let reader_thread = std::thread::Builder::new()
+            .name("remote-tls-io".into())
+            .spawn(move || {
+                client_tls_io_loop(conn, sock, dec, codec, io_subscribers, cmd_rx);
+            })
+            .context("remote TLS IO thread 생성 실패")?;
+
+        Ok(Self {
+            transport: ClientTransport::Tls {
+                commands: cmd_tx,
+                shutdown,
+            },
             subscribers,
             reader_thread: Some(reader_thread),
             codec,
@@ -758,22 +1322,287 @@ impl RemoteRuntimeClient {
     }
 }
 
-/// reader가 디코드한 이벤트 하나를 처리한다 (§4.3/§4.4). 재구성 후 항상 전체 Viewport를
-/// slot에 dispatch — UI는 변함없이 전체 스냅샷만 본다. `false`를 반환하면 접속을 끊는다
-/// (검증 실패/프로토콜 위반). keyframe/delta 재구성 상태(recon)와 재동기화 요청은
-/// 접속 단위(reader 스레드 소유)다.
-fn handle_decoded_event(
+/// rustls `ClientConfig` — ring provider + 지문 핀닝 검증기(C-3 core). CA/hostname/만료를 무시하고
+/// SHA-256(cert DER) 지문 일치만으로 서버를 신뢰한다(TOFU).
+fn build_client_config(expected_fingerprint: &str) -> anyhow::Result<rustls::ClientConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = Arc::new(FingerprintVerifier {
+        expected: expected_fingerprint.to_ascii_lowercase(),
+        supported: provider.signature_verification_algorithms,
+    });
+    Ok(rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .context("rustls 클라이언트 프로토콜 버전 구성 실패")?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth())
+}
+
+/// TOFU 지문 핀닝 검증기 (C-3 core, 설계 §2.2). 표준 PKI(CA 체인·hostname·만료) 대신
+/// **SHA-256(end-entity cert DER) == 핀 지문**만 확인한다. handshake 서명은 여전히 검증해
+/// 핀된 cert의 키를 실제로 보유한 peer만 통과시킨다(핀만 흉내낸 MITM 차단).
+#[derive(Debug)]
+struct FingerprintVerifier {
+    /// 소문자 정규화된 기대 지문("ab:cd:…").
+    expected: String,
+    supported: WebPkiSupportedAlgorithms,
+}
+
+impl ServerCertVerifier for FingerprintVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        // CA/hostname/만료는 무시(TOFU) — 지문만 대조.
+        let got = crate::tls_identity::fingerprint(end_entity.as_ref());
+        if fingerprint_eq(got.as_bytes(), self.expected.as_bytes()) {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "TLS 서버 인증서 지문 불일치 (TOFU 핀 실패)".into(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(message, cert, dss, &self.supported)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(message, cert, dss, &self.supported)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.supported.supported_schemes()
+    }
+}
+
+/// 지문 상수시간-ish 비교 — 대소문자는 호출측이 이미 정규화(양쪽 소문자). 길이 다르면 거부.
+fn fingerprint_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// 클라이언트 TLS 핸드셰이크: ClientHello 프레임을 버퍼링하고 TLS record 핸드셰이크를 완료시킨 뒤
+/// ServerHello 프레임을 받아 협상 코덱을 확정한다. 지문 불일치(검증기 Err)나 토큰 거부(EOF)는
+/// `Err`로 올라와 attach가 실패한다. [`TLS_HANDSHAKE_TIMEOUT`] 초과도 Err.
+fn tls_client_handshake(
+    conn: &mut rustls::Connection,
+    sock: &mut TcpStream,
+    dec: &mut FrameDecoder,
+    token: &str,
+) -> anyhow::Result<Codec> {
+    let hello = ClientHello {
+        magic: PROTO_MAGIC,
+        proto_version: PROTO_VERSION,
+        features: CLIENT_FEATURES,
+        token: token.as_bytes().to_vec(),
+    };
+    let payload = postcard::to_allocvec(&hello).context("remote ClientHello 직렬화 실패")?;
+    // 핸드셰이크 완료 전이라도 writer는 평문을 버퍼링하고 traffic key 준비 후 전송한다.
+    write_frame(&mut conn.writer(), &payload).context("remote ClientHello 버퍼링 실패")?;
+
+    let deadline = Instant::now() + TLS_HANDSHAKE_TIMEOUT;
+    loop {
+        if Instant::now() >= deadline {
+            bail!("remote TLS 핸드셰이크 시간 초과");
+        }
+        tls_flush(conn, sock).context("remote TLS 쓰기 실패")?;
+        // 지문 불일치는 process_new_packets가 여기서 Err를 돌려준다(검증기 거부).
+        match tls_pump_read(conn, sock)
+            .context("remote TLS 핸드셰이크 실패(지문/인증서 거부 가능)")?
+        {
+            PumpRead::Ok => {}
+            PumpRead::Eof => bail!("remote TLS 인증 거부 — 토큰/지문을 확인하세요"),
+        }
+        match dec.advance(&mut conn.reader()) {
+            FramePoll::Frame(frame) if frame.is_empty() => {} // heartbeat 무시
+            FramePoll::Frame(frame) => {
+                let server_hello: ServerHello =
+                    postcard::from_bytes(&frame).context("remote ServerHello 디코드 실패")?;
+                if server_hello.proto_version != PROTO_VERSION {
+                    bail!("remote 프로토콜 버전 불일치");
+                }
+                // 협상 불변식: agreed ⊆ 요청(CLIENT_FEATURES) — 평문 attach와 동일 방어.
+                if server_hello.features & !CLIENT_FEATURES != 0 {
+                    bail!("remote 서버가 미요청 feature를 ack — 협상 불변식 위반, 접속 거부");
+                }
+                return Ok(Codec::from_features(server_hello.features));
+            }
+            FramePoll::Pending => std::thread::sleep(TLS_IDLE_SLEEP),
+            FramePoll::Closed => bail!("remote TLS 인증 거부 — 접속 종료"),
+        }
+    }
+}
+
+/// 클라이언트 TLS 단일 IO 루프 (§2.4): rustls 스트림 단독 소유. 수신 이벤트는 재구성 dispatch,
+/// 송신 명령(+gap 시 RequestKeyframe)은 채널에서 받아 소켓이 받는 만큼 흘려보낸다. read를 write
+/// 진척과 무관하게 매 tick 수행해 이벤트 수신이 명령 backpressure에 굶지 않는다.
+fn client_tls_io_loop(
+    mut conn: rustls::Connection,
+    mut sock: TcpStream,
+    mut dec: FrameDecoder,
+    codec: Codec,
+    subscribers: Arc<Mutex<Vec<RemoteSubscriber>>>,
+    commands: std::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    let mut recon: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> = HashMap::new();
+    let mut pending_keyframe: HashSet<SessionId> = HashSet::new();
+    let mut out: VecDeque<Vec<u8>> = VecDeque::new();
+
+    'main: loop {
+        let mut progressed = false;
+
+        // (1) READ 먼저 — 명령 송신 backpressure와 무관하게 이벤트를 흡수한다. read_tls와 프레임
+        //     드레인을 교대해 received_plaintext 버퍼 넘침을 막고, read 단계도 tick당
+        //     [`TLS_READ_STEPS_MAX`]로 상한한다(codex HIGH) — 고출력 서버 스트림이 소켓을 계속
+        //     readable하게 유지해도 명령 drain/write 단계(Ctrl-C/Resize/RequestKeyframe)가
+        //     굶지 않는다. 남은 수신분은 다음 tick에.
+        let mut eof = false;
+        let mut read_steps = 0usize;
+        'read: loop {
+            loop {
+                match dec.advance(&mut conn.reader()) {
+                    FramePoll::Frame(frame) => {
+                        progressed = true;
+                        if frame.is_empty() {
+                            continue; // heartbeat 소비
+                        }
+                        let Ok(decoded) = codec.decode_event(&frame) else {
+                            tracing::warn!("remote 이벤트 프로토콜 위반 — 접속 종료");
+                            break 'main;
+                        };
+                        let outcome = reconstruct_and_dispatch(
+                            decoded,
+                            &subscribers,
+                            &mut recon,
+                            &mut pending_keyframe,
+                        );
+                        if outcome.disconnect {
+                            break 'main;
+                        }
+                        if let Some(session) = outcome.request_keyframe {
+                            match encode_request_keyframe(session) {
+                                Ok(p) => out.push_back(p),
+                                Err(e) => tracing::warn!("remote RequestKeyframe 직렬화 실패: {e}"),
+                            }
+                        }
+                    }
+                    FramePoll::Pending => break,
+                    FramePoll::Closed => break 'main,
+                }
+            }
+            // 상한 도달 — 명령 drain/write 단계로 넘어간다(progressed라 sleep 없이 다음 tick 계속).
+            if read_steps >= TLS_READ_STEPS_MAX {
+                progressed = true;
+                break 'read;
+            }
+            match tls_read_step(&mut conn, &mut sock) {
+                Ok(ReadStep::Progressed) => {
+                    read_steps += 1;
+                    continue 'read;
+                }
+                Ok(ReadStep::Idle) => break 'read,
+                Ok(ReadStep::Eof) => {
+                    eof = true;
+                    break 'read;
+                }
+                Err(_) => break 'main,
+            }
+        }
+
+        // (2) 송신 명령 흡수 — 서버 outbound와 같은 원칙(codex HIGH): 직전 배치를 소켓에 다
+        //     흘려보냈을 때만(out 빔 + 소켓 미포화) drain하고, tick당 상한으로 cap해 fast
+        //     producer가 루프를 붙잡지 못하게 한다. 백로그/포화 중엔 drain하지 않는다 —
+        //     명령은 유계 sync_channel에서 자연 대기(순서 보존, 코얼레싱 없음).
+        //     Receiver Disconnected = 클라이언트 drop.
+        if out.is_empty() && !conn.wants_write() {
+            for _ in 0..TLS_CMD_DRAIN_MAX {
+                match commands.try_recv() {
+                    Ok(frame) => out.push_back(frame),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'main,
+                }
+            }
+        }
+
+        // (3) out을 한 프레임씩 밀고 flush — 소켓 backpressure면 나머지는 out에 남긴다.
+        while let Some(front) = out.front() {
+            if write_frame(&mut conn.writer(), front).is_err() {
+                break 'main;
+            }
+            out.pop_front();
+            progressed = true;
+            if tls_flush(&mut conn, &mut sock).is_err() {
+                break 'main;
+            }
+            if conn.wants_write() {
+                break;
+            }
+        }
+        if tls_flush(&mut conn, &mut sock).is_err() {
+            break;
+        }
+
+        if eof {
+            break;
+        }
+        if !progressed {
+            std::thread::sleep(TLS_IDLE_SLEEP);
+        }
+    }
+
+    let _ = conn.write_tls(&mut sock);
+    let _ = sock.shutdown(Shutdown::Both);
+}
+
+/// [`reconstruct_and_dispatch`] 결과 — 접속 종료 여부 + keyframe 재동기화 요청 세션.
+/// transport(평문 소켓 / TLS 큐)에 독립적이라 두 경로가 재구성 로직을 공유한다.
+struct ReconOutcome {
+    /// 검증 실패/프로토콜 위반 → 접속 종료.
+    disconnect: bool,
+    /// gap/기형 delta로 keyframe을 요청해야 하는 세션(세션당 1회, 폭주 방지 후).
+    request_keyframe: Option<SessionId>,
+}
+
+/// 디코드된 이벤트 하나를 재구성해 항상 전체 Viewport를 slot에 dispatch한다 (§4.3/§4.4).
+/// transport 무관 코어 — 평문([`handle_decoded_event`])과 TLS IO 루프가 공유한다.
+/// keyframe 요청은 여기서 보내지 않고 [`ReconOutcome`]로 돌려 호출측이 자기 transport로 보낸다.
+fn reconstruct_and_dispatch(
     decoded: DecodedEvent,
     subscribers: &Arc<Mutex<Vec<RemoteSubscriber>>>,
-    writer: &Mutex<TcpStream>,
     recon: &mut HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)>,
     pending_keyframe: &mut HashSet<SessionId>,
-) -> bool {
+) -> ReconOutcome {
+    let cont = ReconOutcome {
+        disconnect: false,
+        request_keyframe: None,
+    };
+    let disconnect = ReconOutcome {
+        disconnect: true,
+        request_keyframe: None,
+    };
     match decoded {
         DecodedEvent::Event(event) => {
             if let Err(reason) = validate_event(&event) {
                 tracing::warn!("remote 이벤트 검증 실패({reason}) — 접속 종료");
-                return false;
+                return disconnect;
             }
             // 종료된 세션의 재구성 상태를 정리한다 — 장기 연결에서 baseline Arc/pending이
             // 누적되지 않게 (codex P2). Viewport slot은 receiver.drain()이 프레임마다 비운다.
@@ -782,6 +1611,7 @@ fn handle_decoded_event(
                 pending_keyframe.remove(session);
             }
             dispatch(subscribers, event);
+            cont
         }
         DecodedEvent::Keyframe {
             session,
@@ -797,11 +1627,12 @@ fn handle_decoded_event(
             };
             if let Err(reason) = validate_event(&event) {
                 tracing::warn!("remote keyframe 검증 실패({reason}) — 접속 종료");
-                return false;
+                return disconnect;
             }
             recon.insert(session, (seq, snapshot));
             pending_keyframe.remove(&session);
             dispatch(subscribers, event);
+            cont
         }
         DecodedEvent::Delta {
             session,
@@ -830,10 +1661,11 @@ fn handle_decoded_event(
                     };
                     if let Err(reason) = validate_event(&event) {
                         tracing::warn!("remote delta 재구성 검증 실패({reason}) — 접속 종료");
-                        return false;
+                        return disconnect;
                     }
                     recon.insert(session, (seq, reconstructed));
                     dispatch(subscribers, event);
+                    cont
                 }
                 // 기형 delta 또는 seq gap → 패닉/접속종료 대신 gap 복구 경로 재사용:
                 // baseline을 버리고 keyframe 요청, 이후 delta는 keyframe 도착까지 drop.
@@ -843,14 +1675,31 @@ fn handle_decoded_event(
                         tracing::warn!("remote 기형 delta({reason}) — keyframe 재동기화");
                     }
                     recon.remove(&session);
-                    if pending_keyframe.insert(session) {
-                        request_keyframe(writer, session);
+                    let request_keyframe = pending_keyframe.insert(session).then_some(session);
+                    ReconOutcome {
+                        disconnect: false,
+                        request_keyframe,
                     }
                 }
             }
         }
     }
-    true
+}
+
+/// 평문 reader 스레드용 래퍼(기존 시그니처/동작 보존): 재구성 후 keyframe 요청을 writer 소켓으로
+/// 보낸다. `false` 반환이면 접속을 끊는다. (TLS는 [`reconstruct_and_dispatch`]를 직접 쓴다.)
+fn handle_decoded_event(
+    decoded: DecodedEvent,
+    subscribers: &Arc<Mutex<Vec<RemoteSubscriber>>>,
+    writer: &Mutex<TcpStream>,
+    recon: &mut HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)>,
+    pending_keyframe: &mut HashSet<SessionId>,
+) -> bool {
+    let outcome = reconstruct_and_dispatch(decoded, subscribers, recon, pending_keyframe);
+    if let Some(session) = outcome.request_keyframe {
+        request_keyframe(writer, session);
+    }
+    !outcome.disconnect
 }
 
 /// seq gap 재동기화(§4.4): reader 스레드가 RequestKeyframe 제어 프레임을 명령 채널로 보낸다.
@@ -897,8 +1746,34 @@ impl RuntimeCommandSink for RemoteRuntimeClient {
     fn send_command(&self, command: RuntimeCommand) -> anyhow::Result<()> {
         // 접속 코덱으로 인코딩. 단계 A(Plain)는 postcard(RuntimeCommand)와 바이트 동일.
         let payload = self.codec.encode_command(&command)?;
-        let mut stream = self.writer.lock().expect("remote writer lock");
-        write_frame(&mut *stream, &payload).context("remote 명령 전송 실패")
+        match &self.transport {
+            ClientTransport::Plain(writer) => {
+                let mut stream = writer.lock().expect("remote writer lock");
+                write_frame(&mut *stream, &payload).context("remote 명령 전송 실패")
+            }
+            // IO 스레드로 enqueue (유계 try_send — 블록 없음). 큐 가득참(backpressure)과
+            // IO 스레드 종료를 각각 명시적 Err로 surface한다 — 조용히 버리지 않는다(설계 요구 #3).
+            ClientTransport::Tls { commands, .. } => {
+                // 크기 검사를 enqueue 전에 — oversized 명령이 Ok를 받고 나중에 IO 스레드
+                // write_frame에서 접속을 죽이는 일이 없게 즉시 Err(접속 유지). 평문 경로의
+                // write_frame 송신측 상한과 동일 계약 (codex MED).
+                if payload.len() > MAX_FRAME_BYTES {
+                    bail!(
+                        "remote 명령 frame이 상한({MAX_FRAME_BYTES}B)을 초과: {}B — 전송 거부(접속 유지)",
+                        payload.len()
+                    );
+                }
+                match commands.try_send(payload) {
+                    Ok(()) => Ok(()),
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => Err(anyhow::anyhow!(
+                        "remote 명령 전송 큐 가득참 — 원격 서버 응답 지연(backpressure)"
+                    )),
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(anyhow::anyhow!(
+                        "remote TLS IO 스레드 종료 — 명령 전송 불가"
+                    )),
+                }
+            }
+        }
     }
 }
 
@@ -925,8 +1800,17 @@ impl crate::client::RuntimeClient for RemoteRuntimeClient {}
 
 impl Drop for RemoteRuntimeClient {
     fn drop(&mut self) {
-        if let Ok(stream) = self.writer.lock() {
-            let _ = stream.shutdown(Shutdown::Both);
+        // 소켓을 닫아 IO/reader 스레드를 깨운다. TLS는 채널 sender도 함께 drop돼(transport
+        // 소유) IO 루프가 Disconnected로도 빠져나온다.
+        match &self.transport {
+            ClientTransport::Plain(writer) => {
+                if let Ok(stream) = writer.lock() {
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+            }
+            ClientTransport::Tls { shutdown, .. } => {
+                let _ = shutdown.shutdown(Shutdown::Both);
+            }
         }
         if let Some(handle) = self.reader_thread.take() {
             let _ = handle.join();
@@ -2046,5 +2930,485 @@ mod tests {
             "SessionExited가 클라 recon을 정리한다"
         );
         assert!(!pending.contains(&s), "SessionExited가 pending을 정리한다");
+    }
+
+    // ---- TLS 전송 (단계 C-2 + C-3 core, §2) ----
+
+    /// 자기서명 신원을 rcgen로 직접 만든다 (keyring 우회 — 신원 수명주기는 tls_identity.rs가
+    /// 테스트한다). 여러 테스트가 공유 mock keyring의 고정 키 id를 다투지 않게 한다.
+    fn test_identity() -> TlsIdentity {
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(vec!["deppy-remote".to_owned()]).unwrap();
+        TlsIdentity {
+            cert_der: cert.der().to_vec(),
+            key_der: key_pair.serialize_der(),
+        }
+    }
+
+    /// 커스텀 셸 커맨드로 백엔드를 만든다 (slow-consumer 테스트의 대량 출력용).
+    fn test_backend_cmd(name: &str, args: Vec<String>) -> InProcessRuntimeClient {
+        init_mock_store();
+        let logs = std::env::temp_dir().join(format!("deppy-remote-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&logs).unwrap();
+        InProcessRuntimeClient::with_shell(
+            5,
+            Arc::new(secret::KeyringSecretStore),
+            logs,
+            secret::RedactionService::new(),
+            pty::CommandSpec {
+                program: "/bin/sh".into(),
+                args,
+                env: Vec::new(),
+            },
+            None,
+        )
+    }
+
+    /// TLS 왕복: 올바른 지문으로 attach_tls → SpawnShell 명령이 암호화 채널을 건너 worker에 닿고
+    /// ShellSpawned/MuxUpdated/Viewport(재구성된 전체)가 되돌아온다 (평문 왕복의 TLS판, Delta 협상).
+    #[test]
+    fn tls_attach_명령_이벤트_왕복() {
+        let identity = test_identity();
+        let fp = identity.fingerprint();
+        let server = RemoteRuntimeServer::serve_tls(
+            test_backend("tls-roundtrip"),
+            "127.0.0.1:0".parse().unwrap(),
+            identity,
+        )
+        .unwrap();
+        let client =
+            RemoteRuntimeClient::attach_tls(server.local_addr(), server.auth_token(), &fp).unwrap();
+        let rx = client.subscribe();
+
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+
+        let mut seen = Vec::new();
+        wait_for(&rx, &mut seen, Duration::from_secs(10), |events| {
+            let spawned = events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::ShellSpawned { .. }));
+            let mux = events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::MuxUpdated { .. }));
+            let viewport = events.iter().any(|e| {
+                matches!(e, RuntimeEvent::Viewport { snapshot, .. }
+                    if snapshot.visible_cells.iter().map(|c| c.c).collect::<String>().contains("remote-ok"))
+            });
+            spawned && mux && viewport
+        });
+
+        drop(client);
+        server.shutdown();
+    }
+
+    /// 지문 불일치 → TLS 핸드셰이크에서 검증기가 거부 → attach Err. 서버는 생존해 올바른 지문의
+    /// 재접속을 정상 처리한다.
+    #[test]
+    fn tls_지문_불일치는_거부되고_서버는_생존() {
+        let identity = test_identity();
+        let correct_fp = identity.fingerprint();
+        let server = RemoteRuntimeServer::serve_tls(
+            test_backend("tls-badfp"),
+            "127.0.0.1:0".parse().unwrap(),
+            identity,
+        )
+        .unwrap();
+
+        // 다른 인증서의 지문 = 불일치.
+        let wrong_fp = test_identity().fingerprint();
+        assert!(
+            RemoteRuntimeClient::attach_tls(server.local_addr(), server.auth_token(), &wrong_fp)
+                .is_err(),
+            "지문 불일치는 attach 실패여야 한다"
+        );
+
+        // 서버 생존 확인 — 올바른 지문으로 붙어 명령이 통한다.
+        let client =
+            RemoteRuntimeClient::attach_tls(server.local_addr(), server.auth_token(), &correct_fp)
+                .unwrap();
+        let rx = client.subscribe();
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let mut seen = Vec::new();
+        wait_for(&rx, &mut seen, Duration::from_secs(10), |events| {
+            events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::ShellSpawned { .. }))
+        });
+        drop(client);
+        server.shutdown();
+    }
+
+    /// 잘못된 토큰(지문은 맞음) → TLS는 서지만 ServerHello 없이 끊긴다 → attach Err. 서버 생존.
+    #[test]
+    fn tls_잘못된_토큰은_거부() {
+        let identity = test_identity();
+        let fp = identity.fingerprint();
+        let server = RemoteRuntimeServer::serve_tls(
+            test_backend("tls-badtoken"),
+            "127.0.0.1:0".parse().unwrap(),
+            identity,
+        )
+        .unwrap();
+        assert!(
+            RemoteRuntimeClient::attach_tls(server.local_addr(), "wrong-token", &fp).is_err(),
+            "잘못된 토큰은 attach 실패여야 한다"
+        );
+        // 서버 생존 — 올바른 토큰으로는 붙는다.
+        let client =
+            RemoteRuntimeClient::attach_tls(server.local_addr(), server.auth_token(), &fp).unwrap();
+        drop(client);
+        server.shutdown();
+    }
+
+    /// 유휴 기간을 건너도 TLS 접속이 살아 있다 — 유휴 후 명령/이벤트 왕복이 계속 성립한다.
+    /// (15s heartbeat 프레임 자체는 서버 pump의 write_frame(&[]) 경로와 구조적으로 동일하며
+    /// 여기선 liveness만 짧게 확인한다.)
+    #[test]
+    fn tls_유휴후에도_접속_유지() {
+        let identity = test_identity();
+        let fp = identity.fingerprint();
+        let server = RemoteRuntimeServer::serve_tls(
+            test_backend("tls-idle"),
+            "127.0.0.1:0".parse().unwrap(),
+            identity,
+        )
+        .unwrap();
+        let client =
+            RemoteRuntimeClient::attach_tls(server.local_addr(), server.auth_token(), &fp).unwrap();
+        let rx = client.subscribe();
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let mut seen = Vec::new();
+        wait_for(&rx, &mut seen, Duration::from_secs(10), |events| {
+            events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::ShellSpawned { .. }))
+        });
+        let first = seen
+            .iter()
+            .filter(|e| matches!(e, RuntimeEvent::ShellSpawned { .. }))
+            .count();
+
+        // 유휴 — 아무것도 오가지 않는 구간.
+        std::thread::sleep(Duration::from_secs(1));
+
+        // 유휴 후에도 명령이 통하고 이벤트가 돌아온다 = 접속 살아있음.
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        wait_for(&rx, &mut seen, Duration::from_secs(10), |events| {
+            events
+                .iter()
+                .filter(|e| matches!(e, RuntimeEvent::ShellSpawned { .. }))
+                .count()
+                > first
+        });
+        drop(client);
+        server.shutdown();
+    }
+
+    /// slow-consumer 스모크: 한 세션이 대량 출력을 뿜어 이벤트가 서버 쪽에 쌓이는 동안에도
+    /// 서버는 두 번째 명령을 계속 읽어 처리한다 (write backpressure가 read를 굶기지 않음, §2.4).
+    /// 단일 IO 루프가 매 tick write 진척과 무관하게 read를 먼저 수행하고, 나갈 배치는 앱계층
+    /// 큐로 상한(코얼레싱)하기에 데드락이 구조적으로 없다 — 이 테스트는 그 결과를 거칠게 확인한다.
+    #[test]
+    fn tls_느린_소비자에도_명령이_처리된다() {
+        let backend = test_backend_cmd(
+            "tls-slow",
+            vec![
+                "-c".into(),
+                "for i in $(seq 1 4000); do echo line $i; done; sleep 5".into(),
+            ],
+        );
+        let identity = test_identity();
+        let fp = identity.fingerprint();
+        let server =
+            RemoteRuntimeServer::serve_tls(backend, "127.0.0.1:0".parse().unwrap(), identity)
+                .unwrap();
+        let client =
+            RemoteRuntimeClient::attach_tls(server.local_addr(), server.auth_token(), &fp).unwrap();
+        let rx = client.subscribe();
+
+        // 세션 1 — 대량 출력을 뿜는다.
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 1000,
+            })
+            .unwrap();
+
+        // rx를 드레인하지 않고 이벤트가 쌓이게 둔다 (서버→클라 backpressure 유도).
+        std::thread::sleep(Duration::from_millis(500));
+
+        // 이벤트 부하 중에 두 번째 명령을 보낸다 — 서버가 이걸 읽어 처리해야 한다.
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 1000,
+            })
+            .unwrap();
+
+        // 두 세션 모두 spawn됐음을 확인 = 두 번째 명령이 굶지 않고 처리됨.
+        let mut seen = Vec::new();
+        wait_for(&rx, &mut seen, Duration::from_secs(15), |events| {
+            events
+                .iter()
+                .filter(|e| matches!(e, RuntimeEvent::ShellSpawned { .. }))
+                .count()
+                >= 2
+        });
+        drop(client);
+        server.shutdown();
+    }
+
+    /// send_command의 backpressure/종료 surface (codex HIGH): 유계 sync_channel이 가득 차면
+    /// try_send가 즉시 명시적 Err(블록/silent drop 없음), IO 스레드 종료(Receiver drop) 후에는
+    /// 종료 Err. 소비자 없는 transport를 직접 조립해 두 경로를 결정적으로 검증한다.
+    #[test]
+    fn tls_send_command는_큐포화와_스레드종료를_err로_surface() {
+        let (client_sock, _server_sock) = socket_pair();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
+        let client = RemoteRuntimeClient {
+            transport: ClientTransport::Tls {
+                commands: tx,
+                shutdown: client_sock,
+            },
+            subscribers: Arc::default(),
+            reader_thread: None,
+            codec: Codec::Delta,
+        };
+        let cmd = || RuntimeCommand::SpawnShell {
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 100,
+        };
+        // 소비자(IO 스레드)가 없는 상태에서 용량 2를 채운다 — 셋째는 가득참 Err.
+        client.send_command(cmd()).unwrap();
+        client.send_command(cmd()).unwrap();
+        let err = client.send_command(cmd()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("가득"),
+            "큐 포화는 가득참 Err여야 한다: {err:#}"
+        );
+        // IO 스레드 죽음(Receiver drop) → 이후 send는 종료 Err.
+        drop(rx);
+        let err = client.send_command(cmd()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("종료"),
+            "IO 스레드 종료는 종료 Err여야 한다: {err:#}"
+        );
+    }
+
+    /// 명령 폭주 스모크 (codex HIGH): send_command를 대량 호출해 큐를 압박해도(가득참 Err는
+    /// backpressure surface로 허용) IO 루프는 read 인터리브를 유지해 이벤트 수신이 계속되고,
+    /// 폭주가 끝나면 큐가 회복돼 새 명령 왕복이 성립한다(기아/메모리 무한 성장 없음).
+    #[test]
+    fn tls_명령_폭주에도_이벤트_수신_지속() {
+        let identity = test_identity();
+        let fp = identity.fingerprint();
+        let server = RemoteRuntimeServer::serve_tls(
+            test_backend("tls-flood"),
+            "127.0.0.1:0".parse().unwrap(),
+            identity,
+        )
+        .unwrap();
+        let client =
+            RemoteRuntimeClient::attach_tls(server.local_addr(), server.auth_token(), &fp).unwrap();
+        let rx = client.subscribe();
+
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let mut seen = Vec::new();
+        wait_for(&rx, &mut seen, Duration::from_secs(10), |events| {
+            events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::ShellSpawned { .. }))
+        });
+        let session = seen
+            .iter()
+            .find_map(|e| match e {
+                RuntimeEvent::ShellSpawned { session } => Some(*session),
+                _ => None,
+            })
+            .unwrap();
+
+        // 폭주: Resize를 대량 전송. 가득참 Err는 silent drop이 아니라 backpressure surface —
+        // 허용하고 계속 민다(순서 보존, 코얼레싱 없음이 계약).
+        for i in 0..3000u16 {
+            let _ = client.send_command(RuntimeCommand::Resize {
+                session,
+                cols: 80 + (i % 3),
+                rows: 24,
+            });
+        }
+
+        // 폭주 후 큐가 배수되면 새 명령이 다시 들어간다(회복) — 가득참 동안은 재시도.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match client.send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            }) {
+                Ok(()) => break,
+                Err(_) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "폭주 후 send_command가 회복되지 않음"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+
+        // 폭주를 건너서도 이벤트 수신이 계속된다 — 두 번째 ShellSpawned 왕복 확인.
+        wait_for(&rx, &mut seen, Duration::from_secs(15), |events| {
+            events
+                .iter()
+                .filter(|e| matches!(e, RuntimeEvent::ShellSpawned { .. }))
+                .count()
+                >= 2
+        });
+        drop(client);
+        server.shutdown();
+    }
+
+    /// read cap 검증 (codex HIGH — slow-consumer의 역방향): 서버가 이벤트를 연속 폭주시켜
+    /// 클라 소켓이 계속 readable해도, 클라 IO 루프의 read 단계 상한([`TLS_READ_STEPS_MAX`])이
+    /// 명령 drain/write 단계를 보장해 폭주 **도중** 보낸 명령이 서버에 도달한다.
+    #[test]
+    fn tls_이벤트_폭주중에도_클라_명령이_도달() {
+        // 세션 1이 대량 출력을 뿜어 서버→클라 이벤트 스트림을 포화시킨다.
+        let backend = test_backend_cmd(
+            "tls-rev-flood",
+            vec![
+                "-c".into(),
+                "for i in $(seq 1 8000); do echo flood line $i; done; sleep 5".into(),
+            ],
+        );
+        let identity = test_identity();
+        let fp = identity.fingerprint();
+        let server =
+            RemoteRuntimeServer::serve_tls(backend, "127.0.0.1:0".parse().unwrap(), identity)
+                .unwrap();
+        let client =
+            RemoteRuntimeClient::attach_tls(server.local_addr(), server.auth_token(), &fp).unwrap();
+        let rx = client.subscribe();
+
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 1000,
+            })
+            .unwrap();
+        // 출력 폭주가 흐르기 시작할 때까지 잠깐 — 이후 명령은 수신 폭주와 경합한다.
+        let mut seen = Vec::new();
+        wait_for(&rx, &mut seen, Duration::from_secs(10), |events| {
+            events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::ShellSpawned { .. }))
+        });
+
+        // 폭주 도중 두 번째 명령 — read cap 덕에 클라 IO 루프가 write 단계에 도달해야 한다.
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 1000,
+            })
+            .unwrap();
+        wait_for(&rx, &mut seen, Duration::from_secs(15), |events| {
+            events
+                .iter()
+                .filter(|e| matches!(e, RuntimeEvent::ShellSpawned { .. }))
+                .count()
+                >= 2
+        });
+        drop(client);
+        server.shutdown();
+    }
+
+    /// oversized 명령은 enqueue 전에 즉시 Err(codex MED) — Ok를 받아 놓고 IO 스레드가
+    /// write_frame에서 접속을 죽이는 일이 없다. 이후 정상 명령 왕복으로 접속 생존 확인.
+    #[test]
+    fn tls_초과크기_명령은_err_접속은_생존() {
+        let identity = test_identity();
+        let fp = identity.fingerprint();
+        let server = RemoteRuntimeServer::serve_tls(
+            test_backend("tls-oversize"),
+            "127.0.0.1:0".parse().unwrap(),
+            identity,
+        )
+        .unwrap();
+        let client =
+            RemoteRuntimeClient::attach_tls(server.local_addr(), server.auth_token(), &fp).unwrap();
+        let rx = client.subscribe();
+
+        // 인코딩이 MAX_FRAME_BYTES를 넘는 명령 (args에 17MiB 문자열).
+        let oversized = RuntimeCommand::SpawnAgent {
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 100,
+            agent_config_id: None,
+            command: "x".into(),
+            args: vec!["a".repeat(MAX_FRAME_BYTES + 1024)],
+            env_plain: Vec::new(),
+            env_secrets: Vec::new(),
+            waiting_regex: None,
+            approval_regex: None,
+            error_regex: None,
+            done_regex: None,
+        };
+        let err = client.send_command(oversized).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("상한"),
+            "초과 크기는 상한 Err여야 한다: {err:#}"
+        );
+
+        // 접속 생존 — 정상 명령이 여전히 왕복한다.
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let mut seen = Vec::new();
+        wait_for(&rx, &mut seen, Duration::from_secs(10), |events| {
+            events
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::ShellSpawned { .. }))
+        });
+        drop(client);
+        server.shutdown();
     }
 }

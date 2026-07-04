@@ -3410,6 +3410,8 @@ dependencies = [
  "pty",
  "rcgen",
  "rusqlite",
+ "rustls",
+ "rustls-pki-types",
  "secret",
  "serde",
  "serde_json",

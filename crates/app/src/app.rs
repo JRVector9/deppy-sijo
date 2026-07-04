@@ -558,6 +558,7 @@ impl eframe::App for App {
     // egui 0.35부터 update(&Context) 대신 ui(&mut Ui) 시그니처를 쓴다.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.frame_stats.begin();
+        let mut unread_before = 0;
         egui::Panel::top("top_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("설정").clicked() {
@@ -582,6 +583,7 @@ impl eframe::App for App {
                     }
                 }
                 let unread = self.notifications_ui.unread();
+                unread_before = unread;
                 let label = if unread > 0 {
                     format!("알림 ({unread})")
                 } else {
@@ -640,6 +642,10 @@ impl eframe::App for App {
                 .collect();
             self.notifications_ui
                 .retain_sessions(&self.active.id, &alive);
+            // retain_sessions가 배지 그리기 이후 unread를 줄였다면 다음 프레임에 재반영
+            if self.notifications_ui.unread() != unread_before {
+                ui.ctx().request_repaint();
+            }
         }
         // 전환 후 대상 workspace의 mux가 재구성되면(재emit) 알림이 가리킨 세션 pane으로
         // 이동한다 — 전환은 즉시지만 mux는 다음 몇 프레임에 채워지므로 pending으로 둔다.

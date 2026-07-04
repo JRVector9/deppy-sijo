@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod approvals;
 pub mod connectors;
 pub mod credentials;
 pub mod env_profiles;

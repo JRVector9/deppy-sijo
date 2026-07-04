@@ -37,6 +37,10 @@ pub struct App {
     credentials_ui: ui::credentials::CredentialsUi,
     env_profiles_ui: ui::env_profiles::EnvProfilesUi,
     notifications_ui: ui::notifications::NotificationsUi,
+    /// agent-proxy 승인 팝업 (option 1.5). proxy가 DB에 쓴 pending 행을 폴링해 표시한다.
+    approvals_ui: ui::approvals::ApprovalsUi,
+    /// 승인 목록 폴링 스로틀 — logic()이 매 프레임 돌아도 DB 조회는 ~500ms 간격으로.
+    last_approval_poll: std::time::Instant,
     frame_stats: crate::perf::FrameStats,
     /// 현재 활성(렌더되는) workspace의 런타임 상태.
     active: WorkspaceRuntime,
@@ -117,6 +121,9 @@ impl App {
             credentials_ui: ui::credentials::CredentialsUi::new(redaction.clone()),
             env_profiles_ui: ui::env_profiles::EnvProfilesUi::new(),
             notifications_ui: ui::notifications::NotificationsUi::new(),
+            approvals_ui: ui::approvals::ApprovalsUi::new(),
+            // 첫 폴링은 ~POLL 간격 뒤 (시작 시 500ms 지연은 허용 가능한 절충).
+            last_approval_poll: std::time::Instant::now(),
             active,
             warm: std::collections::HashMap::new(),
             warm_order: Vec::new(),
@@ -137,6 +144,10 @@ impl App {
     /// warm 상태로 유지할 최대 workspace 수 (활성 제외). 저-RAM 정책상 작게 — 초과분은
     /// Suspended(워커 shutdown). active + MAX_WARM개까지 워커가 동시 실행될 수 있다.
     const MAX_WARM: usize = 2;
+
+    /// 승인 폴링 간격(ms). 배터리↔지연 절충 — 더 똑똑한 크로스-프로세스 신호는 후속 과제.
+    /// idle에서도 이 주기로 프레임을 예약해 pending 승인을 ~0.5s 내 감지한다.
+    const APPROVAL_POLL_MS: u64 = 500;
 
     /// 한 workspace의 런타임 워커를 만든다: 생성 → wake 구독 → 저장 layout 복원 →
     /// credential redaction 시드. (perf 하네스는 제외 — new()에서 기본 workspace만.)
@@ -553,6 +564,21 @@ impl eframe::App for App {
             // 보이는 idle 상태에서도 새 출력/상태를 즉시 렌더하도록 프레임 예약
             ctx.request_repaint();
         }
+
+        // agent-proxy 승인 폴링 (option 1.5). proxy(별도 프로세스)가 DB에 쓴 pending 행을
+        // 주기적으로 읽어 approvals_ui에 넘긴다. 팝업 자체는 ui()(가시)에서만 뜨지만,
+        // 여기서 폴링해 목록을 신선하게 유지한다. egui는 필요 시에만 리페인트하므로 idle에도
+        // ~0.5s 내 감지되도록 다음 프레임을 예약한다 (쿼리는 인덱스라 저렴).
+        ctx.request_repaint_after(std::time::Duration::from_millis(Self::APPROVAL_POLL_MS));
+        if self.last_approval_poll.elapsed()
+            >= std::time::Duration::from_millis(Self::APPROVAL_POLL_MS)
+        {
+            self.last_approval_poll = std::time::Instant::now();
+            match self.db.list_pending_approvals() {
+                Ok(rows) => self.approvals_ui.set_pending(rows),
+                Err(e) => tracing::warn!("승인 목록 조회 실패: {e:#}"),
+            }
+        }
     }
 
     // egui 0.35부터 update(&Context) 대신 ui(&mut Ui) 시그니처를 쓴다.
@@ -682,6 +708,29 @@ impl eframe::App for App {
             }
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(50));
+        }
+
+        // agent-proxy 승인 팝업 (option 1.5). logic()이 폴링해 넣어둔 pending 중 가장
+        // 오래된 하나를 모달로 띄운다. 버튼을 누르면 결정을 DB에 되쓴다.
+        if let Some(decision) = self.approvals_ui.show(ui.ctx()) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            // proxy가 타임아웃으로 먼저 해소했으면 행이 사라졌을 수 있다 —
+            // resolve_approval은 first-writer-wins라 그 경우 조용한 no-op(안전).
+            if let Err(e) =
+                self.db
+                    .resolve_approval(&decision.id, decision.allowed, decision.remember, now)
+            {
+                tracing::warn!("승인 해소 실패: {e:#}");
+            }
+            // 해소 직후 목록을 갱신해 다음 항목이 바로 뜨게 한다 (다음 폴링을 기다리지 않음).
+            match self.db.list_pending_approvals() {
+                Ok(rows) => self.approvals_ui.set_pending(rows),
+                Err(e) => tracing::warn!("승인 목록 조회 실패: {e:#}"),
+            }
+            ui.ctx().request_repaint();
         }
 
         let changed = ui::settings::show(ui.ctx(), &mut self.settings_open, &mut self.config);

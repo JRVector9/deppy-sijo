@@ -234,6 +234,56 @@ struct WorkspaceRuntime {
     input_pressure: Option<runtime::PtyInputPressure>,
     /// Warm으로 내려간 시각. 일정 시간 이후 자동 Suspended(워커 shutdown)로 내린다.
     backgrounded_at: Option<std::time::Instant>,
+    /// live 세션 추적 (suspend 보호 — 이벤트 스트림에서 갱신).
+    live: LiveSessionTracker,
+}
+
+impl WorkspaceRuntime {
+    /// 아직 종료(Exited)되지 않은 세션이 pane에 하나라도 있으면 true — 셸이든
+    /// 에이전트든 떠 있는 것 자체가 실행 중이다. 이런 workspace는 Suspended(워커
+    /// shutdown = PTY kill)로 내리면 안 된다 (2026-07-05 사용자 요구: 진행 중인
+    /// 에이전트 작업이 경고 없이 죽는 문제).
+    fn has_live_sessions(&self) -> bool {
+        self.live.has_live()
+    }
+}
+
+/// 이벤트 스트림에서 "pane에 붙어 있고 아직 Exited 안 된 세션"을 추적한다.
+/// MuxUpdated가 세션 집합의 근거, SessionExited가 종료 마킹 — 이벤트 순서대로
+/// 갱신해 한 drain 안의 Exited → pane 제거 MuxUpdated 시퀀스도 정확히 반영된다.
+#[derive(Default)]
+struct LiveSessionTracker {
+    /// 최신 MuxUpdated 기준 pane에 붙은 세션 집합.
+    mux_sessions: std::collections::HashSet<runtime::SessionId>,
+    /// SessionExited를 관측한 세션 (mux_sessions에 남은 것만 유지해 유계).
+    exited_sessions: std::collections::HashSet<runtime::SessionId>,
+}
+
+impl LiveSessionTracker {
+    fn observe(&mut self, event: &runtime::RuntimeEvent) {
+        match event {
+            runtime::RuntimeEvent::MuxUpdated { snapshot } => {
+                self.mux_sessions = snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .filter_map(|pane| pane.session_id)
+                    .collect();
+                self.exited_sessions
+                    .retain(|s| self.mux_sessions.contains(s));
+            }
+            runtime::RuntimeEvent::SessionExited { session, .. } => {
+                self.exited_sessions.insert(*session);
+            }
+            _ => {}
+        }
+    }
+
+    fn has_live(&self) -> bool {
+        self.mux_sessions
+            .iter()
+            .any(|s| !self.exited_sessions.contains(s))
+    }
 }
 
 /// 실행 중인 remote TLS 서버 + 그 신원 지문(attach 클라이언트 대조용).
@@ -420,10 +470,13 @@ impl App {
     }
 
     /// warm 상태로 유지할 최대 workspace 수 (활성 제외). 저-RAM 정책상 작게 — 초과분은
-    /// Suspended(워커 shutdown). active + MAX_WARM개까지 워커가 동시 실행될 수 있다.
+    /// Suspended(워커 shutdown). 단 **live 세션(미종료 셸/에이전트)이 있는 workspace는
+    /// 상한과 무관하게 warm으로 유지**된다(작업 보호 > 메모리) — 그 경우 동시 워커 수는
+    /// 사용자가 실제로 실행 중인 workspace 수까지 늘 수 있다.
     const MAX_WARM: usize = 2;
     /// Warm workspace가 이 시간 동안 재활성화되지 않으면 Suspended로 내린다. 세션/PTY는
-    /// 종료되고 layout/session metadata만 DB에 남는다 (§14.1).
+    /// 종료되고 layout/session metadata만 DB에 남는다 (§14.1). live 세션이 있으면
+    /// 시간이 지나도 내리지 않는다.
     const WARM_AUTO_SUSPEND_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
     /// 승인 watcher 폴링 간격(ms). frame 예약은 하지 않고, pending 상태 변화 때만 UI를 깨운다.
@@ -476,6 +529,7 @@ impl App {
             session_resource_usage: Vec::new(),
             input_pressure: None,
             backgrounded_at: None,
+            live: LiveSessionTracker::default(),
         }
     }
 
@@ -669,9 +723,14 @@ impl App {
 
     /// warm 풀이 MAX_WARM을 넘으면 가장 오래된 것부터 Suspended로 내린다 (워커 shutdown,
     /// 세션 종료 — §14.1 Suspended). background 스레드에서 정리하고 on_exit에서 join.
+    /// **live 세션(미종료 셸/에이전트)이 있는 workspace는 축출하지 않는다** — 진행 중
+    /// 작업을 경고 없이 kill하지 않기 위해 상한 초과를 허용한다 (메모리 < 작업 보호).
     fn evict_warm(&mut self) {
-        while self.warm_order.len() > Self::MAX_WARM {
-            let evict_id = self.warm_order.remove(0);
+        let evictable = warm_eviction_candidates(&self.warm_order, Self::MAX_WARM, |id| {
+            self.warm.get(id).is_some_and(|rt| rt.has_live_sessions())
+        });
+        for evict_id in evictable {
+            self.warm_order.retain(|id| id != &evict_id);
             self.suspend_warm_workspace(&evict_id);
         }
     }
@@ -684,6 +743,10 @@ impl App {
             Self::WARM_AUTO_SUSPEND_AFTER,
         );
         for id in expired {
+            // live 세션이 있으면 시간이 지나도 suspend하지 않는다 (작업 보호).
+            if self.warm.get(&id).is_some_and(|rt| rt.has_live_sessions()) {
+                continue;
+            }
             self.warm_order.retain(|warm_id| warm_id != &id);
             self.suspend_warm_workspace(&id);
         }
@@ -702,6 +765,17 @@ impl App {
                 &mut rt.session_titles,
                 &self.i18n,
             );
+            // 최종 방어: 마지막 drain에서 새 spawn이 관측됐을 수 있다 — live 세션이
+            // 있으면 suspend를 취소하고 warm으로 되돌린다 (워커/PTY 유지).
+            if rt.has_live_sessions() {
+                tracing::info!(
+                    workspace_id,
+                    "suspend 취소 — 실행 중 세션이 있어 warm 유지 (작업 보호)"
+                );
+                self.warm.insert(workspace_id.to_owned(), rt);
+                self.warm_order.push(workspace_id.to_owned());
+                return;
+            }
             // 축출 = Suspended(워커 종료) — 그 workspace의 진행형 알림은 더는 조치
             // 불가하므로 정리한다 (결과 알림은 기록이라 유지, codex 리뷰).
             self.notifications_ui.prune_transient(workspace_id);
@@ -1066,6 +1140,8 @@ impl App {
             if let runtime::RuntimeEvent::PtyInputPressure { pressure, .. } = event {
                 rt.input_pressure = Some(pressure.clone());
             }
+            // live 세션 추적 (suspend 보호)
+            rt.live.observe(event);
         }
     }
 
@@ -1599,6 +1675,22 @@ fn load_catalog(locale: &str) -> i18n::Catalog {
     })
 }
 
+/// warm 풀 상한 초과분 중 축출 가능한(live 세션 없는) workspace를 앞(가장 오래됨)에서부터
+/// 고른다. live workspace는 건너뛰며, 그만큼 상한 초과가 허용된다 (작업 보호 우선).
+fn warm_eviction_candidates(
+    warm_order: &[String],
+    max_warm: usize,
+    has_live: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let overflow = warm_order.len().saturating_sub(max_warm);
+    warm_order
+        .iter()
+        .filter(|id| !has_live(id))
+        .take(overflow)
+        .cloned()
+        .collect()
+}
+
 fn expired_warm_workspace_ids(
     warm_order: &[String],
     backgrounded_at: impl Fn(&str) -> Option<std::time::Instant>,
@@ -2092,5 +2184,80 @@ h:1 EE:FF
             expired_warm_workspace_ids(&ids, |id| backgrounded.get(id).copied(), now, timeout),
             vec!["a".to_owned(), "c".to_owned()]
         );
+    }
+
+    #[test]
+    fn warm_eviction은_live_workspace를_건너뛴다() {
+        let ids = vec![
+            "a".to_owned(),
+            "b".to_owned(),
+            "c".to_owned(),
+            "d".to_owned(),
+        ];
+        // 상한 2, 초과 2 — 가장 오래된 a부터 고르되 live(a, c)는 건너뛴다
+        let live: std::collections::HashSet<&str> = ["a", "c"].into();
+        assert_eq!(
+            warm_eviction_candidates(&ids, 2, |id| live.contains(id)),
+            vec!["b".to_owned(), "d".to_owned()]
+        );
+        // 전부 live면 아무것도 축출하지 않는다 (상한 초과 허용 — 작업 보호)
+        assert_eq!(
+            warm_eviction_candidates(&ids, 2, |_| true),
+            Vec::<String>::new()
+        );
+        // 초과 없음 → 빈 결과
+        assert_eq!(
+            warm_eviction_candidates(&ids, 4, |_| false),
+            Vec::<String>::new()
+        );
+        // live 아닌 것이 초과분보다 많아도 초과분만큼만 축출
+        assert_eq!(
+            warm_eviction_candidates(&ids, 3, |_| false),
+            vec!["a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn live_세션_추적은_mux와_exited를_반영한다() {
+        use std::sync::Arc;
+        let mut tracker = LiveSessionTracker::default();
+        assert!(!tracker.has_live(), "빈 workspace는 live 아님");
+
+        let s1 = runtime::SessionId(1);
+        let mux = |sessions: &[runtime::SessionId]| runtime::RuntimeEvent::MuxUpdated {
+            snapshot: Arc::new(runtime::MuxSnapshot {
+                tabs: vec![runtime::TabSnapshot {
+                    id: runtime::MuxTabId::new(),
+                    title: "t".into(),
+                    layout: runtime::LayoutNode::Pane(runtime::MuxPaneId::new()),
+                    panes: sessions
+                        .iter()
+                        .map(|s| runtime::PaneSnapshot {
+                            id: runtime::MuxPaneId::new(),
+                            session_id: Some(*s),
+                            title: "p".into(),
+                        })
+                        .collect(),
+                }],
+                active_tab: None,
+                focused_pane: None,
+            }),
+        };
+
+        // 세션 attach → live
+        tracker.observe(&mux(&[s1]));
+        assert!(tracker.has_live());
+
+        // Exited → live 아님 (pane은 남아 있어도 프로세스는 죽음 — agent 결과 pane)
+        tracker.observe(&runtime::RuntimeEvent::SessionExited {
+            session: s1,
+            exit_code: Some(0),
+        });
+        assert!(!tracker.has_live());
+
+        // pane 제거 MuxUpdated → exited 집합도 정리(유계)
+        tracker.observe(&mux(&[]));
+        assert!(tracker.exited_sessions.is_empty());
+        assert!(!tracker.has_live());
     }
 }

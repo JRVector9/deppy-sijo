@@ -561,6 +561,11 @@ fn drain_receiver_into_outbound(
     let mut source = OutboundDrain::Open;
     loop {
         match receiver.events.try_recv() {
+            // ResourceUsage는 로컬 UI 텔레메트리 — 원격 피어에 보내지 않는다.
+            // postcard append-only는 기존 variant discriminant를 보존할 뿐, 구버전
+            // 피어가 모르는 새 variant를 디코드하게 해 주지 않는다(수신 즉시 decode
+            // 실패 → 접속 종료). 버전 협상으로 게이트하기 전까지 wire에서 제외 (codex).
+            Ok(RuntimeEvent::ResourceUsage { .. }) => {}
             Ok(event) => outbound.enqueue(event)?,
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
@@ -1958,7 +1963,20 @@ fn reconstruct_and_dispatch(
             snapshot,
             bracketed_paste,
         } => {
-            // 전체 기준선 — recon을 세팅하고 그대로 전체 Viewport로 emit.
+            // 전체 기준선 — recon을 세팅하고 전체 Viewport로 emit. dirty_ranges는
+            // **full로 승격**한다: keyframe의 dirty_ranges는 서버의 마지막 로컬
+            // take_snapshot 기준이라 클라이언트 렌더 캐시의 기준선과 무관하다 —
+            // 그대로 흘리면 UI row cache가 stale 행을 유지할 수 있다 (codex High:
+            // slow-client coalesce/keyframe 폴백/RequestKeyframe 복구 경로).
+            let snapshot = {
+                let mut full = (*snapshot).clone();
+                let cells = full.cols as usize * full.rows as usize;
+                full.dirty_ranges = vec![terminal::CellRange {
+                    start: 0,
+                    end: cells,
+                }];
+                Arc::new(full)
+            };
             let event = RuntimeEvent::Viewport {
                 session,
                 snapshot: Arc::clone(&snapshot),

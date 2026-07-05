@@ -34,6 +34,8 @@ pub struct ProcessResourceMonitor {
     last_wall: Option<Instant>,
     last_cpu_seconds: Option<f64>,
     next_sample: Instant,
+    /// 마지막으로 발행한 스냅샷 — 변화 게이트 기준.
+    last_emitted: Option<ProcessResourceSnapshot>,
 }
 
 impl ProcessResourceMonitor {
@@ -43,6 +45,7 @@ impl ProcessResourceMonitor {
             last_wall: None,
             last_cpu_seconds: None,
             next_sample: Instant::now(),
+            last_emitted: None,
         }
     }
 
@@ -52,7 +55,12 @@ impl ProcessResourceMonitor {
             return None;
         }
         self.next_sample = now + self.config.sample_interval;
-        Some(self.sample(now))
+        let snapshot = self.sample(now);
+        if !should_emit(self.last_emitted.as_ref(), &snapshot) {
+            return None;
+        }
+        self.last_emitted = Some(snapshot);
+        Some(snapshot)
     }
 
     fn sample(&mut self, now: Instant) -> ProcessResourceSnapshot {
@@ -77,6 +85,24 @@ impl ProcessResourceMonitor {
             high_rss: rss_bytes >= self.config.high_rss_bytes,
         }
     }
+}
+
+/// 변화 게이트: 직전 발행 대비 CPU ±0.5%p / RSS ±1MiB / high 플래그 변화가 없으면
+/// 재발행하지 않는다 — idle에서 2초마다 wake/repaint를 유발하지 않기 위함
+/// (codex: resource monitor는 idle-silent여야 한다). 첫 샘플은 항상 발행.
+fn should_emit(last: Option<&ProcessResourceSnapshot>, next: &ProcessResourceSnapshot) -> bool {
+    let Some(last) = last else {
+        return true;
+    };
+    let cpu_delta = match (last.cpu_percent, next.cpu_percent) {
+        (Some(a), Some(b)) => (a - b).abs(),
+        (None, None) => 0.0,
+        _ => f32::INFINITY,
+    };
+    cpu_delta >= 0.5
+        || last.rss_bytes.abs_diff(next.rss_bytes) >= 1024 * 1024
+        || last.high_cpu != next.high_cpu
+        || last.high_rss != next.high_rss
 }
 
 fn unix_ms() -> u64 {
@@ -142,6 +168,39 @@ fn page_size() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 변화_게이트는_idle에서_재발행하지_않는다() {
+        let snap = |cpu: Option<f32>, rss: u64| ProcessResourceSnapshot {
+            pid: 1,
+            sampled_at_ms: 0,
+            rss_bytes: rss,
+            cpu_percent: cpu,
+            high_cpu: false,
+            high_rss: false,
+        };
+        // 첫 샘플은 항상 발행
+        assert!(should_emit(None, &snap(Some(1.0), 100 << 20)));
+        // 변화 없음(임계 미만) → 침묵
+        let last = snap(Some(1.0), 100 << 20);
+        assert!(!should_emit(
+            Some(&last),
+            &snap(Some(1.2), (100 << 20) + 4096)
+        ));
+        // CPU ±0.5%p 이상 → 발행
+        assert!(should_emit(Some(&last), &snap(Some(1.6), 100 << 20)));
+        // RSS ±1MiB 이상 → 발행
+        assert!(should_emit(Some(&last), &snap(Some(1.0), 101 << 20)));
+        // cpu 기준선 등장(None→Some) → 발행
+        assert!(should_emit(
+            Some(&snap(None, 100 << 20)),
+            &snap(Some(1.0), 100 << 20)
+        ));
+        // high 플래그 전이 → 발행
+        let mut hot = snap(Some(1.0), 100 << 20);
+        hot.high_rss = true;
+        assert!(should_emit(Some(&last), &hot));
+    }
 
     #[test]
     fn first_sample_has_no_cpu_baseline() {

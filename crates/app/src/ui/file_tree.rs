@@ -31,6 +31,8 @@ pub enum SidebarAction {
         tab: runtime::MuxTabId,
         pane: runtime::MuxPaneId,
     },
+    /// 새 셸 생성 (세션 섹션의 + 버튼)
+    NewShell,
 }
 
 /// 트리 노드. `children == None`은 아직 나열 안 됨(lazy).
@@ -773,7 +775,16 @@ impl FileTreeUi {
         // 현재 workspace의 셸/에이전트를 나열하고 클릭으로 전환한다.
         if !sessions.is_empty() {
             ui.add_space(2.0);
-            ui.weak(catalog.t("file_tree.sessions", &[]));
+            ui.horizontal(|ui| {
+                ui.weak(catalog.t("file_tree.sessions", &[]));
+                if ui
+                    .small_button("+")
+                    .on_hover_text(catalog.t("workspace.new_shell", &[]))
+                    .clicked()
+                {
+                    action = Some(SidebarAction::NewShell);
+                }
+            });
             for entry in sessions {
                 let label = if entry.status.is_empty() {
                     format!("▸ {}", entry.title)

@@ -38,6 +38,9 @@ pub struct WorkspaceUi {
     /// split 경계 드래그 중 로컬 미리보기 (path, ratio). 드래그 동안은 명령을 보내지
     /// 않고(매 프레임 DB 저장 방지) 릴리즈 시 1회 ResizeSplit을 보낸다.
     split_drag: Option<(Vec<u8>, f32)>,
+    /// 닫기 확인 대기 중인 pane — 실행 중 세션이 있는 pane 닫기는 확인을 거친다
+    /// (2026-07-05 사용자 보고: 닫기 실수로 셸 전체 즉사 방지).
+    confirm_close: Option<runtime::MuxPaneId>,
     /// 터미널 마우스 선택 (session, anchor 셀, head 셀 — 드래그 방향 그대로,
     /// 렌더/복사 시 정규화). 새 출력(Viewport)이 오면 그 세션의 선택은 해제한다.
     selection: Option<(SessionId, usize, usize)>,
@@ -73,6 +76,7 @@ impl WorkspaceUi {
             pending_focus: None,
             pending_spawns: 0,
             split_drag: None,
+            confirm_close: None,
             selection: None,
             error: None,
         }
@@ -193,7 +197,9 @@ impl WorkspaceUi {
     ) {
         self.handle_events(events, catalog);
 
-        self.tab_bar(ui, config, client, catalog);
+        // 탭바 제거 (2026-07-05): 셸 전환은 좌측 사이드바 세션 목록이 담당하고,
+        // 새 셸/분할/닫기는 각 pane 헤더가 담당한다 — 셸 수만큼 탭이 늘어나
+        // 상단이 넘치던 문제 해소.
         if let Some(error) = self.error.clone() {
             ui.horizontal(|ui| {
                 ui.colored_label(ui.visuals().error_fg_color, error);
@@ -206,7 +212,20 @@ impl WorkspaceUi {
 
         let Some(mux) = self.mux.clone() else {
             ui.centered_and_justified(|ui| {
-                ui.label(catalog.t("workspace.start_shell_prompt", &[]))
+                if ui
+                    .button(catalog.t("workspace.new_shell", &[]))
+                    .on_hover_text(catalog.t("workspace.start_shell_prompt", &[]))
+                    .clicked()
+                {
+                    self.send(
+                        client,
+                        RuntimeCommand::SpawnShell {
+                            cols: 80,
+                            rows: 24,
+                            scrollback_lines: config.scrollback_lines as usize,
+                        },
+                    );
+                }
             });
             self.flush_command_repaint(ui.ctx());
             return;
@@ -224,7 +243,20 @@ impl WorkspaceUi {
             .and_then(|id| mux.tabs.iter().find(|tab| &tab.id == id))
         else {
             ui.centered_and_justified(|ui| {
-                ui.label(catalog.t("workspace.start_shell_prompt", &[]))
+                if ui
+                    .button(catalog.t("workspace.new_shell", &[]))
+                    .on_hover_text(catalog.t("workspace.start_shell_prompt", &[]))
+                    .clicked()
+                {
+                    self.send(
+                        client,
+                        RuntimeCommand::SpawnShell {
+                            cols: 80,
+                            rows: 24,
+                            scrollback_lines: config.scrollback_lines as usize,
+                        },
+                    );
+                }
             });
             self.flush_command_repaint(ui.ctx());
             return;
@@ -235,6 +267,8 @@ impl WorkspaceUi {
         // 깨우지 않던 시절의 안전망) → 가시 idle에서 20fps 리페인트로 CPU ~10%를 상시
         // 소모했다. 이제 worker의 wake가 Viewport(dirty 게이트)·상태 이벤트 모두를
         // 깨우므로 폴링이 불필요하다: 출력/상태가 있을 때만 프레임이 돈다.
+
+        self.close_confirm_dialog(ui.ctx(), client, catalog);
 
         let rect = ui.available_rect_before_wrap();
         let layout = active_tab.layout.clone();
@@ -254,94 +288,6 @@ impl WorkspaceUi {
 
         // 응답(MuxUpdated/Viewport)을 다음 프레임에서 수신하도록 보장
         self.flush_command_repaint(ui.ctx());
-    }
-
-    fn tab_bar(
-        &mut self,
-        ui: &mut egui::Ui,
-        config: &TerminalConfig,
-        client: &dyn RuntimeClient,
-        catalog: &i18n::Catalog,
-    ) {
-        let mux = self.mux.clone();
-        ui.horizontal(|ui| {
-            if let Some(mux) = &mux {
-                for tab in &mux.tabs {
-                    let active = mux.active_tab.as_ref() == Some(&tab.id);
-                    // tab 내 세션들의 감지 상태 요약 — 가장 주의가 필요한 상태 우선 (PR-12)
-                    let icon = tab
-                        .panes
-                        .iter()
-                        .filter_map(|pane| pane.session_id)
-                        .filter_map(|session| {
-                            self.sessions.get(&session).and_then(|view| view.status)
-                        })
-                        .max_by_key(|status| status.urgency())
-                        .map(status_icon)
-                        .unwrap_or("");
-                    let title = format!("{icon}{}", tab.title);
-                    if ui.selectable_label(active, title).clicked() && !active {
-                        self.send(
-                            client,
-                            RuntimeCommand::SelectTab {
-                                tab: tab.id.clone(),
-                            },
-                        );
-                    }
-                    if ui.small_button("×").clicked() {
-                        self.send(
-                            client,
-                            RuntimeCommand::CloseTab {
-                                tab: tab.id.clone(),
-                            },
-                        );
-                    }
-                    ui.separator();
-                }
-            }
-            if ui.button(catalog.t("workspace.new_shell", &[])).clicked() {
-                self.send(
-                    client,
-                    RuntimeCommand::SpawnShell {
-                        cols: 80,
-                        rows: 24,
-                        scrollback_lines: config.scrollback_lines as usize,
-                    },
-                );
-            }
-            // focused pane 대상 분할 (새 pane에 새 셸 attach)
-            if let Some(focused) = mux.as_ref().and_then(|m| m.focused_pane.clone()) {
-                if ui
-                    .button(catalog.t("workspace.split_horizontal_short", &[]))
-                    .clicked()
-                {
-                    self.send(
-                        client,
-                        RuntimeCommand::SplitPane {
-                            pane: focused.clone(),
-                            direction: SplitDirection::Horizontal,
-                            scrollback_lines: config.scrollback_lines as usize,
-                        },
-                    );
-                }
-                if ui
-                    .button(catalog.t("workspace.split_vertical_short", &[]))
-                    .clicked()
-                {
-                    self.send(
-                        client,
-                        RuntimeCommand::SplitPane {
-                            pane: focused.clone(),
-                            direction: SplitDirection::Vertical,
-                            scrollback_lines: config.scrollback_lines as usize,
-                        },
-                    );
-                }
-                if ui.button(catalog.t("workspace.close_pane", &[])).clicked() {
-                    self.send(client, RuntimeCommand::ClosePane { pane: focused });
-                }
-            }
-        });
     }
 
     /// layout 트리를 rect 분할로 재귀 렌더한다.
@@ -536,6 +482,103 @@ impl WorkspaceUi {
             );
         }
         self.pane_context_menu(&pane_resp, pane_id, config, client, catalog);
+
+        // pane 헤더 바 (2026-07-05): [상태 제목] [×] ... [+셸] [분할│] [분할─]
+        // 닫기/분할 대상이 "이 pane"임이 시각적으로 자명하다 — 탭바 제거의 대체 UI.
+        let header_fill = if focused {
+            ui.visuals().selection.bg_fill.gamma_multiply(0.35)
+        } else {
+            ui.visuals().faint_bg_color
+        };
+        egui::Frame::new()
+            .fill(header_fill)
+            .inner_margin(egui::Margin::symmetric(6, 2))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let icon = pane
+                        .session_id
+                        .and_then(|s| self.sessions.get(&s))
+                        .and_then(|v| v.status)
+                        .map(status_icon)
+                        .unwrap_or("");
+                    let title = if icon.is_empty() {
+                        pane.title.clone()
+                    } else {
+                        format!("{icon} {}", pane.title)
+                    };
+                    // 우측 컨트롤 폭 예약 — 긴 제목이 닫기/분할 버튼을 밀어내지
+                    // 않게 truncate 최대폭 제한 (codex, 사이드바 헤더와 동일 패턴)
+                    let title_resp = ui
+                        .scope(|ui| {
+                            ui.set_max_width((ui.available_width() - 120.0).max(30.0));
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(title).small().strong())
+                                    .sense(egui::Sense::click())
+                                    .truncate(),
+                            )
+                        })
+                        .inner;
+                    if title_resp.clicked() && !focused {
+                        self.send(
+                            client,
+                            RuntimeCommand::FocusPane {
+                                pane: pane_id.clone(),
+                            },
+                        );
+                    }
+                    if ui
+                        .small_button("×")
+                        .on_hover_text(catalog.t("workspace.close_pane", &[]))
+                        .clicked()
+                    {
+                        self.request_close_pane(client, pane_id.clone());
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button("─")
+                            .on_hover_text(catalog.t("workspace.split_vertical_short", &[]))
+                            .clicked()
+                        {
+                            self.send(
+                                client,
+                                RuntimeCommand::SplitPane {
+                                    pane: pane_id.clone(),
+                                    direction: SplitDirection::Vertical,
+                                    scrollback_lines: config.scrollback_lines as usize,
+                                },
+                            );
+                        }
+                        if ui
+                            .small_button("│")
+                            .on_hover_text(catalog.t("workspace.split_horizontal_short", &[]))
+                            .clicked()
+                        {
+                            self.send(
+                                client,
+                                RuntimeCommand::SplitPane {
+                                    pane: pane_id.clone(),
+                                    direction: SplitDirection::Horizontal,
+                                    scrollback_lines: config.scrollback_lines as usize,
+                                },
+                            );
+                        }
+                        if ui
+                            .small_button("+")
+                            .on_hover_text(catalog.t("workspace.new_shell", &[]))
+                            .clicked()
+                        {
+                            self.send(
+                                client,
+                                RuntimeCommand::SpawnShell {
+                                    cols: 80,
+                                    rows: 24,
+                                    scrollback_lines: config.scrollback_lines as usize,
+                                },
+                            );
+                        }
+                    });
+                });
+            });
         if pane.session_id.is_some() {
             if pane_resp
                 .dnd_hover_payload::<std::path::PathBuf>()
@@ -789,6 +832,78 @@ impl WorkspaceUi {
     /// 명령을 보냈거나 spawn 응답 대기 중이면 repaint를 예약한다 —
     /// 느린 spawn(keyring 등)도 응답 이벤트가 올 때까지 폴링이 끊기지 않는다.
     /// show()의 모든 return 경로에서 호출할 것.
+    /// pane 닫기 요청 — 실행 중 세션이면 확인을 거치고, 아니면 즉시 닫는다.
+    /// (세션 상태를 모르면 보수적으로 확인을 띄운다 — 실수 즉사 방지가 목적.)
+    fn request_close_pane(&mut self, client: &dyn RuntimeClient, pane: runtime::MuxPaneId) {
+        let running = self
+            .mux
+            .as_ref()
+            .and_then(|mux| {
+                mux.tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .find(|p| p.id == pane)
+            })
+            .and_then(|p| p.session_id)
+            .map(|s| {
+                self.sessions
+                    .get(&s)
+                    .is_none_or(|view| view.exit_code.is_none())
+            })
+            .unwrap_or(false);
+        if running {
+            self.confirm_close = Some(pane);
+            // 다이얼로그는 다음 프레임에 그려진다(show 초입 호출 순서) — 리페인트를
+            // 예약해 × 클릭 직후 확인창이 바로 뜨게 한다 (codex).
+            self.command_sent = true;
+        } else {
+            self.send(client, RuntimeCommand::ClosePane { pane });
+        }
+    }
+
+    /// 닫기 확인 다이얼로그 (request_close_pane이 세팅) — 실행 중 세션 종료 경고.
+    fn close_confirm_dialog(
+        &mut self,
+        ctx: &egui::Context,
+        client: &dyn RuntimeClient,
+        catalog: &i18n::Catalog,
+    ) {
+        let Some(pane) = self.confirm_close.clone() else {
+            return;
+        };
+        // 대상 pane이 그 사이 사라졌으면(셸 exit 등) 조용히 정리
+        let alive = self
+            .mux
+            .as_ref()
+            .is_some_and(|m| m.tabs.iter().flat_map(|t| &t.panes).any(|p| p.id == pane));
+        if !alive {
+            self.confirm_close = None;
+            return;
+        }
+        let mut open = true;
+        egui::Window::new(catalog.t("workspace.close_confirm.title", &[]))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(catalog.t("workspace.close_confirm.body", &[]));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button(catalog.t("action.close", &[])).clicked() {
+                        self.send(client, RuntimeCommand::ClosePane { pane: pane.clone() });
+                        self.confirm_close = None;
+                    }
+                    if ui.button(catalog.t("action.cancel", &[])).clicked() {
+                        self.confirm_close = None;
+                    }
+                });
+            });
+        if !open {
+            self.confirm_close = None;
+        }
+    }
+
     /// pane 우클릭 메뉴 — 분할/닫기 (2026-07-05, 선택한 pane 단위 제어).
     fn pane_context_menu(
         &mut self,
@@ -872,12 +987,7 @@ impl WorkspaceUi {
                 ui.separator();
             }
             if ui.button(catalog.t("workspace.close_pane", &[])).clicked() {
-                self.send(
-                    client,
-                    RuntimeCommand::ClosePane {
-                        pane: pane_id.clone(),
-                    },
-                );
+                self.request_close_pane(client, pane_id.clone());
                 ui.close();
             }
         });

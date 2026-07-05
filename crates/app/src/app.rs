@@ -1452,6 +1452,20 @@ impl eframe::App for App {
                         tracing::warn!("pane 포커스 실패: {e:#}");
                     }
                 }
+                // 사이드바 + 버튼 — 새 셸 (탭바 제거 후 대체 진입점)
+                Some(ui::file_tree::SidebarAction::NewShell) => {
+                    if let Err(e) =
+                        self.active
+                            .runtime
+                            .send_command(runtime::RuntimeCommand::SpawnShell {
+                                cols: 80,
+                                rows: 24,
+                                scrollback_lines: self.config.terminal.scrollback_lines as usize,
+                            })
+                    {
+                        tracing::warn!("새 셸 시작 실패: {e:#}");
+                    }
+                }
                 None => {}
             }
         }

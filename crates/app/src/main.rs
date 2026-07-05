@@ -61,11 +61,15 @@ fn main() -> anyhow::Result<()> {
             // fullsize content view로 콘텐츠가 타이틀바까지 확장되고, 네이티브 제목
             // 텍스트는 숨긴다. 신호등(닫기/최소화/전체화면)은 그대로 남는다.
             // 상단 바 렌더는 신호등 폭만큼 왼쪽 여백을 두고, 빈 영역은 창 드래그로 처리한다.
+            // eframe 문서 권장 조합: fullsize_content_view는 titlebar_shown(false)·
+            // title_shown(false)와 함께 써야 한다. titlebar_shown(true)면 네이티브
+            // 타이틀바가 상단 바를 덮어 잘라냈다(2026-07-06 사용자 화면). 신호등은
+            // 데코레이션이 켜져 있어 그대로 남는다.
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([1200.0, 800.0])
                 .with_fullsize_content_view(true)
                 .with_title_shown(false)
-                .with_titlebar_shown(true),
+                .with_titlebar_shown(false),
             ..Default::default()
         },
         Box::new(move |cc| {

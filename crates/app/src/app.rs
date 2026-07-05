@@ -1350,65 +1350,90 @@ impl eframe::App for App {
         self.frame_stats.begin();
         let text = self.i18n.clone();
         let mut unread_before = 0;
-        egui::Panel::top("top_bar")
-            .resizable(false)
-            .exact_size(40.0)
-            .show(ui, |ui| {
-                // 타이틀바 영역 통합 (2026-07-06): 빈 곳을 잡으면 창을 드래그로 옮긴다.
-                // 버튼보다 먼저 등록해 버튼 위 클릭은 버튼이, 빈 영역 드래그는 이쪽이 받는다.
-                let bar_rect = ui.max_rect();
-                let drag = ui.interact(
-                    bar_rect,
-                    egui::Id::new("titlebar_drag"),
-                    egui::Sense::click_and_drag(),
-                );
-                if drag.drag_started_by(egui::PointerButton::Primary) {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        egui::Panel::top("top_bar").resizable(false).show(ui, |ui| {
+            // 타이틀바 영역 통합 (2026-07-06): fullsize content view로 이 바가 macOS
+            // 타이틀바까지 확장된다. 패널 크기는 버튼 높이에 맞춰 자동 — exact_size로
+            // 강제하면 버튼이 얇은 띠에 클리핑됐다(2026-07-06 사용자 화면). 위아래
+            // 여백으로 신호등(y~14) 높이에 맞춰 세로 중앙 정렬한다.
+            // 빈 곳을 잡으면 창을 드래그로 옮긴다 — 버튼보다 먼저 등록해 버튼 위
+            // 클릭은 버튼이, 빈 영역 드래그는 이쪽이 받는다.
+            let bar_rect = ui.max_rect();
+            let drag = ui.interact(
+                bar_rect,
+                egui::Id::new("titlebar_drag"),
+                egui::Sense::click_and_drag(),
+            );
+            if drag.drag_started_by(egui::PointerButton::Primary) {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            ui.add_space(7.0);
+            ui.horizontal(|ui| {
+                // 신호등(닫기/최소화/전체화면) 폭만큼 왼쪽 여백 — macOS.
+                #[cfg(target_os = "macos")]
+                ui.add_space(72.0);
+                // 프레임 없는 텍스트 버튼 — 버튼마다 박스가 생기면 "라인 여러 개"로
+                // 보인다 (2026-07-06 사용자). hover 시에만 옅은 배경.
+                let tbtn = |ui: &mut egui::Ui, label: String| {
+                    ui.add(egui::Button::new(label).frame(false)).clicked()
+                };
+                if tbtn(ui, text.t("top.settings", &[])) {
+                    self.settings_open = !self.settings_open;
                 }
-                ui.horizontal_centered(|ui| {
-                    // 신호등(닫기/최소화/전체화면) 폭만큼 왼쪽 여백 — macOS.
-                    #[cfg(target_os = "macos")]
-                    ui.add_space(72.0);
-                    if ui.button(text.t("top.settings", &[])).clicked() {
-                        self.settings_open = !self.settings_open;
-                    }
-                    if ui.button(text.t("top.credentials", &[])).clicked() {
-                        self.credentials_ui.toggle();
-                    }
-                    if ui.button(text.t("top.connectors", &[])).clicked() {
-                        self.connectors_ui.toggle();
-                    }
-                    if ui.button(text.t("top.environment", &[])).clicked() {
-                        self.env_profiles_ui.toggle();
-                    }
-                    if ui.button(text.t("top.agents", &[])).clicked() {
-                        self.agents_ui.toggle();
-                    }
-                    if ui.button(text.t("top.workspaces", &[])).clicked() {
-                        self.workspaces_open = !self.workspaces_open;
-                        if self.workspaces_open {
-                            self.refresh_workspaces();
-                        }
-                    }
-                    if ui.button(text.t("top.activity", &[])).clicked() {
-                        self.activity_ui.toggle();
+                if tbtn(ui, text.t("top.credentials", &[])) {
+                    self.credentials_ui.toggle();
+                }
+                if tbtn(ui, text.t("top.connectors", &[])) {
+                    self.connectors_ui.toggle();
+                }
+                if tbtn(ui, text.t("top.environment", &[])) {
+                    self.env_profiles_ui.toggle();
+                }
+                if tbtn(ui, text.t("top.agents", &[])) {
+                    self.agents_ui.toggle();
+                }
+                if tbtn(ui, text.t("top.workspaces", &[])) {
+                    self.workspaces_open = !self.workspaces_open;
+                    if self.workspaces_open {
                         self.refresh_workspaces();
                     }
-                    let unread = self.notifications_ui.unread();
-                    unread_before = unread;
-                    let label = if unread > 0 {
-                        let count = unread.to_string();
-                        text.t("top.notifications.unread", &[("count", &count)])
-                    } else {
-                        text.t("top.notifications", &[])
+                }
+                if tbtn(ui, text.t("top.activity", &[])) {
+                    self.activity_ui.toggle();
+                    self.refresh_workspaces();
+                }
+                let unread = self.notifications_ui.unread();
+                unread_before = unread;
+                let label = if unread > 0 {
+                    let count = unread.to_string();
+                    text.t("top.notifications.unread", &[("count", &count)])
+                } else {
+                    text.t("top.notifications", &[])
+                };
+                if tbtn(ui, label) {
+                    // 열면 모두 읽음 → 배지가 이미 그려진 뒤라 다음 프레임에 갱신
+                    self.notifications_ui.toggle();
+                    ui.ctx().request_repaint();
+                }
+                // 우측: 로케일 · 메모리 (목업의 'ko · 113MB').
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let locale_short = self
+                        .config
+                        .i18n
+                        .locale
+                        .split('-')
+                        .next()
+                        .unwrap_or(&self.config.i18n.locale);
+                    let label = match self.active.resource_usage {
+                        Some(r) => format!("{locale_short} · {}MB", r.rss_bytes / (1024 * 1024)),
+                        None => locale_short.to_owned(),
                     };
-                    if ui.button(label).clicked() {
-                        // 열면 모두 읽음 → 배지가 이미 그려진 뒤라 다음 프레임에 갱신
-                        self.notifications_ui.toggle();
-                        ui.ctx().request_repaint();
-                    }
+                    ui.weak(label);
                 });
             });
+            ui.add_space(6.0);
+            // 툴바-본문 경계선 하나 (픽셀 스냅 헤어라인).
+            crate::ui::hairline(ui);
+        });
 
         // 폴더 트리 사이드바 (FT-1) — CentralPanel보다 먼저 배치해야 한다 (§9-1).
         // OFF(None)면 Panel 자체를 만들지 않는다 (§6 리소스 0).

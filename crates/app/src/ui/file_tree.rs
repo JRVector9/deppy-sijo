@@ -15,8 +15,11 @@ pub struct SessionEntry {
     pub tab: runtime::MuxTabId,
     pub pane: runtime::MuxPaneId,
     pub title: String,
-    /// 상태 아이콘 (⏳/✋/✅/❌, 없으면 빈 문자열)
-    pub status: &'static str,
+    /// agent 감지 상태 (Running/Waiting/NeedsApproval/Done/Error). 셸은 항상 None —
+    /// status 감지는 agent만(§PR-12). 세션 행 상태 점 색으로 그린다.
+    pub status: Option<runtime::SessionStatus>,
+    /// agent 세션인가 (status 감지 대상 = agent). 타입 글리프(마름모/삼각형) 구분용.
+    pub is_agent: bool,
     /// 최신 화면 요약 (마지막 비어있지 않은 행 — 2026-07-05)
     pub summary: String,
     pub focused: bool,
@@ -743,8 +746,9 @@ impl FileTreeUi {
         egui::Panel::left("file_tree_panel")
             .resizable(true)
             .default_size(240.0)
-            // 내용이 안 보여도 좁힐 수 있게 — 최소폭 거의 0까지 허용 (2026-07-05 요청)
-            .size_range(egui::Rangef::new(28.0, f32::INFINITY))
+            // 최소폭 확보 — 너무 좁히면 세션 행(점·글리프·요약)이 깨져 보였다
+            // (2026-07-06 사용자 화면). 접기는 별도 토글(◂)로 처리, 폭은 160px까지만.
+            .size_range(egui::Rangef::new(160.0, f32::INFINITY))
             .show(ui, |ui| self.contents(ui, sessions, catalog))
             .inner
     }
@@ -794,23 +798,9 @@ impl FileTreeUi {
                 .max_height(session_max_h)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
                     for entry in sessions {
-                        let label = if entry.status.is_empty() {
-                            format!("▸ {}", entry.title)
-                        } else {
-                            format!("{} {}", entry.status, entry.title)
-                        };
-                        let resp = ui.selectable_label(entry.focused, egui::RichText::new(label));
-                        if !entry.summary.is_empty() {
-                            ui.indent(("session_summary", &entry.pane), |ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&entry.summary).weak().small(),
-                                    )
-                                    .truncate(),
-                                );
-                            });
-                        }
+                        let resp = session_row(ui, entry);
                         if resp.clicked() && !entry.focused {
                             action = Some(SidebarAction::FocusSession {
                                 tab: entry.tab.clone(),
@@ -1830,6 +1820,129 @@ pub enum ShellKind {
     PowerShell,
     /// cmd.exe double-quote grouping.
     Cmd,
+}
+
+/// 세션 행을 painter로 직접 그린다 (2026-07-06 목업 반영). 상태를 이모지 글리프로
+/// 쓰면 폰트(AppleGothic)에 ⏳/✋/▸/◆ 글리프가 없어 □(두부)로 깨진다 — 색 점·삼각형·
+/// 마름모를 도형으로 그려 회피한다. 선택 시 액센트 배경 + 좌측 레일, agent는 레일 표시,
+/// 요약 한 줄(dim/mono). 반환 Response로 클릭을 처리한다.
+fn session_row(ui: &mut egui::Ui, entry: &SessionEntry) -> egui::Response {
+    let has_summary = !entry.summary.is_empty();
+    let row_h = if has_summary { 38.0 } else { 24.0 };
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), row_h),
+        egui::Sense::click(),
+    );
+    if !ui.is_rect_visible(rect) {
+        return resp;
+    }
+    let visuals = ui.visuals();
+    let accent = visuals.selection.bg_fill;
+    let dot = session_status_color(entry.status, visuals);
+    let painter = ui.painter();
+
+    // 선택/hover 배경
+    if entry.focused {
+        painter.rect_filled(rect, 4.0, accent.gamma_multiply(0.18));
+    } else if resp.hovered() {
+        painter.rect_filled(rect, 4.0, visuals.widgets.hovered.bg_fill);
+    }
+    // 좌측 상태 레일 (선택 또는 agent) — 2px
+    if entry.focused || entry.is_agent {
+        let rail = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), rect.top() + 3.0),
+            egui::vec2(2.0, row_h - 6.0),
+        );
+        let rail_color = if entry.focused { accent } else { dot };
+        painter.rect_filled(rail, 1.0, rail_color);
+    }
+    let mid_y = rect.top() + if has_summary { 13.0 } else { row_h / 2.0 };
+    // 상태 점
+    painter.circle_filled(egui::pos2(rect.left() + 17.0, mid_y), 3.5, dot);
+    // 타입 글리프: agent=마름모(◆), shell=삼각형(▸) — 도형으로 (폰트 글리프 회피)
+    paint_type_glyph(
+        painter,
+        egui::pos2(rect.left() + 31.0, mid_y),
+        entry.is_agent,
+        visuals.weak_text_color(),
+    );
+    // 타이틀
+    let title_color = if entry.focused {
+        accent
+    } else {
+        visuals.text_color()
+    };
+    painter.text(
+        egui::pos2(rect.left() + 44.0, mid_y),
+        egui::Align2::LEFT_CENTER,
+        &entry.title,
+        egui::FontId::proportional(13.0),
+        title_color,
+    );
+    // 요약 (dim, mono, 길면 잘림)
+    if has_summary {
+        painter.text(
+            egui::pos2(rect.left() + 30.0, rect.top() + 27.0),
+            egui::Align2::LEFT_CENTER,
+            truncate_chars(&entry.summary, 40),
+            egui::FontId::monospace(10.5),
+            visuals.weak_text_color().gamma_multiply(0.9),
+        );
+    }
+    resp
+}
+
+/// 타입 글리프를 도형으로 그린다: agent=마름모(◆), shell=삼각형(▸). 폰트에 없는
+/// 글리프(□ 깨짐)를 피하려 painter로 직접 그린다. `center` 중심, `d`≈3.5 반경.
+pub(crate) fn paint_type_glyph(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    is_agent: bool,
+    color: egui::Color32,
+) {
+    let d = 3.5;
+    let pts = if is_agent {
+        vec![
+            egui::pos2(center.x, center.y - d),
+            egui::pos2(center.x + d, center.y),
+            egui::pos2(center.x, center.y + d),
+            egui::pos2(center.x - d, center.y),
+        ]
+    } else {
+        vec![
+            egui::pos2(center.x - 2.5, center.y - d),
+            egui::pos2(center.x - 2.5, center.y + d),
+            egui::pos2(center.x + 3.0, center.y),
+        ]
+    };
+    painter.add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
+}
+
+/// 세션 상태 → 상태 점 색 (목업 상태 색과 일치). 유휴(None)는 흐린 회색.
+pub(crate) fn session_status_color(
+    status: Option<runtime::SessionStatus>,
+    visuals: &egui::Visuals,
+) -> egui::Color32 {
+    use runtime::SessionStatus as S;
+    match status {
+        Some(S::Running) => egui::Color32::from_rgb(0x43, 0xb8, 0xcd), // 실행(시안)
+        Some(S::Waiting) => egui::Color32::from_rgb(0xd9, 0xb2, 0x6a), // 대기(노랑)
+        Some(S::NeedsApproval) => egui::Color32::from_rgb(0xe0, 0xa8, 0x3e), // 승인(주황)
+        Some(S::Done) => egui::Color32::from_rgb(0x6c, 0xc2, 0x6c),    // 완료(초록)
+        Some(S::Error) => egui::Color32::from_rgb(0xe0, 0x5c, 0x53),   // 오류(빨강)
+        None => visuals.weak_text_color(),                             // 유휴
+    }
+}
+
+/// UTF-8 char 경계 기준 말줄임 (요약 표시용 — painter.text는 자동 truncate가 없다).
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_owned()
+    } else {
+        let mut out: String = s.chars().take(max).collect();
+        out.push('…');
+        out
+    }
 }
 
 /// 현재 플랫폼/환경에서 새 shell session이 사용할 것으로 예상되는 기본 shell kind.

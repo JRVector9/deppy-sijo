@@ -492,26 +492,46 @@ impl WorkspaceUi {
 
         // pane 헤더 바 (2026-07-05): [상태 제목] [×] ... [+셸] [분할│] [분할─]
         // 닫기/분할 대상이 "이 pane"임이 시각적으로 자명하다 — 탭바 제거의 대체 UI.
+        // pane 헤더는 터미널-계열 다크 배경(터미널 pane은 항상 다크 — theme와 무관,
+        // 목업 §pane-head). focused는 accent를 20% 섞은 은은한 teal, 그 외는 다크.
+        let status = pane
+            .session_id
+            .and_then(|s| self.sessions.get(&s))
+            .and_then(|v| v.status);
+        let is_agent = status.is_some();
+        let accent = ui.visuals().selection.bg_fill;
         let header_fill = if focused {
-            ui.visuals().selection.bg_fill.gamma_multiply(0.35)
+            egui::Color32::from_rgb(0x22, 0x38, 0x40)
         } else {
-            ui.visuals().faint_bg_color
+            egui::Color32::from_rgb(0x1e, 0x1e, 0x24)
         };
         egui::Frame::new()
             .fill(header_fill)
-            .inner_margin(egui::Margin::symmetric(6, 2))
+            .inner_margin(egui::Margin::symmetric(8, 4))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let icon = pane
-                        .session_id
-                        .and_then(|s| self.sessions.get(&s))
-                        .and_then(|v| v.status)
-                        .map(status_icon)
-                        .unwrap_or("");
-                    let title = if icon.is_empty() {
-                        pane.title.clone()
+                    // 타입 글리프(◆/▸)를 도형으로 — 상태 있으면 상태색, 없으면 focus/dim
+                    let (grect, _) =
+                        ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                    let glyph_color = if let Some(s) = status {
+                        crate::ui::file_tree::session_status_color(Some(s), ui.visuals())
+                    } else if focused {
+                        accent
                     } else {
-                        format!("{icon} {}", pane.title)
+                        egui::Color32::from_rgb(0x8b, 0x8f, 0x98)
+                    };
+                    crate::ui::file_tree::paint_type_glyph(
+                        ui.painter(),
+                        grect.center(),
+                        is_agent,
+                        glyph_color,
+                    );
+                    // 타이틀 — 다크 헤더 위이므로 밝은 색 명시 (theme text는 라이트
+                    // 테마에서 어두워 안 보인다). focused는 accent.
+                    let title_color = if focused {
+                        accent
+                    } else {
+                        egui::Color32::from_rgb(0xc8, 0xcc, 0xd2)
                     };
                     // 우측 컨트롤 폭 예약 — 긴 제목이 닫기/분할 버튼을 밀어내지
                     // 않게 truncate 최대폭 제한 (codex, 사이드바 헤더와 동일 패턴)
@@ -519,9 +539,14 @@ impl WorkspaceUi {
                         .scope(|ui| {
                             ui.set_max_width((ui.available_width() - 120.0).max(30.0));
                             ui.add(
-                                egui::Label::new(egui::RichText::new(title).small().strong())
-                                    .sense(egui::Sense::click())
-                                    .truncate(),
+                                egui::Label::new(
+                                    egui::RichText::new(pane.title.clone())
+                                        .small()
+                                        .strong()
+                                        .color(title_color),
+                                )
+                                .sense(egui::Sense::click())
+                                .truncate(),
                             )
                         })
                         .inner;
@@ -1020,9 +1045,7 @@ impl WorkspaceUi {
                 let status = pane
                     .session_id
                     .and_then(|s| self.sessions.get(&s))
-                    .and_then(|v| v.status)
-                    .map(status_icon)
-                    .unwrap_or("");
+                    .and_then(|v| v.status);
                 let summary = pane
                     .session_id
                     .and_then(|s| self.sessions.get(&s))
@@ -1033,6 +1056,9 @@ impl WorkspaceUi {
                     pane: pane.id.clone(),
                     title: pane.title.clone(),
                     status,
+                    // status 감지는 agent만 → status가 잡히면 agent. (갓 spawn된 agent는
+                    // 첫 감지 전까지 셸로 보이는 짧은 창이 있으나 곧 Running이 잡힌다.)
+                    is_agent: status.is_some(),
                     summary,
                     focused: mux.focused_pane.as_ref() == Some(&pane.id),
                 }
@@ -1160,16 +1186,6 @@ fn visible_mux_sessions(snapshot: &MuxSnapshot) -> HashSet<SessionId> {
         .flat_map(|tab| &tab.panes)
         .filter_map(|pane| pane.session_id)
         .collect()
-}
-
-fn status_icon(status: SessionStatus) -> &'static str {
-    match status {
-        SessionStatus::Running => "",
-        SessionStatus::Waiting => "⏳",
-        SessionStatus::NeedsApproval => "✋",
-        SessionStatus::Error => "❌",
-        SessionStatus::Done => "✅",
-    }
 }
 
 fn format_bytes(bytes: u64) -> String {

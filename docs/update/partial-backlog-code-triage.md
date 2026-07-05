@@ -151,7 +151,7 @@ Result:
 
 ### PR-U20b - Full Scenario A-E Performance Report
 
-Classification: implement as release-gate measurement, not app-code hardening.
+Classification: report implemented in PR-U20b; release-hardware measurements remain.
 
 Evidence:
 
@@ -166,6 +166,13 @@ Implementation scope:
 - Run the planned scenarios with frame p95, CPU, RSS, queue/backpressure, and
   notes for test hardware/build profile.
 - Treat failures as targeted follow-up PRs rather than broad refactors.
+
+Result:
+
+- `docs/performance/final-gate.md` now exists.
+- `cargo run -p xtask -- perf-smoke` passes.
+- GUI/remote soak rows remain Pending because this sandbox did not execute the
+  release-hardware Scenario A-E measurement run.
 
 ## Defer / No Code Now
 

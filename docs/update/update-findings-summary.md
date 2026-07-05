@@ -71,7 +71,7 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 | PR-U17 Status Detector Cost Control | Partial complete | Current wave | Regex-empty sessions skip screen-text scans; detector cost stats added. Confidence/user override remain deferred. |
 | PR-U18 SQLite Write Batching | Foundation complete / runtime wiring pending | Current wave | Bounded/debounced `DbWriteWorker` and pending approval batch insert added; runtime/app hot-path rewiring remains follow-up. |
 | PR-U19 Remote Slow Consumer Backpressure | Complete | PR-U19 | Remote outbound durable queue is bounded, viewport slots coalesce, and slow durable overflow disconnects the affected client. |
-| PR-U20 Final Performance Gate | Smoke command complete / full scenario pending | Current wave | `cargo run -p xtask -- perf-smoke` added and passed; full RSS/CPU scenario report still pending. |
+| PR-U20 Final Performance Gate | Report created / release approval pending | PR-U20, PR-U20b | `cargo run -p xtask -- perf-smoke` passes and `docs/performance/final-gate.md` now records Scenario A-E status. Release approval still requires GUI/remote soak measurements on release hardware. |
 | PR-U21 I18n Infrastructure | Complete | PR-U21 | `crates/i18n`, required locale catalogs, fallback/pseudo-locale support, config locale persistence, and `xtask i18n-check` added. |
 | PR-U22 UI String Migration | Complete | PR-U22 | Core UI labels, windows, settings, workspace manager, file tree, credentials, approvals, env profiles, agents, connectors, and notification center now render through `i18n::Catalog`; locale selector is wired in settings. |
 | PR-U23 Runtime Message Localization | Complete | PR-U23 | `RuntimeEvent::SpawnFailed` now carries `MessagePayload { message_id, args, diagnostic }`; runtime failure and notification status messages render through `i18n::Catalog`. |
@@ -81,9 +81,9 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 
 ## Release Blockers Remaining
 
-- Full PR-U20 Scenario A-E measurements remain pending in Phase D.
+- Full PR-U20 Scenario A-E release-hardware measurements remain pending in Phase D, but the final-gate report now exists.
 - PR-U12 child process tree aggregation and PR-U18 runtime/app hot-path write wiring remain follow-up.
-- Code triage classifies PR-U20b as the next release-gate measurement candidate.
+- Code triage now points PR-U20 follow-up to release-hardware measurement execution, not code changes.
 
 ## Deferred / Backlog Items
 
@@ -97,5 +97,5 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 
 ## Next Operating Wave
 
-1. Run full PR-U20 Scenario A-E measurements after the remaining follow-up triage.
+1. Run full PR-U20 Scenario A-E measurements from `docs/performance/final-gate.md`.
 2. Run final gates in order: PR-U11, PR-U20, PR-U24.

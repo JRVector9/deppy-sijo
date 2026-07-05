@@ -28,7 +28,8 @@
 - [x] Hidden status detector snapshot smoke runs.
 - [x] Existing remote/runtime backpressure tests are callable through the gate.
 - [ ] Full Scenario A-E RSS/CPU/p95 measurements are not completed.
-- [ ] `docs/performance/final-gate.md` is still pending.
+- [x] `docs/performance/final-gate.md` exists via PR-U20b and records pending
+  release-hardware measurements.
 
 ## Regression Risks
 
@@ -53,4 +54,5 @@ Remove the `perf-smoke` branch from `xtask`.
 ## Follow-up
 
 - Implement PR-U12/U13/U14/U15/U19 and PR-U26 before using PR-U20 as a release approval gate.
-- Add `docs/performance/final-gate.md` with RSS/CPU/frame p95 measurements for the planned scenarios.
+- Execute the `docs/performance/final-gate.md` manual Scenario A-E measurements
+  on release hardware and replace Pending rows with measured values.

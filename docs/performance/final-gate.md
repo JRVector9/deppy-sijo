@@ -1,22 +1,22 @@
 # PR-U20 Final Performance Gate
 
 작성일: 2026-07-05
-작성 범위: PR-U20b Scenario A-E release-gate report
+작성 범위: PR-U20b Scenario A-E release-gate report, PR-U20c baseline update
 
 ## Verdict
 
 Release verdict: **Not approved yet**
 
-Reason: automated performance smoke passes, but this Codex sandbox did not run
-the GUI/remote soak measurements required to claim final RSS/CPU/frame-p95
-approval for Scenarios A-E.
+Reason: automated performance smoke passes for the PR-U20c baseline, but this
+Codex sandbox did not run the GUI/remote soak measurements required to claim
+final RSS/CPU/frame-p95 approval for Scenarios A-E.
 
 ## Environment
 
 - Repository: `/Users/jr/Desktop/Projects/deppy-sijo`
-- Commit under test: `7f2c0f8 Add scoped MCP server env injection`
-- This PR-U20b commit adds the report only; no runtime code changed after the
-  commit under test.
+- Baseline commit under test: `52f1cd1 Document remaining parallel PR contracts`
+- PR-U20c baseline adds measurement documentation only; no runtime behavior was
+  changed by the baseline measurement commit.
 - OS: macOS 26.4.1 build 25E253
 - Kernel: Darwin 25.4.0 arm64
 - Hardware details: `sysctl` hardware queries were denied in the sandbox.
@@ -24,7 +24,7 @@ approval for Scenarios A-E.
 
 ## Automated Evidence
 
-Executed before this report:
+Latest baseline run:
 
 - `cargo run -p xtask -- perf-smoke` - pass
 
@@ -50,6 +50,9 @@ Related gates from the same working set:
 | C | 10 hidden sessions, 3 high-output sessions | `perf-smoke` validates hidden-session harness shape and hidden snapshot smoke | RSS/CPU/frame p95 not measured | Pending |
 | D | Folder tree 100k files | Existing file-tree tests and PR-U05b ignore/listing hardening exist | 100k-file GUI/folder-tree run not measured | Pending |
 | E | Remote slow consumer | `perf-smoke` exercises runtime backpressure tests | Long slow-client soak not measured | Pending |
+
+Detailed baseline notes are recorded in
+`docs/performance/release-hardware-measurements.md`.
 
 ## Required Manual Measurement Procedure
 

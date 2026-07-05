@@ -58,18 +58,22 @@ impl ApprovalsUi {
     ///
     /// 창이 숨겨져 있으면 ui()가 실행되지 않아 이 팝업도 안 뜬다 — 사용자가 앱을
     /// 전면으로 가져와야 승인할 수 있다(그동안 proxy는 타임아웃까지 폴링). 의도된 동작.
-    pub fn show(&mut self, ctx: &egui::Context) -> Option<ApprovalDecision> {
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        catalog: &i18n::Catalog,
+    ) -> Option<ApprovalDecision> {
         let row = self.pending.first()?.clone();
         let mut decision = None;
-        egui::Window::new("도구 실행 승인")
+        egui::Window::new(catalog.t("approval.title", &[]))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.label(format!("서버: {}", row.server_id));
-                ui.label(format!("도구: {}", row.tool_name));
+                ui.label(catalog.t("approval.server", &[("value", &row.server_id)]));
+                ui.label(catalog.t("approval.tool", &[("value", &row.tool_name)]));
                 ui.separator();
-                ui.label("인자 미리보기:");
+                ui.label(catalog.t("approval.arguments_preview", &[]));
                 // proxy가 이미 redact한 표시용 텍스트지만 신뢰하지 않는다 —
                 // 일반 Label로 그대로 표시한다(egui는 마크업을 해석하지 않음).
                 egui::ScrollArea::vertical()
@@ -83,12 +87,12 @@ impl ApprovalsUi {
                         );
                     });
                 ui.separator();
-                ui.checkbox(&mut self.remember, "이 도구 기억");
+                ui.checkbox(&mut self.remember, catalog.t("approval.remember_tool", &[]));
                 ui.horizontal(|ui| {
-                    if ui.button("허용").clicked() {
+                    if ui.button(catalog.t("action.allow", &[])).clicked() {
                         decision = self.decide(true);
                     }
-                    if ui.button("거부").clicked() {
+                    if ui.button(catalog.t("action.deny", &[])).clicked() {
                         decision = self.decide(false);
                     }
                 });

@@ -64,21 +64,31 @@ impl CredentialsUi {
         self.error = None;
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, credentials: &dyn CredentialService) {
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        credentials: &dyn CredentialService,
+        catalog: &i18n::Catalog,
+    ) {
         if !self.open {
             return;
         }
         let mut open = true;
-        egui::Window::new("자격증명")
+        egui::Window::new(catalog.t("credentials.title", &[]))
             .open(&mut open)
             .resizable(false)
-            .show(ctx, |ui| self.contents(ui, credentials));
+            .show(ctx, |ui| self.contents(ui, credentials, catalog));
         if !open {
             self.close();
         }
     }
 
-    fn contents(&mut self, ui: &mut egui::Ui, credentials: &dyn CredentialService) {
+    fn contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        credentials: &dyn CredentialService,
+        catalog: &i18n::Catalog,
+    ) {
         let list = match &self.cached {
             Some(list) => list.clone(),
             None => match credentials.list_credentials() {
@@ -89,7 +99,7 @@ impl CredentialsUi {
                 Err(e) => {
                     ui.colored_label(
                         ui.visuals().error_fg_color,
-                        format!("목록 조회 실패: {e:#}"),
+                        catalog.t("common.list_failed", &[("message", &format!("{e:#}"))]),
                     );
                     return;
                 }
@@ -97,7 +107,7 @@ impl CredentialsUi {
         };
 
         if list.is_empty() {
-            ui.label("저장된 자격증명이 없습니다.");
+            ui.label(catalog.t("credentials.empty", &[]));
         }
         let mut delete_id = None;
         for meta in &list {
@@ -109,7 +119,7 @@ impl CredentialsUi {
                     meta.credential_kind,
                     meta.masked_hint.as_deref().unwrap_or(""),
                 ));
-                if ui.button("삭제").clicked() {
+                if ui.button(catalog.t("action.delete", &[])).clicked() {
                     delete_id = Some(meta.id.clone());
                 }
             });
@@ -122,29 +132,32 @@ impl CredentialsUi {
         }
 
         ui.separator();
-        ui.heading("추가");
+        ui.heading(catalog.t("credentials.add", &[]));
         ui.horizontal(|ui| {
-            ui.label("provider");
+            ui.label(catalog.t("credentials.provider", &[]));
             ui.text_edit_singleline(&mut self.provider);
         });
         ui.horizontal(|ui| {
-            ui.label("라벨");
+            ui.label(catalog.t("credentials.label", &[]));
             ui.text_edit_singleline(&mut self.label);
         });
         ui.horizontal(|ui| {
-            ui.label("종류");
+            ui.label(catalog.t("credentials.kind", &[]));
             for kind in ["api_key", "token"] {
                 ui.selectable_value(&mut self.kind, kind, kind);
             }
         });
         ui.horizontal(|ui| {
-            ui.label("secret");
+            ui.label(catalog.t("credentials.secret", &[]));
             ui.add(egui::TextEdit::singleline(&mut self.secret_input).password(true));
         });
         let filled = !self.provider.trim().is_empty()
             && !self.label.trim().is_empty()
             && !self.secret_input.is_empty();
-        if ui.add_enabled(filled, egui::Button::new("추가")).clicked() {
+        if ui
+            .add_enabled(filled, egui::Button::new(catalog.t("action.add", &[])))
+            .clicked()
+        {
             self.error = self.add(credentials).err().map(|e| format!("{e:#}"));
         }
 

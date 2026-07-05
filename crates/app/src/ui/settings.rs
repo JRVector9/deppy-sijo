@@ -44,41 +44,67 @@ pub fn show(
     config: &mut Config,
     remote: &RemoteView,
     reveal_token: &mut bool,
+    catalog: &i18n::Catalog,
 ) -> SettingsOutput {
     let mut changed = false;
     let mut remote_action = RemoteAction::None;
-    egui::Window::new("설정")
+    egui::Window::new(catalog.t("settings.title", &[]))
         .open(open)
         .resizable(false)
         .show(ctx, |ui| {
-            ui.heading("UI");
+            ui.heading(catalog.t("settings.ui", &[]));
             ui.horizontal(|ui| {
-                ui.label("테마");
-                for (theme, label) in [
-                    (Theme::System, "시스템"),
-                    (Theme::Light, "라이트"),
-                    (Theme::Dark, "다크"),
+                ui.label(catalog.t("settings.theme", &[]));
+                for (theme, label_key) in [
+                    (Theme::System, "settings.theme.system"),
+                    (Theme::Light, "settings.theme.light"),
+                    (Theme::Dark, "settings.theme.dark"),
                 ] {
                     changed |= ui
-                        .selectable_value(&mut config.ui.theme, theme, label)
+                        .selectable_value(&mut config.ui.theme, theme, catalog.t(label_key, &[]))
                         .changed();
                 }
             });
             // 폴더 트리 사이드바 ON/OFF (file-tree-design §6) — hot toggle, OFF면 리소스 0
             changed |= ui
-                .checkbox(&mut config.ui.file_tree_enabled, "폴더 트리 사이드바")
+                .checkbox(
+                    &mut config.ui.file_tree_enabled,
+                    catalog.t("settings.file_tree_sidebar", &[]),
+                )
                 .changed();
 
             ui.separator();
-            ui.heading("Terminal");
+            ui.heading(catalog.t("settings.language", &[]));
+            ui.horizontal_wrapped(|ui| {
+                ui.label(catalog.t("settings.locale", &[]));
+                for (locale, label_key) in [
+                    (i18n::FALLBACK_LOCALE, "settings.locale.en_us"),
+                    ("ja-JP", "settings.locale.ja_jp"),
+                    ("zh-Hans", "settings.locale.zh_hans"),
+                    ("zh-Hant", "settings.locale.zh_hant"),
+                    ("ko-KR", "settings.locale.ko_kr"),
+                    (i18n::PSEUDO_LOCALE, "settings.locale.pseudo"),
+                ] {
+                    changed |= ui
+                        .selectable_value(
+                            &mut config.i18n.locale,
+                            locale.to_owned(),
+                            catalog.t(label_key, &[]),
+                        )
+                        .changed();
+                }
+            });
+
+            ui.separator();
+            ui.heading(catalog.t("settings.terminal", &[]));
             ui.horizontal(|ui| {
-                ui.label("폰트 크기");
+                ui.label(catalog.t("settings.font_size", &[]));
                 changed |= ui
                     .add(egui::DragValue::new(&mut config.terminal.font_size).range(8.0..=32.0))
                     .changed();
             });
             ui.horizontal(|ui| {
-                ui.label("스크롤백 줄 수");
+                ui.label(catalog.t("settings.scrollback_lines", &[]));
                 changed |= ui
                     .add(
                         egui::DragValue::new(&mut config.terminal.scrollback_lines)
@@ -88,25 +114,28 @@ pub fn show(
             });
 
             ui.separator();
-            ui.heading("Performance");
+            ui.heading(catalog.t("settings.performance", &[]));
             ui.horizontal(|ui| {
-                ui.label("출력 배치 간격(ms)");
+                ui.label(catalog.t("settings.output_batch_ms", &[]));
                 changed |= ui
                     .add(
                         egui::DragValue::new(&mut config.performance.output_batch_ms)
                             .range(16..=50),
                     )
                     .changed();
-                ui.weak("(앱 재시작 후 적용)");
+                ui.weak(catalog.t("settings.restart_required", &[]));
             });
 
             ui.separator();
-            ui.heading("Remote (TLS)");
+            ui.heading(catalog.t("settings.remote_tls", &[]));
             // 체크박스 = 실행 중 OR 저장된 자동시작 의도. 자동시작이 실패해도 켜진 채(+에러
             // 표시)로 남아, 사용자가 꺼서 persisted auto-start를 해제할 수 있다 (codex Medium —
             // running만 반영하면 실패 상태에서 Start만 나가 auto-start를 UI로 끌 수 없음).
             let mut enabled = remote.running || config.remote.tls_enabled;
-            if ui.checkbox(&mut enabled, "TLS 원격 서버 사용").changed() {
+            if ui
+                .checkbox(&mut enabled, catalog.t("settings.remote_tls_enabled", &[]))
+                .changed()
+            {
                 remote_action = if enabled {
                     RemoteAction::Start
                 } else {
@@ -114,19 +143,22 @@ pub fn show(
                 };
             }
             ui.horizontal(|ui| {
-                ui.label("포트 (0 = 임의)");
+                ui.label(catalog.t("settings.port", &[]));
                 changed |= ui
                     .add(egui::DragValue::new(&mut config.remote.port).range(0..=65535))
                     .changed();
-                ui.weak("(토글 off/on 후 적용)");
+                ui.weak(catalog.t("settings.toggle_restart_required", &[]));
             });
             if let Some(err) = remote.error {
-                ui.colored_label(ui.visuals().error_fg_color, format!("시작 실패: {err}"));
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    catalog.t("settings.start_failed", &[("message", err)]),
+                );
             }
             if remote.running {
                 if let Some(addr) = &remote.addr {
                     ui.horizontal(|ui| {
-                        ui.label("주소");
+                        ui.label(catalog.t("settings.address", &[]));
                         ui.add(
                             egui::Label::new(egui::RichText::new(addr).monospace())
                                 .selectable(true),
@@ -134,7 +166,7 @@ pub fn show(
                     });
                 }
                 if let Some(fp) = remote.fingerprint {
-                    ui.label("지문 (SHA-256):");
+                    ui.label(catalog.t("settings.fingerprint", &[]));
                     ui.add(
                         egui::Label::new(egui::RichText::new(fp).monospace())
                             .selectable(true)
@@ -143,8 +175,8 @@ pub fn show(
                 }
                 if let Some(token) = remote.token {
                     ui.horizontal(|ui| {
-                        ui.label("토큰");
-                        ui.checkbox(reveal_token, "표시");
+                        ui.label(catalog.t("settings.token", &[]));
+                        ui.checkbox(reveal_token, catalog.t("settings.show", &[]));
                     });
                     if *reveal_token {
                         ui.add(
@@ -154,26 +186,26 @@ pub fn show(
                         );
                         ui.colored_label(
                             ui.visuals().warn_fg_color,
-                            "⚠ 민감 — 이 토큰 보유자는 셸 접근과 동등한 권한을 가집니다.",
+                            catalog.t("settings.token_sensitive_warning", &[]),
                         );
                     } else {
-                        ui.weak("•••••••• (표시를 체크해 확인 — 드래그 선택 후 복사)");
+                        ui.weak(catalog.t("settings.token_hidden_hint", &[]));
                     }
                 }
-                ui.weak("클라이언트에서 attach_tls_tofu — 첫 접속 시 위 지문과 대조하세요.");
+                ui.weak(catalog.t("settings.client_fingerprint_hint", &[]));
             }
 
             ui.separator();
-            ui.heading("known_hosts");
+            ui.heading(catalog.t("settings.known_hosts", &[]));
             ui.weak(remote.known_hosts_path.as_str());
             if remote.known_hosts.is_empty() {
-                ui.weak("(신뢰 기록 없음)");
+                ui.weak(catalog.t("settings.no_trust_records", &[]));
             } else {
                 for (host, fp) in remote.known_hosts {
                     ui.horizontal(|ui| {
                         ui.monospace(host);
                         ui.weak(truncate_fingerprint(fp, 17));
-                        if ui.button("삭제(forget)").clicked() {
+                        if ui.button(catalog.t("settings.forget", &[])).clicked() {
                             remote_action = RemoteAction::Forget(host.clone());
                         }
                     });

@@ -135,7 +135,11 @@ impl NotificationsUi {
 
     /// 알림 센터를 그린다. 클릭한 항목의 (workspace_id, session)을 돌려준다 —
     /// 호출측(App)이 활성 workspace면 pane focus, 아니면 그 workspace로 전환한다.
-    pub fn show(&mut self, ctx: &egui::Context) -> Option<(String, SessionId)> {
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        catalog: &i18n::Catalog,
+    ) -> Option<(String, SessionId)> {
         if !self.open {
             return None;
         }
@@ -154,14 +158,18 @@ impl NotificationsUi {
         }
         let mut open = true;
         let mut clicked = None;
-        egui::Window::new("알림")
+        egui::Window::new(catalog.t("notification.title", &[]))
             .open(&mut open)
             .resizable(false)
             .show(ctx, |ui| {
                 if self.items.is_empty() {
-                    ui.label("알림이 없습니다.");
+                    ui.label(catalog.t("notification.empty", &[]));
                 }
-                if !self.items.is_empty() && ui.button("모두 지우기").clicked() {
+                if !self.items.is_empty()
+                    && ui
+                        .button(catalog.t("notification.clear_all", &[]))
+                        .clicked()
+                {
                     self.items.clear();
                 }
                 // 최신 항목이 위로
@@ -169,7 +177,7 @@ impl NotificationsUi {
                     let icon = status_icon(item.status);
                     if ui
                         .button(format!("{icon} {}", item.title))
-                        .on_hover_text("클릭하면 해당 workspace/세션으로 이동")
+                        .on_hover_text(catalog.t("notification.goto_session", &[]))
                         .clicked()
                     {
                         clicked = Some((item.workspace_id.clone(), item.session));

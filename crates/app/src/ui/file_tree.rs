@@ -453,7 +453,12 @@ impl FileTreeUi {
     /// 좌측 사이드바 렌더 (§6 — `egui::Panel::left`, CentralPanel 앞에서 호출할 것 §9-1).
     /// 반환: "터미널에 경로 삽입" 요청 경로 (호출측 App이 WriteInput으로 전달 — §6
     /// 유일한 runtime 접점을 App에 남긴다).
-    pub fn panel(&mut self, ui: &mut egui::Ui, sessions: &[SessionEntry]) -> Option<SidebarAction> {
+    pub fn panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        sessions: &[SessionEntry],
+        catalog: &i18n::Catalog,
+    ) -> Option<SidebarAction> {
         // 접힘 여부와 무관하게 배경 채널을 소비한다 (codex Med-2 — 접힌 채로 워처/조작
         // 채널이 무한 누적되거나 op 완료(in_flight/에러/영구삭제 확인)가 방치되는 것 방지).
         self.pump_listings();
@@ -466,7 +471,7 @@ impl FileTreeUi {
                 .show(ui, |ui| {
                     if ui
                         .small_button("▸")
-                        .on_hover_text("사이드바 펼치기")
+                        .on_hover_text(catalog.t("file_tree.expand_sidebar", &[]))
                         .clicked()
                     {
                         self.collapsed = false;
@@ -479,7 +484,7 @@ impl FileTreeUi {
             .default_size(240.0)
             // 내용이 안 보여도 좁힐 수 있게 — 최소폭 거의 0까지 허용 (2026-07-05 요청)
             .size_range(egui::Rangef::new(28.0, f32::INFINITY))
-            .show(ui, |ui| self.contents(ui, sessions))
+            .show(ui, |ui| self.contents(ui, sessions, catalog))
             .inner
     }
 
@@ -496,7 +501,12 @@ impl FileTreeUi {
         }
     }
 
-    fn contents(&mut self, ui: &mut egui::Ui, sessions: &[SessionEntry]) -> Option<SidebarAction> {
+    fn contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        sessions: &[SessionEntry],
+        catalog: &i18n::Catalog,
+    ) -> Option<SidebarAction> {
         // (워처/백그라운드 채널 수거는 panel()이 접힘 여부와 무관하게 이미 수행했다)
         let mut action: Option<SidebarAction> = None;
 
@@ -504,7 +514,7 @@ impl FileTreeUi {
         // 현재 workspace의 셸/에이전트를 나열하고 클릭으로 전환한다.
         if !sessions.is_empty() {
             ui.add_space(2.0);
-            ui.weak("세션");
+            ui.weak(catalog.t("file_tree.sessions", &[]));
             for entry in sessions {
                 let label = if entry.status.is_empty() {
                     format!("▸ {}", entry.title)
@@ -549,17 +559,21 @@ impl FileTreeUi {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .small_button("◂")
-                        .on_hover_text("사이드바 접기")
+                        .on_hover_text(catalog.t("file_tree.collapse_sidebar", &[]))
                         .clicked()
                     {
                         self.collapsed = true;
                     }
-                    if ui.small_button("⟳").on_hover_text("새로고침").clicked() {
+                    if ui
+                        .small_button("⟳")
+                        .on_hover_text(catalog.t("file_tree.refresh", &[]))
+                        .clicked()
+                    {
                         self.refresh();
                     }
                     let hidden = ui
-                        .selectable_label(self.show_hidden, "숨김")
-                        .on_hover_text("숨김(.) 항목 표시");
+                        .selectable_label(self.show_hidden, catalog.t("file_tree.hidden", &[]))
+                        .on_hover_text(catalog.t("file_tree.show_hidden", &[]));
                     if hidden.clicked() {
                         self.show_hidden = !self.show_hidden;
                         // 워처 콜백 스레드와 동기화 (숨김 이벤트 필터)
@@ -577,8 +591,8 @@ impl FileTreeUi {
 
         if self.root.is_none() {
             // path 미설정 (§9-2 backfill 강제 없음) — 트리 대신 안내
-            ui.weak("프로젝트 경로를 설정하세요");
-            ui.weak("(워크스페이스 창 → 경로 편집)");
+            ui.weak(catalog.t("file_tree.set_project_path", &[]));
+            ui.weak(catalog.t("file_tree.edit_workspace_path_hint", &[]));
             return action;
         }
         if let Some(err) = &self.root_error {
@@ -599,10 +613,10 @@ impl FileTreeUi {
         }) = &mut edit
         {
             ui.horizontal(|ui| {
-                ui.label("새 폴더:");
+                ui.label(catalog.t("file_tree.new_folder_label", &[]));
                 let resp = ui.add(
                     egui::TextEdit::singleline(buffer)
-                        .hint_text("이름")
+                        .hint_text(catalog.t("common.name", &[]))
                         .desired_width(120.0),
                 );
                 if *focus {
@@ -610,21 +624,27 @@ impl FileTreeUi {
                     *focus = false;
                 }
                 let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.small_button("생성").clicked() || enter {
+                if ui.small_button(catalog.t("action.new", &[])).clicked() || enter {
                     edit_done = Some(true);
-                } else if ui.small_button("취소").clicked()
+                } else if ui.small_button(catalog.t("action.cancel", &[])).clicked()
                     || ui.input(|i| i.key_pressed(egui::Key::Escape))
                 {
                     edit_done = Some(false);
                 }
             });
-            ui.weak(format!("위치: {}", parent.display()));
+            ui.weak(catalog.t(
+                "file_tree.location",
+                &[("path", &parent.display().to_string())],
+            ));
         }
 
         // 헤더 우클릭: 루트에 새 폴더 (FT-3)
         if let Some(root) = self.root.clone() {
             header.response.context_menu(|ui| {
-                if ui.button("새 폴더 (루트)").clicked() {
+                if ui
+                    .button(catalog.t("file_tree.new_folder_root", &[]))
+                    .clicked()
+                {
                     menu_action = Some(MenuAction::NewFolder(root.clone()));
                     ui.close();
                 }
@@ -758,29 +778,35 @@ impl FileTreeUi {
                         };
                         if let Some(parent) = new_folder_parent {
                             let label = if row.is_dir {
-                                "새 폴더 (이 안에)"
+                                catalog.t("file_tree.new_folder_inside", &[])
                             } else {
-                                "새 폴더 (같은 위치)"
+                                catalog.t("file_tree.new_folder_alongside", &[])
                             };
                             if ui.button(label).clicked() {
                                 menu_action = Some(MenuAction::NewFolder(parent));
                                 ui.close();
                             }
                         }
-                        if ui.button("이름 변경").clicked() {
+                        if ui.button(catalog.t("file_tree.rename", &[])).clicked() {
                             menu_action = Some(MenuAction::Rename(row.path.clone()));
                             ui.close();
                         }
-                        if ui.button("휴지통으로 삭제").clicked() {
+                        if ui
+                            .button(catalog.t("file_tree.move_to_trash", &[]))
+                            .clicked()
+                        {
                             menu_action = Some(MenuAction::Delete(row.path.clone()));
                             ui.close();
                         }
                         ui.separator();
-                        if ui.button("경로 복사").clicked() {
+                        if ui.button(catalog.t("file_tree.copy_path", &[])).clicked() {
                             menu_action = Some(MenuAction::CopyPath(row.path.clone()));
                             ui.close();
                         }
-                        if ui.button("터미널에 경로 삽입").clicked() {
+                        if ui
+                            .button(catalog.t("file_tree.insert_path_terminal", &[]))
+                            .clicked()
+                        {
                             menu_action = Some(MenuAction::InsertPath(row.path.clone()));
                             ui.close();
                         }
@@ -881,10 +907,13 @@ impl FileTreeUi {
                 .unwrap_or_else(|| path.display().to_string());
             ui.colored_label(
                 ui.visuals().warn_fg_color,
-                format!("휴지통 이동 실패 — '{name}' 영구 삭제?"),
+                catalog.t("file_tree.permanent_delete_prompt", &[("name", &name)]),
             );
             ui.horizontal(|ui| {
-                if ui.button("영구 삭제").clicked() {
+                if ui
+                    .button(catalog.t("file_tree.permanent_delete", &[]))
+                    .clicked()
+                {
                     self.confirm_delete = None;
                     let refresh: Vec<PathBuf> =
                         path.parent().map(Path::to_path_buf).into_iter().collect();
@@ -894,7 +923,7 @@ impl FileTreeUi {
                         remove_all(&target).map_err(|e| format!("영구 삭제 실패: {e}"))
                     });
                 }
-                if ui.button("취소").clicked() {
+                if ui.button(catalog.t("action.cancel", &[])).clicked() {
                     self.confirm_delete = None;
                 }
             });
@@ -903,13 +932,13 @@ impl FileTreeUi {
         if self.in_flight > 0 {
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new().size(12.0));
-                ui.weak("파일 조작 중…");
+                ui.weak(catalog.t("file_tree.file_operation_running", &[]));
             });
         }
         if !self.pending_listings.is_empty() {
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new().size(12.0));
-                ui.weak("폴더 나열 중…");
+                ui.weak(catalog.t("file_tree.listing_folders", &[]));
             });
         }
         if let Some(err) = self.error.clone() {
@@ -2650,8 +2679,9 @@ mod tests {
             .unwrap();
 
         // 접힘 상태로 panel 호출 — 렌더는 생략돼도 채널은 소비돼야 한다 (codex Med-2)
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         egui::__run_test_ui(|ui| {
-            assert!(tree.panel(ui, &[]).is_none());
+            assert!(tree.panel(ui, &[], &catalog).is_none());
         });
         drain_listings(&mut tree);
 

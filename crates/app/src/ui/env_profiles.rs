@@ -41,16 +41,22 @@ impl EnvProfilesUi {
         self.open = !self.open;
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, db: &mut Db, workspace_id: &str) {
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        db: &mut Db,
+        workspace_id: &str,
+        catalog: &i18n::Catalog,
+    ) {
         if !self.open {
             return;
         }
         let mut open = true;
-        egui::Window::new("환경")
+        egui::Window::new(catalog.t("env.title", &[]))
             .open(&mut open)
             .resizable(false)
             .show(ctx, |ui| {
-                if let Err(e) = self.contents(ui, db, workspace_id) {
+                if let Err(e) = self.contents(ui, db, workspace_id, catalog) {
                     self.error = Some(format!("{e:#}"));
                 }
                 if let Some(error) = &self.error {
@@ -65,6 +71,7 @@ impl EnvProfilesUi {
         ui: &mut egui::Ui,
         db: &mut Db,
         workspace_id: &str,
+        catalog: &i18n::Catalog,
     ) -> anyhow::Result<()> {
         if self.cached_workspace.as_deref() != Some(workspace_id) {
             // workspace가 바뀌었다 — 이전 workspace의 profile/var/선택으로
@@ -85,7 +92,7 @@ impl EnvProfilesUi {
 
         // ---- profile 목록 ----
         if profiles.is_empty() {
-            ui.label("profile이 없습니다.");
+            ui.label(catalog.t("env.empty_profiles", &[]));
         }
         let mut delete_profile = None;
         for profile in &profiles {
@@ -100,7 +107,7 @@ impl EnvProfilesUi {
                     self.selected = Some(profile.id.clone());
                     self.vars = None;
                 }
-                if ui.button("삭제").clicked() {
+                if ui.button(catalog.t("action.delete", &[])).clicked() {
                     delete_profile = Some(profile.id.clone());
                 }
             });
@@ -117,7 +124,7 @@ impl EnvProfilesUi {
 
         // ---- profile 생성 ----
         ui.horizontal(|ui| {
-            ui.label("이름");
+            ui.label(catalog.t("common.name", &[]));
             ui.text_edit_singleline(&mut self.new_name);
             for kind in ["local", "staging", "production", "custom"] {
                 ui.selectable_value(&mut self.new_kind, kind, kind);
@@ -125,7 +132,10 @@ impl EnvProfilesUi {
         });
         let name_filled = !self.new_name.trim().is_empty();
         if ui
-            .add_enabled(name_filled, egui::Button::new("profile 생성"))
+            .add_enabled(
+                name_filled,
+                egui::Button::new(catalog.t("env.create_profile", &[])),
+            )
             .clicked()
         {
             db.insert_env_profile(workspace_id, self.new_name.trim(), self.new_kind)?;
@@ -142,12 +152,12 @@ impl EnvProfilesUi {
             return Ok(());
         };
         ui.separator();
-        ui.heading(format!("{} 환경변수", profile.name));
+        ui.heading(catalog.t("env.vars_heading", &[("name", &profile.name)]));
         if profile.is_production {
             // production guard (설계문서 6.4) — spawn 직전 경고는 PR-09에서 이 플래그를 소비
             ui.colored_label(
                 ui.visuals().warn_fg_color,
-                "⚠ production profile — 실행 전 경고 대상입니다",
+                catalog.t("env.production_warning", &[]),
             );
         }
 
@@ -164,12 +174,16 @@ impl EnvProfilesUi {
         let mut delete_key = None;
         for var in &vars {
             ui.horizontal(|ui| {
-                ui.label(describe_var(var, &credentials));
+                ui.label(describe_var(
+                    var,
+                    &credentials,
+                    &catalog.t("env.deleted_credential", &[]),
+                ));
                 // OS env와 충돌하면 precedence 결과를 표시 (설계문서 6.2)
                 if std::env::var_os(&var.key).is_some() {
-                    ui.weak("OS env 덮어씀");
+                    ui.weak(catalog.t("env.os_override", &[]));
                 }
-                if ui.button("삭제").clicked() {
+                if ui.button(catalog.t("action.delete", &[])).clicked() {
                     delete_key = Some(var.key.clone());
                 }
             });
@@ -182,20 +196,20 @@ impl EnvProfilesUi {
 
         // ---- env var 추가 ----
         ui.horizontal(|ui| {
-            ui.label("key");
+            ui.label(catalog.t("common.key", &[]));
             ui.text_edit_singleline(&mut self.var_key);
             ui.selectable_value(&mut self.var_is_secret, false, "plain");
             ui.selectable_value(&mut self.var_is_secret, true, "secret");
         });
         if self.var_is_secret {
             ui.horizontal(|ui| {
-                ui.label("credential");
+                ui.label(catalog.t("env.credential", &[]));
                 let current = self
                     .var_credential_id
                     .as_ref()
                     .and_then(|id| credentials.iter().find(|c| &c.id == id))
                     .map(|c| c.label.clone())
-                    .unwrap_or_else(|| "선택".into());
+                    .unwrap_or_else(|| catalog.t("common.select", &[]));
                 egui::ComboBox::from_id_salt("var_credential")
                     .selected_text(current)
                     .show_ui(ui, |ui| {
@@ -210,7 +224,7 @@ impl EnvProfilesUi {
             });
         } else {
             ui.horizontal(|ui| {
-                ui.label("value");
+                ui.label(catalog.t("common.value", &[]));
                 ui.text_edit_singleline(&mut self.var_plain_value);
             });
         }
@@ -226,7 +240,7 @@ impl EnvProfilesUi {
                 true
             };
         if ui
-            .add_enabled(filled, egui::Button::new("변수 추가"))
+            .add_enabled(filled, egui::Button::new(catalog.t("env.add_var", &[])))
             .clicked()
         {
             let value = if self.var_is_secret {
@@ -247,7 +261,7 @@ impl EnvProfilesUi {
         // ---- 적용 결과 미리보기 (EnvDiffPreview 최소형) ----
         if !vars.is_empty() {
             ui.separator();
-            ui.heading("적용 결과 미리보기");
+            ui.heading(catalog.t("env.preview_heading", &[]));
             let os_layer = EnvLayer {
                 name: "OS".into(),
                 vars: vars
@@ -275,11 +289,17 @@ impl EnvProfilesUi {
                 let conflict = if resolved.overridden.is_empty() {
                     String::new()
                 } else {
-                    format!("  ({} 덮어씀)", resolved.overridden.join(", "))
+                    let overridden = resolved.overridden.join(", ");
+                    catalog.t("env.preview_overridden", &[("names", &overridden)])
                 };
                 ui.label(format!(
                     "{} ← {}{}",
-                    display_value(&resolved.key, &resolved.value, &credentials),
+                    display_value(
+                        &resolved.key,
+                        &resolved.value,
+                        &credentials,
+                        &catalog.t("env.deleted_credential", &[]),
+                    ),
                     resolved.source,
                     conflict
                 ));
@@ -290,11 +310,16 @@ impl EnvProfilesUi {
 }
 
 /// 목록 표시용. secret은 credential 라벨/힌트만 노출한다.
-fn describe_var(var: &EnvVarRow, credentials: &[CredentialMeta]) -> String {
-    display_value(&var.key, &var.value, credentials)
+fn describe_var(var: &EnvVarRow, credentials: &[CredentialMeta], deleted_label: &str) -> String {
+    display_value(&var.key, &var.value, credentials, deleted_label)
 }
 
-fn display_value(key: &str, value: &EnvValue, credentials: &[CredentialMeta]) -> String {
+fn display_value(
+    key: &str,
+    value: &EnvValue,
+    credentials: &[CredentialMeta],
+    deleted_label: &str,
+) -> String {
     match value {
         EnvValue::Plain(v) => format!("{key} = {v}"),
         EnvValue::Secret { credential_id } => {
@@ -305,7 +330,7 @@ fn display_value(key: &str, value: &EnvValue, credentials: &[CredentialMeta]) ->
                     c.label,
                     c.masked_hint.as_deref().unwrap_or("")
                 ),
-                None => format!("{key} = [secret: 삭제된 credential]"),
+                None => format!("{key} = [secret: {deleted_label}]"),
             }
         }
     }

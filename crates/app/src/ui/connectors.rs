@@ -172,6 +172,7 @@ impl ConnectorsUi {
         db: &mut Db,
         workspace_id: &str,
         oauth_store: &dyn OAuthCredentialStore,
+        catalog: &i18n::Catalog,
     ) -> bool {
         // 백그라운드 결과는 창이 닫혀 있어도 소화한다 (다시 열 때 최신 상태)
         self.drain_results(db);
@@ -181,10 +182,10 @@ impl ConnectorsUi {
             return credential_added;
         }
         let mut open = true;
-        egui::Window::new("연결")
+        egui::Window::new(catalog.t("connectors.title", &[]))
             .open(&mut open)
             .resizable(false)
-            .show(ctx, |ui| self.contents(ui, ctx, db, workspace_id));
+            .show(ctx, |ui| self.contents(ui, ctx, db, workspace_id, catalog));
         self.open = open;
         credential_added
     }
@@ -231,6 +232,7 @@ impl ConnectorsUi {
         ctx: &egui::Context,
         db: &mut Db,
         workspace_id: &str,
+        catalog: &i18n::Catalog,
     ) {
         if !self.rules_loaded {
             self.load_permission_rules(db);
@@ -244,42 +246,45 @@ impl ConnectorsUi {
                     list
                 }
                 Err(e) => {
-                    ui.colored_label(egui::Color32::RED, format!("목록 조회 실패: {e:#}"));
+                    ui.colored_label(
+                        egui::Color32::RED,
+                        catalog.t("common.list_failed", &[("message", &format!("{e:#}"))]),
+                    );
                     return;
                 }
             },
         };
 
-        ui.heading("Local MCP");
+        ui.heading(catalog.t("connectors.local_mcp", &[]));
         if servers.is_empty() {
-            ui.label("등록된 MCP 서버가 없습니다.");
+            ui.label(catalog.t("connectors.empty_mcp", &[]));
         }
         for server in &servers {
-            self.server_card(ui, ctx, db, server);
+            self.server_card(ui, ctx, db, server, catalog);
         }
 
         // 도구 실행 패널 (선택된 tool이 있을 때) — 정책 평가·승인·실행·감사
         if self.invoke.is_some() {
-            self.tool_invoke_panel(ui, ctx, db, workspace_id);
+            self.tool_invoke_panel(ui, ctx, db, workspace_id, catalog);
         }
 
         ui.separator();
-        ui.label("MCP 서버 추가 (stdio)");
+        ui.label(catalog.t("connectors.add_mcp_stdio", &[]));
         ui.horizontal(|ui| {
-            ui.label("이름");
+            ui.label(catalog.t("common.name", &[]));
             ui.text_edit_singleline(&mut self.name);
         });
         ui.horizontal(|ui| {
-            ui.label("command");
+            ui.label(catalog.t("common.command", &[]));
             ui.text_edit_singleline(&mut self.command);
         });
-        ui.label("args (한 줄에 하나) — secret은 args가 아니라 자격증명/환경으로");
+        ui.label(catalog.t("connectors.args_note", &[]));
         ui.add(
             egui::TextEdit::multiline(&mut self.args_input)
                 .desired_rows(2)
                 .hint_text("-y\nserver-filesystem"),
         );
-        if ui.button("추가").clicked() {
+        if ui.button(catalog.t("action.add", &[])).clicked() {
             self.add_server(db);
         }
         if let Some(error) = &self.error {
@@ -288,9 +293,9 @@ impl ConnectorsUi {
 
         // OAuth 커넥터 (PR-18): external browser + PKCE + localhost callback
         ui.separator();
-        ui.heading("OAuth 커넥터");
+        ui.heading(catalog.t("connectors.oauth", &[]));
         ui.horizontal(|ui| {
-            ui.label("이름");
+            ui.label(catalog.t("common.name", &[]));
             ui.text_edit_singleline(&mut self.oauth_label);
         });
         ui.horizontal(|ui| {
@@ -306,12 +311,15 @@ impl ConnectorsUi {
             ui.text_edit_singleline(&mut self.oauth_client_id);
         });
         ui.horizontal(|ui| {
-            ui.label("scopes (공백 구분)");
+            ui.label(catalog.t("connectors.oauth_scopes", &[]));
             ui.text_edit_singleline(&mut self.oauth_scopes);
         });
         let waiting = matches!(self.oauth_status, Some(OAuthStatus::Waiting));
         if ui
-            .add_enabled(!waiting, egui::Button::new("브라우저로 연결"))
+            .add_enabled(
+                !waiting,
+                egui::Button::new(catalog.t("connectors.connect_browser", &[])),
+            )
             .clicked()
         {
             self.start_oauth(ctx);
@@ -319,16 +327,19 @@ impl ConnectorsUi {
         match &self.oauth_status {
             None => {}
             Some(OAuthStatus::Waiting) => {
-                ui.weak("브라우저에서 승인을 기다리는 중…");
+                ui.weak(catalog.t("connectors.oauth_waiting", &[]));
             }
             Some(OAuthStatus::Done(label)) => {
                 ui.colored_label(
                     egui::Color32::from_rgb(0x2e, 0xa0, 0x43),
-                    format!("● 연결됨 — '{label}' 토큰이 keyring에 저장되었습니다"),
+                    catalog.t("connectors.oauth_done", &[("label", label)]),
                 );
             }
             Some(OAuthStatus::Failed(msg)) => {
-                ui.colored_label(egui::Color32::RED, format!("● 실패: {msg}"));
+                ui.colored_label(
+                    egui::Color32::RED,
+                    catalog.t("connectors.failed", &[("message", msg)]),
+                );
             }
         }
     }
@@ -415,6 +426,7 @@ impl ConnectorsUi {
         ctx: &egui::Context,
         db: &mut Db,
         server: &McpServerRow,
+        catalog: &i18n::Catalog,
     ) {
         ui.group(|ui| {
             ui.horizontal(|ui| {
@@ -428,19 +440,26 @@ impl ConnectorsUi {
             });
             ui.horizontal(|ui| {
                 match self.status.get(&server.id) {
-                    None => ui.weak("미확인"),
-                    Some(ConnStatus::Checking) => ui.weak("확인 중…"),
+                    None => ui.weak(catalog.t("connectors.unchecked", &[])),
+                    Some(ConnStatus::Checking) => ui.weak(catalog.t("connectors.checking", &[])),
                     Some(ConnStatus::Connected { tools }) => ui.colored_label(
                         egui::Color32::from_rgb(0x2e, 0xa0, 0x43),
-                        format!("● 연결됨 — tools {tools}개"),
+                        catalog.t(
+                            "connectors.connected_tools",
+                            &[("count", &tools.to_string())],
+                        ),
                     ),
-                    Some(ConnStatus::Failed(msg)) => {
-                        ui.colored_label(egui::Color32::RED, format!("● 실패: {msg}"))
-                    }
+                    Some(ConnStatus::Failed(msg)) => ui.colored_label(
+                        egui::Color32::RED,
+                        catalog.t("connectors.failed", &[("message", msg)]),
+                    ),
                 };
                 let checking = matches!(self.status.get(&server.id), Some(ConnStatus::Checking));
                 if ui
-                    .add_enabled(!checking, egui::Button::new("연결 테스트"))
+                    .add_enabled(
+                        !checking,
+                        egui::Button::new(catalog.t("connectors.test", &[])),
+                    )
                     .clicked()
                 {
                     self.start_discover(ctx, server);
@@ -453,7 +472,10 @@ impl ConnectorsUi {
                         ui.monospace(&tool.name);
                         // 실행 중인 invoke가 있으면 새로 시작 금지 (동시 실행/덮어쓰기 방지)
                         if ui
-                            .add_enabled(self.invoke.is_none(), egui::Button::new("실행").small())
+                            .add_enabled(
+                                self.invoke.is_none(),
+                                egui::Button::new(catalog.t("action.run", &[])).small(),
+                            )
                             .clicked()
                         {
                             self.begin_invoke(server, &tool);
@@ -464,16 +486,21 @@ impl ConnectorsUi {
                             audit::PermissionRule::Allow => {
                                 ui.colored_label(
                                     egui::Color32::from_rgb(0x2e, 0xa0, 0x43),
-                                    "규칙: 항상 허용",
+                                    catalog.t("connectors.rule_allow", &[]),
                                 );
                             }
                             audit::PermissionRule::Deny => {
-                                ui.colored_label(egui::Color32::RED, "규칙: 항상 거부");
+                                ui.colored_label(
+                                    egui::Color32::RED,
+                                    catalog.t("connectors.rule_deny", &[]),
+                                );
                             }
                             audit::PermissionRule::Ask => {}
                         }
                         if rule != audit::PermissionRule::Ask
-                            && ui.small_button("규칙 해제").clicked()
+                            && ui
+                                .small_button(catalog.t("connectors.clear_rule", &[]))
+                                .clicked()
                         {
                             self.policy.set_rule(
                                 &server.id,
@@ -518,6 +545,7 @@ impl ConnectorsUi {
         ctx: &egui::Context,
         db: &mut Db,
         workspace_id: &str,
+        catalog: &i18n::Catalog,
     ) {
         ui.separator();
         let Some(mut inv) = self.invoke.take() else {
@@ -552,23 +580,23 @@ impl ConnectorsUi {
         }
         let mut act = Act::None;
         ui.group(|ui| {
-            ui.strong(format!(
-                "도구 실행 — {} · {}",
-                inv.server_name, inv.tool_name
+            ui.strong(catalog.t(
+                "connectors.tool_invoke_title",
+                &[("server", &inv.server_name), ("tool", &inv.tool_name)],
             ));
             match &inv.phase {
                 InvokePhase::Editing => {
-                    ui.label("인자 (JSON object)");
+                    ui.label(catalog.t("connectors.arguments_json", &[]));
                     ui.add(
                         egui::TextEdit::multiline(&mut inv.input)
                             .code_editor()
                             .desired_rows(3),
                     );
                     ui.horizontal(|ui| {
-                        if ui.button("호출").clicked() {
+                        if ui.button(catalog.t("connectors.invoke", &[])).clicked() {
                             act = Act::Submit;
                         }
-                        if ui.button("취소").clicked() {
+                        if ui.button(catalog.t("action.cancel", &[])).clicked() {
                             act = Act::Close;
                         }
                     });
@@ -576,30 +604,42 @@ impl ConnectorsUi {
                 InvokePhase::Preparing => {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label("스키마 확인 중…");
+                        ui.label(catalog.t("connectors.schema_checking", &[]));
                     });
                 }
                 InvokePhase::Approval(reason) => {
                     let why = match reason {
-                        audit::ApprovalReason::AskRule => "정책: 매번 확인",
-                        audit::ApprovalReason::FirstUse => "첫 사용 — 승인 필요",
-                        audit::ApprovalReason::SchemaChanged => "스키마 변경 — 재승인 필요",
+                        audit::ApprovalReason::AskRule => {
+                            catalog.t("connectors.approval.ask_rule", &[])
+                        }
+                        audit::ApprovalReason::FirstUse => {
+                            catalog.t("connectors.approval.first_use", &[])
+                        }
+                        audit::ApprovalReason::SchemaChanged => {
+                            catalog.t("connectors.approval.schema_changed", &[])
+                        }
                     };
                     ui.colored_label(
                         egui::Color32::from_rgb(0xd0, 0x8a, 0x00),
-                        format!("승인 필요: {why}"),
+                        catalog.t("connectors.approval_needed", &[("reason", &why)]),
                     );
                     ui.horizontal(|ui| {
-                        if ui.button("이번만 허용").clicked() {
+                        if ui.button(catalog.t("connectors.allow_once", &[])).clicked() {
                             act = Act::Decide(audit::ToolDecision::AllowOnce);
                         }
-                        if ui.button("항상 허용").clicked() {
+                        if ui
+                            .button(catalog.t("connectors.allow_always", &[]))
+                            .clicked()
+                        {
                             act = Act::Decide(audit::ToolDecision::AllowAlways);
                         }
-                        if ui.button("이번만 거부").clicked() {
+                        if ui.button(catalog.t("connectors.deny_once", &[])).clicked() {
                             act = Act::Decide(audit::ToolDecision::DenyOnce);
                         }
-                        if ui.button("항상 거부").clicked() {
+                        if ui
+                            .button(catalog.t("connectors.deny_always", &[]))
+                            .clicked()
+                        {
                             act = Act::Decide(audit::ToolDecision::DenyAlways);
                         }
                     });
@@ -607,11 +647,11 @@ impl ConnectorsUi {
                 InvokePhase::Running => {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label("실행 중…");
+                        ui.label(catalog.t("status.running", &[]));
                     });
                 }
                 InvokePhase::Done(output) => {
-                    ui.label("결과");
+                    ui.label(catalog.t("connectors.result", &[]));
                     let mut shown = output.clone();
                     ui.add(
                         egui::TextEdit::multiline(&mut shown)
@@ -619,13 +659,13 @@ impl ConnectorsUi {
                             .desired_rows(6)
                             .interactive(false),
                     );
-                    if ui.button("닫기").clicked() {
+                    if ui.button(catalog.t("action.close", &[])).clicked() {
                         act = Act::Close;
                     }
                 }
                 InvokePhase::Failed(msg) => {
                     ui.colored_label(egui::Color32::RED, msg.clone());
-                    if ui.button("닫기").clicked() {
+                    if ui.button(catalog.t("action.close", &[])).clicked() {
                         act = Act::Close;
                     }
                 }

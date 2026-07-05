@@ -80,6 +80,7 @@ impl AgentsUi {
         client: &dyn RuntimeClient,
         events: &[RuntimeEvent],
         db_path: &Path,
+        catalog: &i18n::Catalog,
     ) {
         // 실행 응답 추적 (창이 닫혀 있어도)
         for event in events {
@@ -93,7 +94,7 @@ impl AgentsUi {
                 } => {
                     self.pending_launches = self.pending_launches.saturating_sub(1);
                     // 실행 주체인 이 창에도 실패를 표시한다 (workspace 에러바와 별개)
-                    self.error = Some(format!("실행 실패: {message}"));
+                    self.error = Some(catalog.t("agents.run_failed", &[("message", message)]));
                 }
                 _ => {}
             }
@@ -106,11 +107,11 @@ impl AgentsUi {
             return;
         }
         let mut open = true;
-        egui::Window::new("에이전트")
+        egui::Window::new(catalog.t("agents.title", &[]))
             .open(&mut open)
             .resizable(false)
             .show(ctx, |ui| {
-                self.contents(ui, db, workspace_id, config, client, db_path)
+                self.contents(ui, db, workspace_id, config, client, db_path, catalog)
             });
         if !open {
             self.open = false;
@@ -127,6 +128,7 @@ impl AgentsUi {
         config: &TerminalConfig,
         client: &dyn RuntimeClient,
         db_path: &Path,
+        catalog: &i18n::Catalog,
     ) {
         let list = match &self.cached {
             Some(list) => list.clone(),
@@ -138,7 +140,7 @@ impl AgentsUi {
                 Err(e) => {
                     ui.colored_label(
                         ui.visuals().error_fg_color,
-                        format!("목록 조회 실패: {e:#}"),
+                        catalog.t("common.list_failed", &[("message", &format!("{e:#}"))]),
                     );
                     return;
                 }
@@ -146,22 +148,22 @@ impl AgentsUi {
         };
 
         if list.is_empty() {
-            ui.label("등록된 에이전트가 없습니다.");
+            ui.label(catalog.t("agents.empty", &[]));
         }
         // 실행 profile 선택 (설계문서 PR-09: env profile 선택)
         let profiles = db.list_env_profiles(workspace_id).unwrap_or_default();
         ui.horizontal(|ui| {
-            ui.label("실행 profile");
+            ui.label(catalog.t("agents.run_profile", &[]));
             let current = self
                 .run_profile
                 .as_ref()
                 .and_then(|id| profiles.iter().find(|p| &p.id == id))
                 .map(|p| p.name.clone())
-                .unwrap_or_else(|| "(없음)".into());
+                .unwrap_or_else(|| catalog.t("common.none", &[]));
             egui::ComboBox::from_id_salt("agent_run_profile")
                 .selected_text(current)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.run_profile, None, "(없음)");
+                    ui.selectable_value(&mut self.run_profile, None, catalog.t("common.none", &[]));
                     for profile in &profiles {
                         let label = if profile.is_production {
                             format!("⚠ {}", profile.name)
@@ -178,7 +180,10 @@ impl AgentsUi {
                 .and_then(|id| profiles.iter().find(|p| &p.id == id))
                 .is_some_and(|p| p.is_production)
             {
-                ui.colored_label(ui.visuals().warn_fg_color, "⚠ production profile");
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    catalog.t("agents.production_profile", &[]),
+                );
             }
         });
 
@@ -192,10 +197,10 @@ impl AgentsUi {
                     config.command,
                     agent_args_for_display(&config.args)
                 ));
-                if ui.button("실행").clicked() {
+                if ui.button(catalog.t("action.run", &[])).clicked() {
                     run_config = Some(config.clone());
                 }
-                if ui.button("삭제").clicked() {
+                if ui.button(catalog.t("action.delete", &[])).clicked() {
                     delete_id = Some(config.id.clone());
                 }
             });
@@ -220,22 +225,22 @@ impl AgentsUi {
         }
 
         ui.separator();
-        ui.heading("등록");
+        ui.heading(catalog.t("agents.register", &[]));
         ui.horizontal(|ui| {
-            ui.label("이름");
+            ui.label(catalog.t("common.name", &[]));
             ui.text_edit_singleline(&mut self.name);
         });
         ui.horizontal(|ui| {
-            ui.label("command");
+            ui.label(catalog.t("common.command", &[]));
             ui.text_edit_singleline(&mut self.command);
         });
-        ui.label("args (한 줄에 하나)");
+        ui.label(catalog.t("agents.args_one_per_line", &[]));
         ui.add(
             egui::TextEdit::multiline(&mut self.args_input)
                 .desired_rows(3)
                 .font(egui::TextStyle::Monospace),
         );
-        ui.collapsing("상태 감지 regex (선택)", |ui| {
+        ui.collapsing(catalog.t("agents.status_regex", &[]), |ui| {
             for (label, field) in [
                 ("waiting", &mut self.waiting_regex),
                 ("approval", &mut self.approval_regex),
@@ -252,7 +257,7 @@ impl AgentsUi {
         // 에이전트의 MCP tool 호출을 deppy-mcp-proxy로 라우팅한다 (backend 선택 필수).
         ui.checkbox(
             &mut self.mcp_proxy_enabled,
-            "deppy 권한계층 경유 (MCP proxy)",
+            catalog.t("agents.mcp_proxy", &[]),
         );
         let servers = if self.mcp_proxy_enabled {
             db.list_mcp_servers().unwrap_or_default()
@@ -261,17 +266,21 @@ impl AgentsUi {
         };
         if self.mcp_proxy_enabled {
             ui.horizontal(|ui| {
-                ui.label("backend");
+                ui.label(catalog.t("common.backend", &[]));
                 let current = self
                     .mcp_proxy_server_id
                     .as_ref()
                     .and_then(|id| servers.iter().find(|s| &s.id == id))
                     .map(|s| s.name.clone())
-                    .unwrap_or_else(|| "(선택)".into());
+                    .unwrap_or_else(|| catalog.t("common.select", &[]));
                 egui::ComboBox::from_id_salt("agent_mcp_proxy_backend")
                     .selected_text(current)
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.mcp_proxy_server_id, None, "(선택)");
+                        ui.selectable_value(
+                            &mut self.mcp_proxy_server_id,
+                            None,
+                            catalog.t("common.select", &[]),
+                        );
                         for server in &servers {
                             ui.selectable_value(
                                 &mut self.mcp_proxy_server_id,
@@ -284,7 +293,7 @@ impl AgentsUi {
             // 주입 플래그 커스텀 (고급): 에이전트마다 규약이 달라(--mcp-config 외) 이름만 바꾼다.
             // 비우면 기본 --mcp-config. 경로는 항상 다음 arg로 붙는다(=path 규약은 후속 과제).
             ui.horizontal(|ui| {
-                ui.label("설정 플래그 (고급, 비우면 --mcp-config)");
+                ui.label(catalog.t("agents.config_flag", &[]));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.mcp_config_flag)
                         .font(egui::TextStyle::Monospace),
@@ -311,14 +320,20 @@ impl AgentsUi {
         let filled =
             !self.name.trim().is_empty() && !self.command.trim().is_empty() && proxy_ok && flag_ok;
         if self.mcp_proxy_enabled && self.mcp_proxy_server_id.is_none() {
-            ui.colored_label(ui.visuals().warn_fg_color, "backend를 선택하세요");
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                catalog.t("agents.select_backend", &[]),
+            );
         }
         if self.mcp_proxy_enabled
             && let Err(hint) = validate_mcp_config_flag(&self.mcp_config_flag)
         {
             ui.colored_label(ui.visuals().warn_fg_color, hint);
         }
-        if ui.add_enabled(filled, egui::Button::new("등록")).clicked() {
+        if ui
+            .add_enabled(filled, egui::Button::new(catalog.t("agents.register", &[])))
+            .clicked()
+        {
             let args: Vec<String> = self
                 .args_input
                 .lines()

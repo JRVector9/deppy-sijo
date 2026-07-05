@@ -76,7 +76,7 @@ impl WorkspaceUi {
         }
     }
 
-    fn handle_events(&mut self, events: &[RuntimeEvent]) {
+    fn handle_events(&mut self, events: &[RuntimeEvent], catalog: &i18n::Catalog) {
         for event in events {
             match event {
                 RuntimeEvent::MuxUpdated { snapshot } => {
@@ -146,10 +146,13 @@ impl WorkspaceUi {
                         self.pending_spawns = self.pending_spawns.saturating_sub(1);
                     }
                     let kind = match kind {
-                        SpawnKind::Shell => "셸",
-                        SpawnKind::Agent => "에이전트",
+                        SpawnKind::Shell => catalog.t("workspace.spawn.shell", &[]),
+                        SpawnKind::Agent => catalog.t("workspace.spawn.agent", &[]),
                     };
-                    self.error = Some(format!("{kind} 시작 실패: {message}"));
+                    self.error = Some(catalog.t(
+                        "workspace.spawn_failed",
+                        &[("kind", kind.as_str()), ("message", message.as_str())],
+                    ));
                 }
                 RuntimeEvent::SessionStatusChanged { session, status } => {
                     if self.session_alive(*session) {
@@ -171,10 +174,11 @@ impl WorkspaceUi {
         config: &TerminalConfig,
         client: &dyn RuntimeClient,
         events: &[RuntimeEvent],
+        catalog: &i18n::Catalog,
     ) {
-        self.handle_events(events);
+        self.handle_events(events, catalog);
 
-        self.tab_bar(ui, config, client);
+        self.tab_bar(ui, config, client, catalog);
         if let Some(error) = self.error.clone() {
             ui.horizontal(|ui| {
                 ui.colored_label(ui.visuals().error_fg_color, error);
@@ -186,7 +190,9 @@ impl WorkspaceUi {
         ui.separator();
 
         let Some(mux) = self.mux.clone() else {
-            ui.centered_and_justified(|ui| ui.label("+ 새 셸 로 시작하세요"));
+            ui.centered_and_justified(|ui| {
+                ui.label(catalog.t("workspace.start_shell_prompt", &[]))
+            });
             self.flush_command_repaint(ui.ctx());
             return;
         };
@@ -202,7 +208,9 @@ impl WorkspaceUi {
             .as_ref()
             .and_then(|id| mux.tabs.iter().find(|tab| &tab.id == id))
         else {
-            ui.centered_and_justified(|ui| ui.label("+ 새 셸 로 시작하세요"));
+            ui.centered_and_justified(|ui| {
+                ui.label(catalog.t("workspace.start_shell_prompt", &[]))
+            });
             self.flush_command_repaint(ui.ctx());
             return;
         };
@@ -226,13 +234,20 @@ impl WorkspaceUi {
             client,
             &tab_id,
             &mut split_path,
+            catalog,
         );
 
         // 응답(MuxUpdated/Viewport)을 다음 프레임에서 수신하도록 보장
         self.flush_command_repaint(ui.ctx());
     }
 
-    fn tab_bar(&mut self, ui: &mut egui::Ui, config: &TerminalConfig, client: &dyn RuntimeClient) {
+    fn tab_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        config: &TerminalConfig,
+        client: &dyn RuntimeClient,
+        catalog: &i18n::Catalog,
+    ) {
         let mux = self.mux.clone();
         ui.horizontal(|ui| {
             if let Some(mux) = &mux {
@@ -269,7 +284,7 @@ impl WorkspaceUi {
                     ui.separator();
                 }
             }
-            if ui.button("+ 새 셸").clicked() {
+            if ui.button(catalog.t("workspace.new_shell", &[])).clicked() {
                 self.send(
                     client,
                     RuntimeCommand::SpawnShell {
@@ -281,7 +296,10 @@ impl WorkspaceUi {
             }
             // focused pane 대상 분할 (새 pane에 새 셸 attach)
             if let Some(focused) = mux.as_ref().and_then(|m| m.focused_pane.clone()) {
-                if ui.button("분할│").clicked() {
+                if ui
+                    .button(catalog.t("workspace.split_horizontal_short", &[]))
+                    .clicked()
+                {
                     self.send(
                         client,
                         RuntimeCommand::SplitPane {
@@ -291,7 +309,10 @@ impl WorkspaceUi {
                         },
                     );
                 }
-                if ui.button("분할─").clicked() {
+                if ui
+                    .button(catalog.t("workspace.split_vertical_short", &[]))
+                    .clicked()
+                {
                     self.send(
                         client,
                         RuntimeCommand::SplitPane {
@@ -301,7 +322,7 @@ impl WorkspaceUi {
                         },
                     );
                 }
-                if ui.button("pane 닫기").clicked() {
+                if ui.button(catalog.t("workspace.close_pane", &[])).clicked() {
                     self.send(client, RuntimeCommand::ClosePane { pane: focused });
                 }
             }
@@ -321,6 +342,7 @@ impl WorkspaceUi {
         client: &dyn RuntimeClient,
         tab_id: &runtime::MuxTabId,
         path: &mut Vec<u8>,
+        catalog: &i18n::Catalog,
     ) {
         match node {
             LayoutNode::Pane(pane_id) => {
@@ -328,7 +350,7 @@ impl WorkspaceUi {
                 // max_rect는 배치만 제한한다 — 이전 크기의 스냅샷이 이웃 pane을
                 // 덮어 그리지 않게 페인터 클립도 pane 영역으로 줄인다
                 child.set_clip_rect(rect.intersect(ui.clip_rect()));
-                self.render_pane(&mut child, pane_id, mux, config, client);
+                self.render_pane(&mut child, pane_id, mux, config, client, catalog);
                 // 포커스된 pane 표시 — 상단 한 줄만 (전체 테두리는 시각적으로 과함,
                 // 2026-07-05 사용자 피드백)
                 if mux.focused_pane.as_ref() == Some(pane_id) {
@@ -383,10 +405,22 @@ impl WorkspaceUi {
                     }
                 };
                 path.push(0);
-                self.render_node(ui, first_rect, first, mux, config, client, tab_id, path);
+                self.render_node(
+                    ui, first_rect, first, mux, config, client, tab_id, path, catalog,
+                );
                 path.pop();
                 path.push(1);
-                self.render_node(ui, second_rect, second, mux, config, client, tab_id, path);
+                self.render_node(
+                    ui,
+                    second_rect,
+                    second,
+                    mux,
+                    config,
+                    client,
+                    tab_id,
+                    path,
+                    catalog,
+                );
                 path.pop();
                 // 핸들은 자식 pane들 **뒤에** 등록 — egui 히트테스트는 나중 등록이
                 // 우선이라, ±2px 확장 히트영역이 터미널 선택 드래그에 밀리지 않는다
@@ -458,6 +492,7 @@ impl WorkspaceUi {
         mux: &MuxSnapshot,
         config: &TerminalConfig,
         client: &dyn RuntimeClient,
+        catalog: &i18n::Catalog,
     ) {
         let Some(pane) = mux
             .tabs
@@ -485,7 +520,7 @@ impl WorkspaceUi {
                 },
             );
         }
-        self.pane_context_menu(&pane_resp, pane_id, config, client);
+        self.pane_context_menu(&pane_resp, pane_id, config, client, catalog);
         if pane.session_id.is_some() {
             if pane_resp
                 .dnd_hover_payload::<std::path::PathBuf>()
@@ -511,7 +546,7 @@ impl WorkspaceUi {
             }
         }
         let Some(session) = pane.session_id else {
-            ui.label("(세션 없음)");
+            ui.label(catalog.t("workspace.no_session", &[]));
             return;
         };
 
@@ -536,7 +571,7 @@ impl WorkspaceUi {
         let (exit_code, bracketed, snapshot) = {
             let view = self.sessions.entry(session).or_default();
             let Some(snapshot) = view.snapshot.clone() else {
-                ui.label("연결 중…");
+                ui.label(catalog.t("workspace.connecting", &[]));
                 return;
             };
             (view.exit_code, view.bracketed_paste, snapshot)
@@ -628,7 +663,7 @@ impl WorkspaceUi {
             }
         }
         // 터미널 위 우클릭도 같은 메뉴 (터미널 위젯이 topmost라 배경 interact가 못 받음)
-        self.pane_context_menu(&output.response, pane_id, config, client);
+        self.pane_context_menu(&output.response, pane_id, config, client, catalog);
 
         // 입력은 focused pane으로만
         if focused && output.response.has_focus() {
@@ -694,10 +729,10 @@ impl WorkspaceUi {
         }
 
         if let Some(code) = exit_code {
-            ui.label(format!(
-                "[종료: exit code {}]",
-                code.map_or("알 수 없음".into(), |c| c.to_string())
-            ));
+            let code = code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| catalog.t("workspace.exit_unknown", &[]));
+            ui.label(catalog.t("workspace.exited", &[("code", code.as_str())]));
         }
     }
 
@@ -711,9 +746,13 @@ impl WorkspaceUi {
         pane_id: &runtime::MuxPaneId,
         config: &TerminalConfig,
         client: &dyn RuntimeClient,
+        catalog: &i18n::Catalog,
     ) {
         resp.context_menu(|ui| {
-            if ui.button("분할 │ (좌우)").clicked() {
+            if ui
+                .button(catalog.t("workspace.split_horizontal", &[]))
+                .clicked()
+            {
                 self.send(
                     client,
                     RuntimeCommand::SplitPane {
@@ -724,7 +763,10 @@ impl WorkspaceUi {
                 );
                 ui.close();
             }
-            if ui.button("분할 ─ (상하)").clicked() {
+            if ui
+                .button(catalog.t("workspace.split_vertical", &[]))
+                .clicked()
+            {
                 self.send(
                     client,
                     RuntimeCommand::SplitPane {
@@ -736,7 +778,7 @@ impl WorkspaceUi {
                 ui.close();
             }
             ui.separator();
-            if ui.button("pane 닫기").clicked() {
+            if ui.button(catalog.t("workspace.close_pane", &[])).clicked() {
                 self.send(
                     client,
                     RuntimeCommand::ClosePane {
@@ -971,11 +1013,16 @@ mod tests {
         })
     }
 
+    fn catalog() -> i18n::Catalog {
+        i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap()
+    }
+
     #[test]
     fn muxupdated_뒤_hidden_viewport는_snapshot을_되살리지_않는다() {
         let hidden = SessionId(1);
         let visible = SessionId(2);
         let mut ui = WorkspaceUi::new();
+        let catalog = catalog();
 
         let tab_a = tab(
             "a",
@@ -988,28 +1035,34 @@ mod tests {
             LayoutNode::Pane(pane_id("pb")),
         );
 
-        ui.handle_events(&[
-            RuntimeEvent::MuxUpdated {
-                snapshot: mux("a", vec![tab_a.clone(), tab_b.clone()], "pa"),
-            },
-            RuntimeEvent::Viewport {
-                session: hidden,
-                snapshot: snapshot("old visible"),
-                bracketed_paste: false,
-            },
-        ]);
+        ui.handle_events(
+            &[
+                RuntimeEvent::MuxUpdated {
+                    snapshot: mux("a", vec![tab_a.clone(), tab_b.clone()], "pa"),
+                },
+                RuntimeEvent::Viewport {
+                    session: hidden,
+                    snapshot: snapshot("old visible"),
+                    bracketed_paste: false,
+                },
+            ],
+            &catalog,
+        );
         assert!(ui.sessions.get(&hidden).unwrap().snapshot.is_some());
 
-        ui.handle_events(&[
-            RuntimeEvent::MuxUpdated {
-                snapshot: mux("b", vec![tab_a, tab_b], "pb"),
-            },
-            RuntimeEvent::Viewport {
-                session: hidden,
-                snapshot: snapshot("stale hidden"),
-                bracketed_paste: false,
-            },
-        ]);
+        ui.handle_events(
+            &[
+                RuntimeEvent::MuxUpdated {
+                    snapshot: mux("b", vec![tab_a, tab_b], "pb"),
+                },
+                RuntimeEvent::Viewport {
+                    session: hidden,
+                    snapshot: snapshot("stale hidden"),
+                    bracketed_paste: false,
+                },
+            ],
+            &catalog,
+        );
 
         assert!(
             ui.sessions
@@ -1024,6 +1077,7 @@ mod tests {
         let left = SessionId(10);
         let right = SessionId(11);
         let mut ui = WorkspaceUi::new();
+        let catalog = catalog();
         let split = LayoutNode::Split {
             direction: SplitDirection::Horizontal,
             ratio: 0.5,
@@ -1036,21 +1090,24 @@ mod tests {
             split,
         );
 
-        ui.handle_events(&[
-            RuntimeEvent::MuxUpdated {
-                snapshot: mux("active", vec![active], "left"),
-            },
-            RuntimeEvent::Viewport {
-                session: left,
-                snapshot: snapshot("left"),
-                bracketed_paste: false,
-            },
-            RuntimeEvent::Viewport {
-                session: right,
-                snapshot: snapshot("right"),
-                bracketed_paste: true,
-            },
-        ]);
+        ui.handle_events(
+            &[
+                RuntimeEvent::MuxUpdated {
+                    snapshot: mux("active", vec![active], "left"),
+                },
+                RuntimeEvent::Viewport {
+                    session: left,
+                    snapshot: snapshot("left"),
+                    bracketed_paste: false,
+                },
+                RuntimeEvent::Viewport {
+                    session: right,
+                    snapshot: snapshot("right"),
+                    bracketed_paste: true,
+                },
+            ],
+            &catalog,
+        );
 
         assert!(ui.sessions.get(&left).unwrap().snapshot.is_some());
         assert!(ui.sessions.get(&right).unwrap().snapshot.is_some());

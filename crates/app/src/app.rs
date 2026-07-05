@@ -234,6 +234,7 @@ pub struct App {
     /// 시작 시 창을 주 화면으로 1회 이동했다 (centered의 macOS 좌표 문제 우회)
     startup_positioned: bool,
     frame_stats: crate::perf::FrameStats,
+    i18n: i18n::Catalog,
     /// 현재 활성(렌더되는) workspace의 런타임 상태.
     active: WorkspaceRuntime,
     /// warm workspace들 (전환으로 물러났지만 워커는 계속 실행 — §14.1 Warm). 이벤트는
@@ -284,6 +285,7 @@ impl App {
     ) -> Self {
         // output_batch_ms는 시작 시 고정, scrollback_lines는 세션 spawn 시점에 전달
         let redaction = secret::RedactionService::new();
+        let i18n = load_catalog(&config.i18n.locale);
         let active = Self::make_runtime(
             &config,
             &logs_base,
@@ -344,6 +346,7 @@ impl App {
             warm: std::collections::HashMap::new(),
             warm_order: Vec::new(),
             frame_stats: crate::perf::FrameStats::new(),
+            i18n,
             egui_ctx,
             db_path,
             logs_base,
@@ -732,7 +735,7 @@ impl App {
     }
 
     /// 워크스페이스 목록 창: 전환/생성. 전환은 워커 shutdown+recreate라 창 closure 밖에서.
-    fn workspaces_window(&mut self, ctx: &egui::Context) {
+    fn workspaces_window(&mut self, ctx: &egui::Context, catalog: &i18n::Catalog) {
         if !self.workspaces_open {
             return;
         }
@@ -746,7 +749,7 @@ impl App {
         let mut edit_ws_path = self.edit_ws_path.take();
         let mut save_path: Option<(String, String)> = None;
         let deletable = self.workspaces.len() > 1; // 마지막 workspace는 삭제 불가
-        egui::Window::new("워크스페이스")
+        egui::Window::new(catalog.t("workspace.manager.title", &[]))
             .open(&mut open)
             .resizable(false)
             .show(ctx, |ui| {
@@ -754,23 +757,29 @@ impl App {
                     ui.horizontal(|ui| {
                         if ws.id == self.active.id {
                             ui.strong(&ws.name);
-                            ui.weak("(현재)");
+                            ui.weak(catalog.t("workspace.manager.current", &[]));
                         } else {
                             ui.label(&ws.name);
-                            if ui.button("전환").clicked() {
+                            if ui
+                                .button(catalog.t("workspace.manager.switch", &[]))
+                                .clicked()
+                            {
                                 switch_to = Some(ws.id.clone());
                             }
                             // 삭제 (활성/마지막 제외) — 2단계 확인
                             if deletable {
                                 if self.confirm_delete_ws.as_deref() == Some(ws.id.as_str()) {
-                                    ui.colored_label(egui::Color32::RED, "세션·env 삭제?");
-                                    if ui.button("삭제").clicked() {
+                                    ui.colored_label(
+                                        egui::Color32::RED,
+                                        catalog.t("workspace.manager.delete_confirm", &[]),
+                                    );
+                                    if ui.button(catalog.t("action.delete", &[])).clicked() {
                                         delete_id = Some(ws.id.clone());
                                     }
-                                    if ui.button("취소").clicked() {
+                                    if ui.button(catalog.t("action.cancel", &[])).clicked() {
                                         cancel_confirm = true;
                                     }
-                                } else if ui.button("삭제").clicked() {
+                                } else if ui.button(catalog.t("action.delete", &[])).clicked() {
                                     set_confirm = Some(ws.id.clone());
                                 }
                             }
@@ -781,26 +790,29 @@ impl App {
                         ui.add_space(12.0);
                         match &mut edit_ws_path {
                             Some((id, buffer)) if *id == ws.id => {
-                                ui.label("경로");
+                                ui.label(catalog.t("workspace.manager.path", &[]));
                                 ui.add(
                                     egui::TextEdit::singleline(buffer)
                                         .hint_text("/path/to/project")
                                         .desired_width(260.0),
                                 );
-                                if ui.button("저장").clicked() {
+                                if ui.button(catalog.t("action.save", &[])).clicked() {
                                     save_path = Some((id.clone(), buffer.trim().to_owned()));
                                     edit_ws_path = None;
-                                } else if ui.button("취소").clicked() {
+                                } else if ui.button(catalog.t("action.cancel", &[])).clicked() {
                                     edit_ws_path = None;
                                 }
                             }
                             _ => {
                                 if ws.path.is_empty() {
-                                    ui.weak("경로 미설정");
+                                    ui.weak(catalog.t("workspace.manager.path_unset", &[]));
                                 } else {
                                     ui.weak(&ws.path);
                                 }
-                                if ui.small_button("경로 편집").clicked() {
+                                if ui
+                                    .small_button(catalog.t("workspace.manager.edit_path", &[]))
+                                    .clicked()
+                                {
                                     edit_ws_path = Some((ws.id.clone(), ws.path.clone()));
                                 }
                             }
@@ -809,17 +821,17 @@ impl App {
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label("새 워크스페이스");
+                    ui.label(catalog.t("workspace.manager.new_workspace", &[]));
                     ui.text_edit_singleline(&mut self.new_workspace_name);
-                    if ui.button("생성").clicked() {
+                    if ui.button(catalog.t("action.new", &[])).clicked() {
                         create = true;
                     }
                 });
                 ui.horizontal(|ui| {
-                    ui.label("프로젝트 경로");
+                    ui.label(catalog.t("workspace.manager.project_path", &[]));
                     ui.add(
                         egui::TextEdit::singleline(&mut self.new_workspace_path)
-                            .hint_text("(선택) /path/to/project")
+                            .hint_text(catalog.t("workspace.manager.project_path_hint", &[]))
                             .desired_width(260.0),
                     );
                 });
@@ -1087,25 +1099,26 @@ impl eframe::App for App {
     // egui 0.35부터 update(&Context) 대신 ui(&mut Ui) 시그니처를 쓴다.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.frame_stats.begin();
+        let text = self.i18n.clone();
         let mut unread_before = 0;
         egui::Panel::top("top_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("설정").clicked() {
+                if ui.button(text.t("top.settings", &[])).clicked() {
                     self.settings_open = !self.settings_open;
                 }
-                if ui.button("자격증명").clicked() {
+                if ui.button(text.t("top.credentials", &[])).clicked() {
                     self.credentials_ui.toggle();
                 }
-                if ui.button("연결").clicked() {
+                if ui.button(text.t("top.connectors", &[])).clicked() {
                     self.connectors_ui.toggle();
                 }
-                if ui.button("환경").clicked() {
+                if ui.button(text.t("top.environment", &[])).clicked() {
                     self.env_profiles_ui.toggle();
                 }
-                if ui.button("에이전트").clicked() {
+                if ui.button(text.t("top.agents", &[])).clicked() {
                     self.agents_ui.toggle();
                 }
-                if ui.button("워크스페이스").clicked() {
+                if ui.button(text.t("top.workspaces", &[])).clicked() {
                     self.workspaces_open = !self.workspaces_open;
                     if self.workspaces_open {
                         self.refresh_workspaces();
@@ -1114,9 +1127,10 @@ impl eframe::App for App {
                 let unread = self.notifications_ui.unread();
                 unread_before = unread;
                 let label = if unread > 0 {
-                    format!("알림 ({unread})")
+                    let count = unread.to_string();
+                    text.t("top.notifications.unread", &[("count", &count)])
                 } else {
-                    "알림".to_owned()
+                    text.t("top.notifications", &[])
                 };
                 if ui.button(label).clicked() {
                     // 열면 모두 읽음 → 배지가 이미 그려진 뒤라 다음 프레임에 갱신
@@ -1133,7 +1147,7 @@ impl eframe::App for App {
             let sidebar_action = self
                 .file_tree
                 .as_mut()
-                .and_then(|tree| tree.panel(ui, &sessions));
+                .and_then(|tree| tree.panel(ui, &sessions, &text));
             match sidebar_action {
                 // "터미널에 경로 삽입" (FT-3): 포커스된 pane의 세션에 WriteInput —
                 // 파일 트리의 유일한 runtime 접점 (§6).
@@ -1193,7 +1207,7 @@ impl eframe::App for App {
         }
 
         // 워크스페이스 전환/생성 (switch는 워커 shutdown+recreate라 window closure 밖에서)
-        self.workspaces_window(ui.ctx());
+        self.workspaces_window(ui.ctx(), &text);
 
         // logic()이 drain해 쌓아둔 이벤트를 렌더에 소비한다 (알림은 logic()에서 이미 처리).
         // Warm 동안 쌓였다면 Active 복귀 시 여기서 몰아 처리된다.
@@ -1206,6 +1220,7 @@ impl eframe::App for App {
             &self.active.runtime,
             &events,
             &self.db_path,
+            &text,
         );
         {
             let credential_service = AppCredentialService {
@@ -1213,7 +1228,8 @@ impl eframe::App for App {
                 secret_store: &self.secret_store,
                 redaction: &self.redaction,
             };
-            self.credentials_ui.show(ui.ctx(), &credential_service);
+            self.credentials_ui
+                .show(ui.ctx(), &credential_service, &text);
         }
         let credential_added = {
             let oauth_store = AppOAuthCredentialStore {
@@ -1221,7 +1237,7 @@ impl eframe::App for App {
                 redaction: &self.redaction,
             };
             self.connectors_ui
-                .show(ui.ctx(), &mut self.db, &self.active.id, &oauth_store)
+                .show(ui.ctx(), &mut self.db, &self.active.id, &oauth_store, &text)
         };
         if credential_added {
             // OAuth로 credential이 추가됨 — 자격증명 창은 이번 프레임에 이미
@@ -1230,11 +1246,15 @@ impl eframe::App for App {
             ui.ctx().request_repaint();
         }
         self.env_profiles_ui
-            .show(ui.ctx(), &mut self.db, &self.active.id);
+            .show(ui.ctx(), &mut self.db, &self.active.id, &text);
         egui::CentralPanel::default().show(ui, |ui| {
-            self.active
-                .workspace_ui
-                .show(ui, &self.config.terminal, &self.active.runtime, &events);
+            self.active.workspace_ui.show(
+                ui,
+                &self.config.terminal,
+                &self.active.runtime,
+                &events,
+                &text,
+            );
         });
 
         // 알림 센터 렌더 (생성은 logic()에서 끝났다). 활성 workspace의 사라진 세션의
@@ -1268,7 +1288,7 @@ impl eframe::App for App {
             }
         }
         // 클릭한 알림 → 활성 workspace면 pane focus, 아니면 그 workspace로 전환 후 focus 예약.
-        if let Some((ws_id, session)) = self.notifications_ui.show(ui.ctx()) {
+        if let Some((ws_id, session)) = self.notifications_ui.show(ui.ctx(), &text) {
             if ws_id == self.active.id {
                 if let Some(pane) = mux.as_ref().and_then(|m| pane_of_session(m, session)) {
                     let _ = self
@@ -1293,7 +1313,7 @@ impl eframe::App for App {
 
         // agent-proxy 승인 팝업 (option 1.5). logic()이 폴링해 넣어둔 pending 중 가장
         // 오래된 하나를 모달로 띄운다. 버튼을 누르면 결정을 DB에 되쓴다.
-        if let Some(decision) = self.approvals_ui.show(ui.ctx()) {
+        if let Some(decision) = self.approvals_ui.show(ui.ctx(), &text) {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
@@ -1346,8 +1366,13 @@ impl eframe::App for App {
             &mut self.config,
             &remote_view,
             &mut self.remote_reveal_token,
+            &text,
         );
         if out.config_changed {
+            self.config.i18n.locale = i18n::normalize_locale(&self.config.i18n.locale);
+            if self.i18n.locale() != self.config.i18n.locale {
+                self.i18n = load_catalog(&self.config.i18n.locale);
+            }
             // hot reload: 테마는 즉시 적용
             ui.ctx().set_theme(self.config.ui.theme.to_egui());
             // 폴더 트리 hot toggle (§6): OFF → 상태 drop(리소스 0), ON → 즉시 생성
@@ -1424,6 +1449,13 @@ fn pane_of_session(
         .flat_map(|tab| &tab.panes)
         .find(|pane| pane.session_id == Some(session))
         .map(|pane| pane.id.clone())
+}
+
+fn load_catalog(locale: &str) -> i18n::Catalog {
+    i18n::Catalog::load(locale).unwrap_or_else(|e| {
+        tracing::warn!("locale catalog 로드 실패({locale}): {e:#}");
+        i18n::Catalog::load(i18n::FALLBACK_LOCALE).expect("fallback locale catalog must load")
+    })
 }
 
 fn expired_warm_workspace_ids(

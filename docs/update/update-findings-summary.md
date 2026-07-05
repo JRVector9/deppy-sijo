@@ -32,6 +32,7 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 - `docs/build/*-summary.md`
 - `docs/build/build-track-orchestration.md`
 - `docs/update/partial-backlog-code-triage.md`
+- `docs/update/remaining-follow-up-code-triage.md`
 
 ## Non-Regression Baseline
 
@@ -82,7 +83,9 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 ## Release Blockers Remaining
 
 - Full PR-U20 Scenario A-E release-hardware measurements remain pending in Phase D, but the final-gate report now exists.
-- PR-U12 child process tree aggregation and PR-U18 runtime/app hot-path write wiring remain follow-up.
+- PR-U12 child process tree aggregation, PR-U18 runtime/app hot-path write
+  wiring, PR-U15 PTY input pressure UI, and PR-U17 status confidence/override
+  remain separately scoped follow-ups.
 - Code triage now points PR-U20 follow-up to release-hardware measurement execution, not code changes.
 
 ## Deferred / Backlog Items

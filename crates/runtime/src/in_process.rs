@@ -253,6 +253,17 @@ struct Worker {
 struct SessionLog {
     redactor: StreamRedactor,
     writer: SessionLogWriter,
+    last_log_offset: u64,
+}
+
+impl SessionLog {
+    fn append_redacted_output(&mut self, redacted: &[u8]) -> anyhow::Result<u64> {
+        self.writer.append_output(redacted)?;
+        self.last_log_offset = self
+            .last_log_offset
+            .saturating_add(u64::try_from(redacted.len()).unwrap_or(u64::MAX));
+        Ok(self.last_log_offset)
+    }
 }
 
 /// worker가 소유하는 mux 상태 (설계문서 3장 Mux Runtime).
@@ -390,6 +401,9 @@ impl Worker {
         if let Some(pipe) = &mut self.persist {
             for session in &all_sessions {
                 pipe.session_exited(*session);
+            }
+            if let Err(e) = pipe.flush_async_writes() {
+                tracing::warn!("세션 영속 batch flush 실패 (shutdown): {e:#}");
             }
         }
         let open_sessions: Vec<SessionId> = self.logs.keys().copied().collect();
@@ -722,6 +736,7 @@ impl Worker {
                     SessionLog {
                         redactor: self.redaction.stream_redactor(),
                         writer,
+                        last_log_offset: 0,
                     },
                 );
             }
@@ -733,7 +748,11 @@ impl Worker {
     fn close_session_log(&mut self, session: SessionId, event: &str, detail: Option<&str>) {
         if let Some(mut log) = self.logs.remove(&session) {
             let tail = log.redactor.flush();
-            let _ = log.writer.append_output(&tail);
+            if let Ok(offset) = log.append_redacted_output(&tail)
+                && let Some(pipe) = &mut self.persist
+            {
+                pipe.session_log_offset(session, offset);
+            }
             let _ = log.writer.append_event(event, detail);
             log.writer.flush();
         }
@@ -980,14 +999,21 @@ impl Worker {
             return;
         };
         let mut log = self.logs.get_mut(&session);
+        let mut latest_offset = None;
         let _ = active.pump(|chunk| {
             if let Some(log) = log.as_mut() {
                 let redacted = log.redactor.redact_chunk(chunk);
-                if let Err(e) = log.writer.append_output(&redacted) {
-                    tracing::warn!("세션 로그 최종 기록 실패: {e:#}");
+                match log.append_redacted_output(&redacted) {
+                    Ok(offset) => latest_offset = Some(offset),
+                    Err(e) => tracing::warn!("세션 로그 최종 기록 실패: {e:#}"),
                 }
             }
         });
+        if let Some(offset) = latest_offset
+            && let Some(pipe) = &mut self.persist
+        {
+            pipe.session_log_offset(session, offset);
+        }
     }
 
     /// mux 스냅샷을 push하고, visible(active tab) 세션들의 화면도 즉시 push한다
@@ -1044,15 +1070,19 @@ impl Worker {
         self.archive_over_cap();
         let watched = self.mux.watched_sessions();
         let mut events = Vec::new();
+        let mut log_offsets = Vec::new();
+        let mut status_updates = Vec::new();
         for active in self.sessions.values_mut() {
-            let mut log = self.logs.get_mut(&active.id());
-            let mut detector = self.detectors.get_mut(&active.id());
+            let active_id = active.id();
+            let mut log = self.logs.get_mut(&active_id);
+            let mut detector = self.detectors.get_mut(&active_id);
             let result = active.pump(|chunk| {
                 if let Some(log) = log.as_mut() {
                     // redaction 후에만 디스크에 닿는다 (7장 — raw 평문 저장 금지)
                     let redacted = log.redactor.redact_chunk(chunk);
-                    if let Err(e) = log.writer.append_output(&redacted) {
-                        tracing::warn!("세션 로그 기록 실패: {e:#}");
+                    match log.append_redacted_output(&redacted) {
+                        Ok(offset) => log_offsets.push((active_id, offset)),
+                        Err(e) => tracing::warn!("세션 로그 기록 실패: {e:#}"),
                     }
                 }
                 if let Some(detector) = detector.as_mut() {
@@ -1073,6 +1103,7 @@ impl Worker {
                     .should_scan_screen(result.produced_output)
                     .then(|| active.screen_text());
                 if let Some(status) = detector.evaluate(screen.as_deref()) {
+                    status_updates.push((active.id(), status));
                     events.push(RuntimeEvent::SessionStatusChanged {
                         session: active.id(),
                         status,
@@ -1112,6 +1143,14 @@ impl Worker {
                     session: active.id(),
                     exit_code,
                 });
+            }
+        }
+        if let Some(pipe) = &mut self.persist {
+            for (session, offset) in log_offsets {
+                pipe.session_log_offset(session, offset);
+            }
+            for (session, status) in status_updates {
+                pipe.session_status(session, status);
             }
         }
         // 종료 세션의 로그 마감 (carry flush + exited 이벤트)

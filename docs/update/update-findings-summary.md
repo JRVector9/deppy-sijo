@@ -70,7 +70,7 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 | PR-U15 Output Pipeline Backpressure | Partial complete | Current wave | In-process runtime command queue is bounded and overflow surfaces as an error. PTY input queue policy and visible backpressure badge remain follow-up. |
 | PR-U16 File Watcher Debounce & Ignore Rules | Complete | Current wave | Default watcher ignores, debounce batching, `.env*` warning signal, and per-window invalidation cap added. |
 | PR-U17 Status Detector Cost Control | Partial complete | Current wave | Regex-empty sessions skip screen-text scans; detector cost stats added. Confidence/user override remain deferred. |
-| PR-U18 SQLite Write Batching | Foundation complete / runtime wiring pending | Current wave | Bounded/debounced `DbWriteWorker` and pending approval batch insert added; runtime/app hot-path rewiring remains follow-up. |
+| PR-U18 SQLite Write Batching | Complete for current follow-up | Current wave, PR-U18b | Bounded/debounced `DbWriteWorker`, pending approval batch insert, and runtime persistence status/log-offset hot-path wiring are implemented. Layout save remains synchronous. |
 | PR-U19 Remote Slow Consumer Backpressure | Complete | PR-U19 | Remote outbound durable queue is bounded, viewport slots coalesce, and slow durable overflow disconnects the affected client. |
 | PR-U20 Final Performance Gate | Report created / release approval pending | PR-U20, PR-U20b | `cargo run -p xtask -- perf-smoke` passes and `docs/performance/final-gate.md` now records Scenario A-E status. Release approval still requires GUI/remote soak measurements on release hardware. |
 | PR-U21 I18n Infrastructure | Complete | PR-U21 | `crates/i18n`, required locale catalogs, fallback/pseudo-locale support, config locale persistence, and `xtask i18n-check` added. |
@@ -83,8 +83,8 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 ## Release Blockers Remaining
 
 - Full PR-U20 Scenario A-E release-hardware measurements remain pending in Phase D, but the final-gate report now exists.
-- PR-U12 child process tree aggregation, PR-U18 runtime/app hot-path write
-  wiring, PR-U15 PTY input pressure UI, and PR-U17 status confidence/override
+- PR-U12 child process tree aggregation, PR-U15 PTY input pressure UI, and
+  PR-U17 status confidence/override
   remain separately scoped follow-ups.
 - Code triage now points PR-U20 follow-up to release-hardware measurement execution, not code changes.
 

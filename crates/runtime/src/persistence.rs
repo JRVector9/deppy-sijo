@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use deppy_core::{MuxTabId, MuxWindowId, SessionId};
 use persist::{PaneState, SessionRow, TabState, WindowState};
+use storage::{DbWriteHandle, DbWriteStatsSnapshot, DbWriteWorker, DbWriteWorkerConfig};
 
 /// InProcessRuntimeClient 생성 시 넘기는 영속 설정. None이면 영속 없음(테스트).
 #[derive(Debug, Clone)]
@@ -26,6 +27,10 @@ pub struct PersistConfig {
 pub(crate) struct PersistPipe {
     conn: rusqlite::Connection,
     workspace_id: String,
+    /// Optional batched writer for hot metadata paths. Spawn/session rows and
+    /// layout saves stay synchronous because later reads depend on them.
+    _write_worker: Option<DbWriteWorker>,
+    write_handle: Option<DbWriteHandle>,
     /// 이 실행의 mux window가 저장될 행 id — 이전 실행 것을 재사용해
     /// 실행마다 window 행이 누적되지 않게 한다.
     window_id: MuxWindowId,
@@ -56,9 +61,22 @@ impl PersistPipe {
             Some(w) => (w.id, w.tabs, w.active_tab),
             None => (MuxWindowId::new(), Vec::new(), None),
         };
+        let (write_worker, write_handle) =
+            match DbWriteWorker::spawn(&config.db_path, DbWriteWorkerConfig::default()) {
+                Ok(worker) => {
+                    let handle = worker.handle();
+                    (Some(worker), Some(handle))
+                }
+                Err(e) => {
+                    tracing::warn!("DB batch writer 비활성 (worker 시작 실패): {e:#}");
+                    (None, None)
+                }
+            };
         Ok(Self {
             conn,
             workspace_id: config.workspace_id.clone(),
+            _write_worker: write_worker,
+            write_handle,
             window_id,
             rows: HashMap::new(),
             restored_tabs,
@@ -112,8 +130,59 @@ impl PersistPipe {
             return;
         };
         row.status = persist::SESSION_STATUS_EXITED.to_owned();
+        if let Some(handle) = &self.write_handle {
+            match handle.try_update_session_status(row.id.clone(), row.status.clone()) {
+                Ok(()) => return,
+                Err(e) => tracing::warn!("세션 status batch enqueue 실패 — direct fallback: {e:#}"),
+            }
+        }
         if let Err(e) = persist::upsert_session(&self.conn, row) {
-            tracing::warn!("세션 영속 실패 (exit): {e:#}");
+            tracing::warn!("세션 영속 실패 (exit direct fallback): {e:#}");
+        }
+    }
+
+    pub(crate) fn session_status(&mut self, session_id: SessionId, status: session::SessionStatus) {
+        let Some(row) = self.rows.get_mut(&session_id) else {
+            return;
+        };
+        row.status = session_status_to_persist(status).to_owned();
+        if let Some(handle) = &self.write_handle {
+            match handle.try_update_session_status(row.id.clone(), row.status.clone()) {
+                Ok(()) => return,
+                Err(e) => tracing::warn!("세션 status batch enqueue 실패 — direct fallback: {e:#}"),
+            }
+        }
+        if let Err(e) = persist::upsert_session(&self.conn, row) {
+            tracing::warn!("세션 status 영속 실패 (direct fallback): {e:#}");
+        }
+    }
+
+    /// Redacted ANSI log offset progress. Hot output paths use the batched
+    /// writer; if enqueue fails, fall back to direct update so crash recovery
+    /// does not regress.
+    pub(crate) fn session_log_offset(&mut self, session: SessionId, offset: u64) {
+        let Some(row) = self.rows.get_mut(&session) else {
+            return;
+        };
+        row.last_log_offset = row.last_log_offset.max(offset);
+        if let Some(handle) = &self.write_handle {
+            match handle.try_update_session_log_offset(row.id.clone(), row.last_log_offset) {
+                Ok(()) => return,
+                Err(e) => {
+                    tracing::warn!("세션 log offset batch enqueue 실패 — direct fallback: {e:#}")
+                }
+            }
+        }
+        if let Err(e) = persist::update_session_log_offset(&self.conn, &row.id, row.last_log_offset)
+        {
+            tracing::warn!("세션 log offset 영속 실패 (direct fallback): {e:#}");
+        }
+    }
+
+    pub(crate) fn flush_async_writes(&self) -> anyhow::Result<Option<DbWriteStatsSnapshot>> {
+        match &self.write_handle {
+            Some(handle) => handle.flush().map(Some),
+            None => Ok(None),
         }
     }
 
@@ -159,5 +228,75 @@ impl PersistPipe {
         if let Err(e) = persist::save_window_layout(&mut self.conn, &self.workspace_id, &state) {
             tracing::warn!("mux layout 영속 실패: {e:#}");
         }
+    }
+}
+
+fn session_status_to_persist(status: session::SessionStatus) -> &'static str {
+    match status {
+        session::SessionStatus::Running => persist::SESSION_STATUS_RUNNING,
+        session::SessionStatus::Waiting => "waiting",
+        session::SessionStatus::NeedsApproval => "needs_approval",
+        session::SessionStatus::Error => "error",
+        session::SessionStatus::Done => "done",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-runtime-persist-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite3");
+        (dir, path)
+    }
+
+    #[test]
+    fn persist_pipe는_status와_log_offset을_batch_writer로_보낸다() {
+        let (dir, db_path) = temp_db("batch");
+        let db = storage::Db::open(&db_path).unwrap();
+        let workspace_id = db.create_workspace("runtime").unwrap();
+        drop(db);
+
+        let mut pipe = PersistPipe::open(&PersistConfig {
+            db_path: db_path.clone(),
+            workspace_id,
+        })
+        .unwrap();
+        let session = SessionId(1);
+        pipe.session_spawned(session, "shell", None, "shell", "/bin/sh", &[]);
+        pipe.session_status(session, session::SessionStatus::Waiting);
+        pipe.session_status(session, session::SessionStatus::Done);
+        pipe.session_log_offset(session, 12);
+        pipe.session_log_offset(session, 7);
+        pipe.session_log_offset(session, 128);
+
+        let stats = pipe.flush_async_writes().unwrap().unwrap();
+        assert_eq!(stats.status_enqueued, 2);
+        assert_eq!(stats.status_coalesced, 1);
+        assert_eq!(stats.status_flushed, 1);
+        assert_eq!(stats.log_offset_enqueued, 3);
+        assert_eq!(stats.log_offset_coalesced, 2);
+        assert_eq!(stats.log_offset_flushed, 1);
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (status, offset): (String, i64) = conn
+            .query_row("SELECT status, last_log_offset FROM sessions", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(status, "done");
+        assert_eq!(offset, 128);
+        drop(conn);
+        drop(pipe);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

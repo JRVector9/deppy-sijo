@@ -38,7 +38,7 @@ Recommended scope:
 
 ## PR-U18 Runtime/App Hot-path DB Write Batching Wiring
 
-Status: implement as a separate PR-U18b, not in the current patch set.
+Status: implemented in PR-U18b.
 
 Code checked:
 
@@ -56,11 +56,13 @@ Reason:
   rollback behavior for runtime persistence. It is implementable, but it touches
   runtime persistence contracts and should stay isolated.
 
-Recommended scope:
+Implemented scope:
 
-- Add optional `DbWriteHandle` to runtime persistence config.
-- Route status/log-offset burst paths through the handle.
-- Keep layout save synchronous unless a clear coalescing contract is added.
+- `PersistPipe` owns a `DbWriteWorker` and handle when persistence is enabled.
+- Runtime detector status/session-exit status and redacted log-offset progress
+  route through the batched handle.
+- Enqueue failures fall back to direct persistence.
+- Layout save remains synchronous.
 
 ## PR-U15 PTY Input Queue Policy / Visible Backpressure Badge
 

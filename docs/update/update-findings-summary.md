@@ -76,14 +76,13 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 | PR-U23 Runtime Message Localization | Pending | None | Not implemented. |
 | PR-U24 I18n / CJK Layout Gate | Pending | None | Requires i18n-check and CJK layout evidence. |
 | PR-U25 Global Activity View | Pending | None | Not implemented. |
-| PR-U26 Terminal Dirty-Range Partial Render | Planned | `docs/build/PR-U26-terminal-dirty-range-partial-render.md` | Design document exists; implementation pending before PR-U20 if frame p95 requires it. |
+| PR-U26 Terminal Dirty-Range Partial Render | Complete | PR-U26 / `a8a7239`, review fix `64660c8` | Dirty row propagation, per-session row render cache, remote delta dirty range restoration, and keyframe full-dirty handling are implemented and verified. |
 
 ## Release Blockers Remaining
 
-- PR-U13, PR-U15, and full PR-U20 Scenario A-E measurements remain pending in Phase D.
+- PR-U13 and full PR-U20 Scenario A-E measurements remain pending in Phase D.
 - PR-U12 child process tree aggregation and PR-U18 runtime/app hot-path write wiring remain follow-up.
 - PR-U21 through PR-U24 i18n infrastructure, message boundary, and layout gate are pending.
-- PR-U26 dirty-range partial render is documented but not implemented.
 
 ## Deferred / Backlog Items
 
@@ -96,8 +95,8 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 
 ## Next Operating Wave
 
-1. Finish PR-U16 and PR-U18 because they are already isolated by file ownership.
-2. Split remaining PR-U13 and PR-U15 carefully because both touch runtime worker state.
-3. Run full PR-U20 Scenario A-E measurements after PR-U13/PR-U15 and PR-U26 land.
-4. Start i18n only after the performance wave has stable runtime/event contracts.
+1. Implement PR-U13 Workspace Auto Suspend.
+2. Run full PR-U20 Scenario A-E measurements after PR-U13 lands.
+3. Start PR-U21 through PR-U24 i18n work after the performance wave has stable runtime/event contracts.
+4. Implement PR-U25 Global Activity View after resource events and i18n message boundaries are stable.
 5. Run final gates in order: PR-U11, PR-U20, PR-U24.

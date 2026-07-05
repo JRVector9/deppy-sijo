@@ -21,7 +21,10 @@ pub use event::{MessageArg, MessagePayload, RuntimeEvent, SpawnKind};
 pub use in_process::InProcessRuntimeClient;
 pub use mux::{LayoutNode, MuxSnapshot, PaneSnapshot, TabSnapshot};
 pub use persistence::PersistConfig;
-pub use pty::ProcessIdentitySource;
+pub use pty::{
+    ProcessIdentitySource, PtyInputEnqueueResult, PtyInputPressure, PtyInputQueuePolicy,
+    PtyInputRejectReason,
+};
 pub use remote::{RemoteRuntimeClient, RemoteRuntimeServer, TofuOutcome};
 pub use resource_monitor::{
     ProcessResourceMonitor, ProcessResourceMonitorConfig, ProcessResourceSnapshot,

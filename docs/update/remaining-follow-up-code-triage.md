@@ -69,7 +69,7 @@ Implemented scope:
 
 ## PR-U15 PTY Input Queue Policy / Visible Backpressure Badge
 
-Status: defer pending deadlock-safe design.
+Status: implemented in PR-U15c.
 
 Code checked:
 
@@ -86,11 +86,13 @@ Reason:
 - A visible badge requires a new runtime/UI pressure signal; adding a cap without
   a deadlock-safe write policy can regress paste/input reliability.
 
-Recommended scope:
+Implemented scope:
 
-- Design a byte-budgeted PTY input queue with explicit overflow result.
-- Surface pressure through runtime events or existing activity view.
-- Preserve bracketed paste, terminal DnD paste, and CJK input tests.
+- Added byte/message-budgeted PTY input queue with non-blocking enqueue.
+- Added explicit accepted/backpressured/rejected result and runtime pressure
+  event.
+- Workspace and Global Activity show localized pressure state.
+- Bracketed paste paths remain all-or-nothing per payload.
 
 ## PR-U17 Status Detector Confidence / User Override
 

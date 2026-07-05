@@ -5,6 +5,7 @@ pub struct ActivityWorkspaceRow {
     pub state: ActivityWorkspaceState,
     pub session_count: usize,
     pub pending_events: usize,
+    pub input_pressure: Option<runtime::PtyInputPressure>,
     pub backgrounded_for_secs: Option<u64>,
     pub auto_suspend_remaining_secs: Option<u64>,
     pub resource: Option<runtime::ProcessResourceSnapshot>,
@@ -74,7 +75,7 @@ impl ActivityUi {
                             ui.label(&row.name);
                             state_label(ui, catalog, row);
                             ui.label(row.session_count.to_string());
-                            ui.label(row.pending_events.to_string());
+                            ui.label(queue_label(catalog, row));
                             ui.label(resource_label(
                                 catalog,
                                 row.resource.as_ref(),
@@ -180,13 +181,33 @@ fn resource_label(
     label
 }
 
+fn queue_label(catalog: &i18n::Catalog, row: &ActivityWorkspaceRow) -> String {
+    let mut label = row.pending_events.to_string();
+    if let Some(pressure) = &row.input_pressure {
+        label.push_str(" · ");
+        label.push_str(&catalog.t(
+            "activity.input_pressure",
+            &[
+                ("queued", &format_bytes(pressure.queued_bytes as u64)),
+                ("max", &format_bytes(pressure.max_bytes as u64)),
+            ],
+        ));
+    }
+    label
+}
+
 fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * MIB;
     if bytes >= GIB {
         format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    } else {
+    } else if bytes >= MIB {
         format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -244,5 +265,33 @@ mod tests {
         assert!(label.contains("Child CPU 25.0%"));
         assert!(label.contains("128.0 MiB"));
         assert!(label.contains("High"));
+    }
+
+    #[test]
+    fn queue_label_includes_input_pressure() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let row = ActivityWorkspaceRow {
+            id: "ws".into(),
+            name: "workspace".into(),
+            state: ActivityWorkspaceState::Active,
+            session_count: 1,
+            pending_events: 3,
+            input_pressure: Some(runtime::PtyInputPressure {
+                attempted_bytes: 10,
+                queued_bytes: 1024,
+                queued_messages: 1,
+                max_bytes: 4 * 1024,
+                max_messages: 16,
+                reason: runtime::PtyInputRejectReason::QueueFull,
+            }),
+            backgrounded_for_secs: None,
+            auto_suspend_remaining_secs: None,
+            resource: None,
+            session_resources: Vec::new(),
+        };
+        let label = queue_label(&catalog, &row);
+        assert!(label.contains('3'));
+        assert!(label.contains("input"));
+        assert!(label.contains("1.0 KiB"));
     }
 }

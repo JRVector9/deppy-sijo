@@ -1,7 +1,9 @@
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use deppy_core::SessionId;
-use pty::{CommandSpec, PortablePtyBackend, ProcessIdentity, PtyBackend, PtySession};
+use pty::{
+    CommandSpec, PortablePtyBackend, ProcessIdentity, PtyBackend, PtyInputEnqueueResult, PtySession,
+};
 use terminal::{
     AlacrittyBackend, CellRange, TerminalBackend, TerminalCacheClass, TerminalCacheEvent,
     TerminalCacheFootprint, TerminalViewportSnapshot,
@@ -140,10 +142,16 @@ impl Session {
                                 responded += changes.pty_responses.len();
                                 if responded > RESPONSE_PER_PUMP_CAP {
                                     tracing::warn!("터미널 질의 응답 폭주 — 이번 tick 초과분 버림");
-                                } else if let Some(pty) = &mut self.pty
-                                    && let Err(e) = pty.write_input(&changes.pty_responses)
-                                {
-                                    tracing::warn!("터미널 질의 응답 전송 실패: {e:#}");
+                                } else if let Some(pty) = &mut self.pty {
+                                    match pty.write_input(&changes.pty_responses) {
+                                        Ok(result) if result.is_accepted() => {}
+                                        Ok(result) => tracing::warn!(
+                                            "터미널 질의 응답 전송 pressure: {result:?}"
+                                        ),
+                                        Err(e) => {
+                                            tracing::warn!("터미널 질의 응답 전송 실패: {e:#}");
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -213,12 +221,14 @@ impl Session {
         self.backend.screen_text()
     }
 
-    pub fn write_input(&mut self, bytes: &[u8]) {
-        if let Some(pty) = &mut self.pty
-            && let Err(e) = pty.write_input(bytes)
-        {
-            tracing::warn!("PTY 입력 실패: {e:#}");
+    pub fn write_input(&mut self, bytes: &[u8]) -> Option<PtyInputEnqueueResult> {
+        if let Some(pty) = &mut self.pty {
+            match pty.write_input(bytes) {
+                Ok(result) => return Some(result),
+                Err(e) => tracing::warn!("PTY 입력 실패: {e:#}"),
+            }
         }
+        None
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> Option<TerminalCacheEvent> {

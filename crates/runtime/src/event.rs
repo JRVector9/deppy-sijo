@@ -3,6 +3,7 @@ use std::sync::Arc;
 use terminal::TerminalViewportSnapshot;
 
 use mux::MuxSnapshot;
+use pty::PtyInputPressure;
 use session::SessionStatus;
 
 use crate::command::SessionId;
@@ -103,6 +104,12 @@ pub enum RuntimeEvent {
     ResourceUsage {
         snapshot: ProcessResourceSnapshot,
         session_usage: Vec<SessionResourceUsage>,
+    },
+    /// PTY input queue pressure. UI may show this as a visible backpressure
+    /// signal, but input is never silently dropped.
+    PtyInputPressure {
+        session: SessionId,
+        pressure: PtyInputPressure,
     },
 }
 

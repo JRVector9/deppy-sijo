@@ -1,13 +1,17 @@
 //! PTY 격리 crate (설계문서 1.2 / 9장).
 //! portable-pty 타입은 이 crate 밖으로 노출하지 않는다 — PtyBackend trait으로 감싼다.
 
+mod input_queue;
 mod process_identity;
 
 use std::io::{Read, Write};
-use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 use anyhow::Context;
 
+pub use input_queue::{
+    PtyInputEnqueueResult, PtyInputPressure, PtyInputQueuePolicy, PtyInputRejectReason,
+};
 pub use process_identity::{ProcessIdentity, ProcessIdentitySource};
 
 /// 실행할 프로그램. portable-pty CommandBuilder를 노출하지 않기 위한 최소 스펙.
@@ -42,7 +46,7 @@ pub trait PtySession: Send {
     /// 채널 disconnect는 EOF(프로세스 종료 또는 PTY 닫힘)를 뜻한다.
     fn take_output(&mut self) -> Option<Receiver<Vec<u8>>>;
     fn process_identity(&self) -> ProcessIdentity;
-    fn write_input(&mut self, bytes: &[u8]) -> anyhow::Result<()>;
+    fn write_input(&mut self, bytes: &[u8]) -> anyhow::Result<PtyInputEnqueueResult>;
     fn resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()>;
     fn try_exit_code(&mut self) -> anyhow::Result<Option<u32>>;
     fn kill(&mut self) -> anyhow::Result<()>;
@@ -56,7 +60,8 @@ struct PortablePtySession {
     /// 입력은 writer 전용 스레드가 쓴다 — worker가 blocking write에 매달리지 않는다.
     /// (출력 폭주로 child의 stdout이 막힌 상태에서 worker가 대량 paste를
     /// 동기 write하면 reader(backpressure)와 맞물려 full-duplex deadlock — codex P1)
-    input_tx: Option<Sender<Vec<u8>>>,
+    input_tx: Option<SyncSender<Vec<u8>>>,
+    input_queue: input_queue::PtyInputQueueState,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     output: Option<Receiver<Vec<u8>>>,
 }
@@ -154,15 +159,19 @@ impl PtyBackend for PortablePtyBackend {
             return Err(e).context("PTY reader thread 생성 실패");
         }
 
-        // 입력 전용 writer thread — write_input은 채널 send만 하고 즉시 리턴.
-        // 채널은 unbounded: 입력(타이핑/paste)은 출력과 달리 사용자 규모라
-        // 무한 누적 위험이 낮고, 여기서 backpressure를 주면 위 deadlock이 돌아온다.
-        let (input_tx, input_rx) = channel::<Vec<u8>>();
+        // 입력 전용 writer thread — write_input은 try_send만 하고 즉시 리턴.
+        // byte/message budget으로 무한 누적을 막되 writer thread가 blocking write를
+        // 소유하므로 runtime worker와 reader backpressure가 맞물린 deadlock은 피한다.
+        let input_policy = PtyInputQueuePolicy::default();
+        let input_queue = input_queue::PtyInputQueueState::new(input_policy);
+        let writer_queue = input_queue.clone();
+        let (input_tx, input_rx) = sync_channel::<Vec<u8>>(input_policy.max_messages.max(1));
         let writer_thread =
             std::thread::Builder::new()
                 .name("pty-writer".into())
                 .spawn(move || {
                     for bytes in input_rx {
+                        let len = bytes.len();
                         if writer
                             .write_all(&bytes)
                             .and_then(|()| writer.flush())
@@ -170,9 +179,12 @@ impl PtyBackend for PortablePtyBackend {
                         {
                             // PTY가 닫힘 — 세션 종료 경로가 곧 정리한다
                             tracing::debug!("PTY 입력 쓰기 실패 — writer 종료");
+                            writer_queue.complete(len);
                             break;
                         }
+                        writer_queue.complete(len);
                     }
+                    writer_queue.close();
                 });
         if let Err(e) = writer_thread {
             kill_and_reap_bounded(&mut child);
@@ -182,6 +194,7 @@ impl PtyBackend for PortablePtyBackend {
         Ok(Box::new(PortablePtySession {
             master: pair.master,
             input_tx: Some(input_tx),
+            input_queue,
             child,
             output: Some(rx),
         }))
@@ -236,15 +249,24 @@ impl PtySession for PortablePtySession {
         }
     }
 
-    fn write_input(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+    fn write_input(&mut self, bytes: &[u8]) -> anyhow::Result<PtyInputEnqueueResult> {
         // writer thread로 위임 — worker가 blocking write에 매달리지 않는다.
-        // 쓰기 에러는 비동기(writer thread 로그)로 넘어간다: 여기서의 실패는
-        // "세션이 이미 끝남"뿐이다.
-        self.input_tx
-            .as_ref()
-            .context("PTY writer가 이미 종료됨")?
-            .send(bytes.to_vec())
-            .map_err(|_| anyhow::anyhow!("PTY writer가 이미 종료됨"))
+        // 실제 write 에러는 비동기(writer thread 로그)로 넘어간다. 여기서는 queue
+        // pressure/closed 상태를 명시적으로 반환한다.
+        let Some(tx) = self.input_tx.as_ref() else {
+            let policy = self.input_queue.policy();
+            return Ok(PtyInputEnqueueResult::Rejected {
+                pressure: PtyInputPressure {
+                    attempted_bytes: bytes.len(),
+                    queued_bytes: 0,
+                    queued_messages: 0,
+                    max_bytes: policy.max_bytes,
+                    max_messages: policy.max_messages,
+                    reason: PtyInputRejectReason::SessionClosed,
+                },
+            });
+        };
+        input_queue::enqueue_input(tx, &self.input_queue, bytes)
     }
 
     fn resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()> {

@@ -55,6 +55,7 @@ struct SessionView {
     exit_code: Option<Option<u32>>,
     /// status detector 감지 상태 (agent만, PR-12)
     status: Option<SessionStatus>,
+    input_pressure: Option<runtime::PtyInputPressure>,
 }
 
 impl WorkspaceUi {
@@ -151,6 +152,19 @@ impl WorkspaceUi {
                     if self.session_alive(*session) {
                         self.sessions.entry(*session).or_default().status = Some(*status);
                     }
+                }
+                RuntimeEvent::PtyInputPressure { session, pressure } => {
+                    if self.session_alive(*session) {
+                        self.sessions.entry(*session).or_default().input_pressure =
+                            Some(pressure.clone());
+                    }
+                    self.error = Some(catalog.t(
+                        "workspace.input_pressure",
+                        &[
+                            ("queued", &format_bytes(pressure.queued_bytes as u64)),
+                            ("max", &format_bytes(pressure.max_bytes as u64)),
+                        ],
+                    ));
                 }
                 RuntimeEvent::ShellSpawned { .. } => {
                     self.pending_spawns = self.pending_spawns.saturating_sub(1);
@@ -981,6 +995,15 @@ fn status_icon(status: SessionStatus) -> &'static str {
         SessionStatus::NeedsApproval => "✋",
         SessionStatus::Error => "❌",
         SessionStatus::Done => "✅",
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else {
+        format!("{bytes} B")
     }
 }
 

@@ -67,7 +67,7 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 | PR-U12 Process Resource Monitor | Complete for current follow-up | Current wave, PR-U12c | Low-cadence app process CPU/RSS sampler plus per-session child process CPU/RSS aggregation are implemented and surfaced in Global Activity. |
 | PR-U13 Workspace Auto Suspend | Complete | PR-U13 | Warm workspaces now record background time and auto-suspend after timeout, draining final notifications before worker shutdown. |
 | PR-U14 Terminal Cache Budget Manager | Complete | Current wave | Visible/hidden/exited cache classes, byte/line budgets, trim events, and global exited archive pressure added. |
-| PR-U15 Output Pipeline Backpressure | Partial complete | Current wave | In-process runtime command queue is bounded and overflow surfaces as an error. PTY input queue policy and visible backpressure badge remain follow-up. |
+| PR-U15 Output Pipeline Backpressure | Complete for current follow-up | Current wave, PR-U15c | In-process runtime command queue is bounded; PTY input now has byte/message policy, explicit pressure events, and visible Workspace/Activity pressure signals. |
 | PR-U16 File Watcher Debounce & Ignore Rules | Complete | Current wave | Default watcher ignores, debounce batching, `.env*` warning signal, and per-window invalidation cap added. |
 | PR-U17 Status Detector Cost Control | Partial complete | Current wave | Regex-empty sessions skip screen-text scans; detector cost stats added. Confidence/user override remain deferred. |
 | PR-U18 SQLite Write Batching | Complete for current follow-up | Current wave, PR-U18b | Bounded/debounced `DbWriteWorker`, pending approval batch insert, and runtime persistence status/log-offset hot-path wiring are implemented. Layout save remains synchronous. |
@@ -83,8 +83,7 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 ## Release Blockers Remaining
 
 - Full PR-U20 Scenario A-E release-hardware measurements remain pending in Phase D, but the final-gate report now exists.
-- PR-U15 PTY input pressure UI and PR-U17 status confidence/override
-  remain separately scoped follow-ups.
+- PR-U17 status confidence/override remains a separately scoped follow-up.
 - Code triage now points PR-U20 follow-up to release-hardware measurement execution, not code changes.
 
 ## Deferred / Backlog Items

@@ -230,6 +230,8 @@ struct WorkspaceRuntime {
     resource_usage: Option<runtime::ProcessResourceSnapshot>,
     /// 마지막 worker child-process resource samples. Runtime이 집계한 값만 보관한다.
     session_resource_usage: Vec<runtime::SessionResourceUsage>,
+    /// 마지막 PTY input pressure signal. UI는 런타임 이벤트만 보관한다.
+    input_pressure: Option<runtime::PtyInputPressure>,
     /// Warm으로 내려간 시각. 일정 시간 이후 자동 Suspended(워커 shutdown)로 내린다.
     backgrounded_at: Option<std::time::Instant>,
 }
@@ -472,6 +474,7 @@ impl App {
             session_titles: std::collections::HashMap::new(),
             resource_usage: None,
             session_resource_usage: Vec::new(),
+            input_pressure: None,
             backgrounded_at: None,
         }
     }
@@ -782,6 +785,7 @@ impl App {
                         state: ui::activity::ActivityWorkspaceState::Active,
                         session_count: self.active.workspace_ui.session_entries().len(),
                         pending_events: self.active.pending_events.len(),
+                        input_pressure: self.active.input_pressure.clone(),
                         backgrounded_for_secs: None,
                         auto_suspend_remaining_secs: None,
                         resource: self.active.resource_usage,
@@ -803,6 +807,7 @@ impl App {
                         state: ui::activity::ActivityWorkspaceState::Warm,
                         session_count: rt.session_titles.len(),
                         pending_events: rt.pending_events.len(),
+                        input_pressure: rt.input_pressure.clone(),
                         backgrounded_for_secs: elapsed.map(|duration| duration.as_secs()),
                         auto_suspend_remaining_secs: remaining,
                         resource: rt.resource_usage,
@@ -815,6 +820,7 @@ impl App {
                     state: ui::activity::ActivityWorkspaceState::Suspended,
                     session_count: 0,
                     pending_events: 0,
+                    input_pressure: None,
                     backgrounded_for_secs: None,
                     auto_suspend_remaining_secs: None,
                     resource: None,
@@ -1056,6 +1062,9 @@ impl App {
             {
                 rt.resource_usage = Some(*snapshot);
                 rt.session_resource_usage = session_usage.clone();
+            }
+            if let runtime::RuntimeEvent::PtyInputPressure { pressure, .. } = event {
+                rt.input_pressure = Some(pressure.clone());
             }
         }
     }

@@ -618,10 +618,18 @@ impl Worker {
             }
             RuntimeCommand::WriteInput { session, bytes } => {
                 if let Some(active) = self.sessions.get_mut(&session) {
-                    active.write_input(&bytes);
-                    // 사용자 입력 = 화면 프롬프트에 대한 응답 신호 (status detector)
-                    if let Some(detector) = self.detectors.get_mut(&session) {
-                        detector.on_input();
+                    match active.write_input(&bytes) {
+                        Some(pty::PtyInputEnqueueResult::Accepted) => {
+                            // 사용자 입력 = 화면 프롬프트에 대한 응답 신호 (status detector)
+                            if let Some(detector) = self.detectors.get_mut(&session) {
+                                detector.on_input();
+                            }
+                        }
+                        Some(pty::PtyInputEnqueueResult::Backpressured { pressure })
+                        | Some(pty::PtyInputEnqueueResult::Rejected { pressure }) => {
+                            self.emit(RuntimeEvent::PtyInputPressure { session, pressure });
+                        }
+                        None => {}
                     }
                 }
             }
@@ -2289,6 +2297,45 @@ mod tests {
         });
         assert!(usage.process_count >= 1);
         assert!(usage.rss_bytes > 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn oversized_input은_pressure_event로_surface된다() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("input-pressure"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            _ => None,
+        });
+        client
+            .send_command(RuntimeCommand::WriteInput {
+                session,
+                bytes: vec![b'x'; pty::PtyInputQueuePolicy::default().max_bytes + 1],
+            })
+            .unwrap();
+        let pressure = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::PtyInputPressure {
+                session: pressure_session,
+                pressure,
+            } if *pressure_session == session => Some(pressure.clone()),
+            _ => None,
+        });
+        assert_eq!(pressure.reason, pty::PtyInputRejectReason::PayloadTooLarge);
     }
 
     #[test]

@@ -2914,6 +2914,7 @@ mod tests {
             RuntimeEvent::MuxUpdated { .. } => "MuxUpdated",
             RuntimeEvent::SessionStatusChanged { .. } => "SessionStatusChanged",
             RuntimeEvent::ResourceUsage { .. } => "ResourceUsage",
+            RuntimeEvent::PtyInputPressure { .. } => "PtyInputPressure",
         }
     }
 

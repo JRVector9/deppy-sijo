@@ -13,6 +13,7 @@ pub struct Config {
     pub terminal: TerminalConfig,
     pub performance: PerformanceConfig,
     pub remote: RemoteConfig,
+    pub i18n: I18nConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -39,6 +40,21 @@ pub enum Theme {
     System,
     Light,
     Dark,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct I18nConfig {
+    /// BCP-47 locale tag. Unknown values normalize to the fallback locale.
+    pub locale: String,
+}
+
+impl Default for I18nConfig {
+    fn default() -> Self {
+        Self {
+            locale: i18n::FALLBACK_LOCALE.to_owned(),
+        }
+    }
 }
 
 impl Theme {
@@ -132,6 +148,7 @@ impl Config {
             .performance
             .output_batch_ms
             .clamp(MIN_OUTPUT_BATCH_MS, 1_000);
+        self.i18n.locale = i18n::normalize_locale(&self.i18n.locale);
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
@@ -188,8 +205,22 @@ mod tests {
         assert_eq!(parsed.ui.theme, Theme::Dark);
         assert_eq!(parsed.terminal.scrollback_lines, 10_000);
         assert_eq!(parsed.performance.output_batch_ms, 25);
+        assert_eq!(parsed.i18n.locale, i18n::FALLBACK_LOCALE);
         // 구 config(file_tree_enabled 없음)도 기본 true (§6 serde 기본)
         assert!(parsed.ui.file_tree_enabled);
+    }
+
+    #[test]
+    fn locale_설정은_저장되고_알수없는_locale은_fallback() {
+        let mut config = Config::default();
+        config.i18n.locale = "ja-JP".to_owned();
+        let text = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.i18n.locale, "ja-JP");
+
+        let mut unknown: Config = toml::from_str("[i18n]\nlocale = \"xx-YY\"\n").unwrap();
+        unknown.normalize();
+        assert_eq!(unknown.i18n.locale, i18n::FALLBACK_LOCALE);
     }
 
     #[test]

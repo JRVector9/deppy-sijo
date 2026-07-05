@@ -18,6 +18,9 @@
 //! `cargo run -p xtask -- perf-smoke`
 //!   현재 자동화 가능한 performance/backpressure smoke tests를 실행한다.
 //!
+//! `cargo run -p xtask -- i18n-check`
+//!   필수 locale key completeness, fallback, pseudo-locale smoke tests를 실행한다.
+//!
 //! Cargo.toml의 `path = "../<dir>"` 로컬 의존만 본다(외부 crate는 무관). crate 식별은
 //! 디렉터리명 기준(예: crates/core의 패키지명은 deppy-core지만 여기선 "core").
 
@@ -82,8 +85,9 @@ fn main() -> anyhow::Result<()> {
         "smoke-db-migrations" => smoke_db_migrations(),
         "security-scan" => security_scan(),
         "perf-smoke" => perf_smoke(),
+        "i18n-check" => i18n_check(),
         other => bail!(
-            "알 수 없는 명령 '{other}' — 사용법: cargo run -p xtask -- check-deps|check-boundary|smoke-db-migrations|security-scan|perf-smoke"
+            "알 수 없는 명령 '{other}' — 사용법: cargo run -p xtask -- check-deps|check-boundary|smoke-db-migrations|security-scan|perf-smoke|i18n-check"
         ),
     }
 }
@@ -113,6 +117,13 @@ fn perf_smoke() -> anyhow::Result<()> {
     run_cargo(&["test", "-p", "runtime", "backpressure"])?;
     run_cargo(&["test", "-p", "runtime", "hidden"])?;
     println!("perf-smoke OK");
+    Ok(())
+}
+
+fn i18n_check() -> anyhow::Result<()> {
+    run_cargo(&["test", "-p", "i18n"])?;
+    run_cargo(&["test", "-p", "deppy-sijo", "locale_설정"])?;
+    println!("i18n-check OK");
     Ok(())
 }
 

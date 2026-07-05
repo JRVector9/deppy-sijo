@@ -18,6 +18,7 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 rusqlite = { workspace = true }
 uuid = { workspace = true }
+i18n = { workspace = true }
 audit = { path = "../audit" }
 auth = { path = "../auth" }
 mcp = { path = "../mcp" }
@@ -37,4 +38,3 @@ notify = { workspace = true }
 # renamex_np(RENAME_EXCL) — 덮어쓰기 금지 rename (§9-5 TOCTOU 회피)
 libc = { workspace = true }
 muda = "0.17"
-

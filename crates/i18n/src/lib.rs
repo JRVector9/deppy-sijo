@@ -1,0 +1,193 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+pub const FALLBACK_LOCALE: &str = "en-US";
+pub const PSEUDO_LOCALE: &str = "en-XA";
+pub const REQUIRED_LOCALES: &[&str] = &["en-US", "ja-JP", "zh-Hans", "zh-Hant"];
+pub const OPTIONAL_LOCALES: &[&str] = &["ko-KR"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Catalog {
+    locale: String,
+    primary: BTreeMap<String, String>,
+    fallback: BTreeMap<String, String>,
+}
+
+impl Catalog {
+    pub fn load(locale: &str) -> anyhow::Result<Self> {
+        if locale == PSEUDO_LOCALE {
+            let fallback = parse_locale_file(FALLBACK_LOCALE, locale_source(FALLBACK_LOCALE)?)?;
+            let primary = fallback
+                .iter()
+                .map(|(key, value)| (key.clone(), pseudo_localize(value)))
+                .collect();
+            return Ok(Self {
+                locale: locale.to_owned(),
+                primary,
+                fallback,
+            });
+        }
+
+        let normalized = normalize_locale(locale);
+        let fallback = parse_locale_file(FALLBACK_LOCALE, locale_source(FALLBACK_LOCALE)?)?;
+        let primary = if normalized == FALLBACK_LOCALE {
+            fallback.clone()
+        } else {
+            parse_locale_file(&normalized, locale_source(&normalized)?)?
+        };
+        Ok(Self {
+            locale: normalized,
+            primary,
+            fallback,
+        })
+    }
+
+    pub fn locale(&self) -> &str {
+        &self.locale
+    }
+
+    pub fn t(&self, key: &str, args: &[(&str, &str)]) -> String {
+        let template = self
+            .primary
+            .get(key)
+            .or_else(|| self.fallback.get(key))
+            .map(String::as_str)
+            .unwrap_or(key);
+        interpolate(template, args)
+    }
+
+    pub fn loaded_locale_count(&self) -> usize {
+        if self.locale == FALLBACK_LOCALE || self.locale == PSEUDO_LOCALE {
+            1
+        } else {
+            2
+        }
+    }
+}
+
+pub fn normalize_locale(locale: &str) -> String {
+    if locale == PSEUDO_LOCALE || is_supported_locale(locale) {
+        locale.to_owned()
+    } else {
+        FALLBACK_LOCALE.to_owned()
+    }
+}
+
+pub fn is_supported_locale(locale: &str) -> bool {
+    REQUIRED_LOCALES.contains(&locale) || OPTIONAL_LOCALES.contains(&locale)
+}
+
+pub fn validate_required_locale_completeness() -> anyhow::Result<()> {
+    let fallback = parse_locale_file(FALLBACK_LOCALE, locale_source(FALLBACK_LOCALE)?)?;
+    let fallback_keys: BTreeSet<&str> = fallback.keys().map(String::as_str).collect();
+    for locale in REQUIRED_LOCALES {
+        let entries = parse_locale_file(locale, locale_source(locale)?)?;
+        let keys: BTreeSet<&str> = entries.keys().map(String::as_str).collect();
+        let missing: Vec<&str> = fallback_keys.difference(&keys).copied().collect();
+        let extra: Vec<&str> = keys.difference(&fallback_keys).copied().collect();
+        if !missing.is_empty() || !extra.is_empty() {
+            anyhow::bail!("{locale} locale key mismatch: missing={missing:?} extra={extra:?}");
+        }
+    }
+    Ok(())
+}
+
+fn locale_source(locale: &str) -> anyhow::Result<&'static str> {
+    match locale {
+        "en-US" => Ok(include_str!("../locales/en-US/messages.txt")),
+        "ja-JP" => Ok(include_str!("../locales/ja-JP/messages.txt")),
+        "zh-Hans" => Ok(include_str!("../locales/zh-Hans/messages.txt")),
+        "zh-Hant" => Ok(include_str!("../locales/zh-Hant/messages.txt")),
+        "ko-KR" => Ok(include_str!("../locales/ko-KR/messages.txt")),
+        _ => anyhow::bail!("unsupported locale: {locale}"),
+    }
+}
+
+fn parse_locale_file(locale: &str, source: &str) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut entries = BTreeMap::new();
+    for (line_no, raw) in source.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            anyhow::bail!("{locale}:{} invalid locale line: {raw}", line_no + 1);
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() {
+            anyhow::bail!("{locale}:{} empty locale key", line_no + 1);
+        }
+        if entries.insert(key.to_owned(), value.to_owned()).is_some() {
+            anyhow::bail!("{locale}:{} duplicate locale key: {key}", line_no + 1);
+        }
+    }
+    Ok(entries)
+}
+
+fn interpolate(template: &str, args: &[(&str, &str)]) -> String {
+    let mut out = template.to_owned();
+    for (key, value) in args {
+        out = out.replace(&format!("{{{key}}}"), value);
+    }
+    out
+}
+
+fn pseudo_localize(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 8);
+    out.push('[');
+    for ch in value.chars() {
+        let mapped = match ch {
+            'a' | 'A' => 'á',
+            'e' | 'E' => 'é',
+            'i' | 'I' => 'í',
+            'o' | 'O' => 'ó',
+            'u' | 'U' => 'ú',
+            'c' | 'C' => 'ç',
+            'n' | 'N' => 'ñ',
+            _ => ch,
+        };
+        out.push(mapped);
+    }
+    out.push_str(" !!]");
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn required_locales_have_complete_keys() {
+        validate_required_locale_completeness().unwrap();
+    }
+
+    #[test]
+    fn fallback_locale_normalizes_unknown_locale() {
+        assert_eq!(normalize_locale("xx-YY"), FALLBACK_LOCALE);
+    }
+
+    #[test]
+    fn catalog_uses_primary_then_fallback_and_args() {
+        let catalog = Catalog::load("en-US").unwrap();
+        assert_eq!(
+            catalog.t("app.error", &[("message", "boom")]),
+            "Error: boom"
+        );
+        assert_eq!(catalog.t("missing.key", &[]), "missing.key");
+    }
+
+    #[test]
+    fn non_fallback_catalog_loads_current_and_fallback_only() {
+        let catalog = Catalog::load("ja-JP").unwrap();
+        assert_eq!(catalog.locale(), "ja-JP");
+        assert_eq!(catalog.loaded_locale_count(), 2);
+    }
+
+    #[test]
+    fn pseudo_locale_is_generated_from_fallback() {
+        let catalog = Catalog::load(PSEUDO_LOCALE).unwrap();
+        let value = catalog.t("app.title", &[]);
+        assert!(value.starts_with('['));
+        assert!(value.ends_with("!!]"));
+    }
+}

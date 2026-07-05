@@ -59,11 +59,11 @@ impl AgentsUi {
         }
     }
 
-    /// 런타임에 묶인 pending 실행 상태를 비운다 (workspace 전환으로 워커가 바뀔 때).
-    /// 안 하면 이전 워커의 AgentSpawned를 못 받아 pending_launches가 남아 50ms
-    /// repaint가 무한 예약된다 (codex 리뷰).
-    pub fn clear_pending(&mut self) {
-        self.pending_launches = 0;
+    /// pending 카운트를 회수하며 비운다 — workspace 전환 시 물러나는 workspace의
+    /// WorkspaceRuntime으로 이관해 "agent spawn 응답 대기 = live" 판정에 쓴다
+    /// (codex: agent spawn 직후 전환 race에서 suspend가 새 PTY를 죽이는 창 봉합).
+    pub fn take_pending(&mut self) -> u32 {
+        std::mem::take(&mut self.pending_launches)
     }
 
     pub fn toggle(&mut self) {

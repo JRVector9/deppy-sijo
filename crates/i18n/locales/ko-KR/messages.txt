@@ -111,6 +111,7 @@ notification.session.needs_approval = 승인 필요: {title}
 notification.session.error = 오류: {title}
 notification.session.done = 완료: {title}
 runtime.spawn_failed.shell = 셸 시작 실패: {error}
+runtime.spawn_failed.suspended = workspace가 일시 중단되어 세션을 시작하지 않았습니다
 runtime.spawn_failed.agent = 에이전트 시작 실패: {error}
 runtime.spawn_failed.agent_secret = 에이전트 secret resolve 실패 (credential {credential_id}): {error}
 runtime.split.target_missing = 분할 대상 pane이 이미 없습니다.

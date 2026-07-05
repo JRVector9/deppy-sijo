@@ -236,6 +236,11 @@ struct WorkspaceRuntime {
     backgrounded_at: Option<std::time::Instant>,
     /// live 세션 추적 (suspend 보호 — 이벤트 스트림에서 갱신).
     live: LiveSessionTracker,
+    /// 워커 생성 시각 — 첫 MuxUpdated 관측 전 suspend 유예(RESTORE 관측 창) 판정용.
+    created: std::time::Instant,
+    /// 응답(AgentSpawned/SpawnFailed) 대기 중인 agent spawn 수 — 전환 시 전역
+    /// AgentsUi에서 이관받는다 (agent spawn 직후 전환 race의 live 판정).
+    pending_agent_spawns: u32,
 }
 
 impl WorkspaceRuntime {
@@ -243,9 +248,33 @@ impl WorkspaceRuntime {
     /// 에이전트든 떠 있는 것 자체가 실행 중이다. 이런 workspace는 Suspended(워커
     /// shutdown = PTY kill)로 내리면 안 된다 (2026-07-05 사용자 요구: 진행 중인
     /// 에이전트 작업이 경고 없이 죽는 문제).
+    ///
+    /// tracker 외 두 가지를 추가로 live 취급한다 (codex High — spawn/restore race):
+    /// - 응답 대기 중인 셸 spawn (명령이 큐/워커에 있고 MuxUpdated가 아직 안 옴)
+    /// - 워커 생성 직후 첫 MuxUpdated 관측 전의 유예 창 (RestoreWorkspace 복원 세션이
+    ///   아직 이벤트로 안 왔을 수 있다 — 빈 workspace는 restore가 emit하지 않으므로
+    ///   유예가 끝나면 정상적으로 suspend 가능해진다)
     fn has_live_sessions(&self) -> bool {
-        self.live.has_live()
+        workspace_is_live(
+            self.live.has_live(),
+            self.live.seen_mux,
+            self.workspace_ui.pending_spawns() + self.pending_agent_spawns,
+            self.created.elapsed(),
+        )
     }
+}
+
+/// suspend 보호의 live 판정 (순수 함수 — 테스트 용이).
+fn workspace_is_live(
+    tracker_live: bool,
+    seen_mux: bool,
+    pending_spawns: u32,
+    age: std::time::Duration,
+) -> bool {
+    /// 첫 MuxUpdated 관측 전 suspend를 미루는 유예 — restore 이벤트 전파(수 ms)보다
+    /// 넉넉히. 빈 workspace는 이 유예만 지나면 suspend 대상이 된다.
+    const RESTORE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+    tracker_live || pending_spawns > 0 || (!seen_mux && age < RESTORE_GRACE)
 }
 
 /// 이벤트 스트림에서 "pane에 붙어 있고 아직 Exited 안 된 세션"을 추적한다.
@@ -257,12 +286,15 @@ struct LiveSessionTracker {
     mux_sessions: std::collections::HashSet<runtime::SessionId>,
     /// SessionExited를 관측한 세션 (mux_sessions에 남은 것만 유지해 유계).
     exited_sessions: std::collections::HashSet<runtime::SessionId>,
+    /// MuxUpdated를 한 번이라도 관측했다 — 관측 전에는 restore 유예가 적용된다.
+    seen_mux: bool,
 }
 
 impl LiveSessionTracker {
     fn observe(&mut self, event: &runtime::RuntimeEvent) {
         match event {
             runtime::RuntimeEvent::MuxUpdated { snapshot } => {
+                self.seen_mux = true;
                 self.mux_sessions = snapshot
                     .tabs
                     .iter()
@@ -530,6 +562,8 @@ impl App {
             input_pressure: None,
             backgrounded_at: None,
             live: LiveSessionTracker::default(),
+            created: std::time::Instant::now(),
+            pending_agent_spawns: 0,
         }
     }
 
@@ -707,12 +741,17 @@ impl App {
         old.backgrounded_at = Some(std::time::Instant::now());
         let old_id = old.id.clone();
         self.warm.insert(old_id.clone(), old);
-        self.warm_order.push(old_id);
+        self.warm_order.push(old_id.clone());
 
         // pending 상태 정리 (이전 워커 응답 못 받음, 교차-ws 감사 방지).
         // notifications는 리셋하지 않는다 — (ws, session)로 namespacing돼 전역 센터가
         // 모든 workspace 알림을 유지한다 (background 완료 통지·클릭 이동, codex 리뷰).
-        self.agents_ui.clear_pending();
+        // agent spawn 대기는 버리지 않고 물러난 workspace로 이관 — 응답이 오기 전까지
+        // 그 workspace를 live로 취급해 suspend가 새 PTY를 죽이는 창을 막는다 (codex).
+        let pending_agents = self.agents_ui.take_pending();
+        if let Some(old_rt) = self.warm.get_mut(&old_id) {
+            old_rt.pending_agent_spawns += pending_agents;
+        }
         self.connectors_ui.clear_invoke();
         // 파일 트리 루트를 새 workspace path로 갱신 (FT-1)
         self.refresh_file_tree_root();
@@ -772,6 +811,9 @@ impl App {
                     workspace_id,
                     "suspend 취소 — 실행 중 세션이 있어 warm 유지 (작업 보호)"
                 );
+                // drain한 lifecycle 이벤트를 replay 큐에 보존 — 버리면 재활성 시
+                // exit/status 상태가 UI에 재구성되지 않는다 (codex Medium).
+                rt.pending_events.extend(events);
                 self.warm.insert(workspace_id.to_owned(), rt);
                 self.warm_order.push(workspace_id.to_owned());
                 return;
@@ -1142,6 +1184,17 @@ impl App {
             }
             // live 세션 추적 (suspend 보호)
             rt.live.observe(event);
+            // 이관받은 agent spawn 대기 해소 (성공/실패 어느 쪽이든 응답 도착)
+            if matches!(
+                event,
+                runtime::RuntimeEvent::AgentSpawned { .. }
+                    | runtime::RuntimeEvent::SpawnFailed {
+                        kind: runtime::SpawnKind::Agent,
+                        ..
+                    }
+            ) {
+                rt.pending_agent_spawns = rt.pending_agent_spawns.saturating_sub(1);
+            }
         }
     }
 
@@ -2215,6 +2268,21 @@ h:1 EE:FF
             warm_eviction_candidates(&ids, 3, |_| false),
             vec!["a".to_owned()]
         );
+    }
+
+    #[test]
+    fn workspace_is_live는_spawn대기와_초기유예를_존중한다() {
+        let d = std::time::Duration::from_secs;
+        // tracker가 live면 무조건 live
+        assert!(workspace_is_live(true, true, 0, d(999)));
+        // spawn 응답 대기 중이면 live (mux 관측과 무관)
+        assert!(workspace_is_live(false, true, 1, d(999)));
+        // 첫 MuxUpdated 관측 전 + 유예 내 → live (restore 이벤트 미도착 창)
+        assert!(workspace_is_live(false, false, 0, d(1)));
+        // 유예가 지나면 빈 workspace로 취급 — suspend 가능
+        assert!(!workspace_is_live(false, false, 0, d(11)));
+        // mux 관측 후 세션 없음 → suspend 가능
+        assert!(!workspace_is_live(false, true, 0, d(1)));
     }
 
     #[test]

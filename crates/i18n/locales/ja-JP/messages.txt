@@ -111,6 +111,7 @@ notification.session.needs_approval = 承認が必要: {title}
 notification.session.error = エラー: {title}
 notification.session.done = 完了: {title}
 runtime.spawn_failed.shell = シェル起動失敗: {error}
+runtime.spawn_failed.suspended = ワークスペースが一時停止中のためセッションを開始しませんでした
 runtime.spawn_failed.agent = エージェント起動失敗: {error}
 runtime.spawn_failed.agent_secret = エージェントsecret解決失敗 (credential {credential_id}): {error}
 runtime.split.target_missing = 分割対象paneが存在しません。

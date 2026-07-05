@@ -923,6 +923,12 @@ impl WorkspaceUi {
             .collect()
     }
 
+    /// 응답(Spawned/Failed)을 아직 못 받은 셸 spawn 수 — App의 suspend 보호가
+    /// "spawn 진행 중 = live"로 판정하는 데 쓴다 (codex High race).
+    pub fn pending_spawns(&self) -> u32 {
+        self.pending_spawns
+    }
+
     pub fn mux(&self) -> Option<&Arc<MuxSnapshot>> {
         self.mux.as_ref()
     }

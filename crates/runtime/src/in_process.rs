@@ -121,6 +121,7 @@ impl InProcessRuntimeClient {
                     exited_order: std::collections::VecDeque::new(),
                     hidden_scrollback: std::collections::HashSet::new(),
                     render_active: true,
+                    suspended: false,
                     resource_monitor: ProcessResourceMonitor::new(
                         ProcessResourceMonitorConfig::default(),
                     ),
@@ -251,6 +252,10 @@ struct Worker {
     hidden_scrollback: std::collections::HashSet<SessionId>,
     /// Active면 visible pane snapshot 생성, false(Warm 등)면 중단 (§14.1). 세션은 유지.
     render_active: bool,
+    /// Suspended로 전환됨 — 이후 큐에 남아 있던 spawn류 명령은 무시한다. suspend 직전
+    /// UI가 못 본 SpawnShell/SpawnAgent가 shutdown 경로에서 처리되어 새 PTY가 만들어졌다
+    /// 즉시 죽는 race 차단 (codex High, 2026-07-05 live 보호 후속).
+    suspended: bool,
     /// PR-U12 process resource sampler. Low cadence and independent from UI frames.
     resource_monitor: ProcessResourceMonitor,
 }
@@ -489,6 +494,15 @@ impl Worker {
                 rows,
                 scrollback_lines,
             } => {
+                if self.suspended {
+                    // suspend 이후 큐 잔여 spawn — 무시 (생성 즉시 죽는 것보다 안전)
+                    let _ = (cols, rows, scrollback_lines);
+                    self.emit(RuntimeEvent::SpawnFailed {
+                        kind: SpawnKind::Shell,
+                        message: MessagePayload::new("runtime.spawn_failed.suspended"),
+                    });
+                    return;
+                }
                 let id = SessionId(self.next_id);
                 self.next_id += 1;
                 match Session::spawn_with_spec(
@@ -543,6 +557,13 @@ impl Worker {
                 error_regex,
                 done_regex,
             } => {
+                if self.suspended {
+                    self.emit(RuntimeEvent::SpawnFailed {
+                        kind: SpawnKind::Agent,
+                        message: MessagePayload::new("runtime.spawn_failed.suspended"),
+                    });
+                    return;
+                }
                 // secret은 여기(spawn 직전)에서만 resolve된다 — PR-09 완료 기준.
                 // 실패 시 아무것도 spawn하지 않는다 (부분 주입 금지).
                 let mut env = env_plain;
@@ -740,6 +761,11 @@ impl Worker {
                 // §14.1: Active만 render/snapshot. Warm/Suspended/Closed는 snapshot 중단.
                 // (Suspended/Closed의 PTY 종료는 workspace-close 도입 시 — 지금은 유지)
                 let active = matches!(state, crate::command::WorkspaceRuntimeState::Active);
+                self.suspended = matches!(
+                    state,
+                    crate::command::WorkspaceRuntimeState::Suspended
+                        | crate::command::WorkspaceRuntimeState::Closed
+                );
                 if active && !self.render_active {
                     // Warm→Active 복귀: 전체 mux 스냅샷 + 쌓인 화면을 즉시 다시 push.
                     // workspace 전환 복귀 시 UI가 fresh workspace_ui를 만들 수 있으므로
@@ -754,7 +780,8 @@ impl Worker {
             RuntimeCommand::RestoreWorkspace => {
                 // "완전히 빈 상태(세션 0)"일 때만 복원한다 — 시작 직후 SpawnShell/
                 // SpawnAgent가 먼저 처리돼 세션이 생겼으면 skip해 hybrid 상태를 막는다.
-                if self.sessions.is_empty() {
+                // suspended면 복원하지 않는다 (shutdown 큐 잔여 — 복원 즉시 죽는 것 방지).
+                if !self.suspended && self.sessions.is_empty() {
                     self.restore_saved_layout();
                 }
             }
@@ -1701,6 +1728,49 @@ mod tests {
             }
             _ => None,
         });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn suspended_이후_spawn은_거부된다() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("t"),
+            RedactionService::new(),
+            spec("/bin/echo", &["hi"]),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SetWorkspaceState(
+                crate::command::WorkspaceRuntimeState::Suspended,
+            ))
+            .unwrap();
+        // suspend 후 큐에 들어온 spawn — 세션 생성 없이 SpawnFailed로 거부돼야 한다
+        // (suspend 직전 UI가 못 본 spawn이 shutdown 경로에서 PTY를 만들었다 즉시
+        // 죽이는 race 차단).
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let message = probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::SpawnFailed { kind, message } if *kind == SpawnKind::Shell => {
+                Some(message.message_id.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(message, "runtime.spawn_failed.suspended");
+        assert!(
+            !probe
+                .seen
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::ShellSpawned { .. })),
+            "suspended 상태에서 세션이 생성되면 안 된다"
+        );
     }
 
     #[test]

@@ -111,6 +111,7 @@ notification.session.needs_approval = Approval needed: {title}
 notification.session.error = Error: {title}
 notification.session.done = Done: {title}
 runtime.spawn_failed.shell = Shell start failed: {error}
+runtime.spawn_failed.suspended = Workspace is suspended - session was not started
 runtime.spawn_failed.agent = Agent start failed: {error}
 runtime.spawn_failed.agent_secret = Agent secret resolve failed for credential {credential_id}: {error}
 runtime.split.target_missing = Split target pane no longer exists.

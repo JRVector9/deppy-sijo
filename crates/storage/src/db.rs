@@ -30,7 +30,7 @@ pub struct Db {
 ///     --mcp-config로 에이전트를 deppy-mcp-proxy 권한계층에 태운다).
 /// 11: agent_configs.mcp_config_flag (에이전트별 주입 플래그 커스텀 — NULL=기본 --mcp-config).
 /// 4~6은 각 crate가 소유한 DDL 상수를 그대로 붙인다 (스키마 정의는 한 곳에서만).
-const MIGRATIONS: &[&str] = &[
+pub(crate) const MIGRATIONS: &[&str] = &[
     "
 CREATE TABLE credentials (
     id TEXT PRIMARY KEY,

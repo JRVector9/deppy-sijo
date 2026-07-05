@@ -10,7 +10,11 @@ pub mod renderer_egui;
 mod viewport_snapshot;
 
 pub use alacritty_backend::AlacrittyBackend;
-pub use backend::{TerminalBackend, TerminalExternalSurfaceHandle, TerminalRenderModel};
+pub use backend::{
+    TERMINAL_GLOBAL_CACHE_BUDGET_BYTES, TerminalBackend, TerminalCacheBudget, TerminalCacheClass,
+    TerminalCacheEvent, TerminalCacheEventKind, TerminalCacheFootprint,
+    TerminalExternalSurfaceHandle, TerminalRenderModel,
+};
 pub use change_set::TerminalChangeSet;
 pub use viewport_snapshot::{
     CellRange, CursorShape, CursorSnapshot, TerminalCell, TerminalViewportSnapshot,

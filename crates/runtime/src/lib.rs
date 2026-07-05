@@ -10,6 +10,7 @@ pub mod known_hosts;
 mod persistence;
 mod protocol;
 mod remote;
+mod resource_monitor;
 pub mod tls_identity;
 
 pub use client::{RuntimeClient, RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream};
@@ -21,4 +22,7 @@ pub use in_process::InProcessRuntimeClient;
 pub use mux::{LayoutNode, MuxSnapshot, PaneSnapshot, TabSnapshot};
 pub use persistence::PersistConfig;
 pub use remote::{RemoteRuntimeClient, RemoteRuntimeServer, TofuOutcome};
+pub use resource_monitor::{
+    ProcessResourceMonitor, ProcessResourceMonitorConfig, ProcessResourceSnapshot,
+};
 pub use session::SessionStatus;

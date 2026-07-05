@@ -25,5 +25,8 @@ session = { path = "../session" }
 storage = { path = "../storage" }
 terminal = { path = "../terminal" }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 keyring-core = { workspace = true }

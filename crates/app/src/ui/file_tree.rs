@@ -4,7 +4,7 @@
 //! IO는 상호작용 시점만 — 유휴 시 repaint를 유발하지 않는다. 로컬 파일 IO는
 //! config/DB처럼 앱 소관이라 `std::fs` 직접 사용(§2, remote는 후속 trait 추상화 지점).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
@@ -105,8 +105,9 @@ pub struct FileTreeUi {
     /// 있는 프로젝트 등)를 재귀 감시할 때 FSEvents firehose로 앱이 유휴에도 3~5fps로
     /// 영영 안 쉬던 문제를 구조적으로 제거(설계 §3 "펼치는 디렉터리만", 2026-07-04 조사).
     watched_dirs: std::collections::HashSet<PathBuf>,
-    /// 워처 이벤트로 재나열할 부모 디렉터리 채널 (워처 스레드 → UI).
-    watch_rx: Option<Receiver<PathBuf>>,
+    /// 워처 이벤트 채널 (워처 스레드 → UI). 콜백에서 기본 ignore/.env 분류를 끝내고
+    /// UI 스레드는 dedup+debounce된 dirty dir만 재나열한다.
+    watch_rx: Option<Receiver<WatchEvent>>,
     /// 워처가 무시할 경로 prefix들 — 앱 자신의 data/log 디렉터리 등. 자기 로그 쓰기가
     /// 이벤트로 돌아와 리페인트를 유발하는 자기-루프 차단 (리페인트 원인 조사 2026-07-04).
     watch_ignore: std::sync::Arc<Vec<PathBuf>>,
@@ -120,7 +121,9 @@ pub struct FileTreeUi {
     /// 실제 그린 행높이를 재서 다음 프레임부터 그 값을 쓴다.
     measured_row_height: Option<f32>,
     /// 스로틀 창 안에 도착해 아직 재나열하지 않은 디렉터리 (dedup 집합 — codex Med-1).
-    pending_watch: std::collections::HashSet<PathBuf>,
+    pending_watch: BTreeSet<PathBuf>,
+    /// `.env*` 파일 변경 후보. 숨김 파일 필터와 무관하게 기록해 env-warning 후보로 쓸 수 있다.
+    env_warning_candidates: BTreeSet<PathBuf>,
     /// 마지막 워처 일괄 재나열 시각 — WATCH_RELOAD_MS 미만이면 흡수만 하고 건너뛴다.
     last_watch_reload: std::time::Instant,
 }
@@ -153,6 +156,12 @@ struct PendingListing {
     /// 첫 chunk 적용 시점의 현재 펼침 상태. 이후 chunk는 같은 기준으로 append한다.
     apply_expanded: Option<Arc<HashSet<PathBuf>>>,
     started: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WatchEvent {
+    DirtyDir(PathBuf),
+    EnvFileChanged(PathBuf),
 }
 
 /// 인라인 편집 (FT-3). focus는 첫 프레임에 TextEdit에 포커스를 1회 요청하는 플래그 —
@@ -200,7 +209,8 @@ impl FileTreeUi {
             measured_row_height: None,
             watch_ignore: std::sync::Arc::new(Vec::new()),
             watch_show_hidden: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            pending_watch: std::collections::HashSet::new(),
+            pending_watch: BTreeSet::new(),
+            env_warning_candidates: BTreeSet::new(),
             last_watch_reload: std::time::Instant::now(),
         }
     }
@@ -211,6 +221,15 @@ impl FileTreeUi {
     /// 워처 무시 prefix 설정 (앱 data dir 등). set_root 이전에 호출.
     pub fn set_watch_ignore(&mut self, prefixes: Vec<PathBuf>) {
         self.watch_ignore = std::sync::Arc::new(prefixes);
+    }
+
+    /// 워처가 감지한 `.env*` 변경 후보를 꺼낸다. Project Environment UI 경고 배선은
+    /// 후속 PR에서 붙이더라도, PR-U16에서는 이 state가 테스트 가능한 signal이다.
+    #[allow(dead_code)]
+    pub fn take_env_warning_candidates(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.env_warning_candidates)
+            .into_iter()
+            .collect()
     }
 
     pub fn set_root(&mut self, root: Option<PathBuf>) {
@@ -224,6 +243,7 @@ impl FileTreeUi {
         self.edit = None;
         self.confirm_delete = None;
         self.pending_watch.clear();
+        self.env_warning_candidates.clear();
         self.refresh();
         // 루트가 유효할 때만 감시 시작 (FT-4). 실패는 경고 로그 — 수동 새로고침으로 동작.
         self.start_watcher();
@@ -231,6 +251,9 @@ impl FileTreeUi {
 
     /// 워처 일괄 재나열 최소 간격(ms) — 이벤트·프레임이 동시에 폭주해도 재나열은 ~3.3Hz.
     const WATCH_RELOAD_MS: u64 = 300;
+    /// 한 debounce window에서 reload_dir을 요청할 최대 dirty directory 수. 대량 이벤트가
+    /// 여러 펼친 디렉터리에 흩어져도 한 프레임에 listing worker를 과도하게 만들지 않는다.
+    const WATCH_RELOAD_DIRS_PER_BATCH: usize = 8;
 
     /// 감시자 생성 (FT-4 — FSEvents/notify, 스레드 1개). 실제 감시 대상 디렉터리는
     /// sync_watches가 루트+펼친 디렉터리로 **비재귀** 등록한다. 이벤트 도착 시 해당 부모
@@ -246,7 +269,7 @@ impl FileTreeUi {
         if self.root_error.is_some() {
             return;
         }
-        let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+        let (tx, rx) = std::sync::mpsc::channel::<WatchEvent>();
         let ctx = self.egui_ctx.clone();
         let ignore = std::sync::Arc::clone(&self.watch_ignore);
         let show_hidden = std::sync::Arc::clone(&self.watch_show_hidden);
@@ -256,21 +279,13 @@ impl FileTreeUi {
                 if !relevant_fs_event(&event.kind) {
                     return;
                 }
+                let show_hidden_now = show_hidden.load(std::sync::atomic::Ordering::Relaxed);
                 let mut sent = false;
                 for path in &event.paths {
-                    // 자기-루프/잡음 차단: 앱 data dir 등 무시 prefix 하위는 버린다.
-                    if ignore.iter().any(|p| path.starts_with(p)) {
-                        continue;
-                    }
-                    // 숨김 경로는 트리에 표시되지 않으므로(토글 off) 이벤트도 무의미 —
-                    // 홈 루트 감시 시 ~/Library, ~/.* 의 대량 이벤트를 여기서 거른다.
-                    if !show_hidden.load(std::sync::atomic::Ordering::Relaxed)
-                        && has_hidden_component(&watch_root, path)
+                    for event in
+                        watch_events_for_path(&watch_root, path, show_hidden_now, ignore.as_ref())
                     {
-                        continue;
-                    }
-                    if let Some(parent) = path.parent() {
-                        let _ = tx.send(parent.to_path_buf());
+                        let _ = tx.send(event);
                         sent = true;
                     }
                 }
@@ -303,9 +318,9 @@ impl FileTreeUi {
         };
         // desired = 루트 + 그 직속 항목이 화면에 보이는(펼친) 디렉터리들.
         let mut desired: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-        desired.insert(root);
+        desired.insert(root.clone());
         for row in &self.flat {
-            if row.is_dir && row.expanded {
+            if row.is_dir && row.expanded && !has_default_watch_ignore_component(&root, &row.path) {
                 desired.insert(row.path.clone());
             }
         }
@@ -332,8 +347,15 @@ impl FileTreeUi {
     /// 계속 돌면서 파일 이벤트가 쏟아져도 재나열은 최대 ~3.3Hz.
     fn pump_watch_events(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.watch_rx {
-            while let Ok(dir) = rx.try_recv() {
-                self.pending_watch.insert(dir);
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    WatchEvent::DirtyDir(dir) => {
+                        insert_pending_watch_dir(&mut self.pending_watch, dir)
+                    }
+                    WatchEvent::EnvFileChanged(path) => {
+                        self.env_warning_candidates.insert(path);
+                    }
+                }
             }
         }
         if self.pending_watch.is_empty() {
@@ -348,9 +370,13 @@ impl FileTreeUi {
             return;
         }
         self.last_watch_reload = std::time::Instant::now();
-        let dirty: Vec<PathBuf> = self.pending_watch.drain().collect();
+        let dirty =
+            take_pending_watch_batch(&mut self.pending_watch, Self::WATCH_RELOAD_DIRS_PER_BATCH);
         for dir in dirty {
             self.reload_dir(&dir);
+        }
+        if !self.pending_watch.is_empty() {
+            ctx.request_repaint_after(window);
         }
     }
 
@@ -1285,6 +1311,94 @@ fn parent_dirs(src: &Path, dst: &Path) -> Vec<PathBuf> {
         }
     }
     dirs
+}
+
+fn insert_pending_watch_dir(pending: &mut BTreeSet<PathBuf>, dir: PathBuf) {
+    if pending.iter().any(|existing| dir.starts_with(existing)) {
+        return;
+    }
+    let descendants: Vec<PathBuf> = pending
+        .iter()
+        .filter(|existing| existing.starts_with(&dir))
+        .cloned()
+        .collect();
+    for descendant in descendants {
+        pending.remove(&descendant);
+    }
+    pending.insert(dir);
+}
+
+fn take_pending_watch_batch(pending: &mut BTreeSet<PathBuf>, limit: usize) -> Vec<PathBuf> {
+    let selected: Vec<PathBuf> = pending.iter().take(limit).cloned().collect();
+    for path in &selected {
+        pending.remove(path);
+    }
+    selected
+}
+
+fn watch_events_for_path(
+    root: &Path,
+    path: &Path,
+    show_hidden: bool,
+    ignore_prefixes: &[PathBuf],
+) -> Vec<WatchEvent> {
+    if ignore_prefixes
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+    {
+        return Vec::new();
+    }
+    if has_default_watch_ignore_component(root, path) {
+        return Vec::new();
+    }
+
+    let env_file = is_env_file_candidate(path);
+    if !show_hidden && has_hidden_component(root, path) && !env_file {
+        return Vec::new();
+    }
+
+    let mut events = Vec::new();
+    if env_file {
+        events.push(WatchEvent::EnvFileChanged(path.to_path_buf()));
+    }
+    if let Some(parent) = path.parent() {
+        events.push(WatchEvent::DirtyDir(parent.to_path_buf()));
+    }
+    events
+}
+
+fn has_default_watch_ignore_component(root: &Path, path: &Path) -> bool {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    rel.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(name) if default_watch_ignore_name(&name.to_string_lossy())
+        )
+    })
+}
+
+fn default_watch_ignore_name(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | "node_modules"
+            | "target"
+            | "dist"
+            | "build"
+            | ".next"
+            | ".turbo"
+            | "vendor"
+            | "logs"
+            | ".cache"
+            | ".DS_Store"
+    )
+}
+
+fn is_env_file_candidate(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name == ".env" || name == ".envrc" || name.starts_with(".env.") || name.starts_with(".env-")
 }
 
 /// 트리에 영향을 주는 fs 이벤트인지 (FT-4). Access(읽기 등) 이벤트는 잡음이라 무시.
@@ -2473,8 +2587,8 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         tree.watch_rx = Some(rx);
         std::fs::write(base.join("d/a.txt"), b"a").unwrap();
-        tx.send(base.join("d")).unwrap();
-        tx.send(base.join("d")).unwrap(); // 폭주 중 중복 이벤트
+        tx.send(WatchEvent::DirtyDir(base.join("d"))).unwrap();
+        tx.send(WatchEvent::DirtyDir(base.join("d"))).unwrap(); // 폭주 중 중복 이벤트
 
         // 창 안 (방금 재나열한 상태): 흡수만 — 재나열 없음, dedup 확인
         tree.last_watch_reload = std::time::Instant::now();
@@ -2487,7 +2601,7 @@ mod tests {
         assert_eq!(tree.pending_watch.len(), 1, "pending은 dedup 집합");
 
         // 창 내 반복 호출(프레임 폭주 시뮬레이션)에도 여전히 재나열 없음
-        tx.send(base.join("d")).unwrap();
+        tx.send(WatchEvent::DirtyDir(base.join("d"))).unwrap();
         tree.pump_watch_events(&ctx);
         assert!(!tree.flat.iter().any(|r| r.name == "a.txt"));
 
@@ -2521,7 +2635,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         tree.watch_rx = Some(rx);
         std::fs::write(base.join("new.txt"), b"n").unwrap();
-        tx.send(base.clone()).unwrap();
+        tx.send(WatchEvent::DirtyDir(base.clone())).unwrap();
         tree.last_watch_reload = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_millis(WATCH_TEST_ELAPSED_MS))
             .unwrap();
@@ -2558,6 +2672,109 @@ mod tests {
         assert!(relevant_fs_event(&EventKind::Create(CreateKind::Any)));
         assert!(relevant_fs_event(&EventKind::Remove(RemoveKind::Any)));
         assert!(relevant_fs_event(&EventKind::Modify(ModifyKind::Any)));
+    }
+
+    #[test]
+    fn watcher_기본_ignore_rules는_generated_경로를_버린다() {
+        let root = PathBuf::from("workspace");
+        for name in [
+            ".git",
+            "node_modules",
+            "target",
+            "dist",
+            "build",
+            ".next",
+            ".turbo",
+            "vendor",
+            "logs",
+            ".cache",
+        ] {
+            let path = root.join(name).join("generated.txt");
+            assert!(
+                watch_events_for_path(&root, &path, true, &[]).is_empty(),
+                "{name} should be ignored"
+            );
+        }
+        assert!(
+            watch_events_for_path(&root, &root.join(".DS_Store"), true, &[]).is_empty(),
+            ".DS_Store should be ignored"
+        );
+        assert!(
+            watch_events_for_path(
+                &root,
+                &root.join("src/generated.txt"),
+                true,
+                &[root.join("src")]
+            )
+            .is_empty(),
+            "caller-provided ignore prefixes still apply"
+        );
+    }
+
+    #[test]
+    fn watcher_env_파일은_hidden_off에서도_signal로_남는다() {
+        let root = PathBuf::from("workspace");
+        let env = root.join(".env.local");
+        let events = watch_events_for_path(&root, &env, false, &[]);
+
+        assert_eq!(
+            events,
+            vec![
+                WatchEvent::EnvFileChanged(env.clone()),
+                WatchEvent::DirtyDir(root.clone())
+            ]
+        );
+        assert!(
+            watch_events_for_path(&root, &root.join(".hidden/file.txt"), false, &[]).is_empty(),
+            "일반 hidden 경로는 show_hidden=false에서 무시"
+        );
+    }
+
+    #[test]
+    fn watcher_env_signal은_ui_state에_누적되고_take로_소진된다() {
+        let base = temp_root("env-signal");
+        let env = base.join(".env.production");
+        std::fs::write(&env, b"SECRET=value").unwrap();
+
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tree.watch_rx = Some(rx);
+        for event in watch_events_for_path(&base, &env, false, &[]) {
+            tx.send(event).unwrap();
+        }
+        tree.last_watch_reload = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(WATCH_TEST_ELAPSED_MS))
+            .unwrap();
+        tree.pump_watch_events(&egui::Context::default());
+
+        assert_eq!(tree.take_env_warning_candidates(), vec![env]);
+        assert!(tree.take_env_warning_candidates().is_empty());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn watcher_dirty_dir_batch는_한_프레임_invalidation을_제한한다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        tree.watch_rx = Some(rx);
+        let total = FileTreeUi::WATCH_RELOAD_DIRS_PER_BATCH + 3;
+        for i in 0..total {
+            tx.send(WatchEvent::DirtyDir(PathBuf::from(format!("dir-{i:02}"))))
+                .unwrap();
+        }
+
+        tree.last_watch_reload = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(WATCH_TEST_ELAPSED_MS))
+            .unwrap();
+        tree.pump_watch_events(&egui::Context::default());
+
+        assert_eq!(
+            tree.pending_watch.len(),
+            total - FileTreeUi::WATCH_RELOAD_DIRS_PER_BATCH
+        );
     }
 
     #[test]

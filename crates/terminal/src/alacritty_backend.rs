@@ -2,7 +2,8 @@
 //! Term + vte parser + grid만 쓴다. PTY는 pty crate가 소유한다.
 
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::grid::{Dimensions, Row, Scroll};
+use alacritty_terminal::term::cell::Cell as AlacrittyCell;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode, test::TermSize};
 use alacritty_terminal::vte::ansi::{
@@ -10,7 +11,11 @@ use alacritty_terminal::vte::ansi::{
 };
 use unicode_normalization::UnicodeNormalization;
 
-use crate::backend::{TerminalBackend, TerminalExternalSurfaceHandle, TerminalRenderModel};
+use crate::backend::{
+    TerminalBackend, TerminalCacheBudget, TerminalCacheClass, TerminalCacheEvent,
+    TerminalCacheEventKind, TerminalCacheFootprint, TerminalExternalSurfaceHandle,
+    TerminalRenderModel,
+};
 use crate::change_set::TerminalChangeSet;
 use crate::viewport_snapshot::{
     CursorShape, CursorSnapshot, TerminalCell, TerminalViewportSnapshot,
@@ -73,22 +78,54 @@ pub struct AlacrittyBackend {
     listener: CollectingListener,
     processor: Processor,
     scrollback_lines: usize,
+    cache_class: TerminalCacheClass,
+    active_scrollback_limit: usize,
 }
 
 impl AlacrittyBackend {
     pub fn new(cols: u16, rows: u16, scrollback_lines: usize) -> Self {
         let listener = CollectingListener::default();
+        let cache_class = TerminalCacheClass::Visible;
+        let active_scrollback_limit =
+            effective_scrollback_limit(scrollback_lines, cols as usize, rows as usize, cache_class);
         Self {
-            term: new_term(cols, rows, scrollback_lines, listener.clone()),
+            term: new_term(cols, rows, active_scrollback_limit, listener.clone()),
             listener,
             processor: Processor::new(),
             scrollback_lines,
+            cache_class,
+            active_scrollback_limit,
         }
     }
-}
 
-/// hidden 세션 scrollback 상한 (설계문서 §14.3). 원래 값이 이보다 작으면 원래 값.
-const HIDDEN_SCROLLBACK_LINES: usize = 1_000;
+    fn apply_cache_class(&mut self, class: TerminalCacheClass) -> Option<TerminalCacheEvent> {
+        let before = self.cache_footprint();
+        let target = effective_scrollback_limit(
+            self.scrollback_lines,
+            self.term.columns(),
+            self.term.screen_lines(),
+            class,
+        );
+        self.cache_class = class;
+        if target != self.active_scrollback_limit {
+            self.term.set_options(Config {
+                scrolling_history: target,
+                ..Config::default()
+            });
+            self.active_scrollback_limit = target;
+        }
+        let after = self.cache_footprint();
+        let limit_reduced = target < before.scrollback_limit_lines;
+        let history_trimmed = after.history_lines < before.history_lines;
+        (limit_reduced || history_trimmed).then_some(TerminalCacheEvent {
+            kind: TerminalCacheEventKind::ScrollbackLimitApplied,
+            class,
+            budget: TerminalCacheBudget::for_class(class),
+            before,
+            after,
+        })
+    }
+}
 
 fn new_term(
     cols: u16,
@@ -107,21 +144,35 @@ fn new_term(
     )
 }
 
-impl TerminalBackend for AlacrittyBackend {
-    fn set_visible(&mut self, visible: bool) {
-        let history = if visible {
-            self.scrollback_lines
-        } else {
-            self.scrollback_lines.min(HIDDEN_SCROLLBACK_LINES)
-        };
-        // Config는 new_term과 동일하게 scrolling_history만 비-default —
-        // set_options가 grid.update_history로 ring buffer를 shrink/grow한다.
-        self.term.set_options(Config {
-            scrolling_history: history,
-            ..Config::default()
-        });
-    }
+fn effective_scrollback_limit(
+    requested: usize,
+    cols: usize,
+    rows: usize,
+    class: TerminalCacheClass,
+) -> usize {
+    let budget = TerminalCacheBudget::for_class(class);
+    requested
+        .min(budget.max_scrollback_lines)
+        .min(history_lines_for_byte_budget(cols, rows, budget.max_bytes))
+}
 
+fn history_lines_for_byte_budget(cols: usize, rows: usize, max_bytes: usize) -> usize {
+    let bytes_per_line = estimated_bytes_per_line(cols.max(1));
+    let total_lines = max_bytes / bytes_per_line;
+    total_lines.saturating_sub(rows.max(1))
+}
+
+fn estimated_bytes_per_line(cols: usize) -> usize {
+    std::mem::size_of::<Row<AlacrittyCell>>()
+        .saturating_add(cols.saturating_mul(std::mem::size_of::<AlacrittyCell>()))
+}
+
+fn estimated_terminal_bytes(cols: usize, rows: usize, history_lines: usize) -> usize {
+    rows.saturating_add(history_lines)
+        .saturating_mul(estimated_bytes_per_line(cols.max(1)))
+}
+
+impl TerminalBackend for AlacrittyBackend {
     fn feed(&mut self, bytes: &[u8]) -> anyhow::Result<TerminalChangeSet> {
         // 위치만 비교하면 DECTCEM(?25l/h) 가시성이나 DECSCUSR shape 변경을
         // 놓친다 (codex 리뷰) — dirty 기반 repaint가 cursor-only 변화를 못 본다
@@ -266,8 +317,42 @@ impl TerminalBackend for AlacrittyBackend {
         // alacritty 0.26에는 reset_state가 없다 — Term 재생성으로 초기화
         let cols = self.term.columns() as u16;
         let rows = self.term.screen_lines() as u16;
-        self.term = new_term(cols, rows, self.scrollback_lines, self.listener.clone());
+        self.active_scrollback_limit = effective_scrollback_limit(
+            self.scrollback_lines,
+            cols as usize,
+            rows as usize,
+            self.cache_class,
+        );
+        self.term = new_term(
+            cols,
+            rows,
+            self.active_scrollback_limit,
+            self.listener.clone(),
+        );
         self.processor = Processor::new();
+    }
+
+    fn set_cache_class(&mut self, class: TerminalCacheClass) -> Option<TerminalCacheEvent> {
+        self.apply_cache_class(class)
+    }
+
+    fn cache_class(&self) -> TerminalCacheClass {
+        self.cache_class
+    }
+
+    fn cache_footprint(&self) -> TerminalCacheFootprint {
+        let cols = self.term.columns();
+        let rows = self.term.screen_lines();
+        let history_lines = self.term.history_size();
+        TerminalCacheFootprint {
+            class: self.cache_class,
+            scrollback_limit_lines: self.active_scrollback_limit,
+            history_lines,
+            screen_lines: rows,
+            columns: cols,
+            bytes_per_line: estimated_bytes_per_line(cols),
+            estimated_bytes: estimated_terminal_bytes(cols, rows, history_lines),
+        }
     }
 
     fn bracketed_paste(&self) -> bool {
@@ -460,6 +545,48 @@ mod tests {
         b.scroll(10_000);
         let regrown = b.viewport_snapshot().unwrap().scroll_offset;
         assert!(regrown > 1000, "visible 복귀 후 다시 1000 넘게: {regrown}");
+    }
+
+    #[test]
+    fn visible_scrollback은_설계_cap을_넘지_않는다() {
+        let b = AlacrittyBackend::new(20, 5, 100_000);
+        let footprint = b.cache_footprint();
+        assert_eq!(footprint.class, TerminalCacheClass::Visible);
+        assert_eq!(
+            footprint.scrollback_limit_lines,
+            TerminalCacheBudget::VISIBLE.max_scrollback_lines
+        );
+    }
+
+    #[test]
+    fn hidden_byte_budget이_scrollback을_trim한다() {
+        let cols = 240;
+        let rows = 5;
+        let mut b = AlacrittyBackend::new(cols as u16, rows as u16, 10_000);
+        let hidden_limit =
+            effective_scrollback_limit(10_000, cols, rows, TerminalCacheClass::Hidden);
+        assert!(
+            hidden_limit < TerminalCacheBudget::HIDDEN.max_scrollback_lines,
+            "넓은 terminal에서는 2MB byte cap이 1,000 line cap보다 먼저 적용돼야 함"
+        );
+
+        for i in 0..hidden_limit + 400 {
+            feed(&mut b, format!("line-{i}\r\n").as_bytes());
+        }
+        let before = b.cache_footprint();
+        assert!(
+            before.history_lines > hidden_limit,
+            "테스트가 trim 대상 history를 충분히 만들지 못함: {before:?}"
+        );
+
+        let event = b
+            .set_cache_class(TerminalCacheClass::Hidden)
+            .expect("hidden 전환은 cache trim event를 남겨야 함");
+        assert_eq!(event.class, TerminalCacheClass::Hidden);
+        assert!(event.dropped_history_lines() > 0);
+        assert!(event.freed_estimated_bytes() > 0);
+        assert_eq!(event.after.scrollback_limit_lines, hidden_limit);
+        assert!(event.after.estimated_bytes <= TerminalCacheBudget::HIDDEN.max_bytes);
     }
 
     #[test]

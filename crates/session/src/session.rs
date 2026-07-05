@@ -2,7 +2,10 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 
 use deppy_core::SessionId;
 use pty::{CommandSpec, PortablePtyBackend, PtyBackend, PtySession};
-use terminal::{AlacrittyBackend, TerminalBackend, TerminalViewportSnapshot};
+use terminal::{
+    AlacrittyBackend, TerminalBackend, TerminalCacheClass, TerminalCacheEvent,
+    TerminalCacheFootprint, TerminalViewportSnapshot,
+};
 
 use crate::lifecycle::SessionLifecycle;
 
@@ -46,6 +49,10 @@ pub struct Session {
     exit_code: Option<u32>,
     /// "종료 중"(eof 또는 child_dead) 상태로 보낸 pump tick 수 — 논블로킹 grace
     exit_wait_ticks: u32,
+    /// cache budget manager가 적용한 현재 class. visible이 최우선이고, hidden/exited는
+    /// 줄/byte budget으로 scrollback을 줄인다.
+    cache_class: TerminalCacheClass,
+    cache_events: Vec<TerminalCacheEvent>,
 }
 
 impl Session {
@@ -71,6 +78,8 @@ impl Session {
             child_dead: false,
             exit_code: None,
             exit_wait_ticks: 0,
+            cache_class: TerminalCacheClass::Visible,
+            cache_events: Vec::new(),
         })
     }
 
@@ -195,7 +204,7 @@ impl Session {
         }
     }
 
-    pub fn resize(&mut self, cols: u16, rows: u16) {
+    pub fn resize(&mut self, cols: u16, rows: u16) -> Option<TerminalCacheEvent> {
         let _ = self.backend.resize(cols, rows);
         if let Some(pty) = &mut self.pty
             && let Err(e) = pty.resize(cols, rows)
@@ -203,6 +212,7 @@ impl Session {
             tracing::warn!("PTY resize 실패: {e:#}");
         }
         self.dirty = true;
+        self.set_cache_class(self.cache_class)
     }
 
     pub fn scroll(&mut self, delta: i32) {
@@ -211,8 +221,34 @@ impl Session {
     }
 
     /// 가시성에 따라 scrollback 상한 조정 (§14.3). 전이 시에만 호출할 것.
-    pub fn set_visible(&mut self, visible: bool) {
-        self.backend.set_visible(visible);
+    pub fn set_visible(&mut self, visible: bool) -> Option<TerminalCacheEvent> {
+        let class = if visible {
+            TerminalCacheClass::Visible
+        } else {
+            TerminalCacheClass::Hidden
+        };
+        self.set_cache_class(class)
+    }
+
+    pub fn set_cache_class(&mut self, class: TerminalCacheClass) -> Option<TerminalCacheEvent> {
+        self.cache_class = class;
+        let event = self.backend.set_cache_class(class);
+        if let Some(event) = event {
+            self.cache_events.push(event);
+        }
+        event
+    }
+
+    pub fn cache_class(&self) -> TerminalCacheClass {
+        self.cache_class
+    }
+
+    pub fn cache_footprint(&self) -> TerminalCacheFootprint {
+        self.backend.cache_footprint()
+    }
+
+    pub fn take_cache_events(&mut self) -> Vec<TerminalCacheEvent> {
+        std::mem::take(&mut self.cache_events)
     }
 }
 
@@ -322,5 +358,37 @@ mod tests {
         });
         // snapshot 후 dirty가 지워진다
         assert!(!session.pump(|_| {}).dirty);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cache_class_전이와_trim_event_추적() {
+        let spec = CommandSpec {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "i=0; while [ $i -lt 700 ]; do echo line-$i; i=$((i+1)); done; sleep 30".into(),
+            ],
+            env: Vec::new(),
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(4), SessionKind::Shell, &spec, 240, 5, 10_000)
+                .unwrap();
+
+        wait(Duration::from_secs(5), || {
+            session.pump(|_| {});
+            (session.cache_footprint().history_lines > 400).then_some(())
+        });
+
+        let event = session
+            .set_visible(false)
+            .expect("hidden 전환은 scrollback trim event를 남겨야 함");
+        assert_eq!(session.cache_class(), TerminalCacheClass::Hidden);
+        assert_eq!(session.cache_footprint().class, TerminalCacheClass::Hidden);
+        assert!(event.dropped_history_lines() > 0);
+        assert!(event.freed_estimated_bytes() > 0);
+
+        let events = session.take_cache_events();
+        assert_eq!(events, vec![event]);
     }
 }

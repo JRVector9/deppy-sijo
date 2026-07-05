@@ -9,6 +9,15 @@
 //!   app leaf UI가 secret/MCP/audit/storage side effect를 직접 갖지 않도록 검사한다.
 //!   남아 있는 connector/agent/env DB 호출은 파일+snippet+개수 allowlist로 고정한다.
 //!
+//! `cargo run -p xtask -- smoke-db-migrations`
+//!   storage migration smoke tests를 실행한다.
+//!
+//! `cargo run -p xtask -- security-scan`
+//!   boundary/dependency gates와 secret/audit persistence tests를 실행한다.
+//!
+//! `cargo run -p xtask -- perf-smoke`
+//!   현재 자동화 가능한 performance/backpressure smoke tests를 실행한다.
+//!
 //! Cargo.toml의 `path = "../<dir>"` 로컬 의존만 본다(외부 crate는 무관). crate 식별은
 //! 디렉터리명 기준(예: crates/core의 패키지명은 deppy-core지만 여기선 "core").
 
@@ -70,9 +79,54 @@ fn main() -> anyhow::Result<()> {
     match command.as_str() {
         "check-boundary" => check_boundary(),
         "check-deps" => check_deps(),
+        "smoke-db-migrations" => smoke_db_migrations(),
+        "security-scan" => security_scan(),
+        "perf-smoke" => perf_smoke(),
         other => bail!(
-            "알 수 없는 명령 '{other}' — 사용법: cargo run -p xtask -- check-deps|check-boundary"
+            "알 수 없는 명령 '{other}' — 사용법: cargo run -p xtask -- check-deps|check-boundary|smoke-db-migrations|security-scan|perf-smoke"
         ),
+    }
+}
+
+fn smoke_db_migrations() -> anyhow::Result<()> {
+    run_cargo(&["test", "-p", "storage", "마이그레이션"])?;
+    run_cargo(&["test", "-p", "storage", "v8에서_v9"])?;
+    run_cargo(&["test", "-p", "storage", "v9에서_v10"])?;
+    run_cargo(&["test", "-p", "storage", "v10에서_v11"])?;
+    println!("smoke-db-migrations OK");
+    Ok(())
+}
+
+fn security_scan() -> anyhow::Result<()> {
+    check_boundary()?;
+    check_deps()?;
+    run_cargo(&["test", "-p", "storage", "secret_like"])?;
+    run_cargo(&["test", "-p", "storage", "db_파일에_secret_평문이_없다"])?;
+    run_cargo(&["test", "-p", "mcp-store", "secret_like"])?;
+    run_cargo(&["test", "-p", "audit", "-p", "mcp", "-p", "mcp-proxy"])?;
+    println!("security-scan OK");
+    Ok(())
+}
+
+fn perf_smoke() -> anyhow::Result<()> {
+    run_cargo(&["test", "-p", "deppy-sijo", "perf"])?;
+    run_cargo(&["test", "-p", "runtime", "backpressure"])?;
+    run_cargo(&["test", "-p", "runtime", "hidden"])?;
+    println!("perf-smoke OK");
+    Ok(())
+}
+
+fn run_cargo(args: &[&str]) -> anyhow::Result<()> {
+    let root = workspace_root()?;
+    let status = std::process::Command::new("cargo")
+        .args(args)
+        .current_dir(root)
+        .status()
+        .with_context(|| format!("cargo {} 실행 실패", args.join(" ")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("cargo {} 실패: {status}", args.join(" "));
     }
 }
 

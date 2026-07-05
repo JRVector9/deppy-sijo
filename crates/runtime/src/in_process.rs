@@ -1,7 +1,9 @@
 //! v0 구현체 (설계문서 2.3). worker thread가 세션들을 소유한다.
 //! 세션 로직(PTY+terminal+lifecycle)은 session crate 소관 (PR-08).
 
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::{
+    Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError, channel, sync_channel,
+};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,10 +15,12 @@ use pty::CommandSpec;
 use secret::{RedactionService, SecretStore, StreamRedactor};
 use session::{Session, StatusDetector, StatusPatterns};
 use storage::SessionLogWriter;
+use terminal::{TERMINAL_GLOBAL_CACHE_BUDGET_BYTES, TerminalCacheClass, TerminalCacheEvent};
 
 use crate::client::{RuntimeClient, RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream};
 use crate::command::{RuntimeCommand, SessionId};
 use crate::event::{RuntimeEvent, SpawnKind};
+use crate::resource_monitor::{ProcessResourceMonitor, ProcessResourceMonitorConfig};
 
 /// 구독자 한 명의 송신측. 상태 이벤트(unbounded — 세션 수명당 상수 개수의
 /// 제어 이벤트라 누적 위험 없음)와 세션별 Viewport slot(최신본만 유지 — 14.5의
@@ -32,7 +36,7 @@ struct Subscriber {
 
 pub struct InProcessRuntimeClient {
     /// shutdown 시 None — drop되면 worker가 Disconnected로 종료한다
-    command_tx: Option<Sender<RuntimeCommand>>,
+    command_tx: Option<SyncSender<RuntimeCommand>>,
     subscribers: Arc<Mutex<Vec<Subscriber>>>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -80,7 +84,7 @@ impl InProcessRuntimeClient {
         static RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let logs_root = logs_root.join(format!("run-{run_ms}-{}-{seq}", std::process::id()));
-        let (command_tx, command_rx) = channel();
+        let (command_tx, command_rx) = sync_channel(IN_PROCESS_CMD_QUEUE_CAP);
         let subscribers: Arc<Mutex<Vec<Subscriber>>> = Arc::default();
         let worker_subscribers = Arc::clone(&subscribers);
         let worker = std::thread::Builder::new()
@@ -114,6 +118,9 @@ impl InProcessRuntimeClient {
                     exited_order: std::collections::VecDeque::new(),
                     hidden_scrollback: std::collections::HashSet::new(),
                     render_active: true,
+                    resource_monitor: ProcessResourceMonitor::new(
+                        ProcessResourceMonitorConfig::default(),
+                    ),
                 }
                 .run();
             })
@@ -146,10 +153,16 @@ impl Drop for InProcessRuntimeClient {
 
 impl RuntimeCommandSink for InProcessRuntimeClient {
     fn send_command(&self, command: RuntimeCommand) -> anyhow::Result<()> {
-        self.command_tx
-            .as_ref()
-            .and_then(|tx| tx.send(command).ok())
-            .ok_or_else(|| anyhow::anyhow!("runtime worker가 종료됨"))
+        let Some(tx) = self.command_tx.as_ref() else {
+            anyhow::bail!("runtime worker가 종료됨");
+        };
+        match tx.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                anyhow::bail!("runtime 명령 큐 가득참 — local runtime backpressure")
+            }
+            Err(TrySendError::Disconnected(_)) => anyhow::bail!("runtime worker가 종료됨"),
+        }
     }
 }
 
@@ -201,6 +214,9 @@ impl RuntimeClient for InProcessRuntimeClient {}
 /// 초과분은 가장 오래 전에 종료된 것부터 backend를 drop해 메모리를 유계로 만든다
 /// (열려 있는 pane의 scrollback은 유지 — 시간 기반이 아니라 개수 LRU라 UX 안전).
 const MAX_EXITED_BACKENDS: usize = 24;
+/// Local runtime command queue cap. Commands are ordered and cannot be coalesced
+/// safely in the transport boundary, so overflow is surfaced to the caller.
+const IN_PROCESS_CMD_QUEUE_CAP: usize = 1024;
 
 struct Worker {
     command_rx: Receiver<RuntimeCommand>,
@@ -229,6 +245,8 @@ struct Worker {
     hidden_scrollback: std::collections::HashSet<SessionId>,
     /// Active면 visible pane snapshot 생성, false(Warm 등)면 중단 (§14.1). 세션은 유지.
     render_active: bool,
+    /// PR-U12 process resource sampler. Low cadence and independent from UI frames.
+    resource_monitor: ProcessResourceMonitor,
 }
 
 /// 세션 하나의 redaction 상태 + 로그 파일 (설계문서 7장).
@@ -356,6 +374,7 @@ impl Worker {
                 Err(RecvTimeoutError::Disconnected) => break, // client drop → 종료
             }
             self.pump_sessions();
+            self.pump_resource_monitor();
         }
         // 앱 종료: 남은 출력을 마지막으로 기록하고(로그 유실 방지 — codex 리뷰),
         // 열려 있는 로그의 redaction carry를 flush해 마감한다
@@ -421,6 +440,12 @@ impl Worker {
         }
         for wake in wakes {
             wake();
+        }
+    }
+
+    fn pump_resource_monitor(&mut self) {
+        if let Some(snapshot) = self.resource_monitor.sample_if_due() {
+            self.emit(RuntimeEvent::ResourceUsage { snapshot });
         }
     }
 
@@ -571,8 +596,10 @@ impl Worker {
                 cols,
                 rows,
             } => {
-                if let Some(active) = self.sessions.get_mut(&session) {
-                    active.resize(cols, rows);
+                if let Some(active) = self.sessions.get_mut(&session)
+                    && let Some(event) = active.resize(cols, rows)
+                {
+                    trace_terminal_cache_event(session, event);
                 }
             }
             RuntimeCommand::Scroll { session, delta } => {
@@ -1035,7 +1062,8 @@ impl Worker {
             {
                 // 게이트는 "이번 tick의 새 출력" — 누적 dirty를 쓰면 hidden 세션이
                 // 매 tick 전체 grid를 스캔하게 된다 (hidden은 snapshot으로 dirty가 안 지워짐)
-                let screen = (result.produced_output || detector.take_screen_scan_request())
+                let screen = detector
+                    .should_scan_screen(result.produced_output)
                     .then(|| active.screen_text());
                 if let Some(status) = detector.evaluate(screen.as_deref()) {
                     events.push(RuntimeEvent::SessionStatusChanged {
@@ -1054,6 +1082,21 @@ impl Worker {
                     snapshot: Arc::new(snapshot),
                     bracketed_paste: active.bracketed_paste(),
                 });
+            }
+            if result.just_exited {
+                let class = if watched.contains(&active.id()) {
+                    TerminalCacheClass::Visible
+                } else {
+                    TerminalCacheClass::Exited
+                };
+                if active.cache_class() != class
+                    && let Some(event) = active.set_cache_class(class)
+                {
+                    trace_terminal_cache_event(active.id(), event);
+                }
+                if class != TerminalCacheClass::Hidden {
+                    self.hidden_scrollback.remove(&active.id());
+                }
             }
             if result.just_exited
                 && let session::SessionLifecycle::Exited { exit_code } = active.lifecycle()
@@ -1124,32 +1167,33 @@ impl Worker {
         }
     }
 
-    /// 가시성 전이에 맞춰 running 세션의 scrollback 상한을 조정한다 (§14.3):
-    /// visible(active tab)은 원래 값, hidden은 1,000줄. set_visible이 title 이벤트를
-    /// 유발하므로 실제 전이일 때만 호출한다. mux 변경마다 불린다.
+    /// 가시성/lifecycle 전이에 맞춰 terminal cache budget을 적용한다 (§14.3):
+    /// visible(active tab)은 visible budget, hidden running은 hidden budget,
+    /// non-visible exited는 exited-retained budget. visible이 항상 우선한다.
     fn reconcile_visibility(&mut self) {
         let visible: std::collections::HashSet<SessionId> =
             self.mux.watched_sessions().into_iter().collect();
-        // exited는 archival 소관 — running 세션만 대상
-        let running: Vec<SessionId> = self
-            .sessions
-            .iter()
-            .filter(|(_, s)| s.lifecycle().is_running())
-            .map(|(id, _)| *id)
-            .collect();
-        for id in running {
-            let is_visible = visible.contains(&id);
-            let was_hidden = self.hidden_scrollback.contains(&id);
-            if is_visible && was_hidden {
-                if let Some(s) = self.sessions.get_mut(&id) {
-                    s.set_visible(true);
-                }
-                self.hidden_scrollback.remove(&id);
-            } else if !is_visible && !was_hidden {
-                if let Some(s) = self.sessions.get_mut(&id) {
-                    s.set_visible(false);
-                }
+        let sessions: Vec<SessionId> = self.sessions.keys().copied().collect();
+        for id in sessions {
+            let Some(session) = self.sessions.get_mut(&id) else {
+                continue;
+            };
+            let class = if visible.contains(&id) {
+                TerminalCacheClass::Visible
+            } else if session.lifecycle().is_running() {
+                TerminalCacheClass::Hidden
+            } else {
+                TerminalCacheClass::Exited
+            };
+            if class == TerminalCacheClass::Hidden {
                 self.hidden_scrollback.insert(id);
+            } else {
+                self.hidden_scrollback.remove(&id);
+            }
+            if session.cache_class() != class
+                && let Some(event) = session.set_cache_class(class)
+            {
+                trace_terminal_cache_event(id, event);
             }
         }
     }
@@ -1164,9 +1208,33 @@ impl Worker {
         // 비포커스 pane도 화면에 있어 사용자가 그 scrollback을 보는 중일 수 있다
         // (codex 리뷰: focused 하나만 제외하면 부족). watched = visible.
         let visible = self.mux.watched_sessions();
-        let to_archive = exited_to_archive(&self.exited_order, MAX_EXITED_BACKENDS, &visible);
+        let mut to_archive = exited_to_archive(&self.exited_order, MAX_EXITED_BACKENDS, &visible);
+        let cache_bytes = self.terminal_cache_bytes();
+        if cache_bytes > TERMINAL_GLOBAL_CACHE_BUDGET_BYTES {
+            let bytes_by_session: std::collections::HashMap<SessionId, usize> = self
+                .sessions
+                .iter()
+                .map(|(id, session)| (*id, session.cache_footprint().estimated_bytes))
+                .collect();
+            for session in exited_to_archive_for_budget(
+                &self.exited_order,
+                &visible,
+                &bytes_by_session,
+                cache_bytes,
+                TERMINAL_GLOBAL_CACHE_BUDGET_BYTES,
+            ) {
+                if !to_archive.contains(&session) {
+                    to_archive.push(session);
+                }
+            }
+        }
         let mut detached_any = false;
         for session in to_archive {
+            let estimated_bytes = self
+                .sessions
+                .get(&session)
+                .map(|session| session.cache_footprint().estimated_bytes)
+                .unwrap_or(0);
             self.sessions.remove(&session);
             self.exited_order.retain(|s| *s != session);
             self.hidden_scrollback.remove(&session);
@@ -1176,11 +1244,41 @@ impl Worker {
                     detached_any = true;
                 }
             }
+            tracing::info!(
+                session = session.0,
+                estimated_bytes,
+                cache_class = ?TerminalCacheClass::Exited,
+                "terminal cache archived exited backend"
+            );
         }
         if detached_any {
             self.emit_mux_snapshot();
         }
     }
+
+    fn terminal_cache_bytes(&self) -> usize {
+        self.sessions
+            .values()
+            .map(|session| session.cache_footprint().estimated_bytes)
+            .sum()
+    }
+}
+
+fn trace_terminal_cache_event(session: SessionId, event: TerminalCacheEvent) {
+    tracing::info!(
+        session = session.0,
+        cache_class = ?event.class,
+        kind = ?event.kind,
+        budget_bytes = event.budget.max_bytes,
+        budget_lines = event.budget.max_scrollback_lines,
+        before_bytes = event.before.estimated_bytes,
+        after_bytes = event.after.estimated_bytes,
+        before_history_lines = event.before.history_lines,
+        after_history_lines = event.after.history_lines,
+        dropped_history_lines = event.dropped_history_lines(),
+        freed_estimated_bytes = event.freed_estimated_bytes(),
+        "terminal cache budget applied"
+    );
 }
 
 /// "셸 3" / "에이전트 12" 같은 제목에서 뒤의 숫자를 뽑는다 (복원 시 counter 전진용).
@@ -1208,6 +1306,31 @@ fn exited_to_archive(
         }
         if !visible.contains(session) {
             out.push(*session);
+        }
+    }
+    out
+}
+
+fn exited_to_archive_for_budget(
+    exited_order: &std::collections::VecDeque<SessionId>,
+    visible: &[SessionId],
+    bytes_by_session: &std::collections::HashMap<SessionId, usize>,
+    current_bytes: usize,
+    budget_bytes: usize,
+) -> Vec<SessionId> {
+    let mut remaining = current_bytes.saturating_sub(budget_bytes);
+    if remaining == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for session in exited_order {
+        if visible.contains(session) {
+            continue;
+        }
+        out.push(*session);
+        remaining = remaining.saturating_sub(*bytes_by_session.get(session).unwrap_or(&0));
+        if remaining == 0 {
+            break;
         }
     }
     out
@@ -1244,6 +1367,27 @@ mod tests {
             args: args.iter().map(|s| (*s).into()).collect(),
             env: Vec::new(),
         }
+    }
+
+    #[test]
+    fn in_process_command_queue_full은_err로_surface된다() {
+        let (tx, _rx) = sync_channel(1);
+        let client = InProcessRuntimeClient {
+            command_tx: Some(tx),
+            subscribers: Arc::default(),
+            worker: None,
+        };
+        client
+            .send_command(RuntimeCommand::SetWorkspaceState(
+                WorkspaceRuntimeState::Active,
+            ))
+            .unwrap();
+        let err = client
+            .send_command(RuntimeCommand::SetWorkspaceState(
+                WorkspaceRuntimeState::Warm,
+            ))
+            .unwrap_err();
+        assert!(err.to_string().contains("명령 큐 가득참"));
     }
 
     /// 수신한 이벤트를 버리지 않고 모아두는 테스트 헬퍼 —
@@ -2521,6 +2665,39 @@ mod tests {
                 &[SessionId(2), SessionId(3), SessionId(4), SessionId(5)]
             ),
             vec![SessionId(1)]
+        );
+    }
+
+    #[test]
+    fn exited_archive_global_budget는_visible을_보존한다() {
+        use std::collections::{HashMap, VecDeque};
+        let ids: VecDeque<SessionId> = (1..=5).map(SessionId).collect();
+        let bytes = HashMap::from([
+            (SessionId(1), 40),
+            (SessionId(2), 30),
+            (SessionId(3), 25),
+            (SessionId(4), 20),
+            (SessionId(5), 10),
+        ]);
+
+        assert!(super::exited_to_archive_for_budget(&ids, &[], &bytes, 90, 90).is_empty());
+        assert_eq!(
+            super::exited_to_archive_for_budget(&ids, &[], &bytes, 125, 80),
+            vec![SessionId(1), SessionId(2)]
+        );
+        assert_eq!(
+            super::exited_to_archive_for_budget(&ids, &[SessionId(1)], &bytes, 125, 80),
+            vec![SessionId(2), SessionId(3)]
+        );
+        assert_eq!(
+            super::exited_to_archive_for_budget(
+                &ids,
+                &[SessionId(1), SessionId(2), SessionId(3), SessionId(4)],
+                &bytes,
+                125,
+                80,
+            ),
+            vec![SessionId(5)]
         );
     }
 

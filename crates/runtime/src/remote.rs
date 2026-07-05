@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -75,6 +75,25 @@ const TLS_CMD_DRAIN_MAX: usize = 64;
 /// write/drain 단계로 넘어간다(codex HIGH). peer가 소켓을 계속 readable하게 유지해도
 /// (고출력 스트림) 송신 경로가 굶지 않는다. 남은 수신분은 다음 tick이 이어받는다.
 const TLS_READ_STEPS_MAX: usize = 16;
+/// 접속별 서버→remote client 상태/lifecycle 이벤트 큐 상한. Viewport는 별도 세션별 slot으로
+/// coalesce하므로 이 cap은 silent drop이 금지된 이벤트에만 적용한다. cap 초과는 느린 client의
+/// degraded 상태로 보고 접속을 끊어 재연결을 유도한다.
+const OUTBOUND_DURABLE_QUEUE_CAP: usize = 1024;
+/// 접속별 서버→remote client viewport slot 상한. 초과 시 가장 오래된 viewport slot을 버리고
+/// 최신 viewport를 유지한다. Viewport/delta는 drop/coalesce 허용 대상이다.
+const OUTBOUND_VIEWPORT_SLOT_CAP: usize = 256;
+/// 한 tick에서 소켓/TLS writer로 밀어 넣는 서버 outbound 프레임 상한. 큰 backlog가 생겨도
+/// pump loop가 receiver drain/read side 처리로 돌아오도록 한다.
+const OUTBOUND_WRITE_FRAMES_PER_TICK: usize = 64;
+/// 종료 세션 tombstone 상한. SessionExited 뒤 trailing Viewport가 delta baseline을 되살리지
+/// 않도록 짧게 기억하되, 장기 연결에서 세션 수만큼 무한히 늘지 않게 한다.
+const EXITED_SESSION_TOMBSTONE_CAP: usize = 512;
+/// 평문 서버 이벤트 write 상한. 평문은 reader/pump가 같은 socket clone을 공유하므로 nonblocking
+/// write만 켤 수 없다. 대신 짧은 write timeout 후 접속을 닫아 slow reader가 pump를 붙잡지 못하게 한다.
+const PLAIN_EVENT_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
+/// 평문 클라이언트 명령 write 상한. TLS 경로는 bounded try_send를 쓰고, Plain 경로는 timeout으로
+/// 직접 write가 caller를 오래 붙잡지 않게 한다.
+const PLAIN_CMD_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// 프레임 하나를 쓴다: [u32 LE 길이][payload].
 /// 상한은 송신측에서도 강제 — 초과분을 보내 놓고 peer가 끊는 것보다
@@ -398,6 +417,177 @@ fn validate_event(event: &RuntimeEvent) -> Result<(), &'static str> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundDrain {
+    Open,
+    SourceClosed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundOverflow {
+    DurableFull,
+}
+
+/// 접속별 서버→client outbound queue.
+///
+/// - non-viewport RuntimeEvent는 status/lifecycle/control event라 FIFO로 보존한다.
+/// - Viewport는 세션별 최신 slot만 유지한다.
+/// - durable cap 초과는 silent drop 대신 접속 종료로 surface한다.
+struct OutboundEventQueue {
+    durable: VecDeque<RuntimeEvent>,
+    viewports: HashMap<SessionId, RuntimeEvent>,
+    viewport_order: VecDeque<SessionId>,
+    durable_cap: usize,
+    viewport_cap: usize,
+}
+
+impl OutboundEventQueue {
+    fn new() -> Self {
+        Self::with_caps(OUTBOUND_DURABLE_QUEUE_CAP, OUTBOUND_VIEWPORT_SLOT_CAP)
+    }
+
+    fn with_caps(durable_cap: usize, viewport_cap: usize) -> Self {
+        Self {
+            durable: VecDeque::new(),
+            viewports: HashMap::new(),
+            viewport_order: VecDeque::new(),
+            durable_cap,
+            viewport_cap,
+        }
+    }
+
+    fn enqueue(&mut self, event: RuntimeEvent) -> Result<(), OutboundOverflow> {
+        if let RuntimeEvent::Viewport { session, .. } = &event {
+            let session = *session;
+            if self.viewport_cap == 0 {
+                return Ok(());
+            }
+            if let std::collections::hash_map::Entry::Occupied(mut entry) =
+                self.viewports.entry(session)
+            {
+                entry.insert(event);
+                return Ok(());
+            }
+            while self.viewports.len() >= self.viewport_cap {
+                if let Some(oldest) = self.viewport_order.pop_front() {
+                    self.viewports.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+            self.viewport_order.push_back(session);
+            self.viewports.insert(session, event);
+            Ok(())
+        } else {
+            if self.durable.len() >= self.durable_cap {
+                return Err(OutboundOverflow::DurableFull);
+            }
+            self.durable.push_back(event);
+            Ok(())
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<RuntimeEvent> {
+        if let Some(event) = self.durable.pop_front() {
+            return Some(event);
+        }
+        while let Some(session) = self.viewport_order.pop_front() {
+            if let Some(event) = self.viewports.remove(&session) {
+                return Some(event);
+            }
+        }
+        None
+    }
+
+    fn is_empty(&self) -> bool {
+        self.durable.is_empty() && self.viewports.is_empty()
+    }
+
+    #[cfg(test)]
+    fn durable_len(&self) -> usize {
+        self.durable.len()
+    }
+
+    #[cfg(test)]
+    fn viewport_len(&self) -> usize {
+        self.viewports.len()
+    }
+}
+
+struct ExitedSessionTombstones {
+    set: HashSet<SessionId>,
+    order: VecDeque<SessionId>,
+}
+
+impl ExitedSessionTombstones {
+    fn new() -> Self {
+        Self {
+            set: HashSet::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn insert(&mut self, session: SessionId) {
+        if self.set.insert(session) {
+            self.order.push_back(session);
+            while self.order.len() > EXITED_SESSION_TOMBSTONE_CAP {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.set.remove(&oldest);
+                }
+            }
+        }
+    }
+
+    fn contains(&self, session: &SessionId) -> bool {
+        self.set.contains(session)
+    }
+}
+
+fn drain_receiver_into_outbound(
+    receiver: &RuntimeEventReceiver,
+    outbound: &mut OutboundEventQueue,
+) -> Result<OutboundDrain, OutboundOverflow> {
+    // RuntimeEventReceiver::drain과 같은 happens-before 계약: viewport slot을 먼저 take하고,
+    // 상태 채널을 비운 뒤, 상태 이벤트를 먼저 enqueue한다. 이렇게 하면 Spawned/MuxUpdated가
+    // 같은 tick의 Viewport보다 먼저 durable queue에 들어간다.
+    let viewports: Vec<RuntimeEvent> = receiver
+        .viewports
+        .lock()
+        .expect("remote receiver viewport slot lock")
+        .drain()
+        .map(|(_, event)| event)
+        .collect();
+
+    let mut source = OutboundDrain::Open;
+    loop {
+        match receiver.events.try_recv() {
+            Ok(event) => outbound.enqueue(event)?,
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                source = OutboundDrain::SourceClosed;
+                break;
+            }
+        }
+    }
+    for event in viewports {
+        outbound.enqueue(event)?;
+    }
+    Ok(source)
+}
+
+fn encode_next_outbound_frame(
+    outbound: &mut OutboundEventQueue,
+    codec: Codec,
+    last_sent: &mut HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)>,
+    exited_sessions: &mut ExitedSessionTombstones,
+    visible_sessions: &mut Option<HashSet<SessionId>>,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(event) = outbound.pop_front() else {
+        return Ok(None);
+    };
+    encode_pump_frame(codec, last_sent, exited_sessions, visible_sessions, &event).map(Some)
+}
+
 fn layout_ratios_valid(node: &crate::LayoutNode) -> bool {
     match node {
         crate::LayoutNode::Pane(_) => true,
@@ -709,12 +899,15 @@ fn serve_connection(
         .name("remote-pump".into())
         .spawn(move || {
             let mut stream = pump_stream;
+            let _ = stream.set_write_timeout(Some(PLAIN_EVENT_WRITE_TIMEOUT));
             let mut last_activity = std::time::Instant::now();
             // 접속별 last_sent: 세션마다 (마지막 송신 seq, 그 스냅샷). Delta diff의 기준선.
             // Plain 접속에서는 사용되지 않는다(viewport도 encode_event 경로).
             let mut last_sent: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> =
                 HashMap::new();
             let mut visible_sessions: Option<HashSet<SessionId>> = None;
+            let mut exited_sessions = ExitedSessionTombstones::new();
+            let mut outbound = OutboundEventQueue::new();
             loop {
                 if pump_stop.load(Ordering::SeqCst) || pump_done.load(Ordering::SeqCst) {
                     break;
@@ -727,24 +920,28 @@ fn serve_connection(
                 {
                     last_sent.remove(&session);
                 }
+                match drain_receiver_into_outbound(&receiver, &mut outbound) {
+                    Ok(OutboundDrain::Open) => {}
+                    Ok(OutboundDrain::SourceClosed) => break,
+                    Err(OutboundOverflow::DurableFull) => {
+                        tracing::warn!(
+                            "remote plain outbound durable queue full — slow client disconnect"
+                        );
+                        let _ = stream.shutdown(Shutdown::Both);
+                        return;
+                    }
+                }
                 let mut sent_event = false;
-                // 이 drain 배치 안에서 종료된 세션 (codex P2). drain()은 상태 이벤트를 먼저,
-                // viewport slot을 나중에 붙이므로(client.rs) 같은 배치의 SessionExited(X)가
-                // 뒤따르는 Viewport(X)보다 앞선다. 그 trailing viewport를 keyframe으로
-                // 인코딩하면 방금 지운 last_sent[X]가 되살아나므로, 종료된 세션의 viewport는
-                // baseline을 만들지 않는 plain full(WireMsg::Event)로 보낸다. 배치마다 리셋.
-                let mut exited_this_batch: HashSet<SessionId> = HashSet::new();
-                for event in receiver.drain() {
-                    // 접속 코덱으로 인코딩. Delta는 viewport를 keyframe/delta로, 나머지는
-                    // WireMsg::Event로. Plain은 postcard(RuntimeEvent)와 바이트 동일.
-                    let payload = match encode_pump_frame(
+                for _ in 0..OUTBOUND_WRITE_FRAMES_PER_TICK {
+                    let payload = match encode_next_outbound_frame(
+                        &mut outbound,
                         codec,
                         &mut last_sent,
-                        &mut exited_this_batch,
+                        &mut exited_sessions,
                         &mut visible_sessions,
-                        &event,
                     ) {
-                        Ok(payload) => payload,
+                        Ok(Some(payload)) => payload,
+                        Ok(None) => break,
                         Err(e) => {
                             tracing::warn!("remote event 직렬화 실패: {e}");
                             continue;
@@ -762,7 +959,7 @@ fn serve_connection(
                 }
                 if sent_event {
                     last_activity = std::time::Instant::now();
-                } else if last_activity.elapsed() >= HEARTBEAT_INTERVAL {
+                } else if outbound.is_empty() && last_activity.elapsed() >= HEARTBEAT_INTERVAL {
                     // 길이 0 프레임 = heartbeat. postcard로 직렬화된 RuntimeEvent는
                     // 항상 길이 > 0이라 정상 이벤트 프레임과 명확히 구분된다.
                     // write 실패는 죽은(half-open) peer — 접속을 정리한다.
@@ -873,8 +1070,9 @@ fn serve_connection_tls(
     let receiver = backend.subscribe();
     let mut last_sent: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> = HashMap::new();
     let mut visible_sessions: Option<HashSet<SessionId>> = None;
+    let mut exited_sessions = ExitedSessionTombstones::new();
     let mut keyframe_requests: Vec<SessionId> = Vec::new();
-    let mut out: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut outbound = OutboundEventQueue::new();
     let mut last_activity = Instant::now();
 
     'main: loop {
@@ -941,39 +1139,49 @@ fn serve_connection_tls(
             }
         }
 
-        // (2) 나갈 배치 refill — 직전 배치를 소켓에 다 흘려보냈을 때만 다음을 drain한다.
-        //     그 사이 viewport는 receiver slot에서 latest-wins 코얼레싱(§4.2) → backpressure 상한.
-        if out.is_empty() && !conn.wants_write() {
-            for session in keyframe_requests.drain(..) {
-                last_sent.remove(&session);
-            }
-            let mut exited_this_batch: HashSet<SessionId> = HashSet::new();
-            for event in receiver.drain() {
-                match encode_pump_frame(
-                    codec,
-                    &mut last_sent,
-                    &mut exited_this_batch,
-                    &mut visible_sessions,
-                    &event,
-                ) {
-                    Ok(payload) => out.push_back(payload),
-                    Err(e) => tracing::warn!("remote event 직렬화 실패: {e}"),
-                }
+        // (2) receiver를 계속 bounded outbound queue로 흡수한다. write가 막힌 동안에도
+        //     runtime subscriber 채널이 무제한으로 자라지 않게 하고, durable event cap 초과는
+        //     해당 slow client disconnect로 surface한다.
+        for session in keyframe_requests.drain(..) {
+            last_sent.remove(&session);
+        }
+        match drain_receiver_into_outbound(&receiver, &mut outbound) {
+            Ok(OutboundDrain::Open) => {}
+            Ok(OutboundDrain::SourceClosed) => break,
+            Err(OutboundOverflow::DurableFull) => {
+                tracing::warn!("remote TLS outbound durable queue full — slow client disconnect");
+                break;
             }
         }
 
-        // (3) out을 한 프레임씩 rustls writer로 밀고 flush — 소켓 backpressure면 나머지는 out에 남긴다.
-        while let Some(front) = out.front() {
-            if write_frame(&mut conn.writer(), front).is_err() {
-                break 'main;
-            }
-            out.pop_front();
-            progressed = true;
-            if tls_flush(&mut conn, &mut sock).is_err() {
-                break 'main;
-            }
-            if conn.wants_write() {
-                break; // 소켓이 더 못 받음 — 남은 out은 다음 tick에
+        // (3) bounded queue에서 한 프레임씩 rustls writer로 밀고 flush한다. 소켓 backpressure로
+        //     conn에 pending TLS bytes가 남으면 추가 인코딩을 멈춰 rustls buffer 성장을 제한한다.
+        if !conn.wants_write() {
+            for _ in 0..OUTBOUND_WRITE_FRAMES_PER_TICK {
+                let payload = match encode_next_outbound_frame(
+                    &mut outbound,
+                    codec,
+                    &mut last_sent,
+                    &mut exited_sessions,
+                    &mut visible_sessions,
+                ) {
+                    Ok(Some(payload)) => payload,
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::warn!("remote event 직렬화 실패: {e}");
+                        continue;
+                    }
+                };
+                if write_frame(&mut conn.writer(), &payload).is_err() {
+                    break 'main;
+                }
+                progressed = true;
+                if tls_flush(&mut conn, &mut sock).is_err() {
+                    break 'main;
+                }
+                if conn.wants_write() {
+                    break; // 소켓이 더 못 받음 — 다음 tick에 flush부터 재시도
+                }
             }
         }
         if tls_flush(&mut conn, &mut sock).is_err() {
@@ -984,7 +1192,7 @@ fn serve_connection_tls(
         if progressed {
             last_activity = Instant::now();
         } else if last_activity.elapsed() >= HEARTBEAT_INTERVAL
-            && out.is_empty()
+            && outbound.is_empty()
             && !conn.wants_write()
         {
             if write_frame(&mut conn.writer(), &[]).is_err()
@@ -1079,10 +1287,10 @@ fn tls_server_handshake(
 /// 기존 [`Codec::encode_event`] 경로 그대로 — Plain은 이 경로에서도 바이트 동일.
 ///
 /// `SessionExited`는 Delta 접속에서 그 세션의 baseline을 [`HashMap::remove`]하고
-/// `exited_this_batch`에 등록한다 — 장기 연결에서 종료된 세션의 snapshot Arc가 last_sent에
-/// 누적되지 않게 (codex P2). 이미 종료된 세션의 trailing Viewport(같은 drain 배치)는
-/// keyframe/delta가 아니라 plain full(`WireMsg::Event`)로 보내 baseline을 되살리지 않는다 —
-/// 최종 출력은 여전히 클라 slot에 전달된다.
+/// bounded tombstone에 등록한다 — 장기 연결에서 종료된 세션의 snapshot Arc가 last_sent에
+/// 누적되지 않게 (codex P2). 이미 종료된 세션의 trailing Viewport는 keyframe/delta가 아니라
+/// plain full(`WireMsg::Event`)로 보내 baseline을 되살리지 않는다 — 최종 출력은 여전히 클라
+/// slot에 전달된다.
 ///
 /// `MuxUpdated`는 active tab visible session set을 연결 상태로 갱신하고, set 밖 baseline을
 /// 즉시 prune한다. 같은 drain 배치에서 뒤따르는 hidden `Viewport`도 plain full로만 보내
@@ -1090,7 +1298,7 @@ fn tls_server_handshake(
 fn encode_pump_frame(
     codec: Codec,
     last_sent: &mut HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)>,
-    exited_this_batch: &mut HashSet<SessionId>,
+    exited_sessions: &mut ExitedSessionTombstones,
     visible_sessions: &mut Option<HashSet<SessionId>>,
     event: &RuntimeEvent,
 ) -> anyhow::Result<Vec<u8>> {
@@ -1109,7 +1317,7 @@ fn encode_pump_frame(
                 bracketed_paste,
             },
         ) => {
-            if exited_this_batch.contains(session)
+            if exited_sessions.contains(session)
                 || visible_sessions
                     .as_ref()
                     .is_some_and(|visible| !visible.contains(session))
@@ -1121,7 +1329,7 @@ fn encode_pump_frame(
             }
         }
         (Codec::Delta, RuntimeEvent::SessionExited { session, .. }) => {
-            exited_this_batch.insert(*session);
+            exited_sessions.insert(*session);
             last_sent.remove(session);
             codec.encode_event(event)
         }
@@ -1258,6 +1466,9 @@ impl RemoteRuntimeClient {
         stream
             .set_read_timeout(None)
             .context("remote 핸드셰이크 대기 해제 실패")?;
+        stream
+            .set_write_timeout(Some(PLAIN_CMD_WRITE_TIMEOUT))
+            .context("remote plain 명령 write timeout 설정 실패")?;
         // 협상 불변식: agreed ⊆ 클라이언트 요청(CLIENT_FEATURES). 서버가 요청하지 않은
         // bit를 ack하면 rogue/버그 서버다 — 이를 거부해 서버가 클라이언트에 미협상 코덱을
         // 강제하지 못하게 한다 (codex 검수 P2). masking으로 무시만 하면, 서버가 그 기능으로
@@ -1841,8 +2052,10 @@ fn request_keyframe(writer: &Mutex<TcpStream>, session: SessionId) {
             return;
         }
     };
-    if let Ok(mut stream) = writer.lock() {
-        let _ = write_frame(&mut *stream, &payload);
+    if let Ok(mut stream) = writer.lock()
+        && write_frame(&mut *stream, &payload).is_err()
+    {
+        let _ = stream.shutdown(Shutdown::Both);
     }
 }
 
@@ -1877,7 +2090,11 @@ impl RuntimeCommandSink for RemoteRuntimeClient {
         match &self.transport {
             ClientTransport::Plain(writer) => {
                 let mut stream = writer.lock().expect("remote writer lock");
-                write_frame(&mut *stream, &payload).context("remote 명령 전송 실패")
+                write_frame(&mut *stream, &payload)
+                    .inspect_err(|_| {
+                        let _ = stream.shutdown(Shutdown::Both);
+                    })
+                    .context("remote 명령 전송 실패")
             }
             // IO 스레드로 enqueue (유계 try_send — 블록 없음). 큐 가득참(backpressure)과
             // IO 스레드 종료를 각각 명시적 Err로 surface한다 — 조용히 버리지 않는다(설계 요구 #3).
@@ -2344,10 +2561,11 @@ mod tests {
         drop(client_b);
     }
 
-    /// heartbeat: 유휴 접속에 HEARTBEAT_INTERVAL마다 길이 0 프레임이 온다 —
-    /// postcard RuntimeEvent는 항상 길이 > 0이라 정상 이벤트와 구분된다.
+    /// heartbeat/liveness: 유휴 접속에는 길이 0 heartbeat가 오거나, ResourceUsage 같은
+    /// 저빈도 상태 이벤트가 이미 흐르고 있으면 그 valid 이벤트가 liveness를 증명한다.
+    /// postcard RuntimeEvent는 항상 길이 > 0이라 heartbeat와 정상 이벤트가 구분된다.
     #[test]
-    fn 유휴_접속에_heartbeat_프레임() {
+    fn 유휴_접속은_heartbeat_또는_valid_event로_liveness_확인() {
         let server = RemoteRuntimeServer::serve(test_backend("heartbeat"), 0).unwrap();
         let mut raw = TcpStream::connect(server.local_addr()).unwrap();
         let hello = v2_handshake(&mut raw, server.auth_token().as_bytes(), CLIENT_FEATURES)
@@ -2356,8 +2574,12 @@ mod tests {
 
         // HEARTBEAT_INTERVAL(15s) + 15s 여유
         raw.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-        let frame = read_frame(&mut raw).expect("heartbeat 프레임을 받지 못함");
-        assert!(frame.is_empty(), "heartbeat 프레임은 길이 0이어야 한다");
+        let frame = read_frame(&mut raw).expect("heartbeat/event 프레임을 받지 못함");
+        if !frame.is_empty() {
+            Codec::Delta
+                .decode_event(&frame)
+                .expect("non-heartbeat liveness frame must be a valid event");
+        }
 
         server.shutdown();
     }
@@ -2542,6 +2764,126 @@ mod tests {
             scroll_offset: 0,
             is_alt_screen: alt,
         })
+    }
+
+    #[test]
+    fn outbound_queue는_viewport를_coalesce하고_status_lifecycle을_보존() {
+        let mut queue = OutboundEventQueue::with_caps(4, 2);
+        for i in 0..10 {
+            let line = format!("s{i}");
+            queue
+                .enqueue(RuntimeEvent::Viewport {
+                    session: SessionId(i),
+                    snapshot: make_snapshot(8, 2, &[line.as_str()], false),
+                    bracketed_paste: false,
+                })
+                .unwrap();
+        }
+        assert_eq!(queue.viewport_len(), 2, "viewport slot은 cap으로 제한된다");
+        assert_eq!(queue.durable_len(), 0);
+
+        queue
+            .enqueue(RuntimeEvent::SessionStatusChanged {
+                session: SessionId(100),
+                status: session::SessionStatus::NeedsApproval,
+            })
+            .unwrap();
+        queue
+            .enqueue(RuntimeEvent::SessionExited {
+                session: SessionId(101),
+                exit_code: Some(0),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            queue.pop_front(),
+            Some(RuntimeEvent::SessionStatusChanged {
+                session: SessionId(100),
+                status: session::SessionStatus::NeedsApproval,
+            })
+        ));
+        assert!(matches!(
+            queue.pop_front(),
+            Some(RuntimeEvent::SessionExited {
+                session: SessionId(101),
+                exit_code: Some(0),
+            })
+        ));
+
+        let remaining: Vec<SessionId> = std::iter::from_fn(|| match queue.pop_front() {
+            Some(RuntimeEvent::Viewport { session, .. }) => Some(session),
+            Some(other) => panic!(
+                "unexpected event after durable drain: {:?}",
+                kind_of(&other)
+            ),
+            None => None,
+        })
+        .collect();
+        assert_eq!(
+            remaining,
+            vec![SessionId(8), SessionId(9)],
+            "old viewport slots are dropped, newest slots remain"
+        );
+    }
+
+    #[test]
+    fn outbound_queue는_durable_overflow를_silent_drop하지_않는다() {
+        let mut queue = OutboundEventQueue::with_caps(2, 8);
+        queue
+            .enqueue(RuntimeEvent::SessionStatusChanged {
+                session: SessionId(1),
+                status: session::SessionStatus::Waiting,
+            })
+            .unwrap();
+        queue
+            .enqueue(RuntimeEvent::SessionStatusChanged {
+                session: SessionId(2),
+                status: session::SessionStatus::Done,
+            })
+            .unwrap();
+        let overflow = queue
+            .enqueue(RuntimeEvent::SessionExited {
+                session: SessionId(3),
+                exit_code: None,
+            })
+            .unwrap_err();
+        assert_eq!(overflow, OutboundOverflow::DurableFull);
+        assert_eq!(queue.durable_len(), 2, "durable queue remains bounded");
+    }
+
+    #[test]
+    fn receiver_drain은_durable_cap에서_멈춘다() {
+        let (tx, rx) = channel();
+        let viewports: Arc<Mutex<HashMap<SessionId, RuntimeEvent>>> = Arc::default();
+        let receiver = RuntimeEventReceiver {
+            events: rx,
+            viewports,
+        };
+        for i in 0..5 {
+            tx.send(RuntimeEvent::SessionStatusChanged {
+                session: SessionId(i),
+                status: session::SessionStatus::Running,
+            })
+            .unwrap();
+        }
+
+        let mut queue = OutboundEventQueue::with_caps(3, 8);
+        let overflow = drain_receiver_into_outbound(&receiver, &mut queue).unwrap_err();
+        assert_eq!(overflow, OutboundOverflow::DurableFull);
+        assert_eq!(queue.durable_len(), 3);
+    }
+
+    fn kind_of(event: &RuntimeEvent) -> &'static str {
+        match event {
+            RuntimeEvent::ShellSpawned { .. } => "ShellSpawned",
+            RuntimeEvent::AgentSpawned { .. } => "AgentSpawned",
+            RuntimeEvent::SpawnFailed { .. } => "SpawnFailed",
+            RuntimeEvent::Viewport { .. } => "Viewport",
+            RuntimeEvent::SessionExited { .. } => "SessionExited",
+            RuntimeEvent::MuxUpdated { .. } => "MuxUpdated",
+            RuntimeEvent::SessionStatusChanged { .. } => "SessionStatusChanged",
+            RuntimeEvent::ResourceUsage { .. } => "ResourceUsage",
+        }
     }
 
     fn mux_snapshot(active: &str, tabs: &[(&str, SessionId)]) -> Arc<MuxSnapshot> {
@@ -2959,7 +3301,7 @@ mod tests {
             session: s,
             exit_code: Some(0),
         };
-        let mut exited = HashSet::new();
+        let mut exited = ExitedSessionTombstones::new();
         let mut visible = None;
         encode_pump_frame(
             Codec::Delta,
@@ -2973,7 +3315,7 @@ mod tests {
             !last_sent.contains_key(&s),
             "SessionExited가 서버 baseline을 정리한다"
         );
-        assert!(exited.contains(&s), "종료 세션이 배치 집합에 등록된다");
+        assert!(exited.contains(&s), "종료 세션이 tombstone에 등록된다");
     }
 
     /// MuxUpdated(active_tab=B)는 서버 delta baseline을 visible set으로 prune하고,
@@ -2994,7 +3336,7 @@ mod tests {
         let mux = RuntimeEvent::MuxUpdated {
             snapshot: mux_snapshot("b", &[("a", hidden), ("b", visible_session)]),
         };
-        let mut exited = HashSet::new();
+        let mut exited = ExitedSessionTombstones::new();
         let mut visible = None;
         encode_pump_frame(
             Codec::Delta,
@@ -3096,7 +3438,7 @@ mod tests {
         assert!(last_sent.contains_key(&s));
 
         // 종료 tick: drain 순서대로 SessionExited(X) 먼저, Viewport(X) 나중.
-        let mut exited: HashSet<SessionId> = HashSet::new();
+        let mut exited = ExitedSessionTombstones::new();
         let exit_ev = RuntimeEvent::SessionExited {
             session: s,
             exit_code: Some(0),

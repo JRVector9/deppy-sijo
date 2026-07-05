@@ -158,6 +158,7 @@ impl WorkspaceUi {
                     self.pending_spawns = self.pending_spawns.saturating_sub(1);
                 }
                 RuntimeEvent::AgentSpawned { .. } => {}
+                RuntimeEvent::ResourceUsage { .. } => {}
             }
         }
     }

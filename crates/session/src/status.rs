@@ -30,6 +30,11 @@ pub struct StatusPatterns {
     done: Option<regex::Regex>,
 }
 
+struct ScreenMatchResult {
+    matches: Vec<(SessionStatus, String)>,
+    lines_scanned: usize,
+}
+
 impl StatusPatterns {
     /// 잘못된 regex는 무시하고 경고만 남긴다 (agent 실행 자체를 막지 않는다).
     pub fn compile(
@@ -70,18 +75,25 @@ impl StatusPatterns {
     /// 상태가 고착된다 (heuristic — 화면 중앙 고정 다이얼로그는 놓칠 수 있음).
     /// 꼬리 5줄에서 매치된 (상태, 라인 원문) 목록 — 라인 원문은 소비 판정
     /// (echo 연장 vs 새 프롬프트 구분)에 쓴다.
-    fn match_screen(&self, text: &str) -> Vec<(SessionStatus, String)> {
+    fn match_screen(&self, text: &str) -> ScreenMatchResult {
         const SCAN_TAIL_LINES: usize = 5;
-        text.lines()
+        let mut lines_scanned = 0;
+        let matches = text
+            .lines()
             .rev()
             .filter(|line| !line.trim().is_empty())
             .take(SCAN_TAIL_LINES)
             .filter_map(|line| {
+                lines_scanned += 1;
                 let line = line.trim_end();
                 self.match_text(line)
                     .map(|status| (status, line.to_owned()))
             })
-            .collect()
+            .collect();
+        ScreenMatchResult {
+            matches,
+            lines_scanned,
+        }
     }
 
     /// 우선순위: error > approval > done > waiting (안전한 쪽 우선).
@@ -124,6 +136,17 @@ struct ConsumedPrompt {
     count: usize,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StatusDetectorStats {
+    pub stream_chunks: u64,
+    pub stream_bytes: u64,
+    pub stream_lines: u64,
+    pub screen_scans: u64,
+    pub screen_lines_scanned: u64,
+    pub screen_scans_skipped_empty_patterns: u64,
+    pub idle_evaluations: u64,
+}
+
 pub struct StatusDetector {
     patterns: StatusPatterns,
     /// 완성되지 않은 마지막 라인 (chunk 경계 대응).
@@ -148,6 +171,7 @@ pub struct StatusDetector {
     screen_derived: bool,
     /// 출력이 없어도 다음 tick에 화면 스캔이 필요함 (입력 직후 — worker가 소비)
     screen_scan_requested: bool,
+    stats: StatusDetectorStats,
 }
 
 impl StatusDetector {
@@ -163,16 +187,31 @@ impl StatusDetector {
             idle_waiting: false,
             screen_derived: false,
             screen_scan_requested: false,
+            stats: StatusDetectorStats::default(),
         }
     }
 
-    /// 출력과 무관하게 화면 스캔이 예약돼 있으면 소비하고 true (입력 직후 케이스).
-    pub fn take_screen_scan_request(&mut self) -> bool {
-        std::mem::take(&mut self.screen_scan_requested)
+    /// 호출측이 `screen_text()`를 만들기 전에 묻는 비용 게이트.
+    ///
+    /// regex 패턴이 없는 세션은 idle heuristic만 필요하므로 출력 tick마다 backend grid
+    /// 텍스트를 읽지 않는다. 입력 직후 예약도 이 경로에서 1회성으로 소비한다.
+    pub fn should_scan_screen(&mut self, produced_output: bool) -> bool {
+        let requested = std::mem::take(&mut self.screen_scan_requested);
+        if self.patterns.is_empty() {
+            if produced_output || requested {
+                self.stats.screen_scans_skipped_empty_patterns += 1;
+            }
+            return false;
+        }
+        produced_output || requested
     }
 
     pub fn status(&self) -> SessionStatus {
         self.status
+    }
+
+    pub fn stats(&self) -> StatusDetectorStats {
+        self.stats
     }
 
     /// 사용자 입력 수신 — 현재 화면의 매치 프롬프트를 "응답됨"으로 소비한다.
@@ -195,7 +234,7 @@ impl StatusDetector {
         }
         // 응답이 화면을 다시 그리지 않아도(echo 없는 TUI) 다음 tick에 화면을
         // 재확인해야 한다 — 새 프롬프트가 이미 떠 있을 수 있다 (worker가 소비)
-        self.screen_scan_requested = true;
+        self.screen_scan_requested = !self.patterns.is_empty();
         self.status = SessionStatus::Running;
         self.idle_waiting = false;
         self.screen_derived = false;
@@ -211,6 +250,8 @@ impl StatusDetector {
     /// 상태를 지우지 않는다 — 해제는 사용자 입력(on_input)으로만.
     /// idle heuristic이 만든 Waiting만 출력으로 해제된다 (활동 재개).
     pub fn on_output(&mut self, chunk: &[u8]) {
+        self.stats.stream_chunks += 1;
+        self.stats.stream_bytes += chunk.len() as u64;
         self.last_output = Instant::now();
         if self.idle_waiting {
             self.status = SessionStatus::Running;
@@ -220,6 +261,7 @@ impl StatusDetector {
         // 완성된 라인들 평가, 미완 꼬리는 유지 (\n은 ASCII라 UTF-8 문자를 가르지 않는다)
         while let Some(pos) = self.line_buf.iter().position(|b| *b == b'\n') {
             let line: Vec<u8> = self.line_buf.drain(..=pos).collect();
+            self.stats.stream_lines += 1;
             let line = String::from_utf8_lossy(&line);
             // 시간상 나중의 stream 매치가 이전 상태를 대체한다 — 우선순위는
             // "같은 화면의 동시 매치" 충돌용이지 시간축 규칙이 아니다
@@ -243,7 +285,10 @@ impl StatusDetector {
         // edge-trigger — 같은 프롬프트 라인이 화면에 남아 있어도 재발화하지 않는다
         // (응답 후 상태 고착 방지). 진짜 계속 대기 중이면 idle이 백스톱.
         if let Some(text) = screen_text {
-            let matches = self.patterns.match_screen(text);
+            self.stats.screen_scans += 1;
+            let result = self.patterns.match_screen(text);
+            self.stats.screen_lines_scanned += result.lines_scanned as u64;
+            let matches = result.matches;
             self.last_screen_matches = matches.clone();
             // level-trigger: 매치가 화면에 남아 있는 동안 상태 유지. 단 사용자 입력으로
             // 소비된 프롬프트는 무시한다. 판정은 라인 prefix — echo로 연장된 라인
@@ -296,6 +341,7 @@ impl StatusDetector {
             }
         }
         // idle: 어떤 신호도 없고 출력이 멎었으면 입력 대기 추정 (약한 신호 — 출력으로 해제)
+        self.stats.idle_evaluations += 1;
         if self.status == SessionStatus::Running && self.last_output.elapsed() >= IDLE_THRESHOLD {
             self.status = SessionStatus::Waiting;
             self.idle_waiting = true;
@@ -511,10 +557,25 @@ mod tests {
     fn 입력은_화면_재스캔을_예약() {
         let p = StatusPatterns::compile(Some("WAIT"), None, None, None);
         let mut d = StatusDetector::new(p);
-        assert!(!d.take_screen_scan_request());
+        assert!(!d.should_scan_screen(false));
         d.on_input();
-        assert!(d.take_screen_scan_request());
-        assert!(!d.take_screen_scan_request()); // 1회성
+        assert!(d.should_scan_screen(false));
+        assert!(!d.should_scan_screen(false)); // 1회성
+    }
+
+    #[test]
+    fn regex_없는_detector는_screen_scan을_건너뛴다() {
+        let mut d = StatusDetector::new(StatusPatterns::compile(None, None, None, None));
+        d.on_output(b"busy\n");
+        assert!(!d.should_scan_screen(true));
+        d.evaluate(None);
+        let stats = d.stats();
+        assert_eq!(stats.stream_chunks, 1);
+        assert_eq!(stats.stream_lines, 1);
+        assert_eq!(stats.screen_scans, 0);
+        assert_eq!(stats.screen_scans_skipped_empty_patterns, 1);
+        d.on_input();
+        assert!(!d.should_scan_screen(false));
     }
 
     #[test]

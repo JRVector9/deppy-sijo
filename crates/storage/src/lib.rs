@@ -6,7 +6,13 @@ pub use db::{
     AgentConfigRow, ApprovalOutcome, ApprovalStatus, CredentialMeta, Db, EnvProfileRow, EnvValue,
     EnvVarRow, PendingApprovalRow, PermissionRuleRow, WorkspaceRow,
 };
+pub use mcp_store::PendingApprovalInsert;
 
 mod logs;
 
 pub use logs::SessionLogWriter;
+
+mod write_worker;
+pub use write_worker::{
+    DbWriteHandle, DbWriteQueueError, DbWriteStatsSnapshot, DbWriteWorker, DbWriteWorkerConfig,
+};

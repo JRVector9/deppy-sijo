@@ -127,6 +127,17 @@ pub struct PendingApprovalRow {
     pub created_at: i64,
 }
 
+/// 새 pending approval insert 요청. 표시 문자열은 이미 redacted된 preview만 허용한다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingApprovalInsert {
+    pub id: String,
+    pub server_id: String,
+    pub tool_name: String,
+    pub arguments_preview: String,
+    pub schema_hash: Option<String>,
+    pub created_at: i64,
+}
+
 pub fn list_permission_rules(conn: &Connection) -> anyhow::Result<Vec<PermissionRuleRow>> {
     let mut stmt = conn.prepare(
         "SELECT server_id, tool_name, rule, approved_schema_hash FROM tool_permission_rules",
@@ -188,22 +199,46 @@ pub fn insert_pending_approval(
     schema_hash: Option<&str>,
     created_at: i64,
 ) -> anyhow::Result<()> {
-    conn.execute(
+    let row = PendingApprovalInsert {
+        id: id.to_owned(),
+        server_id: server_id.to_owned(),
+        tool_name: tool_name.to_owned(),
+        arguments_preview: arguments_preview.to_owned(),
+        schema_hash: schema_hash.map(str::to_owned),
+        created_at,
+    };
+    insert_pending_approval_batch(conn, &[row])?;
+    Ok(())
+}
+
+/// pending approval insert를 한 prepared statement로 반복 실행한다.
+pub fn insert_pending_approval_batch(
+    conn: &Connection,
+    rows: &[PendingApprovalInsert],
+) -> anyhow::Result<usize> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let mut stmt = conn.prepare_cached(
         "INSERT INTO pending_approvals
            (id, server_id, tool_name, arguments_preview, schema_hash,
             status, remember, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6)",
-        (
-            id,
-            server_id,
-            tool_name,
-            arguments_preview,
-            schema_hash,
-            created_at,
-        ),
-    )
-    .with_context(|| format!("pending approval 저장 실패: {id}"))?;
-    Ok(())
+    )?;
+    let mut inserted = 0;
+    for row in rows {
+        stmt.execute((
+            &row.id,
+            &row.server_id,
+            &row.tool_name,
+            &row.arguments_preview,
+            &row.schema_hash,
+            row.created_at,
+        ))
+        .with_context(|| format!("pending approval 저장 실패: {}", row.id))?;
+        inserted += 1;
+    }
+    Ok(inserted)
 }
 
 /// 현재 상태를 폴링한다 (proxy가 반복 호출). 행이 없으면 Err — fail-closed.
@@ -648,6 +683,8 @@ mod tests {
         // 앱은 모든 연결에 foreign_keys=ON을 강제한다 (§11.9) — 테스트도 동일 조건
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         conn.execute_batch(MIGRATION_SQL).unwrap();
+        conn.execute_batch(MIGRATION_TOOL_PERMISSION_RULES).unwrap();
+        conn.execute_batch(MIGRATION_PENDING_APPROVALS).unwrap();
         conn
     }
 
@@ -726,6 +763,38 @@ mod tests {
             .query_row("SELECT count(*) FROM mcp_servers", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn pending_approval_batch_insert_roundtrip() {
+        let conn = test_conn();
+        insert_pending_approval_batch(
+            &conn,
+            &[
+                PendingApprovalInsert {
+                    id: "b".to_owned(),
+                    server_id: "srv".to_owned(),
+                    tool_name: "read_file".to_owned(),
+                    arguments_preview: "path=/tmp/b".to_owned(),
+                    schema_hash: None,
+                    created_at: 20,
+                },
+                PendingApprovalInsert {
+                    id: "a".to_owned(),
+                    server_id: "srv".to_owned(),
+                    tool_name: "write_file".to_owned(),
+                    arguments_preview: "path=/tmp/a".to_owned(),
+                    schema_hash: Some("hash".to_owned()),
+                    created_at: 10,
+                },
+            ],
+        )
+        .unwrap();
+
+        let rows = list_pending_approvals(&conn).unwrap();
+        let ids: Vec<_> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+        assert_eq!(rows[0].schema_hash.as_deref(), Some("hash"));
     }
 
     #[test]

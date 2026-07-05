@@ -3928,6 +3928,7 @@ dependencies = [
  "anyhow",
  "deppy-core",
  "keyring-core",
+ "libc",
  "mux",
  "persist",
  "postcard",

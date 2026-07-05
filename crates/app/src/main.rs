@@ -57,7 +57,15 @@ fn main() -> anyhow::Result<()> {
             // 사용자가 창을 잃어버릴 수 있다 (2026-07-05: 왼쪽 외부 모니터에 떠서
             // "앱이 죽은 줄" — 실은 정상 실행 중이었다).
             centered: true,
-            viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 800.0]),
+            // 상단 바를 macOS 네이티브 타이틀바 영역으로 끌어올린다 (2026-07-06):
+            // fullsize content view로 콘텐츠가 타이틀바까지 확장되고, 네이티브 제목
+            // 텍스트는 숨긴다. 신호등(닫기/최소화/전체화면)은 그대로 남는다.
+            // 상단 바 렌더는 신호등 폭만큼 왼쪽 여백을 두고, 빈 영역은 창 드래그로 처리한다.
+            viewport: egui::ViewportBuilder::default()
+                .with_inner_size([1200.0, 800.0])
+                .with_fullsize_content_view(true)
+                .with_title_shown(false)
+                .with_titlebar_shown(true),
             ..Default::default()
         },
         Box::new(move |cc| {

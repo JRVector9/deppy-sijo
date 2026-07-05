@@ -29,192 +29,547 @@ pub struct RemoteView<'a> {
     pub known_hosts: &'a [(String, String)],
 }
 
+/// 통합 설정 창의 좌측 네비 — 인라인으로 렌더하는 "설정" 카테고리.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum Category {
+    #[default]
+    General,
+    Language,
+    Terminal,
+    Performance,
+    RemoteTls,
+}
+
+/// "관리"/"모니터" 그룹 — 아직 별도 패널을 여는 기존 기능들. 통합 창 네비에서 선택 시
+/// App이 해당 패널을 연다 (전체 인라인화는 후속 — 2026-07-06).
+pub enum OpenPanel {
+    Credentials,
+    Connectors,
+    Environment,
+    Agents,
+    Workspaces,
+    Activity,
+    Notifications,
+}
+
 /// 설정 창 결과.
 pub struct SettingsOutput {
     /// config 값이 바뀌어 저장이 필요한가 (테마/터미널/성능/포트).
     pub config_changed: bool,
     /// Remote 섹션 동작 요청.
     pub remote_action: RemoteAction,
+    /// 관리/모니터 네비 항목 클릭 — App이 해당 패널을 연다.
+    pub open_panel: Option<OpenPanel>,
 }
 
-/// 설정 창. config 변경 여부와 Remote 섹션 동작을 [`SettingsOutput`]으로 돌려준다.
+/// 통합 설정 창 (2026-07-06 — 흩어진 툴바 기능을 좌측 네비 한 창으로).
+/// 좌측: 검색 + 그룹별 카테고리. 우측: 선택된 카테고리의 폼. config 변경/Remote 동작/패널
+/// 열기 요청을 [`SettingsOutput`]으로 돌려준다.
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ctx: &egui::Context,
     open: &mut bool,
+    category: &mut Category,
     config: &mut Config,
     remote: &RemoteView,
     reveal_token: &mut bool,
+    notif_unread: u32,
     catalog: &i18n::Catalog,
 ) -> SettingsOutput {
     let mut changed = false;
     let mut remote_action = RemoteAction::None;
+    let mut open_panel = None;
+
     egui::Window::new(catalog.t("settings.title", &[]))
         .open(open)
-        .resizable(false)
+        .collapsible(false)
+        .default_size([1000.0, 640.0])
+        .min_size([720.0, 460.0])
         .show(ctx, |ui| {
-            ui.heading(catalog.t("settings.ui", &[]));
-            ui.horizontal(|ui| {
-                ui.label(catalog.t("settings.theme", &[]));
-                for (theme, label_key) in [
-                    (Theme::System, "settings.theme.system"),
-                    (Theme::Light, "settings.theme.light"),
-                    (Theme::Dark, "settings.theme.dark"),
-                ] {
-                    changed |= ui
-                        .selectable_value(&mut config.ui.theme, theme, catalog.t(label_key, &[]))
-                        .changed();
-                }
+            egui::Panel::left("settings_nav")
+                .resizable(false)
+                .exact_size(216.0)
+                .show(ui, |ui| {
+                    nav(ui, category, &mut open_panel, notif_unread, catalog);
+                });
+            egui::CentralPanel::default().show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        match category {
+                            Category::General => general_page(ui, config, &mut changed, catalog),
+                            Category::Language => language_page(ui, config, &mut changed, catalog),
+                            Category::Terminal => terminal_page(ui, config, &mut changed, catalog),
+                            Category::Performance => {
+                                performance_page(ui, config, &mut changed, catalog)
+                            }
+                            Category::RemoteTls => remote_page(
+                                ui,
+                                config,
+                                remote,
+                                reveal_token,
+                                &mut changed,
+                                &mut remote_action,
+                                catalog,
+                            ),
+                        }
+                    });
             });
-            // 폴더 트리 사이드바 ON/OFF (file-tree-design §6) — hot toggle, OFF면 리소스 0
-            changed |= ui
-                .checkbox(
-                    &mut config.ui.file_tree_enabled,
-                    catalog.t("settings.file_tree_sidebar", &[]),
+        });
+
+    SettingsOutput {
+        config_changed: changed,
+        remote_action,
+        open_panel,
+    }
+}
+
+// ── 좌측 네비 ──
+
+fn nav(
+    ui: &mut egui::Ui,
+    category: &mut Category,
+    open_panel: &mut Option<OpenPanel>,
+    notif_unread: u32,
+    catalog: &i18n::Catalog,
+) {
+    ui.add_space(4.0);
+    // 검색 박스 (시각적 — 필터는 후속)
+    egui::Frame::default()
+        .fill(ui.visuals().extreme_bg_color)
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(9, 6))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.weak("🔍");
+                ui.weak(catalog.t("settings.search", &[]));
+            });
+        });
+    ui.add_space(8.0);
+
+    ui.weak(catalog.t("settings.group.settings", &[]));
+    nav_item(
+        ui,
+        category,
+        Category::General,
+        "⚙",
+        &catalog.t("settings.cat.general", &[]),
+    );
+    nav_item(
+        ui,
+        category,
+        Category::Language,
+        "🌐",
+        &catalog.t("settings.language", &[]),
+    );
+    nav_item(
+        ui,
+        category,
+        Category::Terminal,
+        "▤",
+        &catalog.t("settings.terminal", &[]),
+    );
+    nav_item(
+        ui,
+        category,
+        Category::Performance,
+        "⚡",
+        &catalog.t("settings.performance", &[]),
+    );
+    nav_item(
+        ui,
+        category,
+        Category::RemoteTls,
+        "🔒",
+        &catalog.t("settings.remote_tls", &[]),
+    );
+
+    ui.add_space(6.0);
+    ui.weak(catalog.t("settings.group.manage", &[]));
+    nav_open(
+        ui,
+        "🔑",
+        &catalog.t("top.credentials", &[]),
+        None,
+        open_panel,
+        OpenPanel::Credentials,
+    );
+    nav_open(
+        ui,
+        "🔗",
+        &catalog.t("top.connectors", &[]),
+        None,
+        open_panel,
+        OpenPanel::Connectors,
+    );
+    nav_open(
+        ui,
+        "▦",
+        &catalog.t("top.environment", &[]),
+        None,
+        open_panel,
+        OpenPanel::Environment,
+    );
+    nav_open(
+        ui,
+        "◆",
+        &catalog.t("top.agents", &[]),
+        None,
+        open_panel,
+        OpenPanel::Agents,
+    );
+    nav_open(
+        ui,
+        "▢",
+        &catalog.t("top.workspaces", &[]),
+        None,
+        open_panel,
+        OpenPanel::Workspaces,
+    );
+
+    ui.add_space(6.0);
+    ui.weak(catalog.t("settings.group.monitor", &[]));
+    nav_open(
+        ui,
+        "◷",
+        &catalog.t("top.activity", &[]),
+        None,
+        open_panel,
+        OpenPanel::Activity,
+    );
+    let badge = (notif_unread > 0).then(|| notif_unread.to_string());
+    nav_open(
+        ui,
+        "🔔",
+        &catalog.t("top.notifications", &[]),
+        badge,
+        open_panel,
+        OpenPanel::Notifications,
+    );
+}
+
+fn nav_item(ui: &mut egui::Ui, current: &mut Category, cat: Category, icon: &str, label: &str) {
+    let selected = *current == cat;
+    let text = format!("{icon}  {label}");
+    if ui.selectable_label(selected, text).clicked() {
+        *current = cat;
+    }
+}
+
+fn nav_open(
+    ui: &mut egui::Ui,
+    icon: &str,
+    label: &str,
+    badge: Option<String>,
+    out: &mut Option<OpenPanel>,
+    which: OpenPanel,
+) {
+    ui.horizontal(|ui| {
+        let text = format!("{icon}  {label}");
+        if ui.selectable_label(false, text).clicked() {
+            *out = Some(which);
+        }
+        if let Some(b) = badge {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(format!(" {b} "))
+                        .small()
+                        .background_color(ui.visuals().warn_fg_color)
+                        .color(egui::Color32::from_rgb(0x1a, 0x1a, 0x1a)),
+                );
+            });
+        }
+    });
+}
+
+// ── 폼 헬퍼 ──
+
+/// 섹션 제목.
+fn section(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(10.0);
+    ui.label(egui::RichText::new(title).size(16.0).strong());
+    ui.add_space(4.0);
+}
+
+/// label(+hint) 왼쪽, 컨트롤 오른쪽. 아래 픽셀-스냅 헤어라인.
+fn row(
+    ui: &mut egui::Ui,
+    label: &str,
+    hint: Option<&str>,
+    add_control: impl FnOnce(&mut egui::Ui),
+) {
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(egui::RichText::new(label).size(13.5));
+            if let Some(h) = hint {
+                ui.label(egui::RichText::new(h).weak().small());
+            }
+        });
+        ui.with_layout(
+            egui::Layout::right_to_left(egui::Align::Center),
+            add_control,
+        );
+    });
+    ui.add_space(8.0);
+    crate::ui::hairline(ui);
+}
+
+/// 토글 스위치 (checkbox 대체 — 목업 스타일). 값이 바뀌면 true.
+fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(38.0, 22.0), egui::Sense::click());
+    let mut changed = false;
+    if resp.clicked() {
+        *on = !*on;
+        changed = true;
+    }
+    let radius = rect.height() / 2.0;
+    let bg = if *on {
+        ui.visuals().selection.bg_fill
+    } else {
+        ui.visuals().widgets.inactive.bg_fill
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, radius, bg);
+    let t = if *on { 1.0 } else { 0.0 };
+    let knob_x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), t);
+    painter.circle_filled(
+        egui::pos2(knob_x, rect.center().y),
+        radius - 3.0,
+        egui::Color32::from_rgb(0xf4, 0xf4, 0xf6),
+    );
+    changed
+}
+
+// ── 카테고리 페이지 ──
+
+fn general_page(
+    ui: &mut egui::Ui,
+    config: &mut Config,
+    changed: &mut bool,
+    catalog: &i18n::Catalog,
+) {
+    section(ui, &catalog.t("settings.appearance", &[]));
+    row(
+        ui,
+        &catalog.t("settings.theme", &[]),
+        Some(&catalog.t("settings.theme.hint", &[])),
+        |ui| {
+            for (theme, key) in [
+                (Theme::Dark, "settings.theme.dark"),
+                (Theme::Light, "settings.theme.light"),
+                (Theme::System, "settings.theme.system"),
+            ] {
+                *changed |= ui
+                    .selectable_value(&mut config.ui.theme, theme, catalog.t(key, &[]))
+                    .changed();
+            }
+        },
+    );
+    row(
+        ui,
+        &catalog.t("settings.file_tree_sidebar", &[]),
+        Some(&catalog.t("settings.file_tree.hint", &[])),
+        |ui| {
+            if toggle_switch(ui, &mut config.ui.file_tree_enabled) {
+                *changed = true;
+            }
+        },
+    );
+}
+
+fn language_page(
+    ui: &mut egui::Ui,
+    config: &mut Config,
+    changed: &mut bool,
+    catalog: &i18n::Catalog,
+) {
+    section(ui, &catalog.t("settings.language", &[]));
+    row(
+        ui,
+        &catalog.t("settings.locale", &[]),
+        Some(&catalog.t("settings.locale.hint", &[])),
+        |ui| {
+            egui::ComboBox::from_id_salt("locale_combo")
+                .selected_text(current_locale_label(&config.i18n.locale, catalog))
+                .show_ui(ui, |ui| {
+                    for (locale, key) in [
+                        (i18n::FALLBACK_LOCALE, "settings.locale.en_us"),
+                        ("ja-JP", "settings.locale.ja_jp"),
+                        ("zh-Hans", "settings.locale.zh_hans"),
+                        ("zh-Hant", "settings.locale.zh_hant"),
+                        ("ko-KR", "settings.locale.ko_kr"),
+                        (i18n::PSEUDO_LOCALE, "settings.locale.pseudo"),
+                    ] {
+                        *changed |= ui
+                            .selectable_value(
+                                &mut config.i18n.locale,
+                                locale.to_owned(),
+                                catalog.t(key, &[]),
+                            )
+                            .changed();
+                    }
+                });
+        },
+    );
+}
+
+fn current_locale_label(locale: &str, catalog: &i18n::Catalog) -> String {
+    let key = match locale {
+        "ja-JP" => "settings.locale.ja_jp",
+        "zh-Hans" => "settings.locale.zh_hans",
+        "zh-Hant" => "settings.locale.zh_hant",
+        "ko-KR" => "settings.locale.ko_kr",
+        l if l == i18n::PSEUDO_LOCALE => "settings.locale.pseudo",
+        _ => "settings.locale.en_us",
+    };
+    catalog.t(key, &[])
+}
+
+fn terminal_page(
+    ui: &mut egui::Ui,
+    config: &mut Config,
+    changed: &mut bool,
+    catalog: &i18n::Catalog,
+) {
+    section(ui, &catalog.t("settings.terminal", &[]));
+    row(ui, &catalog.t("settings.font_size", &[]), None, |ui| {
+        *changed |= ui
+            .add(
+                egui::DragValue::new(&mut config.terminal.font_size)
+                    .range(8.0..=32.0)
+                    .speed(0.2),
+            )
+            .changed();
+    });
+    row(
+        ui,
+        &catalog.t("settings.scrollback_lines", &[]),
+        Some(&catalog.t("settings.scrollback.hint", &[])),
+        |ui| {
+            *changed |= ui
+                .add(
+                    egui::DragValue::new(&mut config.terminal.scrollback_lines)
+                        .range(1_000..=100_000)
+                        .speed(50),
                 )
                 .changed();
+        },
+    );
+}
 
-            ui.separator();
-            ui.heading(catalog.t("settings.language", &[]));
-            ui.horizontal_wrapped(|ui| {
-                ui.label(catalog.t("settings.locale", &[]));
-                for (locale, label_key) in [
-                    (i18n::FALLBACK_LOCALE, "settings.locale.en_us"),
-                    ("ja-JP", "settings.locale.ja_jp"),
-                    ("zh-Hans", "settings.locale.zh_hans"),
-                    ("zh-Hant", "settings.locale.zh_hant"),
-                    ("ko-KR", "settings.locale.ko_kr"),
-                    (i18n::PSEUDO_LOCALE, "settings.locale.pseudo"),
-                ] {
-                    changed |= ui
-                        .selectable_value(
-                            &mut config.i18n.locale,
-                            locale.to_owned(),
-                            catalog.t(label_key, &[]),
-                        )
-                        .changed();
-                }
-            });
+fn performance_page(
+    ui: &mut egui::Ui,
+    config: &mut Config,
+    changed: &mut bool,
+    catalog: &i18n::Catalog,
+) {
+    section(ui, &catalog.t("settings.performance", &[]));
+    row(
+        ui,
+        &catalog.t("settings.output_batch_ms", &[]),
+        Some(&catalog.t("settings.output_batch.hint", &[])),
+        |ui| {
+            ui.weak(catalog.t("settings.restart_required", &[]));
+            *changed |= ui
+                .add(egui::DragValue::new(&mut config.performance.output_batch_ms).range(16..=50))
+                .changed();
+        },
+    );
+}
 
-            ui.separator();
-            ui.heading(catalog.t("settings.terminal", &[]));
-            ui.horizontal(|ui| {
-                ui.label(catalog.t("settings.font_size", &[]));
-                changed |= ui
-                    .add(egui::DragValue::new(&mut config.terminal.font_size).range(8.0..=32.0))
-                    .changed();
-            });
-            ui.horizontal(|ui| {
-                ui.label(catalog.t("settings.scrollback_lines", &[]));
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut config.terminal.scrollback_lines)
-                            .range(1_000..=100_000),
-                    )
-                    .changed();
-            });
-
-            ui.separator();
-            ui.heading(catalog.t("settings.performance", &[]));
-            ui.horizontal(|ui| {
-                ui.label(catalog.t("settings.output_batch_ms", &[]));
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut config.performance.output_batch_ms)
-                            .range(16..=50),
-                    )
-                    .changed();
-                ui.weak(catalog.t("settings.restart_required", &[]));
-            });
-
-            ui.separator();
-            ui.heading(catalog.t("settings.remote_tls", &[]));
-            // 체크박스 = 실행 중 OR 저장된 자동시작 의도. 자동시작이 실패해도 켜진 채(+에러
-            // 표시)로 남아, 사용자가 꺼서 persisted auto-start를 해제할 수 있다 (codex Medium —
-            // running만 반영하면 실패 상태에서 Start만 나가 auto-start를 UI로 끌 수 없음).
-            let mut enabled = remote.running || config.remote.tls_enabled;
-            if ui
-                .checkbox(&mut enabled, catalog.t("settings.remote_tls_enabled", &[]))
-                .changed()
-            {
-                remote_action = if enabled {
+#[allow(clippy::too_many_arguments)]
+fn remote_page(
+    ui: &mut egui::Ui,
+    config: &mut Config,
+    remote: &RemoteView,
+    reveal_token: &mut bool,
+    changed: &mut bool,
+    remote_action: &mut RemoteAction,
+    catalog: &i18n::Catalog,
+) {
+    section(ui, &catalog.t("settings.remote_tls", &[]));
+    // 체크박스 = 실행 중 OR 저장된 자동시작 의도 (codex Medium — running만 반영하면
+    // 실패 상태에서 auto-start를 UI로 끌 수 없음).
+    let mut enabled = remote.running || config.remote.tls_enabled;
+    row(
+        ui,
+        &catalog.t("settings.remote_tls_enabled", &[]),
+        Some(&catalog.t("settings.toggle_restart_required", &[])),
+        |ui| {
+            if toggle_switch(ui, &mut enabled) {
+                *remote_action = if enabled {
                     RemoteAction::Start
                 } else {
                     RemoteAction::Stop
                 };
             }
-            ui.horizontal(|ui| {
-                ui.label(catalog.t("settings.port", &[]));
-                changed |= ui
-                    .add(egui::DragValue::new(&mut config.remote.port).range(0..=65535))
-                    .changed();
-                ui.weak(catalog.t("settings.toggle_restart_required", &[]));
+        },
+    );
+    row(ui, &catalog.t("settings.port", &[]), None, |ui| {
+        *changed |= ui
+            .add(egui::DragValue::new(&mut config.remote.port).range(0..=65535))
+            .changed();
+    });
+    if let Some(err) = remote.error {
+        ui.colored_label(
+            ui.visuals().error_fg_color,
+            catalog.t("settings.start_failed", &[("message", err)]),
+        );
+    }
+    if remote.running {
+        if let Some(addr) = &remote.addr {
+            row(ui, &catalog.t("settings.address", &[]), None, |ui| {
+                ui.add(egui::Label::new(egui::RichText::new(addr).monospace()).selectable(true));
             });
-            if let Some(err) = remote.error {
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    catalog.t("settings.start_failed", &[("message", err)]),
+        }
+        if let Some(fp) = remote.fingerprint {
+            ui.add_space(6.0);
+            ui.label(catalog.t("settings.fingerprint", &[]));
+            ui.add(
+                egui::Label::new(egui::RichText::new(fp).monospace())
+                    .selectable(true)
+                    .wrap(),
+            );
+            crate::ui::hairline(ui);
+        }
+        if let Some(token) = remote.token {
+            row(ui, &catalog.t("settings.token", &[]), None, |ui| {
+                ui.checkbox(reveal_token, catalog.t("settings.show", &[]));
+            });
+            if *reveal_token {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(token).monospace())
+                        .selectable(true)
+                        .wrap(),
                 );
-            }
-            if remote.running {
-                if let Some(addr) = &remote.addr {
-                    ui.horizontal(|ui| {
-                        ui.label(catalog.t("settings.address", &[]));
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(addr).monospace())
-                                .selectable(true),
-                        );
-                    });
-                }
-                if let Some(fp) = remote.fingerprint {
-                    ui.label(catalog.t("settings.fingerprint", &[]));
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(fp).monospace())
-                            .selectable(true)
-                            .wrap(),
-                    );
-                }
-                if let Some(token) = remote.token {
-                    ui.horizontal(|ui| {
-                        ui.label(catalog.t("settings.token", &[]));
-                        ui.checkbox(reveal_token, catalog.t("settings.show", &[]));
-                    });
-                    if *reveal_token {
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(token).monospace())
-                                .selectable(true)
-                                .wrap(),
-                        );
-                        ui.colored_label(
-                            ui.visuals().warn_fg_color,
-                            catalog.t("settings.token_sensitive_warning", &[]),
-                        );
-                    } else {
-                        ui.weak(catalog.t("settings.token_hidden_hint", &[]));
-                    }
-                }
-                ui.weak(catalog.t("settings.client_fingerprint_hint", &[]));
-            }
-
-            ui.separator();
-            ui.heading(catalog.t("settings.known_hosts", &[]));
-            ui.weak(remote.known_hosts_path.as_str());
-            if remote.known_hosts.is_empty() {
-                ui.weak(catalog.t("settings.no_trust_records", &[]));
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    catalog.t("settings.token_sensitive_warning", &[]),
+                );
             } else {
-                for (host, fp) in remote.known_hosts {
-                    ui.horizontal(|ui| {
-                        ui.monospace(host);
-                        ui.weak(truncate_fingerprint(fp, 17));
-                        if ui.button(catalog.t("settings.forget", &[])).clicked() {
-                            remote_action = RemoteAction::Forget(host.clone());
-                        }
-                    });
-                }
+                ui.weak(catalog.t("settings.token_hidden_hint", &[]));
             }
-        });
-    SettingsOutput {
-        config_changed: changed,
-        remote_action,
+        }
+        ui.weak(catalog.t("settings.client_fingerprint_hint", &[]));
+    }
+
+    section(ui, &catalog.t("settings.known_hosts", &[]));
+    ui.weak(remote.known_hosts_path.as_str());
+    if remote.known_hosts.is_empty() {
+        ui.weak(catalog.t("settings.no_trust_records", &[]));
+    } else {
+        for (host, fp) in remote.known_hosts {
+            ui.horizontal(|ui| {
+                ui.monospace(host);
+                ui.weak(truncate_fingerprint(fp, 17));
+                if ui.button(catalog.t("settings.forget", &[])).clicked() {
+                    *remote_action = RemoteAction::Forget(host.clone());
+                }
+            });
+        }
     }
 }
 

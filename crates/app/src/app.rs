@@ -330,6 +330,8 @@ pub struct App {
     config: Config,
     config_path: PathBuf,
     settings_open: bool,
+    /// 통합 설정 창의 선택된 카테고리.
+    settings_category: ui::settings::Category,
     db: Db,
     secret_store: KeyringSecretStore,
     agents_ui: ui::agents::AgentsUi,
@@ -445,6 +447,7 @@ impl App {
             config,
             config_path,
             settings_open: false,
+            settings_category: ui::settings::Category::default(),
             db,
             secret_store: KeyringSecretStore,
             agents_ui: ui::agents::AgentsUi::new(),
@@ -1347,48 +1350,65 @@ impl eframe::App for App {
         self.frame_stats.begin();
         let text = self.i18n.clone();
         let mut unread_before = 0;
-        egui::Panel::top("top_bar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button(text.t("top.settings", &[])).clicked() {
-                    self.settings_open = !self.settings_open;
+        egui::Panel::top("top_bar")
+            .resizable(false)
+            .exact_size(40.0)
+            .show(ui, |ui| {
+                // 타이틀바 영역 통합 (2026-07-06): 빈 곳을 잡으면 창을 드래그로 옮긴다.
+                // 버튼보다 먼저 등록해 버튼 위 클릭은 버튼이, 빈 영역 드래그는 이쪽이 받는다.
+                let bar_rect = ui.max_rect();
+                let drag = ui.interact(
+                    bar_rect,
+                    egui::Id::new("titlebar_drag"),
+                    egui::Sense::click_and_drag(),
+                );
+                if drag.drag_started_by(egui::PointerButton::Primary) {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
-                if ui.button(text.t("top.credentials", &[])).clicked() {
-                    self.credentials_ui.toggle();
-                }
-                if ui.button(text.t("top.connectors", &[])).clicked() {
-                    self.connectors_ui.toggle();
-                }
-                if ui.button(text.t("top.environment", &[])).clicked() {
-                    self.env_profiles_ui.toggle();
-                }
-                if ui.button(text.t("top.agents", &[])).clicked() {
-                    self.agents_ui.toggle();
-                }
-                if ui.button(text.t("top.workspaces", &[])).clicked() {
-                    self.workspaces_open = !self.workspaces_open;
-                    if self.workspaces_open {
+                ui.horizontal_centered(|ui| {
+                    // 신호등(닫기/최소화/전체화면) 폭만큼 왼쪽 여백 — macOS.
+                    #[cfg(target_os = "macos")]
+                    ui.add_space(72.0);
+                    if ui.button(text.t("top.settings", &[])).clicked() {
+                        self.settings_open = !self.settings_open;
+                    }
+                    if ui.button(text.t("top.credentials", &[])).clicked() {
+                        self.credentials_ui.toggle();
+                    }
+                    if ui.button(text.t("top.connectors", &[])).clicked() {
+                        self.connectors_ui.toggle();
+                    }
+                    if ui.button(text.t("top.environment", &[])).clicked() {
+                        self.env_profiles_ui.toggle();
+                    }
+                    if ui.button(text.t("top.agents", &[])).clicked() {
+                        self.agents_ui.toggle();
+                    }
+                    if ui.button(text.t("top.workspaces", &[])).clicked() {
+                        self.workspaces_open = !self.workspaces_open;
+                        if self.workspaces_open {
+                            self.refresh_workspaces();
+                        }
+                    }
+                    if ui.button(text.t("top.activity", &[])).clicked() {
+                        self.activity_ui.toggle();
                         self.refresh_workspaces();
                     }
-                }
-                if ui.button(text.t("top.activity", &[])).clicked() {
-                    self.activity_ui.toggle();
-                    self.refresh_workspaces();
-                }
-                let unread = self.notifications_ui.unread();
-                unread_before = unread;
-                let label = if unread > 0 {
-                    let count = unread.to_string();
-                    text.t("top.notifications.unread", &[("count", &count)])
-                } else {
-                    text.t("top.notifications", &[])
-                };
-                if ui.button(label).clicked() {
-                    // 열면 모두 읽음 → 배지가 이미 그려진 뒤라 다음 프레임에 갱신
-                    self.notifications_ui.toggle();
-                    ui.ctx().request_repaint();
-                }
+                    let unread = self.notifications_ui.unread();
+                    unread_before = unread;
+                    let label = if unread > 0 {
+                        let count = unread.to_string();
+                        text.t("top.notifications.unread", &[("count", &count)])
+                    } else {
+                        text.t("top.notifications", &[])
+                    };
+                    if ui.button(label).clicked() {
+                        // 열면 모두 읽음 → 배지가 이미 그려진 뒤라 다음 프레임에 갱신
+                        self.notifications_ui.toggle();
+                        ui.ctx().request_repaint();
+                    }
+                });
             });
-        });
 
         // 폴더 트리 사이드바 (FT-1) — CentralPanel보다 먼저 배치해야 한다 (§9-1).
         // OFF(None)면 Panel 자체를 만들지 않는다 (§6 리소스 0).
@@ -1644,14 +1664,40 @@ impl eframe::App for App {
                 known_hosts: self.known_hosts_cache.as_deref().unwrap_or(&[]),
             }
         };
+        let notif_unread = self.notifications_ui.unread() as u32;
         let out = ui::settings::show(
             ui.ctx(),
             &mut self.settings_open,
+            &mut self.settings_category,
             &mut self.config,
             &remote_view,
             &mut self.remote_reveal_token,
+            notif_unread,
             &text,
         );
+        // 관리/모니터 네비 항목 클릭 — 아직 별도 패널을 여는 기존 기능들 (전체 인라인화 후속).
+        if let Some(panel) = out.open_panel {
+            match panel {
+                ui::settings::OpenPanel::Credentials => self.credentials_ui.toggle(),
+                ui::settings::OpenPanel::Connectors => self.connectors_ui.toggle(),
+                ui::settings::OpenPanel::Environment => self.env_profiles_ui.toggle(),
+                ui::settings::OpenPanel::Agents => self.agents_ui.toggle(),
+                ui::settings::OpenPanel::Workspaces => {
+                    self.workspaces_open = !self.workspaces_open;
+                    if self.workspaces_open {
+                        self.refresh_workspaces();
+                    }
+                }
+                ui::settings::OpenPanel::Activity => {
+                    self.activity_ui.toggle();
+                    self.refresh_workspaces();
+                }
+                ui::settings::OpenPanel::Notifications => {
+                    self.notifications_ui.toggle();
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
         if out.config_changed {
             self.config.i18n.locale = i18n::normalize_locale(&self.config.i18n.locale);
             if self.i18n.locale() != self.config.i18n.locale {

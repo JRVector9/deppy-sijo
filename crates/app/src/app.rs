@@ -200,6 +200,8 @@ struct WorkspaceRuntime {
     /// 세션→제목 캐시 (MuxUpdated에서 누적) — Warm 동안 mux가 안 갱신돼도 알림 제목을
     /// 해석하기 위함. exit 처리 후 제거해 live 세션으로 유계.
     session_titles: std::collections::HashMap<runtime::SessionId, String>,
+    /// 마지막 worker resource sample. PR-U25 activity view 표시용.
+    resource_usage: Option<runtime::ProcessResourceSnapshot>,
     /// Warm으로 내려간 시각. 일정 시간 이후 자동 Suspended(워커 shutdown)로 내린다.
     backgrounded_at: Option<std::time::Instant>,
 }
@@ -222,6 +224,7 @@ pub struct App {
     connectors_ui: ui::connectors::ConnectorsUi,
     credentials_ui: ui::credentials::CredentialsUi,
     env_profiles_ui: ui::env_profiles::EnvProfilesUi,
+    activity_ui: ui::activity::ActivityUi,
     notifications_ui: ui::notifications::NotificationsUi,
     /// agent-proxy 승인 팝업 (option 1.5). proxy가 DB에 쓴 pending 행을 폴링해 표시한다.
     approvals_ui: ui::approvals::ApprovalsUi,
@@ -336,6 +339,7 @@ impl App {
             connectors_ui: ui::connectors::ConnectorsUi::new(redaction.clone()),
             credentials_ui: ui::credentials::CredentialsUi::new(),
             env_profiles_ui: ui::env_profiles::EnvProfilesUi::new(),
+            activity_ui: ui::activity::ActivityUi::new(),
             notifications_ui: ui::notifications::NotificationsUi::new(),
             approvals_ui: ui::approvals::ApprovalsUi::new(),
             approval_poll_requested,
@@ -438,6 +442,7 @@ impl App {
             render_active: true,
             pending_events: Vec::new(),
             session_titles: std::collections::HashMap::new(),
+            resource_usage: None,
             backgrounded_at: None,
         }
     }
@@ -657,6 +662,7 @@ impl App {
             // 마지막으로 큐에 남은 이벤트를 처리해 방금 끝난 background 작업의 완료/오류
             // 알림을 놓치지 않는다 (codex 리뷰 — 축출 시 receiver drop으로 유실되던 것).
             let events = rt.events.drain();
+            Self::record_activity_events(&mut rt, &events);
             Self::process_ws_notifications(
                 &mut self.notifications_ui,
                 workspace_id,
@@ -733,6 +739,57 @@ impl App {
             Ok(list) => self.workspaces = list,
             Err(e) => tracing::warn!("workspace 목록 조회 실패: {e:#}"),
         }
+    }
+
+    fn activity_rows(&self) -> Vec<ui::activity::ActivityWorkspaceRow> {
+        let now = std::time::Instant::now();
+        self.workspaces
+            .iter()
+            .map(|ws| {
+                if ws.id == self.active.id {
+                    return ui::activity::ActivityWorkspaceRow {
+                        id: ws.id.clone(),
+                        name: ws.name.clone(),
+                        state: ui::activity::ActivityWorkspaceState::Active,
+                        session_count: self.active.workspace_ui.session_entries().len(),
+                        pending_events: self.active.pending_events.len(),
+                        backgrounded_for_secs: None,
+                        auto_suspend_remaining_secs: None,
+                        resource: self.active.resource_usage,
+                    };
+                }
+                if let Some(rt) = self.warm.get(&ws.id) {
+                    let elapsed = rt
+                        .backgrounded_at
+                        .map(|at| now.saturating_duration_since(at));
+                    let remaining = elapsed.map(|duration| {
+                        Self::WARM_AUTO_SUSPEND_AFTER
+                            .as_secs()
+                            .saturating_sub(duration.as_secs())
+                    });
+                    return ui::activity::ActivityWorkspaceRow {
+                        id: ws.id.clone(),
+                        name: ws.name.clone(),
+                        state: ui::activity::ActivityWorkspaceState::Warm,
+                        session_count: rt.session_titles.len(),
+                        pending_events: rt.pending_events.len(),
+                        backgrounded_for_secs: elapsed.map(|duration| duration.as_secs()),
+                        auto_suspend_remaining_secs: remaining,
+                        resource: rt.resource_usage,
+                    };
+                }
+                ui::activity::ActivityWorkspaceRow {
+                    id: ws.id.clone(),
+                    name: ws.name.clone(),
+                    state: ui::activity::ActivityWorkspaceState::Suspended,
+                    session_count: 0,
+                    pending_events: 0,
+                    backgrounded_for_secs: None,
+                    auto_suspend_remaining_secs: None,
+                    resource: None,
+                }
+            })
+            .collect()
     }
 
     /// 워크스페이스 목록 창: 전환/생성. 전환은 워커 shutdown+recreate라 창 closure 밖에서.
@@ -958,6 +1015,14 @@ impl App {
         }
     }
 
+    fn record_activity_events(rt: &mut WorkspaceRuntime, events: &[runtime::RuntimeEvent]) {
+        for event in events {
+            if let runtime::RuntimeEvent::ResourceUsage { snapshot } = event {
+                rt.resource_usage = Some(*snapshot);
+            }
+        }
+    }
+
     fn poll_pending_approvals(&mut self) {
         match self.db.list_pending_approvals() {
             Ok(rows) => self.approvals_ui.set_pending(rows),
@@ -1053,6 +1118,7 @@ impl eframe::App for App {
         for rt in self.warm.values_mut() {
             let events = rt.events.drain();
             if !events.is_empty() {
+                Self::record_activity_events(rt, &events);
                 // warm workspace도 알림은 만든다 (background 완료/승인 통지) — (ws, session)로
                 // 식별해 워커 간 SessionId 충돌을 피한다. 렌더용으로는 pending에 누적.
                 Self::process_ws_notifications(
@@ -1077,6 +1143,7 @@ impl eframe::App for App {
         // 깨워 이 logic()을 돌린다. 렌더용으로는 pending_events에 쌓아 ui()가 소비한다.
         let new_events = self.active.events.drain();
         if !new_events.is_empty() {
+            Self::record_activity_events(&mut self.active, &new_events);
             Self::process_ws_notifications(
                 &mut self.notifications_ui,
                 &self.active.id,
@@ -1127,6 +1194,10 @@ impl eframe::App for App {
                     if self.workspaces_open {
                         self.refresh_workspaces();
                     }
+                }
+                if ui.button(text.t("top.activity", &[])).clicked() {
+                    self.activity_ui.toggle();
+                    self.refresh_workspaces();
                 }
                 let unread = self.notifications_ui.unread();
                 unread_before = unread;
@@ -1212,6 +1283,16 @@ impl eframe::App for App {
 
         // 워크스페이스 전환/생성 (switch는 워커 shutdown+recreate라 window closure 밖에서)
         self.workspaces_window(ui.ctx(), &text);
+        let activity_rows = self.activity_rows();
+        if let Some(action) = self.activity_ui.show(ui.ctx(), &text, &activity_rows) {
+            match action {
+                ui::activity::ActivityAction::SwitchWorkspace(id) if id != self.active.id => {
+                    self.switch_workspace(&id);
+                    self.refresh_workspaces();
+                }
+                ui::activity::ActivityAction::SwitchWorkspace(_) => {}
+            }
+        }
 
         // logic()이 drain해 쌓아둔 이벤트를 렌더에 소비한다 (알림은 logic()에서 이미 처리).
         // Warm 동안 쌓였다면 Active 복귀 시 여기서 몰아 처리된다.

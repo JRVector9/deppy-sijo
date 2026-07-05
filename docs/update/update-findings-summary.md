@@ -75,14 +75,13 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 | PR-U22 UI String Migration | Complete | PR-U22 | Core UI labels, windows, settings, workspace manager, file tree, credentials, approvals, env profiles, agents, connectors, and notification center now render through `i18n::Catalog`; locale selector is wired in settings. |
 | PR-U23 Runtime Message Localization | Complete | PR-U23 | `RuntimeEvent::SpawnFailed` now carries `MessagePayload { message_id, args, diagnostic }`; runtime failure and notification status messages render through `i18n::Catalog`. |
 | PR-U24 I18n / CJK Layout Gate | Complete | PR-U24 | `xtask i18n-check` now covers required locale completeness, pseudo-locale expansion, CJK/emoji path paste fixtures, notification message IDs, and deterministic layout width smoke tests. |
-| PR-U25 Global Activity View | Pending | None | Not implemented. |
+| PR-U25 Global Activity View | Complete | PR-U25 | Global Activity view lists Active/Warm/Suspended workspaces, sessions, pending events, CPU/RSS samples, high resource flags, warm auto-suspend countdown, and workspace switch action. |
 | PR-U26 Terminal Dirty-Range Partial Render | Complete | PR-U26 / `a8a7239`, review fix `64660c8` | Dirty row propagation, per-session row render cache, remote delta dirty range restoration, and keyframe full-dirty handling are implemented and verified. |
 
 ## Release Blockers Remaining
 
 - Full PR-U20 Scenario A-E measurements remain pending in Phase D.
 - PR-U12 child process tree aggregation and PR-U18 runtime/app hot-path write wiring remain follow-up.
-- PR-U25 Global Activity View remains pending.
 
 ## Deferred / Backlog Items
 
@@ -95,6 +94,5 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 
 ## Next Operating Wave
 
-1. Run full PR-U20 Scenario A-E measurements after PR-U13 lands.
-2. Implement PR-U25 Global Activity View after resource events and i18n message boundaries are stable.
-3. Run final gates in order: PR-U11, PR-U20, PR-U24.
+1. Run full PR-U20 Scenario A-E measurements after the remaining follow-up triage.
+2. Run final gates in order: PR-U11, PR-U20, PR-U24.

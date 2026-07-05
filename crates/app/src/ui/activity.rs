@@ -1,0 +1,184 @@
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActivityWorkspaceRow {
+    pub id: String,
+    pub name: String,
+    pub state: ActivityWorkspaceState,
+    pub session_count: usize,
+    pub pending_events: usize,
+    pub backgrounded_for_secs: Option<u64>,
+    pub auto_suspend_remaining_secs: Option<u64>,
+    pub resource: Option<runtime::ProcessResourceSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityWorkspaceState {
+    Active,
+    Warm,
+    Suspended,
+}
+
+pub enum ActivityAction {
+    SwitchWorkspace(String),
+}
+
+pub struct ActivityUi {
+    open: bool,
+}
+
+impl ActivityUi {
+    pub fn new() -> Self {
+        Self { open: false }
+    }
+
+    pub fn toggle(&mut self) {
+        self.open = !self.open;
+    }
+
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        catalog: &i18n::Catalog,
+        rows: &[ActivityWorkspaceRow],
+    ) -> Option<ActivityAction> {
+        if !self.open {
+            return None;
+        }
+        if rows.iter().any(|row| row.backgrounded_for_secs.is_some()) {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
+        let mut open = true;
+        let mut action = None;
+        egui::Window::new(catalog.t("activity.title", &[]))
+            .open(&mut open)
+            .resizable(true)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                if rows.is_empty() {
+                    ui.label(catalog.t("activity.empty", &[]));
+                    return;
+                }
+                egui::Grid::new("activity_workspace_grid")
+                    .num_columns(6)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong(catalog.t("activity.workspace", &[]));
+                        ui.strong(catalog.t("activity.state", &[]));
+                        ui.strong(catalog.t("activity.sessions", &[]));
+                        ui.strong(catalog.t("activity.queue", &[]));
+                        ui.strong(catalog.t("activity.resources", &[]));
+                        ui.strong(catalog.t("activity.action", &[]));
+                        ui.end_row();
+
+                        for row in rows {
+                            ui.label(&row.name);
+                            state_label(ui, catalog, row);
+                            ui.label(row.session_count.to_string());
+                            ui.label(row.pending_events.to_string());
+                            ui.label(resource_label(catalog, row.resource.as_ref()));
+                            if row.state != ActivityWorkspaceState::Active {
+                                if ui.button(catalog.t("activity.switch", &[])).clicked() {
+                                    action = Some(ActivityAction::SwitchWorkspace(row.id.clone()));
+                                }
+                            } else {
+                                ui.weak(catalog.t("activity.current", &[]));
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+        self.open = open;
+        action
+    }
+}
+
+fn state_label(ui: &mut egui::Ui, catalog: &i18n::Catalog, row: &ActivityWorkspaceRow) {
+    let key = match row.state {
+        ActivityWorkspaceState::Active => "activity.state.active",
+        ActivityWorkspaceState::Warm => "activity.state.warm",
+        ActivityWorkspaceState::Suspended => "activity.state.suspended",
+    };
+    let mut text = catalog.t(key, &[]);
+    if let Some(secs) = row.backgrounded_for_secs {
+        text.push_str(" · ");
+        text.push_str(&catalog.t(
+            "activity.backgrounded_for",
+            &[("seconds", &secs.to_string())],
+        ));
+    }
+    if let Some(secs) = row.auto_suspend_remaining_secs {
+        text.push_str(" · ");
+        text.push_str(&catalog.t(
+            "activity.auto_suspend_in",
+            &[("seconds", &secs.to_string())],
+        ));
+    }
+    match row.state {
+        ActivityWorkspaceState::Active => {
+            ui.colored_label(ui.visuals().selection.stroke.color, text);
+        }
+        ActivityWorkspaceState::Warm => {
+            ui.label(text);
+        }
+        ActivityWorkspaceState::Suspended => {
+            ui.weak(text);
+        }
+    };
+}
+
+fn resource_label(
+    catalog: &i18n::Catalog,
+    snapshot: Option<&runtime::ProcessResourceSnapshot>,
+) -> String {
+    let Some(snapshot) = snapshot else {
+        return catalog.t("activity.resource_unavailable", &[]);
+    };
+    let cpu = snapshot
+        .cpu_percent
+        .map(|value| format!("{value:.1}%"))
+        .unwrap_or_else(|| catalog.t("activity.cpu_pending", &[]));
+    let rss = format_bytes(snapshot.rss_bytes);
+    let mut label = catalog.t("activity.resource_label", &[("cpu", &cpu), ("rss", &rss)]);
+    if snapshot.high_cpu || snapshot.high_rss {
+        label.push_str(" · ");
+        label.push_str(&catalog.t("activity.resource_high", &[]));
+    }
+    label
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bytes_format_uses_mib_and_gib() {
+        assert_eq!(format_bytes(512 * 1024 * 1024), "512.0 MiB");
+        assert_eq!(format_bytes(2 * 1024 * 1024 * 1024), "2.0 GiB");
+    }
+
+    #[test]
+    fn resource_label_marks_high_usage() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let snapshot = runtime::ProcessResourceSnapshot {
+            pid: 1,
+            sampled_at_ms: 0,
+            rss_bytes: 2 * 1024 * 1024 * 1024,
+            cpu_percent: Some(250.0),
+            high_cpu: true,
+            high_rss: true,
+        };
+        let label = resource_label(&catalog, Some(&snapshot));
+        assert!(label.contains("250.0%"));
+        assert!(label.contains("2.0 GiB"));
+        assert!(label.contains("High"));
+    }
+}

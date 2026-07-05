@@ -1,7 +1,9 @@
 //! CellGrid 렌더러 (설계문서 4.3 egui_cell_renderer).
 //! egui 0.35 신 시그니처(&mut Ui) 기준 (설계문서 1.1). egui_term(1.7)은 참고만.
 
-use crate::viewport_snapshot::{CursorShape, TerminalViewportSnapshot};
+use std::sync::Arc;
+
+use crate::viewport_snapshot::{CellRange, CursorShape, TerminalViewportSnapshot};
 
 pub struct RenderOutput {
     pub response: egui::Response,
@@ -9,6 +11,72 @@ pub struct RenderOutput {
     pub cell_size: egui::Vec2,
     /// 그리드 좌상단 화면 좌표 — 호출측이 포인터→셀 변환(선택 드래그)에 쓴다
     pub origin: egui::Pos2,
+}
+
+/// 세션/pane별 retained row layout cache. UI는 이 캐시를 소유만 하고 backend 타입을
+/// 보지 않는다. selection/cursor/IME는 오버레이라 캐시 무효화 대상이 아니다.
+#[derive(Default)]
+pub struct TerminalRenderCache {
+    cols: u16,
+    rows: u16,
+    scroll_offset: i32,
+    is_alt_screen: bool,
+    font_size_bits: u32,
+    rows_cache: Vec<Option<RowRenderCache>>,
+    rebuilt_rows_last_frame: usize,
+}
+
+impl TerminalRenderCache {
+    pub fn clear(&mut self) {
+        self.rows_cache.clear();
+        self.cols = 0;
+        self.rows = 0;
+        self.scroll_offset = 0;
+        self.is_alt_screen = false;
+        self.font_size_bits = 0;
+        self.rebuilt_rows_last_frame = 0;
+    }
+
+    pub fn rebuilt_rows_last_frame(&self) -> usize {
+        self.rebuilt_rows_last_frame
+    }
+
+    fn prepare(&mut self, snapshot: &TerminalViewportSnapshot, font_size: f32) {
+        self.rebuilt_rows_last_frame = 0;
+        let font_size_bits = font_size.to_bits();
+        let shape_changed = self.cols != snapshot.cols
+            || self.rows != snapshot.rows
+            || self.scroll_offset != snapshot.scroll_offset
+            || self.is_alt_screen != snapshot.is_alt_screen
+            || self.font_size_bits != font_size_bits
+            || self.rows_cache.len() != snapshot.rows as usize;
+        if shape_changed {
+            self.cols = snapshot.cols;
+            self.rows = snapshot.rows;
+            self.scroll_offset = snapshot.scroll_offset;
+            self.is_alt_screen = snapshot.is_alt_screen;
+            self.font_size_bits = font_size_bits;
+            self.rows_cache.clear();
+            self.rows_cache.resize_with(snapshot.rows as usize, || None);
+        }
+    }
+}
+
+struct RowRenderCache {
+    bg_runs: Vec<RowBgRun>,
+    text_runs: Vec<RowTextRun>,
+}
+
+struct RowBgRun {
+    start_col: usize,
+    end_col: usize,
+    color: egui::Color32,
+}
+
+struct RowTextRun {
+    col: usize,
+    galley: Arc<egui::Galley>,
+    color: egui::Color32,
 }
 
 /// 주어진 폰트 크기의 셀 크기 (모노스페이스 'M' 폭 × 행 높이).
@@ -22,6 +90,7 @@ pub fn draw(
     ui: &mut egui::Ui,
     snapshot: &TerminalViewportSnapshot,
     font_size: f32,
+    cache: &mut TerminalRenderCache,
     preedit: Option<&str>,
     // 선택 영역 (정규화된 선형 셀 인덱스, inclusive) — 셀 배경을 선택색으로 그린다
     selection: Option<(usize, usize)>,
@@ -41,39 +110,42 @@ pub fn draw(
     let painter = ui.painter_at(rect);
     let origin = rect.min;
 
-    let cols = snapshot.cols as usize;
     let default_bg = egui::Color32::from_rgb(0x18, 0x18, 0x1c);
     let selection = selection.and_then(|(a, b)| normalize_selection_range(snapshot, a, b));
     painter.rect_filled(rect, 0.0, default_bg);
 
-    for (i, term_cell) in snapshot.visible_cells.iter().enumerate() {
-        if term_cell.wide_spacer {
-            continue;
+    cache.prepare(snapshot, font_size);
+    for row in 0..snapshot.rows as usize {
+        let needs_rebuild = row_is_dirty(snapshot, row)
+            || cache
+                .rows_cache
+                .get(row)
+                .and_then(|cached| cached.as_ref())
+                .is_none();
+        if needs_rebuild {
+            let row_cache = build_row_cache(&painter, snapshot, row, &font_id, default_bg);
+            if let Some(slot) = cache.rows_cache.get_mut(row) {
+                *slot = Some(row_cache);
+                cache.rebuilt_rows_last_frame += 1;
+            }
         }
-        let (row, col) = (i / cols, i % cols);
-        let pos = origin + egui::vec2(col as f32 * cell.x, row as f32 * cell.y);
-        let width = if term_cell.wide { cell.x * 2.0 } else { cell.x };
-        let selected = selection.is_some_and(|(a, b)| i >= a && i <= b);
-        let bg = if selected {
-            egui::Color32::from_rgb(0x2d, 0x4f, 0x77) // 선택 하이라이트
-        } else {
-            rgb(term_cell.bg)
-        };
-        if bg != default_bg {
-            painter.rect_filled(
-                egui::Rect::from_min_size(pos, egui::vec2(width, cell.y)),
-                0.0,
-                bg,
-            );
-        }
-        if term_cell.c != ' ' {
-            painter.text(
-                pos + egui::vec2(width / 2.0, 0.0),
-                egui::Align2::CENTER_TOP,
-                term_cell.c,
-                font_id.clone(),
-                rgb(term_cell.fg),
-            );
+
+        if let Some(row_cache) = cache.rows_cache.get(row).and_then(|cached| cached.as_ref()) {
+            let row_y = row as f32 * cell.y;
+            for bg in &row_cache.bg_runs {
+                let pos = origin + egui::vec2(bg.start_col as f32 * cell.x, row_y);
+                let width = (bg.end_col - bg.start_col) as f32 * cell.x;
+                painter.rect_filled(
+                    egui::Rect::from_min_size(pos, egui::vec2(width, cell.y)),
+                    0.0,
+                    bg.color,
+                );
+            }
+            paint_selection_row(&painter, snapshot, row, origin, cell, selection);
+            for run in &row_cache.text_runs {
+                let pos = origin + egui::vec2(run.col as f32 * cell.x, row_y);
+                painter.galley(pos, Arc::clone(&run.galley), run.color);
+            }
         }
     }
 
@@ -133,6 +205,188 @@ pub fn draw(
         response,
         cell_size: cell,
         origin,
+    }
+}
+
+fn build_row_cache(
+    painter: &egui::Painter,
+    snapshot: &TerminalViewportSnapshot,
+    row: usize,
+    font_id: &egui::FontId,
+    default_bg: egui::Color32,
+) -> RowRenderCache {
+    let cols = snapshot.cols as usize;
+    let row_start = row * cols;
+    let row_end = row_start + cols;
+    let Some(cells) = snapshot.visible_cells.get(row_start..row_end) else {
+        return RowRenderCache {
+            bg_runs: Vec::new(),
+            text_runs: Vec::new(),
+        };
+    };
+
+    let mut bg_runs = Vec::new();
+    for (col, term_cell) in cells.iter().enumerate() {
+        if term_cell.wide_spacer {
+            continue;
+        }
+        let bg = rgb(term_cell.bg);
+        if bg == default_bg {
+            continue;
+        }
+        let width_cols = if term_cell.wide { 2 } else { 1 };
+        push_bg_run(&mut bg_runs, col, (col + width_cols).min(cols), bg);
+    }
+
+    let mut text_runs = Vec::new();
+    let mut pending = PendingTextRun::default();
+    for (col, term_cell) in cells.iter().enumerate() {
+        if term_cell.wide_spacer || term_cell.c == ' ' {
+            pending.flush(&mut text_runs, painter, font_id);
+            continue;
+        }
+
+        let fg = rgb(term_cell.fg);
+        if term_cell.wide {
+            pending.flush(&mut text_runs, painter, font_id);
+            let text = term_cell.c.to_string();
+            text_runs.push(RowTextRun {
+                col,
+                galley: painter.layout_no_wrap(text, font_id.clone(), fg),
+                color: fg,
+            });
+        } else {
+            if pending.needs_flush(col, fg) {
+                pending.flush(&mut text_runs, painter, font_id);
+            }
+            pending.push(col, term_cell.c, fg);
+        }
+    }
+    pending.flush(&mut text_runs, painter, font_id);
+
+    RowRenderCache { bg_runs, text_runs }
+}
+
+#[derive(Default)]
+struct PendingTextRun {
+    start_col: usize,
+    next_col: usize,
+    color: Option<egui::Color32>,
+    text: String,
+}
+
+impl PendingTextRun {
+    fn needs_flush(&self, col: usize, color: egui::Color32) -> bool {
+        self.color.is_some() && (self.color != Some(color) || self.next_col != col)
+    }
+
+    fn push(&mut self, col: usize, ch: char, color: egui::Color32) {
+        if self.color.is_none() {
+            self.start_col = col;
+            self.next_col = col;
+            self.color = Some(color);
+        }
+        self.text.push(ch);
+        self.next_col = col + 1;
+    }
+
+    fn flush(
+        &mut self,
+        text_runs: &mut Vec<RowTextRun>,
+        painter: &egui::Painter,
+        font_id: &egui::FontId,
+    ) {
+        let Some(color) = self.color.take() else {
+            return;
+        };
+        if self.text.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.text);
+        text_runs.push(RowTextRun {
+            col: self.start_col,
+            galley: painter.layout_no_wrap(text, font_id.clone(), color),
+            color,
+        });
+    }
+}
+
+fn push_bg_run(runs: &mut Vec<RowBgRun>, start_col: usize, end_col: usize, color: egui::Color32) {
+    if start_col >= end_col {
+        return;
+    }
+    if let Some(last) = runs.last_mut()
+        && last.end_col == start_col
+        && last.color == color
+    {
+        last.end_col = end_col;
+        return;
+    }
+    runs.push(RowBgRun {
+        start_col,
+        end_col,
+        color,
+    });
+}
+
+fn row_is_dirty(snapshot: &TerminalViewportSnapshot, row: usize) -> bool {
+    let cols = snapshot.cols as usize;
+    if cols == 0 || row >= snapshot.rows as usize {
+        return false;
+    }
+    let row_start = row * cols;
+    let row_end = row_start + cols;
+    snapshot
+        .dirty_ranges
+        .iter()
+        .any(|range| range_intersects_row(range, row_start, row_end))
+}
+
+fn range_intersects_row(range: &CellRange, row_start: usize, row_end: usize) -> bool {
+    range.start < row_end && range.end > row_start && range.start < range.end
+}
+
+fn paint_selection_row(
+    painter: &egui::Painter,
+    snapshot: &TerminalViewportSnapshot,
+    row: usize,
+    origin: egui::Pos2,
+    cell_size: egui::Vec2,
+    selection: Option<(usize, usize)>,
+) {
+    let Some((start, end)) = selection else {
+        return;
+    };
+    let cols = snapshot.cols as usize;
+    let row_start = row * cols;
+    let row_end = row_start + cols;
+    if cols == 0 || end < row_start || start >= row_end {
+        return;
+    }
+
+    let selection_bg = egui::Color32::from_rgb(0x2d, 0x4f, 0x77);
+    for col in 0..cols {
+        let index = row_start + col;
+        if index < start || index > end {
+            continue;
+        }
+        let Some(term_cell) = snapshot.visible_cells.get(index) else {
+            continue;
+        };
+        if term_cell.wide_spacer {
+            continue;
+        }
+        let width = if term_cell.wide {
+            cell_size.x * 2.0
+        } else {
+            cell_size.x
+        };
+        let pos = origin + egui::vec2(col as f32 * cell_size.x, row as f32 * cell_size.y);
+        painter.rect_filled(
+            egui::Rect::from_min_size(pos, egui::vec2(width, cell_size.y)),
+            0.0,
+            selection_bg,
+        );
     }
 }
 
@@ -223,7 +477,7 @@ mod tests {
     use super::*;
     use crate::AlacrittyBackend;
     use crate::backend::TerminalBackend;
-    use crate::viewport_snapshot::{CursorShape, CursorSnapshot, TerminalCell};
+    use crate::viewport_snapshot::{CellRange, CursorShape, CursorSnapshot, TerminalCell};
 
     fn snap(cols: u16, rows: u16, text: &[&str]) -> TerminalViewportSnapshot {
         let mut cells = Vec::new();
@@ -272,6 +526,43 @@ mod tests {
             .iter()
             .position(|cell| cell.wide_spacer)
             .expect("fixture should contain a wide spacer")
+    }
+
+    fn draw_for_test(
+        cache: &mut TerminalRenderCache,
+        snapshot: &TerminalViewportSnapshot,
+    ) -> usize {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_min_size(egui::vec2(500.0, 200.0));
+            draw(ui, snapshot, 13.0, cache, None, None);
+        });
+        cache.rebuilt_rows_last_frame()
+    }
+
+    #[test]
+    fn render_cache는_dirty_row만_재구성한다() {
+        let mut cache = TerminalRenderCache::default();
+        let first = snap(4, 3, &["aaaa", "bbbb", "cccc"]);
+        assert_eq!(draw_for_test(&mut cache, &first), 3);
+
+        let mut second = snap(4, 3, &["aaaa", "bbxb", "cccc"]);
+        second.dirty_ranges = vec![CellRange { start: 4, end: 8 }];
+        assert_eq!(draw_for_test(&mut cache, &second), 1);
+
+        let mut cursor_only = second.clone();
+        cursor_only.cursor.col = 2;
+        cursor_only.dirty_ranges.clear();
+        assert_eq!(draw_for_test(&mut cache, &cursor_only), 0);
+    }
+
+    #[test]
+    fn row_dirty는_cell_range_intersection을_사용한다() {
+        let mut s = snap(5, 3, &["aaaaa", "bbbbb", "ccccc"]);
+        s.dirty_ranges = vec![CellRange { start: 6, end: 7 }];
+        assert!(!row_is_dirty(&s, 0));
+        assert!(row_is_dirty(&s, 1));
+        assert!(!row_is_dirty(&s, 2));
     }
 
     #[test]

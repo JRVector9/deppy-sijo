@@ -3,7 +3,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use deppy_core::SessionId;
 use pty::{CommandSpec, PortablePtyBackend, PtyBackend, PtySession};
 use terminal::{
-    AlacrittyBackend, TerminalBackend, TerminalCacheClass, TerminalCacheEvent,
+    AlacrittyBackend, CellRange, TerminalBackend, TerminalCacheClass, TerminalCacheEvent,
     TerminalCacheFootprint, TerminalViewportSnapshot,
 };
 
@@ -43,6 +43,8 @@ pub struct Session {
     backend: AlacrittyBackend,
     lifecycle: SessionLifecycle,
     dirty: bool,
+    pending_full_dirty: bool,
+    pending_dirty_rows: Vec<u16>,
     /// child가 reap됐는가 (try_exit_code가 Some을 준 tick에 관찰 — 재호출 시 코드 유실)
     child_dead: bool,
     /// 관찰된 exit code (child_dead일 때 유효)
@@ -75,6 +77,8 @@ impl Session {
             backend: AlacrittyBackend::new(cols, rows, scrollback_lines),
             lifecycle: SessionLifecycle::Running,
             dirty: true,
+            pending_full_dirty: true,
+            pending_dirty_rows: Vec::new(),
             child_dead: false,
             exit_code: None,
             exit_wait_ticks: 0,
@@ -116,7 +120,14 @@ impl Session {
                     on_output(&chunk);
                     match self.backend.feed(&chunk) {
                         Ok(changes) => {
-                            self.dirty = true;
+                            if !changes.dirty_rows.is_empty()
+                                || changes.cursor_changed
+                                || changes.title_changed
+                                || changes.bell
+                            {
+                                self.dirty = true;
+                                self.mark_dirty_rows(&changes.dirty_rows);
+                            }
                             // 터미널 질의(DA 등) 응답 회신
                             if !changes.pty_responses.is_empty() {
                                 responded += changes.pty_responses.len();
@@ -180,11 +191,10 @@ impl Session {
     /// hidden pane에 대해 호출하지 않는 것이 14.4 규칙.
     /// None(외부 surface 백엔드 등)일 때 dirty를 지우면 변경이 영구 미발행된다.
     pub fn take_snapshot(&mut self) -> Option<TerminalViewportSnapshot> {
-        let snapshot = self.backend.viewport_snapshot();
-        if snapshot.is_some() {
-            self.dirty = false;
-        }
-        snapshot
+        let mut snapshot = self.backend.viewport_snapshot()?;
+        snapshot.dirty_ranges = self.take_dirty_ranges(snapshot.cols, snapshot.rows);
+        self.dirty = false;
+        Some(snapshot)
     }
 
     pub fn bracketed_paste(&self) -> bool {
@@ -211,13 +221,13 @@ impl Session {
         {
             tracing::warn!("PTY resize 실패: {e:#}");
         }
-        self.dirty = true;
+        self.mark_full_dirty();
         self.set_cache_class(self.cache_class)
     }
 
     pub fn scroll(&mut self, delta: i32) {
         self.backend.scroll(delta);
-        self.dirty = true;
+        self.mark_full_dirty();
     }
 
     /// 가시성에 따라 scrollback 상한 조정 (§14.3). 전이 시에만 호출할 것.
@@ -250,6 +260,74 @@ impl Session {
     pub fn take_cache_events(&mut self) -> Vec<TerminalCacheEvent> {
         std::mem::take(&mut self.cache_events)
     }
+
+    fn mark_dirty_rows(&mut self, rows: &[u16]) {
+        self.pending_dirty_rows.extend_from_slice(rows);
+    }
+
+    fn mark_full_dirty(&mut self) {
+        self.dirty = true;
+        self.pending_full_dirty = true;
+        self.pending_dirty_rows.clear();
+    }
+
+    fn take_dirty_ranges(&mut self, cols: u16, rows: u16) -> Vec<CellRange> {
+        let ranges = if self.pending_full_dirty {
+            full_dirty_ranges(cols, rows)
+        } else {
+            dirty_rows_to_ranges(&mut self.pending_dirty_rows, cols, rows)
+        };
+        self.pending_full_dirty = false;
+        self.pending_dirty_rows.clear();
+        ranges
+    }
+}
+
+fn full_dirty_ranges(cols: u16, rows: u16) -> Vec<CellRange> {
+    let len = cols as usize * rows as usize;
+    (len > 0)
+        .then_some(CellRange { start: 0, end: len })
+        .into_iter()
+        .collect()
+}
+
+fn dirty_rows_to_ranges(dirty_rows: &mut Vec<u16>, cols: u16, rows: u16) -> Vec<CellRange> {
+    if cols == 0 || rows == 0 || dirty_rows.is_empty() {
+        return Vec::new();
+    }
+    dirty_rows.sort_unstable();
+    dirty_rows.dedup();
+
+    let mut ranges = Vec::new();
+    let mut start_row: Option<u16> = None;
+    let mut last_row = 0u16;
+    for row in dirty_rows.iter().copied().filter(|row| *row < rows) {
+        match start_row {
+            None => {
+                start_row = Some(row);
+                last_row = row;
+            }
+            Some(start) if row == last_row.saturating_add(1) => {
+                last_row = row;
+                start_row = Some(start);
+            }
+            Some(start) => {
+                ranges.push(CellRange {
+                    start: start as usize * cols as usize,
+                    end: (last_row as usize + 1) * cols as usize,
+                });
+                start_row = Some(row);
+                last_row = row;
+            }
+        }
+    }
+    if let Some(start) = start_row {
+        ranges.push(CellRange {
+            start: start as usize * cols as usize,
+            end: (last_row as usize + 1) * cols as usize,
+        });
+    }
+    ranges
 }
 
 #[cfg(test)]
@@ -277,6 +355,21 @@ mod tests {
             .collect::<String>()
             .trim_end()
             .to_owned()
+    }
+
+    #[test]
+    fn dirty_rows를_cell_range로_coalesce한다() {
+        let mut rows = vec![4, 2, 3, 9, 2, 99];
+        assert_eq!(
+            dirty_rows_to_ranges(&mut rows, 10, 12),
+            vec![
+                CellRange { start: 20, end: 50 },
+                CellRange {
+                    start: 90,
+                    end: 100
+                },
+            ]
+        );
     }
 
     #[test]
@@ -358,6 +451,63 @@ mod tests {
         });
         // snapshot 후 dirty가 지워진다
         assert!(!session.pump(|_| {}).dirty);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn snapshot_dirty_ranges는_변경된_행만_전달하고_소거한다() {
+        let spec = CommandSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 0.1; printf x; sleep 1".into()],
+            env: Vec::new(),
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(5), SessionKind::Shell, &spec, 80, 24, 100).unwrap();
+
+        // 초기 full-dirty baseline은 먼저 소비한다.
+        let initial = session.take_snapshot().unwrap();
+        assert_eq!(
+            initial.dirty_ranges,
+            vec![CellRange {
+                start: 0,
+                end: 80 * 24,
+            }]
+        );
+
+        let snapshot = wait(Duration::from_secs(5), || {
+            let result = session.pump(|_| {});
+            if !result.dirty {
+                return None;
+            }
+            let snapshot = session.take_snapshot().unwrap();
+            row_text(&snapshot, 0).contains('x').then_some(snapshot)
+        });
+        assert_eq!(snapshot.dirty_ranges, vec![CellRange { start: 0, end: 80 }]);
+
+        assert!(!session.pump(|_| {}).dirty);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scroll은_전체_dirty_range로_무효화한다() {
+        let spec = CommandSpec {
+            program: "/bin/sleep".into(),
+            args: vec!["1".into()],
+            env: Vec::new(),
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(6), SessionKind::Shell, &spec, 80, 24, 100).unwrap();
+        let _ = session.take_snapshot();
+
+        session.scroll(1);
+        let snapshot = session.take_snapshot().unwrap();
+        assert_eq!(
+            snapshot.dirty_ranges,
+            vec![CellRange {
+                start: 0,
+                end: 80 * 24,
+            }]
+        );
     }
 
     #[test]

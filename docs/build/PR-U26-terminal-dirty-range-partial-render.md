@@ -1,8 +1,93 @@
 # PR-U26 — Terminal Dirty-Range Partial Render
 
-작성: 2026-07-05. 상태: 설계(구현 전). 근거: `docs/review/PR-R08-resource-performance-findings.md` Finding 4.
+작성: 2026-07-05. 상태: 구현 완료. 근거: `docs/review/PR-R08-resource-performance-findings.md` Finding 4.
 배치: Phase D(성능, PR-U12~U20). **PR-U20 Final Performance Gate 이전**에 착지해야 한다
 (게이트의 "active pane frame time p95" 기준이 이 PR로 검증된다). PR-U14(scrollback 바이트 예산)와 독립.
+
+## Build Summary
+
+## Input Findings
+
+- PR-R08 Finding 4: backend는 dirty rows를 계산하지만 session/viewport/renderer 경로에서 버려져 active pane 렌더 비용이 `cols * rows`에 비례한다.
+
+## Scope
+
+- `Session` dirty row 누적 및 `TerminalViewportSnapshot.dirty_ranges` 이관.
+- visible pane 전용 egui row layout cache 추가.
+- remote viewport delta 재구성 시 dirty range 복원.
+- hidden pane snapshot/cache drop, CJK/wide selection/copy UX, DnD/copy-paste 경로는 유지.
+
+## Changes
+
+- `crates/session/src/session.rs`
+  - `pending_dirty_rows`와 `pending_full_dirty`를 추가했다.
+  - `pump()`에서 backend dirty rows를 union 누적하고, `take_snapshot()`에서 cell range로 coalesce한 뒤 clear한다.
+  - resize/scroll은 전체 dirty로 무효화한다.
+- `crates/terminal/src/alacritty_backend.rs`
+  - 초기 `Term` damage를 reset해 첫 실제 output이 stale full damage와 섞이지 않게 했다.
+  - alt-screen 전환은 전체 row dirty로 승격한다.
+- `crates/terminal/src/renderer_egui.rs`
+  - `TerminalRenderCache`를 추가했다.
+  - row별 background/text run cache를 만들고, dirty row 또는 cache miss인 행만 galley를 재구성한다.
+  - cursor, selection, IME preedit은 기존처럼 per-frame overlay로 렌더한다.
+- `crates/app/src/ui/workspace.rs`
+  - `SessionView`가 pane/session별 `TerminalRenderCache`를 소유한다.
+  - hidden session 전환 시 snapshot과 render cache를 함께 비운다.
+- `crates/runtime/src/protocol.rs`, `crates/runtime/src/remote.rs`
+  - remote delta 적용 결과에 변경 row dirty range를 복원하고 테스트 기대값을 갱신했다.
+
+## Tests
+
+- `cargo fmt --check`
+- `cargo clippy --workspace --all-targets`
+- `cargo check --workspace --all-targets`
+- `cargo test --workspace --no-run`
+- `cargo test -p terminal -p session`
+- `cargo test -p runtime delta_왕복_등가성 -- --nocapture`
+- `cargo test -p runtime try_apply_delta_기형은_err -- --nocapture`
+- `cargo test -p runtime remote --no-run`
+- `cargo test -p deppy-sijo`
+- `cargo run -p xtask -- perf-smoke`
+- `git diff --check`
+
+## Acceptance Criteria Check
+
+- [x] 한 행만 바뀌는 출력에서 `dirty_ranges`가 해당 행만 포함한다.
+- [x] active pane renderer는 cache miss 또는 dirty row만 galley를 재구성한다.
+- [x] cursor-only 변화는 row cache를 재구성하지 않는다.
+- [x] scroll/resize/alt-screen은 full dirty로 무효화한다.
+- [x] hidden pane snapshot/cache drop 규칙을 유지한다.
+- [x] CJK/wide char selection/copy 회귀 테스트가 유지된다.
+- [x] remote delta 재구성도 dirty range를 보존한다.
+
+## Regression Risks
+
+- 행 batch text run은 ASCII 연속 run을 묶고 wide char는 단일 run으로 격리한다. 픽셀 단위 동일성은 실제 GUI snapshot gate에서 계속 확인해야 한다.
+- `dirty_ranges`는 end-exclusive cell range로 해석한다. 새 소비자가 생기면 같은 규칙을 따라야 한다.
+
+## Resource Impact
+
+- active pane의 text layout 재구성 비용이 전체 visible rows에서 dirty rows/cache miss rows로 축소된다.
+- hidden session은 기존대로 snapshot을 만들지 않으며, UI render cache도 hidden 전환 시 drop된다.
+
+## Security Impact
+
+- secret/log/storage 경로 변경 없음. raw log 평문 저장 정책 변경 없음.
+
+## I18n/CJK Impact
+
+- CJK/wide/emoji selection copy 테스트는 유지된다.
+- wide char는 text run batching에서 격리해 run 내부 glyph advance가 다음 terminal column을 밀지 않게 했다.
+
+## Rollback Plan
+
+- `renderer_egui::draw` 호출부에서 `TerminalRenderCache` 사용을 되돌리고 기존 cell-by-cell 렌더 루프로 복원한다.
+- `Session`의 dirty range 누적은 snapshot metadata만 변경하므로, 문제가 있으면 `dirty_ranges: Vec::new()` 방출로 되돌릴 수 있다.
+
+## Follow-up
+
+- PR-U20 final performance gate에서 active pane frame time p95를 실제 시나리오로 기록한다.
+- remote partial snapshot diff(비용 A)는 별도 PR에서 scroll/reflow 좌표계와 함께 다룬다.
 
 ## 0. 배경 / 근거
 

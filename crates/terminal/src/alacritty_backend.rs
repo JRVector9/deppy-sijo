@@ -137,11 +137,13 @@ fn new_term(
         scrolling_history: scrollback_lines,
         ..Config::default()
     };
-    Term::new(
+    let mut term = Term::new(
         config,
         &TermSize::new(cols.max(1) as usize, rows.max(1) as usize),
         listener,
-    )
+    );
+    term.reset_damage();
+    term
 }
 
 fn effective_scrollback_limit(
@@ -181,16 +183,20 @@ impl TerminalBackend for AlacrittyBackend {
             self.term.mode().contains(TermMode::SHOW_CURSOR),
             self.term.cursor_style(),
         );
+        let alt_screen_before = self.term.mode().contains(TermMode::ALT_SCREEN);
         self.processor.advance(&mut self.term, bytes);
 
         let screen_lines = self.term.screen_lines();
-        let dirty_rows = match self.term.damage() {
+        let mut dirty_rows: Vec<u16> = match self.term.damage() {
             TermDamage::Full => (0..screen_lines as u16).collect(),
             TermDamage::Partial(lines) => lines
                 .filter(|l| l.is_damaged())
                 .map(|l| l.line as u16)
                 .collect(),
         };
+        if self.term.mode().contains(TermMode::ALT_SCREEN) != alt_screen_before {
+            dirty_rows = (0..screen_lines as u16).collect();
+        }
         self.term.reset_damage();
 
         let mut pty_responses = std::mem::take(

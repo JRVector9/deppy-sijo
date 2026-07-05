@@ -48,6 +48,7 @@ pub struct WorkspaceUi {
 #[derive(Default)]
 struct SessionView {
     snapshot: Option<Arc<TerminalViewportSnapshot>>,
+    render_cache: renderer_egui::TerminalRenderCache,
     bracketed_paste: bool,
     /// 사이드바 세션 목록에 보여줄 최신 화면 요약 (마지막 비어있지 않은 행, ≤48자)
     summary: String,
@@ -90,6 +91,7 @@ impl WorkspaceUi {
                     for (id, view) in self.sessions.iter_mut() {
                         if !visible.contains(id) {
                             view.snapshot = None;
+                            view.render_cache.clear();
                         }
                     }
                     // 드래그 중 tab 전환/분할 구조 변경이면 미리보기가 다른 split에
@@ -531,12 +533,13 @@ impl WorkspaceUi {
             );
         }
 
-        let view = self.sessions.entry(session).or_default();
-        let exit_code = view.exit_code;
-        let bracketed = view.bracketed_paste;
-        let Some(snapshot) = view.snapshot.clone() else {
-            ui.label("연결 중…");
-            return;
+        let (exit_code, bracketed, snapshot) = {
+            let view = self.sessions.entry(session).or_default();
+            let Some(snapshot) = view.snapshot.clone() else {
+                ui.label("연결 중…");
+                return;
+            };
+            (view.exit_code, view.bracketed_paste, snapshot)
         };
 
         let preedit = (focused && !self.preedit.is_empty()).then_some(self.preedit.as_str());
@@ -544,7 +547,17 @@ impl WorkspaceUi {
         let selection_range = self
             .selection
             .and_then(|(s, a, b)| (s == session).then_some((a.min(b), a.max(b))));
-        let output = renderer_egui::draw(ui, &snapshot, config.font_size, preedit, selection_range);
+        let output = {
+            let view = self.sessions.entry(session).or_default();
+            renderer_egui::draw(
+                ui,
+                &snapshot,
+                config.font_size,
+                &mut view.render_cache,
+                preedit,
+                selection_range,
+            )
+        };
 
         // 마우스 드래그 = 셀 선택 (2026-07-05 복사 지원). 파일트리 드래그(dnd payload)
         // 중에는 선택을 시작하지 않는다.

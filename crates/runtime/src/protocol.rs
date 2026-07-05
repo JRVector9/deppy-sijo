@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use deppy_core::SessionId;
-use terminal::{CursorSnapshot, TerminalCell, TerminalViewportSnapshot};
+use terminal::{CellRange, CursorSnapshot, TerminalCell, TerminalViewportSnapshot};
 
 use crate::command::RuntimeCommand;
 use crate::event::RuntimeEvent;
@@ -324,9 +324,53 @@ pub(crate) fn try_apply_delta(
         rows: delta.rows,
         cursor: delta.cursor,
         visible_cells: cells.into(),
-        dirty_ranges: Vec::new(),
+        dirty_ranges: row_patches_to_dirty_ranges(&delta.changed_rows, cols, rows),
         title: delta.title.clone(),
         scroll_offset: delta.scroll_offset,
         is_alt_screen: delta.is_alt_screen,
     })
+}
+
+fn row_patches_to_dirty_ranges(patches: &[RowPatch], cols: usize, rows: usize) -> Vec<CellRange> {
+    if cols == 0 || rows == 0 || patches.is_empty() {
+        return Vec::new();
+    }
+    let mut changed_rows: Vec<usize> = patches
+        .iter()
+        .map(|patch| patch.row as usize)
+        .filter(|row| *row < rows)
+        .collect();
+    changed_rows.sort_unstable();
+    changed_rows.dedup();
+
+    let mut ranges = Vec::new();
+    let mut start_row: Option<usize> = None;
+    let mut last_row = 0usize;
+    for row in changed_rows {
+        match start_row {
+            None => {
+                start_row = Some(row);
+                last_row = row;
+            }
+            Some(start) if row == last_row.saturating_add(1) => {
+                start_row = Some(start);
+                last_row = row;
+            }
+            Some(start) => {
+                ranges.push(CellRange {
+                    start: start * cols,
+                    end: (last_row + 1) * cols,
+                });
+                start_row = Some(row);
+                last_row = row;
+            }
+        }
+    }
+    if let Some(start) = start_row {
+        ranges.push(CellRange {
+            start: start * cols,
+            end: (last_row + 1) * cols,
+        });
+    }
+    ranges
 }

@@ -2723,7 +2723,7 @@ mod tests {
     // ---- delta viewport 스트리밍 (§4) ----
 
     use crate::protocol::{RowPatch, ViewportDelta, try_apply_delta};
-    use terminal::{CursorShape, CursorSnapshot, TerminalCell};
+    use terminal::{CellRange, CursorShape, CursorSnapshot, TerminalCell};
 
     fn cell(c: char) -> TerminalCell {
         TerminalCell {
@@ -2764,6 +2764,19 @@ mod tests {
             scroll_offset: 0,
             is_alt_screen: alt,
         })
+    }
+
+    fn assert_same_viewport_content(
+        actual: &TerminalViewportSnapshot,
+        expected: &TerminalViewportSnapshot,
+    ) {
+        assert_eq!(actual.cols, expected.cols);
+        assert_eq!(actual.rows, expected.rows);
+        assert_eq!(actual.cursor, expected.cursor);
+        assert_eq!(actual.visible_cells, expected.visible_cells);
+        assert_eq!(actual.title, expected.title);
+        assert_eq!(actual.scroll_offset, expected.scroll_offset);
+        assert_eq!(actual.is_alt_screen, expected.is_alt_screen);
     }
 
     #[test]
@@ -2980,9 +2993,19 @@ mod tests {
             make_snapshot(20, 5, &["hello!", "world", "line3", "", ""], false), // row 2 타이핑
             make_snapshot(20, 5, &["hello!", "world", "line3", "", ""], false), // 변화 없음(헤더만)
         ];
-        for snap in &snaps {
+        let expected_dirty = [
+            Vec::new(),
+            vec![CellRange { start: 0, end: 20 }],
+            vec![CellRange { start: 40, end: 60 }],
+            Vec::new(),
+        ];
+        for (snap, dirty_ranges) in snaps.iter().zip(expected_dirty) {
             let recon = pipe.round_trip(s, snap);
-            assert_eq!(&recon, snap.as_ref(), "재구성이 source와 동일해야 한다");
+            assert_same_viewport_content(&recon, snap);
+            assert_eq!(
+                recon.dirty_ranges, dirty_ranges,
+                "delta 재구성은 변경 row를 dirty_ranges로 복원해야 한다"
+            );
         }
         assert_eq!(pipe.keyframes, 1, "첫 프레임만 keyframe");
         assert_eq!(pipe.deltas, 3, "이후는 delta");
@@ -3045,7 +3068,12 @@ mod tests {
 
         // 2/10 = 20% 변경 → delta
         let light = make_snapshot(10, 10, &["a", "b"], false);
-        assert_eq!(&pipe.round_trip(s, &light), light.as_ref());
+        let light_recon = pipe.round_trip(s, &light);
+        assert_same_viewport_content(&light_recon, &light);
+        assert_eq!(
+            light_recon.dirty_ranges,
+            vec![CellRange { start: 0, end: 20 }]
+        );
         assert_eq!(pipe.deltas, 1, "20% 변경은 delta");
 
         // 8/10 = 80% 변경 → keyframe 폴백

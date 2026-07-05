@@ -4,7 +4,7 @@ use terminal::TerminalViewportSnapshot;
 
 use mux::MuxSnapshot;
 use pty::PtyInputPressure;
-use session::SessionStatus;
+use session::{SessionStatus, SessionStatusView};
 
 use crate::command::SessionId;
 use crate::resource_monitor::{ProcessResourceSnapshot, SessionResourceUsage};
@@ -98,6 +98,12 @@ pub enum RuntimeEvent {
     SessionStatusChanged {
         session: SessionId,
         status: SessionStatus,
+    },
+    /// Additive status view carrying confidence/source/override state. Existing
+    /// `SessionStatusChanged` remains the compatibility event.
+    SessionStatusViewChanged {
+        session: SessionId,
+        view: SessionStatusView,
     },
     /// Process resource sample. App process CPU/RSS plus optional per-session
     /// child process tree aggregation.

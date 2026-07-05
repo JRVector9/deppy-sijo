@@ -1617,9 +1617,9 @@ fn expired_warm_workspace_ids(
 /// warm workspace의 pending_events를 합쳐(coalesce) 재활성 replay를 정확+유계로 만든다.
 ///
 /// replay 규칙(중요): pending_events는 재활성 시 workspace_ui.show()로 렌더 상태를
-/// 재구성한다. workspace_ui는 SessionExited/SessionStatusChanged를 "현재 mux에 그 세션이
-/// 있을 때만" 적용하고(session_alive 체크), MuxUpdated는 pane 구조(session_id/title)만
-/// 담아 status/exit은 lifecycle 이벤트로만 반영된다.
+/// 재구성한다. workspace_ui는 SessionExited/SessionStatusChanged/SessionStatusViewChanged를
+/// "현재 mux에 그 세션이 있을 때만" 적용하고(session_alive 체크), MuxUpdated는 pane
+/// 구조(session_id/title)만 담아 status/exit은 lifecycle 이벤트로만 반영된다.
 ///
 /// 그래서:
 /// 1) 최신 MuxUpdated 하나만 남기고 **맨 앞으로 옮긴다**(나머지 MuxUpdated 제거). replay가
@@ -1627,9 +1627,9 @@ fn expired_warm_workspace_ids(
 ///    적용된다 — 최신 mux 뒤에 남은 SessionExited가 session_alive를 통과해 종료 pane이
 ///    running으로 남는 버그를 막는다. (mux에 없는 detach된 세션의 잔여 이벤트는 무시돼도
 ///    화면에 안 나오니 무해.)
-/// 2) SessionStatusChanged는 세션별 최신 1개만 유지한다(status는 last-wins). detector의
-///    Running↔Waiting churn으로 무계 누적되던 것을 O(세션수)로 유계화. 유지분 상대 순서는
-///    보존.
+/// 2) SessionStatusChanged/SessionStatusViewChanged는 세션별 최신 1개만 유지한다(status는
+///    last-wins). detector의 Running↔Waiting churn으로 무계 누적되던 것을 O(세션수)로
+///    유계화. 유지분 상대 순서는 보존.
 /// 3) SessionExited/ShellSpawned/AgentSpawned/SpawnFailed/Viewport는 전량 순서 보존.
 ///
 /// 알림은 coalesce 전에 process_ws_notifications가 전량 소비하므로(렌더 replay 전용)
@@ -1644,9 +1644,14 @@ fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) {
     // 세션별 마지막 StatusChanged의 원 인덱스 (나중 것이 이김 → 그 인덱스만 유지).
     let mut latest_status_idx: std::collections::HashMap<runtime::SessionId, usize> =
         std::collections::HashMap::new();
+    let mut latest_status_view_idx: std::collections::HashMap<runtime::SessionId, usize> =
+        std::collections::HashMap::new();
     for (i, e) in events.iter().enumerate() {
         if let runtime::RuntimeEvent::SessionStatusChanged { session, .. } = e {
             latest_status_idx.insert(*session, i);
+        }
+        if let runtime::RuntimeEvent::SessionStatusViewChanged { session, .. } = e {
+            latest_status_view_idx.insert(*session, i);
         }
     }
 
@@ -1659,6 +1664,9 @@ fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) {
             // 세션별 마지막 StatusChanged만 유지.
             runtime::RuntimeEvent::SessionStatusChanged { session, .. } => {
                 latest_status_idx.get(session) == Some(&idx)
+            }
+            runtime::RuntimeEvent::SessionStatusViewChanged { session, .. } => {
+                latest_status_view_idx.get(session) == Some(&idx)
             }
             _ => true,
         };
@@ -1994,6 +2002,39 @@ h:1 EE:FF
                 session: runtime::SessionId(2),
                 status: runtime::SessionStatus::Running,
             }
+        ));
+    }
+
+    #[test]
+    fn coalesce_dedups_status_view_per_session() {
+        let view = |status| {
+            runtime::SessionStatusView::detected(
+                status,
+                runtime::StatusSource::StreamRegex,
+                None,
+                None,
+            )
+        };
+        let mut events = vec![
+            runtime::RuntimeEvent::SessionStatusViewChanged {
+                session: runtime::SessionId(1),
+                view: view(runtime::SessionStatus::Running),
+            },
+            runtime::RuntimeEvent::SessionStatusViewChanged {
+                session: runtime::SessionId(1),
+                view: view(runtime::SessionStatus::Waiting),
+            },
+        ];
+
+        coalesce_mux_updated(&mut events);
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            runtime::RuntimeEvent::SessionStatusViewChanged {
+                session: runtime::SessionId(1),
+                view
+            } if view.status == runtime::SessionStatus::Waiting
         ));
     }
 

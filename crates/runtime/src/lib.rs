@@ -30,4 +30,6 @@ pub use resource_monitor::{
     ProcessResourceMonitor, ProcessResourceMonitorConfig, ProcessResourceSnapshot,
     SessionResourceTarget, SessionResourceUsage,
 };
-pub use session::SessionStatus;
+pub use session::{
+    SessionStatus, SessionStatusView, StatusConfidence, StatusSource, UserStatusOverride,
+};

@@ -104,6 +104,11 @@ pub enum RuntimeCommand {
         path: Vec<u8>,
         ratio: f32,
     },
+    /// User status override. Existing detector events remain unchanged.
+    SetUserStatusOverride {
+        session: SessionId,
+        override_: session::UserStatusOverride,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
@@ -206,6 +211,11 @@ impl std::fmt::Debug for RuntimeCommand {
                 .field("tab", tab)
                 .field("path", path)
                 .field("ratio", ratio)
+                .finish(),
+            RuntimeCommand::SetUserStatusOverride { session, override_ } => f
+                .debug_struct("SetUserStatusOverride")
+                .field("session", session)
+                .field("override", override_)
                 .finish(),
         }
     }

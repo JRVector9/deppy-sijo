@@ -2913,6 +2913,7 @@ mod tests {
             RuntimeEvent::SessionExited { .. } => "SessionExited",
             RuntimeEvent::MuxUpdated { .. } => "MuxUpdated",
             RuntimeEvent::SessionStatusChanged { .. } => "SessionStatusChanged",
+            RuntimeEvent::SessionStatusViewChanged { .. } => "SessionStatusViewChanged",
             RuntimeEvent::ResourceUsage { .. } => "ResourceUsage",
             RuntimeEvent::PtyInputPressure { .. } => "PtyInputPressure",
         }

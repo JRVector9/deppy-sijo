@@ -96,7 +96,7 @@ Implemented scope:
 
 ## PR-U17 Status Detector Confidence / User Override
 
-Status: defer to a broader status UX PR.
+Status: implemented in PR-U17b.
 
 Code checked:
 
@@ -112,13 +112,13 @@ Reason:
 - Adding confidence and manual override would change event semantics and UI
   behavior, not just detector cost control.
 
-Recommended scope:
+Implemented scope:
 
-- Add a separate status model that carries status, confidence/source, and
+- Added `SessionStatusView` with source, confidence, detected status, and
   optional user override.
-- Define notification semantics before changing runtime events.
-- Add i18n keys and pseudo-locale layout coverage if override controls are UI
-  visible.
+- Added user override runtime command and additive status view event.
+- Workspace pane context menu exposes localized override controls.
+- Manual overrides do not emit separate OS notifications in this PR.
 
 ## PR-U08 Debug Redaction
 

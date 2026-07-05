@@ -55,6 +55,7 @@ struct SessionView {
     exit_code: Option<Option<u32>>,
     /// status detector 감지 상태 (agent만, PR-12)
     status: Option<SessionStatus>,
+    status_view: Option<runtime::SessionStatusView>,
     input_pressure: Option<runtime::PtyInputPressure>,
 }
 
@@ -151,6 +152,13 @@ impl WorkspaceUi {
                 RuntimeEvent::SessionStatusChanged { session, status } => {
                     if self.session_alive(*session) {
                         self.sessions.entry(*session).or_default().status = Some(*status);
+                    }
+                }
+                RuntimeEvent::SessionStatusViewChanged { session, view } => {
+                    if self.session_alive(*session) {
+                        let entry = self.sessions.entry(*session).or_default();
+                        entry.status = Some(view.status);
+                        entry.status_view = Some(view.clone());
                     }
                 }
                 RuntimeEvent::PtyInputPressure { session, pressure } => {
@@ -791,6 +799,13 @@ impl WorkspaceUi {
         catalog: &i18n::Catalog,
     ) {
         resp.context_menu(|ui| {
+            let session = self.mux.as_ref().and_then(|mux| {
+                mux.tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .find(|pane| &pane.id == pane_id)
+                    .and_then(|pane| pane.session_id)
+            });
             if ui
                 .button(catalog.t("workspace.split_horizontal", &[]))
                 .clicked()
@@ -820,6 +835,42 @@ impl WorkspaceUi {
                 ui.close();
             }
             ui.separator();
+            if let Some(session) = session {
+                ui.menu_button(catalog.t("status.override.menu", &[]), |ui| {
+                    for (key, status) in [
+                        ("status.override.mark_running", SessionStatus::Running),
+                        ("status.override.mark_waiting", SessionStatus::Waiting),
+                        (
+                            "status.override.mark_needs_approval",
+                            SessionStatus::NeedsApproval,
+                        ),
+                        ("status.override.mark_done", SessionStatus::Done),
+                        ("status.override.mark_error", SessionStatus::Error),
+                    ] {
+                        if ui.button(catalog.t(key, &[])).clicked() {
+                            self.send(
+                                client,
+                                RuntimeCommand::SetUserStatusOverride {
+                                    session,
+                                    override_: runtime::UserStatusOverride::Mark(status),
+                                },
+                            );
+                            ui.close();
+                        }
+                    }
+                    if ui.button(catalog.t("status.override.clear", &[])).clicked() {
+                        self.send(
+                            client,
+                            RuntimeCommand::SetUserStatusOverride {
+                                session,
+                                override_: runtime::UserStatusOverride::Clear,
+                            },
+                        );
+                        ui.close();
+                    }
+                });
+                ui.separator();
+            }
             if ui.button(catalog.t("workspace.close_pane", &[])).clicked() {
                 self.send(
                     client,

@@ -14,4 +14,7 @@ pub use agent_session::spawn_agent;
 pub use lifecycle::SessionLifecycle;
 pub use session::{PumpResult, Session, SessionKind};
 pub use shell_session::spawn_shell;
-pub use status::{SessionStatus, StatusDetector, StatusPatterns};
+pub use status::{
+    SessionStatus, SessionStatusView, StatusConfidence, StatusDetector, StatusPatterns,
+    StatusSource, UserStatusOverride,
+};

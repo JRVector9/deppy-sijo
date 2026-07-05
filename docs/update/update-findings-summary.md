@@ -69,7 +69,7 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 | PR-U14 Terminal Cache Budget Manager | Complete | Current wave | Visible/hidden/exited cache classes, byte/line budgets, trim events, and global exited archive pressure added. |
 | PR-U15 Output Pipeline Backpressure | Complete for current follow-up | Current wave, PR-U15c | In-process runtime command queue is bounded; PTY input now has byte/message policy, explicit pressure events, and visible Workspace/Activity pressure signals. |
 | PR-U16 File Watcher Debounce & Ignore Rules | Complete | Current wave | Default watcher ignores, debounce batching, `.env*` warning signal, and per-window invalidation cap added. |
-| PR-U17 Status Detector Cost Control | Partial complete | Current wave | Regex-empty sessions skip screen-text scans; detector cost stats added. Confidence/user override remain deferred. |
+| PR-U17 Status Detector Cost Control | Complete for current follow-up | Current wave, PR-U17b | Regex-empty sessions skip screen-text scans; detector cost stats, status source/confidence, and user override controls are implemented. |
 | PR-U18 SQLite Write Batching | Complete for current follow-up | Current wave, PR-U18b | Bounded/debounced `DbWriteWorker`, pending approval batch insert, and runtime persistence status/log-offset hot-path wiring are implemented. Layout save remains synchronous. |
 | PR-U19 Remote Slow Consumer Backpressure | Complete | PR-U19 | Remote outbound durable queue is bounded, viewport slots coalesce, and slow durable overflow disconnects the affected client. |
 | PR-U20 Final Performance Gate | Report created / release approval pending | PR-U20, PR-U20b | `cargo run -p xtask -- perf-smoke` passes and `docs/performance/final-gate.md` now records Scenario A-E status. Release approval still requires GUI/remote soak measurements on release hardware. |
@@ -83,7 +83,7 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 ## Release Blockers Remaining
 
 - Full PR-U20 Scenario A-E release-hardware measurements remain pending in Phase D, but the final-gate report now exists.
-- PR-U17 status confidence/override remains a separately scoped follow-up.
+- No code-level follow-up remains from the current PR-U12/U15/U17/U18 batch.
 - Code triage now points PR-U20 follow-up to release-hardware measurement execution, not code changes.
 
 ## Deferred / Backlog Items

@@ -15,6 +15,70 @@ pub enum SessionStatus {
     Done,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionStatusView {
+    pub status: SessionStatus,
+    pub detected_status: SessionStatus,
+    pub source: StatusSource,
+    pub confidence: Option<StatusConfidence>,
+    pub user_override: Option<SessionStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum StatusSource {
+    ProcessExit,
+    StreamRegex,
+    ScreenText,
+    IdleHeuristic,
+    UserOverride,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StatusConfidence {
+    pub score: f32,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum UserStatusOverride {
+    Mark(SessionStatus),
+    Clear,
+}
+
+impl SessionStatusView {
+    pub fn detected(
+        status: SessionStatus,
+        source: StatusSource,
+        confidence: Option<StatusConfidence>,
+        user_override: Option<SessionStatus>,
+    ) -> Self {
+        Self {
+            status: user_override.unwrap_or(status),
+            detected_status: status,
+            source: if user_override.is_some() {
+                StatusSource::UserOverride
+            } else {
+                source
+            },
+            confidence,
+            user_override,
+        }
+    }
+
+    pub fn process_exit(status: SessionStatus) -> Self {
+        Self {
+            status,
+            detected_status: status,
+            source: StatusSource::ProcessExit,
+            confidence: Some(StatusConfidence {
+                score: 1.0,
+                reason: "process_exit".into(),
+            }),
+            user_override: None,
+        }
+    }
+}
+
 impl SessionStatus {
     /// 표시 우선순위 (높을수록 주의 필요) — UI가 여러 pane 상태를 요약할 때 사용.
     pub fn urgency(&self) -> u8 {
@@ -171,6 +235,7 @@ pub struct StatusDetector {
     screen_derived: bool,
     /// 출력이 없어도 다음 tick에 화면 스캔이 필요함 (입력 직후 — worker가 소비)
     screen_scan_requested: bool,
+    source: StatusSource,
     stats: StatusDetectorStats,
 }
 
@@ -187,6 +252,7 @@ impl StatusDetector {
             idle_waiting: false,
             screen_derived: false,
             screen_scan_requested: false,
+            source: StatusSource::IdleHeuristic,
             stats: StatusDetectorStats::default(),
         }
     }
@@ -214,6 +280,18 @@ impl StatusDetector {
         self.stats
     }
 
+    pub fn status_view(&self, user_override: Option<SessionStatus>) -> SessionStatusView {
+        SessionStatusView::detected(
+            self.status,
+            self.source,
+            Some(StatusConfidence {
+                score: status_confidence(self.source),
+                reason: status_source_reason(self.source).into(),
+            }),
+            user_override,
+        )
+    }
+
     /// 사용자 입력 수신 — 현재 화면의 매치 프롬프트를 "응답됨"으로 소비한다.
     /// 소비 단위는 (상태, 라인 텍스트) — echo로 연장된 라인은 같은 프롬프트로 본다.
     pub fn on_input(&mut self) {
@@ -236,6 +314,7 @@ impl StatusDetector {
         // 재확인해야 한다 — 새 프롬프트가 이미 떠 있을 수 있다 (worker가 소비)
         self.screen_scan_requested = !self.patterns.is_empty();
         self.status = SessionStatus::Running;
+        self.source = StatusSource::IdleHeuristic;
         self.idle_waiting = false;
         self.screen_derived = false;
         // 개행 없이 떠 있던 프롬프트가 입력 echo로 라인 완성되며 재매치되는 것 방지
@@ -268,6 +347,7 @@ impl StatusDetector {
             // (APPROVE? 다음 ALL DONE이 오면 최종 상태는 Done이어야 한다).
             if let Some(status) = self.patterns.match_text(line.trim_end()) {
                 self.status = status;
+                self.source = StatusSource::StreamRegex;
                 self.screen_derived = false; // stream 유래로 전환 (latch)
             }
         }
@@ -327,6 +407,7 @@ impl StatusDetector {
             if let Some(status) = best {
                 if priority(status) > priority(self.status) || self.screen_derived {
                     self.status = status;
+                    self.source = StatusSource::ScreenText;
                     // Done/Error는 결과 상태 — stream 매치처럼 latch한다.
                     // Waiting/NeedsApproval만 화면에서 사라지면 해제되는 transient.
                     self.screen_derived = matches!(
@@ -337,6 +418,7 @@ impl StatusDetector {
             } else if self.screen_derived {
                 // transient 화면 프롬프트가 사라짐 → 해제 (timeout/auto-continue/진행 재개)
                 self.status = SessionStatus::Running;
+                self.source = StatusSource::ScreenText;
                 self.screen_derived = false;
             }
         }
@@ -344,6 +426,7 @@ impl StatusDetector {
         self.stats.idle_evaluations += 1;
         if self.status == SessionStatus::Running && self.last_output.elapsed() >= IDLE_THRESHOLD {
             self.status = SessionStatus::Waiting;
+            self.source = StatusSource::IdleHeuristic;
             self.idle_waiting = true;
         }
         if self.status != self.last_reported {
@@ -352,6 +435,25 @@ impl StatusDetector {
         } else {
             None
         }
+    }
+}
+
+fn status_confidence(source: StatusSource) -> f32 {
+    match source {
+        StatusSource::ProcessExit | StatusSource::UserOverride => 1.0,
+        StatusSource::StreamRegex => 0.9,
+        StatusSource::ScreenText => 0.8,
+        StatusSource::IdleHeuristic => 0.4,
+    }
+}
+
+fn status_source_reason(source: StatusSource) -> &'static str {
+    match source {
+        StatusSource::ProcessExit => "process_exit",
+        StatusSource::StreamRegex => "stream_regex",
+        StatusSource::ScreenText => "screen_text",
+        StatusSource::IdleHeuristic => "idle_heuristic",
+        StatusSource::UserOverride => "user_override",
     }
 }
 
@@ -375,6 +477,26 @@ mod tests {
         assert_eq!(d.status(), SessionStatus::Running); // 라인 미완성
         d.on_output(b"FOR_INPUT\n");
         assert_eq!(d.status(), SessionStatus::Waiting);
+    }
+
+    #[test]
+    fn status_view는_source_confidence_override를_담는다() {
+        let mut d = StatusDetector::new(patterns());
+        d.on_output(b"WAITING_FOR_INPUT\n");
+        assert_eq!(d.evaluate(None), Some(SessionStatus::Waiting));
+        let detected = d.status_view(None);
+        assert_eq!(detected.status, SessionStatus::Waiting);
+        assert_eq!(detected.source, StatusSource::StreamRegex);
+        assert_eq!(
+            detected.confidence.as_ref().map(|c| c.reason.as_str()),
+            Some("stream_regex")
+        );
+
+        let overridden = d.status_view(Some(SessionStatus::Done));
+        assert_eq!(overridden.status, SessionStatus::Done);
+        assert_eq!(overridden.detected_status, SessionStatus::Waiting);
+        assert_eq!(overridden.source, StatusSource::UserOverride);
+        assert_eq!(overridden.user_override, Some(SessionStatus::Done));
     }
 
     #[test]

@@ -111,6 +111,7 @@ impl InProcessRuntimeClient {
                     sessions: std::collections::HashMap::new(),
                     logs: std::collections::HashMap::new(),
                     detectors: std::collections::HashMap::new(),
+                    status_overrides: std::collections::HashMap::new(),
                     logs_root,
                     redaction,
                     secret_store,
@@ -234,6 +235,9 @@ struct Worker {
     logs: std::collections::HashMap<SessionId, SessionLog>,
     /// 세션별 status detector (PR-12) — regex 있는 agent만
     detectors: std::collections::HashMap<SessionId, StatusDetector>,
+    /// User status overrides. This affects `SessionStatusViewChanged` only;
+    /// legacy `SessionStatusChanged` remains raw detector output.
+    status_overrides: std::collections::HashMap<SessionId, session::SessionStatus>,
     logs_root: PathBuf,
     redaction: RedactionService,
     /// mux 상태 (PR-10) — layout source of truth. UI는 MuxUpdated 스냅샷만 본다.
@@ -633,6 +637,23 @@ impl Worker {
                     }
                 }
             }
+            RuntimeCommand::SetUserStatusOverride { session, override_ } => {
+                if !self.sessions.contains_key(&session) {
+                    return;
+                }
+                match override_ {
+                    session::UserStatusOverride::Mark(status) => {
+                        self.status_overrides.insert(session, status);
+                    }
+                    session::UserStatusOverride::Clear => {
+                        self.status_overrides.remove(&session);
+                    }
+                }
+                self.emit(RuntimeEvent::SessionStatusViewChanged {
+                    session,
+                    view: self.session_status_view(session),
+                });
+            }
             RuntimeCommand::Resize {
                 session,
                 cols,
@@ -673,6 +694,7 @@ impl Worker {
                 self.exited_order.retain(|s| *s != session);
                 self.hidden_scrollback.remove(&session);
                 self.detectors.remove(&session);
+                self.status_overrides.remove(&session);
                 self.close_session_log(session, "killed", None);
                 if let Some(pipe) = &mut self.persist {
                     pipe.session_exited(session);
@@ -935,6 +957,7 @@ impl Worker {
                     // 방어: split 실패 시 고아 pane/세션을 남기지 않는다
                     self.mux.panes.remove(&pane_id);
                     self.sessions.remove(&id);
+                    self.status_overrides.remove(&id);
                     self.close_session_log(id, "killed", None);
                     self.emit(RuntimeEvent::SpawnFailed {
                         kind: SpawnKind::Shell,
@@ -971,6 +994,7 @@ impl Worker {
             self.sessions.remove(&session);
             self.exited_order.retain(|s| *s != session);
             self.hidden_scrollback.remove(&session);
+            self.status_overrides.remove(&session);
             self.detectors.remove(&session);
             self.close_session_log(session, "killed", None);
             if let Some(pipe) = &mut self.persist {
@@ -1003,6 +1027,7 @@ impl Worker {
                 self.exited_order.retain(|s| *s != session);
                 self.hidden_scrollback.remove(&session);
                 self.detectors.remove(&session);
+                self.status_overrides.remove(&session);
                 self.close_session_log(session, "killed", None);
                 if let Some(pipe) = &mut self.persist {
                     pipe.session_exited(session);
@@ -1127,9 +1152,15 @@ impl Worker {
                     .then(|| active.screen_text());
                 if let Some(status) = detector.evaluate(screen.as_deref()) {
                     status_updates.push((active.id(), status));
+                    let view =
+                        detector.status_view(self.status_overrides.get(&active.id()).copied());
                     events.push(RuntimeEvent::SessionStatusChanged {
                         session: active.id(),
                         status,
+                    });
+                    events.push(RuntimeEvent::SessionStatusViewChanged {
+                        session: active.id(),
+                        view,
                     });
                 }
             }
@@ -1162,6 +1193,16 @@ impl Worker {
             if result.just_exited
                 && let session::SessionLifecycle::Exited { exit_code } = active.lifecycle()
             {
+                let status = if exit_code == Some(0) {
+                    session::SessionStatus::Done
+                } else {
+                    session::SessionStatus::Error
+                };
+                self.status_overrides.remove(&active.id());
+                events.push(RuntimeEvent::SessionStatusViewChanged {
+                    session: active.id(),
+                    view: session::SessionStatusView::process_exit(status),
+                });
                 events.push(RuntimeEvent::SessionExited {
                     session: active.id(),
                     exit_code,
@@ -1191,6 +1232,7 @@ impl Worker {
             let detail = exit_code.map(|c| format!("exit code {c}"));
             self.close_session_log(session, "exited", detail.as_deref());
             self.detectors.remove(&session);
+            self.status_overrides.remove(&session);
             if let Some(pipe) = &mut self.persist {
                 pipe.session_exited(session);
             }
@@ -1234,6 +1276,22 @@ impl Worker {
                 self.close_pane(pane);
             }
         }
+    }
+
+    fn session_status_view(&self, session: SessionId) -> session::SessionStatusView {
+        let user_override = self.status_overrides.get(&session).copied();
+        if let Some(detector) = self.detectors.get(&session) {
+            return detector.status_view(user_override);
+        }
+        session::SessionStatusView::detected(
+            session::SessionStatus::Running,
+            session::StatusSource::IdleHeuristic,
+            Some(session::StatusConfidence {
+                score: 0.0,
+                reason: "no_detector".into(),
+            }),
+            user_override,
+        )
     }
 
     /// 가시성/lifecycle 전이에 맞춰 terminal cache budget을 적용한다 (§14.3):
@@ -2336,6 +2394,45 @@ mod tests {
             _ => None,
         });
         assert_eq!(pressure.reason, pty::PtyInputRejectReason::PayloadTooLarge);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn user_status_override는_status_view_event로_surface된다() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("status-override"),
+            RedactionService::new(),
+            pty::default_shell(),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(spawn_agent_cmd("cat", None, None))
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::AgentSpawned { session } => Some(*session),
+            _ => None,
+        });
+        probe.seen.clear();
+        client
+            .send_command(RuntimeCommand::SetUserStatusOverride {
+                session,
+                override_: session::UserStatusOverride::Mark(session::SessionStatus::Done),
+            })
+            .unwrap();
+        let view = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::SessionStatusViewChanged {
+                session: view_session,
+                view,
+            } if *view_session == session => Some(view.clone()),
+            _ => None,
+        });
+        assert_eq!(view.status, session::SessionStatus::Done);
+        assert_eq!(view.detected_status, session::SessionStatus::Running);
+        assert_eq!(view.source, session::StatusSource::UserOverride);
+        assert_eq!(view.user_override, Some(session::SessionStatus::Done));
     }
 
     #[test]

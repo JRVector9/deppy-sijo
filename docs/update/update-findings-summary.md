@@ -59,7 +59,7 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 | PR-U05 Folder Tree Scalability & DnD Hardening | Complete for current findings | PR-B03a, PR-B03b, PR-U05b | Shell quoting, empty root, async/chunk listing, git ignore matcher, watcher filtering, and no-auto-enter path DnD are covered. |
 | PR-U06 Terminal Clipboard / Paste / DnD Hardening | Complete for current findings | PR-B04b, PR-U06b | Shared paste bytes, bracketed path insertion, and terminal selected-text DnD contract are implemented. Clipboard failure abstraction remains deferred. |
 | PR-U07 CJK / IME / Unicode Terminal QA | Complete for selection fixtures | PR-B04a, PR-B04b | Wide-char selection normalization and required paste/DnD fixture coverage added. IME smoke remains a release gate concern. |
-| PR-U08 Redaction Pipeline Hardening | Complete for high findings | PR-B05a, PR-B05a review fix | Secret-like env/args persistence guards strengthened. Manual Debug redaction remains backlog. |
+| PR-U08 Redaction Pipeline Hardening | Complete for current findings | PR-B05a, PR-B05a review fix, PR-U08b | Secret-like env/args persistence guards and runtime/config Debug redaction are covered. |
 | PR-U09 Project Env Safety & Production Guard | Complete for current findings | PR-B05a, PR-U09b | Plain secret-like env blocked. Production profile agent runs now require confirmation before `SpawnAgent`. |
 | PR-U10 MCP Permission / Audit Hardening | Complete for current findings | PR-B06a, PR-U10b | Audit encrypted blob default-off, JSON validation, debug redaction, schema reapproval checks, and scoped MCP env injection are covered. |
 | PR-U11 Final Security Gate | Gate command complete | Current wave | `cargo run -p xtask -- security-scan` added and passed against boundary, deps, secret persistence, audit/MCP/proxy tests. |
@@ -90,7 +90,7 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 - Full store crate split beyond the v2.8 accepted DAG is deferred unless a new cycle appears.
 - Clipboard failure UI abstraction is deferred unless a concrete platform failure
   mode or product requirement appears.
-- Manual `Debug` redaction for all sensitive runtime/config rows.
+- Continue avoiding `Debug` logging for new sensitive runtime/config rows.
 - MCP proxy schema hash reapproval is covered for the current per-session proxy
   architecture; scoped MCP env injection is now implemented by PR-U10b.
 - Pseudo-locale visual smoke and generated default title localization.

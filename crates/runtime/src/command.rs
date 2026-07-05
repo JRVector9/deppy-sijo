@@ -18,7 +18,7 @@ pub enum WorkspaceRuntimeState {
 }
 
 /// UI → Runtime 명령 (설계문서 2.1). v0은 단일 셸 세션에 필요한 것만.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum RuntimeCommand {
     SpawnShell {
         cols: u16,
@@ -104,4 +104,161 @@ pub enum RuntimeCommand {
         path: Vec<u8>,
         ratio: f32,
     },
+}
+
+impl std::fmt::Debug for RuntimeCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RuntimeCommand::SpawnShell {
+                cols,
+                rows,
+                scrollback_lines,
+            } => f
+                .debug_struct("SpawnShell")
+                .field("cols", cols)
+                .field("rows", rows)
+                .field("scrollback_lines", scrollback_lines)
+                .finish(),
+            RuntimeCommand::SpawnAgent {
+                cols,
+                rows,
+                scrollback_lines,
+                agent_config_id,
+                command,
+                args,
+                env_plain,
+                env_secrets,
+                waiting_regex,
+                approval_regex,
+                error_regex,
+                done_regex,
+            } => f
+                .debug_struct("SpawnAgent")
+                .field("cols", cols)
+                .field("rows", rows)
+                .field("scrollback_lines", scrollback_lines)
+                .field("agent_config_id_set", &agent_config_id.is_some())
+                .field("command", command)
+                .field("args_count", &args.len())
+                .field("env_plain_count", &env_plain.len())
+                .field("env_secret_count", &env_secrets.len())
+                .field("waiting_regex_set", &waiting_regex.is_some())
+                .field("approval_regex_set", &approval_regex.is_some())
+                .field("error_regex_set", &error_regex.is_some())
+                .field("done_regex_set", &done_regex.is_some())
+                .finish(),
+            RuntimeCommand::WriteInput { session, bytes } => f
+                .debug_struct("WriteInput")
+                .field("session", session)
+                .field("bytes_len", &bytes.len())
+                .finish(),
+            RuntimeCommand::Resize {
+                session,
+                cols,
+                rows,
+            } => f
+                .debug_struct("Resize")
+                .field("session", session)
+                .field("cols", cols)
+                .field("rows", rows)
+                .finish(),
+            RuntimeCommand::Scroll { session, delta } => f
+                .debug_struct("Scroll")
+                .field("session", session)
+                .field("delta", delta)
+                .finish(),
+            RuntimeCommand::KillSession { session } => f
+                .debug_struct("KillSession")
+                .field("session", session)
+                .finish(),
+            RuntimeCommand::SeedRedaction { credential_ids } => f
+                .debug_struct("SeedRedaction")
+                .field("credential_count", &credential_ids.len())
+                .finish(),
+            RuntimeCommand::SplitPane {
+                pane,
+                direction,
+                scrollback_lines,
+            } => f
+                .debug_struct("SplitPane")
+                .field("pane", pane)
+                .field("direction", direction)
+                .field("scrollback_lines", scrollback_lines)
+                .finish(),
+            RuntimeCommand::ClosePane { pane } => {
+                f.debug_struct("ClosePane").field("pane", pane).finish()
+            }
+            RuntimeCommand::CloseTab { tab } => {
+                f.debug_struct("CloseTab").field("tab", tab).finish()
+            }
+            RuntimeCommand::SelectTab { tab } => {
+                f.debug_struct("SelectTab").field("tab", tab).finish()
+            }
+            RuntimeCommand::FocusPane { pane } => {
+                f.debug_struct("FocusPane").field("pane", pane).finish()
+            }
+            RuntimeCommand::RestoreWorkspace => f.write_str("RestoreWorkspace"),
+            RuntimeCommand::SetWorkspaceState(state) => {
+                f.debug_tuple("SetWorkspaceState").field(state).finish()
+            }
+            RuntimeCommand::ResizeSplit { tab, path, ratio } => f
+                .debug_struct("ResizeSplit")
+                .field("tab", tab)
+                .field("path", path)
+                .field("ratio", ratio)
+                .finish(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_command_debug는_spawn_agent와_input_payload를_숨긴다() {
+        let command = RuntimeCommand::SpawnAgent {
+            cols: 120,
+            rows: 40,
+            scrollback_lines: 10_000,
+            agent_config_id: Some("agent-secret-id".to_owned()),
+            command: "/bin/sh".to_owned(),
+            args: vec!["--token".to_owned(), "sk-debug-never-log".to_owned()],
+            env_plain: vec![("API_KEY".to_owned(), "plain-debug-never-log".to_owned())],
+            env_secrets: vec![("SECRET".to_owned(), "cred-debug-never-log".to_owned())],
+            waiting_regex: Some("waiting-secret-pattern".to_owned()),
+            approval_regex: None,
+            error_regex: None,
+            done_regex: None,
+        };
+        let input = RuntimeCommand::WriteInput {
+            session: SessionId(7),
+            bytes: b"paste-debug-never-log".to_vec(),
+        };
+        let seed = RuntimeCommand::SeedRedaction {
+            credential_ids: vec!["cred-seed-never-log".to_owned()],
+        };
+
+        let text = format!("{command:?}\n{input:?}\n{seed:?}");
+
+        for forbidden in [
+            "agent-secret-id",
+            "sk-debug-never-log",
+            "plain-debug-never-log",
+            "cred-debug-never-log",
+            "waiting-secret-pattern",
+            "paste-debug-never-log",
+            "cred-seed-never-log",
+            "API_KEY",
+            "SECRET",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "Debug leaked {forbidden}: {text}"
+            );
+        }
+        assert!(text.contains("args_count"));
+        assert!(text.contains("bytes_len"));
+        assert!(text.contains("credential_count"));
+    }
 }

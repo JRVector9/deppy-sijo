@@ -5,10 +5,22 @@ use rusqlite::{Connection, OptionalExtension};
 
 /// env 값. secret은 평문 대신 credentials.id만 참조한다 (설계문서 6.3).
 /// 평문 해석은 spawn 직전(PR-09)에만 일어난다.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum EnvValue {
     Plain(String),
     Secret { credential_id: String },
+}
+
+impl std::fmt::Debug for EnvValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EnvValue::Plain(_) => f.debug_tuple("Plain").field(&"[REDACTED_PLAIN]").finish(),
+            EnvValue::Secret { .. } => f
+                .debug_struct("Secret")
+                .field("credential_id", &"[REDACTED_CREDENTIAL_ID]")
+                .finish(),
+        }
+    }
 }
 
 /// SQLite metadata DB (설계문서 11장). secret 평문은 절대 저장하지 않는다 —
@@ -1231,6 +1243,22 @@ mod tests {
         assert_eq!(listed[0].id, "cred-2");
         // 없는 id는 false (참조 중과 동일하게 "안 지움")
         assert!(!db.delete_credential_if_unused("cred-1").unwrap());
+    }
+
+    #[test]
+    fn env_value_debug는_plain과_credential_id를_숨긴다() {
+        let plain = EnvValue::Plain("safe-but-still-runtime-env-value".to_owned());
+        let secret = EnvValue::Secret {
+            credential_id: "cred-debug-never-log".to_owned(),
+        };
+
+        let plain_debug = format!("{plain:?}");
+        let secret_debug = format!("{secret:?}");
+
+        assert!(!plain_debug.contains("safe-but-still-runtime-env-value"));
+        assert!(plain_debug.contains("[REDACTED_PLAIN]"));
+        assert!(!secret_debug.contains("cred-debug-never-log"));
+        assert!(secret_debug.contains("[REDACTED_CREDENTIAL_ID]"));
     }
 
     fn 모든_버전_prefix에서_최신까지_마이그레이션되고_fk_정합(k: usize) {

@@ -94,7 +94,7 @@ impl AgentsUi {
                 } => {
                     self.pending_launches = self.pending_launches.saturating_sub(1);
                     // 실행 주체인 이 창에도 실패를 표시한다 (workspace 에러바와 별개)
-                    self.error = Some(catalog.t("agents.run_failed", &[("message", message)]));
+                    self.error = Some(crate::ui::render_message(catalog, message));
                 }
                 _ => {}
             }

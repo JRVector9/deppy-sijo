@@ -662,6 +662,7 @@ impl App {
                 workspace_id,
                 &events,
                 &mut rt.session_titles,
+                &self.i18n,
             );
             // 축출 = Suspended(워커 종료) — 그 workspace의 진행형 알림은 더는 조치
             // 불가하므로 정리한다 (결과 알림은 기록이라 유지, codex 리뷰).
@@ -922,6 +923,7 @@ impl App {
         workspace_id: &str,
         events: &[runtime::RuntimeEvent],
         session_titles: &mut std::collections::HashMap<runtime::SessionId, String>,
+        catalog: &i18n::Catalog,
     ) {
         for event in events {
             match event {
@@ -941,13 +943,13 @@ impl App {
                 }
                 runtime::RuntimeEvent::SessionStatusChanged { session, status } => {
                     if let Some(title) = session_titles.get(session).cloned() {
-                        notifications.on_status(workspace_id, *session, *status, &title);
+                        notifications.on_status(workspace_id, *session, *status, &title, catalog);
                     }
                 }
                 // regex 없는 agent는 결과가 SessionExited로만 온다 (완료 기준: done/error)
                 runtime::RuntimeEvent::SessionExited { session, exit_code } => {
                     if let Some(title) = session_titles.get(session).cloned() {
-                        notifications.on_exit(workspace_id, *session, *exit_code, &title);
+                        notifications.on_exit(workspace_id, *session, *exit_code, &title, catalog);
                     }
                     session_titles.remove(session);
                 }
@@ -1058,6 +1060,7 @@ impl eframe::App for App {
                     &rt.id,
                     &events,
                     &mut rt.session_titles,
+                    &self.i18n,
                 );
                 rt.pending_events.extend(events);
                 // MuxUpdated는 매번 전체 스냅샷이라 오래된 건 최신에 완전히 대체된다.
@@ -1079,6 +1082,7 @@ impl eframe::App for App {
                 &self.active.id,
                 &new_events,
                 &mut self.active.session_titles,
+                &self.i18n,
             );
             self.active.pending_events.extend(new_events);
             // 창이 숨겨져(render_active=false) ui()가 스킵되면 active의 pending도 warm처럼

@@ -15,6 +15,7 @@ struct NotificationItem {
     session: SessionId,
     status: SessionStatus,
     title: String,
+    message_id: String,
     read: bool,
 }
 
@@ -49,22 +50,29 @@ impl NotificationsUi {
         session: SessionId,
         status: SessionStatus,
         title: &str,
+        catalog: &i18n::Catalog,
     ) {
-        let label = match status {
-            SessionStatus::Waiting => "입력 대기",
-            SessionStatus::NeedsApproval => "승인 필요",
-            SessionStatus::Error => "오류",
-            SessionStatus::Done => "완료",
+        let Some(message_id) = notification_message_id(status) else {
+            // 진행 재개는 알림 아님
+            return;
+        };
+        let rendered = catalog.t(message_id, &[("title", title)]);
+        match status {
             SessionStatus::Running => return, // 진행 재개는 알림 아님
+            SessionStatus::Waiting
+            | SessionStatus::NeedsApproval
+            | SessionStatus::Error
+            | SessionStatus::Done => {}
         };
         #[cfg(not(test))] // 테스트에서 실제 OS 알림을 띄우지 않는다
-        platform::notify(&format!("{label}: {title}"), title);
-        let _ = label;
+        platform::notify(&rendered, title);
+        let _ = rendered;
         self.items.push(NotificationItem {
             workspace_id: workspace_id.to_owned(),
             session,
             status,
             title: title.to_owned(),
+            message_id: message_id.to_owned(),
             // 생성 시엔 항상 안 읽음. on_status는 창이 숨겨져(minimized/occluded) ui()가
             // 스킵돼도 logic()에서 호출되므로, 여기서 self.open으로 읽음 처리하면 사용자가
             // 보지 못한 background 알림이 읽음이 돼 unread 신호를 잃는다. 실제 읽음은
@@ -87,6 +95,7 @@ impl NotificationsUi {
         session: SessionId,
         exit_code: Option<u32>,
         title: &str,
+        catalog: &i18n::Catalog,
     ) {
         let status = if exit_code == Some(0) {
             SessionStatus::Done
@@ -104,7 +113,7 @@ impl NotificationsUi {
             .find(|item| item.workspace_id == workspace_id && item.session == session)
             .is_some_and(|item| item.status == status);
         if !dup {
-            self.on_status(workspace_id, session, status, title);
+            self.on_status(workspace_id, session, status, title, catalog);
         }
     }
 
@@ -175,8 +184,9 @@ impl NotificationsUi {
                 // 최신 항목이 위로
                 for item in self.items.iter().rev() {
                     let icon = status_icon(item.status);
+                    let label = catalog.t(&item.message_id, &[("title", &item.title)]);
                     if ui
-                        .button(format!("{icon} {}", item.title))
+                        .button(format!("{icon} {label}"))
                         .on_hover_text(catalog.t("notification.goto_session", &[]))
                         .clicked()
                     {
@@ -199,31 +209,78 @@ fn status_icon(status: SessionStatus) -> &'static str {
     }
 }
 
+fn notification_message_id(status: SessionStatus) -> Option<&'static str> {
+    match status {
+        SessionStatus::Waiting => Some("notification.session.waiting"),
+        SessionStatus::NeedsApproval => Some("notification.session.needs_approval"),
+        SessionStatus::Error => Some("notification.session.error"),
+        SessionStatus::Done => Some("notification.session.done"),
+        SessionStatus::Running => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const WS: &str = "ws-1";
 
+    fn catalog() -> i18n::Catalog {
+        i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap()
+    }
+
     #[test]
     fn running_복귀는_알림_아님() {
         let mut n = NotificationsUi::new();
-        n.on_status(WS, SessionId(1), SessionStatus::Running, "t");
+        let catalog = catalog();
+        n.on_status(WS, SessionId(1), SessionStatus::Running, "t", &catalog);
         assert_eq!(n.unread(), 0);
-        n.on_status(WS, SessionId(1), SessionStatus::Error, "t");
+        n.on_status(WS, SessionId(1), SessionStatus::Error, "t", &catalog);
         assert_eq!(n.unread(), 1);
+    }
+
+    #[test]
+    fn status_알림은_message_id를_저장한다() {
+        let mut n = NotificationsUi::new();
+        let catalog = catalog();
+        n.on_status(
+            WS,
+            SessionId(1),
+            SessionStatus::NeedsApproval,
+            "review",
+            &catalog,
+        );
+        let item = n.items.first().unwrap();
+        assert_eq!(item.message_id, "notification.session.needs_approval");
+        assert_eq!(
+            catalog.t(&item.message_id, &[("title", &item.title)]),
+            "Approval needed: review"
+        );
     }
 
     #[test]
     fn 다른_workspace의_같은_세션id는_별개_알림() {
         let mut n = NotificationsUi::new();
+        let catalog = catalog();
         // 워커마다 SessionId가 리셋되므로 (ws, session)로 구분돼야 한다
-        n.on_status("ws-a", SessionId(1), SessionStatus::Done, "A작업");
-        n.on_status("ws-b", SessionId(1), SessionStatus::Done, "B작업");
+        n.on_status("ws-a", SessionId(1), SessionStatus::Done, "A작업", &catalog);
+        n.on_status("ws-b", SessionId(1), SessionStatus::Done, "B작업", &catalog);
         assert_eq!(n.items.len(), 2);
         // 활성(ws-a) 기준 retain: ws-a의 진행형만 정리, ws-b(다른 workspace)는 유지
-        n.on_status("ws-a", SessionId(2), SessionStatus::Waiting, "A대기");
-        n.on_status("ws-b", SessionId(2), SessionStatus::Waiting, "B대기");
+        n.on_status(
+            "ws-a",
+            SessionId(2),
+            SessionStatus::Waiting,
+            "A대기",
+            &catalog,
+        );
+        n.on_status(
+            "ws-b",
+            SessionId(2),
+            SessionStatus::Waiting,
+            "B대기",
+            &catalog,
+        );
         n.retain_sessions("ws-a", &[]); // ws-a에 alive 세션 없음
         // ws-a의 Waiting(진행형)은 정리, Done(결과)은 유지, ws-b는 전부 유지
         let has = |ws: &str, sess: u64, st: SessionStatus| {
@@ -242,17 +299,25 @@ mod tests {
         // 숨김 중 logic()에서 on_status가 호출될 수 있으므로 self.open으로 읽음 처리하면
         // 안 된다 — 사용자가 본 시점(show=가시)에만 읽음. 생성 시엔 항상 unread.
         let mut n = NotificationsUi::new();
+        let catalog = catalog();
         n.toggle(); // open = true
-        n.on_status(WS, SessionId(1), SessionStatus::Done, "완료");
+        n.on_status(WS, SessionId(1), SessionStatus::Done, "완료", &catalog);
         assert_eq!(n.unread(), 1);
     }
 
     #[test]
     fn retain은_결과상태_유지하고_진행형만_정리() {
         let mut n = NotificationsUi::new();
-        n.on_status(WS, SessionId(1), SessionStatus::Done, "a"); // 결과 → 유지
-        n.on_status(WS, SessionId(2), SessionStatus::NeedsApproval, "b"); // 진행형 → 정리
-        n.on_status(WS, SessionId(3), SessionStatus::Error, "c"); // 결과 → 유지
+        let catalog = catalog();
+        n.on_status(WS, SessionId(1), SessionStatus::Done, "a", &catalog); // 결과 → 유지
+        n.on_status(
+            WS,
+            SessionId(2),
+            SessionStatus::NeedsApproval,
+            "b",
+            &catalog,
+        ); // 진행형 → 정리
+        n.on_status(WS, SessionId(3), SessionStatus::Error, "c", &catalog); // 결과 → 유지
         // 1·2 사라짐(닫힘/archive). Done(1)·Error(3)는 기록이라 유지, 승인(2)만 정리
         n.retain_sessions(WS, &[SessionId(3)]);
         let sessions: Vec<_> = n.items.iter().map(|i| i.session).collect();
@@ -264,18 +329,19 @@ mod tests {
     #[test]
     fn exit_알림과_status_중복_방지() {
         let mut n = NotificationsUi::new();
+        let catalog = catalog();
         // status detector가 먼저 Done 감지 → 이후 exit(0)는 중복 발화 안 함
-        n.on_status(WS, SessionId(1), SessionStatus::Done, "a");
-        n.on_exit(WS, SessionId(1), Some(0), "a");
+        n.on_status(WS, SessionId(1), SessionStatus::Done, "a", &catalog);
+        n.on_exit(WS, SessionId(1), Some(0), "a", &catalog);
         assert_eq!(n.items.len(), 1);
         // regex 없는 agent: status 없이 exit만 → Done 알림 생성
-        n.on_exit(WS, SessionId(2), Some(0), "b");
+        n.on_exit(WS, SessionId(2), Some(0), "b", &catalog);
         assert_eq!(
             n.items.iter().filter(|i| i.session == SessionId(2)).count(),
             1
         );
         // 비정상 종료 → Error
-        n.on_exit(WS, SessionId(3), Some(1), "c");
+        n.on_exit(WS, SessionId(3), Some(1), "c", &catalog);
         assert!(matches!(
             n.items
                 .iter()
@@ -289,11 +355,12 @@ mod tests {
     #[test]
     fn unread는_읽은_옛항목과_무관하게_pruning에_정합() {
         let mut n = NotificationsUi::new();
-        n.on_status(WS, SessionId(1), SessionStatus::Done, "old"); // 읽을 항목
+        let catalog = catalog();
+        n.on_status(WS, SessionId(1), SessionStatus::Done, "old", &catalog); // 읽을 항목
         n.toggle(); // 열기 → 모두 읽음
         n.toggle(); // 닫기
         assert_eq!(n.unread(), 0);
-        n.on_status(WS, SessionId(2), SessionStatus::Waiting, "new"); // 진행형, 안 읽음 1
+        n.on_status(WS, SessionId(2), SessionStatus::Waiting, "new", &catalog); // 진행형, 안 읽음 1
         assert_eq!(n.unread(), 1);
         // session 2(진행형)가 사라짐 → 정리되어 unread 0, 옛 읽은 Done(1)은 남아도 unread 0
         n.retain_sessions(WS, &[SessionId(1)]);

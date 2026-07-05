@@ -15,6 +15,54 @@ pub enum SpawnKind {
     Agent,
 }
 
+/// Stable localized message payload crossing the runtime boundary.
+///
+/// `message_id` is the user-facing key. `args` contains non-localized values
+/// such as command names, credential ids, or diagnostic text. `diagnostic` is
+/// optional debug detail and should not be used as the stable UI message.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MessagePayload {
+    pub message_id: String,
+    pub args: Vec<MessageArg>,
+    pub diagnostic: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MessageArg {
+    pub key: String,
+    pub value: String,
+}
+
+impl MessagePayload {
+    pub fn new(message_id: impl Into<String>) -> Self {
+        Self {
+            message_id: message_id.into(),
+            args: Vec::new(),
+            diagnostic: None,
+        }
+    }
+
+    pub fn arg(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.args.push(MessageArg {
+            key: key.into(),
+            value: value.into(),
+        });
+        self
+    }
+
+    pub fn diagnostic(mut self, diagnostic: impl Into<String>) -> Self {
+        self.diagnostic = Some(diagnostic.into());
+        self
+    }
+
+    pub fn arg_value(&self, key: &str) -> Option<&str> {
+        self.args
+            .iter()
+            .find(|arg| arg.key == key)
+            .map(|arg| arg.value.as_str())
+    }
+}
+
 /// Runtime → UI 이벤트 (설계문서 2.1).
 /// Viewport는 output batch 주기(설계문서 10.1)마다 push된다 —
 /// remote 전환 시 terminal delta 스트림으로 대체되는 자리 (8.2).
@@ -29,7 +77,7 @@ pub enum RuntimeEvent {
     },
     SpawnFailed {
         kind: SpawnKind,
-        message: String,
+        message: MessagePayload,
     },
     Viewport {
         session: SessionId,
@@ -55,4 +103,44 @@ pub enum RuntimeEvent {
     ResourceUsage {
         snapshot: ProcessResourceSnapshot,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spawn_failed_payload_uses_stable_message_id_and_args() {
+        let payload = MessagePayload::new("runtime.spawn_failed.shell")
+            .arg("error", "missing executable")
+            .diagnostic("No such file or directory");
+        assert_eq!(payload.message_id, "runtime.spawn_failed.shell");
+        assert_eq!(payload.arg_value("error"), Some("missing executable"));
+        assert_eq!(
+            payload.diagnostic.as_deref(),
+            Some("No such file or directory")
+        );
+    }
+
+    #[test]
+    fn spawn_failed_payload_roundtrips_through_postcard() {
+        let event = RuntimeEvent::SpawnFailed {
+            kind: SpawnKind::Agent,
+            message: MessagePayload::new("runtime.spawn_failed.agent_secret")
+                .arg("credential_id", "cred-1")
+                .arg("error", "not found")
+                .diagnostic("keyring lookup failed"),
+        };
+        let bytes = postcard::to_allocvec(&event).unwrap();
+        let decoded: RuntimeEvent = postcard::from_bytes(&bytes).unwrap();
+        match decoded {
+            RuntimeEvent::SpawnFailed { kind, message } => {
+                assert_eq!(kind, SpawnKind::Agent);
+                assert_eq!(message.message_id, "runtime.spawn_failed.agent_secret");
+                assert_eq!(message.arg_value("credential_id"), Some("cred-1"));
+                assert_eq!(message.arg_value("error"), Some("not found"));
+            }
+            _ => panic!("unexpected event"),
+        }
+    }
 }

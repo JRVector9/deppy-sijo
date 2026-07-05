@@ -145,14 +145,7 @@ impl WorkspaceUi {
                     if *kind == SpawnKind::Shell {
                         self.pending_spawns = self.pending_spawns.saturating_sub(1);
                     }
-                    let kind = match kind {
-                        SpawnKind::Shell => catalog.t("workspace.spawn.shell", &[]),
-                        SpawnKind::Agent => catalog.t("workspace.spawn.agent", &[]),
-                    };
-                    self.error = Some(catalog.t(
-                        "workspace.spawn_failed",
-                        &[("kind", kind.as_str()), ("message", message.as_str())],
-                    ));
+                    self.error = Some(crate::ui::render_message(catalog, message));
                 }
                 RuntimeEvent::SessionStatusChanged { session, status } => {
                     if self.session_alive(*session) {

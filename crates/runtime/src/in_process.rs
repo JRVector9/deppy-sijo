@@ -19,7 +19,7 @@ use terminal::{TERMINAL_GLOBAL_CACHE_BUDGET_BYTES, TerminalCacheClass, TerminalC
 
 use crate::client::{RuntimeClient, RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream};
 use crate::command::{RuntimeCommand, SessionId};
-use crate::event::{RuntimeEvent, SpawnKind};
+use crate::event::{MessagePayload, RuntimeEvent, SpawnKind};
 use crate::resource_monitor::{ProcessResourceMonitor, ProcessResourceMonitorConfig};
 
 /// 구독자 한 명의 송신측. 상태 이벤트(unbounded — 세션 수명당 상수 개수의
@@ -490,7 +490,9 @@ impl Worker {
                     }
                     Err(e) => self.emit(RuntimeEvent::SpawnFailed {
                         kind: SpawnKind::Shell,
-                        message: format!("{e:#}"),
+                        message: MessagePayload::new("runtime.spawn_failed.shell")
+                            .arg("error", format!("{e:#}"))
+                            .diagnostic(format!("{e:#}")),
                     }),
                 }
             }
@@ -521,17 +523,18 @@ impl Worker {
                         }
                         Err(e) => {
                             // credential id만 로그 — secret 값/키 이름은 남기지 않는다
-                            resolve_failed = Some(format!(
-                                "secret resolve 실패 (credential {credential_id}): {e:#}"
-                            ));
+                            resolve_failed = Some((credential_id, format!("{e:#}")));
                             break;
                         }
                     }
                 }
-                if let Some(message) = resolve_failed {
+                if let Some((credential_id, error)) = resolve_failed {
                     self.emit(RuntimeEvent::SpawnFailed {
                         kind: SpawnKind::Agent,
-                        message,
+                        message: MessagePayload::new("runtime.spawn_failed.agent_secret")
+                            .arg("credential_id", credential_id)
+                            .arg("error", error.clone())
+                            .diagnostic(error),
                     });
                     return;
                 }
@@ -578,7 +581,9 @@ impl Worker {
                     }
                     Err(e) => self.emit(RuntimeEvent::SpawnFailed {
                         kind: SpawnKind::Agent,
-                        message: format!("{e:#}"),
+                        message: MessagePayload::new("runtime.spawn_failed.agent")
+                            .arg("error", format!("{e:#}"))
+                            .diagnostic(format!("{e:#}")),
                     }),
                 }
             }
@@ -853,7 +858,7 @@ impl Worker {
             // stale 요청(이미 닫힌 pane)에도 응답한다 — UI의 pending 폴링이 끝나도록
             self.emit(RuntimeEvent::SpawnFailed {
                 kind: SpawnKind::Shell,
-                message: "분할 대상 pane이 이미 없음".into(),
+                message: MessagePayload::new("runtime.split.target_missing"),
             });
             return;
         };
@@ -891,7 +896,7 @@ impl Worker {
                     self.close_session_log(id, "killed", None);
                     self.emit(RuntimeEvent::SpawnFailed {
                         kind: SpawnKind::Shell,
-                        message: "분할 실패 (대상 pane 소실)".into(),
+                        message: MessagePayload::new("runtime.split.target_lost"),
                     });
                     return;
                 }
@@ -902,7 +907,9 @@ impl Worker {
             }
             Err(e) => self.emit(RuntimeEvent::SpawnFailed {
                 kind: SpawnKind::Shell,
-                message: format!("{e:#}"),
+                message: MessagePayload::new("runtime.spawn_failed.shell")
+                    .arg("error", format!("{e:#}"))
+                    .diagnostic(format!("{e:#}")),
             }),
         }
     }
@@ -1926,12 +1933,17 @@ mod tests {
                 done_regex: None,
             })
             .unwrap();
-        // resolve 실패 → SpawnFailed, 메시지에 secret 값 없음 (credential id만)
+        // resolve 실패 → SpawnFailed, payload에 secret 값 없음 (credential id만)
         let message = probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::SpawnFailed { message, .. } => Some(message.clone()),
             _ => None,
         });
-        assert!(message.contains("cred-없음"));
+        assert_eq!(message.message_id, "runtime.spawn_failed.agent_secret");
+        assert_eq!(message.arg_value("credential_id"), Some("cred-없음"));
+        assert!(
+            !format!("{message:?}").contains("누출되면 안 됨"),
+            "failed spawn payload must not include command args"
+        );
         // 실패 시 아무것도 spawn되지 않아야 한다 (부분 주입 금지)
         std::thread::sleep(Duration::from_millis(150));
         probe.seen.extend(probe.rx.drain());

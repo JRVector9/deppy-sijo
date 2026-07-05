@@ -63,7 +63,7 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 | PR-U10 MCP Permission / Audit Hardening | Partial complete | PR-B06a | Audit encrypted blob default-off, JSON validation, debug redaction done. Schema reapproval cache and scoped env injection remain pending. |
 | PR-U11 Final Security Gate | Gate command complete | Current wave | `cargo run -p xtask -- security-scan` added and passed against boundary, deps, secret persistence, audit/MCP/proxy tests. |
 | PR-U12 Process Resource Monitor | Foundation complete / child tree pending | Current wave | Low-cadence app process CPU/RSS sampler and `RuntimeEvent::ResourceUsage` added; per-session child process tree and UI controls remain follow-up. |
-| PR-U13 Workspace Auto Suspend | Pending | None | Not implemented. |
+| PR-U13 Workspace Auto Suspend | Complete | PR-U13 | Warm workspaces now record background time and auto-suspend after timeout, draining final notifications before worker shutdown. |
 | PR-U14 Terminal Cache Budget Manager | Complete | Current wave | Visible/hidden/exited cache classes, byte/line budgets, trim events, and global exited archive pressure added. |
 | PR-U15 Output Pipeline Backpressure | Partial complete | Current wave | In-process runtime command queue is bounded and overflow surfaces as an error. PTY input queue policy and visible backpressure badge remain follow-up. |
 | PR-U16 File Watcher Debounce & Ignore Rules | Complete | Current wave | Default watcher ignores, debounce batching, `.env*` warning signal, and per-window invalidation cap added. |
@@ -80,7 +80,7 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 
 ## Release Blockers Remaining
 
-- PR-U13 and full PR-U20 Scenario A-E measurements remain pending in Phase D.
+- Full PR-U20 Scenario A-E measurements remain pending in Phase D.
 - PR-U12 child process tree aggregation and PR-U18 runtime/app hot-path write wiring remain follow-up.
 - PR-U21 through PR-U24 i18n infrastructure, message boundary, and layout gate are pending.
 
@@ -95,8 +95,7 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 
 ## Next Operating Wave
 
-1. Implement PR-U13 Workspace Auto Suspend.
-2. Run full PR-U20 Scenario A-E measurements after PR-U13 lands.
-3. Start PR-U21 through PR-U24 i18n work after the performance wave has stable runtime/event contracts.
-4. Implement PR-U25 Global Activity View after resource events and i18n message boundaries are stable.
-5. Run final gates in order: PR-U11, PR-U20, PR-U24.
+1. Run full PR-U20 Scenario A-E measurements after PR-U13 lands.
+2. Start PR-U21 through PR-U24 i18n work after the performance wave has stable runtime/event contracts.
+3. Implement PR-U25 Global Activity View after resource events and i18n message boundaries are stable.
+4. Run final gates in order: PR-U11, PR-U20, PR-U24.

@@ -200,6 +200,8 @@ struct WorkspaceRuntime {
     /// 세션→제목 캐시 (MuxUpdated에서 누적) — Warm 동안 mux가 안 갱신돼도 알림 제목을
     /// 해석하기 위함. exit 처리 후 제거해 live 세션으로 유계.
     session_titles: std::collections::HashMap<runtime::SessionId, String>,
+    /// Warm으로 내려간 시각. 일정 시간 이후 자동 Suspended(워커 shutdown)로 내린다.
+    backgrounded_at: Option<std::time::Instant>,
 }
 
 /// 실행 중인 remote TLS 서버 + 그 신원 지문(attach 클라이언트 대조용).
@@ -383,6 +385,9 @@ impl App {
     /// warm 상태로 유지할 최대 workspace 수 (활성 제외). 저-RAM 정책상 작게 — 초과분은
     /// Suspended(워커 shutdown). active + MAX_WARM개까지 워커가 동시 실행될 수 있다.
     const MAX_WARM: usize = 2;
+    /// Warm workspace가 이 시간 동안 재활성화되지 않으면 Suspended로 내린다. 세션/PTY는
+    /// 종료되고 layout/session metadata만 DB에 남는다 (§14.1).
+    const WARM_AUTO_SUSPEND_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
     /// 승인 watcher 폴링 간격(ms). frame 예약은 하지 않고, pending 상태 변화 때만 UI를 깨운다.
     const APPROVAL_POLL_MS: u64 = 500;
@@ -430,6 +435,7 @@ impl App {
             render_active: true,
             pending_events: Vec::new(),
             session_titles: std::collections::HashMap::new(),
+            backgrounded_at: None,
         }
     }
 
@@ -589,6 +595,7 @@ impl App {
         // 마지막 active 상태 + 아래 Active 재emit(전체 mux 스냅샷)으로 최신화된다. (새 워커는
         // 이미 fresh + RestoreWorkspace라 리셋 불필요.)
         new_active.render_active = true;
+        new_active.backgrounded_at = None;
         let _ = new_active
             .runtime
             .send_command(runtime::RuntimeCommand::SetWorkspaceState(
@@ -603,6 +610,7 @@ impl App {
                 runtime::WorkspaceRuntimeState::Warm,
             ));
         old.render_active = false;
+        old.backgrounded_at = Some(std::time::Instant::now());
         let old_id = old.id.clone();
         self.warm.insert(old_id.clone(), old);
         self.warm_order.push(old_id);
@@ -624,26 +632,47 @@ impl App {
     fn evict_warm(&mut self) {
         while self.warm_order.len() > Self::MAX_WARM {
             let evict_id = self.warm_order.remove(0);
-            if let Some(mut rt) = self.warm.remove(&evict_id) {
-                // 마지막으로 큐에 남은 이벤트를 처리해 방금 끝난 background 작업의 완료/오류
-                // 알림을 놓치지 않는다 (codex 리뷰 — 축출 시 receiver drop으로 유실되던 것).
-                let events = rt.events.drain();
-                Self::process_ws_notifications(
-                    &mut self.notifications_ui,
-                    &evict_id,
-                    &events,
-                    &mut rt.session_titles,
-                );
-                // 축출 = Suspended(워커 종료) — 그 workspace의 진행형 알림은 더는 조치
-                // 불가하므로 정리한다 (결과 알림은 기록이라 유지, codex 리뷰).
-                self.notifications_ui.prune_transient(&evict_id);
-                self.pending_shutdowns.retain(|(_, h)| !h.is_finished());
-                let handle = std::thread::spawn(move || {
-                    let mut runtime = rt.runtime;
-                    runtime.shutdown();
-                });
-                self.pending_shutdowns.push((evict_id, handle));
-            }
+            self.suspend_warm_workspace(&evict_id);
+        }
+    }
+
+    fn evict_idle_warm(&mut self, now: std::time::Instant) {
+        let expired = expired_warm_workspace_ids(
+            &self.warm_order,
+            |id| self.warm.get(id).and_then(|rt| rt.backgrounded_at),
+            now,
+            Self::WARM_AUTO_SUSPEND_AFTER,
+        );
+        for id in expired {
+            self.warm_order.retain(|warm_id| warm_id != &id);
+            self.suspend_warm_workspace(&id);
+        }
+    }
+
+    fn suspend_warm_workspace(&mut self, workspace_id: &str) {
+        if let Some(mut rt) = self.warm.remove(workspace_id) {
+            // 마지막으로 큐에 남은 이벤트를 처리해 방금 끝난 background 작업의 완료/오류
+            // 알림을 놓치지 않는다 (codex 리뷰 — 축출 시 receiver drop으로 유실되던 것).
+            let events = rt.events.drain();
+            Self::process_ws_notifications(
+                &mut self.notifications_ui,
+                workspace_id,
+                &events,
+                &mut rt.session_titles,
+            );
+            // 축출 = Suspended(워커 종료) — 그 workspace의 진행형 알림은 더는 조치
+            // 불가하므로 정리한다 (결과 알림은 기록이라 유지, codex 리뷰).
+            self.notifications_ui.prune_transient(workspace_id);
+            self.pending_shutdowns.retain(|(_, h)| !h.is_finished());
+            let evict_id = workspace_id.to_owned();
+            let handle = std::thread::spawn(move || {
+                let mut runtime = rt.runtime;
+                let _ = runtime.send_command(runtime::RuntimeCommand::SetWorkspaceState(
+                    runtime::WorkspaceRuntimeState::Suspended,
+                ));
+                runtime.shutdown();
+            });
+            self.pending_shutdowns.push((evict_id, handle));
         }
     }
 
@@ -1026,6 +1055,7 @@ impl eframe::App for App {
                 coalesce_mux_updated(&mut rt.pending_events);
             }
         }
+        self.evict_idle_warm(std::time::Instant::now());
 
         // 이벤트 drain + 알림 생성은 non-render 경로인 여기서 한다 (§14.1 Warm:
         // ui()가 스킵돼도 승인/완료/실패 알림은 유지). worker의 wake가 숨겨진 UI를
@@ -1394,6 +1424,21 @@ fn pane_of_session(
         .flat_map(|tab| &tab.panes)
         .find(|pane| pane.session_id == Some(session))
         .map(|pane| pane.id.clone())
+}
+
+fn expired_warm_workspace_ids(
+    warm_order: &[String],
+    backgrounded_at: impl Fn(&str) -> Option<std::time::Instant>,
+    now: std::time::Instant,
+    timeout: std::time::Duration,
+) -> Vec<String> {
+    warm_order
+        .iter()
+        .filter(|id| {
+            backgrounded_at(id).is_some_and(|at| now.saturating_duration_since(at) >= timeout)
+        })
+        .cloned()
+        .collect()
 }
 
 /// warm workspace의 pending_events를 합쳐(coalesce) 재활성 replay를 정확+유계로 만든다.
@@ -1817,5 +1862,21 @@ h:1 EE:FF
         ];
         coalesce_mux_updated(&mut events);
         assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn warm_auto_suspend_candidates_respect_timeout_and_order() {
+        let now = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(60);
+        let ids = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let mut backgrounded = HashMap::new();
+        backgrounded.insert("a".to_owned(), now - std::time::Duration::from_secs(61));
+        backgrounded.insert("b".to_owned(), now - std::time::Duration::from_secs(59));
+        backgrounded.insert("c".to_owned(), now - std::time::Duration::from_secs(120));
+
+        assert_eq!(
+            expired_warm_workspace_ids(&ids, |id| backgrounded.get(id).copied(), now, timeout),
+            vec!["a".to_owned(), "c".to_owned()]
+        );
     }
 }

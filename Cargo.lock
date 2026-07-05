@@ -3709,6 +3709,7 @@ dependencies = [
  "anyhow",
  "libc",
  "portable-pty",
+ "serde",
  "tracing",
 ]
 

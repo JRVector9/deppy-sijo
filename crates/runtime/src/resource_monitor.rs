@@ -1,5 +1,8 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use deppy_core::SessionId;
+use pty::{ProcessIdentity, ProcessIdentitySource};
+
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProcessResourceSnapshot {
     pub pid: u32,
@@ -10,6 +13,26 @@ pub struct ProcessResourceSnapshot {
     pub cpu_percent: Option<f32>,
     pub high_cpu: bool,
     pub high_rss: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionResourceUsage {
+    pub session: SessionId,
+    pub pid: Option<u32>,
+    pub process_group: Option<u32>,
+    pub identity_source: ProcessIdentitySource,
+    pub sampled_at_ms: u64,
+    pub process_count: usize,
+    pub rss_bytes: u64,
+    pub cpu_percent: Option<f32>,
+    pub high_cpu: bool,
+    pub high_rss: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SessionResourceTarget {
+    pub session: SessionId,
+    pub identity: ProcessIdentity,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +59,7 @@ pub struct ProcessResourceMonitor {
     next_sample: Instant,
     /// 마지막으로 발행한 스냅샷 — 변화 게이트 기준.
     last_emitted: Option<ProcessResourceSnapshot>,
+    last_emitted_sessions: Vec<SessionResourceUsage>,
 }
 
 impl ProcessResourceMonitor {
@@ -46,21 +70,34 @@ impl ProcessResourceMonitor {
             last_cpu_seconds: None,
             next_sample: Instant::now(),
             last_emitted: None,
+            last_emitted_sessions: Vec::new(),
         }
     }
 
     pub fn sample_if_due(&mut self) -> Option<ProcessResourceSnapshot> {
+        self.sample_if_due_with_sessions(&[])
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    pub fn sample_if_due_with_sessions(
+        &mut self,
+        targets: &[SessionResourceTarget],
+    ) -> Option<(ProcessResourceSnapshot, Vec<SessionResourceUsage>)> {
         let now = Instant::now();
         if now < self.next_sample {
             return None;
         }
         self.next_sample = now + self.config.sample_interval;
         let snapshot = self.sample(now);
-        if !should_emit(self.last_emitted.as_ref(), &snapshot) {
+        let session_usage = self.sample_session_usage(targets, snapshot.sampled_at_ms);
+        if !should_emit(self.last_emitted.as_ref(), &snapshot)
+            && !should_emit_sessions(&self.last_emitted_sessions, &session_usage)
+        {
             return None;
         }
         self.last_emitted = Some(snapshot);
-        Some(snapshot)
+        self.last_emitted_sessions = session_usage.clone();
+        Some((snapshot, session_usage))
     }
 
     fn sample(&mut self, now: Instant) -> ProcessResourceSnapshot {
@@ -85,6 +122,29 @@ impl ProcessResourceMonitor {
             high_rss: rss_bytes >= self.config.high_rss_bytes,
         }
     }
+
+    fn sample_session_usage(
+        &self,
+        targets: &[SessionResourceTarget],
+        sampled_at_ms: u64,
+    ) -> Vec<SessionResourceUsage> {
+        if targets.is_empty() {
+            return Vec::new();
+        }
+        let rows = process_rows();
+        targets
+            .iter()
+            .map(|target| {
+                aggregate_session_usage(
+                    *target,
+                    &rows,
+                    sampled_at_ms,
+                    self.config.high_cpu_percent,
+                    self.config.high_rss_bytes,
+                )
+            })
+            .collect()
+    }
 }
 
 /// 변화 게이트: 직전 발행 대비 CPU ±0.5%p / RSS ±1MiB / high 플래그 변화가 없으면
@@ -103,6 +163,146 @@ fn should_emit(last: Option<&ProcessResourceSnapshot>, next: &ProcessResourceSna
         || last.rss_bytes.abs_diff(next.rss_bytes) >= 1024 * 1024
         || last.high_cpu != next.high_cpu
         || last.high_rss != next.high_rss
+}
+
+fn should_emit_sessions(last: &[SessionResourceUsage], next: &[SessionResourceUsage]) -> bool {
+    if last.len() != next.len() {
+        return true;
+    }
+    for next_usage in next {
+        let Some(last_usage) = last
+            .iter()
+            .find(|usage| usage.session == next_usage.session)
+        else {
+            return true;
+        };
+        let cpu_delta = match (last_usage.cpu_percent, next_usage.cpu_percent) {
+            (Some(a), Some(b)) => (a - b).abs(),
+            (None, None) => 0.0,
+            _ => f32::INFINITY,
+        };
+        if cpu_delta >= 0.5
+            || last_usage.rss_bytes.abs_diff(next_usage.rss_bytes) >= 1024 * 1024
+            || last_usage.process_count != next_usage.process_count
+            || last_usage.high_cpu != next_usage.high_cpu
+            || last_usage.high_rss != next_usage.high_rss
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProcessRow {
+    pid: u32,
+    ppid: Option<u32>,
+    pgid: Option<u32>,
+    rss_bytes: u64,
+    cpu_percent: Option<f32>,
+}
+
+fn aggregate_session_usage(
+    target: SessionResourceTarget,
+    rows: &[ProcessRow],
+    sampled_at_ms: u64,
+    high_cpu_percent: f32,
+    high_rss_bytes: u64,
+) -> SessionResourceUsage {
+    let matched = matching_process_rows(target.identity, rows);
+    let rss_bytes = matched
+        .iter()
+        .fold(0u64, |acc, row| acc.saturating_add(row.rss_bytes));
+    let mut cpu_seen = false;
+    let cpu_total = matched.iter().fold(0.0f32, |acc, row| {
+        if let Some(cpu) = row.cpu_percent {
+            cpu_seen = true;
+            acc + cpu
+        } else {
+            acc
+        }
+    });
+    let cpu_percent = cpu_seen.then_some(cpu_total);
+    SessionResourceUsage {
+        session: target.session,
+        pid: target.identity.pid,
+        process_group: target.identity.process_group,
+        identity_source: target.identity.source,
+        sampled_at_ms,
+        process_count: matched.len(),
+        rss_bytes,
+        cpu_percent,
+        high_cpu: cpu_percent.is_some_and(|cpu| cpu >= high_cpu_percent),
+        high_rss: rss_bytes >= high_rss_bytes,
+    }
+}
+
+fn matching_process_rows(identity: ProcessIdentity, rows: &[ProcessRow]) -> Vec<ProcessRow> {
+    if let Some(process_group) = identity.process_group {
+        let matched: Vec<_> = rows
+            .iter()
+            .copied()
+            .filter(|row| row.pgid == Some(process_group))
+            .collect();
+        if !matched.is_empty() {
+            return matched;
+        }
+    }
+    let Some(root_pid) = identity.pid else {
+        return Vec::new();
+    };
+    let mut wanted = std::collections::HashSet::from([root_pid]);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for row in rows {
+            if row.ppid.is_some_and(|ppid| wanted.contains(&ppid)) && wanted.insert(row.pid) {
+                changed = true;
+            }
+        }
+    }
+    rows.iter()
+        .copied()
+        .filter(|row| wanted.contains(&row.pid))
+        .collect()
+}
+
+#[cfg(unix)]
+fn process_rows() -> Vec<ProcessRow> {
+    let output = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,pgid=,rss=,pcpu="])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(parse_process_row)
+        .collect()
+}
+
+#[cfg(not(unix))]
+fn process_rows() -> Vec<ProcessRow> {
+    Vec::new()
+}
+
+fn parse_process_row(line: &str) -> Option<ProcessRow> {
+    let mut parts = line.split_whitespace();
+    let pid = parts.next()?.parse().ok()?;
+    let ppid = parts.next().and_then(|value| value.parse().ok());
+    let pgid = parts.next().and_then(|value| value.parse().ok());
+    let rss_kib = parts.next()?.parse::<u64>().ok()?;
+    let cpu_percent = parts.next().and_then(|value| value.parse().ok());
+    Some(ProcessRow {
+        pid,
+        ppid,
+        pgid,
+        rss_bytes: rss_kib.saturating_mul(1024),
+        cpu_percent,
+    })
 }
 
 fn unix_ms() -> u64 {
@@ -226,5 +426,88 @@ mod tests {
         let sample = monitor.sample_if_due().unwrap();
         assert!(sample.high_rss);
         assert!(!sample.high_cpu);
+    }
+
+    #[test]
+    fn session_usage_aggregates_process_group() {
+        let rows = vec![
+            ProcessRow {
+                pid: 10,
+                ppid: Some(1),
+                pgid: Some(10),
+                rss_bytes: 10 << 20,
+                cpu_percent: Some(12.5),
+            },
+            ProcessRow {
+                pid: 11,
+                ppid: Some(10),
+                pgid: Some(10),
+                rss_bytes: 20 << 20,
+                cpu_percent: Some(7.5),
+            },
+            ProcessRow {
+                pid: 99,
+                ppid: Some(1),
+                pgid: Some(99),
+                rss_bytes: 99 << 20,
+                cpu_percent: Some(99.0),
+            },
+        ];
+        let usage = aggregate_session_usage(
+            SessionResourceTarget {
+                session: SessionId(1),
+                identity: ProcessIdentity {
+                    pid: Some(10),
+                    process_group: Some(10),
+                    source: ProcessIdentitySource::PortablePty,
+                },
+            },
+            &rows,
+            123,
+            19.0,
+            25 << 20,
+        );
+        assert_eq!(usage.process_count, 2);
+        assert_eq!(usage.rss_bytes, 30 << 20);
+        assert_eq!(usage.cpu_percent, Some(20.0));
+        assert!(usage.high_cpu);
+        assert!(usage.high_rss);
+    }
+
+    #[test]
+    fn session_usage_falls_back_to_pid_descendants() {
+        let rows = vec![
+            ProcessRow {
+                pid: 10,
+                ppid: Some(1),
+                pgid: Some(77),
+                rss_bytes: 10,
+                cpu_percent: Some(1.0),
+            },
+            ProcessRow {
+                pid: 11,
+                ppid: Some(10),
+                pgid: Some(77),
+                rss_bytes: 20,
+                cpu_percent: Some(2.0),
+            },
+        ];
+        let usage = aggregate_session_usage(
+            SessionResourceTarget {
+                session: SessionId(1),
+                identity: ProcessIdentity {
+                    pid: Some(10),
+                    process_group: Some(999),
+                    source: ProcessIdentitySource::PlatformFallback,
+                },
+            },
+            &rows,
+            123,
+            100.0,
+            100,
+        );
+        assert_eq!(usage.process_count, 2);
+        assert_eq!(usage.rss_bytes, 30);
+        assert_eq!(usage.cpu_percent, Some(3.0));
     }
 }

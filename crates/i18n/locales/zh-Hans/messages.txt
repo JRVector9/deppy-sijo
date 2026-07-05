@@ -165,6 +165,7 @@ activity.auto_suspend_in = suspend in {seconds}s
 activity.resource_unavailable = 没有样本
 activity.cpu_pending = 等待中
 activity.resource_label = CPU {cpu} / RSS {rss}
+activity.child_resource_label = 子进程 CPU {cpu} / RSS {rss}
 activity.resource_high = 高负载
 connectors.title = 连接
 connectors.local_mcp = Local MCP

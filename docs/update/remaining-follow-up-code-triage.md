@@ -10,7 +10,7 @@ not be mixed into the current completed PRs.
 
 ## PR-U12 Child Process Tree CPU/RSS Aggregation
 
-Status: defer to a dedicated PR-U12c.
+Status: implemented in PR-U12c.
 
 Code checked:
 
@@ -28,13 +28,16 @@ Reason:
 - Implementing this correctly needs pty trait API changes, session metadata
   propagation, and platform-specific process tree aggregation.
 
-Recommended scope:
+Implemented scope:
 
-- Add a redacted `ProcessIdentity { pid, process_group }` style API at the pty
+- Added redacted `ProcessIdentity { pid, process_group, source }` at the pty
   boundary.
-- Aggregate per-session child tree CPU/RSS in runtime, not UI.
-- Add tests with fake process identity where possible and platform-gated smoke
-  for real process trees.
+- Runtime aggregates per-session child tree CPU/RSS using process group first
+  and PID-descendant fallback.
+- Global Activity displays runtime-provided child CPU/RSS without owning process
+  sampling.
+- Added process identity, resource aggregation, runtime smoke, and activity
+  label tests.
 
 ## PR-U18 Runtime/App Hot-path DB Write Batching Wiring
 

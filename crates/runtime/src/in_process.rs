@@ -20,7 +20,9 @@ use terminal::{TERMINAL_GLOBAL_CACHE_BUDGET_BYTES, TerminalCacheClass, TerminalC
 use crate::client::{RuntimeClient, RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream};
 use crate::command::{RuntimeCommand, SessionId};
 use crate::event::{MessagePayload, RuntimeEvent, SpawnKind};
-use crate::resource_monitor::{ProcessResourceMonitor, ProcessResourceMonitorConfig};
+use crate::resource_monitor::{
+    ProcessResourceMonitor, ProcessResourceMonitorConfig, SessionResourceTarget,
+};
 
 /// 구독자 한 명의 송신측. 상태 이벤트(unbounded — 세션 수명당 상수 개수의
 /// 제어 이벤트라 누적 위험 없음)와 세션별 Viewport slot(최신본만 유지 — 14.5의
@@ -458,8 +460,21 @@ impl Worker {
     }
 
     fn pump_resource_monitor(&mut self) {
-        if let Some(snapshot) = self.resource_monitor.sample_if_due() {
-            self.emit(RuntimeEvent::ResourceUsage { snapshot });
+        let targets: Vec<_> = self
+            .sessions
+            .values()
+            .map(|session| SessionResourceTarget {
+                session: session.id(),
+                identity: session.process_identity(),
+            })
+            .collect();
+        if let Some((snapshot, session_usage)) =
+            self.resource_monitor.sample_if_due_with_sessions(&targets)
+        {
+            self.emit(RuntimeEvent::ResourceUsage {
+                snapshot,
+                session_usage,
+            });
         }
     }
 
@@ -2240,6 +2255,40 @@ mod tests {
                 .any(|e| matches!(e, RuntimeEvent::Viewport { session, .. } if *session == agent)),
             "hidden 세션의 Viewport가 발행됨 (snapshot 생성 규칙 위반)"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resource_usage는_session_child_usage를_포함한다() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("resource-child"),
+            RedactionService::new(),
+            spec("/bin/sleep", &["5"]),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            _ => None,
+        });
+        let usage = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::ResourceUsage { session_usage, .. } => session_usage
+                .iter()
+                .find(|usage| usage.session == session && usage.pid.is_some())
+                .cloned(),
+            _ => None,
+        });
+        assert!(usage.process_count >= 1);
+        assert!(usage.rss_bytes > 0);
     }
 
     #[test]

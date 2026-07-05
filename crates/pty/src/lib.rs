@@ -1,10 +1,14 @@
 //! PTY 격리 crate (설계문서 1.2 / 9장).
 //! portable-pty 타입은 이 crate 밖으로 노출하지 않는다 — PtyBackend trait으로 감싼다.
 
+mod process_identity;
+
 use std::io::{Read, Write};
 use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
 
 use anyhow::Context;
+
+pub use process_identity::{ProcessIdentity, ProcessIdentitySource};
 
 /// 실행할 프로그램. portable-pty CommandBuilder를 노출하지 않기 위한 최소 스펙.
 /// env 값에 secret 평문이 올 수 있다 — 절대 로그에 찍지 말 것 (Debug 미구현 이유).
@@ -37,6 +41,7 @@ pub trait PtySession: Send {
     /// dedicated reader thread가 채우는 출력 채널. 최초 1회만 Some.
     /// 채널 disconnect는 EOF(프로세스 종료 또는 PTY 닫힘)를 뜻한다.
     fn take_output(&mut self) -> Option<Receiver<Vec<u8>>>;
+    fn process_identity(&self) -> ProcessIdentity;
     fn write_input(&mut self, bytes: &[u8]) -> anyhow::Result<()>;
     fn resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()>;
     fn try_exit_code(&mut self) -> anyhow::Result<Option<u32>>;
@@ -210,6 +215,27 @@ impl PtySession for PortablePtySession {
         self.output.take()
     }
 
+    fn process_identity(&self) -> ProcessIdentity {
+        let pid = self.child.process_id();
+        #[cfg(unix)]
+        let process_group = self
+            .master
+            .process_group_leader()
+            .and_then(|pgid| u32::try_from(pgid).ok());
+        #[cfg(not(unix))]
+        let process_group = None;
+        let source = if pid.is_some() || process_group.is_some() {
+            ProcessIdentitySource::PortablePty
+        } else {
+            ProcessIdentitySource::Unavailable
+        };
+        ProcessIdentity {
+            pid,
+            process_group,
+            source,
+        }
+    }
+
     fn write_input(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         // writer thread로 위임 — worker가 blocking write에 매달리지 않는다.
         // 쓰기 에러는 비동기(writer thread 로그)로 넘어간다: 여기서의 실패는
@@ -264,6 +290,19 @@ mod tests {
                 24,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn process_identity_exposes_redacted_pid_metadata() {
+        let session = spawn("/bin/sleep", &["1"]);
+        let identity = session.process_identity();
+        assert!(identity.pid.is_some());
+        #[cfg(unix)]
+        assert!(identity.process_group.is_some());
+        assert_eq!(identity.source, ProcessIdentitySource::PortablePty);
+        let debug = format!("{identity:?}");
+        assert!(!debug.contains("/bin/sleep"));
+        assert!(!debug.contains("SHELL="));
     }
 
     /// 채널이 닫힐 때까지 출력을 모은다 (timeout 포함).

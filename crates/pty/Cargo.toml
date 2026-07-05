@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 tracing = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
 portable-pty = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

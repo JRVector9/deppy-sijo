@@ -6,7 +6,7 @@ use mux::MuxSnapshot;
 use session::SessionStatus;
 
 use crate::command::SessionId;
-use crate::resource_monitor::ProcessResourceSnapshot;
+use crate::resource_monitor::{ProcessResourceSnapshot, SessionResourceUsage};
 
 /// SpawnFailed의 출처 구분 — 셸/에이전트 UI가 서로의 실패를 오귀속하지 않게 한다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -98,10 +98,11 @@ pub enum RuntimeEvent {
         session: SessionId,
         status: SessionStatus,
     },
-    /// Process resource sample. PR-U12 foundation: app process CPU/RSS is sampled
-    /// at a low cadence; per-session child process tree aggregation is a follow-up.
+    /// Process resource sample. App process CPU/RSS plus optional per-session
+    /// child process tree aggregation.
     ResourceUsage {
         snapshot: ProcessResourceSnapshot,
+        session_usage: Vec<SessionResourceUsage>,
     },
 }
 

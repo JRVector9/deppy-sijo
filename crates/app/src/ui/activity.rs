@@ -8,6 +8,7 @@ pub struct ActivityWorkspaceRow {
     pub backgrounded_for_secs: Option<u64>,
     pub auto_suspend_remaining_secs: Option<u64>,
     pub resource: Option<runtime::ProcessResourceSnapshot>,
+    pub session_resources: Vec<runtime::SessionResourceUsage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +75,11 @@ impl ActivityUi {
                             state_label(ui, catalog, row);
                             ui.label(row.session_count.to_string());
                             ui.label(row.pending_events.to_string());
-                            ui.label(resource_label(catalog, row.resource.as_ref()));
+                            ui.label(resource_label(
+                                catalog,
+                                row.resource.as_ref(),
+                                &row.session_resources,
+                            ));
                             if row.state != ActivityWorkspaceState::Active {
                                 if ui.button(catalog.t("activity.switch", &[])).clicked() {
                                     action = Some(ActivityAction::SwitchWorkspace(row.id.clone()));
@@ -128,6 +133,7 @@ fn state_label(ui: &mut egui::Ui, catalog: &i18n::Catalog, row: &ActivityWorkspa
 fn resource_label(
     catalog: &i18n::Catalog,
     snapshot: Option<&runtime::ProcessResourceSnapshot>,
+    session_resources: &[runtime::SessionResourceUsage],
 ) -> String {
     let Some(snapshot) = snapshot else {
         return catalog.t("activity.resource_unavailable", &[]);
@@ -141,6 +147,35 @@ fn resource_label(
     if snapshot.high_cpu || snapshot.high_rss {
         label.push_str(" · ");
         label.push_str(&catalog.t("activity.resource_high", &[]));
+    }
+    if !session_resources.is_empty() {
+        let child_rss = session_resources
+            .iter()
+            .fold(0u64, |acc, usage| acc.saturating_add(usage.rss_bytes));
+        let child_cpu_seen = session_resources
+            .iter()
+            .any(|usage| usage.cpu_percent.is_some());
+        let child_cpu = child_cpu_seen
+            .then(|| {
+                session_resources
+                    .iter()
+                    .filter_map(|usage| usage.cpu_percent)
+                    .sum::<f32>()
+            })
+            .map(|value| format!("{value:.1}%"))
+            .unwrap_or_else(|| catalog.t("activity.cpu_pending", &[]));
+        label.push_str(" · ");
+        label.push_str(&catalog.t(
+            "activity.child_resource_label",
+            &[("cpu", &child_cpu), ("rss", &format_bytes(child_rss))],
+        ));
+        if session_resources
+            .iter()
+            .any(|usage| usage.high_cpu || usage.high_rss)
+        {
+            label.push_str(" · ");
+            label.push_str(&catalog.t("activity.resource_high", &[]));
+        }
     }
     label
 }
@@ -176,9 +211,38 @@ mod tests {
             high_cpu: true,
             high_rss: true,
         };
-        let label = resource_label(&catalog, Some(&snapshot));
+        let label = resource_label(&catalog, Some(&snapshot), &[]);
         assert!(label.contains("250.0%"));
         assert!(label.contains("2.0 GiB"));
+        assert!(label.contains("High"));
+    }
+
+    #[test]
+    fn resource_label_includes_child_usage() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let snapshot = runtime::ProcessResourceSnapshot {
+            pid: 1,
+            sampled_at_ms: 0,
+            rss_bytes: 512 * 1024 * 1024,
+            cpu_percent: Some(10.0),
+            high_cpu: false,
+            high_rss: false,
+        };
+        let child = runtime::SessionResourceUsage {
+            session: runtime::SessionId(7),
+            pid: Some(100),
+            process_group: Some(100),
+            identity_source: runtime::ProcessIdentitySource::PortablePty,
+            sampled_at_ms: 0,
+            process_count: 2,
+            rss_bytes: 128 * 1024 * 1024,
+            cpu_percent: Some(25.0),
+            high_cpu: true,
+            high_rss: false,
+        };
+        let label = resource_label(&catalog, Some(&snapshot), &[child]);
+        assert!(label.contains("Child CPU 25.0%"));
+        assert!(label.contains("128.0 MiB"));
         assert!(label.contains("High"));
     }
 }

@@ -165,6 +165,7 @@ activity.auto_suspend_in = suspend in {seconds}s
 activity.resource_unavailable = 샘플 없음
 activity.cpu_pending = 대기 중
 activity.resource_label = CPU {cpu} / RSS {rss}
+activity.child_resource_label = 자식 CPU {cpu} / RSS {rss}
 activity.resource_high = 높음
 connectors.title = 연결
 connectors.local_mcp = Local MCP

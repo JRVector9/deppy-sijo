@@ -1,7 +1,7 @@
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use deppy_core::SessionId;
-use pty::{CommandSpec, PortablePtyBackend, PtyBackend, PtySession};
+use pty::{CommandSpec, PortablePtyBackend, ProcessIdentity, PtyBackend, PtySession};
 use terminal::{
     AlacrittyBackend, CellRange, TerminalBackend, TerminalCacheClass, TerminalCacheEvent,
     TerminalCacheFootprint, TerminalViewportSnapshot,
@@ -39,6 +39,7 @@ pub struct Session {
     kind: SessionKind,
     /// Exited 후 None — backend는 scrollback 열람을 위해 유지
     pty: Option<Box<dyn PtySession>>,
+    process_identity: ProcessIdentity,
     output: Receiver<Vec<u8>>,
     backend: AlacrittyBackend,
     lifecycle: SessionLifecycle,
@@ -68,11 +69,13 @@ impl Session {
         scrollback_lines: usize,
     ) -> anyhow::Result<Self> {
         let mut pty = PortablePtyBackend.spawn(spec, cols, rows)?;
+        let process_identity = pty.process_identity();
         let output = pty.take_output().expect("새 세션의 output 채널");
         Ok(Self {
             id,
             kind,
             pty: Some(pty),
+            process_identity,
             output,
             backend: AlacrittyBackend::new(cols, rows, scrollback_lines),
             lifecycle: SessionLifecycle::Running,
@@ -93,6 +96,10 @@ impl Session {
 
     pub fn kind(&self) -> SessionKind {
         self.kind
+    }
+
+    pub fn process_identity(&self) -> ProcessIdentity {
+        self.process_identity
     }
 
     pub fn lifecycle(&self) -> SessionLifecycle {

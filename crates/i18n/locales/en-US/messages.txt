@@ -165,6 +165,7 @@ activity.auto_suspend_in = suspend in {seconds}s
 activity.resource_unavailable = No sample
 activity.cpu_pending = pending
 activity.resource_label = CPU {cpu} / RSS {rss}
+activity.child_resource_label = Child CPU {cpu} / RSS {rss}
 activity.resource_high = High
 connectors.title = Connectors
 connectors.local_mcp = Local MCP

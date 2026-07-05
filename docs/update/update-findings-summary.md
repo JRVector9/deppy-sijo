@@ -64,7 +64,7 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 | PR-U09 Project Env Safety & Production Guard | Complete for current findings | PR-B05a, PR-U09b | Plain secret-like env blocked. Production profile agent runs now require confirmation before `SpawnAgent`. |
 | PR-U10 MCP Permission / Audit Hardening | Complete for current findings | PR-B06a, PR-U10b | Audit encrypted blob default-off, JSON validation, debug redaction, schema reapproval checks, and scoped MCP env injection are covered. |
 | PR-U11 Final Security Gate | Gate command complete | Current wave | `cargo run -p xtask -- security-scan` added and passed against boundary, deps, secret persistence, audit/MCP/proxy tests. |
-| PR-U12 Process Resource Monitor | Foundation complete / child tree pending | Current wave | Low-cadence app process CPU/RSS sampler and `RuntimeEvent::ResourceUsage` added; per-session child process tree and UI controls remain follow-up. |
+| PR-U12 Process Resource Monitor | Complete for current follow-up | Current wave, PR-U12c | Low-cadence app process CPU/RSS sampler plus per-session child process CPU/RSS aggregation are implemented and surfaced in Global Activity. |
 | PR-U13 Workspace Auto Suspend | Complete | PR-U13 | Warm workspaces now record background time and auto-suspend after timeout, draining final notifications before worker shutdown. |
 | PR-U14 Terminal Cache Budget Manager | Complete | Current wave | Visible/hidden/exited cache classes, byte/line budgets, trim events, and global exited archive pressure added. |
 | PR-U15 Output Pipeline Backpressure | Partial complete | Current wave | In-process runtime command queue is bounded and overflow surfaces as an error. PTY input queue policy and visible backpressure badge remain follow-up. |
@@ -83,8 +83,7 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 ## Release Blockers Remaining
 
 - Full PR-U20 Scenario A-E release-hardware measurements remain pending in Phase D, but the final-gate report now exists.
-- PR-U12 child process tree aggregation, PR-U15 PTY input pressure UI, and
-  PR-U17 status confidence/override
+- PR-U15 PTY input pressure UI and PR-U17 status confidence/override
   remain separately scoped follow-ups.
 - Code triage now points PR-U20 follow-up to release-hardware measurement execution, not code changes.
 

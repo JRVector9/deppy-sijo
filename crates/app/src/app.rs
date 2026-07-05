@@ -228,6 +228,8 @@ struct WorkspaceRuntime {
     session_titles: std::collections::HashMap<runtime::SessionId, String>,
     /// 마지막 worker resource sample. PR-U25 activity view 표시용.
     resource_usage: Option<runtime::ProcessResourceSnapshot>,
+    /// 마지막 worker child-process resource samples. Runtime이 집계한 값만 보관한다.
+    session_resource_usage: Vec<runtime::SessionResourceUsage>,
     /// Warm으로 내려간 시각. 일정 시간 이후 자동 Suspended(워커 shutdown)로 내린다.
     backgrounded_at: Option<std::time::Instant>,
 }
@@ -469,6 +471,7 @@ impl App {
             pending_events: Vec::new(),
             session_titles: std::collections::HashMap::new(),
             resource_usage: None,
+            session_resource_usage: Vec::new(),
             backgrounded_at: None,
         }
     }
@@ -782,6 +785,7 @@ impl App {
                         backgrounded_for_secs: None,
                         auto_suspend_remaining_secs: None,
                         resource: self.active.resource_usage,
+                        session_resources: self.active.session_resource_usage.clone(),
                     };
                 }
                 if let Some(rt) = self.warm.get(&ws.id) {
@@ -802,6 +806,7 @@ impl App {
                         backgrounded_for_secs: elapsed.map(|duration| duration.as_secs()),
                         auto_suspend_remaining_secs: remaining,
                         resource: rt.resource_usage,
+                        session_resources: rt.session_resource_usage.clone(),
                     };
                 }
                 ui::activity::ActivityWorkspaceRow {
@@ -813,6 +818,7 @@ impl App {
                     backgrounded_for_secs: None,
                     auto_suspend_remaining_secs: None,
                     resource: None,
+                    session_resources: Vec::new(),
                 }
             })
             .collect()
@@ -1043,8 +1049,13 @@ impl App {
 
     fn record_activity_events(rt: &mut WorkspaceRuntime, events: &[runtime::RuntimeEvent]) {
         for event in events {
-            if let runtime::RuntimeEvent::ResourceUsage { snapshot } = event {
+            if let runtime::RuntimeEvent::ResourceUsage {
+                snapshot,
+                session_usage,
+            } = event
+            {
                 rt.resource_usage = Some(*snapshot);
+                rt.session_resource_usage = session_usage.clone();
             }
         }
     }

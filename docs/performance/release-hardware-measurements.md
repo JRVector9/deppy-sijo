@@ -46,13 +46,34 @@ pending. `perf-smoke` success is not treated as Scenario A-E release approval.
 
 ## Final Measurement Slot
 
-Run this section after PR-U12c, PR-U18b, PR-U15c, and PR-U17b have landed.
+PR-U12c, PR-U18b, PR-U15c, and PR-U17b have landed.
+
+- Final implementation commit under test:
+  `8d18295 Add status confidence and user override flow`
+- Final automated gate profile: Cargo test/dev profile.
+- Final automated gate date: 2026-07-05.
+
+## Final Automated Commands
+
+| Command | Result | Notes |
+|---|---|---|
+| `cargo run -p xtask -- security-scan` | Pass | Boundary, dependency, secret-redaction, MCP audit/permission, and security unit gates passed. |
+| `cargo run -p xtask -- perf-smoke` | Pass | App perf harness, runtime backpressure-filtered tests, and hidden-session status detector smoke passed. |
+| `cargo run -p xtask -- i18n-check` | Pass | Required locale completeness, CJK path paste fixture, and notification message-id gates passed. |
+
+## Scenario A-E Final Matrix
 
 | Scenario | RSS | CPU | Frame p95 | Queue/Pressure | Gate |
 |---|---:|---:|---:|---|---|
-| A | Pending | Pending | Pending | Pending | Pending |
-| B | Pending | Pending | Pending | Pending | Pending |
-| C | Pending | Pending | Pending | Pending | Pending |
-| D | Pending | Pending | Pending | Pending | Pending |
-| E | Pending | Pending | Pending | Pending | Pending |
+| A Empty app idle | Pending | Pending | Pending | Pending | Pending |
+| B 5 workspaces / 20 panes / 10 sessions | Pending | Pending | Pending | Pending | Pending |
+| C Hidden sessions and high output | Pending | Pending | Pending | Automated smoke passed; release soak pending | Pending |
+| D Folder tree 100k files | Pending | Pending | Pending | Pending | Pending |
+| E Remote slow consumer | Pending | Pending | Pending | Automated backpressure smoke passed; release soak pending | Pending |
 
+## Final Verdict
+
+Automated security, performance smoke, and i18n gates pass after the remaining
+implementation PRs. Release approval remains pending because this sandbox did
+not run the required GUI release-build Scenario A-E measurements on release
+hardware. `perf-smoke` success is still not treated as full release approval.

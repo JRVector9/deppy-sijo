@@ -1,20 +1,24 @@
 # PR-U20 Final Performance Gate
 
 작성일: 2026-07-05
-작성 범위: PR-U20b Scenario A-E release-gate report, PR-U20c baseline update
+작성 범위: PR-U20b Scenario A-E release-gate report, PR-U20c baseline/final
+automated gate update
 
 ## Verdict
 
 Release verdict: **Not approved yet**
 
-Reason: automated performance smoke passes for the PR-U20c baseline, but this
-Codex sandbox did not run the GUI/remote soak measurements required to claim
-final RSS/CPU/frame-p95 approval for Scenarios A-E.
+Reason: automated security, performance smoke, and i18n gates pass after
+PR-U12c, PR-U18b, PR-U15c, and PR-U17b, but this Codex sandbox did not run the
+GUI/remote soak measurements required to claim final RSS/CPU/frame-p95 approval
+for Scenarios A-E.
 
 ## Environment
 
 - Repository: `/Users/jr/Desktop/Projects/deppy-sijo`
 - Baseline commit under test: `52f1cd1 Document remaining parallel PR contracts`
+- Final implementation commit under test:
+  `8d18295 Add status confidence and user override flow`
 - PR-U20c baseline adds measurement documentation only; no runtime behavior was
   changed by the baseline measurement commit.
 - OS: macOS 26.4.1 build 25E253
@@ -24,15 +28,21 @@ final RSS/CPU/frame-p95 approval for Scenarios A-E.
 
 ## Automated Evidence
 
-Latest baseline run:
+Latest final automated run:
 
+- `cargo run -p xtask -- security-scan` - pass
 - `cargo run -p xtask -- perf-smoke` - pass
+- `cargo run -p xtask -- i18n-check` - pass
 
-The smoke command covered:
+The smoke/gate commands covered:
 
+- UI boundary, dependency, secret-redaction, MCP audit/permission, and security
+  unit gates
 - app performance harness unit tests
 - runtime backpressure-filtered tests
 - hidden-session status detector smoke
+- required locale completeness, CJK path paste fixture, and message-id
+  notification gates
 
 Related gates from the same working set:
 
@@ -45,7 +55,7 @@ Related gates from the same working set:
 
 | Scenario | Requirement | Automated Evidence | Measured Result | Gate |
 |---|---|---|---|---|
-| A | Empty app idle RSS/CPU and idle repaint | None beyond compile/smoke | Not measured in this sandbox | Pending |
+| A | Empty app idle RSS/CPU and idle repaint | Automated gates pass; no GUI idle run | Not measured in this sandbox | Pending |
 | B | 5 workspaces, 20 panes, 10 sessions, 2 visible panes | Current mux/runtime tests compile; no full GUI load run | Not measured in this sandbox | Pending |
 | C | 10 hidden sessions, 3 high-output sessions | `perf-smoke` validates hidden-session harness shape and hidden snapshot smoke | RSS/CPU/frame p95 not measured | Pending |
 | D | Folder tree 100k files | Existing file-tree tests and PR-U05b ignore/listing hardening exist | 100k-file GUI/folder-tree run not measured | Pending |

@@ -17,9 +17,16 @@
 
 - Updated `docs/performance/final-gate.md` to reference the PR-U20c baseline.
 - Added `docs/performance/release-hardware-measurements.md`.
+- Updated the same performance documents with the post-implementation automated
+  final gate evidence after PR-U12c, PR-U18b, PR-U15c, and PR-U17b landed.
 
 ## Tests
 
+- Final automated gates:
+  - `cargo run -p xtask -- security-scan` - pass
+  - `cargo run -p xtask -- perf-smoke` - pass
+  - `cargo run -p xtask -- i18n-check` - pass
+- Baseline commands:
 - `cargo run -p xtask -- perf-smoke` - pass
 - `sw_vers` - pass
 - `uname -a` - pass
@@ -32,8 +39,9 @@
 - [x] Scenario A-E final measurement slots are documented.
 - [x] `perf-smoke` is not treated as release approval.
 - [x] Pending measurement reasons are explicit.
-- [ ] Final Scenario A-E measurements remain pending until implementation PRs
-  land and release hardware GUI/remote soak can be run.
+- [x] Final automated gates were rerun after implementation PRs landed.
+- [ ] Final Scenario A-E GUI/remote release-hardware measurements remain
+  pending until release hardware soak can be run.
 
 ## Regression Risks
 
@@ -59,4 +67,3 @@ measurement format.
 ## Follow-up
 
 - Re-run final Scenario A-E after PR-U12c, PR-U18b, PR-U15c, and PR-U17b.
-

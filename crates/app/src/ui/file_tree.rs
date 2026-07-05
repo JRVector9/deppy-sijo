@@ -6,8 +6,8 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 /// 사이드바 세션 목록 항목 (§6 확장 — 좌측 패널은 트리+세션의 workspace 사이드바다,
 /// 2026-07-05). App이 WorkspaceUi 스냅샷에서 조립해 넘긴다.
@@ -111,6 +111,9 @@ pub struct FileTreeUi {
     /// 워처가 무시할 경로 prefix들 — 앱 자신의 data/log 디렉터리 등. 자기 로그 쓰기가
     /// 이벤트로 돌아와 리페인트를 유발하는 자기-루프 차단 (리페인트 원인 조사 2026-07-04).
     watch_ignore: std::sync::Arc<Vec<PathBuf>>,
+    /// `.gitignore`/`.git/info/exclude`/global excludes matcher. listing worker와 watcher가
+    /// 공유하고, 디렉터리를 펼칠 때만 ancestor ignore 파일을 lazy 로드한다.
+    ignore_cache: GitIgnoreCache,
     /// 콜백 스레드와 공유하는 show_hidden — 숨김 경로 이벤트는 트리에 보이지도 않으므로
     /// 무시한다 (홈 디렉터리 루트에서 ~/Library 등 잡음 이벤트 대량 차단).
     watch_show_hidden: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -164,6 +167,251 @@ enum WatchEvent {
     EnvFileChanged(PathBuf),
 }
 
+#[derive(Clone)]
+struct GitIgnoreCache {
+    inner: Arc<Mutex<GitIgnoreCacheInner>>,
+}
+
+#[derive(Default)]
+struct GitIgnoreCacheInner {
+    root: Option<PathBuf>,
+    base_rules: Vec<IgnoreRule>,
+    dir_rules: HashMap<PathBuf, Vec<IgnoreRule>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IgnoreRule {
+    base: PathBuf,
+    pattern: String,
+    negated: bool,
+    directory_only: bool,
+    anchored: bool,
+    has_slash: bool,
+}
+
+impl Default for GitIgnoreCache {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(GitIgnoreCacheInner::default())),
+        }
+    }
+}
+
+impl GitIgnoreCache {
+    fn reset(&self, root: Option<&Path>) {
+        let mut inner = self.inner.lock().expect("gitignore cache lock");
+        inner.root = root.map(Path::to_path_buf);
+        inner.base_rules.clear();
+        inner.dir_rules.clear();
+        if let Some(root) = root {
+            inner.base_rules.extend(load_global_ignore_rules(root));
+            inner
+                .base_rules
+                .extend(load_ignore_file(&root.join(".gitignore"), root));
+            inner
+                .base_rules
+                .extend(load_ignore_file(&root.join(".git/info/exclude"), root));
+        }
+    }
+
+    fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        let mut inner = self.inner.lock().expect("gitignore cache lock");
+        let Some(root) = inner.root.clone() else {
+            return false;
+        };
+        if path == root {
+            return false;
+        }
+        let Ok(rel) = path.strip_prefix(&root) else {
+            return false;
+        };
+        if rel.as_os_str().is_empty() {
+            return false;
+        }
+        let dir = path.parent().unwrap_or(&root);
+        let rules = inner.rules_for_dir(&root, dir);
+        let mut ignored = false;
+        for rule in &rules {
+            if rule.matches(path, is_dir) {
+                ignored = !rule.negated;
+            }
+        }
+        ignored
+    }
+}
+
+impl GitIgnoreCacheInner {
+    fn rules_for_dir(&mut self, root: &Path, dir: &Path) -> Vec<IgnoreRule> {
+        let dir = if dir.starts_with(root) { dir } else { root };
+        if let Some(rules) = self.dir_rules.get(dir) {
+            return rules.clone();
+        }
+
+        let mut rules = self.base_rules.clone();
+        if let Ok(rel) = dir.strip_prefix(root) {
+            let mut current = root.to_path_buf();
+            for component in rel.components() {
+                let std::path::Component::Normal(name) = component else {
+                    continue;
+                };
+                current.push(name);
+                rules.extend(load_ignore_file(&current.join(".gitignore"), &current));
+            }
+        }
+        self.dir_rules.insert(dir.to_path_buf(), rules.clone());
+        rules
+    }
+}
+
+impl IgnoreRule {
+    fn parse(base: &Path, raw: &str) -> Option<Self> {
+        let mut pattern = raw.trim();
+        if pattern.is_empty() {
+            return None;
+        }
+        if let Some(rest) = pattern.strip_prefix("\\#") {
+            pattern = rest;
+        } else if pattern.starts_with('#') {
+            return None;
+        }
+
+        let negated = if let Some(rest) = pattern.strip_prefix("\\!") {
+            pattern = rest;
+            false
+        } else if let Some(rest) = pattern.strip_prefix('!') {
+            pattern = rest.trim_start();
+            true
+        } else {
+            false
+        };
+        if pattern.is_empty() {
+            return None;
+        }
+
+        let directory_only = pattern.ends_with('/');
+        pattern = pattern.trim_end_matches('/');
+        let anchored = pattern.starts_with('/');
+        pattern = pattern.trim_start_matches('/');
+        if pattern.is_empty() {
+            return None;
+        }
+        let pattern = pattern.replace("\\#", "#").replace("\\!", "!");
+        let has_slash = pattern.contains('/');
+        Some(Self {
+            base: base.to_path_buf(),
+            pattern,
+            negated,
+            directory_only,
+            anchored,
+            has_slash,
+        })
+    }
+
+    fn matches(&self, path: &Path, is_dir: bool) -> bool {
+        let Ok(rel) = path.strip_prefix(&self.base) else {
+            return false;
+        };
+        let components = path_components(rel);
+        if components.is_empty() {
+            return false;
+        }
+
+        if self.has_slash || self.anchored {
+            let rel_text = components.join("/");
+            if self.directory_only {
+                return path_prefixes(&components, is_dir)
+                    .iter()
+                    .any(|prefix| glob_match(&self.pattern, prefix));
+            }
+            return glob_match(&self.pattern, &rel_text)
+                || path_prefixes(&components, is_dir)
+                    .iter()
+                    .any(|prefix| glob_match(&self.pattern, prefix));
+        }
+
+        let check_components: &[String] = if self.directory_only && !is_dir {
+            components
+                .get(..components.len().saturating_sub(1))
+                .unwrap_or(&[])
+        } else {
+            &components
+        };
+        check_components
+            .iter()
+            .any(|component| glob_match(&self.pattern, component))
+    }
+}
+
+fn load_global_ignore_rules(root: &Path) -> Vec<IgnoreRule> {
+    global_ignore_files()
+        .into_iter()
+        .flat_map(|path| load_ignore_file(&path, root))
+        .collect()
+}
+
+fn global_ignore_files() -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
+            files.push(xdg.join("git/ignore"));
+        } else {
+            files.push(home.join(".config/git/ignore"));
+        }
+        files.push(home.join(".gitignore_global"));
+    }
+    files
+}
+
+fn load_ignore_file(path: &Path, base: &Path) -> Vec<IgnoreRule> {
+    let Ok(source) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    source
+        .lines()
+        .filter_map(|line| IgnoreRule::parse(base, line))
+        .collect()
+}
+
+fn path_components(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn path_prefixes(components: &[String], is_dir: bool) -> Vec<String> {
+    let limit = if is_dir {
+        components.len()
+    } else {
+        components.len().saturating_sub(1)
+    };
+    (1..=limit).map(|end| components[..end].join("/")).collect()
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let mut dp = vec![vec![false; text.len() + 1]; pattern.len() + 1];
+    dp[0][0] = true;
+    for i in 1..=pattern.len() {
+        if pattern[i - 1] == '*' {
+            dp[i][0] = dp[i - 1][0];
+        }
+    }
+    for i in 1..=pattern.len() {
+        for j in 1..=text.len() {
+            dp[i][j] = match pattern[i - 1] {
+                '*' => dp[i - 1][j] || dp[i][j - 1],
+                '?' => dp[i - 1][j - 1],
+                ch => ch == text[j - 1] && dp[i - 1][j - 1],
+            };
+        }
+    }
+    dp[pattern.len()][text.len()]
+}
+
 /// 인라인 편집 (FT-3). focus는 첫 프레임에 TextEdit에 포커스를 1회 요청하는 플래그 —
 /// 편집 중 키 입력이 터미널로 새지 않게 한다(§9-8: 터미널은 자기 response가
 /// 포커스를 가질 때만 입력을 소비한다).
@@ -208,6 +456,7 @@ impl FileTreeUi {
             watch_rx: None,
             measured_row_height: None,
             watch_ignore: std::sync::Arc::new(Vec::new()),
+            ignore_cache: GitIgnoreCache::default(),
             watch_show_hidden: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_watch: BTreeSet::new(),
             env_warning_candidates: BTreeSet::new(),
@@ -244,6 +493,7 @@ impl FileTreeUi {
         self.confirm_delete = None;
         self.pending_watch.clear();
         self.env_warning_candidates.clear();
+        self.ignore_cache.reset(self.root.as_deref());
         self.refresh();
         // 루트가 유효할 때만 감시 시작 (FT-4). 실패는 경고 로그 — 수동 새로고침으로 동작.
         self.start_watcher();
@@ -272,6 +522,7 @@ impl FileTreeUi {
         let (tx, rx) = std::sync::mpsc::channel::<WatchEvent>();
         let ctx = self.egui_ctx.clone();
         let ignore = std::sync::Arc::clone(&self.watch_ignore);
+        let ignore_cache = self.ignore_cache.clone();
         let show_hidden = std::sync::Arc::clone(&self.watch_show_hidden);
         let watch_root = root.clone();
         let handler = move |res: Result<notify::Event, notify::Error>| match res {
@@ -282,9 +533,13 @@ impl FileTreeUi {
                 let show_hidden_now = show_hidden.load(std::sync::atomic::Ordering::Relaxed);
                 let mut sent = false;
                 for path in &event.paths {
-                    for event in
-                        watch_events_for_path(&watch_root, path, show_hidden_now, ignore.as_ref())
-                    {
+                    for event in watch_events_for_path_with_ignore(
+                        &watch_root,
+                        path,
+                        show_hidden_now,
+                        ignore.as_ref(),
+                        &ignore_cache,
+                    ) {
                         let _ = tx.send(event);
                         sent = true;
                     }
@@ -320,7 +575,11 @@ impl FileTreeUi {
         let mut desired: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         desired.insert(root.clone());
         for row in &self.flat {
-            if row.is_dir && row.expanded && !has_default_watch_ignore_component(&root, &row.path) {
+            if row.is_dir
+                && row.expanded
+                && !has_default_watch_ignore_component(&root, &row.path)
+                && !self.ignore_cache.is_ignored(&row.path, true)
+            {
                 desired.insert(row.path.clone());
             }
         }
@@ -1102,7 +1361,9 @@ impl FileTreeUi {
             self.egui_ctx.clone(),
             self.listing_epoch,
             token,
+            self.root.clone(),
             path,
+            self.ignore_cache.clone(),
         );
     }
 
@@ -1365,11 +1626,28 @@ fn take_pending_watch_batch(pending: &mut BTreeSet<PathBuf>, limit: usize) -> Ve
     selected
 }
 
+#[cfg(test)]
 fn watch_events_for_path(
     root: &Path,
     path: &Path,
     show_hidden: bool,
     ignore_prefixes: &[PathBuf],
+) -> Vec<WatchEvent> {
+    watch_events_for_path_with_ignore(
+        root,
+        path,
+        show_hidden,
+        ignore_prefixes,
+        &GitIgnoreCache::default(),
+    )
+}
+
+fn watch_events_for_path_with_ignore(
+    root: &Path,
+    path: &Path,
+    show_hidden: bool,
+    ignore_prefixes: &[PathBuf],
+    ignore_cache: &GitIgnoreCache,
 ) -> Vec<WatchEvent> {
     if ignore_prefixes
         .iter()
@@ -1378,6 +1656,10 @@ fn watch_events_for_path(
         return Vec::new();
     }
     if has_default_watch_ignore_component(root, path) {
+        return Vec::new();
+    }
+    let is_dir = path.is_dir();
+    if ignore_cache.is_ignored(path, is_dir) {
         return Vec::new();
     }
 
@@ -1767,20 +2049,24 @@ fn spawn_listing_worker(
     ctx: egui::Context,
     epoch: u64,
     token: u64,
+    root: Option<PathBuf>,
     path: PathBuf,
+    ignore_cache: GitIgnoreCache,
 ) {
-    std::thread::spawn(move || match read_children(&path) {
-        Ok(nodes) => send_listing_chunks(tx, &ctx, epoch, token, path, nodes),
-        Err(e) => {
-            let _ = tx.send(ListingOutcome {
-                epoch,
-                token,
-                path,
-                result: ListingResult::Error(e.to_string()),
-            });
-            ctx.request_repaint();
-        }
-    });
+    std::thread::spawn(
+        move || match read_children(&path, root.as_deref(), &ignore_cache) {
+            Ok(nodes) => send_listing_chunks(tx, &ctx, epoch, token, path, nodes),
+            Err(e) => {
+                let _ = tx.send(ListingOutcome {
+                    epoch,
+                    token,
+                    path,
+                    result: ListingResult::Error(e.to_string()),
+                });
+                ctx.request_repaint();
+            }
+        },
+    );
 }
 
 fn send_listing_chunks(
@@ -1829,11 +2115,19 @@ fn send_listing_chunks(
     }
 }
 
-fn read_children(path: &Path) -> std::io::Result<Vec<TreeNode>> {
+fn read_children(
+    path: &Path,
+    root: Option<&Path>,
+    ignore_cache: &GitIgnoreCache,
+) -> std::io::Result<Vec<TreeNode>> {
     let mut nodes = Vec::new();
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let entry_path = entry.path();
+        if root.is_some_and(|_| ignore_cache.is_ignored(&entry_path, is_dir)) {
+            continue;
+        }
         nodes.push(TreeNode::new(
             entry.file_name().to_string_lossy().into_owned(),
             is_dir,
@@ -1937,7 +2231,8 @@ fn collect_expanded_paths(nodes: &[TreeNode], base: &Path, out: &mut HashSet<Pat
 /// 접근 불가/사라진 하위는 접는다). 새로고침·부분 재나열의 공통 코어.
 #[cfg(test)]
 fn reread(base: &Path, old: &[TreeNode]) -> std::io::Result<Vec<TreeNode>> {
-    let mut fresh = read_children(base)?;
+    let ignore_cache = GitIgnoreCache::default();
+    let mut fresh = read_children(base, None, &ignore_cache)?;
     for node in fresh.iter_mut() {
         if !node.is_dir {
             continue;
@@ -2739,6 +3034,83 @@ mod tests {
             .is_empty(),
             "caller-provided ignore prefixes still apply"
         );
+    }
+
+    #[test]
+    fn gitignore_matcher는_listing과_nested_rules에_적용된다() {
+        let base = temp_root("gitignore-listing");
+        std::fs::write(base.join(".gitignore"), "root-ignored.txt\nbuild/\n").unwrap();
+        std::fs::create_dir_all(base.join(".git/info")).unwrap();
+        std::fs::write(base.join(".git/info/exclude"), "info.log\n").unwrap();
+        std::fs::write(base.join("root-ignored.txt"), b"x").unwrap();
+        std::fs::write(base.join("info.log"), b"x").unwrap();
+        std::fs::create_dir_all(base.join("build")).unwrap();
+        std::fs::write(base.join("build/output.txt"), b"x").unwrap();
+        std::fs::create_dir_all(base.join("nested")).unwrap();
+        std::fs::write(base.join("nested/.gitignore"), "*.tmp\n").unwrap();
+        std::fs::write(base.join("nested/keep.rs"), b"k").unwrap();
+        std::fs::write(base.join("nested/skip.tmp"), b"s").unwrap();
+
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+
+        assert!(tree.flat.iter().any(|r| r.name == "nested"));
+        assert!(!tree.flat.iter().any(|r| r.name == "root-ignored.txt"));
+        assert!(!tree.flat.iter().any(|r| r.name == "info.log"));
+        assert!(!tree.flat.iter().any(|r| r.name == "build"));
+
+        tree.toggle_dir(&base.join("nested"));
+        drain_listings(&mut tree);
+        assert!(tree.flat.iter().any(|r| r.name == "keep.rs"));
+        assert!(!tree.flat.iter().any(|r| r.name == "skip.tmp"));
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn watcher_gitignore_rules는_dirty_event를_버린다() {
+        let base = temp_root("gitignore-watch");
+        std::fs::write(base.join(".gitignore"), "*.tmp\nignored-dir/\n").unwrap();
+        std::fs::write(base.join("skip.tmp"), b"x").unwrap();
+        std::fs::create_dir_all(base.join("ignored-dir")).unwrap();
+        std::fs::write(base.join("ignored-dir/file.rs"), b"x").unwrap();
+        std::fs::write(base.join("keep.rs"), b"k").unwrap();
+
+        let ignore_cache = GitIgnoreCache::default();
+        ignore_cache.reset(Some(&base));
+        assert!(
+            watch_events_for_path_with_ignore(
+                &base,
+                &base.join("skip.tmp"),
+                true,
+                &[],
+                &ignore_cache
+            )
+            .is_empty()
+        );
+        assert!(
+            watch_events_for_path_with_ignore(
+                &base,
+                &base.join("ignored-dir/file.rs"),
+                true,
+                &[],
+                &ignore_cache
+            )
+            .is_empty()
+        );
+        assert!(
+            !watch_events_for_path_with_ignore(
+                &base,
+                &base.join("keep.rs"),
+                true,
+                &[],
+                &ignore_cache
+            )
+            .is_empty()
+        );
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

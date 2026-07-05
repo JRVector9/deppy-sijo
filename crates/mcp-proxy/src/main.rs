@@ -42,8 +42,6 @@ fn main() -> anyhow::Result<()> {
         .into_iter()
         .find(|s| s.id == cli.server_id)
         .with_context(|| format!("MCP 서버 '{}'를 DB에서 찾을 수 없음", cli.server_id))?;
-    let config = server_config(&server)?;
-
     // keyring store 등록 (credential redaction 시드용).
     // 실패해도 프록시는 동작한다 — 시드만 비활성 (best-effort, insecure fallback 아님).
     let keyring_ok = match secret::init_platform_store() {
@@ -56,9 +54,16 @@ fn main() -> anyhow::Result<()> {
 
     // 로그/프리뷰 redaction: 저장된 credential secret을 시드한다 (app/runtime과 동일 관례).
     let redaction = RedactionService::new();
+    let keyring_store = KeyringSecretStore;
     if keyring_ok {
-        seed_redaction(&db, &redaction);
+        seed_redaction(&db, &keyring_store, &redaction);
     }
+    let secret_store: Option<&dyn SecretStore> = if keyring_ok {
+        Some(&keyring_store)
+    } else {
+        None
+    };
+    let config = server_config(&server, secret_store, &redaction)?;
 
     // 이전에 크래시한 프록시가 남긴 orphan pending 승인을 정리한다 — GUI가 죽은 팝업을
     // 띄우지 않게. best-effort(실패해도 서빙 계속). db를 hook으로 넘기기 전에 한다.
@@ -102,7 +107,11 @@ fn unix_secs() -> i64 {
 
 /// McpServerRow → LocalMcpManager가 spawn할 McpServerConfig.
 /// v0는 stdio kind + command 필수 (§1.5).
-fn server_config(row: &McpServerRow) -> anyhow::Result<McpServerConfig> {
+fn server_config(
+    row: &McpServerRow,
+    secret_store: Option<&dyn SecretStore>,
+    redaction: &RedactionService,
+) -> anyhow::Result<McpServerConfig> {
     anyhow::ensure!(
         row.kind == "stdio",
         "서버 '{}'의 kind가 '{}' — v0 프록시는 stdio만 지원",
@@ -117,13 +126,41 @@ fn server_config(row: &McpServerRow) -> anyhow::Result<McpServerConfig> {
         name: row.name.clone(),
         command,
         args: row.args.clone(),
+        env: resolve_server_env(row, secret_store, redaction)?,
+        inherit_env: row.inherit_env,
     })
+}
+
+fn resolve_server_env(
+    row: &McpServerRow,
+    secret_store: Option<&dyn SecretStore>,
+    redaction: &RedactionService,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let mut env = row.env_plain.clone();
+    if row.env_secrets.is_empty() {
+        return Ok(env);
+    }
+    let store = secret_store.with_context(|| {
+        format!(
+            "MCP 서버 '{}' scoped secret env를 해석할 keyring이 없음",
+            row.id
+        )
+    })?;
+    for (key, credential_id) in &row.env_secrets {
+        let secret = store
+            .get_secret(credential_id)
+            .with_context(|| format!("MCP 서버 '{}' env '{}' credential 조회 실패", row.id, key))?;
+        redaction.register(&secret);
+        redaction.register_json_fields(&secret);
+        env.push((key.clone(), secret.expose().to_owned()));
+    }
+    Ok(env)
 }
 
 /// 저장된 credential secret을 redaction 대상으로 등록한다 (프리뷰/로그 누출 방지).
 /// resolve는 이 단일 스레드에서만 일어난다 (secret 접근 직렬화, §1.4). best-effort —
 /// 개별 실패는 경고만 남기고 계속한다.
-fn seed_redaction(db: &storage::Db, redaction: &RedactionService) {
+fn seed_redaction(db: &storage::Db, store: &dyn SecretStore, redaction: &RedactionService) {
     let credentials = match db.list_credentials() {
         Ok(c) => c,
         Err(e) => {
@@ -131,18 +168,17 @@ fn seed_redaction(db: &storage::Db, redaction: &RedactionService) {
             return;
         }
     };
-    let store = KeyringSecretStore;
     for credential in credentials {
-        register_secret(&store, redaction, &credential.id);
+        register_secret(store, redaction, &credential.id);
         // OAuth 토큰은 refresh entry가 별도 keyring 좌표에 있다 (app.rs와 동일).
         if credential.credential_kind == "oauth_token" {
-            register_secret(&store, redaction, &auth::refresh_entry_id(&credential.id));
+            register_secret(store, redaction, &auth::refresh_entry_id(&credential.id));
         }
     }
 }
 
 /// keyring에서 secret 하나를 읽어 원본 + (JSON이면) 내부 필드까지 redaction 등록한다.
-fn register_secret(store: &KeyringSecretStore, redaction: &RedactionService, id: &str) {
+fn register_secret(store: &dyn SecretStore, redaction: &RedactionService, id: &str) {
     match store.get_secret(id) {
         Ok(value) => {
             redaction.register(&value);

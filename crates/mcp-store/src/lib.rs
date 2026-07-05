@@ -71,6 +71,14 @@ CREATE TABLE pending_approvals (
 CREATE INDEX idx_pending_approvals_status ON pending_approvals(status);
 ";
 
+/// scoped MCP env metadata — 전역 마이그레이션 v12 슬롯.
+/// env_json은 안전한 plain 값만, env_credentials_json은 key→credential_id만 저장한다.
+pub const MIGRATION_SERVER_ENV: &str = "
+ALTER TABLE mcp_servers ADD COLUMN env_json TEXT;
+ALTER TABLE mcp_servers ADD COLUMN env_credentials_json TEXT;
+ALTER TABLE mcp_servers ADD COLUMN inherit_env INTEGER NOT NULL DEFAULT 1;
+";
+
 /// tool 권한 규칙 한 행. rule은 영속 문자열("allow"|"deny"|"ask") — 해석은 상위 계층.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PermissionRuleRow {
@@ -328,6 +336,12 @@ pub struct McpServerRow {
     pub command: Option<String>,
     /// args_json 컬럼에 JSON 배열로 저장
     pub args: Vec<String>,
+    /// env_json 컬럼에 JSON object로 저장. secret-like key/value는 저장 전 거부한다.
+    pub env_plain: Vec<(String, String)>,
+    /// env_credentials_json 컬럼에 JSON object로 저장. 값은 credential id만 저장한다.
+    pub env_secrets: Vec<(String, String)>,
+    /// true면 parent env 상속, false면 scoped env만 주입한다.
+    pub inherit_env: bool,
     pub url: Option<String>,
     pub enabled: bool,
 }
@@ -371,6 +385,45 @@ pub fn validate_server_args_for_persistence(args: &[String]) -> anyhow::Result<(
             "MCP server args에 {}가 포함되어 저장을 거부합니다. secret은 credential/env binding으로 저장하세요",
             reason.label()
         );
+    }
+    Ok(())
+}
+
+pub fn validate_server_env_for_persistence(
+    env_plain: &[(String, String)],
+    env_secrets: &[(String, String)],
+) -> anyhow::Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for (key, value) in env_plain {
+        validate_env_key(key)?;
+        if !seen.insert(key.clone()) {
+            anyhow::bail!("MCP env key 중복: {key}");
+        }
+        if secret_like_arg_key(key) || secret_like_value(value).is_some() {
+            anyhow::bail!(
+                "MCP env '{}'는 secret-like plain value로 저장할 수 없습니다. credential binding을 사용하세요",
+                key
+            );
+        }
+    }
+    for (key, credential_id) in env_secrets {
+        validate_env_key(key)?;
+        if !seen.insert(key.clone()) {
+            anyhow::bail!("MCP env key 중복: {key}");
+        }
+        if credential_id.trim().is_empty() || credential_id.contains('\0') {
+            anyhow::bail!(
+                "MCP env '{}' credential_id가 비어있거나 유효하지 않습니다",
+                key
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_env_key(key: &str) -> anyhow::Result<()> {
+    if key.trim().is_empty() || key.contains('=') || key.contains('\0') {
+        anyhow::bail!("MCP env key가 비어있거나 유효하지 않습니다");
     }
     Ok(())
 }
@@ -553,10 +606,16 @@ fn looks_like_token_literal(value: &str) -> bool {
 pub fn insert_server(conn: &Connection, row: &McpServerRow) -> anyhow::Result<()> {
     validate_server_args_for_persistence(&row.args)
         .with_context(|| format!("mcp_server args validation 실패: {}", row.name))?;
+    validate_server_env_for_persistence(&row.env_plain, &row.env_secrets)
+        .with_context(|| format!("mcp_server env validation 실패: {}", row.name))?;
     let args_json = serde_json::to_string(&row.args)?;
+    let env_json = env_pairs_json(&row.env_plain)?;
+    let env_credentials_json = env_pairs_json(&row.env_secrets)?;
     conn.execute(
-        "INSERT INTO mcp_servers (id, name, kind, command, args_json, url, enabled, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+        "INSERT INTO mcp_servers
+           (id, name, kind, command, args_json, env_json, env_credentials_json,
+            inherit_env, url, enabled, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
             strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
         (
             &row.id,
@@ -564,6 +623,9 @@ pub fn insert_server(conn: &Connection, row: &McpServerRow) -> anyhow::Result<()
             &row.kind,
             &row.command,
             &args_json,
+            &env_json,
+            &env_credentials_json,
+            row.inherit_env,
             &row.url,
             row.enabled,
         ),
@@ -574,7 +636,8 @@ pub fn insert_server(conn: &Connection, row: &McpServerRow) -> anyhow::Result<()
 
 pub fn list_servers(conn: &Connection) -> anyhow::Result<Vec<McpServerRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, kind, command, args_json, url, enabled
+        "SELECT id, name, kind, command, args_json, env_json, env_credentials_json,
+                inherit_env, url, enabled
          FROM mcp_servers ORDER BY created_at, id",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -585,29 +648,80 @@ pub fn list_servers(conn: &Connection) -> anyhow::Result<Vec<McpServerRow>> {
             row.get::<_, Option<String>>(3)?,
             row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<String>>(5)?,
-            row.get::<_, bool>(6)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, bool>(7)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, bool>(9)?,
         ))
     })?;
     let mut servers = Vec::new();
     for row in rows {
-        let (id, name, kind, command, args_json, url, enabled) = row?;
+        let (
+            id,
+            name,
+            kind,
+            command,
+            args_json,
+            env_json,
+            env_credentials_json,
+            inherit_env,
+            url,
+            enabled,
+        ) = row?;
         let args = match args_json {
             Some(json) => {
                 serde_json::from_str(&json).with_context(|| format!("args_json 파싱 실패: {id}"))?
             }
             None => Vec::new(),
         };
+        let env_plain = parse_env_pairs(&id, "env_json", env_json)?;
+        let env_secrets = parse_env_pairs(&id, "env_credentials_json", env_credentials_json)?;
         servers.push(McpServerRow {
             id,
             name,
             kind,
             command,
             args,
+            env_plain,
+            env_secrets,
+            inherit_env,
             url,
             enabled,
         });
     }
     Ok(servers)
+}
+
+fn env_pairs_json(pairs: &[(String, String)]) -> anyhow::Result<Option<String>> {
+    if pairs.is_empty() {
+        return Ok(None);
+    }
+    let map: serde_json::Map<String, serde_json::Value> = pairs
+        .iter()
+        .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
+        .collect();
+    Ok(Some(serde_json::to_string(&map)?))
+}
+
+fn parse_env_pairs(
+    row_id: &str,
+    column: &str,
+    json: Option<String>,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let Some(json) = json else {
+        return Ok(Vec::new());
+    };
+    let map: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&json).with_context(|| format!("{column} 파싱 실패: {row_id}"))?;
+    let mut pairs = Vec::with_capacity(map.len());
+    for (key, value) in map {
+        let Some(value) = value.as_str() else {
+            anyhow::bail!("{column} value는 문자열이어야 합니다: {row_id}:{key}");
+        };
+        pairs.push((key, value.to_owned()));
+    }
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(pairs)
 }
 
 pub fn insert_tool(conn: &Connection, row: &McpToolRow) -> anyhow::Result<()> {
@@ -676,13 +790,14 @@ pub fn list_tools_for_server(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MIGRATION_SQL;
+    use crate::{MIGRATION_SERVER_ENV, MIGRATION_SQL};
 
     fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         // 앱은 모든 연결에 foreign_keys=ON을 강제한다 (§11.9) — 테스트도 동일 조건
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         conn.execute_batch(MIGRATION_SQL).unwrap();
+        conn.execute_batch(MIGRATION_SERVER_ENV).unwrap();
         conn.execute_batch(MIGRATION_TOOL_PERMISSION_RULES).unwrap();
         conn.execute_batch(MIGRATION_PENDING_APPROVALS).unwrap();
         conn
@@ -695,6 +810,9 @@ mod tests {
             kind: "stdio".to_owned(),
             command: Some("npx".to_owned()),
             args: vec!["-y".to_owned(), "server-filesystem".to_owned()],
+            env_plain: Vec::new(),
+            env_secrets: Vec::new(),
+            inherit_env: true,
             url: None,
             enabled: true,
         }
@@ -706,6 +824,45 @@ mod tests {
         let server = sample_server();
         insert_server(&conn, &server).unwrap();
         assert_eq!(list_servers(&conn).unwrap(), vec![server]);
+    }
+
+    #[test]
+    fn server_env_plain과_credential_id는_roundtrip된다() {
+        let conn = test_conn();
+        let mut server = sample_server();
+        server.env_plain = vec![("MCP_SAFE_MODE".to_owned(), "1".to_owned())];
+        server.env_secrets = vec![("MCP_ACCESS_TOKEN".to_owned(), "cred-123".to_owned())];
+        server.inherit_env = false;
+
+        insert_server(&conn, &server).unwrap();
+
+        assert_eq!(list_servers(&conn).unwrap(), vec![server]);
+        let (env_json, env_credentials_json): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT env_json, env_credentials_json FROM mcp_servers WHERE id = 'srv-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(env_json.as_deref(), Some(r#"{"MCP_SAFE_MODE":"1"}"#));
+        assert_eq!(
+            env_credentials_json.as_deref(),
+            Some(r#"{"MCP_ACCESS_TOKEN":"cred-123"}"#)
+        );
+    }
+
+    #[test]
+    fn server_env_plain_secret_like_value는_저장하지_않는다() {
+        let conn = test_conn();
+        let mut server = sample_server();
+        let secret = "sk-mcp-env-secret-never-persisted";
+        server.env_plain = vec![("MCP_TOKEN".to_owned(), secret.to_owned())];
+
+        assert!(insert_server(&conn, &server).is_err());
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM mcp_servers", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

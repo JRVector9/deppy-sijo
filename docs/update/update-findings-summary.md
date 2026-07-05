@@ -61,7 +61,7 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 | PR-U07 CJK / IME / Unicode Terminal QA | Complete for selection fixtures | PR-B04a, PR-B04b | Wide-char selection normalization and required paste/DnD fixture coverage added. IME smoke remains a release gate concern. |
 | PR-U08 Redaction Pipeline Hardening | Complete for high findings | PR-B05a, PR-B05a review fix | Secret-like env/args persistence guards strengthened. Manual Debug redaction remains backlog. |
 | PR-U09 Project Env Safety & Production Guard | Complete for current findings | PR-B05a, PR-U09b | Plain secret-like env blocked. Production profile agent runs now require confirmation before `SpawnAgent`. |
-| PR-U10 MCP Permission / Audit Hardening | Partial complete | PR-B06a, code triage | Audit encrypted blob default-off, JSON validation, debug redaction, and schema reapproval checks are covered. Scoped MCP env injection remains pending. |
+| PR-U10 MCP Permission / Audit Hardening | Complete for current findings | PR-B06a, PR-U10b | Audit encrypted blob default-off, JSON validation, debug redaction, schema reapproval checks, and scoped MCP env injection are covered. |
 | PR-U11 Final Security Gate | Gate command complete | Current wave | `cargo run -p xtask -- security-scan` added and passed against boundary, deps, secret persistence, audit/MCP/proxy tests. |
 | PR-U12 Process Resource Monitor | Foundation complete / child tree pending | Current wave | Low-cadence app process CPU/RSS sampler and `RuntimeEvent::ResourceUsage` added; per-session child process tree and UI controls remain follow-up. |
 | PR-U13 Workspace Auto Suspend | Complete | PR-U13 | Warm workspaces now record background time and auto-suspend after timeout, draining final notifications before worker shutdown. |
@@ -83,8 +83,7 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 
 - Full PR-U20 Scenario A-E measurements remain pending in Phase D.
 - PR-U12 child process tree aggregation and PR-U18 runtime/app hot-path write wiring remain follow-up.
-- Code triage classifies PR-U10b and PR-U20b as the
-  next implementable backlog candidates.
+- Code triage classifies PR-U20b as the next release-gate measurement candidate.
 
 ## Deferred / Backlog Items
 
@@ -93,7 +92,7 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
   mode or product requirement appears.
 - Manual `Debug` redaction for all sensitive runtime/config rows.
 - MCP proxy schema hash reapproval is covered for the current per-session proxy
-  architecture; scoped MCP env injection remains implementable as PR-U10b.
+  architecture; scoped MCP env injection is now implemented by PR-U10b.
 - Pseudo-locale visual smoke and generated default title localization.
 
 ## Next Operating Wave

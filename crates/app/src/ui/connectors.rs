@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use anyhow::Context;
 use mcp::{LocalMcpManager, McpServerConfig, McpTool};
 use mcp_store::{McpServerRow, McpToolRow};
 use secret::RedactionService;
@@ -41,6 +42,9 @@ struct ToolInvoke {
     server_name: String,
     command: String,
     args: Vec<String>,
+    env_plain: Vec<(String, String)>,
+    env_secrets: Vec<(String, String)>,
+    inherit_env: bool,
     tool_name: String,
     schema_hash: String,
     /// tool 인자 JSON draft (사용자 편집)
@@ -85,6 +89,14 @@ pub struct StoredOAuthCredential {
 pub trait OAuthCredentialStore {
     fn store_oauth_token(&self, token: &auth::OAuthToken) -> anyhow::Result<StoredOAuthCredential>;
     fn delete_oauth_token(&self, id: &str) -> anyhow::Result<()>;
+}
+
+pub trait McpScopedEnvResolver {
+    fn resolve_mcp_env(
+        &self,
+        env_plain: &[(String, String)],
+        env_secrets: &[(String, String)],
+    ) -> anyhow::Result<Vec<(String, String)>>;
 }
 
 pub struct ConnectorsUi {
@@ -172,6 +184,7 @@ impl ConnectorsUi {
         db: &mut Db,
         workspace_id: &str,
         oauth_store: &dyn OAuthCredentialStore,
+        env_resolver: &dyn McpScopedEnvResolver,
         catalog: &i18n::Catalog,
     ) -> bool {
         // 백그라운드 결과는 창이 닫혀 있어도 소화한다 (다시 열 때 최신 상태)
@@ -185,7 +198,9 @@ impl ConnectorsUi {
         egui::Window::new(catalog.t("connectors.title", &[]))
             .open(&mut open)
             .resizable(false)
-            .show(ctx, |ui| self.contents(ui, ctx, db, workspace_id, catalog));
+            .show(ctx, |ui| {
+                self.contents(ui, ctx, db, workspace_id, env_resolver, catalog)
+            });
         self.open = open;
         credential_added
     }
@@ -232,6 +247,7 @@ impl ConnectorsUi {
         ctx: &egui::Context,
         db: &mut Db,
         workspace_id: &str,
+        env_resolver: &dyn McpScopedEnvResolver,
         catalog: &i18n::Catalog,
     ) {
         if !self.rules_loaded {
@@ -260,12 +276,12 @@ impl ConnectorsUi {
             ui.label(catalog.t("connectors.empty_mcp", &[]));
         }
         for server in &servers {
-            self.server_card(ui, ctx, db, server, catalog);
+            self.server_card(ui, ctx, db, server, env_resolver, catalog);
         }
 
         // 도구 실행 패널 (선택된 tool이 있을 때) — 정책 평가·승인·실행·감사
         if self.invoke.is_some() {
-            self.tool_invoke_panel(ui, ctx, db, workspace_id, catalog);
+            self.tool_invoke_panel(ui, ctx, db, workspace_id, env_resolver, catalog);
         }
 
         ui.separator();
@@ -426,6 +442,7 @@ impl ConnectorsUi {
         ctx: &egui::Context,
         db: &mut Db,
         server: &McpServerRow,
+        env_resolver: &dyn McpScopedEnvResolver,
         catalog: &i18n::Catalog,
     ) {
         ui.group(|ui| {
@@ -462,7 +479,7 @@ impl ConnectorsUi {
                     )
                     .clicked()
                 {
-                    self.start_discover(ctx, server);
+                    self.start_discover(ctx, server, env_resolver);
                 }
             });
             // 저장된 tool 목록 + 실행 버튼 + 현재 권한 규칙 (PR-16)
@@ -477,8 +494,9 @@ impl ConnectorsUi {
                                 egui::Button::new(catalog.t("action.run", &[])).small(),
                             )
                             .clicked()
+                            && let Err(e) = self.begin_invoke(server, &tool)
                         {
-                            self.begin_invoke(server, &tool);
+                            self.error = Some(format!("실행 준비 실패: {e:#}"));
                         }
                         // 현재 규칙 표시 + Ask 아니면 해제 버튼 (잘못 always한 것 되돌리기)
                         let rule = self.policy.rule(&server.id, &tool.name);
@@ -518,7 +536,14 @@ impl ConnectorsUi {
     }
 
     /// 도구 실행 시작 — Editing 상태로 invoke 패널을 연다.
-    fn begin_invoke(&mut self, server: &McpServerRow, tool: &McpToolRow) {
+    fn begin_invoke(&mut self, server: &McpServerRow, tool: &McpToolRow) -> anyhow::Result<()> {
+        let command = server.command.clone().unwrap_or_default();
+        anyhow::ensure!(
+            !command.trim().is_empty(),
+            "MCP server command가 비어 있습니다"
+        );
+        mcp_store::validate_server_env_for_persistence(&server.env_plain, &server.env_secrets)
+            .context("MCP scoped env validation 실패")?;
         self.invoke_gen += 1;
         // schema_hash는 저장분 우선, 없으면 스키마에서 재계산 (재승인 판정용)
         let schema_hash = tool.schema_hash.clone().unwrap_or_else(|| {
@@ -527,8 +552,11 @@ impl ConnectorsUi {
         self.invoke = Some(ToolInvoke {
             server_id: server.id.clone(),
             server_name: server.name.clone(),
-            command: server.command.clone().unwrap_or_default(),
+            command,
             args: server.args.clone(),
+            env_plain: server.env_plain.clone(),
+            env_secrets: server.env_secrets.clone(),
+            inherit_env: server.inherit_env,
             tool_name: tool.name.clone(),
             schema_hash,
             input: "{}".to_owned(),
@@ -536,6 +564,7 @@ impl ConnectorsUi {
             generation: self.invoke_gen,
             prepared_hash: None,
         });
+        Ok(())
     }
 
     /// 도구 실행 패널: 편집 → 정책 평가 → (승인) → tools/call → 결과. 감사는 결정 시점에.
@@ -545,6 +574,7 @@ impl ConnectorsUi {
         ctx: &egui::Context,
         db: &mut Db,
         workspace_id: &str,
+        env_resolver: &dyn McpScopedEnvResolver,
         catalog: &i18n::Catalog,
     ) {
         ui.separator();
@@ -563,7 +593,7 @@ impl ConnectorsUi {
                     let request = request_of(&inv);
                     match self.policy.evaluate(&request) {
                         audit::PolicyEvaluation::Decided(decision) => {
-                            self.run_tool(&inv, db, workspace_id, ctx, decision)
+                            self.run_tool(&inv, db, workspace_id, ctx, decision, env_resolver)
                         }
                         audit::PolicyEvaluation::NeedsApproval(reason) => {
                             InvokePhase::Approval(reason)
@@ -689,9 +719,9 @@ impl ConnectorsUi {
                     decision @ audit::ToolDecision::PolicyDeny,
                 ) = self.policy.evaluate(&request)
                 {
-                    self.run_tool(&inv, db, workspace_id, ctx, decision)
+                    self.run_tool(&inv, db, workspace_id, ctx, decision, env_resolver)
                 } else {
-                    self.start_prepare(&inv, ctx);
+                    self.start_prepare(&inv, ctx, env_resolver);
                     inv.prepared_hash = None;
                     InvokePhase::Preparing
                 };
@@ -721,7 +751,7 @@ impl ConnectorsUi {
                         tracing::warn!("권한 규칙 저장 실패: {e:#}");
                     }
                 }
-                inv.phase = self.run_tool(&inv, db, workspace_id, ctx, decision);
+                inv.phase = self.run_tool(&inv, db, workspace_id, ctx, decision, env_resolver);
                 self.invoke = Some(inv);
             }
         }
@@ -729,11 +759,21 @@ impl ConnectorsUi {
 
     /// 현재 tool 스키마를 서버에서 다시 가져와 schema hash를 확보한다 (백그라운드).
     /// 저장된 stale hash로 재승인을 우회하지 않도록 호출 직전에 재확인한다.
-    fn start_prepare(&self, inv: &ToolInvoke, ctx: &egui::Context) {
-        let config = McpServerConfig {
-            name: inv.server_name.clone(),
-            command: inv.command.clone(),
-            args: inv.args.clone(),
+    fn start_prepare(
+        &self,
+        inv: &ToolInvoke,
+        ctx: &egui::Context,
+        env_resolver: &dyn McpScopedEnvResolver,
+    ) {
+        let config = match config_for_invoke(inv, env_resolver) {
+            Ok(config) => config,
+            Err(e) => {
+                let _ = self
+                    .invoke_tx
+                    .send((inv.generation, InvokeMsg::Result(Err(format!("{e:#}")))));
+                ctx.request_repaint();
+                return;
+            }
         };
         let manager = LocalMcpManager::new(self.redaction.clone());
         let tx = self.invoke_tx.clone();
@@ -763,6 +803,7 @@ impl ConnectorsUi {
         workspace_id: &str,
         ctx: &egui::Context,
         decision: audit::ToolDecision,
+        env_resolver: &dyn McpScopedEnvResolver,
     ) -> InvokePhase {
         let arguments = match parse_tool_arguments(&inv.input) {
             Ok(arguments) => arguments,
@@ -784,10 +825,9 @@ impl ConnectorsUi {
         if !decision.is_allowed() {
             return InvokePhase::Failed("정책상 거부됨".to_owned());
         }
-        let config = McpServerConfig {
-            name: inv.server_name.clone(),
-            command: inv.command.clone(),
-            args: inv.args.clone(),
+        let config = match config_for_invoke(inv, env_resolver) {
+            Ok(config) => config,
+            Err(e) => return InvokePhase::Failed(format!("{e:#}")),
         };
         let manager = LocalMcpManager::new(self.redaction.clone());
         let redaction = self.redaction.clone();
@@ -812,7 +852,12 @@ impl ConnectorsUi {
     }
 
     /// 연결 테스트를 백그라운드로 시작한다 (UI 프레임을 막지 않는다).
-    fn start_discover(&mut self, ctx: &egui::Context, server: &McpServerRow) {
+    fn start_discover(
+        &mut self,
+        ctx: &egui::Context,
+        server: &McpServerRow,
+        env_resolver: &dyn McpScopedEnvResolver,
+    ) {
         let Some(command) = server.command.clone() else {
             self.status.insert(
                 server.id.clone(),
@@ -820,12 +865,23 @@ impl ConnectorsUi {
             );
             return;
         };
-        self.status.insert(server.id.clone(), ConnStatus::Checking);
-        let config = McpServerConfig {
-            name: server.name.clone(),
+        let config = match mcp_config_for_values(
+            &server.name,
             command,
-            args: server.args.clone(),
+            server.args.clone(),
+            server.inherit_env,
+            &server.env_plain,
+            &server.env_secrets,
+            env_resolver,
+        ) {
+            Ok(config) => config,
+            Err(e) => {
+                self.status
+                    .insert(server.id.clone(), ConnStatus::Failed(format!("{e:#}")));
+                return;
+            }
         };
+        self.status.insert(server.id.clone(), ConnStatus::Checking);
         let manager = LocalMcpManager::new(self.redaction.clone());
         let tx = self.result_tx.clone();
         let ctx = ctx.clone();
@@ -880,6 +936,9 @@ impl ConnectorsUi {
             kind: "stdio".to_owned(), // v0는 stdio만 (§1.5)
             command: Some(command.to_owned()),
             args,
+            env_plain: Vec::new(),
+            env_secrets: Vec::new(),
+            inherit_env: true,
             url: None,
             enabled: true,
         };
@@ -894,6 +953,46 @@ impl ConnectorsUi {
             Err(e) => self.error = Some(format!("추가 실패: {e:#}")),
         }
     }
+}
+
+fn mcp_config_for_values(
+    name: &str,
+    command: String,
+    args: Vec<String>,
+    inherit_env: bool,
+    env_plain: &[(String, String)],
+    env_secrets: &[(String, String)],
+    env_resolver: &dyn McpScopedEnvResolver,
+) -> anyhow::Result<McpServerConfig> {
+    anyhow::ensure!(
+        !command.trim().is_empty(),
+        "MCP server command가 비어 있습니다"
+    );
+    mcp_store::validate_server_env_for_persistence(env_plain, env_secrets)
+        .context("MCP scoped env validation 실패")?;
+    let env = env_resolver.resolve_mcp_env(env_plain, env_secrets)?;
+    Ok(McpServerConfig {
+        name: name.to_owned(),
+        command,
+        args,
+        env,
+        inherit_env,
+    })
+}
+
+fn config_for_invoke(
+    inv: &ToolInvoke,
+    env_resolver: &dyn McpScopedEnvResolver,
+) -> anyhow::Result<McpServerConfig> {
+    mcp_config_for_values(
+        &inv.server_name,
+        inv.command.clone(),
+        inv.args.clone(),
+        inv.inherit_env,
+        &inv.env_plain,
+        &inv.env_secrets,
+        env_resolver,
+    )
 }
 
 fn mcp_args_for_display(args: &[String]) -> String {
@@ -991,6 +1090,9 @@ mod tests {
             server_name: "mock".to_owned(),
             command: "/nonexistent/deppy-connectors-test".to_owned(),
             args: Vec::new(),
+            env_plain: Vec::new(),
+            env_secrets: Vec::new(),
+            inherit_env: true,
             tool_name: "read_file".to_owned(),
             schema_hash: audit::schema_hash(r#"{"type":"object"}"#),
             input: input.to_owned(),
@@ -1031,6 +1133,59 @@ mod tests {
         );
     }
 
+    struct MemMcpEnvResolver(std::collections::HashMap<String, String>);
+
+    impl McpScopedEnvResolver for MemMcpEnvResolver {
+        fn resolve_mcp_env(
+            &self,
+            env_plain: &[(String, String)],
+            env_secrets: &[(String, String)],
+        ) -> anyhow::Result<Vec<(String, String)>> {
+            let mut env = env_plain.to_vec();
+            for (key, credential_id) in env_secrets {
+                let value = self
+                    .0
+                    .get(credential_id)
+                    .cloned()
+                    .with_context(|| format!("missing secret: {credential_id}"))?;
+                env.push((key.clone(), value));
+            }
+            Ok(env)
+        }
+    }
+
+    #[test]
+    fn scoped_mcp_env_config는_credential을_해석하고_debug에_값을_숨긴다() {
+        let resolver = MemMcpEnvResolver(std::collections::HashMap::from([(
+            "cred-1".to_owned(),
+            "sk-scoped-env-secret".to_owned(),
+        )]));
+
+        let config = mcp_config_for_values(
+            "mock",
+            "/bin/sh".to_owned(),
+            vec!["-c".to_owned(), "exit 0".to_owned()],
+            false,
+            &[("MCP_SAFE".to_owned(), "1".to_owned())],
+            &[("MCP_TOKEN".to_owned(), "cred-1".to_owned())],
+            &resolver,
+        )
+        .unwrap();
+
+        assert!(!config.inherit_env);
+        assert_eq!(
+            config.env,
+            vec![
+                ("MCP_SAFE".to_owned(), "1".to_owned()),
+                ("MCP_TOKEN".to_owned(), "sk-scoped-env-secret".to_owned())
+            ]
+        );
+        assert!(
+            !format!("{config:?}").contains("sk-scoped-env-secret"),
+            "Debug must not expose scoped env values"
+        );
+    }
+
     #[test]
     fn tool_arguments는_json_object만_허용한다() {
         assert!(parse_tool_arguments(r#"{"path":"/tmp/x"}"#).is_ok());
@@ -1052,8 +1207,16 @@ mod tests {
         let ui = ConnectorsUi::new(RedactionService::new());
         let ctx = egui::Context::default();
         let inv = invoke_with_input(r#"{"token":"sk-unregistered-secret","path":"/tmp/x"}"#);
+        let resolver = MemMcpEnvResolver(std::collections::HashMap::new());
 
-        let phase = ui.run_tool(&inv, &db, "ws-1", &ctx, audit::ToolDecision::DenyOnce);
+        let phase = ui.run_tool(
+            &inv,
+            &db,
+            "ws-1",
+            &ctx,
+            audit::ToolDecision::DenyOnce,
+            &resolver,
+        );
 
         assert!(matches!(phase, InvokePhase::Failed(_)));
         let rows = audit_rows(&path);
@@ -1073,10 +1236,18 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let ui = ConnectorsUi::new(RedactionService::new());
         let ctx = egui::Context::default();
+        let resolver = MemMcpEnvResolver(std::collections::HashMap::new());
 
         for input in ["{bad", "[1,2]"] {
             let inv = invoke_with_input(input);
-            let phase = ui.run_tool(&inv, &db, "ws-1", &ctx, audit::ToolDecision::DenyOnce);
+            let phase = ui.run_tool(
+                &inv,
+                &db,
+                "ws-1",
+                &ctx,
+                audit::ToolDecision::DenyOnce,
+                &resolver,
+            );
             assert!(matches!(phase, InvokePhase::Failed(_)));
         }
 

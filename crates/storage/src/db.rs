@@ -29,6 +29,7 @@ pub struct Db {
 /// 10: agent_configs.mcp_proxy_* (agent-proxy 배선 — spawn 시 .mcp.json 생성 +
 ///     --mcp-config로 에이전트를 deppy-mcp-proxy 권한계층에 태운다).
 /// 11: agent_configs.mcp_config_flag (에이전트별 주입 플래그 커스텀 — NULL=기본 --mcp-config).
+/// 12: mcp_servers scoped env metadata (plain-safe env + credential ids, PR-U10b).
 /// 4~6은 각 crate가 소유한 DDL 상수를 그대로 붙인다 (스키마 정의는 한 곳에서만).
 pub(crate) const MIGRATIONS: &[&str] = &[
     "
@@ -128,6 +129,8 @@ ALTER TABLE agent_configs ADD COLUMN mcp_proxy_server_id TEXT;
     //     쓰고, 값이 있으면 그 플래그 이름으로 붙인다 (에이전트마다 다른 규약 대응). nullable —
     //     기존 행/enabled 여부와 무관하게 NULL 허용(빈 문자열은 API 레벨에서 None으로 정규화).
     "ALTER TABLE agent_configs ADD COLUMN mcp_config_flag TEXT;",
+    // 12: mcp_servers scoped env. secret 값은 저장하지 않고 credential id만 저장한다.
+    mcp_store::MIGRATION_SERVER_ENV,
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -475,19 +478,29 @@ impl Db {
             .conn
             .execute(
                 "DELETE FROM credentials WHERE id = ?1
-                   AND NOT EXISTS (SELECT 1 FROM env_vars WHERE credential_id = ?1)",
+                   AND NOT EXISTS (SELECT 1 FROM env_vars WHERE credential_id = ?1)
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM mcp_servers, json_each(COALESCE(mcp_servers.env_credentials_json, '{}'))
+                       WHERE json_each.value = ?1
+                   )",
                 [id],
             )
             .with_context(|| format!("credential 삭제 실패: {id}"))?;
         Ok(affected == 1)
     }
 
-    /// env var가 이 credential을 참조 중인지 확인 (UI 에러 메시지 구분용).
+    /// env var 또는 MCP scoped env가 이 credential을 참조 중인지 확인 (UI 에러 메시지 구분용).
     pub fn credential_in_use(&self, id: &str) -> anyhow::Result<bool> {
         let exists: Option<i64> = self
             .conn
             .query_row(
-                "SELECT 1 FROM env_vars WHERE credential_id = ?1 LIMIT 1",
+                "SELECT 1 FROM env_vars WHERE credential_id = ?1
+                 UNION ALL
+                 SELECT 1
+                 FROM mcp_servers, json_each(COALESCE(mcp_servers.env_credentials_json, '{}'))
+                 WHERE json_each.value = ?1
+                 LIMIT 1",
                 [id],
                 |row| row.get(0),
             )
@@ -1478,6 +1491,29 @@ mod tests {
         db.delete_env_var(&profile, "API_KEY").unwrap();
         assert!(!db.credential_in_use("cred-1").unwrap());
         assert!(db.delete_credential_if_unused("cred-1").unwrap());
+    }
+
+    #[test]
+    fn mcp_scoped_env가_참조하는_credential은_삭제_거부() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_credential(&sample("cred-1")).unwrap();
+        db.insert_mcp_server(&mcp_store::McpServerRow {
+            id: "srv-1".to_owned(),
+            name: "mock".to_owned(),
+            kind: "stdio".to_owned(),
+            command: Some("/bin/sh".to_owned()),
+            args: Vec::new(),
+            env_plain: Vec::new(),
+            env_secrets: vec![("MCP_TOKEN".to_owned(), "cred-1".to_owned())],
+            inherit_env: true,
+            url: None,
+            enabled: true,
+        })
+        .unwrap();
+
+        assert!(db.credential_in_use("cred-1").unwrap());
+        assert!(!db.delete_credential_if_unused("cred-1").unwrap());
+        assert_eq!(db.list_credentials().unwrap().len(), 1);
     }
 
     #[test]

@@ -112,7 +112,7 @@ Tests:
 
 ### PR-U10b - Scoped MCP Env Injection
 
-Classification: implement.
+Classification: implemented in PR-U10b.
 
 Evidence:
 
@@ -138,6 +138,16 @@ Tests:
 - Credential-backed env values are resolved at spawn and redacted from stderr,
   audit previews, and error strings.
 - Stored rows contain credential ids or safe plain values only.
+
+Result:
+
+- `mcp_servers` now stores safe plain env and credential ids plus
+  `inherit_env`.
+- `StdioClient::spawn` applies explicit scoped env and supports strict
+  `env_clear` mode.
+- Connector Center and `deppy-mcp-proxy` resolve credential env through the
+  secret store immediately before backend spawn and register resolved values for
+  redaction.
 
 ### PR-U20b - Full Scenario A-E Performance Report
 

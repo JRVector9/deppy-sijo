@@ -53,16 +53,22 @@ pub(crate) struct StdioClient {
 
 impl StdioClient {
     /// MCP 서버 subprocess spawn + stdout/stderr reader thread 기동.
-    /// credentials는 environment 상속으로 전달된다 (§1.5 v0) — env 조작은 호출측 소관.
+    /// scoped env는 여기에만 적용한다. inherit_env=false면 parent env를 지우고 명시 env만 주입한다.
     pub(crate) fn spawn(
         command: &str,
         args: &[String],
+        env: &[(String, String)],
+        inherit_env: bool,
         redaction: &RedactionService,
         request_timeout: Duration,
     ) -> anyhow::Result<Self> {
         let mut builder = Command::new(command);
+        if !inherit_env {
+            builder.env_clear();
+        }
         builder
             .args(args)
+            .envs(env.iter().map(|(key, value)| (key, value)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

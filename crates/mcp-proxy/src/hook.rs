@@ -308,6 +308,8 @@ mod tests {
             name: "no-backend".to_owned(),
             command: "/nonexistent/deppy-proxy-test-cmd".to_owned(),
             args: Vec::new(),
+            env: Vec::new(),
+            inherit_env: true,
         }
     }
 
@@ -370,6 +372,8 @@ mod tests {
             name: "mock".to_owned(),
             command: "/bin/sh".to_owned(),
             args: vec!["-c".to_owned(), script],
+            env: Vec::new(),
+            inherit_env: true,
         }
     }
 

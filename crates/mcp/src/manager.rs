@@ -18,12 +18,27 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_TOOL_PAGES: usize = 100;
 
 /// local stdio MCP 서버 실행 스펙 (§11.4 kind='stdio' 행에 대응).
-/// credentials는 environment 상속으로 전달된다 (§1.5 v0) — env 주입은 호출측 소관.
-#[derive(Debug, Clone, PartialEq)]
+/// scoped env secret은 spawn 직전 호출측이 해석해 env에 넣는다. Debug는 env 값을 출력하지 않는다.
+#[derive(Clone, PartialEq)]
 pub struct McpServerConfig {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub inherit_env: bool,
+}
+
+impl std::fmt::Debug for McpServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env_keys: Vec<&str> = self.env.iter().map(|(key, _)| key.as_str()).collect();
+        f.debug_struct("McpServerConfig")
+            .field("name", &self.name)
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field("env_keys", &env_keys)
+            .field("inherit_env", &self.inherit_env)
+            .finish()
+    }
 }
 
 /// tools/list가 돌려준 tool 하나 (§11.5 mcp_tools 행에 대응).
@@ -61,6 +76,8 @@ impl LocalMcpManager {
         let mut client = StdioClient::spawn(
             &config.command,
             &config.args,
+            &config.env,
+            config.inherit_env,
             &self.redaction,
             self.request_timeout,
         )
@@ -206,6 +223,8 @@ mod tests {
             name: "mock".to_owned(),
             command: "/bin/sh".to_owned(),
             args: vec!["-c".to_owned(), script.to_owned()],
+            env: Vec::new(),
+            inherit_env: true,
         }
     }
 
@@ -232,6 +251,14 @@ read -r _call
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"hello world"}],"isError":false}}'
 "#;
 
+    const ENV_SCRIPT: &str = r#"
+read -r _init
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"mock","version":"0.1"}}}'
+read -r _initialized
+read -r _list
+printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"%s","inputSchema":{"type":"object"}}]}}\n' "$DEPPY_MCP_SCOPED_TOOL"
+"#;
+
     #[test]
     fn call_tool_왕복() {
         let manager = manager();
@@ -243,6 +270,26 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text
             Some("hello world")
         );
         assert_eq!(result.get("isError").and_then(Value::as_bool), Some(false));
+    }
+
+    #[test]
+    fn scoped_env는_stdio_server에만_주입된다() {
+        let manager = manager();
+        let mut config = sh_config(ENV_SCRIPT);
+        config.inherit_env = false;
+        config.env = vec![(
+            "DEPPY_MCP_SCOPED_TOOL".to_owned(),
+            "scoped_env_tool".to_owned(),
+        )];
+
+        let tools = manager.discover_tools(&config).unwrap();
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "scoped_env_tool");
+        assert!(
+            !format!("{config:?}").contains("scoped_env_tool"),
+            "Debug must not expose env values"
+        );
     }
 
     #[test]

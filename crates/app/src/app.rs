@@ -185,6 +185,32 @@ impl ui::connectors::OAuthCredentialStore for AppOAuthCredentialStore<'_> {
     }
 }
 
+struct AppMcpScopedEnvResolver<'a> {
+    secret_store: &'a dyn secret::SecretStore,
+    redaction: &'a secret::RedactionService,
+}
+
+impl ui::connectors::McpScopedEnvResolver for AppMcpScopedEnvResolver<'_> {
+    fn resolve_mcp_env(
+        &self,
+        env_plain: &[(String, String)],
+        env_secrets: &[(String, String)],
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        mcp_store::validate_server_env_for_persistence(env_plain, env_secrets)?;
+        let mut env = env_plain.to_vec();
+        for (key, credential_id) in env_secrets {
+            let secret = self
+                .secret_store
+                .get_secret(credential_id)
+                .map_err(|e| anyhow::anyhow!("MCP env '{}' credential 조회 실패: {e:#}", key))?;
+            self.redaction.register(&secret);
+            self.redaction.register_json_fields(&secret);
+            env.push((key.clone(), secret.expose().to_owned()));
+        }
+        Ok(env)
+    }
+}
+
 /// 한 workspace의 런타임 상태 묶음 (워커-per-workspace §14.1 준비 — Stage A).
 /// 활성 workspace는 렌더되고, (후속) warm workspace는 이벤트만 드레인된다.
 struct WorkspaceRuntime {
@@ -1321,8 +1347,18 @@ impl eframe::App for App {
                 secret_store: &self.secret_store,
                 redaction: &self.redaction,
             };
-            self.connectors_ui
-                .show(ui.ctx(), &mut self.db, &self.active.id, &oauth_store, &text)
+            let mcp_env_resolver = AppMcpScopedEnvResolver {
+                secret_store: &self.secret_store,
+                redaction: &self.redaction,
+            };
+            self.connectors_ui.show(
+                ui.ctx(),
+                &mut self.db,
+                &self.active.id,
+                &oauth_store,
+                &mcp_env_resolver,
+                &text,
+            )
         };
         if credential_added {
             // OAuth로 credential이 추가됨 — 자격증명 창은 이번 프레임에 이미

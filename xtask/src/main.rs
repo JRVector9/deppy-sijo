@@ -19,7 +19,7 @@
 //!   현재 자동화 가능한 performance/backpressure smoke tests를 실행한다.
 //!
 //! `cargo run -p xtask -- i18n-check`
-//!   필수 locale key completeness, fallback, pseudo-locale smoke tests를 실행한다.
+//!   필수 locale key completeness, fallback, pseudo-locale, CJK path, layout smoke tests를 실행한다.
 //!
 //! Cargo.toml의 `path = "../<dir>"` 로컬 의존만 본다(외부 crate는 무관). crate 식별은
 //! 디렉터리명 기준(예: crates/core의 패키지명은 deppy-core지만 여기선 "core").
@@ -123,6 +123,18 @@ fn perf_smoke() -> anyhow::Result<()> {
 fn i18n_check() -> anyhow::Result<()> {
     run_cargo(&["test", "-p", "i18n"])?;
     run_cargo(&["test", "-p", "deppy-sijo", "locale_설정"])?;
+    run_cargo(&[
+        "test",
+        "-p",
+        "deppy-sijo",
+        "path_insert_paste_bytes_required_fixtures",
+    ])?;
+    run_cargo(&[
+        "test",
+        "-p",
+        "deppy-sijo",
+        "status_알림은_message_id를_저장한다",
+    ])?;
     println!("i18n-check OK");
     Ok(())
 }

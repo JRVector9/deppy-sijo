@@ -190,4 +190,79 @@ mod tests {
         assert!(value.starts_with('['));
         assert!(value.ends_with("!!]"));
     }
+
+    #[test]
+    fn layout_gate_core_ui_labels_fit_generous_budgets() {
+        let samples = [
+            ("top.settings", Vec::new(), 28),
+            ("top.credentials", Vec::new(), 32),
+            ("top.connectors", Vec::new(), 28),
+            ("top.environment", Vec::new(), 32),
+            ("top.notifications.unread", vec![("count", "999")], 36),
+            ("settings.file_tree_sidebar", Vec::new(), 48),
+            ("settings.output_batch_ms", Vec::new(), 56),
+            ("workspace.start_shell_prompt", Vec::new(), 56),
+            ("file_tree.insert_path_terminal", Vec::new(), 56),
+            (
+                "file_tree.permanent_delete_prompt",
+                vec![("name", "プロジェクト/設定文件.rs")],
+                96,
+            ),
+            (
+                "notification.session.needs_approval",
+                vec![("title", "프로젝트/설정파일.rs")],
+                80,
+            ),
+            (
+                "runtime.spawn_failed.agent_secret",
+                vec![("credential_id", "cred-設定"), ("error", "not found")],
+                120,
+            ),
+        ];
+        for locale in REQUIRED_LOCALES.iter().chain(OPTIONAL_LOCALES.iter()) {
+            let catalog = Catalog::load(locale).unwrap();
+            for (key, args, budget) in &samples {
+                let rendered = catalog.t(key, args);
+                assert!(!rendered.is_empty(), "{locale} {key} rendered empty");
+                assert!(
+                    !rendered.contains('{'),
+                    "{locale} {key} left an uninterpolated placeholder: {rendered}"
+                );
+                assert!(
+                    visual_width(&rendered) <= *budget,
+                    "{locale} {key} width {} > budget {budget}: {rendered}",
+                    visual_width(&rendered)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pseudo_locale_gate_expands_real_ui_keys() {
+        let fallback = Catalog::load(FALLBACK_LOCALE).unwrap();
+        let pseudo = Catalog::load(PSEUDO_LOCALE).unwrap();
+        for key in [
+            "top.settings",
+            "settings.file_tree_sidebar",
+            "workspace.start_shell_prompt",
+            "file_tree.insert_path_terminal",
+            "notification.session.done",
+        ] {
+            let args = [("title", "session")];
+            let base = fallback.t(key, &args);
+            let localized = pseudo.t(key, &args);
+            assert!(localized.starts_with('['), "{key}: {localized}");
+            assert!(localized.ends_with("!!]"), "{key}: {localized}");
+            assert!(
+                localized.chars().count() > base.chars().count(),
+                "{key}: pseudo locale should expand text"
+            );
+        }
+    }
+
+    fn visual_width(text: &str) -> usize {
+        text.chars()
+            .map(|ch| if ch.is_ascii() { 1 } else { 2 })
+            .sum()
+    }
 }

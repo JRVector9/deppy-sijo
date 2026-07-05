@@ -785,28 +785,40 @@ impl FileTreeUi {
                     action = Some(SidebarAction::NewShell);
                 }
             });
-            for entry in sessions {
-                let label = if entry.status.is_empty() {
-                    format!("▸ {}", entry.title)
-                } else {
-                    format!("{} {}", entry.status, entry.title)
-                };
-                let resp = ui.selectable_label(entry.focused, egui::RichText::new(label));
-                if !entry.summary.is_empty() {
-                    ui.indent(("session_summary", &entry.pane), |ui| {
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(&entry.summary).weak().small())
-                                .truncate(),
-                        );
-                    });
-                }
-                if resp.clicked() && !entry.focused {
-                    action = Some(SidebarAction::FocusSession {
-                        tab: entry.tab.clone(),
-                        pane: entry.pane.clone(),
-                    });
-                }
-            }
+            // 세션이 많으면 목록이 패널을 다 먹고 아래로 넘쳐 잘렸다 (2026-07-05 사용자
+            // 보고). 세션 목록은 패널 높이의 절반까지만 쓰고 그 안에서 스크롤, 나머지는
+            // 아래 파일 트리가 갖는다. auto_shrink[_, true]로 세션이 적으면 줄어든다.
+            let session_max_h = (ui.available_height() * 0.5).max(80.0);
+            egui::ScrollArea::vertical()
+                .id_salt("session_list_scroll")
+                .max_height(session_max_h)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for entry in sessions {
+                        let label = if entry.status.is_empty() {
+                            format!("▸ {}", entry.title)
+                        } else {
+                            format!("{} {}", entry.status, entry.title)
+                        };
+                        let resp = ui.selectable_label(entry.focused, egui::RichText::new(label));
+                        if !entry.summary.is_empty() {
+                            ui.indent(("session_summary", &entry.pane), |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&entry.summary).weak().small(),
+                                    )
+                                    .truncate(),
+                                );
+                            });
+                        }
+                        if resp.clicked() && !entry.focused {
+                            action = Some(SidebarAction::FocusSession {
+                                tab: entry.tab.clone(),
+                                pane: entry.pane.clone(),
+                            });
+                        }
+                    }
+                });
             ui.add_space(4.0);
             ui.separator();
         }

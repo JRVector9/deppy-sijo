@@ -208,7 +208,7 @@ impl WorkspaceUi {
                 }
             });
         }
-        ui.separator();
+        crate::ui::hairline(ui);
 
         let Some(mux) = self.mux.clone() else {
             ui.centered_and_justified(|ui| {
@@ -315,10 +315,17 @@ impl WorkspaceUi {
                 // 포커스된 pane 표시 — 상단 한 줄만 (전체 테두리는 시각적으로 과함,
                 // 2026-07-05 사용자 피드백)
                 if mux.focused_pane.as_ref() == Some(pane_id) {
-                    ui.painter().line_segment(
-                        [rect.left_top(), rect.right_top()],
-                        egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
+                    // 상단 2px 강조선 — 짝수 폭이라 픽셀 '경계'에 스냅해야 또렷하다
+                    // (round_to_pixel_center는 홀수 폭용). top을 device 픽셀 경계에 맞춘
+                    // rect_filled로 그린다 (경계 정렬 시 feathering 기여가 0).
+                    let painter = ui.painter();
+                    let ppp = painter.pixels_per_point();
+                    let top = (rect.top() * ppp).round() / ppp;
+                    let line = egui::Rect::from_min_max(
+                        egui::pos2(rect.left(), top),
+                        egui::pos2(rect.right(), top + 2.0),
                     );
+                    painter.rect_filled(line, 0.0, ui.visuals().selection.stroke.color);
                 }
             }
             LayoutNode::Split {

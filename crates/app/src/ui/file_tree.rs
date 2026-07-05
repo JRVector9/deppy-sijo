@@ -820,7 +820,7 @@ impl FileTreeUi {
                     }
                 });
             ui.add_space(4.0);
-            ui.separator();
+            crate::ui::hairline(ui);
         }
 
         // 헤더: 현재 루트 경로(~ 축약) + 새로고침/숨김 토글/접기 (§6). 헤더 전체가
@@ -869,7 +869,7 @@ impl FileTreeUi {
         if let (Some(payload), Some(root)) = (root_drop, self.root.clone()) {
             self.start_move((*payload).clone(), root);
         }
-        ui.separator();
+        crate::ui::hairline(ui);
 
         if self.root.is_none() {
             // path 미설정 (§9-2 backfill 강제 없음) — 트리 대신 안내

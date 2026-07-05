@@ -134,15 +134,114 @@ Verification:
 - `cargo tree --workspace --edges normal,build` - pass
 - `cargo tree --workspace --edges normal,build,dev` - pass
 
+## Second Build Wave
+
+### PR-B02a Pane Resource Guard
+Worker: `019f3045-607e-7922-99c8-f13226473393`
+
+Status: Complete
+
+Sources:
+- PR-R03
+
+Owned scope:
+- `crates/app/src/ui/workspace.rs`
+- `crates/runtime/src/remote.rs`
+- `crates/session/src/session.rs` only if needed
+- `docs/build/PR-B02a-summary.md`
+
+Acceptance criteria:
+- Hidden stale `Viewport` events do not rehydrate UI snapshot cache after a `MuxUpdated` makes their session invisible.
+- Remote server `last_sent` baselines are pruned by the visible set from `MuxUpdated`.
+- Remote client `recon` baselines are pruned by the visible set from `MuxUpdated`.
+- Active tab visible split panes continue to render; focused-only rendering is forbidden.
+
+Verification:
+- `cargo test -p deppy-sijo workspace` - pass
+- `cargo test -p runtime -p mux` - pass
+
+### PR-B03a Folder Tree Shell Quoting And Empty Root
+Worker: `019f3045-e80e-7372-ad03-5655f2fc27a2`
+
+Status: Complete
+
+Sources:
+- PR-R00
+- PR-R04
+
+Owned scope:
+- `crates/app/src/ui/file_tree.rs`
+- `crates/app/src/app.rs`
+- `docs/build/PR-B03a-summary.md`
+
+Acceptance criteria:
+- Shell-specific quoting helper covers POSIX, fish, PowerShell, and cmd.
+- Existing `shell_quote(path)` remains available for current call sites.
+- Empty workspace path does not silently expose Desktop as file tree root.
+- Terminal path insertion remains no-auto-Enter.
+
+Verification:
+- `cargo test -p deppy-sijo file_tree` - pass
+- `cargo test -p deppy-sijo workspace_path_to_tree_root` - pass
+- `cargo test -p deppy-sijo` - pass
+
+### PR-B05a Secret-like Env And Args Persistence Guard
+Worker: `019f3046-329c-7811-96c1-bb2506a26a42`
+
+Status: Complete
+
+Sources:
+- PR-R06
+
+Owned scope:
+- `crates/app/src/ui/env_profiles.rs`
+- `crates/app/src/ui/agents.rs`
+- `crates/app/src/ui/connectors.rs`
+- `crates/storage/src/db.rs`
+- `crates/mcp-store/src/lib.rs`
+- `docs/build/PR-B05a-summary.md`
+
+Acceptance criteria:
+- Secret-like env keys cannot be saved as `EnvValue::Plain` by default.
+- Secret-backed env values still save successfully.
+- Agent and MCP args with high-confidence secret-like payloads are rejected before SQLite persistence.
+- Rejected values do not appear in DB plain columns or args JSON.
+
+Verification:
+- `cargo test -p storage -p mcp-store` - pass
+- `cargo test -p deppy-sijo agents` - pass
+- `cargo test -p deppy-sijo connectors` - pass
+- `cargo test -p deppy-sijo` - pass
+
+## Second Wave Integrated Verification
+- `cargo fmt` - pass
+- `cargo check --workspace --all-targets` - pass
+- `cargo test --workspace --no-run` - pass
+- `cargo test -p deppy-sijo file_tree` - pass
+- `cargo test -p deppy-sijo workspace_path_to_tree_root` - pass
+- `cargo test -p deppy-sijo workspace` - pass
+- `cargo test -p runtime -p mux` - pass
+- `cargo test -p storage -p mcp-store` - pass
+- `cargo test -p deppy-sijo agents` - pass
+- `cargo test -p deppy-sijo connectors` - pass
+- `cargo test -p deppy-sijo` - pass
+- `cargo run -p xtask -- check-deps` - pass
+- `cargo tree --workspace --edges normal,build` - pass
+- `cargo tree --workspace --edges normal,build,dev` - pass
+- `git diff --check` - pass
+
 ## Deferred Build Waves
-- PR-B00 Boundary Hardening: wait until PR-B06a lands because Connector UI ownership overlaps.
-- PR-B03 Folder Tree Scalability & DnD Hardening: start after terminal paste/CJK and security audit changes are integrated.
-- PR-B04b Unified Paste/DnD Byte Helper: start after PR-B04a and PR-B03 quoting contract are known.
+- PR-B00 Boundary Hardening: ready for a focused follow-up now that PR-B06a and PR-B05a have landed.
+- PR-B03b Folder Tree Async Listing: ready for a focused follow-up now that PR-B03a quoting/root contract is integrated.
+- PR-B04b Unified Paste/DnD Byte Helper: ready for a focused follow-up now that PR-B04a and PR-B03a have landed.
 - PR-B11-B13 I18n: dedicated wave because it changes broad UI/runtime event contracts.
-- PR-B02 Pane Resource Guard: can run after current wave; it should not change the normalized visible-pane policy.
+- PR-B10 Output Pipeline Backpressure and PR-B15 SQLite batching: defer until pane/security/folder tree wave lands.
 
 ## Build PR Review Requests
 - PR-B06a: security review against PR-R06/PR-R07, including DB audit rows and logs.
 - PR-B04a: terminal/CJK review against PR-R05 and PR-R00 baseline.
 - PR-B08a: performance review against PR-R08, especially idle repaint and pending approval wake behavior.
 - PR-B01b: dependency review against PR-R02 and `xtask check-deps`.
+- PR-B02a: pane/resource review against PR-R03, especially hidden `Viewport` handling and split-pane visibility.
+- PR-B03a: folder tree/DnD review against PR-R04, especially shell quoting fixtures and empty root handling.
+- PR-B05a: security review against PR-R06, especially rejected secret-like env and args persistence.

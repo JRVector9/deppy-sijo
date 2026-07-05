@@ -186,6 +186,186 @@ pub struct AgentConfigRow {
     pub mcp_config_flag: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretLikeReason {
+    EnvKey,
+    EnvValue,
+    ArgFlag,
+    BearerToken,
+    DatabaseUrl,
+    TokenLiteral,
+}
+
+impl SecretLikeReason {
+    fn label(self) -> &'static str {
+        match self {
+            SecretLikeReason::EnvKey => "secret-like env key",
+            SecretLikeReason::EnvValue => "secret-like env value",
+            SecretLikeReason::ArgFlag => "secret-like command argument flag",
+            SecretLikeReason::BearerToken => "bearer token payload",
+            SecretLikeReason::DatabaseUrl => "database URL payload",
+            SecretLikeReason::TokenLiteral => "token-like payload",
+        }
+    }
+}
+
+fn secret_like_env_plain_reason(key: &str, value: &str) -> Option<SecretLikeReason> {
+    if secret_like_env_key(key) {
+        return Some(SecretLikeReason::EnvKey);
+    }
+    secret_like_value(value).map(|reason| match reason {
+        SecretLikeReason::DatabaseUrl => SecretLikeReason::DatabaseUrl,
+        SecretLikeReason::BearerToken => SecretLikeReason::BearerToken,
+        SecretLikeReason::TokenLiteral => SecretLikeReason::TokenLiteral,
+        _ => SecretLikeReason::EnvValue,
+    })
+}
+
+fn secret_like_env_key(key: &str) -> bool {
+    let key = normalize_identifier(key);
+    matches!(
+        key.as_str(),
+        "API_KEY"
+            | "TOKEN"
+            | "ACCESS_TOKEN"
+            | "REFRESH_TOKEN"
+            | "AUTH_TOKEN"
+            | "AUTHORIZATION"
+            | "DATABASE_URL"
+            | "DB_URL"
+            | "PASSWORD"
+            | "PASSWD"
+            | "SECRET"
+            | "SECRET_KEY"
+            | "CLIENT_SECRET"
+            | "PRIVATE_KEY"
+    ) || key.ends_with("_API_KEY")
+        || key.ends_with("_TOKEN")
+        || key.ends_with("_AUTHORIZATION")
+        || key.ends_with("_DATABASE_URL")
+        || key.ends_with("_DB_URL")
+        || key.ends_with("_PASSWORD")
+        || key.ends_with("_PASSWD")
+        || key.ends_with("_SECRET")
+        || key.ends_with("_SECRET_KEY")
+        || key.ends_with("_CLIENT_SECRET")
+        || key.ends_with("_PRIVATE_KEY")
+}
+
+fn normalize_identifier(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .map(|c| {
+            if c == '-' {
+                '_'
+            } else {
+                c.to_ascii_uppercase()
+            }
+        })
+        .collect()
+}
+
+fn validate_args_for_persistence(args: &[String], label: &str) -> anyhow::Result<()> {
+    if let Some(reason) = secret_like_args_reason(args) {
+        anyhow::bail!(
+            "{label}에 {}가 포함되어 저장을 거부합니다. secret은 credential/env binding으로 저장하세요",
+            reason.label()
+        );
+    }
+    Ok(())
+}
+
+fn secret_like_args_reason(args: &[String]) -> Option<SecretLikeReason> {
+    let joined = args.join(" ");
+    if contains_bearer_payload(&joined) {
+        return Some(SecretLikeReason::BearerToken);
+    }
+    if contains_database_url_payload(&joined) {
+        return Some(SecretLikeReason::DatabaseUrl);
+    }
+    for arg in args {
+        let trimmed = arg.trim();
+        if secret_like_arg_flag(trimmed) {
+            return Some(SecretLikeReason::ArgFlag);
+        }
+        if let Some(reason) = secret_like_value(trimmed) {
+            return Some(reason);
+        }
+    }
+    None
+}
+
+fn secret_like_arg_flag(arg: &str) -> bool {
+    const FLAGS: &[&str] = &[
+        "--api-key",
+        "--api_key",
+        "--token",
+        "--access-token",
+        "--access_token",
+        "--auth-token",
+        "--auth_token",
+        "--password",
+        "--secret",
+        "--client-secret",
+        "--client_secret",
+    ];
+    let lower = arg.to_ascii_lowercase();
+    FLAGS
+        .iter()
+        .any(|flag| lower == *flag || lower.starts_with(&format!("{flag}=")))
+}
+
+fn secret_like_value(value: &str) -> Option<SecretLikeReason> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if contains_bearer_payload(trimmed) {
+        return Some(SecretLikeReason::BearerToken);
+    }
+    if contains_database_url_payload(trimmed) || looks_like_database_url_with_password(trimmed) {
+        return Some(SecretLikeReason::DatabaseUrl);
+    }
+    if looks_like_token_literal(trimmed) {
+        return Some(SecretLikeReason::TokenLiteral);
+    }
+    None
+}
+
+fn contains_bearer_payload(value: &str) -> bool {
+    value.to_ascii_lowercase().contains("bearer ")
+}
+
+fn contains_database_url_payload(value: &str) -> bool {
+    value.to_ascii_uppercase().contains("DATABASE_URL=")
+}
+
+fn looks_like_database_url_with_password(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    ["postgres://", "postgresql://", "mysql://", "mariadb://"]
+        .iter()
+        .any(|scheme| {
+            lower.starts_with(scheme)
+                && value.contains('@')
+                && value
+                    .split_once("://")
+                    .and_then(|(_, rest)| rest.split('@').next())
+                    .is_some_and(|userinfo| userinfo.contains(':'))
+        })
+}
+
+fn looks_like_token_literal(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let len = value.chars().count();
+    len >= 12
+        && (lower.starts_with("sk-")
+            || lower.starts_with("ghp_")
+            || lower.starts_with("github_pat_")
+            || lower.starts_with("xoxb-")
+            || lower.starts_with("xoxp-"))
+}
+
 impl Db {
     /// DB 열기 + 마이그레이션. infra(PRAGMA/백업/IMMEDIATE 러너)는 storage-core가 담당하고
     /// (v2.8 §6.1), 이 crate는 **마이그레이션 원장(MIGRATIONS, v1..vN 순서 불변)** 조립과
@@ -543,6 +723,7 @@ impl Db {
         key: &str,
         value: &EnvValue,
     ) -> anyhow::Result<()> {
+        Self::validate_env_var_for_persistence(key, value)?;
         let (kind, plain_value, credential_id) = match value {
             EnvValue::Plain(v) => ("plain", Some(v.as_str()), None),
             EnvValue::Secret { credential_id } => ("secret", None, Some(credential_id.as_str())),
@@ -600,6 +781,19 @@ impl Db {
         Ok(())
     }
 
+    pub fn validate_env_var_for_persistence(key: &str, value: &EnvValue) -> anyhow::Result<()> {
+        if let EnvValue::Plain(plain) = value
+            && let Some(reason) = secret_like_env_plain_reason(key, plain)
+        {
+            anyhow::bail!(
+                "{} '{}'는 EnvValue::Plain으로 저장할 수 없습니다. credential secret으로 저장하세요",
+                reason.label(),
+                key
+            );
+        }
+        Ok(())
+    }
+
     /// agent config 등록 (설계문서 PR-09/12). args는 array로만 저장한다 (완료 기준).
     #[allow(clippy::too_many_arguments)]
     pub fn insert_agent_config(
@@ -615,6 +809,7 @@ impl Db {
         mcp_proxy_server_id: Option<&str>,
         mcp_config_flag: Option<&str>,
     ) -> anyhow::Result<String> {
+        Self::validate_agent_args_for_persistence(args)?;
         let id = uuid::Uuid::new_v4().to_string();
         let args_json = serde_json::to_string(args)?;
         // 빈 문자열은 None으로 정규화 (mcp_proxy_server_id와 동일 관례 — stale/빈값 저장 방지)
@@ -644,6 +839,10 @@ impl Db {
             )
             .with_context(|| format!("agent config 저장 실패: {name}"))?;
         Ok(id)
+    }
+
+    pub fn validate_agent_args_for_persistence(args: &[String]) -> anyhow::Result<()> {
+        validate_args_for_persistence(args, "agent args")
     }
 
     pub fn list_agent_configs(&self) -> anyhow::Result<Vec<AgentConfigRow>> {
@@ -1147,6 +1346,78 @@ mod tests {
     }
 
     #[test]
+    fn secret_like_env_key는_plain_저장을_거부하고_secret은_허용한다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.ensure_default_workspace().unwrap();
+        let profile = db.insert_env_profile(&ws, "로컬", "local").unwrap();
+        db.insert_credential(&sample("cred-api")).unwrap();
+
+        for key in ["API_KEY", "DATABASE_URL", "AUTHORIZATION", "AUTH_TOKEN"] {
+            let err = db
+                .upsert_env_var(
+                    &profile,
+                    key,
+                    &EnvValue::Plain(format!("sk-live-env-secret-never-persisted-{key}")),
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("EnvValue::Plain"));
+            let count: i64 = db
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM env_vars WHERE profile_id = ?1 AND key = ?2",
+                    (&profile, key),
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{key} should not be persisted as plain");
+        }
+
+        db.upsert_env_var(
+            &profile,
+            "API_KEY",
+            &EnvValue::Secret {
+                credential_id: "cred-api".into(),
+            },
+        )
+        .unwrap();
+        let (kind, plain_value, credential_id): (String, Option<String>, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT kind, plain_value, credential_id FROM env_vars
+                 WHERE profile_id = ?1 AND key = 'API_KEY'",
+                [&profile],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "secret");
+        assert_eq!(plain_value, None);
+        assert_eq!(credential_id.as_deref(), Some("cred-api"));
+    }
+
+    #[test]
+    fn secret_like_env_value는_plain_value에_남지_않는다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.ensure_default_workspace().unwrap();
+        let profile = db.insert_env_profile(&ws, "로컬", "local").unwrap();
+        let secret = "Authorization: Bearer sk-env-value-never-persisted";
+
+        assert!(
+            db.upsert_env_var(&profile, "SAFE_NAME", &EnvValue::Plain(secret.into()))
+                .is_err()
+        );
+        let plain_values: Vec<String> = db
+            .conn
+            .prepare("SELECT plain_value FROM env_vars")
+            .unwrap()
+            .query_map([], |row| row.get::<_, Option<String>>(0))
+            .unwrap()
+            .map(|v| v.unwrap().unwrap_or_default())
+            .collect();
+        assert!(plain_values.iter().all(|v| !v.contains("sk-env-value")));
+    }
+
+    #[test]
     fn env_var가_참조하는_credential은_삭제_거부() {
         let db = Db::open_in_memory().unwrap();
         let ws = db.ensure_default_workspace().unwrap();
@@ -1234,6 +1505,40 @@ mod tests {
         assert_eq!(listed[0].mcp_config_flag, None);
         db.delete_agent_config(&id).unwrap();
         assert!(db.list_agent_configs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_args_secret_like_payload는_args_json에_저장되지_않는다() {
+        let db = Db::open_in_memory().unwrap();
+        let secret = "sk-agent-plaintext-never-persisted";
+        let args = vec!["--api-key".to_owned(), secret.to_owned()];
+
+        assert!(
+            db.insert_agent_config(
+                "위험 에이전트",
+                "agent",
+                &args,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            )
+            .is_err()
+        );
+
+        let rows: Vec<String> = db
+            .conn
+            .prepare("SELECT args_json FROM agent_configs")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(rows.is_empty());
+        assert!(rows.iter().all(|json| !json.contains(secret)));
     }
 
     #[test]

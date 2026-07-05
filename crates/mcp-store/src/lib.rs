@@ -311,7 +311,128 @@ pub struct McpToolRow {
     pub schema_hash: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretLikeArgsReason {
+    ArgFlag,
+    BearerToken,
+    DatabaseUrl,
+    TokenLiteral,
+}
+
+impl SecretLikeArgsReason {
+    fn label(self) -> &'static str {
+        match self {
+            SecretLikeArgsReason::ArgFlag => "secret-like command argument flag",
+            SecretLikeArgsReason::BearerToken => "bearer token payload",
+            SecretLikeArgsReason::DatabaseUrl => "database URL payload",
+            SecretLikeArgsReason::TokenLiteral => "token-like payload",
+        }
+    }
+}
+
+pub fn validate_server_args_for_persistence(args: &[String]) -> anyhow::Result<()> {
+    if let Some(reason) = secret_like_args_reason(args) {
+        anyhow::bail!(
+            "MCP server args에 {}가 포함되어 저장을 거부합니다. secret은 credential/env binding으로 저장하세요",
+            reason.label()
+        );
+    }
+    Ok(())
+}
+
+fn secret_like_args_reason(args: &[String]) -> Option<SecretLikeArgsReason> {
+    let joined = args.join(" ");
+    if contains_bearer_payload(&joined) {
+        return Some(SecretLikeArgsReason::BearerToken);
+    }
+    if contains_database_url_payload(&joined) {
+        return Some(SecretLikeArgsReason::DatabaseUrl);
+    }
+    for arg in args {
+        let trimmed = arg.trim();
+        if secret_like_arg_flag(trimmed) {
+            return Some(SecretLikeArgsReason::ArgFlag);
+        }
+        if let Some(reason) = secret_like_value(trimmed) {
+            return Some(reason);
+        }
+    }
+    None
+}
+
+fn secret_like_arg_flag(arg: &str) -> bool {
+    const FLAGS: &[&str] = &[
+        "--api-key",
+        "--api_key",
+        "--token",
+        "--access-token",
+        "--access_token",
+        "--auth-token",
+        "--auth_token",
+        "--password",
+        "--secret",
+        "--client-secret",
+        "--client_secret",
+    ];
+    let lower = arg.to_ascii_lowercase();
+    FLAGS
+        .iter()
+        .any(|flag| lower == *flag || lower.starts_with(&format!("{flag}=")))
+}
+
+fn secret_like_value(value: &str) -> Option<SecretLikeArgsReason> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if contains_bearer_payload(trimmed) {
+        return Some(SecretLikeArgsReason::BearerToken);
+    }
+    if contains_database_url_payload(trimmed) || looks_like_database_url_with_password(trimmed) {
+        return Some(SecretLikeArgsReason::DatabaseUrl);
+    }
+    if looks_like_token_literal(trimmed) {
+        return Some(SecretLikeArgsReason::TokenLiteral);
+    }
+    None
+}
+
+fn contains_bearer_payload(value: &str) -> bool {
+    value.to_ascii_lowercase().contains("bearer ")
+}
+
+fn contains_database_url_payload(value: &str) -> bool {
+    value.to_ascii_uppercase().contains("DATABASE_URL=")
+}
+
+fn looks_like_database_url_with_password(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    ["postgres://", "postgresql://", "mysql://", "mariadb://"]
+        .iter()
+        .any(|scheme| {
+            lower.starts_with(scheme)
+                && value.contains('@')
+                && value
+                    .split_once("://")
+                    .and_then(|(_, rest)| rest.split('@').next())
+                    .is_some_and(|userinfo| userinfo.contains(':'))
+        })
+}
+
+fn looks_like_token_literal(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let len = value.chars().count();
+    len >= 12
+        && (lower.starts_with("sk-")
+            || lower.starts_with("ghp_")
+            || lower.starts_with("github_pat_")
+            || lower.starts_with("xoxb-")
+            || lower.starts_with("xoxp-"))
+}
+
 pub fn insert_server(conn: &Connection, row: &McpServerRow) -> anyhow::Result<()> {
+    validate_server_args_for_persistence(&row.args)
+        .with_context(|| format!("mcp_server args validation 실패: {}", row.name))?;
     let args_json = serde_json::to_string(&row.args)?;
     conn.execute(
         "INSERT INTO mcp_servers (id, name, kind, command, args_json, url, enabled, created_at, updated_at)
@@ -463,6 +584,41 @@ mod tests {
         let server = sample_server();
         insert_server(&conn, &server).unwrap();
         assert_eq!(list_servers(&conn).unwrap(), vec![server]);
+    }
+
+    #[test]
+    fn server_args_secret_like_payload는_args_json에_저장되지_않는다() {
+        let conn = test_conn();
+        let secret = "sk-mcp-plaintext-never-persisted";
+        let mut server = sample_server();
+        server.args = vec!["--token".to_owned(), secret.to_owned()];
+
+        assert!(insert_server(&conn, &server).is_err());
+        let rows: Vec<String> = conn
+            .prepare("SELECT args_json FROM mcp_servers")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(rows.is_empty());
+        assert!(rows.iter().all(|json| !json.contains(secret)));
+    }
+
+    #[test]
+    fn server_args_database_url_assignment은_거부된다() {
+        let conn = test_conn();
+        let mut server = sample_server();
+        server.args = vec![
+            "DATABASE_URL=postgres://user:pass@localhost/app".to_owned(),
+            "--safe".to_owned(),
+        ];
+
+        assert!(insert_server(&conn, &server).is_err());
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM mcp_servers", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

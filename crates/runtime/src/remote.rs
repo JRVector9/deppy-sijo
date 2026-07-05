@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use deppy_core::SessionId;
+use mux::MuxSnapshot;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
 use rustls::{DigitallySignedStruct, SignatureScheme};
@@ -713,6 +714,7 @@ fn serve_connection(
             // Plain 접속에서는 사용되지 않는다(viewport도 encode_event 경로).
             let mut last_sent: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> =
                 HashMap::new();
+            let mut visible_sessions: Option<HashSet<SessionId>> = None;
             loop {
                 if pump_stop.load(Ordering::SeqCst) || pump_done.load(Ordering::SeqCst) {
                     break;
@@ -739,6 +741,7 @@ fn serve_connection(
                         codec,
                         &mut last_sent,
                         &mut exited_this_batch,
+                        &mut visible_sessions,
                         &event,
                     ) {
                         Ok(payload) => payload,
@@ -869,6 +872,7 @@ fn serve_connection_tls(
     // Phase 2: 명령/이벤트 루프. last_sent/keyframe_requests는 이 스레드 단독 소유(락 불필요).
     let receiver = backend.subscribe();
     let mut last_sent: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> = HashMap::new();
+    let mut visible_sessions: Option<HashSet<SessionId>> = None;
     let mut keyframe_requests: Vec<SessionId> = Vec::new();
     let mut out: VecDeque<Vec<u8>> = VecDeque::new();
     let mut last_activity = Instant::now();
@@ -945,7 +949,13 @@ fn serve_connection_tls(
             }
             let mut exited_this_batch: HashSet<SessionId> = HashSet::new();
             for event in receiver.drain() {
-                match encode_pump_frame(codec, &mut last_sent, &mut exited_this_batch, &event) {
+                match encode_pump_frame(
+                    codec,
+                    &mut last_sent,
+                    &mut exited_this_batch,
+                    &mut visible_sessions,
+                    &event,
+                ) {
                     Ok(payload) => out.push_back(payload),
                     Err(e) => tracing::warn!("remote event 직렬화 실패: {e}"),
                 }
@@ -1073,13 +1083,24 @@ fn tls_server_handshake(
 /// 누적되지 않게 (codex P2). 이미 종료된 세션의 trailing Viewport(같은 drain 배치)는
 /// keyframe/delta가 아니라 plain full(`WireMsg::Event`)로 보내 baseline을 되살리지 않는다 —
 /// 최종 출력은 여전히 클라 slot에 전달된다.
+///
+/// `MuxUpdated`는 active tab visible session set을 연결 상태로 갱신하고, set 밖 baseline을
+/// 즉시 prune한다. 같은 drain 배치에서 뒤따르는 hidden `Viewport`도 plain full로만 보내
+/// `last_sent`가 hidden snapshot Arc를 다시 잡지 않게 한다.
 fn encode_pump_frame(
     codec: Codec,
     last_sent: &mut HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)>,
     exited_this_batch: &mut HashSet<SessionId>,
+    visible_sessions: &mut Option<HashSet<SessionId>>,
     event: &RuntimeEvent,
 ) -> anyhow::Result<Vec<u8>> {
     match (codec, event) {
+        (Codec::Delta, RuntimeEvent::MuxUpdated { snapshot }) => {
+            let visible = visible_session_set(snapshot);
+            last_sent.retain(|session, _| visible.contains(session));
+            *visible_sessions = Some(visible);
+            codec.encode_event(event)
+        }
         (
             Codec::Delta,
             RuntimeEvent::Viewport {
@@ -1088,8 +1109,12 @@ fn encode_pump_frame(
                 bracketed_paste,
             },
         ) => {
-            if exited_this_batch.contains(session) {
-                // 이 배치에서 이미 종료된 세션 — baseline을 만들지 않고 전체 스냅샷을 그대로.
+            if exited_this_batch.contains(session)
+                || visible_sessions
+                    .as_ref()
+                    .is_some_and(|visible| !visible.contains(session))
+            {
+                // 종료됐거나 현재 active tab 밖인 세션 — baseline을 만들지 않고 전체 스냅샷을 그대로.
                 codec.encode_event(event)
             } else {
                 encode_viewport_frame(last_sent, *session, snapshot, *bracketed_paste)
@@ -1102,6 +1127,17 @@ fn encode_pump_frame(
         }
         _ => codec.encode_event(event),
     }
+}
+
+fn visible_session_set(snapshot: &MuxSnapshot) -> HashSet<SessionId> {
+    snapshot
+        .active_tab
+        .as_ref()
+        .and_then(|active| snapshot.tabs.iter().find(|tab| &tab.id == active))
+        .into_iter()
+        .flat_map(|tab| &tab.panes)
+        .filter_map(|pane| pane.session_id)
+        .collect()
 }
 
 /// Delta 접속에서 세션 viewport를 last_sent 대비 keyframe/delta로 인코딩하고 baseline을
@@ -1690,9 +1726,17 @@ fn reconstruct_and_dispatch(
             }
             // 종료된 세션의 재구성 상태를 정리한다 — 장기 연결에서 baseline Arc/pending이
             // 누적되지 않게 (codex P2). Viewport slot은 receiver.drain()이 프레임마다 비운다.
-            if let RuntimeEvent::SessionExited { session, .. } = &event {
-                recon.remove(session);
-                pending_keyframe.remove(session);
+            match &event {
+                RuntimeEvent::SessionExited { session, .. } => {
+                    recon.remove(session);
+                    pending_keyframe.remove(session);
+                }
+                RuntimeEvent::MuxUpdated { snapshot } => {
+                    let visible = visible_session_set(snapshot);
+                    recon.retain(|session, _| visible.contains(session));
+                    pending_keyframe.retain(|session| visible.contains(session));
+                }
+                _ => {}
             }
             dispatch(subscribers, event);
             cont
@@ -2500,6 +2544,30 @@ mod tests {
         })
     }
 
+    fn mux_snapshot(active: &str, tabs: &[(&str, SessionId)]) -> Arc<MuxSnapshot> {
+        Arc::new(MuxSnapshot {
+            tabs: tabs
+                .iter()
+                .map(|(tab, session)| {
+                    let tab_id = deppy_core::MuxTabId((*tab).to_owned());
+                    let pane_id = deppy_core::MuxPaneId(format!("pane-{tab}"));
+                    mux::TabSnapshot {
+                        id: tab_id,
+                        title: (*tab).to_owned(),
+                        layout: crate::LayoutNode::Pane(pane_id.clone()),
+                        panes: vec![mux::PaneSnapshot {
+                            id: pane_id,
+                            session_id: Some(*session),
+                            title: format!("pane-{tab}"),
+                        }],
+                    }
+                })
+                .collect(),
+            active_tab: Some(deppy_core::MuxTabId(active.to_owned())),
+            focused_pane: None,
+        })
+    }
+
     /// 네트워크 없이 서버 encode(last_sent) → 클라이언트 reconstruct(recon) 파이프라인을 돈다.
     /// round_trip은 매 tick의 재구성된 전체 스냅샷을 돌려준다 — source와 == 여야 한다(§4.8).
     struct DeltaPipe {
@@ -2892,12 +2960,127 @@ mod tests {
             exit_code: Some(0),
         };
         let mut exited = HashSet::new();
-        encode_pump_frame(Codec::Delta, &mut last_sent, &mut exited, &exit).unwrap();
+        let mut visible = None;
+        encode_pump_frame(
+            Codec::Delta,
+            &mut last_sent,
+            &mut exited,
+            &mut visible,
+            &exit,
+        )
+        .unwrap();
         assert!(
             !last_sent.contains_key(&s),
             "SessionExited가 서버 baseline을 정리한다"
         );
         assert!(exited.contains(&s), "종료 세션이 배치 집합에 등록된다");
+    }
+
+    /// MuxUpdated(active_tab=B)는 서버 delta baseline을 visible set으로 prune하고,
+    /// 같은 drain 배치의 hidden Viewport(A)가 last_sent를 되살리지 않는다.
+    #[test]
+    fn muxupdated는_서버_last_sent를_visible_set으로_prune() {
+        let hidden = SessionId(21);
+        let visible_session = SessionId(22);
+        let hidden_snap = make_snapshot(10, 3, &["hidden"], false);
+        let visible_snap = make_snapshot(10, 3, &["visible"], false);
+        let mut last_sent: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> =
+            HashMap::new();
+        encode_viewport_frame(&mut last_sent, hidden, &hidden_snap, false).unwrap();
+        encode_viewport_frame(&mut last_sent, visible_session, &visible_snap, false).unwrap();
+        assert!(last_sent.contains_key(&hidden));
+        assert!(last_sent.contains_key(&visible_session));
+
+        let mux = RuntimeEvent::MuxUpdated {
+            snapshot: mux_snapshot("b", &[("a", hidden), ("b", visible_session)]),
+        };
+        let mut exited = HashSet::new();
+        let mut visible = None;
+        encode_pump_frame(
+            Codec::Delta,
+            &mut last_sent,
+            &mut exited,
+            &mut visible,
+            &mux,
+        )
+        .unwrap();
+        assert!(
+            !last_sent.contains_key(&hidden),
+            "active tab 밖 session baseline은 MuxUpdated에서 제거돼야 한다"
+        );
+        assert!(
+            last_sent.contains_key(&visible_session),
+            "active tab visible session baseline은 유지돼야 한다"
+        );
+
+        let stale = RuntimeEvent::Viewport {
+            session: hidden,
+            snapshot: Arc::clone(&hidden_snap),
+            bracketed_paste: false,
+        };
+        let frame = encode_pump_frame(
+            Codec::Delta,
+            &mut last_sent,
+            &mut exited,
+            &mut visible,
+            &stale,
+        )
+        .unwrap();
+        assert!(
+            !last_sent.contains_key(&hidden),
+            "MuxUpdated 뒤 hidden Viewport가 서버 baseline을 되살리면 안 된다"
+        );
+        assert!(
+            matches!(
+                Codec::Delta.decode_event(&frame).unwrap(),
+                DecodedEvent::Event(RuntimeEvent::Viewport { session, .. }) if session == hidden
+            ),
+            "hidden trailing Viewport는 delta baseline 없이 plain Event로만 나가야 한다"
+        );
+    }
+
+    /// MuxUpdated(active_tab=B)는 클라이언트 recon/pending baseline도 visible set으로 prune한다.
+    #[test]
+    fn muxupdated는_클라_recon을_visible_set으로_prune() {
+        let hidden = SessionId(31);
+        let visible_session = SessionId(32);
+        let subscribers: Arc<Mutex<Vec<RemoteSubscriber>>> = Arc::default();
+        let mut recon: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> = HashMap::new();
+        recon.insert(hidden, (0, make_snapshot(10, 3, &["hidden"], false)));
+        recon.insert(
+            visible_session,
+            (0, make_snapshot(10, 3, &["visible"], false)),
+        );
+        let mut pending = HashSet::new();
+        pending.insert(hidden);
+        pending.insert(visible_session);
+
+        let outcome = reconstruct_and_dispatch(
+            DecodedEvent::Event(RuntimeEvent::MuxUpdated {
+                snapshot: mux_snapshot("b", &[("a", hidden), ("b", visible_session)]),
+            }),
+            &subscribers,
+            &mut recon,
+            &mut pending,
+        );
+
+        assert!(!outcome.disconnect);
+        assert!(
+            !recon.contains_key(&hidden),
+            "active tab 밖 session recon baseline은 제거돼야 한다"
+        );
+        assert!(
+            recon.contains_key(&visible_session),
+            "active tab visible session recon baseline은 유지돼야 한다"
+        );
+        assert!(
+            !pending.contains(&hidden),
+            "hidden pending keyframe도 정리한다"
+        );
+        assert!(
+            pending.contains(&visible_session),
+            "visible pending keyframe은 유지한다"
+        );
     }
 
     /// 같은 drain 배치의 [SessionExited(X), Viewport(X)]에서 trailing viewport가 종료 세션의
@@ -2924,10 +3107,23 @@ mod tests {
             snapshot: Arc::clone(&final_snap),
             bracketed_paste: false,
         };
-        let exit_frame =
-            encode_pump_frame(Codec::Delta, &mut last_sent, &mut exited, &exit_ev).unwrap();
-        let vp_frame =
-            encode_pump_frame(Codec::Delta, &mut last_sent, &mut exited, &vp_ev).unwrap();
+        let mut visible = None;
+        let exit_frame = encode_pump_frame(
+            Codec::Delta,
+            &mut last_sent,
+            &mut exited,
+            &mut visible,
+            &exit_ev,
+        )
+        .unwrap();
+        let vp_frame = encode_pump_frame(
+            Codec::Delta,
+            &mut last_sent,
+            &mut exited,
+            &mut visible,
+            &vp_ev,
+        )
+        .unwrap();
 
         // 서버: 종료 세션 baseline이 되살아나지 않는다.
         assert!(

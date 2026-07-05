@@ -1080,17 +1080,87 @@ fn apply_new_folder(parent: &Path, name: &str) -> Result<PathBuf, String> {
     }
 }
 
-/// 터미널 삽입용 최소 셸 인용: 안전 문자만이면 그대로, 아니면 작은따옴표 감싸기.
+/// 터미널 경로 삽입 대상 셸 계열. 세션별 셸 metadata 배선은 후속 PR 범위이므로,
+/// 현재 call site는 `shell_quote`/`shell_path_insert_bytes` 기본 wrapper를 쓴다.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellKind {
+    /// POSIX sh/bash/zsh 계열 single-quote escaping.
+    Posix,
+    /// fish single-quote escaping.
+    Fish,
+    /// PowerShell single-quote escaping.
+    PowerShell,
+    /// cmd.exe double-quote grouping.
+    Cmd,
+}
+
+/// 터미널 삽입용 기본 셸 인용. 기존 call site는 shell kind를 모르므로 POSIX 동작을
+/// 유지한다. 세션 shell metadata가 생기면 `shell_quote_for`로 분기한다.
 pub fn shell_quote(path: &Path) -> String {
+    shell_quote_for(path, ShellKind::Posix)
+}
+
+/// 터미널 경로 삽입용 byte payload: quoted path + trailing space, no Enter.
+pub fn shell_path_insert_bytes(path: &Path) -> Vec<u8> {
+    shell_path_insert_bytes_for(path, ShellKind::Posix)
+}
+
+/// shell-specific 터미널 경로 삽입용 byte payload: quoted path + trailing space, no Enter.
+pub fn shell_path_insert_bytes_for(path: &Path, shell: ShellKind) -> Vec<u8> {
+    let mut bytes = shell_quote_for(path, shell).into_bytes();
+    bytes.push(b' ');
+    bytes
+}
+
+/// shell-specific 터미널 삽입용 최소 셸 인용.
+pub fn shell_quote_for(path: &Path, shell: ShellKind) -> String {
     let s = path.display().to_string();
-    let safe = !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || "/._-~".contains(c));
-    if safe {
-        s
+    match shell {
+        ShellKind::Posix => quote_posix(&s),
+        ShellKind::Fish => quote_fish(&s),
+        ShellKind::PowerShell => quote_powershell(&s),
+        ShellKind::Cmd => quote_cmd(&s),
+    }
+}
+
+fn quote_posix(s: &str) -> String {
+    if shell_safe(s, "/._-~") {
+        s.to_owned()
     } else {
         format!("'{}'", s.replace('\'', r"'\''"))
     }
+}
+
+fn quote_fish(s: &str) -> String {
+    if shell_safe(s, "/._-~") {
+        s.to_owned()
+    } else {
+        let escaped = s.replace('\\', r"\\").replace('\'', r"\'");
+        format!("'{escaped}'")
+    }
+}
+
+fn quote_powershell(s: &str) -> String {
+    if shell_safe(s, r"/._-~:\") {
+        s.to_owned()
+    } else {
+        format!("'{}'", s.replace('\'', "''"))
+    }
+}
+
+fn quote_cmd(s: &str) -> String {
+    if shell_safe(s, r"/._-~:\") {
+        s.to_owned()
+    } else {
+        format!("\"{}\"", s.replace('"', r#"\""#))
+    }
+}
+
+fn shell_safe(s: &str, extra_safe: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || extra_safe.contains(c))
 }
 
 /// 이동 계획 (§9-4 가드 통과 결과).
@@ -1627,6 +1697,203 @@ mod tests {
         assert_eq!(shell_quote(Path::new("/한글/경로")), "'/한글/경로'");
         // 작은따옴표 이스케이프
         assert_eq!(shell_quote(Path::new("/a/it's")), r"'/a/it'\''s'");
+    }
+
+    #[test]
+    fn shell_quote_for_shell별_table() {
+        let cases = [
+            (
+                "posix/bash/zsh spaces",
+                ShellKind::Posix,
+                "/tmp/My File.txt",
+                "'/tmp/My File.txt'",
+            ),
+            (
+                "posix/bash/zsh single quote",
+                ShellKind::Posix,
+                "/tmp/Bob's File.txt",
+                r"'/tmp/Bob'\''s File.txt'",
+            ),
+            (
+                "posix/bash/zsh backslash drive colon",
+                ShellKind::Posix,
+                r"C:\Users\me\file.txt",
+                r"'C:\Users\me\file.txt'",
+            ),
+            (
+                "posix/bash/zsh Japanese",
+                ShellKind::Posix,
+                "/tmp/プロジェクト/設定.rs",
+                "'/tmp/プロジェクト/設定.rs'",
+            ),
+            (
+                "posix/bash/zsh Chinese",
+                ShellKind::Posix,
+                "/tmp/项目/配置.rs",
+                "'/tmp/项目/配置.rs'",
+            ),
+            (
+                "posix/bash/zsh Korean",
+                ShellKind::Posix,
+                "/tmp/프로젝트/설정.rs",
+                "'/tmp/프로젝트/설정.rs'",
+            ),
+            (
+                "posix/bash/zsh emoji",
+                ShellKind::Posix,
+                "/tmp/project/🚀-deploy/config.json",
+                "'/tmp/project/🚀-deploy/config.json'",
+            ),
+            (
+                "fish spaces",
+                ShellKind::Fish,
+                "/tmp/My File.txt",
+                "'/tmp/My File.txt'",
+            ),
+            (
+                "fish single quote",
+                ShellKind::Fish,
+                "/tmp/Bob's File.txt",
+                r"'/tmp/Bob\'s File.txt'",
+            ),
+            (
+                "fish backslash drive colon",
+                ShellKind::Fish,
+                r"C:\Users\me\file.txt",
+                r"'C:\\Users\\me\\file.txt'",
+            ),
+            (
+                "fish Japanese",
+                ShellKind::Fish,
+                "/tmp/プロジェクト/設定.rs",
+                "'/tmp/プロジェクト/設定.rs'",
+            ),
+            (
+                "fish Chinese",
+                ShellKind::Fish,
+                "/tmp/项目/配置.rs",
+                "'/tmp/项目/配置.rs'",
+            ),
+            (
+                "fish Korean",
+                ShellKind::Fish,
+                "/tmp/프로젝트/설정.rs",
+                "'/tmp/프로젝트/설정.rs'",
+            ),
+            (
+                "fish emoji",
+                ShellKind::Fish,
+                "/tmp/project/🚀-deploy/config.json",
+                "'/tmp/project/🚀-deploy/config.json'",
+            ),
+            (
+                "PowerShell spaces",
+                ShellKind::PowerShell,
+                r"C:\Users\me\My File.txt",
+                r"'C:\Users\me\My File.txt'",
+            ),
+            (
+                "PowerShell single quote",
+                ShellKind::PowerShell,
+                r"C:\Users\me\Bob's File.txt",
+                r"'C:\Users\me\Bob''s File.txt'",
+            ),
+            (
+                "PowerShell backslash drive colon",
+                ShellKind::PowerShell,
+                r"C:\Users\me\file.txt",
+                r"C:\Users\me\file.txt",
+            ),
+            (
+                "PowerShell Japanese",
+                ShellKind::PowerShell,
+                r"C:\work\プロジェクト\設定.rs",
+                r"'C:\work\プロジェクト\設定.rs'",
+            ),
+            (
+                "PowerShell Chinese",
+                ShellKind::PowerShell,
+                r"C:\work\项目\配置.rs",
+                r"'C:\work\项目\配置.rs'",
+            ),
+            (
+                "PowerShell Korean",
+                ShellKind::PowerShell,
+                r"C:\work\프로젝트\설정.rs",
+                r"'C:\work\프로젝트\설정.rs'",
+            ),
+            (
+                "PowerShell emoji",
+                ShellKind::PowerShell,
+                r"C:\work\project\🚀-deploy\config.json",
+                r"'C:\work\project\🚀-deploy\config.json'",
+            ),
+            (
+                "cmd spaces",
+                ShellKind::Cmd,
+                r"C:\Users\me\My File.txt",
+                r#""C:\Users\me\My File.txt""#,
+            ),
+            (
+                "cmd single quote",
+                ShellKind::Cmd,
+                r"C:\Users\me\Bob's File.txt",
+                r#""C:\Users\me\Bob's File.txt""#,
+            ),
+            (
+                "cmd backslash drive colon",
+                ShellKind::Cmd,
+                r"C:\Users\me\file.txt",
+                r"C:\Users\me\file.txt",
+            ),
+            (
+                "cmd Japanese",
+                ShellKind::Cmd,
+                r"C:\work\プロジェクト\設定.rs",
+                r#""C:\work\プロジェクト\設定.rs""#,
+            ),
+            (
+                "cmd Chinese",
+                ShellKind::Cmd,
+                r"C:\work\项目\配置.rs",
+                r#""C:\work\项目\配置.rs""#,
+            ),
+            (
+                "cmd Korean",
+                ShellKind::Cmd,
+                r"C:\work\프로젝트\설정.rs",
+                r#""C:\work\프로젝트\설정.rs""#,
+            ),
+            (
+                "cmd emoji",
+                ShellKind::Cmd,
+                r"C:\work\project\🚀-deploy\config.json",
+                r#""C:\work\project\🚀-deploy\config.json""#,
+            ),
+        ];
+
+        for (name, shell, path, expected) in cases {
+            assert_eq!(shell_quote_for(Path::new(path), shell), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn shell_path_insert_bytes는_trailing_space만_붙이고_enter는_넣지_않는다() {
+        for shell in [
+            ShellKind::Posix,
+            ShellKind::Fish,
+            ShellKind::PowerShell,
+            ShellKind::Cmd,
+        ] {
+            let bytes = shell_path_insert_bytes_for(Path::new("/tmp/Bob's File.txt"), shell);
+            assert_eq!(bytes.last(), Some(&b' '), "{shell:?}");
+            assert!(!bytes[..bytes.len() - 1].contains(&b'\n'), "{shell:?}");
+            assert!(!bytes[..bytes.len() - 1].contains(&b'\r'), "{shell:?}");
+        }
+        assert_eq!(
+            shell_path_insert_bytes(Path::new("/a/b_c-d.txt")),
+            b"/a/b_c-d.txt ".to_vec()
+        );
     }
 
     #[test]

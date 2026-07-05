@@ -236,6 +236,7 @@ impl EnvProfilesUi {
             } else {
                 EnvValue::Plain(self.var_plain_value.clone())
             };
+            Db::validate_env_var_for_persistence(self.var_key.trim(), &value)?;
             db.upsert_env_var(&profile_id, self.var_key.trim(), &value)?;
             self.var_key.clear();
             self.var_plain_value.clear();

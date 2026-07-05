@@ -1,8 +1,8 @@
 //! 워크스페이스 뷰 (설계문서 PR-10): tab bar + split pane 렌더.
 //! Runtime Boundary(2장) 준수 — 명령 전송/이벤트 수신/스냅샷 렌더만.
-//! mux 배치는 MuxUpdated 스냅샷이 유일한 근거, active pane만 live render (14.4).
+//! mux 배치는 MuxUpdated 스냅샷이 유일한 근거, active tab visible pane만 live render (14.4).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use runtime::{
@@ -40,7 +40,7 @@ pub struct WorkspaceUi {
     error: Option<String>,
 }
 
-/// 세션별 화면 캐시. 비활성 pane은 마지막 스냅샷을 정적으로 표시한다.
+/// 세션별 화면 캐시. hidden tab 세션의 스냅샷은 `MuxUpdated`에서 버린다.
 #[derive(Default)]
 struct SessionView {
     snapshot: Option<Arc<TerminalViewportSnapshot>>,
@@ -75,24 +75,13 @@ impl WorkspaceUi {
             match event {
                 RuntimeEvent::MuxUpdated { snapshot } => {
                     // 사라진 세션의 캐시 정리
-                    let alive: Vec<SessionId> = snapshot
-                        .tabs
-                        .iter()
-                        .flat_map(|tab| &tab.panes)
-                        .filter_map(|pane| pane.session_id)
-                        .collect();
+                    let alive = mux_sessions(snapshot);
                     self.sessions.retain(|id, _| alive.contains(id));
                     self.sent_sizes.retain(|id, _| alive.contains(id));
                     // hidden(active tab 밖) 세션의 마지막 스냅샷은 버린다 —
                     // §14.4 hidden render cache drop. tab 복귀 시 worker가
                     // 전환 즉시 push하므로(emit_mux_and_watched) 공백은 짧다 (codex 리뷰)
-                    let visible: Vec<SessionId> = snapshot
-                        .tabs
-                        .iter()
-                        .filter(|tab| Some(&tab.id) == snapshot.active_tab.as_ref())
-                        .flat_map(|tab| &tab.panes)
-                        .filter_map(|pane| pane.session_id)
-                        .collect();
+                    let visible = visible_mux_sessions(snapshot);
                     for (id, view) in self.sessions.iter_mut() {
                         if !visible.contains(id) {
                             view.snapshot = None;
@@ -113,9 +102,9 @@ impl WorkspaceUi {
                     snapshot,
                     bracketed_paste,
                 } => {
-                    // pane 제거 후 도착한 stale Viewport가 캐시를 되살리면
-                    // any_running이 영구 repaint를 유발한다 — mux에 살아있는 세션만
-                    if self.session_alive(*session) {
+                    // hidden 전환 뒤 도착한 stale Viewport가 캐시를 되살리지 않도록
+                    // 현재 active tab의 visible 세션만 snapshot을 저장한다.
+                    if self.session_visible(*session) {
                         if self.selection.is_some_and(|(s, _, _)| s == *session) {
                             self.selection = None; // 화면이 갱신되면 선택은 무효
                         }
@@ -791,6 +780,19 @@ impl WorkspaceUi {
         })
     }
 
+    fn session_visible(&self, session: SessionId) -> bool {
+        self.mux.as_ref().is_some_and(|mux| {
+            mux.active_tab
+                .as_ref()
+                .and_then(|active| mux.tabs.iter().find(|tab| &tab.id == active))
+                .is_some_and(|tab| {
+                    tab.panes
+                        .iter()
+                        .any(|pane| pane.session_id == Some(session))
+                })
+        })
+    }
+
     fn send(&mut self, client: &dyn RuntimeClient, command: RuntimeCommand) {
         let is_spawn = matches!(
             command,
@@ -828,6 +830,26 @@ fn last_line_summary(snapshot: &TerminalViewportSnapshot) -> String {
     String::new()
 }
 
+fn mux_sessions(snapshot: &MuxSnapshot) -> HashSet<SessionId> {
+    snapshot
+        .tabs
+        .iter()
+        .flat_map(|tab| &tab.panes)
+        .filter_map(|pane| pane.session_id)
+        .collect()
+}
+
+fn visible_mux_sessions(snapshot: &MuxSnapshot) -> HashSet<SessionId> {
+    snapshot
+        .active_tab
+        .as_ref()
+        .and_then(|active| snapshot.tabs.iter().find(|tab| &tab.id == active))
+        .into_iter()
+        .flat_map(|tab| &tab.panes)
+        .filter_map(|pane| pane.session_id)
+        .collect()
+}
+
 fn status_icon(status: SessionStatus) -> &'static str {
     match status {
         SessionStatus::Running => "",
@@ -835,5 +857,162 @@ fn status_icon(status: SessionStatus) -> &'static str {
         SessionStatus::NeedsApproval => "✋",
         SessionStatus::Error => "❌",
         SessionStatus::Done => "✅",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use runtime::{MuxPaneId, MuxTabId, PaneSnapshot, TabSnapshot};
+    use terminal::{CursorShape, CursorSnapshot, TerminalCell};
+
+    fn pane_id(name: &str) -> MuxPaneId {
+        MuxPaneId(name.to_owned())
+    }
+
+    fn tab_id(name: &str) -> MuxTabId {
+        MuxTabId(name.to_owned())
+    }
+
+    fn pane(id: &str, session: SessionId) -> PaneSnapshot {
+        PaneSnapshot {
+            id: pane_id(id),
+            session_id: Some(session),
+            title: id.to_owned(),
+        }
+    }
+
+    fn tab(id: &str, panes: Vec<PaneSnapshot>, layout: LayoutNode) -> TabSnapshot {
+        TabSnapshot {
+            id: tab_id(id),
+            title: id.to_owned(),
+            layout,
+            panes,
+        }
+    }
+
+    fn mux(active: &str, tabs: Vec<TabSnapshot>, focused: &str) -> Arc<MuxSnapshot> {
+        Arc::new(MuxSnapshot {
+            tabs,
+            active_tab: Some(tab_id(active)),
+            focused_pane: Some(pane_id(focused)),
+        })
+    }
+
+    fn snapshot(text: &str) -> Arc<TerminalViewportSnapshot> {
+        let cols = 12;
+        let rows = 2;
+        let mut cells = Vec::with_capacity(cols * rows);
+        let chars: Vec<char> = text.chars().collect();
+        for idx in 0..cols * rows {
+            cells.push(TerminalCell {
+                c: chars.get(idx).copied().unwrap_or(' '),
+                fg: [255, 255, 255],
+                bg: [0, 0, 0],
+                wide: false,
+                wide_spacer: false,
+            });
+        }
+        Arc::new(TerminalViewportSnapshot {
+            cols: cols as u16,
+            rows: rows as u16,
+            cursor: CursorSnapshot {
+                col: 0,
+                row: 0,
+                shape: CursorShape::Block,
+                visible: true,
+            },
+            visible_cells: cells.into(),
+            dirty_ranges: Vec::new(),
+            title: None,
+            scroll_offset: 0,
+            is_alt_screen: false,
+        })
+    }
+
+    #[test]
+    fn muxupdated_뒤_hidden_viewport는_snapshot을_되살리지_않는다() {
+        let hidden = SessionId(1);
+        let visible = SessionId(2);
+        let mut ui = WorkspaceUi::new();
+
+        let tab_a = tab(
+            "a",
+            vec![pane("pa", hidden)],
+            LayoutNode::Pane(pane_id("pa")),
+        );
+        let tab_b = tab(
+            "b",
+            vec![pane("pb", visible)],
+            LayoutNode::Pane(pane_id("pb")),
+        );
+
+        ui.handle_events(&[
+            RuntimeEvent::MuxUpdated {
+                snapshot: mux("a", vec![tab_a.clone(), tab_b.clone()], "pa"),
+            },
+            RuntimeEvent::Viewport {
+                session: hidden,
+                snapshot: snapshot("old visible"),
+                bracketed_paste: false,
+            },
+        ]);
+        assert!(ui.sessions.get(&hidden).unwrap().snapshot.is_some());
+
+        ui.handle_events(&[
+            RuntimeEvent::MuxUpdated {
+                snapshot: mux("b", vec![tab_a, tab_b], "pb"),
+            },
+            RuntimeEvent::Viewport {
+                session: hidden,
+                snapshot: snapshot("stale hidden"),
+                bracketed_paste: false,
+            },
+        ]);
+
+        assert!(
+            ui.sessions
+                .get(&hidden)
+                .is_none_or(|view| view.snapshot.is_none()),
+            "hidden tab의 stale Viewport가 UI snapshot cache를 되살리면 안 된다"
+        );
+    }
+
+    #[test]
+    fn active_tab_split의_visible_pane들은_viewport를_받는다() {
+        let left = SessionId(10);
+        let right = SessionId(11);
+        let mut ui = WorkspaceUi::new();
+        let split = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(LayoutNode::Pane(pane_id("left"))),
+            second: Box::new(LayoutNode::Pane(pane_id("right"))),
+        };
+        let active = tab(
+            "active",
+            vec![pane("left", left), pane("right", right)],
+            split,
+        );
+
+        ui.handle_events(&[
+            RuntimeEvent::MuxUpdated {
+                snapshot: mux("active", vec![active], "left"),
+            },
+            RuntimeEvent::Viewport {
+                session: left,
+                snapshot: snapshot("left"),
+                bracketed_paste: false,
+            },
+            RuntimeEvent::Viewport {
+                session: right,
+                snapshot: snapshot("right"),
+                bracketed_paste: true,
+            },
+        ]);
+
+        assert!(ui.sessions.get(&left).unwrap().snapshot.is_some());
+        assert!(ui.sessions.get(&right).unwrap().snapshot.is_some());
+        assert!(ui.sessions.get(&right).unwrap().bracketed_paste);
     }
 }

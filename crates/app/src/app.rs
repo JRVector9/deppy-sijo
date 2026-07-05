@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use runtime::{InProcessRuntimeClient, RuntimeCommandSink, RuntimeEventReceiver};
 
@@ -566,17 +566,16 @@ impl App {
     /// 활성 workspace의 트리 루트 (path 미설정/조회 실패 → None → 안내 표시 §9-2).
     fn active_tree_root(&self) -> Option<PathBuf> {
         match self.db.workspace_path(&self.active.id) {
-            Ok(Some(path)) if !path.trim().is_empty() => Some(PathBuf::from(path)),
-            // 경로 미설정이면 데스크톱을 기본 루트로 보여준다 (2026-07-05 사용자 요청 —
-            // 빈 안내 화면 대신 바로 쓸 수 있는 트리). workspace 경로를 저장하면 그쪽 우선.
-            Ok(_) => directories::UserDirs::new()
-                .and_then(|d| d.desktop_dir().map(Path::to_path_buf))
-                .filter(|p| p.is_dir()),
+            Ok(path) => Self::workspace_path_to_tree_root(path),
             Err(e) => {
                 tracing::warn!("workspace 경로 조회 실패: {e:#}");
                 None
             }
         }
+    }
+
+    fn workspace_path_to_tree_root(path: Option<String>) -> Option<PathBuf> {
+        path.and_then(|path| (!path.trim().is_empty()).then(|| PathBuf::from(path)))
     }
 
     /// 활성 workspace 기준으로 파일 트리 상태를 새로 만든다 (ON 전환/루트 변경 시).
@@ -1022,7 +1021,7 @@ impl eframe::App for App {
                     });
                     match session {
                         Some(session) => {
-                            let bytes = ui::file_tree::shell_quote(&path).into_bytes();
+                            let bytes = ui::file_tree::shell_path_insert_bytes(&path);
                             if let Err(e) = self.active.runtime.send_command(
                                 runtime::RuntimeCommand::WriteInput { session, bytes },
                             ) {
@@ -1386,6 +1385,20 @@ mod tests {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(sqlite_sidecar(path, "-wal"));
         let _ = std::fs::remove_file(sqlite_sidecar(path, "-shm"));
+    }
+
+    #[test]
+    fn workspace_path_to_tree_root는_빈_경로를_desktop_fallback하지_않는다() {
+        assert_eq!(App::workspace_path_to_tree_root(None), None);
+        assert_eq!(App::workspace_path_to_tree_root(Some(String::new())), None);
+        assert_eq!(
+            App::workspace_path_to_tree_root(Some("   \t ".to_owned())),
+            None
+        );
+        assert_eq!(
+            App::workspace_path_to_tree_root(Some(" /tmp/project ".to_owned())),
+            Some(PathBuf::from(" /tmp/project "))
+        );
     }
 
     #[test]

@@ -412,7 +412,11 @@ impl ConnectorsUi {
             ui.horizontal(|ui| {
                 ui.strong(&server.name);
                 let command = server.command.as_deref().unwrap_or("");
-                ui.weak(format!("{} {}", command, server.args.join(" ")));
+                ui.weak(format!(
+                    "{} {}",
+                    command,
+                    mcp_args_for_display(&server.args)
+                ));
             });
             ui.horizontal(|ui| {
                 match self.status.get(&server.id) {
@@ -818,6 +822,10 @@ impl ConnectorsUi {
             .filter(|line| !line.is_empty())
             .map(str::to_owned)
             .collect();
+        if let Err(e) = mcp_store::validate_server_args_for_persistence(&args) {
+            self.error = Some(format!("추가 실패: {e:#}"));
+            return;
+        }
         let row = McpServerRow {
             id: uuid::Uuid::new_v4().to_string(),
             name: name.to_owned(),
@@ -837,6 +845,14 @@ impl ConnectorsUi {
             }
             Err(e) => self.error = Some(format!("추가 실패: {e:#}")),
         }
+    }
+}
+
+fn mcp_args_for_display(args: &[String]) -> String {
+    if mcp_store::validate_server_args_for_persistence(args).is_err() {
+        "[REDACTED_ARGS]".to_owned()
+    } else {
+        args.join(" ")
     }
 }
 
@@ -951,6 +967,20 @@ mod tests {
         );
         assert_eq!(rows[0].server_id, "srv-1");
         assert_eq!(rows[0].trust_level, "unknown");
+    }
+
+    #[test]
+    fn mcp_args_display는_secret_like_payload를_숨긴다() {
+        let rendered = mcp_args_for_display(&[
+            "-H".to_owned(),
+            "Authorization: Bearer sk-ui-mcp-secret-never-rendered".to_owned(),
+        ]);
+        assert_eq!(rendered, "[REDACTED_ARGS]");
+        assert!(!rendered.contains("sk-ui-mcp-secret"));
+        assert_eq!(
+            mcp_args_for_display(&["-y".to_owned(), "server-filesystem".to_owned()]),
+            "-y server-filesystem"
+        );
     }
 
     #[test]

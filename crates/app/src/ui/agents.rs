@@ -190,7 +190,7 @@ impl AgentsUi {
                     "{} — {} {}",
                     config.name,
                     config.command,
-                    config.args.join(" ")
+                    agent_args_for_display(&config.args)
                 ));
                 if ui.button("실행").clicked() {
                     run_config = Some(config.clone());
@@ -326,6 +326,10 @@ impl AgentsUi {
                 .filter(|line| !line.is_empty())
                 .map(str::to_owned)
                 .collect();
+            if let Err(e) = Db::validate_agent_args_for_persistence(&args) {
+                self.error = Some(format!("{e:#}"));
+                return;
+            }
             let opt = |s: &str| {
                 let t = s.trim();
                 (!t.is_empty()).then(|| t.to_owned())
@@ -469,6 +473,14 @@ impl AgentsUi {
     }
 }
 
+fn agent_args_for_display(args: &[String]) -> String {
+    if Db::validate_agent_args_for_persistence(args).is_err() {
+        "[REDACTED_ARGS]".to_owned()
+    } else {
+        args.join(" ")
+    }
+}
+
 /// MCP config 주입 플래그 유효성 검사 (순수 함수로 분리해 단위 테스트 가능하게).
 /// 비었으면 Ok(None) — 기본 `--mcp-config`를 쓴다. 값이 있으면 앞뒤 공백을 trim한 뒤
 /// 반드시 `-`로 시작해야 Ok(Some(...)); 아니면 힌트 문자열을 담은 Err.
@@ -571,6 +583,20 @@ mod tests {
         // '-'로 시작하지 않으면 거부
         assert!(validate_mcp_config_flag("mcp-config").is_err());
         assert!(validate_mcp_config_flag("config=path").is_err());
+    }
+
+    #[test]
+    fn agent_args_display는_secret_like_payload를_숨긴다() {
+        let rendered = agent_args_for_display(&[
+            "--api-key".to_owned(),
+            "sk-ui-agent-secret-never-rendered".to_owned(),
+        ]);
+        assert_eq!(rendered, "[REDACTED_ARGS]");
+        assert!(!rendered.contains("sk-ui-agent-secret"));
+        assert_eq!(
+            agent_args_for_display(&["build".to_owned(), "--release".to_owned()]),
+            "build --release"
+        );
     }
 
     #[test]

@@ -57,7 +57,7 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 | PR-U03 DB Migration & Store Repository Gate | Gate command complete | Current wave | `cargo run -p xtask -- smoke-db-migrations` added and passed. Store-specific repository coverage remains incremental. |
 | PR-U04 Pane & Mux Resource Guard | Complete for high findings | PR-B02a | Hidden stale viewport and remote baselines pruned by visible session set. |
 | PR-U05 Folder Tree Scalability & DnD Hardening | Partial complete | PR-B03a, PR-B03b | Shell quoting, empty root, async/chunk listing done. Ignore matcher and watcher storm handling pending under PR-U16. |
-| PR-U06 Terminal Clipboard / Paste / DnD Hardening | Partial complete | PR-B04b | Shared paste bytes and bracketed path insertion done. Clipboard failure abstraction and terminal internal DnD contract remain backlog. |
+| PR-U06 Terminal Clipboard / Paste / DnD Hardening | Complete for current findings | PR-B04b, PR-U06b | Shared paste bytes, bracketed path insertion, and terminal selected-text DnD contract are implemented. Clipboard failure abstraction remains deferred. |
 | PR-U07 CJK / IME / Unicode Terminal QA | Complete for selection fixtures | PR-B04a, PR-B04b | Wide-char selection normalization and required paste/DnD fixture coverage added. IME smoke remains a release gate concern. |
 | PR-U08 Redaction Pipeline Hardening | Complete for high findings | PR-B05a, PR-B05a review fix | Secret-like env/args persistence guards strengthened. Manual Debug redaction remains backlog. |
 | PR-U09 Project Env Safety & Production Guard | Complete for current findings | PR-B05a, PR-U09b | Plain secret-like env blocked. Production profile agent runs now require confirmation before `SpawnAgent`. |
@@ -83,7 +83,7 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 
 - Full PR-U20 Scenario A-E measurements remain pending in Phase D.
 - PR-U12 child process tree aggregation and PR-U18 runtime/app hot-path write wiring remain follow-up.
-- Code triage classifies PR-U05b, PR-U06b, PR-U10b, and PR-U20b as the
+- Code triage classifies PR-U05b, PR-U10b, and PR-U20b as the
   next implementable backlog candidates.
 
 ## Deferred / Backlog Items
@@ -91,7 +91,6 @@ implemented items, and continue with the remaining Build/Hardening/Gate PRs only
 - Full store crate split beyond the v2.8 accepted DAG is deferred unless a new cycle appears.
 - Clipboard failure UI abstraction is deferred unless a concrete platform failure
   mode or product requirement appears.
-- Terminal internal selected-text DnD contract is implementable as PR-U06b.
 - Manual `Debug` redaction for all sensitive runtime/config rows.
 - MCP proxy schema hash reapproval is covered for the current per-session proxy
   architecture; scoped MCP env injection remains implementable as PR-U10b.

@@ -518,6 +518,9 @@ impl WorkspaceUi {
             if pane_resp
                 .dnd_hover_payload::<std::path::PathBuf>()
                 .is_some()
+                || pane_resp
+                    .dnd_hover_payload::<TerminalTextDragPayload>()
+                    .is_some()
             {
                 ui.painter().rect_stroke(
                     pane_rect,
@@ -526,16 +529,22 @@ impl WorkspaceUi {
                     egui::StrokeKind::Inside,
                 );
             }
-            if let (Some(session), Some(path)) = (
-                pane.session_id,
-                pane_resp.dnd_release_payload::<std::path::PathBuf>(),
-            ) {
-                let bytes = path_insert_paste_bytes(
-                    &path,
-                    self.session_shell_kind(session),
-                    self.session_bracketed_paste(session),
-                );
-                self.send(client, RuntimeCommand::WriteInput { session, bytes });
+            if let Some(session) = pane.session_id {
+                if let Some(path) = pane_resp.dnd_release_payload::<std::path::PathBuf>() {
+                    let bytes = path_insert_paste_bytes(
+                        &path,
+                        self.session_shell_kind(session),
+                        self.session_bracketed_paste(session),
+                    );
+                    self.send(client, RuntimeCommand::WriteInput { session, bytes });
+                }
+                if let Some(text) = pane_resp.dnd_release_payload::<TerminalTextDragPayload>() {
+                    let bytes = terminal_text_paste_bytes(
+                        &text.text,
+                        self.session_bracketed_paste(session),
+                    );
+                    self.send(client, RuntimeCommand::WriteInput { session, bytes });
+                }
             }
         }
         let Some(session) = pane.session_id else {
@@ -587,8 +596,8 @@ impl WorkspaceUi {
             )
         };
 
-        // 마우스 드래그 = 셀 선택 (2026-07-05 복사 지원). 파일트리 드래그(dnd payload)
-        // 중에는 선택을 시작하지 않는다.
+        // 선택된 텍스트 위에서 시작한 드래그는 terminal-internal DnD payload가 된다.
+        // 그 외의 마우스 드래그는 기존 셀 선택 동작을 유지한다.
         if !egui::DragAndDrop::has_any_payload(ui.ctx()) {
             let cell_at = |pos: egui::Pos2| -> usize {
                 let col = ((pos.x - output.origin.x) / output.cell_size.x)
@@ -605,7 +614,18 @@ impl WorkspaceUi {
                 && let Some(pos) = output.response.interact_pointer_pos()
             {
                 let idx = cell_at(pos);
-                self.selection = Some((session, idx, idx));
+                if let Some((start, end)) = selection_range
+                    && selection_range_contains(start, end, idx)
+                {
+                    let text = renderer_egui::selection_text(&snapshot, start, end);
+                    if !text.is_empty() {
+                        output
+                            .response
+                            .dnd_set_drag_payload(TerminalTextDragPayload { text });
+                    }
+                } else {
+                    self.selection = Some((session, idx, idx));
+                }
             } else if output.response.dragged()
                 && let Some(pos) = output.response.interact_pointer_pos()
                 && let Some((s, anchor, _)) = self.selection
@@ -645,6 +665,21 @@ impl WorkspaceUi {
         // hover 테두리는 위 pane 배경 경로가 pane_rect에 그린다.
         if let Some(path) = output.response.dnd_release_payload::<std::path::PathBuf>() {
             let bytes = path_insert_paste_bytes(&path, self.session_shell_kind(session), bracketed);
+            self.send(client, RuntimeCommand::WriteInput { session, bytes });
+            if !focused {
+                self.send(
+                    client,
+                    RuntimeCommand::FocusPane {
+                        pane: pane_id.clone(),
+                    },
+                );
+            }
+        }
+        if let Some(text) = output
+            .response
+            .dnd_release_payload::<TerminalTextDragPayload>()
+        {
+            let bytes = terminal_text_paste_bytes(&text.text, bracketed);
             self.send(client, RuntimeCommand::WriteInput { session, bytes });
             if !focused {
                 self.send(
@@ -883,6 +918,19 @@ pub(crate) fn path_insert_paste_bytes(
 ) -> Vec<u8> {
     let raw = crate::ui::file_tree::shell_path_insert_bytes_for(path, shell_kind);
     input_mapper::paste_bytes(&raw, bracketed_paste)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalTextDragPayload {
+    text: String,
+}
+
+fn selection_range_contains(start: usize, end: usize, idx: usize) -> bool {
+    start <= idx && idx <= end
+}
+
+fn terminal_text_paste_bytes(text: &str, bracketed_paste: bool) -> Vec<u8> {
+    input_mapper::paste_bytes(text.as_bytes(), bracketed_paste)
 }
 
 /// 상태 → tab 제목 아이콘 (PR-12).
@@ -1150,5 +1198,40 @@ mod tests {
                 assert!(!inner.contains(&b'\r'), "{fixture} {shell:?}");
             }
         }
+    }
+
+    #[test]
+    fn terminal_text_dnd_paste는_raw_text를_보존한다() {
+        let fixtures = [
+            "src/main.rs",
+            "プロジェクト/設定ファイル.rs",
+            "项目/配置文件.rs",
+            "專案/設定檔.rs",
+            "프로젝트/설정파일.rs",
+            "project/🚀-deploy/config.json",
+            "line one\nline two",
+        ];
+
+        for fixture in fixtures {
+            assert_eq!(
+                terminal_text_paste_bytes(fixture, false),
+                fixture.as_bytes(),
+                "{fixture}"
+            );
+            let wrapped = terminal_text_paste_bytes(fixture, true);
+            assert!(wrapped.starts_with(b"\x1b[200~"), "{fixture}");
+            assert!(wrapped.ends_with(b"\x1b[201~"), "{fixture}");
+            let inner = &wrapped[b"\x1b[200~".len()..wrapped.len() - b"\x1b[201~".len()];
+            assert_eq!(inner, fixture.as_bytes(), "{fixture}");
+        }
+    }
+
+    #[test]
+    fn terminal_text_dnd는_선택범위_내부에서만_시작한다() {
+        assert!(selection_range_contains(3, 7, 3));
+        assert!(selection_range_contains(3, 7, 5));
+        assert!(selection_range_contains(3, 7, 7));
+        assert!(!selection_range_contains(3, 7, 2));
+        assert!(!selection_range_contains(3, 7, 8));
     }
 }

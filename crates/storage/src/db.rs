@@ -289,6 +289,9 @@ fn secret_like_args_reason(args: &[String]) -> Option<SecretLikeReason> {
         if secret_like_arg_flag(trimmed) {
             return Some(SecretLikeReason::ArgFlag);
         }
+        if let Some(reason) = secret_like_assignment(trimmed) {
+            return Some(reason);
+        }
         if let Some(reason) = secret_like_value(trimmed) {
             return Some(reason);
         }
@@ -311,9 +314,32 @@ fn secret_like_arg_flag(arg: &str) -> bool {
         "--client_secret",
     ];
     let lower = arg.to_ascii_lowercase();
-    FLAGS
-        .iter()
-        .any(|flag| lower == *flag || lower.starts_with(&format!("{flag}=")))
+    FLAGS.iter().any(|flag| {
+        lower == *flag
+            || lower.starts_with(&format!("{flag}="))
+            || lower.starts_with(&format!("{flag} "))
+    })
+}
+
+fn secret_like_assignment(arg: &str) -> Option<SecretLikeReason> {
+    let (key, value) = arg.split_once('=')?;
+    let key = key.trim().trim_start_matches('-');
+    let value = value.trim();
+    if key.is_empty() || value.is_empty() {
+        return None;
+    }
+    if secret_like_env_key(key) {
+        let key = normalize_identifier(key);
+        if key == "DATABASE_URL"
+            || key == "DB_URL"
+            || key.ends_with("_DATABASE_URL")
+            || key.ends_with("_DB_URL")
+        {
+            return Some(SecretLikeReason::DatabaseUrl);
+        }
+        return Some(SecretLikeReason::ArgFlag);
+    }
+    secret_like_value(value)
 }
 
 fn secret_like_value(value: &str) -> Option<SecretLikeReason> {
@@ -330,7 +356,21 @@ fn secret_like_value(value: &str) -> Option<SecretLikeReason> {
     if looks_like_token_literal(trimmed) {
         return Some(SecretLikeReason::TokenLiteral);
     }
+    for token in secret_like_tokens(trimmed) {
+        if looks_like_database_url_with_password(token) {
+            return Some(SecretLikeReason::DatabaseUrl);
+        }
+        if looks_like_token_literal(token) {
+            return Some(SecretLikeReason::TokenLiteral);
+        }
+    }
     None
+}
+
+fn secret_like_tokens(value: &str) -> impl Iterator<Item = &str> {
+    value
+        .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';'))
+        .filter(|token| !token.is_empty())
 }
 
 fn contains_bearer_payload(value: &str) -> bool {
@@ -1539,6 +1579,41 @@ mod tests {
             .unwrap();
         assert!(rows.is_empty());
         assert!(rows.iter().all(|json| !json.contains(secret)));
+    }
+
+    #[test]
+    fn agent_args_한줄_secret_flag와_database_url_flag를_거부한다() {
+        let db = Db::open_in_memory().unwrap();
+        let cases = [
+            "--api-key sk-agent-inline-never-persisted",
+            "--database-url=postgres://user:pass@localhost/app",
+            "OPENAI_API_KEY=sk-agent-assignment-never-persisted",
+        ];
+
+        for (idx, arg) in cases.iter().enumerate() {
+            assert!(
+                db.insert_agent_config(
+                    &format!("위험 에이전트 {idx}"),
+                    "agent",
+                    &[arg.to_string()],
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                )
+                .is_err(),
+                "{arg}"
+            );
+        }
+
+        let count: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM agent_configs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

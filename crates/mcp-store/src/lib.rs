@@ -353,6 +353,9 @@ fn secret_like_args_reason(args: &[String]) -> Option<SecretLikeArgsReason> {
         if secret_like_arg_flag(trimmed) {
             return Some(SecretLikeArgsReason::ArgFlag);
         }
+        if let Some(reason) = secret_like_assignment(trimmed) {
+            return Some(reason);
+        }
         if let Some(reason) = secret_like_value(trimmed) {
             return Some(reason);
         }
@@ -375,9 +378,32 @@ fn secret_like_arg_flag(arg: &str) -> bool {
         "--client_secret",
     ];
     let lower = arg.to_ascii_lowercase();
-    FLAGS
-        .iter()
-        .any(|flag| lower == *flag || lower.starts_with(&format!("{flag}=")))
+    FLAGS.iter().any(|flag| {
+        lower == *flag
+            || lower.starts_with(&format!("{flag}="))
+            || lower.starts_with(&format!("{flag} "))
+    })
+}
+
+fn secret_like_assignment(arg: &str) -> Option<SecretLikeArgsReason> {
+    let (key, value) = arg.split_once('=')?;
+    let key = key.trim().trim_start_matches('-');
+    let value = value.trim();
+    if key.is_empty() || value.is_empty() {
+        return None;
+    }
+    if secret_like_arg_key(key) {
+        let key = normalize_identifier(key);
+        if key == "DATABASE_URL"
+            || key == "DB_URL"
+            || key.ends_with("_DATABASE_URL")
+            || key.ends_with("_DB_URL")
+        {
+            return Some(SecretLikeArgsReason::DatabaseUrl);
+        }
+        return Some(SecretLikeArgsReason::ArgFlag);
+    }
+    secret_like_value(value)
 }
 
 fn secret_like_value(value: &str) -> Option<SecretLikeArgsReason> {
@@ -394,7 +420,66 @@ fn secret_like_value(value: &str) -> Option<SecretLikeArgsReason> {
     if looks_like_token_literal(trimmed) {
         return Some(SecretLikeArgsReason::TokenLiteral);
     }
+    for token in secret_like_tokens(trimmed) {
+        if looks_like_database_url_with_password(token) {
+            return Some(SecretLikeArgsReason::DatabaseUrl);
+        }
+        if looks_like_token_literal(token) {
+            return Some(SecretLikeArgsReason::TokenLiteral);
+        }
+    }
     None
+}
+
+fn secret_like_tokens(value: &str) -> impl Iterator<Item = &str> {
+    value
+        .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';'))
+        .filter(|token| !token.is_empty())
+}
+
+fn secret_like_arg_key(key: &str) -> bool {
+    let key = normalize_identifier(key);
+    matches!(
+        key.as_str(),
+        "API_KEY"
+            | "TOKEN"
+            | "ACCESS_TOKEN"
+            | "REFRESH_TOKEN"
+            | "AUTH_TOKEN"
+            | "AUTHORIZATION"
+            | "DATABASE_URL"
+            | "DB_URL"
+            | "PASSWORD"
+            | "PASSWD"
+            | "SECRET"
+            | "SECRET_KEY"
+            | "CLIENT_SECRET"
+            | "PRIVATE_KEY"
+    ) || key.ends_with("_API_KEY")
+        || key.ends_with("_TOKEN")
+        || key.ends_with("_AUTHORIZATION")
+        || key.ends_with("_DATABASE_URL")
+        || key.ends_with("_DB_URL")
+        || key.ends_with("_PASSWORD")
+        || key.ends_with("_PASSWD")
+        || key.ends_with("_SECRET")
+        || key.ends_with("_SECRET_KEY")
+        || key.ends_with("_CLIENT_SECRET")
+        || key.ends_with("_PRIVATE_KEY")
+}
+
+fn normalize_identifier(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .map(|c| {
+            if c == '-' {
+                '_'
+            } else {
+                c.to_ascii_uppercase()
+            }
+        })
+        .collect()
 }
 
 fn contains_bearer_payload(value: &str) -> bool {
@@ -615,6 +700,28 @@ mod tests {
         ];
 
         assert!(insert_server(&conn, &server).is_err());
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM mcp_servers", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn server_args_한줄_secret_flag와_database_url_flag를_거부한다() {
+        let conn = test_conn();
+        let cases = [
+            "--api-key sk-mcp-inline-never-persisted",
+            "--database-url=postgres://user:pass@localhost/app",
+            "MCP_TOKEN=sk-mcp-assignment-never-persisted",
+        ];
+
+        for (idx, arg) in cases.iter().enumerate() {
+            let mut server = sample_server();
+            server.id = format!("srv-danger-{idx}");
+            server.args = vec![arg.to_string()];
+            assert!(insert_server(&conn, &server).is_err(), "{arg}");
+        }
+
         let count: i64 = conn
             .query_row("SELECT count(*) FROM mcp_servers", [], |row| row.get(0))
             .unwrap();

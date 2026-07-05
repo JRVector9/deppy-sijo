@@ -1,22 +1,39 @@
-use crate::storage::{CredentialMeta, Db};
-use secret::{self, SecretStore, SecretString};
+#[derive(Debug, Clone, PartialEq)]
+pub struct CredentialListItem {
+    pub id: String,
+    pub provider: String,
+    pub label: String,
+    pub credential_kind: String,
+    pub masked_hint: Option<String>,
+}
+
+pub struct NewCredential {
+    pub provider: String,
+    pub label: String,
+    pub credential_kind: String,
+    pub secret: String,
+}
+
+pub trait CredentialService {
+    fn list_credentials(&self) -> anyhow::Result<Vec<CredentialListItem>>;
+    fn add_credential(&self, credential: NewCredential) -> anyhow::Result<()>;
+    fn delete_credential(&self, id: &str) -> anyhow::Result<()>;
+}
 
 /// 자격증명 관리 창 상태. secret 입력값은 추가 즉시 비운다.
 pub struct CredentialsUi {
-    redaction: secret::RedactionService,
     open: bool,
     provider: String,
     label: String,
     kind: &'static str,
     secret_input: String,
     error: Option<String>,
-    cached: Option<Vec<CredentialMeta>>,
+    cached: Option<Vec<CredentialListItem>>,
 }
 
 impl CredentialsUi {
-    pub fn new(redaction: secret::RedactionService) -> Self {
+    pub fn new() -> Self {
         Self {
-            redaction,
             open: false,
             provider: String::new(),
             label: String::new(),
@@ -47,7 +64,7 @@ impl CredentialsUi {
         self.error = None;
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, db: &Db, store: &dyn SecretStore) {
+    pub fn show(&mut self, ctx: &egui::Context, credentials: &dyn CredentialService) {
         if !self.open {
             return;
         }
@@ -55,16 +72,16 @@ impl CredentialsUi {
         egui::Window::new("자격증명")
             .open(&mut open)
             .resizable(false)
-            .show(ctx, |ui| self.contents(ui, db, store));
+            .show(ctx, |ui| self.contents(ui, credentials));
         if !open {
             self.close();
         }
     }
 
-    fn contents(&mut self, ui: &mut egui::Ui, db: &Db, store: &dyn SecretStore) {
+    fn contents(&mut self, ui: &mut egui::Ui, credentials: &dyn CredentialService) {
         let list = match &self.cached {
             Some(list) => list.clone(),
-            None => match db.list_credentials() {
+            None => match credentials.list_credentials() {
                 Ok(list) => {
                     self.cached = Some(list.clone());
                     list
@@ -98,7 +115,10 @@ impl CredentialsUi {
             });
         }
         if let Some(id) = delete_id {
-            self.error = self.delete(db, store, &id).err().map(|e| format!("{e:#}"));
+            self.error = self
+                .delete(credentials, &id)
+                .err()
+                .map(|e| format!("{e:#}"));
         }
 
         ui.separator();
@@ -125,7 +145,7 @@ impl CredentialsUi {
             && !self.label.trim().is_empty()
             && !self.secret_input.is_empty();
         if ui.add_enabled(filled, egui::Button::new("추가")).clicked() {
-            self.error = self.add(db, store).err().map(|e| format!("{e:#}"));
+            self.error = self.add(credentials).err().map(|e| format!("{e:#}"));
         }
 
         if let Some(error) = &self.error {
@@ -133,58 +153,23 @@ impl CredentialsUi {
         }
     }
 
-    fn add(&mut self, db: &Db, store: &dyn SecretStore) -> anyhow::Result<()> {
-        // 입력 평문은 SecretString으로 옮기고 입력창은 즉시 비운다
-        let secret = SecretString::new(std::mem::take(&mut self.secret_input));
-        // 새 credential은 즉시 로그 redaction 대상 (7장). 입력값을 그대로 등록 —
-        // UI가 get_secret을 부르는 게 아니다 (2.1 준수).
-        self.redaction.register(&secret);
-        // JSON 형태 credential(service account 등)은 개별 필드가 로그에 찍힌다 —
-        // 필드 단위로도 등록 (JSON이 아니면 no-op. codex 리뷰 반영)
-        self.redaction.register_json_fields(&secret);
-        let id = uuid::Uuid::new_v4().to_string();
-        store.set_secret(&id, &secret)?;
-        let meta = CredentialMeta {
-            id: id.clone(),
+    fn add(&mut self, credentials: &dyn CredentialService) -> anyhow::Result<()> {
+        let request = NewCredential {
             provider: self.provider.trim().to_owned(),
             label: self.label.trim().to_owned(),
             credential_kind: self.kind.to_owned(),
-            masked_hint: Some(secret::masked_hint(secret.expose())),
+            // 입력 평문은 service boundary로 옮기고 입력창은 즉시 비운다.
+            secret: std::mem::take(&mut self.secret_input),
         };
-        if let Err(e) = db.insert_credential(&meta) {
-            // metadata 실패 시 keyring 고아 entry 방지 (rollback)
-            if let Err(rollback) = store.delete_secret(&id) {
-                tracing::warn!(credential_id = %id, "rollback 실패 — 고아 keyring entry: {rollback:#}");
-            }
-            return Err(e);
-        }
-        tracing::info!(credential_id = %id, "credential 추가"); // secret 값은 로그 금지
+        credentials.add_credential(request)?;
         self.provider.clear();
         self.label.clear();
         self.cached = None;
         Ok(())
     }
 
-    fn delete(&mut self, db: &Db, store: &dyn SecretStore, id: &str) -> anyhow::Result<()> {
-        // 순서 근거 (codex 리뷰 왕복):
-        // 1) 참조 검사 — 참조 중이면 아무것도 건드리지 않는다.
-        // 2) keyring 삭제 먼저 — 실패(잠긴 keychain 등)하면 metadata가 남아
-        //    있으므로 사용자가 재시도할 수 있다.
-        // 3) 조건부 DB 삭제 — 검사~삭제 사이에 참조가 생기는 rare race면
-        //    행이 남는데, secret은 이미 지워졌고(안전한 방향) delete_secret이
-        //    NoEntry를 성공으로 취급하므로 재시도가 수렴한다.
-        if db.credential_in_use(id)? {
-            anyhow::bail!("env var가 참조 중인 credential입니다 — 해당 변수를 먼저 삭제하세요");
-        }
-        store.delete_secret(id)?;
-        // OAuth refresh token entry도 함께 (NoEntry는 성공 취급 — kind 무관 시도)
-        store.delete_secret(&auth::refresh_entry_id(id))?;
-        if !db.delete_credential_if_unused(id)? {
-            anyhow::bail!(
-                "삭제 중 env var 참조가 생겼습니다 — secret은 지워졌으니 변수 정리 후 다시 삭제하세요"
-            );
-        }
-        tracing::info!(credential_id = %id, "credential 삭제");
+    fn delete(&mut self, credentials: &dyn CredentialService, id: &str) -> anyhow::Result<()> {
+        credentials.delete_credential(id)?;
         self.cached = None;
         Ok(())
     }

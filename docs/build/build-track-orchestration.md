@@ -230,12 +230,148 @@ Verification:
 - `cargo tree --workspace --edges normal,build,dev` - pass
 - `git diff --check` - pass
 
+## Build Wave Reviews
+
+### Wave 1 Review
+Reviewer: `019f3058-58bf-7210-b36e-e2b8a050d30a`
+
+Verdict: Approve
+
+Notes:
+- PR-B06a, PR-B04a, PR-B08a, and PR-B01b met their acceptance criteria in a clean `0216016` checkout.
+- Residual gaps are non-blocking: soft-wrap wide-spacer fixture coverage, direct runtime constructor lower-bound defense, and pre-existing Markdown whitespace in prompt-pack docs.
+
+### Wave 2 Review
+Reviewer: `019f3058-908c-7230-9981-5e7745c09ae9`
+
+Verdict: Block resolved in third-wave integration
+
+Findings resolved during the next integration:
+- PR-B03a/B04b path insertion now passes shell kind into the real `path_insert_paste_bytes` call sites instead of always using the POSIX/default wrapper.
+- PR-B05a storage and mcp-store args scanners now reject one-line `--api-key value`, `--database-url=...`, and secret-like `KEY=VALUE` payloads before persistence.
+
+## Third Build Wave
+
+### PR-B00 Boundary Hardening
+Worker: `019f3057-8b76-76f2-be41-3cb5fded232d`
+
+Status: Complete
+
+Sources:
+- PR-R00
+- PR-R01
+
+Owned scope:
+- `xtask/src/main.rs`
+- `crates/app/src/ui/credentials.rs`
+- `crates/app/src/ui/connectors.rs`
+- `crates/app/src/app.rs`
+- `docs/build/PR-B00-summary.md`
+
+Acceptance criteria:
+- `cargo run -p xtask -- check-boundary` exists and passes.
+- Leaf UI no longer directly names `KeyringSecretStore`, `SecretStore`, or direct secret set/get/delete APIs.
+- Remaining UI DB/MCP/audit exceptions are frozen by file, snippet, and count.
+- Existing connector audit/security and credential flows continue to pass.
+
+Verification:
+- `cargo run -p xtask -- check-boundary` - pass
+- `cargo test -p deppy-sijo credentials` - pass
+- `cargo test -p deppy-sijo connectors` - pass
+
+### PR-B03b Folder Tree Async Listing
+Worker: `019f3057-d62b-7770-9037-804754cce45b`
+
+Status: Complete
+
+Sources:
+- PR-R04
+- PR-R08
+
+Owned scope:
+- `crates/app/src/ui/file_tree.rs`
+- `docs/build/PR-B03b-summary.md`
+
+Acceptance criteria:
+- Root/expanded directory listing runs off the UI thread.
+- Root switch/collapse stale listing results are discarded.
+- Listing results apply in bounded chunks; frame draining is capped.
+- Existing folder tree DnD/move, watcher, and shell quoting tests continue to pass.
+
+Verification:
+- `cargo test -p deppy-sijo file_tree` - pass
+
+### PR-B04b Unified Paste/DnD Byte Helper
+Worker: `019f3058-203a-7160-aec8-2ce45a5d61b6`
+
+Status: Complete
+
+Sources:
+- PR-R05
+- PR-R04
+
+Owned scope:
+- `crates/terminal/src/input_mapper.rs`
+- `crates/app/src/ui/workspace.rs`
+- `crates/app/src/app.rs`
+- `docs/build/PR-B04b-summary.md`
+
+Acceptance criteria:
+- Clipboard paste, terminal path drop, and sidebar/context path insert share `paste_bytes` semantics.
+- Bracketed paste wraps path payloads when the target session reports bracketed paste.
+- Path insertion keeps trailing space and never adds CR/LF.
+- Required English/Japanese/Simplified Chinese/Traditional Chinese/Korean/emoji fixtures are covered.
+- Actual call sites pass shell kind to shell-specific path insert bytes.
+
+Verification:
+- `cargo test -p terminal` - pass
+- `cargo test -p deppy-sijo workspace` - pass
+- `cargo test -p deppy-sijo file_tree` - pass
+
+### Third-Wave Security Integration
+Worker: local integration after Wave 2 review
+
+Status: Complete
+
+Sources:
+- Wave 2 Build PR Review Finding 2
+- PR-R06
+
+Owned scope:
+- `crates/storage/src/db.rs`
+- `crates/mcp-store/src/lib.rs`
+- `docs/build/PR-B05a-review-fix-summary.md`
+
+Acceptance criteria:
+- One-line `--api-key value` args are rejected before SQLite persistence.
+- `--database-url=...` and secret-like `KEY=VALUE` args are rejected before SQLite persistence.
+- Display redaction reuses the stronger persistence validation.
+
+Verification:
+- `cargo test -p storage -p mcp-store` - pass
+
+## Third Wave Integrated Verification
+- `cargo fmt --check` - pass
+- `cargo check --workspace --all-targets` - pass
+- `cargo test --workspace --no-run` - pass
+- `cargo test -p terminal` - pass
+- `cargo test -p deppy-sijo file_tree` - pass
+- `cargo test -p deppy-sijo workspace` - pass
+- `cargo test -p deppy-sijo credentials` - pass
+- `cargo test -p deppy-sijo connectors` - pass
+- `cargo test -p storage -p mcp-store` - pass
+- `cargo test -p deppy-sijo` - pass
+- `cargo run -p xtask -- check-boundary` - pass
+- `cargo run -p xtask -- check-deps` - pass
+- `cargo tree --workspace --edges normal,build` - pass
+- `cargo tree --workspace --edges normal,build,dev` - pass
+- `git diff --check` - pass
+
 ## Deferred Build Waves
-- PR-B00 Boundary Hardening: ready for a focused follow-up now that PR-B06a and PR-B05a have landed.
-- PR-B03b Folder Tree Async Listing: ready for a focused follow-up now that PR-B03a quoting/root contract is integrated.
-- PR-B04b Unified Paste/DnD Byte Helper: ready for a focused follow-up now that PR-B04a and PR-B03a have landed.
 - PR-B11-B13 I18n: dedicated wave because it changes broad UI/runtime event contracts.
-- PR-B10 Output Pipeline Backpressure and PR-B15 SQLite batching: defer until pane/security/folder tree wave lands.
+- PR-B10 Output Pipeline Backpressure and PR-B15 SQLite batching: still pending.
+- PR-B03c Ignore Matcher: still pending.
+- PR-B04c Clipboard failure abstraction and PR-B04d terminal internal DnD contract: still pending.
 
 ## Build PR Review Requests
 - PR-B06a: security review against PR-R06/PR-R07, including DB audit rows and logs.
@@ -245,3 +381,6 @@ Verification:
 - PR-B02a: pane/resource review against PR-R03, especially hidden `Viewport` handling and split-pane visibility.
 - PR-B03a: folder tree/DnD review against PR-R04, especially shell quoting fixtures and empty root handling.
 - PR-B05a: security review against PR-R06, especially rejected secret-like env and args persistence.
+- PR-B00: boundary review against PR-R01 and `xtask check-boundary`, especially allowlist drift.
+- PR-B03b: performance/resource review against PR-R04/PR-R08, especially async listing races and chunk application.
+- PR-B04b: terminal/DnD review against PR-R05, especially bracketed paste, shell kind, and no-auto-Enter.

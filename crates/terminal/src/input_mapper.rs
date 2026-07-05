@@ -23,7 +23,7 @@ pub fn map_event(
             if cfg!(not(target_os = "macos")) && modifiers.ctrl && !modifiers.shift {
                 Some(vec![0x16]) // Ctrl+V — readline quoted-insert 등
             } else {
-                Some(wrap_paste(text, bracketed_paste))
+                Some(paste_bytes(text.as_bytes(), bracketed_paste))
             }
         }
         // shift 조합(Ctrl+Shift+C/X)은 클립보드 의도 — selection 미지원이라 무시
@@ -41,15 +41,15 @@ pub fn map_event(
     }
 }
 
-/// bracketed paste 모드(DEC 2004)면 ESC[200~ / ESC[201~로 감싼다.
-fn wrap_paste(text: &str, bracketed: bool) -> Vec<u8> {
+/// bracketed paste 모드(DEC 2004)면 ESC[200~ / ESC[201~로 감싼 paste bytes를 만든다.
+pub fn paste_bytes(payload: &[u8], bracketed: bool) -> Vec<u8> {
     if bracketed {
         let mut out = b"\x1b[200~".to_vec();
-        out.extend_from_slice(text.as_bytes());
+        out.extend_from_slice(payload);
         out.extend_from_slice(b"\x1b[201~");
         out
     } else {
-        text.as_bytes().to_vec()
+        payload.to_vec()
     }
 }
 
@@ -173,6 +173,30 @@ mod tests {
             map_event(&egui::Event::Paste("hi".into()), false, &paste_mods),
             Some(b"hi".to_vec())
         );
+    }
+
+    #[test]
+    fn paste_bytes_required_fixtures는_bracketed_상태를_따른다() {
+        let fixtures = [
+            "src/main.rs",
+            "プロジェクト/設定ファイル.rs",
+            "项目/配置文件.rs",
+            "專案/設定檔.rs",
+            "프로젝트/설정파일.rs",
+            "project/🚀-deploy/config.json",
+        ];
+
+        for fixture in fixtures {
+            assert_eq!(
+                paste_bytes(fixture.as_bytes(), false),
+                fixture.as_bytes().to_vec()
+            );
+
+            let mut expected = b"\x1b[200~".to_vec();
+            expected.extend_from_slice(fixture.as_bytes());
+            expected.extend_from_slice(b"\x1b[201~");
+            assert_eq!(paste_bytes(fixture.as_bytes(), true), expected, "{fixture}");
+        }
     }
 
     #[test]

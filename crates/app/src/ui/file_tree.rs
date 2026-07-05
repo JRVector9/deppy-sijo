@@ -4,7 +4,9 @@
 //! IO는 상호작용 시점만 — 유휴 시 repaint를 유발하지 않는다. 로컬 파일 IO는
 //! config/DB처럼 앱 소관이라 `std::fs` 직접 사용(§2, remote는 후속 trait 추상화 지점).
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
 /// 사이드바 세션 목록 항목 (§6 확장 — 좌측 패널은 트리+세션의 workspace 사이드바다,
@@ -78,6 +80,15 @@ pub struct FileTreeUi {
     /// 백그라운드 파일 조작(EXDEV copy 등 §9-3)의 완료/에러 채널.
     ops_tx: Sender<OpOutcome>,
     ops_rx: Receiver<OpOutcome>,
+    /// 백그라운드 디렉터리 listing 결과 채널. read_dir/sort는 worker에서 수행한다.
+    listing_tx: Sender<ListingOutcome>,
+    listing_rx: Receiver<ListingOutcome>,
+    /// root 전환 generation. 이전 root의 late result는 epoch mismatch로 폐기한다.
+    listing_epoch: u64,
+    /// per-directory listing token 발급용 monotonic counter.
+    next_listing_token: u64,
+    /// 현재 유효한 per-directory listing 요청. collapse/refresh/root switch 시 제거한다.
+    pending_listings: HashMap<PathBuf, PendingListing>,
     /// 진행 중인 백그라운드 조작 수 (>0이면 스피너 표시).
     in_flight: usize,
     /// 백그라운드 완료 시 UI를 깨우기 위한 컨텍스트.
@@ -122,6 +133,28 @@ struct OpOutcome {
     confirm_delete: Option<PathBuf>,
 }
 
+/// 디렉터리 listing worker 결과. 큰 디렉터리 apply 비용도 쪼개기 위해 chunk로 전달한다.
+struct ListingOutcome {
+    epoch: u64,
+    token: u64,
+    path: PathBuf,
+    result: ListingResult,
+}
+
+enum ListingResult {
+    Chunk { nodes: Vec<TreeNode>, done: bool },
+    Error(String),
+}
+
+struct PendingListing {
+    token: u64,
+    /// refresh/reload 시작 시점의 펼침 상태. 결과 적용 직전의 현재 상태가 없을 때 fallback.
+    preserve_expanded: Arc<HashSet<PathBuf>>,
+    /// 첫 chunk 적용 시점의 현재 펼침 상태. 이후 chunk는 같은 기준으로 append한다.
+    apply_expanded: Option<Arc<HashSet<PathBuf>>>,
+    started: bool,
+}
+
 /// 인라인 편집 (FT-3). focus는 첫 프레임에 TextEdit에 포커스를 1회 요청하는 플래그 —
 /// 편집 중 키 입력이 터미널로 새지 않게 한다(§9-8: 터미널은 자기 response가
 /// 포커스를 가질 때만 입력을 소비한다).
@@ -141,6 +174,7 @@ enum EditState {
 impl FileTreeUi {
     pub fn new(egui_ctx: egui::Context) -> Self {
         let (ops_tx, ops_rx) = std::sync::mpsc::channel();
+        let (listing_tx, listing_rx) = std::sync::mpsc::channel();
         Self {
             root: None,
             root_error: None,
@@ -151,6 +185,11 @@ impl FileTreeUi {
             error: None,
             ops_tx,
             ops_rx,
+            listing_tx,
+            listing_rx,
+            listing_epoch: 0,
+            next_listing_token: 0,
+            pending_listings: HashMap::new(),
             in_flight: 0,
             egui_ctx,
             edit: None,
@@ -175,6 +214,8 @@ impl FileTreeUi {
     }
 
     pub fn set_root(&mut self, root: Option<PathBuf>) {
+        self.listing_epoch = self.listing_epoch.wrapping_add(1);
+        self.pending_listings.clear();
         self.root = root.map(|r| r.canonicalize().unwrap_or(r));
         self.root_error = None;
         self.children = None;
@@ -334,18 +375,10 @@ impl FileTreeUi {
         let Some(root) = self.root.clone() else {
             return;
         };
-        let old = self.children.take().unwrap_or_default();
-        match reread(&root, &old) {
-            Ok(children) => {
-                self.children = Some(children);
-                self.root_error = None;
-            }
-            Err(e) => {
-                self.children = None;
-                self.root_error = Some(format!("루트 나열 실패: {e}"));
-            }
-        }
-        self.rebuild_flat();
+        self.root_error = None;
+        let preserve_expanded = Arc::new(self.collect_expanded_paths());
+        self.invalidate_listing_subtree(&root);
+        self.request_listing(root, preserve_expanded);
     }
 
     /// flat 캐시 재계산 (펼침/접힘/숨김 토글/조작 후에만 호출).
@@ -366,20 +399,27 @@ impl FileTreeUi {
         let Ok(rel) = path.strip_prefix(&root) else {
             return;
         };
-        let Some(node) = self.children.as_mut().and_then(|c| node_mut(c, rel)) else {
-            return;
-        };
-        if node.expanded {
-            node.expanded = false;
-            node.children = None; // 접힌 노드 캐시 해제 (§3 메모리 상한)
-        } else {
-            match read_children(path) {
-                Ok(children) => {
-                    node.children = Some(children);
-                    node.expanded = true;
-                }
-                Err(e) => self.error = Some(format!("{} 나열 실패: {e}", node.name)),
+        let mut expand = false;
+        let mut collapse = false;
+        {
+            let Some(node) = self.children.as_mut().and_then(|c| node_mut(c, rel)) else {
+                return;
+            };
+            if node.expanded {
+                node.expanded = false;
+                node.children = None; // 접힌 노드 캐시 해제 (§3 메모리 상한)
+                collapse = true;
+            } else {
+                node.expanded = true;
+                node.children = Some(Vec::new());
+                expand = true;
             }
+        }
+        if collapse {
+            self.invalidate_listing_subtree(path);
+        }
+        if expand {
+            self.request_listing(path.to_path_buf(), Arc::new(HashSet::new()));
         }
         self.rebuild_flat();
     }
@@ -390,6 +430,7 @@ impl FileTreeUi {
     pub fn panel(&mut self, ui: &mut egui::Ui, sessions: &[SessionEntry]) -> Option<SidebarAction> {
         // 접힘 여부와 무관하게 배경 채널을 소비한다 (codex Med-2 — 접힌 채로 워처/조작
         // 채널이 무한 누적되거나 op 완료(in_flight/에러/영구삭제 확인)가 방치되는 것 방지).
+        self.pump_listings();
         self.pump_watch_events(ui.ctx());
         self.pump_ops();
         if self.collapsed {
@@ -839,6 +880,12 @@ impl FileTreeUi {
                 ui.weak("파일 조작 중…");
             });
         }
+        if !self.pending_listings.is_empty() {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(12.0));
+                ui.weak("폴더 나열 중…");
+            });
+        }
         if let Some(err) = self.error.clone() {
             ui.horizontal(|ui| {
                 ui.colored_label(ui.visuals().error_fg_color, err);
@@ -970,20 +1017,262 @@ impl FileTreeUi {
         let Ok(rel) = dir.strip_prefix(&root) else {
             return;
         };
-        if let Some(node) = self.children.as_mut().and_then(|c| node_mut(c, rel))
-            && node.expanded
-        {
-            let old = node.children.take().unwrap_or_default();
-            match reread(dir, &old) {
-                Ok(children) => node.children = Some(children),
-                Err(_) => {
-                    // 디렉터리가 사라짐(이동/삭제) — 접고 캐시 해제
-                    node.expanded = false;
-                    node.children = None;
+        let should_reload = self
+            .children
+            .as_ref()
+            .and_then(|c| node_ref(c, rel))
+            .map(|node| node.expanded)
+            .unwrap_or(false);
+        if should_reload {
+            let preserve_expanded = Arc::new(self.collect_expanded_paths());
+            self.invalidate_listing_subtree(dir);
+            self.request_listing(dir.to_path_buf(), preserve_expanded);
+        }
+    }
+
+    fn request_listing(&mut self, path: PathBuf, preserve_expanded: Arc<HashSet<PathBuf>>) {
+        self.next_listing_token = self.next_listing_token.wrapping_add(1);
+        let token = self.next_listing_token;
+        self.pending_listings.insert(
+            path.clone(),
+            PendingListing {
+                token,
+                preserve_expanded,
+                apply_expanded: None,
+                started: false,
+            },
+        );
+        spawn_listing_worker(
+            self.listing_tx.clone(),
+            self.egui_ctx.clone(),
+            self.listing_epoch,
+            token,
+            path,
+        );
+    }
+
+    fn request_listing_if_absent(
+        &mut self,
+        path: PathBuf,
+        preserve_expanded: Arc<HashSet<PathBuf>>,
+    ) {
+        if self.pending_listings.contains_key(&path) {
+            return;
+        }
+        self.request_listing(path, preserve_expanded);
+    }
+
+    fn invalidate_listing_subtree(&mut self, path: &Path) {
+        self.pending_listings
+            .retain(|pending_path, _| !pending_path.starts_with(path));
+    }
+
+    fn pump_listings(&mut self) {
+        let mut processed = 0;
+        while processed < LISTING_RESULTS_PER_FRAME {
+            let Ok(outcome) = self.listing_rx.try_recv() else {
+                return;
+            };
+            self.apply_listing_outcome(outcome);
+            processed += 1;
+        }
+        if !self.pending_listings.is_empty() {
+            self.egui_ctx.request_repaint();
+        }
+    }
+
+    fn apply_listing_outcome(&mut self, outcome: ListingOutcome) {
+        if outcome.epoch != self.listing_epoch {
+            return;
+        }
+        let Some(pending) = self.pending_listings.get(&outcome.path) else {
+            return;
+        };
+        if pending.token != outcome.token {
+            return;
+        }
+
+        match outcome.result {
+            ListingResult::Chunk { nodes, done } => {
+                self.apply_listing_chunk(outcome.path, nodes, done);
+            }
+            ListingResult::Error(error) => {
+                self.pending_listings.remove(&outcome.path);
+                self.apply_listing_error(&outcome.path, error);
+            }
+        }
+    }
+
+    fn apply_listing_chunk(&mut self, path: PathBuf, nodes: Vec<TreeNode>, done: bool) {
+        let first = self
+            .pending_listings
+            .get(&path)
+            .map(|pending| !pending.started)
+            .unwrap_or(false);
+        let expanded = if first {
+            let expanded = self
+                .current_expanded_paths_for_listing(&path)
+                .unwrap_or_else(|| {
+                    self.pending_listings
+                        .get(&path)
+                        .map(|pending| (*pending.preserve_expanded).clone())
+                        .unwrap_or_default()
+                });
+            let expanded = Arc::new(expanded);
+            if let Some(pending) = self.pending_listings.get_mut(&path) {
+                pending.started = true;
+                pending.apply_expanded = Some(Arc::clone(&expanded));
+            }
+            expanded
+        } else {
+            self.pending_listings
+                .get(&path)
+                .and_then(|pending| pending.apply_expanded.as_ref().map(Arc::clone))
+                .unwrap_or_else(|| Arc::new(HashSet::new()))
+        };
+
+        let prepared = prepare_listing_nodes(&path, nodes, &expanded);
+        let applied = if first {
+            self.replace_listing_children(&path, prepared)
+        } else {
+            self.append_listing_children(&path, prepared)
+        };
+        if !applied {
+            self.invalidate_listing_subtree(&path);
+            return;
+        }
+
+        let preserve_expanded = self
+            .pending_listings
+            .get(&path)
+            .map(|pending| Arc::clone(&pending.preserve_expanded));
+        if done {
+            self.pending_listings.remove(&path);
+            if let Some(preserve_expanded) = preserve_expanded {
+                for child in self.expanded_direct_child_paths(&path) {
+                    self.request_listing_if_absent(child, Arc::clone(&preserve_expanded));
                 }
             }
         }
+        self.root_error = None;
         self.rebuild_flat();
+    }
+
+    fn apply_listing_error(&mut self, path: &Path, error: String) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        if path == root {
+            self.children = None;
+            self.root_error = Some(format!("루트 나열 실패: {error}"));
+            self.rebuild_flat();
+            return;
+        }
+        if let Ok(rel) = path.strip_prefix(&root)
+            && let Some(node) = self.children.as_mut().and_then(|c| node_mut(c, rel))
+        {
+            node.expanded = false;
+            node.children = None;
+        }
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        self.error = Some(format!("{name} 나열 실패: {error}"));
+        self.rebuild_flat();
+    }
+
+    fn replace_listing_children(&mut self, path: &Path, nodes: Vec<TreeNode>) -> bool {
+        let Some(root) = self.root.clone() else {
+            return false;
+        };
+        if path == root {
+            self.children = Some(nodes);
+            return true;
+        }
+        let Ok(rel) = path.strip_prefix(&root) else {
+            return false;
+        };
+        let Some(node) = self.children.as_mut().and_then(|c| node_mut(c, rel)) else {
+            return false;
+        };
+        if !node.expanded {
+            return false;
+        }
+        node.children = Some(nodes);
+        true
+    }
+
+    fn append_listing_children(&mut self, path: &Path, mut nodes: Vec<TreeNode>) -> bool {
+        let Some(root) = self.root.clone() else {
+            return false;
+        };
+        let target = if path == root {
+            self.children.as_mut()
+        } else {
+            let Ok(rel) = path.strip_prefix(&root) else {
+                return false;
+            };
+            let Some(node) = self.children.as_mut().and_then(|c| node_mut(c, rel)) else {
+                return false;
+            };
+            if !node.expanded {
+                return false;
+            }
+            node.children.as_mut()
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        target.append(&mut nodes);
+        true
+    }
+
+    fn current_expanded_paths_for_listing(&self, path: &Path) -> Option<HashSet<PathBuf>> {
+        let root = self.root.as_ref()?;
+        if path == root {
+            let children = self.children.as_ref()?;
+            let mut expanded = HashSet::new();
+            collect_expanded_paths(children, root, &mut expanded);
+            return Some(expanded);
+        }
+        let rel = path.strip_prefix(root).ok()?;
+        let node = self.children.as_ref().and_then(|c| node_ref(c, rel))?;
+        let children = node.children.as_ref()?;
+        let mut expanded = HashSet::new();
+        collect_expanded_paths(children, path, &mut expanded);
+        Some(expanded)
+    }
+
+    fn collect_expanded_paths(&self) -> HashSet<PathBuf> {
+        let mut expanded = HashSet::new();
+        if let (Some(root), Some(children)) = (&self.root, &self.children) {
+            collect_expanded_paths(children, root, &mut expanded);
+        }
+        expanded
+    }
+
+    fn expanded_direct_child_paths(&self, path: &Path) -> Vec<PathBuf> {
+        let Some(root) = self.root.as_ref() else {
+            return Vec::new();
+        };
+        let children = if path == root {
+            self.children.as_ref()
+        } else {
+            let Ok(rel) = path.strip_prefix(root) else {
+                return Vec::new();
+            };
+            self.children
+                .as_ref()
+                .and_then(|c| node_ref(c, rel))
+                .and_then(|node| node.children.as_ref())
+        };
+        children
+            .into_iter()
+            .flat_map(|children| children.iter())
+            .filter(|node| node.is_dir && node.expanded)
+            .map(|node| path.join(&node.name))
+            .collect()
     }
 }
 
@@ -1095,13 +1384,39 @@ pub enum ShellKind {
     Cmd,
 }
 
+/// 현재 플랫폼/환경에서 새 shell session이 사용할 것으로 예상되는 기본 shell kind.
+/// Runtime이 per-session shell metadata를 노출하기 전까지 실제 path-insert call site의
+/// 보수적 기본값으로 쓴다.
+pub fn default_shell_kind() -> ShellKind {
+    #[cfg(windows)]
+    {
+        ShellKind::PowerShell
+    }
+    #[cfg(not(windows))]
+    {
+        let shell = std::env::var("SHELL").unwrap_or_default();
+        let name = Path::new(&shell)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if name == "fish" {
+            ShellKind::Fish
+        } else {
+            ShellKind::Posix
+        }
+    }
+}
+
 /// 터미널 삽입용 기본 셸 인용. 기존 call site는 shell kind를 모르므로 POSIX 동작을
 /// 유지한다. 세션 shell metadata가 생기면 `shell_quote_for`로 분기한다.
+#[allow(dead_code)]
 pub fn shell_quote(path: &Path) -> String {
     shell_quote_for(path, ShellKind::Posix)
 }
 
 /// 터미널 경로 삽입용 byte payload: quoted path + trailing space, no Enter.
+#[allow(dead_code)]
 pub fn shell_path_insert_bytes(path: &Path) -> Vec<u8> {
     shell_path_insert_bytes_for(path, ShellKind::Posix)
 }
@@ -1301,6 +1616,76 @@ fn remove_all(path: &Path) -> std::io::Result<()> {
 
 /// 한 디렉터리를 나열한다 (lazy 단위 — 재귀 없음). symlink는 따라가지 않는다(§9-4:
 /// `DirEntry::file_type`은 링크를 해석하지 않으므로 링크는 파일처럼 취급 — 펼침 불가).
+const LISTING_CHUNK_SIZE: usize = 2048;
+const LISTING_RESULTS_PER_FRAME: usize = 4;
+
+fn spawn_listing_worker(
+    tx: Sender<ListingOutcome>,
+    ctx: egui::Context,
+    epoch: u64,
+    token: u64,
+    path: PathBuf,
+) {
+    std::thread::spawn(move || match read_children(&path) {
+        Ok(nodes) => send_listing_chunks(tx, &ctx, epoch, token, path, nodes),
+        Err(e) => {
+            let _ = tx.send(ListingOutcome {
+                epoch,
+                token,
+                path,
+                result: ListingResult::Error(e.to_string()),
+            });
+            ctx.request_repaint();
+        }
+    });
+}
+
+fn send_listing_chunks(
+    tx: Sender<ListingOutcome>,
+    ctx: &egui::Context,
+    epoch: u64,
+    token: u64,
+    path: PathBuf,
+    nodes: Vec<TreeNode>,
+) {
+    let mut iter = nodes.into_iter().peekable();
+    if iter.peek().is_none() {
+        let _ = tx.send(ListingOutcome {
+            epoch,
+            token,
+            path,
+            result: ListingResult::Chunk {
+                nodes: Vec::new(),
+                done: true,
+            },
+        });
+        ctx.request_repaint();
+        return;
+    }
+
+    while iter.peek().is_some() {
+        let mut chunk = Vec::with_capacity(LISTING_CHUNK_SIZE);
+        for _ in 0..LISTING_CHUNK_SIZE {
+            let Some(node) = iter.next() else {
+                break;
+            };
+            chunk.push(node);
+        }
+        let done = iter.peek().is_none();
+        let sent = tx.send(ListingOutcome {
+            epoch,
+            token,
+            path: path.clone(),
+            result: ListingResult::Chunk { nodes: chunk, done },
+        });
+        ctx.request_repaint();
+        if sent.is_err() {
+            break;
+        }
+        std::thread::yield_now();
+    }
+}
+
 fn read_children(path: &Path) -> std::io::Result<Vec<TreeNode>> {
     let mut nodes = Vec::new();
     for entry in std::fs::read_dir(path)? {
@@ -1313,6 +1698,23 @@ fn read_children(path: &Path) -> std::io::Result<Vec<TreeNode>> {
     }
     sort_nodes(&mut nodes);
     Ok(nodes)
+}
+
+fn prepare_listing_nodes(
+    parent: &Path,
+    mut nodes: Vec<TreeNode>,
+    expanded_paths: &HashSet<PathBuf>,
+) -> Vec<TreeNode> {
+    for node in &mut nodes {
+        if !node.is_dir {
+            continue;
+        }
+        if expanded_paths.contains(&parent.join(&node.name)) {
+            node.expanded = true;
+            node.children = Some(Vec::new());
+        }
+    }
+    nodes
 }
 
 /// 정렬: 디렉터리 우선 + 이름 (단순 유니코드 순 — §3, 로케일 비교는 비목표).
@@ -1362,8 +1764,35 @@ fn node_mut<'a>(mut nodes: &'a mut Vec<TreeNode>, rel: &Path) -> Option<&'a mut 
     None
 }
 
+fn node_ref<'a>(mut nodes: &'a [TreeNode], rel: &Path) -> Option<&'a TreeNode> {
+    let mut comps = rel.components().peekable();
+    while let Some(comp) = comps.next() {
+        let name = comp.as_os_str().to_string_lossy();
+        let node = nodes.iter().find(|n| n.name == name)?;
+        if comps.peek().is_none() {
+            return Some(node);
+        }
+        nodes = node.children.as_deref()?;
+    }
+    None
+}
+
+fn collect_expanded_paths(nodes: &[TreeNode], base: &Path, out: &mut HashSet<PathBuf>) {
+    for node in nodes {
+        if !node.is_dir || !node.expanded {
+            continue;
+        }
+        let path = base.join(&node.name);
+        out.insert(path.clone());
+        if let Some(children) = &node.children {
+            collect_expanded_paths(children, &path, out);
+        }
+    }
+}
+
 /// 디렉터리를 다시 나열하되, 이전 트리의 펼침 상태를 이월한다 (펼친 하위만 재귀 —
 /// 접근 불가/사라진 하위는 접는다). 새로고침·부분 재나열의 공통 코어.
+#[cfg(test)]
 fn reread(base: &Path, old: &[TreeNode]) -> std::io::Result<Vec<TreeNode>> {
     let mut fresh = read_children(base)?;
     for node in fresh.iter_mut() {
@@ -1490,6 +1919,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         base.canonicalize().unwrap()
+    }
+
+    fn drain_listings(tree: &mut FileTreeUi) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            tree.pump_listings();
+            if tree.pending_listings.is_empty() {
+                tree.pump_listings();
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for async file-tree listing"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn pump_listings_for(tree: &mut FileTreeUi, duration: std::time::Duration) {
+        let deadline = std::time::Instant::now() + duration;
+        while std::time::Instant::now() < deadline {
+            tree.pump_listings();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        tree.pump_listings();
     }
 
     #[test]
@@ -1909,6 +2363,67 @@ mod tests {
     }
 
     #[test]
+    fn set_root은_listing을_background로_요청하고_stale_root를_버린다() {
+        let base = temp_root("async-root-stale");
+        let root_a = base.join("root-a");
+        let root_b = base.join("root-b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        std::fs::write(root_a.join("a.txt"), b"a").unwrap();
+        std::fs::write(root_b.join("b.txt"), b"b").unwrap();
+
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(root_a.clone()));
+        assert!(
+            tree.pending_listings.contains_key(&root_a),
+            "set_root은 read_dir 완료를 기다리지 않고 listing 요청만 등록한다"
+        );
+        assert!(tree.children.is_none());
+
+        tree.set_root(Some(root_b.clone()));
+        drain_listings(&mut tree);
+        pump_listings_for(&mut tree, std::time::Duration::from_millis(100));
+
+        assert!(
+            tree.flat.iter().any(|row| row.name == "b.txt"),
+            "현재 root 결과는 적용"
+        );
+        assert!(
+            !tree.flat.iter().any(|row| row.name == "a.txt"),
+            "이전 root late result는 epoch mismatch로 폐기"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn collapse_후_도착한_listing_result는_폐기된다() {
+        let base = temp_root("async-collapse-stale");
+        std::fs::create_dir_all(base.join("d")).unwrap();
+        std::fs::write(base.join("d/child.txt"), b"child").unwrap();
+
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
+
+        tree.toggle_dir(&base.join("d"));
+        assert!(tree.pending_listings.contains_key(&base.join("d")));
+        tree.toggle_dir(&base.join("d"));
+        assert!(
+            !tree.pending_listings.contains_key(&base.join("d")),
+            "collapse는 in-flight dir listing token을 무효화한다"
+        );
+
+        pump_listings_for(&mut tree, std::time::Duration::from_millis(100));
+        let d = tree.flat.iter().find(|row| row.name == "d").unwrap();
+        assert!(!d.expanded);
+        assert!(
+            !tree.flat.iter().any(|row| row.name == "child.txt"),
+            "collapse 이후 도착한 stale child listing은 tree state를 오염시키지 않는다"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
     fn 워처_이벤트_경로의_부모만_부분_재나열된다() {
         // 워처 콜백이 보내는 "부모 디렉터리" 재나열 경로를 OS 워처 없이 검증한다
         // (실제 FSEvents 왕복은 타이밍 의존이라 단위 테스트에서 제외 — 수동 스모크).
@@ -1919,8 +2434,11 @@ mod tests {
 
         let mut tree = FileTreeUi::new(egui::Context::default());
         tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
         tree.toggle_dir(&base.join("watched"));
+        drain_listings(&mut tree);
         tree.toggle_dir(&base.join("other"));
+        drain_listings(&mut tree);
         assert!(tree.flat.iter().any(|r| r.name == "o.txt"));
         assert!(!tree.flat.iter().any(|r| r.name == "new.txt"));
 
@@ -1928,6 +2446,7 @@ mod tests {
         std::fs::write(base.join("watched/new.txt"), b"n").unwrap();
         std::fs::write(base.join("other/late.txt"), b"l").unwrap();
         tree.reload_dir(&base.join("watched"));
+        drain_listings(&mut tree);
 
         assert!(
             tree.flat.iter().any(|r| r.name == "new.txt"),
@@ -1946,7 +2465,9 @@ mod tests {
         std::fs::create_dir_all(base.join("d")).unwrap();
         let mut tree = FileTreeUi::new(egui::Context::default());
         tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
         tree.toggle_dir(&base.join("d"));
+        drain_listings(&mut tree);
 
         // 실제 OS 워처 대신 채널을 주입해 스로틀 로직만 검증한다
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1970,16 +2491,18 @@ mod tests {
         tree.pump_watch_events(&ctx);
         assert!(!tree.flat.iter().any(|r| r.name == "a.txt"));
 
-        // 창 경과 → 일괄 재나열 1회, pending 소진
+        // 창 경과 → 재나열 요청 1회, pending 소진. 실제 read_dir 적용은 async.
         tree.last_watch_reload = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_millis(WATCH_TEST_ELAPSED_MS))
             .expect("테스트 프로세스 기동 후라 언더플로 없음");
         tree.pump_watch_events(&ctx);
+        assert!(!tree.flat.iter().any(|r| r.name == "a.txt"));
+        assert!(tree.pending_watch.is_empty());
+        drain_listings(&mut tree);
         assert!(
             tree.flat.iter().any(|r| r.name == "a.txt"),
-            "창 경과 후 반영"
+            "async listing 적용 후 반영"
         );
-        assert!(tree.pending_watch.is_empty());
         std::fs::remove_dir_all(&base).unwrap();
     }
 
@@ -1991,6 +2514,7 @@ mod tests {
         let base = temp_root("collapsed-drain");
         let mut tree = FileTreeUi::new(egui::Context::default());
         tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
         tree.collapsed = true;
 
         // 워처 채널 주입 + 새 파일 이벤트 (창 경과 상태)
@@ -2015,6 +2539,7 @@ mod tests {
         egui::__run_test_ui(|ui| {
             assert!(tree.panel(ui, &[]).is_none());
         });
+        drain_listings(&mut tree);
 
         assert!(
             tree.flat.iter().any(|r| r.name == "new.txt"),

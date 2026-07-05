@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use mcp::{LocalMcpManager, McpServerConfig, McpTool};
 use mcp_store::{McpServerRow, McpToolRow};
-use secret::{KeyringSecretStore, RedactionService, SecretStore};
+use secret::RedactionService;
 
 use crate::storage::{CredentialMeta, Db};
 
@@ -76,6 +76,16 @@ type InvokeResult = (u64, InvokeMsg);
 /// tool 인자 JSON 최대 크기 — stdin pipe buffer(대체로 ≥64KB)보다 작게 잡아
 /// write_all이 서버 미독취 시에도 블록되지 않게 한다 (transport write hang 방지).
 const MAX_TOOL_INPUT: usize = 32 * 1024;
+
+pub struct StoredOAuthCredential {
+    pub id: String,
+    pub masked_hint: String,
+}
+
+pub trait OAuthCredentialStore {
+    fn store_oauth_token(&self, token: &auth::OAuthToken) -> anyhow::Result<StoredOAuthCredential>;
+    fn delete_oauth_token(&self, id: &str) -> anyhow::Result<()>;
+}
 
 pub struct ConnectorsUi {
     redaction: RedactionService,
@@ -161,12 +171,12 @@ impl ConnectorsUi {
         ctx: &egui::Context,
         db: &mut Db,
         workspace_id: &str,
-        _secret_store: &dyn SecretStore,
+        oauth_store: &dyn OAuthCredentialStore,
     ) -> bool {
         // 백그라운드 결과는 창이 닫혀 있어도 소화한다 (다시 열 때 최신 상태)
         self.drain_results(db);
         self.drain_invoke();
-        let credential_added = self.drain_oauth(db);
+        let credential_added = self.drain_oauth(db, oauth_store);
         if !self.open {
             return credential_added;
         }
@@ -359,7 +369,7 @@ impl ConnectorsUi {
 
     /// OAuth 결과 반영: keyring 저장 → credentials 등록 → redaction 시드.
     /// 중간 실패 시 keyring 고아 토큰을 지운다. credential을 추가했으면 true.
-    fn drain_oauth(&mut self, db: &Db) -> bool {
+    fn drain_oauth(&mut self, db: &Db, oauth_store: &dyn OAuthCredentialStore) -> bool {
         let mut added = false;
         while let Ok((label, result)) = self.oauth_rx.try_recv() {
             let token = match result {
@@ -369,31 +379,29 @@ impl ConnectorsUi {
                     continue;
                 }
             };
-            let id = uuid::Uuid::new_v4().to_string();
-            let store = KeyringSecretStore;
-            if let Err(e) = auth::store_token(&store, &id, &token) {
-                self.oauth_status = Some(OAuthStatus::Failed(format!("keyring 저장 실패: {e:#}")));
-                continue;
-            }
+            let stored = match oauth_store.store_oauth_token(&token) {
+                Ok(stored) => stored,
+                Err(e) => {
+                    self.oauth_status =
+                        Some(OAuthStatus::Failed(format!("keyring 저장 실패: {e:#}")));
+                    continue;
+                }
+            };
             let meta = CredentialMeta {
-                id: id.clone(),
+                id: stored.id.clone(),
                 provider: "oauth".to_owned(),
                 label: label.clone(),
                 credential_kind: "oauth_token".to_owned(),
-                masked_hint: Some(secret::masked_hint(token.access_token.expose())),
+                masked_hint: Some(stored.masked_hint),
             };
             if let Err(e) = db.insert_credential(&meta) {
                 // 고아 토큰 정리 (access + refresh)
-                let _ = store.delete_secret(&id);
-                let _ = store.delete_secret(&auth::refresh_entry_id(&id));
+                if let Err(rollback) = oauth_store.delete_oauth_token(&stored.id) {
+                    tracing::warn!("OAuth token rollback 실패: {rollback:#}");
+                }
                 self.oauth_status =
                     Some(OAuthStatus::Failed(format!("credential 등록 실패: {e:#}")));
                 continue;
-            }
-            // 이후 세션 로그에 토큰이 찍히지 않도록 redaction에 등록 (§7)
-            self.redaction.register(&token.access_token);
-            if let Some(refresh) = &token.refresh_token {
-                self.redaction.register(refresh);
             }
             self.oauth_status = Some(OAuthStatus::Done(label));
             added = true;

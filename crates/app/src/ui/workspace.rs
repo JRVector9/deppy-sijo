@@ -3,6 +3,7 @@
 //! mux 배치는 MuxUpdated 스냅샷이 유일한 근거, active tab visible pane만 live render (14.4).
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use runtime::{
@@ -16,6 +17,9 @@ use crate::config::TerminalConfig;
 pub struct WorkspaceUi {
     mux: Option<Arc<MuxSnapshot>>,
     sessions: HashMap<SessionId, SessionView>,
+    /// Runtime이 per-session shell metadata를 제공하기 전까지 path insert quoting에 쓰는
+    /// workspace 기본 shell kind.
+    shell_kind: crate::ui::file_tree::ShellKind,
     /// IME 조합 중 텍스트 (focused pane 전용)
     preedit: String,
     /// 세션별 마지막 전송한 (cols, rows) — 변화 시에만 Resize 전송
@@ -57,6 +61,7 @@ impl WorkspaceUi {
         Self {
             mux: None,
             sessions: HashMap::new(),
+            shell_kind: crate::ui::file_tree::default_shell_kind(),
             preedit: String::new(),
             sent_sizes: HashMap::new(),
             scroll_residual: 0.0,
@@ -494,8 +499,11 @@ impl WorkspaceUi {
                 pane.session_id,
                 pane_resp.dnd_release_payload::<std::path::PathBuf>(),
             ) {
-                let mut bytes = crate::ui::file_tree::shell_quote(&path).into_bytes();
-                bytes.push(b' ');
+                let bytes = path_insert_paste_bytes(
+                    &path,
+                    self.session_shell_kind(session),
+                    self.session_bracketed_paste(session),
+                );
                 self.send(client, RuntimeCommand::WriteInput { session, bytes });
             }
         }
@@ -594,8 +602,7 @@ impl WorkspaceUi {
         // 파일 트리에서 드래그한 경로를 터미널 위에 드롭 → 입력으로 삽입 (2026-07-05).
         // hover 테두리는 위 pane 배경 경로가 pane_rect에 그린다.
         if let Some(path) = output.response.dnd_release_payload::<std::path::PathBuf>() {
-            let mut bytes = crate::ui::file_tree::shell_quote(&path).into_bytes();
-            bytes.push(b' ');
+            let bytes = path_insert_paste_bytes(&path, self.session_shell_kind(session), bracketed);
             self.send(client, RuntimeCommand::WriteInput { session, bytes });
             if !focused {
                 self.send(
@@ -771,6 +778,16 @@ impl WorkspaceUi {
         self.mux.as_ref()
     }
 
+    pub fn session_bracketed_paste(&self, session: SessionId) -> bool {
+        self.sessions
+            .get(&session)
+            .is_some_and(|view| view.bracketed_paste)
+    }
+
+    pub fn session_shell_kind(&self, _session: SessionId) -> crate::ui::file_tree::ShellKind {
+        self.shell_kind
+    }
+
     fn session_alive(&self, session: SessionId) -> bool {
         self.mux.as_ref().is_some_and(|mux| {
             mux.tabs
@@ -807,6 +824,16 @@ impl WorkspaceUi {
             }
         }
     }
+}
+
+/// File-tree/sidebar path insertion uses the same paste byte semantics as clipboard paste.
+pub(crate) fn path_insert_paste_bytes(
+    path: &Path,
+    shell_kind: crate::ui::file_tree::ShellKind,
+    bracketed_paste: bool,
+) -> Vec<u8> {
+    let raw = crate::ui::file_tree::shell_path_insert_bytes_for(path, shell_kind);
+    input_mapper::paste_bytes(&raw, bracketed_paste)
 }
 
 /// 상태 → tab 제목 아이콘 (PR-12).
@@ -1014,5 +1041,50 @@ mod tests {
         assert!(ui.sessions.get(&left).unwrap().snapshot.is_some());
         assert!(ui.sessions.get(&right).unwrap().snapshot.is_some());
         assert!(ui.sessions.get(&right).unwrap().bracketed_paste);
+        assert!(!ui.session_bracketed_paste(left));
+        assert!(ui.session_bracketed_paste(right));
+    }
+
+    #[test]
+    fn path_insert_paste_bytes_required_fixtures는_bracketed와_no_enter를_지킨다() {
+        use crate::ui::file_tree::ShellKind;
+
+        let fixtures = [
+            "src/main.rs",
+            "プロジェクト/設定ファイル.rs",
+            "项目/配置文件.rs",
+            "專案/設定檔.rs",
+            "프로젝트/설정파일.rs",
+            "project/🚀-deploy/config.json",
+        ];
+
+        for fixture in fixtures {
+            let path = Path::new(fixture);
+            for shell in [
+                ShellKind::Posix,
+                ShellKind::Fish,
+                ShellKind::PowerShell,
+                ShellKind::Cmd,
+            ] {
+                let raw = crate::ui::file_tree::shell_path_insert_bytes_for(path, shell);
+                assert_eq!(
+                    path_insert_paste_bytes(path, shell, false),
+                    raw,
+                    "{fixture} {shell:?}"
+                );
+                assert_eq!(raw.last(), Some(&b' '), "{fixture} {shell:?}");
+                assert!(!raw.contains(&b'\n'), "{fixture} {shell:?}");
+                assert!(!raw.contains(&b'\r'), "{fixture} {shell:?}");
+
+                let wrapped = path_insert_paste_bytes(path, shell, true);
+                assert!(wrapped.starts_with(b"\x1b[200~"), "{fixture} {shell:?}");
+                assert!(wrapped.ends_with(b"\x1b[201~"), "{fixture} {shell:?}");
+                let inner = &wrapped[b"\x1b[200~".len()..wrapped.len() - b"\x1b[201~".len()];
+                assert_eq!(inner, raw.as_slice(), "{fixture} {shell:?}");
+                assert_eq!(inner.last(), Some(&b' '), "{fixture} {shell:?}");
+                assert!(!inner.contains(&b'\n'), "{fixture} {shell:?}");
+                assert!(!inner.contains(&b'\r'), "{fixture} {shell:?}");
+            }
+        }
     }
 }

@@ -87,6 +87,104 @@ impl Drop for ApprovalWatcher {
     }
 }
 
+struct AppCredentialService<'a> {
+    db: &'a Db,
+    secret_store: &'a dyn secret::SecretStore,
+    redaction: &'a secret::RedactionService,
+}
+
+impl ui::credentials::CredentialService for AppCredentialService<'_> {
+    fn list_credentials(&self) -> anyhow::Result<Vec<ui::credentials::CredentialListItem>> {
+        Ok(self
+            .db
+            .list_credentials()?
+            .into_iter()
+            .map(|meta| ui::credentials::CredentialListItem {
+                id: meta.id,
+                provider: meta.provider,
+                label: meta.label,
+                credential_kind: meta.credential_kind,
+                masked_hint: meta.masked_hint,
+            })
+            .collect())
+    }
+
+    fn add_credential(&self, credential: ui::credentials::NewCredential) -> anyhow::Result<()> {
+        let secret = secret::SecretString::new(credential.secret);
+        // 새 credential은 즉시 로그 redaction 대상이다. JSON service account 형태도
+        // 필드 단위로 등록해 후속 session/MCP output에서 마스킹된다.
+        self.redaction.register(&secret);
+        self.redaction.register_json_fields(&secret);
+        let id = uuid::Uuid::new_v4().to_string();
+        self.secret_store.set_secret(&id, &secret)?;
+        let meta = crate::storage::CredentialMeta {
+            id: id.clone(),
+            provider: credential.provider,
+            label: credential.label,
+            credential_kind: credential.credential_kind,
+            masked_hint: Some(secret::masked_hint(secret.expose())),
+        };
+        if let Err(e) = self.db.insert_credential(&meta) {
+            if let Err(rollback) = self.secret_store.delete_secret(&id) {
+                tracing::warn!(credential_id = %id, "rollback 실패 — 고아 keyring entry: {rollback:#}");
+            }
+            return Err(e);
+        }
+        tracing::info!(credential_id = %id, "credential 추가");
+        Ok(())
+    }
+
+    fn delete_credential(&self, id: &str) -> anyhow::Result<()> {
+        // 순서 근거:
+        // 1) 참조 검사 — 참조 중이면 아무것도 건드리지 않는다.
+        // 2) keyring 삭제 먼저 — 실패하면 metadata가 남아 사용자가 재시도할 수 있다.
+        // 3) 조건부 DB 삭제 — 참조 race가 생기면 행이 남고, secret은 이미 지워진다.
+        if self.db.credential_in_use(id)? {
+            anyhow::bail!("env var가 참조 중인 credential입니다 — 해당 변수를 먼저 삭제하세요");
+        }
+        self.secret_store.delete_secret(id)?;
+        self.secret_store
+            .delete_secret(&auth::refresh_entry_id(id))?;
+        if !self.db.delete_credential_if_unused(id)? {
+            anyhow::bail!(
+                "삭제 중 env var 참조가 생겼습니다 — secret은 지워졌으니 변수 정리 후 다시 삭제하세요"
+            );
+        }
+        tracing::info!(credential_id = %id, "credential 삭제");
+        Ok(())
+    }
+}
+
+struct AppOAuthCredentialStore<'a> {
+    secret_store: &'a dyn secret::SecretStore,
+    redaction: &'a secret::RedactionService,
+}
+
+impl ui::connectors::OAuthCredentialStore for AppOAuthCredentialStore<'_> {
+    fn store_oauth_token(
+        &self,
+        token: &auth::OAuthToken,
+    ) -> anyhow::Result<ui::connectors::StoredOAuthCredential> {
+        let id = uuid::Uuid::new_v4().to_string();
+        auth::store_token(self.secret_store, &id, token)?;
+        self.redaction.register(&token.access_token);
+        if let Some(refresh) = &token.refresh_token {
+            self.redaction.register(refresh);
+        }
+        Ok(ui::connectors::StoredOAuthCredential {
+            id,
+            masked_hint: secret::masked_hint(token.access_token.expose()),
+        })
+    }
+
+    fn delete_oauth_token(&self, id: &str) -> anyhow::Result<()> {
+        self.secret_store.delete_secret(id)?;
+        self.secret_store
+            .delete_secret(&auth::refresh_entry_id(id))?;
+        Ok(())
+    }
+}
+
 /// 한 workspace의 런타임 상태 묶음 (워커-per-workspace §14.1 준비 — Stage A).
 /// 활성 workspace는 렌더되고, (후속) warm workspace는 이벤트만 드레인된다.
 struct WorkspaceRuntime {
@@ -232,7 +330,7 @@ impl App {
             secret_store: KeyringSecretStore,
             agents_ui: ui::agents::AgentsUi::new(),
             connectors_ui: ui::connectors::ConnectorsUi::new(redaction.clone()),
-            credentials_ui: ui::credentials::CredentialsUi::new(redaction.clone()),
+            credentials_ui: ui::credentials::CredentialsUi::new(),
             env_profiles_ui: ui::env_profiles::EnvProfilesUi::new(),
             notifications_ui: ui::notifications::NotificationsUi::new(),
             approvals_ui: ui::approvals::ApprovalsUi::new(),
@@ -1021,7 +1119,12 @@ impl eframe::App for App {
                     });
                     match session {
                         Some(session) => {
-                            let bytes = ui::file_tree::shell_path_insert_bytes(&path);
+                            let bracketed =
+                                self.active.workspace_ui.session_bracketed_paste(session);
+                            let shell_kind = self.active.workspace_ui.session_shell_kind(session);
+                            let bytes = ui::workspace::path_insert_paste_bytes(
+                                &path, shell_kind, bracketed,
+                            );
                             if let Err(e) = self.active.runtime.send_command(
                                 runtime::RuntimeCommand::WriteInput { session, bytes },
                             ) {
@@ -1074,12 +1177,23 @@ impl eframe::App for App {
             &events,
             &self.db_path,
         );
-        self.credentials_ui
-            .show(ui.ctx(), &self.db, &self.secret_store);
-        if self
-            .connectors_ui
-            .show(ui.ctx(), &mut self.db, &self.active.id, &self.secret_store)
         {
+            let credential_service = AppCredentialService {
+                db: &self.db,
+                secret_store: &self.secret_store,
+                redaction: &self.redaction,
+            };
+            self.credentials_ui.show(ui.ctx(), &credential_service);
+        }
+        let credential_added = {
+            let oauth_store = AppOAuthCredentialStore {
+                secret_store: &self.secret_store,
+                redaction: &self.redaction,
+            };
+            self.connectors_ui
+                .show(ui.ctx(), &mut self.db, &self.active.id, &oauth_store)
+        };
+        if credential_added {
             // OAuth로 credential이 추가됨 — 자격증명 창은 이번 프레임에 이미
             // 그려졌으므로 캐시 무효화 후 다음 프레임을 예약해 즉시 반영한다
             self.credentials_ui.invalidate_cache();
@@ -1342,7 +1456,9 @@ fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
 
     /// 구분 가능한 최소 MuxUpdated 이벤트 (active_tab 태그로 스냅샷을 식별).
     fn mux_event(tag: &str) -> runtime::RuntimeEvent {
@@ -1385,6 +1501,109 @@ mod tests {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(sqlite_sidecar(path, "-wal"));
         let _ = std::fs::remove_file(sqlite_sidecar(path, "-shm"));
+    }
+
+    struct MemSecretStore(Mutex<HashMap<String, String>>);
+
+    impl MemSecretStore {
+        fn new() -> Self {
+            Self(Mutex::new(HashMap::new()))
+        }
+
+        fn contains(&self, id: &str) -> bool {
+            self.0.lock().unwrap().contains_key(id)
+        }
+    }
+
+    impl secret::SecretStore for MemSecretStore {
+        fn set_secret(&self, id: &str, secret: &secret::SecretString) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(id.to_owned(), secret.expose().to_owned());
+            Ok(())
+        }
+
+        fn get_secret(&self, id: &str) -> anyhow::Result<secret::SecretString> {
+            let value = self
+                .0
+                .lock()
+                .unwrap()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing secret: {id}"))?;
+            Ok(secret::SecretString::new(value))
+        }
+
+        fn delete_secret(&self, id: &str) -> anyhow::Result<()> {
+            self.0.lock().unwrap().remove(id);
+            Ok(())
+        }
+
+        fn has_secret(&self, id: &str) -> anyhow::Result<bool> {
+            Ok(self.contains(id))
+        }
+    }
+
+    #[test]
+    fn credentials_service_add_delete_owns_db_and_secret_side_effects() {
+        let path = temp_db_path("credentials-service");
+        let db = storage::Db::open(&path).unwrap();
+        let store = MemSecretStore::new();
+        let redaction = secret::RedactionService::new();
+        let service = AppCredentialService {
+            db: &db,
+            secret_store: &store,
+            redaction: &redaction,
+        };
+
+        ui::credentials::CredentialService::add_credential(
+            &service,
+            ui::credentials::NewCredential {
+                provider: "test".to_owned(),
+                label: "unit".to_owned(),
+                credential_kind: "api_key".to_owned(),
+                secret: "sk-test-boundary-secret".to_owned(),
+            },
+        )
+        .unwrap();
+
+        let rows = db.list_credentials().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(store.contains(&rows[0].id));
+
+        ui::credentials::CredentialService::delete_credential(&service, &rows[0].id).unwrap();
+        assert!(db.list_credentials().unwrap().is_empty());
+        assert!(!store.contains(&rows[0].id));
+
+        drop(db);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn connectors_oauth_secret_adapter_stores_access_and_refresh_tokens() {
+        let store = MemSecretStore::new();
+        let redaction = secret::RedactionService::new();
+        let service = AppOAuthCredentialStore {
+            secret_store: &store,
+            redaction: &redaction,
+        };
+        let token = auth::OAuthToken {
+            access_token: secret::SecretString::new("access-token-secret".to_owned()),
+            refresh_token: Some(secret::SecretString::new("refresh-token-secret".to_owned())),
+            expires_in_secs: Some(3600),
+        };
+
+        let stored =
+            ui::connectors::OAuthCredentialStore::store_oauth_token(&service, &token).unwrap();
+
+        assert!(store.contains(&stored.id));
+        assert!(store.contains(&auth::refresh_entry_id(&stored.id)));
+        assert_eq!(stored.masked_hint, "****cret");
+
+        ui::connectors::OAuthCredentialStore::delete_oauth_token(&service, &stored.id).unwrap();
+        assert!(!store.contains(&stored.id));
+        assert!(!store.contains(&auth::refresh_entry_id(&stored.id)));
     }
 
     #[test]

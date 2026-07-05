@@ -5,7 +5,7 @@ use runtime::{RuntimeClient, RuntimeCommand, RuntimeEvent, SpawnKind};
 
 use crate::config::TerminalConfig;
 use crate::env::EnvValue;
-use crate::storage::{AgentConfigRow, Db};
+use crate::storage::{AgentConfigRow, Db, EnvProfileRow};
 
 /// agent command 등록·실행 창 (설계문서 PR-09/10).
 /// 실행 시 env profile을 선택하면 plain은 값으로, secret은 credential_id로
@@ -29,6 +29,8 @@ pub struct AgentsUi {
     mcp_config_flag: String,
     /// 실행 시 적용할 env profile (None = profile 없이)
     run_profile: Option<String>,
+    /// production profile 실행은 경고 표시만으로는 부족하므로 spawn 직전 확인을 요구한다.
+    pending_production_run: Option<PendingProductionRun>,
     /// 응답(AgentSpawned/SpawnFailed)을 아직 못 받은 실행 수 — 폴링 유지
     pending_launches: u32,
     error: Option<String>,
@@ -50,6 +52,7 @@ impl AgentsUi {
             mcp_proxy_server_id: None,
             mcp_config_flag: String::new(),
             run_profile: None,
+            pending_production_run: None,
             pending_launches: 0,
             error: None,
             cached: None,
@@ -116,6 +119,7 @@ impl AgentsUi {
         if !open {
             self.open = false;
             self.error = None;
+            self.pending_production_run = None;
         }
     }
 
@@ -188,7 +192,7 @@ impl AgentsUi {
         });
 
         let mut delete_id = None;
-        let mut run_config = None;
+        let mut run_config: Option<(AgentConfigRow, Option<String>)> = None;
         for config in &list {
             ui.horizontal(|ui| {
                 ui.label(format!(
@@ -198,22 +202,34 @@ impl AgentsUi {
                     agent_args_for_display(&config.args)
                 ));
                 if ui.button(catalog.t("action.run", &[])).clicked() {
-                    run_config = Some(config.clone());
+                    if let Some((profile_id, profile_name)) =
+                        production_profile_to_confirm(self.run_profile.as_deref(), &profiles)
+                    {
+                        self.pending_production_run = Some(PendingProductionRun {
+                            agent: config.clone(),
+                            profile_id,
+                            profile_name,
+                        });
+                    } else {
+                        run_config = Some((config.clone(), self.run_profile.clone()));
+                    }
                 }
                 if ui.button(catalog.t("action.delete", &[])).clicked() {
                     delete_id = Some(config.id.clone());
                 }
             });
         }
-        if let Some(agent) = run_config {
-            if let Err(e) = self.run(db, config, client, &agent, workspace_id, db_path) {
-                self.error = Some(format!("{e:#}"));
-            } else {
-                self.error = None;
-                self.pending_launches += 1;
-                ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(50));
-            }
+        if let Some((agent, profile_id)) = run_config {
+            self.launch_agent(
+                ui.ctx(),
+                db,
+                config,
+                client,
+                &agent,
+                workspace_id,
+                db_path,
+                profile_id.as_deref(),
+            );
         }
         if let Some(id) = delete_id {
             if let Err(e) = db.delete_agent_config(&id) {
@@ -407,6 +423,93 @@ impl AgentsUi {
         if let Some(error) = &self.error {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
+        self.production_confirm_window(
+            ui.ctx(),
+            db,
+            config,
+            client,
+            workspace_id,
+            db_path,
+            catalog,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn production_confirm_window(
+        &mut self,
+        ctx: &egui::Context,
+        db: &Db,
+        config: &TerminalConfig,
+        client: &dyn RuntimeClient,
+        workspace_id: &str,
+        db_path: &Path,
+        catalog: &i18n::Catalog,
+    ) {
+        let Some(pending) = self.pending_production_run.clone() else {
+            return;
+        };
+        let mut action = ProductionConfirmAction::None;
+        egui::Window::new(catalog.t("agents.production_confirm_title", &[]))
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(catalog.t(
+                    "agents.production_confirm_message",
+                    &[
+                        ("agent", pending.agent.name.as_str()),
+                        ("profile", pending.profile_name.as_str()),
+                    ],
+                ));
+                ui.weak(catalog.t("agents.production_confirm_secret_hint", &[]));
+                ui.horizontal(|ui| {
+                    if ui.button(catalog.t("action.cancel", &[])).clicked() {
+                        action = ProductionConfirmAction::Cancel;
+                    }
+                    if ui.button(catalog.t("action.run", &[])).clicked() {
+                        action = ProductionConfirmAction::Run;
+                    }
+                });
+            });
+        match action {
+            ProductionConfirmAction::None => {}
+            ProductionConfirmAction::Cancel => {
+                self.pending_production_run = None;
+            }
+            ProductionConfirmAction::Run => {
+                self.pending_production_run = None;
+                self.launch_agent(
+                    ctx,
+                    db,
+                    config,
+                    client,
+                    &pending.agent,
+                    workspace_id,
+                    db_path,
+                    Some(pending.profile_id.as_str()),
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_agent(
+        &mut self,
+        ctx: &egui::Context,
+        db: &Db,
+        config: &TerminalConfig,
+        client: &dyn RuntimeClient,
+        agent: &AgentConfigRow,
+        workspace_id: &str,
+        db_path: &Path,
+        profile_id: Option<&str>,
+    ) {
+        if let Err(e) = self.run(db, config, client, agent, workspace_id, db_path, profile_id) {
+            self.error = Some(format!("{e:#}"));
+        } else {
+            self.error = None;
+            self.pending_launches += 1;
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
     }
 
     /// 선택된 profile의 env를 plain/secret(credential_id)으로 나눠 SpawnAgent를 보낸다.
@@ -420,19 +523,22 @@ impl AgentsUi {
         agent: &AgentConfigRow,
         workspace_id: &str,
         db_path: &Path,
+        profile_id: Option<&str>,
     ) -> anyhow::Result<()> {
         let mut env_plain = Vec::new();
         let mut env_secrets = Vec::new();
-        if let Some(profile_id) = &self.run_profile {
+        if let Some(profile_id) = profile_id {
             // 선택된 profile이 **현재 workspace** 것인지 실행 직전에 검증한다 —
             // workspace 전환 후 남은 이전 선택으로 다른 프로젝트의 credential이
             // 주입되는 것 방지 (§6.1, codex P1)
             let owned = db
                 .list_env_profiles(workspace_id)?
                 .iter()
-                .any(|p| &p.id == profile_id);
+                .any(|p| p.id == profile_id);
             if !owned {
-                self.run_profile = None;
+                if self.run_profile.as_deref() == Some(profile_id) {
+                    self.run_profile = None;
+                }
                 anyhow::bail!("선택된 profile이 현재 workspace에 없습니다 — 다시 선택하세요");
             }
             for var in db.list_env_vars(profile_id)? {
@@ -486,6 +592,31 @@ impl AgentsUi {
         })?;
         Ok(())
     }
+}
+
+#[derive(Clone)]
+struct PendingProductionRun {
+    agent: AgentConfigRow,
+    profile_id: String,
+    profile_name: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProductionConfirmAction {
+    None,
+    Cancel,
+    Run,
+}
+
+fn production_profile_to_confirm(
+    run_profile: Option<&str>,
+    profiles: &[EnvProfileRow],
+) -> Option<(String, String)> {
+    let id = run_profile?;
+    profiles
+        .iter()
+        .find(|profile| profile.id == id && profile.is_production)
+        .map(|profile| (profile.id.clone(), profile.name.clone()))
 }
 
 fn agent_args_for_display(args: &[String]) -> String {
@@ -611,6 +742,34 @@ mod tests {
         assert_eq!(
             agent_args_for_display(&["build".to_owned(), "--release".to_owned()]),
             "build --release"
+        );
+    }
+
+    #[test]
+    fn production_profile은_실행전_confirm_대상이다() {
+        let profiles = vec![
+            EnvProfileRow {
+                id: "dev".to_owned(),
+                name: "Development".to_owned(),
+                kind: "local".to_owned(),
+                is_production: false,
+            },
+            EnvProfileRow {
+                id: "prod".to_owned(),
+                name: "Production".to_owned(),
+                kind: "production".to_owned(),
+                is_production: true,
+            },
+        ];
+        assert_eq!(
+            production_profile_to_confirm(Some("prod"), &profiles),
+            Some(("prod".to_owned(), "Production".to_owned()))
+        );
+        assert_eq!(production_profile_to_confirm(Some("dev"), &profiles), None);
+        assert_eq!(production_profile_to_confirm(None, &profiles), None);
+        assert_eq!(
+            production_profile_to_confirm(Some("missing"), &profiles),
+            None
         );
     }
 

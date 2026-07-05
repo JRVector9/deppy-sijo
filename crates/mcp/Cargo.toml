@@ -11,7 +11,6 @@ license.workspace = true
 anyhow = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
-rusqlite = { workspace = true }
 deppy-core = { path = "../core" }
 secret = { path = "../secret" }
 

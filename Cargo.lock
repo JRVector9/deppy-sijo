@@ -2610,7 +2610,6 @@ dependencies = [
  "anyhow",
  "deppy-core",
  "libc",
- "rusqlite",
  "secret",
  "serde_json",
  "tracing",

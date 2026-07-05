@@ -177,7 +177,7 @@ impl StdioClient {
             match self.events.try_recv() {
                 Ok(ReaderEvent::Message(value)) => {
                     if value.get("method").is_some() {
-                        tracing::debug!(?value, "server발 MCP 메시지 무시 (v0 미지원)");
+                        debug_unsupported_server_message(&value, true);
                         continue;
                     }
                     let desc =
@@ -223,11 +223,6 @@ impl StdioClient {
                         // request(ping 등)는 응답을 기다리며 교착할 수 있으므로
                         // method-not-found로 회신한다 (codex 리뷰 반영).
                         // 원문은 로그에 싣지 않는다 — params에 secret 가능 (§7).
-                        let request_method = value
-                            .get("method")
-                            .and_then(Value::as_str)
-                            .unwrap_or("?")
-                            .to_owned();
                         if let Some(request_id) = value.get("id").cloned() {
                             let reply = serde_json::json!({
                                 "jsonrpc": "2.0",
@@ -236,7 +231,7 @@ impl StdioClient {
                             });
                             let _ = self.write_line(&reply);
                         }
-                        tracing::debug!(method = %request_method, "server발 MCP 메시지 (v0 미지원)");
+                        debug_unsupported_server_message(&value, false);
                         continue;
                     }
                     // response — 유일한 outstanding 요청의 id와 일치해야 한다
@@ -266,6 +261,15 @@ impl StdioClient {
                 }
             }
         }
+    }
+}
+
+fn debug_unsupported_server_message(value: &Value, ignored: bool) {
+    let method = value.get("method").and_then(Value::as_str).unwrap_or("?");
+    if ignored {
+        tracing::debug!(method = %method, "server발 MCP 메시지 무시 (v0 미지원)");
+    } else {
+        tracing::debug!(method = %method, "server발 MCP 메시지 (v0 미지원)");
     }
 }
 
@@ -464,6 +468,10 @@ fn append_capped(log: &Mutex<Vec<u8>>, chunk: Vec<u8>) {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
 
     #[test]
     fn jsonrpc_검증() {
@@ -532,5 +540,82 @@ mod tests {
             read_line_capped(&mut reader, 4),
             LineRead::TooLong
         ));
+    }
+
+    #[derive(Clone)]
+    struct CaptureSubscriber {
+        fields: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Subscriber for CaptureSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut visitor = CaptureVisitor {
+                fields: Arc::clone(&self.fields),
+            };
+            event.record(&mut visitor);
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    struct CaptureVisitor {
+        fields: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Visit for CaptureVisitor {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.fields
+                .lock()
+                .unwrap()
+                .push(format!("{}={}", field.name(), value));
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .lock()
+                .unwrap()
+                .push(format!("{}={value:?}", field.name()));
+        }
+    }
+
+    #[test]
+    fn unsolicited_debug_log는_params_전체를_기록하지_않는다() {
+        let fields = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            fields: Arc::clone(&fields),
+        };
+        let value = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": {
+                "Authorization": "Bearer sk-should-not-appear"
+            }
+        });
+
+        tracing::subscriber::with_default(subscriber, || {
+            debug_unsupported_server_message(&value, true);
+        });
+
+        let captured = fields.lock().unwrap().join("\n");
+        assert!(
+            captured.contains("method=notifications/message"),
+            "{captured}"
+        );
+        assert!(!captured.contains("sk-should-not-appear"), "{captured}");
+        assert!(!captured.contains("Authorization"), "{captured}");
     }
 }

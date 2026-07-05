@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use audit::{AuditRecord, PermissionRule, ToolDecision};
 use mcp::{LocalMcpManager, McpServerConfig, PermissionHook, ProxyDecision};
-use secret::{KeyringSecretStore, RedactionService, SecretStore};
+use secret::RedactionService;
 use serde_json::Value;
 use storage::{ApprovalStatus, Db};
 
@@ -22,9 +22,6 @@ pub struct DbPermissionHook {
     server_id: String,
     /// 프리뷰/감사 redaction — 시작 시 DB credential로 시드된다.
     redaction: RedactionService,
-    /// keyring store가 초기화됐는지 — false면 audit encryptor를 넘기지 않는다 (blob NULL).
-    keyring_ok: bool,
-    store: KeyringSecretStore,
     poll_interval: Duration,
     approval_timeout: Duration,
     /// live 스키마 검증용 백엔드 spec + manager (DB 캐시가 아니라 실제 백엔드에서 해시 계산).
@@ -41,7 +38,6 @@ impl DbPermissionHook {
         db: Db,
         server_id: String,
         redaction: RedactionService,
-        keyring_ok: bool,
         poll_interval: Duration,
         approval_timeout: Duration,
         manager: LocalMcpManager,
@@ -51,8 +47,6 @@ impl DbPermissionHook {
             db,
             server_id,
             redaction,
-            keyring_ok,
-            store: KeyringSecretStore,
             poll_interval,
             approval_timeout,
             manager,
@@ -110,14 +104,9 @@ impl DbPermissionHook {
         cache.as_ref().and_then(|m| m.get(tool_name).cloned())
     }
 
-    /// 감사 로그 한 건 기록. input_json 원문은 record_audit이 내부에서 redact/암호화한다.
+    /// 감사 로그 한 건 기록. 기본 경로는 redacted JSON만 저장하고 encrypted raw blob은 NULL이다.
     fn record(&self, tool_name: &str, arguments: &Value, decision: ToolDecision) {
         let input_json = serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_owned());
-        let encryptor: Option<&dyn SecretStore> = if self.keyring_ok {
-            Some(&self.store)
-        } else {
-            None
-        };
         let record = AuditRecord {
             workspace_id: None,
             session_id: None,
@@ -126,10 +115,7 @@ impl DbPermissionHook {
             input_json: &input_json,
             decision,
         };
-        if let Err(e) = self
-            .db
-            .record_tool_audit(&record, &self.redaction, encryptor)
-        {
+        if let Err(e) = self.db.record_tool_audit(&record, &self.redaction, None) {
             tracing::warn!(tool = %tool_name, "audit 기록 실패: {e:#}");
         }
     }
@@ -245,6 +231,10 @@ impl DbPermissionHook {
 
 impl PermissionHook for DbPermissionHook {
     fn check(&self, tool_name: &str, arguments: &Value) -> ProxyDecision {
+        if !arguments.is_object() {
+            tracing::warn!(tool = %tool_name, "tools/call arguments가 object가 아님 — audit/approval 전에 거부");
+            return ProxyDecision::Deny("tools/call arguments는 JSON object여야 합니다".to_owned());
+        }
         let (rule, approved_hash) = match self.current_rule(tool_name) {
             Ok(rule) => rule,
             Err(e) => {
@@ -335,7 +325,6 @@ mod tests {
             Db::open(path).unwrap(),
             "srv-1".to_owned(),
             RedactionService::new(),
-            false, // keyring 없음 — encryptor None
             poll,
             timeout,
             LocalMcpManager::new(RedactionService::new()),
@@ -348,6 +337,17 @@ mod tests {
         let conn = rusqlite::Connection::open(path).unwrap();
         conn.query_row("SELECT count(*) FROM tool_audit_logs", [], |row| row.get(0))
             .unwrap()
+    }
+
+    fn audit_redacted_and_blob(path: &Path) -> (String, Option<Vec<u8>>) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.query_row(
+            "SELECT input_redacted_json, input_encrypted_blob
+             FROM tool_audit_logs ORDER BY created_at, id LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
     }
 
     /// initialize → tools/list로 tool 하나(주어진 name/inputSchema)를 내놓는 mock stdio
@@ -451,6 +451,37 @@ mod tests {
         let decision = hook.check("delete_file", &serde_json::json!({}));
         assert!(matches!(decision, ProxyDecision::Deny(_)));
         assert_eq!(audit_count(&path), 1);
+    }
+
+    #[test]
+    fn 기본_proxy_audit는_redacted_only_blob_null() {
+        let path = temp_db_path();
+        let hook = hook_with(&path, Duration::from_millis(20), Duration::from_secs(5));
+        hook.db
+            .upsert_permission_rule("srv-1", "delete_file", "deny", None)
+            .unwrap();
+
+        let decision = hook.check(
+            "delete_file",
+            &serde_json::json!({"token": "unregistered-secret-xyz"}),
+        );
+
+        assert!(matches!(decision, ProxyDecision::Deny(_)));
+        let (redacted, blob) = audit_redacted_and_blob(&path);
+        assert!(!redacted.contains("unregistered-secret-xyz"), "{redacted}");
+        assert!(redacted.contains("[REDACTED]"), "{redacted}");
+        assert!(blob.is_none(), "encrypted blob must be default-off");
+    }
+
+    #[test]
+    fn hook_non_object_arguments는_audit_없이_거부() {
+        let path = temp_db_path();
+        let hook = hook_with(&path, Duration::from_millis(20), Duration::from_secs(5));
+
+        let decision = hook.check("read_file", &serde_json::json!([1, 2]));
+
+        assert!(matches!(decision, ProxyDecision::Deny(_)));
+        assert_eq!(audit_count(&path), 0);
     }
 
     #[test]

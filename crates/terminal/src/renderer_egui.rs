@@ -43,6 +43,7 @@ pub fn draw(
 
     let cols = snapshot.cols as usize;
     let default_bg = egui::Color32::from_rgb(0x18, 0x18, 0x1c);
+    let selection = selection.and_then(|(a, b)| normalize_selection_range(snapshot, a, b));
     painter.rect_filled(rect, 0.0, default_bg);
 
     for (i, term_cell) in snapshot.visible_cells.iter().enumerate() {
@@ -139,13 +140,9 @@ pub fn draw(
 /// 제거 + 개행, wide_spacer는 건너뛴다 (복사용).
 pub fn selection_text(snapshot: &TerminalViewportSnapshot, start: usize, end: usize) -> String {
     let cols = snapshot.cols as usize;
-    if cols == 0 {
+    let Some((start, end)) = normalize_selection_range(snapshot, start, end) else {
         return String::new();
-    }
-    let end = end.min(snapshot.visible_cells.len().saturating_sub(1));
-    if start > end {
-        return String::new();
-    }
+    };
     let mut out = String::new();
     let mut line = String::new();
     let mut current_row = start / cols;
@@ -166,6 +163,57 @@ pub fn selection_text(snapshot: &TerminalViewportSnapshot, start: usize, end: us
     out
 }
 
+fn normalize_selection_range(
+    snapshot: &TerminalViewportSnapshot,
+    start: usize,
+    end: usize,
+) -> Option<(usize, usize)> {
+    let cols = snapshot.cols as usize;
+    let len = snapshot.visible_cells.len();
+    if cols == 0 || len == 0 {
+        return None;
+    }
+    let end = end.min(len.saturating_sub(1));
+    if start > end {
+        return None;
+    }
+
+    let start = normalize_selection_endpoint(snapshot, start)?;
+    let end = normalize_selection_endpoint(snapshot, end)?;
+    Some(if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    })
+}
+
+fn normalize_selection_endpoint(
+    snapshot: &TerminalViewportSnapshot,
+    index: usize,
+) -> Option<usize> {
+    if index >= snapshot.visible_cells.len() {
+        return None;
+    }
+    if !snapshot.visible_cells[index].wide_spacer {
+        return Some(index);
+    }
+    Some(owning_wide_cell(snapshot, index).unwrap_or(index))
+}
+
+fn owning_wide_cell(snapshot: &TerminalViewportSnapshot, spacer: usize) -> Option<usize> {
+    let cols = snapshot.cols as usize;
+    let cells = &snapshot.visible_cells;
+    if cols == 0 || spacer >= cells.len() || !cells[spacer].wide_spacer {
+        return None;
+    }
+
+    let col = spacer % cols;
+    if col > 0 && cells.get(spacer - 1).is_some_and(|cell| cell.wide) {
+        return Some(spacer - 1);
+    }
+    None
+}
+
 fn rgb(c: [u8; 3]) -> egui::Color32 {
     egui::Color32::from_rgb(c[0], c[1], c[2])
 }
@@ -173,6 +221,8 @@ fn rgb(c: [u8; 3]) -> egui::Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AlacrittyBackend;
+    use crate::backend::TerminalBackend;
     use crate::viewport_snapshot::{CursorShape, CursorSnapshot, TerminalCell};
 
     fn snap(cols: u16, rows: u16, text: &[&str]) -> TerminalViewportSnapshot {
@@ -206,6 +256,24 @@ mod tests {
         }
     }
 
+    fn backend_snap(text: &str) -> TerminalViewportSnapshot {
+        let mut backend = AlacrittyBackend::new(80, 4, 100);
+        backend.feed(text.as_bytes()).unwrap();
+        backend.viewport_snapshot().unwrap()
+    }
+
+    fn full_row_selection_text(snapshot: &TerminalViewportSnapshot) -> String {
+        selection_text(snapshot, 0, snapshot.cols as usize - 1)
+    }
+
+    fn first_wide_spacer(snapshot: &TerminalViewportSnapshot) -> usize {
+        snapshot
+            .visible_cells
+            .iter()
+            .position(|cell| cell.wide_spacer)
+            .expect("fixture should contain a wide spacer")
+    }
+
     #[test]
     fn selection_text_행별_trailing_공백_제거와_개행() {
         let s = snap(8, 3, &["hello", "world ok", "tail"]);
@@ -216,5 +284,78 @@ mod tests {
         // 범위 초과는 clamp, start>end는 빈 문자열
         assert_eq!(selection_text(&s, 16, 999), "tail");
         assert_eq!(selection_text(&s, 5, 2), "");
+    }
+
+    #[test]
+    fn required_fixture_selection_copy_full_rows() {
+        let fixtures = [
+            "src/main.rs",
+            "プロジェクト/設定ファイル.rs",
+            "项目/配置文件.rs",
+            "專案/設定檔.rs",
+            "프로젝트/설정파일.rs",
+            "project/🚀-deploy/config.json",
+        ];
+
+        for fixture in fixtures {
+            let snapshot = backend_snap(fixture);
+            assert_eq!(full_row_selection_text(&snapshot), fixture, "{fixture}");
+        }
+
+        let ascii = backend_snap("src/main.rs");
+        assert_eq!(selection_text(&ascii, 4, 7), "main");
+    }
+
+    #[test]
+    fn cjk_wide_spacer_selection_endpoints_include_owner() {
+        let fixtures = [
+            "プロジェクト/設定ファイル.rs",
+            "项目/配置文件.rs",
+            "專案/設定檔.rs",
+            "프로젝트/설정파일.rs",
+        ];
+
+        for fixture in fixtures {
+            let snapshot = backend_snap(fixture);
+            let spacer = first_wide_spacer(&snapshot);
+            let owner = owning_wide_cell(&snapshot, spacer).expect("wide spacer owner");
+            let owner_text = snapshot.visible_cells[owner].c.to_string();
+
+            assert_eq!(
+                selection_text(&snapshot, spacer, snapshot.cols as usize - 1),
+                fixture,
+                "start on spacer should copy full fixture: {fixture}"
+            );
+            assert_eq!(
+                selection_text(&snapshot, spacer, spacer),
+                owner_text,
+                "single spacer selection should copy owning char: {fixture}"
+            );
+            assert_eq!(
+                selection_text(&snapshot, owner, spacer),
+                owner_text,
+                "end on spacer should copy owning char: {fixture}"
+            );
+        }
+    }
+
+    #[test]
+    fn emoji_path_fixture_selection_copy_preserves_rocket() {
+        let snapshot = backend_snap("project/🚀-deploy/config.json");
+        assert_eq!(
+            full_row_selection_text(&snapshot),
+            "project/🚀-deploy/config.json"
+        );
+
+        let spacer = snapshot
+            .visible_cells
+            .iter()
+            .enumerate()
+            .find_map(|(index, cell)| {
+                let owner = owning_wide_cell(&snapshot, index)?;
+                (cell.wide_spacer && snapshot.visible_cells[owner].c == '🚀').then_some(index)
+            })
+            .expect("rocket fixture should contain a wide spacer");
+        assert_eq!(selection_text(&snapshot, spacer, spacer), "🚀");
     }
 }

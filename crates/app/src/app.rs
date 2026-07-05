@@ -3,11 +3,89 @@ use std::path::{Path, PathBuf};
 use runtime::{InProcessRuntimeClient, RuntimeCommandSink, RuntimeEventReceiver};
 
 use crate::config::Config;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use crate::storage::Db;
 use crate::ui;
+use mcp_store::PendingApprovalRow;
 use secret::KeyringSecretStore;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ApprovalPendingSignature(Vec<String>);
+
+impl ApprovalPendingSignature {
+    fn from_rows(rows: &[PendingApprovalRow]) -> Self {
+        Self(rows.iter().map(|row| row.id.clone()).collect())
+    }
+}
+
+struct ApprovalWatcher {
+    stop_tx: Option<std::sync::mpsc::Sender<()>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ApprovalWatcher {
+    fn spawn(
+        db_path: PathBuf,
+        ctx: egui::Context,
+        poll_requested: Arc<AtomicBool>,
+        interval: std::time::Duration,
+    ) -> Self {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("approval-watcher".to_owned())
+            .spawn(move || {
+                let db = match Db::open(&db_path) {
+                    Ok(db) => db,
+                    Err(e) => {
+                        tracing::warn!("approval watcher DB 열기 실패: {e:#}");
+                        return;
+                    }
+                };
+                let mut last = ApprovalPendingSignature::default();
+                loop {
+                    match stop_rx.recv_timeout(interval) {
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    match db.list_pending_approvals() {
+                        Ok(rows) => {
+                            let next = ApprovalPendingSignature::from_rows(&rows);
+                            if next != last {
+                                last = next;
+                                poll_requested.store(true, Ordering::Release);
+                                ctx.request_repaint();
+                            }
+                        }
+                        Err(e) => tracing::warn!("approval watcher 조회 실패: {e:#}"),
+                    }
+                }
+            })
+            .expect("approval watcher thread spawn");
+        Self {
+            stop_tx: Some(stop_tx),
+            handle: Some(handle),
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for ApprovalWatcher {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
 
 /// 한 workspace의 런타임 상태 묶음 (워커-per-workspace §14.1 준비 — Stage A).
 /// 활성 workspace는 렌더되고, (후속) warm workspace는 이벤트만 드레인된다.
@@ -47,8 +125,10 @@ pub struct App {
     notifications_ui: ui::notifications::NotificationsUi,
     /// agent-proxy 승인 팝업 (option 1.5). proxy가 DB에 쓴 pending 행을 폴링해 표시한다.
     approvals_ui: ui::approvals::ApprovalsUi,
-    /// 승인 목록 폴링 스로틀 — logic()이 매 프레임 돌아도 DB 조회는 ~500ms 간격으로.
-    last_approval_poll: std::time::Instant,
+    /// watcher가 pending approval 목록 변화를 감지하면 logic()이 한 번만 DB를 읽게 하는 플래그.
+    approval_poll_requested: Arc<AtomicBool>,
+    /// 외부 proxy가 DB에 쓴 pending approval 변화를 감지해 UI를 깨운다.
+    approval_watcher: ApprovalWatcher,
     /// 마지막 오프스크린 창 위치 보정 시각 (쿨다운용)
     last_offscreen_fix: std::time::Instant,
     /// 시작 시 창을 주 화면으로 1회 이동했다 (centered의 macOS 좌표 문제 우회)
@@ -136,6 +216,14 @@ impl App {
             }
         }
 
+        let approval_poll_requested = Arc::new(AtomicBool::new(false));
+        let approval_watcher = ApprovalWatcher::spawn(
+            db_path.clone(),
+            egui_ctx.clone(),
+            approval_poll_requested.clone(),
+            std::time::Duration::from_millis(Self::APPROVAL_POLL_MS),
+        );
+
         let mut app = Self {
             config,
             config_path,
@@ -148,8 +236,8 @@ impl App {
             env_profiles_ui: ui::env_profiles::EnvProfilesUi::new(),
             notifications_ui: ui::notifications::NotificationsUi::new(),
             approvals_ui: ui::approvals::ApprovalsUi::new(),
-            // 첫 폴링은 ~POLL 간격 뒤 (시작 시 500ms 지연은 허용 가능한 절충).
-            last_approval_poll: std::time::Instant::now(),
+            approval_poll_requested,
+            approval_watcher,
             last_offscreen_fix: std::time::Instant::now(),
             startup_positioned: false,
             active,
@@ -174,6 +262,7 @@ impl App {
             known_hosts_cache: None,
             file_tree: None,
         };
+        app.poll_pending_approvals();
         // 파일 트리 헤더(workspace 이름) 표시용 — 시작 시 1회 로드
         app.refresh_workspaces();
         if app.config.ui.file_tree_enabled {
@@ -197,8 +286,7 @@ impl App {
     /// Suspended(워커 shutdown). active + MAX_WARM개까지 워커가 동시 실행될 수 있다.
     const MAX_WARM: usize = 2;
 
-    /// 승인 폴링 간격(ms). 배터리↔지연 절충 — 더 똑똑한 크로스-프로세스 신호는 후속 과제.
-    /// idle에서도 이 주기로 프레임을 예약해 pending 승인을 ~0.5s 내 감지한다.
+    /// 승인 watcher 폴링 간격(ms). frame 예약은 하지 않고, pending 상태 변화 때만 UI를 깨운다.
     const APPROVAL_POLL_MS: u64 = 500;
 
     /// 한 workspace의 런타임 워커를 만든다: 생성 → wake 구독 → 저장 layout 복원 →
@@ -729,10 +817,18 @@ impl App {
             }
         }
     }
+
+    fn poll_pending_approvals(&mut self) {
+        match self.db.list_pending_approvals() {
+            Ok(rows) => self.approvals_ui.set_pending(rows),
+            Err(e) => tracing::warn!("승인 목록 조회 실패: {e:#}"),
+        }
+    }
 }
 
 impl eframe::App for App {
     fn on_exit(&mut self) {
+        self.approval_watcher.stop();
         // remote TLS 서버를 먼저 정지 — accept 루프·접속·전용 worker(그 세션들 reap)를 정리한다.
         if let Some(state) = self.remote.take() {
             state.server.shutdown();
@@ -856,19 +952,8 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
-        // agent-proxy 승인 폴링 (option 1.5). proxy(별도 프로세스)가 DB에 쓴 pending 행을
-        // 주기적으로 읽어 approvals_ui에 넘긴다. 팝업 자체는 ui()(가시)에서만 뜨지만,
-        // 여기서 폴링해 목록을 신선하게 유지한다. egui는 필요 시에만 리페인트하므로 idle에도
-        // ~0.5s 내 감지되도록 다음 프레임을 예약한다 (쿼리는 인덱스라 저렴).
-        ctx.request_repaint_after(std::time::Duration::from_millis(Self::APPROVAL_POLL_MS));
-        if self.last_approval_poll.elapsed()
-            >= std::time::Duration::from_millis(Self::APPROVAL_POLL_MS)
-        {
-            self.last_approval_poll = std::time::Instant::now();
-            match self.db.list_pending_approvals() {
-                Ok(rows) => self.approvals_ui.set_pending(rows),
-                Err(e) => tracing::warn!("승인 목록 조회 실패: {e:#}"),
-            }
+        if self.approval_poll_requested.swap(false, Ordering::AcqRel) {
+            self.poll_pending_approvals();
         }
     }
 
@@ -1258,6 +1343,7 @@ fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
 
     /// 구분 가능한 최소 MuxUpdated 이벤트 (active_tab 태그로 스냅샷을 식별).
     fn mux_event(tag: &str) -> runtime::RuntimeEvent {
@@ -1277,6 +1363,29 @@ mod tests {
             }
             _ => None,
         }
+    }
+
+    fn temp_db_path(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "deppy-sijo-{name}-{}-{nanos}.sqlite3",
+            std::process::id()
+        ))
+    }
+
+    fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
+        let mut file_name = path.as_os_str().to_owned();
+        file_name.push(suffix);
+        PathBuf::from(file_name)
+    }
+
+    fn remove_sqlite_files(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(sqlite_sidecar(path, "-wal"));
+        let _ = std::fs::remove_file(sqlite_sidecar(path, "-shm"));
     }
 
     #[test]
@@ -1307,6 +1416,60 @@ h:1 EE:FF
         assert_eq!(rows.len(), 2);
         assert!(rows.contains(&("h:1".to_owned(), "ee:ff".to_owned())));
         assert!(rows.contains(&("h:2".to_owned(), "cc:dd".to_owned())));
+    }
+
+    #[test]
+    fn approval_watcher_empty_db는_repaint를_예약하지_않는다() {
+        let path = temp_db_path("approval-empty");
+        let db = storage::Db::open(&path).unwrap();
+        let ctx = egui::Context::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        ctx.set_request_repaint_callback(move |info| {
+            let _ = tx.send(info.delay);
+        });
+        let poll_requested = Arc::new(AtomicBool::new(false));
+        let mut watcher = ApprovalWatcher::spawn(
+            path.clone(),
+            ctx,
+            poll_requested.clone(),
+            std::time::Duration::from_millis(20),
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(90));
+
+        assert!(rx.try_recv().is_err());
+        assert!(!poll_requested.load(Ordering::Acquire));
+        watcher.stop();
+        drop(db);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn approval_watcher_pending_삽입시_ui를_깨운다() {
+        let path = temp_db_path("approval-pending");
+        let db = storage::Db::open(&path).unwrap();
+        let ctx = egui::Context::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        ctx.set_request_repaint_callback(move |info| {
+            let _ = tx.send(info.delay);
+        });
+        let poll_requested = Arc::new(AtomicBool::new(false));
+        let mut watcher = ApprovalWatcher::spawn(
+            path.clone(),
+            ctx,
+            poll_requested.clone(),
+            std::time::Duration::from_millis(20),
+        );
+
+        db.insert_pending_approval("req-1", "srv", "tool", "{}", None, 100)
+            .unwrap();
+
+        let delay = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert_eq!(delay, std::time::Duration::ZERO);
+        assert!(poll_requested.load(Ordering::Acquire));
+        watcher.stop();
+        drop(db);
+        remove_sqlite_files(&path);
     }
 
     #[test]

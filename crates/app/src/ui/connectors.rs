@@ -155,13 +155,13 @@ impl ConnectorsUi {
     }
 
     /// 새 credential이 등록됐으면 true (호출측이 자격증명 창 캐시를 무효화).
-    /// `secret_store`는 감사 로그의 input_encrypted_blob 암호화에 쓰인다 (§7).
+    /// raw/encrypted audit input 보존은 명시 opt-in 전까지 기본 비활성이다.
     pub fn show(
         &mut self,
         ctx: &egui::Context,
         db: &mut Db,
         workspace_id: &str,
-        secret_store: &dyn SecretStore,
+        _secret_store: &dyn SecretStore,
     ) -> bool {
         // 백그라운드 결과는 창이 닫혀 있어도 소화한다 (다시 열 때 최신 상태)
         self.drain_results(db);
@@ -174,9 +174,7 @@ impl ConnectorsUi {
         egui::Window::new("연결")
             .open(&mut open)
             .resizable(false)
-            .show(ctx, |ui| {
-                self.contents(ui, ctx, db, workspace_id, secret_store)
-            });
+            .show(ctx, |ui| self.contents(ui, ctx, db, workspace_id));
         self.open = open;
         credential_added
     }
@@ -223,7 +221,6 @@ impl ConnectorsUi {
         ctx: &egui::Context,
         db: &mut Db,
         workspace_id: &str,
-        secret_store: &dyn SecretStore,
     ) {
         if !self.rules_loaded {
             self.load_permission_rules(db);
@@ -253,7 +250,7 @@ impl ConnectorsUi {
 
         // 도구 실행 패널 (선택된 tool이 있을 때) — 정책 평가·승인·실행·감사
         if self.invoke.is_some() {
-            self.tool_invoke_panel(ui, ctx, db, workspace_id, secret_store);
+            self.tool_invoke_panel(ui, ctx, db, workspace_id);
         }
 
         ui.separator();
@@ -509,7 +506,6 @@ impl ConnectorsUi {
         ctx: &egui::Context,
         db: &mut Db,
         workspace_id: &str,
-        secret_store: &dyn SecretStore,
     ) {
         ui.separator();
         let Some(mut inv) = self.invoke.take() else {
@@ -521,12 +517,19 @@ impl ConnectorsUi {
             && let Some(hash) = inv.prepared_hash.take()
         {
             inv.schema_hash = hash;
-            let request = request_of(&inv);
-            inv.phase = match self.policy.evaluate(&request) {
-                audit::PolicyEvaluation::Decided(decision) => {
-                    self.run_tool(&inv, db, workspace_id, secret_store, ctx, decision)
+            inv.phase = match parse_tool_arguments(&inv.input) {
+                Err(message) => InvokePhase::Failed(message),
+                Ok(_) => {
+                    let request = request_of(&inv);
+                    match self.policy.evaluate(&request) {
+                        audit::PolicyEvaluation::Decided(decision) => {
+                            self.run_tool(&inv, db, workspace_id, ctx, decision)
+                        }
+                        audit::PolicyEvaluation::NeedsApproval(reason) => {
+                            InvokePhase::Approval(reason)
+                        }
+                    }
                 }
-                audit::PolicyEvaluation::NeedsApproval(reason) => InvokePhase::Approval(reason),
             };
         }
         enum Act {
@@ -622,6 +625,11 @@ impl ConnectorsUi {
             Act::None => self.invoke = Some(inv),
             Act::Close => {} // inv drop
             Act::Submit => {
+                if let Err(message) = parse_tool_arguments(&inv.input) {
+                    inv.phase = InvokePhase::Failed(message);
+                    self.invoke = Some(inv);
+                    return;
+                }
                 let request = request_of(&inv);
                 // Deny 규칙은 스키마와 무관 — prepare(서버 spawn) 없이 즉시 거부+감사.
                 // 그 외(Allow/Ask)는 stale hash로 우회되지 않도록 현재 스키마를 재확인한다.
@@ -629,7 +637,7 @@ impl ConnectorsUi {
                     decision @ audit::ToolDecision::PolicyDeny,
                 ) = self.policy.evaluate(&request)
                 {
-                    self.run_tool(&inv, db, workspace_id, secret_store, ctx, decision)
+                    self.run_tool(&inv, db, workspace_id, ctx, decision)
                 } else {
                     self.start_prepare(&inv, ctx);
                     inv.prepared_hash = None;
@@ -638,6 +646,11 @@ impl ConnectorsUi {
                 self.invoke = Some(inv);
             }
             Act::Decide(decision) => {
+                if let Err(message) = parse_tool_arguments(&inv.input) {
+                    inv.phase = InvokePhase::Failed(message);
+                    self.invoke = Some(inv);
+                    return;
+                }
                 let request = request_of(&inv);
                 self.policy.apply_decision(&request, decision);
                 // Always 계열은 규칙이 바뀌므로 영속한다 (재시작해도 유지)
@@ -656,7 +669,7 @@ impl ConnectorsUi {
                         tracing::warn!("권한 규칙 저장 실패: {e:#}");
                     }
                 }
-                inv.phase = self.run_tool(&inv, db, workspace_id, secret_store, ctx, decision);
+                inv.phase = self.run_tool(&inv, db, workspace_id, ctx, decision);
                 self.invoke = Some(inv);
             }
         }
@@ -688,27 +701,23 @@ impl ConnectorsUi {
         });
     }
 
-    /// 감사 기록(redacted + 암호화) 후, 허용이면 백그라운드로 tools/call 실행.
+    /// 감사 기록(redacted only; encrypted raw input 기본 비활성) 후, 허용이면
+    /// 백그라운드로 tools/call 실행.
     /// 반환은 다음 phase (Running 또는 Failed).
     fn run_tool(
         &self,
         inv: &ToolInvoke,
         db: &Db,
         workspace_id: &str,
-        secret_store: &dyn SecretStore,
         ctx: &egui::Context,
         decision: audit::ToolDecision,
     ) -> InvokePhase {
-        // 인자 크기 상한 — 큰 JSON이 stdin pipe buffer를 채우면 write_all이 영구 블록돼
-        // UI가 Running에 갇힌다. 감사(redact/암호화/저장) '전에' 검사해 과대 입력이
-        // crypto/DB 자원을 소모하지 않게 한다 (codex 리뷰).
-        if inv.input.len() > MAX_TOOL_INPUT {
-            return InvokePhase::Failed(format!(
-                "인자가 너무 큽니다 (최대 {}KB)",
-                MAX_TOOL_INPUT / 1024
-            ));
-        }
-        // 감사: redacted 저장 + 전체 원본 암호화(§7). 실패해도 실행 판단엔 영향 없음.
+        let arguments = match parse_tool_arguments(&inv.input) {
+            Ok(arguments) => arguments,
+            Err(message) => return InvokePhase::Failed(message),
+        };
+        // 감사: 기본 경로는 redacted JSON만 저장하고 encrypted raw blob은 NULL로 둔다.
+        // raw/encrypted input 보존은 명시 opt-in plumbing이 생긴 뒤에만 Some(encryptor)를 넘긴다.
         let record = audit::AuditRecord {
             workspace_id: Some(workspace_id),
             session_id: None,
@@ -717,18 +726,12 @@ impl ConnectorsUi {
             input_json: &inv.input,
             decision,
         };
-        if let Err(e) = db.record_tool_audit(&record, &self.redaction, Some(secret_store)) {
+        if let Err(e) = db.record_tool_audit(&record, &self.redaction, None) {
             tracing::warn!("tool 감사 기록 실패: {e:#}");
         }
         if !decision.is_allowed() {
             return InvokePhase::Failed("정책상 거부됨".to_owned());
         }
-        // 인자는 JSON object여야 한다 (MCP 스펙)
-        let arguments: serde_json::Value = match serde_json::from_str(&inv.input) {
-            Ok(value @ serde_json::Value::Object(_)) => value,
-            Ok(_) => return InvokePhase::Failed("인자는 JSON object여야 합니다".to_owned()),
-            Err(e) => return InvokePhase::Failed(format!("인자 JSON 파싱 실패: {e}")),
-        };
         let config = McpServerConfig {
             name: inv.server_name.clone(),
             command: inv.command.clone(),
@@ -857,6 +860,22 @@ fn request_of(inv: &ToolInvoke) -> audit::ToolApprovalRequest {
     }
 }
 
+fn parse_tool_arguments(input: &str) -> Result<serde_json::Value, String> {
+    // 인자 크기 상한 — 큰 JSON이 stdin pipe buffer를 채우면 write_all이 영구 블록돼
+    // UI가 Running에 갇힌다. policy/approval/audit 전에 막아 DB/crypto 자원도 쓰지 않는다.
+    if input.len() > MAX_TOOL_INPUT {
+        return Err(format!(
+            "인자가 너무 큽니다 (최대 {}KB)",
+            MAX_TOOL_INPUT / 1024
+        ));
+    }
+    match serde_json::from_str(input) {
+        Ok(value @ serde_json::Value::Object(_)) => Ok(value),
+        Ok(_) => Err("인자는 JSON object여야 합니다".to_owned()),
+        Err(e) => Err(format!("인자 JSON 파싱 실패: {e}")),
+    }
+}
+
 fn tool_rows(server_id: &str, tools: &[McpTool]) -> Vec<McpToolRow> {
     tools
         .iter()
@@ -875,6 +894,47 @@ fn tool_rows(server_id: &str, tools: &[McpTool]) -> Vec<McpToolRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_db_path() -> PathBuf {
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("deppy-connectors-test-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("metadata.sqlite3")
+    }
+
+    fn audit_rows(path: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT input_redacted_json, input_encrypted_blob
+                 FROM tool_audit_logs ORDER BY created_at, id",
+            )
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn invoke_with_input(input: &str) -> ToolInvoke {
+        ToolInvoke {
+            server_id: "srv-1".to_owned(),
+            server_name: "mock".to_owned(),
+            command: "/nonexistent/deppy-connectors-test".to_owned(),
+            args: Vec::new(),
+            tool_name: "read_file".to_owned(),
+            schema_hash: audit::schema_hash(r#"{"type":"object"}"#),
+            input: input.to_owned(),
+            phase: InvokePhase::Editing,
+            generation: 1,
+            prepared_hash: None,
+        }
+    }
 
     #[test]
     fn tool_rows는_schema_hash를_계산한다() {
@@ -891,5 +951,57 @@ mod tests {
         );
         assert_eq!(rows[0].server_id, "srv-1");
         assert_eq!(rows[0].trust_level, "unknown");
+    }
+
+    #[test]
+    fn tool_arguments는_json_object만_허용한다() {
+        assert!(parse_tool_arguments(r#"{"path":"/tmp/x"}"#).is_ok());
+        assert!(
+            parse_tool_arguments("{bad")
+                .unwrap_err()
+                .contains("파싱 실패")
+        );
+        assert_eq!(
+            parse_tool_arguments("[1,2]").unwrap_err(),
+            "인자는 JSON object여야 합니다"
+        );
+    }
+
+    #[test]
+    fn connector_audit_기본값은_redacted_only_blob_null() {
+        let path = temp_db_path();
+        let db = Db::open(&path).unwrap();
+        let ui = ConnectorsUi::new(RedactionService::new());
+        let ctx = egui::Context::default();
+        let inv = invoke_with_input(r#"{"token":"sk-unregistered-secret","path":"/tmp/x"}"#);
+
+        let phase = ui.run_tool(&inv, &db, "ws-1", &ctx, audit::ToolDecision::DenyOnce);
+
+        assert!(matches!(phase, InvokePhase::Failed(_)));
+        let rows = audit_rows(&path);
+        assert_eq!(rows.len(), 1);
+        assert!(
+            !rows[0].0.contains("sk-unregistered-secret"),
+            "{}",
+            rows[0].0
+        );
+        assert!(rows[0].0.contains("[REDACTED]"), "{}", rows[0].0);
+        assert!(rows[0].1.is_none(), "encrypted blob must be default-off");
+    }
+
+    #[test]
+    fn connector_invalid_input은_audit_없이_local_error() {
+        let path = temp_db_path();
+        let db = Db::open(&path).unwrap();
+        let ui = ConnectorsUi::new(RedactionService::new());
+        let ctx = egui::Context::default();
+
+        for input in ["{bad", "[1,2]"] {
+            let inv = invoke_with_input(input);
+            let phase = ui.run_tool(&inv, &db, "ws-1", &ctx, audit::ToolDecision::DenyOnce);
+            assert!(matches!(phase, InvokePhase::Failed(_)));
+        }
+
+        assert!(audit_rows(&path).is_empty());
     }
 }

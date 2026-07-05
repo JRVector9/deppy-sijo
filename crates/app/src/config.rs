@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+const MIN_OUTPUT_BATCH_MS: u64 = 16;
+
 /// config.toml 루트. 각 항목의 소비처는 설계문서 v2.5 참조.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -126,7 +128,10 @@ impl Config {
             TerminalConfig::default().font_size
         };
         t.scrollback_lines = t.scrollback_lines.clamp(100, 100_000);
-        self.performance.output_batch_ms = self.performance.output_batch_ms.clamp(1, 1_000);
+        self.performance.output_batch_ms = self
+            .performance
+            .output_batch_ms
+            .clamp(MIN_OUTPUT_BATCH_MS, 1_000);
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
@@ -157,8 +162,16 @@ mod tests {
         let config = Config::load_or_create(&dir).unwrap();
         assert_eq!(config.terminal.font_size, 32.0);
         assert_eq!(config.terminal.scrollback_lines, 100);
-        assert_eq!(config.performance.output_batch_ms, 1); // 0이면 busy-poll
+        assert_eq!(config.performance.output_batch_ms, MIN_OUTPUT_BATCH_MS);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn output_batch_1ms도_16ms로_정규화() {
+        let mut config = Config::default();
+        config.performance.output_batch_ms = 1;
+        config.normalize();
+        assert_eq!(config.performance.output_batch_ms, MIN_OUTPUT_BATCH_MS);
     }
 
     #[test]

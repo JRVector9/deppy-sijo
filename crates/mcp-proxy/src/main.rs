@@ -44,12 +44,12 @@ fn main() -> anyhow::Result<()> {
         .with_context(|| format!("MCP 서버 '{}'를 DB에서 찾을 수 없음", cli.server_id))?;
     let config = server_config(&server)?;
 
-    // keyring store 등록 (credential redaction 시드 + audit blob 암호화에 필요).
-    // 실패해도 프록시는 동작한다 — 시드/암호화만 비활성 (best-effort, insecure fallback 아님).
+    // keyring store 등록 (credential redaction 시드용).
+    // 실패해도 프록시는 동작한다 — 시드만 비활성 (best-effort, insecure fallback 아님).
     let keyring_ok = match secret::init_platform_store() {
         Ok(()) => true,
         Err(e) => {
-            tracing::warn!("keyring store 초기화 실패 — redaction 시드/audit 암호화 비활성: {e:#}");
+            tracing::warn!("keyring store 초기화 실패 — redaction 시드 생략: {e:#}");
             false
         }
     };
@@ -81,7 +81,6 @@ fn main() -> anyhow::Result<()> {
         db,
         cli.server_id,
         redaction,
-        keyring_ok,
         cli.poll_interval,
         cli.approval_timeout,
         hook_manager,

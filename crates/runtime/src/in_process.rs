@@ -961,6 +961,12 @@ impl Worker {
         ) {
             Ok(new_session) => {
                 self.sessions.insert(id, new_session);
+                // 복원된 셸도 status detector 설치 — 없으면 상태 감지가 아예 안 됐다
+                // (셸 135가 복원 셸이라 built-in 프롬프트 감지도 무동작, #92/#93).
+                self.detectors.insert(
+                    id,
+                    StatusDetector::new(StatusPatterns::compile(None, None, None, None)),
+                );
                 self.open_session_log(id);
                 pane.session_id = Some(id);
                 if let Some(pipe) = &mut self.persist {
@@ -1008,6 +1014,11 @@ impl Worker {
         ) {
             Ok(new_session) => {
                 self.sessions.insert(id, new_session);
+                // 분할로 만든 셸도 status detector 설치 (감지 누락 방지, #92/#93).
+                self.detectors.insert(
+                    id,
+                    StatusDetector::new(StatusPatterns::compile(None, None, None, None)),
+                );
                 self.open_session_log(id);
                 if let Some(pipe) = &mut self.persist {
                     let args: Vec<String> = self.shell.args.clone();

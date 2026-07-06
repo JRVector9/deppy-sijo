@@ -873,6 +873,46 @@ impl WorkspaceUi {
                         image_paste_requested = true;
                         continue;
                     }
+                    // Shift+화살표 → 마우스 드래그처럼 선택 확장. 터미널로는 안 보낸다.
+                    // alt-screen(vim/less 등 TUI)에선 앱이 shift+화살표를 쓰므로 가로채지
+                    // 않고 그대로 통과시킨다.
+                    if !snapshot.is_alt_screen
+                        && let egui::Event::Key {
+                            key,
+                            pressed: true,
+                            modifiers: m,
+                            ..
+                        } = event
+                        && m.shift
+                        && matches!(
+                            key,
+                            egui::Key::ArrowLeft
+                                | egui::Key::ArrowRight
+                                | egui::Key::ArrowUp
+                                | egui::Key::ArrowDown
+                        )
+                    {
+                        let cols = snapshot.cols as usize;
+                        let max_idx = (cols * snapshot.rows as usize).saturating_sub(1);
+                        // 앵커: 기존 선택이 있으면 유지, 없으면 커서 위치에서 시작.
+                        let (anchor, end) = match self.selection {
+                            Some((s, a, e)) if s == session => (a, e),
+                            _ => {
+                                let cur = snapshot.cursor.row as usize * cols
+                                    + snapshot.cursor.col as usize;
+                                (cur, cur)
+                            }
+                        };
+                        let new_end = match key {
+                            egui::Key::ArrowRight => (end + 1).min(max_idx),
+                            egui::Key::ArrowLeft => end.saturating_sub(1),
+                            egui::Key::ArrowDown => (end + cols).min(max_idx),
+                            egui::Key::ArrowUp => end.saturating_sub(cols),
+                            _ => end,
+                        };
+                        self.selection = Some((session, anchor, new_end));
+                        continue;
+                    }
                     if let Some(bytes) = input_mapper::map_event(event, bracketed, &modifiers) {
                         pending.extend(bytes);
                     }

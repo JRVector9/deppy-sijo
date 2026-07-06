@@ -34,6 +34,14 @@ fn main() -> anyhow::Result<()> {
         .with_ansi(false)
         .init();
 
+    // `deppy-mcp-proxy hooks --db <path> --event <needs-input|clear>` — claude/codex hook
+    // 수신부. env DEPPY_SESSION_ID(=pane_id)로 needsInput을 DB에 set/clear하고 즉시 종료
+    // (프록시 안 뜬다). stdin(hook payload)은 소비만 하고 안 씀 — 이벤트 타입으로 충분.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("hooks") {
+        return run_hooks(&args[2..]);
+    }
+
     let cli = Cli::from_env()?;
     let db = storage::Db::open(&cli.db_path)?;
 
@@ -101,6 +109,37 @@ fn main() -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     run_proxy(stdin.lock(), stdout.lock(), forwarder, hook)
+}
+
+/// claude/codex hook 수신: `--db <path> --event <needs-input|clear>`, 세션은 env
+/// DEPPY_SESSION_ID(=pane_id). needsInput을 DB에 set/clear하고 즉시 종료한다.
+/// **hook은 절대 에이전트를 막으면 안 되므로** 뭐가 없거나 실패해도 조용히 성공 반환한다.
+fn run_hooks(args: &[String]) -> anyhow::Result<()> {
+    let mut db_path: Option<std::path::PathBuf> = None;
+    let mut event: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--db" => db_path = it.next().map(std::path::PathBuf::from),
+            "--event" => event = it.next().cloned(),
+            _ => {}
+        }
+    }
+    // codex는 hook stdout이 유효 JSON이길 기대 — 무슨 일이 있어도 '{}' 출력.
+    println!("{{}}");
+    let Some(session_key) = std::env::var("DEPPY_SESSION_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(());
+    };
+    let (Some(db_path), Some(event)) = (db_path, event) else {
+        return Ok(());
+    };
+    if let Ok(db) = storage::Db::open(&db_path) {
+        let _ = db.set_agent_needs_input(&session_key, event == "needs-input");
+    }
+    Ok(())
 }
 
 /// 현재 unix epoch seconds. 정상 시스템 시계에서 UNIX_EPOCH 이후이므로 0으로 폴백.

@@ -158,6 +158,15 @@ CREATE TABLE agent_sessions (
     PRIMARY KEY (workspace_id, pane_id)
 );
 ",
+    // 14: 에이전트 needsInput(승인/입력 대기) — claude/codex hook이 세션 키(DEPPY_SESSION_ID
+    // = pane_id)로 set/clear한다. 앱이 레일 상태(주황)에 반영. hook 수신은 deppy-mcp-proxy.
+    "
+CREATE TABLE agent_needs_input (
+    session_key TEXT PRIMARY KEY,
+    waiting INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -613,6 +622,30 @@ impl Db {
             (workspace_id, pane_id),
         )?;
         Ok(())
+    }
+
+    /// 에이전트 needsInput 상태를 세션 키(pane_id)로 set/clear한다 (hook 수신부가 호출).
+    pub fn set_agent_needs_input(&self, session_key: &str, waiting: bool) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO agent_needs_input (session_key, waiting, updated_at)
+                 VALUES (?1, ?2, CAST(strftime('%s','now') AS INTEGER))",
+                (session_key, waiting as i64),
+            )
+            .with_context(|| format!("needsInput 저장 실패: {session_key}"))?;
+        Ok(())
+    }
+
+    /// 현재 입력 대기(waiting) 중인 세션 키 목록. stale(1시간 초과)은 제외해 죽은 hook의
+    /// 잔여가 영원히 주황으로 남지 않게 한다.
+    pub fn list_waiting_sessions(&self) -> anyhow::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_key FROM agent_needs_input
+             WHERE waiting = 1
+               AND updated_at > CAST(strftime('%s','now') AS INTEGER) - 3600",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// 워크스페이스의 저장된 에이전트 세션 (복원 시 resume 대상).
@@ -1128,6 +1161,23 @@ mod tests {
         // 개별 삭제
         db.delete_agent_session(&ws, "pane-1").unwrap();
         assert_eq!(db.list_agent_sessions(&ws).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn agent_needs_input_set_clear_list() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_agent_needs_input("pane-1", true).unwrap();
+        db.set_agent_needs_input("pane-2", true).unwrap();
+        db.set_agent_needs_input("pane-3", false).unwrap();
+        let mut waiting = db.list_waiting_sessions().unwrap();
+        waiting.sort();
+        assert_eq!(waiting, vec!["pane-1".to_string(), "pane-2".to_string()]);
+        // clear → 목록에서 빠짐
+        db.set_agent_needs_input("pane-1", false).unwrap();
+        assert_eq!(
+            db.list_waiting_sessions().unwrap(),
+            vec!["pane-2".to_string()]
+        );
     }
 
     #[test]

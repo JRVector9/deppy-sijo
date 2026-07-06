@@ -314,21 +314,8 @@ impl WorkspaceUi {
                 // 덮어 그리지 않게 페인터 클립도 pane 영역으로 줄인다
                 child.set_clip_rect(rect.intersect(ui.clip_rect()));
                 self.render_pane(&mut child, pane_id, mux, config, client, catalog);
-                // 포커스된 pane 표시 — 상단 한 줄만 (전체 테두리는 시각적으로 과함,
-                // 2026-07-05 사용자 피드백)
-                if mux.focused_pane.as_ref() == Some(pane_id) {
-                    // 상단 2px 강조선 — 짝수 폭이라 픽셀 '경계'에 스냅해야 또렷하다
-                    // (round_to_pixel_center는 홀수 폭용). top을 device 픽셀 경계에 맞춘
-                    // rect_filled로 그린다 (경계 정렬 시 feathering 기여가 0).
-                    let painter = ui.painter();
-                    let ppp = painter.pixels_per_point();
-                    let top = (rect.top() * ppp).round() / ppp;
-                    let line = egui::Rect::from_min_max(
-                        egui::pos2(rect.left(), top),
-                        egui::pos2(rect.right(), top + 2.0),
-                    );
-                    painter.rect_filled(line, 0.0, ui.visuals().selection.stroke.color);
-                }
+                // 포커스된 pane 표시는 pane 헤더의 accent 하이라이트가 담당한다 —
+                // 상단 2px 강조선은 헤더 색과 겹쳐 라인만 늘어 제거(#66 사용자).
             }
             LayoutNode::Split {
                 direction,

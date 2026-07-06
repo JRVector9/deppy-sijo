@@ -1288,8 +1288,8 @@ impl eframe::App for App {
                 });
             });
             ui.add_space(6.0);
-            // 툴바-본문 경계선 하나 (픽셀 스냅 헤어라인).
-            crate::ui::hairline(ui);
+            // 툴바-본문 경계선은 egui Panel::top이 자체로 그린다 — 커스텀 hairline을
+            // 추가하면 패널 여백 탓에 끝까지 안 닿는 짧은 선이 겹쳤다(#65 사용자).
         });
 
         // 폴더 트리 사이드바 (FT-1) — CentralPanel보다 먼저 배치해야 한다 (§9-1).

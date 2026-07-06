@@ -540,7 +540,7 @@ impl WorkspaceUi {
                             ui.set_max_width((ui.available_width() - 120.0).max(30.0));
                             ui.add(
                                 egui::Label::new(
-                                    egui::RichText::new(pane.title.clone())
+                                    egui::RichText::new(display_pane_title(&pane.title, catalog))
                                         .small()
                                         .strong()
                                         .color(title_color),
@@ -1034,7 +1034,10 @@ impl WorkspaceUi {
 
     /// 최신 mux 스냅샷 (알림 센터가 pane 조회·제목에 사용).
     /// 사이드바 세션 목록용 항목 조립 (2026-07-05 — workspace 사이드바).
-    pub fn session_entries(&self) -> Vec<crate::ui::file_tree::SessionEntry> {
+    pub fn session_entries(
+        &self,
+        catalog: &i18n::Catalog,
+    ) -> Vec<crate::ui::file_tree::SessionEntry> {
         let Some(mux) = &self.mux else {
             return Vec::new();
         };
@@ -1054,7 +1057,7 @@ impl WorkspaceUi {
                 crate::ui::file_tree::SessionEntry {
                     tab: tab.id.clone(),
                     pane: pane.id.clone(),
-                    title: pane.title.clone(),
+                    title: display_pane_title(&pane.title, catalog),
                     status,
                     // status 감지는 agent만 → status가 잡히면 agent. (갓 spawn된 agent는
                     // 첫 감지 전까지 셸로 보이는 짧은 창이 있으나 곧 Running이 잡힌다.)
@@ -1070,6 +1073,17 @@ impl WorkspaceUi {
     /// "spawn 진행 중 = live"로 판정하는 데 쓴다 (codex High race).
     pub fn pending_spawns(&self) -> u32 {
         self.pending_spawns
+    }
+
+    pub fn spawn_shell(&mut self, client: &dyn RuntimeClient, scrollback_lines: usize) {
+        self.send(
+            client,
+            RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines,
+            },
+        );
     }
 
     pub fn mux(&self) -> Option<&Arc<MuxSnapshot>> {
@@ -1132,6 +1146,27 @@ pub(crate) fn path_insert_paste_bytes(
 ) -> Vec<u8> {
     let raw = crate::ui::file_tree::shell_path_insert_bytes_for(path, shell_kind);
     input_mapper::paste_bytes(&raw, bracketed_paste)
+}
+
+pub(crate) fn display_pane_title(raw: &str, catalog: &i18n::Catalog) -> String {
+    let Some((prefix, suffix)) = raw.rsplit_once(' ') else {
+        return match raw {
+            "workspace.spawn.shell" | "셸" => catalog.t("workspace.spawn.shell", &[]),
+            "workspace.spawn.agent" | "에이전트" => catalog.t("workspace.spawn.agent", &[]),
+            _ => raw.to_owned(),
+        };
+    };
+    let key = match prefix {
+        "workspace.spawn.shell" | "셸" => Some("workspace.spawn.shell"),
+        "workspace.spawn.agent" | "에이전트" => Some("workspace.spawn.agent"),
+        _ => None,
+    };
+    if let Some(key) = key
+        && suffix.parse::<u64>().is_ok()
+    {
+        return format!("{} {suffix}", catalog.t(key, &[]));
+    }
+    raw.to_owned()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1411,6 +1446,21 @@ mod tests {
                 assert!(!inner.contains(&b'\r'), "{fixture} {shell:?}");
             }
         }
+    }
+
+    #[test]
+    fn generated_pane_titles_render_through_catalog_and_legacy_korean_titles() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        assert_eq!(
+            display_pane_title("workspace.spawn.shell 3", &catalog),
+            "Shell 3"
+        );
+        assert_eq!(
+            display_pane_title("workspace.spawn.agent 4", &catalog),
+            "Agent 4"
+        );
+        assert_eq!(display_pane_title("셸 5", &catalog), "Shell 5");
+        assert_eq!(display_pane_title("custom title", &catalog), "custom title");
     }
 
     #[test]

@@ -1015,7 +1015,11 @@ impl FileTreeUi {
                         egui::pos2(ui.max_rect().left(), response.rect.min.y),
                         egui::pos2(ui.max_rect().right(), response.rect.max.y),
                     );
-                    let row_resp = ui.interact(row_rect, drag_id.with("row"), egui::Sense::click());
+                    let row_resp =
+                        ui.interact(row_rect, drag_id.with("row"), egui::Sense::click_and_drag());
+                    if row_resp.drag_started() {
+                        row_resp.dnd_set_drag_payload(row.path.clone());
+                    }
                     // 행높이 실측 (드래그 중엔 행이 tooltip 레이어로 빠져 rect가 다름 — 제외)
                     if observed_row_height.is_none()
                         && !egui::DragAndDrop::has_any_payload(ui.ctx())

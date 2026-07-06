@@ -31,6 +31,8 @@ pub struct PumpResult {
     pub dirty: bool,
     /// 이번 pump에서 새 출력이 있었는가 (비누적 — status 화면 스캔 게이트용)
     pub produced_output: bool,
+    /// Number of PTY output bytes consumed during this pump.
+    pub output_bytes: usize,
     /// 이번 pump에서 Running → Exited로 전이했는가
     pub just_exited: bool,
 }
@@ -198,6 +200,7 @@ impl Session {
         PumpResult {
             dirty: self.dirty,
             produced_output: fed > 0,
+            output_bytes: fed,
             just_exited,
         }
     }

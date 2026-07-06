@@ -25,6 +25,7 @@ use crate::hook::DbPermissionHook;
 /// 둬서, 살아있는 다른 프록시의 pending(나이 < 자기 timeout ≤ 상한 = cutoff)은 절대 안
 /// 쓸리게 한다 (codex — 짧은 고정 cutoff가 긴 timeout의 live pending을 오살하던 문제).
 const ORPHAN_CUTOFF_SECS: i64 = cli::MAX_APPROVAL_TIMEOUT_SECS as i64;
+const RESOLVED_APPROVAL_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 
 fn main() -> anyhow::Result<()> {
     // stdout은 JSON-RPC 전용 → 로그는 stderr로만.
@@ -74,6 +75,11 @@ fn main() -> anyhow::Result<()> {
         Ok(n) if n > 0 => tracing::info!("orphan pending 승인 {n}건 정리(이전 크래시 잔여)"),
         Ok(_) => {}
         Err(e) => tracing::warn!("orphan pending 승인 정리 실패(무시하고 계속): {e:#}"),
+    }
+    match db.prune_resolved_approvals(now - RESOLVED_APPROVAL_RETENTION_SECS) {
+        Ok(n) if n > 0 => tracing::info!("resolved approval {n}건 정리"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("resolved approval 정리 실패(무시하고 계속): {e:#}"),
     }
 
     // 백엔드 stderr redaction을 위해 manager도 같은 redaction을 공유한다.

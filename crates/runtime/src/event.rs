@@ -99,12 +99,6 @@ pub enum RuntimeEvent {
         session: SessionId,
         status: SessionStatus,
     },
-    /// Additive status view carrying confidence/source/override state. Existing
-    /// `SessionStatusChanged` remains the compatibility event.
-    SessionStatusViewChanged {
-        session: SessionId,
-        view: SessionStatusView,
-    },
     /// Process resource sample. App process CPU/RSS plus optional per-session
     /// child process tree aggregation.
     ResourceUsage {
@@ -116,6 +110,12 @@ pub enum RuntimeEvent {
     PtyInputPressure {
         session: SessionId,
         pressure: PtyInputPressure,
+    },
+    /// Additive status view carrying confidence/source/override state. Existing
+    /// `SessionStatusChanged` remains the compatibility event.
+    SessionStatusViewChanged {
+        session: SessionId,
+        view: SessionStatusView,
     },
 }
 

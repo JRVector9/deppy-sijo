@@ -326,6 +326,21 @@ pub fn expire_pending_approvals(
     Ok(affected)
 }
 
+/// 오래된 resolved approval 행을 삭제한다. pending 행은 live IPC 상태라 건드리지 않는다.
+pub fn prune_resolved_approvals(
+    conn: &Connection,
+    resolved_before_epoch_secs: i64,
+) -> anyhow::Result<usize> {
+    let affected = conn
+        .execute(
+            "DELETE FROM pending_approvals
+             WHERE status != 'pending' AND resolved_at IS NOT NULL AND resolved_at < ?1",
+            [resolved_before_epoch_secs],
+        )
+        .context("resolved approval 정리 실패")?;
+    Ok(affected)
+}
+
 /// §11.4 mcp_servers 한 행.
 #[derive(Debug, Clone, PartialEq)]
 pub struct McpServerRow {
@@ -952,6 +967,27 @@ mod tests {
         let ids: Vec<_> = rows.iter().map(|row| row.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b"]);
         assert_eq!(rows[0].schema_hash.as_deref(), Some("hash"));
+    }
+
+    #[test]
+    fn prune_resolved_approvals는_pending을_보존하고_오래된_resolved만_삭제() {
+        let conn = test_conn();
+        insert_pending_approval(&conn, "pending", "srv", "tool", "prev", None, 10).unwrap();
+        insert_pending_approval(&conn, "old", "srv", "tool", "prev", None, 20).unwrap();
+        insert_pending_approval(&conn, "new", "srv", "tool", "prev", None, 30).unwrap();
+        resolve_approval(&conn, "old", true, false, 100).unwrap();
+        resolve_approval(&conn, "new", false, false, 300).unwrap();
+
+        assert_eq!(prune_resolved_approvals(&conn, 200).unwrap(), 1);
+        assert!(poll_approval(&conn, "old").is_err());
+        assert_eq!(
+            poll_approval(&conn, "new").unwrap().status,
+            ApprovalStatus::Denied
+        );
+        assert_eq!(
+            list_pending_approvals(&conn).unwrap()[0].id.as_str(),
+            "pending"
+        );
     }
 
     #[test]

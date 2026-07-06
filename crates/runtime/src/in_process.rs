@@ -30,6 +30,7 @@ use crate::resource_monitor::{
 struct Subscriber {
     events: Sender<RuntimeEvent>,
     viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>>,
+    input_pressures: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>>,
     /// 상태 이벤트(채널) 도착 시 소비자를 깨우는 콜백 — UI가 숨겨져(Warm) repaint가
     /// 없을 때도 알림/상태를 처리하도록 (§14.1). Viewport(slot)도 깨운다 — push가
     /// dirty 게이트라 출력이 있을 때만 울리므로 idle 리페인트를 유발하지 않는다.
@@ -175,17 +176,21 @@ impl RuntimeEventStream for InProcessRuntimeClient {
         let (tx, rx) = channel();
         let viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
             Arc::default();
+        let input_pressures: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
+            Arc::default();
         self.subscribers
             .lock()
             .expect("subscribers lock")
             .push(Subscriber {
                 events: tx,
                 viewports: Arc::clone(&viewports),
+                input_pressures: Arc::clone(&input_pressures),
                 wake: None,
             });
         RuntimeEventReceiver {
             events: rx,
             viewports,
+            input_pressures,
         }
     }
 }
@@ -197,17 +202,21 @@ impl InProcessRuntimeClient {
         let (tx, rx) = channel();
         let viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
             Arc::default();
+        let input_pressures: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
+            Arc::default();
         self.subscribers
             .lock()
             .expect("subscribers lock")
             .push(Subscriber {
                 events: tx,
                 viewports: Arc::clone(&viewports),
+                input_pressures: Arc::clone(&input_pressures),
                 wake: Some(wake),
             });
         RuntimeEventReceiver {
             events: rx,
             viewports,
+            input_pressures,
         }
     }
 }
@@ -221,6 +230,10 @@ const MAX_EXITED_BACKENDS: usize = 24;
 /// Local runtime command queue cap. Commands are ordered and cannot be coalesced
 /// safely in the transport boundary, so overflow is surfaced to the caller.
 const IN_PROCESS_CMD_QUEUE_CAP: usize = 1024;
+const FINAL_DRAIN_MAX_BYTES: usize = 2 * 1024 * 1024;
+const FINAL_DRAIN_MAX_PUMPS: usize = 32;
+const SHELL_TITLE_ID: &str = "workspace.spawn.shell";
+const AGENT_TITLE_ID: &str = "workspace.spawn.agent";
 
 struct Worker {
     command_rx: Receiver<RuntimeCommand>,
@@ -452,6 +465,19 @@ impl Worker {
                         wakes.push(Arc::clone(wake));
                     }
                     true
+                } else if let RuntimeEvent::PtyInputPressure { session, .. } = &event {
+                    if Arc::strong_count(&subscriber.input_pressures) <= 1 {
+                        return false;
+                    }
+                    subscriber
+                        .input_pressures
+                        .lock()
+                        .expect("input pressure slot lock")
+                        .insert(*session, event.clone());
+                    if let Some(wake) = &subscriber.wake {
+                        wakes.push(Arc::clone(wake));
+                    }
+                    true
                 } else if subscriber.events.send(event.clone()).is_ok() {
                     // 상태 이벤트가 채널에 들어감 — 숨겨진 UI도 깨워 처리하게 한다
                     if let Some(wake) = &subscriber.wake {
@@ -516,14 +542,14 @@ impl Worker {
                     Ok(new_session) => {
                         self.sessions.insert(id, new_session);
                         self.open_session_log(id);
-                        self.attach_in_new_tab(id, "셸");
+                        self.attach_in_new_tab(id, SHELL_TITLE_ID);
                         if let Some(pipe) = &mut self.persist {
                             let args: Vec<String> = self.shell.args.clone();
                             pipe.session_spawned(
                                 id,
                                 "shell",
                                 None,
-                                "셸",
+                                SHELL_TITLE_ID,
                                 &self.shell.program,
                                 &args,
                             );
@@ -611,7 +637,7 @@ impl Worker {
                         // regex가 없어도 idle heuristic(3단)은 동작해야 한다 — 상시 설치
                         self.detectors.insert(id, StatusDetector::new(patterns));
                         self.open_session_log(id);
-                        self.attach_in_new_tab(id, "에이전트");
+                        self.attach_in_new_tab(id, AGENT_TITLE_ID);
                         if let Some(pipe) = &mut self.persist {
                             // 스키마 CHECK: agent kind는 agent_id 필수 — config id가
                             // 없는 spawn(perf 하네스 등)은 shell kind로 기록한다
@@ -624,7 +650,7 @@ impl Worker {
                                 id,
                                 kind,
                                 agent_config_id,
-                                "에이전트",
+                                AGENT_TITLE_ID,
                                 &spec.program,
                                 &spec.args,
                             );
@@ -732,7 +758,17 @@ impl Worker {
                 pane,
                 direction,
                 scrollback_lines,
-            } => self.split_pane(pane, direction, scrollback_lines),
+            } => {
+                if self.suspended {
+                    let _ = (pane, direction, scrollback_lines);
+                    self.emit(RuntimeEvent::SpawnFailed {
+                        kind: SpawnKind::Shell,
+                        message: MessagePayload::new("runtime.spawn_failed.suspended"),
+                    });
+                    return;
+                }
+                self.split_pane(pane, direction, scrollback_lines);
+            }
             RuntimeCommand::ClosePane { pane } => self.close_pane(pane),
             RuntimeCommand::CloseTab { tab } => self.close_tab(tab),
             RuntimeCommand::SelectTab { tab } => {
@@ -968,11 +1004,21 @@ impl Worker {
                 self.open_session_log(id);
                 if let Some(pipe) = &mut self.persist {
                     let args: Vec<String> = self.shell.args.clone();
-                    pipe.session_spawned(id, "shell", None, "셸", &self.shell.program, &args);
+                    pipe.session_spawned(
+                        id,
+                        "shell",
+                        None,
+                        SHELL_TITLE_ID,
+                        &self.shell.program,
+                        &args,
+                    );
                 }
                 self.tab_counter += 1;
                 let pane_id = MuxPaneId::new();
-                let mut pane = MuxPane::new(pane_id.clone(), format!("셸 {}", self.tab_counter));
+                let mut pane = MuxPane::new(
+                    pane_id.clone(),
+                    format!("{SHELL_TITLE_ID} {}", self.tab_counter),
+                );
                 pane.session_id = Some(id);
                 self.mux.panes.insert(pane_id.clone(), pane);
                 let split_ok = self
@@ -1075,15 +1121,22 @@ impl Worker {
         };
         let mut log = self.logs.get_mut(&session);
         let mut latest_offset = None;
-        let _ = active.pump(|chunk| {
-            if let Some(log) = log.as_mut() {
-                let redacted = log.redactor.redact_chunk(chunk);
-                match log.append_redacted_output(&redacted) {
-                    Ok(offset) => latest_offset = Some(offset),
-                    Err(e) => tracing::warn!("세션 로그 최종 기록 실패: {e:#}"),
+        let mut drained = 0usize;
+        for _ in 0..FINAL_DRAIN_MAX_PUMPS {
+            let result = active.pump(|chunk| {
+                if let Some(log) = log.as_mut() {
+                    let redacted = log.redactor.redact_chunk(chunk);
+                    match log.append_redacted_output(&redacted) {
+                        Ok(offset) => latest_offset = Some(offset),
+                        Err(e) => tracing::warn!("세션 로그 최종 기록 실패: {e:#}"),
+                    }
                 }
+            });
+            drained = drained.saturating_add(result.output_bytes);
+            if !result.produced_output || drained >= FINAL_DRAIN_MAX_BYTES {
+                break;
             }
-        });
+        }
         if let Some(offset) = latest_offset
             && let Some(pipe) = &mut self.persist
         {
@@ -1435,7 +1488,8 @@ fn trace_terminal_cache_event(session: SessionId, event: TerminalCacheEvent) {
     );
 }
 
-/// "셸 3" / "에이전트 12" 같은 제목에서 뒤의 숫자를 뽑는다 (복원 시 counter 전진용).
+/// "workspace.spawn.shell 3" / legacy "셸 3" 같은 제목에서 뒤의 숫자를 뽑는다
+/// (복원 시 counter 전진용).
 fn title_suffix(title: &str) -> Option<u64> {
     title.rsplit(' ').next()?.parse().ok()
 }
@@ -1770,6 +1824,67 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, RuntimeEvent::ShellSpawned { .. })),
             "suspended 상태에서 세션이 생성되면 안 된다"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn suspended_이후_split은_거부된다() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("suspended-split"),
+            RedactionService::new(),
+            spec("/bin/sleep", &["5"]),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::ShellSpawned { .. } => Some(()),
+            _ => None,
+        });
+        let pane = probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::MuxUpdated { snapshot } => snapshot
+                .tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .find(|pane| pane.session_id.is_some())
+                .map(|pane| pane.id.clone()),
+            _ => None,
+        });
+        probe.seen.clear();
+        client
+            .send_command(RuntimeCommand::SetWorkspaceState(
+                crate::command::WorkspaceRuntimeState::Suspended,
+            ))
+            .unwrap();
+        client
+            .send_command(RuntimeCommand::SplitPane {
+                pane,
+                direction: mux::SplitDirection::Horizontal,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let message = probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::SpawnFailed { kind, message } if *kind == SpawnKind::Shell => {
+                Some(message.message_id.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(message, "runtime.spawn_failed.suspended");
+        assert!(
+            !probe
+                .seen
+                .iter()
+                .any(|e| matches!(e, RuntimeEvent::ShellSpawned { .. })),
+            "suspended split must not spawn a new shell"
         );
     }
 
@@ -2468,6 +2583,57 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn input_pressure_events_are_coalesced_per_session() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("input-pressure-coalesce"),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            None,
+        );
+        let rx = client.subscribe();
+        let mut probe = Probe::new(rx);
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            _ => None,
+        });
+        probe.seen.clear();
+        let oversized = vec![b'x'; pty::PtyInputQueuePolicy::default().max_bytes + 1];
+        for _ in 0..8 {
+            client
+                .send_command(RuntimeCommand::WriteInput {
+                    session,
+                    bytes: oversized.clone(),
+                })
+                .unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let events = probe.rx.drain();
+        let pressure_count = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::PtyInputPressure {
+                        session: pressure_session,
+                        ..
+                    } if *pressure_session == session
+                )
+            })
+            .count();
+        assert_eq!(pressure_count, 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn user_status_override는_status_view_event로_surface된다() {
         let client = InProcessRuntimeClient::with_shell(
             5,
@@ -3020,6 +3186,8 @@ mod tests {
     fn title_suffix_파싱() {
         assert_eq!(super::title_suffix("셸 3"), Some(3));
         assert_eq!(super::title_suffix("에이전트 12"), Some(12));
+        assert_eq!(super::title_suffix("workspace.spawn.shell 4"), Some(4));
+        assert_eq!(super::title_suffix("workspace.spawn.agent 5"), Some(5));
         assert_eq!(super::title_suffix("셸"), None);
         assert_eq!(super::title_suffix("이름 없음"), None);
         // 복원 counter 전진: "셸 1"·"셸 3"만 남아도(중간 닫힘) max는 3

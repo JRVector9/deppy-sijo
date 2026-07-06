@@ -3,6 +3,8 @@ use std::path::Path;
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension};
 
+const RESOLVED_APPROVAL_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+
 /// env 값. secret은 평문 대신 credentials.id만 참조한다 (설계문서 6.3).
 /// 평문 해석은 spawn 직전(PR-09)에만 일어난다.
 #[derive(Clone, PartialEq)]
@@ -707,7 +709,10 @@ impl Db {
         remember: bool,
         resolved_at: i64,
     ) -> anyhow::Result<()> {
-        mcp_store::resolve_approval(&self.conn, id, allowed, remember, resolved_at)
+        mcp_store::resolve_approval(&self.conn, id, allowed, remember, resolved_at)?;
+        let cutoff = resolved_at.saturating_sub(RESOLVED_APPROVAL_RETENTION_SECS);
+        let _ = mcp_store::prune_resolved_approvals(&self.conn, cutoff)?;
+        Ok(())
     }
 
     /// 크래시 orphan pending 정리 — cutoff보다 오래된 pending을 denied로. 반영 행 수 반환.
@@ -717,6 +722,13 @@ impl Db {
         resolved_at: i64,
     ) -> anyhow::Result<usize> {
         mcp_store::expire_pending_approvals(&self.conn, older_than_epoch_secs, resolved_at)
+    }
+
+    pub fn prune_resolved_approvals(
+        &self,
+        resolved_before_epoch_secs: i64,
+    ) -> anyhow::Result<usize> {
+        mcp_store::prune_resolved_approvals(&self.conn, resolved_before_epoch_secs)
     }
 
     /// tool 실행 감사 기록 (PR-16). encryptor를 넘기면 전체 입력이 암호화 저장된다 (§7).
@@ -1131,6 +1143,29 @@ mod tests {
         );
         // 멱등: 재호출은 더 이상 pending이 없어 0
         assert_eq!(db.expire_pending_approvals(500, 700).unwrap(), 0);
+    }
+
+    #[test]
+    fn resolve_approval은_오래된_resolved_rows를_prune한다() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_pending_approval("old", "srv", "t", "prev", None, 10)
+            .unwrap();
+        db.insert_pending_approval("keep", "srv", "t", "prev", None, 20)
+            .unwrap();
+        db.resolve_approval("old", true, false, 100).unwrap();
+        db.resolve_approval(
+            "keep",
+            true,
+            false,
+            100 + RESOLVED_APPROVAL_RETENTION_SECS + 1,
+        )
+        .unwrap();
+
+        assert!(db.poll_approval("old").is_err());
+        assert_eq!(
+            db.poll_approval("keep").unwrap().status,
+            ApprovalStatus::Allowed
+        );
     }
 
     #[test]
@@ -1802,6 +1837,48 @@ mod tests {
         .unwrap();
         let listed = db.list_agent_configs().unwrap();
         assert_eq!(listed[0].mcp_config_flag.as_deref(), Some("--cfg"));
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn v11에서_v12로_업그레이드된다() {
+        let dir = std::env::temp_dir().join(format!("deppy-mig-11to12-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite3");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..11] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 11).unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(Db::read_user_version(&db.conn).unwrap(), MIGRATIONS.len());
+        db.insert_mcp_server(&mcp_store::McpServerRow {
+            id: "srv-env".to_owned(),
+            name: "env server".to_owned(),
+            kind: "stdio".to_owned(),
+            command: Some("/bin/sh".to_owned()),
+            args: vec!["-lc".to_owned(), "true".to_owned()],
+            env_plain: vec![("MCP_SAFE_MODE".to_owned(), "1".to_owned())],
+            env_secrets: vec![("MCP_TOKEN".to_owned(), "cred-token".to_owned())],
+            inherit_env: false,
+            url: None,
+            enabled: true,
+        })
+        .unwrap();
+        let listed = db.list_mcp_servers().unwrap();
+        assert_eq!(
+            listed[0].env_plain,
+            vec![("MCP_SAFE_MODE".to_owned(), "1".to_owned())]
+        );
+        assert_eq!(
+            listed[0].env_secrets,
+            vec![("MCP_TOKEN".to_owned(), "cred-token".to_owned())]
+        );
+        assert!(!listed[0].inherit_env);
         drop(db);
         std::fs::remove_dir_all(&dir).unwrap();
     }

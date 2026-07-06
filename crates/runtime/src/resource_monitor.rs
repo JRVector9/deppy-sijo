@@ -238,18 +238,18 @@ fn aggregate_session_usage(
 }
 
 fn matching_process_rows(identity: ProcessIdentity, rows: &[ProcessRow]) -> Vec<ProcessRow> {
+    let mut matched = std::collections::BTreeMap::new();
     if let Some(process_group) = identity.process_group {
-        let matched: Vec<_> = rows
+        for row in rows
             .iter()
             .copied()
             .filter(|row| row.pgid == Some(process_group))
-            .collect();
-        if !matched.is_empty() {
-            return matched;
+        {
+            matched.insert(row.pid, row);
         }
     }
     let Some(root_pid) = identity.pid else {
-        return Vec::new();
+        return matched.into_values().collect();
     };
     let mut wanted = std::collections::HashSet::from([root_pid]);
     let mut changed = true;
@@ -264,7 +264,10 @@ fn matching_process_rows(identity: ProcessIdentity, rows: &[ProcessRow]) -> Vec<
     rows.iter()
         .copied()
         .filter(|row| wanted.contains(&row.pid))
-        .collect()
+        .for_each(|row| {
+            matched.insert(row.pid, row);
+        });
+    matched.into_values().collect()
 }
 
 #[cfg(unix)]
@@ -509,5 +512,49 @@ mod tests {
         assert_eq!(usage.process_count, 2);
         assert_eq!(usage.rss_bytes, 30);
         assert_eq!(usage.cpu_percent, Some(3.0));
+    }
+
+    #[test]
+    fn session_usage_unions_process_group_and_pid_descendants() {
+        let rows = vec![
+            ProcessRow {
+                pid: 10,
+                ppid: Some(1),
+                pgid: Some(10),
+                rss_bytes: 10,
+                cpu_percent: Some(1.0),
+            },
+            ProcessRow {
+                pid: 11,
+                ppid: Some(10),
+                pgid: Some(77),
+                rss_bytes: 20,
+                cpu_percent: Some(2.0),
+            },
+            ProcessRow {
+                pid: 12,
+                ppid: Some(11),
+                pgid: Some(77),
+                rss_bytes: 30,
+                cpu_percent: Some(3.0),
+            },
+        ];
+        let usage = aggregate_session_usage(
+            SessionResourceTarget {
+                session: SessionId(1),
+                identity: ProcessIdentity {
+                    pid: Some(10),
+                    process_group: Some(10),
+                    source: ProcessIdentitySource::PortablePty,
+                },
+            },
+            &rows,
+            123,
+            100.0,
+            100,
+        );
+        assert_eq!(usage.process_count, 3);
+        assert_eq!(usage.rss_bytes, 60);
+        assert_eq!(usage.cpu_percent, Some(6.0));
     }
 }

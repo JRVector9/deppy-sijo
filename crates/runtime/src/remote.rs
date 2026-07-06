@@ -557,15 +557,28 @@ fn drain_receiver_into_outbound(
         .drain()
         .map(|(_, event)| event)
         .collect();
+    // Local-only PTY input pressure is coalesced in a receiver slot. Drain it so
+    // the remote bridge cannot accumulate telemetry, but keep it off the v2 wire
+    // until protocol negotiation has a feature bit for additive telemetry.
+    receiver
+        .input_pressures
+        .lock()
+        .expect("remote receiver input pressure slot lock")
+        .clear();
 
     let mut source = OutboundDrain::Open;
     loop {
         match receiver.events.try_recv() {
-            // ResourceUsage는 로컬 UI 텔레메트리 — 원격 피어에 보내지 않는다.
+            // ResourceUsage/PtyInputPressure/SessionStatusViewChanged는 로컬 UI
+            // telemetry/additive status view — 원격 피어에 보내지 않는다.
             // postcard append-only는 기존 variant discriminant를 보존할 뿐, 구버전
             // 피어가 모르는 새 variant를 디코드하게 해 주지 않는다(수신 즉시 decode
             // 실패 → 접속 종료). 버전 협상으로 게이트하기 전까지 wire에서 제외 (codex).
-            Ok(RuntimeEvent::ResourceUsage { .. }) => {}
+            Ok(
+                RuntimeEvent::ResourceUsage { .. }
+                | RuntimeEvent::PtyInputPressure { .. }
+                | RuntimeEvent::SessionStatusViewChanged { .. },
+            ) => {}
             Ok(event) => outbound.enqueue(event)?,
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
@@ -1436,6 +1449,7 @@ enum ClientTransport {
 struct RemoteSubscriber {
     events: std::sync::mpsc::Sender<RuntimeEvent>,
     viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>>,
+    input_pressures: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>>,
 }
 
 impl RemoteRuntimeClient {
@@ -2095,6 +2109,16 @@ fn dispatch(subscribers: &Arc<Mutex<Vec<RemoteSubscriber>>>, event: RuntimeEvent
                     .expect("remote viewport slot lock")
                     .insert(*session, event.clone());
                 true
+            } else if let RuntimeEvent::PtyInputPressure { session, .. } = &event {
+                if Arc::strong_count(&subscriber.input_pressures) <= 1 {
+                    return false;
+                }
+                subscriber
+                    .input_pressures
+                    .lock()
+                    .expect("remote input pressure slot lock")
+                    .insert(*session, event.clone());
+                true
             } else {
                 subscriber.events.send(event.clone()).is_ok()
             }
@@ -2145,16 +2169,20 @@ impl RuntimeEventStream for RemoteRuntimeClient {
         let (tx, rx) = channel();
         let viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
             Arc::default();
+        let input_pressures: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
+            Arc::default();
         self.subscribers
             .lock()
             .expect("remote subscribers lock")
             .push(RemoteSubscriber {
                 events: tx,
                 viewports: Arc::clone(&viewports),
+                input_pressures: Arc::clone(&input_pressures),
             });
         RuntimeEventReceiver {
             events: rx,
             viewports,
+            input_pressures,
         }
     }
 }
@@ -2886,9 +2914,11 @@ mod tests {
     fn receiver_drain은_durable_cap에서_멈춘다() {
         let (tx, rx) = channel();
         let viewports: Arc<Mutex<HashMap<SessionId, RuntimeEvent>>> = Arc::default();
+        let input_pressures: Arc<Mutex<HashMap<SessionId, RuntimeEvent>>> = Arc::default();
         let receiver = RuntimeEventReceiver {
             events: rx,
             viewports,
+            input_pressures,
         };
         for i in 0..5 {
             tx.send(RuntimeEvent::SessionStatusChanged {
@@ -2902,6 +2932,57 @@ mod tests {
         let overflow = drain_receiver_into_outbound(&receiver, &mut queue).unwrap_err();
         assert_eq!(overflow, OutboundOverflow::DurableFull);
         assert_eq!(queue.durable_len(), 3);
+    }
+
+    #[test]
+    fn receiver_drain은_additive_local_events를_wire에서_필터링한다() {
+        let (tx, rx) = channel();
+        let viewports: Arc<Mutex<HashMap<SessionId, RuntimeEvent>>> = Arc::default();
+        let input_pressures: Arc<Mutex<HashMap<SessionId, RuntimeEvent>>> = Arc::default();
+        let receiver = RuntimeEventReceiver {
+            events: rx,
+            viewports,
+            input_pressures: Arc::clone(&input_pressures),
+        };
+        tx.send(RuntimeEvent::SessionStatusViewChanged {
+            session: SessionId(1),
+            view: session::SessionStatusView::process_exit(session::SessionStatus::Done),
+        })
+        .unwrap();
+        tx.send(RuntimeEvent::SessionStatusChanged {
+            session: SessionId(1),
+            status: session::SessionStatus::Done,
+        })
+        .unwrap();
+        input_pressures.lock().unwrap().insert(
+            SessionId(1),
+            RuntimeEvent::PtyInputPressure {
+                session: SessionId(1),
+                pressure: pty::PtyInputPressure {
+                    attempted_bytes: 1,
+                    queued_bytes: 1,
+                    queued_messages: 1,
+                    max_bytes: 1,
+                    max_messages: 1,
+                    reason: pty::PtyInputRejectReason::QueueFull,
+                },
+            },
+        );
+
+        let mut queue = OutboundEventQueue::with_caps(4, 4);
+        assert_eq!(
+            drain_receiver_into_outbound(&receiver, &mut queue).unwrap(),
+            OutboundDrain::Open
+        );
+        assert!(matches!(
+            queue.pop_front(),
+            Some(RuntimeEvent::SessionStatusChanged {
+                session: SessionId(1),
+                status: session::SessionStatus::Done,
+            })
+        ));
+        assert!(queue.pop_front().is_none());
+        assert!(receiver.input_pressures.lock().unwrap().is_empty());
     }
 
     fn kind_of(event: &RuntimeEvent) -> &'static str {
@@ -3538,6 +3619,7 @@ mod tests {
             Arc::new(Mutex::new(vec![RemoteSubscriber {
                 events: tx,
                 viewports: Arc::clone(&slot),
+                input_pressures: Arc::default(),
             }]));
         let mut recon: HashMap<SessionId, (u64, Arc<TerminalViewportSnapshot>)> = HashMap::new();
         recon.insert(s, (0, snap0)); // 클라도 baseline이 있었음

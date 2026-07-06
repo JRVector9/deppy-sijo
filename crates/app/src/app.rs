@@ -484,6 +484,7 @@ impl App {
             known_hosts_cache: None,
             file_tree: None,
         };
+        app.prune_resolved_approvals();
         app.poll_pending_approvals();
         // 파일 트리 헤더(workspace 이름) 표시용 — 시작 시 1회 로드
         app.refresh_workspaces();
@@ -516,6 +517,7 @@ impl App {
 
     /// 승인 watcher 폴링 간격(ms). frame 예약은 하지 않고, pending 상태 변화 때만 UI를 깨운다.
     const APPROVAL_POLL_MS: u64 = 500;
+    const RESOLVED_APPROVAL_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 
     /// 한 workspace의 런타임 워커를 만든다: 생성 → wake 구독 → 저장 layout 복원 →
     /// credential redaction 시드. (perf 하네스는 제외 — new()에서 기본 workspace만.)
@@ -902,7 +904,7 @@ impl App {
                         id: ws.id.clone(),
                         name: ws.name.clone(),
                         state: ui::activity::ActivityWorkspaceState::Active,
-                        session_count: self.active.workspace_ui.session_entries().len(),
+                        session_count: self.active.workspace_ui.session_entries(&self.i18n).len(),
                         pending_events: self.active.pending_events.len(),
                         input_pressure: self.active.input_pressure.clone(),
                         backgrounded_for_secs: None,
@@ -1151,7 +1153,10 @@ impl App {
                     session_titles.retain(|session, _| present.contains(session));
                     for pane in snapshot.tabs.iter().flat_map(|tab| &tab.panes) {
                         if let Some(session) = pane.session_id {
-                            session_titles.insert(session, pane.title.clone());
+                            session_titles.insert(
+                                session,
+                                ui::workspace::display_pane_title(&pane.title, catalog),
+                            );
                         }
                     }
                 }
@@ -1205,6 +1210,21 @@ impl App {
         match self.db.list_pending_approvals() {
             Ok(rows) => self.approvals_ui.set_pending(rows),
             Err(e) => tracing::warn!("승인 목록 조회 실패: {e:#}"),
+        }
+    }
+
+    fn prune_resolved_approvals(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        match self
+            .db
+            .prune_resolved_approvals(now.saturating_sub(Self::RESOLVED_APPROVAL_RETENTION_SECS))
+        {
+            Ok(n) if n > 0 => tracing::info!("resolved MCP approval {n}건 정리"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("resolved MCP approval 정리 실패: {e:#}"),
         }
     }
 }
@@ -1355,9 +1375,10 @@ impl eframe::App for App {
             // 타이틀바까지 확장된다. 패널 크기는 버튼 높이에 맞춰 자동 — exact_size로
             // 강제하면 버튼이 얇은 띠에 클리핑됐다(2026-07-06 사용자 화면). 위아래
             // 여백으로 신호등(y~14) 높이에 맞춰 세로 중앙 정렬한다.
-            // 빈 곳을 잡으면 창을 드래그로 옮긴다 — 버튼보다 먼저 등록해 버튼 위
-            // 클릭은 버튼이, 빈 영역 드래그는 이쪽이 받는다.
-            let bar_rect = ui.max_rect();
+            // 빈 곳을 잡으면 창을 드래그로 옮긴다. auto-sized Panel의 max_rect는
+            // content 측정 전 매우 커질 수 있으므로 실제 titlebar 높이만 hit-test한다.
+            let bar_rect =
+                egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), 34.0));
             let drag = ui.interact(
                 bar_rect,
                 egui::Id::new("titlebar_drag"),
@@ -1438,7 +1459,7 @@ impl eframe::App for App {
         // 폴더 트리 사이드바 (FT-1) — CentralPanel보다 먼저 배치해야 한다 (§9-1).
         // OFF(None)면 Panel 자체를 만들지 않는다 (§6 리소스 0).
         if self.file_tree.is_some() {
-            let sessions = self.active.workspace_ui.session_entries();
+            let sessions = self.active.workspace_ui.session_entries(&text);
             let sidebar_action = self
                 .file_tree
                 .as_mut()
@@ -1499,17 +1520,10 @@ impl eframe::App for App {
                 }
                 // 사이드바 + 버튼 — 새 셸 (탭바 제거 후 대체 진입점)
                 Some(ui::file_tree::SidebarAction::NewShell) => {
-                    if let Err(e) =
-                        self.active
-                            .runtime
-                            .send_command(runtime::RuntimeCommand::SpawnShell {
-                                cols: 80,
-                                rows: 24,
-                                scrollback_lines: self.config.terminal.scrollback_lines as usize,
-                            })
-                    {
-                        tracing::warn!("새 셸 시작 실패: {e:#}");
-                    }
+                    self.active.workspace_ui.spawn_shell(
+                        &self.active.runtime,
+                        self.config.terminal.scrollback_lines as usize,
+                    );
                 }
                 None => {}
             }
@@ -1655,6 +1669,7 @@ impl eframe::App for App {
             {
                 tracing::warn!("승인 해소 실패: {e:#}");
             }
+            self.prune_resolved_approvals();
             // 해소 직후 목록을 갱신해 다음 항목이 바로 뜨게 한다 (다음 폴링을 기다리지 않음).
             match self.db.list_pending_approvals() {
                 Ok(rows) => self.approvals_ui.set_pending(rows),

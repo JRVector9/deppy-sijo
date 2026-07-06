@@ -11,6 +11,7 @@ use crate::event::RuntimeEvent;
 pub struct RuntimeEventReceiver {
     pub(crate) events: std::sync::mpsc::Receiver<RuntimeEvent>,
     pub(crate) viewports: Arc<Mutex<HashMap<SessionId, RuntimeEvent>>>,
+    pub(crate) input_pressures: Arc<Mutex<HashMap<SessionId, RuntimeEvent>>>,
 }
 
 impl RuntimeEventReceiver {
@@ -28,7 +29,15 @@ impl RuntimeEventReceiver {
             .drain()
             .map(|(_, event)| event)
             .collect();
+        let input_pressures: Vec<RuntimeEvent> = self
+            .input_pressures
+            .lock()
+            .expect("input pressure slot lock")
+            .drain()
+            .map(|(_, event)| event)
+            .collect();
         let mut out: Vec<RuntimeEvent> = self.events.try_iter().collect();
+        out.extend(input_pressures);
         out.extend(viewports);
         out
     }

@@ -143,7 +143,7 @@ fn nav(
         .inner_margin(egui::Margin::symmetric(9, 6))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.weak("🔍");
+                ui.weak("/");
                 ui.weak(catalog.t("settings.search", &[]));
             });
         });
@@ -154,14 +154,14 @@ fn nav(
         ui,
         category,
         Category::General,
-        "⚙",
+        "G",
         &catalog.t("settings.cat.general", &[]),
     );
     nav_item(
         ui,
         category,
         Category::Language,
-        "🌐",
+        "L",
         &catalog.t("settings.language", &[]),
     );
     nav_item(
@@ -175,14 +175,14 @@ fn nav(
         ui,
         category,
         Category::Performance,
-        "⚡",
+        "P",
         &catalog.t("settings.performance", &[]),
     );
     nav_item(
         ui,
         category,
         Category::RemoteTls,
-        "🔒",
+        "R",
         &catalog.t("settings.remote_tls", &[]),
     );
 
@@ -190,7 +190,7 @@ fn nav(
     ui.weak(catalog.t("settings.group.manage", &[]));
     nav_open(
         ui,
-        "🔑",
+        "K",
         &catalog.t("top.credentials", &[]),
         None,
         open_panel,
@@ -198,7 +198,7 @@ fn nav(
     );
     nav_open(
         ui,
-        "🔗",
+        "C",
         &catalog.t("top.connectors", &[]),
         None,
         open_panel,

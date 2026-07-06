@@ -536,7 +536,7 @@ impl WorkspaceUi {
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(display_pane_title(&pane.title, catalog))
-                                        .small()
+                                        .size(10.0)
                                         .strong()
                                         .color(title_color),
                                 )
@@ -594,15 +594,21 @@ impl WorkspaceUi {
                                 },
                             );
                         }
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("+")
-                                        .size(15.0)
-                                        .color(egui::Color32::from_rgb(0x8b, 0x8f, 0x98)),
-                                )
-                                .frame(false),
-                            )
+                        let (pr, plus_resp) =
+                            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                        let pcol = if plus_resp.hovered() {
+                            egui::Color32::from_rgb(0xc8, 0xcc, 0xd2)
+                        } else {
+                            egui::Color32::from_rgb(0x8b, 0x8f, 0x98)
+                        };
+                        ui.painter().text(
+                            pr.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "+",
+                            egui::FontId::proportional(15.0),
+                            pcol,
+                        );
+                        if plus_resp
                             .on_hover_text(catalog.t("workspace.new_shell", &[]))
                             .clicked()
                         {
@@ -800,11 +806,20 @@ impl WorkspaceUi {
         // 입력은 focused pane으로만. egui focus가 세션 목록/버튼으로 튀어도 Claude/vim
         // 같은 terminal TUI 입력은 계속 terminal에 보내야 한다. 단 TextEdit/팝업/별도
         // Window가 열려 있으면 그 UI가 키보드를 소유한다.
+        // top_layer_id()는 닫힌 Window의 layer가 areas order에 남아 계속 Some을
+        // 반환한다 — 설정 창을 한 번 열면 터미널 입력이 영구 차단됐다(2026-07-06 사용자).
+        // "이번 프레임에 실제로 보이는" Middle(Window) layer 존재로 판정한다.
+        let any_window_visible = ui.ctx().memory(|mem| {
+            mem.areas()
+                .visible_layer_ids()
+                .iter()
+                .any(|layer| layer.order == egui::Order::Middle)
+        });
         let terminal_keyboard_active = focused
             && terminal_keyboard_input_allowed(
                 ui.ctx().text_edit_focused(),
                 ui.ctx().any_popup_open(),
-                ui.ctx().top_layer_id().is_some(),
+                any_window_visible,
             );
         if terminal_keyboard_active && !output.response.has_focus() {
             request_terminal_focus(&output.response);

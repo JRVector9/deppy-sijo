@@ -132,9 +132,13 @@ pub fn show(
                 ui.visuals().widgets.noninteractive.bg_stroke,
             );
 
+            let nav_frame = egui::Frame::default()
+                .fill(ui.visuals().faint_bg_color) // panel2 — 우측 폼과 톤 분리 (#72)
+                .inner_margin(egui::Margin::same(10));
             egui::Panel::left("settings_nav")
                 .resizable(false)
                 .exact_size(216.0)
+                .frame(nav_frame)
                 .show(ui, |ui| {
                     nav(ui, category, notif_unread, search_query, catalog);
                 });
@@ -185,6 +189,7 @@ fn nav(
     ui.add(
         egui::TextEdit::singleline(search_query)
             .hint_text(catalog.t("settings.search", &[]))
+            .margin(egui::Margin::symmetric(8, 5)) // 검색창 높이 축소 (#72)
             .desired_width(ui.available_width()),
     );
     ui.add_space(8.0);

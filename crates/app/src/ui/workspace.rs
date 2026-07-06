@@ -536,7 +536,7 @@ impl WorkspaceUi {
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(display_pane_title(&pane.title, catalog))
-                                        .size(10.0)
+                                        .size(13.0)
                                         .strong()
                                         .color(title_color),
                                 )

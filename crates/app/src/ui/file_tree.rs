@@ -814,7 +814,9 @@ impl FileTreeUi {
         // 헤더: 현재 루트 경로(~ 축약) + 새로고침/숨김 토글/접기 (§6). 헤더 전체가
         // 루트로의 드롭 대상이다 (§4 — 루트 영역 dnd_drop_zone).
         let display_root = self.display_root();
-        let (header, root_drop) = ui.dnd_drop_zone::<PathBuf, ()>(egui::Frame::default(), |ui| {
+        // 헤더는 dnd_drop_zone을 쓰지 않는다 — 그 API는 항상 inactive.bg_stroke로
+        // 프레임 박스를 그려 네모 라인이 보였다(#74). 수동 rect 기반 드롭으로 대체.
+        let header_scope = ui.scope(|ui| {
             ui.horizontal(|ui| {
                 // 루트 폴더 아이콘 — 도형 (이모지 □ 깨짐 회피)
                 let (fr, _) = ui.allocate_exact_size(egui::vec2(18.0, 16.0), egui::Sense::hover());
@@ -822,14 +824,15 @@ impl FileTreeUi {
                 // 우측 컨트롤(접기/새로고침/숨김) 폭을 예약 — 긴 경로가 버튼을
                 // 밀어내지 않게 truncate 라벨의 최대폭을 제한한다 (codex P2).
                 ui.scope(|ui| {
-                    ui.set_max_width((ui.available_width() - 110.0).max(40.0));
+                    ui.set_max_width((ui.available_width() - 80.0).max(40.0));
                     ui.add(
                         egui::Label::new(egui::RichText::new(&display_root).strong()).truncate(),
                     )
                     .on_hover_text(&display_root);
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // 접기: ◂는 폰트에 없어 □로 깨진다 — 도형 캐럿, 프레임 없음(#68)
+                    // 아이콘 3종 전부 18x18 painter 셀로 통일 (#74)
+                    // 접기: ◂는 폰트에 없어 □로 깨진다 — 도형 캐럿
                     let (cr, collapse) =
                         ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
                     let ccol = if collapse.hovered() {
@@ -856,17 +859,42 @@ impl FileTreeUi {
                     {
                         self.collapsed = true;
                     }
-                    if ui
-                        .add(egui::Button::new("⟳").frame(false))
+                    // 새로고침 ⟳ — 18x18 셀 중앙
+                    let (rr, refresh) =
+                        ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                    let rcol = if refresh.hovered() {
+                        ui.visuals().text_color()
+                    } else {
+                        ui.visuals().weak_text_color()
+                    };
+                    ui.painter().text(
+                        rr.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "⟳",
+                        egui::FontId::proportional(14.0),
+                        rcol,
+                    );
+                    if refresh
                         .on_hover_text(catalog.t("file_tree.refresh", &[]))
                         .clicked()
                     {
                         self.refresh();
                     }
-                    let hidden = ui
-                        .selectable_label(self.show_hidden, catalog.t("file_tree.hidden", &[]))
-                        .on_hover_text(catalog.t("file_tree.show_hidden", &[]));
-                    if hidden.clicked() {
+                    // 숨김 토글 — 텍스트 대신 눈 아이콘, 켜짐이면 accent (#74)
+                    let (er, eye) =
+                        ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                    let ecol = if self.show_hidden {
+                        ui.visuals().selection.bg_fill
+                    } else if eye.hovered() {
+                        ui.visuals().text_color()
+                    } else {
+                        ui.visuals().weak_text_color()
+                    };
+                    paint_eye(ui.painter(), er.center(), ecol);
+                    if eye
+                        .on_hover_text(catalog.t("file_tree.show_hidden", &[]))
+                        .clicked()
+                    {
                         self.show_hidden = !self.show_hidden;
                         // 워처 콜백 스레드와 동기화 (숨김 이벤트 필터)
                         self.watch_show_hidden
@@ -876,7 +904,28 @@ impl FileTreeUi {
                 });
             });
         });
-        if let (Some(payload), Some(root)) = (root_drop, self.root.clone()) {
+        // 헤더 전체 폭 = 루트로의 드롭 대상 (§4). 드래그 중 hover면 강조 스트로크.
+        let header_rect = egui::Rect::from_min_max(
+            egui::pos2(ui.max_rect().left(), header_scope.response.rect.min.y),
+            egui::pos2(ui.max_rect().right(), header_scope.response.rect.max.y),
+        );
+        let header_drop = ui.interact(
+            header_rect,
+            egui::Id::new("file_tree_root_drop"),
+            egui::Sense::hover(),
+        );
+        if header_drop.dnd_hover_payload::<PathBuf>().is_some() {
+            ui.painter().rect_stroke(
+                header_rect,
+                2.0,
+                ui.visuals().widgets.active.bg_stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        if let (Some(payload), Some(root)) = (
+            header_drop.dnd_release_payload::<PathBuf>(),
+            self.root.clone(),
+        ) {
             self.start_move((*payload).clone(), root);
         }
         crate::ui::hairline_full(ui);
@@ -932,7 +981,7 @@ impl FileTreeUi {
 
         // 헤더 우클릭: 루트에 새 폴더 (FT-3)
         if let Some(root) = self.root.clone() {
-            header.response.context_menu(|ui| {
+            header_drop.context_menu(|ui| {
                 if ui
                     .button(catalog.t("file_tree.new_folder_root", &[]))
                     .clicked()
@@ -1977,6 +2026,26 @@ pub(crate) fn paint_split(ui: &mut egui::Ui, horizontal: bool) -> egui::Response
         p.vline(sq.center().x, sq.y_range(), egui::Stroke::new(1.0, col));
     }
     resp
+}
+
+/// 눈 아이콘 — 숨김 파일 토글 (#74). 아몬드형 윤곽 + 동공.
+fn paint_eye(p: &egui::Painter, c: egui::Pos2, col: egui::Color32) {
+    let s = egui::Stroke::new(1.3, col);
+    let w = 6.5;
+    let h = 4.2;
+    // 위/아래 눈꺼풀 곡선을 짧은 선분으로 근사
+    let mut top = Vec::new();
+    let mut bot = Vec::new();
+    for i in 0..=8 {
+        let t = i as f32 / 8.0;
+        let x = c.x - w + 2.0 * w * t;
+        let dy = h * (std::f32::consts::PI * t).sin();
+        top.push(egui::pos2(x, c.y - dy));
+        bot.push(egui::pos2(x, c.y + dy));
+    }
+    p.add(egui::Shape::line(top, s));
+    p.add(egui::Shape::line(bot, s));
+    p.circle_filled(c, 1.8, col);
 }
 
 /// 폴더 아이콘 — 탭 + 본체 (채움).

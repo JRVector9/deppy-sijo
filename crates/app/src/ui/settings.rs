@@ -89,17 +89,15 @@ pub fn show(
     egui::Window::new(catalog.t("settings.title", &[]))
         .title_bar(false) // 기본 타이틀바(높음) 제거 — 컴팩트 커스텀 행 사용 (목업 §설정)
         .collapsible(false)
+        .default_pos([140.0, 90.0])
         .default_size([1000.0, 640.0])
         .min_size([720.0, 460.0])
         .show(ctx, |ui| {
             // 컴팩트 타이틀 행 (세로 30px) — 드래그 이동 + × 닫기
-            let (bar, drag) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), 30.0),
-                egui::Sense::click_and_drag(),
-            );
-            if drag.dragged() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-            }
+            // 타이틀 행: 드래그는 잡지 않는다 — StartDrag는 OS 창 전체를 움직여
+            // 설정 창이 못 움직였다(#77). 빈 영역 드래그는 egui Window(Area) 이동.
+            let (bar, _) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
             ui.painter().text(
                 bar.center(),
                 egui::Align2::CENTER_CENTER,
@@ -189,7 +187,7 @@ fn nav(
     ui.add(
         egui::TextEdit::singleline(search_query)
             .hint_text(catalog.t("settings.search", &[]))
-            .margin(egui::Margin::symmetric(8, 5)) // 검색창 높이 축소 (#72)
+            .margin(egui::Margin::symmetric(10, 9)) // 검색창 크기 (#72→키움)
             .desired_width(ui.available_width()),
     );
     ui.add_space(8.0);
@@ -423,7 +421,7 @@ fn row(
         ui.vertical(|ui| {
             ui.label(egui::RichText::new(label).size(13.5));
             if let Some(h) = hint {
-                ui.label(egui::RichText::new(h).weak().small());
+                ui.label(egui::RichText::new(h).weak().size(11.5));
             }
         });
         ui.with_layout(
@@ -914,8 +912,13 @@ fn language_page(
         &catalog.t("settings.locale", &[]),
         Some(&catalog.t("settings.locale.hint", &[])),
         |ui| {
+            ui.spacing_mut().interact_size.y = 30.0; // 스텝퍼(30h)와 크기 통일 (#78)
             egui::ComboBox::from_id_salt("locale_combo")
-                .selected_text(current_locale_label(&config.i18n.locale, catalog))
+                .width(130.0)
+                .selected_text(
+                    egui::RichText::new(current_locale_label(&config.i18n.locale, catalog))
+                        .size(13.0),
+                )
                 .show_ui(ui, |ui| {
                     for (locale, key) in [
                         (i18n::FALLBACK_LOCALE, "settings.locale.en_us"),

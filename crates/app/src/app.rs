@@ -1398,15 +1398,21 @@ impl eframe::App for App {
             self.credentials_ui.invalidate_cache();
             ui.ctx().request_repaint();
         }
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.active.workspace_ui.show(
-                ui,
-                &self.config.terminal,
-                &self.active.runtime,
-                &events,
-                &text,
-            );
-        });
+        // 작업창은 여백 없이 경계까지 채운다 — CentralPanel 기본 inner_margin(8) 탓에
+        // pane 좌/상/우 여백이 보였다(#69 사용자).
+        let central_frame =
+            egui::Frame::central_panel(&ui.ctx().global_style()).inner_margin(egui::Margin::ZERO);
+        egui::CentralPanel::default()
+            .frame(central_frame)
+            .show(ui, |ui| {
+                self.active.workspace_ui.show(
+                    ui,
+                    &self.config.terminal,
+                    &self.active.runtime,
+                    &events,
+                    &text,
+                );
+            });
 
         // 알림 센터 렌더 (생성은 logic()에서 끝났다). 활성 workspace의 사라진 세션의
         // 진행형 알림 정리 (다른 workspace 건 alive를 알 수 없어 유지).

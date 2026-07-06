@@ -432,7 +432,7 @@ impl WorkspaceUi {
                 .rect_filled(gap_rect, 0.0, ui.visuals().selection.bg_fill);
         } else {
             ui.painter()
-                .rect_filled(gap_rect, 0.0, egui::Color32::from_rgb(0x2e, 0x2e, 0x37));
+                .rect_filled(gap_rect, 0.0, egui::Color32::from_rgb(0x3a, 0x3a, 0x42));
         }
         if resp.dragged()
             && let Some(pointer) = resp.interact_pointer_pos()

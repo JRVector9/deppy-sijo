@@ -19,7 +19,9 @@ fn dark() -> egui::Visuals {
     let panel = rgb(0x1b, 0x1b, 0x21);
     let panel2 = rgb(0x22, 0x22, 0x2a);
     let panel_hi = rgb(0x2a, 0x2a, 0x33);
-    let hair = rgb(0x2d, 0x2d, 0x36);
+    // 라인은 패널 위에서 또렷하게 — #2d2d36은 패널(#1b1b21)과 대비 없어 안 보였다(#58).
+    // 목업 타겟 경계선(egui 기본 from_gray(60)) 수준의 쿨그레이로.
+    let hair = rgb(0x3a, 0x3a, 0x42);
     palette(
         egui::Visuals::dark(),
         accent,

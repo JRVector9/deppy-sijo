@@ -1,4 +1,6 @@
-// Phase 2에서 상태/복원 흐름에 배선한다 — 그전까진 테스트만 사용하므로 dead_code 허용.
+// Phase 2/3에서 상태/복원 흐름에 배선한다 — 그전까진 테스트만 사용하므로 dead_code 허용.
+#[allow(dead_code)]
+mod agent_detect;
 #[allow(dead_code)]
 mod agent_transcript;
 mod app;

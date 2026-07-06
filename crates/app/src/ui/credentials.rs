@@ -49,6 +49,11 @@ impl CredentialsUi {
         self.cached = None;
     }
 
+    /// 창이 열려 있는가 (툴바 선택 하이라이트용).
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
     pub fn toggle(&mut self) {
         if self.open {
             self.close();

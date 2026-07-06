@@ -1936,10 +1936,12 @@ fn paint_caret(p: &egui::Painter, c: egui::Pos2, expanded: bool, col: egui::Colo
 /// 분할 표현), false=세로선. 클릭 Response 반환 (이모지 □ 깨짐 회피, 목업 §pane-head).
 pub(crate) fn paint_split(ui: &mut egui::Ui, horizontal: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+    // pane 헤더는 테마 무관 항상 다크 — theme 색을 쓰면 light 테마에서 어두운 아이콘이
+    // 다크 헤더에 묻힌다(codex Step4). ×와 같은 고정 밝은 회색을 쓴다.
     let col = if resp.hovered() {
-        ui.visuals().text_color()
+        egui::Color32::from_rgb(0xc8, 0xcc, 0xd2)
     } else {
-        ui.visuals().weak_text_color()
+        egui::Color32::from_rgb(0x8b, 0x8f, 0x98)
     };
     let p = ui.painter();
     let sq = egui::Rect::from_center_size(rect.center(), egui::vec2(11.0, 11.0));

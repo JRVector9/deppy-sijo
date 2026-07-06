@@ -66,6 +66,11 @@ impl AgentsUi {
         std::mem::take(&mut self.pending_launches)
     }
 
+    /// 창이 열려 있는가 (툴바 선택 하이라이트용).
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
     pub fn toggle(&mut self) {
         self.open = !self.open;
         if !self.open {

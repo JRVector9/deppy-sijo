@@ -37,6 +37,11 @@ impl EnvProfilesUi {
         }
     }
 
+    /// 창이 열려 있는가 (툴바 선택 하이라이트용).
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
     pub fn toggle(&mut self) {
         self.open = !self.open;
     }

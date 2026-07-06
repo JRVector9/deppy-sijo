@@ -1399,33 +1399,71 @@ impl eframe::App for App {
                 // 신호등(닫기/최소화/전체화면) 폭만큼 왼쪽 여백 — macOS.
                 #[cfg(target_os = "macos")]
                 ui.add_space(72.0);
-                // 프레임 없는 텍스트 버튼 — 버튼마다 박스가 생기면 "라인 여러 개"로
-                // 보인다 (2026-07-06 사용자). hover 시에만 옅은 배경.
-                let tbtn = |ui: &mut egui::Ui, label: String| {
-                    ui.add(egui::Button::new(label).frame(false)).clicked()
+                // 프레임 없는 텍스트 버튼 — 선택(열린 창)이면 accent-soft 둥근 박스로
+                // 강조, hover 시 옅은 배경 (목업 §타이틀바 선택 하이라이트).
+                let tbtn = |ui: &mut egui::Ui, label: String, selected: bool| -> bool {
+                    let accent = ui.visuals().selection.bg_fill;
+                    let col = if selected {
+                        accent
+                    } else {
+                        ui.visuals().weak_text_color()
+                    };
+                    let font = egui::FontId::proportional(13.0);
+                    let galley = ui.painter().layout_no_wrap(label, font, col);
+                    let w = galley.size().x + 20.0;
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::click());
+                    if selected {
+                        ui.painter()
+                            .rect_filled(rect, 6.0, accent.gamma_multiply(0.15));
+                    } else if resp.hovered() {
+                        ui.painter().rect_filled(
+                            rect,
+                            6.0,
+                            ui.visuals().widgets.hovered.weak_bg_fill,
+                        );
+                    }
+                    let pos = egui::pos2(
+                        rect.center().x - galley.size().x / 2.0,
+                        rect.center().y - galley.size().y / 2.0,
+                    );
+                    ui.painter().galley(pos, galley, col);
+                    resp.clicked()
                 };
-                if tbtn(ui, text.t("top.settings", &[])) {
+                if tbtn(ui, text.t("top.settings", &[]), self.settings_open) {
                     self.settings_open = !self.settings_open;
                 }
-                if tbtn(ui, text.t("top.credentials", &[])) {
+                if tbtn(
+                    ui,
+                    text.t("top.credentials", &[]),
+                    self.credentials_ui.is_open(),
+                ) {
                     self.credentials_ui.toggle();
                 }
-                if tbtn(ui, text.t("top.connectors", &[])) {
+                if tbtn(
+                    ui,
+                    text.t("top.connectors", &[]),
+                    self.connectors_ui.is_open(),
+                ) {
                     self.connectors_ui.toggle();
                 }
-                if tbtn(ui, text.t("top.environment", &[])) {
+                if tbtn(
+                    ui,
+                    text.t("top.environment", &[]),
+                    self.env_profiles_ui.is_open(),
+                ) {
                     self.env_profiles_ui.toggle();
                 }
-                if tbtn(ui, text.t("top.agents", &[])) {
+                if tbtn(ui, text.t("top.agents", &[]), self.agents_ui.is_open()) {
                     self.agents_ui.toggle();
                 }
-                if tbtn(ui, text.t("top.workspaces", &[])) {
+                if tbtn(ui, text.t("top.workspaces", &[]), self.workspaces_open) {
                     self.workspaces_open = !self.workspaces_open;
                     if self.workspaces_open {
                         self.refresh_workspaces();
                     }
                 }
-                if tbtn(ui, text.t("top.activity", &[])) {
+                if tbtn(ui, text.t("top.activity", &[]), self.activity_ui.is_open()) {
                     self.activity_ui.toggle();
                     self.refresh_workspaces();
                 }
@@ -1437,7 +1475,7 @@ impl eframe::App for App {
                 } else {
                     text.t("top.notifications", &[])
                 };
-                if tbtn(ui, label) {
+                if tbtn(ui, label, self.notifications_ui.is_open()) {
                     // 열면 모두 읽음 → 배지가 이미 그려진 뒤라 다음 프레임에 갱신
                     self.notifications_ui.toggle();
                     ui.ctx().request_repaint();

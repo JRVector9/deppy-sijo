@@ -368,6 +368,8 @@ pub struct App {
     logs_base: PathBuf,
     redaction: secret::RedactionService,
     workspaces: Vec<crate::storage::WorkspaceRow>,
+    /// 이름 편집 중인 워크스페이스 (id, 편집 버퍼) — #3 이름 변경 UI 상태.
+    ws_name_edit: Option<(String, String)>,
     /// 알림 클릭으로 다른 workspace 전환 후, mux 재구성되면 이동할 (workspace, session).
     pending_focus: Option<(String, runtime::SessionId)>,
     /// 전환으로 background 정리 중인 옛 워커 shutdown 스레드들 (workspace_id, handle).
@@ -470,6 +472,7 @@ impl App {
             logs_base,
             redaction,
             workspaces: Vec::new(),
+            ws_name_edit: None,
             pending_focus: None,
             pending_shutdowns: Vec::new(),
             remote: None,
@@ -862,6 +865,26 @@ impl App {
         }
     }
 
+    /// 워크스페이스 표시 이름 — 사용자가 이름을 지정했으면 그 이름, 아니면(‘default’/빈값)
+    /// 프로젝트 경로의 폴더명으로 대체한다(#3). "셸 12" 대신 프로젝트명이 보이게.
+    fn workspace_display_name(row: &crate::storage::WorkspaceRow) -> String {
+        let name = row.name.trim();
+        if !name.is_empty() && name != "default" {
+            return name.to_owned();
+        }
+        let path = row.path.trim();
+        if !path.is_empty()
+            && let Some(base) = std::path::Path::new(path).file_name()
+        {
+            return base.to_string_lossy().into_owned();
+        }
+        if name.is_empty() {
+            "default".to_owned()
+        } else {
+            name.to_owned()
+        }
+    }
+
     fn workspace_path_to_tree_root(path: Option<String>) -> Option<PathBuf> {
         path.and_then(|path| (!path.trim().is_empty()).then(|| PathBuf::from(path)))
     }
@@ -900,7 +923,7 @@ impl App {
                 if ws.id == self.active.id {
                     return ui::activity::ActivityWorkspaceRow {
                         id: ws.id.clone(),
-                        name: ws.name.clone(),
+                        name: Self::workspace_display_name(ws),
                         state: ui::activity::ActivityWorkspaceState::Active,
                         session_count: self.active.workspace_ui.session_entries(&self.i18n).len(),
                         pending_events: self.active.pending_events.len(),
@@ -922,7 +945,7 @@ impl App {
                     });
                     return ui::activity::ActivityWorkspaceRow {
                         id: ws.id.clone(),
-                        name: ws.name.clone(),
+                        name: Self::workspace_display_name(ws),
                         state: ui::activity::ActivityWorkspaceState::Warm,
                         session_count: rt.session_titles.len(),
                         pending_events: rt.pending_events.len(),
@@ -935,7 +958,7 @@ impl App {
                 }
                 ui::activity::ActivityWorkspaceRow {
                     id: ws.id.clone(),
-                    name: ws.name.clone(),
+                    name: Self::workspace_display_name(ws),
                     state: ui::activity::ActivityWorkspaceState::Suspended,
                     session_count: 0,
                     pending_events: 0,
@@ -1533,6 +1556,10 @@ impl eframe::App for App {
         let mut activity_action = None;
         let mut notif_click = None;
         let mut ws_switch: Option<String> = None;
+        // #3 워크스페이스 이름 편집 캡처 (클로저 밖에서 db/refresh 처리 — self 전체 &mut).
+        let mut ws_rename: Option<(String, String)> = None;
+        let mut ws_edit_start: Option<(String, String)> = None;
+        let mut ws_edit_cancel = false;
         let out = ui::settings::show(
             ui.ctx(),
             &mut self.settings_open,
@@ -1589,18 +1616,48 @@ impl eframe::App for App {
                         );
                     }
                     C::Workspaces => {
-                        // 최소 인라인: 목록 + 전환(생성/삭제/경로편집은 후속). 전환은
-                        // 워커 재구성이라 창 밖에서 처리하도록 캡처만 한다.
+                        // 목록 + 전환 + 이름 편집(#3). 전환·저장은 워커 재구성/refresh라
+                        // 창 밖에서 처리하도록 캡처만 한다.
+                        let edit = &mut self.ws_name_edit;
                         for ws in &self.workspaces {
                             ui.horizontal(|ui| {
-                                if ws.id == wsid {
-                                    ui.strong(&ws.name);
-                                    ui.weak(text.t("workspace.manager.current", &[]));
-                                } else {
-                                    ui.label(&ws.name);
-                                    if ui.button(text.t("workspace.manager.switch", &[])).clicked()
+                                let editing = edit.as_ref().is_some_and(|(id, _)| id == &ws.id);
+                                if editing {
+                                    let buf = &mut edit.as_mut().unwrap().1;
+                                    ui.add(
+                                        egui::TextEdit::singleline(buf)
+                                            .hint_text(text.t("workspace.manager.name_hint", &[]))
+                                            .desired_width(180.0),
+                                    );
+                                    if ui
+                                        .button(text.t("workspace.manager.name_save", &[]))
+                                        .clicked()
                                     {
-                                        ws_switch = Some(ws.id.clone());
+                                        ws_rename = Some((ws.id.clone(), buf.clone()));
+                                    }
+                                    if ui
+                                        .button(text.t("workspace.manager.name_cancel", &[]))
+                                        .clicked()
+                                    {
+                                        ws_edit_cancel = true;
+                                    }
+                                } else {
+                                    let display = Self::workspace_display_name(ws);
+                                    if ws.id == wsid {
+                                        ui.strong(&display);
+                                        ui.weak(text.t("workspace.manager.current", &[]));
+                                    } else {
+                                        ui.label(&display);
+                                        if ui
+                                            .button(text.t("workspace.manager.switch", &[]))
+                                            .clicked()
+                                        {
+                                            ws_switch = Some(ws.id.clone());
+                                        }
+                                    }
+                                    if ui.button(text.t("workspace.manager.rename", &[])).clicked()
+                                    {
+                                        ws_edit_start = Some((ws.id.clone(), display));
                                     }
                                 }
                             });
@@ -1617,6 +1674,23 @@ impl eframe::App for App {
             },
         );
         // 관리/모니터 액션 처리 (클로저 밖 — self 전체 &mut 필요한 것들)
+        // #3 이름 편집: 시작/취소/저장
+        if let Some(start) = ws_edit_start {
+            self.ws_name_edit = Some(start);
+        }
+        if ws_edit_cancel {
+            self.ws_name_edit = None;
+        }
+        if let Some((id, name)) = ws_rename {
+            let name = name.trim();
+            // 빈 이름은 'default'로 저장 → 표시 시 프로젝트명 fallback.
+            let to_save = if name.is_empty() { "default" } else { name };
+            if let Err(e) = self.db.rename_workspace(&id, to_save) {
+                tracing::warn!("워크스페이스 이름 저장 실패: {e:#}");
+            }
+            self.ws_name_edit = None;
+            self.refresh_workspaces();
+        }
         if let Some(id) = ws_switch.filter(|id| *id != self.active.id) {
             {
                 self.switch_workspace(&id);

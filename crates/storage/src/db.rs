@@ -562,6 +562,21 @@ impl Db {
     }
 
     /// workspace의 프로젝트 경로를 설정한다 (FT-0 — 컬럼은 v2부터 존재, 값 채움만).
+    /// workspace 이름을 변경한다 (#3 — 사용자 지정 이름).
+    pub fn rename_workspace(&self, id: &str, name: &str) -> anyhow::Result<()> {
+        let affected = self
+            .conn
+            .execute(
+                "UPDATE workspaces
+                 SET name = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE id = ?1",
+                (id, name),
+            )
+            .with_context(|| format!("workspace 이름 저장 실패: {id}"))?;
+        anyhow::ensure!(affected == 1, "workspace 없음: {id}");
+        Ok(())
+    }
+
     pub fn set_workspace_path(&self, id: &str, path: &str) -> anyhow::Result<()> {
         let affected = self
             .conn

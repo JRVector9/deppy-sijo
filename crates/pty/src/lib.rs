@@ -16,6 +16,7 @@ pub use process_identity::{ProcessIdentity, ProcessIdentitySource};
 
 /// 실행할 프로그램. portable-pty CommandBuilder를 노출하지 않기 위한 최소 스펙.
 /// env 값에 secret 평문이 올 수 있다 — 절대 로그에 찍지 말 것 (Debug 미구현 이유).
+#[derive(Clone)]
 pub struct CommandSpec {
     pub program: String,
     pub args: Vec<String>,

@@ -534,7 +534,7 @@ impl Worker {
                 match Session::spawn_with_spec(
                     id,
                     session::SessionKind::Shell,
-                    &self.shell, // 테스트 주입 가능해야 하므로 default_shell 헬퍼 대신 spec 직접
+                    &self.shell_with_session(id), // 테스트 주입 가능해야 하므로 default_shell 헬퍼 대신 spec 직접
                     cols,
                     rows,
                     scrollback_lines,
@@ -874,6 +874,16 @@ impl Worker {
     }
 
     /// 새 tab에 pane 하나를 만들어 세션을 attach하고 포커스한다.
+    /// DEPPY_SESSION_ID를 주입한 셸 spec — 이 셸에서 실행된 claude/codex의 hook이 세션을
+    /// 식별해 needsInput을 보고한다(옵션2 hook 배선). 세션ID를 키로 써 spawn 시점에 이미
+    /// 안다(pane 생성 순서와 무관).
+    fn shell_with_session(&self, id: SessionId) -> CommandSpec {
+        let mut spec = self.shell.clone();
+        spec.env
+            .push(("DEPPY_SESSION_ID".to_owned(), id.0.to_string()));
+        spec
+    }
+
     fn attach_in_new_tab(&mut self, session: SessionId, title_prefix: &str) {
         self.tab_counter += 1;
         let title = format!("{title_prefix} {}", self.tab_counter);
@@ -954,7 +964,7 @@ impl Worker {
         match Session::spawn_with_spec(
             id,
             session::SessionKind::Shell,
-            &self.shell,
+            &self.shell_with_session(id),
             80,
             24,
             Self::RESTORE_SCROLLBACK_LINES,
@@ -1007,7 +1017,7 @@ impl Worker {
         match Session::spawn_with_spec(
             id,
             session::SessionKind::Shell,
-            &self.shell,
+            &self.shell_with_session(id),
             80,
             24,
             scrollback_lines,

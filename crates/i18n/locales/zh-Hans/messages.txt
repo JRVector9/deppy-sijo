@@ -25,6 +25,7 @@ status.override.menu = 状态覆盖
 status.override.mark_running = 标记为运行中
 status.override.mark_waiting = 标记为等待中
 status.override.mark_needs_approval = 标记为需要批准
+status.override.mark_idle = 标记为空闲
 status.override.mark_done = 标记为完成
 status.override.mark_error = 标记为错误
 status.override.clear = 清除覆盖

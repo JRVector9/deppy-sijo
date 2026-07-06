@@ -1073,6 +1073,7 @@ impl WorkspaceUi {
                             "status.override.mark_needs_approval",
                             SessionStatus::NeedsApproval,
                         ),
+                        ("status.override.mark_idle", SessionStatus::Idle),
                         ("status.override.mark_done", SessionStatus::Done),
                         ("status.override.mark_error", SessionStatus::Error),
                     ] {

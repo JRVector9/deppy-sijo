@@ -236,6 +236,7 @@ fn session_status_to_persist(status: session::SessionStatus) -> &'static str {
         session::SessionStatus::Running => persist::SESSION_STATUS_RUNNING,
         session::SessionStatus::Waiting => "waiting",
         session::SessionStatus::NeedsApproval => "needs_approval",
+        session::SessionStatus::Idle => "idle",
         session::SessionStatus::Error => "error",
         session::SessionStatus::Done => "done",
     }

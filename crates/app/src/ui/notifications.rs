@@ -54,6 +54,7 @@ impl NotificationsUi {
         let rendered = catalog.t(message_id, &[("title", title)]);
         match status {
             SessionStatus::Running => return, // 진행 재개는 알림 아님
+            SessionStatus::Idle => return,    // 쉬는 중 — 알림 아님
             SessionStatus::Waiting
             | SessionStatus::NeedsApproval
             | SessionStatus::Error
@@ -176,6 +177,7 @@ fn status_icon(status: SessionStatus) -> &'static str {
         SessionStatus::NeedsApproval => "✋",
         SessionStatus::Error => "❌",
         SessionStatus::Done => "✅",
+        SessionStatus::Idle => "",
         SessionStatus::Running => "",
     }
 }
@@ -186,6 +188,7 @@ fn notification_message_id(status: SessionStatus) -> Option<&'static str> {
         SessionStatus::NeedsApproval => Some("notification.session.needs_approval"),
         SessionStatus::Error => Some("notification.session.error"),
         SessionStatus::Done => Some("notification.session.done"),
+        SessionStatus::Idle => None, // 쉬는 중은 알림 아님
         SessionStatus::Running => None,
     }
 }

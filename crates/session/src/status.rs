@@ -8,9 +8,12 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SessionStatus {
     Running,
-    /// 입력 대기 (regex 매치 또는 idle heuristic)
+    /// 입력 대기 — regex/화면 프롬프트로 감지된 "진짜 사용자 입력 필요"(needs-input).
     Waiting,
     NeedsApproval,
+    /// 작업 완료 후 프롬프트 복귀(세션은 살아있음). output idle heuristic이 만든다.
+    /// Waiting과 달리 대기 중인 프롬프트가 없는 "쉬는 중" 상태 (cmux Idle 대응).
+    Idle,
     Error,
     Done,
 }
@@ -184,6 +187,7 @@ fn priority(status: SessionStatus) -> u8 {
         SessionStatus::NeedsApproval => 3,
         SessionStatus::Done => 2,
         SessionStatus::Waiting => 1,
+        SessionStatus::Idle => 0,
         SessionStatus::Running => 0,
     }
 }
@@ -425,7 +429,8 @@ impl StatusDetector {
         // idle: 어떤 신호도 없고 출력이 멎었으면 입력 대기 추정 (약한 신호 — 출력으로 해제)
         self.stats.idle_evaluations += 1;
         if self.status == SessionStatus::Running && self.last_output.elapsed() >= IDLE_THRESHOLD {
-            self.status = SessionStatus::Waiting;
+            // 출력이 멎었고 감지된 프롬프트가 없다 = 작업 완료·프롬프트 복귀(Idle).
+            self.status = SessionStatus::Idle;
             self.source = StatusSource::IdleHeuristic;
             self.idle_waiting = true;
         }
@@ -702,10 +707,12 @@ mod tests {
 
     #[test]
     fn idle_heuristic() {
+        // 출력이 멎으면 idle 휴리스틱은 Idle(작업완료·프롬프트 복귀)로 본다.
+        // 진짜 입력 대기(Waiting)는 regex/화면 프롬프트로만 감지된다.
         let mut d = StatusDetector::new(patterns());
         d.on_output(b"busy\n");
         d.last_output = Instant::now() - Duration::from_secs(11);
-        assert_eq!(d.evaluate(None), Some(SessionStatus::Waiting));
+        assert_eq!(d.evaluate(None), Some(SessionStatus::Idle));
     }
 
     #[test]

@@ -25,6 +25,7 @@ status.override.menu = 狀態覆寫
 status.override.mark_running = 標記為執行中
 status.override.mark_waiting = 標記為等待中
 status.override.mark_needs_approval = 標記為需要核准
+status.override.mark_idle = 標記為閒置
 status.override.mark_done = 標記為完成
 status.override.mark_error = 標記為錯誤
 status.override.clear = 清除覆寫

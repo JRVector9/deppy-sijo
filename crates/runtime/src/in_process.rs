@@ -541,6 +541,13 @@ impl Worker {
                 ) {
                     Ok(new_session) => {
                         self.sessions.insert(id, new_session);
+                        // 셸도 status detector 설치 — regex 패턴은 없지만 idle heuristic
+                        // (3단)이 Running/Idle을 감지해 레일에 상태가 반영된다(#2). agent와
+                        // 달리 셸엔 감지 regex가 없어 그동안 상태가 아예 안 났다.
+                        self.detectors.insert(
+                            id,
+                            StatusDetector::new(StatusPatterns::compile(None, None, None, None)),
+                        );
                         self.open_session_log(id);
                         self.attach_in_new_tab(id, SHELL_TITLE_ID);
                         if let Some(pipe) = &mut self.persist {

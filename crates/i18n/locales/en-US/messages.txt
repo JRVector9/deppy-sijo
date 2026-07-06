@@ -25,6 +25,7 @@ status.override.menu = Status override
 status.override.mark_running = Mark running
 status.override.mark_waiting = Mark waiting
 status.override.mark_needs_approval = Mark needs approval
+status.override.mark_idle = Mark as idle
 status.override.mark_done = Mark done
 status.override.mark_error = Mark error
 status.override.clear = Clear override

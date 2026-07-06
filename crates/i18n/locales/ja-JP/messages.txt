@@ -25,6 +25,7 @@ status.override.menu = 状態を指定
 status.override.mark_running = 実行中にする
 status.override.mark_waiting = 待機中にする
 status.override.mark_needs_approval = 承認待ちにする
+status.override.mark_idle = アイドルとして表示
 status.override.mark_done = 完了にする
 status.override.mark_error = エラーにする
 status.override.clear = 指定を解除

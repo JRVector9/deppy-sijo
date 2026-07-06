@@ -25,6 +25,7 @@ status.override.menu = 상태 지정
 status.override.mark_running = 실행 중으로 표시
 status.override.mark_waiting = 대기 중으로 표시
 status.override.mark_needs_approval = 승인 필요로 표시
+status.override.mark_idle = 유휴로 표시
 status.override.mark_done = 완료로 표시
 status.override.mark_error = 오류로 표시
 status.override.clear = 지정 해제

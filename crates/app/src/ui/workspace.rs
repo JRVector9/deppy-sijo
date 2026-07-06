@@ -200,6 +200,8 @@ impl WorkspaceUi {
         // 탭바 제거 (2026-07-05): 셸 전환은 좌측 사이드바 세션 목록이 담당하고,
         // 새 셸/분할/닫기는 각 pane 헤더가 담당한다 — 셸 수만큼 탭이 늘어나
         // 상단이 넘치던 문제 해소.
+        // 에러 바가 있을 때만 pane과 분리하는 헤어라인을 둔다 — 평소엔 top_bar 하단
+        // 헤어라인이 이미 구분선이라 여기 무조건 그리면 라인이 두 줄로 겹쳤다(#64 사용자).
         if let Some(error) = self.error.clone() {
             ui.horizontal(|ui| {
                 ui.colored_label(ui.visuals().error_fg_color, error);
@@ -207,8 +209,8 @@ impl WorkspaceUi {
                     self.error = None;
                 }
             });
+            crate::ui::hairline(ui);
         }
-        crate::ui::hairline(ui);
 
         let Some(mux) = self.mux.clone() else {
             ui.centered_and_justified(|ui| {

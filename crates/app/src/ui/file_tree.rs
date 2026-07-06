@@ -2013,7 +2013,9 @@ pub(crate) fn session_status_color(
         Some(S::NeedsApproval) => egui::Color32::from_rgb(0xe0, 0xa8, 0x3e), // 승인(주황)
         Some(S::Done) => egui::Color32::from_rgb(0x6c, 0xc2, 0x6c),    // 완료(초록)
         Some(S::Error) => egui::Color32::from_rgb(0xe0, 0x5c, 0x53),   // 오류(빨강)
-        None => visuals.weak_text_color(),                             // 유휴
+        // 유휴(셸 등 status 없음) — weak_text_color는 팔레트에서 저대비라 안 보였다
+        // (2026-07-06 사용자). accent(#63)를 기본 레일 색으로 지정해 항상 보이게.
+        None => visuals.selection.bg_fill,
     }
 }
 

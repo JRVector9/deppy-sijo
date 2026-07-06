@@ -852,10 +852,10 @@ impl WorkspaceUi {
                 );
             }
             if image_paste_requested && !text_paste_seen {
-                match crate::ui::clipboard_image::paste_clipboard_image_to_png() {
-                    Ok(Some(path)) => {
-                        let bytes = path_insert_paste_bytes(
-                            &path,
+                match crate::ui::clipboard_image::paste_clipboard_paths_or_image_to_paths() {
+                    Ok(Some(paths)) => {
+                        let bytes = paths_insert_paste_bytes(
+                            &paths,
                             self.session_shell_kind(session),
                             bracketed,
                         );
@@ -1095,9 +1095,6 @@ impl WorkspaceUi {
                     pane: pane.id.clone(),
                     title: display_pane_title(&pane.title, catalog),
                     status,
-                    // status 감지는 agent만 → status가 잡히면 agent. (갓 spawn된 agent는
-                    // 첫 감지 전까지 셸로 보이는 짧은 창이 있으나 곧 Running이 잡힌다.)
-                    is_agent: status.is_some(),
                     summary,
                     focused: mux.focused_pane.as_ref() == Some(&pane.id),
                 }
@@ -1181,6 +1178,20 @@ pub(crate) fn path_insert_paste_bytes(
     bracketed_paste: bool,
 ) -> Vec<u8> {
     let raw = crate::ui::file_tree::shell_path_insert_bytes_for(path, shell_kind);
+    input_mapper::paste_bytes(&raw, bracketed_paste)
+}
+
+pub(crate) fn paths_insert_paste_bytes(
+    paths: &[std::path::PathBuf],
+    shell_kind: crate::ui::file_tree::ShellKind,
+    bracketed_paste: bool,
+) -> Vec<u8> {
+    let mut raw = Vec::new();
+    for path in paths {
+        raw.extend(crate::ui::file_tree::shell_path_insert_bytes_for(
+            path, shell_kind,
+        ));
+    }
     input_mapper::paste_bytes(&raw, bracketed_paste)
 }
 
@@ -1506,6 +1517,43 @@ mod tests {
                 assert!(!inner.contains(&b'\n'), "{fixture} {shell:?}");
                 assert!(!inner.contains(&b'\r'), "{fixture} {shell:?}");
             }
+        }
+    }
+
+    #[test]
+    fn paths_insert_paste_bytes는_클립보드_file_list를_다중_path로_삽입한다() {
+        use crate::ui::file_tree::ShellKind;
+
+        let paths = vec![
+            std::path::PathBuf::from("images/sample image.png"),
+            std::path::PathBuf::from("프로젝트/🚀-deploy/설정 파일.png"),
+        ];
+        for shell in [
+            ShellKind::Posix,
+            ShellKind::Fish,
+            ShellKind::PowerShell,
+            ShellKind::Cmd,
+        ] {
+            let mut expected = Vec::new();
+            for path in &paths {
+                expected.extend(crate::ui::file_tree::shell_path_insert_bytes_for(
+                    path, shell,
+                ));
+            }
+            assert_eq!(
+                paths_insert_paste_bytes(&paths, shell, false),
+                expected,
+                "{shell:?}"
+            );
+            assert_eq!(expected.last(), Some(&b' '), "{shell:?}");
+            assert!(!expected.contains(&b'\n'), "{shell:?}");
+            assert!(!expected.contains(&b'\r'), "{shell:?}");
+
+            let wrapped = paths_insert_paste_bytes(&paths, shell, true);
+            assert!(wrapped.starts_with(b"\x1b[200~"), "{shell:?}");
+            assert!(wrapped.ends_with(b"\x1b[201~"), "{shell:?}");
+            let inner = &wrapped[b"\x1b[200~".len()..wrapped.len() - b"\x1b[201~".len()];
+            assert_eq!(inner, expected.as_slice(), "{shell:?}");
         }
     }
 

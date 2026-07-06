@@ -4,6 +4,32 @@ use anyhow::Context;
 
 pub fn paste_clipboard_image_to_png() -> anyhow::Result<Option<PathBuf>> {
     let mut clipboard = arboard::Clipboard::new().context("clipboard 열기 실패")?;
+    paste_clipboard_image_to_png_with(&mut clipboard)
+}
+
+pub fn paste_clipboard_paths_or_image_to_paths() -> anyhow::Result<Option<Vec<PathBuf>>> {
+    let mut clipboard = arboard::Clipboard::new().context("clipboard 열기 실패")?;
+    if let Some(paths) = clipboard_file_list(&mut clipboard)? {
+        return Ok(Some(paths));
+    }
+    paste_clipboard_image_to_png_with(&mut clipboard).map(|path| path.map(|path| vec![path]))
+}
+
+fn clipboard_file_list(
+    clipboard: &mut arboard::Clipboard,
+) -> anyhow::Result<Option<Vec<PathBuf>>> {
+    match clipboard.get().file_list() {
+        Ok(paths) => Ok((!paths.is_empty()).then_some(paths)),
+        Err(arboard::Error::ContentNotAvailable)
+        | Err(arboard::Error::ClipboardNotSupported)
+        | Err(arboard::Error::ConversionFailure) => Ok(None),
+        Err(e) => Err(e).context("clipboard 파일 목록 읽기 실패"),
+    }
+}
+
+fn paste_clipboard_image_to_png_with(
+    clipboard: &mut arboard::Clipboard,
+) -> anyhow::Result<Option<PathBuf>> {
     let image = match clipboard.get_image() {
         Ok(image) => image,
         Err(arboard::Error::ContentNotAvailable) => return Ok(None),

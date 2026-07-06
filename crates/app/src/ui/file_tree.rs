@@ -16,10 +16,8 @@ pub struct SessionEntry {
     pub pane: runtime::MuxPaneId,
     pub title: String,
     /// agent 감지 상태 (Running/Waiting/NeedsApproval/Done/Error). 셸은 항상 None —
-    /// status 감지는 agent만(§PR-12). 세션 행 상태 점 색으로 그린다.
+    /// status 감지는 agent만(§PR-12). 세션 행 좌측 상태 레일 색으로 그린다.
     pub status: Option<runtime::SessionStatus>,
-    /// agent 세션인가 (status 감지 대상 = agent). 타입 글리프(마름모/삼각형) 구분용.
-    pub is_agent: bool,
     /// 최신 화면 요약 (마지막 비어있지 않은 행 — 2026-07-05)
     pub summary: String,
     pub focused: bool,
@@ -1851,25 +1849,14 @@ fn session_row(ui: &mut egui::Ui, entry: &SessionEntry) -> egui::Response {
     } else if resp.hovered() {
         painter.rect_filled(rect, 4.0, visuals.widgets.hovered.bg_fill);
     }
-    // 좌측 상태 레일 (선택 또는 agent) — 2px
-    if entry.focused || entry.is_agent {
-        let rail = egui::Rect::from_min_size(
-            egui::pos2(rect.left(), rect.top() + 3.0),
-            egui::vec2(2.0, row_h - 6.0),
-        );
-        let rail_color = if entry.focused { accent } else { dot };
-        painter.rect_filled(rail, 1.0, rail_color);
-    }
-    let mid_y = rect.top() + if has_summary { 13.0 } else { row_h / 2.0 };
-    // 상태 점
-    painter.circle_filled(egui::pos2(rect.left() + 17.0, mid_y), 3.5, dot);
-    // 타입 글리프: agent=마름모(◆), shell=삼각형(▸) — 도형으로 (폰트 글리프 회피)
-    paint_type_glyph(
-        painter,
-        egui::pos2(rect.left() + 31.0, mid_y),
-        entry.is_agent,
-        visuals.weak_text_color(),
+    // 좌측 상태 레일(2px) — 항상 표시, 상태 색으로 세로로 훑어 파악 (목업 §세션).
+    // 점·타입 글리프는 제거하고 레일이 유일한 상태 표시다 (2026-07-06 사용자).
+    let rail = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), rect.top() + 4.0),
+        egui::vec2(2.0, row_h - 8.0),
     );
+    painter.rect_filled(rail, 1.0, dot);
+    let mid_y = rect.top() + if has_summary { 13.0 } else { row_h / 2.0 };
     // 타이틀
     let title_color = if entry.focused {
         accent
@@ -1877,7 +1864,7 @@ fn session_row(ui: &mut egui::Ui, entry: &SessionEntry) -> egui::Response {
         visuals.text_color()
     };
     painter.text(
-        egui::pos2(rect.left() + 44.0, mid_y),
+        egui::pos2(rect.left() + 16.0, mid_y),
         egui::Align2::LEFT_CENTER,
         &entry.title,
         egui::FontId::proportional(13.0),
@@ -1886,7 +1873,7 @@ fn session_row(ui: &mut egui::Ui, entry: &SessionEntry) -> egui::Response {
     // 요약 (dim, mono, 길면 잘림)
     if has_summary {
         painter.text(
-            egui::pos2(rect.left() + 30.0, rect.top() + 27.0),
+            egui::pos2(rect.left() + 16.0, rect.top() + 27.0),
             egui::Align2::LEFT_CENTER,
             truncate_chars(&entry.summary, 40),
             egui::FontId::monospace(10.5),

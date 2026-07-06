@@ -701,8 +701,6 @@ impl App {
                 self.remote = Some(state);
                 self.remote_error = None;
                 self.config.remote.tls_enabled = true;
-                // 에이전트 상태 hook 토글 반영(설치/해제).
-                self.sync_agent_hooks();
                 if let Err(e) = self.config.save(&self.config_path) {
                     tracing::warn!("config 저장 실패: {e:#}");
                     // 서버는 켜졌지만 자동시작이 영속되지 않음 — 사용자에게 알린다.
@@ -1947,6 +1945,8 @@ impl eframe::App for App {
             // hot reload: 테마는 즉시 적용 (터미널 캐시 clear는 ui() 상단의 실효 테마
             // 감지가 다음 프레임에 처리 — System 전환까지 한 경로로 커버).
             ui.ctx().set_theme(self.config.ui.theme.to_egui());
+            // 에이전트 상태 hook 토글(agent_status_hooks) 반영 — 설치/해제.
+            self.sync_agent_hooks();
             // 폴더 트리 hot toggle (§6): OFF → 상태 drop(리소스 0), ON → 즉시 생성
             if self.config.ui.file_tree_enabled != self.file_tree.is_some() {
                 self.file_tree = self

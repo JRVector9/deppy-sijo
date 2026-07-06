@@ -125,6 +125,9 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
             _ => {}
         }
     }
+    // hook payload(claude/codex가 stdin으로 보냄)를 끝까지 읽어 버린다 — 안 읽고 종료하면
+    // 에이전트의 write가 broken pipe로 막힐 수 있다(codex 지적).
+    let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
     // codex는 hook stdout이 유효 JSON이길 기대 — 무슨 일이 있어도 '{}' 출력.
     println!("{{}}");
     let Some(session_key) = std::env::var("DEPPY_SESSION_ID")

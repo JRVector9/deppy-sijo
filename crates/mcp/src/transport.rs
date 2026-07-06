@@ -18,6 +18,9 @@ use serde_json::{Value, json};
 
 /// stdout 한 줄 최대 길이 — newline 없는 무한 스트림으로 인한 메모리 폭주 방지
 const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+/// stdin으로 보내는 JSON-RPC 한 줄 최대 길이. 큰 tools/call payload는 pipe를
+/// 채워 blocking write가 될 수 있으므로 transport 경계에서 한 번 더 제한한다.
+pub(crate) const MAX_WRITE_LINE_BYTES: usize = 64 * 1024;
 /// redacted stderr 보관 상한 (초과분은 버리고 truncation 표식만 남긴다)
 const STDERR_LOG_CAP: usize = 256 * 1024;
 /// 위반 라인을 에러 메시지에 실을 때 최대 문자 수 (redact 후에도 길이는 제한)
@@ -201,15 +204,44 @@ impl StdioClient {
         }
     }
 
-    /// 한 줄 JSON-RPC 전송. write에는 timeout이 없다 — v0 요청(initialize/tools/list)은
-    /// pipe 버퍼보다 훨씬 작아 서버가 stdin을 읽지 않아도 블록하지 않는다.
+    /// 한 줄 JSON-RPC 전송. stdin write도 timeout을 적용한다 — MCP 서버가 stdin을
+    /// 읽지 않거나 큰 payload로 pipe가 차도 호출 thread가 영구 block되지 않아야 한다.
     fn write_line(&mut self, msg: &Value) -> anyhow::Result<()> {
-        let stdin = self.stdin.as_mut().context("stdin이 이미 닫힘")?;
         let mut line = serde_json::to_vec(msg)?;
         line.push(b'\n');
-        stdin.write_all(&line)?;
-        stdin.flush()?;
-        Ok(())
+        if line.len() > MAX_WRITE_LINE_BYTES {
+            bail!(
+                "MCP 요청 크기 초과: {} bytes (max {MAX_WRITE_LINE_BYTES})",
+                line.len()
+            );
+        }
+        let mut stdin = self.stdin.take().context("stdin이 이미 닫힘")?;
+        let (tx, rx) = sync_channel(1);
+        std::thread::Builder::new()
+            .name("mcp-stdin-write".into())
+            .spawn(move || {
+                let result = stdin.write_all(&line).and_then(|()| stdin.flush());
+                let _ = tx.send(result.map(|()| stdin));
+            })
+            .context("mcp stdin write thread 생성 실패")?;
+        match rx.recv_timeout(self.request_timeout) {
+            Ok(Ok(stdin)) => {
+                self.stdin = Some(stdin);
+                Ok(())
+            }
+            Ok(Err(e)) => Err(e.into()),
+            Err(RecvTimeoutError::Timeout) => {
+                let status = kill_and_reap(&mut self.child);
+                self.reaped = true;
+                bail!(
+                    "MCP stdin write timeout ({:?}, exit: {status:?})",
+                    self.request_timeout
+                )
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                bail!("MCP stdin write thread 종료")
+            }
+        }
     }
 
     /// id가 일치하는 response를 기다린다 (request/response 상관).

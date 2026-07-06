@@ -1639,6 +1639,13 @@ impl eframe::App for App {
             }
             // hot reload: 테마는 즉시 적용
             ui.ctx().set_theme(self.config.ui.theme.to_egui());
+            // 테마 변경 시 터미널 렌더 캐시를 비운다 — 안 그러면 stale galley로 글자가
+            // 깨진 채 남아 키 입력 전까지 안 고쳐졌다(#7 사용자). active + warm 모두.
+            self.active.workspace_ui.clear_render_caches();
+            for rt in self.warm.values_mut() {
+                rt.workspace_ui.clear_render_caches();
+            }
+            ui.ctx().request_repaint();
             // 폴더 트리 hot toggle (§6): OFF → 상태 drop(리소스 0), ON → 즉시 생성
             if self.config.ui.file_tree_enabled != self.file_tree.is_some() {
                 self.file_tree = self
@@ -1769,7 +1776,9 @@ fn expired_warm_workspace_ids(
 /// 2) SessionStatusChanged/SessionStatusViewChanged는 세션별 최신 1개만 유지한다(status는
 ///    last-wins). detector의 Running↔Waiting churn으로 무계 누적되던 것을 O(세션수)로
 ///    유계화. 유지분 상대 순서는 보존.
-/// 3) SessionExited/ShellSpawned/AgentSpawned/SpawnFailed/Viewport는 전량 순서 보존.
+/// 3) ResourceUsage는 프로세스/세션 리소스의 현재 상태라 최신 1개만 유지한다.
+/// 4) PtyInputPressure는 세션별 현재 입력 큐 상태라 세션별 최신 1개만 유지한다.
+/// 5) SessionExited/ShellSpawned/AgentSpawned/SpawnFailed/Viewport는 전량 순서 보존.
 ///
 /// 알림은 coalesce 전에 process_ws_notifications가 전량 소비하므로(렌더 replay 전용)
 /// 공격적으로 줄여도 알림엔 영향이 없다.
@@ -1779,11 +1788,16 @@ fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) {
         .iter()
         .rposition(|e| matches!(e, runtime::RuntimeEvent::MuxUpdated { .. }))
         .map(|i| events[i].clone());
+    let latest_resource_idx = events
+        .iter()
+        .rposition(|e| matches!(e, runtime::RuntimeEvent::ResourceUsage { .. }));
 
     // 세션별 마지막 StatusChanged의 원 인덱스 (나중 것이 이김 → 그 인덱스만 유지).
     let mut latest_status_idx: std::collections::HashMap<runtime::SessionId, usize> =
         std::collections::HashMap::new();
     let mut latest_status_view_idx: std::collections::HashMap<runtime::SessionId, usize> =
+        std::collections::HashMap::new();
+    let mut latest_input_pressure_idx: std::collections::HashMap<runtime::SessionId, usize> =
         std::collections::HashMap::new();
     for (i, e) in events.iter().enumerate() {
         if let runtime::RuntimeEvent::SessionStatusChanged { session, .. } = e {
@@ -1791,6 +1805,9 @@ fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) {
         }
         if let runtime::RuntimeEvent::SessionStatusViewChanged { session, .. } = e {
             latest_status_view_idx.insert(*session, i);
+        }
+        if let runtime::RuntimeEvent::PtyInputPressure { session, .. } = e {
+            latest_input_pressure_idx.insert(*session, i);
         }
     }
 
@@ -1806,6 +1823,10 @@ fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) {
             }
             runtime::RuntimeEvent::SessionStatusViewChanged { session, .. } => {
                 latest_status_view_idx.get(session) == Some(&idx)
+            }
+            runtime::RuntimeEvent::ResourceUsage { .. } => latest_resource_idx == Some(idx),
+            runtime::RuntimeEvent::PtyInputPressure { session, .. } => {
+                latest_input_pressure_idx.get(session) == Some(&idx)
             }
             _ => true,
         };
@@ -1842,6 +1863,34 @@ mod tests {
                 snapshot.active_tab.as_ref().map(|t| t.0.as_str())
             }
             _ => None,
+        }
+    }
+
+    fn resource_event(sampled_at_ms: u64) -> runtime::RuntimeEvent {
+        runtime::RuntimeEvent::ResourceUsage {
+            snapshot: runtime::ProcessResourceSnapshot {
+                pid: 42,
+                sampled_at_ms,
+                rss_bytes: sampled_at_ms * 1024,
+                cpu_percent: Some(sampled_at_ms as f32),
+                high_cpu: false,
+                high_rss: false,
+            },
+            session_usage: Vec::new(),
+        }
+    }
+
+    fn input_pressure_event(session: u64, queued_bytes: usize) -> runtime::RuntimeEvent {
+        runtime::RuntimeEvent::PtyInputPressure {
+            session: runtime::SessionId(session),
+            pressure: runtime::PtyInputPressure {
+                attempted_bytes: queued_bytes + 1,
+                queued_bytes,
+                queued_messages: 1,
+                max_bytes: 1024,
+                max_messages: 8,
+                reason: runtime::PtyInputRejectReason::QueueFull,
+            },
         }
     }
 
@@ -2174,6 +2223,77 @@ h:1 EE:FF
                 session: runtime::SessionId(1),
                 view
             } if view.status == runtime::SessionStatus::Waiting
+        ));
+    }
+
+    #[test]
+    fn coalesce_dedups_resource_usage_to_latest() {
+        let mut events = vec![
+            resource_event(1),
+            runtime::RuntimeEvent::ShellSpawned {
+                session: runtime::SessionId(7),
+            },
+            resource_event(2),
+            runtime::RuntimeEvent::SessionExited {
+                session: runtime::SessionId(7),
+                exit_code: Some(0),
+            },
+        ];
+
+        coalesce_mux_updated(&mut events);
+
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            &events[0],
+            runtime::RuntimeEvent::ShellSpawned {
+                session: runtime::SessionId(7)
+            }
+        ));
+        assert!(matches!(
+            &events[1],
+            runtime::RuntimeEvent::ResourceUsage { snapshot, .. }
+                if snapshot.sampled_at_ms == 2
+        ));
+        assert!(matches!(
+            &events[2],
+            runtime::RuntimeEvent::SessionExited {
+                session: runtime::SessionId(7),
+                exit_code: Some(0)
+            }
+        ));
+    }
+
+    #[test]
+    fn coalesce_dedups_input_pressure_per_session() {
+        let mut events = vec![
+            input_pressure_event(1, 10),
+            input_pressure_event(2, 20),
+            input_pressure_event(1, 30),
+            runtime::RuntimeEvent::SessionExited {
+                session: runtime::SessionId(1),
+                exit_code: Some(0),
+            },
+        ];
+
+        coalesce_mux_updated(&mut events);
+
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            &events[0],
+            runtime::RuntimeEvent::PtyInputPressure { session, pressure }
+                if *session == runtime::SessionId(2) && pressure.queued_bytes == 20
+        ));
+        assert!(matches!(
+            &events[1],
+            runtime::RuntimeEvent::PtyInputPressure { session, pressure }
+                if *session == runtime::SessionId(1) && pressure.queued_bytes == 30
+        ));
+        assert!(matches!(
+            &events[2],
+            runtime::RuntimeEvent::SessionExited {
+                session: runtime::SessionId(1),
+                exit_code: Some(0)
+            }
         ));
     }
 

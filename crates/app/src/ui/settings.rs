@@ -86,8 +86,10 @@ pub fn show(
         };
     }
 
+    let win_frame = egui::Frame::window(&ctx.global_style()).inner_margin(egui::Margin::ZERO);
     egui::Window::new(catalog.t("settings.title", &[]))
         .title_bar(false) // 기본 타이틀바(높음) 제거 — 컴팩트 커스텀 행 사용 (목업 §설정)
+        .frame(win_frame) // 여백 0 — 타이틀 라인이 창 끝까지(#6), 좌측 이중 여백 제거(#1)
         .collapsible(false)
         .default_pos([140.0, 90.0])
         .default_size([1000.0, 640.0])
@@ -132,7 +134,13 @@ pub fn show(
 
             let nav_frame = egui::Frame::default()
                 .fill(ui.visuals().faint_bg_color) // panel2 — 우측 폼과 톤 분리 (#72)
-                .inner_margin(egui::Margin::same(10));
+                // 좌측 여백 축소(#1) — 창 여백 0과 합쳐 네비가 창 왼쪽에 밀착.
+                .inner_margin(egui::Margin {
+                    left: 8,
+                    right: 8,
+                    top: 10,
+                    bottom: 10,
+                });
             egui::Panel::left("settings_nav")
                 .resizable(false)
                 .exact_size(216.0)
@@ -161,8 +169,12 @@ pub fn show(
                                 &mut remote_action,
                                 catalog,
                             ),
-                            // 관리/모니터 7개 — App이 각 패널 contents() 렌더
-                            other => render_management(ui, other),
+                            // 관리/모니터 7개 — App이 각 패널 contents() 렌더.
+                            // 버튼·입력을 디자인 룰(docs/ui-components.md)로 통일한 뒤 렌더.
+                            other => {
+                                apply_component_style(ui);
+                                render_management(ui, other)
+                            }
                         }
                     });
             });
@@ -172,6 +184,27 @@ pub fn show(
         config_changed: changed,
         remote_action,
     }
+}
+
+/// 관리/모니터 패널의 버튼·입력을 디자인 룰로 통일한다 (#2·#3·#4, docs/ui-components.md).
+/// 컨트롤 높이 30, 버튼 배경 accent-soft(#85 색)·라운딩 6, 텍스트 중앙(egui 버튼 기본).
+fn apply_component_style(ui: &mut egui::Ui) {
+    let accent = ui.visuals().selection.bg_fill;
+    let soft = accent.gamma_multiply(0.16);
+    let hover = accent.gamma_multiply(0.30);
+    let radius = egui::CornerRadius::same(6);
+    let spacing = ui.spacing_mut();
+    spacing.interact_size.y = 30.0; // 버튼·입력·드롭다운 높이 통일
+    spacing.button_padding = egui::vec2(12.0, 7.0);
+    let v = ui.visuals_mut();
+    v.widgets.inactive.weak_bg_fill = soft;
+    v.widgets.inactive.bg_fill = soft;
+    v.widgets.inactive.corner_radius = radius;
+    v.widgets.hovered.weak_bg_fill = hover;
+    v.widgets.hovered.bg_fill = hover;
+    v.widgets.hovered.corner_radius = radius;
+    v.widgets.active.weak_bg_fill = hover;
+    v.widgets.active.corner_radius = radius;
 }
 
 // ── 좌측 네비 ──

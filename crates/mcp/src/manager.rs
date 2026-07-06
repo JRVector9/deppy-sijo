@@ -273,6 +273,34 @@ printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"%s","inputSchema":{"
     }
 
     #[test]
+    fn call_tool_큰_payload는_stdio_write전에_거부() {
+        let script = r#"
+read -r _init
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"mock","version":"0.1"}}}'
+read -r _initialized
+sleep 30
+"#;
+        let manager = manager();
+        let started = Instant::now();
+        let error = manager
+            .call_tool(
+                &sh_config(script),
+                "echo_tool",
+                json!({"msg": "x".repeat(crate::transport::MAX_WRITE_LINE_BYTES)}),
+            )
+            .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("MCP 요청 크기 초과"),
+            "{error:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "큰 payload 거부가 timeout에 의존하면 안 됨"
+        );
+    }
+
+    #[test]
     fn scoped_env는_stdio_server에만_주입된다() {
         let manager = manager();
         let mut config = sh_config(ENV_SCRIPT);

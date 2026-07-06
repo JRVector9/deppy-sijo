@@ -82,6 +82,14 @@ impl WorkspaceUi {
         }
     }
 
+    /// 모든 세션의 터미널 렌더 캐시를 비운다 — 테마 변경 시 stale galley(옛 폰트
+    /// 아틀라스/색)가 재사용돼 글자가 깨지던 문제 해결(#7). 다음 프레임에 전 행 재구성.
+    pub fn clear_render_caches(&mut self) {
+        for view in self.sessions.values_mut() {
+            view.render_cache.clear();
+        }
+    }
+
     fn handle_events(&mut self, events: &[RuntimeEvent], catalog: &i18n::Catalog) {
         for event in events {
             match event {

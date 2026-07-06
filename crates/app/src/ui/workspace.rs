@@ -790,8 +790,19 @@ impl WorkspaceUi {
         // 터미널 위 우클릭도 같은 메뉴 (터미널 위젯이 topmost라 배경 interact가 못 받음)
         self.pane_context_menu(&output.response, pane_id, config, client, catalog);
 
-        // 입력은 focused pane으로만
-        if focused && output.response.has_focus() {
+        // 입력은 focused pane으로만. egui focus가 세션 목록/버튼으로 튀어도 Claude/vim
+        // 같은 terminal TUI 입력은 계속 terminal에 보내야 한다. 단 TextEdit/팝업/별도
+        // Window가 열려 있으면 그 UI가 키보드를 소유한다.
+        let terminal_keyboard_active = focused
+            && terminal_keyboard_input_allowed(
+                ui.ctx().text_edit_focused(),
+                ui.ctx().any_popup_open(),
+                ui.ctx().top_layer_id().is_some(),
+            );
+        if terminal_keyboard_active && !output.response.has_focus() {
+            output.response.request_focus();
+        }
+        if terminal_keyboard_active {
             let mut pending: Vec<u8> = Vec::new();
             let mut copy_text: Option<String> = None;
             let mut image_paste_requested = false;
@@ -1224,6 +1235,14 @@ fn is_clipboard_paste_shortcut(event: &egui::Event) -> bool {
     }
 }
 
+fn terminal_keyboard_input_allowed(
+    text_edit_focused: bool,
+    popup_open: bool,
+    top_window_open: bool,
+) -> bool {
+    !(text_edit_focused || popup_open || top_window_open)
+}
+
 /// 상태 → tab 제목 아이콘 (PR-12).
 /// 사이드바 세션 요약 — 화면의 마지막 비어있지 않은 행 (≤48자, 2026-07-05).
 fn last_line_summary(snapshot: &TerminalViewportSnapshot) -> String {
@@ -1577,5 +1596,13 @@ mod tests {
             assert!(!is_clipboard_paste_shortcut(&ctrl_v));
             assert!(is_clipboard_paste_shortcut(&ctrl_shift_v));
         }
+    }
+
+    #[test]
+    fn terminal_keyboard는_textedit_popup_window가_없을때만_활성이다() {
+        assert!(terminal_keyboard_input_allowed(false, false, false));
+        assert!(!terminal_keyboard_input_allowed(true, false, false));
+        assert!(!terminal_keyboard_input_allowed(false, true, false));
+        assert!(!terminal_keyboard_input_allowed(false, false, true));
     }
 }

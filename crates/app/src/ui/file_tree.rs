@@ -1932,6 +1932,31 @@ fn paint_caret(p: &egui::Painter, c: egui::Pos2, expanded: bool, col: egui::Colo
     p.add(egui::Shape::convex_polygon(pts, col, egui::Stroke::NONE));
 }
 
+/// pane 헤더 분할 아이콘 — 작은 사각형 + 가운데 분할선. horizontal=가로선(위/아래
+/// 분할 표현), false=세로선. 클릭 Response 반환 (이모지 □ 깨짐 회피, 목업 §pane-head).
+pub(crate) fn paint_split(ui: &mut egui::Ui, horizontal: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+    let col = if resp.hovered() {
+        ui.visuals().text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let p = ui.painter();
+    let sq = egui::Rect::from_center_size(rect.center(), egui::vec2(11.0, 11.0));
+    p.rect_stroke(
+        sq,
+        1.5,
+        egui::Stroke::new(1.0, col),
+        egui::StrokeKind::Inside,
+    );
+    if horizontal {
+        p.hline(sq.x_range(), sq.center().y, egui::Stroke::new(1.0, col));
+    } else {
+        p.vline(sq.center().x, sq.y_range(), egui::Stroke::new(1.0, col));
+    }
+    resp
+}
+
 /// 폴더 아이콘 — 탭 + 본체 (채움).
 fn paint_folder(p: &egui::Painter, c: egui::Pos2, col: egui::Color32) {
     let w = 15.0;

@@ -558,16 +558,22 @@ impl WorkspaceUi {
                             },
                         );
                     }
+                    ui.add_space(4.0); // × 앞 여백 (목업 §pane-head)
                     if ui
-                        .small_button("×")
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("×")
+                                    .color(egui::Color32::from_rgb(0x8b, 0x8f, 0x98)),
+                            )
+                            .frame(false),
+                        )
                         .on_hover_text(catalog.t("workspace.close_pane", &[]))
                         .clicked()
                     {
                         self.request_close_pane(client, pane_id.clone());
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .small_button("─")
+                        if crate::ui::file_tree::paint_split(ui, true)
                             .on_hover_text(catalog.t("workspace.split_vertical_short", &[]))
                             .clicked()
                         {
@@ -580,8 +586,7 @@ impl WorkspaceUi {
                                 },
                             );
                         }
-                        if ui
-                            .small_button("│")
+                        if crate::ui::file_tree::paint_split(ui, false)
                             .on_hover_text(catalog.t("workspace.split_horizontal_short", &[]))
                             .clicked()
                         {
@@ -595,7 +600,14 @@ impl WorkspaceUi {
                             );
                         }
                         if ui
-                            .small_button("+")
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("+")
+                                        .size(15.0)
+                                        .color(egui::Color32::from_rgb(0x8b, 0x8f, 0x98)),
+                                )
+                                .frame(false),
+                            )
                             .on_hover_text(catalog.t("workspace.new_shell", &[]))
                             .clicked()
                         {
@@ -806,7 +818,7 @@ impl WorkspaceUi {
             let mut pending: Vec<u8> = Vec::new();
             let mut copy_text: Option<String> = None;
             let mut image_paste_requested = false;
-            let mut text_paste_seen = false;
+            let mut text_paste_bytes: Option<Vec<u8>> = None;
             ui.input(|input| {
                 let modifiers = input.modifiers;
                 for event in &input.raw.events {
@@ -818,7 +830,8 @@ impl WorkspaceUi {
                         self.preedit.clear();
                     }
                     if matches!(event, egui::Event::Paste(_)) {
-                        text_paste_seen = true;
+                        text_paste_bytes = input_mapper::map_event(event, bracketed, &modifiers);
+                        continue;
                     }
                     // Cmd+C(macOS)/Ctrl+C(그 외)의 Copy 이벤트: 선택이 있으면 복사가
                     // 우선 — 이벤트를 소비해 ^C 전송(비macOS 매핑)을 막는다 (2026-07-05)
@@ -842,6 +855,35 @@ impl WorkspaceUi {
             if let Some(text) = copy_text {
                 ui.ctx().copy_text(text);
             }
+            if image_paste_requested {
+                match crate::ui::clipboard_image::paste_clipboard_paths_or_image_to_paths() {
+                    Ok(Some(paths)) => {
+                        if let Some(bytes) = clipboard_terminal_paste_bytes(
+                            Some(&paths),
+                            text_paste_bytes.take(),
+                            self.session_shell_kind(session),
+                            bracketed,
+                        ) {
+                            pending.extend(bytes);
+                        }
+                    }
+                    Ok(None) => {
+                        if let Some(bytes) = clipboard_terminal_paste_bytes(
+                            None,
+                            text_paste_bytes.take(),
+                            self.session_shell_kind(session),
+                            bracketed,
+                        ) {
+                            pending.extend(bytes);
+                        }
+                    }
+                    Err(e) => {
+                        self.error = Some(format!("{e:#}"));
+                    }
+                }
+            } else if let Some(bytes) = text_paste_bytes {
+                pending.extend(bytes);
+            }
             if !pending.is_empty() {
                 self.send(
                     client,
@@ -850,22 +892,6 @@ impl WorkspaceUi {
                         bytes: pending,
                     },
                 );
-            }
-            if image_paste_requested && !text_paste_seen {
-                match crate::ui::clipboard_image::paste_clipboard_paths_or_image_to_paths() {
-                    Ok(Some(paths)) => {
-                        let bytes = paths_insert_paste_bytes(
-                            &paths,
-                            self.session_shell_kind(session),
-                            bracketed,
-                        );
-                        self.send(client, RuntimeCommand::WriteInput { session, bytes });
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        self.error = Some(format!("{e:#}"));
-                    }
-                }
             }
         }
 
@@ -1229,6 +1255,19 @@ fn terminal_text_paste_bytes(text: &str, bracketed_paste: bool) -> Vec<u8> {
     input_mapper::paste_bytes(text.as_bytes(), bracketed_paste)
 }
 
+fn clipboard_terminal_paste_bytes(
+    paths: Option<&[std::path::PathBuf]>,
+    text_paste_bytes: Option<Vec<u8>>,
+    shell_kind: crate::ui::file_tree::ShellKind,
+    bracketed_paste: bool,
+) -> Option<Vec<u8>> {
+    if let Some(paths) = paths {
+        Some(paths_insert_paste_bytes(paths, shell_kind, bracketed_paste))
+    } else {
+        text_paste_bytes
+    }
+}
+
 fn is_clipboard_paste_shortcut(event: &egui::Event) -> bool {
     let egui::Event::Key {
         key: egui::Key::V,
@@ -1555,6 +1594,31 @@ mod tests {
             let inner = &wrapped[b"\x1b[200~".len()..wrapped.len() - b"\x1b[201~".len()];
             assert_eq!(inner, expected.as_slice(), "{shell:?}");
         }
+    }
+
+    #[test]
+    fn clipboard_terminal_paste는_file_list를_text_flavor보다_우선한다() {
+        use crate::ui::file_tree::ShellKind;
+
+        let paths = vec![std::path::PathBuf::from("images/sample image.png")];
+        let text = Some(b"images/sample image.png".to_vec());
+
+        assert_eq!(
+            clipboard_terminal_paste_bytes(Some(&paths), text, ShellKind::Posix, false),
+            Some(paths_insert_paste_bytes(&paths, ShellKind::Posix, false))
+        );
+    }
+
+    #[test]
+    fn clipboard_terminal_paste는_file_list가_없으면_text_paste로_fallback한다() {
+        use crate::ui::file_tree::ShellKind;
+
+        let text = input_mapper::paste_bytes("plain text".as_bytes(), true);
+
+        assert_eq!(
+            clipboard_terminal_paste_bytes(None, Some(text.clone()), ShellKind::Posix, true),
+            Some(text)
+        );
     }
 
     #[test]

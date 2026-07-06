@@ -107,6 +107,11 @@ pub fn draw(
     );
     // click_and_drag: 클릭=포커스, 드래그=선택 (2026-07-05 복사 지원)
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    if response.has_focus() {
+        ui.memory_mut(|memory| {
+            memory.set_focus_lock_filter(response.id, terminal_focus_lock_filter());
+        });
+    }
     let painter = ui.painter_at(rect);
     let origin = rect.min;
 
@@ -205,6 +210,15 @@ pub fn draw(
         response,
         cell_size: cell,
         origin,
+    }
+}
+
+fn terminal_focus_lock_filter() -> egui::EventFilter {
+    egui::EventFilter {
+        tab: true,
+        horizontal_arrows: true,
+        vertical_arrows: true,
+        escape: true,
     }
 }
 
@@ -563,6 +577,15 @@ mod tests {
         assert!(!row_is_dirty(&s, 0));
         assert!(row_is_dirty(&s, 1));
         assert!(!row_is_dirty(&s, 2));
+    }
+
+    #[test]
+    fn terminal_focus_lock_filter는_tui_navigation_keys를_ui_focus에서_잠근다() {
+        let filter = terminal_focus_lock_filter();
+        assert!(filter.tab);
+        assert!(filter.horizontal_arrows);
+        assert!(filter.vertical_arrows);
+        assert!(filter.escape);
     }
 
     #[test]

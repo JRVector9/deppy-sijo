@@ -329,6 +329,9 @@ struct RemoteTlsState {
 pub struct App {
     config: Config,
     config_path: PathBuf,
+    /// 직전 프레임의 실효 테마(다크 여부) — 바뀌면 터미널 렌더 캐시를 비운다.
+    /// System 테마의 OS 레벨 전환은 config_changed를 안 거치므로 매 프레임 감지한다(#7 codex).
+    last_theme_dark: bool,
     settings_open: bool,
     /// 통합 설정 창의 선택된 카테고리.
     settings_category: ui::settings::Category,
@@ -440,6 +443,7 @@ impl App {
         let mut app = Self {
             config,
             config_path,
+            last_theme_dark: true,
             settings_open: false,
             settings_category: ui::settings::Category::default(),
             settings_search: String::new(),
@@ -1184,6 +1188,18 @@ impl eframe::App for App {
         self.frame_stats.begin();
         let text = self.i18n.clone();
         let mut unread_before = 0;
+        // 실효 테마(다크 여부)가 바뀌면 터미널 렌더 캐시를 비운다 — stale galley로 글자가
+        // 깨진 채 남던 문제(#7). 설정에서의 명시 변경과 System 테마의 OS 레벨 전환(raw
+        // input system_theme, config_changed 안 거침, codex 지적)을 모두 여기서 커버한다.
+        let theme_dark = ui.ctx().global_style().visuals.dark_mode;
+        if theme_dark != self.last_theme_dark {
+            self.last_theme_dark = theme_dark;
+            self.active.workspace_ui.clear_render_caches();
+            for rt in self.warm.values_mut() {
+                rt.workspace_ui.clear_render_caches();
+            }
+            ui.ctx().request_repaint();
+        }
         // 타이틀바 통합 바: 패널 기본 inner_margin(8)을 없애 상단 경계에 붙이고 좌측
         // 여백을 제거한다(#67 사용자). 항목은 신호등 높이(28pt 타이틀바, 중심 y≈14)에
         // 맞춰 세로 중앙 정렬.
@@ -1637,15 +1653,9 @@ impl eframe::App for App {
             if self.i18n.locale() != self.config.i18n.locale {
                 self.i18n = load_catalog(&self.config.i18n.locale);
             }
-            // hot reload: 테마는 즉시 적용
+            // hot reload: 테마는 즉시 적용 (터미널 캐시 clear는 ui() 상단의 실효 테마
+            // 감지가 다음 프레임에 처리 — System 전환까지 한 경로로 커버).
             ui.ctx().set_theme(self.config.ui.theme.to_egui());
-            // 테마 변경 시 터미널 렌더 캐시를 비운다 — 안 그러면 stale galley로 글자가
-            // 깨진 채 남아 키 입력 전까지 안 고쳐졌다(#7 사용자). active + warm 모두.
-            self.active.workspace_ui.clear_render_caches();
-            for rt in self.warm.values_mut() {
-                rt.workspace_ui.clear_render_caches();
-            }
-            ui.ctx().request_repaint();
             // 폴더 트리 hot toggle (§6): OFF → 상태 drop(리소스 0), ON → 즉시 생성
             if self.config.ui.file_tree_enabled != self.file_tree.is_some() {
                 self.file_tree = self

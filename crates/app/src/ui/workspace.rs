@@ -334,7 +334,9 @@ impl WorkspaceUi {
                 first,
                 second,
             } => {
-                let gap = 4.0;
+                // 목업처럼 pane을 붙이고 1px 구분선만 둔다 (기존 4px 투명 gap 제거).
+                // 리사이즈 잡기는 split_handle이 히트영역을 ±2px 확장해 보장한다.
+                let gap = 1.0;
                 // 드래그 중이면 로컬 미리보기 ratio 사용 (릴리즈 시에만 명령 전송)
                 let ratio = match &self.split_drag {
                     Some((drag_path, preview)) if drag_path == path => *preview,
@@ -424,9 +426,13 @@ impl WorkspaceUi {
             SplitDirection::Vertical => egui::CursorIcon::ResizeVertical,
         };
         let resp = resp.on_hover_cursor(cursor);
+        // 항상 1px 구분선(다크 헤어라인)을 그린다 — hover/drag 시 accent로 강조.
         if resp.hovered() || resp.dragged() {
             ui.painter()
                 .rect_filled(gap_rect, 0.0, ui.visuals().selection.bg_fill);
+        } else {
+            ui.painter()
+                .rect_filled(gap_rect, 0.0, egui::Color32::from_rgb(0x2e, 0x2e, 0x37));
         }
         if resp.dragged()
             && let Some(pointer) = resp.interact_pointer_pos()

@@ -88,7 +88,7 @@ impl CredentialsUi {
         }
     }
 
-    fn contents(
+    pub fn contents(
         &mut self,
         ui: &mut egui::Ui,
         credentials: &dyn CredentialService,

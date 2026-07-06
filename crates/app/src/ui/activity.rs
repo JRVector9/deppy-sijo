@@ -60,44 +60,56 @@ impl ActivityUi {
             .resizable(true)
             .default_width(560.0)
             .show(ctx, |ui| {
-                if rows.is_empty() {
-                    ui.label(catalog.t("activity.empty", &[]));
-                    return;
-                }
-                egui::Grid::new("activity_workspace_grid")
-                    .num_columns(6)
-                    .striped(true)
-                    .show(ui, |ui| {
-                        ui.strong(catalog.t("activity.workspace", &[]));
-                        ui.strong(catalog.t("activity.state", &[]));
-                        ui.strong(catalog.t("activity.sessions", &[]));
-                        ui.strong(catalog.t("activity.queue", &[]));
-                        ui.strong(catalog.t("activity.resources", &[]));
-                        ui.strong(catalog.t("activity.action", &[]));
-                        ui.end_row();
-
-                        for row in rows {
-                            ui.label(&row.name);
-                            state_label(ui, catalog, row);
-                            ui.label(row.session_count.to_string());
-                            ui.label(queue_label(catalog, row));
-                            ui.label(resource_label(
-                                catalog,
-                                row.resource.as_ref(),
-                                &row.session_resources,
-                            ));
-                            if row.state != ActivityWorkspaceState::Active {
-                                if ui.button(catalog.t("activity.switch", &[])).clicked() {
-                                    action = Some(ActivityAction::SwitchWorkspace(row.id.clone()));
-                                }
-                            } else {
-                                ui.weak(catalog.t("activity.current", &[]));
-                            }
-                            ui.end_row();
-                        }
-                    });
+                action = self.contents(ui, catalog, rows);
             });
         self.open = open;
+        action
+    }
+
+    /// 창 프레임 없이 본문만 렌더한다 (통합 설정 창 우측 패널용, 2026-07-06).
+    pub fn contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        catalog: &i18n::Catalog,
+        rows: &[ActivityWorkspaceRow],
+    ) -> Option<ActivityAction> {
+        let mut action = None;
+        if rows.is_empty() {
+            ui.label(catalog.t("activity.empty", &[]));
+            return action;
+        }
+        egui::Grid::new("activity_workspace_grid")
+            .num_columns(6)
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong(catalog.t("activity.workspace", &[]));
+                ui.strong(catalog.t("activity.state", &[]));
+                ui.strong(catalog.t("activity.sessions", &[]));
+                ui.strong(catalog.t("activity.queue", &[]));
+                ui.strong(catalog.t("activity.resources", &[]));
+                ui.strong(catalog.t("activity.action", &[]));
+                ui.end_row();
+
+                for row in rows {
+                    ui.label(&row.name);
+                    state_label(ui, catalog, row);
+                    ui.label(row.session_count.to_string());
+                    ui.label(queue_label(catalog, row));
+                    ui.label(resource_label(
+                        catalog,
+                        row.resource.as_ref(),
+                        &row.session_resources,
+                    ));
+                    if row.state != ActivityWorkspaceState::Active {
+                        if ui.button(catalog.t("activity.switch", &[])).clicked() {
+                            action = Some(ActivityAction::SwitchWorkspace(row.id.clone()));
+                        }
+                    } else {
+                        ui.weak(catalog.t("activity.current", &[]));
+                    }
+                    ui.end_row();
+                }
+            });
         action
     }
 }

@@ -246,7 +246,7 @@ impl ConnectorsUi {
         }
     }
 
-    fn contents(
+    pub fn contents(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,

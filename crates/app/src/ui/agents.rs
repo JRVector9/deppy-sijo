@@ -129,7 +129,7 @@ impl AgentsUi {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn contents(
+    pub fn contents(
         &mut self,
         ui: &mut egui::Ui,
         db: &Db,

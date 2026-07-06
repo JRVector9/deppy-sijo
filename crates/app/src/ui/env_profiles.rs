@@ -71,7 +71,7 @@ impl EnvProfilesUi {
         self.open = open;
     }
 
-    fn contents(
+    pub fn contents(
         &mut self,
         ui: &mut egui::Ui,
         db: &mut Db,

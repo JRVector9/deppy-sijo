@@ -176,30 +176,41 @@ impl NotificationsUi {
             .open(&mut open)
             .resizable(false)
             .show(ctx, |ui| {
-                if self.items.is_empty() {
-                    ui.label(catalog.t("notification.empty", &[]));
-                }
-                if !self.items.is_empty()
-                    && ui
-                        .button(catalog.t("notification.clear_all", &[]))
-                        .clicked()
-                {
-                    self.items.clear();
-                }
-                // 최신 항목이 위로
-                for item in self.items.iter().rev() {
-                    let icon = status_icon(item.status);
-                    let label = catalog.t(&item.message_id, &[("title", &item.title)]);
-                    if ui
-                        .button(format!("{icon} {label}"))
-                        .on_hover_text(catalog.t("notification.goto_session", &[]))
-                        .clicked()
-                    {
-                        clicked = Some((item.workspace_id.clone(), item.session));
-                    }
-                }
+                clicked = self.contents(ui, catalog);
             });
         self.open = open;
+        clicked
+    }
+
+    /// 창 프레임 없이 본문만 렌더 (통합 설정 창 우측 패널용). 읽음 처리는 show()가 한다.
+    pub fn contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        catalog: &i18n::Catalog,
+    ) -> Option<(String, SessionId)> {
+        let mut clicked = None;
+        if self.items.is_empty() {
+            ui.label(catalog.t("notification.empty", &[]));
+        }
+        if !self.items.is_empty()
+            && ui
+                .button(catalog.t("notification.clear_all", &[]))
+                .clicked()
+        {
+            self.items.clear();
+        }
+        // 최신 항목이 위로
+        for item in self.items.iter().rev() {
+            let icon = status_icon(item.status);
+            let label = catalog.t(&item.message_id, &[("title", &item.title)]);
+            if ui
+                .button(format!("{icon} {label}"))
+                .on_hover_text(catalog.t("notification.goto_session", &[]))
+                .clicked()
+            {
+                clicked = Some((item.workspace_id.clone(), item.session));
+            }
+        }
         clicked
     }
 }

@@ -3,8 +3,8 @@
 
 mod db;
 pub use db::{
-    AgentConfigRow, ApprovalOutcome, ApprovalStatus, CredentialMeta, Db, EnvProfileRow, EnvValue,
-    EnvVarRow, PendingApprovalRow, PermissionRuleRow, WorkspaceRow,
+    AgentConfigRow, AgentSessionRow, ApprovalOutcome, ApprovalStatus, CredentialMeta, Db,
+    EnvProfileRow, EnvValue, EnvVarRow, PendingApprovalRow, PermissionRuleRow, WorkspaceRow,
 };
 pub use mcp_store::PendingApprovalInsert;
 

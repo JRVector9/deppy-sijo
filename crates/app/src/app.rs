@@ -376,6 +376,14 @@ pub struct App {
         std::collections::HashMap<runtime::SessionId, crate::agent_transcript::AgentActivity>,
     /// 에이전트 감지(ps/lsof+파싱) 스로틀 타이머 — 매 프레임은 부담이라 주기 갱신.
     last_agent_poll: std::time::Instant,
+    /// 마지막으로 DB에 저장한 pane_id → row — 차등 upsert/delete 및 churn 방지용.
+    persisted_agents: std::collections::HashMap<String, crate::storage::AgentSessionRow>,
+    /// 복원용으로 로드한 (pane_id → 저장된 에이전트 세션). 워크스페이스 활성 시 로드.
+    restore_agents: std::collections::HashMap<String, crate::storage::AgentSessionRow>,
+    /// restore_agents를 로드한 워크스페이스 id (전환 시 재로드 판정).
+    restore_loaded_for: Option<String>,
+    /// 이번 실행에서 이미 resume 명령을 보낸 pane (중복 주입 방지).
+    resumed_panes: std::collections::HashSet<String>,
     /// 알림 클릭으로 다른 workspace 전환 후, mux 재구성되면 이동할 (workspace, session).
     pending_focus: Option<(String, runtime::SessionId)>,
     /// 전환으로 background 정리 중인 옛 워커 shutdown 스레드들 (workspace_id, handle).
@@ -481,6 +489,10 @@ impl App {
             ws_name_edit: None,
             agent_activity: std::collections::HashMap::new(),
             last_agent_poll: std::time::Instant::now(),
+            persisted_agents: std::collections::HashMap::new(),
+            restore_agents: std::collections::HashMap::new(),
+            restore_loaded_for: None,
+            resumed_panes: std::collections::HashSet::new(),
             pending_focus: None,
             pending_shutdowns: Vec::new(),
             remote: None,
@@ -1367,11 +1379,102 @@ impl eframe::App for App {
                 .iter()
                 .filter_map(|r| r.pid.map(|pid| (r.session, pid)))
                 .collect();
+            // 복원용 저장 데이터를 먼저 로드한다(아래 persistence가 지우기 전에).
+            // 워크스페이스가 바뀌면 재로드.
+            if self.restore_loaded_for.as_deref() != Some(self.active.id.as_str()) {
+                self.restore_agents = self
+                    .db
+                    .list_agent_sessions(&self.active.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|r| (r.pane_id.clone(), r))
+                    .collect();
+                // persisted_agents는 "이번 세션에 감지해 저장한 것"만 추적한다 — 빈 맵으로
+                // 시작해야 아래 삭제 루프가 아직 감지 전인 복원 데이터를 지우지 않는다
+                // (codex: restore_agents로 채우면 시작/전환 직후 빈 감지에 DB가 비워짐).
+                self.persisted_agents = std::collections::HashMap::new();
+                self.resumed_panes.clear();
+                self.restore_loaded_for = Some(self.active.id.clone());
+            }
+
             let bindings = crate::agent_detect::detect(&sessions);
             self.agent_activity = bindings
                 .iter()
                 .filter_map(|(sid, b)| crate::agent_detect::activity(b).map(|a| (*sid, a)))
                 .collect();
+
+            // 영속(옵션2 Phase 3): 감지된 에이전트를 pane_id로 매핑해 (kind, session-id)를
+            // 차등 upsert하고, 사라진(종료된) 것은 지운다 — replace-all은 시작 직후 빈 감지에
+            // 복원 데이터를 날려서 안 된다.
+            let mux = self.active.workspace_ui.mux().cloned();
+            let current: std::collections::HashMap<String, crate::storage::AgentSessionRow> =
+                bindings
+                    .iter()
+                    .filter_map(|(sid, b)| {
+                        let pane = mux.as_ref().and_then(|m| pane_of_session(m, *sid))?;
+                        let kind = match b.kind {
+                            crate::agent_detect::AgentKind::Claude => "claude",
+                            crate::agent_detect::AgentKind::Codex => "codex",
+                        };
+                        Some((
+                            pane.0.clone(),
+                            crate::storage::AgentSessionRow {
+                                pane_id: pane.0,
+                                kind: kind.to_owned(),
+                                session_id: b.session_id.clone(),
+                            },
+                        ))
+                    })
+                    .collect();
+            for (pane_id, row) in &current {
+                if self.persisted_agents.get(pane_id) != Some(row)
+                    && let Err(e) = self.db.upsert_agent_session(
+                        &self.active.id,
+                        pane_id,
+                        &row.kind,
+                        &row.session_id,
+                    )
+                {
+                    tracing::warn!("agent session 저장 실패: {e:#}");
+                }
+            }
+            for pane_id in self.persisted_agents.keys() {
+                if !current.contains_key(pane_id) {
+                    let _ = self.db.delete_agent_session(&self.active.id, pane_id);
+                }
+            }
+            self.persisted_agents = current;
+
+            // 복원 resume 주입: 복원된 pane(저장된 에이전트 있음)에 에이전트가 아직 안
+            // 떠 있으면(bindings에 없음) native resume 명령을 셸에 한 번 보낸다.
+            if let Some(mux) = &mux {
+                for pane in mux.tabs.iter().flat_map(|t| &t.panes) {
+                    let pane_key = pane.id.0.clone();
+                    let Some(saved) = self.restore_agents.get(&pane_key) else {
+                        continue;
+                    };
+                    let Some(session) = pane.session_id else {
+                        continue;
+                    };
+                    if self.resumed_panes.contains(&pane_key) || bindings.contains_key(&session) {
+                        continue; // 이미 보냈거나 이미 실행 중
+                    }
+                    let cmd = match saved.kind.as_str() {
+                        "claude" => format!("claude --resume {}\n", saved.session_id),
+                        "codex" => format!("codex resume {}\n", saved.session_id),
+                        _ => continue,
+                    };
+                    let _ = self
+                        .active
+                        .runtime
+                        .send_command(runtime::RuntimeCommand::WriteInput {
+                            session,
+                            bytes: cmd.into_bytes(),
+                        });
+                    self.resumed_panes.insert(pane_key);
+                }
+            }
+
             // 창이 유휴여도 다음 폴링이 돌도록 재그리기 예약.
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(2000));

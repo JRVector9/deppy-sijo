@@ -145,7 +145,30 @@ ALTER TABLE agent_configs ADD COLUMN mcp_proxy_server_id TEXT;
     "ALTER TABLE agent_configs ADD COLUMN mcp_config_flag TEXT;",
     // 12: mcp_servers scoped env. secret 값은 저장하지 않고 credential id만 저장한다.
     mcp_store::MIGRATION_SERVER_ENV,
+    // 13: 옵션2 에이전트 세션 — 재시작 복원 시 native resume(claude --resume / codex
+    // resume)에 쓸 (pane, kind, agent session-id). pane_id는 복원 시 verbatim 유지되는
+    // durable id라 바인딩 키로 쓴다.
+    "
+CREATE TABLE agent_sessions (
+    workspace_id TEXT NOT NULL,
+    pane_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, pane_id)
+);
+",
 ];
+
+/// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentSessionRow {
+    pub pane_id: String,
+    /// "claude" | "codex".
+    pub kind: String,
+    /// 에이전트 자신의 세션 ID (`claude --resume <id>` / `codex resume <id>`).
+    pub session_id: String,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CredentialMeta {
@@ -562,6 +585,51 @@ impl Db {
     }
 
     /// workspace의 프로젝트 경로를 설정한다 (FT-0 — 컬럼은 v2부터 존재, 값 채움만).
+    /// 감지된 에이전트 세션 하나를 upsert한다(옵션2). replace-all이 아니라 차등 upsert라
+    /// 시작 직후(감지 전) 저장된 복원 데이터를 지우지 않는다.
+    pub fn upsert_agent_session(
+        &self,
+        workspace_id: &str,
+        pane_id: &str,
+        kind: &str,
+        session_id: &str,
+    ) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO agent_sessions
+                   (workspace_id, pane_id, kind, session_id, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, CAST(strftime('%s','now') AS INTEGER))",
+                (workspace_id, pane_id, kind, session_id),
+            )
+            .with_context(|| format!("agent session 저장 실패: {pane_id}"))?;
+        Ok(())
+    }
+
+    /// 에이전트가 종료돼 더는 감지되지 않는 pane의 행을 지운다 — 복원 시 이미 닫은
+    /// 에이전트를 되살리지 않도록.
+    pub fn delete_agent_session(&self, workspace_id: &str, pane_id: &str) -> anyhow::Result<()> {
+        self.conn.execute(
+            "DELETE FROM agent_sessions WHERE workspace_id = ?1 AND pane_id = ?2",
+            (workspace_id, pane_id),
+        )?;
+        Ok(())
+    }
+
+    /// 워크스페이스의 저장된 에이전트 세션 (복원 시 resume 대상).
+    pub fn list_agent_sessions(&self, workspace_id: &str) -> anyhow::Result<Vec<AgentSessionRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT pane_id, kind, session_id FROM agent_sessions WHERE workspace_id = ?1",
+        )?;
+        let rows = stmt.query_map([workspace_id], |row| {
+            Ok(AgentSessionRow {
+                pane_id: row.get(0)?,
+                kind: row.get(1)?,
+                session_id: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// workspace 이름을 변경한다 (#3 — 사용자 지정 이름).
     pub fn rename_workspace(&self, id: &str, name: &str) -> anyhow::Result<()> {
         let affected = self

@@ -53,22 +53,6 @@ pub enum OpenPanel {
     Notifications,
 }
 
-#[derive(Clone, Copy)]
-enum Icon {
-    Gear,
-    Globe,
-    Terminal,
-    Bolt,
-    Lock,
-    Key,
-    Link,
-    Grid,
-    Diamond,
-    Square,
-    Clock,
-    Bell,
-}
-
 /// 설정 창 결과.
 pub struct SettingsOutput {
     /// config 값이 바뀌어 저장이 필요한가 (테마/터미널/성능/포트).
@@ -431,7 +415,8 @@ fn nav_matches(query: &str, label: &str, aliases: &str) -> bool {
     label.to_lowercase().contains(&query) || aliases.to_lowercase().contains(&query)
 }
 
-fn paint_icon(
+#[allow(dead_code)]
+fn paint_icon_legacy_unused(
     painter: &egui::Painter,
     center: egui::Pos2,
     size: f32,
@@ -578,6 +563,7 @@ fn paint_icon(
             painter.hline(center.x - 6.0..=center.x + 6.0, body.bottom(), stroke);
             painter.circle_filled(egui::pos2(center.x, body.bottom() + 2.0), 1.3, color);
         }
+        _ => {}
     }
 }
 

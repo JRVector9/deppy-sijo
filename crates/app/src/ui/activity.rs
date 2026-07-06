@@ -23,47 +23,11 @@ pub enum ActivityAction {
     SwitchWorkspace(String),
 }
 
-pub struct ActivityUi {
-    open: bool,
-}
+pub struct ActivityUi {}
 
 impl ActivityUi {
     pub fn new() -> Self {
-        Self { open: false }
-    }
-
-    /// 창이 열려 있는가 (툴바 선택 하이라이트용).
-    pub fn is_open(&self) -> bool {
-        self.open
-    }
-
-    pub fn toggle(&mut self) {
-        self.open = !self.open;
-    }
-
-    pub fn show(
-        &mut self,
-        ctx: &egui::Context,
-        catalog: &i18n::Catalog,
-        rows: &[ActivityWorkspaceRow],
-    ) -> Option<ActivityAction> {
-        if !self.open {
-            return None;
-        }
-        if rows.iter().any(|row| row.backgrounded_for_secs.is_some()) {
-            ctx.request_repaint_after(std::time::Duration::from_secs(1));
-        }
-        let mut open = true;
-        let mut action = None;
-        egui::Window::new(catalog.t("activity.title", &[]))
-            .open(&mut open)
-            .resizable(true)
-            .default_width(560.0)
-            .show(ctx, |ui| {
-                action = self.contents(ui, catalog, rows);
-            });
-        self.open = open;
-        action
+        Self {}
     }
 
     /// 창 프레임 없이 본문만 렌더한다 (통합 설정 창 우측 패널용, 2026-07-06).

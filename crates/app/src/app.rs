@@ -365,14 +365,6 @@ pub struct App {
     logs_base: PathBuf,
     redaction: secret::RedactionService,
     workspaces: Vec<crate::storage::WorkspaceRow>,
-    workspaces_open: bool,
-    new_workspace_name: String,
-    /// 새 workspace 생성 시 함께 넣을 프로젝트 경로 (FT-0 — 빈 값 허용).
-    new_workspace_path: String,
-    /// 경로 편집 중인 workspace (id, 입력 버퍼) — 한 번에 한 행만.
-    edit_ws_path: Option<(String, String)>,
-    /// 삭제 확인 대기 중인 workspace id (2단계 확인 — 실수 방지)
-    confirm_delete_ws: Option<String>,
     /// 알림 클릭으로 다른 workspace 전환 후, mux 재구성되면 이동할 (workspace, session).
     pending_focus: Option<(String, runtime::SessionId)>,
     /// 전환으로 background 정리 중인 옛 워커 shutdown 스레드들 (workspace_id, handle).
@@ -474,11 +466,6 @@ impl App {
             logs_base,
             redaction,
             workspaces: Vec::new(),
-            workspaces_open: false,
-            new_workspace_name: String::new(),
-            new_workspace_path: String::new(),
-            edit_ws_path: None,
-            confirm_delete_ws: None,
             pending_focus: None,
             pending_shutdowns: Vec::new(),
             remote: None,
@@ -958,186 +945,6 @@ impl App {
             .collect()
     }
 
-    /// 워크스페이스 목록 창: 전환/생성. 전환은 워커 shutdown+recreate라 창 closure 밖에서.
-    fn workspaces_window(&mut self, ctx: &egui::Context, catalog: &i18n::Catalog) {
-        if !self.workspaces_open {
-            return;
-        }
-        let mut open = true;
-        let mut switch_to: Option<String> = None;
-        let mut delete_id: Option<String> = None;
-        let mut set_confirm: Option<String> = None;
-        let mut cancel_confirm = false;
-        let mut create = false;
-        // 경로 편집 상태를 잠시 꺼내 로컬로 다룬다 (workspaces 순회와 동시 &mut 회피)
-        let mut edit_ws_path = self.edit_ws_path.take();
-        let mut save_path: Option<(String, String)> = None;
-        let deletable = self.workspaces.len() > 1; // 마지막 workspace는 삭제 불가
-        egui::Window::new(catalog.t("workspace.manager.title", &[]))
-            .open(&mut open)
-            .resizable(false)
-            .show(ctx, |ui| {
-                for ws in &self.workspaces {
-                    ui.horizontal(|ui| {
-                        if ws.id == self.active.id {
-                            ui.strong(&ws.name);
-                            ui.weak(catalog.t("workspace.manager.current", &[]));
-                        } else {
-                            ui.label(&ws.name);
-                            if ui
-                                .button(catalog.t("workspace.manager.switch", &[]))
-                                .clicked()
-                            {
-                                switch_to = Some(ws.id.clone());
-                            }
-                            // 삭제 (활성/마지막 제외) — 2단계 확인
-                            if deletable {
-                                if self.confirm_delete_ws.as_deref() == Some(ws.id.as_str()) {
-                                    ui.colored_label(
-                                        egui::Color32::RED,
-                                        catalog.t("workspace.manager.delete_confirm", &[]),
-                                    );
-                                    if ui.button(catalog.t("action.delete", &[])).clicked() {
-                                        delete_id = Some(ws.id.clone());
-                                    }
-                                    if ui.button(catalog.t("action.cancel", &[])).clicked() {
-                                        cancel_confirm = true;
-                                    }
-                                } else if ui.button(catalog.t("action.delete", &[])).clicked() {
-                                    set_confirm = Some(ws.id.clone());
-                                }
-                            }
-                        }
-                    });
-                    // 프로젝트 경로 (FT-0): 표시 + 인라인 편집. 파일 트리의 루트가 된다.
-                    ui.horizontal(|ui| {
-                        ui.add_space(12.0);
-                        match &mut edit_ws_path {
-                            Some((id, buffer)) if *id == ws.id => {
-                                ui.label(catalog.t("workspace.manager.path", &[]));
-                                ui.add(
-                                    egui::TextEdit::singleline(buffer)
-                                        .hint_text("/path/to/project")
-                                        .desired_width(260.0),
-                                );
-                                if ui.button(catalog.t("action.save", &[])).clicked() {
-                                    save_path = Some((id.clone(), buffer.trim().to_owned()));
-                                    edit_ws_path = None;
-                                } else if ui.button(catalog.t("action.cancel", &[])).clicked() {
-                                    edit_ws_path = None;
-                                }
-                            }
-                            _ => {
-                                if ws.path.is_empty() {
-                                    ui.weak(catalog.t("workspace.manager.path_unset", &[]));
-                                } else {
-                                    ui.weak(&ws.path);
-                                }
-                                if ui
-                                    .small_button(catalog.t("workspace.manager.edit_path", &[]))
-                                    .clicked()
-                                {
-                                    edit_ws_path = Some((ws.id.clone(), ws.path.clone()));
-                                }
-                            }
-                        }
-                    });
-                }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label(catalog.t("workspace.manager.new_workspace", &[]));
-                    ui.text_edit_singleline(&mut self.new_workspace_name);
-                    if ui.button(catalog.t("action.new", &[])).clicked() {
-                        create = true;
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label(catalog.t("workspace.manager.project_path", &[]));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.new_workspace_path)
-                            .hint_text(catalog.t("workspace.manager.project_path_hint", &[]))
-                            .desired_width(260.0),
-                    );
-                });
-            });
-        self.workspaces_open = open;
-        self.edit_ws_path = edit_ws_path;
-
-        if let Some((id, path)) = save_path {
-            match self.db.set_workspace_path(&id, &path) {
-                Ok(()) => {
-                    self.refresh_workspaces();
-                    // 활성 workspace의 경로가 바뀌면 트리 루트도 갱신 (FT-1)
-                    if id == self.active.id {
-                        self.refresh_file_tree_root();
-                    }
-                }
-                Err(e) => tracing::warn!("workspace 경로 저장 실패: {e:#}"),
-            }
-        }
-
-        if create {
-            let name = self.new_workspace_name.trim().to_owned();
-            if !name.is_empty() {
-                match self.db.create_workspace(&name) {
-                    Ok(id) => {
-                        // 경로가 입력됐으면 함께 저장 (FT-0 — 실패해도 생성은 유지)
-                        let path = self.new_workspace_path.trim();
-                        if !path.is_empty()
-                            && let Err(e) = self.db.set_workspace_path(&id, path)
-                        {
-                            tracing::warn!("workspace 경로 저장 실패: {e:#}");
-                        }
-                        self.new_workspace_name.clear();
-                        self.new_workspace_path.clear();
-                        switch_to = Some(id); // 생성 후 바로 전환
-                    }
-                    Err(e) => tracing::warn!("workspace 생성 실패: {e:#}"),
-                }
-            }
-        }
-        if cancel_confirm {
-            self.confirm_delete_ws = None;
-        }
-        if let Some(id) = set_confirm {
-            self.confirm_delete_ws = Some(id);
-        }
-        if let Some(id) = delete_id {
-            self.confirm_delete_ws = None;
-            // 활성 workspace는 삭제 목록에 뜨지 않으므로 여기 도달하지 않는다 (이중 방어)
-            if id != self.active.id {
-                // 이 workspace의 background shutdown이 끝나길 먼저 기다린다 — 워커가
-                // persist/로그를 쓰는 중에 삭제하면 DB 행 재생성·로그 파일 경합이 난다.
-                // warm 풀에서 실행 중이면 먼저 동기 shutdown (워커 정지 후 삭제).
-                if let Some(rt) = self.warm.remove(&id) {
-                    self.warm_order.retain(|w| w != &id);
-                    let mut runtime = rt.runtime;
-                    runtime.shutdown();
-                }
-                self.join_pending_shutdown(&id);
-                match self.db.delete_workspace(&id) {
-                    Ok(()) => {
-                        self.notifications_ui.prune_workspace(&id);
-                        // 로그 디렉터리도 정리 (best-effort — redacted 로그, 실패해도 무해)
-                        let log_dir = self.logs_base.join(&id);
-                        if let Err(e) = std::fs::remove_dir_all(&log_dir)
-                            && e.kind() != std::io::ErrorKind::NotFound
-                        {
-                            tracing::warn!("workspace 로그 삭제 실패 {}: {e:#}", log_dir.display());
-                        }
-                    }
-                    Err(e) => tracing::warn!("workspace 삭제 실패: {e:#}"),
-                }
-                self.refresh_workspaces();
-            }
-        }
-        if let Some(id) = switch_to {
-            self.confirm_delete_ws = None;
-            self.switch_workspace(&id);
-            self.refresh_workspaces();
-        }
-    }
-
     /// 한 workspace의 이벤트에서 제목을 누적(session_titles)하고 상태/exit을 알림으로
     /// 만든다. 알림은 (workspace_id, SessionId)로 식별 — 워커마다 SessionId가 리셋돼
     /// 충돌하므로. 활성/warm 워커 모두 이걸 거쳐 background workspace 알림도 뜬다.
@@ -1430,56 +1237,40 @@ impl eframe::App for App {
                     ui.painter().galley(pos, galley, col);
                     resp.clicked()
                 };
-                if tbtn(ui, text.t("top.settings", &[]), self.settings_open) {
-                    self.settings_open = !self.settings_open;
-                }
-                if tbtn(
-                    ui,
-                    text.t("top.credentials", &[]),
-                    self.credentials_ui.is_open(),
-                ) {
-                    self.credentials_ui.toggle();
-                }
-                if tbtn(
-                    ui,
-                    text.t("top.connectors", &[]),
-                    self.connectors_ui.is_open(),
-                ) {
-                    self.connectors_ui.toggle();
-                }
-                if tbtn(
-                    ui,
-                    text.t("top.environment", &[]),
-                    self.env_profiles_ui.is_open(),
-                ) {
-                    self.env_profiles_ui.toggle();
-                }
-                if tbtn(ui, text.t("top.agents", &[]), self.agents_ui.is_open()) {
-                    self.agents_ui.toggle();
-                }
-                if tbtn(ui, text.t("top.workspaces", &[]), self.workspaces_open) {
-                    self.workspaces_open = !self.workspaces_open;
-                    if self.workspaces_open {
-                        self.refresh_workspaces();
-                    }
-                }
-                if tbtn(ui, text.t("top.activity", &[]), self.activity_ui.is_open()) {
-                    self.activity_ui.toggle();
-                    self.refresh_workspaces();
-                }
+                // 툴바 버튼 = 통합 설정 창을 해당 카테고리로 연다 (전체 통합, 2026-07-06).
+                // 이미 그 카테고리로 열려 있으면 닫는다(토글). 선택 하이라이트도 그 상태.
+                use ui::settings::Category as Cat;
+                // 알림 라벨/unread는 tab 클로저(&mut self 캡처) 전에 계산 (borrow 분리).
                 let unread = self.notifications_ui.unread();
                 unread_before = unread;
-                let label = if unread > 0 {
+                let notif_label = if unread > 0 {
                     let count = unread.to_string();
                     text.t("top.notifications.unread", &[("count", &count)])
                 } else {
                     text.t("top.notifications", &[])
                 };
-                if tbtn(ui, label, self.notifications_ui.is_open()) {
-                    // 열면 모두 읽음 → 배지가 이미 그려진 뒤라 다음 프레임에 갱신
-                    self.notifications_ui.toggle();
-                    ui.ctx().request_repaint();
-                }
+                let mut tab = |ui: &mut egui::Ui, label: String, cat: Cat| {
+                    let sel = self.settings_open && self.settings_category == cat;
+                    if tbtn(ui, label, sel) {
+                        if sel {
+                            self.settings_open = false;
+                        } else {
+                            self.settings_open = true;
+                            self.settings_category = cat;
+                            if matches!(cat, Cat::Workspaces | Cat::Activity) {
+                                self.refresh_workspaces();
+                            }
+                        }
+                    }
+                };
+                tab(ui, text.t("top.settings", &[]), Cat::General);
+                tab(ui, text.t("top.credentials", &[]), Cat::Credentials);
+                tab(ui, text.t("top.connectors", &[]), Cat::Connectors);
+                tab(ui, text.t("top.environment", &[]), Cat::Environment);
+                tab(ui, text.t("top.agents", &[]), Cat::Agents);
+                tab(ui, text.t("top.workspaces", &[]), Cat::Workspaces);
+                tab(ui, text.t("top.activity", &[]), Cat::Activity);
+                tab(ui, notif_label, Cat::Notifications);
                 // 우측: 로케일 · 메모리 (목업의 'ko · 113MB').
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let locale_short = self
@@ -1574,67 +1365,26 @@ impl eframe::App for App {
             }
         }
 
-        // 워크스페이스 전환/생성 (switch는 워커 shutdown+recreate라 window closure 밖에서)
-        self.workspaces_window(ui.ctx(), &text);
-        let activity_rows = self.activity_rows();
-        if let Some(action) = self.activity_ui.show(ui.ctx(), &text, &activity_rows) {
-            match action {
-                ui::activity::ActivityAction::SwitchWorkspace(id) if id != self.active.id => {
-                    self.switch_workspace(&id);
-                    self.refresh_workspaces();
-                }
-                ui::activity::ActivityAction::SwitchWorkspace(_) => {}
-            }
-        }
-
-        // logic()이 drain해 쌓아둔 이벤트를 렌더에 소비한다 (알림은 logic()에서 이미 처리).
-        // Warm 동안 쌓였다면 Active 복귀 시 여기서 몰아 처리된다.
+        // ── 관리/모니터 패널 부수효과 (매 프레임 — 통합 설정 창 표시 여부와 무관) ──
+        // 렌더는 통합 설정 창 클로저(아래)에서. 여기선 창이 닫혀 있어도 돌아야 하는
+        // 부수효과만: agent 실행 응답 추적, OAuth 결과 drain(→credential 추가 시 캐시 무효화).
         let events = std::mem::take(&mut self.active.pending_events);
-        self.agents_ui.show(
-            ui.ctx(),
-            &self.db,
-            &self.active.id,
-            &self.config.terminal,
-            &self.active.runtime,
-            &events,
-            &self.db_path,
-            &text,
-        );
-        {
-            let credential_service = AppCredentialService {
-                db: &self.db,
-                secret_store: &self.secret_store,
-                redaction: &self.redaction,
-            };
-            self.credentials_ui
-                .show(ui.ctx(), &credential_service, &text);
-        }
+        self.agents_ui
+            .observe_launch_events(&events, ui.ctx(), &text);
+        // 커넥터 백그라운드 결과(tools/call·MCP invoke·OAuth)는 창 표시와 무관하게 매 프레임 소화.
+        self.connectors_ui.drain_results(&mut self.db);
+        self.connectors_ui.drain_invoke();
         let credential_added = {
             let oauth_store = AppOAuthCredentialStore {
                 secret_store: &self.secret_store,
                 redaction: &self.redaction,
             };
-            let mcp_env_resolver = AppMcpScopedEnvResolver {
-                secret_store: &self.secret_store,
-                redaction: &self.redaction,
-            };
-            self.connectors_ui.show(
-                ui.ctx(),
-                &mut self.db,
-                &self.active.id,
-                &oauth_store,
-                &mcp_env_resolver,
-                &text,
-            )
+            self.connectors_ui.drain_oauth(&self.db, &oauth_store)
         };
         if credential_added {
-            // OAuth로 credential이 추가됨 — 자격증명 창은 이번 프레임에 이미
-            // 그려졌으므로 캐시 무효화 후 다음 프레임을 예약해 즉시 반영한다
             self.credentials_ui.invalidate_cache();
             ui.ctx().request_repaint();
         }
-        self.env_profiles_ui
-            .show(ui.ctx(), &mut self.db, &self.active.id, &text);
         egui::CentralPanel::default().show(ui, |ui| {
             self.active.workspace_ui.show(
                 ui,
@@ -1675,29 +1425,7 @@ impl eframe::App for App {
                 self.pending_focus = None;
             }
         }
-        // 클릭한 알림 → 활성 workspace면 pane focus, 아니면 그 workspace로 전환 후 focus 예약.
-        if let Some((ws_id, session)) = self.notifications_ui.show(ui.ctx(), &text) {
-            if ws_id == self.active.id {
-                if let Some(pane) = mux.as_ref().and_then(|m| pane_of_session(m, session)) {
-                    let _ = self
-                        .active
-                        .runtime
-                        .send_command(runtime::RuntimeCommand::FocusPane { pane });
-                }
-            } else {
-                // warm 재사용이면 워커·SessionId가 그대로라 그 세션으로 focus 예약.
-                // 재생성(비-warm)이면 SessionId가 리셋돼 옛 id가 엉뚱한 셸을 잡을 수
-                // 있으므로 focus를 예약하지 않는다 (전환만, codex 리뷰).
-                let reused = self.warm.contains_key(&ws_id);
-                self.switch_workspace(&ws_id);
-                self.refresh_workspaces();
-                if reused {
-                    self.pending_focus = Some((ws_id, session));
-                }
-            }
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(50));
-        }
+        // (알림 클릭 → focus/전환 처리는 통합 설정 창 렌더 이후로 이동 — 클로저에서 캡처)
 
         // agent-proxy 승인 팝업 (option 1.5). logic()이 폴링해 넣어둔 pending 중 가장
         // 오래된 하나를 모달로 띄운다. 버튼을 누르면 결정을 DB에 되쓴다.
@@ -1749,7 +1477,24 @@ impl eframe::App for App {
                 known_hosts: self.known_hosts_cache.as_deref().unwrap_or(&[]),
             }
         };
+        // 알림 카테고리를 보고 있으면 읽음 처리 (기존 notifications.show가 하던 것).
+        if self.settings_open
+            && self.settings_category == ui::settings::Category::Notifications
+            && self.notifications_ui.mark_all_read()
+        {
+            ui.ctx().request_repaint();
+        }
         let notif_unread = self.notifications_ui.unread() as u32;
+        // 통합 설정 창: 설정 5개는 settings::show가 인라인, 관리/모니터 7개는 아래
+        // render_management 클로저가 각 패널 contents()를 렌더한다 (전체 통합, 2026-07-06).
+        // config는 &mut로 넘기므로 클로저는 config 대신 미리 클론한 값을 쓴다 (borrow 분리).
+        let activity_rows = self.activity_rows();
+        let term_cfg = self.config.terminal.clone();
+        let wsid = self.active.id.clone();
+        let db_path = self.db_path.clone();
+        let mut activity_action = None;
+        let mut notif_click = None;
+        let mut ws_switch: Option<String> = None;
         let out = ui::settings::show(
             ui.ctx(),
             &mut self.settings_open,
@@ -1760,29 +1505,110 @@ impl eframe::App for App {
             notif_unread,
             &mut self.settings_search,
             &text,
-        );
-        // 관리/모니터 네비 항목 클릭 — 아직 별도 패널을 여는 기존 기능들 (전체 인라인화 후속).
-        if let Some(panel) = out.open_panel {
-            match panel {
-                ui::settings::OpenPanel::Credentials => self.credentials_ui.toggle(),
-                ui::settings::OpenPanel::Connectors => self.connectors_ui.toggle(),
-                ui::settings::OpenPanel::Environment => self.env_profiles_ui.toggle(),
-                ui::settings::OpenPanel::Agents => self.agents_ui.toggle(),
-                ui::settings::OpenPanel::Workspaces => {
-                    self.workspaces_open = !self.workspaces_open;
-                    if self.workspaces_open {
-                        self.refresh_workspaces();
+            |ui, cat| {
+                use ui::settings::Category as C;
+                match cat {
+                    C::Credentials => {
+                        let svc = AppCredentialService {
+                            db: &self.db,
+                            secret_store: &self.secret_store,
+                            redaction: &self.redaction,
+                        };
+                        self.credentials_ui.contents(ui, &svc, &text);
                     }
+                    C::Connectors => {
+                        let ctx = ui.ctx().clone();
+                        let resolver = AppMcpScopedEnvResolver {
+                            secret_store: &self.secret_store,
+                            redaction: &self.redaction,
+                        };
+                        self.connectors_ui.contents(
+                            ui,
+                            &ctx,
+                            &mut self.db,
+                            &wsid,
+                            &resolver,
+                            &text,
+                        );
+                    }
+                    C::Environment => {
+                        if let Err(e) =
+                            self.env_profiles_ui
+                                .contents(ui, &mut self.db, &wsid, &text)
+                        {
+                            ui.colored_label(ui.visuals().error_fg_color, format!("{e:#}"));
+                        }
+                    }
+                    C::Agents => {
+                        self.agents_ui.contents(
+                            ui,
+                            &self.db,
+                            &wsid,
+                            &term_cfg,
+                            &self.active.runtime,
+                            &db_path,
+                            &text,
+                        );
+                    }
+                    C::Workspaces => {
+                        // 최소 인라인: 목록 + 전환(생성/삭제/경로편집은 후속). 전환은
+                        // 워커 재구성이라 창 밖에서 처리하도록 캡처만 한다.
+                        for ws in &self.workspaces {
+                            ui.horizontal(|ui| {
+                                if ws.id == wsid {
+                                    ui.strong(&ws.name);
+                                    ui.weak(text.t("workspace.manager.current", &[]));
+                                } else {
+                                    ui.label(&ws.name);
+                                    if ui.button(text.t("workspace.manager.switch", &[])).clicked()
+                                    {
+                                        ws_switch = Some(ws.id.clone());
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    C::Activity => {
+                        activity_action = self.activity_ui.contents(ui, &text, &activity_rows);
+                    }
+                    C::Notifications => {
+                        notif_click = self.notifications_ui.contents(ui, &text);
+                    }
+                    _ => {}
                 }
-                ui::settings::OpenPanel::Activity => {
-                    self.activity_ui.toggle();
-                    self.refresh_workspaces();
+            },
+        );
+        // 관리/모니터 액션 처리 (클로저 밖 — self 전체 &mut 필요한 것들)
+        if let Some(id) = ws_switch.filter(|id| *id != self.active.id) {
+            {
+                self.switch_workspace(&id);
+                self.refresh_workspaces();
+            }
+        }
+        if let Some(ui::activity::ActivityAction::SwitchWorkspace(id)) =
+            activity_action.filter(|a| matches!(a, ui::activity::ActivityAction::SwitchWorkspace(id) if *id != self.active.id))
+        {
+            self.switch_workspace(&id);
+            self.refresh_workspaces();
+        }
+        if let Some((ws_id, session)) = notif_click {
+            if ws_id == self.active.id {
+                if let Some(pane) = mux.as_ref().and_then(|m| pane_of_session(m, session)) {
+                    let _ = self
+                        .active
+                        .runtime
+                        .send_command(runtime::RuntimeCommand::FocusPane { pane });
                 }
-                ui::settings::OpenPanel::Notifications => {
-                    self.notifications_ui.toggle();
-                    ui.ctx().request_repaint();
+            } else {
+                let reused = self.warm.contains_key(&ws_id);
+                self.switch_workspace(&ws_id);
+                self.refresh_workspaces();
+                if reused {
+                    self.pending_focus = Some((ws_id, session));
                 }
             }
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
         }
         if out.config_changed {
             self.config.i18n.locale = i18n::normalize_locale(&self.config.i18n.locale);

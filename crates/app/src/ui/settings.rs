@@ -29,7 +29,8 @@ pub struct RemoteView<'a> {
     pub known_hosts: &'a [(String, String)],
 }
 
-/// 통합 설정 창의 좌측 네비 — 인라인으로 렌더하는 "설정" 카테고리.
+/// 통합 설정 창의 좌측 네비 카테고리. 설정 5개는 이 파일이 인라인 렌더하고, 관리/모니터
+/// 7개는 App이 `render_management` 콜백으로 각 패널의 contents()를 렌더한다 (2026-07-06 전체 통합).
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum Category {
     #[default]
@@ -38,17 +39,13 @@ pub enum Category {
     Terminal,
     Performance,
     RemoteTls,
-}
-
-/// "관리"/"모니터" 그룹 — 아직 별도 패널을 여는 기존 기능들. 통합 창 네비에서 선택 시
-/// App이 해당 패널을 연다 (전체 인라인화는 후속 — 2026-07-06).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum OpenPanel {
+    // ── 관리 (App이 render_management로 렌더) ──
     Credentials,
     Connectors,
     Environment,
     Agents,
     Workspaces,
+    // ── 모니터 ──
     Activity,
     Notifications,
 }
@@ -59,13 +56,12 @@ pub struct SettingsOutput {
     pub config_changed: bool,
     /// Remote 섹션 동작 요청.
     pub remote_action: RemoteAction,
-    /// 관리/모니터 네비 항목 클릭 — App이 해당 패널을 연다.
-    pub open_panel: Option<OpenPanel>,
 }
 
 /// 통합 설정 창 (2026-07-06 — 흩어진 툴바 기능을 좌측 네비 한 창으로).
-/// 좌측: 검색 + 그룹별 카테고리. 우측: 선택된 카테고리의 폼. config 변경/Remote 동작/패널
-/// 열기 요청을 [`SettingsOutput`]으로 돌려준다.
+/// 좌측: 검색 + 그룹별 카테고리. 우측: 선택된 카테고리의 폼. 설정 5개는 여기서 인라인
+/// 렌더하고, 관리/모니터 7개는 `render_management(ui, category)` 콜백으로 App이 각 패널의
+/// contents()를 그린다.
 #[allow(clippy::too_many_arguments)]
 pub fn show(
     ctx: &egui::Context,
@@ -77,17 +73,16 @@ pub fn show(
     notif_unread: u32,
     search_query: &mut String,
     catalog: &i18n::Catalog,
+    mut render_management: impl FnMut(&mut egui::Ui, Category),
 ) -> SettingsOutput {
     let mut changed = false;
     let mut remote_action = RemoteAction::None;
-    let mut open_panel = None;
 
     // title_bar(false)라 기본 open 처리가 없다 — 닫힘이면 창 자체를 만들지 않는다.
     if !*open {
         return SettingsOutput {
             config_changed: false,
             remote_action,
-            open_panel,
         };
     }
 
@@ -141,21 +136,14 @@ pub fn show(
                 .resizable(false)
                 .exact_size(216.0)
                 .show(ui, |ui| {
-                    nav(
-                        ui,
-                        category,
-                        &mut open_panel,
-                        notif_unread,
-                        search_query,
-                        catalog,
-                    );
+                    nav(ui, category, notif_unread, search_query, catalog);
                 });
             egui::CentralPanel::default().show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.add_space(4.0);
-                        match category {
+                        match *category {
                             Category::General => general_page(ui, config, &mut changed, catalog),
                             Category::Language => language_page(ui, config, &mut changed, catalog),
                             Category::Terminal => terminal_page(ui, config, &mut changed, catalog),
@@ -171,6 +159,8 @@ pub fn show(
                                 &mut remote_action,
                                 catalog,
                             ),
+                            // 관리/모니터 7개 — App이 각 패널 contents() 렌더
+                            other => render_management(ui, other),
                         }
                     });
             });
@@ -179,7 +169,6 @@ pub fn show(
     SettingsOutput {
         config_changed: changed,
         remote_action,
-        open_panel,
     }
 }
 
@@ -188,7 +177,6 @@ pub fn show(
 fn nav(
     ui: &mut egui::Ui,
     category: &mut Category,
-    open_panel: &mut Option<OpenPanel>,
     notif_unread: u32,
     search_query: &mut String,
     catalog: &i18n::Catalog,
@@ -248,37 +236,37 @@ fn nav(
                 ui.weak(catalog.t("settings.group.settings", &[]));
                 for (cat, icon, label, _) in visible_settings {
                     rendered += 1;
-                    nav_item(ui, category, cat, icon, &label);
+                    nav_item(ui, category, cat, icon, &label, None);
                 }
             }
 
             let manage = [
                 (
-                    OpenPanel::Credentials,
+                    Category::Credentials,
                     Icon::Key,
                     catalog.t("top.credentials", &[]),
                     "credentials secrets key api token password",
                 ),
                 (
-                    OpenPanel::Connectors,
+                    Category::Connectors,
                     Icon::Link,
                     catalog.t("top.connectors", &[]),
                     "connectors mcp tools oauth server",
                 ),
                 (
-                    OpenPanel::Environment,
+                    Category::Environment,
                     Icon::Grid,
                     catalog.t("top.environment", &[]),
                     "environment env profile variables production",
                 ),
                 (
-                    OpenPanel::Agents,
+                    Category::Agents,
                     Icon::Diamond,
                     catalog.t("top.agents", &[]),
                     "agents command runner status regex",
                 ),
                 (
-                    OpenPanel::Workspaces,
+                    Category::Workspaces,
                     Icon::Square,
                     catalog.t("top.workspaces", &[]),
                     "workspaces project path folder root",
@@ -291,22 +279,22 @@ fn nav(
             if !visible_manage.is_empty() {
                 ui.add_space(6.0);
                 ui.weak(catalog.t("settings.group.manage", &[]));
-                for (panel, icon, label, _) in visible_manage {
+                for (cat, icon, label, _) in visible_manage {
                     rendered += 1;
-                    nav_open(ui, icon, &label, None, open_panel, panel);
+                    nav_item(ui, category, cat, icon, &label, None);
                 }
             }
 
             let badge = (notif_unread > 0).then(|| notif_unread.to_string());
             let monitor = [
                 (
-                    OpenPanel::Activity,
+                    Category::Activity,
                     Icon::Clock,
                     catalog.t("top.activity", &[]),
                     "activity monitor cpu rss memory process workspace backpressure",
                 ),
                 (
-                    OpenPanel::Notifications,
+                    Category::Notifications,
                     Icon::Bell,
                     catalog.t("top.notifications", &[]),
                     "notifications alerts unread status approval",
@@ -319,12 +307,12 @@ fn nav(
             if !visible_monitor.is_empty() {
                 ui.add_space(6.0);
                 ui.weak(catalog.t("settings.group.monitor", &[]));
-                for (panel, icon, label, _) in visible_monitor {
+                for (cat, icon, label, _) in visible_monitor {
                     rendered += 1;
-                    let item_badge = (panel == OpenPanel::Notifications)
+                    let item_badge = (cat == Category::Notifications)
                         .then(|| badge.clone())
                         .flatten();
-                    nav_open(ui, icon, &label, item_badge, open_panel, panel);
+                    nav_item(ui, category, cat, icon, &label, item_badge);
                 }
             }
 
@@ -334,22 +322,16 @@ fn nav(
         });
 }
 
-fn nav_item(ui: &mut egui::Ui, current: &mut Category, cat: Category, icon: Icon, label: &str) {
-    if nav_row(ui, *current == cat, icon, label, None) {
-        *current = cat;
-    }
-}
-
-fn nav_open(
+fn nav_item(
     ui: &mut egui::Ui,
+    current: &mut Category,
+    cat: Category,
     icon: Icon,
     label: &str,
     badge: Option<String>,
-    out: &mut Option<OpenPanel>,
-    which: OpenPanel,
 ) {
-    if nav_row(ui, false, icon, label, badge) {
-        *out = Some(which);
+    if nav_row(ui, *current == cat, icon, label, badge) {
+        *current = cat;
     }
 }
 

@@ -5,7 +5,6 @@
 use runtime::{SessionId, SessionStatus};
 
 pub struct NotificationsUi {
-    open: bool,
     items: Vec<NotificationItem>,
 }
 
@@ -21,25 +20,16 @@ struct NotificationItem {
 
 impl NotificationsUi {
     pub fn new() -> Self {
-        Self {
-            open: false,
-            items: Vec::new(),
-        }
+        Self { items: Vec::new() }
     }
 
-    /// 창이 열려 있는가 (툴바 선택 하이라이트용).
-    pub fn is_open(&self) -> bool {
-        self.open
-    }
-
-    pub fn toggle(&mut self) {
-        self.open = !self.open;
-        if self.open {
-            // 센터를 열면 모두 읽음 처리
-            for item in &mut self.items {
-                item.read = true;
-            }
+    /// 표시 시 모든 항목을 읽음 처리한다. 읽지 않은 게 있었으면 true (repaint 필요).
+    pub fn mark_all_read(&mut self) -> bool {
+        let had_unread = self.items.iter().any(|item| !item.read);
+        for item in &mut self.items {
+            item.read = true;
         }
+        had_unread
     }
 
     /// 안 읽은 항목 수 — 항목별 read 플래그에서 파생 (pruning에 자동 정합).
@@ -145,41 +135,6 @@ impl NotificationsUi {
                 || item.workspace_id != active_workspace_id
                 || alive.contains(&item.session)
         });
-    }
-
-    /// 알림 센터를 그린다. 클릭한 항목의 (workspace_id, session)을 돌려준다 —
-    /// 호출측(App)이 활성 workspace면 pane focus, 아니면 그 workspace로 전환한다.
-    pub fn show(
-        &mut self,
-        ctx: &egui::Context,
-        catalog: &i18n::Catalog,
-    ) -> Option<(String, SessionId)> {
-        if !self.open {
-            return None;
-        }
-        // show()는 ui()에서만 호출되고 ui()는 창이 가시일 때만 실행된다 — 즉 여기 도달했다는
-        // 건 센터가 열려 있고 화면에 보인다는 뜻이므로 표시된 항목을 읽음 처리한다. (센터가
-        // 열린 채 새 알림이 도착한 경우에도 다음 렌더에서 읽음 처리됨.)
-        let had_unread = self.items.iter().any(|item| !item.read);
-        for item in &mut self.items {
-            item.read = true;
-        }
-        // unread 뱃지는 이 프레임 앞서(상단바) 이미 그려졌다 — 방금 읽음으로 바꿨으면
-        // 다음 프레임에 뱃지가 갱신되도록 repaint를 요청한다(안 그러면 무관한 UI 활동
-        // 전까지 "알림 (1)"이 남는다).
-        if had_unread {
-            ctx.request_repaint();
-        }
-        let mut open = true;
-        let mut clicked = None;
-        egui::Window::new(catalog.t("notification.title", &[]))
-            .open(&mut open)
-            .resizable(false)
-            .show(ctx, |ui| {
-                clicked = self.contents(ui, catalog);
-            });
-        self.open = open;
-        clicked
     }
 
     /// 창 프레임 없이 본문만 렌더 (통합 설정 창 우측 패널용). 읽음 처리는 show()가 한다.
@@ -316,7 +271,7 @@ mod tests {
         // 안 된다 — 사용자가 본 시점(show=가시)에만 읽음. 생성 시엔 항상 unread.
         let mut n = NotificationsUi::new();
         let catalog = catalog();
-        n.toggle(); // open = true
+        n.mark_all_read();
         n.on_status(WS, SessionId(1), SessionStatus::Done, "완료", &catalog);
         assert_eq!(n.unread(), 1);
     }
@@ -373,8 +328,7 @@ mod tests {
         let mut n = NotificationsUi::new();
         let catalog = catalog();
         n.on_status(WS, SessionId(1), SessionStatus::Done, "old", &catalog); // 읽을 항목
-        n.toggle(); // 열기 → 모두 읽음
-        n.toggle(); // 닫기
+        n.mark_all_read(); // 보기 → 모두 읽음
         assert_eq!(n.unread(), 0);
         n.on_status(WS, SessionId(2), SessionStatus::Waiting, "new", &catalog); // 진행형, 안 읽음 1
         assert_eq!(n.unread(), 1);

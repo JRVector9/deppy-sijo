@@ -22,7 +22,6 @@ pub trait CredentialService {
 
 /// 자격증명 관리 창 상태. secret 입력값은 추가 즉시 비운다.
 pub struct CredentialsUi {
-    open: bool,
     provider: String,
     label: String,
     kind: &'static str,
@@ -34,7 +33,6 @@ pub struct CredentialsUi {
 impl CredentialsUi {
     pub fn new() -> Self {
         Self {
-            open: false,
             provider: String::new(),
             label: String::new(),
             kind: "api_key",
@@ -47,45 +45,6 @@ impl CredentialsUi {
     /// 다른 창(커넥터)이 credential을 추가했을 때 목록 캐시를 버린다.
     pub fn invalidate_cache(&mut self) {
         self.cached = None;
-    }
-
-    /// 창이 열려 있는가 (툴바 선택 하이라이트용).
-    pub fn is_open(&self) -> bool {
-        self.open
-    }
-
-    pub fn toggle(&mut self) {
-        if self.open {
-            self.close();
-        } else {
-            self.open = true;
-        }
-    }
-
-    /// 모든 닫힘 경로는 여기를 지난다 — 입력 중이던 secret 평문을 즉시 버린다
-    fn close(&mut self) {
-        self.open = false;
-        self.secret_input.clear();
-        self.error = None;
-    }
-
-    pub fn show(
-        &mut self,
-        ctx: &egui::Context,
-        credentials: &dyn CredentialService,
-        catalog: &i18n::Catalog,
-    ) {
-        if !self.open {
-            return;
-        }
-        let mut open = true;
-        egui::Window::new(catalog.t("credentials.title", &[]))
-            .open(&mut open)
-            .resizable(false)
-            .show(ctx, |ui| self.contents(ui, credentials, catalog));
-        if !open {
-            self.close();
-        }
     }
 
     pub fn contents(

@@ -3,7 +3,6 @@ use crate::storage::{CredentialMeta, Db, EnvProfileRow, EnvVarRow};
 
 /// 프로젝트 환경(env profile) 관리 창.
 pub struct EnvProfilesUi {
-    open: bool,
     selected: Option<String>,
     new_name: String,
     new_kind: &'static str,
@@ -22,7 +21,6 @@ pub struct EnvProfilesUi {
 impl EnvProfilesUi {
     pub fn new() -> Self {
         Self {
-            open: false,
             selected: None,
             new_name: String::new(),
             new_kind: "local",
@@ -35,40 +33,6 @@ impl EnvProfilesUi {
             vars: None,
             cached_workspace: None,
         }
-    }
-
-    /// 창이 열려 있는가 (툴바 선택 하이라이트용).
-    pub fn is_open(&self) -> bool {
-        self.open
-    }
-
-    pub fn toggle(&mut self) {
-        self.open = !self.open;
-    }
-
-    pub fn show(
-        &mut self,
-        ctx: &egui::Context,
-        db: &mut Db,
-        workspace_id: &str,
-        catalog: &i18n::Catalog,
-    ) {
-        if !self.open {
-            return;
-        }
-        let mut open = true;
-        egui::Window::new(catalog.t("env.title", &[]))
-            .open(&mut open)
-            .resizable(false)
-            .show(ctx, |ui| {
-                if let Err(e) = self.contents(ui, db, workspace_id, catalog) {
-                    self.error = Some(format!("{e:#}"));
-                }
-                if let Some(error) = &self.error {
-                    ui.colored_label(ui.visuals().error_fg_color, error);
-                }
-            });
-        self.open = open;
     }
 
     pub fn contents(

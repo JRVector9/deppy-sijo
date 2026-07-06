@@ -11,7 +11,6 @@ use crate::storage::{AgentConfigRow, Db, EnvProfileRow};
 /// 실행 시 env profile을 선택하면 plain은 값으로, secret은 credential_id로
 /// runtime에 전달된다 — resolve는 spawn 직전 worker에서 (6.3).
 pub struct AgentsUi {
-    open: bool,
     name: String,
     command: String,
     /// 줄바꿈으로 구분해 args array로 저장한다 (셸 문자열 파싱 금지)
@@ -40,7 +39,6 @@ pub struct AgentsUi {
 impl AgentsUi {
     pub fn new() -> Self {
         Self {
-            open: false,
             name: String::new(),
             command: String::new(),
             args_input: String::new(),
@@ -66,31 +64,14 @@ impl AgentsUi {
         std::mem::take(&mut self.pending_launches)
     }
 
-    /// 창이 열려 있는가 (툴바 선택 하이라이트용).
-    pub fn is_open(&self) -> bool {
-        self.open
-    }
-
-    pub fn toggle(&mut self) {
-        self.open = !self.open;
-        if !self.open {
-            self.error = None;
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn show(
+    /// 실행 응답(AgentSpawned/SpawnFailed) 추적 — 창이 닫혀 있어도 매 프레임 호출해야
+    /// pending_launches가 올바르게 감소한다 (통합 창 인라인화 후 App이 직접 호출).
+    pub fn observe_launch_events(
         &mut self,
-        ctx: &egui::Context,
-        db: &Db,
-        workspace_id: &str,
-        config: &TerminalConfig,
-        client: &dyn RuntimeClient,
         events: &[RuntimeEvent],
-        db_path: &Path,
+        ctx: &egui::Context,
         catalog: &i18n::Catalog,
     ) {
-        // 실행 응답 추적 (창이 닫혀 있어도)
         for event in events {
             match event {
                 RuntimeEvent::AgentSpawned { .. } => {
@@ -101,30 +82,13 @@ impl AgentsUi {
                     message,
                 } => {
                     self.pending_launches = self.pending_launches.saturating_sub(1);
-                    // 실행 주체인 이 창에도 실패를 표시한다 (workspace 에러바와 별개)
                     self.error = Some(crate::ui::render_message(catalog, message));
                 }
                 _ => {}
             }
         }
         if self.pending_launches > 0 {
-            // 응답이 올 때까지 폴링 유지 (keyring resolve 등으로 늦어질 수 있다)
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
-        }
-        if !self.open {
-            return;
-        }
-        let mut open = true;
-        egui::Window::new(catalog.t("agents.title", &[]))
-            .open(&mut open)
-            .resizable(false)
-            .show(ctx, |ui| {
-                self.contents(ui, db, workspace_id, config, client, db_path, catalog)
-            });
-        if !open {
-            self.open = false;
-            self.error = None;
-            self.pending_production_run = None;
         }
     }
 

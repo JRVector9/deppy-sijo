@@ -101,7 +101,6 @@ pub trait McpScopedEnvResolver {
 
 pub struct ConnectorsUi {
     redaction: RedactionService,
-    open: bool,
     // 추가 폼
     name: String,
     command: String,
@@ -139,7 +138,6 @@ impl ConnectorsUi {
         let (invoke_tx, invoke_rx) = mpsc::channel();
         Self {
             redaction,
-            open: false,
             name: String::new(),
             command: String::new(),
             args_input: String::new(),
@@ -165,53 +163,14 @@ impl ConnectorsUi {
         }
     }
 
-    /// 창이 열려 있는가 (툴바 선택 하이라이트용).
-    pub fn is_open(&self) -> bool {
-        self.open
-    }
-
-    pub fn toggle(&mut self) {
-        self.open = !self.open;
-        self.error = None;
-    }
-
     /// 진행 중인 도구 실행 상태를 비운다 (workspace 전환 시 — A에서 연 invoke가 B에서
     /// 실행/감사되지 않도록). 백그라운드 스레드는 계속 돌지만 결과는 세대 불일치로 무시된다.
     pub fn clear_invoke(&mut self) {
         self.invoke = None;
     }
 
-    /// 새 credential이 등록됐으면 true (호출측이 자격증명 창 캐시를 무효화).
-    /// raw/encrypted audit input 보존은 명시 opt-in 전까지 기본 비활성이다.
-    pub fn show(
-        &mut self,
-        ctx: &egui::Context,
-        db: &mut Db,
-        workspace_id: &str,
-        oauth_store: &dyn OAuthCredentialStore,
-        env_resolver: &dyn McpScopedEnvResolver,
-        catalog: &i18n::Catalog,
-    ) -> bool {
-        // 백그라운드 결과는 창이 닫혀 있어도 소화한다 (다시 열 때 최신 상태)
-        self.drain_results(db);
-        self.drain_invoke();
-        let credential_added = self.drain_oauth(db, oauth_store);
-        if !self.open {
-            return credential_added;
-        }
-        let mut open = true;
-        egui::Window::new(catalog.t("connectors.title", &[]))
-            .open(&mut open)
-            .resizable(false)
-            .show(ctx, |ui| {
-                self.contents(ui, ctx, db, workspace_id, env_resolver, catalog)
-            });
-        self.open = open;
-        credential_added
-    }
-
     /// 백그라운드 tools/call 결과를 현재 invoke 상태에 반영.
-    fn drain_invoke(&mut self) {
+    pub fn drain_invoke(&mut self) {
         while let Ok((generation, msg)) = self.invoke_rx.try_recv() {
             // 세대 일치할 때만 반영 — 다른 tool을 새로 시작했으면 이전 백그라운드
             // 결과는 무시한다 (stale 결과 race). Prepared는 패널이 정책 평가에 소비한다.
@@ -401,7 +360,7 @@ impl ConnectorsUi {
 
     /// OAuth 결과 반영: keyring 저장 → credentials 등록 → redaction 시드.
     /// 중간 실패 시 keyring 고아 토큰을 지운다. credential을 추가했으면 true.
-    fn drain_oauth(&mut self, db: &Db, oauth_store: &dyn OAuthCredentialStore) -> bool {
+    pub fn drain_oauth(&mut self, db: &Db, oauth_store: &dyn OAuthCredentialStore) -> bool {
         let mut added = false;
         while let Ok((label, result)) = self.oauth_rx.try_recv() {
             let token = match result {
@@ -901,7 +860,7 @@ impl ConnectorsUi {
     }
 
     /// 백그라운드 결과 반영: 상태 갱신 + tools를 DB에 교체 저장 (schema_hash 포함).
-    fn drain_results(&mut self, db: &mut Db) {
+    pub fn drain_results(&mut self, db: &mut Db) {
         while let Ok((server_id, result)) = self.result_rx.try_recv() {
             let status = match result {
                 Ok(tools) => {

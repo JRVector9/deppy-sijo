@@ -370,12 +370,17 @@ pub struct App {
     workspaces: Vec<crate::storage::WorkspaceRow>,
     /// 이름 편집 중인 워크스페이스 (id, 편집 버퍼) — #3 이름 변경 UI 상태.
     ws_name_edit: Option<(String, String)>,
-    /// 옵션2: 활성 세션별 에이전트 transcript 활동(working/idle) — 타이머로 갱신해
-    /// 레일 상태에 반영한다(regex 위 우선). 승인/오류/완료는 regex 우선.
+    /// 옵션2: 활성 세션별 에이전트 transcript 활동(working/idle) — 레일 상태에 반영.
     agent_activity:
         std::collections::HashMap<runtime::SessionId, crate::agent_transcript::AgentActivity>,
-    /// 에이전트 감지(ps/lsof+파싱) 스로틀 타이머 — 매 프레임은 부담이라 주기 갱신.
-    last_agent_poll: std::time::Instant,
+    /// 세션 → 바인딩된 에이전트(transcript 경로 포함). 바인딩 폴(느림)에서 갱신,
+    /// 활동 폴(빠름)이 이걸 재파싱한다.
+    agent_bindings:
+        std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
+    /// 바인딩 감지(ps/lsof, 에이전트 시작/종료 드묾) 스로틀 — 2.5초.
+    last_binding_poll: std::time::Instant,
+    /// 활동 파싱(바인딩된 transcript tail-read, 가벼움) 스로틀 — 에이전트 있을 때만 1.5초.
+    last_activity_poll: std::time::Instant,
     /// 마지막으로 DB에 저장한 pane_id → row — 차등 upsert/delete 및 churn 방지용.
     persisted_agents: std::collections::HashMap<String, crate::storage::AgentSessionRow>,
     /// 복원용으로 로드한 (pane_id → 저장된 에이전트 세션). 워크스페이스 활성 시 로드.
@@ -488,7 +493,9 @@ impl App {
             workspaces: Vec::new(),
             ws_name_edit: None,
             agent_activity: std::collections::HashMap::new(),
-            last_agent_poll: std::time::Instant::now(),
+            agent_bindings: std::collections::HashMap::new(),
+            last_binding_poll: std::time::Instant::now(),
+            last_activity_poll: std::time::Instant::now(),
             persisted_agents: std::collections::HashMap::new(),
             restore_agents: std::collections::HashMap::new(),
             restore_loaded_for: None,
@@ -1368,11 +1375,27 @@ impl eframe::App for App {
                 // 추가하면 패널 여백 탓에 끝까지 안 닿는 짧은 선이 겹쳤다(#65 사용자).
             });
 
-        // 옵션2: 활성 세션의 에이전트 transcript 상태를 주기적으로 갱신한다. ps/lsof +
-        // 파싱은 매 프레임엔 부담이라 2초 스로틀. 세션별 shell pid는 리소스 모니터가 이미
-        // 수집한 session_resource_usage에서 재사용한다.
-        if self.last_agent_poll.elapsed() >= std::time::Duration::from_millis(2000) {
-            self.last_agent_poll = std::time::Instant::now();
+        // ── 옵션2: 에이전트 상태 (2-tier 폴링, 리소스 절약) ──
+        // 활동 파싱(빠름, 1.5초): 바인딩된 transcript만 tail-read라 가볍다. 에이전트가
+        // 있을 때만 돌려 유휴 시 불필요한 재그리기를 피한다.
+        if !self.agent_bindings.is_empty()
+            && self.last_activity_poll.elapsed() >= std::time::Duration::from_millis(1500)
+        {
+            self.last_activity_poll = std::time::Instant::now();
+            self.agent_activity = self
+                .agent_bindings
+                .iter()
+                .filter_map(|(sid, b)| crate::agent_detect::activity(b).map(|a| (*sid, a)))
+                .collect();
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(1500));
+        }
+
+        // 바인딩 감지(느림, 2.5초): ps/lsof로 어느 세션이 어떤 에이전트를 도는지 파악 +
+        // 영속 + 복원 resume. 에이전트 시작/종료는 드물어 저빈도로 충분하다. 셸 pid는
+        // 리소스 모니터가 수집한 session_resource_usage를 재사용한다.
+        if self.last_binding_poll.elapsed() >= std::time::Duration::from_millis(2500) {
+            self.last_binding_poll = std::time::Instant::now();
             let sessions: Vec<(runtime::SessionId, u32)> = self
                 .active
                 .session_resource_usage
@@ -1398,6 +1421,7 @@ impl eframe::App for App {
             }
 
             let bindings = crate::agent_detect::detect(&sessions);
+            self.agent_bindings = bindings.clone();
             self.agent_activity = bindings
                 .iter()
                 .filter_map(|(sid, b)| crate::agent_detect::activity(b).map(|a| (*sid, a)))
@@ -1459,6 +1483,17 @@ impl eframe::App for App {
                     if self.resumed_panes.contains(&pane_key) || bindings.contains_key(&session) {
                         continue; // 이미 보냈거나 이미 실행 중
                     }
+                    // 대상 transcript가 아직 존재하는지 확인 — 지워진 세션에 --resume을
+                    // 던지지 않는다. 없으면 stale 행을 지우고 재시도하지 않는다.
+                    let kind = crate::agent_detect::kind_from_str(&saved.kind);
+                    let exists = kind.is_some_and(|k| {
+                        crate::agent_detect::find_transcript(k, &saved.session_id).is_some()
+                    });
+                    if !exists {
+                        let _ = self.db.delete_agent_session(&self.active.id, &pane_key);
+                        self.resumed_panes.insert(pane_key);
+                        continue;
+                    }
                     let cmd = match saved.kind.as_str() {
                         "claude" => format!("claude --resume {}\n", saved.session_id),
                         "codex" => format!("codex resume {}\n", saved.session_id),
@@ -1475,9 +1510,9 @@ impl eframe::App for App {
                 }
             }
 
-            // 창이 유휴여도 다음 폴링이 돌도록 재그리기 예약.
+            // 창이 유휴여도 다음 바인딩 폴이 돌도록 재그리기 예약.
             ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(2000));
+                .request_repaint_after(std::time::Duration::from_millis(2500));
         }
 
         // 폴더 트리 사이드바 (FT-1) — CentralPanel보다 먼저 배치해야 한다 (§9-1).

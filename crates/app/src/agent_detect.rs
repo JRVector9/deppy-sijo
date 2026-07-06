@@ -129,6 +129,37 @@ fn bind_transcript(kind: AgentKind, sid_hint: Option<String>, pid: u32) -> Optio
     }
 }
 
+/// 저장된 (kind, session_id)로 transcript 파일을 찾는다 — 복원 resume 전에 대상이 아직
+/// 존재하는지 확인해, 이미 지워진 세션에 `--resume`을 던지지 않게 한다.
+pub fn find_transcript(kind: AgentKind, session_id: &str) -> Option<PathBuf> {
+    match kind {
+        AgentKind::Claude => find_claude_transcript(session_id),
+        AgentKind::Codex => find_codex_transcript_by_id(session_id),
+    }
+}
+
+/// "claude"/"codex" 문자열 → AgentKind.
+pub fn kind_from_str(s: &str) -> Option<AgentKind> {
+    match s {
+        "claude" => Some(AgentKind::Claude),
+        "codex" => Some(AgentKind::Codex),
+        _ => None,
+    }
+}
+
+/// codex rollout을 session_id(UUID)가 파일명에 든 것으로 찾는다.
+fn find_codex_transcript_by_id(session_id: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let root = Path::new(&home).join(".codex/sessions");
+    let mut files = Vec::new();
+    collect_jsonl(&root, &mut files);
+    files.into_iter().find(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains(session_id))
+    })
+}
+
 /// 세션ID로 claude transcript를 찾는다 (`~/.claude/projects/*/<sid>.jsonl`).
 fn find_claude_transcript(session_id: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;

@@ -1184,113 +1184,126 @@ impl eframe::App for App {
         self.frame_stats.begin();
         let text = self.i18n.clone();
         let mut unread_before = 0;
-        egui::Panel::top("top_bar").resizable(false).show(ui, |ui| {
-            // 타이틀바 영역 통합 (2026-07-06): fullsize content view로 이 바가 macOS
-            // 타이틀바까지 확장된다. 패널 크기는 버튼 높이에 맞춰 자동 — exact_size로
-            // 강제하면 버튼이 얇은 띠에 클리핑됐다(2026-07-06 사용자 화면). 위아래
-            // 여백으로 신호등(y~14) 높이에 맞춰 세로 중앙 정렬한다.
-            // 빈 곳을 잡으면 창을 드래그로 옮긴다. auto-sized Panel의 max_rect는
-            // content 측정 전 매우 커질 수 있으므로 실제 titlebar 높이만 hit-test한다.
-            let bar_rect =
-                egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), 34.0));
-            let drag = ui.interact(
-                bar_rect,
-                egui::Id::new("titlebar_drag"),
-                egui::Sense::click_and_drag(),
-            );
-            if drag.drag_started_by(egui::PointerButton::Primary) {
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-            }
-            ui.add_space(7.0);
-            ui.horizontal(|ui| {
-                // 신호등(닫기/최소화/전체화면) 폭만큼 왼쪽 여백 — macOS.
-                #[cfg(target_os = "macos")]
-                ui.add_space(72.0);
-                // 프레임 없는 텍스트 버튼 — 선택(열린 창)이면 accent-soft 둥근 박스로
-                // 강조, hover 시 옅은 배경 (목업 §타이틀바 선택 하이라이트).
-                let tbtn = |ui: &mut egui::Ui, label: String, selected: bool| -> bool {
-                    let accent = ui.visuals().selection.bg_fill;
-                    let col = if selected {
-                        accent
-                    } else {
-                        ui.visuals().weak_text_color()
-                    };
-                    let font = egui::FontId::proportional(13.0);
-                    let galley = ui.painter().layout_no_wrap(label, font, col);
-                    let w = galley.size().x + 20.0;
-                    let (rect, resp) =
-                        ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::click());
-                    if selected {
-                        ui.painter()
-                            .rect_filled(rect, 6.0, accent.gamma_multiply(0.15));
-                    } else if resp.hovered() {
-                        ui.painter().rect_filled(
-                            rect,
-                            6.0,
-                            ui.visuals().widgets.hovered.weak_bg_fill,
-                        );
-                    }
-                    let pos = egui::pos2(
-                        rect.center().x - galley.size().x / 2.0,
-                        rect.center().y - galley.size().y / 2.0,
-                    );
-                    ui.painter().galley(pos, galley, col);
-                    resp.clicked()
-                };
-                // 툴바 버튼 = 통합 설정 창을 해당 카테고리로 연다 (전체 통합, 2026-07-06).
-                // 이미 그 카테고리로 열려 있으면 닫는다(토글). 선택 하이라이트도 그 상태.
-                use ui::settings::Category as Cat;
-                // 알림 라벨/unread는 tab 클로저(&mut self 캡처) 전에 계산 (borrow 분리).
-                let unread = self.notifications_ui.unread();
-                unread_before = unread;
-                let notif_label = if unread > 0 {
-                    let count = unread.to_string();
-                    text.t("top.notifications.unread", &[("count", &count)])
-                } else {
-                    text.t("top.notifications", &[])
-                };
-                let mut tab = |ui: &mut egui::Ui, label: String, cat: Cat| {
-                    let sel = self.settings_open && self.settings_category == cat;
-                    if tbtn(ui, label, sel) {
-                        if sel {
-                            self.settings_open = false;
-                        } else {
-                            self.settings_open = true;
-                            self.settings_category = cat;
-                            if matches!(cat, Cat::Workspaces | Cat::Activity) {
-                                self.refresh_workspaces();
+        // 타이틀바 통합 바: 패널 기본 inner_margin(8)을 없애 상단 경계에 붙이고 좌측
+        // 여백을 제거한다(#67 사용자). 항목은 신호등 높이(28pt 타이틀바, 중심 y≈14)에
+        // 맞춰 세로 중앙 정렬.
+        let bar_h = 28.0;
+        let top_frame =
+            egui::Frame::side_top_panel(&ui.ctx().global_style()).inner_margin(egui::Margin::ZERO);
+        egui::Panel::top("top_bar")
+            .resizable(false)
+            .frame(top_frame)
+            .show(ui, |ui| {
+                // 빈 곳을 잡으면 창을 드래그로 옮긴다. auto-sized Panel의 max_rect는
+                // content 측정 전 매우 커질 수 있으므로 실제 titlebar 높이만 hit-test한다.
+                let bar_rect = egui::Rect::from_min_size(
+                    ui.cursor().min,
+                    egui::vec2(ui.available_width(), bar_h),
+                );
+                let drag = ui.interact(
+                    bar_rect,
+                    egui::Id::new("titlebar_drag"),
+                    egui::Sense::click_and_drag(),
+                );
+                if drag.drag_started_by(egui::PointerButton::Primary) {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), bar_h),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        // 신호등(닫기/최소화/전체화면) 폭만큼 왼쪽 여백 — macOS.
+                        #[cfg(target_os = "macos")]
+                        ui.add_space(76.0);
+                        // 프레임 없는 텍스트 버튼 — 선택(열린 창)이면 accent-soft 둥근 박스로
+                        // 강조, hover 시 옅은 배경 (목업 §타이틀바 선택 하이라이트).
+                        let tbtn = |ui: &mut egui::Ui, label: String, selected: bool| -> bool {
+                            let accent = ui.visuals().selection.bg_fill;
+                            let col = if selected {
+                                accent
+                            } else {
+                                ui.visuals().weak_text_color()
+                            };
+                            let font = egui::FontId::proportional(13.0);
+                            let galley = ui.painter().layout_no_wrap(label, font, col);
+                            let w = galley.size().x + 20.0;
+                            let (rect, resp) =
+                                ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::click());
+                            if selected {
+                                ui.painter()
+                                    .rect_filled(rect, 6.0, accent.gamma_multiply(0.15));
+                            } else if resp.hovered() {
+                                ui.painter().rect_filled(
+                                    rect,
+                                    6.0,
+                                    ui.visuals().widgets.hovered.weak_bg_fill,
+                                );
                             }
-                        }
-                    }
-                };
-                tab(ui, text.t("top.settings", &[]), Cat::General);
-                tab(ui, text.t("top.credentials", &[]), Cat::Credentials);
-                tab(ui, text.t("top.connectors", &[]), Cat::Connectors);
-                tab(ui, text.t("top.environment", &[]), Cat::Environment);
-                tab(ui, text.t("top.agents", &[]), Cat::Agents);
-                tab(ui, text.t("top.workspaces", &[]), Cat::Workspaces);
-                tab(ui, text.t("top.activity", &[]), Cat::Activity);
-                tab(ui, notif_label, Cat::Notifications);
-                // 우측: 로케일 · 메모리 (목업의 'ko · 113MB').
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let locale_short = self
-                        .config
-                        .i18n
-                        .locale
-                        .split('-')
-                        .next()
-                        .unwrap_or(&self.config.i18n.locale);
-                    let label = match self.active.resource_usage {
-                        Some(r) => format!("{locale_short} · {}MB", r.rss_bytes / (1024 * 1024)),
-                        None => locale_short.to_owned(),
-                    };
-                    ui.weak(label);
-                });
+                            let pos = egui::pos2(
+                                rect.center().x - galley.size().x / 2.0,
+                                rect.center().y - galley.size().y / 2.0,
+                            );
+                            ui.painter().galley(pos, galley, col);
+                            resp.clicked()
+                        };
+                        // 툴바 버튼 = 통합 설정 창을 해당 카테고리로 연다 (전체 통합, 2026-07-06).
+                        // 이미 그 카테고리로 열려 있으면 닫는다(토글). 선택 하이라이트도 그 상태.
+                        use ui::settings::Category as Cat;
+                        // 알림 라벨/unread는 tab 클로저(&mut self 캡처) 전에 계산 (borrow 분리).
+                        let unread = self.notifications_ui.unread();
+                        unread_before = unread;
+                        let notif_label = if unread > 0 {
+                            let count = unread.to_string();
+                            text.t("top.notifications.unread", &[("count", &count)])
+                        } else {
+                            text.t("top.notifications", &[])
+                        };
+                        let mut tab = |ui: &mut egui::Ui, label: String, cat: Cat| {
+                            let sel = self.settings_open && self.settings_category == cat;
+                            if tbtn(ui, label, sel) {
+                                if sel {
+                                    self.settings_open = false;
+                                } else {
+                                    self.settings_open = true;
+                                    self.settings_category = cat;
+                                    if matches!(cat, Cat::Workspaces | Cat::Activity) {
+                                        self.refresh_workspaces();
+                                    }
+                                }
+                            }
+                        };
+                        tab(ui, text.t("top.settings", &[]), Cat::General);
+                        tab(ui, text.t("top.credentials", &[]), Cat::Credentials);
+                        tab(ui, text.t("top.connectors", &[]), Cat::Connectors);
+                        tab(ui, text.t("top.environment", &[]), Cat::Environment);
+                        tab(ui, text.t("top.agents", &[]), Cat::Agents);
+                        tab(ui, text.t("top.workspaces", &[]), Cat::Workspaces);
+                        tab(ui, text.t("top.activity", &[]), Cat::Activity);
+                        tab(ui, notif_label, Cat::Notifications);
+                        // 우측: 로케일 · 메모리 (목업의 'ko · 113MB'). 패널 margin 0이라
+                        // 오른쪽 끝 여백을 직접 준다.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(10.0);
+                            let locale_short = self
+                                .config
+                                .i18n
+                                .locale
+                                .split('-')
+                                .next()
+                                .unwrap_or(&self.config.i18n.locale);
+                            let label = match self.active.resource_usage {
+                                Some(r) => {
+                                    format!("{locale_short} · {}MB", r.rss_bytes / (1024 * 1024))
+                                }
+                                None => locale_short.to_owned(),
+                            };
+                            ui.weak(label);
+                        });
+                    },
+                );
+                // 툴바-본문 경계선은 egui Panel::top이 자체로 그린다 — 커스텀 hairline을
+                // 추가하면 패널 여백 탓에 끝까지 안 닿는 짧은 선이 겹쳤다(#65 사용자).
             });
-            ui.add_space(6.0);
-            // 툴바-본문 경계선은 egui Panel::top이 자체로 그린다 — 커스텀 hairline을
-            // 추가하면 패널 여백 탓에 끝까지 안 닿는 짧은 선이 겹쳤다(#65 사용자).
-        });
 
         // 폴더 트리 사이드바 (FT-1) — CentralPanel보다 먼저 배치해야 한다 (§9-1).
         // OFF(None)면 Panel 자체를 만들지 않는다 (§6 리소스 0).

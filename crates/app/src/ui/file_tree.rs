@@ -808,7 +808,7 @@ impl FileTreeUi {
                     }
                 });
             ui.add_space(4.0);
-            crate::ui::hairline(ui);
+            crate::ui::hairline_full(ui);
         }
 
         // 헤더: 현재 루트 경로(~ 축약) + 새로고침/숨김 토글/접기 (§6). 헤더 전체가
@@ -829,15 +829,35 @@ impl FileTreeUi {
                     .on_hover_text(&display_root);
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button("◂")
+                    // 접기: ◂는 폰트에 없어 □로 깨진다 — 도형 캐럿, 프레임 없음(#68)
+                    let (cr, collapse) =
+                        ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                    let ccol = if collapse.hovered() {
+                        ui.visuals().text_color()
+                    } else {
+                        ui.visuals().weak_text_color()
+                    };
+                    {
+                        let c = cr.center();
+                        let d = 4.0;
+                        ui.painter().add(egui::Shape::convex_polygon(
+                            vec![
+                                egui::pos2(c.x + d * 0.6, c.y - d),
+                                egui::pos2(c.x + d * 0.6, c.y + d),
+                                egui::pos2(c.x - d * 0.8, c.y),
+                            ],
+                            ccol,
+                            egui::Stroke::NONE,
+                        ));
+                    }
+                    if collapse
                         .on_hover_text(catalog.t("file_tree.collapse_sidebar", &[]))
                         .clicked()
                     {
                         self.collapsed = true;
                     }
                     if ui
-                        .small_button("⟳")
+                        .add(egui::Button::new("⟳").frame(false))
                         .on_hover_text(catalog.t("file_tree.refresh", &[]))
                         .clicked()
                     {
@@ -859,7 +879,7 @@ impl FileTreeUi {
         if let (Some(payload), Some(root)) = (root_drop, self.root.clone()) {
             self.start_move((*payload).clone(), root);
         }
-        crate::ui::hairline(ui);
+        crate::ui::hairline_full(ui);
 
         if self.root.is_none() {
             // path 미설정 (§9-2 backfill 강제 없음) — 트리 대신 안내

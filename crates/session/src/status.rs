@@ -197,10 +197,12 @@ struct BuiltinPatterns {
 
 static BUILTIN: std::sync::LazyLock<BuiltinPatterns> = std::sync::LazyLock::new(|| {
     BuiltinPatterns {
-        // 승인/확인 프롬프트: claude "Do you want to proceed? ❯ 1. Yes", codex "Allow
-        // command?", 일반 y/n. 파괴적 동작 확인이라 NeedsApproval로 본다.
+        // 승인/확인 프롬프트. codex/claude는 옵션 목록(❯ 1. Yes …)이 화면 위쪽에 있고
+        // 스캔 대상인 꼬리 5줄엔 하단 푸터가 들어오므로, 푸터/문구를 여러 개 중복으로
+        // 잡아 최소 하나가 꼬리에 걸리게 한다: "Would you like to run", "Yes, proceed",
+        // "Press enter to confirm", "don't ask again", "tell Codex/Claude", y/n 등.
         approval: regex::Regex::new(
-            r"(?i)(do you want to (proceed|make this edit|create|run|continue|apply)|❯\s*1\.\s*yes\b|allow (this )?(command|edit|action|tool)|approve this|grant\s+.{0,24}permission|\[y/n\]|\(y/n\)|\by/n\?)",
+            r"(?i)(do you want to (proceed|make this edit|create|run|continue|apply)|would you like to run|yes,?\s*proceed|press enter to confirm|don'?t ask again|tell (codex|claude)\b|allow (this )?(command|edit|action|tool)|approve this|grant\s+.{0,24}permission|\[y/n\]|\(y/n\)|\by/n\?|❯\s*1\.\s*yes\b)",
         )
         .expect("built-in approval regex"),
         // 그 외 입력 대기: "Press Enter", "type ... to continue", "waiting for input".
@@ -734,6 +736,15 @@ mod tests {
         let mut d = StatusDetector::new(StatusPatterns::compile(None, None, None, None));
         d.on_output(b"working\n");
         let screen = "Do you want to proceed?\n❯ 1. Yes\n  2. No";
+        assert_eq!(d.evaluate(Some(screen)), Some(SessionStatus::NeedsApproval));
+    }
+
+    #[test]
+    fn builtin_패턴이_codex_승인_푸터를_감지() {
+        // codex는 옵션이 위쪽·푸터가 꼬리에 온다 — 꼬리 5줄의 푸터/문구로 감지(#92 사용자).
+        let mut d = StatusDetector::new(StatusPatterns::compile(None, None, None, None));
+        d.on_output(b"working\n");
+        let screen = "  1. Yes, proceed (y)\n  2. Yes, and don't ask again for commands (p)\n  3. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel";
         assert_eq!(d.evaluate(Some(screen)), Some(SessionStatus::NeedsApproval));
     }
 

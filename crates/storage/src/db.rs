@@ -686,6 +686,11 @@ impl Db {
             "DELETE FROM env_profiles WHERE workspace_id = ?1",
             [workspace_id],
         )?;
+        // 옵션2 에이전트 세션 (storage 소유) — 워크스페이스와 함께 정리(orphan 방지).
+        tx.execute(
+            "DELETE FROM agent_sessions WHERE workspace_id = ?1",
+            [workspace_id],
+        )?;
         tx.execute("DELETE FROM workspaces WHERE id = ?1", [workspace_id])?;
         tx.commit()?;
         Ok(())
@@ -1099,6 +1104,43 @@ mod tests {
         // 다른 workspace는 그대로
         assert!(db.list_workspaces().unwrap().iter().any(|w| w.id == other));
         assert_eq!(db.list_env_profiles(&other).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn agent_sessions_upsert_list_delete_roundtrip() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("ws").unwrap();
+        db.upsert_agent_session(&ws, "pane-1", "claude", "sid-a")
+            .unwrap();
+        db.upsert_agent_session(&ws, "pane-2", "codex", "sid-b")
+            .unwrap();
+        let rows = db.list_agent_sessions(&ws).unwrap();
+        assert_eq!(rows.len(), 2);
+        // upsert는 같은 pane을 교체 (중복 아님)
+        db.upsert_agent_session(&ws, "pane-1", "claude", "sid-a2")
+            .unwrap();
+        let rows = db.list_agent_sessions(&ws).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .any(|r| r.pane_id == "pane-1" && r.session_id == "sid-a2")
+        );
+        // 개별 삭제
+        db.delete_agent_session(&ws, "pane-1").unwrap();
+        assert_eq!(db.list_agent_sessions(&ws).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_workspace가_agent_sessions도_정리() {
+        let mut db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("삭제대상").unwrap();
+        let other = db.create_workspace("유지").unwrap();
+        db.upsert_agent_session(&ws, "p1", "claude", "s1").unwrap();
+        db.upsert_agent_session(&other, "p2", "codex", "s2")
+            .unwrap();
+        db.delete_workspace(&ws).unwrap();
+        assert!(db.list_agent_sessions(&ws).unwrap().is_empty());
+        assert_eq!(db.list_agent_sessions(&other).unwrap().len(), 1);
     }
 
     #[test]

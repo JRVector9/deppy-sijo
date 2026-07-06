@@ -22,8 +22,16 @@ pub struct UiConfig {
     pub theme: Theme,
     /// 폴더 트리 사이드바 ON/OFF (file-tree-design §6). OFF면 Panel 미생성 + 상태 drop.
     pub file_tree_enabled: bool,
+    /// 재시작 시 이전 claude/codex 세션을 native resume 명령으로 자동 이어가기(옵션2).
+    /// OFF면 자동 명령 주입 안 함(사용자가 수동으로 이어감).
+    #[serde(default = "default_true")]
+    pub auto_resume_agents: bool,
     /// 다음 실행 때 다시 열 마지막 활성 workspace. 삭제되었거나 없으면 default workspace로 대체.
     pub last_workspace_id: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for UiConfig {
@@ -31,6 +39,7 @@ impl Default for UiConfig {
         Self {
             theme: Theme::default(),
             file_tree_enabled: true,
+            auto_resume_agents: true,
             last_workspace_id: None,
         }
     }

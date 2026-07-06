@@ -1471,7 +1471,10 @@ impl eframe::App for App {
 
             // 복원 resume 주입: 복원된 pane(저장된 에이전트 있음)에 에이전트가 아직 안
             // 떠 있으면(bindings에 없음) native resume 명령을 셸에 한 번 보낸다.
-            if let Some(mux) = &mux {
+            // 자동 명령 주입이라 설정으로 끌 수 있다(기본 ON).
+            if self.config.ui.auto_resume_agents
+                && let Some(mux) = &mux
+            {
                 for pane in mux.tabs.iter().flat_map(|t| &t.panes) {
                     let pane_key = pane.id.0.clone();
                     let Some(saved) = self.restore_agents.get(&pane_key) else {

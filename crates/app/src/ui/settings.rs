@@ -931,6 +931,16 @@ fn general_page(
             }
         },
     );
+    row(
+        ui,
+        &catalog.t("settings.auto_resume", &[]),
+        Some(&catalog.t("settings.auto_resume.hint", &[])),
+        |ui| {
+            if toggle_switch(ui, &mut config.ui.auto_resume_agents) {
+                *changed = true;
+            }
+        },
+    );
 }
 
 fn language_page(

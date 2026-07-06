@@ -730,7 +730,14 @@ impl WorkspaceUi {
                     as usize;
                 row * snapshot.cols as usize + col
             };
-            if output.response.drag_started()
+            if output.response.double_clicked()
+                && let Some(pos) = output.response.interact_pointer_pos()
+            {
+                // 더블클릭 → 커서 아래 단어(공백 구분) 선택 (드래그한 것처럼).
+                if let Some((s, e)) = word_range_at(&snapshot, cell_at(pos)) {
+                    self.selection = Some((session, s, e));
+                }
+            } else if output.response.drag_started()
                 && let Some(pos) = output.response.interact_pointer_pos()
             {
                 let idx = cell_at(pos);
@@ -752,10 +759,9 @@ impl WorkspaceUi {
                 && s == session
             {
                 self.selection = Some((session, anchor, cell_at(pos)));
+            } else if output.response.clicked() {
+                self.selection = None; // 단순 클릭은 선택 해제 (더블클릭 아님)
             }
-        }
-        if output.response.clicked() {
-            self.selection = None; // 단순 클릭은 선택 해제
         }
 
         // 포커스 pane 파란 테두리는 사용자 요청으로 제거(2026-07-04) — 단일 pane 사용 시
@@ -1321,6 +1327,39 @@ fn is_clipboard_paste_shortcut(event: &egui::Event) -> bool {
     } else {
         modifiers.ctrl && modifiers.shift
     }
+}
+
+/// 셀 idx 아래의 단어(공백 구분 비어있지 않은 셀 연속) 범위를 [start, end]로 돌려준다.
+/// 공백 위를 더블클릭하면 None. 더블클릭 단어 선택에 쓴다.
+fn word_range_at(
+    snapshot: &terminal::TerminalViewportSnapshot,
+    idx: usize,
+) -> Option<(usize, usize)> {
+    let cols = snapshot.cols as usize;
+    if cols == 0 {
+        return None;
+    }
+    let row = idx / cols;
+    let col = idx % cols;
+    let base = row * cols;
+    let is_word = |c: usize| -> bool {
+        snapshot
+            .visible_cells
+            .get(base + c)
+            .is_some_and(|cell| !cell.c.is_whitespace() && cell.c != '\0')
+    };
+    if !is_word(col) {
+        return None;
+    }
+    let mut start = col;
+    while start > 0 && is_word(start - 1) {
+        start -= 1;
+    }
+    let mut end = col;
+    while end + 1 < cols && is_word(end + 1) {
+        end += 1;
+    }
+    Some((base + start, base + end))
 }
 
 /// regex/휴리스틱 상태와 transcript 기반 활동(옵션2)을 병합한다. 승인/오류/완료는

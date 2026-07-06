@@ -42,6 +42,7 @@ pub enum Category {
 
 /// "관리"/"모니터" 그룹 — 아직 별도 패널을 여는 기존 기능들. 통합 창 네비에서 선택 시
 /// App이 해당 패널을 연다 (전체 인라인화는 후속 — 2026-07-06).
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum OpenPanel {
     Credentials,
     Connectors,
@@ -74,6 +75,7 @@ pub fn show(
     remote: &RemoteView,
     reveal_token: &mut bool,
     notif_unread: u32,
+    search_query: &mut String,
     catalog: &i18n::Catalog,
 ) -> SettingsOutput {
     let mut changed = false;
@@ -90,7 +92,14 @@ pub fn show(
                 .resizable(false)
                 .exact_size(216.0)
                 .show(ui, |ui| {
-                    nav(ui, category, &mut open_panel, notif_unread, catalog);
+                    nav(
+                        ui,
+                        category,
+                        &mut open_panel,
+                        notif_unread,
+                        search_query,
+                        catalog,
+                    );
                 });
             egui::CentralPanel::default().show(ui, |ui| {
                 egui::ScrollArea::vertical()
@@ -132,122 +141,143 @@ fn nav(
     category: &mut Category,
     open_panel: &mut Option<OpenPanel>,
     notif_unread: u32,
+    search_query: &mut String,
     catalog: &i18n::Catalog,
 ) {
     ui.add_space(4.0);
-    // 검색 박스 (시각적 — 필터는 후속)
-    egui::Frame::default()
-        .fill(ui.visuals().extreme_bg_color)
-        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-        .corner_radius(6.0)
-        .inner_margin(egui::Margin::symmetric(9, 6))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.weak("/");
-                ui.weak(catalog.t("settings.search", &[]));
-            });
-        });
+    ui.add(
+        egui::TextEdit::singleline(search_query)
+            .hint_text(catalog.t("settings.search", &[]))
+            .desired_width(ui.available_width()),
+    );
     ui.add_space(8.0);
 
-    ui.weak(catalog.t("settings.group.settings", &[]));
-    nav_item(
-        ui,
-        category,
-        Category::General,
-        "G",
-        &catalog.t("settings.cat.general", &[]),
-    );
-    nav_item(
-        ui,
-        category,
-        Category::Language,
-        "L",
-        &catalog.t("settings.language", &[]),
-    );
-    nav_item(
-        ui,
-        category,
-        Category::Terminal,
-        "▤",
-        &catalog.t("settings.terminal", &[]),
-    );
-    nav_item(
-        ui,
-        category,
-        Category::Performance,
-        "P",
-        &catalog.t("settings.performance", &[]),
-    );
-    nav_item(
-        ui,
-        category,
-        Category::RemoteTls,
-        "R",
-        &catalog.t("settings.remote_tls", &[]),
-    );
+    let query = search_query.trim();
+    let mut rendered = 0usize;
 
-    ui.add_space(6.0);
-    ui.weak(catalog.t("settings.group.manage", &[]));
-    nav_open(
-        ui,
-        "K",
-        &catalog.t("top.credentials", &[]),
-        None,
-        open_panel,
-        OpenPanel::Credentials,
-    );
-    nav_open(
-        ui,
-        "C",
-        &catalog.t("top.connectors", &[]),
-        None,
-        open_panel,
-        OpenPanel::Connectors,
-    );
-    nav_open(
-        ui,
-        "▦",
-        &catalog.t("top.environment", &[]),
-        None,
-        open_panel,
-        OpenPanel::Environment,
-    );
-    nav_open(
-        ui,
-        "◆",
-        &catalog.t("top.agents", &[]),
-        None,
-        open_panel,
-        OpenPanel::Agents,
-    );
-    nav_open(
-        ui,
-        "▢",
-        &catalog.t("top.workspaces", &[]),
-        None,
-        open_panel,
-        OpenPanel::Workspaces,
-    );
+    let settings = [
+        (
+            Category::General,
+            "G",
+            catalog.t("settings.cat.general", &[]),
+            "general appearance theme folder tree sidebar ui",
+        ),
+        (
+            Category::Language,
+            "L",
+            catalog.t("settings.language", &[]),
+            "language locale i18n english japanese chinese korean",
+        ),
+        (
+            Category::Terminal,
+            "T",
+            catalog.t("settings.terminal", &[]),
+            "terminal font scrollback shell paste clipboard",
+        ),
+        (
+            Category::Performance,
+            "P",
+            catalog.t("settings.performance", &[]),
+            "performance output batch cpu memory rss resource",
+        ),
+        (
+            Category::RemoteTls,
+            "R",
+            catalog.t("settings.remote_tls", &[]),
+            "remote tls server port token fingerprint known hosts",
+        ),
+    ];
+    let visible_settings: Vec<_> = settings
+        .into_iter()
+        .filter(|(_, _, label, aliases)| nav_matches(query, label, aliases))
+        .collect();
+    if !visible_settings.is_empty() {
+        ui.weak(catalog.t("settings.group.settings", &[]));
+        for (cat, icon, label, _) in visible_settings {
+            rendered += 1;
+            nav_item(ui, category, cat, icon, &label);
+        }
+    }
 
-    ui.add_space(6.0);
-    ui.weak(catalog.t("settings.group.monitor", &[]));
-    nav_open(
-        ui,
-        "◷",
-        &catalog.t("top.activity", &[]),
-        None,
-        open_panel,
-        OpenPanel::Activity,
-    );
+    let manage = [
+        (
+            OpenPanel::Credentials,
+            "K",
+            catalog.t("top.credentials", &[]),
+            "credentials secrets key api token password",
+        ),
+        (
+            OpenPanel::Connectors,
+            "C",
+            catalog.t("top.connectors", &[]),
+            "connectors mcp tools oauth server",
+        ),
+        (
+            OpenPanel::Environment,
+            "E",
+            catalog.t("top.environment", &[]),
+            "environment env profile variables production",
+        ),
+        (
+            OpenPanel::Agents,
+            "A",
+            catalog.t("top.agents", &[]),
+            "agents command runner status regex",
+        ),
+        (
+            OpenPanel::Workspaces,
+            "W",
+            catalog.t("top.workspaces", &[]),
+            "workspaces project path folder root",
+        ),
+    ];
+    let visible_manage: Vec<_> = manage
+        .into_iter()
+        .filter(|(_, _, label, aliases)| nav_matches(query, label, aliases))
+        .collect();
+    if !visible_manage.is_empty() {
+        ui.add_space(6.0);
+        ui.weak(catalog.t("settings.group.manage", &[]));
+        for (panel, icon, label, _) in visible_manage {
+            rendered += 1;
+            nav_open(ui, icon, &label, None, open_panel, panel);
+        }
+    }
+
     let badge = (notif_unread > 0).then(|| notif_unread.to_string());
-    nav_open(
-        ui,
-        "🔔",
-        &catalog.t("top.notifications", &[]),
-        badge,
-        open_panel,
-        OpenPanel::Notifications,
-    );
+    let monitor = [
+        (
+            OpenPanel::Activity,
+            "M",
+            catalog.t("top.activity", &[]),
+            "activity monitor cpu rss memory process workspace backpressure",
+        ),
+        (
+            OpenPanel::Notifications,
+            "N",
+            catalog.t("top.notifications", &[]),
+            "notifications alerts unread status approval",
+        ),
+    ];
+    let visible_monitor: Vec<_> = monitor
+        .into_iter()
+        .filter(|(_, _, label, aliases)| nav_matches(query, label, aliases))
+        .collect();
+    if !visible_monitor.is_empty() {
+        ui.add_space(6.0);
+        ui.weak(catalog.t("settings.group.monitor", &[]));
+        for (panel, icon, label, _) in visible_monitor {
+            rendered += 1;
+            let item_badge = (panel == OpenPanel::Notifications)
+                .then(|| badge.clone())
+                .flatten();
+            nav_open(ui, icon, &label, item_badge, open_panel, panel);
+        }
+    }
+
+    if rendered == 0 {
+        ui.weak(catalog.t("settings.search.no_results", &[]));
+    }
 }
 
 fn nav_item(ui: &mut egui::Ui, current: &mut Category, cat: Category, icon: &str, label: &str) {
@@ -282,6 +312,14 @@ fn nav_open(
             });
         }
     });
+}
+
+fn nav_matches(query: &str, label: &str, aliases: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let query = query.to_lowercase();
+    label.to_lowercase().contains(&query) || aliases.to_lowercase().contains(&query)
 }
 
 // ── 폼 헬퍼 ──
@@ -401,7 +439,6 @@ fn language_page(
                         ("zh-Hans", "settings.locale.zh_hans"),
                         ("zh-Hant", "settings.locale.zh_hant"),
                         ("ko-KR", "settings.locale.ko_kr"),
-                        (i18n::PSEUDO_LOCALE, "settings.locale.pseudo"),
                     ] {
                         *changed |= ui
                             .selectable_value(
@@ -422,7 +459,6 @@ fn current_locale_label(locale: &str, catalog: &i18n::Catalog) -> String {
         "zh-Hans" => "settings.locale.zh_hans",
         "zh-Hant" => "settings.locale.zh_hant",
         "ko-KR" => "settings.locale.ko_kr",
-        l if l == i18n::PSEUDO_LOCALE => "settings.locale.pseudo",
         _ => "settings.locale.en_us",
     };
     catalog.t(key, &[])
@@ -584,7 +620,7 @@ fn truncate_fingerprint(fp: &str, keep: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_fingerprint;
+    use super::{nav_matches, truncate_fingerprint};
 
     #[test]
     fn 지문_짧으면_그대로() {
@@ -594,5 +630,16 @@ mod tests {
     #[test]
     fn 지문_길면_앞부분만_말줄임() {
         assert_eq!(truncate_fingerprint("aa:bb:cc:dd", 5), "aa:bb…");
+    }
+
+    #[test]
+    fn 설정_검색은_label과_alias를_모두_본다() {
+        assert!(nav_matches("term", "터미널", "terminal paste clipboard"));
+        assert!(nav_matches("알림", "알림", "notifications alerts"));
+        assert!(!nav_matches(
+            "missing",
+            "터미널",
+            "terminal paste clipboard"
+        ));
     }
 }

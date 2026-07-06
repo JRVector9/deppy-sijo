@@ -42,6 +42,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 i18n = { path = "crates/i18n" }
+arboard = "3.6.1"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 portable-pty = "0.9"
 alacritty_terminal = "0.26"

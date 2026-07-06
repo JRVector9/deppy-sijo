@@ -26,7 +26,7 @@ fn main() -> anyhow::Result<()> {
 
     let db_path = paths.data_dir.join("metadata.sqlite3");
     let db = storage::Db::open(&db_path)?;
-    let workspace_id = db.ensure_default_workspace()?;
+    let workspace_id = initial_workspace_id(&db, config.ui.last_workspace_id.as_deref())?;
     // 이전 실행이 비정상 종료됐다면 남은 세션을 Exited로 정리 (crash recovery).
     // 실패는 기동 중단 — 거짓 running 상태로 복원 UI가 뜨면 안 된다 (codex 리뷰 반영)
     let reconciled = db
@@ -91,6 +91,25 @@ fn main() -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("eframe 실행 실패: {e}"))
 }
 
+fn initial_workspace_id(
+    db: &storage::Db,
+    last_workspace_id: Option<&str>,
+) -> anyhow::Result<String> {
+    let fallback = db.ensure_default_workspace()?;
+    let Some(last) = last_workspace_id else {
+        return Ok(fallback);
+    };
+    let exists = db
+        .list_workspaces()?
+        .iter()
+        .any(|workspace| workspace.id == last);
+    if exists {
+        Ok(last.to_owned())
+    } else {
+        Ok(fallback)
+    }
+}
+
 /// macOS 네이티브 메뉴바 (2026-07-05 사용자 요청) — About/설정(⌘,)/종료(⌘Q).
 /// 이벤트는 app.rs가 MenuEvent::receiver로 폴링한다 ("settings" id).
 #[cfg(target_os = "macos")]
@@ -148,4 +167,35 @@ fn init_logging(paths: &paths::AppPaths) -> tracing_appender::non_blocking::Work
         .with_ansi(false)
         .init();
     guard
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db(tag: &str) -> (std::path::PathBuf, storage::Db) {
+        let dir =
+            std::env::temp_dir().join(format!("deppy-sijo-main-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite3");
+        let db = storage::Db::open(&path).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn initial_workspace_prefers_existing_last_workspace() {
+        let (dir, db) = temp_db("last-existing");
+        let _default = db.ensure_default_workspace().unwrap();
+        let last = db.create_workspace("last").unwrap();
+        assert_eq!(initial_workspace_id(&db, Some(&last)).unwrap(), last);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn initial_workspace_falls_back_when_last_workspace_is_missing() {
+        let (dir, db) = temp_db("last-missing");
+        let default = db.ensure_default_workspace().unwrap();
+        assert_eq!(initial_workspace_id(&db, Some("missing")).unwrap(), default);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

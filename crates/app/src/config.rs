@@ -22,6 +22,8 @@ pub struct UiConfig {
     pub theme: Theme,
     /// 폴더 트리 사이드바 ON/OFF (file-tree-design §6). OFF면 Panel 미생성 + 상태 drop.
     pub file_tree_enabled: bool,
+    /// 다음 실행 때 다시 열 마지막 활성 workspace. 삭제되었거나 없으면 default workspace로 대체.
+    pub last_workspace_id: Option<String>,
 }
 
 impl Default for UiConfig {
@@ -29,6 +31,7 @@ impl Default for UiConfig {
         Self {
             theme: Theme::default(),
             file_tree_enabled: true,
+            last_workspace_id: None,
         }
     }
 }
@@ -208,6 +211,7 @@ mod tests {
         assert_eq!(parsed.i18n.locale, i18n::FALLBACK_LOCALE);
         // 구 config(file_tree_enabled 없음)도 기본 true (§6 serde 기본)
         assert!(parsed.ui.file_tree_enabled);
+        assert_eq!(parsed.ui.last_workspace_id, None);
     }
 
     #[test]
@@ -231,6 +235,15 @@ mod tests {
         let text = toml::to_string_pretty(&c).unwrap();
         let parsed: Config = toml::from_str(&text).unwrap();
         assert!(!parsed.ui.file_tree_enabled);
+    }
+
+    #[test]
+    fn 마지막_workspace_id_roundtrip() {
+        let mut c = Config::default();
+        c.ui.last_workspace_id = Some("ws-last".to_owned());
+        let text = toml::to_string_pretty(&c).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.ui.last_workspace_id.as_deref(), Some("ws-last"));
     }
 
     #[test]

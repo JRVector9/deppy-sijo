@@ -999,12 +999,14 @@ name = "deppy-sijo"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "audit",
  "auth",
  "directories",
  "eframe",
  "egui",
  "i18n",
+ "image",
  "libc",
  "mcp",
  "mcp-store",

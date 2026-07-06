@@ -19,6 +19,8 @@ tracing-appender = { workspace = true }
 rusqlite = { workspace = true }
 uuid = { workspace = true }
 i18n = { workspace = true }
+arboard = { workspace = true }
+image = { workspace = true }
 audit = { path = "../audit" }
 auth = { path = "../auth" }
 mcp = { path = "../mcp" }

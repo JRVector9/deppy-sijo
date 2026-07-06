@@ -794,6 +794,8 @@ impl WorkspaceUi {
         if focused && output.response.has_focus() {
             let mut pending: Vec<u8> = Vec::new();
             let mut copy_text: Option<String> = None;
+            let mut image_paste_requested = false;
+            let mut text_paste_seen = false;
             ui.input(|input| {
                 let modifiers = input.modifiers;
                 for event in &input.raw.events {
@@ -804,6 +806,9 @@ impl WorkspaceUi {
                     if let egui::Event::Ime(egui::ImeEvent::Commit(_)) = event {
                         self.preedit.clear();
                     }
+                    if matches!(event, egui::Event::Paste(_)) {
+                        text_paste_seen = true;
+                    }
                     // Cmd+C(macOS)/Ctrl+C(그 외)의 Copy 이벤트: 선택이 있으면 복사가
                     // 우선 — 이벤트를 소비해 ^C 전송(비macOS 매핑)을 막는다 (2026-07-05)
                     if matches!(event, egui::Event::Copy)
@@ -812,6 +817,10 @@ impl WorkspaceUi {
                     {
                         copy_text =
                             Some(renderer_egui::selection_text(&snapshot, a.min(b), a.max(b)));
+                        continue;
+                    }
+                    if is_clipboard_paste_shortcut(event) {
+                        image_paste_requested = true;
                         continue;
                     }
                     if let Some(bytes) = input_mapper::map_event(event, bracketed, &modifiers) {
@@ -830,6 +839,22 @@ impl WorkspaceUi {
                         bytes: pending,
                     },
                 );
+            }
+            if image_paste_requested && !text_paste_seen {
+                match crate::ui::clipboard_image::paste_clipboard_image_to_png() {
+                    Ok(Some(path)) => {
+                        let bytes = path_insert_paste_bytes(
+                            &path,
+                            self.session_shell_kind(session),
+                            bracketed,
+                        );
+                        self.send(client, RuntimeCommand::WriteInput { session, bytes });
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        self.error = Some(format!("{e:#}"));
+                    }
+                }
             }
         }
 
@@ -1182,6 +1207,23 @@ fn terminal_text_paste_bytes(text: &str, bracketed_paste: bool) -> Vec<u8> {
     input_mapper::paste_bytes(text.as_bytes(), bracketed_paste)
 }
 
+fn is_clipboard_paste_shortcut(event: &egui::Event) -> bool {
+    let egui::Event::Key {
+        key: egui::Key::V,
+        pressed: true,
+        modifiers,
+        ..
+    } = event
+    else {
+        return false;
+    };
+    if cfg!(target_os = "macos") {
+        modifiers.command && !modifiers.ctrl
+    } else {
+        modifiers.ctrl && modifiers.shift
+    }
+}
+
 /// 상태 → tab 제목 아이콘 (PR-12).
 /// 사이드바 세션 요약 — 화면의 마지막 비어있지 않은 행 (≤48자, 2026-07-05).
 fn last_line_summary(snapshot: &TerminalViewportSnapshot) -> String {
@@ -1496,5 +1538,44 @@ mod tests {
         assert!(selection_range_contains(3, 7, 7));
         assert!(!selection_range_contains(3, 7, 2));
         assert!(!selection_range_contains(3, 7, 8));
+    }
+
+    #[test]
+    fn image_paste_shortcut은_platform_clipboard_paste만_잡는다() {
+        let ctrl_v = egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        };
+        let ctrl_shift_v = egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+        };
+        let cmd_v = egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                mac_cmd: true,
+                command: true,
+                ..egui::Modifiers::NONE
+            },
+        };
+
+        if cfg!(target_os = "macos") {
+            assert!(is_clipboard_paste_shortcut(&cmd_v));
+            assert!(!is_clipboard_paste_shortcut(&ctrl_v));
+            assert!(!is_clipboard_paste_shortcut(&ctrl_shift_v));
+        } else {
+            assert!(!is_clipboard_paste_shortcut(&cmd_v));
+            assert!(!is_clipboard_paste_shortcut(&ctrl_v));
+            assert!(is_clipboard_paste_shortcut(&ctrl_shift_v));
+        }
     }
 }

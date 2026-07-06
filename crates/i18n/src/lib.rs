@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const FALLBACK_LOCALE: &str = "en-US";
-pub const PSEUDO_LOCALE: &str = "en-XA";
 pub const REQUIRED_LOCALES: &[&str] = &["en-US", "ja-JP", "zh-Hans", "zh-Hant"];
 pub const OPTIONAL_LOCALES: &[&str] = &["ko-KR"];
 
@@ -14,19 +13,6 @@ pub struct Catalog {
 
 impl Catalog {
     pub fn load(locale: &str) -> anyhow::Result<Self> {
-        if locale == PSEUDO_LOCALE {
-            let fallback = parse_locale_file(FALLBACK_LOCALE, locale_source(FALLBACK_LOCALE)?)?;
-            let primary = fallback
-                .iter()
-                .map(|(key, value)| (key.clone(), pseudo_localize(value)))
-                .collect();
-            return Ok(Self {
-                locale: locale.to_owned(),
-                primary,
-                fallback,
-            });
-        }
-
         let normalized = normalize_locale(locale);
         let fallback = parse_locale_file(FALLBACK_LOCALE, locale_source(FALLBACK_LOCALE)?)?;
         let primary = if normalized == FALLBACK_LOCALE {
@@ -56,16 +42,12 @@ impl Catalog {
     }
 
     pub fn loaded_locale_count(&self) -> usize {
-        if self.locale == FALLBACK_LOCALE || self.locale == PSEUDO_LOCALE {
-            1
-        } else {
-            2
-        }
+        if self.locale == FALLBACK_LOCALE { 1 } else { 2 }
     }
 }
 
 pub fn normalize_locale(locale: &str) -> String {
-    if locale == PSEUDO_LOCALE || is_supported_locale(locale) {
+    if is_supported_locale(locale) {
         locale.to_owned()
     } else {
         FALLBACK_LOCALE.to_owned()
@@ -132,26 +114,6 @@ fn interpolate(template: &str, args: &[(&str, &str)]) -> String {
     out
 }
 
-fn pseudo_localize(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 8);
-    out.push('[');
-    for ch in value.chars() {
-        let mapped = match ch {
-            'a' | 'A' => 'á',
-            'e' | 'E' => 'é',
-            'i' | 'I' => 'í',
-            'o' | 'O' => 'ó',
-            'u' | 'U' => 'ú',
-            'c' | 'C' => 'ç',
-            'n' | 'N' => 'ñ',
-            _ => ch,
-        };
-        out.push(mapped);
-    }
-    out.push_str(" !!]");
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,14 +143,6 @@ mod tests {
         let catalog = Catalog::load("ja-JP").unwrap();
         assert_eq!(catalog.locale(), "ja-JP");
         assert_eq!(catalog.loaded_locale_count(), 2);
-    }
-
-    #[test]
-    fn pseudo_locale_is_generated_from_fallback() {
-        let catalog = Catalog::load(PSEUDO_LOCALE).unwrap();
-        let value = catalog.t("app.title", &[]);
-        assert!(value.starts_with('['));
-        assert!(value.ends_with("!!]"));
     }
 
     #[test]
@@ -238,26 +192,8 @@ mod tests {
     }
 
     #[test]
-    fn pseudo_locale_gate_expands_real_ui_keys() {
-        let fallback = Catalog::load(FALLBACK_LOCALE).unwrap();
-        let pseudo = Catalog::load(PSEUDO_LOCALE).unwrap();
-        for key in [
-            "top.settings",
-            "settings.file_tree_sidebar",
-            "workspace.start_shell_prompt",
-            "file_tree.insert_path_terminal",
-            "notification.session.done",
-        ] {
-            let args = [("title", "session")];
-            let base = fallback.t(key, &args);
-            let localized = pseudo.t(key, &args);
-            assert!(localized.starts_with('['), "{key}: {localized}");
-            assert!(localized.ends_with("!!]"), "{key}: {localized}");
-            assert!(
-                localized.chars().count() > base.chars().count(),
-                "{key}: pseudo locale should expand text"
-            );
-        }
+    fn unsupported_locale_normalizes_to_fallback() {
+        assert_eq!(normalize_locale("en-XA"), FALLBACK_LOCALE);
     }
 
     fn visual_width(text: &str) -> usize {

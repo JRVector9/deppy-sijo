@@ -1,0 +1,90 @@
+use std::path::{Path, PathBuf};
+
+use anyhow::Context;
+
+pub fn paste_clipboard_image_to_png() -> anyhow::Result<Option<PathBuf>> {
+    let mut clipboard = arboard::Clipboard::new().context("clipboard 열기 실패")?;
+    let image = match clipboard.get_image() {
+        Ok(image) => image,
+        Err(arboard::Error::ContentNotAvailable) => return Ok(None),
+        Err(e) => return Err(e).context("clipboard 이미지 읽기 실패"),
+    };
+    let path = next_clipboard_image_path();
+    write_rgba_png(&path, image.width, image.height, image.bytes.as_ref())?;
+    Ok(Some(path))
+}
+
+fn next_clipboard_image_path() -> PathBuf {
+    let dir = directories::ProjectDirs::from("city", "ahto", "deppy-sijo")
+        .map(|dirs| dirs.cache_dir().join("clipboard-images"))
+        .unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("deppy-sijo")
+                .join("clipboard-images")
+        });
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    dir.join(format!(
+        "clipboard-image-{}-{millis}.png",
+        std::process::id()
+    ))
+}
+
+fn write_rgba_png(path: &Path, width: usize, height: usize, rgba: &[u8]) -> anyhow::Result<()> {
+    anyhow::ensure!(width > 0 && height > 0, "clipboard 이미지 크기가 비어 있음");
+    anyhow::ensure!(
+        width <= u32::MAX as usize && height <= u32::MAX as usize,
+        "clipboard 이미지 크기가 PNG 저장 한도를 초과함"
+    );
+    anyhow::ensure!(
+        rgba.len() == width.saturating_mul(height).saturating_mul(4),
+        "clipboard 이미지 RGBA 버퍼 크기 불일치"
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("clipboard 이미지 디렉터리 생성 실패: {}", parent.display())
+        })?;
+    }
+    image::save_buffer_with_format(
+        path,
+        rgba,
+        width as u32,
+        height as u32,
+        image::ColorType::Rgba8,
+        image::ImageFormat::Png,
+    )
+    .with_context(|| format!("clipboard 이미지 저장 실패: {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rgba_png_writer_rejects_wrong_buffer_size() {
+        let path = std::env::temp_dir().join(format!(
+            "deppy-sijo-bad-clipboard-image-{}.png",
+            std::process::id()
+        ));
+        let err = write_rgba_png(&path, 2, 2, &[0, 0, 0, 255]).unwrap_err();
+        assert!(err.to_string().contains("RGBA"));
+    }
+
+    #[test]
+    fn rgba_png_writer_creates_png_file() {
+        let path = std::env::temp_dir().join(format!(
+            "deppy-sijo-clipboard-image-test-{}.png",
+            std::process::id()
+        ));
+        let rgba = [
+            255, 0, 0, 255, //
+            0, 255, 0, 255,
+        ];
+        write_rgba_png(&path, 2, 1, &rgba).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let _ = std::fs::remove_file(path);
+    }
+}

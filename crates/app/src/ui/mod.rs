@@ -1,6 +1,7 @@
 pub mod activity;
 pub mod agents;
 pub mod approvals;
+pub mod clipboard_image;
 pub mod connectors;
 pub mod credentials;
 pub mod env_profiles;

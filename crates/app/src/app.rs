@@ -332,6 +332,7 @@ pub struct App {
     settings_open: bool,
     /// 통합 설정 창의 선택된 카테고리.
     settings_category: ui::settings::Category,
+    settings_search: String,
     db: Db,
     secret_store: KeyringSecretStore,
     agents_ui: ui::agents::AgentsUi,
@@ -392,7 +393,7 @@ pub struct App {
 impl App {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        config: Config,
+        mut config: Config,
         config_path: PathBuf,
         db: Db,
         workspace_id: String,
@@ -401,6 +402,7 @@ impl App {
         egui_ctx: egui::Context,
     ) -> Self {
         // output_batch_ms는 시작 시 고정, scrollback_lines는 세션 spawn 시점에 전달
+        config.ui.last_workspace_id = Some(workspace_id.clone());
         let redaction = secret::RedactionService::new();
         let i18n = load_catalog(&config.i18n.locale);
         let active = Self::make_runtime(
@@ -448,6 +450,7 @@ impl App {
             config_path,
             settings_open: false,
             settings_category: ui::settings::Category::default(),
+            settings_search: String::new(),
             db,
             secret_store: KeyringSecretStore,
             agents_ui: ui::agents::AgentsUi::new(),
@@ -759,6 +762,10 @@ impl App {
         }
         self.connectors_ui.clear_invoke();
         // 파일 트리 루트를 새 workspace path로 갱신 (FT-1)
+        self.config.ui.last_workspace_id = Some(target_id.to_owned());
+        if let Err(e) = self.config.save(&self.config_path) {
+            tracing::warn!("마지막 workspace 저장 실패: {e:#}");
+        }
         self.refresh_file_tree_root();
         self.egui_ctx.request_repaint();
 
@@ -1713,6 +1720,7 @@ impl eframe::App for App {
             &remote_view,
             &mut self.remote_reveal_token,
             notif_unread,
+            &mut self.settings_search,
             &text,
         );
         // 관리/모니터 네비 항목 클릭 — 아직 별도 패널을 여는 기존 기능들 (전체 인라인화 후속).

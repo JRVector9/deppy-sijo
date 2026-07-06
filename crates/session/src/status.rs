@@ -164,22 +164,52 @@ impl StatusPatterns {
     }
 
     /// 우선순위: error > approval > done > waiting (안전한 쪽 우선).
+    /// config regex에 더해 claude/codex 공통 프롬프트 built-in 패턴도 항상 검사한다
+    /// (#3b — 셸에서 수동 실행한 claude/codex도 승인/입력 대기를 감지).
     fn match_text(&self, text: &str) -> Option<SessionStatus> {
         if self.error.as_ref().is_some_and(|re| re.is_match(text)) {
             return Some(SessionStatus::Error);
         }
-        if self.approval.as_ref().is_some_and(|re| re.is_match(text)) {
+        if self.approval.as_ref().is_some_and(|re| re.is_match(text))
+            || BUILTIN.approval.is_match(text)
+        {
             return Some(SessionStatus::NeedsApproval);
         }
         if self.done.as_ref().is_some_and(|re| re.is_match(text)) {
             return Some(SessionStatus::Done);
         }
-        if self.waiting.as_ref().is_some_and(|re| re.is_match(text)) {
+        if self.waiting.as_ref().is_some_and(|re| re.is_match(text))
+            || BUILTIN.waiting.is_match(text)
+        {
             return Some(SessionStatus::Waiting);
         }
         None
     }
 }
+
+/// claude/codex 등 공통 CLI 프롬프트를 감지하는 내장 패턴 (#3b). config regex가 없는
+/// 셸에서도 승인/입력 대기 상태를 잡아 상태 레일이 반응하게 한다. 화면 꼬리 라인에
+/// 매칭되므로 프롬프트가 사라지면(응답) 해제된다.
+struct BuiltinPatterns {
+    approval: regex::Regex,
+    waiting: regex::Regex,
+}
+
+static BUILTIN: std::sync::LazyLock<BuiltinPatterns> = std::sync::LazyLock::new(|| {
+    BuiltinPatterns {
+        // 승인/확인 프롬프트: claude "Do you want to proceed? ❯ 1. Yes", codex "Allow
+        // command?", 일반 y/n. 파괴적 동작 확인이라 NeedsApproval로 본다.
+        approval: regex::Regex::new(
+            r"(?i)(do you want to (proceed|make this edit|create|run|continue|apply)|❯\s*1\.\s*yes\b|allow (this )?(command|edit|action|tool)|approve this|grant\s+.{0,24}permission|\[y/n\]|\(y/n\)|\by/n\?)",
+        )
+        .expect("built-in approval regex"),
+        // 그 외 입력 대기: "Press Enter", "type ... to continue", "waiting for input".
+        waiting: regex::Regex::new(
+            r"(?i)(press enter to continue|type\s+.{0,24}\s+to continue|waiting for (your )?(input|response)|paste your|enter your\s)",
+        )
+        .expect("built-in waiting regex"),
+    }
+});
 
 fn priority(status: SessionStatus) -> u8 {
     match status {
@@ -266,13 +296,10 @@ impl StatusDetector {
     /// regex 패턴이 없는 세션은 idle heuristic만 필요하므로 출력 tick마다 backend grid
     /// 텍스트를 읽지 않는다. 입력 직후 예약도 이 경로에서 1회성으로 소비한다.
     pub fn should_scan_screen(&mut self, produced_output: bool) -> bool {
+        // built-in claude/codex 패턴이 상시 활성이라 config가 비어도 화면을 스캔한다
+        // (#3b — 셸에서 수동 실행한 claude/codex도 프롬프트 감지). 새 출력이 있거나
+        // 입력 직후 재확인 요청이 있을 때만 스캔해 비용을 유계로 둔다.
         let requested = std::mem::take(&mut self.screen_scan_requested);
-        if self.patterns.is_empty() {
-            if produced_output || requested {
-                self.stats.screen_scans_skipped_empty_patterns += 1;
-            }
-            return false;
-        }
         produced_output || requested
     }
 
@@ -316,7 +343,7 @@ impl StatusDetector {
         }
         // 응답이 화면을 다시 그리지 않아도(echo 없는 TUI) 다음 tick에 화면을
         // 재확인해야 한다 — 새 프롬프트가 이미 떠 있을 수 있다 (worker가 소비)
-        self.screen_scan_requested = !self.patterns.is_empty();
+        self.screen_scan_requested = true; // built-in 패턴 상시 — 입력 후 항상 재확인 (#3b)
         self.status = SessionStatus::Running;
         self.source = StatusSource::IdleHeuristic;
         self.idle_waiting = false;
@@ -691,18 +718,23 @@ mod tests {
     }
 
     #[test]
-    fn regex_없는_detector는_screen_scan을_건너뛴다() {
+    fn regex_없는_detector도_builtin_위해_화면을_스캔한다() {
+        // #3b: config regex가 없어도 built-in claude/codex 패턴을 위해 화면을 스캔한다.
         let mut d = StatusDetector::new(StatusPatterns::compile(None, None, None, None));
         d.on_output(b"busy\n");
-        assert!(!d.should_scan_screen(true));
-        d.evaluate(None);
-        let stats = d.stats();
-        assert_eq!(stats.stream_chunks, 1);
-        assert_eq!(stats.stream_lines, 1);
-        assert_eq!(stats.screen_scans, 0);
-        assert_eq!(stats.screen_scans_skipped_empty_patterns, 1);
+        assert!(d.should_scan_screen(true)); // 새 출력 → 스캔 (건너뛰지 않음)
+        assert!(!d.should_scan_screen(false)); // 새 출력·요청 없으면 스캔 안 함
         d.on_input();
-        assert!(!d.should_scan_screen(false));
+        assert!(d.should_scan_screen(false)); // 입력 후 재확인 요청됨
+    }
+
+    #[test]
+    fn builtin_패턴이_claude_승인_프롬프트를_감지() {
+        // #3b: config regex 없는 셸에서도 claude/codex 승인 프롬프트를 NeedsApproval로.
+        let mut d = StatusDetector::new(StatusPatterns::compile(None, None, None, None));
+        d.on_output(b"working\n");
+        let screen = "Do you want to proceed?\n❯ 1. Yes\n  2. No";
+        assert_eq!(d.evaluate(Some(screen)), Some(SessionStatus::NeedsApproval));
     }
 
     #[test]

@@ -1911,49 +1911,73 @@ fn session_row(ui: &mut egui::Ui, entry: &SessionEntry) -> egui::Response {
     if !ui.is_rect_visible(rect) {
         return resp;
     }
-    let visuals = ui.visuals();
-    let accent = visuals.selection.bg_fill;
-    let dot = session_status_color(entry.status, visuals);
-    let painter = ui.painter();
+    // 색을 먼저 복사(Copy)해 visuals 차용을 끝낸 뒤 ui.fonts로 galley를 만든다.
+    let accent = ui.visuals().selection.bg_fill;
+    let dot = session_status_color(entry.status, ui.visuals());
+    let hover_bg = ui.visuals().widgets.hovered.bg_fill;
+    let summary_color = ui.visuals().weak_text_color().gamma_multiply(0.9);
+    let title_color = if entry.focused {
+        accent
+    } else {
+        ui.visuals().text_color()
+    };
+    // 텍스트는 행 폭(좌 16 + 우 여백 8) 안으로 잘라 '…' 처리 — 고정 글자수 truncate는
+    // 좁은 사이드바에서 박스 밖으로 삐져나갔다(#91 사용자).
+    let max_w = (rect.width() - 16.0 - 8.0).max(10.0);
+    let title_galley = clipped_line(ui, &entry.title, egui::FontId::proportional(13.0), max_w);
+    let summary_galley =
+        has_summary.then(|| clipped_line(ui, &entry.summary, egui::FontId::monospace(10.5), max_w));
 
+    let painter = ui.painter();
     // 선택/hover 배경
     if entry.focused {
         painter.rect_filled(rect, 4.0, accent.gamma_multiply(0.18));
     } else if resp.hovered() {
-        painter.rect_filled(rect, 4.0, visuals.widgets.hovered.bg_fill);
+        painter.rect_filled(rect, 4.0, hover_bg);
     }
     // 좌측 상태 레일(2px) — 항상 표시, 상태 색으로 세로로 훑어 파악 (목업 §세션).
-    // 점·타입 글리프는 제거하고 레일이 유일한 상태 표시다 (2026-07-06 사용자).
     let rail = egui::Rect::from_min_size(
         egui::pos2(rect.left(), rect.top() + 4.0),
         egui::vec2(2.0, row_h - 8.0),
     );
     painter.rect_filled(rail, 1.0, dot);
     let mid_y = rect.top() + if has_summary { 13.0 } else { row_h / 2.0 };
-    // 타이틀
-    let title_color = if entry.focused {
-        accent
-    } else {
-        visuals.text_color()
-    };
-    painter.text(
-        egui::pos2(rect.left() + 16.0, mid_y),
-        egui::Align2::LEFT_CENTER,
-        &entry.title,
-        egui::FontId::proportional(13.0),
+    painter.galley(
+        egui::pos2(rect.left() + 16.0, mid_y - title_galley.size().y / 2.0),
+        title_galley,
         title_color,
     );
-    // 요약 (dim, mono, 길면 잘림)
-    if has_summary {
-        painter.text(
-            egui::pos2(rect.left() + 16.0, rect.top() + 27.0),
-            egui::Align2::LEFT_CENTER,
-            truncate_chars(&entry.summary, 40),
-            egui::FontId::monospace(10.5),
-            visuals.weak_text_color().gamma_multiply(0.9),
+    if let Some(sg) = summary_galley {
+        painter.galley(
+            egui::pos2(rect.left() + 16.0, rect.top() + 27.0 - sg.size().y / 2.0),
+            sg,
+            summary_color,
         );
     }
     resp
+}
+
+/// 한 줄 텍스트를 max_width 안으로 잘라 '…'로 끝내는 galley (박스 밖 삐짐 방지, #91).
+fn clipped_line(
+    ui: &egui::Ui,
+    text: &str,
+    font_id: egui::FontId,
+    max_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::single_section(
+        text.to_owned(),
+        egui::TextFormat {
+            font_id,
+            ..Default::default()
+        },
+    );
+    job.wrap = egui::text::TextWrapping {
+        max_width,
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    ui.painter().layout_job(job)
 }
 
 /// 타입 글리프를 도형으로 그린다: agent=마름모(◆), shell=삼각형(▸). 폰트에 없는
@@ -2106,17 +2130,6 @@ pub(crate) fn session_status_color(
         Some(S::Idle) => egui::Color32::from_rgb(0x8b, 0x8f, 0x98),
         // status 미보고(첫 평가 전) — Idle과 같은 회색 fallback.
         None => egui::Color32::from_rgb(0x8b, 0x8f, 0x98),
-    }
-}
-
-/// UTF-8 char 경계 기준 말줄임 (요약 표시용 — painter.text는 자동 truncate가 없다).
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_owned()
-    } else {
-        let mut out: String = s.chars().take(max).collect();
-        out.push('…');
-        out
     }
 }
 

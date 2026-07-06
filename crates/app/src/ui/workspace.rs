@@ -457,6 +457,8 @@ impl WorkspaceUi {
         client: &dyn RuntimeClient,
         catalog: &i18n::Catalog,
     ) {
+        // 헤더-터미널 사이 기본 item_spacing 틈에 패널색이 비쳤다(#81) — 0으로.
+        ui.spacing_mut().item_spacing.y = 0.0;
         let Some(pane) = mux
             .tabs
             .iter()

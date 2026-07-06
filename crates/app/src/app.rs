@@ -1400,8 +1400,11 @@ impl eframe::App for App {
         }
         // 작업창은 여백 없이 경계까지 채운다 — CentralPanel 기본 inner_margin(8) 탓에
         // pane 좌/상/우 여백이 보였다(#69 사용자).
-        let central_frame =
-            egui::Frame::central_panel(&ui.ctx().global_style()).inner_margin(egui::Margin::ZERO);
+        // 작업창 배경은 테마 무관 항상 다크(#18181c) — 라이트 테마에서 터미널 하단
+        // 여백/pane 틈에 밝은 패널색이 드러났다(#80·#81).
+        let central_frame = egui::Frame::central_panel(&ui.ctx().global_style())
+            .inner_margin(egui::Margin::ZERO)
+            .fill(egui::Color32::from_rgb(0x18, 0x18, 0x1c));
         egui::CentralPanel::default()
             .frame(central_frame)
             .show(ui, |ui| {

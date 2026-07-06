@@ -180,6 +180,22 @@ mod tests {
     }
 
     #[test]
+    fn tui_number_selection은_text_event로_전달하고_key_event는_중복하지_않는다() {
+        assert_eq!(
+            map_event(&egui::Event::Text("1".into()), false, &NONE),
+            Some(b"1".to_vec())
+        );
+        assert_eq!(
+            map_event(&egui::Event::Text("95".into()), false, &NONE),
+            Some(b"95".to_vec())
+        );
+        assert_eq!(
+            map_event(&key_event(egui::Key::Num1, NONE), false, &NONE),
+            None
+        );
+    }
+
+    #[test]
     fn tui_navigation_확장키_매핑() {
         let shift = egui::Modifiers::SHIFT;
         let ctrl = egui::Modifiers::CTRL;

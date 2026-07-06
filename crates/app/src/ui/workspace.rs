@@ -762,10 +762,10 @@ impl WorkspaceUi {
         // 요청이 유실된다 (리뷰 반영).
         if focused && self.pending_focus.as_ref() == Some(pane_id) {
             self.pending_focus = None;
-            output.response.request_focus();
+            request_terminal_focus(&output.response);
         }
         if output.response.clicked() {
-            output.response.request_focus();
+            request_terminal_focus(&output.response);
             if !focused {
                 self.send(
                     client,
@@ -818,7 +818,7 @@ impl WorkspaceUi {
                 ui.ctx().top_layer_id().is_some(),
             );
         if terminal_keyboard_active && !output.response.has_focus() {
-            output.response.request_focus();
+            request_terminal_focus(&output.response);
         }
         if terminal_keyboard_active {
             let mut pending: Vec<u8> = Vec::new();
@@ -1259,6 +1259,13 @@ fn selection_range_contains(start: usize, end: usize, idx: usize) -> bool {
 
 fn terminal_text_paste_bytes(text: &str, bracketed_paste: bool) -> Vec<u8> {
     input_mapper::paste_bytes(text.as_bytes(), bracketed_paste)
+}
+
+fn request_terminal_focus(response: &egui::Response) {
+    response.request_focus();
+    response.ctx.memory_mut(|memory| {
+        memory.set_focus_lock_filter(response.id, renderer_egui::terminal_focus_lock_filter());
+    });
 }
 
 fn clipboard_terminal_paste_bytes(
@@ -1722,5 +1729,14 @@ mod tests {
         assert!(!terminal_keyboard_input_allowed(true, false, false));
         assert!(!terminal_keyboard_input_allowed(false, true, false));
         assert!(!terminal_keyboard_input_allowed(false, false, true));
+    }
+
+    #[test]
+    fn terminal_focus_lock_filter는_app_request_focus와_같은_filter를_쓴다() {
+        let filter = renderer_egui::terminal_focus_lock_filter();
+        assert!(filter.tab);
+        assert!(filter.horizontal_arrows);
+        assert!(filter.vertical_arrows);
+        assert!(filter.escape);
     }
 }

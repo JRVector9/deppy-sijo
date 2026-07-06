@@ -53,6 +53,22 @@ pub enum OpenPanel {
     Notifications,
 }
 
+#[derive(Clone, Copy)]
+enum Icon {
+    Gear,
+    Globe,
+    Terminal,
+    Bolt,
+    Lock,
+    Key,
+    Link,
+    Grid,
+    Diamond,
+    Square,
+    Clock,
+    Bell,
+}
+
 /// 설정 창 결과.
 pub struct SettingsOutput {
     /// config 값이 바뀌어 저장이 필요한가 (테마/터미널/성능/포트).
@@ -82,12 +98,61 @@ pub fn show(
     let mut remote_action = RemoteAction::None;
     let mut open_panel = None;
 
+    // title_bar(false)라 기본 open 처리가 없다 — 닫힘이면 창 자체를 만들지 않는다.
+    if !*open {
+        return SettingsOutput {
+            config_changed: false,
+            remote_action,
+            open_panel,
+        };
+    }
+
     egui::Window::new(catalog.t("settings.title", &[]))
-        .open(open)
+        .title_bar(false) // 기본 타이틀바(높음) 제거 — 컴팩트 커스텀 행 사용 (목업 §설정)
         .collapsible(false)
         .default_size([1000.0, 640.0])
         .min_size([720.0, 460.0])
         .show(ctx, |ui| {
+            // 컴팩트 타이틀 행 (세로 30px) — 드래그 이동 + × 닫기
+            let (bar, drag) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), 30.0),
+                egui::Sense::click_and_drag(),
+            );
+            if drag.dragged() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            ui.painter().text(
+                bar.center(),
+                egui::Align2::CENTER_CENTER,
+                catalog.t("settings.title", &[]),
+                egui::FontId::proportional(13.5),
+                ui.visuals().weak_text_color(),
+            );
+            let x_rect = egui::Rect::from_center_size(
+                egui::pos2(bar.right() - 18.0, bar.center().y),
+                egui::vec2(24.0, 24.0),
+            );
+            let xr = ui.interact(x_rect, ui.id().with("set_close"), egui::Sense::click());
+            ui.painter().text(
+                x_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "×",
+                egui::FontId::proportional(16.0),
+                if xr.hovered() {
+                    ui.visuals().text_color()
+                } else {
+                    ui.visuals().weak_text_color()
+                },
+            );
+            if xr.clicked() {
+                *open = false;
+            }
+            ui.painter().hline(
+                bar.x_range(),
+                bar.bottom(),
+                ui.visuals().widgets.noninteractive.bg_stroke,
+            );
+
             egui::Panel::left("settings_nav")
                 .resizable(false)
                 .exact_size(216.0)
@@ -152,166 +217,210 @@ fn nav(
     );
     ui.add_space(8.0);
 
-    let query = search_query.trim();
-    let mut rendered = 0usize;
+    let query = search_query.trim().to_owned();
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let query = query.as_str();
+            let mut rendered = 0usize;
 
-    let settings = [
-        (
-            Category::General,
-            "G",
-            catalog.t("settings.cat.general", &[]),
-            "general appearance theme folder tree sidebar ui",
-        ),
-        (
-            Category::Language,
-            "L",
-            catalog.t("settings.language", &[]),
-            "language locale i18n english japanese chinese korean",
-        ),
-        (
-            Category::Terminal,
-            "T",
-            catalog.t("settings.terminal", &[]),
-            "terminal font scrollback shell paste clipboard",
-        ),
-        (
-            Category::Performance,
-            "P",
-            catalog.t("settings.performance", &[]),
-            "performance output batch cpu memory rss resource",
-        ),
-        (
-            Category::RemoteTls,
-            "R",
-            catalog.t("settings.remote_tls", &[]),
-            "remote tls server port token fingerprint known hosts",
-        ),
-    ];
-    let visible_settings: Vec<_> = settings
-        .into_iter()
-        .filter(|(_, _, label, aliases)| nav_matches(query, label, aliases))
-        .collect();
-    if !visible_settings.is_empty() {
-        ui.weak(catalog.t("settings.group.settings", &[]));
-        for (cat, icon, label, _) in visible_settings {
-            rendered += 1;
-            nav_item(ui, category, cat, icon, &label);
-        }
-    }
+            let settings = [
+                (
+                    Category::General,
+                    Icon::Gear,
+                    catalog.t("settings.cat.general", &[]),
+                    "general appearance theme folder tree sidebar ui",
+                ),
+                (
+                    Category::Language,
+                    Icon::Globe,
+                    catalog.t("settings.language", &[]),
+                    "language locale i18n english japanese chinese korean",
+                ),
+                (
+                    Category::Terminal,
+                    Icon::Terminal,
+                    catalog.t("settings.terminal", &[]),
+                    "terminal font scrollback shell paste clipboard",
+                ),
+                (
+                    Category::Performance,
+                    Icon::Bolt,
+                    catalog.t("settings.performance", &[]),
+                    "performance output batch cpu memory rss resource",
+                ),
+                (
+                    Category::RemoteTls,
+                    Icon::Lock,
+                    catalog.t("settings.remote_tls", &[]),
+                    "remote tls server port token fingerprint known hosts",
+                ),
+            ];
+            let visible_settings: Vec<_> = settings
+                .into_iter()
+                .filter(|(_, _, label, aliases)| nav_matches(query, label, aliases))
+                .collect();
+            if !visible_settings.is_empty() {
+                ui.weak(catalog.t("settings.group.settings", &[]));
+                for (cat, icon, label, _) in visible_settings {
+                    rendered += 1;
+                    nav_item(ui, category, cat, icon, &label);
+                }
+            }
 
-    let manage = [
-        (
-            OpenPanel::Credentials,
-            "K",
-            catalog.t("top.credentials", &[]),
-            "credentials secrets key api token password",
-        ),
-        (
-            OpenPanel::Connectors,
-            "C",
-            catalog.t("top.connectors", &[]),
-            "connectors mcp tools oauth server",
-        ),
-        (
-            OpenPanel::Environment,
-            "E",
-            catalog.t("top.environment", &[]),
-            "environment env profile variables production",
-        ),
-        (
-            OpenPanel::Agents,
-            "A",
-            catalog.t("top.agents", &[]),
-            "agents command runner status regex",
-        ),
-        (
-            OpenPanel::Workspaces,
-            "W",
-            catalog.t("top.workspaces", &[]),
-            "workspaces project path folder root",
-        ),
-    ];
-    let visible_manage: Vec<_> = manage
-        .into_iter()
-        .filter(|(_, _, label, aliases)| nav_matches(query, label, aliases))
-        .collect();
-    if !visible_manage.is_empty() {
-        ui.add_space(6.0);
-        ui.weak(catalog.t("settings.group.manage", &[]));
-        for (panel, icon, label, _) in visible_manage {
-            rendered += 1;
-            nav_open(ui, icon, &label, None, open_panel, panel);
-        }
-    }
+            let manage = [
+                (
+                    OpenPanel::Credentials,
+                    Icon::Key,
+                    catalog.t("top.credentials", &[]),
+                    "credentials secrets key api token password",
+                ),
+                (
+                    OpenPanel::Connectors,
+                    Icon::Link,
+                    catalog.t("top.connectors", &[]),
+                    "connectors mcp tools oauth server",
+                ),
+                (
+                    OpenPanel::Environment,
+                    Icon::Grid,
+                    catalog.t("top.environment", &[]),
+                    "environment env profile variables production",
+                ),
+                (
+                    OpenPanel::Agents,
+                    Icon::Diamond,
+                    catalog.t("top.agents", &[]),
+                    "agents command runner status regex",
+                ),
+                (
+                    OpenPanel::Workspaces,
+                    Icon::Square,
+                    catalog.t("top.workspaces", &[]),
+                    "workspaces project path folder root",
+                ),
+            ];
+            let visible_manage: Vec<_> = manage
+                .into_iter()
+                .filter(|(_, _, label, aliases)| nav_matches(query, label, aliases))
+                .collect();
+            if !visible_manage.is_empty() {
+                ui.add_space(6.0);
+                ui.weak(catalog.t("settings.group.manage", &[]));
+                for (panel, icon, label, _) in visible_manage {
+                    rendered += 1;
+                    nav_open(ui, icon, &label, None, open_panel, panel);
+                }
+            }
 
-    let badge = (notif_unread > 0).then(|| notif_unread.to_string());
-    let monitor = [
-        (
-            OpenPanel::Activity,
-            "M",
-            catalog.t("top.activity", &[]),
-            "activity monitor cpu rss memory process workspace backpressure",
-        ),
-        (
-            OpenPanel::Notifications,
-            "N",
-            catalog.t("top.notifications", &[]),
-            "notifications alerts unread status approval",
-        ),
-    ];
-    let visible_monitor: Vec<_> = monitor
-        .into_iter()
-        .filter(|(_, _, label, aliases)| nav_matches(query, label, aliases))
-        .collect();
-    if !visible_monitor.is_empty() {
-        ui.add_space(6.0);
-        ui.weak(catalog.t("settings.group.monitor", &[]));
-        for (panel, icon, label, _) in visible_monitor {
-            rendered += 1;
-            let item_badge = (panel == OpenPanel::Notifications)
-                .then(|| badge.clone())
-                .flatten();
-            nav_open(ui, icon, &label, item_badge, open_panel, panel);
-        }
-    }
+            let badge = (notif_unread > 0).then(|| notif_unread.to_string());
+            let monitor = [
+                (
+                    OpenPanel::Activity,
+                    Icon::Clock,
+                    catalog.t("top.activity", &[]),
+                    "activity monitor cpu rss memory process workspace backpressure",
+                ),
+                (
+                    OpenPanel::Notifications,
+                    Icon::Bell,
+                    catalog.t("top.notifications", &[]),
+                    "notifications alerts unread status approval",
+                ),
+            ];
+            let visible_monitor: Vec<_> = monitor
+                .into_iter()
+                .filter(|(_, _, label, aliases)| nav_matches(query, label, aliases))
+                .collect();
+            if !visible_monitor.is_empty() {
+                ui.add_space(6.0);
+                ui.weak(catalog.t("settings.group.monitor", &[]));
+                for (panel, icon, label, _) in visible_monitor {
+                    rendered += 1;
+                    let item_badge = (panel == OpenPanel::Notifications)
+                        .then(|| badge.clone())
+                        .flatten();
+                    nav_open(ui, icon, &label, item_badge, open_panel, panel);
+                }
+            }
 
-    if rendered == 0 {
-        ui.weak(catalog.t("settings.search.no_results", &[]));
-    }
+            if rendered == 0 {
+                ui.weak(catalog.t("settings.search.no_results", &[]));
+            }
+        });
 }
 
-fn nav_item(ui: &mut egui::Ui, current: &mut Category, cat: Category, icon: &str, label: &str) {
-    let selected = *current == cat;
-    let text = format!("{icon}  {label}");
-    if ui.selectable_label(selected, text).clicked() {
+fn nav_item(ui: &mut egui::Ui, current: &mut Category, cat: Category, icon: Icon, label: &str) {
+    if nav_row(ui, *current == cat, icon, label, None) {
         *current = cat;
     }
 }
 
 fn nav_open(
     ui: &mut egui::Ui,
-    icon: &str,
+    icon: Icon,
     label: &str,
     badge: Option<String>,
     out: &mut Option<OpenPanel>,
     which: OpenPanel,
 ) {
-    ui.horizontal(|ui| {
-        let text = format!("{icon}  {label}");
-        if ui.selectable_label(false, text).clicked() {
-            *out = Some(which);
-        }
-        if let Some(b) = badge {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    egui::RichText::new(format!(" {b} "))
-                        .small()
-                        .background_color(ui.visuals().warn_fg_color)
-                        .color(egui::Color32::from_rgb(0x1a, 0x1a, 0x1a)),
-                );
-            });
-        }
-    });
+    if nav_row(ui, false, icon, label, badge) {
+        *out = Some(which);
+    }
+}
+
+/// 전체폭 네비 항목 — 아이콘 + 라벨, 선택/hover 배경이 행 전체를 덮는다 (목업 §설정).
+/// 선택은 accent-soft, 아이콘·라벨은 accent/dim. 반환: 클릭 여부.
+fn nav_row(
+    ui: &mut egui::Ui,
+    selected: bool,
+    icon: Icon,
+    label: &str,
+    badge: Option<String>,
+) -> bool {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::click());
+    let accent = ui.visuals().selection.bg_fill;
+    let p = ui.painter();
+    if selected {
+        p.rect_filled(rect, 7.0, accent.gamma_multiply(0.15));
+    } else if resp.hovered() {
+        p.rect_filled(rect, 7.0, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    let icon_col = if selected {
+        accent
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let cy = rect.center().y;
+    paint_icon(p, egui::pos2(rect.left() + 14.0, cy), 15.0, icon, icon_col);
+    let tc = if selected {
+        accent
+    } else {
+        ui.visuals().text_color()
+    };
+    p.text(
+        egui::pos2(rect.left() + 32.0, cy),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.5),
+        tc,
+    );
+    if let Some(b) = badge {
+        let br = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - 16.0, cy),
+            egui::vec2(18.0, 16.0),
+        );
+        p.rect_filled(br, 8.0, egui::Color32::from_rgb(0xe7, 0x8a, 0x4e));
+        p.text(
+            br.center(),
+            egui::Align2::CENTER_CENTER,
+            b,
+            egui::FontId::proportional(11.0),
+            egui::Color32::from_rgb(0x1a, 0x1a, 0x1a),
+        );
+    }
+    resp.clicked()
 }
 
 fn nav_matches(query: &str, label: &str, aliases: &str) -> bool {
@@ -320,6 +429,156 @@ fn nav_matches(query: &str, label: &str, aliases: &str) -> bool {
     }
     let query = query.to_lowercase();
     label.to_lowercase().contains(&query) || aliases.to_lowercase().contains(&query)
+}
+
+fn paint_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    size: f32,
+    icon: Icon,
+    color: egui::Color32,
+) {
+    let stroke = egui::Stroke::new(1.35, color);
+    let r = size * 0.42;
+    match icon {
+        Icon::Gear => {
+            painter.circle_stroke(center, r * 0.72, stroke);
+            for (dx, dy) in [(0.0, -r), (r, 0.0), (0.0, r), (-r, 0.0)] {
+                painter.line_segment(
+                    [
+                        egui::pos2(center.x + dx * 0.62, center.y + dy * 0.62),
+                        egui::pos2(center.x + dx, center.y + dy),
+                    ],
+                    stroke,
+                );
+            }
+        }
+        Icon::Globe => {
+            painter.circle_stroke(center, r, stroke);
+            painter.vline(center.x, center.y - r..=center.y + r, stroke);
+            painter.hline(center.x - r..=center.x + r, center.y, stroke);
+        }
+        Icon::Terminal => {
+            let rect = egui::Rect::from_center_size(center, egui::vec2(size * 0.9, size * 0.68));
+            painter.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
+            let x = rect.left() + 3.0;
+            painter.line_segment(
+                [egui::pos2(x, center.y - 3.0), egui::pos2(x + 3.5, center.y)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(x + 3.5, center.y), egui::pos2(x, center.y + 3.0)],
+                stroke,
+            );
+            painter.hline(
+                rect.left() + 8.5..=rect.right() - 3.0,
+                center.y + 3.5,
+                stroke,
+            );
+        }
+        Icon::Bolt => {
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(center.x + 1.5, center.y - r),
+                    egui::pos2(center.x - 3.0, center.y + 0.5),
+                    egui::pos2(center.x + 1.0, center.y + 0.5),
+                    egui::pos2(center.x - 1.5, center.y + r),
+                    egui::pos2(center.x + 4.0, center.y - 1.0),
+                    egui::pos2(center.x, center.y - 1.0),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+        Icon::Lock => {
+            let body = egui::Rect::from_center_size(
+                egui::pos2(center.x, center.y + 2.0),
+                egui::vec2(10.0, 8.0),
+            );
+            painter.rect_stroke(body, 2.0, stroke, egui::StrokeKind::Inside);
+            painter.line_segment(
+                [
+                    egui::pos2(center.x - 4.0, center.y - 1.0),
+                    egui::pos2(center.x - 4.0, center.y - 4.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(center.x - 4.0, center.y - 4.0),
+                    egui::pos2(center.x + 4.0, center.y - 4.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(center.x + 4.0, center.y - 4.0),
+                    egui::pos2(center.x + 4.0, center.y - 1.0),
+                ],
+                stroke,
+            );
+        }
+        Icon::Key => {
+            painter.circle_stroke(egui::pos2(center.x - 3.5, center.y), 3.2, stroke);
+            painter.hline(center.x - 0.5..=center.x + 6.0, center.y, stroke);
+            painter.vline(center.x + 4.0, center.y..=center.y + 3.0, stroke);
+        }
+        Icon::Link => {
+            painter.circle_stroke(egui::pos2(center.x - 3.0, center.y), 4.0, stroke);
+            painter.circle_stroke(egui::pos2(center.x + 3.0, center.y), 4.0, stroke);
+            painter.line_segment(
+                [
+                    egui::pos2(center.x - 2.0, center.y),
+                    egui::pos2(center.x + 2.0, center.y),
+                ],
+                stroke,
+            );
+        }
+        Icon::Grid => {
+            for dx in [-3.2, 3.2] {
+                for dy in [-3.2, 3.2] {
+                    let rect = egui::Rect::from_center_size(
+                        egui::pos2(center.x + dx, center.y + dy),
+                        egui::vec2(4.5, 4.5),
+                    );
+                    painter.rect_stroke(rect, 1.0, stroke, egui::StrokeKind::Inside);
+                }
+            }
+        }
+        Icon::Diamond => {
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(center.x, center.y - r),
+                    egui::pos2(center.x + r, center.y),
+                    egui::pos2(center.x, center.y + r),
+                    egui::pos2(center.x - r, center.y),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+        Icon::Square => {
+            let rect = egui::Rect::from_center_size(center, egui::vec2(size * 0.72, size * 0.72));
+            painter.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
+        }
+        Icon::Clock => {
+            painter.circle_stroke(center, r, stroke);
+            painter.line_segment([center, egui::pos2(center.x, center.y - r * 0.55)], stroke);
+            painter.line_segment(
+                [center, egui::pos2(center.x + r * 0.5, center.y + 1.5)],
+                stroke,
+            );
+        }
+        Icon::Bell => {
+            let body = egui::Rect::from_center_size(
+                egui::pos2(center.x, center.y + 1.0),
+                egui::vec2(10.0, 8.5),
+            );
+            painter.rect_stroke(body, 4.0, stroke, egui::StrokeKind::Inside);
+            painter.hline(center.x - 6.0..=center.x + 6.0, body.bottom(), stroke);
+            painter.circle_filled(egui::pos2(center.x, body.bottom() + 2.0), 1.3, color);
+        }
+    }
 }
 
 // ── 폼 헬퍼 ──
@@ -381,6 +640,401 @@ fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> bool {
     changed
 }
 
+// ── 네비 아이콘 · 세그먼트 · 스텝퍼 (painter 도형 — 이모지 □ 깨짐 회피) ──
+
+#[derive(Clone, Copy)]
+pub enum Icon {
+    Gear,
+    Globe,
+    Terminal,
+    Bolt,
+    Lock,
+    Key,
+    Link,
+    Grid,
+    Diamond,
+    Square,
+    Clock,
+    Bell,
+    Monitor,
+    Sun,
+    Moon,
+}
+
+fn paint_icon(p: &egui::Painter, c: egui::Pos2, sz: f32, icon: Icon, col: egui::Color32) {
+    let s = egui::Stroke::new(1.4, col);
+    let r = sz / 2.0;
+    match icon {
+        Icon::Gear => {
+            p.circle_stroke(c, r * 0.62, s);
+            p.circle_filled(c, r * 0.22, col);
+            for i in 0..6 {
+                let a = i as f32 * std::f32::consts::TAU / 6.0;
+                let (dx, dy) = (a.cos(), a.sin());
+                p.line_segment(
+                    [
+                        egui::pos2(c.x + dx * r * 0.62, c.y + dy * r * 0.62),
+                        egui::pos2(c.x + dx * r, c.y + dy * r),
+                    ],
+                    s,
+                );
+            }
+        }
+        Icon::Globe => {
+            p.circle_stroke(c, r * 0.8, s);
+            p.line_segment(
+                [
+                    egui::pos2(c.x - r * 0.8, c.y),
+                    egui::pos2(c.x + r * 0.8, c.y),
+                ],
+                s,
+            );
+            let e = egui::Rect::from_center_size(c, egui::vec2(r * 0.8, r * 1.6));
+            p.rect_stroke(e, r * 0.4, s, egui::StrokeKind::Inside);
+        }
+        Icon::Terminal => {
+            let b = egui::Rect::from_center_size(c, egui::vec2(sz, sz * 0.82));
+            p.rect_stroke(b, 2.0, s, egui::StrokeKind::Inside);
+            p.line_segment(
+                [
+                    egui::pos2(c.x - r * 0.5, c.y - r * 0.25),
+                    egui::pos2(c.x - r * 0.1, c.y + r * 0.05),
+                ],
+                s,
+            );
+            p.line_segment(
+                [
+                    egui::pos2(c.x - r * 0.1, c.y + r * 0.05),
+                    egui::pos2(c.x - r * 0.5, c.y + r * 0.35),
+                ],
+                s,
+            );
+        }
+        Icon::Bolt => {
+            p.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(c.x + r * 0.2, c.y - r),
+                    egui::pos2(c.x - r * 0.5, c.y + r * 0.15),
+                    egui::pos2(c.x, c.y + r * 0.15),
+                    egui::pos2(c.x - r * 0.2, c.y + r),
+                    egui::pos2(c.x + r * 0.5, c.y - r * 0.15),
+                    egui::pos2(c.x, c.y - r * 0.15),
+                ],
+                col,
+                egui::Stroke::NONE,
+            ));
+        }
+        Icon::Lock => {
+            let body = egui::Rect::from_min_size(
+                egui::pos2(c.x - r * 0.6, c.y - r * 0.1),
+                egui::vec2(r * 1.2, r * 0.95),
+            );
+            p.rect_stroke(body, 2.0, s, egui::StrokeKind::Inside);
+            p.add(egui::Shape::Path(egui::epaint::PathShape {
+                points: vec![
+                    egui::pos2(c.x - r * 0.35, c.y - r * 0.1),
+                    egui::pos2(c.x - r * 0.35, c.y - r * 0.55),
+                    egui::pos2(c.x + r * 0.35, c.y - r * 0.55),
+                    egui::pos2(c.x + r * 0.35, c.y - r * 0.1),
+                ],
+                closed: false,
+                fill: egui::Color32::TRANSPARENT,
+                stroke: s.into(),
+            }));
+        }
+        Icon::Key => {
+            p.circle_stroke(egui::pos2(c.x - r * 0.4, c.y - r * 0.4), r * 0.4, s);
+            p.line_segment(
+                [
+                    egui::pos2(c.x - r * 0.15, c.y - r * 0.15),
+                    egui::pos2(c.x + r * 0.7, c.y + r * 0.7),
+                ],
+                s,
+            );
+            p.line_segment(
+                [
+                    egui::pos2(c.x + r * 0.5, c.y + r * 0.5),
+                    egui::pos2(c.x + r * 0.7, c.y + r * 0.3),
+                ],
+                s,
+            );
+        }
+        Icon::Link => {
+            let a = egui::Rect::from_center_size(
+                egui::pos2(c.x - r * 0.35, c.y - r * 0.35),
+                egui::vec2(r * 0.9, r * 0.55),
+            );
+            let b = egui::Rect::from_center_size(
+                egui::pos2(c.x + r * 0.35, c.y + r * 0.35),
+                egui::vec2(r * 0.9, r * 0.55),
+            );
+            p.rect_stroke(a, r * 0.3, s, egui::StrokeKind::Inside);
+            p.rect_stroke(b, r * 0.3, s, egui::StrokeKind::Inside);
+        }
+        Icon::Grid => {
+            for (dx, dy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                let cell = egui::Rect::from_center_size(
+                    egui::pos2(c.x + dx * r * 0.42, c.y + dy * r * 0.42),
+                    egui::vec2(r * 0.55, r * 0.55),
+                );
+                p.rect_stroke(cell, 1.0, s, egui::StrokeKind::Inside);
+            }
+        }
+        Icon::Diamond => {
+            p.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(c.x, c.y - r * 0.85),
+                    egui::pos2(c.x + r * 0.85, c.y),
+                    egui::pos2(c.x, c.y + r * 0.85),
+                    egui::pos2(c.x - r * 0.85, c.y),
+                ],
+                col,
+                egui::Stroke::NONE,
+            ));
+        }
+        Icon::Square => {
+            let b = egui::Rect::from_center_size(c, egui::vec2(sz * 0.85, sz * 0.85));
+            p.rect_stroke(b, 2.0, s, egui::StrokeKind::Inside);
+        }
+        Icon::Clock => {
+            p.circle_stroke(c, r * 0.8, s);
+            p.line_segment([c, egui::pos2(c.x, c.y - r * 0.5)], s);
+            p.line_segment([c, egui::pos2(c.x + r * 0.4, c.y)], s);
+        }
+        Icon::Bell => {
+            p.add(egui::Shape::Path(egui::epaint::PathShape {
+                points: vec![
+                    egui::pos2(c.x - r * 0.6, c.y + r * 0.4),
+                    egui::pos2(c.x - r * 0.45, c.y - r * 0.2),
+                    egui::pos2(c.x, c.y - r * 0.7),
+                    egui::pos2(c.x + r * 0.45, c.y - r * 0.2),
+                    egui::pos2(c.x + r * 0.6, c.y + r * 0.4),
+                ],
+                closed: true,
+                fill: egui::Color32::TRANSPARENT,
+                stroke: s.into(),
+            }));
+            p.circle_filled(egui::pos2(c.x, c.y + r * 0.65), r * 0.14, col);
+        }
+        Icon::Monitor => {
+            let screen = egui::Rect::from_center_size(
+                egui::pos2(c.x, c.y - r * 0.15),
+                egui::vec2(sz, sz * 0.7),
+            );
+            p.rect_stroke(screen, 2.0, s, egui::StrokeKind::Inside);
+            p.line_segment(
+                [
+                    egui::pos2(c.x - r * 0.4, c.y + r * 0.85),
+                    egui::pos2(c.x + r * 0.4, c.y + r * 0.85),
+                ],
+                s,
+            );
+            p.line_segment(
+                [
+                    egui::pos2(c.x, screen.bottom()),
+                    egui::pos2(c.x, c.y + r * 0.85),
+                ],
+                s,
+            );
+        }
+        Icon::Sun => {
+            p.circle_filled(c, r * 0.42, col);
+            for i in 0..8 {
+                let a = i as f32 * std::f32::consts::TAU / 8.0;
+                let (dx, dy) = (a.cos(), a.sin());
+                p.line_segment(
+                    [
+                        egui::pos2(c.x + dx * r * 0.62, c.y + dy * r * 0.62),
+                        egui::pos2(c.x + dx * r, c.y + dy * r),
+                    ],
+                    s,
+                );
+            }
+        }
+        Icon::Moon => {
+            p.circle_filled(c, r * 0.8, col);
+            p.circle_filled(
+                egui::pos2(c.x + r * 0.42, c.y - r * 0.25),
+                r * 0.72,
+                egui::Color32::from_rgb(0x22, 0x22, 0x2a),
+            );
+        }
+    }
+}
+
+/// 세그먼트 토글 (테마: 시스템/라이트/다크) — 아이콘 + 라벨, 좌→우 고정 순서, 구분선,
+/// 선택 accent-soft. painter로 직접 그려 layout(right_to_left) 영향을 안 받는다.
+/// 반환: 변경 여부.
+fn segmented(ui: &mut egui::Ui, sel: &mut Theme, items: &[(Theme, Icon, String)]) -> bool {
+    let font = egui::FontId::proportional(12.5);
+    let h = 30.0;
+    let icon_sz = 14.0;
+    let gap = 6.0;
+    let pad = 12.0;
+    let hair = ui.visuals().widgets.noninteractive.bg_stroke.color;
+    let panel2 = ui.visuals().widgets.inactive.bg_fill;
+    let accent = ui.visuals().selection.bg_fill;
+    let text_w: Vec<f32> = items
+        .iter()
+        .map(|(_, _, l)| {
+            ui.painter()
+                .layout_no_wrap(l.clone(), font.clone(), accent)
+                .size()
+                .x
+        })
+        .collect();
+    let widths: Vec<f32> = text_w
+        .iter()
+        .map(|w| pad + icon_sz + gap + w + pad)
+        .collect();
+    let total: f32 = widths.iter().sum();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(total, h), egui::Sense::hover());
+    ui.painter().rect(
+        rect,
+        7.0,
+        panel2,
+        egui::Stroke::new(1.0, hair),
+        egui::StrokeKind::Inside,
+    );
+    let mut changed = false;
+    let mut x = rect.left();
+    for (i, (theme, icon, label)) in items.iter().enumerate() {
+        let seg = egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(widths[i], h));
+        let on = *sel == *theme;
+        if on {
+            ui.painter()
+                .rect_filled(seg.shrink(2.0), 5.0, accent.gamma_multiply(0.15));
+        }
+        let col = if on {
+            accent
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        let cy = seg.center().y;
+        paint_icon(
+            ui.painter(),
+            egui::pos2(seg.left() + pad + icon_sz / 2.0, cy),
+            icon_sz,
+            *icon,
+            col,
+        );
+        ui.painter().text(
+            egui::pos2(seg.left() + pad + icon_sz + gap, cy),
+            egui::Align2::LEFT_CENTER,
+            label,
+            font.clone(),
+            col,
+        );
+        if i < items.len() - 1 {
+            ui.painter().vline(
+                seg.right(),
+                (rect.top() + 5.0)..=(rect.bottom() - 5.0),
+                egui::Stroke::new(1.0, hair),
+            );
+        }
+        let r = ui.interact(seg, ui.id().with(("seg", i)), egui::Sense::click());
+        if r.clicked() && !on {
+            *sel = *theme;
+            changed = true;
+        }
+        x += widths[i];
+    }
+    changed
+}
+
+/// 사용자 입력 스텝퍼 — [값] │ [−] │ [+], 경계선 박스. 반환: 변경 여부.
+fn stepper(ui: &mut egui::Ui, value: &mut i64, step: i64, min: i64, max: i64, unit: &str) -> bool {
+    let h = 30.0;
+    let btn_w = 30.0;
+    let val_w = 70.0;
+    let total = val_w + btn_w * 2.0;
+    let hair = ui.visuals().widgets.noninteractive.bg_stroke.color;
+    let panel2 = ui.visuals().widgets.inactive.bg_fill;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(total, h), egui::Sense::hover());
+    ui.painter().rect(
+        rect,
+        6.0,
+        panel2,
+        egui::Stroke::new(1.0, hair),
+        egui::StrokeKind::Inside,
+    );
+    let shown = if unit.is_empty() {
+        comma(*value)
+    } else {
+        format!("{} {unit}", comma(*value))
+    };
+    ui.painter().text(
+        egui::pos2(rect.left() + val_w / 2.0, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        shown,
+        egui::FontId::monospace(13.0),
+        ui.visuals().text_color(),
+    );
+    let x1 = rect.left() + val_w;
+    let x2 = x1 + btn_w;
+    ui.painter()
+        .vline(x1, rect.y_range(), egui::Stroke::new(1.0, hair));
+    ui.painter()
+        .vline(x2, rect.y_range(), egui::Stroke::new(1.0, hair));
+    let minus = egui::Rect::from_min_size(egui::pos2(x1, rect.top()), egui::vec2(btn_w, h));
+    let plus = egui::Rect::from_min_size(egui::pos2(x2, rect.top()), egui::vec2(btn_w, h));
+    let mr = ui.interact(
+        minus,
+        ui.id().with(("minus", min, max, unit)),
+        egui::Sense::click(),
+    );
+    let pr = ui.interact(
+        plus,
+        ui.id().with(("plus", min, max, unit)),
+        egui::Sense::click(),
+    );
+    if mr.hovered() {
+        ui.painter()
+            .rect_filled(minus, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    if pr.hovered() {
+        ui.painter()
+            .rect_filled(plus, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    let fc = ui.visuals().weak_text_color();
+    ui.painter().text(
+        minus.center(),
+        egui::Align2::CENTER_CENTER,
+        "−",
+        egui::FontId::proportional(15.0),
+        fc,
+    );
+    ui.painter().text(
+        plus.center(),
+        egui::Align2::CENTER_CENTER,
+        "+",
+        egui::FontId::proportional(15.0),
+        fc,
+    );
+    let mut changed = false;
+    if mr.clicked() {
+        *value = (*value - step).clamp(min, max);
+        changed = true;
+    }
+    if pr.clicked() {
+        *value = (*value + step).clamp(min, max);
+        changed = true;
+    }
+    changed
+}
+
+fn comma(n: i64) -> String {
+    let s = n.abs().to_string();
+    let mut out = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if n < 0 { format!("-{out}") } else { out }
+}
+
 // ── 카테고리 페이지 ──
 
 fn general_page(
@@ -395,15 +1049,24 @@ fn general_page(
         &catalog.t("settings.theme", &[]),
         Some(&catalog.t("settings.theme.hint", &[])),
         |ui| {
-            for (theme, key) in [
-                (Theme::Dark, "settings.theme.dark"),
-                (Theme::Light, "settings.theme.light"),
-                (Theme::System, "settings.theme.system"),
-            ] {
-                *changed |= ui
-                    .selectable_value(&mut config.ui.theme, theme, catalog.t(key, &[]))
-                    .changed();
-            }
+            let items = [
+                (
+                    Theme::System,
+                    Icon::Monitor,
+                    catalog.t("settings.theme.system", &[]),
+                ),
+                (
+                    Theme::Light,
+                    Icon::Sun,
+                    catalog.t("settings.theme.light", &[]),
+                ),
+                (
+                    Theme::Dark,
+                    Icon::Moon,
+                    catalog.t("settings.theme.dark", &[]),
+                ),
+            ];
+            *changed |= segmented(ui, &mut config.ui.theme, &items);
         },
     );
     row(
@@ -472,26 +1135,22 @@ fn terminal_page(
 ) {
     section(ui, &catalog.t("settings.terminal", &[]));
     row(ui, &catalog.t("settings.font_size", &[]), None, |ui| {
-        *changed |= ui
-            .add(
-                egui::DragValue::new(&mut config.terminal.font_size)
-                    .range(8.0..=32.0)
-                    .speed(0.2),
-            )
-            .changed();
+        let mut v = config.terminal.font_size as i64;
+        if stepper(ui, &mut v, 1, 8, 32, "") {
+            config.terminal.font_size = v as f32;
+            *changed = true;
+        }
     });
     row(
         ui,
         &catalog.t("settings.scrollback_lines", &[]),
         Some(&catalog.t("settings.scrollback.hint", &[])),
         |ui| {
-            *changed |= ui
-                .add(
-                    egui::DragValue::new(&mut config.terminal.scrollback_lines)
-                        .range(1_000..=100_000)
-                        .speed(50),
-                )
-                .changed();
+            let mut v = config.terminal.scrollback_lines as i64;
+            if stepper(ui, &mut v, 500, 1_000, 100_000, "") {
+                config.terminal.scrollback_lines = v as u32;
+                *changed = true;
+            }
         },
     );
 }
@@ -508,10 +1167,11 @@ fn performance_page(
         &catalog.t("settings.output_batch_ms", &[]),
         Some(&catalog.t("settings.output_batch.hint", &[])),
         |ui| {
-            ui.weak(catalog.t("settings.restart_required", &[]));
-            *changed |= ui
-                .add(egui::DragValue::new(&mut config.performance.output_batch_ms).range(16..=50))
-                .changed();
+            let mut v = config.performance.output_batch_ms as i64;
+            if stepper(ui, &mut v, 1, 16, 50, "ms") {
+                config.performance.output_batch_ms = v as u64;
+                *changed = true;
+            }
         },
     );
 }

@@ -213,7 +213,7 @@ pub fn draw(
     }
 }
 
-fn terminal_focus_lock_filter() -> egui::EventFilter {
+pub fn terminal_focus_lock_filter() -> egui::EventFilter {
     egui::EventFilter {
         tab: true,
         horizontal_arrows: true,

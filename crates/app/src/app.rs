@@ -370,6 +370,12 @@ pub struct App {
     workspaces: Vec<crate::storage::WorkspaceRow>,
     /// 이름 편집 중인 워크스페이스 (id, 편집 버퍼) — #3 이름 변경 UI 상태.
     ws_name_edit: Option<(String, String)>,
+    /// 옵션2: 활성 세션별 에이전트 transcript 활동(working/idle) — 타이머로 갱신해
+    /// 레일 상태에 반영한다(regex 위 우선). 승인/오류/완료는 regex 우선.
+    agent_activity:
+        std::collections::HashMap<runtime::SessionId, crate::agent_transcript::AgentActivity>,
+    /// 에이전트 감지(ps/lsof+파싱) 스로틀 타이머 — 매 프레임은 부담이라 주기 갱신.
+    last_agent_poll: std::time::Instant,
     /// 알림 클릭으로 다른 workspace 전환 후, mux 재구성되면 이동할 (workspace, session).
     pending_focus: Option<(String, runtime::SessionId)>,
     /// 전환으로 background 정리 중인 옛 워커 shutdown 스레드들 (workspace_id, handle).
@@ -473,6 +479,8 @@ impl App {
             redaction,
             workspaces: Vec::new(),
             ws_name_edit: None,
+            agent_activity: std::collections::HashMap::new(),
+            last_agent_poll: std::time::Instant::now(),
             pending_focus: None,
             pending_shutdowns: Vec::new(),
             remote: None,
@@ -925,7 +933,11 @@ impl App {
                         id: ws.id.clone(),
                         name: Self::workspace_display_name(ws),
                         state: ui::activity::ActivityWorkspaceState::Active,
-                        session_count: self.active.workspace_ui.session_entries(&self.i18n).len(),
+                        session_count: self
+                            .active
+                            .workspace_ui
+                            .session_entries(&self.i18n, &self.agent_activity)
+                            .len(),
                         pending_events: self.active.pending_events.len(),
                         input_pressure: self.active.input_pressure.clone(),
                         backgrounded_for_secs: None,
@@ -1344,10 +1356,34 @@ impl eframe::App for App {
                 // 추가하면 패널 여백 탓에 끝까지 안 닿는 짧은 선이 겹쳤다(#65 사용자).
             });
 
+        // 옵션2: 활성 세션의 에이전트 transcript 상태를 주기적으로 갱신한다. ps/lsof +
+        // 파싱은 매 프레임엔 부담이라 2초 스로틀. 세션별 shell pid는 리소스 모니터가 이미
+        // 수집한 session_resource_usage에서 재사용한다.
+        if self.last_agent_poll.elapsed() >= std::time::Duration::from_millis(2000) {
+            self.last_agent_poll = std::time::Instant::now();
+            let sessions: Vec<(runtime::SessionId, u32)> = self
+                .active
+                .session_resource_usage
+                .iter()
+                .filter_map(|r| r.pid.map(|pid| (r.session, pid)))
+                .collect();
+            let bindings = crate::agent_detect::detect(&sessions);
+            self.agent_activity = bindings
+                .iter()
+                .filter_map(|(sid, b)| crate::agent_detect::activity(b).map(|a| (*sid, a)))
+                .collect();
+            // 창이 유휴여도 다음 폴링이 돌도록 재그리기 예약.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(2000));
+        }
+
         // 폴더 트리 사이드바 (FT-1) — CentralPanel보다 먼저 배치해야 한다 (§9-1).
         // OFF(None)면 Panel 자체를 만들지 않는다 (§6 리소스 0).
         if self.file_tree.is_some() {
-            let sessions = self.active.workspace_ui.session_entries(&text);
+            let sessions = self
+                .active
+                .workspace_ui
+                .session_entries(&text, &self.agent_activity);
             let sidebar_action = self
                 .file_tree
                 .as_mut()

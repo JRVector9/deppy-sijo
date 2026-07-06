@@ -47,6 +47,15 @@ pub fn detect(sessions: &[(SessionId, u32)]) -> HashMap<SessionId, AgentBinding>
     out
 }
 
+/// 바인딩된 transcript를 파싱해 현재 활동(working/idle)을 읽는다.
+pub fn activity(binding: &AgentBinding) -> Option<agent_transcript::AgentActivity> {
+    let state = match binding.kind {
+        AgentKind::Claude => agent_transcript::parse_claude(&binding.transcript),
+        AgentKind::Codex => agent_transcript::parse_codex(&binding.transcript),
+    }?;
+    Some(state.activity)
+}
+
 /// 셸 pid의 자손 중 claude/codex를 찾아 transcript까지 바인딩한다.
 fn find_agent(shell_pid: u32, rows: &[ProcRow]) -> Option<AgentBinding> {
     let descendants = descendant_pids(shell_pid, rows);

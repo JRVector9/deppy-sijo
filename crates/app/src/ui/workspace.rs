@@ -1120,6 +1120,10 @@ impl WorkspaceUi {
     pub fn session_entries(
         &self,
         catalog: &i18n::Catalog,
+        agent_activity: &std::collections::HashMap<
+            runtime::SessionId,
+            crate::agent_transcript::AgentActivity,
+        >,
     ) -> Vec<crate::ui::file_tree::SessionEntry> {
         let Some(mux) = &self.mux else {
             return Vec::new();
@@ -1128,10 +1132,16 @@ impl WorkspaceUi {
             .iter()
             .flat_map(|tab| tab.panes.iter().map(move |pane| (tab, pane)))
             .map(|(tab, pane)| {
-                let status = pane
+                let regex_status = pane
                     .session_id
                     .and_then(|s| self.sessions.get(&s))
                     .and_then(|v| v.status);
+                // transcript 기반 활동(옵션2)이 있으면 regex 상태를 덮어쓴다 — 단 '주의'
+                // 상태(승인/오류/완료)는 transcript에 없는 신호라 regex를 우선한다.
+                let activity = pane
+                    .session_id
+                    .and_then(|s| agent_activity.get(&s).copied());
+                let status = merge_agent_status(regex_status, activity);
                 let summary = pane
                     .session_id
                     .and_then(|s| self.sessions.get(&s))
@@ -1310,6 +1320,25 @@ fn is_clipboard_paste_shortcut(event: &egui::Event) -> bool {
         modifiers.command && !modifiers.ctrl
     } else {
         modifiers.ctrl && modifiers.shift
+    }
+}
+
+/// regex/휴리스틱 상태와 transcript 기반 활동(옵션2)을 병합한다. 승인/오류/완료는
+/// transcript에 없는 '주의' 신호라 regex를 우선하고, 그 외(실행/대기/유휴/미보고)는
+/// 더 정확한 transcript 활동으로 덮어쓴다.
+fn merge_agent_status(
+    regex: Option<runtime::SessionStatus>,
+    activity: Option<crate::agent_transcript::AgentActivity>,
+) -> Option<runtime::SessionStatus> {
+    use crate::agent_transcript::AgentActivity;
+    use runtime::SessionStatus as S;
+    if matches!(regex, Some(S::NeedsApproval | S::Error | S::Done)) {
+        return regex;
+    }
+    match activity {
+        Some(AgentActivity::Working) => Some(S::Running),
+        Some(AgentActivity::Idle) => Some(S::Idle),
+        None => regex,
     }
 }
 

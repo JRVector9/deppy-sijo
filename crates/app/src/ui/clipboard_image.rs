@@ -2,11 +2,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-pub fn paste_clipboard_image_to_png() -> anyhow::Result<Option<PathBuf>> {
-    let mut clipboard = arboard::Clipboard::new().context("clipboard 열기 실패")?;
-    paste_clipboard_image_to_png_with(&mut clipboard)
-}
-
 pub fn paste_clipboard_paths_or_image_to_paths() -> anyhow::Result<Option<Vec<PathBuf>>> {
     let mut clipboard = arboard::Clipboard::new().context("clipboard 열기 실패")?;
     if let Some(paths) = clipboard_file_list(&mut clipboard)? {
@@ -15,9 +10,7 @@ pub fn paste_clipboard_paths_or_image_to_paths() -> anyhow::Result<Option<Vec<Pa
     paste_clipboard_image_to_png_with(&mut clipboard).map(|path| path.map(|path| vec![path]))
 }
 
-fn clipboard_file_list(
-    clipboard: &mut arboard::Clipboard,
-) -> anyhow::Result<Option<Vec<PathBuf>>> {
+fn clipboard_file_list(clipboard: &mut arboard::Clipboard) -> anyhow::Result<Option<Vec<PathBuf>>> {
     match clipboard.get().file_list() {
         Ok(paths) => Ok((!paths.is_empty()).then_some(paths)),
         Err(arboard::Error::ContentNotAvailable)

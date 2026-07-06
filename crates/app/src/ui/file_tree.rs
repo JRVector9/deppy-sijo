@@ -816,7 +816,9 @@ impl FileTreeUi {
         let display_root = self.display_root();
         let (header, root_drop) = ui.dnd_drop_zone::<PathBuf, ()>(egui::Frame::default(), |ui| {
             ui.horizontal(|ui| {
-                ui.label("📁");
+                // 루트 폴더 아이콘 — 도형 (이모지 □ 깨짐 회피)
+                let (fr, _) = ui.allocate_exact_size(egui::vec2(18.0, 16.0), egui::Sense::hover());
+                paint_folder(ui.painter(), fr.center(), ui.visuals().weak_text_color());
                 // 우측 컨트롤(접기/새로고침/숨김) 폭을 예약 — 긴 경로가 버튼을
                 // 밀어내지 않게 truncate 라벨의 최대폭을 제한한다 (codex P2).
                 ui.scope(|ui| {
@@ -984,17 +986,29 @@ impl FileTreeUi {
                         response,
                     } = ui.dnd_drag_source(drag_id, row.path.clone(), |ui| {
                         ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
                             ui.add_space(row.depth as f32 * 12.0);
-                            // 디자인 (2026-07-05): 캐럿+아이콘+이름, 숨김 항목은 흐리게
-                            let text = if row.is_dir {
-                                let caret = if row.expanded { "▼" } else { "▶" };
-                                let icon = if row.expanded { "📂" } else { "📁" };
-                                format!("{caret} {icon} {}", row.name)
+                            // 캐럿+폴더/파일 아이콘을 도형으로 (이모지 □ 깨짐 회피, 목업 §트리)
+                            let icon_col = ui.visuals().weak_text_color();
+                            let carve = ui.visuals().extreme_bg_color;
+                            let (cr, _) = ui
+                                .allocate_exact_size(egui::vec2(10.0, 16.0), egui::Sense::hover());
+                            if row.is_dir {
+                                paint_caret(ui.painter(), cr.center(), row.expanded, icon_col);
+                            }
+                            let (ir, _) = ui
+                                .allocate_exact_size(egui::vec2(17.0, 16.0), egui::Sense::hover());
+                            if row.is_dir {
+                                paint_folder(ui.painter(), ir.center(), icon_col);
                             } else {
-                                // 캐럿 자리 공백으로 들여쓰기 정렬
-                                format!("\u{2003} {} {}", file_icon(&row.name), row.name)
-                            };
-                            let mut rich = egui::RichText::new(text);
+                                let fc = if row.name.starts_with('.') {
+                                    ui.visuals().weak_text_color()
+                                } else {
+                                    egui::Color32::from_rgb(0xc8, 0xcc, 0xd2)
+                                };
+                                paint_file(ui.painter(), ir.center(), fc, carve);
+                            }
+                            let mut rich = egui::RichText::new(&row.name);
                             if row.name.starts_with('.') {
                                 rich = rich.weak().italics();
                             }
@@ -1739,16 +1753,6 @@ fn has_hidden_component(root: &std::path::Path, path: &std::path::Path) -> bool 
     })
 }
 
-/// 파일 아이콘 — 확장자 몇 가지만 구분 (이미지/문서/그 외).
-fn file_icon(name: &str) -> &'static str {
-    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    match ext.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "heic" => "🖼",
-        "md" | "markdown" => "📘",
-        _ => "📄",
-    }
-}
-
 fn relevant_fs_event(kind: &notify::EventKind) -> bool {
     !matches!(kind, notify::EventKind::Access(_))
 }
@@ -1907,6 +1911,67 @@ pub(crate) fn paint_type_glyph(
         ]
     };
     painter.add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
+}
+
+/// 트리 확장 캐럿 (▸ 접힘 / ▾ 펼침) — 작은 삼각형 (이모지 □ 깨짐 회피).
+fn paint_caret(p: &egui::Painter, c: egui::Pos2, expanded: bool, col: egui::Color32) {
+    let d = 3.0;
+    let pts = if expanded {
+        vec![
+            egui::pos2(c.x - d, c.y - d * 0.6),
+            egui::pos2(c.x + d, c.y - d * 0.6),
+            egui::pos2(c.x, c.y + d * 0.8),
+        ]
+    } else {
+        vec![
+            egui::pos2(c.x - d * 0.6, c.y - d),
+            egui::pos2(c.x - d * 0.6, c.y + d),
+            egui::pos2(c.x + d * 0.8, c.y),
+        ]
+    };
+    p.add(egui::Shape::convex_polygon(pts, col, egui::Stroke::NONE));
+}
+
+/// 폴더 아이콘 — 탭 + 본체 (채움).
+fn paint_folder(p: &egui::Painter, c: egui::Pos2, col: egui::Color32) {
+    let w = 15.0;
+    let h = 11.0;
+    let body = egui::Rect::from_center_size(egui::pos2(c.x, c.y + 1.0), egui::vec2(w, h));
+    let tab = egui::Rect::from_min_size(
+        egui::pos2(body.left(), body.top() - 3.0),
+        egui::vec2(w * 0.45, 4.0),
+    );
+    p.rect_filled(tab, 1.5, col);
+    p.rect_filled(body, 2.0, col);
+}
+
+/// 파일 아이콘 — 문서(접힌 모서리). `carve`는 접힌 모서리를 파낼 배경색.
+fn paint_file(p: &egui::Painter, c: egui::Pos2, col: egui::Color32, carve: egui::Color32) {
+    let w = 11.0;
+    let h = 14.0;
+    let fold = 4.0;
+    let l = c.x - w / 2.0;
+    let r = c.x + w / 2.0;
+    let top = c.y - h / 2.0;
+    let bot = c.y + h / 2.0;
+    let body = vec![
+        egui::pos2(l, top),
+        egui::pos2(r - fold, top),
+        egui::pos2(r, top + fold),
+        egui::pos2(r, bot),
+        egui::pos2(l, bot),
+    ];
+    p.add(egui::Shape::convex_polygon(body, col, egui::Stroke::NONE));
+    let corner = vec![
+        egui::pos2(r - fold, top),
+        egui::pos2(r - fold, top + fold),
+        egui::pos2(r, top + fold),
+    ];
+    p.add(egui::Shape::convex_polygon(
+        corner,
+        carve,
+        egui::Stroke::NONE,
+    ));
 }
 
 /// 세션 상태 → 상태 점 색 (목업 상태 색과 일치). 유휴(None)는 흐린 회색.

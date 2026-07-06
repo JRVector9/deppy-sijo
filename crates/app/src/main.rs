@@ -5,6 +5,7 @@ mod fonts;
 mod paths;
 mod perf;
 mod storage;
+mod theme;
 mod ui;
 
 fn main() -> anyhow::Result<()> {
@@ -74,6 +75,9 @@ fn main() -> anyhow::Result<()> {
         },
         Box::new(move |cc| {
             // 저장된 테마를 시작 시점에 적용
+            // 목업 팔레트(시안 액센트 + 쿨그레이)를 테마별로 심는다 — set_theme보다 먼저
+            // 등록해야 프리퍼런스 적용 시 커스텀 색이 선택된다.
+            theme::install_palette(&cc.egui_ctx);
             cc.egui_ctx.set_theme(config.ui.theme.to_egui());
             fonts::install_cjk_fallback(&cc.egui_ctx);
             install_macos_menu();

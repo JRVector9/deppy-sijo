@@ -60,15 +60,20 @@ fn map_key(key: egui::Key, modifiers: &egui::Modifiers) -> Option<Vec<u8>> {
     {
         return Some(vec![byte]);
     }
+    if key == egui::Key::Tab && modifiers.shift {
+        return Some(b"\x1b[Z".to_vec());
+    }
+    if let Some(bytes) = arrow_key_bytes(key, modifiers) {
+        return Some(bytes);
+    }
+    if let Some(bytes) = function_key_bytes(key) {
+        return Some(bytes.to_vec());
+    }
     let bytes: &[u8] = match key {
         egui::Key::Enter => b"\r",
         egui::Key::Tab => b"\t",
         egui::Key::Backspace => b"\x7f",
         egui::Key::Escape => b"\x1b",
-        egui::Key::ArrowUp => b"\x1b[A",
-        egui::Key::ArrowDown => b"\x1b[B",
-        egui::Key::ArrowRight => b"\x1b[C",
-        egui::Key::ArrowLeft => b"\x1b[D",
         egui::Key::Home => b"\x1b[H",
         egui::Key::End => b"\x1b[F",
         egui::Key::PageUp => b"\x1b[5~",
@@ -78,6 +83,52 @@ fn map_key(key: egui::Key, modifiers: &egui::Modifiers) -> Option<Vec<u8>> {
         _ => return None,
     };
     Some(bytes.to_vec())
+}
+
+fn arrow_key_bytes(key: egui::Key, modifiers: &egui::Modifiers) -> Option<Vec<u8>> {
+    let final_byte = match key {
+        egui::Key::ArrowUp => b'A',
+        egui::Key::ArrowDown => b'B',
+        egui::Key::ArrowRight => b'C',
+        egui::Key::ArrowLeft => b'D',
+        _ => return None,
+    };
+    let Some(modifier) = csi_modifier(modifiers) else {
+        return Some(vec![b'\x1b', b'[', final_byte]);
+    };
+    Some(format!("\x1b[1;{modifier}{}", final_byte as char).into_bytes())
+}
+
+fn csi_modifier(modifiers: &egui::Modifiers) -> Option<u8> {
+    let mut value = 1;
+    if modifiers.shift {
+        value += 1;
+    }
+    if modifiers.alt {
+        value += 2;
+    }
+    if modifiers.ctrl {
+        value += 4;
+    }
+    (value != 1).then_some(value)
+}
+
+fn function_key_bytes(key: egui::Key) -> Option<&'static [u8]> {
+    match key {
+        egui::Key::F1 => Some(b"\x1bOP"),
+        egui::Key::F2 => Some(b"\x1bOQ"),
+        egui::Key::F3 => Some(b"\x1bOR"),
+        egui::Key::F4 => Some(b"\x1bOS"),
+        egui::Key::F5 => Some(b"\x1b[15~"),
+        egui::Key::F6 => Some(b"\x1b[17~"),
+        egui::Key::F7 => Some(b"\x1b[18~"),
+        egui::Key::F8 => Some(b"\x1b[19~"),
+        egui::Key::F9 => Some(b"\x1b[20~"),
+        egui::Key::F10 => Some(b"\x1b[21~"),
+        egui::Key::F11 => Some(b"\x1b[23~"),
+        egui::Key::F12 => Some(b"\x1b[24~"),
+        _ => None,
+    }
 }
 
 fn ctrl_byte(key: egui::Key) -> Option<u8> {
@@ -125,6 +176,59 @@ mod tests {
         assert_eq!(
             map_event(&key_event(egui::Key::ArrowUp, NONE), false, &NONE),
             Some(b"\x1b[A".to_vec())
+        );
+    }
+
+    #[test]
+    fn tui_navigation_확장키_매핑() {
+        let shift = egui::Modifiers::SHIFT;
+        let ctrl = egui::Modifiers::CTRL;
+        let alt = egui::Modifiers::ALT;
+        let ctrl_shift = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
+
+        assert_eq!(
+            map_event(&key_event(egui::Key::Tab, shift), false, &shift),
+            Some(b"\x1b[Z".to_vec())
+        );
+        assert_eq!(
+            map_event(&key_event(egui::Key::ArrowUp, shift), false, &shift),
+            Some(b"\x1b[1;2A".to_vec())
+        );
+        assert_eq!(
+            map_event(&key_event(egui::Key::ArrowRight, alt), false, &alt),
+            Some(b"\x1b[1;3C".to_vec())
+        );
+        assert_eq!(
+            map_event(
+                &key_event(egui::Key::ArrowDown, ctrl_shift),
+                false,
+                &ctrl_shift
+            ),
+            Some(b"\x1b[1;6B".to_vec())
+        );
+        assert_eq!(
+            map_event(&key_event(egui::Key::ArrowLeft, ctrl), false, &ctrl),
+            Some(b"\x1b[1;5D".to_vec())
+        );
+    }
+
+    #[test]
+    fn function_keys_f1_to_f12_mapping() {
+        assert_eq!(
+            map_event(&key_event(egui::Key::F1, NONE), false, &NONE),
+            Some(b"\x1bOP".to_vec())
+        );
+        assert_eq!(
+            map_event(&key_event(egui::Key::F4, NONE), false, &NONE),
+            Some(b"\x1bOS".to_vec())
+        );
+        assert_eq!(
+            map_event(&key_event(egui::Key::F5, NONE), false, &NONE),
+            Some(b"\x1b[15~".to_vec())
+        );
+        assert_eq!(
+            map_event(&key_event(egui::Key::F12, NONE), false, &NONE),
+            Some(b"\x1b[24~".to_vec())
         );
     }
 

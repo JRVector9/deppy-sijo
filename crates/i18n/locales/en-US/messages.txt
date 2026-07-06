@@ -41,6 +41,8 @@ settings.theme.hint = Chrome only — terminal panes stay dark
 settings.file_tree.hint = OFF creates no panel — zero resource
 settings.auto_resume = Auto-resume agent sessions
 settings.auto_resume.hint = Re-run claude/codex resume on restart to continue the previous session
+settings.status_hooks = Agent status hooks
+settings.status_hooks.hint = Install hooks in claude/codex to reliably detect approval/input waits (off = screen guess only)
 settings.locale.hint = Korean · English · Japanese · Chinese Simplified/Traditional (bundled)
 settings.scrollback.hint = Hidden sessions auto-reduce to 1,000 lines
 settings.output_batch.hint = 0/1 normalize to 16ms (idle repaint guard)

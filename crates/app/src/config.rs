@@ -26,6 +26,10 @@ pub struct UiConfig {
     /// OFF면 자동 명령 주입 안 함(사용자가 수동으로 이어감).
     #[serde(default = "default_true")]
     pub auto_resume_agents: bool,
+    /// 에이전트 상태 hook 전역 설치(옵션2 needsInput). ON이면 claude/codex 설정에
+    /// deppy hook을 넣어 승인/입력 대기를 정확히 감지. OFF면 제거(regex fallback만).
+    #[serde(default = "default_true")]
+    pub agent_status_hooks: bool,
     /// 다음 실행 때 다시 열 마지막 활성 workspace. 삭제되었거나 없으면 default workspace로 대체.
     pub last_workspace_id: Option<String>,
 }
@@ -40,6 +44,7 @@ impl Default for UiConfig {
             theme: Theme::default(),
             file_tree_enabled: true,
             auto_resume_agents: true,
+            agent_status_hooks: true,
             last_workspace_id: None,
         }
     }

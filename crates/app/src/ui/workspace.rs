@@ -1170,6 +1170,7 @@ impl WorkspaceUi {
             runtime::SessionId,
             crate::agent_transcript::AgentActivity,
         >,
+        needs_input: &std::collections::HashSet<runtime::SessionId>,
     ) -> Vec<crate::ui::file_tree::SessionEntry> {
         let Some(mux) = &self.mux else {
             return Vec::new();
@@ -1187,7 +1188,9 @@ impl WorkspaceUi {
                 let activity = pane
                     .session_id
                     .and_then(|s| agent_activity.get(&s).copied());
-                let status = merge_agent_status(regex_status, activity);
+                // hook이 보고한 needsInput = 가장 신뢰도 높은 승인 신호(최우선).
+                let waiting = pane.session_id.is_some_and(|s| needs_input.contains(&s));
+                let status = merge_agent_status(regex_status, activity, waiting);
                 let summary = pane
                     .session_id
                     .and_then(|s| self.sessions.get(&s))
@@ -1408,9 +1411,15 @@ fn word_range_at(
 fn merge_agent_status(
     regex: Option<runtime::SessionStatus>,
     activity: Option<crate::agent_transcript::AgentActivity>,
+    needs_input: bool,
 ) -> Option<runtime::SessionStatus> {
     use crate::agent_transcript::AgentActivity;
     use runtime::SessionStatus as S;
+    // hook needsInput은 가장 신뢰도 높은 승인 대기 신호 — 단, transcript가 Working이면
+    // 에이전트가 재개된 것이라(clear hook 지연 대비) 대기로 보지 않는다.
+    if needs_input && activity != Some(AgentActivity::Working) {
+        return Some(S::NeedsApproval);
+    }
     if matches!(regex, Some(S::NeedsApproval | S::Error | S::Done)) {
         return regex;
     }

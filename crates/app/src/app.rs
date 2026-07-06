@@ -383,6 +383,8 @@ pub struct App {
     last_activity_poll: std::time::Instant,
     /// 마지막으로 DB에 저장한 pane_id → row — 차등 upsert/delete 및 churn 방지용.
     persisted_agents: std::collections::HashMap<String, crate::storage::AgentSessionRow>,
+    /// hook이 보고한 입력 대기(needsInput) 세션들 — DB에서 주기적으로 읽어 레일 주황 반영.
+    agent_needs_input: std::collections::HashSet<runtime::SessionId>,
     /// 복원용으로 로드한 (pane_id → 저장된 에이전트 세션). 워크스페이스 활성 시 로드.
     restore_agents: std::collections::HashMap<String, crate::storage::AgentSessionRow>,
     /// restore_agents를 로드한 워크스페이스 id (전환 시 재로드 판정).
@@ -497,6 +499,7 @@ impl App {
             last_binding_poll: std::time::Instant::now(),
             last_activity_poll: std::time::Instant::now(),
             persisted_agents: std::collections::HashMap::new(),
+            agent_needs_input: std::collections::HashSet::new(),
             restore_agents: std::collections::HashMap::new(),
             restore_loaded_for: None,
             resumed_panes: std::collections::HashSet::new(),
@@ -515,6 +518,8 @@ impl App {
         if app.config.ui.file_tree_enabled {
             app.file_tree = Some(app.make_file_tree());
         }
+        // 에이전트 상태 hook 전역 설치/해제 (설정 토글에 따라, best-effort).
+        app.sync_agent_hooks();
         // 시작 시 config가 remote를 켜 뒀으면 best-effort로 기동한다 (실패는 log + settings 표시,
         // config는 그대로 두어 다음 실행에 재시도). 자동 시작은 config 저장을 유발하지 않는다.
         if app.config.remote.tls_enabled {
@@ -620,6 +625,32 @@ impl App {
         }
     }
 
+    /// hook이 보고한 입력 대기 세션(needsInput)을 DB에서 읽어 갱신한다. session_key는
+    /// DEPPY_SESSION_ID(=SessionId u64 문자열).
+    fn refresh_needs_input(&mut self) {
+        self.agent_needs_input = self
+            .db
+            .list_waiting_sessions()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|k| k.parse::<u64>().ok().map(runtime::SessionId))
+            .collect();
+    }
+
+    /// 에이전트 상태 hook을 설정 토글에 맞춰 전역 설치/해제한다(옵션2 needsInput).
+    /// best-effort — 실패해도 앱은 정상 동작(regex fallback). claude만 현재 지원.
+    fn sync_agent_hooks(&self) {
+        let result = if self.config.ui.agent_status_hooks {
+            crate::ui::agents::mcp_proxy_bin()
+                .and_then(|bin| crate::agent_hooks::install_claude(&self.db_path, &bin))
+        } else {
+            crate::agent_hooks::uninstall_claude()
+        };
+        if let Err(e) = result {
+            tracing::warn!("에이전트 상태 hook 동기화 실패: {e:#}");
+        }
+    }
+
     /// 앱 데이터 디렉터리 (db_path = `<data>/metadata.sqlite3` → parent). remote cert/known_hosts의 기준.
     fn data_dir(&self) -> &std::path::Path {
         self.db_path
@@ -670,6 +701,8 @@ impl App {
                 self.remote = Some(state);
                 self.remote_error = None;
                 self.config.remote.tls_enabled = true;
+                // 에이전트 상태 hook 토글 반영(설치/해제).
+                self.sync_agent_hooks();
                 if let Err(e) = self.config.save(&self.config_path) {
                     tracing::warn!("config 저장 실패: {e:#}");
                     // 서버는 켜졌지만 자동시작이 영속되지 않음 — 사용자에게 알린다.
@@ -955,7 +988,11 @@ impl App {
                         session_count: self
                             .active
                             .workspace_ui
-                            .session_entries(&self.i18n, &self.agent_activity)
+                            .session_entries(
+                                &self.i18n,
+                                &self.agent_activity,
+                                &self.agent_needs_input,
+                            )
                             .len(),
                         pending_events: self.active.pending_events.len(),
                         input_pressure: self.active.input_pressure.clone(),
@@ -1387,6 +1424,7 @@ impl eframe::App for App {
                 .iter()
                 .filter_map(|(sid, b)| crate::agent_detect::activity(b).map(|a| (*sid, a)))
                 .collect();
+            self.refresh_needs_input();
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(1500));
         }
@@ -1426,6 +1464,7 @@ impl eframe::App for App {
                 .iter()
                 .filter_map(|(sid, b)| crate::agent_detect::activity(b).map(|a| (*sid, a)))
                 .collect();
+            self.refresh_needs_input();
 
             // 영속(옵션2 Phase 3): 감지된 에이전트를 pane_id로 매핑해 (kind, session-id)를
             // 차등 upsert하고, 사라진(종료된) 것은 지운다 — replace-all은 시작 직후 빈 감지에
@@ -1521,10 +1560,11 @@ impl eframe::App for App {
         // 폴더 트리 사이드바 (FT-1) — CentralPanel보다 먼저 배치해야 한다 (§9-1).
         // OFF(None)면 Panel 자체를 만들지 않는다 (§6 리소스 0).
         if self.file_tree.is_some() {
-            let sessions = self
-                .active
-                .workspace_ui
-                .session_entries(&text, &self.agent_activity);
+            let sessions = self.active.workspace_ui.session_entries(
+                &text,
+                &self.agent_activity,
+                &self.agent_needs_input,
+            );
             let sidebar_action = self
                 .file_tree
                 .as_mut()

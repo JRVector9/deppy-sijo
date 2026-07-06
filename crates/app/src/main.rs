@@ -1,4 +1,5 @@
 mod agent_detect;
+mod agent_hooks;
 mod agent_transcript;
 mod app;
 mod config;

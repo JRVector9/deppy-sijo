@@ -623,7 +623,7 @@ fn validate_mcp_config_flag(raw: &str) -> Result<Option<String>, &'static str> {
 /// deppy-mcp-proxy 바이너리 경로. 앱 실행 파일 **옆**에 함께 배포되는 것을 계약으로 한다
 /// (dev: target/*/에 함께 빌드, release: 번들에 함께 복사). 옆에 없으면 PATH를 막연히
 /// 믿지 않고 에러 — 권한계층 경유를 켠 스폰이 프록시 없이 조용히 진행되지 않게 한다(codex).
-fn mcp_proxy_bin() -> anyhow::Result<String> {
+pub(crate) fn mcp_proxy_bin() -> anyhow::Result<String> {
     let exe = std::env::current_exe().context("현재 실행 파일 경로 조회 실패")?;
     let dir = exe
         .parent()

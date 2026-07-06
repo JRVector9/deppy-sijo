@@ -41,6 +41,8 @@ settings.theme.hint = 僅切換外殼 — 終端機窗格永遠為深色
 settings.file_tree.hint = 關閉則不建立面板 — 零資源
 settings.auto_resume = 自動恢復工作階段
 settings.auto_resume.hint = 重新啟動時自動執行 claude/codex resume 繼續上次工作階段
+settings.status_hooks = 代理狀態掛鉤
+settings.status_hooks.hint = 在 claude/codex 安裝掛鉤以準確偵測核准/輸入等待（關閉=僅畫面推測）
 settings.locale.hint = 韓語 · 英語 · 日本語 · 简体 · 繁體（內建）
 settings.scrollback.hint = 隱藏工作階段自動縮減為 1,000 行
 settings.output_batch.hint = 0/1 正規化為 16ms（抑制閒置重繪）

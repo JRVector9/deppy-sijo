@@ -941,6 +941,16 @@ fn general_page(
             }
         },
     );
+    row(
+        ui,
+        &catalog.t("settings.status_hooks", &[]),
+        Some(&catalog.t("settings.status_hooks.hint", &[])),
+        |ui| {
+            if toggle_switch(ui, &mut config.ui.agent_status_hooks) {
+                *changed = true;
+            }
+        },
+    );
 }
 
 fn language_page(

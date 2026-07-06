@@ -41,6 +41,8 @@ settings.theme.hint = クロームのみ切替 — ターミナルは常にダ�
 settings.file_tree.hint = OFFでパネル非生成 — リソース0
 settings.auto_resume = セッション自動再開
 settings.auto_resume.hint = 再起動時に前回の claude/codex セッションを resume で自動継続
+settings.status_hooks = エージェント状態フック
+settings.status_hooks.hint = claude/codexにフックを設定し承認/入力待ちを正確に検知（オフ=画面推測のみ）
 settings.locale.hint = 韓国語・英語・日本語・中国語(簡体/繁体)（同梱）
 settings.scrollback.hint = hiddenセッションは自動で1,000行に縮小
 settings.output_batch.hint = 0・1は16msに正規化（idle repaint抑制）

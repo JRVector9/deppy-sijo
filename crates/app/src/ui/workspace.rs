@@ -821,9 +821,16 @@ impl WorkspaceUi {
             if output.response.double_clicked()
                 && let Some(pos) = output.response.interact_pointer_pos()
             {
-                // 더블클릭 → 커서 아래 단어(공백 구분) 선택 (드래그한 것처럼).
+                // 더블클릭 → 커서 아래 단어(공백 구분) 선택. 단어가 URL이면 기본 브라우저로
+                // 연다(claude/codex/셸 화면의 링크를 바로 열기).
                 if let Some((s, e)) = word_range_at(&snapshot, cell_at(pos)) {
                     self.selection = Some((session, s, e));
+                    let word = renderer_egui::selection_text(&snapshot, s, e);
+                    if let Some(url) = extract_url(&word)
+                        && let Err(err) = auth::open_in_browser(url)
+                    {
+                        self.error = Some(format!("{err:#}"));
+                    }
                 }
             } else if output.response.drag_started()
                 && let Some(pos) = output.response.interact_pointer_pos()
@@ -1508,6 +1515,12 @@ fn is_clipboard_paste_shortcut(event: &egui::Event) -> bool {
 
 /// 셀 idx 아래의 단어(공백 구분 비어있지 않은 셀 연속) 범위를 [start, end]로 돌려준다.
 /// 공백 위를 더블클릭하면 None. 더블클릭 단어 선택에 쓴다.
+/// 단어가 URL이면 (뒤따르는 구두점 제거 후) 그 URL을 반환한다. http/https만 연다.
+fn extract_url(word: &str) -> Option<&str> {
+    let trimmed = word.trim_end_matches(|c: char| ".,;:!?)]}>\"'".contains(c));
+    (trimmed.starts_with("http://") || trimmed.starts_with("https://")).then_some(trimmed)
+}
+
 fn word_range_at(
     snapshot: &terminal::TerminalViewportSnapshot,
     idx: usize,

@@ -1671,6 +1671,16 @@ impl eframe::App for App {
                         self.config.terminal.scrollback_lines as usize,
                     );
                 }
+                // 세션 이름 변경 — pane 제목 갱신(mux 반영 + 영속).
+                Some(ui::file_tree::SidebarAction::RenameSession { pane, title }) => {
+                    if let Err(e) = self
+                        .active
+                        .runtime
+                        .send_command(runtime::RuntimeCommand::RenamePane { pane, title })
+                    {
+                        tracing::warn!("세션 이름 변경 실패: {e:#}");
+                    }
+                }
                 None => {}
             }
         }

@@ -34,6 +34,11 @@ pub enum SidebarAction {
     },
     /// 새 셸 생성 (세션 섹션의 + 버튼)
     NewShell,
+    /// 세션 이름 변경 — pane 제목을 갱신한다(우클릭/더블클릭 인라인 편집).
+    RenameSession {
+        pane: runtime::MuxPaneId,
+        title: String,
+    },
 }
 
 /// 트리 노드. `children == None`은 아직 나열 안 됨(lazy).
@@ -132,6 +137,8 @@ pub struct FileTreeUi {
     env_warning_candidates: BTreeSet<PathBuf>,
     /// 마지막 워처 일괄 재나열 시각 — WATCH_RELOAD_MS 미만이면 흡수만 하고 건너뛴다.
     last_watch_reload: std::time::Instant,
+    /// 세션 목록 이름 인라인 편집 중 (pane, 편집 버퍼). 우클릭/더블클릭으로 시작.
+    session_name_edit: Option<(runtime::MuxPaneId, String)>,
 }
 
 /// 백그라운드 파일 조작 결과 — 완료 후 재나열할 부모 디렉터리 + 에러(있으면).
@@ -464,6 +471,7 @@ impl FileTreeUi {
             pending_watch: BTreeSet::new(),
             env_warning_candidates: BTreeSet::new(),
             last_watch_reload: std::time::Instant::now(),
+            session_name_edit: None,
         }
     }
 
@@ -798,12 +806,46 @@ impl FileTreeUi {
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     for entry in sessions {
-                        let resp = session_row(ui, entry);
-                        if resp.clicked() && !entry.focused {
-                            action = Some(SidebarAction::FocusSession {
-                                tab: entry.tab.clone(),
-                                pane: entry.pane.clone(),
+                        let editing =
+                            matches!(&self.session_name_edit, Some((p, _)) if *p == entry.pane);
+                        if editing {
+                            // 인라인 이름 편집 — Enter 확정(RenameSession), Esc 취소.
+                            let buf = &mut self.session_name_edit.as_mut().unwrap().1;
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(buf)
+                                    .desired_width(f32::INFINITY)
+                                    .font(egui::FontId::proportional(13.0)),
+                            );
+                            resp.request_focus();
+                            let (enter, esc) = ui.input(|i| {
+                                (
+                                    i.key_pressed(egui::Key::Enter),
+                                    i.key_pressed(egui::Key::Escape),
+                                )
                             });
+                            if enter {
+                                if let Some((pane, title)) = self.session_name_edit.take() {
+                                    let title = title.trim().to_owned();
+                                    if !title.is_empty() {
+                                        action = Some(SidebarAction::RenameSession { pane, title });
+                                    }
+                                }
+                            } else if esc {
+                                self.session_name_edit = None;
+                            }
+                        } else {
+                            let resp = session_row(ui, entry)
+                                .on_hover_text(catalog.t("workspace.rename_hint", &[]));
+                            // 우클릭/더블클릭 → 이름 편집 시작. 단순 클릭 → 세션 전환.
+                            if resp.secondary_clicked() || resp.double_clicked() {
+                                self.session_name_edit =
+                                    Some((entry.pane.clone(), entry.title.clone()));
+                            } else if resp.clicked() && !entry.focused {
+                                action = Some(SidebarAction::FocusSession {
+                                    tab: entry.tab.clone(),
+                                    pane: entry.pane.clone(),
+                                });
+                            }
                         }
                     }
                 });

@@ -97,23 +97,35 @@ impl CredentialsUi {
 
         ui.separator();
         ui.heading(catalog.t("credentials.add", &[]));
-        ui.horizontal(|ui| {
-            ui.label(catalog.t("credentials.provider", &[]));
-            ui.text_edit_singleline(&mut self.provider);
+        // 입력 컴포넌트를 설정 컨트롤과 동일하게 우측 정렬 + 고정폭으로 통일한다(#7).
+        // FIELD_W는 언어 드롭다운/스텝퍼와 같은 폭.
+        const FIELD_W: f32 = 130.0;
+        let field_row = |ui: &mut egui::Ui, label: String, add: &mut dyn FnMut(&mut egui::Ui)| {
+            ui.horizontal(|ui| {
+                ui.label(label);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    add(ui)
+                });
+            });
+        };
+        field_row(ui, catalog.t("credentials.provider", &[]), &mut |ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.provider).desired_width(FIELD_W));
         });
-        ui.horizontal(|ui| {
-            ui.label(catalog.t("credentials.label", &[]));
-            ui.text_edit_singleline(&mut self.label);
+        field_row(ui, catalog.t("credentials.label", &[]), &mut |ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.label).desired_width(FIELD_W));
         });
-        ui.horizontal(|ui| {
-            ui.label(catalog.t("credentials.kind", &[]));
-            for kind in ["api_key", "token"] {
+        field_row(ui, catalog.t("credentials.kind", &[]), &mut |ui| {
+            // 우측 정렬이라 오른쪽부터 배치 — token, api_key 순으로 넣어야 화면상 api_key가 왼쪽.
+            for kind in ["token", "api_key"] {
                 ui.selectable_value(&mut self.kind, kind, kind);
             }
         });
-        ui.horizontal(|ui| {
-            ui.label(catalog.t("credentials.secret", &[]));
-            ui.add(egui::TextEdit::singleline(&mut self.secret_input).password(true));
+        field_row(ui, catalog.t("credentials.secret", &[]), &mut |ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.secret_input)
+                    .password(true)
+                    .desired_width(FIELD_W),
+            );
         });
         let filled = !self.provider.trim().is_empty()
             && !self.label.trim().is_empty()

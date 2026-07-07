@@ -875,6 +875,79 @@ fn stepper(ui: &mut egui::Ui, value: &mut i64, step: i64, min: i64, max: i64, un
     changed
 }
 
+/// stepper의 f32 변형 — 소수 step(폰트 0.5px 등). 정수값은 정수로, 아니면 소수 1자리 표시.
+fn stepper_f32(ui: &mut egui::Ui, value: &mut f32, step: f32, min: f32, max: f32) -> bool {
+    let h = 30.0;
+    let btn_w = 30.0;
+    let val_w = 70.0;
+    let total = val_w + btn_w * 2.0;
+    let hair = ui.visuals().widgets.noninteractive.bg_stroke.color;
+    let panel2 = ui.visuals().widgets.inactive.bg_fill;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(total, h), egui::Sense::hover());
+    ui.painter().rect(
+        rect,
+        6.0,
+        panel2,
+        egui::Stroke::new(1.0, hair),
+        egui::StrokeKind::Inside,
+    );
+    let shown = if (*value - value.round()).abs() < 1e-3 {
+        format!("{}", value.round() as i64)
+    } else {
+        format!("{value:.1}")
+    };
+    ui.painter().text(
+        egui::pos2(rect.left() + val_w / 2.0, rect.center().y),
+        egui::Align2::CENTER_CENTER,
+        shown,
+        egui::FontId::monospace(13.0),
+        ui.visuals().text_color(),
+    );
+    let x1 = rect.left() + val_w;
+    let x2 = x1 + btn_w;
+    ui.painter()
+        .vline(x1, rect.y_range(), egui::Stroke::new(1.0, hair));
+    ui.painter()
+        .vline(x2, rect.y_range(), egui::Stroke::new(1.0, hair));
+    let minus = egui::Rect::from_min_size(egui::pos2(x1, rect.top()), egui::vec2(btn_w, h));
+    let plus = egui::Rect::from_min_size(egui::pos2(x2, rect.top()), egui::vec2(btn_w, h));
+    let mr = ui.interact(minus, ui.id().with("fstep_minus"), egui::Sense::click());
+    let pr = ui.interact(plus, ui.id().with("fstep_plus"), egui::Sense::click());
+    if mr.hovered() {
+        ui.painter()
+            .rect_filled(minus, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    if pr.hovered() {
+        ui.painter()
+            .rect_filled(plus, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    let fc = ui.visuals().weak_text_color();
+    ui.painter().text(
+        minus.center(),
+        egui::Align2::CENTER_CENTER,
+        "−",
+        egui::FontId::proportional(15.0),
+        fc,
+    );
+    ui.painter().text(
+        plus.center(),
+        egui::Align2::CENTER_CENTER,
+        "+",
+        egui::FontId::proportional(15.0),
+        fc,
+    );
+    let mut changed = false;
+    if mr.clicked() {
+        *value = (*value - step).clamp(min, max);
+        changed = true;
+    }
+    if pr.clicked() {
+        *value = (*value + step).clamp(min, max);
+        changed = true;
+    }
+    changed
+}
+
 fn comma(n: i64) -> String {
     let s = n.abs().to_string();
     let mut out = String::new();
@@ -1012,9 +1085,9 @@ fn terminal_page(
 ) {
     section(ui, &catalog.t("settings.terminal", &[]));
     row(ui, &catalog.t("settings.font_size", &[]), None, |ui| {
-        let mut v = config.terminal.font_size as i64;
-        if stepper(ui, &mut v, 1, 8, 32, "") {
-            config.terminal.font_size = v as f32;
+        let mut v = config.terminal.font_size;
+        if stepper_f32(ui, &mut v, 0.5, 8.0, 32.0) {
+            config.terminal.font_size = v;
             *changed = true;
         }
     });

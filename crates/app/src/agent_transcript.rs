@@ -113,7 +113,7 @@ pub fn parse_codex(path: &Path) -> Option<TranscriptState> {
 }
 
 /// 파일명에서 UUID(마지막 5개 하이픈 그룹)를 뽑는다 — 타임스탬프에도 하이픈이 있어 정규식으로.
-fn codex_session_id(file_name: &str) -> Option<String> {
+pub(crate) fn codex_session_id(file_name: &str) -> Option<String> {
     let re =
         regex::Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").ok()?;
     re.find(file_name).map(|m| m.as_str().to_owned())

@@ -145,6 +145,22 @@ fn bind_transcript(kind: AgentKind, sid_hint: Option<String>, pid: u32) -> Optio
             })
         }
         AgentKind::Codex => {
+            // 1순위: 프로세스가 append 중인 rollout을 lsof로 직접 획득 — 결정적(스캔·상한·
+            // cwd 매칭 불필요, resume된 옛 파일·같은 cwd 다중 세션도 정확). codex는 rollout을
+            // write 모드로 열어둔다(2026-07-07 실증: 07/03 파일을 resume 중인 프로세스에서 확인).
+            if let Some(transcript) = codex_open_rollout(pid)
+                && let Some(session_id) = transcript
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(agent_transcript::codex_session_id)
+            {
+                return Some(AgentBinding {
+                    kind,
+                    session_id,
+                    transcript,
+                });
+            }
+            // fallback: cwd 매칭 스캔 (파일을 안 열어둔 짧은 순간/플랫폼 차이 대비).
             let cwd = process_cwd(pid)?;
             let (session_id, transcript) = find_codex_transcript(&cwd)?;
             Some(AgentBinding {
@@ -258,6 +274,26 @@ fn collect_jsonl_bounded(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
             out.push(p);
         }
     }
+}
+
+/// codex 프로세스가 열어둔 rollout(.jsonl) 파일 — `lsof -p <pid>`의 열린 파일 중
+/// `~/.codex/sessions/**.jsonl`. 있으면 그게 곧 이 프로세스의 transcript(결정적).
+#[cfg(unix)]
+fn codex_open_rollout(pid: u32) -> Option<PathBuf> {
+    let out = std::process::Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-Fn"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix('n'))
+        .find(|p| p.contains("/.codex/sessions/") && p.ends_with(".jsonl"))
+        .map(PathBuf::from)
+}
+
+#[cfg(not(unix))]
+fn codex_open_rollout(_pid: u32) -> Option<PathBuf> {
+    None
 }
 
 /// 프로세스의 cwd (macOS/Unix: `lsof -p <pid> -d cwd`).

@@ -913,6 +913,19 @@ impl WorkspaceUi {
                         self.selection = Some((session, anchor, new_end));
                         continue;
                     }
+                    // Shift+Enter → 줄바꿈(LF). claude/codex는 \n을 입력 줄바꿈으로, \r을
+                    // 제출로 구분한다(claude /terminal-setup 관례). Enter(\r)는 그대로 제출.
+                    if let egui::Event::Key {
+                        key: egui::Key::Enter,
+                        pressed: true,
+                        modifiers: m,
+                        ..
+                    } = event
+                        && m.shift
+                    {
+                        pending.push(b'\n');
+                        continue;
+                    }
                     if let Some(bytes) = input_mapper::map_event(event, bracketed, &modifiers) {
                         pending.extend(bytes);
                     }

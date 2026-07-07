@@ -117,6 +117,7 @@ workspace.new_shell = + 新建 Shell
 workspace.split_horizontal_short = 拆分 |
 workspace.split_vertical_short = 拆分 -
 workspace.close_pane = 关闭 pane
+workspace.rename_hint = 右键或双击重命名
 workspace.close_confirm.title = 关闭窗格
 workspace.close_confirm.body = 正在运行的会话将被终止。确定关闭吗？
 workspace.split_horizontal = 拆分 | (左右)

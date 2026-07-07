@@ -117,6 +117,7 @@ workspace.new_shell = + 新規シェル
 workspace.split_horizontal_short = 分割 |
 workspace.split_vertical_short = 分割 -
 workspace.close_pane = paneを閉じる
+workspace.rename_hint = 右クリック/ダブルクリックで名前を変更
 workspace.close_confirm.title = ペインを閉じる
 workspace.close_confirm.body = 実行中のセッションが終了します。閉じますか？
 workspace.split_horizontal = 分割 | (左右)

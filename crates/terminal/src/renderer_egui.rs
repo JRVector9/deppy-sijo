@@ -113,7 +113,10 @@ pub fn draw(
         });
     }
     let painter = ui.painter_at(rect);
-    let origin = rect.min;
+    // 좌측 여백 — 텍스트가 pane 경계선에 딱 붙지 않게 살짝 띄운다(사용자 요청). 배경은
+    // rect 전체를 채우므로 이 여백은 배경색 간격이 된다. paint/hit-test 모두 이 origin 기준.
+    const LEFT_PAD: f32 = 2.0;
+    let origin = rect.min + egui::vec2(LEFT_PAD, 0.0);
 
     let default_bg = egui::Color32::from_rgb(0x18, 0x18, 0x1c);
     let selection = selection.and_then(|(a, b)| normalize_selection_range(snapshot, a, b));

@@ -1063,13 +1063,21 @@ fn language_page(
                 egui::FontId::proportional(13.0),
                 ui.visuals().text_color(),
             );
-            ui.painter().text(
-                egui::pos2(rect.right() - 12.0, rect.center().y),
-                egui::Align2::CENTER_CENTER,
-                "▾",
-                egui::FontId::proportional(11.0),
-                ui.visuals().weak_text_color(),
-            );
+            // 아래 화살표 — ▾ 문자는 폰트에 없어 □로 깨진다(사용자). 도형 삼각형으로 그린다.
+            {
+                let ax = rect.right() - 12.0;
+                let cy = rect.center().y;
+                let d = 3.5;
+                ui.painter().add(egui::Shape::convex_polygon(
+                    vec![
+                        egui::pos2(ax - d, cy - d * 0.6),
+                        egui::pos2(ax + d, cy - d * 0.6),
+                        egui::pos2(ax, cy + d * 0.7),
+                    ],
+                    ui.visuals().weak_text_color(),
+                    egui::Stroke::NONE,
+                ));
+            }
             egui::Popup::menu(&resp).show(|ui| {
                 ui.set_min_width(w);
                 for (locale, key) in [

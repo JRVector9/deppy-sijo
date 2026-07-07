@@ -97,15 +97,23 @@ impl CredentialsUi {
 
         ui.separator();
         ui.heading(catalog.t("credentials.add", &[]));
-        // 입력 컴포넌트를 설정 컨트롤과 동일하게 우측 정렬 + 고정폭으로 통일한다(#7).
-        // FIELD_W는 언어 드롭다운/스텝퍼와 같은 폭.
-        const FIELD_W: f32 = 130.0;
+        // 좌측 라벨 컬럼 + 넓은 입력 폼 — 라벨 far-left/입력 far-right로 큰 빈 공간이 생기던
+        // 우측정렬을 폼 스타일로 교체(#5 레이아웃 수정). 모든 입력이 같은 x에서 시작해 정렬.
+        const LABEL_W: f32 = 88.0;
+        const FIELD_W: f32 = 320.0;
+        let text_color = ui.visuals().text_color();
         let field_row = |ui: &mut egui::Ui, label: String, add: &mut dyn FnMut(&mut egui::Ui)| {
             ui.horizontal(|ui| {
-                ui.label(label);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    add(ui)
-                });
+                let (r, _) =
+                    ui.allocate_exact_size(egui::vec2(LABEL_W, 30.0), egui::Sense::hover());
+                ui.painter().text(
+                    egui::pos2(r.left(), r.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    egui::FontId::proportional(13.5),
+                    text_color,
+                );
+                add(ui);
             });
         };
         field_row(ui, catalog.t("credentials.provider", &[]), &mut |ui| {
@@ -115,8 +123,7 @@ impl CredentialsUi {
             ui.add(egui::TextEdit::singleline(&mut self.label).desired_width(FIELD_W));
         });
         field_row(ui, catalog.t("credentials.kind", &[]), &mut |ui| {
-            // 우측 정렬이라 오른쪽부터 배치 — token, api_key 순으로 넣어야 화면상 api_key가 왼쪽.
-            for kind in ["token", "api_key"] {
+            for kind in ["api_key", "token"] {
                 ui.selectable_value(&mut self.kind, kind, kind);
             }
         });

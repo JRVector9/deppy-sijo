@@ -567,20 +567,17 @@ impl WorkspaceUi {
 
         // pane 헤더 바 (2026-07-05): [상태 제목] [×] ... [+셸] [분할│] [분할─]
         // 닫기/분할 대상이 "이 pane"임이 시각적으로 자명하다 — 탭바 제거의 대체 UI.
-        // pane 헤더는 터미널-계열 다크 배경(터미널 pane은 항상 다크 — theme와 무관,
-        // 목업 §pane-head). focused는 accent를 20% 섞은 은은한 teal, 그 외는 다크.
+        // pane 헤더는 터미널과 동일한 다크 배경(별도 틴트 없음 — 사용자 요청 2026-07-07).
+        // 아래 hairline 한 줄로만 최소 분리한다. 포커스는 제목/글리프 accent 색으로 표시.
         let status = pane
             .session_id
             .and_then(|s| self.sessions.get(&s))
             .and_then(|v| v.status);
         let is_agent = status.is_some();
         let accent = ui.visuals().selection.bg_fill;
-        let header_fill = if focused {
-            egui::Color32::from_rgb(0x22, 0x38, 0x40)
-        } else {
-            egui::Color32::from_rgb(0x1e, 0x1e, 0x24)
-        };
-        egui::Frame::new()
+        // 터미널 렌더러의 default_bg와 동일 (renderer_egui) — 헤더가 터미널로 이어져 보이게.
+        let header_fill = egui::Color32::from_rgb(0x18, 0x18, 0x1c);
+        let header = egui::Frame::new()
             .fill(header_fill)
             // 좌측 여백 축소 — ◆ 아이콘이 왼쪽 가까이 붙게(사용자 요청).
             .inner_margin(egui::Margin {
@@ -715,6 +712,13 @@ impl WorkspaceUi {
                     });
                 });
             });
+        // 헤더-터미널 최소 구분선(1px hairline) — 배경색이 같아 경계가 없어지므로.
+        let hr = header.response.rect;
+        ui.painter().hline(
+            hr.x_range(),
+            hr.bottom() - 0.5,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(0x2a, 0x2a, 0x30)),
+        );
         if pane.session_id.is_some() {
             if pane_resp
                 .dnd_hover_payload::<std::path::PathBuf>()

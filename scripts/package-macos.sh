@@ -43,7 +43,17 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# ad-hoc 서명 — 미서명 바이너리는 최신 macOS에서 실행이 막힐 수 있다
-codesign --force --sign - "$BUNDLE"
+# 서명 — scripts/setup-dev-signing.sh로 신뢰 설정한 고정 인증서가 있으면 그것으로 서명한다.
+# ad-hoc(`--sign -`)은 매 빌드 cdhash가 달라져 macOS TCC(데스크탑 폴더 접근 등)가 매번 앱을
+# "새 앱"으로 보고 권한을 재요청한다. 고정 인증서로 서명하면 한 번 승인한 권한이 유지된다.
+CERT_CN="deppy-sijo-dev"
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "$CERT_CN"; then
+    codesign --force --deep --sign "$CERT_CN" "$BUNDLE"
+    echo "서명: $CERT_CN (고정 identity — TCC 권한 재빌드 후 유지)"
+else
+    codesign --force --sign - "$BUNDLE"
+    echo "서명: ad-hoc — 재빌드마다 macOS 권한(데스크탑 접근 등)을 다시 물어봅니다."
+    echo "  한 번만 설정하려면: sh scripts/setup-dev-signing.sh (비밀번호 1회)"
+fi
 
 echo "bundle: $BUNDLE"

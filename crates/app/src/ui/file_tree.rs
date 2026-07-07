@@ -1944,8 +1944,15 @@ pub enum ShellKind {
 /// 마름모를 도형으로 그려 회피한다. 선택 시 액센트 배경 + 좌측 레일, agent는 레일 표시,
 /// 요약 한 줄(dim/mono). 반환 Response로 클릭을 처리한다.
 fn session_row(ui: &mut egui::Ui, entry: &SessionEntry) -> egui::Response {
-    let has_summary = !entry.summary.is_empty();
-    let row_h = if has_summary { 38.0 } else { 24.0 };
+    // 요약이 없어도(유휴/시작 직후) 두 행 높이를 유지하고 '~'를 표시한다 — 행 높이가
+    // 상태마다 접혔다 펴지면 목록이 들쭉날쭉해 보인다(2026-07-07 디자인 요청).
+    let has_summary = true;
+    let summary_text: &str = if entry.summary.is_empty() {
+        "~"
+    } else {
+        &entry.summary
+    };
+    let row_h = 38.0;
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), row_h),
         egui::Sense::click(),
@@ -1968,7 +1975,7 @@ fn session_row(ui: &mut egui::Ui, entry: &SessionEntry) -> egui::Response {
     let max_w = (rect.width() - 16.0 - 8.0).max(10.0);
     let title_galley = clipped_line(ui, &entry.title, egui::FontId::proportional(13.0), max_w);
     let summary_galley =
-        has_summary.then(|| clipped_line(ui, &entry.summary, egui::FontId::monospace(10.5), max_w));
+        has_summary.then(|| clipped_line(ui, summary_text, egui::FontId::monospace(10.5), max_w));
 
     let painter = ui.painter();
     // 선택/hover 배경

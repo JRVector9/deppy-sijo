@@ -51,6 +51,9 @@ pub struct WorkspaceUi {
 #[derive(Default)]
 struct SessionView {
     snapshot: Option<Arc<TerminalViewportSnapshot>>,
+    /// freeze(선택 중) 동안 도착한 최신 snapshot을 보관 — 선택 해제 시 이걸로 catch-up해
+    /// 화면이 선택 당시에 머무는 것을 막는다(codex). 프레임 시작 시 프로모트한다.
+    pending_snapshot: Option<Arc<TerminalViewportSnapshot>>,
     render_cache: renderer_egui::TerminalRenderCache,
     bracketed_paste: bool,
     /// 사이드바 세션 목록에 보여줄 최신 화면 요약 (마지막 비어있지 않은 행, ≤48자)
@@ -122,6 +125,7 @@ impl WorkspaceUi {
                     for (id, view) in self.sessions.iter_mut() {
                         if !visible.contains(id) {
                             view.snapshot = None;
+                            view.pending_snapshot = None;
                             view.render_cache.clear();
                         }
                     }
@@ -151,8 +155,13 @@ impl WorkspaceUi {
                         let frozen = self.selection.is_some_and(|(s, _, _)| s == *session);
                         let view = self.sessions.entry(*session).or_default();
                         view.bracketed_paste = *bracketed_paste;
-                        if !frozen {
+                        if frozen {
+                            // 선택 중엔 표시 snapshot을 얼리되, 최신본은 pending에 보관해
+                            // 해제 시 catch-up한다(codex — 안 그러면 화면이 선택 당시에 멈춤).
+                            view.pending_snapshot = Some(Arc::clone(snapshot));
+                        } else {
                             view.snapshot = Some(Arc::clone(snapshot));
+                            view.pending_snapshot = None;
                             // 사이드바 세션 요약 — 마지막 비어있지 않은 행 (2026-07-05)
                             view.summary = last_line_summary(snapshot);
                         }
@@ -712,8 +721,15 @@ impl WorkspaceUi {
             );
         }
 
+        let selected = self.selection.is_some_and(|(s, _, _)| s == session);
         let (exit_code, bracketed, snapshot) = {
             let view = self.sessions.entry(session).or_default();
+            // 선택이 없으면(freeze 해제) freeze 중 보관한 최신본으로 catch-up한다 — 새
+            // Viewport가 안 와도 화면이 선택 당시에 멈추지 않게(codex).
+            if !selected && let Some(pending) = view.pending_snapshot.take() {
+                view.summary = last_line_summary(&pending);
+                view.snapshot = Some(pending);
+            }
             let Some(snapshot) = view.snapshot.clone() else {
                 ui.label(catalog.t("workspace.connecting", &[]));
                 return;

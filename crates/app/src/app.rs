@@ -343,6 +343,10 @@ pub struct App {
     last_theme_dark: bool,
     /// 직전 프레임의 UI 폰트 설정 — 바뀌면 폰트 재등록(hot reload).
     last_ui_font: Option<String>,
+    /// .env mtime 폴링(2s) — 사이드바 OFF면 워처가 없어 .env 변경/삭제 신호가 안 오므로
+    /// (존재여부, mtime) 변화를 직접 감지해 재동기화한다(codex — stale secret 주입 방지).
+    last_dotenv_check: std::time::Instant,
+    last_dotenv_state: Option<(bool, Option<std::time::SystemTime>)>,
     settings_open: bool,
     /// 통합 설정 창의 선택된 카테고리.
     settings_category: ui::settings::Category,
@@ -505,6 +509,8 @@ impl App {
             config_path,
             last_theme_dark: true,
             last_ui_font: None,
+            last_dotenv_check: std::time::Instant::now(),
+            last_dotenv_state: None,
             settings_open: false,
             settings_category: ui::settings::Category::default(),
             settings_search: String::new(),
@@ -1172,6 +1178,8 @@ impl App {
         self.refresh_file_tree_root();
         // 새 workspace의 .env → 환경 profile 동기화 + 기본 env 주입 (2026-07-07).
         self.sync_dotenv_env();
+        // mtime 폴링 상태 리셋 — 새 root의 첫 관측을 기준점으로 다시 잡는다.
+        self.last_dotenv_state = None;
         self.egui_ctx.request_repaint();
 
         self.evict_warm();
@@ -1320,6 +1328,31 @@ impl App {
                 env_plain,
                 env_secrets,
             });
+    }
+
+    /// .env (존재여부, mtime)을 2초 간격으로 폴링해 변화 시 재동기화한다 — 사이드바 OFF로
+    /// 워처가 없을 때의 fallback(codex). 워처 경로와 중복 실행돼도 동기화는 idempotent.
+    fn poll_dotenv_change(&mut self) {
+        if self.last_dotenv_check.elapsed() < std::time::Duration::from_secs(2) {
+            return;
+        }
+        self.last_dotenv_check = std::time::Instant::now();
+        let state = match self.active_tree_root() {
+            Some(root) => match std::fs::metadata(root.join(".env")) {
+                Ok(meta) => (true, meta.modified().ok()),
+                Err(_) => (false, None),
+            },
+            None => (false, None),
+        };
+        match self.last_dotenv_state {
+            // 첫 관측은 기록만 — 시작/전환 시의 sync_dotenv_env가 이미 처리했다.
+            None => self.last_dotenv_state = Some(state),
+            Some(prev) if prev != state => {
+                self.last_dotenv_state = Some(state);
+                self.sync_dotenv_env();
+            }
+            Some(_) => {}
+        }
     }
 
     /// 활성 workspace의 트리 루트 (path 미설정/조회 실패 → None → 안내 표시 §9-2).
@@ -1701,6 +1734,8 @@ impl eframe::App for App {
             }
             ui.ctx().request_repaint();
         }
+        // .env 변경 폴링 fallback (사이드바 OFF 대비 — 2s 스로틀).
+        self.poll_dotenv_change();
         // UI 폰트 설정 변경 hot reload — 폰트 재등록 + 렌더 캐시 무효화(2026-07-07).
         if self.config.ui.ui_font != self.last_ui_font {
             self.last_ui_font = self.config.ui.ui_font.clone();

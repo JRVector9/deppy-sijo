@@ -1276,6 +1276,10 @@ impl App {
     /// 전송한다(SetSessionDefaultEnv) — 이후 새 셸부터 자동 주입(2026-07-07 요청).
     /// 시작/워크스페이스 전환 시 1회. best-effort — 실패해도 앱은 정상 동작.
     fn sync_dotenv_env(&mut self) {
+        // 폴링 기준점은 **읽기 전에** 캡처한다 — 읽기~기록 사이에 .env가 바뀌면 새 mtime이
+        // 기준점이 되어 다음 폴링이 "변화 없음"으로 삼키던 TOCTOU 제거(codex 검증).
+        // 읽기 직전 변경이 끼어들면 다음 폴링에서 mtime 불일치 → 한 번 더 동기화(안전 방향).
+        let baseline = self.dotenv_stat();
         // 1) .env → dotenv profile 동기화 (secret은 keyring).
         let mut dotenv_present = false;
         if let Some(root) = self.active_tree_root() {
@@ -1327,9 +1331,7 @@ impl App {
                 env_plain,
                 env_secrets,
             });
-        // 폴링 기준점을 지금 상태로 — sync~첫 폴링 사이의 .env 변경이 "첫 관측 기록"으로
-        // 삼켜져 재동기화를 건너뛰지 않게 한다(codex 검증 반영).
-        self.last_dotenv_state = Some(self.dotenv_stat());
+        self.last_dotenv_state = Some(baseline);
     }
 
     /// 활성 workspace `.env`의 (존재여부, mtime) — 폴링 비교용.

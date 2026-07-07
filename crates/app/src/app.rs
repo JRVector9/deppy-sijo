@@ -807,14 +807,19 @@ impl App {
     }
 
     /// 에이전트 상태 hook을 설정 토글에 맞춰 전역 설치/해제한다(옵션2 needsInput).
-    /// best-effort — 실패해도 앱은 정상 동작(regex fallback). claude만 현재 지원.
+    /// best-effort — 실패해도 앱은 정상 동작(regex fallback). claude + codex.
     fn sync_agent_hooks(&self) {
-        let result = if self.config.ui.agent_status_hooks {
-            crate::ui::agents::mcp_proxy_bin()
-                .and_then(|bin| crate::agent_hooks::install_claude(&self.db_path, &bin))
-        } else {
-            crate::agent_hooks::uninstall_claude()
-        };
+        let result = (|| -> anyhow::Result<()> {
+            if self.config.ui.agent_status_hooks {
+                let bin = crate::ui::agents::mcp_proxy_bin()?;
+                crate::agent_hooks::install_claude(&self.db_path, &bin)?;
+                crate::agent_hooks::install_codex(&self.db_path, &bin)?;
+            } else {
+                crate::agent_hooks::uninstall_claude()?;
+                crate::agent_hooks::uninstall_codex()?;
+            }
+            Ok(())
+        })();
         if let Err(e) = result {
             tracing::warn!("에이전트 상태 hook 동기화 실패: {e:#}");
         }

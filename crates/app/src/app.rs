@@ -1587,6 +1587,15 @@ impl eframe::App for App {
                 // 추가하면 패널 여백 탓에 끝까지 안 닿는 짧은 선이 겹쳤다(#65 사용자).
             });
 
+        // 세션 기본 제목을 "셀 N" 대신 프로젝트명(폴더명 ≈ 깃 레포명, 없으면 "~")으로
+        // 표시하도록 활성 workspace 이름을 WorkspaceUi에 넘긴다(사용자 요청).
+        let project_name = self
+            .workspaces
+            .iter()
+            .find(|w| w.id == self.active.id)
+            .map(Self::workspace_display_name);
+        self.active.workspace_ui.set_project_name(project_name);
+
         // 폴더 트리 사이드바 (FT-1) — CentralPanel보다 먼저 배치해야 한다 (§9-1).
         // OFF(None)면 Panel 자체를 만들지 않는다 (§6 리소스 0).
         if self.file_tree.is_some() {
@@ -1892,24 +1901,17 @@ impl eframe::App for App {
                                     }
                                 } else {
                                     let display = Self::workspace_display_name(ws);
-                                    // 이름 label 우클릭 → 이름 편집 시작(사용자 요청).
-                                    let label = egui::RichText::new(&display);
-                                    let label = if ws.id == wsid { label.strong() } else { label };
-                                    let name_resp = ui
-                                        .add(egui::Label::new(label).sense(egui::Sense::click()))
-                                        .on_hover_text(
-                                            text.t("workspace.manager.rename_hint", &[]),
-                                        );
-                                    if name_resp.secondary_clicked() {
-                                        ws_edit_start = Some((ws.id.clone(), display.clone()));
-                                    }
                                     if ws.id == wsid {
+                                        ui.strong(&display);
                                         ui.weak(text.t("workspace.manager.current", &[]));
-                                    } else if ui
-                                        .button(text.t("workspace.manager.switch", &[]))
-                                        .clicked()
-                                    {
-                                        ws_switch = Some(ws.id.clone());
+                                    } else {
+                                        ui.label(&display);
+                                        if ui
+                                            .button(text.t("workspace.manager.switch", &[]))
+                                            .clicked()
+                                        {
+                                            ws_switch = Some(ws.id.clone());
+                                        }
                                     }
                                     if ui.button(text.t("workspace.manager.rename", &[])).clicked()
                                     {

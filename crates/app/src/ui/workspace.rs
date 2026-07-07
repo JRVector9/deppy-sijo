@@ -44,6 +44,9 @@ pub struct WorkspaceUi {
     /// 터미널 마우스 선택 (session, anchor 셀, head 셀 — 드래그 방향 그대로,
     /// 렌더/복사 시 정규화). 새 출력(Viewport)이 오면 그 세션의 선택은 해제한다.
     selection: Option<(SessionId, usize, usize)>,
+    /// 활성 workspace의 프로젝트명(폴더명 ≈ 깃 레포명, 없으면 "~"). 세션 기본 제목이
+    /// "셀 134" 대신 이걸로 표시된다. rename한 세션은 그대로 둔다. App이 매 프레임 세팅.
+    project_name: Option<String>,
     error: Option<String>,
 }
 
@@ -81,8 +84,26 @@ impl WorkspaceUi {
             split_drag: None,
             confirm_close: None,
             selection: None,
+            project_name: None,
             error: None,
         }
+    }
+
+    /// 활성 workspace의 프로젝트명을 세팅한다(App이 매 프레임). 세션 기본 제목("셀 N")을
+    /// 이 이름으로 표시한다.
+    pub fn set_project_name(&mut self, name: Option<String>) {
+        self.project_name = name;
+    }
+
+    /// 세션 표시 제목 — 기본 셸/에이전트 제목("워크스페이스 spawn N")이면 프로젝트명으로
+    /// 대체(있을 때), rename됐거나 프로젝트명이 없으면 기존 표기(display_pane_title).
+    fn resolve_session_title(&self, raw: &str, catalog: &i18n::Catalog) -> String {
+        if is_default_session_title(raw)
+            && let Some(project) = self.project_name.as_deref()
+        {
+            return project.to_owned();
+        }
+        display_pane_title(raw, catalog)
     }
 
     /// 모든 세션의 터미널 렌더 캐시를 비운다 — 테마 변경 시 stale galley(옛 폰트
@@ -571,12 +592,13 @@ impl WorkspaceUi {
                     };
                     // 우측 컨트롤 폭 예약 — 긴 제목이 닫기/분할 버튼을 밀어내지
                     // 않게 truncate 최대폭 제한 (codex, 사이드바 헤더와 동일 패턴)
+                    let pane_title = self.resolve_session_title(&pane.title, catalog);
                     let title_resp = ui
                         .scope(|ui| {
                             ui.set_max_width((ui.available_width() - 120.0).max(30.0));
                             ui.add(
                                 egui::Label::new(
-                                    egui::RichText::new(display_pane_title(&pane.title, catalog))
+                                    egui::RichText::new(pane_title)
                                         .size(13.0)
                                         .strong()
                                         .color(title_color),
@@ -1259,7 +1281,7 @@ impl WorkspaceUi {
                 crate::ui::file_tree::SessionEntry {
                     tab: tab.id.clone(),
                     pane: pane.id.clone(),
-                    title: display_pane_title(&pane.title, catalog),
+                    title: self.resolve_session_title(&pane.title, catalog),
                     status,
                     summary,
                     focused: mux.focused_pane.as_ref() == Some(&pane.id),
@@ -1369,6 +1391,18 @@ pub(crate) fn paths_insert_paste_bytes(
     input_mapper::paste_bytes(&raw, bracketed_paste)
 }
 
+/// raw 제목이 아직 rename 안 된 기본 셸/에이전트 제목("workspace.spawn.shell 134" 등)인가.
+/// 기본 제목이면 프로젝트명으로 대체 표시한다(resolve_session_title).
+fn is_default_session_title(raw: &str) -> bool {
+    let Some((prefix, suffix)) = raw.rsplit_once(' ') else {
+        return false;
+    };
+    matches!(
+        prefix,
+        "workspace.spawn.shell" | "셸" | "workspace.spawn.agent" | "에이전트"
+    ) && suffix.parse::<u64>().is_ok()
+}
+
 pub(crate) fn display_pane_title(raw: &str, catalog: &i18n::Catalog) -> String {
     let Some((prefix, suffix)) = raw.rsplit_once(' ') else {
         return match raw {
@@ -1426,7 +1460,7 @@ fn clipboard_terminal_paste_bytes(
 fn is_clipboard_paste_shortcut(event: &egui::Event) -> bool {
     let egui::Event::Key {
         key: egui::Key::V,
-        pressed: true,
+        pressed,
         modifiers,
         ..
     } = event
@@ -1434,9 +1468,12 @@ fn is_clipboard_paste_shortcut(event: &egui::Event) -> bool {
         return false;
     };
     if cfg!(target_os = "macos") {
-        modifiers.command && !modifiers.ctrl
+        // macOS는 Cmd+V의 key PRESS를 앱에 전달하지 않고 release(pressed=false)만 준다
+        // (실측: Event::Paste도 안 옴). 그래서 press로는 감지가 안 돼 붙여넣기가 무시됐다 —
+        // release로 감지한다. 프레임당 image_paste_requested 불리언 1회로 합쳐진다.
+        !pressed && modifiers.command && !modifiers.ctrl
     } else {
-        modifiers.ctrl && modifiers.shift
+        *pressed && modifiers.ctrl && modifiers.shift
     }
 }
 

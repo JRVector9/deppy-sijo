@@ -126,9 +126,10 @@ impl WorkspaceUi {
                     // hidden 전환 뒤 도착한 stale Viewport가 캐시를 되살리지 않도록
                     // 현재 active tab의 visible 세션만 snapshot을 저장한다.
                     if self.session_visible(*session) {
-                        if self.selection.is_some_and(|(s, _, _)| s == *session) {
-                            self.selection = None; // 화면이 갱신되면 선택은 무효
-                        }
+                        // 선택은 화면 갱신에도 유지한다 — claude/codex 작업 중엔 화면이 매
+                        // 프레임 갱신돼, 여기서 지우면 드래그 선택이 즉시 무효화됐다(#3).
+                        // 선택 해제는 단순 클릭이 담당한다(그리드 좌표 기준이라 스크롤 시
+                        // 다른 셀을 가리킬 수 있으나 무해 — 사용자가 클릭해 해제).
                         let view = self.sessions.entry(*session).or_default();
                         view.snapshot = Some(Arc::clone(snapshot));
                         view.bracketed_paste = *bracketed_paste;

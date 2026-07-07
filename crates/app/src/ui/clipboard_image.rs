@@ -154,9 +154,12 @@ fn next_clipboard_image_path() -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default();
+    // UUID로 유일성 보장 — 대체된 옛 paste task가 아직 살아있어 같은 millisecond에 경로를
+    // 잡으면 파일이 서로 덮여 최신 반환 경로 내용이 옛 바이트가 되던 레이스 방지(codex).
     dir.join(format!(
-        "clipboard-image-{}-{millis}.png",
-        std::process::id()
+        "clipboard-image-{}-{millis}-{}.png",
+        std::process::id(),
+        uuid::Uuid::new_v4()
     ))
 }
 

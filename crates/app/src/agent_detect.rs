@@ -275,6 +275,29 @@ pub fn find_transcript(kind: AgentKind, session_id: &str) -> Option<PathBuf> {
     }
 }
 
+/// transcript(jsonl) 앞부분에서 세션의 원래 cwd를 읽는다 — 복원 resume 시 그 폴더로
+/// `cd` 하기 위함(2026-07-08: resume은 이어졌는데 셸 폴더가 workspace 루트라 실제 작업
+/// 폴더와 달랐다). codex rollout은 1행 session_meta payload.cwd, claude는 초반 행들에
+/// "cwd" 필드. 파싱 실패 줄은 건너뛴다.
+pub fn transcript_cwd(path: &std::path::Path) -> Option<String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines().take(50).map_while(Result::ok) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if let Some(cwd) = v
+            .get("cwd")
+            .and_then(|x| x.as_str())
+            .or_else(|| v.pointer("/payload/cwd").and_then(|x| x.as_str()))
+        {
+            return Some(cwd.to_owned());
+        }
+    }
+    None
+}
+
 /// "claude"/"codex" 문자열 → AgentKind.
 pub fn kind_from_str(s: &str) -> Option<AgentKind> {
     match s {

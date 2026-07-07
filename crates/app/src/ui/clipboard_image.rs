@@ -18,7 +18,17 @@ pub fn paste_clipboard_paths_or_image_background(
 ) -> std::sync::mpsc::Receiver<anyhow::Result<Option<Vec<PathBuf>>>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let result = paste_clipboard_paths_or_image_to_paths();
+        let mut result = paste_clipboard_paths_or_image_to_paths();
+        // 스크린샷 직후 ⌘V 레이스: 캡처 유틸이 클립보드에 이미지를 쓰기까지 수백 ms 걸릴
+        // 수 있어 첫 ⌘V가 "빈 클립보드"로 무시됐다(2026-07-08 사용자). 파일/이미지/텍스트가
+        // 전부 없을 때만 잠깐 기다렸다 재시도한다 — 텍스트가 있으면 정상 텍스트 paste라
+        // 즉시 반환(지연 없음), 진짜 빈 클립보드면 어차피 붙일 게 없어 대기 무해.
+        let mut tries = 0;
+        while tries < 4 && matches!(&result, Ok(None)) && read_clipboard_text().is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            result = paste_clipboard_paths_or_image_to_paths();
+            tries += 1;
+        }
         let _ = tx.send(result);
         ctx.request_repaint();
     });
@@ -123,13 +133,21 @@ fn write_rgba_png(path: &Path, width: usize, height: usize, rgba: &[u8]) -> anyh
             format!("clipboard 이미지 디렉터리 생성 실패: {}", parent.display())
         })?;
     }
-    image::save_buffer_with_format(
-        path,
+    // Fast 압축 — 기본 압축은 스크린샷(수 MP)에서 수백 ms 걸려 붙여넣기 지연의 주범이었다
+    // (2026-07-08). 파일이 조금 커지지만 임시 캐시(24h TTL)라 트레이드오프가 맞다.
+    use image::ImageEncoder;
+    let file = std::fs::File::create(path)
+        .with_context(|| format!("clipboard 이미지 파일 생성 실패: {}", path.display()))?;
+    image::codecs::png::PngEncoder::new_with_quality(
+        std::io::BufWriter::new(file),
+        image::codecs::png::CompressionType::Fast,
+        image::codecs::png::FilterType::Adaptive,
+    )
+    .write_image(
         rgba,
         width as u32,
         height as u32,
-        image::ColorType::Rgba8,
-        image::ImageFormat::Png,
+        image::ExtendedColorType::Rgba8,
     )
     .with_context(|| format!("clipboard 이미지 저장 실패: {}", path.display()))
 }

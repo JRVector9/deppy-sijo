@@ -1013,28 +1013,65 @@ fn general_page(
                         .map(|(name, _)| name.clone())
                 })
                 .unwrap_or_else(|| catalog.t("settings.ui_font.auto", &[]));
-            egui::ComboBox::from_id_salt("ui_font")
-                .selected_text(current_label)
-                .width(180.0)
-                .show_ui(ui, |ui| {
-                    if ui
-                        .selectable_label(
-                            config.ui.ui_font.is_none(),
-                            catalog.t("settings.ui_font.auto", &[]),
-                        )
-                        .clicked()
-                    {
-                        config.ui.ui_font = None;
+            // 언어 콤보와 동일한 커스텀 박스(중앙 텍스트 + ▾ 도형) — 기본 ComboBox는
+            // 스타일이 달라 컴포넌트가 튀었다(사용자 #5).
+            let w = 180.0;
+            let h = 30.0;
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+            let hair = ui.visuals().widgets.noninteractive.bg_stroke.color;
+            let bg = if resp.hovered() {
+                ui.visuals().widgets.hovered.bg_fill
+            } else {
+                ui.visuals().widgets.inactive.bg_fill
+            };
+            ui.painter().rect(
+                rect,
+                6.0,
+                bg,
+                egui::Stroke::new(1.0, hair),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                current_label,
+                egui::FontId::proportional(13.0),
+                ui.visuals().text_color(),
+            );
+            {
+                let ax = rect.right() - 12.0;
+                let cy = rect.center().y;
+                let d = 3.5;
+                ui.painter().add(egui::Shape::convex_polygon(
+                    vec![
+                        egui::pos2(ax - d, cy - d * 0.6),
+                        egui::pos2(ax + d, cy - d * 0.6),
+                        egui::pos2(ax, cy + d * 0.7),
+                    ],
+                    ui.visuals().weak_text_color(),
+                    egui::Stroke::NONE,
+                ));
+            }
+            egui::Popup::menu(&resp).show(|ui| {
+                ui.set_min_width(w);
+                if ui
+                    .selectable_label(
+                        config.ui.ui_font.is_none(),
+                        catalog.t("settings.ui_font.auto", &[]),
+                    )
+                    .clicked()
+                {
+                    config.ui.ui_font = None;
+                    *changed = true;
+                }
+                for (name, path) in FONT_OPTIONS.iter() {
+                    let selected = config.ui.ui_font.as_deref() == Some(path.as_str());
+                    if ui.selectable_label(selected, name).clicked() {
+                        config.ui.ui_font = Some(path.clone());
                         *changed = true;
                     }
-                    for (name, path) in FONT_OPTIONS.iter() {
-                        let selected = config.ui.ui_font.as_deref() == Some(path.as_str());
-                        if ui.selectable_label(selected, name).clicked() {
-                            config.ui.ui_font = Some(path.clone());
-                            *changed = true;
-                        }
-                    }
-                });
+                }
+            });
         },
     );
     row(

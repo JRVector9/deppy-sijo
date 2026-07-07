@@ -939,17 +939,22 @@ impl App {
                 }
                 // 대상 transcript가 아직 존재하는지 확인 — 지워진 세션에 --resume 안 던짐.
                 let kind = crate::agent_detect::kind_from_str(&saved.kind);
-                let exists = kind.is_some_and(|k| {
-                    crate::agent_detect::find_transcript(k, &saved.session_id).is_some()
-                });
-                if !exists {
+                let transcript =
+                    kind.and_then(|k| crate::agent_detect::find_transcript(k, &saved.session_id));
+                let Some(transcript) = transcript else {
                     let _ = self.db.delete_agent_session(&self.active.id, &pane_key);
                     self.resumed_panes.insert(pane_key);
                     continue;
-                }
+                };
+                // 세션의 원래 폴더로 cd 후 resume — 셸이 workspace 루트에서 떠서 대화는
+                // 이어지는데 실제 작업 폴더가 달랐던 문제(2026-07-08 사용자 #6).
+                let cd_prefix = crate::agent_detect::transcript_cwd(&transcript)
+                    .filter(|p| std::path::Path::new(p).is_dir())
+                    .map(|p| format!("cd {} && ", crate::agent_hooks::sh_quote(&p)))
+                    .unwrap_or_default();
                 let cmd = match saved.kind.as_str() {
-                    "claude" => format!("claude --resume {}\n", saved.session_id),
-                    "codex" => format!("codex resume {}\n", saved.session_id),
+                    "claude" => format!("{cd_prefix}claude --resume {}\n", saved.session_id),
+                    "codex" => format!("{cd_prefix}codex resume {}\n", saved.session_id),
                     _ => continue,
                 };
                 // 선택 중 freeze 해제 — 이 경로도 WorkspaceUi::send를 우회한다(codex).

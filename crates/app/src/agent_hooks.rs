@@ -20,7 +20,7 @@ const MARKER: &str = "--deppy-hook";
 
 /// 셸 커맨드 인자로 안전하게 감싼다 — 작은따옴표 안에 넣되 내부 작은따옴표는 '\'' 로 이스케이프.
 /// 경로에 공백/작은따옴표(예: /Users/O'Connor/…)가 있어도 hook 커맨드가 안 깨진다(codex 지적).
-fn sh_quote(s: &str) -> String {
+pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 

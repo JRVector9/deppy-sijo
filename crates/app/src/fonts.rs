@@ -18,9 +18,10 @@ const CJK_FONT_CANDIDATES: &[&str] = &[
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
 ];
 
-/// 기본 UI 폰트 경로 (macOS — Apple SD Gothic Neo, Latin+한글 통합 네이티브 폰트).
+/// 기본 UI 폰트 경로 (macOS — AppleGothic, 사용자 선호 2026-07-08. 이전 기본은
+/// Apple SD Gothic Neo였고 목록에서 여전히 선택 가능).
 #[cfg(target_os = "macos")]
-const DEFAULT_UI_FONT: &str = "/System/Library/Fonts/AppleSDGothicNeo.ttc";
+const DEFAULT_UI_FONT: &str = "/System/Library/Fonts/Supplemental/AppleGothic.ttf";
 #[cfg(not(target_os = "macos"))]
 const DEFAULT_UI_FONT: &str = "";
 
@@ -81,10 +82,13 @@ pub fn ui_font_options() -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     // 고정 후보 (macOS 기본 한글 폰트)
     for (name, path) in [
-        ("Apple SD Gothic Neo", DEFAULT_UI_FONT),
         (
             "AppleGothic",
             "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+        ),
+        (
+            "Apple SD Gothic Neo",
+            "/System/Library/Fonts/AppleSDGothicNeo.ttc",
         ),
     ] {
         if !path.is_empty() && std::path::Path::new(path).is_file() {

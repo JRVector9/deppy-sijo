@@ -53,6 +53,8 @@ type ColorFormatter = std::sync::Arc<dyn Fn(Rgb) -> String + Sync + Send + 'stat
 struct CollectingListener {
     pty_responses: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     color_requests: std::sync::Arc<std::sync::Mutex<Vec<(usize, ColorFormatter)>>>,
+    /// OSC 0/2로 프로그램이 설정한 터미널 제목(현재 값). 세션 이름 동적 표시에 쓴다.
+    title: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl EventListener for CollectingListener {
@@ -68,6 +70,9 @@ impl EventListener for CollectingListener {
                 .lock()
                 .expect("color_requests lock")
                 .push((index, formatter)),
+            // OSC 0/2 제목 — 최신 값 보관, 리셋이면 비운다.
+            Event::Title(t) => *self.title.lock().expect("title lock") = Some(t),
+            Event::ResetTitle => *self.title.lock().expect("title lock") = None,
             _ => {}
         }
     }
@@ -305,7 +310,8 @@ impl TerminalBackend for AlacrittyBackend {
             // 항상 빈 값 — 아직 소비자(부분 렌더러)가 없다. 채우려면 스크롤/리플로우
             // 좌표계와 함께 설계해야 하므로 부분 렌더 도입 시 같이 간다 (codex 리뷰 기록)
             dirty_ranges: Vec::new(),
-            title: None, // PR-10 tabs에서 listener 도입 시
+            // OSC 0/2로 프로그램이 설정한 제목 — 세션 이름 동적 표시(없으면 폴더명 fallback).
+            title: self.listener.title.lock().ok().and_then(|t| t.clone()),
             scroll_offset: display_offset as i32,
             is_alt_screen: self.term.mode().contains(TermMode::ALT_SCREEN),
         })

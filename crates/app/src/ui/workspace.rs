@@ -95,15 +95,33 @@ impl WorkspaceUi {
         self.project_name = name;
     }
 
-    /// 세션 표시 제목 — 기본 셸/에이전트 제목("워크스페이스 spawn N")이면 프로젝트명으로
-    /// 대체(있을 때), rename됐거나 프로젝트명이 없으면 기존 표기(display_pane_title).
-    fn resolve_session_title(&self, raw: &str, catalog: &i18n::Catalog) -> String {
-        if is_default_session_title(raw)
-            && let Some(project) = self.project_name.as_deref()
-        {
+    /// 세션 표시 제목. 우선순위: ① 사용자 rename(기본 제목이 아니면) → 그대로,
+    /// ② OSC 0/2 동적 제목(프로그램이 설정, 예: cwd/명령) → 그 제목, ③ 프로젝트 폴더명(≈깃
+    /// 레포명), ④ 원 표기. osc는 이 세션 터미널의 현재 OSC 제목.
+    fn resolve_session_title(
+        &self,
+        raw: &str,
+        osc: Option<&str>,
+        catalog: &i18n::Catalog,
+    ) -> String {
+        if !is_default_session_title(raw) {
+            return display_pane_title(raw, catalog); // 사용자 rename — 그대로
+        }
+        if let Some(t) = osc.map(str::trim).filter(|t| !t.is_empty()) {
+            return t.to_owned();
+        }
+        if let Some(project) = self.project_name.as_deref() {
             return project.to_owned();
         }
         display_pane_title(raw, catalog)
+    }
+
+    /// 세션의 현재 OSC 제목(있으면).
+    fn session_osc_title(&self, session: Option<SessionId>) -> Option<String> {
+        session
+            .and_then(|s| self.sessions.get(&s))
+            .and_then(|v| v.snapshot.as_ref())
+            .and_then(|s| s.title.clone())
     }
 
     /// 모든 세션의 터미널 렌더 캐시를 비운다 — 테마 변경 시 stale galley(옛 폰트
@@ -600,7 +618,9 @@ impl WorkspaceUi {
                     };
                     // 우측 컨트롤 폭 예약 — 긴 제목이 닫기/분할 버튼을 밀어내지
                     // 않게 truncate 최대폭 제한 (codex, 사이드바 헤더와 동일 패턴)
-                    let pane_title = self.resolve_session_title(&pane.title, catalog);
+                    let osc = self.session_osc_title(pane.session_id);
+                    let pane_title =
+                        self.resolve_session_title(&pane.title, osc.as_deref(), catalog);
                     let title_resp = ui
                         .scope(|ui| {
                             ui.set_max_width((ui.available_width() - 120.0).max(30.0));
@@ -1286,10 +1306,11 @@ impl WorkspaceUi {
                     .and_then(|s| self.sessions.get(&s))
                     .map(|v| v.summary.clone())
                     .unwrap_or_default();
+                let osc = self.session_osc_title(pane.session_id);
                 crate::ui::file_tree::SessionEntry {
                     tab: tab.id.clone(),
                     pane: pane.id.clone(),
-                    title: self.resolve_session_title(&pane.title, catalog),
+                    title: self.resolve_session_title(&pane.title, osc.as_deref(), catalog),
                     status,
                     summary,
                     focused: mux.focused_pane.as_ref() == Some(&pane.id),

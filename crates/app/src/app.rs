@@ -387,6 +387,11 @@ pub struct App {
     agent_detect_rx: std::sync::mpsc::Receiver<crate::agent_detect_worker::DetectOutcome>,
     /// 워크스페이스 전환마다 증가 — 스레드가 실어 보낸 stale 결과를 폐기하는 데 쓴다.
     agent_detect_epoch: u64,
+    /// hook 바인딩 DB 조회 스로틀(1s) — poll_agent_detect는 매 프레임 돌아 매번 쿼리하면
+    /// 렌더 중 초당 수십 회가 된다. 캐시를 워커 입력에 재사용.
+    last_hook_query: std::time::Instant,
+    hook_overrides:
+        std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
     /// 마지막으로 DB에 저장한 pane_id → row — 차등 upsert/delete 및 churn 방지용.
     persisted_agents: std::collections::HashMap<String, crate::storage::AgentSessionRow>,
     /// hook이 보고한 입력 대기(needsInput) 세션들 — DB에서 주기적으로 읽어 레일 주황 반영.
@@ -516,6 +521,8 @@ impl App {
             agent_detect_input,
             agent_detect_rx,
             agent_detect_epoch: 0,
+            last_hook_query: std::time::Instant::now(),
+            hook_overrides: std::collections::HashMap::new(),
             persisted_agents: std::collections::HashMap::new(),
             agent_needs_input: std::collections::HashSet::new(),
             restore_agents: std::collections::HashMap::new(),
@@ -530,6 +537,10 @@ impl App {
             file_tree: None,
         };
         app.prune_resolved_approvals();
+        // hook 상태 테이블 오래된 행 정리(무한 누적 방지).
+        if let Err(e) = app.db.prune_agent_hook_state() {
+            tracing::warn!("hook 상태 정리 실패: {e:#}");
+        }
         app.poll_pending_approvals();
         // 파일 트리 헤더(workspace 이름) 표시용 — 시작 시 1회 로드
         app.refresh_workspaces();
@@ -667,34 +678,39 @@ impl App {
             .filter_map(|r| r.pid.map(|pid| (r.session, pid)))
             .collect();
         // hook이 보고한 결정적 바인딩(활성 워크스페이스 것만) — 워커 탐색을 대체한다.
-        let ws_prefix = format!("{}:", self.active.id);
-        let hook_overrides: std::collections::HashMap<
-            runtime::SessionId,
-            crate::agent_detect::AgentBinding,
-        > = self
-            .db
-            .list_hook_sessions()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|r| {
-                let sid = r
-                    .session_key
-                    .strip_prefix(&ws_prefix)?
-                    .parse::<u64>()
-                    .ok()?;
-                let kind = crate::agent_detect::kind_from_str(&r.kind)?;
-                Some((
-                    runtime::SessionId(sid),
-                    crate::agent_detect::AgentBinding {
-                        kind,
-                        session_id: r.agent_session_id,
-                        transcript: std::path::PathBuf::from(r.transcript_path),
-                    },
-                ))
-            })
-            .collect();
+        // poll_agent_detect는 매 프레임 돌므로 DB 조회는 1초 스로틀 + 캐시.
+        if self.last_hook_query.elapsed() >= std::time::Duration::from_secs(1) {
+            self.last_hook_query = std::time::Instant::now();
+            let ws_prefix = format!("{}:", self.active.id);
+            self.hook_overrides = self
+                .db
+                .list_hook_sessions()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|r| {
+                    let sid = r
+                        .session_key
+                        .strip_prefix(&ws_prefix)?
+                        .parse::<u64>()
+                        .ok()?;
+                    let kind = crate::agent_detect::kind_from_str(&r.kind)?;
+                    Some((
+                        runtime::SessionId(sid),
+                        crate::agent_detect::AgentBinding {
+                            kind,
+                            session_id: r.agent_session_id,
+                            transcript: std::path::PathBuf::from(r.transcript_path),
+                        },
+                    ))
+                })
+                .collect();
+        }
         if let Ok(mut input) = self.agent_detect_input.lock() {
-            *input = (self.agent_detect_epoch, sessions, hook_overrides);
+            *input = (
+                self.agent_detect_epoch,
+                sessions,
+                self.hook_overrides.clone(),
+            );
         }
         // 결과를 논블로킹 드레인 — 최신 것만 취한다(epoch 불일치=전환 잔여는 폐기).
         let mut latest_bindings = None;

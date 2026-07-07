@@ -33,6 +33,12 @@ fn write_executable(path: &std::path::Path, content: &str) -> anyhow::Result<()>
 /// shim/hook 스크립트/claude 설정을 (재)생성한다. 매 시작 호출 — idempotent.
 pub fn install(db_path: &std::path::Path, proxy_bin: &str) -> anyhow::Result<()> {
     let Some(root) = root() else { return Ok(()) };
+    // 경로에 작은따옴표가 있으면 shim의 sh/TOML 인용이 조용히 깨진다(codex 리뷰 실험:
+    // O'Connor 홈에서 인자 mangling) — 설치 거부(극히 드묾, regex fallback 유지).
+    anyhow::ensure!(
+        !root.to_string_lossy().contains('\''),
+        "shim 경로에 작은따옴표 포함 — hook shim 미설치"
+    );
     let shims = root.join("shims");
     let hooks = root.join("hooks");
     std::fs::create_dir_all(&shims)?;
@@ -78,6 +84,9 @@ pub fn install(db_path: &std::path::Path, proxy_bin: &str) -> anyhow::Result<()>
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$SELF_DIR" | tr '\n' ':' | sed 's/:$//')"
 export PATH
+# PATH strip 실패(변형 경로 등) 시 자기 자신을 다시 exec하는 무한루프 방지 가드.
+if [ -n "${DEPPY_SHIM_GUARD:-}" ]; then echo "deppy shim: real binary not found" >&2; exit 127; fi
+export DEPPY_SHIM_GUARD=1
 "#;
 
     // claude shim

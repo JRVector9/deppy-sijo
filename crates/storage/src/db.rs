@@ -645,6 +645,20 @@ impl Db {
     }
 
     /// 에이전트 needsInput 상태를 세션 키(pane_id)로 set/clear한다 (hook 수신부가 호출).
+    /// hook 상태 테이블의 오래된 행 정리(7일) — 읽기는 최근만 보지만 행 자체가 무한
+    /// 누적되는 것을 막는다(시작 시 1회 호출).
+    pub fn prune_agent_hook_state(&self) -> anyhow::Result<()> {
+        self.conn.execute(
+            "DELETE FROM agent_hook_sessions WHERE updated_at < strftime('%s','now') - 604800",
+            [],
+        )?;
+        self.conn.execute(
+            "DELETE FROM agent_needs_input WHERE updated_at < strftime('%s','now') - 604800",
+            [],
+        )?;
+        Ok(())
+    }
+
     /// hook(SessionStart 등)이 보고한 에이전트 바인딩 upsert (v15).
     pub fn upsert_hook_session(
         &self,

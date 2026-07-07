@@ -2168,9 +2168,10 @@ pub(crate) fn session_status_color(
         Some(S::NeedsApproval) => egui::Color32::from_rgb(0xe0, 0xa8, 0x3e), // 승인(주황)
         Some(S::Done) => egui::Color32::from_rgb(0x6c, 0xc2, 0x6c),    // 완료(초록)
         Some(S::Error) => egui::Color32::from_rgb(0xe0, 0x5c, 0x53),   // 오류(빨강)
-        // 유휴(작업완료·프롬프트 복귀, 살아있음) — 차분한 회색 (실행중 시안과 구분).
-        Some(S::Idle) => egui::Color32::from_rgb(0x8b, 0x8f, 0x98),
-        // status 미보고(첫 평가 전) — Idle과 같은 회색 fallback.
+        // 유휴(에이전트 붙어있고 대기) — 차분한 초록. 이전엔 미감지와 같은 회색이라
+        // "감지 안 됨"과 구분이 안 됐다(2026-07-07 사용자: 실행중인데 안 잡혀 보임).
+        Some(S::Idle) => egui::Color32::from_rgb(0x56, 0xa0, 0x6a),
+        // status 미보고(에이전트 없음/첫 평가 전) — 회색.
         None => egui::Color32::from_rgb(0x8b, 0x8f, 0x98),
     }
 }

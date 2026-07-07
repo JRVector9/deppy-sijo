@@ -86,15 +86,23 @@ pub fn activity(binding: &AgentBinding) -> Option<agent_transcript::AgentActivit
 /// 그 에이전트 프로세스 pid도 함께 돌려준다.
 fn find_agent(shell_pid: u32, rows: &[ProcRow]) -> Option<(AgentBinding, u32)> {
     let descendants = descendant_pids(shell_pid, rows);
-    // 가장 안쪽(최근 spawn) 우선 — 트리 순서상 뒤에 오는 pid가 대체로 최신.
+    // 한 셸에 에이전트가 여럿일 수 있다(^Z 중단 후 재실행 등, 2026-07-07 실증: codex 2개).
+    // 첫 매치(pid 낮은 것 = 대체로 오래된 것)가 아니라 transcript mtime이 가장 최신인
+    // 후보를 고른다 — 활성 대화가 append 중인 쪽이 사용자가 보는 세션이다.
+    let mut best: Option<(AgentBinding, u32, Option<std::time::SystemTime>)> = None;
     for row in rows.iter().filter(|r| descendants.contains(&r.pid)) {
         if let Some((kind, sid_hint)) = classify(&row.command)
             && let Some(b) = bind_transcript(kind, sid_hint, row.pid)
         {
-            return Some((b, row.pid));
+            let mtime = std::fs::metadata(&b.transcript)
+                .and_then(|m| m.modified())
+                .ok();
+            if best.as_ref().is_none_or(|(_, _, prev)| mtime > *prev) {
+                best = Some((b, row.pid, mtime));
+            }
         }
     }
-    None
+    best.map(|(b, pid, _)| (b, pid))
 }
 
 /// command가 claude/codex인지 판별하고, claude면 argv에서 세션ID를 추출한다.

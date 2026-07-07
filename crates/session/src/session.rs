@@ -399,6 +399,7 @@ mod tests {
             program: "/bin/echo".into(),
             args: vec!["세션".into()],
             env: Vec::new(),
+            cwd: None,
         };
         let mut session =
             Session::spawn_with_spec(SessionId(1), SessionKind::Shell, &spec, 80, 24, 100).unwrap();
@@ -431,6 +432,7 @@ mod tests {
                 "for i in 1 2 3 4 5; do echo line-$i; done".into(),
             ],
             env: Vec::new(),
+            cwd: None,
         };
         let mut session =
             Session::spawn_with_spec(SessionId(3), SessionKind::Shell, &spec, 80, 24, 100).unwrap();
@@ -460,6 +462,7 @@ mod tests {
             program: "/bin/cat".into(),
             args: Vec::new(),
             env: Vec::new(),
+            cwd: None,
         };
         let mut session =
             Session::spawn_with_spec(SessionId(2), SessionKind::Shell, &spec, 80, 24, 100).unwrap();
@@ -480,6 +483,7 @@ mod tests {
             program: "/bin/sh".into(),
             args: vec!["-c".into(), "sleep 0.1; printf x; sleep 1".into()],
             env: Vec::new(),
+            cwd: None,
         };
         let mut session =
             Session::spawn_with_spec(SessionId(5), SessionKind::Shell, &spec, 80, 24, 100).unwrap();
@@ -514,6 +518,7 @@ mod tests {
             program: "/bin/sleep".into(),
             args: vec!["1".into()],
             env: Vec::new(),
+            cwd: None,
         };
         let mut session =
             Session::spawn_with_spec(SessionId(6), SessionKind::Shell, &spec, 80, 24, 100).unwrap();
@@ -540,6 +545,7 @@ mod tests {
                 "i=0; while [ $i -lt 700 ]; do echo line-$i; i=$((i+1)); done; sleep 30".into(),
             ],
             env: Vec::new(),
+            cwd: None,
         };
         let mut session =
             Session::spawn_with_spec(SessionId(4), SessionKind::Shell, &spec, 240, 5, 10_000)

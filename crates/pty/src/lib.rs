@@ -22,6 +22,9 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     /// 추가 환경변수 (상속 env 위에 덮어쓴다)
     pub env: Vec<(String, String)>,
+    /// 작업 디렉터리. None이면 부모 프로세스 cwd 상속(= 앱 실행 위치). 셸은 workspace
+    /// 폴더에서 뜨도록 설정한다 — 재시작 시 루트로 튕기지 않게(에이전트 이어가기).
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 /// 플랫폼 기본 셸 (설계문서 PR-04: macOS zsh / Windows PowerShell).
@@ -34,6 +37,7 @@ pub fn default_shell() -> CommandSpec {
         program,
         args: Vec::new(),
         env: Vec::new(),
+        cwd: None,
     }
 }
 
@@ -110,6 +114,9 @@ impl PtyBackend for PortablePtyBackend {
         builder.args(&cmd.args);
         for (key, value) in &cmd.env {
             builder.env(key, value);
+        }
+        if let Some(cwd) = &cmd.cwd {
+            builder.cwd(cwd);
         }
         let child = pair
             .slave
@@ -308,6 +315,7 @@ mod tests {
                     program: program.into(),
                     args: args.iter().map(|s| (*s).into()).collect(),
                     env: Vec::new(),
+                    cwd: None,
                 },
                 80,
                 24,

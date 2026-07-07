@@ -56,13 +56,18 @@ impl InProcessRuntimeClient {
         logs_root: PathBuf,
         redaction: RedactionService,
         persist: Option<crate::persistence::PersistConfig>,
+        // 셸 작업 디렉터리(workspace 폴더). None이면 앱 cwd 상속 — 재시작 시 셸이 이 폴더에서
+        // 떠서 claude/codex를 이어갈 수 있다(#2 루트로 튕김 수정).
+        cwd: Option<PathBuf>,
     ) -> Self {
+        let mut shell = pty::default_shell();
+        shell.cwd = cwd;
         Self::with_shell(
             output_batch_ms,
             secret_store,
             logs_root,
             redaction,
-            pty::default_shell(),
+            shell,
             persist,
         )
     }
@@ -642,6 +647,8 @@ impl Worker {
                     program: command,
                     args,
                     env,
+                    // 에이전트도 워크스페이스 폴더에서 실행 — 셸과 동일 cwd(agent 이어가기).
+                    cwd: self.shell.cwd.clone(),
                 };
                 match session::spawn_agent(id, &spec, cols, rows, scrollback_lines) {
                     Ok(new_session) => {
@@ -1618,6 +1625,7 @@ mod tests {
             program: program.into(),
             args: args.iter().map(|s| (*s).into()).collect(),
             env: Vec::new(),
+            cwd: None,
         }
     }
 

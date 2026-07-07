@@ -573,6 +573,14 @@ impl App {
     ) -> WorkspaceRuntime {
         // 세션 로그 루트: logs/<workspace_id>/ (설계문서 7장)
         let logs_root = logs_base.join(workspace_id);
+        // 셸 cwd = workspace 폴더(존재하는 디렉터리일 때만) — 재시작 시 루트가 아닌 이 폴더에서
+        // 셸이 떠 claude/codex를 이어갈 수 있다(#2). 미설정/무효면 None(앱 cwd 상속).
+        let shell_cwd = db
+            .workspace_path(workspace_id)
+            .ok()
+            .flatten()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir());
         let runtime = InProcessRuntimeClient::new(
             config.performance.output_batch_ms,
             Arc::new(KeyringSecretStore),
@@ -582,6 +590,7 @@ impl App {
                 db_path: db_path.to_path_buf(),
                 workspace_id: workspace_id.to_owned(),
             }),
+            shell_cwd,
         );
         // 상태 이벤트 도착 시 UI를 깨운다 (§14.1 Warm 알림 유지). subscribe→restore 순서
         // 를 코드로 보장하려 subscribe 직후 복원 명령을 보낸다.
@@ -802,6 +811,7 @@ impl App {
             self.logs_base.join("remote"),
             self.redaction.clone(),
             None, // 원격 세션은 영속하지 않는다
+            None, // 원격은 workspace 폴더 개념 없음 — cwd 상속
         );
         Self::seed_redaction(&worker, &self.db);
         let addr =

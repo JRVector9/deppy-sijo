@@ -2251,6 +2251,7 @@ mod tests {
                 program: "/bin/sh".into(),
                 args: vec!["-c".into(), "echo remote-ok; sleep 5".into()],
                 env: Vec::new(),
+                cwd: None,
             },
             None,
         )
@@ -3711,6 +3712,7 @@ mod tests {
                 program: "/bin/sh".into(),
                 args,
                 env: Vec::new(),
+                cwd: None,
             },
             None,
         )

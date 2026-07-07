@@ -1177,9 +1177,8 @@ impl App {
         }
         self.refresh_file_tree_root();
         // 새 workspace의 .env → 환경 profile 동기화 + 기본 env 주입 (2026-07-07).
+        // 폴링 기준점도 내부에서 새 root 기준으로 다시 잡힌다.
         self.sync_dotenv_env();
-        // mtime 폴링 상태 리셋 — 새 root의 첫 관측을 기준점으로 다시 잡는다.
-        self.last_dotenv_state = None;
         self.egui_ctx.request_repaint();
 
         self.evict_warm();
@@ -1328,6 +1327,20 @@ impl App {
                 env_plain,
                 env_secrets,
             });
+        // 폴링 기준점을 지금 상태로 — sync~첫 폴링 사이의 .env 변경이 "첫 관측 기록"으로
+        // 삼켜져 재동기화를 건너뛰지 않게 한다(codex 검증 반영).
+        self.last_dotenv_state = Some(self.dotenv_stat());
+    }
+
+    /// 활성 workspace `.env`의 (존재여부, mtime) — 폴링 비교용.
+    fn dotenv_stat(&self) -> (bool, Option<std::time::SystemTime>) {
+        match self.active_tree_root() {
+            Some(root) => match std::fs::metadata(root.join(".env")) {
+                Ok(meta) => (true, meta.modified().ok()),
+                Err(_) => (false, None),
+            },
+            None => (false, None),
+        }
     }
 
     /// .env (존재여부, mtime)을 2초 간격으로 폴링해 변화 시 재동기화한다 — 사이드바 OFF로
@@ -1337,21 +1350,11 @@ impl App {
             return;
         }
         self.last_dotenv_check = std::time::Instant::now();
-        let state = match self.active_tree_root() {
-            Some(root) => match std::fs::metadata(root.join(".env")) {
-                Ok(meta) => (true, meta.modified().ok()),
-                Err(_) => (false, None),
-            },
-            None => (false, None),
-        };
-        match self.last_dotenv_state {
-            // 첫 관측은 기록만 — 시작/전환 시의 sync_dotenv_env가 이미 처리했다.
-            None => self.last_dotenv_state = Some(state),
-            Some(prev) if prev != state => {
-                self.last_dotenv_state = Some(state);
-                self.sync_dotenv_env();
-            }
-            Some(_) => {}
+        let state = self.dotenv_stat();
+        // 기준점은 sync_dotenv_env가 매번 스스로 잡는다(시작/전환 직후 포함) — 여기서는
+        // 변화 감지만. None(이론상 미도달)도 안전하게 재동기화로 처리.
+        if self.last_dotenv_state != Some(state) {
+            self.sync_dotenv_env(); // 내부에서 last_dotenv_state 갱신
         }
     }
 

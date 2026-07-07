@@ -108,6 +108,7 @@ workspace.manager.new_workspace = 新しいワークスペース
 workspace.manager.project_path = プロジェクトパス
 workspace.manager.project_path_hint = 任意: /path/to/project
 workspace.manager.rename = 名前変更
+workspace.manager.rename_hint = 右クリックで名前を変更
 workspace.manager.name_save = 保存
 workspace.manager.name_cancel = キャンセル
 workspace.manager.name_hint = ワークスペース名

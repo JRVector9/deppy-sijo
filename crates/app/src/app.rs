@@ -645,6 +645,44 @@ impl App {
         }
     }
 
+    /// 에이전트 감지 워커의 입력 갱신 + 결과 드레인 — ui()가 아닌 logic()에서 돈다.
+    /// hidden/minimized로 ui()가 스킵돼도 결과를 소비해 unbounded 채널 누적을 막는다
+    /// (§14.1 Warm: 창이 안 보이면 logic()만 호출됨, codex 리뷰). UI(egui)에 의존하지 않는
+    /// 순수 상태 갱신이라 logic()이 올바른 위치다.
+    fn poll_agent_detect(&mut self) {
+        // 워커 입력(활성 세션 pid 목록 + epoch)을 최신값으로 갱신 — 워커가 다음 tick에 읽어
+        // ps/lsof/transcript 스캔을 UI 스레드 밖에서 수행한다.
+        let sessions: Vec<(runtime::SessionId, u32)> = self
+            .active
+            .session_resource_usage
+            .iter()
+            .filter_map(|r| r.pid.map(|pid| (r.session, pid)))
+            .collect();
+        if let Ok(mut input) = self.agent_detect_input.lock() {
+            *input = (self.agent_detect_epoch, sessions);
+        }
+        // 결과를 논블로킹 드레인 — 최신 것만 취한다(epoch 불일치=전환 잔여는 폐기).
+        let mut latest_bindings = None;
+        let mut latest_activity = None;
+        while let Ok(outcome) = self.agent_detect_rx.try_recv() {
+            if outcome.epoch != self.agent_detect_epoch {
+                continue;
+            }
+            latest_activity = Some(outcome.activity);
+            if outcome.bindings.is_some() {
+                latest_bindings = outcome.bindings;
+            }
+        }
+        if let Some(activity) = latest_activity {
+            self.agent_activity = activity;
+            self.refresh_needs_input();
+        }
+        if let Some(bindings) = latest_bindings {
+            self.agent_bindings = bindings.clone();
+            self.process_agent_bindings(&bindings);
+        }
+    }
+
     /// hook이 보고한 입력 대기 세션(needsInput)을 DB에서 읽어 갱신한다. session_key는
     /// `{workspace_id}:{session_id}` — SessionId가 워커마다 1부터라 전역 유일하지 않아
     /// workspace_id로 스코프한다(codex High). 활성 워크스페이스 것만 남긴다.
@@ -1062,7 +1100,7 @@ impl App {
     }
 
     /// 워크스페이스 표시 이름 — 사용자가 이름을 지정했으면 그 이름, 아니면(‘default’/빈값)
-    /// 프로젝트 경로의 폴더명으로 대체한다(#3). "셸 12" 대신 프로젝트명이 보이게.
+    /// 프로젝트 폴더명(≈깃 레포명)으로 대체한다. 폴더도 없으면 "~"(아직 아무것도 없음).
     fn workspace_display_name(row: &crate::storage::WorkspaceRow) -> String {
         let name = row.name.trim();
         if !name.is_empty() && name != "default" {
@@ -1074,11 +1112,8 @@ impl App {
         {
             return base.to_string_lossy().into_owned();
         }
-        if name.is_empty() {
-            "default".to_owned()
-        } else {
-            name.to_owned()
-        }
+        // 이름 미지정 + 폴더 미설정 → "~" (홈/미설정 표시).
+        "~".to_owned()
     }
 
     fn workspace_path_to_tree_root(path: Option<String>) -> Option<PathBuf> {
@@ -1408,6 +1443,10 @@ impl eframe::App for App {
         if self.approval_poll_requested.swap(false, Ordering::AcqRel) {
             self.poll_pending_approvals();
         }
+
+        // 에이전트 감지 워커 입력 갱신 + 결과 드레인 — ui()가 아닌 여기(logic)에서 해야
+        // hidden/minimized로 ui()가 스킵돼도 결과 채널이 누적되지 않는다(codex 리뷰).
+        self.poll_agent_detect();
     }
 
     // egui 0.35부터 update(&Context) 대신 ui(&mut Ui) 시그니처를 쓴다.
@@ -1547,41 +1586,6 @@ impl eframe::App for App {
                 // 툴바-본문 경계선은 egui Panel::top이 자체로 그린다 — 커스텀 hairline을
                 // 추가하면 패널 여백 탓에 끝까지 안 닿는 짧은 선이 겹쳤다(#65 사용자).
             });
-
-        // ── 옵션2: 에이전트 상태 (감지는 백그라운드 워커, codex #3) ──
-        // 워커 입력(활성 세션 pid 목록 + epoch)을 최신값으로 갱신한다. 워커가 다음 tick에
-        // 읽어 ps/lsof/transcript 스캔을 UI 스레드 밖에서 수행한다.
-        {
-            let sessions: Vec<(runtime::SessionId, u32)> = self
-                .active
-                .session_resource_usage
-                .iter()
-                .filter_map(|r| r.pid.map(|pid| (r.session, pid)))
-                .collect();
-            if let Ok(mut input) = self.agent_detect_input.lock() {
-                *input = (self.agent_detect_epoch, sessions);
-            }
-        }
-        // 워커 결과를 논블로킹 드레인 — 최신 것만 취한다(epoch 불일치=전환 잔여는 폐기).
-        let mut latest_bindings = None;
-        let mut latest_activity = None;
-        while let Ok(outcome) = self.agent_detect_rx.try_recv() {
-            if outcome.epoch != self.agent_detect_epoch {
-                continue;
-            }
-            latest_activity = Some(outcome.activity);
-            if outcome.bindings.is_some() {
-                latest_bindings = outcome.bindings;
-            }
-        }
-        if let Some(activity) = latest_activity {
-            self.agent_activity = activity;
-            self.refresh_needs_input();
-        }
-        if let Some(bindings) = latest_bindings {
-            self.agent_bindings = bindings.clone();
-            self.process_agent_bindings(&bindings);
-        }
 
         // 폴더 트리 사이드바 (FT-1) — CentralPanel보다 먼저 배치해야 한다 (§9-1).
         // OFF(None)면 Panel 자체를 만들지 않는다 (§6 리소스 0).
@@ -1888,17 +1892,24 @@ impl eframe::App for App {
                                     }
                                 } else {
                                     let display = Self::workspace_display_name(ws);
+                                    // 이름 label 우클릭 → 이름 편집 시작(사용자 요청).
+                                    let label = egui::RichText::new(&display);
+                                    let label = if ws.id == wsid { label.strong() } else { label };
+                                    let name_resp = ui
+                                        .add(egui::Label::new(label).sense(egui::Sense::click()))
+                                        .on_hover_text(
+                                            text.t("workspace.manager.rename_hint", &[]),
+                                        );
+                                    if name_resp.secondary_clicked() {
+                                        ws_edit_start = Some((ws.id.clone(), display.clone()));
+                                    }
                                     if ws.id == wsid {
-                                        ui.strong(&display);
                                         ui.weak(text.t("workspace.manager.current", &[]));
-                                    } else {
-                                        ui.label(&display);
-                                        if ui
-                                            .button(text.t("workspace.manager.switch", &[]))
-                                            .clicked()
-                                        {
-                                            ws_switch = Some(ws.id.clone());
-                                        }
+                                    } else if ui
+                                        .button(text.t("workspace.manager.switch", &[]))
+                                        .clicked()
+                                    {
+                                        ws_switch = Some(ws.id.clone());
                                     }
                                     if ui.button(text.t("workspace.manager.rename", &[])).clicked()
                                     {

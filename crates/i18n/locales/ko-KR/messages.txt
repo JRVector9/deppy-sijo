@@ -108,6 +108,7 @@ workspace.manager.new_workspace = 새 워크스페이스
 workspace.manager.project_path = 프로젝트 경로
 workspace.manager.project_path_hint = 선택: /path/to/project
 workspace.manager.rename = 이름 변경
+workspace.manager.rename_hint = 우클릭으로 이름 변경
 workspace.manager.name_save = 저장
 workspace.manager.name_cancel = 취소
 workspace.manager.name_hint = 워크스페이스 이름

@@ -19,7 +19,7 @@ const BINDING_INTERVAL: Duration = Duration::from_millis(2500);
 const ACTIVITY_INTERVAL: Duration = Duration::from_millis(1500);
 
 /// App → 스레드 입력: (epoch, 활성 세션 pid 목록). 최신 값 하나만 의미 있다.
-pub type DetectInput = Arc<Mutex<(u64, Vec<(SessionId, u32)>)>>;
+pub type DetectInput = Arc<Mutex<(u64, Vec<(SessionId, u32)>, HashMap<SessionId, AgentBinding>)>>;
 
 /// 스레드 → App 결과. bindings는 바인딩 tier에서만 Some(활동 tier는 None), activity는 매번.
 pub struct DetectOutcome {
@@ -45,7 +45,7 @@ fn compute_activity(
 impl AgentDetectWorker {
     /// 전용 스레드를 띄운다. 입력 핸들과 결과 수신 채널을 함께 돌려준다.
     pub fn spawn(ctx: egui::Context) -> (Self, DetectInput, mpsc::Receiver<DetectOutcome>) {
-        let input: DetectInput = Arc::new(Mutex::new((0, Vec::new())));
+        let input: DetectInput = Arc::new(Mutex::new((0, Vec::new(), HashMap::new())));
         let (out_tx, out_rx) = mpsc::channel();
         let (stop_tx, stop_rx) = mpsc::channel();
         let input2 = input.clone();
@@ -72,7 +72,7 @@ impl AgentDetectWorker {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                     }
-                    let (epoch, sessions) = input2.lock().unwrap().clone();
+                    let (epoch, sessions, overrides) = input2.lock().unwrap().clone();
                     // 워크스페이스 전환(epoch 변경) 시 캐시를 비운다 — SessionId가 워커마다
                     // 1부터라 캐시가 다른 워크스페이스 세션과 충돌하는 것을 막는다.
                     if epoch != last_epoch {
@@ -83,7 +83,7 @@ impl AgentDetectWorker {
                     if last_binding.elapsed() >= BINDING_INTERVAL {
                         last_binding = Instant::now();
                         last_activity = Instant::now();
-                        bindings = agent_detect::detect_cached(&sessions, &mut cache);
+                        bindings = agent_detect::detect_cached(&sessions, &overrides, &mut cache);
                         let activity = compute_activity(&bindings);
                         let sent = out_tx.send(DetectOutcome {
                             epoch,

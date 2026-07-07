@@ -167,6 +167,17 @@ CREATE TABLE agent_needs_input (
     updated_at INTEGER NOT NULL
 );
 ",
+    // v15: hook이 보고한 에이전트 세션 바인딩 (SessionStart 등 — session_key는
+    // {workspace_id}:{session_id}, 옵션2 hook 배선의 결정적 바인딩 소스)
+    "
+CREATE TABLE agent_hook_sessions (
+    session_key TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    agent_session_id TEXT NOT NULL,
+    transcript_path TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -177,6 +188,15 @@ pub struct AgentSessionRow {
     pub kind: String,
     /// 에이전트 자신의 세션 ID (`claude --resume <id>` / `codex resume <id>`).
     pub session_id: String,
+}
+
+/// hook이 보고한 세션 바인딩 행 (v15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookSessionRow {
+    pub session_key: String,
+    pub kind: String,
+    pub agent_session_id: String,
+    pub transcript_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -625,6 +645,44 @@ impl Db {
     }
 
     /// 에이전트 needsInput 상태를 세션 키(pane_id)로 set/clear한다 (hook 수신부가 호출).
+    /// hook(SessionStart 등)이 보고한 에이전트 바인딩 upsert (v15).
+    pub fn upsert_hook_session(
+        &self,
+        session_key: &str,
+        kind: &str,
+        agent_session_id: &str,
+        transcript_path: &str,
+    ) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO agent_hook_sessions
+                 (session_key, kind, agent_session_id, transcript_path, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, strftime('%s','now'))",
+                rusqlite::params![session_key, kind, agent_session_id, transcript_path],
+            )
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
+    /// hook이 보고한 바인딩 목록 (최근 24h — 죽은 세션 행이 영원히 남지 않게).
+    pub fn list_hook_sessions(&self) -> anyhow::Result<Vec<HookSessionRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_key, kind, agent_session_id, transcript_path FROM agent_hook_sessions
+             WHERE updated_at > strftime('%s','now') - 86400",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(HookSessionRow {
+                    session_key: r.get(0)?,
+                    kind: r.get(1)?,
+                    agent_session_id: r.get(2)?,
+                    transcript_path: r.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn set_agent_needs_input(&self, session_key: &str, waiting: bool) -> anyhow::Result<()> {
         self.conn
             .execute(

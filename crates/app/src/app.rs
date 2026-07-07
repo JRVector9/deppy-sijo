@@ -429,6 +429,13 @@ impl App {
         config.ui.last_workspace_id = Some(workspace_id.clone());
         let redaction = secret::RedactionService::new();
         let i18n = load_catalog(&config.i18n.locale);
+        // shim을 make_runtime 전에 설치한다 — 첫 셸부터 PATH에 shim이 얹히도록.
+        if config.ui.agent_status_hooks
+            && let Ok(bin) = crate::ui::agents::mcp_proxy_bin()
+            && let Err(e) = crate::agent_shim::install(&db_path, &bin)
+        {
+            tracing::warn!("agent shim 설치 실패: {e:#}");
+        }
         let active = Self::make_runtime(
             &config,
             &logs_base,
@@ -591,6 +598,7 @@ impl App {
                 workspace_id: workspace_id.to_owned(),
             }),
             shell_cwd,
+            Self::shim_shell_env(config),
         );
         // 상태 이벤트 도착 시 UI를 깨운다 (§14.1 Warm 알림 유지). subscribe→restore 순서
         // 를 코드로 보장하려 subscribe 직후 복원 명령을 보낸다.
@@ -658,8 +666,35 @@ impl App {
             .iter()
             .filter_map(|r| r.pid.map(|pid| (r.session, pid)))
             .collect();
+        // hook이 보고한 결정적 바인딩(활성 워크스페이스 것만) — 워커 탐색을 대체한다.
+        let ws_prefix = format!("{}:", self.active.id);
+        let hook_overrides: std::collections::HashMap<
+            runtime::SessionId,
+            crate::agent_detect::AgentBinding,
+        > = self
+            .db
+            .list_hook_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| {
+                let sid = r
+                    .session_key
+                    .strip_prefix(&ws_prefix)?
+                    .parse::<u64>()
+                    .ok()?;
+                let kind = crate::agent_detect::kind_from_str(&r.kind)?;
+                Some((
+                    runtime::SessionId(sid),
+                    crate::agent_detect::AgentBinding {
+                        kind,
+                        session_id: r.agent_session_id,
+                        transcript: std::path::PathBuf::from(r.transcript_path),
+                    },
+                ))
+            })
+            .collect();
         if let Ok(mut input) = self.agent_detect_input.lock() {
-            *input = (self.agent_detect_epoch, sessions);
+            *input = (self.agent_detect_epoch, sessions, hook_overrides);
         }
         // 결과를 논블로킹 드레인 — 최신 것만 취한다(epoch 불일치=전환 잔여는 폐기).
         let mut latest_bindings = None;
@@ -806,17 +841,30 @@ impl App {
         }
     }
 
+    /// shim PATH env — hook 토글 ON이고 shim이 설치돼 있으면 셸 PATH 앞에 주입한다.
+    fn shim_shell_env(config: &Config) -> Vec<(String, String)> {
+        if !config.ui.agent_status_hooks {
+            return Vec::new();
+        }
+        let Some(dir) = crate::agent_shim::shim_dir() else {
+            return Vec::new();
+        };
+        let path = std::env::var("PATH").unwrap_or_default();
+        vec![("PATH".to_owned(), format!("{}:{path}", dir.display()))]
+    }
+
     /// 에이전트 상태 hook을 설정 토글에 맞춰 전역 설치/해제한다(옵션2 needsInput).
     /// best-effort — 실패해도 앱은 정상 동작(regex fallback). claude + codex.
     fn sync_agent_hooks(&self) {
         let result = (|| -> anyhow::Result<()> {
+            // 전역 config 방식(구)은 항상 정리한다 — shim 방식으로 전환(cmux식, 2026-07-07).
+            crate::agent_hooks::uninstall_claude()?;
+            crate::agent_hooks::uninstall_codex()?;
             if self.config.ui.agent_status_hooks {
                 let bin = crate::ui::agents::mcp_proxy_bin()?;
-                crate::agent_hooks::install_claude(&self.db_path, &bin)?;
-                crate::agent_hooks::install_codex(&self.db_path, &bin)?;
+                crate::agent_shim::install(&self.db_path, &bin)?;
             } else {
-                crate::agent_hooks::uninstall_claude()?;
-                crate::agent_hooks::uninstall_codex()?;
+                crate::agent_shim::remove()?;
             }
             Ok(())
         })();
@@ -855,8 +903,9 @@ impl App {
             Arc::new(KeyringSecretStore),
             self.logs_base.join("remote"),
             self.redaction.clone(),
-            None, // 원격 세션은 영속하지 않는다
-            None, // 원격은 workspace 폴더 개념 없음 — cwd 상속
+            None,       // 원격 세션은 영속하지 않는다
+            None,       // 원격은 workspace 폴더 개념 없음 — cwd 상속
+            Vec::new(), // 원격 셸엔 shim 미주입
         );
         Self::seed_redaction(&worker, &self.db);
         let addr =

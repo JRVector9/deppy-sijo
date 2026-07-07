@@ -48,12 +48,24 @@ pub struct BindingCache {
 /// 캐시를 활용한 detect. `cache`는 호출측(워커 스레드)이 소유·유지한다.
 pub fn detect_cached(
     sessions: &[(SessionId, u32)],
+    overrides: &HashMap<SessionId, AgentBinding>,
     cache: &mut BindingCache,
 ) -> HashMap<SessionId, AgentBinding> {
     let rows = process_rows();
     let live_pids: std::collections::HashSet<u32> = rows.iter().map(|r| r.pid).collect();
     let mut out = HashMap::new();
     for (sid, shell_pid) in sessions {
+        // hook(SessionStart 등)이 보고한 바인딩이 있으면 그것이 결정적 — 프로세스 생존만
+        // 확인하고 탐색 전체를 스킵한다(cmux식 이벤트 바인딩, 2026-07-07).
+        if let Some(b) = overrides.get(sid) {
+            if let Some(owner) = find_agent_pid(*shell_pid, &rows) {
+                cache.entries.insert(*sid, (b.clone(), owner, true));
+                out.insert(*sid, b.clone());
+            } else {
+                cache.entries.remove(sid);
+            }
+            continue;
+        }
         // 캐시 히트 + owner 프로세스 생존 → 재발견 스킵. 단 휴리스틱 바인딩은 lsof로
         // 결정적 업그레이드를 시도한다(작업 중 rollout이 열리면 정확한 파일로 교체).
         if let Some((binding, owner_pid, det)) = cache.entries.get(sid)
@@ -111,6 +123,15 @@ pub fn activity(binding: &AgentBinding) -> Option<agent_transcript::AgentActivit
 
 /// 셸 pid의 자손 중 claude/codex를 찾아 transcript까지 바인딩한다. 캐시 생존 확인용으로
 /// 그 에이전트 프로세스 pid도 함께 돌려준다.
+/// 셸 자손 중 에이전트 프로세스가 있으면 그 pid (생존 확인용 — 바인딩은 hook이 제공).
+fn find_agent_pid(shell_pid: u32, rows: &[ProcRow]) -> Option<u32> {
+    let descendants = descendant_pids(shell_pid, rows);
+    rows.iter()
+        .filter(|r| descendants.contains(&r.pid))
+        .find(|r| classify(&r.command).is_some())
+        .map(|r| r.pid)
+}
+
 fn find_agent(shell_pid: u32, rows: &[ProcRow]) -> Option<(AgentBinding, u32, bool)> {
     let descendants = descendant_pids(shell_pid, rows);
     // 한 셸에 에이전트가 여럿일 수 있다(^Z 중단 후 재실행 등, 2026-07-07 실증: codex 2개).

@@ -59,9 +59,12 @@ impl InProcessRuntimeClient {
         // 셸 작업 디렉터리(workspace 폴더). None이면 앱 cwd 상속 — 재시작 시 셸이 이 폴더에서
         // 떠서 claude/codex를 이어갈 수 있다(#2 루트로 튕김 수정).
         cwd: Option<PathBuf>,
+        // 셸에 추가할 env (예: PATH 앞단에 deppy shim 디렉터리 — cmux식 hook 주입).
+        extra_env: Vec<(String, String)>,
     ) -> Self {
         let mut shell = pty::default_shell();
         shell.cwd = cwd;
+        shell.env.extend(extra_env);
         Self::with_shell(
             output_batch_ms,
             secret_store,

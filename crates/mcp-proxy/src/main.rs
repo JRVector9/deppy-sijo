@@ -125,9 +125,11 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
             _ => {}
         }
     }
-    // hook payload(claude/codex가 stdin으로 보냄)를 끝까지 읽어 버린다 — 안 읽고 종료하면
-    // 에이전트의 write가 broken pipe로 막힐 수 있다(codex 지적).
-    let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+    // hook payload(claude/codex가 stdin으로 보냄)를 끝까지 읽는다 — 안 읽고 종료하면
+    // 에이전트의 write가 broken pipe로 막힐 수 있고(codex 지적), payload에 세션 바인딩
+    // (session_id/transcript_path)이 들어 있어 결정적 바인딩 소스로 기록한다.
+    let mut payload = String::new();
+    let _ = std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut payload);
     // codex는 hook stdout이 유효 JSON이길 기대 — 무슨 일이 있어도 '{}' 출력.
     println!("{{}}");
     let Some(session_key) = std::env::var("DEPPY_SESSION_ID")
@@ -140,7 +142,24 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     };
     if let Ok(db) = storage::Db::open(&db_path) {
-        let _ = db.set_agent_needs_input(&session_key, event == "needs-input");
+        // needsInput 이벤트만 대기 상태를 바꾼다. session-start 등은 바인딩만 기록.
+        if event == "needs-input" || event == "clear" {
+            let _ = db.set_agent_needs_input(&session_key, event == "needs-input");
+        }
+        // 어떤 이벤트든 payload에 (session_id, transcript_path)가 오면 최신 바인딩으로 갱신.
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
+            let sid = v.get("session_id").and_then(|x| x.as_str());
+            let path = v.get("transcript_path").and_then(|x| x.as_str());
+            if let (Some(sid), Some(path)) = (sid, path) {
+                // kind는 transcript 경로로 판별(.codex=codex, 그 외=claude).
+                let kind = if path.contains("/.codex/") {
+                    "codex"
+                } else {
+                    "claude"
+                };
+                let _ = db.upsert_hook_session(&session_key, kind, sid, path);
+            }
+        }
     }
     Ok(())
 }

@@ -377,10 +377,16 @@ pub struct App {
     /// 활동 폴(빠름)이 이걸 재파싱한다.
     agent_bindings:
         std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
-    /// 바인딩 감지(ps/lsof, 에이전트 시작/종료 드묾) 스로틀 — 2.5초.
-    last_binding_poll: std::time::Instant,
-    /// 활동 파싱(바인딩된 transcript tail-read, 가벼움) 스로틀 — 에이전트 있을 때만 1.5초.
-    last_activity_poll: std::time::Instant,
+    /// agent 감지 백그라운드 워커(ps/lsof/transcript 스캔을 UI 스레드 밖에서, codex #3).
+    /// 필드로 보유만 한다 — App drop 시 이 필드의 Drop이 스레드를 stop+join한다(직접 read X).
+    #[allow(dead_code)]
+    agent_detect_worker: crate::agent_detect_worker::AgentDetectWorker,
+    /// 워커 입력(활성 세션 pid 목록 + epoch) — 매 프레임 최신값 write-through.
+    agent_detect_input: crate::agent_detect_worker::DetectInput,
+    /// 워커 결과 수신 채널.
+    agent_detect_rx: std::sync::mpsc::Receiver<crate::agent_detect_worker::DetectOutcome>,
+    /// 워크스페이스 전환마다 증가 — 스레드가 실어 보낸 stale 결과를 폐기하는 데 쓴다.
+    agent_detect_epoch: u64,
     /// 마지막으로 DB에 저장한 pane_id → row — 차등 upsert/delete 및 churn 방지용.
     persisted_agents: std::collections::HashMap<String, crate::storage::AgentSessionRow>,
     /// hook이 보고한 입력 대기(needsInput) 세션들 — DB에서 주기적으로 읽어 레일 주황 반영.
@@ -462,6 +468,9 @@ impl App {
             approval_poll_requested.clone(),
             std::time::Duration::from_millis(Self::APPROVAL_POLL_MS),
         );
+        // agent 감지 백그라운드 워커 (ps/lsof/transcript 스캔을 UI 스레드 밖에서, codex #3).
+        let (agent_detect_worker, agent_detect_input, agent_detect_rx) =
+            crate::agent_detect_worker::AgentDetectWorker::spawn(egui_ctx.clone());
 
         let mut app = Self {
             config,
@@ -496,8 +505,10 @@ impl App {
             ws_name_edit: None,
             agent_activity: std::collections::HashMap::new(),
             agent_bindings: std::collections::HashMap::new(),
-            last_binding_poll: std::time::Instant::now(),
-            last_activity_poll: std::time::Instant::now(),
+            agent_detect_worker,
+            agent_detect_input,
+            agent_detect_rx,
+            agent_detect_epoch: 0,
             persisted_agents: std::collections::HashMap::new(),
             agent_needs_input: std::collections::HashSet::new(),
             restore_agents: std::collections::HashMap::new(),
@@ -641,6 +652,109 @@ impl App {
                 s.parse::<u64>().ok().map(runtime::SessionId)
             })
             .collect();
+    }
+
+    /// 바인딩 감지 결과를 소비한다 — 저장(차등 upsert/delete) + 복원 resume 주입. 워커
+    /// 스레드에서 계산된 bindings를 받아 UI 스레드(여기)에서 부수효과만 처리한다(codex #3).
+    fn process_agent_bindings(
+        &mut self,
+        bindings: &std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
+    ) {
+        // 복원용 저장 데이터를 먼저 로드한다(아래 persistence가 지우기 전에). 전환 시 재로드.
+        if self.restore_loaded_for.as_deref() != Some(self.active.id.as_str()) {
+            self.restore_agents = self
+                .db
+                .list_agent_sessions(&self.active.id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| (r.pane_id.clone(), r))
+                .collect();
+            // persisted_agents는 "이번 세션에 감지해 저장한 것"만 추적한다(빈 맵 시작 — 아직
+            // 감지 전인 복원 데이터를 삭제 루프가 지우지 않게, codex).
+            self.persisted_agents = std::collections::HashMap::new();
+            self.resumed_panes.clear();
+            self.restore_loaded_for = Some(self.active.id.clone());
+        }
+
+        let mux = self.active.workspace_ui.mux().cloned();
+        let current: std::collections::HashMap<String, crate::storage::AgentSessionRow> = bindings
+            .iter()
+            .filter_map(|(sid, b)| {
+                let pane = mux.as_ref().and_then(|m| pane_of_session(m, *sid))?;
+                let kind = match b.kind {
+                    crate::agent_detect::AgentKind::Claude => "claude",
+                    crate::agent_detect::AgentKind::Codex => "codex",
+                };
+                Some((
+                    pane.0.clone(),
+                    crate::storage::AgentSessionRow {
+                        pane_id: pane.0,
+                        kind: kind.to_owned(),
+                        session_id: b.session_id.clone(),
+                    },
+                ))
+            })
+            .collect();
+        for (pane_id, row) in &current {
+            if self.persisted_agents.get(pane_id) != Some(row)
+                && let Err(e) = self.db.upsert_agent_session(
+                    &self.active.id,
+                    pane_id,
+                    &row.kind,
+                    &row.session_id,
+                )
+            {
+                tracing::warn!("agent session 저장 실패: {e:#}");
+            }
+        }
+        for pane_id in self.persisted_agents.keys() {
+            if !current.contains_key(pane_id) {
+                let _ = self.db.delete_agent_session(&self.active.id, pane_id);
+            }
+        }
+        self.persisted_agents = current;
+
+        // 복원 resume 주입: 저장된 에이전트가 있는 pane에 에이전트가 아직 안 떠 있으면
+        // native resume 명령을 셸에 한 번 보낸다(설정으로 끌 수 있다, 기본 ON).
+        if self.config.ui.auto_resume_agents
+            && let Some(mux) = &mux
+        {
+            for pane in mux.tabs.iter().flat_map(|t| &t.panes) {
+                let pane_key = pane.id.0.clone();
+                let Some(saved) = self.restore_agents.get(&pane_key) else {
+                    continue;
+                };
+                let Some(session) = pane.session_id else {
+                    continue;
+                };
+                if self.resumed_panes.contains(&pane_key) || bindings.contains_key(&session) {
+                    continue; // 이미 보냈거나 이미 실행 중
+                }
+                // 대상 transcript가 아직 존재하는지 확인 — 지워진 세션에 --resume 안 던짐.
+                let kind = crate::agent_detect::kind_from_str(&saved.kind);
+                let exists = kind.is_some_and(|k| {
+                    crate::agent_detect::find_transcript(k, &saved.session_id).is_some()
+                });
+                if !exists {
+                    let _ = self.db.delete_agent_session(&self.active.id, &pane_key);
+                    self.resumed_panes.insert(pane_key);
+                    continue;
+                }
+                let cmd = match saved.kind.as_str() {
+                    "claude" => format!("claude --resume {}\n", saved.session_id),
+                    "codex" => format!("codex resume {}\n", saved.session_id),
+                    _ => continue,
+                };
+                let _ = self
+                    .active
+                    .runtime
+                    .send_command(runtime::RuntimeCommand::WriteInput {
+                        session,
+                        bytes: cmd.into_bytes(),
+                    });
+                self.resumed_panes.insert(pane_key);
+            }
+        }
     }
 
     /// 에이전트 상태 hook을 설정 토글에 맞춰 전역 설치/해제한다(옵션2 needsInput).
@@ -798,6 +912,12 @@ impl App {
 
         // 현재 활성을 Warm으로 내리고 warm 풀에 보관 (워커·세션 계속 실행).
         let mut old = std::mem::replace(&mut self.active, new_active);
+        // agent 감지 워커: 전환 시 epoch을 올려 이전 워크스페이스의 잔여 결과를 폐기하고,
+        // 즉시 감지가 새 워크스페이스 기준으로 재시작되게 한다(codex #3).
+        self.agent_detect_epoch += 1;
+        self.agent_bindings.clear();
+        self.agent_activity.clear();
+        self.agent_needs_input.clear();
         let _ = old
             .runtime
             .send_command(runtime::RuntimeCommand::SetWorkspaceState(
@@ -1416,149 +1536,39 @@ impl eframe::App for App {
                 // 추가하면 패널 여백 탓에 끝까지 안 닿는 짧은 선이 겹쳤다(#65 사용자).
             });
 
-        // ── 옵션2: 에이전트 상태 (2-tier 폴링, 리소스 절약) ──
-        // 활동 파싱(빠름, 1.5초): 바인딩된 transcript만 tail-read라 가볍다. 에이전트가
-        // 있을 때만 돌려 유휴 시 불필요한 재그리기를 피한다.
-        if !self.agent_bindings.is_empty()
-            && self.last_activity_poll.elapsed() >= std::time::Duration::from_millis(1500)
+        // ── 옵션2: 에이전트 상태 (감지는 백그라운드 워커, codex #3) ──
+        // 워커 입력(활성 세션 pid 목록 + epoch)을 최신값으로 갱신한다. 워커가 다음 tick에
+        // 읽어 ps/lsof/transcript 스캔을 UI 스레드 밖에서 수행한다.
         {
-            self.last_activity_poll = std::time::Instant::now();
-            self.agent_activity = self
-                .agent_bindings
-                .iter()
-                .filter_map(|(sid, b)| crate::agent_detect::activity(b).map(|a| (*sid, a)))
-                .collect();
-            self.refresh_needs_input();
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(1500));
-        }
-
-        // 바인딩 감지(느림, 2.5초): ps/lsof로 어느 세션이 어떤 에이전트를 도는지 파악 +
-        // 영속 + 복원 resume. 에이전트 시작/종료는 드물어 저빈도로 충분하다. 셸 pid는
-        // 리소스 모니터가 수집한 session_resource_usage를 재사용한다.
-        if self.last_binding_poll.elapsed() >= std::time::Duration::from_millis(2500) {
-            self.last_binding_poll = std::time::Instant::now();
             let sessions: Vec<(runtime::SessionId, u32)> = self
                 .active
                 .session_resource_usage
                 .iter()
                 .filter_map(|r| r.pid.map(|pid| (r.session, pid)))
                 .collect();
-            // 복원용 저장 데이터를 먼저 로드한다(아래 persistence가 지우기 전에).
-            // 워크스페이스가 바뀌면 재로드.
-            if self.restore_loaded_for.as_deref() != Some(self.active.id.as_str()) {
-                self.restore_agents = self
-                    .db
-                    .list_agent_sessions(&self.active.id)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|r| (r.pane_id.clone(), r))
-                    .collect();
-                // persisted_agents는 "이번 세션에 감지해 저장한 것"만 추적한다 — 빈 맵으로
-                // 시작해야 아래 삭제 루프가 아직 감지 전인 복원 데이터를 지우지 않는다
-                // (codex: restore_agents로 채우면 시작/전환 직후 빈 감지에 DB가 비워짐).
-                self.persisted_agents = std::collections::HashMap::new();
-                self.resumed_panes.clear();
-                self.restore_loaded_for = Some(self.active.id.clone());
+            if let Ok(mut input) = self.agent_detect_input.lock() {
+                *input = (self.agent_detect_epoch, sessions);
             }
-
-            let bindings = crate::agent_detect::detect(&sessions);
-            self.agent_bindings = bindings.clone();
-            self.agent_activity = bindings
-                .iter()
-                .filter_map(|(sid, b)| crate::agent_detect::activity(b).map(|a| (*sid, a)))
-                .collect();
+        }
+        // 워커 결과를 논블로킹 드레인 — 최신 것만 취한다(epoch 불일치=전환 잔여는 폐기).
+        let mut latest_bindings = None;
+        let mut latest_activity = None;
+        while let Ok(outcome) = self.agent_detect_rx.try_recv() {
+            if outcome.epoch != self.agent_detect_epoch {
+                continue;
+            }
+            latest_activity = Some(outcome.activity);
+            if outcome.bindings.is_some() {
+                latest_bindings = outcome.bindings;
+            }
+        }
+        if let Some(activity) = latest_activity {
+            self.agent_activity = activity;
             self.refresh_needs_input();
-
-            // 영속(옵션2 Phase 3): 감지된 에이전트를 pane_id로 매핑해 (kind, session-id)를
-            // 차등 upsert하고, 사라진(종료된) 것은 지운다 — replace-all은 시작 직후 빈 감지에
-            // 복원 데이터를 날려서 안 된다.
-            let mux = self.active.workspace_ui.mux().cloned();
-            let current: std::collections::HashMap<String, crate::storage::AgentSessionRow> =
-                bindings
-                    .iter()
-                    .filter_map(|(sid, b)| {
-                        let pane = mux.as_ref().and_then(|m| pane_of_session(m, *sid))?;
-                        let kind = match b.kind {
-                            crate::agent_detect::AgentKind::Claude => "claude",
-                            crate::agent_detect::AgentKind::Codex => "codex",
-                        };
-                        Some((
-                            pane.0.clone(),
-                            crate::storage::AgentSessionRow {
-                                pane_id: pane.0,
-                                kind: kind.to_owned(),
-                                session_id: b.session_id.clone(),
-                            },
-                        ))
-                    })
-                    .collect();
-            for (pane_id, row) in &current {
-                if self.persisted_agents.get(pane_id) != Some(row)
-                    && let Err(e) = self.db.upsert_agent_session(
-                        &self.active.id,
-                        pane_id,
-                        &row.kind,
-                        &row.session_id,
-                    )
-                {
-                    tracing::warn!("agent session 저장 실패: {e:#}");
-                }
-            }
-            for pane_id in self.persisted_agents.keys() {
-                if !current.contains_key(pane_id) {
-                    let _ = self.db.delete_agent_session(&self.active.id, pane_id);
-                }
-            }
-            self.persisted_agents = current;
-
-            // 복원 resume 주입: 복원된 pane(저장된 에이전트 있음)에 에이전트가 아직 안
-            // 떠 있으면(bindings에 없음) native resume 명령을 셸에 한 번 보낸다.
-            // 자동 명령 주입이라 설정으로 끌 수 있다(기본 ON).
-            if self.config.ui.auto_resume_agents
-                && let Some(mux) = &mux
-            {
-                for pane in mux.tabs.iter().flat_map(|t| &t.panes) {
-                    let pane_key = pane.id.0.clone();
-                    let Some(saved) = self.restore_agents.get(&pane_key) else {
-                        continue;
-                    };
-                    let Some(session) = pane.session_id else {
-                        continue;
-                    };
-                    if self.resumed_panes.contains(&pane_key) || bindings.contains_key(&session) {
-                        continue; // 이미 보냈거나 이미 실행 중
-                    }
-                    // 대상 transcript가 아직 존재하는지 확인 — 지워진 세션에 --resume을
-                    // 던지지 않는다. 없으면 stale 행을 지우고 재시도하지 않는다.
-                    let kind = crate::agent_detect::kind_from_str(&saved.kind);
-                    let exists = kind.is_some_and(|k| {
-                        crate::agent_detect::find_transcript(k, &saved.session_id).is_some()
-                    });
-                    if !exists {
-                        let _ = self.db.delete_agent_session(&self.active.id, &pane_key);
-                        self.resumed_panes.insert(pane_key);
-                        continue;
-                    }
-                    let cmd = match saved.kind.as_str() {
-                        "claude" => format!("claude --resume {}\n", saved.session_id),
-                        "codex" => format!("codex resume {}\n", saved.session_id),
-                        _ => continue,
-                    };
-                    let _ = self
-                        .active
-                        .runtime
-                        .send_command(runtime::RuntimeCommand::WriteInput {
-                            session,
-                            bytes: cmd.into_bytes(),
-                        });
-                    self.resumed_panes.insert(pane_key);
-                }
-            }
-
-            // 창이 유휴여도 다음 바인딩 폴이 돌도록 재그리기 예약.
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(2500));
+        }
+        if let Some(bindings) = latest_bindings {
+            self.agent_bindings = bindings.clone();
+            self.process_agent_bindings(&bindings);
         }
 
         // 폴더 트리 사이드바 (FT-1) — CentralPanel보다 먼저 배치해야 한다 (§9-1).

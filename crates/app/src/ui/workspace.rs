@@ -1358,6 +1358,17 @@ impl WorkspaceUi {
         self.mux.as_ref()
     }
 
+    /// 포커스된 pane의 세션 id — 워크스페이스 이름(현재 작업 폴더) 추적용.
+    pub fn focused_session(&self) -> Option<SessionId> {
+        let mux = self.mux.as_ref()?;
+        let focused = mux.focused_pane.as_ref()?;
+        mux.tabs
+            .iter()
+            .flat_map(|t| &t.panes)
+            .find(|p| &p.id == focused)
+            .and_then(|p| p.session_id)
+    }
+
     pub fn session_bracketed_paste(&self, session: SessionId) -> bool {
         self.sessions
             .get(&session)

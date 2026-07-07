@@ -701,6 +701,14 @@ impl App {
             .iter()
             .filter_map(|r| r.pid.map(|pid| (r.session, pid)))
             .collect();
+        // 포커스 세션의 셸 pid — 워커가 cwd(현재 작업 폴더)를 lsof로 얻어 워크스페이스
+        // 이름에 반영한다(2026-07-08).
+        let focused_pid = self
+            .active
+            .workspace_ui
+            .focused_session()
+            .and_then(|sid| sessions.iter().find(|(s, _)| *s == sid))
+            .map(|(_, pid)| *pid);
         // hook이 보고한 결정적 바인딩(활성 워크스페이스 것만) — 워커 탐색을 대체한다.
         // poll_agent_detect는 매 프레임 돌므로 DB 조회는 1초 스로틀 + 캐시.
         if self.last_hook_query.elapsed() >= std::time::Duration::from_secs(1) {
@@ -734,11 +742,13 @@ impl App {
                 self.agent_detect_epoch,
                 sessions,
                 self.hook_overrides.clone(),
+                focused_pid,
             );
         }
         // 결과를 논블로킹 드레인 — 최신 것만 취한다(epoch 불일치=전환 잔여는 폐기).
         let mut latest_bindings = None;
         let mut latest_activity = None;
+        let mut latest_cwd = None;
         while let Ok(outcome) = self.agent_detect_rx.try_recv() {
             if outcome.epoch != self.agent_detect_epoch {
                 continue;
@@ -747,6 +757,12 @@ impl App {
             if outcome.bindings.is_some() {
                 latest_bindings = outcome.bindings;
             }
+            if outcome.focused_cwd.is_some() {
+                latest_cwd = outcome.focused_cwd;
+            }
+        }
+        if let Some(cwd) = latest_cwd {
+            self.update_workspace_folder_name(&cwd);
         }
         if let Some(activity) = latest_activity {
             self.agent_activity = activity;
@@ -1384,18 +1400,47 @@ impl App {
         }
     }
 
-    /// 워크스페이스 표시 이름 — 항상 프로젝트 폴더명(≈깃 레포명). 폴더 미설정이면 "~".
-    /// 이름 지정 기능은 제거(2026-07-08 사용자) — DB의 name은 무시한다(세부 구분은
-    /// 세션 이름 수정으로).
+    /// 워크스페이스 표시 이름 — 포커스 세션의 현재 작업 폴더(git 저장소면 프로젝트명)를
+    /// name에 자동 저장하고 그걸 표시한다(2026-07-08). 아직 감지 전이면 path 폴더명,
+    /// 그것도 없으면 "~". 자동 추적이라 포커스 이동·재시작에도 마지막 폴더가 유지된다.
     fn workspace_display_name(row: &crate::storage::WorkspaceRow) -> String {
+        let name = row.name.trim();
+        if !name.is_empty() && name != "default" {
+            return name.to_owned();
+        }
         let path = row.path.trim();
         if !path.is_empty()
             && let Some(base) = std::path::Path::new(path).file_name()
         {
             return base.to_string_lossy().into_owned();
         }
-        // 이름 미지정 + 폴더 미설정 → "~" (홈/미설정 표시).
         "~".to_owned()
+    }
+
+    /// 포커스 세션 cwd → 워크스페이스 이름(현재 작업 폴더/프로젝트명)을 갱신·영속한다.
+    /// 변경 시에만 DB에 쓴다(churn 방지). 감지 실패(빈 이름)면 이전 값을 유지한다 —
+    /// 포커스가 다른 pane으로 옮겨가도 폴더명이 "~"로 리셋되지 않게(사용자 요청).
+    fn update_workspace_folder_name(&mut self, cwd: &str) {
+        let Some(name) = crate::agent_detect::project_display_name(cwd) else {
+            return;
+        };
+        if name.is_empty() || name == "default" {
+            return;
+        }
+        // 현재 저장된 이름과 같으면 skip.
+        if self
+            .workspaces
+            .iter()
+            .find(|w| w.id == self.active.id)
+            .is_some_and(|w| w.name == name)
+        {
+            return;
+        }
+        if let Err(e) = self.db.rename_workspace(&self.active.id, &name) {
+            tracing::warn!("워크스페이스 폴더명 저장 실패: {e:#}");
+            return;
+        }
+        self.refresh_workspaces();
     }
 
     fn workspace_path_to_tree_root(path: Option<String>) -> Option<PathBuf> {

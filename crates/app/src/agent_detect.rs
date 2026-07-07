@@ -444,6 +444,39 @@ fn codex_open_rollout(_pid: u32) -> Option<PathBuf> {
     None
 }
 
+/// 셸 pid의 현재 작업 디렉터리(워크스페이스 이름 추적용, 2026-07-08). off-thread 호출.
+pub(crate) fn session_cwd(shell_pid: u32) -> Option<String> {
+    process_cwd(shell_pid)
+}
+
+/// cwd → 워크스페이스 표시명. git 저장소 안이면 저장소 루트(.git 있는 폴더)명, 아니면
+/// cwd 폴더명. 홈 디렉터리 자체는 "~". 사용자가 "어디서 작업 중인지" 보이게 한다.
+pub(crate) fn project_display_name(cwd: &str) -> Option<String> {
+    let path = std::path::Path::new(cwd);
+    if !path.is_absolute() {
+        return None;
+    }
+    // 홈 루트는 특별 취급 — 폴더명("jr" 등) 대신 "~".
+    if std::env::var_os("HOME").is_some_and(|h| path == std::path::Path::new(&h)) {
+        return Some("~".to_owned());
+    }
+    // .git을 위로 탐색(최대 40단계 — 극단 경로 방어) → 저장소 루트명.
+    let mut cur = Some(path);
+    let mut steps = 0;
+    while let Some(dir) = cur {
+        if steps >= 40 {
+            break;
+        }
+        if dir.join(".git").exists() {
+            return dir.file_name().map(|n| n.to_string_lossy().into_owned());
+        }
+        cur = dir.parent();
+        steps += 1;
+    }
+    // 저장소 아니면 현재 폴더명.
+    path.file_name().map(|n| n.to_string_lossy().into_owned())
+}
+
 /// 프로세스의 cwd (macOS/Unix: `lsof -p <pid> -d cwd`).
 #[cfg(unix)]
 fn process_cwd(pid: u32) -> Option<String> {
@@ -516,6 +549,30 @@ fn parse_ps_line(line: &str) -> Option<ProcRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_display_name_git루트와_폴더명() {
+        let base = std::env::temp_dir().join(format!("deppy-proj-{}", std::process::id()));
+        let repo = base.join("myrepo");
+        let sub = repo.join("crates").join("app");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        // 저장소 하위에서도 저장소 루트명
+        assert_eq!(
+            project_display_name(sub.to_str().unwrap()),
+            Some("myrepo".to_owned())
+        );
+        // 저장소 아닌 폴더는 폴더명
+        let plain = base.join("plainfolder");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(
+            project_display_name(plain.to_str().unwrap()),
+            Some("plainfolder".to_owned())
+        );
+        // 상대경로는 None
+        assert_eq!(project_display_name("relative/path"), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn parse_ps_line_splits_command_with_spaces() {

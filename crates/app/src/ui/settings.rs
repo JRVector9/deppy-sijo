@@ -1038,30 +1038,56 @@ fn language_page(
         &catalog.t("settings.locale", &[]),
         Some(&catalog.t("settings.locale.hint", &[])),
         |ui| {
-            ui.spacing_mut().interact_size.y = 30.0; // 스텝퍼(30h)와 크기 통일 (#78)
-            egui::ComboBox::from_id_salt("locale_combo")
-                .width(130.0)
-                .selected_text(
-                    egui::RichText::new(current_locale_label(&config.i18n.locale, catalog))
-                        .size(13.0),
-                )
-                .show_ui(ui, |ui| {
-                    for (locale, key) in [
-                        (i18n::FALLBACK_LOCALE, "settings.locale.en_us"),
-                        ("ja-JP", "settings.locale.ja_jp"),
-                        ("zh-Hans", "settings.locale.zh_hans"),
-                        ("zh-Hant", "settings.locale.zh_hant"),
-                        ("ko-KR", "settings.locale.ko_kr"),
-                    ] {
-                        *changed |= ui
-                            .selectable_value(
-                                &mut config.i18n.locale,
-                                locale.to_owned(),
-                                catalog.t(key, &[]),
-                            )
-                            .changed();
+            // egui ComboBox는 selected_text를 좌측정렬(하드코딩)이라 텍스트 중앙정렬이 안 된다
+            // → 커스텀 박스(중앙 텍스트 + ▾) + Popup::menu로 구현한다(#6).
+            let w = 130.0;
+            let h = 30.0;
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+            let hair = ui.visuals().widgets.noninteractive.bg_stroke.color;
+            let bg = if resp.hovered() {
+                ui.visuals().widgets.hovered.bg_fill
+            } else {
+                ui.visuals().widgets.inactive.bg_fill
+            };
+            ui.painter().rect(
+                rect,
+                6.0,
+                bg,
+                egui::Stroke::new(1.0, hair),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                current_locale_label(&config.i18n.locale, catalog),
+                egui::FontId::proportional(13.0),
+                ui.visuals().text_color(),
+            );
+            ui.painter().text(
+                egui::pos2(rect.right() - 12.0, rect.center().y),
+                egui::Align2::CENTER_CENTER,
+                "▾",
+                egui::FontId::proportional(11.0),
+                ui.visuals().weak_text_color(),
+            );
+            egui::Popup::menu(&resp).show(|ui| {
+                ui.set_min_width(w);
+                for (locale, key) in [
+                    (i18n::FALLBACK_LOCALE, "settings.locale.en_us"),
+                    ("ja-JP", "settings.locale.ja_jp"),
+                    ("zh-Hans", "settings.locale.zh_hans"),
+                    ("zh-Hant", "settings.locale.zh_hant"),
+                    ("ko-KR", "settings.locale.ko_kr"),
+                ] {
+                    if ui
+                        .selectable_label(config.i18n.locale == locale, catalog.t(key, &[]))
+                        .clicked()
+                    {
+                        config.i18n.locale = locale.to_owned();
+                        *changed = true;
                     }
-                });
+                }
+            });
         },
     );
 }

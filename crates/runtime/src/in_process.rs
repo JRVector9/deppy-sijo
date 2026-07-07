@@ -108,6 +108,12 @@ impl InProcessRuntimeClient {
                     subscribers: worker_subscribers,
                     batch: Duration::from_millis(output_batch_ms.max(1)),
                     shell,
+                    // needsInput hook 키를 워크스페이스 스코프로 만들기 위해 workspace_id를
+                    // 워커에 보관한다(SessionId는 워커마다 1부터라 전역 유일하지 않음 — codex High).
+                    workspace_id: persist
+                        .as_ref()
+                        .map(|c| c.workspace_id.clone())
+                        .unwrap_or_default(),
                     next_id: 1,
                     sessions: std::collections::HashMap::new(),
                     logs: std::collections::HashMap::new(),
@@ -240,6 +246,8 @@ struct Worker {
     subscribers: Arc<Mutex<Vec<Subscriber>>>,
     batch: Duration,
     shell: CommandSpec,
+    /// 이 워커의 workspace id — needsInput hook 키(`{workspace_id}:{session_id}`)에 쓴다.
+    workspace_id: String,
     next_id: u64,
     /// 다중 세션 (PR-08 Session Runtime). 세션 로직은 session crate 소관.
     sessions: std::collections::HashMap<SessionId, Session>,
@@ -625,13 +633,16 @@ impl Worker {
                     });
                     return;
                 }
+                let id = SessionId(self.next_id);
+                self.next_id += 1;
+                // 앱이 직접 띄운 에이전트에도 needsInput hook 키를 주입한다(셸과 동일 —
+                // 안 하면 Agents UI 실행 세션은 needsInput 미반영, codex Medium).
+                env.push(("DEPPY_SESSION_ID".to_owned(), self.session_key(id)));
                 let spec = CommandSpec {
                     program: command,
                     args,
                     env,
                 };
-                let id = SessionId(self.next_id);
-                self.next_id += 1;
                 match session::spawn_agent(id, &spec, cols, rows, scrollback_lines) {
                     Ok(new_session) => {
                         self.sessions.insert(id, new_session);
@@ -874,13 +885,18 @@ impl Worker {
     }
 
     /// 새 tab에 pane 하나를 만들어 세션을 attach하고 포커스한다.
+    /// needsInput hook 세션 키 — `{workspace_id}:{session_id}`. SessionId는 워커마다 1부터라
+    /// 전역 유일하지 않으므로 workspace_id로 스코프해 워크스페이스 간 오표시를 막는다(codex High).
+    fn session_key(&self, id: SessionId) -> String {
+        format!("{}:{}", self.workspace_id, id.0)
+    }
+
     /// DEPPY_SESSION_ID를 주입한 셸 spec — 이 셸에서 실행된 claude/codex의 hook이 세션을
-    /// 식별해 needsInput을 보고한다(옵션2 hook 배선). 세션ID를 키로 써 spawn 시점에 이미
-    /// 안다(pane 생성 순서와 무관).
+    /// 식별해 needsInput을 보고한다(옵션2 hook 배선). spawn 시점에 이미 안다(pane 순서 무관).
     fn shell_with_session(&self, id: SessionId) -> CommandSpec {
         let mut spec = self.shell.clone();
         spec.env
-            .push(("DEPPY_SESSION_ID".to_owned(), id.0.to_string()));
+            .push(("DEPPY_SESSION_ID".to_owned(), self.session_key(id)));
         spec
     }
 

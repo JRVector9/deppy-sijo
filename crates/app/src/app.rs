@@ -626,14 +626,20 @@ impl App {
     }
 
     /// hook이 보고한 입력 대기 세션(needsInput)을 DB에서 읽어 갱신한다. session_key는
-    /// DEPPY_SESSION_ID(=SessionId u64 문자열).
+    /// `{workspace_id}:{session_id}` — SessionId가 워커마다 1부터라 전역 유일하지 않아
+    /// workspace_id로 스코프한다(codex High). 활성 워크스페이스 것만 남긴다.
     fn refresh_needs_input(&mut self) {
+        let ws = self.active.id.clone();
         self.agent_needs_input = self
             .db
             .list_waiting_sessions()
             .unwrap_or_default()
             .iter()
-            .filter_map(|k| k.parse::<u64>().ok().map(runtime::SessionId))
+            .filter_map(|k| {
+                let (w, s) = k.rsplit_once(':')?;
+                (w == ws).then_some(())?;
+                s.parse::<u64>().ok().map(runtime::SessionId)
+            })
             .collect();
     }
 

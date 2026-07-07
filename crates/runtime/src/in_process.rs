@@ -846,6 +846,12 @@ impl Worker {
                     self.restore_saved_layout();
                 }
             }
+            RuntimeCommand::RenamePane { pane, title } => {
+                if let Some(p) = self.mux.panes.get_mut(&pane) {
+                    p.title = title;
+                    self.emit_mux_snapshot(); // UI 반영 + 영속 저장
+                }
+            }
             RuntimeCommand::ResizeSplit { tab, path, ratio } => {
                 if let Some(t) = self.mux.tabs.get_mut(&tab)
                     && t.layout.set_split_ratio(&path, ratio)

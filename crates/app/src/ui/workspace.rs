@@ -47,6 +47,8 @@ pub struct WorkspaceUi {
     /// 활성 workspace의 프로젝트명(폴더명 ≈ 깃 레포명, 없으면 "~"). 세션 기본 제목이
     /// "셀 134" 대신 이걸로 표시된다. rename한 세션은 그대로 둔다. App이 매 프레임 세팅.
     project_name: Option<String>,
+    /// pane 제목 인라인 편집 중 (pane, 편집 버퍼). 헤더 제목 우클릭으로 시작(cmux식 rename).
+    name_edit: Option<(runtime::MuxPaneId, String)>,
     error: Option<String>,
 }
 
@@ -85,6 +87,7 @@ impl WorkspaceUi {
             confirm_close: None,
             selection: None,
             project_name: None,
+            name_edit: None,
             error: None,
         }
     }
@@ -567,9 +570,11 @@ impl WorkspaceUi {
             .inner_margin(egui::Margin::symmetric(8, 4))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    // 아이콘-제목 간격을 좁힌다(사용자 요청). 글리프 박스도 축소.
+                    ui.spacing_mut().item_spacing.x = 4.0;
                     // 타입 글리프(◆/▸)를 도형으로 — 상태 있으면 상태색, 없으면 focus/dim
                     let (grect, _) =
-                        ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                        ui.allocate_exact_size(egui::vec2(11.0, 14.0), egui::Sense::hover());
                     let glyph_color = if let Some(s) = status {
                         crate::ui::file_tree::session_status_color(Some(s), ui.visuals())
                     } else if focused {
@@ -593,28 +598,66 @@ impl WorkspaceUi {
                     // 우측 컨트롤 폭 예약 — 긴 제목이 닫기/분할 버튼을 밀어내지
                     // 않게 truncate 최대폭 제한 (codex, 사이드바 헤더와 동일 패턴)
                     let pane_title = self.resolve_session_title(&pane.title, catalog);
-                    let title_resp = ui
-                        .scope(|ui| {
-                            ui.set_max_width((ui.available_width() - 120.0).max(30.0));
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(pane_title)
-                                        .size(13.0)
-                                        .strong()
-                                        .color(title_color),
+                    let editing = matches!(&self.name_edit, Some((p, _)) if p == pane_id);
+                    if editing {
+                        // 인라인 이름 편집 — Enter 확정(RenamePane), Esc 취소. 편집 중엔 포커스
+                        // 유지(터미널 입력은 text_edit_focused로 자동 차단됨).
+                        let buf = &mut self.name_edit.as_mut().unwrap().1;
+                        let resp = ui
+                            .scope(|ui| {
+                                ui.set_max_width((ui.available_width() - 120.0).max(30.0));
+                                ui.add(
+                                    egui::TextEdit::singleline(buf)
+                                        .desired_width(f32::INFINITY)
+                                        .font(egui::FontId::proportional(13.0)),
                                 )
-                                .sense(egui::Sense::click())
-                                .truncate(),
+                            })
+                            .inner;
+                        resp.request_focus();
+                        let (enter, esc) = ui.input(|i| {
+                            (
+                                i.key_pressed(egui::Key::Enter),
+                                i.key_pressed(egui::Key::Escape),
                             )
-                        })
-                        .inner;
-                    if title_resp.clicked() && !focused {
-                        self.send(
-                            client,
-                            RuntimeCommand::FocusPane {
-                                pane: pane_id.clone(),
-                            },
-                        );
+                        });
+                        if enter {
+                            if let Some((pane, title)) = self.name_edit.take() {
+                                let title = title.trim().to_owned();
+                                if !title.is_empty() {
+                                    self.send(client, RuntimeCommand::RenamePane { pane, title });
+                                }
+                            }
+                        } else if esc {
+                            self.name_edit = None;
+                        }
+                    } else {
+                        let title_resp = ui
+                            .scope(|ui| {
+                                ui.set_max_width((ui.available_width() - 120.0).max(30.0));
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(pane_title.clone())
+                                            .size(13.0)
+                                            .strong()
+                                            .color(title_color),
+                                    )
+                                    .sense(egui::Sense::click())
+                                    .truncate(),
+                                )
+                            })
+                            .inner
+                            .on_hover_text(catalog.t("workspace.rename_hint", &[]));
+                        // 우클릭/더블클릭 → 이름 편집 시작(cmux식). 단순 클릭 → pane 포커스.
+                        if title_resp.secondary_clicked() || title_resp.double_clicked() {
+                            self.name_edit = Some((pane_id.clone(), pane_title));
+                        } else if title_resp.clicked() && !focused {
+                            self.send(
+                                client,
+                                RuntimeCommand::FocusPane {
+                                    pane: pane_id.clone(),
+                                },
+                            );
+                        }
                     }
                     ui.add_space(4.0); // × 앞 여백 (목업 §pane-head)
                     if ui
@@ -1949,8 +1992,21 @@ mod tests {
             },
         };
 
+        // macOS는 Cmd+V의 key PRESS를 앱에 안 주고 release만 준다(실측) — release로 감지한다.
+        let cmd_v_release = egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                mac_cmd: true,
+                command: true,
+                ..egui::Modifiers::NONE
+            },
+        };
         if cfg!(target_os = "macos") {
-            assert!(is_clipboard_paste_shortcut(&cmd_v));
+            assert!(is_clipboard_paste_shortcut(&cmd_v_release));
+            assert!(!is_clipboard_paste_shortcut(&cmd_v)); // press는 무시(release만)
             assert!(!is_clipboard_paste_shortcut(&ctrl_v));
             assert!(!is_clipboard_paste_shortcut(&ctrl_shift_v));
         } else {

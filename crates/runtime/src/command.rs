@@ -109,6 +109,12 @@ pub enum RuntimeCommand {
         session: SessionId,
         override_: session::UserStatusOverride,
     },
+    /// pane 제목을 바꾼다(세션 이름 rename). mux.panes의 title을 갱신하고 영속한다.
+    /// (append-only — wire 호환)
+    RenamePane {
+        pane: MuxPaneId,
+        title: String,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
@@ -216,6 +222,11 @@ impl std::fmt::Debug for RuntimeCommand {
                 .debug_struct("SetUserStatusOverride")
                 .field("session", session)
                 .field("override", override_)
+                .finish(),
+            RuntimeCommand::RenamePane { pane, title } => f
+                .debug_struct("RenamePane")
+                .field("pane", pane)
+                .field("title", title)
                 .finish(),
         }
     }

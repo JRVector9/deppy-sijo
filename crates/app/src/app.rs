@@ -1533,40 +1533,23 @@ impl eframe::App for App {
                             ui.painter().galley(pos, galley, col);
                             resp.clicked()
                         };
-                        // 툴바 버튼 = 통합 설정 창을 해당 카테고리로 연다 (전체 통합, 2026-07-06).
-                        // 이미 그 카테고리로 열려 있으면 닫는다(토글). 선택 하이라이트도 그 상태.
-                        use ui::settings::Category as Cat;
-                        // 알림 라벨/unread는 tab 클로저(&mut self 캡처) 전에 계산 (borrow 분리).
+                        // 툴바 = '설정' 버튼 하나만 — 나머지 카테고리는 전부 설정 창의 좌측
+                        // 네비에 이미 있어 중복이었다(사용자 요청, 2026-07-07). 알림 unread는
+                        // 설정 라벨에 뱃지 카운트로 얹는다.
                         let unread = self.notifications_ui.unread();
                         unread_before = unread;
-                        let notif_label = if unread > 0 {
-                            let count = unread.to_string();
-                            text.t("top.notifications.unread", &[("count", &count)])
+                        let settings_label = if unread > 0 {
+                            format!("{} ({unread})", text.t("top.settings", &[]))
                         } else {
-                            text.t("top.notifications", &[])
+                            text.t("top.settings", &[])
                         };
-                        let mut tab = |ui: &mut egui::Ui, label: String, cat: Cat| {
-                            let sel = self.settings_open && self.settings_category == cat;
-                            if tbtn(ui, label, sel) {
-                                if sel {
-                                    self.settings_open = false;
-                                } else {
-                                    self.settings_open = true;
-                                    self.settings_category = cat;
-                                    if matches!(cat, Cat::Workspaces | Cat::Activity) {
-                                        self.refresh_workspaces();
-                                    }
-                                }
+                        let sel = self.settings_open;
+                        if tbtn(ui, settings_label, sel) {
+                            self.settings_open = !sel;
+                            if self.settings_open {
+                                self.refresh_workspaces();
                             }
-                        };
-                        tab(ui, text.t("top.settings", &[]), Cat::General);
-                        tab(ui, text.t("top.credentials", &[]), Cat::Credentials);
-                        tab(ui, text.t("top.connectors", &[]), Cat::Connectors);
-                        tab(ui, text.t("top.environment", &[]), Cat::Environment);
-                        tab(ui, text.t("top.agents", &[]), Cat::Agents);
-                        tab(ui, text.t("top.workspaces", &[]), Cat::Workspaces);
-                        tab(ui, text.t("top.activity", &[]), Cat::Activity);
-                        tab(ui, notif_label, Cat::Notifications);
+                        }
                         // 우측: 로케일 · 메모리 (목업의 'ko · 113MB'). 패널 margin 0이라
                         // 오른쪽 끝 여백을 직접 준다.
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

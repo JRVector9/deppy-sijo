@@ -754,6 +754,8 @@ impl App {
                     "codex" => format!("codex resume {}\n", saved.session_id),
                     _ => continue,
                 };
+                // 선택 중 freeze 해제 — 이 경로도 WorkspaceUi::send를 우회한다(codex).
+                self.active.workspace_ui.clear_selection(session);
                 let _ = self
                     .active
                     .runtime
@@ -1614,6 +1616,8 @@ impl eframe::App for App {
                             let bytes = ui::workspace::path_insert_paste_bytes(
                                 &path, shell_kind, bracketed,
                             );
+                            // 선택 중 freeze 해제 — 이 경로는 WorkspaceUi::send를 우회한다(codex).
+                            self.active.workspace_ui.clear_selection(session);
                             if let Err(e) = self.active.runtime.send_command(
                                 runtime::RuntimeCommand::WriteInput { session, bytes },
                             ) {

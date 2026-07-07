@@ -84,6 +84,15 @@ impl WorkspaceUi {
 
     /// 모든 세션의 터미널 렌더 캐시를 비운다 — 테마 변경 시 stale galley(옛 폰트
     /// 아틀라스/색)가 재사용돼 글자가 깨지던 문제 해결(#7). 다음 프레임에 전 행 재구성.
+    /// 이 세션에 걸린 선택을 해제한다 — 선택 중엔 화면이 freeze되므로, WorkspaceUi::send를
+    /// 우회해 직접 WriteInput을 보내는 경로(app.rs의 트리 드롭·resume 주입)에서 화면이 멈춘
+    /// 듯 보이지 않게 호출한다(codex).
+    pub fn clear_selection(&mut self, session: SessionId) {
+        if self.selection.is_some_and(|(s, _, _)| s == session) {
+            self.selection = None;
+        }
+    }
+
     pub fn clear_render_caches(&mut self) {
         for view in self.sessions.values_mut() {
             view.render_cache.clear();
@@ -102,6 +111,14 @@ impl WorkspaceUi {
                     // §14.4 hidden render cache drop. tab 복귀 시 worker가
                     // 전환 즉시 push하므로(emit_mux_and_watched) 공백은 짧다 (codex 리뷰)
                     let visible = visible_mux_sessions(snapshot);
+                    // 선택된 세션이 hidden 되면 선택을 해제한다 — 안 그러면 freeze(선택 중
+                    // snapshot 갱신 스킵)가 재표시돼도 안 풀려 stuck 된다(codex).
+                    if self
+                        .selection
+                        .is_some_and(|(s, _, _)| !visible.contains(&s))
+                    {
+                        self.selection = None;
+                    }
                     for (id, view) in self.sessions.iter_mut() {
                         if !visible.contains(id) {
                             view.snapshot = None;
@@ -126,15 +143,19 @@ impl WorkspaceUi {
                     // hidden 전환 뒤 도착한 stale Viewport가 캐시를 되살리지 않도록
                     // 현재 active tab의 visible 세션만 snapshot을 저장한다.
                     if self.session_visible(*session) {
-                        // 선택은 화면 갱신에도 유지한다 — claude/codex 작업 중엔 화면이 매
-                        // 프레임 갱신돼, 여기서 지우면 드래그 선택이 즉시 무효화됐다(#3).
-                        // 선택 해제는 단순 클릭이 담당한다(그리드 좌표 기준이라 스크롤 시
-                        // 다른 셀을 가리킬 수 있으나 무해 — 사용자가 클릭해 해제).
+                        // 이 세션에 선택이 걸려 있으면 화면(snapshot)을 얼린다 — claude/codex
+                        // 작업 중엔 화면이 매 프레임 갱신돼 예전엔 선택이 즉시 무효화됐다(#3).
+                        // 좌표 기준 선택이라 그냥 유지만 하면 갱신된 화면의 '다른 텍스트'를
+                        // 복사할 수 있어(codex), 선택 중엔 뷰를 정지시켜 선택·복사·표시가 항상
+                        // 일치하게 한다(표준 터미널 동작). 클릭으로 선택 해제하면 최신으로 갱신.
+                        let frozen = self.selection.is_some_and(|(s, _, _)| s == *session);
                         let view = self.sessions.entry(*session).or_default();
-                        view.snapshot = Some(Arc::clone(snapshot));
                         view.bracketed_paste = *bracketed_paste;
-                        // 사이드바 세션 요약 — 마지막 비어있지 않은 행 (2026-07-05)
-                        view.summary = last_line_summary(snapshot);
+                        if !frozen {
+                            view.snapshot = Some(Arc::clone(snapshot));
+                            // 사이드바 세션 요약 — 마지막 비어있지 않은 행 (2026-07-05)
+                            view.summary = last_line_summary(snapshot);
+                        }
                     }
                 }
                 RuntimeEvent::SessionExited { session, exit_code } => {
@@ -973,6 +994,7 @@ impl WorkspaceUi {
                 pending.extend(bytes);
             }
             if !pending.is_empty() {
+                // 선택 해제는 send()가 WriteInput 공통 지점에서 처리한다.
                 self.send(
                     client,
                     RuntimeCommand::WriteInput {
@@ -1284,6 +1306,14 @@ impl WorkspaceUi {
     }
 
     fn send(&mut self, client: &dyn RuntimeClient, command: RuntimeCommand) {
+        // 터미널에 입력을 보내면 그 세션 선택을 해제한다 — 선택 중엔 화면이 freeze돼(선택
+        // 정확성) 있어, 입력(타이핑/파일·텍스트 드롭/paste) 후 안 지우면 화면이 멈춘 듯
+        // 보인다. 모든 WriteInput 경로의 공통 지점이라 여기서 한 번에 처리한다(codex).
+        if let RuntimeCommand::WriteInput { session, .. } = &command
+            && self.selection.is_some_and(|(s, _, _)| s == *session)
+        {
+            self.selection = None;
+        }
         let is_spawn = matches!(
             command,
             RuntimeCommand::SpawnShell { .. } | RuntimeCommand::SplitPane { .. }

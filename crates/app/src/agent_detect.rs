@@ -144,11 +144,24 @@ fn claude_session_id(command: &str) -> Option<String> {
 fn bind_transcript(kind: AgentKind, sid_hint: Option<String>, pid: u32) -> Option<AgentBinding> {
     match kind {
         AgentKind::Claude => {
-            let sid = sid_hint?; // argv에서 세션ID를 못 얻으면 바인딩 안 함(모호 회피)
-            let transcript = find_claude_transcript(&sid)?;
+            // 1순위: argv --session-id (결정적 — cmux/자동화 실행 케이스).
+            if let Some(sid) = sid_hint {
+                let transcript = find_claude_transcript(&sid)?;
+                return Some(AgentBinding {
+                    kind,
+                    session_id: sid,
+                    transcript,
+                });
+            }
+            // fallback: 손타이핑 `claude`(argv에 세션ID 없음 — 2026-07-07 실증)는 cwd의
+            // 프로젝트 디렉터리(~/.claude/projects/<escaped-cwd>/)에서 최신 mtime transcript.
+            // 이게 없으면 상태가 느린 화면 regex로만 잡혀 딜레이가 났다. 같은 cwd에 claude
+            // 2개면 최신 대화 쪽으로 모일 수 있는 한계는 codex cwd fallback과 동일.
+            let cwd = process_cwd(pid)?;
+            let (session_id, transcript) = find_claude_transcript_by_cwd(&cwd)?;
             Some(AgentBinding {
                 kind,
-                session_id: sid,
+                session_id,
                 transcript,
             })
         }
@@ -209,6 +222,37 @@ fn find_codex_transcript_by_id(session_id: &str) -> Option<PathBuf> {
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.contains(session_id))
     })
+}
+
+/// claude 프로젝트 디렉터리 이름 — cwd의 비영숫자를 전부 '-'로 치환한다
+/// (실증: `/Users/jr/Desktop/Projects/deppy/.claude/...` → `-Users-jr-Desktop-Projects-deppy--claude-...`).
+fn claude_project_dir_escape(cwd: &str) -> String {
+    cwd.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// cwd 기준으로 claude transcript를 찾는다 — 그 cwd의 프로젝트 디렉터리에서 최신 mtime
+/// jsonl(활성 대화가 append 중인 것). 파일명(stem) = 세션ID.
+fn find_claude_transcript_by_cwd(cwd: &str) -> Option<(String, PathBuf)> {
+    let home = std::env::var_os("HOME")?;
+    let dir = Path::new(&home)
+        .join(".claude/projects")
+        .join(claude_project_dir_escape(cwd));
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = e.path();
+        if p.extension().is_some_and(|x| x == "jsonl")
+            && let Ok(meta) = e.metadata()
+            && let Ok(mtime) = meta.modified()
+            && best.as_ref().is_none_or(|(bm, _)| mtime > *bm)
+        {
+            best = Some((mtime, p));
+        }
+    }
+    let (_, p) = best?;
+    let sid = p.file_stem()?.to_str()?.to_owned();
+    Some((sid, p))
 }
 
 /// 세션ID로 claude transcript를 찾는다 (`~/.claude/projects/*/<sid>.jsonl`).
@@ -437,6 +481,16 @@ mod tests {
         let d = descendant_pids(100, &rows);
         assert!(d.contains(&200) && d.contains(&300));
         assert!(!d.contains(&999));
+    }
+
+    #[test]
+    fn claude_project_dir_escape_비영숫자를_하이픈으로() {
+        assert_eq!(
+            claude_project_dir_escape("/Users/jr/Desktop/Projects/deppy-sijo"),
+            "-Users-jr-Desktop-Projects-deppy-sijo"
+        );
+        // dot도 '-' (실증: deppy/.claude → deppy--claude)
+        assert_eq!(claude_project_dir_escape("/a/b.c/d_e"), "-a-b-c-d-e");
     }
 
     /// 실제 머신의 claude/codex 프로세스를 감지해 transcript 바인딩까지 되는지 smoke-test.

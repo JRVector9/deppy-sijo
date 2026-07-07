@@ -116,6 +116,8 @@ impl InProcessRuntimeClient {
                     subscribers: worker_subscribers,
                     batch: Duration::from_millis(output_batch_ms.max(1)),
                     shell,
+                    default_env_plain: Vec::new(),
+                    default_env_secrets: Vec::new(),
                     // needsInput hook 키를 워크스페이스 스코프로 만들기 위해 workspace_id를
                     // 워커에 보관한다(SessionId는 워커마다 1부터라 전역 유일하지 않음 — codex High).
                     workspace_id: persist
@@ -254,6 +256,10 @@ struct Worker {
     subscribers: Arc<Mutex<Vec<Subscriber>>>,
     batch: Duration,
     shell: CommandSpec,
+    /// 워크스페이스 기본 env(.env 자동 주입 — 2026-07-07). 이후 SpawnShell에 적용된다.
+    /// secret은 (key, credential_id)로 들고 spawn 직전에만 resolve한다(6.3).
+    default_env_plain: Vec<(String, String)>,
+    default_env_secrets: Vec<(String, String)>,
     /// 이 워커의 workspace id — needsInput hook 키(`{workspace_id}:{session_id}`)에 쓴다.
     workspace_id: String,
     next_id: u64,
@@ -695,6 +701,14 @@ impl Worker {
                     }),
                 }
             }
+            RuntimeCommand::SetSessionDefaultEnv {
+                env_plain,
+                env_secrets,
+            } => {
+                // 이후 SpawnShell부터 적용 — 기존 세션은 건드리지 않는다(.env 자동 주입).
+                self.default_env_plain = env_plain;
+                self.default_env_secrets = env_secrets;
+            }
             RuntimeCommand::WriteInput { session, bytes } => {
                 if let Some(active) = self.sessions.get_mut(&session) {
                     match active.write_input(&bytes) {
@@ -913,6 +927,24 @@ impl Worker {
         let mut spec = self.shell.clone();
         spec.env
             .push(("DEPPY_SESSION_ID".to_owned(), self.session_key(id)));
+        // 워크스페이스 기본 env(.env 자동 주입). secret은 여기(spawn 직전)에서만 resolve.
+        // 셸은 에이전트와 달리 spawn 실패보다 부분 주입이 낫다 — 실패 키는 건너뛰고 경고.
+        spec.env.extend(self.default_env_plain.iter().cloned());
+        for (key, credential_id) in &self.default_env_secrets {
+            match self.secret_store.get_secret(credential_id) {
+                Ok(value) => {
+                    self.redaction.register(&value);
+                    spec.env.push((key.clone(), value.expose().to_owned()));
+                }
+                Err(e) => {
+                    // credential id만 로그 — secret 값/키 이름은 남기지 않는다(6.3 관례).
+                    tracing::warn!(
+                        credential_id,
+                        "기본 env secret resolve 실패 — 건너뜀: {e:#}"
+                    );
+                }
+            }
+        }
         spec
     }
 

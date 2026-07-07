@@ -5,6 +5,7 @@ mod agent_shim;
 mod agent_transcript;
 mod app;
 mod config;
+mod dotenv_sync;
 mod env;
 mod fonts;
 mod paths;

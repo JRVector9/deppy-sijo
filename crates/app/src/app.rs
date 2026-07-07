@@ -565,6 +565,8 @@ impl App {
         }
         // 에이전트 상태 hook 전역 설치/해제 (설정 토글에 따라, best-effort).
         app.sync_agent_hooks();
+        // .env → 환경 profile 동기화 + 새 셸 기본 env 주입 (2026-07-07).
+        app.sync_dotenv_env();
         // 시작 시 config가 remote를 켜 뒀으면 best-effort로 기동한다 (실패는 log + settings 표시,
         // config는 그대로 두어 다음 실행에 재시도). 자동 시작은 config 저장을 유발하지 않는다.
         if app.config.remote.tls_enabled {
@@ -1165,6 +1167,8 @@ impl App {
             tracing::warn!("마지막 workspace 저장 실패: {e:#}");
         }
         self.refresh_file_tree_root();
+        // 새 workspace의 .env → 환경 profile 동기화 + 기본 env 주입 (2026-07-07).
+        self.sync_dotenv_env();
         self.egui_ctx.request_repaint();
 
         self.evict_warm();
@@ -1256,6 +1260,57 @@ impl App {
                 i += 1;
             }
         }
+    }
+
+    /// 활성 workspace의 `.env`를 환경 profile로 동기화하고, 그 env를 워커 기본 env로
+    /// 전송한다(SetSessionDefaultEnv) — 이후 새 셸부터 자동 주입(2026-07-07 요청).
+    /// 시작/워크스페이스 전환 시 1회. best-effort — 실패해도 앱은 정상 동작.
+    fn sync_dotenv_env(&mut self) {
+        // 1) .env → dotenv profile 동기화 (secret은 keyring).
+        if let Some(root) = self.active_tree_root() {
+            match crate::dotenv_sync::sync_workspace_dotenv(
+                &self.db,
+                &self.secret_store,
+                &self.redaction,
+                &self.active.id,
+                &root,
+            ) {
+                Ok(Some(report)) if report.upserted + report.removed > 0 => {
+                    tracing::info!(
+                        upserted = report.upserted,
+                        removed = report.removed,
+                        ".env → 환경 profile 동기화"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(".env 동기화 실패: {e:#}"),
+            }
+        }
+        // 2) dotenv profile env를 워커 기본 env로 전송 — profile이 없으면 빈 값으로
+        //    보내 이전 워크스페이스의 잔여 기본 env를 지운다.
+        let (mut env_plain, mut env_secrets) = (Vec::new(), Vec::new());
+        if let Ok(profiles) = self.db.list_env_profiles(&self.active.id)
+            && let Some(p) = profiles
+                .into_iter()
+                .find(|p| p.kind == crate::dotenv_sync::DOTENV_PROFILE_KIND)
+            && let Ok(vars) = self.db.list_env_vars(&p.id)
+        {
+            for var in vars {
+                match var.value {
+                    crate::env::EnvValue::Plain(v) => env_plain.push((var.key, v)),
+                    crate::env::EnvValue::Secret { credential_id } => {
+                        env_secrets.push((var.key, credential_id));
+                    }
+                }
+            }
+        }
+        let _ = self
+            .active
+            .runtime
+            .send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
+                env_plain,
+                env_secrets,
+            });
     }
 
     /// 활성 workspace의 트리 루트 (path 미설정/조회 실패 → None → 안내 표시 §9-2).

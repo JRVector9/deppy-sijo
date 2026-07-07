@@ -40,7 +40,9 @@ struct ProcRow {
 /// 다시 탐색한다. 정상 케이스(에이전트 생존)에서 세션당 O(1) pid 확인만 남는다.
 #[derive(Default)]
 pub struct BindingCache {
-    entries: HashMap<SessionId, (AgentBinding, u32)>, // (바인딩, 에이전트 owner pid)
+    /// (바인딩, 에이전트 owner pid, 결정적 여부). 휴리스틱 바인딩은 매 tick lsof로
+    /// 업그레이드를 시도한다 — codex가 작업 중 rollout을 열면 정확한 것으로 교체.
+    entries: HashMap<SessionId, (AgentBinding, u32, bool)>,
 }
 
 /// 캐시를 활용한 detect. `cache`는 호출측(워커 스레드)이 소유·유지한다.
@@ -52,16 +54,41 @@ pub fn detect_cached(
     let live_pids: std::collections::HashSet<u32> = rows.iter().map(|r| r.pid).collect();
     let mut out = HashMap::new();
     for (sid, shell_pid) in sessions {
-        // 캐시 히트 + owner 프로세스 생존 → 재발견 스킵.
-        if let Some((binding, owner_pid)) = cache.entries.get(sid)
+        // 캐시 히트 + owner 프로세스 생존 → 재발견 스킵. 단 휴리스틱 바인딩은 lsof로
+        // 결정적 업그레이드를 시도한다(작업 중 rollout이 열리면 정확한 파일로 교체).
+        if let Some((binding, owner_pid, det)) = cache.entries.get(sid)
             && live_pids.contains(owner_pid)
         {
-            out.insert(*sid, binding.clone());
+            let (owner_pid, det) = (*owner_pid, *det);
+            {
+                if !det
+                    && binding.kind == AgentKind::Codex
+                    && let Some(t) = codex_open_rollout(owner_pid)
+                    && let Some(id) = t
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .and_then(agent_transcript::codex_session_id)
+                {
+                    let upgraded = AgentBinding {
+                        kind: AgentKind::Codex,
+                        session_id: id,
+                        transcript: t,
+                    };
+                    cache
+                        .entries
+                        .insert(*sid, (upgraded.clone(), owner_pid, true));
+                    out.insert(*sid, upgraded);
+                } else {
+                    out.insert(*sid, cache.entries[sid].0.clone());
+                }
+            }
             continue;
         }
         // 미스/종료 → 전체 탐색 후 캐시 갱신.
-        if let Some((binding, owner_pid)) = find_agent(*shell_pid, &rows) {
-            cache.entries.insert(*sid, (binding.clone(), owner_pid));
+        if let Some((binding, owner_pid, det)) = find_agent(*shell_pid, &rows) {
+            cache
+                .entries
+                .insert(*sid, (binding.clone(), owner_pid, det));
             out.insert(*sid, binding);
         } else {
             cache.entries.remove(sid);
@@ -84,38 +111,43 @@ pub fn activity(binding: &AgentBinding) -> Option<agent_transcript::AgentActivit
 
 /// 셸 pid의 자손 중 claude/codex를 찾아 transcript까지 바인딩한다. 캐시 생존 확인용으로
 /// 그 에이전트 프로세스 pid도 함께 돌려준다.
-fn find_agent(shell_pid: u32, rows: &[ProcRow]) -> Option<(AgentBinding, u32)> {
+fn find_agent(shell_pid: u32, rows: &[ProcRow]) -> Option<(AgentBinding, u32, bool)> {
     let descendants = descendant_pids(shell_pid, rows);
     // 한 셸에 에이전트가 여럿일 수 있다(^Z 중단 후 재실행 등, 2026-07-07 실증: codex 2개).
-    // 첫 매치(pid 낮은 것 = 대체로 오래된 것)가 아니라 transcript mtime이 가장 최신인
-    // 후보를 고른다 — 활성 대화가 append 중인 쪽이 사용자가 보는 세션이다.
-    let mut best: Option<(AgentBinding, u32, Option<std::time::SystemTime>)> = None;
+    // 선택 기준: ①결정적(argv/lsof) 바인딩이 휴리스틱(cwd)보다 우선 — 휴리스틱 mtime이
+    // 더 최신이어도 오바인딩일 수 있다(실증: fresh codex가 resume 세션으로 오바인딩).
+    // ②같은 등급 안에선 transcript mtime 최신(활성 대화가 append 중인 쪽).
+    let mut best: Option<(AgentBinding, u32, bool, Option<std::time::SystemTime>)> = None;
     for row in rows.iter().filter(|r| descendants.contains(&r.pid)) {
         if let Some((kind, sid_hint)) = classify(&row.command)
-            && let Some(b) = bind_transcript(kind, sid_hint, row.pid)
+            && let Some((b, det)) = bind_transcript(kind, sid_hint, row.pid)
         {
             let mtime = std::fs::metadata(&b.transcript)
                 .and_then(|m| m.modified())
                 .ok();
-            if best.as_ref().is_none_or(|(_, _, prev)| mtime > *prev) {
-                best = Some((b, row.pid, mtime));
+            let better = best
+                .as_ref()
+                .is_none_or(|(_, _, bdet, bmt)| (det, mtime) > (*bdet, *bmt));
+            if better {
+                best = Some((b, row.pid, det, mtime));
             }
         }
     }
-    best.map(|(b, pid, _)| (b, pid))
+    best.map(|(b, pid, det, _)| (b, pid, det))
 }
 
 /// command가 claude/codex인지 판별하고, claude면 argv에서 세션ID를 추출한다.
 fn classify(command: &str) -> Option<(AgentKind, Option<String>)> {
-    // 바이너리 경로가 claude/codex로 끝나는 토큰이 있는지 (부분일치 오탐 회피).
+    // 처음 두 토큰(프로그램, 또는 인터프리터+스크립트)의 파일명이 claude/codex인지.
+    // 이전의 `contains("/codex ")`는 인자 없는 `node /opt/.../codex`(뒤공백 없음)를
+    // 놓쳤다(2026-07-07 실증 — fresh codex wrapper 미분류).
     let is = |name: &str| {
-        command.split_whitespace().next().is_some_and(|prog| {
-            Path::new(prog)
+        command.split_whitespace().take(2).any(|tok| {
+            Path::new(tok)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n == name)
-        }) || command.contains(&format!("/{name} ")) // node wrapper: "node .../codex ..."
-            || command.contains(&format!("/{name}\t"))
+        })
     };
     if is("claude") {
         return Some((AgentKind::Claude, claude_session_id(command)));
@@ -140,18 +172,28 @@ fn claude_session_id(command: &str) -> Option<String> {
     None
 }
 
-/// 감지된 에이전트를 실제 transcript 파일로 확정한다.
-fn bind_transcript(kind: AgentKind, sid_hint: Option<String>, pid: u32) -> Option<AgentBinding> {
+/// 감지된 에이전트를 실제 transcript 파일로 확정한다. 두 번째 반환값 = 결정적 여부:
+/// argv 세션ID(claude)·lsof 열린 파일(codex)은 결정적, cwd 매칭은 휴리스틱(오바인딩 가능 —
+/// 2026-07-07 실증: 프로세스 cwd(/Users)와 rollout 기록 cwd(arteawiki)가 다르거나, 같은
+/// cwd 다중 세션이 최신 쪽으로 모임). find_agent가 결정적 후보를 우선한다.
+fn bind_transcript(
+    kind: AgentKind,
+    sid_hint: Option<String>,
+    pid: u32,
+) -> Option<(AgentBinding, bool)> {
     match kind {
         AgentKind::Claude => {
             // 1순위: argv --session-id (결정적 — cmux/자동화 실행 케이스).
             if let Some(sid) = sid_hint {
                 let transcript = find_claude_transcript(&sid)?;
-                return Some(AgentBinding {
-                    kind,
-                    session_id: sid,
-                    transcript,
-                });
+                return Some((
+                    AgentBinding {
+                        kind,
+                        session_id: sid,
+                        transcript,
+                    },
+                    true,
+                ));
             }
             // fallback: 손타이핑 `claude`(argv에 세션ID 없음 — 2026-07-07 실증)는 cwd의
             // 프로젝트 디렉터리(~/.claude/projects/<escaped-cwd>/)에서 최신 mtime transcript.
@@ -159,11 +201,14 @@ fn bind_transcript(kind: AgentKind, sid_hint: Option<String>, pid: u32) -> Optio
             // 2개면 최신 대화 쪽으로 모일 수 있는 한계는 codex cwd fallback과 동일.
             let cwd = process_cwd(pid)?;
             let (session_id, transcript) = find_claude_transcript_by_cwd(&cwd)?;
-            Some(AgentBinding {
-                kind,
-                session_id,
-                transcript,
-            })
+            Some((
+                AgentBinding {
+                    kind,
+                    session_id,
+                    transcript,
+                },
+                false,
+            ))
         }
         AgentKind::Codex => {
             // 1순위: 프로세스가 append 중인 rollout을 lsof로 직접 획득 — 결정적(스캔·상한·
@@ -175,20 +220,27 @@ fn bind_transcript(kind: AgentKind, sid_hint: Option<String>, pid: u32) -> Optio
                     .and_then(|n| n.to_str())
                     .and_then(agent_transcript::codex_session_id)
             {
-                return Some(AgentBinding {
+                return Some((
+                    AgentBinding {
+                        kind,
+                        session_id,
+                        transcript,
+                    },
+                    true,
+                ));
+            }
+            // fallback: cwd 매칭 스캔 — 휴리스틱. codex는 rollout을 항상 열어두지 않아
+            // (실증: idle fresh 세션은 닫혀 있음) lsof가 자주 miss라 필요하다.
+            let cwd = process_cwd(pid)?;
+            let (session_id, transcript) = find_codex_transcript(&cwd)?;
+            Some((
+                AgentBinding {
                     kind,
                     session_id,
                     transcript,
-                });
-            }
-            // fallback: cwd 매칭 스캔 (파일을 안 열어둔 짧은 순간/플랫폼 차이 대비).
-            let cwd = process_cwd(pid)?;
-            let (session_id, transcript) = find_codex_transcript(&cwd)?;
-            Some(AgentBinding {
-                kind,
-                session_id,
-                transcript,
-            })
+                },
+                false,
+            ))
         }
     }
 }
@@ -503,10 +555,10 @@ mod tests {
         let mut found = 0;
         for row in &rows {
             if let Some((kind, sid)) = classify(&row.command)
-                && let Some(b) = bind_transcript(kind, sid, row.pid)
+                && let Some((b, det)) = bind_transcript(kind, sid, row.pid)
             {
                 println!(
-                    "  {:?} pid={} sid={}… → {}",
+                    "  {:?} pid={} det={det} sid={}… → {}",
                     b.kind,
                     row.pid,
                     &b.session_id[..b.session_id.len().min(16)],

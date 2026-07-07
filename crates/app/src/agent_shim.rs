@@ -50,6 +50,7 @@ pub fn install(db_path: &std::path::Path, proxy_bin: &str) -> anyhow::Result<()>
         ("session-start", "session-start"),
         ("needs-input", "needs-input"),
         ("clear", "clear"),
+        ("turn-done", "turn-done"),
     ];
     for (name, ev) in EVENTS {
         let script = format!("#!/bin/sh\nexec {}\n", hook_command(proxy_bin, db_path, ev));
@@ -69,7 +70,8 @@ pub fn install(db_path: &std::path::Path, proxy_bin: &str) -> anyhow::Result<()>
             "Notification":     [ { "hooks": [ { "type": "command", "command": hook("needs-input") } ] } ],
             "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": hook("clear") } ] } ],
             "PreToolUse":       [ { "hooks": [ { "type": "command", "command": hook("clear") } ] } ],
-            "Stop":             [ { "hooks": [ { "type": "command", "command": hook("clear") } ] } ],
+            // Stop = 턴 완료 → 상태 레일 '완료' 트랜지언트 (clear가 아니라 turn-done).
+            "Stop":             [ { "hooks": [ { "type": "command", "command": hook("turn-done") } ] } ],
         }
     });
     let settings_path = root.join("claude-hook-settings.json");
@@ -102,7 +104,8 @@ export DEPPY_SHIM_GUARD=1
         ("PermissionRequest", "needs-input", 120_000),
         ("UserPromptSubmit", "clear", 10_000),
         ("PreToolUse", "clear", 10_000),
-        ("Stop", "clear", 10_000),
+        // Stop = 턴 완료 → '완료' 트랜지언트.
+        ("Stop", "turn-done", 10_000),
     ];
     let mut codex_args = String::from("--enable hooks --dangerously-bypass-hook-trust");
     for (event, name, timeout) in codex_events {

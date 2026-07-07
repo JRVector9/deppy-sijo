@@ -178,6 +178,11 @@ CREATE TABLE agent_hook_sessions (
     updated_at INTEGER NOT NULL
 );
 ",
+    // v16: 턴 완료(Stop hook) 신호 — 상태 레일 '완료(바이올렛)' 트랜지언트의 소스.
+    // needs-input/clear(INSERT OR REPLACE)가 자연히 0으로 리셋한다.
+    "
+ALTER TABLE agent_needs_input ADD COLUMN turn_done INTEGER NOT NULL DEFAULT 0;
+",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -720,6 +725,41 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// 턴 완료(Stop hook) 기록 — waiting은 0으로 함께 리셋한다(턴이 끝났으므로).
+    pub fn set_agent_turn_done(&self, session_key: &str) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO agent_needs_input
+                     (session_key, waiting, turn_done, updated_at)
+                 VALUES (?1, 0, 1, CAST(strftime('%s','now') AS INTEGER))",
+                (session_key,),
+            )
+            .with_context(|| format!("turn_done 저장 실패: {session_key}"))?;
+        Ok(())
+    }
+
+    /// 턴 완료 소비(사용자가 해당 pane을 확인) — turn_done만 내린다(waiting 불변).
+    pub fn clear_agent_turn_done(&self, session_key: &str) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE agent_needs_input SET turn_done = 0 WHERE session_key = ?1",
+                (session_key,),
+            )
+            .with_context(|| format!("turn_done 해제 실패: {session_key}"))?;
+        Ok(())
+    }
+
+    /// 턴 완료(미확인) 세션 키 목록. waiting과 같은 1시간 stale 컷오프.
+    pub fn list_turn_done_sessions(&self) -> anyhow::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_key FROM agent_needs_input
+             WHERE turn_done = 1
+               AND updated_at > CAST(strftime('%s','now') AS INTEGER) - 3600",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// 워크스페이스의 저장된 에이전트 세션 (복원 시 resume 대상).
     pub fn list_agent_sessions(&self, workspace_id: &str) -> anyhow::Result<Vec<AgentSessionRow>> {
         let mut stmt = self.conn.prepare(
@@ -1246,6 +1286,29 @@ mod tests {
         assert_eq!(waiting, vec!["pane-1".to_string(), "pane-2".to_string()]);
         // clear → 목록에서 빠짐
         db.set_agent_needs_input("pane-1", false).unwrap();
+        assert_eq!(
+            db.list_waiting_sessions().unwrap(),
+            vec!["pane-2".to_string()]
+        );
+    }
+
+    #[test]
+    fn agent_turn_done_set_clear_및_needs_input과_상호리셋() {
+        let db = Db::open_in_memory().unwrap();
+        // Stop hook → turn_done=1, waiting=0
+        db.set_agent_turn_done("pane-1").unwrap();
+        assert_eq!(
+            db.list_turn_done_sessions().unwrap(),
+            vec!["pane-1".to_string()]
+        );
+        assert!(db.list_waiting_sessions().unwrap().is_empty());
+        // 확인(소비) → turn_done만 내림
+        db.clear_agent_turn_done("pane-1").unwrap();
+        assert!(db.list_turn_done_sessions().unwrap().is_empty());
+        // needs-input(REPLACE)이 turn_done을 자연 리셋
+        db.set_agent_turn_done("pane-2").unwrap();
+        db.set_agent_needs_input("pane-2", true).unwrap();
+        assert!(db.list_turn_done_sessions().unwrap().is_empty());
         assert_eq!(
             db.list_waiting_sessions().unwrap(),
             vec!["pane-2".to_string()]

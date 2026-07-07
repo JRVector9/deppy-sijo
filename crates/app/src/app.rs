@@ -326,6 +326,15 @@ struct RemoteTlsState {
     fingerprint: String,
 }
 
+/// 세션 알림(완료/입력대기) 주목 상태 — 레일 폭(6px)·1회 펄스 추적 (2026-07-07).
+struct SessionAlert {
+    status: runtime::SessionStatus,
+    /// 사용자가 확인(포커스)했는가 — false면 레일 6px 유지.
+    seen: bool,
+    /// 알림 도착 시 이미 포커스 중이던 pane의 1회 펄스 시작 시각.
+    pulse_started: Option<std::time::Instant>,
+}
+
 pub struct App {
     config: Config,
     config_path: PathBuf,
@@ -396,6 +405,10 @@ pub struct App {
     persisted_agents: std::collections::HashMap<String, crate::storage::AgentSessionRow>,
     /// hook이 보고한 입력 대기(needsInput) 세션들 — DB에서 주기적으로 읽어 레일 주황 반영.
     agent_needs_input: std::collections::HashSet<runtime::SessionId>,
+    /// hook이 보고한 턴 완료(Stop) 세션들 — 레일 '완료(바이올렛)' 트랜지언트 소스.
+    agent_turn_done: std::collections::HashSet<runtime::SessionId>,
+    /// 완료/입력대기 주목(attention) 추적 — 미확인이면 레일 6px, 포커스 확인 시 해제.
+    session_alerts: std::collections::HashMap<runtime::SessionId, SessionAlert>,
     /// 복원용으로 로드한 (pane_id → 저장된 에이전트 세션). 워크스페이스 활성 시 로드.
     restore_agents: std::collections::HashMap<String, crate::storage::AgentSessionRow>,
     /// restore_agents를 로드한 워크스페이스 id (전환 시 재로드 판정).
@@ -525,6 +538,8 @@ impl App {
             hook_overrides: std::collections::HashMap::new(),
             persisted_agents: std::collections::HashMap::new(),
             agent_needs_input: std::collections::HashSet::new(),
+            agent_turn_done: std::collections::HashSet::new(),
+            session_alerts: std::collections::HashMap::new(),
             restore_agents: std::collections::HashMap::new(),
             restore_loaded_for: None,
             resumed_panes: std::collections::HashSet::new(),
@@ -739,17 +754,86 @@ impl App {
     /// workspace_id로 스코프한다(codex High). 활성 워크스페이스 것만 남긴다.
     fn refresh_needs_input(&mut self) {
         let ws = self.active.id.clone();
-        self.agent_needs_input = self
-            .db
-            .list_waiting_sessions()
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|k| {
-                let (w, s) = k.rsplit_once(':')?;
-                (w == ws).then_some(())?;
-                s.parse::<u64>().ok().map(runtime::SessionId)
-            })
-            .collect();
+        let to_ids = |keys: Vec<String>| -> std::collections::HashSet<runtime::SessionId> {
+            keys.iter()
+                .filter_map(|k| {
+                    let (w, s) = k.rsplit_once(':')?;
+                    (w == ws).then_some(())?;
+                    s.parse::<u64>().ok().map(runtime::SessionId)
+                })
+                .collect()
+        };
+        self.agent_needs_input = to_ids(self.db.list_waiting_sessions().unwrap_or_default());
+        // 턴 완료(Stop hook) — 확인(포커스) 시 update_session_alerts가 소비한다.
+        self.agent_turn_done = to_ids(self.db.list_turn_done_sessions().unwrap_or_default());
+    }
+
+    /// 완료/입력대기 주목(attention) 추적 — 세션 엔트리에 attention/pulse를 채운다.
+    /// 규칙(2026-07-07): 알림 발생 시 그 pane이 비포커스면 확인할 때까지 레일 6px 유지,
+    /// 이미 포커스 중이면 6px 대신 1회 펄스. 완료는 확인 시 소비(DB clear → 유휴로 복귀).
+    fn update_session_alerts(&mut self, entries: &mut [ui::file_tree::SessionEntry]) {
+        use runtime::SessionStatus as S;
+        const PULSE_SECS: f32 = 0.9;
+        let mut any_pulse = false;
+        for entry in entries.iter_mut() {
+            let Some(sid) = entry.session else { continue };
+            let alert_status = match entry.status {
+                Some(s @ (S::Done | S::NeedsApproval)) => Some(s),
+                _ => None,
+            };
+            match alert_status {
+                Some(status) => {
+                    let is_new = self
+                        .session_alerts
+                        .get(&sid)
+                        .is_none_or(|a| a.status != status);
+                    if is_new {
+                        // 새 알림: 보고 있으면 펄스 1회, 아니면 미확인(6px)으로 시작.
+                        self.session_alerts.insert(
+                            sid,
+                            SessionAlert {
+                                status,
+                                seen: entry.focused,
+                                pulse_started: entry.focused.then(std::time::Instant::now),
+                            },
+                        );
+                    }
+                    let alert = self.session_alerts.get_mut(&sid).expect("방금 삽입/존재");
+                    // 확인: 포커스가 오면 seen 처리. 완료는 소비해 유휴로 되돌린다.
+                    if entry.focused && !alert.seen {
+                        alert.seen = true;
+                    }
+                    if alert.seen && status == S::Done && self.agent_turn_done.contains(&sid) {
+                        let key = format!("{}:{}", self.active.id, sid.0);
+                        let _ = self.db.clear_agent_turn_done(&key);
+                        self.agent_turn_done.remove(&sid);
+                    }
+                    entry.attention = !alert.seen;
+                    if let Some(started) = alert.pulse_started {
+                        let t = started.elapsed().as_secs_f32() / PULSE_SECS;
+                        if t < 1.0 {
+                            entry.pulse = Some((
+                                t,
+                                ui::file_tree::session_status_color(
+                                    Some(status),
+                                    &egui::Visuals::dark(),
+                                ),
+                            ));
+                            any_pulse = true;
+                        } else {
+                            alert.pulse_started = None;
+                        }
+                    }
+                }
+                None => {
+                    self.session_alerts.remove(&sid);
+                }
+            }
+        }
+        if any_pulse {
+            // 펄스 애니메이션 프레임 지속 — 끝나면 자연히 유휴 리페인트로 복귀.
+            self.egui_ctx.request_repaint();
+        }
     }
 
     /// 바인딩 감지 결과를 소비한다 — 저장(차등 upsert/delete) + 복원 resume 주입. 워커
@@ -1038,6 +1122,8 @@ impl App {
         self.agent_bindings.clear();
         self.agent_activity.clear();
         self.agent_needs_input.clear();
+        self.agent_turn_done.clear();
+        self.session_alerts.clear();
         let _ = old
             .runtime
             .send_command(runtime::RuntimeCommand::SetWorkspaceState(
@@ -1233,6 +1319,7 @@ impl App {
                                 &self.i18n,
                                 &self.agent_activity,
                                 &self.agent_needs_input,
+                                &self.agent_turn_done,
                             )
                             .len(),
                         pending_events: self.active.pending_events.len(),
@@ -1652,11 +1739,14 @@ impl eframe::App for App {
         // 폴더 트리 사이드바 (FT-1) — CentralPanel보다 먼저 배치해야 한다 (§9-1).
         // OFF(None)면 Panel 자체를 만들지 않는다 (§6 리소스 0).
         if self.file_tree.is_some() {
-            let sessions = self.active.workspace_ui.session_entries(
+            let mut sessions = self.active.workspace_ui.session_entries(
                 &text,
                 &self.agent_activity,
                 &self.agent_needs_input,
+                &self.agent_turn_done,
             );
+            // 완료/입력대기 주목(6px 레일·펄스) 갱신 + 확인 시 완료 소비.
+            self.update_session_alerts(&mut sessions);
             let sidebar_action = self
                 .file_tree
                 .as_mut()

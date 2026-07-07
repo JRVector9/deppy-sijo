@@ -1233,9 +1233,9 @@ impl WorkspaceUi {
             ui.separator();
             if let Some(session) = session {
                 ui.menu_button(catalog.t("status.override.menu", &[]), |ui| {
+                    // mark_waiting은 제거 — 대기는 입력대기(NeedsApproval)로 통합(2026-07-07).
                     for (key, status) in [
                         ("status.override.mark_running", SessionStatus::Running),
-                        ("status.override.mark_waiting", SessionStatus::Waiting),
                         (
                             "status.override.mark_needs_approval",
                             SessionStatus::NeedsApproval,
@@ -1292,6 +1292,7 @@ impl WorkspaceUi {
             crate::agent_transcript::AgentActivity,
         >,
         needs_input: &std::collections::HashSet<runtime::SessionId>,
+        turn_done: &std::collections::HashSet<runtime::SessionId>,
     ) -> Vec<crate::ui::file_tree::SessionEntry> {
         let Some(mux) = &self.mux else {
             return Vec::new();
@@ -1311,7 +1312,8 @@ impl WorkspaceUi {
                     .and_then(|s| agent_activity.get(&s).copied());
                 // hook이 보고한 needsInput = 가장 신뢰도 높은 승인 신호(최우선).
                 let waiting = pane.session_id.is_some_and(|s| needs_input.contains(&s));
-                let status = merge_agent_status(regex_status, activity, waiting);
+                let done = pane.session_id.is_some_and(|s| turn_done.contains(&s));
+                let status = merge_agent_status(regex_status, activity, waiting, done);
                 let summary = pane
                     .session_id
                     .and_then(|s| self.sessions.get(&s))
@@ -1321,10 +1323,13 @@ impl WorkspaceUi {
                 crate::ui::file_tree::SessionEntry {
                     tab: tab.id.clone(),
                     pane: pane.id.clone(),
+                    session: pane.session_id,
                     title: self.resolve_session_title(&pane.title, osc.as_deref(), catalog),
                     status,
                     summary,
                     focused: mux.focused_pane.as_ref() == Some(&pane.id),
+                    attention: false, // App의 alert 추적이 채운다 (update_session_alerts)
+                    pulse: None,
                 }
             })
             .collect()
@@ -1568,6 +1573,7 @@ fn merge_agent_status(
     regex: Option<runtime::SessionStatus>,
     activity: Option<crate::agent_transcript::AgentActivity>,
     needs_input: bool,
+    turn_done: bool,
 ) -> Option<runtime::SessionStatus> {
     use crate::agent_transcript::AgentActivity;
     use runtime::SessionStatus as S;
@@ -1576,8 +1582,16 @@ fn merge_agent_status(
     if needs_input && activity != Some(AgentActivity::Working) {
         return Some(S::NeedsApproval);
     }
-    if matches!(regex, Some(S::NeedsApproval | S::Error | S::Done)) {
-        return regex;
+    // Stop hook = 턴 완료. UserPromptSubmit/PreToolUse가 clear하므로 재개 시 즉시 해제.
+    // transcript activity(Stop 직후 잠깐 Working으로 남음)보다 우선한다.
+    if turn_done {
+        return Some(S::Done);
+    }
+    match regex {
+        // 대기(Waiting)는 입력대기(주황)로 통합 — 별도 팔레트 없음 (2026-07-07 결정).
+        Some(S::Waiting) => return Some(S::NeedsApproval),
+        Some(S::NeedsApproval | S::Error | S::Done) => return regex,
+        _ => {}
     }
     match activity {
         Some(AgentActivity::Working) => Some(S::Running),

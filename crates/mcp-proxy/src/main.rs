@@ -145,6 +145,9 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
         // needsInput 이벤트만 대기 상태를 바꾼다. session-start 등은 바인딩만 기록.
         if event == "needs-input" || event == "clear" {
             let _ = db.set_agent_needs_input(&session_key, event == "needs-input");
+        } else if event == "turn-done" {
+            // Stop hook = 턴 완료 → 상태 레일 '완료(바이올렛)' 트랜지언트 트리거.
+            let _ = db.set_agent_turn_done(&session_key);
         }
         // 어떤 이벤트든 payload에 (session_id, transcript_path)가 오면 최신 바인딩으로 갱신.
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {

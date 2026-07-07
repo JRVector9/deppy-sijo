@@ -14,13 +14,19 @@ use std::sync::{Arc, Mutex};
 pub struct SessionEntry {
     pub tab: runtime::MuxTabId,
     pub pane: runtime::MuxPaneId,
+    /// pane의 세션 id — App의 alert(주목) 추적 키.
+    pub session: Option<runtime::SessionId>,
     pub title: String,
-    /// agent 감지 상태 (Running/Waiting/NeedsApproval/Done/Error). 셸은 항상 None —
+    /// agent 감지 상태 (Running/NeedsApproval/Done/Error/Idle). 셸은 항상 None —
     /// status 감지는 agent만(§PR-12). 세션 행 좌측 상태 레일 색으로 그린다.
     pub status: Option<runtime::SessionStatus>,
     /// 최신 화면 요약 (마지막 비어있지 않은 행 — 2026-07-05)
     pub summary: String,
     pub focused: bool,
+    /// 미확인 완료/입력대기 — 레일을 6px로 굵힌다. 해당 pane 포커스 시 해제.
+    pub attention: bool,
+    /// 알림 도착 시 이미 포커스 중이던 pane의 1회 펄스 — (진행 0..1, 알림 색).
+    pub pulse: Option<(f32, egui::Color32)>,
 }
 
 /// 사이드바에서 App으로 올라가는 액션.
@@ -1984,12 +1990,22 @@ fn session_row(ui: &mut egui::Ui, entry: &SessionEntry) -> egui::Response {
     } else if resp.hovered() {
         painter.rect_filled(rect, 4.0, hover_bg);
     }
-    // 좌측 상태 레일(2px) — 항상 표시, 상태 색으로 세로로 훑어 파악 (목업 §세션).
+    // 좌측 상태 레일 — 항상 표시, 상태 색으로 세로로 훑어 파악 (목업 §세션).
+    // 폭 = 두 번째 채널(2026-07-07): 평시 3px, 미확인 완료/입력대기(attention)는 6px로
+    // 굵힌다. 알림 도착 시 이미 보고 있던 pane은 6px 대신 1회 펄스(3→6→3px).
+    // 자리는 최대 6px 기준으로 상시 예약(텍스트 x=16 고정)이라 폭이 바뀌어도 안 밀린다.
+    let (rail_w, rail_color) = if let Some((t, color)) = entry.pulse {
+        (3.0 + 3.0 * (t * std::f32::consts::PI).sin(), color)
+    } else if entry.attention {
+        (6.0, dot)
+    } else {
+        (3.0, dot)
+    };
     let rail = egui::Rect::from_min_size(
         egui::pos2(rect.left(), rect.top() + 4.0),
-        egui::vec2(2.0, row_h - 8.0),
+        egui::vec2(rail_w, row_h - 8.0),
     );
-    painter.rect_filled(rail, 1.0, dot);
+    painter.rect_filled(rail, 1.0, rail_color);
     let mid_y = rect.top() + if has_summary { 13.0 } else { row_h / 2.0 };
     painter.galley(
         egui::pos2(rect.left() + 16.0, mid_y - title_galley.size().y / 2.0),
@@ -2171,10 +2187,11 @@ pub(crate) fn session_status_color(
     use runtime::SessionStatus as S;
     match status {
         Some(S::Running) => egui::Color32::from_rgb(0x43, 0xb8, 0xcd), // 실행(시안)
-        Some(S::Waiting) => egui::Color32::from_rgb(0xd9, 0xb2, 0x6a), // 대기(노랑)
-        Some(S::NeedsApproval) => egui::Color32::from_rgb(0xe0, 0xa8, 0x3e), // 승인(주황)
-        Some(S::Done) => egui::Color32::from_rgb(0x6c, 0xc2, 0x6c),    // 완료(초록)
-        Some(S::Error) => egui::Color32::from_rgb(0xe0, 0x5c, 0x53),   // 오류(빨강)
+        // 대기는 입력대기로 통합(2026-07-07) — merge에서 이미 흡수되지만 방어적으로 같은 색.
+        Some(S::Waiting | S::NeedsApproval) => egui::Color32::from_rgb(0xe0, 0xa8, 0x3e), // 입력대기(주황)
+        // 완료 = 바이올렛(팔레트 유일 보라 — 유휴 초록과 확실히 구분, 2026-07-07 결정).
+        Some(S::Done) => egui::Color32::from_rgb(0x9a, 0x7f, 0xd1),
+        Some(S::Error) => egui::Color32::from_rgb(0xe0, 0x5c, 0x53), // 오류(빨강)
         // 유휴(에이전트 붙어있고 대기) — 차분한 초록. 이전엔 미감지와 같은 회색이라
         // "감지 안 됨"과 구분이 안 됐다(2026-07-07 사용자: 실행중인데 안 잡혀 보임).
         Some(S::Idle) => egui::Color32::from_rgb(0x56, 0xa0, 0x6a),

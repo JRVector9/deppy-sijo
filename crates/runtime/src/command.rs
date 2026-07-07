@@ -45,13 +45,6 @@ pub enum RuntimeCommand {
         error_regex: Option<String>,
         done_regex: Option<String>,
     },
-    /// 이후 SpawnShell이 사용할 워크스페이스 기본 env(.env 자동 주입 — 2026-07-07).
-    /// secret은 credential_id 참조로만 전달되고 worker가 spawn 직전에 resolve한다(6.3).
-    SetSessionDefaultEnv {
-        env_plain: Vec<(String, String)>,
-        /// (env key, credential_id)
-        env_secrets: Vec<(String, String)>,
-    },
     WriteInput {
         session: SessionId,
         bytes: Vec<u8>,
@@ -121,6 +114,14 @@ pub enum RuntimeCommand {
     RenamePane {
         pane: MuxPaneId,
         title: String,
+    },
+    /// 이후 SpawnShell이 사용할 워크스페이스 기본 env(.env 자동 주입 — 2026-07-07).
+    /// secret은 credential_id 참조로만 전달되고 worker가 spawn 직전에 resolve한다(6.3).
+    /// **wire 계약**: postcard enum discriminant라 variant는 항상 끝에만 추가한다(codex High).
+    SetSessionDefaultEnv {
+        env_plain: Vec<(String, String)>,
+        /// (env key, credential_id)
+        env_secrets: Vec<(String, String)>,
     },
 }
 

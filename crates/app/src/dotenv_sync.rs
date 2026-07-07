@@ -39,15 +39,18 @@ pub fn parse_dotenv(content: &str) -> Vec<(String, String)> {
         {
             continue;
         }
-        let mut value = value.trim();
-        // 값 뒤 주석은 따옴표 없는 값에만 해당하나, 단순화를 위해 따옴표부터 처리한다.
-        if (value.starts_with('"') && value.ends_with('"') && value.len() >= 2)
-            || (value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2)
-        {
-            value = &value[1..value.len() - 1];
+        let value = value.trim();
+        // 따옴표 값은 닫는 따옴표까지가 값 — 그 뒤(후행 주석 등)는 버린다.
+        // `FOO="bar" # comment`가 `"bar"`로 저장되던 것 수정(codex 리뷰).
+        let value = if let Some(rest) = value.strip_prefix('"') {
+            rest.split_once('"').map_or(rest, |(v, _)| v)
+        } else if let Some(rest) = value.strip_prefix('\'') {
+            rest.split_once('\'').map_or(rest, |(v, _)| v)
         } else if let Some((v, _comment)) = value.split_once(" #") {
-            value = v.trim_end();
-        }
+            v.trim_end()
+        } else {
+            value
+        };
         out.push((key.to_owned(), value.to_owned()));
     }
     out
@@ -188,6 +191,7 @@ API_KEY="sk-live-123"
 EMPTY=
 QUOTED='hello world'
 PLAIN=value # trailing comment
+QUOTED_COMMENT="bar" # comment
 INVALID LINE
 =nokey
 "#;
@@ -203,6 +207,7 @@ INVALID LINE
                 ("EMPTY".to_owned(), String::new()),
                 ("QUOTED".to_owned(), "hello world".to_owned()),
                 ("PLAIN".to_owned(), "value".to_owned()),
+                ("QUOTED_COMMENT".to_owned(), "bar".to_owned()),
             ]
         );
     }

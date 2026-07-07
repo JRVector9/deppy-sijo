@@ -61,7 +61,13 @@ struct PendingPaste {
     shell_kind: crate::ui::file_tree::ShellKind,
     /// egui Event::Paste로 이미 받은 텍스트(있으면) — 이미지가 없을 때의 fallback.
     text_fallback: Option<Vec<u8>>,
+    /// 요청 시각 — 워크스페이스가 warm으로 물러났다 돌아온 뒤 도착한 옛 paste가
+    /// 살아있는 세션(바뀐 프롬프트)에 뒤늦게 꽂히지 않게 만료시킨다(codex Medium).
+    requested_at: std::time::Instant,
 }
+
+/// 백그라운드 paste 결과의 수명 — 이보다 오래된 완료는 버린다.
+const PASTE_TASK_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 세션별 화면 캐시. hidden tab 세션의 스냅샷은 `MuxUpdated`에서 버린다.
 #[derive(Default)]
@@ -1059,6 +1065,7 @@ impl WorkspaceUi {
                     bracketed,
                     shell_kind: self.session_shell_kind(session),
                     text_fallback: text_paste_bytes.take(),
+                    requested_at: std::time::Instant::now(),
                 });
             } else if let Some(bytes) = text_paste_bytes {
                 pending.extend(bytes);
@@ -1363,6 +1370,11 @@ impl WorkspaceUi {
     /// 스레드가 끝나면 repaint를 깨우므로 유휴 중에도 다음 프레임에 소비된다.
     fn poll_paste_task(&mut self, client: &dyn RuntimeClient) {
         let Some(task) = &self.paste_task else { return };
+        // 만료: warm으로 물러났다 돌아온 뒤 옛 paste가 뒤늦게 꽂히는 것 방지(codex Medium).
+        if task.requested_at.elapsed() > PASTE_TASK_TTL {
+            self.paste_task = None;
+            return;
+        }
         let result = match task.rx.try_recv() {
             Ok(result) => result,
             Err(std::sync::mpsc::TryRecvError::Empty) => return,

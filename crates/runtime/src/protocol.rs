@@ -24,8 +24,9 @@ use crate::event::RuntimeEvent;
 
 /// 첫 프레임을 v1 원시 토큰과 구분하고 오접속을 조기 거부하는 매직.
 pub(crate) const PROTO_MAGIC: [u8; 4] = *b"DPRT";
-/// 현재 프로토콜 버전.
-pub(crate) const PROTO_VERSION: u16 = 2;
+/// 현재 프로토콜 버전. v3: SetSessionDefaultEnv 커맨드 추가(끝에 append) — 구버전 피어가
+/// 미지의 variant를 스트림 중간에서 만나 오해독하는 대신 handshake에서 거부되게 올린다.
+pub(crate) const PROTO_VERSION: u16 = 3;
 
 /// delta viewport 스트리밍 기능 비트 (§3.1).
 pub(crate) const FEAT_DELTA_VIEWPORT: u32 = 1 << 0;

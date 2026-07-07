@@ -1267,6 +1267,7 @@ impl App {
     /// 시작/워크스페이스 전환 시 1회. best-effort — 실패해도 앱은 정상 동작.
     fn sync_dotenv_env(&mut self) {
         // 1) .env → dotenv profile 동기화 (secret은 keyring).
+        let mut dotenv_present = false;
         if let Some(root) = self.active_tree_root() {
             match crate::dotenv_sync::sync_workspace_dotenv(
                 &self.db,
@@ -1275,21 +1276,26 @@ impl App {
                 &self.active.id,
                 &root,
             ) {
-                Ok(Some(report)) if report.upserted + report.removed > 0 => {
-                    tracing::info!(
-                        upserted = report.upserted,
-                        removed = report.removed,
-                        ".env → 환경 profile 동기화"
-                    );
+                Ok(Some(report)) => {
+                    dotenv_present = true;
+                    if report.upserted + report.removed > 0 {
+                        tracing::info!(
+                            upserted = report.upserted,
+                            removed = report.removed,
+                            ".env → 환경 profile 동기화"
+                        );
+                    }
                 }
-                Ok(_) => {}
+                Ok(None) => {}
                 Err(e) => tracing::warn!(".env 동기화 실패: {e:#}"),
             }
         }
-        // 2) dotenv profile env를 워커 기본 env로 전송 — profile이 없으면 빈 값으로
-        //    보내 이전 워크스페이스의 잔여 기본 env를 지운다.
+        // 2) dotenv profile env를 워커 기본 env로 전송. **.env가 지금 존재할 때만** 주입 —
+        //    .env가 사라졌으면(브랜치 전환/삭제) profile은 보존하되 stale secret이 새 셸에
+        //    계속 들어가면 안 된다(codex High). 없으면 빈 값으로 잔여 기본 env를 지운다.
         let (mut env_plain, mut env_secrets) = (Vec::new(), Vec::new());
-        if let Ok(profiles) = self.db.list_env_profiles(&self.active.id)
+        if dotenv_present
+            && let Ok(profiles) = self.db.list_env_profiles(&self.active.id)
             && let Some(p) = profiles
                 .into_iter()
                 .find(|p| p.kind == crate::dotenv_sync::DOTENV_PROFILE_KIND)

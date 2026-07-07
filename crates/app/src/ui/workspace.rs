@@ -1380,11 +1380,16 @@ impl WorkspaceUi {
     }
 
     fn send(&mut self, client: &dyn RuntimeClient, command: RuntimeCommand) {
-        // 터미널에 입력을 보내면 그 세션 선택을 해제한다 — 선택 중엔 화면이 freeze돼(선택
-        // 정확성) 있어, 입력(타이핑/파일·텍스트 드롭/paste) 후 안 지우면 화면이 멈춘 듯
-        // 보인다. 모든 WriteInput 경로의 공통 지점이라 여기서 한 번에 처리한다(codex).
-        if let RuntimeCommand::WriteInput { session, .. } = &command
-            && self.selection.is_some_and(|(s, _, _)| s == *session)
+        // 터미널에 입력/스크롤을 보내면 그 세션 선택을 해제한다 — 선택 중엔 화면이 freeze돼
+        // (선택 정확성) 있어, 안 지우면 타이핑·스크롤해도 화면이 멈춘 듯 보인다(사용자:
+        // 드래그 선택 후 스크롤이 안 내려감). 공통 지점이라 여기서 한 번에 처리한다.
+        let touched = match &command {
+            RuntimeCommand::WriteInput { session, .. } => Some(*session),
+            RuntimeCommand::Scroll { session, .. } => Some(*session),
+            _ => None,
+        };
+        if let Some(session) = touched
+            && self.selection.is_some_and(|(s, _, _)| s == session)
         {
             self.selection = None;
         }

@@ -222,8 +222,12 @@ fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// 재귀 스캔에 상한을 둔다(codex 리뷰): ①심링크 미추적(루프·외부 거대 디렉터리 방지),
-/// ②depth 상한, ③파일 수 상한. ~/.codex/sessions는 YYYY/MM/DD(depth≈3)라 넉넉하다.
-/// resume 존재확인이 UI 스레드에서도 부르므로 무한 재귀/대량 스캔으로 인한 freeze를 막는다.
+/// ②depth 상한, ③파일 수 상한. resume 존재확인이 UI 스레드에서도 부르므로 무한 재귀/대량
+/// 스캔으로 인한 freeze를 막는다.
+///
+/// **역순(최신 먼저) 순회**: ~/.codex/sessions는 YYYY/MM/DD 구조 + rollout-<타임스탬프> 파일명
+/// 이라 이름 역순 = 시간 역순. 상한에 걸리면 '오래된 쪽'이 잘려야 한다 — 정순 순회는 rollout이
+/// 상한(4096)을 넘는 순간 최신 세션이 누락돼 codex 감지가 죽었다(2026-07-07 실증: 7,447개).
 fn collect_jsonl_bounded(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     const MAX_DEPTH: usize = 8;
     const MAX_FILES: usize = 4096;
@@ -233,7 +237,10 @@ fn collect_jsonl_bounded(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
-    for e in rd.flatten() {
+    // 이름 역순 정렬 — read_dir 순서는 비보장이라 명시 정렬해야 "최신 먼저"가 성립한다.
+    let mut entries: Vec<_> = rd.flatten().collect();
+    entries.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
+    for e in entries {
         if out.len() >= MAX_FILES {
             break;
         }

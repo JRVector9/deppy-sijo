@@ -1839,6 +1839,16 @@ impl eframe::App for App {
                 .file_tree
                 .as_mut()
                 .and_then(|tree| tree.panel(ui, &sessions, &text));
+            // 워처의 .env* 변경 신호 → 활성 워크스페이스에서 .env가 바뀌거나 사라져도
+            // 즉시 재동기화 + 기본 env 재전송 — 시작/전환 시에만 동기화하면 삭제된
+            // .env의 secret이 새 셸에 계속 주입된다(codex High).
+            let env_changed = self
+                .file_tree
+                .as_mut()
+                .is_some_and(|tree| !tree.take_env_warning_candidates().is_empty());
+            if env_changed {
+                self.sync_dotenv_env();
+            }
             match sidebar_action {
                 // "터미널에 경로 삽입" (FT-3): 포커스된 pane의 세션에 WriteInput —
                 // 파일 트리의 유일한 runtime 접점 (§6).

@@ -489,9 +489,8 @@ impl FileTreeUi {
         self.watch_ignore = std::sync::Arc::new(prefixes);
     }
 
-    /// 워처가 감지한 `.env*` 변경 후보를 꺼낸다. Project Environment UI 경고 배선은
-    /// 후속 PR에서 붙이더라도, PR-U16에서는 이 state가 테스트 가능한 signal이다.
-    #[allow(dead_code)]
+    /// 워처가 감지한 `.env*` 변경 후보를 꺼낸다. App이 매 프레임 소비해 .env 변경/삭제
+    /// 시 dotenv 재동기화를 트리거한다(2026-07-08 — stale secret 주입 방지, codex High).
     pub fn take_env_warning_candidates(&mut self) -> Vec<PathBuf> {
         std::mem::take(&mut self.env_warning_candidates)
             .into_iter()

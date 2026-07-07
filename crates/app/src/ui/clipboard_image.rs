@@ -10,6 +10,16 @@ pub fn paste_clipboard_paths_or_image_to_paths() -> anyhow::Result<Option<Vec<Pa
     paste_clipboard_image_to_png_with(&mut clipboard).map(|path| path.map(|path| vec![path]))
 }
 
+/// OS 클립보드의 텍스트를 직접 읽는다(빈/부재/에러는 None). ⌘V 시 egui Event::Paste가
+/// 터미널 위젯(비 텍스트에딧)에 안 오는 경우의 fallback — claude/codex 상태창 붙여넣기(#4).
+pub fn read_clipboard_text() -> Option<String> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    match clipboard.get_text() {
+        Ok(text) if !text.is_empty() => Some(text),
+        _ => None,
+    }
+}
+
 fn clipboard_file_list(clipboard: &mut arboard::Clipboard) -> anyhow::Result<Option<Vec<PathBuf>>> {
     match clipboard.get().file_list() {
         Ok(paths) => Ok((!paths.is_empty()).then_some(paths)),

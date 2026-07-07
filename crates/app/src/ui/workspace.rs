@@ -948,12 +948,20 @@ impl WorkspaceUi {
                         }
                     }
                     Ok(None) => {
-                        if let Some(bytes) = clipboard_terminal_paste_bytes(
+                        // egui Event::Paste가 왔으면 그 텍스트, 아니면 arboard로 클립보드
+                        // 텍스트를 직접 읽는다 — 터미널 위젯엔 Event::Paste가 안 올 수 있어
+                        // claude/codex 상태창 붙여넣기가 안 되던 것 수정(#4).
+                        let bytes = clipboard_terminal_paste_bytes(
                             None,
                             text_paste_bytes.take(),
                             self.session_shell_kind(session),
                             bracketed,
-                        ) {
+                        )
+                        .or_else(|| {
+                            crate::ui::clipboard_image::read_clipboard_text()
+                                .map(|t| terminal_text_paste_bytes(&t, bracketed))
+                        });
+                        if let Some(bytes) = bytes {
                             pending.extend(bytes);
                         }
                     }

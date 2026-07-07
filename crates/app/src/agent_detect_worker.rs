@@ -55,6 +55,8 @@ impl AgentDetectWorker {
                 let mut last_binding = Instant::now();
                 let mut last_activity = Instant::now();
                 let mut bindings: HashMap<SessionId, AgentBinding> = HashMap::new();
+                let mut cache = agent_detect::BindingCache::default();
+                let mut last_epoch = 0u64;
                 loop {
                     // 다음 만기까지 잔다. 활동 tier는 바인딩이 있을 때만 (없으면 바인딩 tier만).
                     let binding_wait = BINDING_INTERVAL.saturating_sub(last_binding.elapsed());
@@ -71,10 +73,17 @@ impl AgentDetectWorker {
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                     }
                     let (epoch, sessions) = input2.lock().unwrap().clone();
+                    // 워크스페이스 전환(epoch 변경) 시 캐시를 비운다 — SessionId가 워커마다
+                    // 1부터라 캐시가 다른 워크스페이스 세션과 충돌하는 것을 막는다.
+                    if epoch != last_epoch {
+                        last_epoch = epoch;
+                        cache = agent_detect::BindingCache::default();
+                        bindings.clear();
+                    }
                     if last_binding.elapsed() >= BINDING_INTERVAL {
                         last_binding = Instant::now();
                         last_activity = Instant::now();
-                        bindings = agent_detect::detect(&sessions);
+                        bindings = agent_detect::detect_cached(&sessions, &mut cache);
                         let activity = compute_activity(&bindings);
                         let sent = out_tx.send(DetectOutcome {
                             epoch,

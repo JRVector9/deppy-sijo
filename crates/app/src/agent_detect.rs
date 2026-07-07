@@ -34,16 +34,42 @@ struct ProcRow {
     command: String,
 }
 
-/// 각 세션(셸 pid)에서 실행 중인 에이전트를 감지해 transcript로 바인딩한다.
-/// ps를 한 번 호출해 전체 트리를 만들고, 세션마다 자손에서 claude/codex를 찾는다.
-pub fn detect(sessions: &[(SessionId, u32)]) -> HashMap<SessionId, AgentBinding> {
+/// 이미 확정된 세션→바인딩을 캐시해 재발견(lsof/codex 재귀 스캔)을 스킵한다(codex #3).
+/// 각 세션(셸 pid)에서 실행 중인 에이전트를 감지해 transcript로 바인딩한다 — ps를 한 번
+/// 에이전트 프로세스(owner_pid)가 여전히 ps 결과에 살아있으면 캐시를 재사용하고, 사라졌으면
+/// 다시 탐색한다. 정상 케이스(에이전트 생존)에서 세션당 O(1) pid 확인만 남는다.
+#[derive(Default)]
+pub struct BindingCache {
+    entries: HashMap<SessionId, (AgentBinding, u32)>, // (바인딩, 에이전트 owner pid)
+}
+
+/// 캐시를 활용한 detect. `cache`는 호출측(워커 스레드)이 소유·유지한다.
+pub fn detect_cached(
+    sessions: &[(SessionId, u32)],
+    cache: &mut BindingCache,
+) -> HashMap<SessionId, AgentBinding> {
     let rows = process_rows();
+    let live_pids: std::collections::HashSet<u32> = rows.iter().map(|r| r.pid).collect();
     let mut out = HashMap::new();
     for (sid, shell_pid) in sessions {
-        if let Some(b) = find_agent(*shell_pid, &rows) {
-            out.insert(*sid, b);
+        // 캐시 히트 + owner 프로세스 생존 → 재발견 스킵.
+        if let Some((binding, owner_pid)) = cache.entries.get(sid)
+            && live_pids.contains(owner_pid)
+        {
+            out.insert(*sid, binding.clone());
+            continue;
+        }
+        // 미스/종료 → 전체 탐색 후 캐시 갱신.
+        if let Some((binding, owner_pid)) = find_agent(*shell_pid, &rows) {
+            cache.entries.insert(*sid, (binding.clone(), owner_pid));
+            out.insert(*sid, binding);
+        } else {
+            cache.entries.remove(sid);
         }
     }
+    // 더는 존재하지 않는 세션의 캐시 항목 정리(누수 방지).
+    let alive: std::collections::HashSet<SessionId> = sessions.iter().map(|(s, _)| *s).collect();
+    cache.entries.retain(|sid, _| alive.contains(sid));
     out
 }
 
@@ -56,15 +82,16 @@ pub fn activity(binding: &AgentBinding) -> Option<agent_transcript::AgentActivit
     Some(state.activity)
 }
 
-/// 셸 pid의 자손 중 claude/codex를 찾아 transcript까지 바인딩한다.
-fn find_agent(shell_pid: u32, rows: &[ProcRow]) -> Option<AgentBinding> {
+/// 셸 pid의 자손 중 claude/codex를 찾아 transcript까지 바인딩한다. 캐시 생존 확인용으로
+/// 그 에이전트 프로세스 pid도 함께 돌려준다.
+fn find_agent(shell_pid: u32, rows: &[ProcRow]) -> Option<(AgentBinding, u32)> {
     let descendants = descendant_pids(shell_pid, rows);
     // 가장 안쪽(최근 spawn) 우선 — 트리 순서상 뒤에 오는 pid가 대체로 최신.
     for row in rows.iter().filter(|r| descendants.contains(&r.pid)) {
         if let Some((kind, sid_hint)) = classify(&row.command)
             && let Some(b) = bind_transcript(kind, sid_hint, row.pid)
         {
-            return Some(b);
+            return Some((b, row.pid));
         }
     }
     None

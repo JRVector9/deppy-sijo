@@ -739,24 +739,30 @@ impl Db {
     }
 
     /// 턴 완료 소비(사용자가 해당 pane을 확인) — turn_done만 내린다(waiting 불변).
-    pub fn clear_agent_turn_done(&self, session_key: &str) -> anyhow::Result<()> {
+    /// `seen_at`(내가 읽은 updated_at) 이후에 도착한 새 완료 이벤트는 지우지 않는다 —
+    /// 읽기~clear 사이 새 Stop이 오면 그 알림까지 유실되던 레이스 방지(codex 리뷰).
+    pub fn clear_agent_turn_done(&self, session_key: &str, seen_at: i64) -> anyhow::Result<()> {
         self.conn
             .execute(
-                "UPDATE agent_needs_input SET turn_done = 0 WHERE session_key = ?1",
-                (session_key,),
+                "UPDATE agent_needs_input SET turn_done = 0
+                 WHERE session_key = ?1 AND updated_at <= ?2",
+                (session_key, seen_at),
             )
             .with_context(|| format!("turn_done 해제 실패: {session_key}"))?;
         Ok(())
     }
 
-    /// 턴 완료(미확인) 세션 키 목록. waiting과 같은 1시간 stale 컷오프.
-    pub fn list_turn_done_sessions(&self) -> anyhow::Result<Vec<String>> {
+    /// 턴 완료(미확인) 세션 (key, updated_at) 목록. waiting과 같은 1시간 stale 컷오프.
+    /// updated_at은 소비 시 조건부 clear의 세대 기준으로 쓴다.
+    pub fn list_turn_done_sessions(&self) -> anyhow::Result<Vec<(String, i64)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT session_key FROM agent_needs_input
+            "SELECT session_key, updated_at FROM agent_needs_input
              WHERE turn_done = 1
                AND updated_at > CAST(strftime('%s','now') AS INTEGER) - 3600",
         )?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -1297,13 +1303,16 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         // Stop hook → turn_done=1, waiting=0
         db.set_agent_turn_done("pane-1").unwrap();
-        assert_eq!(
-            db.list_turn_done_sessions().unwrap(),
-            vec!["pane-1".to_string()]
-        );
+        let listed = db.list_turn_done_sessions().unwrap();
+        assert_eq!(listed.len(), 1);
+        let (key, seen_at) = listed[0].clone();
+        assert_eq!(key, "pane-1");
         assert!(db.list_waiting_sessions().unwrap().is_empty());
+        // 읽은 세대 이전 이벤트만 소비 — 더 새 이벤트(seen_at 미래)는 남는다(레이스 방지)
+        db.clear_agent_turn_done("pane-1", seen_at - 1).unwrap();
+        assert_eq!(db.list_turn_done_sessions().unwrap().len(), 1);
         // 확인(소비) → turn_done만 내림
-        db.clear_agent_turn_done("pane-1").unwrap();
+        db.clear_agent_turn_done("pane-1", seen_at).unwrap();
         assert!(db.list_turn_done_sessions().unwrap().is_empty());
         // needs-input(REPLACE)이 turn_done을 자연 리셋
         db.set_agent_turn_done("pane-2").unwrap();

@@ -1285,7 +1285,7 @@ impl WorkspaceUi {
             crate::agent_transcript::AgentActivity,
         >,
         needs_input: &std::collections::HashSet<runtime::SessionId>,
-        turn_done: &std::collections::HashSet<runtime::SessionId>,
+        turn_done: &std::collections::HashMap<runtime::SessionId, i64>,
     ) -> Vec<crate::ui::file_tree::SessionEntry> {
         let Some(mux) = &self.mux else {
             return Vec::new();
@@ -1305,7 +1305,7 @@ impl WorkspaceUi {
                     .and_then(|s| agent_activity.get(&s).copied());
                 // hook이 보고한 needsInput = 가장 신뢰도 높은 승인 신호(최우선).
                 let waiting = pane.session_id.is_some_and(|s| needs_input.contains(&s));
-                let done = pane.session_id.is_some_and(|s| turn_done.contains(&s));
+                let done = pane.session_id.is_some_and(|s| turn_done.contains_key(&s));
                 let status = merge_agent_status(regex_status, activity, waiting, done);
                 let summary = pane
                     .session_id
@@ -1621,6 +1621,11 @@ fn merge_agent_status(
     if needs_input && activity != Some(AgentActivity::Working) {
         return Some(S::NeedsApproval);
     }
+    // 명시적 오류는 완료보다 우선 — Stop은 모든 턴 종료에 오므로 turn_done이 error를
+    // 가리면 실패한 턴이 '완료(바이올렛)'로 위장된다(codex 리뷰).
+    if matches!(regex, Some(S::Error)) {
+        return regex;
+    }
     // Stop hook = 턴 완료. UserPromptSubmit/PreToolUse가 clear하므로 재개 시 즉시 해제.
     // transcript activity(Stop 직후 잠깐 Working으로 남음)보다 우선한다.
     if turn_done {
@@ -1629,7 +1634,7 @@ fn merge_agent_status(
     match regex {
         // 대기(Waiting)는 입력대기(주황)로 통합 — 별도 팔레트 없음 (2026-07-07 결정).
         Some(S::Waiting) => return Some(S::NeedsApproval),
-        Some(S::NeedsApproval | S::Error | S::Done) => return regex,
+        Some(S::NeedsApproval | S::Done) => return regex,
         _ => {}
     }
     match activity {

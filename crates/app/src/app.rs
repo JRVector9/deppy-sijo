@@ -405,8 +405,9 @@ pub struct App {
     persisted_agents: std::collections::HashMap<String, crate::storage::AgentSessionRow>,
     /// hook이 보고한 입력 대기(needsInput) 세션들 — DB에서 주기적으로 읽어 레일 주황 반영.
     agent_needs_input: std::collections::HashSet<runtime::SessionId>,
-    /// hook이 보고한 턴 완료(Stop) 세션들 — 레일 '완료(바이올렛)' 트랜지언트 소스.
-    agent_turn_done: std::collections::HashSet<runtime::SessionId>,
+    /// hook이 보고한 턴 완료(Stop) 세션 → updated_at — 레일 '완료(바이올렛)' 트랜지언트
+    /// 소스. 값(updated_at)은 소비 시 조건부 clear의 세대 기준(레이스 방지, codex 리뷰).
+    agent_turn_done: std::collections::HashMap<runtime::SessionId, i64>,
     /// 완료/입력대기 주목(attention) 추적 — 미확인이면 레일 6px, 포커스 확인 시 해제.
     session_alerts: std::collections::HashMap<runtime::SessionId, SessionAlert>,
     /// 복원용으로 로드한 (pane_id → 저장된 에이전트 세션). 워크스페이스 활성 시 로드.
@@ -538,7 +539,7 @@ impl App {
             hook_overrides: std::collections::HashMap::new(),
             persisted_agents: std::collections::HashMap::new(),
             agent_needs_input: std::collections::HashSet::new(),
-            agent_turn_done: std::collections::HashSet::new(),
+            agent_turn_done: std::collections::HashMap::new(),
             session_alerts: std::collections::HashMap::new(),
             restore_agents: std::collections::HashMap::new(),
             restore_loaded_for: None,
@@ -754,18 +755,27 @@ impl App {
     /// workspace_id로 스코프한다(codex High). 활성 워크스페이스 것만 남긴다.
     fn refresh_needs_input(&mut self) {
         let ws = self.active.id.clone();
-        let to_ids = |keys: Vec<String>| -> std::collections::HashSet<runtime::SessionId> {
-            keys.iter()
-                .filter_map(|k| {
-                    let (w, s) = k.rsplit_once(':')?;
-                    (w == ws).then_some(())?;
-                    s.parse::<u64>().ok().map(runtime::SessionId)
-                })
-                .collect()
+        let to_id = |k: &str| -> Option<runtime::SessionId> {
+            let (w, s) = k.rsplit_once(':')?;
+            (w == ws).then_some(())?;
+            s.parse::<u64>().ok().map(runtime::SessionId)
         };
-        self.agent_needs_input = to_ids(self.db.list_waiting_sessions().unwrap_or_default());
+        self.agent_needs_input = self
+            .db
+            .list_waiting_sessions()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|k| to_id(k))
+            .collect();
         // 턴 완료(Stop hook) — 확인(포커스) 시 update_session_alerts가 소비한다.
-        self.agent_turn_done = to_ids(self.db.list_turn_done_sessions().unwrap_or_default());
+        // updated_at을 함께 들고 있다가 조건부 clear의 세대 기준으로 쓴다(레이스 방지).
+        self.agent_turn_done = self
+            .db
+            .list_turn_done_sessions()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|(k, at)| Some((to_id(k)?, *at)))
+            .collect();
     }
 
     /// 완료/입력대기 주목(attention) 추적 — 세션 엔트리에 attention/pulse를 채운다.
@@ -803,9 +813,13 @@ impl App {
                     if entry.focused && !alert.seen {
                         alert.seen = true;
                     }
-                    if alert.seen && status == S::Done && self.agent_turn_done.contains(&sid) {
+                    if alert.seen
+                        && status == S::Done
+                        && let Some(&seen_at) = self.agent_turn_done.get(&sid)
+                    {
+                        // 내가 읽은 세대(seen_at)까지만 소비 — 그 뒤 도착한 새 완료는 남긴다.
                         let key = format!("{}:{}", self.active.id, sid.0);
-                        let _ = self.db.clear_agent_turn_done(&key);
+                        let _ = self.db.clear_agent_turn_done(&key, seen_at);
                         self.agent_turn_done.remove(&sid);
                     }
                     entry.attention = !alert.seen;

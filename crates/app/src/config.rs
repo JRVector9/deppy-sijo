@@ -32,6 +32,10 @@ pub struct UiConfig {
     pub agent_status_hooks: bool,
     /// 다음 실행 때 다시 열 마지막 활성 workspace. 삭제되었거나 없으면 default workspace로 대체.
     pub last_workspace_id: Option<String>,
+    /// UI(Proportional) 폰트 파일 경로. None = 기본(자동 — macOS는 Apple SD Gothic Neo).
+    /// 설정 화면의 목록은 시스템에 설치된 한글 지원 폰트에서 고른다(2026-07-07).
+    #[serde(default)]
+    pub ui_font: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -46,6 +50,7 @@ impl Default for UiConfig {
             auto_resume_agents: true,
             agent_status_hooks: true,
             last_workspace_id: None,
+            ui_font: None,
         }
     }
 }

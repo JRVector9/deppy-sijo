@@ -341,6 +341,8 @@ pub struct App {
     /// 직전 프레임의 실효 테마(다크 여부) — 바뀌면 터미널 렌더 캐시를 비운다.
     /// System 테마의 OS 레벨 전환은 config_changed를 안 거치므로 매 프레임 감지한다(#7 codex).
     last_theme_dark: bool,
+    /// 직전 프레임의 UI 폰트 설정 — 바뀌면 폰트 재등록(hot reload).
+    last_ui_font: Option<String>,
     settings_open: bool,
     /// 통합 설정 창의 선택된 카테고리.
     settings_category: ui::settings::Category,
@@ -502,6 +504,7 @@ impl App {
             config,
             config_path,
             last_theme_dark: true,
+            last_ui_font: None,
             settings_open: false,
             settings_category: ui::settings::Category::default(),
             settings_search: String::new(),
@@ -1692,6 +1695,16 @@ impl eframe::App for App {
         let theme_dark = ui.ctx().global_style().visuals.dark_mode;
         if theme_dark != self.last_theme_dark {
             self.last_theme_dark = theme_dark;
+            self.active.workspace_ui.clear_render_caches();
+            for rt in self.warm.values_mut() {
+                rt.workspace_ui.clear_render_caches();
+            }
+            ui.ctx().request_repaint();
+        }
+        // UI 폰트 설정 변경 hot reload — 폰트 재등록 + 렌더 캐시 무효화(2026-07-07).
+        if self.config.ui.ui_font != self.last_ui_font {
+            self.last_ui_font = self.config.ui.ui_font.clone();
+            crate::fonts::install_cjk_fallback(ui.ctx(), self.config.ui.ui_font.as_deref());
             self.active.workspace_ui.clear_render_caches();
             for rt in self.warm.values_mut() {
                 rt.workspace_ui.clear_render_caches();

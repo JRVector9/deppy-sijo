@@ -996,6 +996,49 @@ fn general_page(
     );
     row(
         ui,
+        &catalog.t("settings.ui_font", &[]),
+        Some(&catalog.t("settings.ui_font.hint", &[])),
+        |ui| {
+            // 시스템 폰트 스캔은 파일 IO — 프로세스당 1회 캐시(새 폰트는 재시작 후 표시).
+            static FONT_OPTIONS: std::sync::LazyLock<Vec<(String, String)>> =
+                std::sync::LazyLock::new(crate::fonts::ui_font_options);
+            let current_label = config
+                .ui
+                .ui_font
+                .as_deref()
+                .and_then(|p| {
+                    FONT_OPTIONS
+                        .iter()
+                        .find(|(_, path)| path == p)
+                        .map(|(name, _)| name.clone())
+                })
+                .unwrap_or_else(|| catalog.t("settings.ui_font.auto", &[]));
+            egui::ComboBox::from_id_salt("ui_font")
+                .selected_text(current_label)
+                .width(180.0)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(
+                            config.ui.ui_font.is_none(),
+                            catalog.t("settings.ui_font.auto", &[]),
+                        )
+                        .clicked()
+                    {
+                        config.ui.ui_font = None;
+                        *changed = true;
+                    }
+                    for (name, path) in FONT_OPTIONS.iter() {
+                        let selected = config.ui.ui_font.as_deref() == Some(path.as_str());
+                        if ui.selectable_label(selected, name).clicked() {
+                            config.ui.ui_font = Some(path.clone());
+                            *changed = true;
+                        }
+                    }
+                });
+        },
+    );
+    row(
+        ui,
         &catalog.t("settings.file_tree_sidebar", &[]),
         Some(&catalog.t("settings.file_tree.hint", &[])),
         |ui| {

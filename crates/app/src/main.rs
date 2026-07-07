@@ -85,7 +85,7 @@ fn main() -> anyhow::Result<()> {
             // 등록해야 프리퍼런스 적용 시 커스텀 색이 선택된다.
             theme::install_palette(&cc.egui_ctx);
             cc.egui_ctx.set_theme(config.ui.theme.to_egui());
-            fonts::install_cjk_fallback(&cc.egui_ctx);
+            fonts::install_cjk_fallback(&cc.egui_ctx, config.ui.ui_font.as_deref());
             install_macos_menu();
             Ok(Box::new(app::App::new(
                 config,

@@ -2,12 +2,27 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-pub fn paste_clipboard_paths_or_image_to_paths() -> anyhow::Result<Option<Vec<PathBuf>>> {
+fn paste_clipboard_paths_or_image_to_paths() -> anyhow::Result<Option<Vec<PathBuf>>> {
     let mut clipboard = arboard::Clipboard::new().context("clipboard 열기 실패")?;
     if let Some(paths) = clipboard_file_list(&mut clipboard)? {
         return Ok(Some(paths));
     }
     paste_clipboard_image_to_png_with(&mut clipboard).map(|path| path.map(|path| vec![path]))
+}
+
+/// 클립보드 파일/이미지 paste를 백그라운드 스레드에서 처리한다 — get_image()의 전체 RGBA
+/// 복사 + PNG 인코딩(스크린샷 기준 50~300ms)이 UI 스레드를 멈추던 딜레이 제거(2026-07-07).
+/// 결과는 채널로 오고, 완료 시 repaint를 깨워 다음 프레임에 즉시 소비된다.
+pub fn paste_clipboard_paths_or_image_background(
+    ctx: egui::Context,
+) -> std::sync::mpsc::Receiver<anyhow::Result<Option<Vec<PathBuf>>>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = paste_clipboard_paths_or_image_to_paths();
+        let _ = tx.send(result);
+        ctx.request_repaint();
+    });
+    rx
 }
 
 /// OS 클립보드의 텍스트를 직접 읽는다(빈/부재/에러는 None). ⌘V 시 egui Event::Paste가

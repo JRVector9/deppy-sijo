@@ -47,7 +47,20 @@ pub struct WorkspaceUi {
     /// 활성 workspace의 프로젝트명(폴더명 ≈ 깃 레포명, 없으면 "~"). 세션 기본 제목이
     /// "셀 134" 대신 이걸로 표시된다. rename한 세션은 그대로 둔다. App이 매 프레임 세팅.
     project_name: Option<String>,
+    /// 진행 중인 백그라운드 클립보드 paste(이미지 PNG 인코딩을 UI 밖으로 — 2026-07-07).
+    /// show()가 매 프레임 폴링해 완료 시 해당 세션에 삽입한다. 새 ⌘V는 이전 것을 대체.
+    paste_task: Option<PendingPaste>,
     error: Option<String>,
+}
+
+/// 백그라운드 paste 1건의 컨텍스트 — 요청 시점의 세션/모드를 캡처해 완료 시 그대로 쓴다.
+struct PendingPaste {
+    rx: std::sync::mpsc::Receiver<anyhow::Result<Option<Vec<std::path::PathBuf>>>>,
+    session: SessionId,
+    bracketed: bool,
+    shell_kind: crate::ui::file_tree::ShellKind,
+    /// egui Event::Paste로 이미 받은 텍스트(있으면) — 이미지가 없을 때의 fallback.
+    text_fallback: Option<Vec<u8>>,
 }
 
 /// 세션별 화면 캐시. hidden tab 세션의 스냅샷은 `MuxUpdated`에서 버린다.
@@ -85,6 +98,7 @@ impl WorkspaceUi {
             confirm_close: None,
             selection: None,
             project_name: None,
+            paste_task: None,
             error: None,
         }
     }
@@ -274,6 +288,7 @@ impl WorkspaceUi {
         catalog: &i18n::Catalog,
     ) {
         self.handle_events(events, catalog);
+        self.poll_paste_task(client);
 
         // 탭바 제거 (2026-07-05): 셸 전환은 좌측 사이드바 세션 목록이 담당하고,
         // 새 셸/분할/닫기는 각 pane 헤더가 담당한다 — 셸 수만큼 탭이 늘어나
@@ -1034,39 +1049,17 @@ impl WorkspaceUi {
                 ui.ctx().copy_text(text);
             }
             if image_paste_requested {
-                match crate::ui::clipboard_image::paste_clipboard_paths_or_image_to_paths() {
-                    Ok(Some(paths)) => {
-                        if let Some(bytes) = clipboard_terminal_paste_bytes(
-                            Some(&paths),
-                            text_paste_bytes.take(),
-                            self.session_shell_kind(session),
-                            bracketed,
-                        ) {
-                            pending.extend(bytes);
-                        }
-                    }
-                    Ok(None) => {
-                        // egui Event::Paste가 왔으면 그 텍스트, 아니면 arboard로 클립보드
-                        // 텍스트를 직접 읽는다 — 터미널 위젯엔 Event::Paste가 안 올 수 있어
-                        // claude/codex 상태창 붙여넣기가 안 되던 것 수정(#4).
-                        let bytes = clipboard_terminal_paste_bytes(
-                            None,
-                            text_paste_bytes.take(),
-                            self.session_shell_kind(session),
-                            bracketed,
-                        )
-                        .or_else(|| {
-                            crate::ui::clipboard_image::read_clipboard_text()
-                                .map(|t| terminal_text_paste_bytes(&t, bracketed))
-                        });
-                        if let Some(bytes) = bytes {
-                            pending.extend(bytes);
-                        }
-                    }
-                    Err(e) => {
-                        self.error = Some(format!("{e:#}"));
-                    }
-                }
+                // 파일/이미지 판별 + PNG 인코딩은 백그라운드로(UI 딜레이 제거 — 2026-07-07).
+                // 완료는 show()의 poll_paste_task가 소비한다. 연타 ⌘V는 최신 것으로 대체.
+                self.paste_task = Some(PendingPaste {
+                    rx: crate::ui::clipboard_image::paste_clipboard_paths_or_image_background(
+                        ui.ctx().clone(),
+                    ),
+                    session,
+                    bracketed,
+                    shell_kind: self.session_shell_kind(session),
+                    text_fallback: text_paste_bytes.take(),
+                });
             } else if let Some(bytes) = text_paste_bytes {
                 pending.extend(bytes);
             }
@@ -1364,6 +1357,52 @@ impl WorkspaceUi {
 
     pub fn session_shell_kind(&self, _session: SessionId) -> crate::ui::file_tree::ShellKind {
         self.shell_kind
+    }
+
+    /// 백그라운드 클립보드 paste 완료를 폴링해 요청 시점 세션에 삽입한다(2026-07-07).
+    /// 스레드가 끝나면 repaint를 깨우므로 유휴 중에도 다음 프레임에 소비된다.
+    fn poll_paste_task(&mut self, client: &dyn RuntimeClient) {
+        let Some(task) = &self.paste_task else { return };
+        let result = match task.rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.paste_task = None;
+                return;
+            }
+        };
+        let task = self.paste_task.take().expect("위에서 Some 확인");
+        let bytes = match result {
+            Ok(paths) => {
+                // 이미지/파일이 없으면: egui Event::Paste 텍스트 → 클립보드 텍스트 순 fallback
+                // (터미널 위젯엔 Event::Paste가 안 올 수 있음 — #4와 동일 규칙).
+                clipboard_terminal_paste_bytes(
+                    paths.as_deref(),
+                    task.text_fallback,
+                    task.shell_kind,
+                    task.bracketed,
+                )
+                .or_else(|| {
+                    paths.is_none().then(|| {
+                        crate::ui::clipboard_image::read_clipboard_text()
+                            .map(|t| terminal_text_paste_bytes(&t, task.bracketed))
+                    })?
+                })
+            }
+            Err(e) => {
+                self.error = Some(format!("{e:#}"));
+                None
+            }
+        };
+        if let Some(bytes) = bytes {
+            self.send(
+                client,
+                RuntimeCommand::WriteInput {
+                    session: task.session,
+                    bytes,
+                },
+            );
+        }
     }
 
     fn session_alive(&self, session: SessionId) -> bool {

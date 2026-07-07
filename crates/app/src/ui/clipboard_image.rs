@@ -38,9 +38,41 @@ fn paste_clipboard_image_to_png_with(
         Err(arboard::Error::ContentNotAvailable) => return Ok(None),
         Err(e) => return Err(e).context("clipboard 이미지 읽기 실패"),
     };
+    // 너무 큰 이미지는 UI 스레드 동기 PNG 인코딩이 hitch를 유발 — 상한(codex 리뷰).
+    const MAX_PIXELS: usize = 40_000_000; // ~40MP
+    anyhow::ensure!(
+        image.width.saturating_mul(image.height) <= MAX_PIXELS,
+        "clipboard 이미지가 너무 큽니다({}x{}) — 붙여넣기 생략",
+        image.width,
+        image.height
+    );
     let path = next_clipboard_image_path();
+    // 오래된 캐시 파일 정리(무한 증가 방지, codex 리뷰).
+    if let Some(dir) = path.parent() {
+        prune_clipboard_cache(dir);
+    }
     write_rgba_png(&path, image.width, image.height, image.bytes.as_ref())?;
     Ok(Some(path))
+}
+
+/// clipboard-images 캐시에서 TTL(24h) 지난 파일을 지운다 — paste마다 새 파일을 만들어
+/// 쌓이던 것을 유계화(codex 리뷰). best-effort.
+fn prune_clipboard_cache(dir: &Path) {
+    const TTL_SECS: u64 = 24 * 60 * 60;
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for e in rd.flatten() {
+        if let Ok(meta) = e.metadata()
+            && let Ok(modified) = meta.modified()
+            && now
+                .duration_since(modified)
+                .is_ok_and(|age| age.as_secs() > TTL_SECS)
+        {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 }
 
 fn next_clipboard_image_path() -> PathBuf {

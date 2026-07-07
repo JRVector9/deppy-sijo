@@ -218,13 +218,35 @@ fn find_codex_transcript(cwd: &str) -> Option<(String, PathBuf)> {
 }
 
 fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
+    collect_jsonl_bounded(dir, out, 0);
+}
+
+/// 재귀 스캔에 상한을 둔다(codex 리뷰): ①심링크 미추적(루프·외부 거대 디렉터리 방지),
+/// ②depth 상한, ③파일 수 상한. ~/.codex/sessions는 YYYY/MM/DD(depth≈3)라 넉넉하다.
+/// resume 존재확인이 UI 스레드에서도 부르므로 무한 재귀/대량 스캔으로 인한 freeze를 막는다.
+fn collect_jsonl_bounded(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+    const MAX_DEPTH: usize = 8;
+    const MAX_FILES: usize = 4096;
+    if depth > MAX_DEPTH || out.len() >= MAX_FILES {
+        return;
+    }
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
     for e in rd.flatten() {
+        if out.len() >= MAX_FILES {
+            break;
+        }
+        // file_type()는 심링크를 따라가지 않는다(Path::is_dir과 달리) — 심링크는 스킵.
+        let Ok(ft) = e.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            continue;
+        }
         let p = e.path();
-        if p.is_dir() {
-            collect_jsonl(&p, out);
+        if ft.is_dir() {
+            collect_jsonl_bounded(&p, out, depth + 1);
         } else if p.extension().is_some_and(|x| x == "jsonl") {
             out.push(p);
         }

@@ -1057,14 +1057,16 @@ impl WorkspaceUi {
             if image_paste_requested {
                 // 파일/이미지 판별 + PNG 인코딩은 백그라운드로(UI 딜레이 제거 — 2026-07-07).
                 // 완료는 show()의 poll_paste_task가 소비한다. 연타 ⌘V는 최신 것으로 대체.
+                let text_fallback = text_paste_bytes.take();
                 self.paste_task = Some(PendingPaste {
                     rx: crate::ui::clipboard_image::paste_clipboard_paths_or_image_background(
                         ui.ctx().clone(),
+                        text_fallback.is_some(),
                     ),
                     session,
                     bracketed,
                     shell_kind: self.session_shell_kind(session),
-                    text_fallback: text_paste_bytes.take(),
+                    text_fallback,
                     requested_at: std::time::Instant::now(),
                 });
             } else if let Some(bytes) = text_paste_bytes {

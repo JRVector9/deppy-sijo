@@ -15,16 +15,22 @@ fn paste_clipboard_paths_or_image_to_paths() -> anyhow::Result<Option<Vec<PathBu
 /// 결과는 채널로 오고, 완료 시 repaint를 깨워 다음 프레임에 즉시 소비된다.
 pub fn paste_clipboard_paths_or_image_background(
     ctx: egui::Context,
+    has_text_fallback: bool,
 ) -> std::sync::mpsc::Receiver<anyhow::Result<Option<Vec<PathBuf>>>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut result = paste_clipboard_paths_or_image_to_paths();
         // 스크린샷 직후 ⌘V 레이스: 캡처 유틸이 클립보드에 이미지를 쓰기까지 수백 ms 걸릴
         // 수 있어 첫 ⌘V가 "빈 클립보드"로 무시됐다(2026-07-08 사용자). 파일/이미지/텍스트가
-        // 전부 없을 때만 잠깐 기다렸다 재시도한다 — 텍스트가 있으면 정상 텍스트 paste라
-        // 즉시 반환(지연 없음), 진짜 빈 클립보드면 어차피 붙일 게 없어 대기 무해.
+        // 전부 없을 때만 잠깐 기다렸다 재시도한다 — 이미 Event::Paste 텍스트를 받았거나
+        // (has_text_fallback — 기다리면 그 텍스트 붙여넣기만 늦어짐, codex Low) 클립보드에
+        // 텍스트가 있으면 재시도 없이 즉시 반환.
         let mut tries = 0;
-        while tries < 4 && matches!(&result, Ok(None)) && read_clipboard_text().is_none() {
+        while !has_text_fallback
+            && tries < 4
+            && matches!(&result, Ok(None))
+            && read_clipboard_text().is_none()
+        {
             std::thread::sleep(std::time::Duration::from_millis(150));
             result = paste_clipboard_paths_or_image_to_paths();
             tries += 1;
@@ -55,9 +61,45 @@ fn clipboard_file_list(clipboard: &mut arboard::Clipboard) -> anyhow::Result<Opt
     }
 }
 
+/// macOS: pasteboard의 PNG 바이트를 **디코드 없이 그대로** 가져온다 — cmux와 동일 접근.
+/// 스크린샷은 pasteboard에 이미 PNG로 있으므로 파일로 쓰기만 하면 된다(수 ms).
+/// arboard get_image()는 RGBA 디코드 + PNG 재인코딩 왕복이라 수백 ms 걸렸다(2026-07-08).
+#[cfg(target_os = "macos")]
+fn clipboard_png_bytes() -> Option<Vec<u8>> {
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG};
+    // SAFETY: generalPasteboard는 공유 싱글턴 반환, dataForType은 불변 조회 —
+    // 백그라운드 스레드에서 읽기 전용 접근은 NSPasteboard 문서상 허용.
+    unsafe {
+        let pasteboard = NSPasteboard::generalPasteboard();
+        let data = pasteboard.dataForType(NSPasteboardTypePNG)?;
+        Some(data.to_vec())
+    }
+}
+
 fn paste_clipboard_image_to_png_with(
     clipboard: &mut arboard::Clipboard,
 ) -> anyhow::Result<Option<PathBuf>> {
+    // 1) macOS 빠른 경로: pasteboard PNG 바이트를 그대로 파일로 (변환 0).
+    #[cfg(target_os = "macos")]
+    {
+        const MAX_PNG_BYTES: usize = 32 * 1024 * 1024; // 32MB — 비정상 payload 방지
+        if let Some(png) = clipboard_png_bytes()
+            && !png.is_empty()
+            && png.len() <= MAX_PNG_BYTES
+        {
+            let path = next_clipboard_image_path();
+            if let Some(dir) = path.parent() {
+                prune_clipboard_cache(dir);
+                std::fs::create_dir_all(dir).with_context(|| {
+                    format!("clipboard 이미지 디렉터리 생성 실패: {}", dir.display())
+                })?;
+            }
+            std::fs::write(&path, &png)
+                .with_context(|| format!("clipboard PNG 저장 실패: {}", path.display()))?;
+            return Ok(Some(path));
+        }
+    }
+    // 2) fallback: RGBA 디코드 + Fast PNG 인코딩 (TIFF-only pasteboard, 비 macOS 등).
     let image = match clipboard.get_image() {
         Ok(image) => image,
         Err(arboard::Error::ContentNotAvailable) => return Ok(None),

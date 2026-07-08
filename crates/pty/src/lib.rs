@@ -112,6 +112,17 @@ impl PtyBackend for PortablePtyBackend {
             .context("PTY 생성 실패")?;
         let mut builder = portable_pty::CommandBuilder::new(&cmd.program);
         builder.args(&cmd.args);
+        // GUI 앱은 launchd로 실행되면 TERM/COLORTERM이 없다 — portable-pty는 env를
+        // 순수 상속만 하므로 셸 안 claude/codex가 색을 포기해 흑백이 된다(2026-07-09).
+        // 부모에도 spec에도 없을 때만 터미널 표준값을 설정한다(명시 값이 항상 우선).
+        let has =
+            |key: &str| std::env::var_os(key).is_some() || cmd.env.iter().any(|(k, _)| k == key);
+        if !has("TERM") {
+            builder.env("TERM", "xterm-256color");
+        }
+        if !has("COLORTERM") {
+            builder.env("COLORTERM", "truecolor");
+        }
         for (key, value) in &cmd.env {
             builder.env(key, value);
         }

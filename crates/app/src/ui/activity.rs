@@ -77,7 +77,7 @@ impl ActivityUi {
             .show(ui, |ui| {
                 ui.strong(catalog.t("activity.workspace", &[]));
                 ui.strong(catalog.t("activity.state", &[]));
-                ui.strong(catalog.t("activity.sessions", &[]));
+                ui.strong(catalog.t("activity.agent", &[]));
                 ui.strong(catalog.t("activity.queue", &[]));
                 ui.strong(catalog.t("activity.resources", &[]));
                 ui.strong(catalog.t("activity.action", &[]));
@@ -86,7 +86,12 @@ impl ActivityUi {
                 for row in rows {
                     ui.label(&row.name);
                     state_label(ui, catalog, row);
-                    ui.label(row.session_count.to_string());
+                    // 워크스페이스 행의 에이전트 열 = 세션 수 요약 (서브행과 열 의미 일치,
+                    // 사용자 피드백 2026-07-08).
+                    ui.weak(catalog.t(
+                        "activity.session_count",
+                        &[("count", &row.session_count.to_string())],
+                    ));
                     ui.horizontal(|ui| {
                         ui.label(row.pending_events.to_string());
                         if let Some(pressure) = &row.input_pressure {
@@ -107,9 +112,9 @@ impl ActivityUi {
                     }
                     ui.end_row();
 
-                    // pane(세션)별 서브행 — 워크스페이스 열을 의도적으로 재사용한다:
-                    // 상태 열=상태줄("실행 중 · ctx 69%"), 세션(수) 열=에이전트 정보
-                    // ("Codex · gpt-5.5 · xhigh"), 큐 열=입력압력 뱃지, 자원 열=세션 트리 합산.
+                    // pane(세션)별 서브행 — 상태 열=상태줄("실행 중 · ctx 69%"),
+                    // 에이전트 열=에이전트 정보("Codex · gpt-5.5 · xhigh"),
+                    // 큐 열=입력압력 뱃지, 자원 열=세션 트리 합산.
                     for s in &row.sessions {
                         ui.weak(format!("└ {}", s.name));
                         ui.label(s.status_line.as_deref().unwrap_or(""));

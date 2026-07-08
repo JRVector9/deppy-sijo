@@ -58,7 +58,12 @@ impl ActivityUi {
                     ui.label(&row.name);
                     state_label(ui, catalog, row);
                     ui.label(row.session_count.to_string());
-                    ui.label(queue_label(catalog, row));
+                    ui.horizontal(|ui| {
+                        ui.label(row.pending_events.to_string());
+                        if let Some(pressure) = &row.input_pressure {
+                            input_pressure_badge(ui, catalog, pressure);
+                        }
+                    });
                     ui.label(resource_label(
                         catalog,
                         row.resource.as_ref(),
@@ -162,19 +167,53 @@ fn resource_label(
     label
 }
 
-fn queue_label(catalog: &i18n::Catalog, row: &ActivityWorkspaceRow) -> String {
-    let mut label = row.pending_events.to_string();
-    if let Some(pressure) = &row.input_pressure {
-        label.push_str(" · ");
-        label.push_str(&catalog.t(
-            "activity.input_pressure",
+/// PTY 입력 backpressure 뱃지 — 마지막 pressure 신호를 색으로 구분해 표시한다.
+/// QueueFull은 큐가 빠지면 회복되는 일시 상태(경고색), 나머지 사유는 에러색.
+fn input_pressure_badge(
+    ui: &mut egui::Ui,
+    catalog: &i18n::Catalog,
+    pressure: &runtime::PtyInputPressure,
+) {
+    let color = if input_pressure_is_transient(pressure.reason) {
+        ui.visuals().warn_fg_color
+    } else {
+        ui.visuals().error_fg_color
+    };
+    let text = input_pressure_badge_text(catalog, pressure);
+    egui::Frame::new()
+        .fill(color.gamma_multiply(0.15))
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(6, 1))
+        .show(ui, |ui| {
+            ui.colored_label(color, egui::RichText::new(text).small());
+        })
+        .response
+        .on_hover_text(catalog.t(
+            "workspace.input_pressure",
             &[
                 ("queued", &format_bytes(pressure.queued_bytes as u64)),
                 ("max", &format_bytes(pressure.max_bytes as u64)),
             ],
         ));
-    }
-    label
+}
+
+/// QueueFull만 일시적(재시도 가능) — SessionClosed/WriterUnavailable/PayloadTooLarge는
+/// 재시도로 회복되지 않는다 (input_queue.rs 경계 정의와 동일).
+fn input_pressure_is_transient(reason: runtime::PtyInputRejectReason) -> bool {
+    matches!(reason, runtime::PtyInputRejectReason::QueueFull)
+}
+
+fn input_pressure_badge_text(
+    catalog: &i18n::Catalog,
+    pressure: &runtime::PtyInputPressure,
+) -> String {
+    catalog.t(
+        "activity.input_pressure",
+        &[
+            ("queued", &format_bytes(pressure.queued_bytes as u64)),
+            ("max", &format_bytes(pressure.max_bytes as u64)),
+        ],
+    )
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -249,30 +288,34 @@ mod tests {
     }
 
     #[test]
-    fn queue_label_includes_input_pressure() {
+    fn input_pressure_badge_text_formats_queued_and_max_bytes() {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
-        let row = ActivityWorkspaceRow {
-            id: "ws".into(),
-            name: "workspace".into(),
-            state: ActivityWorkspaceState::Active,
-            session_count: 1,
-            pending_events: 3,
-            input_pressure: Some(runtime::PtyInputPressure {
-                attempted_bytes: 10,
-                queued_bytes: 1024,
-                queued_messages: 1,
-                max_bytes: 4 * 1024,
-                max_messages: 16,
-                reason: runtime::PtyInputRejectReason::QueueFull,
-            }),
-            backgrounded_for_secs: None,
-            auto_suspend_remaining_secs: None,
-            resource: None,
-            session_resources: Vec::new(),
+        let pressure = runtime::PtyInputPressure {
+            attempted_bytes: 10,
+            queued_bytes: 1024,
+            queued_messages: 1,
+            max_bytes: 4 * 1024,
+            max_messages: 16,
+            reason: runtime::PtyInputRejectReason::QueueFull,
         };
-        let label = queue_label(&catalog, &row);
-        assert!(label.contains('3'));
-        assert!(label.contains("input"));
-        assert!(label.contains("1.0 KiB"));
+        let text = input_pressure_badge_text(&catalog, &pressure);
+        assert!(text.contains("input"));
+        assert!(text.contains("1.0 KiB"));
+        assert!(text.contains("4.0 KiB"));
+    }
+
+    /// 뱃지 색 경계: QueueFull만 경고(일시적), 나머지는 에러(재시도 불가).
+    #[test]
+    fn input_pressure_severity_boundary() {
+        assert!(input_pressure_is_transient(
+            runtime::PtyInputRejectReason::QueueFull
+        ));
+        for reason in [
+            runtime::PtyInputRejectReason::SessionClosed,
+            runtime::PtyInputRejectReason::WriterUnavailable,
+            runtime::PtyInputRejectReason::PayloadTooLarge,
+        ] {
+            assert!(!input_pressure_is_transient(reason));
+        }
     }
 }

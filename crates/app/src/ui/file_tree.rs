@@ -769,16 +769,33 @@ impl FileTreeUi {
     }
 
     /// 루트 경로 표시용 — 홈은 `~`로 축약.
-    fn display_root(&self) -> String {
+    /// 현재 루트의 breadcrumb 세그먼트 — (표시 라벨, 이동 대상 경로)를 조상→현재 순으로.
+    /// HOME 아래면 첫 세그먼트가 "~"(=HOME), 아니면 파일시스템 루트("/")부터(2026-07-08).
+    fn breadcrumb_segments(&self) -> Vec<(String, PathBuf)> {
         let Some(root) = &self.root else {
-            return String::new();
+            return Vec::new();
         };
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        match home.as_deref().and_then(|h| root.strip_prefix(h).ok()) {
-            Some(rel) if rel.as_os_str().is_empty() => "~".to_owned(),
-            Some(rel) => format!("~/{}", rel.display()),
-            None => root.display().to_string(),
+        // 루트→조상 순으로 모은 뒤 뒤집는다. HOME에 도달하면 "~"로 끝맺는다.
+        let mut rev: Vec<(String, PathBuf)> = Vec::new();
+        let mut cur: &Path = root.as_path();
+        loop {
+            if home.as_deref() == Some(cur) {
+                rev.push(("~".to_owned(), cur.to_path_buf()));
+                break;
+            }
+            let label = match cur.file_name() {
+                Some(name) => name.to_string_lossy().into_owned(),
+                None => "/".to_owned(), // 파일시스템 루트
+            };
+            rev.push((label, cur.to_path_buf()));
+            match cur.parent() {
+                Some(p) => cur = p,
+                None => break,
+            }
         }
+        rev.reverse();
+        rev
     }
 
     fn contents(
@@ -862,54 +879,17 @@ impl FileTreeUi {
             crate::ui::hairline_full(ui);
         }
 
-        // 헤더: 현재 루트 경로(~ 축약) + 새로고침/숨김 토글/접기 (§6). 헤더 전체가
+        // 헤더: breadcrumb(현재 위치) + 새로고침/숨김 토글/접기 (§6). 헤더 전체가
         // 루트로의 드롭 대상이다 (§4 — 루트 영역 dnd_drop_zone).
-        let display_root = self.display_root();
         // 헤더는 dnd_drop_zone을 쓰지 않는다 — 그 API는 항상 inactive.bg_stroke로
         // 프레임 박스를 그려 네모 라인이 보였다(#74). 수동 rect 기반 드롭으로 대체.
         let mut go_parent = false;
+        let mut nav_to: Option<PathBuf> = None;
         let header_scope = ui.scope(|ui| {
             ui.horizontal(|ui| {
-                // 상위 폴더로 이동 — 어느 폴더에서든 항상 위로 갈 수 있게(사용자 2026-07-08).
-                // 루트에 부모가 있을 때만 위 캐럿(▲) 버튼. 없으면(‘/’) 자리만 비운다.
-                if self.root.as_ref().and_then(|r| r.parent()).is_some() {
-                    let (ur, up) =
-                        ui.allocate_exact_size(egui::vec2(18.0, 16.0), egui::Sense::click());
-                    let ucol = if up.hovered() {
-                        ui.visuals().text_color()
-                    } else {
-                        ui.visuals().weak_text_color()
-                    };
-                    let c = ur.center();
-                    let d = 4.0;
-                    ui.painter().add(egui::Shape::convex_polygon(
-                        vec![
-                            egui::pos2(c.x, c.y - d * 0.8),
-                            egui::pos2(c.x - d, c.y + d * 0.6),
-                            egui::pos2(c.x + d, c.y + d * 0.6),
-                        ],
-                        ucol,
-                        egui::Stroke::NONE,
-                    ));
-                    if up
-                        .on_hover_text(catalog.t("file_tree.parent", &[]))
-                        .clicked()
-                    {
-                        go_parent = true;
-                    }
-                }
-                // 루트 폴더 아이콘 — 도형 (이모지 □ 깨짐 회피)
+                // 루트 폴더 아이콘 — 도형 (이모지 □ 깨짐 회피). 드롭 대상 앵커.
                 let (fr, _) = ui.allocate_exact_size(egui::vec2(18.0, 16.0), egui::Sense::hover());
                 paint_folder(ui.painter(), fr.center(), ui.visuals().weak_text_color());
-                // 우측 컨트롤(접기/새로고침/숨김) 폭을 예약 — 긴 경로가 버튼을
-                // 밀어내지 않게 truncate 라벨의 최대폭을 제한한다 (codex P2).
-                ui.scope(|ui| {
-                    ui.set_max_width((ui.available_width() - 80.0).max(40.0));
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(&display_root).strong()).truncate(),
-                    )
-                    .on_hover_text(&display_root);
-                });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // 아이콘 3종 전부 18x18 painter 셀로 통일 (#74)
                     // 접기: ◂는 폰트에 없어 □로 깨진다 — 도형 캐럿
@@ -983,6 +963,42 @@ impl FileTreeUi {
                     }
                 });
             });
+            // breadcrumb 행 — 현재 위치를 구간별로 표시(클릭 시 그 조상으로 점프,
+            // 여러 단계 위로 한 번에). 좁은 사이드바에서 길면 다음 줄로 넘어간다(2026-07-08).
+            let segments = self.breadcrumb_segments();
+            if !segments.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    let last = segments.len() - 1;
+                    for (i, (label, path)) in segments.iter().enumerate() {
+                        if i > 0 {
+                            ui.add(egui::Label::new(
+                                egui::RichText::new("›").color(ui.visuals().weak_text_color()),
+                            ));
+                        }
+                        if i == last {
+                            // 현재 폴더 — 강조, 클릭 불가.
+                            ui.add(egui::Label::new(egui::RichText::new(label).strong()));
+                        } else {
+                            let resp = ui
+                                .add(
+                                    egui::Label::new(
+                                        egui::RichText::new(label)
+                                            .color(ui.visuals().weak_text_color()),
+                                    )
+                                    .sense(egui::Sense::click()),
+                                )
+                                .on_hover_text(path.display().to_string());
+                            if resp.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if resp.clicked() {
+                                nav_to = Some(path.clone());
+                            }
+                        }
+                    }
+                });
+            }
         });
         // 헤더 전체 폭 = 루트로의 드롭 대상 (§4). 드래그 중 hover면 강조 스트로크.
         let header_rect = egui::Rect::from_min_max(
@@ -1010,8 +1026,54 @@ impl FileTreeUi {
         }
         crate::ui::hairline_full(ui);
 
-        // 상위 폴더 이동 요청 — 헤더 클로저 밖에서 set_root(부모)로 리스팅/워처까지 재구성.
-        if go_parent
+        // ".." 고정 행 — 트리 맨 위, 스크롤과 무관하게 항상 보인다. 루트에 부모가
+        // 있을 때만(‘/’이면 숨김). 표준 파일매니저 관용으로 "한 단계 위"를 명확히 한다
+        // (헤더 ▲ 아이콘 대체, 사용자 2026-07-08).
+        if self.root.as_ref().and_then(|r| r.parent()).is_some() {
+            let up_h = 22.0;
+            let (rect, resp) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), up_h), egui::Sense::click());
+            if resp.hovered() {
+                ui.painter().rect_filled(
+                    rect,
+                    0.0,
+                    ui.visuals().selection.bg_fill.gamma_multiply(0.14),
+                );
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            let accent = ui.visuals().selection.stroke.color;
+            // 좌측 accent 핀
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(rect.min, egui::vec2(2.0, rect.height())),
+                0.0,
+                accent.gamma_multiply(0.6),
+            );
+            ui.painter().text(
+                egui::pos2(rect.left() + 12.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                "↑  ..",
+                egui::FontId::monospace(13.0),
+                accent,
+            );
+            ui.painter().text(
+                egui::pos2(rect.right() - 10.0, rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                catalog.t("file_tree.parent", &[]),
+                egui::FontId::proportional(11.0),
+                ui.visuals().weak_text_color(),
+            );
+            if resp.clicked() {
+                go_parent = true;
+            }
+            crate::ui::hairline_full(ui);
+        }
+
+        // breadcrumb 구간 클릭 → 그 조상으로 점프 (여러 단계 위로 한 번에).
+        if let Some(target) = nav_to {
+            self.set_root(Some(target));
+        }
+        // ".." → 부모로 한 단계. set_root(부모)로 리스팅/워처까지 재구성.
+        else if go_parent
             && let Some(parent) = self
                 .root
                 .as_ref()

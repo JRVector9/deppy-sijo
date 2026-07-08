@@ -1554,7 +1554,13 @@ impl App {
         if let Some(data_dir) = self.db_path.parent() {
             tree.set_watch_ignore(vec![data_dir.to_path_buf()]);
         }
-        tree.set_root(self.active_tree_root());
+        // 워크스페이스 폴더 미설정이어도 파일트리는 **항상** 뜨게 — HOME으로 폴백(사용자
+        // 2026-07-08). .env 동기화는 active_tree_root(폴더 미설정=None)를 따로 쓰므로
+        // ~/.env를 자동 로드하진 않는다(트리 표시 루트와 .env 원천 분리).
+        tree.set_root(
+            self.active_tree_root()
+                .or_else(|| std::env::var_os("HOME").map(PathBuf::from)),
+        );
         tree
     }
 

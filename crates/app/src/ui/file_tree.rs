@@ -867,8 +867,34 @@ impl FileTreeUi {
         let display_root = self.display_root();
         // 헤더는 dnd_drop_zone을 쓰지 않는다 — 그 API는 항상 inactive.bg_stroke로
         // 프레임 박스를 그려 네모 라인이 보였다(#74). 수동 rect 기반 드롭으로 대체.
+        let mut go_parent = false;
         let header_scope = ui.scope(|ui| {
             ui.horizontal(|ui| {
+                // 상위 폴더로 이동 — 어느 폴더에서든 항상 위로 갈 수 있게(사용자 2026-07-08).
+                // 루트에 부모가 있을 때만 위 캐럿(▲) 버튼. 없으면(‘/’) 자리만 비운다.
+                if self.root.as_ref().and_then(|r| r.parent()).is_some() {
+                    let (ur, up) =
+                        ui.allocate_exact_size(egui::vec2(18.0, 16.0), egui::Sense::click());
+                    let ucol = if up.hovered() {
+                        ui.visuals().text_color()
+                    } else {
+                        ui.visuals().weak_text_color()
+                    };
+                    let c = ur.center();
+                    let d = 4.0;
+                    ui.painter().add(egui::Shape::convex_polygon(
+                        vec![
+                            egui::pos2(c.x, c.y - d * 0.8),
+                            egui::pos2(c.x - d, c.y + d * 0.6),
+                            egui::pos2(c.x + d, c.y + d * 0.6),
+                        ],
+                        ucol,
+                        egui::Stroke::NONE,
+                    ));
+                    if up.on_hover_text(catalog.t("file_tree.parent", &[])).clicked() {
+                        go_parent = true;
+                    }
+                }
                 // 루트 폴더 아이콘 — 도형 (이모지 □ 깨짐 회피)
                 let (fr, _) = ui.allocate_exact_size(egui::vec2(18.0, 16.0), egui::Sense::hover());
                 paint_folder(ui.painter(), fr.center(), ui.visuals().weak_text_color());
@@ -981,8 +1007,15 @@ impl FileTreeUi {
         }
         crate::ui::hairline_full(ui);
 
+        // 상위 폴더 이동 요청 — 헤더 클로저 밖에서 set_root(부모)로 리스팅/워처까지 재구성.
+        if go_parent
+            && let Some(parent) = self.root.as_ref().and_then(|r| r.parent()).map(Path::to_path_buf)
+        {
+            self.set_root(Some(parent));
+        }
+
         if self.root.is_none() {
-            // path 미설정 (§9-2 backfill 강제 없음) — 트리 대신 안내
+            // path 미설정 + HOME도 없음(극히 드묾) — 트리 대신 안내(환경 메뉴로 유도).
             ui.weak(catalog.t("file_tree.set_project_path", &[]));
             ui.weak(catalog.t("file_tree.edit_workspace_path_hint", &[]));
             return action;

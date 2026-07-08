@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use runtime::SessionId;
 
-use crate::agent_detect::{self, AgentBinding};
+use crate::agent_detect::{self, AgentBinding, AgentDisplay};
 use crate::agent_transcript::AgentActivity;
 
 const BINDING_INTERVAL: Duration = Duration::from_millis(2500);
@@ -28,6 +28,8 @@ pub struct DetectOutcome {
     pub activity: HashMap<SessionId, AgentActivity>,
     /// 세션별 현재 작업 폴더(바인딩 tier에서만, 한 번의 lsof). 행 폴더명 + 워크스페이스명.
     pub session_cwds: Option<HashMap<SessionId, String>>,
+    /// 세션별 에이전트 표시 정보(model/effort/context) — 바인딩 tier에서만.
+    pub agent_info: Option<HashMap<SessionId, AgentDisplay>>,
 }
 
 pub struct AgentDetectWorker {
@@ -42,6 +44,33 @@ fn compute_activity(
         .iter()
         .filter_map(|(sid, b)| agent_detect::activity(b).map(|a| (*sid, a)))
         .collect()
+}
+
+/// transcript를 세션당 **한 번만** 파싱해 activity 맵 + 표시정보(model/effort/context) 맵을
+/// 함께 만든다(중복 파싱 방지). model/effort/context는 바인딩 tier에서만 필요.
+fn compute_activity_and_info(
+    bindings: &HashMap<SessionId, AgentBinding>,
+) -> (
+    HashMap<SessionId, AgentActivity>,
+    HashMap<SessionId, AgentDisplay>,
+) {
+    let mut activity = HashMap::new();
+    let mut info = HashMap::new();
+    for (sid, b) in bindings {
+        if let Some(state) = agent_detect::agent_state(b) {
+            activity.insert(*sid, state.activity);
+            info.insert(
+                *sid,
+                AgentDisplay {
+                    kind: b.kind,
+                    model: state.model,
+                    effort: state.effort,
+                    context_pct: state.context_pct,
+                },
+            );
+        }
+    }
+    (activity, info)
 }
 
 impl AgentDetectWorker {
@@ -86,7 +115,8 @@ impl AgentDetectWorker {
                         last_binding = Instant::now();
                         last_activity = Instant::now();
                         bindings = agent_detect::detect_cached(&sessions, &overrides, &mut cache);
-                        let activity = compute_activity(&bindings);
+                        // transcript 1-pass로 activity + 표시정보(model/effort/context).
+                        let (activity, agent_info) = compute_activity_and_info(&bindings);
                         // 세션별 현재 작업 폴더 — 한 번의 lsof(행 폴더명 + 워크스페이스명).
                         let pids: Vec<u32> = sessions.iter().map(|(_, p)| *p).collect();
                         let cwd_by_pid = agent_detect::session_cwds(&pids);
@@ -99,6 +129,7 @@ impl AgentDetectWorker {
                             bindings: Some(bindings.clone()),
                             activity,
                             session_cwds: Some(session_cwds),
+                            agent_info: Some(agent_info),
                         });
                         if sent.is_err() {
                             break; // 수신측(App) drop → 종료
@@ -113,6 +144,7 @@ impl AgentDetectWorker {
                                 bindings: None,
                                 activity,
                                 session_cwds: None,
+                                agent_info: None,
                             })
                             .is_err()
                         {

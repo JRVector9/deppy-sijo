@@ -112,13 +112,27 @@ pub fn detect_cached(
     out
 }
 
-/// 바인딩된 transcript를 파싱해 현재 활동(working/idle)을 읽는다.
-pub fn activity(binding: &AgentBinding) -> Option<agent_transcript::AgentActivity> {
-    let state = match binding.kind {
+/// 바인딩된 transcript를 파싱해 전체 상태(활동 + 표시 정보)를 읽는다. 파싱은 한 번만.
+pub fn agent_state(binding: &AgentBinding) -> Option<agent_transcript::TranscriptState> {
+    match binding.kind {
         AgentKind::Claude => agent_transcript::parse_claude(&binding.transcript),
         AgentKind::Codex => agent_transcript::parse_codex(&binding.transcript),
-    }?;
-    Some(state.activity)
+    }
+}
+
+/// 바인딩된 transcript를 파싱해 현재 활동(working/idle)을 읽는다.
+pub fn activity(binding: &AgentBinding) -> Option<agent_transcript::AgentActivity> {
+    agent_state(binding).map(|s| s.activity)
+}
+
+/// 3줄 세션 행 2행 표시 정보 (2026-07-08). kind는 바인딩에서, model/effort/context는
+/// transcript(codex 전부 / claude는 model만 — effort/context는 statusLine→DB)에서.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentDisplay {
+    pub kind: AgentKind,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub context_pct: Option<u8>,
 }
 
 /// 셸 pid의 자손 중 claude/codex를 찾아 transcript까지 바인딩한다. 캐시 생존 확인용으로

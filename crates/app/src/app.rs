@@ -416,6 +416,9 @@ pub struct App {
     session_alerts: std::collections::HashMap<runtime::SessionId, SessionAlert>,
     /// 세션별 현재 작업 폴더(감지 워커 lsof) — 행 1행 폴더명 + 워크스페이스명.
     session_cwds: std::collections::HashMap<runtime::SessionId, String>,
+    /// 세션별 에이전트 표시 정보(model/effort/context) — 3줄 행 2/3행. claude는 effort/
+    /// context를 statusLine DB에서 병합(Phase 2b).
+    agent_info: std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentDisplay>,
     /// 복원용으로 로드한 (pane_id → 저장된 에이전트 세션). 워크스페이스 활성 시 로드.
     restore_agents: std::collections::HashMap<String, crate::storage::AgentSessionRow>,
     /// restore_agents를 로드한 워크스페이스 id (전환 시 재로드 판정).
@@ -550,6 +553,7 @@ impl App {
             agent_turn_done: std::collections::HashMap::new(),
             session_alerts: std::collections::HashMap::new(),
             session_cwds: std::collections::HashMap::new(),
+            agent_info: std::collections::HashMap::new(),
             restore_agents: std::collections::HashMap::new(),
             restore_loaded_for: None,
             resumed_panes: std::collections::HashSet::new(),
@@ -743,6 +747,7 @@ impl App {
         let mut latest_bindings = None;
         let mut latest_activity = None;
         let mut latest_cwds = None;
+        let mut latest_info = None;
         while let Ok(outcome) = self.agent_detect_rx.try_recv() {
             if outcome.epoch != self.agent_detect_epoch {
                 continue;
@@ -754,6 +759,12 @@ impl App {
             if outcome.session_cwds.is_some() {
                 latest_cwds = outcome.session_cwds;
             }
+            if outcome.agent_info.is_some() {
+                latest_info = outcome.agent_info;
+            }
+        }
+        if let Some(info) = latest_info {
+            self.agent_info = info;
         }
         if let Some(cwds) = latest_cwds {
             self.session_cwds = cwds;
@@ -1187,6 +1198,7 @@ impl App {
         self.agent_turn_done.clear();
         self.session_alerts.clear();
         self.session_cwds.clear();
+        self.agent_info.clear();
         let _ = old
             .runtime
             .send_command(runtime::RuntimeCommand::SetWorkspaceState(

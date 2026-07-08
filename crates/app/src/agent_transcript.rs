@@ -26,6 +26,12 @@ pub struct TranscriptState {
     /// transcript에 기록된 작업 디렉토리 — pane(cwd) 바인딩 앵커.
     pub cwd: Option<String>,
     pub activity: AgentActivity,
+    /// 표시용(3줄 세션 행, 2026-07-08). codex는 rollout에서 전부, claude는 model만
+    /// (effort/context는 statusLine→DB, Phase 2b).
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    /// 남은 컨텍스트 %(0~100). codex는 rollout에서 계산.
+    pub context_pct: Option<u8>,
 }
 
 /// 파일 끝 `max_bytes`만 읽는다 — transcript는 수십 MB가 될 수 있어 tail만 본다.
@@ -48,6 +54,9 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
     let session_id = path.file_stem()?.to_str()?.to_owned();
     let text = tail_text(path, TAIL_BYTES).ok()?;
     let mut cwd = None;
+    let mut activity: Option<AgentActivity> = None;
+    // 최신 assistant message.model = 현재 모델(effort/context는 statusLine→DB, Phase 2b).
+    let mut model: Option<String> = None;
     for line in text.lines().rev() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -57,31 +66,40 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
         }
         match v.get("type").and_then(Value::as_str) {
             Some("assistant") => {
-                let end =
-                    v.pointer("/message/stop_reason").and_then(Value::as_str) == Some("end_turn");
-                let activity = if end {
-                    AgentActivity::Idle
-                } else {
-                    AgentActivity::Working
-                };
-                return Some(TranscriptState {
-                    session_id,
-                    cwd,
-                    activity,
-                });
+                if model.is_none() {
+                    model = v
+                        .pointer("/message/model")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
+                if activity.is_none() {
+                    let end = v.pointer("/message/stop_reason").and_then(Value::as_str)
+                        == Some("end_turn");
+                    activity = Some(if end {
+                        AgentActivity::Idle
+                    } else {
+                        AgentActivity::Working
+                    });
+                }
             }
             // user 이벤트(툴 결과/유저 입력) 직후는 에이전트가 이어받아 작업한다.
-            Some("user") => {
-                return Some(TranscriptState {
-                    session_id,
-                    cwd,
-                    activity: AgentActivity::Working,
-                });
+            Some("user") if activity.is_none() => {
+                activity = Some(AgentActivity::Working);
             }
             _ => {}
         }
+        if activity.is_some() && model.is_some() && cwd.is_some() {
+            break;
+        }
     }
-    None
+    Some(TranscriptState {
+        session_id,
+        cwd,
+        activity: activity?,
+        model,
+        effort: None,
+        context_pct: None,
+    })
 }
 
 /// codex rollout(`~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`) 파싱.
@@ -91,25 +109,63 @@ pub fn parse_codex(path: &Path) -> Option<TranscriptState> {
     let session_id = codex_session_id(path.file_name()?.to_str()?)?;
     let cwd = codex_cwd_from_head(path);
     let text = tail_text(path, TAIL_BYTES).ok()?;
+    // 역순 1-pass로 activity(첫 event_msg) + model/effort(첫 turn_context) +
+    // context%(첫 token_count)를 모은다. 셋 다 채워지면 조기 종료.
+    let mut activity: Option<AgentActivity> = None;
+    let mut model: Option<String> = None;
+    let mut effort: Option<String> = None;
+    let mut context_pct: Option<u8> = None;
     for line in text.lines().rev() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if v.get("type").and_then(Value::as_str) != Some("event_msg") {
-            continue;
+        match v.get("type").and_then(Value::as_str) {
+            Some("event_msg") if activity.is_none() => {
+                activity = match v.pointer("/payload/type").and_then(Value::as_str) {
+                    Some("task_complete") | Some("turn_aborted") => Some(AgentActivity::Idle),
+                    Some(_) => Some(AgentActivity::Working),
+                    None => None,
+                };
+            }
+            Some("turn_context") if model.is_none() => {
+                model = v
+                    .pointer("/payload/model")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                effort = v
+                    .pointer("/payload/effort")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            Some("token_count") if context_pct.is_none() => {
+                let info = v.pointer("/payload/info");
+                let window = info
+                    .and_then(|i| i.pointer("/model_context_window"))
+                    .and_then(Value::as_u64);
+                let used = info
+                    .and_then(|i| i.pointer("/last_token_usage/input_tokens"))
+                    .and_then(Value::as_u64);
+                if let (Some(w), Some(u)) = (window, used)
+                    && w > 0
+                {
+                    let remaining = 100u64.saturating_sub(u.saturating_mul(100) / w);
+                    context_pct = Some(remaining.min(100) as u8);
+                }
+            }
+            _ => {}
         }
-        let activity = match v.pointer("/payload/type").and_then(Value::as_str) {
-            Some("task_complete") | Some("turn_aborted") => AgentActivity::Idle,
-            Some(_) => AgentActivity::Working,
-            None => continue,
-        };
-        return Some(TranscriptState {
-            session_id,
-            cwd,
-            activity,
-        });
+        if activity.is_some() && model.is_some() && context_pct.is_some() {
+            break;
+        }
     }
-    None
+    Some(TranscriptState {
+        session_id,
+        cwd,
+        activity: activity?,
+        model,
+        effort,
+        context_pct,
+    })
 }
 
 /// 파일명에서 UUID(마지막 5개 하이픈 그룹)를 뽑는다 — 타임스탬프에도 하이픈이 있어 정규식으로.
@@ -169,6 +225,37 @@ mod tests {
         assert_eq!(s.session_id, "sess-abc");
         assert_eq!(s.cwd.as_deref(), Some("/proj"));
         assert_eq!(s.activity, AgentActivity::Idle);
+    }
+
+    #[test]
+    fn codex_model_effort_context_추출() {
+        // rollout: turn_context(model/effort) + token_count(window/used) + event_msg(활동)
+        let p = write_tmp(
+            "rollout-2026-01-01T00-00-00-11111111-2222-3333-4444-555555555555.jsonl",
+            r#"{"type":"session_meta","payload":{"cwd":"/proj"}}
+{"type":"turn_context","payload":{"model":"gpt-5.5","effort":"xhigh","cwd":"/proj"}}
+{"type":"token_count","payload":{"info":{"model_context_window":200000,"last_token_usage":{"input_tokens":60000}}}}
+{"type":"event_msg","payload":{"type":"task_complete"}}
+"#,
+        );
+        let s = parse_codex(&p).unwrap();
+        assert_eq!(s.activity, AgentActivity::Idle);
+        assert_eq!(s.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(s.effort.as_deref(), Some("xhigh"));
+        assert_eq!(s.context_pct, Some(70)); // 60000/200000 = 30% used → 70% 남음
+    }
+
+    #[test]
+    fn claude_model_추출_및_effort_context_none() {
+        let p = write_tmp(
+            "sess-model.jsonl",
+            r#"{"type":"assistant","cwd":"/m","message":{"model":"claude-opus-4-8","stop_reason":"end_turn","content":[]}}
+"#,
+        );
+        let s = parse_claude(&p).unwrap();
+        assert_eq!(s.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(s.effort, None); // statusLine→DB(Phase 2b)
+        assert_eq!(s.context_pct, None);
     }
 
     #[test]

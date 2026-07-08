@@ -74,6 +74,15 @@ pub fn panel_bg(ui: &egui::Ui) -> egui::Color32 {
     }
 }
 
+/// navActive 토큰 — egui visuals에 대응 색이 없어 로컬 상수로 정의한다.
+fn tok_nav_active(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(0x2e, 0x4a, 0x5e)
+    } else {
+        egui::Color32::from_rgb(0xcc, 0xde, 0xed)
+    }
+}
+
 pub fn render_with_style(
     ui: &mut egui::Ui,
     projects: &[EnvProjectRow],
@@ -103,6 +112,24 @@ pub fn render_with_style(
         egui::pos2(panel_rect.left(), header_rect.bottom() + 1.0),
         panel_rect.right_bottom(),
     );
+
+    let mut action = if add_requested {
+        EnvProjectListAction::AddRequested
+    } else {
+        EnvProjectListAction::None
+    };
+
+    if projects.is_empty() {
+        ui.painter().text(
+            list_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            catalog.t("env.projects_empty", &[]),
+            egui::FontId::proportional(14.0),
+            ui.visuals().weak_text_color(),
+        );
+        return action;
+    }
+
     let mut list_ui = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(list_rect)
@@ -110,11 +137,6 @@ pub fn render_with_style(
     );
     list_ui.set_width(style.width);
 
-    let mut action = if add_requested {
-        EnvProjectListAction::AddRequested
-    } else {
-        EnvProjectListAction::None
-    };
     let content_height = projects.len() as f32 * (style.row_height + 1.0);
     if content_height <= list_rect.height() {
         render_rows(
@@ -200,7 +222,7 @@ fn paint_header(
         add_rect.center(),
         egui::Align2::CENTER_CENTER,
         "+",
-        egui::FontId::proportional(style.header_font_size),
+        egui::FontId::proportional(16.0),
         ui.visuals().text_color(),
     );
     add.clicked()
@@ -220,7 +242,7 @@ fn render_row(
         egui::Sense::click(),
     );
     let fill = if selected {
-        ui.visuals().selection.bg_fill.gamma_multiply(0.58)
+        tok_nav_active(ui)
     } else if response.hovered() {
         ui.visuals().widgets.hovered.weak_bg_fill
     } else {
@@ -230,10 +252,12 @@ fn render_row(
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, fill);
 
+    // 삭제 버튼은 이름/env count가 있는 위쪽 줄과 세로 중심을 맞춘다.
+    let delete_top = rect.center().y - style.row_text_offset_y - style.delete_button_height / 2.0;
     let delete_rect = egui::Rect::from_min_size(
         egui::pos2(
             rect.right() - style.padding_x - style.delete_width,
-            rect.center().y - 22.0,
+            delete_top,
         ),
         egui::vec2(style.delete_width, style.delete_button_height),
     );
@@ -245,15 +269,21 @@ fn render_row(
         egui::pos2(rect.left() + style.padding_x, rect.top()),
         egui::pos2(text_right, rect.center().y),
     );
+    let name_pos = egui::pos2(
+        rect.left() + style.padding_x,
+        rect.center().y - style.row_text_offset_y,
+    );
+    let name_font = egui::FontId::proportional(style.name_font_size);
+    let name_color = ui.visuals().text_color();
+    // fonts.rs가 Regular 페이스만 등록해 Bold 지정이 불가 — 겹쳐그리기(faux-bold)는
+    // 흐림을 유발하므로 쓰지 않고 한 번만 그린다(사용자 2026-07-09). 진짜 Bold가
+    // 필요하면 fonts.rs에 Bold 페이스 등록이 선행돼야 한다.
     painter.with_clip_rect(name_clip).text(
-        egui::pos2(
-            rect.left() + style.padding_x,
-            rect.center().y - style.row_text_offset_y,
-        ),
+        name_pos,
         egui::Align2::LEFT_CENTER,
         &project.name,
-        egui::FontId::proportional(style.name_font_size),
-        ui.visuals().text_color(),
+        name_font,
+        name_color,
     );
 
     let path = display_project_path(&project.path);
@@ -340,7 +370,7 @@ fn paint_delete_button(ui: &mut egui::Ui, rect: egui::Rect, danger: bool) {
         rect.center(),
         egui::Align2::CENTER_CENTER,
         "×",
-        egui::FontId::proportional(11.0),
+        egui::FontId::proportional(12.0),
         text,
     );
 }

@@ -25,6 +25,13 @@ pub struct EnvProfilesUi {
 }
 
 impl EnvProfilesUi {
+    /// 같은 workspace에서 DB가 외부 경로(.env 자동 동기화 등)로 바뀌었을 때 목록/변수
+    /// 캐시를 버린다 — 다음 프레임에 DB에서 재조회(상세 표가 stale/카운트 불일치 방지).
+    pub fn invalidate_cache(&mut self) {
+        self.profiles = None;
+        self.vars = None;
+    }
+
     pub fn new() -> Self {
         Self {
             selected: None,
@@ -353,7 +360,7 @@ impl EnvProfilesUi {
         }
 
         if profiles.is_empty() {
-            env_api_section_header(ui, &catalog.t("env.env_vars", &[]), Some(0), None);
+            // 프로파일이 없으면 생성 폼만 (환경 변수 섹션 진입 전).
             compact_profile_form(ui, self, db, workspace_id, catalog)?;
             if let Some(error) = &self.error {
                 ui.colored_label(ui.visuals().error_fg_color, error);
@@ -361,12 +368,53 @@ impl EnvProfilesUi {
             return Ok(None);
         }
 
-        let profile_id = self.selected.clone().unwrap_or_default();
+        // 경고 표시용 production 플래그(선택 변경 프레임엔 1프레임 stale — 무해).
+        let pre_production = self
+            .selected
+            .as_deref()
+            .and_then(|id| profiles.iter().find(|p| p.id == id))
+            .map(|p| p.is_production)
+            .unwrap_or(false);
+
+        // 프로파일 선택기를 **상단**에 둔다(#5). 이 안에서 선택 변경/삭제 시 self.selected와
+        // self.vars(=None)가 바뀔 수 있으므로, 아래에서 profile_id·vars를 **재확정**한다
+        // (안 그러면 이전 프로파일 vars가 캐시에 고정돼 오표시/오삭제 — codex High).
+        compact_profile_controls(
+            ui,
+            self,
+            db,
+            workspace_id,
+            &profiles,
+            pre_production,
+            catalog,
+        )?;
+        ui.add_space(14.0);
+
+        // controls가 프로파일을 생성/삭제하면 self.profiles=None로 만든다 — 그 경우 stale
+        // 스냅샷으로 삭제된 id를 재선택하지 않게 **최신 목록을 재조회**한다(codex High).
+        let profiles = match &self.profiles {
+            Some(p) => p.clone(),
+            None => {
+                let p = db.list_env_profiles(workspace_id)?;
+                self.profiles = Some(p.clone());
+                p
+            }
+        };
+        // 재확정 — 선택이 바뀌었거나 삭제됐으면 first로 폴백. 목록이 비면(마지막 삭제) 종료.
+        if self.selected.is_none()
+            || !profiles
+                .iter()
+                .any(|p| Some(p.id.as_str()) == self.selected.as_deref())
+        {
+            self.selected = profiles.first().map(|p| p.id.clone());
+            self.vars = None;
+        }
+        let Some(profile_id) = self.selected.clone() else {
+            return Ok(None);
+        };
         let Some(profile) = profiles.iter().find(|p| p.id == profile_id) else {
             return Ok(None);
         };
-
-        let profile_is_production = profile.is_production;
 
         let credentials = db.list_credentials()?;
         let vars = match &self.vars {
@@ -377,14 +425,13 @@ impl EnvProfilesUi {
                 v
             }
         };
-        let (api_key_vars, env_vars): (Vec<&EnvVarRow>, Vec<&EnvVarRow>) = vars
-            .iter()
-            .partition(|var| is_api_like_env_key(&var.key, &var.value));
 
+        // 환경 변수: api-like 분리 없이 **전부 한 표**로(#1/#4). API 키는 App이 별도
+        // 자격증명 섹션으로 렌더한다 — 여기서 두 번째 "API Keys" 섹션은 만들지 않는다.
         if env_api_section_header(
             ui,
             &catalog.t("env.env_vars", &[]),
-            Some(env_vars.len()),
+            Some(vars.len()),
             Some(&catalog.t("env.add_key", &[])),
         ) {
             ui.memory_mut(|mem| mem.request_focus(env_var_key_input_id()));
@@ -394,36 +441,19 @@ impl EnvProfilesUi {
             &[catalog.t("common.key", &[]), catalog.t("common.value", &[])],
         );
         let mut delete_key = None;
-        for var in &env_vars {
+        for var in &vars {
             if env_table_row(ui, var, &credentials, catalog) {
                 delete_key = Some(var.key.clone());
             }
             env_table_divider(ui);
         }
-        if env_vars.is_empty() {
+        if vars.is_empty() {
             env_empty_placeholder_row(ui, catalog);
             env_table_divider(ui);
         }
 
         compact_env_var_form(ui, self, db, &profile_id, &credentials, catalog)?;
 
-        ui.add_space(14.0);
-        env_api_section_header(
-            ui,
-            &catalog.t("credentials.api_keys", &[]),
-            Some(api_key_vars.len()),
-            None,
-        );
-        env_table_header(
-            ui,
-            &[catalog.t("common.key", &[]), catalog.t("common.value", &[])],
-        );
-        for var in &api_key_vars {
-            if env_table_row(ui, var, &credentials, catalog) {
-                delete_key = Some(var.key.clone());
-            }
-            env_table_divider(ui);
-        }
         if let Some(key) = delete_key {
             db.delete_env_var(&profile_id, &key)?;
             self.vars = None;
@@ -482,20 +512,6 @@ impl EnvProfilesUi {
                 );
             }
         }
-
-        let bottom_spacer = (ui.available_height() - 112.0).clamp(0.0, 260.0);
-        if bottom_spacer > 0.0 {
-            ui.add_space(bottom_spacer);
-        }
-        compact_profile_controls(
-            ui,
-            self,
-            db,
-            workspace_id,
-            &profiles,
-            profile_is_production,
-            catalog,
-        )?;
 
         if let Some(error) = &self.error {
             ui.colored_label(ui.visuals().error_fg_color, error);
@@ -805,31 +821,6 @@ fn display_env_value(
     }
 }
 
-pub(crate) fn is_api_like_env_key(key: &str, value: &EnvValue) -> bool {
-    if matches!(value, EnvValue::Secret { .. }) {
-        return true;
-    }
-
-    let key = key.to_ascii_uppercase();
-    const MARKERS: &[&str] = &[
-        "API_KEY",
-        "APIKEY",
-        "ACCESS_KEY",
-        "SECRET_KEY",
-        "SECRET",
-        "TOKEN",
-        "PASSWORD",
-        "PASSCODE",
-        "PRIVATE_KEY",
-        "CLIENT_SECRET",
-        "CLIENT_ID",
-        "SIGNING_KEY",
-        "SIGNING_SECRET",
-        "WEBHOOK_SECRET",
-    ];
-    MARKERS.iter().any(|marker| key.contains(marker))
-}
-
 fn compact_profile_controls(
     ui: &mut egui::Ui,
     state: &mut EnvProfilesUi,
@@ -839,9 +830,7 @@ fn compact_profile_controls(
     selected_is_production: bool,
     catalog: &i18n::Catalog,
 ) -> anyhow::Result<()> {
-    ui.add_space(16.0);
-    env_table_divider(ui);
-    ui.add_space(8.0);
+    // 상단 배치(#5): 프로파일 라벨 + 칩 + 삭제, 생산 경고, 생성 폼. 아래에 구분선.
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new(catalog.t("env.profile", &[]))
@@ -892,7 +881,10 @@ fn compact_profile_controls(
             egui::RichText::new(catalog.t("env.production_warning", &[])).size(13.0),
         );
     }
-    compact_profile_form(ui, state, db, workspace_id, catalog)
+    compact_profile_form(ui, state, db, workspace_id, catalog)?;
+    ui.add_space(8.0);
+    env_table_divider(ui);
+    Ok(())
 }
 
 fn compact_env_var_form(

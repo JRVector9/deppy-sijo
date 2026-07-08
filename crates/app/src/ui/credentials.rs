@@ -173,7 +173,14 @@ impl CredentialsUi {
         };
 
         ui.add_space(16.0);
-        credentials_section_header(ui, &catalog.t("credentials.api_keys", &[]), list.len());
+        if credentials_section_header(
+            ui,
+            &catalog.t("credentials.api_keys", &[]),
+            list.len(),
+            &catalog.t("env.add_key", &[]),
+        ) {
+            ui.memory_mut(|mem| mem.request_focus(credential_provider_input_id()));
+        }
         credentials_table_header(
             ui,
             &[
@@ -208,6 +215,7 @@ impl CredentialsUi {
         ui.horizontal_wrapped(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.provider)
+                    .id_source(credential_provider_input_id())
                     .hint_text(catalog.t("credentials.provider", &[]))
                     .desired_width(120.0),
             );
@@ -263,7 +271,14 @@ impl CredentialsUi {
     }
 }
 
-fn credentials_section_header(ui: &mut egui::Ui, title: &str, count: usize) {
+/// 섹션 헤더: 제목 + 카운트 배지 + 우측 액션 버튼. 버튼 클릭 시 true를 반환한다.
+fn credentials_section_header(
+    ui: &mut egui::Ui,
+    title: &str,
+    count: usize,
+    action_label: &str,
+) -> bool {
+    let mut clicked = false;
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(title).size(14.0).strong());
         egui::Frame::NONE
@@ -276,7 +291,19 @@ fn credentials_section_header(ui: &mut egui::Ui, title: &str, count: usize) {
                         .color(ui.visuals().hyperlink_color),
                 );
             });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // sharp(라운딩 0) — 1px border는 테마 기본 widget stroke를 그대로 사용.
+            clicked = ui
+                .add(egui::Button::new(action_label).corner_radius(0))
+                .clicked();
+        });
     });
+    clicked
+}
+
+/// "+ 추가" 헤더 버튼 클릭 시 포커스를 옮길 provider 입력창의 고정 Id.
+fn credential_provider_input_id() -> egui::Id {
+    egui::Id::new("credentials_provider_input")
 }
 
 fn credentials_table_header(ui: &mut egui::Ui, columns: &[String]) {
@@ -355,16 +382,9 @@ fn credential_table_row(
         ui.visuals().text_color(),
     );
 
-    let reveal_center = egui::pos2(rect.right() - 72.0, y);
-    painter.text(
-        reveal_center,
-        egui::Align2::CENTER_CENTER,
-        "○",
-        egui::FontId::proportional(12.0),
-        ui.visuals().weak_text_color(),
-    );
+    // #6: 안전한 reveal 경로가 없어 죽어있던 ○ 버튼은 제거하고 삭제(×)만 남긴다.
     let delete_rect =
-        egui::Rect::from_center_size(egui::pos2(rect.right() - 40.0, y), egui::vec2(28.0, 20.0));
+        egui::Rect::from_center_size(egui::pos2(rect.right() - 24.0, y), egui::vec2(28.0, 20.0));
     let delete = ui
         .interact(
             delete_rect,
@@ -406,7 +426,8 @@ fn credential_table_row(
 }
 
 fn credential_columns(rect: egui::Rect) -> [egui::Rect; 4] {
-    let action_w = 92.0;
+    // reveal(○) 버튼 제거로 삭제(×) 하나만 남아 액션 열 폭을 축소했다(#6).
+    let action_w = 48.0;
     let content = egui::Rect::from_min_max(
         rect.min,
         egui::pos2((rect.right() - action_w).max(rect.left()), rect.bottom()),

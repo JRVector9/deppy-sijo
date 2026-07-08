@@ -171,6 +171,7 @@ approval.arguments_preview = 參數預覽：
 approval.remember_tool = 記住此工具
 env.title = 環境
 env.projects = 專案
+env.projects_empty = 無專案
 env.profile = Profile
 env.env_vars = 環境變數
 env.empty_profiles = 沒有 profile。

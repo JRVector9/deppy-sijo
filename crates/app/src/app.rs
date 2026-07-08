@@ -1712,6 +1712,10 @@ impl App {
                 env_secrets,
             });
         self.last_dotenv_state = Some(baseline);
+        // .env 동기화가 DB의 env profile/변수/credential을 바꿨을 수 있다 — 설정 UI 캐시를
+        // 무효화해 상세 표가 stale로 남거나 카운트(DB 신선)와 어긋나지 않게 한다(codex Med).
+        self.env_profiles_ui.invalidate_cache();
+        self.credentials_ui.invalidate_cache();
     }
 
     /// 폴더의 (dev, ino)를 읽는다(inode 앵커용). 유효 디렉터리가 아니면 None.
@@ -1858,6 +1862,9 @@ impl App {
     }
 
     fn env_api_project_rows(&self) -> Vec<ui::env_project_list::EnvProjectRow> {
+        // API 키(자격증명)는 전역 공유 풀이라 모든 프로젝트에서 같은 수를 보인다 — 이 동일
+        // 카운트 자체가 "공유 자원"임을 알려준다(#2 오해 방지). env는 프로젝트별 env 변수 총합.
+        let key_count = self.db.list_credentials().map(|c| c.len()).unwrap_or(0);
         self.workspaces
             .iter()
             .map(|row| {
@@ -1868,27 +1875,17 @@ impl App {
                     .flatten()
                     .filter(|path| !path.trim().is_empty())
                     .unwrap_or_else(|| row.path.clone());
-                let (env_count, key_count) = self
+                let env_count = self
                     .db
                     .list_env_profiles(&row.id)
                     .map(|profiles| {
-                        let mut env_count = 0usize;
-                        let mut key_count = 0usize;
-                        for vars in profiles
+                        profiles
                             .iter()
                             .filter_map(|profile| self.db.list_env_vars(&profile.id).ok())
-                        {
-                            for var in vars {
-                                if ui::env_profiles::is_api_like_env_key(&var.key, &var.value) {
-                                    key_count += 1;
-                                } else {
-                                    env_count += 1;
-                                }
-                            }
-                        }
-                        (env_count, key_count)
+                            .map(|vars| vars.len())
+                            .sum()
                     })
-                    .unwrap_or((0, 0));
+                    .unwrap_or(0usize);
                 ui::env_project_list::EnvProjectRow {
                     id: row.id.clone(),
                     name: Self::workspace_display_name(row),

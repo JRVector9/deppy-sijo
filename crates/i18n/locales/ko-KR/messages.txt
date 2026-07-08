@@ -171,6 +171,7 @@ approval.arguments_preview = 인자 미리보기:
 approval.remember_tool = 이 도구 기억
 env.title = 환경
 env.projects = 프로젝트
+env.projects_empty = 프로젝트 없음
 env.profile = 프로파일
 env.env_vars = 환경 변수
 env.empty_profiles = profile이 없습니다.

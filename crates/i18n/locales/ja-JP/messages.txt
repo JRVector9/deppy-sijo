@@ -171,6 +171,7 @@ approval.arguments_preview = 引数プレビュー:
 approval.remember_tool = このツールを記憶
 env.title = 環境
 env.projects = プロジェクト
+env.projects_empty = プロジェクトなし
 env.profile = プロファイル
 env.env_vars = 環境変数
 env.empty_profiles = profileはありません。

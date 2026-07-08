@@ -297,6 +297,12 @@ const DB_CALL_ALLOW: &[BoundaryAllow] = &[
     },
     BoundaryAllow {
         path: "crates/app/src/ui/env_profiles.rs",
+        snippet: "let current_path = db.workspace_path(workspace_id).ok().flatten();",
+        count: 1,
+        reason: "project folder path display for env sync (2026-07-08)",
+    },
+    BoundaryAllow {
+        path: "crates/app/src/ui/env_profiles.rs",
         snippet: "db.delete_env_profile(&id)?;",
         count: 1,
         reason: "existing env profile storage UI exception",

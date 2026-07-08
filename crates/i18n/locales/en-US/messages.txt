@@ -15,6 +15,7 @@ status.done = Done
 status.error = Error
 status.needs_approval = Needs approval
 status.running = Running
+status.idle = Idle
 status.waiting = Waiting
 status.source.process_exit = Process exit
 status.source.stream_regex = Stream pattern

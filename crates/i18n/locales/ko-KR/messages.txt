@@ -15,6 +15,7 @@ status.done = 완료
 status.error = 오류
 status.needs_approval = 승인 필요
 status.running = 실행 중
+status.idle = 유휴
 status.waiting = 대기 중
 status.source.process_exit = 프로세스 종료
 status.source.stream_regex = 스트림 패턴

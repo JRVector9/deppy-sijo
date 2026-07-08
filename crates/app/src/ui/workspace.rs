@@ -1357,6 +1357,15 @@ impl WorkspaceUi {
                     .map(|v| v.summary.clone())
                     .unwrap_or_default();
                 let osc = self.session_osc_title(pane.session_id);
+                // 에이전트 정보(2/3행) — 있으면 3줄 렌더. codex/claude 병합본(App).
+                let info = pane.session_id.and_then(|s| self.agent_info.get(&s));
+                let (agent_line, status_line) = match info {
+                    Some(d) => (
+                        Some(agent_info_line(d)),
+                        Some(status_ctx_line(status, d.context_pct, catalog)),
+                    ),
+                    None => (None, None),
+                };
                 crate::ui::file_tree::SessionEntry {
                     tab: tab.id.clone(),
                     pane: pane.id.clone(),
@@ -1372,6 +1381,8 @@ impl WorkspaceUi {
                     focused: mux.focused_pane.as_ref() == Some(&pane.id),
                     attention: false, // App의 alert 추적이 채운다 (update_session_alerts)
                     pulse: None,
+                    agent_line,
+                    status_line,
                 }
             })
             .collect()
@@ -1589,6 +1600,48 @@ fn selection_range_contains(start: usize, end: usize, idx: usize) -> bool {
 
 fn terminal_text_paste_bytes(text: &str, bracketed_paste: bool) -> Vec<u8> {
     input_mapper::paste_bytes(text.as_bytes(), bracketed_paste)
+}
+
+/// 세션 행 2행: "Codex · gpt-5.5 · xhigh" (빈 부분은 생략). 2026-07-08.
+fn agent_info_line(d: &crate::agent_detect::AgentDisplay) -> String {
+    use crate::agent_detect::AgentKind;
+    let name = match d.kind {
+        AgentKind::Claude => "Claude",
+        AgentKind::Codex => "Codex",
+    };
+    let mut parts = vec![name.to_owned()];
+    if let Some(m) = d.model.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(m.to_owned());
+    }
+    if let Some(e) = d.effort.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(e.to_owned());
+    }
+    parts.join(" · ")
+}
+
+/// 세션 행 3행: "실행 중 · ctx 69%" (상태 라벨 + 남은 컨텍스트%). 상태 없으면 ctx만.
+fn status_ctx_line(
+    status: Option<runtime::SessionStatus>,
+    context_pct: Option<u8>,
+    catalog: &i18n::Catalog,
+) -> String {
+    use runtime::SessionStatus as S;
+    let label = status.map(|s| {
+        let key = match s {
+            S::Running => "status.running",
+            S::Waiting | S::NeedsApproval => "status.needs_approval",
+            S::Done => "status.done",
+            S::Error => "status.error",
+            S::Idle => "status.idle",
+        };
+        catalog.t(key, &[])
+    });
+    match (label, context_pct) {
+        (Some(l), Some(p)) => format!("{l} · ctx {p}%"),
+        (Some(l), None) => l,
+        (None, Some(p)) => format!("ctx {p}%"),
+        (None, None) => String::new(),
+    }
 }
 
 fn request_terminal_focus(response: &egui::Response) {

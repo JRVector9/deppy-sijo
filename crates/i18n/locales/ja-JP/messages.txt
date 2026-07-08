@@ -15,6 +15,7 @@ status.done = 完了
 status.error = エラー
 status.needs_approval = 承認が必要
 status.running = 実行中
+status.idle = アイドル
 status.waiting = 待機中
 status.source.process_exit = プロセス終了
 status.source.stream_regex = ストリームパターン

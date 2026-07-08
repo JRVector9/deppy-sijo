@@ -15,6 +15,7 @@ status.done = 完成
 status.error = 錯誤
 status.needs_approval = 需要核准
 status.running = 執行中
+status.idle = 閒置
 status.waiting = 等待中
 status.source.process_exit = 行程結束
 status.source.stream_regex = 串流模式

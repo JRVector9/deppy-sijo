@@ -27,6 +27,10 @@ pub struct SessionEntry {
     pub attention: bool,
     /// 알림 도착 시 이미 포커스 중이던 pane의 1회 펄스 — (진행 0..1, 알림 색).
     pub pulse: Option<(f32, egui::Color32)>,
+    /// 에이전트 2행: "Codex · gpt-5.5 · xhigh" (에이전트일 때만 Some → 3줄 렌더).
+    pub agent_line: Option<String>,
+    /// 에이전트 3행: "실행 중 · ctx 69%" (상태 라벨 + 남은 컨텍스트).
+    pub status_line: Option<String>,
 }
 
 /// 사이드바에서 App으로 올라가는 액션.
@@ -1949,15 +1953,15 @@ pub enum ShellKind {
 /// 마름모를 도형으로 그려 회피한다. 선택 시 액센트 배경 + 좌측 레일, agent는 레일 표시,
 /// 요약 한 줄(dim/mono). 반환 Response로 클릭을 처리한다.
 fn session_row(ui: &mut egui::Ui, entry: &SessionEntry) -> egui::Response {
-    // 요약이 없어도(유휴/시작 직후) 두 행 높이를 유지하고 '~'를 표시한다 — 행 높이가
-    // 상태마다 접혔다 펴지면 목록이 들쭉날쭉해 보인다(2026-07-07 디자인 요청).
-    let has_summary = true;
+    // 에이전트면 3줄(제목/에이전트·모델·effort/상태·ctx%), 아니면 2줄(제목/요약).
+    // 요약이 없어도(유휴/시작 직후) 2행에 '~'를 표시해 행 높이를 유지한다(2026-07-07).
+    let agent = entry.agent_line.is_some();
     let summary_text: &str = if entry.summary.is_empty() {
         "~"
     } else {
         &entry.summary
     };
-    let row_h = 38.0;
+    let row_h = if agent { 52.0 } else { 38.0 };
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), row_h),
         egui::Sense::click(),
@@ -1969,7 +1973,7 @@ fn session_row(ui: &mut egui::Ui, entry: &SessionEntry) -> egui::Response {
     let accent = ui.visuals().selection.bg_fill;
     let dot = session_status_color(entry.status, ui.visuals());
     let hover_bg = ui.visuals().widgets.hovered.bg_fill;
-    let summary_color = ui.visuals().weak_text_color().gamma_multiply(0.9);
+    let sub_color = ui.visuals().weak_text_color().gamma_multiply(0.9);
     let title_color = if entry.focused {
         accent
     } else {
@@ -1979,8 +1983,14 @@ fn session_row(ui: &mut egui::Ui, entry: &SessionEntry) -> egui::Response {
     // 좁은 사이드바에서 박스 밖으로 삐져나갔다(#91 사용자).
     let max_w = (rect.width() - 16.0 - 8.0).max(10.0);
     let title_galley = clipped_line(ui, &entry.title, egui::FontId::proportional(13.0), max_w);
-    let summary_galley =
-        has_summary.then(|| clipped_line(ui, summary_text, egui::FontId::monospace(10.5), max_w));
+    // 2행/3행: 에이전트면 agent_line/status_line, 아니면 요약(2행)만.
+    let (line2, line3) = if agent {
+        (entry.agent_line.as_deref(), entry.status_line.as_deref())
+    } else {
+        (Some(summary_text), None)
+    };
+    let line2_galley = line2.map(|t| clipped_line(ui, t, egui::FontId::monospace(10.5), max_w));
+    let line3_galley = line3.map(|t| clipped_line(ui, t, egui::FontId::monospace(10.5), max_w));
 
     let painter = ui.painter();
     // 선택/hover 배경
@@ -2005,17 +2015,27 @@ fn session_row(ui: &mut egui::Ui, entry: &SessionEntry) -> egui::Response {
         egui::vec2(rail_w, row_h - 8.0),
     );
     painter.rect_filled(rail, 1.0, rail_color);
-    let mid_y = rect.top() + if has_summary { 13.0 } else { row_h / 2.0 };
+    // 제목(1행) + 2행 + 3행 — 세로 위치는 행 수에 맞춰.
     painter.galley(
-        egui::pos2(rect.left() + 16.0, mid_y - title_galley.size().y / 2.0),
+        egui::pos2(
+            rect.left() + 16.0,
+            rect.top() + 13.0 - title_galley.size().y / 2.0,
+        ),
         title_galley,
         title_color,
     );
-    if let Some(sg) = summary_galley {
+    if let Some(g) = line2_galley {
         painter.galley(
-            egui::pos2(rect.left() + 16.0, rect.top() + 27.0 - sg.size().y / 2.0),
-            sg,
-            summary_color,
+            egui::pos2(rect.left() + 16.0, rect.top() + 27.0 - g.size().y / 2.0),
+            g,
+            sub_color,
+        );
+    }
+    if let Some(g) = line3_galley {
+        painter.galley(
+            egui::pos2(rect.left() + 16.0, rect.top() + 41.0 - g.size().y / 2.0),
+            g,
+            sub_color,
         );
     }
     resp

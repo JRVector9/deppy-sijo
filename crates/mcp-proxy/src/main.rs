@@ -217,13 +217,17 @@ fn run_statusline(args: &[String]) -> anyhow::Result<()> {
     if std::fs::read_to_string(&sig_path).ok().as_deref() == Some(sig.as_str()) {
         return Ok(()); // 변화 없음
     }
-    if let Ok(db) = storage::Db::open(&db_path) {
-        let _ = db.upsert_statusline(&session_key, effort, model, ctx);
+    // **DB write 성공 시에만** sig를 커밋한다 — 실패했는데 sig를 쓰면 값이 바뀔 때까지
+    // 영영 재시도를 못 해 DB가 stale로 남는다(codex Medium).
+    let wrote = storage::Db::open(&db_path)
+        .and_then(|db| db.upsert_statusline(&session_key, effort, model, ctx))
+        .is_ok();
+    if wrote {
+        if let Some(dir) = sig_path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&sig_path, sig);
     }
-    if let Some(dir) = sig_path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::write(&sig_path, sig);
     Ok(())
 }
 
@@ -266,7 +270,7 @@ fn chain_user_statusline(json: &serde_json::Value, payload: &str) -> Option<Stri
             .map(str::to_owned)
     })?;
     // payload를 stdin으로 넘겨 사용자 스크립트 실행(그들이 기대하는 입력 형식 그대로).
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::process::{Command, Stdio};
     let mut child = Command::new("sh")
         .arg("-c")
@@ -278,9 +282,26 @@ fn chain_user_statusline(json: &serde_json::Value, payload: &str) -> Option<Stri
         .ok()?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(payload.as_bytes());
+        // drop(stdin)으로 EOF 신호 — take한 값이 블록 끝에서 drop됨.
     }
-    let out = child.wait_with_output().ok()?;
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    // stdout을 별도 스레드로 읽어 파이프-full 데드락을 피하고, 최대 2초만 기다린다 —
+    // 사용자 statusLine이 멈추면 claude 렌더가 무한 블록되지 않게 kill(codex High).
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let out = match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        Ok(buf) => buf,
+        Err(_) => {
+            let _ = child.kill();
+            return None; // 타임아웃 — 이번 렌더는 우리 바만(빈 출력)
+        }
+    };
+    let _ = child.wait();
+    Some(String::from_utf8_lossy(&out).into_owned())
 }
 
 /// 현재 unix epoch seconds. 정상 시스템 시계에서 UNIX_EPOCH 이후이므로 0으로 폴백.

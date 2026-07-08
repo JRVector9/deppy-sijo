@@ -300,4 +300,37 @@ mod tests {
         drop(pipe);
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    /// crash-recovery 불변식: 명시적 flush 없이 pipe가 drop돼도(앱 종료 경로)
+    /// 배치 버퍼에 남은 write가 유실되면 안 된다.
+    #[test]
+    fn persist_pipe는_drop시_pending_batch를_flush한다() {
+        let (dir, db_path) = temp_db("drop-flush");
+        let db = storage::Db::open(&db_path).unwrap();
+        let workspace_id = db.create_workspace("runtime").unwrap();
+        drop(db);
+
+        let mut pipe = PersistPipe::open(&PersistConfig {
+            db_path: db_path.clone(),
+            workspace_id,
+        })
+        .unwrap();
+        let session = SessionId(1);
+        pipe.session_spawned(session, "shell", None, "shell", "/bin/sh", &[]);
+        pipe.session_status(session, session::SessionStatus::Done);
+        pipe.session_log_offset(session, 64);
+        // flush_async_writes 호출 없이 drop — 버퍼가 flush돼야 한다.
+        drop(pipe);
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (status, offset): (String, i64) = conn
+            .query_row("SELECT status, last_log_offset FROM sessions", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(status, "done");
+        assert_eq!(offset, 64);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

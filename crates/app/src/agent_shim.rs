@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use crate::agent_hooks::hook_command;
+use crate::agent_hooks::{hook_command, statusline_command};
 
 /// shim 루트 (`~/.deppy-sijo`).
 fn root() -> Option<PathBuf> {
@@ -72,7 +72,9 @@ pub fn install(db_path: &std::path::Path, proxy_bin: &str) -> anyhow::Result<()>
             "PreToolUse":       [ { "hooks": [ { "type": "command", "command": hook("clear") } ] } ],
             // Stop = 턴 완료 → 상태 레일 '완료' 트랜지언트 (clear가 아니라 turn-done).
             "Stop":             [ { "hooks": [ { "type": "command", "command": hook("turn-done") } ] } ],
-        }
+        },
+        // statusLine = effort/model/남은 context% 캡처 + 사용자 원래 statusLine 체이닝.
+        "statusLine": { "type": "command", "command": statusline_command(proxy_bin, db_path) }
     });
     let settings_path = root.join("claude-hook-settings.json");
     std::fs::write(

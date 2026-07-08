@@ -183,6 +183,18 @@ CREATE TABLE agent_hook_sessions (
     "
 ALTER TABLE agent_needs_input ADD COLUMN turn_done INTEGER NOT NULL DEFAULT 0;
 ",
+    // v17: claude statusLine이 보고한 표시 정보(effort/model/남은 context%). session_key는
+    // {workspace_id}:{session_id}(=pane). 3줄 세션 행 2/3행에 병합. codex는 rollout에서
+    // 직접 얻으므로 이 테이블은 claude 전용.
+    "
+CREATE TABLE agent_statusline (
+    session_key TEXT PRIMARY KEY,
+    effort TEXT,
+    model TEXT,
+    context_pct INTEGER,
+    updated_at INTEGER NOT NULL
+);
+",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -202,6 +214,15 @@ pub struct HookSessionRow {
     pub kind: String,
     pub agent_session_id: String,
     pub transcript_path: String,
+}
+
+/// claude statusLine 표시 정보 한 행 (v17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatuslineRow {
+    pub session_key: String,
+    pub effort: Option<String>,
+    pub model: Option<String>,
+    pub context_pct: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -661,6 +682,10 @@ impl Db {
             "DELETE FROM agent_needs_input WHERE updated_at < strftime('%s','now') - 604800",
             [],
         )?;
+        self.conn.execute(
+            "DELETE FROM agent_statusline WHERE updated_at < strftime('%s','now') - 604800",
+            [],
+        )?;
         Ok(())
     }
 
@@ -750,6 +775,43 @@ impl Db {
             )
             .with_context(|| format!("turn_done 해제 실패: {session_key}"))?;
         Ok(())
+    }
+
+    /// claude statusLine 표시 정보 upsert(effort/model/남은 context%). 값 변경 시에만
+    /// 호출되도록 프록시가 스로틀한다.
+    pub fn upsert_statusline(
+        &self,
+        session_key: &str,
+        effort: Option<&str>,
+        model: Option<&str>,
+        context_pct: Option<i64>,
+    ) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO agent_statusline
+                     (session_key, effort, model, context_pct, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, CAST(strftime('%s','now') AS INTEGER))",
+                (session_key, effort, model, context_pct),
+            )
+            .with_context(|| format!("statusline 저장 실패: {session_key}"))?;
+        Ok(())
+    }
+
+    /// 최근(1시간 이내) statusLine 정보 목록 — (key, effort, model, context_pct).
+    pub fn list_statuslines(&self) -> anyhow::Result<Vec<StatuslineRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_key, effort, model, context_pct FROM agent_statusline
+             WHERE updated_at > CAST(strftime('%s','now') AS INTEGER) - 3600",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(StatuslineRow {
+                session_key: row.get(0)?,
+                effort: row.get(1)?,
+                model: row.get(2)?,
+                context_pct: row.get(3)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// 턴 완료(미확인) 세션 (key, updated_at) 목록. waiting과 같은 1시간 stale 컷오프.

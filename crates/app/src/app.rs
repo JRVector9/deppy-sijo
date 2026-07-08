@@ -416,9 +416,11 @@ pub struct App {
     session_alerts: std::collections::HashMap<runtime::SessionId, SessionAlert>,
     /// 세션별 현재 작업 폴더(감지 워커 lsof) — 행 1행 폴더명 + 워크스페이스명.
     session_cwds: std::collections::HashMap<runtime::SessionId, String>,
-    /// 세션별 에이전트 표시 정보(model/effort/context) — 3줄 행 2/3행. claude는 effort/
-    /// context를 statusLine DB에서 병합(Phase 2b).
+    /// 세션별 에이전트 표시 정보(model/effort/context) — 워커 raw(transcript). claude는
+    /// effort/context를 statusLine DB(아래)에서 병합해 최종본을 WorkspaceUi로 넘긴다.
     agent_info: std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentDisplay>,
+    /// claude statusLine이 보고한 effort/model/context% — 1s 스로틀로 DB에서 읽어 병합.
+    statuslines: std::collections::HashMap<runtime::SessionId, crate::storage::StatuslineRow>,
     /// 복원용으로 로드한 (pane_id → 저장된 에이전트 세션). 워크스페이스 활성 시 로드.
     restore_agents: std::collections::HashMap<String, crate::storage::AgentSessionRow>,
     /// restore_agents를 로드한 워크스페이스 id (전환 시 재로드 판정).
@@ -554,6 +556,7 @@ impl App {
             session_alerts: std::collections::HashMap::new(),
             session_cwds: std::collections::HashMap::new(),
             agent_info: std::collections::HashMap::new(),
+            statuslines: std::collections::HashMap::new(),
             restore_agents: std::collections::HashMap::new(),
             restore_loaded_for: None,
             resumed_panes: std::collections::HashSet::new(),
@@ -735,6 +738,21 @@ impl App {
                     ))
                 })
                 .collect();
+            // claude statusLine 표시 정보(effort/model/context%) — 활성 워크스페이스 것만.
+            self.statuslines = self
+                .db
+                .list_statuslines()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|r| {
+                    let sid = r
+                        .session_key
+                        .strip_prefix(&ws_prefix)?
+                        .parse::<u64>()
+                        .ok()?;
+                    Some((runtime::SessionId(sid), r))
+                })
+                .collect();
         }
         if let Ok(mut input) = self.agent_detect_input.lock() {
             *input = (
@@ -766,6 +784,9 @@ impl App {
         if let Some(info) = latest_info {
             self.agent_info = info;
         }
+        // 에이전트 표시정보 최종본(claude는 statusLine으로 effort/model/context 병합) →
+        // WorkspaceUi. statuslines가 매 1s 갱신되므로 매 poll에서 병합해 최신을 반영한다.
+        self.push_agent_display();
         if let Some(cwds) = latest_cwds {
             self.session_cwds = cwds;
             // 세션 행/pane 헤더 1행 폴더명 원천 — WorkspaceUi에 전달.
@@ -819,6 +840,31 @@ impl App {
             .iter()
             .filter_map(|(k, at)| Some((to_id(k)?, *at)))
             .collect();
+    }
+
+    /// 워커 raw(agent_info) + claude statusLine(statuslines)을 병합해 최종 표시정보를
+    /// WorkspaceUi에 넘긴다. claude는 statusLine의 effort/model/context%를 우선(정확),
+    /// 없으면 transcript 값. codex는 raw 그대로.
+    fn push_agent_display(&mut self) {
+        use crate::agent_detect::{AgentDisplay, AgentKind};
+        let mut merged: std::collections::HashMap<runtime::SessionId, AgentDisplay> =
+            self.agent_info.clone();
+        for (sid, d) in merged.iter_mut() {
+            if d.kind == AgentKind::Claude
+                && let Some(sl) = self.statuslines.get(sid)
+            {
+                if sl.effort.is_some() {
+                    d.effort = sl.effort.clone();
+                }
+                if sl.model.is_some() {
+                    d.model = sl.model.clone(); // "Opus 4.8 (1M context)" — transcript보다 나음
+                }
+                if let Some(pct) = sl.context_pct {
+                    d.context_pct = Some(pct.clamp(0, 100) as u8);
+                }
+            }
+        }
+        self.active.workspace_ui.set_agent_info(merged);
     }
 
     /// 완료/입력대기 주목(attention) 추적 — 세션 엔트리에 attention/pulse를 채운다.
@@ -1199,6 +1245,7 @@ impl App {
         self.session_alerts.clear();
         self.session_cwds.clear();
         self.agent_info.clear();
+        self.statuslines.clear();
         let _ = old
             .runtime
             .send_command(runtime::RuntimeCommand::SetWorkspaceState(

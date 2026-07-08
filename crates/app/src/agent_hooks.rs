@@ -33,6 +33,16 @@ pub(crate) fn hook_command(proxy_bin: &str, db_path: &std::path::Path, event: &s
     )
 }
 
+/// claude statusLine 오버레이 command — proxy가 effort/model/context%를 DB에 기록하고
+/// 사용자 원래 statusLine을 체이닝한다(2026-07-08).
+pub(crate) fn statusline_command(proxy_bin: &str, db_path: &std::path::Path) -> String {
+    format!(
+        "{} statusline --db {}",
+        sh_quote(proxy_bin),
+        sh_quote(&db_path.display().to_string())
+    )
+}
+
 fn claude_settings_path() -> Option<PathBuf> {
     Some(PathBuf::from(std::env::var_os("HOME")?).join(".claude/settings.json"))
 }

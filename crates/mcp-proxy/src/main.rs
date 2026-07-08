@@ -41,6 +41,12 @@ fn main() -> anyhow::Result<()> {
     if args.get(1).map(String::as_str) == Some("hooks") {
         return run_hooks(&args[2..]);
     }
+    // `deppy-mcp-proxy statusline --db <path>` — claude statusLine 오버레이가 렌더마다
+    // 호출. stdin JSON에서 effort/model/남은 context%를 뽑아 (변경 시에만) DB에 기록하고,
+    // 사용자 원래 statusLine을 체이닝 호출해 그 출력을 통과시킨다(사용자 바 보존).
+    if args.get(1).map(String::as_str) == Some("statusline") {
+        return run_statusline(&args[2..]);
+    }
 
     let cli = Cli::from_env()?;
     let db = storage::Db::open(&cli.db_path)?;
@@ -165,6 +171,116 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// claude statusLine 수신: `--db <path>`, 세션은 env DEPPY_SESSION_ID(=pane_id).
+/// stdin JSON에서 effort/model/남은 context%를 뽑아 **값이 바뀔 때만** DB에 기록하고,
+/// 사용자 원래 statusLine을 체이닝 호출해 그 출력을 stdout으로 통과시킨다.
+/// statusLine은 절대 claude를 막으면 안 되므로 뭐가 실패해도 조용히 진행한다.
+fn run_statusline(args: &[String]) -> anyhow::Result<()> {
+    let mut db_path: Option<std::path::PathBuf> = None;
+    let mut it = args.iter();
+    while let Some(flag) = it.next() {
+        if flag == "--db" {
+            db_path = it.next().map(std::path::PathBuf::from);
+        }
+    }
+    let mut payload = String::new();
+    let _ = std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut payload);
+    let json: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
+
+    // 사용자 원래 statusLine을 먼저 실행해 출력 통과(우리 처리 실패와 무관하게 바 유지).
+    if let Some(out) = chain_user_statusline(&json, &payload) {
+        print!("{out}");
+    }
+
+    // effort/model/context% 추출 → 변경 시에만 DB. session_key 없으면 스킵.
+    let session_key = std::env::var("DEPPY_SESSION_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let (Some(session_key), Some(db_path)) = (session_key, db_path) else {
+        return Ok(());
+    };
+    let effort = json.pointer("/effort/level").and_then(|v| v.as_str());
+    let model = json.pointer("/model/display_name").and_then(|v| v.as_str());
+    let ctx = json
+        .pointer("/context_window/remaining_percentage")
+        .and_then(serde_json::Value::as_i64);
+    let sig = format!(
+        "{}|{}|{}",
+        effort.unwrap_or(""),
+        model.unwrap_or(""),
+        ctx.map(|c| c.to_string()).unwrap_or_default()
+    );
+    // sig 파일로 렌더마다의 DB write를 막는다 — 값이 바뀐 렌더에서만 DB에 쓴다.
+    let sig_path = statusline_sig_path(&session_key);
+    if std::fs::read_to_string(&sig_path).ok().as_deref() == Some(sig.as_str()) {
+        return Ok(()); // 변화 없음
+    }
+    if let Ok(db) = storage::Db::open(&db_path) {
+        let _ = db.upsert_statusline(&session_key, effort, model, ctx);
+    }
+    if let Some(dir) = sig_path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&sig_path, sig);
+    Ok(())
+}
+
+/// 세션별 statusLine 시그니처 캐시 경로(`~/.deppy-sijo/statusline/<sanitized-key>.sig`).
+fn statusline_sig_path(session_key: &str) -> std::path::PathBuf {
+    let safe: String = session_key
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let base = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(".deppy-sijo")
+        .join("statusline")
+        .join(format!("{safe}.sig"))
+}
+
+/// 사용자 원래 statusLine command를 settings에서 찾아 payload를 stdin으로 넘겨 실행하고
+/// stdout을 돌려준다. 없거나 실패하면 None(=우리 오버레이는 아무것도 안 그림 → 사용자가
+/// 원래 statusLine이 없던 상태와 동일). 우리 오버레이 파일은 읽지 않으므로 무한루프 없음.
+fn chain_user_statusline(json: &serde_json::Value, payload: &str) -> Option<String> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+    let project = json
+        .pointer("/workspace/project_dir")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from);
+    // 우선순위: 프로젝트 local > 프로젝트 settings > user local > user.
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(p) = &project {
+        candidates.push(p.join(".claude/settings.local.json"));
+        candidates.push(p.join(".claude/settings.json"));
+    }
+    candidates.push(home.join(".claude/settings.local.json"));
+    candidates.push(home.join(".claude/settings.json"));
+    let command = candidates.iter().find_map(|p| {
+        let text = std::fs::read_to_string(p).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        v.pointer("/statusLine/command")
+            .and_then(|c| c.as_str())
+            .map(str::to_owned)
+    })?;
+    // payload를 stdin으로 넘겨 사용자 스크립트 실행(그들이 기대하는 입력 형식 그대로).
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(payload.as_bytes());
+    }
+    let out = child.wait_with_output().ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// 현재 unix epoch seconds. 정상 시스템 시계에서 UNIX_EPOCH 이후이므로 0으로 폴백.

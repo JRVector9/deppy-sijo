@@ -49,6 +49,8 @@ pub struct WorkspaceUi {
     project_name: Option<String>,
     /// 세션별 현재 작업 폴더(App이 매 프레임 set) — 1행 제목 폴더명/프로젝트명 원천.
     session_cwds: std::collections::HashMap<SessionId, String>,
+    /// 세션별 에이전트 표시정보(model/effort/context — App이 병합해 set) — 3줄 행 2/3행.
+    agent_info: std::collections::HashMap<SessionId, crate::agent_detect::AgentDisplay>,
     /// 진행 중인 백그라운드 클립보드 paste(이미지 PNG 인코딩을 UI 밖으로 — 2026-07-07).
     /// show()가 매 프레임 폴링해 완료 시 해당 세션에 삽입한다. 새 ⌘V는 이전 것을 대체.
     paste_task: Option<PendingPaste>,
@@ -107,6 +109,7 @@ impl WorkspaceUi {
             selection: None,
             project_name: None,
             session_cwds: std::collections::HashMap::new(),
+            agent_info: std::collections::HashMap::new(),
             paste_task: None,
             error: None,
         }
@@ -121,6 +124,14 @@ impl WorkspaceUi {
     /// 세션별 현재 작업 폴더를 세팅한다(App이 매 프레임, 감지 워커 lsof 결과).
     pub fn set_session_cwds(&mut self, cwds: std::collections::HashMap<SessionId, String>) {
         self.session_cwds = cwds;
+    }
+
+    /// 세션별 에이전트 표시정보를 세팅한다(App이 병합한 최종본 — 3줄 행 렌더용).
+    pub fn set_agent_info(
+        &mut self,
+        info: std::collections::HashMap<SessionId, crate::agent_detect::AgentDisplay>,
+    ) {
+        self.agent_info = info;
     }
 
     /// 세션 표시 제목. 우선순위: ① 사용자 rename(기본 제목이 아니면) → 그대로,

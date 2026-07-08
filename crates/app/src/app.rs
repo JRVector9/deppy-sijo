@@ -414,6 +414,8 @@ pub struct App {
     agent_turn_done: std::collections::HashMap<runtime::SessionId, i64>,
     /// 완료/입력대기 주목(attention) 추적 — 미확인이면 레일 6px, 포커스 확인 시 해제.
     session_alerts: std::collections::HashMap<runtime::SessionId, SessionAlert>,
+    /// 세션별 현재 작업 폴더(감지 워커 lsof) — 행 1행 폴더명 + 워크스페이스명.
+    session_cwds: std::collections::HashMap<runtime::SessionId, String>,
     /// 복원용으로 로드한 (pane_id → 저장된 에이전트 세션). 워크스페이스 활성 시 로드.
     restore_agents: std::collections::HashMap<String, crate::storage::AgentSessionRow>,
     /// restore_agents를 로드한 워크스페이스 id (전환 시 재로드 판정).
@@ -547,6 +549,7 @@ impl App {
             agent_needs_input: std::collections::HashSet::new(),
             agent_turn_done: std::collections::HashMap::new(),
             session_alerts: std::collections::HashMap::new(),
+            session_cwds: std::collections::HashMap::new(),
             restore_agents: std::collections::HashMap::new(),
             restore_loaded_for: None,
             resumed_panes: std::collections::HashSet::new(),
@@ -701,14 +704,6 @@ impl App {
             .iter()
             .filter_map(|r| r.pid.map(|pid| (r.session, pid)))
             .collect();
-        // 포커스 세션의 셸 pid — 워커가 cwd(현재 작업 폴더)를 lsof로 얻어 워크스페이스
-        // 이름에 반영한다(2026-07-08).
-        let focused_pid = self
-            .active
-            .workspace_ui
-            .focused_session()
-            .and_then(|sid| sessions.iter().find(|(s, _)| *s == sid))
-            .map(|(_, pid)| *pid);
         // hook이 보고한 결정적 바인딩(활성 워크스페이스 것만) — 워커 탐색을 대체한다.
         // poll_agent_detect는 매 프레임 돌므로 DB 조회는 1초 스로틀 + 캐시.
         if self.last_hook_query.elapsed() >= std::time::Duration::from_secs(1) {
@@ -742,13 +737,12 @@ impl App {
                 self.agent_detect_epoch,
                 sessions,
                 self.hook_overrides.clone(),
-                focused_pid,
             );
         }
         // 결과를 논블로킹 드레인 — 최신 것만 취한다(epoch 불일치=전환 잔여는 폐기).
         let mut latest_bindings = None;
         let mut latest_activity = None;
-        let mut latest_cwd = None;
+        let mut latest_cwds = None;
         while let Ok(outcome) = self.agent_detect_rx.try_recv() {
             if outcome.epoch != self.agent_detect_epoch {
                 continue;
@@ -757,12 +751,26 @@ impl App {
             if outcome.bindings.is_some() {
                 latest_bindings = outcome.bindings;
             }
-            if outcome.focused_cwd.is_some() {
-                latest_cwd = outcome.focused_cwd;
+            if outcome.session_cwds.is_some() {
+                latest_cwds = outcome.session_cwds;
             }
         }
-        if let Some(cwd) = latest_cwd {
-            self.update_workspace_folder_name(&cwd);
+        if let Some(cwds) = latest_cwds {
+            self.session_cwds = cwds;
+            // 세션 행/pane 헤더 1행 폴더명 원천 — WorkspaceUi에 전달.
+            self.active
+                .workspace_ui
+                .set_session_cwds(self.session_cwds.clone());
+            // 포커스 세션 cwd → 워크스페이스 이름(현재 작업 폴더/프로젝트명).
+            if let Some(cwd) = self
+                .active
+                .workspace_ui
+                .focused_session()
+                .and_then(|sid| self.session_cwds.get(&sid))
+                .cloned()
+            {
+                self.update_workspace_folder_name(&cwd);
+            }
         }
         if let Some(activity) = latest_activity {
             self.agent_activity = activity;
@@ -1178,6 +1186,7 @@ impl App {
         self.agent_needs_input.clear();
         self.agent_turn_done.clear();
         self.session_alerts.clear();
+        self.session_cwds.clear();
         let _ = old
             .runtime
             .send_command(runtime::RuntimeCommand::SetWorkspaceState(

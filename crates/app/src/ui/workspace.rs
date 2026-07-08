@@ -47,6 +47,8 @@ pub struct WorkspaceUi {
     /// 활성 workspace의 프로젝트명(폴더명 ≈ 깃 레포명, 없으면 "~"). 세션 기본 제목이
     /// "셀 134" 대신 이걸로 표시된다. rename한 세션은 그대로 둔다. App이 매 프레임 세팅.
     project_name: Option<String>,
+    /// 세션별 현재 작업 폴더(App이 매 프레임 set) — 1행 제목 폴더명/프로젝트명 원천.
+    session_cwds: std::collections::HashMap<SessionId, String>,
     /// 진행 중인 백그라운드 클립보드 paste(이미지 PNG 인코딩을 UI 밖으로 — 2026-07-07).
     /// show()가 매 프레임 폴링해 완료 시 해당 세션에 삽입한다. 새 ⌘V는 이전 것을 대체.
     paste_task: Option<PendingPaste>,
@@ -104,6 +106,7 @@ impl WorkspaceUi {
             confirm_close: None,
             selection: None,
             project_name: None,
+            session_cwds: std::collections::HashMap::new(),
             paste_task: None,
             error: None,
         }
@@ -115,18 +118,35 @@ impl WorkspaceUi {
         self.project_name = name;
     }
 
+    /// 세션별 현재 작업 폴더를 세팅한다(App이 매 프레임, 감지 워커 lsof 결과).
+    pub fn set_session_cwds(&mut self, cwds: std::collections::HashMap<SessionId, String>) {
+        self.session_cwds = cwds;
+    }
+
     /// 세션 표시 제목. 우선순위: ① 사용자 rename(기본 제목이 아니면) → 그대로,
     /// ② OSC 0/2 동적 제목(프로그램이 설정, 예: cwd/명령) → 그 제목, ③ 프로젝트 폴더명(≈깃
     /// 레포명), ④ 원 표기. osc는 이 세션 터미널의 현재 OSC 제목.
+    /// 세션 1행 제목 우선순위(2026-07-08 사용자): 수동 rename > 현재 작업 폴더명(git
+    /// 프로젝트명) > OSC 타이틀 > "~". 폴더명이 기본이라 어느 폴더에서 작업 중인지 보인다.
     fn resolve_session_title(
         &self,
         raw: &str,
+        session: Option<SessionId>,
         osc: Option<&str>,
         catalog: &i18n::Catalog,
     ) -> String {
         if !is_default_session_title(raw) {
-            return display_pane_title(raw, catalog); // 사용자 rename — 그대로
+            return display_pane_title(raw, catalog); // 사용자 rename — 그대로 고정
         }
+        // 현재 작업 폴더명(git 프로젝트명) — 세션별 cwd(App이 매 프레임 set).
+        if let Some(n) = session
+            .and_then(|s| self.session_cwds.get(&s))
+            .and_then(|c| crate::agent_detect::project_display_name(c))
+            .filter(|t| !t.trim().is_empty())
+        {
+            return n;
+        }
+        // cwd 미탐지(pid 없음/lsof 지연) 폴백: OSC 타이틀 > 프로젝트명 > 기본.
         if let Some(t) = osc.map(str::trim).filter(|t| !t.is_empty()) {
             return t.to_owned();
         }
@@ -637,8 +657,12 @@ impl WorkspaceUi {
                     // 우측 컨트롤 폭 예약 — 긴 제목이 닫기/분할 버튼을 밀어내지
                     // 않게 truncate 최대폭 제한 (codex, 사이드바 헤더와 동일 패턴)
                     let osc = self.session_osc_title(pane.session_id);
-                    let pane_title =
-                        self.resolve_session_title(&pane.title, osc.as_deref(), catalog);
+                    let pane_title = self.resolve_session_title(
+                        &pane.title,
+                        pane.session_id,
+                        osc.as_deref(),
+                        catalog,
+                    );
                     let title_resp = ui
                         .scope(|ui| {
                             ui.set_max_width((ui.available_width() - 120.0).max(30.0));
@@ -1326,7 +1350,12 @@ impl WorkspaceUi {
                     tab: tab.id.clone(),
                     pane: pane.id.clone(),
                     session: pane.session_id,
-                    title: self.resolve_session_title(&pane.title, osc.as_deref(), catalog),
+                    title: self.resolve_session_title(
+                        &pane.title,
+                        pane.session_id,
+                        osc.as_deref(),
+                        catalog,
+                    ),
                     status,
                     summary,
                     focused: mux.focused_pane.as_ref() == Some(&pane.id),

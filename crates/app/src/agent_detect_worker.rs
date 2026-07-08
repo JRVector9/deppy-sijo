@@ -18,24 +18,16 @@ use crate::agent_transcript::AgentActivity;
 const BINDING_INTERVAL: Duration = Duration::from_millis(2500);
 const ACTIVITY_INTERVAL: Duration = Duration::from_millis(1500);
 
-/// App → 스레드 입력: (epoch, 활성 세션 pid 목록, hook 오버라이드, 포커스 세션 pid).
-/// 포커스 세션 pid는 워크스페이스 이름(현재 작업 폴더) 추적용. 최신 값 하나만 의미 있다.
-pub type DetectInput = Arc<
-    Mutex<(
-        u64,
-        Vec<(SessionId, u32)>,
-        HashMap<SessionId, AgentBinding>,
-        Option<u32>,
-    )>,
->;
+/// App → 스레드 입력: (epoch, 활성 세션 pid 목록, hook 오버라이드). 최신 값 하나만 의미 있다.
+pub type DetectInput = Arc<Mutex<(u64, Vec<(SessionId, u32)>, HashMap<SessionId, AgentBinding>)>>;
 
 /// 스레드 → App 결과. bindings는 바인딩 tier에서만 Some(활동 tier는 None), activity는 매번.
 pub struct DetectOutcome {
     pub epoch: u64,
     pub bindings: Option<HashMap<SessionId, AgentBinding>>,
     pub activity: HashMap<SessionId, AgentActivity>,
-    /// 포커스 세션의 현재 작업 폴더(바인딩 tier에서만 계산). None=미변경/미탐지.
-    pub focused_cwd: Option<String>,
+    /// 세션별 현재 작업 폴더(바인딩 tier에서만, 한 번의 lsof). 행 폴더명 + 워크스페이스명.
+    pub session_cwds: Option<HashMap<SessionId, String>>,
 }
 
 pub struct AgentDetectWorker {
@@ -55,7 +47,7 @@ fn compute_activity(
 impl AgentDetectWorker {
     /// 전용 스레드를 띄운다. 입력 핸들과 결과 수신 채널을 함께 돌려준다.
     pub fn spawn(ctx: egui::Context) -> (Self, DetectInput, mpsc::Receiver<DetectOutcome>) {
-        let input: DetectInput = Arc::new(Mutex::new((0, Vec::new(), HashMap::new(), None)));
+        let input: DetectInput = Arc::new(Mutex::new((0, Vec::new(), HashMap::new())));
         let (out_tx, out_rx) = mpsc::channel();
         let (stop_tx, stop_rx) = mpsc::channel();
         let input2 = input.clone();
@@ -82,7 +74,7 @@ impl AgentDetectWorker {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                     }
-                    let (epoch, sessions, overrides, focused_pid) = input2.lock().unwrap().clone();
+                    let (epoch, sessions, overrides) = input2.lock().unwrap().clone();
                     // 워크스페이스 전환(epoch 변경) 시 캐시를 비운다 — SessionId가 워커마다
                     // 1부터라 캐시가 다른 워크스페이스 세션과 충돌하는 것을 막는다.
                     if epoch != last_epoch {
@@ -95,13 +87,18 @@ impl AgentDetectWorker {
                         last_activity = Instant::now();
                         bindings = agent_detect::detect_cached(&sessions, &overrides, &mut cache);
                         let activity = compute_activity(&bindings);
-                        // 포커스 세션의 현재 작업 폴더(워크스페이스 이름 추적) — 바인딩 tier에서만.
-                        let focused_cwd = focused_pid.and_then(agent_detect::session_cwd);
+                        // 세션별 현재 작업 폴더 — 한 번의 lsof(행 폴더명 + 워크스페이스명).
+                        let pids: Vec<u32> = sessions.iter().map(|(_, p)| *p).collect();
+                        let cwd_by_pid = agent_detect::session_cwds(&pids);
+                        let session_cwds = sessions
+                            .iter()
+                            .filter_map(|(sid, pid)| cwd_by_pid.get(pid).map(|c| (*sid, c.clone())))
+                            .collect();
                         let sent = out_tx.send(DetectOutcome {
                             epoch,
                             bindings: Some(bindings.clone()),
                             activity,
-                            focused_cwd,
+                            session_cwds: Some(session_cwds),
                         });
                         if sent.is_err() {
                             break; // 수신측(App) drop → 종료
@@ -115,7 +112,7 @@ impl AgentDetectWorker {
                                 epoch,
                                 bindings: None,
                                 activity,
-                                focused_cwd: None,
+                                session_cwds: None,
                             })
                             .is_err()
                         {

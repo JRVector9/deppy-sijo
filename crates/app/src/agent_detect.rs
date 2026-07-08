@@ -444,9 +444,41 @@ fn codex_open_rollout(_pid: u32) -> Option<PathBuf> {
     None
 }
 
-/// 셸 pid의 현재 작업 디렉터리(워크스페이스 이름 추적용, 2026-07-08). off-thread 호출.
-pub(crate) fn session_cwd(shell_pid: u32) -> Option<String> {
-    process_cwd(shell_pid)
+/// 여러 셸 pid의 현재 작업 디렉터리를 **한 번의 lsof**로 얻는다(세션 행 폴더명 +
+/// 워크스페이스 이름 추적, 2026-07-08). off-thread 호출. `-p pid1,pid2,...`는 lsof가
+/// 지원하는 다중 pid 형식이라 세션 수만큼 프로세스를 띄우지 않는다.
+#[cfg(unix)]
+pub(crate) fn session_cwds(pids: &[u32]) -> HashMap<u32, String> {
+    let mut out = HashMap::new();
+    if pids.is_empty() {
+        return out;
+    }
+    let list = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let output = std::process::Command::new("lsof")
+        .args(["-a", "-d", "cwd", "-p", &list, "-Fpn"])
+        .output();
+    let Ok(output) = output else { return out };
+    // -Fpn: 'p<pid>' 라인 뒤에 그 프로세스의 'n<경로>' 라인이 온다.
+    let mut cur: Option<u32> = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(pid) = line.strip_prefix('p') {
+            cur = pid.parse().ok();
+        } else if let Some(path) = line.strip_prefix('n')
+            && let Some(pid) = cur
+        {
+            out.insert(pid, path.to_owned());
+        }
+    }
+    out
+}
+
+#[cfg(not(unix))]
+pub(crate) fn session_cwds(_pids: &[u32]) -> HashMap<u32, String> {
+    HashMap::new()
 }
 
 /// cwd → 워크스페이스 표시명. git 저장소 안이면 저장소 루트(.git 있는 폴더)명, 아니면

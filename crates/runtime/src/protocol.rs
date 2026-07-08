@@ -26,7 +26,7 @@ use crate::event::RuntimeEvent;
 pub(crate) const PROTO_MAGIC: [u8; 4] = *b"DPRT";
 /// 현재 프로토콜 버전. v3: SetSessionDefaultEnv 추가. v4: SetShellCwd 추가(끝에 append) —
 /// 구버전 피어가 미지의 variant를 스트림 중간에서 만나 오해독하는 대신 handshake에서 거부.
-pub(crate) const PROTO_VERSION: u16 = 4;
+pub(crate) const PROTO_VERSION: u16 = 5;
 
 /// delta viewport 스트리밍 기능 비트 (§3.1).
 pub(crate) const FEAT_DELTA_VIEWPORT: u32 = 1 << 0;

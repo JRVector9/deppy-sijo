@@ -43,6 +43,9 @@ pub struct PaneState {
     pub session_id: Option<String>,
     pub title: String,
     pub pane_kind: PaneKind,
+    /// 이 pane 세션의 마지막 작업 폴더(sessions.cwd JOIN) — 복원 시 그 폴더에서
+    /// 셸을 띄우기 위함(A안 2026-07-08). 세션 행이 없거나 미기록이면 None.
+    pub cwd: Option<String>,
 }
 
 /// sessions 테이블 한 행 (§11.1). created_at/updated_at은 SQLite가 기록한다.
@@ -309,8 +312,12 @@ fn load_panes(
     tab_id: &str,
     layout: &LayoutNode,
 ) -> anyhow::Result<Option<Vec<PaneState>>> {
-    let mut stmt =
-        conn.prepare("SELECT id, session_id, title, pane_kind FROM mux_panes WHERE tab_id = ?1")?;
+    // sessions.cwd를 JOIN — 복원 시 pane별 마지막 작업 폴더로 셸을 띄운다(A안).
+    let mut stmt = conn.prepare(
+        "SELECT p.id, p.session_id, p.title, p.pane_kind, s.cwd
+         FROM mux_panes p LEFT JOIN sessions s ON s.id = p.session_id
+         WHERE p.tab_id = ?1",
+    )?;
     let mut by_id: HashMap<String, PaneState> = stmt
         .query_map([tab_id], |row| {
             let id: String = row.get(0)?;
@@ -321,6 +328,7 @@ fn load_panes(
                     session_id: row.get(1)?,
                     title: row.get(2)?,
                     pane_kind: pane_kind_from_str(&row.get::<_, String>(3)?),
+                    cwd: row.get::<_, Option<String>>(4)?.filter(|c| !c.is_empty()),
                 },
             ))
         })?
@@ -527,6 +535,8 @@ pub(crate) mod tests {
                     session_id: (*id == &b).then(|| "sess-1".to_owned()),
                     title: "pane".into(),
                     pane_kind: PaneKind::Terminal,
+                    // sess-1 pane은 sessions.cwd("/tmp") JOIN 결과와 일치해야 round-trip
+                    cwd: (*id == &b).then(|| "/tmp".to_owned()),
                 })
                 .collect(),
         };
@@ -541,6 +551,7 @@ pub(crate) mod tests {
                 session_id: None,
                 title: "pane".into(),
                 pane_kind: PaneKind::Terminal,
+                cwd: None,
             }],
         };
         WindowState {

@@ -822,6 +822,19 @@ impl App {
         // WorkspaceUi. statuslines가 매 1s 갱신되므로 매 poll에서 병합해 최신을 반영한다.
         self.push_agent_display();
         if let Some(cwds) = latest_cwds {
+            // 변경된 세션 cwd만 워커 persist로 — 재시작 복원이 pane별 원래 폴더에서
+            // 셸을 띄우게 한다(A안 2026-07-08). 같은 값은 워커 쪽에서도 no-op이지만
+            // 여기서 걸러 wire 트래픽을 줄인다.
+            for (session, cwd) in &cwds {
+                if self.session_cwds.get(session) != Some(cwd) {
+                    let _ = self.active.runtime.send_command(
+                        runtime::RuntimeCommand::UpdateSessionCwd {
+                            session: *session,
+                            cwd: cwd.clone(),
+                        },
+                    );
+                }
+            }
             self.session_cwds = cwds;
             // 세션 행/pane 헤더 1행 폴더명 원천 — WorkspaceUi에 전달.
             self.active
@@ -2512,6 +2525,7 @@ impl eframe::App for App {
         let mut activity_action = None;
         let mut notif_click = None;
         let mut ws_switch: Option<String> = None;
+        let mut ws_create: Option<std::path::PathBuf> = None;
         let mut env_action: Option<ui::env_profiles::EnvAction> = None;
         // #3 워크스페이스 이름 편집 캡처 (클로저 밖에서 db/refresh 처리 — self 전체 &mut).
         let out = ui::settings::show(
@@ -2578,6 +2592,17 @@ impl eframe::App for App {
                         // 이름 지정(이름 변경) 기능은 제거(2026-07-08 사용자) — 워크스페이스
                         // 이름은 항상 프로젝트 폴더명(경로 미설정이면 "~"). 세부 구분은
                         // 세션(pane) 이름 직접 수정으로 한다.
+                        // 새 워크스페이스(B안 2026-07-08): 폴더 선택 → 프로젝트별 격리
+                        // 워크스페이스 생성 + 즉시 전환. 처리(생성/전환)는 창 밖에서.
+                        if ui
+                            .button(text.t("workspace.manager.new", &[]))
+                            .on_hover_text(text.t("workspace.manager.new_hint", &[]))
+                            .clicked()
+                            && let Some(dir) = rfd::FileDialog::new().pick_folder()
+                        {
+                            ws_create = Some(dir);
+                        }
+                        ui.add_space(6.0);
                         for ws in &self.workspaces {
                             ui.horizontal(|ui| {
                                 let display = Self::workspace_display_name(ws);
@@ -2630,10 +2655,41 @@ impl eframe::App for App {
                 self.refresh_workspaces();
             }
         }
+        // 새 워크스페이스 생성(B안) — 폴더명으로 만들고 path/앵커 저장 후 즉시 전환.
+        // 전환(switch_workspace → make_runtime)이 DB의 path/.env를 읽으므로 저장이 먼저다.
+        let mut ws_created = false;
+        if let Some(dir) = ws_create {
+            let name = crate::agent_detect::project_display_name(&dir.to_string_lossy())
+                .or_else(|| dir.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "workspace".to_owned());
+            match self.db.create_workspace(&name) {
+                Ok(new_id) => {
+                    let path_str = dir.to_string_lossy().into_owned();
+                    if let Err(e) = self.db.set_workspace_path(&new_id, &path_str) {
+                        tracing::warn!("새 워크스페이스 경로 저장 실패: {e:#}");
+                    }
+                    let anchor = Self::folder_anchor(&path_str);
+                    let _ = self.db.set_workspace_anchor(
+                        &new_id,
+                        anchor.map(|a| a.0),
+                        anchor.map(|a| a.1),
+                    );
+                    ws_switch = Some(new_id);
+                    ws_created = true;
+                }
+                Err(e) => tracing::warn!("워크스페이스 생성 실패: {e:#}"),
+            }
+        }
         if let Some(id) = ws_switch.filter(|id| *id != self.active.id) {
+            let switched_new = ws_created;
             {
                 self.switch_workspace(&id);
                 self.refresh_workspaces();
+            }
+            // 새로 만든 워크스페이스면 .env를 즉시 동기화 — 2s 폴링을 기다리지 않고
+            // 첫 셸부터 그 폴더의 env를 받게 한다(B안).
+            if switched_new {
+                self.sync_dotenv_env();
             }
         }
         match activity_action {

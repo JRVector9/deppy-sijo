@@ -126,6 +126,12 @@ pub enum RuntimeCommand {
     /// 이후 SpawnShell/SpawnAgent가 쓸 셸 cwd를 갱신한다(프로젝트 폴더 live 변경 —
     /// 2026-07-08). None이면 앱 cwd 상속. **wire 계약: variant는 끝에만 추가**.
     SetShellCwd(Option<std::path::PathBuf>),
+    /// 감지 워커(lsof)가 관측한 세션의 현재 작업 폴더 — persist에 기록해 재시작 복원이
+    /// pane별 원래 폴더에서 셸을 띄우게 한다(A안 2026-07-08). **variant는 끝에만 추가**.
+    UpdateSessionCwd {
+        session: SessionId,
+        cwd: String,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
@@ -180,6 +186,10 @@ impl std::fmt::Debug for RuntimeCommand {
             RuntimeCommand::SetShellCwd(cwd) => {
                 f.debug_tuple("SetShellCwd").field(&cwd.is_some()).finish()
             }
+            RuntimeCommand::UpdateSessionCwd { session, .. } => f
+                .debug_struct("UpdateSessionCwd")
+                .field("session", session)
+                .finish_non_exhaustive(),
             RuntimeCommand::WriteInput { session, bytes } => f
                 .debug_struct("WriteInput")
                 .field("session", session)

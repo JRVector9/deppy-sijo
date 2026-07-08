@@ -581,6 +581,7 @@ impl Worker {
                                 SHELL_TITLE_ID,
                                 &self.shell.program,
                                 &args,
+                                &Self::spawn_cwd_string(&self.shell.cwd),
                             );
                         }
                         // MuxUpdated → Spawned → Viewport(slot) 순서 —
@@ -687,6 +688,7 @@ impl Worker {
                                 AGENT_TITLE_ID,
                                 &spec.program,
                                 &spec.args,
+                                &Self::spawn_cwd_string(&spec.cwd),
                             );
                         }
                         self.emit_mux_snapshot();
@@ -712,6 +714,13 @@ impl Worker {
             RuntimeCommand::SetShellCwd(cwd) => {
                 // 프로젝트 폴더 live 변경 — 이후 SpawnShell/SpawnAgent가 이 cwd에서 뜬다.
                 self.shell.cwd = cwd;
+            }
+            RuntimeCommand::UpdateSessionCwd { session, cwd } => {
+                // 감지 워커가 관측한 live cd — persist에 기록해 재시작 복원이 pane별
+                // 원래 폴더에서 셸을 띄우게 한다(A안 2026-07-08).
+                if let Some(pipe) = &mut self.persist {
+                    pipe.update_session_cwd(session, &cwd);
+                }
             }
             RuntimeCommand::WriteInput { session, bytes } => {
                 if let Some(active) = self.sessions.get_mut(&session) {
@@ -927,6 +936,17 @@ impl Worker {
 
     /// DEPPY_SESSION_ID를 주입한 셸 spec — 이 셸에서 실행된 claude/codex의 hook이 세션을
     /// 식별해 needsInput을 보고한다(옵션2 hook 배선). spawn 시점에 이미 안다(pane 순서 무관).
+    /// spawn spec의 cwd를 persist 기록용 문자열로 — None이면 앱 프로세스 cwd.
+    fn spawn_cwd_string(cwd: &Option<std::path::PathBuf>) -> String {
+        cwd.as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            })
+    }
+
     fn shell_with_session(&self, id: SessionId) -> CommandSpec {
         let mut spec = self.shell.clone();
         spec.env
@@ -1029,10 +1049,36 @@ impl Worker {
         let mut pane = MuxPane::new(pane_state.id.clone(), pane_state.title.clone());
         let id = SessionId(self.next_id);
         self.next_id += 1;
+        // A안(2026-07-08): pane별 마지막 작업 폴더로 복원 — 저장 cwd가 유효 디렉터리면
+        // 그 폴더에서 셸을 띄우고, 그 폴더의 .env도 이 pane에만 주입한다(pane별 프로젝트).
+        // 무효/미기록이면 워크스페이스 cwd(기존 동작)로 폴백.
+        let mut spec = self.shell_with_session(id);
+        let restored_cwd = pane_state
+            .cwd
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_dir());
+        if let Some(dir) = &restored_cwd {
+            spec.cwd = Some(dir.clone());
+            let dotenv = dir.join(".env");
+            if let Ok(content) = std::fs::read_to_string(&dotenv) {
+                for (key, value) in crate::dotenv::parse_dotenv(&content) {
+                    // 워크스페이스 기본 env보다 뒤에 붙어 pane 폴더 값이 이긴다
+                    // (PTY env 적용은 순차라 마지막 값 승리). secret 값은 로그에
+                    // 새지 않게 redaction에 등록.
+                    if crate::dotenv::is_secret_key(&key) {
+                        self.redaction
+                            .register(&secret::SecretString::new(value.clone()));
+                    }
+                    spec.env.push((key, value));
+                }
+            }
+        }
+        let spawn_cwd = Self::spawn_cwd_string(&spec.cwd);
         match Session::spawn_with_spec(
             id,
             session::SessionKind::Shell,
-            &self.shell_with_session(id),
+            &spec,
             80,
             24,
             Self::RESTORE_SCROLLBACK_LINES,
@@ -1056,6 +1102,7 @@ impl Worker {
                         &pane_state.title,
                         &self.shell.program,
                         &args,
+                        &spawn_cwd,
                     );
                 }
             }
@@ -1107,6 +1154,7 @@ impl Worker {
                         SHELL_TITLE_ID,
                         &self.shell.program,
                         &args,
+                        &Self::spawn_cwd_string(&self.shell.cwd),
                     );
                 }
                 self.tab_counter += 1;

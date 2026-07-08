@@ -4,6 +4,7 @@
 
 mod client;
 mod command;
+pub mod dotenv;
 mod event;
 mod in_process;
 pub mod known_hosts;

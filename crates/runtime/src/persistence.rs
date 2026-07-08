@@ -112,6 +112,7 @@ impl PersistPipe {
         title: &str,
         command: &str,
         args: &[String],
+        cwd: &str,
     ) {
         let row = SessionRow {
             id: uuid::Uuid::new_v4().to_string(),
@@ -121,9 +122,9 @@ impl PersistPipe {
             title: title.to_owned(),
             command: command.to_owned(),
             args: args.to_vec(),
-            cwd: std::env::current_dir()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
+            // 실제 spawn 폴더 — 이전엔 앱 프로세스 current_dir("/")가 저장돼 복원이
+            // 원래 폴더를 못 찾았다(A안 2026-07-08). live cd는 update_session_cwd가 따라간다.
+            cwd: cwd.to_owned(),
             status: persist::SESSION_STATUS_RUNNING.to_owned(),
             last_log_offset: 0,
         };
@@ -131,6 +132,21 @@ impl PersistPipe {
             tracing::warn!("세션 영속 실패 (spawn): {e:#}");
         }
         self.rows.insert(session, row);
+    }
+
+    /// 세션의 현재 작업 폴더 갱신 — 감지 워커(lsof)가 관측한 live cd를 따라간다(A안).
+    /// 복원 시 이 값으로 그 폴더에서 셸을 다시 띄운다.
+    pub(crate) fn update_session_cwd(&mut self, session: SessionId, cwd: &str) {
+        let Some(row) = self.rows.get_mut(&session) else {
+            return;
+        };
+        if row.cwd == cwd {
+            return;
+        }
+        row.cwd = cwd.to_owned();
+        if let Err(e) = persist::upsert_session(&self.conn, row) {
+            tracing::warn!("세션 cwd 영속 실패: {e:#}");
+        }
     }
 
     /// 세션 종료 기록 — spawn 때 저장한 행의 status만 바꿔 다시 쓴다.
@@ -228,6 +244,7 @@ impl PersistPipe {
                                 .and_then(|s| self.rows.get(&s))
                                 .map(|row| row.id.clone()),
                             title: pane.title.clone(),
+                            cwd: None, // 저장 경로는 sessions 테이블이 원천 — 여기선 불필요
                             pane_kind: pane.pane_kind,
                         })
                         .collect(),
@@ -282,7 +299,7 @@ mod tests {
         })
         .unwrap();
         let session = SessionId(1);
-        pipe.session_spawned(session, "shell", None, "shell", "/bin/sh", &[]);
+        pipe.session_spawned(session, "shell", None, "shell", "/bin/sh", &[], "/tmp");
         pipe.session_status(session, session::SessionStatus::Waiting);
         pipe.session_status(session, session::SessionStatus::Done);
         pipe.session_log_offset(session, 12);
@@ -334,7 +351,7 @@ mod tests {
         )
         .unwrap();
         let session = SessionId(1);
-        pipe.session_spawned(session, "shell", None, "shell", "/bin/sh", &[]);
+        pipe.session_spawned(session, "shell", None, "shell", "/bin/sh", &[], "/tmp");
         pipe.session_status(session, session::SessionStatus::Done);
         pipe.session_log_offset(session, 64);
         // flush_async_writes 호출 없이 즉시 drop — 타이머가 안 도니 오직 drop만 flush 가능.

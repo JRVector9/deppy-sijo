@@ -5,6 +5,7 @@ pub mod clipboard_image;
 pub mod connectors;
 pub mod credentials;
 pub mod env_profiles;
+pub mod env_project_list;
 pub mod file_tree;
 pub mod notifications;
 pub mod settings;

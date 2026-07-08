@@ -155,6 +155,229 @@ impl ui::credentials::CredentialService for AppCredentialService<'_> {
     }
 }
 
+#[derive(Default)]
+struct EnvApiProjectEditState {
+    name_workspace_id: Option<String>,
+    name_buffer: String,
+    path_workspace_id: Option<String>,
+    path_buffer: String,
+}
+
+fn render_env_api_project_header(
+    ui: &mut egui::Ui,
+    project: Option<&ui::env_project_list::EnvProjectRow>,
+    env_action: &mut Option<ui::env_profiles::EnvAction>,
+    workspace_rename: &mut Option<String>,
+    edit: &mut EnvApiProjectEditState,
+    catalog: &i18n::Catalog,
+) {
+    let project_id = project.map(|project| project.id.as_str()).unwrap_or("");
+    let name = project
+        .map(|project| project.name.as_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("~");
+    let path = project
+        .map(|project| project.path.as_str())
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or("");
+    let path_text = if path.is_empty() {
+        catalog.t("workspace.manager.path_unset", &[])
+    } else {
+        path.to_owned()
+    };
+
+    const HEADER_H: f32 = 104.0;
+    const LABEL_W: f32 = 82.0;
+    const BUTTON_H: f32 = 28.0;
+
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), HEADER_H),
+        egui::Sense::hover(),
+    );
+    let label_x = rect.left();
+    let value_x = rect.left() + LABEL_W;
+    let row1_y = rect.top() + 24.0;
+    let row2_y = rect.top() + 58.0;
+    let buttons_fit_top = rect.width() >= 500.0;
+    let buttons_left = if buttons_fit_top {
+        rect.right() - 160.0
+    } else {
+        rect.left()
+    };
+    let buttons_top = if buttons_fit_top {
+        rect.top() + 8.0
+    } else {
+        rect.bottom() - BUTTON_H - 8.0
+    };
+    let text_right = if buttons_fit_top {
+        (buttons_left - 12.0).max(value_x + 80.0)
+    } else {
+        rect.right()
+    };
+    let name_rect = egui::Rect::from_min_max(
+        egui::pos2(value_x, rect.top() + 9.0),
+        egui::pos2(text_right.max(value_x + 120.0), rect.top() + 39.0),
+    );
+    let path_rect = egui::Rect::from_min_max(
+        egui::pos2(value_x, rect.top() + 43.0),
+        egui::pos2(rect.right(), rect.top() + 73.0),
+    );
+
+    ui.painter().text(
+        egui::pos2(label_x, row1_y),
+        egui::Align2::LEFT_CENTER,
+        catalog.t("common.name", &[]),
+        egui::FontId::proportional(13.0),
+        ui.visuals().weak_text_color(),
+    );
+    if edit.name_workspace_id.as_deref() == Some(project_id) {
+        let response = ui.put(
+            name_rect,
+            egui::TextEdit::singleline(&mut edit.name_buffer)
+                .id_source(("env_api_project_name", project_id))
+                .desired_width(name_rect.width()),
+        );
+        let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        let commit = response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if escape && response.has_focus() {
+            edit.name_workspace_id = None;
+            edit.name_buffer.clear();
+        } else if commit {
+            let next = edit.name_buffer.trim();
+            if !next.is_empty() && next != name {
+                *workspace_rename = Some(next.to_owned());
+            }
+            edit.name_workspace_id = None;
+            edit.name_buffer.clear();
+        }
+    } else {
+        let response = ui
+            .interact(
+                name_rect,
+                ui.id().with(("env_api_project_name", project_id)),
+                egui::Sense::click(),
+            )
+            .on_hover_cursor(egui::CursorIcon::Text);
+        if response.hovered() {
+            ui.painter()
+                .rect_filled(name_rect, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
+            ui.painter().rect_stroke(
+                name_rect,
+                0.0,
+                ui.visuals().widgets.noninteractive.bg_stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        ui.painter().with_clip_rect(name_rect).text(
+            egui::pos2(value_x, row1_y),
+            egui::Align2::LEFT_CENTER,
+            name,
+            egui::FontId::proportional(15.0),
+            ui.visuals().text_color(),
+        );
+        if response.double_clicked() && !project_id.is_empty() {
+            edit.name_workspace_id = Some(project_id.to_owned());
+            edit.name_buffer = name.to_owned();
+            ui.memory_mut(|mem| {
+                mem.request_focus(ui.id().with(("env_api_project_name", project_id)));
+            });
+        }
+    }
+
+    ui.painter().text(
+        egui::pos2(label_x, row2_y),
+        egui::Align2::LEFT_CENTER,
+        catalog.t("workspace.manager.path", &[]),
+        egui::FontId::proportional(13.0),
+        ui.visuals().weak_text_color(),
+    );
+    if edit.path_workspace_id.as_deref() == Some(project_id) {
+        let response = ui.put(
+            path_rect,
+            egui::TextEdit::singleline(&mut edit.path_buffer)
+                .id_source(("env_api_project_path", project_id))
+                .desired_width(path_rect.width()),
+        );
+        let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        let commit = response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if escape && response.has_focus() {
+            edit.path_workspace_id = None;
+            edit.path_buffer.clear();
+        } else if commit {
+            let next = edit.path_buffer.trim();
+            if next != path {
+                *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(
+                    std::path::PathBuf::from(next),
+                ));
+            }
+            edit.path_workspace_id = None;
+            edit.path_buffer.clear();
+        }
+    } else {
+        let response = ui
+            .interact(
+                path_rect,
+                ui.id().with(("env_api_project_path", project_id)),
+                egui::Sense::click(),
+            )
+            .on_hover_cursor(egui::CursorIcon::Text);
+        if response.hovered() {
+            ui.painter()
+                .rect_filled(path_rect, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
+            ui.painter().rect_stroke(
+                path_rect,
+                0.0,
+                ui.visuals().widgets.noninteractive.bg_stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        ui.painter().with_clip_rect(path_rect).text(
+            egui::pos2(value_x, row2_y),
+            egui::Align2::LEFT_CENTER,
+            &path_text,
+            egui::FontId::proportional(14.0),
+            ui.visuals().text_color(),
+        );
+        if response.double_clicked() && !project_id.is_empty() {
+            edit.path_workspace_id = Some(project_id.to_owned());
+            edit.path_buffer = path.to_owned();
+            ui.memory_mut(|mem| {
+                mem.request_focus(ui.id().with(("env_api_project_path", project_id)));
+            });
+        }
+    }
+
+    let choose_text = catalog.t("env.project_folder.choose", &[]);
+    let clear_text = catalog.t("env.project_folder.clear", &[]);
+    let choose_rect = egui::Rect::from_min_size(
+        egui::pos2(buttons_left + 64.0, buttons_top),
+        egui::vec2(96.0, BUTTON_H),
+    );
+    let clear_rect = egui::Rect::from_min_size(
+        egui::pos2(buttons_left, buttons_top),
+        egui::vec2(56.0, BUTTON_H),
+    );
+    if ui
+        .put(choose_rect, egui::Button::new(choose_text))
+        .clicked()
+        && let Some(dir) = rfd::FileDialog::new().pick_folder()
+    {
+        *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(dir));
+    }
+    if !path.is_empty() && ui.put(clear_rect, egui::Button::new(clear_text)).clicked() {
+        *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(
+            std::path::PathBuf::new(),
+        ));
+    }
+
+    let y = ui.painter().round_to_pixel_center(rect.bottom());
+    ui.painter().hline(
+        rect.x_range(),
+        y,
+        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+    );
+}
+
 struct AppOAuthCredentialStore<'a> {
     secret_store: &'a dyn secret::SecretStore,
     redaction: &'a secret::RedactionService,
@@ -364,6 +587,7 @@ pub struct App {
     /// 통합 설정 창의 선택된 카테고리.
     settings_category: ui::settings::Category,
     settings_search: String,
+    env_api_project_edit: EnvApiProjectEditState,
     db: Db,
     secret_store: KeyringSecretStore,
     agents_ui: ui::agents::AgentsUi,
@@ -534,6 +758,7 @@ impl App {
             settings_open: false,
             settings_category: ui::settings::Category::default(),
             settings_search: String::new(),
+            env_api_project_edit: EnvApiProjectEditState::default(),
             db,
             secret_store: KeyringSecretStore,
             agents_ui: ui::agents::AgentsUi::new(),
@@ -1632,6 +1857,49 @@ impl App {
         "~".to_owned()
     }
 
+    fn env_api_project_rows(&self) -> Vec<ui::env_project_list::EnvProjectRow> {
+        self.workspaces
+            .iter()
+            .map(|row| {
+                let path = self
+                    .db
+                    .workspace_path(&row.id)
+                    .ok()
+                    .flatten()
+                    .filter(|path| !path.trim().is_empty())
+                    .unwrap_or_else(|| row.path.clone());
+                let (env_count, key_count) = self
+                    .db
+                    .list_env_profiles(&row.id)
+                    .map(|profiles| {
+                        let mut env_count = 0usize;
+                        let mut key_count = 0usize;
+                        for vars in profiles
+                            .iter()
+                            .filter_map(|profile| self.db.list_env_vars(&profile.id).ok())
+                        {
+                            for var in vars {
+                                if ui::env_profiles::is_api_like_env_key(&var.key, &var.value) {
+                                    key_count += 1;
+                                } else {
+                                    env_count += 1;
+                                }
+                            }
+                        }
+                        (env_count, key_count)
+                    })
+                    .unwrap_or((0, 0));
+                ui::env_project_list::EnvProjectRow {
+                    id: row.id.clone(),
+                    name: Self::workspace_display_name(row),
+                    path,
+                    env_count,
+                    key_count,
+                }
+            })
+            .collect()
+    }
+
     /// 포커스 세션 cwd → 워크스페이스 이름(현재 작업 폴더/프로젝트명)을 갱신·영속한다.
     /// 변경 시에만 DB에 쓴다(churn 방지). 감지 실패(빈 이름)면 이전 값을 유지한다 —
     /// 포커스가 다른 pane으로 옮겨가도 폴더명이 "~"로 리셋되지 않게(사용자 요청).
@@ -2551,11 +2819,22 @@ impl eframe::App for App {
         };
         let term_cfg = self.config.terminal.clone();
         let wsid = self.active.id.clone();
+        let env_api_projects = if self.settings_open {
+            self.env_api_project_rows()
+        } else {
+            Vec::new()
+        };
+        let active_env_api_project = env_api_projects
+            .iter()
+            .find(|project| project.id == wsid)
+            .cloned();
         let db_path = self.db_path.clone();
         let mut activity_action = None;
         let mut notif_click = None;
         let mut ws_switch: Option<String> = None;
         let mut ws_create: Option<std::path::PathBuf> = None;
+        let mut ws_delete: Option<String> = None;
+        let mut workspace_rename: Option<String> = None;
         let mut env_action: Option<ui::env_profiles::EnvAction> = None;
         // #3 워크스페이스 이름 편집 캡처 (클로저 밖에서 db/refresh 처리 — self 전체 &mut).
         let out = ui::settings::show(
@@ -2595,15 +2874,78 @@ impl eframe::App for App {
                         );
                     }
                     C::Environment => {
-                        match self
-                            .env_profiles_ui
-                            .contents(ui, &mut self.db, &wsid, &text)
-                        {
-                            Ok(a) => env_action = a,
-                            Err(e) => {
-                                ui.colored_label(ui.visuals().error_fg_color, format!("{e:#}"));
+                        let panel_bg = ui::env_project_list::panel_bg(ui);
+                        ui.painter().rect_filled(ui.clip_rect(), 0.0, panel_bg);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            ui.set_height(ui.available_height());
+                            let project_list_style =
+                                ui::env_project_list::EnvProjectListStyle::for_available_width(
+                                    ui.available_width(),
+                                );
+                            match ui::env_project_list::render_with_style(
+                                ui,
+                                &env_api_projects,
+                                &wsid,
+                                &text,
+                                &project_list_style,
+                            ) {
+                                ui::env_project_list::EnvProjectListAction::None => {}
+                                ui::env_project_list::EnvProjectListAction::Select(id) => {
+                                    ws_switch = Some(id);
+                                }
+                                ui::env_project_list::EnvProjectListAction::AddRequested => {
+                                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                        ws_create = Some(dir);
+                                    }
+                                }
+                                ui::env_project_list::EnvProjectListAction::DeleteRequested(id) => {
+                                    ws_delete = Some(id);
+                                }
                             }
-                        }
+                            ui.separator();
+                            ui.add_space(10.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt("env_api_detail_scroll")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.add_space(12.0);
+                                    render_env_api_project_header(
+                                        ui,
+                                        active_env_api_project.as_ref(),
+                                        &mut env_action,
+                                        &mut workspace_rename,
+                                        &mut self.env_api_project_edit,
+                                        &text,
+                                    );
+                                    ui.add_space(18.0);
+                                    match self.env_profiles_ui.contents_compact(
+                                        ui,
+                                        &mut self.db,
+                                        &wsid,
+                                        &text,
+                                    ) {
+                                        Ok(a) => {
+                                            if a.is_some() {
+                                                env_action = a;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            ui.colored_label(
+                                                ui.visuals().error_fg_color,
+                                                format!("{e:#}"),
+                                            );
+                                        }
+                                    }
+                                    let svc = AppCredentialService {
+                                        db: &self.db,
+                                        secret_store: &self.secret_store,
+                                        redaction: &self.redaction,
+                                    };
+                                    self.credentials_ui.contents_compact(ui, &svc, &text);
+                                });
+                        });
                     }
                     C::Agents => {
                         self.agents_ui.contents(
@@ -2660,6 +3002,16 @@ impl eframe::App for App {
             },
         );
         // 관리/모니터 액션 처리 (클로저 밖 — self 전체 &mut 필요한 것들)
+        if let Some(name) = workspace_rename {
+            let name = name.trim();
+            if !name.is_empty() {
+                if let Err(e) = self.db.rename_workspace(&self.active.id, name) {
+                    tracing::warn!("워크스페이스 이름 저장 실패: {e:#}");
+                } else {
+                    self.refresh_workspaces();
+                }
+            }
+        }
         // 환경 메뉴에서 프로젝트 폴더 설정 → workspace path 저장 + .env 재동기화 + 파일트리 루트.
         if let Some(ui::env_profiles::EnvAction::SetProjectPath(path)) = env_action {
             let path_str = path.to_string_lossy().into_owned();
@@ -2683,6 +3035,26 @@ impl eframe::App for App {
                 }
                 self.refresh_file_tree_root();
                 self.refresh_workspaces();
+            }
+        }
+        if let Some(delete_id) = ws_delete {
+            if delete_id == self.active.id {
+                tracing::info!(
+                    "활성 워크스페이스 삭제 요청 무시 — 다른 워크스페이스로 전환 후 삭제 필요"
+                );
+            } else if self.workspaces.len() <= 1 {
+                tracing::info!("마지막 워크스페이스 삭제 요청 무시");
+            } else {
+                self.join_pending_shutdown(&delete_id);
+                if let Some(mut runtime) = self.warm.remove(&delete_id) {
+                    runtime.runtime.shutdown();
+                }
+                self.warm_order.retain(|id| id != &delete_id);
+                self.notifications_ui.prune_workspace(&delete_id);
+                match self.db.delete_workspace(&delete_id) {
+                    Ok(()) => self.refresh_workspaces(),
+                    Err(e) => tracing::warn!("워크스페이스 삭제 실패: {e:#}"),
+                }
             }
         }
         // 새 워크스페이스 생성(B안) — 폴더명으로 만들고 path/앵커 저장 후 즉시 전환.

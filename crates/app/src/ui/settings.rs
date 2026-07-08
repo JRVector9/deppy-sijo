@@ -86,99 +86,83 @@ pub fn show(
         };
     }
 
-    let win_frame = egui::Frame::window(&ctx.global_style()).inner_margin(egui::Margin::ZERO);
-    egui::Window::new(catalog.t("settings.title", &[]))
-        .title_bar(false) // 기본 타이틀바(높음) 제거 — 컴팩트 커스텀 행 사용 (목업 §설정)
-        .frame(win_frame) // 여백 0 — 타이틀 라인이 창 끝까지(#6), 좌측 이중 여백 제거(#1)
-        .collapsible(false)
-        .default_pos([140.0, 90.0])
-        .default_size([1000.0, 640.0])
-        .min_size([720.0, 460.0])
-        .show(ctx, |ui| {
-            // 컴팩트 타이틀 행 (세로 30px) — 드래그 이동 + × 닫기
-            // 타이틀 행: 드래그는 잡지 않는다 — StartDrag는 OS 창 전체를 움직여
-            // 설정 창이 못 움직였다(#77). 빈 영역 드래그는 egui Window(Area) 이동.
-            let (bar, _) = ui
-                .allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
-            ui.painter().text(
-                bar.center(),
-                egui::Align2::CENTER_CENTER,
-                catalog.t("settings.title", &[]),
-                egui::FontId::proportional(13.5),
-                ui.visuals().weak_text_color(),
-            );
-            let x_rect = egui::Rect::from_center_size(
-                egui::pos2(bar.right() - 18.0, bar.center().y),
-                egui::vec2(24.0, 24.0),
-            );
-            let xr = ui.interact(x_rect, ui.id().with("set_close"), egui::Sense::click());
-            ui.painter().text(
-                x_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "×",
-                egui::FontId::proportional(16.0),
-                if xr.hovered() {
-                    ui.visuals().text_color()
-                } else {
-                    ui.visuals().weak_text_color()
-                },
-            );
-            if xr.clicked() {
+    // 별도 OS 창(immediate viewport) — 앱 창 안에 갇혀 있던 egui::Window를 네이티브 창으로
+    // 전환해 메인 창 밖으로도 옮길 수 있게 한다(사용자 요청 2026-07-08). 타이틀/닫기는
+    // 네이티브 타이틀바가 담당하므로 기존 커스텀 30px 타이틀 행은 제거.
+    // 멀티뷰포트 미지원 백엔드에서는 egui가 자동으로 임베디드 창으로 폴백한다.
+    let win_frame = egui::Frame::default()
+        .inner_margin(egui::Margin::ZERO)
+        .fill(ctx.global_style().visuals.window_fill);
+    ctx.show_viewport_immediate(
+        egui::ViewportId::from_hash_of("deppy_settings_window"),
+        egui::ViewportBuilder::default()
+            .with_title(catalog.t("settings.title", &[]))
+            .with_inner_size([1000.0, 640.0])
+            .with_min_inner_size([720.0, 460.0]),
+        // egui 0.35 immediate viewport 콜백은 &mut Ui(뷰포트 루트)를 받는다 — Context 아님.
+        // Ui::input은 현재(자식) 뷰포트의 입력을 읽으므로 close_requested가 이 창의 것.
+        |root, _class| {
+            if root.input(|i| i.viewport().close_requested()) {
                 *open = false;
             }
-            ui.painter().hline(
-                bar.x_range(),
-                bar.bottom(),
-                ui.visuals().widgets.noninteractive.bg_stroke,
-            );
-
-            let nav_frame = egui::Frame::default()
-                .fill(ui.visuals().faint_bg_color) // panel2 — 우측 폼과 톤 분리 (#72)
-                // 좌측 여백 축소(#1) — 창 여백 0과 합쳐 네비가 창 왼쪽에 밀착.
-                .inner_margin(egui::Margin {
-                    left: 8,
-                    right: 8,
-                    top: 10,
-                    bottom: 10,
-                });
-            egui::Panel::left("settings_nav")
-                .resizable(false)
-                .exact_size(216.0)
-                .frame(nav_frame)
-                .show(ui, |ui| {
-                    nav(ui, category, notif_unread, search_query, catalog);
-                });
-            egui::CentralPanel::default().show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.add_space(4.0);
-                        match *category {
-                            Category::General => general_page(ui, config, &mut changed, catalog),
-                            Category::Language => language_page(ui, config, &mut changed, catalog),
-                            Category::Terminal => terminal_page(ui, config, &mut changed, catalog),
-                            Category::Performance => {
-                                performance_page(ui, config, &mut changed, catalog)
-                            }
-                            Category::RemoteTls => remote_page(
-                                ui,
-                                config,
-                                remote,
-                                reveal_token,
-                                &mut changed,
-                                &mut remote_action,
-                                catalog,
-                            ),
-                            // 관리/모니터 7개 — App이 각 패널 contents() 렌더.
-                            // 버튼·입력을 디자인 룰(docs/ui-components.md)로 통일한 뒤 렌더.
-                            other => {
-                                apply_component_style(ui);
-                                render_management(ui, other)
-                            }
-                        }
+            egui::CentralPanel::default()
+                .frame(win_frame)
+                .show(root, |ui| {
+                    let nav_frame = egui::Frame::default()
+                        .fill(ui.visuals().faint_bg_color) // panel2 — 우측 폼과 톤 분리 (#72)
+                        // 좌측 여백 축소(#1) — 창 여백 0과 합쳐 네비가 창 왼쪽에 밀착.
+                        .inner_margin(egui::Margin {
+                            left: 8,
+                            right: 8,
+                            top: 10,
+                            bottom: 10,
+                        });
+                    egui::Panel::left("settings_nav")
+                        .resizable(false)
+                        .exact_size(216.0)
+                        .frame(nav_frame)
+                        .show(ui, |ui| {
+                            nav(ui, category, notif_unread, search_query, catalog);
+                        });
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.add_space(4.0);
+                                match *category {
+                                    Category::General => {
+                                        general_page(ui, config, &mut changed, catalog)
+                                    }
+                                    Category::Language => {
+                                        language_page(ui, config, &mut changed, catalog)
+                                    }
+                                    Category::Terminal => {
+                                        terminal_page(ui, config, &mut changed, catalog)
+                                    }
+                                    Category::Performance => {
+                                        performance_page(ui, config, &mut changed, catalog)
+                                    }
+                                    Category::RemoteTls => remote_page(
+                                        ui,
+                                        config,
+                                        remote,
+                                        reveal_token,
+                                        &mut changed,
+                                        &mut remote_action,
+                                        catalog,
+                                    ),
+                                    // 관리/모니터 7개 — App이 각 패널 contents() 렌더.
+                                    // 버튼·입력을 디자인 룰(docs/ui-components.md)로 통일한 뒤 렌더.
+                                    other => {
+                                        apply_component_style(ui);
+                                        render_management(ui, other)
+                                    }
+                                }
+                            });
                     });
-            });
-        });
+                });
+        },
+    );
 
     SettingsOutput {
         config_changed: changed,

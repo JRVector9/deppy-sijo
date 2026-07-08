@@ -10,6 +10,23 @@ pub struct ActivityWorkspaceRow {
     pub auto_suspend_remaining_secs: Option<u64>,
     pub resource: Option<runtime::ProcessResourceSnapshot>,
     pub session_resources: Vec<runtime::SessionResourceUsage>,
+    /// pane(세션)별 모니터링 서브행 — 워크스페이스 행 아래 들여쓰기로 렌더(2026-07-08).
+    pub sessions: Vec<ActivitySessionRow>,
+}
+
+/// pane(세션) 하나의 모니터링 행. 활성 워크스페이스는 제목·에이전트·상태까지,
+/// warm은 제목·자원만 채워진다(감지 워커가 활성에서만 돈다).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActivitySessionRow {
+    pub name: String,
+    /// "Codex · gpt-5.5 · xhigh" — 에이전트가 아니면 None(셸).
+    pub agent_line: Option<String>,
+    /// "실행 중 · ctx 69%" — warm/셸은 None.
+    pub status_line: Option<String>,
+    /// 세션별 자원 샘플 (자식 프로세스 트리 합산).
+    pub resource: Option<runtime::SessionResourceUsage>,
+    /// 세션별 마지막 입력 backpressure 신호.
+    pub pressure: Option<runtime::PtyInputPressure>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +38,8 @@ pub enum ActivityWorkspaceState {
 
 pub enum ActivityAction {
     SwitchWorkspace(String),
+    /// 모든 워크스페이스(활성+warm)의 터미널 렌더 캐시 비우기 — 작업/프로세스에 무해.
+    ClearRenderCaches,
 }
 
 pub struct ActivityUi {}
@@ -42,6 +61,16 @@ impl ActivityUi {
             ui.label(catalog.t("activity.empty", &[]));
             return action;
         }
+        // 전체 렌더 캐시 비우기 — 안전한 것(렌더 캐시)만 담는다. 절전/스크롤백은
+        // 작업·기록에 영향이 있어 이 버튼에 포함하지 않는다(2026-07-08 검토).
+        if ui
+            .button(catalog.t("activity.clear_caches", &[]))
+            .on_hover_text(catalog.t("activity.clear_caches_hint", &[]))
+            .clicked()
+        {
+            action = Some(ActivityAction::ClearRenderCaches);
+        }
+        ui.add_space(6.0);
         egui::Grid::new("activity_workspace_grid")
             .num_columns(6)
             .striped(true)
@@ -77,10 +106,51 @@ impl ActivityUi {
                         ui.weak(catalog.t("activity.current", &[]));
                     }
                     ui.end_row();
+
+                    // pane(세션)별 서브행 — 이름 들여쓰기, 상태/에이전트/압력/자원을 각 열에.
+                    for s in &row.sessions {
+                        ui.weak(format!("└ {}", s.name));
+                        ui.label(s.status_line.as_deref().unwrap_or(""));
+                        ui.label(s.agent_line.as_deref().unwrap_or(""));
+                        ui.horizontal(|ui| {
+                            if let Some(pressure) = &s.pressure {
+                                input_pressure_badge(ui, catalog, pressure);
+                            }
+                        });
+                        ui.label(session_resource_text(catalog, s.resource.as_ref()));
+                        ui.label("");
+                        ui.end_row();
+                    }
                 }
             });
         action
     }
+}
+
+/// 세션 서브행의 자원 셀 — 세션 트리(셸+자손) 합산 CPU/RSS(+프로세스 수, 높음 표시).
+fn session_resource_text(
+    catalog: &i18n::Catalog,
+    usage: Option<&runtime::SessionResourceUsage>,
+) -> String {
+    let Some(u) = usage else {
+        return String::new();
+    };
+    let cpu = u
+        .cpu_percent
+        .map(|v| format!("{v:.1}%"))
+        .unwrap_or_else(|| catalog.t("activity.cpu_pending", &[]));
+    let mut label = catalog.t(
+        "activity.resource_label",
+        &[("cpu", &cpu), ("rss", &format_bytes(u.rss_bytes))],
+    );
+    if u.process_count > 1 {
+        label.push_str(&format!(" · {}p", u.process_count));
+    }
+    if u.high_cpu || u.high_rss {
+        label.push_str(" · ");
+        label.push_str(&catalog.t("activity.resource_high", &[]));
+    }
+    label
 }
 
 fn state_label(ui: &mut egui::Ui, catalog: &i18n::Catalog, row: &ActivityWorkspaceRow) {

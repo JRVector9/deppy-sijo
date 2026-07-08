@@ -232,6 +232,9 @@ struct WorkspaceRuntime {
     session_resource_usage: Vec<runtime::SessionResourceUsage>,
     /// 마지막 PTY input pressure signal. UI는 런타임 이벤트만 보관한다.
     input_pressure: Option<runtime::PtyInputPressure>,
+    /// 세션별 마지막 input pressure — 활동 뷰 pane 서브행용(2026-07-08). exit 시 제거.
+    session_input_pressure:
+        std::collections::HashMap<runtime::SessionId, runtime::PtyInputPressure>,
     /// Warm으로 내려간 시각. 일정 시간 이후 자동 Suspended(워커 shutdown)로 내린다.
     backgrounded_at: Option<std::time::Instant>,
     /// live 세션 추적 (suspend 보호 — 이벤트 스트림에서 갱신).
@@ -694,6 +697,7 @@ impl App {
             resource_usage: None,
             session_resource_usage: Vec::new(),
             input_pressure: None,
+            session_input_pressure: std::collections::HashMap::new(),
             backgrounded_at: None,
             live: LiveSessionTracker::default(),
             created: std::time::Instant::now(),
@@ -1680,26 +1684,45 @@ impl App {
             .iter()
             .map(|ws| {
                 if ws.id == self.active.id {
+                    // pane별 서브행 — 사이드바 3줄 행과 같은 원천(session_entries)에
+                    // 세션별 자원/입력압력을 붙인다(2026-07-08).
+                    let entries = self.active.workspace_ui.session_entries(
+                        &self.i18n,
+                        &self.agent_activity,
+                        &self.agent_needs_input,
+                        &self.agent_turn_done,
+                    );
+                    let sessions = entries
+                        .iter()
+                        .map(|e| ui::activity::ActivitySessionRow {
+                            name: e.title.clone(),
+                            agent_line: e.agent_line.clone(),
+                            status_line: e.status_line.clone(),
+                            resource: e.session.and_then(|s| {
+                                self.active
+                                    .session_resource_usage
+                                    .iter()
+                                    .find(|u| u.session == s)
+                                    .cloned()
+                            }),
+                            pressure: e
+                                .session
+                                .and_then(|s| self.active.session_input_pressure.get(&s))
+                                .cloned(),
+                        })
+                        .collect::<Vec<_>>();
                     return ui::activity::ActivityWorkspaceRow {
                         id: ws.id.clone(),
                         name: Self::workspace_display_name(ws),
                         state: ui::activity::ActivityWorkspaceState::Active,
-                        session_count: self
-                            .active
-                            .workspace_ui
-                            .session_entries(
-                                &self.i18n,
-                                &self.agent_activity,
-                                &self.agent_needs_input,
-                                &self.agent_turn_done,
-                            )
-                            .len(),
+                        session_count: entries.len(),
                         pending_events: self.active.pending_events.len(),
                         input_pressure: self.active.input_pressure.clone(),
                         backgrounded_for_secs: None,
                         auto_suspend_remaining_secs: None,
                         resource: self.active.resource_usage,
                         session_resources: self.active.session_resource_usage.clone(),
+                        sessions,
                     };
                 }
                 if let Some(rt) = self.warm.get(&ws.id) {
@@ -1711,6 +1734,23 @@ impl App {
                             .as_secs()
                             .saturating_sub(duration.as_secs())
                     });
+                    // warm은 감지 워커가 안 돌아 제목·자원·압력만 채운다 (id 순 정렬).
+                    let mut ids: Vec<_> = rt.session_titles.keys().copied().collect();
+                    ids.sort_by_key(|s| s.0);
+                    let sessions = ids
+                        .iter()
+                        .map(|s| ui::activity::ActivitySessionRow {
+                            name: rt.session_titles.get(s).cloned().unwrap_or_default(),
+                            agent_line: None,
+                            status_line: None,
+                            resource: rt
+                                .session_resource_usage
+                                .iter()
+                                .find(|u| u.session == *s)
+                                .cloned(),
+                            pressure: rt.session_input_pressure.get(s).cloned(),
+                        })
+                        .collect::<Vec<_>>();
                     return ui::activity::ActivityWorkspaceRow {
                         id: ws.id.clone(),
                         name: Self::workspace_display_name(ws),
@@ -1722,6 +1762,7 @@ impl App {
                         auto_suspend_remaining_secs: remaining,
                         resource: rt.resource_usage,
                         session_resources: rt.session_resource_usage.clone(),
+                        sessions,
                     };
                 }
                 ui::activity::ActivityWorkspaceRow {
@@ -1735,6 +1776,7 @@ impl App {
                     auto_suspend_remaining_secs: None,
                     resource: None,
                     session_resources: Vec::new(),
+                    sessions: Vec::new(),
                 }
             })
             .collect()
@@ -1796,8 +1838,13 @@ impl App {
                 rt.resource_usage = Some(*snapshot);
                 rt.session_resource_usage = session_usage.clone();
             }
-            if let runtime::RuntimeEvent::PtyInputPressure { pressure, .. } = event {
+            if let runtime::RuntimeEvent::PtyInputPressure { session, pressure } = event {
                 rt.input_pressure = Some(pressure.clone());
+                rt.session_input_pressure.insert(*session, pressure.clone());
+            }
+            // 세션 종료 시 pane별 압력 신호 정리 (stale 뱃지 방지).
+            if let runtime::RuntimeEvent::SessionExited { session, .. } = event {
+                rt.session_input_pressure.remove(session);
             }
             // live 세션 추적 (suspend 보호)
             rt.live.observe(event);
@@ -2554,11 +2601,20 @@ impl eframe::App for App {
                 self.refresh_workspaces();
             }
         }
-        if let Some(ui::activity::ActivityAction::SwitchWorkspace(id)) =
-            activity_action.filter(|a| matches!(a, ui::activity::ActivityAction::SwitchWorkspace(id) if *id != self.active.id))
-        {
-            self.switch_workspace(&id);
-            self.refresh_workspaces();
+        match activity_action {
+            Some(ui::activity::ActivityAction::SwitchWorkspace(id)) if id != self.active.id => {
+                self.switch_workspace(&id);
+                self.refresh_workspaces();
+            }
+            Some(ui::activity::ActivityAction::ClearRenderCaches) => {
+                // 렌더 캐시만 — 작업/프로세스/스크롤백 무해(2026-07-08 검토). 다음 프레임 재구축.
+                self.active.workspace_ui.clear_render_caches();
+                for rt in self.warm.values_mut() {
+                    rt.workspace_ui.clear_render_caches();
+                }
+                self.egui_ctx.request_repaint();
+            }
+            _ => {}
         }
         if let Some((ws_id, session)) = notif_click {
             if ws_id == self.active.id {

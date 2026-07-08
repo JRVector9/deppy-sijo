@@ -272,6 +272,7 @@ file_tree.rename = 이름 변경
 file_tree.move_to_trash = 휴지통으로 삭제
 file_tree.copy_path = 경로 복사
 file_tree.insert_path_terminal = 터미널에 경로 삽입
+file_tree.cd_here = 해당 경로로 이동
 file_tree.permanent_delete_prompt = 휴지통 이동 실패. '{name}' 영구 삭제?
 file_tree.permanent_delete = 영구 삭제
 file_tree.file_operation_running = 파일 조작 중...

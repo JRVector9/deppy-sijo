@@ -1542,6 +1542,27 @@ pub(crate) fn path_insert_paste_bytes(
     input_mapper::paste_bytes(&raw, bracketed_paste)
 }
 
+/// 포커스 터미널에서 이 폴더로 이동 — `cd <quoted-path>` + 실행(Enter).
+/// 붙여넣기(bracketed)로 명령을 넣은 뒤 CR을 브라켓 밖에 붙여 실행되게 한다(2026-07-08).
+pub(crate) fn cd_paste_bytes(
+    path: &Path,
+    shell_kind: crate::ui::file_tree::ShellKind,
+    bracketed_paste: bool,
+) -> Vec<u8> {
+    use crate::ui::file_tree::ShellKind;
+    let quoted = crate::ui::file_tree::shell_quote_for(path, shell_kind);
+    // 셸별 cd 문법 — PowerShell은 -LiteralPath로 와일드카드(`foo[bar]`) 해석을 막고,
+    // cmd는 `/d`로 드라이브 변경까지 처리한다(codex Medium 2026-07-08).
+    let cmd = match shell_kind {
+        ShellKind::PowerShell => format!("Set-Location -LiteralPath {quoted}"),
+        ShellKind::Cmd => format!("cd /d {quoted}"),
+        ShellKind::Posix | ShellKind::Fish => format!("cd {quoted}"),
+    };
+    let mut bytes = input_mapper::paste_bytes(cmd.as_bytes(), bracketed_paste);
+    bytes.push(b'\r'); // 실행 — bracketed paste 종료 뒤의 CR
+    bytes
+}
+
 pub(crate) fn paths_insert_paste_bytes(
     paths: &[std::path::PathBuf],
     shell_kind: crate::ui::file_tree::ShellKind,

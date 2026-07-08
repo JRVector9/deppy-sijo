@@ -272,6 +272,7 @@ file_tree.rename = Rename
 file_tree.move_to_trash = Move to trash
 file_tree.copy_path = Copy path
 file_tree.insert_path_terminal = Insert path into terminal
+file_tree.cd_here = Go to folder (cd)
 file_tree.permanent_delete_prompt = Move to trash failed. Permanently delete '{name}'?
 file_tree.permanent_delete = Permanently delete
 file_tree.file_operation_running = File operation running...

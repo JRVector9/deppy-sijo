@@ -1673,8 +1673,11 @@ impl App {
         // 워크스페이스 폴더 미설정이어도 파일트리는 **항상** 뜨게 — HOME으로 폴백(사용자
         // 2026-07-08). .env 동기화는 active_tree_root(폴더 미설정=None)를 따로 쓰므로
         // ~/.env를 자동 로드하진 않는다(트리 표시 루트와 .env 원천 분리).
+        // 저장 경로가 존재하지 않으면(폴더 이동/삭제/최초 실행 stale) 에러 대신 HOME으로
+        // 폴백 — "폴더 못 찾음" 에러가 뜨지 않게(사용자 2026-07-08). rename 감지는 별도.
         tree.set_root(
             self.active_tree_root()
+                .filter(|p| p.is_dir())
                 .or_else(|| std::env::var_os("HOME").map(PathBuf::from)),
         );
         tree
@@ -2263,6 +2266,33 @@ impl eframe::App for App {
                             }
                         }
                         None => tracing::info!("경로 삽입: 활성 터미널 세션 없음 — 무시"),
+                    }
+                }
+                Some(ui::file_tree::SidebarAction::CdPath(path)) => {
+                    // 포커스된 터미널에서 이 폴더로 cd 실행 (InsertPath와 같은 세션 해석).
+                    let session = self.active.workspace_ui.mux().and_then(|mux| {
+                        mux.focused_pane.as_ref().and_then(|focused| {
+                            mux.tabs
+                                .iter()
+                                .flat_map(|tab| &tab.panes)
+                                .find(|pane| &pane.id == focused)
+                                .and_then(|pane| pane.session_id)
+                        })
+                    });
+                    match session {
+                        Some(session) => {
+                            let bracketed =
+                                self.active.workspace_ui.session_bracketed_paste(session);
+                            let shell_kind = self.active.workspace_ui.session_shell_kind(session);
+                            let bytes = ui::workspace::cd_paste_bytes(&path, shell_kind, bracketed);
+                            self.active.workspace_ui.clear_selection(session);
+                            if let Err(e) = self.active.runtime.send_command(
+                                runtime::RuntimeCommand::WriteInput { session, bytes },
+                            ) {
+                                tracing::warn!("cd 삽입 실패: {e:#}");
+                            }
+                        }
+                        None => tracing::info!("cd: 활성 터미널 세션 없음 — 무시"),
                     }
                 }
                 // 세션 목록 클릭 — 해당 tab/pane으로 전환 (workspace 사이드바)

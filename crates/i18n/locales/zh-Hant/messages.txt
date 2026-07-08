@@ -272,6 +272,7 @@ file_tree.rename = 重新命名
 file_tree.move_to_trash = 移到垃圾桶
 file_tree.copy_path = 複製路徑
 file_tree.insert_path_terminal = 插入路徑到終端機
+file_tree.cd_here = 切換到此資料夾 (cd)
 file_tree.permanent_delete_prompt = 移到垃圾桶失敗。永久刪除 '{name}'？
 file_tree.permanent_delete = 永久刪除
 file_tree.file_operation_running = 檔案操作中...

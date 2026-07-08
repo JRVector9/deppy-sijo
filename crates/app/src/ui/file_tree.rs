@@ -37,6 +37,8 @@ pub struct SessionEntry {
 pub enum SidebarAction {
     /// 경로를 포커스된 터미널에 삽입 (FT-3)
     InsertPath(PathBuf),
+    /// 포커스된 터미널에서 이 폴더로 cd 실행 (디렉터리 컨텍스트 메뉴, 2026-07-08)
+    CdPath(PathBuf),
     /// 세션 목록에서 선택 — 해당 tab/pane으로 전환
     FocusSession {
         tab: runtime::MuxTabId,
@@ -967,37 +969,45 @@ impl FileTreeUi {
             // 여러 단계 위로 한 번에). 좁은 사이드바에서 길면 다음 줄로 넘어간다(2026-07-08).
             let segments = self.breadcrumb_segments();
             if !segments.is_empty() {
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    let last = segments.len() - 1;
-                    for (i, (label, path)) in segments.iter().enumerate() {
-                        if i > 0 {
-                            ui.add(egui::Label::new(
-                                egui::RichText::new("›").color(ui.visuals().weak_text_color()),
-                            ));
-                        }
-                        if i == last {
-                            // 현재 폴더 — 강조, 클릭 불가.
-                            ui.add(egui::Label::new(egui::RichText::new(label).strong()));
-                        } else {
-                            let resp = ui
-                                .add(
-                                    egui::Label::new(
-                                        egui::RichText::new(label)
+                // 깊은 경로도 끝(현재 폴더)이 항상 보이게 가로 스크롤 + 우측 고정.
+                // 조상은 왼쪽으로 스크롤해 보고 클릭할 수 있다(2026-07-08).
+                egui::ScrollArea::horizontal()
+                    .stick_to_right(true)
+                    .max_width(f32::INFINITY)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            let last = segments.len() - 1;
+                            for (i, (label, path)) in segments.iter().enumerate() {
+                                if i > 0 {
+                                    ui.add(egui::Label::new(
+                                        egui::RichText::new("›")
                                             .color(ui.visuals().weak_text_color()),
-                                    )
-                                    .sense(egui::Sense::click()),
-                                )
-                                .on_hover_text(path.display().to_string());
-                            if resp.hovered() {
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    ));
+                                }
+                                if i == last {
+                                    // 현재 폴더 — 강조, 클릭 불가.
+                                    ui.add(egui::Label::new(egui::RichText::new(label).strong()));
+                                } else {
+                                    let resp = ui
+                                        .add(
+                                            egui::Label::new(
+                                                egui::RichText::new(label)
+                                                    .color(ui.visuals().weak_text_color()),
+                                            )
+                                            .sense(egui::Sense::click()),
+                                        )
+                                        .on_hover_text(path.display().to_string());
+                                    if resp.hovered() {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+                                    if resp.clicked() {
+                                        nav_to = Some(path.clone());
+                                    }
+                                }
                             }
-                            if resp.clicked() {
-                                nav_to = Some(path.clone());
-                            }
-                        }
-                    }
-                });
+                        });
+                    });
             }
         });
         // 헤더 전체 폭 = 루트로의 드롭 대상 (§4). 드래그 중 hover면 강조 스트로크.
@@ -1320,6 +1330,11 @@ impl FileTreeUi {
                             menu_action = Some(MenuAction::InsertPath(row.path.clone()));
                             ui.close();
                         }
+                        // 디렉터리만 — 포커스된 터미널에서 이 폴더로 cd (2026-07-08).
+                        if row.is_dir && ui.button(catalog.t("file_tree.cd_here", &[])).clicked() {
+                            menu_action = Some(MenuAction::CdPath(row.path.clone()));
+                            ui.close();
+                        }
                     });
                 }
             });
@@ -1405,6 +1420,7 @@ impl FileTreeUi {
             Some(MenuAction::Delete(path)) => self.spawn_trash(path),
             Some(MenuAction::CopyPath(path)) => ui.ctx().copy_text(path.display().to_string()),
             Some(MenuAction::InsertPath(path)) => action = Some(SidebarAction::InsertPath(path)),
+            Some(MenuAction::CdPath(path)) => action = Some(SidebarAction::CdPath(path)),
             None => {}
         }
         self.edit = edit;
@@ -1986,6 +2002,7 @@ enum MenuAction {
     Delete(PathBuf),
     CopyPath(PathBuf),
     InsertPath(PathBuf),
+    CdPath(PathBuf),
 }
 
 /// 이름 검증 (§5): 빈 이름·경로 구분자·'.'/'..' 거부. Ok = 트림된 이름.

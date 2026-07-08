@@ -272,6 +272,7 @@ file_tree.rename = 名前変更
 file_tree.move_to_trash = ゴミ箱へ移動
 file_tree.copy_path = パスをコピー
 file_tree.insert_path_terminal = ターミナルにパスを挿入
+file_tree.cd_here = このフォルダへ移動 (cd)
 file_tree.permanent_delete_prompt = ゴミ箱への移動に失敗しました。'{name}' を完全に削除しますか?
 file_tree.permanent_delete = 完全に削除
 file_tree.file_operation_running = ファイル操作中...

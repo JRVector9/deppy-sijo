@@ -31,6 +31,9 @@ struct Subscriber {
     events: Sender<RuntimeEvent>,
     viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>>,
     input_pressures: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>>,
+    /// ResourceUsage 최신본 slot — 주기 샘플이 느린 소비자 채널에 무한 누적되지
+    /// 않게 latest-value 덮어쓰기(안정성 감사 High #1).
+    resource_usage: Arc<Mutex<Option<RuntimeEvent>>>,
     /// 상태 이벤트(채널) 도착 시 소비자를 깨우는 콜백 — UI가 숨겨져(Warm) repaint가
     /// 없을 때도 알림/상태를 처리하도록 (§14.1). Viewport(slot)도 깨운다 — push가
     /// dirty 게이트라 출력이 있을 때만 울리므로 idle 리페인트를 유발하지 않는다.
@@ -194,6 +197,7 @@ impl RuntimeEventStream for InProcessRuntimeClient {
             Arc::default();
         let input_pressures: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
             Arc::default();
+        let resource_usage: Arc<Mutex<Option<RuntimeEvent>>> = Arc::default();
         self.subscribers
             .lock()
             .expect("subscribers lock")
@@ -201,12 +205,14 @@ impl RuntimeEventStream for InProcessRuntimeClient {
                 events: tx,
                 viewports: Arc::clone(&viewports),
                 input_pressures: Arc::clone(&input_pressures),
+                resource_usage: Arc::clone(&resource_usage),
                 wake: None,
             });
         RuntimeEventReceiver {
             events: rx,
             viewports,
             input_pressures,
+            resource_usage,
         }
     }
 }
@@ -220,6 +226,7 @@ impl InProcessRuntimeClient {
             Arc::default();
         let input_pressures: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
             Arc::default();
+        let resource_usage: Arc<Mutex<Option<RuntimeEvent>>> = Arc::default();
         self.subscribers
             .lock()
             .expect("subscribers lock")
@@ -227,12 +234,14 @@ impl InProcessRuntimeClient {
                 events: tx,
                 viewports: Arc::clone(&viewports),
                 input_pressures: Arc::clone(&input_pressures),
+                resource_usage: Arc::clone(&resource_usage),
                 wake: Some(wake),
             });
         RuntimeEventReceiver {
             events: rx,
             viewports,
             input_pressures,
+            resource_usage,
         }
     }
 }
@@ -496,6 +505,19 @@ impl Worker {
                         .lock()
                         .expect("input pressure slot lock")
                         .insert(*session, event.clone());
+                    if let Some(wake) = &subscriber.wake {
+                        wakes.push(Arc::clone(wake));
+                    }
+                    true
+                } else if matches!(&event, RuntimeEvent::ResourceUsage { .. }) {
+                    // 주기 샘플 — 최신본 slot 덮어쓰기(느린 소비자 채널 누적 방지).
+                    if Arc::strong_count(&subscriber.resource_usage) <= 1 {
+                        return false;
+                    }
+                    *subscriber
+                        .resource_usage
+                        .lock()
+                        .expect("resource usage slot lock") = Some(event.clone());
                     if let Some(wake) = &subscriber.wake {
                         wakes.push(Arc::clone(wake));
                     }
@@ -1720,6 +1742,44 @@ mod tests {
             env: Vec::new(),
             cwd: None,
         }
+    }
+
+    /// 안정성 감사 High #1: 주기 ResourceUsage가 느린(드레인 안 하는) 구독자 채널에
+    /// 누적되지 않고 latest-value slot 하나로 코얼레싱된다.
+    #[test]
+    fn resource_usage는_드레인_없이도_slot_하나로_코얼레싱된다() {
+        init_mock_store();
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("resource-slot"),
+            RedactionService::new(),
+            spec("/bin/sh", &["-c", "sleep 30"]),
+            None,
+        );
+        let rx = client.subscribe();
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        // 샘플 주기(2s) 두 번 이상 경과 — 드레인하지 않고 방치.
+        std::thread::sleep(Duration::from_millis(5200));
+        let events = rx.drain();
+        let resource_count = events
+            .iter()
+            .filter(|e| matches!(e, RuntimeEvent::ResourceUsage { .. }))
+            .count();
+        assert!(
+            resource_count <= 1,
+            "ResourceUsage가 채널에 누적됨 (count={resource_count}) — slot 코얼레싱 회귀"
+        );
+        assert_eq!(
+            resource_count, 1,
+            "5초간 샘플이 최소 1회는 slot에 있어야 함 (모니터 미동작?)"
+        );
     }
 
     #[test]

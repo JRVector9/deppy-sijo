@@ -214,14 +214,34 @@ impl Drop for PortablePtySession {
     /// reader thread는 프로세스 종료(EOF) 또는 수신측 drop 후 send 실패로 끝난다.
     fn drop(&mut self) {
         // 터미널 종료 규약: foreground process group에 SIGHUP —
-        // 셸이 kill되어도 살아남는 grandchild job까지 정리 대상에 포함
-        // (SIGHUP을 무시하는 프로세스는 nohup과 동일하게 살아남는다 — 표준 동작)
+        // 셸이 kill되어도 살아남는 grandchild job까지 정리 대상에 포함.
         #[cfg(unix)]
-        if let Some(pgid) = self.master.process_group_leader() {
+        let pgid = self.master.process_group_leader();
+        #[cfg(unix)]
+        if let Some(pgid) = pgid {
             unsafe { libc::killpg(pgid, libc::SIGHUP) };
         }
         // kill 실패해도 무한 wait에 매달리지 않는다 (bounded reap — codex P1)
         kill_and_reap_bounded(&mut self.child);
+        // 제품 정책(안정성 감사 Med #3, 2026-07-08): pane/세션 닫기 = 프로세스 트리 정리.
+        // SIGHUP을 무시한 자손(nohup류)이 남지 않게 process group에 SIGTERM → 짧은
+        // 유예 → SIGKILL로 에스컬레이션한다. pgid 재사용 오발 위험은 Drop 직후 수백 ms
+        // 내 재확인이라 극소. 유예는 200ms로 짧게 — Drop이 UI/worker 스레드에서 불린다.
+        #[cfg(unix)]
+        if let Some(pgid) = pgid {
+            let group_alive = || unsafe { libc::killpg(pgid, 0) } == 0;
+            if group_alive() {
+                unsafe { libc::killpg(pgid, libc::SIGTERM) };
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+                while group_alive() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                if group_alive() {
+                    tracing::info!(pgid, "SIGTERM 후에도 자손 생존 — SIGKILL 에스컬레이션");
+                    unsafe { libc::killpg(pgid, libc::SIGKILL) };
+                }
+            }
+        }
         // teardown 계약: input_tx drop → writer thread 종료(채널 닫힘),
         // output Receiver drop(필드) → send 블록된 reader thread가 Err로 풀림,
         // reader의 read 블록은 child 종료의 EOF로 풀린다. thread join은 하지
@@ -321,6 +341,59 @@ mod tests {
                 24,
             )
             .unwrap()
+    }
+
+    /// 제품 정책(감사 Med #3): 세션 drop = 프로세스 트리 정리. HUP/TERM을 무시하는
+    /// 자손(nohup류)도 SIGKILL 에스컬레이션으로 종료돼야 한다.
+    #[cfg(unix)]
+    #[test]
+    fn drop은_sighup_무시_자손까지_정리한다() {
+        let pidfile = std::env::temp_dir().join(format!(
+            "deppy-pty-orphan-{}-{}.pid",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let script = format!(
+            "( trap '' HUP TERM; sleep 300 ) & echo $! > {}; sleep 300",
+            pidfile.display()
+        );
+        let session = spawn("/bin/sh", &["-c", &script]);
+        // 자손 pid 파일이 생길 때까지 대기
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let orphan_pid: i32 = loop {
+            if let Ok(text) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = text.trim().parse()
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "자손 pid 파일 미생성");
+            std::thread::sleep(Duration::from_millis(30));
+        };
+        assert_eq!(
+            unsafe { libc::kill(orphan_pid, 0) },
+            0,
+            "자손이 살아있어야 시작"
+        );
+        drop(session);
+        // SIGKILL 에스컬레이션 후 자손 소멸 확인 (reap은 init이 하므로 kill(pid,0) 폴링).
+        // zombie 동안 kill(pid,0)이 성공할 수 있으나 macOS launchd는 orphan을 즉시
+        // reap하므로 5s 데드라인 내 소멸을 기대한다(codex Low — 수용).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let alive = unsafe { libc::kill(orphan_pid, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "HUP/TERM 무시 자손이 drop 후에도 생존 (pid {orphan_pid})"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::fs::remove_file(&pidfile).ok();
     }
 
     #[test]

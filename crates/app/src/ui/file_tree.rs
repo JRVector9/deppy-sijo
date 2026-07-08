@@ -105,6 +105,10 @@ pub struct FileTreeUi {
     listing_rx: Receiver<ListingOutcome>,
     /// root 전환 generation. 이전 root의 late result는 epoch mismatch로 폐기한다.
     listing_epoch: u64,
+    /// 워커와 공유하는 현재 epoch — 워커가 나열 전/청크 전송 중에 확인해 stale 작업을
+    /// **송신 전에** 중단한다(구 epoch 청크가 unbounded 채널에 쌓이는 것 방지 —
+    /// 안정성 감사 High #2).
+    listing_epoch_shared: Arc<std::sync::atomic::AtomicU64>,
     /// per-directory listing token 발급용 monotonic counter.
     next_listing_token: u64,
     /// 현재 유효한 per-directory listing 요청. collapse/refresh/root switch 시 제거한다.
@@ -181,6 +185,9 @@ struct PendingListing {
     /// 첫 chunk 적용 시점의 현재 펼침 상태. 이후 chunk는 같은 기준으로 append한다.
     apply_expanded: Option<Arc<HashSet<PathBuf>>>,
     started: bool,
+    /// 워커와 공유하는 취소 플래그 — 같은 경로 재요청(reload_dir token 교체)이나 부분
+    /// 무효화 시 구 워커가 청크를 **송신하기 전에** 멈추게 한다(codex High 2026-07-08).
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -467,6 +474,7 @@ impl FileTreeUi {
             listing_tx,
             listing_rx,
             listing_epoch: 0,
+            listing_epoch_shared: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             next_listing_token: 0,
             pending_listings: HashMap::new(),
             in_flight: 0,
@@ -505,6 +513,8 @@ impl FileTreeUi {
 
     pub fn set_root(&mut self, root: Option<PathBuf>) {
         self.listing_epoch = self.listing_epoch.wrapping_add(1);
+        self.listing_epoch_shared
+            .store(self.listing_epoch, std::sync::atomic::Ordering::Relaxed);
         self.pending_listings.clear();
         self.root = root.map(|r| r.canonicalize().unwrap_or(r));
         self.root_error = None;
@@ -683,6 +693,12 @@ impl FileTreeUi {
             return;
         };
         self.root_error = None;
+        // 같은 root 재나열도 전체 교체다 — epoch을 올려 진행 중이던 구 워커가
+        // 청크를 **송신하기 전에** 중단되게 한다(안 올리면 token mismatch로 수신측에서만
+        // 버려져 unbounded 채널에 stale 청크가 쌓인다 — codex High 2026-07-08).
+        self.listing_epoch = self.listing_epoch.wrapping_add(1);
+        self.listing_epoch_shared
+            .store(self.listing_epoch, std::sync::atomic::Ordering::Relaxed);
         let preserve_expanded = Arc::new(self.collect_expanded_paths());
         self.invalidate_listing_subtree(&root);
         self.request_listing(root, preserve_expanded);
@@ -1614,19 +1630,28 @@ impl FileTreeUi {
     fn request_listing(&mut self, path: PathBuf, preserve_expanded: Arc<HashSet<PathBuf>>) {
         self.next_listing_token = self.next_listing_token.wrapping_add(1);
         let token = self.next_listing_token;
-        self.pending_listings.insert(
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Some(old) = self.pending_listings.insert(
             path.clone(),
             PendingListing {
                 token,
                 preserve_expanded,
                 apply_expanded: None,
                 started: false,
+                cancel: Arc::clone(&cancel),
             },
-        );
+        ) {
+            // 같은 경로 재요청(reload_dir) — 구 워커의 잔여 청크 송신을 중단시킨다.
+            old.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         spawn_listing_worker(
             self.listing_tx.clone(),
             self.egui_ctx.clone(),
-            self.listing_epoch,
+            ListingEpochGuard {
+                requested: self.listing_epoch,
+                current: Arc::clone(&self.listing_epoch_shared),
+                cancel,
+            },
             token,
             self.root.clone(),
             path,
@@ -1646,8 +1671,15 @@ impl FileTreeUi {
     }
 
     fn invalidate_listing_subtree(&mut self, path: &Path) {
-        self.pending_listings
-            .retain(|pending_path, _| !pending_path.starts_with(path));
+        self.pending_listings.retain(|pending_path, pending| {
+            let keep = !pending_path.starts_with(path);
+            if !keep {
+                pending
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            keep
+        });
     }
 
     fn pump_listings(&mut self) {
@@ -1656,6 +1688,11 @@ impl FileTreeUi {
             let Ok(outcome) = self.listing_rx.try_recv() else {
                 return;
             };
+            // stale(구 epoch)은 프레임 예산에 세지 않고 즉시 폐기 — 백로그를
+            // 프레임당 4개씩만 비우면 따라잡기가 밀린다(안정성 감사 High #2).
+            if outcome.epoch != self.listing_epoch {
+                continue;
+            }
             self.apply_listing_outcome(outcome);
             processed += 1;
         }
@@ -2573,43 +2610,66 @@ fn remove_all(path: &Path) -> std::io::Result<()> {
 const LISTING_CHUNK_SIZE: usize = 2048;
 const LISTING_RESULTS_PER_FRAME: usize = 4;
 
+/// listing 워커의 stale 판정 — 요청 시점 epoch과 UI의 현재 epoch(공유 atomic)을 묶어
+/// 워커가 나열 전/청크 전송 중에 확인한다(안정성 감사 High #2).
+struct ListingEpochGuard {
+    requested: u64,
+    current: Arc<std::sync::atomic::AtomicU64>,
+    /// 이 요청 전용 취소 플래그(같은 경로 token 교체/부분 무효화).
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ListingEpochGuard {
+    fn is_stale(&self) -> bool {
+        self.current.load(std::sync::atomic::Ordering::Relaxed) != self.requested
+            || self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 fn spawn_listing_worker(
     tx: Sender<ListingOutcome>,
     ctx: egui::Context,
-    epoch: u64,
+    epoch: ListingEpochGuard,
     token: u64,
     root: Option<PathBuf>,
     path: PathBuf,
     ignore_cache: GitIgnoreCache,
 ) {
-    std::thread::spawn(
-        move || match read_children(&path, root.as_deref(), &ignore_cache) {
-            Ok(nodes) => send_listing_chunks(tx, &ctx, epoch, token, path, nodes),
+    std::thread::spawn(move || {
+        // stale 조기 취소 — root 전환/refresh로 epoch이 바뀌었으면 나열조차 하지 않는다.
+        if epoch.is_stale() {
+            return;
+        }
+        match read_children(&path, root.as_deref(), &ignore_cache) {
+            Ok(nodes) => send_listing_chunks(tx, &ctx, &epoch, token, path, nodes),
             Err(e) => {
                 let _ = tx.send(ListingOutcome {
-                    epoch,
+                    epoch: epoch.requested,
                     token,
                     path,
                     result: ListingResult::Error(e.to_string()),
                 });
                 ctx.request_repaint();
             }
-        },
-    );
+        }
+    });
 }
 
 fn send_listing_chunks(
     tx: Sender<ListingOutcome>,
     ctx: &egui::Context,
-    epoch: u64,
+    epoch: &ListingEpochGuard,
     token: u64,
     path: PathBuf,
     nodes: Vec<TreeNode>,
 ) {
     let mut iter = nodes.into_iter().peekable();
     if iter.peek().is_none() {
+        if epoch.is_stale() {
+            return;
+        }
         let _ = tx.send(ListingOutcome {
-            epoch,
+            epoch: epoch.requested,
             token,
             path,
             result: ListingResult::Chunk {
@@ -2622,6 +2682,10 @@ fn send_listing_chunks(
     }
 
     while iter.peek().is_some() {
+        // 청크마다 stale 확인 — 구 epoch 결과를 unbounded 채널에 계속 밀어넣지 않는다.
+        if epoch.is_stale() {
+            return;
+        }
         let mut chunk = Vec::with_capacity(LISTING_CHUNK_SIZE);
         for _ in 0..LISTING_CHUNK_SIZE {
             let Some(node) = iter.next() else {
@@ -2630,8 +2694,13 @@ fn send_listing_chunks(
             chunk.push(node);
         }
         let done = iter.peek().is_none();
+        // send 직전 재확인 — 확인과 send를 원자화할 수는 없어 취소 직후 stale 청크가
+        // **최대 1개** 들어갈 수 있지만(유계), 수신측 epoch/token 필터가 버린다.
+        if epoch.is_stale() {
+            return;
+        }
         let sent = tx.send(ListingOutcome {
-            epoch,
+            epoch: epoch.requested,
             token,
             path: path.clone(),
             result: ListingResult::Chunk { nodes: chunk, done },
@@ -2790,6 +2859,73 @@ fn reread(base: &Path, old: &[TreeNode]) -> std::io::Result<Vec<TreeNode>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 안정성 감사 High #2: 워커가 stale epoch(루트 전환/refresh 후) 청크를
+    /// unbounded 채널에 밀어넣지 않는다 — 송신 전에 중단.
+    #[test]
+    fn stale_epoch_청크는_송신전에_중단된다() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = egui::Context::default();
+        let shared = Arc::new(std::sync::atomic::AtomicU64::new(7)); // 현재 epoch=7
+        let mk_nodes = || -> Vec<TreeNode> {
+            (0..5000)
+                .map(|i| TreeNode::new(format!("f{i}"), false))
+                .collect()
+        };
+        // 구 epoch(6)으로 전송 시도 → 아무 청크도 채널에 없어야 한다.
+        send_listing_chunks(
+            tx.clone(),
+            &ctx,
+            &ListingEpochGuard {
+                requested: 6,
+                current: Arc::clone(&shared),
+                cancel: Arc::default(),
+            },
+            1,
+            PathBuf::from("/tmp/x"),
+            mk_nodes(),
+        );
+        assert!(rx.try_recv().is_err(), "stale 청크가 채널에 들어감");
+        // 현재 epoch(7)이면 정상 전송.
+        send_listing_chunks(
+            tx,
+            &ctx,
+            &ListingEpochGuard {
+                requested: 7,
+                current: shared,
+                cancel: Arc::default(),
+            },
+            2,
+            PathBuf::from("/tmp/x"),
+            mk_nodes(),
+        );
+        assert!(rx.try_recv().is_ok(), "현재 epoch 청크가 전송돼야 함");
+    }
+
+    /// codex High(2026-07-08): 같은 경로 재요청(reload_dir token 교체) 시 구 요청의
+    /// cancel 플래그가 서면 같은 epoch이어도 송신 전에 중단된다.
+    #[test]
+    fn cancel_플래그는_같은_epoch에서도_송신을_중단한다() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = egui::Context::default();
+        let shared = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true)); // 이미 취소됨
+        send_listing_chunks(
+            tx,
+            &ctx,
+            &ListingEpochGuard {
+                requested: 1,
+                current: shared,
+                cancel,
+            },
+            1,
+            PathBuf::from("/tmp/x"),
+            (0..100)
+                .map(|i| TreeNode::new(format!("f{i}"), false))
+                .collect(),
+        );
+        assert!(rx.try_recv().is_err(), "취소된 요청의 청크가 채널에 들어감");
+    }
 
     fn dir(name: &str) -> TreeNode {
         TreeNode::new(name.into(), true)

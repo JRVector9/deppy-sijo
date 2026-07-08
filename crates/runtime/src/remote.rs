@@ -2183,6 +2183,9 @@ impl RuntimeEventStream for RemoteRuntimeClient {
             events: rx,
             viewports,
             input_pressures,
+            // remote는 wire 단계에서 outbound 큐가 이미 유계/코얼레싱이라(감사 통과)
+            // ResourceUsage도 채널 경로 그대로 — 빈 slot만 채운다.
+            resource_usage: Arc::default(),
         }
     }
 }
@@ -2920,6 +2923,7 @@ mod tests {
             events: rx,
             viewports,
             input_pressures,
+            resource_usage: Arc::default(),
         };
         for i in 0..5 {
             tx.send(RuntimeEvent::SessionStatusChanged {
@@ -2944,6 +2948,7 @@ mod tests {
             events: rx,
             viewports,
             input_pressures: Arc::clone(&input_pressures),
+            resource_usage: Arc::default(),
         };
         tx.send(RuntimeEvent::SessionStatusViewChanged {
             session: SessionId(1),

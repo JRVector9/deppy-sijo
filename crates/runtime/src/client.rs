@@ -12,6 +12,9 @@ pub struct RuntimeEventReceiver {
     pub(crate) events: std::sync::mpsc::Receiver<RuntimeEvent>,
     pub(crate) viewports: Arc<Mutex<HashMap<SessionId, RuntimeEvent>>>,
     pub(crate) input_pressures: Arc<Mutex<HashMap<SessionId, RuntimeEvent>>>,
+    /// ResourceUsage 최신본 slot — 주기 샘플(유일한 무한 반복 이벤트 소스)이라 느린
+    /// 소비자에게도 채널에 누적되지 않게 latest-value로 덮어쓴다(안정성 감사 High #1).
+    pub(crate) resource_usage: Arc<Mutex<Option<RuntimeEvent>>>,
 }
 
 impl RuntimeEventReceiver {
@@ -36,7 +39,13 @@ impl RuntimeEventReceiver {
             .drain()
             .map(|(_, event)| event)
             .collect();
+        let resource = self
+            .resource_usage
+            .lock()
+            .expect("resource usage slot lock")
+            .take();
         let mut out: Vec<RuntimeEvent> = self.events.try_iter().collect();
+        out.extend(resource);
         out.extend(input_pressures);
         out.extend(viewports);
         out

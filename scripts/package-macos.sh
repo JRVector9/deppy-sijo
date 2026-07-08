@@ -43,13 +43,24 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# 서명 — scripts/setup-dev-signing.sh로 신뢰 설정한 고정 인증서가 있으면 그것으로 서명한다.
-# ad-hoc(`--sign -`)은 매 빌드 cdhash가 달라져 macOS TCC(데스크탑 폴더 접근 등)가 매번 앱을
-# "새 앱"으로 보고 권한을 재요청한다. 고정 인증서로 서명하면 한 번 승인한 권한이 유지된다.
-CERT_CN="deppy-sijo-dev"
-if security find-identity -v -p codesigning 2>/dev/null | grep -q "$CERT_CN"; then
-    codesign --force --deep --sign "$CERT_CN" "$BUNDLE"
-    echo "서명: $CERT_CN (고정 identity — TCC 권한 재빌드 후 유지)"
+# 서명 — Apple 발급 인증서(Developer ID/Apple Development)가 있으면 최우선으로 쓴다.
+# self-signed(deppy-sijo-dev)는 TCC(폴더 접근)는 고정하지만 Apple 신뢰 체인이 아니라
+# **키체인 partition**에 못 들어가, keyring 항목(env secret) 접근마다 로그인 키체인
+# 암호를 물어본다(빌드마다 ~30회, 2026-07-08 실증). Apple 인증서 서명이면 '항상 허용'이
+# designated requirement(identifier+cert)로 유지돼 재빌드 후에도 재프롬프트가 없다.
+# 우선순위: $DEPPY_SIGN_IDENTITY > Developer ID Application > Apple Development >
+#           deppy-sijo-dev(self-signed) > ad-hoc.
+IDENTITIES=$(security find-identity -v -p codesigning 2>/dev/null)
+pick_identity() {
+    echo "$IDENTITIES" | grep -o "\"$1[^\"]*\"" | head -1 | tr -d '"'
+}
+SIGN_ID="${DEPPY_SIGN_IDENTITY:-}"
+[ -z "$SIGN_ID" ] && SIGN_ID=$(pick_identity "Developer ID Application")
+[ -z "$SIGN_ID" ] && SIGN_ID=$(pick_identity "Apple Development")
+[ -z "$SIGN_ID" ] && SIGN_ID=$(pick_identity "deppy-sijo-dev")
+if [ -n "$SIGN_ID" ]; then
+    codesign --force --deep --sign "$SIGN_ID" "$BUNDLE"
+    echo "서명: $SIGN_ID (고정 identity — TCC/키체인 권한 재빌드 후 유지)"
 else
     codesign --force --sign - "$BUNDLE"
     echo "서명: ad-hoc — 재빌드마다 macOS 권한(데스크탑 접근 등)을 다시 물어봅니다."

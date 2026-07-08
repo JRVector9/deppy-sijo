@@ -1518,25 +1518,39 @@ impl App {
         else {
             return; // 폴더 미설정 — 감지 대상 아님
         };
-        // 경로가 아직 유효하면: 앵커가 없으면 backfill하고 끝.
-        if std::path::Path::new(&path).is_dir() {
-            if self.db.workspace_anchor(&ws).ok().flatten().is_none() {
-                self.save_workspace_anchor();
+        let anchor = self.db.workspace_anchor(&ws).ok().flatten();
+        let current = Self::folder_anchor(&path); // path가 유효 디렉터리면 그 (dev,ino)
+        // 정상 상태 판정: path가 유효하고 앵커가 없거나(backfill) 앵커와 inode가 일치.
+        if let Some(cur) = current {
+            match anchor {
+                None => self.save_workspace_anchor(), // 구 워크스페이스 backfill
+                Some(a) if a == cur => {}             // 정상 — 같은 폴더
+                Some(_) => {
+                    // path는 유효하지만 inode가 다르다 = 원래 폴더가 이동되고 그 자리에 다른
+                    // 폴더가 들어섰다(mv proj proj.old && mkdir proj). stale로 보고 매칭 진행.
+                    self.propose_rename_by_anchor(&ws, &path, anchor);
+                    return;
+                }
             }
             self.dismissed_renames.remove(&ws); // 경로 정상화 → 무시 상태 해제
             return;
         }
-        // 경로 stale — 무시한 워크스페이스는 재확인 안 함.
-        if self.dismissed_renames.contains(&ws) {
+        // path가 사라짐(stale) → 앵커로 이동 위치 탐색.
+        self.propose_rename_by_anchor(&ws, &path, anchor);
+    }
+
+    /// 저장 앵커(dev,ino)와 일치하는 세션 cwd를 찾아 rename 복구 모달을 제안한다.
+    fn propose_rename_by_anchor(&mut self, ws: &str, old_path: &str, anchor: Option<(i64, i64)>) {
+        if self.dismissed_renames.contains(ws) {
             return;
         }
-        let Some(anchor) = self.db.workspace_anchor(&ws).ok().flatten() else {
+        let Some(anchor) = anchor else {
             return; // 앵커 없음 → 자동 복구 불가(재선택 안내는 파일트리/환경메뉴가 담당)
         };
-        // 세션 cwd 중 앵커(dev,ino)와 일치하는 폴더 = 이동된 새 경로.
         for cwd in self.session_cwds.values() {
-            if Self::folder_anchor(cwd) == Some(anchor) {
-                self.workspace_rename_prompt = Some((path.clone(), cwd.clone()));
+            // 후보는 현재 저장 경로와 달라야 한다(같으면 이동 아님).
+            if cwd != old_path && Self::folder_anchor(cwd) == Some(anchor) {
+                self.workspace_rename_prompt = Some((old_path.to_owned(), cwd.clone()));
                 return;
             }
         }
@@ -2333,23 +2347,34 @@ impl eframe::App for App {
                 });
             match decision {
                 Some(true) => {
-                    // 새 경로로 갱신 + 앵커/env/셸 cwd 재구성 (SetProjectPath와 동일 흐름).
-                    if let Err(e) = self.db.set_workspace_path(&self.active.id, &new) {
-                        tracing::warn!("폴더 이동 경로 갱신 실패: {e:#}");
-                    } else {
-                        self.save_workspace_anchor();
-                        self.sync_dotenv_env();
-                        let cwd = std::path::PathBuf::from(&new);
-                        let cwd = cwd.is_dir().then_some(cwd);
-                        let _ = self
-                            .active
-                            .runtime
-                            .send_command(runtime::RuntimeCommand::SetShellCwd(cwd.clone()));
-                        if let Some(dir) = &cwd {
-                            self.update_workspace_folder_name(&dir.to_string_lossy());
+                    // 커밋 직전 재검증(codex Low): 프롬프트가 열린 사이 상태가 변했을 수 있다 —
+                    // ①DB 경로가 여전히 old인지 ②new 폴더의 inode가 저장 앵커와 같은지.
+                    let db_path = self.db.workspace_path(&self.active.id).ok().flatten();
+                    let stored = self.db.workspace_anchor(&self.active.id).ok().flatten();
+                    let valid = db_path.as_deref() == Some(old.as_str())
+                        && stored.is_some()
+                        && Self::folder_anchor(&new) == stored;
+                    if valid {
+                        // 새 경로로 갱신 + 앵커/env/셸 cwd 재구성 (SetProjectPath와 동일 흐름).
+                        if let Err(e) = self.db.set_workspace_path(&self.active.id, &new) {
+                            tracing::warn!("폴더 이동 경로 갱신 실패: {e:#}");
+                        } else {
+                            self.save_workspace_anchor();
+                            self.sync_dotenv_env();
+                            let cwd = std::path::PathBuf::from(&new);
+                            let cwd = cwd.is_dir().then_some(cwd);
+                            let _ = self
+                                .active
+                                .runtime
+                                .send_command(runtime::RuntimeCommand::SetShellCwd(cwd.clone()));
+                            if let Some(dir) = &cwd {
+                                self.update_workspace_folder_name(&dir.to_string_lossy());
+                            }
+                            self.refresh_file_tree_root();
+                            self.refresh_workspaces();
                         }
-                        self.refresh_file_tree_root();
-                        self.refresh_workspaces();
+                    } else {
+                        tracing::info!("폴더 이동 프롬프트 stale — 갱신 취소");
                     }
                     self.workspace_rename_prompt = None;
                 }

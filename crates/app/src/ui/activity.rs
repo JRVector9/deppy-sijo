@@ -107,7 +107,9 @@ impl ActivityUi {
                     }
                     ui.end_row();
 
-                    // pane(세션)별 서브행 — 이름 들여쓰기, 상태/에이전트/압력/자원을 각 열에.
+                    // pane(세션)별 서브행 — 워크스페이스 열을 의도적으로 재사용한다:
+                    // 상태 열=상태줄("실행 중 · ctx 69%"), 세션(수) 열=에이전트 정보
+                    // ("Codex · gpt-5.5 · xhigh"), 큐 열=입력압력 뱃지, 자원 열=세션 트리 합산.
                     for s in &row.sessions {
                         ui.weak(format!("└ {}", s.name));
                         ui.label(s.status_line.as_deref().unwrap_or(""));

@@ -230,11 +230,14 @@ struct WorkspaceRuntime {
     resource_usage: Option<runtime::ProcessResourceSnapshot>,
     /// 마지막 worker child-process resource samples. Runtime이 집계한 값만 보관한다.
     session_resource_usage: Vec<runtime::SessionResourceUsage>,
-    /// 마지막 PTY input pressure signal. UI는 런타임 이벤트만 보관한다.
-    input_pressure: Option<runtime::PtyInputPressure>,
-    /// 세션별 마지막 input pressure — 활동 뷰 pane 서브행용(2026-07-08). exit 시 제거.
-    session_input_pressure:
-        std::collections::HashMap<runtime::SessionId, runtime::PtyInputPressure>,
+    /// 마지막 PTY input pressure signal(+관측 시각). 회복 이벤트가 없어(QueueFull은
+    /// writer drain으로 조용히 해소) 표시 시 TTL로 stale 뱃지를 걸러낸다(codex 2026-07-08).
+    input_pressure: Option<(runtime::PtyInputPressure, std::time::Instant)>,
+    /// 세션별 마지막 input pressure(+관측 시각) — 활동 뷰 pane 서브행용. exit 시 제거.
+    session_input_pressure: std::collections::HashMap<
+        runtime::SessionId,
+        (runtime::PtyInputPressure, std::time::Instant),
+    >,
     /// Warm으로 내려간 시각. 일정 시간 이후 자동 Suspended(워커 shutdown)로 내린다.
     backgrounded_at: Option<std::time::Instant>,
     /// live 세션 추적 (suspend 보호 — 이벤트 스트림에서 갱신).
@@ -1678,6 +1681,19 @@ impl App {
         }
     }
 
+    /// pressure 뱃지 표시 TTL — 회복 이벤트가 없어(큐가 빠져도 신호 없음) 마지막 관측이
+    /// 이 시간보다 오래되면 해소된 것으로 보고 숨긴다. 종료성 사유는 SessionExited가 정리.
+    const PRESSURE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn fresh_pressure(
+        entry: Option<&(runtime::PtyInputPressure, std::time::Instant)>,
+        now: std::time::Instant,
+    ) -> Option<runtime::PtyInputPressure> {
+        entry
+            .filter(|(_, at)| now.saturating_duration_since(*at) < Self::PRESSURE_TTL)
+            .map(|(p, _)| p.clone())
+    }
+
     fn activity_rows(&self) -> Vec<ui::activity::ActivityWorkspaceRow> {
         let now = std::time::Instant::now();
         self.workspaces
@@ -1705,10 +1721,11 @@ impl App {
                                     .find(|u| u.session == s)
                                     .cloned()
                             }),
-                            pressure: e
-                                .session
-                                .and_then(|s| self.active.session_input_pressure.get(&s))
-                                .cloned(),
+                            pressure: Self::fresh_pressure(
+                                e.session
+                                    .and_then(|s| self.active.session_input_pressure.get(&s)),
+                                now,
+                            ),
                         })
                         .collect::<Vec<_>>();
                     return ui::activity::ActivityWorkspaceRow {
@@ -1717,7 +1734,10 @@ impl App {
                         state: ui::activity::ActivityWorkspaceState::Active,
                         session_count: entries.len(),
                         pending_events: self.active.pending_events.len(),
-                        input_pressure: self.active.input_pressure.clone(),
+                        input_pressure: Self::fresh_pressure(
+                            self.active.input_pressure.as_ref(),
+                            now,
+                        ),
                         backgrounded_for_secs: None,
                         auto_suspend_remaining_secs: None,
                         resource: self.active.resource_usage,
@@ -1748,7 +1768,7 @@ impl App {
                                 .iter()
                                 .find(|u| u.session == *s)
                                 .cloned(),
-                            pressure: rt.session_input_pressure.get(s).cloned(),
+                            pressure: Self::fresh_pressure(rt.session_input_pressure.get(s), now),
                         })
                         .collect::<Vec<_>>();
                     return ui::activity::ActivityWorkspaceRow {
@@ -1757,7 +1777,7 @@ impl App {
                         state: ui::activity::ActivityWorkspaceState::Warm,
                         session_count: rt.session_titles.len(),
                         pending_events: rt.pending_events.len(),
-                        input_pressure: rt.input_pressure.clone(),
+                        input_pressure: Self::fresh_pressure(rt.input_pressure.as_ref(), now),
                         backgrounded_for_secs: elapsed.map(|duration| duration.as_secs()),
                         auto_suspend_remaining_secs: remaining,
                         resource: rt.resource_usage,
@@ -1839,12 +1859,20 @@ impl App {
                 rt.session_resource_usage = session_usage.clone();
             }
             if let runtime::RuntimeEvent::PtyInputPressure { session, pressure } = event {
-                rt.input_pressure = Some(pressure.clone());
-                rt.session_input_pressure.insert(*session, pressure.clone());
+                let now = std::time::Instant::now();
+                rt.input_pressure = Some((pressure.clone(), now));
+                rt.session_input_pressure
+                    .insert(*session, (pressure.clone(), now));
             }
-            // 세션 종료 시 pane별 압력 신호 정리 (stale 뱃지 방지).
+            // 세션 종료 시 pane별 압력 신호 정리 (stale 뱃지 방지). 워크스페이스 뱃지도
+            // 남은 세션들 중 최신으로 재계산 — exit한 세션의 신호가 TTL까지 남지 않게(codex).
             if let runtime::RuntimeEvent::SessionExited { session, .. } = event {
                 rt.session_input_pressure.remove(session);
+                rt.input_pressure = rt
+                    .session_input_pressure
+                    .values()
+                    .max_by_key(|(_, at)| *at)
+                    .cloned();
             }
             // live 세션 추적 (suspend 보호)
             rt.live.observe(event);
@@ -2470,7 +2498,14 @@ impl eframe::App for App {
         // 통합 설정 창: 설정 5개는 settings::show가 인라인, 관리/모니터 7개는 아래
         // render_management 클로저가 각 패널 contents()를 렌더한다 (전체 통합, 2026-07-06).
         // config는 &mut로 넘기므로 클로저는 config 대신 미리 클론한 값을 쓴다 (borrow 분리).
-        let activity_rows = self.activity_rows();
+        // 설정창이 열려 있을 때만 조립 — 닫힌 평상시 프레임 비용 0(codex Low). 카테고리까지
+        // 조건에 넣으면 탭 전환 프레임에 빈 행이 한 프레임 번쩍이므로(category가 show() 안에서
+        // 갱신) 창 열림만 본다.
+        let activity_rows = if self.settings_open {
+            self.activity_rows()
+        } else {
+            Vec::new()
+        };
         let term_cfg = self.config.terminal.clone();
         let wsid = self.active.id.clone();
         let db_path = self.db_path.clone();

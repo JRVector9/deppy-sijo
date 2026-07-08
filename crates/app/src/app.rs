@@ -2659,25 +2659,36 @@ impl eframe::App for App {
         // 전환(switch_workspace → make_runtime)이 DB의 path/.env를 읽으므로 저장이 먼저다.
         let mut ws_created = false;
         if let Some(dir) = ws_create {
-            let name = crate::agent_detect::project_display_name(&dir.to_string_lossy())
-                .or_else(|| dir.file_name().map(|n| n.to_string_lossy().into_owned()))
-                .unwrap_or_else(|| "workspace".to_owned());
-            match self.db.create_workspace(&name) {
-                Ok(new_id) => {
-                    let path_str = dir.to_string_lossy().into_owned();
-                    if let Err(e) = self.db.set_workspace_path(&new_id, &path_str) {
-                        tracing::warn!("새 워크스페이스 경로 저장 실패: {e:#}");
+            let path_str = dir.to_string_lossy().into_owned();
+            // 같은 폴더의 워크스페이스가 이미 있으면 새로 만들지 않고 그리로 전환
+            // (중복 생성 방지 — path unique 제약이 없다, codex Medium).
+            if let Some(existing) = self.workspaces.iter().find(|ws| {
+                self.db.workspace_path(&ws.id).ok().flatten().as_deref() == Some(path_str.as_str())
+            }) {
+                ws_switch = Some(existing.id.clone());
+            } else {
+                let name = crate::agent_detect::project_display_name(&path_str)
+                    .or_else(|| dir.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| "workspace".to_owned());
+                match self.db.create_workspace(&name) {
+                    Ok(new_id) => {
+                        if let Err(e) = self.db.set_workspace_path(&new_id, &path_str) {
+                            // path 없는 워크스페이스로 전환하면 복원/.env가 엉뚱한 루트
+                            // 기준으로 시작한다 — 전환하지 않는다(codex Low).
+                            tracing::warn!("새 워크스페이스 경로 저장 실패 — 전환 취소: {e:#}");
+                        } else {
+                            let anchor = Self::folder_anchor(&path_str);
+                            let _ = self.db.set_workspace_anchor(
+                                &new_id,
+                                anchor.map(|a| a.0),
+                                anchor.map(|a| a.1),
+                            );
+                            ws_switch = Some(new_id);
+                            ws_created = true;
+                        }
                     }
-                    let anchor = Self::folder_anchor(&path_str);
-                    let _ = self.db.set_workspace_anchor(
-                        &new_id,
-                        anchor.map(|a| a.0),
-                        anchor.map(|a| a.1),
-                    );
-                    ws_switch = Some(new_id);
-                    ws_created = true;
+                    Err(e) => tracing::warn!("워크스페이스 생성 실패: {e:#}"),
                 }
-                Err(e) => tracing::warn!("워크스페이스 생성 실패: {e:#}"),
             }
         }
         if let Some(id) = ws_switch.filter(|id| *id != self.active.id) {

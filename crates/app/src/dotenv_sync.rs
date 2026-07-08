@@ -253,10 +253,14 @@ INVALID LINE
             "GITHUB_TOKEN",
             "DB_PASSWORD",
             "AUTH_DOMAIN",
+            // 자격증명 포함 URL — 복원 경로 redaction을 위해 키 판정으로 승격(codex High,
+            // 이전엔 validate_env_var_for_persistence 폴백이 잡았다).
+            "DATABASE_URL",
+            "DB_URL",
         ] {
             assert!(is_secret_key(k), "{k}는 secret이어야 함");
         }
-        for k in ["DATABASE_URL", "NODE_ENV", "PORT", "LOG_LEVEL"] {
+        for k in ["NODE_ENV", "PORT", "LOG_LEVEL"] {
             assert!(!is_secret_key(k), "{k}는 plain이어야 함");
         }
     }

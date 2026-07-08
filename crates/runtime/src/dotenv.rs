@@ -43,6 +43,15 @@ pub fn parse_dotenv(content: &str) -> Vec<(String, String)> {
 /// 남는 것보다 plain이 keyring에 들어가는 쪽이 안전).
 pub fn is_secret_key(key: &str) -> bool {
     let upper = key.to_ascii_uppercase();
+    // DB 접속 URL은 자격증명을 포함한다 — storage::secret_like_env_key와 판정 정합
+    // (복원 경로가 이 함수만 쓰므로 여기서도 secret으로 잡아 redaction 등록, codex High).
+    if upper == "DATABASE_URL"
+        || upper == "DB_URL"
+        || upper.ends_with("_DATABASE_URL")
+        || upper.ends_with("_DB_URL")
+    {
+        return true;
+    }
     [
         "SECRET",
         "TOKEN",

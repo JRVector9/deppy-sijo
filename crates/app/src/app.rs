@@ -335,6 +335,9 @@ struct SessionAlert {
     pulse_started: Option<std::time::Instant>,
 }
 
+/// (env key, 값 또는 credential_id) 쌍 목록 — SetSessionDefaultEnv용.
+type EnvPairs = Vec<(String, String)>;
+
 pub struct App {
     config: Config,
     config_path: PathBuf,
@@ -642,7 +645,7 @@ impl App {
                 db_path: db_path.to_path_buf(),
                 workspace_id: workspace_id.to_owned(),
             }),
-            shell_cwd,
+            shell_cwd.clone(),
             Self::shim_shell_env(config),
         );
         // 상태 이벤트 도착 시 UI를 깨운다 (§14.1 Warm 알림 유지). subscribe→restore 순서
@@ -651,6 +654,24 @@ impl App {
             let ctx = egui_ctx.clone();
             move || ctx.request_repaint()
         }));
+        // .env → dotenv profile 동기화 후 **RestoreWorkspace 전에** 기본 env를 심는다 —
+        // 복원/초기 셸도 .env 변수를 받게(순서 버그 수정, 2026-07-08 실측). 이후 sync_dotenv_env
+        // 가 live 변경을 마저 담당한다.
+        if let Some(root) = &shell_cwd {
+            let store = KeyringSecretStore;
+            let _ = crate::dotenv_sync::sync_workspace_dotenv(
+                db,
+                &store,
+                redaction,
+                workspace_id,
+                root,
+            );
+            let (env_plain, env_secrets) = Self::dotenv_default_env(db, workspace_id);
+            let _ = runtime.send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
+                env_plain,
+                env_secrets,
+            });
+        }
         if let Err(e) = runtime.send_command(runtime::RuntimeCommand::RestoreWorkspace) {
             tracing::warn!("workspace 복원 명령 전송 실패: {e:#}");
         }
@@ -1372,6 +1393,28 @@ impl App {
     /// 활성 workspace의 `.env`를 환경 profile로 동기화하고, 그 env를 워커 기본 env로
     /// 전송한다(SetSessionDefaultEnv) — 이후 새 셸부터 자동 주입(2026-07-07 요청).
     /// 시작/워크스페이스 전환 시 1회. best-effort — 실패해도 앱은 정상 동작.
+    /// workspace의 dotenv profile을 (env_plain, env_secrets=credential 참조)로 읽는다 —
+    /// SetSessionDefaultEnv용. profile 없으면 빈 값.
+    fn dotenv_default_env(db: &Db, workspace_id: &str) -> (EnvPairs, EnvPairs) {
+        let (mut env_plain, mut env_secrets) = (Vec::new(), Vec::new());
+        if let Ok(profiles) = db.list_env_profiles(workspace_id)
+            && let Some(p) = profiles
+                .into_iter()
+                .find(|p| p.kind == crate::dotenv_sync::DOTENV_PROFILE_KIND)
+            && let Ok(vars) = db.list_env_vars(&p.id)
+        {
+            for var in vars {
+                match var.value {
+                    crate::env::EnvValue::Plain(v) => env_plain.push((var.key, v)),
+                    crate::env::EnvValue::Secret { credential_id } => {
+                        env_secrets.push((var.key, credential_id));
+                    }
+                }
+            }
+        }
+        (env_plain, env_secrets)
+    }
+
     fn sync_dotenv_env(&mut self) {
         // 폴링 기준점은 **읽기 전에** 캡처한다 — 읽기~기록 사이에 .env가 바뀌면 새 mtime이
         // 기준점이 되어 다음 폴링이 "변화 없음"으로 삼키던 TOCTOU 제거(codex 검증).
@@ -1404,23 +1447,11 @@ impl App {
         // 2) dotenv profile env를 워커 기본 env로 전송. **.env가 지금 존재할 때만** 주입 —
         //    .env가 사라졌으면(브랜치 전환/삭제) profile은 보존하되 stale secret이 새 셸에
         //    계속 들어가면 안 된다(codex High). 없으면 빈 값으로 잔여 기본 env를 지운다.
-        let (mut env_plain, mut env_secrets) = (Vec::new(), Vec::new());
-        if dotenv_present
-            && let Ok(profiles) = self.db.list_env_profiles(&self.active.id)
-            && let Some(p) = profiles
-                .into_iter()
-                .find(|p| p.kind == crate::dotenv_sync::DOTENV_PROFILE_KIND)
-            && let Ok(vars) = self.db.list_env_vars(&p.id)
-        {
-            for var in vars {
-                match var.value {
-                    crate::env::EnvValue::Plain(v) => env_plain.push((var.key, v)),
-                    crate::env::EnvValue::Secret { credential_id } => {
-                        env_secrets.push((var.key, credential_id));
-                    }
-                }
-            }
-        }
+        let (env_plain, env_secrets) = if dotenv_present {
+            Self::dotenv_default_env(&self.db, &self.active.id)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let _ = self
             .active
             .runtime

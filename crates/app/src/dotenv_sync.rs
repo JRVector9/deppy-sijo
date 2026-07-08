@@ -112,7 +112,13 @@ pub fn sync_workspace_dotenv(
 
     for (key, value) in &parsed {
         let current = existing.iter().find(|v| &v.key == key);
-        if is_secret_key(key) {
+        // secret 판정은 **storage의 검증과 일치**시켜야 한다 — storage가 Plain으로 거부하는
+        // 키(DATABASE_URL/DB_URL/*_TOKEN 등)나 값을 우리가 Plain으로 저장하려다 upsert가
+        // 실패해 동기화 전체가 중단됐다(2026-07-08 실측). 우리 휴리스틱(is_secret_key)에
+        // 더해 storage가 거부하면 secret으로 저장한다.
+        let needs_secret = is_secret_key(key)
+            || Db::validate_env_var_for_persistence(key, &EnvValue::Plain(value.clone())).is_err();
+        if needs_secret {
             let secret = secret::SecretString::new(value.clone());
             redaction.register(&secret);
             // 기존 secret var면 credential 재사용(keyring 값만 갱신), 아니면 새로 만든다.

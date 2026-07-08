@@ -44,6 +44,15 @@ pub(crate) struct PersistPipe {
 
 impl PersistPipe {
     pub(crate) fn open(config: &PersistConfig) -> anyhow::Result<Self> {
+        Self::open_with_worker_config(config, DbWriteWorkerConfig::default())
+    }
+
+    /// batch writer 설정을 명시로 받는 open — 테스트에서 긴 flush_interval로 타이머 flush를
+    /// 배제해 "drop이 flush했다"를 결정적으로 검증하는 데 쓴다.
+    pub(crate) fn open_with_worker_config(
+        config: &PersistConfig,
+        worker_config: DbWriteWorkerConfig,
+    ) -> anyhow::Result<Self> {
         let conn = rusqlite::Connection::open(&config.db_path)
             .with_context(|| format!("persist DB 열기 실패: {}", config.db_path.display()))?;
         // 앱의 Db::open과 같은 연결 규약 (§11.9). 스키마는 앱이 이미 마이그레이션했다.
@@ -62,7 +71,7 @@ impl PersistPipe {
             None => (MuxWindowId::new(), Vec::new(), None),
         };
         let (write_worker, write_handle) =
-            match DbWriteWorker::spawn(&config.db_path, DbWriteWorkerConfig::default()) {
+            match DbWriteWorker::spawn(&config.db_path, worker_config) {
                 Ok(worker) => {
                     let handle = worker.handle();
                     (Some(worker), Some(handle))
@@ -310,16 +319,25 @@ mod tests {
         let workspace_id = db.create_workspace("runtime").unwrap();
         drop(db);
 
-        let mut pipe = PersistPipe::open(&PersistConfig {
-            db_path: db_path.clone(),
-            workspace_id,
-        })
+        // 타이머 flush(기본 50ms)를 사실상 무한대로 늘려 배제한다 — 그래야 drop 시점까지
+        // batch가 pending이고, 값이 남아있다면 그건 **drop이 flush했다**는 결정적 증거다
+        // (타이머/direct fallback으로 통과하는 false positive 제거, codex 리뷰).
+        let mut pipe = PersistPipe::open_with_worker_config(
+            &PersistConfig {
+                db_path: db_path.clone(),
+                workspace_id,
+            },
+            DbWriteWorkerConfig {
+                flush_interval: std::time::Duration::from_secs(3600),
+                ..DbWriteWorkerConfig::default()
+            },
+        )
         .unwrap();
         let session = SessionId(1);
         pipe.session_spawned(session, "shell", None, "shell", "/bin/sh", &[]);
         pipe.session_status(session, session::SessionStatus::Done);
         pipe.session_log_offset(session, 64);
-        // flush_async_writes 호출 없이 drop — 버퍼가 flush돼야 한다.
+        // flush_async_writes 호출 없이 즉시 drop — 타이머가 안 도니 오직 drop만 flush 가능.
         drop(pipe);
 
         let conn = rusqlite::Connection::open(&db_path).unwrap();

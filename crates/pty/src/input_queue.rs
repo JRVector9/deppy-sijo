@@ -202,7 +202,12 @@ pub(crate) fn enqueue_input(
                 });
             }
             Err(TrySendError::Disconnected(_)) => {
-                queue.release(attempted_bytes - sent_bytes, chunk_count - sent_chunks);
+                // writer thread가 죽음 — 이미 보낸 prefix chunk도 receiver drop으로
+                // complete()되지 않는다. 따라서 **전체 예약**(sent+unsent)을 되돌려 닫히는
+                // 큐에 회계 누수를 남기지 않는다(Full 경로는 살아있는 writer가 완료하므로
+                // 미전송분만 release가 맞지만, Disconnected는 다르다 — codex Medium).
+                let _ = (sent_bytes, sent_chunks);
+                queue.release(attempted_bytes, chunk_count);
                 queue.close();
                 let inner = queue.inner.lock().expect("PTY input queue mutex");
                 return Ok(PtyInputEnqueueResult::Rejected {

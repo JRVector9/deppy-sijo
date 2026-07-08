@@ -2635,6 +2635,7 @@ dependencies = [
  "anyhow",
  "audit",
  "auth",
+ "libc",
  "mcp",
  "mcp-store",
  "rusqlite",

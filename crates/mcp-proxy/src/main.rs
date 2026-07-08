@@ -272,20 +272,25 @@ fn chain_user_statusline(json: &serde_json::Value, payload: &str) -> Option<Stri
     // payload를 stdin으로 넘겨 사용자 스크립트 실행(그들이 기대하는 입력 형식 그대로).
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
-    let mut child = Command::new("sh")
-        .arg("-c")
+    // **새 프로세스 그룹**으로 띄운다(setpgid) — 타임아웃 시 sh뿐 아니라 그 손자(파이프로
+    // stdout을 붙든 서브프로세스)까지 그룹째 kill해 좀비/블록을 막는다(codex High/Med).
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
         .arg(&command)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    cmd.process_group(0); // pgid = 자식 pid
+    let mut child = cmd.spawn().ok()?;
+    let pid = child.id() as i32;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(payload.as_bytes());
         // drop(stdin)으로 EOF 신호 — take한 값이 블록 끝에서 drop됨.
     }
-    // stdout을 별도 스레드로 읽어 파이프-full 데드락을 피하고, 최대 2초만 기다린다 —
-    // 사용자 statusLine이 멈추면 claude 렌더가 무한 블록되지 않게 kill(codex High).
+    // stdout을 별도 스레드로 읽어 파이프-full 데드락을 피하고, 최대 2초만 기다린다.
     let mut stdout = child.stdout.take()?;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -293,15 +298,15 @@ fn chain_user_statusline(json: &serde_json::Value, payload: &str) -> Option<Stri
         let _ = stdout.read_to_end(&mut buf);
         let _ = tx.send(buf);
     });
-    let out = match rx.recv_timeout(std::time::Duration::from_secs(2)) {
-        Ok(buf) => buf,
-        Err(_) => {
-            let _ = child.kill();
-            return None; // 타임아웃 — 이번 렌더는 우리 바만(빈 출력)
-        }
-    };
+    let result = rx.recv_timeout(std::time::Duration::from_secs(2)).ok();
+    // 성공/타임아웃 무관하게 **그룹째 kill 후 reap** — stdout EOF 뒤에도 살아있는 프로세스나
+    // 손자를 남기지 않는다. 이미 죽었으면 killpg는 no-op(ESRCH). 그 뒤 wait는 즉시 반환.
+    #[cfg(unix)]
+    unsafe {
+        libc::killpg(pid, libc::SIGKILL);
+    }
     let _ = child.wait();
-    Some(String::from_utf8_lossy(&out).into_owned())
+    result.map(|buf| String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// 현재 unix epoch seconds. 정상 시스템 시계에서 UNIX_EPOCH 이후이므로 0으로 폴백.

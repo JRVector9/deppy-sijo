@@ -24,6 +24,10 @@ mcp-store = { path = "../mcp-store" }
 secret = { path = "../secret" }
 storage = { path = "../storage" }
 
+[target.'cfg(unix)'.dependencies]
+# statusLine 체이닝 자식을 프로세스 그룹째 kill/reap (좀비·손자 프로세스 방지)
+libc = { workspace = true }
+
 [dev-dependencies]
 # 테스트에서 audit 로그 행을 직접 세기 위한 raw 연결 (storage가 조회 API를 노출하지 않음)
 rusqlite = { workspace = true }

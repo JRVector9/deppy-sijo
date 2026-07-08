@@ -2259,6 +2259,7 @@ impl eframe::App for App {
         let mut activity_action = None;
         let mut notif_click = None;
         let mut ws_switch: Option<String> = None;
+        let mut env_action: Option<ui::env_profiles::EnvAction> = None;
         // #3 워크스페이스 이름 편집 캡처 (클로저 밖에서 db/refresh 처리 — self 전체 &mut).
         let out = ui::settings::show(
             ui.ctx(),
@@ -2297,11 +2298,14 @@ impl eframe::App for App {
                         );
                     }
                     C::Environment => {
-                        if let Err(e) =
-                            self.env_profiles_ui
-                                .contents(ui, &mut self.db, &wsid, &text)
+                        match self
+                            .env_profiles_ui
+                            .contents(ui, &mut self.db, &wsid, &text)
                         {
-                            ui.colored_label(ui.visuals().error_fg_color, format!("{e:#}"));
+                            Ok(a) => env_action = a,
+                            Err(e) => {
+                                ui.colored_label(ui.visuals().error_fg_color, format!("{e:#}"));
+                            }
                         }
                     }
                     C::Agents => {
@@ -2348,6 +2352,17 @@ impl eframe::App for App {
             },
         );
         // 관리/모니터 액션 처리 (클로저 밖 — self 전체 &mut 필요한 것들)
+        // 환경 메뉴에서 프로젝트 폴더 설정 → workspace path 저장 + .env 재동기화 + 파일트리 루트.
+        if let Some(ui::env_profiles::EnvAction::SetProjectPath(path)) = env_action {
+            let path_str = path.to_string_lossy();
+            if let Err(e) = self.db.set_workspace_path(&self.active.id, &path_str) {
+                tracing::warn!("프로젝트 폴더 저장 실패: {e:#}");
+            } else {
+                self.sync_dotenv_env(); // .env → profile + SetSessionDefaultEnv(새 셸에 적용)
+                self.refresh_file_tree_root();
+                self.refresh_workspaces();
+            }
+        }
         if let Some(id) = ws_switch.filter(|id| *id != self.active.id) {
             {
                 self.switch_workspace(&id);

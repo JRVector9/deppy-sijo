@@ -21,6 +21,8 @@ uuid = { workspace = true }
 i18n = { workspace = true }
 arboard = { workspace = true }
 image = { workspace = true }
+# 프로젝트 폴더 선택 네이티브 다이얼로그 (환경 메뉴 — 워크스페이스 path 지정, 2026-07-08)
+rfd = "0.15"
 audit = { path = "../audit" }
 auth = { path = "../auth" }
 mcp = { path = "../mcp" }

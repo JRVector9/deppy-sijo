@@ -1,6 +1,12 @@
 use crate::env::{self, EnvLayer, EnvValue};
 use crate::storage::{CredentialMeta, Db, EnvProfileRow, EnvVarRow};
 
+/// 환경 UI에서 App으로 올라가는 액션.
+pub enum EnvAction {
+    /// 프로젝트 폴더(워크스페이스 path) 설정 — App이 .env 재동기화 + 파일트리 루트 갱신.
+    SetProjectPath(std::path::PathBuf),
+}
+
 /// 프로젝트 환경(env profile) 관리 창.
 pub struct EnvProfilesUi {
     selected: Option<String>,
@@ -41,7 +47,43 @@ impl EnvProfilesUi {
         db: &mut Db,
         workspace_id: &str,
         catalog: &i18n::Catalog,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<EnvAction>> {
+        let mut action = None;
+        // ---- 프로젝트 폴더(워크스페이스 path) — 이 폴더의 .env가 자동 동기화된다 ----
+        let current_path = db.workspace_path(workspace_id).ok().flatten();
+        let has_path = current_path
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty());
+        ui.horizontal(|ui| {
+            ui.label(catalog.t("env.project_folder", &[]));
+            let shown = if has_path {
+                current_path.clone().unwrap_or_default()
+            } else {
+                catalog.t("env.project_folder.unset", &[])
+            };
+            ui.monospace(shown);
+            if ui
+                .button(catalog.t("env.project_folder.choose", &[]))
+                .clicked()
+                && let Some(dir) = rfd::FileDialog::new().pick_folder()
+            {
+                action = Some(EnvAction::SetProjectPath(dir));
+            }
+            if has_path
+                && ui
+                    .button(catalog.t("env.project_folder.clear", &[]))
+                    .clicked()
+            {
+                action = Some(EnvAction::SetProjectPath(std::path::PathBuf::new()));
+            }
+        });
+        ui.label(
+            egui::RichText::new(catalog.t("env.project_folder.hint", &[]))
+                .small()
+                .weak(),
+        );
+        ui.separator();
+
         if self.cached_workspace.as_deref() != Some(workspace_id) {
             // workspace가 바뀌었다 — 이전 workspace의 profile/var/선택으로
             // 조회·삭제·upsert하면 안 된다
@@ -115,10 +157,10 @@ impl EnvProfilesUi {
 
         // ---- 선택된 profile의 env vars ----
         let Some(profile_id) = self.selected.clone() else {
-            return Ok(());
+            return Ok(action);
         };
         let Some(profile) = profiles.iter().find(|p| p.id == profile_id) else {
-            return Ok(());
+            return Ok(action);
         };
         ui.separator();
         ui.heading(catalog.t("env.vars_heading", &[("name", &profile.name)]));
@@ -274,7 +316,7 @@ impl EnvProfilesUi {
                 ));
             }
         }
-        Ok(())
+        Ok(action)
     }
 }
 

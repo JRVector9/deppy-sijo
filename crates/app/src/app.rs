@@ -2354,11 +2354,23 @@ impl eframe::App for App {
         // 관리/모니터 액션 처리 (클로저 밖 — self 전체 &mut 필요한 것들)
         // 환경 메뉴에서 프로젝트 폴더 설정 → workspace path 저장 + .env 재동기화 + 파일트리 루트.
         if let Some(ui::env_profiles::EnvAction::SetProjectPath(path)) = env_action {
-            let path_str = path.to_string_lossy();
+            let path_str = path.to_string_lossy().into_owned();
             if let Err(e) = self.db.set_workspace_path(&self.active.id, &path_str) {
                 tracing::warn!("프로젝트 폴더 저장 실패: {e:#}");
             } else {
                 self.sync_dotenv_env(); // .env → profile + SetSessionDefaultEnv(새 셸에 적용)
+                // active runtime의 셸 cwd도 갱신 — 새 셸/에이전트가 이 폴더에서 뜨게(codex High).
+                let new_cwd = std::path::PathBuf::from(&path_str);
+                let cwd = (new_cwd.is_dir()).then_some(new_cwd);
+                let _ = self
+                    .active
+                    .runtime
+                    .send_command(runtime::RuntimeCommand::SetShellCwd(cwd.clone()));
+                // 워크스페이스 표시명도 새 폴더명으로 갱신 — path와 cwd 자동추적 name이
+                // 어긋나지 않게(codex Medium). 해제(빈 path)면 cwd 자동추적에 맡긴다.
+                if let Some(dir) = &cwd {
+                    self.update_workspace_folder_name(&dir.to_string_lossy());
+                }
                 self.refresh_file_tree_root();
                 self.refresh_workspaces();
             }

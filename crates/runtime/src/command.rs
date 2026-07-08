@@ -123,6 +123,9 @@ pub enum RuntimeCommand {
         /// (env key, credential_id)
         env_secrets: Vec<(String, String)>,
     },
+    /// 이후 SpawnShell/SpawnAgent가 쓸 셸 cwd를 갱신한다(프로젝트 폴더 live 변경 —
+    /// 2026-07-08). None이면 앱 cwd 상속. **wire 계약: variant는 끝에만 추가**.
+    SetShellCwd(Option<std::path::PathBuf>),
 }
 
 impl std::fmt::Debug for RuntimeCommand {
@@ -174,6 +177,9 @@ impl std::fmt::Debug for RuntimeCommand {
                 .field("env_plain_count", &env_plain.len())
                 .field("env_secret_count", &env_secrets.len())
                 .finish(),
+            RuntimeCommand::SetShellCwd(cwd) => {
+                f.debug_tuple("SetShellCwd").field(&cwd.is_some()).finish()
+            }
             RuntimeCommand::WriteInput { session, bytes } => f
                 .debug_struct("WriteInput")
                 .field("session", session)

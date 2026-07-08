@@ -709,6 +709,10 @@ impl Worker {
                 self.default_env_plain = env_plain;
                 self.default_env_secrets = env_secrets;
             }
+            RuntimeCommand::SetShellCwd(cwd) => {
+                // 프로젝트 폴더 live 변경 — 이후 SpawnShell/SpawnAgent가 이 cwd에서 뜬다.
+                self.shell.cwd = cwd;
+            }
             RuntimeCommand::WriteInput { session, bytes } => {
                 if let Some(active) = self.sessions.get_mut(&session) {
                     match active.write_input(&bytes) {

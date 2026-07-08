@@ -195,6 +195,12 @@ CREATE TABLE agent_statusline (
     updated_at INTEGER NOT NULL
 );
 ",
+    // v18: 프로젝트 폴더 앵커(dev, ino) — 폴더 rename/이동 시 path가 stale돼도 세션 cwd의
+    // inode와 대조해 새 경로를 찾아 복구 제안하는 데 쓴다(2026-07-08).
+    "
+ALTER TABLE workspaces ADD COLUMN path_dev INTEGER;
+ALTER TABLE workspaces ADD COLUMN path_ino INTEGER;
+",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -880,6 +886,36 @@ impl Db {
             })
             .optional()
             .map_err(Into::into)
+    }
+
+    /// 프로젝트 폴더 앵커(dev, ino)를 저장한다 — 폴더 rename 감지·복구용(2026-07-08).
+    /// path 미설정/무효면 (None, None)으로 지운다.
+    pub fn set_workspace_anchor(
+        &self,
+        id: &str,
+        dev: Option<i64>,
+        ino: Option<i64>,
+    ) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE workspaces SET path_dev = ?2, path_ino = ?3 WHERE id = ?1",
+                (id, dev, ino),
+            )
+            .with_context(|| format!("workspace 앵커 저장 실패: {id}"))?;
+        Ok(())
+    }
+
+    /// 프로젝트 폴더 앵커(dev, ino) — 둘 다 있을 때만 Some.
+    pub fn workspace_anchor(&self, id: &str) -> anyhow::Result<Option<(i64, i64)>> {
+        let row: Option<(Option<i64>, Option<i64>)> = self
+            .conn
+            .query_row(
+                "SELECT path_dev, path_ino FROM workspaces WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(d, i)| Some((d?, i?))))
     }
 
     /// workspace + 그 자식 데이터(세션/mux/env)를 한 트랜잭션으로 삭제한다 (destructive).

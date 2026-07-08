@@ -350,6 +350,10 @@ pub struct App {
     /// (존재여부, mtime) 변화를 직접 감지해 재동기화한다(codex — stale secret 주입 방지).
     last_dotenv_check: std::time::Instant,
     last_dotenv_state: Option<(bool, Option<std::time::SystemTime>)>,
+    /// 프로젝트 폴더 rename 복구 확인 모달 — Some((old, new))이면 표시(2026-07-08).
+    workspace_rename_prompt: Option<(String, String)>,
+    /// rename 제안을 '무시'한 워크스페이스 — 이번 실행 동안 재확인 안 함(경로 변경 시 해제).
+    dismissed_renames: std::collections::HashSet<String>,
     settings_open: bool,
     /// 통합 설정 창의 선택된 카테고리.
     settings_category: ui::settings::Category,
@@ -519,6 +523,8 @@ impl App {
             last_ui_font: None,
             last_dotenv_check: std::time::Instant::now(),
             last_dotenv_state: None,
+            workspace_rename_prompt: None,
+            dismissed_renames: std::collections::HashSet::new(),
             settings_open: false,
             settings_category: ui::settings::Category::default(),
             settings_search: String::new(),
@@ -1265,6 +1271,7 @@ impl App {
         self.agent_turn_done.clear();
         self.session_alerts.clear();
         self.session_cwds.clear();
+        self.workspace_rename_prompt = None; // 워크스페이스 전환 시 옛 rename 제안 폐기
         self.agent_info.clear();
         self.statuslines.clear();
         let _ = old
@@ -1462,6 +1469,79 @@ impl App {
         self.last_dotenv_state = Some(baseline);
     }
 
+    /// 폴더의 (dev, ino)를 읽는다(inode 앵커용). 유효 디렉터리가 아니면 None.
+    fn folder_anchor(path: &str) -> Option<(i64, i64)> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = std::fs::metadata(path).ok()?;
+            if !meta.is_dir() {
+                return None;
+            }
+            Some((meta.dev() as i64, meta.ino() as i64))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            None
+        }
+    }
+
+    /// 활성 workspace의 프로젝트 폴더 앵커(dev,ino)를 현재 경로 기준으로 저장한다.
+    fn save_workspace_anchor(&self) {
+        let anchor = self
+            .db
+            .workspace_path(&self.active.id)
+            .ok()
+            .flatten()
+            .filter(|p| !p.trim().is_empty())
+            .and_then(|p| Self::folder_anchor(&p));
+        let _ =
+            self.db
+                .set_workspace_anchor(&self.active.id, anchor.map(|a| a.0), anchor.map(|a| a.1));
+    }
+
+    /// 프로젝트 폴더 rename/이동 감지(2s 폴링). 저장된 경로가 stale(사라짐)이고, 세션 cwd 중
+    /// 저장된 앵커(dev,ino)와 일치하는 폴더가 있으면 → 그 폴더가 이동된 새 경로다. 확인 모달로
+    /// 제안한다(사용자 요청 2026-07-08). 앵커 없으면(구 워크스페이스) 유효 경로일 때 backfill.
+    fn detect_workspace_folder_rename(&mut self) {
+        if self.workspace_rename_prompt.is_some() {
+            return; // 이미 확인 대기 중
+        }
+        let ws = self.active.id.clone();
+        let Some(path) = self
+            .db
+            .workspace_path(&ws)
+            .ok()
+            .flatten()
+            .filter(|p| !p.trim().is_empty())
+        else {
+            return; // 폴더 미설정 — 감지 대상 아님
+        };
+        // 경로가 아직 유효하면: 앵커가 없으면 backfill하고 끝.
+        if std::path::Path::new(&path).is_dir() {
+            if self.db.workspace_anchor(&ws).ok().flatten().is_none() {
+                self.save_workspace_anchor();
+            }
+            self.dismissed_renames.remove(&ws); // 경로 정상화 → 무시 상태 해제
+            return;
+        }
+        // 경로 stale — 무시한 워크스페이스는 재확인 안 함.
+        if self.dismissed_renames.contains(&ws) {
+            return;
+        }
+        let Some(anchor) = self.db.workspace_anchor(&ws).ok().flatten() else {
+            return; // 앵커 없음 → 자동 복구 불가(재선택 안내는 파일트리/환경메뉴가 담당)
+        };
+        // 세션 cwd 중 앵커(dev,ino)와 일치하는 폴더 = 이동된 새 경로.
+        for cwd in self.session_cwds.values() {
+            if Self::folder_anchor(cwd) == Some(anchor) {
+                self.workspace_rename_prompt = Some((path.clone(), cwd.clone()));
+                return;
+            }
+        }
+    }
+
     /// 활성 workspace `.env`의 (존재여부, mtime) — 폴링 비교용.
     fn dotenv_stat(&self) -> (bool, Option<std::time::SystemTime>) {
         match self.active_tree_root() {
@@ -1480,6 +1560,8 @@ impl App {
             return;
         }
         self.last_dotenv_check = std::time::Instant::now();
+        // 프로젝트 폴더 rename/이동 감지도 같은 2s 주기로 (앵커 backfill 포함).
+        self.detect_workspace_folder_rename();
         let state = self.dotenv_stat();
         // 기준점은 sync_dotenv_env가 매번 스스로 잡는다(시작/전환 직후 포함) — 여기서는
         // 변화 감지만. None(이론상 미도달)도 안전하게 재동기화로 처리.
@@ -2221,6 +2303,64 @@ impl eframe::App for App {
             ui.ctx().request_repaint();
         }
 
+        // 프로젝트 폴더 rename/이동 감지 → 복구 확인 모달 (사용자 요청 2026-07-08).
+        if let Some((old, new)) = self.workspace_rename_prompt.clone() {
+            let mut decision: Option<bool> = None; // Some(true)=갱신, Some(false)=무시
+            egui::Window::new(text.t("workspace.folder_moved.title", &[]))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    ui.label(text.t("workspace.folder_moved.body", &[]));
+                    ui.add_space(4.0);
+                    ui.label(text.t("workspace.folder_moved.from", &[("path", &old)]));
+                    ui.label(text.t("workspace.folder_moved.to", &[("path", &new)]));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(text.t("workspace.folder_moved.update", &[]))
+                            .clicked()
+                        {
+                            decision = Some(true);
+                        }
+                        if ui
+                            .button(text.t("workspace.folder_moved.ignore", &[]))
+                            .clicked()
+                        {
+                            decision = Some(false);
+                        }
+                    });
+                });
+            match decision {
+                Some(true) => {
+                    // 새 경로로 갱신 + 앵커/env/셸 cwd 재구성 (SetProjectPath와 동일 흐름).
+                    if let Err(e) = self.db.set_workspace_path(&self.active.id, &new) {
+                        tracing::warn!("폴더 이동 경로 갱신 실패: {e:#}");
+                    } else {
+                        self.save_workspace_anchor();
+                        self.sync_dotenv_env();
+                        let cwd = std::path::PathBuf::from(&new);
+                        let cwd = cwd.is_dir().then_some(cwd);
+                        let _ = self
+                            .active
+                            .runtime
+                            .send_command(runtime::RuntimeCommand::SetShellCwd(cwd.clone()));
+                        if let Some(dir) = &cwd {
+                            self.update_workspace_folder_name(&dir.to_string_lossy());
+                        }
+                        self.refresh_file_tree_root();
+                        self.refresh_workspaces();
+                    }
+                    self.workspace_rename_prompt = None;
+                }
+                Some(false) => {
+                    self.dismissed_renames.insert(self.active.id.clone());
+                    self.workspace_rename_prompt = None;
+                }
+                None => {}
+            }
+        }
+
         // known_hosts는 settings 열 때 lazily 로드한다 (닫으면 아래서 None으로 리셋 → 재로드).
         if self.settings_open && self.known_hosts_cache.is_none() {
             let kh = self.load_known_hosts();
@@ -2364,6 +2504,8 @@ impl eframe::App for App {
             if let Err(e) = self.db.set_workspace_path(&self.active.id, &path_str) {
                 tracing::warn!("프로젝트 폴더 저장 실패: {e:#}");
             } else {
+                self.save_workspace_anchor(); // rename 복구용 (dev,ino) 앵커
+                self.dismissed_renames.remove(&self.active.id);
                 self.sync_dotenv_env(); // .env → profile + SetSessionDefaultEnv(새 셸에 적용)
                 // active runtime의 셸 cwd도 갱신 — 새 셸/에이전트가 이 폴더에서 뜨게(codex High).
                 let new_cwd = std::path::PathBuf::from(&path_str);

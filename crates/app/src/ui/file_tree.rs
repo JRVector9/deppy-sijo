@@ -891,7 +891,10 @@ impl FileTreeUi {
                         ucol,
                         egui::Stroke::NONE,
                     ));
-                    if up.on_hover_text(catalog.t("file_tree.parent", &[])).clicked() {
+                    if up
+                        .on_hover_text(catalog.t("file_tree.parent", &[]))
+                        .clicked()
+                    {
                         go_parent = true;
                     }
                 }
@@ -1009,7 +1012,11 @@ impl FileTreeUi {
 
         // 상위 폴더 이동 요청 — 헤더 클로저 밖에서 set_root(부모)로 리스팅/워처까지 재구성.
         if go_parent
-            && let Some(parent) = self.root.as_ref().and_then(|r| r.parent()).map(Path::to_path_buf)
+            && let Some(parent) = self
+                .root
+                .as_ref()
+                .and_then(|r| r.parent())
+                .map(Path::to_path_buf)
         {
             self.set_root(Some(parent));
         }

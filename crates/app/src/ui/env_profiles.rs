@@ -1,4 +1,4 @@
-use crate::env::{self, EnvLayer, EnvValue};
+use crate::env::EnvValue;
 use crate::storage::{CredentialMeta, Db, EnvProfileRow, EnvVarRow};
 
 /// 환경 UI에서 App으로 올라가는 액션.
@@ -17,6 +17,11 @@ pub struct EnvProfilesUi {
     var_plain_value: String,
     var_credential_id: Option<String>,
     error: Option<String>,
+    /// '+ 추가' 클릭 시에만 인라인 추가 폼을 펼친다(스크린샷: 기본은 표만 — P2).
+    show_add_form: bool,
+    /// 프로파일 관리 UI 수동 펼침 — 기본 숨김(P1)이어도 '프로파일 관리…' 링크로 접근
+    /// 가능(단일 프로파일에서 두 번째 생성 경로 보존 — codex Med).
+    show_profile_controls: bool,
     profiles: Option<Vec<EnvProfileRow>>,
     vars: Option<Vec<EnvVarRow>>,
     /// credential 메타 캐시 — 매 프레임 list_credentials() 동기 SQLite 조회 방지.
@@ -37,6 +42,15 @@ impl EnvProfilesUi {
         self.credentials = None;
     }
 
+    /// 추가 폼 draft를 버린다 — 워크스페이스/프로파일이 바뀌면 이전 컨텍스트의 입력이
+    /// 다른 대상에 저장되는 누수를 막는다(codex Med).
+    fn reset_var_form(&mut self) {
+        self.show_add_form = false;
+        self.var_key.clear();
+        self.var_plain_value.clear();
+        self.var_credential_id = None;
+    }
+
     pub fn new() -> Self {
         Self {
             selected: None,
@@ -47,6 +61,8 @@ impl EnvProfilesUi {
             var_plain_value: String::new(),
             var_credential_id: None,
             error: None,
+            show_add_form: false,
+            show_profile_controls: false,
             profiles: None,
             vars: None,
             credentials: None,
@@ -66,6 +82,9 @@ impl EnvProfilesUi {
             self.vars = None;
             self.selected = None;
             self.cached_workspace = Some(workspace_id.to_owned());
+            // 이전 워크스페이스에서 펼친 추가 폼/입력값이 넘어와 엉뚱한 곳에 저장되지 않게.
+            self.reset_var_form();
+            self.show_profile_controls = false;
             // self.credentials는 유지 — credential은 workspace에 속하지 않는 전역 데이터.
         }
 
@@ -104,19 +123,23 @@ impl EnvProfilesUi {
             .map(|p| p.is_production)
             .unwrap_or(false);
 
-        // 프로파일 선택기를 **상단**에 둔다(#5). 이 안에서 선택 변경/삭제 시 self.selected와
-        // self.vars(=None)가 바뀔 수 있으므로, 아래에서 profile_id·vars를 **재확정**한다
-        // (안 그러면 이전 프로파일 vars가 캐시에 고정돼 오표시/오삭제 — codex High).
-        compact_profile_controls(
-            ui,
-            self,
-            db,
-            workspace_id,
-            &profiles,
-            pre_production,
-            catalog,
-        )?;
-        ui.add_space(14.0);
+        // 프로파일 선택기(#5, 상단): 스크린샷은 프로젝트당 환경이 암묵적 1개라 노출하지
+        // 않는다 — **2개 이상이거나 production일 때만** 표시(관리 기능 보존, P1).
+        // 이 안에서 선택 변경/삭제 시 self.selected/self.vars가 바뀔 수 있으므로 아래에서
+        // profile_id·vars를 **재확정**한다(codex High — stale 캐시 오표시/오삭제 방지).
+        let controls_visible = profiles.len() > 1 || pre_production || self.show_profile_controls;
+        if controls_visible {
+            compact_profile_controls(
+                ui,
+                self,
+                db,
+                workspace_id,
+                &profiles,
+                pre_production,
+                catalog,
+            )?;
+            ui.add_space(14.0);
+        }
 
         // controls가 프로파일을 생성/삭제하면 self.profiles=None로 만든다 — 그 경우 stale
         // 스냅샷으로 삭제된 id를 재선택하지 않게 **최신 목록을 재조회**한다(codex High).
@@ -136,13 +159,14 @@ impl EnvProfilesUi {
         {
             self.selected = profiles.first().map(|p| p.id.clone());
             self.vars = None;
+            self.reset_var_form();
         }
         let Some(profile_id) = self.selected.clone() else {
             return Ok(None);
         };
-        let Some(profile) = profiles.iter().find(|p| p.id == profile_id) else {
+        if !profiles.iter().any(|p| p.id == profile_id) {
             return Ok(None);
-        };
+        }
 
         let credentials = match &self.credentials {
             Some(c) => c.clone(),
@@ -169,7 +193,11 @@ impl EnvProfilesUi {
             Some(vars.len()),
             Some(&catalog.t("env.add_key", &[])),
         ) {
-            ui.memory_mut(|mem| mem.request_focus(env_var_key_input_id()));
+            // 토글(P2) — 스크린샷은 기본 표만, 폼은 '+ 추가'를 눌렀을 때만.
+            self.show_add_form = !self.show_add_form;
+            if self.show_add_form {
+                ui.memory_mut(|mem| mem.request_focus(env_var_key_input_id()));
+            }
         }
         env_table_header(
             ui,
@@ -183,11 +211,15 @@ impl EnvProfilesUi {
             env_table_divider(ui);
         }
         if vars.is_empty() {
-            env_empty_placeholder_row(ui, catalog);
+            if env_empty_placeholder_row(ui, catalog) {
+                self.show_add_form = true;
+            }
             env_table_divider(ui);
         }
 
-        compact_env_var_form(ui, self, db, &profile_id, &credentials, catalog)?;
+        if self.show_add_form {
+            compact_env_var_form(ui, self, db, &profile_id, &credentials, catalog)?;
+        }
 
         if let Some(key) = delete_key {
             db.delete_env_var(&profile_id, &key)?;
@@ -195,56 +227,24 @@ impl EnvProfilesUi {
             self.error = None;
         }
 
-        if !vars.is_empty() {
-            ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new(catalog.t("env.preview_heading", &[]))
-                    .size(13.0)
-                    .weak(),
+        // 미리보기 블록은 제거(P3) — 스크린샷은 표 중심. OS override 정보는 각 행
+        // dot hover 툴팁으로 제공(정보 손실 없음).
+        if !controls_visible {
+            // 기본 숨김(P1)이어도 프로파일 관리 진입점은 남긴다 — 작은 weak 링크(codex Med).
+            ui.add_space(10.0);
+            let link = ui.add(
+                egui::Label::new(
+                    egui::RichText::new(catalog.t("env.manage_profiles", &[]))
+                        .size(12.0)
+                        .color(ui.visuals().weak_text_color()),
+                )
+                .sense(egui::Sense::click()),
             );
-            let os_layer = EnvLayer {
-                name: "OS".into(),
-                vars: vars
-                    .iter()
-                    .filter_map(|v| {
-                        std::env::var_os(&v.key).map(|val| {
-                            (
-                                v.key.clone(),
-                                EnvValue::Plain(val.to_string_lossy().into_owned()),
-                            )
-                        })
-                    })
-                    .collect(),
-            };
-            let profile_layer = EnvLayer {
-                name: profile.name.clone(),
-                vars: vars
-                    .iter()
-                    .map(|v| (v.key.clone(), v.value.clone()))
-                    .collect(),
-            };
-            for resolved in env::resolve(&[os_layer, profile_layer]) {
-                let conflict = if resolved.overridden.is_empty() {
-                    String::new()
-                } else {
-                    let overridden = resolved.overridden.join(", ");
-                    catalog.t("env.preview_overridden", &[("names", &overridden)])
-                };
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} ← {}{}",
-                        display_value(
-                            &resolved.key,
-                            &resolved.value,
-                            &credentials,
-                            &catalog.t("env.deleted_credential", &[]),
-                        ),
-                        resolved.source,
-                        conflict
-                    ))
-                    .size(13.0)
-                    .weak(),
-                );
+            if link.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if link.clicked() {
+                self.show_profile_controls = true;
             }
         }
 
@@ -252,28 +252,6 @@ impl EnvProfilesUi {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
         Ok(None)
-    }
-}
-
-fn display_value(
-    key: &str,
-    value: &EnvValue,
-    credentials: &[CredentialMeta],
-    deleted_label: &str,
-) -> String {
-    match value {
-        EnvValue::Plain(v) => format!("{key} = {v}"),
-        EnvValue::Secret { credential_id } => {
-            let cred = credentials.iter().find(|c| &c.id == credential_id);
-            match cred {
-                Some(c) => format!(
-                    "{key} = [secret: {} {}]",
-                    c.label,
-                    c.masked_hint.as_deref().unwrap_or("")
-                ),
-                None => format!("{key} = [secret: {deleted_label}]"),
-            }
-        }
     }
 }
 
@@ -387,28 +365,43 @@ fn env_table_row(
         ui.visuals().text_color(),
     );
 
-    let override_center = egui::pos2(rect.right() - 72.0, y);
+    // dot(P4, 스크린샷): secret(마스킹) 행 = ● accent, plain 행 = ○ 회색.
+    // hover 툴팁: secret은 keyring 저장 안내, plain은 OS override 여부.
+    let dot_center = egui::pos2(rect.right() - 72.0, y);
+    let is_secret = matches!(var.value, EnvValue::Secret { .. });
     let has_os_override = std::env::var_os(&var.key).is_some();
-    let override_text = if has_os_override { "●" } else { "○" };
-    let override_color = if has_os_override {
-        ui.visuals().hyperlink_color
+    let (dot_text, dot_color) = if is_secret {
+        ("●", ui.visuals().hyperlink_color)
     } else {
-        ui.visuals().weak_text_color()
+        ("○", ui.visuals().weak_text_color())
     };
     painter.text(
-        override_center,
+        dot_center,
         egui::Align2::CENTER_CENTER,
-        override_text,
+        dot_text,
         egui::FontId::proportional(12.0),
-        override_color,
+        dot_color,
     );
-    let override_rect = egui::Rect::from_center_size(override_center, egui::vec2(20.0, 20.0));
-    ui.interact(
-        override_rect,
-        ui.id().with(("env_override", &var.key)),
+    let dot_rect = egui::Rect::from_center_size(dot_center, egui::vec2(20.0, 20.0));
+    // secret이면서 OS env에도 같은 키가 있으면 두 정보를 함께(정보 손실 방지 — codex Low).
+    let mut hover = String::new();
+    if is_secret {
+        hover.push_str(&catalog.t("env.secret_stored", &[]));
+    }
+    if has_os_override {
+        if !hover.is_empty() {
+            hover.push('\n');
+        }
+        hover.push_str(&catalog.t("env.os_override", &[]));
+    }
+    let dot_resp = ui.interact(
+        dot_rect,
+        ui.id().with(("env_dot", &var.key)),
         egui::Sense::hover(),
-    )
-    .on_hover_text(catalog.t("env.os_override", &[]));
+    );
+    if !hover.is_empty() {
+        dot_resp.on_hover_text(hover);
+    }
 
     let delete_rect =
         egui::Rect::from_center_size(egui::pos2(rect.right() - 40.0, y), egui::vec2(22.0, 18.0));
@@ -452,14 +445,15 @@ fn env_table_row(
     delete.clicked()
 }
 
-fn env_empty_placeholder_row(ui: &mut egui::Ui, catalog: &i18n::Catalog) {
+fn env_empty_placeholder_row(ui: &mut egui::Ui, catalog: &i18n::Catalog) -> bool {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 46.0), egui::Sense::click());
     if response.hovered() {
         ui.painter()
             .rect_filled(rect, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
     }
-    if response.clicked() {
+    let clicked = response.clicked();
+    if clicked {
         ui.memory_mut(|mem| mem.request_focus(env_var_key_input_id()));
     }
 
@@ -503,6 +497,7 @@ fn env_empty_placeholder_row(ui: &mut egui::Ui, catalog: &i18n::Catalog) {
         egui::FontId::proportional(11.0),
         ui.visuals().weak_text_color(),
     );
+    clicked
 }
 
 fn env_table_columns(rect: egui::Rect) -> [egui::Rect; 2] {
@@ -582,6 +577,8 @@ fn compact_profile_controls(
             {
                 state.selected = Some(profile.id.clone());
                 state.vars = None;
+                // 이전 프로파일 컨텍스트의 추가 폼 draft를 버린다(codex Med).
+                state.reset_var_form();
             }
             if ui
                 .small_button("×")

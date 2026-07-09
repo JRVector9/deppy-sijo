@@ -3,6 +3,9 @@ use std::collections::BTreeMap;
 pub use storage::EnvValue;
 
 /// precedence 한 계층 (설계문서 6.2). resolve에는 낮음 → 높음 순으로 전달한다.
+// 미리보기 UI 제거(2026-07-09)로 현재 호출처 없음 — §6.2 resolve 계약과 테스트를 보존한다
+// (spawn 경고/충돌 표시 재도입 시 재사용). 삭제하지 말 것.
+#[allow(dead_code)]
 pub struct EnvLayer {
     pub name: String,
     pub vars: Vec<(String, EnvValue)>,
@@ -10,6 +13,7 @@ pub struct EnvLayer {
 
 /// resolve 결과 한 항목. 충돌 시 UI 표시용으로 가려진 계층을 남긴다 (6.2).
 #[derive(Debug, PartialEq)]
+#[allow(dead_code)]
 pub struct ResolvedVar {
     pub key: String,
     pub value: EnvValue,
@@ -19,6 +23,7 @@ pub struct ResolvedVar {
 }
 
 /// EnvPrecedenceResolver: 마지막(높은) 계층이 이긴다. key 오름차순 반환.
+#[allow(dead_code)]
 pub fn resolve(layers: &[EnvLayer]) -> Vec<ResolvedVar> {
     let mut map: BTreeMap<String, ResolvedVar> = BTreeMap::new();
     for layer in layers {

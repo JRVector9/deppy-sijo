@@ -289,33 +289,29 @@ const DB_CALL_ALLOW: &[BoundaryAllow] = &[
         count: 1,
         reason: "PR-B00 deferred connector MCP server storage boundary",
     },
+    // env_profiles: dead 비-compact contents() 삭제(PR-ENV-D)로 compact 경로의 실제
+    // 스니펫으로 재등록(2026-07-09). 예외 수는 삭제 전과 동일 범주(기존 storage UI 예외).
     BoundaryAllow {
         path: "crates/app/src/ui/env_profiles.rs",
         snippet: "let p = db.list_env_profiles(workspace_id)?;",
+        count: 2, // 초기 조회 + 프로파일 controls 후 재조회(codex High 재확정)
+        reason: "existing env profile storage UI exception",
+    },
+    BoundaryAllow {
+        path: "crates/app/src/ui/env_profiles.rs",
+        snippet: "if let Err(e) = db.delete_env_profile(&id) {",
         count: 1,
         reason: "existing env profile storage UI exception",
     },
     BoundaryAllow {
         path: "crates/app/src/ui/env_profiles.rs",
-        snippet: "let current_path = db.workspace_path(workspace_id).ok().flatten();",
-        count: 1,
-        reason: "project folder path display for env sync (2026-07-08)",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/env_profiles.rs",
-        snippet: "db.delete_env_profile(&id)?;",
+        snippet: "match db.insert_env_profile(workspace_id, state.new_name.trim(), state.new_kind) {",
         count: 1,
         reason: "existing env profile storage UI exception",
     },
     BoundaryAllow {
         path: "crates/app/src/ui/env_profiles.rs",
-        snippet: "db.insert_env_profile(workspace_id, self.new_name.trim(), self.new_kind)?;",
-        count: 1,
-        reason: "existing env profile storage UI exception",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/env_profiles.rs",
-        snippet: "let credentials = db.list_credentials()?;",
+        snippet: "let c = db.list_credentials()?;",
         count: 1,
         reason: "existing env profile storage UI exception",
     },
@@ -333,7 +329,7 @@ const DB_CALL_ALLOW: &[BoundaryAllow] = &[
     },
     BoundaryAllow {
         path: "crates/app/src/ui/env_profiles.rs",
-        snippet: "db.upsert_env_var(&profile_id, self.var_key.trim(), &value)?;",
+        snippet: ".and_then(|_| db.upsert_env_var(profile_id, key, &value))",
         count: 1,
         reason: "existing env profile storage UI exception",
     },

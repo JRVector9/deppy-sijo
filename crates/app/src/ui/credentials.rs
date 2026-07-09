@@ -27,6 +27,8 @@ pub struct CredentialsUi {
     kind: &'static str,
     secret_input: String,
     error: Option<String>,
+    /// '+ 추가' 클릭 시에만 인라인 추가 폼을 펼친다(스크린샷: 기본은 표만 — P2).
+    show_add_form: bool,
     cached: Option<Vec<CredentialListItem>>,
 }
 
@@ -38,6 +40,7 @@ impl CredentialsUi {
             kind: "api_key",
             secret_input: String::new(),
             error: None,
+            show_add_form: false,
             cached: None,
         }
     }
@@ -48,116 +51,15 @@ impl CredentialsUi {
     }
 
     /// 비-compact 버전 — settings.rs가 Credentials→Environment로 리다이렉트해 실제 도달 불가.
-    /// app.rs C::Credentials 분기가 아직 호출하므로 유지(분기 제거 시 함께 삭제).
-    #[allow(dead_code)]
-    pub fn contents(
-        &mut self,
-        ui: &mut egui::Ui,
-        credentials: &dyn CredentialService,
-        catalog: &i18n::Catalog,
-    ) {
-        let list = match &self.cached {
-            Some(list) => list.clone(),
-            None => match credentials.list_credentials() {
-                Ok(list) => {
-                    self.cached = Some(list.clone());
-                    list
-                }
-                Err(e) => {
-                    ui.colored_label(
-                        ui.visuals().error_fg_color,
-                        catalog.t("common.list_failed", &[("message", &format!("{e:#}"))]),
-                    );
-                    return;
-                }
-            },
-        };
-
-        if list.is_empty() {
-            ui.label(catalog.t("credentials.empty", &[]));
-        }
-        let mut delete_id = None;
-        for meta in &list {
-            ui.horizontal(|ui| {
-                ui.label(format!(
-                    "{} · {} ({}) {}",
-                    meta.label,
-                    meta.provider,
-                    meta.credential_kind,
-                    meta.masked_hint.as_deref().unwrap_or(""),
-                ));
-                if ui.button(catalog.t("action.delete", &[])).clicked() {
-                    delete_id = Some(meta.id.clone());
-                }
-            });
-        }
-        if let Some(id) = delete_id {
-            self.error = self
-                .delete(credentials, &id)
-                .err()
-                .map(|e| format!("{e:#}"));
-        }
-
-        ui.separator();
-        ui.heading(catalog.t("credentials.add", &[]));
-        // 좌측 라벨 컬럼 + 넓은 입력 폼 — 라벨 far-left/입력 far-right로 큰 빈 공간이 생기던
-        // 우측정렬을 폼 스타일로 교체(#5 레이아웃 수정). 모든 입력이 같은 x에서 시작해 정렬.
-        const LABEL_W: f32 = 88.0;
-        const FIELD_W: f32 = 320.0;
-        let text_color = ui.visuals().text_color();
-        let field_row = |ui: &mut egui::Ui, label: String, add: &mut dyn FnMut(&mut egui::Ui)| {
-            ui.horizontal(|ui| {
-                let (r, _) =
-                    ui.allocate_exact_size(egui::vec2(LABEL_W, 30.0), egui::Sense::hover());
-                ui.painter().text(
-                    egui::pos2(r.left(), r.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    label,
-                    egui::FontId::proportional(13.5),
-                    text_color,
-                );
-                add(ui);
-            });
-        };
-        field_row(ui, catalog.t("credentials.provider", &[]), &mut |ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.provider).desired_width(FIELD_W));
-        });
-        field_row(ui, catalog.t("credentials.label", &[]), &mut |ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.label).desired_width(FIELD_W));
-        });
-        field_row(ui, catalog.t("credentials.kind", &[]), &mut |ui| {
-            for kind in ["api_key", "token"] {
-                ui.selectable_value(&mut self.kind, kind, kind);
-            }
-        });
-        field_row(ui, catalog.t("credentials.secret", &[]), &mut |ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.secret_input)
-                    .password(true)
-                    .desired_width(FIELD_W),
-            );
-        });
-        let filled = !self.provider.trim().is_empty()
-            && !self.label.trim().is_empty()
-            && !self.secret_input.is_empty();
-        if ui
-            .add_enabled(filled, egui::Button::new(catalog.t("action.add", &[])))
-            .clicked()
-        {
-            self.error = self.add(credentials).err().map(|e| format!("{e:#}"));
-        }
-
-        if let Some(error) = &self.error {
-            ui.colored_label(ui.visuals().error_fg_color, error);
-        }
-    }
-
+    /// 반환: 이 프레임에 credential 목록이 **변경**(추가/삭제 성공)됐는가 — App이 true면
+    /// EnvProfilesUi 캐시를 무효화한다(PR-ENV-C 배선: env 시크릿 콤보/마스킹 stale 방지).
     pub fn contents_compact(
         &mut self,
         ui: &mut egui::Ui,
         credentials: &dyn CredentialService,
         catalog: &i18n::Catalog,
-    ) {
+    ) -> bool {
+        let mut changed = false;
         let list = match &self.cached {
             Some(list) => list.clone(),
             None => match credentials.list_credentials() {
@@ -170,7 +72,7 @@ impl CredentialsUi {
                         ui.visuals().error_fg_color,
                         catalog.t("common.list_failed", &[("message", &format!("{e:#}"))]),
                     );
-                    return;
+                    return false;
                 }
             },
         };
@@ -182,7 +84,11 @@ impl CredentialsUi {
             list.len(),
             &catalog.t("env.add_key", &[]),
         ) {
-            ui.memory_mut(|mem| mem.request_focus(credential_provider_input_id()));
+            // 토글(P2) — 스크린샷은 기본 표만, 폼은 '+ 추가'를 눌렀을 때만.
+            self.show_add_form = !self.show_add_form;
+            if self.show_add_form {
+                ui.memory_mut(|mem| mem.request_focus(credential_provider_input_id()));
+            }
         }
         credentials_table_header(
             ui,
@@ -208,48 +114,60 @@ impl CredentialsUi {
             );
         }
         if let Some(id) = delete_id {
-            self.error = self
-                .delete(credentials, &id)
-                .err()
-                .map(|e| format!("{e:#}"));
+            match self.delete(credentials, &id) {
+                Ok(()) => {
+                    changed = true;
+                    self.error = None;
+                }
+                Err(e) => self.error = Some(format!("{e:#}")),
+            }
         }
 
-        ui.add_space(8.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.provider)
-                    .id_source(credential_provider_input_id())
-                    .hint_text(catalog.t("credentials.provider", &[]))
-                    .desired_width(120.0),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut self.label)
-                    .hint_text(catalog.t("credentials.label", &[]))
-                    .desired_width(160.0),
-            );
-            for kind in ["api_key", "token"] {
-                ui.selectable_value(&mut self.kind, kind, kind);
-            }
-            ui.add(
-                egui::TextEdit::singleline(&mut self.secret_input)
-                    .password(true)
-                    .hint_text(catalog.t("credentials.secret", &[]))
-                    .desired_width(220.0),
-            );
-            let filled = !self.provider.trim().is_empty()
-                && !self.label.trim().is_empty()
-                && !self.secret_input.is_empty();
-            if ui
-                .add_enabled(filled, egui::Button::new(catalog.t("action.add", &[])))
-                .clicked()
-            {
-                self.error = self.add(credentials).err().map(|e| format!("{e:#}"));
-            }
-        });
+        if self.show_add_form {
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.provider)
+                        .id_source(credential_provider_input_id())
+                        .hint_text(catalog.t("credentials.provider", &[]))
+                        .desired_width(120.0),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.label)
+                        .hint_text(catalog.t("credentials.label", &[]))
+                        .desired_width(160.0),
+                );
+                for kind in ["api_key", "token"] {
+                    ui.selectable_value(&mut self.kind, kind, kind);
+                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.secret_input)
+                        .password(true)
+                        .hint_text(catalog.t("credentials.secret", &[]))
+                        .desired_width(220.0),
+                );
+                let filled = !self.provider.trim().is_empty()
+                    && !self.label.trim().is_empty()
+                    && !self.secret_input.is_empty();
+                if ui
+                    .add_enabled(filled, egui::Button::new(catalog.t("action.add", &[])))
+                    .clicked()
+                {
+                    match self.add(credentials) {
+                        Ok(()) => {
+                            changed = true;
+                            self.error = None;
+                        }
+                        Err(e) => self.error = Some(format!("{e:#}")),
+                    }
+                }
+            });
+        }
 
         if let Some(error) = &self.error {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
+        changed
     }
 
     fn add(&mut self, credentials: &dyn CredentialService) -> anyhow::Result<()> {
@@ -363,18 +281,29 @@ fn credential_table_row(
             egui::pos2(cols[2].left() + 6.0, y - 14.0),
             egui::vec2(badge_width, 28.0),
         );
-        painter.rect_stroke(
-            badge,
-            0.0,
-            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
-            egui::StrokeKind::Inside,
-        );
+        // 종류 뱃지(P5, 스크린샷): token = accent 채움+대비 글자, api_key 등 = 1px outline.
+        let filled = meta.credential_kind == "token";
+        if filled {
+            painter.rect_filled(badge, 0.0, ui.visuals().selection.bg_fill);
+        } else {
+            painter.rect_stroke(
+                badge,
+                0.0,
+                egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let badge_text_color = if filled {
+            ui.visuals().window_fill
+        } else {
+            ui.visuals().weak_text_color()
+        };
         painter.with_clip_rect(cols[2]).text(
             egui::pos2(badge.left() + 7.0, badge.center().y),
             egui::Align2::LEFT_CENTER,
             &meta.credential_kind,
             egui::FontId::proportional(13.0),
-            ui.visuals().weak_text_color(),
+            badge_text_color,
         );
     }
     painter.with_clip_rect(cols[3]).text(

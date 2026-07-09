@@ -1922,10 +1922,8 @@ impl App {
     /// 재사용한다 — 설정창이 열려 있는 동안 매 프레임 DB 조회를 막는다.
     fn env_api_project_rows_cached(&mut self) -> Vec<ui::env_project_list::EnvProjectRow> {
         let now = std::time::Instant::now();
-        if Self::env_api_cache_expired(
-            self.env_api_projects_cache.as_ref().map(|(_, at)| *at),
-            now,
-        ) {
+        if Self::env_api_cache_expired(self.env_api_projects_cache.as_ref().map(|(_, at)| *at), now)
+        {
             self.env_api_projects_cache = Some((self.env_api_project_rows(), now));
         }
         self.env_api_projects_cache
@@ -2662,6 +2660,8 @@ impl eframe::App for App {
         };
         if credential_added {
             self.credentials_ui.invalidate_cache();
+            // env 뷰의 시크릿 콤보/마스킹도 새 credential을 봐야 한다(PR-ENV-C 배선).
+            self.env_profiles_ui.invalidate_cache();
             ui.ctx().request_repaint();
         }
         // 작업창은 여백 없이 경계까지 채운다 — CentralPanel 기본 inner_margin(8) 탓에
@@ -2897,14 +2897,8 @@ impl eframe::App for App {
             |ui, cat| {
                 use ui::settings::Category as C;
                 match cat {
-                    C::Credentials => {
-                        let svc = AppCredentialService {
-                            db: &self.db,
-                            secret_store: &self.secret_store,
-                            redaction: &self.redaction,
-                        };
-                        self.credentials_ui.contents(ui, &svc, &text);
-                    }
+                    // C::Credentials는 settings.rs가 Environment로 리다이렉트 — 분기 불필요
+                    // (자격증명 UI는 Environment 뷰의 API 키 섹션으로 통합, 2026-07-09).
                     C::Connectors => {
                         let ctx = ui.ctx().clone();
                         let resolver = AppMcpScopedEnvResolver {
@@ -2990,7 +2984,11 @@ impl eframe::App for App {
                                         secret_store: &self.secret_store,
                                         redaction: &self.redaction,
                                     };
-                                    self.credentials_ui.contents_compact(ui, &svc, &text);
+                                    if self.credentials_ui.contents_compact(ui, &svc, &text) {
+                                        // credential 추가/삭제 → env 시크릿 콤보/마스킹 갱신
+                                        // (PR-ENV-C 배선).
+                                        self.env_profiles_ui.invalidate_cache();
+                                    }
                                 });
                         });
                     }

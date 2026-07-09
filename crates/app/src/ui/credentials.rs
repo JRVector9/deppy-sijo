@@ -47,6 +47,9 @@ impl CredentialsUi {
         self.cached = None;
     }
 
+    /// 비-compact 버전 — settings.rs가 Credentials→Environment로 리다이렉트해 실제 도달 불가.
+    /// app.rs C::Credentials 분기가 아직 호출하므로 유지(분기 제거 시 함께 삭제).
+    #[allow(dead_code)]
     pub fn contents(
         &mut self,
         ui: &mut egui::Ui,

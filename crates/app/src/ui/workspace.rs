@@ -1350,7 +1350,15 @@ impl WorkspaceUi {
                 // hook이 보고한 needsInput = 가장 신뢰도 높은 승인 신호(최우선).
                 let waiting = pane.session_id.is_some_and(|s| needs_input.contains(&s));
                 let done = pane.session_id.is_some_and(|s| turn_done.contains_key(&s));
-                let status = merge_agent_status(regex_status, activity, waiting, done);
+                let merged = merge_agent_status(regex_status, activity, waiting, done);
+                // U17b: 수동 오버라이드가 있으면 최우선(status view의 user_override).
+                let view = pane
+                    .session_id
+                    .and_then(|s| self.sessions.get(&s))
+                    .and_then(|v| v.status_view.as_ref());
+                let user_override = view.and_then(|v| v.user_override);
+                let status = user_override.or(merged);
+                let status_hint = view.map(status_view_hint_text(catalog));
                 let summary = pane
                     .session_id
                     .and_then(|s| self.sessions.get(&s))
@@ -1370,6 +1378,8 @@ impl WorkspaceUi {
                     tab: tab.id.clone(),
                     pane: pane.id.clone(),
                     session: pane.session_id,
+                    user_override,
+                    status_hint,
                     title: self.resolve_session_title(
                         &pane.title,
                         pane.session_id,
@@ -1641,6 +1651,33 @@ fn agent_info_line(d: &crate::agent_detect::AgentDisplay) -> String {
 }
 
 /// 세션 행 3행: "실행 중 · ctx 69%" (상태 라벨 + 남은 컨텍스트%). 상태 없으면 ctx만.
+/// 상태 view의 hover 힌트 — 출처(감지 방법)와 신뢰도, 수동 지정 여부(U17b).
+fn status_view_hint_text(
+    catalog: &i18n::Catalog,
+) -> impl Fn(&runtime::SessionStatusView) -> String + '_ {
+    move |view| {
+        if view.user_override.is_some() {
+            return catalog.t("status.hint.user_override", &[]);
+        }
+        let source_key = match view.source {
+            runtime::StatusSource::ProcessExit => "status.hint.source.process_exit",
+            runtime::StatusSource::StreamRegex => "status.hint.source.stream_regex",
+            runtime::StatusSource::ScreenText => "status.hint.source.screen_text",
+            runtime::StatusSource::IdleHeuristic => "status.hint.source.idle_heuristic",
+            runtime::StatusSource::UserOverride => "status.hint.user_override",
+        };
+        let mut out = catalog.t(source_key, &[]);
+        if let Some(conf) = &view.confidence {
+            out.push_str(" · ");
+            out.push_str(&catalog.t(
+                "status.hint.confidence",
+                &[("score", &format!("{:.0}%", conf.score * 100.0))],
+            ));
+        }
+        out
+    }
+}
+
 fn status_ctx_line(
     status: Option<runtime::SessionStatus>,
     context_pct: Option<u8>,

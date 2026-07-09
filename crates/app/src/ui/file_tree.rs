@@ -29,6 +29,10 @@ pub struct SessionEntry {
     pub pulse: Option<(f32, egui::Color32)>,
     /// 에이전트 2행: "Codex · gpt-5.5 · xhigh" (에이전트일 때만 Some → 3줄 렌더).
     pub agent_line: Option<String>,
+    /// 수동 상태 지정(오버라이드) 값 — 컨텍스트 메뉴 체크 표시용(U17b).
+    pub user_override: Option<runtime::SessionStatus>,
+    /// 상태 hover 힌트 — 감지 출처/신뢰도 또는 '수동 지정'(U17b).
+    pub status_hint: Option<String>,
     /// 에이전트 3행: "실행 중 · ctx 69%" (상태 라벨 + 남은 컨텍스트).
     pub status_line: Option<String>,
 }
@@ -46,10 +50,15 @@ pub enum SidebarAction {
     },
     /// 새 셸 생성 (세션 섹션의 + 버튼)
     NewShell,
-    /// 세션 이름 변경 — pane 제목을 갱신한다(우클릭/더블클릭 인라인 편집).
+    /// 세션 이름 변경 — pane 제목을 갱신한다(더블클릭/메뉴 인라인 편집).
     RenameSession {
         pane: runtime::MuxPaneId,
         title: String,
+    },
+    /// 수동 상태 지정(U17b) — None이면 자동 감지로 복귀(오버라이드 해제).
+    OverrideStatus {
+        session: runtime::SessionId,
+        status: Option<runtime::SessionStatus>,
     },
 }
 
@@ -878,10 +887,65 @@ impl FileTreeUi {
                                 self.session_name_edit = None;
                             }
                         } else {
-                            let resp = session_row(ui, entry)
-                                .on_hover_text(catalog.t("workspace.rename_hint", &[]));
-                            // 우클릭/더블클릭 → 이름 편집 시작. 단순 클릭 → 세션 전환.
-                            if resp.secondary_clicked() || resp.double_clicked() {
+                            // hover 힌트: 상태 감지 출처/신뢰도(U17b)가 있으면 함께.
+                            let hover = match &entry.status_hint {
+                                Some(hint) => {
+                                    format!("{}\n{}", hint, catalog.t("workspace.rename_hint", &[]))
+                                }
+                                None => catalog.t("workspace.rename_hint", &[]),
+                            };
+                            let resp = session_row(ui, entry).on_hover_text(hover);
+                            // 우클릭 → 컨텍스트 메뉴(이름 변경 + 상태 지정, U17b).
+                            // 더블클릭 → 이름 편집. 단순 클릭 → 세션 전환.
+                            if let Some(session) = entry.session {
+                                resp.context_menu(|ui| {
+                                    if ui.button(catalog.t("workspace.rename_menu", &[])).clicked()
+                                    {
+                                        self.session_name_edit =
+                                            Some((entry.pane.clone(), entry.title.clone()));
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    ui.label(
+                                        egui::RichText::new(catalog.t("status.override.menu", &[]))
+                                            .small()
+                                            .weak(),
+                                    );
+                                    use runtime::SessionStatus as S;
+                                    for (status, key) in [
+                                        (S::Running, "status.override.running"),
+                                        (S::NeedsApproval, "status.override.waiting"),
+                                        (S::Done, "status.override.done"),
+                                        (S::Error, "status.override.error"),
+                                    ] {
+                                        let selected = entry.user_override == Some(status);
+                                        if ui
+                                            .selectable_label(selected, catalog.t(key, &[]))
+                                            .clicked()
+                                        {
+                                            action = Some(SidebarAction::OverrideStatus {
+                                                session,
+                                                status: Some(status),
+                                            });
+                                            ui.close();
+                                        }
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            entry.user_override.is_none(),
+                                            catalog.t("status.override.clear", &[]),
+                                        )
+                                        .clicked()
+                                    {
+                                        action = Some(SidebarAction::OverrideStatus {
+                                            session,
+                                            status: None,
+                                        });
+                                        ui.close();
+                                    }
+                                });
+                            }
+                            if resp.double_clicked() {
                                 self.session_name_edit =
                                     Some((entry.pane.clone(), entry.title.clone()));
                             } else if resp.clicked() && !entry.focused {

@@ -2671,6 +2671,18 @@ impl eframe::App for App {
                         tracing::warn!("세션 이름 변경 실패: {e:#}");
                     }
                 }
+                // U17b: 수동 상태 지정/해제 — 알림은 재발송하지 않는다(표시 전용 의미).
+                Some(ui::file_tree::SidebarAction::OverrideStatus { session, status }) => {
+                    let override_ = match status {
+                        Some(s) => runtime::UserStatusOverride::Mark(s),
+                        None => runtime::UserStatusOverride::Clear,
+                    };
+                    if let Err(e) = self.active.runtime.send_command(
+                        runtime::RuntimeCommand::SetUserStatusOverride { session, override_ },
+                    ) {
+                        tracing::warn!("상태 지정 실패: {e:#}");
+                    }
+                }
                 None => {}
             }
         }

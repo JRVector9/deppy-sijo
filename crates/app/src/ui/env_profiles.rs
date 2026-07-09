@@ -24,6 +24,10 @@ pub struct EnvProfilesUi {
     show_profile_controls: bool,
     profiles: Option<Vec<EnvProfileRow>>,
     vars: Option<Vec<EnvVarRow>>,
+    /// dot(●) 클릭으로 값을 펼친 secret — (profile_id, key) → 토글 시 1회 resolve한
+    /// 평문 캐시. 매 프레임 keyring 조회(전역 mutex — 프레임 정지 위험, codex Med)를
+    /// 피하고, 프로파일이 달라지면 키가 달라 자동 무효. 전환/삭제 시 비움.
+    revealed: std::collections::HashMap<(String, String), String>,
     /// credential 메타 캐시 — 매 프레임 list_credentials() 동기 SQLite 조회 방지.
     /// credential은 workspace와 무관한 전역 데이터라 workspace 전환 시 버리지 않는다.
     credentials: Option<Vec<CredentialMeta>>,
@@ -40,12 +44,16 @@ impl EnvProfilesUi {
         self.vars = None;
         // 외부 .env 동기화가 credential을 새로 만들 수 있으므로 함께 버린다.
         self.credentials = None;
+        // .env 동기화가 같은 (profile,key)의 secret 값을 바꿨을 수 있다 — 펼쳐둔 평문이
+        // 이전 값으로 남지 않게 reveal 캐시도 비운다(codex 2026-07-09).
+        self.revealed.clear();
     }
 
     /// 추가 폼 draft를 버린다 — 워크스페이스/프로파일이 바뀌면 이전 컨텍스트의 입력이
     /// 다른 대상에 저장되는 누수를 막는다(codex Med).
     fn reset_var_form(&mut self) {
         self.show_add_form = false;
+        self.revealed.clear();
         self.var_key.clear();
         self.var_plain_value.clear();
         self.var_credential_id = None;
@@ -61,6 +69,7 @@ impl EnvProfilesUi {
             var_plain_value: String::new(),
             var_credential_id: None,
             error: None,
+            revealed: std::collections::HashMap::new(),
             show_add_form: false,
             show_profile_controls: false,
             profiles: None,
@@ -75,6 +84,7 @@ impl EnvProfilesUi {
         ui: &mut egui::Ui,
         db: &mut Db,
         workspace_id: &str,
+        reveal_secret: &dyn Fn(&str) -> Option<String>,
         catalog: &i18n::Catalog,
     ) -> anyhow::Result<Option<EnvAction>> {
         if self.cached_workspace.as_deref() != Some(workspace_id) {
@@ -204,11 +214,32 @@ impl EnvProfilesUi {
             &[catalog.t("common.key", &[]), catalog.t("common.value", &[])],
         );
         let mut delete_key = None;
+        let mut toggle_reveal: Option<(String, Option<String>)> = None; // (key, credential_id)
         for var in &vars {
-            if env_table_row(ui, var, &credentials, catalog) {
+            let reveal_id = (profile_id.clone(), var.key.clone());
+            let revealed_value = self.revealed.get(&reveal_id).map(String::as_str);
+            let row = env_table_row(ui, var, &credentials, revealed_value, catalog);
+            if row.delete {
                 delete_key = Some(var.key.clone());
             }
+            if row.toggle_reveal {
+                let cred = match &var.value {
+                    EnvValue::Secret { credential_id } => Some(credential_id.clone()),
+                    EnvValue::Plain(_) => None,
+                };
+                toggle_reveal = Some((var.key.clone(), cred));
+            }
             env_table_divider(ui);
+        }
+        if let Some((key, cred)) = toggle_reveal {
+            let reveal_id = (profile_id.clone(), key);
+            if self.revealed.remove(&reveal_id).is_none()
+                && let Some(credential_id) = cred
+                && let Some(plain) = reveal_secret(&credential_id)
+            {
+                // 토글 순간에만 keyring 1회 조회 — 이후 프레임은 캐시 표시.
+                self.revealed.insert(reveal_id, plain);
+            }
         }
         if vars.is_empty() {
             if env_empty_placeholder_row(ui, catalog) {
@@ -223,6 +254,7 @@ impl EnvProfilesUi {
 
         if let Some(key) = delete_key {
             db.delete_env_var(&profile_id, &key)?;
+            self.revealed.remove(&(profile_id.clone(), key));
             self.vars = None;
             self.error = None;
         }
@@ -330,12 +362,18 @@ fn env_table_header(ui: &mut egui::Ui, columns: &[String]) {
     env_table_divider(ui);
 }
 
+struct EnvRowResponse {
+    delete: bool,
+    toggle_reveal: bool,
+}
+
 fn env_table_row(
     ui: &mut egui::Ui,
     var: &EnvVarRow,
     credentials: &[CredentialMeta],
+    revealed_value: Option<&str>,
     catalog: &i18n::Catalog,
-) -> bool {
+) -> EnvRowResponse {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 46.0), egui::Sense::hover());
     if response.hovered() {
@@ -353,14 +391,19 @@ fn env_table_row(
         egui::FontId::proportional(14.0),
         ui.visuals().hyperlink_color,
     );
-    painter.with_clip_rect(cols[1]).text(
-        egui::pos2(cols[1].left() + 6.0, y),
-        egui::Align2::LEFT_CENTER,
-        display_env_value(
+    let value_text = match revealed_value {
+        // dot 토글로 펼친 secret — 개인 로컬 서비스의 입력 확인용(2026-07-09).
+        Some(plain) => plain.to_owned(),
+        None => display_env_value(
             &var.value,
             credentials,
             &catalog.t("env.deleted_credential", &[]),
         ),
+    };
+    painter.with_clip_rect(cols[1]).text(
+        egui::pos2(cols[1].left() + 6.0, y),
+        egui::Align2::LEFT_CENTER,
+        value_text,
         egui::FontId::proportional(14.0),
         ui.visuals().text_color(),
     );
@@ -397,8 +440,21 @@ fn env_table_row(
     let dot_resp = ui.interact(
         dot_rect,
         ui.id().with(("env_dot", &var.key)),
-        egui::Sense::hover(),
+        if is_secret {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
     );
+    let mut toggle_reveal = false;
+    if is_secret {
+        if dot_resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if dot_resp.clicked() {
+            toggle_reveal = true;
+        }
+    }
     if !hover.is_empty() {
         dot_resp.on_hover_text(hover);
     }
@@ -442,7 +498,10 @@ fn env_table_row(
         egui::FontId::proportional(11.0),
         text,
     );
-    delete.clicked()
+    EnvRowResponse {
+        delete: delete.clicked(),
+        toggle_reveal,
+    }
 }
 
 fn env_empty_placeholder_row(ui: &mut egui::Ui, catalog: &i18n::Catalog) -> bool {
@@ -679,6 +738,10 @@ fn compact_env_var_form(
                 .and_then(|_| db.upsert_env_var(profile_id, key, &value))
             {
                 Ok(()) => {
+                    // 같은 키를 갱신했으면 이전 reveal 평문이 stale — 캐시 제거(codex).
+                    state
+                        .revealed
+                        .remove(&(profile_id.to_owned(), key.to_owned()));
                     state.var_key.clear();
                     state.var_plain_value.clear();
                     state.vars = None;

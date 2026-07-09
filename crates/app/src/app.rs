@@ -95,10 +95,15 @@ struct AppCredentialService<'a> {
 
 impl ui::credentials::CredentialService for AppCredentialService<'_> {
     fn list_credentials(&self) -> anyhow::Result<Vec<ui::credentials::CredentialListItem>> {
+        // .env 자동 동기화로 생긴(=env var가 참조하는) credential은 환경 변수 표에 이미
+        // 마스킹으로 나온다 — 'API 키' 표에 또 나오면 같은 데이터가 두 번 세어져 혼란
+        // (사용자 2026-07-09: 23env/23key 중복). 수동 등록/커넥터용만 남긴다.
+        let referenced = self.db.env_referenced_credential_ids()?;
         Ok(self
             .db
             .list_credentials()?
             .into_iter()
+            .filter(|meta| !referenced.contains(&meta.id))
             .map(|meta| ui::credentials::CredentialListItem {
                 id: meta.id,
                 provider: meta.provider,
@@ -262,43 +267,45 @@ fn render_env_api_project_header(
                 edit.path_buffer.clear();
             }
         } else {
-            // 긴 경로가 우측 버튼을 밀어내지 않게 truncate + 최대폭 제한.
-            ui.scope(|ui| {
-                ui.set_max_width((ui.available_width() - 170.0).max(120.0));
-                let response = ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(&path_text)
-                            .size(14.0)
-                            .color(ui.visuals().weak_text_color()),
-                    )
-                    .truncate()
-                    .sense(egui::Sense::click()),
-                );
-                let response = response.on_hover_text(&path_text);
-                if response.double_clicked() && !project_id.is_empty() {
-                    edit.path_workspace_id = Some(project_id.to_owned());
-                    edit.path_buffer = path.to_owned();
+            // 버튼을 **먼저**(우→좌) 배치하고 남은 폭을 경로 라벨이 쓴다 — 고정 폭 가정은
+            // 좁은 창/긴 로컬라이즈 문구에서 버튼이 잘렸다(codex Low).
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button(catalog.t("env.project_folder.choose", &[]))
+                    .clicked()
+                    && let Some(dir) = rfd::FileDialog::new().pick_folder()
+                {
+                    *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(dir));
                 }
+                if !path.is_empty()
+                    && ui
+                        .small_button(catalog.t("env.project_folder.clear", &[]))
+                        .clicked()
+                {
+                    *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(
+                        std::path::PathBuf::new(),
+                    ));
+                }
+                // 남은 폭 전부 — truncate 라벨 (rtl이라 좌측 정렬로 다시 감싼다).
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let response = ui
+                        .add(
+                            egui::Label::new(
+                                egui::RichText::new(&path_text)
+                                    .size(14.0)
+                                    .color(ui.visuals().weak_text_color()),
+                            )
+                            .truncate()
+                            .sense(egui::Sense::click()),
+                        )
+                        .on_hover_text(&path_text);
+                    if response.double_clicked() && !project_id.is_empty() {
+                        edit.path_workspace_id = Some(project_id.to_owned());
+                        edit.path_buffer = path.to_owned();
+                    }
+                });
             });
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .small_button(catalog.t("env.project_folder.choose", &[]))
-                .clicked()
-                && let Some(dir) = rfd::FileDialog::new().pick_folder()
-            {
-                *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(dir));
-            }
-            if !path.is_empty()
-                && ui
-                    .small_button(catalog.t("env.project_folder.clear", &[]))
-                    .clicked()
-            {
-                *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(
-                    std::path::PathBuf::new(),
-                ));
-            }
-        });
     });
     ui.add_space(10.0);
     crate::ui::hairline_full(ui);
@@ -1797,7 +1804,13 @@ impl App {
     fn env_api_project_rows(&self) -> Vec<ui::env_project_list::EnvProjectRow> {
         // API 키(자격증명)는 전역 공유 풀이라 모든 프로젝트에서 같은 수를 보인다 — 이 동일
         // 카운트 자체가 "공유 자원"임을 알려준다(#2 오해 방지). env는 프로젝트별 env 변수 총합.
-        let key_count = self.db.list_credentials().map(|c| c.len()).unwrap_or(0);
+        // env가 참조하는 credential은 제외 — 'API 키' 표(list_credentials 필터)와 동일 기준.
+        let referenced = self.db.env_referenced_credential_ids().unwrap_or_default();
+        let key_count = self
+            .db
+            .list_credentials()
+            .map(|c| c.iter().filter(|m| !referenced.contains(&m.id)).count())
+            .unwrap_or(0);
         self.workspaces
             .iter()
             .map(|row| {
@@ -2875,7 +2888,6 @@ impl eframe::App for App {
                                 }
                             }
                             ui.separator();
-                            ui.add_space(10.0);
                             // 우측 상세는 **세로 스택** — 부모 horizontal 레이아웃을 그대로
                             // 상속하면 헤더/표가 가로 한 줄로 흘러 화면 중앙에 떴다
                             // (2026-07-09 스크린샷 회귀). vertical로 명시해 top-down 강제.
@@ -2896,10 +2908,20 @@ impl eframe::App for App {
                                             &text,
                                         );
                                         ui.add_space(18.0);
+                                        // dot(●) 클릭 reveal — 개인 로컬 확인용. 값은 UI
+                                        // 표시만, 로그에 남기지 않는다(redaction 등록됨).
+                                        let store: &dyn secret::SecretStore = &self.secret_store;
+                                        let reveal = |credential_id: &str| {
+                                            store
+                                                .get_secret(credential_id)
+                                                .ok()
+                                                .map(|s| s.expose().to_owned())
+                                        };
                                         match self.env_profiles_ui.contents_compact(
                                             ui,
                                             &mut self.db,
                                             &wsid,
+                                            &reveal,
                                             &text,
                                         ) {
                                             Ok(a) => {

@@ -589,6 +589,26 @@ impl Db {
     }
 
     /// env var 또는 MCP scoped env가 이 credential을 참조 중인지 확인 (UI 에러 메시지 구분용).
+    /// env var가 참조 중인 credential id 집합 — 환경 UI의 "API 키" 표에서 .env 자동
+    /// 동기화로 생긴 credential을 숨겨 환경 변수 표와의 이중 표시를 막는다(2026-07-09).
+    pub fn env_referenced_credential_ids(
+        &self,
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare_cached(
+            // **dotenv 자동 동기화 profile**의 참조만 — 수동 등록 credential을 다른
+            // profile에서 참조해도 API 키 표에 남긴다(과필터 방지, codex Med 2026-07-09).
+            "SELECT DISTINCT ev.credential_id
+             FROM env_vars ev JOIN env_profiles ep ON ev.profile_id = ep.id
+             WHERE ep.kind = 'dotenv' AND ev.credential_id IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
+    }
+
     pub fn credential_in_use(&self, id: &str) -> anyhow::Result<bool> {
         let exists: Option<i64> = self
             .conn

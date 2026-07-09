@@ -42,7 +42,7 @@ impl Default for EnvProjectListStyle {
             padding_x: 10.0,
             count_width: 46.0,
             delete_width: 18.0,
-            gap: 6.0,
+            gap: 14.0, // 이름 clip과 env/key 카운트 사이 여유 — 닿아 보임 방지(2026-07-09)
             add_button_size: 16.0,
             delete_button_height: 18.0,
             name_font_size: 14.0,

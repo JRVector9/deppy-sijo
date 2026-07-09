@@ -52,6 +52,8 @@ pub trait PtySession: Send {
     fn take_output(&mut self) -> Option<Receiver<Vec<u8>>>;
     fn process_identity(&self) -> ProcessIdentity;
     fn write_input(&mut self, bytes: &[u8]) -> anyhow::Result<PtyInputEnqueueResult>;
+    /// 입력 큐가 비었는가 — backpressure 해소 이벤트 판정용(2026-07-09).
+    fn input_queue_idle(&self) -> bool;
     fn resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()>;
     fn try_exit_code(&mut self) -> anyhow::Result<Option<u32>>;
     fn kill(&mut self) -> anyhow::Result<()>;
@@ -286,6 +288,10 @@ impl PtySession for PortablePtySession {
             process_group,
             source,
         }
+    }
+
+    fn input_queue_idle(&self) -> bool {
+        self.input_queue.is_idle()
     }
 
     fn write_input(&mut self, bytes: &[u8]) -> anyhow::Result<PtyInputEnqueueResult> {

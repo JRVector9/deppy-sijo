@@ -145,6 +145,7 @@ impl InProcessRuntimeClient {
                     resource_monitor: ProcessResourceMonitor::new(
                         ProcessResourceMonitorConfig::default(),
                     ),
+                    pressured_sessions: std::collections::HashSet::new(),
                 }
                 .run();
             })
@@ -302,6 +303,8 @@ struct Worker {
     suspended: bool,
     /// PR-U12 process resource sampler. Low cadence and independent from UI frames.
     resource_monitor: ProcessResourceMonitor,
+    /// backpressure를 emit한 세션들 — 큐가 비면 해소 이벤트(queued=0)를 보낸다(2026-07-09).
+    pressured_sessions: std::collections::HashSet<SessionId>,
 }
 
 /// 세션 하나의 redaction 상태 + 로그 파일 (설계문서 7장).
@@ -441,6 +444,7 @@ impl Worker {
             }
             self.pump_sessions();
             self.pump_resource_monitor();
+            self.pump_input_pressure_resolution();
         }
         // 앱 종료: 남은 출력을 마지막으로 기록하고(로그 유실 방지 — codex 리뷰),
         // 열려 있는 로그의 redaction carry를 flush해 마감한다
@@ -554,6 +558,45 @@ impl Worker {
                 snapshot,
                 session_usage,
             });
+        }
+    }
+
+    /// backpressure 해소 폴링 — pressure를 보냈던 세션의 입력 큐가 비면
+    /// `queued_messages=0`인 PtyInputPressure를 한 번 보내 UI 뱃지를 내리게 한다
+    /// (해소 전용 variant를 추가하지 않고 기존 이벤트의 0 값으로 표현 — wire 불변).
+    fn pump_input_pressure_resolution(&mut self) {
+        if self.pressured_sessions.is_empty() {
+            return;
+        }
+        let resolved: Vec<SessionId> = self
+            .pressured_sessions
+            .iter()
+            .copied()
+            .filter(|s| {
+                self.sessions
+                    .get(s)
+                    .map(|session| session.input_queue_idle())
+                    // 세션이 사라졌으면 해소된 것으로 취급(추적 제거).
+                    .unwrap_or(true)
+            })
+            .collect();
+        for session in resolved {
+            self.pressured_sessions.remove(&session);
+            if self.sessions.contains_key(&session) {
+                // spawn은 항상 기본 정책을 쓰므로 max 값도 기본에서 취한다.
+                let policy = pty::PtyInputQueuePolicy::default();
+                self.emit(RuntimeEvent::PtyInputPressure {
+                    session,
+                    pressure: pty::PtyInputPressure {
+                        attempted_bytes: 0,
+                        queued_bytes: 0,
+                        queued_messages: 0,
+                        max_bytes: policy.max_bytes,
+                        max_messages: policy.max_messages,
+                        reason: pty::PtyInputRejectReason::QueueFull,
+                    },
+                });
+            }
         }
     }
 
@@ -755,6 +798,7 @@ impl Worker {
                         }
                         Some(pty::PtyInputEnqueueResult::Backpressured { pressure })
                         | Some(pty::PtyInputEnqueueResult::Rejected { pressure }) => {
+                            self.pressured_sessions.insert(session);
                             self.emit(RuntimeEvent::PtyInputPressure { session, pressure });
                         }
                         None => {}

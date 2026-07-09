@@ -224,6 +224,15 @@ impl Session {
         self.backend.screen_text()
     }
 
+    /// 입력 큐가 비었는가 — backpressure 해소 판정(2026-07-09). PTY가 이미 닫혔으면
+    /// 더 쌓일 것도 없으니 idle로 본다.
+    pub fn input_queue_idle(&self) -> bool {
+        self.pty
+            .as_ref()
+            .map(|pty| pty.input_queue_idle())
+            .unwrap_or(true)
+    }
+
     pub fn write_input(&mut self, bytes: &[u8]) -> Option<PtyInputEnqueueResult> {
         if let Some(pty) = &mut self.pty {
             match pty.write_input(bytes) {

@@ -2210,10 +2210,20 @@ impl App {
                 rt.session_resource_usage = session_usage.clone();
             }
             if let runtime::RuntimeEvent::PtyInputPressure { session, pressure } = event {
-                let now = std::time::Instant::now();
-                rt.input_pressure = Some((pressure.clone(), now));
-                rt.session_input_pressure
-                    .insert(*session, (pressure.clone(), now));
+                if pressure.queued_messages == 0 && pressure.queued_bytes == 0 {
+                    // 해소 신호(워커가 큐 비움 관측, 2026-07-09) — 뱃지 즉시 내림.
+                    rt.session_input_pressure.remove(session);
+                    rt.input_pressure = rt
+                        .session_input_pressure
+                        .values()
+                        .max_by_key(|(_, at)| *at)
+                        .cloned();
+                } else {
+                    let now = std::time::Instant::now();
+                    rt.input_pressure = Some((pressure.clone(), now));
+                    rt.session_input_pressure
+                        .insert(*session, (pressure.clone(), now));
+                }
             }
             // 세션 종료 시 pane별 압력 신호 정리 (stale 뱃지 방지). 워크스페이스 뱃지도
             // 남은 세션들 중 최신으로 재계산 — exit한 세션의 신호가 TTL까지 남지 않게(codex).

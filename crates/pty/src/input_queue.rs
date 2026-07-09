@@ -85,6 +85,12 @@ impl PtyInputQueueState {
         self.inner.lock().expect("PTY input queue mutex").policy
     }
 
+    /// 입력 큐가 완전히 비었는가 — backpressure 해소 판정(worker tick 폴링, 2026-07-09).
+    pub(crate) fn is_idle(&self) -> bool {
+        let inner = self.inner.lock().expect("PTY input queue mutex");
+        inner.queued_messages == 0 && inner.queued_bytes == 0
+    }
+
     pub(crate) fn complete(&self, bytes: usize) {
         self.release(bytes, 1);
     }

@@ -91,6 +91,8 @@ struct AppCredentialService<'a> {
     db: &'a Db,
     secret_store: &'a dyn secret::SecretStore,
     redaction: &'a secret::RedactionService,
+    /// 현재 workspace — 목록은 소속+전역, 새 credential은 이 workspace 소속(#2, v19).
+    workspace_id: &'a str,
 }
 
 impl ui::credentials::CredentialService for AppCredentialService<'_> {
@@ -101,7 +103,7 @@ impl ui::credentials::CredentialService for AppCredentialService<'_> {
         let referenced = self.db.env_referenced_credential_ids()?;
         Ok(self
             .db
-            .list_credentials()?
+            .list_credentials_for_workspace(self.workspace_id)?
             .into_iter()
             .filter(|meta| !referenced.contains(&meta.id))
             .map(|meta| ui::credentials::CredentialListItem {
@@ -128,6 +130,8 @@ impl ui::credentials::CredentialService for AppCredentialService<'_> {
             label: credential.label,
             credential_kind: credential.credential_kind,
             masked_hint: Some(secret::masked_hint(secret.expose())),
+            // 환경 UI에서 추가한 키는 현재 프로젝트 소속(#2).
+            workspace_id: Some(self.workspace_id.to_owned()),
         };
         if let Err(e) = self.db.insert_credential(&meta) {
             if let Err(rollback) = self.secret_store.delete_secret(&id) {
@@ -1805,15 +1809,8 @@ impl App {
     }
 
     fn env_api_project_rows(&self) -> Vec<ui::env_project_list::EnvProjectRow> {
-        // API 키(자격증명)는 전역 공유 풀이라 모든 프로젝트에서 같은 수를 보인다 — 이 동일
-        // 카운트 자체가 "공유 자원"임을 알려준다(#2 오해 방지). env는 프로젝트별 env 변수 총합.
-        // env가 참조하는 credential은 제외 — 'API 키' 표(list_credentials 필터)와 동일 기준.
+        // key = 그 프로젝트에서 보이는 API 키 수(소속+전역, dotenv 참조 제외 — #2 격리).
         let referenced = self.db.env_referenced_credential_ids().unwrap_or_default();
-        let key_count = self
-            .db
-            .list_credentials()
-            .map(|c| c.iter().filter(|m| !referenced.contains(&m.id)).count())
-            .unwrap_or(0);
         self.workspaces
             .iter()
             .map(|row| {
@@ -1835,6 +1832,11 @@ impl App {
                             .sum()
                     })
                     .unwrap_or(0usize);
+                let key_count = self
+                    .db
+                    .list_credentials_for_workspace(&row.id)
+                    .map(|c| c.iter().filter(|m| !referenced.contains(&m.id)).count())
+                    .unwrap_or(0);
                 ui::env_project_list::EnvProjectRow {
                     id: row.id.clone(),
                     name: Self::workspace_display_name(row),
@@ -2949,6 +2951,7 @@ impl eframe::App for App {
                                             db: &self.db,
                                             secret_store: &self.secret_store,
                                             redaction: &self.redaction,
+                                            workspace_id: &wsid,
                                         };
                                         if self.credentials_ui.contents_compact(ui, &svc, &text) {
                                             // credential 추가/삭제 → env 시크릿 콤보/마스킹 갱신
@@ -3484,6 +3487,7 @@ mod tests {
             db: &db,
             secret_store: &store,
             redaction: &redaction,
+            workspace_id: "ws-test",
         };
 
         ui::credentials::CredentialService::add_credential(

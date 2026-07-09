@@ -384,6 +384,8 @@ impl ConnectorsUi {
                 label: label.clone(),
                 credential_kind: "oauth_token".to_owned(),
                 masked_hint: Some(stored.masked_hint),
+                // 커넥터(OAuth) credential은 MCP 서버(전역)와 짝 — 전역 공유(#2).
+                workspace_id: None,
             };
             if let Err(e) = db.insert_credential(&meta) {
                 // 고아 토큰 정리 (access + refresh)

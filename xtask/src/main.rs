@@ -311,7 +311,7 @@ const DB_CALL_ALLOW: &[BoundaryAllow] = &[
     },
     BoundaryAllow {
         path: "crates/app/src/ui/env_profiles.rs",
-        snippet: "let c = db.list_credentials()?;",
+        snippet: "let c = db.list_credentials_for_workspace(workspace_id)?;",
         count: 1,
         reason: "existing env profile storage UI exception",
     },

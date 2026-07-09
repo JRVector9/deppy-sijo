@@ -201,6 +201,11 @@ CREATE TABLE agent_statusline (
 ALTER TABLE workspaces ADD COLUMN path_dev INTEGER;
 ALTER TABLE workspaces ADD COLUMN path_ino INTEGER;
 ",
+    // v19: credential 프로젝트(워크스페이스) 소속 — NULL이면 전역 공유(커넥터/OAuth,
+    // 기존 데이터 호환). 환경 UI 추가·.env 동기화 credential은 해당 workspace 소속(#2).
+    "
+ALTER TABLE credentials ADD COLUMN workspace_id TEXT;
+",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -238,6 +243,8 @@ pub struct CredentialMeta {
     pub label: String,
     pub credential_kind: String,
     pub masked_hint: Option<String>,
+    /// 소속 workspace — None이면 전역 공유(커넥터/OAuth·레거시). (#2, v19)
+    pub workspace_id: Option<String>,
 }
 
 /// workspace 한 행 (WorkspaceSidebar 표시용).
@@ -534,8 +541,9 @@ impl Db {
             .execute(
                 "INSERT INTO credentials
                    (id, provider, label, credential_kind,
-                    keyring_service, keyring_username, masked_hint, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                    keyring_service, keyring_username, masked_hint, workspace_id,
+                    created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
                     strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
                 (
                     &meta.id,
@@ -545,6 +553,7 @@ impl Db {
                     secret::KEYRING_SERVICE,
                     &meta.id, // keyring username = credential id
                     &meta.masked_hint,
+                    &meta.workspace_id,
                 ),
             )
             .with_context(|| format!("credential 저장 실패: {}", meta.id))?;
@@ -553,7 +562,7 @@ impl Db {
 
     pub fn list_credentials(&self) -> anyhow::Result<Vec<CredentialMeta>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT id, provider, label, credential_kind, masked_hint
+            "SELECT id, provider, label, credential_kind, masked_hint, workspace_id
              FROM credentials ORDER BY created_at, id",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -563,6 +572,31 @@ impl Db {
                 label: row.get(2)?,
                 credential_kind: row.get(3)?,
                 masked_hint: row.get(4)?,
+                workspace_id: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// 이 workspace에서 보이는 credential — 소속(workspace_id=ws) + 전역(NULL). (#2)
+    pub fn list_credentials_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> anyhow::Result<Vec<CredentialMeta>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, provider, label, credential_kind, masked_hint, workspace_id
+             FROM credentials
+             WHERE workspace_id IS NULL OR workspace_id = ?1
+             ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([workspace_id], |row| {
+            Ok(CredentialMeta {
+                id: row.get(0)?,
+                provider: row.get(1)?,
+                label: row.get(2)?,
+                credential_kind: row.get(3)?,
+                masked_hint: row.get(4)?,
+                workspace_id: row.get(5)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -1658,6 +1692,7 @@ mod tests {
             label: "개인 키".into(),
             credential_kind: "api_key".into(),
             masked_hint: Some("****3456".into()),
+            workspace_id: None,
         }
     }
 
@@ -1681,6 +1716,7 @@ mod tests {
                 label: "scan".into(),
                 credential_kind: "api_key".into(),
                 masked_hint: Some(secret::masked_hint(SECRET)),
+                workspace_id: None,
             })
             .unwrap();
             // env secret은 credential_id 참조만 저장된다

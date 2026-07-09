@@ -88,6 +88,8 @@ pub fn sync_workspace_dotenv(
                         label: format!("{key} (.env)"),
                         credential_kind: "api_key".to_owned(),
                         masked_hint: Some(secret::masked_hint(value)),
+                        // .env발 credential은 해당 프로젝트 소속(#2).
+                        workspace_id: Some(workspace_id.to_owned()),
                     };
                     if let Err(e) = db.insert_credential(&meta) {
                         let _ = secret_store.delete_secret(&id);

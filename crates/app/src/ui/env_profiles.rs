@@ -185,7 +185,7 @@ impl EnvProfilesUi {
         let credentials = match &self.credentials {
             Some(c) => c.clone(),
             None => {
-                let c = db.list_credentials()?;
+                let c = db.list_credentials_for_workspace(workspace_id)?;
                 self.credentials = Some(c.clone());
                 c
             }

@@ -18,6 +18,15 @@ pub trait CredentialService {
     fn list_credentials(&self) -> anyhow::Result<Vec<CredentialListItem>>;
     fn add_credential(&self, credential: NewCredential) -> anyhow::Result<()>;
     fn delete_credential(&self, id: &str) -> anyhow::Result<()>;
+    /// keyring에 남았지만 DB credentials가 모르는 항목(id 목록) — 고아 스캔.
+    fn orphan_credentials(&self) -> anyhow::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    /// 고아 항목 삭제 — 지운 개수 반환.
+    fn purge_orphan_credentials(&self, ids: &[String]) -> anyhow::Result<usize> {
+        let _ = ids;
+        Ok(0)
+    }
 }
 
 /// 자격증명 관리 창 상태. secret 입력값은 추가 즉시 비운다.
@@ -29,6 +38,10 @@ pub struct CredentialsUi {
     error: Option<String>,
     /// '+ 추가' 클릭 시에만 인라인 추가 폼을 펼친다(스크린샷: 기본은 표만 — P2).
     show_add_form: bool,
+    /// 고아 keyring 정리 흐름 상태 — None=대기, Some(목록)=발견(확인 대기).
+    orphan_candidates: Option<Vec<String>>,
+    /// 마지막 정리 결과 메시지(정리 개수/없음).
+    orphan_status: Option<String>,
     cached: Option<Vec<CredentialListItem>>,
 }
 
@@ -41,6 +54,8 @@ impl CredentialsUi {
             secret_input: String::new(),
             error: None,
             show_add_form: false,
+            orphan_candidates: None,
+            orphan_status: None,
             cached: None,
         }
     }
@@ -162,6 +177,72 @@ impl CredentialsUi {
                     }
                 }
             });
+        }
+
+        // 고아 keyring 정리 — 삭제된 profile/credential이 남긴 잔여 항목(uuid 계정만
+        // 대상, 시스템 키 제외). 위험 작업이라 링크 → 스캔 → 개수 확인 → 정리 2단계.
+        ui.add_space(12.0);
+        match self.orphan_candidates.clone() {
+            None => {
+                ui.horizontal(|ui| {
+                    let link = ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(catalog.t("credentials.purge_orphans", &[]))
+                                .size(12.0)
+                                .color(ui.visuals().weak_text_color()),
+                        )
+                        .sense(egui::Sense::click()),
+                    );
+                    if link.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if link.clicked() {
+                        match credentials.orphan_credentials() {
+                            Ok(list) if list.is_empty() => {
+                                self.orphan_status = Some(catalog.t("credentials.purge_none", &[]));
+                            }
+                            Ok(list) => {
+                                self.orphan_status = None;
+                                self.orphan_candidates = Some(list);
+                            }
+                            Err(e) => self.orphan_status = Some(format!("{e:#}")),
+                        }
+                    }
+                    if let Some(status) = &self.orphan_status {
+                        ui.label(egui::RichText::new(status).size(12.0).weak());
+                    }
+                });
+            }
+            Some(list) => {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(catalog.t(
+                            "credentials.purge_found",
+                            &[("count", &list.len().to_string())],
+                        ))
+                        .size(12.0)
+                        .color(ui.visuals().warn_fg_color),
+                    );
+                    if ui
+                        .small_button(catalog.t("credentials.purge_go", &[]))
+                        .clicked()
+                    {
+                        match credentials.purge_orphan_credentials(&list) {
+                            Ok(n) => {
+                                self.orphan_status = Some(
+                                    catalog
+                                        .t("credentials.purge_done", &[("count", &n.to_string())]),
+                                );
+                            }
+                            Err(e) => self.orphan_status = Some(format!("{e:#}")),
+                        }
+                        self.orphan_candidates = None;
+                    }
+                    if ui.small_button(catalog.t("action.cancel", &[])).clicked() {
+                        self.orphan_candidates = None;
+                    }
+                });
+            }
         }
 
         if let Some(error) = &self.error {

@@ -162,6 +162,43 @@ impl ui::credentials::CredentialService for AppCredentialService<'_> {
         tracing::info!(credential_id = %id, "credential 삭제");
         Ok(())
     }
+
+    fn orphan_credentials(&self) -> anyhow::Result<Vec<String>> {
+        #[cfg(target_os = "macos")]
+        {
+            let known: std::collections::HashSet<String> = self
+                .db
+                .list_credentials()?
+                .into_iter()
+                .map(|c| c.id)
+                .collect();
+            let mut orphans: Vec<String> = scan_keychain_accounts()?
+                .into_iter()
+                .filter(|acct| {
+                    // UUID(또는 uuid.refresh)만 후보 — base가 DB에 없으면 고아.
+                    uuid_base(acct).is_some_and(|base| !known.contains(base))
+                })
+                .collect();
+            orphans.sort();
+            orphans.dedup();
+            Ok(orphans)
+        }
+        #[cfg(not(target_os = "macos"))]
+        Ok(Vec::new())
+    }
+
+    fn purge_orphan_credentials(&self, ids: &[String]) -> anyhow::Result<usize> {
+        let mut purged = 0usize;
+        for id in ids {
+            // keyring 항목 삭제 — DB에는 애초에 없으니 keyring만.
+            match self.secret_store.delete_secret(id) {
+                Ok(()) => purged += 1,
+                Err(e) => tracing::warn!(account = %id, "고아 keyring 삭제 실패: {e:#}"),
+            }
+        }
+        tracing::info!(purged, "고아 keyring 항목 정리");
+        Ok(purged)
+    }
 }
 
 #[derive(Default)]
@@ -313,6 +350,58 @@ fn render_env_api_project_header(
     });
     ui.add_space(10.0);
     crate::ui::hairline_full(ui);
+}
+
+/// keyring 고아 항목 스캔/정리 (macOS security CLI) — 삭제된 env profile/credential이
+/// 남긴 keyring 잔여(실측 48개, 2026-07-08) 청소. **UUID 형태의 계정만** 후보로 삼아
+/// 앱의 시스템 키(remote-tls-* 등)는 건드리지 않는다.
+#[cfg(target_os = "macos")]
+fn scan_keychain_accounts() -> anyhow::Result<Vec<String>> {
+    let out = std::process::Command::new("/usr/bin/security")
+        .arg("dump-keychain")
+        .output()?;
+    anyhow::ensure!(out.status.success(), "security dump-keychain 실패");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut accounts = Vec::new();
+    let mut acct: Option<String> = None;
+    let mut svce_match = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("class:") {
+            if svce_match && let Some(a) = acct.take() {
+                accounts.push(a);
+            }
+            acct = None;
+            svce_match = false;
+        } else if let Some(rest) = line.strip_prefix("\"acct\"<blob>=\"") {
+            acct = rest.strip_suffix('\"').map(str::to_owned);
+        } else if line.contains("\"svce\"<blob>=\"") && line.contains(secret::KEYRING_SERVICE) {
+            svce_match = true;
+        }
+    }
+    if svce_match && let Some(a) = acct.take() {
+        accounts.push(a);
+    }
+    Ok(accounts)
+}
+
+/// UUID v4 형태(8-4-4-4-12 hex)인가 — credential id 규약. `.refresh` 접미는 벗겨 판정.
+fn uuid_base(account: &str) -> Option<&str> {
+    let base = account.strip_suffix(".refresh").unwrap_or(account);
+    let bytes = base.as_bytes();
+    if bytes.len() != 36 {
+        return None;
+    }
+    for (i, b) in bytes.iter().enumerate() {
+        let ok = match i {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        };
+        if !ok {
+            return None;
+        }
+    }
+    Some(base)
 }
 
 struct AppOAuthCredentialStore<'a> {

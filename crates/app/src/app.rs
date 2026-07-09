@@ -588,6 +588,11 @@ pub struct App {
     settings_category: ui::settings::Category,
     settings_search: String,
     env_api_project_edit: EnvApiProjectEditState,
+    /// env/API 프로젝트 행 캐시 (행, 계산 시각) — 설정창이 열려 있는 동안 매 프레임
+    /// N+1 SQLite 조회(list_credentials + 워크스페이스별 list_env_profiles/list_env_vars)를
+    /// 막는다. 무효화: refresh_workspaces / sync_dotenv_env(명시) + 1s TTL(설정 UI 안에서의
+    /// env var·credential 직접 편집은 하위 UI 내부 상태라 TTL로 최대 1s 지연 반영).
+    env_api_projects_cache: Option<(Vec<ui::env_project_list::EnvProjectRow>, std::time::Instant)>,
     db: Db,
     secret_store: KeyringSecretStore,
     agents_ui: ui::agents::AgentsUi,
@@ -759,6 +764,7 @@ impl App {
             settings_category: ui::settings::Category::default(),
             settings_search: String::new(),
             env_api_project_edit: EnvApiProjectEditState::default(),
+            env_api_projects_cache: None,
             db,
             secret_store: KeyringSecretStore,
             agents_ui: ui::agents::AgentsUi::new(),
@@ -1716,6 +1722,7 @@ impl App {
         // 무효화해 상세 표가 stale로 남거나 카운트(DB 신선)와 어긋나지 않게 한다(codex Med).
         self.env_profiles_ui.invalidate_cache();
         self.credentials_ui.invalidate_cache();
+        self.env_api_projects_cache = None;
     }
 
     /// 폴더의 (dev, ino)를 읽는다(inode 앵커용). 유효 디렉터리가 아니면 None.
@@ -1897,6 +1904,36 @@ impl App {
             .collect()
     }
 
+    /// env/API 프로젝트 행 캐시 TTL — 설정 UI 안에서의 직접 편집(env var/credential
+    /// 추가·삭제)은 하위 UI 내부 상태라 App이 즉시 알 수 없으므로 1초 주기 재계산으로
+    /// 반영한다(매 프레임 N+1 쿼리 → 최대 1Hz, 편집 반영 지연 ≤ 1s).
+    const ENV_API_PROJECTS_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// env/API 프로젝트 행 캐시 재계산 필요 판정 (캐시 없음 또는 TTL 경과). 테스트용 분리.
+    fn env_api_cache_expired(
+        computed_at: Option<std::time::Instant>,
+        now: std::time::Instant,
+    ) -> bool {
+        computed_at.is_none_or(|at| now.saturating_duration_since(at) >= Self::ENV_API_PROJECTS_TTL)
+    }
+
+    /// 캐시를 거쳐 env/API 프로젝트 행을 돌려준다. 명시 무효화(refresh_workspaces /
+    /// sync_dotenv_env)로 캐시가 비었거나 TTL이 지났으면 재계산하고, 아니면 마지막 값을
+    /// 재사용한다 — 설정창이 열려 있는 동안 매 프레임 DB 조회를 막는다.
+    fn env_api_project_rows_cached(&mut self) -> Vec<ui::env_project_list::EnvProjectRow> {
+        let now = std::time::Instant::now();
+        if Self::env_api_cache_expired(
+            self.env_api_projects_cache.as_ref().map(|(_, at)| *at),
+            now,
+        ) {
+            self.env_api_projects_cache = Some((self.env_api_project_rows(), now));
+        }
+        self.env_api_projects_cache
+            .as_ref()
+            .map(|(rows, _)| rows.clone())
+            .unwrap_or_default()
+    }
+
     /// 포커스 세션 cwd → 워크스페이스 이름(현재 작업 폴더/프로젝트명)을 갱신·영속한다.
     /// 변경 시에만 DB에 쓴다(churn 방지). 감지 실패(빈 이름)면 이전 값을 유지한다 —
     /// 포커스가 다른 pane으로 옮겨가도 폴더명이 "~"로 리셋되지 않게(사용자 요청).
@@ -1960,6 +1997,8 @@ impl App {
             Ok(list) => self.workspaces = list,
             Err(e) => tracing::warn!("workspace 목록 조회 실패: {e:#}"),
         }
+        // 워크스페이스 목록/이름/경로가 바뀌었을 수 있다 — env/API 프로젝트 행 캐시 무효화.
+        self.env_api_projects_cache = None;
     }
 
     /// pressure 뱃지 표시 TTL — 회복 이벤트가 없어(큐가 빠져도 신호 없음) 마지막 관측이
@@ -2774,6 +2813,22 @@ impl eframe::App for App {
             let kh = self.load_known_hosts();
             self.known_hosts_cache = Some(kh);
         }
+        // env/API 프로젝트 행: Environment 카테고리를 보고 있을 때만 (캐시 만료 시) 재계산.
+        // 다른 카테고리 프레임에는 마지막 캐시를 그대로 넘긴다 — category가 show() 안에서
+        // 갱신되므로(activity_rows 주석 참조) 탭 전환 프레임에 빈 목록이 번쩍이지 않게.
+        // remote_view가 self를 immutable 차용하기 전에 갱신한다(&mut self, borrow 분리).
+        let env_api_projects = if self.settings_open
+            && self.settings_category == ui::settings::Category::Environment
+        {
+            self.env_api_project_rows_cached()
+        } else if self.settings_open {
+            self.env_api_projects_cache
+                .as_ref()
+                .map(|(rows, _)| rows.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         // Remote 뷰모델을 현재 상태에서 구성 (UI는 서버를 직접 만지지 않는다 — disjoint 필드 차용).
         let remote_view = {
             let (running, addr, fp, token) = match &self.remote {
@@ -2816,11 +2871,6 @@ impl eframe::App for App {
         };
         let term_cfg = self.config.terminal.clone();
         let wsid = self.active.id.clone();
-        let env_api_projects = if self.settings_open {
-            self.env_api_project_rows()
-        } else {
-            Vec::new()
-        };
         let active_env_api_project = env_api_projects
             .iter()
             .find(|project| project.id == wsid)
@@ -3941,5 +3991,30 @@ h:1 EE:FF
         tracker.observe(&mux(&[]));
         assert!(tracker.exited_sessions.is_empty());
         assert!(!tracker.has_live());
+    }
+
+    /// env/API 프로젝트 행 캐시의 TTL 판정 — 캐시 없음/TTL 경과면 재계산, 그 안이면 재사용.
+    #[test]
+    fn env_api_cache_ttl_judgement() {
+        let base = std::time::Instant::now();
+        // 캐시 없음(명시 무효화 직후) → 재계산.
+        assert!(App::env_api_cache_expired(None, base));
+        // 방금 계산 → 재사용.
+        assert!(!App::env_api_cache_expired(Some(base), base));
+        // TTL(1s) 직전 → 재사용.
+        assert!(!App::env_api_cache_expired(
+            Some(base),
+            base + std::time::Duration::from_millis(999)
+        ));
+        // TTL 경과 → 재계산.
+        assert!(App::env_api_cache_expired(
+            Some(base),
+            base + std::time::Duration::from_millis(1000)
+        ));
+        // 계산 시각이 now보다 뒤(시계 보정 등) → saturating으로 0 취급, 재사용.
+        assert!(!App::env_api_cache_expired(
+            Some(base + std::time::Duration::from_secs(5)),
+            base
+        ));
     }
 }

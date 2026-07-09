@@ -19,6 +19,9 @@ pub struct EnvProfilesUi {
     error: Option<String>,
     profiles: Option<Vec<EnvProfileRow>>,
     vars: Option<Vec<EnvVarRow>>,
+    /// credential 메타 캐시 — 매 프레임 list_credentials() 동기 SQLite 조회 방지.
+    /// credential은 workspace와 무관한 전역 데이터라 workspace 전환 시 버리지 않는다.
+    credentials: Option<Vec<CredentialMeta>>,
     /// 캐시가 속한 workspace — 다른 workspace로 바뀌면 캐시/선택을 통째로 버린다
     /// (§6.1 "프로젝트 A 키가 B에 들어감" 방지 — codex 리뷰)
     cached_workspace: Option<String>,
@@ -30,6 +33,8 @@ impl EnvProfilesUi {
     pub fn invalidate_cache(&mut self) {
         self.profiles = None;
         self.vars = None;
+        // 외부 .env 동기화가 credential을 새로 만들 수 있으므로 함께 버린다.
+        self.credentials = None;
     }
 
     pub fn new() -> Self {
@@ -44,6 +49,7 @@ impl EnvProfilesUi {
             error: None,
             profiles: None,
             vars: None,
+            credentials: None,
             cached_workspace: None,
         }
     }
@@ -60,6 +66,7 @@ impl EnvProfilesUi {
             self.vars = None;
             self.selected = None;
             self.cached_workspace = Some(workspace_id.to_owned());
+            // self.credentials는 유지 — credential은 workspace에 속하지 않는 전역 데이터.
         }
 
         let profiles = match &self.profiles {
@@ -137,7 +144,14 @@ impl EnvProfilesUi {
             return Ok(None);
         };
 
-        let credentials = db.list_credentials()?;
+        let credentials = match &self.credentials {
+            Some(c) => c.clone(),
+            None => {
+                let c = db.list_credentials()?;
+                self.credentials = Some(c.clone());
+                c
+            }
+        };
         let vars = match &self.vars {
             Some(v) => v.clone(),
             None => {

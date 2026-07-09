@@ -329,17 +329,31 @@ fn render_env_api_project_header(
                 }
                 // 남은 폭 전부 — truncate 라벨 (rtl이라 좌측 정렬로 다시 감싼다).
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    // 사라진 경로(rename 자동 복구 불가)는 경고색 + 조치 안내(2026-07-09).
+                    let path_missing = !path.is_empty() && !std::path::Path::new(path).is_dir();
+                    let path_color = if path_missing {
+                        ui.visuals().error_fg_color
+                    } else {
+                        ui.visuals().weak_text_color()
+                    };
+                    let hover_text = if path_missing {
+                        format!(
+                            "{}\n{}",
+                            path_text,
+                            catalog.t("env.project_path_missing", &[])
+                        )
+                    } else {
+                        path_text.clone()
+                    };
                     let response = ui
                         .add(
                             egui::Label::new(
-                                egui::RichText::new(&path_text)
-                                    .size(14.0)
-                                    .color(ui.visuals().weak_text_color()),
+                                egui::RichText::new(&path_text).size(14.0).color(path_color),
                             )
                             .truncate()
                             .sense(egui::Sense::click()),
                         )
-                        .on_hover_text(&path_text);
+                        .on_hover_text(hover_text);
                     if response.double_clicked() && !project_id.is_empty() {
                         edit.path_workspace_id = Some(project_id.to_owned());
                         edit.path_buffer = path.to_owned();
@@ -1926,10 +1940,12 @@ impl App {
                     .list_credentials_for_workspace(&row.id)
                     .map(|c| c.iter().filter(|m| !referenced.contains(&m.id)).count())
                     .unwrap_or(0);
+                let path_missing = !path.trim().is_empty() && !std::path::Path::new(&path).is_dir();
                 ui::env_project_list::EnvProjectRow {
                     id: row.id.clone(),
                     name: Self::workspace_display_name(row),
                     path,
+                    path_missing,
                     env_count,
                     key_count,
                 }

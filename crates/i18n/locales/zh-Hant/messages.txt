@@ -177,6 +177,7 @@ approval.remember_tool = 記住此工具
 env.title = 環境
 env.projects = 專案
 env.projects_empty = 無專案
+env.project_path_missing = 找不到資料夾 — 已移動/刪除（跨卷移動或無 shell），無法自動復原。雙擊路徑修改，或用 [選擇資料夾] 重新指定。
 env.profile = Profile
 env.manage_profiles = 管理設定檔…
 env.env_vars = 環境變數

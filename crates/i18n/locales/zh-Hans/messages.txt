@@ -177,6 +177,7 @@ approval.remember_tool = 记住此工具
 env.title = 环境
 env.projects = 项目
 env.projects_empty = 无项目
+env.project_path_missing = 找不到文件夹 — 已移动/删除（跨卷移动或无 shell），无法自动恢复。双击路径修改，或用 [选择文件夹] 重新指定。
 env.profile = Profile
 env.manage_profiles = 管理配置…
 env.env_vars = 环境变量

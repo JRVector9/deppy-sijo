@@ -177,6 +177,7 @@ approval.remember_tool = Remember this tool
 env.title = Environment
 env.projects = Projects
 env.projects_empty = No projects
+env.project_path_missing = Folder not found — moved/deleted (cross-volume move or no shell inside), so auto-recovery could not follow. Double-click the path to edit, or use [Choose folder].
 env.profile = Profile
 env.manage_profiles = Manage profiles…
 env.env_vars = Environment variables

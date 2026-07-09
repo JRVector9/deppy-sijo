@@ -3,6 +3,9 @@ pub struct EnvProjectRow {
     pub id: String,
     pub name: String,
     pub path: String,
+    /// 저장 경로가 디스크에 없음(폴더 이동/삭제, EXDEV 볼륨 이동, 셸 부재로 자동 복구
+    /// 불가) — 경로를 경고색으로 표시해 재선택을 유도한다(2026-07-09).
+    pub path_missing: bool,
     pub env_count: usize,
     pub key_count: usize,
 }
@@ -294,6 +297,12 @@ fn render_row(
         egui::pos2(rect.left() + style.padding_x, rect.center().y),
         egui::pos2(text_right, rect.bottom()),
     );
+    // 경로가 사라진 프로젝트(rename 자동 복구 불가 — EXDEV/셸 부재)는 경고색으로.
+    let path_color = if project.path_missing {
+        ui.visuals().error_fg_color
+    } else {
+        ui.visuals().weak_text_color()
+    };
     painter.with_clip_rect(path_clip).text(
         egui::pos2(
             rect.left() + style.padding_x,
@@ -302,8 +311,17 @@ fn render_row(
         egui::Align2::LEFT_CENTER,
         path,
         egui::FontId::proportional(style.path_font_size),
-        ui.visuals().weak_text_color(),
+        path_color,
     );
+    if project.path_missing {
+        // 경로 영역 hover에 원인/조치 안내.
+        let hint = ui.interact(
+            path_clip,
+            ui.id().with(("env_project_path_missing", &project.id)),
+            egui::Sense::hover(),
+        );
+        hint.on_hover_text(catalog.t("env.project_path_missing", &[]));
+    }
 
     painter.text(
         egui::pos2(count_right, rect.center().y - style.row_text_offset_y),

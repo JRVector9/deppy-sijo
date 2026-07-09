@@ -177,6 +177,7 @@ approval.remember_tool = このツールを記憶
 env.title = 環境
 env.projects = プロジェクト
 env.projects_empty = プロジェクトなし
+env.project_path_missing = フォルダが見つかりません — 移動/削除（別ボリュームへの移動・シェル不在）で自動復旧できません。パスをダブルクリックして修正するか、[フォルダ選択] で再指定してください。
 env.profile = プロファイル
 env.manage_profiles = プロファイル管理…
 env.env_vars = 環境変数

@@ -163,6 +163,10 @@ struct EnvApiProjectEditState {
     path_buffer: String,
 }
 
+/// 환경/API 상세 상단 헤더 — 목업(스크린샷) 기준: '이름/경로' 두 행 + 하단 구분선.
+/// painter 절대좌표·put 버튼은 위젯 흐름과 어긋나 폭이 좁아지면 겹쳤다(2026-07-09 회귀)
+/// — 표준 horizontal 레이아웃으로 재작성. 이름/경로는 더블클릭 인라인 편집 유지,
+/// 폴더 선택/해제는 경로 행 우측의 작은 버튼.
 fn render_env_api_project_header(
     ui: &mut egui::Ui,
     project: Option<&ui::env_project_list::EnvProjectRow>,
@@ -186,196 +190,118 @@ fn render_env_api_project_header(
         path.to_owned()
     };
 
-    const HEADER_H: f32 = 104.0;
-    const LABEL_W: f32 = 82.0;
-    const BUTTON_H: f32 = 28.0;
-
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), HEADER_H),
-        egui::Sense::hover(),
-    );
-    let label_x = rect.left();
-    let value_x = rect.left() + LABEL_W;
-    let row1_y = rect.top() + 24.0;
-    let row2_y = rect.top() + 58.0;
-    let buttons_fit_top = rect.width() >= 500.0;
-    let buttons_left = if buttons_fit_top {
-        rect.right() - 160.0
-    } else {
-        rect.left()
-    };
-    let buttons_top = if buttons_fit_top {
-        rect.top() + 8.0
-    } else {
-        rect.bottom() - BUTTON_H - 8.0
-    };
-    let text_right = if buttons_fit_top {
-        (buttons_left - 12.0).max(value_x + 80.0)
-    } else {
-        rect.right()
-    };
-    let name_rect = egui::Rect::from_min_max(
-        egui::pos2(value_x, rect.top() + 9.0),
-        egui::pos2(text_right.max(value_x + 120.0), rect.top() + 39.0),
-    );
-    let path_rect = egui::Rect::from_min_max(
-        egui::pos2(value_x, rect.top() + 43.0),
-        egui::pos2(rect.right(), rect.top() + 73.0),
-    );
-
-    ui.painter().text(
-        egui::pos2(label_x, row1_y),
-        egui::Align2::LEFT_CENTER,
-        catalog.t("common.name", &[]),
-        egui::FontId::proportional(13.0),
-        ui.visuals().weak_text_color(),
-    );
-    if edit.name_workspace_id.as_deref() == Some(project_id) {
-        let response = ui.put(
-            name_rect,
-            egui::TextEdit::singleline(&mut edit.name_buffer)
-                .id_source(("env_api_project_name", project_id))
-                .desired_width(name_rect.width()),
-        );
-        let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
-        let commit = response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if escape && response.has_focus() {
-            edit.name_workspace_id = None;
-            edit.name_buffer.clear();
-        } else if commit {
-            let next = edit.name_buffer.trim();
-            if !next.is_empty() && next != name {
-                *workspace_rename = Some(next.to_owned());
-            }
-            edit.name_workspace_id = None;
-            edit.name_buffer.clear();
-        }
-    } else {
-        let response = ui
-            .interact(
-                name_rect,
-                ui.id().with(("env_api_project_name", project_id)),
-                egui::Sense::click(),
-            )
-            .on_hover_cursor(egui::CursorIcon::Text);
-        if response.hovered() {
-            ui.painter()
-                .rect_filled(name_rect, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
-            ui.painter().rect_stroke(
-                name_rect,
-                0.0,
-                ui.visuals().widgets.noninteractive.bg_stroke,
-                egui::StrokeKind::Inside,
-            );
-        }
-        ui.painter().with_clip_rect(name_rect).text(
-            egui::pos2(value_x, row1_y),
+    const LABEL_W: f32 = 56.0;
+    let label = |ui: &mut egui::Ui, text: String| {
+        let (r, _) = ui.allocate_exact_size(egui::vec2(LABEL_W, 24.0), egui::Sense::hover());
+        ui.painter().text(
+            egui::pos2(r.left(), r.center().y),
             egui::Align2::LEFT_CENTER,
-            name,
-            egui::FontId::proportional(15.0),
-            ui.visuals().text_color(),
+            text,
+            egui::FontId::proportional(13.0),
+            ui.visuals().weak_text_color(),
         );
-        if response.double_clicked() && !project_id.is_empty() {
-            edit.name_workspace_id = Some(project_id.to_owned());
-            edit.name_buffer = name.to_owned();
-            ui.memory_mut(|mem| {
-                mem.request_focus(ui.id().with(("env_api_project_name", project_id)));
+    };
+
+    // 행 1: 이름 (더블클릭 → 인라인 편집)
+    ui.horizontal(|ui| {
+        label(ui, catalog.t("common.name", &[]));
+        if edit.name_workspace_id.as_deref() == Some(project_id) {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut edit.name_buffer)
+                    .id_source(("env_api_project_name", project_id))
+                    .desired_width(260.0),
+            );
+            let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            let commit = response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if escape && response.has_focus() {
+                edit.name_workspace_id = None;
+                edit.name_buffer.clear();
+            } else if commit {
+                let next = edit.name_buffer.trim();
+                if !next.is_empty() && next != name {
+                    *workspace_rename = Some(next.to_owned());
+                }
+                edit.name_workspace_id = None;
+                edit.name_buffer.clear();
+            }
+        } else {
+            let response = ui.add(
+                egui::Label::new(egui::RichText::new(name).size(15.0).strong())
+                    .sense(egui::Sense::click()),
+            );
+            if response.double_clicked() && !project_id.is_empty() {
+                edit.name_workspace_id = Some(project_id.to_owned());
+                edit.name_buffer = name.to_owned();
+            }
+        }
+    });
+    ui.add_space(6.0);
+
+    // 행 2: 경로 (더블클릭 편집) + 우측 작은 폴더 선택/해제
+    ui.horizontal(|ui| {
+        label(ui, catalog.t("workspace.manager.path", &[]));
+        if edit.path_workspace_id.as_deref() == Some(project_id) {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut edit.path_buffer)
+                    .id_source(("env_api_project_path", project_id))
+                    .desired_width((ui.available_width() - 170.0).max(160.0)),
+            );
+            let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            let commit = response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if escape && response.has_focus() {
+                edit.path_workspace_id = None;
+                edit.path_buffer.clear();
+            } else if commit {
+                let next = edit.path_buffer.trim();
+                if next != path {
+                    *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(
+                        std::path::PathBuf::from(next),
+                    ));
+                }
+                edit.path_workspace_id = None;
+                edit.path_buffer.clear();
+            }
+        } else {
+            // 긴 경로가 우측 버튼을 밀어내지 않게 truncate + 최대폭 제한.
+            ui.scope(|ui| {
+                ui.set_max_width((ui.available_width() - 170.0).max(120.0));
+                let response = ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&path_text)
+                            .size(14.0)
+                            .color(ui.visuals().weak_text_color()),
+                    )
+                    .truncate()
+                    .sense(egui::Sense::click()),
+                );
+                let response = response.on_hover_text(&path_text);
+                if response.double_clicked() && !project_id.is_empty() {
+                    edit.path_workspace_id = Some(project_id.to_owned());
+                    edit.path_buffer = path.to_owned();
+                }
             });
         }
-    }
-
-    ui.painter().text(
-        egui::pos2(label_x, row2_y),
-        egui::Align2::LEFT_CENTER,
-        catalog.t("workspace.manager.path", &[]),
-        egui::FontId::proportional(13.0),
-        ui.visuals().weak_text_color(),
-    );
-    if edit.path_workspace_id.as_deref() == Some(project_id) {
-        let response = ui.put(
-            path_rect,
-            egui::TextEdit::singleline(&mut edit.path_buffer)
-                .id_source(("env_api_project_path", project_id))
-                .desired_width(path_rect.width()),
-        );
-        let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
-        let commit = response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if escape && response.has_focus() {
-            edit.path_workspace_id = None;
-            edit.path_buffer.clear();
-        } else if commit {
-            let next = edit.path_buffer.trim();
-            if next != path {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button(catalog.t("env.project_folder.choose", &[]))
+                .clicked()
+                && let Some(dir) = rfd::FileDialog::new().pick_folder()
+            {
+                *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(dir));
+            }
+            if !path.is_empty()
+                && ui
+                    .small_button(catalog.t("env.project_folder.clear", &[]))
+                    .clicked()
+            {
                 *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(
-                    std::path::PathBuf::from(next),
+                    std::path::PathBuf::new(),
                 ));
             }
-            edit.path_workspace_id = None;
-            edit.path_buffer.clear();
-        }
-    } else {
-        let response = ui
-            .interact(
-                path_rect,
-                ui.id().with(("env_api_project_path", project_id)),
-                egui::Sense::click(),
-            )
-            .on_hover_cursor(egui::CursorIcon::Text);
-        if response.hovered() {
-            ui.painter()
-                .rect_filled(path_rect, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
-            ui.painter().rect_stroke(
-                path_rect,
-                0.0,
-                ui.visuals().widgets.noninteractive.bg_stroke,
-                egui::StrokeKind::Inside,
-            );
-        }
-        ui.painter().with_clip_rect(path_rect).text(
-            egui::pos2(value_x, row2_y),
-            egui::Align2::LEFT_CENTER,
-            &path_text,
-            egui::FontId::proportional(14.0),
-            ui.visuals().text_color(),
-        );
-        if response.double_clicked() && !project_id.is_empty() {
-            edit.path_workspace_id = Some(project_id.to_owned());
-            edit.path_buffer = path.to_owned();
-            ui.memory_mut(|mem| {
-                mem.request_focus(ui.id().with(("env_api_project_path", project_id)));
-            });
-        }
-    }
-
-    let choose_text = catalog.t("env.project_folder.choose", &[]);
-    let clear_text = catalog.t("env.project_folder.clear", &[]);
-    let choose_rect = egui::Rect::from_min_size(
-        egui::pos2(buttons_left + 64.0, buttons_top),
-        egui::vec2(96.0, BUTTON_H),
-    );
-    let clear_rect = egui::Rect::from_min_size(
-        egui::pos2(buttons_left, buttons_top),
-        egui::vec2(56.0, BUTTON_H),
-    );
-    if ui
-        .put(choose_rect, egui::Button::new(choose_text))
-        .clicked()
-        && let Some(dir) = rfd::FileDialog::new().pick_folder()
-    {
-        *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(dir));
-    }
-    if !path.is_empty() && ui.put(clear_rect, egui::Button::new(clear_text)).clicked() {
-        *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(
-            std::path::PathBuf::new(),
-        ));
-    }
-
-    let y = ui.painter().round_to_pixel_center(rect.bottom());
-    ui.painter().hline(
-        rect.x_range(),
-        y,
-        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
-    );
+        });
+    });
+    ui.add_space(10.0);
+    crate::ui::hairline_full(ui);
 }
 
 struct AppOAuthCredentialStore<'a> {
@@ -2917,9 +2843,13 @@ impl eframe::App for App {
                     C::Environment => {
                         let panel_bg = ui::env_project_list::panel_bg(ui);
                         ui.painter().rect_filled(ui.clip_rect(), 0.0, panel_bg);
+                        // 전체 가용 높이를 **먼저** 캡처해 좌측 리스트/우측 스크롤에 강제한다
+                        // — horizontal 안에서 available_height가 줄어 리스트가 수십 px로
+                        // 잘리던 회귀 방지(2026-07-09 스크린샷).
+                        let full_h = ui.available_height();
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 0.0;
-                            ui.set_height(ui.available_height());
+                            ui.set_min_height(full_h);
                             let project_list_style =
                                 ui::env_project_list::EnvProjectListStyle::for_available_width(
                                     ui.available_width(),
@@ -2946,50 +2876,56 @@ impl eframe::App for App {
                             }
                             ui.separator();
                             ui.add_space(10.0);
-                            egui::ScrollArea::vertical()
-                                .id_salt("env_api_detail_scroll")
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.add_space(12.0);
-                                    render_env_api_project_header(
-                                        ui,
-                                        active_env_api_project.as_ref(),
-                                        &mut env_action,
-                                        &mut workspace_rename,
-                                        &mut self.env_api_project_edit,
-                                        &text,
-                                    );
-                                    ui.add_space(18.0);
-                                    match self.env_profiles_ui.contents_compact(
-                                        ui,
-                                        &mut self.db,
-                                        &wsid,
-                                        &text,
-                                    ) {
-                                        Ok(a) => {
-                                            if a.is_some() {
-                                                env_action = a;
+                            // 우측 상세는 **세로 스택** — 부모 horizontal 레이아웃을 그대로
+                            // 상속하면 헤더/표가 가로 한 줄로 흘러 화면 중앙에 떴다
+                            // (2026-07-09 스크린샷 회귀). vertical로 명시해 top-down 강제.
+                            ui.vertical(|ui| {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("env_api_detail_scroll")
+                                    .auto_shrink([false, false])
+                                    .max_height(full_h)
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.add_space(12.0);
+                                        render_env_api_project_header(
+                                            ui,
+                                            active_env_api_project.as_ref(),
+                                            &mut env_action,
+                                            &mut workspace_rename,
+                                            &mut self.env_api_project_edit,
+                                            &text,
+                                        );
+                                        ui.add_space(18.0);
+                                        match self.env_profiles_ui.contents_compact(
+                                            ui,
+                                            &mut self.db,
+                                            &wsid,
+                                            &text,
+                                        ) {
+                                            Ok(a) => {
+                                                if a.is_some() {
+                                                    env_action = a;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                ui.colored_label(
+                                                    ui.visuals().error_fg_color,
+                                                    format!("{e:#}"),
+                                                );
                                             }
                                         }
-                                        Err(e) => {
-                                            ui.colored_label(
-                                                ui.visuals().error_fg_color,
-                                                format!("{e:#}"),
-                                            );
+                                        let svc = AppCredentialService {
+                                            db: &self.db,
+                                            secret_store: &self.secret_store,
+                                            redaction: &self.redaction,
+                                        };
+                                        if self.credentials_ui.contents_compact(ui, &svc, &text) {
+                                            // credential 추가/삭제 → env 시크릿 콤보/마스킹 갱신
+                                            // (PR-ENV-C 배선).
+                                            self.env_profiles_ui.invalidate_cache();
                                         }
-                                    }
-                                    let svc = AppCredentialService {
-                                        db: &self.db,
-                                        secret_store: &self.secret_store,
-                                        redaction: &self.redaction,
-                                    };
-                                    if self.credentials_ui.contents_compact(ui, &svc, &text) {
-                                        // credential 추가/삭제 → env 시크릿 콤보/마스킹 갱신
-                                        // (PR-ENV-C 배선).
-                                        self.env_profiles_ui.invalidate_cache();
-                                    }
-                                });
+                                    });
+                            });
                         });
                     }
                     C::Agents => {

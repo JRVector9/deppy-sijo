@@ -24,10 +24,12 @@ pub struct EnvProfilesUi {
     show_profile_controls: bool,
     profiles: Option<Vec<EnvProfileRow>>,
     vars: Option<Vec<EnvVarRow>>,
-    /// dot(●) 클릭으로 값을 펼친 secret — (profile_id, key) → 토글 시 1회 resolve한
-    /// 평문 캐시. 매 프레임 keyring 조회(전역 mutex — 프레임 정지 위험, codex Med)를
-    /// 피하고, 프로파일이 달라지면 키가 달라 자동 무효. 전환/삭제 시 비움.
+    /// secret 평문 캐시 — vars 로드 시 일괄 resolve(keyring, 캐시 미스 프레임 1회).
+    /// **기본이 노출**(개인 로컬 서비스, 사용자 2026-07-09)이라 렌더마다 조회하지 않도록
+    /// 캐시한다. 전환/삭제/동기화 시 비움.
     revealed: std::collections::HashMap<(String, String), String>,
+    /// dot(●) 토글로 **가린** 키들 — 기본은 노출, 켜면 마스킹.
+    masked: std::collections::HashSet<(String, String)>,
     /// credential 메타 캐시 — 매 프레임 list_credentials() 동기 SQLite 조회 방지.
     /// credential은 workspace와 무관한 전역 데이터라 workspace 전환 시 버리지 않는다.
     credentials: Option<Vec<CredentialMeta>>,
@@ -44,8 +46,8 @@ impl EnvProfilesUi {
         self.vars = None;
         // 외부 .env 동기화가 credential을 새로 만들 수 있으므로 함께 버린다.
         self.credentials = None;
-        // .env 동기화가 같은 (profile,key)의 secret 값을 바꿨을 수 있다 — 펼쳐둔 평문이
-        // 이전 값으로 남지 않게 reveal 캐시도 비운다(codex 2026-07-09).
+        // .env 동기화가 같은 (profile,key)의 secret 값을 바꿨을 수 있다 — 평문 캐시를
+        // 비워 다음 로드에서 재resolve(codex 2026-07-09). 가림 토글은 유지.
         self.revealed.clear();
     }
 
@@ -54,6 +56,7 @@ impl EnvProfilesUi {
     fn reset_var_form(&mut self) {
         self.show_add_form = false;
         self.revealed.clear();
+        self.masked.clear();
         self.var_key.clear();
         self.var_plain_value.clear();
         self.var_credential_id = None;
@@ -70,6 +73,7 @@ impl EnvProfilesUi {
             var_credential_id: None,
             error: None,
             revealed: std::collections::HashMap::new(),
+            masked: std::collections::HashSet::new(),
             show_add_form: false,
             show_profile_controls: false,
             profiles: None,
@@ -190,6 +194,19 @@ impl EnvProfilesUi {
             Some(v) => v.clone(),
             None => {
                 let v = db.list_env_vars(&profile_id)?;
+                // 기본 노출(사용자 결정 — 개인 로컬 서비스): secret 평문을 이 프레임에
+                // 일괄 resolve해 캐시. keyring N회는 캐시 미스(첫 진입/무효화) 프레임
+                // 1회뿐이라 수용. 평문 상주는 설정창 닫힘 시 App이 invalidate로 정리.
+                for var in &v {
+                    if let EnvValue::Secret { credential_id } = &var.value {
+                        let id = (profile_id.clone(), var.key.clone());
+                        if !self.revealed.contains_key(&id)
+                            && let Some(plain) = reveal_secret(credential_id)
+                        {
+                            self.revealed.insert(id, plain);
+                        }
+                    }
+                }
                 self.vars = Some(v.clone());
                 v
             }
@@ -214,31 +231,29 @@ impl EnvProfilesUi {
             &[catalog.t("common.key", &[]), catalog.t("common.value", &[])],
         );
         let mut delete_key = None;
-        let mut toggle_reveal: Option<(String, Option<String>)> = None; // (key, credential_id)
+        let mut toggle_mask: Option<String> = None;
         for var in &vars {
             let reveal_id = (profile_id.clone(), var.key.clone());
-            let revealed_value = self.revealed.get(&reveal_id).map(String::as_str);
-            let row = env_table_row(ui, var, &credentials, revealed_value, catalog);
+            let is_masked = self.masked.contains(&reveal_id);
+            // 기본 노출 — 가림 토글이 켜진 행만 마스킹(사용자 2026-07-09).
+            let revealed_value = if is_masked {
+                None
+            } else {
+                self.revealed.get(&reveal_id).map(String::as_str)
+            };
+            let row = env_table_row(ui, var, &credentials, revealed_value, is_masked, catalog);
             if row.delete {
                 delete_key = Some(var.key.clone());
             }
             if row.toggle_reveal {
-                let cred = match &var.value {
-                    EnvValue::Secret { credential_id } => Some(credential_id.clone()),
-                    EnvValue::Plain(_) => None,
-                };
-                toggle_reveal = Some((var.key.clone(), cred));
+                toggle_mask = Some(var.key.clone());
             }
             env_table_divider(ui);
         }
-        if let Some((key, cred)) = toggle_reveal {
-            let reveal_id = (profile_id.clone(), key);
-            if self.revealed.remove(&reveal_id).is_none()
-                && let Some(credential_id) = cred
-                && let Some(plain) = reveal_secret(&credential_id)
-            {
-                // 토글 순간에만 keyring 1회 조회 — 이후 프레임은 캐시 표시.
-                self.revealed.insert(reveal_id, plain);
+        if let Some(key) = toggle_mask {
+            let id = (profile_id.clone(), key);
+            if !self.masked.remove(&id) {
+                self.masked.insert(id);
             }
         }
         if vars.is_empty() {
@@ -254,7 +269,9 @@ impl EnvProfilesUi {
 
         if let Some(key) = delete_key {
             db.delete_env_var(&profile_id, &key)?;
-            self.revealed.remove(&(profile_id.clone(), key));
+            let id = (profile_id.clone(), key);
+            self.revealed.remove(&id);
+            self.masked.remove(&id); // 재추가 시 '기본 노출'이 tombstone에 가려지지 않게
             self.vars = None;
             self.error = None;
         }
@@ -372,6 +389,7 @@ fn env_table_row(
     var: &EnvVarRow,
     credentials: &[CredentialMeta],
     revealed_value: Option<&str>,
+    is_masked: bool,
     catalog: &i18n::Catalog,
 ) -> EnvRowResponse {
     let (rect, response) =
@@ -391,14 +409,26 @@ fn env_table_row(
         egui::FontId::proportional(14.0),
         ui.visuals().hyperlink_color,
     );
-    let value_text = match revealed_value {
-        // dot 토글로 펼친 secret — 개인 로컬 서비스의 입력 확인용(2026-07-09).
-        Some(plain) => plain.to_owned(),
-        None => display_env_value(
-            &var.value,
-            credentials,
-            &catalog.t("env.deleted_credential", &[]),
-        ),
+    let value_text = if is_masked {
+        // 가림 토글 켜짐 — plain/secret 모두 마스킹(secret은 credential 힌트 형태).
+        match &var.value {
+            EnvValue::Plain(_) => "••••••••".to_owned(),
+            EnvValue::Secret { .. } => display_env_value(
+                &var.value,
+                credentials,
+                &catalog.t("env.deleted_credential", &[]),
+            ),
+        }
+    } else {
+        match revealed_value {
+            // 기본 노출 — secret은 로드 시 resolve된 평문 캐시(2026-07-09).
+            Some(plain) => plain.to_owned(),
+            None => display_env_value(
+                &var.value,
+                credentials,
+                &catalog.t("env.deleted_credential", &[]),
+            ),
+        }
     };
     painter.with_clip_rect(cols[1]).text(
         egui::pos2(cols[1].left() + 6.0, y),
@@ -408,12 +438,12 @@ fn env_table_row(
         ui.visuals().text_color(),
     );
 
-    // dot(P4, 스크린샷): secret(마스킹) 행 = ● accent, plain 행 = ○ 회색.
+    // dot 토글: **꺼짐(○)=노출(기본)**, 켜짐(● accent)=가림(사용자 2026-07-09).
     // hover 툴팁: secret은 keyring 저장 안내, plain은 OS override 여부.
     let dot_center = egui::pos2(rect.right() - 72.0, y);
     let is_secret = matches!(var.value, EnvValue::Secret { .. });
     let has_os_override = std::env::var_os(&var.key).is_some();
-    let (dot_text, dot_color) = if is_secret {
+    let (dot_text, dot_color) = if is_masked {
         ("●", ui.visuals().hyperlink_color)
     } else {
         ("○", ui.visuals().weak_text_color())
@@ -440,20 +470,14 @@ fn env_table_row(
     let dot_resp = ui.interact(
         dot_rect,
         ui.id().with(("env_dot", &var.key)),
-        if is_secret {
-            egui::Sense::click()
-        } else {
-            egui::Sense::hover()
-        },
+        egui::Sense::click(),
     );
     let mut toggle_reveal = false;
-    if is_secret {
-        if dot_resp.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        if dot_resp.clicked() {
-            toggle_reveal = true;
-        }
+    if dot_resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if dot_resp.clicked() {
+        toggle_reveal = true;
     }
     if !hover.is_empty() {
         dot_resp.on_hover_text(hover);
@@ -738,10 +762,10 @@ fn compact_env_var_form(
                 .and_then(|_| db.upsert_env_var(profile_id, key, &value))
             {
                 Ok(()) => {
-                    // 같은 키를 갱신했으면 이전 reveal 평문이 stale — 캐시 제거(codex).
-                    state
-                        .revealed
-                        .remove(&(profile_id.to_owned(), key.to_owned()));
+                    // 같은 키를 갱신했으면 이전 평문/가림 상태가 stale — 함께 제거(codex).
+                    let id = (profile_id.to_owned(), key.to_owned());
+                    state.revealed.remove(&id);
+                    state.masked.remove(&id);
                     state.var_key.clear();
                     state.var_plain_value.clear();
                     state.vars = None;

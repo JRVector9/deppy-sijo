@@ -517,6 +517,8 @@ pub struct App {
     /// rename 제안을 '무시'한 워크스페이스 — 이번 실행 동안 재확인 안 함(경로 변경 시 해제).
     dismissed_renames: std::collections::HashSet<String>,
     settings_open: bool,
+    /// 직전 프레임의 설정창 열림 상태 — 닫힘 전이에서 env 평문 캐시를 비운다(보안).
+    settings_was_open: bool,
     /// 통합 설정 창의 선택된 카테고리.
     settings_category: ui::settings::Category,
     settings_search: String,
@@ -694,6 +696,7 @@ impl App {
             workspace_rename_prompt: None,
             dismissed_renames: std::collections::HashSet::new(),
             settings_open: false,
+            settings_was_open: false,
             settings_category: ui::settings::Category::default(),
             settings_search: String::new(),
             env_api_project_edit: EnvApiProjectEditState::default(),
@@ -2823,6 +2826,12 @@ impl eframe::App for App {
         let mut workspace_rename: Option<String> = None;
         let mut env_action: Option<ui::env_profiles::EnvAction> = None;
         // #3 워크스페이스 이름 편집 캡처 (클로저 밖에서 db/refresh 처리 — self 전체 &mut).
+        // 설정창 닫힘 전이 — env secret 평문 캐시를 메모리에서 정리(codex Med:
+        // 기본 노출로 상주하는 평문의 수명을 설정창 열림 동안으로 한정).
+        if self.settings_was_open && !self.settings_open {
+            self.env_profiles_ui.invalidate_cache();
+        }
+        self.settings_was_open = self.settings_open;
         let out = ui::settings::show(
             ui.ctx(),
             &mut self.settings_open,

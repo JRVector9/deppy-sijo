@@ -29,7 +29,6 @@ pub struct EnvProjectListStyle {
     pub name_font_size: f32,
     pub path_font_size: f32,
     pub count_font_size: f32,
-    pub header_font_size: f32,
     pub row_text_offset_y: f32,
 }
 
@@ -38,7 +37,7 @@ impl Default for EnvProjectListStyle {
         Self {
             width: 220.0,
             header_height: 34.0,
-            row_height: 76.0,
+            row_height: 58.0, // 세로 간격 축소(사용자 2026-07-09)
             padding_x: 10.0,
             count_width: 46.0,
             delete_width: 18.0,
@@ -48,8 +47,7 @@ impl Default for EnvProjectListStyle {
             name_font_size: 14.0,
             path_font_size: 12.0,
             count_font_size: 12.0,
-            header_font_size: 13.0,
-            row_text_offset_y: 13.0,
+            row_text_offset_y: 11.0,
         }
     }
 }
@@ -184,12 +182,13 @@ fn paint_header(
     style: &EnvProjectListStyle,
     catalog: &i18n::Catalog,
 ) -> bool {
+    // 다른 상세 페이지 제목(page_title: 15px strong)과 동일 속성(사용자 2026-07-09).
     ui.painter().text(
         egui::pos2(rect.left() + style.padding_x, rect.center().y),
         egui::Align2::LEFT_CENTER,
         catalog.t("env.projects", &[]),
-        egui::FontId::proportional(style.header_font_size),
-        ui.visuals().weak_text_color(),
+        egui::FontId::new(15.0, egui::FontFamily::Proportional),
+        ui.visuals().text_color(),
     );
 
     let add_rect = egui::Rect::from_center_size(
@@ -237,10 +236,11 @@ fn render_row(
     catalog: &i18n::Catalog,
 ) -> EnvProjectListAction {
     let bg = panel_bg(ui);
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(style.width, style.row_height),
-        egui::Sense::click(),
-    );
+    // 행 폭은 실제 가용 폭(스크롤바 예약 반영) — style.width 고정이면 우측 빈 띠,
+    // max(style.width)면 좁은 뷰포트에서 스크롤바 침범(codex Low).
+    let row_w = ui.available_width();
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(row_w, style.row_height), egui::Sense::click());
     let fill = if selected {
         tok_nav_active(ui)
     } else if response.hovered() {
@@ -250,7 +250,10 @@ fn render_row(
     };
 
     let painter = ui.painter();
-    painter.rect_filled(rect, 0.0, fill);
+    // 선택/hover 배경은 아래 divider(1px)까지 포함해 세로로 빈틈없이 칠한다.
+    let fill_rect =
+        egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), rect.bottom() + 1.0));
+    painter.rect_filled(fill_rect, 0.0, fill);
 
     // 삭제 버튼은 이름/env count가 있는 위쪽 줄과 세로 중심을 맞춘다.
     let delete_top = rect.center().y - style.row_text_offset_y - style.delete_button_height / 2.0;
@@ -317,7 +320,9 @@ fn render_row(
         ui.visuals().weak_text_color(),
     );
 
-    if response.hovered() || selected {
+    // 삭제 ×는 마우스가 행 위에 있을 때만 — 벗어나면 사라진다(사용자 2026-07-09).
+    // 키보드/터치 접근 경로 없음은 로컬 데스크톱(마우스) 전제로 수용(codex Low).
+    if response.hovered() {
         let delete_enabled = !selected && project_count > 1;
         let delete = ui
             .interact(
@@ -377,6 +382,8 @@ fn paint_delete_button(ui: &mut egui::Ui, rect: egui::Rect, danger: bool) {
 
 fn row_divider(ui: &mut egui::Ui, width: f32) {
     let color = ui.visuals().widgets.noninteractive.bg_stroke.color;
+    let _ = width;
+    let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
     paint_hline(ui.painter(), rect.x_range().into(), rect.center().y, color);
 }

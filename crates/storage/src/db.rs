@@ -643,6 +643,23 @@ impl Db {
         Ok(out)
     }
 
+    /// MCP 서버 env가 참조하는 credential id 집합 — orphan 정리의 live set에 포함해
+    /// 실제 사용 중인 MCP secret을 지우지 않게 한다(codex Med 2026-07-09).
+    pub fn mcp_referenced_credential_ids(
+        &self,
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT DISTINCT json_each.value
+             FROM mcp_servers, json_each(COALESCE(mcp_servers.env_credentials_json, '{}'))",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
+    }
+
     pub fn credential_in_use(&self, id: &str) -> anyhow::Result<bool> {
         let exists: Option<i64> = self
             .conn

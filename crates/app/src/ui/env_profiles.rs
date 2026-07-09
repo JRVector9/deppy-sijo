@@ -99,7 +99,9 @@ impl EnvProfilesUi {
             // 이전 워크스페이스에서 펼친 추가 폼/입력값이 넘어와 엉뚱한 곳에 저장되지 않게.
             self.reset_var_form();
             self.show_profile_controls = false;
-            // self.credentials는 유지 — credential은 workspace에 속하지 않는 전역 데이터.
+            // v19(#2)부터 credential 목록이 workspace별(소속+전역) — 이전 워크스페이스
+            // 목록이 콤보에 남아 교차 참조로 저장되지 않게 캐시를 버린다(codex High).
+            self.credentials = None;
         }
 
         let profiles = match &self.profiles {

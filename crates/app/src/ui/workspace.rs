@@ -55,6 +55,9 @@ pub struct WorkspaceUi {
     /// show()가 매 프레임 폴링해 완료 시 해당 세션에 삽입한다. 새 ⌘V는 이전 것을 대체.
     paste_task: Option<PendingPaste>,
     error: Option<String>,
+    /// 현재 error 배너가 input backpressure 경고인지 — 해소 이벤트(queued=0)가
+    /// 무관한 오류(spawn 실패 등)를 지우지 않게 구분한다(codex 2026-07-09).
+    error_is_pressure: bool,
 }
 
 /// 백그라운드 paste 1건의 컨텍스트 — 요청 시점의 세션/모드를 캡처해 완료 시 그대로 쓴다.
@@ -112,6 +115,7 @@ impl WorkspaceUi {
             agent_info: std::collections::HashMap::new(),
             paste_task: None,
             error: None,
+            error_is_pressure: false,
         }
     }
 
@@ -280,6 +284,7 @@ impl WorkspaceUi {
                     if *kind == SpawnKind::Shell {
                         self.pending_spawns = self.pending_spawns.saturating_sub(1);
                     }
+                    self.error_is_pressure = false;
                     self.error = Some(crate::ui::render_message(catalog, message));
                 }
                 RuntimeEvent::SessionStatusChanged { session, status } => {
@@ -295,10 +300,23 @@ impl WorkspaceUi {
                     }
                 }
                 RuntimeEvent::PtyInputPressure { session, pressure } => {
+                    // queued=0은 해소 신호(2026-07-09) — 경고 대신 상태를 걷어낸다.
+                    if pressure.queued_messages == 0 && pressure.queued_bytes == 0 {
+                        if let Some(entry) = self.sessions.get_mut(session) {
+                            entry.input_pressure = None;
+                        }
+                        // 압력 경고일 때만 배너를 걷는다 — spawn 실패 등 무관 오류 보존.
+                        if self.error_is_pressure {
+                            self.error = None;
+                            self.error_is_pressure = false;
+                        }
+                        continue;
+                    }
                     if self.session_alive(*session) {
                         self.sessions.entry(*session).or_default().input_pressure =
                             Some(pressure.clone());
                     }
+                    self.error_is_pressure = true;
                     self.error = Some(catalog.t(
                         "workspace.input_pressure",
                         &[
@@ -889,6 +907,7 @@ impl WorkspaceUi {
                     if let Some(url) = extract_url(&word)
                         && let Err(err) = auth::open_in_browser(url)
                     {
+                        self.error_is_pressure = false;
                         self.error = Some(format!("{err:#}"));
                     }
                 }
@@ -1476,6 +1495,8 @@ impl WorkspaceUi {
                 })
             }
             Err(e) => {
+                self.error_is_pressure = false;
+                self.error_is_pressure = false;
                 self.error = Some(format!("{e:#}"));
                 None
             }
@@ -1532,6 +1553,7 @@ impl WorkspaceUi {
             RuntimeCommand::SpawnShell { .. } | RuntimeCommand::SplitPane { .. }
         );
         if let Err(e) = client.send_command(command) {
+            self.error_is_pressure = false;
             self.error = Some(format!("{e:#}"));
         } else {
             self.command_sent = true;

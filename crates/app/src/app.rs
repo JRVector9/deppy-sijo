@@ -166,12 +166,15 @@ impl ui::credentials::CredentialService for AppCredentialService<'_> {
     fn orphan_credentials(&self) -> anyhow::Result<Vec<String>> {
         #[cfg(target_os = "macos")]
         {
-            let known: std::collections::HashSet<String> = self
+            let mut known: std::collections::HashSet<String> = self
                 .db
                 .list_credentials()?
                 .into_iter()
                 .map(|c| c.id)
                 .collect();
+            // MCP env 참조도 live — metadata 없이 keyring만 있는 사용 중 secret 보호
+            // (codex Med).
+            known.extend(self.db.mcp_referenced_credential_ids()?);
             let mut orphans: Vec<String> = scan_keychain_accounts()?
                 .into_iter()
                 .filter(|acct| {

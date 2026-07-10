@@ -2193,7 +2193,13 @@ fn session_row(ui: &mut egui::Ui, entry: &SessionEntry) -> egui::Response {
     let accent = ui.visuals().selection.bg_fill;
     let dot = session_status_color(entry.status, ui.visuals());
     let hover_bg = ui.visuals().widgets.hovered.bg_fill;
-    let sub_color = ui.visuals().weak_text_color().gamma_multiply(0.9);
+    // 2·3행(보조 정보): 다크는 기존 weak 톤, 라이트는 weak가 패널 위에서 너무 옅어
+    // textSecondary(#444444) 수준으로 진하게 (라이트 테마 회색 흐림, 2026-07-10).
+    let sub_color = if ui.visuals().dark_mode {
+        ui.visuals().weak_text_color().gamma_multiply(0.9)
+    } else {
+        egui::Color32::from_rgb(0x44, 0x44, 0x44)
+    };
     let title_color = if entry.focused {
         accent
     } else {
@@ -2272,6 +2278,9 @@ fn clipped_line(
         text.to_owned(),
         egui::TextFormat {
             font_id,
+            // PLACEHOLDER여야 painter.galley의 fallback 색이 적용된다 — 기본값
+            // Color32::GRAY는 fallback을 무시하고 항상 회색으로 그려졌다(라이트 흐림 원인).
+            color: egui::Color32::PLACEHOLDER,
             ..Default::default()
         },
     );

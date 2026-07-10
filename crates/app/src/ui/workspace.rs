@@ -837,7 +837,7 @@ impl WorkspaceUi {
         let avail = ui.available_size();
         let cols =
             ((renderer_egui::grid_width_for_available(avail.x) / cell.x) as u16).clamp(10, 500);
-        let rows = (((avail.y - cell.y) / cell.y) as u16).clamp(3, 200);
+        let rows = renderer_egui::grid_rows_for_available(avail.y, cell.y);
         if self.sent_sizes.get(&session) != Some(&(cols, rows)) {
             self.sent_sizes.insert(session, (cols, rows));
             self.send(
@@ -1163,7 +1163,15 @@ impl WorkspaceUi {
             let code = code
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| catalog.t("workspace.exit_unknown", &[]));
-            ui.label(catalog.t("workspace.exited", &[("code", code.as_str())]));
+            // renderer가 pane 최하단까지 쓰므로 상태를 새 행으로 배치하지 않고 overlay한다.
+            // 종료 표시는 유지하면서 하단에 다시 한 행짜리 빈 띠가 생기는 회귀를 막는다.
+            ui.painter().text(
+                output.response.rect.left_bottom() + egui::vec2(6.0, -4.0),
+                egui::Align2::LEFT_BOTTOM,
+                catalog.t("workspace.exited", &[("code", code.as_str())]),
+                egui::FontId::proportional(12.0),
+                ui.visuals().weak_text_color(),
+            );
         }
     }
 
@@ -1433,6 +1441,50 @@ impl WorkspaceUi {
                 scrollback_lines,
             },
         );
+    }
+
+    /// 단축키용 현재 pane 닫기. 실행 중인 세션은 마우스 ×와 동일하게 확인창을 거친다.
+    pub fn close_focused_pane(&mut self, client: &dyn RuntimeClient) {
+        if let Some(pane) = self.mux.as_ref().and_then(|mux| mux.focused_pane.clone()) {
+            self.request_close_pane(client, pane);
+        }
+    }
+
+    /// 단축키용 현재 pane 분할. UI 버튼과 같은 runtime 명령을 사용한다.
+    pub fn split_focused_pane(
+        &mut self,
+        client: &dyn RuntimeClient,
+        direction: SplitDirection,
+        scrollback_lines: usize,
+    ) {
+        if let Some(pane) = self.mux.as_ref().and_then(|mux| mux.focused_pane.clone()) {
+            self.send(
+                client,
+                RuntimeCommand::SplitPane {
+                    pane,
+                    direction,
+                    scrollback_lines,
+                },
+            );
+        }
+    }
+
+    /// 활성 탭의 pane 벡터 순서로 포커스를 순환한다. 끝에서는 반대편으로 이어진다.
+    pub fn focus_relative_pane(&mut self, client: &dyn RuntimeClient, delta: isize) {
+        let next = self.mux.as_ref().and_then(|mux| {
+            let active = mux.active_tab.as_ref()?;
+            let tab = mux.tabs.iter().find(|tab| &tab.id == active)?;
+            if tab.panes.len() < 2 {
+                return None;
+            }
+            let focused = mux.focused_pane.as_ref()?;
+            let current = tab.panes.iter().position(|pane| &pane.id == focused)?;
+            let next = (current as isize + delta).rem_euclid(tab.panes.len() as isize) as usize;
+            Some(tab.panes[next].id.clone())
+        });
+        if let Some(pane) = next {
+            self.send(client, RuntimeCommand::FocusPane { pane });
+        }
     }
 
     pub fn mux(&self) -> Option<&Arc<MuxSnapshot>> {

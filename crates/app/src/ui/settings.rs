@@ -1,4 +1,5 @@
 use crate::config::{Config, Theme};
+use crate::shortcuts::{self, ShortcutAction, ShortcutGroup};
 
 /// `SettingsDetailShell`/`SettingsRow`/control 목업이 공유하는 타이포 토큰.
 /// 참조 화면의 Settings Detail Font Map(15/14/13/14px)을 한 곳에서 강제한다.
@@ -85,6 +86,7 @@ pub enum Category {
     General,
     Language,
     Terminal,
+    Shortcuts,
     Performance,
     RemoteTls,
     // ── 관리 (App이 render_management로 렌더) ──
@@ -199,6 +201,9 @@ pub fn show(
                                 Category::Terminal => {
                                     terminal_page(ui, config, &mut changed, catalog)
                                 }
+                                Category::Shortcuts => {
+                                    shortcuts_page(ui, config, &mut changed, catalog)
+                                }
                                 Category::Performance => {
                                     performance_page(ui, config, &mut changed, catalog)
                                 }
@@ -246,6 +251,7 @@ fn is_inline_settings_category(category: Category) -> bool {
         Category::General
             | Category::Language
             | Category::Terminal
+            | Category::Shortcuts
             | Category::Performance
             | Category::RemoteTls
     )
@@ -399,6 +405,12 @@ fn nav(
                     Icon::Terminal,
                     catalog.t("settings.terminal", &[]),
                     "terminal font scrollback shell paste clipboard",
+                ),
+                (
+                    Category::Shortcuts,
+                    Icon::Keyboard,
+                    catalog.t("settings.shortcuts", &[]),
+                    "shortcuts keyboard key bindings hotkeys commands 단축키 키보드",
                 ),
                 (
                     Category::Performance,
@@ -821,6 +833,7 @@ pub enum Icon {
     Gear,
     Globe,
     Terminal,
+    Keyboard,
     Bolt,
     Lock,
     Link,
@@ -882,6 +895,22 @@ fn paint_icon(p: &egui::Painter, c: egui::Pos2, sz: f32, icon: Icon, col: egui::
                 ],
                 s,
             );
+        }
+        Icon::Keyboard => {
+            let b = egui::Rect::from_center_size(c, egui::vec2(sz, sz * 0.72));
+            p.rect_stroke(b, 1.5, s, egui::StrokeKind::Inside);
+            for row in 0..2 {
+                for column in 0..4 {
+                    let key = egui::Rect::from_min_size(
+                        egui::pos2(
+                            b.left() + 2.0 + column as f32 * (sz - 4.0) / 4.0,
+                            b.top() + 2.0 + row as f32 * (b.height() - 4.0) / 2.0,
+                        ),
+                        egui::vec2((sz - 8.0) / 4.0, (b.height() - 8.0) / 2.0),
+                    );
+                    p.rect_filled(key, 0.5, col);
+                }
+            }
         }
         Icon::Bolt => {
             p.add(egui::Shape::convex_polygon(
@@ -1461,6 +1490,261 @@ fn terminal_page(
             }
         },
     );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ShortcutPageFilter {
+    #[default]
+    All,
+    Group(ShortcutGroup),
+}
+
+#[derive(Clone, Default)]
+struct ShortcutPageState {
+    query: String,
+    filter: ShortcutPageFilter,
+    recording: Option<ShortcutAction>,
+    capture_error: bool,
+}
+
+fn shortcuts_page(
+    ui: &mut egui::Ui,
+    config: &mut Config,
+    changed: &mut bool,
+    catalog: &i18n::Catalog,
+) {
+    let state_id = egui::Id::new("settings_shortcuts_page_state");
+    let mut state = ui.ctx().data_mut(|data| {
+        data.get_temp::<ShortcutPageState>(state_id)
+            .unwrap_or_default()
+    });
+
+    // 녹화 중에는 Escape=취소, Backspace/Delete=비우기, 나머지 modifier chord=저장.
+    if let Some(action) = state.recording {
+        let events = ui.input(|input| input.events.clone());
+        for event in &events {
+            let egui::Event::Key {
+                key,
+                pressed: true,
+                repeat: false,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            match key {
+                egui::Key::Escape => {
+                    state.recording = None;
+                    state.capture_error = false;
+                    break;
+                }
+                egui::Key::Backspace | egui::Key::Delete => {
+                    shortcuts::set_binding(&mut config.shortcuts, action, None);
+                    *changed = true;
+                    state.recording = None;
+                    state.capture_error = false;
+                    break;
+                }
+                _ => {
+                    if let Some(binding) = shortcuts::captured_binding(event) {
+                        shortcuts::set_binding(&mut config.shortcuts, action, Some(binding));
+                        *changed = true;
+                        state.recording = None;
+                        state.capture_error = false;
+                        break;
+                    }
+                    if !matches!(
+                        key,
+                        egui::Key::ShiftLeft
+                            | egui::Key::ShiftRight
+                            | egui::Key::ControlLeft
+                            | egui::Key::ControlRight
+                            | egui::Key::AltLeft
+                            | egui::Key::AltRight
+                            | egui::Key::SuperLeft
+                            | egui::Key::SuperRight
+                    ) {
+                        state.capture_error = true;
+                    }
+                }
+            }
+        }
+    }
+
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(catalog.t("settings.shortcuts", &[]))
+                .strong()
+                .size(SETTINGS_TYPE.page_title),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .button(catalog.t("shortcuts.reset_all", &[]))
+                .on_hover_text(catalog.t("shortcuts.reset_all.hint", &[]))
+                .clicked()
+            {
+                shortcuts::reset_all(&mut config.shortcuts);
+                *changed = true;
+                state.recording = None;
+            }
+        });
+    });
+    ui.add_space(9.0);
+    hint_text(ui, catalog.t("shortcuts.help", &[]));
+    ui.add_space(12.0);
+    settings_hairline(ui);
+    ui.add_space(14.0);
+
+    ui.horizontal(|ui| {
+        let search_width = (ui.available_width() - 390.0).max(220.0);
+        ui.add_sized(
+            [search_width, CONTROL_HEIGHT],
+            egui::TextEdit::singleline(&mut state.query)
+                .hint_text(catalog.t("shortcuts.search", &[]))
+                .margin(egui::Margin::symmetric(10, 7)),
+        );
+        ui.add_space(8.0);
+        shortcut_filter_button(
+            ui,
+            &mut state.filter,
+            ShortcutPageFilter::All,
+            &catalog.t("shortcuts.filter.all", &[]),
+        );
+        for group in ShortcutGroup::ALL {
+            shortcut_filter_button(
+                ui,
+                &mut state.filter,
+                ShortcutPageFilter::Group(group),
+                &catalog.t(group.title_key(), &[]),
+            );
+        }
+    });
+
+    let conflicts = shortcuts::conflicts(&config.shortcuts);
+    if !conflicts.is_empty() {
+        ui.add_space(10.0);
+        let color = ui.visuals().error_fg_color;
+        egui::Frame::NONE
+            .fill(color.gamma_multiply(0.12))
+            .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.65)))
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.colored_label(
+                    color,
+                    egui::RichText::new(catalog.t("shortcuts.conflict", &[]))
+                        .size(SETTINGS_TYPE.row_description),
+                );
+            });
+    }
+    if state.capture_error {
+        ui.add_space(8.0);
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            egui::RichText::new(catalog.t("shortcuts.modifier_required", &[]))
+                .size(SETTINGS_TYPE.row_description),
+        );
+    }
+
+    let query = state.query.trim().to_lowercase();
+    let mut rendered = 0usize;
+    for group in ShortcutGroup::ALL {
+        let filter_matches = match state.filter {
+            ShortcutPageFilter::All => true,
+            ShortcutPageFilter::Group(selected) => selected == group,
+        };
+        if !filter_matches {
+            continue;
+        }
+        let actions: Vec<_> = ShortcutAction::ALL
+            .into_iter()
+            .filter(|action| action.group() == group)
+            .filter(|action| {
+                query.is_empty()
+                    || catalog
+                        .t(action.title_key(), &[])
+                        .to_lowercase()
+                        .contains(&query)
+                    || catalog
+                        .t(action.description_key(), &[])
+                        .to_lowercase()
+                        .contains(&query)
+            })
+            .collect();
+        if actions.is_empty() {
+            continue;
+        }
+        section(ui, &catalog.t(group.title_key(), &[]));
+        for action in actions {
+            rendered += 1;
+            let title = catalog.t(action.title_key(), &[]);
+            let description = catalog.t(action.description_key(), &[]);
+            let is_recording = state.recording == Some(action);
+            let is_conflict = conflicts.contains(&action);
+            let custom = config.shortcuts.bindings.contains_key(action.id())
+                || config.shortcuts.disabled.contains(action.id());
+            let binding = shortcuts::effective_binding(&config.shortcuts, action);
+            row(ui, &title, Some(&description), |ui| {
+                let reset = ui
+                    .add_enabled(custom, egui::Button::new(catalog.t("shortcuts.reset", &[])))
+                    .on_hover_text(catalog.t("shortcuts.reset.hint", &[]));
+                if reset.clicked() {
+                    shortcuts::reset_binding(&mut config.shortcuts, action);
+                    *changed = true;
+                    if is_recording {
+                        state.recording = None;
+                    }
+                }
+                if ui
+                    .button(catalog.t("shortcuts.clear", &[]))
+                    .on_hover_text(catalog.t("shortcuts.clear.hint", &[]))
+                    .clicked()
+                {
+                    shortcuts::set_binding(&mut config.shortcuts, action, None);
+                    *changed = true;
+                    state.recording = None;
+                }
+                let label = if is_recording {
+                    catalog.t("shortcuts.recording", &[])
+                } else if let Some(binding) = binding {
+                    ui.ctx().format_shortcut(&binding)
+                } else {
+                    catalog.t("shortcuts.unassigned", &[])
+                };
+                let text = if is_conflict {
+                    egui::RichText::new(label).color(ui.visuals().error_fg_color)
+                } else if is_recording {
+                    egui::RichText::new(label).color(ui.visuals().selection.bg_fill)
+                } else {
+                    egui::RichText::new(label)
+                };
+                if ui
+                    .add_sized([172.0, CONTROL_HEIGHT], egui::Button::new(text))
+                    .on_hover_text(catalog.t("shortcuts.record.hint", &[]))
+                    .clicked()
+                {
+                    state.recording = if is_recording { None } else { Some(action) };
+                    state.capture_error = false;
+                }
+            });
+        }
+    }
+    if rendered == 0 {
+        ui.add_space(18.0);
+        hint_text(ui, catalog.t("settings.search.no_results", &[]));
+    }
+
+    ui.ctx().data_mut(|data| data.insert_temp(state_id, state));
+}
+
+fn shortcut_filter_button(
+    ui: &mut egui::Ui,
+    current: &mut ShortcutPageFilter,
+    candidate: ShortcutPageFilter,
+    label: &str,
+) {
+    if ui.selectable_label(*current == candidate, label).clicked() {
+        *current = candidate;
+    }
 }
 
 fn performance_page(

@@ -24,6 +24,15 @@ pub fn grid_width_for_available(available_width: f32) -> f32 {
     (available_width.max(0.0) - HORIZONTAL_PADDING * 2.0).max(0.0)
 }
 
+/// pane 높이에서 만들 수 있는 PTY 행 수. 실제 가용 높이를 전부 행 계산에 사용하고,
+/// 남는 sub-cell 픽셀은 renderer가 터미널 배경으로 채운다.
+pub fn grid_rows_for_available(available_height: f32, cell_height: f32) -> u16 {
+    if !available_height.is_finite() || !cell_height.is_finite() || cell_height <= 0.0 {
+        return 3;
+    }
+    ((available_height.max(0.0) / cell_height).floor() as u16).clamp(3, 200)
+}
+
 /// 세션/pane별 retained row layout cache. UI는 이 캐시를 소유만 하고 backend 타입을
 /// 보지 않는다. selection/cursor/IME는 오버레이라 캐시 무효화 대상이 아니다.
 #[derive(Default)]
@@ -112,11 +121,16 @@ pub fn draw(
     // stale(더 큰) snapshot이 이웃 pane의 클릭/스크롤을 가로채는 것 방지 (codex 리뷰).
     // 넘치는 셀은 아래 content_rect로 잘리며 좌우 여백을 침범하지 않는다.
     let avail = ui.available_size();
+    let render_height = if avail.y.is_finite() {
+        avail.y.max(0.0)
+    } else {
+        cell.y * snapshot.rows as f32
+    };
     let size = egui::vec2(
         ((cell.x * snapshot.cols as f32).min(grid_width_for_available(avail.x))
             + HORIZONTAL_PADDING * 2.0)
             .min(avail.x.max(0.0)),
-        (cell.y * snapshot.rows as f32).min(avail.y.max(0.0)),
+        render_height,
     );
     // click_and_drag: 클릭=포커스, 드래그=선택 (2026-07-05 복사 지원)
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
@@ -599,6 +613,20 @@ mod tests {
             (rect.right() - grid_right - 3.0).abs() < 0.01,
             "rect={rect:?}, origin={origin:?}, cell={cell:?}, grid_right={grid_right}"
         );
+    }
+
+    #[test]
+    fn terminal_높이는_완전한_행을_모두_사용한다() {
+        assert_eq!(grid_rows_for_available(100.0, 20.0), 5);
+        assert_eq!(grid_rows_for_available(119.9, 20.0), 5);
+        assert_eq!(grid_rows_for_available(120.0, 20.0), 6);
+    }
+
+    #[test]
+    fn terminal_행계산은_비정상_높이에서도_최솟값을_지킨다() {
+        assert_eq!(grid_rows_for_available(1.0, 20.0), 3);
+        assert_eq!(grid_rows_for_available(f32::NAN, 20.0), 3);
+        assert_eq!(grid_rows_for_available(100.0, 0.0), 3);
     }
 
     #[test]

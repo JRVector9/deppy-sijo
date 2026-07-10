@@ -10,6 +10,7 @@ mod env;
 mod fonts;
 mod paths;
 mod perf;
+mod shortcuts;
 mod storage;
 mod theme;
 mod ui;

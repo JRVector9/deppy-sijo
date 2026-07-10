@@ -42,11 +42,24 @@ pub enum ActivityAction {
     ClearRenderCaches,
 }
 
-pub struct ActivityUi {}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ActivityFilter {
+    #[default]
+    All,
+    Active,
+    Warm,
+    Warning,
+}
+
+pub struct ActivityUi {
+    filter: ActivityFilter,
+}
 
 impl ActivityUi {
     pub fn new() -> Self {
-        Self {}
+        Self {
+            filter: ActivityFilter::All,
+        }
     }
 
     /// 창 프레임 없이 본문만 렌더한다 (통합 설정 창 우측 패널용, 2026-07-06).
@@ -57,81 +70,314 @@ impl ActivityUi {
         rows: &[ActivityWorkspaceRow],
     ) -> Option<ActivityAction> {
         let mut action = None;
-        if rows.is_empty() {
-            ui.label(catalog.t("activity.empty", &[]));
-            return action;
-        }
-        // 전체 렌더 캐시 비우기 — 안전한 것(렌더 캐시)만 담는다. 절전/스크롤백은
-        // 작업·기록에 영향이 있어 이 버튼에 포함하지 않는다(2026-07-08 검토).
-        if ui
-            .button(catalog.t("activity.clear_caches", &[]))
-            .on_hover_text(catalog.t("activity.clear_caches_hint", &[]))
-            .clicked()
-        {
-            action = Some(ActivityAction::ClearRenderCaches);
-        }
-        ui.add_space(6.0);
-        egui::Grid::new("activity_workspace_grid")
-            .num_columns(6)
-            .striped(true)
+        egui::Frame::NONE
+            .inner_margin(egui::Margin {
+                left: 26,
+                right: 26,
+                top: 20,
+                bottom: 40,
+            })
             .show(ui, |ui| {
-                ui.strong(catalog.t("activity.workspace", &[]));
-                ui.strong(catalog.t("activity.state", &[]));
-                ui.strong(catalog.t("activity.agent", &[]));
-                ui.strong(catalog.t("activity.queue", &[]));
-                ui.strong(catalog.t("activity.resources", &[]));
-                ui.strong(catalog.t("activity.action", &[]));
-                ui.end_row();
-
-                for row in rows {
-                    ui.label(&row.name);
-                    state_label(ui, catalog, row);
-                    // 워크스페이스 행의 에이전트 열 = 세션 수 요약 (서브행과 열 의미 일치,
-                    // 사용자 피드백 2026-07-08).
-                    ui.weak(catalog.t(
-                        "activity.session_count",
-                        &[("count", &row.session_count.to_string())],
-                    ));
-                    ui.horizontal(|ui| {
-                        ui.label(row.pending_events.to_string());
-                        if let Some(pressure) = &row.input_pressure {
-                            input_pressure_badge(ui, catalog, pressure);
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(catalog.t("top.activity", &[]))
+                            .strong()
+                            .size(15.0),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // 안전한 렌더 캐시만 비운다. 실행 프로세스·스크롤 기록은 유지된다.
+                        if ui
+                            .button(catalog.t("activity.clear_caches", &[]))
+                            .on_hover_text(catalog.t("activity.clear_caches_hint", &[]))
+                            .clicked()
+                        {
+                            action = Some(ActivityAction::ClearRenderCaches);
                         }
                     });
-                    ui.label(resource_label(
-                        catalog,
-                        row.resource.as_ref(),
-                        &row.session_resources,
-                    ));
-                    if row.state != ActivityWorkspaceState::Active {
-                        if ui.button(catalog.t("activity.switch", &[])).clicked() {
-                            action = Some(ActivityAction::SwitchWorkspace(row.id.clone()));
-                        }
-                    } else {
-                        ui.weak(catalog.t("activity.current", &[]));
-                    }
-                    ui.end_row();
+                });
+                ui.add_space(16.0);
+                activity_hairline(ui);
+                ui.add_space(16.0);
 
-                    // pane(세션)별 서브행 — 상태 열=상태줄("실행 중 · ctx 69%"),
-                    // 에이전트 열=에이전트 정보("Codex · gpt-5.5 · xhigh"),
-                    // 큐 열=입력압력 뱃지, 자원 열=세션 트리 합산.
-                    for s in &row.sessions {
-                        ui.weak(format!("└ {}", s.name));
-                        ui.label(s.status_line.as_deref().unwrap_or(""));
-                        ui.label(s.agent_line.as_deref().unwrap_or(""));
-                        ui.horizontal(|ui| {
-                            if let Some(pressure) = &s.pressure {
-                                input_pressure_badge(ui, catalog, pressure);
-                            }
-                        });
-                        ui.label(session_resource_text(catalog, s.resource.as_ref()));
-                        ui.label("");
-                        ui.end_row();
+                let summary = activity_summary(rows);
+                summary_cards(ui, catalog, summary);
+                ui.add_space(18.0);
+
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(catalog.t("activity.workspaces", &[]))
+                            .strong()
+                            .size(14.0),
+                    );
+                    ui.add_space(10.0);
+                    for (filter, key) in [
+                        (ActivityFilter::All, "activity.filter.all"),
+                        (ActivityFilter::Active, "activity.filter.active"),
+                        (ActivityFilter::Warm, "activity.filter.warm"),
+                        (ActivityFilter::Warning, "activity.filter.warning"),
+                    ] {
+                        if ui
+                            .selectable_label(self.filter == filter, catalog.t(key, &[]))
+                            .clicked()
+                        {
+                            self.filter = filter;
+                        }
                     }
+                });
+                ui.add_space(8.0);
+                activity_hairline(ui);
+                ui.add_space(10.0);
+
+                let filtered: Vec<_> = rows
+                    .iter()
+                    .filter(|row| activity_filter_matches(self.filter, row))
+                    .collect();
+                if filtered.is_empty() {
+                    ui.add_space(10.0);
+                    ui.weak(catalog.t("activity.empty_filtered", &[]));
+                    return;
+                }
+                for row in filtered {
+                    workspace_card(ui, catalog, row, &mut action);
+                    ui.add_space(10.0);
                 }
             });
         action
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ActivitySummary {
+    workspaces: usize,
+    active: usize,
+    warm: usize,
+    sessions: usize,
+    cpu_percent: Option<f32>,
+    rss_bytes: u64,
+    warnings: usize,
+}
+
+fn activity_summary(rows: &[ActivityWorkspaceRow]) -> ActivitySummary {
+    let mut summary = ActivitySummary {
+        workspaces: rows.len(),
+        active: 0,
+        warm: 0,
+        sessions: 0,
+        cpu_percent: None,
+        rss_bytes: 0,
+        warnings: 0,
+    };
+    let mut cpu = 0.0;
+    let mut cpu_seen = false;
+    for row in rows {
+        match row.state {
+            ActivityWorkspaceState::Active => summary.active += 1,
+            ActivityWorkspaceState::Warm | ActivityWorkspaceState::Suspended => summary.warm += 1,
+        }
+        summary.sessions += row.session_count;
+        if let Some(resource) = &row.resource {
+            summary.rss_bytes = summary.rss_bytes.saturating_add(resource.rss_bytes);
+            if let Some(value) = resource.cpu_percent {
+                cpu += value;
+                cpu_seen = true;
+            }
+        }
+        for resource in &row.session_resources {
+            summary.rss_bytes = summary.rss_bytes.saturating_add(resource.rss_bytes);
+            if let Some(value) = resource.cpu_percent {
+                cpu += value;
+                cpu_seen = true;
+            }
+        }
+        if workspace_has_warning(row) {
+            summary.warnings += 1;
+        }
+    }
+    summary.cpu_percent = cpu_seen.then_some(cpu);
+    summary
+}
+
+fn summary_cards(ui: &mut egui::Ui, catalog: &i18n::Catalog, summary: ActivitySummary) {
+    let cpu = summary
+        .cpu_percent
+        .map(|value| format!("{value:.1}%"))
+        .unwrap_or_else(|| catalog.t("activity.cpu_pending", &[]));
+    let values = [
+        (
+            catalog.t("activity.summary.workspaces", &[]),
+            summary.workspaces.to_string(),
+            catalog.t(
+                "activity.summary.workspace_detail",
+                &[
+                    ("active", &summary.active.to_string()),
+                    ("warm", &summary.warm.to_string()),
+                ],
+            ),
+        ),
+        (
+            catalog.t("activity.summary.sessions", &[]),
+            summary.sessions.to_string(),
+            catalog.t("activity.summary.sessions_detail", &[]),
+        ),
+        (
+            catalog.t("activity.summary.cpu", &[]),
+            cpu,
+            catalog.t("activity.summary.cpu_detail", &[]),
+        ),
+        (
+            catalog.t("activity.summary.memory", &[]),
+            format_bytes(summary.rss_bytes),
+            catalog.t(
+                "activity.summary.warning_detail",
+                &[("count", &summary.warnings.to_string())],
+            ),
+        ),
+    ];
+    ui.columns(4, |columns| {
+        for (column, (label, value, detail)) in columns.iter_mut().zip(values) {
+            let fill = column.visuals().panel_fill;
+            let border = column.visuals().widgets.noninteractive.bg_stroke;
+            egui::Frame::NONE
+                .fill(fill)
+                .stroke(border)
+                .inner_margin(egui::Margin::symmetric(12, 10))
+                .show(column, |ui| {
+                    ui.set_min_height(72.0);
+                    ui.weak(egui::RichText::new(label).size(12.0));
+                    ui.add_space(5.0);
+                    ui.label(egui::RichText::new(value).strong().size(20.0));
+                    ui.add_space(3.0);
+                    ui.weak(egui::RichText::new(detail).size(11.0));
+                });
+        }
+    });
+}
+
+fn activity_filter_matches(filter: ActivityFilter, row: &ActivityWorkspaceRow) -> bool {
+    match filter {
+        ActivityFilter::All => true,
+        ActivityFilter::Active => row.state == ActivityWorkspaceState::Active,
+        ActivityFilter::Warm => row.state != ActivityWorkspaceState::Active,
+        ActivityFilter::Warning => workspace_has_warning(row),
+    }
+}
+
+fn workspace_has_warning(row: &ActivityWorkspaceRow) -> bool {
+    row.input_pressure.is_some()
+        || row
+            .resource
+            .as_ref()
+            .is_some_and(|r| r.high_cpu || r.high_rss)
+        || row
+            .session_resources
+            .iter()
+            .any(|resource| resource.high_cpu || resource.high_rss)
+        || row
+            .sessions
+            .iter()
+            .any(|session| session.pressure.is_some())
+}
+
+fn activity_hairline(ui: &mut egui::Ui) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().hline(
+        rect.x_range(),
+        ui.painter().round_to_pixel_center(rect.center().y),
+        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+    );
+}
+
+fn workspace_card(
+    ui: &mut egui::Ui,
+    catalog: &i18n::Catalog,
+    row: &ActivityWorkspaceRow,
+    action: &mut Option<ActivityAction>,
+) {
+    let fill = ui.visuals().panel_fill;
+    let border = ui.visuals().widgets.noninteractive.bg_stroke;
+    egui::Frame::NONE
+        .fill(fill)
+        .stroke(border)
+        .inner_margin(egui::Margin::symmetric(14, 12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(&row.name).strong().size(14.0));
+                    ui.add_space(4.0);
+                    state_label(ui, catalog, row);
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if row.state == ActivityWorkspaceState::Active {
+                        ui.weak(catalog.t("activity.current", &[]));
+                    } else if ui.button(catalog.t("activity.switch", &[])).clicked() {
+                        *action = Some(ActivityAction::SwitchWorkspace(row.id.clone()));
+                    }
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new(resource_label(
+                            catalog,
+                            row.resource.as_ref(),
+                            &row.session_resources,
+                        ))
+                        .monospace()
+                        .size(12.0),
+                    );
+                    if row.pending_events > 0 {
+                        ui.weak(format!(
+                            "{} {}",
+                            catalog.t("activity.queue", &[]),
+                            row.pending_events
+                        ));
+                    }
+                    if let Some(pressure) = &row.input_pressure {
+                        input_pressure_badge(ui, catalog, pressure);
+                    }
+                });
+            });
+
+            if !row.sessions.is_empty() {
+                ui.add_space(10.0);
+                activity_hairline(ui);
+                for session in &row.sessions {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.set_min_height(38.0);
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new(&session.name).size(13.0));
+                            if let Some(agent) = &session.agent_line {
+                                ui.weak(egui::RichText::new(agent).size(11.0));
+                            }
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(session_resource_text(
+                                    catalog,
+                                    session.resource.as_ref(),
+                                ))
+                                .monospace()
+                                .size(11.0),
+                            );
+                            if let Some(pressure) = &session.pressure {
+                                input_pressure_badge(ui, catalog, pressure);
+                            }
+                            if let Some(status) = &session.status_line {
+                                ui.weak(egui::RichText::new(status).size(11.0));
+                            }
+                        });
+                    });
+                }
+            } else {
+                ui.add_space(8.0);
+                ui.weak(catalog.t(
+                    "activity.session_count",
+                    &[("count", &row.session_count.to_string())],
+                ));
+            }
+        });
 }
 
 /// 세션 서브행의 자원 셀 — 세션 트리(셸+자손) 합산 CPU/RSS(+프로세스 수, 높음 표시).
@@ -316,6 +562,16 @@ mod tests {
     fn bytes_format_uses_mib_and_gib() {
         assert_eq!(format_bytes(512 * 1024 * 1024), "512.0 MiB");
         assert_eq!(format_bytes(2 * 1024 * 1024 * 1024), "2.0 GiB");
+    }
+
+    #[test]
+    fn empty_activity_summary_is_zeroed() {
+        let summary = activity_summary(&[]);
+        assert_eq!(summary.workspaces, 0);
+        assert_eq!(summary.sessions, 0);
+        assert_eq!(summary.cpu_percent, None);
+        assert_eq!(summary.rss_bytes, 0);
+        assert_eq!(summary.warnings, 0);
     }
 
     #[test]

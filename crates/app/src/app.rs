@@ -2017,6 +2017,112 @@ impl App {
         self.evict_warm();
     }
 
+    fn cycle_workspace(&mut self, delta: isize) {
+        if self.workspaces.len() < 2 {
+            return;
+        }
+        let current = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == self.active.id)
+            .unwrap_or(0);
+        let next = (current as isize + delta).rem_euclid(self.workspaces.len() as isize) as usize;
+        let target = self.workspaces[next].id.clone();
+        self.switch_workspace(&target);
+        self.refresh_workspaces();
+    }
+
+    /// 설정에 저장된 전역 단축키 한 건을 실행한다. 설정 창에서는 키 녹화와 검색 입력이
+    /// 우선이고, 일반 TextEdit 포커스 중에도 문자 편집 단축키를 가로채지 않는다.
+    fn handle_configured_shortcut(&mut self, ctx: &egui::Context) {
+        if self.settings_open || ctx.text_edit_focused() {
+            return;
+        }
+        let Some(action) = crate::shortcuts::take_triggered_action(ctx, &self.config.shortcuts)
+        else {
+            return;
+        };
+
+        use crate::shortcuts::ShortcutAction as A;
+        match action {
+            A::ToggleSidebar => {
+                self.config.ui.file_tree_enabled = !self.config.ui.file_tree_enabled;
+                self.file_tree = self
+                    .config
+                    .ui
+                    .file_tree_enabled
+                    .then(|| self.make_file_tree());
+                if let Err(error) = self.config.save(&self.config_path) {
+                    tracing::warn!("단축키 설정 저장 실패: {error:#}");
+                }
+            }
+            A::OpenEnvironment | A::OpenAgents | A::OpenActivity | A::OpenNotifications => {
+                self.settings_category = match action {
+                    A::OpenEnvironment => ui::settings::Category::Environment,
+                    A::OpenAgents => ui::settings::Category::Agents,
+                    A::OpenActivity => ui::settings::Category::Activity,
+                    A::OpenNotifications => ui::settings::Category::Notifications,
+                    _ => unreachable!(),
+                };
+                self.settings_open = true;
+                self.refresh_workspaces();
+            }
+            A::NewShell => self.active.workspace_ui.spawn_shell(
+                &self.active.runtime,
+                self.config.terminal.scrollback_lines as usize,
+            ),
+            A::ClosePane => self
+                .active
+                .workspace_ui
+                .close_focused_pane(&self.active.runtime),
+            A::SplitVertical | A::SplitHorizontal => {
+                let direction = if action == A::SplitVertical {
+                    runtime::SplitDirection::Vertical
+                } else {
+                    runtime::SplitDirection::Horizontal
+                };
+                self.active.workspace_ui.split_focused_pane(
+                    &self.active.runtime,
+                    direction,
+                    self.config.terminal.scrollback_lines as usize,
+                );
+            }
+            A::FocusNextPane => self
+                .active
+                .workspace_ui
+                .focus_relative_pane(&self.active.runtime, 1),
+            A::FocusPreviousPane => self
+                .active
+                .workspace_ui
+                .focus_relative_pane(&self.active.runtime, -1),
+            A::NextWorkspace => self.cycle_workspace(1),
+            A::PreviousWorkspace => self.cycle_workspace(-1),
+            A::IncreaseTerminalFont | A::DecreaseTerminalFont => {
+                let delta = if action == A::IncreaseTerminalFont {
+                    0.5
+                } else {
+                    -0.5
+                };
+                self.config.terminal.font_size =
+                    (self.config.terminal.font_size + delta).clamp(8.0, 32.0);
+                self.active.workspace_ui.clear_render_caches();
+                for runtime in self.warm.values_mut() {
+                    runtime.workspace_ui.clear_render_caches();
+                }
+                if let Err(error) = self.config.save(&self.config_path) {
+                    tracing::warn!("터미널 글꼴 크기 저장 실패: {error:#}");
+                }
+            }
+            A::ClearRenderCaches => {
+                self.active.workspace_ui.clear_render_caches();
+                for runtime in self.warm.values_mut() {
+                    runtime.workspace_ui.clear_render_caches();
+                }
+            }
+        }
+        ctx.request_repaint();
+    }
+
     /// warm 풀이 MAX_WARM을 넘으면 가장 오래된 것부터 Suspended로 내린다 (워커 shutdown,
     /// 세션 종료 — §14.1 Suspended). background 스레드에서 정리하고 on_exit에서 join.
     /// **live 세션(미종료 셸/에이전트)이 있는 workspace는 축출하지 않는다** — 진행 중
@@ -3052,6 +3158,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.frame_stats.begin();
         let text = self.i18n.clone();
+        self.handle_configured_shortcut(ui.ctx());
         let mut unread_before = 0;
         // 실효 테마(다크 여부)가 바뀌면 터미널 렌더 캐시를 비운다 — stale galley로 글자가
         // 깨진 채 남던 문제(#7). 설정에서의 명시 변경과 System 테마의 OS 레벨 전환(raw

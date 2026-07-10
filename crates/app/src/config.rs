@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -14,6 +15,18 @@ pub struct Config {
     pub performance: PerformanceConfig,
     pub remote: RemoteConfig,
     pub i18n: I18nConfig,
+    /// 기본 단축키에서 달라진 항목만 저장한다. 키 이름은 `shortcuts` 모듈이 해석하며,
+    /// 알 수 없는 항목은 무시해 이전/이후 버전의 config와 호환한다.
+    pub shortcuts: ShortcutsConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShortcutsConfig {
+    /// action id -> `Command+Shift+E` 형태의 portable chord.
+    pub bindings: BTreeMap<String, String>,
+    /// 사용자가 명시적으로 비운 action. bindings와 동시에 있으면 disabled가 우선한다.
+    pub disabled: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -229,6 +242,8 @@ mod tests {
         assert_eq!(parsed.terminal.scrollback_lines, 10_000);
         assert_eq!(parsed.performance.output_batch_ms, 25);
         assert_eq!(parsed.i18n.locale, i18n::FALLBACK_LOCALE);
+        assert!(parsed.shortcuts.bindings.is_empty());
+        assert!(parsed.shortcuts.disabled.is_empty());
         // 구 config(file_tree_enabled 없음)도 기본 true (§6 serde 기본)
         assert!(parsed.ui.file_tree_enabled);
         assert_eq!(parsed.ui.last_workspace_id, None);

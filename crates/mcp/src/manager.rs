@@ -406,6 +406,27 @@ sleep 1
     }
 
     #[test]
+    fn protocolversion_누락과_빈문자열도_거부() {
+        // 필드 자체가 없는 응답 → None, 빈 문자열 → 목록 밖. 둘 다 미지원 거부.
+        let missing = r#"
+read -r _init
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"capabilities":{},"serverInfo":{"name":"mock","version":"0"}}}'
+sleep 1
+"#;
+        let error = format!("{:#}", manager().connect(&sh_config(missing)).unwrap_err());
+        assert!(error.contains("None"), "{error}");
+        assert!(error.contains("미지원"), "{error}");
+
+        let empty = r#"
+read -r _init
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"","capabilities":{},"serverInfo":{"name":"mock","version":"0"}}}'
+sleep 1
+"#;
+        let error = format!("{:#}", manager().connect(&sh_config(empty)).unwrap_err());
+        assert!(error.contains("미지원"), "{error}");
+    }
+
+    #[test]
     fn stdout_비json_라인은_프로토콜_위반으로_거부() {
         let script = r#"
 read -r _init

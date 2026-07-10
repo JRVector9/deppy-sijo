@@ -27,6 +27,48 @@ pub struct DotenvSyncReport {
     pub removed: usize,
 }
 
+/// 프로젝트 폴더 **해제** 시 dotenv 자동 profile을 통째로 정리한다(2026-07-10):
+/// 변수 → 전용 credential(참조 없을 때만) → keyring → profile 순. `.env` 파일이
+/// 원본이므로 재지정 시 그대로 복구된다 — 해제했는데 키가 화면에 남는 문제 해결.
+pub fn remove_workspace_dotenv(
+    db: &mut Db,
+    secret_store: &dyn secret::SecretStore,
+    workspace_id: &str,
+) -> anyhow::Result<usize> {
+    let Some(profile) = db
+        .list_env_profiles(workspace_id)?
+        .into_iter()
+        .find(|p| p.kind == DOTENV_PROFILE_KIND)
+    else {
+        return Ok(0);
+    };
+    let vars = db.list_env_vars(&profile.id)?;
+    // dotenv가 **직접 만든** credential(provider="env")만 삭제 후보 — 사용자가 dotenv
+    // profile에 수동으로 붙인 외부 credential은 참조가 사라져도 보존한다(codex High).
+    let dotenv_owned: std::collections::HashSet<String> = db
+        .list_credentials()?
+        .into_iter()
+        .filter(|c| c.provider == "env")
+        .map(|c| c.id)
+        .collect();
+    let mut removed = 0usize;
+    for var in &vars {
+        db.delete_env_var(&profile.id, &var.key)?;
+        if let EnvValue::Secret { credential_id } = &var.value
+            && dotenv_owned.contains(credential_id)
+            && db
+                .delete_credential_if_unused(credential_id)
+                .unwrap_or(false)
+        {
+            let _ = secret_store.delete_secret(credential_id);
+        }
+        removed += 1;
+    }
+    db.delete_env_profile(&profile.id)?;
+    tracing::info!(removed, "프로젝트 해제 — dotenv profile 정리");
+    Ok(removed)
+}
+
 /// workspace 루트의 `.env`를 dotenv profile로 동기화한다. `.env`가 없으면 None.
 /// secret 저장이 하나라도 실패하면 그 키만 건너뛰고 계속한다(best-effort).
 pub fn sync_workspace_dotenv(

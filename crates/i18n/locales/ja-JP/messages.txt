@@ -164,6 +164,7 @@ credentials.purge_none = 孤児項目なし
 credentials.purge_found = keyring の孤児項目 {count} 件 — 整理しますか？
 credentials.purge_go = 整理
 credentials.purge_done = {count} 件整理
+credentials.purge_remaining = 残り孤児 {count} 件
 credentials.add = 追加
 credentials.provider = provider
 credentials.label = ラベル

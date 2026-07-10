@@ -229,10 +229,19 @@ impl CredentialsUi {
                     {
                         match credentials.purge_orphan_credentials(&list) {
                             Ok(n) => {
-                                self.orphan_status = Some(
-                                    catalog
-                                        .t("credentials.purge_done", &[("count", &n.to_string())]),
-                                );
+                                // 정리 직후 재스캔 — 남은 고아 수까지 표시(2026-07-10:
+                                // '정리됨'만 남고 0 확인이 안 되던 문제).
+                                let done = catalog
+                                    .t("credentials.purge_done", &[("count", &n.to_string())]);
+                                // 재스캔 실패를 '남은 0'으로 오표시하지 않는다(codex Med).
+                                let tail = match credentials.orphan_credentials() {
+                                    Ok(l) => catalog.t(
+                                        "credentials.purge_remaining",
+                                        &[("count", &l.len().to_string())],
+                                    ),
+                                    Err(e) => format!("{e:#}"),
+                                };
+                                self.orphan_status = Some(format!("{done} · {tail}"));
                             }
                             Err(e) => self.orphan_status = Some(format!("{e:#}")),
                         }

@@ -164,6 +164,7 @@ credentials.purge_none = 고아 항목 없음
 credentials.purge_found = keyring 고아 항목 {count}개 발견 — 정리하시겠습니까?
 credentials.purge_go = 정리
 credentials.purge_done = {count}개 정리됨
+credentials.purge_remaining = 남은 고아 {count}개
 credentials.add = 추가
 credentials.provider = 공급자
 credentials.label = 라벨

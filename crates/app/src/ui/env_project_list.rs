@@ -253,9 +253,12 @@ fn render_row(
     };
 
     let painter = ui.painter();
-    // 선택/hover 배경은 아래 divider(1px)까지 포함해 세로로 빈틈없이 칠한다.
-    let fill_rect =
-        egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), rect.bottom() + 1.0));
+    // 선택/hover 배경은 위 divider(이전 행 경계)와 아래 divider까지 포함해
+    // 세로로 빈틈없이 칠한다(2026-07-10: 상하 밝은 줄 제거).
+    let fill_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), rect.top() - 1.0),
+        egui::pos2(rect.right(), rect.bottom() + 1.0),
+    );
     painter.rect_filled(fill_rect, 0.0, fill);
 
     // 삭제 버튼은 이름/env count가 있는 위쪽 줄과 세로 중심을 맞춘다.

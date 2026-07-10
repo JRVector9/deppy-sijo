@@ -164,6 +164,7 @@ credentials.purge_none = No orphaned entries
 credentials.purge_found = Found {count} orphaned keyring entries — clean them?
 credentials.purge_go = Clean
 credentials.purge_done = Cleaned {count}
+credentials.purge_remaining = {count} orphans remaining
 credentials.add = Add
 credentials.provider = provider
 credentials.label = Label

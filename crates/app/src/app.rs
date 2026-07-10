@@ -3180,6 +3180,20 @@ impl eframe::App for App {
             if let Err(e) = self.db.set_workspace_path(&self.active.id, &path_str) {
                 tracing::warn!("프로젝트 폴더 저장 실패: {e:#}");
             } else {
+                if path_str.trim().is_empty() {
+                    // 해제(2026-07-10): dotenv profile/변수/전용 credential 정리 —
+                    // 해제했는데 관련 키가 화면·주입에 남지 않게. .env가 원본이라 안전.
+                    if let Err(e) = crate::dotenv_sync::remove_workspace_dotenv(
+                        &mut self.db,
+                        &self.secret_store,
+                        &self.active.id,
+                    ) {
+                        tracing::warn!("dotenv 정리 실패: {e:#}");
+                    }
+                    self.env_profiles_ui.invalidate_cache();
+                    self.credentials_ui.invalidate_cache();
+                    self.env_api_projects_cache = None;
+                }
                 self.save_workspace_anchor(); // rename 복구용 (dev,ino) 앵커
                 self.dismissed_renames.remove(&self.active.id);
                 self.sync_dotenv_env(); // .env → profile + SetSessionDefaultEnv(새 셸에 적용)

@@ -164,6 +164,7 @@ credentials.purge_none = 無孤立項目
 credentials.purge_found = 發現 {count} 個孤立 keyring 項目 — 要清理嗎？
 credentials.purge_go = 清理
 credentials.purge_done = 已清理 {count} 個
+credentials.purge_remaining = 剩餘孤立 {count} 個
 credentials.add = 新增
 credentials.provider = provider
 credentials.label = 標籤

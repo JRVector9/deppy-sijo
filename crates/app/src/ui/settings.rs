@@ -80,7 +80,7 @@ pub struct RemoteView<'a> {
 
 /// 통합 설정 창의 좌측 네비 카테고리. 설정 5개는 이 파일이 인라인 렌더하고, 관리/모니터
 /// 7개는 App이 `render_management` 콜백으로 각 패널의 contents()를 렌더한다 (2026-07-06 전체 통합).
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Category {
     #[default]
     General,
@@ -224,6 +224,10 @@ pub fn show(
                                 render_detail(ui);
                             } else {
                                 egui::ScrollArea::vertical()
+                                    // 카테고리마다 scroll state를 분리한다. 단축키처럼 긴
+                                    // 화면을 내린 뒤 활동으로 이동해도 이전 offset을 이어받아
+                                    // 첫 워크스페이스가 화면 밖에서 시작하지 않는다.
+                                    .id_salt(("settings_detail_scroll", *category))
                                     .auto_shrink([false, false])
                                     .show(ui, |ui| {
                                         apply_component_style(ui);

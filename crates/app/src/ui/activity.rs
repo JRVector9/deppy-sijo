@@ -53,12 +53,16 @@ enum ActivityFilter {
 
 pub struct ActivityUi {
     filter: ActivityFilter,
+    /// 직전 렌더 frame. 한 frame 이상 Activity가 렌더되지 않았으면 새 진입으로 보고
+    /// `전체` 필터로 복귀한다.
+    last_render_frame: Option<u64>,
 }
 
 impl ActivityUi {
     pub fn new() -> Self {
         Self {
             filter: ActivityFilter::All,
+            last_render_frame: None,
         }
     }
 
@@ -69,6 +73,7 @@ impl ActivityUi {
         catalog: &i18n::Catalog,
         rows: &[ActivityWorkspaceRow],
     ) -> Option<ActivityAction> {
+        self.begin_visit_frame(ui.ctx().cumulative_frame_nr());
         let mut action = None;
         egui::Frame::NONE
             .inner_margin(egui::Margin {
@@ -145,6 +150,16 @@ impl ActivityUi {
                 }
             });
         action
+    }
+
+    fn begin_visit_frame(&mut self, frame: u64) {
+        let entering = self
+            .last_render_frame
+            .is_none_or(|last| frame > last.saturating_add(1));
+        if entering {
+            self.filter = ActivityFilter::All;
+        }
+        self.last_render_frame = Some(frame);
     }
 }
 
@@ -572,6 +587,21 @@ mod tests {
         assert_eq!(summary.cpu_percent, None);
         assert_eq!(summary.rss_bytes, 0);
         assert_eq!(summary.warnings, 0);
+    }
+
+    #[test]
+    fn activity_reentry_resets_filter_to_all_immediately() {
+        let mut ui = ActivityUi::new();
+        ui.filter = ActivityFilter::Warning;
+        ui.begin_visit_frame(10);
+        assert_eq!(ui.filter, ActivityFilter::All);
+
+        ui.filter = ActivityFilter::Active;
+        ui.begin_visit_frame(11);
+        assert_eq!(ui.filter, ActivityFilter::Active);
+
+        ui.begin_visit_frame(13);
+        assert_eq!(ui.filter, ActivityFilter::All);
     }
 
     #[test]

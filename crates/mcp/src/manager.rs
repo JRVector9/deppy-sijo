@@ -10,8 +10,20 @@ use serde_json::{Value, json};
 
 use crate::transport::StdioClient;
 
-/// 기준 스펙 개정판 (§1.5 — PR-17/18/19 시작 시 최신 개정판 재확인).
+/// initialize 요청에 싣는 기준 스펙 개정판 (§1.5 — 최신 우선).
+/// VS Code도 요청에는 최신 하나만 보낸다(버전별 분기 없음) — 서버가 자기 버전으로
+/// 응답하는 것이 스펙 협상 규칙이다.
 pub const PROTOCOL_VERSION: &str = "2025-11-25";
+
+/// 수용 가능한 서버 응답 protocolVersion 목록 (최신 우선, H1). 서버가 이 중 하나로
+/// 응답하면 협상 성공 — deppy는 tools/list·tools/call만 쓰므로 개정판 간 실질 차이
+/// 없다. 목록 밖 응답만 거부한다(엄격 gate 유지 — VS Code의 "무검증 수용"은 미채택).
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+];
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// tools/list cursor 페이지네이션 상한 — 악의적 서버의 무한 cursor 방어
@@ -97,18 +109,22 @@ impl LocalMcpManager {
             )
             .with_context(|| format!("MCP 서버 '{}' initialize 실패", config.name))?;
 
-        // §1.5는 2025-11-25 개정판을 기준으로 명시한다 — 다른 개정판은
-        // 프로토콜 gate에서 거부한다 (codex 리뷰 반영: warn만으로는 기준 미달)
+        // 서버 응답 버전이 지원 목록에 있으면 협상 성공 (H1). 목록 밖만 거부한다 —
+        // 실서버 상당수가 아직 구 개정판으로 응답하므로 정확 일치 gate는 과도했다.
         let server_version = initialize_result
             .get("protocolVersion")
             .and_then(Value::as_str);
-        if server_version != Some(PROTOCOL_VERSION) {
-            anyhow::bail!(
-                "MCP 서버 '{}' protocolVersion 불일치: {:?} (기준 {PROTOCOL_VERSION})",
-                config.name,
-                server_version
-            );
-        }
+        let negotiated = server_version
+            .filter(|version| SUPPORTED_PROTOCOL_VERSIONS.contains(version))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "MCP 서버 '{}' protocolVersion 미지원: {:?} (지원: {})",
+                    config.name,
+                    server_version,
+                    SUPPORTED_PROTOCOL_VERSIONS.join(", ")
+                )
+            })?
+            .to_owned();
 
         client
             .notify("notifications/initialized", json!({}))
@@ -117,6 +133,7 @@ impl LocalMcpManager {
         Ok(McpConnection {
             client,
             initialize_result,
+            negotiated_version: negotiated,
         })
     }
 
@@ -147,6 +164,9 @@ pub struct McpConnection {
     client: StdioClient,
     /// initialize 응답 원본 (protocolVersion / capabilities / serverInfo)
     pub initialize_result: Value,
+    /// 협상된 프로토콜 버전 (H1) — HTTP transport(H2)가 이후 요청의
+    /// `MCP-Protocol-Version` 헤더 값으로 쓴다. stdio는 헤더가 없어 미사용.
+    pub negotiated_version: String,
 }
 
 impl McpConnection {
@@ -353,6 +373,36 @@ sleep 30
             assert!(Instant::now() < deadline, "stderr 미도착: {log:?}");
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn 지원_목록의_모든_버전으로_협상_성공() {
+        // H1: 서버가 어느 지원 버전으로 응답하든 connect 성공 + negotiated_version 일치
+        for version in SUPPORTED_PROTOCOL_VERSIONS {
+            let script = format!(
+                r#"
+read -r _init
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"{version}","capabilities":{{}},"serverInfo":{{"name":"mock","version":"0"}}}}}}'
+read -r _initialized
+sleep 1
+"#
+            );
+            let connection = manager().connect(&sh_config(&script)).unwrap();
+            assert_eq!(&connection.negotiated_version, version);
+        }
+    }
+
+    #[test]
+    fn 지원_목록_밖_버전은_서버버전과_목록을_담아_거부() {
+        let script = r#"
+read -r _init
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1999-01-01","capabilities":{},"serverInfo":{"name":"mock","version":"0"}}}'
+sleep 1
+"#;
+        let error = format!("{:#}", manager().connect(&sh_config(script)).unwrap_err());
+        assert!(error.contains("1999-01-01"), "{error}");
+        assert!(error.contains("2025-11-25"), "{error}"); // 지원 목록 포함
+        assert!(error.contains("미지원"), "{error}");
     }
 
     #[test]

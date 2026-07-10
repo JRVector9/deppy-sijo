@@ -193,10 +193,27 @@ impl ui::credentials::CredentialService for AppCredentialService<'_> {
     fn purge_orphan_credentials(&self, ids: &[String]) -> anyhow::Result<usize> {
         let mut purged = 0usize;
         for id in ids {
-            // keyring 항목 삭제 — DB에는 애초에 없으니 keyring만.
-            match self.secret_store.delete_secret(id) {
-                Ok(()) => purged += 1,
-                Err(e) => tracing::warn!(account = %id, "고아 keyring 삭제 실패: {e:#}"),
+            // keyring API 대신 security CLI로 삭제(2026-07-10): 고아는 구 서명 시절
+            // 생성이라 partition 불일치로 keyring 접근마다 키체인 암호를 물었다
+            // ('항상 허용'도 유지 안 됨). CLI 삭제는 이 검사를 거치지 않아 무프롬프트.
+            #[cfg(target_os = "macos")]
+            let ok = std::process::Command::new("/usr/bin/security")
+                .args([
+                    "delete-generic-password",
+                    "-s",
+                    secret::KEYRING_SERVICE,
+                    "-a",
+                    id,
+                ])
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false);
+            #[cfg(not(target_os = "macos"))]
+            let ok = self.secret_store.delete_secret(id).is_ok();
+            if ok {
+                purged += 1;
+            } else {
+                tracing::warn!(account = %id, "고아 keyring 삭제 실패");
             }
         }
         tracing::info!(purged, "고아 keyring 항목 정리");

@@ -180,6 +180,32 @@ impl PersistPipe {
         self.rows.get(&session).map(|row| row.id.as_str())
     }
 
+    /// 복원 대기 중인 이전 세션 행의 kind (행 소비 전 peek) — restore_pane이
+    /// 셸 respawn / 열람 전용(archived) 복원을 분기하는 게이트 (PR-A2).
+    pub(crate) fn restored_session_kind(&self, persistent_id: &str) -> Option<String> {
+        self.restored_rows
+            .get(persistent_id)
+            .map(|row| row.session_kind.clone())
+    }
+
+    /// 열람 전용(archived) 복원 세션을 이전 UUID 행에 재결속한다 — kind/exited
+    /// status를 **보존**한다 (`session_restored`는 kind를 shell·status를 running으로
+    /// 덮어써 재사용 불가). 결속을 누락하면 다음 save_layout이 pane.session_id를
+    /// None으로 저장해 이후 재시작부터 내용을 영구히 잃는다 (PR-A2 함정).
+    pub(crate) fn session_rebound_archived(
+        &mut self,
+        session: SessionId,
+        persistent_id: &str,
+    ) -> bool {
+        let Some(row) = self.restored_rows.remove(persistent_id) else {
+            tracing::warn!(persistent_id, "archived 재결속 대상 행 없음");
+            return false;
+        };
+        // DB 행은 이미 올바른 상태(kind/exited) — 쓰기 없이 메모리 결속만
+        self.rows.insert(session, row);
+        true
+    }
+
     /// 세션의 현재 작업 폴더 갱신 — 감지 워커(lsof)가 관측한 live cd를 따라간다(A안).
     /// 복원 시 이 값으로 그 폴더에서 셸을 다시 띄운다.
     pub(crate) fn update_session_cwd(&mut self, session: SessionId, cwd: &str) {

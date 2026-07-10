@@ -1403,6 +1403,28 @@ impl Worker {
         }
         self.mux.fix_focus();
         self.emit_mux_and_watched();
+        // PR-A2: 열람 전용으로 복원된 exited 세션의 상태 배지 정합 — 상태 뷰만
+        // 재공표한다. SessionExited는 다시 emit하지 않는다(재시작마다 완료 알림이
+        // 재발화하는 것 방지 — 복원 시점에 exited인 세션은 전부 archived 복원분).
+        let restored_exited: Vec<(SessionId, Option<u32>)> = self
+            .sessions
+            .iter()
+            .filter_map(|(id, live)| match live.lifecycle() {
+                session::SessionLifecycle::Exited { exit_code } => Some((*id, exit_code)),
+                session::SessionLifecycle::Running => None,
+            })
+            .collect();
+        for (session, exit_code) in restored_exited {
+            let status = if exit_code == Some(0) {
+                session::SessionStatus::Done
+            } else {
+                session::SessionStatus::Error
+            };
+            self.emit(RuntimeEvent::SessionStatusViewChanged {
+                session,
+                view: session::SessionStatusView::process_exit(status),
+            });
+        }
     }
 
     /// 저장된 tab 하나를 재구성한다 — tab/pane id, layout 구조, active_pane은
@@ -1424,7 +1446,19 @@ impl Worker {
     /// 저장된 pane 하나에 fresh 셸을 spawn해 attach한다. spawn 실패 시에도 pane
     /// 자체는 만든다(session_id 없이) — 기존 "세션을 잃은 pane" 모델과 동일하게
     /// layout/tab 구조는 살아있게 한다.
+    /// agent였던 pane은 respawn 대신 열람 전용 복원(PR-A2) — agent 재실행 금지는
+    /// persistence 헤더의 안전 요구사항이고, 결과 화면 보존이 목적이다.
     fn restore_pane(&mut self, pane_state: &persist::PaneState) {
+        if let Some(persistent_id) = pane_state.session_id.as_deref() {
+            let was_agent = self
+                .persist
+                .as_ref()
+                .and_then(|pipe| pipe.restored_session_kind(persistent_id))
+                .is_some_and(|kind| kind == "agent");
+            if was_agent && self.restore_archived_pane(pane_state, persistent_id) {
+                return;
+            }
+        }
         let mut pane = MuxPane::new(pane_state.id.clone(), pane_state.title.clone());
         let id = SessionId(self.next_id);
         self.next_id += 1;
@@ -1511,6 +1545,62 @@ impl Worker {
             }
         }
         self.mux.panes.insert(pane_state.id.clone(), pane);
+    }
+
+    /// agent pane의 열람 전용 복원 (PR-A2): 디스크 아카이브 1차, 로그 tail 폴백.
+    /// 성공 시 세션·pane 등록까지 마치고 true — 재결속 실패면 false로
+    /// 셸 respawn 경로에 맡긴다 (행이 이미 소비된 예외 상황).
+    fn restore_archived_pane(
+        &mut self,
+        pane_state: &persist::PaneState,
+        persistent_id: &str,
+    ) -> bool {
+        let id = SessionId(self.next_id);
+        self.next_id += 1;
+        // 재결속 먼저 — save_layout이 rows에서 UUID를 찾으므로 이게 빠지면
+        // 다음 저장에서 pane↔세션 연결이 영구 유실된다 (계획 문서 §1 함정)
+        if let Some(pipe) = &mut self.persist
+            && !pipe.session_rebound_archived(id, persistent_id)
+        {
+            return false;
+        }
+        let restored = match storage::scrollback_archive::read(&self.logs_root, persistent_id) {
+            Ok(Some((meta, dump))) => {
+                self.archived_on_disk.insert(id);
+                Session::restore_archived(
+                    id,
+                    archive_kind_from_u8(meta.kind),
+                    meta.cols,
+                    meta.rows,
+                    meta.scrollback_lines as usize,
+                    meta.exit_code,
+                    &dump,
+                )
+            }
+            _ => {
+                // 폴백: 아카이브 부재(레거시/GC/손상) — redacted.ansi.log tail을
+                // 열람 전용 세션에 재생 (VS Code revive/reconnection 2계층 차용)
+                let (cols, rows) = Self::restored_terminal_size(&self.logs_root, persistent_id);
+                let mut session = Session::restore_archived(
+                    id,
+                    session::SessionKind::Agent,
+                    cols,
+                    rows,
+                    Self::RESTORE_SCROLLBACK_LINES,
+                    None,
+                    &[],
+                );
+                Self::replay_saved_ansi(&self.logs_root, persistent_id, &mut session);
+                session
+            }
+        };
+        self.sessions.insert(id, restored);
+        self.exited_order.push_back(id);
+        let mut pane = MuxPane::new(pane_state.id.clone(), pane_state.title.clone());
+        pane.session_id = Some(id);
+        self.mux.panes.insert(pane_state.id.clone(), pane);
+        tracing::info!(persistent_id, session = id.0, "agent pane 열람 전용 복원");
+        true
     }
 
     fn split_pane(
@@ -3797,6 +3887,117 @@ mod tests {
         assert_eq!(meta.exit_code, Some(0));
         let text = String::from_utf8_lossy(&dump);
         assert!(text.contains("archive-roundtrip-marker"), "{text}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// PR-A2: agent pane은 재시작 후 respawn 대신 열람 전용 복원된다 —
+    /// 아카이브 1차 → (파일 삭제 시) 로그 tail 폴백, 재결속으로 2회 왕복에도
+    /// pane↔UUID 연결이 유지된다.
+    #[cfg(unix)]
+    #[test]
+    fn 재시작시_agent_pane은_열람전용으로_복원된다() {
+        init_mock_store();
+        let dir = std::env::temp_dir().join(format!("deppy-rta2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("metadata.sqlite3");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT, path TEXT,
+                     created_at TEXT DEFAULT '', updated_at TEXT DEFAULT '');
+                 CREATE TABLE agent_configs (id TEXT PRIMARY KEY);
+                 INSERT INTO workspaces (id) VALUES ('ws-a2');
+                 INSERT INTO agent_configs (id) VALUES ('cfg-1');",
+            )
+            .unwrap();
+            conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+        }
+        let persist_config = || crate::persistence::PersistConfig {
+            db_path: db_path.clone(),
+            workspace_id: "ws-a2".into(),
+        };
+        let logs_root = test_logs_root("a2-archive");
+        let make_client = || {
+            InProcessRuntimeClient::with_shell(
+                5,
+                test_store(),
+                logs_root.clone(),
+                RedactionService::new(),
+                spec("/bin/cat", &[]),
+                Some(persist_config()),
+            )
+        };
+        let viewport_text = |snapshot: &terminal::TerminalViewportSnapshot| -> String {
+            snapshot
+                .visible_cells
+                .iter()
+                .filter(|c| !c.wide_spacer)
+                .map(|c| c.c)
+                .collect()
+        };
+
+        // 1) agent(config id 있음 — DB kind 'agent') 실행 → 종료 → 워커 종료
+        {
+            let client = make_client();
+            let mut probe = Probe::new(client.subscribe());
+            let mut cmd = spawn_agent_cmd("echo a2-restore-marker", None, None);
+            if let RuntimeCommand::SpawnAgent {
+                agent_config_id, ..
+            } = &mut cmd
+            {
+                *agent_config_id = Some("cfg-1".into());
+            }
+            client.send_command(cmd).unwrap();
+            probe.wait_for(Duration::from_secs(15), |e| match e {
+                RuntimeEvent::SessionExited { .. } => Some(()),
+                _ => None,
+            });
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        // 2) 재시작 1: 아카이브로 열람 전용 복원 — respawn 없이 내용이 보인다
+        let restore_and_check = |round: &str| {
+            let client = make_client();
+            let mut probe = Probe::new(client.subscribe());
+            client
+                .send_command(RuntimeCommand::RestoreWorkspace)
+                .unwrap();
+            let text = probe.wait_for(Duration::from_secs(15), |e| match e {
+                RuntimeEvent::Viewport { snapshot, .. } => {
+                    let text = viewport_text(snapshot);
+                    text.contains("a2-restore-marker").then_some(text)
+                }
+                _ => None,
+            });
+            assert!(text.contains("a2-restore-marker"), "{round}: {text}");
+            // 워커 종료 후 DB 확인: respawn이었다면 kind가 'shell'로 덮였을 것
+            drop(probe);
+            drop(client);
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let (count, kind): (i64, String) = conn
+                .query_row(
+                    "SELECT COUNT(*), MAX(session_kind) FROM sessions",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{round}: 세션 행이 늘면 재결속 실패");
+            assert_eq!(kind, "agent", "{round}: respawn이면 shell로 덮인다");
+        };
+        restore_and_check("재시작1");
+        // 3) 재시작 2 (2회 왕복 — 재결속이 layout 저장을 통과했는지)
+        restore_and_check("재시작2");
+
+        // 4) 아카이브 삭제 → 로그 tail 폴백으로도 열람 전용 복원
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let uuid: String = conn
+            .query_row("SELECT id FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        drop(conn);
+        let archive = storage::scrollback_archive::archive_path(&logs_root, &uuid).unwrap();
+        std::fs::remove_file(&archive).unwrap();
+        restore_and_check("로그폴백");
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

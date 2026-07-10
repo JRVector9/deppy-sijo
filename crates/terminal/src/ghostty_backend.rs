@@ -492,10 +492,7 @@ mod tests {
         let nfd = "\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}";
         feed(&mut b, nfd.as_bytes());
         assert_eq!(row_text(&b, 0), "한글");
-        assert_eq!(
-            b.screen_text().lines().next().unwrap().trim_end(),
-            "한글"
-        );
+        assert_eq!(b.screen_text().lines().next().unwrap().trim_end(), "한글");
     }
 
     #[test]
@@ -542,7 +539,10 @@ mod tests {
         let mut b = backend(80, 24, 100);
         let changes = feed(&mut b, b"\x1b]2;My Title\x1b\\");
         assert!(changes.title_changed);
-        assert_eq!(b.viewport_snapshot().unwrap().title.as_deref(), Some("My Title"));
+        assert_eq!(
+            b.viewport_snapshot().unwrap().title.as_deref(),
+            Some("My Title")
+        );
     }
 
     #[test]

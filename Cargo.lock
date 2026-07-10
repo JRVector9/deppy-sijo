@@ -4087,6 +4087,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "deppy-core",
+ "flate2",
  "keyring-core",
  "libc",
  "mux",

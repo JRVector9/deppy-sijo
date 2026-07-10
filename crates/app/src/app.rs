@@ -2380,6 +2380,12 @@ impl App {
         if self.active.restore_pending_since.is_none() {
             return;
         }
+        // 복원 전에 캐시 정책부터 — 복원된 exited 세션들이 첫 tick에 설정값 기준으로
+        // archive되도록 (§14.3 확장).
+        let _ = self
+            .active
+            .runtime
+            .send_command(self.terminal_cache_policy_command());
         match self
             .active
             .runtime
@@ -2387,6 +2393,23 @@ impl App {
         {
             Ok(()) => self.active.restore_pending_since = None,
             Err(error) => tracing::warn!("workspace 복원 명령 전송 지연: {error:#}"),
+        }
+    }
+
+    /// 설정의 exited cap / 캐시 예산을 워커 정책 명령으로 만든다 (§14.3 확장).
+    fn terminal_cache_policy_command(&self) -> runtime::RuntimeCommand {
+        runtime::RuntimeCommand::SetTerminalCachePolicy {
+            max_exited_backends: self.config.terminal.exited_backend_cap as usize,
+            cache_budget_bytes: self.config.terminal.cache_budget_mb as usize * 1024 * 1024,
+        }
+    }
+
+    /// 캐시 정책을 활성 + warm 워커 전체에 반영한다 (설정 변경 시).
+    fn broadcast_terminal_cache_policy(&mut self) {
+        let command = self.terminal_cache_policy_command();
+        let _ = self.active.runtime.send_command(command.clone());
+        for rt in self.warm.values() {
+            let _ = rt.runtime.send_command(command.clone());
         }
     }
 
@@ -4265,6 +4288,8 @@ impl eframe::App for App {
             ui.ctx().set_theme(self.config.ui.theme.to_egui());
             // 에이전트 상태 hook 토글(agent_status_hooks) 반영 — 설치/해제.
             self.sync_agent_hooks();
+            // 터미널 캐시 정책(exited cap/예산) — 활성+warm 워커에 live 반영 (§14.3 확장).
+            self.broadcast_terminal_cache_policy();
             // 폴더 트리 hot toggle (§6): OFF → 상태 drop(리소스 0), ON → 즉시 생성
             if self.config.ui.file_tree_enabled != self.file_tree.is_some() {
                 self.file_tree = self

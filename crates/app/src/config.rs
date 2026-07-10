@@ -109,6 +109,10 @@ pub struct TerminalConfig {
     pub font_size: f32,
     /// visible session scrollback 상한 (설계문서 14.3)
     pub scrollback_lines: u32,
+    /// 종료 세션 백엔드 LRU 상한 — 초과분은 압축 아카이브 (§14.3 확장, 2026-07-11)
+    pub exited_backend_cap: u32,
+    /// 전역 터미널 캐시 예산 (MB) — 초과 시 exited부터 아카이브
+    pub cache_budget_mb: u32,
 }
 
 impl Default for TerminalConfig {
@@ -116,6 +120,8 @@ impl Default for TerminalConfig {
         Self {
             font_size: 11.0,
             scrollback_lines: 10_000,
+            exited_backend_cap: 64,
+            cache_budget_mb: 128,
         }
     }
 }
@@ -180,6 +186,8 @@ impl Config {
             TerminalConfig::default().font_size
         };
         t.scrollback_lines = t.scrollback_lines.clamp(100, 100_000);
+        t.exited_backend_cap = t.exited_backend_cap.clamp(4, 512);
+        t.cache_budget_mb = t.cache_budget_mb.clamp(32, 2048);
         self.performance.output_batch_ms = self
             .performance
             .output_batch_ms

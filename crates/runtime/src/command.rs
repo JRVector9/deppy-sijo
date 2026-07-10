@@ -132,6 +132,13 @@ pub enum RuntimeCommand {
         session: SessionId,
         cwd: String,
     },
+    /// exited 백엔드 캐시 정책 (§14.3 확장, 2026-07-11 — 설정에서 변경).
+    /// max_exited_backends = live 백엔드 LRU 상한(초과분은 압축 아카이브),
+    /// cache_budget_bytes = 전역 터미널 캐시 예산. **variant는 끝에만 추가** (wire 계약).
+    SetTerminalCachePolicy {
+        max_exited_backends: usize,
+        cache_budget_bytes: usize,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
@@ -190,6 +197,14 @@ impl std::fmt::Debug for RuntimeCommand {
                 .debug_struct("UpdateSessionCwd")
                 .field("session", session)
                 .finish_non_exhaustive(),
+            RuntimeCommand::SetTerminalCachePolicy {
+                max_exited_backends,
+                cache_budget_bytes,
+            } => f
+                .debug_struct("SetTerminalCachePolicy")
+                .field("max_exited_backends", max_exited_backends)
+                .field("cache_budget_bytes", cache_budget_bytes)
+                .finish(),
             RuntimeCommand::WriteInput { session, bytes } => f
                 .debug_struct("WriteInput")
                 .field("session", session)

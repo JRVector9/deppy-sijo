@@ -371,6 +371,86 @@ impl TerminalBackend for AlacrittyBackend {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
+    /// grid 전체(history+화면)를 truecolor SGR ANSI로 덤프한다. 새 백엔드에
+    /// 그대로 feed하면 스크롤백·색·wide char가 복원된다 (압축 아카이브 왕복용).
+    /// wrapped 행은 개행 없이 이어붙여 복원 시 reflow가 자연스럽다.
+    fn serialize_scrollback(&self) -> Option<Vec<u8>> {
+        let grid = self.term.grid();
+        let cols = self.term.columns();
+        let rows = self.term.screen_lines();
+        let history = self.term.history_size();
+        let colors = self.term.colors();
+        let mut out: Vec<u8> = Vec::with_capacity((history + rows) * cols);
+        // 현재 SGR 상태 — 색이 바뀔 때만 시퀀스를 낸다
+        let mut current: Option<([u8; 3], [u8; 3])> = None;
+        let total = history as i32 + rows as i32;
+        for (emitted, line_idx) in (-(history as i32)..rows as i32).enumerate() {
+            let line = &grid[alacritty_terminal::index::Line(line_idx)];
+            let wrapped = line[alacritty_terminal::index::Column(cols - 1)]
+                .flags
+                .contains(Flags::WRAPLINE);
+            // trailing 기본 빈칸 trim (wrapped 행은 전체 폭 보존 — 이어붙는 내용)
+            let mut end = cols;
+            if !wrapped {
+                while end > 0 {
+                    let cell = &line[alacritty_terminal::index::Column(end - 1)];
+                    let plain = cell.c == ' '
+                        && cell.zerowidth().is_none()
+                        && resolve_color(cell.bg, colors, DEFAULT_BG) == DEFAULT_BG
+                        && !cell.flags.contains(Flags::INVERSE);
+                    if plain {
+                        end -= 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            for col in 0..end {
+                let cell = &line[alacritty_terminal::index::Column(col)];
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                let (mut fg, mut bg) = (
+                    resolve_color(cell.fg, colors, DEFAULT_FG),
+                    resolve_color(cell.bg, colors, DEFAULT_BG),
+                );
+                if cell.flags.contains(Flags::INVERSE) {
+                    std::mem::swap(&mut fg, &mut bg);
+                }
+                if current != Some((fg, bg)) {
+                    if (fg, bg) == (DEFAULT_FG, DEFAULT_BG) {
+                        out.extend_from_slice(b"\x1b[0m");
+                    } else {
+                        out.extend_from_slice(
+                            format!(
+                                "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m",
+                                fg[0], fg[1], fg[2], bg[0], bg[1], bg[2]
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                    current = Some((fg, bg));
+                }
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(cell.c.encode_utf8(&mut buf).as_bytes());
+                if let Some(zerowidth) = cell.zerowidth() {
+                    for zw in zerowidth {
+                        out.extend_from_slice(zw.encode_utf8(&mut buf).as_bytes());
+                    }
+                }
+            }
+            // wrapped면 개행 없이 이어붙임, 마지막 행 뒤에는 개행 없음(화면 밀림 방지)
+            if !wrapped && (emitted as i32) < total - 1 {
+                out.extend_from_slice(b"\r\n");
+            }
+        }
+        out.extend_from_slice(b"\x1b[0m");
+        Some(out)
+    }
+
     fn screen_text(&self) -> String {
         // 셀 벡터/Arc 할당 없이 문자만 모은다 — snapshot이 아니다.
         // display_iter는 스크롤된 viewport를 반영하므로 쓰지 않는다 —
@@ -739,6 +819,35 @@ mod tests {
         let text = backend.screen_text();
         assert!(text.contains("줄1 WAITING"));
         assert!(text.contains("줄2"));
+    }
+
+    #[test]
+    fn scrollback_직렬화_왕복() {
+        let mut a = AlacrittyBackend::new(40, 5, 100);
+        for i in 0..20 {
+            feed(&mut a, format!("line{i}\r\n").as_bytes());
+        }
+        feed(&mut a, "가나 \x1b[31mred\x1b[0m end".as_bytes());
+
+        let dump = a.serialize_scrollback().unwrap();
+        let mut b = AlacrittyBackend::new(40, 5, 100);
+        b.feed(&dump).unwrap();
+
+        // 화면 셀(문자·색·wide) 완전 일치 + history 줄 수 보존
+        let snap_a = a.viewport_snapshot().unwrap();
+        let snap_b = b.viewport_snapshot().unwrap();
+        assert_eq!(snap_a.visible_cells, snap_b.visible_cells);
+        assert_eq!(
+            a.cache_footprint().history_lines,
+            b.cache_footprint().history_lines
+        );
+        // 마지막 행: 한글 wide + 빨간 SGR 복원
+        assert_eq!(cell_at(&b, 4, 0).c, '가');
+        assert!(cell_at(&b, 4, 0).wide);
+        assert_eq!(cell_at(&b, 4, 5).fg, ANSI16[1]);
+        // 스크롤백 최상단까지 복원
+        b.scroll(1000);
+        assert_eq!(row_text(&b, 0), "line0");
     }
 
     #[test]

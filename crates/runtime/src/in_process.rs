@@ -183,6 +183,10 @@ impl InProcessRuntimeClient {
                     tab_counter: 0,
                     persist: persist_pipe,
                     exited_order: std::collections::VecDeque::new(),
+                    max_exited_backends: DEFAULT_MAX_EXITED_BACKENDS,
+                    cache_budget_bytes: TERMINAL_GLOBAL_CACHE_BUDGET_BYTES,
+                    archived: std::collections::HashMap::new(),
+                    archived_order: std::collections::VecDeque::new(),
                     hidden_scrollback: std::collections::HashSet::new(),
                     render_active: true,
                     suspended: false,
@@ -312,10 +316,13 @@ impl InProcessRuntimeClient {
 
 impl RuntimeClient for InProcessRuntimeClient {}
 
-/// exited 세션의 terminal backend(scrollback)를 유지하는 최대 개수 (§14.2/14.3).
-/// 초과분은 가장 오래 전에 종료된 것부터 backend를 drop해 메모리를 유계로 만든다
-/// (열려 있는 pane의 scrollback은 유지 — 시간 기반이 아니라 개수 LRU라 UX 안전).
-const MAX_EXITED_BACKENDS: usize = 24;
+/// exited 세션의 terminal backend(scrollback)를 유지하는 최대 개수 기본값 (§14.2/14.3).
+/// 초과분은 가장 오래 전에 종료된 것부터 압축 아카이브로 내려 메모리를 유계로 만든다
+/// (설정에서 변경 — SetTerminalCachePolicy).
+const DEFAULT_MAX_EXITED_BACKENDS: usize = 64;
+/// 압축 아카이브 총 바이트 예산 — 초과 시 오래된 아카이브부터 제거 (LRU).
+/// 개당 압축 ANSI ~수십 KB라 넉넉한 개수를 담는다.
+const ARCHIVED_SCROLLBACK_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 /// Local runtime command queue cap. Commands are ordered and cannot be coalesced
 /// safely in the transport boundary, so overflow is surfaced to the caller.
 const IN_PROCESS_CMD_QUEUE_CAP: usize = 1024;
@@ -359,6 +366,15 @@ struct Worker {
     persist: Option<crate::persistence::PersistPipe>,
     /// backend를 유지 중인 exited 세션들 (종료 순서 — 오래된 것이 앞). §14.3 cap.
     exited_order: std::collections::VecDeque<SessionId>,
+    /// exited 백엔드 LRU 상한 (SetTerminalCachePolicy로 변경 — 설정 UI).
+    max_exited_backends: usize,
+    /// 전역 터미널 캐시 바이트 예산 (SetTerminalCachePolicy로 변경).
+    cache_budget_bytes: usize,
+    /// 압축 아카이브 — 백엔드를 내린 exited 세션의 zlib(ANSI) 덤프. pane이 다시
+    /// 보이면 복원(inflate)한다 (§14.3 확장, 2026-07-11).
+    archived: std::collections::HashMap<SessionId, ArchivedScrollback>,
+    /// 아카이브 삽입 순서 (오래된 것이 앞 — 총 바이트 예산 초과 시 제거 순서)
+    archived_order: std::collections::VecDeque<SessionId>,
     /// 현재 hidden scrollback cap이 적용된 running 세션들 (§14.3) — 전이 감지용.
     hidden_scrollback: std::collections::HashSet<SessionId>,
     /// Active면 visible pane snapshot 생성, false(Warm 등)면 중단 (§14.1). 세션은 유지.
@@ -371,6 +387,17 @@ struct Worker {
     resource_monitor: ProcessResourceMonitor,
     /// backpressure를 emit한 세션들 — 큐가 비면 해소 이벤트(queued=0)를 보낸다(2026-07-09).
     pressured_sessions: std::collections::HashSet<SessionId>,
+}
+
+/// 압축 아카이브 항목 — 백엔드를 내린 exited 세션의 복원 재료 (§14.3 확장).
+struct ArchivedScrollback {
+    kind: session::SessionKind,
+    cols: u16,
+    rows: u16,
+    scrollback_lines: usize,
+    exit_code: Option<u32>,
+    /// zlib 압축된 스타일 보존 ANSI 덤프
+    compressed: Vec<u8>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -917,6 +944,16 @@ impl Worker {
                 if let Some(pipe) = &mut self.persist {
                     pipe.update_session_cwd(session, &cwd);
                 }
+            }
+            RuntimeCommand::SetTerminalCachePolicy {
+                max_exited_backends,
+                cache_budget_bytes,
+            } => {
+                // 원값 방어 (remote wire 포함) — 설정 UI clamp와 동일 기준.
+                // 적용은 다음 pump tick의 archive_over_cap이 처리한다.
+                self.max_exited_backends = max_exited_backends.clamp(4, 512);
+                self.cache_budget_bytes =
+                    cache_budget_bytes.clamp(32 * 1024 * 1024, 2048 * 1024 * 1024);
             }
             RuntimeCommand::WriteInput { session, bytes } => {
                 if let Some(active) = self.sessions.get_mut(&session) {
@@ -1648,6 +1685,13 @@ impl Worker {
         if !self.render_active {
             return; // Warm 등 — snapshot 생성 금지 (§14.1). 세션 pump는 계속된다.
         }
+        // 아카이브된 세션의 pane이 보이면 먼저 복원한다 — 복원 직후 dirty라
+        // 아래 루프가 같은 tick에 Viewport를 push한다 ("연결 중…" 공백 없음).
+        for session in self.mux.watched_sessions() {
+            if !self.sessions.contains_key(&session) && self.archived.contains_key(&session) {
+                self.inflate_archived(session);
+            }
+        }
         let mut events = Vec::new();
         for session in self.mux.watched_sessions() {
             if let Some(active) = self.sessions.get_mut(&session)
@@ -1894,17 +1938,18 @@ impl Worker {
 
     /// exited backend 개수 cap 초과분을 archive한다 (§14.3). pump 시작 시 호출 —
     /// 이번 tick의 신규 exit보다 최소 한 tick 뒤에 archive되도록.
-    /// backend를 drop하고, 아직 열려 있는 pane은 detach(session_id=None) +
-    /// MuxUpdated로 알린다(죽은 session_id를 가리킨 pane이 Viewport를 못 받아
-    /// "연결 중…"에 갇히는 것 방지 — codex 리뷰).
+    /// backend는 압축 아카이브(zlib ANSI)로 내려 pane을 유지하고, 다시 보이면
+    /// 복원한다. 직렬화 미지원 백엔드만 기존대로 drop + pane detach
+    /// ("연결 중…" 갇힘 방지 — codex 리뷰의 detach 사유는 복원 훅이 대신한다).
     fn archive_over_cap(&mut self) {
         // 현재 보이는(active tab의) pane 세션은 archive하지 않는다 — split이면
         // 비포커스 pane도 화면에 있어 사용자가 그 scrollback을 보는 중일 수 있다
         // (codex 리뷰: focused 하나만 제외하면 부족). watched = visible.
         let visible = self.mux.watched_sessions();
-        let mut to_archive = exited_to_archive(&self.exited_order, MAX_EXITED_BACKENDS, &visible);
+        let mut to_archive =
+            exited_to_archive(&self.exited_order, self.max_exited_backends, &visible);
         let cache_bytes = self.terminal_cache_bytes();
-        if cache_bytes > TERMINAL_GLOBAL_CACHE_BUDGET_BYTES {
+        if cache_bytes > self.cache_budget_bytes {
             let bytes_by_session: std::collections::HashMap<SessionId, usize> = self
                 .sessions
                 .iter()
@@ -1915,7 +1960,7 @@ impl Worker {
                 &visible,
                 &bytes_by_session,
                 cache_bytes,
-                TERMINAL_GLOBAL_CACHE_BUDGET_BYTES,
+                self.cache_budget_bytes,
             ) {
                 if !to_archive.contains(&session) {
                     to_archive.push(session);
@@ -1924,23 +1969,35 @@ impl Worker {
         }
         let mut detached_any = false;
         for session in to_archive {
-            let estimated_bytes = self
-                .sessions
-                .get(&session)
-                .map(|session| session.cache_footprint().estimated_bytes)
-                .unwrap_or(0);
+            let Some(live) = self.sessions.get(&session) else {
+                continue;
+            };
+            let estimated_bytes = live.cache_footprint().estimated_bytes;
+            // 압축 아카이브 시도 — 성공하면 pane을 유지하고 다시 보일 때 복원한다
+            let entry = self.make_archive_entry(live);
+            let restorable = entry.is_some();
+            if let Some(entry) = entry {
+                self.archived_order.push_back(session);
+                self.archived.insert(session, entry);
+                self.trim_archived_budget();
+            }
             self.sessions.remove(&session);
             self.exited_order.retain(|s| *s != session);
             self.hidden_scrollback.remove(&session);
-            for pane in self.mux.panes.values_mut() {
-                if pane.session_id == Some(session) {
-                    pane.session_id = None;
-                    detached_any = true;
+            if !restorable {
+                // 복원 불가(직렬화 미지원) — 기존 동작: pane detach로
+                // "연결 중…" 갇힘을 방지한다 (codex 리뷰)
+                for pane in self.mux.panes.values_mut() {
+                    if pane.session_id == Some(session) {
+                        pane.session_id = None;
+                        detached_any = true;
+                    }
                 }
             }
             tracing::info!(
                 session = session.0,
                 estimated_bytes,
+                restorable,
                 cache_class = ?TerminalCacheClass::Exited,
                 "terminal cache archived exited backend"
             );
@@ -1948,6 +2005,70 @@ impl Worker {
         if detached_any {
             self.emit_mux_snapshot();
         }
+    }
+
+    /// exited 세션의 scrollback을 zlib 압축 아카이브 항목으로 만든다.
+    /// 직렬화 미지원 백엔드(예: experimental ghostty)는 None.
+    fn make_archive_entry(&self, live: &Session) -> Option<ArchivedScrollback> {
+        let dump = live.serialize_scrollback()?;
+        let footprint = live.cache_footprint();
+        let exit_code = match live.lifecycle() {
+            session::SessionLifecycle::Exited { exit_code } => exit_code,
+            session::SessionLifecycle::Running => None,
+        };
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &dump).ok()?;
+        let compressed = encoder.finish().ok()?;
+        Some(ArchivedScrollback {
+            kind: live.kind(),
+            cols: footprint.columns as u16,
+            rows: footprint.screen_lines as u16,
+            scrollback_lines: footprint.scrollback_limit_lines,
+            exit_code,
+            compressed,
+        })
+    }
+
+    /// 아카이브 총 바이트가 예산을 넘으면 오래된 것부터 제거한다 (LRU).
+    fn trim_archived_budget(&mut self) {
+        let mut total: usize = self.archived.values().map(|a| a.compressed.len()).sum();
+        while total > ARCHIVED_SCROLLBACK_BUDGET_BYTES {
+            let Some(oldest) = self.archived_order.pop_front() else {
+                break;
+            };
+            if let Some(dropped) = self.archived.remove(&oldest) {
+                total -= dropped.compressed.len();
+                tracing::info!(session = oldest.0, "archived scrollback 예산 초과 — 제거");
+            }
+        }
+    }
+
+    /// 아카이브된 세션의 pane이 다시 보이면 백엔드를 복원한다 (열람 시 inflate).
+    /// 복원된 세션은 다시 exited LRU의 최신 자리로 들어간다.
+    fn inflate_archived(&mut self, session: SessionId) {
+        let Some(entry) = self.archived.remove(&session) else {
+            return;
+        };
+        self.archived_order.retain(|s| *s != session);
+        let mut dump = Vec::new();
+        let mut decoder = flate2::read::ZlibDecoder::new(entry.compressed.as_slice());
+        if std::io::Read::read_to_end(&mut decoder, &mut dump).is_err() {
+            tracing::warn!(session = session.0, "archived scrollback 해제 실패 — 폐기");
+            return;
+        }
+        let restored = Session::restore_archived(
+            session,
+            entry.kind,
+            entry.cols,
+            entry.rows,
+            entry.scrollback_lines,
+            entry.exit_code,
+            &dump,
+        );
+        self.sessions.insert(session, restored);
+        self.exited_order.push_back(session);
+        tracing::info!(session = session.0, "archived scrollback 복원");
     }
 
     fn terminal_cache_bytes(&self) -> usize {

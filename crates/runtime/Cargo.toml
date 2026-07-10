@@ -24,6 +24,8 @@ rustls-pki-types = { workspace = true }
 session = { path = "../session" }
 storage = { path = "../storage" }
 terminal = { path = "../terminal" }
+# exited scrollback 압축 아카이브 (§14.3 확장 — image crate 경유로 이미 트리에 있음)
+flate2 = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

@@ -1494,6 +1494,30 @@ fn terminal_page(
             }
         },
     );
+    row(
+        ui,
+        &catalog.t("settings.exited_cap", &[]),
+        Some(&catalog.t("settings.exited_cap.hint", &[])),
+        |ui| {
+            let mut v = config.terminal.exited_backend_cap as i64;
+            if stepper(ui, &mut v, 4, 4, 512, "") {
+                config.terminal.exited_backend_cap = v as u32;
+                *changed = true;
+            }
+        },
+    );
+    row(
+        ui,
+        &catalog.t("settings.cache_budget", &[]),
+        Some(&catalog.t("settings.cache_budget.hint", &[])),
+        |ui| {
+            let mut v = config.terminal.cache_budget_mb as i64;
+            if stepper(ui, &mut v, 32, 32, 2_048, "MB") {
+                config.terminal.cache_budget_mb = v as u32;
+                *changed = true;
+            }
+        },
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

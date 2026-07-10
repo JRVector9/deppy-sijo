@@ -135,6 +135,48 @@ impl Session {
         })
     }
 
+    /// 압축 아카이브에서 복원한 열람 전용 세션 (§14.3 확장 — exited 백엔드 복원).
+    /// 프로세스 없음(pty None) — 백엔드에 아카이브 ANSI를 재주입해 스크롤백을 되살린다.
+    pub fn restore_archived(
+        id: SessionId,
+        kind: SessionKind,
+        cols: u16,
+        rows: u16,
+        scrollback_lines: usize,
+        exit_code: Option<u32>,
+        ansi_dump: &[u8],
+    ) -> Self {
+        let (_tx, output) = std::sync::mpsc::channel();
+        let mut backend = terminal::new_default_backend(cols, rows, scrollback_lines);
+        if let Err(e) = backend.feed(ansi_dump) {
+            tracing::warn!("아카이브 복원 feed 실패: {e:#}");
+        }
+        // 복원 즉시 exited budget 적용 (visible 한도로 부풀지 않게)
+        backend.set_cache_class(TerminalCacheClass::Exited);
+        Self {
+            id,
+            kind,
+            pty: None,
+            process_identity: pty::ProcessIdentity::unavailable(),
+            output,
+            backend,
+            lifecycle: SessionLifecycle::Exited { exit_code },
+            dirty: true,
+            pending_full_dirty: true,
+            pending_dirty_rows: Vec::new(),
+            child_dead: true,
+            exit_code,
+            exit_wait_ticks: 0,
+            cache_class: TerminalCacheClass::Exited,
+            cache_events: Vec::new(),
+        }
+    }
+
+    /// scrollback+화면을 ANSI로 직렬화 (압축 아카이브용 — 미지원 백엔드는 None).
+    pub fn serialize_scrollback(&self) -> Option<Vec<u8>> {
+        self.backend.serialize_scrollback()
+    }
+
     pub fn id(&self) -> SessionId {
         self.id
     }
@@ -443,6 +485,38 @@ fn dirty_rows_to_ranges(dirty_rows: &mut Vec<u16>, cols: u16, rows: u16) -> Vec<
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn 아카이브_복원_세션은_스크롤백을_보존한다() {
+        // live 백엔드에 출력 → 직렬화 → 복원 세션이 화면·스크롤백·상태를 되살린다
+        let mut backend = terminal::new_default_backend(40, 5, 100);
+        for i in 0..12 {
+            backend.feed(format!("line{i}\r\n").as_bytes()).unwrap();
+        }
+        let dump = backend
+            .serialize_scrollback()
+            .expect("alacritty는 직렬화 지원");
+
+        let mut restored =
+            Session::restore_archived(SessionId(9), SessionKind::Shell, 40, 5, 100, Some(0), &dump);
+        assert!(!restored.lifecycle().is_running());
+        assert_eq!(restored.cache_footprint().class, TerminalCacheClass::Exited);
+        // 화면 마지막 줄 + 스크롤백 히스토리 보존
+        assert!(restored.screen_text().contains("line11"));
+        assert!(restored.cache_footprint().history_lines > 0);
+        // 복원 직후 dirty — 첫 snapshot이 바로 나온다 ("연결 중" 공백 방지)
+        assert!(restored.take_snapshot().is_some());
+        // 스크롤로 과거 내용 열람 가능
+        restored.scroll(1000);
+        let top = restored.take_snapshot().unwrap();
+        let cols = top.cols as usize;
+        let first_row: String = top.visible_cells[..cols]
+            .iter()
+            .filter(|c| !c.wide_spacer)
+            .map(|c| c.c)
+            .collect();
+        assert!(first_row.trim_end().starts_with("line0"), "{first_row}");
+    }
 
     fn wait<T>(timeout: Duration, mut poll: impl FnMut() -> Option<T>) -> T {
         let deadline = Instant::now() + timeout;

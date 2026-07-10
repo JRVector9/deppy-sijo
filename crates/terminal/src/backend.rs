@@ -126,4 +126,11 @@ pub trait TerminalBackend {
     /// 현재 화면(스크롤 무시, 실제 grid)의 텍스트 — status detector용 경량 조회.
     /// TerminalViewportSnapshot을 만들지 않는다 (설계문서 PR-12: hidden session 규칙).
     fn screen_text(&self) -> String;
+
+    /// scrollback+화면 전체를 스타일 보존 ANSI 바이트로 직렬화한다 —
+    /// exited 백엔드 압축 아카이브용 (§14.3 확장). 새 백엔드에 feed하면 복원된다.
+    /// 미지원 백엔드는 None (아카이브 대신 기존 drop 동작).
+    fn serialize_scrollback(&self) -> Option<Vec<u8>> {
+        None
+    }
 }

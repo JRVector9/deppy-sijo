@@ -7,8 +7,8 @@ use pty::{
     PtyOutputWake, PtySession,
 };
 use terminal::{
-    AlacrittyBackend, CellRange, TerminalBackend, TerminalCacheClass, TerminalCacheEvent,
-    TerminalCacheFootprint, TerminalViewportSnapshot,
+    CellRange, TerminalBackend, TerminalCacheClass, TerminalCacheEvent, TerminalCacheFootprint,
+    TerminalViewportSnapshot,
 };
 
 use crate::lifecycle::SessionLifecycle;
@@ -47,7 +47,9 @@ pub struct Session {
     pty: Option<Box<dyn PtySession>>,
     process_identity: ProcessIdentity,
     output: Receiver<Vec<u8>>,
-    backend: AlacrittyBackend,
+    /// 백엔드 선택은 terminal::new_default_backend (기본 alacritty,
+    /// ghostty-backend feature + DEPPY_TERM_BACKEND=ghostty면 libghostty — A/B 실측용).
+    backend: Box<dyn TerminalBackend>,
     lifecycle: SessionLifecycle,
     dirty: bool,
     pending_full_dirty: bool,
@@ -120,7 +122,7 @@ impl Session {
             pty: Some(pty),
             process_identity,
             output,
-            backend: AlacrittyBackend::new(cols, rows, scrollback_lines),
+            backend: terminal::new_default_backend(cols, rows, scrollback_lines),
             lifecycle: SessionLifecycle::Running,
             dirty: true,
             pending_full_dirty: true,

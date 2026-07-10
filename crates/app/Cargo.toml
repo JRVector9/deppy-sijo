@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# LibGhosttyBackend A/B 실측용 (실행 시 DEPPY_TERM_BACKEND=ghostty로 선택) —
+# 빌드에 Zig 필요. 기본 빌드에는 포함하지 않는다.
+ghostty-backend = ["terminal/ghostty-backend"]
+
 [dependencies]
 eframe = { workspace = true }
 egui = { workspace = true }

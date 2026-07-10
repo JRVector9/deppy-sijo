@@ -8,6 +8,8 @@ action.new = 新建
 action.save = 保存
 action.stop = 停止
 action.add = 添加
+action.show_secret = 显示密钥
+action.hide_secret = 隐藏密钥
 action.run = 运行
 action.allow = 允许
 action.deny = 拒绝
@@ -49,7 +51,7 @@ settings.status_hooks = 智能体状态钩子
 settings.status_hooks.hint = 在 claude/codex 中安装钩子以准确检测审批/输入等待（关闭=仅屏幕推测）
 settings.locale.hint = 韩语 · 英语 · 日本語 · 简体 · 繁體（内置）
 settings.scrollback.hint = 隐藏会话自动缩减为 1,000 行
-settings.output_batch.hint = 0/1 归一化为 16ms（抑制空闲重绘）
+settings.output_batch.hint = 输出到达时立即唤醒，连续更新以8ms合并（此值为空闲回退上限）
 workspace.title = 工作区
 workspace.no_session = 无会话
 workspace.connecting = 连接中...

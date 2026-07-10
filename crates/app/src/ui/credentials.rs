@@ -45,6 +45,10 @@ pub struct CredentialsUi {
     /// 마지막 정리 결과 메시지(정리 개수/없음).
     orphan_status: Option<String>,
     cached: Option<Vec<CredentialListItem>>,
+    /// API 비밀키는 기본 마스킹한다. 사용자가 ○를 누른 항목만 background keyring
+    /// worker 결과를 이 UI가 소유하며, 화면/목록 무효화 때 즉시 폐기한다.
+    reveal_requested: std::collections::HashSet<String>,
+    revealed: std::collections::HashMap<String, String>,
 }
 
 impl CredentialsUi {
@@ -60,12 +64,21 @@ impl CredentialsUi {
             orphan_candidates: None,
             orphan_status: None,
             cached: None,
+            reveal_requested: std::collections::HashSet::new(),
+            revealed: std::collections::HashMap::new(),
         }
     }
 
     /// 다른 창(커넥터)이 credential을 추가했을 때 목록 캐시를 버린다.
     pub fn invalidate_cache(&mut self) {
         self.cached = None;
+        self.clear_revealed_secrets();
+    }
+
+    /// 설정 닫기/워크스페이스 전환에서 목록 메타 캐시는 유지하면서 평문만 즉시 폐기한다.
+    pub fn clear_revealed_secrets(&mut self) {
+        self.reveal_requested.clear();
+        self.revealed.clear();
     }
 
     /// 비-compact 버전 — settings.rs가 Credentials→Environment로 리다이렉트해 실제 도달 불가.
@@ -75,6 +88,7 @@ impl CredentialsUi {
         &mut self,
         ui: &mut egui::Ui,
         credentials: &dyn CredentialService,
+        reveal_secret: &mut dyn FnMut(&str) -> Option<String>,
         catalog: &i18n::Catalog,
     ) -> bool {
         let mut changed = false;
@@ -95,12 +109,28 @@ impl CredentialsUi {
             },
         };
 
-        ui.add_space(16.0);
+        self.reveal_requested
+            .retain(|id| list.iter().any(|item| item.id == *id));
+        self.revealed
+            .retain(|id, _| list.iter().any(|item| item.id == *id));
+        for meta in &list {
+            if self.reveal_requested.contains(&meta.id)
+                && !self.revealed.contains_key(&meta.id)
+                && let Some(secret) = reveal_secret(&meta.id)
+            {
+                self.revealed.insert(meta.id.clone(), secret);
+            }
+        }
+
+        // EnvVarTable의 CSS margin-bottom: 2px. SectionHeader 자체가 상단 10px
+        // padding을 포함하므로 여기서 다시 10px을 더하지 않는다.
+        ui.add_space(2.0);
+        let add_label = format!("+ {}", catalog.t("action.add", &[]));
         if credentials_section_header(
             ui,
             &catalog.t("credentials.api_keys", &[]),
             list.len(),
-            &catalog.t("env.add_key", &[]),
+            &add_label,
         ) {
             // 토글(P2) — 스크린샷은 기본 표만, 폼은 '+ 추가'를 눌렀을 때만.
             self.show_add_form = !self.show_add_form;
@@ -119,7 +149,8 @@ impl CredentialsUi {
         );
         let mut delete_id: Option<(String, String)> = None;
         for meta in &list {
-            if credential_table_row(ui, meta, catalog) {
+            let row = credential_table_row(ui, meta, self.revealed.get(&meta.id), catalog);
+            if row.delete {
                 let name = if meta.label.is_empty() {
                     meta.provider.clone()
                 } else {
@@ -127,7 +158,13 @@ impl CredentialsUi {
                 };
                 delete_id = Some((meta.id.clone(), name));
             }
-            credentials_table_divider(ui);
+            if row.toggle_reveal {
+                if self.reveal_requested.remove(&meta.id) {
+                    self.revealed.remove(&meta.id);
+                } else {
+                    self.reveal_requested.insert(meta.id.clone());
+                }
+            }
         }
         if list.is_empty() {
             ui.label(
@@ -163,6 +200,8 @@ impl CredentialsUi {
                     match self.delete(credentials, &del_id) {
                         Ok(()) => {
                             changed = true;
+                            self.reveal_requested.remove(&del_id);
+                            self.revealed.remove(&del_id);
                             self.error = None;
                         }
                         Err(e) => self.error = Some(format!("{e:#}")),
@@ -215,78 +254,81 @@ impl CredentialsUi {
             });
         }
 
-        // 고아 keyring 정리 — 삭제된 profile/credential이 남긴 잔여 항목(uuid 계정만
-        // 대상, 시스템 키 제외). 위험 작업이라 링크 → 스캔 → 개수 확인 → 정리 2단계.
-        ui.add_space(12.0);
-        match self.orphan_candidates.clone() {
-            None => {
-                ui.horizontal(|ui| {
-                    let link = ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(catalog.t("credentials.purge_orphans", &[]))
-                                .size(12.0)
-                                .color(ui.visuals().weak_text_color()),
-                        )
-                        .sense(egui::Sense::click()),
-                    );
-                    if link.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                    if link.clicked() {
-                        match credentials.orphan_credentials() {
-                            Ok(list) if list.is_empty() => {
-                                self.orphan_status = Some(catalog.t("credentials.purge_none", &[]));
-                            }
-                            Ok(list) => {
-                                self.orphan_status = None;
-                                self.orphan_candidates = Some(list);
-                            }
-                            Err(e) => self.orphan_status = Some(format!("{e:#}")),
+        // 기본 표에서는 목업에 없는 관리 링크를 숨긴다. '+ 추가' 폼을 연 경우에만
+        // 고아 keyring 정리 진입점을 함께 노출해 기존 관리 기능은 보존한다.
+        if self.show_add_form || self.orphan_candidates.is_some() || self.orphan_status.is_some() {
+            ui.add_space(12.0);
+            match self.orphan_candidates.clone() {
+                None => {
+                    ui.horizontal(|ui| {
+                        let link = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(catalog.t("credentials.purge_orphans", &[]))
+                                    .size(12.0)
+                                    .color(ui.visuals().weak_text_color()),
+                            )
+                            .sense(egui::Sense::click()),
+                        );
+                        if link.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
-                    }
-                    if let Some(status) = &self.orphan_status {
-                        ui.label(egui::RichText::new(status).size(12.0).weak());
-                    }
-                });
-            }
-            Some(list) => {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(catalog.t(
-                            "credentials.purge_found",
-                            &[("count", &list.len().to_string())],
-                        ))
-                        .size(12.0)
-                        .color(ui.visuals().warn_fg_color),
-                    );
-                    if ui
-                        .small_button(catalog.t("credentials.purge_go", &[]))
-                        .clicked()
-                    {
-                        match credentials.purge_orphan_credentials(&list) {
-                            Ok(n) => {
-                                // 정리 직후 재스캔 — 남은 고아 수까지 표시(2026-07-10:
-                                // '정리됨'만 남고 0 확인이 안 되던 문제).
-                                let done = catalog
-                                    .t("credentials.purge_done", &[("count", &n.to_string())]);
-                                // 재스캔 실패를 '남은 0'으로 오표시하지 않는다(codex Med).
-                                let tail = match credentials.orphan_credentials() {
-                                    Ok(l) => catalog.t(
-                                        "credentials.purge_remaining",
-                                        &[("count", &l.len().to_string())],
-                                    ),
-                                    Err(e) => format!("{e:#}"),
-                                };
-                                self.orphan_status = Some(format!("{done} · {tail}"));
+                        if link.clicked() {
+                            match credentials.orphan_credentials() {
+                                Ok(list) if list.is_empty() => {
+                                    self.orphan_status =
+                                        Some(catalog.t("credentials.purge_none", &[]));
+                                }
+                                Ok(list) => {
+                                    self.orphan_status = None;
+                                    self.orphan_candidates = Some(list);
+                                }
+                                Err(e) => self.orphan_status = Some(format!("{e:#}")),
                             }
-                            Err(e) => self.orphan_status = Some(format!("{e:#}")),
                         }
-                        self.orphan_candidates = None;
-                    }
-                    if ui.small_button(catalog.t("action.cancel", &[])).clicked() {
-                        self.orphan_candidates = None;
-                    }
-                });
+                        if let Some(status) = &self.orphan_status {
+                            ui.label(egui::RichText::new(status).size(12.0).weak());
+                        }
+                    });
+                }
+                Some(list) => {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(catalog.t(
+                                "credentials.purge_found",
+                                &[("count", &list.len().to_string())],
+                            ))
+                            .size(12.0)
+                            .color(ui.visuals().warn_fg_color),
+                        );
+                        if ui
+                            .small_button(catalog.t("credentials.purge_go", &[]))
+                            .clicked()
+                        {
+                            match credentials.purge_orphan_credentials(&list) {
+                                Ok(n) => {
+                                    // 정리 직후 재스캔 — 남은 고아 수까지 표시(2026-07-10:
+                                    // '정리됨'만 남고 0 확인이 안 되던 문제).
+                                    let done = catalog
+                                        .t("credentials.purge_done", &[("count", &n.to_string())]);
+                                    // 재스캔 실패를 '남은 0'으로 오표시하지 않는다(codex Med).
+                                    let tail = match credentials.orphan_credentials() {
+                                        Ok(l) => catalog.t(
+                                            "credentials.purge_remaining",
+                                            &[("count", &l.len().to_string())],
+                                        ),
+                                        Err(e) => format!("{e:#}"),
+                                    };
+                                    self.orphan_status = Some(format!("{done} · {tail}"));
+                                }
+                                Err(e) => self.orphan_status = Some(format!("{e:#}")),
+                            }
+                            self.orphan_candidates = None;
+                        }
+                        if ui.small_button(catalog.t("action.cancel", &[])).clicked() {
+                            self.orphan_candidates = None;
+                        }
+                    });
+                }
             }
         }
 
@@ -325,27 +367,90 @@ fn credentials_section_header(
     count: usize,
     action_label: &str,
 ) -> bool {
-    let mut clicked = false;
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(title).size(14.0).strong());
-        egui::Frame::NONE
-            .fill(ui.visuals().faint_bg_color)
-            .inner_margin(egui::Margin::symmetric(6, 2))
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(count.to_string())
-                        .size(13.0)
-                        .color(ui.visuals().hyperlink_color),
-                );
-            });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // sharp(라운딩 0) — 1px border는 테마 기본 widget stroke를 그대로 사용.
-            clicked = ui
-                .add(egui::Button::new(action_label).corner_radius(0))
-                .clicked();
-        });
-    });
-    clicked
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::hover());
+    let painter = ui.painter();
+    let y = rect.center().y;
+    let title_font = egui::FontId::monospace(14.0);
+    painter.text(
+        egui::pos2(rect.left(), y),
+        egui::Align2::LEFT_CENTER,
+        title,
+        title_font.clone(),
+        ui.visuals().text_color(),
+    );
+    let title_w = painter
+        .layout_no_wrap(title.to_owned(), title_font, ui.visuals().text_color())
+        .rect
+        .width();
+    let count_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + title_w + 16.0, y),
+        egui::vec2(20.0, 20.0),
+    );
+    let tag = if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(0x2a, 0x3a, 0x44)
+    } else {
+        egui::Color32::from_rgb(0xd0, 0xe8, 0xf4)
+    };
+    painter.rect_filled(count_rect, 0.0, tag);
+    painter.text(
+        count_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        count.to_string(),
+        egui::FontId::monospace(12.0),
+        ui.visuals().hyperlink_color,
+    );
+
+    let button_font = egui::FontId::monospace(13.0);
+    let label_w = painter
+        .layout_no_wrap(
+            action_label.to_owned(),
+            button_font.clone(),
+            ui.visuals().weak_text_color(),
+        )
+        .rect
+        .width();
+    let button_w = (label_w + 16.0).max(58.0);
+    let button_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - button_w / 2.0, y),
+        egui::vec2(button_w, 26.0),
+    );
+    let response = ui.interact(
+        button_rect,
+        ui.id().with("credentials_section_add"),
+        egui::Sense::click(),
+    );
+    let hovered = response.hovered();
+    let fill = if hovered {
+        ui.visuals().selection.bg_fill
+    } else {
+        ui.visuals().extreme_bg_color
+    };
+    let stroke = if hovered {
+        ui.visuals().selection.bg_fill
+    } else {
+        ui.visuals().widgets.noninteractive.bg_stroke.color
+    };
+    painter.rect_filled(button_rect, 0.0, fill);
+    painter.rect_stroke(
+        button_rect,
+        0.0,
+        egui::Stroke::new(1.0, stroke),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        button_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        action_label,
+        button_font,
+        if hovered {
+            egui::Color32::WHITE
+        } else {
+            ui.visuals().weak_text_color()
+        },
+    );
+    paint_credentials_hline(ui, rect.bottom());
+    response.clicked()
 }
 
 /// "+ 추가" 헤더 버튼 클릭 시 포커스를 옮길 provider 입력창의 고정 Id.
@@ -354,33 +459,37 @@ fn credential_provider_input_id() -> egui::Id {
 }
 
 fn credentials_table_header(ui: &mut egui::Ui, columns: &[String]) {
-    ui.add_space(2.0);
-    credentials_table_divider(ui);
     let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
     let cols = credential_columns(rect);
     let painter = ui.painter();
     let color = ui.visuals().weak_text_color();
-    let font = egui::FontId::proportional(12.0);
+    let font = egui::FontId::monospace(12.0);
     for (idx, column) in columns.iter().enumerate() {
         painter.text(
-            egui::pos2(cols[idx].left() + 6.0, rect.center().y),
+            egui::pos2(cols[idx].left(), rect.center().y),
             egui::Align2::LEFT_CENTER,
             column,
             font.clone(),
             color,
         );
     }
-    credentials_table_divider(ui);
+    paint_credentials_hline(ui, rect.bottom());
+}
+
+struct CredentialRowResponse {
+    delete: bool,
+    toggle_reveal: bool,
 }
 
 fn credential_table_row(
     ui: &mut egui::Ui,
     meta: &CredentialListItem,
+    revealed_secret: Option<&String>,
     catalog: &i18n::Catalog,
-) -> bool {
+) -> CredentialRowResponse {
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 46.0), egui::Sense::hover());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
     if response.hovered() {
         ui.painter()
             .rect_filled(rect, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
@@ -389,23 +498,23 @@ fn credential_table_row(
     let painter = ui.painter();
     let y = rect.center().y;
     painter.with_clip_rect(cols[0]).text(
-        egui::pos2(cols[0].left() + 6.0, y),
+        egui::pos2(cols[0].left() + 2.0, y),
         egui::Align2::LEFT_CENTER,
         &meta.provider,
-        egui::FontId::proportional(14.0),
-        ui.visuals().text_color(),
+        egui::FontId::monospace(14.0),
+        credential_secondary_text(ui),
     );
     painter.with_clip_rect(cols[1]).text(
-        egui::pos2(cols[1].left() + 6.0, y),
+        egui::pos2(cols[1].left() + 2.0, y),
         egui::Align2::LEFT_CENTER,
         &meta.label,
-        egui::FontId::proportional(14.0),
+        egui::FontId::monospace(14.0),
         ui.visuals().text_color(),
     );
     if let Some(badge_width) = credential_kind_badge_width(&meta.credential_kind, cols[2].width()) {
         let badge = egui::Rect::from_min_size(
-            egui::pos2(cols[2].left() + 6.0, y - 14.0),
-            egui::vec2(badge_width, 28.0),
+            egui::pos2(cols[2].left() + 4.0, y - 12.0),
+            egui::vec2(badge_width, 24.0),
         );
         // 종류 뱃지(P5, 스크린샷): token = accent 채움+대비 글자, api_key 등 = 1px outline.
         let filled = meta.credential_kind == "token";
@@ -420,29 +529,73 @@ fn credential_table_row(
             );
         }
         let badge_text_color = if filled {
-            ui.visuals().window_fill
+            egui::Color32::WHITE
         } else {
             ui.visuals().weak_text_color()
         };
         painter.with_clip_rect(cols[2]).text(
-            egui::pos2(badge.left() + 7.0, badge.center().y),
+            egui::pos2(badge.left() + 5.0, badge.center().y),
             egui::Align2::LEFT_CENTER,
             &meta.credential_kind,
-            egui::FontId::proportional(13.0),
+            egui::FontId::monospace(12.0),
             badge_text_color,
         );
     }
-    painter.with_clip_rect(cols[3]).text(
-        egui::pos2(cols[3].left() + 6.0, y),
+    let reveal_center = egui::pos2(cols[3].right() - 9.0, y);
+    let reveal_rect = egui::Rect::from_center_size(reveal_center, egui::vec2(18.0, 16.0));
+    let secret_clip = egui::Rect::from_min_max(
+        cols[3].min,
+        egui::pos2(
+            (reveal_rect.left() - 2.0).max(cols[3].left()),
+            cols[3].bottom(),
+        ),
+    );
+    painter.with_clip_rect(secret_clip).text(
+        egui::pos2(cols[3].left() + 2.0, y),
         egui::Align2::LEFT_CENTER,
-        meta.masked_hint.as_deref().unwrap_or("••••••••••••"),
-        egui::FontId::proportional(14.0),
+        revealed_secret
+            .map(String::as_str)
+            .unwrap_or("••••••••••••••••"),
+        egui::FontId::monospace(14.0),
         ui.visuals().text_color(),
     );
 
-    // #6: 안전한 reveal 경로가 없어 죽어있던 ○ 버튼은 제거하고 삭제(×)만 남긴다.
-    let delete_rect =
-        egui::Rect::from_center_size(egui::pos2(rect.right() - 24.0, y), egui::vec2(28.0, 20.0));
+    let reveal = ui
+        .interact(
+            reveal_rect,
+            ui.id().with(("credential_reveal", &meta.id)),
+            egui::Sense::click(),
+        )
+        .on_hover_text(if revealed_secret.is_some() {
+            catalog.t("action.hide_secret", &[])
+        } else {
+            catalog.t("action.show_secret", &[])
+        });
+    if response.hovered() {
+        painter.rect_stroke(
+            reveal_rect,
+            0.0,
+            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+            egui::StrokeKind::Inside,
+        );
+    }
+    painter.text(
+        reveal_center,
+        egui::Align2::CENTER_CENTER,
+        if revealed_secret.is_some() {
+            "●"
+        } else {
+            "○"
+        },
+        egui::FontId::monospace(12.0),
+        if revealed_secret.is_some() {
+            ui.visuals().hyperlink_color
+        } else {
+            ui.visuals().weak_text_color()
+        },
+    );
+
+    let delete_rect = egui::Rect::from_center_size(cols[4].center(), egui::vec2(22.0, 18.0));
     let delete = ui
         .interact(
             delete_rect,
@@ -453,8 +606,10 @@ fn credential_table_row(
     let hovered = delete.hovered();
     let stroke = if hovered {
         ui.visuals().error_fg_color
-    } else {
+    } else if response.hovered() {
         ui.visuals().widgets.noninteractive.bg_stroke.color
+    } else {
+        egui::Color32::TRANSPARENT
     };
     let fill = if hovered {
         ui.visuals().error_fg_color
@@ -477,33 +632,49 @@ fn credential_table_row(
         delete_rect.center(),
         egui::Align2::CENTER_CENTER,
         "×",
-        egui::FontId::proportional(12.0),
+        egui::FontId::monospace(12.0),
         text,
     );
-    delete.clicked()
+    paint_credentials_hline(ui, rect.top());
+    paint_credentials_hline(ui, rect.bottom());
+    CredentialRowResponse {
+        delete: delete.clicked(),
+        toggle_reveal: reveal.clicked(),
+    }
 }
 
-fn credential_columns(rect: egui::Rect) -> [egui::Rect; 4] {
-    // reveal(○) 버튼 제거로 삭제(×) 하나만 남아 액션 열 폭을 축소했다(#6).
-    let action_w = 48.0;
-    let content = egui::Rect::from_min_max(
-        rect.min,
-        egui::pos2((rect.right() - action_w).max(rect.left()), rect.bottom()),
+fn credential_columns(rect: egui::Rect) -> [egui::Rect; 5] {
+    const GAP: f32 = 4.0;
+    const PROVIDER_W: f32 = 80.0;
+    const KIND_W: f32 = 56.0;
+    const ACTION_W: f32 = 24.0;
+    let flexible = ((rect.width() - PROVIDER_W - KIND_W - ACTION_W - GAP * 4.0).max(0.0)) / 2.0;
+    let provider = egui::Rect::from_min_size(rect.min, egui::vec2(PROVIDER_W, rect.height()));
+    let label = egui::Rect::from_min_size(
+        egui::pos2(provider.right() + GAP, rect.top()),
+        egui::vec2(flexible, rect.height()),
     );
-    let w = content.width();
-    let provider_w = w * 0.16;
-    let label_w = w * 0.32;
-    let kind_w = w * 0.18;
-    let provider = egui::Rect::from_min_size(content.min, egui::vec2(provider_w, content.height()));
-    let label = provider.translate(egui::vec2(provider_w, 0.0));
-    let label = egui::Rect::from_min_size(label.min, egui::vec2(label_w, content.height()));
-    let kind = label.translate(egui::vec2(label_w, 0.0));
-    let kind = egui::Rect::from_min_size(kind.min, egui::vec2(kind_w, content.height()));
-    let secret = egui::Rect::from_min_max(
-        egui::pos2(kind.right(), content.top()),
-        egui::pos2(content.right(), content.bottom()),
+    let kind = egui::Rect::from_min_size(
+        egui::pos2(label.right() + GAP, rect.top()),
+        egui::vec2(KIND_W, rect.height()),
     );
-    [provider, label, kind, secret]
+    let secret = egui::Rect::from_min_size(
+        egui::pos2(kind.right() + GAP, rect.top()),
+        egui::vec2(flexible, rect.height()),
+    );
+    let delete = egui::Rect::from_min_size(
+        egui::pos2(secret.right() + GAP, rect.top()),
+        egui::vec2(ACTION_W, rect.height()),
+    );
+    [provider, label, kind, secret, delete]
+}
+
+fn credential_secondary_text(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(0xaa, 0xaa, 0xaa)
+    } else {
+        egui::Color32::from_rgb(0x44, 0x44, 0x44)
+    }
 }
 
 fn credential_kind_badge_width(kind: &str, column_width: f32) -> Option<f32> {
@@ -515,18 +686,16 @@ fn credential_kind_badge_width(kind: &str, column_width: f32) -> Option<f32> {
     Some(desired.min(max))
 }
 
-fn credentials_table_divider(ui: &mut egui::Ui) {
+fn paint_credentials_hline(ui: &egui::Ui, y: f32) {
     let color = ui.visuals().widgets.noninteractive.bg_stroke.color;
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
-    let y = ui.painter().round_to_pixel_center(rect.center().y);
+    let y = ui.painter().round_to_pixel_center(y);
     ui.painter()
-        .hline(rect.x_range(), y, egui::Stroke::new(1.0, color));
+        .hline(ui.min_rect().x_range(), y, egui::Stroke::new(1.0, color));
 }
 
 #[cfg(test)]
 mod tests {
-    use super::credential_kind_badge_width;
+    use super::{credential_columns, credential_kind_badge_width};
 
     #[test]
     fn credential_badge_width는_좁은_컬럼에서_panic하지_않는다() {
@@ -535,5 +704,17 @@ mod tests {
         assert_eq!(credential_kind_badge_width("api_key", 14.0), None);
         assert_eq!(credential_kind_badge_width("api_key", f32::NAN), None);
         assert_eq!(credential_kind_badge_width("api_key", 22.0), Some(14.0));
+    }
+
+    #[test]
+    fn credential_columns는_참조_grid_폭을_유지한다() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(841.0, 30.0));
+        let columns = credential_columns(rect);
+        assert_eq!(columns[0].width(), 80.0);
+        assert_eq!(columns[1].width(), 332.5);
+        assert_eq!(columns[2].width(), 56.0);
+        assert_eq!(columns[3].width(), 332.5);
+        assert_eq!(columns[4].width(), 24.0);
+        assert_eq!(columns[4].right(), rect.right());
     }
 }

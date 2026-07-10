@@ -8,6 +8,8 @@ action.new = New
 action.save = Save
 action.stop = Stop
 action.add = Add
+action.show_secret = Show secret
+action.hide_secret = Hide secret
 action.run = Run
 action.allow = Allow
 action.deny = Deny
@@ -49,7 +51,7 @@ settings.status_hooks = Agent status hooks
 settings.status_hooks.hint = Install hooks in claude/codex to reliably detect approval/input waits (off = screen guess only)
 settings.locale.hint = Korean · English · Japanese · Chinese Simplified/Traditional (bundled)
 settings.scrollback.hint = Hidden sessions auto-reduce to 1,000 lines
-settings.output_batch.hint = 0/1 normalize to 16ms (idle repaint guard)
+settings.output_batch.hint = Output wakes immediately; continuous updates coalesce at 8ms (value is idle fallback cap)
 workspace.title = Workspace
 workspace.no_session = No session
 workspace.connecting = Connecting...

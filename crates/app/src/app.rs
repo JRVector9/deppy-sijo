@@ -502,10 +502,9 @@ struct EnvApiProjectEditState {
     path_buffer: String,
 }
 
-/// 환경/API 상세 상단 헤더 — 목업(스크린샷) 기준: '이름/경로' 두 행 + 하단 구분선.
-/// painter 절대좌표·put 버튼은 위젯 흐름과 어긋나 폭이 좁아지면 겹쳤다(2026-07-09 회귀)
-/// — 표준 horizontal 레이아웃으로 재작성. 이름/경로는 더블클릭 인라인 편집 유지,
-/// 폴더 선택/해제는 경로 행 우측의 작은 버튼.
+/// 환경/API 상세 상단 헤더 — 참조 화면의 68px 고정 헤더와 14px 좌우 inset.
+/// 이름/경로는 클릭해 인라인 편집하며, 화면에 없는 폴더 관리 동작은 경로 우클릭 메뉴에
+/// 보존한다. 따라서 표준 상태의 픽셀 배치는 목업과 같고 기존 기능도 잃지 않는다.
 fn render_env_api_project_header(
     ui: &mut egui::Ui,
     project: Option<&ui::env_project_list::EnvProjectRow>,
@@ -529,145 +528,172 @@ fn render_env_api_project_header(
     let path_text = if path.is_empty() {
         catalog.t("workspace.manager.path_unset", &[])
     } else {
-        path.to_owned()
+        ui::env_project_list::display_project_path(path)
     };
 
-    const LABEL_W: f32 = 56.0;
-    let label = |ui: &mut egui::Ui, text: String| {
-        let (r, _) = ui.allocate_exact_size(egui::vec2(LABEL_W, 24.0), egui::Sense::hover());
-        ui.painter().text(
-            egui::pos2(r.left(), r.center().y),
-            egui::Align2::LEFT_CENTER,
-            text,
-            egui::FontId::proportional(13.0),
-            ui.visuals().weak_text_color(),
+    const HEADER_H: f32 = 68.0;
+    const PAD_X: f32 = 14.0;
+    const LABEL_W: f32 = 34.0;
+    const LABEL_GAP: f32 = 6.0;
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), HEADER_H),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter().clone();
+    let value_x = rect.left() + PAD_X + LABEL_W + LABEL_GAP;
+    let name_y = rect.top() + 21.0;
+    let path_y = rect.top() + 49.0;
+    let value_right = rect.right() - PAD_X;
+
+    painter.text(
+        egui::pos2(rect.left() + PAD_X, name_y),
+        egui::Align2::LEFT_CENTER,
+        catalog.t("common.name", &[]),
+        egui::FontId::monospace(13.0),
+        ui.visuals().weak_text_color(),
+    );
+    painter.text(
+        egui::pos2(rect.left() + PAD_X, path_y),
+        egui::Align2::LEFT_CENTER,
+        catalog.t("workspace.manager.path", &[]),
+        egui::FontId::monospace(13.0),
+        ui.visuals().weak_text_color(),
+    );
+
+    let name_rect = egui::Rect::from_min_max(
+        egui::pos2(value_x, rect.top() + 8.0),
+        egui::pos2(value_right, rect.top() + 34.0),
+    );
+    if edit.name_workspace_id.as_deref() == Some(project_id) {
+        let response = ui.put(
+            name_rect,
+            egui::TextEdit::singleline(&mut edit.name_buffer)
+                .font(egui::TextStyle::Monospace)
+                .id_source(("env_api_project_name", project_id)),
         );
-    };
-
-    // 행 1: 이름 (더블클릭 → 인라인 편집)
-    ui.horizontal(|ui| {
-        label(ui, catalog.t("common.name", &[]));
-        if edit.name_workspace_id.as_deref() == Some(project_id) {
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut edit.name_buffer)
-                    .id_source(("env_api_project_name", project_id))
-                    .desired_width(260.0),
-            );
-            let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
-            let commit = response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if escape && response.has_focus() {
-                edit.name_workspace_id = None;
-                edit.name_buffer.clear();
-            } else if commit {
-                let next = edit.name_buffer.trim();
-                if !next.is_empty() && next != name {
-                    *workspace_rename = Some(next.to_owned());
-                }
-                edit.name_workspace_id = None;
-                edit.name_buffer.clear();
+        let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        let commit = response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if escape && response.has_focus() {
+            edit.name_workspace_id = None;
+            edit.name_buffer.clear();
+        } else if commit {
+            let next = edit.name_buffer.trim();
+            if !next.is_empty() && next != name {
+                *workspace_rename = Some(next.to_owned());
             }
-        } else {
-            let response = ui.add(
-                egui::Label::new(egui::RichText::new(name).size(15.0).strong())
-                    .sense(egui::Sense::click()),
-            );
-            if response.double_clicked() && !project_id.is_empty() {
-                edit.name_workspace_id = Some(project_id.to_owned());
-                edit.name_buffer = name.to_owned();
-            }
+            edit.name_workspace_id = None;
+            edit.name_buffer.clear();
         }
-    });
-    ui.add_space(6.0);
+    } else {
+        painter.with_clip_rect(name_rect).text(
+            egui::pos2(value_x, name_y),
+            egui::Align2::LEFT_CENTER,
+            name,
+            egui::FontId::monospace(15.0),
+            ui.visuals().text_color(),
+        );
+        let response = ui.interact(
+            name_rect,
+            ui.id().with(("env_api_project_name_label", project_id)),
+            egui::Sense::click(),
+        );
+        if response.clicked() && !project_id.is_empty() {
+            edit.name_workspace_id = Some(project_id.to_owned());
+            edit.name_buffer = name.to_owned();
+        }
+    }
 
-    // 행 2: 경로 (더블클릭 편집) + 우측 작은 폴더 선택/해제
-    ui.horizontal(|ui| {
-        label(ui, catalog.t("workspace.manager.path", &[]));
-        if edit.path_workspace_id.as_deref() == Some(project_id) {
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut edit.path_buffer)
-                    .id_source(("env_api_project_path", project_id))
-                    .desired_width((ui.available_width() - 170.0).max(160.0)),
-            );
-            let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
-            let commit = response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if escape && response.has_focus() {
-                edit.path_workspace_id = None;
-                edit.path_buffer.clear();
-            } else if commit {
-                let next = edit.path_buffer.trim();
-                if next != path {
-                    *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(
-                        std::path::PathBuf::from(next),
-                    ));
-                }
-                edit.path_workspace_id = None;
-                edit.path_buffer.clear();
+    let path_rect = egui::Rect::from_min_max(
+        egui::pos2(value_x, rect.top() + 36.0),
+        egui::pos2(value_right, rect.top() + 62.0),
+    );
+    if edit.path_workspace_id.as_deref() == Some(project_id) {
+        let response = ui.put(
+            path_rect,
+            egui::TextEdit::singleline(&mut edit.path_buffer)
+                .font(egui::TextStyle::Monospace)
+                .id_source(("env_api_project_path", project_id)),
+        );
+        let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        let commit = response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if escape && response.has_focus() {
+            edit.path_workspace_id = None;
+            edit.path_buffer.clear();
+        } else if commit {
+            let next = edit.path_buffer.trim();
+            if next != path {
+                *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(
+                    std::path::PathBuf::from(next),
+                ));
             }
+            edit.path_workspace_id = None;
+            edit.path_buffer.clear();
+        }
+    } else {
+        let path_color = if path_missing {
+            ui.visuals().error_fg_color
         } else {
-            // 버튼을 **먼저**(우→좌) 배치하고 남은 폭을 경로 라벨이 쓴다 — 고정 폭 가정은
-            // 좁은 창/긴 로컬라이즈 문구에서 버튼이 잘렸다(codex Low).
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button(catalog.t("env.project_folder.choose", &[]))
+            ui.visuals().weak_text_color()
+        };
+        painter.with_clip_rect(path_rect).text(
+            egui::pos2(value_x, path_y),
+            egui::Align2::LEFT_CENTER,
+            &path_text,
+            egui::FontId::monospace(14.0),
+            path_color,
+        );
+        let hover_text = if path_missing {
+            format!(
+                "{}\n{}",
+                path_text,
+                catalog.t("env.project_path_missing", &[])
+            )
+        } else {
+            path_text.clone()
+        };
+        let response = ui
+            .interact(
+                path_rect,
+                ui.id().with(("env_api_project_path_label", project_id)),
+                egui::Sense::click(),
+            )
+            .on_hover_text(hover_text);
+        if response.clicked() && !project_id.is_empty() {
+            edit.path_workspace_id = Some(project_id.to_owned());
+            edit.path_buffer = path.to_owned();
+        }
+        response.context_menu(|ui| {
+            if ui
+                .button(catalog.t("env.project_folder.choose", &[]))
+                .clicked()
+                && let Some(dir) = rfd::FileDialog::new().pick_folder()
+            {
+                *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(dir));
+                ui.close();
+            }
+            if !path.is_empty()
+                && ui
+                    .button(catalog.t("env.project_folder.clear", &[]))
                     .clicked()
-                    && let Some(dir) = rfd::FileDialog::new().pick_folder()
-                {
-                    *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(dir));
-                }
-                if !path.is_empty()
-                    && ui
-                        .small_button(catalog.t("env.project_folder.clear", &[]))
-                        .clicked()
-                {
-                    *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(
-                        std::path::PathBuf::new(),
-                    ));
-                }
-                // 재탐색(4번, 2026-07-10) — .env 계열을 다시 스캔해 표를 갱신.
-                if !path.is_empty()
-                    && ui
-                        .small_button("⟳")
-                        .on_hover_text(catalog.t("env.resync_hint", &[]))
-                        .clicked()
-                {
-                    *env_action = Some(ui::env_profiles::EnvAction::Resync);
-                }
-                // 남은 폭 전부 — truncate 라벨 (rtl이라 좌측 정렬로 다시 감싼다).
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    // 사라진 경로(rename 자동 복구 불가)는 경고색 + 조치 안내(2026-07-09).
-                    let path_color = if path_missing {
-                        ui.visuals().error_fg_color
-                    } else {
-                        ui.visuals().weak_text_color()
-                    };
-                    let hover_text = if path_missing {
-                        format!(
-                            "{}\n{}",
-                            path_text,
-                            catalog.t("env.project_path_missing", &[])
-                        )
-                    } else {
-                        path_text.clone()
-                    };
-                    let response = ui
-                        .add(
-                            egui::Label::new(
-                                egui::RichText::new(&path_text).size(14.0).color(path_color),
-                            )
-                            .truncate()
-                            .sense(egui::Sense::click()),
-                        )
-                        .on_hover_text(hover_text);
-                    if response.double_clicked() && !project_id.is_empty() {
-                        edit.path_workspace_id = Some(project_id.to_owned());
-                        edit.path_buffer = path.to_owned();
-                    }
-                });
-            });
-        }
-    });
-    ui.add_space(10.0);
-    crate::ui::hairline_full(ui);
+            {
+                *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(
+                    std::path::PathBuf::new(),
+                ));
+                ui.close();
+            }
+            if !path.is_empty() && ui.button(catalog.t("env.resync_hint", &[])).clicked() {
+                *env_action = Some(ui::env_profiles::EnvAction::Resync);
+                ui.close();
+            }
+        });
+    }
+
+    let y = painter.round_to_pixel_center(rect.bottom());
+    painter.hline(
+        rect.x_range(),
+        y,
+        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+    );
 }
 
 /// keyring 고아 항목 스캔/정리 (macOS security CLI) — 삭제된 env profile/credential이
@@ -2417,6 +2443,7 @@ impl App {
 
     fn invalidate_env_profile_ui(&mut self) {
         self.env_profiles_ui.invalidate_cache();
+        self.credentials_ui.clear_revealed_secrets();
         self.env_secret_generation = self.env_secret_generation.wrapping_add(1);
         self.env_secret_cache.clear();
         self.env_secret_pending.clear();
@@ -3630,8 +3657,20 @@ impl eframe::App for App {
                         );
                     }
                     C::Environment => {
-                        let panel_bg = ui::env_project_list::panel_bg(ui);
-                        ui.painter().rect_filled(ui.clip_rect(), 0.0, panel_bg);
+                        // 이 화면은 참조 목업처럼 전용 monospace grid를 사용한다.
+                        let style = ui.style_mut();
+                        style
+                            .text_styles
+                            .insert(egui::TextStyle::Body, egui::FontId::monospace(14.0));
+                        style
+                            .text_styles
+                            .insert(egui::TextStyle::Button, egui::FontId::monospace(13.0));
+                        style
+                            .text_styles
+                            .insert(egui::TextStyle::Small, egui::FontId::monospace(12.0));
+                        // 상세 surface=#242424, 프로젝트 rail은 renderer가 #1e1e1e로 덮는다.
+                        ui.painter()
+                            .rect_filled(ui.clip_rect(), 0.0, ui.visuals().panel_fill);
                         // 전체 가용 높이를 **먼저** 캡처해 좌측 리스트/우측 스크롤에 강제한다
                         // — horizontal 안에서 available_height가 줄어 리스트가 수십 px로
                         // 잘리던 회귀 방지(2026-07-09 스크린샷).
@@ -3684,107 +3723,121 @@ impl eframe::App for App {
                                     ),
                                 );
                             }
-                            // 우측 상세는 **세로 스택** — 부모 horizontal 레이아웃을 그대로
-                            // 상속하면 헤더/표가 가로 한 줄로 흘러 화면 중앙에 떴다
-                            // (2026-07-09 스크린샷 회귀). vertical로 명시해 top-down 강제.
+                            // 우측은 React의 flex column과 동일: 68px 고정 헤더 + body만 scroll.
                             ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                ui.set_min_height(full_h);
+                                ui.set_width(ui.available_width());
+                                render_env_api_project_header(
+                                    ui,
+                                    active_env_api_project.as_ref(),
+                                    &mut env_action,
+                                    &mut workspace_rename,
+                                    &mut self.env_api_project_edit,
+                                    &text,
+                                );
                                 egui::ScrollArea::vertical()
                                     .id_salt("env_api_detail_scroll")
                                     .auto_shrink([false, false])
-                                    .max_height(full_h)
+                                    .max_height((full_h - 68.0).max(0.0))
                                     .show(ui, |ui| {
                                         ui.set_width(ui.available_width());
-                                        ui.add_space(12.0);
-                                        render_env_api_project_header(
-                                            ui,
-                                            active_env_api_project.as_ref(),
-                                            &mut env_action,
-                                            &mut workspace_rename,
-                                            &mut self.env_api_project_edit,
-                                            &text,
-                                        );
-                                        if env_project_rows_loading {
-                                            ui.horizontal(|ui| {
-                                                ui.add(egui::Spinner::new().size(12.0));
-                                                ui.weak(text.t("env.background.loading", &[]));
-                                            });
-                                        } else if env_project_rows_failed {
-                                            ui.colored_label(
-                                                ui.visuals().error_fg_color,
-                                                text.t("env.background.load_failed", &[]),
-                                            );
-                                        }
-                                        ui.add_space(18.0);
-                                        // keyring 조회는 전용 worker에서 수행한다. callback은
-                                        // cache hit을 반환하거나 bounded 요청 큐에 enqueue만 한다.
-                                        {
-                                            let generation = self.env_secret_generation;
-                                            let cache = &mut self.env_secret_cache;
-                                            let failures = &self.env_secret_failures;
-                                            let pending = &mut self.env_secret_pending;
-                                            let worker = &self.env_secret_reveal_worker;
-                                            let mut reveal = |credential_id: &str| {
-                                                if let Some(value) = cache.remove(credential_id) {
-                                                    // EnvProfilesUi가 곧바로 자기 표시 cache로 소유권을
-                                                    // 가져간다. App에 평문 복제본을 남기지 않는다.
-                                                    return Some(value);
-                                                }
-                                                if failures.contains(credential_id) {
-                                                    return None;
-                                                }
-                                                if pending.insert(credential_id.to_owned())
-                                                    && !worker.try_request(EnvSecretRevealJob {
-                                                        generation,
-                                                        credential_id: credential_id.to_owned(),
-                                                    })
-                                                {
-                                                    pending.remove(credential_id);
-                                                }
-                                                None
-                                            };
-                                            match self.env_profiles_ui.contents_compact(
-                                                ui,
-                                                &mut self.db,
-                                                &wsid,
-                                                &mut reveal,
-                                                &text,
-                                            ) {
-                                                Ok(a) => {
-                                                    if a.is_some() {
-                                                        env_action = a;
-                                                    }
-                                                }
-                                                Err(e) => {
+                                        egui::Frame::NONE
+                                            .inner_margin(egui::Margin {
+                                                left: 14,
+                                                right: 14,
+                                                top: 0,
+                                                bottom: 12,
+                                            })
+                                            .show(ui, |ui| {
+                                                if env_project_rows_loading {
+                                                    ui.horizontal(|ui| {
+                                                        ui.add(egui::Spinner::new().size(12.0));
+                                                        ui.weak(
+                                                            text.t("env.background.loading", &[]),
+                                                        );
+                                                    });
+                                                } else if env_project_rows_failed {
                                                     ui.colored_label(
                                                         ui.visuals().error_fg_color,
-                                                        format!("{e:#}"),
+                                                        text.t("env.background.load_failed", &[]),
                                                     );
                                                 }
-                                            }
-                                        }
-                                        if !self.env_secret_pending.is_empty() {
-                                            ui.horizontal(|ui| {
-                                                ui.add(egui::Spinner::new().size(12.0));
-                                                ui.weak(text.t("env.secret.loading", &[]));
+
+                                                // env/API의 ○ reveal은 같은 bounded background
+                                                // keyring worker를 공유한다. callback은 캐시 hit을
+                                                // 넘기거나 요청을 enqueue할 뿐 UI thread I/O가 없다.
+                                                let generation = self.env_secret_generation;
+                                                let cache = &mut self.env_secret_cache;
+                                                let failures = &self.env_secret_failures;
+                                                let pending = &mut self.env_secret_pending;
+                                                let worker = &self.env_secret_reveal_worker;
+                                                let mut reveal = |credential_id: &str| {
+                                                    if let Some(value) = cache.remove(credential_id)
+                                                    {
+                                                        return Some(value);
+                                                    }
+                                                    if failures.contains(credential_id) {
+                                                        return None;
+                                                    }
+                                                    if pending.insert(credential_id.to_owned())
+                                                        && !worker.try_request(EnvSecretRevealJob {
+                                                            generation,
+                                                            credential_id: credential_id.to_owned(),
+                                                        })
+                                                    {
+                                                        pending.remove(credential_id);
+                                                    }
+                                                    None
+                                                };
+                                                match self.env_profiles_ui.contents_compact(
+                                                    ui,
+                                                    &mut self.db,
+                                                    &wsid,
+                                                    &mut reveal,
+                                                    &text,
+                                                ) {
+                                                    Ok(a) => {
+                                                        if a.is_some() {
+                                                            env_action = a;
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        ui.colored_label(
+                                                            ui.visuals().error_fg_color,
+                                                            format!("{e:#}"),
+                                                        );
+                                                    }
+                                                }
+
+                                                let svc = AppCredentialService {
+                                                    db: &self.db,
+                                                    secret_store: &self.secret_store,
+                                                    redaction: &self.redaction,
+                                                    workspace_id: &wsid,
+                                                };
+                                                if self.credentials_ui.contents_compact(
+                                                    ui,
+                                                    &svc,
+                                                    &mut reveal,
+                                                    &text,
+                                                ) {
+                                                    credentials_changed = true;
+                                                }
+
+                                                if !self.env_secret_pending.is_empty() {
+                                                    ui.horizontal(|ui| {
+                                                        ui.add(egui::Spinner::new().size(12.0));
+                                                        ui.weak(text.t("env.secret.loading", &[]));
+                                                    });
+                                                }
+                                                if !self.env_secret_failures.is_empty() {
+                                                    ui.colored_label(
+                                                        ui.visuals().error_fg_color,
+                                                        text.t("env.secret.load_failed", &[]),
+                                                    );
+                                                }
                                             });
-                                        }
-                                        if !self.env_secret_failures.is_empty() {
-                                            ui.colored_label(
-                                                ui.visuals().error_fg_color,
-                                                text.t("env.secret.load_failed", &[]),
-                                            );
-                                        }
-                                        let svc = AppCredentialService {
-                                            db: &self.db,
-                                            secret_store: &self.secret_store,
-                                            redaction: &self.redaction,
-                                            workspace_id: &wsid,
-                                        };
-                                        if self.credentials_ui.contents_compact(ui, &svc, &text) {
-                                            // credential 추가/삭제 → env 시크릿 콤보/마스킹 갱신
-                                            // (PR-ENV-C 배선).
-                                            credentials_changed = true;
-                                        }
                                     });
                             });
                         });

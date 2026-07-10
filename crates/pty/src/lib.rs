@@ -5,6 +5,7 @@ mod input_queue;
 mod process_identity;
 
 use std::io::{Read, Write};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 use anyhow::Context;
@@ -13,6 +14,10 @@ pub use input_queue::{
     PtyInputEnqueueResult, PtyInputPressure, PtyInputQueuePolicy, PtyInputRejectReason,
 };
 pub use process_identity::{ProcessIdentity, ProcessIdentitySource};
+
+/// PTY reader가 새 출력 chunk를 채널에 넣은 직후 호출하는 coalescible wake callback.
+/// 런타임은 이를 worker thread `unpark`에 연결해 타이머 폴링 지연 없이 출력에 반응한다.
+pub type PtyOutputWake = Arc<dyn Fn() + Send + Sync>;
 
 /// 실행할 프로그램. portable-pty CommandBuilder를 노출하지 않기 위한 최소 스펙.
 /// env 값에 secret 평문이 올 수 있다 — 절대 로그에 찍지 말 것 (Debug 미구현 이유).
@@ -61,73 +66,44 @@ pub trait PtySession: Send {
 
 pub struct PortablePtyBackend;
 
-struct PortablePtySession {
-    // resize용으로만 유지. reader/writer는 이미 분리해서 보관한다.
-    master: Box<dyn portable_pty::MasterPty + Send>,
-    /// 입력은 writer 전용 스레드가 쓴다 — worker가 blocking write에 매달리지 않는다.
-    /// (출력 폭주로 child의 stdout이 막힌 상태에서 worker가 대량 paste를
-    /// 동기 write하면 reader(backpressure)와 맞물려 full-duplex deadlock — codex P1)
-    input_tx: Option<SyncSender<Vec<u8>>>,
-    input_queue: input_queue::PtyInputQueueState,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
-    output: Option<Receiver<Vec<u8>>>,
-}
-
-/// kill 후 reap을 폴링으로 — kill이 실패해도(권한/플랫폼 문제) 무한 wait에
-/// 매달리지 않는다 (codex P1: portable-pty 0.9 Windows kill 리스크).
-/// 제한 시간 내에 reap하지 못하면 leak을 감수하고 로그만 남긴다.
-fn kill_and_reap_bounded(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
-    let _ = child.kill();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return, // reap 완료
-            Ok(None) => {}
-            Err(_) => return, // 조회 불가 — 더 기다려도 알 수 없다
-        }
-        if std::time::Instant::now() >= deadline {
-            tracing::warn!("PTY child가 kill 후에도 종료되지 않음 — reap 포기 (leak 감수)");
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-}
-
-fn pty_size(cols: u16, rows: u16) -> portable_pty::PtySize {
-    portable_pty::PtySize {
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    }
-}
-
-impl PtyBackend for PortablePtyBackend {
-    fn spawn(
+impl PortablePtyBackend {
+    /// 출력 도착 wake가 필요한 런타임용 spawn. 일반 소비자는 [`PtyBackend::spawn`]을 써도 된다.
+    pub fn spawn_with_output_wake(
         &self,
         cmd: &CommandSpec,
         cols: u16,
         rows: u16,
+        output_wake: PtyOutputWake,
+    ) -> anyhow::Result<Box<dyn PtySession>> {
+        self.spawn_impl(cmd, cols, rows, Some(output_wake))
+    }
+
+    fn spawn_impl(
+        &self,
+        cmd: &CommandSpec,
+        cols: u16,
+        rows: u16,
+        output_wake: Option<PtyOutputWake>,
     ) -> anyhow::Result<Box<dyn PtySession>> {
         let pair = portable_pty::native_pty_system()
             .openpty(pty_size(cols, rows))
             .context("PTY 생성 실패")?;
         let mut builder = portable_pty::CommandBuilder::new(&cmd.program);
         builder.args(&cmd.args);
-        // GUI 앱은 launchd로 실행되면 TERM/COLORTERM이 없다 — portable-pty는 env를
-        // 순수 상속만 하므로 셸 안 claude/codex가 색을 포기해 흑백이 된다(2026-07-09).
-        // 부모에도 spec에도 없을 때만 터미널 표준값을 설정한다(명시 값이 항상 우선).
-        let has =
-            |key: &str| std::env::var_os(key).is_some() || cmd.env.iter().any(|(k, _)| k == key);
-        if !has("TERM") {
-            builder.env("TERM", "xterm-256color");
-        }
-        if !has("COLORTERM") {
-            builder.env("COLORTERM", "truecolor");
-        }
         for (key, value) in &cmd.env {
             builder.env(key, value);
         }
+        // 임베디드 PTY의 capability는 부모 터미널/GUI launch 환경이 아니라 이
+        // emulator가 결정한다. `open`/개발 셸에서 NO_COLOR=1·TERM_PROGRAM=ghostty가
+        // 상속되면 Codex/Claude가 ANSI 색상을 아예 출력하지 않았다. CommandSpec의
+        // 값까지 적용한 뒤 제품 capability로 최종 고정해 재빌드/실행 방식과
+        // 무관하게 동일한 truecolor 터미널을 노출한다.
+        builder.env("TERM", "xterm-256color");
+        builder.env("COLORTERM", "truecolor");
+        builder.env("TERM_PROGRAM", "deppy-sijo");
+        builder.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+        builder.env("CLICOLOR", "1");
+        builder.env_remove("NO_COLOR");
         if let Some(cwd) = &cmd.cwd {
             builder.cwd(cwd);
         }
@@ -170,6 +146,12 @@ impl PtyBackend for PortablePtyBackend {
                             Ok(n) => {
                                 if tx.send(buf[..n].to_vec()).is_err() {
                                     break; // 수신측이 사라짐
+                                }
+                                // send 뒤 호출해야 worker가 깨났을 때 chunk가 반드시 보인다.
+                                // Thread::unpark 토큰은 자연스럽게 1개로 합쳐져 출력 폭주에도
+                                // wake queue나 메모리가 늘지 않는다.
+                                if let Some(wake) = &output_wake {
+                                    wake();
                                 }
                             }
                         }
@@ -219,6 +201,58 @@ impl PtyBackend for PortablePtyBackend {
             child,
             output: Some(rx),
         }))
+    }
+}
+
+struct PortablePtySession {
+    // resize용으로만 유지. reader/writer는 이미 분리해서 보관한다.
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    /// 입력은 writer 전용 스레드가 쓴다 — worker가 blocking write에 매달리지 않는다.
+    /// (출력 폭주로 child의 stdout이 막힌 상태에서 worker가 대량 paste를
+    /// 동기 write하면 reader(backpressure)와 맞물려 full-duplex deadlock — codex P1)
+    input_tx: Option<SyncSender<Vec<u8>>>,
+    input_queue: input_queue::PtyInputQueueState,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    output: Option<Receiver<Vec<u8>>>,
+}
+
+/// kill 후 reap을 폴링으로 — kill이 실패해도(권한/플랫폼 문제) 무한 wait에
+/// 매달리지 않는다 (codex P1: portable-pty 0.9 Windows kill 리스크).
+/// 제한 시간 내에 reap하지 못하면 leak을 감수하고 로그만 남긴다.
+fn kill_and_reap_bounded(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
+    let _ = child.kill();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return, // reap 완료
+            Ok(None) => {}
+            Err(_) => return, // 조회 불가 — 더 기다려도 알 수 없다
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!("PTY child가 kill 후에도 종료되지 않음 — reap 포기 (leak 감수)");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn pty_size(cols: u16, rows: u16) -> portable_pty::PtySize {
+    portable_pty::PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    }
+}
+
+impl PtyBackend for PortablePtyBackend {
+    fn spawn(
+        &self,
+        cmd: &CommandSpec,
+        cols: u16,
+        rows: u16,
+    ) -> anyhow::Result<Box<dyn PtySession>> {
+        self.spawn_impl(cmd, cols, rows, None)
     }
 }
 
@@ -424,6 +458,76 @@ mod tests {
         let debug = format!("{identity:?}");
         assert!(!debug.contains("/bin/sleep"));
         assert!(!debug.contains("SHELL="));
+    }
+
+    #[test]
+    fn embedded_pty는_no_color를_제거하고_truecolor_capability를_고정한다() {
+        let mut session = PortablePtyBackend
+            .spawn(
+                &CommandSpec {
+                    program: "/bin/sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        concat!(
+                            "printf 'TERM=%s\\nCOLORTERM=%s\\nTERM_PROGRAM=%s\\n",
+                            "CLICOLOR=%s\\nNO_COLOR=%s\\n' ",
+                            "\"$TERM\" \"$COLORTERM\" \"$TERM_PROGRAM\" \"$CLICOLOR\" ",
+                            "\"${NO_COLOR-unset}\""
+                        )
+                        .into(),
+                    ],
+                    env: vec![
+                        ("TERM".into(), "dumb".into()),
+                        ("COLORTERM".into(), String::new()),
+                        ("TERM_PROGRAM".into(), "ghostty".into()),
+                        ("NO_COLOR".into(), "1".into()),
+                        ("CLICOLOR".into(), "0".into()),
+                    ],
+                    cwd: None,
+                },
+                80,
+                24,
+            )
+            .unwrap();
+        let rx = session.take_output().unwrap();
+        let output = collect_output(&rx, Duration::from_secs(5));
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("TERM=xterm-256color"));
+        assert!(text.contains("COLORTERM=truecolor"));
+        assert!(text.contains("TERM_PROGRAM=deppy-sijo"));
+        assert!(text.contains("CLICOLOR=1"));
+        assert!(text.contains("NO_COLOR=unset"));
+        assert_eq!(wait_exit(&mut session, Duration::from_secs(5)), Some(0));
+    }
+
+    #[test]
+    fn output_chunk가_채널에_들어오면_worker_wake를_호출한다() {
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&wakes);
+        let wake: PtyOutputWake = Arc::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let mut session = PortablePtyBackend
+            .spawn_with_output_wake(
+                &CommandSpec {
+                    program: "/bin/echo".into(),
+                    args: vec!["wake-output".into()],
+                    env: Vec::new(),
+                    cwd: None,
+                },
+                80,
+                24,
+                wake,
+            )
+            .unwrap();
+        let rx = session.take_output().unwrap();
+        let output = collect_output(&rx, Duration::from_secs(5));
+        assert!(String::from_utf8_lossy(&output).contains("wake-output"));
+        assert!(
+            wakes.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "출력은 도착했지만 wake callback이 호출되지 않음"
+        );
+        assert_eq!(wait_exit(&mut session, Duration::from_secs(5)), Some(0));
     }
 
     /// 채널이 닫힐 때까지 출력을 모은다 (timeout 포함).

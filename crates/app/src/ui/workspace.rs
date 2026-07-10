@@ -835,7 +835,8 @@ impl WorkspaceUi {
         // PTY 크기가 틀어지는 문제 방지 (runtime도 visible 세션을 모두 push한다)
         let cell = renderer_egui::cell_size(ui.ctx(), config.font_size);
         let avail = ui.available_size();
-        let cols = ((avail.x / cell.x) as u16).clamp(10, 500);
+        let cols =
+            ((renderer_egui::grid_width_for_available(avail.x) / cell.x) as u16).clamp(10, 500);
         let rows = (((avail.y - cell.y) / cell.y) as u16).clamp(3, 200);
         if self.sent_sizes.get(&session) != Some(&(cols, rows)) {
             self.sent_sizes.insert(session, (cols, rows));

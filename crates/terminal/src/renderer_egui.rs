@@ -13,6 +13,17 @@ pub struct RenderOutput {
     pub origin: egui::Pos2,
 }
 
+/// 터미널 셀 그리드 좌우의 고정 내부 여백.
+///
+/// 열 수 계산과 실제 렌더링이 같은 값을 사용해야 마지막 열이 우측 여백을 침범하거나
+/// 잘리지 않는다.
+pub const HORIZONTAL_PADDING: f32 = 3.0;
+
+/// 전체 터미널 폭에서 좌우 내부 여백을 제외한 셀 그리드 가용 폭.
+pub fn grid_width_for_available(available_width: f32) -> f32 {
+    (available_width.max(0.0) - HORIZONTAL_PADDING * 2.0).max(0.0)
+}
+
 /// 세션/pane별 retained row layout cache. UI는 이 캐시를 소유만 하고 backend 타입을
 /// 보지 않는다. selection/cursor/IME는 오버레이라 캐시 무효화 대상이 아니다.
 #[derive(Default)]
@@ -99,10 +110,12 @@ pub fn draw(
     let cell = cell_size(ui.ctx(), font_size);
     // hit-test/응답 rect는 pane 영역을 넘지 않게 clamp한다 — split/resize 직후
     // stale(더 큰) snapshot이 이웃 pane의 클릭/스크롤을 가로채는 것 방지 (codex 리뷰).
-    // 넘치는 셀은 어차피 호출측 clip_rect로 잘린다.
+    // 넘치는 셀은 아래 content_rect로 잘리며 좌우 여백을 침범하지 않는다.
     let avail = ui.available_size();
     let size = egui::vec2(
-        (cell.x * snapshot.cols as f32).min(avail.x.max(0.0)),
+        ((cell.x * snapshot.cols as f32).min(grid_width_for_available(avail.x))
+            + HORIZONTAL_PADDING * 2.0)
+            .min(avail.x.max(0.0)),
         (cell.y * snapshot.rows as f32).min(avail.y.max(0.0)),
     );
     // click_and_drag: 클릭=포커스, 드래그=선택 (2026-07-05 복사 지원)
@@ -112,15 +125,13 @@ pub fn draw(
             memory.set_focus_lock_filter(response.id, terminal_focus_lock_filter());
         });
     }
-    let painter = ui.painter_at(rect);
-    // 좌측 여백 — 텍스트가 pane 경계선에 딱 붙지 않게 살짝 띄운다(사용자 요청). 배경은
-    // rect 전체를 채우므로 이 여백은 배경색 간격이 된다. paint/hit-test 모두 이 origin 기준.
-    const LEFT_PAD: f32 = 4.0;
-    let origin = rect.min + egui::vec2(LEFT_PAD, 0.0);
-
+    let background_painter = ui.painter_at(rect);
+    let content_rect = terminal_content_rect(rect);
+    let painter = background_painter.with_clip_rect(content_rect);
+    let origin = content_rect.min;
     let default_bg = egui::Color32::from_rgb(0x18, 0x18, 0x1c);
     let selection = selection.and_then(|(a, b)| normalize_selection_range(snapshot, a, b));
-    painter.rect_filled(rect, 0.0, default_bg);
+    background_painter.rect_filled(rect, 0.0, default_bg);
 
     cache.prepare(snapshot, font_size);
     for row in 0..snapshot.rows as usize {
@@ -214,6 +225,15 @@ pub fn draw(
         cell_size: cell,
         origin,
     }
+}
+
+fn terminal_content_rect(rect: egui::Rect) -> egui::Rect {
+    // 극단적으로 좁은 pane에서도 좌우가 교차하지 않게 같은 inset을 절반까지 줄인다.
+    let inset = HORIZONTAL_PADDING.min(rect.width().max(0.0) * 0.5);
+    egui::Rect::from_min_max(
+        rect.min + egui::vec2(inset, 0.0),
+        rect.max - egui::vec2(inset, 0.0),
+    )
 }
 
 pub fn terminal_focus_lock_filter() -> egui::EventFilter {
@@ -555,6 +575,30 @@ mod tests {
             draw(ui, snapshot, 13.0, cache, None, None);
         });
         cache.rebuilt_rows_last_frame()
+    }
+
+    #[test]
+    fn terminal_좌우_내부여백은_각각_3픽셀이다() {
+        assert_eq!(HORIZONTAL_PADDING, 3.0);
+        assert_eq!(grid_width_for_available(100.0), 94.0);
+
+        let snapshot = snap(4, 1, &["test"]);
+        let ctx = egui::Context::default();
+        let mut cache = TerminalRenderCache::default();
+        let mut measured = None;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_min_size(egui::vec2(500.0, 200.0));
+            let output = draw(ui, &snapshot, 13.0, &mut cache, None, None);
+            measured = Some((output.response.rect, output.origin, output.cell_size));
+        });
+
+        let (rect, origin, cell) = measured.expect("terminal should be rendered");
+        let grid_right = origin.x + cell.x * snapshot.cols as f32;
+        assert!((origin.x - rect.left() - 3.0).abs() < f32::EPSILON);
+        assert!(
+            (rect.right() - grid_right - 3.0).abs() < 0.01,
+            "rect={rect:?}, origin={origin:?}, cell={cell:?}, grid_right={grid_right}"
+        );
     }
 
     #[test]

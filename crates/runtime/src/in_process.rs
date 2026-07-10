@@ -1,7 +1,7 @@
 //! v0 구현체 (설계문서 2.3). worker thread가 세션들을 소유한다.
 //! 세션 로직(PTY+terminal+lifecycle)은 session crate 소관 (PR-08).
 
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,6 +24,13 @@ use crate::event::{MessagePayload, RuntimeEvent, SpawnKind};
 use crate::resource_monitor::{
     ProcessResourceMonitor, ProcessResourceMonitorConfig, SessionResourceTarget,
 };
+
+/// 재시작 시 한 세션에서 terminal parser로 다시 읽는 ANSI tail 상한. 전체 audit 로그는
+/// append-only로 보존하되 시작 I/O/CPU는 세션당 유계로 유지한다.
+const MAX_ANSI_REPLAY_BYTES: u64 = 16 * 1024 * 1024;
+/// 연속 출력 중 viewport snapshot을 만들 수 있는 최소 간격. 8ms는 120Hz 화면을
+/// 따라가면서도 token/chunk마다 전체 grid snapshot을 만드는 폭주를 막는다.
+const ACTIVE_VIEWPORT_FRAME_INTERVAL: Duration = Duration::from_millis(8);
 
 /// 구독자 한 명의 송신측. 상태 이벤트(unbounded — 세션 수명당 상수 개수의
 /// 제어 이벤트라 누적 위험 없음)와 세션별 Viewport slot(최신본만 유지 — 14.5의
@@ -72,11 +79,15 @@ pub struct InProcessRuntimeClient {
     command_tx: Option<SyncSender<RuntimeCommand>>,
     subscribers: Arc<Mutex<Vec<Subscriber>>>,
     worker: Option<std::thread::JoinHandle<()>>,
+    /// command 송신과 PTY 출력 도착이 timeout을 기다리지 않고 worker를 깨우는 핸들.
+    /// `Thread::unpark` 토큰은 1개로 coalesce되어 wake 폭주가 누적되지 않는다.
+    worker_thread: Option<std::thread::Thread>,
 }
 
 impl InProcessRuntimeClient {
-    /// `output_batch_ms`: Viewport push 주기 (설계문서 10.1, config.performance 소비).
-    /// 시작 시점에 고정 — 변경은 앱 재시작 필요.
+    /// `output_batch_ms`: 출력/명령이 없을 때 worker fallback poll 주기
+    /// (설계문서 10.1, config.performance 소비). 실제 출력은 PTY reader wake로 즉시
+    /// pump하고 연속 viewport만 8ms로 합친다. 시작 시점에 고정 — 변경은 앱 재시작 필요.
     /// `secret_store`: SpawnAgent의 secret env를 spawn 직전에 resolve할 때만 사용 (6.3).
     /// `logs_root`: 세션별 redacted 로그 디렉터리 (7장). `redaction`: 공유 레지스트리 —
     /// UI(credential 저장)와 worker(spawn 주입)가 같은 인스턴스에 등록한다.
@@ -124,7 +135,7 @@ impl InProcessRuntimeClient {
         // 같은 ms의 다중 인스턴스/테스트 충돌 방지: pid + 프로세스 내 카운터
         static RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let logs_root = logs_root.join(format!("run-{run_ms}-{}-{seq}", std::process::id()));
+        let run_logs_root = logs_root.join(format!("run-{run_ms}-{}-{seq}", std::process::id()));
         let (command_tx, command_rx) = sync_channel(IN_PROCESS_CMD_QUEUE_CAP);
         let subscribers: Arc<Mutex<Vec<Subscriber>>> = Arc::default();
         let worker_subscribers = Arc::clone(&subscribers);
@@ -160,6 +171,7 @@ impl InProcessRuntimeClient {
                     detectors: std::collections::HashMap::new(),
                     status_overrides: std::collections::HashMap::new(),
                     logs_root,
+                    run_logs_root,
                     redaction,
                     secret_store,
                     mux: MuxState::new(),
@@ -177,10 +189,12 @@ impl InProcessRuntimeClient {
                 .run();
             })
             .expect("runtime worker thread 생성");
+        let worker_thread = Some(worker.thread().clone());
         Self {
             command_tx: Some(command_tx),
             subscribers,
             worker: Some(worker),
+            worker_thread,
         }
     }
 
@@ -189,11 +203,15 @@ impl InProcessRuntimeClient {
     /// 스케줄링 경합으로 자식 프로세스가 reap되지 않는 문제 방지.
     pub fn shutdown(&mut self) {
         self.command_tx = None; // Disconnected → worker 루프 break
+        if let Some(worker_thread) = &self.worker_thread {
+            worker_thread.unpark();
+        }
         if let Some(worker) = self.worker.take()
             && worker.join().is_err()
         {
             tracing::warn!("runtime worker join 실패 (panic)");
         }
+        self.worker_thread = None;
     }
 }
 
@@ -209,7 +227,12 @@ impl RuntimeCommandSink for InProcessRuntimeClient {
             anyhow::bail!("runtime worker가 종료됨");
         };
         match tx.try_send(command) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if let Some(worker_thread) = &self.worker_thread {
+                    worker_thread.unpark();
+                }
+                Ok(())
+            }
             Err(TrySendError::Full(_)) => {
                 anyhow::bail!("runtime 명령 큐 가득참 — local runtime backpressure")
             }
@@ -320,6 +343,9 @@ struct Worker {
     /// legacy `SessionStatusChanged` remains raw detector output.
     status_overrides: std::collections::HashMap<SessionId, session::SessionStatus>,
     logs_root: PathBuf,
+    /// 영속 설정이 없는 테스트/원격 워커용 실행별 로그 루트. 숫자 SessionId가
+    /// 재시작마다 재사용돼도 서로 append되지 않게 격리한다.
+    run_logs_root: PathBuf,
     redaction: RedactionService,
     /// mux 상태 (PR-10) — layout source of truth. UI는 MuxUpdated 스냅샷만 본다.
     mux: MuxState,
@@ -340,6 +366,14 @@ struct Worker {
     resource_monitor: ProcessResourceMonitor,
     /// backpressure를 emit한 세션들 — 큐가 비면 해소 이벤트(queued=0)를 보낸다(2026-07-09).
     pressured_sessions: std::collections::HashSet<SessionId>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PumpActivity {
+    /// frame pacing 때문에 아직 snapshot으로 내보내지 않은 visible dirty 화면이 있다.
+    pending_viewport: bool,
+    /// 이번 pump에서 visible viewport를 하나 이상 내보냈다.
+    viewport_emitted: bool,
 }
 
 /// 세션 하나의 redaction 상태 + 로그 파일 (설계문서 7장).
@@ -456,28 +490,83 @@ impl MuxState {
 }
 
 impl Worker {
+    fn spawn_session(
+        id: SessionId,
+        kind: session::SessionKind,
+        spec: &CommandSpec,
+        cols: u16,
+        rows: u16,
+        scrollback_lines: usize,
+    ) -> anyhow::Result<Session> {
+        let worker_thread = std::thread::current();
+        let output_wake: pty::PtyOutputWake = Arc::new(move || worker_thread.unpark());
+        Session::spawn_with_spec_and_output_wake(
+            id,
+            kind,
+            spec,
+            cols,
+            rows,
+            scrollback_lines,
+            output_wake,
+        )
+    }
+
     fn run(&mut self) {
+        // config batch는 출력/명령이 전혀 없을 때의 fallback poll 간격이다. 출력 reader와
+        // command sender가 이 thread를 unpark하므로 첫 반응은 timeout과 무관하게 즉시다.
+        // 연속 출력은 8ms(또는 더 작은 테스트 batch) frame pacing으로 snapshot만 합친다.
+        let viewport_interval = self.batch.min(ACTIVE_VIEWPORT_FRAME_INTERVAL);
+        let mut next_viewport_at = std::time::Instant::now();
+        let mut pending_viewport = false;
         loop {
-            // batch 간격으로 깨어나며 명령을 처리한다
-            match self.command_rx.recv_timeout(self.batch) {
-                Ok(command) => {
-                    self.handle_command(command);
-                    // 몰려온 명령은 한 번에 소화하되 상한을 둔다 — 명령 폭주
-                    // (paste/resize 연타)가 PTY pump·로그·상태 감지를 굶기지
-                    // 않게 한다. 남은 명령은 다음 tick이 즉시 이어받는다 (codex 리뷰)
-                    const COMMAND_BURST_CAP: usize = 128;
-                    let mut burst = 0;
-                    while burst < COMMAND_BURST_CAP
-                        && let Ok(command) = self.command_rx.try_recv()
-                    {
+            let now = std::time::Instant::now();
+            let wait = if pending_viewport {
+                next_viewport_at
+                    .saturating_duration_since(now)
+                    .min(self.batch)
+            } else {
+                self.batch
+            };
+            std::thread::park_timeout(wait);
+
+            // 몰려온 명령은 한 번에 소화하되 상한을 둔다 — 명령 폭주
+            // (paste/resize 연타)가 PTY pump·로그·상태 감지를 굶기지 않게 한다.
+            const COMMAND_BURST_CAP: usize = 128;
+            let mut handled = 0;
+            let mut disconnected = false;
+            while handled < COMMAND_BURST_CAP {
+                match self.command_rx.try_recv() {
+                    Ok(command) => {
                         self.handle_command(command);
-                        burst += 1;
+                        handled += 1;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break, // client drop → 종료
             }
-            self.pump_sessions();
+            if disconnected {
+                // 기존 recv_timeout 루프처럼 마지막 command batch 뒤 한 번은 pump해
+                // command 직후 도착한 PTY tail과 status/persistence를 반영하고 종료한다.
+                let _ = self.pump_sessions(true);
+                self.pump_resource_monitor();
+                self.pump_input_pressure_resolution();
+                break; // client drop → 종료
+            }
+            if handled == COMMAND_BURST_CAP {
+                // unpark 토큰은 coalesced되므로 대량 명령이 이미 queue에 들어온 경우
+                // 다음 tick을 스스로 예약해 command backlog를 timeout까지 방치하지 않는다.
+                std::thread::current().unpark();
+            }
+
+            let allow_viewport = std::time::Instant::now() >= next_viewport_at;
+            let activity = self.pump_sessions(allow_viewport);
+            if activity.viewport_emitted {
+                next_viewport_at = std::time::Instant::now() + viewport_interval;
+            }
+            pending_viewport = activity.pending_viewport;
             self.pump_resource_monitor();
             self.pump_input_pressure_resolution();
         }
@@ -648,7 +737,7 @@ impl Worker {
                 }
                 let id = SessionId(self.next_id);
                 self.next_id += 1;
-                match Session::spawn_with_spec(
+                match Self::spawn_session(
                     id,
                     session::SessionKind::Shell,
                     &self.shell_with_session(id), // 테스트 주입 가능해야 하므로 default_shell 헬퍼 대신 spec 직접
@@ -665,7 +754,6 @@ impl Worker {
                             id,
                             StatusDetector::new(StatusPatterns::compile(None, None, None, None)),
                         );
-                        self.open_session_log(id);
                         self.attach_in_new_tab(id, SHELL_TITLE_ID);
                         if let Some(pipe) = &mut self.persist {
                             let args: Vec<String> = self.shell.args.clone();
@@ -679,6 +767,7 @@ impl Worker {
                                 &Self::spawn_cwd_string(&self.shell.cwd),
                             );
                         }
+                        self.open_session_log(id);
                         // MuxUpdated → Spawned → Viewport(slot) 순서 —
                         // drain의 happens-before 계약 (Viewport가 Spawned보다 먼저
                         // slot에 들어가면 안 된다)
@@ -755,7 +844,14 @@ impl Worker {
                     // 에이전트도 워크스페이스 폴더에서 실행 — 셸과 동일 cwd(agent 이어가기).
                     cwd: self.shell.cwd.clone(),
                 };
-                match session::spawn_agent(id, &spec, cols, rows, scrollback_lines) {
+                match Self::spawn_session(
+                    id,
+                    session::SessionKind::Agent,
+                    &spec,
+                    cols,
+                    rows,
+                    scrollback_lines,
+                ) {
                     Ok(new_session) => {
                         self.sessions.insert(id, new_session);
                         let patterns = StatusPatterns::compile(
@@ -766,7 +862,6 @@ impl Worker {
                         );
                         // regex가 없어도 idle heuristic(3단)은 동작해야 한다 — 상시 설치
                         self.detectors.insert(id, StatusDetector::new(patterns));
-                        self.open_session_log(id);
                         self.attach_in_new_tab(id, AGENT_TITLE_ID);
                         if let Some(pipe) = &mut self.persist {
                             // 스키마 CHECK: agent kind는 agent_id 필수 — config id가
@@ -786,6 +881,7 @@ impl Worker {
                                 &Self::spawn_cwd_string(&spec.cwd),
                             );
                         }
+                        self.open_session_log(id);
                         self.emit_mux_snapshot();
                         self.emit(RuntimeEvent::AgentSpawned { session: id });
                         self.push_watched_viewports();
@@ -998,19 +1094,65 @@ impl Worker {
 
     /// 세션 로그를 연다. 실패해도 세션은 계속 (로그만 없음 — warn).
     fn open_session_log(&mut self, session: SessionId) {
-        match SessionLogWriter::open(&self.logs_root, session) {
+        let persistent_key = self
+            .persist
+            .as_ref()
+            .and_then(|pipe| pipe.session_log_key(session))
+            .map(str::to_owned);
+        let opened = match persistent_key.as_deref() {
+            Some(key) => SessionLogWriter::open_key(&self.logs_root, key),
+            None => SessionLogWriter::open(&self.run_logs_root, session),
+        };
+        match opened {
             Ok(mut writer) => {
+                let last_log_offset = writer.ansi_len().unwrap_or(0);
                 let _ = writer.append_event("spawned", None);
                 self.logs.insert(
                     session,
                     SessionLog {
                         redactor: self.redaction.stream_redactor(),
                         writer,
-                        last_log_offset: 0,
+                        last_log_offset,
                     },
                 );
             }
             Err(e) => tracing::warn!("세션 로그 열기 실패: {e:#}"),
+        }
+    }
+
+    /// pane이 가리키는 이전 영속 세션의 redacted ANSI를 새 terminal backend에
+    /// 스트리밍 재생한다. 파일이 없는 최초/legacy 세션은 정상적인 빈 복원이다.
+    fn replay_saved_ansi(logs_root: &std::path::Path, persistent_id: &str, session: &mut Session) {
+        let path = match SessionLogWriter::ansi_path(logs_root, persistent_id) {
+            Ok(path) => path,
+            Err(e) => {
+                tracing::warn!(persistent_id, "복원 ANSI 로그 경로 거부: {e:#}");
+                return;
+            }
+        };
+        let mut file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                tracing::warn!(persistent_id, path = %path.display(), "복원 ANSI 로그 열기 실패: {e}");
+                return;
+            }
+        };
+        let replay_start = match seek_ansi_replay_tail(&mut file, MAX_ANSI_REPLAY_BYTES) {
+            Ok(start) => start,
+            Err(e) => {
+                tracing::warn!(persistent_id, path = %path.display(), "복원 ANSI tail 탐색 실패: {e}");
+                return;
+            }
+        };
+        match session.replay_ansi(&mut file) {
+            Ok(bytes) => tracing::info!(
+                persistent_id,
+                bytes,
+                replay_start,
+                "이전 ANSI scrollback 복원"
+            ),
+            Err(e) => tracing::warn!(persistent_id, "이전 ANSI scrollback 복원 실패: {e:#}"),
         }
     }
 
@@ -1176,7 +1318,7 @@ impl Worker {
             }
         }
         let spawn_cwd = Self::spawn_cwd_string(&spec.cwd);
-        match Session::spawn_with_spec(
+        match Self::spawn_session(
             id,
             session::SessionKind::Shell,
             &spec,
@@ -1184,7 +1326,10 @@ impl Worker {
             24,
             Self::RESTORE_SCROLLBACK_LINES,
         ) {
-            Ok(new_session) => {
+            Ok(mut new_session) => {
+                if let Some(persistent_id) = pane_state.session_id.as_deref() {
+                    Self::replay_saved_ansi(&self.logs_root, persistent_id, &mut new_session);
+                }
                 self.sessions.insert(id, new_session);
                 // 복원된 셸도 status detector 설치 — 없으면 상태 감지가 아예 안 됐다
                 // (셸 135가 복원 셸이라 built-in 프롬프트 감지도 무동작, #92/#93).
@@ -1192,20 +1337,33 @@ impl Worker {
                     id,
                     StatusDetector::new(StatusPatterns::compile(None, None, None, None)),
                 );
-                self.open_session_log(id);
                 pane.session_id = Some(id);
                 if let Some(pipe) = &mut self.persist {
                     let args: Vec<String> = self.shell.args.clone();
-                    pipe.session_spawned(
-                        id,
-                        "shell",
-                        None,
-                        &pane_state.title,
-                        &self.shell.program,
-                        &args,
-                        &spawn_cwd,
-                    );
+                    if let Some(persistent_id) = pane_state.session_id.as_deref() {
+                        pipe.session_restored(
+                            id,
+                            persistent_id,
+                            "shell",
+                            None,
+                            &pane_state.title,
+                            &self.shell.program,
+                            &args,
+                            &spawn_cwd,
+                        );
+                    } else {
+                        pipe.session_spawned(
+                            id,
+                            "shell",
+                            None,
+                            &pane_state.title,
+                            &self.shell.program,
+                            &args,
+                            &spawn_cwd,
+                        );
+                    }
                 }
+                self.open_session_log(id);
             }
             Err(e) => {
                 tracing::warn!(pane_id = %pane_state.id.0, "복원 중 셸 spawn 실패: {e:#}");
@@ -1230,7 +1388,7 @@ impl Worker {
         };
         let id = SessionId(self.next_id);
         self.next_id += 1;
-        match Session::spawn_with_spec(
+        match Self::spawn_session(
             id,
             session::SessionKind::Shell,
             &self.shell_with_session(id),
@@ -1245,7 +1403,6 @@ impl Worker {
                     id,
                     StatusDetector::new(StatusPatterns::compile(None, None, None, None)),
                 );
-                self.open_session_log(id);
                 if let Some(pipe) = &mut self.persist {
                     let args: Vec<String> = self.shell.args.clone();
                     pipe.session_spawned(
@@ -1258,6 +1415,7 @@ impl Worker {
                         &Self::spawn_cwd_string(&self.shell.cwd),
                     );
                 }
+                self.open_session_log(id);
                 self.tab_counter += 1;
                 let pane_id = MuxPaneId::new();
                 let mut pane = MuxPane::new(
@@ -1435,7 +1593,7 @@ impl Worker {
 
     /// 모든 세션의 PTY 출력을 반영하고, active pane 세션만 Viewport를 push한다
     /// (14.4: hidden pane snapshot 생성 금지 — dirty는 유지되어 포커스 전환 시 따라잡는다).
-    fn pump_sessions(&mut self) {
+    fn pump_sessions(&mut self, allow_viewport: bool) -> PumpActivity {
         // 이전 tick까지 쌓인 exited 세션 중 cap 초과분을 먼저 archive한다.
         // 이번 tick에 새로 종료되는 세션은 exited_order에 이번 tick 끝에 추가되므로
         // 다음 tick에야 archive 대상이 된다 — SessionExited emit과 detach MuxUpdated가
@@ -1445,6 +1603,7 @@ impl Worker {
         let mut events = Vec::new();
         let mut log_offsets = Vec::new();
         let mut status_updates = Vec::new();
+        let mut activity = PumpActivity::default();
         for active in self.sessions.values_mut() {
             let active_id = active.id();
             let mut log = self.logs.get_mut(&active_id);
@@ -1489,16 +1648,24 @@ impl Worker {
                     });
                 }
             }
-            if self.render_active
-                && result.dirty
-                && watched.contains(&active.id())
-                && let Some(snapshot) = active.take_snapshot()
-            {
-                events.push(RuntimeEvent::Viewport {
-                    session: active.id(),
-                    snapshot: Arc::new(snapshot),
-                    bracketed_paste: active.bracketed_paste(),
-                });
+            if self.render_active && result.dirty && watched.contains(&active.id()) {
+                if allow_viewport {
+                    if let Some(snapshot) = active.take_snapshot() {
+                        events.push(RuntimeEvent::Viewport {
+                            session: active.id(),
+                            snapshot: Arc::new(snapshot),
+                            bracketed_paste: active.bracketed_paste(),
+                        });
+                        activity.viewport_emitted = true;
+                    } else {
+                        // backend가 일시적으로 snapshot을 못 만들면 dirty를 유지하고
+                        // 다음 paced tick에서 재시도한다.
+                        activity.pending_viewport = true;
+                    }
+                } else {
+                    // PTY/parser/log는 즉시 처리하되 snapshot만 다음 display cadence로 합친다.
+                    activity.pending_viewport = true;
+                }
             }
             if result.just_exited {
                 let class = if watched.contains(&active.id()) {
@@ -1601,6 +1768,7 @@ impl Worker {
                 self.close_pane(pane);
             }
         }
+        activity
     }
 
     fn session_status_view(&self, session: SessionId) -> session::SessionStatusView {
@@ -1737,6 +1905,38 @@ fn trace_terminal_cache_event(session: SessionId, event: TerminalCacheEvent) {
 /// (복원 시 counter 전진용).
 fn title_suffix(title: &str) -> Option<u64> {
     title.rsplit(' ').next()?.parse().ok()
+}
+
+/// ANSI tail cutoff가 escape/UTF-8 sequence 한가운데 놓이지 않게 다음 newline 뒤로
+/// 정렬한다. newline 없는 병적 giant line은 복원하지 않는다. 어느 경우든 cutoff 이후
+/// 최대 `max_bytes`만 읽으므로 시작 지연이 로그 전체 크기에 비례하지 않는다.
+fn seek_ansi_replay_tail(file: &mut std::fs::File, max_bytes: u64) -> std::io::Result<u64> {
+    use std::io::{Read as _, Seek as _};
+
+    let len = file.metadata()?.len();
+    if len <= max_bytes {
+        file.seek(std::io::SeekFrom::Start(0))?;
+        return Ok(0);
+    }
+    let cutoff = len.saturating_sub(max_bytes);
+    file.seek(std::io::SeekFrom::Start(cutoff))?;
+    let mut position = cutoff;
+    let mut buffer = [0u8; 8192];
+    while position < len {
+        let remaining = usize::try_from((len - position).min(buffer.len() as u64)).unwrap_or(0);
+        let read = file.read(&mut buffer[..remaining])?;
+        if read == 0 {
+            break;
+        }
+        if let Some(index) = buffer[..read].iter().position(|byte| *byte == b'\n') {
+            let start = position + index as u64 + 1;
+            file.seek(std::io::SeekFrom::Start(start))?;
+            return Ok(start);
+        }
+        position += read as u64;
+    }
+    file.seek(std::io::SeekFrom::Start(len))?;
+    Ok(len)
 }
 
 /// exit 순서(오래된 것이 앞)에서 cap 초과분을 archive(backend drop) 대상으로 돌려준다
@@ -1898,6 +2098,7 @@ mod tests {
             command_tx: Some(tx),
             subscribers: Arc::default(),
             worker: None,
+            worker_thread: None,
         };
         client
             .send_command(RuntimeCommand::SetWorkspaceState(
@@ -1956,6 +2157,49 @@ mod tests {
             .collect::<String>()
             .trim_end()
             .to_owned()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pty_output_wake는_긴_fallback_batch보다_먼저_viewport를_보낸다() {
+        // wake 배선이 없으면 marker는 2초 batch timeout 뒤에야 보인다. reader의
+        // unpark가 연결되어 있으면 child의 150ms sleep 직후 도착해야 한다.
+        let client = InProcessRuntimeClient::with_shell(
+            2_000,
+            test_store(),
+            test_logs_root("output-wake-latency"),
+            RedactionService::new(),
+            spec(
+                "/bin/sh",
+                &["-c", "sleep 0.15; printf 'wake-latency\\n'; sleep 1"],
+            ),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(5), |event| match event {
+            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            _ => None,
+        });
+        let started = Instant::now();
+        probe.wait_for(Duration::from_secs(5), |event| match event {
+            RuntimeEvent::Viewport { snapshot, .. }
+                if snapshot_text(snapshot, 0).contains("wake-latency") =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "PTY output wake가 동작하지 않아 2초 fallback batch를 기다림"
+        );
     }
 
     #[test]
@@ -3262,6 +3506,120 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 앱 release 재빌드/재실행 시 fresh 셸을 붙이더라도 이전 agent 출력과 ANSI
+    /// truecolor가 영속 세션 로그에서 복원돼야 한다.
+    #[cfg(unix)]
+    #[test]
+    fn 재시작시_ansi_scrollback과_color가_복원된다() {
+        init_mock_store();
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-rt-ansi-restore-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("metadata.sqlite3");
+        let logs_root = dir.join("logs");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT, path TEXT,
+                     created_at TEXT DEFAULT '', updated_at TEXT DEFAULT '');
+                 CREATE TABLE agent_configs (id TEXT PRIMARY KEY);
+                 INSERT INTO workspaces (id) VALUES ('ws-ansi');",
+            )
+            .unwrap();
+            conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+        }
+        let persist_config = || crate::persistence::PersistConfig {
+            db_path: db_path.clone(),
+            workspace_id: "ws-ansi".into(),
+        };
+
+        {
+            let client = InProcessRuntimeClient::with_shell(
+                5,
+                test_store(),
+                logs_root.clone(),
+                RedactionService::new(),
+                spec(
+                    "/bin/sh",
+                    &[
+                        "-c",
+                        r"printf '\033[38;2;12;34;56m\033[48;2;78;90;123mPERSIST-COLOR\033[0m\r\n'; exec /bin/cat",
+                    ],
+                ),
+                Some(persist_config()),
+            );
+            let mut probe = Probe::new(client.subscribe());
+            client
+                .send_command(RuntimeCommand::SpawnShell {
+                    cols: 80,
+                    rows: 24,
+                    scrollback_lines: 100,
+                })
+                .unwrap();
+            probe.wait_for(Duration::from_secs(15), |event| match event {
+                RuntimeEvent::Viewport { snapshot, .. }
+                    if snapshot.visible_cells.iter().any(|cell| {
+                        cell.c == 'P' && cell.fg == [12, 34, 56] && cell.bg == [78, 90, 123]
+                    }) =>
+                {
+                    Some(())
+                }
+                _ => None,
+            });
+        }
+
+        let persistent_id: String = rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .query_row("SELECT id FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        let ansi_path = SessionLogWriter::ansi_path(&logs_root, &persistent_id).unwrap();
+        assert!(
+            std::fs::read(&ansi_path)
+                .unwrap()
+                .windows(b"\x1b[38;2;12;34;56m".len())
+                .any(|bytes| bytes == b"\x1b[38;2;12;34;56m"),
+            "영속 ANSI 로그에 truecolor escape가 보존돼야 함"
+        );
+
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            logs_root.clone(),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(persist_config()),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::RestoreWorkspace)
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::Viewport { snapshot, .. }
+                if snapshot.visible_cells.iter().any(|cell| {
+                    cell.c == 'P' && cell.fg == [12, 34, 56] && cell.bg == [78, 90, 123]
+                }) =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
+
+        // restore가 새 UUID를 매번 만들면 다음 재시작에서 로그 연결이 다시 끊긴다.
+        let row_count: i64 = rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(row_count, 1);
+        drop(client);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 회귀 (codex 리뷰 P2): RestoreWorkspace가 "빈 상태"에서만 복원한다.
     /// SpawnShell이 먼저 처리돼 세션이 생긴 뒤 온 RestoreWorkspace는 skip돼야
     /// 저장 layout이 새 세션 위에 덧붙는 hybrid 상태를 만들지 않는다.
@@ -3493,6 +3851,38 @@ mod tests {
             ),
             vec![SessionId(5)]
         );
+    }
+
+    #[test]
+    fn ansi_replay_tail은_상한과_ansi_경계를_지킨다() {
+        use std::io::Read as _;
+
+        let path = std::env::temp_dir().join(format!(
+            "deppy-ansi-tail-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let recent = b"\x1b[38;2;12;34;56mRECENT\x1b[0m\n";
+        let mut data = b"old-prefix-possibly-mid-escape-\x1b[31mOLD\n".to_vec();
+        data.extend_from_slice(recent);
+        std::fs::write(&path, &data).unwrap();
+
+        let mut file = std::fs::File::open(&path).unwrap();
+        let start = super::seek_ansi_replay_tail(&mut file, recent.len() as u64 + 8).unwrap();
+        assert!(start > 0);
+        let mut restored = Vec::new();
+        file.read_to_end(&mut restored).unwrap();
+        assert_eq!(restored, recent);
+        assert!(restored.len() as u64 <= recent.len() as u64 + 8);
+
+        // cutoff 뒤에도 newline이 없는 giant line은 중간 escape/text를 그리지 않고 생략.
+        std::fs::write(&path, vec![b'x'; 128]).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        assert_eq!(super::seek_ansi_replay_tail(&mut file, 16).unwrap(), 128);
+        let mut restored = Vec::new();
+        file.read_to_end(&mut restored).unwrap();
+        assert!(restored.is_empty());
+        std::fs::remove_file(path).ok();
     }
 
     #[cfg(unix)]

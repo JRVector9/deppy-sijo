@@ -110,7 +110,8 @@ impl Default for TerminalConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PerformanceConfig {
-    /// PTY output batch 간격, 16~50ms (설계문서 10.1)
+    /// Runtime worker의 idle fallback poll 간격, UI 범위 16~50ms. 실제 PTY 출력은
+    /// reader wake로 즉시 pump되고, 연속 viewport는 runtime에서 8ms로 frame pacing한다.
     pub output_batch_ms: u64,
 }
 

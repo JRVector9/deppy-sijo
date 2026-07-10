@@ -36,6 +36,9 @@ pub(crate) struct PersistPipe {
     window_id: MuxWindowId,
     /// runtime SessionId(u64, 실행마다 리셋) → 영속 행 (id는 UUID)
     rows: HashMap<SessionId, SessionRow>,
+    /// 시작 시 읽은 이전 세션 행. layout pane의 영속 session id와 결합해 fresh PTY를
+    /// 같은 영속 세션/ANSI 로그에 다시 연결할 때 소비한다.
+    restored_rows: HashMap<String, SessionRow>,
     /// 이전 실행이 저장한 tab 구조 — worker 시작 시 [`Self::take_saved_layout`]으로
     /// 한 번만 소비된다(복원 완료 후에는 빈 Vec).
     restored_tabs: Vec<TabState>,
@@ -70,6 +73,10 @@ impl PersistPipe {
             Some(w) => (w.id, w.tabs, w.active_tab),
             None => (MuxWindowId::new(), Vec::new(), None),
         };
+        let restored_rows = persist::load_sessions(&conn, &config.workspace_id)?
+            .into_iter()
+            .map(|row| (row.id.clone(), row))
+            .collect();
         let (write_worker, write_handle) =
             match DbWriteWorker::spawn(&config.db_path, worker_config) {
                 Ok(worker) => {
@@ -88,6 +95,7 @@ impl PersistPipe {
             write_handle,
             window_id,
             rows: HashMap::new(),
+            restored_rows,
             restored_tabs,
             restored_active_tab,
         })
@@ -132,6 +140,44 @@ impl PersistPipe {
             tracing::warn!("세션 영속 실패 (spawn): {e:#}");
         }
         self.rows.insert(session, row);
+    }
+
+    /// 이전 pane이 가리키던 영속 세션 행을 fresh PTY에 재연결한다. UUID를 재사용하므로
+    /// `logs/<workspace>/<uuid>/redacted.ansi.log`도 실행 사이에 끊기지 않는다.
+    /// 손상/삭제로 이전 행이 없으면 안전하게 새 영속 세션으로 폴백한다.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn session_restored(
+        &mut self,
+        session: SessionId,
+        persistent_id: &str,
+        kind: &str,
+        agent_id: Option<String>,
+        title: &str,
+        command: &str,
+        args: &[String],
+        cwd: &str,
+    ) {
+        let Some(mut row) = self.restored_rows.remove(persistent_id) else {
+            tracing::warn!(persistent_id, "복원 세션 행 없음 — 새 영속 세션으로 폴백");
+            self.session_spawned(session, kind, agent_id, title, command, args, cwd);
+            return;
+        };
+        row.session_kind = kind.to_owned();
+        row.agent_id = agent_id;
+        row.title = title.to_owned();
+        row.command = command.to_owned();
+        row.args = args.to_vec();
+        row.cwd = cwd.to_owned();
+        row.status = persist::SESSION_STATUS_RUNNING.to_owned();
+        if let Err(e) = persist::upsert_session(&self.conn, &row) {
+            tracing::warn!(persistent_id, "세션 영속 실패 (restore): {e:#}");
+        }
+        self.rows.insert(session, row);
+    }
+
+    /// runtime SessionId에 결속된 영속 UUID. 로그 디렉터리 키로 사용한다.
+    pub(crate) fn session_log_key(&self, session: SessionId) -> Option<&str> {
+        self.rows.get(&session).map(|row| row.id.as_str())
     }
 
     /// 세션의 현재 작업 폴더 갱신 — 감지 워커(lsof)가 관측한 live cd를 따라간다(A안).

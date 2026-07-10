@@ -25,9 +25,14 @@ const DEFAULT_UI_FONT: &str = "/System/Library/Fonts/Supplemental/AppleGothic.tt
 #[cfg(not(target_os = "macos"))]
 const DEFAULT_UI_FONT: &str = "";
 
+#[cfg(target_os = "macos")]
+pub const DEFAULT_UI_FONT_NAME: &str = "AppleGothic";
+#[cfg(not(target_os = "macos"))]
+pub const DEFAULT_UI_FONT_NAME: &str = "System";
+
 /// 한글 fallback 폰트를 등록한다. 실패해도 앱은 계속 뜬다 (한글만 깨짐).
 /// `ui_font`: 설정에서 고른 UI(Proportional) 폰트 파일 경로 — None/로드 실패면 기본
-/// (macOS는 Apple SD Gothic Neo). 설정 변경 시 재호출해 hot reload된다(2026-07-07).
+/// (macOS는 AppleGothic). 설정 변경 시 재호출해 hot reload된다(2026-07-07).
 pub fn install_cjk_fallback(ctx: &egui::Context, ui_font: Option<&str>) {
     let mut fonts = egui::FontDefinitions::default();
 
@@ -138,4 +143,42 @@ pub fn ui_font_options() -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// 설정 화면에 표시할 실제 UI 폰트명. `None`은 단순히 "자동"으로 숨기지 않고 현재
+/// 플랫폼 기본값을 표시해, 사용자가 지금 적용된 폰트를 즉시 확인할 수 있게 한다.
+pub fn effective_ui_font_name(selected_path: Option<&str>, options: &[(String, String)]) -> String {
+    let Some(selected_path) = selected_path else {
+        return DEFAULT_UI_FONT_NAME.to_owned();
+    };
+    options
+        .iter()
+        .find(|(_, path)| path == selected_path)
+        .map(|(name, _)| name.clone())
+        .or_else(|| {
+            std::path::Path::new(selected_path)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| DEFAULT_UI_FONT_NAME.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_UI_FONT_NAME, effective_ui_font_name};
+
+    #[test]
+    fn 기본_ui_font는_실제_플랫폼_폰트명을_표시한다() {
+        assert_eq!(effective_ui_font_name(None, &[]), DEFAULT_UI_FONT_NAME);
+    }
+
+    #[test]
+    fn 선택한_ui_font는_options의_표시명을_사용한다() {
+        let options = vec![("Pretendard".to_owned(), "/fonts/p.ttf".to_owned())];
+        assert_eq!(
+            effective_ui_font_name(Some("/fonts/p.ttf"), &options),
+            "Pretendard"
+        );
+    }
 }

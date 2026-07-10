@@ -1,12 +1,52 @@
 use crate::config::{Config, Theme};
 
-const PAGE_TITLE_SIZE: f32 = 15.0;
-const SECTION_TITLE_SIZE: f32 = 14.0;
-const ROW_TITLE_SIZE: f32 = 14.0;
-const ROW_DESC_SIZE: f32 = 13.0;
-const CONTROL_TEXT_SIZE: f32 = 14.0;
-const CONTROL_HEIGHT: f32 = 28.0;
-const DETAIL_PAD_X: f32 = 10.0;
+/// `SettingsDetailShell`/`SettingsRow`/control 목업이 공유하는 타이포 토큰.
+/// 참조 화면의 Settings Detail Font Map(15/14/13/14px)을 한 곳에서 강제한다.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SettingsTypography {
+    page_title: f32,
+    section_title: f32,
+    row_title: f32,
+    row_description: f32,
+    control: f32,
+}
+
+const SETTINGS_TYPE: SettingsTypography = SettingsTypography {
+    page_title: 15.0,
+    section_title: 14.0,
+    row_title: 14.0,
+    row_description: 13.0,
+    control: 14.0,
+};
+
+/// 참조 React 컴포넌트의 logical px 치수.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SettingsDetailMetrics {
+    pad_x: f32,
+    pad_top: f32,
+    pad_bottom: f32,
+    row_height: f32,
+    control_column: f32,
+    column_gap: f32,
+    control_height: f32,
+    select_width: f32,
+    segment_width: f32,
+}
+
+const SETTINGS_DETAIL: SettingsDetailMetrics = SettingsDetailMetrics {
+    pad_x: 26.0,
+    pad_top: 20.0,
+    pad_bottom: 40.0,
+    row_height: 68.0,
+    control_column: 360.0,
+    column_gap: 20.0,
+    control_height: 34.0,
+    select_width: 230.0,
+    segment_width: 104.0,
+};
+
+const CONTROL_HEIGHT: f32 = SETTINGS_DETAIL.control_height;
+const CONTROL_TEXT_SIZE: f32 = SETTINGS_TYPE.control;
 
 /// Remote(TLS) 섹션이 App에 돌려주는 동작 — App만 서버 핸들/파일을 소유하므로 의도만 전달한다.
 pub enum RemoteAction {
@@ -105,8 +145,10 @@ pub fn show(
         egui::ViewportId::from_hash_of("deppy_settings_window"),
         egui::ViewportBuilder::default()
             .with_title(catalog.t("settings.title", &[]))
-            .with_inner_size([1000.0, 640.0])
-            .with_min_inner_size([720.0, 460.0]),
+            // 참조 설정 창은 1280px 프레임에서 190px nav를 뺀 1090px 환경/API
+            // surface다. 네이티브 타이틀바는 viewport 밖이므로 본문 높이는 730px.
+            .with_inner_size([1280.0, 730.0])
+            .with_min_inner_size([900.0, 520.0]),
         // egui 0.35 immediate viewport 콜백은 &mut Ui(뷰포트 루트)를 받는다 — Context 아님.
         // Ui::input은 현재(자식) 뷰포트의 입력을 읽으므로 close_requested가 이 창의 것.
         |root, _class| {
@@ -131,13 +173,18 @@ pub fn show(
                         });
                     egui::Panel::left("settings_nav")
                         .resizable(false)
-                        .exact_size(216.0)
+                        .exact_size(190.0)
                         .frame(nav_frame)
                         .show(ui, |ui| {
                             nav(ui, category, notif_unread, search_query, catalog);
                         });
+                    let inline_detail = is_inline_settings_category(*category);
                     let detail_frame = egui::Frame::default()
-                        .fill(ui.visuals().faint_bg_color)
+                        .fill(if inline_detail {
+                            ui.visuals().extreme_bg_color
+                        } else {
+                            ui.visuals().faint_bg_color
+                        })
                         .inner_margin(egui::Margin::ZERO);
                     egui::CentralPanel::default()
                         .frame(detail_frame)
@@ -175,7 +222,11 @@ pub fn show(
                                     .auto_shrink([false, false])
                                     .show(ui, |ui| {
                                         apply_component_style(ui);
-                                        render_detail(ui);
+                                        if inline_detail {
+                                            settings_detail_shell(ui, render_detail);
+                                        } else {
+                                            render_detail(ui);
+                                        }
                                     });
                             }
                         });
@@ -187,6 +238,17 @@ pub fn show(
         config_changed: changed,
         remote_action,
     }
+}
+
+fn is_inline_settings_category(category: Category) -> bool {
+    matches!(
+        category,
+        Category::General
+            | Category::Language
+            | Category::Terminal
+            | Category::Performance
+            | Category::RemoteTls
+    )
 }
 
 fn rgb(r: u8, g: u8, b: u8) -> egui::Color32 {
@@ -233,6 +295,9 @@ fn apply_settings_palette(ui: &mut egui::Ui) {
     v.extreme_bg_color = input;
     v.selection.bg_fill = accent;
     v.selection.stroke = egui::Stroke::new(1.0, border_focus);
+    v.hyperlink_color = accent;
+    // #d4d4d4 × 0.535 ≈ 목업 muted #717171.
+    v.weak_text_alpha = 0.535;
     v.window_stroke = egui::Stroke::new(1.0, border);
     v.warn_fg_color = rgb(0xe7, 0x8a, 0x4e);
     v.error_fg_color = if dark {
@@ -527,60 +592,152 @@ fn nav_matches(query: &str, label: &str, aliases: &str) -> bool {
 
 // ── 폼 헬퍼 ──
 
+/// React의 `SettingsDetailShell`과 같은 공통 상세 surface.
+/// 모든 인라인 설정 페이지가 동일한 배경·여백·수직 리듬을 공유한다.
+fn settings_detail_shell(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::NONE
+        .inner_margin(egui::Margin {
+            left: SETTINGS_DETAIL.pad_x as i8,
+            right: SETTINGS_DETAIL.pad_x as i8,
+            top: SETTINGS_DETAIL.pad_top as i8,
+            bottom: SETTINGS_DETAIL.pad_bottom as i8,
+        })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            // 행/구분선 자체가 참조의 간격을 포함하므로 egui의 암묵적 6px 간격은 제거한다.
+            ui.spacing_mut().item_spacing.y = 0.0;
+            add_contents(ui);
+        });
+}
+
+fn settings_text_secondary(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        rgb(0xaa, 0xaa, 0xaa)
+    } else {
+        rgb(0x44, 0x44, 0x44)
+    }
+}
+
+fn settings_input_border(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        rgb(0x40, 0x40, 0x40)
+    } else {
+        rgb(0xb8, 0xb8, 0xb8)
+    }
+}
+
+fn settings_nav_active(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        rgb(0x2e, 0x4a, 0x5e)
+    } else {
+        rgb(0xcc, 0xde, 0xed)
+    }
+}
+
+/// 내용 폭 안에서만 그리는 1px 구분선. 상세 페이지의 26px 좌우 여백을 침범하지 않는다.
+fn settings_hairline(ui: &mut egui::Ui) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    let y = ui.painter().round_to_pixel_center(rect.center().y);
+    ui.painter().hline(
+        rect.x_range(),
+        y,
+        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+    );
+}
+
 /// 설정 상세 페이지 제목 — Settings Detail Font Map 기준 15px.
 fn page_title(ui: &mut egui::Ui, title: &str) {
-    ui.add_space(12.0);
-    ui.horizontal(|ui| {
-        ui.add_space(DETAIL_PAD_X);
-        ui.label(egui::RichText::new(title).size(PAGE_TITLE_SIZE).strong());
-    });
-    ui.add_space(8.0);
-    crate::ui::hairline_full(ui);
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::hover());
+    ui.painter().text(
+        rect.left_center(),
+        egui::Align2::LEFT_CENTER,
+        title,
+        egui::FontId::proportional(SETTINGS_TYPE.page_title),
+        ui.visuals().strong_text_color(),
+    );
+    ui.add_space(16.0);
+    settings_hairline(ui);
 }
 
 /// 섹션 제목 — 카드 없이 title + 1px divider만 사용한다.
 fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(14.0);
-    ui.horizontal(|ui| {
-        ui.add_space(DETAIL_PAD_X);
-        ui.label(egui::RichText::new(title).size(SECTION_TITLE_SIZE).strong());
-    });
+    ui.label(
+        egui::RichText::new(title)
+            .size(SETTINGS_TYPE.section_title)
+            .strong(),
+    );
     ui.add_space(4.0);
-    crate::ui::hairline_full(ui);
+    settings_hairline(ui);
 }
 
-/// label(+hint) 왼쪽, 컨트롤 오른쪽. 아래 픽셀-스냅 헤어라인.
+/// React의 `SettingsRow`: 68px 행, `1fr 360px` 열, 20px gap, 아래 1px 구분선.
 fn row(
     ui: &mut egui::Ui,
     label: &str,
     hint: Option<&str>,
     add_control: impl FnOnce(&mut egui::Ui),
 ) {
-    ui.add_space(7.0);
-    let row_width = (ui.available_width() - DETAIL_PAD_X * 2.0).max(0.0);
-    ui.horizontal(|ui| {
-        ui.add_space(DETAIL_PAD_X);
-        ui.allocate_ui_with_layout(
-            egui::vec2(row_width, 0.0),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.set_width(row_width);
-                ui.vertical(|ui| {
-                    ui.set_width((row_width * 0.58).min(440.0));
-                    ui.label(egui::RichText::new(label).size(ROW_TITLE_SIZE));
-                    if let Some(h) = hint {
-                        ui.label(egui::RichText::new(h).weak().size(ROW_DESC_SIZE));
-                    }
-                });
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    add_control,
-                );
-            },
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), SETTINGS_DETAIL.row_height),
+        egui::Sense::hover(),
+    );
+    let control_width = SETTINGS_DETAIL
+        .control_column
+        .min((rect.width() - SETTINGS_DETAIL.column_gap).max(0.0));
+    let control_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.right() - control_width, rect.top()),
+        rect.right_bottom(),
+    );
+    let label_rect = egui::Rect::from_min_max(
+        rect.left_top(),
+        egui::pos2(
+            (control_rect.left() - SETTINGS_DETAIL.column_gap).max(rect.left()),
+            rect.bottom(),
+        ),
+    );
+    let painter = ui
+        .painter()
+        .with_clip_rect(label_rect.intersect(ui.clip_rect()));
+    let title_y = if hint.is_some() {
+        rect.top() + 21.0
+    } else {
+        rect.center().y
+    };
+    painter.text(
+        egui::pos2(rect.left(), title_y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(SETTINGS_TYPE.row_title),
+        ui.visuals().text_color(),
+    );
+    if let Some(hint) = hint {
+        painter.text(
+            egui::pos2(rect.left(), rect.top() + 46.0),
+            egui::Align2::LEFT_CENTER,
+            hint,
+            egui::FontId::proportional(SETTINGS_TYPE.row_description),
+            settings_text_secondary(ui),
         );
-    });
-    ui.add_space(7.0);
-    crate::ui::hairline_full(ui);
+    }
+
+    let mut control_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(("settings_row_control", label))
+            .max_rect(control_rect)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    control_ui.set_clip_rect(control_rect.intersect(ui.clip_rect()));
+    add_control(&mut control_ui);
+
+    let y = ui.painter().round_to_pixel_center(rect.bottom());
+    ui.painter().hline(
+        rect.x_range(),
+        y,
+        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+    );
 }
 
 fn detail_text(ui: &mut egui::Ui, text: impl Into<String>, selectable: bool) {
@@ -595,22 +752,23 @@ fn detail_text(ui: &mut egui::Ui, text: impl Into<String>, selectable: bool) {
 }
 
 fn hint_text(ui: &mut egui::Ui, text: impl Into<String>) {
-    ui.label(egui::RichText::new(text.into()).weak().size(ROW_DESC_SIZE));
+    ui.label(
+        egui::RichText::new(text.into())
+            .color(settings_text_secondary(ui))
+            .size(SETTINGS_TYPE.row_description),
+    );
 }
 
 fn detail_block(ui: &mut egui::Ui, label: &str, value: impl Into<String>) {
     ui.add_space(7.0);
-    ui.horizontal(|ui| {
-        ui.add_space(DETAIL_PAD_X);
-        ui.vertical(|ui| {
-            ui.set_width((ui.available_width() - DETAIL_PAD_X).max(0.0));
-            ui.label(egui::RichText::new(label).size(ROW_TITLE_SIZE));
-            ui.add_space(3.0);
-            detail_text(ui, value, true);
-        });
+    ui.vertical(|ui| {
+        ui.set_width(ui.available_width());
+        ui.label(egui::RichText::new(label).size(SETTINGS_TYPE.row_title));
+        ui.add_space(3.0);
+        detail_text(ui, value, true);
     });
     ui.add_space(7.0);
-    crate::ui::hairline_full(ui);
+    settings_hairline(ui);
 }
 
 /// 토글 스위치 (checkbox 대체 — 목업 스타일). 값이 바뀌면 true.
@@ -625,15 +783,21 @@ fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> bool {
     let bg = if *on {
         ui.visuals().selection.bg_fill
     } else {
-        ui.visuals().widgets.inactive.bg_fill
+        ui.visuals().panel_fill
     };
-    let stroke = if *on {
-        ui.visuals().selection.stroke
+    let stroke_color = if *on {
+        ui.visuals().selection.bg_fill
     } else {
-        ui.visuals().widgets.inactive.bg_stroke
+        ui.visuals().widgets.noninteractive.bg_stroke.color
     };
     let painter = ui.painter();
-    painter.rect(rect, radius, bg, stroke, egui::StrokeKind::Inside);
+    painter.rect(
+        rect,
+        radius,
+        bg,
+        egui::Stroke::new(1.0, stroke_color),
+        egui::StrokeKind::Inside,
+    );
     let t = if *on { 1.0 } else { 0.0 };
     let knob_size = egui::vec2(18.0, 18.0);
     let knob_left = egui::lerp((rect.left() + 4.0)..=(rect.right() - 4.0 - knob_size.x), t);
@@ -665,7 +829,7 @@ pub enum Icon {
     Square,
     Clock,
     Bell,
-    Monitor,
+    SystemIndicator,
     Sun,
     Moon,
 }
@@ -808,26 +972,11 @@ fn paint_icon(p: &egui::Painter, c: egui::Pos2, sz: f32, icon: Icon, col: egui::
             }));
             p.circle_filled(egui::pos2(c.x, c.y + r * 0.65), r * 0.14, col);
         }
-        Icon::Monitor => {
-            let screen = egui::Rect::from_center_size(
-                egui::pos2(c.x, c.y - r * 0.15),
-                egui::vec2(sz, sz * 0.7),
-            );
-            p.rect_stroke(screen, 2.0, s, egui::StrokeKind::Inside);
-            p.line_segment(
-                [
-                    egui::pos2(c.x - r * 0.4, c.y + r * 0.85),
-                    egui::pos2(c.x + r * 0.4, c.y + r * 0.85),
-                ],
-                s,
-            );
-            p.line_segment(
-                [
-                    egui::pos2(c.x, screen.bottom()),
-                    egui::pos2(c.x, c.y + r * 0.85),
-                ],
-                s,
-            );
+        Icon::SystemIndicator => {
+            let outer = egui::Rect::from_center_size(c, egui::vec2(sz * 0.84, sz * 0.84));
+            let inner = egui::Rect::from_center_size(c, egui::vec2(sz * 0.48, sz * 0.48));
+            p.rect_stroke(outer, 0.0, s, egui::StrokeKind::Inside);
+            p.rect_filled(inner, 0.0, col);
         }
         Icon::Sun => {
             p.circle_filled(c, r * 0.42, col);
@@ -844,12 +993,7 @@ fn paint_icon(p: &egui::Painter, c: egui::Pos2, sz: f32, icon: Icon, col: egui::
             }
         }
         Icon::Moon => {
-            p.circle_filled(c, r * 0.8, col);
-            p.circle_filled(
-                egui::pos2(c.x + r * 0.42, c.y - r * 0.25),
-                r * 0.72,
-                egui::Color32::from_rgb(0x22, 0x22, 0x2a),
-            );
+            p.circle_filled(c, r * 0.56, col);
         }
     }
 }
@@ -862,85 +1006,129 @@ fn segmented(ui: &mut egui::Ui, sel: &mut Theme, items: &[(Theme, Icon, String)]
     let h = CONTROL_HEIGHT;
     let icon_sz = 14.0;
     let gap = 6.0;
-    let pad = 12.0;
-    let hair = ui.visuals().widgets.noninteractive.bg_stroke.color;
-    let input = ui.visuals().extreme_bg_color;
+    let segment_width = SETTINGS_DETAIL.segment_width;
+    let total = segment_width * items.len() as f32;
+    let border = settings_input_border(ui);
+    let surface = ui.visuals().panel_fill;
     let accent = ui.visuals().selection.bg_fill;
-    let text_w: Vec<f32> = items
-        .iter()
-        .map(|(_, _, l)| {
-            ui.painter()
-                .layout_no_wrap(l.clone(), font.clone(), accent)
-                .size()
-                .x
-        })
-        .collect();
-    let widths: Vec<f32> = text_w
-        .iter()
-        .map(|w| pad + icon_sz + gap + w + pad)
-        .collect();
-    let total: f32 = widths.iter().sum();
     let (rect, _) = ui.allocate_exact_size(egui::vec2(total, h), egui::Sense::hover());
-    ui.painter().rect(
-        rect,
-        0.0,
-        input,
-        egui::Stroke::new(1.0, hair),
-        egui::StrokeKind::Inside,
-    );
+    ui.painter().rect_filled(rect, 0.0, surface);
     let mut changed = false;
     let mut x = rect.left();
     for (i, (theme, icon, label)) in items.iter().enumerate() {
-        let seg = egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(widths[i], h));
+        let seg =
+            egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(segment_width, h));
         let on = *sel == *theme;
+        let response = ui.interact(
+            seg,
+            ui.id().with(("settings_segment", i)),
+            egui::Sense::click(),
+        );
         if on {
-            ui.painter().rect_filled(seg.shrink(1.0), 0.0, accent);
+            ui.painter().rect_filled(seg, 0.0, settings_nav_active(ui));
+        } else if response.hovered() {
+            ui.painter()
+                .rect_filled(seg, 0.0, ui.visuals().widgets.hovered.bg_fill);
         }
         let col = if on {
-            egui::Color32::WHITE
+            accent
         } else {
-            ui.visuals().weak_text_color()
+            settings_text_secondary(ui)
         };
         let cy = seg.center().y;
+        let text_width = ui
+            .painter()
+            .layout_no_wrap(label.clone(), font.clone(), col)
+            .size()
+            .x;
+        let content_width = icon_sz + gap + text_width;
+        let content_left = seg.center().x - content_width / 2.0;
         paint_icon(
             ui.painter(),
-            egui::pos2(seg.left() + pad + icon_sz / 2.0, cy),
+            egui::pos2(content_left + icon_sz / 2.0, cy),
             icon_sz,
             *icon,
             col,
         );
         ui.painter().text(
-            egui::pos2(seg.left() + pad + icon_sz + gap, cy),
+            egui::pos2(content_left + icon_sz + gap, cy),
             egui::Align2::LEFT_CENTER,
             label,
             font.clone(),
             col,
         );
         if i < items.len() - 1 {
-            ui.painter().vline(
-                seg.right(),
-                (rect.top() + 5.0)..=(rect.bottom() - 5.0),
-                egui::Stroke::new(1.0, hair),
-            );
+            ui.painter()
+                .vline(seg.right(), rect.y_range(), egui::Stroke::new(1.0, border));
         }
-        let r = ui.interact(seg, ui.id().with(("seg", i)), egui::Sense::click());
-        if r.clicked() && !on {
+        if response.clicked() && !on {
             *sel = *theme;
             changed = true;
         }
-        x += widths[i];
+        x += segment_width;
     }
+    ui.painter().rect_stroke(
+        rect,
+        0.0,
+        egui::Stroke::new(1.0, border),
+        egui::StrokeKind::Inside,
+    );
     changed
+}
+
+/// React의 `SettingsSelect`: 230×34, 좌측 라벨·우측 화살표를 갖는 공통 선택 버튼.
+fn settings_select_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(SETTINGS_DETAIL.select_width, CONTROL_HEIGHT),
+        egui::Sense::click(),
+    );
+    let background = if response.hovered() {
+        ui.visuals().widgets.hovered.bg_fill
+    } else {
+        ui.visuals().panel_fill
+    };
+    ui.painter().rect(
+        rect,
+        0.0,
+        background,
+        egui::Stroke::new(1.0, settings_input_border(ui)),
+        egui::StrokeKind::Inside,
+    );
+    let label_clip = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 12.0, rect.top()),
+        egui::pos2(rect.right() - 30.0, rect.bottom()),
+    )
+    .intersect(ui.clip_rect());
+    ui.painter().with_clip_rect(label_clip).text(
+        egui::pos2(rect.left() + 12.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(CONTROL_TEXT_SIZE),
+        ui.visuals().text_color(),
+    );
+    let arrow_x = rect.right() - 12.0;
+    let cy = rect.center().y;
+    let d = 3.5;
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(arrow_x - d, cy - d * 0.6),
+            egui::pos2(arrow_x + d, cy - d * 0.6),
+            egui::pos2(arrow_x, cy + d * 0.7),
+        ],
+        ui.visuals().weak_text_color(),
+        egui::Stroke::NONE,
+    ));
+    response
 }
 
 /// 사용자 입력 스텝퍼 — [값] │ [−] │ [+], 경계선 박스. 반환: 변경 여부.
 fn stepper(ui: &mut egui::Ui, value: &mut i64, step: i64, min: i64, max: i64, unit: &str) -> bool {
     let h = CONTROL_HEIGHT;
-    let btn_w = 28.0;
-    let val_w = 76.0;
+    let btn_w = 44.0;
+    let val_w = 138.0;
     let total = val_w + btn_w * 2.0;
-    let hair = ui.visuals().widgets.noninteractive.bg_stroke.color;
-    let input = ui.visuals().extreme_bg_color;
+    let hair = settings_input_border(ui);
+    let input = ui.visuals().panel_fill;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(total, h), egui::Sense::hover());
     ui.painter().rect(
         rect,
@@ -1017,11 +1205,11 @@ fn stepper(ui: &mut egui::Ui, value: &mut i64, step: i64, min: i64, max: i64, un
 /// stepper의 f32 변형 — 소수 step(폰트 0.5px 등). 정수값은 정수로, 아니면 소수 1자리 표시.
 fn stepper_f32(ui: &mut egui::Ui, value: &mut f32, step: f32, min: f32, max: f32) -> bool {
     let h = CONTROL_HEIGHT;
-    let btn_w = 28.0;
-    let val_w = 76.0;
+    let btn_w = 44.0;
+    let val_w = 138.0;
     let total = val_w + btn_w * 2.0;
-    let hair = ui.visuals().widgets.noninteractive.bg_stroke.color;
-    let input = ui.visuals().extreme_bg_color;
+    let hair = settings_input_border(ui);
+    let input = ui.visuals().panel_fill;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(total, h), egui::Sense::hover());
     ui.painter().rect(
         rect,
@@ -1116,7 +1304,7 @@ fn general_page(
             let items = [
                 (
                     Theme::System,
-                    Icon::Monitor,
+                    Icon::SystemIndicator,
                     catalog.t("settings.theme.system", &[]),
                 ),
                 (
@@ -1141,58 +1329,13 @@ fn general_page(
             // 시스템 폰트 스캔은 파일 IO — 프로세스당 1회 캐시(새 폰트는 재시작 후 표시).
             static FONT_OPTIONS: std::sync::LazyLock<Vec<(String, String)>> =
                 std::sync::LazyLock::new(crate::fonts::ui_font_options);
-            let current_label = config
-                .ui
-                .ui_font
-                .as_deref()
-                .and_then(|p| {
-                    FONT_OPTIONS
-                        .iter()
-                        .find(|(_, path)| path == p)
-                        .map(|(name, _)| name.clone())
-                })
-                .unwrap_or_else(|| catalog.t("settings.ui_font.auto", &[]));
-            // 언어 콤보와 동일한 커스텀 박스(중앙 텍스트 + ▾ 도형) — 기본 ComboBox는
-            // 스타일이 달라 컴포넌트가 튀었다(사용자 #5).
-            let w = 180.0;
-            let h = CONTROL_HEIGHT;
-            let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
-            let hair = ui.visuals().widgets.noninteractive.bg_stroke.color;
-            let bg = if resp.hovered() {
-                ui.visuals().widgets.hovered.bg_fill
-            } else {
-                ui.visuals().extreme_bg_color
-            };
-            ui.painter().rect(
-                rect,
-                0.0,
-                bg,
-                egui::Stroke::new(1.0, hair),
-                egui::StrokeKind::Inside,
+            let current_label = crate::fonts::effective_ui_font_name(
+                config.ui.ui_font.as_deref(),
+                FONT_OPTIONS.as_slice(),
             );
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                current_label,
-                egui::FontId::proportional(CONTROL_TEXT_SIZE),
-                ui.visuals().text_color(),
-            );
-            {
-                let ax = rect.right() - 12.0;
-                let cy = rect.center().y;
-                let d = 3.5;
-                ui.painter().add(egui::Shape::convex_polygon(
-                    vec![
-                        egui::pos2(ax - d, cy - d * 0.6),
-                        egui::pos2(ax + d, cy - d * 0.6),
-                        egui::pos2(ax, cy + d * 0.7),
-                    ],
-                    ui.visuals().weak_text_color(),
-                    egui::Stroke::NONE,
-                ));
-            }
+            let resp = settings_select_button(ui, &current_label);
             egui::Popup::menu(&resp).show(|ui| {
-                ui.set_min_width(w);
+                ui.set_min_width(SETTINGS_DETAIL.select_width);
                 if ui
                     .selectable_label(
                         config.ui.ui_font.is_none(),
@@ -1257,48 +1400,10 @@ fn language_page(
         &catalog.t("settings.locale", &[]),
         Some(&catalog.t("settings.locale.hint", &[])),
         |ui| {
-            // egui ComboBox는 selected_text를 좌측정렬(하드코딩)이라 텍스트 중앙정렬이 안 된다
-            // → 커스텀 박스(중앙 텍스트 + ▾) + Popup::menu로 구현한다(#6).
-            let w = 130.0;
-            let h = CONTROL_HEIGHT;
-            let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
-            let hair = ui.visuals().widgets.noninteractive.bg_stroke.color;
-            let bg = if resp.hovered() {
-                ui.visuals().widgets.hovered.bg_fill
-            } else {
-                ui.visuals().extreme_bg_color
-            };
-            ui.painter().rect(
-                rect,
-                0.0,
-                bg,
-                egui::Stroke::new(1.0, hair),
-                egui::StrokeKind::Inside,
-            );
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                current_locale_label(&config.i18n.locale, catalog),
-                egui::FontId::proportional(CONTROL_TEXT_SIZE),
-                ui.visuals().text_color(),
-            );
-            // 아래 화살표 — ▾ 문자는 폰트에 없어 □로 깨진다(사용자). 도형 삼각형으로 그린다.
-            {
-                let ax = rect.right() - 12.0;
-                let cy = rect.center().y;
-                let d = 3.5;
-                ui.painter().add(egui::Shape::convex_polygon(
-                    vec![
-                        egui::pos2(ax - d, cy - d * 0.6),
-                        egui::pos2(ax + d, cy - d * 0.6),
-                        egui::pos2(ax, cy + d * 0.7),
-                    ],
-                    ui.visuals().weak_text_color(),
-                    egui::Stroke::NONE,
-                ));
-            }
+            let locale_label = current_locale_label(&config.i18n.locale, catalog);
+            let resp = settings_select_button(ui, &locale_label);
             egui::Popup::menu(&resp).show(|ui| {
-                ui.set_min_width(w);
+                ui.set_min_width(SETTINGS_DETAIL.select_width);
                 for (locale, key) in [
                     (i18n::FALLBACK_LOCALE, "settings.locale.en_us"),
                     ("ja-JP", "settings.locale.ja_jp"),
@@ -1417,7 +1522,7 @@ fn remote_page(
         ui.colored_label(
             ui.visuals().error_fg_color,
             egui::RichText::new(catalog.t("settings.start_failed", &[("message", err)]))
-                .size(ROW_DESC_SIZE),
+                .size(SETTINGS_TYPE.row_description),
         );
         ui.add_space(7.0);
         crate::ui::hairline(ui);
@@ -1440,7 +1545,7 @@ fn remote_page(
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
                     egui::RichText::new(catalog.t("settings.token_sensitive_warning", &[]))
-                        .size(ROW_DESC_SIZE),
+                        .size(SETTINGS_TYPE.row_description),
                 );
             } else {
                 hint_text(ui, catalog.t("settings.token_hidden_hint", &[]));
@@ -1464,7 +1569,7 @@ fn remote_page(
                 ui.label(
                     egui::RichText::new(truncate_fingerprint(fp, 17))
                         .weak()
-                        .size(ROW_DESC_SIZE),
+                        .size(SETTINGS_TYPE.row_description),
                 );
                 if ui.button(catalog.t("settings.forget", &[])).clicked() {
                     *remote_action = RemoteAction::Forget(host.clone());
@@ -1485,7 +1590,29 @@ fn truncate_fingerprint(fp: &str, keep: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{nav_matches, truncate_fingerprint};
+    use super::{SETTINGS_DETAIL, SETTINGS_TYPE, nav_matches, truncate_fingerprint};
+
+    #[test]
+    fn 모양_화면_타이포그래피는_참조_font_map을_고정한다() {
+        assert_eq!(SETTINGS_TYPE.page_title, 15.0);
+        assert_eq!(SETTINGS_TYPE.section_title, 14.0);
+        assert_eq!(SETTINGS_TYPE.row_title, 14.0);
+        assert_eq!(SETTINGS_TYPE.row_description, 13.0);
+        assert_eq!(SETTINGS_TYPE.control, 14.0);
+    }
+
+    #[test]
+    fn 모양_화면_컴포넌트_치수는_참조값을_고정한다() {
+        assert_eq!(SETTINGS_DETAIL.pad_x, 26.0);
+        assert_eq!(SETTINGS_DETAIL.pad_top, 20.0);
+        assert_eq!(SETTINGS_DETAIL.pad_bottom, 40.0);
+        assert_eq!(SETTINGS_DETAIL.row_height, 68.0);
+        assert_eq!(SETTINGS_DETAIL.control_column, 360.0);
+        assert_eq!(SETTINGS_DETAIL.column_gap, 20.0);
+        assert_eq!(SETTINGS_DETAIL.control_height, 34.0);
+        assert_eq!(SETTINGS_DETAIL.select_width, 230.0);
+        assert_eq!(SETTINGS_DETAIL.segment_width, 104.0);
+    }
 
     #[test]
     fn 지문_짧으면_그대로() {

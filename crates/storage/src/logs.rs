@@ -21,7 +21,14 @@ pub struct SessionLogWriter {
 impl SessionLogWriter {
     /// `logs_root/<session id>/` 아래에 세 파일을 append 모드로 연다.
     pub fn open(logs_root: &Path, session: SessionId) -> anyhow::Result<Self> {
-        let dir = logs_root.join(session.0.to_string());
+        Self::open_key(logs_root, &session.0.to_string())
+    }
+
+    /// 영속 세션 id를 디렉터리 키로 사용해 로그를 연다. 런타임의 숫자 SessionId는
+    /// 프로세스 재시작마다 다시 1부터 시작하므로, 재시작 복원 대상은 이 API를 써야
+    /// 이전 ANSI 로그와 같은 파일에 계속 append할 수 있다.
+    pub fn open_key(logs_root: &Path, session_key: &str) -> anyhow::Result<Self> {
+        let dir = Self::session_dir_key(logs_root, session_key)?;
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("로그 디렉터리 생성 실패: {}", dir.display()))?;
         Ok(Self {
@@ -34,6 +41,28 @@ impl SessionLogWriter {
 
     pub fn session_dir(logs_root: &Path, session: SessionId) -> PathBuf {
         logs_root.join(session.0.to_string())
+    }
+
+    /// 저장된 ANSI 로그를 복원할 때 사용하는 경로. key는 DB가 발급한 UUID지만,
+    /// 방어적으로 단일 파일명 성분만 허용해 경로 탈출을 막는다.
+    pub fn session_dir_key(logs_root: &Path, session_key: &str) -> anyhow::Result<PathBuf> {
+        let mut components = Path::new(session_key).components();
+        let valid = matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none();
+        anyhow::ensure!(
+            valid && !session_key.is_empty(),
+            "유효하지 않은 session log key"
+        );
+        Ok(logs_root.join(session_key))
+    }
+
+    pub fn ansi_path(logs_root: &Path, session_key: &str) -> anyhow::Result<PathBuf> {
+        Ok(Self::session_dir_key(logs_root, session_key)?.join("redacted.ansi.log"))
+    }
+
+    /// append 재개 시 offset을 기존 파일 길이부터 이어가기 위한 길이 조회.
+    pub fn ansi_len(&self) -> std::io::Result<u64> {
+        self.ansi.metadata().map(|metadata| metadata.len())
     }
 
     /// redaction이 끝난 출력 chunk를 기록한다.
@@ -221,6 +250,25 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("\"event\":\"spawned\""));
         assert!(lines[1].contains("exit code 0"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn 영속_session_key는_ansi를_이어쓰고_경로탈출을_거부한다() {
+        let root = temp_root("persistent-key");
+        let key = "019f3804-586d-7ca3-9386-1cbc8710ca08";
+        {
+            let mut writer = SessionLogWriter::open_key(&root, key).unwrap();
+            writer.append_output(b"\x1b[36mkept\x1b[0m").unwrap();
+            writer.flush();
+        }
+        assert_eq!(
+            std::fs::read(SessionLogWriter::ansi_path(&root, key).unwrap()).unwrap(),
+            b"\x1b[36mkept\x1b[0m"
+        );
+        for invalid in ["", ".", "..", "../escape", "nested/session", "/tmp/escape"] {
+            assert!(SessionLogWriter::session_dir_key(&root, invalid).is_err());
+        }
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

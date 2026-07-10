@@ -32,11 +32,10 @@ pub struct EnvProfilesUi {
     show_profile_controls: bool,
     profiles: Option<Vec<EnvProfileRow>>,
     vars: Option<Vec<EnvVarRow>>,
-    /// secret 평문 캐시 — vars 로드 시 일괄 resolve(keyring, 캐시 미스 프레임 1회).
-    /// **기본이 노출**(개인 로컬 서비스, 사용자 2026-07-09)이라 렌더마다 조회하지 않도록
-    /// 캐시한다. 전환/삭제/동기화 시 비움.
+    /// 사용자가 ○ 토글로 명시적으로 연 secret 평문 캐시. 참조 화면과 안전한 기본값에
+    /// 맞춰 secret은 처음에 마스킹하며, keyring 조회도 reveal 시점에만 요청한다.
     revealed: std::collections::HashMap<(String, String), String>,
-    /// dot(●) 토글로 **가린** 키들 — 기본은 노출, 켜면 마스킹.
+    /// dot(●) 토글로 가린 키들 — secret은 로드 시 기본으로 포함한다.
     masked: std::collections::HashSet<(String, String)>,
     /// credential 메타 캐시 — 매 프레임 list_credentials() 동기 SQLite 조회 방지.
     /// credential은 workspace와 무관한 전역 데이터라 workspace 전환 시 버리지 않는다.
@@ -220,17 +219,22 @@ impl EnvProfilesUi {
                 self.masked.retain(|(masked_profile, key)| {
                     masked_profile != &profile_id || live_keys.contains(key.as_str())
                 });
+                for var in &v {
+                    if matches!(var.value, EnvValue::Secret { .. }) {
+                        self.masked.insert((profile_id.clone(), var.key.clone()));
+                    }
+                }
                 self.vars = Some(v.clone());
                 v
             }
         };
-        // 기본 노출 정책은 유지하되, callback은 App의 background keyring worker에 요청만
-        // 넣는다. 결과가 도착한 다음 프레임에도 vars cache가 Some이므로 매 프레임 아직
-        // 비어 있는 항목만 확인해야 평문 cache가 채워진다.
+        // secret은 기본 마스킹한다. 사용자가 ○를 눌러 masked에서 빠진 항목만 App의
+        // background keyring worker에 요청하고, 결과가 오는 프레임에 평문 cache를 채운다.
         for var in &vars {
             if let EnvValue::Secret { credential_id } = &var.value {
                 let id = (profile_id.clone(), var.key.clone());
-                if !self.revealed.contains_key(&id)
+                if !self.masked.contains(&id)
+                    && !self.revealed.contains_key(&id)
                     && let Some(plain) = reveal_secret(credential_id)
                 {
                     self.revealed.insert(id, plain);
@@ -240,11 +244,12 @@ impl EnvProfilesUi {
 
         // 환경 변수: api-like 분리 없이 **전부 한 표**로(#1/#4). API 키는 App이 별도
         // 자격증명 섹션으로 렌더한다 — 여기서 두 번째 "API Keys" 섹션은 만들지 않는다.
+        let add_label = format!("+ {}", catalog.t("action.add", &[]));
         if env_api_section_header(
             ui,
             &catalog.t("env.env_vars", &[]),
             Some(vars.len()),
-            Some(&catalog.t("env.add_key", &[])),
+            Some(&add_label),
         ) {
             // 토글(P2) — 스크린샷은 기본 표만, 폼은 '+ 추가'를 눌렀을 때만.
             self.show_add_form = !self.show_add_form;
@@ -261,7 +266,7 @@ impl EnvProfilesUi {
         for var in &vars {
             let reveal_id = (profile_id.clone(), var.key.clone());
             let is_masked = self.masked.contains(&reveal_id);
-            // 기본 노출 — 가림 토글이 켜진 행만 마스킹(사용자 2026-07-09).
+            // secret은 기본 마스킹, plain은 기본 노출이며 dot 토글로 상태를 바꾼다.
             let revealed_value = if is_masked {
                 None
             } else {
@@ -274,19 +279,16 @@ impl EnvProfilesUi {
             if row.toggle_reveal {
                 toggle_mask = Some(var.key.clone());
             }
-            env_table_divider(ui);
         }
         if let Some(key) = toggle_mask {
             let id = (profile_id.clone(), key);
             if !self.masked.remove(&id) {
+                self.revealed.remove(&id);
                 self.masked.insert(id);
             }
         }
-        if vars.is_empty() {
-            if env_empty_placeholder_row(ui, catalog) {
-                self.show_add_form = true;
-            }
-            env_table_divider(ui);
+        if vars.is_empty() && env_empty_placeholder_row(ui, catalog) {
+            self.show_add_form = true;
         }
 
         if self.show_add_form
@@ -344,7 +346,7 @@ impl EnvProfilesUi {
         if let Some(key) = delete_key {
             let id = (profile_id.clone(), key.clone());
             self.revealed.remove(&id);
-            self.masked.remove(&id); // 재추가 시 '기본 노출'이 tombstone에 가려지지 않게
+            self.masked.remove(&id); // 같은 이름의 새 변수에 삭제 전 토글 상태가 남지 않게
             self.error = None;
             if is_dotenv {
                 // 8번(codex Med 반영): DB를 먼저 지우지 않는다 — 파일 라인 제거 후
@@ -359,7 +361,7 @@ impl EnvProfilesUi {
 
         // 미리보기 블록은 제거(P3) — 스크린샷은 표 중심. OS override 정보는 각 행
         // dot hover 툴팁으로 제공(정보 손실 없음).
-        if !controls_visible {
+        if !controls_visible && self.show_add_form {
             // 기본 숨김(P1)이어도 프로파일 관리 진입점은 남긴다 — 작은 weak 링크(codex Med).
             ui.add_space(10.0);
             let link = ui.add(
@@ -392,72 +394,115 @@ fn env_api_section_header(
     action_label: Option<&str>,
 ) -> bool {
     let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::hover());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::hover());
     let painter = ui.painter();
     let y = rect.center().y;
     let mut x = rect.left();
+    let title_font = egui::FontId::monospace(14.0);
     painter.text(
         egui::pos2(x, y),
         egui::Align2::LEFT_CENTER,
         title,
-        egui::FontId::proportional(14.0),
+        title_font.clone(),
         ui.visuals().text_color(),
     );
     x += painter
-        .layout_no_wrap(
-            title.to_owned(),
-            egui::FontId::proportional(14.0),
-            ui.visuals().text_color(),
-        )
+        .layout_no_wrap(title.to_owned(), title_font, ui.visuals().text_color())
         .rect
         .width()
-        + 10.0;
+        + 6.0;
     if let Some(count) = count {
         let count_text = count.to_string();
         let count_rect =
-            egui::Rect::from_center_size(egui::pos2(x + 14.0, y), egui::vec2(28.0, 28.0));
-        painter.rect_filled(count_rect, 0.0, ui.visuals().faint_bg_color);
+            egui::Rect::from_center_size(egui::pos2(x + 10.0, y), egui::vec2(20.0, 20.0));
+        let tag = if ui.visuals().dark_mode {
+            egui::Color32::from_rgb(0x2a, 0x3a, 0x44)
+        } else {
+            egui::Color32::from_rgb(0xd0, 0xe8, 0xf4)
+        };
+        painter.rect_filled(count_rect, 0.0, tag);
         painter.text(
             count_rect.center(),
             egui::Align2::CENTER_CENTER,
             count_text,
-            egui::FontId::proportional(13.0),
+            egui::FontId::monospace(12.0),
             ui.visuals().hyperlink_color,
         );
     }
 
+    let mut clicked = false;
     if let Some(action_label) = action_label {
-        let button_w = 72.0;
+        let label_font = egui::FontId::monospace(13.0);
+        let label_width = painter
+            .layout_no_wrap(
+                action_label.to_owned(),
+                label_font.clone(),
+                ui.visuals().weak_text_color(),
+            )
+            .rect
+            .width();
+        let button_w = (label_width + 16.0).max(58.0);
         let button_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.right() - button_w, rect.center().y - 14.0),
-            egui::vec2(button_w, 28.0),
+            egui::pos2(rect.right() - button_w, rect.center().y - 13.0),
+            egui::vec2(button_w, 26.0),
         );
-        return ui
-            .put(button_rect, egui::Button::new(action_label))
-            .clicked();
+        let response = ui.interact(
+            button_rect,
+            ui.id().with(("env_api_section_add", title)),
+            egui::Sense::click(),
+        );
+        let hovered = response.hovered();
+        let fill = if hovered {
+            ui.visuals().selection.bg_fill
+        } else {
+            ui.visuals().extreme_bg_color
+        };
+        let stroke = if hovered {
+            ui.visuals().selection.bg_fill
+        } else {
+            ui.visuals().widgets.noninteractive.bg_stroke.color
+        };
+        painter.rect_filled(button_rect, 0.0, fill);
+        painter.rect_stroke(
+            button_rect,
+            0.0,
+            egui::Stroke::new(1.0, stroke),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            button_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            action_label,
+            label_font,
+            if hovered {
+                egui::Color32::WHITE
+            } else {
+                ui.visuals().weak_text_color()
+            },
+        );
+        clicked = response.clicked();
     }
-    false
+    paint_table_hline(ui, rect.bottom());
+    clicked
 }
 
 fn env_table_header(ui: &mut egui::Ui, columns: &[String]) {
-    ui.add_space(2.0);
-    env_table_divider(ui);
     let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
     let cols = env_table_columns(rect);
     let painter = ui.painter();
     let color = ui.visuals().weak_text_color();
-    let font = egui::FontId::proportional(12.0);
+    let font = egui::FontId::monospace(12.0);
     for (idx, column) in columns.iter().take(2).enumerate() {
         painter.text(
-            egui::pos2(cols[idx].left() + 6.0, rect.center().y),
+            egui::pos2(cols[idx].left(), rect.center().y),
             egui::Align2::LEFT_CENTER,
             column,
             font.clone(),
             color,
         );
     }
-    env_table_divider(ui);
+    paint_table_hline(ui, rect.bottom());
 }
 
 struct EnvRowResponse {
@@ -474,7 +519,7 @@ fn env_table_row(
     catalog: &i18n::Catalog,
 ) -> EnvRowResponse {
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 46.0), egui::Sense::hover());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
     if response.hovered() {
         ui.painter()
             .rect_filled(rect, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
@@ -484,25 +529,17 @@ fn env_table_row(
     let painter = ui.painter();
     let y = rect.center().y;
     painter.with_clip_rect(cols[0]).text(
-        egui::pos2(cols[0].left() + 6.0, y),
+        egui::pos2(cols[0].left() + 2.0, y),
         egui::Align2::LEFT_CENTER,
         &var.key,
-        egui::FontId::proportional(14.0),
+        egui::FontId::monospace(14.0),
         ui.visuals().hyperlink_color,
     );
     let value_text = if is_masked {
-        // 가림 토글 켜짐 — plain/secret 모두 마스킹(secret은 credential 힌트 형태).
-        match &var.value {
-            EnvValue::Plain(_) => "••••••••".to_owned(),
-            EnvValue::Secret { .. } => display_env_value(
-                &var.value,
-                credentials,
-                &catalog.t("env.deleted_credential", &[]),
-            ),
-        }
+        "••••••••••••••••".to_owned()
     } else {
         match revealed_value {
-            // 기본 노출 — secret은 로드 시 resolve된 평문 캐시(2026-07-09).
+            // 사용자가 연 secret은 background worker가 resolve한 평문 cache를 표시한다.
             Some(plain) => plain.to_owned(),
             None => display_env_value(
                 &var.value,
@@ -512,16 +549,16 @@ fn env_table_row(
         }
     };
     painter.with_clip_rect(cols[1]).text(
-        egui::pos2(cols[1].left() + 6.0, y),
+        egui::pos2(cols[1].left() + 2.0, y),
         egui::Align2::LEFT_CENTER,
         value_text,
-        egui::FontId::proportional(14.0),
+        egui::FontId::monospace(14.0),
         ui.visuals().text_color(),
     );
 
-    // dot 토글: **꺼짐(○)=노출(기본)**, 켜짐(● accent)=가림(사용자 2026-07-09).
+    // dot 토글: ○=노출, ● accent=가림. secret은 안전하게 ●가 기본이다.
     // hover 툴팁: secret은 keyring 저장 안내, plain은 OS override 여부.
-    let dot_center = egui::pos2(rect.right() - 72.0, y);
+    let dot_center = cols[2].center();
     let is_secret = matches!(var.value, EnvValue::Secret { .. });
     let has_os_override = std::env::var_os(&var.key).is_some();
     let (dot_text, dot_color) = if is_masked {
@@ -533,10 +570,10 @@ fn env_table_row(
         dot_center,
         egui::Align2::CENTER_CENTER,
         dot_text,
-        egui::FontId::proportional(12.0),
+        egui::FontId::monospace(12.0),
         dot_color,
     );
-    let dot_rect = egui::Rect::from_center_size(dot_center, egui::vec2(20.0, 20.0));
+    let dot_rect = egui::Rect::from_center_size(dot_center, egui::vec2(22.0, 18.0));
     // secret이면서 OS env에도 같은 키가 있으면 두 정보를 함께(정보 손실 방지 — codex Low).
     let mut hover = String::new();
     if is_secret {
@@ -563,9 +600,16 @@ fn env_table_row(
     if !hover.is_empty() {
         dot_resp.on_hover_text(hover);
     }
+    if response.hovered() {
+        painter.rect_stroke(
+            dot_rect,
+            0.0,
+            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+            egui::StrokeKind::Inside,
+        );
+    }
 
-    let delete_rect =
-        egui::Rect::from_center_size(egui::pos2(rect.right() - 40.0, y), egui::vec2(22.0, 18.0));
+    let delete_rect = egui::Rect::from_center_size(cols[3].center(), egui::vec2(22.0, 18.0));
     let delete = ui
         .interact(
             delete_rect,
@@ -576,8 +620,10 @@ fn env_table_row(
     let hovered = delete.hovered();
     let stroke = if hovered {
         ui.visuals().error_fg_color
-    } else {
+    } else if response.hovered() {
         ui.visuals().widgets.noninteractive.bg_stroke.color
+    } else {
+        egui::Color32::TRANSPARENT
     };
     let fill = if hovered {
         ui.visuals().error_fg_color
@@ -600,9 +646,11 @@ fn env_table_row(
         delete_rect.center(),
         egui::Align2::CENTER_CENTER,
         "×",
-        egui::FontId::proportional(11.0),
+        egui::FontId::monospace(11.0),
         text,
     );
+    paint_table_hline(ui, rect.top());
+    paint_table_hline(ui, rect.bottom());
     EnvRowResponse {
         delete: delete.clicked(),
         toggle_reveal,
@@ -611,7 +659,7 @@ fn env_table_row(
 
 fn env_empty_placeholder_row(ui: &mut egui::Ui, catalog: &i18n::Catalog) -> bool {
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 46.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::click());
     if response.hovered() {
         ui.painter()
             .rect_filled(rect, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
@@ -624,68 +672,72 @@ fn env_empty_placeholder_row(ui: &mut egui::Ui, catalog: &i18n::Catalog) -> bool
     let cols = env_table_columns(rect);
     let y = rect.center().y;
     ui.painter().with_clip_rect(cols[0]).text(
-        egui::pos2(cols[0].left() + 6.0, y),
+        egui::pos2(cols[0].left() + 2.0, y),
         egui::Align2::LEFT_CENTER,
         "NEW_VAR",
-        egui::FontId::proportional(14.0),
+        egui::FontId::monospace(14.0),
         ui.visuals().hyperlink_color,
     );
     ui.painter().with_clip_rect(cols[1]).text(
-        egui::pos2(cols[1].left() + 6.0, y),
+        egui::pos2(cols[1].left() + 2.0, y),
         egui::Align2::LEFT_CENTER,
         catalog.t("env.empty_value_placeholder", &[]),
-        egui::FontId::proportional(14.0),
+        egui::FontId::monospace(14.0),
         ui.visuals().weak_text_color(),
     );
 
-    let override_center = egui::pos2(rect.right() - 72.0, y);
+    let override_center = cols[2].center();
     ui.painter().text(
         override_center,
         egui::Align2::CENTER_CENTER,
         "○",
-        egui::FontId::proportional(12.0),
+        egui::FontId::monospace(12.0),
         ui.visuals().weak_text_color(),
     );
-    let delete_rect =
-        egui::Rect::from_center_size(egui::pos2(rect.right() - 40.0, y), egui::vec2(22.0, 18.0));
-    ui.painter().rect_stroke(
-        delete_rect,
-        0.0,
-        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
-        egui::StrokeKind::Inside,
-    );
+    let delete_rect = egui::Rect::from_center_size(cols[3].center(), egui::vec2(22.0, 18.0));
     ui.painter().text(
         delete_rect.center(),
         egui::Align2::CENTER_CENTER,
         "×",
-        egui::FontId::proportional(11.0),
+        egui::FontId::monospace(11.0),
         ui.visuals().weak_text_color(),
     );
+    paint_table_hline(ui, rect.top());
+    paint_table_hline(ui, rect.bottom());
     clicked
 }
 
-fn env_table_columns(rect: egui::Rect) -> [egui::Rect; 2] {
-    let action_w = 92.0;
-    let content = egui::Rect::from_min_max(
-        rect.min,
-        egui::pos2((rect.right() - action_w).max(rect.left()), rect.bottom()),
+fn env_table_columns(rect: egui::Rect) -> [egui::Rect; 4] {
+    const GAP: f32 = 4.0;
+    const ACTION_W: f32 = 24.0;
+    let flexible = ((rect.width() - ACTION_W * 2.0 - GAP * 3.0).max(0.0)) / 2.0;
+    let key = egui::Rect::from_min_size(rect.min, egui::vec2(flexible, rect.height()));
+    let value = egui::Rect::from_min_size(
+        egui::pos2(key.right() + GAP, rect.top()),
+        egui::vec2(flexible, rect.height()),
     );
-    let key_w = content.width() * 0.45;
-    let key = egui::Rect::from_min_size(content.min, egui::vec2(key_w, content.height()));
-    let value = egui::Rect::from_min_max(
-        egui::pos2(key.right(), content.top()),
-        egui::pos2(content.right(), content.bottom()),
+    let mask = egui::Rect::from_min_size(
+        egui::pos2(value.right() + GAP, rect.top()),
+        egui::vec2(ACTION_W, rect.height()),
     );
-    [key, value]
+    let delete = egui::Rect::from_min_size(
+        egui::pos2(mask.right() + GAP, rect.top()),
+        egui::vec2(ACTION_W, rect.height()),
+    );
+    [key, value, mask, delete]
+}
+
+fn paint_table_hline(ui: &egui::Ui, y: f32) {
+    let color = ui.visuals().widgets.noninteractive.bg_stroke.color;
+    let y = ui.painter().round_to_pixel_center(y);
+    ui.painter()
+        .hline(ui.min_rect().x_range(), y, egui::Stroke::new(1.0, color));
 }
 
 fn env_table_divider(ui: &mut egui::Ui) {
-    let color = ui.visuals().widgets.noninteractive.bg_stroke.color;
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
-    let y = ui.painter().round_to_pixel_center(rect.center().y);
-    ui.painter()
-        .hline(rect.x_range(), y, egui::Stroke::new(1.0, color));
+    paint_table_hline(ui, rect.center().y);
 }
 
 fn display_env_value(
@@ -698,13 +750,8 @@ fn display_env_value(
         EnvValue::Secret { credential_id } => credentials
             .iter()
             .find(|c| &c.id == credential_id)
-            .map(|c| {
-                c.masked_hint
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("••••••••••••")
-                    .to_owned()
-            })
+            // 참조 화면처럼 접미사도 노출하지 않고 완전히 마스킹한다.
+            .map(|_| "••••••••••••••••".to_owned())
             .unwrap_or_else(|| format!("[{deleted_label}]")),
     }
 }
@@ -921,4 +968,20 @@ fn compact_profile_form(
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::env_table_columns;
+
+    #[test]
+    fn env_columns는_두_flex열과_두_action열을_정확히_배치한다() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(841.0, 30.0));
+        let columns = env_table_columns(rect);
+        assert_eq!(columns[0].width(), 390.5);
+        assert_eq!(columns[1].width(), 390.5);
+        assert_eq!(columns[2].width(), 24.0);
+        assert_eq!(columns[3].width(), 24.0);
+        assert_eq!(columns[3].right(), rect.right());
+    }
 }

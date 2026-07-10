@@ -8,6 +8,8 @@ action.new = 新規
 action.save = 保存
 action.stop = 停止
 action.add = 追加
+action.show_secret = シークレットを表示
+action.hide_secret = シークレットを隠す
 action.run = 実行
 action.allow = 許可
 action.deny = 拒否
@@ -49,7 +51,7 @@ settings.status_hooks = エージェント状態フック
 settings.status_hooks.hint = claude/codexにフックを設定し承認/入力待ちを正確に検知（オフ=画面推測のみ）
 settings.locale.hint = 韓国語・英語・日本語・中国語(簡体/繁体)（同梱）
 settings.scrollback.hint = hiddenセッションは自動で1,000行に縮小
-settings.output_batch.hint = 0・1は16msに正規化（idle repaint抑制）
+settings.output_batch.hint = 出力到着時に即時wake・連続更新は8msで結合（値はidleフォールバック上限）
 workspace.title = ワークスペース
 workspace.no_session = セッションなし
 workspace.connecting = 接続中...

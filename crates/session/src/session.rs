@@ -1,8 +1,10 @@
+use std::io::Read;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use deppy_core::SessionId;
 use pty::{
-    CommandSpec, PortablePtyBackend, ProcessIdentity, PtyBackend, PtyInputEnqueueResult, PtySession,
+    CommandSpec, PortablePtyBackend, ProcessIdentity, PtyBackend, PtyInputEnqueueResult,
+    PtyOutputWake, PtySession,
 };
 use terminal::{
     AlacrittyBackend, CellRange, TerminalBackend, TerminalCacheClass, TerminalCacheEvent,
@@ -72,7 +74,44 @@ impl Session {
         rows: u16,
         scrollback_lines: usize,
     ) -> anyhow::Result<Self> {
-        let mut pty = PortablePtyBackend.spawn(spec, cols, rows)?;
+        Self::spawn_with_spec_inner(id, kind, spec, cols, rows, scrollback_lines, None)
+    }
+
+    /// 런타임 worker용 spawn. PTY 출력 reader가 새 chunk를 받은 즉시 `output_wake`를
+    /// 호출해 고정 batch timeout을 기다리지 않고 terminal parser를 pump한다.
+    pub fn spawn_with_spec_and_output_wake(
+        id: SessionId,
+        kind: SessionKind,
+        spec: &CommandSpec,
+        cols: u16,
+        rows: u16,
+        scrollback_lines: usize,
+        output_wake: PtyOutputWake,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_with_spec_inner(
+            id,
+            kind,
+            spec,
+            cols,
+            rows,
+            scrollback_lines,
+            Some(output_wake),
+        )
+    }
+
+    fn spawn_with_spec_inner(
+        id: SessionId,
+        kind: SessionKind,
+        spec: &CommandSpec,
+        cols: u16,
+        rows: u16,
+        scrollback_lines: usize,
+        output_wake: Option<PtyOutputWake>,
+    ) -> anyhow::Result<Self> {
+        let mut pty = match output_wake {
+            Some(wake) => PortablePtyBackend.spawn_with_output_wake(spec, cols, rows, wake)?,
+            None => PortablePtyBackend.spawn(spec, cols, rows)?,
+        };
         let process_identity = pty.process_identity();
         let output = pty.take_output().expect("새 세션의 output 채널");
         Ok(Self {
@@ -110,7 +149,7 @@ impl Session {
         self.lifecycle
     }
 
-    /// PTY 출력을 terminal backend에 반영한다. batch tick마다 호출.
+    /// PTY 출력을 terminal backend에 반영한다. 출력 wake 또는 fallback tick마다 호출.
     /// `on_output`은 raw chunk마다 불린다 — 로그/status detector는
     /// backend 내부가 아니라 이 output stream 기반이다 (설계문서 4.1).
     pub fn pump(&mut self, mut on_output: impl FnMut(&[u8])) -> PumpResult {
@@ -222,6 +261,33 @@ impl Session {
     /// status detector용 경량 화면 텍스트 (snapshot 미생성 — PR-12 hidden 규칙).
     pub fn screen_text(&self) -> String {
         self.backend.screen_text()
+    }
+
+    /// 이전 실행의 redacted ANSI 로그를 같은 terminal parser에 다시 통과시켜
+    /// scrollback과 셀 색상을 복원한다. 로그는 chunk 단위로 읽으므로 큰 세션도
+    /// 파일 전체를 메모리에 올리지 않는다. 재생 중 생기는 터미널 질의 응답은 과거
+    /// 출력에 대한 것이므로 새 PTY에 보내지 않는다.
+    pub fn replay_ansi(&mut self, reader: &mut impl Read) -> anyhow::Result<u64> {
+        const REPLAY_CHUNK: usize = 64 * 1024;
+        let mut buffer = [0u8; REPLAY_CHUNK];
+        let mut replayed = 0u64;
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            if replayed == 0 {
+                // tail replay는 이전 파일의 SGR state를 알 수 없다. 새 parser가 ground인
+                // 상태에서 색/속성만 reset하고, 이후 로그의 ANSI가 정확히 다시 적용되게 한다.
+                self.backend.feed(b"\x1b[0m")?;
+            }
+            self.backend.feed(&buffer[..read])?;
+            replayed = replayed.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        }
+        if replayed > 0 {
+            self.mark_full_dirty();
+        }
+        Ok(replayed)
     }
 
     /// 입력 큐가 비었는가 — backpressure 해소 판정(2026-07-09). PTY가 이미 닫혔으면
@@ -483,6 +549,43 @@ mod tests {
         });
         // snapshot 후 dirty가 지워진다
         assert!(!session.pump(|_| {}).dirty);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ansi_replay는_글자와_truecolor를_복원한다() {
+        let spec = CommandSpec {
+            program: "/bin/cat".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(20), SessionKind::Shell, &spec, 80, 24, 100)
+                .unwrap();
+        let ansi = b"\x1b[38;2;12;34;56m\x1b[48;2;78;90;123mPERSIST-COLOR\x1b[0m\r\n";
+
+        assert_eq!(
+            session
+                .replay_ansi(&mut std::io::Cursor::new(ansi))
+                .unwrap(),
+            ansi.len() as u64
+        );
+        let snapshot = session.take_snapshot().unwrap();
+        let cell = snapshot
+            .visible_cells
+            .iter()
+            .find(|cell| cell.c == 'P')
+            .expect("replayed text");
+        assert_eq!(cell.fg, [12, 34, 56]);
+        assert_eq!(cell.bg, [78, 90, 123]);
+        assert_eq!(
+            snapshot.dirty_ranges,
+            vec![CellRange {
+                start: 0,
+                end: 80 * 24,
+            }]
+        );
     }
 
     #[test]

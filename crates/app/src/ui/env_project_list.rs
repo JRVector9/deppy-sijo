@@ -32,25 +32,24 @@ pub struct EnvProjectListStyle {
     pub name_font_size: f32,
     pub path_font_size: f32,
     pub count_font_size: f32,
-    pub row_text_offset_y: f32,
 }
 
 impl Default for EnvProjectListStyle {
     fn default() -> Self {
         Self {
             width: 220.0,
-            header_height: 34.0,
-            row_height: 58.0, // 세로 간격 축소(사용자 2026-07-09)
+            // 참조 목업(ProjectList.tsx)의 CSS logical px를 그대로 사용한다.
+            header_height: 42.0,
+            row_height: 76.0,
             padding_x: 10.0,
-            count_width: 46.0,
-            delete_width: 18.0,
-            gap: 14.0, // 이름 clip과 env/key 카운트 사이 여유 — 닿아 보임 방지(2026-07-09)
-            add_button_size: 16.0,
-            delete_button_height: 18.0,
+            count_width: 52.0,
+            delete_width: 22.0,
+            gap: 6.0,
+            add_button_size: 18.0,
+            delete_button_height: 20.0,
             name_font_size: 14.0,
             path_font_size: 12.0,
             count_font_size: 12.0,
-            row_text_offset_y: 11.0,
         }
     }
 }
@@ -69,9 +68,17 @@ impl EnvProjectListStyle {
 
 pub fn panel_bg(ui: &egui::Ui) -> egui::Color32 {
     if ui.visuals().dark_mode {
-        egui::Color32::from_rgb(0x20, 0x20, 0x20)
+        egui::Color32::from_rgb(0x1e, 0x1e, 0x1e)
     } else {
-        ui.visuals().faint_bg_color
+        egui::Color32::from_rgb(0xfa, 0xfa, 0xfa)
+    }
+}
+
+fn text_secondary(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(0xaa, 0xaa, 0xaa)
+    } else {
+        egui::Color32::from_rgb(0x44, 0x44, 0x44)
     }
 }
 
@@ -109,10 +116,7 @@ pub fn render_with_style(
         divider_color,
     );
 
-    let list_rect = egui::Rect::from_min_max(
-        egui::pos2(panel_rect.left(), header_rect.bottom() + 1.0),
-        panel_rect.right_bottom(),
-    );
+    let list_rect = egui::Rect::from_min_max(header_rect.left_bottom(), panel_rect.right_bottom());
 
     let mut action = if add_requested {
         EnvProjectListAction::AddRequested
@@ -142,7 +146,7 @@ pub fn render_with_style(
     // 통일한다. ui.available_width()는 ScrollArea 유무/레이아웃에 따라 달라져
     // 우측 경계선 침범 또는 빈 여백 띠의 원인이 됐다(2026-07-10).
     let row_width = list_rect.width();
-    let content_height = projects.len() as f32 * (style.row_height + 1.0);
+    let content_height = projects.len() as f32 * style.row_height;
     if content_height <= list_rect.height() {
         render_rows(
             &mut list_ui,
@@ -197,7 +201,6 @@ fn render_rows(
         if !matches!(next, EnvProjectListAction::None) {
             *action = next;
         }
-        row_divider(ui, row_width);
     }
 }
 
@@ -207,13 +210,13 @@ fn paint_header(
     style: &EnvProjectListStyle,
     catalog: &i18n::Catalog,
 ) -> bool {
-    // 다른 상세 페이지 제목(page_title: 15px strong)과 동일 속성(사용자 2026-07-09).
+    // ProjectList.tsx: 13px muted label, 10px horizontal inset.
     ui.painter().text(
         egui::pos2(rect.left() + style.padding_x, rect.center().y),
         egui::Align2::LEFT_CENTER,
         catalog.t("env.projects", &[]),
-        egui::FontId::new(15.0, egui::FontFamily::Proportional),
-        ui.visuals().text_color(),
+        egui::FontId::monospace(13.0),
+        ui.visuals().weak_text_color(),
     );
 
     let add_rect = egui::Rect::from_center_size(
@@ -231,7 +234,7 @@ fn paint_header(
         )
         .on_hover_text(catalog.t("workspace.manager.new_hint", &[]));
     let add_fill = if add.hovered() {
-        ui.visuals().widgets.hovered.weak_bg_fill
+        ui.visuals().selection.bg_fill
     } else {
         ui.visuals().extreme_bg_color
     };
@@ -239,15 +242,23 @@ fn paint_header(
     ui.painter().rect_stroke(
         add_rect,
         0.0,
-        ui.visuals().widgets.noninteractive.bg_stroke,
+        if add.hovered() {
+            egui::Stroke::new(1.0, ui.visuals().selection.bg_fill)
+        } else {
+            ui.visuals().widgets.noninteractive.bg_stroke
+        },
         egui::StrokeKind::Inside,
     );
     ui.painter().text(
         add_rect.center(),
         egui::Align2::CENTER_CENTER,
         "+",
-        egui::FontId::proportional(16.0),
-        ui.visuals().text_color(),
+        egui::FontId::monospace(16.0),
+        if add.hovered() {
+            egui::Color32::WHITE
+        } else {
+            ui.visuals().weak_text_color()
+        },
     );
     add.clicked()
 }
@@ -278,16 +289,26 @@ fn render_row(
     };
 
     let painter = ui.painter();
-    // 선택/hover 배경은 위 divider(이전 행 경계)와 아래 divider까지 포함해
-    // 세로로 빈틈없이 칠한다(2026-07-10: 상하 밝은 줄 제거).
-    let fill_rect = egui::Rect::from_min_max(
-        egui::pos2(rect.left(), rect.top() - 1.0),
-        egui::pos2(rect.right(), rect.bottom() + 1.0),
+    painter.rect_filled(rect, 0.0, fill);
+    // CSS border-bottom: 1px. 별도 레이아웃 행을 소비하지 않아 총 행 높이가 76px다.
+    // 다음 행 fill이 이전 border를 덮어도 현재 top에서 같은 1px을 복원한다.
+    paint_hline(
+        painter,
+        rect.x_range().into(),
+        rect.top(),
+        ui.visuals().widgets.noninteractive.bg_stroke.color,
     );
-    painter.rect_filled(fill_rect, 0.0, fill);
+    paint_hline(
+        painter,
+        rect.x_range().into(),
+        rect.bottom(),
+        ui.visuals().widgets.noninteractive.bg_stroke.color,
+    );
 
     // 삭제 버튼은 이름/env count가 있는 위쪽 줄과 세로 중심을 맞춘다.
-    let delete_top = rect.center().y - style.row_text_offset_y - style.delete_button_height / 2.0;
+    let name_y = rect.top() + 23.0;
+    let path_y = rect.top() + 50.0;
+    let delete_top = name_y - style.delete_button_height / 2.0;
     let delete_rect = egui::Rect::from_min_size(
         egui::pos2(
             rect.right() - style.padding_x - style.delete_width,
@@ -303,12 +324,13 @@ fn render_row(
         egui::pos2(rect.left() + style.padding_x, rect.top()),
         egui::pos2(text_right, rect.center().y),
     );
-    let name_pos = egui::pos2(
-        rect.left() + style.padding_x,
-        rect.center().y - style.row_text_offset_y,
-    );
-    let name_font = egui::FontId::proportional(style.name_font_size);
-    let name_color = ui.visuals().text_color();
+    let name_pos = egui::pos2(rect.left() + style.padding_x, name_y);
+    let name_font = egui::FontId::monospace(style.name_font_size);
+    let name_color = if selected {
+        ui.visuals().text_color()
+    } else {
+        text_secondary(ui)
+    };
     // fonts.rs가 Regular 페이스만 등록해 Bold 지정이 불가 — 겹쳐그리기(faux-bold)는
     // 흐림을 유발하므로 쓰지 않고 한 번만 그린다(사용자 2026-07-09). 진짜 Bold가
     // 필요하면 fonts.rs에 Bold 페이스 등록이 선행돼야 한다.
@@ -328,17 +350,16 @@ fn render_row(
     // 경로가 사라진 프로젝트(rename 자동 복구 불가 — EXDEV/셸 부재)는 경고색으로.
     let path_color = if project.path_missing {
         ui.visuals().error_fg_color
+    } else if selected {
+        text_secondary(ui)
     } else {
         ui.visuals().weak_text_color()
     };
     painter.with_clip_rect(path_clip).text(
-        egui::pos2(
-            rect.left() + style.padding_x,
-            rect.center().y + style.row_text_offset_y,
-        ),
+        egui::pos2(rect.left() + style.padding_x, path_y),
         egui::Align2::LEFT_CENTER,
         path,
-        egui::FontId::proportional(style.path_font_size),
+        egui::FontId::monospace(style.path_font_size),
         path_color,
     );
     if project.path_missing {
@@ -352,23 +373,30 @@ fn render_row(
     }
 
     painter.text(
-        egui::pos2(count_right, rect.center().y - style.row_text_offset_y),
+        egui::pos2(count_right, name_y),
         egui::Align2::RIGHT_CENTER,
         format!("{}env", project.env_count),
-        egui::FontId::proportional(style.count_font_size),
-        ui.visuals().weak_text_color(),
+        egui::FontId::monospace(style.count_font_size),
+        if selected {
+            text_secondary(ui)
+        } else {
+            ui.visuals().weak_text_color()
+        },
     );
     painter.text(
-        egui::pos2(count_right, rect.center().y + style.row_text_offset_y),
+        egui::pos2(count_right, path_y),
         egui::Align2::RIGHT_CENTER,
         format!("{}key", project.key_count),
-        egui::FontId::proportional(style.count_font_size),
-        ui.visuals().weak_text_color(),
+        egui::FontId::monospace(style.count_font_size),
+        if selected {
+            text_secondary(ui)
+        } else {
+            ui.visuals().weak_text_color()
+        },
     );
 
-    // 삭제 ×는 마우스가 행 위에 있을 때만 — 벗어나면 사라진다(사용자 2026-07-09).
-    // 키보드/터치 접근 경로 없음은 로컬 데스크톱(마우스) 전제로 수용(codex Low).
-    if response.hovered() {
+    // 선택 행은 항상, 나머지는 hover 때만 ×를 노출한다.
+    if selected || response.hovered() {
         // 선택(활성) 행에서도 삭제 요청을 발행한다 — 확인 다이얼로그·활성 워크스페이스
         // 전환은 App(오케스트레이터) 담당(2026-07-10). 마지막 1개 제한만 유지.
         let delete_enabled = project_count > 1;
@@ -396,7 +424,7 @@ fn paint_delete_button(ui: &mut egui::Ui, rect: egui::Rect, danger: bool) {
     let fill = if danger {
         ui.visuals().error_fg_color
     } else {
-        ui.visuals().window_fill
+        egui::Color32::TRANSPARENT
     };
     let stroke = if danger {
         ui.visuals().error_fg_color
@@ -419,17 +447,9 @@ fn paint_delete_button(ui: &mut egui::Ui, rect: egui::Rect, danger: bool) {
         rect.center(),
         egui::Align2::CENTER_CENTER,
         "×",
-        egui::FontId::proportional(12.0),
+        egui::FontId::monospace(12.0),
         text,
     );
-}
-
-fn row_divider(ui: &mut egui::Ui, width: f32) {
-    // 행과 동일한 row_width를 그대로 사용 — available_width를 다시 재면 행 폭과
-    // 어긋나 우측 끝이 들쭉날쭉해진다(2026-07-10).
-    let color = ui.visuals().widgets.noninteractive.bg_stroke.color;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
-    paint_hline(ui.painter(), rect.x_range().into(), rect.center().y, color);
 }
 
 fn paint_hline(
@@ -442,7 +462,7 @@ fn paint_hline(
     painter.hline(x_range, y, egui::Stroke::new(1.0, color));
 }
 
-fn display_project_path(path: &str) -> String {
+pub fn display_project_path(path: &str) -> String {
     if path.trim().is_empty() {
         return "~".to_owned();
     }
@@ -454,4 +474,18 @@ fn display_project_path(path: &str) -> String {
         }
     }
     path.to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EnvProjectListStyle;
+
+    #[test]
+    fn reference_project_list는_220_42_76_grid를_쓴다() {
+        let style = EnvProjectListStyle::default();
+        assert_eq!(style.width, 220.0);
+        assert_eq!(style.header_height, 42.0);
+        assert_eq!(style.row_height, 76.0);
+        assert_eq!(style.padding_x, 10.0);
+    }
 }

@@ -138,12 +138,17 @@ pub fn render_with_style(
     );
     list_ui.set_width(style.width);
 
+    // 행/divider/선택 배경 폭은 전부 panel_rect(=패널 배경·헤더와 동일) 기준으로
+    // 통일한다. ui.available_width()는 ScrollArea 유무/레이아웃에 따라 달라져
+    // 우측 경계선 침범 또는 빈 여백 띠의 원인이 됐다(2026-07-10).
+    let row_width = list_rect.width();
     let content_height = projects.len() as f32 * (style.row_height + 1.0);
     if content_height <= list_rect.height() {
         render_rows(
             &mut list_ui,
             projects,
             active_id,
+            row_width,
             style,
             catalog,
             &mut action,
@@ -153,7 +158,7 @@ pub fn render_with_style(
             .id_salt("env_project_list_scroll")
             .auto_shrink([false, false])
             .show(&mut list_ui, |ui| {
-                render_rows(ui, projects, active_id, style, catalog, &mut action);
+                render_rows(ui, projects, active_id, row_width, style, catalog, &mut action);
             });
     }
 
@@ -164,6 +169,7 @@ fn render_rows(
     ui: &mut egui::Ui,
     projects: &[EnvProjectRow],
     active_id: &str,
+    row_width: f32,
     style: &EnvProjectListStyle,
     catalog: &i18n::Catalog,
     action: &mut EnvProjectListAction,
@@ -171,11 +177,11 @@ fn render_rows(
     ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
     for project in projects {
         let selected = project.id == active_id;
-        let next = render_row(ui, project, selected, projects.len(), style, catalog);
+        let next = render_row(ui, project, selected, projects.len(), row_width, style, catalog);
         if !matches!(next, EnvProjectListAction::None) {
             *action = next;
         }
-        row_divider(ui, style.width);
+        row_divider(ui, row_width);
     }
 }
 
@@ -235,15 +241,16 @@ fn render_row(
     project: &EnvProjectRow,
     selected: bool,
     project_count: usize,
+    row_width: f32,
     style: &EnvProjectListStyle,
     catalog: &i18n::Catalog,
 ) -> EnvProjectListAction {
     let bg = panel_bg(ui);
-    // 행 폭은 실제 가용 폭(스크롤바 예약 반영) — style.width 고정이면 우측 빈 띠,
-    // max(style.width)면 좁은 뷰포트에서 스크롤바 침범(codex Low).
-    let row_w = ui.available_width();
+    // 행 폭은 render_with_style이 잰 panel_rect 폭(row_width) 고정 — 패널 배경·
+    // 헤더·divider와 우측 끝이 항상 일치한다. 스크롤바는 floating(예약 폭 0)이라
+    // ScrollArea 유무와 무관하게 같은 폭이 유지된다(2026-07-10).
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(row_w, style.row_height), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(row_width, style.row_height), egui::Sense::click());
     let fill = if selected {
         tok_nav_active(ui)
     } else if response.hovered() {
@@ -344,18 +351,16 @@ fn render_row(
     // 삭제 ×는 마우스가 행 위에 있을 때만 — 벗어나면 사라진다(사용자 2026-07-09).
     // 키보드/터치 접근 경로 없음은 로컬 데스크톱(마우스) 전제로 수용(codex Low).
     if response.hovered() {
-        let delete_enabled = !selected && project_count > 1;
+        // 선택(활성) 행에서도 삭제 요청을 발행한다 — 확인 다이얼로그·활성 워크스페이스
+        // 전환은 App(오케스트레이터) 담당(2026-07-10). 마지막 1개 제한만 유지.
+        let delete_enabled = project_count > 1;
         let delete = ui
             .interact(
                 delete_rect,
                 ui.id().with(("env_project_delete", &project.id)),
                 egui::Sense::click(),
             )
-            .on_hover_text(if selected {
-                catalog.t("workspace.manager.delete_active_hint", &[])
-            } else {
-                catalog.t("action.delete", &[])
-            });
+            .on_hover_text(catalog.t("action.delete", &[]));
         paint_delete_button(ui, delete_rect, delete.hovered() && delete_enabled);
         if delete.clicked() && delete_enabled {
             return EnvProjectListAction::DeleteRequested(project.id.clone());
@@ -402,9 +407,9 @@ fn paint_delete_button(ui: &mut egui::Ui, rect: egui::Rect, danger: bool) {
 }
 
 fn row_divider(ui: &mut egui::Ui, width: f32) {
+    // 행과 동일한 row_width를 그대로 사용 — available_width를 다시 재면 행 폭과
+    // 어긋나 우측 끝이 들쭉날쭉해진다(2026-07-10).
     let color = ui.visuals().widgets.noninteractive.bg_stroke.color;
-    let _ = width;
-    let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
     paint_hline(ui.painter(), rect.x_range().into(), rect.center().y, color);
 }

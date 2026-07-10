@@ -12,6 +12,8 @@
 
 use std::path::Path;
 
+use anyhow::Context;
+
 use crate::env::EnvValue;
 use crate::storage::Db;
 
@@ -29,6 +31,70 @@ pub use runtime::dotenv::{is_secret_key, parse_dotenv};
 pub struct DotenvSyncReport {
     pub upserted: usize,
     pub removed: usize,
+}
+
+/// UI 편집을 `.env` 파일에 **라인 단위**로 반영한다(7·8번, 2026-07-10). 주석·순서 보존.
+/// - 대상 파일: 키가 이미 있는 파일(.env.local 우선순위 역순으로 탐색), 없으면 `.env`
+///   (파일이 없으면 생성). value=None이면 해당 라인 삭제.
+/// - 반영 후 mtime 폴링/명시 sync가 DB를 따라 갱신한다(.env가 단일 진실).
+pub fn write_env_var(root: &std::path::Path, key: &str, value: Option<&str>) -> anyhow::Result<()> {
+    // 키가 존재하는 파일 찾기 — 병합 우선순위가 높은 파일(.env.local)부터.
+    let mut target: Option<std::path::PathBuf> = None;
+    for name in DOTENV_FILE_NAMES.iter().rev() {
+        let path = root.join(name);
+        if let Ok(content) = std::fs::read_to_string(&path)
+            && parse_dotenv(&content).iter().any(|(k, _)| k == key)
+        {
+            target = Some(path);
+            break;
+        }
+    }
+    let path = target.unwrap_or_else(|| root.join(DOTENV_FILE_NAMES[0]));
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+
+    // 값 직렬화 — 파서가 이스케이프를 해석하지 않으므로(codex Med) 이스케이프 금지:
+    // 내부에 "가 있으면 '…'로 감싸고, "와 '를 둘 다 포함하면 라운드트립 불가라 거부.
+    let render = |v: &str| -> anyhow::Result<String> {
+        if v.contains('"') {
+            anyhow::ensure!(
+                !v.contains('\''),
+                "큰따옴표와 작은따옴표를 모두 포함한 값은 .env에 기록할 수 없습니다"
+            );
+            return Ok(format!("{key}='{v}'"));
+        }
+        if v.is_empty()
+            || v.chars()
+                .any(|c| c.is_whitespace() || c == '#' || c == '\'')
+        {
+            Ok(format!("{key}=\"{v}\""))
+        } else {
+            Ok(format!("{key}={v}"))
+        }
+    };
+
+    let mut lines: Vec<String> = content.lines().map(str::to_owned).collect();
+    let matches_key = |line: &str| -> bool {
+        let t = line.trim();
+        let t = t.strip_prefix("export ").unwrap_or(t).trim_start();
+        t.split_once('=')
+            .map(|(k, _)| k.trim() == key)
+            .unwrap_or(false)
+    };
+    let existing = lines.iter().position(|l| matches_key(l));
+    match (existing, value) {
+        (Some(idx), Some(v)) => lines[idx] = render(v)?,
+        (Some(idx), None) => {
+            lines.remove(idx);
+        }
+        (None, Some(v)) => lines.push(render(v)?),
+        (None, None) => return Ok(()), // 지울 것 없음
+    }
+    let mut out = lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    std::fs::write(&path, out).with_context(|| format!(".env 기록 실패: {}", path.display()))?;
+    Ok(())
 }
 
 /// 프로젝트 폴더 **해제** 시 dotenv 자동 profile을 통째로 정리한다(2026-07-10):
@@ -201,6 +267,40 @@ mod tests {
     use super::*;
 
     #[test]
+    #[test]
+    fn write_env_var는_라운드트립을_보존한다() {
+        let dir = std::env::temp_dir().join(format!("deppy-wenv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = dir.join(".env");
+        std::fs::write(&env, "# comment\nKEEP=1\nOLD=x\n").unwrap();
+        // 수정 + 추가(공백/내부 큰따옴표 값) + 삭제
+        write_env_var(&dir, "OLD", Some("new value")).unwrap();
+        write_env_var(&dir, "QUOTED", Some("a\"b")).unwrap();
+        write_env_var(&dir, "KEEP", None).unwrap();
+        let content = std::fs::read_to_string(&env).unwrap();
+        assert!(content.starts_with("# comment\n"), "주석 보존");
+        assert!(!content.contains("KEEP="), "삭제 반영");
+        let parsed = parse_dotenv(&content);
+        assert_eq!(
+            parsed
+                .iter()
+                .find(|(k, _)| k == "OLD")
+                .map(|(_, v)| v.as_str()),
+            Some("new value")
+        );
+        assert_eq!(
+            parsed
+                .iter()
+                .find(|(k, _)| k == "QUOTED")
+                .map(|(_, v)| v.as_str()),
+            Some("a\"b"),
+            "내부 큰따옴표 라운드트립"
+        );
+        // 둘 다 포함한 값은 거부
+        assert!(write_env_var(&dir, "BAD", Some("a\"b'c")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     fn parse_dotenv는_주석_export_따옴표를_처리한다() {
         let content = r#"
 # comment

@@ -5,6 +5,10 @@ use crate::storage::{CredentialMeta, Db, EnvProfileRow, EnvVarRow};
 pub enum EnvAction {
     /// 프로젝트 폴더(워크스페이스 path) 설정 — App이 .env 재동기화 + 파일트리 루트 갱신.
     SetProjectPath(std::path::PathBuf),
+    /// 프로젝트 env 재탐색(리프레시 ⟳) — .env 계열 재스캔 + 캐시 무효화(2026-07-10).
+    Resync,
+    /// dotenv profile 편집을 .env 파일에 반영(7·8번) — value None이면 라인 삭제.
+    DotenvWrite { key: String, value: Option<String> },
 }
 
 /// 프로젝트 환경(env profile) 관리 창.
@@ -180,6 +184,12 @@ impl EnvProfilesUi {
         let Some(profile_id) = self.selected.clone() else {
             return Ok(None);
         };
+        let mut action: Option<EnvAction> = None;
+        let is_dotenv = profiles
+            .iter()
+            .find(|p| p.id == profile_id)
+            .map(|p| p.kind == "dotenv")
+            .unwrap_or(false);
         if !profiles.iter().any(|p| p.id == profile_id) {
             return Ok(None);
         }
@@ -265,17 +275,32 @@ impl EnvProfilesUi {
             env_table_divider(ui);
         }
 
-        if self.show_add_form {
-            compact_env_var_form(ui, self, db, &profile_id, &credentials, catalog)?;
+        if self.show_add_form
+            && let Some(written) =
+                compact_env_var_form(ui, self, db, &profile_id, is_dotenv, &credentials, catalog)?
+        {
+            // 7번(2026-07-10): dotenv profile 추가/수정은 .env 파일에도 기록 —
+            // 안 쓰면 다음 동기화 때 파일 기준으로 지워진다(.env가 진실).
+            action = Some(EnvAction::DotenvWrite {
+                key: written.0,
+                value: Some(written.1),
+            });
         }
 
         if let Some(key) = delete_key {
-            db.delete_env_var(&profile_id, &key)?;
-            let id = (profile_id.clone(), key);
+            let id = (profile_id.clone(), key.clone());
             self.revealed.remove(&id);
             self.masked.remove(&id); // 재추가 시 '기본 노출'이 tombstone에 가려지지 않게
-            self.vars = None;
             self.error = None;
+            if is_dotenv {
+                // 8번(codex Med 반영): DB를 먼저 지우지 않는다 — 파일 라인 제거 후
+                // sync의 '사라진 키 제거'가 DB row와 전용 credential/keyring까지 일관
+                // 정리한다(먼저 지우면 sync가 credential 회수 기회를 잃음).
+                action = Some(EnvAction::DotenvWrite { key, value: None });
+            } else {
+                db.delete_env_var(&profile_id, &key)?;
+                self.vars = None;
+            }
         }
 
         // 미리보기 블록은 제거(P3) — 스크린샷은 표 중심. OS override 정보는 각 행
@@ -302,7 +327,7 @@ impl EnvProfilesUi {
         if let Some(error) = &self.error {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
-        Ok(None)
+        Ok(action)
     }
 }
 
@@ -703,9 +728,11 @@ fn compact_env_var_form(
     state: &mut EnvProfilesUi,
     db: &mut Db,
     profile_id: &str,
+    is_dotenv: bool,
     credentials: &[CredentialMeta],
     catalog: &i18n::Catalog,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<(String, String)>> {
+    let mut written: Option<(String, String)> = None;
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.add(
@@ -714,8 +741,14 @@ fn compact_env_var_form(
                 .id_source(env_var_key_input_id())
                 .desired_width(180.0),
         );
-        ui.selectable_value(&mut state.var_is_secret, false, "plain");
-        ui.selectable_value(&mut state.var_is_secret, true, "secret");
+        if is_dotenv {
+            // dotenv profile은 .env 파일이 진실 — 값을 그대로 입력받아 파일에 쓰고,
+            // secret 여부는 동기화가 키/값으로 판정해 keyring 보관한다(7번).
+            state.var_is_secret = false;
+        } else {
+            ui.selectable_value(&mut state.var_is_secret, false, "plain");
+            ui.selectable_value(&mut state.var_is_secret, true, "secret");
+        }
         if state.var_is_secret {
             let current = state
                 .var_credential_id
@@ -753,31 +786,45 @@ fn compact_env_var_form(
             .add_enabled(filled, egui::Button::new(catalog.t("env.add_var", &[])))
             .clicked()
         {
-            let value = if state.var_is_secret {
-                EnvValue::Secret {
-                    credential_id: state.var_credential_id.clone().unwrap_or_default(),
-                }
+            if is_dotenv {
+                // dotenv는 **파일이 진실**(codex High/Med 통합, 2026-07-10): DB를 직접
+                // 만지지 않고 기록만 반환 — App이 파일에 쓰고 즉시 동기화하면 secret
+                // 판정(keyring)·DB upsert를 sync가 일관 처리한다. (직접 Plain upsert는
+                // secret-like 키에서 storage 검증에 거부됐다 — codex High.)
+                written = Some((key.to_owned(), state.var_plain_value.clone()));
+                let id = (profile_id.to_owned(), key.to_owned());
+                state.revealed.remove(&id);
+                state.masked.remove(&id);
+                state.var_key.clear();
+                state.var_plain_value.clear();
+                state.error = None;
             } else {
-                EnvValue::Plain(state.var_plain_value.clone())
-            };
-            match Db::validate_env_var_for_persistence(key, &value)
-                .and_then(|_| db.upsert_env_var(profile_id, key, &value))
-            {
-                Ok(()) => {
-                    // 같은 키를 갱신했으면 이전 평문/가림 상태가 stale — 함께 제거(codex).
-                    let id = (profile_id.to_owned(), key.to_owned());
-                    state.revealed.remove(&id);
-                    state.masked.remove(&id);
-                    state.var_key.clear();
-                    state.var_plain_value.clear();
-                    state.vars = None;
-                    state.error = None;
+                let value = if state.var_is_secret {
+                    EnvValue::Secret {
+                        credential_id: state.var_credential_id.clone().unwrap_or_default(),
+                    }
+                } else {
+                    EnvValue::Plain(state.var_plain_value.clone())
+                };
+                match Db::validate_env_var_for_persistence(key, &value)
+                    .and_then(|_| db.upsert_env_var(profile_id, key, &value))
+                {
+                    Ok(()) => {
+                        // 같은 키 갱신 시 이전 평문/가림 상태 stale — 함께 제거(codex).
+                        let id = (profile_id.to_owned(), key.to_owned());
+                        state.revealed.remove(&id);
+                        state.masked.remove(&id);
+                        state.var_key.clear();
+                        state.var_plain_value.clear();
+                        state.vars = None;
+                        state.error = None;
+                    }
+                    Err(e) => state.error = Some(format!("{e:#}")),
                 }
-                Err(e) => state.error = Some(format!("{e:#}")),
             }
         }
     });
-    Ok(())
+    Ok(written)
 }
 
 fn env_var_key_input_id() -> egui::Id {

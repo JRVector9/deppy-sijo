@@ -158,7 +158,15 @@ pub fn render_with_style(
             .id_salt("env_project_list_scroll")
             .auto_shrink([false, false])
             .show(&mut list_ui, |ui| {
-                render_rows(ui, projects, active_id, row_width, style, catalog, &mut action);
+                render_rows(
+                    ui,
+                    projects,
+                    active_id,
+                    row_width,
+                    style,
+                    catalog,
+                    &mut action,
+                );
             });
     }
 
@@ -177,7 +185,15 @@ fn render_rows(
     ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
     for project in projects {
         let selected = project.id == active_id;
-        let next = render_row(ui, project, selected, projects.len(), row_width, style, catalog);
+        let next = render_row(
+            ui,
+            project,
+            selected,
+            projects.len(),
+            row_width,
+            style,
+            catalog,
+        );
         if !matches!(next, EnvProjectListAction::None) {
             *action = next;
         }
@@ -249,8 +265,10 @@ fn render_row(
     // 행 폭은 render_with_style이 잰 panel_rect 폭(row_width) 고정 — 패널 배경·
     // 헤더·divider와 우측 끝이 항상 일치한다. 스크롤바는 floating(예약 폭 0)이라
     // ScrollArea 유무와 무관하게 같은 폭이 유지된다(2026-07-10).
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(row_width, style.row_height), egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(row_width, style.row_height),
+        egui::Sense::click(),
+    );
     let fill = if selected {
         tok_nav_active(ui)
     } else if response.hovered() {

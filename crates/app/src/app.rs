@@ -347,6 +347,15 @@ fn render_env_api_project_header(
                         std::path::PathBuf::new(),
                     ));
                 }
+                // 재탐색(4번, 2026-07-10) — .env 계열을 다시 스캔해 표를 갱신.
+                if !path.is_empty()
+                    && ui
+                        .small_button("⟳")
+                        .on_hover_text(catalog.t("env.resync_hint", &[]))
+                        .clicked()
+                {
+                    *env_action = Some(ui::env_profiles::EnvAction::Resync);
+                }
                 // 남은 폭 전부 — truncate 라벨 (rtl이라 좌측 정렬로 다시 감싼다).
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     // 사라진 경로(rename 자동 복구 불가)는 경고색 + 조치 안내(2026-07-09).
@@ -641,6 +650,8 @@ pub struct App {
     last_dotenv_state: Option<(bool, Option<std::time::SystemTime>)>,
     /// 프로젝트 폴더 rename 복구 확인 모달 — Some((old, new))이면 표시(2026-07-08).
     workspace_rename_prompt: Option<(String, String)>,
+    /// 프로젝트 삭제 확인 대기 — Some((id, 표시명)). 확인 모달에서 확정/취소(2026-07-10).
+    ws_delete_confirm: Option<(String, String)>,
     /// rename 제안을 '무시'한 워크스페이스 — 이번 실행 동안 재확인 안 함(경로 변경 시 해제).
     dismissed_renames: std::collections::HashSet<String>,
     settings_open: bool,
@@ -821,6 +832,7 @@ impl App {
             last_dotenv_check: std::time::Instant::now(),
             last_dotenv_state: None,
             workspace_rename_prompt: None,
+            ws_delete_confirm: None,
             dismissed_renames: std::collections::HashSet::new(),
             settings_open: false,
             settings_was_open: false,
@@ -1877,13 +1889,33 @@ impl App {
 
     /// 활성 workspace `.env`의 (존재여부, mtime) — 폴링 비교용.
     fn dotenv_stat(&self) -> (bool, Option<std::time::SystemTime>) {
-        match self.active_tree_root() {
-            Some(root) => match std::fs::metadata(root.join(".env")) {
-                Ok(meta) => (true, meta.modified().ok()),
-                Err(_) => (false, None),
-            },
-            None => (false, None),
+        // .env 계열 **파일별** (존재, mtime)을 전부 반영 — 최신 mtime만 보면 "옛 파일
+        // 삭제"가 상태 불변으로 보여 재동기화가 안 됐다(codex High 2026-07-10).
+        // 요약: exists = 하나라도 존재 / mtime = 파일별 (존재,mtime)을 해시한 대리값.
+        let Some(root) = self.active_tree_root() else {
+            return (false, None);
+        };
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        let mut exists = false;
+        for name in crate::dotenv_sync::DOTENV_FILE_NAMES {
+            match std::fs::metadata(root.join(name)) {
+                Ok(meta) => {
+                    exists = true;
+                    true.hash(&mut hasher);
+                    meta.modified()
+                        .ok()
+                        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_nanos())
+                        .hash(&mut hasher);
+                }
+                Err(_) => false.hash(&mut hasher),
+            }
         }
+        // 대리 mtime: 해시를 SystemTime로 인코딩(비교 전용 — 절대 시각 의미 없음).
+        let digest = hasher.finish();
+        let surrogate = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(digest >> 1);
+        (exists, exists.then_some(surrogate))
     }
 
     /// .env (존재여부, mtime)을 2초 간격으로 폴링해 변화 시 재동기화한다 — 사이드바 OFF로
@@ -3042,10 +3074,30 @@ impl eframe::App for App {
                                     }
                                 }
                                 ui::env_project_list::EnvProjectListAction::DeleteRequested(id) => {
-                                    ws_delete = Some(id);
+                                    // 즉시 삭제하지 않고 확인 모달로(5번, 2026-07-10).
+                                    let name = env_api_projects
+                                        .iter()
+                                        .find(|p| p.id == id)
+                                        .map(|p| p.name.clone())
+                                        .unwrap_or_default();
+                                    self.ws_delete_confirm = Some((id, name));
                                 }
                             }
-                            ui.separator();
+                            // 리스트/상세 경계 — separator(6px 스트립)는 우측에 배경
+                            // 띠를 남겼다(codex Low) → 1px vline으로 대체.
+                            {
+                                let h = ui.available_height();
+                                let (r, _) = ui
+                                    .allocate_exact_size(egui::vec2(1.0, h), egui::Sense::hover());
+                                ui.painter().vline(
+                                    r.center().x,
+                                    r.y_range(),
+                                    egui::Stroke::new(
+                                        1.0,
+                                        ui.visuals().widgets.noninteractive.bg_stroke.color,
+                                    ),
+                                );
+                            }
                             // 우측 상세는 **세로 스택** — 부모 horizontal 레이아웃을 그대로
                             // 상속하면 헤더/표가 가로 한 줄로 흘러 화면 중앙에 떴다
                             // (2026-07-09 스크린샷 회귀). vertical로 명시해 top-down 강제.
@@ -3175,6 +3227,25 @@ impl eframe::App for App {
             }
         }
         // 환경 메뉴에서 프로젝트 폴더 설정 → workspace path 저장 + .env 재동기화 + 파일트리 루트.
+        if let Some(ui::env_profiles::EnvAction::DotenvWrite { key, value }) = &env_action {
+            // 7·8번(2026-07-10): UI 편집을 .env 파일에 라인 단위 반영 → 즉시 재동기화.
+            if let Some(root) = self.active_tree_root() {
+                if let Err(e) = crate::dotenv_sync::write_env_var(&root, key, value.as_deref()) {
+                    tracing::warn!(".env 기록 실패: {e:#}");
+                } else {
+                    self.sync_dotenv_env();
+                    self.env_profiles_ui.invalidate_cache();
+                    self.env_api_projects_cache = None;
+                }
+            }
+        }
+        if let Some(ui::env_profiles::EnvAction::Resync) = env_action {
+            // 리프레시(4번): .env 계열 재스캔 + UI/카운트 캐시 무효화.
+            self.sync_dotenv_env();
+            self.env_profiles_ui.invalidate_cache();
+            self.credentials_ui.invalidate_cache();
+            self.env_api_projects_cache = None;
+        }
         if let Some(ui::env_profiles::EnvAction::SetProjectPath(path)) = env_action {
             let path_str = path.to_string_lossy().into_owned();
             if let Err(e) = self.db.set_workspace_path(&self.active.id, &path_str) {
@@ -3213,6 +3284,59 @@ impl eframe::App for App {
                 self.refresh_workspaces();
             }
         }
+        // 프로젝트 삭제 확인 모달(5번, 2026-07-10) — 목록/DB에서만 제거, 폴더·.env는 보존.
+        if let Some((del_id, del_name)) = self.ws_delete_confirm.clone() {
+            let mut decision: Option<bool> = None;
+            egui::Window::new(text.t("workspace.delete_confirm.title", &[]))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    ui.label(text.t("workspace.delete_confirm.body", &[("name", &del_name)]));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(text.t("workspace.delete_confirm.go", &[]))
+                            .clicked()
+                        {
+                            decision = Some(true);
+                        }
+                        if ui.button(text.t("action.cancel", &[])).clicked() {
+                            decision = Some(false);
+                        }
+                    });
+                });
+            match decision {
+                Some(true) => {
+                    // 활성 프로젝트면 다른 프로젝트로 먼저 전환(삭제 가드가 active를 거부).
+                    if del_id == self.active.id
+                        && let Some(other) = self
+                            .workspaces
+                            .iter()
+                            .find(|w| w.id != del_id)
+                            .map(|w| w.id.clone())
+                    {
+                        self.switch_workspace(&other);
+                        self.refresh_workspaces();
+                    }
+                    // keyring까지 정리(dotenv 소유 credential) 후 DB 삭제 — 화면·DB에서만
+                    // 제거되고 폴더/.env 파일은 보존(재등록 시 복구).
+                    if let Err(e) = crate::dotenv_sync::remove_workspace_dotenv(
+                        &mut self.db,
+                        &self.secret_store,
+                        &del_id,
+                    ) {
+                        tracing::warn!("dotenv 정리 실패: {e:#}");
+                    }
+                    ws_delete = Some(del_id);
+                    self.env_api_projects_cache = None;
+                    self.ws_delete_confirm = None;
+                }
+                Some(false) => self.ws_delete_confirm = None,
+                None => {}
+            }
+        }
+
         if let Some(delete_id) = ws_delete {
             if delete_id == self.active.id {
                 tracing::info!(

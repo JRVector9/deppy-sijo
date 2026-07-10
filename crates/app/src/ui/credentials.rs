@@ -39,6 +39,8 @@ pub struct CredentialsUi {
     /// '+ 추가' 클릭 시에만 인라인 추가 폼을 펼친다(스크린샷: 기본은 표만 — P2).
     show_add_form: bool,
     /// 고아 keyring 정리 흐름 상태 — None=대기, Some(목록)=발견(확인 대기).
+    /// 삭제 확인 대기 (id, 표시명) — ×를 눌러도 바로 지우지 않고 모달로 묻는다.
+    delete_confirm: Option<(String, String)>,
     orphan_candidates: Option<Vec<String>>,
     /// 마지막 정리 결과 메시지(정리 개수/없음).
     orphan_status: Option<String>,
@@ -54,6 +56,7 @@ impl CredentialsUi {
             secret_input: String::new(),
             error: None,
             show_add_form: false,
+            delete_confirm: None,
             orphan_candidates: None,
             orphan_status: None,
             cached: None,
@@ -114,10 +117,15 @@ impl CredentialsUi {
                 catalog.t("credentials.secret", &[]),
             ],
         );
-        let mut delete_id = None;
+        let mut delete_id: Option<(String, String)> = None;
         for meta in &list {
             if credential_table_row(ui, meta, catalog) {
-                delete_id = Some(meta.id.clone());
+                let name = if meta.label.is_empty() {
+                    meta.provider.clone()
+                } else {
+                    meta.label.clone()
+                };
+                delete_id = Some((meta.id.clone(), name));
             }
             credentials_table_divider(ui);
         }
@@ -128,13 +136,41 @@ impl CredentialsUi {
                     .weak(),
             );
         }
-        if let Some(id) = delete_id {
-            match self.delete(credentials, &id) {
-                Ok(()) => {
-                    changed = true;
-                    self.error = None;
+        if let Some(pending) = delete_id {
+            self.delete_confirm = Some(pending);
+        }
+        // 삭제 확인 모달(사용자 2026-07-10 #1) — 키체인 시크릿도 함께 지워지므로 확인 필수.
+        if let Some((del_id, del_name)) = self.delete_confirm.clone() {
+            let mut decision: Option<bool> = None;
+            egui::Window::new(catalog.t("credentials.delete_confirm.title", &[]))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    ui.label(catalog.t("credentials.delete_confirm.body", &[("name", &del_name)]));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(catalog.t("action.delete", &[])).clicked() {
+                            decision = Some(true);
+                        }
+                        if ui.button(catalog.t("action.cancel", &[])).clicked() {
+                            decision = Some(false);
+                        }
+                    });
+                });
+            match decision {
+                Some(true) => {
+                    match self.delete(credentials, &del_id) {
+                        Ok(()) => {
+                            changed = true;
+                            self.error = None;
+                        }
+                        Err(e) => self.error = Some(format!("{e:#}")),
+                    }
+                    self.delete_confirm = None;
                 }
-                Err(e) => self.error = Some(format!("{e:#}")),
+                Some(false) => self.delete_confirm = None,
+                None => {}
             }
         }
 

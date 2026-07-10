@@ -23,6 +23,10 @@ pub struct EnvProfilesUi {
     error: Option<String>,
     /// '+ 추가' 클릭 시에만 인라인 추가 폼을 펼친다(스크린샷: 기본은 표만 — P2).
     show_add_form: bool,
+    /// 삭제 확인 대기 (profile_id, key) — ×를 눌러도 바로 지우지 않고 모달로 묻는다.
+    /// profile_id를 함께 저장해 확인 중 프로파일 전환 시 다른 프로파일의 같은 key가
+    /// 지워지는 것을 막는다(codex High 2026-07-10).
+    delete_confirm: Option<(String, String)>,
     /// 프로파일 관리 UI 수동 펼침 — 기본 숨김(P1)이어도 '프로파일 관리…' 링크로 접근
     /// 가능(단일 프로파일에서 두 번째 생성 경로 보존 — codex Med).
     show_profile_controls: bool,
@@ -48,6 +52,7 @@ impl EnvProfilesUi {
     pub fn invalidate_cache(&mut self) {
         self.profiles = None;
         self.vars = None;
+        self.delete_confirm = None;
         // 외부 .env 동기화가 credential을 새로 만들 수 있으므로 함께 버린다.
         self.credentials = None;
         // .env 동기화가 같은 (profile,key)의 secret 값을 바꿨을 수 있다 — 평문 캐시를
@@ -79,6 +84,7 @@ impl EnvProfilesUi {
             revealed: std::collections::HashMap::new(),
             masked: std::collections::HashSet::new(),
             show_add_form: false,
+            delete_confirm: None,
             show_profile_controls: false,
             profiles: None,
             vars: None,
@@ -255,7 +261,7 @@ impl EnvProfilesUi {
             };
             let row = env_table_row(ui, var, &credentials, revealed_value, is_masked, catalog);
             if row.delete {
-                delete_key = Some(var.key.clone());
+                self.delete_confirm = Some((profile_id.clone(), var.key.clone()));
             }
             if row.toggle_reveal {
                 toggle_mask = Some(var.key.clone());
@@ -285,6 +291,46 @@ impl EnvProfilesUi {
                 key: written.0,
                 value: Some(written.1),
             });
+        }
+
+        // 삭제 확인 모달(사용자 2026-07-10 #1) — 확정 시에만 delete_key로 진행.
+        // egui::Window는 배경 상호작용을 막지 않으므로, 대기 중 프로파일이 바뀌면 폐기.
+        if let Some((pending_profile, _)) = &self.delete_confirm
+            && *pending_profile != profile_id
+        {
+            self.delete_confirm = None;
+        }
+        if let Some((_, pending)) = self.delete_confirm.clone() {
+            let mut decision: Option<bool> = None;
+            egui::Window::new(catalog.t("env.var_delete_confirm.title", &[]))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    let body_key = if is_dotenv {
+                        "env.var_delete_confirm.body_dotenv"
+                    } else {
+                        "env.var_delete_confirm.body"
+                    };
+                    ui.label(catalog.t(body_key, &[("key", &pending)]));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(catalog.t("action.delete", &[])).clicked() {
+                            decision = Some(true);
+                        }
+                        if ui.button(catalog.t("action.cancel", &[])).clicked() {
+                            decision = Some(false);
+                        }
+                    });
+                });
+            match decision {
+                Some(true) => {
+                    delete_key = Some(pending);
+                    self.delete_confirm = None;
+                }
+                Some(false) => self.delete_confirm = None,
+                None => {}
+            }
         }
 
         if let Some(key) = delete_key {

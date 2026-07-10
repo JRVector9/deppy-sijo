@@ -1,6 +1,5 @@
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActivityWorkspaceRow {
-    pub id: String,
     pub name: String,
     pub state: ActivityWorkspaceState,
     pub session_count: usize,
@@ -37,33 +36,15 @@ pub enum ActivityWorkspaceState {
 }
 
 pub enum ActivityAction {
-    SwitchWorkspace(String),
     /// 모든 워크스페이스(활성+warm)의 터미널 렌더 캐시 비우기 — 작업/프로세스에 무해.
     ClearRenderCaches,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum ActivityFilter {
-    #[default]
-    All,
-    Active,
-    Warm,
-    Warning,
-}
-
-pub struct ActivityUi {
-    filter: ActivityFilter,
-    /// 직전 렌더 frame. 한 frame 이상 Activity가 렌더되지 않았으면 새 진입으로 보고
-    /// `전체` 필터로 복귀한다.
-    last_render_frame: Option<u64>,
-}
+pub struct ActivityUi {}
 
 impl ActivityUi {
     pub fn new() -> Self {
-        Self {
-            filter: ActivityFilter::All,
-            last_render_frame: None,
-        }
+        Self {}
     }
 
     /// 창 프레임 없이 본문만 렌더한다 (통합 설정 창 우측 패널용, 2026-07-06).
@@ -73,7 +54,6 @@ impl ActivityUi {
         catalog: &i18n::Catalog,
         rows: &[ActivityWorkspaceRow],
     ) -> Option<ActivityAction> {
-        self.begin_visit_frame(ui.ctx().cumulative_frame_nr());
         let mut action = None;
         egui::Frame::NONE
             .inner_margin(egui::Margin {
@@ -110,56 +90,17 @@ impl ActivityUi {
                 summary_cards(ui, catalog, summary);
                 ui.add_space(18.0);
 
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(catalog.t("activity.workspaces", &[]))
-                            .strong()
-                            .size(14.0),
-                    );
+                if rows.is_empty() {
                     ui.add_space(10.0);
-                    for (filter, key) in [
-                        (ActivityFilter::All, "activity.filter.all"),
-                        (ActivityFilter::Active, "activity.filter.active"),
-                        (ActivityFilter::Warm, "activity.filter.warm"),
-                        (ActivityFilter::Warning, "activity.filter.warning"),
-                    ] {
-                        if ui
-                            .selectable_label(self.filter == filter, catalog.t(key, &[]))
-                            .clicked()
-                        {
-                            self.filter = filter;
-                        }
-                    }
-                });
-                ui.add_space(8.0);
-                activity_hairline(ui);
-                ui.add_space(10.0);
-
-                let filtered: Vec<_> = rows
-                    .iter()
-                    .filter(|row| activity_filter_matches(self.filter, row))
-                    .collect();
-                if filtered.is_empty() {
-                    ui.add_space(10.0);
-                    ui.weak(catalog.t("activity.empty_filtered", &[]));
+                    ui.weak(catalog.t("activity.empty", &[]));
                     return;
                 }
-                for row in filtered {
-                    workspace_card(ui, catalog, row, &mut action);
+                for row in rows {
+                    workspace_card(ui, catalog, row);
                     ui.add_space(10.0);
                 }
             });
         action
-    }
-
-    fn begin_visit_frame(&mut self, frame: u64) {
-        let entering = self
-            .last_render_frame
-            .is_none_or(|last| frame > last.saturating_add(1));
-        if entering {
-            self.filter = ActivityFilter::All;
-        }
-        self.last_render_frame = Some(frame);
     }
 }
 
@@ -270,15 +211,6 @@ fn summary_cards(ui: &mut egui::Ui, catalog: &i18n::Catalog, summary: ActivitySu
     });
 }
 
-fn activity_filter_matches(filter: ActivityFilter, row: &ActivityWorkspaceRow) -> bool {
-    match filter {
-        ActivityFilter::All => true,
-        ActivityFilter::Active => row.state == ActivityWorkspaceState::Active,
-        ActivityFilter::Warm => row.state != ActivityWorkspaceState::Active,
-        ActivityFilter::Warning => workspace_has_warning(row),
-    }
-}
-
 fn workspace_has_warning(row: &ActivityWorkspaceRow) -> bool {
     row.input_pressure.is_some()
         || row
@@ -305,12 +237,7 @@ fn activity_hairline(ui: &mut egui::Ui) {
     );
 }
 
-fn workspace_card(
-    ui: &mut egui::Ui,
-    catalog: &i18n::Catalog,
-    row: &ActivityWorkspaceRow,
-    action: &mut Option<ActivityAction>,
-) {
+fn workspace_card(ui: &mut egui::Ui, catalog: &i18n::Catalog, row: &ActivityWorkspaceRow) {
     let fill = ui.visuals().panel_fill;
     let border = ui.visuals().widgets.noninteractive.bg_stroke;
     egui::Frame::NONE
@@ -328,8 +255,6 @@ fn workspace_card(
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if row.state == ActivityWorkspaceState::Active {
                         ui.weak(catalog.t("activity.current", &[]));
-                    } else if ui.button(catalog.t("activity.switch", &[])).clicked() {
-                        *action = Some(ActivityAction::SwitchWorkspace(row.id.clone()));
                     }
                     ui.add_space(10.0);
                     ui.label(
@@ -587,21 +512,6 @@ mod tests {
         assert_eq!(summary.cpu_percent, None);
         assert_eq!(summary.rss_bytes, 0);
         assert_eq!(summary.warnings, 0);
-    }
-
-    #[test]
-    fn activity_reentry_resets_filter_to_all_immediately() {
-        let mut ui = ActivityUi::new();
-        ui.filter = ActivityFilter::Warning;
-        ui.begin_visit_frame(10);
-        assert_eq!(ui.filter, ActivityFilter::All);
-
-        ui.filter = ActivityFilter::Active;
-        ui.begin_visit_frame(11);
-        assert_eq!(ui.filter, ActivityFilter::Active);
-
-        ui.begin_visit_frame(13);
-        assert_eq!(ui.filter, ActivityFilter::All);
     }
 
     #[test]

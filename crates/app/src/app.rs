@@ -2773,7 +2773,6 @@ impl App {
                         })
                         .collect::<Vec<_>>();
                     return ui::activity::ActivityWorkspaceRow {
-                        id: ws.id.clone(),
                         name: Self::workspace_display_name(ws),
                         state: ui::activity::ActivityWorkspaceState::Active,
                         session_count: entries.len(),
@@ -2816,7 +2815,6 @@ impl App {
                         })
                         .collect::<Vec<_>>();
                     return ui::activity::ActivityWorkspaceRow {
-                        id: ws.id.clone(),
                         name: Self::workspace_display_name(ws),
                         state: ui::activity::ActivityWorkspaceState::Warm,
                         session_count: rt.session_titles.len(),
@@ -2830,7 +2828,6 @@ impl App {
                     };
                 }
                 ui::activity::ActivityWorkspaceRow {
-                    id: ws.id.clone(),
                     name: Self::workspace_display_name(ws),
                     state: ui::activity::ActivityWorkspaceState::Suspended,
                     session_count: 0,
@@ -4198,10 +4195,6 @@ impl eframe::App for App {
             }
         }
         match activity_action {
-            Some(ui::activity::ActivityAction::SwitchWorkspace(id)) if id != self.active.id => {
-                self.switch_workspace(&id);
-                self.refresh_workspaces();
-            }
             Some(ui::activity::ActivityAction::ClearRenderCaches) => {
                 // 렌더 캐시만 — 작업/프로세스/스크롤백 무해(2026-07-08 검토). 다음 프레임 재구축.
                 self.active.workspace_ui.clear_render_caches();
@@ -4210,7 +4203,7 @@ impl eframe::App for App {
                 }
                 self.egui_ctx.request_repaint();
             }
-            _ => {}
+            None => {}
         }
         if let Some((ws_id, session)) = notif_click {
             if ws_id == self.active.id {

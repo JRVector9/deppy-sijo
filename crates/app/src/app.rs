@@ -1041,6 +1041,9 @@ pub struct App {
     logs_base: PathBuf,
     redaction: secret::RedactionService,
     workspaces: Vec<crate::storage::WorkspaceRow>,
+    /// 런타임이 없는 workspace도 활동 화면에 복원 대상 pane을 표시하기 위한 DB snapshot.
+    /// refresh_workspaces에서 한 쿼리로 갱신한다.
+    persisted_activity_panes: std::collections::HashMap<String, Vec<String>>,
     /// 옵션2: 활성 세션별 에이전트 transcript 활동(working/idle) — 레일 상태에 반영.
     agent_activity:
         std::collections::HashMap<runtime::SessionId, crate::agent_transcript::AgentActivity>,
@@ -1229,6 +1232,7 @@ impl App {
             logs_base,
             redaction,
             workspaces: Vec::new(),
+            persisted_activity_panes: std::collections::HashMap::new(),
             agent_activity: std::collections::HashMap::new(),
             agent_bindings: std::collections::HashMap::new(),
             agent_detect_worker,
@@ -2721,6 +2725,17 @@ impl App {
             Ok(list) => self.workspaces = list,
             Err(e) => tracing::warn!("workspace 목록 조회 실패: {e:#}"),
         }
+        match self.db.list_persisted_activity_panes() {
+            Ok(rows) => {
+                let mut by_workspace: std::collections::HashMap<String, Vec<String>> =
+                    std::collections::HashMap::new();
+                for (workspace_id, title) in rows {
+                    by_workspace.entry(workspace_id).or_default().push(title);
+                }
+                self.persisted_activity_panes = by_workspace;
+            }
+            Err(e) => tracing::warn!("활동 pane snapshot 조회 실패: {e:#}"),
+        }
         // 워크스페이스 목록/이름/경로가 바뀌었을 수 있다 — env/API 프로젝트 행 캐시 무효화.
         self.invalidate_env_api_projects();
     }
@@ -2827,17 +2842,33 @@ impl App {
                         sessions,
                     };
                 }
+                let sessions = self
+                    .persisted_activity_panes
+                    .get(&ws.id)
+                    .into_iter()
+                    .flatten()
+                    .map(|title| ui::activity::ActivitySessionRow {
+                        name: title.clone(),
+                        agent_line: None,
+                        status_line: None,
+                        resource: None,
+                        pressure: None,
+                    })
+                    .collect::<Vec<_>>();
                 ui::activity::ActivityWorkspaceRow {
                     name: Self::workspace_display_name(ws),
-                    state: ui::activity::ActivityWorkspaceState::Suspended,
-                    session_count: 0,
+                    // DB에는 있으나 active/warm runtime이 없는 워크스페이스도 숨기지 않고
+                    // 유휴 카드로 표시한다. 현재 복원 레이아웃의 pane은 위 snapshot에서
+                    // 하위 세션 행으로 복구한다.
+                    state: ui::activity::ActivityWorkspaceState::Idle,
+                    session_count: sessions.len(),
                     pending_events: 0,
                     input_pressure: None,
                     backgrounded_for_secs: None,
                     auto_suspend_remaining_secs: None,
                     resource: None,
                     session_resources: Vec::new(),
-                    sessions: Vec::new(),
+                    sessions,
                 }
             })
             .collect()

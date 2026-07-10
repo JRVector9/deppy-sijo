@@ -290,6 +290,18 @@ impl Session {
         Ok(replayed)
     }
 
+    /// 영속 ANSI 화면 뒤에 fresh PTY를 붙이기 전 terminal mode/cursor 경계를 만든다.
+    /// 이전 agent가 alternate screen·mouse tracking·좁은 scroll region을 남긴 채 앱이
+    /// 종료됐어도 새 셸 출력은 main screen의 새 줄에서 시작해야 한다. 이 바이트는
+    /// 복원용 parser에만 적용되고 append-only 세션 로그에는 기록되지 않는다.
+    pub fn finish_ansi_replay(&mut self) -> anyhow::Result<()> {
+        self.backend.feed(
+            b"\x1b[?1049l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[r\x1b[?6l\x1b[?7h\x1b[4l\x1b[0m\x1b[?25h\r\n",
+        )?;
+        self.mark_full_dirty();
+        Ok(())
+    }
+
     /// 입력 큐가 비었는가 — backpressure 해소 판정(2026-07-09). PTY가 이미 닫혔으면
     /// 더 쌓일 것도 없으니 idle로 본다.
     pub fn input_queue_idle(&self) -> bool {
@@ -586,6 +598,37 @@ mod tests {
                 end: 80 * 24,
             }]
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ansi_replay_경계는_alt_screen을_끝내고_fresh_출력을_새줄에_둔다() {
+        let spec = CommandSpec {
+            program: "/bin/cat".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(21), SessionKind::Shell, &spec, 40, 6, 100).unwrap();
+
+        session
+            .replay_ansi(&mut std::io::Cursor::new(
+                b"OLD-HISTORY\x1b[?1049hALT-SCREEN",
+            ))
+            .unwrap();
+        assert!(session.take_snapshot().unwrap().is_alt_screen);
+
+        session.finish_ansi_replay().unwrap();
+        session
+            .replay_ansi(&mut std::io::Cursor::new(b"FRESH-PROMPT"))
+            .unwrap();
+        let snapshot = session.take_snapshot().unwrap();
+        assert!(!snapshot.is_alt_screen);
+        let text = session.screen_text();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with("OLD-HISTORY"), "{text:?}");
+        assert!(lines[1].starts_with("FRESH-PROMPT"), "{text:?}");
     }
 
     #[test]

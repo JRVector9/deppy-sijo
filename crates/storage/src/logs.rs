@@ -60,6 +60,60 @@ impl SessionLogWriter {
         Ok(Self::session_dir_key(logs_root, session_key)?.join("redacted.ansi.log"))
     }
 
+    /// 마지막으로 UI가 확정한 터미널 grid 크기. ANSI 로그의 zsh/ZLE redraw는 당시
+    /// 열 수에 의존하므로 재시작 복원도 같은 크기에서 먼저 파싱해야 한다.
+    pub fn terminal_size_path(logs_root: &Path, session_key: &str) -> anyhow::Result<PathBuf> {
+        Ok(Self::session_dir_key(logs_root, session_key)?.join("terminal.size"))
+    }
+
+    pub fn load_terminal_size(
+        logs_root: &Path,
+        session_key: &str,
+    ) -> anyhow::Result<Option<(u16, u16)>> {
+        let path = Self::terminal_size_path(logs_root, session_key)?;
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("터미널 크기 읽기 실패: {}", path.display()));
+            }
+        };
+        let mut fields = raw.split_whitespace();
+        let cols: u16 = fields
+            .next()
+            .context("터미널 열 수 없음")?
+            .parse()
+            .context("터미널 열 수 파싱 실패")?;
+        let rows: u16 = fields
+            .next()
+            .context("터미널 행 수 없음")?
+            .parse()
+            .context("터미널 행 수 파싱 실패")?;
+        anyhow::ensure!(fields.next().is_none(), "터미널 크기 필드가 너무 많음");
+        // 손상된 sidecar가 재시작 시 과도한 terminal grid 할당으로 이어지지 않게
+        // UI/runtime이 허용하는 범위와 같은 상한을 둔다.
+        anyhow::ensure!((1..=500).contains(&cols), "터미널 열 수 범위 초과");
+        anyhow::ensure!((1..=500).contains(&rows), "터미널 행 수 범위 초과");
+        Ok(Some((cols, rows)))
+    }
+
+    pub fn save_terminal_size(
+        logs_root: &Path,
+        session_key: &str,
+        cols: u16,
+        rows: u16,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!((1..=500).contains(&cols), "터미널 열 수 범위 초과");
+        anyhow::ensure!((1..=500).contains(&rows), "터미널 행 수 범위 초과");
+        let dir = Self::session_dir_key(logs_root, session_key)?;
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("로그 디렉터리 생성 실패: {}", dir.display()))?;
+        let path = dir.join("terminal.size");
+        std::fs::write(&path, format!("{cols} {rows}\n"))
+            .with_context(|| format!("터미널 크기 기록 실패: {}", path.display()))
+    }
+
     /// append 재개 시 offset을 기존 파일 길이부터 이어가기 위한 길이 조회.
     pub fn ansi_len(&self) -> std::io::Result<u64> {
         self.ansi.metadata().map(|metadata| metadata.len())
@@ -269,6 +323,31 @@ mod tests {
         for invalid in ["", ".", "..", "../escape", "nested/session", "/tmp/escape"] {
             assert!(SessionLogWriter::session_dir_key(&root, invalid).is_err());
         }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn 터미널_크기_sidecar를_저장하고_검증한다() {
+        let root = temp_root("terminal-size");
+        let key = "019f3804-586d-7ca3-9386-1cbc8710ca08";
+
+        assert_eq!(
+            SessionLogWriter::load_terminal_size(&root, key).unwrap(),
+            None
+        );
+        SessionLogWriter::save_terminal_size(&root, key, 121, 47).unwrap();
+        assert_eq!(
+            SessionLogWriter::load_terminal_size(&root, key).unwrap(),
+            Some((121, 47))
+        );
+
+        std::fs::write(
+            SessionLogWriter::terminal_size_path(&root, key).unwrap(),
+            "65535 47\n",
+        )
+        .unwrap();
+        assert!(SessionLogWriter::load_terminal_size(&root, key).is_err());
+        assert!(SessionLogWriter::save_terminal_size(&root, key, 0, 47).is_err());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

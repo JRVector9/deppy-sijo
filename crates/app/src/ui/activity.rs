@@ -32,7 +32,8 @@ pub struct ActivitySessionRow {
 pub enum ActivityWorkspaceState {
     Active,
     Warm,
-    Suspended,
+    /// DB에는 존재하지만 현재 runtime/세션이 없는 워크스페이스.
+    Idle,
 }
 
 pub enum ActivityAction {
@@ -109,6 +110,7 @@ struct ActivitySummary {
     workspaces: usize,
     active: usize,
     warm: usize,
+    idle: usize,
     sessions: usize,
     cpu_percent: Option<f32>,
     rss_bytes: u64,
@@ -120,6 +122,7 @@ fn activity_summary(rows: &[ActivityWorkspaceRow]) -> ActivitySummary {
         workspaces: rows.len(),
         active: 0,
         warm: 0,
+        idle: 0,
         sessions: 0,
         cpu_percent: None,
         rss_bytes: 0,
@@ -130,7 +133,8 @@ fn activity_summary(rows: &[ActivityWorkspaceRow]) -> ActivitySummary {
     for row in rows {
         match row.state {
             ActivityWorkspaceState::Active => summary.active += 1,
-            ActivityWorkspaceState::Warm | ActivityWorkspaceState::Suspended => summary.warm += 1,
+            ActivityWorkspaceState::Warm => summary.warm += 1,
+            ActivityWorkspaceState::Idle => summary.idle += 1,
         }
         summary.sessions += row.session_count;
         if let Some(resource) = &row.resource {
@@ -169,6 +173,7 @@ fn summary_cards(ui: &mut egui::Ui, catalog: &i18n::Catalog, summary: ActivitySu
                 &[
                     ("active", &summary.active.to_string()),
                     ("warm", &summary.warm.to_string()),
+                    ("idle", &summary.idle.to_string()),
                 ],
             ),
         ),
@@ -240,6 +245,7 @@ fn activity_hairline(ui: &mut egui::Ui) {
 fn workspace_card(ui: &mut egui::Ui, catalog: &i18n::Catalog, row: &ActivityWorkspaceRow) {
     let fill = ui.visuals().panel_fill;
     let border = ui.visuals().widgets.noninteractive.bg_stroke;
+    let idle = row.state == ActivityWorkspaceState::Idle;
     egui::Frame::NONE
         .fill(fill)
         .stroke(border)
@@ -257,15 +263,12 @@ fn workspace_card(ui: &mut egui::Ui, catalog: &i18n::Catalog, row: &ActivityWork
                         ui.weak(catalog.t("activity.current", &[]));
                     }
                     ui.add_space(10.0);
-                    ui.label(
-                        egui::RichText::new(resource_label(
-                            catalog,
-                            row.resource.as_ref(),
-                            &row.session_resources,
-                        ))
-                        .monospace()
-                        .size(12.0),
-                    );
+                    let resources = if idle {
+                        zero_resource_label(catalog)
+                    } else {
+                        resource_label(catalog, row.resource.as_ref(), &row.session_resources)
+                    };
+                    ui.label(egui::RichText::new(resources).monospace().size(12.0));
                     if row.pending_events > 0 {
                         ui.weak(format!(
                             "{} {}",
@@ -293,14 +296,12 @@ fn workspace_card(ui: &mut egui::Ui, catalog: &i18n::Catalog, row: &ActivityWork
                             }
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                egui::RichText::new(session_resource_text(
-                                    catalog,
-                                    session.resource.as_ref(),
-                                ))
-                                .monospace()
-                                .size(11.0),
-                            );
+                            let resources = match session.resource.as_ref() {
+                                Some(resource) => session_resource_text(catalog, Some(resource)),
+                                None if idle => zero_resource_label(catalog),
+                                None => String::new(),
+                            };
+                            ui.label(egui::RichText::new(resources).monospace().size(11.0));
                             if let Some(pressure) = &session.pressure {
                                 input_pressure_badge(ui, catalog, pressure);
                             }
@@ -318,6 +319,15 @@ fn workspace_card(ui: &mut egui::Ui, catalog: &i18n::Catalog, row: &ActivityWork
                 ));
             }
         });
+}
+
+/// 런타임 자체가 없으면 측정 실패가 아니라 실제 프로세스 사용량이 0이다.
+/// 워크스페이스 헤더와 영속 세션 행에 같은 형식을 사용한다.
+fn zero_resource_label(catalog: &i18n::Catalog) -> String {
+    catalog.t(
+        "activity.resource_label",
+        &[("cpu", "0.0%"), ("rss", "0 B")],
+    )
 }
 
 /// 세션 서브행의 자원 셀 — 세션 트리(셸+자손) 합산 CPU/RSS(+프로세스 수, 높음 표시).
@@ -350,7 +360,7 @@ fn state_label(ui: &mut egui::Ui, catalog: &i18n::Catalog, row: &ActivityWorkspa
     let key = match row.state {
         ActivityWorkspaceState::Active => "activity.state.active",
         ActivityWorkspaceState::Warm => "activity.state.warm",
-        ActivityWorkspaceState::Suspended => "activity.state.suspended",
+        ActivityWorkspaceState::Idle => "activity.state.idle",
     };
     let mut text = catalog.t(key, &[]);
     if let Some(secs) = row.backgrounded_for_secs {
@@ -374,7 +384,7 @@ fn state_label(ui: &mut egui::Ui, catalog: &i18n::Catalog, row: &ActivityWorkspa
         ActivityWorkspaceState::Warm => {
             ui.label(text);
         }
-        ActivityWorkspaceState::Suspended => {
+        ActivityWorkspaceState::Idle => {
             ui.weak(text);
         }
     };
@@ -508,10 +518,32 @@ mod tests {
     fn empty_activity_summary_is_zeroed() {
         let summary = activity_summary(&[]);
         assert_eq!(summary.workspaces, 0);
+        assert_eq!(summary.idle, 0);
         assert_eq!(summary.sessions, 0);
         assert_eq!(summary.cpu_percent, None);
         assert_eq!(summary.rss_bytes, 0);
         assert_eq!(summary.warnings, 0);
+    }
+
+    #[test]
+    fn idle_workspace_is_kept_in_the_full_summary() {
+        let rows = [ActivityWorkspaceRow {
+            name: "idle-project".to_owned(),
+            state: ActivityWorkspaceState::Idle,
+            session_count: 0,
+            pending_events: 0,
+            input_pressure: None,
+            backgrounded_for_secs: None,
+            auto_suspend_remaining_secs: None,
+            resource: None,
+            session_resources: Vec::new(),
+            sessions: Vec::new(),
+        }];
+        let summary = activity_summary(&rows);
+        assert_eq!(summary.workspaces, 1);
+        assert_eq!(summary.idle, 1);
+        assert_eq!(summary.active, 0);
+        assert_eq!(summary.warm, 0);
     }
 
     #[test]
@@ -558,6 +590,13 @@ mod tests {
         assert!(label.contains("Child CPU 25.0%"));
         assert!(label.contains("128.0 MiB"));
         assert!(label.contains("High"));
+    }
+
+    #[test]
+    fn idle_resource_label_reports_zero_instead_of_missing_sample() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let label = zero_resource_label(&catalog);
+        assert_eq!(label, "CPU 0.0% / RSS 0 B");
     }
 
     #[test]

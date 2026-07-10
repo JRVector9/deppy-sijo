@@ -723,6 +723,21 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// 런타임이 없는 워크스페이스의 활동 화면에 쓸 영속 pane 제목 snapshot.
+    /// `sessions` 전체는 닫힌 과거 이력도 남으므로, 현재 복원 레이아웃에 연결된
+    /// `mux_panes`만 읽는다. 한 쿼리로 모든 workspace를 반환해 UI의 N+1을 피한다.
+    pub fn list_persisted_activity_panes(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT p.workspace_id,
+                    COALESCE(NULLIF(p.title, ''), NULLIF(s.title, ''), p.id)
+               FROM mux_panes p
+               LEFT JOIN sessions s ON s.id = p.session_id
+              ORDER BY p.workspace_id, p.created_at, p.id",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// 환경/API 프로젝트 목록용 집계. workspace별 profile/var와 credential을 UI에서
     /// N+1 조회하지 않도록 한 SQL snapshot으로 반환한다. key_count는 현재 UI 계약대로
     /// 해당 workspace에서 보이는(소속+전역) credential 중 dotenv profile이 참조하는
@@ -1465,6 +1480,57 @@ mod tests {
         // 다른 workspace는 그대로
         assert!(db.list_workspaces().unwrap().iter().any(|w| w.id == other));
         assert_eq!(db.list_env_profiles(&other).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn activity_panes는_현재_mux_layout의_pane만_반환한다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("idle").unwrap();
+        for (id, title) in [
+            ("session-live", "saved shell"),
+            ("session-old", "old shell"),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO sessions
+                       (id, workspace_id, session_kind, agent_id, title, command, args_json,
+                        cwd, status, created_at, updated_at, last_log_offset)
+                     VALUES (?1, ?2, 'shell', NULL, ?3, 'sh', '[]', '/', 'exited',
+                        '2026-01-01', '2026-01-01', 0)",
+                    (id, &ws, title),
+                )
+                .unwrap();
+        }
+        db.conn
+            .execute(
+                "INSERT INTO mux_windows
+                   (id, workspace_id, title, active_tab_id, created_at, updated_at)
+                 VALUES ('window-1', ?1, NULL, NULL, '2026-01-01', '2026-01-01')",
+                [&ws],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO mux_tabs
+                   (id, window_id, workspace_id, title, tab_index, created_at, updated_at)
+                 VALUES ('tab-1', 'window-1', ?1, 'tab', 0, '2026-01-01', '2026-01-01')",
+                [&ws],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO mux_panes
+                   (id, workspace_id, tab_id, session_id, title, pane_kind, created_at, updated_at)
+                 VALUES ('pane-1', ?1, 'tab-1', 'session-live', '', 'terminal',
+                    '2026-01-01', '2026-01-01')",
+                [&ws],
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.list_persisted_activity_panes().unwrap(),
+            vec![(ws, "saved shell".to_owned())]
+        );
     }
 
     #[test]

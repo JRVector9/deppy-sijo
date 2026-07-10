@@ -28,6 +28,11 @@ use crate::resource_monitor::{
 /// 재시작 시 한 세션에서 terminal parser로 다시 읽는 ANSI tail 상한. 전체 audit 로그는
 /// append-only로 보존하되 시작 I/O/CPU는 세션당 유계로 유지한다.
 const MAX_ANSI_REPLAY_BYTES: u64 = 16 * 1024 * 1024;
+/// `terminal.size`가 없던 구버전 로그에서 마지막 zsh ZLE redraw 너비를 찾는 tail 상한.
+/// geometry 복구는 최초 한 번뿐이고 이후 resize가 sidecar를 기록한다.
+const MAX_ANSI_GEOMETRY_SCAN_BYTES: u64 = 256 * 1024;
+const DEFAULT_TERMINAL_COLS: u16 = 80;
+const DEFAULT_TERMINAL_ROWS: u16 = 24;
 /// 연속 출력 중 viewport snapshot을 만들 수 있는 최소 간격. 8ms는 120Hz 화면을
 /// 따라가면서도 token/chunk마다 전체 grid snapshot을 만드는 폭주를 막는다.
 const ACTIVE_VIEWPORT_FRAME_INTERVAL: Duration = Duration::from_millis(8);
@@ -958,10 +963,11 @@ impl Worker {
                 cols,
                 rows,
             } => {
-                if let Some(active) = self.sessions.get_mut(&session)
-                    && let Some(event) = active.resize(cols, rows)
-                {
-                    trace_terminal_cache_event(session, event);
+                if let Some(active) = self.sessions.get_mut(&session) {
+                    if let Some(event) = active.resize(cols, rows) {
+                        trace_terminal_cache_event(session, event);
+                    }
+                    self.save_terminal_size(session, cols, rows);
                 }
             }
             RuntimeCommand::Scroll { session, delta } => {
@@ -1120,6 +1126,62 @@ impl Worker {
         }
     }
 
+    /// 영속 sidecar가 있으면 정확한 마지막 grid를 사용한다. 구버전 세션은 zsh가
+    /// PROMPT_EOL_MARK를 지울 때 남긴 width-dependent ANSI 패턴에서 열 수를 한 번
+    /// 추론한다. 80열 로그를 실제 121열 pane처럼 잘못 재생하면 공백이 wrap되어
+    /// 역상 `%`와 중복 프롬프트가 화면 곳곳에 남는다.
+    fn restored_terminal_size(logs_root: &std::path::Path, persistent_id: &str) -> (u16, u16) {
+        match SessionLogWriter::load_terminal_size(logs_root, persistent_id) {
+            Ok(Some(size)) => return size,
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(persistent_id, "저장 터미널 크기 무시: {error:#}");
+            }
+        }
+
+        let path = match SessionLogWriter::ansi_path(logs_root, persistent_id) {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::warn!(persistent_id, "복원 ANSI 로그 경로 거부: {error:#}");
+                return (DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS);
+            }
+        };
+        match infer_zsh_terminal_cols(&path, MAX_ANSI_GEOMETRY_SCAN_BYTES) {
+            Ok(Some(cols)) => {
+                tracing::info!(persistent_id, cols, "구버전 ANSI 로그에서 터미널 너비 복구");
+                (cols, DEFAULT_TERMINAL_ROWS)
+            }
+            Ok(None) => (DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS)
+            }
+            Err(error) => {
+                tracing::warn!(persistent_id, path = %path.display(), "복원 터미널 너비 탐색 실패: {error}");
+                (DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS)
+            }
+        }
+    }
+
+    fn save_terminal_size(&self, session: SessionId, cols: u16, rows: u16) {
+        let Some(persistent_id) = self
+            .persist
+            .as_ref()
+            .and_then(|pipe| pipe.session_log_key(session))
+        else {
+            return;
+        };
+        if let Err(error) =
+            SessionLogWriter::save_terminal_size(&self.logs_root, persistent_id, cols, rows)
+        {
+            tracing::warn!(
+                persistent_id,
+                cols,
+                rows,
+                "터미널 크기 영속 실패: {error:#}"
+            );
+        }
+    }
+
     /// pane이 가리키는 이전 영속 세션의 redacted ANSI를 새 terminal backend에
     /// 스트리밍 재생한다. 파일이 없는 최초/legacy 세션은 정상적인 빈 복원이다.
     fn replay_saved_ansi(logs_root: &std::path::Path, persistent_id: &str, session: &mut Session) {
@@ -1146,12 +1208,19 @@ impl Worker {
             }
         };
         match session.replay_ansi(&mut file) {
-            Ok(bytes) => tracing::info!(
-                persistent_id,
-                bytes,
-                replay_start,
-                "이전 ANSI scrollback 복원"
-            ),
+            Ok(bytes) => {
+                if bytes > 0
+                    && let Err(error) = session.finish_ansi_replay()
+                {
+                    tracing::warn!(persistent_id, "ANSI 복원 경계 초기화 실패: {error:#}");
+                }
+                tracing::info!(
+                    persistent_id,
+                    bytes,
+                    replay_start,
+                    "이전 ANSI scrollback 복원"
+                );
+            }
             Err(e) => tracing::warn!(persistent_id, "이전 ANSI scrollback 복원 실패: {e:#}"),
         }
     }
@@ -1318,12 +1387,17 @@ impl Worker {
             }
         }
         let spawn_cwd = Self::spawn_cwd_string(&spec.cwd);
+        let (restore_cols, restore_rows) = pane_state
+            .session_id
+            .as_deref()
+            .map(|persistent_id| Self::restored_terminal_size(&self.logs_root, persistent_id))
+            .unwrap_or((DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS));
         match Self::spawn_session(
             id,
             session::SessionKind::Shell,
             &spec,
-            80,
-            24,
+            restore_cols,
+            restore_rows,
             Self::RESTORE_SCROLLBACK_LINES,
         ) {
             Ok(mut new_session) => {
@@ -1905,6 +1979,51 @@ fn trace_terminal_cache_event(session: SessionId, event: TerminalCacheEvent) {
 /// (복원 시 counter 전진용).
 fn title_suffix(title: &str) -> Option<u64> {
     title.rsplit(' ').next()?.parse().ok()
+}
+
+/// zsh ZLE의 기본 PROMPT_EOL_MARK redraw는 `%`를 역상으로 그린 뒤 정확히
+/// `COLUMNS - 1`개의 공백을 출력하고 CR로 되돌아온다. 이 raw ANSI 패턴의 가장
+/// 마지막 항목으로 `terminal.size` 도입 전 로그의 최종 열 수를 복구한다.
+fn infer_zsh_terminal_cols(path: &std::path::Path, max_bytes: u64) -> std::io::Result<Option<u16>> {
+    use std::io::{Read as _, Seek as _};
+
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(max_bytes);
+    file.seek(std::io::SeekFrom::Start(start))?;
+    let mut tail = Vec::with_capacity(usize::try_from(len - start).unwrap_or(0));
+    file.read_to_end(&mut tail)?;
+    Ok(infer_zsh_terminal_cols_from_bytes(&tail))
+}
+
+fn infer_zsh_terminal_cols_from_bytes(bytes: &[u8]) -> Option<u16> {
+    const PREFIX: &[u8] = b"\x1b[1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m";
+    const SUFFIX: &[u8] = b"\r \r\r";
+
+    let mut latest = None;
+    let mut index = 0usize;
+    while index + PREFIX.len() <= bytes.len() {
+        if &bytes[index..index + PREFIX.len()] != PREFIX {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index + PREFIX.len();
+        let spaces_start = cursor;
+        while cursor < bytes.len() && bytes[cursor] == b' ' && cursor - spaces_start <= 500 {
+            cursor += 1;
+        }
+        let spaces = cursor - spaces_start;
+        if spaces > 0
+            && cursor + SUFFIX.len() <= bytes.len()
+            && &bytes[cursor..cursor + SUFFIX.len()] == SUFFIX
+            && let Ok(cols) = u16::try_from(spaces + 1)
+            && (10..=500).contains(&cols)
+        {
+            latest = Some(cols);
+        }
+        index += PREFIX.len();
+    }
+    latest
 }
 
 /// ANSI tail cutoff가 escape/UTF-8 sequence 한가운데 놓이지 않게 다음 newline 뒤로
@@ -3562,11 +3681,27 @@ mod tests {
                     scrollback_lines: 100,
                 })
                 .unwrap();
+            let runtime_session = probe.wait_for(Duration::from_secs(15), |event| match event {
+                RuntimeEvent::Viewport {
+                    session, snapshot, ..
+                } if snapshot.visible_cells.iter().any(|cell| {
+                    cell.c == 'P' && cell.fg == [12, 34, 56] && cell.bg == [78, 90, 123]
+                }) =>
+                {
+                    Some(*session)
+                }
+                _ => None,
+            });
+            client
+                .send_command(RuntimeCommand::Resize {
+                    session: runtime_session,
+                    cols: 121,
+                    rows: 47,
+                })
+                .unwrap();
             probe.wait_for(Duration::from_secs(15), |event| match event {
                 RuntimeEvent::Viewport { snapshot, .. }
-                    if snapshot.visible_cells.iter().any(|cell| {
-                        cell.c == 'P' && cell.fg == [12, 34, 56] && cell.bg == [78, 90, 123]
-                    }) =>
+                    if (snapshot.cols, snapshot.rows) == (121, 47) =>
                 {
                     Some(())
                 }
@@ -3579,6 +3714,10 @@ mod tests {
             .query_row("SELECT id FROM sessions", [], |row| row.get(0))
             .unwrap();
         let ansi_path = SessionLogWriter::ansi_path(&logs_root, &persistent_id).unwrap();
+        assert_eq!(
+            SessionLogWriter::load_terminal_size(&logs_root, &persistent_id).unwrap(),
+            Some((121, 47))
+        );
         assert!(
             std::fs::read(&ansi_path)
                 .unwrap()
@@ -3601,9 +3740,10 @@ mod tests {
             .unwrap();
         probe.wait_for(Duration::from_secs(15), |event| match event {
             RuntimeEvent::Viewport { snapshot, .. }
-                if snapshot.visible_cells.iter().any(|cell| {
-                    cell.c == 'P' && cell.fg == [12, 34, 56] && cell.bg == [78, 90, 123]
-                }) =>
+                if (snapshot.cols, snapshot.rows) == (121, 47)
+                    && snapshot.visible_cells.iter().any(|cell| {
+                        cell.c == 'P' && cell.fg == [12, 34, 56] && cell.bg == [78, 90, 123]
+                    }) =>
             {
                 Some(())
             }
@@ -3883,6 +4023,30 @@ mod tests {
         file.read_to_end(&mut restored).unwrap();
         assert!(restored.is_empty());
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn 구버전_zsh_ansi에서_마지막_terminal_너비를_복구한다() {
+        fn marker(cols: usize) -> Vec<u8> {
+            let mut bytes = b"\x1b[1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m".to_vec();
+            bytes.extend(std::iter::repeat_n(b' ', cols - 1));
+            bytes.extend_from_slice(b"\r \r\r");
+            bytes
+        }
+
+        let mut log = b"old output\r\n".to_vec();
+        log.extend(marker(121));
+        log.extend_from_slice(b"prompt\r\n");
+        log.extend(marker(84));
+        assert_eq!(super::infer_zsh_terminal_cols_from_bytes(&log), Some(84));
+
+        // tail에 잘린 최신 marker가 있어도 마지막 완전한 항목을 사용한다.
+        log.extend_from_slice(b"\x1b[1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m   ");
+        assert_eq!(super::infer_zsh_terminal_cols_from_bytes(&log), Some(84));
+        assert_eq!(
+            super::infer_zsh_terminal_cols_from_bytes(b"plain shell output"),
+            None
+        );
     }
 
     #[cfg(unix)]

@@ -13,6 +13,9 @@ mod logs;
 
 pub use logs::SessionLogWriter;
 
+/// 종료 세션 스크롤백 압축 아카이브 (§14.3 확장 — PR-A1)
+pub mod scrollback_archive;
+
 mod write_worker;
 pub use write_worker::{
     DbWriteHandle, DbWriteQueueError, DbWriteStatsSnapshot, DbWriteWorker, DbWriteWorkerConfig,

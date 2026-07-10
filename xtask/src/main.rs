@@ -249,6 +249,13 @@ const DB_CALL_ALLOW: &[BoundaryAllow] = &[
     },
     BoundaryAllow {
         path: "crates/app/src/ui/connectors.rs",
+        // 가져오기(run_import)의 이름 중복 검사용 조회 (2026-07-11)
+        snippet: "let mut existing: std::collections::HashSet<String> = match db.list_mcp_servers()",
+        count: 1,
+        reason: "PR-B00 deferred connector storage boundary",
+    },
+    BoundaryAllow {
+        path: "crates/app/src/ui/connectors.rs",
         snippet: "if let Err(e) = db.insert_credential(&meta) {",
         count: 1,
         reason: "PR-B00 deferred connector OAuth metadata storage boundary",
@@ -285,8 +292,9 @@ const DB_CALL_ALLOW: &[BoundaryAllow] = &[
     },
     BoundaryAllow {
         path: "crates/app/src/ui/connectors.rs",
+        // 수동 추가 폼 + mcpServers 가져오기(run_import) 두 경로 (2026-07-11)
         snippet: "match db.insert_mcp_server(&row) {",
-        count: 1,
+        count: 2,
         reason: "PR-B00 deferred connector MCP server storage boundary",
     },
     // env_profiles: dead 비-compact contents() 삭제(PR-ENV-D)로 compact 경로의 실제

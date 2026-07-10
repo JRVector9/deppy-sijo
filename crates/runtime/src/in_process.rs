@@ -187,6 +187,7 @@ impl InProcessRuntimeClient {
                     cache_budget_bytes: TERMINAL_GLOBAL_CACHE_BUDGET_BYTES,
                     archived: std::collections::HashMap::new(),
                     archived_order: std::collections::VecDeque::new(),
+                    archived_on_disk: std::collections::HashSet::new(),
                     hidden_scrollback: std::collections::HashSet::new(),
                     render_active: true,
                     suspended: false,
@@ -375,6 +376,9 @@ struct Worker {
     archived: std::collections::HashMap<SessionId, ArchivedScrollback>,
     /// 아카이브 삽입 순서 (오래된 것이 앞 — 총 바이트 예산 초과 시 제거 순서)
     archived_order: std::collections::VecDeque<SessionId>,
+    /// 디스크 아카이브(scrollback.zlib)가 있는 세션들 (PR-A1) — 메모리 아카이브가
+    /// 예산 축출돼도 디스크에서 복원 가능함을 fs stat 없이 판정한다.
+    archived_on_disk: std::collections::HashSet<SessionId>,
     /// 현재 hidden scrollback cap이 적용된 running 세션들 (§14.3) — 전이 감지용.
     hidden_scrollback: std::collections::HashSet<SessionId>,
     /// Active면 visible pane snapshot 생성, false(Warm 등)면 중단 (§14.1). 세션은 유지.
@@ -387,6 +391,21 @@ struct Worker {
     resource_monitor: ProcessResourceMonitor,
     /// backpressure를 emit한 세션들 — 큐가 비면 해소 이벤트(queued=0)를 보낸다(2026-07-09).
     pressured_sessions: std::collections::HashSet<SessionId>,
+}
+
+/// SessionKind ↔ 아카이브 헤더 kind 바이트 (0=shell, 1=agent).
+fn archive_kind_to_u8(kind: session::SessionKind) -> u8 {
+    match kind {
+        session::SessionKind::Shell => 0,
+        session::SessionKind::Agent => 1,
+    }
+}
+
+fn archive_kind_from_u8(byte: u8) -> session::SessionKind {
+    match byte {
+        1 => session::SessionKind::Agent,
+        _ => session::SessionKind::Shell,
+    }
 }
 
 /// 압축 아카이브 항목 — 백엔드를 내린 exited 세션의 복원 재료 (§14.3 확장).
@@ -619,6 +638,17 @@ impl Worker {
             }
             if let Err(e) = pipe.flush_async_writes() {
                 tracing::warn!("세션 영속 batch flush 실패 (shutdown): {e:#}");
+            }
+        }
+        // 스크롤백 아카이브 flush (PR-A1): 미기록 exited + suspend로 죽는 running
+        // agent의 최종 grid — 재시작/suspend 해제 후 열람 복원(PR-A2)의 원천.
+        // running 셸은 제외 — 복원 시 respawn+로그 replay가 기대 동작이다.
+        for session in &all_sessions {
+            let skip = self.sessions.get(session).is_some_and(|live| {
+                live.lifecycle().is_running() && live.kind() == session::SessionKind::Shell
+            });
+            if !skip {
+                self.write_scrollback_archive(*session);
             }
         }
         let open_sessions: Vec<SessionId> = self.logs.keys().copied().collect();
@@ -1688,7 +1718,10 @@ impl Worker {
         // 아카이브된 세션의 pane이 보이면 먼저 복원한다 — 복원 직후 dirty라
         // 아래 루프가 같은 tick에 Viewport를 push한다 ("연결 중…" 공백 없음).
         for session in self.mux.watched_sessions() {
-            if !self.sessions.contains_key(&session) && self.archived.contains_key(&session) {
+            if !self.sessions.contains_key(&session)
+                && (self.archived.contains_key(&session)
+                    || self.archived_on_disk.contains(&session))
+            {
                 self.inflate_archived(session);
             }
         }
@@ -1848,6 +1881,9 @@ impl Worker {
             }
             // scrollback 열람용으로 backend를 유지하되 개수를 유계로 (§14.3)
             self.exited_order.push_back(session);
+            // 최종 grid를 디스크 아카이브로 기록 (PR-A1) — exited grid는 불변이라
+            // 이 시점 1회 기록으로 suspend/재시작 생존이 보장된다.
+            self.write_scrollback_archive(session);
         }
         // 이번 tick의 이벤트(SessionExited/Viewport 등)를 먼저 emit한다.
         // archival의 detach MuxUpdated가 이보다 먼저 가면, 같은 tick에 cap 초과로
@@ -2044,31 +2080,132 @@ impl Worker {
         }
     }
 
-    /// 아카이브된 세션의 pane이 다시 보이면 백엔드를 복원한다 (열람 시 inflate).
-    /// 복원된 세션은 다시 exited LRU의 최신 자리로 들어간다.
-    fn inflate_archived(&mut self, session: SessionId) {
-        let Some(entry) = self.archived.remove(&session) else {
-            return;
+    /// exited 세션의 최종 grid를 디스크 아카이브로 기록한다 (PR-A1).
+    /// persist UUID 세션만 대상, 파일이 있으면 skip(exited grid 불변), 빈 grid 생략.
+    /// 아카이브는 grid 원문이므로 디스크에 닿기 전 redaction 필수 (§7 — 로그와 달리
+    /// 이 덤프는 StreamRedactor를 거치지 않은 상태다).
+    fn write_scrollback_archive(&mut self, session: SessionId) {
+        let Some(key) = self
+            .persist
+            .as_ref()
+            .and_then(|pipe| pipe.session_log_key(session))
+            .map(str::to_owned)
+        else {
+            return; // 비영속 세션 — 메모리 아카이브만
         };
-        self.archived_order.retain(|s| *s != session);
-        let mut dump = Vec::new();
-        let mut decoder = flate2::read::ZlibDecoder::new(entry.compressed.as_slice());
-        if std::io::Read::read_to_end(&mut decoder, &mut dump).is_err() {
-            tracing::warn!(session = session.0, "archived scrollback 해제 실패 — 폐기");
+        if storage::scrollback_archive::exists(&self.logs_root, &key) {
+            self.archived_on_disk.insert(session);
             return;
         }
-        let restored = Session::restore_archived(
-            session,
-            entry.kind,
-            entry.cols,
-            entry.rows,
-            entry.scrollback_lines,
-            entry.exit_code,
-            &dump,
-        );
+        let Some(live) = self.sessions.get(&session) else {
+            return;
+        };
+        // 빈 grid는 기록 생략 (VS Code v1.69 노이즈 억제 차용)
+        let footprint = live.cache_footprint();
+        if footprint.history_lines == 0 && live.screen_text().trim().is_empty() {
+            return;
+        }
+        let Some(dump) = live.serialize_scrollback() else {
+            return; // 직렬화 미지원 백엔드 (experimental ghostty)
+        };
+        let mut redactor = self.redaction.stream_redactor();
+        let mut redacted = redactor.redact_chunk(&dump);
+        redacted.extend(redactor.flush());
+        let meta = storage::scrollback_archive::ArchiveMeta {
+            kind: archive_kind_to_u8(live.kind()),
+            cols: footprint.columns.min(u16::MAX as usize) as u16,
+            rows: footprint.screen_lines.min(u16::MAX as usize) as u16,
+            scrollback_lines: footprint.scrollback_limit_lines.min(u32::MAX as usize) as u32,
+            exit_code: match live.lifecycle() {
+                session::SessionLifecycle::Exited { exit_code } => exit_code,
+                session::SessionLifecycle::Running => None,
+            },
+        };
+        match storage::scrollback_archive::write(&self.logs_root, &key, &meta, &redacted) {
+            Ok(()) => {
+                self.archived_on_disk.insert(session);
+                if let Err(e) = storage::scrollback_archive::gc(
+                    &self.logs_root,
+                    storage::scrollback_archive::ARCHIVE_DISK_BUDGET_BYTES,
+                ) {
+                    tracing::warn!("scrollback 아카이브 GC 실패: {e:#}");
+                }
+            }
+            Err(e) => tracing::warn!(session = session.0, "scrollback 아카이브 기록 실패: {e:#}"),
+        }
+    }
+
+    /// 아카이브된 세션의 pane이 다시 보이면 백엔드를 복원한다 (열람 시 inflate).
+    /// 메모리 아카이브 우선, 예산 축출로 내려갔으면 디스크 아카이브 폴백 (PR-A1).
+    /// 복원된 세션은 다시 exited LRU의 최신 자리로 들어간다.
+    fn inflate_archived(&mut self, session: SessionId) {
+        if let Some(entry) = self.archived.remove(&session) {
+            self.archived_order.retain(|s| *s != session);
+            let mut dump = Vec::new();
+            let mut decoder = flate2::read::ZlibDecoder::new(entry.compressed.as_slice());
+            if std::io::Read::read_to_end(&mut decoder, &mut dump).is_ok() {
+                self.insert_restored_session(
+                    session,
+                    entry.kind,
+                    entry.cols,
+                    entry.rows,
+                    entry.scrollback_lines,
+                    entry.exit_code,
+                    &dump,
+                );
+                tracing::info!(session = session.0, "archived scrollback 복원 (메모리)");
+                return;
+            }
+            tracing::warn!(
+                session = session.0,
+                "메모리 아카이브 해제 실패 — 디스크 폴백"
+            );
+        }
+        // 디스크 폴백: exit 시 기록해 둔 scrollback.zlib (persist UUID 세션만)
+        let Some(key) = self
+            .persist
+            .as_ref()
+            .and_then(|pipe| pipe.session_log_key(session))
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        match storage::scrollback_archive::read(&self.logs_root, &key) {
+            Ok(Some((meta, dump))) => {
+                self.insert_restored_session(
+                    session,
+                    archive_kind_from_u8(meta.kind),
+                    meta.cols,
+                    meta.rows,
+                    meta.scrollback_lines as usize,
+                    meta.exit_code,
+                    &dump,
+                );
+                tracing::info!(session = session.0, "archived scrollback 복원 (디스크)");
+            }
+            Ok(None) => {
+                self.archived_on_disk.remove(&session);
+            }
+            Err(e) => tracing::warn!(session = session.0, "디스크 아카이브 읽기 실패: {e:#}"),
+        }
+    }
+
+    /// 아카이브 덤프로 열람 전용 세션을 만들어 편입한다 (inflate 공통 경로).
+    #[expect(clippy::too_many_arguments, reason = "아카이브 메타 필드 그대로")]
+    fn insert_restored_session(
+        &mut self,
+        session: SessionId,
+        kind: session::SessionKind,
+        cols: u16,
+        rows: u16,
+        scrollback_lines: usize,
+        exit_code: Option<u32>,
+        dump: &[u8],
+    ) {
+        let restored =
+            Session::restore_archived(session, kind, cols, rows, scrollback_lines, exit_code, dump);
         self.sessions.insert(session, restored);
         self.exited_order.push_back(session);
-        tracing::info!(session = session.0, "archived scrollback 복원");
     }
 
     fn terminal_cache_bytes(&self) -> usize {
@@ -3603,6 +3740,63 @@ mod tests {
         // 재시작 crash recovery와의 연동: exited라 reconcile 대상 아님 (멱등)
         assert_eq!(persist::reconcile_orphan_sessions(&conn).unwrap(), 0);
         drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// PR-A1: 세션 exit 시 최종 grid가 디스크 아카이브(scrollback.zlib)로 기록되고,
+    /// 메타·내용이 라운드트립된다 (suspend/재시작 생존의 원천).
+    #[cfg(unix)]
+    #[test]
+    fn exit시_scrollback_아카이브가_디스크에_기록된다() {
+        init_mock_store();
+        let dir = std::env::temp_dir().join(format!("deppy-rtarchive-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("metadata.sqlite3");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT, path TEXT,
+                     created_at TEXT DEFAULT '', updated_at TEXT DEFAULT '');
+                 CREATE TABLE agent_configs (id TEXT PRIMARY KEY);
+                 INSERT INTO workspaces (id) VALUES ('ws-arch');",
+            )
+            .unwrap();
+            conn.execute_batch(persist::MIGRATION_SQL).unwrap();
+        }
+        let logs_root = test_logs_root("archive");
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            logs_root.clone(),
+            RedactionService::new(),
+            spec("/bin/cat", &[]),
+            Some(crate::persistence::PersistConfig {
+                db_path: db_path.clone(),
+                workspace_id: "ws-arch".into(),
+            }),
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(spawn_agent_cmd("echo archive-roundtrip-marker", None, None))
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::SessionExited { .. } => Some(()),
+            _ => None,
+        });
+        std::thread::sleep(Duration::from_millis(200));
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let uuid: String = conn
+            .query_row("SELECT id FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        drop(conn);
+        let (meta, dump) = storage::scrollback_archive::read(&logs_root, &uuid)
+            .unwrap()
+            .expect("exit 시점에 아카이브 파일이 기록돼야 함");
+        assert_eq!(meta.kind, 1, "SpawnAgent 세션은 agent kind");
+        assert_eq!(meta.exit_code, Some(0));
+        let text = String::from_utf8_lossy(&dump);
+        assert!(text.contains("archive-roundtrip-marker"), "{text}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

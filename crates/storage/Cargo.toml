@@ -17,3 +17,5 @@ persist = { path = "../persist" }
 mcp-store = { path = "../mcp-store" }
 audit = { path = "../audit" }
 secret = { path = "../secret" }
+# scrollback 아카이브 압축 (PR-A1 — runtime과 동일 계열)
+flate2 = "1"

@@ -4643,6 +4643,7 @@ dependencies = [
  "anyhow",
  "audit",
  "deppy-core",
+ "flate2",
  "mcp-store",
  "persist",
  "rusqlite",

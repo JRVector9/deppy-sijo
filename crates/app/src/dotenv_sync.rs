@@ -1,11 +1,13 @@
-//! 프로젝트 루트의 `.env`를 설정 › 환경(env profile)으로 자동 동기화한다 (2026-07-07).
+//! 프로젝트 루트의 dotenv 파일들을 설정 › 환경(env profile)으로 자동 동기화한다 (2026-07-07).
 //!
-//! - workspace 활성화 시 루트 `.env`를 파싱해 kind=`dotenv` profile로 upsert한다.
+//! - workspace 활성화 시 루트의 `.env` → `.env.local`을 관례 순서로 **병합**해 파싱하고
+//!   (뒤 파일이 같은 키를 덮어씀 — dotenv 표준 우선순위) kind=`dotenv` profile로 upsert한다.
+//!   `.env.development` 같은 모드별 파일은 앱이 실행 모드를 모르므로 읽지 않는다.
 //!   secret으로 보이는 키(API/SECRET/TOKEN/…)는 값이 DB가 아닌 **OS keyring**(credential)에
-//!   저장되고, 나머지는 plain으로 저장된다. `.env`에서 사라진 키는 profile에서도 지운다.
-//! - `.env`가 source of truth — dotenv profile의 해당 키를 UI에서 고쳐도 다음 동기화가
-//!   `.env` 값으로 되돌린다(다른 profile은 건드리지 않음).
-//! - `.env` 파일이 없으면 아무것도 만들지 않고, 기존 dotenv profile은 그대로 둔다
+//!   저장되고, 나머지는 plain으로 저장된다. 병합 결과에서 사라진 키는 profile에서도 지운다.
+//! - dotenv 파일이 source of truth — dotenv profile의 해당 키를 UI에서 고쳐도 다음 동기화가
+//!   파일 값으로 되돌린다(다른 profile은 건드리지 않음).
+//! - dotenv 파일이 하나도 없으면 아무것도 만들지 않고, 기존 dotenv profile은 그대로 둔다
 //!   (일시적 체크아웃 차이로 저장된 환경이 사라지지 않게).
 
 use std::path::Path;
@@ -17,6 +19,8 @@ use crate::storage::Db;
 pub const DOTENV_PROFILE_KIND: &str = "dotenv";
 /// dotenv 자동 profile 이름.
 pub const DOTENV_PROFILE_NAME: &str = ".env";
+/// 스캔·병합할 dotenv 파일 이름(관례 순서 — 뒤 파일이 같은 키를 덮어씀).
+pub const DOTENV_FILE_NAMES: [&str; 2] = [".env", ".env.local"];
 
 pub use runtime::dotenv::{is_secret_key, parse_dotenv};
 
@@ -69,7 +73,28 @@ pub fn remove_workspace_dotenv(
     Ok(removed)
 }
 
-/// workspace 루트의 `.env`를 dotenv profile로 동기화한다. `.env`가 없으면 None.
+/// 루트의 dotenv 파일들(`DOTENV_FILE_NAMES` 순서)을 읽어 병합 파싱한다.
+/// 같은 키는 뒤 파일 값이 이긴다(순서는 처음 등장 위치 유지). 읽은 파일이 없으면 None.
+fn read_merged_dotenv(root: &Path) -> Option<Vec<(String, String)>> {
+    let mut merged: Vec<(String, String)> = Vec::new();
+    let mut found = false;
+    for name in DOTENV_FILE_NAMES {
+        let Ok(content) = std::fs::read_to_string(root.join(name)) else {
+            continue;
+        };
+        found = true;
+        for (key, value) in parse_dotenv(&content) {
+            match merged.iter_mut().find(|(k, _)| *k == key) {
+                Some(entry) => entry.1 = value,
+                None => merged.push((key, value)),
+            }
+        }
+    }
+    found.then_some(merged)
+}
+
+/// workspace 루트의 dotenv 파일들(`.env` → `.env.local` 병합)을 dotenv profile로
+/// 동기화한다. 파일이 하나도 없으면 None.
 /// secret 저장이 하나라도 실패하면 그 키만 건너뛰고 계속한다(best-effort).
 pub fn sync_workspace_dotenv(
     db: &Db,
@@ -78,11 +103,9 @@ pub fn sync_workspace_dotenv(
     workspace_id: &str,
     root: &Path,
 ) -> anyhow::Result<Option<DotenvSyncReport>> {
-    let env_path = root.join(".env");
-    let Ok(content) = std::fs::read_to_string(&env_path) else {
-        return Ok(None); // .env 없음 — 기존 profile은 보존
+    let Some(parsed) = read_merged_dotenv(root) else {
+        return Ok(None); // dotenv 파일 없음 — 기존 profile은 보존
     };
-    let parsed = parse_dotenv(&content);
 
     // dotenv profile 찾기/생성.
     let profile_id = match db
@@ -153,7 +176,7 @@ pub fn sync_workspace_dotenv(
         }
     }
 
-    // `.env`에서 사라진 키 제거 (+ 이 profile 전용 credential 정리).
+    // 병합 결과에서 사라진 키 제거 (+ 이 profile 전용 credential 정리).
     for var in &existing {
         if parsed.iter().any(|(k, _)| k == &var.key) {
             continue;
@@ -286,6 +309,77 @@ INVALID LINE
                 .is_none()
         );
         assert_eq!(db.list_env_vars(&profile.id).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_local이_env를_덮어쓰고_병합_기준으로_삭제한다() {
+        let dir =
+            std::env::temp_dir().join(format!("deppy-dotenv-merge-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("test.db")).unwrap();
+        let store = MemStore(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let redaction = secret::RedactionService::new();
+        let ws = db.create_workspace("test").unwrap();
+
+        // .env + .env.local — 겹치는 PORT는 .env.local이 이긴다.
+        std::fs::write(dir.join(".env"), "PORT=3000\nFOO=a\n").unwrap();
+        std::fs::write(dir.join(".env.local"), "PORT=5000\nBAR=b\n").unwrap();
+        let report = sync_workspace_dotenv(&db, &store, &redaction, &ws, &dir)
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.upserted, 3);
+        let profile = db
+            .list_env_profiles(&ws)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.kind == DOTENV_PROFILE_KIND)
+            .unwrap();
+        let vars = db.list_env_vars(&profile.id).unwrap();
+        assert_eq!(vars.len(), 3);
+        let port = vars.iter().find(|v| v.key == "PORT").unwrap();
+        assert_eq!(port.value, EnvValue::Plain("5000".to_owned()));
+
+        // .env.local 삭제 → PORT는 .env 값으로 복귀, BAR는 병합 결과에서 사라져 제거.
+        std::fs::remove_file(dir.join(".env.local")).unwrap();
+        let report = sync_workspace_dotenv(&db, &store, &redaction, &ws, &dir)
+            .unwrap()
+            .unwrap();
+        assert_eq!((report.upserted, report.removed), (1, 1));
+        let vars = db.list_env_vars(&profile.id).unwrap();
+        assert_eq!(vars.len(), 2);
+        let port = vars.iter().find(|v| v.key == "PORT").unwrap();
+        assert_eq!(port.value, EnvValue::Plain("3000".to_owned()));
+        assert!(!vars.iter().any(|v| v.key == "BAR"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_local만_있어도_동기화한다() {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-dotenv-local-only-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("test.db")).unwrap();
+        let store = MemStore(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let redaction = secret::RedactionService::new();
+        let ws = db.create_workspace("test").unwrap();
+
+        std::fs::write(dir.join(".env.local"), "PORT=7000\n").unwrap();
+        let report = sync_workspace_dotenv(&db, &store, &redaction, &ws, &dir)
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.upserted, 1);
+        let profile = db
+            .list_env_profiles(&ws)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.kind == DOTENV_PROFILE_KIND)
+            .unwrap();
+        let vars = db.list_env_vars(&profile.id).unwrap();
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].value, EnvValue::Plain("7000".to_owned()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

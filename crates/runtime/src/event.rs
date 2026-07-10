@@ -117,6 +117,14 @@ pub enum RuntimeEvent {
         session: SessionId,
         view: SessionStatusView,
     },
+    /// 재시작 시 아카이브에서 열람 전용으로 복원된 이미-종료된 세션 (PR-A2).
+    /// `SessionExited`와 달리 완료 **알림을 재발화하지 않는다** — 대신 UI가 생존
+    /// 추적(LiveSessionTracker)과 exit_code 부기를 갱신하는 데 쓴다.
+    /// **variant는 enum 끝에만 추가** (postcard discriminant — remote wire 호환).
+    SessionRestored {
+        session: SessionId,
+        exit_code: Option<u32>,
+    },
 }
 
 #[cfg(test)]

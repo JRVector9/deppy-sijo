@@ -3021,6 +3021,7 @@ mod tests {
             RuntimeEvent::SessionStatusViewChanged { .. } => "SessionStatusViewChanged",
             RuntimeEvent::ResourceUsage { .. } => "ResourceUsage",
             RuntimeEvent::PtyInputPressure { .. } => "PtyInputPressure",
+            RuntimeEvent::SessionRestored { .. } => "SessionRestored",
         }
     }
 

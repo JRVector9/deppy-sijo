@@ -920,7 +920,10 @@ impl LiveSessionTracker {
                 self.exited_sessions
                     .retain(|s| self.mux_sessions.contains(s));
             }
-            runtime::RuntimeEvent::SessionExited { session, .. } => {
+            runtime::RuntimeEvent::SessionExited { session, .. }
+            // 재시작 시 archived 복원된 세션도 이미 종료됨 — 생존 추적에서 제외해야
+            // auto-suspend/warm 축출이 정상 동작한다 (PR-A2 codex 리뷰 P1).
+            | runtime::RuntimeEvent::SessionRestored { session, .. } => {
                 self.exited_sessions.insert(*session);
             }
             _ => {}
@@ -5150,6 +5153,49 @@ h:1 EE:FF
         tracker.observe(&mux(&[]));
         assert!(tracker.exited_sessions.is_empty());
         assert!(!tracker.has_live());
+    }
+
+    /// PR-A2 회귀 방지: 재시작 시 archived 복원된 세션은 SessionRestored로 오고,
+    /// SessionExited와 동일하게 생존 추적에서 제외돼야 한다 (그러지 않으면 복원된
+    /// agent pane 때문에 auto-suspend/warm 축출이 영구 무력화됨 — codex 리뷰 P1).
+    #[test]
+    fn session_restored도_live_추적에서_제외된다() {
+        use std::sync::Arc;
+        let mut tracker = LiveSessionTracker::default();
+        let s1 = runtime::SessionId(1);
+        let mux = |sessions: &[runtime::SessionId]| runtime::RuntimeEvent::MuxUpdated {
+            snapshot: Arc::new(runtime::MuxSnapshot {
+                tabs: vec![runtime::TabSnapshot {
+                    id: runtime::MuxTabId::new(),
+                    title: "t".into(),
+                    layout: runtime::LayoutNode::Pane(runtime::MuxPaneId::new()),
+                    panes: sessions
+                        .iter()
+                        .map(|s| runtime::PaneSnapshot {
+                            id: runtime::MuxPaneId::new(),
+                            session_id: Some(*s),
+                            title: "p".into(),
+                        })
+                        .collect(),
+                }],
+                active_tab: None,
+                focused_pane: None,
+            }),
+        };
+        // 복원된 pane(세션 있음) — SessionExited 없이 SessionRestored만 온다
+        tracker.observe(&mux(&[s1]));
+        assert!(
+            tracker.has_live(),
+            "SessionRestored 관측 전에는 live로 보임"
+        );
+        tracker.observe(&runtime::RuntimeEvent::SessionRestored {
+            session: s1,
+            exit_code: Some(0),
+        });
+        assert!(
+            !tracker.has_live(),
+            "복원된 exited 세션은 live 아님 — auto-suspend 정상 동작"
+        );
     }
 
     /// env/API 프로젝트 행 캐시의 TTL 판정 — 캐시 없음/TTL 경과면 재계산, 그 안이면 재사용.

@@ -261,7 +261,11 @@ impl WorkspaceUi {
                         }
                     }
                 }
-                RuntimeEvent::SessionExited { session, exit_code } => {
+                // SessionExited(런타임 종료) / SessionRestored(재시작 시 아카이브 복원,
+                // PR-A2)는 UI 부기가 동일하다 — exit_code + 결과 상태 배지를 채운다.
+                // 완료 알림 차이(복원은 재발화 안 함)는 process_ws_notifications 몫.
+                RuntimeEvent::SessionExited { session, exit_code }
+                | RuntimeEvent::SessionRestored { session, exit_code } => {
                     if self.session_alive(*session) {
                         let view = self.sessions.entry(*session).or_default();
                         view.exit_code = Some(*exit_code);

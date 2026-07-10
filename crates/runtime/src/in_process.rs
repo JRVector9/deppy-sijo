@@ -1252,6 +1252,19 @@ impl Worker {
     /// pane이 가리키는 이전 영속 세션의 redacted ANSI를 새 terminal backend에
     /// 스트리밍 재생한다. 파일이 없는 최초/legacy 세션은 정상적인 빈 복원이다.
     fn replay_saved_ansi(logs_root: &std::path::Path, persistent_id: &str, session: &mut Session) {
+        Self::replay_saved_ansi_ext(logs_root, persistent_id, session, true);
+    }
+
+    /// `finish_boundary`: 재생 후 모드 경계(alt-screen 종료 등)를 리셋할지.
+    /// 셸 respawn 복원은 새 PTY가 붙기 전 정리가 필요해 true. **agent 열람 전용
+    /// 복원(PR-A2 폴백)은 false** — PTY가 안 붙으므로, alt-screen을 강제 종료하면
+    /// "종료 순간 화면 보존" 정책(PR-A1 §8)을 어기고 primary 빈 버퍼가 보인다.
+    fn replay_saved_ansi_ext(
+        logs_root: &std::path::Path,
+        persistent_id: &str,
+        session: &mut Session,
+        finish_boundary: bool,
+    ) {
         let path = match SessionLogWriter::ansi_path(logs_root, persistent_id) {
             Ok(path) => path,
             Err(e) => {
@@ -1277,6 +1290,7 @@ impl Worker {
         match session.replay_ansi(&mut file) {
             Ok(bytes) => {
                 if bytes > 0
+                    && finish_boundary
                     && let Err(error) = session.finish_ansi_replay()
                 {
                     tracing::warn!(persistent_id, "ANSI 복원 경계 초기화 실패: {error:#}");
@@ -1403,9 +1417,11 @@ impl Worker {
         }
         self.mux.fix_focus();
         self.emit_mux_and_watched();
-        // PR-A2: 열람 전용으로 복원된 exited 세션의 상태 배지 정합 — 상태 뷰만
-        // 재공표한다. SessionExited는 다시 emit하지 않는다(재시작마다 완료 알림이
-        // 재발화하는 것 방지 — 복원 시점에 exited인 세션은 전부 archived 복원분).
+        // PR-A2: 열람 전용으로 복원된 exited 세션을 UI에 알린다. SessionRestored는
+        // 완료 알림을 재발화하지 않으면서(재시작마다 done 알림 중복 방지) UI의 생존
+        // 추적(LiveSessionTracker)·exit_code 부기·상태 배지를 갱신한다. SessionExited를
+        // 그대로 쓰면 알림이 중복되고, 안 쓰면 세션이 "영원히 살아있는 것"으로 취급돼
+        // auto-suspend/warm 축출이 무력화된다 (codex 리뷰 P1).
         let restored_exited: Vec<(SessionId, Option<u32>)> = self
             .sessions
             .iter()
@@ -1424,6 +1440,7 @@ impl Worker {
                 session,
                 view: session::SessionStatusView::process_exit(status),
             });
+            self.emit(RuntimeEvent::SessionRestored { session, exit_code });
         }
     }
 
@@ -1590,7 +1607,8 @@ impl Worker {
                     None,
                     &[],
                 );
-                Self::replay_saved_ansi(&self.logs_root, persistent_id, &mut session);
+                // 열람 전용 — 모드 경계 리셋 생략(alt-screen 화면 보존, codex 리뷰 P2)
+                Self::replay_saved_ansi_ext(&self.logs_root, persistent_id, &mut session, false);
                 session
             }
         };

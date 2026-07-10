@@ -61,6 +61,17 @@ pub fn write(
         "scrollback 아카이브 크기 초과: {} bytes",
         redacted_ansi.len()
     );
+    // parse와 대칭인 불변식 — 범위 밖 meta는 기록 후 읽기에서 손상으로 오인돼
+    // 조용히 삭제되므로, 쓰기 시점에 거부해 데이터 유실을 막는다 (codex 리뷰 P3).
+    anyhow::ensure!(
+        meta.kind <= 1
+            && (1..=MAX_GRID_DIM).contains(&meta.cols)
+            && (1..=MAX_GRID_DIM).contains(&meta.rows),
+        "scrollback 아카이브 meta 범위 위반: kind={} cols={} rows={}",
+        meta.kind,
+        meta.cols,
+        meta.rows
+    );
     let path = archive_path(logs_root, session_key)?;
     let dir = path.parent().expect("archive_path는 항상 부모가 있다");
     std::fs::create_dir_all(dir)

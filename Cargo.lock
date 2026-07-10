@@ -2705,6 +2705,8 @@ dependencies = [
  "secret",
  "serde_json",
  "tracing",
+ "ureq",
+ "url",
 ]
 
 [[package]]

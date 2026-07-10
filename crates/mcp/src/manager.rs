@@ -1,6 +1,7 @@
 //! Local MCP Manager (설계문서 §1.5 v0 / PR-15).
 //! spawn → initialize 핸드셰이크 → initialized notification → tools/list.
-//! v0는 local stdio MCP only — Streamable HTTP/OAuth는 v1+ (§1.5).
+//! transport는 local stdio + Streamable HTTP(H2, crates/mcp/src/http.rs) —
+//! OAuth 사다리는 H4/H5.
 
 use std::time::Duration;
 
@@ -8,6 +9,7 @@ use anyhow::Context;
 use secret::RedactionService;
 use serde_json::{Value, json};
 
+use crate::http::{HttpClient, McpHttpServerConfig};
 use crate::transport::StdioClient;
 
 /// initialize 요청에 싣는 기준 스펙 개정판 (§1.5 — 최신 우선).
@@ -18,12 +20,8 @@ pub const PROTOCOL_VERSION: &str = "2025-11-25";
 /// 수용 가능한 서버 응답 protocolVersion 목록 (최신 우선, H1). 서버가 이 중 하나로
 /// 응답하면 협상 성공 — deppy는 tools/list·tools/call만 쓰므로 개정판 간 실질 차이
 /// 없다. 목록 밖 응답만 거부한다(엄격 gate 유지 — VS Code의 "무검증 수용"은 미채택).
-pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
-    "2025-11-25",
-    "2025-06-18",
-    "2025-03-26",
-    "2024-11-05",
-];
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// tools/list cursor 페이지네이션 상한 — 악의적 서버의 무한 cursor 방어
@@ -38,6 +36,26 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub inherit_env: bool,
+}
+
+impl McpServerConfig {
+    /// stdio 서버 config 생성자 — struct literal 대신 쓸 수 있는 헬퍼 (H2).
+    /// 이후 필드가 추가돼도 이 경로의 호출측은 깨지지 않는다.
+    pub fn stdio(
+        name: String,
+        command: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        inherit_env: bool,
+    ) -> Self {
+        Self {
+            name,
+            command,
+            args,
+            env,
+            inherit_env,
+        }
+    }
 }
 
 impl std::fmt::Debug for McpServerConfig {
@@ -109,29 +127,28 @@ impl LocalMcpManager {
             )
             .with_context(|| format!("MCP 서버 '{}' initialize 실패", config.name))?;
 
-        // 서버 응답 버전이 지원 목록에 있으면 협상 성공 (H1). 목록 밖만 거부한다 —
-        // 실서버 상당수가 아직 구 개정판으로 응답하므로 정확 일치 gate는 과도했다.
-        let server_version = initialize_result
-            .get("protocolVersion")
-            .and_then(Value::as_str);
-        let negotiated = server_version
-            .filter(|version| SUPPORTED_PROTOCOL_VERSIONS.contains(version))
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "MCP 서버 '{}' protocolVersion 미지원: {:?} (지원: {})",
-                    config.name,
-                    server_version,
-                    SUPPORTED_PROTOCOL_VERSIONS.join(", ")
-                )
-            })?
-            .to_owned();
+        let negotiated = negotiate_protocol_version(&config.name, &initialize_result)?;
 
         client
             .notify("notifications/initialized", json!({}))
             .with_context(|| format!("MCP 서버 '{}' initialized notification 실패", config.name))?;
 
         Ok(McpConnection {
-            client,
+            client: TransportClient::Stdio(client),
+            initialize_result,
+            negotiated_version: negotiated,
+        })
+    }
+
+    /// Streamable HTTP 서버에 연결한다 (H2): URL 검증 → initialize(세션 캡처)
+    /// → 버전 협상 → initialized notification. 반환된 연결이 drop되면 세션
+    /// DELETE가 베스트에포트로 나간다.
+    pub fn connect_http(&self, config: &McpHttpServerConfig) -> anyhow::Result<McpConnection> {
+        let (client, initialize_result, negotiated) =
+            HttpClient::connect(config, self.request_timeout)
+                .with_context(|| format!("MCP 서버 '{}' HTTP 연결 실패", config.name))?;
+        Ok(McpConnection {
+            client: TransportClient::Http(client),
             initialize_result,
             negotiated_version: negotiated,
         })
@@ -156,16 +173,81 @@ impl LocalMcpManager {
         connection.call_tool(name, arguments)
         // connection drop → 서버 프로세스 정리
     }
+
+    /// HTTP connect → tools/list → 연결 종료(세션 DELETE)까지 한 번에 (H2).
+    pub fn discover_tools_http(
+        &self,
+        config: &McpHttpServerConfig,
+    ) -> anyhow::Result<Vec<McpTool>> {
+        let mut connection = self.connect_http(config)?;
+        connection.list_tools()
+        // connection drop → 세션 DELETE (베스트에포트)
+    }
+
+    /// HTTP connect → tools/call → 연결 종료(세션 DELETE)까지 한 번에 (H2).
+    /// connect-per-call 관례는 stdio와 동일 — 호출마다 새 세션을 수립한다.
+    pub fn call_tool_http(
+        &self,
+        config: &McpHttpServerConfig,
+        name: &str,
+        arguments: Value,
+    ) -> anyhow::Result<Value> {
+        let mut connection = self.connect_http(config)?;
+        connection.call_tool(name, arguments)
+        // connection drop → 세션 DELETE (베스트에포트)
+    }
 }
 
-/// initialize를 마친 stdio MCP 연결. drop 시 서버 프로세스를 kill + reap한다.
+/// initialize 응답의 protocolVersion을 지원 목록과 협상한다 (H1).
+/// 목록 밖만 거부 — 실서버 상당수가 아직 구 개정판으로 응답하므로 정확 일치
+/// gate는 과도했다. stdio(connect)와 HTTP(handshake·세션 재수립)가 공용으로 쓴다.
+pub(crate) fn negotiate_protocol_version(
+    server_name: &str,
+    initialize_result: &Value,
+) -> anyhow::Result<String> {
+    let server_version = initialize_result
+        .get("protocolVersion")
+        .and_then(Value::as_str);
+    server_version
+        .filter(|version| SUPPORTED_PROTOCOL_VERSIONS.contains(version))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "MCP 서버 '{server_name}' protocolVersion 미지원: {server_version:?} (지원: {})",
+                SUPPORTED_PROTOCOL_VERSIONS.join(", ")
+            )
+        })
+}
+
+/// transport별 클라이언트 — McpConnection이 요청을 위임한다 (H2).
+#[derive(Debug)]
+enum TransportClient {
+    /// stdio subprocess. drop 시 kill + reap.
+    Stdio(StdioClient),
+    /// Streamable HTTP. drop 시 세션 DELETE (베스트에포트).
+    Http(HttpClient),
+}
+
+impl TransportClient {
+    fn request(&mut self, method: &str, params: Value) -> anyhow::Result<Value> {
+        match self {
+            Self::Stdio(client) => client.request(method, params),
+            Self::Http(client) => client.request(method, params),
+        }
+    }
+}
+
+/// initialize를 마친 MCP 연결 (stdio 또는 Streamable HTTP).
+/// drop 시 stdio는 서버 프로세스를 kill + reap하고, HTTP는 세션을 DELETE한다.
 #[derive(Debug)]
 pub struct McpConnection {
-    client: StdioClient,
+    client: TransportClient,
     /// initialize 응답 원본 (protocolVersion / capabilities / serverInfo)
     pub initialize_result: Value,
     /// 협상된 프로토콜 버전 (H1) — HTTP transport(H2)가 이후 요청의
     /// `MCP-Protocol-Version` 헤더 값으로 쓴다. stdio는 헤더가 없어 미사용.
+    /// HTTP 세션 재수립(400/404 재시도) 시 내부적으로 재협상될 수 있다 —
+    /// 이 필드는 최초 connect 시점의 값이다.
     pub negotiated_version: String,
 }
 
@@ -203,9 +285,13 @@ impl McpConnection {
             .request("tools/call", json!({"name": name, "arguments": arguments}))
     }
 
-    /// 지금까지 캡처된 redacted stderr 로그.
+    /// 지금까지 캡처된 redacted stderr 로그 (stdio 전용 — HTTP는 stderr가
+    /// 없으므로 빈 문자열).
     pub fn stderr_log(&self) -> String {
-        self.client.stderr_log()
+        match &self.client {
+            TransportClient::Stdio(client) => client.stderr_log(),
+            TransportClient::Http(_) => String::new(),
+        }
     }
 }
 

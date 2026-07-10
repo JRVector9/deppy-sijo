@@ -27,6 +27,279 @@ struct ApprovalWatcher {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+struct EnvProjectRowsJob {
+    generation: u64,
+    workspaces: Vec<crate::storage::WorkspaceRow>,
+}
+
+struct EnvProjectRowsOutcome {
+    generation: u64,
+    rows: anyhow::Result<Vec<ui::env_project_list::EnvProjectRow>>,
+}
+
+struct EnvProjectRowsWorker {
+    tx: std::sync::mpsc::SyncSender<EnvProjectRowsJob>,
+    rx: std::sync::mpsc::Receiver<EnvProjectRowsOutcome>,
+}
+
+struct EnvSecretRevealJob {
+    generation: u64,
+    credential_id: String,
+}
+
+struct EnvSecretRevealOutcome {
+    generation: u64,
+    credential_id: String,
+    value: anyhow::Result<String>,
+}
+
+struct EnvSecretRevealWorker {
+    tx: std::sync::mpsc::SyncSender<EnvSecretRevealJob>,
+    rx: std::sync::mpsc::Receiver<EnvSecretRevealOutcome>,
+}
+
+type DotenvState = (bool, Option<std::time::SystemTime>);
+
+struct DotenvSyncJob {
+    generation: u64,
+    revision: u64,
+    workspace_id: String,
+    root: Option<PathBuf>,
+    previous_state: Option<DotenvState>,
+    force: bool,
+}
+
+struct DotenvSyncPayload {
+    report: Option<crate::dotenv_sync::DotenvSyncReport>,
+    env_plain: Vec<(String, String)>,
+    env_secrets: Vec<(String, String)>,
+}
+
+struct DotenvSyncOutcome {
+    generation: u64,
+    revision: u64,
+    workspace_id: String,
+    root: Option<PathBuf>,
+    baseline: DotenvState,
+    result: anyhow::Result<Option<DotenvSyncPayload>>,
+}
+
+struct DotenvSyncWorker {
+    tx: std::sync::mpsc::SyncSender<DotenvSyncJob>,
+    rx: std::sync::mpsc::Receiver<DotenvSyncOutcome>,
+}
+
+fn dotenv_state_for_root(root: Option<&std::path::Path>) -> DotenvState {
+    let Some(root) = root else {
+        return (false, None);
+    };
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    let mut exists = false;
+    for name in crate::dotenv_sync::DOTENV_FILE_NAMES {
+        match std::fs::metadata(root.join(name)) {
+            Ok(meta) => {
+                exists = true;
+                true.hash(&mut hasher);
+                meta.modified()
+                    .ok()
+                    .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos())
+                    .hash(&mut hasher);
+            }
+            Err(_) => false.hash(&mut hasher),
+        }
+    }
+    let digest = hasher.finish();
+    let surrogate = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(digest >> 1);
+    (exists, exists.then_some(surrogate))
+}
+
+fn load_dotenv_default_env(db: &Db, workspace_id: &str) -> anyhow::Result<(EnvPairs, EnvPairs)> {
+    let (mut env_plain, mut env_secrets) = (Vec::new(), Vec::new());
+    if let Some(profile) = db
+        .list_env_profiles(workspace_id)?
+        .into_iter()
+        .find(|profile| profile.kind == crate::dotenv_sync::DOTENV_PROFILE_KIND)
+    {
+        for var in db.list_env_vars(&profile.id)? {
+            match var.value {
+                crate::env::EnvValue::Plain(value) => env_plain.push((var.key, value)),
+                crate::env::EnvValue::Secret { credential_id } => {
+                    env_secrets.push((var.key, credential_id));
+                }
+            }
+        }
+    }
+    Ok((env_plain, env_secrets))
+}
+
+impl DotenvSyncWorker {
+    fn spawn(db_path: PathBuf, redaction: secret::RedactionService, ctx: egui::Context) -> Self {
+        // App은 한 번에 하나만 제출하고 추가 요청은 최신 1건으로 축약한다. 채널도 hard cap을
+        // 둬 느린 외장/네트워크 볼륨이나 keychain이 UI 메모리 증가로 번지지 않게 한다.
+        let (tx, jobs) = std::sync::mpsc::sync_channel::<DotenvSyncJob>(1);
+        let (results, rx) = std::sync::mpsc::sync_channel::<DotenvSyncOutcome>(1);
+        std::thread::Builder::new()
+            .name("dotenv-sync".to_owned())
+            .spawn(move || {
+                while let Ok(job) = jobs.recv() {
+                    // 기준점은 파일을 읽기 직전에 worker에서 캡처한다. 읽는 도중 파일이 다시
+                    // 바뀌면 이 옛 기준점과 다음 점검이 달라져 안전하게 한 번 더 동기화된다.
+                    let baseline = dotenv_state_for_root(job.root.as_deref());
+                    let result = if !job.force && job.previous_state == Some(baseline) {
+                        Ok(None)
+                    } else if let Some(root) = job.root.as_deref() {
+                        Db::open(&db_path).and_then(|db| {
+                            crate::dotenv_sync::sync_workspace_dotenv(
+                                &db,
+                                &KeyringSecretStore,
+                                &redaction,
+                                &job.workspace_id,
+                                root,
+                            )
+                            .and_then(|report| {
+                                let (env_plain, env_secrets) = if report.is_some() {
+                                    load_dotenv_default_env(&db, &job.workspace_id)?
+                                } else {
+                                    (Vec::new(), Vec::new())
+                                };
+                                Ok(Some(DotenvSyncPayload {
+                                    report,
+                                    env_plain,
+                                    env_secrets,
+                                }))
+                            })
+                        })
+                    } else {
+                        Ok(Some(DotenvSyncPayload {
+                            report: None,
+                            env_plain: Vec::new(),
+                            env_secrets: Vec::new(),
+                        }))
+                    };
+                    if results
+                        .send(DotenvSyncOutcome {
+                            generation: job.generation,
+                            revision: job.revision,
+                            workspace_id: job.workspace_id,
+                            root: job.root,
+                            baseline,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    ctx.request_repaint();
+                }
+            })
+            .expect("dotenv sync worker thread spawn");
+        Self { tx, rx }
+    }
+
+    fn try_request(
+        &self,
+        job: DotenvSyncJob,
+    ) -> Result<(), std::sync::mpsc::TrySendError<DotenvSyncJob>> {
+        self.tx.try_send(job)
+    }
+}
+
+impl EnvSecretRevealWorker {
+    fn spawn(ctx: egui::Context) -> Self {
+        let (tx, jobs) = std::sync::mpsc::sync_channel::<EnvSecretRevealJob>(64);
+        let (results, rx) = std::sync::mpsc::sync_channel::<EnvSecretRevealOutcome>(64);
+        std::thread::Builder::new()
+            .name("env-secret-reveal".to_owned())
+            .spawn(move || {
+                while let Ok(job) = jobs.recv() {
+                    let value =
+                        secret::SecretStore::get_secret(&KeyringSecretStore, &job.credential_id)
+                            .map(|secret| secret.expose().to_owned());
+                    if results
+                        .send(EnvSecretRevealOutcome {
+                            generation: job.generation,
+                            credential_id: job.credential_id,
+                            value,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    ctx.request_repaint();
+                }
+            })
+            .expect("환경 secret reveal worker thread spawn");
+        Self { tx, rx }
+    }
+
+    fn try_request(&self, job: EnvSecretRevealJob) -> bool {
+        self.tx.try_send(job).is_ok()
+    }
+}
+
+impl EnvProjectRowsWorker {
+    fn spawn(db_path: PathBuf, ctx: egui::Context) -> Self {
+        let (tx, jobs) = std::sync::mpsc::sync_channel::<EnvProjectRowsJob>(1);
+        let (results, rx) = std::sync::mpsc::sync_channel::<EnvProjectRowsOutcome>(1);
+        std::thread::Builder::new()
+            .name("env-project-rows".to_owned())
+            .spawn(move || {
+                let mut db = None;
+                while let Ok(job) = jobs.recv() {
+                    let rows = (|| -> anyhow::Result<_> {
+                        if db.is_none() {
+                            db = Some(Db::open(&db_path)?);
+                        }
+                        let db = db.as_ref().expect("DB initialized above");
+                        db.env_api_project_counts().map(|counts| {
+                            let counts: std::collections::HashMap<_, _> = counts
+                                .into_iter()
+                                .map(|count| (count.workspace_id.clone(), count))
+                                .collect();
+                            job.workspaces
+                                .iter()
+                                .map(|workspace| {
+                                    let count = counts.get(&workspace.id);
+                                    let path = workspace.path.clone();
+                                    ui::env_project_list::EnvProjectRow {
+                                        id: workspace.id.clone(),
+                                        name: App::workspace_display_name(workspace),
+                                        path_missing: !path.trim().is_empty()
+                                            && !std::path::Path::new(&path).is_dir(),
+                                        path,
+                                        env_count: count.map_or(0, |count| count.env_count),
+                                        key_count: count.map_or(0, |count| count.key_count),
+                                    }
+                                })
+                                .collect()
+                        })
+                    })();
+                    if results
+                        .send(EnvProjectRowsOutcome {
+                            generation: job.generation,
+                            rows,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    ctx.request_repaint();
+                }
+            })
+            .expect("환경 프로젝트 worker thread spawn");
+        Self { tx, rx }
+    }
+
+    fn try_request(
+        &self,
+        job: EnvProjectRowsJob,
+    ) -> Result<(), std::sync::mpsc::TrySendError<EnvProjectRowsJob>> {
+        self.tx.try_send(job)
+    }
+}
+
 impl ApprovalWatcher {
     fn spawn(
         db_path: PathBuf,
@@ -250,6 +523,9 @@ fn render_env_api_project_header(
         .map(|project| project.path.as_str())
         .filter(|path| !path.trim().is_empty())
         .unwrap_or("");
+    // 프로젝트 목록을 만들 때 계산한 값을 재사용한다. Path::is_dir()는 네트워크/외장
+    // 볼륨에서 블록될 수 있으므로 설정 UI의 매 프레임 렌더 경로에서 다시 호출하지 않는다.
+    let path_missing = project.is_some_and(|project| project.path_missing);
     let path_text = if path.is_empty() {
         catalog.t("workspace.manager.path_unset", &[])
     } else {
@@ -359,7 +635,6 @@ fn render_env_api_project_header(
                 // 남은 폭 전부 — truncate 라벨 (rtl이라 좌측 정렬로 다시 감싼다).
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     // 사라진 경로(rename 자동 복구 불가)는 경고색 + 조치 안내(2026-07-09).
-                    let path_missing = !path.is_empty() && !std::path::Path::new(path).is_dir();
                     let path_color = if path_missing {
                         ui.visuals().error_fg_color
                     } else {
@@ -539,6 +814,14 @@ struct WorkspaceRuntime {
     /// 응답(AgentSpawned/SpawnFailed) 대기 중인 agent spawn 수 — 전환 시 전역
     /// AgentsUi에서 이관받는다 (agent spawn 직후 전환 race의 live 판정).
     pending_agent_spawns: u32,
+    /// 새 runtime은 background dotenv 결과를 먼저 적용한 뒤 RestoreWorkspace를 보낸다.
+    /// 느린 볼륨/keychain 때문에 복원이 영원히 막히지 않도록 logic에서 timeout fallback한다.
+    restore_pending_since: Option<std::time::Instant>,
+    /// durable 구독 overflow 뒤 이미 큐에 들어온 이벤트를 budget 단위로 끝까지 적용한 다음
+    /// fresh receiver로 재구독하기 위한 상태.
+    event_overflow_pending: bool,
+    /// active receiver 재구독 뒤 전체 mux/viewport snapshot 재전송 명령이 아직 남아 있다.
+    event_resync_pending: bool,
 }
 
 impl WorkspaceRuntime {
@@ -573,6 +856,15 @@ fn workspace_is_live(
     /// 넉넉히. 빈 workspace는 이 유예만 지나면 suspend 대상이 된다.
     const RESTORE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
     tracker_live || pending_spawns > 0 || (!seen_mux && age < RESTORE_GRACE)
+}
+
+fn projected_live_warm_count(
+    current_live_warm: usize,
+    target_is_live_warm: bool,
+    active_will_be_live: bool,
+) -> usize {
+    current_live_warm.saturating_sub(usize::from(target_is_live_warm))
+        + usize::from(active_will_be_live)
 }
 
 /// 이벤트 스트림에서 "pane에 붙어 있고 아직 Exited 안 된 세션"을 추적한다.
@@ -647,11 +939,27 @@ pub struct App {
     /// .env mtime 폴링(2s) — 사이드바 OFF면 워처가 없어 .env 변경/삭제 신호가 안 오므로
     /// (존재여부, mtime) 변화를 직접 감지해 재동기화한다(codex — stale secret 주입 방지).
     last_dotenv_check: std::time::Instant,
-    last_dotenv_state: Option<(bool, Option<std::time::SystemTime>)>,
+    last_dotenv_state: Option<DotenvState>,
+    dotenv_sync_worker: DotenvSyncWorker,
+    /// 활성 workspace/root가 바뀔 때 증가한다. 옛 worker 결과가 새 workspace runtime에
+    /// 주입되는 것을 막는 epoch이다.
+    dotenv_sync_generation: u64,
+    /// 같은 workspace/root에서도 watcher/manual 변경이 들어오면 증가해 실행 중이던 옛
+    /// 파일 snapshot 결과를 폐기한다. 주기적 unchanged poll은 증가시키지 않는다.
+    dotenv_sync_revision: u64,
+    dotenv_sync_context: Option<(String, Option<PathBuf>)>,
+    dotenv_sync_pending: bool,
+    dotenv_sync_worker_failed: bool,
+    /// worker가 느린 동안 들어온 watcher/poll 요청은 최신 한 건으로 합친다.
+    dotenv_sync_deferred: Option<DotenvSyncJob>,
     /// 프로젝트 폴더 rename 복구 확인 모달 — Some((old, new))이면 표시(2026-07-08).
     workspace_rename_prompt: Option<(String, String)>,
     /// 프로젝트 삭제 확인 대기 — Some((id, 표시명)). 확인 모달에서 확정/취소(2026-07-10).
     ws_delete_confirm: Option<(String, String)>,
+    /// runtime durable 이벤트 큐가 포화돼 느린 구독자가 끊긴 경우 사용자 경고 모달.
+    runtime_stream_warning: bool,
+    /// live warm hard cap을 넘기는 workspace 전환을 거부했을 때 대상 표시명.
+    warm_limit_warning: Option<String>,
     /// rename 제안을 '무시'한 워크스페이스 — 이번 실행 동안 재확인 안 함(경로 변경 시 해제).
     dismissed_renames: std::collections::HashSet<String>,
     settings_open: bool,
@@ -666,6 +974,15 @@ pub struct App {
     /// 막는다. 무효화: refresh_workspaces / sync_dotenv_env(명시) + 1s TTL(설정 UI 안에서의
     /// env var·credential 직접 편집은 하위 UI 내부 상태라 TTL로 최대 1s 지연 반영).
     env_api_projects_cache: Option<(Vec<ui::env_project_list::EnvProjectRow>, std::time::Instant)>,
+    env_project_rows_worker: EnvProjectRowsWorker,
+    env_project_rows_generation: u64,
+    env_project_rows_pending: bool,
+    env_project_rows_failed: bool,
+    env_secret_reveal_worker: EnvSecretRevealWorker,
+    env_secret_generation: u64,
+    env_secret_cache: std::collections::HashMap<String, String>,
+    env_secret_pending: std::collections::HashSet<String>,
+    env_secret_failures: std::collections::HashSet<String>,
     db: Db,
     secret_store: KeyringSecretStore,
     agents_ui: ui::agents::AgentsUi,
@@ -823,6 +1140,11 @@ impl App {
         // agent 감지 백그라운드 워커 (ps/lsof/transcript 스캔을 UI 스레드 밖에서, codex #3).
         let (agent_detect_worker, agent_detect_input, agent_detect_rx) =
             crate::agent_detect_worker::AgentDetectWorker::spawn(egui_ctx.clone());
+        let env_project_rows_worker =
+            EnvProjectRowsWorker::spawn(db_path.clone(), egui_ctx.clone());
+        let env_secret_reveal_worker = EnvSecretRevealWorker::spawn(egui_ctx.clone());
+        let dotenv_sync_worker =
+            DotenvSyncWorker::spawn(db_path.clone(), redaction.clone(), egui_ctx.clone());
 
         let mut app = Self {
             config,
@@ -831,8 +1153,17 @@ impl App {
             last_ui_font: None,
             last_dotenv_check: std::time::Instant::now(),
             last_dotenv_state: None,
+            dotenv_sync_worker,
+            dotenv_sync_generation: 0,
+            dotenv_sync_revision: 0,
+            dotenv_sync_context: None,
+            dotenv_sync_pending: false,
+            dotenv_sync_worker_failed: false,
+            dotenv_sync_deferred: None,
             workspace_rename_prompt: None,
             ws_delete_confirm: None,
+            runtime_stream_warning: false,
+            warm_limit_warning: None,
             dismissed_renames: std::collections::HashSet::new(),
             settings_open: false,
             settings_was_open: false,
@@ -840,6 +1171,15 @@ impl App {
             settings_search: String::new(),
             env_api_project_edit: EnvApiProjectEditState::default(),
             env_api_projects_cache: None,
+            env_project_rows_worker,
+            env_project_rows_generation: 0,
+            env_project_rows_pending: false,
+            env_project_rows_failed: false,
+            env_secret_reveal_worker,
+            env_secret_generation: 0,
+            env_secret_cache: std::collections::HashMap::new(),
+            env_secret_pending: std::collections::HashSet::new(),
+            env_secret_failures: std::collections::HashSet::new(),
             db,
             secret_store: KeyringSecretStore,
             agents_ui: ui::agents::AgentsUi::new(),
@@ -918,11 +1258,11 @@ impl App {
         app
     }
 
-    /// warm 상태로 유지할 최대 workspace 수 (활성 제외). 저-RAM 정책상 작게 — 초과분은
-    /// Suspended(워커 shutdown). 단 **live 세션(미종료 셸/에이전트)이 있는 workspace는
-    /// 상한과 무관하게 warm으로 유지**된다(작업 보호 > 메모리) — 그 경우 동시 워커 수는
-    /// 사용자가 실제로 실행 중인 workspace 수까지 늘 수 있다.
+    /// warm 상태로 유지할 최대 idle workspace 수 (활성 제외).
     const MAX_WARM: usize = 2;
+    /// 실행 중 세션이 있는 warm workspace hard cap. 초과 전환은 기존 작업을 죽이지 않고
+    /// 거부해 runtime/PTY/terminal buffer가 workspace 수만큼 무한 증가하지 않게 한다.
+    const MAX_LIVE_WARM: usize = 4;
     /// Warm workspace가 이 시간 동안 재활성화되지 않으면 Suspended로 내린다. 세션/PTY는
     /// 종료되고 layout/session metadata만 DB에 남는다 (§14.1). live 세션이 있으면
     /// 시간이 지나도 내리지 않는다.
@@ -968,31 +1308,9 @@ impl App {
         );
         // 상태 이벤트 도착 시 UI를 깨운다 (§14.1 Warm 알림 유지). subscribe→restore 순서
         // 를 코드로 보장하려 subscribe 직후 복원 명령을 보낸다.
-        let runtime_events = runtime.subscribe_with_wake(std::sync::Arc::new({
-            let ctx = egui_ctx.clone();
-            move || ctx.request_repaint()
-        }));
-        // .env → dotenv profile 동기화 후 **RestoreWorkspace 전에** 기본 env를 심는다 —
-        // 복원/초기 셸도 .env 변수를 받게(순서 버그 수정, 2026-07-08 실측). 이후 sync_dotenv_env
-        // 가 live 변경을 마저 담당한다.
-        if let Some(root) = &shell_cwd {
-            let store = KeyringSecretStore;
-            let _ = crate::dotenv_sync::sync_workspace_dotenv(
-                db,
-                &store,
-                redaction,
-                workspace_id,
-                root,
-            );
-            let (env_plain, env_secrets) = Self::dotenv_default_env(db, workspace_id);
-            let _ = runtime.send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
-                env_plain,
-                env_secrets,
-            });
-        }
-        if let Err(e) = runtime.send_command(runtime::RuntimeCommand::RestoreWorkspace) {
-            tracing::warn!("workspace 복원 명령 전송 실패: {e:#}");
-        }
+        let runtime_events = Self::subscribe_runtime_events(&runtime, egui_ctx);
+        // RestoreWorkspace는 background dotenv 결과를 적용한 뒤 보낸다. `.env`/keychain I/O를
+        // UI thread에서 수행하지 않으면서도 복원된 첫 셸부터 올바른 기본 env를 받게 한다.
         // 저장된 credential을 로그 redaction 대상으로 시드 (값 resolve는 worker에서)
         Self::seed_redaction(&runtime, db);
         WorkspaceRuntime {
@@ -1011,7 +1329,20 @@ impl App {
             live: LiveSessionTracker::default(),
             created: std::time::Instant::now(),
             pending_agent_spawns: 0,
+            restore_pending_since: Some(std::time::Instant::now()),
+            event_overflow_pending: false,
+            event_resync_pending: false,
         }
+    }
+
+    fn subscribe_runtime_events(
+        runtime: &InProcessRuntimeClient,
+        ctx: &egui::Context,
+    ) -> RuntimeEventReceiver {
+        runtime.subscribe_with_wake(std::sync::Arc::new({
+            let ctx = ctx.clone();
+            move || ctx.request_repaint()
+        }))
     }
 
     /// 저장된 credential id를 worker의 로그 redaction 대상으로 시드한다 (값 resolve는 worker).
@@ -1549,6 +1880,31 @@ impl App {
         if target_id == self.active.id {
             return;
         }
+        let live_warm = self
+            .warm
+            .values()
+            .filter(|runtime| runtime.has_live_sessions())
+            .count();
+        let target_is_live_warm = self
+            .warm
+            .get(target_id)
+            .is_some_and(WorkspaceRuntime::has_live_sessions);
+        let projected = projected_live_warm_count(
+            live_warm,
+            target_is_live_warm,
+            self.active.has_live_sessions(),
+        );
+        if projected > Self::MAX_LIVE_WARM {
+            self.warm_limit_warning = Some(
+                self.workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == target_id)
+                    .map(Self::workspace_display_name)
+                    .unwrap_or_else(|| target_id.to_owned()),
+            );
+            self.egui_ctx.request_repaint();
+            return;
+        }
         // 대상이 background 정리 중이면 먼저 끝낸다 (같은 window 행 경합 방지 — codex 리뷰).
         self.join_pending_shutdown(target_id);
 
@@ -1671,6 +2027,9 @@ impl App {
             // 마지막으로 큐에 남은 이벤트를 처리해 방금 끝난 background 작업의 완료/오류
             // 알림을 놓치지 않는다 (codex 리뷰 — 축출 시 receiver drop으로 유실되던 것).
             let events = rt.events.drain();
+            if rt.events.take_overflowed() {
+                self.runtime_stream_warning = true;
+            }
             Self::record_activity_events(&mut rt, &events);
             Self::process_ws_notifications(
                 &mut self.notifications_ui,
@@ -1724,80 +2083,201 @@ impl App {
     }
 
     /// 활성 workspace의 `.env`를 환경 profile로 동기화하고, 그 env를 워커 기본 env로
-    /// 전송한다(SetSessionDefaultEnv) — 이후 새 셸부터 자동 주입(2026-07-07 요청).
-    /// 시작/워크스페이스 전환 시 1회. best-effort — 실패해도 앱은 정상 동작.
-    /// workspace의 dotenv profile을 (env_plain, env_secrets=credential 참조)로 읽는다 —
-    /// SetSessionDefaultEnv용. profile 없으면 빈 값.
-    fn dotenv_default_env(db: &Db, workspace_id: &str) -> (EnvPairs, EnvPairs) {
-        let (mut env_plain, mut env_secrets) = (Vec::new(), Vec::new());
-        if let Ok(profiles) = db.list_env_profiles(workspace_id)
-            && let Some(p) = profiles
-                .into_iter()
-                .find(|p| p.kind == crate::dotenv_sync::DOTENV_PROFILE_KIND)
-            && let Ok(vars) = db.list_env_vars(&p.id)
-        {
-            for var in vars {
-                match var.value {
-                    crate::env::EnvValue::Plain(v) => env_plain.push((var.key, v)),
-                    crate::env::EnvValue::Secret { credential_id } => {
-                        env_secrets.push((var.key, credential_id));
-                    }
-                }
-            }
-        }
-        (env_plain, env_secrets)
+    /// 전송한다(SetSessionDefaultEnv). 파일/SQLite/keyring 작업은 전용 worker에서 수행하고
+    /// 이 메서드는 bounded/coalesced 요청만 넣으므로 UI thread를 막지 않는다.
+    fn sync_dotenv_env(&mut self) {
+        self.request_dotenv_sync(true);
     }
 
-    fn sync_dotenv_env(&mut self) {
-        // 폴링 기준점은 **읽기 전에** 캡처한다 — 읽기~기록 사이에 .env가 바뀌면 새 mtime이
-        // 기준점이 되어 다음 폴링이 "변화 없음"으로 삼키던 TOCTOU 제거(codex 검증).
-        // 읽기 직전 변경이 끼어들면 다음 폴링에서 mtime 불일치 → 한 번 더 동기화(안전 방향).
-        let baseline = self.dotenv_stat();
-        // 1) .env → dotenv profile 동기화 (secret은 keyring).
-        let mut dotenv_present = false;
-        if let Some(root) = self.active_tree_root() {
-            match crate::dotenv_sync::sync_workspace_dotenv(
-                &self.db,
-                &self.secret_store,
-                &self.redaction,
-                &self.active.id,
-                &root,
-            ) {
-                Ok(Some(report)) => {
-                    dotenv_present = true;
-                    if report.upserted + report.removed > 0 {
-                        tracing::info!(
-                            upserted = report.upserted,
-                            removed = report.removed,
-                            ".env → 환경 profile 동기화"
-                        );
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => tracing::warn!(".env 동기화 실패: {e:#}"),
+    fn request_dotenv_sync(&mut self, force: bool) {
+        if self.dotenv_sync_worker_failed {
+            return;
+        }
+        let workspace_id = self.active.id.clone();
+        let root = self.active_tree_root();
+        let context = (workspace_id.clone(), root.clone());
+        let context_changed = self.dotenv_sync_context.as_ref() != Some(&context);
+        if context_changed {
+            self.dotenv_sync_generation = self.dotenv_sync_generation.wrapping_add(1);
+            self.dotenv_sync_context = Some(context);
+            self.last_dotenv_state = None;
+            // 이전 context의 대기 요청은 최신 workspace/root 요청으로 교체한다. 이미 실행 중인
+            // 결과는 generation 검사에서 폐기된다.
+            self.dotenv_sync_deferred = None;
+        }
+        if force || context_changed {
+            self.dotenv_sync_revision = self.dotenv_sync_revision.wrapping_add(1);
+        }
+        let job = DotenvSyncJob {
+            generation: self.dotenv_sync_generation,
+            revision: self.dotenv_sync_revision,
+            workspace_id,
+            root,
+            previous_state: self.last_dotenv_state,
+            force,
+        };
+        if self.dotenv_sync_pending {
+            if let Some(deferred) = self.dotenv_sync_deferred.as_mut()
+                && deferred.generation == job.generation
+            {
+                deferred.force |= job.force;
+                deferred.previous_state = job.previous_state;
+                deferred.revision = job.revision;
+            } else {
+                self.dotenv_sync_deferred = Some(job);
+            }
+            return;
+        }
+        self.dispatch_dotenv_sync(job);
+    }
+
+    fn dispatch_dotenv_sync(&mut self, mut job: DotenvSyncJob) {
+        if job.generation != self.dotenv_sync_generation
+            || job.revision != self.dotenv_sync_revision
+        {
+            return;
+        }
+        job.previous_state = self.last_dotenv_state;
+        match self.dotenv_sync_worker.try_request(job) {
+            Ok(()) => self.dotenv_sync_pending = true,
+            Err(std::sync::mpsc::TrySendError::Full(job)) => {
+                // 정상 경로에서는 pending=true일 때만 찬다. 방어적으로 최신 한 건만 보존한다.
+                self.dotenv_sync_deferred = Some(job);
+                self.egui_ctx
+                    .request_repaint_after(std::time::Duration::from_millis(25));
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                self.dotenv_sync_worker_failed = true;
+                self.dotenv_sync_deferred = None;
+                tracing::warn!("dotenv background worker 연결 종료");
             }
         }
-        // 2) dotenv profile env를 워커 기본 env로 전송. **.env가 지금 존재할 때만** 주입 —
-        //    .env가 사라졌으면(브랜치 전환/삭제) profile은 보존하되 stale secret이 새 셸에
-        //    계속 들어가면 안 된다(codex High). 없으면 빈 값으로 잔여 기본 env를 지운다.
-        let (env_plain, env_secrets) = if dotenv_present {
-            Self::dotenv_default_env(&self.db, &self.active.id)
-        } else {
-            (Vec::new(), Vec::new())
+    }
+
+    fn poll_dotenv_sync(&mut self) {
+        while let Ok(outcome) = self.dotenv_sync_worker.rx.try_recv() {
+            self.dotenv_sync_pending = false;
+            let current = self.dotenv_sync_context.as_ref().is_some_and(|context| {
+                outcome.generation == self.dotenv_sync_generation
+                    && outcome.revision == self.dotenv_sync_revision
+                    && context.0 == outcome.workspace_id
+                    && context.1 == outcome.root
+                    && self.active.id == outcome.workspace_id
+            });
+            if current {
+                self.last_dotenv_state = Some(outcome.baseline);
+                let mut restore_ready = true;
+                match outcome.result {
+                    Ok(None) => {
+                        // 첫 복원 요청은 force라 보통 도달하지 않는다. worker 재시작/호출 순서가
+                        // 달라져도 stale 기본 env 없이 복원하도록 빈 값 명령을 선행한다.
+                        if self.active.restore_pending_since.is_some() {
+                            restore_ready = self
+                                .active
+                                .runtime
+                                .send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
+                                    env_plain: Vec::new(),
+                                    env_secrets: Vec::new(),
+                                })
+                                .is_ok();
+                        }
+                    }
+                    Ok(Some(payload)) => {
+                        if let Some(report) = payload.report
+                            && report.upserted + report.removed > 0
+                        {
+                            tracing::info!(
+                                upserted = report.upserted,
+                                removed = report.removed,
+                                ".env → 환경 profile 동기화"
+                            );
+                        }
+                        restore_ready = self
+                            .active
+                            .runtime
+                            .send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
+                                env_plain: payload.env_plain,
+                                env_secrets: payload.env_secrets,
+                            })
+                            .is_ok();
+                        self.invalidate_env_profile_ui();
+                        self.credentials_ui.invalidate_cache();
+                        self.invalidate_env_api_projects();
+                    }
+                    Err(error) => {
+                        tracing::warn!(".env background 동기화 실패: {error:#}");
+                        // transient I/O/keyring/DB 오류는 다음 2초 점검에서 반드시 재시도한다.
+                        self.last_dotenv_state = None;
+                        // 읽지 못한 secret을 이전 workspace/default env에서 계속 주입하는 것보다
+                        // 새 셸의 기본 env를 비우는 쪽이 보안상 안전하다.
+                        restore_ready = self
+                            .active
+                            .runtime
+                            .send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
+                                env_plain: Vec::new(),
+                                env_secrets: Vec::new(),
+                            })
+                            .is_ok();
+                        self.invalidate_env_profile_ui();
+                        self.credentials_ui.invalidate_cache();
+                        self.invalidate_env_api_projects();
+                    }
+                }
+                if !restore_ready {
+                    // runtime command queue가 잠시 찼다면 동일 baseline을 완료로 확정하지
+                    // 않는다. 다음 점검이 기본 env 전송을 다시 시도한다.
+                    self.last_dotenv_state = None;
+                }
+                if restore_ready {
+                    self.complete_active_restore();
+                }
+            }
+        }
+        if !self.dotenv_sync_pending
+            && let Some(job) = self.dotenv_sync_deferred.take()
+        {
+            self.dispatch_dotenv_sync(job);
+        }
+    }
+
+    fn complete_active_restore(&mut self) {
+        if self.active.restore_pending_since.is_none() {
+            return;
+        }
+        match self
+            .active
+            .runtime
+            .send_command(runtime::RuntimeCommand::RestoreWorkspace)
+        {
+            Ok(()) => self.active.restore_pending_since = None,
+            Err(error) => tracing::warn!("workspace 복원 명령 전송 지연: {error:#}"),
+        }
+    }
+
+    fn poll_restore_timeout(&mut self) {
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let Some(started) = self.active.restore_pending_since else {
+            return;
         };
-        let _ = self
+        let elapsed = started.elapsed();
+        if elapsed < TIMEOUT {
+            self.egui_ctx.request_repaint_after(TIMEOUT - elapsed);
+            return;
+        }
+        // 외장 볼륨/keychain이 멈춰도 앱 복원이 영구 대기하지 않는다. 빈 기본 env가 먼저
+        // 들어간 경우에만 Restore를 보내며, 늦게 도착한 동기화 결과는 이후 새 셸에 적용된다.
+        if self
             .active
             .runtime
             .send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
-                env_plain,
-                env_secrets,
-            });
-        self.last_dotenv_state = Some(baseline);
-        // .env 동기화가 DB의 env profile/변수/credential을 바꿨을 수 있다 — 설정 UI 캐시를
-        // 무효화해 상세 표가 stale로 남거나 카운트(DB 신선)와 어긋나지 않게 한다(codex Med).
-        self.env_profiles_ui.invalidate_cache();
-        self.credentials_ui.invalidate_cache();
-        self.env_api_projects_cache = None;
+                env_plain: Vec::new(),
+                env_secrets: Vec::new(),
+            })
+            .is_ok()
+        {
+            tracing::warn!("dotenv background 동기화 timeout — 빈 env로 workspace 복원");
+            self.complete_active_restore();
+        }
     }
 
     /// 폴더의 (dev, ino)를 읽는다(inode 앵커용). 유효 디렉터리가 아니면 None.
@@ -1887,39 +2367,9 @@ impl App {
         }
     }
 
-    /// 활성 workspace `.env`의 (존재여부, mtime) — 폴링 비교용.
-    fn dotenv_stat(&self) -> (bool, Option<std::time::SystemTime>) {
-        // .env 계열 **파일별** (존재, mtime)을 전부 반영 — 최신 mtime만 보면 "옛 파일
-        // 삭제"가 상태 불변으로 보여 재동기화가 안 됐다(codex High 2026-07-10).
-        // 요약: exists = 하나라도 존재 / mtime = 파일별 (존재,mtime)을 해시한 대리값.
-        let Some(root) = self.active_tree_root() else {
-            return (false, None);
-        };
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::hash::DefaultHasher::new();
-        let mut exists = false;
-        for name in crate::dotenv_sync::DOTENV_FILE_NAMES {
-            match std::fs::metadata(root.join(name)) {
-                Ok(meta) => {
-                    exists = true;
-                    true.hash(&mut hasher);
-                    meta.modified()
-                        .ok()
-                        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_nanos())
-                        .hash(&mut hasher);
-                }
-                Err(_) => false.hash(&mut hasher),
-            }
-        }
-        // 대리 mtime: 해시를 SystemTime로 인코딩(비교 전용 — 절대 시각 의미 없음).
-        let digest = hasher.finish();
-        let surrogate = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(digest >> 1);
-        (exists, exists.then_some(surrogate))
-    }
-
     /// .env (존재여부, mtime)을 2초 간격으로 폴링해 변화 시 재동기화한다 — 사이드바 OFF로
-    /// 워처가 없을 때의 fallback(codex). 워처 경로와 중복 실행돼도 동기화는 idempotent.
+    /// 워처가 없을 때의 fallback(codex). stat도 worker에서 수행하고, 변화가 없으면 DB/keyring
+    /// 작업을 생략한다. 워처 경로와 중복 실행돼도 요청은 최신 한 건으로 축약된다.
     fn poll_dotenv_change(&mut self) {
         if self.last_dotenv_check.elapsed() < std::time::Duration::from_secs(2) {
             return;
@@ -1927,12 +2377,7 @@ impl App {
         self.last_dotenv_check = std::time::Instant::now();
         // 프로젝트 폴더 rename/이동 감지도 같은 2s 주기로 (앵커 backfill 포함).
         self.detect_workspace_folder_rename();
-        let state = self.dotenv_stat();
-        // 기준점은 sync_dotenv_env가 매번 스스로 잡는다(시작/전환 직후 포함) — 여기서는
-        // 변화 감지만. None(이론상 미도달)도 안전하게 재동기화로 처리.
-        if self.last_dotenv_state != Some(state) {
-            self.sync_dotenv_env(); // 내부에서 last_dotenv_state 갱신
-        }
+        self.request_dotenv_sync(false);
     }
 
     /// 활성 workspace의 트리 루트 (path 미설정/조회 실패 → None → 안내 표시 §9-2).
@@ -1963,51 +2408,46 @@ impl App {
         "~".to_owned()
     }
 
-    fn env_api_project_rows(&self) -> Vec<ui::env_project_list::EnvProjectRow> {
-        // key = 그 프로젝트에서 보이는 API 키 수(소속+전역, dotenv 참조 제외 — #2 격리).
-        let referenced = self.db.env_referenced_credential_ids().unwrap_or_default();
-        self.workspaces
-            .iter()
-            .map(|row| {
-                let path = self
-                    .db
-                    .workspace_path(&row.id)
-                    .ok()
-                    .flatten()
-                    .filter(|path| !path.trim().is_empty())
-                    .unwrap_or_else(|| row.path.clone());
-                let env_count = self
-                    .db
-                    .list_env_profiles(&row.id)
-                    .map(|profiles| {
-                        profiles
-                            .iter()
-                            .filter_map(|profile| self.db.list_env_vars(&profile.id).ok())
-                            .map(|vars| vars.len())
-                            .sum()
-                    })
-                    .unwrap_or(0usize);
-                let key_count = self
-                    .db
-                    .list_credentials_for_workspace(&row.id)
-                    .map(|c| c.iter().filter(|m| !referenced.contains(&m.id)).count())
-                    .unwrap_or(0);
-                let path_missing = !path.trim().is_empty() && !std::path::Path::new(&path).is_dir();
-                ui::env_project_list::EnvProjectRow {
-                    id: row.id.clone(),
-                    name: Self::workspace_display_name(row),
-                    path,
-                    path_missing,
-                    env_count,
-                    key_count,
+    fn invalidate_env_api_projects(&mut self) {
+        self.env_api_projects_cache = None;
+        self.env_project_rows_generation = self.env_project_rows_generation.wrapping_add(1);
+        self.env_project_rows_pending = false;
+        self.env_project_rows_failed = false;
+    }
+
+    fn invalidate_env_profile_ui(&mut self) {
+        self.env_profiles_ui.invalidate_cache();
+        self.env_secret_generation = self.env_secret_generation.wrapping_add(1);
+        self.env_secret_cache.clear();
+        self.env_secret_pending.clear();
+        self.env_secret_failures.clear();
+    }
+
+    fn poll_env_secret_reveals(&mut self) {
+        while let Ok(outcome) = self.env_secret_reveal_worker.rx.try_recv() {
+            if outcome.generation != self.env_secret_generation {
+                continue;
+            }
+            self.env_secret_pending.remove(&outcome.credential_id);
+            match outcome.value {
+                Ok(value) => {
+                    self.env_secret_failures.remove(&outcome.credential_id);
+                    self.env_secret_cache.insert(outcome.credential_id, value);
                 }
-            })
-            .collect()
+                Err(error) => {
+                    tracing::warn!(
+                        credential_id = outcome.credential_id,
+                        "환경 secret background 조회 실패: {error:#}"
+                    );
+                    self.env_secret_failures.insert(outcome.credential_id);
+                }
+            }
+        }
     }
 
     /// env/API 프로젝트 행 캐시 TTL — 설정 UI 안에서의 직접 편집(env var/credential
     /// 추가·삭제)은 하위 UI 내부 상태라 App이 즉시 알 수 없으므로 1초 주기 재계산으로
-    /// 반영한다(매 프레임 N+1 쿼리 → 최대 1Hz, 편집 반영 지연 ≤ 1s).
+    /// 반영한다. 집계/경로 stat은 전용 worker에서 수행해 UI thread를 막지 않는다.
     const ENV_API_PROJECTS_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 
     /// env/API 프로젝트 행 캐시 재계산 필요 판정 (캐시 없음 또는 TTL 경과). 테스트용 분리.
@@ -2019,18 +2459,70 @@ impl App {
     }
 
     /// 캐시를 거쳐 env/API 프로젝트 행을 돌려준다. 명시 무효화(refresh_workspaces /
-    /// sync_dotenv_env)로 캐시가 비었거나 TTL이 지났으면 재계산하고, 아니면 마지막 값을
-    /// 재사용한다 — 설정창이 열려 있는 동안 매 프레임 DB 조회를 막는다.
+    /// sync_dotenv_env)로 캐시가 비었거나 TTL이 지났으면 worker에 최신 snapshot을 요청하고,
+    /// generation이 맞는 결과만 적용한다.
     fn env_api_project_rows_cached(&mut self) -> Vec<ui::env_project_list::EnvProjectRow> {
         let now = std::time::Instant::now();
+        while let Ok(outcome) = self.env_project_rows_worker.rx.try_recv() {
+            if outcome.generation != self.env_project_rows_generation {
+                continue;
+            }
+            self.env_project_rows_pending = false;
+            match outcome.rows {
+                Ok(rows) => {
+                    self.env_project_rows_failed = false;
+                    self.env_api_projects_cache = Some((rows, now));
+                }
+                Err(error) => {
+                    tracing::warn!("환경 프로젝트 목록 background 조회 실패: {error:#}");
+                    self.env_project_rows_failed = true;
+                    if let Some((_, computed_at)) = &mut self.env_api_projects_cache {
+                        *computed_at = now;
+                    } else {
+                        self.env_api_projects_cache = Some((Vec::new(), now));
+                    }
+                }
+            }
+        }
         if Self::env_api_cache_expired(self.env_api_projects_cache.as_ref().map(|(_, at)| *at), now)
+            && !self.env_project_rows_pending
         {
-            self.env_api_projects_cache = Some((self.env_api_project_rows(), now));
+            let generation = self.env_project_rows_generation;
+            match self.env_project_rows_worker.try_request(EnvProjectRowsJob {
+                generation,
+                workspaces: self.workspaces.clone(),
+            }) {
+                Ok(()) => {
+                    self.env_project_rows_pending = true;
+                    self.env_project_rows_failed = false;
+                }
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    self.egui_ctx
+                        .request_repaint_after(std::time::Duration::from_millis(25));
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    self.env_project_rows_failed = true;
+                }
+            }
         }
         self.env_api_projects_cache
             .as_ref()
             .map(|(rows, _)| rows.clone())
-            .unwrap_or_default()
+            .unwrap_or_else(|| {
+                // 첫 background 결과 전에도 목록 골격은 즉시 보인다. count/path 상태만
+                // worker 결과에서 채워진다(UI thread filesystem/DB 접근 없음).
+                self.workspaces
+                    .iter()
+                    .map(|workspace| ui::env_project_list::EnvProjectRow {
+                        id: workspace.id.clone(),
+                        name: Self::workspace_display_name(workspace),
+                        path: workspace.path.clone(),
+                        path_missing: false,
+                        env_count: 0,
+                        key_count: 0,
+                    })
+                    .collect()
+            })
     }
 
     /// 포커스 세션 cwd → 워크스페이스 이름(현재 작업 폴더/프로젝트명)을 갱신·영속한다.
@@ -2097,7 +2589,7 @@ impl App {
             Err(e) => tracing::warn!("workspace 목록 조회 실패: {e:#}"),
         }
         // 워크스페이스 목록/이름/경로가 바뀌었을 수 있다 — env/API 프로젝트 행 캐시 무효화.
-        self.env_api_projects_cache = None;
+        self.invalidate_env_api_projects();
     }
 
     /// pressure 뱃지 표시 TTL — 회복 이벤트가 없어(큐가 빠져도 신호 없음) 마지막 관측이
@@ -2369,6 +2861,13 @@ impl eframe::App for App {
     // 스킵 판단에 쓰는 바로 그 신호(minimized OR occluded — macOS는 occluded로 갱신되어
     // minimized 미갱신 문제를 피한다). None(미보고)이면 안전하게 Active 유지.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 파일/SQLite/keyring은 worker에서 끝났고, 여기서는 최신 epoch 결과만 짧게 적용한다.
+        self.poll_dotenv_sync();
+        self.poll_restore_timeout();
+        // 설정이 닫혀도 stale generation 결과를 계속 버려 worker의 bounded 결과 큐가
+        // 평문 secret을 붙잡은 채 막히지 않게 한다.
+        self.poll_env_secret_reveals();
+
         // macOS 네이티브 메뉴 이벤트 (main.rs install_macos_menu)
         #[cfg(target_os = "macos")]
         while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
@@ -2426,8 +2925,13 @@ impl eframe::App for App {
         // 않는다 — SessionExited/StatusChanged 같은 일회성 lifecycle 이벤트를 버리면
         // 재활성 시 종료된 pane이 실행 중으로 보인다, codex 리뷰). 재활성 시 fresh가 아닌
         // 이 누적분을 그대로 ui()가 처리해 상태를 재구성한다. 렌더/알림은 활성만.
+        let mut runtime_stream_overflowed = false;
         for rt in self.warm.values_mut() {
             let events = rt.events.drain();
+            if rt.events.take_overflowed() {
+                runtime_stream_overflowed = true;
+                rt.event_overflow_pending = true;
+            }
             if !events.is_empty() {
                 Self::record_activity_events(rt, &events);
                 // warm workspace도 알림은 만든다 (background 완료/승인 통지) — (ws, session)로
@@ -2442,11 +2946,18 @@ impl eframe::App for App {
                 rt.pending_events.extend(events);
                 // MuxUpdated는 매번 전체 스냅샷이라 오래된 건 최신에 완전히 대체된다.
                 // chatty한 warm 워커가 pending_events를 무한 누적하지 않도록 최신 하나만
-                // 남기고 합친다 (lifecycle/Viewport는 순서대로 보존 — replay 정확성).
+                // 남기고 합친다 (lifecycle은 순서 보존, Viewport는 세션별 최신본 — replay 정확성).
                 // 새 이벤트가 들어온 이 분기에서만 호출돼 프레임마다 도는 걸 피한다.
                 coalesce_mux_updated(&mut rt.pending_events);
             }
+            if rt.event_overflow_pending && rt.events.durable_backlog_exhausted() {
+                rt.events = Self::subscribe_runtime_events(&rt.runtime, ctx);
+                rt.event_overflow_pending = false;
+                // warm→active 전환 자체가 전체 mux/viewport snapshot을 보내므로 지금은
+                // worker를 깨우지 않는다.
+            }
         }
+        self.runtime_stream_warning |= runtime_stream_overflowed;
         self.evict_idle_warm(std::time::Instant::now());
 
         // 이벤트 drain + 알림 생성은 non-render 경로인 여기서 한다 (§14.1 Warm:
@@ -2470,6 +2981,34 @@ impl eframe::App for App {
                 coalesce_mux_updated(&mut self.active.pending_events);
             }
             // 보이는 idle 상태에서도 새 출력/상태를 즉시 렌더하도록 프레임 예약
+            ctx.request_repaint();
+        }
+        if self.active.events.take_overflowed() {
+            self.runtime_stream_warning = true;
+            self.active.event_overflow_pending = true;
+        }
+        if self.active.event_overflow_pending && self.active.events.durable_backlog_exhausted() {
+            self.active.events = Self::subscribe_runtime_events(&self.active.runtime, ctx);
+            self.active.event_overflow_pending = false;
+            self.active.event_resync_pending = self.active.render_active;
+        }
+        if self.active.event_resync_pending
+            && self
+                .active
+                .runtime
+                .send_command(runtime::RuntimeCommand::SetWorkspaceState(
+                    runtime::WorkspaceRuntimeState::Warm,
+                ))
+                .is_ok()
+            && self
+                .active
+                .runtime
+                .send_command(runtime::RuntimeCommand::SetWorkspaceState(
+                    runtime::WorkspaceRuntimeState::Active,
+                ))
+                .is_ok()
+        {
+            self.active.event_resync_pending = false;
             ctx.request_repaint();
         }
 
@@ -2784,7 +3323,7 @@ impl eframe::App for App {
         if credential_added {
             self.credentials_ui.invalidate_cache();
             // env 뷰의 시크릿 콤보/마스킹도 새 credential을 봐야 한다(PR-ENV-C 배선).
-            self.env_profiles_ui.invalidate_cache();
+            self.invalidate_env_profile_ui();
             ui.ctx().request_repaint();
         }
         // 작업창은 여백 없이 경계까지 채운다 — CentralPanel 기본 inner_margin(8) 탓에
@@ -2860,6 +3399,48 @@ impl eframe::App for App {
                 Err(e) => tracing::warn!("승인 목록 조회 실패: {e:#}"),
             }
             ui.ctx().request_repaint();
+        }
+
+        if self.runtime_stream_warning {
+            let mut close = false;
+            egui::Window::new(text.t("runtime.event_overflow.title", &[]))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    ui.label(text.t("runtime.event_overflow.body", &[]));
+                    ui.add_space(8.0);
+                    if ui.button(text.t("action.close", &[])).clicked() {
+                        close = true;
+                    }
+                });
+            if close {
+                self.runtime_stream_warning = false;
+            }
+        }
+
+        if let Some(target) = self.warm_limit_warning.clone() {
+            let mut close = false;
+            egui::Window::new(text.t("workspace.warm_limit.title", &[]))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    ui.label(text.t(
+                        "workspace.warm_limit.body",
+                        &[
+                            ("target", &target),
+                            ("limit", &Self::MAX_LIVE_WARM.to_string()),
+                        ],
+                    ));
+                    ui.add_space(8.0);
+                    if ui.button(text.t("action.close", &[])).clicked() {
+                        close = true;
+                    }
+                });
+            if close {
+                self.warm_limit_warning = None;
+            }
         }
 
         // 프로젝트 폴더 rename/이동 감지 → 복구 확인 모달 (사용자 요청 2026-07-08).
@@ -2952,6 +3533,13 @@ impl eframe::App for App {
         } else {
             Vec::new()
         };
+        // 설정창 닫힘 전이 — env secret 평문 캐시를 메모리에서 정리(codex Med:
+        // 기본 노출로 상주하는 평문의 수명을 설정창 열림 동안으로 한정). remote_view가
+        // self 일부를 immutable 차용하기 전에 처리한다.
+        if self.settings_was_open && !self.settings_open {
+            self.invalidate_env_profile_ui();
+        }
+        self.settings_was_open = self.settings_open;
         // Remote 뷰모델을 현재 상태에서 구성 (UI는 서버를 직접 만지지 않는다 — disjoint 필드 차용).
         let remote_view = {
             let (running, addr, fp, token) = match &self.remote {
@@ -2998,6 +3586,9 @@ impl eframe::App for App {
             .iter()
             .find(|project| project.id == wsid)
             .cloned();
+        let env_project_rows_loading =
+            self.env_api_projects_cache.is_none() && self.env_project_rows_pending;
+        let env_project_rows_failed = self.env_project_rows_failed;
         let db_path = self.db_path.clone();
         let mut activity_action = None;
         let mut notif_click = None;
@@ -3006,13 +3597,8 @@ impl eframe::App for App {
         let mut ws_delete: Option<String> = None;
         let mut workspace_rename: Option<String> = None;
         let mut env_action: Option<ui::env_profiles::EnvAction> = None;
+        let mut credentials_changed = false;
         // #3 워크스페이스 이름 편집 캡처 (클로저 밖에서 db/refresh 처리 — self 전체 &mut).
-        // 설정창 닫힘 전이 — env secret 평문 캐시를 메모리에서 정리(codex Med:
-        // 기본 노출로 상주하는 평문의 수명을 설정창 열림 동안으로 한정).
-        if self.settings_was_open && !self.settings_open {
-            self.env_profiles_ui.invalidate_cache();
-        }
-        self.settings_was_open = self.settings_open;
         let out = ui::settings::show(
             ui.ctx(),
             &mut self.settings_open,
@@ -3117,34 +3703,76 @@ impl eframe::App for App {
                                             &mut self.env_api_project_edit,
                                             &text,
                                         );
+                                        if env_project_rows_loading {
+                                            ui.horizontal(|ui| {
+                                                ui.add(egui::Spinner::new().size(12.0));
+                                                ui.weak(text.t("env.background.loading", &[]));
+                                            });
+                                        } else if env_project_rows_failed {
+                                            ui.colored_label(
+                                                ui.visuals().error_fg_color,
+                                                text.t("env.background.load_failed", &[]),
+                                            );
+                                        }
                                         ui.add_space(18.0);
-                                        // dot(●) 클릭 reveal — 개인 로컬 확인용. 값은 UI
-                                        // 표시만, 로그에 남기지 않는다(redaction 등록됨).
-                                        let store: &dyn secret::SecretStore = &self.secret_store;
-                                        let reveal = |credential_id: &str| {
-                                            store
-                                                .get_secret(credential_id)
-                                                .ok()
-                                                .map(|s| s.expose().to_owned())
-                                        };
-                                        match self.env_profiles_ui.contents_compact(
-                                            ui,
-                                            &mut self.db,
-                                            &wsid,
-                                            &reveal,
-                                            &text,
-                                        ) {
-                                            Ok(a) => {
-                                                if a.is_some() {
-                                                    env_action = a;
+                                        // keyring 조회는 전용 worker에서 수행한다. callback은
+                                        // cache hit을 반환하거나 bounded 요청 큐에 enqueue만 한다.
+                                        {
+                                            let generation = self.env_secret_generation;
+                                            let cache = &mut self.env_secret_cache;
+                                            let failures = &self.env_secret_failures;
+                                            let pending = &mut self.env_secret_pending;
+                                            let worker = &self.env_secret_reveal_worker;
+                                            let mut reveal = |credential_id: &str| {
+                                                if let Some(value) = cache.remove(credential_id) {
+                                                    // EnvProfilesUi가 곧바로 자기 표시 cache로 소유권을
+                                                    // 가져간다. App에 평문 복제본을 남기지 않는다.
+                                                    return Some(value);
+                                                }
+                                                if failures.contains(credential_id) {
+                                                    return None;
+                                                }
+                                                if pending.insert(credential_id.to_owned())
+                                                    && !worker.try_request(EnvSecretRevealJob {
+                                                        generation,
+                                                        credential_id: credential_id.to_owned(),
+                                                    })
+                                                {
+                                                    pending.remove(credential_id);
+                                                }
+                                                None
+                                            };
+                                            match self.env_profiles_ui.contents_compact(
+                                                ui,
+                                                &mut self.db,
+                                                &wsid,
+                                                &mut reveal,
+                                                &text,
+                                            ) {
+                                                Ok(a) => {
+                                                    if a.is_some() {
+                                                        env_action = a;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    ui.colored_label(
+                                                        ui.visuals().error_fg_color,
+                                                        format!("{e:#}"),
+                                                    );
                                                 }
                                             }
-                                            Err(e) => {
-                                                ui.colored_label(
-                                                    ui.visuals().error_fg_color,
-                                                    format!("{e:#}"),
-                                                );
-                                            }
+                                        }
+                                        if !self.env_secret_pending.is_empty() {
+                                            ui.horizontal(|ui| {
+                                                ui.add(egui::Spinner::new().size(12.0));
+                                                ui.weak(text.t("env.secret.loading", &[]));
+                                            });
+                                        }
+                                        if !self.env_secret_failures.is_empty() {
+                                            ui.colored_label(
+                                                ui.visuals().error_fg_color,
+                                                text.t("env.secret.load_failed", &[]),
+                                            );
                                         }
                                         let svc = AppCredentialService {
                                             db: &self.db,
@@ -3155,7 +3783,7 @@ impl eframe::App for App {
                                         if self.credentials_ui.contents_compact(ui, &svc, &text) {
                                             // credential 추가/삭제 → env 시크릿 콤보/마스킹 갱신
                                             // (PR-ENV-C 배선).
-                                            self.env_profiles_ui.invalidate_cache();
+                                            credentials_changed = true;
                                         }
                                     });
                             });
@@ -3216,6 +3844,10 @@ impl eframe::App for App {
             },
         );
         // 관리/모니터 액션 처리 (클로저 밖 — self 전체 &mut 필요한 것들)
+        if credentials_changed {
+            self.invalidate_env_profile_ui();
+            self.invalidate_env_api_projects();
+        }
         if let Some(name) = workspace_rename {
             let name = name.trim();
             if !name.is_empty() {
@@ -3234,17 +3866,17 @@ impl eframe::App for App {
                     tracing::warn!(".env 기록 실패: {e:#}");
                 } else {
                     self.sync_dotenv_env();
-                    self.env_profiles_ui.invalidate_cache();
-                    self.env_api_projects_cache = None;
+                    self.invalidate_env_profile_ui();
+                    self.invalidate_env_api_projects();
                 }
             }
         }
         if let Some(ui::env_profiles::EnvAction::Resync) = env_action {
             // 리프레시(4번): .env 계열 재스캔 + UI/카운트 캐시 무효화.
             self.sync_dotenv_env();
-            self.env_profiles_ui.invalidate_cache();
+            self.invalidate_env_profile_ui();
             self.credentials_ui.invalidate_cache();
-            self.env_api_projects_cache = None;
+            self.invalidate_env_api_projects();
         }
         if let Some(ui::env_profiles::EnvAction::SetProjectPath(path)) = env_action {
             let path_str = path.to_string_lossy().into_owned();
@@ -3261,9 +3893,9 @@ impl eframe::App for App {
                     ) {
                         tracing::warn!("dotenv 정리 실패: {e:#}");
                     }
-                    self.env_profiles_ui.invalidate_cache();
+                    self.invalidate_env_profile_ui();
                     self.credentials_ui.invalidate_cache();
-                    self.env_api_projects_cache = None;
+                    self.invalidate_env_api_projects();
                 }
                 self.save_workspace_anchor(); // rename 복구용 (dev,ino) 앵커
                 self.dismissed_renames.remove(&self.active.id);
@@ -3329,7 +3961,7 @@ impl eframe::App for App {
                         tracing::warn!("dotenv 정리 실패: {e:#}");
                     }
                     ws_delete = Some(del_id);
-                    self.env_api_projects_cache = None;
+                    self.invalidate_env_api_projects();
                     self.ws_delete_confirm = None;
                 }
                 Some(false) => self.ws_delete_confirm = None,
@@ -3581,7 +4213,9 @@ fn expired_warm_workspace_ids(
 ///    유계화. 유지분 상대 순서는 보존.
 /// 3) ResourceUsage는 프로세스/세션 리소스의 현재 상태라 최신 1개만 유지한다.
 /// 4) PtyInputPressure는 세션별 현재 입력 큐 상태라 세션별 최신 1개만 유지한다.
-/// 5) SessionExited/ShellSpawned/AgentSpawned/SpawnFailed/Viewport는 전량 순서 보존.
+/// 5) Viewport는 화면 전체 최신 스냅샷이므로 세션별 최신 1개만 유지한다. warm/숨김 상태의
+///    고출력 세션이 pending replay Vec를 출력량만큼 키우지 않게 한다.
+/// 6) SessionExited/ShellSpawned/AgentSpawned/SpawnFailed는 전량 순서 보존.
 ///
 /// 알림은 coalesce 전에 process_ws_notifications가 전량 소비하므로(렌더 replay 전용)
 /// 공격적으로 줄여도 알림엔 영향이 없다.
@@ -3602,6 +4236,8 @@ fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) {
         std::collections::HashMap::new();
     let mut latest_input_pressure_idx: std::collections::HashMap<runtime::SessionId, usize> =
         std::collections::HashMap::new();
+    let mut latest_viewport_idx: std::collections::HashMap<runtime::SessionId, usize> =
+        std::collections::HashMap::new();
     for (i, e) in events.iter().enumerate() {
         if let runtime::RuntimeEvent::SessionStatusChanged { session, .. } = e {
             latest_status_idx.insert(*session, i);
@@ -3611,6 +4247,9 @@ fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) {
         }
         if let runtime::RuntimeEvent::PtyInputPressure { session, .. } = e {
             latest_input_pressure_idx.insert(*session, i);
+        }
+        if let runtime::RuntimeEvent::Viewport { session, .. } = e {
+            latest_viewport_idx.insert(*session, i);
         }
     }
 
@@ -3630,6 +4269,9 @@ fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) {
             runtime::RuntimeEvent::ResourceUsage { .. } => latest_resource_idx == Some(idx),
             runtime::RuntimeEvent::PtyInputPressure { session, .. } => {
                 latest_input_pressure_idx.get(session) == Some(&idx)
+            }
+            runtime::RuntimeEvent::Viewport { session, .. } => {
+                latest_viewport_idx.get(session) == Some(&idx)
             }
             _ => true,
         };
@@ -3694,6 +4336,28 @@ mod tests {
                 max_messages: 8,
                 reason: runtime::PtyInputRejectReason::QueueFull,
             },
+        }
+    }
+
+    fn viewport_event(session: u64, title: &str) -> runtime::RuntimeEvent {
+        runtime::RuntimeEvent::Viewport {
+            session: runtime::SessionId(session),
+            snapshot: std::sync::Arc::new(terminal::TerminalViewportSnapshot {
+                cols: 0,
+                rows: 0,
+                cursor: terminal::CursorSnapshot {
+                    col: 0,
+                    row: 0,
+                    shape: terminal::CursorShape::Block,
+                    visible: false,
+                },
+                visible_cells: Vec::new().into(),
+                dirty_ranges: Vec::new(),
+                title: Some(title.to_owned()),
+                scroll_offset: 0,
+                is_alt_screen: false,
+            }),
+            bracketed_paste: false,
         }
     }
 
@@ -4102,6 +4766,31 @@ h:1 EE:FF
     }
 
     #[test]
+    fn coalesce_dedups_viewport_per_session() {
+        let mut events = vec![
+            viewport_event(1, "old"),
+            viewport_event(2, "other"),
+            viewport_event(1, "latest"),
+        ];
+
+        coalesce_mux_updated(&mut events);
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            runtime::RuntimeEvent::Viewport { session, snapshot, .. }
+                if *session == runtime::SessionId(2)
+                    && snapshot.title.as_deref() == Some("other")
+        ));
+        assert!(matches!(
+            &events[1],
+            runtime::RuntimeEvent::Viewport { session, snapshot, .. }
+                if *session == runtime::SessionId(1)
+                    && snapshot.title.as_deref() == Some("latest")
+        ));
+    }
+
+    #[test]
     fn coalesce_exit_stays_after_mux_for_replay() {
         // [MuxUpdated(세션X 도입), SessionExited(X)] → coalesce 후에도 exit이 mux 뒤에.
         // (mux가 맨 앞으로 가므로 replay 시 X를 먼저 확립하고 exit이 적용됨.)
@@ -4201,6 +4890,13 @@ h:1 EE:FF
         assert!(!workspace_is_live(false, false, 0, d(11)));
         // mux 관측 후 세션 없음 → suspend 가능
         assert!(!workspace_is_live(false, true, 0, d(1)));
+    }
+
+    #[test]
+    fn live_warm_예상치는_기존_target_전환과_신규_전환을_구분한다() {
+        assert_eq!(projected_live_warm_count(4, true, true), 4);
+        assert_eq!(projected_live_warm_count(4, false, true), 5);
+        assert_eq!(projected_live_warm_count(4, false, false), 4);
     }
 
     #[test]

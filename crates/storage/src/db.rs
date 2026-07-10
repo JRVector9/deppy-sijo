@@ -274,6 +274,13 @@ pub struct EnvVarRow {
     pub value: EnvValue,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvApiProjectCount {
+    pub workspace_id: String,
+    pub env_count: usize,
+    pub key_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentConfigRow {
     pub id: String,
@@ -714,6 +721,40 @@ impl Db {
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// 환경/API 프로젝트 목록용 집계. workspace별 profile/var와 credential을 UI에서
+    /// N+1 조회하지 않도록 한 SQL snapshot으로 반환한다. key_count는 현재 UI 계약대로
+    /// 해당 workspace에서 보이는(소속+전역) credential 중 dotenv profile이 참조하는
+    /// 자동 생성 credential을 제외한 수다.
+    pub fn env_api_project_counts(&self) -> anyhow::Result<Vec<EnvApiProjectCount>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT w.id,
+                    (SELECT COUNT(*)
+                       FROM env_profiles ep
+                       JOIN env_vars ev ON ev.profile_id = ep.id
+                      WHERE ep.workspace_id = w.id) AS env_count,
+                    (SELECT COUNT(*)
+                       FROM credentials c
+                      WHERE (c.workspace_id IS NULL OR c.workspace_id = w.id)
+                        AND NOT EXISTS (
+                            SELECT 1
+                              FROM env_vars hidden_ev
+                              JOIN env_profiles hidden_ep ON hidden_ep.id = hidden_ev.profile_id
+                             WHERE hidden_ep.kind = 'dotenv'
+                               AND hidden_ev.credential_id = c.id
+                        )) AS key_count
+               FROM workspaces w
+              ORDER BY w.created_at, w.id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(EnvApiProjectCount {
+                workspace_id: row.get(0)?,
+                env_count: row.get::<_, i64>(1)?.max(0) as usize,
+                key_count: row.get::<_, i64>(2)?.max(0) as usize,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// workspace의 프로젝트 경로를 설정한다 (FT-0 — 컬럼은 v2부터 존재, 값 채움만).
@@ -1931,6 +1972,43 @@ mod tests {
         db.delete_env_profile(&local).unwrap();
         assert_eq!(db.list_env_profiles(&ws).unwrap().len(), 1);
         assert_eq!(db.list_env_profiles(&ws).unwrap()[0].id, prod);
+    }
+
+    #[test]
+    fn env_api_project_counts는_workspace별_집계를_한번에_반환한다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws1 = db.ensure_default_workspace().unwrap();
+        let ws2 = db.create_workspace("second").unwrap();
+        let local = db.insert_env_profile(&ws1, "local", "local").unwrap();
+        let dotenv = db.insert_env_profile(&ws1, ".env", "dotenv").unwrap();
+
+        let mut local_credential = sample("local-key");
+        local_credential.workspace_id = Some(ws1.clone());
+        db.insert_credential(&sample("global-key")).unwrap();
+        db.insert_credential(&local_credential).unwrap();
+        db.insert_credential(&sample("dotenv-key")).unwrap();
+        db.upsert_env_var(&local, "PORT", &EnvValue::Plain("3000".into()))
+            .unwrap();
+        db.upsert_env_var(
+            &dotenv,
+            "API_KEY",
+            &EnvValue::Secret {
+                credential_id: "dotenv-key".into(),
+            },
+        )
+        .unwrap();
+
+        let counts = db.env_api_project_counts().unwrap();
+        let first = counts
+            .iter()
+            .find(|count| count.workspace_id == ws1)
+            .unwrap();
+        assert_eq!((first.env_count, first.key_count), (2, 2));
+        let second = counts
+            .iter()
+            .find(|count| count.workspace_id == ws2)
+            .unwrap();
+        assert_eq!((second.env_count, second.key_count), (0, 1));
     }
 
     #[test]

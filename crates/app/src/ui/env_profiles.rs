@@ -98,7 +98,7 @@ impl EnvProfilesUi {
         ui: &mut egui::Ui,
         db: &mut Db,
         workspace_id: &str,
-        reveal_secret: &dyn Fn(&str) -> Option<String>,
+        reveal_secret: &mut dyn FnMut(&str) -> Option<String>,
         catalog: &i18n::Catalog,
     ) -> anyhow::Result<Option<EnvAction>> {
         if self.cached_workspace.as_deref() != Some(workspace_id) {
@@ -212,23 +212,31 @@ impl EnvProfilesUi {
             Some(v) => v.clone(),
             None => {
                 let v = db.list_env_vars(&profile_id)?;
-                // 기본 노출(사용자 결정 — 개인 로컬 서비스): secret 평문을 이 프레임에
-                // 일괄 resolve해 캐시. keyring N회는 캐시 미스(첫 진입/무효화) 프레임
-                // 1회뿐이라 수용. 평문 상주는 설정창 닫힘 시 App이 invalidate로 정리.
-                for var in &v {
-                    if let EnvValue::Secret { credential_id } = &var.value {
-                        let id = (profile_id.clone(), var.key.clone());
-                        if !self.revealed.contains_key(&id)
-                            && let Some(plain) = reveal_secret(credential_id)
-                        {
-                            self.revealed.insert(id, plain);
-                        }
-                    }
-                }
+                // 외부 .env 동기화로 사라진 키의 마스킹 tombstone을 계속 들고 있으면,
+                // 같은 workspace에서 키 이름이 계속 바뀌는 동안 HashSet이 제한 없이 자란다.
+                // 현재 프로파일에 실제로 남은 키만 유지한다.
+                let live_keys: std::collections::HashSet<&str> =
+                    v.iter().map(|var| var.key.as_str()).collect();
+                self.masked.retain(|(masked_profile, key)| {
+                    masked_profile != &profile_id || live_keys.contains(key.as_str())
+                });
                 self.vars = Some(v.clone());
                 v
             }
         };
+        // 기본 노출 정책은 유지하되, callback은 App의 background keyring worker에 요청만
+        // 넣는다. 결과가 도착한 다음 프레임에도 vars cache가 Some이므로 매 프레임 아직
+        // 비어 있는 항목만 확인해야 평문 cache가 채워진다.
+        for var in &vars {
+            if let EnvValue::Secret { credential_id } = &var.value {
+                let id = (profile_id.clone(), var.key.clone());
+                if !self.revealed.contains_key(&id)
+                    && let Some(plain) = reveal_secret(credential_id)
+                {
+                    self.revealed.insert(id, plain);
+                }
+            }
+        }
 
         // 환경 변수: api-like 분리 없이 **전부 한 표**로(#1/#4). API 키는 App이 별도
         // 자격증명 섹션으로 렌더한다 — 여기서 두 번째 "API Keys" 섹션은 만들지 않는다.

@@ -1,9 +1,7 @@
 //! v0 구현체 (설계문서 2.3). worker thread가 세션들을 소유한다.
 //! 세션 로직(PTY+terminal+lifecycle)은 session crate 소관 (PR-08).
 
-use std::sync::mpsc::{
-    Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError, channel, sync_channel,
-};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,7 +15,10 @@ use session::{Session, StatusDetector, StatusPatterns};
 use storage::SessionLogWriter;
 use terminal::{TERMINAL_GLOBAL_CACHE_BUDGET_BYTES, TerminalCacheClass, TerminalCacheEvent};
 
-use crate::client::{RuntimeClient, RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream};
+use crate::client::{
+    LOCAL_EVENT_QUEUE_CAP, RuntimeClient, RuntimeCommandSink, RuntimeEventReceiver,
+    RuntimeEventStream,
+};
 use crate::command::{RuntimeCommand, SessionId};
 use crate::event::{MessagePayload, RuntimeEvent, SpawnKind};
 use crate::resource_monitor::{
@@ -28,7 +29,8 @@ use crate::resource_monitor::{
 /// 제어 이벤트라 누적 위험 없음)와 세션별 Viewport slot(최신본만 유지 — 14.5의
 /// output bounded 요구를 "누적 불가" 구조로 충족)을 분리한다 (8.2).
 struct Subscriber {
-    events: Sender<RuntimeEvent>,
+    events: SyncSender<RuntimeEvent>,
+    overflowed: Arc<std::sync::atomic::AtomicBool>,
     viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>>,
     input_pressures: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>>,
     /// ResourceUsage 최신본 slot — 주기 샘플이 느린 소비자 채널에 무한 누적되지
@@ -38,6 +40,31 @@ struct Subscriber {
     /// 없을 때도 알림/상태를 처리하도록 (§14.1). Viewport(slot)도 깨운다 — push가
     /// dirty 게이트라 출력이 있을 때만 울리므로 idle 리페인트를 유발하지 않는다.
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+fn enqueue_durable_event(
+    subscriber: &Subscriber,
+    event: RuntimeEvent,
+    wakes: &mut Vec<Arc<dyn Fn() + Send + Sync>>,
+) -> bool {
+    match subscriber.events.try_send(event) {
+        Ok(()) => {
+            if let Some(wake) = &subscriber.wake {
+                wakes.push(Arc::clone(wake));
+            }
+            true
+        }
+        Err(TrySendError::Full(_)) => {
+            subscriber
+                .overflowed
+                .store(true, std::sync::atomic::Ordering::Release);
+            if let Some(wake) = &subscriber.wake {
+                wakes.push(Arc::clone(wake));
+            }
+            false
+        }
+        Err(TrySendError::Disconnected(_)) => false,
+    }
 }
 
 pub struct InProcessRuntimeClient {
@@ -193,17 +220,19 @@ impl RuntimeCommandSink for InProcessRuntimeClient {
 
 impl RuntimeEventStream for InProcessRuntimeClient {
     fn subscribe(&self) -> RuntimeEventReceiver {
-        let (tx, rx) = channel();
+        let (tx, rx) = sync_channel(LOCAL_EVENT_QUEUE_CAP);
         let viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
             Arc::default();
         let input_pressures: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
             Arc::default();
         let resource_usage: Arc<Mutex<Option<RuntimeEvent>>> = Arc::default();
+        let overflowed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.subscribers
             .lock()
             .expect("subscribers lock")
             .push(Subscriber {
                 events: tx,
+                overflowed: Arc::clone(&overflowed),
                 viewports: Arc::clone(&viewports),
                 input_pressures: Arc::clone(&input_pressures),
                 resource_usage: Arc::clone(&resource_usage),
@@ -211,6 +240,8 @@ impl RuntimeEventStream for InProcessRuntimeClient {
             });
         RuntimeEventReceiver {
             events: rx,
+            pending_durable: Mutex::new(None),
+            overflowed,
             viewports,
             input_pressures,
             resource_usage,
@@ -222,17 +253,19 @@ impl InProcessRuntimeClient {
     /// 상태 이벤트 도착 시 `wake`를 호출하는 구독. UI가 숨겨져 프레임이 멈춰도
     /// worker가 UI 스레드를 깨워 알림/상태를 처리하게 한다 (§14.1 Warm 알림 유지).
     pub fn subscribe_with_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) -> RuntimeEventReceiver {
-        let (tx, rx) = channel();
+        let (tx, rx) = sync_channel(LOCAL_EVENT_QUEUE_CAP);
         let viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
             Arc::default();
         let input_pressures: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
             Arc::default();
         let resource_usage: Arc<Mutex<Option<RuntimeEvent>>> = Arc::default();
+        let overflowed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.subscribers
             .lock()
             .expect("subscribers lock")
             .push(Subscriber {
                 events: tx,
+                overflowed: Arc::clone(&overflowed),
                 viewports: Arc::clone(&viewports),
                 input_pressures: Arc::clone(&input_pressures),
                 resource_usage: Arc::clone(&resource_usage),
@@ -240,6 +273,8 @@ impl InProcessRuntimeClient {
             });
         RuntimeEventReceiver {
             events: rx,
+            pending_durable: Mutex::new(None),
+            overflowed,
             viewports,
             input_pressures,
             resource_usage,
@@ -526,14 +561,9 @@ impl Worker {
                         wakes.push(Arc::clone(wake));
                     }
                     true
-                } else if subscriber.events.send(event.clone()).is_ok() {
-                    // 상태 이벤트가 채널에 들어감 — 숨겨진 UI도 깨워 처리하게 한다
-                    if let Some(wake) = &subscriber.wake {
-                        wakes.push(Arc::clone(wake));
-                    }
-                    true
                 } else {
-                    false
+                    // 포화 시 false → retain에서 제거되어 느린 구독자가 disconnect된다.
+                    enqueue_durable_event(subscriber, event.clone(), &mut wakes)
                 }
             });
         }
@@ -796,9 +826,14 @@ impl Worker {
                                 detector.on_input();
                             }
                         }
-                        Some(pty::PtyInputEnqueueResult::Backpressured { pressure })
-                        | Some(pty::PtyInputEnqueueResult::Rejected { pressure }) => {
+                        Some(pty::PtyInputEnqueueResult::Backpressured { pressure }) => {
                             self.pressured_sessions.insert(session);
+                            self.emit(RuntimeEvent::PtyInputPressure { session, pressure });
+                        }
+                        Some(pty::PtyInputEnqueueResult::Rejected { pressure }) => {
+                            // PayloadTooLarge/closed/writer 없음은 큐가 빠지면 회복되는 상태가
+                            // 아니다. resolution poll에 넣으면 즉시 QueueFull(queued=0)이
+                            // 최신값 slot을 덮어 원래 거부 원인을 잃는다.
                             self.emit(RuntimeEvent::PtyInputPressure { session, pressure });
                         }
                         None => {}
@@ -1786,6 +1821,36 @@ mod tests {
             env: Vec::new(),
             cwd: None,
         }
+    }
+
+    #[test]
+    fn durable_event_queue_포화는_구독자를_degraded로_표시한다() {
+        let (tx, _rx) = sync_channel(1);
+        let overflowed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let subscriber = Subscriber {
+            events: tx,
+            overflowed: Arc::clone(&overflowed),
+            viewports: Arc::default(),
+            input_pressures: Arc::default(),
+            resource_usage: Arc::default(),
+            wake: None,
+        };
+        let mut wakes = Vec::new();
+        assert!(enqueue_durable_event(
+            &subscriber,
+            RuntimeEvent::ShellSpawned {
+                session: SessionId(1)
+            },
+            &mut wakes,
+        ));
+        assert!(!enqueue_durable_event(
+            &subscriber,
+            RuntimeEvent::ShellSpawned {
+                session: SessionId(2)
+            },
+            &mut wakes,
+        ));
+        assert!(overflowed.load(std::sync::atomic::Ordering::Acquire));
     }
 
     /// 안정성 감사 High #1: 주기 ResourceUsage가 느린(드레인 안 하는) 구독자 채널에

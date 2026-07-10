@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{TryRecvError, channel};
+use std::sync::mpsc::{SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -37,7 +37,9 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use terminal::TerminalViewportSnapshot;
 
-use crate::client::{RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream};
+use crate::client::{
+    LOCAL_EVENT_QUEUE_CAP, RuntimeCommandSink, RuntimeEventReceiver, RuntimeEventStream,
+};
 use crate::command::RuntimeCommand;
 use crate::event::RuntimeEvent;
 use crate::in_process::InProcessRuntimeClient;
@@ -568,7 +570,7 @@ fn drain_receiver_into_outbound(
 
     let mut source = OutboundDrain::Open;
     loop {
-        match receiver.events.try_recv() {
+        match receiver.try_recv_durable() {
             // ResourceUsage/PtyInputPressure/SessionStatusViewChanged는 로컬 UI
             // telemetry/additive status view — 원격 피어에 보내지 않는다.
             // postcard append-only는 기존 variant discriminant를 보존할 뿐, 구버전
@@ -1447,7 +1449,8 @@ enum ClientTransport {
 }
 
 struct RemoteSubscriber {
-    events: std::sync::mpsc::Sender<RuntimeEvent>,
+    events: SyncSender<RuntimeEvent>,
+    overflowed: Arc<AtomicBool>,
     viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>>,
     input_pressures: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>>,
 }
@@ -2120,7 +2123,14 @@ fn dispatch(subscribers: &Arc<Mutex<Vec<RemoteSubscriber>>>, event: RuntimeEvent
                     .insert(*session, event.clone());
                 true
             } else {
-                subscriber.events.send(event.clone()).is_ok()
+                match subscriber.events.try_send(event.clone()) {
+                    Ok(()) => true,
+                    Err(TrySendError::Full(_)) => {
+                        subscriber.overflowed.store(true, Ordering::Release);
+                        false
+                    }
+                    Err(TrySendError::Disconnected(_)) => false,
+                }
             }
         });
 }
@@ -2166,21 +2176,25 @@ impl RuntimeCommandSink for RemoteRuntimeClient {
 
 impl RuntimeEventStream for RemoteRuntimeClient {
     fn subscribe(&self) -> RuntimeEventReceiver {
-        let (tx, rx) = channel();
+        let (tx, rx) = sync_channel(LOCAL_EVENT_QUEUE_CAP);
         let viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
             Arc::default();
         let input_pressures: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
             Arc::default();
+        let overflowed = Arc::new(AtomicBool::new(false));
         self.subscribers
             .lock()
             .expect("remote subscribers lock")
             .push(RemoteSubscriber {
                 events: tx,
+                overflowed: Arc::clone(&overflowed),
                 viewports: Arc::clone(&viewports),
                 input_pressures: Arc::clone(&input_pressures),
             });
         RuntimeEventReceiver {
             events: rx,
+            pending_durable: Mutex::new(None),
+            overflowed,
             viewports,
             input_pressures,
             // remote는 wire 단계에서 outbound 큐가 이미 유계/코얼레싱이라(감사 통과)
@@ -2916,11 +2930,13 @@ mod tests {
 
     #[test]
     fn receiver_drain은_durable_cap에서_멈춘다() {
-        let (tx, rx) = channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let viewports: Arc<Mutex<HashMap<SessionId, RuntimeEvent>>> = Arc::default();
         let input_pressures: Arc<Mutex<HashMap<SessionId, RuntimeEvent>>> = Arc::default();
         let receiver = RuntimeEventReceiver {
             events: rx,
+            pending_durable: Mutex::new(None),
+            overflowed: Arc::default(),
             viewports,
             input_pressures,
             resource_usage: Arc::default(),
@@ -2941,11 +2957,13 @@ mod tests {
 
     #[test]
     fn receiver_drain은_additive_local_events를_wire에서_필터링한다() {
-        let (tx, rx) = channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let viewports: Arc<Mutex<HashMap<SessionId, RuntimeEvent>>> = Arc::default();
         let input_pressures: Arc<Mutex<HashMap<SessionId, RuntimeEvent>>> = Arc::default();
         let receiver = RuntimeEventReceiver {
             events: rx,
+            pending_durable: Mutex::new(None),
+            overflowed: Arc::default(),
             viewports,
             input_pressures: Arc::clone(&input_pressures),
             resource_usage: Arc::default(),
@@ -3619,11 +3637,12 @@ mod tests {
         // 클라이언트: slot을 관찰할 실제 구독자 하나를 붙이고 두 프레임을 순서대로 처리한다.
         let (client_sock, _server) = socket_pair();
         let writer = Mutex::new(client_sock);
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = sync_channel(LOCAL_EVENT_QUEUE_CAP);
         let slot: Arc<Mutex<HashMap<SessionId, RuntimeEvent>>> = Arc::default();
         let subscribers: Arc<Mutex<Vec<RemoteSubscriber>>> =
             Arc::new(Mutex::new(vec![RemoteSubscriber {
                 events: tx,
+                overflowed: Arc::default(),
                 viewports: Arc::clone(&slot),
                 input_pressures: Arc::default(),
             }]));

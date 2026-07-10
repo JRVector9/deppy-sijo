@@ -10,6 +10,7 @@
 //! - dotenv 파일이 하나도 없으면 아무것도 만들지 않고, 기존 dotenv profile은 그대로 둔다
 //!   (일시적 체크아웃 차이로 저장된 환경이 사라지지 않게).
 
+use std::io::Write as _;
 use std::path::Path;
 
 use anyhow::Context;
@@ -33,16 +34,127 @@ pub struct DotenvSyncReport {
     pub removed: usize,
 }
 
+struct TempFileGuard(Option<std::path::PathBuf>);
+
+impl TempFileGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn atomic_write_env(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!(".env 상위 디렉터리 없음: {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(".env");
+    let temp = parent.join(format!(
+        ".{file_name}.deppy-tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temp)
+        .with_context(|| format!("dotenv 임시 파일 생성 실패: {}", temp.display()))?;
+    let mut guard = TempFileGuard(Some(temp.clone()));
+
+    // 기존 파일의 접근 권한을 유지한다. 새 파일은 OpenOptions의 0600(Unix) 기본을 쓴다.
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            std::fs::set_permissions(&temp, metadata.permissions())
+                .with_context(|| format!("dotenv 임시 파일 권한 설정 실패: {}", temp.display()))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("dotenv 원본 권한 조회 실패: {}", path.display()));
+        }
+    }
+    file.write_all(contents)
+        .with_context(|| format!("dotenv 임시 파일 쓰기 실패: {}", temp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("dotenv 임시 파일 sync 실패: {}", temp.display()))?;
+    drop(file);
+
+    atomic_replace(&temp, path)
+        .with_context(|| format!("dotenv 원자 교체 실패: {}", path.display()))?;
+    guard.disarm();
+
+    #[cfg(unix)]
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("dotenv 디렉터리 sync 실패: {}", parent.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn atomic_replace(temp: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::rename(temp, target)
+}
+
+#[cfg(windows)]
+fn atomic_replace(temp: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let from: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: 두 경로는 호출 동안 살아 있는 NUL 종료 UTF-16 버퍼다.
+    let result = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn atomic_replace(temp: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::rename(temp, target)
+}
+
 /// UI 편집을 `.env` 파일에 **라인 단위**로 반영한다(7·8번, 2026-07-10). 주석·순서 보존.
 /// - 대상 파일: 키가 이미 있는 파일(.env.local 우선순위 역순으로 탐색), 없으면 `.env`
 ///   (파일이 없으면 생성). value=None이면 해당 라인 삭제.
 /// - 반영 후 mtime 폴링/명시 sync가 DB를 따라 갱신한다(.env가 단일 진실).
 pub fn write_env_var(root: &std::path::Path, key: &str, value: Option<&str>) -> anyhow::Result<()> {
+    fn read_if_present(path: &std::path::Path) -> anyhow::Result<Option<String>> {
+        match std::fs::read_to_string(path) {
+            Ok(content) => Ok(Some(content)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| format!(".env 읽기 실패: {}", path.display())),
+        }
+    }
+
     // 키가 존재하는 파일 찾기 — 병합 우선순위가 높은 파일(.env.local)부터.
     let mut target: Option<std::path::PathBuf> = None;
     for name in DOTENV_FILE_NAMES.iter().rev() {
         let path = root.join(name);
-        if let Ok(content) = std::fs::read_to_string(&path)
+        if let Some(content) = read_if_present(&path)?
             && parse_dotenv(&content).iter().any(|(k, _)| k == key)
         {
             target = Some(path);
@@ -50,7 +162,9 @@ pub fn write_env_var(root: &std::path::Path, key: &str, value: Option<&str>) -> 
         }
     }
     let path = target.unwrap_or_else(|| root.join(DOTENV_FILE_NAMES[0]));
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    // NotFound만 새 파일로 취급한다. 권한 오류/잘못된 UTF-8/일시적 I/O 실패를 빈 파일로
+    // 오인해 기존 .env 전체를 덮어쓰는 데이터 손실을 막는다.
+    let content = read_if_present(&path)?.unwrap_or_default();
 
     // 값 직렬화 — 파서가 이스케이프를 해석하지 않으므로(codex Med) 이스케이프 금지:
     // 내부에 "가 있으면 '…'로 감싸고, "와 '를 둘 다 포함하면 라운드트립 불가라 거부.
@@ -80,11 +194,23 @@ pub fn write_env_var(root: &std::path::Path, key: &str, value: Option<&str>) -> 
             .map(|(k, _)| k.trim() == key)
             .unwrap_or(false)
     };
-    let existing = lines.iter().position(|l| matches_key(l));
-    match (existing, value) {
-        (Some(idx), Some(v)) => lines[idx] = render(v)?,
-        (Some(idx), None) => {
-            lines.remove(idx);
+    let existing: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| matches_key(line).then_some(idx))
+        .collect();
+    match (existing.last().copied(), value) {
+        (Some(last), Some(v)) => {
+            // dotenv의 실효 값은 마지막 중복 정의다. 마지막 행을 갱신하고 앞선 중복은
+            // 제거해 UI 편집 직후에도 파서/셸에서 동일한 단일 값이 보이게 한다.
+            lines[last] = render(v)?;
+            for idx in existing[..existing.len() - 1].iter().rev() {
+                lines.remove(*idx);
+            }
+        }
+        (Some(_), None) => {
+            // 하나만 지우면 뒤의 중복 정의가 살아나 삭제가 무효화되므로 전부 제거한다.
+            lines.retain(|line| !matches_key(line));
         }
         (None, Some(v)) => lines.push(render(v)?),
         (None, None) => return Ok(()), // 지울 것 없음
@@ -93,7 +219,8 @@ pub fn write_env_var(root: &std::path::Path, key: &str, value: Option<&str>) -> 
     if !out.is_empty() {
         out.push('\n');
     }
-    std::fs::write(&path, out).with_context(|| format!(".env 기록 실패: {}", path.display()))?;
+    atomic_write_env(&path, out.as_bytes())
+        .with_context(|| format!(".env 기록 실패: {}", path.display()))?;
     Ok(())
 }
 
@@ -141,22 +268,34 @@ pub fn remove_workspace_dotenv(
 
 /// 루트의 dotenv 파일들(`DOTENV_FILE_NAMES` 순서)을 읽어 병합 파싱한다.
 /// 같은 키는 뒤 파일 값이 이긴다(순서는 처음 등장 위치 유지). 읽은 파일이 없으면 None.
-fn read_merged_dotenv(root: &Path) -> Option<Vec<(String, String)>> {
+///
+/// 존재하는 파일의 권한/UTF-8/I/O 오류는 반드시 호출자에 전달한다. 한 파일의 읽기 실패를
+/// "파일 없음"으로 취급하면 다른 파일의 부분 결과로 동기화가 진행되어, 읽지 못한 파일의
+/// 키를 DB/keyring에서 삭제된 것으로 오판할 수 있다.
+fn read_merged_dotenv(root: &Path) -> anyhow::Result<Option<Vec<(String, String)>>> {
     let mut merged: Vec<(String, String)> = Vec::new();
+    let mut positions: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut found = false;
     for name in DOTENV_FILE_NAMES {
-        let Ok(content) = std::fs::read_to_string(root.join(name)) else {
-            continue;
+        let path = root.join(name);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("dotenv 읽기 실패: {}", path.display()));
+            }
         };
         found = true;
         for (key, value) in parse_dotenv(&content) {
-            match merged.iter_mut().find(|(k, _)| *k == key) {
-                Some(entry) => entry.1 = value,
-                None => merged.push((key, value)),
+            if let Some(index) = positions.get(&key).copied() {
+                merged[index].1 = value;
+            } else {
+                positions.insert(key.clone(), merged.len());
+                merged.push((key, value));
             }
         }
     }
-    found.then_some(merged)
+    Ok(found.then_some(merged))
 }
 
 /// workspace 루트의 dotenv 파일들(`.env` → `.env.local` 병합)을 dotenv profile로
@@ -169,7 +308,7 @@ pub fn sync_workspace_dotenv(
     workspace_id: &str,
     root: &Path,
 ) -> anyhow::Result<Option<DotenvSyncReport>> {
-    let Some(parsed) = read_merged_dotenv(root) else {
+    let Some(parsed) = read_merged_dotenv(root)? else {
         return Ok(None); // dotenv 파일 없음 — 기존 profile은 보존
     };
 
@@ -267,7 +406,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[test]
     fn write_env_var는_라운드트립을_보존한다() {
         let dir = std::env::temp_dir().join(format!("deppy-wenv-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -301,6 +439,102 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
+    fn write_env_var는_중복_정의를_하나로_정리하고_삭제는_전부_지운다() {
+        let dir =
+            std::env::temp_dir().join(format!("deppy-wenv-duplicates-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = dir.join(".env");
+        std::fs::write(&env, "PORT=1000\nKEEP=1\nexport PORT=2000\n").unwrap();
+
+        write_env_var(&dir, "PORT", Some("3000")).unwrap();
+        let content = std::fs::read_to_string(&env).unwrap();
+        assert_eq!(content.matches("PORT=").count(), 1);
+        assert_eq!(
+            parse_dotenv(&content)
+                .into_iter()
+                .find(|(key, _)| key == "PORT")
+                .map(|(_, value)| value),
+            Some("3000".to_owned())
+        );
+
+        std::fs::write(&env, "PORT=1000\nKEEP=1\nPORT=2000\n").unwrap();
+        write_env_var(&dir, "PORT", None).unwrap();
+        let content = std::fs::read_to_string(&env).unwrap();
+        assert!(!parse_dotenv(&content).iter().any(|(key, _)| key == "PORT"));
+        assert!(content.contains("KEEP=1"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_env_var는_읽을_수_없는_utf8_파일을_덮어쓰지_않는다() {
+        let dir =
+            std::env::temp_dir().join(format!("deppy-wenv-invalid-utf8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = dir.join(".env");
+        let original = [0xff, 0xfe, b'=', b'1', b'\n'];
+        std::fs::write(&env, original).unwrap();
+
+        assert!(write_env_var(&dir, "PORT", Some("3000")).is_err());
+        assert_eq!(std::fs::read(&env).unwrap(), original);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_env_write는_권한을_보존하고_temp를_남기지_않는다() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-wenv-atomic-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = dir.join(".env");
+        std::fs::write(&env, "PORT=1000\n").unwrap();
+        std::fs::set_permissions(&env, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        write_env_var(&dir, "PORT", Some("3000")).unwrap();
+        assert_eq!(
+            std::fs::metadata(&env).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(std::fs::read_to_string(&env).unwrap(), "PORT=3000\n");
+        assert!(std::fs::read_dir(&dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("deppy-tmp")
+        }));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn atomic_env_write_교체실패는_원본과_temp_정리를_보장한다() {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-wenv-atomic-failure-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join(".env");
+        std::fs::create_dir(&target).unwrap();
+
+        assert!(atomic_write_env(&target, b"PORT=3000\n").is_err());
+        assert!(target.is_dir());
+        assert!(std::fs::read_dir(&dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("deppy-tmp")
+        }));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn parse_dotenv는_주석_export_따옴표를_처리한다() {
         let content = r#"
 # comment
@@ -480,6 +714,47 @@ INVALID LINE
         let vars = db.list_env_vars(&profile.id).unwrap();
         assert_eq!(vars.len(), 1);
         assert_eq!(vars[0].value, EnvValue::Plain("7000".to_owned()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_local_읽기_실패는_부분_동기화하지_않고_기존_상태를_보존한다() {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-dotenv-read-failure-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("test.db")).unwrap();
+        let store = MemStore(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let redaction = secret::RedactionService::new();
+        let ws = db.create_workspace("test").unwrap();
+
+        std::fs::write(dir.join(".env"), "PORT=3000\n").unwrap();
+        std::fs::write(dir.join(".env.local"), "API_KEY=sk-local\n").unwrap();
+        sync_workspace_dotenv(&db, &store, &redaction, &ws, &dir).unwrap();
+        let profile = db
+            .list_env_profiles(&ws)
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.kind == DOTENV_PROFILE_KIND)
+            .unwrap();
+        let before = db.list_env_vars(&profile.id).unwrap();
+        assert_eq!(before.len(), 2);
+        let credential_id = before
+            .iter()
+            .find_map(|var| match &var.value {
+                EnvValue::Secret { credential_id } => Some(credential_id.clone()),
+                EnvValue::Plain(_) => None,
+            })
+            .unwrap();
+
+        std::fs::write(dir.join(".env.local"), [0xff, 0xfe, b'\n']).unwrap();
+        assert!(sync_workspace_dotenv(&db, &store, &redaction, &ws, &dir).is_err());
+        assert_eq!(db.list_env_vars(&profile.id).unwrap(), before);
+        assert_eq!(
+            store.0.lock().unwrap().get(&credential_id).unwrap(),
+            "sk-local"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 
 /// 사이드바 세션 목록 항목 (§6 확장 — 좌측 패널은 트리+세션의 workspace 사이드바다,
@@ -107,11 +107,18 @@ pub struct FileTreeUi {
     /// 마지막 조작 에러 (하단 빨간 라벨, §4).
     error: Option<String>,
     /// 백그라운드 파일 조작(EXDEV copy 등 §9-3)의 완료/에러 채널.
-    ops_tx: Sender<OpOutcome>,
+    ops_tx: SyncSender<OpOutcome>,
     ops_rx: Receiver<OpOutcome>,
     /// 백그라운드 디렉터리 listing 결과 채널. read_dir/sort는 worker에서 수행한다.
-    listing_tx: Sender<ListingOutcome>,
+    listing_tx: SyncSender<ListingOutcome>,
     listing_rx: Receiver<ListingOutcome>,
+    /// 프로세스 전역 고정 크기 listing worker pool 입력 큐. FileTreeUi를 반복 생성해도
+    /// 요청마다/인스턴스마다 OS thread를 만들지 않는다.
+    listing_jobs: SyncSender<ListingJob>,
+    /// FileTreeUi drop/root 교체 시 worker가 send/read loop를 중단하게 하는 플래그.
+    listing_shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// job 큐 포화 시 다수 요청을 한 번의 root refresh로 축약한다.
+    listing_refresh_deferred: bool,
     /// root 전환 generation. 이전 root의 late result는 epoch mismatch로 폐기한다.
     listing_epoch: u64,
     /// 워커와 공유하는 현재 epoch — 워커가 나열 전/청크 전송 중에 확인해 stale 작업을
@@ -141,6 +148,8 @@ pub struct FileTreeUi {
     /// 워처 이벤트 채널 (워처 스레드 → UI). 콜백에서 기본 ignore/.env 분류를 끝내고
     /// UI 스레드는 dedup+debounce된 dirty dir만 재나열한다.
     watch_rx: Option<Receiver<WatchEvent>>,
+    /// watcher 채널 포화 — 개별 이벤트를 더 쌓지 않고 root refresh 한 건으로 축약.
+    watch_overflowed: Arc<std::sync::atomic::AtomicBool>,
     /// 워처가 무시할 경로 prefix들 — 앱 자신의 data/log 디렉터리 등. 자기 로그 쓰기가
     /// 이벤트로 돌아와 리페인트를 유발하는 자기-루프 차단 (리페인트 원인 조사 2026-07-04).
     watch_ignore: std::sync::Arc<Vec<PathBuf>>,
@@ -180,6 +189,17 @@ struct ListingOutcome {
     token: u64,
     path: PathBuf,
     result: ListingResult,
+}
+
+struct ListingJob {
+    tx: SyncSender<ListingOutcome>,
+    ctx: egui::Context,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    epoch: ListingEpochGuard,
+    token: u64,
+    root: Option<PathBuf>,
+    path: PathBuf,
+    ignore_cache: GitIgnoreCache,
 }
 
 enum ListingResult {
@@ -468,8 +488,10 @@ enum EditState {
 
 impl FileTreeUi {
     pub fn new(egui_ctx: egui::Context) -> Self {
-        let (ops_tx, ops_rx) = std::sync::mpsc::channel();
-        let (listing_tx, listing_rx) = std::sync::mpsc::channel();
+        let (ops_tx, ops_rx) = sync_channel(FILE_OP_RESULT_QUEUE_CAP);
+        let (listing_tx, listing_rx) = sync_channel(LISTING_RESULT_QUEUE_CAP);
+        let listing_jobs = global_listing_pool().clone();
+        let listing_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         Self {
             root: None,
             root_error: None,
@@ -482,6 +504,9 @@ impl FileTreeUi {
             ops_rx,
             listing_tx,
             listing_rx,
+            listing_jobs,
+            listing_shutdown,
+            listing_refresh_deferred: false,
             listing_epoch: 0,
             listing_epoch_shared: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             next_listing_token: 0,
@@ -493,6 +518,7 @@ impl FileTreeUi {
             watcher: None,
             watched_dirs: std::collections::HashSet::new(),
             watch_rx: None,
+            watch_overflowed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             measured_row_height: None,
             watch_ignore: std::sync::Arc::new(Vec::new()),
             ignore_cache: GitIgnoreCache::default(),
@@ -551,21 +577,46 @@ impl FileTreeUi {
     /// 디렉터리만 채널로 보내고 ~300ms 디바운스로 repaint를 예약한다(폭주 시 일괄 처리).
     /// idle에는 이벤트가 없어 repaint를 유발하지 않는다 (리소스 계약).
     fn start_watcher(&mut self) {
-        self.watcher = None;
+        #[cfg(not(test))]
+        if let Some(watcher) = self.watcher.take() {
+            retire_watcher(watcher);
+        }
+        #[cfg(test)]
+        {
+            self.watcher = None;
+        }
         self.watch_rx = None;
         self.watched_dirs.clear();
+        // 단위 테스트는 아래 watcher 변환/스로틀 로직에 채널을 직접 주입한다. macOS
+        // FSEvents backend를 실제로 만들면 Drop이 OS latency만큼(실측 60s+) 기다려 테스트가
+        // 느려지므로 platform watcher 생성만 제외한다.
+        #[cfg(test)]
+        return;
+        #[cfg(not(test))]
+        self.start_platform_watcher();
+    }
+
+    #[cfg(not(test))]
+    fn start_platform_watcher(&mut self) {
         let Some(root) = self.root.clone() else {
             return;
         };
         if self.root_error.is_some() {
             return;
         }
-        let (tx, rx) = std::sync::mpsc::channel::<WatchEvent>();
+        if !try_acquire_watcher_slot() {
+            tracing::warn!("파일 감시자 정리 대기 상한 — 수동 새로고침으로 동작");
+            return;
+        }
+        self.watch_overflowed
+            .store(false, std::sync::atomic::Ordering::Release);
+        let (tx, rx) = sync_channel::<WatchEvent>(WATCH_EVENT_QUEUE_CAP);
         let ctx = self.egui_ctx.clone();
         let ignore = std::sync::Arc::clone(&self.watch_ignore);
         let ignore_cache = self.ignore_cache.clone();
         let show_hidden = std::sync::Arc::clone(&self.watch_show_hidden);
         let watch_root = root.clone();
+        let overflowed = Arc::clone(&self.watch_overflowed);
         let handler = move |res: Result<notify::Event, notify::Error>| match res {
             Ok(event) => {
                 if !relevant_fs_event(&event.kind) {
@@ -581,8 +632,16 @@ impl FileTreeUi {
                         ignore.as_ref(),
                         &ignore_cache,
                     ) {
-                        let _ = tx.send(event);
-                        sent = true;
+                        match tx.try_send(event) {
+                            Ok(()) => sent = true,
+                            Err(TrySendError::Full(_)) => {
+                                // 개별 경로를 계속 쌓지 않고 UI가 root refresh 한 건으로
+                                // 복구하게 한다. 플래그는 coalesced라 burst 크기와 무관하게 유계.
+                                overflowed.store(true, std::sync::atomic::Ordering::Release);
+                                sent = true;
+                            }
+                            Err(TrySendError::Disconnected(_)) => return,
+                        }
                     }
                 }
                 if !sent {
@@ -600,7 +659,10 @@ impl FileTreeUi {
                 self.watch_rx = Some(rx);
                 self.sync_watches(); // 루트(+현재 펼침) 비재귀 등록
             }
-            Err(e) => tracing::warn!("파일 감시자 생성 실패 (수동 새로고침으로 동작): {e}"),
+            Err(e) => {
+                release_watcher_slot();
+                tracing::warn!("파일 감시자 생성 실패 (수동 새로고침으로 동작): {e}");
+            }
         }
     }
 
@@ -642,12 +704,25 @@ impl FileTreeUi {
     }
 
     /// 워처 이벤트 수거 + 시간 스로틀 재나열 (FT-4, codex Med-1). 채널은 매 프레임
-    /// **끝까지 비워** pending 집합에 흡수하고(백로그 방지), 실제 재나열(reread 재귀)은
+    /// 프레임 예산만큼 비워 pending 집합에 흡수하고, 실제 재나열(reread 재귀)은
     /// 마지막 일괄 후 WATCH_RELOAD_MS 경과 시에만 수행한다 — 터미널 출력으로 프레임이
     /// 계속 돌면서 파일 이벤트가 쏟아져도 재나열은 최대 ~3.3Hz.
     fn pump_watch_events(&mut self, ctx: &egui::Context) {
+        if self
+            .watch_overflowed
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+            && let Some(root) = &self.root
+        {
+            // 포화 burst는 root 한 건으로 축약한다.
+            insert_pending_watch_dir(&mut self.pending_watch, root.clone());
+        }
+        let mut drained = 0usize;
         if let Some(rx) = &self.watch_rx {
-            while let Ok(event) = rx.try_recv() {
+            while drained < WATCH_EVENTS_PER_FRAME {
+                let Ok(event) = rx.try_recv() else {
+                    break;
+                };
+                drained += 1;
                 match event {
                     WatchEvent::DirtyDir(dir) => {
                         insert_pending_watch_dir(&mut self.pending_watch, dir)
@@ -657,6 +732,9 @@ impl FileTreeUi {
                     }
                 }
             }
+        }
+        if drained == WATCH_EVENTS_PER_FRAME {
+            ctx.request_repaint();
         }
         if self.pending_watch.is_empty() {
             return;
@@ -1619,6 +1697,11 @@ impl FileTreeUi {
         refresh: Vec<PathBuf>,
         job: impl FnOnce() -> Result<(), String> + Send + 'static,
     ) {
+        if self.in_flight >= FILE_OP_WORKER_CAP {
+            self.error =
+                Some("파일 작업이 너무 많습니다 — 진행 중인 작업을 기다려 주세요".to_owned());
+            return;
+        }
         self.in_flight += 1;
         let tx = self.ops_tx.clone();
         let ctx = self.egui_ctx.clone();
@@ -1636,6 +1719,11 @@ impl FileTreeUi {
     /// 휴지통 이동 (§5/§9-7). 큰 디렉터리도 프레임을 막지 않게 항상 백그라운드.
     /// 실패 시 영구삭제 확인을 UI에 예약한다 (조용한 영구삭제 금지).
     fn spawn_trash(&mut self, path: PathBuf) {
+        if self.in_flight >= FILE_OP_WORKER_CAP {
+            self.error =
+                Some("파일 작업이 너무 많습니다 — 진행 중인 작업을 기다려 주세요".to_owned());
+            return;
+        }
         self.in_flight += 1;
         let tx = self.ops_tx.clone();
         let ctx = self.egui_ctx.clone();
@@ -1708,19 +1796,37 @@ impl FileTreeUi {
             // 같은 경로 재요청(reload_dir) — 구 워커의 잔여 청크 송신을 중단시킨다.
             old.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        spawn_listing_worker(
-            self.listing_tx.clone(),
-            self.egui_ctx.clone(),
-            ListingEpochGuard {
+        let job = ListingJob {
+            tx: self.listing_tx.clone(),
+            ctx: self.egui_ctx.clone(),
+            shutdown: Arc::clone(&self.listing_shutdown),
+            epoch: ListingEpochGuard {
                 requested: self.listing_epoch,
                 current: Arc::clone(&self.listing_epoch_shared),
                 cancel,
             },
             token,
-            self.root.clone(),
+            root: self.root.clone(),
             path,
-            self.ignore_cache.clone(),
-        );
+            ignore_cache: self.ignore_cache.clone(),
+        };
+        match self.listing_jobs.try_send(job) {
+            Ok(()) => {}
+            Err(TrySendError::Full(job)) => {
+                // 요청을 무제한 보관하지 않는다. 이 경로 요청은 취소하고, 큐가 비는
+                // 프레임에 root refresh 한 건으로 상태를 재구성한다.
+                job.epoch
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::Release);
+                self.pending_listings.remove(&job.path);
+                self.listing_refresh_deferred = true;
+                self.egui_ctx.request_repaint();
+            }
+            Err(TrySendError::Disconnected(job)) => {
+                self.pending_listings.remove(&job.path);
+                self.error = Some("파일 listing worker가 종료되었습니다".to_owned());
+            }
+        }
     }
 
     fn request_listing_if_absent(
@@ -1750,7 +1856,7 @@ impl FileTreeUi {
         let mut processed = 0;
         while processed < LISTING_RESULTS_PER_FRAME {
             let Ok(outcome) = self.listing_rx.try_recv() else {
-                return;
+                break;
             };
             // stale(구 epoch)은 프레임 예산에 세지 않고 즉시 폐기 — 백로그를
             // 프레임당 4개씩만 비우면 따라잡기가 밀린다(안정성 감사 High #2).
@@ -1759,6 +1865,11 @@ impl FileTreeUi {
             }
             self.apply_listing_outcome(outcome);
             processed += 1;
+        }
+        if self.listing_refresh_deferred && self.pending_listings.len() < LISTING_JOB_QUEUE_CAP / 2
+        {
+            self.listing_refresh_deferred = false;
+            self.refresh();
         }
         if !self.pending_listings.is_empty() {
             self.egui_ctx.request_repaint();
@@ -1957,6 +2068,22 @@ impl FileTreeUi {
             .filter(|node| node.is_dir && node.expanded)
             .map(|node| path.join(&node.name))
             .collect()
+    }
+}
+
+impl Drop for FileTreeUi {
+    fn drop(&mut self) {
+        // read_dir가 네트워크 파일시스템에서 오래 막힐 수 있어 UI thread에서 join하지는
+        // 않는다. 인스턴스 플래그와 result receiver drop으로 전역 pool의 이 인스턴스 job은
+        // 다음 entry/send 경계에서 끝난다. pool 자체는 프로세스 전역 4개로 계속 재사용한다.
+        self.listing_shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        // macOS FSEvents watcher Drop은 감시 루트가 외부에서 사라진 경우 OS latency만큼
+        // 블록할 수 있다. 고정 1개 reaper + 전역 slot cap으로 UI를 막지 않고 유계 정리한다.
+        #[cfg(not(test))]
+        if let Some(watcher) = self.watcher.take() {
+            retire_watcher(watcher);
+        }
     }
 }
 
@@ -2682,6 +2809,90 @@ fn remove_all(path: &Path) -> std::io::Result<()> {
 /// `DirEntry::file_type`은 링크를 해석하지 않으므로 링크는 파일처럼 취급 — 펼침 불가).
 const LISTING_CHUNK_SIZE: usize = 2048;
 const LISTING_RESULTS_PER_FRAME: usize = 4;
+const LISTING_WORKER_COUNT: usize = 4;
+const LISTING_JOB_QUEUE_CAP: usize = 64;
+const LISTING_RESULT_QUEUE_CAP: usize = 16;
+const FILE_OP_RESULT_QUEUE_CAP: usize = 32;
+const FILE_OP_WORKER_CAP: usize = 4;
+#[cfg(not(test))]
+const WATCH_EVENT_QUEUE_CAP: usize = 512;
+const WATCH_EVENTS_PER_FRAME: usize = 256;
+
+#[cfg(not(test))]
+const WATCHER_SLOT_CAP: usize = 4;
+#[cfg(not(test))]
+static WATCHER_SLOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(not(test))]
+static WATCHER_REAPER: std::sync::OnceLock<SyncSender<notify::RecommendedWatcher>> =
+    std::sync::OnceLock::new();
+
+#[cfg(not(test))]
+fn try_acquire_watcher_slot() -> bool {
+    WATCHER_SLOTS
+        .fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |current| (current < WATCHER_SLOT_CAP).then_some(current + 1),
+        )
+        .is_ok()
+}
+
+#[cfg(not(test))]
+fn release_watcher_slot() {
+    let previous = WATCHER_SLOTS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    debug_assert!(previous > 0, "watcher slot underflow");
+}
+
+#[cfg(not(test))]
+fn watcher_reaper() -> &'static SyncSender<notify::RecommendedWatcher> {
+    WATCHER_REAPER.get_or_init(|| {
+        let (tx, rx) = sync_channel::<notify::RecommendedWatcher>(WATCHER_SLOT_CAP);
+        if let Err(error) = std::thread::Builder::new()
+            .name("file-watcher-reaper".to_owned())
+            .spawn(move || {
+                while let Ok(watcher) = rx.recv() {
+                    drop(watcher);
+                    release_watcher_slot();
+                }
+            })
+        {
+            // receiver는 spawn 실패와 함께 drop되어 tx가 Disconnected가 된다. retire 호출은
+            // 아래 bounded fallback으로 넘어가므로 앱 시작/토글을 panic시키지 않는다.
+            tracing::error!("file watcher reaper thread 생성 실패: {error}");
+        }
+        tx
+    })
+}
+
+#[cfg(not(test))]
+fn retire_watcher(watcher: notify::RecommendedWatcher) {
+    match watcher_reaper().try_send(watcher) {
+        Ok(()) => {}
+        Err(TrySendError::Full(watcher)) | Err(TrySendError::Disconnected(watcher)) => {
+            // slot cap 때문에 fallback thread 수도 최대 WATCHER_SLOT_CAP이다. UI thread에서
+            // 직접 Drop해 멈추는 것보다 독립 정리를 유지한다.
+            let pending = Arc::new(Mutex::new(Some(watcher)));
+            let worker_pending = Arc::clone(&pending);
+            if std::thread::Builder::new()
+                .name("file-watcher-retire-fallback".to_owned())
+                .spawn(move || {
+                    if let Some(watcher) =
+                        worker_pending.lock().expect("watcher fallback lock").take()
+                    {
+                        drop(watcher);
+                    }
+                    release_watcher_slot();
+                })
+                .is_err()
+            {
+                // thread 생성 실패 시 watcher를 leak해 UI block을 피하되 slot은 점유한 채
+                // 남긴다. 최대 WATCHER_SLOT_CAP 이후 새 watcher 생성이 중단되어 유계다.
+                std::mem::forget(pending);
+                tracing::error!("파일 감시자 정리 thread 생성 실패 — watcher slot 격리");
+            }
+        }
+    }
+}
 
 /// listing 워커의 stale 판정 — 요청 시점 epoch과 UI의 현재 epoch(공유 atomic)을 묶어
 /// 워커가 나열 전/청크 전송 중에 확인한다(안정성 감사 High #2).
@@ -2699,39 +2910,126 @@ impl ListingEpochGuard {
     }
 }
 
-fn spawn_listing_worker(
-    tx: Sender<ListingOutcome>,
-    ctx: egui::Context,
-    epoch: ListingEpochGuard,
-    token: u64,
-    root: Option<PathBuf>,
-    path: PathBuf,
-    ignore_cache: GitIgnoreCache,
-) {
-    std::thread::spawn(move || {
-        // stale 조기 취소 — root 전환/refresh로 epoch이 바뀌었으면 나열조차 하지 않는다.
-        if epoch.is_stale() {
-            return;
+static LISTING_POOL: std::sync::OnceLock<SyncSender<ListingJob>> = std::sync::OnceLock::new();
+
+fn global_listing_pool() -> &'static SyncSender<ListingJob> {
+    LISTING_POOL.get_or_init(|| {
+        let (tx, jobs) = sync_channel::<ListingJob>(LISTING_JOB_QUEUE_CAP);
+        let jobs = Arc::new(Mutex::new(jobs));
+        let mut spawned = 0usize;
+        for index in 0..LISTING_WORKER_COUNT {
+            let jobs = Arc::clone(&jobs);
+            match std::thread::Builder::new()
+                .name(format!("file-listing-{index}"))
+                .spawn(move || {
+                    loop {
+                        let job = {
+                            let Ok(rx) = jobs.lock() else {
+                                return;
+                            };
+                            let Ok(job) = rx.recv() else {
+                                return;
+                            };
+                            job
+                        };
+                        run_listing_job(job);
+                    }
+                }) {
+                Ok(_) => spawned += 1,
+                Err(error) => {
+                    tracing::error!(worker = index, "file listing worker 생성 실패: {error}")
+                }
+            }
         }
-        match read_children(&path, root.as_deref(), &ignore_cache) {
-            Ok(nodes) => send_listing_chunks(tx, &ctx, &epoch, token, path, nodes),
-            Err(e) => {
-                let _ = tx.send(ListingOutcome {
+        if spawned == 0 {
+            // jobs Arc가 이 초기화 끝에서 drop되면 tx는 Disconnected가 되고 UI가 오류를
+            // 표시한다. thread 자원 부족으로 앱 전체를 panic시키지 않는다.
+            tracing::error!("file listing worker를 하나도 만들지 못했습니다");
+        }
+        tx
+    })
+}
+
+fn run_listing_job(job: ListingJob) {
+    let ListingJob {
+        tx,
+        ctx,
+        shutdown,
+        epoch,
+        token,
+        root,
+        path,
+        ignore_cache,
+    } = job;
+    if epoch.is_stale() || shutdown.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    match read_children_guarded(
+        &path,
+        root.as_deref(),
+        &ignore_cache,
+        Some((&epoch, shutdown.as_ref())),
+    ) {
+        Ok(nodes) => {
+            send_listing_chunks_bounded(&tx, &ctx, &epoch, shutdown.as_ref(), token, path, nodes)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::Interrupted || epoch.is_stale() => {}
+        Err(error) => {
+            let _ = send_listing_outcome(
+                &tx,
+                ListingOutcome {
                     epoch: epoch.requested,
                     token,
                     path,
-                    result: ListingResult::Error(e.to_string()),
-                });
-                ctx.request_repaint();
-            }
+                    result: ListingResult::Error(error.to_string()),
+                },
+                &epoch,
+                shutdown.as_ref(),
+            );
+            ctx.request_repaint();
         }
-    });
+    }
 }
 
+fn send_listing_outcome(
+    tx: &SyncSender<ListingOutcome>,
+    mut outcome: ListingOutcome,
+    epoch: &ListingEpochGuard,
+    shutdown: &std::sync::atomic::AtomicBool,
+) -> bool {
+    loop {
+        if epoch.is_stale() || shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        match tx.try_send(outcome) {
+            Ok(()) => return true,
+            Err(TrySendError::Full(returned)) => {
+                outcome = returned;
+                std::thread::park_timeout(std::time::Duration::from_millis(2));
+            }
+            Err(TrySendError::Disconnected(_)) => return false,
+        }
+    }
+}
+
+#[cfg(test)]
 fn send_listing_chunks(
-    tx: Sender<ListingOutcome>,
+    tx: SyncSender<ListingOutcome>,
     ctx: &egui::Context,
     epoch: &ListingEpochGuard,
+    token: u64,
+    path: PathBuf,
+    nodes: Vec<TreeNode>,
+) {
+    let shutdown = std::sync::atomic::AtomicBool::new(false);
+    send_listing_chunks_bounded(&tx, ctx, epoch, &shutdown, token, path, nodes);
+}
+
+fn send_listing_chunks_bounded(
+    tx: &SyncSender<ListingOutcome>,
+    ctx: &egui::Context,
+    epoch: &ListingEpochGuard,
+    shutdown: &std::sync::atomic::AtomicBool,
     token: u64,
     path: PathBuf,
     nodes: Vec<TreeNode>,
@@ -2741,16 +3039,23 @@ fn send_listing_chunks(
         if epoch.is_stale() {
             return;
         }
-        let _ = tx.send(ListingOutcome {
-            epoch: epoch.requested,
-            token,
-            path,
-            result: ListingResult::Chunk {
-                nodes: Vec::new(),
-                done: true,
+        let sent = send_listing_outcome(
+            tx,
+            ListingOutcome {
+                epoch: epoch.requested,
+                token,
+                path,
+                result: ListingResult::Chunk {
+                    nodes: Vec::new(),
+                    done: true,
+                },
             },
-        });
-        ctx.request_repaint();
+            epoch,
+            shutdown,
+        );
+        if sent {
+            ctx.request_repaint();
+        }
         return;
     }
 
@@ -2772,27 +3077,49 @@ fn send_listing_chunks(
         if epoch.is_stale() {
             return;
         }
-        let sent = tx.send(ListingOutcome {
-            epoch: epoch.requested,
-            token,
-            path: path.clone(),
-            result: ListingResult::Chunk { nodes: chunk, done },
-        });
-        ctx.request_repaint();
-        if sent.is_err() {
+        let sent = send_listing_outcome(
+            tx,
+            ListingOutcome {
+                epoch: epoch.requested,
+                token,
+                path: path.clone(),
+                result: ListingResult::Chunk { nodes: chunk, done },
+            },
+            epoch,
+            shutdown,
+        );
+        if !sent {
             break;
         }
-        std::thread::yield_now();
+        ctx.request_repaint();
     }
 }
 
+#[cfg(test)]
 fn read_children(
     path: &Path,
     root: Option<&Path>,
     ignore_cache: &GitIgnoreCache,
 ) -> std::io::Result<Vec<TreeNode>> {
+    read_children_guarded(path, root, ignore_cache, None)
+}
+
+fn read_children_guarded(
+    path: &Path,
+    root: Option<&Path>,
+    ignore_cache: &GitIgnoreCache,
+    guard: Option<(&ListingEpochGuard, &std::sync::atomic::AtomicBool)>,
+) -> std::io::Result<Vec<TreeNode>> {
     let mut nodes = Vec::new();
     for entry in std::fs::read_dir(path)? {
+        if guard.is_some_and(|(epoch, shutdown)| {
+            epoch.is_stale() || shutdown.load(std::sync::atomic::Ordering::Acquire)
+        }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "listing cancelled",
+            ));
+        }
         let entry = entry?;
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         let entry_path = entry.path();
@@ -2934,10 +3261,10 @@ mod tests {
     use super::*;
 
     /// 안정성 감사 High #2: 워커가 stale epoch(루트 전환/refresh 후) 청크를
-    /// unbounded 채널에 밀어넣지 않는다 — 송신 전에 중단.
+    /// bounded 결과 채널에 stale 청크를 밀어넣지 않는다 — 송신 전에 중단.
     #[test]
     fn stale_epoch_청크는_송신전에_중단된다() {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = sync_channel(8);
         let ctx = egui::Context::default();
         let shared = Arc::new(std::sync::atomic::AtomicU64::new(7)); // 현재 epoch=7
         let mk_nodes = || -> Vec<TreeNode> {
@@ -2979,7 +3306,7 @@ mod tests {
     /// cancel 플래그가 서면 같은 epoch이어도 송신 전에 중단된다.
     #[test]
     fn cancel_플래그는_같은_epoch에서도_송신을_중단한다() {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = sync_channel(8);
         let ctx = egui::Context::default();
         let shared = Arc::new(std::sync::atomic::AtomicU64::new(1));
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true)); // 이미 취소됨

@@ -8,6 +8,7 @@ mod config;
 mod dotenv_sync;
 mod env;
 mod fonts;
+mod mcp_import;
 mod paths;
 mod perf;
 mod shortcuts;

@@ -14,6 +14,7 @@ use mcp::{LocalMcpManager, McpServerConfig, McpTool};
 use mcp_store::{McpServerRow, McpToolRow};
 use secret::RedactionService;
 
+use crate::mcp_import::{self, SkipReason};
 use crate::storage::{CredentialMeta, Db};
 
 /// 서버별 연결 상태 (완료 기준: 연결 상태 표시).
@@ -81,6 +82,38 @@ type InvokeResult = (u64, InvokeMsg);
 /// write_all이 서버 미독취 시에도 블록되지 않게 한다 (transport write hang 방지).
 const MAX_TOOL_INPUT: usize = 32 * 1024;
 
+/// 인기 stdio MCP 서버 프리셋 — 클릭하면 추가 폼에 채워진다 (직접 등록하지 않음:
+/// filesystem 허용 루트처럼 사용자가 고쳐야 하는 인자가 있어 폼 경유가 안전하다).
+struct McpPreset {
+    name: &'static str,
+    command: &'static str,
+    /// "{HOME}"은 클릭 시점에 홈 디렉토리 절대경로로 치환한다
+    args: &'static [&'static str],
+}
+
+const MCP_PRESETS: &[McpPreset] = &[
+    McpPreset {
+        name: "filesystem",
+        command: "npx",
+        args: &["-y", "@modelcontextprotocol/server-filesystem", "{HOME}"],
+    },
+    McpPreset {
+        name: "memory",
+        command: "npx",
+        args: &["-y", "@modelcontextprotocol/server-memory"],
+    },
+    McpPreset {
+        name: "fetch",
+        command: "uvx",
+        args: &["mcp-server-fetch"],
+    },
+    McpPreset {
+        name: "everything",
+        command: "npx",
+        args: &["-y", "@modelcontextprotocol/server-everything"],
+    },
+];
+
 pub struct StoredOAuthCredential {
     pub id: String,
     pub masked_hint: String,
@@ -111,6 +144,10 @@ pub struct ConnectorsUi {
     status: HashMap<String, ConnStatus>,
     result_tx: mpsc::Sender<DiscoverResult>,
     result_rx: mpsc::Receiver<DiscoverResult>,
+    // 가져오기 (JSON 붙여넣기 · 파일 · Claude Desktop 설정)
+    import_input: String,
+    /// 마지막 가져오기 결과 요약 (서버별 등록/건너뜀/실패 한 줄씩)
+    import_report: Vec<String>,
     // OAuth 폼 (PR-18)
     oauth_label: String,
     oauth_auth_url: String,
@@ -146,6 +183,8 @@ impl ConnectorsUi {
             status: HashMap::new(),
             result_tx,
             result_rx,
+            import_input: String::new(),
+            import_report: Vec::new(),
             oauth_label: String::new(),
             oauth_auth_url: String::new(),
             oauth_token_url: String::new(),
@@ -250,6 +289,19 @@ impl ConnectorsUi {
 
         ui.separator();
         ui.label(catalog.t("connectors.add_mcp_stdio", &[]));
+        // 인기 서버 프리셋 — 클릭하면 아래 폼에 채워진다 (경로 등 수정 후 추가)
+        ui.horizontal(|ui| {
+            ui.label(catalog.t("connectors.presets", &[]));
+            for preset in MCP_PRESETS {
+                if ui
+                    .small_button(preset.name)
+                    .on_hover_text(catalog.t("connectors.preset_hint", &[]))
+                    .clicked()
+                {
+                    self.apply_preset(preset);
+                }
+            }
+        });
         ui.horizontal(|ui| {
             ui.label(catalog.t("common.name", &[]));
             ui.text_edit_singleline(&mut self.name);
@@ -269,6 +321,52 @@ impl ConnectorsUi {
         }
         if let Some(error) = &self.error {
             ui.colored_label(egui::Color32::RED, error);
+        }
+
+        // 가져오기: README의 mcpServers JSON 붙여넣기 / .mcp.json 파일 / Claude Desktop 설정
+        ui.separator();
+        ui.label(catalog.t("connectors.import_title", &[]));
+        ui.add(
+            egui::TextEdit::multiline(&mut self.import_input)
+                .desired_rows(3)
+                .hint_text(r#"{"mcpServers": {"name": {"command": "npx", "args": ["..."]}}}"#),
+        );
+        ui.horizontal(|ui| {
+            if ui
+                .button(catalog.t("connectors.import_button", &[]))
+                .clicked()
+            {
+                let text = self.import_input.clone();
+                // 실패하면 입력을 남겨 고쳐서 재시도할 수 있게 한다
+                if self.run_import(&text, db, ctx, env_resolver, catalog) > 0 {
+                    self.import_input.clear();
+                }
+            }
+            if ui
+                .button(catalog.t("connectors.import_file", &[]))
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("JSON", &["json"])
+                    .pick_file()
+            {
+                self.import_from_path(&path, db, ctx, env_resolver, catalog);
+            }
+            if ui
+                .button(catalog.t("connectors.import_claude_desktop", &[]))
+                .clicked()
+            {
+                match claude_desktop_config_path() {
+                    Some(path) => self.import_from_path(&path, db, ctx, env_resolver, catalog),
+                    None => {
+                        self.import_report = vec![
+                            catalog.t("connectors.failed", &[("message", "config dir 확인 실패")]),
+                        ];
+                    }
+                }
+            }
+        });
+        for line in &self.import_report {
+            ui.weak(line);
         }
 
         // OAuth 커넥터 (PR-18): external browser + PKCE + localhost callback
@@ -919,6 +1017,158 @@ impl ConnectorsUi {
             Err(e) => self.error = Some(format!("추가 실패: {e:#}")),
         }
     }
+
+    /// 프리셋을 추가 폼에 채운다 — "{HOME}"은 홈 디렉토리 절대경로로 치환
+    /// (filesystem 허용 루트처럼 서버가 절대경로 인자를 요구하는 경우).
+    fn apply_preset(&mut self, preset: &McpPreset) {
+        self.name = preset.name.to_owned();
+        self.command = preset.command.to_owned();
+        let home = directories::BaseDirs::new()
+            .map(|dirs| dirs.home_dir().to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.args_input = preset
+            .args
+            .iter()
+            .map(|arg| arg.replace("{HOME}", &home))
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.error = None;
+    }
+
+    /// 파일에서 mcpServers JSON을 읽어 가져온다 (.mcp.json / claude_desktop_config.json).
+    fn import_from_path(
+        &mut self,
+        path: &std::path::Path,
+        db: &mut Db,
+        ctx: &egui::Context,
+        env_resolver: &dyn McpScopedEnvResolver,
+        catalog: &i18n::Catalog,
+    ) {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                self.run_import(&text, db, ctx, env_resolver, catalog);
+            }
+            Err(e) => {
+                self.import_report = vec![catalog.t(
+                    "connectors.failed",
+                    &[("message", &format!("{}: {e}", path.display()))],
+                )];
+            }
+        }
+    }
+
+    /// mcpServers JSON 텍스트를 파싱해 stdio 서버를 등록하고, 등록 즉시 연결
+    /// 테스트(discover)까지 시작한다. 서버별 결과는 import_report 한 줄씩.
+    /// 반환: 등록한 서버 수.
+    fn run_import(
+        &mut self,
+        text: &str,
+        db: &mut Db,
+        ctx: &egui::Context,
+        env_resolver: &dyn McpScopedEnvResolver,
+        catalog: &i18n::Catalog,
+    ) -> usize {
+        self.import_report.clear();
+        let parse = match mcp_import::parse_mcp_servers_json(text) {
+            Ok(parse) => parse,
+            Err(e) => {
+                self.import_report
+                    .push(catalog.t("connectors.failed", &[("message", &format!("{e:#}"))]));
+                return 0;
+            }
+        };
+        // 이름 중복은 건너뛴다 (mcp_servers에 unique 제약이 없어 여기서 막는다)
+        let mut existing: std::collections::HashSet<String> = match db.list_mcp_servers() {
+            Ok(rows) => rows.into_iter().map(|row| row.name).collect(),
+            Err(e) => {
+                self.import_report
+                    .push(catalog.t("connectors.failed", &[("message", &format!("{e:#}"))]));
+                return 0;
+            }
+        };
+        let mut added = 0;
+        for server in parse.servers {
+            let mcp_import::ParsedServer {
+                name,
+                command,
+                args,
+                env_plain,
+                skipped_env,
+            } = server;
+            if !existing.insert(name.clone()) {
+                self.import_report
+                    .push(catalog.t("connectors.import_exists", &[("name", &name)]));
+                continue;
+            }
+            let row = McpServerRow {
+                id: uuid::Uuid::new_v4().to_string(),
+                name,
+                kind: "stdio".to_owned(), // v0는 stdio만 (§1.5)
+                command: Some(command),
+                args,
+                env_plain,
+                env_secrets: Vec::new(),
+                inherit_env: true,
+                url: None,
+                enabled: true,
+            };
+            match db.insert_mcp_server(&row) {
+                Ok(()) => {
+                    added += 1;
+                    self.import_report.push(if skipped_env.is_empty() {
+                        catalog.t("connectors.import_added", &[("name", &row.name)])
+                    } else {
+                        catalog.t(
+                            "connectors.import_added_env_note",
+                            &[("name", &row.name), ("keys", &skipped_env.join(", "))],
+                        )
+                    });
+                    // 붙여넣기 → 등록 → 곧바로 연결 확인까지 (수동 테스트 클릭 생략)
+                    self.start_discover(ctx, &row, env_resolver);
+                }
+                Err(e) => {
+                    existing.remove(&row.name);
+                    self.import_report.push(catalog.t(
+                        "connectors.import_failed_row",
+                        &[("name", &row.name), ("message", &format!("{e:#}"))],
+                    ));
+                }
+            }
+        }
+        for skipped in parse.skipped {
+            let line = match &skipped.reason {
+                SkipReason::HttpTransport => {
+                    catalog.t("connectors.import_skip_http", &[("name", &skipped.name)])
+                }
+                SkipReason::MissingCommand => {
+                    catalog.t("connectors.import_skip_command", &[("name", &skipped.name)])
+                }
+                SkipReason::Invalid(message) => catalog.t(
+                    "connectors.import_skip_invalid",
+                    &[("name", &skipped.name), ("message", message)],
+                ),
+            };
+            self.import_report.push(line);
+        }
+        if self.import_report.is_empty() {
+            self.import_report
+                .push(catalog.t("connectors.import_none", &[]));
+        }
+        if added > 0 {
+            self.cached = None; // 목록 재조회
+        }
+        added
+    }
+}
+
+/// Claude Desktop 설정 경로 — macOS `~/Library/Application Support/Claude/…`,
+/// Windows `%APPDATA%\Claude\…`, Linux `~/.config/Claude/…` (config_dir 공통).
+fn claude_desktop_config_path() -> Option<std::path::PathBuf> {
+    directories::BaseDirs::new().map(|dirs| {
+        dirs.config_dir()
+            .join("Claude")
+            .join("claude_desktop_config.json")
+    })
 }
 
 fn mcp_config_for_values(

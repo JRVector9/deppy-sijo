@@ -98,6 +98,7 @@ fn smoke_db_migrations() -> anyhow::Result<()> {
     run_cargo(&["test", "-p", "storage", "v9에서_v10"])?;
     run_cargo(&["test", "-p", "storage", "v10에서_v11"])?;
     run_cargo(&["test", "-p", "storage", "v11에서_v12"])?;
+    run_cargo(&["test", "-p", "storage", "v20에서_v21"])?;
     println!("smoke-db-migrations OK");
     Ok(())
 }

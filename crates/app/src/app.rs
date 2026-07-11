@@ -1982,6 +1982,15 @@ impl App {
     /// cert 모드(자체 TLS + 비-loopback)는 후속 — config에 자리만 있다.
     fn start_web(&self) -> anyhow::Result<WebRemoteState> {
         let token = web_remote::pairing::get_or_create_token(&self.secret_store)?;
+        // 웹푸시(P4) VAPID 키 — keyring에서 get_or_create(SecretStore 접근이 app 소유). 개인키는
+        // keyring에만, 공개키만 서버가 JS에 노출한다. 실패하면 푸시만 비활성(대시보드는 유지).
+        let vapid = match web_remote::push::get_or_create_vapid_key(&self.secret_store) {
+            Ok(key) => Some(key),
+            Err(e) => {
+                tracing::warn!("웹푸시 VAPID 키 준비 실패 — 푸시 비활성: {e:#}");
+                None
+            }
+        };
         let addr =
             std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, self.config.web.port));
         let hostname = self.config.web.ts_hostname.trim();
@@ -1992,6 +2001,8 @@ impl App {
                 allowed_host: (!hostname.is_empty()).then(|| hostname.to_owned()),
                 // 승인 대시보드는 자체 Db 연결로 직행(프록시↔GUI 공유 DB IPC 관례, 계획 §0.2).
                 db_path: Some(self.db_path.clone()),
+                // 웹푸시 발송(P4)도 db_path로 자체 연결을 연다(구독 저장·승인 폴링).
+                vapid,
             },
         )?;
         // 활성 workspace worker 이벤트를 대시보드에 붙인다(P2). wake 클로저는 egui 프레임과

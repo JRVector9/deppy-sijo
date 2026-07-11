@@ -131,6 +131,24 @@ fn new_entry() -> SessionEntry {
     }
 }
 
+/// 런타임 이벤트 하나를 웹푸시 싱크로 넘긴다(P4). 세션 상태 전이만 대상 — 실제 발송 여부는
+/// push 계층이 상태(입력대기/완료)와 중복 억제로 결정한다. SessionRestored(재시작 복원)는
+/// "완료"가 아니므로 넘기지 않는다 — 앱 재시작 때마다 완료 알림이 쏟아지는 것을 막는다.
+fn forward_to_push(push: &crate::push::PushHandle, event: &RuntimeEvent) {
+    match event {
+        RuntimeEvent::SessionStatusChanged { session, status } => {
+            push.notify_session(session.0, *status)
+        }
+        RuntimeEvent::SessionStatusViewChanged { session, view } => {
+            push.notify_session(session.0, view.status)
+        }
+        RuntimeEvent::SessionExited { session, .. } => {
+            push.notify_session(session.0, SessionStatus::Done)
+        }
+        _ => {}
+    }
+}
+
 fn resource_view(snapshot: &ProcessResourceSnapshot) -> ResourceView {
     ResourceView {
         cpu: snapshot.cpu_percent,
@@ -162,6 +180,9 @@ struct Inner {
     sessions: BTreeMap<u64, SessionEntry>,
     resource: Option<ResourceView>,
     last_poll: Instant,
+    /// 웹푸시 발송 싱크(P4). 이벤트 drain 시 세션 상태 전이(입력대기/완료)를 넘긴다 —
+    /// 승인 발송은 push가 DB를 직접 폴링하므로 여기서 넘기지 않는다. None이면 푸시 비활성.
+    push_sink: Option<crate::push::PushHandle>,
 }
 
 /// 접속 스레드가 소켓으로 밀어낼 발행 스냅샷. 버전이 오르면 push 대상.
@@ -230,6 +251,7 @@ impl DashboardHandle {
                 sessions: BTreeMap::new(),
                 resource: None,
                 last_poll: Instant::now() - POLL_INTERVAL,
+                push_sink: None,
             }),
             published: Mutex::new(Published::default()),
             db: Mutex::new(db),
@@ -261,6 +283,13 @@ impl DashboardHandle {
     /// `subscribe_with_wake`에 넘길 안정적 wake 클로저(호출마다 같은 Arc 복제).
     pub fn wake_fn(&self) -> Arc<dyn Fn() + Send + Sync> {
         Arc::clone(&self.wake)
+    }
+
+    /// 웹푸시 발송 싱크를 붙인다(P4 — 서버 기동 시 1회, 접속 전). 이후 이벤트 drain에서
+    /// 세션 상태 전이(입력대기/완료)를 이 싱크로 넘긴다. 승인 발송은 push가 DB를 직접 폴링한다.
+    pub fn set_push_sink(&self, push: crate::push::PushHandle) {
+        let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
+        inner.push_sink = Some(push);
     }
 
     /// 활성 workspace worker 구독을 붙인다(시작 + 워크스페이스 전환마다). 옛 receiver는
@@ -435,10 +464,18 @@ fn run(shared: &Arc<Shared>) {
                 );
             }
             let Inner {
-                sessions, resource, ..
+                sessions,
+                resource,
+                push_sink,
+                ..
             } = &mut *inner;
             for event in &events {
                 apply_event(sessions, resource, event);
+                // 세션 상태 전이(입력대기/완료)를 웹푸시로 넘긴다 — 앱이 닫혀 있어도 알린다(P4).
+                // notify_session이 Done/Waiting 외 상태는 무시하므로 여기서는 걸러내지 않는다.
+                if let Some(push) = push_sink.as_ref() {
+                    forward_to_push(push, event);
+                }
             }
         }
 

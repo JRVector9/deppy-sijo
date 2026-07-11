@@ -275,6 +275,39 @@ mod tests {
     }
 
     #[test]
+    fn sw_js_shell_배열은_rust_shell의_부분집합이다() {
+        // 역방향 drift 가드(P3 리뷰): sw.js SHELL에만 있고 static_srv SHELL엔 없는 경로가 생기면
+        // 그 경로는 서빙되지 않아 cache.addAll이 통째로 실패(all-or-nothing) → 조용한 SW install
+        // 실패. sw.js의 `const SHELL = [...]` 배열을 파싱해 모든 경로가 Rust SHELL에 있는지 본다.
+        let start = SW_JS_TEMPLATE
+            .find("const SHELL = [")
+            .expect("sw.js에 SHELL 배열 없음");
+        let rest = &SW_JS_TEMPLATE[start..];
+        let end = rest.find("];").expect("sw.js SHELL 배열 끝(];) 없음");
+        let array = &rest[..end];
+        let rust_paths: Vec<&str> = SHELL.iter().map(|&(path, _)| path).collect();
+        let mut seen = 0;
+        for line in array.lines() {
+            let Some(path) = line
+                .trim()
+                .strip_prefix('\'')
+                .and_then(|s| s.split('\'').next())
+            else {
+                continue;
+            };
+            if !path.starts_with('/') {
+                continue;
+            }
+            assert!(
+                rust_paths.contains(&path),
+                "sw.js SHELL의 '{path}'가 static_srv SHELL에 없음(서빙 안 됨 → cache.addAll 실패)"
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, SHELL.len(), "양방향 SHELL 개수 불일치");
+    }
+
+    #[test]
     fn manifest는_유효_json이고_아이콘이_서빙된다() {
         let resp = respond("/manifest.webmanifest", "", TOKEN);
         let json: serde_json::Value =

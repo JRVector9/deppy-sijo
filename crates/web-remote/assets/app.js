@@ -61,6 +61,12 @@
 
   const token = localStorage.getItem(TOKEN_KEY);
 
+  // 권한이 이미 허용돼 있으면(재방문) 구독을 보장한다 — 브라우저가 구독을 회전/삭제했거나
+  // 서버 재시작으로 구독이 비었을 수 있다. 서버 등록은 endpoint upsert라 반복해도 안전하다.
+  if (token && 'Notification' in window && Notification.permission === 'granted') {
+    enablePush(token);
+  }
+
   const STATUS_LABEL = {
     running: '실행 중',
     waiting: '입력 대기',
@@ -273,7 +279,10 @@
   function maybeShowIosInstallHint() {
     const el = document.getElementById('ios-install');
     if (!el) return;
-    const isIos = /iphone|ipad|ipod/i.test(navigator.userAgent);
+    // iPadOS 13+는 기본 "데스크톱 사이트 요청"으로 UA가 macOS로 위장한다 — UA만 보면 대다수
+    // iPad를 놓친다. MacIntel + 멀티터치를 보조 판별로 더해 iPad를 잡는다(P3 리뷰).
+    const isIos = /iphone|ipad|ipod/i.test(navigator.userAgent)
+      || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
     const standalone = window.matchMedia('(display-mode: standalone)').matches
       || window.navigator.standalone === true;
     if (!isIos || standalone || localStorage.getItem(IOS_HINT_KEY)) return;
@@ -287,9 +296,9 @@
     }
   }
 
-  // P3: 알림 권한 유도 — 앱 아이콘 뱃지(iOS 설치형)·푸시(P4)는 알림 권한 승인 후에만 동작한다.
-  // 권한이 아직 미결정(default)일 때만 버튼을 노출한다. 지금은 Notification.requestPermission만
-  // 호출하지만, P4에서 웹푸시 구독(pushManager.subscribe)과 같은 클릭 제스처로 통합될 자리다.
+  // P4: 알림 권한 유도 + 웹푸시 구독 — 앱 아이콘 뱃지(iOS 설치형)·푸시는 알림 권한 승인 후에만
+  // 동작한다. 권한이 아직 미결정(default)일 때만 버튼을 노출한다. 같은 클릭 제스처 안에서
+  // 권한 요청 → 허용 시 pushManager.subscribe → 서버 등록(POST)까지 이어간다.
   function maybeShowNotifyButton() {
     const btn = document.getElementById('notify-enable');
     if (!btn) return;
@@ -297,20 +306,66 @@
     btn.hidden = false;
     btn.addEventListener('click', () => {
       // iOS/WebKit은 사용자 제스처(클릭 핸들러) 안에서만 권한 요청을 허용한다.
-      let result;
-      try {
-        result = Notification.requestPermission();
-      } catch {
+      requestNotificationPermission().then((permission) => {
         btn.hidden = true;
-        return;
-      }
-      // 구형 Safari는 콜백형(반환 undefined), iOS 16.4+는 Promise형 — 둘 다 처리한다.
-      if (result && typeof result.finally === 'function') {
-        result.finally(() => { btn.hidden = true; });
-      } else {
-        btn.hidden = true;
-      }
+        if (permission === 'granted') enablePush(localStorage.getItem(TOKEN_KEY));
+      });
     });
+  }
+
+  // 권한 요청을 Promise로 정규화한다 — iOS 16.4+는 Promise형, 구형 Safari는 콜백형.
+  function requestNotificationPermission() {
+    try {
+      const result = Notification.requestPermission();
+      if (result && typeof result.then === 'function') return result;
+      return new Promise((resolve) => {
+        Notification.requestPermission((perm) => resolve(perm));
+      });
+    } catch {
+      return Promise.resolve('denied');
+    }
+  }
+
+  // P4: 웹푸시 구독을 보장하고 서버에 등록한다. 권한이 이미 'granted'일 때 호출한다.
+  // iOS 제약: 웹푸시는 **홈 화면 설치형(standalone) + 사용자 제스처 + iOS 16.4+** 에서만
+  // 동작한다. 데스크톱 알림(notify-rust)과는 중복 억제하지 않는다(다른 기기).
+  async function enablePush(token) {
+    if (!token) return;
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      let sub = await reg.pushManager.getSubscription();
+      if (!sub) {
+        // VAPID 공개키를 서버에서 받아 구독한다(applicationServerKey).
+        const res = await fetch('/push/vapid?token=' + encodeURIComponent(token));
+        if (!res.ok) return; // 푸시 비활성(키 없음) — 조용히 종료
+        const body = await res.json();
+        if (!body || !body.key) return;
+        sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(body.key),
+        });
+      }
+      const json = sub.toJSON(); // { endpoint, keys: { p256dh, auth } }
+      if (!json || !json.endpoint || !json.keys) return;
+      await fetch('/push/subscribe?token=' + encodeURIComponent(token), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ endpoint: json.endpoint, keys: json.keys }),
+      });
+    } catch {
+      // 구독 실패(권한/브라우저 제약)는 무시 — 다음 방문에 재시도한다.
+    }
+  }
+
+  // base64url VAPID 공개키를 pushManager가 요구하는 Uint8Array로 변환한다.
+  function urlBase64ToUint8Array(base64Url) {
+    const padding = '='.repeat((4 - (base64Url.length % 4)) % 4);
+    const base64 = (base64Url + padding).replace(/-/g, '+').replace(/_/g, '/');
+    const raw = atob(base64);
+    const out = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    return out;
   }
 
   // 탭 백그라운드 시 스트림 정지(서버 접속 종료 → 0연결 예산 준수). 포그라운드 복귀 시 재연결.

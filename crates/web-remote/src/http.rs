@@ -9,6 +9,9 @@ use std::io::{BufRead, Write};
 pub const MAX_HEAD_BYTES: usize = 8 * 1024;
 /// 헤더 개수 상한.
 pub const MAX_HEADERS: usize = 64;
+/// POST 본문 상한 — 웹푸시 구독 JSON(P4)만 받는 유일한 본문이라 작게 유계로 둔다.
+/// (endpoint URL + p256dh/auth base64url ≈ 수백 바이트.) 초과는 413.
+pub const MAX_BODY_BYTES: usize = 4 * 1024;
 
 /// 파싱된 요청 head. `query`에는 페어링 토큰이 실릴 수 있다 — **로그 금지**.
 #[derive(Debug)]
@@ -29,6 +32,23 @@ impl RequestHead {
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, v)| v.as_str())
+    }
+
+    /// Content-Length 헤더를 파싱한다(POST 본문 길이). 없거나 기형이면 None.
+    pub fn content_length(&self) -> Option<usize> {
+        self.header("content-length")
+            .and_then(|v| v.trim().parse::<usize>().ok())
+    }
+}
+
+/// POST 본문을 정확히 `len` 바이트 읽는다. head를 읽은 뒤 같은 reader에서 이어 읽으므로
+/// BufReader에 선입된 본문 바이트도 포함된다. EOF/타임아웃/절단은 Err.
+pub fn read_body<R: BufRead>(reader: &mut R, len: usize) -> Result<Vec<u8>, HeadError> {
+    let mut buf = vec![0u8; len];
+    match reader.read_exact(&mut buf) {
+        Ok(()) => Ok(buf),
+        // 절단/타임아웃/EOF — 응답 없이 종료 취급(상위가 400으로 응답).
+        Err(_) => Err(HeadError::Closed),
     }
 }
 

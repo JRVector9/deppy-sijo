@@ -14,12 +14,12 @@
 //! 바인딩: serve 모드(기본) = 127.0.0.1 평문 + `tailscale serve`가 HTTPS 종단.
 //! 비-loopback 평문 bind는 거부(remote-tls-delta §2.5) — cert 모드(자체 TLS)는 후속.
 
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 
@@ -32,7 +32,8 @@ pub mod ws_api;
 /// OS backlog에서 대기시킨다 — 브라우저의 병렬 자산 요청(보통 ≤6)이 깨지지 않는다.
 pub const MAX_CONNECTIONS: usize = 3;
 
-/// 요청 head 수신 타임아웃 — 침묵 peer(slowloris)가 접속 슬롯을 오래 점유하지 못하게.
+/// 요청 head 총 수신 데드라인 겸 read/write syscall 타임아웃 — 침묵·트리클
+/// peer(slowloris)의 접속 슬롯 점유에 wall-clock 상한을 둔다.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 서버 기동 옵션.
@@ -187,6 +188,8 @@ fn spawn_accept(
                     let _ = stream.shutdown(Shutdown::Both);
                     break;
                 }
+                // 주의: conns 락은 spawn부터 아래 push까지 계속 쥐어야 한다 — 중간에 놓으면
+                // 자식의 self-removal(retain)이 push보다 먼저 실행돼 슬롯이 영구 누수된다.
                 let handle = match std::thread::Builder::new()
                     .name("web-remote-conn".into())
                     .spawn(move || {
@@ -216,27 +219,57 @@ fn spawn_accept(
         .context("web-remote accept 스레드 생성 실패")
 }
 
+/// head 읽기 전체에 wall-clock 데드라인을 강제하는 read 래퍼.
+///
+/// `set_read_timeout`은 **read syscall 단위** 타임아웃이라, 타임아웃 직전마다 1바이트씩
+/// 흘리는(trickle) 피어는 매 read를 성공시키며 head 읽기를 무한정 끌 수 있다 — 그러면
+/// 트리클 접속 [`MAX_CONNECTIONS`]개만으로 서버가 완전히 막힌다. 매 read 전에 총
+/// 소요시간을 검사해 데드라인을 넘겼으면 TimedOut으로 끊는다(read_head_line이 Closed로
+/// 분류). 마지막 read 자체는 syscall 타임아웃이 끊으므로 총 점유는 데드라인+타임아웃 이내.
+struct DeadlineReader<R> {
+    inner: R,
+    deadline: Instant,
+}
+
+impl<R: Read> Read for DeadlineReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if Instant::now() >= self.deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "요청 head 데드라인 초과",
+            ));
+        }
+        self.inner.read(buf)
+    }
+}
+
 /// 접속 하나 = 요청 하나 (Connection: close). head 파싱 → Host 검증 → 라우팅.
 fn handle_connection(stream: TcpStream, ctx: &ConnCtx) {
     let peer = stream
         .peer_addr()
         .map(|addr| addr.to_string())
         .unwrap_or_else(|_| "?".to_owned());
-    // BSD/macOS에서 accept된 소켓의 blocking 상태를 명시 복원 + head 수신 타임아웃
-    // (auth callback.rs 관례 — slowloris 슬롯 점유 방지 겸용).
+    // BSD/macOS에서 accept된 소켓의 blocking 상태를 명시 복원 + read/write syscall 타임아웃
+    // (auth callback.rs 관례). read 타임아웃은 syscall 단위라 트리클 피어에는 뚫린다 —
+    // head 전체 wall-clock 상한은 DeadlineReader가 강제한다. write 타임아웃은 응답을
+    // 읽지 않는 피어에 write_all이 무기한 블록하지 않게 한다 (read/write 방어 대칭).
     if stream.set_nonblocking(false).is_err()
         || stream.set_read_timeout(Some(READ_TIMEOUT)).is_err()
+        || stream.set_write_timeout(Some(READ_TIMEOUT)).is_err()
     {
         return;
     }
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(DeadlineReader {
+        inner: stream,
+        deadline: Instant::now() + READ_TIMEOUT,
+    });
     let head = match http::read_request_head(&mut reader) {
         Ok(head) => head,
-        Err(http::HeadError::Closed) => return, // 침묵/절단 peer — 응답 없이 종료
+        Err(http::HeadError::Closed) => return, // 침묵/트리클/절단 peer — 응답 없이 종료
         Err(http::HeadError::TooLarge) => {
             tracing::warn!(peer, "web-remote: 요청 head 상한 초과 — 431");
             respond(
-                reader.into_inner(),
+                reader.into_inner().inner,
                 &http::Response::plain(431, "request head too large"),
                 &peer,
                 "?",
@@ -245,7 +278,7 @@ fn handle_connection(stream: TcpStream, ctx: &ConnCtx) {
         }
         Err(http::HeadError::Malformed) => {
             respond(
-                reader.into_inner(),
+                reader.into_inner().inner,
                 &http::Response::plain(400, "bad request"),
                 &peer,
                 "?",
@@ -253,7 +286,7 @@ fn handle_connection(stream: TcpStream, ctx: &ConnCtx) {
             return;
         }
     };
-    let stream = reader.into_inner();
+    let stream = reader.into_inner().inner;
 
     // Host 검증 — DNS rebinding 차단 (remote-tls-delta §1.5 Origin 지침의 HTTP 적용).
     if !host_allowed(head.header("host"), ctx.allowed_host.as_deref()) {
@@ -505,6 +538,36 @@ mod tests {
         let server = start(None);
         let response = request(server.local_addr(), "NOT-HTTP\r\n\r\n");
         assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    }
+
+    /// 매 read가 (syscall 타임아웃 전에) 1바이트씩 성공하는 트리클 피어 시뮬레이션 —
+    /// 개행 없이 무한 공급해 read_line이 스스로 끝나지 않게 한다.
+    struct TrickleReader;
+
+    impl Read for TrickleReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(Duration::from_millis(2));
+            buf[0] = b'a';
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn 트리클_피어는_head_총_데드라인에서_컷된다() {
+        let deadline = Duration::from_millis(50);
+        let start = Instant::now();
+        let mut reader = BufReader::new(DeadlineReader {
+            inner: TrickleReader,
+            deadline: start + deadline,
+        });
+        let err = http::read_request_head(&mut reader).unwrap_err();
+        let elapsed = start.elapsed();
+        // 타임아웃은 응답 없는 종료(Closed)로 분류된다
+        assert_eq!(err, http::HeadError::Closed);
+        // syscall 단위 read는 계속 성공하지만 총 소요시간 데드라인이 끊는다 —
+        // head 예산(8KB × 2ms ≈ 16초) 소진보다 훨씬 먼저.
+        assert!(elapsed >= deadline, "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
     }
 
     #[test]

@@ -3,14 +3,43 @@
 //!
 //! flow를 begin/complete로 쪼개 두었다 — 브라우저·네트워크 없이도
 //! PKCE/state 규칙을 테스트할 수 있고, UI는 [`run_flow`] 하나만 부른다.
+//!
+//! PR-H4: 401에서 토큰 획득까지의 네트워크 프리미티브 추가 —
+//! WWW-Authenticate 파서([`parse_www_authenticate`]), RFC 9728/8414 발견
+//! ([`discover_protected_resource`]/[`discover_authorization_server`]),
+//! RFC 7591 DCR([`register_client`]), refresh([`refresh_access_token`]).
+//! 401 사다리 조립과 UI 배선은 H5 몫.
 
 mod browser;
 mod callback;
+mod discovery;
 mod flow;
+mod refresh;
+mod registration;
+#[cfg(test)]
+mod test_support;
+mod www_authenticate;
 
 pub use browser::open_in_browser;
-pub use callback::{CallbackParams, LocalhostCallbackServer};
-pub use flow::{OAuthProviderConfig, OAuthToken, PendingAuthorization, begin, complete, run_flow};
+pub use callback::{
+    CallbackParams, FIXED_CALLBACK_PORT, LocalhostCallbackServer, registration_redirect_uris,
+};
+pub use discovery::{
+    AuthorizationServerMetadata, DiscoveryHeaders, ProtectedResourceMetadata,
+    discover_authorization_server, discover_protected_resource,
+};
+pub use flow::{
+    OAuthProviderConfig, OAuthToken, PendingAuthorization, begin, begin_with_resource, complete,
+    run_flow, run_flow_with_resource,
+};
+pub use refresh::{
+    REFRESH_MARGIN, RefreshCoordinator, RefreshOutcome, RefreshParams, refresh_access_token,
+    should_refresh, should_refresh_at,
+};
+pub use registration::{
+    DynamicRegistration, RegistrationError, RegistrationOptions, register_client,
+};
+pub use www_authenticate::{AuthChallenge, find_bearer_challenge, parse_www_authenticate};
 
 use secret::SecretStore;
 
@@ -18,10 +47,17 @@ use secret::SecretStore;
 /// 이 crate가 만드는 콜백 URI는 항상 127.0.0.1 loopback이지만, provider 설정에
 /// 커스텀 URI가 들어오는 경로를 대비해 공개 검증 함수로 둔다.
 pub fn validate_redirect_uri(uri: &str) -> anyhow::Result<()> {
-    let parsed = oauth2::url::Url::parse(uri)
-        .map_err(|e| anyhow::anyhow!("redirect URI 파싱 실패: {uri} ({e})"))?;
+    validate_https_or_loopback(uri).map(|_| ())
+}
+
+/// URL이 https이거나 http+loopback인지 검증한다 — redirect URI·발견 요청·
+/// token endpoint 공용 규칙 (PR-H4에서 추출). 평문 HTTP로 code/token/메타데이터를
+/// 주고받지 않으며, localhost는 콜백·로컬 테스트 예외다.
+pub fn validate_https_or_loopback(url: &str) -> anyhow::Result<oauth2::url::Url> {
+    let parsed =
+        oauth2::url::Url::parse(url).map_err(|e| anyhow::anyhow!("URL 파싱 실패: {url} ({e})"))?;
     match parsed.scheme() {
-        "https" => Ok(()),
+        "https" => Ok(parsed),
         "http" => {
             use oauth2::url::Host;
             let is_loopback = match parsed.host() {
@@ -31,18 +67,25 @@ pub fn validate_redirect_uri(uri: &str) -> anyhow::Result<()> {
                 None => false,
             };
             if is_loopback {
-                Ok(())
+                Ok(parsed)
             } else {
-                anyhow::bail!("http redirect URI는 localhost만 허용: {uri}")
+                anyhow::bail!("http URL은 localhost만 허용: {url}")
             }
         }
-        other => anyhow::bail!("redirect URI scheme 불허: {other} ({uri})"),
+        other => anyhow::bail!("URL scheme 불허: {other} ({url})"),
     }
 }
 
 /// refresh token이 저장되는 keyring entry id (access와 분리).
 pub fn refresh_entry_id(credential_id: &str) -> String {
     format!("{credential_id}.refresh")
+}
+
+/// DCR client_secret이 저장되는 keyring entry id (PR-H4).
+/// [`register_client`]가 client_secret을 돌려주면 호출측이 이 entry에 저장한다 —
+/// client_id(비밀 아님)는 credentials 메타데이터(SQLite)에.
+pub fn dcr_secret_entry_id(credential_id: &str) -> String {
+    format!("{credential_id}.dcr")
 }
 
 /// 획득한 토큰을 keyring에 저장한다 (완료 기준: token keyring 저장).
@@ -83,6 +126,12 @@ mod tests {
         assert!(validate_redirect_uri("http://evil.com/cb").is_err());
         assert!(validate_redirect_uri("ftp://127.0.0.1/cb").is_err());
         assert!(validate_redirect_uri("not a url").is_err());
+    }
+
+    #[test]
+    fn keyring_entry_id_규약() {
+        assert_eq!(refresh_entry_id("cred-1"), "cred-1.refresh");
+        assert_eq!(dcr_secret_entry_id("cred-1"), "cred-1.dcr");
     }
 
     #[test]

@@ -15,15 +15,33 @@ pub struct CallbackParams {
     pub state: String,
 }
 
+/// DCR redirect_uris에 등록하는 고정 loopback 포트 (PR-H4).
+/// redirect URI 정확 일치를 요구하는 비스펙 AS 대비 — [`LocalhostCallbackServer::bind`]가
+/// 이 포트를 먼저 시도한다. 임의 선정 deppy 고유 포트로, 점유 중이면 임의 포트로 내려간다.
+pub const FIXED_CALLBACK_PORT: u16 = 47456;
+
+/// RFC 7591 등록에 병기할 redirect URI 형태: 고정 포트 + 포트 생략
+/// (RFC 8252 §7.3 — loopback redirect는 포트 무시 매칭이 원칙이라 임의 포트를 허용).
+pub fn registration_redirect_uris() -> [String; 2] {
+    [
+        format!("http://127.0.0.1:{FIXED_CALLBACK_PORT}/callback"),
+        "http://127.0.0.1/callback".to_owned(),
+    ]
+}
+
 pub struct LocalhostCallbackServer {
     listener: TcpListener,
     redirect_uri: String,
 }
 
 impl LocalhostCallbackServer {
-    /// loopback 임의 포트에 bind한다. redirect URI는 `http://127.0.0.1:{port}/callback`.
+    /// loopback에 bind한다. redirect URI는 `http://127.0.0.1:{port}/callback`.
+    /// [`FIXED_CALLBACK_PORT`]를 먼저 시도하고(DCR redirect_uris와 정확 일치),
+    /// 점유 중이면 임의 포트로 폴백한다.
     pub fn bind() -> anyhow::Result<Self> {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).context("callback 서버 bind 실패")?;
+        let listener = TcpListener::bind(("127.0.0.1", FIXED_CALLBACK_PORT))
+            .or_else(|_| TcpListener::bind(("127.0.0.1", 0)))
+            .context("callback 서버 bind 실패")?;
         let port = listener.local_addr()?.port();
         Ok(Self {
             listener,
@@ -228,5 +246,35 @@ mod tests {
         let server = LocalhostCallbackServer::bind().unwrap();
         let result = server.wait_for_callback(Duration::from_millis(120), "s");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn 고정_포트_점유_시_임의_포트로_폴백() {
+        // 고정 포트를 확보할 때까지 재시도 — 병렬 테스트의 bind()와 무관하게
+        // 폴백 경로를 결정적으로 강제한다
+        let _occupier = loop {
+            match TcpListener::bind(("127.0.0.1", FIXED_CALLBACK_PORT)) {
+                Ok(listener) => break listener,
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        };
+        let server = LocalhostCallbackServer::bind().unwrap();
+        let port: u16 = server
+            .redirect_uri()
+            .trim_start_matches("http://127.0.0.1:")
+            .trim_end_matches("/callback")
+            .parse()
+            .unwrap();
+        assert_ne!(port, FIXED_CALLBACK_PORT);
+    }
+
+    #[test]
+    fn 등록용_redirect_uri는_고정_포트와_포트_생략_병기() {
+        let uris = registration_redirect_uris();
+        assert_eq!(
+            uris[0],
+            format!("http://127.0.0.1:{FIXED_CALLBACK_PORT}/callback")
+        );
+        assert_eq!(uris[1], "http://127.0.0.1/callback");
     }
 }

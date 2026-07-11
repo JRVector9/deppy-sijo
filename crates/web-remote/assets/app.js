@@ -172,7 +172,7 @@
       case 'dashboard':
         // 오프라인 폴백 화면이 "마지막 상태 시각"을 보여줄 수 있게 수신 시각을 저장한다.
         localStorage.setItem(LAST_DASHBOARD_KEY, String(Date.now()));
-        renderSessions(msg.sessions || [], msg.resource || null);
+        renderWorkspaces(msg.workspaces || [], msg.resource || null);
         break;
       case 'approvals':
         renderApprovals(msg.pending || []);
@@ -555,7 +555,8 @@
     });
   }
 
-  let lastSessions = [];
+  let lastSessions = [];   // 시청 가능한 세션(활성 워크스페이스)
+  let lastWorkspaces = [];
 
   /// 딥링크 대상이 현재 세션 목록에 있으면 시청을 시작한다(1회성).
   function consumePendingWatch(sessions) {
@@ -568,38 +569,49 @@
     return true;
   }
 
-  function renderSessions(sessions, resource) {
-    lastSessions = sessions;
-    sessionsEmpty.hidden = sessions.length > 0;
+  const WORKSPACE_STATE_LABEL = { active: '활성', warm: '대기(백그라운드)', idle: '유휴' };
+
+  // 워크스페이스별 세션 목록. 활성 워크스페이스의 세션만 id가 있어 시청/입력이 가능하고,
+  // warm/유휴는 표시 전용이다(세션 id가 worker-로컬이라 다른 워크스페이스 id로 시청하면
+  // 엉뚱한 세션이 잡힌다 — 서버가 id 자체를 안 보낸다). 이름은 데스크톱 활동 패널과 같은
+  // 프로젝트명 규칙으로 서버가 해석해 보낸다.
+  function renderWorkspaces(workspaces, resource) {
+    lastWorkspaces = workspaces;
+    lastSessions = workspaces.flatMap((ws) => ws.sessions || []).filter((s) => s.id != null);
+    sessionsEmpty.hidden = workspaces.some((ws) => (ws.sessions || []).length > 0);
     sessionsEl.textContent = '';
-    for (const s of sessions) {
-      const li = document.createElement('li');
-      li.className = 'session';
 
-      const title = document.createElement('span');
-      title.className = 'title';
-      title.textContent = s.title || ('세션 ' + s.id);
-      li.appendChild(title);
+    for (const ws of workspaces) {
+      const group = document.createElement('li');
+      group.className = 'ws-group';
 
-      const badge = document.createElement('span');
-      const status = s.exited ? 'done' : (s.status || 'running');
-      badge.className = 'badge ' + status;
-      badge.textContent = STATUS_LABEL[status] || status;
-      li.appendChild(badge);
+      const head = document.createElement('div');
+      head.className = 'ws-head';
+      const name = document.createElement('span');
+      name.className = 'ws-name';
+      name.textContent = ws.name || ws.id;
+      head.appendChild(name);
+      const state = document.createElement('span');
+      state.className = 'ws-state ' + (ws.state || 'idle');
+      state.textContent = WORKSPACE_STATE_LABEL[ws.state] || ws.state || '';
+      head.appendChild(state);
+      group.appendChild(head);
 
-      // 터미널 뷰어(P5d) — 현재 화면 읽기 전용 열람. 제목은 textContent로만 다룬다.
-      const viewBtn = document.createElement('button');
-      viewBtn.type = 'button';
-      viewBtn.className = 'view-btn';
-      viewBtn.textContent = s.id === viewer.watching ? '보는 중' : '보기';
-      viewBtn.disabled = s.id === viewer.watching;
-      viewBtn.addEventListener('click', () => {
-        openViewer(s.id, s.title || ('세션 ' + s.id));
-        renderSessions(sessions, resource); // "보는 중" 배지 갱신
-      });
-      li.appendChild(viewBtn);
-      sessionsEl.appendChild(li);
+      const list = document.createElement('ul');
+      list.className = 'ws-sessions';
+      for (const s of ws.sessions || []) {
+        list.appendChild(sessionRow(s, ws));
+      }
+      if (!(ws.sessions || []).length) {
+        const empty = document.createElement('p');
+        empty.className = 'empty';
+        empty.textContent = '세션 없음';
+        group.appendChild(empty);
+      }
+      group.appendChild(list);
+      sessionsEl.appendChild(group);
     }
+
     if (resource) {
       const cpu = resource.cpu != null ? resource.cpu.toFixed(0) + '%' : '—';
       resourceEl.textContent = 'CPU ' + cpu + ' · RAM ' + (resource.rss_mb || 0) + 'MB';
@@ -607,7 +619,46 @@
       resourceEl.textContent = '';
     }
     // 알림 딥링크 대기분이 있으면 목록 도착 시점에 소비한다 (P6c).
-    consumePendingWatch(sessions);
+    consumePendingWatch(lastSessions);
+  }
+
+  function sessionRow(s, ws) {
+    const li = document.createElement('li');
+    li.className = 'session';
+
+    const title = document.createElement('span');
+    title.className = 'title';
+    title.textContent = s.title || (s.id != null ? '세션 ' + s.id : '세션');
+    li.appendChild(title);
+
+    // 상태는 활성 워크스페이스만 감지된다(warm/유휴는 감지 워커가 안 돈다).
+    if (s.exited || s.status) {
+      const badge = document.createElement('span');
+      const status = s.exited ? 'done' : s.status;
+      badge.className = 'badge ' + status;
+      badge.textContent = STATUS_LABEL[status] || status;
+      li.appendChild(badge);
+    }
+
+    if (s.id != null) {
+      const viewBtn = document.createElement('button');
+      viewBtn.type = 'button';
+      viewBtn.className = 'view-btn';
+      viewBtn.textContent = s.id === viewer.watching ? '보는 중' : '보기';
+      viewBtn.disabled = s.id === viewer.watching;
+      viewBtn.addEventListener('click', () => {
+        openViewer(s.id, s.title || ('세션 ' + s.id));
+        renderWorkspaces(lastWorkspaces, null); // "보는 중" 배지 갱신
+      });
+      li.appendChild(viewBtn);
+    } else {
+      // 표시 전용 — 이 워크스페이스로 전환해야 볼 수 있다.
+      const note = document.createElement('span');
+      note.className = 'view-note';
+      note.textContent = ws.state === 'warm' ? '백그라운드' : '유휴';
+      li.appendChild(note);
+    }
+    return li;
   }
 
   // P3: iOS 설치 안내 — iOS Safari이고 아직 설치(standalone) 전일 때만 노출. 닫으면 억제한다.

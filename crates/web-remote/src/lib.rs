@@ -192,8 +192,8 @@ impl WebRemoteServer {
 
     /// 현재 활성 workspace의 세션 상태를 대시보드에 시드한다(구독 등록 직후 호출 — 재구독 시
     /// edge-trigger 상태 유실 보정). app이 GUI 배지용으로 이미 추적 중인 상태를 넘긴다.
-    pub fn seed_sessions(&self, seeds: Vec<dashboard::SessionSeed>) {
-        self.dashboard.seed_sessions(seeds);
+    pub fn set_workspaces(&self, seeds: Vec<dashboard::WorkspaceSeed>) {
+        self.dashboard.set_workspaces(seeds);
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -1536,30 +1536,91 @@ mod tests {
         false
     }
 
+    /// 앱이 push한 워크스페이스 스냅샷 하나(활성) — 테스트 헬퍼.
+    fn active_seed(sessions: Vec<dashboard::SessionSeed>) -> Vec<dashboard::WorkspaceSeed> {
+        vec![dashboard::WorkspaceSeed {
+            id: "ws-1".to_owned(),
+            name: "프로젝트".to_owned(),
+            state: dashboard::WorkspaceState::Active,
+            sessions,
+        }]
+    }
+
     // ── P2-1: 대시보드 상태 시드 ───────────────────────────────────────────
     #[test]
-    fn ws_시드_상태가_프레임에_반영되고_mux는_시드를_덮지_않는다() {
+    fn ws_시드_상태가_프레임에_반영되고_mux는_제목을_덮지_않는다() {
         let server = start(None);
         let addr = server.local_addr();
         // 접속(재구독) 전에 needs_approval로 시드 — 이벤트 이력 없는 새 구독자가 즉시 반영해야 한다
-        server.seed_sessions(vec![dashboard::SessionSeed {
-            id: 7,
+        server.set_workspaces(active_seed(vec![dashboard::SessionSeed {
+            id: Some(7),
             title: "claude".to_owned(),
-            status: runtime::SessionStatus::NeedsApproval,
+            status: Some(runtime::SessionStatus::NeedsApproval),
             exited: false,
-        }]);
+        }]));
         let mut ws = ws_client_authed(addr);
         let frame = wait_dashboard_frame(&mut ws, r#""id":7"#).expect("시드 프레임 없음");
         assert!(frame.contains(r#""status":"needs_approval""#), "{frame}");
+        assert!(frame.contains(r#""title":"claude""#), "{frame}");
+        assert!(frame.contains(r#""state":"active""#), "{frame}");
 
-        // 제목만 바꾸는 MuxUpdated가 와도 시드된 needs_approval을 Running으로 덮지 않는다
-        server.dashboard.inject_event(mux_event(&[(7, "claude-2")]));
+        // MuxUpdated는 소속(멤버십)만 근거다 — raw pane 제목("workspace.spawn.shell 140")으로
+        // 앱이 해석한 표시명을 덮지 않고, 시드된 상태도 Running으로 리셋하지 않는다.
+        server
+            .dashboard
+            .inject_event(mux_event(&[(7, "workspace.spawn.shell 140")]));
+        std::thread::sleep(Duration::from_millis(400));
+        let frame = wait_dashboard_frame(&mut ws, r#""id":7"#).unwrap_or_default();
+        if !frame.is_empty() {
+            assert!(
+                !frame.contains("workspace.spawn.shell"),
+                "mux raw 제목이 표시명을 덮었다: {frame}"
+            );
+            assert!(
+                frame.contains(r#""status":"needs_approval""#),
+                "MuxUpdated가 시드된 상태를 덮었다: {frame}"
+            );
+        }
+        drop(ws);
+    }
+
+    /// 폰에도 전체 워크스페이스가 보인다 — warm/유휴는 표시 전용(세션 id 없음).
+    #[test]
+    fn ws_대시보드는_전체_워크스페이스를_싣고_비활성은_표시전용이다() {
+        let server = start(None);
+        let addr = server.local_addr();
+        server.set_workspaces(vec![
+            dashboard::WorkspaceSeed {
+                id: "ws-1".to_owned(),
+                name: "deppy-sijo".to_owned(),
+                state: dashboard::WorkspaceState::Active,
+                sessions: vec![dashboard::SessionSeed {
+                    id: Some(7),
+                    title: "deppy-sijo".to_owned(),
+                    status: Some(runtime::SessionStatus::Running),
+                    exited: false,
+                }],
+            },
+            dashboard::WorkspaceSeed {
+                id: "ws-2".to_owned(),
+                name: "source".to_owned(),
+                state: dashboard::WorkspaceState::Warm,
+                sessions: vec![dashboard::SessionSeed {
+                    id: None,
+                    title: "deppy-mux".to_owned(),
+                    status: None,
+                    exited: false,
+                }],
+            },
+        ]);
+        let mut ws = ws_client_authed(addr);
         let frame =
-            wait_dashboard_frame(&mut ws, r#""title":"claude-2""#).expect("제목 갱신 프레임 없음");
-        assert!(
-            frame.contains(r#""status":"needs_approval""#),
-            "MuxUpdated가 시드된 상태를 덮었다: {frame}"
-        );
+            wait_dashboard_frame(&mut ws, r#""state":"warm""#).expect("warm 워크스페이스 없음");
+        assert!(frame.contains(r#""name":"deppy-sijo""#), "{frame}");
+        assert!(frame.contains(r#""name":"source""#), "{frame}");
+        // 활성 세션만 id를 싣는다(시청 대상) — warm 세션은 id 없이 이름만
+        assert!(frame.contains(r#""id":7"#), "{frame}");
+        assert!(frame.contains(r#""title":"deppy-mux""#), "{frame}");
         drop(ws);
     }
 
@@ -1568,12 +1629,12 @@ mod tests {
         let server = start(None);
         let addr = server.local_addr();
         // 워크스페이스 A: 세션 1 = needs_approval
-        server.seed_sessions(vec![dashboard::SessionSeed {
-            id: 1,
+        server.set_workspaces(active_seed(vec![dashboard::SessionSeed {
+            id: Some(1),
             title: "A".to_owned(),
-            status: runtime::SessionStatus::NeedsApproval,
+            status: Some(runtime::SessionStatus::NeedsApproval),
             exited: false,
-        }]);
+        }]));
         let mut ws = ws_client_authed(addr);
         assert!(
             wait_dashboard_frame(&mut ws, r#""id":1"#).is_some(),
@@ -1581,12 +1642,12 @@ mod tests {
         );
         // 전환: 워크스페이스 B로 재시드(세션 2 = error). 세션 맵 통째 교체라 A의 세션 1은 사라진다
         // — MuxUpdated 재발화를 놓쳐도 옛 워크스페이스 세션이 정체되지 않는다(전환 레이스 해소).
-        server.seed_sessions(vec![dashboard::SessionSeed {
-            id: 2,
+        server.set_workspaces(active_seed(vec![dashboard::SessionSeed {
+            id: Some(2),
             title: "B".to_owned(),
-            status: runtime::SessionStatus::Error,
+            status: Some(runtime::SessionStatus::Error),
             exited: false,
-        }]);
+        }]));
         let frame =
             wait_dashboard_frame(&mut ws, r#""id":2"#).expect("워크스페이스 B 재시드 미반영");
         assert!(frame.contains(r#""status":"error""#), "{frame}");

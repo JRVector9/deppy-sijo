@@ -1,15 +1,19 @@
-//! web-remote — 모바일 PWA용 내장 웹서버 (mobile-pwa 계획 v3.3 PR-P1 스캐폴드).
+//! web-remote — 모바일 PWA용 내장 웹서버 (mobile-pwa 계획 v3.3 PR-P1/P2).
 //!
 //! 계층 (방법 B(클라우드 앱 셸) 이전 대비 모듈 경계):
 //!   - [`http`]: 수제 최소 HTTP/1.1 파서/응답 — 프레임워크 없음 (auth callback.rs 관례)
 //!   - [`static_srv`]: 임베드 정적 셸 + 페어링 토큰 게이트 — 이전 시 이 계층만 교체
-//!   - [`ws_api`]: WS API 자리 (P2) — P1은 Upgrade 판별 후 501
+//!   - [`ws_api`]: WS 승격 + 승인/상태 대시보드 세션 (P2 — tungstenite sync, 첫 프레임 인증)
+//!   - [`dashboard`]: 대시보드 브리지 — runtime 이벤트 구독 + 승인 DB 직행 (P2)
+//!   - [`protocol`]: WS JSON 프로토콜 v1 (P2)
 //!   - [`pairing`]: 페어링 토큰 keyring 영속 + 접속 URL
 //!
 //! 스레드 모델: tokio 금지 — 단일 accept 스레드 + 접속당 블로킹 스레드
-//! (runtime remote.rs spawn_accept 관례). 접속은 요청 1개 처리 후 Connection: close.
-//! **OFF(서버 미생성) = 스레드/소켓 0. ON + 접속 0 = accept 블로킹 대기만 (idle CPU 0,
-//! egui repaint 유발 없음).**
+//! (runtime remote.rs spawn_accept 관례). 정적 요청은 1개 처리 후 Connection: close,
+//! WS 접속은 대시보드 스트림을 위해 슬롯을 장수 점유한다. 별도 대시보드 브리지 스레드
+//! 하나가 이벤트 drain/승인 폴링을 담당한다([`dashboard`]).
+//! **OFF(서버 미생성) = 스레드/소켓 0. ON + 접속 0 = accept 블로킹 대기 + 브리지 park
+//! (승인 폴링 정지 — idle CPU 0, egui repaint 유발 없음).**
 //!
 //! 바인딩: serve 모드(기본) = 127.0.0.1 평문 + `tailscale serve`가 HTTPS 종단.
 //! 비-loopback 평문 bind는 거부(remote-tls-delta §2.5) — cert 모드(자체 TLS)는 후속.
@@ -23,8 +27,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 
+pub mod dashboard;
 pub mod http;
 pub mod pairing;
+pub mod protocol;
 pub mod static_srv;
 pub mod ws_api;
 
@@ -42,6 +48,8 @@ pub struct ServeOptions {
     pub token: String,
     /// 허용 Host(ts.net 호스트명). None/빈 값이면 loopback 계열 Host만 허용.
     pub allowed_host: Option<String>,
+    /// 승인 대시보드용 자체 DB 경로(P2). None이면 상태 대시보드만 동작하고 승인은 빈 목록.
+    pub db_path: Option<std::path::PathBuf>,
 }
 
 /// 접속 스레드들이 공유하는 불변 컨텍스트.
@@ -49,6 +57,10 @@ struct ConnCtx {
     token: String,
     /// 소문자 정규화된 허용 호스트명.
     allowed_host: Option<String>,
+    /// WS 대시보드 브리지 핸들(승인 resolve·이벤트 구독·발행 스냅샷 공유).
+    dashboard: dashboard::DashboardHandle,
+    /// shutdown 신호 — 장수 WS 접속이 tick마다 확인해 즉시 종료한다.
+    stop: Arc<AtomicBool>,
 }
 
 /// 살아있는 접속 하나 — shutdown 시 소켓 종료 + join 대상 (remote.rs ConnEntry 관례).
@@ -60,12 +72,16 @@ struct ConnEntry {
 /// 접속 목록 + 슬롯 반납 신호. accept 스레드는 상한 초과 시 Condvar에서 기다린다.
 type ConnSet = (Mutex<Vec<ConnEntry>>, Condvar);
 
-/// 실행 중인 웹서버. Drop/shutdown이 accept 루프·접속 스레드를 모두 정리한다.
+/// 실행 중인 웹서버. Drop/shutdown이 accept 루프·접속 스레드·대시보드 스레드를 모두 정리한다.
 pub struct WebRemoteServer {
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
     accept_thread: Option<JoinHandle<()>>,
     connections: Arc<ConnSet>,
+    /// WS 대시보드 브리지 핸들(app이 runtime 구독을 붙이는 데 쓴다).
+    dashboard: dashboard::DashboardHandle,
+    /// 브리지 스레드 join 대상 — shutdown 시 stop 후 join한다.
+    dashboard_thread: Option<JoinHandle<()>>,
 }
 
 impl WebRemoteServer {
@@ -82,12 +98,16 @@ impl WebRemoteServer {
         let addr = listener.local_addr()?;
         let stop = Arc::new(AtomicBool::new(false));
         let connections: Arc<ConnSet> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        // WS 대시보드 브리지 스레드. OFF(서버 미생성)면 이 스레드도 없다 — 리소스 0.
+        let (dashboard, dashboard_thread) = dashboard::DashboardHandle::spawn(options.db_path);
         let ctx = Arc::new(ConnCtx {
             token: options.token,
             allowed_host: options
                 .allowed_host
                 .map(|host| host.trim().to_ascii_lowercase())
                 .filter(|host| !host.is_empty()),
+            dashboard: dashboard.clone(),
+            stop: Arc::clone(&stop),
         });
         let accept_thread =
             spawn_accept(listener, ctx, Arc::clone(&stop), Arc::clone(&connections))?;
@@ -97,7 +117,19 @@ impl WebRemoteServer {
             stop,
             accept_thread: Some(accept_thread),
             connections,
+            dashboard,
+            dashboard_thread: Some(dashboard_thread),
         })
+    }
+
+    /// `subscribe_with_wake`에 넘길 안정적 wake 클로저 — app이 활성 runtime을 구독할 때 쓴다.
+    pub fn dashboard_wake(&self) -> Arc<dyn Fn() + Send + Sync> {
+        self.dashboard.wake_fn()
+    }
+
+    /// 활성 workspace worker 이벤트 구독을 대시보드에 붙인다(시작 + 워크스페이스 전환마다).
+    pub fn set_runtime_source(&self, receiver: runtime::RuntimeEventReceiver) {
+        self.dashboard.set_runtime_source(receiver);
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -130,6 +162,11 @@ impl WebRemoteServer {
         // blocking accept를 깨운다
         let _ = TcpStream::connect(self.addr);
         if let Some(handle) = self.accept_thread.take() {
+            let _ = handle.join();
+        }
+        // 접속 스레드가 모두 끝난 뒤(ConnectionGuard drop 완료) 대시보드 스레드를 정지·join한다.
+        self.dashboard.stop();
+        if let Some(handle) = self.dashboard_thread.take() {
             let _ = handle.join();
         }
         tracing::info!(addr = %self.addr, "web-remote 서버 정지");
@@ -299,9 +336,11 @@ fn handle_connection(stream: TcpStream, ctx: &ConnCtx) {
         );
         return;
     }
-    // WS 업그레이드는 ws_api 계층 몫 (P1은 자리 응답).
+    // WS 업그레이드는 ws_api 계층이 승격해 대시보드 세션을 처리한다(접속을 장수 점유).
+    // query에 토큰이 실릴 수 있어 로그하지 않는다 — path만.
     if ws_api::is_upgrade_request(&head) {
-        respond(stream, &ws_api::not_ready_response(), &peer, &head.path);
+        tracing::info!(peer, path = %head.path, "web-remote WS 업그레이드");
+        ws_api::serve(stream, &head, &ctx.token, &ctx.dashboard, &ctx.stop);
         return;
     }
     if head.method != "GET" {
@@ -354,16 +393,24 @@ fn strip_port(host: &str) -> &str {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+    use std::path::PathBuf;
     use std::time::Instant;
+    use tungstenite::Message;
+    use tungstenite::protocol::{Role, WebSocket};
 
     const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
     fn start(allowed_host: Option<&str>) -> WebRemoteServer {
+        start_with_db(allowed_host, None)
+    }
+
+    fn start_with_db(allowed_host: Option<&str>, db_path: Option<PathBuf>) -> WebRemoteServer {
         WebRemoteServer::serve(
             SocketAddr::from(([127, 0, 0, 1], 0)),
             ServeOptions {
                 token: TEST_TOKEN.to_owned(),
                 allowed_host: allowed_host.map(str::to_owned),
+                db_path,
             },
         )
         .unwrap()
@@ -452,6 +499,7 @@ mod tests {
             ServeOptions {
                 token: TEST_TOKEN.to_owned(),
                 allowed_host: None,
+                db_path: None,
             },
         );
         // WebRemoteServer는 Debug 미구현(스레드 핸들) — unwrap_err 대신 match로 확인
@@ -514,13 +562,275 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_요청은_501_자리응답() {
+    fn ws_핸드셰이크는_101_키없는_업그레이드는_400() {
         let server = start(None);
-        let response = request(
-            server.local_addr(),
+        let addr = server.local_addr();
+        // 유효 핸드셰이크(key + version 13) → 101 + 표준 accept 키
+        let ok = request_head_only(
+            addr,
+            "GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        );
+        assert!(ok.starts_with("HTTP/1.1 101"), "{ok}");
+        assert!(
+            ok.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+            "{ok}"
+        );
+        // 키 없는 업그레이드 → 400
+        let bad = request(
+            addr,
             "GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
         );
-        assert!(response.starts_with("HTTP/1.1 501"), "{response}");
+        assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+    }
+
+    /// 응답 head(\r\n\r\n)까지만 읽는다 — 101 뒤 서버가 접속을 열어 둔 채 인증을 기다리므로
+    /// EOF까지 읽으면 auth 타임아웃(5s)만큼 블록된다.
+    fn request_head_only(addr: SocketAddr, raw: &str) -> String {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(raw.as_bytes()).unwrap();
+        let mut out = Vec::new();
+        let mut one = [0u8; 1];
+        while stream.read(&mut one).map(|n| n > 0).unwrap_or(false) {
+            out.push(one[0]);
+            if out.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// tungstenite 클라이언트로 핸드셰이크를 마치고 프레이밍 소켓을 돌려준다(테스트용).
+    fn ws_client(addr: SocketAddr) -> WebSocket<TcpStream> {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        // 짧은 read 타임아웃 — read_text가 데드라인까지 재시도할 수 있게.
+        stream
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        stream
+            .write_all(
+                b"GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            )
+            .unwrap();
+        // 101 head 소진(그 뒤엔 WS 프레임 — 서버는 인증 프레임 전까지 아무것도 안 보낸다)
+        let mut one = [0u8; 1];
+        let mut head = Vec::new();
+        while stream.read(&mut one).map(|n| n > 0).unwrap_or(false) {
+            head.push(one[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert!(
+            String::from_utf8_lossy(&head).starts_with("HTTP/1.1 101"),
+            "핸드셰이크 실패: {}",
+            String::from_utf8_lossy(&head)
+        );
+        WebSocket::from_raw_socket(stream, Role::Client, None)
+    }
+
+    fn send_text(ws: &mut WebSocket<TcpStream>, text: &str) {
+        ws.send(Message::Text(text.to_owned().into())).unwrap();
+    }
+
+    /// 데드라인 내 텍스트 프레임 하나를 돌려준다(Ping/Pong 스킵). 없으면 None.
+    fn read_text(ws: &mut WebSocket<TcpStream>, timeout: Duration) -> Option<String> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match ws.read() {
+                Ok(Message::Text(t)) => return Some(t.as_str().to_owned()),
+                Ok(Message::Close(_)) => return None,
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(io))
+                    if io.kind() == std::io::ErrorKind::WouldBlock
+                        || io.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    /// 데드라인 내에 특정 `type`의 프레임을 찾아 돌려준다.
+    fn read_frame_of_type(
+        ws: &mut WebSocket<TcpStream>,
+        ty: &str,
+        timeout: Duration,
+    ) -> Option<String> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match read_text(ws, remaining) {
+                Some(text) if text.contains(&format!(r#""type":"{ty}""#)) => return Some(text),
+                Some(_) => {}
+                None => return None,
+            }
+        }
+        None
+    }
+
+    fn temp_db_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "web-remote-test-{}.db",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    #[test]
+    fn ws_인증_성공은_welcome_실패는_close() {
+        let server = start(None);
+        let addr = server.local_addr();
+
+        // 정상: 유효 토큰 → welcome + 대시보드/승인 프레임
+        let mut ws = ws_client(addr);
+        send_text(
+            &mut ws,
+            &format!(r#"{{"type":"auth","v":1,"token":"{TEST_TOKEN}"}}"#),
+        );
+        let welcome = read_frame_of_type(&mut ws, "welcome", Duration::from_secs(3));
+        assert!(welcome.is_some(), "welcome 프레임 없음");
+        assert!(welcome.unwrap().contains(r#""v":1"#));
+        // 접속 없던 서버가 등록 즉시 대시보드 프레임을 발행한다(빈 세션이라도)
+        assert!(
+            read_frame_of_type(&mut ws, "dashboard", Duration::from_secs(3)).is_some(),
+            "대시보드 프레임 없음"
+        );
+
+        // 거부: 잘못된 토큰 → error + close
+        let mut bad = ws_client(addr);
+        send_text(&mut bad, r#"{"type":"auth","v":1,"token":"wrong"}"#);
+        // error 프레임 또는 close 중 하나로 종료됨
+        let got = read_text(&mut bad, Duration::from_secs(3));
+        assert!(
+            got.as_deref()
+                .map(|t| t.contains("unauthorized"))
+                .unwrap_or(true),
+            "인증 실패인데 close/error가 아님: {got:?}"
+        );
+    }
+
+    #[test]
+    fn ws_인증_전_비auth_첫프레임은_거부() {
+        let server = start(None);
+        let mut ws = ws_client(server.local_addr());
+        // 첫 프레임이 resolve(비-auth) → 인증 실패로 close
+        send_text(&mut ws, r#"{"type":"resolve","id":"x","allowed":true}"#);
+        let got = read_text(&mut ws, Duration::from_secs(3));
+        assert!(
+            got.as_deref()
+                .map(|t| t.contains("unauthorized"))
+                .unwrap_or(true),
+            "비-auth 첫 프레임이 거부되지 않음: {got:?}"
+        );
+    }
+
+    #[test]
+    fn ws_승인_목록_수신과_resolve_왕복() {
+        let db_path = temp_db_path();
+        // 사전에 pending 승인 하나 삽입(별도 연결 — 브리지는 자기 연결로 폴링)
+        {
+            let db = storage::Db::open(&db_path).unwrap();
+            db.insert_pending_approval(
+                "appr-1",
+                "github",
+                "create_issue",
+                "{\"title\":\"x\"}",
+                None,
+                1720,
+            )
+            .unwrap();
+        }
+        let server = start_with_db(None, Some(db_path.clone()));
+        let mut ws = ws_client(server.local_addr());
+        send_text(
+            &mut ws,
+            &format!(r#"{{"type":"auth","v":1,"token":"{TEST_TOKEN}"}}"#),
+        );
+        // 승인 프레임에 삽입한 항목이 보인다
+        let approvals = read_frame_of_type(&mut ws, "approvals", Duration::from_secs(3))
+            .expect("승인 프레임 없음");
+        assert!(approvals.contains("appr-1"), "{approvals}");
+        assert!(approvals.contains("create_issue"), "{approvals}");
+
+        // Deny 결정을 보낸다 → DB에 resolved로 반영(더 이상 pending 아님)
+        send_text(
+            &mut ws,
+            r#"{"type":"resolve","id":"appr-1","allowed":false,"remember":false}"#,
+        );
+        // 브리지가 재폴링해 빈 목록을 발행할 때까지 대기
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut resolved = false;
+        while Instant::now() < deadline {
+            let db = storage::Db::open(&db_path).unwrap();
+            if db.list_pending_approvals().unwrap().is_empty() {
+                resolved = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(resolved, "resolve가 DB에 반영되지 않음");
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn ws_상태_스트림_프레임에_주입_상태가_반영된다() {
+        let server = start(None);
+        let mut ws = ws_client(server.local_addr());
+        send_text(
+            &mut ws,
+            &format!(r#"{{"type":"auth","v":1,"token":"{TEST_TOKEN}"}}"#),
+        );
+        // 접속 등록 후 세션 상태 이벤트를 주입 → 대시보드 프레임으로 흘러야 한다
+        assert!(read_frame_of_type(&mut ws, "welcome", Duration::from_secs(3)).is_some());
+        server
+            .dashboard
+            .inject_event(runtime::RuntimeEvent::SessionStatusChanged {
+                session: runtime::SessionId(42),
+                status: runtime::SessionStatus::NeedsApproval,
+            });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut seen = false;
+        while Instant::now() < deadline {
+            if let Some(frame) = read_frame_of_type(&mut ws, "dashboard", Duration::from_secs(1))
+                && frame.contains(r#""status":"needs_approval""#)
+                && frame.contains(r#""id":42"#)
+            {
+                seen = true;
+                break;
+            }
+        }
+        assert!(seen, "주입한 상태가 대시보드 프레임에 반영되지 않음");
+    }
+
+    #[test]
+    fn 접속_0에서는_승인_폴링이_정지한다() {
+        let db_path = temp_db_path();
+        let server = start_with_db(None, Some(db_path.clone()));
+        // 접속이 없으면 폴링 타이머가 없다 — 잠시 기다려도 poll_count 0
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(
+            server.dashboard.poll_count(),
+            0,
+            "접속 0인데 승인 폴링이 돌았다"
+        );
+
+        // 접속이 생기면 즉시 폴링(force) → 카운트 증가
+        let mut ws = ws_client(server.local_addr());
+        send_text(
+            &mut ws,
+            &format!(r#"{{"type":"auth","v":1,"token":"{TEST_TOKEN}"}}"#),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while server.dashboard.poll_count() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            server.dashboard.poll_count() >= 1,
+            "접속 후에도 폴링이 안 돌았다"
+        );
+        drop(ws);
+        let _ = std::fs::remove_file(&db_path);
     }
 
     #[test]

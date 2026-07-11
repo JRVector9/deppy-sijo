@@ -11,17 +11,26 @@
   <link rel="stylesheet" href="/app.css">
 </head>
 <body data-view="shell">
-  <main class="card">
+  <main class="app">
     <header class="brand">
-      <img src="/icon.svg" alt="" width="44" height="44">
+      <img src="/icon.svg" alt="" width="36" height="36">
       <h1>Deppy Sijo</h1>
+      <p class="status"><span id="dot" class="dot"></span> <span id="status-text">연결 중…</span></p>
     </header>
-    <p class="status"><span id="dot" class="dot"></span> <span id="status-text">확인 중…</span></p>
-    <p class="placeholder">연결됨 — 승인/상태 대시보드는 P2에서 제공됩니다.</p>
-    <dl class="meta">
-      <div><dt>서버</dt><dd id="host">-</dd></div>
-      <div><dt>마지막 확인</dt><dd id="last-check">-</dd></div>
-    </dl>
+
+    <!-- 킬러 기능: 승인 대시보드. 카드의 미리보기/서버/도구는 모두 textContent로만 삽입한다. -->
+    <section class="panel" aria-labelledby="approvals-title">
+      <h2 id="approvals-title">승인 대기 <span id="approvals-count" class="count">0</span></h2>
+      <div id="approvals" class="cards"></div>
+      <p id="approvals-empty" class="empty">대기 중인 승인이 없습니다.</p>
+    </section>
+
+    <section class="panel" aria-labelledby="sessions-title">
+      <h2 id="sessions-title">세션</h2>
+      <ul id="sessions" class="sessions"></ul>
+      <p id="sessions-empty" class="empty">활성 세션이 없습니다.</p>
+      <p id="resource" class="resource"></p>
+    </section>
   </main>
   <script src="/app.js"></script>
 </body>

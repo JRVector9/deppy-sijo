@@ -144,12 +144,14 @@ fn reason(status: u16) -> &'static str {
 
 /// 응답을 쓴다. 보안 헤더는 전 응답 공통 — CSP(`default-src 'self'`, 인라인 스크립트
 /// 금지 + `frame-ancestors 'none'`: default-src는 frame-ancestors에 상속되지 않으므로
-/// 명시해 타 출처 iframe 임베드(clickjacking)를 차단)와 nosniff. HTTP 캐시는
+/// 명시해 타 출처 iframe 임베드(clickjacking)를 차단)와 nosniff. `connect-src 'self'`는
+/// P2 대시보드의 동일 출처 WS(wss)를 명시 허용한다 — default-src 상속으로도 되지만 일부
+/// WebKit(iOS 타깃) 버전의 ws 스킴 매칭 이슈를 피하려 명시한다. HTTP 캐시는
 /// no-cache — 셸 캐싱은 SW가 담당한다(버전 키 갱신은 P3).
 pub fn write_response(stream: &mut impl Write, response: &Response) -> std::io::Result<()> {
     write!(
         stream,
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-cache\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'self'; frame-ancestors 'none'\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-cache\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'self'; connect-src 'self'; frame-ancestors 'none'\r\n\r\n",
         response.status,
         reason(response.status),
         response.content_type,
@@ -251,7 +253,7 @@ mod tests {
         assert!(text.contains("Connection: close\r\n"), "{text}");
         assert!(
             text.contains(
-                "Content-Security-Policy: default-src 'self'; frame-ancestors 'none'\r\n"
+                "Content-Security-Policy: default-src 'self'; connect-src 'self'; frame-ancestors 'none'\r\n"
             ),
             "{text}"
         );

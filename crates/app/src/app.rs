@@ -2097,6 +2097,9 @@ impl App {
                                 status: Some(
                                     entry.status.unwrap_or(runtime::SessionStatus::Running),
                                 ),
+                                // 돌고 있는 에이전트("Claude · sonnet · high") — 사이드바
+                                // 2행과 같은 원천(agent_detect). 셸이면 None.
+                                agent: entry.agent_line,
                                 exited: self.active.live.exited_sessions.contains(&session),
                             })
                         })
@@ -2140,6 +2143,8 @@ impl App {
                             id: None, // 표시 전용
                             title: self.activity_session_name(&ws.id, &raw),
                             status: None,
+                            // warm/유휴는 감지 워커가 안 돌아 에이전트 정보가 없다.
+                            agent: None,
                             exited: false,
                         })
                         .collect(),

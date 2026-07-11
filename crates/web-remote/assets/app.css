@@ -90,6 +90,12 @@ h1 { font-size: 19px; font-weight: 600; color: #f0f0f0; }
   padding: 9px 10px; background: #1f1f1f; border: 1px solid #383838; border-radius: 8px;
 }
 .session .title { font-size: 14px; color: #e0e0e0; word-break: break-word; }
+/* 이름 + 에이전트 요약(2줄) */
+.session-name { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.session-name .agent {
+  font-size: 11px; color: #8fb3d0; font-family: ui-monospace, Menlo, monospace;
+  word-break: break-word;
+}
 .badge {
   font-size: 12px; font-weight: 600; padding: 2px 9px; border-radius: 10px; flex: none;
   background: #3a3a3a; color: #d4d4d4;

@@ -148,6 +148,9 @@ pub struct SessionSeed {
     pub id: Option<u64>,
     pub title: String,
     pub status: Option<SessionStatus>,
+    /// 돌고 있는 에이전트 요약("Claude · sonnet · high"). 앱의 감지 결과 — 활성
+    /// 워크스페이스만 감지 워커가 돌므로 warm/유휴는 None.
+    pub agent: Option<String>,
     pub exited: bool,
 }
 
@@ -297,6 +300,7 @@ fn workspace_views(
                     id: Some(*id),
                     title: format!("세션 {id}"),
                     status: Some(status_str(entry.status)),
+                    agent: None,
                     exited: entry.exited,
                 })
                 .collect(),
@@ -306,20 +310,23 @@ fn workspace_views(
         .iter()
         .map(|ws| {
             let sessions = if ws.state == WorkspaceState::Active {
-                let titles: BTreeMap<u64, &str> = ws
+                let by_id: BTreeMap<u64, &SessionSeed> = ws
                     .sessions
                     .iter()
-                    .filter_map(|s| s.id.map(|id| (id, s.title.as_str())))
+                    .filter_map(|s| s.id.map(|id| (id, s)))
                     .collect();
                 live.iter()
-                    .map(|(id, entry)| SessionView {
-                        id: Some(*id),
-                        title: titles
-                            .get(id)
-                            .map(|t| (*t).to_owned())
-                            .unwrap_or_else(|| format!("세션 {id}")),
-                        status: Some(status_str(entry.status)),
-                        exited: entry.exited,
+                    .map(|(id, entry)| {
+                        let seed = by_id.get(id);
+                        SessionView {
+                            id: Some(*id),
+                            title: seed
+                                .map(|s| s.title.clone())
+                                .unwrap_or_else(|| format!("세션 {id}")),
+                            status: Some(status_str(entry.status)),
+                            agent: seed.and_then(|s| s.agent.clone()),
+                            exited: entry.exited,
+                        }
                     })
                     .collect()
             } else {
@@ -329,6 +336,7 @@ fn workspace_views(
                         id: None, // 표시 전용 — 세션 id는 worker-로컬
                         title: s.title.clone(),
                         status: s.status.map(status_str),
+                        agent: s.agent.clone(),
                         exited: s.exited,
                     })
                     .collect()
@@ -1063,6 +1071,7 @@ mod tests {
                     id: Some(10),
                     title: "deppy-sijo".into(),
                     status: Some(SessionStatus::Running),
+                    agent: Some("Claude · sonnet · high".into()),
                     exited: false,
                 }],
             },
@@ -1074,6 +1083,7 @@ mod tests {
                     id: Some(10), // 앱이 실수로 id를 넣어도 브리지가 표시 전용으로 만든다
                     title: "deppy-mux".into(),
                     status: None,
+                    agent: None,
                     exited: false,
                 }],
             },
@@ -1084,6 +1094,11 @@ mod tests {
         assert_eq!(views[0].sessions[0].id, Some(10));
         assert_eq!(views[0].sessions[0].title, "deppy-sijo");
         assert_eq!(views[0].sessions[0].status, Some("needs_approval"));
+        // 돌고 있는 에이전트 요약이 실린다(폰에서 "무슨 에이전트가 도는지" 확인)
+        assert_eq!(
+            views[0].sessions[0].agent.as_deref(),
+            Some("Claude · sonnet · high")
+        );
         // 비활성: 표시 전용(id 없음 — 세션 id는 worker-로컬이라 시청 불가)
         assert_eq!(views[1].state, "warm");
         assert_eq!(views[1].sessions[0].id, None);

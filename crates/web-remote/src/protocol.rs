@@ -75,6 +75,10 @@ pub struct SessionView {
     /// 감지된 상태(런타임 이벤트 유래). warm/유휴는 상태 추적이 없어 생략된다.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<&'static str>,
+    /// 이 세션에서 돌고 있는 에이전트 요약("Claude · sonnet · high") — 앱의 감지
+    /// 결과(agent_detect)다. 감지 워커는 활성 워크스페이스만 돌므로 warm/유휴는 없다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// 종료(SessionExited/Restored 관측) — 완료 배지용.
     pub exited: bool,
 }
@@ -642,6 +646,7 @@ mod tests {
                         id: Some(7),
                         title: "claude".into(),
                         status: Some("needs_approval"),
+                        agent: Some("Claude · sonnet · high".into()),
                         exited: false,
                     }],
                 },
@@ -654,6 +659,7 @@ mod tests {
                         id: None,
                         title: "deppy-mux".into(),
                         status: None,
+                        agent: None,
                         exited: false,
                     }],
                 },
@@ -668,6 +674,10 @@ mod tests {
         assert!(dash.contains(r#""status":"needs_approval""#), "{dash}");
         assert!(dash.contains(r#""rss_mb":340"#), "{dash}");
         assert!(dash.contains(r#""state":"warm""#), "{dash}");
+        assert!(
+            dash.contains(r#""agent":"Claude · sonnet · high""#),
+            "{dash}"
+        );
         // 비활성 세션은 id/status가 아예 실리지 않는다(클라가 "보기" 버튼을 안 만든다)
         let warm_part = dash.split(r#""name":"source""#).nth(1).unwrap();
         assert!(!warm_part.contains(r#""id":"#), "{dash}");

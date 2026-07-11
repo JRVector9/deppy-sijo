@@ -626,10 +626,20 @@
     const li = document.createElement('li');
     li.className = 'session';
 
+    // 이름 + (있으면) 돌고 있는 에이전트 요약 — 2줄. 둘 다 textContent로만 삽입한다.
+    const nameBox = document.createElement('span');
+    nameBox.className = 'session-name';
     const title = document.createElement('span');
     title.className = 'title';
     title.textContent = s.title || (s.id != null ? '세션 ' + s.id : '세션');
-    li.appendChild(title);
+    nameBox.appendChild(title);
+    if (s.agent) {
+      const agent = document.createElement('span');
+      agent.className = 'agent';
+      agent.textContent = s.agent;
+      nameBox.appendChild(agent);
+    }
+    li.appendChild(nameBox);
 
     // 상태는 활성 워크스페이스만 감지된다(warm/유휴는 감지 워커가 안 돈다).
     if (s.exited || s.status) {

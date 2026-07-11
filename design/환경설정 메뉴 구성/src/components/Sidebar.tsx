@@ -24,7 +24,8 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { icon: '⚷', label: '자격증명' },
       { icon: '⚯', label: '연결 (커넥터)' },
-      { icon: '▤', label: '환경 프로필' },
+      { icon: '▤', label: '환경 및 API' },
+      { icon: '▤', label: '환경 설정' },
       { icon: '◈', label: '에이전트' },
       { icon: '▢', label: '워크스페이스' },
     ],
@@ -49,6 +50,17 @@ interface Props {
 export default function Sidebar({ theme, activeNav, onSelect, search, onSearch }: Props) {
   const t = egui(theme)
   const [hoveredItem, setHoveredItem] = useState<string | null>(null)
+  const query = search.trim().toLowerCase()
+  const groups = NAV_GROUPS
+    .map(group => ({
+      ...group,
+      items: group.items.filter(item =>
+        !query ||
+        item.label.toLowerCase().includes(query) ||
+        group.label.toLowerCase().includes(query)
+      ),
+    }))
+    .filter(group => group.items.length > 0)
 
   return (
     <div style={{
@@ -92,7 +104,7 @@ export default function Sidebar({ theme, activeNav, onSelect, search, onSearch }
 
       {/* Nav groups */}
       <div style={{ flex: 1, overflowY: 'auto', padding: '4px 0' }}>
-        {NAV_GROUPS.map(group => (
+        {groups.map(group => (
           <div key={group.label}>
             <div style={{
               padding: '8px 12px 3px',
@@ -144,6 +156,15 @@ export default function Sidebar({ theme, activeNav, onSelect, search, onSearch }
             })}
           </div>
         ))}
+        {groups.length === 0 && (
+          <div style={{
+            padding: '8px 12px',
+            fontSize: 13,
+            color: t.muted,
+          }}>
+            검색 결과 없음
+          </div>
+        )}
       </div>
     </div>
   )

@@ -320,6 +320,36 @@ function TypeToggleDemo({ active, t, label }: { active: 'api_key' | 'token'; t: 
   )
 }
 
+// ─── switch toggle ───────────────────────────────────────────────────────────
+
+function SwitchToggleDemo({ checked, t, label }: { checked: boolean; t: EguiTokens; label?: string }) {
+  return (
+    <Cell t={t} label={label}>
+      <div style={{
+        width: 46,
+        height: 26,
+        border: `1px solid ${checked ? t.accent : t.border}`,
+        backgroundColor: checked ? t.accent : t.surface,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: checked ? 'flex-end' : 'flex-start',
+        padding: 3,
+        boxSizing: 'border-box',
+        borderRadius: 2,
+      }}>
+        <span style={{
+          width: 18,
+          height: 18,
+          backgroundColor: checked ? t.accentText : t.muted,
+          display: 'block',
+          borderRadius: 2,
+        }} />
+      </div>
+      <Annotation t={t}>outer/inner radius 2px</Annotation>
+    </Cell>
+  )
+}
+
 // ─── badge / tag ──────────────────────────────────────────────────────────────
 
 function BadgeDemo({ value, t, label }: { value: string | number; t: EguiTokens; label?: string }) {
@@ -499,14 +529,14 @@ function LayoutDiagram({ t }: { t: EguiTokens }) {
             <div style={{ height: 14, backgroundColor: t.input, border: `1px solid ${t.inputBorder}` }} />
           </div>
           {/* nav groups */}
-          {[['설정', ['일반', '언어', '터미널', '성능']], ['관리', ['자격증명', '환경 프로필']], ['모니터', ['활동', '알림']]].map(([group, items]) => (
+          {[['설정', ['일반', '언어', '터미널', '성능']], ['관리', ['자격증명', '환경 설정']], ['모니터', ['활동', '알림']]].map(([group, items]) => (
             <div key={group as string}>
               <div style={{ fontSize: 7, color: t.muted, padding: '4px 4px 1px', letterSpacing: '0.06em' }}>{group as string}</div>
               {(items as string[]).map(item => (
                 <div key={item} style={{
                   fontSize: 7, padding: '2px 4px',
-                  color: item === '환경 프로필' ? t.navActiveText : t.muted,
-                  backgroundColor: item === '환경 프로필' ? t.navActive : 'transparent',
+                  color: item === '환경 설정' ? t.navActiveText : t.muted,
+                  backgroundColor: item === '환경 설정' ? t.navActive : 'transparent',
                 }}>{item}</div>
               ))}
             </div>
@@ -522,7 +552,7 @@ function LayoutDiagram({ t }: { t: EguiTokens }) {
             display: 'flex', alignItems: 'center',
             padding: '0 6px', justifyContent: 'space-between',
           }}>
-            <span style={{ fontSize: 7, color: t.text }}>환경 프로필</span>
+            <span style={{ fontSize: 7, color: t.text }}>환경 설정</span>
             <div style={{ display: 'flex', gap: 1 }}>
               <span style={{ fontSize: 6, padding: '1px 4px', backgroundColor: t.input, border: `1px solid ${t.border}`, color: t.muted }}>라이트</span>
               <span style={{ fontSize: 6, padding: '1px 4px', backgroundColor: t.accent, color: t.accentText }}>다크</span>
@@ -644,7 +674,7 @@ function ThemeColumn({ theme }: { theme: Theme }) {
       <SectionTitle t={t}>02 · Typography · JetBrains Mono</SectionTitle>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 14 }}>
         {[
-          { size: 13, weight: 600, label: 'Panel header · 13px/600', sample: '환경 프로필' },
+          { size: 13, weight: 600, label: 'Panel header · 13px/600', sample: '환경 설정' },
           { size: 12, weight: 600, label: 'Section title · 12px/600', sample: 'my-backend' },
           { size: 11, weight: 400, label: 'Body / row value · 11px/400', sample: 'DATABASE_URL = postgres://localhost:5432' },
           { size: 10, weight: 400, label: 'Caption / add btn · 10px/400', sample: '+ 추가    라이트    다크' },
@@ -654,6 +684,63 @@ function ThemeColumn({ theme }: { theme: Theme }) {
           <div key={row.size + row.label} style={{ display: 'flex', alignItems: 'baseline', gap: 12 }}>
             <span style={{ width: 200, fontSize: 8, color: t.muted, flexShrink: 0 }}>{row.label}</span>
             <span style={{ fontSize: row.size, fontWeight: row.weight, color: t.text }}>{row.sample}</span>
+          </div>
+        ))}
+      </div>
+
+      <SectionTitle t={t}>02B · Settings Detail Font Map</SectionTitle>
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: '180px 80px minmax(0, 1fr)',
+        border: `1px solid ${t.border}`,
+        marginBottom: 14,
+      }}>
+        {[
+          ['프로젝트 목록 헤더', '13px', '프로젝트'],
+          ['프로젝트 목록 이름', '14px', 'my-backend'],
+          ['프로젝트 목록 경로/카운트', '12px', '~/projects/my-backend · 4env'],
+          ['상세 상단 라벨', '13px', '이름 / 경로'],
+          ['상세 프로젝트 이름', '15px', 'my-backend'],
+          ['상세 프로젝트 경로', '14px', '~/projects/my-backend'],
+          ['섹션 제목', '14px', '환경 변수 / API 키'],
+          ['테이블 헤더', '12px', '키 / 값 / 공급자'],
+          ['테이블 입력값', '14px', 'DATABASE_URL · postgres://localhost'],
+          ['버튼 / 배지', '12-16px', '+ 추가 · 4 · token'],
+          ['설정 상세 페이지 제목', '15px', 'Terminal / Local MCP'],
+          ['설정 row 제목', '14px', '폰트 크기 / TLS 원격 서버 사용'],
+          ['설정 row 설명', '13px', '터미널 출력 영역과 입력 composer의 기본 글자 크기'],
+          ['설정 control', '14px', 'AppleGothic · 25 ms · 연결 테스트'],
+        ].map(([area, size, sample], index) => (
+          <div
+            key={area}
+            style={{
+              display: 'contents',
+            }}
+          >
+            <div style={{
+              padding: '7px 9px',
+              borderBottom: index === 13 ? 'none' : `1px solid ${t.border}`,
+              color: t.muted,
+              fontSize: 10,
+            }}>{area}</div>
+            <div style={{
+              padding: '7px 9px',
+              borderLeft: `1px solid ${t.border}`,
+              borderBottom: index === 13 ? 'none' : `1px solid ${t.border}`,
+              color: t.accent,
+              fontSize: 10,
+              fontVariantNumeric: 'tabular-nums',
+            }}>{size}</div>
+            <div style={{
+              padding: '7px 9px',
+              borderLeft: `1px solid ${t.border}`,
+              borderBottom: index === 13 ? 'none' : `1px solid ${t.border}`,
+              color: t.text,
+              fontSize: size === '12-16px' ? 13 : Number(size.replace('px', '')),
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}>{sample}</div>
           </div>
         ))}
       </div>
@@ -689,23 +776,30 @@ function ThemeColumn({ theme }: { theme: Theme }) {
         <TypeToggleDemo active="token" t={t} label="token selected" />
       </Row>
 
-      {/* ── 7. Theme Toggle ── */}
-      <SectionTitle t={t}>07 · Theme Toggle</SectionTitle>
+      {/* ── 7. Switch Toggle ── */}
+      <SectionTitle t={t}>07 · Switch Toggle</SectionTitle>
+      <Row>
+        <SwitchToggleDemo checked t={t} label="on" />
+        <SwitchToggleDemo checked={false} t={t} label="off" />
+      </Row>
+
+      {/* ── 8. Theme Toggle ── */}
+      <SectionTitle t={t}>08 · Theme Toggle</SectionTitle>
       <Row>
         <ThemeToggleDemo active="dark" t={t} label="dark active" />
         <ThemeToggleDemo active="light" t={t} label="light active" />
       </Row>
 
-      {/* ── 8. Badges ── */}
-      <SectionTitle t={t}>08 · Badges &amp; Tags</SectionTitle>
+      {/* ── 9. Badges ── */}
+      <SectionTitle t={t}>09 · Badges &amp; Tags</SectionTitle>
       <Row>
         <BadgeDemo value={4} t={t} label="count (tag bg)" />
         <BadgeDemo value="api_key" t={t} label="type label" />
         <NotifBadge value={2} t={t} label="notification (accent)" />
       </Row>
 
-      {/* ── 9. Nav Items ── */}
-      <SectionTitle t={t}>09 · Nav Items</SectionTitle>
+      {/* ── 10. Nav Items ── */}
+      <SectionTitle t={t}>10 · Nav Items</SectionTitle>
       <Row gap={8}>
         <Cell t={t} label="default">
           <NavItemDemo label="언어" state="default" icon="⊕" t={t} />
@@ -714,21 +808,21 @@ function ThemeColumn({ theme }: { theme: Theme }) {
           <NavItemDemo label="터미널" state="hover" icon="▣" t={t} />
         </Cell>
         <Cell t={t} label="active">
-          <NavItemDemo label="환경 프로필" state="active" icon="▤" t={t} />
+          <NavItemDemo label="환경 설정" state="active" icon="▤" t={t} />
         </Cell>
         <Cell t={t} label="badge">
           <NavItemDemo label="알림" state="default" icon="◍" badge={2} t={t} />
         </Cell>
       </Row>
 
-      {/* ── 10. Section Header ── */}
-      <SectionTitle t={t}>10 · Section Header</SectionTitle>
+      {/* ── 11. Section Header ── */}
+      <SectionTitle t={t}>11 · Section Header</SectionTitle>
       <Row>
         <SectionHeaderDemo label="환경 변수" count={4} t={t} label="with count badge + add btn" />
       </Row>
 
-      {/* ── 11. Project List Item ── */}
-      <SectionTitle t={t}>11 · Project List Item</SectionTitle>
+      {/* ── 12. Project List Item ── */}
+      <SectionTitle t={t}>12 · Project List Item</SectionTitle>
       <Row gap={8}>
         <Cell t={t} label="default">
           <ProjectItemDemo name="frontend-app" path="~/projects/frontend-app" envCount={2} keyCount={1} state="default" t={t} />
@@ -741,8 +835,8 @@ function ThemeColumn({ theme }: { theme: Theme }) {
         </Cell>
       </Row>
 
-      {/* ── 12. Env Var Row ── */}
-      <SectionTitle t={t}>12 · Env Var Row</SectionTitle>
+      {/* ── 13. Env Var Row ── */}
+      <SectionTitle t={t}>13 · Env Var Row</SectionTitle>
       <Row gap={8}>
         <EnvRowDemo keyName="DATABASE_URL" value="postgres://localhost" t={t} label="default" />
         <EnvRowDemo keyName="SECRET_KEY" value="sk-dev-abc123" masked t={t} label="masked" />
@@ -750,15 +844,15 @@ function ThemeColumn({ theme }: { theme: Theme }) {
         <EnvRowDemo keyName="PORT" value="8080" hover t={t} label="hover state" />
       </Row>
 
-      {/* ── 13. API Key Row ── */}
-      <SectionTitle t={t}>13 · API Key Row</SectionTitle>
+      {/* ── 14. API Key Row ── */}
+      <SectionTitle t={t}>14 · API Key Row</SectionTitle>
       <Row gap={8}>
         <ApiRowDemo provider="openai" label="dev key" type="api_key" secret="sk-••••••••••••" t={t} label="api_key" />
         <ApiRowDemo provider="github" label="personal" type="token" secret="ghp_•••••••••" hover t={t} label="token / hover" />
       </Row>
 
-      {/* ── 14. Scrollbar ── */}
-      <SectionTitle t={t}>14 · Scrollbar</SectionTitle>
+      {/* ── 15. Scrollbar ── */}
+      <SectionTitle t={t}>15 · Scrollbar</SectionTitle>
       <Row>
         <ScrollbarDemo t={t} label="3px solid thumb" />
       </Row>
@@ -866,7 +960,7 @@ export default function ComponentGuide() {
       }}>
         <div>
           <div style={{ fontSize: 16, fontWeight: 700, color: t.text, marginBottom: 2 }}>
-            환경 프로필 · Component Guide
+            환경 설정 · Component Guide
           </div>
           <div style={{ fontSize: 10, color: t.muted }}>
             egui constraints · monospace grid · 두 테마 병렬 표시

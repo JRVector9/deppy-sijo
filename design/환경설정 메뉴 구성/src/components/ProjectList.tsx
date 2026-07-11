@@ -18,7 +18,8 @@ export default function ProjectList({ theme, projects, selectedId, onSelect, onA
 
   return (
     <div style={{
-      width: 188,
+      width: 220,
+      minWidth: 220,
       flexShrink: 0,
       display: 'flex',
       flexDirection: 'column',
@@ -29,25 +30,27 @@ export default function ProjectList({ theme, projects, selectedId, onSelect, onA
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'space-between',
-        padding: '8px 10px 6px',
+        height: 42,
+        padding: '0 10px',
         borderBottom: `1px solid ${t.border}`,
+        boxSizing: 'border-box',
       }}>
-        <span style={{ fontSize: 10, color: t.muted, letterSpacing: '0.06em', textTransform: 'uppercase' }}>
+        <span style={{ fontSize: 13, color: t.muted, letterSpacing: '0.06em', textTransform: 'uppercase' }}>
           프로젝트
         </span>
         <button
           onClick={onAdd}
           onMouseEnter={() => setHoveredId('__add')}
           onMouseLeave={() => setHoveredId(null)}
-          style={{
-            background: hoveredId === '__add' ? t.accent : t.input,
-            border: `1px solid ${t.border}`,
-            color: hoveredId === '__add' ? t.accentText : t.muted,
-            fontSize: 13,
-            lineHeight: 1,
+            style={{
+              background: hoveredId === '__add' ? t.accent : t.input,
+              border: `1px solid ${hoveredId === '__add' ? t.accent : t.border}`,
+              color: hoveredId === '__add' ? t.accentText : t.muted,
+              fontSize: 16,
+              lineHeight: 1,
             cursor: 'pointer',
-            width: 18,
-            height: 18,
+              width: 18,
+              height: 18,
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
@@ -62,6 +65,8 @@ export default function ProjectList({ theme, projects, selectedId, onSelect, onA
         {projects.map(proj => {
           const isActive = proj.id === selectedId
           const isHover = hoveredId === proj.id && !isActive
+          const showDelete = isHover || isActive
+          const deleteHover = hoveredDel === proj.id
           return (
             <div
               key={proj.id}
@@ -69,82 +74,103 @@ export default function ProjectList({ theme, projects, selectedId, onSelect, onA
               onMouseEnter={() => setHoveredId(proj.id)}
               onMouseLeave={() => setHoveredId(null)}
               style={{
-                display: 'flex',
+                display: 'grid',
+                gridTemplateColumns: 'minmax(0, 1fr) 52px 22px',
+                gridTemplateRows: '24px 22px',
                 alignItems: 'center',
-                gap: 6,
-                padding: '6px 10px',
+                columnGap: 6,
+                rowGap: 2,
+                minHeight: 76,
+                padding: '10px',
                 cursor: 'pointer',
                 backgroundColor: isActive ? t.navActive : isHover ? t.surfaceHover : 'transparent',
                 borderBottom: `1px solid ${t.border}`,
                 transition: 'background-color 0.08s',
-                position: 'relative',
+                boxSizing: 'border-box',
               }}
             >
-              {/* Folder icon */}
-              <span style={{ fontSize: 11, color: isActive ? t.accent : t.muted, flexShrink: 0 }}>▤</span>
-
-              {/* Project info */}
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{
-                  fontSize: 11,
-                  fontWeight: isActive ? 600 : 400,
-                  color: isActive ? t.text : t.textSecondary,
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                }}>
-                  {proj.name}
-                </div>
-                <div style={{
-                  fontSize: 9,
-                  color: t.muted,
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                  marginTop: 1,
-                  letterSpacing: '0.01em',
-                }}>
-                  {proj.path}
-                </div>
+              <div style={{
+                gridColumn: 1,
+                gridRow: 1,
+                minWidth: 0,
+                fontSize: 14,
+                fontWeight: isActive ? 600 : 400,
+                color: isActive ? t.text : t.textSecondary,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}>
+                {proj.name}
               </div>
-
-              {/* Counts */}
-              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 2, flexShrink: 0 }}>
-                <span style={{ fontSize: 9, color: t.muted }}>{proj.envVars.length}env</span>
-                <span style={{ fontSize: 9, color: t.muted }}>{proj.apiKeys.length}key</span>
+              <div style={{
+                gridColumn: 1,
+                gridRow: 2,
+                minWidth: 0,
+                fontSize: 12,
+                color: isActive ? t.textSecondary : t.muted,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+                letterSpacing: '0.01em',
+              }}>
+                {proj.path}
               </div>
-
-              {/* Delete button (hover only) */}
-              {(isHover || isActive) && (
-                <button
-                  onClick={e => { e.stopPropagation(); onDelete(proj.id) }}
-                  onMouseEnter={() => setHoveredDel(proj.id)}
-                  onMouseLeave={() => setHoveredDel(null)}
-                  style={{
-                    position: 'absolute',
-                    right: 4,
-                    top: 4,
-                    width: 14,
-                    height: 14,
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    background: hoveredDel === proj.id ? t.danger : 'transparent',
-                    border: `1px solid ${hoveredDel === proj.id ? t.danger : t.border}`,
-                    color: hoveredDel === proj.id ? t.dangerText : t.muted,
-                    cursor: 'pointer',
-                    fontSize: 9,
-                    fontFamily: 'inherit',
-                    transition: 'background-color 0.08s',
-                  }}
-                >×</button>
-              )}
+              <span style={{
+                gridColumn: 2,
+                gridRow: 1,
+                justifySelf: 'end',
+                fontSize: 12,
+                color: isActive ? t.textSecondary : t.muted,
+                whiteSpace: 'nowrap',
+                fontVariantNumeric: 'tabular-nums',
+              }}>
+                {proj.envVars.length}env
+              </span>
+              <span style={{
+                gridColumn: 2,
+                gridRow: 2,
+                justifySelf: 'end',
+                fontSize: 12,
+                color: isActive ? t.textSecondary : t.muted,
+                whiteSpace: 'nowrap',
+                fontVariantNumeric: 'tabular-nums',
+              }}>
+                {proj.apiKeys.length}key
+              </span>
+              <button
+                onClick={e => { e.stopPropagation(); onDelete(proj.id) }}
+                onMouseEnter={() => setHoveredDel(proj.id)}
+                onMouseLeave={() => setHoveredDel(null)}
+                aria-label={`${proj.name} 삭제`}
+                style={{
+                  gridColumn: 3,
+                  gridRow: 1,
+                  justifySelf: 'end',
+                  alignSelf: 'center',
+                  width: 22,
+                  height: 20,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  visibility: showDelete ? 'visible' : 'hidden',
+                  pointerEvents: showDelete ? 'auto' : 'none',
+                  background: deleteHover ? t.danger : 'transparent',
+                  border: `1px solid ${deleteHover ? t.danger : t.border}`,
+                  color: deleteHover ? t.dangerText : t.muted,
+                  cursor: 'pointer',
+                  fontSize: 12,
+                  fontFamily: 'inherit',
+                  lineHeight: 1,
+                  padding: 0,
+                  transition: 'background-color 0.08s, color 0.08s, border-color 0.08s',
+                }}
+              >×</button>
             </div>
           )
         })}
 
         {projects.length === 0 && (
-          <div style={{ padding: 12, fontSize: 11, color: t.muted, textAlign: 'center' }}>
+          <div style={{ padding: 12, fontSize: 14, color: t.muted, textAlign: 'center' }}>
             프로젝트 없음
           </div>
         )}

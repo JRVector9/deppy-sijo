@@ -5,7 +5,7 @@ import EnvProfilePanel from './EnvProfilePanel'
 
 type NavItem =
   | '일반' | '언어' | '터미널' | '성능' | '원격 서버 (TLS)'
-  | '자격증명' | '연결 (커넥터)' | '환경 프로필' | '에이전트' | '워크스페이스'
+  | '자격증명' | '연결 (커넥터)' | '환경 설정' | '에이전트' | '워크스페이스'
   | '활동' | '알림'
 
 interface Props {
@@ -15,7 +15,7 @@ interface Props {
 
 export default function SettingsPanel({ theme, onThemeChange }: Props) {
   const t = egui(theme)
-  const [activeNav, setActiveNav] = useState<NavItem>('환경 프로필')
+  const [activeNav, setActiveNav] = useState<NavItem>('환경 설정')
   const [search, setSearch] = useState('')
 
   return (
@@ -59,8 +59,8 @@ export default function SettingsPanel({ theme, onThemeChange }: Props) {
 
         {/* Content area */}
         <div style={{ flex: 1, overflow: 'hidden' }}>
-          {activeNav === '환경 프로필' && <EnvProfilePanel theme={theme} />}
-          {activeNav !== '환경 프로필' && (
+          {activeNav === '환경 설정' && <EnvProfilePanel theme={theme} />}
+          {activeNav !== '환경 설정' && (
             <div style={{ padding: 24, color: t.muted, fontSize: 12 }}>
               {activeNav} 설정 패널
             </div>

@@ -61,7 +61,7 @@ export default function ProjectDetail({ theme, project, onChange }: Props) {
   }
 
   const inputStyle = {
-    fontSize: 11,
+    fontSize: 14,
     fontFamily: 'inherit',
     backgroundColor: t.input,
     border: `1px solid ${t.inputBorder}`,
@@ -80,7 +80,7 @@ export default function ProjectDetail({ theme, project, onChange }: Props) {
       }}>
         {/* Name row */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-          <span style={{ fontSize: 10, color: t.muted, width: 34, flexShrink: 0 }}>이름</span>
+          <span style={{ fontSize: 13, color: t.muted, width: 34, flexShrink: 0 }}>이름</span>
           {editingName ? (
             <input
               autoFocus
@@ -93,7 +93,7 @@ export default function ProjectDetail({ theme, project, onChange }: Props) {
           ) : (
             <span
               onClick={() => setEditingName(true)}
-              style={{ fontSize: 12, fontWeight: 600, color: t.text, cursor: 'text', flex: 1 }}
+              style={{ fontSize: 15, fontWeight: 600, color: t.text, cursor: 'text', flex: 1 }}
             >
               {project.name}
             </span>
@@ -101,7 +101,7 @@ export default function ProjectDetail({ theme, project, onChange }: Props) {
         </div>
         {/* Path row */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <span style={{ fontSize: 10, color: t.muted, width: 34, flexShrink: 0 }}>경로</span>
+          <span style={{ fontSize: 13, color: t.muted, width: 34, flexShrink: 0 }}>경로</span>
           {editingPath ? (
             <input
               autoFocus
@@ -114,7 +114,7 @@ export default function ProjectDetail({ theme, project, onChange }: Props) {
           ) : (
             <span
               onClick={() => setEditingPath(true)}
-              style={{ fontSize: 11, color: t.muted, cursor: 'text', flex: 1, letterSpacing: '0.01em' }}
+              style={{ fontSize: 14, color: t.muted, cursor: 'text', flex: 1, letterSpacing: '0.01em' }}
             >
               {project.path}
             </span>
@@ -160,9 +160,9 @@ function SectionHeader({ label, count, onAdd, theme }: { label: string; count: n
       marginBottom: 0,
     }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-        <span style={{ fontSize: 11, fontWeight: 600, color: t.text, letterSpacing: '0.02em' }}>{label}</span>
+        <span style={{ fontSize: 14, fontWeight: 600, color: t.text, letterSpacing: '0.02em' }}>{label}</span>
         <span style={{
-          fontSize: 9,
+          fontSize: 12,
           padding: '1px 5px',
           backgroundColor: t.tag,
           color: t.tagText,
@@ -174,7 +174,7 @@ function SectionHeader({ label, count, onAdd, theme }: { label: string; count: n
         onMouseEnter={() => setHover(true)}
         onMouseLeave={() => setHover(false)}
         style={{
-          fontSize: 10,
+          fontSize: 13,
           padding: '2px 8px',
           fontFamily: 'inherit',
           cursor: 'pointer',
@@ -208,14 +208,14 @@ function EnvVarTable({ theme, vars, onUpdate, onDelete }: {
 
   if (vars.length === 0) {
     return (
-      <div style={{ padding: '8px 0', fontSize: 11, color: t.muted }}>
+      <div style={{ padding: '8px 0', fontSize: 14, color: t.muted }}>
         저장된 환경 변수가 없습니다.
       </div>
     )
   }
 
   const inputBase = {
-    fontSize: 11,
+    fontSize: 14,
     fontFamily: 'inherit',
     backgroundColor: 'transparent',
     border: 'none',
@@ -237,7 +237,7 @@ function EnvVarTable({ theme, vars, onUpdate, onDelete }: {
         borderBottom: `1px solid ${t.border}`,
       }}>
         {['키', '값', '', ''].map((h, i) => (
-          <span key={i} style={{ fontSize: 9, color: t.muted, letterSpacing: '0.05em', textTransform: 'uppercase' }}>{h}</span>
+          <span key={i} style={{ fontSize: 12, color: t.muted, letterSpacing: '0.05em', textTransform: 'uppercase' }}>{h}</span>
         ))}
       </div>
 
@@ -282,7 +282,7 @@ function EnvVarTable({ theme, vars, onUpdate, onDelete }: {
                 background: 'transparent',
                 border: `1px solid ${isHover ? t.border : 'transparent'}`,
                 color: v.masked ? t.accent : t.muted,
-                fontSize: 10,
+                fontSize: 13,
                 fontFamily: 'inherit',
                 display: 'flex',
                 alignItems: 'center',
@@ -299,7 +299,7 @@ function EnvVarTable({ theme, vars, onUpdate, onDelete }: {
                 background: 'transparent',
                 border: `1px solid ${isHover ? t.border : 'transparent'}`,
                 color: t.muted,
-                fontSize: 11,
+                fontSize: 14,
                 fontFamily: 'inherit',
                 display: 'flex',
                 alignItems: 'center',
@@ -333,14 +333,14 @@ function ApiKeyTable({ theme, keys, onUpdate, onDelete }: {
 
   if (keys.length === 0) {
     return (
-      <div style={{ padding: '8px 0', fontSize: 11, color: t.muted }}>
+      <div style={{ padding: '8px 0', fontSize: 14, color: t.muted }}>
         저장된 API 키가 없습니다.
       </div>
     )
   }
 
   const inputBase = {
-    fontSize: 11,
+    fontSize: 14,
     fontFamily: 'inherit',
     backgroundColor: 'transparent',
     border: 'none',
@@ -361,7 +361,7 @@ function ApiKeyTable({ theme, keys, onUpdate, onDelete }: {
         borderBottom: `1px solid ${t.border}`,
       }}>
         {['공급자', '라벨', '종류', '비밀키', ''].map((h, i) => (
-          <span key={i} style={{ fontSize: 9, color: t.muted, letterSpacing: '0.05em', textTransform: 'uppercase' }}>{h}</span>
+          <span key={i} style={{ fontSize: 12, color: t.muted, letterSpacing: '0.05em', textTransform: 'uppercase' }}>{h}</span>
         ))}
       </div>
 
@@ -398,7 +398,7 @@ function ApiKeyTable({ theme, keys, onUpdate, onDelete }: {
             <button
               onClick={() => onUpdate(k.id, 'type', k.type === 'api_key' ? 'token' : 'api_key')}
               style={{
-                fontSize: 9,
+                fontSize: 12,
                 padding: '2px 5px',
                 cursor: 'pointer',
                 fontFamily: 'inherit',
@@ -426,7 +426,7 @@ function ApiKeyTable({ theme, keys, onUpdate, onDelete }: {
                   background: 'transparent',
                   border: `1px solid ${isHover ? t.border : 'transparent'}`,
                   color: show ? t.accent : t.muted,
-                  fontSize: 9,
+                  fontSize: 12,
                   fontFamily: 'inherit',
                   flexShrink: 0,
                   display: 'flex',
@@ -445,7 +445,7 @@ function ApiKeyTable({ theme, keys, onUpdate, onDelete }: {
                 background: 'transparent',
                 border: `1px solid ${isHover ? t.border : 'transparent'}`,
                 color: t.muted,
-                fontSize: 11,
+                fontSize: 14,
                 fontFamily: 'inherit',
                 display: 'flex',
                 alignItems: 'center',

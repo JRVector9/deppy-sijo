@@ -1,6 +1,7 @@
 //! MCP 서버 import 파서 (커넥터 센터 — JSON 붙여넣기 · 파일 · Claude Desktop 설정).
-//! 생태계 표준 `mcpServers` JSON 블록을 파싱해 stdio 서버 등록 후보로 변환한다.
-//! v0는 stdio only(§1.5) — url/type이 HTTP 계열인 항목은 이유와 함께 건너뛴다.
+//! 생태계 표준 `mcpServers` JSON 블록을 파싱해 stdio/http 서버 등록 후보로 변환한다.
+//! http/streamable-http 계열(+url만 있는 항목)은 url 매핑으로 등록하고(H3),
+//! legacy `sse` transport만 이유와 함께 건너뛴다 (구 HTTP+SSE는 미지원 — 계획 §차용 안 함 #1).
 //! secret-like env 값은 저장하지 않고 제외 키 목록으로 보고한다 (credential binding 유도).
 
 use anyhow::Context;
@@ -19,13 +20,23 @@ pub struct ParsedServer {
     pub skipped_env: Vec<String>,
 }
 
+/// 파싱된 http(Streamable HTTP) 서버 1개 (등록 후보) — H3.
+/// URL 정책 검증(https/localhost)은 등록 직전 호출측(connectors) 몫이다.
+#[derive(Debug, PartialEq)]
+pub struct ParsedHttpServer {
+    pub name: String,
+    pub url: String,
+}
+
 /// 항목을 건너뛴 이유.
 #[derive(Debug, PartialEq)]
 pub enum SkipReason {
-    /// url 또는 type이 HTTP 계열 — Streamable HTTP는 v1 (§1.5)
-    HttpTransport,
+    /// type이 legacy `sse` — 구 HTTP+SSE transport는 미지원 (Streamable HTTP만 지원)
+    LegacySse,
     /// command가 없거나 비어 있음
     MissingCommand,
+    /// http 계열인데 url이 없거나 비어 있음
+    MissingUrl,
     /// 항목 형식이 스펙과 다름 (파싱 에러 메시지)
     Invalid(String),
 }
@@ -39,6 +50,8 @@ pub struct SkippedServer {
 #[derive(Debug, Default, PartialEq)]
 pub struct ImportParse {
     pub servers: Vec<ParsedServer>,
+    /// url 매핑으로 등록할 http 계열 서버 (H3)
+    pub http_servers: Vec<ParsedHttpServer>,
     pub skipped: Vec<SkippedServer>,
 }
 
@@ -74,16 +87,30 @@ pub fn parse_mcp_servers_json(text: &str) -> anyhow::Result<ImportParse> {
             }
         };
         let kind = raw.kind.as_deref().unwrap_or("").to_ascii_lowercase();
-        if raw.url.is_some()
-            || matches!(
-                kind.as_str(),
-                "http" | "sse" | "streamable-http" | "streamable_http"
-            )
-        {
+        // legacy `sse`는 계속 스킵 — 구 HTTP+SSE transport는 미지원 (계획 §차용 안 함 #1).
+        if kind == "sse" {
             parse.skipped.push(SkippedServer {
                 name: name.clone(),
-                reason: SkipReason::HttpTransport,
+                reason: SkipReason::LegacySse,
             });
+            continue;
+        }
+        // http 계열 kind 또는 (명시적 stdio가 아닌데) url이 있는 항목 → url 매핑 등록 (H3).
+        let http_kind = matches!(
+            kind.as_str(),
+            "http" | "streamable-http" | "streamable_http"
+        );
+        if http_kind || (raw.url.is_some() && kind != "stdio") {
+            match raw.url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+                Some(url) => parse.http_servers.push(ParsedHttpServer {
+                    name: name.clone(),
+                    url: url.to_owned(),
+                }),
+                None => parse.skipped.push(SkippedServer {
+                    name: name.clone(),
+                    reason: SkipReason::MissingUrl,
+                }),
+            }
             continue;
         }
         let Some(command) = raw.command.filter(|c| !c.trim().is_empty()) else {
@@ -179,24 +206,71 @@ mod tests {
     }
 
     #[test]
-    fn http_항목은_v1_사유로_건너뜀() {
+    fn http_항목은_url로_등록되고_sse만_건너뜀() {
+        // 기존 `http_항목은_v1_사유로_건너뜀` 대체 (H3): http 계열은 url 매핑 등록.
         let parse = parse_mcp_servers_json(
             r#"{"mcpServers": {
                 "remote": {"url": "https://mcp.example.com"},
-                "typed": {"type": "http", "command": "ignored"},
+                "typed": {"type": "http", "url": "https://typed.example.com", "command": "ignored"},
+                "snake": {"type": "streamable_http", "url": "https://snake.example.com"},
+                "dash": {"type": "streamable-http", "url": " https://dash.example.com "},
+                "legacy": {"type": "sse", "url": "https://old.example.com"},
                 "local": {"command": "npx"}
             }}"#,
         )
         .unwrap();
         assert_eq!(parse.servers.len(), 1);
         assert_eq!(parse.servers[0].name, "local");
+        let mut https: Vec<(&str, &str)> = parse
+            .http_servers
+            .iter()
+            .map(|s| (s.name.as_str(), s.url.as_str()))
+            .collect();
+        https.sort();
+        assert_eq!(
+            https,
+            [
+                ("dash", "https://dash.example.com"), // 공백 trim
+                ("remote", "https://mcp.example.com"),
+                ("snake", "https://snake.example.com"),
+                ("typed", "https://typed.example.com"),
+            ]
+        );
+        // legacy sse만 스킵
+        assert_eq!(parse.skipped.len(), 1);
+        assert_eq!(parse.skipped[0].name, "legacy");
+        assert_eq!(parse.skipped[0].reason, SkipReason::LegacySse);
+    }
+
+    #[test]
+    fn http_계열인데_url_없으면_건너뜀() {
+        let parse = parse_mcp_servers_json(
+            r#"{"mcpServers": {
+                "nourl": {"type": "http"},
+                "blank": {"type": "streamable-http", "url": "  "}
+            }}"#,
+        )
+        .unwrap();
+        assert!(parse.servers.is_empty());
+        assert!(parse.http_servers.is_empty());
         assert_eq!(parse.skipped.len(), 2);
         assert!(
             parse
                 .skipped
                 .iter()
-                .all(|s| s.reason == SkipReason::HttpTransport)
+                .all(|s| s.reason == SkipReason::MissingUrl)
         );
+    }
+
+    #[test]
+    fn 명시적_stdio_kind는_url이_있어도_stdio로_판정() {
+        let parse = parse_mcp_servers_json(
+            r#"{"mcpServers": {"s": {"type": "stdio", "command": "npx", "url": "https://x"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(parse.servers.len(), 1);
+        assert!(parse.http_servers.is_empty());
+        assert!(parse.skipped.is_empty());
     }
 
     #[test]

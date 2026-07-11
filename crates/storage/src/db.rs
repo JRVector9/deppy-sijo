@@ -1093,6 +1093,12 @@ impl Db {
         mcp_store::insert_server(&self.conn, row)
     }
 
+    /// http MCP 서버의 url 갱신 (H3). 호출측(UI)이 Allow 규칙 초기화 +
+    /// mcp_tools 캐시 무효화 + 최초 연결 재확인을 함께 수행한다.
+    pub fn update_mcp_server_url(&self, server_id: &str, url: &str) -> anyhow::Result<()> {
+        mcp_store::update_server_url(&self.conn, server_id, url)
+    }
+
     /// 연결 테스트로 발견한 tools를 교체 저장 (PR-17).
     pub fn replace_mcp_tools(
         &mut self,

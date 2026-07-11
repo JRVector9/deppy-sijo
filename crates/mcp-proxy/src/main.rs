@@ -12,12 +12,12 @@ mod forwarder;
 mod hook;
 
 use anyhow::Context;
-use mcp::{LocalMcpManager, McpServerConfig, run_proxy};
+use mcp::{LocalMcpManager, McpHttpServerConfig, McpServerConfig, run_proxy, validate_mcp_url};
 use mcp_store::McpServerRow;
 use secret::{KeyringSecretStore, RedactionService, SecretStore};
 
 use crate::cli::Cli;
-use crate::forwarder::ManagerToolForwarder;
+use crate::forwarder::{BackendConfig, ManagerToolForwarder};
 use crate::hook::DbPermissionHook;
 
 /// orphan 판정 컷오프(초): created_at이 (now - 이 값)보다 오래된 pending은 죽은 프록시가
@@ -317,30 +317,47 @@ fn unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// McpServerRow → LocalMcpManager가 spawn할 McpServerConfig.
-/// v0는 stdio kind + command 필수 (§1.5).
+/// McpServerRow → kind별 BackendConfig (H3): stdio는 command 필수 + scoped env 해석,
+/// http는 url 필수 + 시작 시점 URL 정책 검증(https/localhost — 연결 때도 재검증된다).
+/// http bearer는 H3에서 항상 None — credential 연동(401 사다리)은 H5 소관.
 fn server_config(
     row: &McpServerRow,
     secret_store: Option<&dyn SecretStore>,
     redaction: &RedactionService,
-) -> anyhow::Result<McpServerConfig> {
-    anyhow::ensure!(
-        row.kind == "stdio",
-        "서버 '{}'의 kind가 '{}' — v0 프록시는 stdio만 지원",
-        row.id,
-        row.kind
-    );
-    let command = row
-        .command
-        .clone()
-        .with_context(|| format!("stdio 서버 '{}'에 command가 없음", row.id))?;
-    Ok(McpServerConfig {
-        name: row.name.clone(),
-        command,
-        args: row.args.clone(),
-        env: resolve_server_env(row, secret_store, redaction)?,
-        inherit_env: row.inherit_env,
-    })
+) -> anyhow::Result<BackendConfig> {
+    match row.kind.as_str() {
+        "stdio" => {
+            let command = row
+                .command
+                .clone()
+                .with_context(|| format!("stdio 서버 '{}'에 command가 없음", row.id))?;
+            Ok(BackendConfig::Stdio(McpServerConfig::stdio(
+                row.name.clone(),
+                command,
+                row.args.clone(),
+                resolve_server_env(row, secret_store, redaction)?,
+                row.inherit_env,
+            )))
+        }
+        "http" => {
+            let url = row
+                .url
+                .clone()
+                .with_context(|| format!("http 서버 '{}'에 url이 없음", row.id))?;
+            validate_mcp_url(&url)
+                .with_context(|| format!("http 서버 '{}' url 정책 위반", row.id))?;
+            Ok(BackendConfig::Http(McpHttpServerConfig {
+                name: row.name.clone(),
+                url,
+                bearer: None,
+            }))
+        }
+        other => anyhow::bail!(
+            "서버 '{}'의 kind가 '{}' — 프록시는 stdio|http만 지원",
+            row.id,
+            other
+        ),
+    }
 }
 
 fn resolve_server_env(

@@ -1,3 +1,6 @@
 /target
 .DS_Store
 sijo_font.png
+
+# 디자인 목업(Figma)의 의존성 — 잠금 파일(pnpm-lock)로 재현되므로 추적하지 않는다
+node_modules/

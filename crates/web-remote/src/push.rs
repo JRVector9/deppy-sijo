@@ -400,10 +400,10 @@ impl BroadcastOutcome {
 enum Notification {
     /// pending 승인 — 개수 포함.
     Approval { count: usize },
-    /// 세션 완료.
-    SessionDone,
-    /// 세션 입력 대기.
-    SessionWaiting,
+    /// 세션 완료 — 딥링크용 세션 id 포함 (P6c).
+    SessionDone { session: u64 },
+    /// 세션 입력 대기 — 딥링크용 세션 id 포함 (P6c).
+    SessionWaiting { session: u64 },
 }
 
 impl Notification {
@@ -416,15 +416,19 @@ impl Notification {
                 "count": count,
                 "tag": "deppy-approval",
             }),
-            Notification::SessionDone => serde_json::json!({
+            // session id는 딥링크(알림 탭 → 그 세션 화면)용 — 민감정보 아님(worker-로컬
+            // 순번). 클라이언트는 대시보드에 실재하는 id일 때만 자동 시청한다 (P6c).
+            Notification::SessionDone { session } => serde_json::json!({
                 "kind": "done",
                 "title": "세션 완료",
                 "tag": "deppy-session",
+                "session": session,
             }),
-            Notification::SessionWaiting => serde_json::json!({
+            Notification::SessionWaiting { session } => serde_json::json!({
                 "kind": "waiting",
                 "title": "입력 대기",
                 "tag": "deppy-session",
+                "session": session,
             }),
         }
         .to_string()
@@ -689,8 +693,12 @@ fn run(shared: &Arc<PushShared>) {
                 continue;
             }
             let note = match job.kind {
-                SessionKind::Done => Notification::SessionDone,
-                SessionKind::Waiting => Notification::SessionWaiting,
+                SessionKind::Done => Notification::SessionDone {
+                    session: job.session,
+                },
+                SessionKind::Waiting => Notification::SessionWaiting {
+                    session: job.session,
+                },
             };
             let outcome = broadcast(shared, &note);
             let attempts = job.attempts + 1;
@@ -1160,6 +1168,20 @@ mod tests {
     const RFC_NONCE: &str = "4h_95klXJ5E_qnoN";
     /// RFC 8291 §5의 전체 본문(헤더‖암호문, Content-Length 145) — base64url 무패딩.
     const RFC_BODY: &str = "DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A_yl95bQpu6cVPTpK4Mqgkf1CXztLVBSt2Ks3oZwbuwXPXLWyouBWLVWGNWQexSgSxsj_Qulcy4a-fN";
+
+    /// P6c: 세션 알림 페이로드에 딥링크용 session id가 실린다(승인 알림에는 없다).
+    #[test]
+    fn 세션_알림_페이로드는_딥링크용_세션_id를_싣는다() {
+        let done = Notification::SessionDone { session: 7 }.payload();
+        assert!(done.contains(r#""session":7"#), "{done}");
+        assert!(done.contains(r#""kind":"done""#), "{done}");
+        let waiting = Notification::SessionWaiting { session: 42 }.payload();
+        assert!(waiting.contains(r#""session":42"#), "{waiting}");
+        // 승인 알림은 세션 개념이 없다 — 개수만
+        let approval = Notification::Approval { count: 3 }.payload();
+        assert!(!approval.contains("session"), "{approval}");
+        assert!(approval.contains(r#""count":3"#), "{approval}");
+    }
 
     fn ub(s: &str) -> Vec<u8> {
         decode_b64_loose(s).unwrap()

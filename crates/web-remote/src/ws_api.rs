@@ -29,9 +29,13 @@ const PING_INTERVAL: Duration = Duration::from_secs(15);
 /// 소켓 read 데드라인(tick). 이 주기로 깨어 발행 스냅샷 push/ping을 확인한다 —
 /// 승인/상태 반영 ≤1s 요건을 여유 있게 만족(≈3 tick/s, 유휴 CPU 미미).
 const WS_TICK: Duration = Duration::from_millis(300);
-/// 클라이언트 텍스트 프레임 상한(제어 메시지만 — 큰 페이로드 거부). 입력/붙여넣기(P5)가
-/// 생기면 별도 상한으로 확장한다.
+/// 인증 프레임 상한(제어 메시지 — 큰 페이로드 거부).
 const MAX_CLIENT_FRAME_BYTES: usize = 64 * 1024;
+/// 인증 후 프레임 상한 (P6a — Input/붙여넣기 포함). JSON 이스케이프 오버헤드를
+/// 감안해 텍스트 상한(256KB)보다 넉넉히, tungstenite 상한(1MB)보다 작게.
+const MAX_INPUT_FRAME_BYTES: usize = 512 * 1024;
+/// Input 텍스트 바이트 상한 — 초과는 조용히 버리고 로그만(클라도 같은 상한을 건다).
+const MAX_INPUT_TEXT_BYTES: usize = 256 * 1024;
 /// tungstenite 프레임/메시지 크기 상한 — 기본(16MB/64MB) 대신 1MB로 낮춰 인증 전 대용량
 /// 프레임의 메모리 점유를 유계로 둔다. 서버 대시보드/승인 프레임은 이보다 훨씬 작다.
 const WS_SIZE_CAP: usize = 1024 * 1024;
@@ -202,6 +206,8 @@ fn stream_loop(
     // watch 전환·RequestKeyframe에서 리셋한다 (remote.rs §4.4-5 관례).
     let mut viewport_seq = 0u64;
     let mut baseline: Option<std::sync::Arc<runtime::TerminalViewportSnapshot>> = None;
+    // 입력 큐 압박 버전 (P6a) — watch 전환 시 리셋.
+    let mut pressure_ver = 0u64;
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -235,6 +241,15 @@ fn stream_loop(
             viewport_seq = seq;
             baseline = Some(snapshot);
         }
+        // 입력 큐 압박 push (P6a) — composer 전송 버튼 게이트 신호.
+        if let Some(session) = watch.watched
+            && let Some((version, json)) = dashboard.input_pressure_if_newer(session, pressure_ver)
+        {
+            if ws.send(Message::Text(json.into())).is_err() {
+                return;
+            }
+            pressure_ver = version;
+        }
 
         // keepalive ping(serve 프록시 idle 절단 대응).
         if last_ping.elapsed() >= PING_INTERVAL {
@@ -247,7 +262,7 @@ fn stream_loop(
         // 클라 메시지 한 건 처리(없으면 tick 타임아웃).
         match ws.read() {
             Ok(Message::Text(text)) => {
-                if text.len() <= MAX_CLIENT_FRAME_BYTES {
+                if text.len() <= MAX_INPUT_FRAME_BYTES {
                     match ClientMsg::parse(text.as_str()) {
                         Some(ClientMsg::Resolve {
                             id,
@@ -260,11 +275,13 @@ fn stream_loop(
                             watch.set(Some(session));
                             viewport_seq = 0;
                             baseline = None;
+                            pressure_ver = 0;
                         }
                         Some(ClientMsg::Unwatch) => {
                             watch.set(None);
                             viewport_seq = 0;
                             baseline = None;
+                            pressure_ver = 0;
                         }
                         // 클라 렌더 상태 파손 — baseline을 버려 다음 프레임을 keyframe으로.
                         // seq도 리셋해 같은 슬롯(seq 불변)이라도 즉시 재전송되게 한다 (P5c).
@@ -282,6 +299,25 @@ fn stream_loop(
                         Some(ClientMsg::Scroll { session, delta }) => {
                             if watch.watched == Some(session) {
                                 dashboard.send_scroll(session, delta);
+                            }
+                        }
+                        // 자유 텍스트 입력 (P6a) — 시청 중 세션에만. 정규화/제어문자
+                        // strip/bracketed wrap은 브리지가 한다. 상한 초과는 버리고 로그만
+                        // (클라이언트가 같은 상한을 선제 적용 — 정상 경로에서 비발현).
+                        Some(ClientMsg::Input {
+                            session,
+                            text,
+                            submit,
+                        }) => {
+                            if watch.watched == Some(session) {
+                                if text.len() <= MAX_INPUT_TEXT_BYTES {
+                                    dashboard.send_input(session, &text, submit);
+                                } else {
+                                    tracing::warn!(
+                                        len = text.len(),
+                                        "web-remote: Input 텍스트 상한 초과 — 무시"
+                                    );
+                                }
                             }
                         }
                         Some(ClientMsg::Auth { .. }) | None => {}

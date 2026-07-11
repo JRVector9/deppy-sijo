@@ -180,6 +180,13 @@
       case 'viewport':
         handleViewport(msg);
         break;
+      case 'input_pressure':
+        // PTY 입력 큐 압박 — 해소(queued=0)까지 전송 차단 (P6b).
+        if (msg.session !== viewer.watching) break;
+        inputBlocked = (msg.queued || 0) > 0 || msg.reason === 'too_large';
+        setComposerNote(inputBlocked ? '입력 대기열이 찼습니다 — 잠시 후 다시 시도하세요' : '');
+        updateComposerEnabled();
+        break;
       case 'error':
         setStatus('bad', '오류: ' + (msg.message || ''));
         break;
@@ -208,6 +215,9 @@
     viewer.screen = null;
     resetScroll();
     updateScrollNote();
+    inputBlocked = false;
+    setComposerNote('');
+    updateComposerEnabled();
     viewer.label.textContent = title || ('세션 ' + sessionId);
     viewer.el.hidden = false;
     send({ type: 'watch', session: sessionId });
@@ -220,6 +230,9 @@
     viewer.screen = null;
     resetScroll();
     updateScrollNote();
+    inputBlocked = false;
+    setComposerNote('');
+    updateComposerEnabled();
     viewer.el.hidden = true;
     send({ type: 'unwatch' });
   }
@@ -358,9 +371,92 @@
     send({ type: 'key', session: viewer.watching, key });
   }
 
+  // ── composer (P6b) — 자유 입력. 행동 계약:
+  //   1) 입력은 항상 "시청 중인 세션"에만 간다(서버도 강제).
+  //   2) 전송 시점에 target을 캡처한다 — 전송 중 세션이 바뀌어도 캡처된 세션으로만 간다.
+  //   3) 전송 실패(WS 미연결)면 draft를 비우지 않는다.
+  //   4) 큐 압박(InputPressure) 중에는 전송을 막고 배지로 알린다.
+  const MAX_INPUT_BYTES = 256 * 1024; // 서버 상한과 동일
+  const composerText = document.getElementById('composer-text');
+  const composerSend = document.getElementById('composer-send');
+  const composerNote = document.getElementById('composer-note');
+  let inputBlocked = false;
+
+  function autoGrow() {
+    composerText.style.height = 'auto';
+    // 최대 5행 — 그 이상은 내부 스크롤
+    const max = 5 * 22 + 16;
+    composerText.style.height = Math.min(composerText.scrollHeight, max) + 'px';
+  }
+
+  function setComposerNote(text) {
+    composerNote.hidden = !text;
+    if (text) composerNote.textContent = text;
+  }
+
+  function updateComposerEnabled() {
+    const disabled = viewer.watching == null || inputBlocked;
+    composerSend.disabled = disabled;
+    composerText.disabled = viewer.watching == null;
+  }
+
+  function sendComposer() {
+    // (2) 전송 시점 target 캡처 — 이후 전환돼도 이 세션으로만 간다.
+    const target = viewer.watching;
+    if (target == null || inputBlocked) return;
+    const text = composerText.value;
+    if (!text) return;
+    if (new Blob([text]).size > MAX_INPUT_BYTES) {
+      setComposerNote('입력이 너무 큽니다 (256KB 초과)');
+      return;
+    }
+    // (3) 전송 실패면 draft 유지 — send()가 false를 준다(WS 미연결).
+    if (!send({ type: 'input', session: target, text, submit: true })) {
+      setComposerNote('연결이 끊겼습니다 — 재연결 후 다시 전송하세요');
+      return;
+    }
+    setComposerNote('');
+    composerText.value = '';
+    autoGrow();
+  }
+
+  composerText.addEventListener('input', autoGrow);
+  composerText.addEventListener('keydown', (e) => {
+    // 모바일: Enter는 줄바꿈(오전송 방지). 데스크톱 브라우저: Cmd/Ctrl-Enter로 전송.
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      sendComposer();
+    }
+  });
+  composerSend.addEventListener('click', sendComposer);
+
+  // 특수키 행 — 누르는 즉시 전송(composer 미경유). 화살표는 길게 눌러 반복.
+  for (const btn of document.querySelectorAll('.viewer-keys button')) {
+    const key = btn.dataset.key;
+    let repeatTimer = null;
+    let repeatInterval = null;
+    const stopRepeat = () => {
+      clearTimeout(repeatTimer);
+      clearInterval(repeatInterval);
+      repeatTimer = null;
+      repeatInterval = null;
+    };
+    btn.addEventListener('click', () => sendKey(key));
+    if (key === 'up' || key === 'down' || key === 'left' || key === 'right') {
+      const startRepeat = () => {
+        stopRepeat();
+        repeatTimer = setTimeout(() => {
+          repeatInterval = setInterval(() => sendKey(key), 120);
+        }, 400);
+      };
+      btn.addEventListener('pointerdown', startRepeat);
+      for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) {
+        btn.addEventListener(ev, stopRepeat);
+      }
+    }
+  }
+
   document.getElementById('viewer-close').addEventListener('click', closeViewer);
-  document.getElementById('viewer-ctrl-c').addEventListener('click', () => sendKey('ctrl_c'));
-  document.getElementById('viewer-enter').addEventListener('click', () => sendKey('enter'));
   // 회전/리사이즈 시 현재 화면 모델로 canvas를 다시 맞춘다 — 다음 프레임을 기다리지
   // 않는다 (유휴 세션이면 무기한 옛 폭 고정, P5 리뷰 P3). screen 없으면 no-op.
   window.addEventListener('resize', () => drawScreen());
@@ -411,6 +507,9 @@
     remember.appendChild(document.createTextNode(' 이 결정을 기억(규칙으로 저장)'));
     card.appendChild(remember);
 
+    // 참고(P6c): 승인 카드에서 "화면 보기"(그 세션 시청)는 pending_approvals 행에
+    // 세션 id가 없어 배선하지 못했다 — proxy가 승인을 등록할 때 세션을 기록해야 한다
+    // (DB 컬럼 추가 필요, 백로그). 세션 알림 딥링크는 정상 동작한다.
     const actions = document.createElement('div');
     actions.className = 'actions';
     const deny = document.createElement('button');
@@ -435,7 +534,42 @@
     for (const btn of card.querySelectorAll('button')) btn.disabled = true;
   }
 
+  // ── 알림 딥링크 (P6c) — 알림 탭 → 그 세션 화면. 세션 id는 worker-로컬(재시작 시
+  // 재배정)이라, 대시보드에 실재하는 id일 때만 자동 시청한다(스테일 알림 방어).
+  let pendingWatch = null;
+  {
+    const watchParam = Number(params.get('watch'));
+    if (Number.isInteger(watchParam) && watchParam > 0) {
+      pendingWatch = watchParam;
+      history.replaceState(null, '', location.pathname); // URL 위생
+    }
+  }
+  if ('serviceWorker' in navigator) {
+    // 이미 열린 창에 알림 클릭이 도착한 경우 — SW가 postMessage로 전달한다.
+    navigator.serviceWorker.addEventListener('message', (event) => {
+      const msg = event.data;
+      if (msg && msg.type === 'watch' && Number.isInteger(msg.session)) {
+        pendingWatch = msg.session;
+        consumePendingWatch(lastSessions);
+      }
+    });
+  }
+
+  let lastSessions = [];
+
+  /// 딥링크 대상이 현재 세션 목록에 있으면 시청을 시작한다(1회성).
+  function consumePendingWatch(sessions) {
+    if (pendingWatch == null) return false;
+    const target = sessions.find((s) => s.id === pendingWatch);
+    if (!target) return false;
+    const id = pendingWatch;
+    pendingWatch = null;
+    openViewer(id, target.title || ('세션 ' + id));
+    return true;
+  }
+
   function renderSessions(sessions, resource) {
+    lastSessions = sessions;
     sessionsEmpty.hidden = sessions.length > 0;
     sessionsEl.textContent = '';
     for (const s of sessions) {
@@ -472,6 +606,8 @@
     } else {
       resourceEl.textContent = '';
     }
+    // 알림 딥링크 대기분이 있으면 목록 도착 시점에 소비한다 (P6c).
+    consumePendingWatch(sessions);
   }
 
   // P3: iOS 설치 안내 — iOS Safari이고 아직 설치(standalone) 전일 때만 노출. 닫으면 억제한다.

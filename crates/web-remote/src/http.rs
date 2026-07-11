@@ -169,9 +169,11 @@ fn reason(status: u16) -> &'static str {
 /// WebKit(iOS 타깃) 버전의 ws 스킴 매칭 이슈를 피하려 명시한다. HTTP 캐시는
 /// no-cache — 셸 캐싱은 SW가 담당한다(버전 키 갱신은 P3).
 pub fn write_response(stream: &mut impl Write, response: &Response) -> std::io::Result<()> {
+    // Referrer-Policy/Permissions-Policy는 심층 방어 (P6a — deppy-mux 비교 차용):
+    // 토큰이 실린 URL의 외부 유출 축소 + 불필요 기기 권한 원천 차단.
     write!(
         stream,
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-cache\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'self'; connect-src 'self'; frame-ancestors 'none'\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-cache\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: strict-origin-when-cross-origin\r\nPermissions-Policy: camera=(), microphone=(), geolocation=()\r\nContent-Security-Policy: default-src 'self'; connect-src 'self'; frame-ancestors 'none'\r\n\r\n",
         response.status,
         reason(response.status),
         response.content_type,

@@ -115,6 +115,36 @@ h1 { font-size: 19px; font-weight: 600; color: #f0f0f0; }
 }
 .viewer-actions .viewer-close { margin-left: auto; background: #2a2a2a; color: #9a9a9a; }
 
+/* 특수키 행 (P6b) — 가로 스크롤 가능, 터치 타깃 44px 이상 */
+.viewer-keys {
+  display: flex; gap: 6px; margin-top: 10px; overflow-x: auto;
+  -webkit-overflow-scrolling: touch; padding-bottom: 2px;
+}
+.viewer-keys button {
+  flex: none; min-width: 46px; min-height: 44px; padding: 0 10px;
+  font-size: 14px; font-weight: 600; border-radius: 8px;
+  background: #2f2f2f; color: #d8d8d8; border: 1px solid #474747; cursor: pointer;
+}
+.viewer-keys button:active { background: #3d4d5e; }
+
+/* composer (P6b) */
+.composer { display: flex; gap: 8px; align-items: flex-end; margin-top: 10px; }
+.composer textarea {
+  flex: 1; min-height: 44px; max-height: 130px; resize: none;
+  padding: 10px 12px; border-radius: 9px; line-height: 22px;
+  background: #1b1b1b; color: #e4e4e4; border: 1px solid #454545;
+  font-family: inherit; font-size: 15px; /* iOS 자동 확대 방지: ≥16px 권장이나 15px+viewport 고정으로 충분 */
+}
+.composer textarea:focus { outline: none; border-color: #5a7fa0; }
+.composer textarea:disabled { opacity: 0.5; }
+.composer button {
+  flex: none; min-height: 44px; padding: 0 16px; border-radius: 9px;
+  font-size: 14px; font-weight: 700; cursor: pointer;
+  background: #2c4a63; color: #cfe4f5; border: 1px solid #3d6183;
+}
+.composer button:disabled { opacity: 0.45; cursor: default; }
+.composer-note { margin-top: 6px; font-size: 12px; color: #e6b95a; }
+
 /* P3 설치 셸: iOS 설치 안내 배너 / 알림 권한 버튼 / 오프라인 재시도 */
 .ios-hint {
   position: relative; margin-top: 14px; padding: 14px 40px 14px 14px;

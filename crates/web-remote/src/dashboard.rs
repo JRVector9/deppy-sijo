@@ -240,6 +240,9 @@ struct Published {
     dash_version: u64,
     approvals_json: String,
     appr_version: u64,
+    /// 시청 세션별 최신 화면 슬롯 (P5c) — (seq, 스냅샷). 최신본만 유지(coalesce,
+    /// remote.rs 슬롯 관례). 시청이 끊기면 rebind_watch가 제거한다 — 메모리 유계.
+    viewports: BTreeMap<u64, (u64, Arc<runtime::TerminalViewportSnapshot>)>,
 }
 
 struct Shared {
@@ -368,6 +371,7 @@ impl DashboardHandle {
             return;
         }
         let mut commands: Vec<RuntimeCommand> = Vec::new();
+        let mut drop_slot: Option<u64> = None;
         let sink = {
             let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
             if let Some(old) = from
@@ -377,6 +381,7 @@ impl DashboardHandle {
                 if entry.count == 0 {
                     inner.watchers.remove(&old);
                     commands.push(lease_command(old, false));
+                    drop_slot = Some(old);
                 }
             }
             if let Some(new) = to {
@@ -392,6 +397,16 @@ impl DashboardHandle {
             }
             inner.command_sink.clone()
         };
+        // 마지막 시청자가 떠난 세션의 화면 슬롯 제거 (P5c — trailing 스냅샷이 남지 않게).
+        // inner 락을 놓은 뒤 published만 잠근다 (락 순서 준수).
+        if let Some(old) = drop_slot {
+            self.shared
+                .published
+                .lock()
+                .expect("published lock")
+                .viewports
+                .remove(&old);
+        }
         if let Some(sink) = sink {
             for command in commands {
                 sink(command);
@@ -498,6 +513,21 @@ impl DashboardHandle {
             .then(|| (published.appr_version, published.approvals_json.clone()))
     }
 
+    /// 시청 세션의 화면 슬롯이 `last_seq`보다 새로우면 (seq, 스냅샷)을 돌려준다 (P5c).
+    /// Arc 복제라 싸다 — 인코딩(keyframe/delta)은 접속 스레드가 자기 baseline으로 한다.
+    pub fn viewport_if_newer(
+        &self,
+        session: u64,
+        last_seq: u64,
+    ) -> Option<(u64, Arc<runtime::TerminalViewportSnapshot>)> {
+        let published = self.shared.published.lock().expect("published lock");
+        published
+            .viewports
+            .get(&session)
+            .filter(|(seq, _)| *seq > last_seq)
+            .map(|(seq, snapshot)| (*seq, Arc::clone(snapshot)))
+    }
+
     /// 지금까지의 승인 DB 폴링 횟수(테스트).
     pub fn poll_count(&self) -> u64 {
         self.shared.poll_count.load(Ordering::SeqCst)
@@ -510,16 +540,36 @@ impl DashboardHandle {
     }
 
     /// 테스트 전용: 런타임 receiver 없이 이벤트 하나를 세션 맵에 반영하고 브리지를 깨운다
-    /// (상태 스트림 프레임을 실제 WS로 검증하기 위한 주입 시드).
+    /// (상태 스트림 프레임을 실제 WS로 검증하기 위한 주입 시드). Viewport 이벤트는 run()의
+    /// drain과 동일하게 시청 중일 때만 슬롯에 반영한다 (P5c).
     #[cfg(test)]
     pub fn inject_event(&self, event: RuntimeEvent) {
-        {
+        let staged = {
             let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
             let Inner {
-                sessions, resource, ..
+                sessions,
+                resource,
+                watchers,
+                ..
             } = &mut *inner;
             apply_event(sessions, resource, &event);
+            let staged = match &event {
+                RuntimeEvent::Viewport {
+                    session, snapshot, ..
+                } if watchers.contains_key(&session.0) => Some((session.0, Arc::clone(snapshot))),
+                _ => None,
+            };
             inner.dirty = true;
+            staged
+        };
+        if let Some((session, snapshot)) = staged {
+            let mut published = self.shared.published.lock().expect("published lock");
+            let entry = published
+                .viewports
+                .entry(session)
+                .or_insert((0, Arc::clone(&snapshot)));
+            entry.0 += 1;
+            entry.1 = snapshot;
         }
         self.shared.cvar.notify_all();
     }
@@ -577,6 +627,10 @@ fn run(shared: &Arc<Shared>) {
         inner.dirty = false;
 
         // 1) 런타임 이벤트 drain — 접속 유무와 무관하게 처리해 durable 큐 overflow를 막는다.
+        //    시청 중 세션의 Viewport는 스테이징해 두었다가 inner 락을 놓은 뒤 슬롯에 반영한다
+        //    (P5c — 세션별 최신본만, coalesce).
+        let mut staged_viewports: BTreeMap<u64, Arc<runtime::TerminalViewportSnapshot>> =
+            BTreeMap::new();
         if let Some(receiver) = inner.receiver.as_ref() {
             let events = receiver.drain();
             if receiver.take_overflowed() {
@@ -588,6 +642,7 @@ fn run(shared: &Arc<Shared>) {
                 sessions,
                 resource,
                 push_sink,
+                watchers,
                 ..
             } = &mut *inner;
             for event in &events {
@@ -596,6 +651,13 @@ fn run(shared: &Arc<Shared>) {
                 // notify_session이 Done/Waiting 외 상태는 무시하므로 여기서는 걸러내지 않는다.
                 if let Some(push) = push_sink.as_ref() {
                     forward_to_push(push, event);
+                }
+                if let RuntimeEvent::Viewport {
+                    session, snapshot, ..
+                } = event
+                    && watchers.contains_key(&session.0)
+                {
+                    staged_viewports.insert(session.0, Arc::clone(snapshot));
                 }
             }
         }
@@ -641,6 +703,18 @@ fn run(shared: &Arc<Shared>) {
             publish(shared, dash_json, appr_json);
         } else {
             drop(inner);
+        }
+        // 시청 화면 슬롯 반영 (P5c) — inner 락 없이 published만 잠근다 (락 순서 준수).
+        if !staged_viewports.is_empty() {
+            let mut published = shared.published.lock().expect("published lock");
+            for (session, snapshot) in staged_viewports {
+                let entry = published
+                    .viewports
+                    .entry(session)
+                    .or_insert((0, Arc::clone(&snapshot)));
+                entry.0 += 1;
+                entry.1 = snapshot;
+            }
         }
         if let Some(sink) = renewal_sink {
             for session in renewals {
@@ -849,6 +923,65 @@ mod tests {
             .filter_map(lease_of)
             .collect();
         assert_eq!(got, vec![(3, true), (5, true)]);
+        handle.stop();
+        thread.join().unwrap();
+    }
+
+    fn viewport_event(session: u64) -> RuntimeEvent {
+        let cells = vec![
+            runtime::TerminalCell {
+                c: ' ',
+                fg: [255, 255, 255],
+                bg: [0, 0, 0],
+                wide: false,
+                wide_spacer: false,
+            };
+            4
+        ];
+        RuntimeEvent::Viewport {
+            session: SessionId(session),
+            snapshot: StdArc::new(runtime::TerminalViewportSnapshot {
+                cols: 2,
+                rows: 2,
+                cursor: runtime::CursorSnapshot {
+                    col: 0,
+                    row: 0,
+                    shape: runtime::CursorShape::Block,
+                    visible: true,
+                },
+                visible_cells: cells.into(),
+                dirty_ranges: Vec::new(),
+                title: None,
+                scroll_offset: 0,
+                is_alt_screen: false,
+            }),
+            bracketed_paste: false,
+        }
+    }
+
+    #[test]
+    fn 시청_슬롯은_watch_중에만_쌓이고_해제되면_제거된다() {
+        let (handle, thread) = DashboardHandle::spawn(None);
+        let (sink, _captured) = capture_sink();
+        handle.set_command_sink(sink);
+        // 시청 전 Viewport — 슬롯에 쌓이지 않는다 (메모리 유계)
+        handle.inject_event(viewport_event(7));
+        assert!(handle.viewport_if_newer(7, 0).is_none());
+        // 시청 시작 → 이벤트마다 seq 증가
+        handle.rebind_watch(None, Some(7));
+        handle.inject_event(viewport_event(7));
+        let (seq1, _) = handle.viewport_if_newer(7, 0).expect("슬롯 없음");
+        handle.inject_event(viewport_event(7));
+        let (seq2, _) = handle.viewport_if_newer(7, 0).expect("슬롯 없음");
+        assert!(seq2 > seq1);
+        // 이미 본 seq — None (불필요 재전송 방지)
+        assert!(handle.viewport_if_newer(7, seq2).is_none());
+        // 다른(비시청) 세션은 여전히 없음
+        handle.inject_event(viewport_event(8));
+        assert!(handle.viewport_if_newer(8, 0).is_none());
+        // 마지막 시청자 이탈 → 슬롯 제거 (trailing 스냅샷 없음)
+        handle.rebind_watch(Some(7), None);
+        assert!(handle.viewport_if_newer(7, 0).is_none());
         handle.stop();
         thread.join().unwrap();
     }

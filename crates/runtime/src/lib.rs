@@ -31,6 +31,12 @@ pub use resource_monitor::{
     ProcessResourceMonitor, ProcessResourceMonitorConfig, ProcessResourceSnapshot,
     SessionResourceTarget, SessionResourceUsage,
 };
+// 웹 계층(P5c)이 Viewport 이벤트의 스냅샷을 인코딩할 때 쓴다 — terminal 크레이트에
+// 직접 의존하는 대신 runtime 경유로 노출해 의존 표면을 한 곳으로 유지한다.
+pub use terminal::{
+    CellRange, CursorShape, CursorSnapshot, TerminalCell, TerminalViewportSnapshot,
+};
+
 pub use session::{
     SessionStatus, SessionStatusView, StatusConfidence, StatusSource, UserStatusOverride,
 };

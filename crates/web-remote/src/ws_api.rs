@@ -172,6 +172,10 @@ fn stream_loop(
     let mut last_dash = 0u64;
     let mut last_appr = 0u64;
     let mut last_ping = Instant::now();
+    // 시청 화면 상태 (P5c) — 접속별 baseline. 없으면 다음 프레임은 keyframe.
+    // watch 전환·RequestKeyframe에서 리셋한다 (remote.rs §4.4-5 관례).
+    let mut viewport_seq = 0u64;
+    let mut baseline: Option<std::sync::Arc<runtime::TerminalViewportSnapshot>> = None;
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -190,6 +194,20 @@ fn stream_loop(
                 return;
             }
             last_appr = version;
+        }
+
+        // 시청 화면 push (P5c) — 슬롯이 내 seq보다 새로우면 baseline과 diff해 전송.
+        // baseline 없음(첫 프레임/전환/재동기화)이면 keyframe이 나간다.
+        if let Some(session) = *watched
+            && let Some((seq, snapshot)) = dashboard.viewport_if_newer(session, viewport_seq)
+        {
+            let frame =
+                crate::protocol::encode_viewport(session, seq, &snapshot, baseline.as_deref());
+            if ws.send(Message::Text(frame.encode().into())).is_err() {
+                return;
+            }
+            viewport_seq = seq;
+            baseline = Some(snapshot);
         }
 
         // keepalive ping(serve 프록시 idle 절단 대응).
@@ -211,11 +229,22 @@ fn stream_loop(
                             remember,
                         }) => dashboard.resolve(&id, allowed, remember),
                         // 시청 전환 — 접속당 1개, 새 watch가 이전 시청을 대체 (P5b).
+                        // baseline 리셋 → 새 세션의 첫 프레임은 keyframe (P5c).
                         Some(ClientMsg::Watch { session }) => {
                             dashboard.rebind_watch(watched.replace(session), Some(session));
+                            viewport_seq = 0;
+                            baseline = None;
                         }
                         Some(ClientMsg::Unwatch) => {
                             dashboard.rebind_watch(watched.take(), None);
+                            viewport_seq = 0;
+                            baseline = None;
+                        }
+                        // 클라 렌더 상태 파손 — baseline을 버려 다음 프레임을 keyframe으로.
+                        // seq도 리셋해 같은 슬롯(seq 불변)이라도 즉시 재전송되게 한다 (P5c).
+                        Some(ClientMsg::RequestKeyframe) => {
+                            viewport_seq = 0;
+                            baseline = None;
                         }
                         Some(ClientMsg::Auth { .. }) | None => {}
                     }

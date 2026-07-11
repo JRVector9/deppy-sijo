@@ -469,6 +469,18 @@ fn handle_connection(stream: TcpStream, ctx: &ConnCtx, connections: &Arc<ConnSet
     // WS 업그레이드(`/ws`만)는 ws_api 계층이 승격해 대시보드 세션을 처리한다(접속을 장수 점유).
     // query에 토큰이 실릴 수 있어 로그하지 않는다 — path만.
     if ws_api::is_upgrade_request(&head) {
+        // Origin 심층 방어 (P6a — CSWSH 대비, 방법 B 선제). 헤더가 있으면 허용 오리진과
+        // 대조하고, 부재(비브라우저 클라)는 첫 프레임 토큰 인증에 위임한다.
+        if !origin_allowed(head.header("origin"), ctx.allowed_host.as_deref()) {
+            tracing::warn!(peer, origin = ?head.header("origin"), "web-remote: Origin 불일치 — 403");
+            respond(
+                stream,
+                &http::Response::plain(403, "forbidden origin"),
+                &peer,
+                &head.path,
+            );
+            return false;
+        }
         // 승격 확정 시점에 정적 슬롯을 반납하고 WS 슬롯으로 이관한다 — 장수 WS가 정적 자산
         // 요청의 슬롯을 굶히지 않게(P2 리뷰). 상한 초과면 이관 없이 503으로 즉시 거부한다
         // (핸드셰이크 전이라 HTTP 503이 즉시 거부 — 브라우저 WS는 실패 후 백오프 재접속).
@@ -542,6 +554,19 @@ fn host_allowed(host: Option<&str>, allowed: Option<&str>) -> bool {
         return true;
     }
     allowed.is_some_and(|allowed| name == allowed)
+}
+
+/// WS 업그레이드 Origin 심층 방어 (P6a). Origin 헤더가 **있으면** 허용 오리진
+/// (ts 호스트/loopback)과 대조해 불일치·기형("null" 포함)을 거부한다. 부재는
+/// 첫 프레임 토큰 인증에 위임 — 비브라우저 클라이언트·기존 테스트와 호환.
+fn origin_allowed(origin: Option<&str>, allowed: Option<&str>) -> bool {
+    let Some(origin) = origin else {
+        return true; // 헤더 없음 — 토큰 인증에 위임
+    };
+    let Some((_scheme, authority)) = origin.split_once("://") else {
+        return false; // "null" 등 기형 오리진
+    };
+    host_allowed(Some(authority), allowed)
 }
 
 /// "host:port" / "[v6]:port" / "host"에서 host 부분만 남긴다.
@@ -1103,6 +1128,108 @@ mod tests {
                 break;
             }
             assert!(Instant::now() < deadline, "WriteInput이 도착하지 않음");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(ws);
+        server.shutdown();
+    }
+
+    #[test]
+    fn origin_검사는_허용_오리진과_부재만_통과시킨다() {
+        let allowed = Some("jr.ts.net");
+        // 부재 — 비브라우저 클라, 토큰 인증에 위임
+        assert!(origin_allowed(None, allowed));
+        // 허용 호스트/loopback (포트·스킴 무관)
+        assert!(origin_allowed(Some("https://jr.ts.net"), allowed));
+        assert!(origin_allowed(Some("http://localhost:5173"), allowed));
+        assert!(origin_allowed(Some("http://127.0.0.1:8737"), allowed));
+        // 불일치·기형은 거부
+        assert!(!origin_allowed(Some("https://evil.example"), allowed));
+        assert!(!origin_allowed(Some("null"), allowed));
+        assert!(!origin_allowed(Some("https://jr.ts.net.evil.com"), allowed));
+    }
+
+    /// P6a: Origin 불일치 업그레이드는 403으로 거부된다 (심층 방어).
+    #[test]
+    fn ws_origin_불일치는_403() {
+        let server = start(None);
+        let mut stream = TcpStream::connect(server.local_addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stream
+            .write_all(
+                b"GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://evil.example\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            )
+            .unwrap();
+        // 상태줄이 여러 read로 쪼개질 수 있다 — 연결 종료까지 모아 읽는다.
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 256];
+        while let Ok(n) = stream.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            raw.extend_from_slice(&buf[..n]);
+            if raw.len() > 4096 {
+                break;
+            }
+        }
+        let head = String::from_utf8_lossy(&raw);
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        server.shutdown();
+    }
+
+    /// P6a: 자유 입력은 시청 중 세션에만 WriteInput으로 전달된다 (제어문자 strip 포함).
+    #[test]
+    fn ws_input은_시청_중_세션에만_전달된다() {
+        let server = start(None);
+        let captured: Arc<Mutex<Vec<runtime::RuntimeCommand>>> = Arc::default();
+        let sink_cap = Arc::clone(&captured);
+        server.set_runtime_command_sink(Arc::new(move |command| {
+            sink_cap.lock().unwrap().push(command);
+        }));
+        let mut ws = ws_client(server.local_addr());
+        send_text(
+            &mut ws,
+            &format!(r#"{{"type":"auth","v":1,"token":"{TEST_TOKEN}"}}"#),
+        );
+        assert!(read_frame_of_type(&mut ws, "welcome", Duration::from_secs(3)).is_some());
+        send_text(&mut ws, r#"{"type":"watch","session":7}"#);
+        // 비시청 세션(무시) → 시청 세션 전송(제어문자 포함 — strip 검증)
+        send_text(
+            &mut ws,
+            r#"{"type":"input","session":9,"text":"evil","submit":true}"#,
+        );
+        send_text(
+            &mut ws,
+            r#"{"type":"input","session":7,"text":"echo\u001b[31m hi","submit":true}"#,
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let inputs: Vec<(u64, Vec<u8>)> = captured
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|command| match command {
+                    runtime::RuntimeCommand::WriteInput { session, bytes } => {
+                        Some((session.0, bytes.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !inputs.is_empty() {
+                assert_eq!(
+                    inputs,
+                    vec![(7, b"echo[31m hi\r".to_vec())],
+                    "비시청 input이 통과했거나 제어문자 strip이 틀림"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "WriteInput이 도착하지 않음 — captured: {:?}",
+                captured.lock().unwrap()
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
         drop(ws);

@@ -43,6 +43,16 @@ pub enum ClientMsg {
     /// 스크롤 상태는 세션당 하나(데스크톱과 공유 — tmux 관례, RuntimeCommand::Scroll
     /// 재사용). 서버가 delta를 방어적으로 캡한다.
     Scroll { session: u64, delta: i32 },
+    /// 시청 중 세션에 자유 텍스트 입력 (P6a — composer). 서버가 C0 제어문자를 걷어내고
+    /// (\t 제외 — 제어 시퀀스는 named key로만), \n을 \r로 정규화하며, 여러 줄/대형
+    /// 텍스트는 세션의 bracketed paste 모드가 켜져 있으면 wrap한다. submit=true면
+    /// 마지막에 Enter(\r)를 덧붙인다(전송), false면 삽입만(첨부 경로 등).
+    Input {
+        session: u64,
+        text: String,
+        #[serde(default)]
+        submit: bool,
+    },
 }
 
 impl ClientMsg {
@@ -135,6 +145,13 @@ pub enum ServerMsg {
         /// 맨 아래 복귀(delta = -offset)에 쓴다.
         offset: i32,
         lines: Vec<LineView>,
+    },
+    /// 시청 세션의 PTY 입력 큐 압박 (P6a) — composer 전송 버튼 게이트.
+    /// queued=0이면 해소(재활성). reason: "queue_full"/"closed"/"too_large"/"unavailable".
+    InputPressure {
+        session: u64,
+        queued: usize,
+        reason: &'static str,
     },
     /// 인증 실패 등 — 직후 close.
     Error { message: String },
@@ -329,6 +346,38 @@ mod tests {
                 delta: -12
             }
         );
+        // Input — submit 생략 시 false (삽입만)
+        let msg = ClientMsg::parse(r#"{"type":"input","session":7,"text":"ls"}"#).unwrap();
+        assert_eq!(
+            msg,
+            ClientMsg::Input {
+                session: 7,
+                text: "ls".into(),
+                submit: false
+            }
+        );
+        let msg =
+            ClientMsg::parse(r#"{"type":"input","session":7,"text":"ls","submit":true}"#).unwrap();
+        assert_eq!(
+            msg,
+            ClientMsg::Input {
+                session: 7,
+                text: "ls".into(),
+                submit: true
+            }
+        );
+    }
+
+    #[test]
+    fn input_pressure_프레임_직렬화() {
+        let json = ServerMsg::InputPressure {
+            session: 7,
+            queued: 4096,
+            reason: "queue_full",
+        }
+        .encode();
+        assert!(json.contains(r#""type":"input_pressure""#), "{json}");
+        assert!(json.contains(r#""queued":4096"#), "{json}");
     }
 
     #[test]

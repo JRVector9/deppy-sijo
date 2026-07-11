@@ -78,6 +78,54 @@ fn lease_command(session: u64, viewing: bool) -> RuntimeCommand {
     }
 }
 
+/// 이 길이를 넘거나 여러 줄이면 "붙여넣기"로 간주한다 (P6a — bracketed wrap 판정).
+const INPUT_PASTE_THRESHOLD: usize = 512;
+
+/// composer 텍스트를 PTY 입력 바이트로 인코딩한다 (P6a — 순수, 테스트 대상).
+///
+/// 1) 개행 정규화(\r\n·\r→\n) 후 C0 제어문자 strip(\t·\n 제외) — 클라이언트發
+///    이스케이프 시퀀스 주입 차단(제어 시퀀스는 named key 화이트리스트로만).
+/// 2) \n→\r (터미널 Enter는 CR).
+/// 3) 여러 줄이거나 512B 초과면 붙여넣기로 간주 — 세션 bracketed paste 모드가
+///    켜져 있으면 `ESC[200~ … ESC[201~` wrap (에이전트가 한 블록으로 인식).
+/// 4) submit이면 wrap **밖에** Enter(\r)를 덧붙인다.
+///
+/// 빈 결과(공백뿐 + submit 없음)는 None — 불필요한 WriteInput을 만들지 않는다.
+fn encode_input(text: &str, submit: bool, bracketed: bool) -> Option<Vec<u8>> {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let cleaned: String = normalized
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\t' || *c == '\n')
+        .collect();
+    let is_paste = cleaned.contains('\n') || cleaned.len() > INPUT_PASTE_THRESHOLD;
+    let body = cleaned.replace('\n', "\r");
+    if body.is_empty() && !submit {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(body.len() + 16);
+    if is_paste && bracketed {
+        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend_from_slice(body.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+    } else {
+        bytes.extend_from_slice(body.as_bytes());
+    }
+    if submit {
+        bytes.push(b'\r');
+    }
+    Some(bytes)
+}
+
+/// [`runtime::PtyInputRejectReason`] → 프로토콜 문자열.
+fn pressure_reason(reason: runtime::PtyInputRejectReason) -> &'static str {
+    match reason {
+        runtime::PtyInputRejectReason::QueueFull => "queue_full",
+        runtime::PtyInputRejectReason::SessionClosed => "closed",
+        runtime::PtyInputRejectReason::WriterUnavailable => "unavailable",
+        runtime::PtyInputRejectReason::PayloadTooLarge => "too_large",
+    }
+}
+
 /// 세션 한 행의 경량 상태(런타임 이벤트에서 누적). 표시용 최소 필드만 유지한다.
 #[derive(Debug, Clone, PartialEq)]
 struct SessionEntry {
@@ -231,6 +279,9 @@ struct Inner {
     command_sink: Option<CommandSink>,
     /// 세션별 시청 접속 집계 (P5b). 0→1에서 lease on, 1→0에서 lease off를 보낸다.
     watchers: BTreeMap<u64, WatcherEntry>,
+    /// 시청 세션별 최신 bracketed paste 모드 (P6a — Viewport 이벤트에서 캐시).
+    /// send_input의 wrap 판정에 쓴다. 시청 종료 시 함께 정리된다.
+    bracketed: BTreeMap<u64, bool>,
 }
 
 /// 접속 스레드가 소켓으로 밀어낼 발행 스냅샷. 버전이 오르면 push 대상.
@@ -243,6 +294,9 @@ struct Published {
     /// 시청 세션별 최신 화면 슬롯 (P5c) — (seq, 스냅샷). 최신본만 유지(coalesce,
     /// remote.rs 슬롯 관례). 시청이 끊기면 rebind_watch가 제거한다 — 메모리 유계.
     viewports: BTreeMap<u64, (u64, Arc<runtime::TerminalViewportSnapshot>)>,
+    /// 시청 세션별 최신 입력 큐 압박 (P6a) — (버전, 인코딩된 InputPressure JSON).
+    /// 최신본만 유지, 시청 종료 시 제거 — 메모리 유계.
+    input_pressure: BTreeMap<u64, (u64, String)>,
 }
 
 struct Shared {
@@ -307,6 +361,7 @@ impl DashboardHandle {
                 push_sink: None,
                 command_sink: None,
                 watchers: BTreeMap::new(),
+                bracketed: BTreeMap::new(),
             }),
             published: Mutex::new(Published::default()),
             db: Mutex::new(db),
@@ -369,12 +424,10 @@ impl DashboardHandle {
     /// 호출. 같은 inner 임계구역에서 published를 중첩 취득해 원자화한다.
     fn clear_watch_state(inner: &mut Inner, shared: &Shared) {
         inner.watchers.clear();
-        shared
-            .published
-            .lock()
-            .expect("published lock")
-            .viewports
-            .clear();
+        inner.bracketed.clear();
+        let mut published = shared.published.lock().expect("published lock");
+        published.viewports.clear();
+        published.input_pressure.clear();
     }
 
     /// web → runtime 명령 싱크를 붙인다 (P5b — receiver와 같은 시점에 교체된다).
@@ -403,15 +456,13 @@ impl DashboardHandle {
             entry.count = entry.count.saturating_sub(1);
             if entry.count == 0 {
                 inner.watchers.remove(&old);
+                inner.bracketed.remove(&old);
                 commands.push(lease_command(old, false));
-                // 마지막 시청자 이탈 — 화면 슬롯도 같은 임계구역에서 제거
+                // 마지막 시청자 이탈 — 화면/입력압박 슬롯도 같은 임계구역에서 제거
                 // (락 순서 inner→published 중첩, 역순 취득 경로 없음 — 교착 없음).
-                self.shared
-                    .published
-                    .lock()
-                    .expect("published lock")
-                    .viewports
-                    .remove(&old);
+                let mut published = self.shared.published.lock().expect("published lock");
+                published.viewports.remove(&old);
+                published.input_pressure.remove(&old);
             }
         }
         if let Some(new) = to {
@@ -430,6 +481,36 @@ impl DashboardHandle {
                 sink(command);
             }
         }
+    }
+
+    /// 시청 세션에 composer 텍스트를 입력한다 (P6a — 자유 입력). 정규화/제어문자
+    /// strip/bracketed wrap은 [`encode_input`] 참조. 죽은 세션 id는 runtime이 무해하게
+    /// 무시한다. 호출측(ws_api)이 "시청 중 세션만" 게이트를 이미 건다.
+    pub fn send_input(&self, session: u64, text: &str, submit: bool) {
+        let (sink, bracketed) = {
+            let inner = self.shared.inner.lock().expect("dashboard inner lock");
+            (
+                inner.command_sink.clone(),
+                inner.bracketed.get(&session).copied().unwrap_or(false),
+            )
+        };
+        let Some(sink) = sink else { return };
+        if let Some(bytes) = encode_input(text, submit, bracketed) {
+            sink(RuntimeCommand::WriteInput {
+                session: SessionId(session),
+                bytes,
+            });
+        }
+    }
+
+    /// 시청 세션의 입력 큐 압박이 `last`보다 새로우면 (버전, JSON)을 돌려준다 (P6a).
+    pub fn input_pressure_if_newer(&self, session: u64, last: u64) -> Option<(u64, String)> {
+        let published = self.shared.published.lock().expect("published lock");
+        published
+            .input_pressure
+            .get(&session)
+            .filter(|(version, _)| *version > last)
+            .map(|(version, json)| (*version, json.clone()))
     }
 
     /// 시청 세션의 스크롤백을 이동한다 (스크롤백 열람). delta 양수 = 과거로.
@@ -457,13 +538,22 @@ impl DashboardHandle {
         }
     }
 
-    /// 시청 세션에 최소 제어 키를 보낸다 (P5d — Ctrl-C/Enter만, 자유 타이핑 비범위).
-    /// 화이트리스트 밖 키는 무시. WriteInput 재사용 — 죽은 세션 id는 runtime이 무해하게
-    /// 무시한다. 호출측(ws_api)이 "시청 중 세션만" 게이트를 이미 건다.
+    /// 시청 세션에 제어 키를 보낸다 (P5d + P6a 확장 — 화살표/Esc/Tab 등).
+    /// 제어 시퀀스는 이 화이트리스트로만 생성된다(자유 텍스트의 제어문자는 strip —
+    /// encode_input). 화이트리스트 밖 키는 무시. WriteInput 재사용 — 죽은 세션 id는
+    /// runtime이 무해하게 무시한다. 호출측(ws_api)이 "시청 중 세션만" 게이트를 이미 건다.
     pub fn send_key(&self, session: u64, key: &str) {
         let bytes: &[u8] = match key {
             "ctrl_c" => b"\x03",
+            "ctrl_d" => b"\x04",
             "enter" => b"\r",
+            "esc" => b"\x1b",
+            "tab" => b"\t",
+            "shift_tab" => b"\x1b[Z",
+            "up" => b"\x1b[A",
+            "down" => b"\x1b[B",
+            "right" => b"\x1b[C",
+            "left" => b"\x1b[D",
             _ => return,
         };
         let sink = self
@@ -594,16 +684,20 @@ impl DashboardHandle {
                 sessions,
                 resource,
                 watchers,
+                bracketed,
                 ..
             } = &mut *inner;
             apply_event(sessions, resource, &event);
             // 실경로(run)와 동일하게 inner 임계구역 안에서 published를 중첩 취득해
             // 슬롯을 반영한다 (P5 리뷰 ②-P1 — 락 순서 inner→published).
             if let RuntimeEvent::Viewport {
-                session, snapshot, ..
+                session,
+                snapshot,
+                bracketed_paste,
             } = &event
                 && watchers.contains_key(&session.0)
             {
+                bracketed.insert(session.0, *bracketed_paste);
                 let mut published = self.shared.published.lock().expect("published lock");
                 let entry = published
                     .viewports
@@ -670,10 +764,11 @@ fn run(shared: &Arc<Shared>) {
         inner.dirty = false;
 
         // 1) 런타임 이벤트 drain — 접속 유무와 무관하게 처리해 durable 큐 overflow를 막는다.
-        //    시청 중 세션의 Viewport는 스테이징해 두었다가 inner 락을 놓은 뒤 슬롯에 반영한다
-        //    (P5c — 세션별 최신본만, coalesce).
+        //    시청 중 세션의 Viewport/입력압박은 스테이징해 두었다가 슬롯에 반영한다
+        //    (P5c/P6a — 세션별 최신본만, coalesce).
         let mut staged_viewports: BTreeMap<u64, Arc<runtime::TerminalViewportSnapshot>> =
             BTreeMap::new();
+        let mut staged_pressure: BTreeMap<u64, String> = BTreeMap::new();
         if let Some(receiver) = inner.receiver.as_ref() {
             let events = receiver.drain();
             if receiver.take_overflowed() {
@@ -686,6 +781,7 @@ fn run(shared: &Arc<Shared>) {
                 resource,
                 push_sink,
                 watchers,
+                bracketed,
                 ..
             } = &mut *inner;
             for event in &events {
@@ -695,19 +791,37 @@ fn run(shared: &Arc<Shared>) {
                 if let Some(push) = push_sink.as_ref() {
                     forward_to_push(push, event);
                 }
-                if let RuntimeEvent::Viewport {
-                    session, snapshot, ..
-                } = event
-                    && watchers.contains_key(&session.0)
-                {
-                    staged_viewports.insert(session.0, Arc::clone(snapshot));
+                match event {
+                    RuntimeEvent::Viewport {
+                        session,
+                        snapshot,
+                        bracketed_paste,
+                    } if watchers.contains_key(&session.0) => {
+                        staged_viewports.insert(session.0, Arc::clone(snapshot));
+                        // 입력 wrap 판정용 최신 paste 모드 캐시 (P6a)
+                        bracketed.insert(session.0, *bracketed_paste);
+                    }
+                    RuntimeEvent::PtyInputPressure { session, pressure }
+                        if watchers.contains_key(&session.0) =>
+                    {
+                        staged_pressure.insert(
+                            session.0,
+                            ServerMsg::InputPressure {
+                                session: session.0,
+                                queued: pressure.queued_bytes,
+                                reason: pressure_reason(pressure.reason),
+                            }
+                            .encode(),
+                        );
+                    }
+                    _ => {}
                 }
             }
         }
-        // 시청 화면 슬롯 반영 — watcher 판정과 **같은 inner 임계구역에서** published를
-        // 중첩 취득해 삽입한다 (P5 리뷰 ②-P1: inner 해제 후 삽입하면 그 사이 완주한
-        // rebind_watch(마지막 이탈)의 슬롯 제거를 덮어 시청 0 슬롯이 부활·잔존한다).
-        if !staged_viewports.is_empty() {
+        // 시청 화면/입력압박 슬롯 반영 — watcher 판정과 **같은 inner 임계구역에서**
+        // published를 중첩 취득해 삽입한다 (P5 리뷰 ②-P1: inner 해제 후 삽입하면 그 사이
+        // 완주한 rebind_watch(마지막 이탈)의 슬롯 제거를 덮어 시청 0 슬롯이 부활·잔존한다).
+        if !staged_viewports.is_empty() || !staged_pressure.is_empty() {
             let mut published = shared.published.lock().expect("published lock");
             for (session, snapshot) in std::mem::take(&mut staged_viewports) {
                 let entry = published
@@ -716,6 +830,14 @@ fn run(shared: &Arc<Shared>) {
                     .or_insert((0, Arc::clone(&snapshot)));
                 entry.0 += 1;
                 entry.1 = snapshot;
+            }
+            for (session, json) in std::mem::take(&mut staged_pressure) {
+                let entry = published
+                    .input_pressure
+                    .entry(session)
+                    .or_insert((0, String::new()));
+                entry.0 += 1;
+                entry.1 = json;
             }
         }
 
@@ -1042,6 +1164,101 @@ mod tests {
         // 마지막 시청자 이탈 → 슬롯 제거 (trailing 스냅샷 없음)
         handle.rebind_watch(Some(7), None);
         assert!(handle.viewport_if_newer(7, 0).is_none());
+        handle.stop();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn encode_input은_정규화_strip_wrap_submit을_정확히_한다() {
+        // 단순 한 줄 + submit → 텍스트 + \r
+        assert_eq!(
+            encode_input("ls -al", true, false).unwrap(),
+            b"ls -al\r".to_vec()
+        );
+        // submit 없음 — 삽입만
+        assert_eq!(
+            encode_input("/tmp/photo.png ", false, false).unwrap(),
+            b"/tmp/photo.png ".to_vec()
+        );
+        // C0 제어문자 strip(\t 제외) — 클라이언트發 이스케이프 주입 차단
+        assert_eq!(
+            encode_input("a\x1b[31mb\x07c\td", true, false).unwrap(),
+            b"a[31mbc\td\r".to_vec()
+        );
+        // 개행 정규화: \r\n·\r → \n → \r, 여러 줄 = paste지만 모드 off면 wrap 없음
+        assert_eq!(
+            encode_input("one\r\ntwo\rthree", false, false).unwrap(),
+            b"one\rtwo\rthree".to_vec()
+        );
+        // 여러 줄 + bracketed on → wrap, submit의 \r는 wrap 밖
+        assert_eq!(
+            encode_input("one\ntwo", true, true).unwrap(),
+            b"\x1b[200~one\rtwo\x1b[201~\r".to_vec()
+        );
+        // 한 줄이라도 512B 초과면 paste 취급
+        let long = "x".repeat(600);
+        let encoded = encode_input(&long, false, true).unwrap();
+        assert!(encoded.starts_with(b"\x1b[200~") && encoded.ends_with(b"\x1b[201~"));
+        // 빈 입력 + submit 없음 → None, submit 있으면 Enter만
+        assert!(encode_input("", false, true).is_none());
+        assert_eq!(encode_input("", true, false).unwrap(), b"\r".to_vec());
+    }
+
+    #[test]
+    fn send_input은_시청_세션의_bracketed_모드를_반영한다() {
+        let (handle, thread) = DashboardHandle::spawn(None);
+        let (sink, captured) = capture_sink();
+        handle.set_command_sink(sink);
+        handle.rebind_watch(None, Some(7));
+        // bracketed on인 Viewport 주입 → 캐시 갱신
+        let RuntimeEvent::Viewport {
+            session, snapshot, ..
+        } = viewport_event(7)
+        else {
+            unreachable!()
+        };
+        handle.inject_event(RuntimeEvent::Viewport {
+            session,
+            snapshot,
+            bracketed_paste: true,
+        });
+        captured.lock().unwrap().clear();
+        handle.send_input(7, "a\nb", true);
+        let inputs: Vec<Vec<u8>> = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|command| match command {
+                RuntimeCommand::WriteInput { bytes, .. } => Some(bytes.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(inputs, vec![b"\x1b[200~a\rb\x1b[201~\r".to_vec()]);
+        handle.stop();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn 확장_키_화이트리스트는_시퀀스로_매핑되고_미지_키는_무시된다() {
+        let (handle, thread) = DashboardHandle::spawn(None);
+        let (sink, captured) = capture_sink();
+        handle.set_command_sink(sink);
+        for key in ["up", "esc", "shift_tab", "rm_rf"] {
+            handle.send_key(7, key);
+        }
+        let inputs: Vec<Vec<u8>> = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|command| match command {
+                RuntimeCommand::WriteInput { bytes, .. } => Some(bytes.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            inputs,
+            vec![b"\x1b[A".to_vec(), b"\x1b".to_vec(), b"\x1b[Z".to_vec()]
+        );
         handle.stop();
         thread.join().unwrap();
     }

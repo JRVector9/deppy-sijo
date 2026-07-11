@@ -73,24 +73,35 @@ self.addEventListener('push', (event) => {
       renotify: true,
       icon: '/icon-192.png',
       badge: '/icon-192.png',
-      // 딥링크: 셸 루트로 포커스/열기 — 셸 단일 화면의 최상단이 승인 패널이라, 열면 곧바로
-      // 승인 대기가 보인다(WS 재연결로 즉시 목록 수신). P3 셸 라우팅에 맞춰 확정한 스킴.
-      data: { url: '/' },
+      // 딥링크: 세션 알림이면 그 세션 화면으로(P6c — `?watch=<id>`), 승인이면 셸 루트로
+      // (최상단이 승인 패널이라 열면 곧바로 보인다). 클라이언트는 대시보드에 실재하는
+      // 세션일 때만 자동 시청한다(재시작으로 id가 재배정된 스테일 알림 방어).
+      data: {
+        url: Number.isInteger(data.session) ? '/?watch=' + data.session : '/',
+        session: Number.isInteger(data.session) ? data.session : null,
+      },
     })
   );
 });
 
-// 알림 클릭 — 이미 열린 셸 탭이 있으면 포커스, 없으면 새로 연다.
+// 알림 클릭 — 이미 열린 셸 탭이 있으면 포커스(+시청 요청 전달), 없으면 딥링크로 연다.
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  const target = (event.notification.data && event.notification.data.url) || '/';
+  const data = event.notification.data || {};
+  const target = data.url || '/';
   event.waitUntil(
     self.clients
       .matchAll({ type: 'window', includeUncontrolled: true })
       .then((clients) => {
         for (const client of clients) {
           // 같은 출처의 열린 창이 있으면 포커스(토큰은 localStorage에 있어 재페어링 불필요).
-          if ('focus' in client) return client.focus();
+          // 이미 열린 창은 URL이 안 바뀌므로 시청 요청을 메시지로 전달한다.
+          if ('focus' in client) {
+            if (data.session != null && 'postMessage' in client) {
+              client.postMessage({ type: 'watch', session: data.session });
+            }
+            return client.focus();
+          }
         }
         return self.clients.openWindow ? self.clients.openWindow(target) : undefined;
       })

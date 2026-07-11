@@ -52,9 +52,30 @@
         <span id="viewer-offset-text"></span>
         <button id="viewer-bottom" type="button">맨 아래로</button>
       </div>
+      <!-- 특수키 행 (P6b): composer를 거치지 않고 즉시 전송 — claude code 메뉴 선택(↑↓+Enter)이
+           폰에서 되는 것이 핵심 사용례. 제어 시퀀스는 서버 화이트리스트가 생성한다. -->
+      <div class="viewer-keys">
+        <button type="button" data-key="esc">Esc</button>
+        <button type="button" data-key="tab">Tab</button>
+        <button type="button" data-key="up">↑</button>
+        <button type="button" data-key="down">↓</button>
+        <button type="button" data-key="left">←</button>
+        <button type="button" data-key="right">→</button>
+        <button type="button" data-key="ctrl_c">Ctrl‑C</button>
+        <button type="button" data-key="ctrl_d">Ctrl‑D</button>
+        <button type="button" data-key="enter">Enter</button>
+      </div>
+
+      <!-- composer (P6b): textarea라 브라우저가 한글 IME 조합을 네이티브로 처리한다.
+           Enter는 줄바꿈, 전송은 버튼(모바일 오전송 방지). 데스크톱은 Cmd/Ctrl-Enter. -->
+      <div class="composer">
+        <textarea id="composer-text" rows="1" placeholder="메시지 입력…"
+                  autocapitalize="off" autocorrect="off" spellcheck="false"></textarea>
+        <button id="composer-send" type="button">전송</button>
+      </div>
+      <p id="composer-note" class="composer-note" hidden></p>
+
       <div class="viewer-actions">
-        <button id="viewer-ctrl-c" type="button">Ctrl‑C</button>
-        <button id="viewer-enter" type="button">Enter</button>
         <button id="viewer-close" type="button" class="viewer-close">닫기</button>
       </div>
     </section>

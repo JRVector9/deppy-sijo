@@ -278,6 +278,12 @@ fn stream_loop(
                                 dashboard.send_key(session, &key);
                             }
                         }
+                        // 스크롤백 이동 — 역시 시청 중 세션에만 (스크롤백 열람).
+                        Some(ClientMsg::Scroll { session, delta }) => {
+                            if watch.watched == Some(session) {
+                                dashboard.send_scroll(session, delta);
+                            }
+                        }
                         Some(ClientMsg::Auth { .. }) | None => {}
                     }
                 }

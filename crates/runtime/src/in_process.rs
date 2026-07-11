@@ -5055,6 +5055,59 @@ mod tests {
         );
     }
 
+    /// 스크롤백 열람: Scroll 커맨드의 dirty가 union 게이트를 타고 lease 세션
+    /// (Warm/hidden)의 Viewport로 흐른다 — 폰 스크롤의 runtime 경로 고정.
+    #[cfg(unix)]
+    #[test]
+    fn scroll은_lease_세션의_viewport를_흐르게_한다() {
+        init_mock_store();
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("lease-scroll"),
+            RedactionService::new(),
+            spec("/bin/sh", &["-c", "sleep 30"]),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SetWorkspaceState(
+                WorkspaceRuntimeState::Warm,
+            ))
+            .unwrap();
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            _ => None,
+        });
+        client
+            .send_command(RuntimeCommand::SetRemoteViewing {
+                session,
+                viewing: true,
+                ttl_ms: 60_000,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::Viewport { session: s, .. } if *s == session => Some(()),
+            _ => None,
+        });
+        // 스크롤 → mark_full_dirty → 다음 pump이 union 게이트로 Viewport를 emit한다
+        probe.seen.clear();
+        client
+            .send_command(RuntimeCommand::Scroll { session, delta: 5 })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::Viewport { session: s, .. } if *s == session => Some(()),
+            _ => None,
+        });
+    }
+
     /// P5 리뷰 P3: lease 갱신(재전송)은 만료 연장만 — 전 대상 스냅샷 재push를
     /// 유발하지 않는다 (15s마다 풀 keyframe 낭비 + Warm wake 소음 방지).
     #[cfg(unix)]

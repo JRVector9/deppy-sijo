@@ -39,6 +39,10 @@ pub enum ClientMsg {
     /// 시청 중 세션에 최소 제어 키 (P5d). 화이트리스트("ctrl_c"/"enter")만 서버가
     /// 바이트로 매핑한다 — 자유 타이핑·IME는 비범위(필요 시 별도 PR).
     Key { session: u64, key: String },
+    /// 시청 중 세션의 스크롤백 이동 (스크롤백 열람 — P5 후속). delta 양수 = 과거로.
+    /// 스크롤 상태는 세션당 하나(데스크톱과 공유 — tmux 관례, RuntimeCommand::Scroll
+    /// 재사용). 서버가 delta를 방어적으로 캡한다.
+    Scroll { session: u64, delta: i32 },
 }
 
 impl ClientMsg {
@@ -127,6 +131,9 @@ pub enum ServerMsg {
         rows: u16,
         cursor: CursorView,
         alt: bool,
+        /// 스크롤백 오프셋(줄) — 0 = 맨 아래(라이브). 클라가 "과거 열람 중" 표시와
+        /// 맨 아래 복귀(delta = -offset)에 쓴다.
+        offset: i32,
         lines: Vec<LineView>,
     },
     /// 인증 실패 등 — 직후 close.
@@ -235,6 +242,7 @@ pub fn encode_viewport(
         rows: snapshot.rows,
         cursor: cursor_view(snapshot),
         alt: snapshot.is_alt_screen,
+        offset: snapshot.scroll_offset,
         lines,
     }
 }
@@ -313,6 +321,22 @@ mod tests {
                 key: "ctrl_c".into()
             }
         );
+        let msg = ClientMsg::parse(r#"{"type":"scroll","session":7,"delta":-12}"#).unwrap();
+        assert_eq!(
+            msg,
+            ClientMsg::Scroll {
+                session: 7,
+                delta: -12
+            }
+        );
+    }
+
+    #[test]
+    fn viewport_프레임은_스크롤백_오프셋을_싣는다() {
+        let mut scrolled = snapshot(10, 2, vec![cell(' ', WHITE, BLACK); 20]);
+        scrolled.scroll_offset = 42;
+        let json = encode_viewport(7, 1, &scrolled, None).encode();
+        assert!(json.contains(r#""offset":42"#), "{json}");
     }
 
     // ── P5c 인코더 ──

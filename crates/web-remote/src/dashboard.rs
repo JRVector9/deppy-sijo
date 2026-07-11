@@ -432,6 +432,31 @@ impl DashboardHandle {
         }
     }
 
+    /// 시청 세션의 스크롤백을 이동한다 (스크롤백 열람). delta 양수 = 과거로.
+    /// 스크롤 상태는 세션당 하나(데스크톱과 공유) — backend가 이력 범위로 클램프하고,
+    /// 여기서는 비정상 값(오버플로 조작)만 방어적으로 캡한다. 죽은 세션 id는 runtime이
+    /// 무해하게 무시한다. 호출측(ws_api)이 "시청 중 세션만" 게이트를 이미 건다.
+    pub fn send_scroll(&self, session: u64, delta: i32) {
+        const SCROLL_DELTA_CAP: i32 = 100_000;
+        let delta = delta.clamp(-SCROLL_DELTA_CAP, SCROLL_DELTA_CAP);
+        if delta == 0 {
+            return;
+        }
+        let sink = self
+            .shared
+            .inner
+            .lock()
+            .expect("dashboard inner lock")
+            .command_sink
+            .clone();
+        if let Some(sink) = sink {
+            sink(RuntimeCommand::Scroll {
+                session: SessionId(session),
+                delta,
+            });
+        }
+    }
+
     /// 시청 세션에 최소 제어 키를 보낸다 (P5d — Ctrl-C/Enter만, 자유 타이핑 비범위).
     /// 화이트리스트 밖 키는 무시. WriteInput 재사용 — 죽은 세션 id는 runtime이 무해하게
     /// 무시한다. 호출측(ws_api)이 "시청 중 세션만" 게이트를 이미 건다.

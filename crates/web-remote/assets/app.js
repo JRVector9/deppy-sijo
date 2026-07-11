@@ -206,6 +206,8 @@
   function openViewer(sessionId, title) {
     viewer.watching = sessionId;
     viewer.screen = null;
+    resetScroll();
+    updateScrollNote();
     viewer.label.textContent = title || ('세션 ' + sessionId);
     viewer.el.hidden = false;
     send({ type: 'watch', session: sessionId });
@@ -216,6 +218,8 @@
     if (viewer.watching == null) return;
     viewer.watching = null;
     viewer.screen = null;
+    resetScroll();
+    updateScrollNote();
     viewer.el.hidden = true;
     send({ type: 'unwatch' });
   }
@@ -235,8 +239,73 @@
     }
     viewer.screen.cursor = msg.cursor || null;
     viewer.screen.alt = !!msg.alt;
+    viewer.screen.offset = msg.offset | 0;
+    updateScrollNote();
     drawScreen();
   }
+
+  // ── 스크롤백 열람 — 터치/휠을 줄 단위 delta로 바꿔 보낸다 (양수 = 과거로).
+  // 스크롤 상태는 세션당 하나(데스크톱과 공유 — tmux 관례). 60ms 코얼레싱으로
+  // 빠른 스와이프가 메시지 폭주를 만들지 않게 한다.
+  let scrollAcc = 0;
+  let scrollTimer = null;
+  let lastTouchY = null;
+
+  function queueScroll(lines) {
+    scrollAcc += lines;
+    if (scrollTimer) return;
+    scrollTimer = setTimeout(() => {
+      scrollTimer = null;
+      const whole = Math.trunc(scrollAcc);
+      scrollAcc -= whole;
+      if (whole !== 0 && viewer.watching != null) {
+        send({ type: 'scroll', session: viewer.watching, delta: whole });
+      }
+    }, 60);
+  }
+
+  function resetScroll() {
+    scrollAcc = 0;
+    lastTouchY = null;
+    if (scrollTimer) {
+      clearTimeout(scrollTimer);
+      scrollTimer = null;
+    }
+  }
+
+  function updateScrollNote() {
+    const note = document.getElementById('viewer-scroll-note');
+    const text = document.getElementById('viewer-offset-text');
+    const offset = (viewer.screen && viewer.screen.offset) || 0;
+    note.hidden = offset <= 0;
+    if (offset > 0) text.textContent = '↑ ' + offset + '줄 위 (과거 열람 중)';
+  }
+
+  viewer.canvas.addEventListener('touchstart', (e) => {
+    if (e.touches.length === 1) lastTouchY = e.touches[0].clientY;
+  }, { passive: true });
+  viewer.canvas.addEventListener('touchmove', (e) => {
+    if (lastTouchY == null || e.touches.length !== 1) return;
+    e.preventDefault(); // 페이지 스크롤 대신 터미널 스크롤백
+    const y = e.touches[0].clientY;
+    const dy = y - lastTouchY;
+    lastTouchY = y;
+    // 손가락을 아래로 끌면(dy>0) 과거로 — 콘텐츠가 손가락을 따라온다.
+    queueScroll(dy / (viewer.cellH || 16));
+  }, { passive: false });
+  viewer.canvas.addEventListener('touchend', () => { lastTouchY = null; }, { passive: true });
+  viewer.canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    // 휠 위(deltaY<0) = 과거로(양수 delta).
+    queueScroll(-e.deltaY / (viewer.cellH || 16));
+  }, { passive: false });
+  document.getElementById('viewer-bottom').addEventListener('click', () => {
+    const offset = (viewer.screen && viewer.screen.offset) || 0;
+    resetScroll();
+    if (offset > 0 && viewer.watching != null) {
+      send({ type: 'scroll', session: viewer.watching, delta: -offset });
+    }
+  });
 
   function drawScreen() {
     const screen = viewer.screen;
@@ -247,6 +316,7 @@
     const cssWidth = canvas.parentElement.clientWidth || 320;
     const cellW = cssWidth / screen.cols;
     const cellH = cellW * 2; // 모노스페이스 종횡비 근사
+    viewer.cellH = cellH; // 터치/휠 → 줄 delta 환산용
     const cssHeight = cellH * screen.rows;
     canvas.width = Math.round(cssWidth * dpr);
     canvas.height = Math.round(cssHeight * dpr);

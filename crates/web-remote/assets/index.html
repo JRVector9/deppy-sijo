@@ -47,6 +47,11 @@
     <section id="viewer" class="panel viewer" aria-labelledby="viewer-title" hidden>
       <h2 id="viewer-title">화면 <span id="viewer-session" class="count"></span></h2>
       <div class="viewer-wrap"><canvas id="viewer-canvas"></canvas></div>
+      <!-- 스크롤백 열람 중 표시 — 터치/휠로 과거를 보는 동안만 나타난다 -->
+      <div id="viewer-scroll-note" class="viewer-scroll-note" hidden>
+        <span id="viewer-offset-text"></span>
+        <button id="viewer-bottom" type="button">맨 아래로</button>
+      </div>
       <div class="viewer-actions">
         <button id="viewer-ctrl-c" type="button">Ctrl‑C</button>
         <button id="viewer-enter" type="button">Enter</button>

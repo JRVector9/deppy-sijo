@@ -20,6 +20,7 @@ members = [
     "crates/storage",
     "crates/storage-core",
     "crates/terminal",
+    "crates/web-remote",
     "xtask",
 ]
 
@@ -68,3 +69,7 @@ postcard = { version = "1", default-features = false, features = ["use-std"] }
 # remote TLS (단계 C-2). ring provider 명시 — aws-lc-rs 회피(Windows NASM/CMake 마찰, 설계 §2.1).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1"
+# 모바일 PWA (v3.3 P1): QR 페어링 — 설정 UI가 접속 URL을 egui 텍스처로 렌더 (image 기능 불필요)
+qrcode = { version = "0.14", default-features = false }
+# 모바일 PWA WS API (v3.3 P2 예정) — sync tungstenite. P1은 워크스페이스 등록만, 실사용 없음
+tungstenite = { version = "0.29", default-features = false }

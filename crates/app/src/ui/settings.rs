@@ -78,6 +78,32 @@ pub struct RemoteView<'a> {
     pub known_hosts: &'a [(String, String)],
 }
 
+/// 모바일 웹(PWA) 섹션이 App에 돌려주는 동작 (RemoteAction 관례 — 의도만 전달).
+pub enum WebRemoteAction {
+    None,
+    /// 토글 on — 웹서버 기동 요청.
+    Start,
+    /// 토글 off — 웹서버 정지 요청.
+    Stop,
+    /// 페어링 토큰 재발급 — 기존 페어링 무효, 실행 중이면 새 토큰으로 재시작.
+    RotateToken,
+}
+
+/// 모바일 웹 섹션 렌더 상태 (App이 채워 넘긴다 — UI는 서버/keyring을 직접 만지지 않는다).
+pub struct WebRemoteView<'a> {
+    /// 웹서버 실행 여부 — 토글 상태의 진실 소스.
+    pub running: bool,
+    /// 실행 중이면 bind 주소("127.0.0.1:포트").
+    pub addr: Option<String>,
+    /// 접속 URL(페어링 토큰 포함 — 민감). QR 원본. 실행 중에만 Some.
+    pub url: Option<String>,
+    /// 시작 실패 등 표시할 에러.
+    pub error: Option<&'a str>,
+}
+
+/// 접속 URL QR 텍스처 캐시 — (원본 URL, 텍스처). URL이 바뀔 때만 재생성한다.
+pub type WebQrCache = Option<(String, egui::TextureHandle)>;
+
 /// 통합 설정 창의 좌측 네비 카테고리. 설정 5개는 이 파일이 인라인 렌더하고, 관리/모니터
 /// 7개는 App이 `render_management` 콜백으로 각 패널의 contents()를 렌더한다 (2026-07-06 전체 통합).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -89,6 +115,7 @@ pub enum Category {
     Shortcuts,
     Performance,
     RemoteTls,
+    MobileWeb,
     // ── 관리 (App이 render_management로 렌더) ──
     Credentials,
     Connectors,
@@ -106,6 +133,8 @@ pub struct SettingsOutput {
     pub config_changed: bool,
     /// Remote 섹션 동작 요청.
     pub remote_action: RemoteAction,
+    /// 모바일 웹 섹션 동작 요청.
+    pub web_action: WebRemoteAction,
 }
 
 /// 통합 설정 창 (2026-07-06 — 흩어진 툴바 기능을 좌측 네비 한 창으로).
@@ -120,6 +149,9 @@ pub fn show(
     config: &mut Config,
     remote: &RemoteView,
     reveal_token: &mut bool,
+    web: &WebRemoteView,
+    web_reveal_url: &mut bool,
+    web_qr: &mut WebQrCache,
     notif_unread: u32,
     search_query: &mut String,
     catalog: &i18n::Catalog,
@@ -127,12 +159,14 @@ pub fn show(
 ) -> SettingsOutput {
     let mut changed = false;
     let mut remote_action = RemoteAction::None;
+    let mut web_action = WebRemoteAction::None;
 
     // title_bar(false)라 기본 open 처리가 없다 — 닫힘이면 창 자체를 만들지 않는다.
     if !*open {
         return SettingsOutput {
             config_changed: false,
             remote_action,
+            web_action,
         };
     }
     if *category == Category::Credentials {
@@ -216,6 +250,16 @@ pub fn show(
                                     &mut remote_action,
                                     catalog,
                                 ),
+                                Category::MobileWeb => mobile_web_page(
+                                    ui,
+                                    config,
+                                    web,
+                                    web_reveal_url,
+                                    web_qr,
+                                    &mut changed,
+                                    &mut web_action,
+                                    catalog,
+                                ),
                                 other => render_management(ui, other),
                             };
 
@@ -246,6 +290,7 @@ pub fn show(
     SettingsOutput {
         config_changed: changed,
         remote_action,
+        web_action,
     }
 }
 
@@ -258,6 +303,7 @@ fn is_inline_settings_category(category: Category) -> bool {
             | Category::Shortcuts
             | Category::Performance
             | Category::RemoteTls
+            | Category::MobileWeb
     )
 }
 
@@ -427,6 +473,12 @@ fn nav(
                     Icon::Lock,
                     catalog.t("settings.remote_tls", &[]),
                     "remote tls server port token fingerprint known hosts",
+                ),
+                (
+                    Category::MobileWeb,
+                    Icon::Phone,
+                    catalog.t("settings.mobile_web", &[]),
+                    "mobile web pwa phone qr pairing tailscale 모바일 웹 페어링",
                 ),
             ];
             let visible_settings: Vec<_> = settings
@@ -840,6 +892,7 @@ pub enum Icon {
     Keyboard,
     Bolt,
     Lock,
+    Phone,
     Link,
     Grid,
     Diamond,
@@ -929,6 +982,18 @@ fn paint_icon(p: &egui::Painter, c: egui::Pos2, sz: f32, icon: Icon, col: egui::
                 col,
                 egui::Stroke::NONE,
             ));
+        }
+        Icon::Phone => {
+            // 스마트폰: 세로 라운드 사각 + 하단 홈 바
+            let body = egui::Rect::from_center_size(c, egui::vec2(sz * 0.6, sz));
+            p.rect_stroke(body, 2.5, s, egui::StrokeKind::Inside);
+            p.line_segment(
+                [
+                    egui::pos2(c.x - r * 0.18, body.bottom() - r * 0.28),
+                    egui::pos2(c.x + r * 0.18, body.bottom() - r * 0.28),
+                ],
+                s,
+            );
         }
         Icon::Lock => {
             let body = egui::Rect::from_min_size(
@@ -1891,6 +1956,185 @@ fn remote_page(
     }
 }
 
+/// 모바일 웹(PWA) 페이지 (mobile-pwa 계획 v3.3 P1) — 토글/포트/호스트명 + 실행 중이면
+/// 접속 URL·QR·토큰 재발급. cert 모드(자체 TLS)는 후속이라 안내 문구만 둔다.
+#[allow(clippy::too_many_arguments)]
+fn mobile_web_page(
+    ui: &mut egui::Ui,
+    config: &mut Config,
+    web: &WebRemoteView,
+    reveal_url: &mut bool,
+    qr_cache: &mut WebQrCache,
+    changed: &mut bool,
+    web_action: &mut WebRemoteAction,
+    catalog: &i18n::Catalog,
+) {
+    page_title(ui, &catalog.t("settings.mobile_web", &[]));
+    // 토글 = 실행 중 OR 저장된 자동시작 의도 (remote_page와 동일 규칙).
+    let mut enabled = web.running || config.web.enabled;
+    row(
+        ui,
+        &catalog.t("settings.mobile_web_enabled", &[]),
+        Some(&catalog.t("settings.mobile_web_enabled.hint", &[])),
+        |ui| {
+            if toggle_switch(ui, &mut enabled) {
+                *web_action = if enabled {
+                    WebRemoteAction::Start
+                } else {
+                    WebRemoteAction::Stop
+                };
+            }
+        },
+    );
+    row(
+        ui,
+        &catalog.t("settings.port", &[]),
+        Some(&catalog.t("settings.toggle_restart_required", &[])),
+        |ui| {
+            *changed |= ui
+                .add(egui::DragValue::new(&mut config.web.port).range(0..=65535))
+                .changed();
+        },
+    );
+    row(
+        ui,
+        &catalog.t("settings.mobile_web.hostname", &[]),
+        Some(&catalog.t("settings.mobile_web.hostname.hint", &[])),
+        |ui| {
+            *changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut config.web.ts_hostname)
+                        .hint_text("machine.tailnet.ts.net")
+                        .desired_width(ui.available_width()),
+                )
+                .changed();
+        },
+    );
+    if let Some(err) = web.error {
+        ui.add_space(7.0);
+        ui.colored_label(
+            ui.visuals().error_fg_color,
+            egui::RichText::new(catalog.t("settings.start_failed", &[("message", err)]))
+                .size(SETTINGS_TYPE.row_description),
+        );
+        ui.add_space(7.0);
+        settings_hairline(ui);
+    }
+    if web.running {
+        if let Some(addr) = &web.addr {
+            row(ui, &catalog.t("settings.address", &[]), None, |ui| {
+                detail_text(ui, addr.as_str(), true);
+            });
+            // serve 모드 가이드 — 실제 bind 포트로 tailscale serve 명령을 안내한다.
+            if let Some((_, port)) = addr.rsplit_once(':') {
+                ui.add_space(7.0);
+                hint_text(
+                    ui,
+                    catalog.t("settings.mobile_web.serve_guide", &[("port", port)]),
+                );
+                ui.add_space(7.0);
+                settings_hairline(ui);
+            }
+        }
+        if let Some(url) = &web.url {
+            // 접속 URL — 페어링 토큰이 실리므로 기본 마스킹. 복사는 항상 전체 URL.
+            row(ui, &catalog.t("settings.mobile_web.url", &[]), None, |ui| {
+                ui.checkbox(reveal_url, catalog.t("settings.show", &[]));
+                if ui.button(catalog.t("action.copy", &[])).clicked() {
+                    ui.ctx().copy_text(url.clone());
+                }
+            });
+            let display = if *reveal_url {
+                url.clone()
+            } else {
+                masked_url(url)
+            };
+            detail_text(ui, display, true);
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                egui::RichText::new(catalog.t("settings.mobile_web.url_warning", &[]))
+                    .size(SETTINGS_TYPE.row_description),
+            );
+            // 페어링 토큰 재발급 — keyring의 토큰을 교체하고 실행 중이면 재시작.
+            row(
+                ui,
+                &catalog.t("settings.token", &[]),
+                Some(&catalog.t("settings.mobile_web.rotate.hint", &[])),
+                |ui| {
+                    if ui
+                        .button(catalog.t("settings.mobile_web.rotate", &[]))
+                        .clicked()
+                    {
+                        *web_action = WebRemoteAction::RotateToken;
+                    }
+                },
+            );
+            // 페어링 QR — 폰 카메라 스캔용 (URL 전체 = 토큰 포함).
+            ui.add_space(14.0);
+            show_qr(ui, qr_cache, url);
+            ui.add_space(6.0);
+            hint_text(ui, catalog.t("settings.mobile_web.qr_hint", &[]));
+            if config.web.ts_hostname.trim().is_empty() {
+                hint_text(ui, catalog.t("settings.mobile_web.qr_needs_hostname", &[]));
+            }
+            ui.add_space(7.0);
+            settings_hairline(ui);
+        }
+    }
+    ui.add_space(14.0);
+    // cert 모드(자체 TLS + 비-loopback bind)는 후속 — config 키만 예약돼 있다.
+    hint_text(ui, catalog.t("settings.mobile_web.cert_note", &[]));
+}
+
+/// 접속 URL의 token 값 부분을 마스킹한다 (표시 전용 — 복사/QR는 전체를 쓴다).
+fn masked_url(url: &str) -> String {
+    match url.split_once("token=") {
+        Some((head, _)) => format!("{head}token=…"),
+        None => url.to_owned(),
+    }
+}
+
+/// 접속 URL QR를 그린다. 텍스처는 1px/모듈로 만들고 NEAREST 정수 배율로 확대해
+/// 모듈 경계가 뭉개지지 않게 한다. URL이 바뀔 때만 재생성.
+fn show_qr(ui: &mut egui::Ui, cache: &mut WebQrCache, url: &str) {
+    if cache
+        .as_ref()
+        .is_none_or(|(cached_url, _)| cached_url != url)
+    {
+        let Some(image) = qr_color_image(url) else {
+            hint_text(ui, "QR 생성 실패");
+            return;
+        };
+        let texture = ui
+            .ctx()
+            .load_texture("web_remote_qr", image, egui::TextureOptions::NEAREST);
+        *cache = Some((url.to_owned(), texture));
+    }
+    if let Some((_, texture)) = cache {
+        let size = texture.size_vec2();
+        let scale = (200.0 / size.x).floor().max(1.0);
+        ui.add(egui::Image::new((texture.id(), size * scale)));
+    }
+}
+
+/// URL을 QR 매트릭스로 인코드해 흑백 이미지로 만든다 (quiet zone 4모듈 포함 — 스캐너 요구).
+fn qr_color_image(data: &str) -> Option<egui::ColorImage> {
+    let code = qrcode::QrCode::new(data.as_bytes()).ok()?;
+    let width = code.width();
+    let colors = code.to_colors();
+    let margin = 4usize;
+    let size = width + margin * 2;
+    let mut image = egui::ColorImage::filled([size, size], egui::Color32::WHITE);
+    for y in 0..width {
+        for x in 0..width {
+            if colors[y * width + x] == qrcode::Color::Dark {
+                image.pixels[(y + margin) * size + (x + margin)] = egui::Color32::BLACK;
+            }
+        }
+    }
+    Some(image)
+}
+
 /// 지문을 목록 표시용으로 앞 `keep`자만 남기고 자른다(전체는 실행 중 서버 지문에서 확인).
 /// char 경계 기준이라 비ASCII가 섞여도 패닉하지 않는다.
 fn truncate_fingerprint(fp: &str, keep: usize) -> String {
@@ -1902,7 +2146,10 @@ fn truncate_fingerprint(fp: &str, keep: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SETTINGS_DETAIL, SETTINGS_TYPE, nav_matches, truncate_fingerprint};
+    use super::{
+        SETTINGS_DETAIL, SETTINGS_TYPE, masked_url, nav_matches, qr_color_image,
+        truncate_fingerprint,
+    };
 
     #[test]
     fn 모양_화면_타이포그래피는_참조_font_map을_고정한다() {
@@ -1934,6 +2181,33 @@ mod tests {
     #[test]
     fn 지문_길면_앞부분만_말줄임() {
         assert_eq!(truncate_fingerprint("aa:bb:cc:dd", 5), "aa:bb…");
+    }
+
+    #[test]
+    fn 접속_url_마스킹은_토큰만_가린다() {
+        assert_eq!(
+            masked_url("https://mac.ts.net/?token=abcd1234"),
+            "https://mac.ts.net/?token=…"
+        );
+        // token 파라미터가 없으면 그대로
+        assert_eq!(masked_url("https://mac.ts.net/"), "https://mac.ts.net/");
+    }
+
+    #[test]
+    fn qr_이미지는_quiet_zone을_포함한_정방형() {
+        let image = qr_color_image("https://mac.ts.net/?token=abc").unwrap();
+        assert_eq!(image.size[0], image.size[1]);
+        // 최소 QR(21모듈) + quiet zone 4×2
+        assert!(image.size[0] >= 21 + 8, "{}", image.size[0]);
+        // 흑백 두 색만
+        assert!(
+            image
+                .pixels
+                .iter()
+                .all(|p| *p == egui::Color32::BLACK || *p == egui::Color32::WHITE)
+        );
+        // 테두리(quiet zone)는 흰색
+        assert_eq!(image.pixels[0], egui::Color32::WHITE);
     }
 
     #[test]

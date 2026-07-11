@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1a1a1a">
+  <title>Deppy Sijo</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/icon.svg">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body data-view="shell">
+  <main class="card">
+    <header class="brand">
+      <img src="/icon.svg" alt="" width="44" height="44">
+      <h1>Deppy Sijo</h1>
+    </header>
+    <p class="status"><span id="dot" class="dot"></span> <span id="status-text">확인 중…</span></p>
+    <p class="placeholder">연결됨 — 승인/상태 대시보드는 P2에서 제공됩니다.</p>
+    <dl class="meta">
+      <div><dt>서버</dt><dd id="host">-</dd></div>
+      <div><dt>마지막 확인</dt><dd id="last-check">-</dd></div>
+    </dl>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

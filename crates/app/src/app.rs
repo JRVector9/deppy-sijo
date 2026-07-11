@@ -945,6 +945,14 @@ struct RemoteTlsState {
     fingerprint: String,
 }
 
+/// 실행 중인 모바일 웹(PWA) 서버 + 페어링 토큰(접속 URL/QR 표시용) — mobile-pwa v3.3 P1.
+/// Drop/shutdown이 accept 루프·접속 스레드를 모두 정리한다 (RemoteTlsState 관례).
+struct WebRemoteState {
+    server: web_remote::WebRemoteServer,
+    /// keyring에서 로드한 페어링 토큰 — 서버가 `/?token=` 게이트로 검증하는 값과 동일.
+    token: String,
+}
+
 /// 세션 알림(완료/입력대기) 주목 상태 — 레일 폭(6px)·1회 펄스 추적 (2026-07-07).
 struct SessionAlert {
     status: runtime::SessionStatus,
@@ -1102,6 +1110,14 @@ pub struct App {
     remote_error: Option<String>,
     /// settings의 토큰 표시(reveal) 토글. 토큰은 민감이라 기본 마스킹.
     remote_reveal_token: bool,
+    /// 모바일 웹(PWA) 서버 (켜져 있을 때만 Some). OFF면 리스너 스레드 자체가 없다 — 리소스 0.
+    web: Option<WebRemoteState>,
+    /// 웹서버 시작/토큰 재발급 실패 시 settings에 표시할 에러.
+    web_error: Option<String>,
+    /// settings의 접속 URL 표시(reveal) 토글 — URL에 페어링 토큰이 실리므로 기본 마스킹.
+    web_reveal_url: bool,
+    /// 접속 URL QR 텍스처 캐시 — URL이 바뀔 때만 재생성, 설정창 닫으면 반환.
+    web_qr: ui::settings::WebQrCache,
     /// known_hosts 표시 캐시 (settings 열 때 lazily 로드, 닫으면 None으로 리셋해 재로드).
     known_hosts_cache: Option<Vec<(String, String)>>,
     /// 폴더 트리 사이드바 (file-tree-design §6). OFF면 None — Panel 미생성 + 상태 drop(리소스 0).
@@ -1259,6 +1275,10 @@ impl App {
             remote: None,
             remote_error: None,
             remote_reveal_token: false,
+            web: None,
+            web_error: None,
+            web_reveal_url: false,
+            web_qr: None,
             known_hosts_cache: None,
             file_tree: None,
         };
@@ -1285,6 +1305,16 @@ impl App {
                 Err(e) => {
                     tracing::warn!("remote TLS 자동 시작 실패: {e:#}");
                     app.remote_error = Some(format!("{e:#}"));
+                }
+            }
+        }
+        // 모바일 웹(PWA) 서버 자동 시작 — remote와 동일한 best-effort 규칙 (v3.3 P1).
+        if app.config.web.enabled {
+            match app.start_web() {
+                Ok(state) => app.web = Some(state),
+                Err(e) => {
+                    tracing::warn!("모바일 웹 서버 자동 시작 실패: {e:#}");
+                    app.web_error = Some(format!("{e:#}"));
                 }
             }
         }
@@ -1890,6 +1920,82 @@ impl App {
             self.remote_error = Some(format!(
                 "서버는 껐지만 설정 저장 실패 — 다음 실행에 다시 켜질 수 있습니다: {e:#}"
             ));
+        }
+    }
+
+    /// 모바일 웹(PWA) 서버 기동 (mobile-pwa v3.3 P1): keyring 페어링 토큰 로드/생성 →
+    /// 127.0.0.1 평문 bind(serve 모드 — HTTPS 종단은 tailscale serve 몫).
+    /// cert 모드(자체 TLS + 비-loopback)는 후속 — config에 자리만 있다.
+    fn start_web(&self) -> anyhow::Result<WebRemoteState> {
+        let token = web_remote::pairing::get_or_create_token(&self.secret_store)?;
+        let addr =
+            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, self.config.web.port));
+        let hostname = self.config.web.ts_hostname.trim();
+        let server = web_remote::WebRemoteServer::serve(
+            addr,
+            web_remote::ServeOptions {
+                token: token.clone(),
+                allowed_host: (!hostname.is_empty()).then(|| hostname.to_owned()),
+            },
+        )?;
+        Ok(WebRemoteState { server, token })
+    }
+
+    /// settings 토글 on: 웹서버를 켜고 성공 시 config에 의도를 영속한다 (remote_enable 관례).
+    fn web_enable(&mut self) {
+        match self.start_web() {
+            Ok(state) => {
+                self.web = Some(state);
+                self.web_error = None;
+                self.config.web.enabled = true;
+                if let Err(e) = self.config.save(&self.config_path) {
+                    tracing::warn!("config 저장 실패: {e:#}");
+                    self.web_error = Some(format!(
+                        "설정 저장 실패 — 다음 실행엔 자동시작 안 됨: {e:#}"
+                    ));
+                }
+            }
+            Err(e) => {
+                tracing::warn!("모바일 웹 서버 시작 실패: {e:#}");
+                self.web_error = Some(format!("{e:#}"));
+            }
+        }
+    }
+
+    /// settings 토글 off: 웹서버 정지(Drop이 accept/접속 스레드 정리) + config 영속.
+    fn web_disable(&mut self) {
+        if let Some(state) = self.web.take() {
+            state.server.shutdown();
+        }
+        self.web_error = None;
+        self.config.web.enabled = false;
+        if let Err(e) = self.config.save(&self.config_path) {
+            tracing::warn!("config 저장 실패: {e:#}");
+            // 저장 실패를 조용히 넘기면 껐다고 생각한 서버가 다음 실행에 자동시작된다 — 표면화.
+            self.web_error = Some(format!(
+                "서버는 껐지만 설정 저장 실패 — 다음 실행에 다시 켜질 수 있습니다: {e:#}"
+            ));
+        }
+    }
+
+    /// 페어링 토큰 재발급 — 기존 페어링(QR/브라우저 저장분) 무효. 서버는 시작 시 토큰을
+    /// 고정하므로 실행 중이면 새 토큰으로 재시작해 반영한다.
+    fn web_rotate_token(&mut self) {
+        if let Err(e) = web_remote::pairing::rotate_token(&self.secret_store) {
+            tracing::warn!("페어링 토큰 재발급 실패: {e:#}");
+            self.web_error = Some(format!("{e:#}"));
+            return;
+        }
+        self.web_error = None;
+        if let Some(state) = self.web.take() {
+            state.server.shutdown();
+            match self.start_web() {
+                Ok(state) => self.web = Some(state),
+                Err(e) => {
+                    tracing::warn!("토큰 재발급 후 웹서버 재시작 실패: {e:#}");
+                    self.web_error = Some(format!("{e:#}"));
+                }
+            }
         }
     }
 
@@ -3749,6 +3855,28 @@ impl eframe::App for App {
                 known_hosts: self.known_hosts_cache.as_deref().unwrap_or(&[]),
             }
         };
+        // 모바일 웹(PWA) 뷰모델 — remote_view와 동일 규칙 (v3.3 P1).
+        let web_view = {
+            let (running, addr, url) = match &self.web {
+                Some(state) => {
+                    let addr = state.server.local_addr();
+                    let hostname = self.config.web.ts_hostname.trim();
+                    let url = web_remote::pairing::access_url(
+                        (!hostname.is_empty()).then_some(hostname),
+                        addr.port(),
+                        &state.token,
+                    );
+                    (true, Some(addr.to_string()), Some(url))
+                }
+                None => (false, None, None),
+            };
+            ui::settings::WebRemoteView {
+                running,
+                addr,
+                url,
+                error: self.web_error.as_deref(),
+            }
+        };
         // 알림 카테고리를 보고 있으면 읽음 처리 (기존 notifications.show가 하던 것).
         if self.settings_open
             && self.settings_category == ui::settings::Category::Notifications
@@ -3794,6 +3922,9 @@ impl eframe::App for App {
             &mut self.config,
             &remote_view,
             &mut self.remote_reveal_token,
+            &web_view,
+            &mut self.web_reveal_url,
+            &mut self.web_qr,
             notif_unread,
             &mut self.settings_search,
             &text,
@@ -4322,11 +4453,19 @@ impl eframe::App for App {
             }
             ui::settings::RemoteAction::None => {}
         }
+        match out.web_action {
+            ui::settings::WebRemoteAction::Start => self.web_enable(),
+            ui::settings::WebRemoteAction::Stop => self.web_disable(),
+            ui::settings::WebRemoteAction::RotateToken => self.web_rotate_token(),
+            ui::settings::WebRemoteAction::None => {}
+        }
         // settings가 닫혔으면 표시 상태를 리셋 — 다음에 열 때 known_hosts를 fresh 로드하고
-        // 토큰은 다시 마스킹한다.
+        // 토큰은 다시 마스킹한다. QR 텍스처도 반환한다(다시 열면 재생성).
         if !self.settings_open {
             self.known_hosts_cache = None;
             self.remote_reveal_token = false;
+            self.web_reveal_url = false;
+            self.web_qr = None;
         }
         self.frame_stats.end();
     }

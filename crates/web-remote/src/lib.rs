@@ -1556,6 +1556,7 @@ mod tests {
             id: Some(7),
             title: "claude".to_owned(),
             status: Some(runtime::SessionStatus::NeedsApproval),
+            agent: Some("Claude · sonnet · high".to_owned()),
             exited: false,
         }]));
         let mut ws = ws_client_authed(addr);
@@ -1598,6 +1599,7 @@ mod tests {
                     id: Some(7),
                     title: "deppy-sijo".to_owned(),
                     status: Some(runtime::SessionStatus::Running),
+                    agent: Some("Codex · gpt-5.5 · high".to_owned()),
                     exited: false,
                 }],
             },
@@ -1609,6 +1611,7 @@ mod tests {
                     id: None,
                     title: "deppy-mux".to_owned(),
                     status: None,
+                    agent: None,
                     exited: false,
                 }],
             },
@@ -1633,6 +1636,7 @@ mod tests {
             id: Some(1),
             title: "A".to_owned(),
             status: Some(runtime::SessionStatus::NeedsApproval),
+            agent: None,
             exited: false,
         }]));
         let mut ws = ws_client_authed(addr);
@@ -1646,6 +1650,7 @@ mod tests {
             id: Some(2),
             title: "B".to_owned(),
             status: Some(runtime::SessionStatus::Error),
+            agent: None,
             exited: false,
         }]));
         let frame =

@@ -184,6 +184,12 @@ impl WebRemoteServer {
         self.dashboard.set_runtime_source(receiver);
     }
 
+    /// web → runtime 명령 싱크를 붙인다 (P5b — 시청 lease 전송용, receiver와 같은 시점에
+    /// 교체). 미설정이면 터미널 뷰어만 비활성 — 대시보드/승인은 그대로 동작한다.
+    pub fn set_runtime_command_sink(&self, sink: dashboard::CommandSink) {
+        self.dashboard.set_command_sink(sink);
+    }
+
     /// 현재 활성 workspace의 세션 상태를 대시보드에 시드한다(구독 등록 직후 호출 — 재구독 시
     /// edge-trigger 상태 유실 보정). app이 GUI 배지용으로 이미 추적 중인 상태를 넘긴다.
     pub fn seed_sessions(&self, seeds: Vec<dashboard::SessionSeed>) {
@@ -908,6 +914,65 @@ mod tests {
                 .unwrap_or(true),
             "인증 실패인데 close/error가 아님: {got:?}"
         );
+    }
+
+    /// P5b: WS watch/전환/절단이 브리지 refcount를 거쳐 runtime lease 명령으로
+    /// 정확히 재바인딩되는지 — 전송 계층까지 포함한 검증.
+    #[test]
+    fn ws_watch_전환과_절단이_lease를_재바인딩한다() {
+        let server = start(None);
+        let captured: Arc<Mutex<Vec<runtime::RuntimeCommand>>> = Arc::default();
+        let sink_cap = Arc::clone(&captured);
+        server.set_runtime_command_sink(Arc::new(move |command| {
+            sink_cap.lock().unwrap().push(command);
+        }));
+        let leases = |captured: &Arc<Mutex<Vec<runtime::RuntimeCommand>>>| -> Vec<(u64, bool)> {
+            captured
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|command| match command {
+                    runtime::RuntimeCommand::SetRemoteViewing {
+                        session, viewing, ..
+                    } => Some((session.0, *viewing)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let wait_leases = |expect: &[(u64, bool)]| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let got = leases(&captured);
+                if got == expect {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "lease 시퀀스 불일치: {got:?} != {expect:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+
+        let mut ws = ws_client(server.local_addr());
+        send_text(
+            &mut ws,
+            &format!(r#"{{"type":"auth","v":1,"token":"{TEST_TOKEN}"}}"#),
+        );
+        assert!(
+            read_frame_of_type(&mut ws, "welcome", Duration::from_secs(3)).is_some(),
+            "welcome 없음"
+        );
+        // 시청 시작 → 7 on
+        send_text(&mut ws, r#"{"type":"watch","session":7}"#);
+        wait_leases(&[(7, true)]);
+        // 전환 → 7 off + 9 on (재바인딩)
+        send_text(&mut ws, r#"{"type":"watch","session":9}"#);
+        wait_leases(&[(7, true), (7, false), (9, true)]);
+        // 절단 → 9 off (Drop 경로 정리)
+        drop(ws);
+        wait_leases(&[(7, true), (7, false), (9, true), (9, false)]);
+        server.shutdown();
     }
 
     #[test]

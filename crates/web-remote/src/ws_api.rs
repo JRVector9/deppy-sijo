@@ -118,7 +118,10 @@ pub fn serve(
         return;
     }
 
-    stream_loop(&mut ws, dashboard, stop);
+    let mut watched: Option<u64> = None;
+    stream_loop(&mut ws, dashboard, stop, &mut watched);
+    // 접속 종료(모든 경로) — 시청 중이었으면 해제해 refcount/lease를 정리한다 (P5b).
+    dashboard.rebind_watch(watched.take(), None);
     let _ = ws.close(None);
     let _ = ws.flush();
 }
@@ -158,8 +161,14 @@ fn authenticate(
     false
 }
 
-/// 인증 후 스트림 루프: 발행 스냅샷 push + ping + 클라 메시지(resolve) 처리.
-fn stream_loop(ws: &mut WebSocket<TcpStream>, dashboard: &DashboardHandle, stop: &AtomicBool) {
+/// 인증 후 스트림 루프: 발행 스냅샷 push + ping + 클라 메시지(resolve/watch) 처리.
+/// `watched`는 이 접속의 현재 시청 세션 — 호출측(serve)이 종료 시 해제를 보장한다.
+fn stream_loop(
+    ws: &mut WebSocket<TcpStream>,
+    dashboard: &DashboardHandle,
+    stop: &AtomicBool,
+    watched: &mut Option<u64>,
+) {
     let mut last_dash = 0u64;
     let mut last_appr = 0u64;
     let mut last_ping = Instant::now();
@@ -194,14 +203,22 @@ fn stream_loop(ws: &mut WebSocket<TcpStream>, dashboard: &DashboardHandle, stop:
         // 클라 메시지 한 건 처리(없으면 tick 타임아웃).
         match ws.read() {
             Ok(Message::Text(text)) => {
-                if text.len() <= MAX_CLIENT_FRAME_BYTES
-                    && let Some(ClientMsg::Resolve {
-                        id,
-                        allowed,
-                        remember,
-                    }) = ClientMsg::parse(text.as_str())
-                {
-                    dashboard.resolve(&id, allowed, remember);
+                if text.len() <= MAX_CLIENT_FRAME_BYTES {
+                    match ClientMsg::parse(text.as_str()) {
+                        Some(ClientMsg::Resolve {
+                            id,
+                            allowed,
+                            remember,
+                        }) => dashboard.resolve(&id, allowed, remember),
+                        // 시청 전환 — 접속당 1개, 새 watch가 이전 시청을 대체 (P5b).
+                        Some(ClientMsg::Watch { session }) => {
+                            dashboard.rebind_watch(watched.replace(session), Some(session));
+                        }
+                        Some(ClientMsg::Unwatch) => {
+                            dashboard.rebind_watch(watched.take(), None);
+                        }
+                        Some(ClientMsg::Auth { .. }) | None => {}
+                    }
                 }
             }
             Ok(Message::Close(_)) => return,

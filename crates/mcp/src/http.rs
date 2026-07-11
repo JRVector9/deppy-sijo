@@ -90,6 +90,27 @@ pub fn validate_mcp_url(input: &str) -> anyhow::Result<()> {
     parse_validated_url(input).map(|_| ())
 }
 
+/// 401/403 인증 요구 응답 (H5 401 사다리의 훅). 요청이 이 상태로 실패하면
+/// anyhow chain에 이 타입이 들어가고, 호출측(connectors)은 downcast로 챌린지를
+/// 꺼내 "에러"가 아니라 "승인 필요"로 분류한다. 세션 만료(400/404) 분류와 겹치지
+/// 않으므로 "인증 사다리를 먼저 해소한 뒤 세션 재수립 판단" 순서가 구조적으로
+/// 지켜진다 (차용: extHostMcp.ts — 4xx 폴백 판정에서 401/403 제외).
+#[derive(Debug, Clone)]
+pub struct McpAuthRequired {
+    pub status: u16,
+    /// WWW-Authenticate 헤더 원문 (없으면 None). 파싱(RFC 7235)은 crates/auth 몫.
+    /// bearer 평문이 에코된 경우를 대비해 저장 전에 마스킹된다.
+    pub www_authenticate: Option<String>,
+}
+
+impl std::fmt::Display for McpAuthRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP {} 인증 필요 (OAuth 승인 대상)", self.status)
+    }
+}
+
+impl std::error::Error for McpAuthRequired {}
+
 fn parse_validated_url(input: &str) -> anyhow::Result<Url> {
     let parsed = Url::parse(input)
         .map_err(|error| anyhow::anyhow!("MCP 서버 URL 파싱 실패: {input} ({error})"))?;
@@ -434,6 +455,20 @@ impl HttpClient {
     ) -> ExchangeError {
         if session_attached && (status == 400 || status == 404) {
             return ExchangeError::SessionExpired { status };
+        }
+        // 401/403은 구조화 에러(McpAuthRequired)로 — H5 사다리가 downcast해
+        // "승인 필요"로 분류하고 WWW-Authenticate 챌린지를 읽는다.
+        if status == 401 || status == 403 {
+            let www_authenticate = response
+                .header("www-authenticate")
+                .map(|value| self.mask_text(value));
+            return ExchangeError::Other(
+                anyhow::Error::new(McpAuthRequired {
+                    status,
+                    www_authenticate,
+                })
+                .context(format!("{method} 실패 — HTTP {status}")),
+            );
         }
         let snippet = self.read_error_snippet(response);
         // initialize 자체가 4xx(401/403 제외)면 구 HTTP+SSE transport 서버일 수
@@ -2115,5 +2150,96 @@ mod tests {
             format!("{error:#}").contains("localhost/루프백만 허용"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn 이지원사_401은_www_authenticate와_함께_구조화_에러() {
+        // H5 훅: 401 응답이 anyhow chain에 McpAuthRequired로 남아 downcast 가능해야 한다
+        let server = spawn_mock(|_, _| {
+            Reply::Raw(http_response(
+                401,
+                &[(
+                    "WWW-Authenticate",
+                    "Bearer resource_metadata=\"https://rs.example/prm\", scope=\"mcp.read\"",
+                )],
+                b"unauthorized",
+            ))
+        });
+        let error = manager()
+            .discover_tools_http(&http_config(&server, None))
+            .unwrap_err();
+        let auth = error
+            .downcast_ref::<McpAuthRequired>()
+            .expect("McpAuthRequired downcast");
+        assert_eq!(auth.status, 401);
+        assert_eq!(
+            auth.www_authenticate.as_deref(),
+            Some("Bearer resource_metadata=\"https://rs.example/prm\", scope=\"mcp.read\"")
+        );
+        // 구 SSE 힌트(다른 4xx용)와 섞이지 않는다
+        assert!(!format!("{error:#}").contains("구 HTTP+SSE"), "{error:#}");
+    }
+
+    #[test]
+    fn 인증_403도_구조화_헤더_없으면_none() {
+        let server = spawn_mock(|index, request| match index {
+            0 => json_reply(request, init_result(), None),
+            1 => accepted(),
+            2 => Reply::Raw(http_response(403, &[], b"forbidden")),
+            _ => not_found(),
+        });
+        let error = manager()
+            .discover_tools_http(&http_config(&server, None))
+            .unwrap_err();
+        let auth = error
+            .downcast_ref::<McpAuthRequired>()
+            .expect("McpAuthRequired downcast");
+        assert_eq!(auth.status, 403);
+        assert_eq!(auth.www_authenticate, None);
+    }
+
+    #[test]
+    fn 인증_401의_www_authenticate에_에코된_bearer는_마스킹() {
+        let token = "sk-echoed-in-challenge-99";
+        let server = spawn_mock(move |_, request| {
+            let echoed = format!(
+                "Bearer error=\"invalid_token\", error_description=\"{}\"",
+                request.header("authorization").unwrap_or_default()
+            );
+            Reply::Raw(http_response(
+                401,
+                &[("WWW-Authenticate", &echoed)],
+                b"unauthorized",
+            ))
+        });
+        let error = manager()
+            .discover_tools_http(&http_config(&server, Some(token)))
+            .unwrap_err();
+        let auth = error
+            .downcast_ref::<McpAuthRequired>()
+            .expect("McpAuthRequired downcast");
+        let header = auth.www_authenticate.as_deref().unwrap_or_default();
+        assert!(!header.contains(token), "{header}");
+        assert!(header.contains("[REDACTED]"), "{header}");
+    }
+
+    #[test]
+    fn 세션_만료_400은_인증_에러로_분류되지_않는다() {
+        // 인증 사다리(401/403)와 세션 재수립(400/404)의 분류가 겹치면 안 된다.
+        // 세션 부착 400은 재수립 1회 재시도 후에도 실패 시 "세션 만료" 에러다.
+        let server = spawn_mock(|index, request| match index {
+            0 => json_reply(request, init_result(), Some("s1")),
+            1 => accepted(),
+            2 => Reply::Raw(http_response(400, &[], b"expired")),
+            3 => json_reply(request, init_result(), Some("s2")),
+            4 => accepted(),
+            5 => Reply::Raw(http_response(400, &[], b"expired")),
+            _ => not_found(),
+        });
+        let error = manager()
+            .discover_tools_http(&http_config(&server, None))
+            .unwrap_err();
+        assert!(error.downcast_ref::<McpAuthRequired>().is_none());
+        assert!(format!("{error:#}").contains("세션 만료 반복"), "{error:#}");
     }
 }

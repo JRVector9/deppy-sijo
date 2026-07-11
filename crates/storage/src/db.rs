@@ -206,6 +206,12 @@ ALTER TABLE workspaces ADD COLUMN path_ino INTEGER;
     "
 ALTER TABLE credentials ADD COLUMN workspace_id TEXT;
 ",
+    // v20: OAuth 연계 메타데이터 (PR-H5). http MCP 서버 바인딩(동의 시점 서버 URL),
+    // 발견된 AS endpoint, client_id, scope, 만료 시각 등 **비밀 아닌** JSON만 저장한다
+    // — 비밀(access/refresh/DCR secret)은 전부 keyring (§2.1). JSON 해석은 앱(connectors) 몫.
+    "
+ALTER TABLE credentials ADD COLUMN oauth_json TEXT;
+",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -606,6 +612,32 @@ impl Db {
                 workspace_id: row.get(5)?,
             })
         })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// OAuth 연계 메타데이터(JSON, 비밀 아님 — v20)를 갱신한다 (PR-H5).
+    /// 값 스키마는 앱(connectors)의 OAuthConnection 직렬화가 소유한다.
+    pub fn set_credential_oauth_json(&self, id: &str, json: &str) -> anyhow::Result<()> {
+        let affected = self
+            .conn
+            .execute(
+                "UPDATE credentials
+                 SET oauth_json = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE id = ?1",
+                (id, json),
+            )
+            .with_context(|| format!("credential oauth 메타 저장 실패: {id}"))?;
+        anyhow::ensure!(affected == 1, "credential 없음: {id}");
+        Ok(())
+    }
+
+    /// oauth_json이 있는 credential (id, json) 목록 — H5가 서버 바인딩을 찾는 데 쓴다.
+    pub fn list_credential_oauth_json(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, oauth_json FROM credentials
+             WHERE oauth_json IS NOT NULL ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -1881,6 +1913,35 @@ mod tests {
         assert_eq!(listed[0].id, "cred-2");
         // 없는 id는 false (참조 중과 동일하게 "안 지움")
         assert!(!db.delete_credential_if_unused("cred-1").unwrap());
+    }
+
+    #[test]
+    fn credential_oauth_메타는_json으로_왕복된다() {
+        // PR-H5 (v20): oauth_json은 비밀 아닌 연계 메타데이터만 담는다
+        let db = Db::open_in_memory().unwrap();
+        db.insert_credential(&sample("cred-oauth")).unwrap();
+        db.insert_credential(&sample("cred-plain")).unwrap();
+
+        assert!(db.list_credential_oauth_json().unwrap().is_empty());
+        db.set_credential_oauth_json("cred-oauth", r#"{"server_id":"srv-1"}"#)
+            .unwrap();
+        let rows = db.list_credential_oauth_json().unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                "cred-oauth".to_owned(),
+                r#"{"server_id":"srv-1"}"#.to_owned()
+            )]
+        );
+        // 갱신은 마지막 값으로 대체
+        db.set_credential_oauth_json("cred-oauth", r#"{"server_id":"srv-2"}"#)
+            .unwrap();
+        assert_eq!(
+            db.list_credential_oauth_json().unwrap()[0].1,
+            r#"{"server_id":"srv-2"}"#
+        );
+        // 없는 credential은 에러
+        assert!(db.set_credential_oauth_json("cred-missing", "{}").is_err());
     }
 
     #[test]

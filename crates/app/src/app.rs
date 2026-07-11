@@ -427,6 +427,9 @@ impl ui::credentials::CredentialService for AppCredentialService<'_> {
         self.secret_store.delete_secret(id)?;
         self.secret_store
             .delete_secret(&auth::refresh_entry_id(id))?;
+        // DCR client_secret entry도 함께 정리 (H4 리뷰 P2 — `{id}.dcr` 고아 방지)
+        self.secret_store
+            .delete_secret(&auth::dcr_secret_entry_id(id))?;
         if !self.db.delete_credential_if_unused(id)? {
             anyhow::bail!(
                 "삭제 중 env var 참조가 생겼습니다 — secret은 지워졌으니 변수 정리 후 다시 삭제하세요"
@@ -729,9 +732,13 @@ fn scan_keychain_accounts() -> anyhow::Result<Vec<String>> {
     Ok(accounts)
 }
 
-/// UUID v4 형태(8-4-4-4-12 hex)인가 — credential id 규약. `.refresh` 접미는 벗겨 판정.
+/// UUID v4 형태(8-4-4-4-12 hex)인가 — credential id 규약. `.refresh`/`.dcr`
+/// 접미(OAuth refresh token / DCR client_secret entry — H4 규약)는 벗겨 판정.
 fn uuid_base(account: &str) -> Option<&str> {
-    let base = account.strip_suffix(".refresh").unwrap_or(account);
+    let base = account
+        .strip_suffix(".refresh")
+        .or_else(|| account.strip_suffix(".dcr"))
+        .unwrap_or(account);
     let bytes = base.as_bytes();
     if bytes.len() != 36 {
         return None;
@@ -759,21 +766,52 @@ impl ui::connectors::OAuthCredentialStore for AppOAuthCredentialStore<'_> {
         token: &auth::OAuthToken,
     ) -> anyhow::Result<ui::connectors::StoredOAuthCredential> {
         let id = uuid::Uuid::new_v4().to_string();
-        auth::store_token(self.secret_store, &id, token)?;
-        self.redaction.register(&token.access_token);
-        if let Some(refresh) = &token.refresh_token {
-            self.redaction.register(refresh);
-        }
+        self.update_oauth_token(&id, token)?;
         Ok(ui::connectors::StoredOAuthCredential {
             id,
             masked_hint: secret::masked_hint(token.access_token.expose()),
         })
     }
 
+    /// 재승인(H5) — 기존 credential id 아래 토큰 재저장 (env 참조 유지).
+    fn update_oauth_token(&self, id: &str, token: &auth::OAuthToken) -> anyhow::Result<()> {
+        auth::store_token(self.secret_store, id, token)?;
+        self.redaction.register(&token.access_token);
+        if let Some(refresh) = &token.refresh_token {
+            self.redaction.register(refresh);
+        }
+        Ok(())
+    }
+
+    /// DCR client_secret keyring 관리 (H5) — Some이면 `{id}.dcr` 저장, None이면 정리.
+    fn set_dcr_secret(
+        &self,
+        id: &str,
+        secret: Option<&secret::SecretString>,
+    ) -> anyhow::Result<()> {
+        let entry = auth::dcr_secret_entry_id(id);
+        match secret {
+            Some(secret) => {
+                self.secret_store.set_secret(&entry, secret)?;
+                self.redaction.register(secret);
+            }
+            None => {
+                // entry가 없어도 정리 성공으로 취급 (재등록으로 secret이 사라진 경우)
+                if let Err(e) = self.secret_store.delete_secret(&entry) {
+                    tracing::debug!("DCR secret entry 정리 생략: {e:#}");
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn delete_oauth_token(&self, id: &str) -> anyhow::Result<()> {
         self.secret_store.delete_secret(id)?;
         self.secret_store
             .delete_secret(&auth::refresh_entry_id(id))?;
+        // DCR client_secret entry도 함께 정리 (H4 리뷰 P2)
+        self.secret_store
+            .delete_secret(&auth::dcr_secret_entry_id(id))?;
         Ok(())
     }
 }
@@ -1024,6 +1062,11 @@ pub struct App {
     secret_store: KeyringSecretStore,
     agents_ui: ui::agents::AgentsUi,
     connectors_ui: ui::connectors::ConnectorsUi,
+    /// OAuth refresh single-flight 조율자 (H5) — 프로세스 단일 인스턴스의 원본.
+    /// 현재 소비자는 connectors_ui뿐이지만, 후속 소비자(P2 web 브리지 등)도 반드시
+    /// 이 인스턴스의 Arc 클론을 받아야 single-flight가 성립한다 (H4 규약).
+    #[allow(dead_code)]
+    refresh_coordinator: Arc<auth::RefreshCoordinator>,
     credentials_ui: ui::credentials::CredentialsUi,
     env_profiles_ui: ui::env_profiles::EnvProfilesUi,
     activity_ui: ui::activity::ActivityUi,
@@ -1178,6 +1221,12 @@ impl App {
             }
         }
 
+        // OAuth refresh single-flight 조율자 (H5) — **프로세스 단일 인스턴스**를 App이
+        // 보관하고 소비자(connectors, 후속 P2 web 브리지 등)는 Arc 클론을 공유한다.
+        // 인스턴스가 갈라지면 동시 도구 호출의 refresh 중복 발사(회전 refresh token
+        // 재사용 → AS replay 감지로 grant 폐기)를 막지 못한다 (H4 규약).
+        let refresh_coordinator = Arc::new(auth::RefreshCoordinator::new());
+
         let approval_poll_requested = Arc::new(AtomicBool::new(false));
         let approval_watcher = ApprovalWatcher::spawn(
             db_path.clone(),
@@ -1231,7 +1280,12 @@ impl App {
             db,
             secret_store: KeyringSecretStore,
             agents_ui: ui::agents::AgentsUi::new(),
-            connectors_ui: ui::connectors::ConnectorsUi::new(redaction.clone()),
+            connectors_ui: ui::connectors::ConnectorsUi::new(
+                redaction.clone(),
+                Arc::new(KeyringSecretStore),
+                Arc::clone(&refresh_coordinator),
+            ),
+            refresh_coordinator,
             credentials_ui: ui::credentials::CredentialsUi::new(),
             env_profiles_ui: ui::env_profiles::EnvProfilesUi::new(),
             activity_ui: ui::activity::ActivityUi::new(),
@@ -3106,8 +3160,34 @@ impl App {
 
     fn poll_pending_approvals(&mut self) {
         match self.db.list_pending_approvals() {
-            Ok(rows) => self.approvals_ui.set_pending(rows),
+            Ok(rows) => {
+                let remote_urls = self.approval_remote_urls(&rows);
+                self.approvals_ui.set_pending(rows, remote_urls);
+            }
             Err(e) => tracing::warn!("승인 목록 조회 실패: {e:#}"),
+        }
+    }
+
+    /// pending 승인에 표시할 http 서버 원격 url (server_id → url).
+    /// proxy 경유 경로는 Connector Center 신뢰 모달을 거치지 않으므로 첫 Ask 승인이
+    /// 원격 전송 고지를 겸한다 (H3 리뷰 P1). pending이 없으면 조회하지 않는다.
+    fn approval_remote_urls(
+        &self,
+        rows: &[storage::PendingApprovalRow],
+    ) -> std::collections::HashMap<String, String> {
+        if rows.is_empty() {
+            return Default::default();
+        }
+        match self.db.list_mcp_servers() {
+            Ok(servers) => servers
+                .into_iter()
+                .filter(|server| server.kind == "http")
+                .filter_map(|server| Some((server.id, server.url?)))
+                .collect(),
+            Err(e) => {
+                tracing::warn!("승인 고지용 MCP 서버 조회 실패: {e:#}");
+                Default::default()
+            }
         }
     }
 
@@ -3606,13 +3686,13 @@ impl eframe::App for App {
             .observe_launch_events(&events, ui.ctx(), &text);
         // 커넥터 백그라운드 결과(tools/call·MCP invoke·OAuth)는 창 표시와 무관하게 매 프레임 소화.
         self.connectors_ui.drain_results(&mut self.db);
-        self.connectors_ui.drain_invoke();
+        self.connectors_ui.drain_invoke(&self.db);
         let credential_added = {
             let oauth_store = AppOAuthCredentialStore {
                 secret_store: &self.secret_store,
                 redaction: &self.redaction,
             };
-            self.connectors_ui.drain_oauth(&self.db, &oauth_store)
+            self.connectors_ui.drain_oauth(&mut self.db, &oauth_store)
         };
         if credential_added {
             self.credentials_ui.invalidate_cache();
@@ -3688,10 +3768,7 @@ impl eframe::App for App {
             }
             self.prune_resolved_approvals();
             // 해소 직후 목록을 갱신해 다음 항목이 바로 뜨게 한다 (다음 폴링을 기다리지 않음).
-            match self.db.list_pending_approvals() {
-                Ok(rows) => self.approvals_ui.set_pending(rows),
-                Err(e) => tracing::warn!("승인 목록 조회 실패: {e:#}"),
-            }
+            self.poll_pending_approvals();
             ui.ctx().request_repaint();
         }
 

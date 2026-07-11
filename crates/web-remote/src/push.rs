@@ -62,6 +62,16 @@ const PUSH_URGENCY: &str = "high";
 const RECORD_SIZE: u32 = 4096;
 /// 발송 HTTP 타임아웃 — 죽은 endpoint가 스레드를 무한정 잡지 않게.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+/// 세션 상태 알림의 총 발송 시도 횟수(첫 시도 + 재시도). 승인은 DB 폴링이 스스로 재수렴하지만
+/// 세션 전이는 (session,kind)가 생애 1회라 재시도 큐가 없으면 일시 장애 = 영구 유실이다.
+const SESSION_SEND_ATTEMPTS: u32 = 3;
+/// `notified_status` 상한 — 세션 id는 런타임에서 단조 증가(next_id)하므로 초과 시 가장 낮은
+/// (=가장 오래된) id부터 버린다. 승인 기록은 pending 목록으로 자기정리되지만 세션 상태는
+/// "사라짐" 신호가 없어 상한으로 유계화한다.
+const MAX_NOTIFIED_SESSIONS: usize = 256;
+/// 등록 가능한 구독 수 상한(계정 전체). 개인용 1~2기기 가정 + 여유. 죽은 endpoint를 다수
+/// 등록해 발송 스레드를 HTTP_TIMEOUT×재시도×구독수만큼 붙잡는 지연을 막는다.
+const MAX_SUBSCRIPTIONS: usize = 8;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // VAPID 키 (ES256)
@@ -121,10 +131,15 @@ impl VapidKey {
     /// VAPID JWT(RFC 8292)를 서명한다. `aud`=endpoint origin, `exp`=now+TTL(≤24h), sub 고정.
     fn sign_jwt(&self, aud: &str, now_secs: u64) -> String {
         let header = URL_SAFE_NO_PAD.encode(br#"{"typ":"JWT","alg":"ES256"}"#);
-        // 클레임은 세 필드만 — aud/exp/sub. 문자열 이스케이프가 필요 없는 값(aud=origin,
-        // sub=고정 mailto)이라 수제 조립해도 안전하다.
-        let exp = now_secs + JWT_TTL_SECS;
-        let claims = format!(r#"{{"aud":"{aud}","exp":{exp},"sub":"{VAPID_SUB}"}}"#);
+        // 클레임(aud/exp/sub)은 serde_json으로 조립한다 — 수제 문자열 조립은 aud에 따옴표·제어
+        // 문자가 섞이면 JSON을 깨뜨린다(등록 검증이 있어도 이스케이프는 직렬화기에 맡긴다).
+        // Notification::payload와 같은 방식.
+        let claims = serde_json::json!({
+            "aud": aud,
+            "exp": now_secs + JWT_TTL_SECS,
+            "sub": VAPID_SUB,
+        })
+        .to_string();
         let claims = URL_SAFE_NO_PAD.encode(claims);
         let signing_input = format!("{header}.{claims}");
         // ES256: ECDSA(P-256, SHA-256) — signature는 고정 64바이트 r‖s(JWS 규약).
@@ -340,8 +355,40 @@ enum Delivery {
     Ok,
     /// 404/410 — 죽은 구독, 즉시 삭제.
     Gone,
-    /// 재시도 1회 후에도 실패 — 이번은 포기(구독은 유지).
+    /// 재시도 1회 후에도 실패(5xx/429/타임아웃/DNS) — **일시 장애**로 본다. 구독은 유지하고
+    /// 호출자가 중복 억제 마킹을 보류해 다음 주기에 재시도한다.
     Failed,
+    /// 구독 데이터가 깨져 발송 자체가 불가(endpoint origin 파싱·본문 암호화 실패). 재시도해도
+    /// 결과가 같으므로 **재시도 대상이 아니다** — 5초마다 무의미한 재발송이 도는 것을 막는다.
+    Broken,
+}
+
+/// 한 번의 브로드캐스트 결과 — 호출자가 "중복 억제 마킹을 커밋할지" 판단하는 근거.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BroadcastOutcome {
+    /// 2xx로 실제 전달된 구독 수.
+    delivered: usize,
+    /// 일시 장애로 실패한 구독 수(재시도 대상).
+    failed: usize,
+}
+
+impl BroadcastOutcome {
+    /// 중복 억제 마킹("이미 알렸다")을 커밋해도 되는가.
+    ///
+    /// 설계 판단 — 발송 실패가 마킹을 롤백하지 않아 생기던 **무음 유실**을 막되, 재시도가
+    /// 중복 알림·폭주로 번지지 않게 한다:
+    ///   - **하나라도 전달**(delivered>0)되면 커밋한다. 실패한 기기 하나 때문에 마킹을 미루면
+    ///     이미 받은 기기에 같은 알림이 다시 간다. 페이로드는 endpoint별 상태가 아니라
+    ///     "종류/개수" 요약이라, 실패한 기기는 다음 새 승인·상태 전이에서 자연히 재수렴한다.
+    ///   - **전량 실패**(delivered==0 && failed>0)면 커밋하지 않는다 → 다음 폴링 주기(승인)나
+    ///     재시도 큐(세션)가 같은 알림을 다시 보낸다. 폭주는 "시도당 재시도 1회" 상한과
+    ///     폴링 주기가 막는다.
+    ///   - **재시도 대상이 없음**(delivered==0 && failed==0: 구독 0건 / 전부 410으로 삭제 /
+    ///     키 손상)이면 커밋한다. 다시 보내도 결과가 같으므로 재시도해봐야 무한 반복뿐이다.
+    ///     410으로 구독이 사라진 경우는 그 구독이 목록에서 빠지므로 어차피 재시도 대상이 아니다.
+    fn should_commit(self) -> bool {
+        self.delivered > 0 || self.failed == 0
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -395,14 +442,27 @@ enum SessionKind {
 // PushManager — 전용 발송 스레드 + 구독/트리거 상태
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// 발송 대기 중인 세션 상태 알림 한 건.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionJob {
+    session: u64,
+    kind: SessionKind,
+    /// 지금까지 시도한 횟수(0 = 아직 미시도). SESSION_SEND_ATTEMPTS에서 포기한다.
+    attempts: u32,
+}
+
 struct PushInner {
     /// 즉시 1회 재평가 강제(구독 등록 직후).
     force: bool,
     /// 대시보드 브리지가 넣은 세션 상태 알림 큐.
-    jobs: VecDeque<(u64, SessionKind)>,
+    jobs: VecDeque<SessionJob>,
+    /// 전량 실패해 **다음 주기에** 재시도할 세션 알림. 스레드 깨움 조건(ready/wait)에 넣지
+    /// 않는 것이 핵심 — 넣으면 실패 즉시 같은 발송이 반복돼 폭주한다. 구독>0이면 어차피 폴링
+    /// 주기마다 깨므로 그때 jobs와 함께 처리된다(구독 0이면 보낼 곳이 없어 처리하지 않는다).
+    retry_jobs: VecDeque<SessionJob>,
     /// 이미 푸시한 pending 승인 id — 중복 발송 방지. pending에서 사라지면 정리(유계).
     notified_approvals: HashSet<String>,
-    /// 세션별 마지막으로 알린 상태 — 같은 전이 반복 발송 방지.
+    /// 세션별 마지막으로 알린 상태 — 같은 전이 반복 발송 방지. MAX_NOTIFIED_SESSIONS로 유계.
     notified_status: HashMap<u64, SessionKind>,
 }
 
@@ -413,6 +473,9 @@ struct PushShared {
     db: Mutex<storage::Db>,
     vapid: VapidKey,
     transport: Box<dyn PushTransport>,
+    /// 승인 폴링 주기 — 운영은 POLL_INTERVAL. 테스트만 짧게 주입해 "다음 주기 재시도"를 빠르게
+    /// 관찰한다.
+    poll_interval: Duration,
     /// 현재 구독 수(폴링 게이트). 0이면 스레드가 park해 폴링이 정지한다.
     sub_count: AtomicUsize,
     stop: AtomicBool,
@@ -446,12 +509,23 @@ impl PushManager {
         vapid: VapidKey,
         transport: Box<dyn PushTransport>,
     ) -> anyhow::Result<Self> {
+        Self::spawn_with_interval(db_path, vapid, transport, POLL_INTERVAL)
+    }
+
+    /// 트랜스포트 + 폴링 주기를 주입해 띄운다(테스트: 재시도를 5초 기다리지 않게).
+    fn spawn_with_interval(
+        db_path: PathBuf,
+        vapid: VapidKey,
+        transport: Box<dyn PushTransport>,
+        poll_interval: Duration,
+    ) -> anyhow::Result<Self> {
         let db = storage::Db::open(&db_path).context("web-remote 웹푸시 DB 열기 실패")?;
         let initial = db.count_web_push_subscriptions().unwrap_or(0).max(0) as usize;
         let shared = Arc::new(PushShared {
             inner: Mutex::new(PushInner {
                 force: false,
                 jobs: VecDeque::new(),
+                retry_jobs: VecDeque::new(),
                 notified_approvals: HashSet::new(),
                 notified_status: HashMap::new(),
             }),
@@ -459,6 +533,7 @@ impl PushManager {
             db: Mutex::new(db),
             vapid,
             transport,
+            poll_interval,
             sub_count: AtomicUsize::new(initial),
             stop: AtomicBool::new(false),
             poll_count: AtomicU64::new(0),
@@ -498,11 +573,31 @@ impl PushHandle {
         self.shared.vapid.public_key_b64url()
     }
 
-    /// 구독을 등록/갱신한다(POST /push/subscribe). DB에 쓰고 스레드를 깨워 즉시 재평가시킨다.
-    pub fn add_subscription(&self, endpoint: &str, p256dh: &str, auth: &str) -> anyhow::Result<()> {
+    /// 구독을 등록/갱신한다(POST /push/subscribe). endpoint 정책(https·공인 주소)과 구독 수
+    /// 상한을 통과해야 DB에 쓰고, 스레드를 깨워 즉시 재평가시킨다.
+    pub fn add_subscription(
+        &self,
+        endpoint: &str,
+        p256dh: &str,
+        auth: &str,
+    ) -> Result<(), SubscribeError> {
+        if !endpoint_allowed(endpoint) {
+            return Err(SubscribeError::BadEndpoint);
+        }
         {
             let db = self.shared.db.lock().expect("push db lock");
-            db.upsert_web_push_subscription(endpoint, p256dh, auth, now_secs() as i64)?;
+            // 상한 검사는 DB 락 안에서 — 동시 등록이 상한을 넘겨 삽입하는 경쟁을 막는다.
+            // 이미 등록된 endpoint의 재등록(브라우저 키 회전)은 새 구독이 아니라 상한과 무관하다.
+            let existing = db
+                .list_web_push_subscriptions()
+                .map_err(SubscribeError::Storage)?;
+            if existing.len() >= MAX_SUBSCRIPTIONS
+                && !existing.iter().any(|row| row.endpoint == endpoint)
+            {
+                return Err(SubscribeError::TooManySubscriptions);
+            }
+            db.upsert_web_push_subscription(endpoint, p256dh, auth, now_secs() as i64)
+                .map_err(SubscribeError::Storage)?;
             let count = db.count_web_push_subscriptions().unwrap_or(0).max(0) as usize;
             self.shared.sub_count.store(count, Ordering::SeqCst);
         }
@@ -524,7 +619,11 @@ impl PushHandle {
         };
         {
             let mut inner = self.shared.inner.lock().expect("push inner lock");
-            inner.jobs.push_back((session, kind));
+            inner.jobs.push_back(SessionJob {
+                session,
+                kind,
+                attempts: 0,
+            });
         }
         self.shared.cvar.notify_all();
     }
@@ -548,6 +647,8 @@ fn run(shared: &Arc<PushShared>) {
         {
             let mut inner = shared.inner.lock().expect("push inner lock");
             // 대기: stop / force / 세션 작업 / (구독>0 && 폴링 주기) 중 하나까지.
+            // retry_jobs는 **깨움 조건이 아니다** — 넣으면 전량 실패가 즉시 재시도로 이어져
+            // 폭주한다. 구독>0이면 폴링 주기마다 깨므로 그때 함께 처리된다.
             loop {
                 if shared.stop.load(Ordering::SeqCst) {
                     return;
@@ -564,32 +665,46 @@ fn run(shared: &Arc<PushShared>) {
                 return;
             }
             let subs = shared.sub_count.load(Ordering::SeqCst);
-            // 세션 작업 큐를 통째로 꺼내 락 밖에서 처리한다(구독 0이면 아래에서 skip).
-            jobs = std::mem::take(&mut inner.jobs);
+            // 이번 주기 작업 = 지난 주기에 전량 실패한 재시도분 + 브리지가 새로 넣은 알림.
+            // 락 밖에서 처리한다(구독 0이면 아래에서 skip).
+            let mut batch = std::mem::take(&mut inner.retry_jobs);
+            batch.extend(inner.jobs.drain(..));
+            jobs = batch;
             do_poll = subs > 0;
             inner.force = false;
         }
 
-        // 세션 상태 알림 — 중복 억제(같은 세션·같은 상태는 1회).
-        for (session, kind) in jobs {
-            let subs = shared.sub_count.load(Ordering::SeqCst);
-            if subs == 0 {
+        // 세션 상태 알림 — 중복 억제(같은 세션·같은 상태는 1회). 마킹은 **발송 결과를 보고**
+        // 커밋한다(BroadcastOutcome::should_commit) — 전량 실패면 마킹하지 않고 재시도 큐에
+        // 넣는다. 세션 전이는 생애 1회라 여기서 버리면 영구 유실이다.
+        for job in jobs {
+            if shared.sub_count.load(Ordering::SeqCst) == 0 {
                 continue;
             }
             let already = {
-                let mut inner = shared.inner.lock().expect("push inner lock");
-                let dup = inner.notified_status.get(&session) == Some(&kind);
-                if !dup {
-                    inner.notified_status.insert(session, kind);
-                }
-                dup
+                let inner = shared.inner.lock().expect("push inner lock");
+                inner.notified_status.get(&job.session) == Some(&job.kind)
             };
-            if !already {
-                let note = match kind {
-                    SessionKind::Done => Notification::SessionDone,
-                    SessionKind::Waiting => Notification::SessionWaiting,
-                };
-                broadcast(shared, &note);
+            if already {
+                continue;
+            }
+            let note = match job.kind {
+                SessionKind::Done => Notification::SessionDone,
+                SessionKind::Waiting => Notification::SessionWaiting,
+            };
+            let outcome = broadcast(shared, &note);
+            let attempts = job.attempts + 1;
+            if outcome.should_commit() {
+                let mut inner = shared.inner.lock().expect("push inner lock");
+                remember_status(&mut inner.notified_status, job.session, job.kind);
+            } else if attempts < SESSION_SEND_ATTEMPTS {
+                let mut inner = shared.inner.lock().expect("push inner lock");
+                inner.retry_jobs.push_back(SessionJob { attempts, ..job });
+            } else {
+                tracing::warn!(
+                    attempts,
+                    "웹푸시 세션 알림 재시도 상한 초과 — 포기(구독 측 지속 장애)"
+                );
             }
         }
 
@@ -598,16 +713,33 @@ fn run(shared: &Arc<PushShared>) {
             shared.poll_count.fetch_add(1, Ordering::SeqCst);
             poll_and_notify_approvals(shared);
             // 다음 폴링 주기까지 대기(구독>0). 그 사이 force/세션작업/stop이 깨운다.
+            // retry_jobs는 조건에서 제외 — 재시도는 다음 주기에 한 번만(폭주 방지).
             let inner = shared.inner.lock().expect("push inner lock");
             if !inner.force && inner.jobs.is_empty() && !shared.stop.load(Ordering::SeqCst) {
-                let _ = shared.cvar.wait_timeout(inner, POLL_INTERVAL);
+                let _ = shared.cvar.wait_timeout(inner, shared.poll_interval);
             }
         }
     }
 }
 
+/// 세션 상태 마킹을 기록하고 상한을 지킨다. 세션 id는 런타임에서 단조 증가하므로 상한 초과 시
+/// 가장 낮은 id(=가장 오래된 세션)부터 버린다 — 그 세션은 이미 끝나 같은 전이가 다시 오지 않는다.
+/// (승인 기록은 pending 목록으로 retain 정리되지만, 세션은 "사라짐" 신호가 없어 상한을 쓴다.)
+fn remember_status(notified: &mut HashMap<u64, SessionKind>, session: u64, kind: SessionKind) {
+    notified.insert(session, kind);
+    while notified.len() > MAX_NOTIFIED_SESSIONS {
+        let Some(oldest) = notified.keys().min().copied() else {
+            break;
+        };
+        notified.remove(&oldest);
+    }
+}
+
 /// pending 승인을 폴링해 새 id가 있으면 개수 알림을 1건 보낸다. 이미 알린 id는 건너뛰고,
 /// pending에서 사라진 id는 기억에서 지운다(유계).
+///
+/// 마킹("이미 알렸다")은 **발송이 성공한 뒤에만** 커밋한다 — 전량 실패인데 마킹부터 하면 다음
+/// 폴링에서 같은 id가 이미 알린 것으로 보여 그 승인은 영구히 알림 없이 묻힌다.
 fn poll_and_notify_approvals(shared: &Arc<PushShared>) {
     let pending = {
         let db = shared.db.lock().expect("push db lock");
@@ -626,40 +758,46 @@ fn poll_and_notify_approvals(shared: &Arc<PushShared>) {
         inner
             .notified_approvals
             .retain(|id| current_ids.contains(id));
-        let has_new = pending
+        pending
             .iter()
-            .any(|row| !inner.notified_approvals.contains(&row.id));
-        if has_new {
-            for id in &current_ids {
-                inner.notified_approvals.insert(id.clone());
-            }
-        }
-        has_new
+            .any(|row| !inner.notified_approvals.contains(&row.id))
     };
-    if has_new {
-        broadcast(
-            shared,
-            &Notification::Approval {
-                count: pending.len(),
-            },
-        );
+    if !has_new {
+        return;
+    }
+    let outcome = broadcast(
+        shared,
+        &Notification::Approval {
+            count: pending.len(),
+        },
+    );
+    if !outcome.should_commit() {
+        // 전량 실패 — 마킹하지 않는다. 다음 폴링 주기가 같은 pending을 다시 알린다.
+        return;
+    }
+    let mut inner = shared.inner.lock().expect("push inner lock");
+    for id in current_ids {
+        inner.notified_approvals.insert(id);
     }
 }
 
-/// 모든 구독에 알림을 보낸다. 성공은 last_ok_at 갱신, 410/404는 구독 삭제, 그 외 실패는 포기.
-fn broadcast(shared: &Arc<PushShared>, note: &Notification) {
+/// 모든 구독에 알림을 보낸다. 성공은 last_ok_at 갱신, 410/404는 구독 삭제, 그 외 실패는 이번
+/// 시도 포기. 결과([`BroadcastOutcome`])로 호출자가 중복 억제 마킹 커밋 여부를 정한다.
+fn broadcast(shared: &Arc<PushShared>, note: &Notification) -> BroadcastOutcome {
     let subs = {
         let db = shared.db.lock().expect("push db lock");
         db.list_web_push_subscriptions().unwrap_or_default()
     };
+    let mut outcome = BroadcastOutcome::default();
     if subs.is_empty() {
-        return;
+        return outcome;
     }
     let payload = note.payload();
     let mut changed = false;
     for sub in subs {
         match deliver(shared, &sub, payload.as_bytes()) {
             Delivery::Ok => {
+                outcome.delivered += 1;
                 let db = shared.db.lock().expect("push db lock");
                 let _ = db.touch_web_push_subscription(&sub.endpoint, now_secs() as i64);
             }
@@ -670,9 +808,19 @@ fn broadcast(shared: &Arc<PushShared>, note: &Notification) {
                 tracing::info!("웹푸시 구독 만료(410/404) — 삭제");
             }
             Delivery::Failed => {
-                tracing::warn!("웹푸시 발송 실패(재시도 후 포기)");
+                outcome.failed += 1;
+                tracing::warn!("웹푸시 발송 실패(재시도 후 포기) — 다음 주기 재시도 대상");
+            }
+            Delivery::Broken => {
+                tracing::warn!("웹푸시 구독 데이터 손상 — 발송 불가(재시도 무의미)");
             }
         }
+    }
+    if outcome.delivered == 0 && outcome.failed > 0 {
+        tracing::warn!(
+            failed = outcome.failed,
+            "웹푸시 전량 실패 — 중복 억제 마킹 보류(다음 주기 재시도)"
+        );
     }
     if changed {
         let count = shared
@@ -684,10 +832,11 @@ fn broadcast(shared: &Arc<PushShared>, note: &Notification) {
             .max(0) as usize;
         shared.sub_count.store(count, Ordering::SeqCst);
     }
+    outcome
 }
 
 /// 한 구독으로 발송한다: VAPID JWT + RFC 8291 암호화 + POST(재시도 1회). 암호화 실패는
-/// 즉시 포기(구독 데이터가 깨진 경우 — 재시도 무의미).
+/// 즉시 포기(구독 데이터가 깨진 경우 — 재시도 무의미 → Broken).
 fn deliver(
     shared: &Arc<PushShared>,
     sub: &storage::WebPushSubscriptionRow,
@@ -695,13 +844,13 @@ fn deliver(
 ) -> Delivery {
     let Some(aud) = endpoint_origin(&sub.endpoint) else {
         tracing::warn!("웹푸시 endpoint origin 파싱 실패 — 건너뜀");
-        return Delivery::Failed;
+        return Delivery::Broken;
     };
     let body = match encrypt_payload(&sub.p256dh, &sub.auth, payload) {
         Ok(body) => body,
         Err(e) => {
             tracing::warn!("웹푸시 본문 암호화 실패: {e:#}");
-            return Delivery::Failed;
+            return Delivery::Broken;
         }
     };
     let authorization = shared.vapid.authorization_header(&aud, now_secs());
@@ -768,7 +917,8 @@ fn vapid_key_response(query: &str, token: &str, push: Option<&PushHandle>) -> Re
     }
 }
 
-/// 구독 등록 — 토큰 게이트 + JSON 본문 {endpoint, keys:{p256dh, auth}}.
+/// 구독 등록 — 토큰 게이트 + JSON 본문 {endpoint, keys:{p256dh, auth}}. endpoint는 정책 검증을
+/// 통과해야 한다(https 공인 주소 + 구독 수 상한).
 fn subscribe_response(
     query: &str,
     body: &[u8],
@@ -790,11 +940,31 @@ fn subscribe_response(
     }
     match push.add_subscription(&sub.endpoint, &sub.keys.p256dh, &sub.keys.auth) {
         Ok(()) => Response::plain(201, "subscribed"),
-        Err(e) => {
+        Err(SubscribeError::BadEndpoint) => {
+            // endpoint는 로그하지 않는다(토큰 보유자가 넣은 임의 문자열).
+            tracing::warn!("웹푸시 구독 endpoint 거부 — https 공인 주소만 허용");
+            Response::plain(400, "bad endpoint")
+        }
+        Err(SubscribeError::TooManySubscriptions) => {
+            tracing::warn!(limit = MAX_SUBSCRIPTIONS, "웹푸시 구독 수 상한 초과 — 거부");
+            Response::plain(403, "subscription limit reached")
+        }
+        Err(SubscribeError::Storage(e)) => {
             tracing::warn!("웹푸시 구독 등록 실패: {e:#}");
             Response::plain(500, "subscribe failed")
         }
     }
+}
+
+/// 구독 등록 거부 사유 — HTTP 상태 매핑용.
+#[derive(Debug)]
+pub enum SubscribeError {
+    /// endpoint 정책 위반(https 아님 / 내부·사설 주소) → 400.
+    BadEndpoint,
+    /// 계정 전체 구독 수 상한 초과 → 403.
+    TooManySubscriptions,
+    /// DB 오류 → 500.
+    Storage(anyhow::Error),
 }
 
 #[derive(serde::Deserialize)]
@@ -830,16 +1000,94 @@ fn now_secs() -> u64 {
 }
 
 /// endpoint URL에서 origin(scheme://authority)을 뽑는다 — VAPID `aud`. url 크레이트 없이 파싱.
+/// authority는 path/query/fragment 앞까지다(`?`/`#`가 aud에 새지 않게).
 fn endpoint_origin(endpoint: &str) -> Option<String> {
     let (scheme, rest) = endpoint.split_once("://")?;
-    if scheme.is_empty() || rest.is_empty() {
+    if scheme.is_empty() {
         return None;
     }
-    let authority = rest.split('/').next().unwrap_or(rest);
+    let authority = endpoint_authority(rest);
     if authority.is_empty() {
         return None;
     }
     Some(format!("{scheme}://{authority}"))
+}
+
+/// `://` 뒤에서 authority(host[:port])만 잘라낸다 — path/query/fragment 제거.
+fn endpoint_authority(rest: &str) -> &str {
+    rest.split(['/', '?', '#']).next().unwrap_or("")
+}
+
+/// 구독 endpoint가 등록 가능한 주소인지 검사한다(SSRF 방어).
+///
+/// 토큰 보유자라도 앱이 내부망으로 POST하게 만들 수 없어야 한다(대시보드에 흔적이 남지 않는
+/// 발송 채널). 규칙:
+///   (a) scheme은 **https만** — 평문 http나 다른 scheme은 거부.
+///   (b) userinfo(`user@host`)는 거부 — 정상 push 서비스에 없고 host 오인의 원인.
+///   (c) host가 loopback/사설/링크로컬/CGNAT/유니크로컬 **IP 리터럴**이거나 localhost 계열
+///       이름이면 거부.
+///
+/// 한계: DNS 이름이 사설 IP로 해석되는 경우(DNS rebinding)는 여기서 막지 못한다 — 해석은 발송
+/// 시점 트랜스포트가 하므로 완전 차단하려면 커넥터 수준 제어가 필요하다. 잔여 리스크로 남긴다
+/// (공격자는 이미 페어링 토큰을 가진 상태이고, 발송 본문은 종류/개수 요약뿐이다).
+fn endpoint_allowed(endpoint: &str) -> bool {
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let authority = endpoint_authority(rest);
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    // host 추출 — IPv6 리터럴은 `[::1]:443` 형태.
+    let host = if let Some(after) = authority.strip_prefix('[') {
+        match after.split_once(']') {
+            Some((host, _port)) => host,
+            None => return false,
+        }
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    if host.is_empty() {
+        return false;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return !is_internal_ip(&ip);
+    }
+    // DNS 이름 — loopback 별칭과 mDNS(.local)만 거부한다.
+    let lower = host.to_ascii_lowercase();
+    !(lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local"))
+}
+
+/// 내부망 IP인가 — loopback/사설/링크로컬/CGNAT(tailscale 대역)/유니크로컬/멀티캐스트 등.
+fn is_internal_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            v4.is_loopback()          // 127.0.0.0/8
+                || v4.is_private()    // 10/8, 172.16/12, 192.168/16
+                || v4.is_link_local() // 169.254/16
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || a == 0                            // 0.0.0.0/8 ("this network" — 0.0.0.0=localhost 우회)
+                || (a == 100 && (64..128).contains(&b)) // 100.64/10 CGNAT(tailscale 대역)
+        }
+        std::net::IpAddr::V6(v6) => {
+            let head = v6.segments()[0];
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (head & 0xfe00) == 0xfc00 // fc00::/7 unique local
+                || (head & 0xffc0) == 0xfe80 // fe80::/10 link local
+                // ::ffff:a.b.c.d — IPv4-mapped로 내부 IPv4를 우회 등록하는 경로 차단.
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| is_internal_ip(&std::net::IpAddr::V4(v4)))
+        }
+    }
 }
 
 /// base64url(그리고 표준 base64) 관대 디코드 — 브라우저 구독 키는 보통 base64url 무패딩이지만
@@ -991,16 +1239,13 @@ mod tests {
         let header = String::from_utf8(decode_b64_loose(parts[0]).unwrap()).unwrap();
         assert!(header.contains(r#""alg":"ES256""#), "{header}");
         let claims = String::from_utf8(decode_b64_loose(parts[1]).unwrap()).unwrap();
-        assert!(
-            claims.contains(r#""aud":"https://push.example.net""#),
-            "{claims}"
-        );
-        assert!(claims.contains(r#""sub":"mailto:"#), "{claims}");
-        // exp = now + 12h, 24h 상한 이내.
-        assert!(
-            claims.contains(&format!(r#""exp":{}"#, 1_000_000 + JWT_TTL_SECS)),
-            "{claims}"
-        );
+        // 클레임은 serde_json으로 조립한다 — 유효한 JSON이어야 한다(수제 조립 회귀 방지).
+        let parsed: serde_json::Value =
+            serde_json::from_str(&claims).expect("클레임이 유효한 JSON이 아님");
+        assert_eq!(parsed["aud"], "https://push.example.net");
+        assert_eq!(parsed["sub"], VAPID_SUB);
+        // exp = now + 12h(JWT_TTL_SECS) — RFC 8292의 24h 상한 이내.
+        assert_eq!(parsed["exp"], 1_000_000 + JWT_TTL_SECS);
     }
 
     #[test]
@@ -1038,27 +1283,217 @@ mod tests {
             endpoint_origin("https://updates.push.services.mozilla.com/wpush/v2/xxx"),
             Some("https://updates.push.services.mozilla.com".to_owned())
         );
+        // query/fragment는 authority(=aud)에 섞이지 않는다.
+        assert_eq!(
+            endpoint_origin("https://push.example?x=1#f"),
+            Some("https://push.example".to_owned())
+        );
         assert_eq!(endpoint_origin("not-a-url"), None);
+    }
+
+    // ── P2: endpoint SSRF 방어 + 구독 수 상한 ───────────────────────────────
+
+    #[test]
+    fn endpoint_검증은_https_공인주소만_허용한다() {
+        // 정상 push 서비스.
+        assert!(endpoint_allowed(
+            "https://fcm.googleapis.com/fcm/send/abc123"
+        ));
+        assert!(endpoint_allowed(
+            "https://updates.push.services.mozilla.com/wpush/v2/xxx"
+        ));
+        assert!(endpoint_allowed("https://web.push.apple.com/QA/x?y=1"));
+        assert!(
+            endpoint_allowed("https://8.8.8.8/x"),
+            "공인 IP 리터럴은 허용"
+        );
+        assert!(
+            endpoint_allowed("https://172.32.0.1/x"),
+            "172.32는 사설 아님"
+        );
+
+        // (a) scheme — https만.
+        assert!(!endpoint_allowed("http://push.example/x"));
+        assert!(!endpoint_allowed("file:///etc/passwd"));
+        assert!(!endpoint_allowed("push.example/x"));
+        assert!(!endpoint_allowed(""));
+
+        // (b) userinfo로 host를 감추는 시도.
+        assert!(!endpoint_allowed("https://fcm.googleapis.com@127.0.0.1/x"));
+
+        // (c) loopback / 사설 / 링크로컬 / CGNAT / 0.0.0.0/8.
+        assert!(!endpoint_allowed("https://127.0.0.1:8080/x"));
+        assert!(!endpoint_allowed("https://localhost/x"));
+        assert!(!endpoint_allowed("https://app.localhost/x"));
+        assert!(!endpoint_allowed("https://nas.local/x"));
+        assert!(!endpoint_allowed("https://10.0.0.5/x"));
+        assert!(!endpoint_allowed("https://172.16.3.9/x"));
+        assert!(!endpoint_allowed("https://172.31.255.254/x"));
+        assert!(!endpoint_allowed("https://192.168.0.10/x"));
+        assert!(!endpoint_allowed(
+            "https://169.254.169.254/latest/meta-data"
+        ));
+        assert!(!endpoint_allowed("https://100.101.102.103/x"), "CGNAT");
+        assert!(!endpoint_allowed("https://0.0.0.0/x"));
+        // IPv6 loopback / ULA / 링크로컬 / IPv4-mapped 우회.
+        assert!(!endpoint_allowed("https://[::1]:8443/x"));
+        assert!(!endpoint_allowed("https://[fc00::1]/x"));
+        assert!(!endpoint_allowed("https://[fe80::1]/x"));
+        assert!(!endpoint_allowed("https://[::ffff:127.0.0.1]/x"));
+    }
+
+    #[test]
+    fn route_subscribe_내부주소_endpoint는_400이고_저장되지_않는다() {
+        let db_path = temp_db();
+        let mgr = PushManager::spawn_with_transport(
+            db_path.clone(),
+            VapidKey::generate(),
+            Box::new(FakeTransport::default()),
+        )
+        .unwrap();
+        let handle = mgr.handle();
+        let head = parse_head(&format!(
+            "POST /push/subscribe?token={TEST_TOKEN} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        ));
+        for endpoint in [
+            "http://push.example/x",
+            "https://127.0.0.1:9000/x",
+            "https://192.168.1.7/x",
+            "https://[::1]/x",
+            "https://localhost/x",
+            "https://169.254.169.254/x",
+        ] {
+            let body = format!(r#"{{"endpoint":"{endpoint}","keys":{{"p256dh":"k","auth":"a"}}}}"#);
+            let resp = route(&head, body.as_bytes(), TEST_TOKEN, Some(&handle)).unwrap();
+            assert_eq!(resp.status, 400, "{endpoint} 가 거부되지 않았다");
+        }
+        let db = storage::Db::open(&db_path).unwrap();
+        assert_eq!(
+            db.count_web_push_subscriptions().unwrap(),
+            0,
+            "거부된 endpoint가 DB에 저장됐다"
+        );
+        // 정상 push 서비스 endpoint는 통과한다.
+        let body =
+            br#"{"endpoint":"https://fcm.googleapis.com/fcm/send/abc","keys":{"p256dh":"k","auth":"a"}}"#;
+        assert_eq!(
+            route(&head, body, TEST_TOKEN, Some(&handle))
+                .unwrap()
+                .status,
+            201
+        );
+
+        mgr.stop_and_join();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn 구독_수_상한을_넘으면_등록을_거부한다() {
+        let db_path = temp_db();
+        let mgr = PushManager::spawn_with_transport(
+            db_path.clone(),
+            VapidKey::generate(),
+            Box::new(FakeTransport::default()),
+        )
+        .unwrap();
+        let handle = mgr.handle();
+        for i in 0..MAX_SUBSCRIPTIONS {
+            handle
+                .add_subscription(
+                    &format!("https://push.example/dev{i}"),
+                    RFC_UA_PUBLIC,
+                    RFC_AUTH,
+                )
+                .unwrap();
+        }
+        // 상한 초과 — 새 endpoint는 거부.
+        let err = handle
+            .add_subscription("https://push.example/extra", RFC_UA_PUBLIC, RFC_AUTH)
+            .unwrap_err();
+        assert!(
+            matches!(err, SubscribeError::TooManySubscriptions),
+            "{err:?}"
+        );
+        // 이미 등록된 endpoint의 재등록(브라우저 키 회전)은 상한과 무관하게 허용.
+        handle
+            .add_subscription("https://push.example/dev0", RFC_UA_PUBLIC, RFC_AUTH)
+            .unwrap();
+        let db = storage::Db::open(&db_path).unwrap();
+        assert_eq!(
+            db.count_web_push_subscriptions().unwrap() as usize,
+            MAX_SUBSCRIPTIONS,
+            "상한을 넘겨 저장됐다"
+        );
+        // HTTP 계층은 403으로 응답한다.
+        let head = parse_head(&format!(
+            "POST /push/subscribe?token={TEST_TOKEN} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        ));
+        let body =
+            br#"{"endpoint":"https://push.example/extra2","keys":{"p256dh":"k","auth":"a"}}"#;
+        assert_eq!(
+            route(&head, body, TEST_TOKEN, Some(&handle))
+                .unwrap()
+                .status,
+            403
+        );
+
+        mgr.stop_and_join();
+        let _ = std::fs::remove_file(&db_path);
     }
 
     // ── 발송 스레드: 폴링 게이트/중복 억제/410 정리 ─────────────────────────
 
-    /// 프로그래밍 가능한 가짜 트랜스포트 — endpoint별 응답을 지정하고 호출을 기록한다.
+    /// 테스트용 짧은 폴링 주기 — "다음 주기 재시도"를 5초 기다리지 않는다.
+    const FAST_POLL: Duration = Duration::from_millis(40);
+
+    /// 가짜 트랜스포트의 응답 — 상태코드 또는 네트워크 실패(타임아웃/DNS).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Reply {
+        Status(u16),
+        /// 상태코드조차 받지 못한 경우(ureq Transport 오류에 해당).
+        Network,
+    }
+
+    /// 프로그래밍 가능한 가짜 트랜스포트 — endpoint별 응답을 지정하고(실행 중 변경 가능:
+    /// 장애→회복 시나리오) 호출을 기록한다. 지정이 없으면 201.
     #[derive(Default)]
     struct FakeTransport {
-        /// endpoint → 반환할 상태코드(없으면 201).
-        responses: StdMutex<HashMap<String, u16>>,
+        responses: StdMutex<HashMap<String, Reply>>,
         calls: StdMutex<Vec<String>>,
     }
     impl FakeTransport {
-        fn with(responses: HashMap<String, u16>) -> Self {
+        fn with(responses: HashMap<String, Reply>) -> Self {
             Self {
                 responses: StdMutex::new(responses),
                 calls: StdMutex::new(Vec::new()),
             }
         }
+        /// 발송 중 응답을 바꾼다(예: 503 → 201 회복).
+        fn set(&self, endpoint: &str, reply: Reply) {
+            self.responses
+                .lock()
+                .unwrap()
+                .insert(endpoint.to_owned(), reply);
+        }
         fn call_count(&self) -> usize {
             self.calls.lock().unwrap().len()
+        }
+        fn calls_to(&self, endpoint: &str) -> usize {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.as_str() == endpoint)
+                .count()
+        }
+        /// 호출 수가 잠시(폴링 주기 몇 번) 변하지 않을 때까지 기다린다 — 재발송이 멎었는지 판정.
+        fn settle(&self) -> usize {
+            wait_until(|| {
+                let before = self.call_count();
+                std::thread::sleep(FAST_POLL * 3);
+                before == self.call_count()
+            });
+            self.call_count()
         }
     }
     impl PushTransport for FakeTransport {
@@ -1071,7 +1506,17 @@ mod tests {
             _b: &[u8],
         ) -> Result<u16, TransportError> {
             self.calls.lock().unwrap().push(endpoint.to_owned());
-            Ok(*self.responses.lock().unwrap().get(endpoint).unwrap_or(&201))
+            let reply = self
+                .responses
+                .lock()
+                .unwrap()
+                .get(endpoint)
+                .copied()
+                .unwrap_or(Reply::Status(201));
+            match reply {
+                Reply::Status(code) => Ok(code),
+                Reply::Network => Err(TransportError),
+            }
         }
     }
 
@@ -1217,7 +1662,7 @@ mod tests {
         let db_path = temp_db();
         insert_pending(&db_path, "appr-410");
         let mut responses = HashMap::new();
-        responses.insert("https://push.example/dead".to_owned(), 410u16);
+        responses.insert("https://push.example/dead".to_owned(), Reply::Status(410));
         let transport = Arc::new(FakeTransport::with(responses));
         let mgr = PushManager::spawn_with_transport(
             db_path.clone(),
@@ -1274,6 +1719,193 @@ mod tests {
         assert_eq!(transport.call_count(), after, "무관 상태가 발송됨");
         mgr.stop_and_join();
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    // ── P1: 발송 실패는 중복 억제 마킹을 커밋하지 않는다(무음 유실 방지) ──────────
+
+    #[test]
+    fn 승인_발송이_전량_실패하면_다음_주기에_재시도한다() {
+        let db_path = temp_db();
+        insert_pending(&db_path, "appr-flaky");
+        let endpoint = "https://push.example/flaky";
+        let transport = Arc::new(FakeTransport::with(HashMap::from([(
+            endpoint.to_owned(),
+            Reply::Status(503),
+        )])));
+        let mgr = PushManager::spawn_with_interval(
+            db_path.clone(),
+            VapidKey::generate(),
+            Box::new(SharedTransport(Arc::clone(&transport))),
+            FAST_POLL,
+        )
+        .unwrap();
+        let handle = mgr.handle();
+        handle
+            .add_subscription(endpoint, RFC_UA_PUBLIC, RFC_AUTH)
+            .unwrap();
+
+        // 발송 1회 = POST 2회(재시도 1회 포함). 전량 실패면 마킹이 커밋되지 않아 다음 폴링
+        // 주기에 같은 승인을 다시 보낸다 → POST가 4회 이상으로 늘어난다.
+        assert!(
+            wait_until(|| transport.call_count() >= 4),
+            "전량 실패인데 다음 주기 재시도가 없었다(마킹이 먼저 커밋됨 — 영구 유실)"
+        );
+
+        // 회복(201) → 성공하면 그제서야 마킹이 커밋돼 재발송이 멎는다.
+        transport.set(endpoint, Reply::Status(201));
+        let settled = transport.settle();
+        std::thread::sleep(FAST_POLL * 4);
+        assert_eq!(
+            transport.call_count(),
+            settled,
+            "성공 후에도 재발송이 계속된다(마킹이 커밋되지 않음)"
+        );
+
+        mgr.stop_and_join();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn 승인_발송이_부분_성공하면_마킹을_커밋한다() {
+        let db_path = temp_db();
+        let _ = storage::Db::open(&db_path).unwrap(); // 파일 생성(승인은 구독 등록 후에 넣는다)
+        let good = "https://push.example/good";
+        let bad = "https://push.example/bad";
+        // bad는 네트워크 실패(타임아웃/DNS) — 재시도 1회 후 Failed.
+        let transport = Arc::new(FakeTransport::with(HashMap::from([(
+            bad.to_owned(),
+            Reply::Network,
+        )])));
+        let mgr = PushManager::spawn_with_interval(
+            db_path.clone(),
+            VapidKey::generate(),
+            Box::new(SharedTransport(Arc::clone(&transport))),
+            FAST_POLL,
+        )
+        .unwrap();
+        let handle = mgr.handle();
+        handle
+            .add_subscription(good, RFC_UA_PUBLIC, RFC_AUTH)
+            .unwrap();
+        handle
+            .add_subscription(bad, RFC_UA_PUBLIC, RFC_AUTH)
+            .unwrap();
+        // 두 구독이 모두 등록된 뒤에 승인을 넣어야 한 번의 발송이 둘 다 대상으로 한다.
+        wait_until(|| handle.poll_count() >= 1);
+        insert_pending(&db_path, "appr-partial");
+
+        assert!(
+            wait_until(|| transport.calls_to(good) >= 1),
+            "정상 구독으로의 발송이 없었다"
+        );
+        // 하나라도 전달됐으면 마킹 커밋 — 실패한 기기 때문에 재발송하면 성공한 기기에 중복
+        // 알림이 간다. 실패 기기는 다음 새 승인에서 재수렴한다.
+        let settled = transport.settle();
+        std::thread::sleep(FAST_POLL * 4);
+        assert_eq!(
+            transport.call_count(),
+            settled,
+            "부분 성공인데 재발송됐다(성공한 기기에 중복 알림)"
+        );
+        assert_eq!(
+            transport.calls_to(good),
+            1,
+            "성공 구독에 중복 발송됐다: {settled}"
+        );
+        assert_eq!(
+            transport.calls_to(bad),
+            2,
+            "실패 구독은 발송당 재시도 1회(총 2회 POST)여야 한다"
+        );
+
+        mgr.stop_and_join();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn 세션_알림_전량_실패는_마킹하지_않고_상한까지_재시도한다() {
+        let db_path = temp_db();
+        let endpoint = "https://push.example/session-flaky";
+        let transport = Arc::new(FakeTransport::with(HashMap::from([(
+            endpoint.to_owned(),
+            Reply::Status(500),
+        )])));
+        let mgr = PushManager::spawn_with_interval(
+            db_path.clone(),
+            VapidKey::generate(),
+            Box::new(SharedTransport(Arc::clone(&transport))),
+            FAST_POLL,
+        )
+        .unwrap();
+        let handle = mgr.handle();
+        handle
+            .add_subscription(endpoint, RFC_UA_PUBLIC, RFC_AUTH)
+            .unwrap();
+        wait_until(|| handle.poll_count() >= 1);
+        let base = transport.call_count();
+
+        // 세션 전이는 생애 1회라 실패를 버리면 영구 유실 — 재시도 큐가 다음 주기에 다시 보낸다.
+        handle.notify_session(7, runtime::SessionStatus::Done);
+        assert!(
+            wait_until(|| transport.call_count() >= base + 4),
+            "세션 알림 전량 실패인데 다음 주기 재시도가 없었다"
+        );
+        // 재시도 상한(SESSION_SEND_ATTEMPTS)까지만 — 그 뒤로는 폭주하지 않고 포기한다.
+        let capped = base + 2 * SESSION_SEND_ATTEMPTS as usize;
+        assert!(
+            wait_until(|| transport.call_count() >= capped),
+            "재시도 상한까지 시도하지 않았다"
+        );
+        std::thread::sleep(FAST_POLL * 4);
+        assert_eq!(
+            transport.call_count(),
+            capped,
+            "재시도 상한을 넘겨 계속 시도한다(폭주)"
+        );
+
+        // 전량 실패는 마킹을 남기지 않았다 — 회복 후 같은 전이가 다시 오면 정상 발송된다.
+        transport.set(endpoint, Reply::Status(201));
+        handle.notify_session(7, runtime::SessionStatus::Done);
+        assert!(
+            wait_until(|| transport.call_count() > capped),
+            "실패가 마킹으로 굳어 재통지가 억제됐다(무음 유실)"
+        );
+        // 성공 뒤에는 다시 중복 억제된다(기존 동작 회귀 없음).
+        let after = transport.settle();
+        handle.notify_session(7, runtime::SessionStatus::Done);
+        std::thread::sleep(FAST_POLL * 4);
+        assert_eq!(
+            transport.call_count(),
+            after,
+            "성공 후 같은 전이가 중복 발송됐다"
+        );
+
+        mgr.stop_and_join();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    // ── P3-1: notified_status 유계화 ────────────────────────────────────────
+
+    #[test]
+    fn notified_status는_상한을_넘지_않고_오래된_세션부터_버린다() {
+        let mut notified: HashMap<u64, SessionKind> = HashMap::new();
+        let last = MAX_NOTIFIED_SESSIONS as u64 + 10;
+        for session in 1..=last {
+            remember_status(&mut notified, session, SessionKind::Done);
+        }
+        assert_eq!(
+            notified.len(),
+            MAX_NOTIFIED_SESSIONS,
+            "세션 기록이 상한 없이 쌓인다"
+        );
+        // 세션 id는 단조 증가 — 가장 낮은(오래된) id부터 버려지고 최신 세션은 남는다.
+        assert!(!notified.contains_key(&1), "가장 오래된 세션이 남아 있다");
+        assert!(!notified.contains_key(&10));
+        assert!(notified.contains_key(&last), "최신 세션이 버려졌다");
+        // 같은 세션 재기록은 크기를 늘리지 않고 상태만 갱신한다.
+        remember_status(&mut notified, last, SessionKind::Waiting);
+        assert_eq!(notified.len(), MAX_NOTIFIED_SESSIONS);
+        assert_eq!(notified.get(&last), Some(&SessionKind::Waiting));
     }
 
     /// Arc<FakeTransport>를 Box<dyn PushTransport>로 넘기기 위한 래퍼(테스트가 관찰을 공유).

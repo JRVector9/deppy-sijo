@@ -67,6 +67,9 @@
     enablePush(token);
   }
 
+  // 서버와 합의한 WS 프로토콜 버전 — welcome에서 대조한다(불일치 = 셸이 낡음).
+  const PROTOCOL_VERSION = 2;
+
   const STATUS_LABEL = {
     running: '실행 중',
     waiting: '입력 대기',
@@ -112,7 +115,7 @@
 
     socket.addEventListener('open', () => {
       reconnectDelay = 1000;
-      socket.send(JSON.stringify({ type: 'auth', v: 1, token }));
+      socket.send(JSON.stringify({ type: 'auth', v: PROTOCOL_VERSION, token }));
     });
 
     socket.addEventListener('message', (event) => {
@@ -162,6 +165,14 @@
   function handleMessage(msg) {
     switch (msg && msg.type) {
       case 'welcome':
+        // 서버 프로토콜이 이 셸보다 새로우면(배포 후 오래 열려 있던 페이지) 스스로 재로드한다.
+        // HTML은 network-first + 자산은 내용 해시 경로라, 재로드하면 반드시 짝이 맞는다.
+        if (typeof msg.v === 'number' && msg.v !== PROTOCOL_VERSION) {
+          setStatus('', '새 버전 — 다시 불러오는 중…');
+          disconnect();
+          location.reload();
+          return;
+        }
         setStatus('ok', '연결됨');
         // 재연결이면 서버 접속 상태(시청)가 초기화됐다 — 보던 세션을 다시 watch한다 (P5d).
         if (viewer.watching != null) {
@@ -557,6 +568,7 @@
 
   let lastSessions = [];   // 시청 가능한 세션(활성 워크스페이스)
   let lastWorkspaces = [];
+  let lastResource = null; // 재렌더 시 CPU/RAM 줄이 깜빡 사라지지 않게 보관
 
   /// 딥링크 대상이 현재 세션 목록에 있으면 시청을 시작한다(1회성).
   function consumePendingWatch(sessions) {
@@ -577,8 +589,10 @@
   // 프로젝트명 규칙으로 서버가 해석해 보낸다.
   function renderWorkspaces(workspaces, resource) {
     lastWorkspaces = workspaces;
+    if (resource) lastResource = resource;
     lastSessions = workspaces.flatMap((ws) => ws.sessions || []).filter((s) => s.id != null);
-    sessionsEmpty.hidden = workspaces.some((ws) => (ws.sessions || []).length > 0);
+    // 그룹별로 "세션 없음"을 표시하므로, 전역 안내는 워크스페이스가 하나도 없을 때만.
+    sessionsEmpty.hidden = workspaces.length > 0;
     sessionsEl.textContent = '';
 
     for (const ws of workspaces) {
@@ -658,7 +672,7 @@
       viewBtn.disabled = s.id === viewer.watching;
       viewBtn.addEventListener('click', () => {
         openViewer(s.id, s.title || ('세션 ' + s.id));
-        renderWorkspaces(lastWorkspaces, null); // "보는 중" 배지 갱신
+        renderWorkspaces(lastWorkspaces, lastResource); // "보는 중" 배지 갱신
       });
       li.appendChild(viewBtn);
     } else {

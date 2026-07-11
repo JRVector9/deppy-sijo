@@ -9,7 +9,11 @@
 use serde::{Deserialize, Serialize};
 
 /// 프로토콜 버전 — 클라/서버 합의값. 하위호환이 깨지면 증가시킨다.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// v2 (2026-07-12): Dashboard 프레임이 `sessions[]` → `workspaces[]`로 바뀌었다.
+/// 오래 열려 있던 옛 페이지가 재연결하면 세션 목록이 빈 채로 남으므로, 클라이언트가
+/// welcome의 v를 확인해 불일치 시 스스로 재로드한다 (리뷰 P3-6).
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 클라이언트 → 서버.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -634,7 +638,10 @@ mod tests {
             v: PROTOCOL_VERSION,
         }
         .encode();
-        assert_eq!(welcome, r#"{"type":"welcome","v":1}"#);
+        assert_eq!(
+            welcome,
+            format!(r#"{{"type":"welcome","v":{PROTOCOL_VERSION}}}"#)
+        );
 
         let dash = ServerMsg::Dashboard {
             workspaces: vec![

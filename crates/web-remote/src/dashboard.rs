@@ -671,33 +671,48 @@ impl DashboardHandle {
     /// 구독 등록(동기) 사이 레이스로 MuxUpdated 재발화를 놓쳐도 옛 워크스페이스 세션이 남지
     /// 않게 한다. 이후 도착하는 이벤트는 증분 갱신이며, MuxUpdated의 or_insert는 시드된 항목을
     /// and_modify(제목만)로 건드리므로 시드된 상태를 기본값(Running)으로 덮어쓰지 않는다.
+    /// 표시 스냅샷(워크스페이스 구성 + 세션 표시명)만 갱신한다. 앱이 매 프레임 호출하며,
+    /// 값이 같으면 조기 반환한다.
+    ///
+    /// **활성 세션의 상태(sessions 맵)는 건드리지 않는다** — 그건 런타임 이벤트가 소유하는
+    /// 프레임 독립 데이터다. 여기서 앱 스냅샷으로 덮으면, 창이 숨겨져 앱의 상태 뷰가 얼어붙은
+    /// 동안(ui() 스킵 → pending_events 미소비) 브리지가 이미 반영한 최신 상태(예: 완료)를
+    /// **stale한 앱 값(실행 중)으로 되돌린다**. 그 이벤트는 edge-trigger라 재발화되지 않아
+    /// 창이 다시 보일 때까지 폰이 영구 오표시된다 (리뷰 P1-1). 상태 시딩은 재구독 시점의
+    /// [`Self::reseed_active_sessions`]만 수행한다.
     pub fn set_workspaces(&self, seeds: Vec<WorkspaceSeed>) {
         {
             let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
             if inner.workspaces == seeds {
                 return; // 변화 없음 — 발행/웨이크 생략(프레임마다 호출돼도 비용 0)
             }
-            // 활성 워크스페이스의 라이브 상태 맵을 스냅샷으로 시드한다 — 이벤트 스트림은
-            // edge-trigger라, 재구독(start_web·워크스페이스 전환)한 브리지는 과거 이력을
-            // 모른다. 통째 교체라 옛 워크스페이스 세션이 남지 않는다(P2 리뷰).
-            if let Some(active) = seeds.iter().find(|ws| ws.state == WorkspaceState::Active) {
-                inner.sessions = active
-                    .sessions
-                    .iter()
-                    .filter_map(|seed| {
-                        seed.id.map(|id| {
-                            (
-                                id,
-                                SessionEntry {
-                                    status: seed.status.unwrap_or(SessionStatus::Running),
-                                    exited: seed.exited,
-                                },
-                            )
-                        })
-                    })
-                    .collect();
-            }
             inner.workspaces = seeds;
+            inner.dirty = true;
+        }
+        self.shared.cvar.notify_all();
+    }
+
+    /// 활성 워크스페이스 세션의 **라이브 상태 맵을 통째 교체**한다 — 재구독(start_web·
+    /// 워크스페이스 전환) 시점에만 호출한다. 이벤트 스트림은 edge-trigger라 재구독한
+    /// 브리지는 과거 이력을 모르므로, 이미 정착한 상태(needs_approval 등)를 시드해야 한다.
+    /// 통째 교체라 옛 워크스페이스 세션이 남지 않는다(P2 리뷰의 전환 레이스 해소).
+    pub fn reseed_active_sessions(&self, sessions: &[SessionSeed]) {
+        {
+            let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
+            inner.sessions = sessions
+                .iter()
+                .filter_map(|seed| {
+                    seed.id.map(|id| {
+                        (
+                            id,
+                            SessionEntry {
+                                status: seed.status.unwrap_or(SessionStatus::Running),
+                                exited: seed.exited,
+                            },
+                        )
+                    })
+                })
+                .collect();
             inner.dirty = true;
         }
         self.shared.cvar.notify_all();
@@ -1418,6 +1433,47 @@ mod tests {
             inputs,
             vec![b"\x1b[A".to_vec(), b"\x1b".to_vec(), b"\x1b[Z".to_vec()]
         );
+        handle.stop();
+        thread.join().unwrap();
+    }
+
+    /// 리뷰 P1-1 회귀: 매 프레임 표시 스냅샷 push가 **런타임 이벤트 상태를 덮지 않는다**.
+    /// (앱의 상태 뷰는 창이 숨겨지면 얼어붙는데, 그 stale 값이 브리지의 최신 상태를
+    /// 되돌리면 폰이 영구 오표시된다 — 이벤트는 edge-trigger라 재발화되지 않는다.)
+    #[test]
+    fn 표시_스냅샷_push는_런타임_상태를_되돌리지_않는다() {
+        let (handle, thread) = DashboardHandle::spawn(None);
+        let active = |status: Option<SessionStatus>| WorkspaceSeed {
+            id: "ws-1".into(),
+            name: "p".into(),
+            state: WorkspaceState::Active,
+            sessions: vec![SessionSeed {
+                id: Some(7),
+                title: "deppy-sijo".into(),
+                status,
+                agent: None,
+                exited: false,
+            }],
+        };
+        // 재구독 시점: Running으로 시드
+        handle.reseed_active_sessions(&active(Some(SessionStatus::Running)).sessions);
+        handle.set_workspaces(vec![active(Some(SessionStatus::Running))]);
+        // 런타임 이벤트: 완료 도착 (브리지가 즉시 반영 — 프레임 독립)
+        handle.inject_event(RuntimeEvent::SessionStatusChanged {
+            session: SessionId(7),
+            status: SessionStatus::Done,
+        });
+        // 앱이 stale 상태(Running)로 표시 스냅샷을 다시 push (제목만 바뀐 상황)
+        let mut stale = active(Some(SessionStatus::Running));
+        stale.sessions[0].title = "deppy-sijo (2)".into();
+        handle.set_workspaces(vec![stale]);
+        // 상태는 여전히 done이어야 한다 — 표시명만 갱신된다
+        let views = {
+            let inner = handle.shared.inner.lock().unwrap();
+            workspace_views(&inner.workspaces, &inner.sessions)
+        };
+        assert_eq!(views[0].sessions[0].status, Some("done"), "상태가 되돌아감");
+        assert_eq!(views[0].sessions[0].title, "deppy-sijo (2)");
         handle.stop();
         thread.join().unwrap();
     }

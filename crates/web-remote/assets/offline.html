@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1a1a1a">
+  <title>Deppy Sijo — 오프라인</title>
+  <link rel="icon" href="/icon-192.png" type="image/png">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<!-- SW가 오프라인 네비게이션 폴백으로 서빙한다. 마지막 dashboard 수신 시각은
+     app.js가 localStorage에 저장한 값을 textContent로만 렌더한다(innerHTML 금지). -->
+<body data-view="offline">
+  <main class="card">
+    <header class="brand">
+      <img src="/icon-192.png" alt="" width="44" height="44">
+      <h1>연결 끊김</h1>
+    </header>
+    <p class="placeholder">서버에 연결할 수 없습니다. 네트워크(Tailscale)를 확인한 뒤 다시 시도하세요.</p>
+    <p id="last-seen" class="hint">마지막 상태 수신: —</p>
+    <button id="retry-btn" class="retry" type="button">다시 시도</button>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

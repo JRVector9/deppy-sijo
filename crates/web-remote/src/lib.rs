@@ -528,6 +528,20 @@ mod tests {
         )
     }
 
+    /// PNG 등 바이너리 응답용 — read_to_string은 비UTF-8에서 실패하므로 raw 바이트로 받는다.
+    fn get_raw(addr: SocketAddr, target: &str) -> Vec<u8> {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream
+            .write_all(format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").as_bytes())
+            .unwrap();
+        let mut out = Vec::new();
+        let _ = stream.read_to_end(&mut out);
+        out
+    }
+
     #[test]
     fn 토큰_일치는_앱셸_불일치는_401() {
         let server = start(None);
@@ -559,6 +573,29 @@ mod tests {
         assert!(missing.starts_with("HTTP/1.1 404"), "{missing}");
         let traversal = get(addr, "/../Cargo.toml");
         assert!(traversal.starts_with("HTTP/1.1 404"), "{traversal}");
+    }
+
+    #[test]
+    fn 설치_셸_자산과_sw_헤더() {
+        let server = start(None);
+        let addr = server.local_addr();
+        // sw.js: 버전 자리표시자 치환 + no-cache 헤더(재방문 시 새 SW 반영 보장)
+        let sw = get(addr, "/sw.js");
+        assert!(sw.starts_with("HTTP/1.1 200"), "{sw}");
+        assert!(sw.contains("Cache-Control: no-cache"), "{sw}");
+        assert!(sw.contains("deppy-shell-"), "{sw}");
+        assert!(!sw.contains("__SHELL_VERSION__"), "{sw}");
+        // 설치 아이콘·오프라인 셸은 바이너리를 포함할 수 있어 raw로 상태줄만 확인한다.
+        for path in [
+            "/icon-192.png",
+            "/icon-512.png",
+            "/icon-maskable-512.png",
+            "/apple-touch-icon.png",
+            "/offline.html",
+        ] {
+            let raw = get_raw(addr, path);
+            assert!(raw.starts_with(b"HTTP/1.1 200"), "{path}");
+        }
     }
 
     #[test]

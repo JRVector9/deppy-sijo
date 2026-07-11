@@ -26,6 +26,8 @@ uuid = { workspace = true }
 i18n = { workspace = true }
 arboard = { workspace = true }
 image = { workspace = true }
+# 모바일 웹 페어링 QR (mobile-pwa v3.3 P1) — 접속 URL을 egui 텍스처로 렌더
+qrcode = { workspace = true }
 # 프로젝트 폴더 선택 네이티브 다이얼로그 (환경 메뉴 — 워크스페이스 path 지정, 2026-07-08)
 rfd = "0.15"
 audit = { path = "../audit" }
@@ -38,6 +40,7 @@ runtime = { path = "../runtime" }
 secret = { path = "../secret" }
 storage = { path = "../storage" }
 terminal = { path = "../terminal" }
+web-remote = { path = "../web-remote" }
 
 # 파일 트리 사이드바 (docs/file-tree-design.md)
 trash = { workspace = true }

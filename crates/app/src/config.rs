@@ -14,6 +14,7 @@ pub struct Config {
     pub terminal: TerminalConfig,
     pub performance: PerformanceConfig,
     pub remote: RemoteConfig,
+    pub web: WebConfig,
     pub i18n: I18nConfig,
     /// 기본 단축키에서 달라진 항목만 저장한다. 키 이름은 `shortcuts` 모듈이 해석하며,
     /// 알 수 없는 항목은 무시해 이전/이후 버전의 config와 호환한다.
@@ -151,6 +152,40 @@ pub struct RemoteConfig {
     pub tls_enabled: bool,
     /// bind 포트. 0이면 OS가 임의 할당(local_addr로 확인). 변경은 토글 off/on 후 적용.
     pub port: u16,
+}
+
+/// 모바일 웹(PWA) 내장 서버 설정 (mobile-pwa 계획 v3.3 P1). 기본 비활성 — opt-in.
+/// OFF면 리스너 스레드 자체를 만들지 않는다(리소스 0).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebConfig {
+    /// 앱 시작 시 웹서버 자동 기동. 기본 false.
+    pub enabled: bool,
+    /// 127.0.0.1 bind 포트. 0 = OS 임의 할당. `tailscale serve --bg <port>` 프록시가
+    /// 재시작 후에도 유효하려면 고정 포트가 필요해 기본값을 고정 포트로 둔다.
+    pub port: u16,
+    /// tailscale serve가 노출하는 ts.net 호스트명 — Host 검증 허용 목록과 접속 URL/QR에
+    /// 사용. 빈 문자열이면 loopback 계열 Host만 허용된다(폰 접속에는 설정 필요).
+    pub ts_hostname: String,
+    /// (자리) cert 모드 인증서 PEM 경로 — `tailscale cert` 자체 TLS는 후속 구현. 현재 미사용.
+    pub tls_cert_pem: String,
+    /// (자리) cert 모드 개인키 PEM 경로. 현재 미사용.
+    pub tls_key_pem: String,
+    /// (자리) 비-loopback bind opt-in (remote C-4 관례) — cert 모드에서만 의미. 현재 미사용.
+    pub allow_non_loopback: bool,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 8737,
+            ts_hostname: String::new(),
+            tls_cert_pem: String::new(),
+            tls_key_pem: String::new(),
+            allow_non_loopback: false,
+        }
+    }
 }
 
 pub fn config_path(config_dir: &Path) -> PathBuf {
@@ -309,6 +344,36 @@ mod tests {
         let mut c = Config::default();
         c.remote.tls_enabled = true;
         c.remote.port = 7777;
+        let text = toml::to_string_pretty(&c).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed, c);
+    }
+
+    #[test]
+    fn web_config_기본값은_off_고정포트() {
+        // OFF가 기본 — OFF면 리스너 스레드 자체가 없어야 한다 (v3.3 P1 리소스 예산).
+        let c = WebConfig::default();
+        assert!(!c.enabled);
+        assert_eq!(c.port, 8737);
+        assert!(c.ts_hostname.is_empty());
+        assert!(c.tls_cert_pem.is_empty());
+        assert!(c.tls_key_pem.is_empty());
+        assert!(!c.allow_non_loopback);
+    }
+
+    #[test]
+    fn web_누락시_기본값으로_채운다() {
+        // 옛 config([web] 섹션 없음)도 로드된다 (serde default).
+        let parsed: Config = toml::from_str("[ui]\ntheme = \"dark\"\n").unwrap();
+        assert_eq!(parsed.web, WebConfig::default());
+    }
+
+    #[test]
+    fn web_config_roundtrip() {
+        let mut c = Config::default();
+        c.web.enabled = true;
+        c.web.port = 9000;
+        c.web.ts_hostname = "mac.tail.ts.net".to_owned();
         let text = toml::to_string_pretty(&c).unwrap();
         let parsed: Config = toml::from_str(&text).unwrap();
         assert_eq!(parsed, c);

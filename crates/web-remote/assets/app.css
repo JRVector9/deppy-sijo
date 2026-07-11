@@ -1,0 +1,30 @@
+/* Deppy Sijo 모바일 셸 (P1) — 데스크톱 설정 창 다크 팔레트와 톤을 맞춘다 */
+:root { color-scheme: dark; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  background: #1a1a1a;
+  color: #d4d4d4;
+  font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Segoe UI", sans-serif;
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+}
+.card {
+  width: 100%; max-width: 420px;
+  background: #242424; border: 1px solid #3a3a3a; border-radius: 12px;
+  padding: 28px 24px;
+}
+.brand { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
+.brand img { border-radius: 10px; }
+h1 { font-size: 20px; font-weight: 600; color: #f0f0f0; }
+.status { display: flex; align-items: center; gap: 8px; font-size: 15px; margin-bottom: 10px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: #6a6a6a; display: inline-block; }
+.dot.ok { background: #58b368; }
+.dot.bad { background: #e05252; }
+.placeholder { font-size: 14px; color: #aaaaaa; line-height: 1.6; margin-bottom: 18px; }
+.meta { border-top: 1px solid #3a3a3a; padding-top: 14px; font-size: 13px; }
+.meta div { display: flex; justify-content: space-between; padding: 4px 0; }
+.meta dt { color: #8a8a8a; }
+.meta dd { font-family: ui-monospace, Menlo, monospace; }
+.hint { font-size: 13px; color: #8a8a8a; }
+.hidden { display: none; }

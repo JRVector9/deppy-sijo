@@ -1,0 +1,12 @@
+{
+  "name": "Deppy Sijo",
+  "short_name": "Deppy",
+  "description": "Deppy Sijo remote — agent approvals and status from your phone",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#1a1a1a",
+  "theme_color": "#1a1a1a",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

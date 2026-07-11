@@ -4,38 +4,53 @@
 //! 이 모듈만 정적 호스팅으로 대체되고 ws_api는 데스크톱에 그대로 남는다 (계획 v3.3 §방법 B).
 
 use std::borrow::Cow;
+use std::sync::OnceLock;
 
 use crate::http::Response;
 
-/// 컴파일 타임 자산 매니페스트: 경로 → (MIME, bytes). 전부 `include_bytes!` 임베드 —
-/// 파일 시스템 접근/디렉터리 탐색이 없으므로 이 목록이 곧 경로 화이트리스트다.
+// 임베드 자산 바이트 — 한 번만 `include_bytes!`하고 ASSETS/SHELL에서 재사용한다(중복 임베드 방지).
+const APP_CSS: &[u8] = include_bytes!("../assets/app.css");
+const APP_JS: &[u8] = include_bytes!("../assets/app.js");
+const MANIFEST: &[u8] = include_bytes!("../assets/manifest.webmanifest");
+const OFFLINE_HTML: &[u8] = include_bytes!("../assets/offline.html");
+const ICON_192: &[u8] = include_bytes!("../assets/icon-192.png");
+const ICON_512: &[u8] = include_bytes!("../assets/icon-512.png");
+const ICON_MASKABLE_512: &[u8] = include_bytes!("../assets/icon-maskable-512.png");
+const APPLE_TOUCH_ICON: &[u8] = include_bytes!("../assets/apple-touch-icon.png");
+
+/// 컴파일 타임 자산 매니페스트: 경로 → (MIME, bytes). 전부 임베드 — 파일 시스템 접근/디렉터리
+/// 탐색이 없으므로 이 목록이 곧 경로 화이트리스트다. `/sw.js`는 버전 키를 서빙 시점에 주입하므로
+/// 여기 두지 않고 [`respond`]가 별도 처리한다.
 const ASSETS: &[(&str, &str, &[u8])] = &[
-    (
-        "/app.css",
-        "text/css; charset=utf-8",
-        include_bytes!("../assets/app.css"),
-    ),
-    (
-        "/app.js",
-        "text/javascript; charset=utf-8",
-        include_bytes!("../assets/app.js"),
-    ),
+    ("/app.css", "text/css; charset=utf-8", APP_CSS),
+    ("/app.js", "text/javascript; charset=utf-8", APP_JS),
     (
         "/manifest.webmanifest",
         "application/manifest+json",
-        include_bytes!("../assets/manifest.webmanifest"),
+        MANIFEST,
     ),
-    (
-        "/sw.js",
-        "text/javascript; charset=utf-8",
-        include_bytes!("../assets/sw.js"),
-    ),
-    (
-        "/icon.svg",
-        "image/svg+xml",
-        include_bytes!("../assets/icon.svg"),
-    ),
+    ("/offline.html", "text/html; charset=utf-8", OFFLINE_HTML),
+    ("/icon-192.png", "image/png", ICON_192),
+    ("/icon-512.png", "image/png", ICON_512),
+    ("/icon-maskable-512.png", "image/png", ICON_MASKABLE_512),
+    ("/apple-touch-icon.png", "image/png", APPLE_TOUCH_ICON),
 ];
+
+/// SW가 프리캐시하는 셸 = (경로, 내용). 이 내용들의 해시가 곧 캐시 버전 키다 — 셸 바이트가
+/// 바뀌면 키가 바뀌어 SW가 새 셸을 설치하고 구 캐시를 지운다. `assets/sw.js`의 SHELL 배열과
+/// 구성이 일치해야 한다(drift 방지 테스트가 강제).
+const SHELL: &[(&str, &[u8])] = &[
+    ("/app.css", APP_CSS),
+    ("/app.js", APP_JS),
+    ("/icon-192.png", ICON_192),
+    ("/manifest.webmanifest", MANIFEST),
+    ("/offline.html", OFFLINE_HTML),
+];
+
+/// 서비스 워커 템플릿 — [`respond`]가 [`SW_VERSION_PLACEHOLDER`]를 셸 해시로 치환해 서빙한다.
+const SW_JS_TEMPLATE: &str = include_str!("../assets/sw.js");
+/// sw.js 안에서 서빙 시점에 셸 버전 해시로 치환되는 자리표시자.
+const SW_VERSION_PLACEHOLDER: &str = "__SHELL_VERSION__";
 
 /// 앱 셸 문서 — `/?token=` 게이트 통과 시에만 서빙.
 const INDEX_HTML: &[u8] = include_bytes!("../assets/index.html");
@@ -62,6 +77,8 @@ pub fn respond(path: &str, query: &str, expected_token: &str) -> Response {
             content_type: "application/json",
             body: Cow::Borrowed(br#"{"status":"ok"}"#),
         },
+        // 서비스 워커 — 버전 키를 서빙 시점에 셸 해시로 주입한다(토큰 게이트 없음, 비밀 없음).
+        "/sw.js" => sw_js_response(),
         _ => ASSETS
             .iter()
             .find(|(asset_path, _, _)| *asset_path == path)
@@ -72,6 +89,41 @@ pub fn respond(path: &str, query: &str, expected_token: &str) -> Response {
             })
             .unwrap_or_else(|| Response::plain(404, "not found")),
     }
+}
+
+/// `/sw.js` 응답 — 버전 자리표시자를 셸 해시로 치환해 서빙한다. sw.js는 저빈도 요청이라
+/// 요청마다 치환해도 비용이 무시할 수준이다. 응답 헤더는 http.rs 전역 `Cache-Control: no-cache`라
+/// 브라우저가 매 방문 재검증한다 → 셸이 바뀌면 재방문 2회 내 새 SW가 반영된다.
+fn sw_js_response() -> Response {
+    let body = SW_JS_TEMPLATE.replace(SW_VERSION_PLACEHOLDER, shell_version());
+    Response {
+        status: 200,
+        content_type: "text/javascript; charset=utf-8",
+        body: Cow::Owned(body.into_bytes()),
+    }
+}
+
+/// SW 캐시 버전 키 — 프리캐시 셸 자산 바이트의 FNV-1a 해시(16진 16자리). 보안용이 아니라
+/// 캐시 무효화용이다. lazy 1회 계산 후 재사용 — 서빙마다 재계산하지 않는다.
+fn shell_version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION.get_or_init(|| {
+        let chunks: Vec<&[u8]> = SHELL.iter().map(|&(_, bytes)| bytes).collect();
+        fnv1a_hex(&chunks)
+    })
+}
+
+/// FNV-1a 64비트 해시를 청크들에 걸쳐 누적하고 16진 문자열로 돌려준다. 의존성 없는 결정적
+/// 해시 — 청크 경계와 무관하게 이어붙인 내용만으로 정해진다(같은 내용 → 같은 키).
+fn fnv1a_hex(chunks: &[&[u8]]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+    for chunk in chunks {
+        for &byte in *chunk {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+        }
+    }
+    format!("{hash:016x}")
 }
 
 /// query에서 `token=` 파라미터를 찾아 상수시간 비교한다. 토큰은 hex라 percent 인코딩이 없다.
@@ -145,8 +197,11 @@ mod tests {
             ("/app.css", "text/css; charset=utf-8"),
             ("/app.js", "text/javascript; charset=utf-8"),
             ("/manifest.webmanifest", "application/manifest+json"),
-            ("/sw.js", "text/javascript; charset=utf-8"),
-            ("/icon.svg", "image/svg+xml"),
+            ("/offline.html", "text/html; charset=utf-8"),
+            ("/icon-192.png", "image/png"),
+            ("/icon-512.png", "image/png"),
+            ("/icon-maskable-512.png", "image/png"),
+            ("/apple-touch-icon.png", "image/png"),
         ] {
             let response = respond(path, "", TOKEN);
             assert_eq!(response.status, 200, "{path}");
@@ -162,9 +217,73 @@ mod tests {
             "/unknown.js",
             "/../Cargo.toml",
             "/assets/app.js",
-            "/app.js/", // 정확 일치만
+            "/app.js/",  // 정확 일치만
+            "/icon.svg", // P3에서 sijobird PNG로 교체 — 더 이상 서빙하지 않음
         ] {
             assert_eq!(respond(path, "", TOKEN).status, 404, "{path}");
+        }
+    }
+
+    #[test]
+    fn sw_js는_버전_자리표시자를_해시로_치환해_서빙() {
+        let r1 = respond("/sw.js", "", TOKEN);
+        assert_eq!(r1.status, 200);
+        assert_eq!(r1.content_type, "text/javascript; charset=utf-8");
+        let body1 = String::from_utf8(r1.body.to_vec()).unwrap();
+        assert!(
+            !body1.contains(SW_VERSION_PLACEHOLDER),
+            "자리표시자가 치환되지 않음"
+        );
+        assert!(
+            body1.contains(&format!("deppy-shell-{}", shell_version())),
+            "캐시 키에 버전 해시가 없음"
+        );
+        // 두 번 요청해도 동일한 버전(결정적) — 재방문 안정성.
+        let r2 = respond("/sw.js", "", TOKEN);
+        assert_eq!(r1.body, r2.body);
+    }
+
+    #[test]
+    fn 셸_버전키는_16진수_16자리() {
+        let v = shell_version();
+        assert_eq!(v.len(), 16, "{v}");
+        assert!(v.chars().all(|c| c.is_ascii_hexdigit()), "{v}");
+    }
+
+    #[test]
+    fn fnv1a는_내용이_바뀌면_키가_바뀐다() {
+        // 같은 내용 → 같은 키
+        assert_eq!(fnv1a_hex(&[&b"deppy"[..]]), fnv1a_hex(&[&b"deppy"[..]]));
+        // 한 바이트만 달라도 → 다른 키(자산 변경 시 캐시 무효화 보장)
+        assert_ne!(fnv1a_hex(&[&b"deppy"[..]]), fnv1a_hex(&[&b"deppz"[..]]));
+        // 청크 경계는 무관 — 이어붙인 내용만으로 정해진다
+        assert_eq!(
+            fnv1a_hex(&[&b"de"[..], &b"ppy"[..]]),
+            fnv1a_hex(&[&b"deppy"[..]])
+        );
+    }
+
+    #[test]
+    fn 프리캐시_셸은_모두_서빙되고_sw에_명시된다() {
+        for &(path, _) in SHELL {
+            assert_eq!(respond(path, "", TOKEN).status, 200, "미서빙 셸: {path}");
+            assert!(
+                SW_JS_TEMPLATE.contains(&format!("'{path}'")),
+                "sw.js SHELL에 누락: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest는_유효_json이고_아이콘이_서빙된다() {
+        let resp = respond("/manifest.webmanifest", "", TOKEN);
+        let json: serde_json::Value =
+            serde_json::from_slice(&resp.body).expect("manifest JSON 파싱 실패");
+        let icons = json["icons"].as_array().expect("icons 배열 없음");
+        assert!(!icons.is_empty(), "아이콘 없음");
+        for icon in icons {
+            let src = icon["src"].as_str().expect("icon src 없음");
+            assert_eq!(respond(src, "", TOKEN).status, 200, "아이콘 미서빙: {src}");
         }
     }
 

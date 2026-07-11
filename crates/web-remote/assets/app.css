@@ -88,3 +88,30 @@ h1 { font-size: 19px; font-weight: 600; color: #f0f0f0; }
 .badge.running { background: #21344a; color: #7db4e6; }
 .badge.idle { background: #333; color: #9a9a9a; }
 .resource { font-size: 12px; color: #8a8a8a; margin-top: 12px; font-family: ui-monospace, Menlo, monospace; }
+
+/* P3 설치 셸: iOS 설치 안내 배너 / 알림 권한 버튼 / 오프라인 재시도 */
+.ios-hint {
+  position: relative; margin-top: 14px; padding: 14px 40px 14px 14px;
+  background: #23303f; border: 1px solid #34506a; border-radius: 10px;
+  font-size: 13px; color: #cfe0ef; line-height: 1.5;
+}
+.ios-hint[hidden] { display: none; }
+.ios-hint .hint-title { font-weight: 600; color: #eaf2fa; margin-bottom: 4px; }
+.ios-hint .hint-sub { color: #8fa6bd; font-size: 12px; margin-top: 6px; }
+.hint-close {
+  position: absolute; top: 8px; right: 8px; width: 26px; height: 26px;
+  background: transparent; border: none; color: #8fa6bd; font-size: 15px;
+  cursor: pointer; border-radius: 6px; line-height: 1;
+}
+.hint-close:hover { background: #2c3d50; color: #eaf2fa; }
+.notify-enable {
+  width: 100%; margin-top: 14px; padding: 12px; font-size: 14px; font-weight: 600;
+  color: #f0f0f0; background: #2f5d8a; border: none; border-radius: 9px; cursor: pointer;
+}
+.notify-enable[hidden] { display: none; }
+.notify-enable:hover { background: #366aa0; }
+.retry {
+  margin-top: 18px; padding: 11px 18px; font-size: 15px; font-weight: 600;
+  color: #f0f0f0; background: #3a3a3a; border: 1px solid #555; border-radius: 8px; cursor: pointer;
+}
+.retry:hover { background: #454545; }

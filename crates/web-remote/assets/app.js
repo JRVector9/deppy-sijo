@@ -4,6 +4,8 @@
 (() => {
   'use strict';
   const TOKEN_KEY = 'deppy.webToken';
+  const LAST_DASHBOARD_KEY = 'deppy.lastDashboardAt';
+  const IOS_HINT_KEY = 'deppy.iosHintDismissed';
   const view = document.body.dataset.view;
   const params = new URLSearchParams(location.search);
   const urlToken = params.get('token');
@@ -20,6 +22,21 @@
     return;
   }
 
+  // offline 뷰 — SW가 오프라인 네비게이션 폴백으로 서빙한다. 마지막 dashboard 수신 시각을
+  // 보여주고 재시도(네트워크 복귀 시 '/'로)를 제공한다. 값은 textContent로만 렌더한다.
+  if (view === 'offline') {
+    const lastSeen = document.getElementById('last-seen');
+    if (lastSeen) {
+      const at = Number(localStorage.getItem(LAST_DASHBOARD_KEY) || 0);
+      lastSeen.textContent = at
+        ? '마지막 상태 수신: ' + new Date(at).toLocaleString('ko-KR')
+        : '마지막 상태 수신 기록이 없습니다.';
+    }
+    const retry = document.getElementById('retry-btn');
+    if (retry) retry.addEventListener('click', () => location.replace('/'));
+    return;
+  }
+
   // shell 뷰 — 토큰을 저장하고 주소창/히스토리에서 제거(위생). 재방문 복구는 401 페이지가 한다.
   if (urlToken) {
     localStorage.setItem(TOKEN_KEY, urlToken);
@@ -29,6 +46,9 @@
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js').catch(() => {});
   }
+
+  maybeShowIosInstallHint();
+  maybeShowNotifyButton();
 
   const dot = document.getElementById('dot');
   const statusText = document.getElementById('status-text');
@@ -139,6 +159,8 @@
         setStatus('ok', '연결됨');
         break;
       case 'dashboard':
+        // 오프라인 폴백 화면이 "마지막 상태 시각"을 보여줄 수 있게 수신 시각을 저장한다.
+        localStorage.setItem(LAST_DASHBOARD_KEY, String(Date.now()));
         renderSessions(msg.sessions || [], msg.resource || null);
         break;
       case 'approvals':
@@ -245,6 +267,50 @@
     } else {
       resourceEl.textContent = '';
     }
+  }
+
+  // P3: iOS 설치 안내 — iOS Safari이고 아직 설치(standalone) 전일 때만 노출. 닫으면 억제한다.
+  function maybeShowIosInstallHint() {
+    const el = document.getElementById('ios-install');
+    if (!el) return;
+    const isIos = /iphone|ipad|ipod/i.test(navigator.userAgent);
+    const standalone = window.matchMedia('(display-mode: standalone)').matches
+      || window.navigator.standalone === true;
+    if (!isIos || standalone || localStorage.getItem(IOS_HINT_KEY)) return;
+    el.hidden = false;
+    const close = document.getElementById('ios-install-close');
+    if (close) {
+      close.addEventListener('click', () => {
+        el.hidden = true;
+        localStorage.setItem(IOS_HINT_KEY, '1');
+      });
+    }
+  }
+
+  // P3: 알림 권한 유도 — 앱 아이콘 뱃지(iOS 설치형)·푸시(P4)는 알림 권한 승인 후에만 동작한다.
+  // 권한이 아직 미결정(default)일 때만 버튼을 노출한다. 지금은 Notification.requestPermission만
+  // 호출하지만, P4에서 웹푸시 구독(pushManager.subscribe)과 같은 클릭 제스처로 통합될 자리다.
+  function maybeShowNotifyButton() {
+    const btn = document.getElementById('notify-enable');
+    if (!btn) return;
+    if (!('Notification' in window) || Notification.permission !== 'default') return;
+    btn.hidden = false;
+    btn.addEventListener('click', () => {
+      // iOS/WebKit은 사용자 제스처(클릭 핸들러) 안에서만 권한 요청을 허용한다.
+      let result;
+      try {
+        result = Notification.requestPermission();
+      } catch {
+        btn.hidden = true;
+        return;
+      }
+      // 구형 Safari는 콜백형(반환 undefined), iOS 16.4+는 Promise형 — 둘 다 처리한다.
+      if (result && typeof result.finally === 'function') {
+        result.finally(() => { btn.hidden = true; });
+      } else {
+        btn.hidden = true;
+      }
+    });
   }
 
   // 탭 백그라운드 시 스트림 정지(서버 접속 종료 → 0연결 예산 준수). 포그라운드 복귀 시 재연결.

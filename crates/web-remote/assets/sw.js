@@ -11,7 +11,12 @@ const CACHE = 'deppy-shell-__SHELL_VERSION__';
 // 오프라인 렌더에 필요한 최소 셸만 프리캐시한다. 큰 아이콘(512/maskable)은 설치 시점에
 // 브라우저가 직접 받으므로 오프라인 캐시에 넣지 않는다. 이 목록은 static_srv의 SHELL
 // (해시 대상)과 일치해야 한다 — drift 방지 테스트가 강제한다.
+// 버전 경로(index.html이 참조)와 무버전 경로(offline.html·pairing.html이 참조)를 모두
+// 프리캐시한다 — 같은 바이트라 캐시 비용은 2배가 아니라 무시할 수준이고, 오프라인에서
+// 두 문서 모두 렌더된다. 버전 경로는 서빙 시점에 해시로 치환된다.
 const SHELL = [
+  '/app.__SHELL_VERSION__.css',
+  '/app.__SHELL_VERSION__.js',
   '/app.css',
   '/app.js',
   '/icon-192.png',

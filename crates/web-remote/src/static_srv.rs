@@ -52,8 +52,9 @@ const SW_JS_TEMPLATE: &str = include_str!("../assets/sw.js");
 /// sw.js 안에서 서빙 시점에 셸 버전 해시로 치환되는 자리표시자.
 const SW_VERSION_PLACEHOLDER: &str = "__SHELL_VERSION__";
 
-/// 앱 셸 문서 — `/?token=` 게이트 통과 시에만 서빙.
-const INDEX_HTML: &[u8] = include_bytes!("../assets/index.html");
+/// 앱 셸 문서 — `/?token=` 게이트 통과 시에만 서빙. 자산 참조에 셸 버전을 주입하므로
+/// 템플릿이다(아래 [`index_html_response`]). SHELL(해시 입력)에 들어있지 않아 순환 없음.
+const INDEX_HTML_TEMPLATE: &str = include_str!("../assets/index.html");
 /// 게이트 실패(401) 본문 — 저장된 토큰으로 자동 복구를 시도하는 페어링 안내 페이지.
 const PAIRING_HTML: &[u8] = include_bytes!("../assets/pairing.html");
 
@@ -63,10 +64,18 @@ const PAIRING_HTML: &[u8] = include_bytes!("../assets/pairing.html");
 /// 아예 공개 호스팅으로 이동), 데이터/행위 권한은 WS API(P2)가 접속마다 첫 프레임
 /// 인증으로 지킨다. 401 본문은 localStorage 토큰으로 자동 재시도하는 페어링 페이지다.
 pub fn respond(path: &str, query: &str, expected_token: &str) -> Response {
+    // 내용 해시 자산 경로(`/app.<version>.js|css`) — index.html이 이 경로를 참조한다.
+    // **스테일 SW 방어**: 구 SW의 fetch 핸들러는 자기 SHELL 목록(`/app.js` 등)에 없는
+    // 경로를 가로채지 않으므로 네트워크로 직행한다 → HTML(network-first)과 JS/CSS가
+    // 항상 같은 버전이 된다. (구 SW는 cache-first + ignoreSearch라 `?v=` 쿼리
+    // 캐시버스팅으로는 못 뚫는다 — 경로 자체가 달라야 한다.)
+    if let Some(response) = versioned_asset(path) {
+        return response;
+    }
     match path {
         "/" => {
             if token_param_matches(query, expected_token) {
-                html(200, INDEX_HTML)
+                index_html_response()
             } else {
                 html(401, PAIRING_HTML)
             }
@@ -101,6 +110,36 @@ fn sw_js_response() -> Response {
         content_type: "text/javascript; charset=utf-8",
         body: Cow::Owned(body.into_bytes()),
     }
+}
+
+/// 앱 셸 문서 — 자산 참조(`/app.__SHELL_VERSION__.js|css`)에 셸 해시를 주입해 서빙한다.
+/// HTML은 SW가 network-first로 다루므로 항상 최신이고, 그 HTML이 가리키는 버전 경로는
+/// 구 SW의 캐시 목록에 없어 네트워크로 간다 — 새 HTML + 구 JS 불일치가 구조적으로 불가능.
+fn index_html_response() -> Response {
+    let body = INDEX_HTML_TEMPLATE.replace(SW_VERSION_PLACEHOLDER, shell_version());
+    Response {
+        status: 200,
+        content_type: "text/html; charset=utf-8",
+        body: Cow::Owned(body.into_bytes()),
+    }
+}
+
+/// `/app.<version>.js|css`면 해당 자산을 돌려준다(버전이 현재 셸 해시와 일치할 때만 —
+/// 옛 버전 경로는 404라 브라우저가 새 HTML을 받도록 강제된다). 그 외 경로는 None.
+fn versioned_asset(path: &str) -> Option<Response> {
+    let version = shell_version();
+    let (mime, bytes): (&'static str, &'static [u8]) = if path == format!("/app.{version}.js") {
+        ("text/javascript; charset=utf-8", APP_JS)
+    } else if path == format!("/app.{version}.css") {
+        ("text/css; charset=utf-8", APP_CSS)
+    } else {
+        return None;
+    };
+    Some(Response {
+        status: 200,
+        content_type: mime,
+        body: Cow::Borrowed(bytes),
+    })
 }
 
 /// SW 캐시 버전 키 — 프리캐시 셸 자산 바이트의 FNV-1a 해시(16진 16자리). 보안용이 아니라
@@ -275,17 +314,18 @@ mod tests {
     }
 
     #[test]
-    fn sw_js_shell_배열은_rust_shell의_부분집합이다() {
-        // 역방향 drift 가드(P3 리뷰): sw.js SHELL에만 있고 static_srv SHELL엔 없는 경로가 생기면
-        // 그 경로는 서빙되지 않아 cache.addAll이 통째로 실패(all-or-nothing) → 조용한 SW install
-        // 실패. sw.js의 `const SHELL = [...]` 배열을 파싱해 모든 경로가 Rust SHELL에 있는지 본다.
-        let start = SW_JS_TEMPLATE
+    fn sw_js_shell_배열의_모든_경로가_서빙된다() {
+        // 역방향 drift 가드(P3 리뷰): sw.js SHELL에 있는데 서빙되지 않는 경로가 생기면
+        // cache.addAll이 통째로 실패(all-or-nothing) → 조용한 SW install 실패. 버전 경로
+        // (`/app.<hash>.js`)까지 포함해 **실제 서빙 여부**로 검증한다.
+        let version = shell_version();
+        let template = SW_JS_TEMPLATE.replace(SW_VERSION_PLACEHOLDER, version);
+        let start = template
             .find("const SHELL = [")
             .expect("sw.js에 SHELL 배열 없음");
-        let rest = &SW_JS_TEMPLATE[start..];
+        let rest = &template[start..];
         let end = rest.find("];").expect("sw.js SHELL 배열 끝(];) 없음");
         let array = &rest[..end];
-        let rust_paths: Vec<&str> = SHELL.iter().map(|&(path, _)| path).collect();
         let mut seen = 0;
         for line in array.lines() {
             let Some(path) = line
@@ -298,13 +338,41 @@ mod tests {
             if !path.starts_with('/') {
                 continue;
             }
-            assert!(
-                rust_paths.contains(&path),
-                "sw.js SHELL의 '{path}'가 static_srv SHELL에 없음(서빙 안 됨 → cache.addAll 실패)"
+            assert_eq!(
+                respond(path, "", TOKEN).status,
+                200,
+                "sw.js SHELL의 '{path}'가 서빙되지 않음 → cache.addAll 실패"
             );
             seen += 1;
         }
-        assert_eq!(seen, SHELL.len(), "양방향 SHELL 개수 불일치");
+        // 무버전 셸 5 + 버전 자산 2(js/css)
+        assert_eq!(seen, SHELL.len() + 2, "sw.js SHELL 경로 수 불일치");
+    }
+
+    /// 스테일 SW 방어의 핵심 계약: index.html이 참조하는 자산 경로는 **버전 해시가 박힌
+    /// 경로**여야 한다. 구 SW의 SHELL 목록(`/app.js`)에 없는 경로라야 가로채이지 않고
+    /// 네트워크로 가서, HTML(network-first)과 JS/CSS 버전이 항상 일치한다.
+    #[test]
+    fn index는_버전_경로_자산을_참조하고_그_경로가_서빙된다() {
+        let version = shell_version();
+        let body = respond("/", &format!("token={TOKEN}"), TOKEN).body;
+        let html = String::from_utf8(body.into_owned()).unwrap();
+        let js_path = format!("/app.{version}.js");
+        let css_path = format!("/app.{version}.css");
+        assert!(html.contains(&format!(r#"src="{js_path}""#)), "{html}");
+        assert!(html.contains(&format!(r#"href="{css_path}""#)), "{html}");
+        // 자리표시자가 남아 있으면 치환 실패
+        assert!(!html.contains(SW_VERSION_PLACEHOLDER), "자리표시자 미치환");
+        // 참조된 버전 경로가 실제로 서빙된다
+        for path in [&js_path, &css_path] {
+            let resp = respond(path, "", TOKEN);
+            assert_eq!(resp.status, 200, "버전 자산 미서빙: {path}");
+        }
+        // 무버전 경로도 계속 서빙된다(offline/pairing 문서가 참조)
+        assert_eq!(respond("/app.js", "", TOKEN).status, 200);
+        assert_eq!(respond("/app.css", "", TOKEN).status, 200);
+        // 옛 버전 경로는 404 — 브라우저가 새 HTML을 받도록 강제된다
+        assert_eq!(respond("/app.0000000000000000.js", "", TOKEN).status, 404);
     }
 
     #[test]

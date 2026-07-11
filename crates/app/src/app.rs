@@ -1097,7 +1097,9 @@ pub struct App {
     workspaces: Vec<crate::storage::WorkspaceRow>,
     /// 런타임이 없는 workspace도 활동 화면에 복원 대상 pane을 표시하기 위한 DB snapshot.
     /// refresh_workspaces에서 한 쿼리로 갱신한다.
-    persisted_activity_panes: std::collections::HashMap<String, Vec<String>>,
+    /// 워크스페이스별 영속 pane snapshot — (raw 제목, 세션 cwd). cwd는 기본 제목
+    /// ("셸 N")을 프로젝트명으로 표시하는 데 쓴다(활성 워크스페이스와 같은 규칙).
+    persisted_activity_panes: std::collections::HashMap<String, Vec<(String, String)>>,
     /// 옵션2: 활성 세션별 에이전트 transcript 활동(working/idle) — 레일 상태에 반영.
     agent_activity:
         std::collections::HashMap<runtime::SessionId, crate::agent_transcript::AgentActivity>,
@@ -3005,10 +3007,13 @@ impl App {
         }
         match self.db.list_persisted_activity_panes() {
             Ok(rows) => {
-                let mut by_workspace: std::collections::HashMap<String, Vec<String>> =
+                let mut by_workspace: std::collections::HashMap<String, Vec<(String, String)>> =
                     std::collections::HashMap::new();
-                for (workspace_id, title) in rows {
-                    by_workspace.entry(workspace_id).or_default().push(title);
+                for (workspace_id, title, cwd) in rows {
+                    by_workspace
+                        .entry(workspace_id)
+                        .or_default()
+                        .push((title, cwd));
                 }
                 self.persisted_activity_panes = by_workspace;
             }
@@ -3029,6 +3034,24 @@ impl App {
         entry
             .filter(|(_, at)| now.saturating_duration_since(*at) < Self::PRESSURE_TTL)
             .map(|(p, _)| p.clone())
+    }
+
+    /// 비활성(warm/유휴) 워크스페이스의 pane 표시명 — 활성 워크스페이스의
+    /// `resolve_session_title`과 같은 규칙: 사용자가 rename했으면 그대로, 기본 제목
+    /// ("셸 N")이면 세션 cwd의 프로젝트명으로 대체한다. 감지 워커는 활성 워크스페이스만
+    /// 돌지만 cwd는 worker가 DB에 영속하므로(UpdateSessionCwd) 여기서 재사용한다.
+    /// cwd를 못 찾으면 기본 제목을 i18n 렌더한 값("셸 1")으로 폴백.
+    fn activity_session_name(&self, workspace_id: &str, raw_title: &str) -> String {
+        let cwd = self
+            .persisted_activity_panes
+            .get(workspace_id)
+            .and_then(|panes| {
+                panes
+                    .iter()
+                    .find(|(title, _)| title == raw_title)
+                    .map(|(_, cwd)| cwd.as_str())
+            });
+        activity_session_name(raw_title, cwd, &self.i18n)
     }
 
     fn activity_rows(&self) -> Vec<ui::activity::ActivityWorkspaceRow> {
@@ -3096,7 +3119,12 @@ impl App {
                     let sessions = ids
                         .iter()
                         .map(|s| ui::activity::ActivitySessionRow {
-                            name: rt.session_titles.get(s).cloned().unwrap_or_default(),
+                            // 기본 제목이면 프로젝트명으로 표시 (활성 워크스페이스와 동일 규칙).
+                            name: rt
+                                .session_titles
+                                .get(s)
+                                .map(|raw| self.activity_session_name(&ws.id, raw))
+                                .unwrap_or_default(),
                             agent_line: None,
                             status_line: None,
                             resource: rt
@@ -3125,8 +3153,9 @@ impl App {
                     .get(&ws.id)
                     .into_iter()
                     .flatten()
-                    .map(|title| ui::activity::ActivitySessionRow {
-                        name: title.clone(),
+                    .map(|(title, _cwd)| ui::activity::ActivitySessionRow {
+                        // 유휴 워크스페이스도 프로젝트명으로 표시 (활성/warm과 동일 규칙).
+                        name: self.activity_session_name(&ws.id, title),
                         agent_line: None,
                         status_line: None,
                         resource: None,
@@ -4868,12 +4897,61 @@ fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) {
     }
 }
 
+/// 비활성(warm/유휴) 워크스페이스 pane의 표시명 (순수 — 테스트 대상).
+/// 활성 워크스페이스의 `resolve_session_title`과 같은 규칙: 사용자가 rename했으면
+/// 그대로, 기본 제목("셸 N")이면 세션 cwd의 프로젝트명으로 대체, cwd가 없거나 판별
+/// 불가면 기본 제목을 i18n 렌더한 값으로 폴백.
+fn activity_session_name(raw_title: &str, cwd: Option<&str>, catalog: &i18n::Catalog) -> String {
+    if !ui::workspace::is_default_session_title(raw_title) {
+        return ui::workspace::display_pane_title(raw_title, catalog);
+    }
+    cwd.filter(|cwd| !cwd.is_empty())
+        .and_then(crate::agent_detect::project_display_name)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| ui::workspace::display_pane_title(raw_title, catalog))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+
+    /// 활동 패널(warm/유휴)의 pane 이름: 기본 제목은 프로젝트명으로, rename은 그대로.
+    #[test]
+    fn 활동_pane_이름은_기본제목이면_프로젝트명으로_표시된다() {
+        let catalog = load_catalog("ko-KR");
+        // 기본 제목 + cwd → 프로젝트(폴더)명
+        assert_eq!(
+            activity_session_name(
+                "workspace.spawn.shell 1",
+                Some("/Users/jr/Desktop/Projects/deppy-sijo"),
+                &catalog
+            ),
+            "deppy-sijo"
+        );
+        // 사용자 rename은 cwd와 무관하게 그대로
+        assert_eq!(
+            activity_session_name("배포 작업", Some("/tmp/whatever"), &catalog),
+            "배포 작업"
+        );
+        // cwd 없음/빈 값 → 기본 제목 i18n 렌더로 폴백(기존 동작)
+        let fallback = ui::workspace::display_pane_title("workspace.spawn.shell 3", &catalog);
+        assert_eq!(
+            activity_session_name("workspace.spawn.shell 3", None, &catalog),
+            fallback
+        );
+        assert_eq!(
+            activity_session_name("workspace.spawn.shell 3", Some(""), &catalog),
+            fallback
+        );
+        // 상대경로(비정상) → 폴백
+        assert_eq!(
+            activity_session_name("workspace.spawn.shell 3", Some("relative/path"), &catalog),
+            fallback
+        );
+    }
 
     /// 구분 가능한 최소 MuxUpdated 이벤트 (active_tab 태그로 스냅샷을 식별).
     fn mux_event(tag: &str) -> runtime::RuntimeEvent {

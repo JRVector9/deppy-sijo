@@ -781,18 +781,22 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// 런타임이 없는 워크스페이스의 활동 화면에 쓸 영속 pane 제목 snapshot.
-    /// `sessions` 전체는 닫힌 과거 이력도 남으므로, 현재 복원 레이아웃에 연결된
-    /// `mux_panes`만 읽는다. 한 쿼리로 모든 workspace를 반환해 UI의 N+1을 피한다.
-    pub fn list_persisted_activity_panes(&self) -> anyhow::Result<Vec<(String, String)>> {
+    /// 런타임이 없는(또는 warm) 워크스페이스의 활동 화면에 쓸 영속 pane snapshot —
+    /// (workspace_id, 제목, 세션 cwd). `sessions` 전체는 닫힌 과거 이력도 남으므로,
+    /// 현재 복원 레이아웃에 연결된 `mux_panes`만 읽는다. 한 쿼리로 모든 workspace를
+    /// 반환해 UI의 N+1을 피한다. cwd는 기본 제목("셸 N")을 프로젝트명으로 바꿔 표시하는
+    /// 데 쓴다(활성 워크스페이스의 resolve_session_title과 같은 규칙) — 세션이 없는
+    /// pane이면 빈 문자열.
+    pub fn list_persisted_activity_panes(&self) -> anyhow::Result<Vec<(String, String, String)>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT p.workspace_id,
-                    COALESCE(NULLIF(p.title, ''), NULLIF(s.title, ''), p.id)
+                    COALESCE(NULLIF(p.title, ''), NULLIF(s.title, ''), p.id),
+                    COALESCE(s.cwd, '')
                FROM mux_panes p
                LEFT JOIN sessions s ON s.id = p.session_id
               ORDER BY p.workspace_id, p.created_at, p.id",
         )?;
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -1666,9 +1670,10 @@ mod tests {
             )
             .unwrap();
 
+        // cwd도 함께 온다 — 기본 제목("셸 N")을 프로젝트명으로 표시하는 데 쓴다.
         assert_eq!(
             db.list_persisted_activity_panes().unwrap(),
-            vec![(ws, "saved shell".to_owned())]
+            vec![(ws, "saved shell".to_owned(), "/".to_owned())]
         );
     }
 

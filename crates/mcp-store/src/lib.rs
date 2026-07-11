@@ -649,6 +649,22 @@ pub fn insert_server(conn: &Connection, row: &McpServerRow) -> anyhow::Result<()
     Ok(())
 }
 
+/// http 서버의 url 갱신 (H3). url 변경은 신뢰 리셋 훅과 한 쌍 — 호출측(UI)이
+/// tool_permission_rules Allow 초기화 + mcp_tools 캐시 무효화 + 재확인을 함께 수행한다
+/// (VS Code cacheNonce 신뢰 모델의 "편집 저장 시점 훅" 등가 구현 — 스키마 추가 없음).
+pub fn update_server_url(conn: &Connection, server_id: &str, url: &str) -> anyhow::Result<()> {
+    let affected = conn
+        .execute(
+            "UPDATE mcp_servers
+             SET url = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE id = ?1",
+            (server_id, url),
+        )
+        .with_context(|| format!("mcp_server url 갱신 실패: {server_id}"))?;
+    anyhow::ensure!(affected == 1, "mcp_server url 갱신 대상 없음: {server_id}");
+    Ok(())
+}
+
 pub fn list_servers(conn: &Connection) -> anyhow::Result<Vec<McpServerRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, name, kind, command, args_json, env_json, env_credentials_json,
@@ -839,6 +855,24 @@ mod tests {
         let server = sample_server();
         insert_server(&conn, &server).unwrap();
         assert_eq!(list_servers(&conn).unwrap(), vec![server]);
+    }
+
+    #[test]
+    fn server_url_갱신은_기존_행만_바꾼다() {
+        let conn = test_conn();
+        let mut server = sample_server();
+        server.kind = "http".to_owned();
+        server.command = None;
+        server.args = Vec::new();
+        server.url = Some("https://old.example.com/mcp".to_owned());
+        insert_server(&conn, &server).unwrap();
+
+        update_server_url(&conn, "srv-1", "https://new.example.com/mcp").unwrap();
+        let rows = list_servers(&conn).unwrap();
+        assert_eq!(rows[0].url.as_deref(), Some("https://new.example.com/mcp"));
+
+        // 없는 id는 에러 (조용한 no-op이면 신뢰 리셋 훅이 헛돈다)
+        assert!(update_server_url(&conn, "no-such", "https://x.example.com").is_err());
     }
 
     #[test]

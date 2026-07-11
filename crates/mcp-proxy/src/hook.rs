@@ -9,10 +9,12 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use audit::{AuditRecord, PermissionRule, ToolDecision};
-use mcp::{LocalMcpManager, McpServerConfig, PermissionHook, ProxyDecision};
+use mcp::{LocalMcpManager, PermissionHook, ProxyDecision};
 use secret::RedactionService;
 use serde_json::Value;
 use storage::{ApprovalStatus, Db};
+
+use crate::forwarder::BackendConfig;
 
 /// 승인 미리보기 최대 길이 (문자 수). 긴 인자가 GUI/DB를 압박하지 않도록 자른다.
 const PREVIEW_MAX_CHARS: usize = 500;
@@ -25,8 +27,9 @@ pub struct DbPermissionHook {
     poll_interval: Duration,
     approval_timeout: Duration,
     /// live 스키마 검증용 백엔드 spec + manager (DB 캐시가 아니라 실제 백엔드에서 해시 계산).
+    /// kind별 config(stdio|http)는 forwarder와 동일한 BackendConfig로 분기한다 (H3).
     manager: LocalMcpManager,
-    config: McpServerConfig,
+    config: BackendConfig,
     /// live 스키마 해시 캐시 (tool_name → schema_hash). 프록시 세션당 최초 필요 시 한 번만
     /// 백엔드를 discover해 채운다(성공 시). None = 아직 성공 discover 못 함(다음 호출에서 재시도).
     schema_cache: Mutex<Option<HashMap<String, String>>>,
@@ -41,7 +44,7 @@ impl DbPermissionHook {
         poll_interval: Duration,
         approval_timeout: Duration,
         manager: LocalMcpManager,
-        config: McpServerConfig,
+        config: BackendConfig,
     ) -> Self {
         Self {
             db,
@@ -87,7 +90,7 @@ impl DbPermissionHook {
     fn schema_hash_for(&self, tool_name: &str) -> Option<String> {
         let mut cache = self.schema_cache.lock().unwrap();
         if cache.is_none() {
-            match self.manager.discover_tools(&self.config) {
+            match self.config.discover_tools(&self.manager) {
                 Ok(tools) => {
                     let map = tools
                         .into_iter()
@@ -303,14 +306,14 @@ mod tests {
 
     /// 존재하지 않는 command를 가리키는 config — live discover가 항상 실패한다
     /// (schema_hash_for → None). live 백엔드가 필요 없는 테스트의 기본값.
-    fn bad_config() -> McpServerConfig {
-        McpServerConfig {
-            name: "no-backend".to_owned(),
-            command: "/nonexistent/deppy-proxy-test-cmd".to_owned(),
-            args: Vec::new(),
-            env: Vec::new(),
-            inherit_env: true,
-        }
+    fn bad_config() -> BackendConfig {
+        BackendConfig::Stdio(mcp::McpServerConfig::stdio(
+            "no-backend".to_owned(),
+            "/nonexistent/deppy-proxy-test-cmd".to_owned(),
+            Vec::new(),
+            Vec::new(),
+            true,
+        ))
     }
 
     fn hook_with(path: &Path, poll: Duration, timeout: Duration) -> DbPermissionHook {
@@ -321,7 +324,7 @@ mod tests {
         path: &Path,
         poll: Duration,
         timeout: Duration,
-        config: McpServerConfig,
+        config: BackendConfig,
     ) -> DbPermissionHook {
         DbPermissionHook::new(
             Db::open(path).unwrap(),
@@ -367,14 +370,14 @@ mod tests {
 
     /// 주어진 script를 `/bin/sh -c`로 실행하는 config.
     #[cfg(unix)]
-    fn sh_config(script: String) -> McpServerConfig {
-        McpServerConfig {
-            name: "mock".to_owned(),
-            command: "/bin/sh".to_owned(),
-            args: vec!["-c".to_owned(), script],
-            env: Vec::new(),
-            inherit_env: true,
-        }
+    fn sh_config(script: String) -> BackendConfig {
+        BackendConfig::Stdio(mcp::McpServerConfig::stdio(
+            "mock".to_owned(),
+            "/bin/sh".to_owned(),
+            vec!["-c".to_owned(), script],
+            Vec::new(),
+            true,
+        ))
     }
 
     #[cfg(unix)]

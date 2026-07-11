@@ -173,7 +173,8 @@ const NO_ALLOW: &[BoundaryAllow] = &[];
 const LOCAL_MCP_MANAGER_ALLOW: &[BoundaryAllow] = &[
     BoundaryAllow {
         path: "crates/app/src/ui/connectors.rs",
-        snippet: "use mcp::{LocalMcpManager, McpServerConfig, McpTool};",
+        // H3: http config 타입 + url 검증 함수 추가 (2026-07-11)
+        snippet: "use mcp::{LocalMcpManager, McpHttpServerConfig, McpServerConfig, McpTool, validate_mcp_url};",
         count: 1,
         reason: "PR-B00 deferred connector MCP runtime boundary",
     },
@@ -182,6 +183,19 @@ const LOCAL_MCP_MANAGER_ALLOW: &[BoundaryAllow] = &[
         snippet: "let manager = LocalMcpManager::new(self.redaction.clone());",
         count: 3,
         reason: "PR-B00 deferred connector MCP discover/prepare/call execution",
+    },
+    // H3 kind별 config 분기(ConnectorConfig)가 manager를 인자로 받는 dispatch 시그니처
+    BoundaryAllow {
+        path: "crates/app/src/ui/connectors.rs",
+        snippet: "fn discover_tools(&self, manager: &LocalMcpManager) -> anyhow::Result<Vec<McpTool>> {",
+        count: 1,
+        reason: "H3 connector transport dispatch signature",
+    },
+    BoundaryAllow {
+        path: "crates/app/src/ui/connectors.rs",
+        snippet: "manager: &LocalMcpManager,",
+        count: 1,
+        reason: "H3 connector transport dispatch signature",
     },
 ];
 
@@ -278,6 +292,31 @@ const DB_CALL_ALLOW: &[BoundaryAllow] = &[
         count: 1,
         reason: "PR-B00 deferred connector permission storage boundary",
     },
+    // H3 url 편집 시점 훅(save_url_edit): Allow 규칙 초기화 + 도구 캐시 무효화 + url 갱신
+    BoundaryAllow {
+        path: "crates/app/src/ui/connectors.rs",
+        snippet: "let rules = db.list_permission_rules().context(\"권한 규칙 조회 실패\")?;",
+        count: 1,
+        reason: "H3 connector url-edit trust reset boundary",
+    },
+    BoundaryAllow {
+        path: "crates/app/src/ui/connectors.rs",
+        snippet: "db.delete_permission_rule(&rule.server_id, &rule.tool_name)",
+        count: 1,
+        reason: "H3 connector url-edit trust reset boundary",
+    },
+    BoundaryAllow {
+        path: "crates/app/src/ui/connectors.rs",
+        snippet: "db.replace_mcp_tools(server_id, &[])",
+        count: 1,
+        reason: "H3 connector url-edit tools cache invalidation boundary",
+    },
+    BoundaryAllow {
+        path: "crates/app/src/ui/connectors.rs",
+        snippet: "db.update_mcp_server_url(server_id, new_url)?;",
+        count: 1,
+        reason: "H3 connector url-edit storage boundary",
+    },
     BoundaryAllow {
         path: "crates/app/src/ui/connectors.rs",
         snippet: "if let Err(e) = db.record_tool_audit(&record, &self.redaction, None) {",
@@ -292,7 +331,7 @@ const DB_CALL_ALLOW: &[BoundaryAllow] = &[
     },
     BoundaryAllow {
         path: "crates/app/src/ui/connectors.rs",
-        // 수동 추가 폼 + mcpServers 가져오기(run_import) 두 경로 (2026-07-11)
+        // 수동 추가 폼(add_server) + 가져오기 공용 등록(import_insert — stdio/http, H3) 두 경로
         snippet: "match db.insert_mcp_server(&row) {",
         count: 2,
         reason: "PR-B00 deferred connector MCP server storage boundary",

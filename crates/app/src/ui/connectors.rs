@@ -1,16 +1,19 @@
-//! Connector Center (설계문서 §3 ConnectorCenter, PR-17/PR-18).
+//! Connector Center (설계문서 §3 ConnectorCenter, PR-17/PR-18 + H3).
 //! local MCP 서버를 카드로 나열하고 쉽게 추가 + 연결 상태를 표시한다.
-//! 연결 테스트(discover_tools)는 subprocess 왕복이라 백그라운드 스레드에서 돌리고,
+//! 연결 테스트(discover_tools)는 subprocess/HTTP 왕복이라 백그라운드 스레드에서 돌리고,
 //! 결과는 채널로 받아 UI에 반영 + mcp_tools를 DB에 교체 저장한다.
+//! HTTP 커넥터(H3): kind='http' 서버를 url로 등록·발견·실행한다. 최초 연결(테스트/
+//! 도구 발견/실행) 전 세션당 1회 신뢰 확인 모달을 거치고, url 편집 저장 시 Allow 규칙
+//! 초기화 + 도구 캐시 무효화 + 재확인한다 (VS Code cacheNonce 신뢰의 편집 시점 훅 등가).
 //! OAuth 커넥터(PR-18): 브라우저 승인 대기가 길어 flow 전체를 백그라운드로 돌리고,
 //! 획득한 토큰은 UI 스레드에서 keyring 저장 + credentials 등록 + redaction 시드.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::Context;
-use mcp::{LocalMcpManager, McpServerConfig, McpTool};
+use mcp::{LocalMcpManager, McpHttpServerConfig, McpServerConfig, McpTool, validate_mcp_url};
 use mcp_store::{McpServerRow, McpToolRow};
 use secret::RedactionService;
 
@@ -41,11 +44,8 @@ enum OAuthStatus {
 struct ToolInvoke {
     server_id: String,
     server_name: String,
-    command: String,
-    args: Vec<String>,
-    env_plain: Vec<(String, String)>,
-    env_secrets: Vec<(String, String)>,
-    inherit_env: bool,
+    /// transport별 연결 스펙 — 서버 row의 kind('stdio'|'http')에 대응 (H3)
+    target: InvokeTarget,
     tool_name: String,
     schema_hash: String,
     /// tool 인자 JSON draft (사용자 편집)
@@ -55,6 +55,20 @@ struct ToolInvoke {
     generation: u64,
     /// Preparing이 가져온 현재 schema hash (패널이 소비해 정책 평가에 반영)
     prepared_hash: Option<String>,
+}
+
+/// invoke가 보관하는 transport별 연결 스펙 (H3).
+enum InvokeTarget {
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env_plain: Vec<(String, String)>,
+        env_secrets: Vec<(String, String)>,
+        inherit_env: bool,
+    },
+    Http {
+        url: String,
+    },
 }
 
 enum InvokePhase {
@@ -77,6 +91,27 @@ enum InvokeMsg {
 
 /// 백그라운드 결과: (실행 세대, 메시지). 세대가 일치할 때만 반영.
 type InvokeResult = (u64, InvokeMsg);
+
+/// 추가 폼의 서버 종류 (H3) — mcp_servers.kind 'stdio' | 'http'에 대응.
+#[derive(Clone, Copy, PartialEq)]
+enum AddKind {
+    Stdio,
+    Http,
+}
+
+/// http 서버 최초 연결 신뢰 확인 모달 상태 (H3). 확인 후 실행할 동작을 보관한다.
+/// 신뢰는 세션 범위(trusted_http) — 스키마 추가 없이 편집 시점 훅과 한 쌍으로 동작한다.
+struct TrustPrompt {
+    server: McpServerRow,
+    /// None = 연결 테스트(discover), Some(tool) = 도구 실행(invoke)
+    tool: Option<McpToolRow>,
+}
+
+/// http 서버 url 편집 draft (H3). 저장 시 Allow 규칙 초기화 + 캐시 무효화 + 재확인.
+struct UrlEdit {
+    server_id: String,
+    draft: String,
+}
 
 /// tool 인자 JSON 최대 크기 — stdin pipe buffer(대체로 ≥64KB)보다 작게 잡아
 /// write_all이 서버 미독취 시에도 블록되지 않게 한다 (transport write hang 방지).
@@ -136,14 +171,23 @@ pub struct ConnectorsUi {
     redaction: RedactionService,
     // 추가 폼
     name: String,
+    /// 추가 폼 종류 선택 (H3): stdio | http
+    add_kind: AddKind,
     command: String,
     /// 한 줄에 하나 — agents 등록과 같은 관례 (셸 문자열 파싱 금지)
     args_input: String,
+    /// http 서버 URL 입력 (H3) — 저장 전 https/localhost 정책 검증
+    url_input: String,
     error: Option<String>,
     cached: Option<Vec<McpServerRow>>,
     status: HashMap<String, ConnStatus>,
     result_tx: mpsc::Sender<DiscoverResult>,
     result_rx: mpsc::Receiver<DiscoverResult>,
+    // http 신뢰/편집 (H3)
+    /// 이번 세션에서 원격 전송을 확인한 http 서버 id — 최초 연결 전 1회 확인 모달
+    trusted_http: HashSet<String>,
+    trust_prompt: Option<TrustPrompt>,
+    url_edit: Option<UrlEdit>,
     // 가져오기 (JSON 붙여넣기 · 파일 · Claude Desktop 설정)
     import_input: String,
     /// 마지막 가져오기 결과 요약 (서버별 등록/건너뜀/실패 한 줄씩)
@@ -176,13 +220,18 @@ impl ConnectorsUi {
         Self {
             redaction,
             name: String::new(),
+            add_kind: AddKind::Stdio,
             command: String::new(),
             args_input: String::new(),
+            url_input: String::new(),
             error: None,
             cached: None,
             status: HashMap::new(),
             result_tx,
             result_rx,
+            trusted_http: HashSet::new(),
+            trust_prompt: None,
+            url_edit: None,
             import_input: String::new(),
             import_report: Vec::new(),
             oauth_label: String::new(),
@@ -287,35 +336,57 @@ impl ConnectorsUi {
             self.tool_invoke_panel(ui, ctx, db, workspace_id, env_resolver, catalog);
         }
 
+        // http 서버 최초 연결 신뢰 확인 모달 (H3) — 확인하면 이번 세션 동안 기억한다
+        self.trust_prompt_modal(ui, ctx, env_resolver, catalog);
+
         ui.separator();
-        ui.label(catalog.t("connectors.add_mcp_stdio", &[]));
-        // 인기 서버 프리셋 — 클릭하면 아래 폼에 채워진다 (경로 등 수정 후 추가)
+        ui.label(catalog.t("connectors.add_mcp", &[]));
+        // 종류 선택 (H3): stdio는 command/args, http는 URL만 입력한다
         ui.horizontal(|ui| {
-            ui.label(catalog.t("connectors.presets", &[]));
-            for preset in MCP_PRESETS {
-                if ui
-                    .small_button(preset.name)
-                    .on_hover_text(catalog.t("connectors.preset_hint", &[]))
-                    .clicked()
-                {
-                    self.apply_preset(preset);
-                }
-            }
+            ui.label(catalog.t("connectors.kind", &[]));
+            ui.radio_value(&mut self.add_kind, AddKind::Stdio, "stdio");
+            ui.radio_value(&mut self.add_kind, AddKind::Http, "http");
         });
+        if self.add_kind == AddKind::Stdio {
+            // 인기 서버 프리셋 — 클릭하면 아래 폼에 채워진다 (경로 등 수정 후 추가)
+            ui.horizontal(|ui| {
+                ui.label(catalog.t("connectors.presets", &[]));
+                for preset in MCP_PRESETS {
+                    if ui
+                        .small_button(preset.name)
+                        .on_hover_text(catalog.t("connectors.preset_hint", &[]))
+                        .clicked()
+                    {
+                        self.apply_preset(preset);
+                    }
+                }
+            });
+        }
         ui.horizontal(|ui| {
             ui.label(catalog.t("common.name", &[]));
             ui.text_edit_singleline(&mut self.name);
         });
-        ui.horizontal(|ui| {
-            ui.label(catalog.t("common.command", &[]));
-            ui.text_edit_singleline(&mut self.command);
-        });
-        ui.label(catalog.t("connectors.args_note", &[]));
-        ui.add(
-            egui::TextEdit::multiline(&mut self.args_input)
-                .desired_rows(2)
-                .hint_text("-y\nserver-filesystem"),
-        );
+        match self.add_kind {
+            AddKind::Stdio => {
+                ui.horizontal(|ui| {
+                    ui.label(catalog.t("common.command", &[]));
+                    ui.text_edit_singleline(&mut self.command);
+                });
+                ui.label(catalog.t("connectors.args_note", &[]));
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.args_input)
+                        .desired_rows(2)
+                        .hint_text("-y\nserver-filesystem"),
+                );
+            }
+            AddKind::Http => {
+                ui.horizontal(|ui| {
+                    ui.label("URL");
+                    ui.text_edit_singleline(&mut self.url_input);
+                });
+                ui.weak(catalog.t("connectors.url_note", &[]));
+            }
+        }
         if ui.button(catalog.t("action.add", &[])).clicked() {
             self.add_server(db);
         }
@@ -512,12 +583,17 @@ impl ConnectorsUi {
         ui.group(|ui| {
             ui.horizontal(|ui| {
                 ui.strong(&server.name);
-                let command = server.command.as_deref().unwrap_or("");
-                ui.weak(format!(
-                    "{} {}",
-                    command,
-                    mcp_args_for_display(&server.args)
-                ));
+                if server.kind == "http" {
+                    // http 서버는 url이 정의의 전부 — command/args 대신 url 표시 (H3)
+                    ui.weak(server.url.as_deref().unwrap_or(""));
+                } else {
+                    let command = server.command.as_deref().unwrap_or("");
+                    ui.weak(format!(
+                        "{} {}",
+                        command,
+                        mcp_args_for_display(&server.args)
+                    ));
+                }
             });
             ui.horizontal(|ui| {
                 match self.status.get(&server.id) {
@@ -543,9 +619,13 @@ impl ConnectorsUi {
                     )
                     .clicked()
                 {
-                    self.start_discover(ctx, server, env_resolver);
+                    self.request_discover(ctx, server, env_resolver);
                 }
             });
+            // http 서버 url 편집 (H3) — 저장 시 Allow 규칙 초기화 + 캐시 무효화 + 재확인
+            if server.kind == "http" {
+                self.url_edit_controls(ui, db, server, catalog);
+            }
             // 저장된 tool 목록 + 실행 버튼 + 현재 권한 규칙 (PR-16)
             if let Ok(tools) = db.list_mcp_tools(&server.id) {
                 for tool in tools {
@@ -558,9 +638,16 @@ impl ConnectorsUi {
                                 egui::Button::new(catalog.t("action.run", &[])).small(),
                             )
                             .clicked()
-                            && let Err(e) = self.begin_invoke(server, &tool)
                         {
-                            self.error = Some(format!("실행 준비 실패: {e:#}"));
+                            // http 서버는 최초 연결 신뢰 확인을 먼저 받는다 (H3)
+                            if server.kind == "http" && !self.trusted_http.contains(&server.id) {
+                                self.trust_prompt = Some(TrustPrompt {
+                                    server: server.clone(),
+                                    tool: Some(tool.clone()),
+                                });
+                            } else if let Err(e) = self.begin_invoke(server, &tool) {
+                                self.error = Some(format!("실행 준비 실패: {e:#}"));
+                            }
                         }
                         // 현재 규칙 표시 + Ask 아니면 해제 버튼 (잘못 always한 것 되돌리기)
                         let rule = self.policy.rule(&server.id, &tool.name);
@@ -601,13 +688,7 @@ impl ConnectorsUi {
 
     /// 도구 실행 시작 — Editing 상태로 invoke 패널을 연다.
     fn begin_invoke(&mut self, server: &McpServerRow, tool: &McpToolRow) -> anyhow::Result<()> {
-        let command = server.command.clone().unwrap_or_default();
-        anyhow::ensure!(
-            !command.trim().is_empty(),
-            "MCP server command가 비어 있습니다"
-        );
-        mcp_store::validate_server_env_for_persistence(&server.env_plain, &server.env_secrets)
-            .context("MCP scoped env validation 실패")?;
+        let target = invoke_target_for_row(server)?;
         self.invoke_gen += 1;
         // schema_hash는 저장분 우선, 없으면 스키마에서 재계산 (재승인 판정용)
         let schema_hash = tool.schema_hash.clone().unwrap_or_else(|| {
@@ -616,11 +697,7 @@ impl ConnectorsUi {
         self.invoke = Some(ToolInvoke {
             server_id: server.id.clone(),
             server_name: server.name.clone(),
-            command,
-            args: server.args.clone(),
-            env_plain: server.env_plain.clone(),
-            env_secrets: server.env_secrets.clone(),
-            inherit_env: server.inherit_env,
+            target,
             tool_name: tool.name.clone(),
             schema_hash,
             input: "{}".to_owned(),
@@ -628,6 +705,168 @@ impl ConnectorsUi {
             generation: self.invoke_gen,
             prepared_hash: None,
         });
+        Ok(())
+    }
+
+    /// 연결 테스트 요청 — http 서버는 세션 최초 1회 신뢰 확인 모달을 거친다 (H3).
+    fn request_discover(
+        &mut self,
+        ctx: &egui::Context,
+        server: &McpServerRow,
+        env_resolver: &dyn McpScopedEnvResolver,
+    ) {
+        if server.kind == "http" && !self.trusted_http.contains(&server.id) {
+            self.trust_prompt = Some(TrustPrompt {
+                server: server.clone(),
+                tool: None,
+            });
+            return;
+        }
+        self.start_discover(ctx, server, env_resolver);
+    }
+
+    /// http 서버 최초 연결 신뢰 확인 모달 (H3, VS Code mcpRegistry 신뢰 프롬프트 차용).
+    /// "이 서버로 도구 호출 데이터가 전송됩니다: {url}" — 확인 시 보류한 동작을 실행한다.
+    fn trust_prompt_modal(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        env_resolver: &dyn McpScopedEnvResolver,
+        catalog: &i18n::Catalog,
+    ) {
+        let Some(prompt) = &self.trust_prompt else {
+            return;
+        };
+        let url = prompt.server.url.clone().unwrap_or_default();
+        let mut decision: Option<bool> = None;
+        egui::Window::new(catalog.t("connectors.trust_title", &[]))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.label(catalog.t("connectors.trust_body", &[("url", &url)]));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(catalog.t("connectors.trust_connect", &[]))
+                        .clicked()
+                    {
+                        decision = Some(true);
+                    }
+                    if ui.button(catalog.t("action.cancel", &[])).clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        match decision {
+            Some(true) => {
+                let Some(prompt) = self.trust_prompt.take() else {
+                    return;
+                };
+                self.trusted_http.insert(prompt.server.id.clone());
+                match prompt.tool {
+                    None => self.start_discover(ctx, &prompt.server, env_resolver),
+                    Some(tool) => {
+                        if let Err(e) = self.begin_invoke(&prompt.server, &tool) {
+                            self.error = Some(format!("실행 준비 실패: {e:#}"));
+                        }
+                    }
+                }
+            }
+            Some(false) => self.trust_prompt = None,
+            None => {}
+        }
+    }
+
+    /// http 서버 url 편집 컨트롤 (H3). 저장 실패 시 draft를 남겨 고쳐서 재시도한다.
+    fn url_edit_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        db: &mut Db,
+        server: &McpServerRow,
+        catalog: &i18n::Catalog,
+    ) {
+        let editing = self
+            .url_edit
+            .as_ref()
+            .is_some_and(|edit| edit.server_id == server.id);
+        if !editing {
+            if ui
+                .small_button(catalog.t("connectors.edit_url", &[]))
+                .clicked()
+            {
+                self.url_edit = Some(UrlEdit {
+                    server_id: server.id.clone(),
+                    draft: server.url.clone().unwrap_or_default(),
+                });
+            }
+            return;
+        }
+        // Some(true)=저장, Some(false)=취소
+        let mut act: Option<bool> = None;
+        if let Some(edit) = &mut self.url_edit {
+            ui.horizontal(|ui| {
+                ui.label("URL");
+                ui.text_edit_singleline(&mut edit.draft);
+            });
+            // 규칙 리셋 고지 — url 변경의 사용자 놀람 방지 (계획 리스크 항목)
+            ui.weak(catalog.t("connectors.url_edit_note", &[]));
+            ui.horizontal(|ui| {
+                if ui.button(catalog.t("action.save", &[])).clicked() {
+                    act = Some(true);
+                }
+                if ui.button(catalog.t("action.cancel", &[])).clicked() {
+                    act = Some(false);
+                }
+            });
+        }
+        match act {
+            Some(true) => {
+                let draft = self
+                    .url_edit
+                    .as_ref()
+                    .map(|edit| edit.draft.clone())
+                    .unwrap_or_default();
+                match self.save_url_edit(db, &server.id, &draft) {
+                    Ok(()) => {
+                        self.url_edit = None;
+                        self.error = None;
+                    }
+                    Err(e) => self.error = Some(format!("URL 저장 실패: {e:#}")),
+                }
+            }
+            Some(false) => self.url_edit = None,
+            None => {}
+        }
+    }
+
+    /// url 편집 저장 (H3): 검증 → Allow 규칙 초기화(Deny/Ask 유지) → 도구 캐시 무효화
+    /// → url 갱신 → 세션 신뢰 철회(다음 연결 전 재확인). 규칙 초기화를 url 갱신보다
+    /// 먼저 해 중간 실패가 항상 안전한 방향(과잉 리셋)으로 남게 한다.
+    /// VS Code의 cacheNonce 신뢰("정의 변경 = 재신뢰 + tools 재조회")를 deppy 정의가
+    /// UI로만 바뀌는 점을 이용해 편집 저장 시점 훅으로 등가 구현 — 스키마 추가 없음.
+    fn save_url_edit(&mut self, db: &mut Db, server_id: &str, new_url: &str) -> anyhow::Result<()> {
+        let new_url = new_url.trim();
+        validate_mcp_url(new_url)?;
+        // Allow 규칙만 초기화 — Deny는 안전한 방향이라 유지한다.
+        let rules = db.list_permission_rules().context("권한 규칙 조회 실패")?;
+        for rule in rules
+            .iter()
+            .filter(|rule| rule.server_id == server_id && rule.rule == "allow")
+        {
+            // in-memory를 먼저 Ask로 되돌린다 (set_rule이 승인 이력도 무효화)
+            self.policy
+                .set_rule(&rule.server_id, &rule.tool_name, audit::PermissionRule::Ask);
+            db.delete_permission_rule(&rule.server_id, &rule.tool_name)
+                .with_context(|| format!("권한 규칙 삭제 실패: {}", rule.tool_name))?;
+        }
+        // 도구 목록 캐시 무효화 — "정의 변경 = tools 재조회 신호" (mcpTypes.ts 차용)
+        db.replace_mcp_tools(server_id, &[])
+            .context("mcp_tools 캐시 무효화 실패")?;
+        db.update_mcp_server_url(server_id, new_url)?;
+        self.trusted_http.remove(server_id);
+        self.status.remove(server_id);
+        self.cached = None; // 목록 재조회
         Ok(())
     }
 
@@ -845,7 +1084,7 @@ impl ConnectorsUi {
         let generation = inv.generation;
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let msg = match manager.discover_tools(&config) {
+            let msg = match config.discover_tools(&manager) {
                 Ok(tools) => match tools.iter().find(|t| t.name == tool_name) {
                     Some(tool) => InvokeMsg::Prepared(audit::schema_hash(&tool.input_schema_json)),
                     None => InvokeMsg::Result(Err(format!("tool '{tool_name}'이 서버에 없습니다"))),
@@ -902,7 +1141,7 @@ impl ConnectorsUi {
         std::thread::spawn(move || {
             // 결과/에러 문자열은 표시 전에 등록된 secret을 마스킹한다 (§7 유출 방지).
             // 성공 결과와 에러 메시지(MCP 서버가 secret을 echo할 수 있음) 둘 다 대상.
-            let result = match manager.call_tool(&config, &tool_name, arguments) {
+            let result = match config.call_tool(&manager, &tool_name, arguments) {
                 Ok(value) => Ok(redact_display(
                     &redaction,
                     &serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
@@ -916,28 +1155,14 @@ impl ConnectorsUi {
     }
 
     /// 연결 테스트를 백그라운드로 시작한다 (UI 프레임을 막지 않는다).
+    /// http 서버의 신뢰 확인은 호출측(request_discover/trust_prompt_modal)이 끝냈다.
     fn start_discover(
         &mut self,
         ctx: &egui::Context,
         server: &McpServerRow,
         env_resolver: &dyn McpScopedEnvResolver,
     ) {
-        let Some(command) = server.command.clone() else {
-            self.status.insert(
-                server.id.clone(),
-                ConnStatus::Failed("command가 비어 있습니다".to_owned()),
-            );
-            return;
-        };
-        let config = match mcp_config_for_values(
-            &server.name,
-            command,
-            server.args.clone(),
-            server.inherit_env,
-            &server.env_plain,
-            &server.env_secrets,
-            env_resolver,
-        ) {
+        let config = match config_for_row(server, env_resolver) {
             Ok(config) => config,
             Err(e) => {
                 self.status
@@ -951,8 +1176,8 @@ impl ConnectorsUi {
         let ctx = ctx.clone();
         let server_id = server.id.clone();
         std::thread::spawn(move || {
-            let result = manager
-                .discover_tools(&config)
+            let result = config
+                .discover_tools(&manager)
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send((server_id, result));
             ctx.request_repaint();
@@ -978,39 +1203,73 @@ impl ConnectorsUi {
 
     fn add_server(&mut self, db: &mut Db) {
         let name = self.name.trim();
-        let command = self.command.trim();
-        if name.is_empty() || command.is_empty() {
-            self.error = Some("이름과 command는 필수입니다".to_owned());
+        if name.is_empty() {
+            self.error = Some("이름은 필수입니다".to_owned());
             return;
         }
-        let args: Vec<String> = self
-            .args_input
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_owned)
-            .collect();
-        if let Err(e) = mcp_store::validate_server_args_for_persistence(&args) {
-            self.error = Some(format!("추가 실패: {e:#}"));
-            return;
-        }
-        let row = McpServerRow {
-            id: uuid::Uuid::new_v4().to_string(),
-            name: name.to_owned(),
-            kind: "stdio".to_owned(), // v0는 stdio만 (§1.5)
-            command: Some(command.to_owned()),
-            args,
-            env_plain: Vec::new(),
-            env_secrets: Vec::new(),
-            inherit_env: true,
-            url: None,
-            enabled: true,
+        // 종류별 row 생성 (H3): stdio는 command/args, http는 url(저장 전 정책 검증)
+        let row = match self.add_kind {
+            AddKind::Stdio => {
+                let command = self.command.trim();
+                if command.is_empty() {
+                    self.error = Some("이름과 command는 필수입니다".to_owned());
+                    return;
+                }
+                let args: Vec<String> = self
+                    .args_input
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                if let Err(e) = mcp_store::validate_server_args_for_persistence(&args) {
+                    self.error = Some(format!("추가 실패: {e:#}"));
+                    return;
+                }
+                McpServerRow {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: name.to_owned(),
+                    kind: "stdio".to_owned(),
+                    command: Some(command.to_owned()),
+                    args,
+                    env_plain: Vec::new(),
+                    env_secrets: Vec::new(),
+                    inherit_env: true,
+                    url: None,
+                    enabled: true,
+                }
+            }
+            AddKind::Http => {
+                let url = self.url_input.trim();
+                if url.is_empty() {
+                    self.error = Some("이름과 URL은 필수입니다".to_owned());
+                    return;
+                }
+                // 저장 전 URL 정책 검증 — https 필수, http는 localhost/루프백만 (H2 규칙)
+                if let Err(e) = validate_mcp_url(url) {
+                    self.error = Some(format!("추가 실패: {e:#}"));
+                    return;
+                }
+                McpServerRow {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: name.to_owned(),
+                    kind: "http".to_owned(),
+                    command: None,
+                    args: Vec::new(),
+                    env_plain: Vec::new(),
+                    env_secrets: Vec::new(),
+                    inherit_env: true,
+                    url: Some(url.to_owned()),
+                    enabled: true,
+                }
+            }
         };
         match db.insert_mcp_server(&row) {
             Ok(()) => {
                 self.name.clear();
                 self.command.clear();
                 self.args_input.clear();
+                self.url_input.clear();
                 self.error = None;
                 self.cached = None; // 목록 재조회
             }
@@ -1102,8 +1361,8 @@ impl ConnectorsUi {
             }
             let row = McpServerRow {
                 id: uuid::Uuid::new_v4().to_string(),
-                name,
-                kind: "stdio".to_owned(), // v0는 stdio만 (§1.5)
+                name: name.clone(),
+                kind: "stdio".to_owned(),
                 command: Some(command),
                 args,
                 env_plain,
@@ -1112,36 +1371,58 @@ impl ConnectorsUi {
                 url: None,
                 enabled: true,
             };
-            match db.insert_mcp_server(&row) {
-                Ok(()) => {
-                    added += 1;
-                    self.import_report.push(if skipped_env.is_empty() {
-                        catalog.t("connectors.import_added", &[("name", &row.name)])
-                    } else {
-                        catalog.t(
-                            "connectors.import_added_env_note",
-                            &[("name", &row.name), ("keys", &skipped_env.join(", "))],
-                        )
-                    });
-                    // 붙여넣기 → 등록 → 곧바로 연결 확인까지 (수동 테스트 클릭 생략)
-                    self.start_discover(ctx, &row, env_resolver);
-                }
-                Err(e) => {
-                    existing.remove(&row.name);
-                    self.import_report.push(catalog.t(
-                        "connectors.import_failed_row",
-                        &[("name", &row.name), ("message", &format!("{e:#}"))],
-                    ));
-                }
+            if self.import_insert(db, ctx, env_resolver, catalog, row, &skipped_env) {
+                added += 1;
+            } else {
+                existing.remove(&name);
+            }
+        }
+        // http 계열: url 매핑 등록 (H3). 등록 즉시 연결 테스트는 하지 않는다 —
+        // 가져온 http 서버도 최초 연결 신뢰 확인(모달) 대상이다.
+        for server in parse.http_servers {
+            let mcp_import::ParsedHttpServer { name, url } = server;
+            if !existing.insert(name.clone()) {
+                self.import_report
+                    .push(catalog.t("connectors.import_exists", &[("name", &name)]));
+                continue;
+            }
+            // 저장 전 URL 정책 검증 — 추가 폼과 동일 규칙 (https 필수, localhost 예외)
+            if let Err(e) = validate_mcp_url(&url) {
+                existing.remove(&name);
+                self.import_report.push(catalog.t(
+                    "connectors.import_failed_row",
+                    &[("name", &name), ("message", &format!("{e:#}"))],
+                ));
+                continue;
+            }
+            let row = McpServerRow {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: name.clone(),
+                kind: "http".to_owned(),
+                command: None,
+                args: Vec::new(),
+                env_plain: Vec::new(),
+                env_secrets: Vec::new(),
+                inherit_env: true,
+                url: Some(url),
+                enabled: true,
+            };
+            if self.import_insert(db, ctx, env_resolver, catalog, row, &[]) {
+                added += 1;
+            } else {
+                existing.remove(&name);
             }
         }
         for skipped in parse.skipped {
             let line = match &skipped.reason {
-                SkipReason::HttpTransport => {
-                    catalog.t("connectors.import_skip_http", &[("name", &skipped.name)])
+                SkipReason::LegacySse => {
+                    catalog.t("connectors.import_skip_sse", &[("name", &skipped.name)])
                 }
                 SkipReason::MissingCommand => {
                     catalog.t("connectors.import_skip_command", &[("name", &skipped.name)])
+                }
+                SkipReason::MissingUrl => {
+                    catalog.t("connectors.import_skip_url", &[("name", &skipped.name)])
                 }
                 SkipReason::Invalid(message) => catalog.t(
                     "connectors.import_skip_invalid",
@@ -1158,6 +1439,44 @@ impl ConnectorsUi {
             self.cached = None; // 목록 재조회
         }
         added
+    }
+
+    /// run_import 등록 공용 경로 (stdio/http). 성공 시 보고 라인을 남기고 stdio만
+    /// 곧바로 연결 테스트를 시작한다 — http는 최초 연결 신뢰 확인(모달)을 거쳐야
+    /// 하므로 자동 연결하지 않는다 (H3). 반환: 등록 성공 여부.
+    fn import_insert(
+        &mut self,
+        db: &mut Db,
+        ctx: &egui::Context,
+        env_resolver: &dyn McpScopedEnvResolver,
+        catalog: &i18n::Catalog,
+        row: McpServerRow,
+        skipped_env: &[String],
+    ) -> bool {
+        match db.insert_mcp_server(&row) {
+            Ok(()) => {
+                self.import_report.push(if skipped_env.is_empty() {
+                    catalog.t("connectors.import_added", &[("name", &row.name)])
+                } else {
+                    catalog.t(
+                        "connectors.import_added_env_note",
+                        &[("name", &row.name), ("keys", &skipped_env.join(", "))],
+                    )
+                });
+                if row.kind == "stdio" {
+                    // 붙여넣기 → 등록 → 곧바로 연결 확인까지 (수동 테스트 클릭 생략)
+                    self.start_discover(ctx, &row, env_resolver);
+                }
+                true
+            }
+            Err(e) => {
+                self.import_report.push(catalog.t(
+                    "connectors.import_failed_row",
+                    &[("name", &row.name), ("message", &format!("{e:#}"))],
+                ));
+                false
+            }
+        }
     }
 }
 
@@ -1196,19 +1515,139 @@ fn mcp_config_for_values(
     })
 }
 
+/// kind별 MCP 연결 설정 (H3) — H2가 stdio(McpServerConfig)와 http(McpHttpServerConfig)를
+/// 분리 타입으로 만들어, mcp_servers row의 kind('stdio'|'http')를 보고 여기서 분기한다.
+/// Debug는 내부 config가 각각 env 값/bearer를 가리는 구현이라 파생해도 안전하다.
+#[derive(Debug)]
+enum ConnectorConfig {
+    Stdio(McpServerConfig),
+    Http(McpHttpServerConfig),
+}
+
+impl ConnectorConfig {
+    /// connect → tools/list — transport별 manager 경로로 위임.
+    fn discover_tools(&self, manager: &LocalMcpManager) -> anyhow::Result<Vec<McpTool>> {
+        match self {
+            Self::Stdio(config) => manager.discover_tools(config),
+            Self::Http(config) => manager.discover_tools_http(config),
+        }
+    }
+
+    /// connect → tools/call — transport별 manager 경로로 위임.
+    fn call_tool(
+        &self,
+        manager: &LocalMcpManager,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        match self {
+            Self::Stdio(config) => manager.call_tool(config, name, arguments),
+            Self::Http(config) => manager.call_tool_http(config, name, arguments),
+        }
+    }
+}
+
+/// McpServerRow → kind별 ConnectorConfig (H3). stdio는 scoped env 해석을 포함한다.
+fn config_for_row(
+    row: &McpServerRow,
+    env_resolver: &dyn McpScopedEnvResolver,
+) -> anyhow::Result<ConnectorConfig> {
+    match row.kind.as_str() {
+        "http" => Ok(ConnectorConfig::Http(http_config_for_values(
+            &row.name,
+            row.url.as_deref(),
+        )?)),
+        "stdio" => {
+            let command = row.command.clone().unwrap_or_default();
+            Ok(ConnectorConfig::Stdio(mcp_config_for_values(
+                &row.name,
+                command,
+                row.args.clone(),
+                row.inherit_env,
+                &row.env_plain,
+                &row.env_secrets,
+                env_resolver,
+            )?))
+        }
+        other => anyhow::bail!("지원하지 않는 MCP 서버 kind: {other}"),
+    }
+}
+
+/// http config 생성 — 저장 전과 같은 URL 정책 검증을 연결 직전에도 적용한다 (H3).
+/// bearer는 H3에서 항상 None — credential 연동(401 사다리)은 H5 소관.
+fn http_config_for_values(name: &str, url: Option<&str>) -> anyhow::Result<McpHttpServerConfig> {
+    let url = url
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .with_context(|| format!("http MCP 서버 '{name}'에 url이 없습니다"))?;
+    validate_mcp_url(url)?;
+    Ok(McpHttpServerConfig {
+        name: name.to_owned(),
+        url: url.to_owned(),
+        bearer: None,
+    })
+}
+
+/// McpServerRow → InvokeTarget (H3): 실행 전에 kind별 필수 필드를 검증해 보관한다.
+fn invoke_target_for_row(server: &McpServerRow) -> anyhow::Result<InvokeTarget> {
+    match server.kind.as_str() {
+        "http" => {
+            let url = server
+                .url
+                .as_deref()
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .context("MCP server url이 비어 있습니다")?;
+            validate_mcp_url(url)?;
+            Ok(InvokeTarget::Http {
+                url: url.to_owned(),
+            })
+        }
+        "stdio" => {
+            let command = server.command.clone().unwrap_or_default();
+            anyhow::ensure!(
+                !command.trim().is_empty(),
+                "MCP server command가 비어 있습니다"
+            );
+            mcp_store::validate_server_env_for_persistence(&server.env_plain, &server.env_secrets)
+                .context("MCP scoped env validation 실패")?;
+            Ok(InvokeTarget::Stdio {
+                command,
+                args: server.args.clone(),
+                env_plain: server.env_plain.clone(),
+                env_secrets: server.env_secrets.clone(),
+                inherit_env: server.inherit_env,
+            })
+        }
+        other => anyhow::bail!("지원하지 않는 MCP 서버 kind: {other}"),
+    }
+}
+
 fn config_for_invoke(
     inv: &ToolInvoke,
     env_resolver: &dyn McpScopedEnvResolver,
-) -> anyhow::Result<McpServerConfig> {
-    mcp_config_for_values(
-        &inv.server_name,
-        inv.command.clone(),
-        inv.args.clone(),
-        inv.inherit_env,
-        &inv.env_plain,
-        &inv.env_secrets,
-        env_resolver,
-    )
+) -> anyhow::Result<ConnectorConfig> {
+    match &inv.target {
+        InvokeTarget::Stdio {
+            command,
+            args,
+            env_plain,
+            env_secrets,
+            inherit_env,
+        } => Ok(ConnectorConfig::Stdio(mcp_config_for_values(
+            &inv.server_name,
+            command.clone(),
+            args.clone(),
+            *inherit_env,
+            env_plain,
+            env_secrets,
+            env_resolver,
+        )?)),
+        InvokeTarget::Http { url } => Ok(ConnectorConfig::Http(http_config_for_values(
+            &inv.server_name,
+            Some(url),
+        )?)),
+    }
 }
 
 fn mcp_args_for_display(args: &[String]) -> String {
@@ -1304,11 +1743,13 @@ mod tests {
         ToolInvoke {
             server_id: "srv-1".to_owned(),
             server_name: "mock".to_owned(),
-            command: "/nonexistent/deppy-connectors-test".to_owned(),
-            args: Vec::new(),
-            env_plain: Vec::new(),
-            env_secrets: Vec::new(),
-            inherit_env: true,
+            target: InvokeTarget::Stdio {
+                command: "/nonexistent/deppy-connectors-test".to_owned(),
+                args: Vec::new(),
+                env_plain: Vec::new(),
+                env_secrets: Vec::new(),
+                inherit_env: true,
+            },
             tool_name: "read_file".to_owned(),
             schema_hash: audit::schema_hash(r#"{"type":"object"}"#),
             input: input.to_owned(),
@@ -1468,5 +1909,146 @@ mod tests {
         }
 
         assert!(audit_rows(&path).is_empty());
+    }
+
+    fn http_row(id: &str, url: Option<&str>) -> McpServerRow {
+        McpServerRow {
+            id: id.to_owned(),
+            name: "remote".to_owned(),
+            kind: "http".to_owned(),
+            command: None,
+            args: Vec::new(),
+            env_plain: Vec::new(),
+            env_secrets: Vec::new(),
+            inherit_env: true,
+            url: url.map(str::to_owned),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn server_row는_kind별_config로_분기된다() {
+        // H3: kind('stdio'|'http')를 보고 McpServerConfig/McpHttpServerConfig 분기 생성
+        let resolver = MemMcpEnvResolver(std::collections::HashMap::new());
+
+        let http = http_row("srv-http", Some("https://mcp.example.com/mcp"));
+        match config_for_row(&http, &resolver).unwrap() {
+            ConnectorConfig::Http(config) => {
+                assert_eq!(config.url, "https://mcp.example.com/mcp");
+                assert_eq!(config.name, "remote");
+                assert!(config.bearer.is_none(), "bearer 연동은 H5");
+            }
+            ConnectorConfig::Stdio(_) => panic!("http row가 stdio config로 분기됨"),
+        }
+
+        let mut stdio = http_row("srv-stdio", None);
+        stdio.kind = "stdio".to_owned();
+        stdio.command = Some("/bin/sh".to_owned());
+        stdio.args = vec!["-c".to_owned(), "exit 0".to_owned()];
+        match config_for_row(&stdio, &resolver).unwrap() {
+            ConnectorConfig::Stdio(config) => assert_eq!(config.command, "/bin/sh"),
+            ConnectorConfig::Http(_) => panic!("stdio row가 http config로 분기됨"),
+        }
+
+        let mut unknown = http_row("srv-x", None);
+        unknown.kind = "websocket".to_owned();
+        let error = format!("{:#}", config_for_row(&unknown, &resolver).unwrap_err());
+        assert!(error.contains("지원하지 않는"), "{error}");
+    }
+
+    #[test]
+    fn http_row_url_정책_위반은_config_생성을_거부한다() {
+        let resolver = MemMcpEnvResolver(std::collections::HashMap::new());
+        // url 없음
+        assert!(config_for_row(&http_row("s1", None), &resolver).is_err());
+        // http는 localhost/루프백만 허용 (H2 규칙을 저장·연결 양쪽에서 재검증)
+        assert!(
+            config_for_row(&http_row("s2", Some("http://evil.example.com")), &resolver).is_err()
+        );
+        assert!(config_for_row(&http_row("s3", Some("http://localhost:9000")), &resolver).is_ok());
+        // invoke target도 같은 규칙
+        assert!(invoke_target_for_row(&http_row("s4", Some("ftp://x"))).is_err());
+        assert!(invoke_target_for_row(&http_row("s5", Some("https://ok.example.com/mcp"))).is_ok());
+    }
+
+    #[test]
+    fn url_편집_저장은_allow_규칙만_리셋하고_도구_캐시를_비운다() {
+        // H3 편집 시점 훅: url 갱신 + Allow 규칙 초기화(Deny 유지) + mcp_tools 무효화
+        // + 세션 신뢰 철회 (VS Code cacheNonce 신뢰 차용의 등가 구현).
+        // 변수명 store: xtask check-boundary가 테스트 라인의 DB 호출 패턴도 세므로 회피.
+        let path = temp_db_path();
+        let mut store = Db::open(&path).unwrap();
+        let mut ui = ConnectorsUi::new(RedactionService::new());
+
+        let server = http_row("srv-h", Some("https://old.example.com/mcp"));
+        store.insert_mcp_server(&server).unwrap();
+        store
+            .replace_mcp_tools(
+                "srv-h",
+                &tool_rows(
+                    "srv-h",
+                    &[McpTool {
+                        name: "tool_a".to_owned(),
+                        description: None,
+                        input_schema_json: r#"{"type":"object"}"#.to_owned(),
+                    }],
+                ),
+            )
+            .unwrap();
+        let hash = audit::schema_hash(r#"{"type":"object"}"#);
+        store
+            .upsert_permission_rule("srv-h", "tool_a", "allow", Some(&hash))
+            .unwrap();
+        store
+            .upsert_permission_rule("srv-h", "tool_b", "deny", None)
+            .unwrap();
+        // 다른 서버의 Allow 규칙은 건드리면 안 된다
+        store
+            .upsert_permission_rule("srv-other", "tool_c", "allow", Some(&hash))
+            .unwrap();
+        ui.policy
+            .load_rule("srv-h", "tool_a", audit::PermissionRule::Allow, Some(hash));
+        ui.trusted_http.insert("srv-h".to_owned());
+
+        ui.save_url_edit(&mut store, "srv-h", "https://new.example.com/mcp")
+            .unwrap();
+
+        // url 갱신
+        let rows = store.list_mcp_servers().unwrap();
+        assert_eq!(rows[0].url.as_deref(), Some("https://new.example.com/mcp"));
+        // Allow만 삭제, Deny와 타 서버 규칙은 유지
+        let rules = store.list_permission_rules().unwrap();
+        assert!(
+            !rules
+                .iter()
+                .any(|r| r.server_id == "srv-h" && r.rule == "allow"),
+            "{rules:?}"
+        );
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.server_id == "srv-h" && r.tool_name == "tool_b" && r.rule == "deny")
+        );
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.server_id == "srv-other" && r.rule == "allow")
+        );
+        // in-memory policy도 Ask로 복귀
+        assert_eq!(
+            ui.policy.rule("srv-h", "tool_a"),
+            audit::PermissionRule::Ask
+        );
+        // 도구 캐시 무효화 + 세션 신뢰 철회
+        assert!(store.list_mcp_tools("srv-h").unwrap().is_empty());
+        assert!(!ui.trusted_http.contains("srv-h"));
+
+        // 정책 위반 url은 거부되고 기존 url이 남는다
+        assert!(
+            ui.save_url_edit(&mut store, "srv-h", "http://evil.example.com")
+                .is_err()
+        );
+        let rows = store.list_mcp_servers().unwrap();
+        assert_eq!(rows[0].url.as_deref(), Some("https://new.example.com/mcp"));
     }
 }

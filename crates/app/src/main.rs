@@ -13,6 +13,7 @@ mod paths;
 mod perf;
 mod shortcuts;
 mod storage;
+mod tailscale;
 mod theme;
 mod ui;
 

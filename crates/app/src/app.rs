@@ -1161,6 +1161,12 @@ pub struct App {
     web_reveal_url: bool,
     /// 접속 URL QR 텍스처 캐시 — URL이 바뀔 때만 재생성, 설정창 닫으면 반환.
     web_qr: ui::settings::WebQrCache,
+    /// ts.net 호스트명 자동 감지 1회성 스레드의 결과 수신 (진행 중일 때만 Some).
+    ts_detect_rx: Option<std::sync::mpsc::Receiver<crate::tailscale::Detected>>,
+    /// 마지막 감지 결과 — 설정 UI 표시용. None = 이 세션에서 아직 시도 안 함.
+    ts_detected: Option<crate::tailscale::Detected>,
+    /// 이번 감지가 수동 버튼 유래인가 — true면 기존 설정값도 감지값으로 덮어쓴다.
+    ts_detect_overwrite: bool,
     /// known_hosts 표시 캐시 (settings 열 때 lazily 로드, 닫으면 None으로 리셋해 재로드).
     known_hosts_cache: Option<Vec<(String, String)>>,
     /// 폴더 트리 사이드바 (file-tree-design §6). OFF면 None — Panel 미생성 + 상태 drop(리소스 0).
@@ -1333,6 +1339,9 @@ impl App {
             web_error: None,
             web_reveal_url: false,
             web_qr: None,
+            ts_detect_rx: None,
+            ts_detected: None,
+            ts_detect_overwrite: false,
             known_hosts_cache: None,
             file_tree: None,
         };
@@ -4003,6 +4012,41 @@ impl eframe::App for App {
                 known_hosts: self.known_hosts_cache.as_deref().unwrap_or(&[]),
             }
         };
+        // ts.net 호스트명 자동 감지: 결과 수령 → 설정 반영. MobileWeb 페이지를 처음 열었고
+        // 호스트명이 비어 있으면 1회 자동 시도한다 (상주 폴링 없음 — 완료 스레드가 repaint).
+        if let Some(rx) = &self.ts_detect_rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    if let crate::tailscale::Detected::Hostname(host) = &result
+                        && (self.ts_detect_overwrite
+                            || self.config.web.ts_hostname.trim().is_empty())
+                        && self.config.web.ts_hostname.trim() != host
+                    {
+                        self.config.web.ts_hostname = host.clone();
+                        if let Err(e) = self.config.save(&self.config_path) {
+                            tracing::warn!("config 저장 실패: {e:#}");
+                            self.web_error = Some(format!("설정 저장 실패: {e:#}"));
+                        }
+                    }
+                    self.ts_detected = Some(result);
+                    self.ts_detect_rx = None;
+                    self.ts_detect_overwrite = false;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // 스레드 생성 실패 등 — 시도 종료로 처리 (CLI 미발견과 동일 안내).
+                    self.ts_detected = Some(crate::tailscale::Detected::CliNotFound);
+                    self.ts_detect_rx = None;
+                    self.ts_detect_overwrite = false;
+                }
+            }
+        } else if self.settings_open
+            && self.settings_category == ui::settings::Category::MobileWeb
+            && self.config.web.ts_hostname.trim().is_empty()
+            && self.ts_detected.is_none()
+        {
+            self.ts_detect_rx = Some(crate::tailscale::spawn_detect(ui.ctx().clone()));
+        }
         // 모바일 웹(PWA) 뷰모델 — remote_view와 동일 규칙 (v3.3 P1).
         let web_view = {
             let (running, addr, url) = match &self.web {
@@ -4023,6 +4067,22 @@ impl eframe::App for App {
                 addr,
                 url,
                 error: self.web_error.as_deref(),
+                ts_detect: if self.ts_detect_rx.is_some() {
+                    ui::settings::TsDetectView::Running
+                } else {
+                    match &self.ts_detected {
+                        None => ui::settings::TsDetectView::Idle,
+                        Some(crate::tailscale::Detected::Hostname(host)) => {
+                            ui::settings::TsDetectView::Found(host)
+                        }
+                        Some(crate::tailscale::Detected::NoHostname) => {
+                            ui::settings::TsDetectView::NoHostname
+                        }
+                        Some(crate::tailscale::Detected::CliNotFound) => {
+                            ui::settings::TsDetectView::NoCli
+                        }
+                    }
+                },
             }
         };
         // 알림 카테고리를 보고 있으면 읽음 처리 (기존 notifications.show가 하던 것).
@@ -4605,6 +4665,13 @@ impl eframe::App for App {
             ui::settings::WebRemoteAction::Start => self.web_enable(),
             ui::settings::WebRemoteAction::Stop => self.web_disable(),
             ui::settings::WebRemoteAction::RotateToken => self.web_rotate_token(),
+            ui::settings::WebRemoteAction::DetectHostname => {
+                // 수동 감지 — 기존 값 덮어쓰기 허용. 이미 진행 중이면 무시.
+                if self.ts_detect_rx.is_none() {
+                    self.ts_detect_overwrite = true;
+                    self.ts_detect_rx = Some(crate::tailscale::spawn_detect(ui.ctx().clone()));
+                }
+            }
             ui::settings::WebRemoteAction::None => {}
         }
         // settings가 닫혔으면 표시 상태를 리셋 — 다음에 열 때 known_hosts를 fresh 로드하고

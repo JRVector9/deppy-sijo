@@ -1990,9 +1990,31 @@ impl App {
             web_remote::ServeOptions {
                 token: token.clone(),
                 allowed_host: (!hostname.is_empty()).then(|| hostname.to_owned()),
+                // 승인 대시보드는 자체 Db 연결로 직행(프록시↔GUI 공유 DB IPC 관례, 계획 §0.2).
+                db_path: Some(self.db_path.clone()),
             },
         )?;
+        // 활성 workspace worker 이벤트를 대시보드에 붙인다(P2). wake 클로저는 egui 프레임과
+        // 무관하게 브리지 스레드를 깨운다(§14.1 Warm 알림 유지) — 창이 숨겨져도 상태가 흐른다.
+        // 워크스페이스 전환 시엔 rebind_web_dashboard가 새 worker로 재구독한다.
+        let receiver = self
+            .active
+            .runtime
+            .subscribe_with_wake(server.dashboard_wake());
+        server.set_runtime_source(receiver);
         Ok(WebRemoteState { server, token })
+    }
+
+    /// 워크스페이스 전환 시 웹 대시보드를 새 활성 worker에 재구독시킨다 — 옛 receiver는
+    /// 교체와 함께 drop되어 옛 worker가 자기 subscriber를 정리한다(계획 P2 "wake 클로저 수명").
+    fn rebind_web_dashboard(&self) {
+        if let Some(web) = &self.web {
+            let receiver = self
+                .active
+                .runtime
+                .subscribe_with_wake(web.server.dashboard_wake());
+            web.server.set_runtime_source(receiver);
+        }
     }
 
     /// settings 토글 on: 웹서버를 켜고 성공 시 config에 의도를 영속한다 (remote_enable 관례).
@@ -2137,6 +2159,8 @@ impl App {
 
         // 현재 활성을 Warm으로 내리고 warm 풀에 보관 (워커·세션 계속 실행).
         let mut old = std::mem::replace(&mut self.active, new_active);
+        // 웹 대시보드가 켜져 있으면 새 활성 worker로 재구독한다(전환 후 상태 스트림 유지).
+        self.rebind_web_dashboard();
         // agent 감지 워커: 전환 시 epoch을 올려 이전 워크스페이스의 잔여 결과를 폐기하고,
         // 즉시 감지가 새 워크스페이스 기준으로 재시작되게 한다(codex #3).
         self.agent_detect_epoch += 1;

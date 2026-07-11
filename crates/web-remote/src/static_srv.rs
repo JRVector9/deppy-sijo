@@ -84,7 +84,8 @@ fn token_param_matches(query: &str, expected: &str) -> bool {
 
 /// 상수 시간 비교 — 토큰 내용의 타이밍 누설 방지 (remote.rs token_matches 관례).
 /// 길이 불일치는 즉시 거부 — 토큰 길이(hex 64자)는 공개 정보라 누설이 아니다.
-fn token_matches(expected: &str, provided: &[u8]) -> bool {
+/// WS 첫 프레임 인증(ws_api)도 같은 비교를 재사용한다.
+pub(crate) fn token_matches(expected: &str, provided: &[u8]) -> bool {
     let expected = expected.as_bytes();
     if expected.len() != provided.len() {
         return false;

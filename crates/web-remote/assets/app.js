@@ -1,6 +1,6 @@
-// Deppy Sijo 모바일 셸 (P1 스캐폴드) — 프레임워크 없음, CSP(default-src 'self') 준수.
-// shell 뷰: 토큰 저장/URL 정리 + 서비스 워커 등록 + /healthz 상태 폴링.
-// pairing 뷰(401 본문): 저장된 토큰으로 1회 자동 재시도, 무효 토큰은 폐기(루프 방지).
+// Deppy Sijo 모바일 대시보드 (P2) — 프레임워크 없음, CSP(default-src 'self') 준수.
+// WS로 승인/상태를 받아 렌더하고, Allow/Deny를 되보낸다. 신뢰경계: 서버가 보낸 문자열
+// (preview/title/server/tool)은 전부 textContent로만 삽입한다 — innerHTML 절대 금지.
 (() => {
   'use strict';
   const TOKEN_KEY = 'deppy.webToken';
@@ -12,7 +12,6 @@
     const saved = localStorage.getItem(TOKEN_KEY);
     if (!urlToken && saved) {
       // 재방문(URL에 토큰 없음) — 저장된 페어링으로 자동 복구
-      document.getElementById('retry').classList.remove('hidden');
       location.replace('/?token=' + encodeURIComponent(saved));
     } else if (urlToken) {
       // 토큰을 제시했는데도 401 — 재발급 등으로 무효. 저장분을 폐기해 리다이렉트 루프를 막는다.
@@ -27,27 +26,236 @@
     history.replaceState(null, '', location.pathname);
   }
 
-  document.getElementById('host').textContent = location.host;
-
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js').catch(() => {});
   }
 
   const dot = document.getElementById('dot');
   const statusText = document.getElementById('status-text');
-  const lastCheck = document.getElementById('last-check');
-  async function ping() {
+  const approvalsEl = document.getElementById('approvals');
+  const approvalsEmpty = document.getElementById('approvals-empty');
+  const approvalsCount = document.getElementById('approvals-count');
+  const sessionsEl = document.getElementById('sessions');
+  const sessionsEmpty = document.getElementById('sessions-empty');
+  const resourceEl = document.getElementById('resource');
+
+  const token = localStorage.getItem(TOKEN_KEY);
+
+  const STATUS_LABEL = {
+    running: '실행 중',
+    waiting: '입력 대기',
+    needs_approval: '승인 필요',
+    idle: '유휴',
+    error: '오류',
+    done: '완료',
+  };
+
+  let ws = null;
+  let reconnectDelay = 1000;
+  let reconnectTimer = null;
+  let manualClose = false;
+
+  function setStatus(cls, text) {
+    dot.className = 'dot ' + cls;
+    statusText.textContent = text;
+  }
+
+  function wsUrl() {
+    const scheme = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    return scheme + location.host + '/ws';
+  }
+
+  function connect() {
+    if (!token) {
+      setStatus('bad', '토큰 없음 — 재페어링 필요');
+      return;
+    }
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+    manualClose = false;
+    setStatus('', '연결 중…');
+    let socket;
     try {
-      const res = await fetch('/healthz', { cache: 'no-store' });
-      if (!res.ok) throw new Error(String(res.status));
-      dot.className = 'dot ok';
-      statusText.textContent = '연결됨';
-      lastCheck.textContent = new Date().toLocaleTimeString();
-    } catch {
-      dot.className = 'dot bad';
-      statusText.textContent = '연결 끊김';
+      socket = new WebSocket(wsUrl());
+    } catch (e) {
+      scheduleReconnect();
+      return;
+    }
+    ws = socket;
+
+    socket.addEventListener('open', () => {
+      reconnectDelay = 1000;
+      socket.send(JSON.stringify({ type: 'auth', v: 1, token }));
+    });
+
+    socket.addEventListener('message', (event) => {
+      let msg;
+      try {
+        msg = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      handleMessage(msg);
+    });
+
+    socket.addEventListener('close', () => {
+      if (ws === socket) ws = null;
+      if (!manualClose) {
+        setStatus('bad', '연결 끊김 — 재연결 중…');
+        scheduleReconnect();
+      }
+    });
+
+    socket.addEventListener('error', () => {
+      // close 이벤트가 뒤따른다 — 거기서 재연결한다.
+    });
+  }
+
+  function scheduleReconnect() {
+    if (manualClose || reconnectTimer) return;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+  }
+
+  function disconnect() {
+    manualClose = true;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (ws) {
+      try { ws.close(); } catch {}
+      ws = null;
     }
   }
-  ping();
-  setInterval(ping, 15000);
+
+  function handleMessage(msg) {
+    switch (msg && msg.type) {
+      case 'welcome':
+        setStatus('ok', '연결됨');
+        break;
+      case 'dashboard':
+        renderSessions(msg.sessions || [], msg.resource || null);
+        break;
+      case 'approvals':
+        renderApprovals(msg.pending || []);
+        break;
+      case 'error':
+        setStatus('bad', '오류: ' + (msg.message || ''));
+        break;
+    }
+  }
+
+  function renderApprovals(pending) {
+    approvalsCount.textContent = String(pending.length);
+    approvalsEmpty.hidden = pending.length > 0;
+    approvalsEl.textContent = '';
+    for (const item of pending) {
+      approvalsEl.appendChild(approvalCard(item));
+    }
+    // 앱 아이콘 뱃지(iOS 16.4+ 설치형 + 알림 권한 시) — P3에서 권한 유도. 실패는 무시.
+    if (navigator.setAppBadge) {
+      if (pending.length > 0) navigator.setAppBadge(pending.length).catch(() => {});
+      else if (navigator.clearAppBadge) navigator.clearAppBadge().catch(() => {});
+    }
+  }
+
+  function approvalCard(item) {
+    const card = document.createElement('div');
+    card.className = 'approval-card';
+
+    const head = document.createElement('div');
+    head.className = 'card-head';
+    const server = document.createElement('span');
+    server.className = 'server';
+    server.textContent = item.server || '';
+    const tool = document.createElement('span');
+    tool.className = 'tool';
+    tool.textContent = item.tool || '';
+    head.appendChild(server);
+    head.appendChild(tool);
+    card.appendChild(head);
+
+    // 미리보기(URL·인자)는 proxy가 이미 redact한 표시용 텍스트 — textContent로만.
+    if (item.preview) {
+      const pre = document.createElement('pre');
+      pre.className = 'preview';
+      pre.textContent = item.preview;
+      card.appendChild(pre);
+    }
+
+    const remember = document.createElement('label');
+    remember.className = 'remember';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    remember.appendChild(cb);
+    remember.appendChild(document.createTextNode(' 이 결정을 기억(규칙으로 저장)'));
+    card.appendChild(remember);
+
+    const actions = document.createElement('div');
+    actions.className = 'actions';
+    const deny = document.createElement('button');
+    deny.className = 'deny';
+    deny.textContent = '거부';
+    deny.addEventListener('click', () => resolve(item.id, false, cb.checked, card));
+    const allow = document.createElement('button');
+    allow.className = 'allow';
+    allow.textContent = '허용';
+    allow.addEventListener('click', () => resolve(item.id, true, cb.checked, card));
+    actions.appendChild(deny);
+    actions.appendChild(allow);
+    card.appendChild(actions);
+    return card;
+  }
+
+  function resolve(id, allowed, remember, card) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: 'resolve', id, allowed, remember }));
+    // 낙관적 비활성화 — 서버의 다음 approvals 프레임이 목록을 확정한다.
+    card.classList.add('resolving');
+    for (const btn of card.querySelectorAll('button')) btn.disabled = true;
+  }
+
+  function renderSessions(sessions, resource) {
+    sessionsEmpty.hidden = sessions.length > 0;
+    sessionsEl.textContent = '';
+    for (const s of sessions) {
+      const li = document.createElement('li');
+      li.className = 'session';
+
+      const title = document.createElement('span');
+      title.className = 'title';
+      title.textContent = s.title || ('세션 ' + s.id);
+      li.appendChild(title);
+
+      const badge = document.createElement('span');
+      const status = s.exited ? 'done' : (s.status || 'running');
+      badge.className = 'badge ' + status;
+      badge.textContent = STATUS_LABEL[status] || status;
+      li.appendChild(badge);
+      sessionsEl.appendChild(li);
+    }
+    if (resource) {
+      const cpu = resource.cpu != null ? resource.cpu.toFixed(0) + '%' : '—';
+      resourceEl.textContent = 'CPU ' + cpu + ' · RAM ' + (resource.rss_mb || 0) + 'MB';
+    } else {
+      resourceEl.textContent = '';
+    }
+  }
+
+  // 탭 백그라운드 시 스트림 정지(서버 접속 종료 → 0연결 예산 준수). 포그라운드 복귀 시 재연결.
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      disconnect();
+      setStatus('', '일시정지(백그라운드)');
+    } else {
+      connect();
+    }
+  });
+
+  connect();
 })();

@@ -1,6 +1,7 @@
 // Deppy Sijo 서비스 워커 (P1 최소) — 공개 셸 자산만 cache-first.
 // '/'(문서)는 토큰 게이트가 있어 사전 캐시하지 않는다 — 오프라인 셸/버전 키 갱신은 P3.
-const CACHE = 'deppy-shell-v1';
+// v2: P2 대시보드 자산(app.js/app.css) 교체 — 키를 올려 구 셸 캐시를 무효화한다.
+const CACHE = 'deppy-shell-v2';
 const SHELL = ['/app.css', '/app.js', '/icon.svg', '/manifest.webmanifest'];
 
 self.addEventListener('install', (event) => {

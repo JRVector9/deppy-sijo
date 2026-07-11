@@ -1,5 +1,7 @@
-# 모바일 PWA용 내장 웹서버 (mobile-pwa v3.3 PR-P1). 의존 최소 원칙 —
+# 모바일 PWA용 내장 웹서버 (mobile-pwa v3.3 PR-P1/P2). 의존 최소 원칙 —
 # HTTP는 수제(프레임워크 없음), 랜덤은 uuid v4(remote.rs 토큰 관례), 토큰 영속은 secret.
+# P2: WS는 sync tungstenite(handshake 기능만 — TLS 기본기능은 off, 종단은 tailscale/cert).
+# 대시보드는 runtime 이벤트 구독 + storage Db 직행(승인) — 두 상위 계층에만 의존.
 [package]
 name = "web-remote"
 version.workspace = true
@@ -11,3 +13,11 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 secret = { path = "../secret" }
+# P2 대시보드: 활성 workspace worker 이벤트 구독(subscribe_with_wake) + 승인 DB 직행.
+runtime = { path = "../runtime" }
+storage = { path = "../storage" }
+# WS JSON 프로토콜(브라우저 친화) — postcard 바이너리는 데스크톱 원격 전용으로 유지.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# sync WebSocket. default-features=false(TLS off)에 handshake만 켜 derive_accept_key 사용.
+tungstenite = { workspace = true, features = ["handshake"] }

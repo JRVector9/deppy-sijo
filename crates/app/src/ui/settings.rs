@@ -87,6 +87,23 @@ pub enum WebRemoteAction {
     Stop,
     /// 페어링 토큰 재발급 — 기존 페어링 무효, 실행 중이면 새 토큰으로 재시작.
     RotateToken,
+    /// ts.net 호스트명 자동 감지 요청 (tailscale status --json — App이 1회성 스레드로 실행).
+    DetectHostname,
+}
+
+/// ts.net 호스트명 자동 감지 표시 상태 (App이 감지 스레드 결과를 매핑해 넘긴다).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TsDetectView<'a> {
+    /// 아직 시도 안 함 — 아무것도 표시하지 않는다.
+    Idle,
+    /// 감지 스레드 진행 중.
+    Running,
+    /// CLI를 찾지 못함 (미설치 또는 알 수 없는 경로).
+    NoCli,
+    /// CLI는 있지만 호스트명 없음 (미로그인/정지/MagicDNS off).
+    NoHostname,
+    /// 감지 성공 — 설정값과 다르면 참고용으로 표시한다.
+    Found(&'a str),
 }
 
 /// 모바일 웹 섹션 렌더 상태 (App이 채워 넘긴다 — UI는 서버/keyring을 직접 만지지 않는다).
@@ -99,6 +116,8 @@ pub struct WebRemoteView<'a> {
     pub url: Option<String>,
     /// 시작 실패 등 표시할 에러.
     pub error: Option<&'a str>,
+    /// ts.net 호스트명 자동 감지 상태.
+    pub ts_detect: TsDetectView<'a>,
 }
 
 /// 접속 URL QR 텍스처 캐시 — (원본 URL, 텍스처). URL이 바뀔 때만 재생성한다.
@@ -2001,6 +2020,19 @@ fn mobile_web_page(
         &catalog.t("settings.mobile_web.hostname", &[]),
         Some(&catalog.t("settings.mobile_web.hostname.hint", &[])),
         |ui| {
+            // right_to_left 배치 — 버튼이 오른쪽 끝, 입력 필드가 남은 폭을 채운다.
+            let detecting = web.ts_detect == TsDetectView::Running;
+            let label = if detecting {
+                catalog.t("settings.mobile_web.detecting", &[])
+            } else {
+                catalog.t("settings.mobile_web.detect", &[])
+            };
+            if ui
+                .add_enabled(!detecting, egui::Button::new(label))
+                .clicked()
+            {
+                *web_action = WebRemoteAction::DetectHostname;
+            }
             *changed |= ui
                 .add(
                     egui::TextEdit::singleline(&mut config.web.ts_hostname)
@@ -2010,6 +2042,22 @@ fn mobile_web_page(
                 .changed();
         },
     );
+    // 감지 결과 안내 — 실패는 원인별로, 성공은 설정값과 다를 때만 참고 표시.
+    match web.ts_detect {
+        TsDetectView::NoCli => {
+            hint_text(ui, catalog.t("settings.mobile_web.detect_no_cli", &[]));
+        }
+        TsDetectView::NoHostname => {
+            hint_text(ui, catalog.t("settings.mobile_web.detect_no_hostname", &[]));
+        }
+        TsDetectView::Found(host) if host != config.web.ts_hostname.trim() => {
+            hint_text(
+                ui,
+                catalog.t("settings.mobile_web.detected", &[("hostname", host)]),
+            );
+        }
+        _ => {}
+    }
     if let Some(err) = web.error {
         ui.add_space(7.0);
         ui.colored_label(

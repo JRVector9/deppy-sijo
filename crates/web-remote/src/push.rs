@@ -65,7 +65,9 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// 세션 상태 알림의 총 발송 시도 횟수(첫 시도 + 재시도). 승인은 DB 폴링이 스스로 재수렴하지만
 /// 세션 전이는 (session,kind)가 생애 1회라 재시도 큐가 없으면 일시 장애 = 영구 유실이다.
 const SESSION_SEND_ATTEMPTS: u32 = 3;
-/// `notified_status` 상한 — 세션 id는 런타임에서 단조 증가(next_id)하므로 초과 시 가장 낮은
+/// `notified_status` 상한 — 초과 시 오래된(사전순 낮은) 키부터 버린다. UUID라 단조성은
+/// 없지만 상한 유지가 목적이다. 원문:
+/// 세션 id는 런타임에서 단조 증가(next_id)하므로 초과 시 가장 낮은
 /// (=가장 오래된) id부터 버린다. 승인 기록은 pending 목록으로 자기정리되지만 세션 상태는
 /// "사라짐" 신호가 없어 상한으로 유계화한다.
 const MAX_NOTIFIED_SESSIONS: usize = 256;
@@ -400,10 +402,10 @@ impl BroadcastOutcome {
 enum Notification {
     /// pending 승인 — 개수 포함.
     Approval { count: usize },
-    /// 세션 완료 — 딥링크용 세션 id 포함 (P6c).
-    SessionDone { session: u64 },
-    /// 세션 입력 대기 — 딥링크용 세션 id 포함 (P6c).
-    SessionWaiting { session: u64 },
+    /// 세션 완료 — 딥링크용 **영속 UUID** 포함 (P6c + I1).
+    SessionDone { session: String },
+    /// 세션 입력 대기 — 딥링크용 **영속 UUID** 포함 (P6c + I1).
+    SessionWaiting { session: String },
 }
 
 impl Notification {
@@ -447,9 +449,10 @@ enum SessionKind {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// 발송 대기 중인 세션 상태 알림 한 건.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionJob {
-    session: u64,
+    /// 영속 세션 UUID (I1) — 딥링크가 재시작 후에도 같은 세션을 가리킨다.
+    session: String,
     kind: SessionKind,
     /// 지금까지 시도한 횟수(0 = 아직 미시도). SESSION_SEND_ATTEMPTS에서 포기한다.
     attempts: u32,
@@ -467,7 +470,7 @@ struct PushInner {
     /// 이미 푸시한 pending 승인 id — 중복 발송 방지. pending에서 사라지면 정리(유계).
     notified_approvals: HashSet<String>,
     /// 세션별 마지막으로 알린 상태 — 같은 전이 반복 발송 방지. MAX_NOTIFIED_SESSIONS로 유계.
-    notified_status: HashMap<u64, SessionKind>,
+    notified_status: HashMap<String, SessionKind>,
 }
 
 struct PushShared {
@@ -615,7 +618,7 @@ impl PushHandle {
 
     /// 대시보드 브리지가 세션 상태 전이를 넘긴다(입력대기/완료만). 비-blocking(큐 적재 + 깨움).
     /// 승인 상태(NeedsApproval)는 DB 폴링이 담당하므로 여기서는 무시한다(중복 방지).
-    pub fn notify_session(&self, session: u64, status: runtime::SessionStatus) {
+    pub fn notify_session(&self, session: String, status: runtime::SessionStatus) {
         let kind = match status {
             runtime::SessionStatus::Done => SessionKind::Done,
             runtime::SessionStatus::Waiting => SessionKind::Waiting,
@@ -694,20 +697,23 @@ fn run(shared: &Arc<PushShared>) {
             }
             let note = match job.kind {
                 SessionKind::Done => Notification::SessionDone {
-                    session: job.session,
+                    session: job.session.clone(),
                 },
                 SessionKind::Waiting => Notification::SessionWaiting {
-                    session: job.session,
+                    session: job.session.clone(),
                 },
             };
             let outcome = broadcast(shared, &note);
             let attempts = job.attempts + 1;
             if outcome.should_commit() {
                 let mut inner = shared.inner.lock().expect("push inner lock");
-                remember_status(&mut inner.notified_status, job.session, job.kind);
+                remember_status(&mut inner.notified_status, &job.session, job.kind);
             } else if attempts < SESSION_SEND_ATTEMPTS {
                 let mut inner = shared.inner.lock().expect("push inner lock");
-                inner.retry_jobs.push_back(SessionJob { attempts, ..job });
+                inner.retry_jobs.push_back(SessionJob {
+                    attempts,
+                    ..job.clone()
+                });
             } else {
                 tracing::warn!(
                     attempts,
@@ -733,10 +739,11 @@ fn run(shared: &Arc<PushShared>) {
 /// 세션 상태 마킹을 기록하고 상한을 지킨다. 세션 id는 런타임에서 단조 증가하므로 상한 초과 시
 /// 가장 낮은 id(=가장 오래된 세션)부터 버린다 — 그 세션은 이미 끝나 같은 전이가 다시 오지 않는다.
 /// (승인 기록은 pending 목록으로 retain 정리되지만, 세션은 "사라짐" 신호가 없어 상한을 쓴다.)
-fn remember_status(notified: &mut HashMap<u64, SessionKind>, session: u64, kind: SessionKind) {
-    notified.insert(session, kind);
+fn remember_status(notified: &mut HashMap<String, SessionKind>, session: &str, kind: SessionKind) {
+    notified.insert(session.to_owned(), kind);
     while notified.len() > MAX_NOTIFIED_SESSIONS {
-        let Some(oldest) = notified.keys().min().copied() else {
+        // UUID라 단조성은 없다 — 사전순 최소 키를 버려 상한만 유지한다.
+        let Some(oldest) = notified.keys().min().cloned() else {
             break;
         };
         notified.remove(&oldest);
@@ -1172,11 +1179,17 @@ mod tests {
     /// P6c: 세션 알림 페이로드에 딥링크용 session id가 실린다(승인 알림에는 없다).
     #[test]
     fn 세션_알림_페이로드는_딥링크용_세션_id를_싣는다() {
-        let done = Notification::SessionDone { session: 7 }.payload();
-        assert!(done.contains(r#""session":7"#), "{done}");
+        let done = Notification::SessionDone {
+            session: "u7".into(),
+        }
+        .payload();
+        assert!(done.contains(r#""session":"u7""#), "{done}");
         assert!(done.contains(r#""kind":"done""#), "{done}");
-        let waiting = Notification::SessionWaiting { session: 42 }.payload();
-        assert!(waiting.contains(r#""session":42"#), "{waiting}");
+        let waiting = Notification::SessionWaiting {
+            session: "u42".into(),
+        }
+        .payload();
+        assert!(waiting.contains(r#""session":"u42""#), "{waiting}");
         // 승인 알림은 세션 개념이 없다 — 개수만
         let approval = Notification::Approval { count: 3 }.payload();
         assert!(!approval.contains("session"), "{approval}");
@@ -1725,18 +1738,18 @@ mod tests {
             .unwrap();
         wait_until(|| handle.poll_count() >= 1);
         let base = transport.call_count();
-        handle.notify_session(7, runtime::SessionStatus::Done);
+        handle.notify_session("u7".to_owned(), runtime::SessionStatus::Done);
         assert!(
             wait_until(|| transport.call_count() > base),
             "세션 완료 발송 없음"
         );
         let after = transport.call_count();
         // 같은 세션·같은 상태 재통지는 억제.
-        handle.notify_session(7, runtime::SessionStatus::Done);
+        handle.notify_session("u7".to_owned(), runtime::SessionStatus::Done);
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(transport.call_count(), after, "세션 완료가 중복 발송됨");
         // 상태 외 값(Running)은 무시.
-        handle.notify_session(7, runtime::SessionStatus::Running);
+        handle.notify_session("u7".to_owned(), runtime::SessionStatus::Running);
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(transport.call_count(), after, "무관 상태가 발송됨");
         mgr.stop_and_join();
@@ -1867,7 +1880,7 @@ mod tests {
         let base = transport.call_count();
 
         // 세션 전이는 생애 1회라 실패를 버리면 영구 유실 — 재시도 큐가 다음 주기에 다시 보낸다.
-        handle.notify_session(7, runtime::SessionStatus::Done);
+        handle.notify_session("u7".to_owned(), runtime::SessionStatus::Done);
         assert!(
             wait_until(|| transport.call_count() >= base + 4),
             "세션 알림 전량 실패인데 다음 주기 재시도가 없었다"
@@ -1887,14 +1900,14 @@ mod tests {
 
         // 전량 실패는 마킹을 남기지 않았다 — 회복 후 같은 전이가 다시 오면 정상 발송된다.
         transport.set(endpoint, Reply::Status(201));
-        handle.notify_session(7, runtime::SessionStatus::Done);
+        handle.notify_session("u7".to_owned(), runtime::SessionStatus::Done);
         assert!(
             wait_until(|| transport.call_count() > capped),
             "실패가 마킹으로 굳어 재통지가 억제됐다(무음 유실)"
         );
         // 성공 뒤에는 다시 중복 억제된다(기존 동작 회귀 없음).
         let after = transport.settle();
-        handle.notify_session(7, runtime::SessionStatus::Done);
+        handle.notify_session("u7".to_owned(), runtime::SessionStatus::Done);
         std::thread::sleep(FAST_POLL * 4);
         assert_eq!(
             transport.call_count(),
@@ -1909,25 +1922,29 @@ mod tests {
     // ── P3-1: notified_status 유계화 ────────────────────────────────────────
 
     #[test]
-    fn notified_status는_상한을_넘지_않고_오래된_세션부터_버린다() {
-        let mut notified: HashMap<u64, SessionKind> = HashMap::new();
-        let last = MAX_NOTIFIED_SESSIONS as u64 + 10;
-        for session in 1..=last {
-            remember_status(&mut notified, session, SessionKind::Done);
+    fn notified_status는_상한을_넘지_않고_오래된_키부터_버린다() {
+        let mut notified: HashMap<String, SessionKind> = HashMap::new();
+        let count = MAX_NOTIFIED_SESSIONS + 10;
+        // 세션 키는 영속 UUID다(I1) — 단조성은 없으므로 사전순 최소 키부터 버린다.
+        // 자리수를 맞춰 사전순 = 생성순이 되게 만든다(테스트 결정성).
+        let key = |i: usize| format!("uuid-{i:06}");
+        for i in 1..=count {
+            remember_status(&mut notified, &key(i), SessionKind::Done);
         }
         assert_eq!(
             notified.len(),
             MAX_NOTIFIED_SESSIONS,
             "세션 기록이 상한 없이 쌓인다"
         );
-        // 세션 id는 단조 증가 — 가장 낮은(오래된) id부터 버려지고 최신 세션은 남는다.
-        assert!(!notified.contains_key(&1), "가장 오래된 세션이 남아 있다");
-        assert!(!notified.contains_key(&10));
-        assert!(notified.contains_key(&last), "최신 세션이 버려졌다");
-        // 같은 세션 재기록은 크기를 늘리지 않고 상태만 갱신한다.
-        remember_status(&mut notified, last, SessionKind::Waiting);
+        assert!(
+            !notified.contains_key(&key(1)),
+            "가장 오래된 키가 남아 있다"
+        );
+        assert!(notified.contains_key(&key(count)), "최신 키가 버려졌다");
+        // 같은 키 재기록은 크기를 늘리지 않고 상태만 갱신한다.
+        remember_status(&mut notified, &key(count), SessionKind::Waiting);
         assert_eq!(notified.len(), MAX_NOTIFIED_SESSIONS);
-        assert_eq!(notified.get(&last), Some(&SessionKind::Waiting));
+        assert_eq!(notified.get(&key(count)), Some(&SessionKind::Waiting));
     }
 
     /// Arc<FakeTransport>를 Box<dyn PushTransport>로 넘기기 위한 래퍼(테스트가 관찰을 공유).

@@ -3040,6 +3040,7 @@ mod tests {
                             id: pane_id,
                             session_id: Some(*session),
                             title: format!("pane-{tab}"),
+                            persistent_session_id: None,
                         }],
                     }
                 })

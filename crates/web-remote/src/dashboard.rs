@@ -47,6 +47,31 @@ const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(15);
 /// 워크스페이스 전환 시 receiver와 함께 교체한다. fire-and-forget — 실패는 로그만.
 pub type CommandSink = Arc<dyn Fn(RuntimeCommand) + Send + Sync>;
 
+/// 영속 UUID ↔ worker-로컬 u64 양방향 맵 (v3.7 I1).
+#[derive(Default)]
+struct IdMap {
+    to_session: BTreeMap<String, u64>,
+    to_uuid: BTreeMap<u64, String>,
+}
+
+impl IdMap {
+    fn clear(&mut self) {
+        self.to_session.clear();
+        self.to_uuid.clear();
+    }
+    fn insert(&mut self, uuid: String, session: u64) {
+        self.to_session.insert(uuid.clone(), session);
+        self.to_uuid.insert(session, uuid);
+    }
+    /// UUID → 현재 워커의 u64. **모르는 UUID면 None** — 명령이 만들어지지 않는다.
+    fn session(&self, uuid: &str) -> Option<u64> {
+        self.to_session.get(uuid).copied()
+    }
+    fn uuid(&self, session: u64) -> Option<&str> {
+        self.to_uuid.get(&session).map(String::as_str)
+    }
+}
+
 /// 세션 하나의 시청 집계 (P5b) — 접속 수 + 마지막 lease 갱신 시각.
 struct WatcherEntry {
     count: usize,
@@ -55,16 +80,16 @@ struct WatcherEntry {
 
 /// 갱신 주기가 지난 시청 세션들을 골라 last_renewal을 갱신한다 (순수 — 테스트 대상).
 fn due_lease_renewals(
-    watchers: &mut BTreeMap<u64, WatcherEntry>,
+    watchers: &mut BTreeMap<String, WatcherEntry>,
     now: Instant,
     interval: Duration,
-) -> Vec<u64> {
+) -> Vec<String> {
     watchers
         .iter_mut()
         .filter(|(_, entry)| now.duration_since(entry.last_renewal) >= interval)
         .map(|(id, entry)| {
             entry.last_renewal = now;
-            *id
+            id.clone()
         })
         .collect()
 }
@@ -201,10 +226,23 @@ fn status_str(status: SessionStatus) -> &'static str {
 fn apply_event(
     sessions: &mut BTreeMap<u64, SessionEntry>,
     resource: &mut Option<ResourceView>,
+    ids: &mut IdMap,
     event: &RuntimeEvent,
 ) {
     match event {
         RuntimeEvent::MuxUpdated { snapshot } => {
+            // 영속 UUID ↔ worker-로컬 u64 매핑 갱신 — 스냅샷이 진실의 원천이다 (I1).
+            // pane에 붙어 있는 세션만 남긴다(전환/종료 시 옛 매핑이 남지 않게).
+            ids.clear();
+            for tab in &snapshot.tabs {
+                for pane in &tab.panes {
+                    if let (Some(session), Some(uuid)) =
+                        (pane.session_id, pane.persistent_session_id.as_ref())
+                    {
+                        ids.insert(uuid.clone(), session.0);
+                    }
+                }
+            }
             // pane에 붙은 세션 집합이 **소속의 근거**다(추가/삭제). 제목은 여기서 쓰지
             // 않는다 — mux의 raw 제목("workspace.spawn.shell 140")은 사람이 읽기 어렵고,
             // 표시명은 앱이 해석해 push한다(WorkspaceSeed). 상태·exited는 보존한다.
@@ -254,18 +292,17 @@ fn new_entry() -> SessionEntry {
 /// 런타임 이벤트 하나를 웹푸시 싱크로 넘긴다(P4). 세션 상태 전이만 대상 — 실제 발송 여부는
 /// push 계층이 상태(입력대기/완료)와 중복 억제로 결정한다. SessionRestored(재시작 복원)는
 /// "완료"가 아니므로 넘기지 않는다 — 앱 재시작 때마다 완료 알림이 쏟아지는 것을 막는다.
-fn forward_to_push(push: &crate::push::PushHandle, event: &RuntimeEvent) {
-    match event {
-        RuntimeEvent::SessionStatusChanged { session, status } => {
-            push.notify_session(session.0, *status)
-        }
-        RuntimeEvent::SessionStatusViewChanged { session, view } => {
-            push.notify_session(session.0, view.status)
-        }
-        RuntimeEvent::SessionExited { session, .. } => {
-            push.notify_session(session.0, SessionStatus::Done)
-        }
-        _ => {}
+/// 딥링크가 재시작 후에도 같은 세션을 가리키도록 **영속 UUID**를 넘긴다 (I1).
+/// UUID를 모르는 세션(persist 없음)은 알림을 보내지 않는다 — 열어봐야 엉뚱한 곳이다.
+fn forward_to_push(push: &crate::push::PushHandle, ids: &IdMap, event: &RuntimeEvent) {
+    let (session, status) = match event {
+        RuntimeEvent::SessionStatusChanged { session, status } => (session.0, *status),
+        RuntimeEvent::SessionStatusViewChanged { session, view } => (session.0, view.status),
+        RuntimeEvent::SessionExited { session, .. } => (session.0, SessionStatus::Done),
+        _ => return,
+    };
+    if let Some(uuid) = ids.uuid(session) {
+        push.notify_session(uuid.to_owned(), status);
     }
 }
 
@@ -286,6 +323,7 @@ fn resource_view(snapshot: &ProcessResourceSnapshot) -> ResourceView {
 fn workspace_views(
     workspaces: &[WorkspaceSeed],
     live: &BTreeMap<u64, SessionEntry>,
+    ids: &IdMap,
 ) -> Vec<WorkspaceView> {
     // 앱 스냅샷이 아직 없는데(웹서버 기동 직후 첫 프레임 전) 라이브 세션이 있으면,
     // 세션이 통째로 안 보이는 것보다 이름 없는 활성 워크스페이스로라도 보여준다.
@@ -297,7 +335,8 @@ fn workspace_views(
             sessions: live
                 .iter()
                 .map(|(id, entry)| SessionView {
-                    id: Some(*id),
+                    // UUID가 없으면 표시 전용 — 폰은 u64를 모른다 (I1).
+                    id: ids.uuid(*id).map(str::to_owned),
                     title: format!("세션 {id}"),
                     status: Some(status_str(entry.status)),
                     agent: None,
@@ -319,7 +358,11 @@ fn workspace_views(
                     .map(|(id, entry)| {
                         let seed = by_id.get(id);
                         SessionView {
-                            id: Some(*id),
+                            // **영속 UUID만 노출**한다 — 폰이 u64를 모르므로 워크스페이스
+                            // 전환·재시작 후 옛 id로 엉뚱한 세션을 잡는 일이 구조적으로
+                            // 불가능하다 (I1). UUID가 없는 세션(persist 없음/레거시)은
+                            // 표시 전용으로 강등된다.
+                            id: ids.uuid(*id).map(str::to_owned),
                             title: seed
                                 .map(|s| s.title.clone())
                                 .unwrap_or_else(|| format!("세션 {id}")),
@@ -333,7 +376,8 @@ fn workspace_views(
                 ws.sessions
                     .iter()
                     .map(|s| SessionView {
-                        id: None, // 표시 전용 — 세션 id는 worker-로컬
+                        // 표시 전용 — 이 워크스페이스의 워커가 없어 시청할 수 없다.
+                        id: None,
                         title: s.title.clone(),
                         status: s.status.map(status_str),
                         agent: s.agent.clone(),
@@ -372,10 +416,14 @@ struct Inner {
     /// web → runtime 명령 싱크 (P5b). None이면 시청 lease를 보내지 않는다(뷰어 비활성).
     command_sink: Option<CommandSink>,
     /// 세션별 시청 접속 집계 (P5b). 0→1에서 lease on, 1→0에서 lease off를 보낸다.
-    watchers: BTreeMap<u64, WatcherEntry>,
+    watchers: BTreeMap<String, WatcherEntry>,
     /// 시청 세션별 최신 bracketed paste 모드 (P6a — Viewport 이벤트에서 캐시).
     /// send_input의 wrap 판정에 쓴다. 시청 종료 시 함께 정리된다.
-    bracketed: BTreeMap<u64, bool>,
+    bracketed: BTreeMap<String, bool>,
+    /// **영속 UUID ↔ worker-로컬 u64** (v3.7 I1). MuxUpdated가 진실의 원천이다.
+    /// 폰에는 UUID만 노출하고(u64는 아예 안 보낸다), 명령을 만들 때 여기서 변환한다 —
+    /// 워커가 모르는 UUID는 변환되지 않아 명령 자체가 만들어지지 않는다(앨리어싱 차단).
+    ids: IdMap,
 }
 
 /// 접속 스레드가 소켓으로 밀어낼 발행 스냅샷. 버전이 오르면 push 대상.
@@ -387,10 +435,10 @@ struct Published {
     appr_version: u64,
     /// 시청 세션별 최신 화면 슬롯 (P5c) — (seq, 스냅샷). 최신본만 유지(coalesce,
     /// remote.rs 슬롯 관례). 시청이 끊기면 rebind_watch가 제거한다 — 메모리 유계.
-    viewports: BTreeMap<u64, (u64, Arc<runtime::TerminalViewportSnapshot>)>,
+    viewports: BTreeMap<String, (u64, Arc<runtime::TerminalViewportSnapshot>)>,
     /// 시청 세션별 최신 입력 큐 압박 (P6a) — (버전, 인코딩된 InputPressure JSON).
     /// 최신본만 유지, 시청 종료 시 제거 — 메모리 유계.
-    input_pressure: BTreeMap<u64, (u64, String)>,
+    input_pressure: BTreeMap<String, (u64, String)>,
 }
 
 struct Shared {
@@ -457,6 +505,7 @@ impl DashboardHandle {
                 command_sink: None,
                 watchers: BTreeMap::new(),
                 bracketed: BTreeMap::new(),
+                ids: IdMap::default(),
             }),
             published: Mutex::new(Published::default()),
             db: Mutex::new(db),
@@ -539,36 +588,46 @@ impl DashboardHandle {
     ///   끼어 시청 0인 세션의 슬롯을 부활시키는 레이스 차단 (②-P1).
     /// - lease 명령을 락 안에서 보내 cross-thread on/off 순서 역전 차단 (공통 지적).
     ///   sink는 try_send+unpark(비블로킹)라 락 하 호출이 안전하다.
-    pub fn rebind_watch(&self, from: Option<u64>, to: Option<u64>) {
+    ///
+    /// `from`과 `to`는 **영속 세션 UUID**다 (I1). lease 명령은 현재 워커의 u64로 변환해서만
+    /// 나간다 — 워커가 모르는 UUID(전환된 워크스페이스 등)면 명령 자체를 만들지 않는다.
+    pub fn rebind_watch(&self, from: Option<&str>, to: Option<&str>) {
         if from == to {
             return;
         }
         let mut commands: Vec<RuntimeCommand> = Vec::new();
         let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
         if let Some(old) = from
-            && let Some(entry) = inner.watchers.get_mut(&old)
+            && let Some(entry) = inner.watchers.get_mut(old)
         {
             entry.count = entry.count.saturating_sub(1);
             if entry.count == 0 {
-                inner.watchers.remove(&old);
-                inner.bracketed.remove(&old);
-                commands.push(lease_command(old, false));
+                inner.watchers.remove(old);
+                inner.bracketed.remove(old);
+                if let Some(session) = inner.ids.session(old) {
+                    commands.push(lease_command(session, false));
+                }
                 // 마지막 시청자 이탈 — 화면/입력압박 슬롯도 같은 임계구역에서 제거
                 // (락 순서 inner→published 중첩, 역순 취득 경로 없음 — 교착 없음).
                 let mut published = self.shared.published.lock().expect("published lock");
-                published.viewports.remove(&old);
-                published.input_pressure.remove(&old);
+                published.viewports.remove(old);
+                published.input_pressure.remove(old);
             }
         }
         if let Some(new) = to {
-            let entry = inner.watchers.entry(new).or_insert(WatcherEntry {
-                count: 0,
-                last_renewal: Instant::now(),
-            });
+            let entry = inner
+                .watchers
+                .entry(new.to_owned())
+                .or_insert(WatcherEntry {
+                    count: 0,
+                    last_renewal: Instant::now(),
+                });
             entry.count += 1;
             if entry.count == 1 {
                 entry.last_renewal = Instant::now();
-                commands.push(lease_command(new, true));
+                if let Some(session) = inner.ids.session(new) {
+                    commands.push(lease_command(session, true));
+                }
             }
         }
         if let Some(sink) = &inner.command_sink {
@@ -578,23 +637,21 @@ impl DashboardHandle {
         }
     }
 
-    /// 시청 세션에 composer 텍스트를 입력한다 (P6a — 자유 입력). 정규화/제어문자
-    /// strip/bracketed wrap은 [`encode_input`] 참조. 죽은 세션 id는 runtime이 무해하게
-    /// 무시한다. 호출측(ws_api)이 "시청 중 세션만" 게이트를 이미 건다.
-    pub fn send_input(&self, session: u64, text: &str, submit: bool) {
-        let (sink, bracketed) = {
+    /// 시청 세션에 composer 텍스트를 입력한다 (P6a). `uuid`는 **영속 세션 UUID**다 —
+    /// 현재 워커의 u64로 변환되지 않으면(다른 워크스페이스/죽은 세션) 아무것도 하지 않는다.
+    pub fn send_input(&self, uuid: &str, text: &str, submit: bool) {
+        let (sink, session, bracketed) = {
             let inner = self.shared.inner.lock().expect("dashboard inner lock");
-            // **브리지 시청 집계로 재확인**한다 — 접속(ws_api)의 watch 상태만 믿으면,
-            // 워크스페이스 전환으로 시청이 정리된 뒤(clear_watch_state)에도 접속이 옛
-            // 세션 id를 들고 있어 **새 워커의 동명 id 세션**에 입력이 주입된다. 세션 id는
-            // worker-로컬(1부터 재배정)이라 화면은 동결된 채 무관한 에이전트에 글자가 간다
-            // (리뷰 P2-1). 전환 직후 watchers는 비어 있으므로 여기서 차단된다.
-            if !inner.watchers.contains_key(&session) {
-                return;
+            if !inner.watchers.contains_key(uuid) {
+                return; // 시청 중이 아니다(전환으로 정리됐을 수 있다 — 리뷰 P2-1)
             }
+            let Some(session) = inner.ids.session(uuid) else {
+                return; // 이 워커가 모르는 세션 — 명령 자체를 만들지 않는다 (I1)
+            };
             (
                 inner.command_sink.clone(),
-                inner.bracketed.get(&session).copied().unwrap_or(false),
+                session,
+                inner.bracketed.get(uuid).copied().unwrap_or(false),
             )
         };
         let Some(sink) = sink else { return };
@@ -607,35 +664,32 @@ impl DashboardHandle {
     }
 
     /// 시청 세션의 입력 큐 압박이 `last`보다 새로우면 (버전, JSON)을 돌려준다 (P6a).
-    pub fn input_pressure_if_newer(&self, session: u64, last: u64) -> Option<(u64, String)> {
+    pub fn input_pressure_if_newer(&self, uuid: &str, last: u64) -> Option<(u64, String)> {
         let published = self.shared.published.lock().expect("published lock");
         published
             .input_pressure
-            .get(&session)
+            .get(uuid)
             .filter(|(version, _)| *version > last)
             .map(|(version, json)| (*version, json.clone()))
     }
 
-    /// 브리지가 이 세션을 시청 중으로 집계하고 있는가 — 워크스페이스 전환 후 남은
-    /// 접속-로컬 watch로 엉뚱한 세션에 명령이 가는 것을 막는 최종 게이트 (리뷰 P2-1).
-    fn is_watched(&self, session: u64) -> bool {
-        self.shared
-            .inner
-            .lock()
-            .expect("dashboard inner lock")
-            .watchers
-            .contains_key(&session)
+    /// 시청 중이고 **현재 워커가 아는** 세션이면 u64를 돌려준다 — 명령 게이트.
+    /// 워크스페이스 전환 후 남은 접속 바인딩(리뷰 P2-1)과 worker-로컬 id 앨리어싱(I1)을
+    /// 한 지점에서 막는다.
+    fn resolve_watched(&self, uuid: &str) -> Option<u64> {
+        let inner = self.shared.inner.lock().expect("dashboard inner lock");
+        if !inner.watchers.contains_key(uuid) {
+            return None;
+        }
+        inner.ids.session(uuid)
     }
 
-    /// 시청 세션의 스크롤백을 이동한다 (스크롤백 열람). delta 양수 = 과거로.
-    /// 스크롤 상태는 세션당 하나(데스크톱과 공유) — backend가 이력 범위로 클램프하고,
-    /// 여기서는 비정상 값(오버플로 조작)만 방어적으로 캡한다. 죽은 세션 id는 runtime이
-    /// 무해하게 무시한다. 호출측(ws_api)이 "시청 중 세션만" 게이트를 이미 건다.
-    pub fn send_scroll(&self, session: u64, delta: i32) {
-        if !self.is_watched(session) {
-            return;
-        }
+    /// 시청 세션의 스크롤백을 이동한다. delta 양수 = 과거로.
+    pub fn send_scroll(&self, uuid: &str, delta: i32) {
         const SCROLL_DELTA_CAP: i32 = 100_000;
+        let Some(session) = self.resolve_watched(uuid) else {
+            return;
+        };
         let delta = delta.clamp(-SCROLL_DELTA_CAP, SCROLL_DELTA_CAP);
         if delta == 0 {
             return;
@@ -656,14 +710,8 @@ impl DashboardHandle {
     }
 
     /// 시청 세션에 제어 키를 보낸다 (P5d + P6a 확장 — 화살표/Esc/Tab 등).
-    /// 제어 시퀀스는 이 화이트리스트로만 생성된다(자유 텍스트의 제어문자는 strip —
-    /// encode_input). 화이트리스트 밖 키는 무시. WriteInput 재사용 — 죽은 세션 id는
-    /// runtime이 무해하게 무시한다. 호출측(ws_api)이 "시청 중 세션만" 게이트를 이미 건다.
-    pub fn send_key(&self, session: u64, key: &str) {
-        // send_input과 같은 이유로 브리지 시청 집계를 재확인한다 (리뷰 P2-1).
-        if !self.is_watched(session) {
-            return;
-        }
+    /// 제어 시퀀스는 이 화이트리스트로만 생성된다(자유 텍스트의 제어문자는 strip).
+    pub fn send_key(&self, uuid: &str, key: &str) {
         let bytes: &[u8] = match key {
             "ctrl_c" => b"\x03",
             "ctrl_d" => b"\x04",
@@ -676,6 +724,9 @@ impl DashboardHandle {
             "right" => b"\x1b[C",
             "left" => b"\x1b[D",
             _ => return,
+        };
+        let Some(session) = self.resolve_watched(uuid) else {
+            return;
         };
         let sink = self
             .shared
@@ -798,13 +849,13 @@ impl DashboardHandle {
     /// Arc 복제라 싸다 — 인코딩(keyframe/delta)은 접속 스레드가 자기 baseline으로 한다.
     pub fn viewport_if_newer(
         &self,
-        session: u64,
+        uuid: &str,
         last_seq: u64,
     ) -> Option<(u64, Arc<runtime::TerminalViewportSnapshot>)> {
         let published = self.shared.published.lock().expect("published lock");
         published
             .viewports
-            .get(&session)
+            .get(uuid)
             .filter(|(seq, _)| *seq > last_seq)
             .map(|(seq, snapshot)| (*seq, Arc::clone(snapshot)))
     }
@@ -832,23 +883,26 @@ impl DashboardHandle {
                 resource,
                 watchers,
                 bracketed,
+                ids,
                 ..
             } = &mut *inner;
-            apply_event(sessions, resource, &event);
+            apply_event(sessions, resource, ids, &event);
             // 실경로(run)와 동일하게 inner 임계구역 안에서 published를 중첩 취득해
-            // 슬롯을 반영한다 (P5 리뷰 ②-P1 — 락 순서 inner→published).
+            // 슬롯을 반영한다 (P5 리뷰 ②-P1 — 락 순서 inner→published). 키는 UUID (I1).
             if let RuntimeEvent::Viewport {
                 session,
                 snapshot,
                 bracketed_paste,
             } = &event
-                && watchers.contains_key(&session.0)
+                && let Some(uuid) = ids.uuid(session.0)
+                && watchers.contains_key(uuid)
             {
-                bracketed.insert(session.0, *bracketed_paste);
+                let uuid = uuid.to_owned();
+                bracketed.insert(uuid.clone(), *bracketed_paste);
                 let mut published = self.shared.published.lock().expect("published lock");
                 let entry = published
                     .viewports
-                    .entry(session.0)
+                    .entry(uuid)
                     .or_insert((0, Arc::clone(snapshot)));
                 entry.0 += 1;
                 entry.1 = Arc::clone(snapshot);
@@ -913,9 +967,9 @@ fn run(shared: &Arc<Shared>) {
         // 1) 런타임 이벤트 drain — 접속 유무와 무관하게 처리해 durable 큐 overflow를 막는다.
         //    시청 중 세션의 Viewport/입력압박은 스테이징해 두었다가 슬롯에 반영한다
         //    (P5c/P6a — 세션별 최신본만, coalesce).
-        let mut staged_viewports: BTreeMap<u64, Arc<runtime::TerminalViewportSnapshot>> =
+        let mut staged_viewports: BTreeMap<String, Arc<runtime::TerminalViewportSnapshot>> =
             BTreeMap::new();
-        let mut staged_pressure: BTreeMap<u64, String> = BTreeMap::new();
+        let mut staged_pressure: BTreeMap<String, String> = BTreeMap::new();
         if let Some(receiver) = inner.receiver.as_ref() {
             let events = receiver.drain();
             if receiver.take_overflowed() {
@@ -929,37 +983,46 @@ fn run(shared: &Arc<Shared>) {
                 push_sink,
                 watchers,
                 bracketed,
+                ids,
                 ..
             } = &mut *inner;
             for event in &events {
-                apply_event(sessions, resource, event);
+                apply_event(sessions, resource, ids, event);
                 // 세션 상태 전이(입력대기/완료)를 웹푸시로 넘긴다 — 앱이 닫혀 있어도 알린다(P4).
                 // notify_session이 Done/Waiting 외 상태는 무시하므로 여기서는 걸러내지 않는다.
                 if let Some(push) = push_sink.as_ref() {
-                    forward_to_push(push, event);
+                    forward_to_push(push, ids, event);
                 }
+                // 슬롯 키는 **영속 UUID**다(폰이 u64를 모른다). UUID를 모르는 세션은
+                // 애초에 시청 대상이 아니다(watchers는 UUID 키) — 자연스럽게 걸러진다.
                 match event {
                     RuntimeEvent::Viewport {
                         session,
                         snapshot,
                         bracketed_paste,
-                    } if watchers.contains_key(&session.0) => {
-                        staged_viewports.insert(session.0, Arc::clone(snapshot));
-                        // 입력 wrap 판정용 최신 paste 모드 캐시 (P6a)
-                        bracketed.insert(session.0, *bracketed_paste);
+                    } => {
+                        if let Some(uuid) = ids.uuid(session.0)
+                            && watchers.contains_key(uuid)
+                        {
+                            let uuid = uuid.to_owned();
+                            staged_viewports.insert(uuid.clone(), Arc::clone(snapshot));
+                            bracketed.insert(uuid, *bracketed_paste);
+                        }
                     }
-                    RuntimeEvent::PtyInputPressure { session, pressure }
-                        if watchers.contains_key(&session.0) =>
-                    {
-                        staged_pressure.insert(
-                            session.0,
-                            ServerMsg::InputPressure {
-                                session: session.0,
-                                queued: pressure.queued_bytes,
-                                reason: pressure_reason(pressure.reason),
-                            }
-                            .encode(),
-                        );
+                    RuntimeEvent::PtyInputPressure { session, pressure } => {
+                        if let Some(uuid) = ids.uuid(session.0)
+                            && watchers.contains_key(uuid)
+                        {
+                            staged_pressure.insert(
+                                uuid.to_owned(),
+                                ServerMsg::InputPressure {
+                                    session: uuid.to_owned(),
+                                    queued: pressure.queued_bytes,
+                                    reason: pressure_reason(pressure.reason),
+                                }
+                                .encode(),
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -1013,11 +1076,16 @@ fn run(shared: &Arc<Shared>) {
         //      (P5 리뷰 — sink는 try_send+unpark 비블로킹이라 락 하 호출 안전).
         let renewals =
             due_lease_renewals(&mut inner.watchers, Instant::now(), LEASE_RENEW_INTERVAL);
-        if !renewals.is_empty()
-            && let Some(sink) = &inner.command_sink
-        {
-            for session in renewals {
-                sink(lease_command(session, true));
+        if !renewals.is_empty() {
+            let commands: Vec<RuntimeCommand> = renewals
+                .iter()
+                .filter_map(|uuid| inner.ids.session(uuid))
+                .map(|session| lease_command(session, true))
+                .collect();
+            if let Some(sink) = &inner.command_sink {
+                for command in commands {
+                    sink(command);
+                }
             }
         }
 
@@ -1025,7 +1093,7 @@ fn run(shared: &Arc<Shared>) {
         //    force_poll+dirty를 세우므로 그때 최신 스냅샷이 만들어진다.
         if conns > 0 {
             let dash_json = ServerMsg::Dashboard {
-                workspaces: workspace_views(&inner.workspaces, &inner.sessions),
+                workspaces: workspace_views(&inner.workspaces, &inner.sessions, &inner.ids),
                 resource: inner.resource.clone(),
             }
             .encode();
@@ -1059,6 +1127,11 @@ mod tests {
     use runtime::{MuxSnapshot, PaneSnapshot, SessionId, TabSnapshot};
     use std::sync::Arc as StdArc;
 
+    /// 세션 u64 → 테스트용 영속 UUID (실제로는 sessions.id UUID).
+    fn test_uuid(session: u64) -> String {
+        format!("uuid-{session}")
+    }
+
     fn mux_event(panes: &[(u64, &str)]) -> RuntimeEvent {
         // mux id는 String UUID 계열(core uuid_id!) — 테스트에선 세션 id를 문자열로 재사용.
         RuntimeEvent::MuxUpdated {
@@ -1073,6 +1146,8 @@ mod tests {
                             id: runtime::MuxPaneId(id.to_string()),
                             session_id: Some(SessionId(*id)),
                             title: (*title).to_owned(),
+                            // 테스트용 결정적 UUID — 실제로는 sessions.id (I1)
+                            persistent_session_id: Some(test_uuid(*id)),
                         })
                         .collect(),
                 }],
@@ -1087,7 +1162,13 @@ mod tests {
         // 제목은 앱 스냅샷(WorkspaceSeed) 몫 — mux는 소속(멤버십)만 정한다.
         let mut sessions = BTreeMap::new();
         let mut resource = None;
-        apply_event(&mut sessions, &mut resource, &mux_event(&[(10, "claude")]));
+        let mut ids = IdMap::default();
+        apply_event(
+            &mut sessions,
+            &mut resource,
+            &mut ids,
+            &mux_event(&[(10, "claude")]),
+        );
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[&10].status, SessionStatus::Running);
     }
@@ -1129,10 +1210,16 @@ mod tests {
                 }],
             },
         ];
-        let views = workspace_views(&seeds, &live);
+        // I1: 활성 세션의 UUID 매핑(MuxUpdated 유래)이 있어야 시청 가능한 id가 나온다
+        let mut ids = IdMap::default();
+        ids.insert(test_uuid(10), 10);
+        let views = workspace_views(&seeds, &live, &ids);
         assert_eq!(views.len(), 2);
         // 활성: 라이브 상태(needs_approval) + 앱이 해석한 표시명
-        assert_eq!(views[0].sessions[0].id, Some(10));
+        assert_eq!(
+            views[0].sessions[0].id.as_deref(),
+            Some(test_uuid(10).as_str())
+        );
         assert_eq!(views[0].sessions[0].title, "deppy-sijo");
         assert_eq!(views[0].sessions[0].status, Some("needs_approval"));
         // 돌고 있는 에이전트 요약이 실린다(폰에서 "무슨 에이전트가 도는지" 확인)
@@ -1150,10 +1237,17 @@ mod tests {
     fn 상태_이벤트가_세션_상태를_덮고_mux는_상태를_보존한다() {
         let mut sessions = BTreeMap::new();
         let mut resource = None;
-        apply_event(&mut sessions, &mut resource, &mux_event(&[(10, "claude")]));
+        let mut ids = IdMap::default();
         apply_event(
             &mut sessions,
             &mut resource,
+            &mut ids,
+            &mux_event(&[(10, "claude")]),
+        );
+        apply_event(
+            &mut sessions,
+            &mut resource,
+            &mut ids,
             &RuntimeEvent::SessionStatusChanged {
                 session: SessionId(10),
                 status: SessionStatus::NeedsApproval,
@@ -1164,6 +1258,7 @@ mod tests {
         apply_event(
             &mut sessions,
             &mut resource,
+            &mut ids,
             &mux_event(&[(10, "claude-2")]),
         );
         assert_eq!(sessions[&10].status, SessionStatus::NeedsApproval);
@@ -1173,14 +1268,17 @@ mod tests {
     fn exit는_완료_배지_mux에서_사라지면_목록에서_제거() {
         let mut sessions = BTreeMap::new();
         let mut resource = None;
+        let mut ids = IdMap::default();
         apply_event(
             &mut sessions,
             &mut resource,
+            &mut ids,
             &mux_event(&[(10, "a"), (11, "b")]),
         );
         apply_event(
             &mut sessions,
             &mut resource,
+            &mut ids,
             &RuntimeEvent::SessionExited {
                 session: SessionId(11),
                 exit_code: Some(0),
@@ -1189,7 +1287,12 @@ mod tests {
         assert!(sessions[&11].exited);
         assert_eq!(sessions[&11].status, SessionStatus::Done);
         // pane이 닫히면(다음 MuxUpdated에서 빠지면) 목록에서 제거
-        apply_event(&mut sessions, &mut resource, &mux_event(&[(10, "a")]));
+        apply_event(
+            &mut sessions,
+            &mut resource,
+            &mut ids,
+            &mux_event(&[(10, "a")]),
+        );
         assert!(!sessions.contains_key(&11));
     }
 
@@ -1197,9 +1300,11 @@ mod tests {
     fn resource_usage가_리소스뷰를_만든다() {
         let mut sessions = BTreeMap::new();
         let mut resource = None;
+        let mut ids = IdMap::default();
         apply_event(
             &mut sessions,
             &mut resource,
+            &mut ids,
             &RuntimeEvent::ResourceUsage {
                 snapshot: ProcessResourceSnapshot {
                     pid: 1,
@@ -1234,6 +1339,14 @@ mod tests {
         }
     }
 
+    /// 브리지에 UUID↔u64 매핑을 심는다 — 실경로에서는 MuxUpdated가 채운다 (I1).
+    fn seed_ids(handle: &DashboardHandle, sessions: &[u64]) {
+        let mut inner = handle.shared.inner.lock().unwrap();
+        for s in sessions {
+            inner.ids.insert(test_uuid(*s), *s);
+        }
+    }
+
     fn capture_sink() -> (CommandSink, StdArc<Mutex<Vec<RuntimeCommand>>>) {
         let captured: StdArc<Mutex<Vec<RuntimeCommand>>> = StdArc::default();
         let sink_cap = StdArc::clone(&captured);
@@ -1248,16 +1361,17 @@ mod tests {
         let (handle, thread) = DashboardHandle::spawn(None);
         let (sink, captured) = capture_sink();
         handle.set_command_sink(sink);
+        seed_ids(&handle, &[1, 2, 3, 5, 7, 8, 9, 10]);
         // conn1: watch 7 (0→1 on) / conn2: watch 7 (1→2 무전송)
-        handle.rebind_watch(None, Some(7));
-        handle.rebind_watch(None, Some(7));
+        handle.rebind_watch(None, Some(&test_uuid(7)));
+        handle.rebind_watch(None, Some(&test_uuid(7)));
         // conn1: 7→9 전환 (7은 2→1 무전송, 9는 0→1 on) — 재바인딩
-        handle.rebind_watch(Some(7), Some(9));
+        handle.rebind_watch(Some(&test_uuid(7)), Some(&test_uuid(9)));
         // 같은 세션으로의 재전환은 no-op
-        handle.rebind_watch(Some(9), Some(9));
+        handle.rebind_watch(Some(&test_uuid(9)), Some(&test_uuid(9)));
         // conn2 종료 (7: 1→0 off), conn1 종료 (9: 1→0 off)
-        handle.rebind_watch(Some(7), None);
-        handle.rebind_watch(Some(9), None);
+        handle.rebind_watch(Some(&test_uuid(7)), None);
+        handle.rebind_watch(Some(&test_uuid(9)), None);
         let got: Vec<(u64, bool)> = captured
             .lock()
             .unwrap()
@@ -1280,10 +1394,11 @@ mod tests {
         let (handle, thread) = DashboardHandle::spawn(None);
         let (sink, captured) = capture_sink();
         handle.set_command_sink(sink);
-        handle.rebind_watch(None, Some(3));
-        handle.rebind_watch(None, Some(5));
+        seed_ids(&handle, &[1, 2, 3, 5, 7, 8, 9, 10]);
+        handle.rebind_watch(None, Some(&test_uuid(3)));
+        handle.rebind_watch(None, Some(&test_uuid(5)));
         handle.inject_event(viewport_event(3));
-        assert!(handle.viewport_if_newer(3, 0).is_some());
+        assert!(handle.viewport_if_newer(&test_uuid(3), 0).is_some());
         captured.lock().unwrap().clear();
         // 새 worker 구독 시점의 정리 경로 (set_runtime_source가 호출)
         {
@@ -1295,9 +1410,12 @@ mod tests {
             captured.lock().unwrap().is_empty(),
             "정리 경로에서 lease 명령이 나감 — 세션 id 앨리어싱 위험"
         );
-        assert!(handle.viewport_if_newer(3, 0).is_none(), "슬롯 잔존");
+        assert!(
+            handle.viewport_if_newer(&test_uuid(3), 0).is_none(),
+            "슬롯 잔존"
+        );
         // 정리 후 새 watch는 fresh 0→1로 정상 동작한다
-        handle.rebind_watch(None, Some(3));
+        handle.rebind_watch(None, Some(&test_uuid(3)));
         let got: Vec<(u64, bool)> = captured
             .lock()
             .unwrap()
@@ -1346,24 +1464,29 @@ mod tests {
         let (handle, thread) = DashboardHandle::spawn(None);
         let (sink, _captured) = capture_sink();
         handle.set_command_sink(sink);
+        seed_ids(&handle, &[1, 2, 3, 5, 7, 8, 9, 10]);
         // 시청 전 Viewport — 슬롯에 쌓이지 않는다 (메모리 유계)
         handle.inject_event(viewport_event(7));
-        assert!(handle.viewport_if_newer(7, 0).is_none());
+        assert!(handle.viewport_if_newer(&test_uuid(7), 0).is_none());
         // 시청 시작 → 이벤트마다 seq 증가
-        handle.rebind_watch(None, Some(7));
+        handle.rebind_watch(None, Some(&test_uuid(7)));
         handle.inject_event(viewport_event(7));
-        let (seq1, _) = handle.viewport_if_newer(7, 0).expect("슬롯 없음");
+        let (seq1, _) = handle
+            .viewport_if_newer(&test_uuid(7), 0)
+            .expect("슬롯 없음");
         handle.inject_event(viewport_event(7));
-        let (seq2, _) = handle.viewport_if_newer(7, 0).expect("슬롯 없음");
+        let (seq2, _) = handle
+            .viewport_if_newer(&test_uuid(7), 0)
+            .expect("슬롯 없음");
         assert!(seq2 > seq1);
         // 이미 본 seq — None (불필요 재전송 방지)
-        assert!(handle.viewport_if_newer(7, seq2).is_none());
+        assert!(handle.viewport_if_newer(&test_uuid(7), seq2).is_none());
         // 다른(비시청) 세션은 여전히 없음
         handle.inject_event(viewport_event(8));
-        assert!(handle.viewport_if_newer(8, 0).is_none());
+        assert!(handle.viewport_if_newer(&test_uuid(8), 0).is_none());
         // 마지막 시청자 이탈 → 슬롯 제거 (trailing 스냅샷 없음)
-        handle.rebind_watch(Some(7), None);
-        assert!(handle.viewport_if_newer(7, 0).is_none());
+        handle.rebind_watch(Some(&test_uuid(7)), None);
+        assert!(handle.viewport_if_newer(&test_uuid(7), 0).is_none());
         handle.stop();
         thread.join().unwrap();
     }
@@ -1409,7 +1532,8 @@ mod tests {
         let (handle, thread) = DashboardHandle::spawn(None);
         let (sink, captured) = capture_sink();
         handle.set_command_sink(sink);
-        handle.rebind_watch(None, Some(7));
+        seed_ids(&handle, &[1, 2, 3, 5, 7, 8, 9, 10]);
+        handle.rebind_watch(None, Some(&test_uuid(7)));
         // bracketed on인 Viewport 주입 → 캐시 갱신
         let RuntimeEvent::Viewport {
             session, snapshot, ..
@@ -1423,7 +1547,7 @@ mod tests {
             bracketed_paste: true,
         });
         captured.lock().unwrap().clear();
-        handle.send_input(7, "a\nb", true);
+        handle.send_input(&test_uuid(7), "a\nb", true);
         let inputs: Vec<Vec<u8>> = captured
             .lock()
             .unwrap()
@@ -1446,8 +1570,9 @@ mod tests {
         let (handle, thread) = DashboardHandle::spawn(None);
         let (sink, captured) = capture_sink();
         handle.set_command_sink(sink);
-        handle.rebind_watch(None, Some(7));
-        handle.send_input(7, "before", true);
+        seed_ids(&handle, &[1, 2, 3, 5, 7, 8, 9, 10]);
+        handle.rebind_watch(None, Some(&test_uuid(7)));
+        handle.send_input(&test_uuid(7), "before", true);
         assert!(
             captured
                 .lock()
@@ -1463,12 +1588,44 @@ mod tests {
         }
         captured.lock().unwrap().clear();
         // 접속(ws_api)은 여전히 watched=Some(7)이라 이 함수들을 부른다 — 전부 차단돼야 한다
-        handle.send_input(7, "yes", true);
-        handle.send_key(7, "enter");
-        handle.send_scroll(7, 5);
+        handle.send_input(&test_uuid(7), "yes", true);
+        handle.send_key(&test_uuid(7), "enter");
+        handle.send_scroll(&test_uuid(7), 5);
         assert!(
             captured.lock().unwrap().is_empty(),
             "시청 정리 후에도 명령이 나갔다 — 새 워커의 동명 세션에 입력이 주입된다"
+        );
+        handle.stop();
+        thread.join().unwrap();
+    }
+
+    /// I1 핵심 계약: **워커가 모르는 UUID로는 명령이 만들어지지 않는다.**
+    /// 폰은 u64를 아예 모르므로(프로토콜이 UUID만 노출) 워크스페이스 전환·재시작 후
+    /// 옛 식별자로 엉뚱한 세션을 잡는 일이 구조적으로 불가능하다.
+    #[test]
+    fn 모르는_uuid로는_시청도_입력도_나가지_않는다() {
+        let (handle, thread) = DashboardHandle::spawn(None);
+        let (sink, captured) = capture_sink();
+        handle.set_command_sink(sink);
+        // 워커가 아는 세션은 10뿐 — 다른 워크스페이스의 UUID는 매핑에 없다
+        seed_ids(&handle, &[10]);
+        let stranger = "uuid-from-another-workspace";
+        handle.rebind_watch(None, Some(stranger));
+        handle.send_input(stranger, "yes", true);
+        handle.send_key(stranger, "enter");
+        handle.send_scroll(stranger, 3);
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "모르는 UUID로 명령이 나갔다 — 앨리어싱 차단 실패"
+        );
+        // 아는 UUID는 정상 동작한다(게이트가 과잉 차단하지 않는다)
+        handle.rebind_watch(None, Some(&test_uuid(10)));
+        handle.send_input(&test_uuid(10), "ls", true);
+        assert!(
+            captured.lock().unwrap().iter().any(
+                |c| matches!(c, RuntimeCommand::WriteInput { session, .. } if session.0 == 10)
+            ),
+            "아는 UUID인데 입력이 안 나갔다"
         );
         handle.stop();
         thread.join().unwrap();
@@ -1479,10 +1636,11 @@ mod tests {
         let (handle, thread) = DashboardHandle::spawn(None);
         let (sink, captured) = capture_sink();
         handle.set_command_sink(sink);
-        handle.rebind_watch(None, Some(7)); // 시청 중이어야 명령이 나간다(P2-1 게이트)
+        seed_ids(&handle, &[1, 2, 3, 5, 7, 8, 9, 10]);
+        handle.rebind_watch(None, Some(&test_uuid(7))); // 시청 중이어야 명령이 나간다(P2-1 게이트)
         captured.lock().unwrap().clear();
         for key in ["up", "esc", "shift_tab", "rm_rf"] {
-            handle.send_key(7, key);
+            handle.send_key(&test_uuid(7), key);
         }
         let inputs: Vec<Vec<u8>> = captured
             .lock()
@@ -1534,7 +1692,7 @@ mod tests {
         // 상태는 여전히 done이어야 한다 — 표시명만 갱신된다
         let views = {
             let inner = handle.shared.inner.lock().unwrap();
-            workspace_views(&inner.workspaces, &inner.sessions)
+            workspace_views(&inner.workspaces, &inner.sessions, &inner.ids)
         };
         assert_eq!(views[0].sessions[0].status, Some("done"), "상태가 되돌아감");
         assert_eq!(views[0].sessions[0].title, "deppy-sijo (2)");
@@ -1547,21 +1705,21 @@ mod tests {
         let mut watchers = BTreeMap::new();
         let now = Instant::now();
         watchers.insert(
-            1,
+            test_uuid(1),
             WatcherEntry {
                 count: 1,
                 last_renewal: now - Duration::from_secs(20),
             },
         );
         watchers.insert(
-            2,
+            test_uuid(2),
             WatcherEntry {
                 count: 1,
                 last_renewal: now,
             },
         );
         let due = due_lease_renewals(&mut watchers, now, Duration::from_secs(15));
-        assert_eq!(due, vec![1]);
+        assert_eq!(due, vec![test_uuid(1)]);
         // 갱신 직후엔 만기가 리셋돼 due가 비어야 한다 (매 tick 재전송 방지)
         assert!(due_lease_renewals(&mut watchers, now, Duration::from_secs(15)).is_empty());
     }

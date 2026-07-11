@@ -179,8 +179,9 @@
           return;
         }
         setStatus('ok', '연결됨');
-        // 재연결이면 서버 접속 상태(시청)가 초기화됐다 — 보던 세션을 다시 watch한다 (P5d).
-        if (viewer.watching != null) {
+        // 재연결이면 서버 접속 상태(시청)가 초기화됐다 — 보던 세션을 다시 watch한다.
+        // 식별자가 영속 UUID라 재시작 뒤에도 같은 세션이 잡힌다 (I1).
+        if (viewer.watching) {
           viewer.screen = null;
           send({ type: 'watch', session: viewer.watching });
         }
@@ -224,6 +225,7 @@
     screen: null,   // { cols, rows, lines: Array<runs>, cursor, alt } — null이면 keyframe 대기
   };
 
+  /// `sessionId`는 영속 UUID 문자열이다 (I1).
   function openViewer(sessionId, title) {
     viewer.watching = sessionId;
     viewer.screen = null;
@@ -232,14 +234,14 @@
     inputBlocked = false;
     setComposerNote('');
     updateComposerEnabled();
-    viewer.label.textContent = title || ('세션 ' + sessionId);
+    viewer.label.textContent = title || '세션';
     viewer.el.hidden = false;
     send({ type: 'watch', session: sessionId });
     viewer.el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
 
   function closeViewer() {
-    if (viewer.watching == null) return;
+    if (!viewer.watching) return;
     viewer.watching = null;
     viewer.screen = null;
     resetScroll();
@@ -285,7 +287,7 @@
       scrollTimer = null;
       const whole = Math.trunc(scrollAcc);
       scrollAcc -= whole;
-      if (whole !== 0 && viewer.watching != null) {
+      if (whole !== 0 && viewer.watching) {
         send({ type: 'scroll', session: viewer.watching, delta: whole });
       }
     }, 60);
@@ -329,7 +331,7 @@
   document.getElementById('viewer-bottom').addEventListener('click', () => {
     const offset = (viewer.screen && viewer.screen.offset) || 0;
     resetScroll();
-    if (offset > 0 && viewer.watching != null) {
+    if (offset > 0 && viewer.watching) {
       send({ type: 'scroll', session: viewer.watching, delta: -offset });
     }
   });
@@ -381,7 +383,7 @@
   }
 
   function sendKey(key) {
-    if (viewer.watching == null) return;
+    if (!viewer.watching) return;
     send({ type: 'key', session: viewer.watching, key });
   }
 
@@ -411,15 +413,15 @@
   }
 
   function updateComposerEnabled() {
-    const disabled = viewer.watching == null || inputBlocked;
+    const disabled = !viewer.watching || inputBlocked;
     composerSend.disabled = disabled;
-    composerText.disabled = viewer.watching == null;
+    composerText.disabled = !viewer.watching;
   }
 
   function sendComposer() {
     // (2) 전송 시점 target 캡처 — 이후 전환돼도 이 세션으로만 간다.
     const target = viewer.watching;
-    if (target == null || inputBlocked) return;
+    if (!target || inputBlocked) return;
     const text = composerText.value;
     if (!text) return;
     // JSON 이스케이프 후 크기로 검사한다 — 제어문자는 \uXXXX로 6배 팽창해 raw 기준
@@ -617,9 +619,8 @@
   // 재배정)이라, 대시보드에 실재하는 id일 때만 자동 시청한다(스테일 알림 방어).
   let pendingWatch = null;
   let pendingWatchDeadline = 0;
-  // 딥링크 대상은 **짧은 기한 안에만** 소비한다. 세션 id는 worker-로컬(재시작마다 1부터)
-  // 이라, 지금 없는 id를 무기한 들고 있으면 나중에 세션 수가 그 값에 도달하는 순간
-  // 무관한 새 세션으로 뷰어가 갑자기 전환된다 (리뷰 P2-3).
+  // 세션 식별자는 **영속 UUID 문자열**이다 (I1) — 재시작해도 같은 세션을 가리킨다.
+  // 그래도 기한을 둔다: 이미 끝난 세션의 알림을 한참 뒤 탭하면 조용히 폐기한다.
   const PENDING_WATCH_TTL_MS = 30_000;
 
   function setPendingWatch(session) {
@@ -627,8 +628,8 @@
     pendingWatchDeadline = Date.now() + PENDING_WATCH_TTL_MS;
   }
   {
-    const watchParam = Number(params.get('watch'));
-    if (Number.isInteger(watchParam) && watchParam > 0) {
+    const watchParam = params.get('watch');
+    if (watchParam) {
       setPendingWatch(watchParam);
       history.replaceState(null, '', location.pathname); // URL 위생
     }
@@ -637,7 +638,7 @@
     // 이미 열린 창에 알림 클릭이 도착한 경우 — SW가 postMessage로 전달한다.
     navigator.serviceWorker.addEventListener('message', (event) => {
       const msg = event.data;
-      if (msg && msg.type === 'watch' && Number.isInteger(msg.session)) {
+      if (msg && msg.type === 'watch' && typeof msg.session === 'string') {
         setPendingWatch(msg.session);
         consumePendingWatch(lastSessions);
       }
@@ -650,7 +651,7 @@
 
   /// 딥링크 대상이 현재 세션 목록에 있으면 시청을 시작한다(1회성).
   function consumePendingWatch(sessions) {
-    if (pendingWatch == null) return false;
+    if (!pendingWatch) return false;
     if (Date.now() > pendingWatchDeadline) {
       pendingWatch = null; // 기한 초과 — 스테일 딥링크는 폐기한다
       return false;
@@ -672,7 +673,7 @@
   function renderWorkspaces(workspaces, resource) {
     lastWorkspaces = workspaces;
     if (resource) lastResource = resource;
-    lastSessions = workspaces.flatMap((ws) => ws.sessions || []).filter((s) => s.id != null);
+    lastSessions = workspaces.flatMap((ws) => ws.sessions || []).filter((s) => s.id);
     // 그룹별로 "세션 없음"을 표시하므로, 전역 안내는 워크스페이스가 하나도 없을 때만.
     sessionsEmpty.hidden = workspaces.length > 0;
     sessionsEl.textContent = '';
@@ -727,7 +728,7 @@
     nameBox.className = 'session-name';
     const title = document.createElement('span');
     title.className = 'title';
-    title.textContent = s.title || (s.id != null ? '세션 ' + s.id : '세션');
+    title.textContent = s.title || '세션';
     nameBox.appendChild(title);
     if (s.agent) {
       const agent = document.createElement('span');
@@ -746,14 +747,14 @@
       li.appendChild(badge);
     }
 
-    if (s.id != null) {
+    if (s.id) {
       const viewBtn = document.createElement('button');
       viewBtn.type = 'button';
       viewBtn.className = 'view-btn';
       viewBtn.textContent = s.id === viewer.watching ? '보는 중' : '보기';
       viewBtn.disabled = s.id === viewer.watching;
       viewBtn.addEventListener('click', () => {
-        openViewer(s.id, s.title || ('세션 ' + s.id));
+        openViewer(s.id, s.title || '세션');
         renderWorkspaces(lastWorkspaces, lastResource); // "보는 중" 배지 갱신
       });
       li.appendChild(viewBtn);

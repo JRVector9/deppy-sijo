@@ -1977,6 +1977,7 @@ mod tests {
             id: pane_id(id),
             session_id: Some(session),
             title: id.to_owned(),
+            persistent_session_id: None,
         }
     }
 

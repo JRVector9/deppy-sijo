@@ -8,6 +8,11 @@
 
 use serde::{Deserialize, Serialize};
 
+/// **세션 식별자는 영속 UUID다** (v3.7 I1): worker-로컬 u64는 워커마다 1부터 재배정되어
+/// 워크스페이스 전환·재시작 시 다른 세션을 가리킬 수 있다(앨리어싱). 폰은 u64를 아예
+/// 모르고, 서버가 UUID를 현재 워커의 u64로 변환한다 — 모르는 UUID면 명령이 만들어지지
+/// 않는다.
+///
 /// 프로토콜 버전 — 클라/서버 합의값. 하위호환이 깨지면 증가시킨다.
 ///
 /// v2 (2026-07-12): Dashboard 프레임이 `sessions[]` → `workspaces[]`로 바뀌었다.
@@ -34,7 +39,7 @@ pub enum ClientMsg {
     },
     /// 세션 시청 시작/전환 (터미널 뷰어 — P5b). 접속당 시청은 1개 — 새 watch가
     /// 이전 시청을 대체한다. 브리지가 refcount를 집계해 runtime lease로 승격한다.
-    Watch { session: u64 },
+    Watch { session: String },
     /// 시청 종료 — 접속은 유지한 채 시청만 끊는다 (WS 절단 시에는 자동 해제).
     Unwatch,
     /// 클라이언트 렌더 상태가 깨졌을 때 전체 화면 재동기화 요청 (P5c — remote.rs
@@ -42,17 +47,17 @@ pub enum ClientMsg {
     RequestKeyframe,
     /// 시청 중 세션에 최소 제어 키 (P5d). 화이트리스트("ctrl_c"/"enter")만 서버가
     /// 바이트로 매핑한다 — 자유 타이핑·IME는 비범위(필요 시 별도 PR).
-    Key { session: u64, key: String },
+    Key { session: String, key: String },
     /// 시청 중 세션의 스크롤백 이동 (스크롤백 열람 — P5 후속). delta 양수 = 과거로.
     /// 스크롤 상태는 세션당 하나(데스크톱과 공유 — tmux 관례, RuntimeCommand::Scroll
     /// 재사용). 서버가 delta를 방어적으로 캡한다.
-    Scroll { session: u64, delta: i32 },
+    Scroll { session: String, delta: i32 },
     /// 시청 중 세션에 자유 텍스트 입력 (P6a — composer). 서버가 C0 제어문자를 걷어내고
     /// (\t 제외 — 제어 시퀀스는 named key로만), \n을 \r로 정규화하며, 여러 줄/대형
     /// 텍스트는 세션의 bracketed paste 모드가 켜져 있으면 wrap한다. submit=true면
     /// 마지막에 Enter(\r)를 덧붙인다(전송), false면 삽입만(첨부 경로 등).
     Input {
-        session: u64,
+        session: String,
         text: String,
         #[serde(default)]
         submit: bool,
@@ -74,7 +79,7 @@ pub struct SessionView {
     /// **표시 전용**: 세션 id는 worker-로컬이라 다른 워크스페이스 id로 시청하면
     /// 엉뚱한 세션이 잡힌다(P5 리뷰 P2에서 확인한 앨리어싱).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<u64>,
+    pub id: Option<String>,
     pub title: String,
     /// 감지된 상태(런타임 이벤트 유래). warm/유휴는 상태 추적이 없어 생략된다.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -161,7 +166,7 @@ pub enum ServerMsg {
     /// 시청 세션 화면 (P5c). keyframe=전체 행, delta=바뀐 행만(빈 lines면 커서만 갱신).
     /// 행 텍스트+스타일 run 인코딩 — 셀 단위 JSON 대비 수십 배 작다 (계획 §4 이식).
     Viewport {
-        session: u64,
+        session: String,
         seq: u64,
         keyframe: bool,
         cols: u16,
@@ -176,7 +181,7 @@ pub enum ServerMsg {
     /// 시청 세션의 PTY 입력 큐 압박 (P6a) — composer 전송 버튼 게이트.
     /// queued=0이면 해소(재활성). reason: "queue_full"/"closed"/"too_large"/"unavailable".
     InputPressure {
-        session: u64,
+        session: String,
         queued: usize,
         reason: &'static str,
     },
@@ -249,7 +254,7 @@ fn encode_line(cells: &[runtime::TerminalCell], row: u16) -> LineView {
 /// (전체 행), 아니면 baseline과 셀이 다른 행만 담은 delta. 행 변화가 없어도 프레임은
 /// 나간다 — 커서 이동만 있는 갱신을 클라이언트가 반영한다.
 pub fn encode_viewport(
-    session: u64,
+    session: &str,
     seq: u64,
     snapshot: &runtime::TerminalViewportSnapshot,
     baseline: Option<&runtime::TerminalViewportSnapshot>,
@@ -279,7 +284,7 @@ pub fn encode_viewport(
         }
     }
     ServerMsg::Viewport {
-        session,
+        session: session.to_owned(),
         seq,
         keyframe,
         cols: snapshot.cols,
@@ -349,46 +354,51 @@ mod tests {
 
     #[test]
     fn watch_unwatch_프레임을_파싱한다() {
-        let msg = ClientMsg::parse(r#"{"type":"watch","session":7}"#).unwrap();
-        assert_eq!(msg, ClientMsg::Watch { session: 7 });
+        let msg = ClientMsg::parse(r#"{"type":"watch","session":"u7"}"#).unwrap();
+        assert_eq!(
+            msg,
+            ClientMsg::Watch {
+                session: "u7".into()
+            }
+        );
         let msg = ClientMsg::parse(r#"{"type":"unwatch"}"#).unwrap();
         assert_eq!(msg, ClientMsg::Unwatch);
         // session 누락 watch는 기형 — 무시
         assert!(ClientMsg::parse(r#"{"type":"watch"}"#).is_none());
         let msg = ClientMsg::parse(r#"{"type":"request_keyframe"}"#).unwrap();
         assert_eq!(msg, ClientMsg::RequestKeyframe);
-        let msg = ClientMsg::parse(r#"{"type":"key","session":7,"key":"ctrl_c"}"#).unwrap();
+        let msg = ClientMsg::parse(r#"{"type":"key","session":"u7","key":"ctrl_c"}"#).unwrap();
         assert_eq!(
             msg,
             ClientMsg::Key {
-                session: 7,
+                session: "u7".into(),
                 key: "ctrl_c".into()
             }
         );
-        let msg = ClientMsg::parse(r#"{"type":"scroll","session":7,"delta":-12}"#).unwrap();
+        let msg = ClientMsg::parse(r#"{"type":"scroll","session":"u7","delta":-12}"#).unwrap();
         assert_eq!(
             msg,
             ClientMsg::Scroll {
-                session: 7,
+                session: "u7".into(),
                 delta: -12
             }
         );
         // Input — submit 생략 시 false (삽입만)
-        let msg = ClientMsg::parse(r#"{"type":"input","session":7,"text":"ls"}"#).unwrap();
+        let msg = ClientMsg::parse(r#"{"type":"input","session":"u7","text":"ls"}"#).unwrap();
         assert_eq!(
             msg,
             ClientMsg::Input {
-                session: 7,
+                session: "u7".into(),
                 text: "ls".into(),
                 submit: false
             }
         );
-        let msg =
-            ClientMsg::parse(r#"{"type":"input","session":7,"text":"ls","submit":true}"#).unwrap();
+        let msg = ClientMsg::parse(r#"{"type":"input","session":"u7","text":"ls","submit":true}"#)
+            .unwrap();
         assert_eq!(
             msg,
             ClientMsg::Input {
-                session: 7,
+                session: "u7".into(),
                 text: "ls".into(),
                 submit: true
             }
@@ -398,7 +408,7 @@ mod tests {
     #[test]
     fn input_pressure_프레임_직렬화() {
         let json = ServerMsg::InputPressure {
-            session: 7,
+            session: "u7".into(),
             queued: 4096,
             reason: "queue_full",
         }
@@ -411,7 +421,7 @@ mod tests {
     fn viewport_프레임은_스크롤백_오프셋을_싣는다() {
         let mut scrolled = snapshot(10, 2, vec![cell(' ', WHITE, BLACK); 20]);
         scrolled.scroll_offset = 42;
-        let json = encode_viewport(7, 1, &scrolled, None).encode();
+        let json = encode_viewport("u7", 1, &scrolled, None).encode();
         assert!(json.contains(r#""offset":42"#), "{json}");
     }
 
@@ -501,7 +511,7 @@ mod tests {
         // keyframe: 전체 행
         let ServerMsg::Viewport {
             keyframe, lines, ..
-        } = encode_viewport(7, 1, &blank, None)
+        } = encode_viewport("u7", 1, &blank, None)
         else {
             panic!("viewport 아님")
         };
@@ -514,7 +524,7 @@ mod tests {
         let changed = snapshot(10, 3, changed_cells);
         let ServerMsg::Viewport {
             keyframe, lines, ..
-        } = encode_viewport(7, 2, &changed, Some(&blank))
+        } = encode_viewport("u7", 2, &changed, Some(&blank))
         else {
             panic!("viewport 아님")
         };
@@ -524,7 +534,7 @@ mod tests {
 
         // 화면 크기 변화 → keyframe 강제
         let resized = snapshot(10, 4, vec![cell(' ', WHITE, BLACK); 40]);
-        let ServerMsg::Viewport { keyframe, .. } = encode_viewport(7, 3, &resized, Some(&blank))
+        let ServerMsg::Viewport { keyframe, .. } = encode_viewport("u7", 3, &resized, Some(&blank))
         else {
             panic!("viewport 아님")
         };
@@ -541,7 +551,7 @@ mod tests {
             lines,
             cursor,
             ..
-        } = encode_viewport(7, 2, &moved, Some(&base))
+        } = encode_viewport("u7", 2, &moved, Some(&base))
         else {
             panic!("viewport 아님")
         };
@@ -574,7 +584,7 @@ mod tests {
         snapshot.visible_cells = vec![cell('x', WHITE, BLACK); 15].into(); // 1.5행분
         let ServerMsg::Viewport {
             keyframe, lines, ..
-        } = encode_viewport(7, 1, &snapshot, None)
+        } = encode_viewport("u7", 1, &snapshot, None)
         else {
             panic!("viewport 아님")
         };
@@ -586,7 +596,7 @@ mod tests {
     fn 프레임_크기_실측_80x24() {
         // 빈 화면 keyframe — 행당 run 1개
         let blank = snapshot(80, 24, vec![cell(' ', WHITE, BLACK); 80 * 24]);
-        let blank_json = encode_viewport(7, 1, &blank, None).encode();
+        let blank_json = encode_viewport("u7", 1, &blank, None).encode();
         assert!(
             blank_json.len() < 8 * 1024,
             "빈 keyframe {}B ≥ 8KB",
@@ -606,7 +616,7 @@ mod tests {
             }
         }
         let busy = snapshot(80, 24, cells);
-        let busy_json = encode_viewport(7, 1, &busy, None).encode();
+        let busy_json = encode_viewport("u7", 1, &busy, None).encode();
         assert!(
             busy_json.len() < 16 * 1024,
             "3-run×24행 keyframe {}B ≥ 16KB (naive 셀 JSON은 ~75KB)",
@@ -617,7 +627,7 @@ mod tests {
         let mut one_row = vec![cell(' ', WHITE, BLACK); 80 * 24];
         one_row[80] = cell('y', WHITE, BLACK);
         let delta_snapshot = snapshot(80, 24, one_row);
-        let delta_json = encode_viewport(7, 2, &delta_snapshot, Some(&blank)).encode();
+        let delta_json = encode_viewport("u7", 2, &delta_snapshot, Some(&blank)).encode();
         assert!(
             delta_json.len() < 1024,
             "1행 delta {}B ≥ 1KB",
@@ -650,7 +660,7 @@ mod tests {
                     name: "deppy-sijo".into(),
                     state: "active",
                     sessions: vec![SessionView {
-                        id: Some(7),
+                        id: Some("u7".into()),
                         title: "claude".into(),
                         status: Some("needs_approval"),
                         agent: Some("Claude · sonnet · high".into()),

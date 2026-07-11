@@ -961,6 +961,9 @@ mod tests {
         server.set_runtime_command_sink(Arc::new(move |command| {
             sink_cap.lock().unwrap().push(command);
         }));
+        // UUID↔u64 매핑 — 실경로에서는 MuxUpdated가 채운다 (I1). 이게 없으면 서버가
+        // UUID를 u64로 변환하지 못해 명령을 만들지 않는다(앨리어싱 차단의 핵심).
+        seed_ids(&server, &[7, 9]);
         let leases = |captured: &Arc<Mutex<Vec<runtime::RuntimeCommand>>>| -> Vec<(u64, bool)> {
             captured
                 .lock()
@@ -999,10 +1002,10 @@ mod tests {
             "welcome 없음"
         );
         // 시청 시작 → 7 on
-        send_text(&mut ws, r#"{"type":"watch","session":7}"#);
+        send_text(&mut ws, r#"{"type":"watch","session":"uuid-7"}"#);
         wait_leases(&[(7, true)]);
         // 전환 → 7 off + 9 on (재바인딩)
-        send_text(&mut ws, r#"{"type":"watch","session":9}"#);
+        send_text(&mut ws, r#"{"type":"watch","session":"uuid-9"}"#);
         wait_leases(&[(7, true), (7, false), (9, true)]);
         // 절단 → 9 off (Drop 경로 정리)
         drop(ws);
@@ -1019,6 +1022,9 @@ mod tests {
         server.set_runtime_command_sink(Arc::new(move |command| {
             sink_cap.lock().unwrap().push(command);
         }));
+        // UUID↔u64 매핑 — 실경로에서는 MuxUpdated가 채운다 (I1). 이게 없으면 서버가
+        // UUID를 u64로 변환하지 못해 명령을 만들지 않는다(앨리어싱 차단의 핵심).
+        seed_ids(&server, &[7, 9]);
 
         let make_snapshot = |first_char: char| {
             let mut cells = vec![
@@ -1061,7 +1067,7 @@ mod tests {
         assert!(read_frame_of_type(&mut ws, "welcome", Duration::from_secs(3)).is_some());
 
         // watch → 브리지에 lease가 등록될 때까지 대기 (이후 inject가 슬롯에 반영된다)
-        send_text(&mut ws, r#"{"type":"watch","session":7}"#);
+        send_text(&mut ws, r#"{"type":"watch","session":"uuid-7"}"#);
         let deadline = Instant::now() + Duration::from_secs(5);
         while captured.lock().unwrap().is_empty() {
             assert!(Instant::now() < deadline, "watch lease가 등록되지 않음");
@@ -1104,18 +1110,33 @@ mod tests {
         server.set_runtime_command_sink(Arc::new(move |command| {
             sink_cap.lock().unwrap().push(command);
         }));
+        // UUID↔u64 매핑 — 실경로에서는 MuxUpdated가 채운다 (I1). 이게 없으면 서버가
+        // UUID를 u64로 변환하지 못해 명령을 만들지 않는다(앨리어싱 차단의 핵심).
+        seed_ids(&server, &[7, 9]);
         let mut ws = ws_client(server.local_addr());
         send_text(
             &mut ws,
             &format!(r#"{{"type":"auth","v":1,"token":"{TEST_TOKEN}"}}"#),
         );
         assert!(read_frame_of_type(&mut ws, "welcome", Duration::from_secs(3)).is_some());
-        send_text(&mut ws, r#"{"type":"watch","session":7}"#);
+        send_text(&mut ws, r#"{"type":"watch","session":"uuid-7"}"#);
         // 비시청 세션 키 + 미지 키 + 유효 키 순서로 보낸다
-        send_text(&mut ws, r#"{"type":"key","session":9,"key":"ctrl_c"}"#);
-        send_text(&mut ws, r#"{"type":"key","session":7,"key":"rm_rf"}"#);
-        send_text(&mut ws, r#"{"type":"key","session":7,"key":"ctrl_c"}"#);
-        send_text(&mut ws, r#"{"type":"key","session":7,"key":"enter"}"#);
+        send_text(
+            &mut ws,
+            r#"{"type":"key","session":"uuid-9","key":"ctrl_c"}"#,
+        );
+        send_text(
+            &mut ws,
+            r#"{"type":"key","session":"uuid-7","key":"rm_rf"}"#,
+        );
+        send_text(
+            &mut ws,
+            r#"{"type":"key","session":"uuid-7","key":"ctrl_c"}"#,
+        );
+        send_text(
+            &mut ws,
+            r#"{"type":"key","session":"uuid-7","key":"enter"}"#,
+        );
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let inputs: Vec<(u64, Vec<u8>)> = captured
@@ -1198,21 +1219,24 @@ mod tests {
         server.set_runtime_command_sink(Arc::new(move |command| {
             sink_cap.lock().unwrap().push(command);
         }));
+        // UUID↔u64 매핑 — 실경로에서는 MuxUpdated가 채운다 (I1). 이게 없으면 서버가
+        // UUID를 u64로 변환하지 못해 명령을 만들지 않는다(앨리어싱 차단의 핵심).
+        seed_ids(&server, &[7, 9]);
         let mut ws = ws_client(server.local_addr());
         send_text(
             &mut ws,
             &format!(r#"{{"type":"auth","v":1,"token":"{TEST_TOKEN}"}}"#),
         );
         assert!(read_frame_of_type(&mut ws, "welcome", Duration::from_secs(3)).is_some());
-        send_text(&mut ws, r#"{"type":"watch","session":7}"#);
+        send_text(&mut ws, r#"{"type":"watch","session":"uuid-7"}"#);
         // 비시청 세션(무시) → 시청 세션 전송(제어문자 포함 — strip 검증)
         send_text(
             &mut ws,
-            r#"{"type":"input","session":9,"text":"evil","submit":true}"#,
+            r#"{"type":"input","session":"uuid-9","text":"evil","submit":true}"#,
         );
         send_text(
             &mut ws,
-            r#"{"type":"input","session":7,"text":"echo\u001b[31m hi","submit":true}"#,
+            r#"{"type":"input","session":"uuid-7","text":"echo\u001b[31m hi","submit":true}"#,
         );
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -1256,19 +1280,22 @@ mod tests {
         server.set_runtime_command_sink(Arc::new(move |command| {
             sink_cap.lock().unwrap().push(command);
         }));
+        // UUID↔u64 매핑 — 실경로에서는 MuxUpdated가 채운다 (I1). 이게 없으면 서버가
+        // UUID를 u64로 변환하지 못해 명령을 만들지 않는다(앨리어싱 차단의 핵심).
+        seed_ids(&server, &[7, 9]);
         let mut ws = ws_client(server.local_addr());
         send_text(
             &mut ws,
             &format!(r#"{{"type":"auth","v":1,"token":"{TEST_TOKEN}"}}"#),
         );
         assert!(read_frame_of_type(&mut ws, "welcome", Duration::from_secs(3)).is_some());
-        send_text(&mut ws, r#"{"type":"watch","session":7}"#);
+        send_text(&mut ws, r#"{"type":"watch","session":"uuid-7"}"#);
         // 비시청 세션(무시) → 정상 delta → 오버사이즈 delta(캡) 순서
-        send_text(&mut ws, r#"{"type":"scroll","session":9,"delta":5}"#);
-        send_text(&mut ws, r#"{"type":"scroll","session":7,"delta":3}"#);
+        send_text(&mut ws, r#"{"type":"scroll","session":"uuid-9","delta":5}"#);
+        send_text(&mut ws, r#"{"type":"scroll","session":"uuid-7","delta":3}"#);
         send_text(
             &mut ws,
-            r#"{"type":"scroll","session":7,"delta":2000000000}"#,
+            r#"{"type":"scroll","session":"uuid-7","delta":2000000000}"#,
         );
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -1369,6 +1396,7 @@ mod tests {
         );
         // 접속 등록 후 세션 상태 이벤트를 주입 → 대시보드 프레임으로 흘러야 한다
         assert!(read_frame_of_type(&mut ws, "welcome", Duration::from_secs(3)).is_some());
+        seed_ids(&server, &[42]); // UUID 매핑(MuxUpdated) — 폰에는 UUID만 노출된다 (I1)
         server
             .dashboard
             .inject_event(runtime::RuntimeEvent::SessionStatusChanged {
@@ -1380,7 +1408,7 @@ mod tests {
         while Instant::now() < deadline {
             if let Some(frame) = read_frame_of_type(&mut ws, "dashboard", Duration::from_secs(1))
                 && frame.contains(r#""status":"needs_approval""#)
-                && frame.contains(r#""id":42"#)
+                && frame.contains(r#""id":"uuid-42""#)
             {
                 seen = true;
                 break;
@@ -1498,6 +1526,7 @@ mod tests {
                             id: runtime::MuxPaneId(id.to_string()),
                             session_id: Some(runtime::SessionId(*id)),
                             title: (*title).to_owned(),
+                            persistent_session_id: Some(format!("uuid-{id}")),
                         })
                         .collect(),
                 }],
@@ -1556,6 +1585,13 @@ mod tests {
         }]
     }
 
+    /// 브리지에 UUID↔u64 매핑을 심는다 — 실경로에서는 MuxUpdated가 채운다 (I1).
+    /// 세션 u64 → "uuid-N".
+    fn seed_ids(server: &WebRemoteServer, sessions: &[u64]) {
+        let panes: Vec<(u64, &str)> = sessions.iter().map(|s| (*s, "p")).collect();
+        server.dashboard.inject_event(mux_event(&panes));
+    }
+
     /// 앱의 재구독 경로(start_web/rebind)와 동일하게 상태 시딩 + 표시 스냅샷을 적용한다.
     /// 매 프레임 경로는 set_workspaces만 부른다 — 상태를 덮지 않는다(리뷰 P1-1).
     fn apply_seed(server: &WebRemoteServer, seeds: Vec<dashboard::WorkspaceSeed>) {
@@ -1563,6 +1599,11 @@ mod tests {
             .iter()
             .find(|ws| ws.state == dashboard::WorkspaceState::Active)
         {
+            // 활성 세션의 UUID 매핑 — 실경로에서는 MuxUpdated가 채운다 (I1).
+            let ids: Vec<u64> = active.sessions.iter().filter_map(|s| s.id).collect();
+            if !ids.is_empty() {
+                seed_ids(server, &ids);
+            }
             server.reseed_active_sessions(&active.sessions);
         }
         server.set_workspaces(seeds);
@@ -1585,7 +1626,7 @@ mod tests {
             }]),
         );
         let mut ws = ws_client_authed(addr);
-        let frame = wait_dashboard_frame(&mut ws, r#""id":7"#).expect("시드 프레임 없음");
+        let frame = wait_dashboard_frame(&mut ws, r#""id":"uuid-7""#).expect("시드 프레임 없음");
         assert!(frame.contains(r#""status":"needs_approval""#), "{frame}");
         assert!(frame.contains(r#""title":"claude""#), "{frame}");
         assert!(frame.contains(r#""state":"active""#), "{frame}");
@@ -1596,7 +1637,7 @@ mod tests {
             .dashboard
             .inject_event(mux_event(&[(7, "workspace.spawn.shell 140")]));
         std::thread::sleep(Duration::from_millis(400));
-        let frame = wait_dashboard_frame(&mut ws, r#""id":7"#).unwrap_or_default();
+        let frame = wait_dashboard_frame(&mut ws, r#""id":"uuid-7""#).unwrap_or_default();
         if !frame.is_empty() {
             assert!(
                 !frame.contains("workspace.spawn.shell"),
@@ -1650,7 +1691,7 @@ mod tests {
         assert!(frame.contains(r#""name":"deppy-sijo""#), "{frame}");
         assert!(frame.contains(r#""name":"source""#), "{frame}");
         // 활성 세션만 id를 싣는다(시청 대상) — warm 세션은 id 없이 이름만
-        assert!(frame.contains(r#""id":7"#), "{frame}");
+        assert!(frame.contains(r#""id":"uuid-7""#), "{frame}");
         assert!(frame.contains(r#""title":"deppy-mux""#), "{frame}");
         drop(ws);
     }
@@ -1672,7 +1713,7 @@ mod tests {
         );
         let mut ws = ws_client_authed(addr);
         assert!(
-            wait_dashboard_frame(&mut ws, r#""id":1"#).is_some(),
+            wait_dashboard_frame(&mut ws, r#""id":"uuid-1""#).is_some(),
             "워크스페이스 A 시드 미반영"
         );
         // 전환: 워크스페이스 B로 재시드(세션 2 = error). 세션 맵 통째 교체라 A의 세션 1은 사라진다
@@ -1687,11 +1728,11 @@ mod tests {
                 exited: false,
             }]),
         );
-        let frame =
-            wait_dashboard_frame(&mut ws, r#""id":2"#).expect("워크스페이스 B 재시드 미반영");
+        let frame = wait_dashboard_frame(&mut ws, r#""id":"uuid-2""#)
+            .expect("워크스페이스 B 재시드 미반영");
         assert!(frame.contains(r#""status":"error""#), "{frame}");
         assert!(
-            !frame.contains(r#""id":1"#),
+            !frame.contains(r#""id":"uuid-1""#),
             "옛 워크스페이스 세션이 남았다: {frame}"
         );
         drop(ws);

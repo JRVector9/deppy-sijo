@@ -137,21 +137,23 @@ pub fn serve(
 /// 접속 하나의 시청 상태 — 전환은 [`WatchBinding::set`]으로만, 해제는 Drop이 보장한다.
 struct WatchBinding<'a> {
     dashboard: &'a DashboardHandle,
-    watched: Option<u64>,
+    /// 시청 중인 **영속 세션 UUID** (I1 — u64는 이 계층에 없다).
+    watched: Option<String>,
 }
 
 impl WatchBinding<'_> {
     /// 시청 대상을 전환한다 (None = 해제). 같은 대상 재지정은 브리지가 no-op 처리한다.
-    fn set(&mut self, to: Option<u64>) {
+    fn set(&mut self, to: Option<String>) {
         let from = std::mem::replace(&mut self.watched, to);
-        self.dashboard.rebind_watch(from, to);
+        self.dashboard
+            .rebind_watch(from.as_deref(), self.watched.as_deref());
     }
 }
 
 impl Drop for WatchBinding<'_> {
     fn drop(&mut self) {
-        if self.watched.is_some() {
-            self.dashboard.rebind_watch(self.watched.take(), None);
+        if let Some(uuid) = self.watched.take() {
+            self.dashboard.rebind_watch(Some(&uuid), None);
         }
     }
 }
@@ -230,11 +232,11 @@ fn stream_loop(
 
         // 시청 화면 push (P5c) — 슬롯이 내 seq보다 새로우면 baseline과 diff해 전송.
         // baseline 없음(첫 프레임/전환/재동기화)이면 keyframe이 나간다.
-        if let Some(session) = watch.watched
-            && let Some((seq, snapshot)) = dashboard.viewport_if_newer(session, viewport_seq)
+        if let Some(session) = watch.watched.clone()
+            && let Some((seq, snapshot)) = dashboard.viewport_if_newer(&session, viewport_seq)
         {
             let frame =
-                crate::protocol::encode_viewport(session, seq, &snapshot, baseline.as_deref());
+                crate::protocol::encode_viewport(&session, seq, &snapshot, baseline.as_deref());
             if ws.send(Message::Text(frame.encode().into())).is_err() {
                 return;
             }
@@ -242,8 +244,8 @@ fn stream_loop(
             baseline = Some(snapshot);
         }
         // 입력 큐 압박 push (P6a) — composer 전송 버튼 게이트 신호.
-        if let Some(session) = watch.watched
-            && let Some((version, json)) = dashboard.input_pressure_if_newer(session, pressure_ver)
+        if let Some(session) = watch.watched.clone()
+            && let Some((version, json)) = dashboard.input_pressure_if_newer(&session, pressure_ver)
         {
             if ws.send(Message::Text(json.into())).is_err() {
                 return;
@@ -298,14 +300,14 @@ fn stream_loop(
                         }
                         // 최소 제어 (P5d) — 이 접속이 시청 중인 세션에만 허용한다.
                         Some(ClientMsg::Key { session, key }) => {
-                            if watch.watched == Some(session) {
-                                dashboard.send_key(session, &key);
+                            if watch.watched.as_deref() == Some(session.as_str()) {
+                                dashboard.send_key(&session, &key);
                             }
                         }
                         // 스크롤백 이동 — 역시 시청 중 세션에만 (스크롤백 열람).
                         Some(ClientMsg::Scroll { session, delta }) => {
-                            if watch.watched == Some(session) {
-                                dashboard.send_scroll(session, delta);
+                            if watch.watched.as_deref() == Some(session.as_str()) {
+                                dashboard.send_scroll(&session, delta);
                             }
                         }
                         // 자유 텍스트 입력 (P6a) — 시청 중 세션에만. 정규화/제어문자
@@ -316,9 +318,9 @@ fn stream_loop(
                             text,
                             submit,
                         }) => {
-                            if watch.watched == Some(session) {
+                            if watch.watched.as_deref() == Some(session.as_str()) {
                                 if text.len() <= MAX_INPUT_TEXT_BYTES {
-                                    dashboard.send_input(session, &text, submit);
+                                    dashboard.send_input(&session, &text, submit);
                                 } else {
                                     tracing::warn!(
                                         len = text.len(),

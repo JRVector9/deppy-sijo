@@ -5863,6 +5863,7 @@ h:1 EE:FF
                             id: runtime::MuxPaneId::new(),
                             session_id: Some(*s),
                             title: "p".into(),
+                            persistent_session_id: None,
                         })
                         .collect(),
                 }],
@@ -5908,6 +5909,7 @@ h:1 EE:FF
                             id: runtime::MuxPaneId::new(),
                             session_id: Some(*s),
                             title: "p".into(),
+                            persistent_session_id: None,
                         })
                         .collect(),
                 }],

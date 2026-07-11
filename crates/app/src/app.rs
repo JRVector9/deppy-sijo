@@ -1169,6 +1169,10 @@ pub struct App {
     ts_detected: Option<crate::tailscale::Detected>,
     /// 이번 감지가 수동 버튼 유래인가 — true면 기존 설정값도 감지값으로 덮어쓴다.
     ts_detect_overwrite: bool,
+    /// serve 진단/설정 1회성 스레드의 결과 수신 (진행 중일 때만 Some) — O1.
+    serve_rx: Option<std::sync::mpsc::Receiver<crate::tailscale::ServeState>>,
+    /// 마지막 serve 진단 결과. None = 이 세션에서 아직 진단 안 함.
+    serve_state: Option<crate::tailscale::ServeState>,
     /// known_hosts 표시 캐시 (settings 열 때 lazily 로드, 닫으면 None으로 리셋해 재로드).
     known_hosts_cache: Option<Vec<(String, String)>>,
     /// 폴더 트리 사이드바 (file-tree-design §6). OFF면 None — Panel 미생성 + 상태 drop(리소스 0).
@@ -1344,6 +1348,8 @@ impl App {
             ts_detect_rx: None,
             ts_detected: None,
             ts_detect_overwrite: false,
+            serve_rx: None,
+            serve_state: None,
             known_hosts_cache: None,
             file_tree: None,
         };
@@ -2168,6 +2174,8 @@ impl App {
             Ok(state) => {
                 self.web = Some(state);
                 self.web_error = None;
+                // 포트가 바뀌었을 수 있다 — serve 진단을 무효화해 다음 프레임에 재진단한다.
+                self.serve_state = None;
                 self.config.web.enabled = true;
                 if let Err(e) = self.config.save(&self.config_path) {
                     tracing::warn!("config 저장 실패: {e:#}");
@@ -2189,6 +2197,7 @@ impl App {
             state.server.shutdown();
         }
         self.web_error = None;
+        self.serve_state = None; // 서버가 없으면 진단은 의미 없다
         self.config.web.enabled = false;
         if let Err(e) = self.config.save(&self.config_path) {
             tracing::warn!("config 저장 실패: {e:#}");
@@ -4174,6 +4183,27 @@ impl eframe::App for App {
         {
             self.ts_detect_rx = Some(crate::tailscale::spawn_detect(ui.ctx().clone()));
         }
+        // serve 온보딩(O1): 결과 수령 → 상태 반영. 모바일 웹 설정 페이지를 열었고 서버가
+        // 켜져 있으면 1회 자동 진단한다(상주 폴링 없음 — 스레드가 완료 시 repaint).
+        if let Some(rx) = &self.serve_rx {
+            match rx.try_recv() {
+                Ok(state) => {
+                    self.serve_state = Some(state);
+                    self.serve_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.serve_state = Some(crate::tailscale::ServeState::Unknown);
+                    self.serve_rx = None;
+                }
+            }
+        } else if self.settings_open
+            && self.settings_category == ui::settings::Category::MobileWeb
+            && self.serve_state.is_none()
+            && let Some(port) = self.web.as_ref().map(|w| w.server.local_addr().port())
+        {
+            self.serve_rx = Some(crate::tailscale::spawn_serve_check(ui.ctx().clone(), port));
+        }
         // 모바일 웹(PWA) 뷰모델 — remote_view와 동일 규칙 (v3.3 P1).
         let web_view = {
             let (running, addr, url) = match &self.web {
@@ -4194,6 +4224,28 @@ impl eframe::App for App {
                 addr,
                 url,
                 error: self.web_error.as_deref(),
+                serve: if self.serve_rx.is_some() {
+                    ui::settings::ServeView::Running
+                } else {
+                    match &self.serve_state {
+                        None => ui::settings::ServeView::Idle,
+                        Some(crate::tailscale::ServeState::Ready) => ui::settings::ServeView::Ready,
+                        Some(crate::tailscale::ServeState::WrongPort(p)) => {
+                            ui::settings::ServeView::WrongPort(*p)
+                        }
+                        Some(crate::tailscale::ServeState::NotConfigured) => {
+                            ui::settings::ServeView::NotConfigured
+                        }
+                        Some(crate::tailscale::ServeState::NotEnabledOnTailnet { approve_url }) => {
+                            ui::settings::ServeView::NotEnabled {
+                                approve_url: approve_url.as_deref(),
+                            }
+                        }
+                        Some(crate::tailscale::ServeState::Unknown) => {
+                            ui::settings::ServeView::Unknown
+                        }
+                    }
+                },
                 ts_detect: if self.ts_detect_rx.is_some() {
                     ui::settings::TsDetectView::Running
                 } else {
@@ -4798,6 +4850,29 @@ impl eframe::App for App {
                     self.ts_detect_overwrite = true;
                     self.ts_detect_rx = Some(crate::tailscale::spawn_detect(ui.ctx().clone()));
                 }
+            }
+            // serve 온보딩 (O1) — CLI 실행은 이 버튼 경로에서만(자동 실행 금지).
+            ui::settings::WebRemoteAction::CheckServe => {
+                if self.serve_rx.is_none()
+                    && let Some(port) = self.web.as_ref().map(|w| w.server.local_addr().port())
+                {
+                    self.serve_rx =
+                        Some(crate::tailscale::spawn_serve_check(ui.ctx().clone(), port));
+                }
+            }
+            ui::settings::WebRemoteAction::ConfigureServe => {
+                if self.serve_rx.is_none()
+                    && let Some(port) = self.web.as_ref().map(|w| w.server.local_addr().port())
+                {
+                    self.serve_rx = Some(crate::tailscale::spawn_serve_configure(
+                        ui.ctx().clone(),
+                        port,
+                    ));
+                }
+            }
+            ui::settings::WebRemoteAction::OpenApproveUrl(url) => {
+                // tailnet 관리 콘솔 승인 — 앱이 대신할 수 없는 유일한 단계.
+                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
             ui::settings::WebRemoteAction::None => {}
         }

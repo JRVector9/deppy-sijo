@@ -89,6 +89,12 @@ pub enum WebRemoteAction {
     RotateToken,
     /// ts.net 호스트명 자동 감지 요청 (tailscale status --json — App이 1회성 스레드로 실행).
     DetectHostname,
+    /// serve 상태 재진단 요청 (O1 — tailscale serve status --json).
+    CheckServe,
+    /// `tailscale serve --bg <port>` 실행 요청 (O1 — 사용자 클릭에서만).
+    ConfigureServe,
+    /// tailnet Serve 승인 페이지를 브라우저로 연다 (O1 — CLI가 준 URL).
+    OpenApproveUrl(String),
 }
 
 /// ts.net 호스트명 자동 감지 표시 상태 (App이 감지 스레드 결과를 매핑해 넘긴다).
@@ -118,6 +124,28 @@ pub struct WebRemoteView<'a> {
     pub error: Option<&'a str>,
     /// ts.net 호스트명 자동 감지 상태.
     pub ts_detect: TsDetectView<'a>,
+    /// serve 온보딩 상태 (O1).
+    pub serve: ServeView<'a>,
+}
+
+/// serve 온보딩 표시 상태 (O1). 폰 접속의 마지막 관문 — 앱 웹서버는 127.0.0.1에만
+/// bind하므로 `tailscale serve`가 HTTPS를 종단해 프록시해야 폰이 붙는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServeView<'a> {
+    /// 아직 진단 안 함(웹서버 꺼짐 등) — 표시 없음.
+    Idle,
+    /// 진단/설정 스레드 진행 중.
+    Running,
+    /// 이 포트로 프록시가 걸려 있다 — 폰 접속 준비 완료.
+    Ready,
+    /// serve가 다른 포트를 가리킨다 — 재설정 필요.
+    WrongPort(u16),
+    /// serve 미설정 — 설정 버튼.
+    NotConfigured,
+    /// tailnet에서 Serve 기능 미활성 — 관리 콘솔 1회 승인 필요.
+    NotEnabled { approve_url: Option<&'a str> },
+    /// CLI 없음/진단 불가 — 문서 안내로 폴백.
+    Unknown,
 }
 
 /// 접속 URL QR 텍스처 캐시 — (원본 URL, 텍스처). URL이 바뀔 때만 재생성한다.
@@ -2073,16 +2101,10 @@ fn mobile_web_page(
             row(ui, &catalog.t("settings.address", &[]), None, |ui| {
                 detail_text(ui, addr.as_str(), true);
             });
-            // serve 모드 가이드 — 실제 bind 포트로 tailscale serve 명령을 안내한다.
-            if let Some((_, port)) = addr.rsplit_once(':') {
-                ui.add_space(7.0);
-                hint_text(
-                    ui,
-                    catalog.t("settings.mobile_web.serve_guide", &[("port", port)]),
-                );
-                ui.add_space(7.0);
-                settings_hairline(ui);
-            }
+            // serve 온보딩 (O1) — 앱은 127.0.0.1에만 bind하므로 tailscale serve가 HTTPS를
+            // 종단해야 폰이 붙는다. 상태별로 **다음 한 걸음만** 보여준다.
+            let port = addr.rsplit_once(':').map(|(_, p)| p).unwrap_or("");
+            serve_row(ui, web, port, web_action, catalog);
         }
         if let Some(url) = &web.url {
             // 접속 URL — 페어링 토큰이 실리므로 기본 마스킹. 복사는 항상 전체 URL.
@@ -2132,6 +2154,100 @@ fn mobile_web_page(
     ui.add_space(14.0);
     // cert 모드(자체 TLS + 비-loopback bind)는 후속 — config 키만 예약돼 있다.
     hint_text(ui, catalog.t("settings.mobile_web.cert_note", &[]));
+}
+
+/// serve 온보딩 행 (O1) — 진단 상태 + 다음 한 걸음 버튼.
+fn serve_row(
+    ui: &mut egui::Ui,
+    web: &WebRemoteView,
+    port: &str,
+    web_action: &mut WebRemoteAction,
+    catalog: &i18n::Catalog,
+) {
+    ui.add_space(7.0);
+    let running = web.serve == ServeView::Running;
+    match &web.serve {
+        // 진단 전/불가 — 기존 문서 안내(수동 명령)로 폴백한다. 하드 실패 금지.
+        ServeView::Idle | ServeView::Unknown => {
+            hint_text(
+                ui,
+                catalog.t("settings.mobile_web.serve_guide", &[("port", port)]),
+            );
+        }
+        ServeView::Running => {
+            hint_text(ui, catalog.t("settings.mobile_web.serve_checking", &[]));
+        }
+        ServeView::Ready => {
+            ui.colored_label(
+                egui::Color32::from_rgb(0x58, 0xb3, 0x68),
+                egui::RichText::new(catalog.t("settings.mobile_web.serve_ready", &[]))
+                    .size(SETTINGS_TYPE.row_description),
+            );
+        }
+        ServeView::NotConfigured | ServeView::WrongPort(_) => {
+            let message = match &web.serve {
+                ServeView::WrongPort(other) => catalog.t(
+                    "settings.mobile_web.serve_wrong_port",
+                    &[("other", &other.to_string()), ("port", port)],
+                ),
+                _ => catalog.t("settings.mobile_web.serve_missing", &[]),
+            };
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                egui::RichText::new(message).size(SETTINGS_TYPE.row_description),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !running,
+                        egui::Button::new(catalog.t("settings.mobile_web.serve_setup", &[])),
+                    )
+                    .clicked()
+                {
+                    *web_action = WebRemoteAction::ConfigureServe;
+                }
+                if ui
+                    .add_enabled(
+                        !running,
+                        egui::Button::new(catalog.t("settings.mobile_web.serve_recheck", &[])),
+                    )
+                    .clicked()
+                {
+                    *web_action = WebRemoteAction::CheckServe;
+                }
+            });
+        }
+        // tailnet 관리 콘솔에서 1회 승인이 필요하다 — 앱이 대신할 수 없는 유일한 단계.
+        ServeView::NotEnabled { approve_url } => {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                egui::RichText::new(catalog.t("settings.mobile_web.serve_not_enabled", &[]))
+                    .size(SETTINGS_TYPE.row_description),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if let Some(url) = approve_url
+                    && ui
+                        .button(catalog.t("settings.mobile_web.serve_approve", &[]))
+                        .clicked()
+                {
+                    *web_action = WebRemoteAction::OpenApproveUrl((*url).to_owned());
+                }
+                if ui
+                    .add_enabled(
+                        !running,
+                        egui::Button::new(catalog.t("settings.mobile_web.serve_recheck", &[])),
+                    )
+                    .clicked()
+                {
+                    *web_action = WebRemoteAction::CheckServe;
+                }
+            });
+        }
+    }
+    ui.add_space(7.0);
+    settings_hairline(ui);
 }
 
 /// 접속 URL의 token 값 부분을 마스킹한다 (표시 전용 — 복사/QR는 전체를 쓴다).

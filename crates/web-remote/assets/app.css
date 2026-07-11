@@ -168,6 +168,11 @@ h1 { font-size: 19px; font-weight: 600; color: #f0f0f0; }
   background: #2c4a63; color: #cfe4f5; border: 1px solid #3d6183;
 }
 .composer button:disabled { opacity: 0.45; cursor: default; }
+/* 첨부 버튼 (P6d) — 터치 타깃 44px, 전송 버튼과 구분되는 보조 톤 */
+.composer .composer-attach {
+  min-width: 44px; padding: 0 12px; font-size: 18px;
+  background: #2f2f2f; color: #d8d8d8; border: 1px solid #474747;
+}
 .composer-note { margin-top: 6px; font-size: 12px; color: #e6b95a; }
 
 /* P3 설치 셸: iOS 설치 안내 배너 / 알림 권한 버튼 / 오프라인 재시도 */

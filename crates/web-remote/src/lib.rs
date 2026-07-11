@@ -33,6 +33,7 @@ pub mod pairing;
 pub mod protocol;
 pub mod push;
 pub mod static_srv;
+pub mod upload;
 pub mod ws_api;
 
 /// 정적 요청(비-WS) 동시 처리 상한. 초과 접속은 503으로 거부하지 않고 슬롯이 빌 때까지
@@ -61,6 +62,9 @@ pub struct ServeOptions {
     /// 웹푸시(P4) VAPID 키. app이 keyring에서 get_or_create해 주입한다(SecretStore 접근이 app
     /// 소유). None이거나 `db_path`가 None이면 푸시 비활성(대시보드만 동작).
     pub vapid: Option<push::VapidKey>,
+    /// 모바일 파일 첨부(P6d) 저장 디렉터리. app이 `logs_base/uploads`를 주입한다. None이면
+    /// `POST /upload`가 404(업로드 비활성) — 테스트/미배선 시 안전한 기본값.
+    pub uploads_dir: Option<std::path::PathBuf>,
 }
 
 /// 접속 스레드들이 공유하는 불변 컨텍스트.
@@ -72,6 +76,8 @@ struct ConnCtx {
     dashboard: dashboard::DashboardHandle,
     /// 웹푸시 핸들(P4) — POST /push/subscribe 등록·공개키 노출. 비활성 시 None.
     push: Option<push::PushHandle>,
+    /// 모바일 파일 첨부(P6d) 저장 디렉터리. None이면 POST /upload가 404.
+    uploads_dir: Option<std::path::PathBuf>,
     /// shutdown 신호 — 장수 WS 접속이 tick마다 확인해 즉시 종료한다.
     stop: Arc<AtomicBool>,
 }
@@ -158,6 +164,7 @@ impl WebRemoteServer {
                 .filter(|host| !host.is_empty()),
             dashboard: dashboard.clone(),
             push: push_handle,
+            uploads_dir: options.uploads_dir,
             stop: Arc::clone(&stop),
         });
         let accept_thread =
@@ -426,10 +433,18 @@ fn handle_connection(stream: TcpStream, ctx: &ConnCtx, connections: &Arc<ConnSet
         }
     };
     // POST 본문은 into_inner(버퍼 폐기) 전에 읽는다 — BufReader에 선입된 본문 바이트를 보존.
-    // 본문을 받는 유일한 경로는 웹푸시 구독 등록(P4 — POST /push/subscribe)이다.
+    // 본문을 받는 경로는 웹푸시 구독 등록(P4 — POST /push/subscribe, 작은 JSON)과 모바일 파일
+    // 첨부(P6d — POST /upload, 최대 10MB)다. 경로별로 상한이 달라 여기서 먼저 정한다 —
+    // Content-Length 선검사가 상한을 넘는 요청을 본문을 읽기 전에 413으로 끊어 메모리
+    // 점유를 유계로 만든다(대용량 업로드도 예외 없이 이 계약을 따른다).
+    let max_body = if head.path == "/upload" {
+        upload::MAX_UPLOAD_BYTES
+    } else {
+        http::MAX_BODY_BYTES
+    };
     let body: Vec<u8> = if head.method == "POST" {
         match head.content_length() {
-            Some(len) if len > http::MAX_BODY_BYTES => {
+            Some(len) if len > max_body => {
                 respond(
                     reader.into_inner().inner,
                     &http::Response::plain(413, "request body too large"),
@@ -507,6 +522,12 @@ fn handle_connection(stream: TcpStream, ctx: &ConnCtx, connections: &Arc<ConnSet
     // 웹푸시(P4) 엔드포인트 — GET /push/vapid(공개키), POST /push/subscribe(등록). 둘 다
     // 토큰 게이트. `/push/*`가 아니면 None을 돌려 정적 라우팅으로 흘려보낸다.
     if let Some(response) = push::route(&head, &body, &ctx.token, ctx.push.as_ref()) {
+        respond(stream, &response, &peer, &head.path);
+        return false;
+    }
+    // 모바일 파일 첨부(P6d) — POST /upload. 토큰 게이트 + Content-Type 화이트리스트는
+    // upload::route 안에서 처리한다. uploads_dir 미배선(테스트/미설정)이면 404.
+    if let Some(response) = upload::route(&head, &body, &ctx.token, ctx.uploads_dir.as_deref()) {
         respond(stream, &response, &peer, &head.path);
         return false;
     }
@@ -610,6 +631,22 @@ mod tests {
                 allowed_host: allowed_host.map(str::to_owned),
                 db_path,
                 vapid: None,
+                uploads_dir: None,
+            },
+        )
+        .unwrap()
+    }
+
+    /// 업로드(P6d) 활성 서버 — uploads_dir을 지정해 띄운다.
+    fn start_with_uploads(dir: PathBuf) -> WebRemoteServer {
+        WebRemoteServer::serve(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            ServeOptions {
+                token: TEST_TOKEN.to_owned(),
+                allowed_host: None,
+                db_path: None,
+                vapid: None,
+                uploads_dir: Some(dir),
             },
         )
         .unwrap()
@@ -737,6 +774,7 @@ mod tests {
                 allowed_host: None,
                 db_path: None,
                 vapid: None,
+                uploads_dir: None,
             },
         );
         // WebRemoteServer는 Debug 미구현(스레드 핸들) — unwrap_err 대신 match로 확인
@@ -1826,6 +1864,7 @@ mod tests {
                 allowed_host: None,
                 db_path: Some(db_path),
                 vapid: Some(push::VapidKey::generate()),
+                uploads_dir: None,
             },
         )
         .unwrap()
@@ -1897,5 +1936,133 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 404"), "{resp}");
         server.shutdown();
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    // ── P6d: 모바일 파일 첨부 HTTP 통합(서버 소켓 경유) ─────────────────────
+    fn temp_uploads_dir() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "web-remote-uploads-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    /// 본문이 있는 POST 요청을 보낸다(Content-Type 지정).
+    fn post_upload(addr: SocketAddr, token: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut head = format!(
+            "POST /upload?token={token} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        head.extend_from_slice(body);
+        stream.write_all(&head).unwrap();
+        let mut out = Vec::new();
+        let _ = stream.read_to_end(&mut out);
+        out
+    }
+
+    #[test]
+    fn 업로드는_토큰_없으면_401() {
+        let dir = temp_uploads_dir();
+        let server = start_with_uploads(dir.clone());
+        let addr = server.local_addr();
+        let resp = post_upload(addr, "wrong", "image/png", b"fake-png");
+        assert!(
+            String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 401"),
+            "{}",
+            String::from_utf8_lossy(&resp)
+        );
+        server.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 업로드는_uploads_dir_미배선이면_404() {
+        // start_with_db(uploads_dir 없음)는 업로드 비활성 — 토큰이 맞아도 404.
+        let server = start_with_db(None, None);
+        let addr = server.local_addr();
+        let resp = post_upload(addr, TEST_TOKEN, "image/png", b"fake-png");
+        assert!(
+            String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 404"),
+            "{}",
+            String::from_utf8_lossy(&resp)
+        );
+        server.shutdown();
+    }
+
+    #[test]
+    fn 업로드는_화이트리스트_밖_타입은_415() {
+        let dir = temp_uploads_dir();
+        let server = start_with_uploads(dir.clone());
+        let addr = server.local_addr();
+        let resp = post_upload(addr, TEST_TOKEN, "application/x-sh", b"#!/bin/sh\necho hi");
+        assert!(
+            String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 415"),
+            "{}",
+            String::from_utf8_lossy(&resp)
+        );
+        // 디렉터리에 아무 파일도 생기지 않는다(거부된 업로드는 저장하지 않는다).
+        assert!(
+            std::fs::read_dir(&dir)
+                .map(|mut it| it.next().is_none())
+                .unwrap_or(true)
+        );
+        server.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 업로드는_본문_상한_초과시_413() {
+        let dir = temp_uploads_dir();
+        let server = start_with_uploads(dir.clone());
+        let addr = server.local_addr();
+        // 본문 없이 과대 Content-Length만 선언해도 상한(10MB)에서 413(본문 읽기 전 거부).
+        let req = format!(
+            "POST /upload?token={TEST_TOKEN} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: image/png\r\nContent-Length: {}\r\n\r\n",
+            upload::MAX_UPLOAD_BYTES + 1
+        );
+        let resp = request(addr, &req);
+        assert!(resp.starts_with("HTTP/1.1 413"), "{resp}");
+        server.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 업로드_성공은_201과_파일_존재를_보장한다() {
+        let dir = temp_uploads_dir();
+        let server = start_with_uploads(dir.clone());
+        let addr = server.local_addr();
+        let body = b"fake-png-bytes";
+        let resp = post_upload(addr, TEST_TOKEN, "image/png", body);
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 201"), "{text}");
+        // 헤더/본문 분리 후 JSON에서 path를 뽑는다.
+        let json_start = text.find("\r\n\r\n").expect("본문 없음") + 4;
+        let json: serde_json::Value = serde_json::from_str(&text[json_start..]).unwrap();
+        let path = json["path"].as_str().expect("path 필드 없음");
+        // 서버 생성 경로 — uploads_dir 아래 uuid.png, 절대경로, 파일이 실재하고 내용 일치.
+        assert!(std::path::Path::new(path).is_absolute(), "{path}");
+        assert!(path.ends_with(".png"), "{path}");
+        assert_eq!(std::fs::read(path).unwrap(), body);
+        server.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 업로드는_빈_본문을_거부한다() {
+        let dir = temp_uploads_dir();
+        let server = start_with_uploads(dir.clone());
+        let addr = server.local_addr();
+        let resp = post_upload(addr, TEST_TOKEN, "image/png", b"");
+        assert!(
+            String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 400"),
+            "{}",
+            String::from_utf8_lossy(&resp)
+        );
+        server.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

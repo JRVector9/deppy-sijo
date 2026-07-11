@@ -9,8 +9,9 @@ use std::io::{BufRead, Write};
 pub const MAX_HEAD_BYTES: usize = 8 * 1024;
 /// 헤더 개수 상한.
 pub const MAX_HEADERS: usize = 64;
-/// POST 본문 상한 — 웹푸시 구독 JSON(P4)만 받는 유일한 본문이라 작게 유계로 둔다.
-/// (endpoint URL + p256dh/auth base64url ≈ 수백 바이트.) 초과는 413.
+/// 기본 POST 본문 상한 — 웹푸시 구독 JSON(P4) 등 작은 JSON 본문용. (endpoint URL +
+/// p256dh/auth base64url ≈ 수백 바이트.) 초과는 413. `/upload`(P6d)만 `upload::MAX_UPLOAD_BYTES`로
+/// 별도 상한을 쓴다(lib.rs handle_connection이 경로별로 분기).
 pub const MAX_BODY_BYTES: usize = 4 * 1024;
 
 /// 파싱된 요청 head. `query`에는 페어링 토큰이 실릴 수 있다 — **로그 금지**.
@@ -156,6 +157,8 @@ fn reason(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
         431 => "Request Header Fields Too Large",
         501 => "Not Implemented",
         _ => "Error",

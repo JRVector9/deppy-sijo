@@ -1109,6 +1109,56 @@ mod tests {
         server.shutdown();
     }
 
+    /// 스크롤백 열람: scroll은 시청 중 세션에만 Scroll 커맨드로 전달되고,
+    /// 비정상 delta는 캡된다.
+    #[test]
+    fn ws_scroll은_시청_중_세션에만_전달되고_캡된다() {
+        let server = start(None);
+        let captured: Arc<Mutex<Vec<runtime::RuntimeCommand>>> = Arc::default();
+        let sink_cap = Arc::clone(&captured);
+        server.set_runtime_command_sink(Arc::new(move |command| {
+            sink_cap.lock().unwrap().push(command);
+        }));
+        let mut ws = ws_client(server.local_addr());
+        send_text(
+            &mut ws,
+            &format!(r#"{{"type":"auth","v":1,"token":"{TEST_TOKEN}"}}"#),
+        );
+        assert!(read_frame_of_type(&mut ws, "welcome", Duration::from_secs(3)).is_some());
+        send_text(&mut ws, r#"{"type":"watch","session":7}"#);
+        // 비시청 세션(무시) → 정상 delta → 오버사이즈 delta(캡) 순서
+        send_text(&mut ws, r#"{"type":"scroll","session":9,"delta":5}"#);
+        send_text(&mut ws, r#"{"type":"scroll","session":7,"delta":3}"#);
+        send_text(
+            &mut ws,
+            r#"{"type":"scroll","session":7,"delta":2000000000}"#,
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let scrolls: Vec<(u64, i32)> = captured
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|command| match command {
+                    runtime::RuntimeCommand::Scroll { session, delta } => Some((session.0, *delta)),
+                    _ => None,
+                })
+                .collect();
+            if scrolls.len() >= 2 {
+                assert_eq!(
+                    scrolls,
+                    vec![(7, 3), (7, 100_000)],
+                    "비시청 스크롤이 통과했거나 캡이 틀림"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "Scroll 커맨드가 도착하지 않음");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(ws);
+        server.shutdown();
+    }
+
     #[test]
     fn ws_인증_전_비auth_첫프레임은_거부() {
         let server = start(None);

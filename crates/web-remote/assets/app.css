@@ -97,7 +97,17 @@ h1 { font-size: 19px; font-weight: 600; color: #f0f0f0; }
 
 /* 터미널 뷰어 (P5d) — 읽기 전용 canvas + 최소 제어 */
 .viewer-wrap { background: #000; border-radius: 8px; overflow: hidden; }
-.viewer-wrap canvas { display: block; width: 100%; }
+.viewer-wrap canvas { display: block; width: 100%; touch-action: none; }
+.viewer-scroll-note {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  margin-top: 8px; padding: 6px 10px;
+  background: #23303f; border: 1px solid #34506a; border-radius: 8px;
+  font-size: 12px; color: #cfe0ef;
+}
+.viewer-scroll-note button {
+  font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 7px;
+  background: #2c3e50; color: #a8c8e8; border: 1px solid #3a5068; cursor: pointer;
+}
 .viewer-actions { display: flex; gap: 10px; margin-top: 12px; }
 .viewer-actions button {
   font-size: 13px; font-weight: 600; padding: 9px 14px; border-radius: 8px;

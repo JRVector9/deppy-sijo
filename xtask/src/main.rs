@@ -550,13 +550,21 @@ fn check_boundary() -> anyhow::Result<()> {
     for path in rust_files_under(&root.join("crates/app/src/ui"))? {
         let rel = rel_path(&root, &path)?;
         let content = std::fs::read_to_string(&path).with_context(|| format!("{rel} 읽기 실패"))?;
+        // 이 가드는 **프로덕션** leaf UI 경계만 governs한다. 유닛 테스트는 관례상
+        // 파일 끝의 `#[cfg(test)]` 모듈에 모여 있고, 테스트 셋업은 DB/secret store/
+        // manager를 직접 구성하는 것이 정상이므로 스캔에서 제외한다.
+        // **마지막** 컬럼0 `#[cfg(test)]`부터를 test 영역으로 본다 — 첫 발생에서 끊으면
+        // 중간에 `#[cfg(test)]` 헬퍼가 흩어진 파일(file_tree.rs: 2124/3015/3098/3230/
+        // 3259)에서 그 뒤 프로덕션 코드가 통째로 스캔에서 빠진다 (H5 리뷰 P2 — 탐지
+        // 통제 커버리지 구멍). 중간 헬퍼는 스캔되지만 test 코드라 경계 위반이 없다.
+        let test_region_start = content
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| *line == "#[cfg(test)]")
+            .map(|(idx, _)| idx)
+            .last();
         for (line_idx, line) in content.lines().enumerate() {
-            // 이 가드는 **프로덕션** leaf UI 경계만 governs한다. 유닛 테스트는 관례상
-            // 파일 끝의 `#[cfg(test)]` 모듈(들)에 모여 있고, 테스트 셋업은 DB/secret
-            // store/manager를 직접 구성하는 것이 정상이므로 스캔에서 제외한다. 컬럼0
-            // 매치만 본다 — 함수 내부의 들여쓰인 인라인 `#[cfg(test)]`(file_tree.rs 등)에
-            // 걸려 프로덕션 코드를 건너뛰지 않도록.
-            if line == "#[cfg(test)]" {
+            if test_region_start.is_some_and(|start| line_idx >= start) {
                 break;
             }
             for (rule_idx, rule) in BOUNDARY_RULES.iter().enumerate() {

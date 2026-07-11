@@ -13,8 +13,13 @@
   if (view === 'pairing') {
     const saved = localStorage.getItem(TOKEN_KEY);
     if (!urlToken && saved) {
-      // 재방문(URL에 토큰 없음) — 저장된 페어링으로 자동 복구
-      location.replace('/?token=' + encodeURIComponent(saved));
+      // 재방문(URL에 토큰 없음) — 저장된 페어링으로 자동 복구.
+      // **기존 쿼리를 보존한다**: 알림 딥링크(/?watch=N)로 콜드 스타트하면 토큰이 없어
+      // 이 페이지가 뜨는데, 토큰만 붙여 리다이렉트하면 watch가 유실돼 자동 시청이
+      // 통째로 불능이었다 (리뷰 P1-1 — P6c의 주 시나리오).
+      const next = new URLSearchParams(location.search);
+      next.set('token', saved);
+      location.replace('/?' + next.toString());
     } else if (urlToken) {
       // 토큰을 제시했는데도 401 — 재발급 등으로 무효. 저장분을 폐기해 리다이렉트 루프를 막는다.
       localStorage.removeItem(TOKEN_KEY);
@@ -192,11 +197,9 @@
         handleViewport(msg);
         break;
       case 'input_pressure':
-        // PTY 입력 큐 압박 — 해소(queued=0)까지 전송 차단 (P6b).
+        // PTY 입력 큐 압박/거부 — 사유별로 다르게 다룬다 (리뷰 P2-2, P3-1).
         if (msg.session !== viewer.watching) break;
-        inputBlocked = (msg.queued || 0) > 0 || msg.reason === 'too_large';
-        setComposerNote(inputBlocked ? '입력 대기열이 찼습니다 — 잠시 후 다시 시도하세요' : '');
-        updateComposerEnabled();
+        handleInputPressure(msg);
         break;
       case 'error':
         setStatus('bad', '오류: ' + (msg.message || ''));
@@ -392,6 +395,8 @@
   const composerSend = document.getElementById('composer-send');
   const composerNote = document.getElementById('composer-note');
   let inputBlocked = false;
+  /// 마지막으로 보낸 입력 — PTY가 거부(backpressure/종료)하면 draft로 되돌린다.
+  let lastSent = null;
 
   function autoGrow() {
     composerText.style.height = 'auto';
@@ -417,7 +422,9 @@
     if (target == null || inputBlocked) return;
     const text = composerText.value;
     if (!text) return;
-    if (new Blob([text]).size > MAX_INPUT_BYTES) {
+    // JSON 이스케이프 후 크기로 검사한다 — 제어문자는 \uXXXX로 6배 팽창해 raw 기준
+    // 검사를 통과해도 서버 프레임 상한에 걸려 조용히 버려질 수 있다 (리뷰 P3-2).
+    if (JSON.stringify(text).length > MAX_INPUT_BYTES) {
       setComposerNote('입력이 너무 큽니다 (256KB 초과)');
       return;
     }
@@ -426,14 +433,62 @@
       setComposerNote('연결이 끊겼습니다 — 재연결 후 다시 전송하세요');
       return;
     }
+    // WS 전송 성공 ≠ PTY 수용. 큐가 차 있으면(backpressure) 서버가 입력을 버리고
+    // InputPressure만 보낸다 — 그때 draft를 복원할 수 있게 마지막 본문을 보관한다
+    // (계획 §0.2-3 "전송 실패 시 draft 보존", 리뷰 P2-2).
+    lastSent = { session: target, text, at: Date.now() };
     setComposerNote('');
     composerText.value = '';
     autoGrow();
   }
 
+  /// 큐 거부로 유실된 입력을 composer로 되돌린다(사용자가 재타이핑하지 않게).
+  function restoreDraft(note) {
+    if (!lastSent || lastSent.session !== viewer.watching) return false;
+    // 전송 직후(2s)에 온 거부만 그 입력의 것으로 본다 — 오래된 것은 이미 반영됐다.
+    if (Date.now() - lastSent.at > 2000) return false;
+    if (!composerText.value) {
+      composerText.value = lastSent.text;
+      autoGrow();
+    }
+    lastSent = null;
+    setComposerNote(note);
+    return true;
+  }
+
+  function handleInputPressure(msg) {
+    const queued = msg.queued || 0;
+    switch (msg.reason) {
+      case 'queue_full':
+        // 큐가 차서 이번 입력이 버려졌다 — 되돌려주고, 빠질 때까지 전송을 막는다.
+        inputBlocked = queued > 0;
+        if (!restoreDraft('입력 대기열이 찼습니다 — 잠시 후 다시 보내세요')) {
+          setComposerNote(inputBlocked ? '입력 대기열이 찼습니다 — 잠시 후 다시 보내세요' : '');
+        }
+        break;
+      case 'closed':
+      case 'unavailable':
+        // 세션이 끝났거나 쓸 수 없다 — 재시도해도 소용없으니 차단하지 않고 알리기만 한다.
+        inputBlocked = false;
+        restoreDraft('세션이 종료되어 입력이 전달되지 않았습니다');
+        break;
+      case 'too_large':
+        // 해소 이벤트가 오지 않는 종류다(runtime이 재시도 큐에 넣지 않음) — 잠그지 않는다.
+        inputBlocked = false;
+        restoreDraft('입력이 너무 커서 전달되지 않았습니다');
+        break;
+      default:
+        inputBlocked = queued > 0;
+        setComposerNote(inputBlocked ? '입력 대기열이 찼습니다 — 잠시 후 다시 보내세요' : '');
+    }
+    updateComposerEnabled();
+  }
+
   composerText.addEventListener('input', autoGrow);
   composerText.addEventListener('keydown', (e) => {
     // 모바일: Enter는 줄바꿈(오전송 방지). 데스크톱 브라우저: Cmd/Ctrl-Enter로 전송.
+    // IME 조합 중(한글 등)에는 전송하지 않는다 — 미확정 텍스트가 나간다 (리뷰 P3-5).
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       sendComposer();
@@ -452,12 +507,25 @@
       repeatTimer = null;
       repeatInterval = null;
     };
-    btn.addEventListener('click', () => sendKey(key));
+    // 반복이 발화했으면 뒤따르는 click을 무시한다 — 아니면 목표에서 한 칸 오버슛한다
+    // (claude 메뉴 ↑↓ 선택이 핵심 사용례라 치명적, 리뷰 P3-4).
+    let repeated = false;
+    btn.addEventListener('click', () => {
+      if (repeated) {
+        repeated = false;
+        return;
+      }
+      sendKey(key);
+    });
     if (key === 'up' || key === 'down' || key === 'left' || key === 'right') {
       const startRepeat = () => {
         stopRepeat();
+        repeated = false;
         repeatTimer = setTimeout(() => {
-          repeatInterval = setInterval(() => sendKey(key), 120);
+          repeatInterval = setInterval(() => {
+            repeated = true;
+            sendKey(key);
+          }, 120);
         }, 400);
       };
       btn.addEventListener('pointerdown', startRepeat);
@@ -548,10 +616,20 @@
   // ── 알림 딥링크 (P6c) — 알림 탭 → 그 세션 화면. 세션 id는 worker-로컬(재시작 시
   // 재배정)이라, 대시보드에 실재하는 id일 때만 자동 시청한다(스테일 알림 방어).
   let pendingWatch = null;
+  let pendingWatchDeadline = 0;
+  // 딥링크 대상은 **짧은 기한 안에만** 소비한다. 세션 id는 worker-로컬(재시작마다 1부터)
+  // 이라, 지금 없는 id를 무기한 들고 있으면 나중에 세션 수가 그 값에 도달하는 순간
+  // 무관한 새 세션으로 뷰어가 갑자기 전환된다 (리뷰 P2-3).
+  const PENDING_WATCH_TTL_MS = 30_000;
+
+  function setPendingWatch(session) {
+    pendingWatch = session;
+    pendingWatchDeadline = Date.now() + PENDING_WATCH_TTL_MS;
+  }
   {
     const watchParam = Number(params.get('watch'));
     if (Number.isInteger(watchParam) && watchParam > 0) {
-      pendingWatch = watchParam;
+      setPendingWatch(watchParam);
       history.replaceState(null, '', location.pathname); // URL 위생
     }
   }
@@ -560,7 +638,7 @@
     navigator.serviceWorker.addEventListener('message', (event) => {
       const msg = event.data;
       if (msg && msg.type === 'watch' && Number.isInteger(msg.session)) {
-        pendingWatch = msg.session;
+        setPendingWatch(msg.session);
         consumePendingWatch(lastSessions);
       }
     });
@@ -573,6 +651,10 @@
   /// 딥링크 대상이 현재 세션 목록에 있으면 시청을 시작한다(1회성).
   function consumePendingWatch(sessions) {
     if (pendingWatch == null) return false;
+    if (Date.now() > pendingWatchDeadline) {
+      pendingWatch = null; // 기한 초과 — 스테일 딥링크는 폐기한다
+      return false;
+    }
     const target = sessions.find((s) => s.id === pendingWatch);
     if (!target) return false;
     const id = pendingWatch;

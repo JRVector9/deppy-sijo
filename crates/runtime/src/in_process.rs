@@ -200,6 +200,7 @@ impl InProcessRuntimeClient {
                         ProcessResourceMonitorConfig::default(),
                     ),
                     pressured_sessions: std::collections::HashSet::new(),
+                    remote_viewing: std::collections::HashMap::new(),
                 }
                 .run();
             })
@@ -325,6 +326,10 @@ impl RuntimeClient for InProcessRuntimeClient {}
 /// exited 세션의 terminal backend(scrollback)를 유지하는 최대 개수 기본값 (§14.2/14.3).
 /// 초과분은 가장 오래 전에 종료된 것부터 압축 아카이브로 내려 메모리를 유계로 만든다
 /// (설정에서 변경 — SetTerminalCachePolicy).
+/// 원격 시청 lease TTL 상한 — 브리지가 보낸 ttl_ms를 이 값으로 캡한다 (P5a).
+/// 갱신이 끊긴 lease가 최대 이 시간 안에는 반드시 원복되게 하는 백스톱.
+const REMOTE_VIEWING_TTL_CAP: Duration = Duration::from_secs(300);
+
 const DEFAULT_MAX_EXITED_BACKENDS: usize = 64;
 /// 압축 아카이브 총 바이트 예산 — 초과 시 오래된 아카이브부터 제거 (LRU).
 /// 개당 압축 ANSI ~수십 KB라 넉넉한 개수를 담는다.
@@ -400,6 +405,9 @@ struct Worker {
     resource_monitor: ProcessResourceMonitor,
     /// backpressure를 emit한 세션들 — 큐가 비면 해소 이벤트(queued=0)를 보낸다(2026-07-09).
     pressured_sessions: std::collections::HashSet<SessionId>,
+    /// 원격 시청 lease — 세션별 만료 시각 (v3.3 P5a). 시청 중에는 hidden tab/Warm에서도
+    /// 스냅샷을 생성한다("visible 등가" 승격). 비어 있으면 어떤 경로에도 추가 비용 없음.
+    remote_viewing: std::collections::HashMap<SessionId, std::time::Instant>,
 }
 
 /// SessionKind ↔ 아카이브 헤더 kind 바이트 (0=shell, 1=agent).
@@ -1001,6 +1009,32 @@ impl Worker {
                 self.cache_budget_bytes =
                     cache_budget_bytes.clamp(32 * 1024 * 1024, 2048 * 1024 * 1024);
             }
+            RuntimeCommand::SetRemoteViewing {
+                session,
+                viewing,
+                ttl_ms,
+            } => {
+                if viewing {
+                    // 살아있거나 아카이브에서 복원 가능한 세션만 — 이미 kill/close된
+                    // id는 무시한다 (stale 커맨드가 유령 lease를 만들지 않게).
+                    let known = self.sessions.contains_key(&session)
+                        || self.archived.contains_key(&session)
+                        || self.archived_on_disk.contains(&session);
+                    if known {
+                        let ttl =
+                            Duration::from_millis(u64::from(ttl_ms)).min(REMOTE_VIEWING_TTL_CAP);
+                        self.remote_viewing
+                            .insert(session, std::time::Instant::now() + ttl);
+                        // visible 등가 승격(hidden cap 해제) 후 현재 화면을 즉시 push —
+                        // 시청자가 다음 출력까지 빈 화면을 보지 않는다.
+                        self.reconcile_visibility();
+                        self.push_watched_viewports();
+                    }
+                } else if self.remote_viewing.remove(&session).is_some() {
+                    // 해제 즉시 hidden cap 재적용 (tombstone 관례 — trailing 승격 차단).
+                    self.reconcile_visibility();
+                }
+            }
             RuntimeCommand::WriteInput { session, bytes } => {
                 if let Some(active) = self.sessions.get_mut(&session) {
                     match active.write_input(&bytes) {
@@ -1081,6 +1115,7 @@ impl Worker {
                 self.sessions.remove(&session);
                 self.exited_order.retain(|s| *s != session);
                 self.hidden_scrollback.remove(&session);
+                self.remote_viewing.remove(&session);
                 self.detectors.remove(&session);
                 self.status_overrides.remove(&session);
                 self.close_session_log(session, "killed", None);
@@ -1735,6 +1770,7 @@ impl Worker {
             self.sessions.remove(&session);
             self.exited_order.retain(|s| *s != session);
             self.hidden_scrollback.remove(&session);
+            self.remote_viewing.remove(&session);
             self.status_overrides.remove(&session);
             self.detectors.remove(&session);
             self.close_session_log(session, "killed", None);
@@ -1767,6 +1803,7 @@ impl Worker {
                 self.sessions.remove(&session);
                 self.exited_order.retain(|s| *s != session);
                 self.hidden_scrollback.remove(&session);
+                self.remote_viewing.remove(&session);
                 self.detectors.remove(&session);
                 self.status_overrides.remove(&session);
                 self.close_session_log(session, "killed", None);
@@ -1836,21 +1873,30 @@ impl Worker {
     }
 
     fn push_watched_viewports(&mut self) {
-        if !self.render_active {
-            return; // Warm 등 — snapshot 생성 금지 (§14.1). 세션 pump는 계속된다.
+        // Warm이면 GUI 몫(watched)은 멈추지만(§14.1 — snapshot 생성 금지, 세션 pump는
+        // 계속), 원격 시청 lease 세션은 계속 스냅샷을 생성한다 — 시청 승격은 스냅샷
+        // 생성만 허용하고 egui repaint는 유발하지 않는다 (P5a). lease 0이면 기존과 동일.
+        let mut targets = if self.render_active {
+            self.mux.watched_sessions()
+        } else {
+            Vec::new()
+        };
+        for session in self.remote_viewed_sessions() {
+            if !targets.contains(&session) {
+                targets.push(session);
+            }
         }
-        // 아카이브된 세션의 pane이 보이면 먼저 복원한다 — 복원 직후 dirty라
-        // 아래 루프가 같은 tick에 Viewport를 push한다 ("연결 중…" 공백 없음).
-        for session in self.mux.watched_sessions() {
-            if !self.sessions.contains_key(&session)
-                && (self.archived.contains_key(&session)
-                    || self.archived_on_disk.contains(&session))
+        // 아카이브된 세션의 pane이 보이면(또는 원격 시청이면) 먼저 복원한다 — 복원 직후
+        // dirty라 아래 루프가 같은 tick에 Viewport를 push한다 ("연결 중…" 공백 없음).
+        for session in &targets {
+            if !self.sessions.contains_key(session)
+                && (self.archived.contains_key(session) || self.archived_on_disk.contains(session))
             {
-                self.inflate_archived(session);
+                self.inflate_archived(*session);
             }
         }
         let mut events = Vec::new();
-        for session in self.mux.watched_sessions() {
+        for session in targets {
             if let Some(active) = self.sessions.get_mut(&session)
                 && let Some(snapshot) = active.take_snapshot()
             {
@@ -1866,6 +1912,22 @@ impl Worker {
         }
     }
 
+    /// lease 만료분을 걷어내고 원격 시청 중인 세션 목록을 돌려준다 (P5a). 만료가
+    /// 있었으면 hidden cap 재적용을 위해 reconcile_visibility를 즉시 호출한다 —
+    /// mux 전이가 없는 유휴 상태에서도 visible 등가 승격이 lease보다 오래 남지 않는다.
+    fn remote_viewed_sessions(&mut self) -> Vec<SessionId> {
+        if self.remote_viewing.is_empty() {
+            return Vec::new();
+        }
+        let now = std::time::Instant::now();
+        let before = self.remote_viewing.len();
+        self.remote_viewing.retain(|_, expiry| *expiry > now);
+        if self.remote_viewing.len() != before {
+            self.reconcile_visibility();
+        }
+        self.remote_viewing.keys().copied().collect()
+    }
+
     /// 모든 세션의 PTY 출력을 반영하고, active pane 세션만 Viewport를 push한다
     /// (14.4: hidden pane snapshot 생성 금지 — dirty는 유지되어 포커스 전환 시 따라잡는다).
     fn pump_sessions(&mut self, allow_viewport: bool) -> PumpActivity {
@@ -1875,6 +1937,8 @@ impl Worker {
         // 서로 다른 tick(≈다른 UI drain)에 나뉘어, 알림/상태가 유실되지 않는다 (codex 리뷰).
         self.archive_over_cap();
         let watched = self.mux.watched_sessions();
+        // 원격 시청 lease 세션 — GUI 가시성과 무관하게 Viewport 대상 (P5a).
+        let remote_viewed = self.remote_viewed_sessions();
         let mut events = Vec::new();
         let mut log_offsets = Vec::new();
         let mut status_updates = Vec::new();
@@ -1923,7 +1987,9 @@ impl Worker {
                     });
                 }
             }
-            if self.render_active && result.dirty && watched.contains(&active.id()) {
+            let viewport_wanted = (self.render_active && watched.contains(&active.id()))
+                || remote_viewed.contains(&active.id());
+            if viewport_wanted && result.dirty {
                 if allow_viewport {
                     if let Some(snapshot) = active.take_snapshot() {
                         events.push(RuntimeEvent::Viewport {
@@ -1943,11 +2009,13 @@ impl Worker {
                 }
             }
             if result.just_exited {
-                let class = if watched.contains(&active.id()) {
-                    TerminalCacheClass::Visible
-                } else {
-                    TerminalCacheClass::Exited
-                };
+                // 원격 시청 중 세션도 visible 등가 — 시청자가 마지막 화면을 본다 (P5a).
+                let class =
+                    if watched.contains(&active.id()) || remote_viewed.contains(&active.id()) {
+                        TerminalCacheClass::Visible
+                    } else {
+                        TerminalCacheClass::Exited
+                    };
                 if active.cache_class() != class
                     && let Some(event) = active.set_cache_class(class)
                 {
@@ -2069,8 +2137,11 @@ impl Worker {
     /// visible(active tab)은 visible budget, hidden running은 hidden budget,
     /// non-visible exited는 exited-retained budget. visible이 항상 우선한다.
     fn reconcile_visibility(&mut self) {
-        let visible: std::collections::HashSet<SessionId> =
+        let mut visible: std::collections::HashSet<SessionId> =
             self.mux.watched_sessions().into_iter().collect();
+        // 원격 시청 lease 세션은 visible 등가 — hidden cap 미적용 (P5a). 만료 정리는
+        // remote_viewed_sessions가 하고, 여기서는 현재 map을 그대로 신뢰한다.
+        visible.extend(self.remote_viewing.keys().copied());
         let sessions: Vec<SessionId> = self.sessions.keys().copied().collect();
         for id in sessions {
             let Some(session) = self.sessions.get_mut(&id) else {
@@ -2105,7 +2176,10 @@ impl Worker {
         // 현재 보이는(active tab의) pane 세션은 archive하지 않는다 — split이면
         // 비포커스 pane도 화면에 있어 사용자가 그 scrollback을 보는 중일 수 있다
         // (codex 리뷰: focused 하나만 제외하면 부족). watched = visible.
-        let visible = self.mux.watched_sessions();
+        let mut visible = self.mux.watched_sessions();
+        // 원격 시청 중 세션도 archive 금지 — 시청 중 backend가 내려가 화면이 얼거나
+        // inflate↔archive 플립플롭이 생기는 것을 막는다 (P5a).
+        visible.extend(self.remote_viewing.keys().copied());
         let mut to_archive =
             exited_to_archive(&self.exited_order, self.max_exited_backends, &visible);
         let cache_bytes = self.terminal_cache_bytes();
@@ -4507,6 +4581,272 @@ mod tests {
             }
             _ => None,
         });
+    }
+
+    /// 스냅샷 전체 행에서 문자열을 찾는다 — 입력 echo가 행을 넘겨도 매칭되게.
+    fn snapshot_contains(snapshot: &terminal::TerminalViewportSnapshot, needle: &str) -> bool {
+        (0..snapshot.rows as usize).any(|row| snapshot_text(snapshot, row).contains(needle))
+    }
+
+    /// P5a: 원격 시청 lease가 hidden tab 세션의 Viewport를 흐르게 하고,
+    /// 해제(viewing=false) 즉시 다시 멈춘다 (§14.4 union 게이트).
+    #[cfg(unix)]
+    #[test]
+    fn 원격_시청_lease는_hidden_세션_viewport를_흐르게_하고_해제시_멈춘다() {
+        init_mock_store();
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("remote-view"),
+            RedactionService::new(),
+            spec("/bin/sh", &["-c", "sleep 30"]),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        // A spawn (tab 1) → B spawn (tab 2 활성 → A hidden)
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let session_a = probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            _ => None,
+        });
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::MuxUpdated { snapshot } if snapshot.tabs.len() == 2 => Some(()),
+            _ => None,
+        });
+        // 기준선: hidden A에 입력(tty echo로 화면 변화) → Viewport가 나오면 안 된다
+        client
+            .send_command(RuntimeCommand::WriteInput {
+                session: session_a,
+                bytes: b"hiddenwrite\r".to_vec(),
+            })
+            .unwrap();
+        let until = Instant::now() + Duration::from_millis(800);
+        while Instant::now() < until {
+            probe.seen.extend(probe.rx.drain());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let hidden_leak = probe.seen.iter().any(|e| {
+            matches!(e, RuntimeEvent::Viewport { session, snapshot, .. }
+                if *session == session_a && snapshot_contains(snapshot, "hiddenwrite"))
+        });
+        assert!(!hidden_leak, "hidden 세션 Viewport가 lease 없이 생성됨");
+
+        // lease 시작 → 즉시 현재 화면 push (다음 출력을 기다리지 않는다)
+        client
+            .send_command(RuntimeCommand::SetRemoteViewing {
+                session: session_a,
+                viewing: true,
+                ttl_ms: 60_000,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::Viewport {
+                session, snapshot, ..
+            } if *session == session_a && snapshot_contains(snapshot, "hiddenwrite") => Some(()),
+            _ => None,
+        });
+        // 시청 중 새 출력 → pump 경로로 Viewport 흐름
+        client
+            .send_command(RuntimeCommand::WriteInput {
+                session: session_a,
+                bytes: b"livewrite\r".to_vec(),
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::Viewport {
+                session, snapshot, ..
+            } if *session == session_a && snapshot_contains(snapshot, "livewrite") => Some(()),
+            _ => None,
+        });
+
+        // 해제 → 이후 출력은 다시 차단 (tombstone — trailing 승격 없음)
+        client
+            .send_command(RuntimeCommand::SetRemoteViewing {
+                session: session_a,
+                viewing: false,
+                ttl_ms: 0,
+            })
+            .unwrap();
+        client
+            .send_command(RuntimeCommand::WriteInput {
+                session: session_a,
+                bytes: b"afterstop\r".to_vec(),
+            })
+            .unwrap();
+        let until = Instant::now() + Duration::from_millis(800);
+        while Instant::now() < until {
+            probe.seen.extend(probe.rx.drain());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let after_stop_leak = probe.seen.iter().any(|e| {
+            matches!(e, RuntimeEvent::Viewport { session, snapshot, .. }
+                if *session == session_a && snapshot_contains(snapshot, "afterstop"))
+        });
+        assert!(!after_stop_leak, "lease 해제 후에도 Viewport가 생성됨");
+    }
+
+    /// P5a: Warm(§14.1)에서도 lease 세션은 스냅샷을 생성하고, TTL 만료로
+    /// 갱신이 끊기면 자동 원복된다 (WS 절단·브리지 사망 백스톱).
+    #[cfg(unix)]
+    #[test]
+    fn 원격_시청은_warm에서도_생성되고_ttl_만료로_중단된다() {
+        init_mock_store();
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("remote-view-warm"),
+            RedactionService::new(),
+            spec("/bin/sh", &["-c", "printf WARMRV; sleep 30"]),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SetWorkspaceState(
+                WorkspaceRuntimeState::Warm,
+            ))
+            .unwrap();
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let session_a = probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            _ => None,
+        });
+        // Warm이라 Viewport 0 (기존 warm 테스트가 보장) — lease 시작 즉시 push된다
+        client
+            .send_command(RuntimeCommand::SetRemoteViewing {
+                session: session_a,
+                viewing: true,
+                ttl_ms: 900,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::Viewport {
+                session, snapshot, ..
+            } if *session == session_a && snapshot_contains(snapshot, "WARMRV") => Some(()),
+            _ => None,
+        });
+        // TTL(900ms) 경과 → lease 자동 원복 → 이후 출력은 차단
+        std::thread::sleep(Duration::from_millis(1200));
+        client
+            .send_command(RuntimeCommand::WriteInput {
+                session: session_a,
+                bytes: b"afterexpiry\r".to_vec(),
+            })
+            .unwrap();
+        let until = Instant::now() + Duration::from_millis(800);
+        while Instant::now() < until {
+            probe.seen.extend(probe.rx.drain());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let expired_leak = probe.seen.iter().any(|e| {
+            matches!(e, RuntimeEvent::Viewport { session, snapshot, .. }
+                if *session == session_a && snapshot_contains(snapshot, "afterexpiry"))
+        });
+        assert!(
+            !expired_leak,
+            "TTL 만료 후에도 Viewport가 생성됨 — lease 백스톱 회귀"
+        );
+    }
+
+    /// P5a: kill된 세션의 lease는 정리되고, 죽은 세션 id로 온 stale lease 커맨드는
+    /// 무시된다 (유령 lease 방지).
+    #[cfg(unix)]
+    #[test]
+    fn kill된_세션의_lease는_정리되고_stale_커맨드는_무시된다() {
+        init_mock_store();
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("remote-view-kill"),
+            RedactionService::new(),
+            spec("/bin/sh", &["-c", "sleep 30"]),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let session_a = probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            _ => None,
+        });
+        client
+            .send_command(RuntimeCommand::SetRemoteViewing {
+                session: session_a,
+                viewing: true,
+                ttl_ms: 60_000,
+            })
+            .unwrap();
+        // spawn의 MuxUpdated(A attach)가 먼저 관측된 뒤 kill을 보낸다 — 이후
+        // "A가 detach된 MuxUpdated"가 kill 처리 완료의 신호가 된다.
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| tab.panes.iter())
+                    .any(|pane| pane.session_id == Some(session_a)) =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
+        client
+            .send_command(RuntimeCommand::KillSession { session: session_a })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::MuxUpdated { snapshot }
+                if snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| tab.panes.iter())
+                    .all(|pane| pane.session_id != Some(session_a)) =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
+        // kill 이후 stale lease 커맨드 — 무시되어야 하고 Viewport도 없어야 한다
+        probe.seen.clear();
+        client
+            .send_command(RuntimeCommand::SetRemoteViewing {
+                session: session_a,
+                viewing: true,
+                ttl_ms: 60_000,
+            })
+            .unwrap();
+        let until = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < until {
+            probe.seen.extend(probe.rx.drain());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let ghost = probe
+            .seen
+            .iter()
+            .any(|e| matches!(e, RuntimeEvent::Viewport { session, .. } if *session == session_a));
+        assert!(!ghost, "kill된 세션에 유령 lease Viewport가 생성됨");
     }
 
     #[test]

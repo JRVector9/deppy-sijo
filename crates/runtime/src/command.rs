@@ -139,6 +139,16 @@ pub enum RuntimeCommand {
         max_exited_backends: usize,
         cache_budget_bytes: usize,
     },
+    /// 원격 시청 lease (모바일 PWA 터미널 뷰어 — v3.3 P5a). viewing=true는 세션을
+    /// "visible 등가"로 승격해 hidden tab/Warm에서도 스냅샷을 생성하게 하고, ttl_ms
+    /// 안에 갱신(재전송)이 없으면 자동 원복된다 — WS 절단·브리지 사망 백스톱.
+    /// viewing=false는 즉시 해제(ttl_ms 무시). **variant는 끝에만 추가** (wire 계약).
+    SetRemoteViewing {
+        session: SessionId,
+        viewing: bool,
+        /// lease 유효기간(ms) — worker가 상한 5분으로 캡한다. 시청 유지는 재전송으로 갱신.
+        ttl_ms: u32,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
@@ -274,6 +284,16 @@ impl std::fmt::Debug for RuntimeCommand {
                 .debug_struct("RenamePane")
                 .field("pane", pane)
                 .field("title", title)
+                .finish(),
+            RuntimeCommand::SetRemoteViewing {
+                session,
+                viewing,
+                ttl_ms,
+            } => f
+                .debug_struct("SetRemoteViewing")
+                .field("session", session)
+                .field("viewing", viewing)
+                .field("ttl_ms", ttl_ms)
                 .finish(),
         }
     }

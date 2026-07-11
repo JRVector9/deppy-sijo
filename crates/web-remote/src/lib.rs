@@ -1351,6 +1351,7 @@ mod tests {
                 "{\"title\":\"x\"}",
                 None,
                 1720,
+                None,
             )
             .unwrap();
         }

@@ -71,6 +71,10 @@ CREATE TABLE pending_approvals (
 CREATE INDEX idx_pending_approvals_status ON pending_approvals(status);
 ";
 
+/// 승인 ↔ 세션 연결 (I2). 승인이 어느 pane에서 났는지 기록한다. 전역 마이그레이션 원장이
+/// 소유하고, 테스트도 이 상수를 적용해 스키마를 일치시킨다.
+pub const MIGRATION_APPROVAL_PANE: &str = "ALTER TABLE pending_approvals ADD COLUMN pane_id TEXT;";
+
 /// scoped MCP env metadata — 전역 마이그레이션 v12 슬롯.
 /// env_json은 안전한 plain 값만, env_credentials_json은 key→credential_id만 저장한다.
 pub const MIGRATION_SERVER_ENV: &str = "
@@ -133,6 +137,11 @@ pub struct PendingApprovalRow {
     pub arguments_preview: String,
     pub schema_hash: Option<String>,
     pub created_at: i64,
+    /// 승인을 요청한 pane_id (I2 — proxy env DEPPY_SESSION_ID). NULL이면 세션 불명.
+    pub pane_id: Option<String>,
+    /// pane → 세션 조인 결과 (I2). 세션 UUID(딥링크용)와 표시 제목.
+    pub session_uuid: Option<String>,
+    pub session_title: Option<String>,
 }
 
 /// 새 pending approval insert 요청. 표시 문자열은 이미 redacted된 preview만 허용한다.
@@ -144,6 +153,8 @@ pub struct PendingApprovalInsert {
     pub arguments_preview: String,
     pub schema_hash: Option<String>,
     pub created_at: i64,
+    /// 요청 pane_id (I2 — proxy가 env로 아는 값. 없으면 None → "세션 불명").
+    pub pane_id: Option<String>,
 }
 
 pub fn list_permission_rules(conn: &Connection) -> anyhow::Result<Vec<PermissionRuleRow>> {
@@ -198,6 +209,7 @@ pub fn delete_permission_rule(
 /// 라이브 승인 요청을 등록한다 (deppy-mcp-proxy → GUI). id는 호출측이 만든 UUID,
 /// created_at은 호출측이 SystemTime으로 넘긴 unix seconds. arguments_preview는
 /// proxy가 이미 redact한 표시용 문자열이어야 한다.
+#[allow(clippy::too_many_arguments)]
 pub fn insert_pending_approval(
     conn: &Connection,
     id: &str,
@@ -206,6 +218,7 @@ pub fn insert_pending_approval(
     arguments_preview: &str,
     schema_hash: Option<&str>,
     created_at: i64,
+    pane_id: Option<&str>,
 ) -> anyhow::Result<()> {
     let row = PendingApprovalInsert {
         id: id.to_owned(),
@@ -214,6 +227,7 @@ pub fn insert_pending_approval(
         arguments_preview: arguments_preview.to_owned(),
         schema_hash: schema_hash.map(str::to_owned),
         created_at,
+        pane_id: pane_id.map(str::to_owned),
     };
     insert_pending_approval_batch(conn, &[row])?;
     Ok(())
@@ -230,8 +244,8 @@ pub fn insert_pending_approval_batch(
     let mut stmt = conn.prepare_cached(
         "INSERT INTO pending_approvals
            (id, server_id, tool_name, arguments_preview, schema_hash,
-            status, remember, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6)",
+            status, remember, created_at, pane_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, ?7)",
     )?;
     let mut inserted = 0;
     for row in rows {
@@ -242,6 +256,7 @@ pub fn insert_pending_approval_batch(
             &row.arguments_preview,
             &row.schema_hash,
             row.created_at,
+            &row.pane_id,
         ))
         .with_context(|| format!("pending approval 저장 실패: {}", row.id))?;
         inserted += 1;
@@ -269,9 +284,16 @@ pub fn poll_approval(conn: &Connection, id: &str) -> anyhow::Result<ApprovalOutc
 
 /// pending 상태 요청만, 오래된 순으로 (GUI 목록). id는 tie-break(결정적 순서).
 pub fn list_pending_approvals(conn: &Connection) -> anyhow::Result<Vec<PendingApprovalRow>> {
+    // pane_id로 mux_panes → sessions를 조인해 세션 UUID/제목을 함께 가져온다 (I2).
+    // LEFT JOIN이라 pane_id NULL·pane 소멸 시에도 승인 행은 그대로 나온다("세션 불명").
+    // 조인 비용은 무시 수준(pending 행 수 ≤ 수십, 1초 폴링).
     let mut stmt = conn.prepare(
-        "SELECT id, server_id, tool_name, arguments_preview, schema_hash, created_at
-         FROM pending_approvals WHERE status = 'pending' ORDER BY created_at, id",
+        "SELECT a.id, a.server_id, a.tool_name, a.arguments_preview, a.schema_hash,
+                a.created_at, a.pane_id, s.id, s.title
+         FROM pending_approvals a
+         LEFT JOIN mux_panes p ON p.id = a.pane_id
+         LEFT JOIN sessions s ON s.id = p.session_id
+         WHERE a.status = 'pending' ORDER BY a.created_at, a.id",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(PendingApprovalRow {
@@ -281,6 +303,9 @@ pub fn list_pending_approvals(conn: &Connection) -> anyhow::Result<Vec<PendingAp
             arguments_preview: row.get(3)?,
             schema_hash: row.get(4)?,
             created_at: row.get(5)?,
+            pane_id: row.get(6)?,
+            session_uuid: row.get(7)?,
+            session_title: row.get(8)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -831,6 +856,14 @@ mod tests {
         conn.execute_batch(MIGRATION_SERVER_ENV).unwrap();
         conn.execute_batch(MIGRATION_TOOL_PERMISSION_RULES).unwrap();
         conn.execute_batch(MIGRATION_PENDING_APPROVALS).unwrap();
+        conn.execute_batch(MIGRATION_APPROVAL_PANE).unwrap();
+        // list_pending_approvals의 LEFT JOIN 대상 (I2) — persist가 소유하는 테이블이지만
+        // 이 crate 테스트는 격리되므로 조인이 성립하도록 최소 컬럼만 만든다.
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT);
+             CREATE TABLE mux_panes (id TEXT PRIMARY KEY, session_id TEXT);",
+        )
+        .unwrap();
         conn
     }
 
@@ -971,6 +1004,49 @@ mod tests {
         assert_eq!(count, 0);
     }
 
+    /// I2: 승인의 pane_id로 세션 UUID/제목을 조인해 함께 반환한다. pane_id NULL이나
+    /// pane 소멸(조인 miss)이면 승인 행은 나오되 세션 필드는 None("세션 불명").
+    #[test]
+    fn 승인은_pane_id로_세션을_조인해_uuid와_제목을_반환한다() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO sessions (id, title) VALUES ('sess-uuid-1', 'deppy-sijo')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mux_panes (id, session_id) VALUES ('pane-1', 'sess-uuid-1')",
+            [],
+        )
+        .unwrap();
+        insert_pending_approval(
+            &conn,
+            "a1",
+            "srv",
+            "read",
+            "prev",
+            None,
+            100,
+            Some("pane-1"),
+        )
+        .unwrap();
+        insert_pending_approval(&conn, "a2", "srv", "write", "prev", None, 200, None).unwrap();
+        insert_pending_approval(&conn, "a3", "srv", "exec", "prev", None, 300, Some("gone"))
+            .unwrap();
+
+        let rows = list_pending_approvals(&conn).unwrap();
+        assert_eq!(rows.len(), 3);
+        let by_id = |id: &str| rows.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(by_id("a1").pane_id.as_deref(), Some("pane-1"));
+        assert_eq!(by_id("a1").session_uuid.as_deref(), Some("sess-uuid-1"));
+        assert_eq!(by_id("a1").session_title.as_deref(), Some("deppy-sijo"));
+        assert_eq!(by_id("a2").pane_id, None);
+        assert_eq!(by_id("a2").session_uuid, None);
+        assert_eq!(by_id("a2").session_title, None);
+        assert_eq!(by_id("a3").pane_id.as_deref(), Some("gone"));
+        assert_eq!(by_id("a3").session_uuid, None);
+    }
+
     #[test]
     fn pending_approval_batch_insert_roundtrip() {
         let conn = test_conn();
@@ -984,6 +1060,7 @@ mod tests {
                     arguments_preview: "path=/tmp/b".to_owned(),
                     schema_hash: None,
                     created_at: 20,
+                    pane_id: None,
                 },
                 PendingApprovalInsert {
                     id: "a".to_owned(),
@@ -992,6 +1069,7 @@ mod tests {
                     arguments_preview: "path=/tmp/a".to_owned(),
                     schema_hash: Some("hash".to_owned()),
                     created_at: 10,
+                    pane_id: None,
                 },
             ],
         )
@@ -1006,9 +1084,9 @@ mod tests {
     #[test]
     fn prune_resolved_approvals는_pending을_보존하고_오래된_resolved만_삭제() {
         let conn = test_conn();
-        insert_pending_approval(&conn, "pending", "srv", "tool", "prev", None, 10).unwrap();
-        insert_pending_approval(&conn, "old", "srv", "tool", "prev", None, 20).unwrap();
-        insert_pending_approval(&conn, "new", "srv", "tool", "prev", None, 30).unwrap();
+        insert_pending_approval(&conn, "pending", "srv", "tool", "prev", None, 10, None).unwrap();
+        insert_pending_approval(&conn, "old", "srv", "tool", "prev", None, 20, None).unwrap();
+        insert_pending_approval(&conn, "new", "srv", "tool", "prev", None, 30, None).unwrap();
         resolve_approval(&conn, "old", true, false, 100).unwrap();
         resolve_approval(&conn, "new", false, false, 300).unwrap();
 

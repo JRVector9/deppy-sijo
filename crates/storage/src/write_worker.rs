@@ -621,6 +621,7 @@ mod tests {
     }
 
     fn pending(id: &str, created_at: i64) -> PendingApprovalInsert {
+        #[allow(clippy::needless_update)]
         PendingApprovalInsert {
             id: id.to_owned(),
             server_id: "srv".to_owned(),
@@ -628,6 +629,7 @@ mod tests {
             arguments_preview: "path=/tmp/x".to_owned(),
             schema_hash: None,
             created_at,
+            pane_id: None,
         }
     }
 

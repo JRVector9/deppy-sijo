@@ -226,6 +226,11 @@ CREATE TABLE web_push_subscriptions (
     last_ok_at INTEGER
 );
 ",
+    // 승인 ↔ 세션 연결 (v3.7 I2). 승인이 어느 pane에서 났는지 기록해 UI가 세션명을
+    // 보이고 폰이 그 세션 화면을 열 수 있게 한다. proxy가 이미 env로 받는 pane_id를
+    // 그대로 싣는다(조회 없음 — 등록 경로는 fail-closed라 새 실패 지점을 안 만든다).
+    // NULL 허용: env 미주입 경로·레거시 행은 "세션 불명"으로 표시.
+    mcp_store::MIGRATION_APPROVAL_PANE,
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -1203,6 +1208,7 @@ impl Db {
     }
 
     /// 라이브 승인 요청 등록 (deppy-mcp-proxy → GUI). 세부 계약은 mcp_store 문서 참조.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_pending_approval(
         &self,
         id: &str,
@@ -1211,6 +1217,7 @@ impl Db {
         arguments_preview: &str,
         schema_hash: Option<&str>,
         created_at: i64,
+        pane_id: Option<&str>,
     ) -> anyhow::Result<()> {
         mcp_store::insert_pending_approval(
             &self.conn,
@@ -1220,6 +1227,7 @@ impl Db {
             arguments_preview,
             schema_hash,
             created_at,
+            pane_id,
         )
     }
 
@@ -1785,8 +1793,16 @@ mod tests {
     #[test]
     fn pending_approval_insert_poll_resolve_라이프사이클() {
         let db = Db::open_in_memory().unwrap();
-        db.insert_pending_approval("req-1", "srv-1", "read_file", "path=/tmp/x", Some("h"), 100)
-            .unwrap();
+        db.insert_pending_approval(
+            "req-1",
+            "srv-1",
+            "read_file",
+            "path=/tmp/x",
+            Some("h"),
+            100,
+            None,
+        )
+        .unwrap();
         // insert 직후엔 pending
         assert_eq!(
             db.poll_approval("req-1").unwrap(),
@@ -1806,8 +1822,16 @@ mod tests {
         );
 
         // deny 경로도 확인
-        db.insert_pending_approval("req-2", "srv-1", "delete_file", "path=/tmp/y", None, 101)
-            .unwrap();
+        db.insert_pending_approval(
+            "req-2",
+            "srv-1",
+            "delete_file",
+            "path=/tmp/y",
+            None,
+            101,
+            None,
+        )
+        .unwrap();
         db.resolve_approval("req-2", false, false, 201).unwrap();
         assert_eq!(
             db.poll_approval("req-2").unwrap(),
@@ -1822,11 +1846,11 @@ mod tests {
     fn list_pending은_pending만_오래된순으로() {
         let db = Db::open_in_memory().unwrap();
         // 일부러 뒤섞인 created_at으로 넣어 정렬을 검증
-        db.insert_pending_approval("b", "srv", "t", "prev", None, 300)
+        db.insert_pending_approval("b", "srv", "t", "prev", None, 300, None)
             .unwrap();
-        db.insert_pending_approval("a", "srv", "t", "prev", Some("hh"), 100)
+        db.insert_pending_approval("a", "srv", "t", "prev", Some("hh"), 100, None)
             .unwrap();
-        db.insert_pending_approval("c", "srv", "t", "prev", None, 200)
+        db.insert_pending_approval("c", "srv", "t", "prev", None, 200, None)
             .unwrap();
         // c를 해소하면 목록에서 빠진다
         db.resolve_approval("c", true, false, 400).unwrap();
@@ -1843,7 +1867,7 @@ mod tests {
     #[test]
     fn resolve_두번은_먼저_쓴_결정을_안_덮는다() {
         let db = Db::open_in_memory().unwrap();
-        db.insert_pending_approval("req", "srv", "t", "prev", None, 100)
+        db.insert_pending_approval("req", "srv", "t", "prev", None, 100, None)
             .unwrap();
         db.resolve_approval("req", true, true, 200).unwrap();
         // 두 번째 해소(deny)는 no-op — 첫 결정(allow/remember) 유지
@@ -1862,9 +1886,9 @@ mod tests {
     #[test]
     fn expire_pending은_오래된_행만_denied로_하고_멱등() {
         let db = Db::open_in_memory().unwrap();
-        db.insert_pending_approval("old", "srv", "t", "prev", None, 100)
+        db.insert_pending_approval("old", "srv", "t", "prev", None, 100, None)
             .unwrap();
-        db.insert_pending_approval("recent", "srv", "t", "prev", None, 1000)
+        db.insert_pending_approval("recent", "srv", "t", "prev", None, 1000, None)
             .unwrap();
         // cutoff=500 → old(100)만 만료, recent(1000)은 유지
         assert_eq!(db.expire_pending_approvals(500, 600).unwrap(), 1);
@@ -1887,9 +1911,9 @@ mod tests {
     #[test]
     fn resolve_approval은_오래된_resolved_rows를_prune한다() {
         let db = Db::open_in_memory().unwrap();
-        db.insert_pending_approval("old", "srv", "t", "prev", None, 10)
+        db.insert_pending_approval("old", "srv", "t", "prev", None, 10, None)
             .unwrap();
-        db.insert_pending_approval("keep", "srv", "t", "prev", None, 20)
+        db.insert_pending_approval("keep", "srv", "t", "prev", None, 20, None)
             .unwrap();
         db.resolve_approval("old", true, false, 100).unwrap();
         db.resolve_approval(
@@ -2151,7 +2175,7 @@ mod tests {
         let db = Db::open(&path).unwrap();
         assert_eq!(Db::read_user_version(&db.conn).unwrap(), MIGRATIONS.len());
         // pending_approvals 테이블이 실제로 사용 가능
-        db.insert_pending_approval("r", "s", "t", "prev", None, 1)
+        db.insert_pending_approval("r", "s", "t", "prev", None, 1, None)
             .unwrap();
         assert_eq!(
             db.poll_approval("r").unwrap().status,

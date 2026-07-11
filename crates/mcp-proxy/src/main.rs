@@ -102,6 +102,10 @@ fn main() -> anyhow::Result<()> {
     let hook_manager = LocalMcpManager::new(redaction.clone());
     let hook_config = config.clone();
     let forwarder = ManagerToolForwarder::new(manager, config);
+    // pane_id = env DEPPY_SESSION_ID — 승인이 어느 세션에서 났는지 표시/딥링크용 (I2).
+    let pane_id = std::env::var("DEPPY_SESSION_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
     let hook = DbPermissionHook::new(
         db,
         cli.server_id,
@@ -110,6 +114,7 @@ fn main() -> anyhow::Result<()> {
         cli.approval_timeout,
         hook_manager,
         hook_config,
+        pane_id,
     );
 
     let stdin = std::io::stdin();

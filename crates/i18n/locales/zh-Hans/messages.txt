@@ -249,6 +249,7 @@ approval.title = 工具执行审批
 approval.server = 服务器：{value}
 approval.remote_note = 此工具调用将发送到远程服务器：{url}
 approval.tool = 工具：{value}
+approval.session = 会话：{value}
 approval.arguments_preview = 参数预览：
 approval.remember_tool = 记住此工具
 env.title = 环境

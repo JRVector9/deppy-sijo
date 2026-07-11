@@ -249,6 +249,7 @@ approval.title = 도구 실행 승인
 approval.server = 서버: {value}
 approval.remote_note = 이 도구 호출은 원격 서버로 전송됩니다: {url}
 approval.tool = 도구: {value}
+approval.session = 세션: {value}
 approval.arguments_preview = 인자 미리보기:
 approval.remember_tool = 이 도구 기억
 env.title = 환경

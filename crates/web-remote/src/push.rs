@@ -1607,7 +1607,7 @@ mod tests {
 
     fn insert_pending(db_path: &std::path::Path, id: &str) {
         let db = storage::Db::open(db_path).unwrap();
-        db.insert_pending_approval(id, "srv", "tool", "{}", None, 1)
+        db.insert_pending_approval(id, "srv", "tool", "{}", None, 1, None)
             .unwrap();
     }
 

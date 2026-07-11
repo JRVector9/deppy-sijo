@@ -5520,7 +5520,7 @@ h:1 EE:FF
             std::time::Duration::from_millis(20),
         );
 
-        db.insert_pending_approval("req-1", "srv", "tool", "{}", None, 100)
+        db.insert_pending_approval("req-1", "srv", "tool", "{}", None, 100, None)
             .unwrap();
 
         let delay = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();

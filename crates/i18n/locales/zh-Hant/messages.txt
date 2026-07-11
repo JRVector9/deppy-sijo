@@ -249,6 +249,7 @@ approval.title = 工具執行核准
 approval.server = 伺服器：{value}
 approval.remote_note = 此工具呼叫將傳送到遠端伺服器：{url}
 approval.tool = 工具：{value}
+approval.session = 工作階段：{value}
 approval.arguments_preview = 參數預覽：
 approval.remember_tool = 記住此工具
 env.title = 環境

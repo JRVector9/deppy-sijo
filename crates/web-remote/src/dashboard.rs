@@ -930,6 +930,9 @@ fn approval_views(rows: Vec<storage::PendingApprovalRow>) -> Vec<ApprovalView> {
             tool: row.tool_name,
             preview: row.arguments_preview,
             created_at: row.created_at,
+            // 세션 UUID/제목 (I2 — pane_id로 sessions 조인). 세션 불명이면 None.
+            session: row.session_uuid,
+            session_title: row.session_title,
         })
         .collect()
 }

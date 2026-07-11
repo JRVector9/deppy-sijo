@@ -1,43 +1,86 @@
-//! Connector Center (설계문서 §3 ConnectorCenter, PR-17/PR-18 + H3).
+//! Connector Center (설계문서 §3 ConnectorCenter, PR-17/PR-18 + H3 + H5).
 //! local MCP 서버를 카드로 나열하고 쉽게 추가 + 연결 상태를 표시한다.
 //! 연결 테스트(discover_tools)는 subprocess/HTTP 왕복이라 백그라운드 스레드에서 돌리고,
 //! 결과는 채널로 받아 UI에 반영 + mcp_tools를 DB에 교체 저장한다.
 //! HTTP 커넥터(H3): kind='http' 서버를 url로 등록·발견·실행한다. 최초 연결(테스트/
 //! 도구 발견/실행) 전 세션당 1회 신뢰 확인 모달을 거치고, url 편집 저장 시 Allow 규칙
 //! 초기화 + 도구 캐시 무효화 + 재확인한다 (VS Code cacheNonce 신뢰의 편집 시점 훅 등가).
-//! OAuth 커넥터(PR-18): 브라우저 승인 대기가 길어 flow 전체를 백그라운드로 돌리고,
-//! 획득한 토큰은 UI 스레드에서 keyring 저장 + credentials 등록 + redaction 시드.
+//! OAuth(H5, 401 사다리): 401/403은 "에러"가 아니라 "승인 필요" 카드 상태로 구분한다
+//! (차용: extHostMcp의 needs-user-interaction 상태 분리). [브라우저로 승인] →
+//! 발견 체인(RFC 9728/8414) → 동의 다이얼로그 → DCR(실패 시 수동 client_id 폴백)
+//! → 외부 브라우저 PKCE → Bearer 재시도(scope 갱신 1회 + 재등록 1회 한정)까지
+//! 백그라운드 스레드 + mpsc로 돌리고, 토큰은 UI 스레드에서 keyring 저장 +
+//! credentials(oauth_json 바인딩 메타) 등록 + redaction 시드. Bearer는 동의 시점
+//! 서버 URL과 현재 url이 일치할 때만 부착한다 (토큰 URL 바인딩 — H3 url 편집
+//! 규칙 리셋과 한 쌍). 구 OAuth 수동 폼(auth/token URL 입력)은 발견 체인이
+//! 대체해 제거했다.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
-use mcp::{LocalMcpManager, McpHttpServerConfig, McpServerConfig, McpTool, validate_mcp_url};
+use mcp::{
+    LocalMcpManager, McpAuthRequired, McpHttpServerConfig, McpServerConfig, McpTool,
+    PROTOCOL_VERSION, validate_mcp_url,
+};
 use mcp_store::{McpServerRow, McpToolRow};
-use secret::RedactionService;
+use secret::{RedactionService, SecretStore, SecretString};
 
 use crate::mcp_import::{self, SkipReason};
 use crate::storage::{CredentialMeta, Db};
 
+/// OAuth 네트워크 프리미티브(발견·DCR·refresh) 타임아웃.
+const OAUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+/// 외부 브라우저 승인 대기 상한 (구 PR-18 run_flow과 동일).
+const BROWSER_FLOW_TIMEOUT: Duration = Duration::from_secs(180);
+
 /// 서버별 연결 상태 (완료 기준: 연결 상태 표시).
 enum ConnStatus {
     Checking,
-    Connected { tools: usize },
+    Connected {
+        tools: usize,
+    },
     Failed(String),
+    /// 401/403 — 에러가 아니라 사용자 승인 개입 지점 (H5). challenge는
+    /// [브라우저로 승인] 클릭 시 발견 체인의 입력이 된다.
+    NeedsAuth {
+        message: String,
+        challenge: AuthChallengeInfo,
+    },
 }
 
-/// 백그라운드 연결 테스트 결과: (server_id, 발견한 tools 또는 에러 문자열).
-type DiscoverResult = (String, Result<Vec<McpTool>, String>);
+/// 401 응답의 Bearer 챌린지에서 추출한 정보 (H5 사다리 입력).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct AuthChallengeInfo {
+    /// RFC 9728 §5.1 resource_metadata — PRM 발견 1순위 후보.
+    resource_metadata: Option<String>,
+    /// RFC 6750 §3 scope — 승인 요청 scope의 1순위 소스.
+    scope: Option<String>,
+}
 
-/// OAuth flow 결과: 입력했던 label과 (토큰 또는 에러 문자열).
-type OAuthResult = (String, Result<auth::OAuthToken, String>);
+/// 백그라운드 실행 실패 (H5): 401/403이면 auth에 챌린지가 실린다.
+#[derive(Debug)]
+struct ExecFailure {
+    message: String,
+    auth: Option<AuthChallengeInfo>,
+}
 
-/// OAuth 연결 진행 상태.
-enum OAuthStatus {
-    Waiting,
-    Done(String),
-    Failed(String),
+/// 백그라운드 refresh 부수효과 — drain이 만료 시각 메타데이터(oauth_json)를 영속한다.
+/// 세대(stale) 여부와 무관하게 적용한다 (전역 상태이므로).
+struct RefreshUpdate {
+    credential_id: String,
+    expires_at_secs: Option<u64>,
+}
+
+/// 백그라운드 연결 테스트 결과.
+struct DiscoverOutcome {
+    server_id: String,
+    /// 요청 시점의 http url — drain에서 현재 row.url과 불일치하면 stale로 폐기
+    /// (url 편집 저장과의 race 방어, H3 리뷰 P2). stdio는 None.
+    request_url: Option<String>,
+    result: Result<Vec<McpTool>, ExecFailure>,
+    refresh: Option<RefreshUpdate>,
 }
 
 /// 진행 중인 도구 실행 (한 번에 하나). 정책 평가 → (필요 시) 승인 → tools/call → 감사.
@@ -85,12 +128,145 @@ enum InvokePhase {
 enum InvokeMsg {
     /// 스키마 재확인 완료 — 현재(호출 시점) schema hash. 재승인 판정에 이걸 쓴다.
     Prepared(String),
-    /// tools/call 결과 (성공 pretty JSON | 실패 에러)
-    Result(Result<String, String>),
+    /// tools/call 결과 (성공 pretty JSON | 실패 — 401/403이면 auth 챌린지 포함)
+    Result(Result<String, ExecFailure>),
 }
 
-/// 백그라운드 결과: (실행 세대, 메시지). 세대가 일치할 때만 반영.
-type InvokeResult = (u64, InvokeMsg);
+/// 백그라운드 결과: (실행 세대, 메시지, refresh 부수효과). 세대가 일치할 때만
+/// 메시지를 반영하고, refresh 부수효과는 세대와 무관하게 영속한다.
+type InvokeResult = (u64, InvokeMsg, Option<RefreshUpdate>);
+
+/// OAuth 승인 진행 상태 (H5) — 브라우저 flow는 한 번에 하나만.
+struct OAuthFlow {
+    server_id: String,
+    server_name: String,
+    server_url: String,
+    /// stale 결과 폐기용 세대 — 취소/재시작 시 증가한다.
+    generation: u64,
+    stage: OAuthStage,
+}
+
+enum OAuthStage {
+    /// 발견 체인(PRM → AS 메타데이터) 백그라운드 실행 중.
+    Discovering,
+    /// 발견 완료 — 브라우저 승인 진입 동의 대기 (authority 표시).
+    Consent(DiscoveredAuth),
+    /// DCR 미지원/거부 — 수동 client_id 입력 대기 (폴백).
+    ManualClient {
+        discovered: DiscoveredAuth,
+        reason: String,
+        client_id: String,
+        client_secret: String,
+    },
+    /// 등록 → 브라우저 승인 → 사다리 재시도 진행 중.
+    Authorizing,
+}
+
+/// 발견 체인의 결과 — AS 메타데이터 + 요청할 scope.
+#[derive(Debug, Clone)]
+struct DiscoveredAuth {
+    metadata: auth::AuthorizationServerMetadata,
+    scopes: Vec<String>,
+}
+
+/// 사다리(stage B)의 클라이언트 등록 출처.
+enum ClientPlan {
+    /// 기존 바인딩의 client 재사용 (issuer 일치 시).
+    Stored {
+        client_id: String,
+        client_secret: Option<SecretString>,
+        manual: bool,
+    },
+    /// RFC 7591 동적 등록.
+    Dcr,
+    /// 수동 입력 폴백 (DCR 미지원/거부).
+    Manual {
+        client_id: String,
+        client_secret: Option<SecretString>,
+    },
+}
+
+/// 사다리 성공 페이로드 — 토큰과 바인딩 메타는 UI 스레드(drain_oauth)가 영속한다.
+struct LadderSuccess {
+    connection: OAuthConnection,
+    token: auth::OAuthToken,
+    /// DCR이 발급한 client_secret — keyring `{id}.dcr`에 저장(없으면 entry 삭제).
+    client_secret: Option<SecretString>,
+    /// 사다리 마지막 성공 요청(tools/list)의 결과 — "완료 후 자동 재시도"의 산물.
+    tools: Vec<McpTool>,
+}
+
+/// 사다리 종료 상태.
+enum LadderEnd {
+    Success(Box<LadderSuccess>),
+    /// DCR 미지원/거부 — 수동 client_id 입력 폴백으로 전환.
+    NeedManualClient {
+        reason: String,
+    },
+    Failed(String),
+}
+
+/// OAuth flow 백그라운드 메시지.
+enum OAuthMsg {
+    Discovered(Box<Result<DiscoveredAuth, String>>),
+    /// discovered를 되돌려줘 수동 입력 단계가 이어서 쓴다.
+    NeedManualClient {
+        discovered: Box<DiscoveredAuth>,
+        reason: String,
+    },
+    Finished(Box<Result<LadderSuccess, String>>),
+}
+
+/// OAuth flow 결과: (세대, 메시지). 세대가 일치할 때만 반영.
+type OAuthFlowResult = (u64, OAuthMsg);
+
+/// http 서버 OAuth 연계 메타데이터 (H5) — credentials.oauth_json(v20)에 저장.
+/// **비밀 아님**: 비밀은 전부 keyring (access={id}, refresh={id}.refresh,
+/// DCR client_secret={id}.dcr — §2.1).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct OAuthConnection {
+    /// 바인딩된 mcp_servers.id.
+    server_id: String,
+    /// **동의 시점**의 서버 URL — 현재 url과 일치할 때만 Bearer를 부착한다
+    /// (차용: mainThreadMcp.ts "token is only released to a server whose current
+    /// URL matches the one the user consented to").
+    server_url: String,
+    /// 발견된 AS issuer/endpoint — 재승인·refresh가 재사용한다.
+    issuer: String,
+    authorization_endpoint: String,
+    token_endpoint: String,
+    client_id: String,
+    /// true면 수동 입력 client — 재등록(DCR) 사다리를 건너뛴다.
+    #[serde(default)]
+    manual_client: bool,
+    #[serde(default)]
+    scopes: Vec<String>,
+    /// access token 만료 시각 (unix 초) — 만료 5분 전 선제 refresh 판정 (H4 정책).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at_secs: Option<u64>,
+}
+
+/// http 서버의 Bearer 부착 해석 결과 (UI 스레드에서 DB/keyring을 읽어 만든다).
+enum HttpAuth {
+    /// 바인딩 없음 — Bearer 없이 요청한다 (401이면 승인 필요 카드).
+    None,
+    /// 동의 시점 URL ≠ 현재 URL — **부착 거부** (토큰 URL 바인딩). 요청은 Bearer
+    /// 없이 나가고, 401이면 재동의(승인 카드) 경로를 탄다.
+    UrlMismatch,
+    /// 바인딩 유효 — access 부착 + refresh 재료.
+    Bound {
+        access: Option<SecretString>,
+        state: HttpAuthState,
+    },
+}
+
+/// 백그라운드 refresh에 필요한 재료 (스레드로 이동 가능한 소유 데이터).
+struct HttpAuthState {
+    credential_id: String,
+    refresh_params: auth::RefreshParams,
+    /// 만료 5분 전(H4 REFRESH_MARGIN) — 요청 전에 선제 refresh.
+    needs_refresh: bool,
+}
 
 /// 추가 폼의 서버 종류 (H3) — mcp_servers.kind 'stdio' | 'http'에 대응.
 #[derive(Clone, Copy, PartialEq)]
@@ -156,6 +332,11 @@ pub struct StoredOAuthCredential {
 
 pub trait OAuthCredentialStore {
     fn store_oauth_token(&self, token: &auth::OAuthToken) -> anyhow::Result<StoredOAuthCredential>;
+    /// 기존 credential id 아래 토큰 재저장 (재승인 — H5). keyring 규약은 store와 동일.
+    fn update_oauth_token(&self, id: &str, token: &auth::OAuthToken) -> anyhow::Result<()>;
+    /// DCR client_secret 저장/삭제 (H5) — Some이면 keyring `{id}.dcr`에, None이면
+    /// entry 제거 (재등록으로 secret이 사라진 경우 잔여 방지).
+    fn set_dcr_secret(&self, id: &str, secret: Option<&SecretString>) -> anyhow::Result<()>;
     fn delete_oauth_token(&self, id: &str) -> anyhow::Result<()>;
 }
 
@@ -169,6 +350,11 @@ pub trait McpScopedEnvResolver {
 
 pub struct ConnectorsUi {
     redaction: RedactionService,
+    /// keyring 접근 (H5) — 백그라운드 refresh 스레드로 clone해 넘긴다.
+    secret_store: Arc<dyn SecretStore>,
+    /// refresh single-flight 조율자 (H5) — **App이 보관하는 프로세스 단일 인스턴스의
+    /// Arc 클론**이어야 동시 도구 호출의 refresh가 합쳐진다 (H4 규약).
+    refresh: Arc<auth::RefreshCoordinator>,
     // 추가 폼
     name: String,
     /// 추가 폼 종류 선택 (H3): stdio | http
@@ -181,8 +367,8 @@ pub struct ConnectorsUi {
     error: Option<String>,
     cached: Option<Vec<McpServerRow>>,
     status: HashMap<String, ConnStatus>,
-    result_tx: mpsc::Sender<DiscoverResult>,
-    result_rx: mpsc::Receiver<DiscoverResult>,
+    result_tx: mpsc::Sender<DiscoverOutcome>,
+    result_rx: mpsc::Receiver<DiscoverOutcome>,
     // http 신뢰/편집 (H3)
     /// 이번 세션에서 원격 전송을 확인한 http 서버 id — 최초 연결 전 1회 확인 모달
     trusted_http: HashSet<String>,
@@ -192,16 +378,11 @@ pub struct ConnectorsUi {
     import_input: String,
     /// 마지막 가져오기 결과 요약 (서버별 등록/건너뜀/실패 한 줄씩)
     import_report: Vec<String>,
-    // OAuth 폼 (PR-18)
-    oauth_label: String,
-    oauth_auth_url: String,
-    oauth_token_url: String,
-    oauth_client_id: String,
-    /// 공백 구분
-    oauth_scopes: String,
-    oauth_status: Option<OAuthStatus>,
-    oauth_tx: mpsc::Sender<OAuthResult>,
-    oauth_rx: mpsc::Receiver<OAuthResult>,
+    // OAuth 승인 flow (H5, 401 사다리)
+    oauth_flow: Option<OAuthFlow>,
+    oauth_gen: u64,
+    oauth_tx: mpsc::Sender<OAuthFlowResult>,
+    oauth_rx: mpsc::Receiver<OAuthFlowResult>,
     // 도구 실행/승인 (PR-16): 규칙은 인메모리(세션 범위 — 재시작 시 초기화)
     policy: audit::PermissionPolicy,
     invoke: Option<ToolInvoke>,
@@ -213,12 +394,18 @@ pub struct ConnectorsUi {
 }
 
 impl ConnectorsUi {
-    pub fn new(redaction: RedactionService) -> Self {
+    pub fn new(
+        redaction: RedactionService,
+        secret_store: Arc<dyn SecretStore>,
+        refresh: Arc<auth::RefreshCoordinator>,
+    ) -> Self {
         let (result_tx, result_rx) = mpsc::channel();
         let (oauth_tx, oauth_rx) = mpsc::channel();
         let (invoke_tx, invoke_rx) = mpsc::channel();
         Self {
             redaction,
+            secret_store,
+            refresh,
             name: String::new(),
             add_kind: AddKind::Stdio,
             command: String::new(),
@@ -234,12 +421,8 @@ impl ConnectorsUi {
             url_edit: None,
             import_input: String::new(),
             import_report: Vec::new(),
-            oauth_label: String::new(),
-            oauth_auth_url: String::new(),
-            oauth_token_url: String::new(),
-            oauth_client_id: String::new(),
-            oauth_scopes: String::new(),
-            oauth_status: None,
+            oauth_flow: None,
+            oauth_gen: 0,
             oauth_tx,
             oauth_rx,
             policy: audit::PermissionPolicy::new(),
@@ -258,8 +441,12 @@ impl ConnectorsUi {
     }
 
     /// 백그라운드 tools/call 결과를 현재 invoke 상태에 반영.
-    pub fn drain_invoke(&mut self) {
-        while let Ok((generation, msg)) = self.invoke_rx.try_recv() {
+    /// refresh 부수효과(만료 시각)는 세대와 무관하게 영속한다 — 전역 상태이므로.
+    pub fn drain_invoke(&mut self, db: &Db) {
+        while let Ok((generation, msg, refresh)) = self.invoke_rx.try_recv() {
+            if let Some(update) = refresh {
+                persist_refresh_update(db, &update);
+            }
             // 세대 일치할 때만 반영 — 다른 tool을 새로 시작했으면 이전 백그라운드
             // 결과는 무시한다 (stale 결과 race). Prepared는 패널이 정책 평가에 소비한다.
             if let Some(inv) = &mut self.invoke
@@ -268,7 +455,21 @@ impl ConnectorsUi {
                 match msg {
                     InvokeMsg::Prepared(hash) => inv.prepared_hash = Some(hash),
                     InvokeMsg::Result(Ok(output)) => inv.phase = InvokePhase::Done(output),
-                    InvokeMsg::Result(Err(err)) => inv.phase = InvokePhase::Failed(err),
+                    InvokeMsg::Result(Err(failure)) => {
+                        // 401/403이면 서버 카드를 "승인 필요"로 전환 (H5) — 승인 후
+                        // 자동 재시도(tools 재발견)는 사다리가 수행하고, 도구 실행은
+                        // 사용자가 다시 시작한다.
+                        if let Some(challenge) = failure.auth {
+                            self.status.insert(
+                                inv.server_id.clone(),
+                                ConnStatus::NeedsAuth {
+                                    message: failure.message.clone(),
+                                    challenge,
+                                },
+                            );
+                        }
+                        inv.phase = InvokePhase::Failed(failure.message);
+                    }
                 }
             }
         }
@@ -337,7 +538,10 @@ impl ConnectorsUi {
         }
 
         // http 서버 최초 연결 신뢰 확인 모달 (H3) — 확인하면 이번 세션 동안 기억한다
-        self.trust_prompt_modal(ui, ctx, env_resolver, catalog);
+        self.trust_prompt_modal(ui, ctx, db, env_resolver, catalog);
+
+        // OAuth 승인 flow 모달 (H5): 발견 → 동의 → (수동 client_id) → 브라우저 승인
+        self.oauth_flow_modal(ui, ctx, db, catalog);
 
         ui.separator();
         ui.label(catalog.t("connectors.add_mcp", &[]));
@@ -439,136 +643,376 @@ impl ConnectorsUi {
         for line in &self.import_report {
             ui.weak(line);
         }
-
-        // OAuth 커넥터 (PR-18): external browser + PKCE + localhost callback
-        ui.separator();
-        ui.heading(catalog.t("connectors.oauth", &[]));
-        ui.horizontal(|ui| {
-            ui.label(catalog.t("common.name", &[]));
-            ui.text_edit_singleline(&mut self.oauth_label);
-        });
-        ui.horizontal(|ui| {
-            ui.label("authorize URL");
-            ui.text_edit_singleline(&mut self.oauth_auth_url);
-        });
-        ui.horizontal(|ui| {
-            ui.label("token URL");
-            ui.text_edit_singleline(&mut self.oauth_token_url);
-        });
-        ui.horizontal(|ui| {
-            ui.label("client id");
-            ui.text_edit_singleline(&mut self.oauth_client_id);
-        });
-        ui.horizontal(|ui| {
-            ui.label(catalog.t("connectors.oauth_scopes", &[]));
-            ui.text_edit_singleline(&mut self.oauth_scopes);
-        });
-        let waiting = matches!(self.oauth_status, Some(OAuthStatus::Waiting));
-        if ui
-            .add_enabled(
-                !waiting,
-                egui::Button::new(catalog.t("connectors.connect_browser", &[])),
-            )
-            .clicked()
-        {
-            self.start_oauth(ctx);
-        }
-        match &self.oauth_status {
-            None => {}
-            Some(OAuthStatus::Waiting) => {
-                ui.weak(catalog.t("connectors.oauth_waiting", &[]));
-            }
-            Some(OAuthStatus::Done(label)) => {
-                ui.colored_label(
-                    egui::Color32::from_rgb(0x2e, 0xa0, 0x43),
-                    catalog.t("connectors.oauth_done", &[("label", label)]),
-                );
-            }
-            Some(OAuthStatus::Failed(msg)) => {
-                ui.colored_label(
-                    egui::Color32::RED,
-                    catalog.t("connectors.failed", &[("message", msg)]),
-                );
-            }
-        }
     }
 
-    /// OAuth flow를 백그라운드로 시작한다 (브라우저 승인 대기까지 블로킹이므로).
-    fn start_oauth(&mut self, ctx: &egui::Context) {
-        let label = self.oauth_label.trim().to_owned();
-        if label.is_empty()
-            || self.oauth_auth_url.trim().is_empty()
-            || self.oauth_token_url.trim().is_empty()
-            || self.oauth_client_id.trim().is_empty()
-        {
-            self.oauth_status = Some(OAuthStatus::Failed(
-                "이름·authorize URL·token URL·client id는 필수입니다".to_owned(),
-            ));
-            return;
+    /// [브라우저로 승인] 진입 (H5): 발견 체인(PRM → AS 메타데이터)을 백그라운드로
+    /// 시작한다. 브라우저는 아직 열지 않는다 — 발견 결과의 authority를 보여주는
+    /// 동의 다이얼로그를 통과해야 stage B(등록+브라우저)로 넘어간다.
+    fn start_oauth_discovery(
+        &mut self,
+        ctx: &egui::Context,
+        server: &McpServerRow,
+        challenge: AuthChallengeInfo,
+    ) {
+        if self.oauth_flow.is_some() {
+            return; // 브라우저 flow는 한 번에 하나
         }
-        let config = auth::OAuthProviderConfig {
-            auth_url: self.oauth_auth_url.trim().to_owned(),
-            token_url: self.oauth_token_url.trim().to_owned(),
-            client_id: self.oauth_client_id.trim().to_owned(),
-            scopes: self
-                .oauth_scopes
-                .split_whitespace()
-                .map(str::to_owned)
-                .collect(),
+        let Some(url) = server
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(str::to_owned)
+        else {
+            self.error = Some("http MCP 서버에 url이 없습니다".to_owned());
+            return;
         };
-        self.oauth_status = Some(OAuthStatus::Waiting);
+        self.oauth_gen += 1;
+        let generation = self.oauth_gen;
+        self.oauth_flow = Some(OAuthFlow {
+            server_id: server.id.clone(),
+            server_name: server.name.clone(),
+            server_url: url.clone(),
+            generation,
+            stage: OAuthStage::Discovering,
+        });
         let tx = self.oauth_tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result =
-                auth::run_flow(&config, Duration::from_secs(180)).map_err(|e| format!("{e:#}"));
-            let _ = tx.send((label, result));
+            let result = discover_auth_metadata(OAUTH_HTTP_TIMEOUT, &url, &challenge)
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send((generation, OAuthMsg::Discovered(Box::new(result))));
             ctx.request_repaint();
         });
     }
 
-    /// OAuth 결과 반영: keyring 저장 → credentials 등록 → redaction 시드.
-    /// 중간 실패 시 keyring 고아 토큰을 지운다. credential을 추가했으면 true.
-    pub fn drain_oauth(&mut self, db: &Db, oauth_store: &dyn OAuthCredentialStore) -> bool {
+    /// 동의 이후 stage B (H5): 클라이언트 확보(저장분/DCR/수동) → 외부 브라우저
+    /// PKCE → Bearer 재시도 사다리. 전부 백그라운드 — 결과는 drain_oauth가 반영.
+    fn start_oauth_authorize(
+        &mut self,
+        ctx: &egui::Context,
+        discovered: DiscoveredAuth,
+        plan: ClientPlan,
+    ) {
+        let Some(flow) = &mut self.oauth_flow else {
+            return;
+        };
+        flow.stage = OAuthStage::Authorizing;
+        let server_id = flow.server_id.clone();
+        let server_name = flow.server_name.clone();
+        let server_url = flow.server_url.clone();
+        let generation = flow.generation;
+        let manager = LocalMcpManager::new(self.redaction.clone());
+        let tx = self.oauth_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            // 브라우저 왕복 추상화 — 테스트는 이 자리를 콜백 직접 호출로 대체한다.
+            let resource = server_url.clone();
+            let authorize = move |config: &auth::OAuthProviderConfig| {
+                auth::run_flow_with_resource(config, BROWSER_FLOW_TIMEOUT, Some(&resource))
+            };
+            let end = run_oauth_ladder(
+                &manager,
+                OAUTH_HTTP_TIMEOUT,
+                &server_id,
+                &server_name,
+                &server_url,
+                &discovered,
+                plan,
+                &authorize,
+            );
+            let msg = match end {
+                LadderEnd::Success(success) => OAuthMsg::Finished(Box::new(Ok(*success))),
+                LadderEnd::NeedManualClient { reason } => OAuthMsg::NeedManualClient {
+                    discovered: Box::new(discovered),
+                    reason,
+                },
+                LadderEnd::Failed(message) => OAuthMsg::Finished(Box::new(Err(message))),
+            };
+            let _ = tx.send((generation, msg));
+            ctx.request_repaint();
+        });
+    }
+
+    /// OAuth flow 백그라운드 결과 반영 (H5): 발견 결과 → 동의 단계 전환, 수동
+    /// client_id 폴백 전환, 사다리 성공 시 keyring 저장 + credentials(oauth_json
+    /// 바인딩) 등록 + redaction 시드 + tools 반영(자동 재시도 결과).
+    /// credential을 추가/갱신했으면 true (호출측 캐시 무효화).
+    pub fn drain_oauth(&mut self, db: &mut Db, oauth_store: &dyn OAuthCredentialStore) -> bool {
         let mut added = false;
-        while let Ok((label, result)) = self.oauth_rx.try_recv() {
-            let token = match result {
-                Ok(token) => token,
-                Err(msg) => {
-                    self.oauth_status = Some(OAuthStatus::Failed(msg));
-                    continue;
+        while let Ok((generation, msg)) = self.oauth_rx.try_recv() {
+            // 취소됐거나(None) 재시작한(세대 불일치) flow의 결과는 폐기한다
+            let (server_id, server_name) = match &self.oauth_flow {
+                Some(flow) if flow.generation == generation => {
+                    (flow.server_id.clone(), flow.server_name.clone())
                 }
+                _ => continue,
             };
-            let stored = match oauth_store.store_oauth_token(&token) {
-                Ok(stored) => stored,
-                Err(e) => {
-                    self.oauth_status =
-                        Some(OAuthStatus::Failed(format!("keyring 저장 실패: {e:#}")));
-                    continue;
+            match msg {
+                OAuthMsg::Discovered(result) => match *result {
+                    Ok(discovered) => {
+                        if let Some(flow) = &mut self.oauth_flow {
+                            flow.stage = OAuthStage::Consent(discovered);
+                        }
+                    }
+                    Err(message) => {
+                        self.status.insert(
+                            server_id,
+                            ConnStatus::Failed(format!("인증 서버 발견 실패: {message}")),
+                        );
+                        self.oauth_flow = None;
+                    }
+                },
+                OAuthMsg::NeedManualClient { discovered, reason } => {
+                    if let Some(flow) = &mut self.oauth_flow {
+                        flow.stage = OAuthStage::ManualClient {
+                            discovered: *discovered,
+                            reason,
+                            client_id: String::new(),
+                            client_secret: String::new(),
+                        };
+                    }
                 }
-            };
-            let meta = CredentialMeta {
-                id: stored.id.clone(),
-                provider: "oauth".to_owned(),
-                label: label.clone(),
-                credential_kind: "oauth_token".to_owned(),
-                masked_hint: Some(stored.masked_hint),
-                // 커넥터(OAuth) credential은 MCP 서버(전역)와 짝 — 전역 공유(#2).
-                workspace_id: None,
-            };
-            if let Err(e) = db.insert_credential(&meta) {
-                // 고아 토큰 정리 (access + refresh)
-                if let Err(rollback) = oauth_store.delete_oauth_token(&stored.id) {
-                    tracing::warn!("OAuth token rollback 실패: {rollback:#}");
+                OAuthMsg::Finished(result) => {
+                    self.oauth_flow = None;
+                    match *result {
+                        Ok(success) => {
+                            match self.store_ladder_success(db, oauth_store, &server_name, success)
+                            {
+                                Ok(tools) => {
+                                    self.status
+                                        .insert(server_id, ConnStatus::Connected { tools });
+                                    added = true;
+                                }
+                                Err(e) => {
+                                    self.status.insert(
+                                        server_id,
+                                        ConnStatus::Failed(format!("승인 결과 저장 실패: {e:#}")),
+                                    );
+                                }
+                            }
+                        }
+                        Err(message) => {
+                            // 승인 실패는 다시 시도할 수 있는 상태 — 기존 챌린지를
+                            // 유지한 채 "승인 필요"로 되돌린다.
+                            let challenge = match self.status.get(&server_id) {
+                                Some(ConnStatus::NeedsAuth { challenge, .. }) => challenge.clone(),
+                                _ => AuthChallengeInfo::default(),
+                            };
+                            self.status
+                                .insert(server_id, ConnStatus::NeedsAuth { message, challenge });
+                        }
+                    }
                 }
-                self.oauth_status =
-                    Some(OAuthStatus::Failed(format!("credential 등록 실패: {e:#}")));
-                continue;
             }
-            self.oauth_status = Some(OAuthStatus::Done(label));
-            added = true;
         }
         added
+    }
+
+    /// 사다리 성공 영속 (UI 스레드): 토큰 keyring 저장(기존 바인딩이 있으면 같은
+    /// credential 재사용 — env 참조 유지) → oauth_json 바인딩 메타 → DCR secret →
+    /// tools 반영. 성공 시 저장한 tool 수를 돌려준다.
+    fn store_ladder_success(
+        &mut self,
+        db: &mut Db,
+        oauth_store: &dyn OAuthCredentialStore,
+        server_name: &str,
+        success: LadderSuccess,
+    ) -> anyhow::Result<usize> {
+        let server_id = success.connection.server_id.clone();
+        let existing = oauth_binding_for_server(db, &server_id).map(|(id, _)| id);
+        let credential_id = match existing {
+            Some(id) => {
+                oauth_store
+                    .update_oauth_token(&id, &success.token)
+                    .context("keyring 토큰 갱신 실패")?;
+                id
+            }
+            None => {
+                let stored = oauth_store
+                    .store_oauth_token(&success.token)
+                    .context("keyring 저장 실패")?;
+                let meta = CredentialMeta {
+                    id: stored.id.clone(),
+                    provider: "oauth".to_owned(),
+                    label: server_name.to_owned(),
+                    credential_kind: "oauth_token".to_owned(),
+                    masked_hint: Some(stored.masked_hint),
+                    // 커넥터(OAuth) credential은 MCP 서버(전역)와 짝 — 전역 공유(#2).
+                    workspace_id: None,
+                };
+                if let Err(e) = db.insert_credential(&meta) {
+                    // 고아 토큰 정리 (access + refresh + dcr)
+                    if let Err(rollback) = oauth_store.delete_oauth_token(&stored.id) {
+                        tracing::warn!("OAuth token rollback 실패: {rollback:#}");
+                    }
+                    return Err(e.context("credential 등록 실패"));
+                }
+                stored.id
+            }
+        };
+        if let Err(e) = oauth_store.set_dcr_secret(&credential_id, success.client_secret.as_ref()) {
+            tracing::warn!("DCR client_secret 저장 실패: {e:#}");
+        }
+        let json = serde_json::to_string(&success.connection).context("바인딩 메타 직렬화 실패")?;
+        db.set_credential_oauth_json(&credential_id, &json)
+            .context("바인딩 메타 저장 실패")?;
+        // 사다리 마지막 성공 요청(tools/list)의 결과 반영 — "완료 후 자동 재시도"
+        let rows = tool_rows(&server_id, &success.tools);
+        db.replace_mcp_tools(&server_id, &rows)
+            .context("tools 저장 실패")?;
+        Ok(rows.len())
+    }
+
+    /// OAuth flow 모달 (H5): 단계별 다이얼로그 — 발견 중 / 브라우저 승인 동의 /
+    /// 수동 client_id 폴백 / 승인 대기. 취소하면 세대를 올려 stale 결과를 폐기한다.
+    fn oauth_flow_modal(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        db: &Db,
+        catalog: &i18n::Catalog,
+    ) {
+        let Some(flow) = &mut self.oauth_flow else {
+            return;
+        };
+        enum Act {
+            None,
+            Cancel,
+            Consent(DiscoveredAuth),
+            Manual(DiscoveredAuth, String, String),
+        }
+        let mut act = Act::None;
+        let server_name = flow.server_name.clone();
+        egui::Window::new(catalog.t("connectors.oauth_flow_title", &[]))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                match &mut flow.stage {
+                    OAuthStage::Discovering => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(catalog.t("connectors.oauth_discovering", &[]));
+                        });
+                    }
+                    OAuthStage::Consent(discovered) => {
+                        // 브라우저 승인 진입 동의 — 서버가 사용자를 임의 인증 서버로
+                        // 보내는 것을 막는 마지막 게이트 (차용: mainThreadMcp loginPrompt).
+                        let authority = authority_of(&discovered.metadata.authorization_endpoint);
+                        ui.label(catalog.t(
+                            "connectors.oauth_consent_body",
+                            &[("name", &server_name), ("authority", &authority)],
+                        ));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(catalog.t("connectors.approve_browser", &[]))
+                                .clicked()
+                            {
+                                act = Act::Consent(discovered.clone());
+                            }
+                            if ui.button(catalog.t("action.cancel", &[])).clicked() {
+                                act = Act::Cancel;
+                            }
+                        });
+                    }
+                    OAuthStage::ManualClient {
+                        discovered,
+                        reason,
+                        client_id,
+                        client_secret,
+                    } => {
+                        ui.label(catalog.t("connectors.oauth_manual_note", &[("reason", reason)]));
+                        ui.weak(catalog.t("connectors.oauth_manual_hint", &[]));
+                        ui.horizontal(|ui| {
+                            ui.label("client id");
+                            ui.text_edit_singleline(client_id);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("client secret");
+                            ui.add(egui::TextEdit::singleline(client_secret).password(true));
+                        });
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    !client_id.trim().is_empty(),
+                                    egui::Button::new(catalog.t("connectors.oauth_continue", &[])),
+                                )
+                                .clicked()
+                            {
+                                act = Act::Manual(
+                                    discovered.clone(),
+                                    client_id.trim().to_owned(),
+                                    client_secret.trim().to_owned(),
+                                );
+                            }
+                            if ui.button(catalog.t("action.cancel", &[])).clicked() {
+                                act = Act::Cancel;
+                            }
+                        });
+                    }
+                    OAuthStage::Authorizing => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(catalog.t("connectors.oauth_waiting", &[]));
+                        });
+                        if ui.button(catalog.t("action.cancel", &[])).clicked() {
+                            act = Act::Cancel;
+                        }
+                    }
+                }
+            });
+        match act {
+            Act::None => {}
+            Act::Cancel => {
+                // 진행 중 백그라운드 결과는 세대 증가로 폐기된다. 브라우저 flow
+                // 스레드는 자체 timeout(BROWSER_FLOW_TIMEOUT)으로 소멸한다.
+                self.oauth_gen += 1;
+                self.oauth_flow = None;
+            }
+            Act::Consent(discovered) => {
+                // 기존 바인딩의 client 재사용 (같은 issuer) — 없으면 DCR부터.
+                let plan = self
+                    .stored_client_plan(db, &discovered)
+                    .unwrap_or(ClientPlan::Dcr);
+                self.start_oauth_authorize(ctx, discovered, plan);
+            }
+            Act::Manual(discovered, client_id, client_secret) => {
+                let secret = if client_secret.is_empty() {
+                    None
+                } else {
+                    Some(SecretString::new(client_secret))
+                };
+                self.start_oauth_authorize(
+                    ctx,
+                    discovered,
+                    ClientPlan::Manual {
+                        client_id,
+                        client_secret: secret,
+                    },
+                );
+            }
+        }
+    }
+
+    /// 기존 바인딩(oauth_json)의 client 재사용 판단 — 발견된 issuer와 일치할 때만.
+    fn stored_client_plan(&self, db: &Db, discovered: &DiscoveredAuth) -> Option<ClientPlan> {
+        let flow = self.oauth_flow.as_ref()?;
+        let (credential_id, connection) = oauth_binding_for_server(db, &flow.server_id)?;
+        if connection.issuer != discovered.metadata.issuer {
+            return None;
+        }
+        let client_secret = self
+            .secret_store
+            .get_secret(&auth::dcr_secret_entry_id(&credential_id))
+            .ok();
+        Some(ClientPlan::Stored {
+            client_id: connection.client_id,
+            client_secret,
+            manual: connection.manual_client,
+        })
     }
 
     fn server_card(
@@ -595,6 +1039,12 @@ impl ConnectorsUi {
                     ));
                 }
             });
+            // NeedsAuth 챌린지는 [브라우저로 승인]의 입력 — 상태 borrow 밖으로 복제
+            let needs_auth = match self.status.get(&server.id) {
+                Some(ConnStatus::NeedsAuth { challenge, .. }) => Some(challenge.clone()),
+                _ => None,
+            };
+            let mut approve: Option<AuthChallengeInfo> = None;
             ui.horizontal(|ui| {
                 match self.status.get(&server.id) {
                     None => ui.weak(catalog.t("connectors.unchecked", &[])),
@@ -610,6 +1060,13 @@ impl ConnectorsUi {
                         egui::Color32::RED,
                         catalog.t("connectors.failed", &[("message", msg)]),
                     ),
+                    // 승인 필요(H5): 에러가 아니라 사용자 개입 지점 — 호박색 + 승인 버튼
+                    Some(ConnStatus::NeedsAuth { message, .. }) => ui
+                        .colored_label(
+                            egui::Color32::from_rgb(0xd0, 0x8a, 0x00),
+                            catalog.t("connectors.needs_auth", &[]),
+                        )
+                        .on_hover_text(message.clone()),
                 };
                 let checking = matches!(self.status.get(&server.id), Some(ConnStatus::Checking));
                 if ui
@@ -619,9 +1076,22 @@ impl ConnectorsUi {
                     )
                     .clicked()
                 {
-                    self.request_discover(ctx, server, env_resolver);
+                    self.request_discover(ctx, db, server, env_resolver);
+                }
+                if let Some(challenge) = needs_auth
+                    && ui
+                        .add_enabled(
+                            self.oauth_flow.is_none(),
+                            egui::Button::new(catalog.t("connectors.approve_browser", &[])),
+                        )
+                        .clicked()
+                {
+                    approve = Some(challenge);
                 }
             });
+            if let Some(challenge) = approve {
+                self.start_oauth_discovery(ctx, server, challenge);
+            }
             // http 서버 url 편집 (H3) — 저장 시 Allow 규칙 초기화 + 캐시 무효화 + 재확인
             if server.kind == "http" {
                 self.url_edit_controls(ui, db, server, catalog);
@@ -712,6 +1182,7 @@ impl ConnectorsUi {
     fn request_discover(
         &mut self,
         ctx: &egui::Context,
+        db: &Db,
         server: &McpServerRow,
         env_resolver: &dyn McpScopedEnvResolver,
     ) {
@@ -722,7 +1193,7 @@ impl ConnectorsUi {
             });
             return;
         }
-        self.start_discover(ctx, server, env_resolver);
+        self.start_discover(ctx, db, server, env_resolver);
     }
 
     /// http 서버 최초 연결 신뢰 확인 모달 (H3, VS Code mcpRegistry 신뢰 프롬프트 차용).
@@ -731,6 +1202,7 @@ impl ConnectorsUi {
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
+        db: &Db,
         env_resolver: &dyn McpScopedEnvResolver,
         catalog: &i18n::Catalog,
     ) {
@@ -765,7 +1237,7 @@ impl ConnectorsUi {
                 };
                 self.trusted_http.insert(prompt.server.id.clone());
                 match prompt.tool {
-                    None => self.start_discover(ctx, &prompt.server, env_resolver),
+                    None => self.start_discover(ctx, db, &prompt.server, env_resolver),
                     Some(tool) => {
                         if let Err(e) = self.begin_invoke(&prompt.server, &tool) {
                             self.error = Some(format!("실행 준비 실패: {e:#}"));
@@ -1024,7 +1496,7 @@ impl ConnectorsUi {
                 {
                     self.run_tool(&inv, db, workspace_id, ctx, decision, env_resolver)
                 } else {
-                    self.start_prepare(&inv, ctx, env_resolver);
+                    self.start_prepare(&inv, ctx, db, env_resolver);
                     inv.prepared_hash = None;
                     InvokePhase::Preparing
                 };
@@ -1060,38 +1532,64 @@ impl ConnectorsUi {
         }
     }
 
+    /// 백그라운드 실행 컨텍스트 (H5). RefreshCoordinator는 App 보관 단일 인스턴스의
+    /// Arc 클론 — 동시 도구 호출의 refresh가 single-flight로 합쳐진다.
+    fn exec_context(&self) -> ExecContext {
+        ExecContext {
+            manager: LocalMcpManager::new(self.redaction.clone()),
+            coordinator: Arc::clone(&self.refresh),
+            store: Arc::clone(&self.secret_store),
+            redaction: self.redaction.clone(),
+        }
+    }
+
     /// 현재 tool 스키마를 서버에서 다시 가져와 schema hash를 확보한다 (백그라운드).
     /// 저장된 stale hash로 재승인을 우회하지 않도록 호출 직전에 재확인한다.
     fn start_prepare(
         &self,
         inv: &ToolInvoke,
         ctx: &egui::Context,
+        db: &Db,
         env_resolver: &dyn McpScopedEnvResolver,
     ) {
         let config = match config_for_invoke(inv, env_resolver) {
-            Ok(config) => config,
+            Ok(config) => config.with_http_auth(
+                db,
+                self.secret_store.as_ref(),
+                &self.redaction,
+                &inv.server_id,
+            ),
             Err(e) => {
-                let _ = self
-                    .invoke_tx
-                    .send((inv.generation, InvokeMsg::Result(Err(format!("{e:#}")))));
+                let _ = self.invoke_tx.send((
+                    inv.generation,
+                    InvokeMsg::Result(Err(plain_failure_of(e))),
+                    None,
+                ));
                 ctx.request_repaint();
                 return;
             }
         };
-        let manager = LocalMcpManager::new(self.redaction.clone());
+        let cx = self.exec_context();
         let tx = self.invoke_tx.clone();
         let tool_name = inv.tool_name.clone();
         let generation = inv.generation;
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let msg = match config.discover_tools(&manager) {
+            let (result, refresh) = config.discover_tools(&cx);
+            let msg = match result {
                 Ok(tools) => match tools.iter().find(|t| t.name == tool_name) {
                     Some(tool) => InvokeMsg::Prepared(audit::schema_hash(&tool.input_schema_json)),
-                    None => InvokeMsg::Result(Err(format!("tool '{tool_name}'이 서버에 없습니다"))),
+                    None => InvokeMsg::Result(Err(ExecFailure {
+                        message: format!("tool '{tool_name}'이 서버에 없습니다"),
+                        auth: None,
+                    })),
                 },
-                Err(e) => InvokeMsg::Result(Err(format!("스키마 확인 실패: {e:#}"))),
+                Err(failure) => InvokeMsg::Result(Err(ExecFailure {
+                    message: format!("스키마 확인 실패: {}", failure.message),
+                    auth: failure.auth,
+                })),
             };
-            let _ = tx.send((generation, msg));
+            let _ = tx.send((generation, msg, refresh));
             ctx.request_repaint();
         });
     }
@@ -1129,10 +1627,15 @@ impl ConnectorsUi {
             return InvokePhase::Failed("정책상 거부됨".to_owned());
         }
         let config = match config_for_invoke(inv, env_resolver) {
-            Ok(config) => config,
+            Ok(config) => config.with_http_auth(
+                db,
+                self.secret_store.as_ref(),
+                &self.redaction,
+                &inv.server_id,
+            ),
             Err(e) => return InvokePhase::Failed(format!("{e:#}")),
         };
-        let manager = LocalMcpManager::new(self.redaction.clone());
+        let cx = self.exec_context();
         let redaction = self.redaction.clone();
         let tx = self.invoke_tx.clone();
         let tool_name = inv.tool_name.clone();
@@ -1141,14 +1644,18 @@ impl ConnectorsUi {
         std::thread::spawn(move || {
             // 결과/에러 문자열은 표시 전에 등록된 secret을 마스킹한다 (§7 유출 방지).
             // 성공 결과와 에러 메시지(MCP 서버가 secret을 echo할 수 있음) 둘 다 대상.
-            let result = match config.call_tool(&manager, &tool_name, arguments) {
+            let (result, refresh) = config.call_tool(&cx, &tool_name, arguments);
+            let result = match result {
                 Ok(value) => Ok(redact_display(
                     &redaction,
                     &serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
                 )),
-                Err(e) => Err(redact_display(&redaction, &format!("{e:#}"))),
+                Err(failure) => Err(ExecFailure {
+                    message: redact_display(&redaction, &failure.message),
+                    auth: failure.auth,
+                }),
             };
-            let _ = tx.send((generation, InvokeMsg::Result(result)));
+            let _ = tx.send((generation, InvokeMsg::Result(result), refresh));
             ctx.request_repaint();
         });
         InvokePhase::Running
@@ -1159,11 +1666,14 @@ impl ConnectorsUi {
     fn start_discover(
         &mut self,
         ctx: &egui::Context,
+        db: &Db,
         server: &McpServerRow,
         env_resolver: &dyn McpScopedEnvResolver,
     ) {
         let config = match config_for_row(server, env_resolver) {
-            Ok(config) => config,
+            Ok(config) => {
+                config.with_http_auth(db, self.secret_store.as_ref(), &self.redaction, &server.id)
+            }
             Err(e) => {
                 self.status
                     .insert(server.id.clone(), ConnStatus::Failed(format!("{e:#}")));
@@ -1171,33 +1681,66 @@ impl ConnectorsUi {
             }
         };
         self.status.insert(server.id.clone(), ConnStatus::Checking);
-        let manager = LocalMcpManager::new(self.redaction.clone());
+        let cx = self.exec_context();
         let tx = self.result_tx.clone();
         let ctx = ctx.clone();
         let server_id = server.id.clone();
+        // 요청 시점 url — drain에서 url 편집 저장과의 race를 걸러낸다 (H3 리뷰 P2)
+        let request_url = (server.kind == "http").then(|| server.url.clone().unwrap_or_default());
         std::thread::spawn(move || {
-            let result = config
-                .discover_tools(&manager)
-                .map_err(|e| format!("{e:#}"));
-            let _ = tx.send((server_id, result));
+            let (result, refresh) = config.discover_tools(&cx);
+            let _ = tx.send(DiscoverOutcome {
+                server_id,
+                request_url,
+                result,
+                refresh,
+            });
             ctx.request_repaint();
         });
     }
 
     /// 백그라운드 결과 반영: 상태 갱신 + tools를 DB에 교체 저장 (schema_hash 포함).
+    /// refresh 부수효과(만료 시각)는 결과 유효성과 무관하게 영속한다.
     pub fn drain_results(&mut self, db: &mut Db) {
-        while let Ok((server_id, result)) = self.result_rx.try_recv() {
-            let status = match result {
+        while let Ok(outcome) = self.result_rx.try_recv() {
+            if let Some(update) = &outcome.refresh {
+                persist_refresh_update(db, update);
+            }
+            // url 편집 저장 race 방어 (H3 리뷰 P2): 요청 시점 url이 현재 저장 url과
+            // 다르면 — save_url_edit이 방금 비운 도구 캐시를 구 서버 결과로 재채우지
+            // 않도록 — 결과를 통째로 폐기한다.
+            if let Some(request_url) = &outcome.request_url {
+                let current = db.list_mcp_servers().ok().and_then(|rows| {
+                    rows.into_iter()
+                        .find(|row| row.id == outcome.server_id)
+                        .and_then(|row| row.url)
+                });
+                if current.as_deref().map(str::trim) != Some(request_url.trim()) {
+                    tracing::info!(
+                        server_id = %outcome.server_id,
+                        "stale discover 결과 폐기 (url 변경/서버 삭제)"
+                    );
+                    continue;
+                }
+            }
+            let status = match outcome.result {
                 Ok(tools) => {
-                    let rows = tool_rows(&server_id, &tools);
-                    match db.replace_mcp_tools(&server_id, &rows) {
+                    let rows = tool_rows(&outcome.server_id, &tools);
+                    match db.replace_mcp_tools(&outcome.server_id, &rows) {
                         Ok(()) => ConnStatus::Connected { tools: rows.len() },
                         Err(e) => ConnStatus::Failed(format!("tools 저장 실패: {e:#}")),
                     }
                 }
-                Err(msg) => ConnStatus::Failed(msg),
+                // 401/403은 에러가 아니라 승인 필요 (H5 상태 분리)
+                Err(failure) => match failure.auth {
+                    Some(challenge) => ConnStatus::NeedsAuth {
+                        message: failure.message,
+                        challenge,
+                    },
+                    None => ConnStatus::Failed(failure.message),
+                },
             };
-            self.status.insert(server_id, status);
+            self.status.insert(outcome.server_id, status);
         }
     }
 
@@ -1465,7 +2008,7 @@ impl ConnectorsUi {
                 });
                 if row.kind == "stdio" {
                     // 붙여넣기 → 등록 → 곧바로 연결 확인까지 (수동 테스트 클릭 생략)
-                    self.start_discover(ctx, &row, env_resolver);
+                    self.start_discover(ctx, db, &row, env_resolver);
                 }
                 true
             }
@@ -1521,42 +2064,578 @@ fn mcp_config_for_values(
 #[derive(Debug)]
 enum ConnectorConfig {
     Stdio(McpServerConfig),
-    Http(McpHttpServerConfig),
+    Http(HttpConnectSpec),
+}
+
+/// http 연결 스펙 (H5): config + Bearer refresh 재료. Debug는 내부가 각각 가린다.
+#[derive(Debug)]
+struct HttpConnectSpec {
+    config: McpHttpServerConfig,
+    auth: Option<HttpAuthState>,
+}
+
+impl std::fmt::Debug for HttpAuthState {
+    /// refresh_params의 client_secret은 RefreshParams Debug가 이미 가린다.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpAuthState")
+            .field("credential_id", &self.credential_id)
+            .field("needs_refresh", &self.needs_refresh)
+            .finish()
+    }
+}
+
+/// 백그라운드 실행 컨텍스트 (H5): manager + refresh 조율자 + keyring + redaction.
+struct ExecContext {
+    manager: LocalMcpManager,
+    coordinator: Arc<auth::RefreshCoordinator>,
+    store: Arc<dyn SecretStore>,
+    redaction: RedactionService,
 }
 
 impl ConnectorConfig {
-    /// connect → tools/list — transport별 manager 경로로 위임.
-    fn discover_tools(&self, manager: &LocalMcpManager) -> anyhow::Result<Vec<McpTool>> {
+    /// http 스펙에 Bearer/refresh 해석을 부착한다 (UI 스레드 — DB/keyring 접근).
+    /// 동의 시점 URL ≠ 현재 URL이면 부착을 거부한다 (토큰 URL 바인딩, H5).
+    fn with_http_auth(
+        self,
+        db: &Db,
+        store: &dyn SecretStore,
+        redaction: &RedactionService,
+        server_id: &str,
+    ) -> Self {
         match self {
-            Self::Stdio(config) => manager.discover_tools(config),
-            Self::Http(config) => manager.discover_tools_http(config),
+            Self::Stdio(config) => Self::Stdio(config),
+            Self::Http(mut spec) => {
+                match resolve_http_auth(db, store, redaction, server_id, &spec.config.url) {
+                    HttpAuth::None | HttpAuth::UrlMismatch => {}
+                    HttpAuth::Bound { access, state } => {
+                        spec.config.bearer = access;
+                        spec.auth = Some(state);
+                    }
+                }
+                Self::Http(spec)
+            }
         }
     }
 
-    /// connect → tools/call — transport별 manager 경로로 위임.
+    /// connect → tools/list — transport별 manager 경로로 위임 (http는 refresh 사다리 포함).
+    fn discover_tools(
+        &self,
+        cx: &ExecContext,
+    ) -> (Result<Vec<McpTool>, ExecFailure>, Option<RefreshUpdate>) {
+        match self {
+            Self::Stdio(config) => (
+                cx.manager.discover_tools(config).map_err(plain_failure_of),
+                None,
+            ),
+            Self::Http(spec) => run_http(cx, spec, |config| cx.manager.discover_tools_http(config)),
+        }
+    }
+
+    /// connect → tools/call — transport별 manager 경로로 위임 (http는 refresh 사다리 포함).
     fn call_tool(
         &self,
-        manager: &LocalMcpManager,
+        cx: &ExecContext,
         name: &str,
         arguments: serde_json::Value,
-    ) -> anyhow::Result<serde_json::Value> {
+    ) -> (
+        Result<serde_json::Value, ExecFailure>,
+        Option<RefreshUpdate>,
+    ) {
         match self {
-            Self::Stdio(config) => manager.call_tool(config, name, arguments),
-            Self::Http(config) => manager.call_tool_http(config, name, arguments),
+            Self::Stdio(config) => (
+                cx.manager
+                    .call_tool(config, name, arguments)
+                    .map_err(plain_failure_of),
+                None,
+            ),
+            Self::Http(spec) => run_http(cx, spec, |config| {
+                cx.manager.call_tool_http(config, name, arguments.clone())
+            }),
         }
     }
 }
 
+/// 인증 정보 없는 실패로 변환 (stdio 등).
+fn plain_failure_of(error: anyhow::Error) -> ExecFailure {
+    ExecFailure {
+        message: format!("{error:#}"),
+        auth: None,
+    }
+}
+
+/// http 요청 실행 (H5): 만료 임박이면 선제 refresh → 요청 → Bearer를 붙였는데
+/// 401이면 반응 refresh 1회 후 원요청 1회 재시도. 그래도 401이면 챌린지를 실어
+/// "승인 필요"로 보고한다. refresh는 여기서 최대 1회 — 무한 루프 없음.
+fn run_http<T>(
+    cx: &ExecContext,
+    spec: &HttpConnectSpec,
+    run: impl Fn(&McpHttpServerConfig) -> anyhow::Result<T>,
+) -> (Result<T, ExecFailure>, Option<RefreshUpdate>) {
+    let mut config = spec.config.clone();
+    let mut update = None;
+    let mut refreshed = false;
+    // 선제 refresh: 만료 5분 전(H4 REFRESH_MARGIN) 또는 access 유실 시
+    if let Some(auth_state) = &spec.auth
+        && auth_state.needs_refresh
+    {
+        update = refresh_bearer(cx, auth_state, &mut config);
+        refreshed = true;
+    }
+    let error = match run(&config) {
+        Ok(value) => return (Ok(value), update),
+        Err(error) => error,
+    };
+    let challenge = auth_challenge_of(&error);
+    // 반응 refresh: 저장 토큰을 붙였는데 401 — 만료 시각 메타가 없거나 stale한
+    // 경우다. 이번 호출에서 아직 refresh를 안 했을 때만 1회 갱신 + 1회 재시도.
+    if challenge.is_some()
+        && !refreshed
+        && config.bearer.is_some()
+        && let Some(auth_state) = &spec.auth
+    {
+        update = refresh_bearer(cx, auth_state, &mut config);
+        if update.is_some() && config.bearer.is_some() {
+            match run(&config) {
+                Ok(value) => return (Ok(value), update),
+                Err(retry_error) => {
+                    let auth = auth_challenge_of(&retry_error);
+                    return (
+                        Err(ExecFailure {
+                            message: format!("{retry_error:#}"),
+                            auth,
+                        }),
+                        update,
+                    );
+                }
+            }
+        }
+    }
+    (
+        Err(ExecFailure {
+            message: format!("{error:#}"),
+            auth: challenge,
+        }),
+        update,
+    )
+}
+
+/// refresh 교환을 수행해 새 access를 config.bearer에 반영한다.
+/// 갱신이 일어났으면 Some(RefreshUpdate) — 재시도 판단과 만료 시각 영속에 쓴다.
+/// AS가 거부(재승인 필요)하면 bearer를 비운다 — 이어지는 401이 승인 카드로 이끈다.
+fn refresh_bearer(
+    cx: &ExecContext,
+    auth_state: &HttpAuthState,
+    config: &mut McpHttpServerConfig,
+) -> Option<RefreshUpdate> {
+    match auth::refresh_access_token(
+        &cx.coordinator,
+        OAUTH_HTTP_TIMEOUT,
+        cx.store.as_ref(),
+        &auth_state.credential_id,
+        &auth_state.refresh_params,
+    ) {
+        Ok(auth::RefreshOutcome::Refreshed(token)) => {
+            cx.redaction.register(&token.access_token);
+            let expires_at_secs = token
+                .expires_in_secs
+                .and_then(|secs| unix_now_secs().map(|now| now + secs));
+            config.bearer = Some(token.access_token);
+            Some(RefreshUpdate {
+                credential_id: auth_state.credential_id.clone(),
+                expires_at_secs,
+            })
+        }
+        Ok(auth::RefreshOutcome::AlreadyRefreshed) => {
+            // 대기 중 다른 호출이 갱신을 끝냈다 — keyring 재조회 (H4 규약)
+            match cx.store.get_secret(&auth_state.credential_id) {
+                Ok(access) => {
+                    cx.redaction.register(&access);
+                    config.bearer = Some(access);
+                    // 만료 시각은 갱신한 호출이 보고한다 — 여기서는 재시도 신호만
+                    Some(RefreshUpdate {
+                        credential_id: auth_state.credential_id.clone(),
+                        expires_at_secs: None,
+                    })
+                }
+                Err(e) => {
+                    tracing::warn!("갱신된 access token 조회 실패: {e:#}");
+                    None
+                }
+            }
+        }
+        Ok(auth::RefreshOutcome::ReauthorizationRequired { reason }) => {
+            tracing::info!(
+                credential_id = %auth_state.credential_id,
+                "refresh 거부 — 재승인 필요: {reason}"
+            );
+            config.bearer = None;
+            None
+        }
+        Err(e) => {
+            // 일시 장애 — 기존 access로 진행 (아직 유효할 수 있다)
+            tracing::warn!("refresh 교환 실패 (일시 장애로 간주): {e:#}");
+            None
+        }
+    }
+}
+
+/// anyhow chain에서 401/403 챌린지를 꺼낸다 (mcp::McpAuthRequired downcast — H5 훅).
+fn auth_challenge_of(error: &anyhow::Error) -> Option<AuthChallengeInfo> {
+    let required = error.downcast_ref::<McpAuthRequired>()?;
+    let mut info = AuthChallengeInfo::default();
+    if let Some(header) = required.www_authenticate.as_deref() {
+        let challenges = auth::parse_www_authenticate(header);
+        if let Some(bearer) = auth::find_bearer_challenge(&challenges) {
+            info.resource_metadata = bearer.resource_metadata().map(str::to_owned);
+            info.scope = bearer.scope().map(str::to_owned);
+        }
+    }
+    Some(info)
+}
+
+/// http 서버의 Bearer 부착 해석 (UI 스레드): oauth_json 바인딩 조회 → **토큰 URL
+/// 바인딩 검사**(동의 시점 URL ≠ 현재 URL이면 부착 거부 — H3 url 편집 규칙 리셋과
+/// 한 쌍) → keyring access + refresh 재료 준비.
+fn resolve_http_auth(
+    db: &Db,
+    store: &dyn SecretStore,
+    redaction: &RedactionService,
+    server_id: &str,
+    current_url: &str,
+) -> HttpAuth {
+    let Some((credential_id, connection)) = oauth_binding_for_server(db, server_id) else {
+        return HttpAuth::None;
+    };
+    if connection.server_url.trim() != current_url.trim() {
+        tracing::info!(
+            server_id,
+            "동의 시점 URL과 현재 URL 불일치 — Bearer 부착 거부 (재동의 필요)"
+        );
+        return HttpAuth::UrlMismatch;
+    }
+    let access = store.get_secret(&credential_id).ok();
+    if let Some(access) = &access {
+        redaction.register(access);
+    }
+    let client_secret = store
+        .get_secret(&auth::dcr_secret_entry_id(&credential_id))
+        .ok();
+    let expires_at = connection
+        .expires_at_secs
+        .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
+    // access가 유실됐어도 refresh token으로 복구를 시도한다
+    let needs_refresh = access.is_none() || auth::should_refresh(expires_at);
+    HttpAuth::Bound {
+        access,
+        state: HttpAuthState {
+            credential_id,
+            refresh_params: auth::RefreshParams {
+                token_url: connection.token_endpoint.clone(),
+                client_id: connection.client_id.clone(),
+                client_secret,
+                // RFC 8707 — refresh 교환에도 대상 리소스를 고정
+                resource: Some(connection.server_url.clone()),
+            },
+            needs_refresh,
+        },
+    }
+}
+
+/// credentials.oauth_json에서 server_id 바인딩을 찾는다 (서버당 1개 유지 규약).
+fn oauth_binding_for_server(db: &Db, server_id: &str) -> Option<(String, OAuthConnection)> {
+    let rows = match db.list_credential_oauth_json() {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("oauth 바인딩 조회 실패: {e:#}");
+            return None;
+        }
+    };
+    for (credential_id, json) in rows {
+        match serde_json::from_str::<OAuthConnection>(&json) {
+            Ok(connection) if connection.server_id == server_id => {
+                return Some((credential_id, connection));
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(credential_id, "oauth 바인딩 파싱 실패: {e}"),
+        }
+    }
+    None
+}
+
+/// refresh가 갱신한 만료 시각을 oauth_json에 반영한다 — 다음 선제 refresh 판정이
+/// 최신 값을 보도록. expires_at_secs가 None(만료 미상)이면 건드리지 않는다.
+fn persist_refresh_update(db: &Db, update: &RefreshUpdate) {
+    if update.expires_at_secs.is_none() {
+        return;
+    }
+    let Some((credential_id, mut connection)) = (match db.list_credential_oauth_json() {
+        Ok(rows) => rows.into_iter().find_map(|(id, json)| {
+            (id == update.credential_id)
+                .then(|| serde_json::from_str::<OAuthConnection>(&json).ok())
+                .flatten()
+                .map(|connection| (id, connection))
+        }),
+        Err(e) => {
+            tracing::warn!("refresh 만료 시각 반영 실패 (조회): {e:#}");
+            None
+        }
+    }) else {
+        return;
+    };
+    connection.expires_at_secs = update.expires_at_secs;
+    match serde_json::to_string(&connection) {
+        Ok(json) => {
+            if let Err(e) = db.set_credential_oauth_json(&credential_id, &json) {
+                tracing::warn!("refresh 만료 시각 반영 실패 (저장): {e:#}");
+            }
+        }
+        Err(e) => tracing::warn!("refresh 만료 시각 직렬화 실패: {e}"),
+    }
+}
+
+/// 발견 체인 (H5 사다리 단 ①): 401 챌린지 → PRM(RFC 9728) → AS 메타데이터(RFC 8414).
+/// PRM이 전부 실패하면 서버 origin을 AS로 간주한다 (2025-03-26 스펙 하위호환 —
+/// PRM 없는 서버는 자신이 AS). 커스텀 헤더(MCP-Protocol-Version)는 same-origin
+/// 대상에만 붙는다 (DiscoveryHeaders — 교차 출처 누출 방지).
+/// AS 메타데이터의 issuer 불일치는 discover_authorization_server가 Err로 거부한다
+/// (H4 리뷰 P1 — 폴백 아님).
+fn discover_auth_metadata(
+    timeout: Duration,
+    server_url: &str,
+    challenge: &AuthChallengeInfo,
+) -> anyhow::Result<DiscoveredAuth> {
+    let headers = auth::DiscoveryHeaders::new(
+        server_url,
+        vec![(
+            "MCP-Protocol-Version".to_owned(),
+            PROTOCOL_VERSION.to_owned(),
+        )],
+    )?;
+    let origin = auth::validate_https_or_loopback(server_url)?
+        .origin()
+        .ascii_serialization();
+    let prm = auth::discover_protected_resource(
+        timeout,
+        server_url,
+        challenge.resource_metadata.as_deref(),
+        Some(&headers),
+    );
+    let (authorization_server, prm_scopes) = match prm {
+        Ok(metadata) => {
+            let as_url = metadata
+                .authorization_servers
+                .iter()
+                .find(|url| auth::validate_https_or_loopback(url).is_ok())
+                .cloned()
+                .unwrap_or_else(|| origin.clone());
+            (as_url, metadata.scopes_supported)
+        }
+        Err(e) => {
+            tracing::info!("PRM 발견 실패 — 서버 origin을 AS로 간주: {e:#}");
+            (origin, None)
+        }
+    };
+    let metadata =
+        auth::discover_authorization_server(timeout, &authorization_server, Some(&headers))?;
+    // scope 우선순위: 401 챌린지 > PRM scopes_supported > 없음
+    let scopes = challenge
+        .scope
+        .as_deref()
+        .map(split_scopes)
+        .filter(|scopes| !scopes.is_empty())
+        .or(prm_scopes)
+        .unwrap_or_default();
+    Ok(DiscoveredAuth { metadata, scopes })
+}
+
+fn split_scopes(raw: &str) -> Vec<String> {
+    raw.split_whitespace().map(str::to_owned).collect()
+}
+
+/// 401 인증 사다리 (H5). 각 단은 1회 한정 — 무한 루프 구조 봉쇄:
+/// (단 ①: 발견 체인은 호출 전 [`discover_auth_metadata`]) → 클라이언트 확보
+/// (저장분/DCR/수동) → 브라우저 승인 → Bearer 재시도. 재시도가 다시 401이면
+/// 단 ② scope 챌린지 변경 시 scope 갱신 + 재승인 1회, 단 ③ 클라이언트 재등록
+/// (DCR) + 재승인 1회. 그래도 401이면 종료 — 트리거 401을 포함해 3연속 401이
+/// 최종 에러가 된다. 성공 시 마지막 요청(tools/list)의 결과가 "자동 재시도"의
+/// 산물로 함께 반환된다.
+///
+/// `authorize`는 브라우저 왕복 추상화 — 프로덕션은 run_flow_with_resource(외부
+/// 브라우저), 테스트는 콜백 직접 호출로 대체한다 (완료 기준).
+#[allow(clippy::too_many_arguments)]
+fn run_oauth_ladder(
+    manager: &LocalMcpManager,
+    timeout: Duration,
+    server_id: &str,
+    server_name: &str,
+    server_url: &str,
+    discovered: &DiscoveredAuth,
+    plan: ClientPlan,
+    authorize: &dyn Fn(&auth::OAuthProviderConfig) -> anyhow::Result<auth::OAuthToken>,
+) -> LadderEnd {
+    let metadata = &discovered.metadata;
+    let mut scopes = discovered.scopes.clone();
+    let (mut client_id, mut client_secret, manual) = match plan {
+        ClientPlan::Stored {
+            client_id,
+            client_secret,
+            manual,
+        } => (client_id, client_secret, manual),
+        ClientPlan::Manual {
+            client_id,
+            client_secret,
+        } => (client_id, client_secret, true),
+        ClientPlan::Dcr => match register_ladder_client(timeout, metadata, &scopes) {
+            Ok((client_id, client_secret)) => (client_id, client_secret, false),
+            Err(auth::RegistrationError::Other(e)) => {
+                return LadderEnd::Failed(format!("클라이언트 등록 실패: {e:#}"));
+            }
+            // DCR 미지원/거부 → 수동 client_id 입력 폴백 (완료 기준)
+            Err(e) => {
+                return LadderEnd::NeedManualClient {
+                    reason: e.to_string(),
+                };
+            }
+        },
+    };
+    let mut token = match authorize(&provider_config(metadata, &client_id, &scopes)) {
+        Ok(token) => token,
+        Err(e) => return LadderEnd::Failed(format!("브라우저 승인 실패: {e:#}")),
+    };
+    let mut scope_refreshed = false;
+    let mut reregistered = manual; // 수동 client는 재등록 단을 쓰지 않는다
+    loop {
+        let config = McpHttpServerConfig {
+            name: server_name.to_owned(),
+            url: server_url.to_owned(),
+            bearer: Some(SecretString::new(token.access_token.expose().to_owned())),
+        };
+        let error = match manager.discover_tools_http(&config) {
+            Ok(tools) => {
+                let connection = OAuthConnection {
+                    server_id: server_id.to_owned(),
+                    // 동의 시점 URL 저장 — 이후 Bearer 부착의 바인딩 기준
+                    server_url: server_url.to_owned(),
+                    issuer: metadata.issuer.clone(),
+                    authorization_endpoint: metadata.authorization_endpoint.clone(),
+                    token_endpoint: metadata.token_endpoint.clone(),
+                    client_id,
+                    manual_client: manual,
+                    scopes,
+                    expires_at_secs: token
+                        .expires_in_secs
+                        .and_then(|secs| unix_now_secs().map(|now| now + secs)),
+                };
+                return LadderEnd::Success(Box::new(LadderSuccess {
+                    connection,
+                    token,
+                    client_secret,
+                    tools,
+                }));
+            }
+            Err(error) => error,
+        };
+        let Some(challenge) = auth_challenge_of(&error) else {
+            return LadderEnd::Failed(format!("{error:#}"));
+        };
+        // 단 ②: scope 챌린지 변경 — 1회만 scope를 갱신해 재승인한다
+        let challenge_scopes = challenge
+            .scope
+            .as_deref()
+            .map(split_scopes)
+            .filter(|scopes| !scopes.is_empty());
+        if let Some(new_scopes) = challenge_scopes
+            && new_scopes != scopes
+            && !scope_refreshed
+        {
+            scope_refreshed = true;
+            scopes = new_scopes;
+            token = match authorize(&provider_config(metadata, &client_id, &scopes)) {
+                Ok(token) => token,
+                Err(e) => {
+                    return LadderEnd::Failed(format!("브라우저 승인 실패 (scope 갱신): {e:#}"));
+                }
+            };
+            continue;
+        }
+        // 단 ③: Authorization을 붙였는데도 401 — 등록 폐기 + 재등록(DCR) 1회만
+        if !reregistered {
+            reregistered = true;
+            match register_ladder_client(timeout, metadata, &scopes) {
+                Ok((new_id, new_secret)) => {
+                    client_id = new_id;
+                    client_secret = new_secret;
+                }
+                Err(e) => return LadderEnd::Failed(format!("클라이언트 재등록 실패: {e}")),
+            }
+            token = match authorize(&provider_config(metadata, &client_id, &scopes)) {
+                Ok(token) => token,
+                Err(e) => return LadderEnd::Failed(format!("브라우저 승인 실패 (재등록): {e:#}")),
+            };
+            continue;
+        }
+        return LadderEnd::Failed(format!(
+            "인증 사다리 소진 — 재등록 후에도 인증 거부 (연속 401): {error:#}"
+        ));
+    }
+}
+
+/// RFC 7591 DCR 실행 — (client_id, client_secret). 사다리의 최초 등록과 재등록 공용.
+fn register_ladder_client(
+    timeout: Duration,
+    metadata: &auth::AuthorizationServerMetadata,
+    scopes: &[String],
+) -> Result<(String, Option<SecretString>), auth::RegistrationError> {
+    let registration = auth::register_client(
+        timeout,
+        metadata,
+        &auth::RegistrationOptions {
+            client_name: "deppy-sijo".to_owned(),
+            scopes: scopes.to_vec(),
+        },
+    )?;
+    Ok((registration.client_id, registration.client_secret))
+}
+
+/// 발견된 endpoint로 PKCE flow 설정을 만든다 — 구 OAuth 폼(수동 URL 입력)의 대체.
+fn provider_config(
+    metadata: &auth::AuthorizationServerMetadata,
+    client_id: &str,
+    scopes: &[String],
+) -> auth::OAuthProviderConfig {
+    auth::OAuthProviderConfig {
+        auth_url: metadata.authorization_endpoint.clone(),
+        token_url: metadata.token_endpoint.clone(),
+        client_id: client_id.to_owned(),
+        scopes: scopes.to_vec(),
+    }
+}
+
+/// 동의 다이얼로그에 표시할 인증 서버 authority — "https://as.example" 형태.
+fn authority_of(url: &str) -> String {
+    auth::validate_https_or_loopback(url)
+        .map(|parsed| parsed.origin().ascii_serialization())
+        .unwrap_or_else(|_| url.to_owned())
+}
+
+fn unix_now_secs() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_secs())
+}
+
 /// McpServerRow → kind별 ConnectorConfig (H3). stdio는 scoped env 해석을 포함한다.
+/// http의 Bearer 부착은 [`ConnectorConfig::with_http_auth`]가 이어서 수행한다 (H5).
 fn config_for_row(
     row: &McpServerRow,
     env_resolver: &dyn McpScopedEnvResolver,
 ) -> anyhow::Result<ConnectorConfig> {
     match row.kind.as_str() {
-        "http" => Ok(ConnectorConfig::Http(http_config_for_values(
-            &row.name,
-            row.url.as_deref(),
-        )?)),
+        "http" => Ok(ConnectorConfig::Http(HttpConnectSpec {
+            config: http_config_for_values(&row.name, row.url.as_deref())?,
+            auth: None,
+        })),
         "stdio" => {
             let command = row.command.clone().unwrap_or_default();
             Ok(ConnectorConfig::Stdio(mcp_config_for_values(
@@ -1574,7 +2653,7 @@ fn config_for_row(
 }
 
 /// http config 생성 — 저장 전과 같은 URL 정책 검증을 연결 직전에도 적용한다 (H3).
-/// bearer는 H3에서 항상 None — credential 연동(401 사다리)은 H5 소관.
+/// bearer는 여기서 None — credential 연동은 with_http_auth(H5)가 부착한다.
 fn http_config_for_values(name: &str, url: Option<&str>) -> anyhow::Result<McpHttpServerConfig> {
     let url = url
         .map(str::trim)
@@ -1643,10 +2722,10 @@ fn config_for_invoke(
             env_secrets,
             env_resolver,
         )?)),
-        InvokeTarget::Http { url } => Ok(ConnectorConfig::Http(http_config_for_values(
-            &inv.server_name,
-            Some(url),
-        )?)),
+        InvokeTarget::Http { url } => Ok(ConnectorConfig::Http(HttpConnectSpec {
+            config: http_config_for_values(&inv.server_name, Some(url))?,
+            auth: None,
+        })),
     }
 }
 
@@ -1712,8 +2791,11 @@ fn tool_rows(server_id: &str, tools: &[McpTool]) -> Vec<McpToolRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -1724,6 +2806,342 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("metadata.sqlite3")
     }
+
+    fn test_ui() -> ConnectorsUi {
+        ConnectorsUi::new(
+            RedactionService::new(),
+            Arc::new(MemStore::default()),
+            Arc::new(auth::RefreshCoordinator::new()),
+        )
+    }
+
+    // ---------- 테스트 인프라: 인메모리 SecretStore + 목 HTTP 서버 ----------
+    // auth::test_support는 cfg(test) crate-private이라 이 crate 테스트용으로 축약 복제.
+
+    #[derive(Default)]
+    struct MemStore(Mutex<std::collections::HashMap<String, String>>);
+
+    impl MemStore {
+        fn seed(&self, id: &str, value: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(id.to_owned(), value.to_owned());
+        }
+
+        fn value(&self, id: &str) -> Option<String> {
+            self.0.lock().unwrap().get(id).cloned()
+        }
+    }
+
+    impl SecretStore for MemStore {
+        fn set_secret(&self, id: &str, secret: &SecretString) -> anyhow::Result<()> {
+            self.seed(id, secret.expose());
+            Ok(())
+        }
+        fn get_secret(&self, id: &str) -> anyhow::Result<SecretString> {
+            self.value(id)
+                .map(SecretString::new)
+                .ok_or_else(|| anyhow::anyhow!("no entry: {id}"))
+        }
+        fn delete_secret(&self, id: &str) -> anyhow::Result<()> {
+            self.0.lock().unwrap().remove(id);
+            Ok(())
+        }
+        fn has_secret(&self, id: &str) -> anyhow::Result<bool> {
+            Ok(self.value(id).is_some())
+        }
+    }
+
+    /// 목 서버가 받은 요청 한 건 (헤더 키 소문자).
+    #[derive(Debug, Clone)]
+    struct RecordedRequest {
+        method: String,
+        path: String,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    impl RecordedRequest {
+        fn header(&self, name: &str) -> Option<&str> {
+            let lower = name.to_ascii_lowercase();
+            self.headers
+                .iter()
+                .find(|(key, _)| *key == lower)
+                .map(|(_, value)| value.as_str())
+        }
+
+        fn rpc_method(&self) -> String {
+            serde_json::from_str::<serde_json::Value>(&self.body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("method")
+                        .and_then(|m| m.as_str())
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default()
+        }
+    }
+
+    struct MockResponse {
+        status: u16,
+        body: String,
+        headers: Vec<(String, String)>,
+    }
+
+    impl MockResponse {
+        fn json(status: u16, body: impl Into<String>) -> Self {
+            Self {
+                status,
+                body: body.into(),
+                headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+            }
+        }
+
+        fn with_header(mut self, name: &str, value: impl Into<String>) -> Self {
+            self.headers.push((name.to_owned(), value.into()));
+            self
+        }
+    }
+
+    /// 요청마다 핸들러를 부르는 초소형 HTTP 서버 (std TcpListener, tokio 금지 관례).
+    struct MockHttpServer {
+        base_url: String,
+        requests: Arc<Mutex<Vec<RecordedRequest>>>,
+        stop: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MockHttpServer {
+        fn start(
+            handler: impl Fn(&RecordedRequest) -> MockResponse + Send + Sync + 'static,
+        ) -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock bind");
+            listener.set_nonblocking(true).expect("mock nonblocking");
+            let port = listener.local_addr().expect("mock addr").port();
+            let requests: Arc<Mutex<Vec<RecordedRequest>>> = Arc::default();
+            let stop = Arc::new(AtomicBool::new(false));
+            let handle = {
+                let requests = Arc::clone(&requests);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                if let Some((request, stream)) = read_request(stream) {
+                                    requests.lock().unwrap().push(request.clone());
+                                    write_response(stream, &handler(&request));
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                })
+            };
+            Self {
+                base_url: format!("http://127.0.0.1:{port}"),
+                requests,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("{}{path}", self.base_url)
+        }
+
+        fn requests(&self) -> Vec<RecordedRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for MockHttpServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn read_request(stream: TcpStream) -> Option<(RecordedRequest, TcpStream)> {
+        stream.set_nonblocking(false).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        let mut reader = BufReader::new(stream);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).ok()?;
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next()?.to_owned();
+        let path = parts.next()?.to_owned();
+        let mut headers = Vec::new();
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).ok()?;
+            let line = line.trim_end();
+            if line.is_empty() {
+                break;
+            }
+            if let Some((key, value)) = line.split_once(':') {
+                let key = key.trim().to_ascii_lowercase();
+                let value = value.trim().to_owned();
+                if key == "content-length" {
+                    content_length = value.parse().unwrap_or(0);
+                }
+                headers.push((key, value));
+            }
+        }
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 {
+            reader.read_exact(&mut body).ok()?;
+        }
+        Some((
+            RecordedRequest {
+                method,
+                path,
+                headers,
+                body: String::from_utf8_lossy(&body).into_owned(),
+            },
+            reader.into_inner(),
+        ))
+    }
+
+    fn write_response(mut stream: TcpStream, response: &MockResponse) {
+        let mut head = format!(
+            "HTTP/1.1 {} Mock\r\nContent-Length: {}\r\nConnection: close\r\n",
+            response.status,
+            response.body.len()
+        );
+        for (name, value) in &response.headers {
+            head.push_str(name);
+            head.push_str(": ");
+            head.push_str(value);
+            head.push_str("\r\n");
+        }
+        head.push_str("\r\n");
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(response.body.as_bytes());
+    }
+
+    /// JSON-RPC 요청에 대한 정상 MCP 응답 (initialize/initialized/tools/list).
+    fn mcp_reply(request: &RecordedRequest) -> MockResponse {
+        let body: serde_json::Value = serde_json::from_str(&request.body).unwrap_or_default();
+        let id = body.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        match body.get("method").and_then(|m| m.as_str()) {
+            Some("initialize") => MockResponse::json(
+                200,
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "serverInfo": {"name": "mock", "version": "0"},
+                    },
+                })
+                .to_string(),
+            ),
+            Some("notifications/initialized") => MockResponse::json(202, ""),
+            Some("tools/list") => MockResponse::json(
+                200,
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {"tools": [{"name": "remote_tool", "inputSchema": {"type": "object"}}]},
+                })
+                .to_string(),
+            ),
+            other => MockResponse::json(500, format!("{{\"unexpected\":{other:?}}}")),
+        }
+    }
+
+    fn unauthorized(challenge: &str) -> MockResponse {
+        MockResponse::json(401, "{}").with_header("WWW-Authenticate", challenge)
+    }
+
+    /// 브라우저 대신 콜백을 직접 치는 GET (완료 기준 — 브라우저 왕복 대체).
+    fn http_get(url: &str) {
+        let Some(rest) = url.strip_prefix("http://") else {
+            return;
+        };
+        let (addr, path) = match rest.split_once('/') {
+            Some((addr, path)) => (addr.to_owned(), format!("/{path}")),
+            None => (rest.to_owned(), "/".to_owned()),
+        };
+        if let Ok(mut stream) = TcpStream::connect(&addr) {
+            let _ = write!(
+                stream,
+                "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+            );
+            let mut sink = String::new();
+            let _ = stream.read_to_string(&mut sink);
+        }
+    }
+
+    fn query_param(url: &str, key: &str) -> Option<String> {
+        let (_, query) = url.split_once('?')?;
+        query.split('&').find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            (k == key).then(|| v.to_owned())
+        })
+    }
+
+    /// 외부 브라우저 없이 PKCE flow를 완주하는 authorize 대역: 콜백 서버 bind →
+    /// begin → 콜백 직접 호출 → complete(목 token endpoint와 실제 code 교환).
+    fn callback_authorize(
+        resource: &str,
+    ) -> impl Fn(&auth::OAuthProviderConfig) -> anyhow::Result<auth::OAuthToken> {
+        let resource = resource.to_owned();
+        move |config| {
+            let callback = auth::LocalhostCallbackServer::bind()?;
+            let pending =
+                auth::begin_with_resource(config, callback.redirect_uri(), Some(&resource))?;
+            let state = query_param(&pending.authorize_url, "state")
+                .context("authorize URL에 state 없음")?;
+            let target = format!("{}?code=mock-code&state={state}", callback.redirect_uri());
+            let opener = std::thread::spawn(move || http_get(&target));
+            let params = callback.wait_for_callback(Duration::from_secs(10), &state)?;
+            let _ = opener.join();
+            auth::complete(pending, params)
+        }
+    }
+
+    /// 네트워크 없이 호출 횟수/요청 scope만 기록하고 순번 토큰을 주는 authorize 대역.
+    fn counting_authorize(
+        calls: Arc<Mutex<Vec<String>>>,
+        prefix: &'static str,
+    ) -> impl Fn(&auth::OAuthProviderConfig) -> anyhow::Result<auth::OAuthToken> {
+        move |config| {
+            let mut calls = calls.lock().unwrap();
+            calls.push(config.scopes.join(" "));
+            let n = calls.len();
+            Ok(auth::OAuthToken {
+                access_token: SecretString::new(format!("{prefix}{n}")),
+                refresh_token: None,
+                expires_in_secs: Some(3600),
+            })
+        }
+    }
+
+    fn as_metadata(base: &str) -> auth::AuthorizationServerMetadata {
+        auth::AuthorizationServerMetadata {
+            issuer: base.to_owned(),
+            authorization_endpoint: format!("{base}/authorize"),
+            token_endpoint: format!("{base}/token"),
+            registration_endpoint: Some(format!("{base}/register")),
+            grant_types_supported: None,
+            scopes_supported: None,
+            code_challenge_methods_supported: None,
+        }
+    }
+
+    fn test_manager() -> LocalMcpManager {
+        LocalMcpManager::new(RedactionService::new()).with_request_timeout(Duration::from_secs(5))
+    }
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
 
     fn audit_rows(path: &Path) -> Vec<(String, Option<Vec<u8>>)> {
         let conn = rusqlite::Connection::open(path).unwrap();
@@ -1861,7 +3279,7 @@ mod tests {
     fn connector_audit_기본값은_redacted_only_blob_null() {
         let path = temp_db_path();
         let db = Db::open(&path).unwrap();
-        let ui = ConnectorsUi::new(RedactionService::new());
+        let ui = test_ui();
         let ctx = egui::Context::default();
         let inv = invoke_with_input(r#"{"token":"sk-unregistered-secret","path":"/tmp/x"}"#);
         let resolver = MemMcpEnvResolver(std::collections::HashMap::new());
@@ -1891,7 +3309,7 @@ mod tests {
     fn connector_invalid_input은_audit_없이_local_error() {
         let path = temp_db_path();
         let db = Db::open(&path).unwrap();
-        let ui = ConnectorsUi::new(RedactionService::new());
+        let ui = test_ui();
         let ctx = egui::Context::default();
         let resolver = MemMcpEnvResolver(std::collections::HashMap::new());
 
@@ -1933,10 +3351,14 @@ mod tests {
 
         let http = http_row("srv-http", Some("https://mcp.example.com/mcp"));
         match config_for_row(&http, &resolver).unwrap() {
-            ConnectorConfig::Http(config) => {
-                assert_eq!(config.url, "https://mcp.example.com/mcp");
-                assert_eq!(config.name, "remote");
-                assert!(config.bearer.is_none(), "bearer 연동은 H5");
+            ConnectorConfig::Http(spec) => {
+                assert_eq!(spec.config.url, "https://mcp.example.com/mcp");
+                assert_eq!(spec.config.name, "remote");
+                assert!(
+                    spec.config.bearer.is_none(),
+                    "bearer 부착은 with_http_auth(H5)"
+                );
+                assert!(spec.auth.is_none());
             }
             ConnectorConfig::Stdio(_) => panic!("http row가 stdio config로 분기됨"),
         }
@@ -1978,7 +3400,7 @@ mod tests {
         // 변수명 store: xtask check-boundary가 테스트 라인의 DB 호출 패턴도 세므로 회피.
         let path = temp_db_path();
         let mut store = Db::open(&path).unwrap();
-        let mut ui = ConnectorsUi::new(RedactionService::new());
+        let mut ui = test_ui();
 
         let server = http_row("srv-h", Some("https://old.example.com/mcp"));
         store.insert_mcp_server(&server).unwrap();
@@ -2050,5 +3472,735 @@ mod tests {
         );
         let rows = store.list_mcp_servers().unwrap();
         assert_eq!(rows[0].url.as_deref(), Some("https://new.example.com/mcp"));
+    }
+
+    // ---------- H5: 401 사다리 / URL 바인딩 / refresh ----------
+
+    /// 목 보호 서버 E2E (완료 기준): 401(+resource_metadata) → PRM → AS 메타데이터
+    /// → DCR → PKCE(브라우저 대신 콜백 직접 호출) → Bearer → tools/list 200.
+    #[test]
+    fn 사다리_e2e_401에서_dcr_pkce_bearer_재시도까지() {
+        let server = MockHttpServer::start(move |request| {
+            let base = format!("http://{}", request.header("host").unwrap_or_default());
+            match request.path.as_str() {
+                "/mcp" => {
+                    if request.header("authorization") == Some("Bearer at-e2e") {
+                        mcp_reply(request)
+                    } else {
+                        unauthorized(&format!(
+                            "Bearer resource_metadata=\"{base}/custom/prm\", scope=\"mcp.read\""
+                        ))
+                    }
+                }
+                "/custom/prm" => MockResponse::json(
+                    200,
+                    serde_json::json!({
+                        "resource": format!("{base}/mcp"),
+                        "authorization_servers": [base],
+                    })
+                    .to_string(),
+                ),
+                "/.well-known/oauth-authorization-server" => MockResponse::json(
+                    200,
+                    serde_json::json!({
+                        "issuer": base,
+                        "authorization_endpoint": format!("{base}/authorize"),
+                        "token_endpoint": format!("{base}/token"),
+                        "registration_endpoint": format!("{base}/register"),
+                        "grant_types_supported": ["authorization_code", "refresh_token"],
+                    })
+                    .to_string(),
+                ),
+                "/register" => MockResponse::json(201, r#"{"client_id":"cid-e2e"}"#),
+                "/token" => MockResponse::json(
+                    200,
+                    r#"{"access_token":"at-e2e","token_type":"bearer","refresh_token":"rt-e2e","expires_in":3600}"#,
+                ),
+                _ => MockResponse::json(404, "{}"),
+            }
+        });
+        let mcp_url = server.url("/mcp");
+        let manager = test_manager();
+
+        // 트리거: Bearer 없는 요청 → 401 — 챌린지가 구조화 에러로 추출된다 (H5 훅)
+        let error = manager
+            .discover_tools_http(&McpHttpServerConfig {
+                name: "remote".to_owned(),
+                url: mcp_url.clone(),
+                bearer: None,
+            })
+            .unwrap_err();
+        let challenge = auth_challenge_of(&error).expect("401 챌린지 추출");
+        assert_eq!(challenge.scope.as_deref(), Some("mcp.read"));
+        assert_eq!(challenge.resource_metadata, Some(server.url("/custom/prm")));
+
+        // 발견 체인 (사다리 단 ①): 챌린지 PRM URL → AS 메타데이터
+        let discovered = discover_auth_metadata(TIMEOUT, &mcp_url, &challenge).unwrap();
+        assert_eq!(discovered.scopes, vec!["mcp.read".to_owned()]);
+        assert_eq!(discovered.metadata.token_endpoint, server.url("/token"));
+
+        // 사다리: DCR → 브라우저(콜백 직접 호출) → Bearer 재시도 → 성공
+        let authorize = callback_authorize(&mcp_url);
+        let end = run_oauth_ladder(
+            &manager,
+            TIMEOUT,
+            "srv-e2e",
+            "remote",
+            &mcp_url,
+            &discovered,
+            ClientPlan::Dcr,
+            &authorize,
+        );
+        let LadderEnd::Success(success) = end else {
+            panic!("사다리 성공이 아님");
+        };
+        assert_eq!(success.tools.len(), 1);
+        assert_eq!(success.tools[0].name, "remote_tool");
+        assert_eq!(success.connection.client_id, "cid-e2e");
+        assert_eq!(success.connection.server_url, mcp_url);
+        assert!(!success.connection.manual_client);
+        assert!(success.connection.expires_at_secs.is_some());
+        assert_eq!(success.token.access_token.expose(), "at-e2e");
+
+        let requests = server.requests();
+        // PRM은 챌린지의 resource_metadata URL을 1순위로 썼다
+        assert!(requests.iter().any(|r| r.path == "/custom/prm"));
+        // DCR 등록: 공개 클라이언트 규약 (상세 규약은 crates/auth 테스트가 소유)
+        let register = requests.iter().find(|r| r.path == "/register").unwrap();
+        assert_eq!(register.method, "POST", "DCR 등록은 POST (RFC 7591)");
+        let register_body: serde_json::Value = serde_json::from_str(&register.body).unwrap();
+        assert_eq!(register_body["token_endpoint_auth_method"], "none");
+        // token 교환: 실제 code + PKCE verifier + RFC 8707 resource가 실렸다
+        let token = requests.iter().find(|r| r.path == "/token").unwrap();
+        assert!(token.body.contains("code=mock-code"), "{}", token.body);
+        assert!(token.body.contains("code_verifier="), "{}", token.body);
+        assert!(
+            token.body.contains("resource=http%3A%2F%2F127.0.0.1"),
+            "{}",
+            token.body
+        );
+        // 성공한 tools/list에는 새 Bearer가 붙었다
+        let listed = requests
+            .iter()
+            .find(|r| r.rpc_method() == "tools/list")
+            .unwrap();
+        assert_eq!(listed.header("authorization"), Some("Bearer at-e2e"));
+    }
+
+    /// 완료 기준: scope 챌린지 변경 → scope 갱신 + 재승인 1회 후 성공.
+    #[test]
+    fn 사다리_scope_챌린지_변경은_1회_재시도() {
+        let server = MockHttpServer::start(|request| {
+            if request.path != "/mcp" {
+                return MockResponse::json(404, "{}");
+            }
+            match request.header("authorization") {
+                // 첫 토큰 — 더 넓은 scope를 요구하는 401
+                Some("Bearer at-s1") => unauthorized(
+                    "Bearer scope=\"mcp.read mcp.write\", error=\"insufficient_scope\"",
+                ),
+                Some("Bearer at-s2") => mcp_reply(request),
+                _ => unauthorized("Bearer scope=\"mcp.read\""),
+            }
+        });
+        let mcp_url = server.url("/mcp");
+        let calls: Arc<Mutex<Vec<String>>> = Arc::default();
+        let authorize = counting_authorize(Arc::clone(&calls), "at-s");
+        let discovered = DiscoveredAuth {
+            metadata: as_metadata("https://as.example"),
+            scopes: vec!["mcp.read".to_owned()],
+        };
+
+        let end = run_oauth_ladder(
+            &test_manager(),
+            TIMEOUT,
+            "srv-scope",
+            "remote",
+            &mcp_url,
+            &discovered,
+            ClientPlan::Stored {
+                client_id: "cid-x".to_owned(),
+                client_secret: None,
+                manual: false,
+            },
+            &authorize,
+        );
+        let LadderEnd::Success(success) = end else {
+            panic!("사다리 성공이 아님");
+        };
+        // 승인은 정확히 2회: 최초(mcp.read) + scope 갱신(mcp.read mcp.write)
+        assert_eq!(
+            calls.lock().unwrap().clone(),
+            vec!["mcp.read".to_owned(), "mcp.read mcp.write".to_owned()]
+        );
+        assert_eq!(
+            success.connection.scopes,
+            vec!["mcp.read".to_owned(), "mcp.write".to_owned()]
+        );
+        assert_eq!(success.token.access_token.expose(), "at-s2");
+    }
+
+    /// 완료 기준: 재등록 사다리는 1회 후 종료 — 트리거 포함 3연속 401이면 최종 에러.
+    #[test]
+    fn 사다리_재등록_1회_후_종료_3연속_401이면_에러() {
+        let register_hits = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&register_hits);
+        let server = MockHttpServer::start(move |request| match request.path.as_str() {
+            // scope 챌린지가 항상 동일 → scope 갱신 단은 건너뛰고 재등록 단으로 간다
+            "/mcp" => unauthorized("Bearer scope=\"mcp.fixed\", error=\"invalid_token\""),
+            "/register" => {
+                let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                MockResponse::json(201, format!("{{\"client_id\":\"cid-r{n}\"}}"))
+            }
+            _ => MockResponse::json(404, "{}"),
+        });
+        let mcp_url = server.url("/mcp");
+        let manager = test_manager();
+
+        // 트리거 401 (1번째)
+        assert!(
+            manager
+                .discover_tools_http(&McpHttpServerConfig {
+                    name: "remote".to_owned(),
+                    url: mcp_url.clone(),
+                    bearer: None,
+                })
+                .is_err()
+        );
+
+        let calls: Arc<Mutex<Vec<String>>> = Arc::default();
+        let authorize = counting_authorize(Arc::clone(&calls), "at-r");
+        let discovered = DiscoveredAuth {
+            metadata: as_metadata(&server.url("")),
+            scopes: vec!["mcp.fixed".to_owned()],
+        };
+        let end = run_oauth_ladder(
+            &manager,
+            TIMEOUT,
+            "srv-rereg",
+            "remote",
+            &mcp_url,
+            &discovered,
+            ClientPlan::Dcr,
+            &authorize,
+        );
+        let LadderEnd::Failed(message) = end else {
+            panic!("최종 에러가 아님");
+        };
+        assert!(message.contains("사다리 소진"), "{message}");
+        // 등록은 정확히 2회: 최초 DCR + 재등록 1회 (그 이상 재시도 없음)
+        assert_eq!(register_hits.load(Ordering::SeqCst), 2);
+        // 승인도 2회 (최초 + 재등록 후)
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        // 서버가 본 401 요청: 트리거(1) + 사다리 재시도(2) = 3연속 401 후 종료
+        let mcp_401 = server
+            .requests()
+            .iter()
+            .filter(|r| r.path == "/mcp" && r.rpc_method() == "initialize")
+            .count();
+        assert_eq!(mcp_401, 3);
+    }
+
+    /// DCR 미지원이면 수동 client_id 폴백으로 전환된다 (완료 기준).
+    #[test]
+    fn 사다리_dcr_미지원이면_수동_client_폴백() {
+        let mut metadata = as_metadata("https://as.example");
+        metadata.registration_endpoint = None;
+        let discovered = DiscoveredAuth {
+            metadata,
+            scopes: Vec::new(),
+        };
+        let authorize = |_config: &auth::OAuthProviderConfig| -> anyhow::Result<auth::OAuthToken> {
+            panic!("등록 실패 시 브라우저를 열면 안 됨")
+        };
+        let end = run_oauth_ladder(
+            &test_manager(),
+            TIMEOUT,
+            "srv-manual",
+            "remote",
+            "https://mcp.example/mcp",
+            &discovered,
+            ClientPlan::Dcr,
+            &authorize,
+        );
+        let LadderEnd::NeedManualClient { reason } = end else {
+            panic!("수동 폴백이 아님");
+        };
+        assert!(reason.contains("registration_endpoint 없음"), "{reason}");
+    }
+
+    /// 수동 client는 재등록 단을 쓰지 않는다 — 재시도 1회 후 곧장 종료.
+    #[test]
+    fn 사다리_수동_client는_재등록_없이_종료() {
+        let server = MockHttpServer::start(|request| match request.path.as_str() {
+            "/mcp" => unauthorized("Bearer error=\"invalid_token\""),
+            "/register" => panic!("수동 client 사다리가 DCR을 호출함"),
+            _ => MockResponse::json(404, "{}"),
+        });
+        let calls: Arc<Mutex<Vec<String>>> = Arc::default();
+        let authorize = counting_authorize(Arc::clone(&calls), "at-m");
+        let discovered = DiscoveredAuth {
+            metadata: as_metadata(&server.url("")),
+            scopes: Vec::new(),
+        };
+        let end = run_oauth_ladder(
+            &test_manager(),
+            TIMEOUT,
+            "srv-manual2",
+            "remote",
+            &server.url("/mcp"),
+            &discovered,
+            ClientPlan::Manual {
+                client_id: "cid-manual".to_owned(),
+                client_secret: None,
+            },
+            &authorize,
+        );
+        assert!(matches!(end, LadderEnd::Failed(_)));
+        // 승인 1회(최초)만 — scope 동일/수동이라 추가 단 없음
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    fn seeded_binding_db(server_id: &str, server_url: &str, token_url: &str) -> (Db, String) {
+        let db = Db::open(&temp_db_path()).unwrap();
+        let credential_id = "cred-h5".to_owned();
+        db.insert_credential(&CredentialMeta {
+            id: credential_id.clone(),
+            provider: "oauth".to_owned(),
+            label: "remote".to_owned(),
+            credential_kind: "oauth_token".to_owned(),
+            masked_hint: None,
+            workspace_id: None,
+        })
+        .unwrap();
+        let connection = OAuthConnection {
+            server_id: server_id.to_owned(),
+            server_url: server_url.to_owned(),
+            issuer: "https://as.example".to_owned(),
+            authorization_endpoint: "https://as.example/authorize".to_owned(),
+            token_endpoint: token_url.to_owned(),
+            client_id: "cid-1".to_owned(),
+            manual_client: false,
+            scopes: vec!["mcp.read".to_owned()],
+            expires_at_secs: None,
+        };
+        db.set_credential_oauth_json(&credential_id, &serde_json::to_string(&connection).unwrap())
+            .unwrap();
+        (db, credential_id)
+    }
+
+    /// 완료 기준: 토큰 URL 바인딩 — 동의 시점 URL과 다르면 Bearer 부착 거부.
+    #[test]
+    fn url_바인딩_불일치는_bearer_부착_거부() {
+        let (db, credential_id) =
+            seeded_binding_db("srv-h", "https://a.example/mcp", "https://as.example/token");
+        let store = MemStore::default();
+        store.seed(&credential_id, "at-bound");
+        let redaction = RedactionService::new();
+
+        // 일치 — 부착
+        match resolve_http_auth(&db, &store, &redaction, "srv-h", "https://a.example/mcp") {
+            HttpAuth::Bound { access, state } => {
+                assert_eq!(access.unwrap().expose(), "at-bound");
+                assert_eq!(state.credential_id, credential_id);
+                assert_eq!(state.refresh_params.token_url, "https://as.example/token");
+                assert_eq!(
+                    state.refresh_params.resource.as_deref(),
+                    Some("https://a.example/mcp")
+                );
+                // 만료 미상 + access 보유 → 선제 refresh 없음
+                assert!(!state.needs_refresh);
+            }
+            _ => panic!("Bound가 아님"),
+        }
+
+        // url 변경(H3 편집 저장 후) — 부착 거부 (재동의 필요)
+        assert!(matches!(
+            resolve_http_auth(&db, &store, &redaction, "srv-h", "https://b.example/mcp"),
+            HttpAuth::UrlMismatch
+        ));
+        // 바인딩 없는 서버 — None
+        assert!(matches!(
+            resolve_http_auth(&db, &store, &redaction, "srv-없음", "https://a.example/mcp"),
+            HttpAuth::None
+        ));
+
+        // with_http_auth 배선: 불일치면 config에 bearer가 붙지 않는다
+        let row = http_row("srv-h", Some("https://b.example/mcp"));
+        let resolver = MemMcpEnvResolver(std::collections::HashMap::new());
+        let config = config_for_row(&row, &resolver)
+            .unwrap()
+            .with_http_auth(&db, &store, &redaction, "srv-h");
+        match config {
+            ConnectorConfig::Http(spec) => {
+                assert!(spec.config.bearer.is_none(), "부착 거부돼야 함");
+                assert!(spec.auth.is_none());
+            }
+            ConnectorConfig::Stdio(_) => panic!("http가 아님"),
+        }
+    }
+
+    /// 401 + 저장 토큰 → 반응 refresh 1회 → 원요청 1회 재시도 성공.
+    #[test]
+    fn 반응_refresh는_401에서_1회_갱신_후_재시도() {
+        let server = MockHttpServer::start(|request| match request.path.as_str() {
+            "/mcp" => match request.header("authorization") {
+                Some("Bearer at-new") => mcp_reply(request),
+                _ => unauthorized("Bearer error=\"invalid_token\""),
+            },
+            "/token" => MockResponse::json(
+                200,
+                r#"{"access_token":"at-new","token_type":"bearer","refresh_token":"rt-new","expires_in":1200}"#,
+            ),
+            _ => MockResponse::json(404, "{}"),
+        });
+        let mcp_url = server.url("/mcp");
+        let store = Arc::new(MemStore::default());
+        store.seed("cred-h5", "at-old");
+        store.seed(&auth::refresh_entry_id("cred-h5"), "rt-old");
+        let cx = ExecContext {
+            manager: test_manager(),
+            coordinator: Arc::new(auth::RefreshCoordinator::new()),
+            store: Arc::clone(&store) as Arc<dyn SecretStore>,
+            redaction: RedactionService::new(),
+        };
+        let spec = HttpConnectSpec {
+            config: McpHttpServerConfig {
+                name: "remote".to_owned(),
+                url: mcp_url.clone(),
+                bearer: Some(SecretString::new("at-old".to_owned())),
+            },
+            auth: Some(HttpAuthState {
+                credential_id: "cred-h5".to_owned(),
+                refresh_params: auth::RefreshParams {
+                    token_url: server.url("/token"),
+                    client_id: "cid-1".to_owned(),
+                    client_secret: None,
+                    resource: Some(mcp_url.clone()),
+                },
+                needs_refresh: false, // 만료 메타 없음 — 선제 아님, 401 반응 경로
+            }),
+        };
+
+        let (result, update) = ConnectorConfig::Http(spec).discover_tools(&cx);
+        let tools = result.expect("refresh 후 재시도 성공");
+        assert_eq!(tools[0].name, "remote_tool");
+        let update = update.expect("refresh 부수효과");
+        assert_eq!(update.credential_id, "cred-h5");
+        assert!(update.expires_at_secs.is_some());
+        // keyring이 새 토큰으로 교체됐다 (H4 store_token 규약)
+        assert_eq!(store.value("cred-h5").as_deref(), Some("at-new"));
+        // token endpoint는 정확히 1회
+        let token_hits = server
+            .requests()
+            .iter()
+            .filter(|r| r.path == "/token")
+            .count();
+        assert_eq!(token_hits, 1);
+    }
+
+    /// 만료 임박(needs_refresh)이면 요청 전에 선제 refresh — 401 왕복이 없다.
+    #[test]
+    fn 선제_refresh는_요청_전에_갱신한다() {
+        let server = MockHttpServer::start(|request| match request.path.as_str() {
+            "/mcp" => match request.header("authorization") {
+                Some("Bearer at-new") => mcp_reply(request),
+                other => panic!("선제 refresh 없이 요청됨: {other:?}"),
+            },
+            "/token" => MockResponse::json(
+                200,
+                r#"{"access_token":"at-new","token_type":"bearer","expires_in":1200}"#,
+            ),
+            _ => MockResponse::json(404, "{}"),
+        });
+        let mcp_url = server.url("/mcp");
+        let store = Arc::new(MemStore::default());
+        store.seed("cred-h5", "at-stale");
+        store.seed(&auth::refresh_entry_id("cred-h5"), "rt-1");
+        let cx = ExecContext {
+            manager: test_manager(),
+            coordinator: Arc::new(auth::RefreshCoordinator::new()),
+            store: Arc::clone(&store) as Arc<dyn SecretStore>,
+            redaction: RedactionService::new(),
+        };
+        let spec = HttpConnectSpec {
+            config: McpHttpServerConfig {
+                name: "remote".to_owned(),
+                url: mcp_url.clone(),
+                bearer: Some(SecretString::new("at-stale".to_owned())),
+            },
+            auth: Some(HttpAuthState {
+                credential_id: "cred-h5".to_owned(),
+                refresh_params: auth::RefreshParams {
+                    token_url: server.url("/token"),
+                    client_id: "cid-1".to_owned(),
+                    client_secret: None,
+                    resource: Some(mcp_url.clone()),
+                },
+                needs_refresh: true, // 만료 5분 전 판정 결과
+            }),
+        };
+
+        let (result, update) = ConnectorConfig::Http(spec).discover_tools(&cx);
+        assert!(result.is_ok());
+        assert!(update.is_some());
+        // 모든 /mcp 요청이 새 토큰으로 나갔다 (패닉 없이 통과한 것 자체가 검증)
+        assert!(
+            server
+                .requests()
+                .iter()
+                .filter(|r| r.path == "/mcp")
+                .all(|r| r.header("authorization") == Some("Bearer at-new"))
+        );
+    }
+
+    /// refresh 만료 시각 부수효과가 oauth_json에 영속된다.
+    #[test]
+    fn refresh_만료_시각은_oauth_json에_반영() {
+        let (db, credential_id) =
+            seeded_binding_db("srv-h", "https://a.example/mcp", "https://as.example/token");
+        persist_refresh_update(
+            &db,
+            &RefreshUpdate {
+                credential_id: credential_id.clone(),
+                expires_at_secs: Some(1_900_000_000),
+            },
+        );
+        let (_, connection) = oauth_binding_for_server(&db, "srv-h").unwrap();
+        assert_eq!(connection.expires_at_secs, Some(1_900_000_000));
+        // 만료 미상(None) 갱신은 기존 값을 지우지 않는다
+        persist_refresh_update(
+            &db,
+            &RefreshUpdate {
+                credential_id,
+                expires_at_secs: None,
+            },
+        );
+        let (_, connection) = oauth_binding_for_server(&db, "srv-h").unwrap();
+        assert_eq!(connection.expires_at_secs, Some(1_900_000_000));
+    }
+
+    /// drain_results: 401 결과는 에러가 아니라 "승인 필요" 상태가 된다.
+    #[test]
+    fn drain_results는_401을_승인_필요로_분류() {
+        let path = temp_db_path();
+        let mut db = Db::open(&path).unwrap();
+        let mut ui = test_ui();
+        db.insert_mcp_server(&http_row("srv-h", Some("https://a.example/mcp")))
+            .unwrap();
+        ui.result_tx
+            .send(DiscoverOutcome {
+                server_id: "srv-h".to_owned(),
+                request_url: Some("https://a.example/mcp".to_owned()),
+                result: Err(ExecFailure {
+                    message: "HTTP 401".to_owned(),
+                    auth: Some(AuthChallengeInfo {
+                        resource_metadata: None,
+                        scope: Some("mcp.read".to_owned()),
+                    }),
+                }),
+                refresh: None,
+            })
+            .unwrap();
+        ui.drain_results(&mut db);
+        match ui.status.get("srv-h") {
+            Some(ConnStatus::NeedsAuth { challenge, .. }) => {
+                assert_eq!(challenge.scope.as_deref(), Some("mcp.read"));
+            }
+            other => panic!(
+                "NeedsAuth가 아님: {:?}",
+                other.map(|_| "다른 상태").unwrap_or("없음")
+            ),
+        }
+    }
+
+    /// url 편집 저장 race (H3 리뷰 P2): 구 url로 시작된 discover 결과는 폐기된다.
+    #[test]
+    fn drain_results는_stale_url_결과를_폐기() {
+        let path = temp_db_path();
+        let mut db = Db::open(&path).unwrap();
+        let mut ui = test_ui();
+        db.insert_mcp_server(&http_row("srv-h", Some("https://new.example.com/mcp")))
+            .unwrap();
+        let tools = vec![McpTool {
+            name: "stale_tool".to_owned(),
+            description: None,
+            input_schema_json: "{}".to_owned(),
+        }];
+        // 구 url로 시작된 백그라운드 결과 도착 — 방금 비운 캐시를 재채우면 안 된다
+        ui.result_tx
+            .send(DiscoverOutcome {
+                server_id: "srv-h".to_owned(),
+                request_url: Some("https://old.example.com/mcp".to_owned()),
+                result: Ok(tools.clone()),
+                refresh: None,
+            })
+            .unwrap();
+        ui.drain_results(&mut db);
+        assert!(!ui.status.contains_key("srv-h"), "stale 결과가 반영됨");
+        assert!(db.list_mcp_tools("srv-h").unwrap().is_empty());
+
+        // 현재 url과 일치하는 결과는 정상 반영
+        ui.result_tx
+            .send(DiscoverOutcome {
+                server_id: "srv-h".to_owned(),
+                request_url: Some("https://new.example.com/mcp".to_owned()),
+                result: Ok(tools),
+                refresh: None,
+            })
+            .unwrap();
+        ui.drain_results(&mut db);
+        assert!(matches!(
+            ui.status.get("srv-h"),
+            Some(ConnStatus::Connected { tools: 1 })
+        ));
+        assert_eq!(db.list_mcp_tools("srv-h").unwrap().len(), 1);
+    }
+
+    /// drain_oauth 성공 경로: 같은 서버의 재승인은 기존 credential을 재사용하고
+    /// (env 참조 유지), 바인딩 메타/도구가 반영된다.
+    #[test]
+    fn drain_oauth_성공은_바인딩과_도구를_영속() {
+        struct TestOAuthStore<'a> {
+            store: &'a MemStore,
+        }
+        impl OAuthCredentialStore for TestOAuthStore<'_> {
+            fn store_oauth_token(
+                &self,
+                token: &auth::OAuthToken,
+            ) -> anyhow::Result<StoredOAuthCredential> {
+                let id = format!("cred-{}", self.store.0.lock().unwrap().len());
+                auth::store_token(self.store, &id, token)?;
+                Ok(StoredOAuthCredential {
+                    id,
+                    masked_hint: "****hint".to_owned(),
+                })
+            }
+            fn update_oauth_token(&self, id: &str, token: &auth::OAuthToken) -> anyhow::Result<()> {
+                auth::store_token(self.store, id, token)
+            }
+            fn set_dcr_secret(
+                &self,
+                id: &str,
+                secret: Option<&SecretString>,
+            ) -> anyhow::Result<()> {
+                let entry = auth::dcr_secret_entry_id(id);
+                match secret {
+                    Some(secret) => self.store.set_secret(&entry, secret),
+                    None => self.store.delete_secret(&entry),
+                }
+            }
+            fn delete_oauth_token(&self, id: &str) -> anyhow::Result<()> {
+                self.store.delete_secret(id)?;
+                self.store.delete_secret(&auth::refresh_entry_id(id))?;
+                self.store.delete_secret(&auth::dcr_secret_entry_id(id))
+            }
+        }
+
+        let path = temp_db_path();
+        let mut db = Db::open(&path).unwrap();
+        // 서버 카드는 승인 전에 이미 존재한다 (사용자가 카드에서 승인) — tools 영속의
+        // FK 부모(mcp_servers) 선행 조건. 프로덕션에선 항상 참.
+        db.insert_mcp_server(&http_row("srv-h", Some("https://a.example/mcp")))
+            .unwrap();
+        let store = MemStore::default();
+        let oauth_store = TestOAuthStore { store: &store };
+        let mut ui = test_ui();
+
+        let success = LadderSuccess {
+            connection: OAuthConnection {
+                server_id: "srv-h".to_owned(),
+                server_url: "https://a.example/mcp".to_owned(),
+                issuer: "https://as.example".to_owned(),
+                authorization_endpoint: "https://as.example/authorize".to_owned(),
+                token_endpoint: "https://as.example/token".to_owned(),
+                client_id: "cid-1".to_owned(),
+                manual_client: false,
+                scopes: vec!["mcp.read".to_owned()],
+                expires_at_secs: Some(1_900_000_000),
+            },
+            token: auth::OAuthToken {
+                access_token: SecretString::new("at-1".to_owned()),
+                refresh_token: Some(SecretString::new("rt-1".to_owned())),
+                expires_in_secs: Some(3600),
+            },
+            client_secret: Some(SecretString::new("cs-1".to_owned())),
+            tools: vec![McpTool {
+                name: "remote_tool".to_owned(),
+                description: None,
+                input_schema_json: "{}".to_owned(),
+            }],
+        };
+        // flow 상태를 만들고 성공 메시지를 흘린다
+        ui.oauth_gen += 1;
+        ui.oauth_flow = Some(OAuthFlow {
+            server_id: "srv-h".to_owned(),
+            server_name: "remote".to_owned(),
+            server_url: "https://a.example/mcp".to_owned(),
+            generation: ui.oauth_gen,
+            stage: OAuthStage::Authorizing,
+        });
+        ui.oauth_tx
+            .send((ui.oauth_gen, OAuthMsg::Finished(Box::new(Ok(success)))))
+            .unwrap();
+        assert!(ui.drain_oauth(&mut db, &oauth_store));
+        assert!(ui.oauth_flow.is_none());
+        assert!(matches!(
+            ui.status.get("srv-h"),
+            Some(ConnStatus::Connected { tools: 1 })
+        ));
+        // credential + 바인딩 + keyring(access/refresh/dcr) 전부 영속
+        let (credential_id, connection) = oauth_binding_for_server(&db, "srv-h").unwrap();
+        assert_eq!(connection.client_id, "cid-1");
+        assert_eq!(store.value(&credential_id).as_deref(), Some("at-1"));
+        assert_eq!(
+            store
+                .value(&auth::refresh_entry_id(&credential_id))
+                .as_deref(),
+            Some("rt-1")
+        );
+        assert_eq!(
+            store
+                .value(&auth::dcr_secret_entry_id(&credential_id))
+                .as_deref(),
+            Some("cs-1")
+        );
+        assert_eq!(db.list_mcp_tools("srv-h").unwrap().len(), 1);
+        let credentials = db.list_credentials().unwrap();
+        assert_eq!(credentials.len(), 1);
+
+        // 재승인(같은 서버): 새 credential을 만들지 않고 같은 id에 토큰만 교체,
+        // DCR secret이 사라졌으면 entry도 정리된다
+        let success2 = LadderSuccess {
+            connection: OAuthConnection {
+                expires_at_secs: Some(2_000_000_000),
+                ..connection
+            },
+            token: auth::OAuthToken {
+                access_token: SecretString::new("at-2".to_owned()),
+                refresh_token: None,
+                expires_in_secs: None,
+            },
+            client_secret: None,
+            tools: Vec::new(),
+        };
+        ui.oauth_gen += 1;
+        ui.oauth_flow = Some(OAuthFlow {
+            server_id: "srv-h".to_owned(),
+            server_name: "remote".to_owned(),
+            server_url: "https://a.example/mcp".to_owned(),
+            generation: ui.oauth_gen,
+            stage: OAuthStage::Authorizing,
+        });
+        ui.oauth_tx
+            .send((ui.oauth_gen, OAuthMsg::Finished(Box::new(Ok(success2)))))
+            .unwrap();
+        assert!(ui.drain_oauth(&mut db, &oauth_store));
+        assert_eq!(db.list_credentials().unwrap().len(), 1, "credential 재사용");
+        assert_eq!(store.value(&credential_id).as_deref(), Some("at-2"));
+        assert_eq!(
+            store.value(&auth::dcr_secret_entry_id(&credential_id)),
+            None
+        );
     }
 }

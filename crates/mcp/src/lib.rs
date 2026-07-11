@@ -10,6 +10,6 @@ mod manager;
 mod proxy;
 mod transport;
 
-pub use http::{McpHttpServerConfig, validate_mcp_url};
+pub use http::{McpAuthRequired, McpHttpServerConfig, validate_mcp_url};
 pub use manager::{LocalMcpManager, McpConnection, McpServerConfig, McpTool, PROTOCOL_VERSION};
 pub use proxy::{PermissionHook, ProxyDecision, ToolForwarder, run_proxy};

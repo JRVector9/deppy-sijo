@@ -3,6 +3,10 @@
 //! 공유 DB에 pending 행을 쓴다. GUI는 그 목록을 폴링해(App::logic) 여기로 넘기고,
 //! 이 모듈이 모달식 창을 띄워 사용자의 허용/거부 결정을 돌려준다. 되쓰기(resolve)는
 //! 호출측(App::ui)이 Db::resolve_approval로 처리한다.
+//! http 서버의 호출이면 원격 url을 함께 고지한다 (H3 리뷰 P1 — proxy 경유 경로는
+//! Connector Center의 신뢰 모달을 거치지 않으므로 첫 Ask 승인이 원격 전송 고지를 겸한다).
+
+use std::collections::HashMap;
 
 use storage::PendingApprovalRow;
 
@@ -17,6 +21,9 @@ pub struct ApprovalDecision {
 pub struct ApprovalsUi {
     /// pending 승인 행들 (오래된 순 — DB가 정렬해 준다). 맨 앞 하나만 표시한다.
     pending: Vec<PendingApprovalRow>,
+    /// http 서버의 원격 url (server_id → url) — 승인 팝업의 원격 전송 고지용.
+    /// 호출측(App)이 pending 폴링 시 mcp_servers에서 함께 채운다.
+    remote_urls: HashMap<String, String>,
     /// 현재(맨 앞) 항목의 "이 도구 기억" 체크 상태. 항목이 바뀌면 리셋한다.
     remember: bool,
     /// remember 리셋 판단용 — 마지막으로 표시한 항목 id.
@@ -27,6 +34,7 @@ impl ApprovalsUi {
     pub fn new() -> Self {
         Self {
             pending: Vec::new(),
+            remote_urls: HashMap::new(),
             remember: false,
             current_id: None,
         }
@@ -34,13 +42,19 @@ impl ApprovalsUi {
 
     /// 폴링으로 새로 읽은 pending 목록을 반영한다 (App::logic에서 호출).
     /// 맨 앞 항목이 바뀌면 이전 항목의 체크 상태가 새 항목에 새지 않도록 remember를 리셋한다.
-    pub fn set_pending(&mut self, rows: Vec<PendingApprovalRow>) {
+    /// `remote_urls`는 http 서버의 원격 전송 고지용 (server_id → url).
+    pub fn set_pending(
+        &mut self,
+        rows: Vec<PendingApprovalRow>,
+        remote_urls: HashMap<String, String>,
+    ) {
         let front = rows.first().map(|r| r.id.clone());
         if front != self.current_id {
             self.remember = false;
             self.current_id = front;
         }
         self.pending = rows;
+        self.remote_urls = remote_urls;
     }
 
     /// 버튼 클릭 → 결정 매핑 (egui 컨텍스트 없이 테스트할 수 있게 분리).
@@ -72,6 +86,13 @@ impl ApprovalsUi {
             .show(ctx, |ui| {
                 ui.label(catalog.t("approval.server", &[("value", &row.server_id)]));
                 ui.label(catalog.t("approval.tool", &[("value", &row.tool_name)]));
+                // http 서버면 원격 전송 고지 — 이 승인이 신뢰 확인을 겸한다 (H3 리뷰 P1)
+                if let Some(url) = self.remote_urls.get(&row.server_id) {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xd0, 0x8a, 0x00),
+                        catalog.t("approval.remote_note", &[("url", url)]),
+                    );
+                }
                 ui.separator();
                 ui.label(catalog.t("approval.arguments_preview", &[]));
                 // proxy가 이미 redact한 표시용 텍스트지만 신뢰하지 않는다 —
@@ -117,11 +138,28 @@ mod tests {
     }
 
     #[test]
+    fn http_서버의_원격_url이_고지용으로_보관된다() {
+        // H3 리뷰 P1: proxy 경유 첫 Ask 승인이 원격 전송 고지를 겸한다
+        let mut ui = ApprovalsUi::new();
+        ui.set_pending(
+            vec![row("a")],
+            HashMap::from([("srv".to_owned(), "https://mcp.example/mcp".to_owned())]),
+        );
+        assert_eq!(
+            ui.remote_urls.get("srv").map(String::as_str),
+            Some("https://mcp.example/mcp")
+        );
+        // stdio만 남으면(맵 비움) 고지도 사라진다
+        ui.set_pending(vec![row("a")], HashMap::new());
+        assert!(ui.remote_urls.is_empty());
+    }
+
+    #[test]
     fn decide_uses_front_row_and_remember_flag() {
         let mut ui = ApprovalsUi::new();
         assert_eq!(ui.decide(true), None); // 비어 있으면 결정 없음
 
-        ui.set_pending(vec![row("a"), row("b")]);
+        ui.set_pending(vec![row("a"), row("b")], HashMap::new());
         // 맨 앞(가장 오래된) 항목 'a'에 대한 결정
         assert_eq!(
             ui.decide(true),
@@ -145,16 +183,16 @@ mod tests {
     #[test]
     fn set_pending_resets_remember_only_on_front_change() {
         let mut ui = ApprovalsUi::new();
-        ui.set_pending(vec![row("a")]);
+        ui.set_pending(vec![row("a")], HashMap::new());
         ui.remember = true;
         // 같은 맨 앞 항목 → 체크 유지 (뒤 항목만 추가돼도)
-        ui.set_pending(vec![row("a"), row("b")]);
+        ui.set_pending(vec![row("a"), row("b")], HashMap::new());
         assert!(ui.remember);
         // 맨 앞이 'b'로 바뀜('a' 해소됨) → 리셋
-        ui.set_pending(vec![row("b")]);
+        ui.set_pending(vec![row("b")], HashMap::new());
         assert!(!ui.remember);
         // 빈 목록 → 리셋 상태 유지
-        ui.set_pending(vec![]);
+        ui.set_pending(vec![], HashMap::new());
         assert!(!ui.remember);
         assert_eq!(ui.decide(true), None);
     }

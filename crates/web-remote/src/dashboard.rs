@@ -43,6 +43,17 @@ struct SessionEntry {
     exited: bool,
 }
 
+/// 앱이 웹 대시보드에 넘기는 세션 시드 한 행. 재구독(start_web·워크스페이스 전환) 직후,
+/// 이벤트 이력이 없는 새 구독자가 needs_approval 등 이미 정착한 상태를 즉시 반영하도록
+/// 앱이 GUI 배지용으로 추적 중인 현재 상태를 담아 넘긴다(계획 P2 리뷰: edge-trigger 유실 보정).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionSeed {
+    pub id: u64,
+    pub title: String,
+    pub status: SessionStatus,
+    pub exited: bool,
+}
+
 /// [`SessionStatus`] → snake_case 문자열(브라우저 프로토콜).
 fn status_str(status: SessionStatus) -> &'static str {
     match status {
@@ -148,8 +159,6 @@ struct Inner {
     force_poll: bool,
     /// 활성 workspace worker 구독. 전환 시 [`DashboardHandle::set_runtime_source`]가 교체한다.
     receiver: Option<RuntimeEventReceiver>,
-    /// 승인 대시보드용 자체 DB 연결(없으면 승인 목록은 빈 채로 상태만 흐른다).
-    db: Option<storage::Db>,
     sessions: BTreeMap<u64, SessionEntry>,
     resource: Option<ResourceView>,
     last_poll: Instant,
@@ -167,6 +176,10 @@ struct Published {
 struct Shared {
     inner: Mutex<Inner>,
     published: Mutex<Published>,
+    /// 승인 대시보드용 자체 DB 연결(없으면 승인 목록은 빈 채로 상태만 흐른다). inner와 별도
+    /// 락으로 두어 승인 되쓰기/폴링의 DB I/O(busy_timeout 최대 5s)가 이벤트 drain·등록이 쓰는
+    /// inner 락을 잡은 채 진행되지 않게 한다(P3 리뷰). 락 순서는 inner→db 고정(교착 방지).
+    db: Mutex<Option<storage::Db>>,
     cvar: Condvar,
     /// 인증까지 마친 라이브 대시보드 WS 수 — wake/타이머 게이트.
     connections: AtomicUsize,
@@ -214,12 +227,12 @@ impl DashboardHandle {
                 dirty: false,
                 force_poll: false,
                 receiver: None,
-                db,
                 sessions: BTreeMap::new(),
                 resource: None,
                 last_poll: Instant::now() - POLL_INTERVAL,
             }),
             published: Mutex::new(Published::default()),
+            db: Mutex::new(db),
             cvar: Condvar::new(),
             connections: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
@@ -259,6 +272,32 @@ impl DashboardHandle {
         self.shared.cvar.notify_all();
     }
 
+    /// 현재 워크스페이스의 세션 목록/상태/제목/exited를 시드한다(start_web·워크스페이스 전환 시,
+    /// 구독 등록 직후 호출). 세션 맵을 **통째로 교체**해, `SetWorkspaceState(Active)`(비동기)와
+    /// 구독 등록(동기) 사이 레이스로 MuxUpdated 재발화를 놓쳐도 옛 워크스페이스 세션이 남지
+    /// 않게 한다. 이후 도착하는 이벤트는 증분 갱신이며, MuxUpdated의 or_insert는 시드된 항목을
+    /// and_modify(제목만)로 건드리므로 시드된 상태를 기본값(Running)으로 덮어쓰지 않는다.
+    pub fn seed_sessions(&self, seeds: Vec<SessionSeed>) {
+        {
+            let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
+            inner.sessions = seeds
+                .into_iter()
+                .map(|seed| {
+                    (
+                        seed.id,
+                        SessionEntry {
+                            title: seed.title,
+                            status: seed.status,
+                            exited: seed.exited,
+                        },
+                    )
+                })
+                .collect();
+            inner.dirty = true;
+        }
+        self.shared.cvar.notify_all();
+    }
+
     /// 인증 완료 접속을 등록한다 — 연결 수 +1, 즉시 폴링 강제. Drop 시 자동 -1.
     pub fn register_connection(&self) -> ConnectionGuard {
         self.shared.connections.fetch_add(1, Ordering::SeqCst);
@@ -277,15 +316,20 @@ impl DashboardHandle {
     /// 즉시 재폴링을 강제해 목록에서 사라진 걸 빠르게 반영한다.
     pub fn resolve(&self, id: &str, allowed: bool, remember: bool) {
         let now = epoch_secs();
-        let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
-        if let Some(db) = &inner.db
+        // 재폴링 강제 플래그만 inner에서 세우고 즉시 놓는다 — DB 되쓰기(busy_timeout 최대 5s)를
+        // inner 락 밖에서 수행해 브리지의 이벤트 drain·접속 등록이 막히지 않게 한다(P3 리뷰).
+        {
+            let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
+            inner.force_poll = true;
+            inner.dirty = true;
+        }
+        // DB 되쓰기는 전용 db 락으로(inner 미보유 — 락 순서 inner→db 준수). 그 뒤 브리지를 깨워
+        // 재폴링시켜 목록에서 사라진 걸 빠르게 반영한다(first-writer-wins — 해소된 id는 no-op).
+        if let Some(db) = self.shared.db.lock().expect("dashboard db lock").as_ref()
             && let Err(e) = db.resolve_approval(id, allowed, remember, now)
         {
             tracing::warn!("web-remote 승인 resolve 실패: {e:#}");
         }
-        inner.force_poll = true;
-        inner.dirty = true;
-        drop(inner);
         self.shared.cvar.notify_all();
     }
 
@@ -407,13 +451,14 @@ fn run(shared: &Arc<Shared>) {
         if should_poll {
             inner.last_poll = Instant::now();
             shared.poll_count.fetch_add(1, Ordering::SeqCst);
-            if let Some(db) = &inner.db {
-                match db.list_pending_approvals() {
+            // db 락을 inner 밑에 중첩 취득한다(락 순서 inner→db). resolve는 inner를 놓고서만
+            // db를 잡으므로 교착이 생기지 않는다.
+            match shared.db.lock().expect("dashboard db lock").as_ref() {
+                Some(db) => match db.list_pending_approvals() {
                     Ok(rows) => approvals = Some(approval_views(rows)),
                     Err(e) => tracing::warn!("web-remote 승인 목록 폴링 실패: {e:#}"),
-                }
-            } else {
-                approvals = Some(Vec::new());
+                },
+                None => approvals = Some(Vec::new()),
             }
         }
 

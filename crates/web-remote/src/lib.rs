@@ -34,9 +34,16 @@ pub mod protocol;
 pub mod static_srv;
 pub mod ws_api;
 
-/// 동시 접속 스레드 상한. 초과 접속은 503으로 거부하지 않고 슬롯이 빌 때까지
-/// OS backlog에서 대기시킨다 — 브라우저의 병렬 자산 요청(보통 ≤6)이 깨지지 않는다.
+/// 정적 요청(비-WS) 동시 처리 상한. 초과 접속은 503으로 거부하지 않고 슬롯이 빌 때까지
+/// OS backlog에서 대기시킨다 — 브라우저의 병렬 자산 요청(보통 ≤6)이 깨지지 않는다. 정적
+/// 요청은 1개 처리 후 즉시 종료(Connection: close)라 슬롯이 빠르게 회전한다. WS는 이 슬롯을
+/// 쓰지 않는다(업그레이드 시 [`MAX_WS_CONNECTIONS`]로 이관) — 장수 WS가 정적 자산 요청을
+/// 굶기지 않게 한다(P2 리뷰).
 pub const MAX_CONNECTIONS: usize = 3;
+
+/// 동시 WS(대시보드) 접속 상한. 업그레이드 확정 시점에 정적 슬롯을 반납하고 이 카운터로
+/// 이관하며, 상한 초과면 즉시 503으로 거부한다. 계획의 폰 1~2대 가정 + 여유로 3을 둔다.
+pub const MAX_WS_CONNECTIONS: usize = 3;
 
 /// 요청 head 총 수신 데드라인 겸 read/write syscall 타임아웃 — 침묵·트리클
 /// peer(slowloris)의 접속 슬롯 점유에 wall-clock 상한을 둔다.
@@ -69,8 +76,19 @@ struct ConnEntry {
     handle: JoinHandle<()>,
 }
 
-/// 접속 목록 + 슬롯 반납 신호. accept 스레드는 상한 초과 시 Condvar에서 기다린다.
-type ConnSet = (Mutex<Vec<ConnEntry>>, Condvar);
+/// 살아있는 접속 목록 + 정적/WS 슬롯 점유 카운트. `entries`는 shutdown(소켓 종료+join)을 위해
+/// 정적·WS 접속을 **모두** 담고, 두 카운터가 슬롯 점유를 따로 센다. WS 승격 시 정적 슬롯을
+/// 반납하고 WS 슬롯으로 이관해, 장수 WS가 정적 자산 요청의 슬롯을 굶기지 않게 한다(P2 리뷰).
+struct ConnState {
+    entries: Vec<ConnEntry>,
+    /// 정적 요청이 점유한 슬롯 수(≤ [`MAX_CONNECTIONS`]). accept는 이 값이 상한 미만일 때만 진행.
+    static_slots: usize,
+    /// WS가 점유한 슬롯 수(≤ [`MAX_WS_CONNECTIONS`]).
+    ws_slots: usize,
+}
+
+/// 접속 상태 + 슬롯 반납 신호. accept 스레드는 정적 슬롯 상한 초과 시 Condvar에서 기다린다.
+type ConnSet = (Mutex<ConnState>, Condvar);
 
 /// 실행 중인 웹서버. Drop/shutdown이 accept 루프·접속 스레드·대시보드 스레드를 모두 정리한다.
 pub struct WebRemoteServer {
@@ -97,7 +115,14 @@ impl WebRemoteServer {
         let listener = TcpListener::bind(addr).context("web-remote bind 실패")?;
         let addr = listener.local_addr()?;
         let stop = Arc::new(AtomicBool::new(false));
-        let connections: Arc<ConnSet> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        let connections: Arc<ConnSet> = Arc::new((
+            Mutex::new(ConnState {
+                entries: Vec::new(),
+                static_slots: 0,
+                ws_slots: 0,
+            }),
+            Condvar::new(),
+        ));
         // WS 대시보드 브리지 스레드. OFF(서버 미생성)면 이 스레드도 없다 — 리소스 0.
         let (dashboard, dashboard_thread) = dashboard::DashboardHandle::spawn(options.db_path);
         let ctx = Arc::new(ConnCtx {
@@ -132,13 +157,30 @@ impl WebRemoteServer {
         self.dashboard.set_runtime_source(receiver);
     }
 
+    /// 현재 활성 workspace의 세션 상태를 대시보드에 시드한다(구독 등록 직후 호출 — 재구독 시
+    /// edge-trigger 상태 유실 보정). app이 GUI 배지용으로 이미 추적 중인 상태를 넘긴다.
+    pub fn seed_sessions(&self, seeds: Vec<dashboard::SessionSeed>) {
+        self.dashboard.seed_sessions(seeds);
+    }
+
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
     }
 
-    /// 현재 살아있는 접속 스레드 수 (표시/테스트용).
+    /// 현재 살아있는 접속(정적+WS) 수 (표시/테스트용).
     pub fn active_connections(&self) -> usize {
-        self.connections.0.lock().expect("connections lock").len()
+        self.connections
+            .0
+            .lock()
+            .expect("connections lock")
+            .entries
+            .len()
+    }
+
+    /// 현재 (정적 슬롯, WS 슬롯) 점유 수 (테스트용 — 슬롯 누수/이관 검증).
+    pub fn slot_counts(&self) -> (usize, usize) {
+        let state = self.connections.0.lock().expect("connections lock");
+        (state.static_slots, state.ws_slots)
     }
 
     /// accept 루프와 모든 접속 스레드를 동기 종료한다.
@@ -151,7 +193,10 @@ impl WebRemoteServer {
         // 접속 소켓을 먼저 모두 닫아 블록된 read를 깨운 뒤 join한다 (remote.rs 관례).
         // notify_all은 슬롯 대기 중인 accept 스레드도 깨운다.
         let (lock, cvar) = &*self.connections;
-        let conns = std::mem::take(&mut *lock.lock().expect("connections lock"));
+        let conns = {
+            let mut state = lock.lock().expect("connections lock");
+            std::mem::take(&mut state.entries)
+        };
         cvar.notify_all();
         for conn in &conns {
             let _ = conn.stream.shutdown(Shutdown::Both);
@@ -214,40 +259,53 @@ fn spawn_accept(
                 let conn_conns = Arc::clone(&connections);
 
                 let (lock, cvar) = &*connections;
-                let mut conns = lock.lock().expect("connections lock");
-                // 동시 접속 상한: 슬롯이 빌 때까지 대기 — 그동안 새 접속은 OS backlog에
-                // 쌓인다(연결 거부 아님). 접속 스레드 종료/shutdown이 notify로 깨운다.
-                while conns.len() >= MAX_CONNECTIONS && !stop.load(Ordering::SeqCst) {
-                    conns = cvar.wait(conns).expect("connections wait");
+                let mut state = lock.lock().expect("connections lock");
+                // 정적 슬롯 상한: 슬롯이 빌 때까지 대기 — 그동안 새 접속은 OS backlog에
+                // 쌓인다(연결 거부 아님). 접속 종료·WS 승격(정적 슬롯 반납)·shutdown이 깨운다.
+                // WS 슬롯은 여기서 세지 않으므로 장수 WS가 정적 요청을 굶히지 않는다(P2 리뷰).
+                while state.static_slots >= MAX_CONNECTIONS && !stop.load(Ordering::SeqCst) {
+                    state = cvar.wait(state).expect("connections wait");
                 }
                 if stop.load(Ordering::SeqCst) {
-                    drop(conns);
+                    drop(state);
                     let _ = stream.shutdown(Shutdown::Both);
                     break;
                 }
-                // 주의: conns 락은 spawn부터 아래 push까지 계속 쥐어야 한다 — 중간에 놓으면
-                // 자식의 self-removal(retain)이 push보다 먼저 실행돼 슬롯이 영구 누수된다.
+                // 주의: state 락은 spawn부터 아래 슬롯 증가+push까지 계속 쥐어야 한다 — 중간에
+                // 놓으면 자식의 정리(retain+슬롯 감산)가 push보다 먼저 실행돼 슬롯이 영구
+                // 누수된다(P1 불변식). 락을 쥔 덕에 자식의 WS 승격(정적 슬롯 반납)도 아래
+                // static_slots 증가 이후에만 진행돼 감산 순서가 어긋나지 않는다.
                 let handle = match std::thread::Builder::new()
                     .name("web-remote-conn".into())
                     .spawn(move || {
-                        handle_connection(stream, &conn_ctx);
+                        // WS로 승격했으면 true — 정적 슬롯을 반납하고 WS 슬롯 보유 상태로 종료.
+                        // 그 경우 ws_slots를, 아니면 static_slots를 반납한다.
+                        let held_ws = handle_connection(stream, &conn_ctx, &conn_conns);
                         // 접속 종료 — 자기 항목을 스스로 제거하고 슬롯 반납을 알린다
                         // (자기 join은 데드락이라 remove만 — remote.rs 관례).
                         let id = std::thread::current().id();
                         let (lock, cvar) = &*conn_conns;
-                        lock.lock()
-                            .expect("connections lock")
+                        let mut state = lock.lock().expect("connections lock");
+                        state
+                            .entries
                             .retain(|entry| entry.handle.thread().id() != id);
+                        if held_ws {
+                            state.ws_slots -= 1;
+                        } else {
+                            state.static_slots -= 1;
+                        }
+                        drop(state);
                         cvar.notify_one();
                     }) {
                     Ok(handle) => handle,
                     Err(e) => {
-                        drop(conns);
+                        drop(state); // 아직 슬롯을 늘리지 않았으므로 롤백 불필요
                         tracing::warn!("web-remote 접속 스레드 생성 실패: {e}");
                         continue;
                     }
                 };
-                conns.push(ConnEntry {
+                state.static_slots += 1;
+                state.entries.push(ConnEntry {
                     stream: shutdown_clone,
                     handle,
                 });
@@ -280,8 +338,9 @@ impl<R: Read> Read for DeadlineReader<R> {
     }
 }
 
-/// 접속 하나 = 요청 하나 (Connection: close). head 파싱 → Host 검증 → 라우팅.
-fn handle_connection(stream: TcpStream, ctx: &ConnCtx) {
+/// 접속 하나 = 요청 하나 (Connection: close). head 파싱 → Host 검증 → 라우팅. WS로 승격해
+/// WS 슬롯 보유 상태로 끝나면 `true`를 돌려준다(호출자가 static/ws 중 어느 슬롯을 반납할지 판정).
+fn handle_connection(stream: TcpStream, ctx: &ConnCtx, connections: &Arc<ConnSet>) -> bool {
     let peer = stream
         .peer_addr()
         .map(|addr| addr.to_string())
@@ -294,7 +353,7 @@ fn handle_connection(stream: TcpStream, ctx: &ConnCtx) {
         || stream.set_read_timeout(Some(READ_TIMEOUT)).is_err()
         || stream.set_write_timeout(Some(READ_TIMEOUT)).is_err()
     {
-        return;
+        return false;
     }
     let mut reader = BufReader::new(DeadlineReader {
         inner: stream,
@@ -302,7 +361,7 @@ fn handle_connection(stream: TcpStream, ctx: &ConnCtx) {
     });
     let head = match http::read_request_head(&mut reader) {
         Ok(head) => head,
-        Err(http::HeadError::Closed) => return, // 침묵/트리클/절단 peer — 응답 없이 종료
+        Err(http::HeadError::Closed) => return false, // 침묵/트리클/절단 peer — 응답 없이 종료
         Err(http::HeadError::TooLarge) => {
             tracing::warn!(peer, "web-remote: 요청 head 상한 초과 — 431");
             respond(
@@ -311,7 +370,7 @@ fn handle_connection(stream: TcpStream, ctx: &ConnCtx) {
                 &peer,
                 "?",
             );
-            return;
+            return false;
         }
         Err(http::HeadError::Malformed) => {
             respond(
@@ -320,9 +379,12 @@ fn handle_connection(stream: TcpStream, ctx: &ConnCtx) {
                 &peer,
                 "?",
             );
-            return;
+            return false;
         }
     };
+    // BufReader → raw 소켓 핸드오프: into_inner는 BufReader 내부 버퍼에 남은 바이트를 버린다.
+    // WS 승격 시 파이프라이닝 클라이언트가 101 전에 선행 프레임을 보냈다면 그 프레임은 유실된다
+    // — 표준 브라우저는 101 수신 전 WS 프레임을 보내지 않으므로 실무상 비발현.
     let stream = reader.into_inner().inner;
 
     // Host 검증 — DNS rebinding 차단 (remote-tls-delta §1.5 Origin 지침의 HTTP 적용).
@@ -334,14 +396,27 @@ fn handle_connection(stream: TcpStream, ctx: &ConnCtx) {
             &peer,
             &head.path,
         );
-        return;
+        return false;
     }
-    // WS 업그레이드는 ws_api 계층이 승격해 대시보드 세션을 처리한다(접속을 장수 점유).
+    // WS 업그레이드(`/ws`만)는 ws_api 계층이 승격해 대시보드 세션을 처리한다(접속을 장수 점유).
     // query에 토큰이 실릴 수 있어 로그하지 않는다 — path만.
     if ws_api::is_upgrade_request(&head) {
+        // 승격 확정 시점에 정적 슬롯을 반납하고 WS 슬롯으로 이관한다 — 장수 WS가 정적 자산
+        // 요청의 슬롯을 굶히지 않게(P2 리뷰). 상한 초과면 이관 없이 503으로 즉시 거부한다
+        // (핸드셰이크 전이라 HTTP 503이 즉시 거부 — 브라우저 WS는 실패 후 백오프 재접속).
+        if !try_acquire_ws_slot(connections) {
+            tracing::warn!(peer, "web-remote: WS 슬롯 상한 초과 — 503");
+            respond(
+                stream,
+                &http::Response::plain(503, "websocket capacity reached"),
+                &peer,
+                &head.path,
+            );
+            return false; // 정적 슬롯 유지 — 호출자가 static_slots 반납
+        }
         tracing::info!(peer, path = %head.path, "web-remote WS 업그레이드");
         ws_api::serve(stream, &head, &ctx.token, &ctx.dashboard, &ctx.stop);
-        return;
+        return true; // WS 슬롯 보유 상태로 종료 — 호출자가 ws_slots 반납
     }
     if head.method != "GET" {
         respond(
@@ -350,10 +425,28 @@ fn handle_connection(stream: TcpStream, ctx: &ConnCtx) {
             &peer,
             &head.path,
         );
-        return;
+        return false;
     }
     let response = static_srv::respond(&head.path, &head.query, &ctx.token);
     respond(stream, &response, &peer, &head.path);
+    false
+}
+
+/// 정적 슬롯을 반납하고 WS 슬롯을 확보한다. WS 슬롯이 남아 있으면 `static_slots`를 1 줄이고
+/// `ws_slots`를 1 늘린 뒤 `true`(정적 슬롯 반납은 대기 중인 accept를 깨운다). 상한 초과면 아무
+/// 변화 없이 `false`(정적 슬롯 유지 — 호출자가 반납). 호출 시점엔 이 접속의 정적 슬롯이 이미
+/// 계수돼 있어(accept가 spawn 전 증가) `static_slots >= 1`이 보장된다 — 언더플로 없음.
+fn try_acquire_ws_slot(connections: &Arc<ConnSet>) -> bool {
+    let (lock, cvar) = &**connections;
+    let mut state = lock.lock().expect("connections lock");
+    if state.ws_slots >= MAX_WS_CONNECTIONS {
+        return false;
+    }
+    state.static_slots -= 1;
+    state.ws_slots += 1;
+    drop(state);
+    cvar.notify_one(); // 정적 슬롯 하나 반납 — 대기 중인 accept 깨움
+    true
 }
 
 /// 응답을 쓰고 접속 감사 로그를 남긴다. query는 토큰이 실리므로 **절대 로그하지 않는다**.
@@ -896,5 +989,206 @@ mod tests {
         assert!(!host_allowed(Some("mac.tail.ts.net"), None));
         assert!(!host_allowed(Some("evil.example"), Some("mac.tail.ts.net")));
         assert!(!host_allowed(None, Some("mac.tail.ts.net")));
+    }
+
+    /// pane→세션 목록만 담은 MuxUpdated(제목 갱신용). 상태는 담지 않는다.
+    fn mux_event(panes: &[(u64, &str)]) -> runtime::RuntimeEvent {
+        runtime::RuntimeEvent::MuxUpdated {
+            snapshot: Arc::new(runtime::MuxSnapshot {
+                tabs: vec![runtime::TabSnapshot {
+                    id: runtime::MuxTabId("tab-1".into()),
+                    title: "tab".into(),
+                    layout: runtime::LayoutNode::Pane(runtime::MuxPaneId("p-1".into())),
+                    panes: panes
+                        .iter()
+                        .map(|(id, title)| runtime::PaneSnapshot {
+                            id: runtime::MuxPaneId(id.to_string()),
+                            session_id: Some(runtime::SessionId(*id)),
+                            title: (*title).to_owned(),
+                        })
+                        .collect(),
+                }],
+                active_tab: Some(runtime::MuxTabId("tab-1".into())),
+                focused_pane: Some(runtime::MuxPaneId("p-1".into())),
+            }),
+        }
+    }
+
+    /// 데드라인 내에 `needle`을 포함한 대시보드 프레임을 찾아 그 전문을 돌려준다.
+    fn wait_dashboard_frame(ws: &mut WebSocket<TcpStream>, needle: &str) -> Option<String> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if let Some(frame) = read_frame_of_type(ws, "dashboard", Duration::from_secs(1))
+                && frame.contains(needle)
+            {
+                return Some(frame);
+            }
+        }
+        None
+    }
+
+    /// 인증까지 마쳐 WS 슬롯을 잡은 클라이언트(welcome 수신으로 등록 완료 확인).
+    fn ws_client_authed(addr: SocketAddr) -> WebSocket<TcpStream> {
+        let mut ws = ws_client(addr);
+        send_text(
+            &mut ws,
+            &format!(r#"{{"type":"auth","v":1,"token":"{TEST_TOKEN}"}}"#),
+        );
+        assert!(
+            read_frame_of_type(&mut ws, "welcome", Duration::from_secs(3)).is_some(),
+            "welcome 프레임 없음"
+        );
+        ws
+    }
+
+    /// (정적, WS) 슬롯이 기대치가 될 때까지 대기한다(비동기 등록/해제 반영).
+    fn wait_slots(server: &WebRemoteServer, want: (usize, usize)) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if server.slot_counts() == want {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    // ── P2-1: 대시보드 상태 시드 ───────────────────────────────────────────
+    #[test]
+    fn ws_시드_상태가_프레임에_반영되고_mux는_시드를_덮지_않는다() {
+        let server = start(None);
+        let addr = server.local_addr();
+        // 접속(재구독) 전에 needs_approval로 시드 — 이벤트 이력 없는 새 구독자가 즉시 반영해야 한다
+        server.seed_sessions(vec![dashboard::SessionSeed {
+            id: 7,
+            title: "claude".to_owned(),
+            status: runtime::SessionStatus::NeedsApproval,
+            exited: false,
+        }]);
+        let mut ws = ws_client_authed(addr);
+        let frame = wait_dashboard_frame(&mut ws, r#""id":7"#).expect("시드 프레임 없음");
+        assert!(frame.contains(r#""status":"needs_approval""#), "{frame}");
+
+        // 제목만 바꾸는 MuxUpdated가 와도 시드된 needs_approval을 Running으로 덮지 않는다
+        server.dashboard.inject_event(mux_event(&[(7, "claude-2")]));
+        let frame =
+            wait_dashboard_frame(&mut ws, r#""title":"claude-2""#).expect("제목 갱신 프레임 없음");
+        assert!(
+            frame.contains(r#""status":"needs_approval""#),
+            "MuxUpdated가 시드된 상태를 덮었다: {frame}"
+        );
+        drop(ws);
+    }
+
+    #[test]
+    fn ws_재시드는_옛_워크스페이스_세션을_교체한다() {
+        let server = start(None);
+        let addr = server.local_addr();
+        // 워크스페이스 A: 세션 1 = needs_approval
+        server.seed_sessions(vec![dashboard::SessionSeed {
+            id: 1,
+            title: "A".to_owned(),
+            status: runtime::SessionStatus::NeedsApproval,
+            exited: false,
+        }]);
+        let mut ws = ws_client_authed(addr);
+        assert!(
+            wait_dashboard_frame(&mut ws, r#""id":1"#).is_some(),
+            "워크스페이스 A 시드 미반영"
+        );
+        // 전환: 워크스페이스 B로 재시드(세션 2 = error). 세션 맵 통째 교체라 A의 세션 1은 사라진다
+        // — MuxUpdated 재발화를 놓쳐도 옛 워크스페이스 세션이 정체되지 않는다(전환 레이스 해소).
+        server.seed_sessions(vec![dashboard::SessionSeed {
+            id: 2,
+            title: "B".to_owned(),
+            status: runtime::SessionStatus::Error,
+            exited: false,
+        }]);
+        let frame =
+            wait_dashboard_frame(&mut ws, r#""id":2"#).expect("워크스페이스 B 재시드 미반영");
+        assert!(frame.contains(r#""status":"error""#), "{frame}");
+        assert!(
+            !frame.contains(r#""id":1"#),
+            "옛 워크스페이스 세션이 남았다: {frame}"
+        );
+        drop(ws);
+    }
+
+    // ── P2-2: WS/정적 슬롯 분리 ────────────────────────────────────────────
+    #[test]
+    fn ws가_정적_슬롯을_모두_점유해도_정적_요청은_즉시_처리된다() {
+        let server = start(None);
+        let addr = server.local_addr();
+        // 정적 슬롯 수(=MAX_CONNECTIONS)만큼 WS를 열어 둔다 — 옛 설계라면 정적 슬롯을 전부
+        // 굶겼을 상황. WS는 별도 슬롯을 쓰므로 정적 풀은 그대로 비어 있어야 한다.
+        let holders: Vec<WebSocket<TcpStream>> = (0..MAX_CONNECTIONS)
+            .map(|_| ws_client_authed(addr))
+            .collect();
+        assert!(
+            wait_slots(&server, (0, MAX_CONNECTIONS)),
+            "WS 슬롯이 이관되지 않음: {:?}",
+            server.slot_counts()
+        );
+        // 정적 GET이 슬롯 대기 없이 즉시 200
+        let resp = get(addr, "/healthz");
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        drop(holders);
+    }
+
+    #[test]
+    fn ws_슬롯_상한_초과는_503으로_거부된다() {
+        let server = start(None);
+        let addr = server.local_addr();
+        let holders: Vec<WebSocket<TcpStream>> = (0..MAX_WS_CONNECTIONS)
+            .map(|_| ws_client_authed(addr))
+            .collect();
+        assert!(
+            wait_slots(&server, (0, MAX_WS_CONNECTIONS)),
+            "WS 슬롯이 상한까지 차지 않음: {:?}",
+            server.slot_counts()
+        );
+        // 상한 초과 WS 업그레이드는 핸드셰이크 전에 503으로 거부(브라우저는 백오프 재접속)
+        let resp = request(
+            addr,
+            "GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        );
+        assert!(resp.starts_with("HTTP/1.1 503"), "{resp}");
+        drop(holders);
+    }
+
+    #[test]
+    fn ws_종료_후_슬롯이_복원된다() {
+        let server = start(None);
+        let addr = server.local_addr();
+        let ws = ws_client_authed(addr);
+        assert!(
+            wait_slots(&server, (0, 1)),
+            "WS 슬롯 이관 안 됨: {:?}",
+            server.slot_counts()
+        );
+        drop(ws); // 접속 종료 — 서버가 WS 슬롯을 반납해야 한다(누수 없음)
+        assert!(
+            wait_slots(&server, (0, 0)),
+            "WS 종료 후 슬롯이 복원되지 않음: {:?}",
+            server.slot_counts()
+        );
+    }
+
+    #[test]
+    fn 비_ws_경로_업그레이드는_정적_라우팅으로_흐른다() {
+        // /ws 아닌 경로의 Upgrade 요청은 WS 승격 대상이 아니다(P3-3) — 정적 라우팅으로 흘러
+        // 화이트리스트 밖이면 404. (WS 슬롯을 잡지 않는다.)
+        let server = start(None);
+        let addr = server.local_addr();
+        let resp = request(
+            addr,
+            "GET /nope HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        );
+        assert!(resp.starts_with("HTTP/1.1 404"), "{resp}");
+        assert_eq!(
+            server.slot_counts().1,
+            0,
+            "비-/ws 업그레이드가 WS 슬롯을 잡았다"
+        );
     }
 }

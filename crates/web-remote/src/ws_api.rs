@@ -36,10 +36,14 @@ const MAX_CLIENT_FRAME_BYTES: usize = 64 * 1024;
 /// 프레임의 메모리 점유를 유계로 둔다. 서버 대시보드/승인 프레임은 이보다 훨씬 작다.
 const WS_SIZE_CAP: usize = 1024 * 1024;
 
-/// WebSocket 업그레이드 요청인가 (`Upgrade: websocket`).
+/// `/ws` 경로의 WebSocket 업그레이드 요청인가 (`Upgrade: websocket`). 경로를 `/ws`로 한정해
+/// 다른 경로로 온 업그레이드 헤더는 정적 라우팅으로 흘려보낸다(정적 셸은 404/401). 클라이언트
+/// (assets/app.js)도 `location.host + '/ws'`로만 접속한다.
 pub fn is_upgrade_request(head: &RequestHead) -> bool {
-    head.header("upgrade")
-        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+    head.path == "/ws"
+        && head
+            .header("upgrade")
+            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
 }
 
 /// 업그레이드 요청 하나를 WS로 승격해 대시보드 세션을 처리한다. head는 이미 Host 검증·
@@ -86,7 +90,7 @@ pub fn serve(
     let mut ws = WebSocket::from_raw_socket(stream, Role::Server, Some(config));
 
     // 1) 인증 — 첫 텍스트 프레임의 토큰을 상수시간 비교. 실패/타임아웃은 close.
-    if !authenticate(&mut ws, token, stop) {
+    if !authenticate(&mut ws, token, stop, AUTH_TIMEOUT) {
         let _ = ws.send(Message::Text(
             ServerMsg::Error {
                 message: "unauthorized".into(),
@@ -119,9 +123,15 @@ pub fn serve(
     let _ = ws.flush();
 }
 
-/// 첫 프레임에서 토큰을 받아 인증한다. 데드라인 내 유효 토큰이면 true.
-fn authenticate(ws: &mut WebSocket<TcpStream>, token: &str, stop: &AtomicBool) -> bool {
-    let deadline = Instant::now() + AUTH_TIMEOUT;
+/// 첫 프레임에서 토큰을 받아 인증한다. `timeout` 내 유효 토큰이면 true. `timeout`은 테스트가
+/// 짧은 데드라인을 주입할 수 있게 인자로 받는다(serve는 [`AUTH_TIMEOUT`]을 넘긴다).
+fn authenticate(
+    ws: &mut WebSocket<TcpStream>,
+    token: &str,
+    stop: &AtomicBool,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if stop.load(Ordering::SeqCst) {
             return false;
@@ -250,5 +260,48 @@ mod tests {
             derive_accept_key(b"dGhlIHNhbXBsZSBub25jZQ=="),
             "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
         );
+    }
+
+    #[test]
+    fn 인증_데드라인_초과는_실패한다() {
+        // 인증 프레임을 전혀 안 보내는 피어 → 주입한 짧은 timeout 내에 close 처리(false).
+        // AUTH_TIMEOUT(5s) 경로를 데드라인 주입으로 빠르게 검증한다(P3-4).
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap(); // 연결만 하고 아무것도 안 보낸다
+        let (server, _) = listener.accept().unwrap();
+        // tick 단위로 깨어 데드라인까지 재시도하도록 짧은 read 타임아웃.
+        server
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let mut ws = WebSocket::from_raw_socket(server, Role::Server, None);
+        let stop = AtomicBool::new(false);
+        let start = Instant::now();
+        let ok = authenticate(&mut ws, "tok", &stop, Duration::from_millis(120));
+        let elapsed = start.elapsed();
+        assert!(!ok, "인증 프레임이 없는데 성공 처리됨");
+        // 데드라인 전에 반환하지 않고(조기 성공/실패 아님), 무한정 걸리지도 않는다.
+        assert!(elapsed >= Duration::from_millis(120), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        drop(client);
+    }
+
+    #[test]
+    fn stop_신호는_인증을_즉시_중단시킨다() {
+        // shutdown 중에는 데드라인 전이라도 인증 루프가 곧바로 빠져나온다.
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let mut ws = WebSocket::from_raw_socket(server, Role::Server, None);
+        let stop = AtomicBool::new(true); // 이미 stop
+        let ok = authenticate(&mut ws, "tok", &stop, Duration::from_secs(5));
+        assert!(!ok, "stop 상태인데 인증이 성공/대기했다");
+        drop(client);
     }
 }

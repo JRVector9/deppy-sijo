@@ -33,6 +33,8 @@ pub struct PendingAuthorization {
     client: ConfiguredClient,
     state: CsrfToken,
     pkce_verifier: PkceCodeVerifier,
+    /// RFC 8707 resource — authorize에 실었다면 token 교환에도 같이 싣는다.
+    resource: Option<String>,
 }
 
 pub struct OAuthToken {
@@ -61,6 +63,17 @@ pub fn begin(
     config: &OAuthProviderConfig,
     redirect_uri: &str,
 ) -> anyhow::Result<PendingAuthorization> {
+    begin_with_resource(config, redirect_uri, None)
+}
+
+/// [`begin`] + RFC 8707 `resource` 파라미터 (PR-H4).
+/// resource(MCP 서버 canonical URL — H5가 넘긴다)는 authorize URL과
+/// token 교환 요청 양쪽에 첨부된다. None이면 기존 begin과 동일.
+pub fn begin_with_resource(
+    config: &OAuthProviderConfig,
+    redirect_uri: &str,
+    resource: Option<&str>,
+) -> anyhow::Result<PendingAuthorization> {
     crate::validate_redirect_uri(redirect_uri)?;
     crate::validate_redirect_uri(&config.auth_url)
         .context("auth URL은 HTTPS(또는 로컬 테스트용 loopback)여야 합니다")?;
@@ -75,17 +88,22 @@ pub fn begin(
         );
 
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
-    let (authorize_url, state) = client
+    let mut request = client
         .authorize_url(CsrfToken::new_random)
         .add_scopes(config.scopes.iter().map(|s| Scope::new(s.clone())))
-        .set_pkce_challenge(pkce_challenge)
-        .url();
+        .set_pkce_challenge(pkce_challenge);
+    if let Some(resource) = resource {
+        // RFC 8707: 발급 대상 리소스를 authorize 단계부터 고정한다
+        request = request.add_extra_param("resource", resource.to_owned());
+    }
+    let (authorize_url, state) = request.url();
 
     Ok(PendingAuthorization {
         authorize_url: authorize_url.to_string(),
         client,
         state,
         pkce_verifier,
+        resource: resource.map(str::to_owned),
     })
 }
 
@@ -102,12 +120,15 @@ pub fn complete(
     let http: ureq::Agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(30))
         .build();
-    let response = pending
+    let mut request = pending
         .client
         .exchange_code(AuthorizationCode::new(params.code))
-        .set_pkce_verifier(pending.pkce_verifier)
-        .request(&http)
-        .context("token 교환 실패")?;
+        .set_pkce_verifier(pending.pkce_verifier);
+    if let Some(resource) = &pending.resource {
+        // RFC 8707: authorize에 실었던 resource를 token 교환에도 동일하게
+        request = request.add_extra_param("resource", resource.as_str());
+    }
+    let response = request.request(&http).context("token 교환 실패")?;
     Ok(OAuthToken {
         access_token: SecretString::new(response.access_token().secret().clone()),
         refresh_token: response
@@ -120,8 +141,17 @@ pub fn complete(
 /// UI용 원스톱: 콜백 서버 bind → 브라우저 열기 → 승인 대기 → token 교환.
 /// 승인 대기까지 블로킹이므로 UI는 백그라운드 스레드에서 부른다.
 pub fn run_flow(config: &OAuthProviderConfig, timeout: Duration) -> anyhow::Result<OAuthToken> {
+    run_flow_with_resource(config, timeout, None)
+}
+
+/// [`run_flow`] + RFC 8707 `resource` 파라미터 (H5의 401 사다리 진입점).
+pub fn run_flow_with_resource(
+    config: &OAuthProviderConfig,
+    timeout: Duration,
+    resource: Option<&str>,
+) -> anyhow::Result<OAuthToken> {
     let server = LocalhostCallbackServer::bind()?;
-    let pending = begin(config, server.redirect_uri())?;
+    let pending = begin_with_resource(config, server.redirect_uri(), resource)?;
     crate::open_in_browser(&pending.authorize_url)?;
     let params = server.wait_for_callback(timeout, pending.state.secret())?;
     complete(pending, params)
@@ -149,6 +179,37 @@ mod tests {
             .query_pairs()
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect()
+    }
+
+    /// 요청 전체(헤더 + Content-Length 본문)를 읽는다. 일부만 읽고 소켓을 닫으면
+    /// 클라이언트 write가 RST를 맞아 병렬 테스트에서 교환이 간헐 실패한다 (macOS).
+    fn read_full_request(stream: &mut std::net::TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let header_end = loop {
+            let n = stream.read(&mut chunk).unwrap();
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            if n == 0 {
+                break buf.len();
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+        let content_length: usize = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0);
+        while buf.len() < header_end + content_length {
+            let n = stream.read(&mut chunk).unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        String::from_utf8_lossy(&buf).into_owned()
     }
 
     #[test]
@@ -210,9 +271,7 @@ mod tests {
         );
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let n = stream.read(&mut buf).unwrap();
-            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let request = read_full_request(&mut stream);
             let body = r#"{"access_token":"at-ok","token_type":"bearer","refresh_token":"rt-ok","expires_in":3600}"#;
             write!(
                 stream,
@@ -244,6 +303,62 @@ mod tests {
         assert!(request.contains("code_verifier="), "{request}");
         assert!(
             request.contains("grant_type=authorization_code"),
+            "{request}"
+        );
+    }
+
+    /// RFC 8707 (PR-H4): resource가 authorize URL과 token 교환 양쪽에 실린다.
+    /// resource 없는 기존 begin 경로는 resource 파라미터를 만들지 않는다.
+    #[test]
+    fn resource_파라미터가_authorize_url과_token_교환에_실린다() {
+        // 기존 begin 경로 — resource 없음
+        let pending = begin(
+            &config("https://provider.example/token"),
+            "http://127.0.0.1:9/callback",
+        )
+        .unwrap();
+        assert!(!query_map(&pending.authorize_url).contains_key("resource"));
+
+        // resource 지정 경로
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let token_url = format!(
+            "http://127.0.0.1:{}/token",
+            listener.local_addr().unwrap().port()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_full_request(&mut stream);
+            let body = r#"{"access_token":"at-ok","token_type":"bearer"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            request
+        });
+
+        let pending = begin_with_resource(
+            &config(&token_url),
+            "http://127.0.0.1:9/callback",
+            Some("https://mcp.example/api"),
+        )
+        .unwrap();
+        let query = query_map(&pending.authorize_url);
+        assert_eq!(query["resource"], "https://mcp.example/api");
+
+        let state = pending.state.secret().clone();
+        complete(
+            pending,
+            CallbackParams {
+                code: "auth-code-2".to_owned(),
+                state,
+            },
+        )
+        .unwrap();
+        let request = server.join().unwrap();
+        assert!(
+            request.contains("resource=https%3A%2F%2Fmcp.example%2Fapi"),
             "{request}"
         );
     }

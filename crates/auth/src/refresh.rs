@@ -17,7 +17,7 @@ use oauth2::{
 };
 use secret::{SecretStore, SecretString};
 
-use crate::{OAuthToken, refresh_entry_id, store_token};
+use crate::{OAuthToken, oauth_http_agent, refresh_entry_id, store_token};
 
 /// 만료 전 선제 refresh 마진 (VS Code DynamicAuthProvider와 동일한 5분).
 pub const REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
@@ -96,9 +96,11 @@ pub enum RefreshOutcome {
 /// access token을 refresh한다. 성공 시 새 토큰은 이미 keyring에 저장돼 있다
 /// ([`crate::store_token`] 규약 — access는 credential id, refresh는 `{id}.refresh`).
 /// 동시 호출은 credential id 단위로 직렬화되고, 대기 중 끝난 갱신은 재발사 없이 공유한다.
+/// 요청은 redirect 금지 [`oauth_http_agent`]로만 나간다 (H4 리뷰 P1) —
+/// 호출측 Agent 주입 대신 timeout을 받는다.
 pub fn refresh_access_token(
     coordinator: &RefreshCoordinator,
-    http: &ureq::Agent,
+    timeout: Duration,
     store: &dyn SecretStore,
     credential_id: &str,
     params: &RefreshParams,
@@ -121,7 +123,7 @@ pub fn refresh_access_token(
             SharedOutcome::Failed(message) => Err(anyhow::anyhow!("선행 refresh 실패: {message}")),
         };
     }
-    let result = do_refresh(http, store, credential_id, params);
+    let result = do_refresh(timeout, store, credential_id, params);
     let shared = match &result {
         Ok(RefreshOutcome::ReauthorizationRequired { reason }) => {
             SharedOutcome::ReauthorizationRequired(reason.clone())
@@ -134,7 +136,7 @@ pub fn refresh_access_token(
 }
 
 fn do_refresh(
-    http: &ureq::Agent,
+    timeout: Duration,
     store: &dyn SecretStore,
     credential_id: &str,
     params: &RefreshParams,
@@ -169,7 +171,11 @@ fn do_refresh(
         // RFC 8707: refresh 교환에도 resource를 실어 대상 리소스를 고정한다
         request = request.add_extra_param("resource", resource.as_str());
     }
-    match request.request(http) {
+    // redirect 금지 Agent (H4 리뷰 P1) — token 응답의 302를 따라가면 refresh token이
+    // redirect 대상으로 흘러갈 수 있다. 302는 oauth2가 비200 응답으로 에러 처리하며
+    // 아래 분류에서 Transient(폐기 없음)로 떨어진다.
+    let http = oauth_http_agent(timeout);
+    match request.request(&http) {
         Ok(response) => {
             let token = OAuthToken {
                 access_token: SecretString::new(response.access_token().secret().clone()),
@@ -266,11 +272,7 @@ mod tests {
     use crate::test_support::{MemStore, MockHttpServer, MockResponse};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn agent() -> ureq::Agent {
-        ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(5))
-            .build()
-    }
+    const TIMEOUT: Duration = Duration::from_secs(5);
 
     fn seeded_store() -> MemStore {
         let store = MemStore::default();
@@ -316,7 +318,7 @@ mod tests {
         let coordinator = RefreshCoordinator::new();
         let outcome = refresh_access_token(
             &coordinator,
-            &agent(),
+            TIMEOUT,
             &store,
             "cred",
             &params(server.url("/token")),
@@ -358,7 +360,7 @@ mod tests {
         let store = seeded_store();
         let outcome = refresh_access_token(
             &RefreshCoordinator::new(),
-            &agent(),
+            TIMEOUT,
             &store,
             "cred",
             &params(server.url("/token")),
@@ -384,7 +386,7 @@ mod tests {
         let store = seeded_store();
         let outcome = refresh_access_token(
             &RefreshCoordinator::new(),
-            &agent(),
+            TIMEOUT,
             &store,
             "cred",
             &params(server.url("/token")),
@@ -406,7 +408,7 @@ mod tests {
         let store = seeded_store();
         let result = refresh_access_token(
             &RefreshCoordinator::new(),
-            &agent(),
+            TIMEOUT,
             &store,
             "cred",
             &params(server.url("/token")),
@@ -421,12 +423,37 @@ mod tests {
     }
 
     #[test]
+    fn refresh는_redirect를_따라가지_않고_토큰을_보존한다() {
+        // H4 리뷰 P1 (CWE-918): token endpoint의 302를 따라가면 refresh token이
+        // redirect 대상으로 유출된다. redirect는 AS의 명시적 거부가 아니므로 폐기도 없다.
+        let server =
+            MockHttpServer::start(|_| MockResponse::redirect(302, "https://evil.example/token"));
+        let store = seeded_store();
+        let result = refresh_access_token(
+            &RefreshCoordinator::new(),
+            TIMEOUT,
+            &store,
+            "cred",
+            &params(server.url("/token")),
+        );
+        assert!(result.is_err());
+        // redirect 대상으로 재요청 없음 — 목 서버가 받은 요청은 1건뿐
+        assert_eq!(server.requests().len(), 1);
+        // 토큰은 살아 있어야 한다 (Transient 취급)
+        assert_eq!(store.value("cred").as_deref(), Some("old-at"));
+        assert_eq!(
+            store.value(&refresh_entry_id("cred")).as_deref(),
+            Some("old-rt")
+        );
+    }
+
+    #[test]
     fn refresh_token이_없으면_네트워크_없이_재승인_필요() {
         let store = MemStore::default();
         store.seed("cred", "old-at"); // access만 있고 refresh 없음
         let outcome = refresh_access_token(
             &RefreshCoordinator::new(),
-            &agent(),
+            TIMEOUT,
             &store,
             "cred",
             &params("https://as.example/token".to_owned()),
@@ -463,7 +490,7 @@ mod tests {
             let request_params = Arc::clone(&request_params);
             std::thread::spawn(move || {
                 std::thread::sleep(delay);
-                refresh_access_token(&coordinator, &agent(), &*store, "cred", &request_params)
+                refresh_access_token(&coordinator, TIMEOUT, &*store, "cred", &request_params)
             })
         };
         let first = spawn_call(Duration::ZERO);

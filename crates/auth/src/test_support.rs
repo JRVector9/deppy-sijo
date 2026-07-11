@@ -36,6 +36,8 @@ pub struct MockResponse {
     pub status: u16,
     pub content_type: &'static str,
     pub body: String,
+    /// Some이면 Location 헤더로 내보낸다 (redirect 거부 테스트용).
+    pub location: Option<String>,
 }
 
 impl MockResponse {
@@ -44,6 +46,7 @@ impl MockResponse {
             status,
             content_type: "application/json",
             body: body.into(),
+            location: None,
         }
     }
 
@@ -52,6 +55,17 @@ impl MockResponse {
             status,
             content_type: "text/plain",
             body: body.into(),
+            location: None,
+        }
+    }
+
+    /// 3xx redirect 응답 (Location 헤더 포함, 본문 없음).
+    pub fn redirect(status: u16, location: impl Into<String>) -> Self {
+        Self {
+            status,
+            content_type: "text/plain",
+            body: String::new(),
+            location: Some(location.into()),
         }
     }
 }
@@ -179,14 +193,20 @@ fn write_response(mut stream: TcpStream, response: &MockResponse) {
     let reason = match response.status {
         200 => "OK",
         201 => "Created",
+        302 => "Found",
         400 => "Bad Request",
         404 => "Not Found",
         500 => "Internal Server Error",
         _ => "Response",
     };
+    let location = response
+        .location
+        .as_ref()
+        .map(|target| format!("Location: {target}\r\n"))
+        .unwrap_or_default();
     let _ = write!(
         stream,
-        "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {} {reason}\r\n{location}Content-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         response.status,
         response.content_type,
         response.body.len(),

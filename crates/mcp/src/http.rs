@@ -12,6 +12,8 @@
 //! - 타임아웃: ureq 2의 agent 전체 timeout은 SSE 스트리밍 바디를 중간 절단하는
 //!   함정이 있어 connect/read/write timeout만 설정한다. read timeout이 SSE idle
 //!   timeout을 겸하고, 비스트리밍(JSON) 바디는 호출측 deadline으로 상한한다.
+//!   상태줄/헤더 수신까지는 전송을 오프로드 스레드로 분리해 벽시계 deadline을
+//!   강제한다 (`send_with_deadline` — H2 리뷰 P1).
 
 use std::io::Read;
 use std::sync::mpsc;
@@ -186,7 +188,8 @@ impl HttpClient {
         let url = parse_validated_url(&config.url)?;
         // ureq 2 함정: agent 전체 timeout(.timeout)은 SSE 스트리밍 바디를 중간
         // 절단한다 — connect/read/write timeout만 설정한다. read timeout이 SSE
-        // idle timeout을 겸하고, JSON 경로의 전체 상한은 exchange의 deadline.
+        // idle timeout을 겸하고, 상태줄/헤더 수신과 JSON 바디의 벽시계 상한은
+        // exchange의 deadline(send_with_deadline + read_body_capped)이 담당.
         let agent = ureq::AgentBuilder::new()
             .redirects(0) // 자동 redirect 금지 — 자격 헤더 소거를 보장하는 수동 처리(exchange_once)
             .user_agent(&format!("deppy-sijo/{}", env!("CARGO_PKG_VERSION")))
@@ -336,7 +339,9 @@ impl HttpClient {
         expect_id: Option<u64>,
         method: &str,
     ) -> Result<Outcome, ExchangeError> {
-        // 비스트리밍(JSON) 경로의 전체 상한 — SSE 경로는 read idle timeout이 담당.
+        // 벽시계 deadline: 상태줄/헤더 수신(send_with_deadline, redirect 포함)과
+        // 비스트리밍(JSON) 바디 읽기의 전체 상한. SSE 바디는 의도적으로 제외 —
+        // 스트리밍은 read idle timeout이 유일한 탈출구다 (모듈 주석).
         let deadline = Instant::now() + self.request_timeout;
         let mut current = self.url.clone();
         let mut http_method = "POST";
@@ -365,11 +370,15 @@ impl HttpClient {
                     session_attached = true;
                 }
             }
-            let result = if send_body {
-                request.send_string(body)
-            } else {
-                request.call()
-            };
+            // H2 리뷰 P1: 이 호출은 connect + 요청 전송 + 상태줄/헤더 수신까지
+            // 블로킹되는데, timeout_read는 개별 read 단위(매 read마다 리셋)라
+            // 느린 드립 서버에 벽시계 상한이 없다 — 오프로드로 deadline을 강제.
+            let result = send_with_deadline(
+                request,
+                send_body.then(|| body.to_owned()),
+                deadline,
+                method,
+            )?;
             let response = match result {
                 Ok(response) if (300..400).contains(&response.status()) => {
                     let status = response.status();
@@ -620,7 +629,13 @@ impl HttpClient {
         if let Some(session) = &self.session_id {
             request = request.set("Mcp-Session-Id", session);
         }
-        let _ = request.send_string(&body);
+        // 베스트에포트 회신도 같은 드립 방어(H2 리뷰 P1) — 헤더 대기에 벽시계 상한.
+        let _ = send_with_deadline(
+            request,
+            Some(body),
+            Instant::now() + self.request_timeout,
+            "method-not-found 회신",
+        );
     }
 }
 
@@ -668,6 +683,58 @@ fn run_with_progress<T>(
         let _ = handle.join();
     }
     result
+}
+
+/// ureq 요청 호출(connect + 요청 전송 + 상태줄/헤더 수신)을 오프로드 스레드에서
+/// 수행하고, 호출 스레드는 deadline까지만 결과를 기다린다 (H2 리뷰 P1).
+///
+/// ureq의 read timeout은 개별 read syscall 단위(매 read마다 리셋)라 서버가
+/// timeout_read보다 짧은 간격으로 헤더를 1바이트씩 흘리면 벽시계 상한 없이
+/// 대기가 늘어난다. agent 전체 timeout(.timeout)은 SSE 스트리밍 바디를 중간
+/// 절단하는 함정이 있어 못 쓰므로(모듈 주석), 헤더 수신까지만 스레드로 분리해
+/// deadline을 강제하고 2xx 확인 후 바디(JSON/SSE)는 기존 경로에서 읽는다.
+///
+/// 한계: deadline 초과로 결과를 포기해도 진행 중인 ureq 호출은 중단시킬 수
+/// 없다. 서버가 침묵하면 오프로드 스레드는 timeout_read로 자멸하지만, 계속
+/// 흘리는 드립 서버는 detached 스레드+소켓을 (호출당 최대 1개, connect-per-call
+/// 관례라 누적 없음) 더 오래 잡아둘 수 있다 — 이 수정의 목표는 호출측 스레드가
+/// deadline에 해방되는 것이다.
+fn send_with_deadline(
+    request: ureq::Request,
+    body: Option<String>,
+    deadline: Instant,
+    method: &str,
+) -> anyhow::Result<Result<ureq::Response, ureq::Error>> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        // redirect 등으로 deadline이 이미 소진 — 무의미한 연결을 열지 않는다.
+        bail!("{method} 응답 timeout (상태줄/헤더 수신 전)");
+    }
+    let (result_tx, result_rx) = mpsc::channel();
+    let sender = std::thread::Builder::new()
+        .name("mcp-http-send".into())
+        .spawn(move || {
+            let result = match &body {
+                Some(body) => request.send_string(body),
+                None => request.call(),
+            };
+            // 호출측이 deadline으로 먼저 포기했으면(disconnect) 결과는 버려진다.
+            let _ = result_tx.send(result);
+        })
+        .with_context(|| format!("{method} 전송 스레드 생성 실패"))?;
+    match result_rx.recv_timeout(remaining) {
+        Ok(result) => {
+            // send 직후라 즉시 join된다 — 정상 경로에는 스레드 잔류가 없다.
+            let _ = sender.join();
+            Ok(result)
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            bail!("{method} 응답 timeout (상태줄/헤더 수신 전)")
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            bail!("{method} 전송 스레드가 결과 없이 종료됨 (panic 추정)")
+        }
+    }
 }
 
 /// 바디를 상한/deadline 안에서 끝까지 읽는다 (비스트리밍 JSON 경로).
@@ -1200,6 +1267,13 @@ mod tests {
         Raw(Vec<u8>),
         /// 바디를 쓴 뒤 커넥션을 열어둔 채 대기 (idle timeout 테스트용).
         RawThenHold(Vec<u8>, Duration),
+        /// immediate를 한 번에 쓴 뒤 drip을 interval 간격 1바이트씩 흘린다 —
+        /// timeout_read를 리셋시키는 느린 드립 서버 재현용 (H2 리뷰 P1).
+        RawThenDrip {
+            immediate: Vec<u8>,
+            drip: Vec<u8>,
+            interval: Duration,
+        },
     }
 
     struct MockServer {
@@ -1254,6 +1328,22 @@ mod tests {
                         let _ = stream.write_all(&bytes);
                         let _ = stream.flush();
                         std::thread::sleep(hold);
+                    }
+                    Reply::RawThenDrip {
+                        immediate,
+                        drip,
+                        interval,
+                    } => {
+                        let _ = stream.write_all(&immediate);
+                        let _ = stream.flush();
+                        for byte in drip {
+                            std::thread::sleep(interval);
+                            // 클라이언트가 소켓을 닫으면 write 실패로 중단
+                            if stream.write_all(&[byte]).is_err() {
+                                break;
+                            }
+                            let _ = stream.flush();
+                        }
                     }
                 }
                 index += 1;
@@ -1870,6 +1960,64 @@ mod tests {
             started.elapsed() < Duration::from_secs(3),
             "read timeout이 유일한 탈출구 — 무한 대기 금지"
         );
+    }
+
+    #[test]
+    fn 헤더_드립은_deadline에서_탈출() {
+        // H2 리뷰 P1 재현: 상태줄/헤더를 timeout_read보다 짧은 간격으로 1바이트씩
+        // 흘리면 개별 read가 매번 "진행"으로 간주돼 벽시계 상한이 없었다
+        // (실측: 300ms 설정에 11.28초 = 37배). 수정 후에는 호출측 deadline이
+        // 헤더 대기에도 걸려 request_timeout 근처에서 탈출해야 한다.
+        let head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n".to_vec();
+        let server = spawn_mock(move |_, _| Reply::RawThenDrip {
+            immediate: Vec::new(),
+            drip: head.clone(), // 50ms × 50바이트 ≈ 2.5초 분량, 완성 불가 헤더
+            interval: Duration::from_millis(50),
+        });
+        let manager = LocalMcpManager::new(RedactionService::new())
+            .with_request_timeout(Duration::from_millis(300));
+
+        let started = Instant::now();
+        let error = manager
+            .connect_http(&http_config(&server, None))
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            format!("{error:#}").contains("상태줄/헤더 수신 전"),
+            "{error:#}"
+        );
+        // 드립 전체를 기다리지 않고 request_timeout(300ms)의 3배 내 탈출
+        assert!(elapsed < Duration::from_millis(900), "{elapsed:?}");
+    }
+
+    #[test]
+    fn json_바디_드립은_deadline_배수_내_탈출() {
+        // 부차 결함 고정: JSON 바디 트리클은 read "사이"에서만 deadline을 검사해
+        // 최대 deadline + timeout_read(≈2배)까지 걸릴 수 있다 — 그 상한을 고정.
+        let server = spawn_mock(|index, request| match index {
+            0 => json_reply(request, init_result(), None),
+            1 => accepted(),
+            2 => Reply::RawThenDrip {
+                // 헤더는 즉시 완성 — Content-Length 미달인 바디만 드립
+                immediate: b"HTTP/1.1 200 OK\r\nConnection: close\r\n\
+                             Content-Type: application/json\r\nContent-Length: 4096\r\n\r\n"
+                    .to_vec(),
+                drip: vec![b'{'; 20],
+                interval: Duration::from_millis(100),
+            },
+            _ => not_found(),
+        });
+        let manager = LocalMcpManager::new(RedactionService::new())
+            .with_request_timeout(Duration::from_millis(300));
+
+        let started = Instant::now();
+        let error = manager
+            .discover_tools_http(&http_config(&server, None))
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(format!("{error:#}").contains("바디 수신 중"), "{error:#}");
+        // deadline(300ms) + read 한 번(≤300ms) = 이론 상한 2배, 여유 포함 3배 내
+        assert!(elapsed < Duration::from_millis(900), "{elapsed:?}");
     }
 
     #[test]

@@ -590,7 +590,9 @@ impl MuxState {
         self.focus.ensure_valid(&panes);
     }
 
-    fn snapshot(&self) -> MuxSnapshot {
+    /// `persistent_id`: SessionId → 영속 UUID 해석기(워커의 PersistPipe). 경계를 넘는
+    /// 식별자를 UUID로 통일하기 위해 스냅샷에 함께 싣는다 (v3.7 I1).
+    fn snapshot(&self, persistent_id: impl Fn(SessionId) -> Option<String>) -> MuxSnapshot {
         let tabs = self
             .window
             .tabs
@@ -608,6 +610,7 @@ impl MuxState {
                         id: pane.id.clone(),
                         session_id: pane.session_id,
                         title: pane.title.clone(),
+                        persistent_session_id: pane.session_id.and_then(&persistent_id),
                     })
                     .collect(),
             })
@@ -1948,7 +1951,14 @@ impl Worker {
             pipe.save_layout(&self.mux.window, &self.mux.tabs, &self.mux.panes);
         }
         self.emit(RuntimeEvent::MuxUpdated {
-            snapshot: Arc::new(self.mux.snapshot()),
+            snapshot: Arc::new(self.mux.snapshot(|session| {
+                // 영속 UUID(sessions.id) — 경계를 넘는 식별자. persist가 없으면 None이고,
+                // 그 세션은 원격에서 표시 전용으로 강등된다 (v3.7 I1).
+                self.persist
+                    .as_ref()
+                    .and_then(|pipe| pipe.session_log_key(session))
+                    .map(str::to_owned)
+            })),
         });
     }
 

@@ -26,7 +26,11 @@ use crate::event::RuntimeEvent;
 pub(crate) const PROTO_MAGIC: [u8; 4] = *b"DPRT";
 /// 현재 프로토콜 버전. v3: SetSessionDefaultEnv 추가. v4: SetShellCwd 추가(끝에 append) —
 /// 구버전 피어가 미지의 variant를 스트림 중간에서 만나 오해독하는 대신 handshake에서 거부.
-pub(crate) const PROTO_VERSION: u16 = 5;
+/// **v6 (v3.7 I1)**: PaneSnapshot에 persistent_session_id 추가. enum variant append와 달리
+/// **구조체 필드 추가는 기존 메시지(MuxUpdated)의 바이트를 바꾸므로** 버전을 올려야 한다 —
+/// postcard 구조체는 태그 없는 순차 인코딩이다. hello가 정확 일치만 허용하므로 구버전
+/// 피어는 조용한 오해독 대신 접속 단계에서 거부된다.
+pub(crate) const PROTO_VERSION: u16 = 6;
 
 /// delta viewport 스트리밍 기능 비트 (§3.1).
 pub(crate) const FEAT_DELTA_VIEWPORT: u32 = 1 << 0;

@@ -262,7 +262,14 @@ fn stream_loop(
         // 클라 메시지 한 건 처리(없으면 tick 타임아웃).
         match ws.read() {
             Ok(Message::Text(text)) => {
-                if text.len() <= MAX_INPUT_FRAME_BYTES {
+                if text.len() > MAX_INPUT_FRAME_BYTES {
+                    // 조용히 버리면 클라는 전송됐다고 믿는다(draft를 이미 비웠다) — 로그로
+                    // 남긴다. 정상 경로에선 클라가 같은 상한을 선제 적용해 비발현 (리뷰 P3-2).
+                    tracing::warn!(
+                        len = text.len(),
+                        "web-remote: WS 텍스트 프레임 상한 초과 — 무시"
+                    );
+                } else {
                     match ClientMsg::parse(text.as_str()) {
                         Some(ClientMsg::Resolve {
                             id,

@@ -584,6 +584,14 @@ impl DashboardHandle {
     pub fn send_input(&self, session: u64, text: &str, submit: bool) {
         let (sink, bracketed) = {
             let inner = self.shared.inner.lock().expect("dashboard inner lock");
+            // **브리지 시청 집계로 재확인**한다 — 접속(ws_api)의 watch 상태만 믿으면,
+            // 워크스페이스 전환으로 시청이 정리된 뒤(clear_watch_state)에도 접속이 옛
+            // 세션 id를 들고 있어 **새 워커의 동명 id 세션**에 입력이 주입된다. 세션 id는
+            // worker-로컬(1부터 재배정)이라 화면은 동결된 채 무관한 에이전트에 글자가 간다
+            // (리뷰 P2-1). 전환 직후 watchers는 비어 있으므로 여기서 차단된다.
+            if !inner.watchers.contains_key(&session) {
+                return;
+            }
             (
                 inner.command_sink.clone(),
                 inner.bracketed.get(&session).copied().unwrap_or(false),
@@ -608,11 +616,25 @@ impl DashboardHandle {
             .map(|(version, json)| (*version, json.clone()))
     }
 
+    /// 브리지가 이 세션을 시청 중으로 집계하고 있는가 — 워크스페이스 전환 후 남은
+    /// 접속-로컬 watch로 엉뚱한 세션에 명령이 가는 것을 막는 최종 게이트 (리뷰 P2-1).
+    fn is_watched(&self, session: u64) -> bool {
+        self.shared
+            .inner
+            .lock()
+            .expect("dashboard inner lock")
+            .watchers
+            .contains_key(&session)
+    }
+
     /// 시청 세션의 스크롤백을 이동한다 (스크롤백 열람). delta 양수 = 과거로.
     /// 스크롤 상태는 세션당 하나(데스크톱과 공유) — backend가 이력 범위로 클램프하고,
     /// 여기서는 비정상 값(오버플로 조작)만 방어적으로 캡한다. 죽은 세션 id는 runtime이
     /// 무해하게 무시한다. 호출측(ws_api)이 "시청 중 세션만" 게이트를 이미 건다.
     pub fn send_scroll(&self, session: u64, delta: i32) {
+        if !self.is_watched(session) {
+            return;
+        }
         const SCROLL_DELTA_CAP: i32 = 100_000;
         let delta = delta.clamp(-SCROLL_DELTA_CAP, SCROLL_DELTA_CAP);
         if delta == 0 {
@@ -638,6 +660,10 @@ impl DashboardHandle {
     /// encode_input). 화이트리스트 밖 키는 무시. WriteInput 재사용 — 죽은 세션 id는
     /// runtime이 무해하게 무시한다. 호출측(ws_api)이 "시청 중 세션만" 게이트를 이미 건다.
     pub fn send_key(&self, session: u64, key: &str) {
+        // send_input과 같은 이유로 브리지 시청 집계를 재확인한다 (리뷰 P2-1).
+        if !self.is_watched(session) {
+            return;
+        }
         let bytes: &[u8] = match key {
             "ctrl_c" => b"\x03",
             "ctrl_d" => b"\x04",
@@ -1412,11 +1438,49 @@ mod tests {
         thread.join().unwrap();
     }
 
+    /// 리뷰 P2-1 회귀: 워크스페이스 전환으로 시청이 정리되면(clear_watch_state) 접속이
+    /// 옛 세션 id를 들고 있어도 명령이 나가지 않는다 — 새 워커의 동명 id 세션(worker-로컬
+    /// 카운터라 재배정됨)에 입력이 주입되는 것을 브리지가 최종 차단한다.
+    #[test]
+    fn 시청이_정리되면_입력_키_스크롤이_모두_차단된다() {
+        let (handle, thread) = DashboardHandle::spawn(None);
+        let (sink, captured) = capture_sink();
+        handle.set_command_sink(sink);
+        handle.rebind_watch(None, Some(7));
+        handle.send_input(7, "before", true);
+        assert!(
+            captured
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| matches!(c, RuntimeCommand::WriteInput { .. })),
+            "시청 중인데 입력이 안 나갔다"
+        );
+        // 워크스페이스 전환 — 브리지가 시청 집계를 비운다
+        {
+            let mut inner = handle.shared.inner.lock().unwrap();
+            DashboardHandle::clear_watch_state(&mut inner, &handle.shared);
+        }
+        captured.lock().unwrap().clear();
+        // 접속(ws_api)은 여전히 watched=Some(7)이라 이 함수들을 부른다 — 전부 차단돼야 한다
+        handle.send_input(7, "yes", true);
+        handle.send_key(7, "enter");
+        handle.send_scroll(7, 5);
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "시청 정리 후에도 명령이 나갔다 — 새 워커의 동명 세션에 입력이 주입된다"
+        );
+        handle.stop();
+        thread.join().unwrap();
+    }
+
     #[test]
     fn 확장_키_화이트리스트는_시퀀스로_매핑되고_미지_키는_무시된다() {
         let (handle, thread) = DashboardHandle::spawn(None);
         let (sink, captured) = capture_sink();
         handle.set_command_sink(sink);
+        handle.rebind_watch(None, Some(7)); // 시청 중이어야 명령이 나간다(P2-1 게이트)
+        captured.lock().unwrap().clear();
         for key in ["up", "esc", "shift_tab", "rm_rf"] {
             handle.send_key(7, key);
         }

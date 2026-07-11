@@ -250,7 +250,9 @@ struct Shared {
     published: Mutex<Published>,
     /// 승인 대시보드용 자체 DB 연결(없으면 승인 목록은 빈 채로 상태만 흐른다). inner와 별도
     /// 락으로 두어 승인 되쓰기/폴링의 DB I/O(busy_timeout 최대 5s)가 이벤트 drain·등록이 쓰는
-    /// inner 락을 잡은 채 진행되지 않게 한다(P3 리뷰). 락 순서는 inner→db 고정(교착 방지).
+    /// inner 락을 잡은 채 진행되지 않게 한다(P3 리뷰). 락 순서는 inner→db, inner→published
+    /// 중첩만 허용(역순 금지 — 교착 방지). 시청 슬롯 생멸은 watcher 전이와 원자화를 위해
+    /// inner를 쥔 채 published를 중첩 취득한다 (P5 리뷰 ②-P1).
     db: Mutex<Option<storage::Db>>,
     cvar: Condvar,
     /// 인증까지 마친 라이브 대시보드 WS 수 — wake/타이머 게이트.
@@ -346,16 +348,33 @@ impl DashboardHandle {
     }
 
     /// 활성 workspace worker 구독을 붙인다(시작 + 워크스페이스 전환마다). 옛 receiver는
-    /// 교체와 함께 drop되어 옛 worker가 자기 subscriber를 정리한다. 시청 lease는 새
-    /// worker가 모르므로 재선언한다 (P5b — runtime 재시작/전환 시 시청 연속성).
+    /// 교체와 함께 drop되어 옛 worker가 자기 subscriber를 정리한다.
+    ///
+    /// 시청 상태는 **정리**한다(재선언 금지 — P5 리뷰 P2): SessionId는 worker마다 1부터
+    /// 재시작하므로, 옛 워크스페이스의 시청 세션 id를 새 worker에 재선언하면 **무관한
+    /// 세션**이 승격되고 Ctrl-C까지 그 세션으로 들어간다. 옛 worker의 lease는 명시
+    /// 해제를 보내지 않아도 TTL(≤45s)로 원복된다(Warm 전환 직후라 유계 허용).
+    /// 폰 시청자는 프레임이 멎으므로 새 세션 목록에서 다시 선택한다.
     pub fn set_runtime_source(&self, receiver: RuntimeEventReceiver) {
         {
             let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
             inner.receiver = Some(receiver);
             inner.dirty = true;
+            Self::clear_watch_state(&mut inner, &self.shared);
         }
-        self.reassert_watch_leases();
         self.shared.cvar.notify_all();
+    }
+
+    /// 시청 상태(watcher refcount + 화면 슬롯)를 전부 비운다 — 새 worker 구독 시
+    /// 호출. 같은 inner 임계구역에서 published를 중첩 취득해 원자화한다.
+    fn clear_watch_state(inner: &mut Inner, shared: &Shared) {
+        inner.watchers.clear();
+        shared
+            .published
+            .lock()
+            .expect("published lock")
+            .viewports
+            .clear();
     }
 
     /// web → runtime 명령 싱크를 붙인다 (P5b — receiver와 같은 시점에 교체된다).
@@ -365,49 +384,48 @@ impl DashboardHandle {
     }
 
     /// 접속의 시청 대상 전환 (P5b). `from`을 내리고 `to`를 올린다 — refcount 전이
-    /// (0→1 / 1→0)에서만 runtime lease 명령이 나간다. 명령 전송은 inner 락 밖에서.
+    /// (0→1 / 1→0)에서만 runtime lease 명령이 나간다.
+    ///
+    /// 전이·슬롯 제거·명령 전송을 **모두 inner 임계구역 안에서** 수행한다 (P5 리뷰):
+    /// - 슬롯 제거를 watcher 제거와 원자화 — run()의 스테이징(역시 inner 하)이 사이에
+    ///   끼어 시청 0인 세션의 슬롯을 부활시키는 레이스 차단 (②-P1).
+    /// - lease 명령을 락 안에서 보내 cross-thread on/off 순서 역전 차단 (공통 지적).
+    ///   sink는 try_send+unpark(비블로킹)라 락 하 호출이 안전하다.
     pub fn rebind_watch(&self, from: Option<u64>, to: Option<u64>) {
         if from == to {
             return;
         }
         let mut commands: Vec<RuntimeCommand> = Vec::new();
-        let mut drop_slot: Option<u64> = None;
-        let sink = {
-            let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
-            if let Some(old) = from
-                && let Some(entry) = inner.watchers.get_mut(&old)
-            {
-                entry.count = entry.count.saturating_sub(1);
-                if entry.count == 0 {
-                    inner.watchers.remove(&old);
-                    commands.push(lease_command(old, false));
-                    drop_slot = Some(old);
-                }
+        let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
+        if let Some(old) = from
+            && let Some(entry) = inner.watchers.get_mut(&old)
+        {
+            entry.count = entry.count.saturating_sub(1);
+            if entry.count == 0 {
+                inner.watchers.remove(&old);
+                commands.push(lease_command(old, false));
+                // 마지막 시청자 이탈 — 화면 슬롯도 같은 임계구역에서 제거
+                // (락 순서 inner→published 중첩, 역순 취득 경로 없음 — 교착 없음).
+                self.shared
+                    .published
+                    .lock()
+                    .expect("published lock")
+                    .viewports
+                    .remove(&old);
             }
-            if let Some(new) = to {
-                let entry = inner.watchers.entry(new).or_insert(WatcherEntry {
-                    count: 0,
-                    last_renewal: Instant::now(),
-                });
-                entry.count += 1;
-                if entry.count == 1 {
-                    entry.last_renewal = Instant::now();
-                    commands.push(lease_command(new, true));
-                }
-            }
-            inner.command_sink.clone()
-        };
-        // 마지막 시청자가 떠난 세션의 화면 슬롯 제거 (P5c — trailing 스냅샷이 남지 않게).
-        // inner 락을 놓은 뒤 published만 잠근다 (락 순서 준수).
-        if let Some(old) = drop_slot {
-            self.shared
-                .published
-                .lock()
-                .expect("published lock")
-                .viewports
-                .remove(&old);
         }
-        if let Some(sink) = sink {
+        if let Some(new) = to {
+            let entry = inner.watchers.entry(new).or_insert(WatcherEntry {
+                count: 0,
+                last_renewal: Instant::now(),
+            });
+            entry.count += 1;
+            if entry.count == 1 {
+                entry.last_renewal = Instant::now();
+                commands.push(lease_command(new, true));
+            }
+        }
+        if let Some(sink) = &inner.command_sink {
             for command in commands {
                 sink(command);
             }
@@ -435,29 +453,6 @@ impl DashboardHandle {
                 session: SessionId(session),
                 bytes: bytes.to_vec(),
             });
-        }
-    }
-
-    /// 시청 중인 모든 세션의 lease를 재선언한다 (P5b — 새 worker 구독 직후). 새 worker는
-    /// 이전 lease를 모르므로 viewing=true를 다시 보내고 갱신 시계를 리셋한다.
-    fn reassert_watch_leases(&self) {
-        let (sink, sessions) = {
-            let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
-            let now = Instant::now();
-            let sessions: Vec<u64> = inner
-                .watchers
-                .iter_mut()
-                .map(|(id, entry)| {
-                    entry.last_renewal = now;
-                    *id
-                })
-                .collect();
-            (inner.command_sink.clone(), sessions)
-        };
-        if let Some(sink) = sink {
-            for session in sessions {
-                sink(lease_command(session, true));
-            }
         }
     }
 
@@ -568,7 +563,7 @@ impl DashboardHandle {
     /// drain과 동일하게 시청 중일 때만 슬롯에 반영한다 (P5c).
     #[cfg(test)]
     pub fn inject_event(&self, event: RuntimeEvent) {
-        let staged = {
+        {
             let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
             let Inner {
                 sessions,
@@ -577,23 +572,22 @@ impl DashboardHandle {
                 ..
             } = &mut *inner;
             apply_event(sessions, resource, &event);
-            let staged = match &event {
-                RuntimeEvent::Viewport {
-                    session, snapshot, ..
-                } if watchers.contains_key(&session.0) => Some((session.0, Arc::clone(snapshot))),
-                _ => None,
-            };
+            // 실경로(run)와 동일하게 inner 임계구역 안에서 published를 중첩 취득해
+            // 슬롯을 반영한다 (P5 리뷰 ②-P1 — 락 순서 inner→published).
+            if let RuntimeEvent::Viewport {
+                session, snapshot, ..
+            } = &event
+                && watchers.contains_key(&session.0)
+            {
+                let mut published = self.shared.published.lock().expect("published lock");
+                let entry = published
+                    .viewports
+                    .entry(session.0)
+                    .or_insert((0, Arc::clone(snapshot)));
+                entry.0 += 1;
+                entry.1 = Arc::clone(snapshot);
+            }
             inner.dirty = true;
-            staged
-        };
-        if let Some((session, snapshot)) = staged {
-            let mut published = self.shared.published.lock().expect("published lock");
-            let entry = published
-                .viewports
-                .entry(session)
-                .or_insert((0, Arc::clone(&snapshot)));
-            entry.0 += 1;
-            entry.1 = snapshot;
         }
         self.shared.cvar.notify_all();
     }
@@ -685,6 +679,20 @@ fn run(shared: &Arc<Shared>) {
                 }
             }
         }
+        // 시청 화면 슬롯 반영 — watcher 판정과 **같은 inner 임계구역에서** published를
+        // 중첩 취득해 삽입한다 (P5 리뷰 ②-P1: inner 해제 후 삽입하면 그 사이 완주한
+        // rebind_watch(마지막 이탈)의 슬롯 제거를 덮어 시청 0 슬롯이 부활·잔존한다).
+        if !staged_viewports.is_empty() {
+            let mut published = shared.published.lock().expect("published lock");
+            for (session, snapshot) in std::mem::take(&mut staged_viewports) {
+                let entry = published
+                    .viewports
+                    .entry(session)
+                    .or_insert((0, Arc::clone(&snapshot)));
+                entry.0 += 1;
+                entry.1 = snapshot;
+            }
+        }
 
         // 2) 승인 폴링 — 접속 ≥1 + (강제 or 주기 만기)에서만. 접속 0이면 완전 정지.
         let conns = shared.connections.load(Ordering::SeqCst);
@@ -707,12 +715,17 @@ fn run(shared: &Arc<Shared>) {
         }
 
         // 2.5) 원격 시청 lease 갱신 (P5b) — 만기(45s TTL) 전에 재전송해 시청을 유지한다.
-        //      시청 0이면 no-op. 전송은 inner 락을 놓은 뒤에.
+        //      시청 0이면 no-op. inner 락 안에서 보내 rebind의 on/off와 순서를 직렬화한다
+        //      (P5 리뷰 — sink는 try_send+unpark 비블로킹이라 락 하 호출 안전).
         let renewals =
             due_lease_renewals(&mut inner.watchers, Instant::now(), LEASE_RENEW_INTERVAL);
-        let renewal_sink = (!renewals.is_empty())
-            .then(|| inner.command_sink.clone())
-            .flatten();
+        if !renewals.is_empty()
+            && let Some(sink) = &inner.command_sink
+        {
+            for session in renewals {
+                sink(lease_command(session, true));
+            }
+        }
 
         // 3) 발행 — 접속 0이면 JSON을 만들지 않는다(불필요 작업 회피). 접속 시 등록이
         //    force_poll+dirty를 세우므로 그때 최신 스냅샷이 만들어진다.
@@ -727,23 +740,6 @@ fn run(shared: &Arc<Shared>) {
             publish(shared, dash_json, appr_json);
         } else {
             drop(inner);
-        }
-        // 시청 화면 슬롯 반영 (P5c) — inner 락 없이 published만 잠근다 (락 순서 준수).
-        if !staged_viewports.is_empty() {
-            let mut published = shared.published.lock().expect("published lock");
-            for (session, snapshot) in staged_viewports {
-                let entry = published
-                    .viewports
-                    .entry(session)
-                    .or_insert((0, Arc::clone(&snapshot)));
-                entry.0 += 1;
-                entry.1 = snapshot;
-            }
-        }
-        if let Some(sink) = renewal_sink {
-            for session in renewals {
-                sink(lease_command(session, true));
-            }
         }
     }
 }
@@ -931,22 +927,37 @@ mod tests {
     }
 
     #[test]
-    fn 재선언은_시청_중인_모든_세션의_lease를_다시_보낸다() {
+    fn 새_worker_구독은_시청을_정리하고_재선언하지_않는다() {
+        // P5 리뷰 P2: SessionId는 worker-로컬이라 새 worker에 옛 시청 id를 재선언하면
+        // 무관한 세션이 승격된다 — 전환 시에는 시청 상태를 정리해야 한다.
         let (handle, thread) = DashboardHandle::spawn(None);
         let (sink, captured) = capture_sink();
         handle.set_command_sink(sink);
         handle.rebind_watch(None, Some(3));
         handle.rebind_watch(None, Some(5));
+        handle.inject_event(viewport_event(3));
+        assert!(handle.viewport_if_newer(3, 0).is_some());
         captured.lock().unwrap().clear();
-        // 새 worker 구독 직후(set_runtime_source 경로) — 모든 시청 lease 재선언
-        handle.reassert_watch_leases();
+        // 새 worker 구독 시점의 정리 경로 (set_runtime_source가 호출)
+        {
+            let mut inner = handle.shared.inner.lock().unwrap();
+            DashboardHandle::clear_watch_state(&mut inner, &handle.shared);
+        }
+        // 재선언 lease가 나가면 안 되고(앨리어싱), 슬롯도 비워져야 한다
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "정리 경로에서 lease 명령이 나감 — 세션 id 앨리어싱 위험"
+        );
+        assert!(handle.viewport_if_newer(3, 0).is_none(), "슬롯 잔존");
+        // 정리 후 새 watch는 fresh 0→1로 정상 동작한다
+        handle.rebind_watch(None, Some(3));
         let got: Vec<(u64, bool)> = captured
             .lock()
             .unwrap()
             .iter()
             .filter_map(lease_of)
             .collect();
-        assert_eq!(got, vec![(3, true), (5, true)]);
+        assert_eq!(got, vec![(3, true)]);
         handle.stop();
         thread.join().unwrap();
     }

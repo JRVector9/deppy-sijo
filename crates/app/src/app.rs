@@ -2020,7 +2020,9 @@ impl App {
         let receiver = self
             .active
             .runtime
-            .subscribe_with_wake(server.dashboard_wake());
+            // background 구독 — 웹 브리지는 렌더와 무관하므로 원격 전용 Viewport에도
+            // 깨어나되(시청 프레임 라우팅), GUI repaint는 유발하지 않는다 (P5 리뷰 P1).
+            .subscribe_with_wake_background(server.dashboard_wake());
         // 터미널 뷰어(P5)의 시청 lease를 runtime으로 보낼 명령 싱크 — receiver보다 먼저
         // (set_runtime_source의 lease 재선언이 이 싱크로 나간다, rebind와 동일 순서).
         if let Some(sink) = self.active.runtime.command_sink() {
@@ -2041,7 +2043,7 @@ impl App {
             let receiver = self
                 .active
                 .runtime
-                .subscribe_with_wake(web.server.dashboard_wake());
+                .subscribe_with_wake_background(web.server.dashboard_wake());
             // 명령 싱크를 receiver보다 먼저 교체한다 — set_runtime_source의 lease 재선언이
             // 새 worker의 싱크로 나가게 (P5b, 워크스페이스 전환 시 시청 연속성).
             if let Some(sink) = self.active.runtime.command_sink() {
@@ -3300,6 +3302,12 @@ impl App {
 impl eframe::App for App {
     fn on_exit(&mut self) {
         self.approval_watcher.stop();
+        // 웹서버(모바일 PWA)를 runtime보다 먼저 정지 — 브리지가 쥔 command_sink가
+        // worker 채널을 살려둔 채 join을 기다리는 순환을 끊는다 (P5 리뷰 P1 종료 데드락;
+        // runtime shutdown 플래그가 근본 방어이고 이 순서는 이중 방어 + 접속 정리).
+        if let Some(state) = self.web.take() {
+            state.server.shutdown();
+        }
         // remote TLS 서버를 먼저 정지 — accept 루프·접속·전용 worker(그 세션들 reap)를 정리한다.
         if let Some(state) = self.remote.take() {
             state.server.shutdown();

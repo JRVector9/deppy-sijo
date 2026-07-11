@@ -118,12 +118,38 @@ pub fn serve(
         return;
     }
 
-    let mut watched: Option<u64> = None;
-    stream_loop(&mut ws, dashboard, stop, &mut watched);
-    // 접속 종료(모든 경로) — 시청 중이었으면 해제해 refcount/lease를 정리한다 (P5b).
-    dashboard.rebind_watch(watched.take(), None);
+    // 시청 해제는 Drop 가드로 — panic unwind를 포함한 모든 종료 경로에서 refcount/
+    // lease가 정리된다 (P5 리뷰 P3: 일반 호출은 panic 시 건너뛰어 watcher가 영구 잔존).
+    let mut watch = WatchBinding {
+        dashboard,
+        watched: None,
+    };
+    stream_loop(&mut ws, dashboard, stop, &mut watch);
+    drop(watch);
     let _ = ws.close(None);
     let _ = ws.flush();
+}
+
+/// 접속 하나의 시청 상태 — 전환은 [`WatchBinding::set`]으로만, 해제는 Drop이 보장한다.
+struct WatchBinding<'a> {
+    dashboard: &'a DashboardHandle,
+    watched: Option<u64>,
+}
+
+impl WatchBinding<'_> {
+    /// 시청 대상을 전환한다 (None = 해제). 같은 대상 재지정은 브리지가 no-op 처리한다.
+    fn set(&mut self, to: Option<u64>) {
+        let from = std::mem::replace(&mut self.watched, to);
+        self.dashboard.rebind_watch(from, to);
+    }
+}
+
+impl Drop for WatchBinding<'_> {
+    fn drop(&mut self) {
+        if self.watched.is_some() {
+            self.dashboard.rebind_watch(self.watched.take(), None);
+        }
+    }
 }
 
 /// 첫 프레임에서 토큰을 받아 인증한다. `timeout` 내 유효 토큰이면 true. `timeout`은 테스트가
@@ -167,7 +193,7 @@ fn stream_loop(
     ws: &mut WebSocket<TcpStream>,
     dashboard: &DashboardHandle,
     stop: &AtomicBool,
-    watched: &mut Option<u64>,
+    watch: &mut WatchBinding<'_>,
 ) {
     let mut last_dash = 0u64;
     let mut last_appr = 0u64;
@@ -198,7 +224,7 @@ fn stream_loop(
 
         // 시청 화면 push (P5c) — 슬롯이 내 seq보다 새로우면 baseline과 diff해 전송.
         // baseline 없음(첫 프레임/전환/재동기화)이면 keyframe이 나간다.
-        if let Some(session) = *watched
+        if let Some(session) = watch.watched
             && let Some((seq, snapshot)) = dashboard.viewport_if_newer(session, viewport_seq)
         {
             let frame =
@@ -231,12 +257,12 @@ fn stream_loop(
                         // 시청 전환 — 접속당 1개, 새 watch가 이전 시청을 대체 (P5b).
                         // baseline 리셋 → 새 세션의 첫 프레임은 keyframe (P5c).
                         Some(ClientMsg::Watch { session }) => {
-                            dashboard.rebind_watch(watched.replace(session), Some(session));
+                            watch.set(Some(session));
                             viewport_seq = 0;
                             baseline = None;
                         }
                         Some(ClientMsg::Unwatch) => {
-                            dashboard.rebind_watch(watched.take(), None);
+                            watch.set(None);
                             viewport_seq = 0;
                             baseline = None;
                         }
@@ -248,7 +274,7 @@ fn stream_loop(
                         }
                         // 최소 제어 (P5d) — 이 접속이 시청 중인 세션에만 허용한다.
                         Some(ClientMsg::Key { session, key }) => {
-                            if *watched == Some(session) {
+                            if watch.watched == Some(session) {
                                 dashboard.send_key(session, &key);
                             }
                         }

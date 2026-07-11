@@ -85,6 +85,177 @@ pub fn spawn_detect(ctx: egui::Context) -> mpsc::Receiver<Detected> {
     rx
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// serve 온보딩 (O1) — 폰 접속의 마지막 관문
+//
+// 앱 웹서버는 127.0.0.1에만 bind한다(§2.5 — 비-loopback 평문 금지). 폰이 접속하려면
+// `tailscale serve`가 HTTPS를 종단해 프록시해야 하는데, 그 설정 여부를 앱이 몰라서
+// "QR을 찍어도 안 열린다"가 된다(2026-07-11 실기기에서 겪음). 여기서 진단하고
+// 버튼 한 번으로 설정한다. CLI 자동 실행은 하지 않는다 — 사용자 클릭에서만.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// serve 진단 결과. UI는 이 상태별로 **다음 한 걸음만** 보여준다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServeState {
+    /// 이 포트로 프록시가 걸려 있다 — 폰 접속 준비 완료.
+    Ready,
+    /// serve는 걸려 있는데 **다른 포트**를 가리킨다(앱 포트 변경 등) — 재설정 필요.
+    WrongPort(u16),
+    /// serve 설정이 없다 — 설정 버튼으로 해결.
+    NotConfigured,
+    /// tailnet에서 Serve/HTTPS 기능이 꺼져 있다 — 관리 콘솔 1회 승인 필요(URL 동봉).
+    NotEnabledOnTailnet { approve_url: Option<String> },
+    /// CLI 없음/실행 실패 — 진단 불가(문서 안내로 폴백).
+    Unknown,
+}
+
+/// `serve status --json`을 파싱해 이 포트로 가는 프록시가 있는지 본다 (순수 — 테스트 대상).
+///
+/// 형식(v1.98 실측):
+/// ```json
+/// { "TCP": {"443": {"HTTPS": true}},
+///   "Web": {"host:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8737"}}}} }
+/// ```
+/// 미설정이면 `Web`이 없거나 비어 있다. 텍스트 출력("No serve config") 대신 JSON을
+/// 쓰는 이유: 로케일·버전에 덜 민감하다.
+fn parse_serve_json(json: &str, port: u16) -> ServeState {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return ServeState::Unknown;
+    };
+    let handlers = value
+        .get("Web")
+        .and_then(|web| web.as_object())
+        .into_iter()
+        .flat_map(|web| web.values())
+        .filter_map(|site| site.get("Handlers")?.as_object())
+        .flat_map(|handlers| handlers.values());
+
+    let mut other_port: Option<u16> = None;
+    for handler in handlers {
+        let Some(proxy) = handler.get("Proxy").and_then(|p| p.as_str()) else {
+            continue;
+        };
+        match proxy_port(proxy) {
+            Some(p) if p == port => return ServeState::Ready,
+            Some(p) => other_port = Some(p),
+            None => {}
+        }
+    }
+    match other_port {
+        Some(p) => ServeState::WrongPort(p),
+        None => ServeState::NotConfigured,
+    }
+}
+
+/// "http://127.0.0.1:8737" → 8737. loopback 대상만 인정한다(우리 서버는 loopback bind).
+fn proxy_port(proxy: &str) -> Option<u16> {
+    let rest = proxy.strip_prefix("http://")?;
+    let (host, port) = rest.trim_end_matches('/').rsplit_once(':')?;
+    if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
+        return None;
+    }
+    port.parse().ok()
+}
+
+/// tailnet에 Serve가 비활성일 때 CLI가 안내하는 승인 URL을 뽑는다 (순수).
+/// 출력 예: "Serve is not enabled on your tailnet.\nTo enable, visit:\n\n  https://login.tailscale.com/f/serve?node=..."
+fn parse_approve_url(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .find(|token| token.starts_with("https://login.tailscale.com/"))
+        .map(|url| url.trim_end_matches(['.', ',']).to_owned())
+}
+
+/// CLI가 "tailnet에 Serve 미활성"이라고 답했는가.
+fn is_not_enabled(text: &str) -> bool {
+    text.contains("not enabled on your tailnet") || text.contains("Serve is not enabled")
+}
+
+/// CLI 후보를 순서대로 실행해 인자를 넘긴다. 실행된 첫 후보의 (stdout, stderr, 성공여부).
+fn run_cli(args: &[&str]) -> Option<(String, String, bool)> {
+    for bin in cli_candidates() {
+        let Ok(output) = std::process::Command::new(&bin)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+        else {
+            continue; // 이 후보 경로에 CLI 없음
+        };
+        return Some((
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            output.status.success(),
+        ));
+    }
+    None
+}
+
+/// serve 상태를 진단한다(읽기 전용 — 아무것도 바꾸지 않는다).
+fn diagnose_serve(port: u16) -> ServeState {
+    let Some((stdout, stderr, ok)) = run_cli(&["serve", "status", "--json"]) else {
+        return ServeState::Unknown;
+    };
+    if !ok {
+        // 미활성 tailnet은 status에서도 안내가 나올 수 있다 — 그 경우 승인 URL을 살린다.
+        let combined = format!("{stdout}{stderr}");
+        if is_not_enabled(&combined) {
+            return ServeState::NotEnabledOnTailnet {
+                approve_url: parse_approve_url(&combined),
+            };
+        }
+        return ServeState::Unknown;
+    }
+    parse_serve_json(&stdout, port)
+}
+
+/// `tailscale serve --bg <port>`로 프록시를 건다(사용자 클릭에서만 호출).
+/// 성공하면 재진단 결과를, tailnet 미활성이면 승인 URL을 담은 상태를 돌려준다.
+fn configure_serve(port: u16) -> ServeState {
+    let port_arg = port.to_string();
+    let Some((stdout, stderr, ok)) = run_cli(&["serve", "--bg", &port_arg]) else {
+        return ServeState::Unknown;
+    };
+    let combined = format!("{stdout}{stderr}");
+    if !ok || is_not_enabled(&combined) {
+        if is_not_enabled(&combined) {
+            return ServeState::NotEnabledOnTailnet {
+                approve_url: parse_approve_url(&combined),
+            };
+        }
+        tracing::warn!("tailscale serve 설정 실패");
+        return ServeState::Unknown;
+    }
+    // 설정 직후 재진단 — 실제로 걸렸는지 CLI에 되묻는다(낙관적 성공 표시 금지).
+    diagnose_serve(port)
+}
+
+/// serve 진단을 1회성 스레드로 돌린다(상주 폴링 없음).
+pub fn spawn_serve_check(ctx: egui::Context, port: u16) -> mpsc::Receiver<ServeState> {
+    spawn_serve_task(ctx, move || diagnose_serve(port))
+}
+
+/// serve 설정을 1회성 스레드로 실행한다(사용자 클릭). 완료 시 재진단 결과가 온다.
+pub fn spawn_serve_configure(ctx: egui::Context, port: u16) -> mpsc::Receiver<ServeState> {
+    spawn_serve_task(ctx, move || configure_serve(port))
+}
+
+fn spawn_serve_task(
+    ctx: egui::Context,
+    task: impl FnOnce() -> ServeState + Send + 'static,
+) -> mpsc::Receiver<ServeState> {
+    let (tx, rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("ts-serve".into())
+        .spawn(move || {
+            if tx.send(task()).is_ok() {
+                ctx.request_repaint();
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("tailscale serve 스레드 생성 실패: {e:#}");
+    }
+    rx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +296,72 @@ mod tests {
     fn 기형_json은_none() {
         assert_eq!(parse_status_json("not json"), None);
         assert_eq!(parse_status_json("{}"), None);
+    }
+
+    // ── serve 온보딩 (O1) ────────────────────────────────────────────────
+
+    /// 2026-07-12 실측(tailscale v1.98) — `serve status --json` 설정된 상태.
+    const SERVE_JSON_READY: &str = r#"{
+      "TCP": { "443": { "HTTPS": true } },
+      "Web": {
+        "jr-macbookair.tail02799e.ts.net:443": {
+          "Handlers": { "/": { "Proxy": "http://127.0.0.1:8737" } }
+        }
+      }
+    }"#;
+
+    #[test]
+    fn serve_json은_같은_포트_프록시를_ready로_본다() {
+        assert_eq!(parse_serve_json(SERVE_JSON_READY, 8737), ServeState::Ready);
+    }
+
+    #[test]
+    fn serve_json은_다른_포트를_wrong_port로_본다() {
+        // 앱 포트를 바꿨는데 serve는 옛 포트를 가리키는 상태 — 재설정이 필요하다.
+        assert_eq!(
+            parse_serve_json(SERVE_JSON_READY, 9000),
+            ServeState::WrongPort(8737)
+        );
+    }
+
+    #[test]
+    fn serve_json은_미설정과_기형을_구분한다() {
+        // Web 없음 = serve 미설정
+        assert_eq!(
+            parse_serve_json(r#"{"TCP":{}}"#, 8737),
+            ServeState::NotConfigured
+        );
+        assert_eq!(parse_serve_json("{}", 8737), ServeState::NotConfigured);
+        // 기형 JSON = 진단 불가(하드 실패 금지 — 문서 안내로 폴백)
+        assert_eq!(parse_serve_json("not json", 8737), ServeState::Unknown);
+    }
+
+    #[test]
+    fn 비_loopback_프록시는_우리_서버가_아니다() {
+        // 다른 서비스가 tailnet에 걸어둔 serve — 우리 포트로 오인하면 안 된다.
+        let other = r#"{"Web":{"h:443":{"Handlers":{"/":{"Proxy":"http://192.168.0.5:8737"}}}}}"#;
+        assert_eq!(parse_serve_json(other, 8737), ServeState::NotConfigured);
+        assert_eq!(proxy_port("http://127.0.0.1:8737"), Some(8737));
+        assert_eq!(proxy_port("http://localhost:80"), Some(80));
+        assert_eq!(proxy_port("https://127.0.0.1:8737"), None); // http만
+        assert_eq!(proxy_port("http://10.0.0.1:8737"), None);
+    }
+
+    #[test]
+    fn tailnet_미활성_출력에서_승인_url을_뽑는다() {
+        // 2026-07-11 실측 출력
+        let text = "Serve is not enabled on your tailnet.\nTo enable, visit:\n\n         https://login.tailscale.com/f/serve?node=nD5Sgs4nBW11CNTRL\n";
+        assert!(is_not_enabled(text));
+        assert_eq!(
+            parse_approve_url(text).as_deref(),
+            Some("https://login.tailscale.com/f/serve?node=nD5Sgs4nBW11CNTRL")
+        );
+        // 승인 URL이 없는 출력도 안전하게 처리
+        assert_eq!(
+            parse_approve_url("Serve is not enabled on your tailnet."),
+            None
+        );
+        assert!(!is_not_enabled(SERVE_JSON_READY));
     }
 
     #[test]

@@ -451,6 +451,38 @@ mod tests {
     }
 
     #[test]
+    fn 행_첫_셀이_spacer면_건너뛰고_시작_열이_정확하다() {
+        // 앞 행 wrap 잔재 등으로 행이 spacer로 시작하는 대칭 케이스 방어 (P5 리뷰 P3).
+        let mut cells = vec![runtime::TerminalCell {
+            c: ' ',
+            fg: WHITE,
+            bg: BLACK,
+            wide: false,
+            wide_spacer: true,
+        }];
+        cells.push(cell('a', WHITE, BLACK));
+        cells.push(cell('b', WHITE, BLACK));
+        let line = encode_line(&cells, 0);
+        assert_eq!(line.runs.len(), 1, "{:?}", line.runs);
+        assert_eq!((line.runs[0].s, line.runs[0].t.as_str()), (1, "ab"));
+    }
+
+    #[test]
+    fn cells가_기하보다_짧으면_있는_행까지만_인코딩한다() {
+        // 방어 경로: visible_cells 길이 < cols×rows — 패닉 없이 부분 keyframe (P5 리뷰 P3).
+        let mut snapshot = snapshot(10, 3, vec![cell(' ', WHITE, BLACK); 30]);
+        snapshot.visible_cells = vec![cell('x', WHITE, BLACK); 15].into(); // 1.5행분
+        let ServerMsg::Viewport {
+            keyframe, lines, ..
+        } = encode_viewport(7, 1, &snapshot, None)
+        else {
+            panic!("viewport 아님")
+        };
+        assert!(keyframe);
+        assert_eq!(lines.len(), 1, "완전한 행(1개)까지만 실려야 함");
+    }
+
+    #[test]
     fn 프레임_크기_실측_80x24() {
         // 빈 화면 keyframe — 행당 run 1개
         let blank = snapshot(80, 24, vec![cell(' ', WHITE, BLACK); 80 * 24]);

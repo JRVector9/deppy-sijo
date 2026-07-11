@@ -52,6 +52,12 @@ struct Subscriber {
     /// 없을 때도 알림/상태를 처리하도록 (§14.1). Viewport(slot)도 깨운다 — push가
     /// dirty 게이트라 출력이 있을 때만 울리므로 idle 리페인트를 유발하지 않는다.
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// wake가 화면 렌더에 묶여 있는가(GUI = request_repaint). true면 GUI가 렌더하지
+    /// 않는 원격 전용 Viewport(원격 시청 lease가 hidden/Warm에서 만든 스냅샷)에는
+    /// 깨우지 않는다 — 시청 중 폰 출력이 데스크톱 repaint를 유발하는 것을 차단
+    /// (P5 리뷰 P1, §14.1 "웹 계층은 egui repaint를 유발하지 않는다"). slot 기록은
+    /// 그대로라 탭 전환 시 따라잡기는 보존된다.
+    render_bound: bool,
 }
 
 fn enqueue_durable_event(
@@ -87,6 +93,10 @@ pub struct InProcessRuntimeClient {
     /// command 송신과 PTY 출력 도착이 timeout을 기다리지 않고 worker를 깨우는 핸들.
     /// `Thread::unpark` 토큰은 1개로 coalesce되어 wake 폭주가 누적되지 않는다.
     worker_thread: Option<std::thread::Thread>,
+    /// shutdown 명시 신호 — command_sink()가 SyncSender 클론을 배포한 뒤로는 채널
+    /// Disconnected에만 의존하면 join이 영원히 안 끝난다(웹 브리지가 sink를 쥔 채
+    /// 앱 종료 → 데드락, P5 리뷰 P1). worker는 이 플래그로도 종료한다.
+    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl InProcessRuntimeClient {
@@ -144,6 +154,8 @@ impl InProcessRuntimeClient {
         let (command_tx, command_rx) = sync_channel(IN_PROCESS_CMD_QUEUE_CAP);
         let subscribers: Arc<Mutex<Vec<Subscriber>>> = Arc::default();
         let worker_subscribers = Arc::clone(&subscribers);
+        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown_flag);
         let worker = std::thread::Builder::new()
             .name("runtime-worker".into())
             .spawn(move || {
@@ -201,6 +213,7 @@ impl InProcessRuntimeClient {
                     ),
                     pressured_sessions: std::collections::HashSet::new(),
                     remote_viewing: std::collections::HashMap::new(),
+                    shutdown_requested: worker_shutdown,
                 }
                 .run();
             })
@@ -211,6 +224,7 @@ impl InProcessRuntimeClient {
             subscribers,
             worker: Some(worker),
             worker_thread,
+            shutdown_flag,
         }
     }
 
@@ -234,6 +248,10 @@ impl InProcessRuntimeClient {
     /// 앱 종료 경로(on_exit)에서 호출 — main 리턴과 worker 정리 사이의
     /// 스케줄링 경합으로 자식 프로세스가 reap되지 않는 문제 방지.
     pub fn shutdown(&mut self) {
+        // 명시 플래그 + 채널 drop 이중화 — command_sink 클론이 밖에 살아 있어도
+        // (웹 브리지 등) worker가 반드시 종료한다 (P5 리뷰 P1: 앱 종료 데드락).
+        self.shutdown_flag
+            .store(true, std::sync::atomic::Ordering::Release);
         self.command_tx = None; // Disconnected → worker 루프 break
         if let Some(worker_thread) = &self.worker_thread {
             worker_thread.unpark();
@@ -292,6 +310,7 @@ impl RuntimeEventStream for InProcessRuntimeClient {
                 input_pressures: Arc::clone(&input_pressures),
                 resource_usage: Arc::clone(&resource_usage),
                 wake: None,
+                render_bound: false,
             });
         RuntimeEventReceiver {
             events: rx,
@@ -307,7 +326,25 @@ impl RuntimeEventStream for InProcessRuntimeClient {
 impl InProcessRuntimeClient {
     /// 상태 이벤트 도착 시 `wake`를 호출하는 구독. UI가 숨겨져 프레임이 멈춰도
     /// worker가 UI 스레드를 깨워 알림/상태를 처리하게 한다 (§14.1 Warm 알림 유지).
+    /// wake=repaint인 GUI용 — 원격 전용 Viewport에는 깨우지 않는다 (P5 리뷰 P1).
     pub fn subscribe_with_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) -> RuntimeEventReceiver {
+        self.subscribe_waked(wake, true)
+    }
+
+    /// 렌더와 무관한 백그라운드 소비자(웹 브리지 등)용 구독 — 원격 전용 Viewport에도
+    /// 깨운다 (시청 프레임 라우팅에 필요). GUI는 [`Self::subscribe_with_wake`]를 쓸 것.
+    pub fn subscribe_with_wake_background(
+        &self,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> RuntimeEventReceiver {
+        self.subscribe_waked(wake, false)
+    }
+
+    fn subscribe_waked(
+        &self,
+        wake: Arc<dyn Fn() + Send + Sync>,
+        render_bound: bool,
+    ) -> RuntimeEventReceiver {
         let (tx, rx) = sync_channel(LOCAL_EVENT_QUEUE_CAP);
         let viewports: Arc<Mutex<std::collections::HashMap<SessionId, RuntimeEvent>>> =
             Arc::default();
@@ -325,6 +362,7 @@ impl InProcessRuntimeClient {
                 input_pressures: Arc::clone(&input_pressures),
                 resource_usage: Arc::clone(&resource_usage),
                 wake: Some(wake),
+                render_bound,
             });
         RuntimeEventReceiver {
             events: rx,
@@ -424,6 +462,8 @@ struct Worker {
     /// 원격 시청 lease — 세션별 만료 시각 (v3.3 P5a). 시청 중에는 hidden tab/Warm에서도
     /// 스냅샷을 생성한다("visible 등가" 승격). 비어 있으면 어떤 경로에도 추가 비용 없음.
     remote_viewing: std::collections::HashMap<SessionId, std::time::Instant>,
+    /// shutdown 명시 신호 (P5 리뷰 P1) — command_sink 클론이 채널을 살려둬도 종료.
+    shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// SessionKind ↔ 아카이브 헤더 kind 바이트 (0=shell, 1=agent).
@@ -638,13 +678,19 @@ impl Worker {
                     }
                 }
             }
-            if disconnected {
+            if disconnected
+                || self
+                    .shutdown_requested
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
                 // 기존 recv_timeout 루프처럼 마지막 command batch 뒤 한 번은 pump해
                 // command 직후 도착한 PTY tail과 status/persistence를 반영하고 종료한다.
+                // shutdown 플래그 경로: command_sink 클론(웹 브리지)이 채널을 살려둬도
+                // 여기서 종료한다 (P5 리뷰 P1 — 앱 종료 데드락 방지).
                 let _ = self.pump_sessions(true);
                 self.pump_resource_monitor();
                 self.pump_input_pressure_resolution();
-                break; // client drop → 종료
+                break; // client drop 또는 명시 shutdown → 종료
             }
             if handled == COMMAND_BURST_CAP {
                 // unpark 토큰은 coalesced되므로 대량 명령이 이미 queue에 들어온 경우
@@ -699,6 +745,14 @@ impl Worker {
     }
 
     fn emit(&self, event: RuntimeEvent) {
+        self.emit_gated(event, true)
+    }
+
+    /// `gui_viewport`: 이 Viewport가 GUI 렌더 대상(visible pane + Active)인가.
+    /// false(원격 시청 전용 스냅샷)면 render_bound 구독자(GUI)는 깨우지 않는다 —
+    /// slot 기록은 유지해 탭 전환/Active 복귀 시 따라잡는다 (P5 리뷰 P1).
+    /// Viewport 외 이벤트에는 무의미(항상 true로 호출).
+    fn emit_gated(&self, event: RuntimeEvent, gui_viewport: bool) {
         // Viewport는 최신본 slot 덮어쓰기 (누적/유실/blocking 없음 — 느린 소비자도
         // 재개 시 항상 최종 화면을 본다), 상태 이벤트는 채널 send.
         // receiver가 drop된 구독자는 제거: slot 경로는 Arc strong_count로 판별
@@ -722,7 +776,11 @@ impl Worker {
                     // idle엔 발생하지 않고, 출력 도착 시에만 UI를 깨운다. 이로써 UI측
                     // 50ms 상시 폴링(가시+running 시 20fps 리페인트 = idle CPU ~10%)을
                     // 제거할 수 있다 (가시 상태 상시 리페인트 원인 조사, 2026-07-04).
-                    if let Some(wake) = &subscriber.wake {
+                    // 단 원격 전용 스냅샷(gui_viewport=false)은 GUI(render_bound)를
+                    // 깨우지 않는다 — Warm/hidden 시청이 repaint를 유발하지 않게 (P5 리뷰).
+                    if let Some(wake) = &subscriber.wake
+                        && (gui_viewport || !subscriber.render_bound)
+                    {
                         wakes.push(Arc::clone(wake));
                     }
                     true
@@ -1039,12 +1097,18 @@ impl Worker {
                     if known {
                         let ttl =
                             Duration::from_millis(u64::from(ttl_ms)).min(REMOTE_VIEWING_TTL_CAP);
-                        self.remote_viewing
-                            .insert(session, std::time::Instant::now() + ttl);
-                        // visible 등가 승격(hidden cap 해제) 후 현재 화면을 즉시 push —
-                        // 시청자가 다음 출력까지 빈 화면을 보지 않는다.
-                        self.reconcile_visibility();
-                        self.push_watched_viewports();
+                        let is_new = self
+                            .remote_viewing
+                            .insert(session, std::time::Instant::now() + ttl)
+                            .is_none();
+                        // 신규 lease만: visible 등가 승격(hidden cap 해제) 후 현재 화면을
+                        // 즉시 push — 시청자가 다음 출력까지 빈 화면을 보지 않는다.
+                        // 갱신(15s 주기 재전송)은 만료 연장만 — 매번 전 대상 풀 스냅샷을
+                        // 다시 만들지 않는다 (P5 리뷰 P3).
+                        if is_new {
+                            self.reconcile_visibility();
+                            self.push_watched_viewports();
+                        }
                     }
                 } else if self.remote_viewing.remove(&session).is_some() {
                     // 해제 즉시 hidden cap 재적용 (tombstone 관례 — trailing 승격 차단).
@@ -1892,11 +1956,12 @@ impl Worker {
         // Warm이면 GUI 몫(watched)은 멈추지만(§14.1 — snapshot 생성 금지, 세션 pump는
         // 계속), 원격 시청 lease 세션은 계속 스냅샷을 생성한다 — 시청 승격은 스냅샷
         // 생성만 허용하고 egui repaint는 유발하지 않는다 (P5a). lease 0이면 기존과 동일.
-        let mut targets = if self.render_active {
+        let gui_targets = if self.render_active {
             self.mux.watched_sessions()
         } else {
             Vec::new()
         };
+        let mut targets = gui_targets.clone();
         for session in self.remote_viewed_sessions() {
             if !targets.contains(&session) {
                 targets.push(session);
@@ -1916,15 +1981,19 @@ impl Worker {
             if let Some(active) = self.sessions.get_mut(&session)
                 && let Some(snapshot) = active.take_snapshot()
             {
-                events.push(RuntimeEvent::Viewport {
-                    session,
-                    snapshot: Arc::new(snapshot),
-                    bracketed_paste: active.bracketed_paste(),
-                });
+                events.push((
+                    RuntimeEvent::Viewport {
+                        session,
+                        snapshot: Arc::new(snapshot),
+                        bracketed_paste: active.bracketed_paste(),
+                    },
+                    // 원격 전용(GUI 비대상) 스냅샷은 render_bound 구독자를 깨우지 않는다.
+                    gui_targets.contains(&session),
+                ));
             }
         }
-        for event in events {
-            self.emit(event);
+        for (event, gui_viewport) in events {
+            self.emit_gated(event, gui_viewport);
         }
     }
 
@@ -1955,7 +2024,8 @@ impl Worker {
         let watched = self.mux.watched_sessions();
         // 원격 시청 lease 세션 — GUI 가시성과 무관하게 Viewport 대상 (P5a).
         let remote_viewed = self.remote_viewed_sessions();
-        let mut events = Vec::new();
+        // (이벤트, gui_viewport) — Viewport만 원격 전용 여부를 구분한다 (P5 리뷰 P1).
+        let mut events: Vec<(RuntimeEvent, bool)> = Vec::new();
         let mut log_offsets = Vec::new();
         let mut status_updates = Vec::new();
         let mut activity = PumpActivity::default();
@@ -1993,14 +2063,20 @@ impl Worker {
                     status_updates.push((active.id(), status));
                     let view =
                         detector.status_view(self.status_overrides.get(&active.id()).copied());
-                    events.push(RuntimeEvent::SessionStatusChanged {
-                        session: active.id(),
-                        status,
-                    });
-                    events.push(RuntimeEvent::SessionStatusViewChanged {
-                        session: active.id(),
-                        view,
-                    });
+                    events.push((
+                        RuntimeEvent::SessionStatusChanged {
+                            session: active.id(),
+                            status,
+                        },
+                        true,
+                    ));
+                    events.push((
+                        RuntimeEvent::SessionStatusViewChanged {
+                            session: active.id(),
+                            view,
+                        },
+                        true,
+                    ));
                 }
             }
             let viewport_wanted = (self.render_active && watched.contains(&active.id()))
@@ -2008,11 +2084,16 @@ impl Worker {
             if viewport_wanted && result.dirty {
                 if allow_viewport {
                     if let Some(snapshot) = active.take_snapshot() {
-                        events.push(RuntimeEvent::Viewport {
-                            session: active.id(),
-                            snapshot: Arc::new(snapshot),
-                            bracketed_paste: active.bracketed_paste(),
-                        });
+                        // 원격 전용(GUI 비대상) 스냅샷은 render_bound 구독자를 깨우지 않는다.
+                        let gui_viewport = self.render_active && watched.contains(&active.id());
+                        events.push((
+                            RuntimeEvent::Viewport {
+                                session: active.id(),
+                                snapshot: Arc::new(snapshot),
+                                bracketed_paste: active.bracketed_paste(),
+                            },
+                            gui_viewport,
+                        ));
                         activity.viewport_emitted = true;
                     } else {
                         // backend가 일시적으로 snapshot을 못 만들면 dirty를 유지하고
@@ -2050,14 +2131,20 @@ impl Worker {
                     session::SessionStatus::Error
                 };
                 self.status_overrides.remove(&active.id());
-                events.push(RuntimeEvent::SessionStatusViewChanged {
-                    session: active.id(),
-                    view: session::SessionStatusView::process_exit(status),
-                });
-                events.push(RuntimeEvent::SessionExited {
-                    session: active.id(),
-                    exit_code,
-                });
+                events.push((
+                    RuntimeEvent::SessionStatusViewChanged {
+                        session: active.id(),
+                        view: session::SessionStatusView::process_exit(status),
+                    },
+                    true,
+                ));
+                events.push((
+                    RuntimeEvent::SessionExited {
+                        session: active.id(),
+                        exit_code,
+                    },
+                    true,
+                ));
             }
         }
         if let Some(pipe) = &mut self.persist {
@@ -2071,7 +2158,7 @@ impl Worker {
         // 종료 세션의 로그 마감 (carry flush + exited 이벤트)
         let mut exited: Vec<(SessionId, Option<u32>)> = events
             .iter()
-            .filter_map(|e| match e {
+            .filter_map(|(e, _)| match e {
                 RuntimeEvent::SessionExited { session, exit_code } => Some((*session, *exit_code)),
                 _ => None,
             })
@@ -2099,13 +2186,13 @@ impl Worker {
         // UI가 exit 상태/알림을 무시한다 (codex 리뷰) — 그래서 exit을 먼저 내보낸다.
         let exited_sessions: Vec<SessionId> = events
             .iter()
-            .filter_map(|e| match e {
+            .filter_map(|(e, _)| match e {
                 RuntimeEvent::SessionExited { session, .. } => Some(*session),
                 _ => None,
             })
             .collect();
-        for event in events {
-            self.emit(event);
+        for (event, gui_viewport) in events {
+            self.emit_gated(event, gui_viewport);
         }
         // 셸 세션 종료 → pane 자동 닫힘 (tmux 관례 — exit하면 pane이 접히고 이웃이
         // 공간을 차지, 2026-07-05 사용자 요청). agent pane은 결과 상태(✅/❌)와
@@ -2640,6 +2727,7 @@ mod tests {
             input_pressures: Arc::default(),
             resource_usage: Arc::default(),
             wake: None,
+            render_bound: false,
         };
         let mut wakes = Vec::new();
         assert!(enqueue_durable_event(
@@ -2705,6 +2793,7 @@ mod tests {
             subscribers: Arc::default(),
             worker: None,
             worker_thread: None,
+            shutdown_flag: Arc::default(),
         };
         client
             .send_command(RuntimeCommand::SetWorkspaceState(
@@ -4863,6 +4952,174 @@ mod tests {
             .iter()
             .any(|e| matches!(e, RuntimeEvent::Viewport { session, .. } if *session == session_a));
         assert!(!ghost, "kill된 세션에 유령 lease Viewport가 생성됨");
+    }
+
+    /// P5 리뷰 P1: command_sink 클론(웹 브리지)이 채널을 살려둬도 shutdown이
+    /// join까지 완료된다 — 앱 종료 데드락 회귀 방지.
+    #[cfg(unix)]
+    #[test]
+    fn command_sink이_살아있어도_shutdown이_완료된다() {
+        init_mock_store();
+        let mut client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("sink-shutdown"),
+            RedactionService::new(),
+            spec("/bin/sh", &["-c", "sleep 30"]),
+            None,
+        );
+        let sink = client.command_sink().expect("command_sink");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let joiner = std::thread::spawn(move || {
+            client.shutdown();
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("shutdown 미완료 — command_sink 클론이 worker join을 막음 (P5 리뷰 P1)");
+        joiner.join().unwrap();
+        drop(sink); // sink는 shutdown 완료 시점까지 살아 있었다 — 그게 이 테스트의 조건
+    }
+
+    /// P5 리뷰 P1: 원격 전용 Viewport(Warm/hidden lease 스냅샷)는 render_bound
+    /// 구독자(GUI=repaint)를 깨우지 않는다 — 시청이 데스크톱 repaint를 유발하면 안 됨.
+    /// 백그라운드 구독자(웹 브리지)는 프레임 라우팅을 위해 깨어나야 한다.
+    #[cfg(unix)]
+    #[test]
+    fn 원격_전용_viewport는_render_bound_구독자를_깨우지_않는다() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        init_mock_store();
+        // 연속 출력 세션 — Warm + lease면 모든 Viewport가 원격 전용이다.
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("wake-gate"),
+            RedactionService::new(),
+            spec("/bin/sh", &["-c", "while :; do printf x; sleep 0.05; done"]),
+            None,
+        );
+        let gui_wakes = Arc::new(AtomicU64::new(0));
+        let bg_wakes = Arc::new(AtomicU64::new(0));
+        let gui_counter = Arc::clone(&gui_wakes);
+        let bg_counter = Arc::clone(&bg_wakes);
+        let _gui_rx = client.subscribe_with_wake(Arc::new(move || {
+            gui_counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        let _bg_rx = client.subscribe_with_wake_background(Arc::new(move || {
+            bg_counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SetWorkspaceState(
+                WorkspaceRuntimeState::Warm,
+            ))
+            .unwrap();
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            _ => None,
+        });
+        client
+            .send_command(RuntimeCommand::SetRemoteViewing {
+                session,
+                viewing: true,
+                ttl_ms: 60_000,
+            })
+            .unwrap();
+        // 스트림이 흐르기 시작한 것 확인 후 측정 창 — 스폰기 상태 이벤트 노이즈를 배제
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::Viewport { session: s, .. } if *s == session => Some(()),
+            _ => None,
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        gui_wakes.store(0, Ordering::SeqCst);
+        bg_wakes.store(0, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(800));
+        let gui = gui_wakes.load(Ordering::SeqCst);
+        let bg = bg_wakes.load(Ordering::SeqCst);
+        assert!(
+            bg >= 5,
+            "백그라운드 구독자가 원격 viewport에 깨어나지 않음 (bg={bg})"
+        );
+        // ResourceUsage(~2s 주기) 등 비-viewport wake 1~2회는 허용 — viewport로 인한
+        // 연속 wake(수십 회)만 없으면 된다.
+        assert!(
+            gui <= 2,
+            "render_bound 구독자가 원격 전용 viewport에 깨어남 (gui={gui}, bg={bg}) — Warm repaint 회귀 (P5 리뷰 P1)"
+        );
+    }
+
+    /// P5 리뷰 P3: lease 갱신(재전송)은 만료 연장만 — 전 대상 스냅샷 재push를
+    /// 유발하지 않는다 (15s마다 풀 keyframe 낭비 + Warm wake 소음 방지).
+    #[cfg(unix)]
+    #[test]
+    fn lease_갱신은_스냅샷을_재push하지_않는다() {
+        init_mock_store();
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("lease-renew"),
+            RedactionService::new(),
+            spec("/bin/sh", &["-c", "sleep 30"]),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SetWorkspaceState(
+                WorkspaceRuntimeState::Warm,
+            ))
+            .unwrap();
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            })
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            _ => None,
+        });
+        // 신규 lease → 즉시 초기 push 1회
+        client
+            .send_command(RuntimeCommand::SetRemoteViewing {
+                session,
+                viewing: true,
+                ttl_ms: 60_000,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::Viewport { session: s, .. } if *s == session => Some(()),
+            _ => None,
+        });
+        // 갱신(재전송) — 조용한 세션이라 새 출력이 없으니 Viewport도 없어야 한다
+        probe.seen.clear();
+        client
+            .send_command(RuntimeCommand::SetRemoteViewing {
+                session,
+                viewing: true,
+                ttl_ms: 60_000,
+            })
+            .unwrap();
+        let until = Instant::now() + Duration::from_millis(700);
+        while Instant::now() < until {
+            probe.seen.extend(probe.rx.drain());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let renewal_push = probe
+            .seen
+            .iter()
+            .any(|e| matches!(e, RuntimeEvent::Viewport { session: s, .. } if *s == session));
+        assert!(
+            !renewal_push,
+            "lease 갱신이 스냅샷을 재push함 (P5 리뷰 P3 회귀)"
+        );
     }
 
     #[test]

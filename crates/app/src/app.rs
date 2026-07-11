@@ -2021,6 +2021,11 @@ impl App {
             .active
             .runtime
             .subscribe_with_wake(server.dashboard_wake());
+        // 터미널 뷰어(P5)의 시청 lease를 runtime으로 보낼 명령 싱크 — receiver보다 먼저
+        // (set_runtime_source의 lease 재선언이 이 싱크로 나간다, rebind와 동일 순서).
+        if let Some(sink) = self.active.runtime.command_sink() {
+            server.set_runtime_command_sink(sink);
+        }
         server.set_runtime_source(receiver);
         // 구독 등록 직후 현재 세션 상태를 시드한다 — 이벤트 스트림은 edge-trigger라, 재구독한
         // 대시보드는 과거 이력을 모른다. 시드가 없으면 이미 needs_approval로 정착한 세션이
@@ -2037,6 +2042,11 @@ impl App {
                 .active
                 .runtime
                 .subscribe_with_wake(web.server.dashboard_wake());
+            // 명령 싱크를 receiver보다 먼저 교체한다 — set_runtime_source의 lease 재선언이
+            // 새 worker의 싱크로 나가게 (P5b, 워크스페이스 전환 시 시청 연속성).
+            if let Some(sink) = self.active.runtime.command_sink() {
+                web.server.set_runtime_command_sink(sink);
+            }
             web.server.set_runtime_source(receiver);
             // 재구독 직후 새 워크스페이스의 현재 세션 상태를 시드한다(start_web과 동일 이유 +
             // 세션 맵 통째 교체로 옛 워크스페이스 세션 정체/전환 레이스까지 해소 — P2 리뷰).

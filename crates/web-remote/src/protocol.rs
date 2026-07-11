@@ -28,6 +28,11 @@ pub enum ClientMsg {
         #[serde(default)]
         remember: bool,
     },
+    /// 세션 시청 시작/전환 (터미널 뷰어 — P5b). 접속당 시청은 1개 — 새 watch가
+    /// 이전 시청을 대체한다. 브리지가 refcount를 집계해 runtime lease로 승격한다.
+    Watch { session: u64 },
+    /// 시청 종료 — 접속은 유지한 채 시청만 끊는다 (WS 절단 시에는 자동 해제).
+    Unwatch,
 }
 
 impl ClientMsg {
@@ -144,6 +149,16 @@ mod tests {
         assert!(ClientMsg::parse("not json").is_none());
         assert!(ClientMsg::parse(r#"{"type":"nope"}"#).is_none());
         assert!(ClientMsg::parse(r#"{"type":"auth"}"#).is_none()); // token 필수
+    }
+
+    #[test]
+    fn watch_unwatch_프레임을_파싱한다() {
+        let msg = ClientMsg::parse(r#"{"type":"watch","session":7}"#).unwrap();
+        assert_eq!(msg, ClientMsg::Watch { session: 7 });
+        let msg = ClientMsg::parse(r#"{"type":"unwatch"}"#).unwrap();
+        assert_eq!(msg, ClientMsg::Unwatch);
+        // session 누락 watch는 기형 — 무시
+        assert!(ClientMsg::parse(r#"{"type":"watch"}"#).is_none());
     }
 
     #[test]

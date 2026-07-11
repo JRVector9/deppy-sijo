@@ -27,12 +27,56 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use runtime::{ProcessResourceSnapshot, RuntimeEvent, RuntimeEventReceiver, SessionStatus};
+use runtime::{
+    ProcessResourceSnapshot, RuntimeCommand, RuntimeEvent, RuntimeEventReceiver, SessionId,
+    SessionStatus,
+};
 
 use crate::protocol::{ApprovalView, ResourceView, ServerMsg, SessionView};
 
 /// 승인 DB 폴링 주기 — 접속이 있을 때만 적용된다(계획 완료기준: 상태/승인 반영 ≤1s).
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 원격 시청 lease TTL(ms) — runtime SetRemoteViewing에 싣는다 (P5b). 갱신 주기의
+/// 3배로 두어 tick 지연·일시 정체에도 시청이 끊기지 않게 한다 (runtime 상한 5분 이내).
+const LEASE_TTL_MS: u32 = 45_000;
+/// lease 갱신 주기 — 브리지 tick(접속 ≥1이면 ≤1s)마다 만기를 검사해 재전송한다.
+const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(15);
+
+/// web → runtime 명령 싱크 (P5b). 앱이 활성 runtime의 command_sink를 주입하고,
+/// 워크스페이스 전환 시 receiver와 함께 교체한다. fire-and-forget — 실패는 로그만.
+pub type CommandSink = Arc<dyn Fn(RuntimeCommand) + Send + Sync>;
+
+/// 세션 하나의 시청 집계 (P5b) — 접속 수 + 마지막 lease 갱신 시각.
+struct WatcherEntry {
+    count: usize,
+    last_renewal: Instant,
+}
+
+/// 갱신 주기가 지난 시청 세션들을 골라 last_renewal을 갱신한다 (순수 — 테스트 대상).
+fn due_lease_renewals(
+    watchers: &mut BTreeMap<u64, WatcherEntry>,
+    now: Instant,
+    interval: Duration,
+) -> Vec<u64> {
+    watchers
+        .iter_mut()
+        .filter(|(_, entry)| now.duration_since(entry.last_renewal) >= interval)
+        .map(|(id, entry)| {
+            entry.last_renewal = now;
+            *id
+        })
+        .collect()
+}
+
+/// 시청 lease 명령을 만든다.
+fn lease_command(session: u64, viewing: bool) -> RuntimeCommand {
+    RuntimeCommand::SetRemoteViewing {
+        session: SessionId(session),
+        viewing,
+        ttl_ms: if viewing { LEASE_TTL_MS } else { 0 },
+    }
+}
 
 /// 세션 한 행의 경량 상태(런타임 이벤트에서 누적). 표시용 최소 필드만 유지한다.
 #[derive(Debug, Clone, PartialEq)]
@@ -183,6 +227,10 @@ struct Inner {
     /// 웹푸시 발송 싱크(P4). 이벤트 drain 시 세션 상태 전이(입력대기/완료)를 넘긴다 —
     /// 승인 발송은 push가 DB를 직접 폴링하므로 여기서 넘기지 않는다. None이면 푸시 비활성.
     push_sink: Option<crate::push::PushHandle>,
+    /// web → runtime 명령 싱크 (P5b). None이면 시청 lease를 보내지 않는다(뷰어 비활성).
+    command_sink: Option<CommandSink>,
+    /// 세션별 시청 접속 집계 (P5b). 0→1에서 lease on, 1→0에서 lease off를 보낸다.
+    watchers: BTreeMap<u64, WatcherEntry>,
 }
 
 /// 접속 스레드가 소켓으로 밀어낼 발행 스냅샷. 버전이 오르면 push 대상.
@@ -252,6 +300,8 @@ impl DashboardHandle {
                 resource: None,
                 last_poll: Instant::now() - POLL_INTERVAL,
                 push_sink: None,
+                command_sink: None,
+                watchers: BTreeMap::new(),
             }),
             published: Mutex::new(Published::default()),
             db: Mutex::new(db),
@@ -293,12 +343,83 @@ impl DashboardHandle {
     }
 
     /// 활성 workspace worker 구독을 붙인다(시작 + 워크스페이스 전환마다). 옛 receiver는
-    /// 교체와 함께 drop되어 옛 worker가 자기 subscriber를 정리한다.
+    /// 교체와 함께 drop되어 옛 worker가 자기 subscriber를 정리한다. 시청 lease는 새
+    /// worker가 모르므로 재선언한다 (P5b — runtime 재시작/전환 시 시청 연속성).
     pub fn set_runtime_source(&self, receiver: RuntimeEventReceiver) {
-        let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
-        inner.receiver = Some(receiver);
-        inner.dirty = true;
+        {
+            let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
+            inner.receiver = Some(receiver);
+            inner.dirty = true;
+        }
+        self.reassert_watch_leases();
         self.shared.cvar.notify_all();
+    }
+
+    /// web → runtime 명령 싱크를 붙인다 (P5b — receiver와 같은 시점에 교체된다).
+    pub fn set_command_sink(&self, sink: CommandSink) {
+        let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
+        inner.command_sink = Some(sink);
+    }
+
+    /// 접속의 시청 대상 전환 (P5b). `from`을 내리고 `to`를 올린다 — refcount 전이
+    /// (0→1 / 1→0)에서만 runtime lease 명령이 나간다. 명령 전송은 inner 락 밖에서.
+    pub fn rebind_watch(&self, from: Option<u64>, to: Option<u64>) {
+        if from == to {
+            return;
+        }
+        let mut commands: Vec<RuntimeCommand> = Vec::new();
+        let sink = {
+            let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
+            if let Some(old) = from
+                && let Some(entry) = inner.watchers.get_mut(&old)
+            {
+                entry.count = entry.count.saturating_sub(1);
+                if entry.count == 0 {
+                    inner.watchers.remove(&old);
+                    commands.push(lease_command(old, false));
+                }
+            }
+            if let Some(new) = to {
+                let entry = inner.watchers.entry(new).or_insert(WatcherEntry {
+                    count: 0,
+                    last_renewal: Instant::now(),
+                });
+                entry.count += 1;
+                if entry.count == 1 {
+                    entry.last_renewal = Instant::now();
+                    commands.push(lease_command(new, true));
+                }
+            }
+            inner.command_sink.clone()
+        };
+        if let Some(sink) = sink {
+            for command in commands {
+                sink(command);
+            }
+        }
+    }
+
+    /// 시청 중인 모든 세션의 lease를 재선언한다 (P5b — 새 worker 구독 직후). 새 worker는
+    /// 이전 lease를 모르므로 viewing=true를 다시 보내고 갱신 시계를 리셋한다.
+    fn reassert_watch_leases(&self) {
+        let (sink, sessions) = {
+            let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
+            let now = Instant::now();
+            let sessions: Vec<u64> = inner
+                .watchers
+                .iter_mut()
+                .map(|(id, entry)| {
+                    entry.last_renewal = now;
+                    *id
+                })
+                .collect();
+            (inner.command_sink.clone(), sessions)
+        };
+        if let Some(sink) = sink {
+            for session in sessions {
+                sink(lease_command(session, true));
+            }
+        }
     }
 
     /// 현재 워크스페이스의 세션 목록/상태/제목/exited를 시드한다(start_web·워크스페이스 전환 시,
@@ -499,6 +620,14 @@ fn run(shared: &Arc<Shared>) {
             }
         }
 
+        // 2.5) 원격 시청 lease 갱신 (P5b) — 만기(45s TTL) 전에 재전송해 시청을 유지한다.
+        //      시청 0이면 no-op. 전송은 inner 락을 놓은 뒤에.
+        let renewals =
+            due_lease_renewals(&mut inner.watchers, Instant::now(), LEASE_RENEW_INTERVAL);
+        let renewal_sink = (!renewals.is_empty())
+            .then(|| inner.command_sink.clone())
+            .flatten();
+
         // 3) 발행 — 접속 0이면 JSON을 만들지 않는다(불필요 작업 회피). 접속 시 등록이
         //    force_poll+dirty를 세우므로 그때 최신 스냅샷이 만들어진다.
         if conns > 0 {
@@ -512,6 +641,11 @@ fn run(shared: &Arc<Shared>) {
             publish(shared, dash_json, appr_json);
         } else {
             drop(inner);
+        }
+        if let Some(sink) = renewal_sink {
+            for session in renewals {
+                sink(lease_command(session, true));
+            }
         }
     }
 }
@@ -647,5 +781,99 @@ mod tests {
         assert_eq!(status_str(SessionStatus::NeedsApproval), "needs_approval");
         assert_eq!(status_str(SessionStatus::Running), "running");
         assert_eq!(status_str(SessionStatus::Done), "done");
+    }
+
+    /// 캡처된 명령에서 시청 lease만 (세션, viewing)으로 뽑는다.
+    fn lease_of(command: &RuntimeCommand) -> Option<(u64, bool)> {
+        match command {
+            RuntimeCommand::SetRemoteViewing {
+                session, viewing, ..
+            } => Some((session.0, *viewing)),
+            _ => None,
+        }
+    }
+
+    fn capture_sink() -> (CommandSink, StdArc<Mutex<Vec<RuntimeCommand>>>) {
+        let captured: StdArc<Mutex<Vec<RuntimeCommand>>> = StdArc::default();
+        let sink_cap = StdArc::clone(&captured);
+        let sink: CommandSink = StdArc::new(move |command| {
+            sink_cap.lock().unwrap().push(command);
+        });
+        (sink, captured)
+    }
+
+    #[test]
+    fn rebind_watch는_refcount_전이에서만_lease를_보낸다() {
+        let (handle, thread) = DashboardHandle::spawn(None);
+        let (sink, captured) = capture_sink();
+        handle.set_command_sink(sink);
+        // conn1: watch 7 (0→1 on) / conn2: watch 7 (1→2 무전송)
+        handle.rebind_watch(None, Some(7));
+        handle.rebind_watch(None, Some(7));
+        // conn1: 7→9 전환 (7은 2→1 무전송, 9는 0→1 on) — 재바인딩
+        handle.rebind_watch(Some(7), Some(9));
+        // 같은 세션으로의 재전환은 no-op
+        handle.rebind_watch(Some(9), Some(9));
+        // conn2 종료 (7: 1→0 off), conn1 종료 (9: 1→0 off)
+        handle.rebind_watch(Some(7), None);
+        handle.rebind_watch(Some(9), None);
+        let got: Vec<(u64, bool)> = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(lease_of)
+            .collect();
+        assert_eq!(
+            got,
+            vec![(7, true), (9, true), (7, false), (9, false)],
+            "refcount 전이 외 lease 전송이 있음"
+        );
+        handle.stop();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn 재선언은_시청_중인_모든_세션의_lease를_다시_보낸다() {
+        let (handle, thread) = DashboardHandle::spawn(None);
+        let (sink, captured) = capture_sink();
+        handle.set_command_sink(sink);
+        handle.rebind_watch(None, Some(3));
+        handle.rebind_watch(None, Some(5));
+        captured.lock().unwrap().clear();
+        // 새 worker 구독 직후(set_runtime_source 경로) — 모든 시청 lease 재선언
+        handle.reassert_watch_leases();
+        let got: Vec<(u64, bool)> = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(lease_of)
+            .collect();
+        assert_eq!(got, vec![(3, true), (5, true)]);
+        handle.stop();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn 갱신주기가_지난_시청만_갱신_대상이_된다() {
+        let mut watchers = BTreeMap::new();
+        let now = Instant::now();
+        watchers.insert(
+            1,
+            WatcherEntry {
+                count: 1,
+                last_renewal: now - Duration::from_secs(20),
+            },
+        );
+        watchers.insert(
+            2,
+            WatcherEntry {
+                count: 1,
+                last_renewal: now,
+            },
+        );
+        let due = due_lease_renewals(&mut watchers, now, Duration::from_secs(15));
+        assert_eq!(due, vec![1]);
+        // 갱신 직후엔 만기가 리셋돼 due가 비어야 한다 (매 tick 재전송 방지)
+        assert!(due_lease_renewals(&mut watchers, now, Duration::from_secs(15)).is_empty());
     }
 }

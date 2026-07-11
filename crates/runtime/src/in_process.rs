@@ -214,6 +214,22 @@ impl InProcessRuntimeClient {
         }
     }
 
+    /// worker로 명령을 보내는 복제 가능한 싱크 (P5b — 웹 계층 등 다른 스레드용).
+    /// SyncSender 복제 + unpark 핸들만 캡처해 client 수명과 분리된다. worker가 종료되면
+    /// try_send가 실패하고 경고 로그만 남는다 — 호출측은 fire-and-forget.
+    pub fn command_sink(&self) -> Option<Arc<dyn Fn(RuntimeCommand) + Send + Sync>> {
+        let tx = self.command_tx.as_ref()?.clone();
+        let worker_thread = self.worker_thread.clone();
+        Some(Arc::new(move |command| match tx.try_send(command) {
+            Ok(()) => {
+                if let Some(worker_thread) = &worker_thread {
+                    worker_thread.unpark();
+                }
+            }
+            Err(e) => tracing::warn!("web→runtime 명령 전송 실패: {e}"),
+        }))
+    }
+
     /// worker를 종료시키고 세션 정리(PtySession Drop)까지 동기적으로 기다린다.
     /// 앱 종료 경로(on_exit)에서 호출 — main 리턴과 worker 정리 사이의
     /// 스케줄링 경합으로 자식 프로세스가 reap되지 않는 문제 방지.

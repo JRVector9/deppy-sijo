@@ -70,8 +70,21 @@ h1 { font-size: 19px; font-weight: 600; color: #f0f0f0; }
 .actions .deny { background: #a83a3a; }
 
 /* 세션 목록 */
-.sessions { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+.sessions { list-style: none; display: flex; flex-direction: column; gap: 14px; }
 .sessions:empty { display: none; }
+
+/* 워크스페이스 그룹 — 활성/warm/유휴 전부 표시 (데스크톱 활동 패널과 같은 구성) */
+.ws-group { list-style: none; }
+.ws-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.ws-name { font-size: 13px; font-weight: 600; color: #cfcfcf; word-break: break-word; }
+.ws-state {
+  font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 9px; flex: none;
+  background: #333; color: #9a9a9a;
+}
+.ws-state.active { background: #21344a; color: #7db4e6; }
+.ws-state.warm { background: #3a3320; color: #d0b264; }
+.ws-sessions { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+.view-note { font-size: 11px; color: #7a7a7a; flex: none; }
 .session {
   display: flex; align-items: center; justify-content: space-between; gap: 10px;
   padding: 9px 10px; background: #1f1f1f; border: 1px solid #383838; border-radius: 8px;

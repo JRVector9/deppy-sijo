@@ -32,7 +32,7 @@ use runtime::{
     SessionStatus,
 };
 
-use crate::protocol::{ApprovalView, ResourceView, ServerMsg, SessionView};
+use crate::protocol::{ApprovalView, ResourceView, ServerMsg, SessionView, WorkspaceView};
 
 /// 승인 DB 폴링 주기 — 접속이 있을 때만 적용된다(계획 완료기준: 상태/승인 반영 ≤1s).
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -126,24 +126,56 @@ fn pressure_reason(reason: runtime::PtyInputRejectReason) -> &'static str {
     }
 }
 
-/// 세션 한 행의 경량 상태(런타임 이벤트에서 누적). 표시용 최소 필드만 유지한다.
+/// 세션 한 행의 경량 상태(런타임 이벤트에서 누적). 제목은 앱 스냅샷(WorkspaceSeed)이
+/// 갖는다 — 여기엔 프레임 독립으로 흘러야 하는 상태만 둔다.
 #[derive(Debug, Clone, PartialEq)]
 struct SessionEntry {
-    title: String,
     status: SessionStatus,
     /// SessionExited/Restored 관측 — 완료 배지.
     exited: bool,
 }
 
-/// 앱이 웹 대시보드에 넘기는 세션 시드 한 행. 재구독(start_web·워크스페이스 전환) 직후,
-/// 이벤트 이력이 없는 새 구독자가 needs_approval 등 이미 정착한 상태를 즉시 반영하도록
-/// 앱이 GUI 배지용으로 추적 중인 현재 상태를 담아 넘긴다(계획 P2 리뷰: edge-trigger 유실 보정).
+/// 앱이 웹 대시보드에 넘기는 세션 한 행.
+///
+/// 제목은 **앱이 해석한 표시명**이다(프로젝트명 규칙 — 데스크톱 활동 패널과 동일).
+/// 브리지는 MuxUpdated의 raw pane 제목("workspace.spawn.shell 140")으로 이걸 덮지
+/// 않는다 — 폰에서도 사람이 읽을 수 있는 이름이 보이게 한다.
+///
+/// 활성 워크스페이스 세션만 `id`가 있다(시청/입력 대상). warm/유휴는 표시 전용 —
+/// 세션 id가 worker-로컬이라 다른 워크스페이스 id로 시청하면 엉뚱한 세션이 잡힌다.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionSeed {
-    pub id: u64,
+    pub id: Option<u64>,
     pub title: String,
-    pub status: SessionStatus,
+    pub status: Option<SessionStatus>,
     pub exited: bool,
+}
+
+/// 워크스페이스 상태 — 데스크톱 활동 패널과 같은 3분류.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceState {
+    Active,
+    Warm,
+    Idle,
+}
+
+impl WorkspaceState {
+    fn as_str(self) -> &'static str {
+        match self {
+            WorkspaceState::Active => "active",
+            WorkspaceState::Warm => "warm",
+            WorkspaceState::Idle => "idle",
+        }
+    }
+}
+
+/// 앱이 넘기는 워크스페이스 한 묶음 — 활성 1개 + warm/유휴 N개.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceSeed {
+    pub id: String,
+    pub name: String,
+    pub state: WorkspaceState,
+    pub sessions: Vec<SessionSeed>,
 }
 
 /// [`SessionStatus`] → snake_case 문자열(브라우저 프로토콜).
@@ -170,26 +202,20 @@ fn apply_event(
 ) {
     match event {
         RuntimeEvent::MuxUpdated { snapshot } => {
-            // pane에 붙은 세션 집합으로 목록을 정렬(추가/삭제). 상태·exited는 보존하고
-            // 제목만 최신화한다 — MuxUpdated가 상태를 리셋하지 않게.
-            let mut live: BTreeMap<u64, String> = BTreeMap::new();
+            // pane에 붙은 세션 집합이 **소속의 근거**다(추가/삭제). 제목은 여기서 쓰지
+            // 않는다 — mux의 raw 제목("workspace.spawn.shell 140")은 사람이 읽기 어렵고,
+            // 표시명은 앱이 해석해 push한다(WorkspaceSeed). 상태·exited는 보존한다.
+            let mut live: Vec<u64> = Vec::new();
             for tab in &snapshot.tabs {
                 for pane in &tab.panes {
                     if let Some(session) = pane.session_id {
-                        live.insert(session.0, pane.title.clone());
+                        live.push(session.0);
                     }
                 }
             }
-            sessions.retain(|id, _| live.contains_key(id));
-            for (id, title) in live {
-                sessions
-                    .entry(id)
-                    .and_modify(|entry| entry.title = title.clone())
-                    .or_insert(SessionEntry {
-                        title,
-                        status: SessionStatus::Running,
-                        exited: false,
-                    });
+            sessions.retain(|id, _| live.contains(id));
+            for id in live {
+                sessions.entry(id).or_insert_with(new_entry);
             }
         }
         RuntimeEvent::SessionStatusChanged { session, status } => {
@@ -217,7 +243,6 @@ fn apply_event(
 
 fn new_entry() -> SessionEntry {
     SessionEntry {
-        title: String::new(),
         status: SessionStatus::Running,
         exited: false,
     }
@@ -249,14 +274,71 @@ fn resource_view(snapshot: &ProcessResourceSnapshot) -> ResourceView {
 }
 
 /// 세션 맵을 정렬된 표시 목록으로. id 오름차순(안정적 렌더).
-fn session_views(sessions: &BTreeMap<u64, SessionEntry>) -> Vec<SessionView> {
-    sessions
+/// 앱 스냅샷(제목·워크스페이스 구성)과 런타임 이벤트 맵(활성 세션의 라이브 상태)을
+/// 합쳐 표시 목록을 만든다.
+///
+/// - **활성 워크스페이스**: 소속·상태는 이벤트 맵이 근거(프레임 독립 — 창이 숨겨져도
+///   흐른다). 제목은 앱 스냅샷에서 가져오고(없으면 "세션 N" 폴백), 시청 가능(id 포함).
+/// - **warm/유휴**: 앱 스냅샷 그대로 — 표시 전용(id 없음).
+fn workspace_views(
+    workspaces: &[WorkspaceSeed],
+    live: &BTreeMap<u64, SessionEntry>,
+) -> Vec<WorkspaceView> {
+    // 앱 스냅샷이 아직 없는데(웹서버 기동 직후 첫 프레임 전) 라이브 세션이 있으면,
+    // 세션이 통째로 안 보이는 것보다 이름 없는 활성 워크스페이스로라도 보여준다.
+    if workspaces.is_empty() && !live.is_empty() {
+        return vec![WorkspaceView {
+            id: String::new(),
+            name: String::new(),
+            state: WorkspaceState::Active.as_str(),
+            sessions: live
+                .iter()
+                .map(|(id, entry)| SessionView {
+                    id: Some(*id),
+                    title: format!("세션 {id}"),
+                    status: Some(status_str(entry.status)),
+                    exited: entry.exited,
+                })
+                .collect(),
+        }];
+    }
+    workspaces
         .iter()
-        .map(|(id, entry)| SessionView {
-            id: *id,
-            title: entry.title.clone(),
-            status: status_str(entry.status),
-            exited: entry.exited,
+        .map(|ws| {
+            let sessions = if ws.state == WorkspaceState::Active {
+                let titles: BTreeMap<u64, &str> = ws
+                    .sessions
+                    .iter()
+                    .filter_map(|s| s.id.map(|id| (id, s.title.as_str())))
+                    .collect();
+                live.iter()
+                    .map(|(id, entry)| SessionView {
+                        id: Some(*id),
+                        title: titles
+                            .get(id)
+                            .map(|t| (*t).to_owned())
+                            .unwrap_or_else(|| format!("세션 {id}")),
+                        status: Some(status_str(entry.status)),
+                        exited: entry.exited,
+                    })
+                    .collect()
+            } else {
+                ws.sessions
+                    .iter()
+                    .map(|s| SessionView {
+                        id: None, // 표시 전용 — 세션 id는 worker-로컬
+                        title: s.title.clone(),
+                        status: s.status.map(status_str),
+                        exited: s.exited,
+                    })
+                    .collect()
+            };
+            WorkspaceView {
+                id: ws.id.clone(),
+                name: ws.name.clone(),
+                state: ws.state.as_str(),
+                sessions,
+            }
         })
         .collect()
 }
@@ -269,7 +351,11 @@ struct Inner {
     force_poll: bool,
     /// 활성 workspace worker 구독. 전환 시 [`DashboardHandle::set_runtime_source`]가 교체한다.
     receiver: Option<RuntimeEventReceiver>,
+    /// 활성 워크스페이스 세션의 **라이브 상태**(런타임 이벤트 유래 — egui 프레임과 무관).
     sessions: BTreeMap<u64, SessionEntry>,
+    /// 앱이 push한 워크스페이스 구성(활성+warm+유휴)과 세션 표시명. 상태가 바뀔 때만
+    /// 갱신된다 — 폰이 전체 워크스페이스를 보고, 이름이 프로젝트명으로 뜨는 근거.
+    workspaces: Vec<WorkspaceSeed>,
     resource: Option<ResourceView>,
     last_poll: Instant,
     /// 웹푸시 발송 싱크(P4). 이벤트 drain 시 세션 상태 전이(입력대기/완료)를 넘긴다 —
@@ -356,6 +442,7 @@ impl DashboardHandle {
                 force_poll: false,
                 receiver: None,
                 sessions: BTreeMap::new(),
+                workspaces: Vec::new(),
                 resource: None,
                 last_poll: Instant::now() - POLL_INTERVAL,
                 push_sink: None,
@@ -576,22 +663,33 @@ impl DashboardHandle {
     /// 구독 등록(동기) 사이 레이스로 MuxUpdated 재발화를 놓쳐도 옛 워크스페이스 세션이 남지
     /// 않게 한다. 이후 도착하는 이벤트는 증분 갱신이며, MuxUpdated의 or_insert는 시드된 항목을
     /// and_modify(제목만)로 건드리므로 시드된 상태를 기본값(Running)으로 덮어쓰지 않는다.
-    pub fn seed_sessions(&self, seeds: Vec<SessionSeed>) {
+    pub fn set_workspaces(&self, seeds: Vec<WorkspaceSeed>) {
         {
             let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
-            inner.sessions = seeds
-                .into_iter()
-                .map(|seed| {
-                    (
-                        seed.id,
-                        SessionEntry {
-                            title: seed.title,
-                            status: seed.status,
-                            exited: seed.exited,
-                        },
-                    )
-                })
-                .collect();
+            if inner.workspaces == seeds {
+                return; // 변화 없음 — 발행/웨이크 생략(프레임마다 호출돼도 비용 0)
+            }
+            // 활성 워크스페이스의 라이브 상태 맵을 스냅샷으로 시드한다 — 이벤트 스트림은
+            // edge-trigger라, 재구독(start_web·워크스페이스 전환)한 브리지는 과거 이력을
+            // 모른다. 통째 교체라 옛 워크스페이스 세션이 남지 않는다(P2 리뷰).
+            if let Some(active) = seeds.iter().find(|ws| ws.state == WorkspaceState::Active) {
+                inner.sessions = active
+                    .sessions
+                    .iter()
+                    .filter_map(|seed| {
+                        seed.id.map(|id| {
+                            (
+                                id,
+                                SessionEntry {
+                                    status: seed.status.unwrap_or(SessionStatus::Running),
+                                    exited: seed.exited,
+                                },
+                            )
+                        })
+                    })
+                    .collect();
+            }
+            inner.workspaces = seeds;
             inner.dirty = true;
         }
         self.shared.cvar.notify_all();
@@ -878,7 +976,7 @@ fn run(shared: &Arc<Shared>) {
         //    force_poll+dirty를 세우므로 그때 최신 스냅샷이 만들어진다.
         if conns > 0 {
             let dash_json = ServerMsg::Dashboard {
-                sessions: session_views(&inner.sessions),
+                workspaces: workspace_views(&inner.workspaces, &inner.sessions),
                 resource: inner.resource.clone(),
             }
             .encode();
@@ -936,13 +1034,60 @@ mod tests {
     }
 
     #[test]
-    fn mux가_세션_목록과_제목을_만든다() {
+    fn mux는_세션_소속을_만든다() {
+        // 제목은 앱 스냅샷(WorkspaceSeed) 몫 — mux는 소속(멤버십)만 정한다.
         let mut sessions = BTreeMap::new();
         let mut resource = None;
         apply_event(&mut sessions, &mut resource, &mux_event(&[(10, "claude")]));
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[&10].title, "claude");
         assert_eq!(sessions[&10].status, SessionStatus::Running);
+    }
+
+    /// 표시명은 앱 스냅샷에서 오고, mux의 raw 제목이 덮지 않는다 (폰에서 사람이 읽는 이름).
+    #[test]
+    fn 표시명은_앱_스냅샷에서_오고_비활성은_표시전용이다() {
+        let mut live = BTreeMap::new();
+        live.insert(
+            10,
+            SessionEntry {
+                status: SessionStatus::NeedsApproval,
+                exited: false,
+            },
+        );
+        let seeds = vec![
+            WorkspaceSeed {
+                id: "ws-1".into(),
+                name: "deppy-sijo".into(),
+                state: WorkspaceState::Active,
+                sessions: vec![SessionSeed {
+                    id: Some(10),
+                    title: "deppy-sijo".into(),
+                    status: Some(SessionStatus::Running),
+                    exited: false,
+                }],
+            },
+            WorkspaceSeed {
+                id: "ws-2".into(),
+                name: "source".into(),
+                state: WorkspaceState::Warm,
+                sessions: vec![SessionSeed {
+                    id: Some(10), // 앱이 실수로 id를 넣어도 브리지가 표시 전용으로 만든다
+                    title: "deppy-mux".into(),
+                    status: None,
+                    exited: false,
+                }],
+            },
+        ];
+        let views = workspace_views(&seeds, &live);
+        assert_eq!(views.len(), 2);
+        // 활성: 라이브 상태(needs_approval) + 앱이 해석한 표시명
+        assert_eq!(views[0].sessions[0].id, Some(10));
+        assert_eq!(views[0].sessions[0].title, "deppy-sijo");
+        assert_eq!(views[0].sessions[0].status, Some("needs_approval"));
+        // 비활성: 표시 전용(id 없음 — 세션 id는 worker-로컬이라 시청 불가)
+        assert_eq!(views[1].state, "warm");
+        assert_eq!(views[1].sessions[0].id, None);
+        assert_eq!(views[1].sessions[0].title, "deppy-mux");
     }
 
     #[test]
@@ -959,13 +1104,12 @@ mod tests {
             },
         );
         assert_eq!(sessions[&10].status, SessionStatus::NeedsApproval);
-        // 제목만 바뀌는 MuxUpdated가 상태를 리셋하지 않아야 한다
+        // 재발화된 MuxUpdated가 상태를 리셋하지 않아야 한다
         apply_event(
             &mut sessions,
             &mut resource,
             &mux_event(&[(10, "claude-2")]),
         );
-        assert_eq!(sessions[&10].title, "claude-2");
         assert_eq!(sessions[&10].status, SessionStatus::NeedsApproval);
     }
 

@@ -63,13 +63,31 @@ impl ClientMsg {
 }
 
 /// 세션 한 행(대시보드). `status`는 snake_case 문자열(런타임 SessionStatus 매핑).
+/// 제목은 앱이 해석한 표시명(프로젝트명 규칙 — 데스크톱 활동 패널과 동일)이다.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SessionView {
-    pub id: u64,
+    /// 활성 워크스페이스 세션만 id가 있다 — 시청/입력 대상. 비활성(warm/유휴)은
+    /// **표시 전용**: 세션 id는 worker-로컬이라 다른 워크스페이스 id로 시청하면
+    /// 엉뚱한 세션이 잡힌다(P5 리뷰 P2에서 확인한 앨리어싱).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
     pub title: String,
-    pub status: &'static str,
+    /// 감지된 상태(런타임 이벤트 유래). warm/유휴는 상태 추적이 없어 생략된다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<&'static str>,
     /// 종료(SessionExited/Restored 관측) — 완료 배지용.
     pub exited: bool,
+}
+
+/// 워크스페이스 한 묶음(대시보드). 활성 1개 + warm/유휴 N개 — 데스크톱 활동 패널과
+/// 같은 구성으로, 폰에서도 전체 워크스페이스가 보인다.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkspaceView {
+    pub id: String,
+    pub name: String,
+    /// "active" | "warm" | "idle"
+    pub state: &'static str,
+    pub sessions: Vec<SessionView>,
 }
 
 /// 앱 프로세스 리소스 요약(대시보드). rss는 표시 편의상 MB.
@@ -124,9 +142,10 @@ pub struct LineView {
 pub enum ServerMsg {
     /// 인증 성공 직후 1회.
     Welcome { v: u32 },
-    /// 세션 상태/리소스 스냅샷(런타임 이벤트 유래).
+    /// 워크스페이스별 세션 목록 + 리소스 스냅샷. 활성 워크스페이스의 상태는 런타임
+    /// 이벤트 유래(프레임 독립), 제목·비활성 워크스페이스는 앱 스냅샷 유래.
     Dashboard {
-        sessions: Vec<SessionView>,
+        workspaces: Vec<WorkspaceView>,
         resource: Option<ResourceView>,
     },
     /// 승인 대기 목록(DB 폴링 유래).
@@ -614,12 +633,31 @@ mod tests {
         assert_eq!(welcome, r#"{"type":"welcome","v":1}"#);
 
         let dash = ServerMsg::Dashboard {
-            sessions: vec![SessionView {
-                id: 7,
-                title: "claude".into(),
-                status: "needs_approval",
-                exited: false,
-            }],
+            workspaces: vec![
+                WorkspaceView {
+                    id: "ws-1".into(),
+                    name: "deppy-sijo".into(),
+                    state: "active",
+                    sessions: vec![SessionView {
+                        id: Some(7),
+                        title: "claude".into(),
+                        status: Some("needs_approval"),
+                        exited: false,
+                    }],
+                },
+                WorkspaceView {
+                    id: "ws-2".into(),
+                    name: "source".into(),
+                    state: "warm",
+                    // 표시 전용 — id/status 없음(직렬화에서 생략된다)
+                    sessions: vec![SessionView {
+                        id: None,
+                        title: "deppy-mux".into(),
+                        status: None,
+                        exited: false,
+                    }],
+                },
+            ],
             resource: Some(ResourceView {
                 cpu: Some(12.5),
                 rss_mb: 340,
@@ -629,6 +667,11 @@ mod tests {
         assert!(dash.contains(r#""type":"dashboard""#), "{dash}");
         assert!(dash.contains(r#""status":"needs_approval""#), "{dash}");
         assert!(dash.contains(r#""rss_mb":340"#), "{dash}");
+        assert!(dash.contains(r#""state":"warm""#), "{dash}");
+        // 비활성 세션은 id/status가 아예 실리지 않는다(클라가 "보기" 버튼을 안 만든다)
+        let warm_part = dash.split(r#""name":"source""#).nth(1).unwrap();
+        assert!(!warm_part.contains(r#""id":"#), "{dash}");
+        assert!(!warm_part.contains(r#""status":"#), "{dash}");
 
         let appr = ServerMsg::Approvals {
             pending: vec![ApprovalView {

@@ -2031,10 +2031,10 @@ impl App {
             server.set_runtime_command_sink(sink);
         }
         server.set_runtime_source(receiver);
-        // 구독 등록 직후 현재 세션 상태를 시드한다 — 이벤트 스트림은 edge-trigger라, 재구독한
-        // 대시보드는 과거 이력을 모른다. 시드가 없으면 이미 needs_approval로 정착한 세션이
-        // 다음 상태 변화까지 "실행 중"으로 오표시된다(계획 P2 리뷰: 킬러 기능 훼손).
-        server.seed_sessions(self.web_session_seed());
+        // 구독 등록 직후 전체 워크스페이스 스냅샷을 시드한다 — 이벤트 스트림은 edge-trigger라,
+        // 재구독한 대시보드는 과거 이력을 모른다. 시드가 없으면 이미 needs_approval로 정착한
+        // 세션이 다음 상태 변화까지 "실행 중"으로 오표시된다(계획 P2 리뷰: 킬러 기능 훼손).
+        server.set_workspaces(self.web_workspace_seed());
         Ok(WebRemoteState { server, token })
     }
 
@@ -2052,39 +2052,109 @@ impl App {
                 web.server.set_runtime_command_sink(sink);
             }
             web.server.set_runtime_source(receiver);
-            // 재구독 직후 새 워크스페이스의 현재 세션 상태를 시드한다(start_web과 동일 이유 +
-            // 세션 맵 통째 교체로 옛 워크스페이스 세션 정체/전환 레이스까지 해소 — P2 리뷰).
-            web.server.seed_sessions(self.web_session_seed());
+            // 재구독 직후 새 워크스페이스 스냅샷을 시드한다(start_web과 동일 이유 + 세션 맵
+            // 통째 교체로 옛 워크스페이스 세션 정체/전환 레이스까지 해소 — P2 리뷰).
+            web.server.set_workspaces(self.web_workspace_seed());
         }
     }
 
-    /// 웹 대시보드 시드용 현재 활성 워크스페이스의 세션 스냅샷을 만든다(세션 id/제목/상태/exited).
-    /// GUI 배지가 쓰는 `session_entries`를 재사용하되, 대시보드 상태는 런타임 감지 이벤트에서만
-    /// 오므로(앱의 transcript/hook 병합은 브리지에 안 보임) 병합 맵은 비워 넘겨 순수 감지 상태를
-    /// 시드한다 — 이후 브리지 갱신과 일관된다. 브라우저는 innerHTML 금지라 제목은 그대로 안전.
-    fn web_session_seed(&self) -> Vec<web_remote::dashboard::SessionSeed> {
+    /// 웹 대시보드용 **전체 워크스페이스** 스냅샷 — 활성 1개 + warm/유휴 N개.
+    /// 데스크톱 활동 패널(activity_rows)과 같은 원천·같은 이름 규칙을 쓴다: 세션 표시명은
+    /// 기본 제목이면 프로젝트명으로 해석되고(activity_session_name / resolve_session_title),
+    /// 사용자가 rename했으면 그대로다 — 폰에서도 "workspace.spawn.shell 140"이 아니라
+    /// 사람이 읽는 이름이 보인다.
+    ///
+    /// 활성 세션만 id를 싣는다(시청/입력 대상). warm/유휴는 표시 전용 — 세션 id는
+    /// worker-로컬이라 다른 워크스페이스 id로 시청하면 엉뚱한 세션이 잡힌다(P5 리뷰 P2).
+    ///
+    /// 활성 워크스페이스 상태는 런타임 감지 이벤트에서만 오므로(앱의 transcript/hook 병합은
+    /// 브리지에 안 보임) 병합 맵은 비워 넘겨 순수 감지 상태를 시드한다 — 브리지의 이벤트
+    /// 갱신과 일관된다. 브라우저는 innerHTML 금지라 제목 문자열은 그대로 안전하다.
+    fn web_workspace_seed(&self) -> Vec<web_remote::dashboard::WorkspaceSeed> {
+        use web_remote::dashboard::{SessionSeed, WorkspaceSeed, WorkspaceState};
         let empty_activity = std::collections::HashMap::new();
         let empty_needs_input = std::collections::HashSet::new();
         let empty_turn_done = std::collections::HashMap::new();
-        self.active
-            .workspace_ui
-            .session_entries(
-                &self.i18n,
-                &empty_activity,
-                &empty_needs_input,
-                &empty_turn_done,
-            )
-            .into_iter()
-            .filter_map(|entry| {
-                let session = entry.session?;
-                Some(web_remote::dashboard::SessionSeed {
-                    id: session.0,
-                    title: entry.title,
-                    status: entry.status.unwrap_or(runtime::SessionStatus::Running),
-                    exited: self.active.live.exited_sessions.contains(&session),
-                })
+        self.workspaces
+            .iter()
+            .map(|ws| {
+                if ws.id == self.active.id {
+                    let sessions = self
+                        .active
+                        .workspace_ui
+                        .session_entries(
+                            &self.i18n,
+                            &empty_activity,
+                            &empty_needs_input,
+                            &empty_turn_done,
+                        )
+                        .into_iter()
+                        .filter_map(|entry| {
+                            let session = entry.session?;
+                            Some(SessionSeed {
+                                id: Some(session.0),
+                                title: entry.title,
+                                status: Some(
+                                    entry.status.unwrap_or(runtime::SessionStatus::Running),
+                                ),
+                                exited: self.active.live.exited_sessions.contains(&session),
+                            })
+                        })
+                        .collect();
+                    return WorkspaceSeed {
+                        id: ws.id.clone(),
+                        name: Self::workspace_display_name(ws),
+                        state: WorkspaceState::Active,
+                        sessions,
+                    };
+                }
+                // warm/유휴 — 감지 워커가 안 돌아 상태는 없다. 이름만 활동 패널과 동일 규칙.
+                let (state, raw_titles): (WorkspaceState, Vec<String>) = match self.warm.get(&ws.id)
+                {
+                    Some(rt) => {
+                        let mut ids: Vec<_> = rt.session_titles.keys().copied().collect();
+                        ids.sort_by_key(|s| s.0);
+                        let titles = ids
+                            .iter()
+                            .filter_map(|s| rt.session_titles.get(s).cloned())
+                            .collect();
+                        (WorkspaceState::Warm, titles)
+                    }
+                    None => (
+                        WorkspaceState::Idle,
+                        self.persisted_activity_panes
+                            .get(&ws.id)
+                            .into_iter()
+                            .flatten()
+                            .map(|(title, _cwd)| title.clone())
+                            .collect(),
+                    ),
+                };
+                WorkspaceSeed {
+                    id: ws.id.clone(),
+                    name: Self::workspace_display_name(ws),
+                    state,
+                    sessions: raw_titles
+                        .into_iter()
+                        .map(|raw| SessionSeed {
+                            id: None, // 표시 전용
+                            title: self.activity_session_name(&ws.id, &raw),
+                            status: None,
+                            exited: false,
+                        })
+                        .collect(),
+                }
             })
             .collect()
+    }
+
+    /// 워크스페이스 스냅샷을 웹 대시보드에 반영한다(변화가 없으면 브리지가 조용히 무시).
+    /// 세션 spawn/종료·제목 해석·warm 전환마다 프레임에서 호출된다 — 비교 후 변화 시에만
+    /// 발행되므로 유휴 비용은 0이다.
+    fn sync_web_workspaces(&self) {
+        if let Some(web) = &self.web {
+            web.server.set_workspaces(self.web_workspace_seed());
+        }
     }
 
     /// settings 토글 on: 웹서버를 켜고 성공 시 config에 의도를 영속한다 (remote_enable 관례).
@@ -3519,6 +3589,11 @@ impl eframe::App for App {
         // 에이전트 감지 워커 입력 갱신 + 결과 드레인 — ui()가 아닌 여기(logic)에서 해야
         // hidden/minimized로 ui()가 스킵돼도 결과 채널이 누적되지 않는다(codex 리뷰).
         self.poll_agent_detect();
+
+        // 폰 대시보드가 볼 워크스페이스 스냅샷(전체 + 해석된 세션 이름) 동기화.
+        // ui()가 아닌 logic()에서 — 창이 숨겨져도 폰에는 최신 구성이 보여야 한다.
+        // 브리지가 변화 없으면 무시하므로(값 비교) 유휴 프레임 비용은 사실상 0이다.
+        self.sync_web_workspaces();
     }
 
     // egui 0.35부터 update(&Context) 대신 ui(&mut Ui) 시그니처를 쓴다.

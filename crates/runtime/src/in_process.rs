@@ -157,6 +157,10 @@ impl InProcessRuntimeClient {
                             }
                         },
                     );
+                // 증분 예산 캐시 시드 — 이전 실행/재시작이 남긴 디스크 아카이브 총량을
+                // 워커당 1회 읽기 전용 스캔으로 복원한다 (A1 리뷰 P2). 이후 exit는
+                // 이 캐시에 증분만 더하고 예산 초과 시에만 전체 스캔(gc)한다.
+                let archive_disk_bytes = storage::scrollback_archive::scan_total(&logs_root);
                 Worker {
                     command_rx,
                     subscribers: worker_subscribers,
@@ -188,6 +192,7 @@ impl InProcessRuntimeClient {
                     archived: std::collections::HashMap::new(),
                     archived_order: std::collections::VecDeque::new(),
                     archived_on_disk: std::collections::HashSet::new(),
+                    archive_disk_bytes,
                     hidden_scrollback: std::collections::HashSet::new(),
                     render_active: true,
                     suspended: false,
@@ -379,6 +384,10 @@ struct Worker {
     /// 디스크 아카이브(scrollback.zlib)가 있는 세션들 (PR-A1) — 메모리 아카이브가
     /// 예산 축출돼도 디스크에서 복원 가능함을 fs stat 없이 판정한다.
     archived_on_disk: std::collections::HashSet<SessionId>,
+    /// 디스크 아카이브 총 바이트의 증분 캐시 (A1 리뷰 P2). 워커 시작 시 1회 스캔으로
+    /// 시드하고, 기록 성공마다 그 파일 크기만 더한다. 예산 초과가 확정될 때만 gc를
+    /// 호출(그때만 전체 디렉터리 스캔+제거)해 매 exit 전체 스캔 비용을 없앤다.
+    archive_disk_bytes: u64,
     /// 현재 hidden scrollback cap이 적용된 running 세션들 (§14.3) — 전이 감지용.
     hidden_scrollback: std::collections::HashSet<SessionId>,
     /// Active면 visible pane snapshot 생성, false(Warm 등)면 중단 (§14.1). 세션은 유지.
@@ -406,6 +415,13 @@ fn archive_kind_from_u8(byte: u8) -> session::SessionKind {
         1 => session::SessionKind::Agent,
         _ => session::SessionKind::Shell,
     }
+}
+
+/// 증분 예산 캐시만으로 예산 초과를 판정한다 (A1 리뷰 P2) — true면 gc(전체 스캔)가
+/// 필요하다. 전체 디렉터리 스캔 없이 캐시+이번 기록 크기로만 결정하는 순수 함수라
+/// 단위 테스트로 "스캔 없이 정확히 감지"를 검증한다.
+fn archive_cache_needs_gc(cached_bytes: u64, written_len: u64, budget: u64) -> bool {
+    cached_bytes.saturating_add(written_len) > budget
 }
 
 /// 압축 아카이브 항목 — 백엔드를 내린 exited 세션의 복원 재료 (§14.3 확장).
@@ -2230,16 +2246,31 @@ impl Worker {
             },
         };
         match storage::scrollback_archive::write(&self.logs_root, &key, &meta, &redacted) {
-            Ok(()) => {
+            Ok(written_len) => {
                 self.archived_on_disk.insert(session);
-                if let Err(e) = storage::scrollback_archive::gc(
-                    &self.logs_root,
-                    storage::scrollback_archive::ARCHIVE_DISK_BUDGET_BYTES,
-                ) {
-                    tracing::warn!("scrollback 아카이브 GC 실패: {e:#}");
-                }
+                self.account_archive_write(written_len);
             }
             Err(e) => tracing::warn!(session = session.0, "scrollback 아카이브 기록 실패: {e:#}"),
+        }
+    }
+
+    /// 디스크 아카이브 기록 후 증분 예산 캐시를 갱신한다 (A1 리뷰 P2). 예산 내면
+    /// 전체 스캔 없이 크기만 더하고, 초과가 확정될 때만 gc(전체 스캔+오래된 것부터
+    /// 제거)를 호출해 캐시를 실제 총량으로 재동기화한다. 이로써 매 exit의 GC 비용이
+    /// "지금까지 존재한 세션 수"에 비례하는 문제를 없앤다.
+    fn account_archive_write(&mut self, written_len: u64) {
+        let budget = storage::scrollback_archive::ARCHIVE_DISK_BUDGET_BYTES;
+        if archive_cache_needs_gc(self.archive_disk_bytes, written_len, budget) {
+            match storage::scrollback_archive::gc(&self.logs_root, budget) {
+                Ok(total) => self.archive_disk_bytes = total,
+                Err(e) => {
+                    // 스캔 실패 — 기록한 만큼은 반영해 undercount를 막는다 (다음 기록에서 재시도).
+                    tracing::warn!("scrollback 아카이브 GC 실패: {e:#}");
+                    self.archive_disk_bytes = self.archive_disk_bytes.saturating_add(written_len);
+                }
+            }
+        } else {
+            self.archive_disk_bytes = self.archive_disk_bytes.saturating_add(written_len);
         }
     }
 
@@ -3849,6 +3880,25 @@ mod tests {
         assert_eq!(persist::reconcile_orphan_sessions(&conn).unwrap(), 0);
         drop(conn);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A1 리뷰 P2: 증분 캐시가 전체 디렉터리 스캔 없이 예산 초과를 정확히 감지한다.
+    /// 예산 내 기록은 gc 불필요(false, 스캔 없이 증분만), 초과 확정 시에만 true(전체 스캔).
+    #[test]
+    fn 증분_캐시는_스캔없이_예산초과만_gc를_요구한다() {
+        let budget = 100u64;
+        // 예산 내 — 스캔 없이 증분만 (gc 불필요)
+        assert!(!archive_cache_needs_gc(50, 40, budget));
+        assert!(
+            !archive_cache_needs_gc(0, 100, budget),
+            "경계(=예산)는 초과 아님"
+        );
+        assert!(!archive_cache_needs_gc(99, 1, budget));
+        // 예산 초과 확정 — 이때만 gc(전체 스캔+제거) 요구
+        assert!(archive_cache_needs_gc(50, 51, budget));
+        assert!(archive_cache_needs_gc(budget, 1, budget));
+        // 오버플로 안전 (saturating) — 초과로 판정
+        assert!(archive_cache_needs_gc(u64::MAX, 1, budget));
     }
 
     /// PR-A1: 세션 exit 시 최종 grid가 디스크 아카이브(scrollback.zlib)로 기록되고,

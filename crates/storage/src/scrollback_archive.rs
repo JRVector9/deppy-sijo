@@ -50,12 +50,14 @@ pub fn exists(logs_root: &Path, session_key: &str) -> bool {
 }
 
 /// redaction이 끝난 ANSI 덤프를 압축해 원자적으로 기록한다 (tmp+rename).
+/// 반환: 디스크에 기록된 파일 바이트 수 (헤더+zlib) — 호출측 증분 예산 캐시가
+/// metadata() 호출 없이 더할 수 있게 한다 (A1 리뷰 P2).
 pub fn write(
     logs_root: &Path,
     session_key: &str,
     meta: &ArchiveMeta,
     redacted_ansi: &[u8],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<u64> {
     anyhow::ensure!(
         redacted_ansi.len() <= MAX_UNCOMPRESSED_BYTES as usize,
         "scrollback 아카이브 크기 초과: {} bytes",
@@ -100,7 +102,7 @@ pub fn write(
         let _ = std::fs::remove_file(&tmp);
         format!("아카이브 rename 실패: {}", path.display())
     })?;
-    Ok(())
+    Ok(bytes.len() as u64)
 }
 
 /// 아카이브를 읽어 (메타, redacted ANSI 덤프)를 돌려준다.
@@ -163,12 +165,14 @@ fn parse(bytes: &[u8]) -> Option<(ArchiveMeta, Vec<u8>)> {
     ))
 }
 
-/// logs_root 아래 아카이브 총량이 예산을 넘으면 mtime 오래된 것부터 삭제한다.
-/// 로그 3종(redacted.*)은 건드리지 않는다 — 대상은 scrollback.zlib뿐.
-pub fn gc(logs_root: &Path, budget_bytes: u64) -> anyhow::Result<()> {
+/// logs_root 아래 각 세션 디렉터리의 scrollback.zlib를 (mtime, len, path)로 모은다.
+/// logs_root 부재는 빈 목록으로 취급한다 (scan_total·gc 공용 스캔).
+fn collect_archives(
+    logs_root: &Path,
+) -> anyhow::Result<Vec<(std::time::SystemTime, u64, PathBuf)>> {
     let entries = match std::fs::read_dir(logs_root) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error).context("logs_root 나열 실패"),
     };
     let mut archives: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
@@ -179,9 +183,26 @@ pub fn gc(logs_root: &Path, budget_bytes: u64) -> anyhow::Result<()> {
             archives.push((mtime, meta.len(), path));
         }
     }
+    Ok(archives)
+}
+
+/// logs_root 아래 아카이브 총 바이트를 센다 (읽기 전용 — 삭제하지 않는다).
+/// 워커 시작 시 증분 예산 캐시를 1회 시드하는 용도 (A1 리뷰 P2). 나열 실패는 0으로
+/// 간주한다 — 이후 예산 초과 확정 시 gc의 실제 스캔이 캐시를 보정한다.
+pub fn scan_total(logs_root: &Path) -> u64 {
+    collect_archives(logs_root)
+        .map(|archives| archives.iter().map(|(_, len, _)| *len).sum())
+        .unwrap_or(0)
+}
+
+/// logs_root 아래 아카이브 총량이 예산을 넘으면 mtime 오래된 것부터 삭제한다.
+/// 로그 3종(redacted.*)은 건드리지 않는다 — 대상은 scrollback.zlib뿐.
+/// 반환: 정리 후 현재 아카이브 총 바이트 — 호출측 증분 예산 캐시 재동기화용 (A1 리뷰 P2).
+pub fn gc(logs_root: &Path, budget_bytes: u64) -> anyhow::Result<u64> {
+    let mut archives = collect_archives(logs_root)?;
     let mut total: u64 = archives.iter().map(|(_, len, _)| *len).sum();
     if total <= budget_bytes {
-        return Ok(());
+        return Ok(total);
     }
     archives.sort_by_key(|(mtime, _, _)| *mtime);
     for (_, len, path) in archives {
@@ -196,7 +217,7 @@ pub fn gc(logs_root: &Path, budget_bytes: u64) -> anyhow::Result<()> {
             Err(e) => tracing::warn!(path = %path.display(), "아카이브 GC 삭제 실패: {e:#}"),
         }
     }
-    Ok(())
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -228,7 +249,14 @@ mod tests {
     fn 라운드트립() {
         let root = temp_root();
         let dump = "한글 \x1b[31mred\x1b[0m line\r\nnext".as_bytes();
-        write(&root, "uuid-1", &meta(), dump).unwrap();
+        let written = write(&root, "uuid-1", &meta(), dump).unwrap();
+        // write 반환값은 디스크 파일 크기와 일치해야 한다 (증분 캐시가 이 값을 더한다).
+        let on_disk = archive_path(&root, "uuid-1")
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .len();
+        assert_eq!(written, on_disk);
         let (read_meta, read_dump) = read(&root, "uuid-1").unwrap().unwrap();
         assert_eq!(read_meta, meta());
         assert_eq!(read_dump, dump);
@@ -289,10 +317,25 @@ mod tests {
             .metadata()
             .unwrap()
             .len();
-        gc(&root, one * 2).unwrap(); // 3개 중 2개 예산 → 가장 오래된 1개 제거
+        let total_after = gc(&root, one * 2).unwrap(); // 3개 중 2개 예산 → 가장 오래된 1개 제거
         assert!(!archive_path(&root, "old").unwrap().exists());
         assert!(archive_path(&root, "mid").unwrap().exists());
         assert!(archive_path(&root, "new").unwrap().exists());
         assert!(log.exists(), "로그 파일 불가침");
+        // gc는 정리 후 총 바이트를 돌려준다 (증분 캐시 재동기화용) — 남은 2개 = 2*one.
+        assert_eq!(total_after, one * 2);
+    }
+
+    #[test]
+    fn scan_total은_아카이브_크기_합만_세고_로그는_제외한다() {
+        let root = temp_root();
+        assert_eq!(scan_total(&root.join("nonexistent")), 0, "부재 루트는 0");
+        let payload = vec![b'x'; 4096];
+        let a = write(&root, "s1", &meta(), &payload).unwrap();
+        let b = write(&root, "s2", &meta(), &payload).unwrap();
+        // 같은 세션 디렉터리의 로그 파일은 scan_total 대상이 아니다.
+        std::fs::write(root.join("s1").join("redacted.ansi.log"), b"log noise").unwrap();
+        // 재시드: 이미 존재하는 아카이브 총량을 정확히 복원한다 (워커 재생성 시드 경로).
+        assert_eq!(scan_total(&root), a + b);
     }
 }

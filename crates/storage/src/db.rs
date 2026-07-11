@@ -212,6 +212,20 @@ ALTER TABLE credentials ADD COLUMN workspace_id TEXT;
     "
 ALTER TABLE credentials ADD COLUMN oauth_json TEXT;
 ",
+    // v21: 웹푸시(VAPID) 구독 — PR-P4. 폰이 앱(브라우저)을 닫아도 승인 요청을 푸시로 알린다.
+    //      endpoint가 PK(푸시 서비스가 준 고유 URL). p256dh/auth는 브라우저 pushManager가
+    //      건넨 RFC 8291 암호화 파라미터(base64url) — 비밀 아닌 이 기기 전용 공개값이라
+    //      credential/keyring이 아니라 여기 평문으로 둔다. last_ok_at은 마지막 발송 성공 시각
+    //      (진단·정리용). 발송 시 410/404를 받으면 web-remote push.rs가 이 행을 즉시 지운다.
+    "
+CREATE TABLE web_push_subscriptions (
+    endpoint TEXT PRIMARY KEY,
+    p256dh TEXT NOT NULL,
+    auth TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    last_ok_at INTEGER
+);
+",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -265,6 +279,18 @@ pub struct WorkspaceRow {
 
 /// 권한 규칙/승인 IPC 타입은 mcp-store 소유(v2.8) — 기존 storage:: 경로 호환을 위해 재수출.
 pub use mcp_store::{ApprovalOutcome, ApprovalStatus, PendingApprovalRow, PermissionRuleRow};
+
+/// 웹푸시(VAPID) 구독 한 행 (v21). web-remote push.rs가 발송 대상으로 읽는다. 세 값 모두
+/// 브라우저 pushManager가 건넨 이 기기 전용 공개 파라미터라 비밀이 아니다(원문 secret 없음).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebPushSubscriptionRow {
+    /// 푸시 서비스가 준 고유 endpoint URL(PK) — 발송 POST 대상.
+    pub endpoint: String,
+    /// base64url p256dh(수신자 공개키) — RFC 8291 암호화 입력.
+    pub p256dh: String,
+    /// base64url auth secret(16바이트) — RFC 8291 암호화 입력.
+    pub auth: String,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnvProfileRow {
@@ -1231,6 +1257,81 @@ impl Db {
         resolved_before_epoch_secs: i64,
     ) -> anyhow::Result<usize> {
         mcp_store::prune_resolved_approvals(&self.conn, resolved_before_epoch_secs)
+    }
+
+    /// 웹푸시 구독 등록/갱신 (v21, PR-P4). 같은 endpoint로 재구독하면 키만 갱신하고
+    /// created_at은 보존한다(브라우저가 키를 회전해도 최초 등록 시각 유지). last_ok_at은
+    /// 갱신 시 손대지 않는다 — 발송 성공만이 갱신한다.
+    pub fn upsert_web_push_subscription(
+        &self,
+        endpoint: &str,
+        p256dh: &str,
+        auth: &str,
+        created_at: i64,
+    ) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO web_push_subscriptions (endpoint, p256dh, auth, created_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(endpoint) DO UPDATE SET
+                   p256dh = excluded.p256dh,
+                   auth = excluded.auth",
+                (endpoint, p256dh, auth, created_at),
+            )
+            .context("웹푸시 구독 저장 실패")?;
+        Ok(())
+    }
+
+    /// 전체 웹푸시 구독 목록 (발송 대상). 등록순(created_at, endpoint)으로 결정적 정렬.
+    pub fn list_web_push_subscriptions(&self) -> anyhow::Result<Vec<WebPushSubscriptionRow>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT endpoint, p256dh, auth FROM web_push_subscriptions
+             ORDER BY created_at, endpoint",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(WebPushSubscriptionRow {
+                endpoint: row.get(0)?,
+                p256dh: row.get(1)?,
+                auth: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// 웹푸시 구독 삭제 (발송이 410 Gone/404 Not Found를 받은 죽은 구독 정리).
+    pub fn delete_web_push_subscription(&self, endpoint: &str) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM web_push_subscriptions WHERE endpoint = ?1",
+                [endpoint],
+            )
+            .context("웹푸시 구독 삭제 실패")?;
+        Ok(())
+    }
+
+    /// 발송 성공 시각(last_ok_at) 갱신 — 진단/정리용.
+    pub fn touch_web_push_subscription(
+        &self,
+        endpoint: &str,
+        last_ok_at: i64,
+    ) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE web_push_subscriptions SET last_ok_at = ?2 WHERE endpoint = ?1",
+                (endpoint, last_ok_at),
+            )
+            .context("웹푸시 구독 last_ok_at 갱신 실패")?;
+        Ok(())
+    }
+
+    /// 현재 구독 수 — 발송 스레드의 폴링 게이트(구독 0이면 폴링 정지)에 쓴다.
+    pub fn count_web_push_subscriptions(&self) -> anyhow::Result<i64> {
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM web_push_subscriptions", [], |row| {
+                    row.get(0)
+                })?;
+        Ok(count)
     }
 
     /// tool 실행 감사 기록 (PR-16). encryptor를 넘기면 전체 입력이 암호화 저장된다 (§7).
@@ -2582,6 +2683,77 @@ mod tests {
         assert!(!listed[0].inherit_env);
         drop(db);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn v20에서_v21로_업그레이드된다() {
+        let dir = std::env::temp_dir().join(format!("deppy-mig-20to21-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite3");
+        // user_version=20 (web_push_subscriptions 이전) 구버전 DB 구성
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..20] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 20).unwrap();
+        }
+        // 오픈 → IMMEDIATE 트랜잭션으로 migration 21 적용. 기존 데이터(무손실) 확인용으로
+        // v20까지 존재하던 credentials에 행을 하나 넣어 두고, 마이그레이션 후에도 남는지 본다.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO credentials
+                   (id, provider, label, credential_kind, keyring_service, keyring_username,
+                    created_at, updated_at)
+                 VALUES ('c1','p','l','k','s','u','t','t')",
+                [],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(Db::read_user_version(&db.conn).unwrap(), MIGRATIONS.len());
+        // 무손실: v20 데이터가 그대로 남아 있다
+        assert_eq!(db.list_credentials().unwrap().len(), 1);
+        // 새 테이블이 실제로 사용 가능 (upsert/list/touch/delete round-trip)
+        db.upsert_web_push_subscription("https://push.example/a", "p256", "auth", 100)
+            .unwrap();
+        let subs = db.list_web_push_subscriptions().unwrap();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].endpoint, "https://push.example/a");
+        assert_eq!(subs[0].p256dh, "p256");
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn 웹푸시_구독_등록_갱신_삭제_왕복() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(db.count_web_push_subscriptions().unwrap(), 0);
+        db.upsert_web_push_subscription("https://push/x", "key1", "auth1", 10)
+            .unwrap();
+        db.upsert_web_push_subscription("https://push/y", "key2", "auth2", 20)
+            .unwrap();
+        assert_eq!(db.count_web_push_subscriptions().unwrap(), 2);
+        // 같은 endpoint 재구독은 키만 갱신하고 행 수는 그대로(created_at 보존)
+        db.upsert_web_push_subscription("https://push/x", "key1b", "auth1b", 99)
+            .unwrap();
+        assert_eq!(db.count_web_push_subscriptions().unwrap(), 2);
+        let list = db.list_web_push_subscriptions().unwrap();
+        // created_at 정렬: x(10) 먼저, y(20) 다음 — 재구독이 created_at을 바꾸지 않았다
+        assert_eq!(list[0].endpoint, "https://push/x");
+        assert_eq!(list[0].p256dh, "key1b");
+        assert_eq!(list[0].auth, "auth1b");
+        // 발송 성공 시각 갱신은 목록에 영향 없음
+        db.touch_web_push_subscription("https://push/x", 12345)
+            .unwrap();
+        // 410 정리: 죽은 구독 삭제
+        db.delete_web_push_subscription("https://push/x").unwrap();
+        assert_eq!(db.count_web_push_subscriptions().unwrap(), 1);
+        assert_eq!(
+            db.list_web_push_subscriptions().unwrap()[0].endpoint,
+            "https://push/y"
+        );
     }
 
     #[test]

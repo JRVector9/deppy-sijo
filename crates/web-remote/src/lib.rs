@@ -31,6 +31,7 @@ pub mod dashboard;
 pub mod http;
 pub mod pairing;
 pub mod protocol;
+pub mod push;
 pub mod static_srv;
 pub mod ws_api;
 
@@ -57,6 +58,9 @@ pub struct ServeOptions {
     pub allowed_host: Option<String>,
     /// 승인 대시보드용 자체 DB 경로(P2). None이면 상태 대시보드만 동작하고 승인은 빈 목록.
     pub db_path: Option<std::path::PathBuf>,
+    /// 웹푸시(P4) VAPID 키. app이 keyring에서 get_or_create해 주입한다(SecretStore 접근이 app
+    /// 소유). None이거나 `db_path`가 None이면 푸시 비활성(대시보드만 동작).
+    pub vapid: Option<push::VapidKey>,
 }
 
 /// 접속 스레드들이 공유하는 불변 컨텍스트.
@@ -66,6 +70,8 @@ struct ConnCtx {
     allowed_host: Option<String>,
     /// WS 대시보드 브리지 핸들(승인 resolve·이벤트 구독·발행 스냅샷 공유).
     dashboard: dashboard::DashboardHandle,
+    /// 웹푸시 핸들(P4) — POST /push/subscribe 등록·공개키 노출. 비활성 시 None.
+    push: Option<push::PushHandle>,
     /// shutdown 신호 — 장수 WS 접속이 tick마다 확인해 즉시 종료한다.
     stop: Arc<AtomicBool>,
 }
@@ -100,6 +106,8 @@ pub struct WebRemoteServer {
     dashboard: dashboard::DashboardHandle,
     /// 브리지 스레드 join 대상 — shutdown 시 stop 후 join한다.
     dashboard_thread: Option<JoinHandle<()>>,
+    /// 웹푸시 발송 매니저(P4) — 전용 스레드 소유. shutdown 시 stop+join. 비활성 시 None.
+    push: Option<push::PushManager>,
 }
 
 impl WebRemoteServer {
@@ -124,7 +132,24 @@ impl WebRemoteServer {
             Condvar::new(),
         ));
         // WS 대시보드 브리지 스레드. OFF(서버 미생성)면 이 스레드도 없다 — 리소스 0.
-        let (dashboard, dashboard_thread) = dashboard::DashboardHandle::spawn(options.db_path);
+        let (dashboard, dashboard_thread) =
+            dashboard::DashboardHandle::spawn(options.db_path.clone());
+        // 웹푸시(P4) — VAPID 키 + DB 경로가 모두 있을 때만 발송 스레드를 띄운다. 자체 DB 연결로
+        // 구독 CRUD·승인 폴링을 하고(대시보드와 별도), 상태 알림은 대시보드 브리지가 넘긴다.
+        let push = match (options.db_path, options.vapid) {
+            (Some(path), Some(vapid)) => match push::PushManager::spawn(path, vapid) {
+                Ok(manager) => {
+                    dashboard.set_push_sink(manager.handle());
+                    Some(manager)
+                }
+                Err(e) => {
+                    tracing::warn!("web-remote 웹푸시 비활성(발송 스레드 생성 실패): {e:#}");
+                    None
+                }
+            },
+            _ => None,
+        };
+        let push_handle = push.as_ref().map(|manager| manager.handle());
         let ctx = Arc::new(ConnCtx {
             token: options.token,
             allowed_host: options
@@ -132,6 +157,7 @@ impl WebRemoteServer {
                 .map(|host| host.trim().to_ascii_lowercase())
                 .filter(|host| !host.is_empty()),
             dashboard: dashboard.clone(),
+            push: push_handle,
             stop: Arc::clone(&stop),
         });
         let accept_thread =
@@ -144,6 +170,7 @@ impl WebRemoteServer {
             connections,
             dashboard,
             dashboard_thread: Some(dashboard_thread),
+            push,
         })
     }
 
@@ -213,6 +240,10 @@ impl WebRemoteServer {
         self.dashboard.stop();
         if let Some(handle) = self.dashboard_thread.take() {
             let _ = handle.join();
+        }
+        // 웹푸시 발송 스레드도 정지·join한다(발송 중이던 요청은 타임아웃까지 이어질 수 있다).
+        if let Some(push) = self.push.take() {
+            push.stop_and_join();
         }
         tracing::info!(addr = %self.addr, "web-remote 서버 정지");
     }
@@ -382,6 +413,37 @@ fn handle_connection(stream: TcpStream, ctx: &ConnCtx, connections: &Arc<ConnSet
             return false;
         }
     };
+    // POST 본문은 into_inner(버퍼 폐기) 전에 읽는다 — BufReader에 선입된 본문 바이트를 보존.
+    // 본문을 받는 유일한 경로는 웹푸시 구독 등록(P4 — POST /push/subscribe)이다.
+    let body: Vec<u8> = if head.method == "POST" {
+        match head.content_length() {
+            Some(len) if len > http::MAX_BODY_BYTES => {
+                respond(
+                    reader.into_inner().inner,
+                    &http::Response::plain(413, "request body too large"),
+                    &peer,
+                    &head.path,
+                );
+                return false;
+            }
+            Some(len) => match http::read_body(&mut reader, len) {
+                Ok(body) => body,
+                Err(_) => {
+                    respond(
+                        reader.into_inner().inner,
+                        &http::Response::plain(400, "bad request body"),
+                        &peer,
+                        &head.path,
+                    );
+                    return false;
+                }
+            },
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
     // BufReader → raw 소켓 핸드오프: into_inner는 BufReader 내부 버퍼에 남은 바이트를 버린다.
     // WS 승격 시 파이프라이닝 클라이언트가 101 전에 선행 프레임을 보냈다면 그 프레임은 유실된다
     // — 표준 브라우저는 101 수신 전 WS 프레임을 보내지 않으므로 실무상 비발현.
@@ -417,6 +479,12 @@ fn handle_connection(stream: TcpStream, ctx: &ConnCtx, connections: &Arc<ConnSet
         tracing::info!(peer, path = %head.path, "web-remote WS 업그레이드");
         ws_api::serve(stream, &head, &ctx.token, &ctx.dashboard, &ctx.stop);
         return true; // WS 슬롯 보유 상태로 종료 — 호출자가 ws_slots 반납
+    }
+    // 웹푸시(P4) 엔드포인트 — GET /push/vapid(공개키), POST /push/subscribe(등록). 둘 다
+    // 토큰 게이트. `/push/*`가 아니면 None을 돌려 정적 라우팅으로 흘려보낸다.
+    if let Some(response) = push::route(&head, &body, &ctx.token, ctx.push.as_ref()) {
+        respond(stream, &response, &peer, &head.path);
+        return false;
     }
     if head.method != "GET" {
         respond(
@@ -504,6 +572,7 @@ mod tests {
                 token: TEST_TOKEN.to_owned(),
                 allowed_host: allowed_host.map(str::to_owned),
                 db_path,
+                vapid: None,
             },
         )
         .unwrap()
@@ -630,6 +699,7 @@ mod tests {
                 token: TEST_TOKEN.to_owned(),
                 allowed_host: None,
                 db_path: None,
+                vapid: None,
             },
         );
         // WebRemoteServer는 Debug 미구현(스레드 핸들) — unwrap_err 대신 match로 확인
@@ -1227,5 +1297,87 @@ mod tests {
             0,
             "비-/ws 업그레이드가 WS 슬롯을 잡았다"
         );
+    }
+
+    // ── P4: 웹푸시 HTTP 통합(서버 소켓 경유 — http.rs 본문 읽기 + 라우팅) ──────
+    fn start_with_push(db_path: PathBuf) -> WebRemoteServer {
+        WebRemoteServer::serve(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            ServeOptions {
+                token: TEST_TOKEN.to_owned(),
+                allowed_host: None,
+                db_path: Some(db_path),
+                vapid: Some(push::VapidKey::generate()),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn push_vapid_공개키_get은_200_json() {
+        let db_path = temp_db_path();
+        let _ = storage::Db::open(&db_path).unwrap();
+        let server = start_with_push(db_path.clone());
+        let addr = server.local_addr();
+        let ok = get(addr, &format!("/push/vapid?token={TEST_TOKEN}"));
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        assert!(ok.contains(r#""key""#), "{ok}");
+        // 잘못된 토큰 → 401.
+        let bad = get(addr, "/push/vapid?token=wrong");
+        assert!(bad.starts_with("HTTP/1.1 401"), "{bad}");
+        server.shutdown();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn push_구독_등록_post는_201이고_db에_저장된다() {
+        let db_path = temp_db_path();
+        let _ = storage::Db::open(&db_path).unwrap();
+        let server = start_with_push(db_path.clone());
+        let addr = server.local_addr();
+        let body = r#"{"endpoint":"https://push.example/sock","keys":{"p256dh":"k","auth":"a"}}"#;
+        let req = format!(
+            "POST /push/subscribe?token={TEST_TOKEN} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = request(addr, &req);
+        assert!(resp.starts_with("HTTP/1.1 201"), "{resp}");
+        // 소켓 경유 본문이 정확히 파싱돼 DB에 저장됐다(http.rs read_body + 핸드오프 검증).
+        let db = storage::Db::open(&db_path).unwrap();
+        let subs = db.list_web_push_subscriptions().unwrap();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].endpoint, "https://push.example/sock");
+        server.shutdown();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn push_본문_상한_초과는_413() {
+        let db_path = temp_db_path();
+        let _ = storage::Db::open(&db_path).unwrap();
+        let server = start_with_push(db_path.clone());
+        let addr = server.local_addr();
+        // 본문 없이 과대 Content-Length만 선언해도 상한에서 413(본문 읽기 전 거부).
+        let req = format!(
+            "POST /push/subscribe?token={TEST_TOKEN} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n",
+            http::MAX_BODY_BYTES + 1
+        );
+        let resp = request(addr, &req);
+        assert!(resp.starts_with("HTTP/1.1 413"), "{resp}");
+        server.shutdown();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn push_비활성_서버는_구독_엔드포인트가_404() {
+        // vapid 없이 시작한 서버(start_with_db)는 push 비활성 — /push/*는 404.
+        let db_path = temp_db_path();
+        let server = start_with_db(None, Some(db_path.clone()));
+        let addr = server.local_addr();
+        let resp = get(addr, &format!("/push/vapid?token={TEST_TOKEN}"));
+        assert!(resp.starts_with("HTTP/1.1 404"), "{resp}");
+        server.shutdown();
+        let _ = std::fs::remove_file(&db_path);
     }
 }

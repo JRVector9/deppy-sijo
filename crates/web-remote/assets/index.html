@@ -13,7 +13,10 @@
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="시조새">
-  <link rel="stylesheet" href="/app.css">
+  <!-- 자산 경로에 셸 버전 해시가 주입된다(static_srv). 구 Service Worker의 캐시 목록에
+       없는 경로라 반드시 네트워크에서 받아온다 — HTML(network-first)과 JS/CSS 버전 불일치
+       (새 화면 + 옛 스크립트) 방지. -->
+  <link rel="stylesheet" href="/app.__SHELL_VERSION__.css">
 </head>
 <body data-view="shell">
   <main class="app">
@@ -87,6 +90,6 @@
       <p id="resource" class="resource"></p>
     </section>
   </main>
-  <script src="/app.js"></script>
+  <script src="/app.__SHELL_VERSION__.js"></script>
 </body>
 </html>

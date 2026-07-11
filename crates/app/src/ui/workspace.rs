@@ -1667,8 +1667,9 @@ pub(crate) fn paths_insert_paste_bytes(
 }
 
 /// raw 제목이 아직 rename 안 된 기본 셸/에이전트 제목("workspace.spawn.shell 134" 등)인가.
-/// 기본 제목이면 프로젝트명으로 대체 표시한다(resolve_session_title).
-fn is_default_session_title(raw: &str) -> bool {
+/// 기본 제목이면 프로젝트명으로 대체 표시한다(resolve_session_title / 활동 패널의
+/// warm·유휴 워크스페이스 행도 같은 규칙을 쓴다 — App::activity_session_name).
+pub(crate) fn is_default_session_title(raw: &str) -> bool {
     let Some((prefix, suffix)) = raw.rsplit_once(' ') else {
         return false;
     };

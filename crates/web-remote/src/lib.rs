@@ -975,6 +975,90 @@ mod tests {
         server.shutdown();
     }
 
+    /// P5c: watch → keyframe, 변경 → 해당 행만 delta, request_keyframe → 재동기화.
+    #[test]
+    fn ws_viewport는_keyframe_delta_재동기화를_거친다() {
+        let server = start(None);
+        let captured: Arc<Mutex<Vec<runtime::RuntimeCommand>>> = Arc::default();
+        let sink_cap = Arc::clone(&captured);
+        server.set_runtime_command_sink(Arc::new(move |command| {
+            sink_cap.lock().unwrap().push(command);
+        }));
+
+        let make_snapshot = |first_char: char| {
+            let mut cells = vec![
+                runtime::TerminalCell {
+                    c: ' ',
+                    fg: [255, 255, 255],
+                    bg: [0, 0, 0],
+                    wide: false,
+                    wide_spacer: false,
+                };
+                20 // 10×2
+            ];
+            cells[0].c = first_char;
+            runtime::RuntimeEvent::Viewport {
+                session: runtime::SessionId(7),
+                snapshot: Arc::new(runtime::TerminalViewportSnapshot {
+                    cols: 10,
+                    rows: 2,
+                    cursor: runtime::CursorSnapshot {
+                        col: 0,
+                        row: 0,
+                        shape: runtime::CursorShape::Block,
+                        visible: true,
+                    },
+                    visible_cells: cells.into(),
+                    dirty_ranges: Vec::new(),
+                    title: None,
+                    scroll_offset: 0,
+                    is_alt_screen: false,
+                }),
+                bracketed_paste: false,
+            }
+        };
+
+        let mut ws = ws_client(server.local_addr());
+        send_text(
+            &mut ws,
+            &format!(r#"{{"type":"auth","v":1,"token":"{TEST_TOKEN}"}}"#),
+        );
+        assert!(read_frame_of_type(&mut ws, "welcome", Duration::from_secs(3)).is_some());
+
+        // watch → 브리지에 lease가 등록될 때까지 대기 (이후 inject가 슬롯에 반영된다)
+        send_text(&mut ws, r#"{"type":"watch","session":7}"#);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while captured.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "watch lease가 등록되지 않음");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // 첫 프레임 = keyframe (전체 2행)
+        server.dashboard.inject_event(make_snapshot('a'));
+        let first = read_frame_of_type(&mut ws, "viewport", Duration::from_secs(3))
+            .expect("viewport 프레임 없음");
+        assert!(first.contains(r#""keyframe":true"#), "{first}");
+        assert_eq!(first.matches(r#""runs":"#).count(), 2, "{first}");
+
+        // 1행만 변경 → delta에 그 행만
+        server.dashboard.inject_event(make_snapshot('b'));
+        let delta = read_frame_of_type(&mut ws, "viewport", Duration::from_secs(3))
+            .expect("delta 프레임 없음");
+        assert!(delta.contains(r#""keyframe":false"#), "{delta}");
+        assert_eq!(delta.matches(r#""runs":"#).count(), 1, "{delta}");
+        assert!(delta.contains(r#""t":"b"#), "{delta}");
+
+        // 재동기화 요청 — 새 스냅샷 없이도 같은 슬롯에서 keyframe 재전송
+        send_text(&mut ws, r#"{"type":"request_keyframe"}"#);
+        let resync = read_frame_of_type(&mut ws, "viewport", Duration::from_secs(3))
+            .expect("재동기화 keyframe 없음");
+        assert!(resync.contains(r#""keyframe":true"#), "{resync}");
+        assert_eq!(resync.matches(r#""runs":"#).count(), 2, "{resync}");
+
+        drop(ws);
+        server.shutdown();
+    }
+
     #[test]
     fn ws_인증_전_비auth_첫프레임은_거부() {
         let server = start(None);

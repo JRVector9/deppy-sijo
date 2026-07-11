@@ -33,6 +33,9 @@ pub enum ClientMsg {
     Watch { session: u64 },
     /// 시청 종료 — 접속은 유지한 채 시청만 끊는다 (WS 절단 시에는 자동 해제).
     Unwatch,
+    /// 클라이언트 렌더 상태가 깨졌을 때 전체 화면 재동기화 요청 (P5c — remote.rs
+    /// RequestKeyframe 관례). 서버는 baseline을 버려 다음 프레임을 keyframe으로 보낸다.
+    RequestKeyframe,
 }
 
 impl ClientMsg {
@@ -70,6 +73,34 @@ pub struct ApprovalView {
     pub created_at: i64,
 }
 
+/// 커서 표시 상태 (P5c). shape는 "block"/"underline"/"beam".
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CursorView {
+    pub col: u16,
+    pub row: u16,
+    pub visible: bool,
+    pub shape: &'static str,
+}
+
+/// 한 행 안의 스타일 run (P5c) — (fg, bg, wide)가 같은 연속 셀 묶음. `s`는 시작 셀
+/// 열, `t`는 텍스트(wide_spacer 제외), `w`=true면 글자당 2셀 폭(한글 등).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RunView {
+    pub s: u16,
+    pub t: String,
+    pub fg: String,
+    pub bg: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub w: bool,
+}
+
+/// 화면 한 행 (P5c). delta 프레임에는 바뀐 행만 실린다.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LineView {
+    pub row: u16,
+    pub runs: Vec<RunView>,
+}
+
 /// 서버 → 클라이언트. 내부 태그(`type`)로 클라가 분기한다.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -83,6 +114,18 @@ pub enum ServerMsg {
     },
     /// 승인 대기 목록(DB 폴링 유래).
     Approvals { pending: Vec<ApprovalView> },
+    /// 시청 세션 화면 (P5c). keyframe=전체 행, delta=바뀐 행만(빈 lines면 커서만 갱신).
+    /// 행 텍스트+스타일 run 인코딩 — 셀 단위 JSON 대비 수십 배 작다 (계획 §4 이식).
+    Viewport {
+        session: u64,
+        seq: u64,
+        keyframe: bool,
+        cols: u16,
+        rows: u16,
+        cursor: CursorView,
+        alt: bool,
+        lines: Vec<LineView>,
+    },
     /// 인증 실패 등 — 직후 close.
     Error { message: String },
 }
@@ -92,6 +135,104 @@ impl ServerMsg {
     pub fn encode(&self) -> String {
         serde_json::to_string(self)
             .unwrap_or_else(|_| r#"{"type":"error","message":"encode failed"}"#.to_owned())
+    }
+}
+
+/// RGB → `#rrggbb` (JSON에서 배열보다 짧고 canvas fillStyle에 그대로 쓰인다).
+fn hex_color(rgb: [u8; 3]) -> String {
+    format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2])
+}
+
+fn cursor_view(snapshot: &runtime::TerminalViewportSnapshot) -> CursorView {
+    CursorView {
+        col: snapshot.cursor.col,
+        row: snapshot.cursor.row,
+        visible: snapshot.cursor.visible,
+        shape: match snapshot.cursor.shape {
+            runtime::CursorShape::Block => "block",
+            runtime::CursorShape::Underline => "underline",
+            runtime::CursorShape::Beam => "beam",
+        },
+    }
+}
+
+/// 행 하나를 스타일 run들로 인코딩한다 (P5c). wide_spacer 셀은 건너뛰고(자리 채움 —
+/// 렌더 안 함), (fg, bg, wide)가 같은 연속 셀을 하나의 run으로 합친다(사실상 행 RLE).
+/// wide 전환에서도 run을 끊어 클라이언트가 run 단위 고정 폭(1 또는 2셀)으로 전진한다.
+fn encode_line(cells: &[runtime::TerminalCell], row: u16) -> LineView {
+    let mut runs: Vec<RunView> = Vec::new();
+    // 진행 중 run의 (fg, bg, wide, 다음 예상 열) — 셀마다 hex 문자열을 만들지 않는다.
+    let mut open: Option<([u8; 3], [u8; 3], bool, u16)> = None;
+    for (col, cell) in cells.iter().enumerate() {
+        if cell.wide_spacer {
+            continue;
+        }
+        let col = col as u16;
+        let advance = if cell.wide { 2 } else { 1 };
+        match (&mut open, runs.last_mut()) {
+            (Some((fg, bg, wide, next)), Some(run))
+                if *fg == cell.fg && *bg == cell.bg && *wide == cell.wide && *next == col =>
+            {
+                run.t.push(cell.c);
+                *next = col + advance;
+            }
+            _ => {
+                runs.push(RunView {
+                    s: col,
+                    t: cell.c.to_string(),
+                    fg: hex_color(cell.fg),
+                    bg: hex_color(cell.bg),
+                    w: cell.wide,
+                });
+                open = Some((cell.fg, cell.bg, cell.wide, col + advance));
+            }
+        }
+    }
+    LineView { row, runs }
+}
+
+/// 시청 화면 프레임을 만든다 (P5c). baseline이 없거나 화면 크기가 바뀌면 keyframe
+/// (전체 행), 아니면 baseline과 셀이 다른 행만 담은 delta. 행 변화가 없어도 프레임은
+/// 나간다 — 커서 이동만 있는 갱신을 클라이언트가 반영한다.
+pub fn encode_viewport(
+    session: u64,
+    seq: u64,
+    snapshot: &runtime::TerminalViewportSnapshot,
+    baseline: Option<&runtime::TerminalViewportSnapshot>,
+) -> ServerMsg {
+    let cols = snapshot.cols as usize;
+    let rows = snapshot.rows as usize;
+    let keyframe = match baseline {
+        Some(base) => base.cols != snapshot.cols || base.rows != snapshot.rows,
+        None => true,
+    };
+    let mut lines = Vec::new();
+    for row in 0..rows {
+        let range = row * cols..(row + 1) * cols;
+        let Some(cells) = snapshot.visible_cells.get(range.clone()) else {
+            break; // 방어: cells 길이가 cols*rows보다 짧으면 있는 만큼만
+        };
+        let changed = if keyframe {
+            true
+        } else {
+            // delta: baseline의 같은 행과 셀 비교 (keyframe이 아니면 기하는 동일)
+            baseline
+                .and_then(|base| base.visible_cells.get(range))
+                .is_none_or(|base_cells| base_cells != cells)
+        };
+        if changed {
+            lines.push(encode_line(cells, row as u16));
+        }
+    }
+    ServerMsg::Viewport {
+        session,
+        seq,
+        keyframe,
+        cols: snapshot.cols,
+        rows: snapshot.rows,
+        cursor: cursor_view(snapshot),
+        alt: snapshot.is_alt_screen,
+        lines,
     }
 }
 
@@ -159,6 +300,193 @@ mod tests {
         assert_eq!(msg, ClientMsg::Unwatch);
         // session 누락 watch는 기형 — 무시
         assert!(ClientMsg::parse(r#"{"type":"watch"}"#).is_none());
+        let msg = ClientMsg::parse(r#"{"type":"request_keyframe"}"#).unwrap();
+        assert_eq!(msg, ClientMsg::RequestKeyframe);
+    }
+
+    // ── P5c 인코더 ──
+
+    fn cell(c: char, fg: [u8; 3], bg: [u8; 3]) -> runtime::TerminalCell {
+        runtime::TerminalCell {
+            c,
+            fg,
+            bg,
+            wide: false,
+            wide_spacer: false,
+        }
+    }
+
+    fn wide_pair(c: char, fg: [u8; 3], bg: [u8; 3]) -> [runtime::TerminalCell; 2] {
+        [
+            runtime::TerminalCell {
+                c,
+                fg,
+                bg,
+                wide: true,
+                wide_spacer: false,
+            },
+            runtime::TerminalCell {
+                c: ' ',
+                fg,
+                bg,
+                wide: false,
+                wide_spacer: true,
+            },
+        ]
+    }
+
+    fn snapshot(
+        cols: u16,
+        rows: u16,
+        cells: Vec<runtime::TerminalCell>,
+    ) -> runtime::TerminalViewportSnapshot {
+        assert_eq!(cells.len(), cols as usize * rows as usize);
+        runtime::TerminalViewportSnapshot {
+            cols,
+            rows,
+            cursor: runtime::CursorSnapshot {
+                col: 0,
+                row: 0,
+                shape: runtime::CursorShape::Block,
+                visible: true,
+            },
+            visible_cells: cells.into(),
+            dirty_ranges: Vec::new(),
+            title: None,
+            scroll_offset: 0,
+            is_alt_screen: false,
+        }
+    }
+
+    const WHITE: [u8; 3] = [255, 255, 255];
+    const BLACK: [u8; 3] = [0, 0, 0];
+    const RED: [u8; 3] = [255, 0, 0];
+
+    #[test]
+    fn 행_run은_스타일과_폭_전환에서_끊고_spacer를_건너뛴다() {
+        // "AB한글cd" — AB는 빨강, 한글은 wide, cd는 흰색
+        let mut cells = vec![cell('A', RED, BLACK), cell('B', RED, BLACK)];
+        cells.extend(wide_pair('한', WHITE, BLACK));
+        cells.extend(wide_pair('글', WHITE, BLACK));
+        cells.push(cell('c', WHITE, BLACK));
+        cells.push(cell('d', WHITE, BLACK));
+        let line = encode_line(&cells, 3);
+        assert_eq!(line.row, 3);
+        assert_eq!(line.runs.len(), 3, "{:?}", line.runs);
+        assert_eq!((line.runs[0].s, line.runs[0].t.as_str()), (0, "AB"));
+        assert_eq!(line.runs[0].fg, "#ff0000");
+        assert!(!line.runs[0].w);
+        // 한글 run: spacer를 건너뛰고 시작 열 2, 글자당 2셀
+        assert_eq!((line.runs[1].s, line.runs[1].t.as_str()), (2, "한글"));
+        assert!(line.runs[1].w);
+        // wide 다음 ascii — 열 6부터
+        assert_eq!((line.runs[2].s, line.runs[2].t.as_str()), (6, "cd"));
+        assert!(!line.runs[2].w);
+    }
+
+    #[test]
+    fn baseline_없으면_keyframe_있으면_바뀐_행만_delta() {
+        let blank = snapshot(10, 3, vec![cell(' ', WHITE, BLACK); 30]);
+        // keyframe: 전체 행
+        let ServerMsg::Viewport {
+            keyframe, lines, ..
+        } = encode_viewport(7, 1, &blank, None)
+        else {
+            panic!("viewport 아님")
+        };
+        assert!(keyframe);
+        assert_eq!(lines.len(), 3);
+
+        // delta: 1행만 변경 → 그 행만
+        let mut changed_cells = vec![cell(' ', WHITE, BLACK); 30];
+        changed_cells[10] = cell('x', WHITE, BLACK);
+        let changed = snapshot(10, 3, changed_cells);
+        let ServerMsg::Viewport {
+            keyframe, lines, ..
+        } = encode_viewport(7, 2, &changed, Some(&blank))
+        else {
+            panic!("viewport 아님")
+        };
+        assert!(!keyframe);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].row, 1);
+
+        // 화면 크기 변화 → keyframe 강제
+        let resized = snapshot(10, 4, vec![cell(' ', WHITE, BLACK); 40]);
+        let ServerMsg::Viewport { keyframe, .. } = encode_viewport(7, 3, &resized, Some(&blank))
+        else {
+            panic!("viewport 아님")
+        };
+        assert!(keyframe, "cols/rows 변화는 keyframe이어야 함");
+    }
+
+    #[test]
+    fn 커서만_바뀐_delta는_빈_lines로_커서를_나른다() {
+        let base = snapshot(10, 2, vec![cell(' ', WHITE, BLACK); 20]);
+        let mut moved = snapshot(10, 2, vec![cell(' ', WHITE, BLACK); 20]);
+        moved.cursor.col = 5;
+        let ServerMsg::Viewport {
+            keyframe,
+            lines,
+            cursor,
+            ..
+        } = encode_viewport(7, 2, &moved, Some(&base))
+        else {
+            panic!("viewport 아님")
+        };
+        assert!(!keyframe);
+        assert!(lines.is_empty());
+        assert_eq!(cursor.col, 5);
+    }
+
+    #[test]
+    fn 프레임_크기_실측_80x24() {
+        // 빈 화면 keyframe — 행당 run 1개
+        let blank = snapshot(80, 24, vec![cell(' ', WHITE, BLACK); 80 * 24]);
+        let blank_json = encode_viewport(7, 1, &blank, None).encode();
+        assert!(
+            blank_json.len() < 8 * 1024,
+            "빈 keyframe {}B ≥ 8KB",
+            blank_json.len()
+        );
+
+        // 현실적 화면: 모든 행이 3색 run (프롬프트/출력/강조 혼합 가정)
+        let mut cells = Vec::with_capacity(80 * 24);
+        for _ in 0..24 {
+            for col in 0..80u16 {
+                let (fg, ch) = match col {
+                    0..=9 => (RED, 'p'),
+                    10..=59 => (WHITE, 'x'),
+                    _ => ([0, 255, 0], ' '),
+                };
+                cells.push(cell(ch, fg, BLACK));
+            }
+        }
+        let busy = snapshot(80, 24, cells);
+        let busy_json = encode_viewport(7, 1, &busy, None).encode();
+        assert!(
+            busy_json.len() < 16 * 1024,
+            "3-run×24행 keyframe {}B ≥ 16KB (naive 셀 JSON은 ~75KB)",
+            busy_json.len()
+        );
+
+        // 1행 delta
+        let mut one_row = vec![cell(' ', WHITE, BLACK); 80 * 24];
+        one_row[80] = cell('y', WHITE, BLACK);
+        let delta_snapshot = snapshot(80, 24, one_row);
+        let delta_json = encode_viewport(7, 2, &delta_snapshot, Some(&blank)).encode();
+        assert!(
+            delta_json.len() < 1024,
+            "1행 delta {}B ≥ 1KB",
+            delta_json.len()
+        );
+        // 실측 기록 (--nocapture로 확인): naive 셀 JSON ~75KB 대비 수십 배 작다.
+        eprintln!(
+            "P5c 프레임 실측 — 빈 keyframe {}B, 3-run keyframe {}B, 1행 delta {}B",
+            blank_json.len(),
+            busy_json.len(),
+            delta_json.len()
+        );
     }
 
     #[test]

@@ -36,6 +36,9 @@ pub enum ClientMsg {
     /// 클라이언트 렌더 상태가 깨졌을 때 전체 화면 재동기화 요청 (P5c — remote.rs
     /// RequestKeyframe 관례). 서버는 baseline을 버려 다음 프레임을 keyframe으로 보낸다.
     RequestKeyframe,
+    /// 시청 중 세션에 최소 제어 키 (P5d). 화이트리스트("ctrl_c"/"enter")만 서버가
+    /// 바이트로 매핑한다 — 자유 타이핑·IME는 비범위(필요 시 별도 PR).
+    Key { session: u64, key: String },
 }
 
 impl ClientMsg {
@@ -302,6 +305,14 @@ mod tests {
         assert!(ClientMsg::parse(r#"{"type":"watch"}"#).is_none());
         let msg = ClientMsg::parse(r#"{"type":"request_keyframe"}"#).unwrap();
         assert_eq!(msg, ClientMsg::RequestKeyframe);
+        let msg = ClientMsg::parse(r#"{"type":"key","session":7,"key":"ctrl_c"}"#).unwrap();
+        assert_eq!(
+            msg,
+            ClientMsg::Key {
+                session: 7,
+                key: "ctrl_c".into()
+            }
+        );
     }
 
     // ── P5c 인코더 ──

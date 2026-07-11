@@ -414,6 +414,30 @@ impl DashboardHandle {
         }
     }
 
+    /// 시청 세션에 최소 제어 키를 보낸다 (P5d — Ctrl-C/Enter만, 자유 타이핑 비범위).
+    /// 화이트리스트 밖 키는 무시. WriteInput 재사용 — 죽은 세션 id는 runtime이 무해하게
+    /// 무시한다. 호출측(ws_api)이 "시청 중 세션만" 게이트를 이미 건다.
+    pub fn send_key(&self, session: u64, key: &str) {
+        let bytes: &[u8] = match key {
+            "ctrl_c" => b"\x03",
+            "enter" => b"\r",
+            _ => return,
+        };
+        let sink = self
+            .shared
+            .inner
+            .lock()
+            .expect("dashboard inner lock")
+            .command_sink
+            .clone();
+        if let Some(sink) = sink {
+            sink(RuntimeCommand::WriteInput {
+                session: SessionId(session),
+                bytes: bytes.to_vec(),
+            });
+        }
+    }
+
     /// 시청 중인 모든 세션의 lease를 재선언한다 (P5b — 새 worker 구독 직후). 새 worker는
     /// 이전 lease를 모르므로 viewing=true를 다시 보내고 갱신 시계를 리셋한다.
     fn reassert_watch_leases(&self) {

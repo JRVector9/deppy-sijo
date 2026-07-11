@@ -88,6 +88,22 @@ h1 { font-size: 19px; font-weight: 600; color: #f0f0f0; }
 .badge.running { background: #21344a; color: #7db4e6; }
 .badge.idle { background: #333; color: #9a9a9a; }
 .resource { font-size: 12px; color: #8a8a8a; margin-top: 12px; font-family: ui-monospace, Menlo, monospace; }
+.view-btn {
+  flex: none; font-size: 12px; font-weight: 600; padding: 5px 11px;
+  background: #2c3e50; color: #a8c8e8; border: 1px solid #3a5068; border-radius: 8px;
+  cursor: pointer;
+}
+.view-btn:disabled { opacity: 0.55; cursor: default; }
+
+/* 터미널 뷰어 (P5d) — 읽기 전용 canvas + 최소 제어 */
+.viewer-wrap { background: #000; border-radius: 8px; overflow: hidden; }
+.viewer-wrap canvas { display: block; width: 100%; }
+.viewer-actions { display: flex; gap: 10px; margin-top: 12px; }
+.viewer-actions button {
+  font-size: 13px; font-weight: 600; padding: 9px 14px; border-radius: 8px;
+  background: #333; color: #e0e0e0; border: 1px solid #4a4a4a; cursor: pointer;
+}
+.viewer-actions .viewer-close { margin-left: auto; background: #2a2a2a; color: #9a9a9a; }
 
 /* P3 설치 셸: iOS 설치 안내 배너 / 알림 권한 버튼 / 오프라인 재시도 */
 .ios-hint {

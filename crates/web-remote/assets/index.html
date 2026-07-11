@@ -43,6 +43,17 @@
       <p id="approvals-empty" class="empty">대기 중인 승인이 없습니다.</p>
     </section>
 
+    <!-- 터미널 뷰어(P5d): 세션의 "보기"로 열린다. 읽기 전용 + 최소 제어(Ctrl-C/Enter)만. -->
+    <section id="viewer" class="panel viewer" aria-labelledby="viewer-title" hidden>
+      <h2 id="viewer-title">화면 <span id="viewer-session" class="count"></span></h2>
+      <div class="viewer-wrap"><canvas id="viewer-canvas"></canvas></div>
+      <div class="viewer-actions">
+        <button id="viewer-ctrl-c" type="button">Ctrl‑C</button>
+        <button id="viewer-enter" type="button">Enter</button>
+        <button id="viewer-close" type="button" class="viewer-close">닫기</button>
+      </div>
+    </section>
+
     <section class="panel" aria-labelledby="sessions-title">
       <h2 id="sessions-title">세션</h2>
       <ul id="sessions" class="sessions"></ul>

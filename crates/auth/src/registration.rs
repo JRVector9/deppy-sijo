@@ -5,11 +5,13 @@
 //! redirect URI 정확 일치를 요구하는 비스펙 AS 대비.
 //! 차용: VS Code oauth.ts `fetchDynamicRegistration`.
 
+use std::time::Duration;
+
 use secret::SecretString;
 
 use crate::callback::registration_redirect_uris;
 use crate::discovery::AuthorizationServerMetadata;
-use crate::validate_https_or_loopback;
+use crate::{oauth_http_agent, validate_https_or_loopback};
 
 /// 등록 요청 구성.
 #[derive(Debug, Clone)]
@@ -54,8 +56,10 @@ impl std::fmt::Display for RegistrationError {
 impl std::error::Error for RegistrationError {}
 
 /// RFC 7591 동적 등록 실행. 성공 시 client_id(+선택 client_secret)를 돌려준다.
+/// 요청은 redirect 금지 [`oauth_http_agent`]로만 나간다 (H4 리뷰 P1) —
+/// 호출측 Agent 주입 대신 timeout을 받는다.
 pub fn register_client(
-    http: &ureq::Agent,
+    timeout: Duration,
     metadata: &AuthorizationServerMetadata,
     options: &RegistrationOptions,
 ) -> Result<DynamicRegistration, RegistrationError> {
@@ -92,6 +96,7 @@ pub fn register_client(
         body["scope"] = options.scopes.join(" ").into();
     }
 
+    let http = oauth_http_agent(timeout);
     let response = http
         .post(endpoint)
         .set("Content-Type", "application/json")
@@ -115,6 +120,15 @@ pub fn register_client(
             )));
         }
     };
+
+    // redirects(0)이라 3xx는 Err이 아니라 Ok로 온다 (ureq는 4xx+만 Err) —
+    // 따라가지 않고 거부한다 (CWE-918 SSRF·헤더 누출 방지, oauth_http_agent 참조)
+    let status = response.status();
+    if (300..400).contains(&status) {
+        return Err(RegistrationError::Other(anyhow::anyhow!(
+            "redirect 거부 (HTTP {status}) — 등록 요청은 redirect를 따라가지 않습니다"
+        )));
+    }
 
     // RFC 7591 §3.2.1 성공은 201 — 200을 주는 실서버도 수용 (2xx는 ureq가 Ok로 준다)
     let body = response
@@ -160,13 +174,8 @@ mod tests {
     use super::*;
     use crate::callback::FIXED_CALLBACK_PORT;
     use crate::test_support::{MockHttpServer, MockResponse};
-    use std::time::Duration;
 
-    fn agent() -> ureq::Agent {
-        ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(5))
-            .build()
-    }
+    const TIMEOUT: Duration = Duration::from_secs(5);
 
     fn metadata(
         registration_endpoint: Option<String>,
@@ -201,7 +210,7 @@ mod tests {
             "client_credentials",
         ]);
         let registration = register_client(
-            &agent(),
+            TIMEOUT,
             &metadata(Some(server.url("/register")), grants),
             &options(),
         )
@@ -239,7 +248,7 @@ mod tests {
 
     #[test]
     fn registration_endpoint_없으면_미지원() {
-        let error = register_client(&agent(), &metadata(None, None), &options()).unwrap_err();
+        let error = register_client(TIMEOUT, &metadata(None, None), &options()).unwrap_err();
         assert!(
             matches!(error, RegistrationError::Unsupported(_)),
             "{error}"
@@ -250,7 +259,7 @@ mod tests {
     fn endpoint_404는_미지원() {
         let server = MockHttpServer::start(|_| MockResponse::json(404, "{}"));
         let error = register_client(
-            &agent(),
+            TIMEOUT,
             &metadata(Some(server.url("/register")), None),
             &options(),
         )
@@ -271,7 +280,7 @@ mod tests {
             )
         });
         let error = register_client(
-            &agent(),
+            TIMEOUT,
             &metadata(Some(server.url("/register")), None),
             &options(),
         )
@@ -286,7 +295,7 @@ mod tests {
     fn grant_목록_생략_시_기본_두_grant를_요청() {
         let server = MockHttpServer::start(|_| MockResponse::json(201, r#"{"client_id":"cid-2"}"#));
         let registration = register_client(
-            &agent(),
+            TIMEOUT,
             &metadata(Some(server.url("/register")), None),
             &options(),
         )
@@ -301,10 +310,34 @@ mod tests {
     }
 
     #[test]
+    fn 등록은_redirect를_따라가지_않고_에러() {
+        // H4 리뷰 P1 (CWE-918): 따라가면 client_id를 주는 경로가 있어도 도달하지 않는다
+        let server = MockHttpServer::start(|req| {
+            if req.path == "/redirected" {
+                MockResponse::json(201, r#"{"client_id":"stolen"}"#)
+            } else {
+                MockResponse::redirect(302, "/redirected")
+            }
+        });
+        let error = register_client(
+            TIMEOUT,
+            &metadata(Some(server.url("/register")), None),
+            &options(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, RegistrationError::Other(_)), "{error}");
+        assert!(error.to_string().contains("redirect 거부"), "{error}");
+        // redirect 대상 경로로는 요청이 가지 않았다
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests.iter().all(|r| r.path != "/redirected"));
+    }
+
+    #[test]
     fn authorization_code_미지원_as는_요청_없이_미지원() {
         let server = MockHttpServer::start(|_| MockResponse::json(201, r#"{"client_id":"x"}"#));
         let error = register_client(
-            &agent(),
+            TIMEOUT,
             &metadata(
                 Some(server.url("/register")),
                 Some(vec!["client_credentials"]),

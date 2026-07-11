@@ -116,10 +116,10 @@ pub fn complete(
     if params.state != *pending.state.secret() {
         bail!("state 불일치 — CSRF 의심, authorization을 거부합니다");
     }
-    // 응답이 멎은 token endpoint에 flow가 영구히 매달리지 않게 timeout
-    let http: ureq::Agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(30))
-        .build();
+    // 응답이 멎은 token endpoint에 flow가 영구히 매달리지 않게 timeout.
+    // redirect 금지도 함께 강제된다 (H4 리뷰 P1) — token 응답의 302를 따라가면
+    // code/PKCE verifier가 redirect 대상으로 유출될 수 있다 (CWE-918).
+    let http = crate::oauth_http_agent(Duration::from_secs(30));
     let mut request = pending
         .client
         .exchange_code(AuthorizationCode::new(params.code))
@@ -304,6 +304,51 @@ mod tests {
         assert!(
             request.contains("grant_type=authorization_code"),
             "{request}"
+        );
+    }
+
+    /// redirect 금지 (H4 리뷰 P1, CWE-918): token endpoint가 302를 줘도 따라가지
+    /// 않는다 — code/PKCE verifier가 redirect 대상으로 흘러가는 것을 차단.
+    #[test]
+    fn token_endpoint_redirect는_따라가지_않고_에러() {
+        // redirect 대상 — 여기로는 어떤 연결도 오면 안 된다
+        let target = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        target.set_nonblocking(true).unwrap();
+        let target_url = format!(
+            "http://127.0.0.1:{}/steal",
+            target.local_addr().unwrap().port()
+        );
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let token_url = format!(
+            "http://127.0.0.1:{}/token",
+            listener.local_addr().unwrap().port()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_full_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: {target_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+
+        let pending = begin(&config(&token_url), "http://127.0.0.1:9/callback").unwrap();
+        let state = pending.state.secret().clone();
+        let result = complete(
+            pending,
+            CallbackParams {
+                code: "auth-code-3".to_owned(),
+                state,
+            },
+        );
+        server.join().unwrap();
+        assert!(result.is_err());
+        // complete는 동기 실행이므로, redirect를 따라갔다면 이미 연결이 와 있어야 한다
+        assert!(
+            target.accept().is_err(),
+            "redirect를 따라가 token 요청이 유출됐다"
         );
     }
 

@@ -2002,6 +2002,10 @@ impl App {
             .runtime
             .subscribe_with_wake(server.dashboard_wake());
         server.set_runtime_source(receiver);
+        // 구독 등록 직후 현재 세션 상태를 시드한다 — 이벤트 스트림은 edge-trigger라, 재구독한
+        // 대시보드는 과거 이력을 모른다. 시드가 없으면 이미 needs_approval로 정착한 세션이
+        // 다음 상태 변화까지 "실행 중"으로 오표시된다(계획 P2 리뷰: 킬러 기능 훼손).
+        server.seed_sessions(self.web_session_seed());
         Ok(WebRemoteState { server, token })
     }
 
@@ -2014,7 +2018,39 @@ impl App {
                 .runtime
                 .subscribe_with_wake(web.server.dashboard_wake());
             web.server.set_runtime_source(receiver);
+            // 재구독 직후 새 워크스페이스의 현재 세션 상태를 시드한다(start_web과 동일 이유 +
+            // 세션 맵 통째 교체로 옛 워크스페이스 세션 정체/전환 레이스까지 해소 — P2 리뷰).
+            web.server.seed_sessions(self.web_session_seed());
         }
+    }
+
+    /// 웹 대시보드 시드용 현재 활성 워크스페이스의 세션 스냅샷을 만든다(세션 id/제목/상태/exited).
+    /// GUI 배지가 쓰는 `session_entries`를 재사용하되, 대시보드 상태는 런타임 감지 이벤트에서만
+    /// 오므로(앱의 transcript/hook 병합은 브리지에 안 보임) 병합 맵은 비워 넘겨 순수 감지 상태를
+    /// 시드한다 — 이후 브리지 갱신과 일관된다. 브라우저는 innerHTML 금지라 제목은 그대로 안전.
+    fn web_session_seed(&self) -> Vec<web_remote::dashboard::SessionSeed> {
+        let empty_activity = std::collections::HashMap::new();
+        let empty_needs_input = std::collections::HashSet::new();
+        let empty_turn_done = std::collections::HashMap::new();
+        self.active
+            .workspace_ui
+            .session_entries(
+                &self.i18n,
+                &empty_activity,
+                &empty_needs_input,
+                &empty_turn_done,
+            )
+            .into_iter()
+            .filter_map(|entry| {
+                let session = entry.session?;
+                Some(web_remote::dashboard::SessionSeed {
+                    id: session.0,
+                    title: entry.title,
+                    status: entry.status.unwrap_or(runtime::SessionStatus::Running),
+                    exited: self.active.live.exited_sessions.contains(&session),
+                })
+            })
+            .collect()
     }
 
     /// settings 토글 on: 웹서버를 켜고 성공 시 config에 의도를 영속한다 (remote_enable 관례).

@@ -119,6 +119,13 @@ pub struct ApprovalView {
     pub tool: String,
     pub preview: String,
     pub created_at: i64,
+    /// 이 승인을 요청한 세션의 **영속 UUID** (I2). 폰의 "화면 보기"가 이걸로 watch한다.
+    /// 세션 불명(pane_id NULL/pane 소멸)이면 생략된다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// 세션 표시 제목 (I2). 승인 카드에 "어느 세션인지"를 보인다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_title: Option<String>,
 }
 
 /// 커서 표시 상태 (P5c). shape는 "block"/"underline"/"beam".
@@ -707,6 +714,8 @@ mod tests {
                 tool: "create_issue".into(),
                 preview: "{redacted}".into(),
                 created_at: 1720,
+                session: None,
+                session_title: None,
             }],
         }
         .encode();

@@ -30,6 +30,10 @@ pub struct DbPermissionHook {
     /// kind별 config(stdio|http)는 forwarder와 동일한 BackendConfig로 분기한다 (H3).
     manager: LocalMcpManager,
     config: BackendConfig,
+    /// 이 프록시가 붙은 pane_id (I2 — env DEPPY_SESSION_ID). 승인 등록 시 그대로 싣는다.
+    /// **조회하지 않는다**: 등록은 fail-closed 경로라 새 실패 지점을 만들지 않기 위함.
+    /// None이면 "세션 불명"으로 등록되고 승인 자체는 정상 진행된다.
+    pane_id: Option<String>,
     /// live 스키마 해시 캐시 (tool_name → schema_hash). 프록시 세션당 최초 필요 시 한 번만
     /// 백엔드를 discover해 채운다(성공 시). None = 아직 성공 discover 못 함(다음 호출에서 재시도).
     schema_cache: Mutex<Option<HashMap<String, String>>>,
@@ -45,6 +49,7 @@ impl DbPermissionHook {
         approval_timeout: Duration,
         manager: LocalMcpManager,
         config: BackendConfig,
+        pane_id: Option<String>,
     ) -> Self {
         Self {
             db,
@@ -54,6 +59,7 @@ impl DbPermissionHook {
             approval_timeout,
             manager,
             config,
+            pane_id,
             schema_cache: Mutex::new(None),
         }
     }
@@ -152,6 +158,7 @@ impl DbPermissionHook {
             &preview,
             schema_hash.as_deref(),
             now,
+            self.pane_id.as_deref(),
         ) {
             tracing::warn!(tool = %tool_name, "승인 요청 등록 실패: {e:#}");
             // fail-closed도 결정이므로 감사에 남긴다 (best-effort, codex).
@@ -334,6 +341,7 @@ mod tests {
             timeout,
             LocalMcpManager::new(RedactionService::new()),
             config,
+            Some("pane-test".to_owned()),
         )
     }
 

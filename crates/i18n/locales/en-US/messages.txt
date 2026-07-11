@@ -249,6 +249,7 @@ approval.title = Tool Approval
 approval.server = Server: {value}
 approval.remote_note = This tool call is sent to a remote server: {url}
 approval.tool = Tool: {value}
+approval.session = Session: {value}
 approval.arguments_preview = Arguments preview:
 approval.remember_tool = Remember this tool
 env.title = Environment

@@ -572,6 +572,14 @@
     head.appendChild(tool);
     card.appendChild(head);
 
+    // 어느 세션의 승인인지 (I2). 세션 불명이면 표시하지 않는다. textContent만.
+    if (item.session_title) {
+      const sess = document.createElement('div');
+      sess.className = 'approval-session';
+      sess.textContent = '세션: ' + item.session_title;
+      card.appendChild(sess);
+    }
+
     // 미리보기(URL·인자)는 proxy가 이미 redact한 표시용 텍스트 — textContent로만.
     if (item.preview) {
       const pre = document.createElement('pre');
@@ -588,11 +596,20 @@
     remember.appendChild(document.createTextNode(' 이 결정을 기억(규칙으로 저장)'));
     card.appendChild(remember);
 
-    // 참고(P6c): 승인 카드에서 "화면 보기"(그 세션 시청)는 pending_approvals 행에
-    // 세션 id가 없어 배선하지 못했다 — proxy가 승인을 등록할 때 세션을 기록해야 한다
-    // (DB 컬럼 추가 필요, 백로그). 세션 알림 딥링크는 정상 동작한다.
     const actions = document.createElement('div');
     actions.className = 'actions';
+    // 승인 전 맥락 확인 — 그 세션 화면을 연다 (I2). session UUID가 있을 때만.
+    if (item.session) {
+      const view = document.createElement('button');
+      view.className = 'approval-view';
+      view.type = 'button';
+      view.textContent = '화면 보기';
+      view.addEventListener('click', () => {
+        const row = lastSessions.find((x) => x.id === item.session);
+        openViewer(item.session, (row && row.title) || (item.session_title || '세션'));
+      });
+      actions.appendChild(view);
+    }
     const deny = document.createElement('button');
     deny.className = 'deny';
     deny.textContent = '거부';

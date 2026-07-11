@@ -53,6 +53,12 @@ h1 { font-size: 19px; font-weight: 600; color: #f0f0f0; }
 .card-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
 .card-head .server { font-size: 12px; color: #9a9a9a; }
 .card-head .tool { font-size: 15px; font-weight: 600; color: #f0f0f0; word-break: break-word; }
+.approval-session { font-size: 12px; color: #9fb8cf; margin-bottom: 8px; word-break: break-word; }
+.approval-view {
+  font-size: 13px; font-weight: 600; padding: 7px 12px; border-radius: 8px;
+  background: #2c4a63; color: #cfe4f5; border: 1px solid #3d6183; cursor: pointer;
+  margin-right: auto;
+}
 .preview {
   font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: #c0c0c0;
   background: #161616; border-radius: 6px; padding: 8px; margin-bottom: 10px;

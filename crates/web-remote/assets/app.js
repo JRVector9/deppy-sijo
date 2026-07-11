@@ -163,6 +163,11 @@
     switch (msg && msg.type) {
       case 'welcome':
         setStatus('ok', '연결됨');
+        // 재연결이면 서버 접속 상태(시청)가 초기화됐다 — 보던 세션을 다시 watch한다 (P5d).
+        if (viewer.watching != null) {
+          viewer.screen = null;
+          send({ type: 'watch', session: viewer.watching });
+        }
         break;
       case 'dashboard':
         // 오프라인 폴백 화면이 "마지막 상태 시각"을 보여줄 수 있게 수신 시각을 저장한다.
@@ -172,11 +177,120 @@
       case 'approvals':
         renderApprovals(msg.pending || []);
         break;
+      case 'viewport':
+        handleViewport(msg);
+        break;
       case 'error':
         setStatus('bad', '오류: ' + (msg.message || ''));
         break;
     }
   }
+
+  function send(msg) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify(msg));
+    return true;
+  }
+
+  // ── 터미널 뷰어 (P5d) — 읽기 전용 canvas + 최소 제어(Ctrl-C/Enter) ──
+  // 서버 프레임(P5c): keyframe=전체 행, delta=바뀐 행만. 클라는 행별 run 배열을
+  // 화면 모델로 유지하고 매 프레임 전체를 다시 그린다(80×24 fillText는 ~ms — 단순 우선).
+  const viewer = {
+    el: document.getElementById('viewer'),
+    label: document.getElementById('viewer-session'),
+    canvas: document.getElementById('viewer-canvas'),
+    watching: null, // 시청 중 세션 id
+    screen: null,   // { cols, rows, lines: Array<runs>, cursor, alt } — null이면 keyframe 대기
+  };
+
+  function openViewer(sessionId, title) {
+    viewer.watching = sessionId;
+    viewer.screen = null;
+    viewer.label.textContent = title || ('세션 ' + sessionId);
+    viewer.el.hidden = false;
+    send({ type: 'watch', session: sessionId });
+    viewer.el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+
+  function closeViewer() {
+    if (viewer.watching == null) return;
+    viewer.watching = null;
+    viewer.screen = null;
+    viewer.el.hidden = true;
+    send({ type: 'unwatch' });
+  }
+
+  function handleViewport(msg) {
+    if (msg.session !== viewer.watching) return; // 전환 직후 이전 세션의 잔여 프레임
+    if (!msg.keyframe && !viewer.screen) {
+      // delta인데 기준 화면이 없다 — 재동기화 요청 (P5c RequestKeyframe)
+      send({ type: 'request_keyframe' });
+      return;
+    }
+    if (msg.keyframe || viewer.screen.cols !== msg.cols || viewer.screen.rows !== msg.rows) {
+      viewer.screen = { cols: msg.cols, rows: msg.rows, lines: new Array(msg.rows).fill(null) };
+    }
+    for (const line of msg.lines || []) {
+      if (line.row < viewer.screen.rows) viewer.screen.lines[line.row] = line.runs || [];
+    }
+    viewer.screen.cursor = msg.cursor || null;
+    viewer.screen.alt = !!msg.alt;
+    drawScreen();
+  }
+
+  function drawScreen() {
+    const screen = viewer.screen;
+    if (!screen) return;
+    const canvas = viewer.canvas;
+    const dpr = window.devicePixelRatio || 1;
+    // 폭에 맞춰 셀 크기 산출 — 80열이 폰 폭에 들어가게 축소 렌더(현재 화면 열람이 목적).
+    const cssWidth = canvas.parentElement.clientWidth || 320;
+    const cellW = cssWidth / screen.cols;
+    const cellH = cellW * 2; // 모노스페이스 종횡비 근사
+    const cssHeight = cellH * screen.rows;
+    canvas.width = Math.round(cssWidth * dpr);
+    canvas.height = Math.round(cssHeight * dpr);
+    canvas.style.width = cssWidth + 'px';
+    canvas.style.height = cssHeight + 'px';
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, cssWidth, cssHeight);
+    ctx.font = (cellH * 0.82).toFixed(2) + 'px ui-monospace, Menlo, monospace';
+    ctx.textBaseline = 'middle';
+    for (let row = 0; row < screen.rows; row++) {
+      const runs = screen.lines[row];
+      if (!runs) continue; // keyframe 이후 아직 갱신 안 된 행 없음(전체 수신) — 방어
+      const y = row * cellH;
+      for (const run of runs) {
+        const advance = run.w ? cellW * 2 : cellW;
+        const chars = Array.from(run.t || '');
+        // run 배경 — 시작 열부터 글자 수 × 폭
+        ctx.fillStyle = run.bg || '#000000';
+        ctx.fillRect(run.s * cellW, y, chars.length * advance, cellH);
+        ctx.fillStyle = run.fg || '#d4d4d4';
+        for (let i = 0; i < chars.length; i++) {
+          if (chars[i] === ' ') continue;
+          ctx.fillText(chars[i], run.s * cellW + i * advance, y + cellH / 2, advance);
+        }
+      }
+    }
+    // 커서 — 반투명 블록 오버레이 (모양 구분은 v1 비범위)
+    const cursor = screen.cursor;
+    if (cursor && cursor.visible) {
+      ctx.fillStyle = 'rgba(212, 212, 212, 0.45)';
+      ctx.fillRect(cursor.col * cellW, cursor.row * cellH, cellW, cellH);
+    }
+  }
+
+  function sendKey(key) {
+    if (viewer.watching == null) return;
+    send({ type: 'key', session: viewer.watching, key });
+  }
+
+  document.getElementById('viewer-close').addEventListener('click', closeViewer);
+  document.getElementById('viewer-ctrl-c').addEventListener('click', () => sendKey('ctrl_c'));
+  document.getElementById('viewer-enter').addEventListener('click', () => sendKey('enter'));
 
   function renderApprovals(pending) {
     approvalsCount.textContent = String(pending.length);
@@ -265,6 +379,18 @@
       badge.className = 'badge ' + status;
       badge.textContent = STATUS_LABEL[status] || status;
       li.appendChild(badge);
+
+      // 터미널 뷰어(P5d) — 현재 화면 읽기 전용 열람. 제목은 textContent로만 다룬다.
+      const viewBtn = document.createElement('button');
+      viewBtn.type = 'button';
+      viewBtn.className = 'view-btn';
+      viewBtn.textContent = s.id === viewer.watching ? '보는 중' : '보기';
+      viewBtn.disabled = s.id === viewer.watching;
+      viewBtn.addEventListener('click', () => {
+        openViewer(s.id, s.title || ('세션 ' + s.id));
+        renderSessions(sessions, resource); // "보는 중" 배지 갱신
+      });
+      li.appendChild(viewBtn);
       sessionsEl.appendChild(li);
     }
     if (resource) {

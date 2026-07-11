@@ -246,6 +246,12 @@ fn stream_loop(
                             viewport_seq = 0;
                             baseline = None;
                         }
+                        // 최소 제어 (P5d) — 이 접속이 시청 중인 세션에만 허용한다.
+                        Some(ClientMsg::Key { session, key }) => {
+                            if *watched == Some(session) {
+                                dashboard.send_key(session, &key);
+                            }
+                        }
                         Some(ClientMsg::Auth { .. }) | None => {}
                     }
                 }

@@ -1059,6 +1059,56 @@ mod tests {
         server.shutdown();
     }
 
+    /// P5d: 제어 키는 시청 중 세션에만 WriteInput으로 전달되고, 비시청 세션·
+    /// 미지 키는 무시된다.
+    #[test]
+    fn ws_key는_시청_중_세션에만_writeinput을_보낸다() {
+        let server = start(None);
+        let captured: Arc<Mutex<Vec<runtime::RuntimeCommand>>> = Arc::default();
+        let sink_cap = Arc::clone(&captured);
+        server.set_runtime_command_sink(Arc::new(move |command| {
+            sink_cap.lock().unwrap().push(command);
+        }));
+        let mut ws = ws_client(server.local_addr());
+        send_text(
+            &mut ws,
+            &format!(r#"{{"type":"auth","v":1,"token":"{TEST_TOKEN}"}}"#),
+        );
+        assert!(read_frame_of_type(&mut ws, "welcome", Duration::from_secs(3)).is_some());
+        send_text(&mut ws, r#"{"type":"watch","session":7}"#);
+        // 비시청 세션 키 + 미지 키 + 유효 키 순서로 보낸다
+        send_text(&mut ws, r#"{"type":"key","session":9,"key":"ctrl_c"}"#);
+        send_text(&mut ws, r#"{"type":"key","session":7,"key":"rm_rf"}"#);
+        send_text(&mut ws, r#"{"type":"key","session":7,"key":"ctrl_c"}"#);
+        send_text(&mut ws, r#"{"type":"key","session":7,"key":"enter"}"#);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let inputs: Vec<(u64, Vec<u8>)> = captured
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|command| match command {
+                    runtime::RuntimeCommand::WriteInput { session, bytes } => {
+                        Some((session.0, bytes.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if inputs.len() >= 2 {
+                assert_eq!(
+                    inputs,
+                    vec![(7, b"\x03".to_vec()), (7, b"\r".to_vec())],
+                    "비시청/미지 키가 통과했거나 매핑이 틀림"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "WriteInput이 도착하지 않음");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(ws);
+        server.shutdown();
+    }
+
     #[test]
     fn ws_인증_전_비auth_첫프레임은_거부() {
         let server = start(None);

@@ -856,6 +856,8 @@ struct WorkspaceRuntime {
     pending_events: Vec<runtime::RuntimeEvent>,
     /// 세션→제목 캐시 (MuxUpdated에서 누적) — Warm 동안 mux가 안 갱신돼도 알림 제목을
     /// 해석하기 위함. exit 처리 후 제거해 live 세션으로 유계.
+    /// 세션별 **raw** pane 제목("workspace.spawn.shell 3"). 표시 시점에 해석한다 —
+    /// 활동 패널/폰은 프로젝트명 규칙(activity_session_name), 알림은 i18n 렌더.
     session_titles: std::collections::HashMap<runtime::SessionId, String>,
     /// 마지막 worker resource sample. PR-U25 activity view 표시용.
     resource_usage: Option<runtime::ProcessResourceSnapshot>,
@@ -1169,6 +1171,12 @@ pub struct App {
     ts_detected: Option<crate::tailscale::Detected>,
     /// 이번 감지가 수동 버튼 유래인가 — true면 기존 설정값도 감지값으로 덮어쓴다.
     ts_detect_overwrite: bool,
+    /// 웹 스냅샷 마지막 동기화 시각 — 프레임마다 구축하지 않도록 스로틀(리뷰 P2-2).
+    last_web_sync: Option<std::time::Instant>,
+    /// cwd → 프로젝트 표시명 캐시. project_display_name은 .git을 상향 탐색하며 stat을
+    /// 최대 40회 호출한다 — 활동 패널/웹 스냅샷이 세션마다 부르므로 메모이즈한다.
+    /// cwd는 거의 안 바뀌고, 바뀌면 새 키로 들어온다(무효화 불필요, 유계).
+    project_name_cache: std::cell::RefCell<std::collections::HashMap<String, Option<String>>>,
     /// serve 진단/설정 1회성 스레드의 결과 수신 (진행 중일 때만 Some) — O1.
     serve_rx: Option<std::sync::mpsc::Receiver<crate::tailscale::ServeState>>,
     /// 마지막 serve 진단 결과. None = 이 세션에서 아직 진단 안 함.
@@ -1348,6 +1356,8 @@ impl App {
             ts_detect_rx: None,
             ts_detected: None,
             ts_detect_overwrite: false,
+            last_web_sync: None,
+            project_name_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             serve_rx: None,
             serve_state: None,
             known_hosts_cache: None,
@@ -2040,7 +2050,11 @@ impl App {
         // 구독 등록 직후 전체 워크스페이스 스냅샷을 시드한다 — 이벤트 스트림은 edge-trigger라,
         // 재구독한 대시보드는 과거 이력을 모른다. 시드가 없으면 이미 needs_approval로 정착한
         // 세션이 다음 상태 변화까지 "실행 중"으로 오표시된다(계획 P2 리뷰: 킬러 기능 훼손).
-        server.set_workspaces(self.web_workspace_seed());
+        let seeds = self.web_workspace_seed();
+        // 재구독 시점에만 활성 세션의 라이브 상태를 시드한다(매 프레임 push와 분리 —
+        // 리뷰 P1-1: 프레임 push가 상태를 덮으면 숨김 창에서 stale 값으로 되돌아간다).
+        Self::reseed_web_sessions(&server, &seeds);
+        server.set_workspaces(seeds);
         Ok(WebRemoteState { server, token })
     }
 
@@ -2060,7 +2074,22 @@ impl App {
             web.server.set_runtime_source(receiver);
             // 재구독 직후 새 워크스페이스 스냅샷을 시드한다(start_web과 동일 이유 + 세션 맵
             // 통째 교체로 옛 워크스페이스 세션 정체/전환 레이스까지 해소 — P2 리뷰).
-            web.server.set_workspaces(self.web_workspace_seed());
+            let seeds = self.web_workspace_seed();
+            Self::reseed_web_sessions(&web.server, &seeds);
+            web.server.set_workspaces(seeds);
+        }
+    }
+
+    /// 재구독 시점 시딩 — 스냅샷에서 활성 워크스페이스의 세션만 골라 넘긴다.
+    fn reseed_web_sessions(
+        server: &web_remote::WebRemoteServer,
+        seeds: &[web_remote::dashboard::WorkspaceSeed],
+    ) {
+        if let Some(active) = seeds
+            .iter()
+            .find(|ws| ws.state == web_remote::dashboard::WorkspaceState::Active)
+        {
+            server.reseed_active_sessions(&active.sessions);
         }
     }
 
@@ -2159,12 +2188,27 @@ impl App {
             .collect()
     }
 
-    /// 워크스페이스 스냅샷을 웹 대시보드에 반영한다(변화가 없으면 브리지가 조용히 무시).
-    /// 세션 spawn/종료·제목 해석·warm 전환마다 프레임에서 호출된다 — 비교 후 변화 시에만
-    /// 발행되므로 유휴 비용은 0이다.
-    fn sync_web_workspaces(&self) {
+    /// 워크스페이스 표시 스냅샷을 웹 대시보드에 반영한다(변화가 없으면 브리지가 무시).
+    ///
+    /// **상태는 시드하지 않는다** — 활성 세션의 상태는 런타임 이벤트가 소유하는 프레임
+    /// 독립 데이터다(리뷰 P1-1). 여기서는 구성·표시명만 보낸다.
+    ///
+    /// 스냅샷 **구축 비용**(제목 해석의 .git 상향 stat 등)이 프레임마다 들지 않도록
+    /// 스로틀한다 — 폰의 ≤1s 반영 요건에 여유가 큰 250ms (리뷰 P2-2).
+    fn sync_web_workspaces(&mut self, now: std::time::Instant) {
+        const WEB_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+        if self.web.is_none() {
+            return;
+        }
+        if let Some(last) = self.last_web_sync
+            && now.duration_since(last) < WEB_SYNC_INTERVAL
+        {
+            return;
+        }
+        self.last_web_sync = Some(now);
+        let seeds = self.web_workspace_seed();
         if let Some(web) = &self.web {
-            web.server.set_workspaces(self.web_workspace_seed());
+            web.server.set_workspaces(seeds);
         }
     }
 
@@ -3129,13 +3173,23 @@ impl App {
         let cwd = self
             .persisted_activity_panes
             .get(workspace_id)
-            .and_then(|panes| {
-                panes
-                    .iter()
-                    .find(|(title, _)| title == raw_title)
-                    .map(|(_, cwd)| cwd.as_str())
-            });
-        activity_session_name(raw_title, cwd, &self.i18n)
+            .and_then(|panes| pane_cwd(panes, raw_title));
+        activity_session_name(raw_title, cwd, &self.i18n, |cwd| {
+            self.cached_project_name(cwd)
+        })
+    }
+
+    /// cwd의 프로젝트 표시명 (메모이즈 — .git 상향 stat이 프레임마다 반복되지 않게).
+    fn cached_project_name(&self, cwd: &str) -> Option<String> {
+        if let Some(hit) = self.project_name_cache.borrow().get(cwd) {
+            return hit.clone();
+        }
+        let name =
+            crate::agent_detect::project_display_name(cwd).filter(|name| !name.trim().is_empty());
+        self.project_name_cache
+            .borrow_mut()
+            .insert(cwd.to_owned(), name.clone());
+        name
     }
 
     fn activity_rows(&self) -> Vec<ui::activity::ActivityWorkspaceRow> {
@@ -3287,21 +3341,24 @@ impl App {
                     session_titles.retain(|session, _| present.contains(session));
                     for pane in snapshot.tabs.iter().flat_map(|tab| &tab.panes) {
                         if let Some(session) = pane.session_id {
-                            session_titles.insert(
-                                session,
-                                ui::workspace::display_pane_title(&pane.title, catalog),
-                            );
+                            // **raw** 제목을 저장한다 — 표시 시점에 해석한다(활동 패널/폰은
+                            // 프로젝트명 규칙, 알림은 i18n 렌더). 렌더된 값을 넣으면
+                            // DB의 raw 제목과 매칭되지 않아 프로젝트명 해석이 조용히
+                            // 실패한다 (리뷰 P2-1).
+                            session_titles.insert(session, pane.title.clone());
                         }
                     }
                 }
                 runtime::RuntimeEvent::SessionStatusChanged { session, status } => {
-                    if let Some(title) = session_titles.get(session).cloned() {
+                    if let Some(raw) = session_titles.get(session).cloned() {
+                        let title = ui::workspace::display_pane_title(&raw, catalog);
                         notifications.on_status(workspace_id, *session, *status, &title, catalog);
                     }
                 }
                 // regex 없는 agent는 결과가 SessionExited로만 온다 (완료 기준: done/error)
                 runtime::RuntimeEvent::SessionExited { session, exit_code } => {
-                    if let Some(title) = session_titles.get(session).cloned() {
+                    if let Some(raw) = session_titles.get(session).cloned() {
+                        let title = ui::workspace::display_pane_title(&raw, catalog);
                         notifications.on_exit(workspace_id, *session, *exit_code, &title, catalog);
                     }
                     session_titles.remove(session);
@@ -3607,7 +3664,7 @@ impl eframe::App for App {
         // 폰 대시보드가 볼 워크스페이스 스냅샷(전체 + 해석된 세션 이름) 동기화.
         // ui()가 아닌 logic()에서 — 창이 숨겨져도 폰에는 최신 구성이 보여야 한다.
         // 브리지가 변화 없으면 무시하므로(값 비교) 유휴 프레임 비용은 사실상 0이다.
-        self.sync_web_workspaces();
+        self.sync_web_workspaces(std::time::Instant::now());
     }
 
     // egui 0.35부터 update(&Context) 대신 ui(&mut Ui) 시그니처를 쓴다.
@@ -5052,16 +5109,34 @@ fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) {
     }
 }
 
+/// 영속 pane snapshot에서 이 제목의 세션 cwd를 찾는다 (순수 — 테스트 대상).
+///
+/// **키는 DB에 저장된 raw 제목**("workspace.spawn.shell 3")이다. 호출측이 i18n 렌더된
+/// 값("셸 3")을 넘기면 항상 miss가 되어 프로젝트명 해석이 조용히 실패한다 —
+/// warm 워크스페이스에서 실제로 그랬다(리뷰 P2-1). session_titles는 raw를 보관한다.
+fn pane_cwd<'a>(panes: &'a [(String, String)], raw_title: &str) -> Option<&'a str> {
+    panes
+        .iter()
+        .find(|(title, _)| title == raw_title)
+        .map(|(_, cwd)| cwd.as_str())
+        .filter(|cwd| !cwd.is_empty())
+}
+
 /// 비활성(warm/유휴) 워크스페이스 pane의 표시명 (순수 — 테스트 대상).
 /// 활성 워크스페이스의 `resolve_session_title`과 같은 규칙: 사용자가 rename했으면
 /// 그대로, 기본 제목("셸 N")이면 세션 cwd의 프로젝트명으로 대체, cwd가 없거나 판별
 /// 불가면 기본 제목을 i18n 렌더한 값으로 폴백.
-fn activity_session_name(raw_title: &str, cwd: Option<&str>, catalog: &i18n::Catalog) -> String {
+fn activity_session_name(
+    raw_title: &str,
+    cwd: Option<&str>,
+    catalog: &i18n::Catalog,
+    resolve_project: impl Fn(&str) -> Option<String>,
+) -> String {
     if !ui::workspace::is_default_session_title(raw_title) {
         return ui::workspace::display_pane_title(raw_title, catalog);
     }
     cwd.filter(|cwd| !cwd.is_empty())
-        .and_then(crate::agent_detect::project_display_name)
+        .and_then(resolve_project)
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| ui::workspace::display_pane_title(raw_title, catalog))
 }
@@ -5073,6 +5148,38 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
+    /// 리뷰 P2-1 회귀: cwd 조회 키는 **DB의 raw 제목**이다. i18n 렌더된 값("셸 3")을
+    /// 넘기면 항상 miss가 되어 프로젝트명 해석이 조용히 실패한다 — warm 워크스페이스가
+    /// 실제로 그랬다(session_titles가 렌더 값을 담고 있었다).
+    #[test]
+    fn cwd_조회는_raw_제목을_키로_쓴다() {
+        let catalog = load_catalog("ko-KR");
+        let raw = "workspace.spawn.shell 3";
+        let panes = vec![(
+            raw.to_owned(),
+            "/Users/jr/Desktop/Projects/deppy-sijo".to_owned(),
+        )];
+        // raw로 조회 → cwd 적중 → 프로젝트명 해석 가능
+        assert_eq!(
+            pane_cwd(&panes, raw),
+            Some("/Users/jr/Desktop/Projects/deppy-sijo")
+        );
+        // 렌더된 값으로 조회 → miss (옛 버그 경로: session_titles가 렌더 값을 담았다)
+        let rendered = ui::workspace::display_pane_title(raw, &catalog);
+        assert_ne!(
+            rendered, raw,
+            "ko에서 렌더 값이 raw와 같으면 이 테스트는 무의미"
+        );
+        assert_eq!(
+            pane_cwd(&panes, &rendered),
+            None,
+            "렌더 값으로 조회가 적중하면 회귀"
+        );
+        // 빈 cwd는 없는 것으로 취급
+        let empty = vec![(raw.to_owned(), String::new())];
+        assert_eq!(pane_cwd(&empty, raw), None);
+    }
+
     /// 활동 패널(warm/유휴)의 pane 이름: 기본 제목은 프로젝트명으로, rename은 그대로.
     #[test]
     fn 활동_pane_이름은_기본제목이면_프로젝트명으로_표시된다() {
@@ -5082,28 +5189,49 @@ mod tests {
             activity_session_name(
                 "workspace.spawn.shell 1",
                 Some("/Users/jr/Desktop/Projects/deppy-sijo"),
-                &catalog
+                &catalog,
+                crate::agent_detect::project_display_name,
             ),
             "deppy-sijo"
         );
         // 사용자 rename은 cwd와 무관하게 그대로
         assert_eq!(
-            activity_session_name("배포 작업", Some("/tmp/whatever"), &catalog),
+            activity_session_name(
+                "배포 작업",
+                Some("/tmp/whatever"),
+                &catalog,
+                crate::agent_detect::project_display_name
+            ),
             "배포 작업"
         );
         // cwd 없음/빈 값 → 기본 제목 i18n 렌더로 폴백(기존 동작)
         let fallback = ui::workspace::display_pane_title("workspace.spawn.shell 3", &catalog);
         assert_eq!(
-            activity_session_name("workspace.spawn.shell 3", None, &catalog),
+            activity_session_name(
+                "workspace.spawn.shell 3",
+                None,
+                &catalog,
+                crate::agent_detect::project_display_name
+            ),
             fallback
         );
         assert_eq!(
-            activity_session_name("workspace.spawn.shell 3", Some(""), &catalog),
+            activity_session_name(
+                "workspace.spawn.shell 3",
+                Some(""),
+                &catalog,
+                crate::agent_detect::project_display_name
+            ),
             fallback
         );
         // 상대경로(비정상) → 폴백
         assert_eq!(
-            activity_session_name("workspace.spawn.shell 3", Some("relative/path"), &catalog),
+            activity_session_name(
+                "workspace.spawn.shell 3",
+                Some("relative/path"),
+                &catalog,
+                crate::agent_detect::project_display_name
+            ),
             fallback
         );
     }

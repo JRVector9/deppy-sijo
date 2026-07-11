@@ -56,7 +56,9 @@ const SW_VERSION_PLACEHOLDER: &str = "__SHELL_VERSION__";
 /// 템플릿이다(아래 [`index_html_response`]). SHELL(해시 입력)에 들어있지 않아 순환 없음.
 const INDEX_HTML_TEMPLATE: &str = include_str!("../assets/index.html");
 /// 게이트 실패(401) 본문 — 저장된 토큰으로 자동 복구를 시도하는 페어링 안내 페이지.
-const PAIRING_HTML: &[u8] = include_bytes!("../assets/pairing.html");
+/// index.html과 같은 이유로 버전 경로를 주입한다(리뷰 P3-1: 스테일 SW 하에서 "새
+/// pairing.html + 구 캐시 app.js"가 될 수 있는데, 이 페이지는 인증 복구 경로라 치명적).
+const PAIRING_HTML_TEMPLATE: &str = include_str!("../assets/pairing.html");
 
 /// GET 요청 하나를 정적 계층에서 라우팅한다. 화이트리스트 밖 경로는 404.
 ///
@@ -77,7 +79,7 @@ pub fn respond(path: &str, query: &str, expected_token: &str) -> Response {
             if token_param_matches(query, expected_token) {
                 index_html_response()
             } else {
-                html(401, PAIRING_HTML)
+                pairing_html_response()
             }
         }
         // 셸 JS의 연결 상태 폴링용 — 살아있음 외 아무것도 노출하지 않는다.
@@ -119,6 +121,16 @@ fn index_html_response() -> Response {
     let body = INDEX_HTML_TEMPLATE.replace(SW_VERSION_PLACEHOLDER, shell_version());
     Response {
         status: 200,
+        content_type: "text/html; charset=utf-8",
+        body: Cow::Owned(body.into_bytes()),
+    }
+}
+
+/// 페어링(401) 문서 — index.html과 같이 버전 경로를 주입한다.
+fn pairing_html_response() -> Response {
+    let body = PAIRING_HTML_TEMPLATE.replace(SW_VERSION_PLACEHOLDER, shell_version());
+    Response {
+        status: 401,
         content_type: "text/html; charset=utf-8",
         body: Cow::Owned(body.into_bytes()),
     }
@@ -186,14 +198,6 @@ pub(crate) fn token_matches(expected: &str, provided: &[u8]) -> bool {
         .zip(provided)
         .fold(0u8, |acc, (a, b)| acc | (a ^ b))
         == 0
-}
-
-fn html(status: u16, body: &'static [u8]) -> Response {
-    Response {
-        status,
-        content_type: "text/html; charset=utf-8",
-        body: Cow::Borrowed(body),
-    }
 }
 
 #[cfg(test)]

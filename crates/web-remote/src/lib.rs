@@ -196,6 +196,12 @@ impl WebRemoteServer {
         self.dashboard.set_workspaces(seeds);
     }
 
+    /// 재구독 시점(start_web·워크스페이스 전환)에 활성 세션의 라이브 상태를 시드한다.
+    /// 매 프레임 호출하는 [`Self::set_workspaces`]와 분리돼 있다 — 리뷰 P1-1 참조.
+    pub fn reseed_active_sessions(&self, sessions: &[dashboard::SessionSeed]) {
+        self.dashboard.reseed_active_sessions(sessions);
+    }
+
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
     }
@@ -921,7 +927,11 @@ mod tests {
         );
         let welcome = read_frame_of_type(&mut ws, "welcome", Duration::from_secs(3));
         assert!(welcome.is_some(), "welcome 프레임 없음");
-        assert!(welcome.unwrap().contains(r#""v":1"#));
+        assert!(
+            welcome
+                .unwrap()
+                .contains(&format!(r#""v":{}"#, protocol::PROTOCOL_VERSION))
+        );
         // 접속 없던 서버가 등록 즉시 대시보드 프레임을 발행한다(빈 세션이라도)
         assert!(
             read_frame_of_type(&mut ws, "dashboard", Duration::from_secs(3)).is_some(),
@@ -1546,19 +1556,34 @@ mod tests {
         }]
     }
 
+    /// 앱의 재구독 경로(start_web/rebind)와 동일하게 상태 시딩 + 표시 스냅샷을 적용한다.
+    /// 매 프레임 경로는 set_workspaces만 부른다 — 상태를 덮지 않는다(리뷰 P1-1).
+    fn apply_seed(server: &WebRemoteServer, seeds: Vec<dashboard::WorkspaceSeed>) {
+        if let Some(active) = seeds
+            .iter()
+            .find(|ws| ws.state == dashboard::WorkspaceState::Active)
+        {
+            server.reseed_active_sessions(&active.sessions);
+        }
+        server.set_workspaces(seeds);
+    }
+
     // ── P2-1: 대시보드 상태 시드 ───────────────────────────────────────────
     #[test]
     fn ws_시드_상태가_프레임에_반영되고_mux는_제목을_덮지_않는다() {
         let server = start(None);
         let addr = server.local_addr();
         // 접속(재구독) 전에 needs_approval로 시드 — 이벤트 이력 없는 새 구독자가 즉시 반영해야 한다
-        server.set_workspaces(active_seed(vec![dashboard::SessionSeed {
-            id: Some(7),
-            title: "claude".to_owned(),
-            status: Some(runtime::SessionStatus::NeedsApproval),
-            agent: Some("Claude · sonnet · high".to_owned()),
-            exited: false,
-        }]));
+        apply_seed(
+            &server,
+            active_seed(vec![dashboard::SessionSeed {
+                id: Some(7),
+                title: "claude".to_owned(),
+                status: Some(runtime::SessionStatus::NeedsApproval),
+                agent: Some("Claude · sonnet · high".to_owned()),
+                exited: false,
+            }]),
+        );
         let mut ws = ws_client_authed(addr);
         let frame = wait_dashboard_frame(&mut ws, r#""id":7"#).expect("시드 프레임 없음");
         assert!(frame.contains(r#""status":"needs_approval""#), "{frame}");
@@ -1590,32 +1615,35 @@ mod tests {
     fn ws_대시보드는_전체_워크스페이스를_싣고_비활성은_표시전용이다() {
         let server = start(None);
         let addr = server.local_addr();
-        server.set_workspaces(vec![
-            dashboard::WorkspaceSeed {
-                id: "ws-1".to_owned(),
-                name: "deppy-sijo".to_owned(),
-                state: dashboard::WorkspaceState::Active,
-                sessions: vec![dashboard::SessionSeed {
-                    id: Some(7),
-                    title: "deppy-sijo".to_owned(),
-                    status: Some(runtime::SessionStatus::Running),
-                    agent: Some("Codex · gpt-5.5 · high".to_owned()),
-                    exited: false,
-                }],
-            },
-            dashboard::WorkspaceSeed {
-                id: "ws-2".to_owned(),
-                name: "source".to_owned(),
-                state: dashboard::WorkspaceState::Warm,
-                sessions: vec![dashboard::SessionSeed {
-                    id: None,
-                    title: "deppy-mux".to_owned(),
-                    status: None,
-                    agent: None,
-                    exited: false,
-                }],
-            },
-        ]);
+        apply_seed(
+            &server,
+            vec![
+                dashboard::WorkspaceSeed {
+                    id: "ws-1".to_owned(),
+                    name: "deppy-sijo".to_owned(),
+                    state: dashboard::WorkspaceState::Active,
+                    sessions: vec![dashboard::SessionSeed {
+                        id: Some(7),
+                        title: "deppy-sijo".to_owned(),
+                        status: Some(runtime::SessionStatus::Running),
+                        agent: Some("Codex · gpt-5.5 · high".to_owned()),
+                        exited: false,
+                    }],
+                },
+                dashboard::WorkspaceSeed {
+                    id: "ws-2".to_owned(),
+                    name: "source".to_owned(),
+                    state: dashboard::WorkspaceState::Warm,
+                    sessions: vec![dashboard::SessionSeed {
+                        id: None,
+                        title: "deppy-mux".to_owned(),
+                        status: None,
+                        agent: None,
+                        exited: false,
+                    }],
+                },
+            ],
+        );
         let mut ws = ws_client_authed(addr);
         let frame =
             wait_dashboard_frame(&mut ws, r#""state":"warm""#).expect("warm 워크스페이스 없음");
@@ -1632,13 +1660,16 @@ mod tests {
         let server = start(None);
         let addr = server.local_addr();
         // 워크스페이스 A: 세션 1 = needs_approval
-        server.set_workspaces(active_seed(vec![dashboard::SessionSeed {
-            id: Some(1),
-            title: "A".to_owned(),
-            status: Some(runtime::SessionStatus::NeedsApproval),
-            agent: None,
-            exited: false,
-        }]));
+        apply_seed(
+            &server,
+            active_seed(vec![dashboard::SessionSeed {
+                id: Some(1),
+                title: "A".to_owned(),
+                status: Some(runtime::SessionStatus::NeedsApproval),
+                agent: None,
+                exited: false,
+            }]),
+        );
         let mut ws = ws_client_authed(addr);
         assert!(
             wait_dashboard_frame(&mut ws, r#""id":1"#).is_some(),
@@ -1646,13 +1677,16 @@ mod tests {
         );
         // 전환: 워크스페이스 B로 재시드(세션 2 = error). 세션 맵 통째 교체라 A의 세션 1은 사라진다
         // — MuxUpdated 재발화를 놓쳐도 옛 워크스페이스 세션이 정체되지 않는다(전환 레이스 해소).
-        server.set_workspaces(active_seed(vec![dashboard::SessionSeed {
-            id: Some(2),
-            title: "B".to_owned(),
-            status: Some(runtime::SessionStatus::Error),
-            agent: None,
-            exited: false,
-        }]));
+        apply_seed(
+            &server,
+            active_seed(vec![dashboard::SessionSeed {
+                id: Some(2),
+                title: "B".to_owned(),
+                status: Some(runtime::SessionStatus::Error),
+                agent: None,
+                exited: false,
+            }]),
+        );
         let frame =
             wait_dashboard_frame(&mut ws, r#""id":2"#).expect("워크스페이스 B 재시드 미반영");
         assert!(frame.contains(r#""status":"error""#), "{frame}");

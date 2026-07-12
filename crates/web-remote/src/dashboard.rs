@@ -47,6 +47,12 @@ const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(15);
 /// 워크스페이스 전환 시 receiver와 함께 교체한다. fire-and-forget — 실패는 로그만.
 pub type CommandSink = Arc<dyn Fn(RuntimeCommand) + Send + Sync>;
 
+/// web → app 워크스페이스 전환 싱크 (미러 진입 — I1b-2). 명령 싱크(runtime 레벨)와 달리
+/// 워크스페이스 전환은 app 레벨이라 별도 채널이 필요하다. 앱이 start_web에서 한 번만
+/// 주입하고(워커별이 아니라 안정적), 폰의 Switch 메시지를 받아 워크스페이스 id를 넘긴다.
+/// 앱은 이걸 egui 스레드의 전환 큐에 넣고 repaint를 요청한다. fire-and-forget.
+pub type SwitchSink = Arc<dyn Fn(String) + Send + Sync>;
+
 /// 영속 UUID ↔ worker-로컬 u64 양방향 맵 (v3.7 I1).
 #[derive(Default)]
 struct IdMap {
@@ -418,6 +424,11 @@ struct Inner {
     push_sink: Option<crate::push::PushHandle>,
     /// web → runtime 명령 싱크 (P5b). None이면 시청 lease를 보내지 않는다(뷰어 비활성).
     command_sink: Option<CommandSink>,
+    /// web → app 워크스페이스 전환 싱크 (미러 진입 — I1b-2). None이면 Switch를 무시한다.
+    switch_sink: Option<SwitchSink>,
+    /// 일시 안내 배너(미러 진입 상한 초과 등 — I1b-2). 앱이 세팅/해제하고 Dashboard 프레임에
+    /// 실려 폰에 전달된다.
+    notice: Option<String>,
     /// 세션별 시청 접속 집계 (P5b). 0→1에서 lease on, 1→0에서 lease off를 보낸다.
     watchers: BTreeMap<String, WatcherEntry>,
     /// 시청 세션별 최신 bracketed paste 모드 (P6a — Viewport 이벤트에서 캐시).
@@ -506,6 +517,8 @@ impl DashboardHandle {
                 last_poll: Instant::now() - POLL_INTERVAL,
                 push_sink: None,
                 command_sink: None,
+                switch_sink: None,
+                notice: None,
                 watchers: BTreeMap::new(),
                 bracketed: BTreeMap::new(),
                 ids: IdMap::default(),
@@ -581,6 +594,40 @@ impl DashboardHandle {
     pub fn set_command_sink(&self, sink: CommandSink) {
         let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
         inner.command_sink = Some(sink);
+    }
+
+    /// web → app 워크스페이스 전환 싱크를 붙인다 (미러 진입 — I1b-2). app 레벨이라 워커별이
+    /// 아니라 start_web에서 한 번만 주입한다(receiver·command_sink와 달리 전환마다 교체 불필요).
+    pub fn set_switch_sink(&self, sink: SwitchSink) {
+        let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
+        inner.switch_sink = Some(sink);
+    }
+
+    /// 폰의 워크스페이스 전환 요청을 앱으로 넘긴다 (미러 진입 — I1b-2). 싱크는 앱 전환 큐에
+    /// push하고 repaint만 하므로(브리지 inner를 다시 잠그지 않음) 락을 놓고 호출한다 — 재진입
+    /// 데드락 회피. 싱크 미설정(뷰어 전용/테스트)이면 조용히 무시한다.
+    pub fn request_switch(&self, workspace: &str) {
+        let sink = {
+            let inner = self.shared.inner.lock().expect("dashboard inner lock");
+            inner.switch_sink.clone()
+        };
+        if let Some(sink) = sink {
+            sink(workspace.to_owned());
+        }
+    }
+
+    /// 폰에 띄울 일시 안내 배너를 세팅/해제한다 (미러 진입 상한 초과 등 — I1b-2). 내용이
+    /// 바뀔 때만 dirty로 표시해 다음 Dashboard 프레임에 실어 보낸다(변화 없으면 비용 0).
+    pub fn set_notice(&self, notice: Option<String>) {
+        {
+            let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
+            if inner.notice == notice {
+                return;
+            }
+            inner.notice = notice;
+            inner.dirty = true;
+        }
+        self.shared.cvar.notify_all();
     }
 
     /// 접속의 시청 대상 전환 (P5b). `from`을 내리고 `to`를 올린다 — refcount 전이
@@ -1101,6 +1148,7 @@ fn run(shared: &Arc<Shared>) {
             let dash_json = ServerMsg::Dashboard {
                 workspaces: workspace_views(&inner.workspaces, &inner.sessions, &inner.ids),
                 resource: inner.resource.clone(),
+                notice: inner.notice.clone(),
             }
             .encode();
             let appr_json = approvals.map(|pending| ServerMsg::Approvals { pending }.encode());
@@ -1389,6 +1437,33 @@ mod tests {
             vec![(7, true), (9, true), (7, false), (9, false)],
             "refcount 전이 외 lease 전송이 있음"
         );
+        handle.stop();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn request_switch는_스위치_싱크로_워크스페이스_id를_넘긴다() {
+        // 미러 진입(I1b-2) — 폰 Switch가 앱 전환 채널로 그대로 전달돼야 한다.
+        let (handle, thread) = DashboardHandle::spawn(None);
+        let captured: StdArc<Mutex<Vec<String>>> = StdArc::default();
+        let cap = StdArc::clone(&captured);
+        let sink: SwitchSink = StdArc::new(move |ws| cap.lock().unwrap().push(ws));
+        handle.set_switch_sink(sink);
+        handle.request_switch("ws-2");
+        handle.request_switch("ws-7");
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec!["ws-2".to_owned(), "ws-7".to_owned()]
+        );
+        handle.stop();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn switch_싱크_미설정이면_request_switch가_무시된다() {
+        // 싱크 없이(뷰어 전용/테스트) 호출해도 패닉/블록 없이 조용히 무시한다.
+        let (handle, thread) = DashboardHandle::spawn(None);
+        handle.request_switch("ws-1");
         handle.stop();
         thread.join().unwrap();
     }

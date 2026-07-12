@@ -62,6 +62,13 @@ pub enum ClientMsg {
         #[serde(default)]
         submit: bool,
     },
+    /// 워크스페이스 전환 요청 (미러 진입 — I1b-2). 폰이 비활성 워크스페이스로 들어가
+    /// 이어서 작업할 때 보낸다. 데스크탑 active를 그 워크스페이스로 전환시킨다(하드 미러 —
+    /// single-source 브리지라 active가 바뀌면 폰·데스크탑이 같은 화면). 대기(warm)는 즉시
+    /// 재사용, 절전은 워커 재생성+resume을 앱의 switch_workspace가 처리하고, 대기 워커 상한
+    /// 초과는 앱이 거부하며 notice로 알린다. `workspace`는 프레임이 이미 폰에 준 워크스페이스
+    /// id(안정 문자열 — 세션 u64와 달리 매핑 불필요)다.
+    Switch { workspace: String },
 }
 
 impl ClientMsg {
@@ -167,6 +174,10 @@ pub enum ServerMsg {
     Dashboard {
         workspaces: Vec<WorkspaceView>,
         resource: Option<ResourceView>,
+        /// 일시 안내 배너(미러 진입 상한 초과 등 — I1b-2). 앱이 세팅하고 TTL 지나면
+        /// 스스로 None으로 돌린다. 클라는 내용이 바뀔 때만 표시하고 몇 초 뒤 자동으로 숨긴다.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        notice: Option<String>,
     },
     /// 승인 대기 목록(DB 폴링 유래).
     Approvals { pending: Vec<ApprovalView> },
@@ -349,6 +360,34 @@ mod tests {
                 allowed: false,
                 remember: true
             }
+        );
+    }
+
+    #[test]
+    fn switch_프레임을_파싱한다() {
+        // 미러 진입(I1b-2) — 워크스페이스 id만 실린다.
+        let msg = ClientMsg::parse(r#"{"type":"switch","workspace":"ws-2"}"#).unwrap();
+        assert_eq!(
+            msg,
+            ClientMsg::Switch {
+                workspace: "ws-2".into()
+            }
+        );
+        // workspace 누락은 파싱 실패(None) — 앱에 빈 전환이 가지 않는다.
+        assert!(ClientMsg::parse(r#"{"type":"switch"}"#).is_none());
+    }
+
+    #[test]
+    fn dashboard_notice는_some일때만_실린다() {
+        let with = ServerMsg::Dashboard {
+            workspaces: vec![],
+            resource: None,
+            notice: Some("대기 워커가 가득 찼습니다".into()),
+        }
+        .encode();
+        assert!(
+            with.contains(r#""notice":"대기 워커가 가득 찼습니다""#),
+            "{with}"
         );
     }
 
@@ -692,12 +731,15 @@ mod tests {
                 cpu: Some(12.5),
                 rss_mb: 340,
             }),
+            notice: None,
         }
         .encode();
         assert!(dash.contains(r#""type":"dashboard""#), "{dash}");
         assert!(dash.contains(r#""status":"needs_approval""#), "{dash}");
         assert!(dash.contains(r#""rss_mb":340"#), "{dash}");
         assert!(dash.contains(r#""state":"warm""#), "{dash}");
+        // notice None이면 프레임에 실리지 않는다(skip_serializing_if).
+        assert!(!dash.contains(r#""notice""#), "{dash}");
         assert!(
             dash.contains(r#""agent":"Claude · sonnet · high""#),
             "{dash}"

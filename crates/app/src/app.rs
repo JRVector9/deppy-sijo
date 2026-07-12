@@ -1037,6 +1037,12 @@ pub struct App {
     runtime_stream_warning: bool,
     /// live warm hard cap을 넘기는 workspace 전환을 거부했을 때 대상 표시명.
     warm_limit_warning: Option<String>,
+    /// 폰(미러 진입 — I1b-2)이 보낸 워크스페이스 전환 요청 큐. 웹 스레드가 push하고 egui
+    /// 스레드가 ui() 시작에서 drain해 switch_workspace로 넘긴다(App은 egui 스레드 소유).
+    web_switch_queue: Arc<std::sync::Mutex<Vec<String>>>,
+    /// 폰에 띄울 일시 안내(전환 상한 초과 등 — I1b-2)와 세팅 시각. TTL이 지나면 프레임
+    /// push에서 None으로 돌려 배너를 내린다(데스크탑 warm_limit_warning 모달과 독립).
+    web_notice: Option<(String, std::time::Instant)>,
     /// rename 제안을 '무시'한 워크스페이스 — 이번 실행 동안 재확인 안 함(경로 변경 시 해제).
     dismissed_renames: std::collections::HashSet<String>,
     settings_open: bool,
@@ -1281,6 +1287,8 @@ impl App {
             ws_delete_confirm: None,
             runtime_stream_warning: false,
             warm_limit_warning: None,
+            web_switch_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
+            web_notice: None,
             dismissed_renames: std::collections::HashSet::new(),
             settings_open: false,
             settings_was_open: false,
@@ -1407,6 +1415,8 @@ impl App {
     /// 실행 중 세션이 있는 warm workspace hard cap. 초과 전환은 기존 작업을 죽이지 않고
     /// 거부해 runtime/PTY/terminal buffer가 workspace 수만큼 무한 증가하지 않게 한다.
     const MAX_LIVE_WARM: usize = 4;
+    /// 폰 미러 진입(I1b-2) 안내 배너 표시 시간 — 이 뒤 앱이 notice를 None으로 돌린다.
+    const WEB_NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(6);
     /// Warm workspace가 이 시간 동안 재활성화되지 않으면 Suspended로 내린다. 세션/PTY는
     /// 종료되고 layout/session metadata만 DB에 남는다 (§14.1). live 세션이 있으면
     /// 시간이 지나도 내리지 않는다.
@@ -2058,6 +2068,17 @@ impl App {
         // 리뷰 P1-1: 프레임 push가 상태를 덮으면 숨김 창에서 stale 값으로 되돌아간다).
         Self::reseed_web_sessions(&server, &seeds);
         server.set_workspaces(seeds);
+        // 폰 미러 진입(I1b-2) — 전환 요청을 egui 스레드 큐로 넘기는 싱크. app 레벨이라 한 번만
+        // 주입한다(command_sink처럼 워커별 교체 불필요). 웹 스레드에서 불리므로 큐 push +
+        // repaint만 하고, 실제 switch_workspace는 ui()가 큐를 drain해 egui 스레드에서 실행한다.
+        let switch_queue = Arc::clone(&self.web_switch_queue);
+        let switch_ctx = self.egui_ctx.clone();
+        server.set_switch_sink(Arc::new(move |workspace: String| {
+            if let Ok(mut queue) = switch_queue.lock() {
+                queue.push(workspace);
+            }
+            switch_ctx.request_repaint();
+        }));
         Ok(WebRemoteState { server, token })
     }
 
@@ -2292,6 +2313,65 @@ impl App {
     /// workspace 전환 (워커-per-workspace §14.1 Warm): 현재 활성 workspace는 Warm으로
     /// 내려 워커를 계속 살려 둔다(에이전트 유지). 대상이 warm 풀에 있으면 재사용(즉시 복귀),
     /// 없으면 새로 만든다. warm 풀이 MAX_WARM을 넘으면 가장 오래된 것을 Suspended(shutdown).
+    /// 폰(미러 진입 — I1b-2)이 보낸 전환 요청 큐를 비운다. 웹 스레드가 push한 워크스페이스
+    /// id를 egui 스레드에서 switch_workspace로 넘긴다 — 대기=재사용/절전=재생성/상한초과=거부를
+    /// switch_workspace가 처리하고, 성공 시 rebind_web_dashboard가 폰·데스크탑을 미러시킨다.
+    fn drain_web_switch_requests(&mut self) {
+        let requests: Vec<String> = match self.web_switch_queue.lock() {
+            Ok(mut queue) if !queue.is_empty() => queue.drain(..).collect(),
+            _ => return,
+        };
+        for ws_id in requests {
+            self.handle_web_switch(&ws_id);
+        }
+    }
+
+    /// 폰이 요청한 워크스페이스로 전환한다(미러 진입). 알 수 없는 id는 무시(방어), 이미
+    /// 활성이면 no-op. 상한 초과로 switch_workspace가 거부하면(active 그대로) 폰에 안내를
+    /// 띄운다 — 조용한 실패를 막는다.
+    fn handle_web_switch(&mut self, ws_id: &str) {
+        if ws_id == self.active.id {
+            return; // 이미 활성 — 폰은 이미 미러 중.
+        }
+        if !self.workspaces.iter().any(|ws| ws.id == ws_id) {
+            tracing::warn!(ws = %ws_id, "폰 전환 요청 — 알 수 없는 워크스페이스 무시");
+            return;
+        }
+        self.switch_workspace(ws_id);
+        if self.active.id == ws_id {
+            // 전환 성공 — 직전 안내 해제(미러가 곧 폰에 반영된다).
+            self.set_web_notice(None);
+        } else if let Some(target) = self.warm_limit_warning.clone() {
+            // 상한 초과로 거부됨 — 폰에 안내(데스크탑 모달과 독립, TTL로 자동 해제).
+            let msg = self.i18n.t(
+                "workspace.warm_limit.body",
+                &[
+                    ("target", &target),
+                    ("limit", &Self::MAX_LIVE_WARM.to_string()),
+                ],
+            );
+            self.set_web_notice(Some(msg));
+            self.egui_ctx.request_repaint_after(Self::WEB_NOTICE_TTL);
+        }
+    }
+
+    /// 폰 안내 배너를 세팅/해제한다 (I1b-2). 앱 상태와 브리지 프레임을 함께 갱신한다.
+    fn set_web_notice(&mut self, notice: Option<String>) {
+        self.web_notice = notice.clone().map(|msg| (msg, std::time::Instant::now()));
+        if let Some(web) = &self.web {
+            web.server.set_dashboard_notice(notice);
+        }
+    }
+
+    /// notice TTL이 지나면 배너를 내린다 (I1b-2 — logic()에서 매 프레임 확인).
+    fn expire_web_notice(&mut self) {
+        if let Some((_, set_at)) = &self.web_notice
+            && set_at.elapsed() >= Self::WEB_NOTICE_TTL
+        {
+            self.set_web_notice(None);
+        }
+    }
+
     fn switch_workspace(&mut self, target_id: &str) {
         if target_id == self.active.id {
             return;
@@ -3659,6 +3739,11 @@ impl eframe::App for App {
         if self.approval_poll_requested.swap(false, Ordering::AcqRel) {
             self.poll_pending_approvals();
         }
+
+        // 폰 미러 진입(I1b-2) — 웹 스레드가 큐에 넣은 워크스페이스 전환 요청을 처리한다.
+        // ui()가 아닌 여기(logic)에서 — 데스크탑 창이 숨겨져도(폰 전용 사용) 전환돼야 한다.
+        self.drain_web_switch_requests();
+        self.expire_web_notice();
 
         // 에이전트 감지 워커 입력 갱신 + 결과 드레인 — ui()가 아닌 여기(logic)에서 해야
         // hidden/minimized로 ui()가 스킵돼도 결과 채널이 누적되지 않는다(codex 리뷰).

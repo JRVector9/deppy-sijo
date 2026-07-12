@@ -63,6 +63,7 @@
   const sessionsEl = document.getElementById('sessions');
   const sessionsEmpty = document.getElementById('sessions-empty');
   const resourceEl = document.getElementById('resource');
+  const noticeBanner = document.getElementById('notice-banner');
 
   const token = localStorage.getItem(TOKEN_KEY);
 
@@ -190,6 +191,7 @@
         // 오프라인 폴백 화면이 "마지막 상태 시각"을 보여줄 수 있게 수신 시각을 저장한다.
         localStorage.setItem(LAST_DASHBOARD_KEY, String(Date.now()));
         renderWorkspaces(msg.workspaces || [], msg.resource || null);
+        showNotice(msg.notice || null); // 미러 진입 안내(I1b-2)
         break;
       case 'approvals':
         renderApprovals(msg.pending || []);
@@ -751,6 +753,26 @@
 
   const WORKSPACE_STATE_LABEL = { active: '활성', warm: '대기', suspended: '절전' };
 
+  // 미러 진입 안내 배너(I1b-2). 서버가 Dashboard 프레임에 실어 보내는 일시 안내(전환 상한
+  // 초과 등)를 표시한다. 서버가 TTL 동안 같은 안내를 반복해 보내도 내용이 바뀔 때만 한 번
+  // 띄우고, 클라 타이머로 몇 초 뒤 자동으로 숨긴다. 내용은 textContent로만 삽입한다.
+  let lastNotice = null;
+  let noticeTimer = null;
+  function showNotice(text) {
+    if (!text) {
+      lastNotice = null; // 서버가 내림 — 다음에 같은 문구가 와도 다시 뜨게 리셋
+      return;
+    }
+    if (text === lastNotice) return; // 같은 안내 반복 표시 방지
+    lastNotice = text;
+    noticeBanner.textContent = text;
+    noticeBanner.hidden = false;
+    if (noticeTimer) clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => {
+      noticeBanner.hidden = true;
+    }, 6000);
+  }
+
   // 워크스페이스별 세션 목록. 활성 워크스페이스의 세션만 id가 있어 시청/입력이 가능하고,
   // 대기/절전은 표시 전용이다(세션 id가 worker-로컬이라 다른 워크스페이스 id로 시청하면
   // 엉뚱한 세션이 잡힌다 — 서버가 id 자체를 안 보낸다). 이름은 데스크톱 활동 패널과 같은
@@ -777,6 +799,20 @@
       state.className = 'ws-state ' + (ws.state || 'suspended');
       state.textContent = WORKSPACE_STATE_LABEL[ws.state] || ws.state || '';
       head.appendChild(state);
+      // 비활성(대기/절전) 워크스페이스는 "이어서 작업" — 데스크탑 active를 이 워크스페이스로
+      // 전환시켜(하드 미러) 폰에서 그대로 이어서 작업한다. 대기는 즉시, 절전은 깨우기.
+      // 낙관적 disable은 하지 않는다 — 성공하면 프레임이 active로 바뀌어 버튼이 사라지고,
+      // 상한 초과로 거부되면 서버 notice 배너가 사유를 알린다(둘 다 재렌더로 자연 반영).
+      if (ws.state && ws.state !== 'active') {
+        const enter = document.createElement('button');
+        enter.type = 'button';
+        enter.className = 'ws-enter';
+        enter.textContent = '이어서 작업';
+        enter.addEventListener('click', () => {
+          send({ type: 'switch', workspace: ws.id });
+        });
+        head.appendChild(enter);
+      }
       group.appendChild(head);
 
       const list = document.createElement('ul');

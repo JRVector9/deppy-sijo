@@ -26,6 +26,10 @@
       <p class="status"><span id="dot" class="dot"></span> <span id="status-text">연결 중…</span></p>
     </header>
 
+    <!-- 미러 진입 안내(I1b-2): 워크스페이스 전환 상한 초과 등. 서버 notice를 몇 초 표시 후
+         자동으로 숨긴다. 내용은 textContent로만 삽입한다(innerHTML 금지). -->
+    <div id="notice-banner" class="notice-banner" role="status" hidden></div>
+
     <!-- iOS 설치 안내: beforeinstallprompt가 없어 공유시트 수동 안내를 띄운다.
          app.js가 iOS Safari && !standalone일 때만 표시하고, 닫으면 localStorage로 억제한다. -->
     <div id="ios-install" class="ios-hint" hidden>

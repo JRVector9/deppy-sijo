@@ -90,6 +90,12 @@ h1 { font-size: 19px; font-weight: 600; color: #f0f0f0; }
 .ws-state.active { background: #21344a; color: #7db4e6; }
 .ws-state.warm { background: #3a3320; color: #d0b264; }
 .ws-state.suspended { background: #2a2a2a; color: #7a7a7a; }
+/* "이어서 작업"(미러 진입 — I1b-2). head 오른쪽 끝으로 민다. */
+.ws-enter {
+  flex: none; margin-left: auto; font-size: 12px; font-weight: 600; padding: 4px 10px;
+  background: #24402c; color: #86d29a; border: 1px solid #356048; border-radius: 8px;
+  cursor: pointer;
+}
 .ws-sessions { list-style: none; display: flex; flex-direction: column; gap: 8px; }
 .view-note { font-size: 11px; color: #7a7a7a; flex: none; }
 .session {
@@ -177,6 +183,12 @@ h1 { font-size: 19px; font-weight: 600; color: #f0f0f0; }
 .composer-note { margin-top: 6px; font-size: 12px; color: #e6b95a; }
 
 /* P3 설치 셸: iOS 설치 안내 배너 / 알림 권한 버튼 / 오프라인 재시도 */
+/* 미러 진입 안내 배너(I1b-2) — 전환 상한 초과 등. 몇 초 뒤 app.js가 숨긴다. */
+.notice-banner {
+  margin: 0 0 10px; padding: 9px 12px; border-radius: 10px; font-size: 13px;
+  background: #3a3320; color: #e0c88a; border: 1px solid #5a4a24;
+}
+.notice-banner[hidden] { display: none; }
 .ios-hint {
   position: relative; margin-top: 14px; padding: 14px 40px 14px 14px;
   background: #23303f; border: 1px solid #34506a; border-radius: 10px;

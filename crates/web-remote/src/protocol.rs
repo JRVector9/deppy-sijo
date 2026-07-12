@@ -98,7 +98,7 @@ pub struct SessionView {
 pub struct WorkspaceView {
     pub id: String,
     pub name: String,
-    /// "active" | "warm" | "idle"
+    /// "active" | "warm" | "suspended"
     pub state: &'static str,
     pub sessions: Vec<SessionView>,
 }

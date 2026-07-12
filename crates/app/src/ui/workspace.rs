@@ -1461,7 +1461,10 @@ impl WorkspaceUi {
         direction: SplitDirection,
         scrollback_lines: usize,
     ) {
-        if let Some(pane) = self.mux.as_ref().and_then(|mux| mux.focused_pane.clone()) {
+        // focused_pane이 없으면(복원 직후·pane 미클릭·단일 pane) 활성 탭의 첫 pane으로
+        // 폴백한다 — 안 그러면 분할 단축키/버튼이 조용히 아무 것도 안 해 "고장난 것처럼"
+        // 보인다(사용자 보고 2026-07-12).
+        if let Some(pane) = self.mux.as_deref().and_then(split_target_pane) {
             self.send(
                 client,
                 RuntimeCommand::SplitPane {
@@ -1938,6 +1941,21 @@ fn mux_sessions(snapshot: &MuxSnapshot) -> HashSet<SessionId> {
         .collect()
 }
 
+/// 분할이 대상으로 삼을 pane: 포커스된 pane이 있으면 그것, 없으면 활성 탭(없으면 첫 탭)의
+/// 첫 pane. pane이 하나도 없으면 None(빈 워크스페이스 — 분할할 게 없다).
+fn split_target_pane(snapshot: &MuxSnapshot) -> Option<runtime::MuxPaneId> {
+    if let Some(pane) = &snapshot.focused_pane {
+        return Some(pane.clone());
+    }
+    let tab = snapshot
+        .active_tab
+        .as_ref()
+        .and_then(|id| snapshot.tabs.iter().find(|tab| &tab.id == id))
+        .or_else(|| snapshot.tabs.first());
+    tab.and_then(|tab| tab.panes.first())
+        .map(|pane| pane.id.clone())
+}
+
 fn visible_mux_sessions(snapshot: &MuxSnapshot) -> HashSet<SessionId> {
     snapshot
         .active_tab
@@ -2031,6 +2049,53 @@ mod tests {
 
     fn catalog() -> i18n::Catalog {
         i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap()
+    }
+
+    #[test]
+    fn split_target는_focus_없으면_활성탭_첫_pane으로_폴백한다() {
+        let tab_a = tab(
+            "a",
+            vec![pane("pa", SessionId(1))],
+            LayoutNode::Pane(pane_id("pa")),
+        );
+        let tab_b = tab(
+            "b",
+            vec![pane("pb", SessionId(2))],
+            LayoutNode::Pane(pane_id("pb")),
+        );
+        let tabs = vec![tab_a, tab_b];
+
+        // focus가 있으면 그대로 쓴다.
+        let with_focus = MuxSnapshot {
+            tabs: tabs.clone(),
+            active_tab: Some(tab_id("a")),
+            focused_pane: Some(pane_id("pb")),
+        };
+        assert_eq!(split_target_pane(&with_focus), Some(pane_id("pb")));
+
+        // focus가 없으면 활성 탭(b)의 첫 pane으로 폴백.
+        let no_focus = MuxSnapshot {
+            tabs: tabs.clone(),
+            active_tab: Some(tab_id("b")),
+            focused_pane: None,
+        };
+        assert_eq!(split_target_pane(&no_focus), Some(pane_id("pb")));
+
+        // focus·active_tab 둘 다 없으면 첫 탭의 첫 pane.
+        let nothing = MuxSnapshot {
+            tabs,
+            active_tab: None,
+            focused_pane: None,
+        };
+        assert_eq!(split_target_pane(&nothing), Some(pane_id("pa")));
+
+        // 빈 워크스페이스면 분할 대상이 없다.
+        let empty = MuxSnapshot {
+            tabs: vec![],
+            active_tab: None,
+            focused_pane: None,
+        };
+        assert_eq!(split_target_pane(&empty), None);
     }
 
     #[test]

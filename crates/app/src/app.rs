@@ -1096,7 +1096,7 @@ pub struct App {
     /// warm workspace들 (전환으로 물러났지만 워커는 계속 실행 — §14.1 Warm). 이벤트는
     /// drain만 하고(채널 backup 방지) 렌더/알림은 안 한다. 재활성 시 즉시 복귀.
     warm: std::collections::HashMap<String, WorkspaceRuntime>,
-    /// warm LRU 순서 (앞이 가장 오래됨) — MAX_WARM 초과 시 앞에서부터 Suspended(shutdown).
+    /// warm LRU 순서 (앞이 가장 오래됨) — max_warm 초과 시 앞에서부터 Suspended(shutdown).
     warm_order: Vec<String>,
     egui_ctx: egui::Context,
     db_path: PathBuf,
@@ -1410,11 +1410,8 @@ impl App {
         app
     }
 
-    /// warm 상태로 유지할 최대 idle workspace 수 (활성 제외).
-    const MAX_WARM: usize = 2;
-    /// 실행 중 세션이 있는 warm workspace hard cap. 초과 전환은 기존 작업을 죽이지 않고
-    /// 거부해 runtime/PTY/terminal buffer가 workspace 수만큼 무한 증가하지 않게 한다.
-    const MAX_LIVE_WARM: usize = 4;
+    /// warm 상한(빈 warm 유지 수 `max_warm`, live warm hard cap `max_live_warm`)은 설정
+    /// (성능)으로 조정한다 — `self.config.performance`. 기본값은 RAM 유도(config.rs).
     /// 폰 미러 진입(I1b-2) 안내 배너 표시 시간 — 이 뒤 앱이 notice를 None으로 돌린다.
     const WEB_NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(6);
     /// Warm workspace가 이 시간 동안 재활성화되지 않으면 Suspended로 내린다. 세션/PTY는
@@ -2321,7 +2318,7 @@ impl App {
 
     /// workspace 전환 (워커-per-workspace §14.1 Warm): 현재 활성 workspace는 Warm으로
     /// 내려 워커를 계속 살려 둔다(에이전트 유지). 대상이 warm 풀에 있으면 재사용(즉시 복귀),
-    /// 없으면 새로 만든다. warm 풀이 MAX_WARM을 넘으면 가장 오래된 것을 Suspended(shutdown).
+    /// 없으면 새로 만든다. warm 풀이 max_warm을 넘으면 가장 오래된 것을 Suspended(shutdown).
     /// 폰(미러 진입 — I1b-2)이 보낸 전환 요청 큐를 비운다. 웹 스레드가 push한 워크스페이스
     /// id를 egui 스레드에서 switch_workspace로 넘긴다 — 대기=재사용/절전=재생성/상한초과=거부를
     /// switch_workspace가 처리하고, 성공 시 rebind_web_dashboard가 폰·데스크탑을 미러시킨다.
@@ -2377,7 +2374,7 @@ impl App {
                 "workspace.warm_limit.body",
                 &[
                     ("target", &target),
-                    ("limit", &Self::MAX_LIVE_WARM.to_string()),
+                    ("limit", &self.config.performance.max_live_warm.to_string()),
                 ],
             );
             self.set_web_notice(Some(msg));
@@ -2420,7 +2417,7 @@ impl App {
             target_is_live_warm,
             self.active.has_live_sessions(),
         );
-        if projected > Self::MAX_LIVE_WARM {
+        if projected > self.config.performance.max_live_warm as usize {
             self.warm_limit_warning = Some(
                 self.workspaces
                     .iter()
@@ -2625,12 +2622,13 @@ impl App {
         ctx.request_repaint();
     }
 
-    /// warm 풀이 MAX_WARM을 넘으면 가장 오래된 것부터 Suspended로 내린다 (워커 shutdown,
-    /// 세션 종료 — §14.1 Suspended). background 스레드에서 정리하고 on_exit에서 join.
+    /// warm 풀이 max_warm(설정)을 넘으면 가장 오래된 것부터 Suspended로 내린다 (워커
+    /// shutdown, 세션 종료 — §14.1 Suspended). background 스레드에서 정리하고 on_exit에서 join.
     /// **live 세션(미종료 셸/에이전트)이 있는 workspace는 축출하지 않는다** — 진행 중
     /// 작업을 경고 없이 kill하지 않기 위해 상한 초과를 허용한다 (메모리 < 작업 보호).
     fn evict_warm(&mut self) {
-        let evictable = warm_eviction_candidates(&self.warm_order, Self::MAX_WARM, |id| {
+        let max_warm = self.config.performance.max_warm as usize;
+        let evictable = warm_eviction_candidates(&self.warm_order, max_warm, |id| {
             self.warm.get(id).is_some_and(|rt| rt.has_live_sessions())
         });
         for evict_id in evictable {
@@ -4192,7 +4190,7 @@ impl eframe::App for App {
                         "workspace.warm_limit.body",
                         &[
                             ("target", &target),
-                            ("limit", &Self::MAX_LIVE_WARM.to_string()),
+                            ("limit", &self.config.performance.max_live_warm.to_string()),
                         ],
                     ));
                     ui.add_space(8.0);

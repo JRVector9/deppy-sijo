@@ -1906,6 +1906,35 @@ fn performance_page(
             }
         },
     );
+    // live warm hard cap — 이 기기 RAM 유도 권장값을 힌트에 함께 보인다.
+    let recommended = crate::config::recommended_max_live_warm();
+    row(
+        ui,
+        &catalog.t("settings.max_live_warm", &[]),
+        Some(&catalog.t(
+            "settings.max_live_warm.hint",
+            &[("recommended", &recommended.to_string())],
+        )),
+        |ui| {
+            let mut v = config.performance.max_live_warm as i64;
+            if stepper(ui, &mut v, 1, 1, 12, "") {
+                config.performance.max_live_warm = v as u32;
+                *changed = true;
+            }
+        },
+    );
+    row(
+        ui,
+        &catalog.t("settings.max_warm", &[]),
+        Some(&catalog.t("settings.max_warm.hint", &[])),
+        |ui| {
+            let mut v = config.performance.max_warm as i64;
+            if stepper(ui, &mut v, 1, 0, 8, "") {
+                config.performance.max_warm = v as u32;
+                *changed = true;
+            }
+        },
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

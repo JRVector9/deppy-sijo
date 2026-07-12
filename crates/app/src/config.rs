@@ -10,7 +10,10 @@ const MIN_OUTPUT_BATCH_MS: u64 = 16;
 /// 잡아(에이전트 실측 수백 MB보다 넉넉) 활성 작업+브라우저+IDE와 공존해도 스왑에 안 빠지게
 /// 3~8로 클램프한다. **첫 실행(또는 필드 첫 등장) 기본값일 뿐** — 저장 후엔 사용자 값을 쓴다.
 pub fn recommended_max_live_warm() -> u32 {
-    max_live_warm_for_ram_gb(ram_bytes() / (1024 * 1024 * 1024))
+    // RAM은 프로세스 수명 동안 불변이라 sysctl을 1회만 하고 캐시한다 — 설정(성능) 페이지가
+    // 힌트용으로 매 프레임 호출해도(리뷰 P3) 이후엔 원자 로드 한 번이다.
+    static CACHE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| max_live_warm_for_ram_gb(ram_bytes() / (1024 * 1024 * 1024)))
 }
 
 /// 순수 함수(테스트 용이) — RAM(GB)에서 권장 live warm 상한. 1슬롯당 4GB 예산, 3~8 클램프.

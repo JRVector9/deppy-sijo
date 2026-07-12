@@ -18,7 +18,10 @@ use serde::{Deserialize, Serialize};
 /// v2 (2026-07-12): Dashboard 프레임이 `sessions[]` → `workspaces[]`로 바뀌었다.
 /// 오래 열려 있던 옛 페이지가 재연결하면 세션 목록이 빈 채로 남으므로, 클라이언트가
 /// welcome의 v를 확인해 불일치 시 스스로 재로드한다 (리뷰 P3-6).
-pub const PROTOCOL_VERSION: u32 = 2;
+/// v3 (2026-07-12): 워크스페이스 상태 와이어 값 `"idle"` → `"suspended"`(I1b-1). 옛 캐시
+/// 클라는 라벨 맵/CSS에 이 값이 없어 영어 "suspended"를 그대로 표시하므로(graceful하나
+/// 미번역), 버전 불일치로 재로드시켜 새 자산을 받게 한다 (리뷰 I1b-1 P3).
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// 클라이언트 → 서버.
 #[derive(Debug, Clone, PartialEq, Deserialize)]

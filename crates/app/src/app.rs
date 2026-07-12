@@ -2177,42 +2177,50 @@ impl App {
                     };
                 }
                 // 대기(warm)/절전 — 감지 워커가 안 돌아 상태는 없다. 이름만 활동 패널과 동일 규칙.
-                let (state, raw_titles): (WorkspaceState, Vec<String>) = match self.warm.get(&ws.id)
-                {
-                    Some(rt) => {
-                        let mut ids: Vec<_> = rt.session_titles.keys().copied().collect();
-                        ids.sort_by_key(|s| s.0);
-                        let titles = ids
-                            .iter()
-                            .filter_map(|s| rt.session_titles.get(s).cloned())
-                            .collect();
-                        (WorkspaceState::Warm, titles)
-                    }
-                    None => (
-                        WorkspaceState::Suspended,
-                        self.persisted_activity_panes
-                            .get(&ws.id)
-                            .into_iter()
-                            .flatten()
-                            .map(|(title, _cwd)| title.clone())
-                            .collect(),
-                    ),
-                };
+                // 대기는 에이전트가 살아있어 마지막 감지 정보를 유지·표시하고(방안①), 절전은 죽어
+                // 표시하지 않는다.
+                let (state, sessions): (WorkspaceState, Vec<SessionSeed>) =
+                    match self.warm.get(&ws.id) {
+                        Some(rt) => {
+                            let mut ids: Vec<_> = rt.session_titles.keys().copied().collect();
+                            ids.sort_by_key(|s| s.0);
+                            let sessions = ids
+                                .iter()
+                                .filter_map(|s| {
+                                    let raw = rt.session_titles.get(s)?;
+                                    Some(SessionSeed {
+                                        id: None, // 표시 전용
+                                        title: self.activity_session_name(&ws.id, raw),
+                                        status: None,
+                                        agent: rt.workspace_ui.agent_line_for(*s),
+                                        exited: false,
+                                    })
+                                })
+                                .collect();
+                            (WorkspaceState::Warm, sessions)
+                        }
+                        None => {
+                            let sessions = self
+                                .persisted_activity_panes
+                                .get(&ws.id)
+                                .into_iter()
+                                .flatten()
+                                .map(|(title, _cwd)| SessionSeed {
+                                    id: None, // 표시 전용
+                                    title: self.activity_session_name(&ws.id, title),
+                                    status: None,
+                                    agent: None, // 절전 — 에이전트 죽음
+                                    exited: false,
+                                })
+                                .collect();
+                            (WorkspaceState::Suspended, sessions)
+                        }
+                    };
                 WorkspaceSeed {
                     id: ws.id.clone(),
                     name: Self::workspace_display_name(ws),
                     state,
-                    sessions: raw_titles
-                        .into_iter()
-                        .map(|raw| SessionSeed {
-                            id: None, // 표시 전용
-                            title: self.activity_session_name(&ws.id, &raw),
-                            status: None,
-                            // 대기/절전은 감지 워커가 안 돌아 에이전트 정보가 없다.
-                            agent: None,
-                            exited: false,
-                        })
-                        .collect(),
+                    sessions,
                 }
             })
             .collect()
@@ -3388,7 +3396,9 @@ impl App {
                                 .get(s)
                                 .map(|raw| self.activity_session_name(&ws.id, raw))
                                 .unwrap_or_default(),
-                            agent_line: None,
+                            // 대기(warm)는 에이전트가 살아있음 — 활성일 때 감지한 마지막 에이전트
+                            // 줄을 유지해 보여준다(방안①). 셸이면 None.
+                            agent_line: rt.workspace_ui.agent_line_for(*s),
                             status_line: None,
                             resource: rt
                                 .session_resource_usage

@@ -1203,12 +1203,12 @@ impl WorkspaceUi {
             );
         }
 
-        // 포커스 pane 탑라인 — 포인트색 2px 라인을 상단에 항상 유지(단일/다중 pane 동일).
+        // 포커스 pane 탑라인 — 포인트색 1px 라인을 상단에 항상 유지(단일/다중 pane 동일).
         if focused {
             ui.painter().hline(
                 pane_rect.x_range(),
-                pane_rect.top() + 1.0,
-                egui::Stroke::new(2.0, accent),
+                pane_rect.top() + 0.5,
+                egui::Stroke::new(1.0, accent),
             );
         }
         // pane 전체 강조 플래시 — 포커스 이동·입력요청·작업완료 시 2초 페이드(2026-07-12 사용자).

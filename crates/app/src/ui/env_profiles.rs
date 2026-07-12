@@ -15,7 +15,6 @@ pub enum EnvAction {
 pub struct EnvProfilesUi {
     selected: Option<String>,
     new_name: String,
-    new_kind: &'static str,
     var_key: String,
     var_is_secret: bool,
     var_plain_value: String,
@@ -74,7 +73,6 @@ impl EnvProfilesUi {
         Self {
             selected: None,
             new_name: String::new(),
-            new_kind: "local",
             var_key: String::new(),
             var_is_secret: false,
             var_plain_value: String::new(),
@@ -113,7 +111,7 @@ impl EnvProfilesUi {
             self.credentials = None;
         }
 
-        let profiles = match &self.profiles {
+        let mut profiles = match &self.profiles {
             Some(p) => p.clone(),
             None => {
                 let p = db.list_env_profiles(workspace_id)?;
@@ -122,6 +120,17 @@ impl EnvProfilesUi {
             }
         };
 
+        // 프로파일이 없으면 기본 프로파일을 자동 생성해 곧바로 환경변수 입력을 보여준다 —
+        // 별도 "프로파일 생성" 단계/kind 프리셋 제거(2026-07-12 사용자: 프로필 다중 전환은
+        // 안 쓰고 환경변수를 직접 관리하는 게 편함). 한 번만 만들어지고 이후엔 비어있지 않다.
+        if profiles.is_empty() {
+            db.insert_env_profile(workspace_id, "default", "local")?;
+            profiles = db.list_env_profiles(workspace_id)?;
+            self.profiles = Some(profiles.clone());
+            self.selected = profiles.first().map(|p| p.id.clone());
+            self.vars = None;
+        }
+
         if self.selected.is_none()
             || !profiles
                 .iter()
@@ -129,15 +138,6 @@ impl EnvProfilesUi {
         {
             self.selected = profiles.first().map(|p| p.id.clone());
             self.vars = None;
-        }
-
-        if profiles.is_empty() {
-            // 프로파일이 없으면 생성 폼만 (환경 변수 섹션 진입 전).
-            compact_profile_form(ui, self, db, workspace_id, catalog)?;
-            if let Some(error) = &self.error {
-                ui.colored_label(ui.visuals().error_fg_color, error);
-            }
-            return Ok(None);
         }
 
         // 경고 표시용 production 플래그(선택 변경 프레임엔 1프레임 stale — 무해).
@@ -946,9 +946,8 @@ fn compact_profile_form(
                 .hint_text(catalog.t("env.create_profile", &[]))
                 .desired_width(180.0),
         );
-        for kind in ["local", "staging", "production", "custom"] {
-            ui.selectable_value(&mut state.new_kind, kind, kind);
-        }
+        // kind 프리셋(local/staging/production/custom) 제거 — production 경고 말곤 아무 역할이
+        // 없었다(2026-07-12 사용자). 추가 프로파일도 그냥 이름만으로 만든다(kind="local").
         let name_filled = !state.new_name.trim().is_empty();
         if ui
             .add_enabled(
@@ -957,7 +956,7 @@ fn compact_profile_form(
             )
             .clicked()
         {
-            match db.insert_env_profile(workspace_id, state.new_name.trim(), state.new_kind) {
+            match db.insert_env_profile(workspace_id, state.new_name.trim(), "local") {
                 Ok(_) => {
                     state.new_name.clear();
                     state.profiles = None;

@@ -1,6 +1,11 @@
 //! egui 기본 폰트에는 한글 글리프가 없다 — 시스템 CJK 폰트를 fallback으로 등록한다.
 //! (PR-05 완료 기준: 한글 렌더링 깨짐 없음)
 
+/// 번들 터미널 모노 폰트 (JetBrains Mono Regular, OFL — assets/fonts/JetBrainsMono-OFL.txt).
+/// Latin은 이걸로, 한글은 CJK 폴백(AppleGothic 등)이 처리한다. egui는 리가처를 셰이핑하지
+/// 않으므로 리가처 없는 깔끔한 렌더가 목적(Cascadia의 리가처는 어차피 안 먹음).
+const TERMINAL_MONO: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
+
 /// 플랫폼별 한글 폰트 후보 (앞에서부터 시도).
 #[cfg(target_os = "macos")]
 const CJK_FONT_CANDIDATES: &[&str] = &[
@@ -36,6 +41,18 @@ pub const DEFAULT_UI_FONT_NAME: &str = "System";
 pub fn install_cjk_fallback(ctx: &egui::Context, ui_font: Option<&str>) {
     let mut fonts = egui::FontDefinitions::default();
 
+    // 터미널 모노(Latin) = 번들 JetBrains Mono. Monospace 패밀리 **맨 앞**에 넣어 egui 기본
+    // Hack 대신 쓰고, 한글은 아래에서 붙는 CJK 폴백이 처리한다(정렬은 폴백 순서로 유지).
+    fonts.font_data.insert(
+        "jbmono".to_owned(),
+        egui::FontData::from_static(TERMINAL_MONO).into(),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .insert(0, "jbmono".to_owned());
+
     // 한글 fallback (families 끝에 붙여 Latin은 기본/SF, 한글만 이 폰트가 처리)
     if let Some((path, bytes)) = CJK_FONT_CANDIDATES
         .iter()
@@ -58,7 +75,7 @@ pub fn install_cjk_fallback(ctx: &egui::Context, ui_font: Option<&str>) {
 
     // UI(Proportional) 기본 폰트 — 설정 폰트 > 기본(macOS: Apple SD Gothic Neo) 순으로
     // 시도. SFNS.ttf(SF Pro)는 fvar 가변폰트라 egui/skrifa가 무시했다(2026-07-06) —
-    // .ttc는 index로 로드된다. 모노(터미널)는 egui 기본(Hack)+CJK fallback 유지.
+    // .ttc는 index로 로드된다. 모노(터미널)는 위에서 번들 JetBrains Mono + CJK fallback.
     let ui_candidates = [ui_font.unwrap_or_default(), DEFAULT_UI_FONT];
     for path in ui_candidates.iter().filter(|p| !p.is_empty()) {
         let Ok(bytes) = std::fs::read(path) else {

@@ -30,6 +30,10 @@ pub struct WorkspaceUi {
     command_sent: bool,
     /// mux focused_pane 변경 추적
     last_focused_pane: Option<runtime::MuxPaneId>,
+    /// 세션별 pane 강조 플래시 만료 시각 — 포커스 이동·입력요청·작업완료 시 now+PANE_FLASH로
+    /// 세팅해 pane 전체 테두리를 잠깐 포인트색으로 그린다(2026-07-12 사용자). 탑라인은 별도로
+    /// 포커스 동안 항상 유지된다.
+    session_flash: HashMap<SessionId, std::time::Instant>,
     /// egui 포커스 동기화 대기 — 해당 pane이 실제로 그려질 때 소비된다
     /// (MuxUpdated가 Viewport보다 먼저 오는 프레임에 요청이 유실되지 않게)
     pending_focus: Option<runtime::MuxPaneId>,
@@ -105,6 +109,7 @@ impl WorkspaceUi {
             scroll_residual: 0.0,
             command_sent: false,
             last_focused_pane: None,
+            session_flash: HashMap::new(),
             pending_focus: None,
             pending_spawns: 0,
             split_drag: None,
@@ -293,11 +298,13 @@ impl WorkspaceUi {
                 }
                 RuntimeEvent::SessionStatusChanged { session, status } => {
                     if self.session_alive(*session) {
+                        self.note_status_flash(*session, *status);
                         self.sessions.entry(*session).or_default().status = Some(*status);
                     }
                 }
                 RuntimeEvent::SessionStatusViewChanged { session, view } => {
                     if self.session_alive(*session) {
+                        self.note_status_flash(*session, view.status);
                         let entry = self.sessions.entry(*session).or_default();
                         entry.status = Some(view.status);
                         entry.status_view = Some(view.clone());
@@ -390,7 +397,25 @@ impl WorkspaceUi {
             self.pending_focus = mux.focused_pane.clone();
             self.preedit.clear();
             self.scroll_residual = 0.0;
+            // 포커스가 옮겨간 pane 세션을 잠깐 강조(pane 전체 2초 플래시).
+            if let Some(session) = mux
+                .focused_pane
+                .as_ref()
+                .and_then(|pid| {
+                    mux.tabs
+                        .iter()
+                        .flat_map(|tab| &tab.panes)
+                        .find(|p| &p.id == pid)
+                })
+                .and_then(|pane| pane.session_id)
+            {
+                self.session_flash
+                    .insert(session, std::time::Instant::now() + PANE_FLASH);
+            }
         }
+        // 만료된 플래시 정리(무한 성장 방지).
+        let now = std::time::Instant::now();
+        self.session_flash.retain(|_, until| now < *until);
         let Some(active_tab) = mux
             .active_tab
             .as_ref()
@@ -1177,6 +1202,38 @@ impl WorkspaceUi {
                 ui.visuals().weak_text_color(),
             );
         }
+
+        // 포커스 pane 탑라인 — 포인트색 2px 라인을 상단에 항상 유지(단일/다중 pane 동일).
+        if focused {
+            ui.painter().hline(
+                pane_rect.x_range(),
+                pane_rect.top() + 1.0,
+                egui::Stroke::new(2.0, accent),
+            );
+        }
+        // pane 전체 강조 플래시 — 포커스 이동·입력요청·작업완료 시 2초 페이드(2026-07-12 사용자).
+        if let Some(session) = pane.session_id
+            && let Some(&until) = self.session_flash.get(&session)
+        {
+            let now = std::time::Instant::now();
+            if now < until {
+                let remain = (until - now).as_secs_f32() / PANE_FLASH.as_secs_f32();
+                let alpha = (remain.clamp(0.0, 1.0) * 255.0) as u8;
+                let color = egui::Color32::from_rgba_unmultiplied(
+                    accent.r(),
+                    accent.g(),
+                    accent.b(),
+                    alpha,
+                );
+                ui.painter().rect_stroke(
+                    pane_rect.shrink(1.0),
+                    2.0,
+                    egui::Stroke::new(2.0, color),
+                    egui::StrokeKind::Inside,
+                );
+                ui.ctx().request_repaint(); // 페이드 애니메이션
+            }
+        }
     }
 
     /// 명령을 보냈거나 spawn 응답 대기 중이면 repaint를 예약한다 —
@@ -1572,6 +1629,16 @@ impl WorkspaceUi {
         }
     }
 
+    /// 상태가 강조 대상(입력요청/작업종료)으로 **새로** 전이하면 그 세션 pane을 플래시한다.
+    /// 반드시 sessions의 status를 갱신하기 **전에** 불러 직전 상태를 읽는다.
+    fn note_status_flash(&mut self, session: SessionId, new_status: SessionStatus) {
+        let prev = self.sessions.get(&session).and_then(|view| view.status);
+        if is_flash_status(new_status) && prev != Some(new_status) {
+            self.session_flash
+                .insert(session, std::time::Instant::now() + PANE_FLASH);
+        }
+    }
+
     fn session_alive(&self, session: SessionId) -> bool {
         self.mux.as_ref().is_some_and(|mux| {
             mux.tabs
@@ -1954,6 +2021,22 @@ fn split_target_pane(snapshot: &MuxSnapshot) -> Option<runtime::MuxPaneId> {
         .or_else(|| snapshot.tabs.first());
     tab.and_then(|tab| tab.panes.first())
         .map(|pane| pane.id.clone())
+}
+
+/// pane 강조 플래시 지속 시간 — 포커스 이동·입력요청·작업완료 시 pane 전체 테두리를 이만큼
+/// 포인트색으로 그리고 페이드아웃한다. 탑라인(포커스 지속 표시)은 이와 무관하다.
+const PANE_FLASH: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// pane 전체 플래시를 유발하는 상태: 입력요청(Waiting/NeedsApproval)·작업종료(Done/Error).
+/// Running(작업 중)·Idle(쉬는 중)은 제외 — 주목이 필요한 순간만 번쩍인다.
+fn is_flash_status(status: SessionStatus) -> bool {
+    matches!(
+        status,
+        SessionStatus::Waiting
+            | SessionStatus::NeedsApproval
+            | SessionStatus::Done
+            | SessionStatus::Error
+    )
 }
 
 fn visible_mux_sessions(snapshot: &MuxSnapshot) -> HashSet<SessionId> {

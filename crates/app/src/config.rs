@@ -154,6 +154,9 @@ pub struct TerminalConfig {
     pub exited_backend_cap: u32,
     /// 전역 터미널 캐시 예산 (MB) — 초과 시 exited부터 아카이브
     pub cache_budget_mb: u32,
+    /// 터미널 모노 폰트 굵기(번들 JetBrains Mono 정적 weight). 설정 UI에서 고른다.
+    /// [`crate::fonts::MONO_WEIGHTS`] 중 하나 — 미지값은 로드 시 Regular로 폴백.
+    pub mono_weight: String,
 }
 
 impl Default for TerminalConfig {
@@ -163,6 +166,7 @@ impl Default for TerminalConfig {
             scrollback_lines: 10_000,
             exited_backend_cap: 64,
             cache_budget_mb: 128,
+            mono_weight: crate::fonts::DEFAULT_MONO_WEIGHT.to_owned(),
         }
     }
 }
@@ -272,6 +276,9 @@ impl Config {
         t.scrollback_lines = t.scrollback_lines.clamp(100, 100_000);
         t.exited_backend_cap = t.exited_backend_cap.clamp(4, 512);
         t.cache_budget_mb = t.cache_budget_mb.clamp(32, 2048);
+        if !crate::fonts::MONO_WEIGHTS.contains(&t.mono_weight.as_str()) {
+            t.mono_weight = crate::fonts::DEFAULT_MONO_WEIGHT.to_owned();
+        }
         self.performance.output_batch_ms = self
             .performance
             .output_batch_ms

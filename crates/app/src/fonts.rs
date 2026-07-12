@@ -1,10 +1,30 @@
 //! egui 기본 폰트에는 한글 글리프가 없다 — 시스템 CJK 폰트를 fallback으로 등록한다.
 //! (PR-05 완료 기준: 한글 렌더링 깨짐 없음)
 
-/// 번들 터미널 모노 폰트 (JetBrains Mono Regular, OFL — assets/fonts/JetBrainsMono-OFL.txt).
-/// Latin은 이걸로, 한글은 CJK 폴백(AppleGothic 등)이 처리한다. egui는 리가처를 셰이핑하지
-/// 않으므로 리가처 없는 깔끔한 렌더가 목적(Cascadia의 리가처는 어차피 안 먹음).
-const TERMINAL_MONO: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
+/// 번들 터미널 모노 폰트 (JetBrains Mono, OFL — assets/fonts/JetBrainsMono-OFL.txt). Latin은
+/// 이걸로, 한글은 CJK 폴백(AppleGothic 등)이 처리한다. egui는 리가처·가변폰트를 셰이핑/해석하지
+/// 않으므로 굵기별 **정적 weight 파일**을 번들해 설정에서 고른다.
+const MONO_LIGHT: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Light.ttf");
+const MONO_REGULAR: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
+const MONO_MEDIUM: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Medium.ttf");
+const MONO_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-SemiBold.ttf");
+const MONO_BOLD: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Bold.ttf");
+
+/// 설정에서 고를 수 있는 터미널 모노 굵기(가는 것부터).
+pub const MONO_WEIGHTS: &[&str] = &["Light", "Regular", "Medium", "SemiBold", "Bold"];
+/// 기본 굵기.
+pub const DEFAULT_MONO_WEIGHT: &str = "Regular";
+
+/// 굵기 이름 → 번들 폰트 바이트. 미지값은 Regular로 폴백.
+fn mono_bytes(weight: &str) -> &'static [u8] {
+    match weight {
+        "Light" => MONO_LIGHT,
+        "Medium" => MONO_MEDIUM,
+        "SemiBold" => MONO_SEMIBOLD,
+        "Bold" => MONO_BOLD,
+        _ => MONO_REGULAR,
+    }
+}
 
 /// 플랫폼별 한글 폰트 후보 (앞에서부터 시도).
 #[cfg(target_os = "macos")]
@@ -38,14 +58,14 @@ pub const DEFAULT_UI_FONT_NAME: &str = "System";
 /// 한글 fallback 폰트를 등록한다. 실패해도 앱은 계속 뜬다 (한글만 깨짐).
 /// `ui_font`: 설정에서 고른 UI(Proportional) 폰트 파일 경로 — None/로드 실패면 기본
 /// (macOS는 AppleGothic). 설정 변경 시 재호출해 hot reload된다(2026-07-07).
-pub fn install_cjk_fallback(ctx: &egui::Context, ui_font: Option<&str>) {
+pub fn install_cjk_fallback(ctx: &egui::Context, ui_font: Option<&str>, mono_weight: &str) {
     let mut fonts = egui::FontDefinitions::default();
 
-    // 터미널 모노(Latin) = 번들 JetBrains Mono. Monospace 패밀리 **맨 앞**에 넣어 egui 기본
-    // Hack 대신 쓰고, 한글은 아래에서 붙는 CJK 폴백이 처리한다(정렬은 폴백 순서로 유지).
+    // 터미널 모노(Latin) = 번들 JetBrains Mono(설정 굵기). Monospace 패밀리 **맨 앞**에 넣어
+    // egui 기본 Hack 대신 쓰고, 한글은 아래에서 붙는 CJK 폴백이 처리한다(정렬은 폴백 순서로 유지).
     fonts.font_data.insert(
         "jbmono".to_owned(),
-        egui::FontData::from_static(TERMINAL_MONO).into(),
+        egui::FontData::from_static(mono_bytes(mono_weight)).into(),
     );
     fonts
         .families

@@ -143,6 +143,14 @@ impl WorkspaceUi {
         self.agent_info = info;
     }
 
+    /// 세션의 에이전트 요약 줄("Codex · gpt-5.6-sol · max")을 돌려준다 — 없으면 셸/미감지.
+    /// 워크스페이스가 대기(warm)로 내려가도 이 맵은 마지막 감지값을 유지하므로(전환 시
+    /// 안 지움), 활동 패널·PWA가 비활성 워크스페이스의 에이전트 정보를 보여줄 수 있다
+    /// (2026-07-13 방안①). 절전되면 workspace_ui째로 사라져 자연히 표시 안 된다.
+    pub fn agent_line_for(&self, session: SessionId) -> Option<String> {
+        self.agent_info.get(&session).map(agent_info_line)
+    }
+
     /// 세션 표시 제목. 우선순위: ① 사용자 rename(기본 제목이 아니면) → 그대로,
     /// ② OSC 0/2 동적 제목(프로그램이 설정, 예: cwd/명령) → 그 제목, ③ 프로젝트 폴더명(≈깃
     /// 레포명), ④ 원 표기. osc는 이 세션 터미널의 현재 OSC 제목.

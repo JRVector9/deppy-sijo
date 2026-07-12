@@ -2146,7 +2146,7 @@ impl App {
                         sessions,
                     };
                 }
-                // warm/유휴 — 감지 워커가 안 돌아 상태는 없다. 이름만 활동 패널과 동일 규칙.
+                // 대기(warm)/절전 — 감지 워커가 안 돌아 상태는 없다. 이름만 활동 패널과 동일 규칙.
                 let (state, raw_titles): (WorkspaceState, Vec<String>) = match self.warm.get(&ws.id)
                 {
                     Some(rt) => {
@@ -2159,7 +2159,7 @@ impl App {
                         (WorkspaceState::Warm, titles)
                     }
                     None => (
-                        WorkspaceState::Idle,
+                        WorkspaceState::Suspended,
                         self.persisted_activity_panes
                             .get(&ws.id)
                             .into_iter()
@@ -2178,7 +2178,7 @@ impl App {
                             id: None, // 표시 전용
                             title: self.activity_session_name(&ws.id, &raw),
                             status: None,
-                            // warm/유휴는 감지 워커가 안 돌아 에이전트 정보가 없다.
+                            // 대기/절전은 감지 워커가 안 돌아 에이전트 정보가 없다.
                             agent: None,
                             exited: false,
                         })

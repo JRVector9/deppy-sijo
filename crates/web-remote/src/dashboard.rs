@@ -179,12 +179,15 @@ pub struct SessionSeed {
     pub exited: bool,
 }
 
-/// 워크스페이스 상태 — 데스크톱 활동 패널과 같은 3분류.
+/// 워크스페이스 상태 — 데스크톱 활동 패널과 같은 3분류(§14.1).
+/// - Active: 렌더 중인 활성 워커
+/// - Warm(대기): 워커·에이전트 살아있음. 폰 진입 = 즉시 미러(재사용)
+/// - Suspended(절전): 워커 종료·에이전트 kill됨, DB/디스크만. 폰 진입 = 깨우기 필요
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceState {
     Active,
     Warm,
-    Idle,
+    Suspended,
 }
 
 impl WorkspaceState {
@@ -192,7 +195,7 @@ impl WorkspaceState {
         match self {
             WorkspaceState::Active => "active",
             WorkspaceState::Warm => "warm",
-            WorkspaceState::Idle => "idle",
+            WorkspaceState::Suspended => "suspended",
         }
     }
 }

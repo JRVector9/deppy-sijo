@@ -681,10 +681,10 @@
     return true;
   }
 
-  const WORKSPACE_STATE_LABEL = { active: '활성', warm: '대기(백그라운드)', idle: '유휴' };
+  const WORKSPACE_STATE_LABEL = { active: '활성', warm: '대기', suspended: '절전' };
 
   // 워크스페이스별 세션 목록. 활성 워크스페이스의 세션만 id가 있어 시청/입력이 가능하고,
-  // warm/유휴는 표시 전용이다(세션 id가 worker-로컬이라 다른 워크스페이스 id로 시청하면
+  // 대기/절전은 표시 전용이다(세션 id가 worker-로컬이라 다른 워크스페이스 id로 시청하면
   // 엉뚱한 세션이 잡힌다 — 서버가 id 자체를 안 보낸다). 이름은 데스크톱 활동 패널과 같은
   // 프로젝트명 규칙으로 서버가 해석해 보낸다.
   function renderWorkspaces(workspaces, resource) {
@@ -706,7 +706,7 @@
       name.textContent = ws.name || ws.id;
       head.appendChild(name);
       const state = document.createElement('span');
-      state.className = 'ws-state ' + (ws.state || 'idle');
+      state.className = 'ws-state ' + (ws.state || 'suspended');
       state.textContent = WORKSPACE_STATE_LABEL[ws.state] || ws.state || '';
       head.appendChild(state);
       group.appendChild(head);
@@ -779,7 +779,7 @@
       // 표시 전용 — 이 워크스페이스로 전환해야 볼 수 있다.
       const note = document.createElement('span');
       note.className = 'view-note';
-      note.textContent = ws.state === 'warm' ? '백그라운드' : '유휴';
+      note.textContent = ws.state === 'warm' ? '대기' : '절전';
       li.appendChild(note);
     }
     return li;

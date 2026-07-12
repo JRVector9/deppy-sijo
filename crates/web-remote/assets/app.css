@@ -89,6 +89,7 @@ h1 { font-size: 19px; font-weight: 600; color: #f0f0f0; }
 }
 .ws-state.active { background: #21344a; color: #7db4e6; }
 .ws-state.warm { background: #3a3320; color: #d0b264; }
+.ws-state.suspended { background: #2a2a2a; color: #7a7a7a; }
 .ws-sessions { list-style: none; display: flex; flex-direction: column; gap: 8px; }
 .view-note { font-size: 11px; color: #7a7a7a; flex: none; }
 .session {

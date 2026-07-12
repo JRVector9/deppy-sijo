@@ -329,6 +329,13 @@ fn stream_loop(
                                 }
                             }
                         }
+                        // 워크스페이스 전환 요청 (미러 진입 — I1b-2). watch 게이트 없음:
+                        // 워크스페이스 id는 프레임이 이미 폰에 준 값이고, 실제 검증(존재·非활성·
+                        // 대기 상한)은 앱 switch_workspace가 한다. 앱이 전환하면 브리지가 새
+                        // 활성 워커로 재구독해 폰·데스크탑이 같은 화면이 된다.
+                        Some(ClientMsg::Switch { workspace }) => {
+                            dashboard.request_switch(&workspace);
+                        }
                         Some(ClientMsg::Auth { .. }) | None => {}
                     }
                 }

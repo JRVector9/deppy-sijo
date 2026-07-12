@@ -197,6 +197,17 @@ impl WebRemoteServer {
         self.dashboard.set_command_sink(sink);
     }
 
+    /// web → app 워크스페이스 전환 싱크를 붙인다 (미러 진입 — I1b-2). app이 start_web에서
+    /// 한 번 주입한다(app 레벨이라 워커별 교체 불필요). 미설정이면 폰 Switch가 무시된다.
+    pub fn set_switch_sink(&self, sink: dashboard::SwitchSink) {
+        self.dashboard.set_switch_sink(sink);
+    }
+
+    /// 폰에 띄울 일시 안내 배너를 세팅/해제한다 (미러 진입 상한 초과 등 — I1b-2).
+    pub fn set_dashboard_notice(&self, notice: Option<String>) {
+        self.dashboard.set_notice(notice);
+    }
+
     /// 현재 활성 workspace의 세션 상태를 대시보드에 시드한다(구독 등록 직후 호출 — 재구독 시
     /// edge-trigger 상태 유실 보정). app이 GUI 배지용으로 이미 추적 중인 상태를 넘긴다.
     pub fn set_workspaces(&self, seeds: Vec<dashboard::WorkspaceSeed>) {

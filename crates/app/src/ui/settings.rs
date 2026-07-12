@@ -1596,6 +1596,22 @@ fn terminal_page(
     });
     row(
         ui,
+        &catalog.t("settings.mono_weight", &[]),
+        Some(&catalog.t("settings.mono_weight.hint", &[])),
+        |ui| {
+            for w in crate::fonts::MONO_WEIGHTS {
+                if ui
+                    .selectable_label(config.terminal.mono_weight == *w, *w)
+                    .clicked()
+                {
+                    config.terminal.mono_weight = (*w).to_owned();
+                    *changed = true;
+                }
+            }
+        },
+    );
+    row(
+        ui,
         &catalog.t("settings.scrollback_lines", &[]),
         Some(&catalog.t("settings.scrollback.hint", &[])),
         |ui| {

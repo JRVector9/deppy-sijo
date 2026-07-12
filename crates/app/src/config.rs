@@ -6,6 +6,43 @@ use serde::{Deserialize, Serialize};
 
 const MIN_OUTPUT_BATCH_MS: u64 = 16;
 
+/// live warm 워크스페이스 상한을 이 기기 RAM에서 유도한다 — live warm 1슬롯당 4GB 예산으로
+/// 잡아(에이전트 실측 수백 MB보다 넉넉) 활성 작업+브라우저+IDE와 공존해도 스왑에 안 빠지게
+/// 3~8로 클램프한다. **첫 실행(또는 필드 첫 등장) 기본값일 뿐** — 저장 후엔 사용자 값을 쓴다.
+pub fn recommended_max_live_warm() -> u32 {
+    max_live_warm_for_ram_gb(ram_bytes() / (1024 * 1024 * 1024))
+}
+
+/// 순수 함수(테스트 용이) — RAM(GB)에서 권장 live warm 상한. 1슬롯당 4GB 예산, 3~8 클램프.
+fn max_live_warm_for_ram_gb(ram_gb: u64) -> u32 {
+    ((ram_gb / 4) as u32).clamp(3, 8)
+}
+
+/// 물리 메모리 바이트. 조회 실패 시 16GB로 가정(보수적 기본 4 유도).
+fn ram_bytes() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        // sysctl hw.memsize — 실패하면 폴백.
+        let mut size: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        let name = c"hw.memsize";
+        // SAFETY: sysctlbyname에 유효한 이름·버퍼·길이를 넘긴다. 실패 시 size는 0 유지.
+        let ok = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                &mut size as *mut u64 as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if ok == 0 && size > 0 {
+            return size;
+        }
+    }
+    16 * 1024 * 1024 * 1024
+}
+
 /// config.toml 루트. 각 항목의 소비처는 설계문서 v2.5 참조.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -133,12 +170,21 @@ pub struct PerformanceConfig {
     /// Runtime worker의 idle fallback poll 간격, UI 범위 16~50ms. 실제 PTY 출력은
     /// reader wake로 즉시 pump되고, 연속 viewport는 runtime에서 8ms로 frame pacing한다.
     pub output_batch_ms: u64,
+    /// warm(백그라운드) 워크스페이스로 유지할 최대 개수(활성 제외). 초과 시 오래된 것부터
+    /// 절전 — **실행 중 세션이 없는 것만**(§14.1). 빈 워커라 거의 공짜(수십 MB, CPU 0).
+    pub max_warm: u32,
+    /// 실행 중 세션이 있는 warm 워크스페이스 hard cap. 초과하는 전환은 기존 작업을 죽이지
+    /// 않고 거부한다. 높이면 동시 워커+에이전트가 늘어 메모리↑ (지배 요인은 에이전트).
+    /// 기본값은 RAM 유도([`recommended_max_live_warm`]) — 첫 실행 시 1회, 이후 사용자 값.
+    pub max_live_warm: u32,
 }
 
 impl Default for PerformanceConfig {
     fn default() -> Self {
         Self {
             output_batch_ms: 25,
+            max_warm: 2,
+            max_live_warm: recommended_max_live_warm(),
         }
     }
 }
@@ -227,6 +273,8 @@ impl Config {
             .performance
             .output_batch_ms
             .clamp(MIN_OUTPUT_BATCH_MS, 1_000);
+        self.performance.max_warm = self.performance.max_warm.clamp(0, 8);
+        self.performance.max_live_warm = self.performance.max_live_warm.clamp(1, 12);
         self.i18n.locale = i18n::normalize_locale(&self.i18n.locale);
     }
 
@@ -276,6 +324,31 @@ mod tests {
         let text = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&text).unwrap();
         assert_eq!(parsed, config);
+    }
+
+    #[test]
+    fn 권장_live_warm은_ram에서_유도되고_3에서_8로_클램프() {
+        assert_eq!(max_live_warm_for_ram_gb(0), 3); // 하한
+        assert_eq!(max_live_warm_for_ram_gb(8), 3); // 8/4=2 → 3으로 클램프
+        assert_eq!(max_live_warm_for_ram_gb(16), 4);
+        assert_eq!(max_live_warm_for_ram_gb(24), 6);
+        assert_eq!(max_live_warm_for_ram_gb(32), 8);
+        assert_eq!(max_live_warm_for_ram_gb(128), 8); // 상한
+    }
+
+    #[test]
+    fn warm_상한_기본값과_정규화_클램프() {
+        let config = Config::default();
+        assert_eq!(config.performance.max_warm, 2);
+        // live warm 기본은 이 기기 RAM 유도 — 값은 다르나 3~8 범위는 불변.
+        assert!((3..=8).contains(&config.performance.max_live_warm));
+        // 손으로 범위 밖 값을 넣어도 로드 정규화가 클램프한다.
+        let mut c = Config::default();
+        c.performance.max_warm = 99;
+        c.performance.max_live_warm = 0;
+        c.normalize();
+        assert_eq!(c.performance.max_warm, 8);
+        assert_eq!(c.performance.max_live_warm, 1);
     }
 
     #[test]

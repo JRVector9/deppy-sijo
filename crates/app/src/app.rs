@@ -2323,11 +2323,15 @@ impl App {
     /// id를 egui 스레드에서 switch_workspace로 넘긴다 — 대기=재사용/절전=재생성/상한초과=거부를
     /// switch_workspace가 처리하고, 성공 시 rebind_web_dashboard가 폰·데스크탑을 미러시킨다.
     fn drain_web_switch_requests(&mut self) {
-        let requests: Vec<String> = match self.web_switch_queue.lock() {
-            Ok(mut queue) if !queue.is_empty() => queue.drain(..).collect(),
-            _ => return,
+        // 하드 미러라 최종 목적지만 의미 있다 — 큐에 쌓인 중간 요청은 버리고 마지막 하나만
+        // 처리한다. 안 그러면 A,B,A,B 연타가 한 프레임에 N번의 워커 spawn+config 저장을
+        // egui 스레드에서 유발한다(리뷰 P3). Drain은 next_back으로 마지막만 꺼내도 drop 시
+        // 범위 전체를 vec에서 제거하므로 큐는 그대로 비워진다(last()의 전체순회 회피).
+        let target: Option<String> = match self.web_switch_queue.lock() {
+            Ok(mut queue) => queue.drain(..).next_back(),
+            Err(_) => return,
         };
-        for ws_id in requests {
+        if let Some(ws_id) = target {
             self.handle_web_switch(&ws_id);
         }
     }
@@ -2383,8 +2387,18 @@ impl App {
     }
 
     /// 폰 안내 배너를 세팅/해제한다 (I1b-2). 앱 상태와 브리지 프레임을 함께 갱신한다.
+    /// **같은 내용을 다시 세팅해도 TTL(set_at)은 유지한다** — 안 그러면 cap-full 버튼 연타가
+    /// 매번 타이머를 리셋해 expire_web_notice가 영영 안 돌고, 서버 notice는 Some에 고정되며
+    /// 클라는 내용 dedup으로 재표시를 안 해 "재탭했는데 아무 반응 없음"이 된다(리뷰 P3:
+    /// 없애려던 silent failure의 재발). now는 내용이 바뀔 때만 새로 찍는다.
     fn set_web_notice(&mut self, notice: Option<String>) {
-        self.web_notice = notice.clone().map(|msg| (msg, std::time::Instant::now()));
+        self.web_notice = notice.clone().map(|msg| {
+            let set_at = match &self.web_notice {
+                Some((prev, at)) if *prev == msg => *at,
+                _ => std::time::Instant::now(),
+            };
+            (msg, set_at)
+        });
         if let Some(web) = &self.web {
             web.server.set_dashboard_notice(notice);
         }

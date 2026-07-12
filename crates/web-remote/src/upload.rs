@@ -126,7 +126,11 @@ fn save_upload(dir: &Path, ext: &str, body: &[u8]) -> anyhow::Result<String> {
     let path = dir.join(&filename);
     let tmp = dir.join(format!("{filename}.tmp"));
     std::fs::write(&tmp, body).with_context(|| format!("tmp 기록 실패: {}", tmp.display()))?;
-    set_no_exec_perms(&tmp)?;
+    // perms 실패도 tmp를 남기지 않는다(리뷰 P3: GC가 .tmp를 안 세므로 예산·정리를 우회).
+    if let Err(e) = set_no_exec_perms(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     std::fs::rename(&tmp, &path).with_context(|| {
         let _ = std::fs::remove_file(&tmp);
         format!("업로드 rename 실패: {}", path.display())
@@ -150,9 +154,34 @@ fn set_no_exec_perms(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 쓰기 도중 크래시/실패로 남은 `.tmp` 잔재를 mtime 기준으로 정리한다. GC 스캔은 `.tmp`를
+/// 세지도 지우지도 않으므로(collect_uploads), 이걸 안 하면 잔재가 디스크·예산을 영구 우회한다
+/// (리뷰 P3). in-flight 업로드는 UPLOAD_READ_TIMEOUT(120s) 안에 rename되므로 그보다 넉넉한
+/// 5분을 넘긴 것만 지운다.
+fn sweep_stale_tmp(dir: &Path) {
+    const TMP_STALE_AGE: std::time::Duration = std::time::Duration::from_secs(300);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "tmp")
+            && let Ok(meta) = entry.metadata()
+            && let Ok(mtime) = meta.modified()
+            && now
+                .duration_since(mtime)
+                .is_ok_and(|age| age >= TMP_STALE_AGE)
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// `dir` 아래 파일들의 총 바이트가 예산을 넘으면 mtime 오래된 것부터 삭제한다
 /// (`storage::scrollback_archive::gc`와 동일 패턴). 스캔/삭제 실패는 경고만 남기고 계속한다.
 fn gc(dir: &Path, budget_bytes: u64) {
+    sweep_stale_tmp(dir); // 예산과 무관하게 잔재 tmp를 먼저 정리한다.
     let mut files = match collect_uploads(dir) {
         Ok(files) => files,
         Err(e) => {
@@ -173,6 +202,11 @@ fn gc(dir: &Path, budget_bytes: u64) {
             Ok(()) => {
                 total = total.saturating_sub(len);
                 tracing::info!(path = %path.display(), "업로드 GC — 예산 초과 제거");
+            }
+            // 동시 GC 패스가 이미 지웠다 — 크기를 차감해 이 패스가 다음(멀쩡한) 파일까지
+            // 과다삭제하지 않게 한다(리뷰 P3: NotFound 미차감 시 초과 제거).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                total = total.saturating_sub(len);
             }
             Err(e) => tracing::warn!(path = %path.display(), "업로드 GC 삭제 실패: {e}"),
         }
@@ -202,6 +236,12 @@ fn collect_uploads(dir: &Path) -> std::io::Result<Vec<(std::time::SystemTime, u6
         }
     }
     Ok(files)
+}
+
+/// `/upload` 토큰 인가 — handle_connection(lib.rs)이 **본문을 읽기 전에** 호출한다(리뷰
+/// P2-1: 미인증 요청이 10MB를 선할당하지 않게). route 내부 검사와 같은 상수시간 규약.
+pub fn authorized(query: &str, token: &str) -> bool {
+    token_query_matches(query, token)
 }
 
 /// query의 `token=` 파라미터를 상수시간 비교한다(static_srv/push 게이트와 동일 규약 —
@@ -288,14 +328,33 @@ mod tests {
             let file = std::fs::File::options().append(true).open(&path).unwrap();
             file.set_modified(time).unwrap();
         }
-        // .tmp 잔재는 GC 스캔/삭제 대상이 아니다(아직 유효한 업로드가 아님).
-        std::fs::write(dir.join("stale.png.tmp"), &payload).unwrap();
+        // 방금 만든 .tmp(in-flight 업로드)는 예산 계산·삭제 대상이 아니다 — 갓 생성돼
+        // sweep 연령(5분)보다 어리므로 tmp sweep도 건드리지 않는다.
+        std::fs::write(dir.join("fresh.png.tmp"), &payload).unwrap();
 
         gc(&dir, 1024 * 2); // 3개(각 1024) 중 2개 예산 → 가장 오래된 1개 제거
         assert!(!dir.join("old.png").exists());
         assert!(dir.join("mid.png").exists());
         assert!(dir.join("new.png").exists());
-        assert!(dir.join("stale.png.tmp").exists(), ".tmp는 불가침");
+        assert!(dir.join("fresh.png.tmp").exists(), "갓 만든 tmp는 보존");
+    }
+
+    #[test]
+    fn gc는_오래된_tmp_잔재를_정리한다() {
+        // 크래시/perms 실패로 남은 .tmp는 collect_uploads가 안 세므로 디스크·예산을
+        // 영구 우회한다(리뷰 P3). sweep이 연령 지난 것만 지운다.
+        let dir = temp_dir();
+        let stale = dir.join("orphan.png.tmp");
+        std::fs::write(&stale, vec![b'x'; 1024]).unwrap();
+        // mtime을 충분히 과거로(1970 기준) — 5분 연령 임계 초과.
+        std::fs::File::options()
+            .append(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+        gc(&dir, u64::MAX); // 예산은 넉넉해도 tmp sweep은 돈다.
+        assert!(!stale.exists(), "연령 지난 tmp 잔재는 정리돼야 한다");
     }
 
     #[test]

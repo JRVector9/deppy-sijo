@@ -50,6 +50,11 @@ pub const MAX_WS_CONNECTIONS: usize = 3;
 /// 요청 head 총 수신 데드라인 겸 read/write syscall 타임아웃 — 침묵·트리클
 /// peer(slowloris)의 접속 슬롯 점유에 wall-clock 상한을 둔다.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// `/upload` 본문(최대 10MB) 수신 데드라인 — 5초(READ_TIMEOUT)로는 느린 모바일 uplink에서
+/// 대용량 사진/문서가 완주 못 해 400으로 실패한다(리뷰 P6d P2-2). 토큰 인가 후에만 적용되고
+/// (아래 gate), stall(무데이터)은 여전히 5초 read syscall 타임아웃이 잡으므로 slowloris
+/// 표면은 늘지 않는다. 10MB / 120s ≈ 0.7Mbps 하한.
+const UPLOAD_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// 서버 기동 옵션.
 pub struct ServeOptions {
@@ -448,6 +453,22 @@ fn handle_connection(stream: TcpStream, ctx: &ConnCtx, connections: &Arc<ConnSet
     // 첨부(P6d — POST /upload, 최대 10MB)다. 경로별로 상한이 달라 여기서 먼저 정한다 —
     // Content-Length 선검사가 상한을 넘는 요청을 본문을 읽기 전에 413으로 끊어 메모리
     // 점유를 유계로 만든다(대용량 업로드도 예외 없이 이 계약을 따른다).
+    // `/upload`(P6d)만 10MB 본문을 허용하는데, 이 상한을 **인가 전에** 열어 주면 미인증
+    // 요청이 401 전에 10MB를 선할당·읽게 된다(리뷰 P2-1: 이전 4KB 상한의 회귀). 그래서
+    // 본문을 읽기 전에 토큰을 먼저 검사한다 — 미인증이면 본문 없이 401. 인가된 요청만
+    // 데드라인을 늘려(P2-2) 느린 모바일 uplink의 대용량 업로드가 완주하게 한다.
+    if head.path == "/upload" {
+        if !upload::authorized(&head.query, &ctx.token) {
+            respond(
+                reader.into_inner().inner,
+                &http::Response::plain(401, "unauthorized"),
+                &peer,
+                &head.path,
+            );
+            return false;
+        }
+        reader.get_mut().deadline = Instant::now() + UPLOAD_READ_TIMEOUT;
+    }
     let max_body = if head.path == "/upload" {
         upload::MAX_UPLOAD_BYTES
     } else {
@@ -2037,6 +2058,22 @@ mod tests {
         );
         let resp = request(addr, &req);
         assert!(resp.starts_with("HTTP/1.1 413"), "{resp}");
+        server.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 업로드는_토큰_틀리면_본문_읽기_전에_401한다() {
+        // 리뷰 P2-1 회귀 방지: 미인증 /upload가 10MB 본문을 선할당·읽으면 안 된다.
+        // 틀린 토큰 + 상한 이내 Content-Length를 선언하되 **본문은 안 보낸다**. 토큰을
+        // 본문보다 먼저 검사하면 즉시 401; 안 하면 서버가 100만 바이트를 기다리다
+        // 데드라인 후 400/절단이 난다. 401이면 본문 읽기 전 거부가 확인된다.
+        let dir = temp_uploads_dir();
+        let server = start_with_uploads(dir.clone());
+        let addr = server.local_addr();
+        let req = "POST /upload?token=wrong HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: image/png\r\nContent-Length: 1000000\r\n\r\n";
+        let resp = request(addr, req);
+        assert!(resp.starts_with("HTTP/1.1 401"), "{resp}");
         server.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }

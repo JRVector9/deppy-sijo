@@ -1860,6 +1860,15 @@ impl App {
                 let Some(transcript) = transcript else {
                     let _ = self.db.delete_agent_session(&self.active.id, &pane_key);
                     self.resumed_panes.insert(pane_key);
+                    // 폰 안내(I1b-3): 기록이 사라져 이어받지 못함 — 셸은 이미 복원돼 있어
+                    // 조용히 넘어가면 폰 사용자는 에이전트가 왜 없는지 모른다. 제목은
+                    // 활동 패널과 같은 프로젝트명 규칙으로 해석해 보낸다.
+                    let title = self.activity_session_name(&self.active.id, &pane.title);
+                    let msg = self
+                        .i18n
+                        .t("workspace.wake.resume_missing", &[("title", &title)]);
+                    self.set_web_notice(Some(msg));
+                    self.egui_ctx.request_repaint_after(Self::WEB_NOTICE_TTL);
                     continue;
                 };
                 // session_id는 그대로 셸 문자열에 들어간다 — 안전 문자만 허용(비정상
@@ -2333,14 +2342,35 @@ impl App {
         if ws_id == self.active.id {
             return; // 이미 활성 — 폰은 이미 미러 중.
         }
-        if !self.workspaces.iter().any(|ws| ws.id == ws_id) {
+        let Some(name) = self
+            .workspaces
+            .iter()
+            .find(|ws| ws.id == ws_id)
+            .map(Self::workspace_display_name)
+        else {
             tracing::warn!(ws = %ws_id, "폰 전환 요청 — 알 수 없는 워크스페이스 무시");
             return;
-        }
+        };
+        // 절전 깨우기(워커 없음 + 복원할 pane 있음) 판정은 전환 전에 — switch가 워커를
+        // 만들고 나면 구분이 사라진다 (I1b-3 "복원 중" 안내).
+        let wake_from_suspend = !self.warm.contains_key(ws_id)
+            && self
+                .persisted_activity_panes
+                .get(ws_id)
+                .is_some_and(|panes| !panes.is_empty());
         self.switch_workspace(ws_id);
         if self.active.id == ws_id {
-            // 전환 성공 — 직전 안내 해제(미러가 곧 폰에 반영된다).
-            self.set_web_notice(None);
+            if wake_from_suspend {
+                // 절전 해제는 워커 생성+RestoreWorkspace+resume까지 몇 초 걸린다 — 그동안
+                // 폰이 빈 세션 목록을 보므로 "복원 중" 안내(TTL 자동 해제, 복원이 끝나면
+                // 대시보드 프레임이 세션을 채운다).
+                let msg = self.i18n.t("workspace.wake.restoring", &[("name", &name)]);
+                self.set_web_notice(Some(msg));
+                self.egui_ctx.request_repaint_after(Self::WEB_NOTICE_TTL);
+            } else {
+                // 대기 재사용 — 즉시 미러되므로 직전 안내만 해제.
+                self.set_web_notice(None);
+            }
         } else if let Some(target) = self.warm_limit_warning.clone() {
             // 상한 초과로 거부됨 — 폰에 안내(데스크탑 모달과 독립, TTL로 자동 해제).
             let msg = self.i18n.t(

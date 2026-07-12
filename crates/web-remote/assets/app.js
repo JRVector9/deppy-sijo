@@ -396,6 +396,8 @@
   const composerText = document.getElementById('composer-text');
   const composerSend = document.getElementById('composer-send');
   const composerNote = document.getElementById('composer-note');
+  const composerAttach = document.getElementById('composer-attach');
+  const composerFile = document.getElementById('composer-file');
   let inputBlocked = false;
   /// 마지막으로 보낸 입력 — PTY가 거부(backpressure/종료)하면 draft로 되돌린다.
   let lastSent = null;
@@ -416,6 +418,8 @@
     const disabled = !viewer.watching || inputBlocked;
     composerSend.disabled = disabled;
     composerText.disabled = !viewer.watching;
+    // 첨부(P6d)는 큐 압박과 무관 — 업로드 중에만(uploadBusy) 잠근다.
+    composerAttach.disabled = !viewer.watching || uploadBusy;
   }
 
   function sendComposer() {
@@ -485,6 +489,70 @@
     }
     updateComposerEnabled();
   }
+
+  // ── 첨부 (P6d) — 파일 선택 → POST /upload(fetch, 토큰 쿼리) → 응답 경로를 composer에
+  // 삽입한다. 파일명/경로는 전부 서버가 생성한다(이 클라는 Content-Type만 알려줄 뿐, 파일명을
+  // 보내지 않는다) — 사용자가 문맥과 함께 전송해야 에이전트에 전달된다(전송은 별도 동작).
+  const MAX_UPLOAD_BYTES = 10 * 1024 * 1024; // 서버 상한과 동일
+  let uploadBusy = false;
+
+  function uploadErrorNote(status) {
+    if (status === 401) return '인증이 만료됐습니다 — 다시 페어링하세요';
+    if (status === 404) return '파일 첨부가 비활성화돼 있습니다';
+    if (status === 413) return '파일이 너무 큽니다 (10MB 초과)';
+    if (status === 415) return '지원하지 않는 파일 형식입니다';
+    return '업로드 실패 (' + status + ')';
+  }
+
+  composerAttach.addEventListener('click', () => {
+    if (composerAttach.disabled) return;
+    composerFile.click();
+  });
+
+  composerFile.addEventListener('change', async () => {
+    const file = composerFile.files && composerFile.files[0];
+    composerFile.value = ''; // 같은 파일 재선택도 change가 발화하게 초기화
+    if (!file) return;
+    if (file.size > MAX_UPLOAD_BYTES) {
+      setComposerNote('파일이 너무 큽니다 (10MB 초과)');
+      return;
+    }
+    const tokenValue = localStorage.getItem(TOKEN_KEY);
+    if (!tokenValue) {
+      setComposerNote('토큰이 없습니다 — 다시 페어링하세요');
+      return;
+    }
+    uploadBusy = true;
+    updateComposerEnabled();
+    setComposerNote('업로드 중…');
+    try {
+      const res = await fetch('/upload?token=' + encodeURIComponent(tokenValue), {
+        method: 'POST',
+        headers: { 'Content-Type': file.type || 'application/octet-stream' },
+        body: file,
+      });
+      if (!res.ok) {
+        setComposerNote(uploadErrorNote(res.status));
+        return;
+      }
+      const result = await res.json();
+      if (!result || typeof result.path !== 'string' || !result.path) {
+        setComposerNote('업로드 응답이 올바르지 않습니다');
+        return;
+      }
+      // 기존 입력에 이어 붙인다(신뢰경계: value 대입만 — innerHTML 아님). 사용자가 문맥과
+      // 함께 전송한다(데스크톱 이미지 paste와 동일 종단 — 에이전트가 경로를 읽는다).
+      const sep = composerText.value && !/\s$/.test(composerText.value) ? '\n' : '';
+      composerText.value += sep + result.path + ' ';
+      autoGrow();
+      setComposerNote('');
+    } catch {
+      setComposerNote('업로드 실패 — 네트워크를 확인하세요');
+    } finally {
+      uploadBusy = false;
+      updateComposerEnabled();
+    }
+  });
 
   composerText.addEventListener('input', autoGrow);
   composerText.addEventListener('keydown', (e) => {

@@ -70,8 +70,13 @@
       </div>
 
       <!-- composer (P6b): textarea라 브라우저가 한글 IME 조합을 네이티브로 처리한다.
-           Enter는 줄바꿈, 전송은 버튼(모바일 오전송 방지). 데스크톱은 Cmd/Ctrl-Enter. -->
+           Enter는 줄바꿈, 전송은 버튼(모바일 오전송 방지). 데스크톱은 Cmd/Ctrl-Enter.
+           첨부(P6d): 파일 선택 → POST /upload → 응답 경로를 textarea에 삽입. accept는
+           UX 힌트일 뿐 — 실제 검증은 서버 Content-Type 화이트리스트가 한다. -->
       <div class="composer">
+        <input id="composer-file" type="file" hidden
+               accept="image/png,image/jpeg,image/gif,image/webp,image/heic,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.md">
+        <button id="composer-attach" type="button" class="composer-attach" aria-label="파일 첨부">📎</button>
         <textarea id="composer-text" rows="1" placeholder="메시지 입력…"
                   autocapitalize="off" autocorrect="off" spellcheck="false"></textarea>
         <button id="composer-send" type="button">전송</button>

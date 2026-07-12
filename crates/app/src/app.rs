@@ -2030,6 +2030,9 @@ impl App {
                 db_path: Some(self.db_path.clone()),
                 // 웹푸시 발송(P4)도 db_path로 자체 연결을 연다(구독 저장·승인 폴링).
                 vapid,
+                // 모바일 파일 첨부(P6d) — 세션에 묶이지 않는 평면 디렉터리라 workspace별
+                // logs_root가 아닌 logs_base 바로 아래에 둔다(remote/ 분리와 같은 이유).
+                uploads_dir: Some(self.logs_base.join("uploads")),
             },
         )?;
         // 활성 workspace worker 이벤트를 대시보드에 붙인다(P2). wake 클로저는 egui 프레임과

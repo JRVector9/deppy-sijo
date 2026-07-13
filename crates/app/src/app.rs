@@ -280,6 +280,7 @@ impl EnvProjectRowsWorker {
                                     ui::env_project_list::EnvProjectRow {
                                         id: workspace.id.clone(),
                                         name: App::workspace_display_name(workspace),
+                                        alias: workspace.name.clone(),
                                         path_missing: !path.trim().is_empty()
                                             && !std::path::Path::new(&path).is_dir(),
                                         path,
@@ -515,8 +516,6 @@ impl ui::credentials::CredentialService for AppCredentialService<'_> {
 struct EnvApiProjectEditState {
     name_workspace_id: Option<String>,
     name_buffer: String,
-    path_workspace_id: Option<String>,
-    path_buffer: String,
 }
 
 /// 환경/API 상세 상단 헤더 — 참조 화면의 68px 고정 헤더와 14px 좌우 inset.
@@ -535,6 +534,8 @@ fn render_env_api_project_header(
         .map(|project| project.name.as_str())
         .filter(|name| !name.trim().is_empty())
         .unwrap_or("~");
+    // 이름 편집 초기값은 표시명("폴더명 (별칭)")이 아니라 별칭 원본이다 (E3).
+    let alias = project.map(|project| project.alias.trim()).unwrap_or("");
     let path = project
         .map(|project| project.path.as_str())
         .filter(|path| !path.trim().is_empty())
@@ -594,8 +595,9 @@ fn render_env_api_project_header(
             edit.name_workspace_id = None;
             edit.name_buffer.clear();
         } else if commit {
+            // E3: 편집 대상은 표시명이 아니라 **별칭**이다. 빈 값 = 별칭 해제(폴더명만 표시).
             let next = edit.name_buffer.trim();
-            if !next.is_empty() && next != name {
+            if next != alias {
                 *workspace_rename = Some(next.to_owned());
             }
             edit.name_workspace_id = None;
@@ -609,14 +611,16 @@ fn render_env_api_project_header(
             egui::FontId::monospace(15.0),
             ui.visuals().text_color(),
         );
-        let response = ui.interact(
-            name_rect,
-            ui.id().with(("env_api_project_name_label", project_id)),
-            egui::Sense::click(),
-        );
+        let response = ui
+            .interact(
+                name_rect,
+                ui.id().with(("env_api_project_name_label", project_id)),
+                egui::Sense::click(),
+            )
+            .on_hover_text(catalog.t("workspace.alias_hint", &[]));
         if response.clicked() && !project_id.is_empty() {
             edit.name_workspace_id = Some(project_id.to_owned());
-            edit.name_buffer = name.to_owned();
+            edit.name_buffer = alias.to_owned();
         }
     }
 
@@ -624,29 +628,7 @@ fn render_env_api_project_header(
         egui::pos2(value_x, rect.top() + 36.0),
         egui::pos2(value_right, rect.top() + 62.0),
     );
-    if edit.path_workspace_id.as_deref() == Some(project_id) {
-        let response = ui.put(
-            path_rect,
-            egui::TextEdit::singleline(&mut edit.path_buffer)
-                .font(egui::TextStyle::Monospace)
-                .id_source(("env_api_project_path", project_id)),
-        );
-        let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
-        let commit = response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if escape && response.has_focus() {
-            edit.path_workspace_id = None;
-            edit.path_buffer.clear();
-        } else if commit {
-            let next = edit.path_buffer.trim();
-            if next != path {
-                *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(
-                    std::path::PathBuf::from(next),
-                ));
-            }
-            edit.path_workspace_id = None;
-            edit.path_buffer.clear();
-        }
-    } else {
+    {
         let path_color = if path_missing {
             ui.visuals().error_fg_color
         } else {
@@ -675,9 +657,13 @@ fn render_env_api_project_header(
                 egui::Sense::click(),
             )
             .on_hover_text(hover_text);
-        if response.clicked() && !project_id.is_empty() {
-            edit.path_workspace_id = Some(project_id.to_owned());
-            edit.path_buffer = path.to_owned();
+        // E3 ④: 경로는 타이핑이 아니라 Finder로만 지정한다 — 오타/존재하지 않는 경로로
+        // 워크스페이스가 유령이 되는 입력 경로 제거. 클릭 = 폴더 선택 다이얼로그.
+        if response.clicked()
+            && !project_id.is_empty()
+            && let Some(dir) = rfd::FileDialog::new().pick_folder()
+        {
+            *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(dir));
         }
         response.context_menu(|ui| {
             if ui
@@ -3091,18 +3077,27 @@ impl App {
     /// 워크스페이스 표시 이름 — 포커스 세션의 현재 작업 폴더(git 저장소면 프로젝트명)를
     /// name에 자동 저장하고 그걸 표시한다(2026-07-08). 아직 감지 전이면 path 폴더명,
     /// 그것도 없으면 "~". 자동 추적이라 포커스 이동·재시작에도 마지막 폴더가 유지된다.
+    /// 워크스페이스 표시 이름 (E3, 2026-07-13): **프로젝트 폴더명에서 파생**하고
+    /// 사용자 이름(name 컬럼 = 별칭)은 `폴더명 (별칭)`으로 병기한다. 정체성이 항상
+    /// 실제 폴더에 고정되어, 이름과 경로가 어긋난 워크스페이스에 환경변수를 넣는
+    /// 사고(binjari)가 표시 차원에서 재발하지 않는다. 기존에 폴더명과 다른 이름을
+    /// 저장한 워크스페이스는 그 이름이 자동으로 별칭으로 강등된다(데이터 무변경).
     fn workspace_display_name(row: &crate::storage::WorkspaceRow) -> String {
-        let name = row.name.trim();
-        if !name.is_empty() && name != "default" {
-            return name.to_owned();
+        let alias = row.name.trim();
+        let alias = (!alias.is_empty() && alias != "default").then_some(alias);
+        let folder = {
+            let path = row.path.trim();
+            (!path.is_empty())
+                .then(|| std::path::Path::new(path).file_name())
+                .flatten()
+                .map(|base| base.to_string_lossy().into_owned())
+        };
+        match (folder, alias) {
+            (Some(folder), Some(alias)) if alias != folder => format!("{folder} ({alias})"),
+            (Some(folder), _) => folder,
+            (None, Some(alias)) => alias.to_owned(),
+            (None, None) => "~".to_owned(),
         }
-        let path = row.path.trim();
-        if !path.is_empty()
-            && let Some(base) = std::path::Path::new(path).file_name()
-        {
-            return base.to_string_lossy().into_owned();
-        }
-        "~".to_owned()
     }
 
     fn invalidate_env_api_projects(&mut self) {
@@ -3214,6 +3209,7 @@ impl App {
                     .map(|workspace| ui::env_project_list::EnvProjectRow {
                         id: workspace.id.clone(),
                         name: Self::workspace_display_name(workspace),
+                        alias: workspace.name.clone(),
                         path: workspace.path.clone(),
                         path_missing: false,
                         env_count: 0,
@@ -3227,19 +3223,24 @@ impl App {
     /// 변경 시에만 DB에 쓴다(churn 방지). 감지 실패(빈 이름)면 이전 값을 유지한다 —
     /// 포커스가 다른 pane으로 옮겨가도 폴더명이 "~"로 리셋되지 않게(사용자 요청).
     fn update_workspace_folder_name(&mut self, cwd: &str) {
+        // E3: 표시 이름은 프로젝트 폴더명에서 파생되고 name 컬럼은 사용자 별칭이다.
+        // cwd 자동 추적은 **경로 미지정 + 별칭 없음** 워크스페이스의 부트스트랩에만
+        // 남긴다 — 경로가 지정된 뒤 자동 추적이 별칭을 덮어쓰지 않게(별칭 보호).
+        let keep = self
+            .workspaces
+            .iter()
+            .find(|w| w.id == self.active.id)
+            .is_none_or(|w| {
+                !w.path.trim().is_empty()
+                    || (!w.name.trim().is_empty() && w.name.trim() != "default")
+            });
+        if keep {
+            return;
+        }
         let Some(name) = crate::agent_detect::project_display_name(cwd) else {
             return;
         };
         if name.is_empty() || name == "default" {
-            return;
-        }
-        // 현재 저장된 이름과 같으면 skip.
-        if self
-            .workspaces
-            .iter()
-            .find(|w| w.id == self.active.id)
-            .is_some_and(|w| w.name == name)
-        {
             return;
         }
         if let Err(e) = self.db.rename_workspace(&self.active.id, &name) {
@@ -4319,9 +4320,7 @@ impl eframe::App for App {
                                 .active
                                 .runtime
                                 .send_command(runtime::RuntimeCommand::SetShellCwd(cwd.clone()));
-                            if let Some(dir) = &cwd {
-                                self.update_workspace_folder_name(&dir.to_string_lossy());
-                            }
+                            // 표시명은 path에서 파생(E3) — 별도 갱신 불필요.
                             self.refresh_file_tree_root();
                             self.refresh_workspaces();
                         }
@@ -4823,13 +4822,12 @@ impl eframe::App for App {
             self.invalidate_env_api_projects();
         }
         if let Some(name) = workspace_rename {
+            // E3: name 컬럼은 별칭 — 빈 값 허용(별칭 해제, 폴더명만 표시).
             let name = name.trim();
-            if !name.is_empty() {
-                if let Err(e) = self.db.rename_workspace(&self.active.id, name) {
-                    tracing::warn!("워크스페이스 이름 저장 실패: {e:#}");
-                } else {
-                    self.refresh_workspaces();
-                }
+            if let Err(e) = self.db.rename_workspace(&self.active.id, name) {
+                tracing::warn!("워크스페이스 이름 저장 실패: {e:#}");
+            } else {
+                self.refresh_workspaces();
             }
         }
         // 환경 메뉴에서 프로젝트 폴더 설정 → workspace path 저장 + .env 재동기화 + 파일트리 루트.
@@ -4881,11 +4879,7 @@ impl eframe::App for App {
                     .active
                     .runtime
                     .send_command(runtime::RuntimeCommand::SetShellCwd(cwd.clone()));
-                // 워크스페이스 표시명도 새 폴더명으로 갱신 — path와 cwd 자동추적 name이
-                // 어긋나지 않게(codex Medium). 해제(빈 path)면 cwd 자동추적에 맡긴다.
-                if let Some(dir) = &cwd {
-                    self.update_workspace_folder_name(&dir.to_string_lossy());
-                }
+                // 표시명은 workspace_display_name이 path에서 파생한다(E3) — 별도 갱신 불필요.
                 self.refresh_file_tree_root();
                 self.refresh_workspaces();
             }
@@ -5332,6 +5326,38 @@ mod tests {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+
+    /// E3: 표시 이름은 폴더명 파생 + 별칭 병기. 기존 이름은 별칭으로 강등(데이터 무변경).
+    #[test]
+    fn 워크스페이스_표시명은_폴더명_파생에_별칭을_병기한다() {
+        let row = |name: &str, path: &str| crate::storage::WorkspaceRow {
+            id: "w".into(),
+            name: name.into(),
+            path: path.into(),
+            created_at: String::new(),
+        };
+        // 폴더명만 (별칭 없음/기본값/폴더명과 동일 → 병기 생략)
+        assert_eq!(
+            App::workspace_display_name(&row("", "/p/binjari")),
+            "binjari"
+        );
+        assert_eq!(
+            App::workspace_display_name(&row("default", "/p/binjari")),
+            "binjari"
+        );
+        assert_eq!(
+            App::workspace_display_name(&row("binjari", "/p/binjari")),
+            "binjari"
+        );
+        // 별칭 병기 — 레거시의 폴더와 다른 이름은 자동으로 별칭으로 강등
+        assert_eq!(
+            App::workspace_display_name(&row("예매봇", "/p/binjari")),
+            "binjari (예매봇)"
+        );
+        // 경로 없음 — 별칭만, 그것도 없으면 "~"
+        assert_eq!(App::workspace_display_name(&row("예매봇", "")), "예매봇");
+        assert_eq!(App::workspace_display_name(&row("", "")), "~");
+    }
 
     /// 리뷰 P2-1 회귀: cwd 조회 키는 **DB의 raw 제목**이다. i18n 렌더된 값("셸 3")을
     /// 넘기면 항상 miss가 되어 프로젝트명 해석이 조용히 실패한다 — warm 워크스페이스가

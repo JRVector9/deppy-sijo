@@ -2,6 +2,9 @@
 pub struct EnvProjectRow {
     pub id: String,
     pub name: String,
+    /// 사용자 별칭(name 컬럼 원본, E3) — 표시명은 `폴더명 (별칭)`으로 파생되므로
+    /// 이름 편집 폼은 표시명이 아니라 이 값을 초기값으로 쓴다.
+    pub alias: String,
     pub path: String,
     /// 저장 경로가 디스크에 없음(폴더 이동/삭제, EXDEV 볼륨 이동, 셸 부재로 자동 복구
     /// 불가) — 경로를 경고색으로 표시해 재선택을 유도한다(2026-07-09).

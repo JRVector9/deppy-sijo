@@ -52,7 +52,7 @@
 
 | 항목 | 현재 구현 (파일:라인 근거) | 판정 | 근거 요약 |
 |---|---|---|---|
-| eframe renderer 백엔드 | `main.rs:59-85` `NativeOptions{..Default}` → `Renderer::Glow`. `Cargo.toml:33` eframe 기본 feature | KEEP (PR-04 변경 지점) | 현재 **glow/OpenGL** 확정, 결함 없음. wgpu는 lock에만 존재·미컴파일 |
+| eframe renderer 백엔드 | ~~`Renderer::Glow`~~ → **정정(2026-07-13, B3/B1 교차 확인)**: eframe 0.35의 **default feature에 `wgpu`가 있고 `glow`는 없다**(`eframe-0.35.0/Cargo.toml` default = [.., "wgpu", ..]). 우리 `Cargo.toml`은 features를 지정하지 않았으므로 **앱은 이미 wgpu/Metal로 실행 중이었다.** Cargo.lock에 glutin/glow가 보이는 것은 feature-독립 기재이며 컴파일되지 않는다 | KEEP (오판정 정정) | **PR-04는 "전환"이 아니라 "검증·문서화"로 재기술 필요.** glow+wgpu 동시 활성 시 `Renderer::default()`는 wgpu를 고른다(eframe `epi.rs:608-612`) — glow feature 추가 후에도 기본 경로 불변 |
 | 터미널 셀→egui 전달 경로 | pump→`session.rs:294-299` take_snapshot→Viewport 이벤트→`workspace.rs` SessionView.snapshot→`renderer_egui::draw(snapshot, render_cache)` | KEEP | 세션별 Arc 스냅샷 단방향 전달, 색은 backend에서 RGB 해석 완료 |
 | 매 프레임 전체 텍스트 재생성 (REPLACE 조건 #1) | `renderer_egui.rs:38-83` 세션별 행 갤리 캐시(retain), `150-183` dirty 행만 `build_row_cache`, 테스트 `650-663`("변화 0→재구성 0, 1행 dirty→1행") | **KEEP (조건 미해당)** | 갤리 **shaping은 dirty 행만**. 단 shape 발행/테셀레이션은 매 repaint 발생(아래 nuance) |
 | 더티 파이프라인 | `alacritty_backend.rs:195-205` term.damage→dirty_rows, `session.rs:215-223,294-299,434-443` 누적·스냅샷 반영·소거, `renderer_egui.rs:393-408` 소비 | KEEP | 엔드투엔드 dirty 추적 실동작 |

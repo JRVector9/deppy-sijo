@@ -8,6 +8,9 @@ license.workspace = true
 # LibGhosttyBackend A/B 실측용 (실행 시 DEPPY_TERM_BACKEND=ghostty로 선택) —
 # 빌드에 Zig 필요. 기본 빌드에는 포함하지 않는다.
 ghostty-backend = ["terminal/ghostty-backend"]
+# 렌더러 A/B 실측(B1)의 프레임 alloc 카운터 — counting GlobalAlloc을 심는다.
+# **기본 빌드에는 코드 자체가 없다**(cfg로 통째 제외) — 평소 실행 비용 0.
+bench-alloc = []
 
 [dependencies]
 eframe = { workspace = true }

@@ -1098,6 +1098,8 @@ pub struct App {
     /// 시작 시 창을 주 화면으로 1회 이동했다 (centered의 macOS 좌표 문제 우회)
     startup_positioned: bool,
     frame_stats: crate::perf::FrameStats,
+    /// 렌더러 A/B 실측 드라이버 (B1) — env 미설정이면 None이고 모든 훅이 no-op이다.
+    bench: Option<crate::bench::Bench>,
     i18n: i18n::Catalog,
     /// 현재 활성(렌더되는) workspace의 런타임 상태.
     active: WorkspaceRuntime,
@@ -1213,9 +1215,18 @@ impl App {
         logs_base: PathBuf,
         db_path: PathBuf,
         egui_ctx: egui::Context,
+        bench: Option<crate::bench::Bench>,
     ) -> Self {
         // output_batch_ms는 시작 시 고정, scrollback_lines는 세션 spawn 시점에 전달
         config.ui.last_workspace_id = Some(workspace_id.clone());
+        // 벤치(B1): DEPPY_BENCH_WORKSPACES=N개가 실제로 상주해야 RSS 비교가 성립한다.
+        // warm 상한은 **설정값**이므로(코드 경로 변경 아님) 벤치 임시 config에서만 올린다.
+        // clamp(max_warm ≤ 8) 때문에 실효 상한은 active 1 + warm 8 = 9개다.
+        if let Some(bench) = &bench {
+            let wanted = bench.opts.workspaces.saturating_sub(1).min(8) as u32;
+            config.performance.max_warm = config.performance.max_warm.max(wanted);
+            config.performance.max_live_warm = config.performance.max_live_warm.max(wanted + 1);
+        }
         let redaction = secret::RedactionService::new();
         let i18n = load_catalog(&config.i18n.locale);
         // shim을 make_runtime 전에 설치한다 — 첫 셸부터 PATH에 shim이 얹히도록.
@@ -1341,6 +1352,7 @@ impl App {
             warm: std::collections::HashMap::new(),
             warm_order: Vec::new(),
             frame_stats: crate::perf::FrameStats::new(),
+            bench,
             i18n,
             egui_ctx,
             db_path,
@@ -1498,6 +1510,143 @@ impl App {
             event_overflow_pending: false,
             event_resync_pending: false,
         }
+    }
+
+    // --- 렌더러 A/B 실측 드라이버 (B1) ---------------------------------------
+    // 전부 `self.bench`(env 게이트) 뒤. 워크스페이스 생성/전환/삭제는 **실제 앱 경로**
+    // (DB workspace + runtime worker)를 그대로 탄다 — 그래야 실측이 의미가 있다.
+
+    fn bench_step(&mut self, ctx: &egui::Context) {
+        let Some(mut bench) = self.bench.take() else {
+            return;
+        };
+        bench.set_workspaces(1 + self.warm.len());
+        // 종료 중이면 새 작업을 시작하지 않는다 (on_exit이 깨끗이 정리되도록).
+        if !bench.closing() {
+            if bench.needs_setup() {
+                self.bench_setup(&mut bench);
+            }
+            let now = std::time::Instant::now();
+            if bench.switch_due(now) {
+                self.cycle_workspace(1);
+            }
+            match bench.createdelete_step(now) {
+                Some(crate::bench::CreateDeleteStep::Create(iter)) => {
+                    self.bench_create_and_run(&mut bench, &format!("bench-cd-{iter}"));
+                }
+                Some(crate::bench::CreateDeleteStep::Delete(id)) => {
+                    self.bench_delete_workspace(&mut bench, &id);
+                }
+                None => {}
+            }
+            // 드라이버가 워크스페이스를 조작하는 시나리오만 프레임을 요구한다.
+            if bench.needs_frames() {
+                ctx.request_repaint();
+            }
+        }
+        self.bench = Some(bench);
+    }
+
+    fn bench_setup(&mut self, bench: &mut crate::bench::Bench) {
+        let base = self.active.id.clone();
+        bench.base = Some(base.clone());
+        let extra = bench.opts.workspaces.saturating_sub(1);
+        if extra > 0 {
+            bench.emit_rss_stage("ws_create_begin");
+            for i in 0..extra {
+                self.bench_create_and_run(bench, &format!("bench-ws-{i}"));
+            }
+            // 활성은 항상 1개 — 기준 워크스페이스로 복귀(나머지는 warm으로 상주).
+            let started = std::time::Instant::now();
+            self.switch_workspace(&base);
+            bench.emit_ws_step("switch_back", elapsed_ms(started));
+            // 상주 수를 먼저 갱신한 뒤 스테이지를 찍는다 — 안 그러면 ws_create_done이
+            // 직전 프레임의 값(1)을 달고 나간다.
+            bench.set_workspaces(1 + self.warm.len());
+            bench.emit_rss_stage("ws_create_done");
+        }
+        // createdelete는 반복마다 자기 셸을 띄운다 — 기준 워크스페이스는 비워 둔다.
+        if bench.scenario() != crate::bench::Scenario::CreateDelete {
+            bench.begin_burst();
+            self.bench_spawn_scenario(bench);
+        }
+    }
+
+    /// 워크스페이스를 만들고(DB) 전환한 뒤(runtime worker) 시나리오 셸을 띄운다.
+    fn bench_create_and_run(&mut self, bench: &mut crate::bench::Bench, name: &str) {
+        let started = std::time::Instant::now();
+        let id = match self.db.create_workspace(name) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!("벤치 워크스페이스 생성 실패: {e:#}");
+                return;
+            }
+        };
+        bench.emit_ws_step("db_create", elapsed_ms(started));
+        self.refresh_workspaces();
+
+        let started = std::time::Instant::now();
+        self.switch_workspace(&id);
+        bench.emit_ws_step("runtime_alloc", elapsed_ms(started));
+        if self.active.id != id {
+            // warm hard cap이 전환을 거부했다 — 지어내지 말고 사실대로 남긴다.
+            tracing::warn!(workspace = %id, "벤치 전환 거부(live warm 상한) — 이 워크스페이스는 미상주");
+            bench.emit_ws_step("switch_rejected", 0.0);
+            return;
+        }
+        bench.begin_burst();
+        self.bench_spawn_scenario(bench);
+        bench.set_createdelete_current(id);
+    }
+
+    fn bench_spawn_scenario(&mut self, bench: &mut crate::bench::Bench) {
+        let Some((command, args)) = bench.scenario().command() else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        let _ = self
+            .active
+            .runtime
+            .send_command(runtime::RuntimeCommand::SpawnAgent {
+                agent_config_id: None,
+                cols: 120,
+                rows: 40,
+                scrollback_lines: self.config.terminal.scrollback_lines as usize,
+                command,
+                args,
+                env_plain: Vec::new(),
+                env_secrets: Vec::new(),
+                waiting_regex: None,
+                approval_regex: None,
+                error_regex: None,
+                done_regex: None,
+            });
+        bench.emit_ws_step("spawn_send", elapsed_ms(started));
+    }
+
+    /// UI의 삭제 경로와 같은 순서: 기준 워크스페이스로 물러난 뒤 warm shutdown + DB 삭제.
+    fn bench_delete_workspace(&mut self, bench: &mut crate::bench::Bench, delete_id: &str) {
+        let started = std::time::Instant::now();
+        if self.active.id == delete_id
+            && let Some(base) = bench.base.clone()
+        {
+            self.switch_workspace(&base);
+        }
+        if self.active.id == delete_id {
+            tracing::warn!(workspace = %delete_id, "벤치: 활성 워크스페이스라 삭제 불가");
+            return;
+        }
+        self.join_pending_shutdown(delete_id);
+        if let Some(mut runtime) = self.warm.remove(delete_id) {
+            runtime.runtime.shutdown();
+        }
+        self.warm_order.retain(|id| id != delete_id);
+        self.notifications_ui.prune_workspace(delete_id);
+        if let Err(e) = self.db.delete_workspace(delete_id) {
+            tracing::warn!("벤치 워크스페이스 삭제 실패: {e:#}");
+        }
+        self.refresh_workspaces();
+        bench.emit_ws_step("delete", elapsed_ms(started));
     }
 
     fn subscribe_runtime_events(
@@ -3690,7 +3839,14 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn on_exit(&mut self) {
+    // eframe의 `glow` feature가 켜지면(B1의 렌더러 A/B) 이 트레이트 메서드에 GL 컨텍스트
+    // 인자가 생긴다 — glow 정리 훅이 필요 없어 무시한다(우리는 GL 객체를 직접 만들지 않는다).
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // B1: 링버퍼에 모은 frame 이벤트 flush + 요약/gpu 이벤트. shutdown보다 **먼저** —
+        // egui 텍스처 상태가 살아 있어야 gpu 이벤트가 실제 값을 낸다.
+        if let Some(bench) = self.bench.as_mut() {
+            bench.finish();
+        }
         self.approval_watcher.stop();
         // 웹서버(모바일 PWA)를 runtime보다 먼저 정지 — 브리지가 쥔 command_sink가
         // worker 채널을 살려둔 채 join을 기다리는 순환을 끊는다 (P5 리뷰 P1 종료 데드락;
@@ -3890,11 +4046,17 @@ impl eframe::App for App {
         // ui()가 아닌 logic()에서 — 창이 숨겨져도 폰에는 최신 구성이 보여야 한다.
         // 브리지가 변화 없으면 무시하므로(값 비교) 유휴 프레임 비용은 사실상 0이다.
         self.sync_web_workspaces(std::time::Instant::now());
+
+        // 렌더러 A/B 실측 드라이버 (B1) — env 미설정이면 즉시 반환한다.
+        self.bench_step(ctx);
     }
 
     // egui 0.35부터 update(&Context) 대신 ui(&mut Ui) 시그니처를 쓴다.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.frame_stats.begin();
+        if let Some(bench) = self.bench.as_mut() {
+            bench.frame_begin(ui.ctx());
+        }
         let text = self.i18n.clone();
         self.handle_configured_shortcut(ui.ctx());
         let mut unread_before = 0;
@@ -5285,7 +5447,26 @@ impl eframe::App for App {
             self.web_qr = None;
         }
         self.frame_stats.end();
+        // B1: 이번 프레임에 그린 터미널 렌더 카운터를 프레임 이벤트에 실어 보낸다.
+        // frame_stats.end() 뒤라 JSONL 기록 비용은 ui_ms에 섞이지 않는다.
+        // 스냅샷 관측도 여기서 — logic()에서 보면 다음 프레임까지 밀려 first_snapshot이
+        // first_render보다 늦게 찍힌다(첫 실측에서 발견).
+        if self.bench.is_some() {
+            let counters = self.active.workspace_ui.frame_counters();
+            let has_snapshot = self.active.workspace_ui.any_snapshot();
+            if let Some(bench) = self.bench.as_mut() {
+                if has_snapshot {
+                    bench.note_first_snapshot();
+                }
+                bench.frame_end(counters);
+            }
+        }
     }
+}
+
+/// Instant → 경과 ms (벤치 ws_step용).
+fn elapsed_ms(started: std::time::Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
 }
 
 /// known_hosts 파일 텍스트를 (host, 지문) 목록으로 파싱한다 (settings 표시 전용 —

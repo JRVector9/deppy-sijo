@@ -11,6 +11,32 @@ pub struct RenderOutput {
     pub cell_size: egui::Vec2,
     /// 그리드 좌상단 화면 좌표 — 호출측이 포인터→셀 변환(선택 드래그)에 쓴다
     pub origin: egui::Pos2,
+    /// 이번 draw의 계측 카운터 — 렌더러 A/B 실측(B1)에서 호출측이 프레임 단위로 합산한다.
+    /// 정수 증가뿐이라 게이트 없이 항상 집계한다(기존 rebuilt_rows_last_frame과 동일 정책).
+    pub counters: RenderCounters,
+}
+
+/// draw 1회의 렌더 비용 카운터. `shapes`는 **우리가 발행한 painter 호출 수**로,
+/// epaint가 내부에서 만드는 테셀레이션 삼각형 수가 아니다.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RenderCounters {
+    /// 이번 프레임에 갤리를 다시 shaping한 행 수 (dirty 또는 캐시 미스)
+    pub rows_rebuilt: usize,
+    /// 이번 프레임에 실제로 그린(캐시 소비) 행 수
+    pub rows_painted: usize,
+    /// 이번 프레임에 발행한 painter 호출 수 (rect_filled + galley + text + line_segment)
+    pub shapes: usize,
+    /// snapshot.dirty_ranges가 가리키는 행 수
+    pub dirty_rows: usize,
+}
+
+impl std::ops::AddAssign for RenderCounters {
+    fn add_assign(&mut self, rhs: Self) {
+        self.rows_rebuilt += rhs.rows_rebuilt;
+        self.rows_painted += rhs.rows_painted;
+        self.shapes += rhs.shapes;
+        self.dirty_rows += rhs.dirty_rows;
+    }
 }
 
 /// 터미널 셀 그리드 좌우의 고정 내부 여백.
@@ -43,7 +69,7 @@ pub struct TerminalRenderCache {
     is_alt_screen: bool,
     font_size_bits: u32,
     rows_cache: Vec<Option<RowRenderCache>>,
-    rebuilt_rows_last_frame: usize,
+    counters: RenderCounters,
 }
 
 impl TerminalRenderCache {
@@ -54,15 +80,15 @@ impl TerminalRenderCache {
         self.scroll_offset = 0;
         self.is_alt_screen = false;
         self.font_size_bits = 0;
-        self.rebuilt_rows_last_frame = 0;
+        self.counters = RenderCounters::default();
     }
 
     pub fn rebuilt_rows_last_frame(&self) -> usize {
-        self.rebuilt_rows_last_frame
+        self.counters.rows_rebuilt
     }
 
     fn prepare(&mut self, snapshot: &TerminalViewportSnapshot, font_size: f32) {
-        self.rebuilt_rows_last_frame = 0;
+        self.counters = RenderCounters::default();
         let font_size_bits = font_size.to_bits();
         let shape_changed = self.cols != snapshot.cols
             || self.rows != snapshot.rows
@@ -148,8 +174,13 @@ pub fn draw(
     background_painter.rect_filled(rect, 0.0, default_bg);
 
     cache.prepare(snapshot, font_size);
+    cache.counters.shapes += 1; // 위 배경 rect_filled
     for row in 0..snapshot.rows as usize {
-        let needs_rebuild = row_is_dirty(snapshot, row)
+        let dirty = row_is_dirty(snapshot, row);
+        if dirty {
+            cache.counters.dirty_rows += 1;
+        }
+        let needs_rebuild = dirty
             || cache
                 .rows_cache
                 .get(row)
@@ -159,7 +190,7 @@ pub fn draw(
             let row_cache = build_row_cache(&painter, snapshot, row, &font_id, default_bg);
             if let Some(slot) = cache.rows_cache.get_mut(row) {
                 *slot = Some(row_cache);
-                cache.rebuilt_rows_last_frame += 1;
+                cache.counters.rows_rebuilt += 1;
             }
         }
 
@@ -174,11 +205,15 @@ pub fn draw(
                     bg.color,
                 );
             }
-            paint_selection_row(&painter, snapshot, row, origin, cell, selection);
+            let selection_shapes =
+                paint_selection_row(&painter, snapshot, row, origin, cell, selection);
             for run in &row_cache.text_runs {
                 let pos = origin + egui::vec2(run.col as f32 * cell.x, row_y);
                 painter.galley(pos, Arc::clone(&run.galley), run.color);
             }
+            cache.counters.rows_painted += 1;
+            cache.counters.shapes +=
+                row_cache.bg_runs.len() + row_cache.text_runs.len() + selection_shapes;
         }
     }
 
@@ -199,6 +234,7 @@ pub fn draw(
             CursorShape::Beam => egui::Rect::from_min_size(pos, egui::vec2(2.0, cell.y)),
         };
         painter.rect_filled(cursor_rect, 0.0, cursor_color);
+        cache.counters.shapes += 1;
 
         // IME는 터미널이 포커스를 가질 때만 — 다른 입력창의 조합/후보창을 뺏지 않는다
         if response.has_focus() {
@@ -223,6 +259,7 @@ pub fn draw(
                     [galley_rect.left_bottom(), galley_rect.right_bottom()],
                     egui::Stroke::new(1.5, egui::Color32::BLACK),
                 );
+                cache.counters.shapes += 4; // text ×2 + rect_filled + line_segment
             }
             ui.ctx().output_mut(|o| {
                 o.ime = Some(egui::output::IMEOutput {
@@ -238,6 +275,7 @@ pub fn draw(
         response,
         cell_size: cell,
         origin,
+        counters: cache.counters,
     }
 }
 
@@ -407,6 +445,7 @@ fn range_intersects_row(range: &CellRange, row_start: usize, row_end: usize) -> 
     range.start < row_end && range.end > row_start && range.start < range.end
 }
 
+/// 선택 배경을 그리고 **발행한 rect 수**를 돌려준다 (shapes 카운터용).
 fn paint_selection_row(
     painter: &egui::Painter,
     snapshot: &TerminalViewportSnapshot,
@@ -414,18 +453,19 @@ fn paint_selection_row(
     origin: egui::Pos2,
     cell_size: egui::Vec2,
     selection: Option<(usize, usize)>,
-) {
+) -> usize {
     let Some((start, end)) = selection else {
-        return;
+        return 0;
     };
     let cols = snapshot.cols as usize;
     let row_start = row * cols;
     let row_end = row_start + cols;
     if cols == 0 || end < row_start || start >= row_end {
-        return;
+        return 0;
     }
 
     let selection_bg = egui::Color32::from_rgb(0x2d, 0x4f, 0x77);
+    let mut painted = 0;
     for col in 0..cols {
         let index = row_start + col;
         if index < start || index > end {
@@ -448,7 +488,9 @@ fn paint_selection_row(
             0.0,
             selection_bg,
         );
+        painted += 1;
     }
+    painted
 }
 
 /// 선택 범위(선형 인덱스, inclusive)의 텍스트를 추출한다 — 행마다 trailing 공백
@@ -660,6 +702,41 @@ mod tests {
         cursor_only.cursor.col = 2;
         cursor_only.dirty_ranges.clear();
         assert_eq!(draw_for_test(&mut cache, &cursor_only), 0);
+    }
+
+    #[test]
+    fn render_counters는_dirty_painted_shapes를_집계한다() {
+        fn counters(
+            cache: &mut TerminalRenderCache,
+            snapshot: &TerminalViewportSnapshot,
+        ) -> RenderCounters {
+            let ctx = egui::Context::default();
+            let mut out = RenderCounters::default();
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.set_min_size(egui::vec2(500.0, 200.0));
+                out = draw(ui, snapshot, 13.0, cache, None, None).counters;
+            });
+            out
+        }
+
+        let mut cache = TerminalRenderCache::default();
+        let first = snap(4, 3, &["aaaa", "bbbb", "cccc"]);
+        let c = counters(&mut cache, &first);
+        // 첫 프레임: dirty_ranges는 비었지만 캐시 미스로 3행 전부 재구성 + 3행 전부 페인트.
+        assert_eq!(c.dirty_rows, 0);
+        assert_eq!(c.rows_rebuilt, 3);
+        assert_eq!(c.rows_painted, 3);
+        // 배경 rect 1 + 행마다 text_run 1개 (기본 bg라 bg_run 없음)
+        assert_eq!(c.shapes, 1 + 3);
+
+        // 2프레임: 1행만 dirty → 재구성 1행, 페인트는 여전히 전체 행(shape 발행은 매 프레임).
+        let mut second = snap(4, 3, &["aaaa", "bbxb", "cccc"]);
+        second.dirty_ranges = vec![CellRange { start: 4, end: 8 }];
+        let c = counters(&mut cache, &second);
+        assert_eq!(c.dirty_rows, 1);
+        assert_eq!(c.rows_rebuilt, 1);
+        assert_eq!(c.rows_painted, 3);
+        assert_eq!(c.shapes, 1 + 3);
     }
 
     #[test]

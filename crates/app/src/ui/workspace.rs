@@ -75,6 +75,9 @@ pub struct WorkspaceUi {
     /// 터미널 텍스트 검색 상태 (T3). Cmd+F로 열리고, 열려 있으면 focused pane 우상단에
     /// 검색 바를 그린다. 한 번에 한 세션만 검색한다.
     search: Option<TerminalSearch>,
+    /// 이번 프레임에 그린 pane들의 렌더 카운터 합 (B1 실측). show() 시작에서 리셋하고
+    /// pane마다 누적한다 — 정수 덧셈뿐이라 게이트 없이 항상 집계한다.
+    frame_counters: renderer_egui::RenderCounters,
 }
 
 /// 터미널 검색 매치 수 상한 (T3) — worker에 보내는 요청 상한. 도달 시 결과가 잘린다.
@@ -164,7 +167,19 @@ impl WorkspaceUi {
             error: None,
             error_is_pressure: false,
             search: None,
+            frame_counters: renderer_egui::RenderCounters::default(),
         }
+    }
+
+    /// 이번 프레임에 이 워크스페이스가 그린 터미널 렌더 카운터 합 (B1 실측).
+    pub fn frame_counters(&self) -> renderer_egui::RenderCounters {
+        self.frame_counters
+    }
+
+    /// 세션 스냅샷이 하나라도 도착했는가 — 워크스페이스 생성 burst의 `first_snapshot`
+    /// 단계 판정용 (B1). 세션이 없으면 false.
+    pub fn any_snapshot(&self) -> bool {
+        self.sessions.values().any(|view| view.snapshot.is_some())
     }
 
     /// Cmd+F 등으로 focused 터미널에서 검색 바를 연다 (T3). 이미 같은 세션에 열려 있으면
@@ -692,6 +707,7 @@ impl WorkspaceUi {
         events: &[RuntimeEvent],
         catalog: &i18n::Catalog,
     ) {
+        self.frame_counters = renderer_egui::RenderCounters::default();
         self.handle_events(events, catalog);
         self.poll_paste_task(client);
 
@@ -1254,6 +1270,8 @@ impl WorkspaceUi {
                 selection_range,
             )
         };
+        // B1 실측: 이 프레임에 그린 pane들의 렌더 비용을 합산한다 (visible pane 전부).
+        self.frame_counters += output.counters;
 
         // 선택된 텍스트 위에서 시작한 드래그는 terminal-internal DnD payload가 된다.
         // 그 외의 마우스 드래그는 기존 셀 선택 동작을 유지한다.

@@ -4,6 +4,7 @@ mod agent_hooks;
 mod agent_shim;
 mod agent_transcript;
 mod app;
+mod bench;
 mod config;
 mod dotenv_sync;
 mod env;
@@ -18,8 +19,20 @@ mod tailscale;
 mod theme;
 mod ui;
 
+use std::path::{Path, PathBuf};
+
 fn main() -> anyhow::Result<()> {
-    let paths = paths::AppPaths::init()?;
+    // 렌더러 A/B 실측(B1) — env 미설정이면 bench_log는 None이고 아래 경로는 전부 무시된다.
+    // `start` 스테이지 RSS는 이 시점(창/렌더러 생성 전)에 이미 찍힌다.
+    let bench_log = bench::init_log();
+    let process_start = std::time::Instant::now();
+    // 벤치 모드는 **사용자 실데이터를 오염시키지 않는다** — 임시 data/config dir로 격리한다.
+    // (DEPPY_RESOURCE_STATS만 켠 경우는 실제 앱 관찰이 목적이라 격리하지 않는다.)
+    let bench_root = bench::isolate_data_dir().then(bench_temp_root);
+    let paths = match &bench_root {
+        Some(root) => bench_paths(root)?,
+        None => paths::AppPaths::init()?,
+    };
     // guard가 drop되면 파일 로그 flush가 끊기므로 main 끝까지 유지한다.
     let _log_guard = init_logging(&paths);
     // 중복 실행 방지 lock (설계문서 PR-14 crash recovery). config 로드/생성보다
@@ -56,9 +69,12 @@ fn main() -> anyhow::Result<()> {
         "앱 시작"
     );
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "Deppy Sijo",
         eframe::NativeOptions {
+            // 렌더러 A/B(B1): env 미지정이면 `Renderer::default()` — eframe 0.35 기본 feature가
+            // wgpu라 이 값은 **Wgpu**이고, 이는 B1 이전과 완전히 동일한 경로다(회귀 없음).
+            renderer: select_renderer(),
             // 창 위치/크기 영속 안 함 — 외부 모니터 분리 후 저장된 좌표로 복원되면
             // 창이 화면 밖에 떠서 "앱이 죽은 것처럼" 보인다 (2026-07-05 실증:
             // eframe 기본 복원은 현재 모니터 배치로 clamp되지 않았다). 위치 기억보다
@@ -96,6 +112,14 @@ fn main() -> anyhow::Result<()> {
                 &config.terminal.mono_weight,
             );
             install_macos_menu();
+            // B1: 실제로 초기화된 백엔드/어댑터를 기록한다 (요청값이 아니라 결과값).
+            let bench = bench_log.and_then(|log| {
+                log.emit("renderer", renderer_fields(cc, process_start));
+                bench::Bench::from_env(log, cc.egui_ctx.clone())
+            });
+            if let Some(bench) = &bench {
+                bench.emit_rss_stage("renderer_init");
+            }
             Ok(Box::new(app::App::new(
                 config,
                 config_path,
@@ -104,10 +128,87 @@ fn main() -> anyhow::Result<()> {
                 logs_base,
                 db_path,
                 cc.egui_ctx.clone(),
+                bench,
             )))
         }),
     )
-    .map_err(|e| anyhow::anyhow!("eframe 실행 실패: {e}"))
+    .map_err(|e| anyhow::anyhow!("eframe 실행 실패: {e}"));
+
+    // 벤치 임시 data dir 정리 — 사용자 실데이터와 격리된 디렉터리만 지운다.
+    if let Some(root) = bench_root {
+        let _ = std::fs::remove_dir_all(root);
+    }
+    result
+}
+
+/// `DEPPY_RENDERER=glow|wgpu`. 미지정/오타면 eframe 기본값 — 즉 **현재 동작(wgpu) 유지**.
+fn select_renderer() -> eframe::Renderer {
+    match std::env::var("DEPPY_RENDERER").as_deref() {
+        Ok("glow") => eframe::Renderer::Glow,
+        Ok("wgpu") => eframe::Renderer::Wgpu,
+        Ok(other) => {
+            eprintln!("DEPPY_RENDERER='{other}' 알 수 없음 — 기본 렌더러 사용");
+            eframe::Renderer::default()
+        }
+        Err(_) => eframe::Renderer::default(),
+    }
+}
+
+/// 실제 초기화된 렌더 백엔드 정보. wgpu면 adapter/backend(Metal 여부)를 어댑터에서 직접
+/// 읽고, glow면 GL 컨텍스트에서 GL_RENDERER/GL_VERSION을 읽는다 — 둘 다 **실측값**이다.
+fn renderer_fields(
+    cc: &eframe::CreationContext<'_>,
+    process_start: std::time::Instant,
+) -> serde_json::Map<String, serde_json::Value> {
+    let init_ms = process_start.elapsed().as_secs_f64() * 1000.0;
+    let (backend, adapter, gpu_backend) = match cc.wgpu_render_state.as_ref() {
+        Some(state) => {
+            let info = state.adapter.get_info();
+            ("wgpu", info.name, format!("{:?}", info.backend))
+        }
+        None => {
+            let (renderer, version) = gl_strings(cc);
+            ("glow", renderer, version)
+        }
+    };
+    let mut map = serde_json::Map::new();
+    map.insert("backend".to_owned(), backend.into());
+    map.insert("adapter".to_owned(), adapter.into());
+    map.insert("gpu_backend".to_owned(), gpu_backend.into());
+    map.insert("init_ms".to_owned(), init_ms.into());
+    map
+}
+
+/// glow 경로의 (GL_RENDERER, GL_VERSION). 컨텍스트가 없으면 "unknown".
+fn gl_strings(cc: &eframe::CreationContext<'_>) -> (String, String) {
+    use eframe::glow::HasContext as _;
+    let Some(gl) = cc.gl.as_ref() else {
+        return ("unknown".to_owned(), "unknown".to_owned());
+    };
+    // SAFETY: eframe이 이 스레드에서 GL 컨텍스트를 current로 만든 뒤 콜백을 부른다.
+    unsafe {
+        (
+            gl.get_parameter_string(eframe::glow::RENDERER),
+            gl.get_parameter_string(eframe::glow::VERSION),
+        )
+    }
+}
+
+/// 벤치 전용 임시 루트 (pid로 구분 — 동시 실행/실데이터 오염 방지).
+fn bench_temp_root() -> PathBuf {
+    std::env::temp_dir().join(format!("deppy-bench-{}", std::process::id()))
+}
+
+fn bench_paths(root: &Path) -> anyhow::Result<paths::AppPaths> {
+    let paths = paths::AppPaths {
+        config_dir: root.join("config"),
+        data_dir: root.join("data"),
+        log_dir: root.join("data").join("logs"),
+    };
+    for dir in [&paths.config_dir, &paths.data_dir, &paths.log_dir] {
+        std::fs::create_dir_all(dir)?;
+    }
+    Ok(paths)
 }
 
 fn initial_workspace_id(

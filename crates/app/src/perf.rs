@@ -56,12 +56,18 @@ impl FrameStats {
 }
 
 fn percentile95(samples: &mut [f32]) -> f32 {
+    percentile(samples, 0.95)
+}
+
+/// q분위(0.0~1.0). `q = 1.0`이면 최댓값. 샘플이 없으면 0.0.
+/// 벤치(B1)의 p50/p95/p99/max가 FrameStats와 **같은 정의**를 쓰도록 여기 둔다.
+pub fn percentile(samples: &mut [f32], q: f32) -> f32 {
     if samples.is_empty() {
         return 0.0;
     }
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let idx = ((samples.len() as f32 * 0.95).ceil() as usize).saturating_sub(1);
-    samples[idx]
+    let idx = ((samples.len() as f32 * q).ceil() as usize).saturating_sub(1);
+    samples[idx.min(samples.len() - 1)]
 }
 
 /// 부하 하네스 시나리오: 완료 기준 "hidden session 10개 + 그중 3개 대량 출력".
@@ -106,6 +112,18 @@ mod tests {
         // 1..=100에서 p95는 95
         let mut hundred: Vec<f32> = (1..=100).map(|v| v as f32).collect();
         assert_eq!(percentile95(&mut hundred), 95.0);
+    }
+
+    #[test]
+    fn percentile_분위() {
+        let mut hundred: Vec<f32> = (1..=100).map(|v| v as f32).collect();
+        assert_eq!(percentile(&mut hundred, 0.50), 50.0);
+        assert_eq!(percentile(&mut hundred, 0.95), 95.0);
+        assert_eq!(percentile(&mut hundred, 0.99), 99.0);
+        // q=1.0은 최댓값 (인덱스 오버플로 없이)
+        assert_eq!(percentile(&mut hundred, 1.0), 100.0);
+        let mut empty: Vec<f32> = vec![];
+        assert_eq!(percentile(&mut empty, 0.5), 0.0);
     }
 
     #[test]

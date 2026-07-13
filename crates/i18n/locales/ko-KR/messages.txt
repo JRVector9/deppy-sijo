@@ -441,3 +441,7 @@ workspace.search.capped = 상한 도달
 workspace.search.prev = 이전 일치 (Shift+Enter)
 workspace.search.next = 다음 일치 (Enter)
 workspace.search.close = 닫기 (Esc)
+settings.session_name_style = 세션 위치 표시
+settings.session_name_style.hint = 세션이 있는 폴더를 어떻게 표시할지: 현재(마지막) 폴더명 또는 git 저장소 이름.
+settings.session_name_style.folder = 현재 폴더명
+settings.session_name_style.repo = 저장소(레포) 이름

@@ -441,3 +441,7 @@ workspace.search.capped = 上限に到達
 workspace.search.prev = 前の一致 (Shift+Enter)
 workspace.search.next = 次の一致 (Enter)
 workspace.search.close = 閉じる (Esc)
+settings.session_name_style = セッション位置の表示
+settings.session_name_style.hint = セッションのある場所の表示方法: 現在（最後）のフォルダ名、または git リポジトリ名。
+settings.session_name_style.folder = 現在のフォルダ名
+settings.session_name_style.repo = リポジトリ名

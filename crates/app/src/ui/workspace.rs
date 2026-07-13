@@ -61,6 +61,8 @@ pub struct WorkspaceUi {
     ui_scale: f32,
     /// 세션별 현재 작업 폴더(App이 매 프레임 set) — 1행 제목 폴더명/프로젝트명 원천.
     session_cwds: std::collections::HashMap<SessionId, String>,
+    /// 세션 위치 표시명 스타일(설정 미러 — set_session_cwds가 매 프레임 갱신).
+    session_name_style: crate::config::SessionNameStyle,
     /// 세션별 에이전트 표시정보(model/effort/context — App이 병합해 set) — 3줄 행 2/3행.
     agent_info: std::collections::HashMap<SessionId, crate::agent_detect::AgentDisplay>,
     /// 진행 중인 백그라운드 클립보드 paste(이미지 PNG 인코딩을 UI 밖으로 — 2026-07-07).
@@ -156,6 +158,7 @@ impl WorkspaceUi {
             project_name: None,
             ui_scale: 1.0,
             session_cwds: std::collections::HashMap::new(),
+            session_name_style: crate::config::SessionNameStyle::default(),
             agent_info: std::collections::HashMap::new(),
             paste_task: None,
             error: None,
@@ -428,8 +431,14 @@ impl WorkspaceUi {
     }
 
     /// 세션별 현재 작업 폴더를 세팅한다(App이 매 프레임, 감지 워커 lsof 결과).
-    pub fn set_session_cwds(&mut self, cwds: std::collections::HashMap<SessionId, String>) {
+    /// `style`은 위치 표시명 스타일(설정 — 현재 폴더명 vs 저장소명)을 함께 나른다.
+    pub fn set_session_cwds(
+        &mut self,
+        cwds: std::collections::HashMap<SessionId, String>,
+        style: crate::config::SessionNameStyle,
+    ) {
         self.session_cwds = cwds;
+        self.session_name_style = style;
     }
 
     /// 세션별 에이전트 표시정보를 세팅한다(App이 병합한 최종본 — 3줄 행 렌더용).
@@ -466,7 +475,7 @@ impl WorkspaceUi {
         // 현재 작업 폴더명(git 프로젝트명) — 세션별 cwd(App이 매 프레임 set).
         if let Some(n) = session
             .and_then(|s| self.session_cwds.get(&s))
-            .and_then(|c| crate::agent_detect::project_display_name(c))
+            .and_then(|c| crate::agent_detect::project_display_name(c, self.session_name_style))
             .filter(|t| !t.trim().is_empty())
         {
             return n;

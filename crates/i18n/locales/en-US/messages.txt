@@ -441,3 +441,7 @@ workspace.search.capped = Max reached
 workspace.search.prev = Previous match (Shift+Enter)
 workspace.search.next = Next match (Enter)
 workspace.search.close = Close (Esc)
+settings.session_name_style = Session location label
+settings.session_name_style.hint = How to label where a session is: the current (last) folder name, or the git repository name.
+settings.session_name_style.folder = Current folder
+settings.session_name_style.repo = Repository name

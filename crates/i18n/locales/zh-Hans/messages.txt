@@ -441,3 +441,7 @@ workspace.search.capped = 已达上限
 workspace.search.prev = 上一个匹配 (Shift+Enter)
 workspace.search.next = 下一个匹配 (Enter)
 workspace.search.close = 关闭 (Esc)
+settings.session_name_style = 会话位置显示
+settings.session_name_style.hint = 如何显示会话所在位置：当前（最后）文件夹名，或 git 仓库名。
+settings.session_name_style.folder = 当前文件夹名
+settings.session_name_style.repo = 仓库名

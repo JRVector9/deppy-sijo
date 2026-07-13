@@ -495,11 +495,15 @@ pub(crate) fn session_cwds(_pids: &[u32]) -> HashMap<u32, String> {
     HashMap::new()
 }
 
-/// cwd → 표시명 = **레포 + 현재 폴더** (2026-07-13 사용자: 둘 다 보여야).
-/// git 저장소 안이면 `레포명/현재폴더`, 두 단계 이상 깊으면 가운데를 생략해
-/// `레포명/…/현재폴더` — 레포 정체성과 실제 위치가 한 줄에 유계 길이로 보인다.
-/// 레포 루트 자체면 레포명만, 저장소 밖이면 현재 폴더명, 홈 디렉터리는 "~".
-pub(crate) fn project_display_name(cwd: &str) -> Option<String> {
+/// cwd → 표시명 (2026-07-13: 설정에서 스타일 선택).
+/// - [`SessionNameStyle::Folder`](기본): **현재(마지막) 폴더명** — Crawler/printbakery면 "printbakery".
+/// - [`SessionNameStyle::Repo`]: git 저장소 루트명(.git 상향 탐색, 최대 40단계) —
+///   저장소 하위 어디서든 "Crawler". 저장소 밖이면 현재 폴더명 폴백.
+///   홈 디렉터리 자체는 두 스타일 모두 "~".
+pub(crate) fn project_display_name(
+    cwd: &str,
+    style: crate::config::SessionNameStyle,
+) -> Option<String> {
     let path = std::path::Path::new(cwd);
     if !path.is_absolute() {
         return None;
@@ -508,32 +512,23 @@ pub(crate) fn project_display_name(cwd: &str) -> Option<String> {
     if std::env::var_os("HOME").is_some_and(|h| path == std::path::Path::new(&h)) {
         return Some("~".to_owned());
     }
-    let leaf = path.file_name()?.to_string_lossy().into_owned();
-    // .git을 위로 탐색(최대 40단계 — 극단 경로 방어) → 저장소 루트.
-    let mut cur = path.parent();
-    let mut depth = 0usize; // cwd와 레포 루트 사이의 중간 단계 수
-    let mut steps = 0;
-    if path.join(".git").exists() {
-        return Some(leaf); // cwd가 곧 레포 루트
-    }
-    while let Some(dir) = cur {
-        if steps >= 40 {
-            break;
+    if style == crate::config::SessionNameStyle::Repo {
+        // .git을 위로 탐색(최대 40단계 — 극단 경로 방어) → 저장소 루트명.
+        let mut cur = Some(path);
+        let mut steps = 0;
+        while let Some(dir) = cur {
+            if steps >= 40 {
+                break;
+            }
+            if dir.join(".git").exists() {
+                return dir.file_name().map(|n| n.to_string_lossy().into_owned());
+            }
+            cur = dir.parent();
+            steps += 1;
         }
-        if dir.join(".git").exists() {
-            let root = dir.file_name()?.to_string_lossy();
-            return Some(if depth == 0 {
-                format!("{root}/{leaf}")
-            } else {
-                format!("{root}/…/{leaf}")
-            });
-        }
-        cur = dir.parent();
-        depth += 1;
-        steps += 1;
     }
-    // 저장소 밖 — 현재 폴더명만.
-    Some(leaf)
+    // Folder 스타일 또는 저장소 밖 — 현재 폴더명.
+    path.file_name().map(|n| n.to_string_lossy().into_owned())
 }
 
 /// 프로세스의 cwd (macOS/Unix: `lsof -p <pid> -d cwd`).
@@ -610,37 +605,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn project_display_name은_레포와_현재폴더를_함께_보여준다() {
+    fn project_display_name은_스타일에_따라_폴더명_또는_레포명() {
+        use crate::config::SessionNameStyle as S;
         let base = std::env::temp_dir().join(format!("deppy-proj-{}", std::process::id()));
         let repo = base.join("Crawler");
         let sub = repo.join("printbakery");
-        let deep = sub.join("assets").join("fonts");
-        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
         std::fs::create_dir_all(repo.join(".git")).unwrap();
-        // 한 단계 하위 → "레포/현재폴더" (2026-07-13: 레포도 폴더도 보여야)
+        let sub_s = sub.to_str().unwrap();
+        // 기본(Folder): 저장소 하위 깊은 폴더도 **현재 폴더명**
         assert_eq!(
-            project_display_name(sub.to_str().unwrap()),
-            Some("Crawler/printbakery".to_owned())
+            project_display_name(sub_s, S::Folder),
+            Some("printbakery".to_owned())
         );
-        // 두 단계 이상 → 가운데 생략 "레포/…/현재폴더"
+        // Repo: 저장소 하위 어디서든 **레포 루트명**
         assert_eq!(
-            project_display_name(deep.to_str().unwrap()),
-            Some("Crawler/…/fonts".to_owned())
-        );
-        // 레포 루트 자체 → 레포명만
-        assert_eq!(
-            project_display_name(repo.to_str().unwrap()),
+            project_display_name(sub_s, S::Repo),
             Some("Crawler".to_owned())
         );
-        // 저장소 아닌 폴더는 폴더명
+        // 레포 루트 자체는 두 스타일 모두 레포명
+        let repo_s = repo.to_str().unwrap();
+        assert_eq!(
+            project_display_name(repo_s, S::Folder),
+            Some("Crawler".to_owned())
+        );
+        assert_eq!(
+            project_display_name(repo_s, S::Repo),
+            Some("Crawler".to_owned())
+        );
+        // 저장소 밖 폴더는 두 스타일 모두 폴더명 (Repo는 폴백)
         let plain = base.join("plainfolder");
         std::fs::create_dir_all(&plain).unwrap();
-        assert_eq!(
-            project_display_name(plain.to_str().unwrap()),
-            Some("plainfolder".to_owned())
-        );
+        for style in [S::Folder, S::Repo] {
+            assert_eq!(
+                project_display_name(plain.to_str().unwrap(), style),
+                Some("plainfolder".to_owned())
+            );
+        }
         // 상대경로는 None
-        assert_eq!(project_display_name("relative/path"), None);
+        assert_eq!(project_display_name("relative/path", S::Folder), None);
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -1526,6 +1526,35 @@ fn general_page(
     );
     row(
         ui,
+        &catalog.t("settings.session_name_style", &[]),
+        Some(&catalog.t("settings.session_name_style.hint", &[])),
+        |ui| {
+            use crate::config::SessionNameStyle;
+            let current_key = match config.ui.session_name_style {
+                SessionNameStyle::Folder => "settings.session_name_style.folder",
+                SessionNameStyle::Repo => "settings.session_name_style.repo",
+            };
+            let resp = settings_select_button(ui, &catalog.t(current_key, &[]));
+            egui::Popup::menu(&resp).show(|ui| {
+                ui.set_min_width(SETTINGS_DETAIL.select_width);
+                for (style, key) in [
+                    (
+                        SessionNameStyle::Folder,
+                        "settings.session_name_style.folder",
+                    ),
+                    (SessionNameStyle::Repo, "settings.session_name_style.repo"),
+                ] {
+                    let selected = config.ui.session_name_style == style;
+                    if ui.selectable_label(selected, catalog.t(key, &[])).clicked() {
+                        config.ui.session_name_style = style;
+                        *changed = true;
+                    }
+                }
+            });
+        },
+    );
+    row(
+        ui,
         &catalog.t("settings.auto_resume", &[]),
         Some(&catalog.t("settings.auto_resume.hint", &[])),
         |ui| {

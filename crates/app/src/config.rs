@@ -88,6 +88,10 @@ pub struct UiConfig {
     /// 변경을 이미 떠 있는 셸에도 다음 프롬프트부터 반영한다. OFF면 새 세션부터만.
     #[serde(default)]
     pub env_live_reload: bool,
+    /// 세션 위치 표시명 스타일 (2026-07-13): 기본 = 현재(마지막) 폴더명,
+    /// Repo = git 저장소 루트명(.git 상향 탐색 — 저장소 하위 어디서든 레포명).
+    #[serde(default)]
+    pub session_name_style: SessionNameStyle,
     /// 다음 실행 때 다시 열 마지막 활성 workspace. 삭제되었거나 없으면 default workspace로 대체.
     pub last_workspace_id: Option<String>,
     /// UI(Proportional) 폰트 파일 경로. None = 기본(자동 — macOS는 Apple SD Gothic Neo).
@@ -117,11 +121,23 @@ impl Default for UiConfig {
             auto_resume_agents: true,
             agent_status_hooks: true,
             env_live_reload: false,
+            session_name_style: SessionNameStyle::default(),
             last_workspace_id: None,
             ui_font: None,
             ui_scale: 1.0,
         }
     }
+}
+
+/// 세션 위치 표시명 스타일 (2026-07-13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionNameStyle {
+    /// 현재(마지막) 폴더명 — 예: Crawler/printbakery에서 "printbakery".
+    #[default]
+    Folder,
+    /// git 저장소 루트명 — 저장소 하위 어디서든 "Crawler".
+    Repo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

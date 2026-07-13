@@ -259,6 +259,16 @@ pub fn terminal_focus_lock_filter() -> egui::EventFilter {
     }
 }
 
+/// 표시용 글리프 치환 — 일부 기호는 어떤 텍스트/모노 폰트에도 없어(예: ⏺ U+23FA는 Menlo·SF
+/// Mono·Apple Symbols·JetBrains Mono 전부 미보유) egui 흑백 이모지 폴백으로 작게 그려진다.
+/// 육안상 같은 글리프로 바꿔 크기를 맞춘다 — **그리드 셀 원본은 불변**이라 복사/선택엔 영향 없다.
+fn display_char(c: char) -> char {
+    match c {
+        '\u{23FA}' => '\u{25CF}', // ⏺ → ● (JetBrains Mono 보유, 동일한 채운 원)
+        other => other,
+    }
+}
+
 fn build_row_cache(
     painter: &egui::Painter,
     snapshot: &TerminalViewportSnapshot,
@@ -300,7 +310,7 @@ fn build_row_cache(
         let fg = rgb(term_cell.fg);
         if term_cell.wide {
             pending.flush(&mut text_runs, painter, font_id);
-            let text = term_cell.c.to_string();
+            let text = display_char(term_cell.c).to_string();
             text_runs.push(RowTextRun {
                 col,
                 galley: painter.layout_no_wrap(text, font_id.clone(), fg),
@@ -310,7 +320,7 @@ fn build_row_cache(
             if pending.needs_flush(col, fg) {
                 pending.flush(&mut text_runs, painter, font_id);
             }
-            pending.push(col, term_cell.c, fg);
+            pending.push(col, display_char(term_cell.c), fg);
         }
     }
     pending.flush(&mut text_runs, painter, font_id);
@@ -526,6 +536,13 @@ fn rgb(c: [u8; 3]) -> egui::Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn display_char는_없는_기호만_치환한다() {
+        assert_eq!(display_char('\u{23FA}'), '\u{25CF}'); // ⏺ → ●
+        assert_eq!(display_char('\u{25CF}'), '\u{25CF}'); // ● 그대로
+        assert_eq!(display_char('A'), 'A');
+        assert_eq!(display_char('가'), '가');
+    }
     use crate::AlacrittyBackend;
     use crate::backend::TerminalBackend;
     use crate::viewport_snapshot::{CellRange, CursorShape, CursorSnapshot, TerminalCell};

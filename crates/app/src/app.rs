@@ -1912,14 +1912,18 @@ impl App {
 
     /// shim PATH env — hook 토글 ON이고 shim이 설치돼 있으면 셸 PATH 앞에 주입한다.
     fn shim_shell_env(config: &Config) -> Vec<(String, String)> {
+        // .env 라이브 반영(E5 ⑨): zsh ZDOTDIR 훅 — 래퍼는 항상 주입(passthrough,
+        // 기능 OFF면 no-op)하고 활성 조건은 세션 기본 env가 동적으로 나른다.
+        let mut env = crate::env_reload::shell_env();
         if !config.ui.agent_status_hooks {
-            return Vec::new();
+            return env;
         }
         let Some(dir) = crate::agent_shim::shim_dir() else {
-            return Vec::new();
+            return env;
         };
         let path = std::env::var("PATH").unwrap_or_default();
-        vec![("PATH".to_owned(), format!("{}:{path}", dir.display()))]
+        env.push(("PATH".to_owned(), format!("{}:{path}", dir.display())));
+        env
     }
 
     /// 에이전트 상태 hook을 설정 토글에 맞춰 전역 설치/해제한다(옵션2 needsInput).
@@ -2852,11 +2856,23 @@ impl App {
                                 ".env → 환경 profile 동기화"
                             );
                         }
+                        // .env 라이브 반영(E5 ⑨) 활성 조건 — 새 셸의 precmd 훅이 이
+                        // 두 값으로 깨어난다. 토글/경로 변경이 다음 동기화에 반영된다.
+                        let mut env_plain = payload.env_plain;
+                        if self.config.ui.env_live_reload
+                            && let Some(root) = outcome.root.as_deref()
+                        {
+                            env_plain.push(("DEPPY_ENV_LIVE_RELOAD".to_owned(), "1".to_owned()));
+                            env_plain.push((
+                                "DEPPY_PROJECT_ROOT".to_owned(),
+                                root.display().to_string(),
+                            ));
+                        }
                         restore_ready = self
                             .active
                             .runtime
                             .send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
-                                env_plain: payload.env_plain,
+                                env_plain,
                                 env_secrets: payload.env_secrets,
                             })
                             .is_ok();
@@ -4547,6 +4563,8 @@ impl eframe::App for App {
         let mut workspace_rename: Option<String> = None;
         let mut env_action: Option<ui::env_profiles::EnvAction> = None;
         let mut credentials_changed = false;
+        // .env 라이브 반영 토글(E5 ⑨) — 클로저 안에서 편집하고 밖에서 저장/적용.
+        let mut env_live_reload_toggle = self.config.ui.env_live_reload;
         // #3 워크스페이스 이름 편집 캡처 (클로저 밖에서 db/refresh 처리 — self 전체 &mut).
         let out = ui::settings::show(
             ui.ctx(),
@@ -4751,6 +4769,14 @@ impl eframe::App for App {
                                                     credentials_changed = true;
                                                 }
 
+                                                // .env 라이브 반영 토글(E5 ⑨ — 옵트인).
+                                                ui.add_space(14.0);
+                                                ui.checkbox(
+                                                    &mut env_live_reload_toggle,
+                                                    text.t("env.live_reload", &[]),
+                                                )
+                                                .on_hover_text(text.t("env.live_reload_hint", &[]));
+
                                                 if !self.env_secret_pending.is_empty() {
                                                     ui.horizontal(|ui| {
                                                         ui.add(egui::Spinner::new().size(12.0));
@@ -4823,6 +4849,14 @@ impl eframe::App for App {
             },
         );
         // 관리/모니터 액션 처리 (클로저 밖 — self 전체 &mut 필요한 것들)
+        if env_live_reload_toggle != self.config.ui.env_live_reload {
+            self.config.ui.env_live_reload = env_live_reload_toggle;
+            if let Err(e) = self.config.save(&self.config_path) {
+                tracing::warn!("env 라이브 반영 설정 저장 실패: {e:#}");
+            }
+            // 다음 동기화가 세션 기본 env(활성 조건)를 갱신한다 — 새 셸부터 적용.
+            self.sync_dotenv_env();
+        }
         if credentials_changed {
             self.invalidate_env_profile_ui();
             self.invalidate_env_api_projects();

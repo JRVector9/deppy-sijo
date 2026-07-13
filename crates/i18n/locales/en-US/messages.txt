@@ -429,3 +429,5 @@ env.no_project_path_note = Environment variables are stored in the project folde
 env.legacy_pending_note = Variables left in the legacy (DB) store — they are migrated to the .env file once a project folder is set.
 workspace.alias_hint = Set an alias — the display name is always "folder (alias)". Leave empty to show the folder name only.
 workspace.open_environment = Environment & API settings…
+env.live_reload = Live .env reload (experimental)
+env.live_reload_hint = When on, deppy shells (zsh) re-export .env changes at the next prompt, so running shells pick them up too. When off, only new sessions get updated values. Applies to newly opened shells.

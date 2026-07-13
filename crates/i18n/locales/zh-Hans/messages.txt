@@ -429,3 +429,5 @@ env.no_project_path_note = 环境变量保存在项目文件夹的 .env 文件�
 env.legacy_pending_note = 遗留（DB）存储中的变量 — 指定项目文件夹后将自动迁移到 .env 文件。
 workspace.alias_hint = 设置别名 — 显示名称始终为“文件夹名 (别名)”。留空则仅显示文件夹名。
 workspace.open_environment = 环境变量·API 设置…
+env.live_reload = .env 实时生效（实验性）
+env.live_reload_hint = 开启后 deppy 终端（zsh）会在下一个提示符时检测 .env 变更并重新导出，已运行的终端也会生效。关闭则仅新会话生效。对新打开的终端生效。

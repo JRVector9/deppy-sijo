@@ -7,6 +7,7 @@ mod app;
 mod config;
 mod dotenv_sync;
 mod env;
+mod env_reload;
 mod fonts;
 mod mcp_import;
 mod paths;

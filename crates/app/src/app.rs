@@ -1061,6 +1061,9 @@ pub struct App {
     /// 막는다. 무효화: refresh_workspaces / sync_dotenv_env(명시) + 1s TTL(설정 UI 안에서의
     /// env var·credential 직접 편집은 하위 UI 내부 상태라 TTL로 최대 1s 지연 반영).
     env_api_projects_cache: Option<(Vec<ui::env_project_list::EnvProjectRow>, std::time::Instant)>,
+    /// T1: pane 우클릭 → 환경설정 진입 시 감지한 focused 세션 폴더 배너.
+    /// 우클릭 진입 시점에만 계산하고, 버튼 클릭 또는 설정 창 닫힘에 버린다.
+    env_session_banner: Option<EnvSessionCwdBanner>,
     env_project_rows_worker: EnvProjectRowsWorker,
     env_project_rows_generation: u64,
     env_project_rows_pending: bool,
@@ -1302,6 +1305,7 @@ impl App {
             settings_search: String::new(),
             env_api_project_edit: EnvApiProjectEditState::default(),
             env_api_projects_cache: None,
+            env_session_banner: None,
             env_project_rows_worker,
             env_project_rows_generation: 0,
             env_project_rows_pending: false,
@@ -3090,6 +3094,40 @@ impl App {
         }
     }
 
+    /// T1: focused pane 세션의 현재 작업 폴더 — agent_detect 워커(lsof)가 채운
+    /// `session_cwds`를 재사용한다 (새 감지 메커니즘 없음).
+    fn focused_session_cwd(&self) -> Option<String> {
+        self.active
+            .workspace_ui
+            .focused_session()
+            .and_then(|sid| self.session_cwds.get(&sid))
+            .cloned()
+    }
+
+    /// T1: pane 우클릭 → 환경설정 진입 시점에 focused 세션 cwd를 감지해 배너 상태를
+    /// 만든다. cwd가 없거나 폴더가 아니면 None. 비교는 canonicalize 기준
+    /// (macOS `/var`↔`/private/var`, 심링크 등)으로 하되 실패 시 원경로로 폴백.
+    fn detect_session_cwd_banner(&self) -> Option<EnvSessionCwdBanner> {
+        let cwd = std::path::PathBuf::from(self.focused_session_cwd()?);
+        if !cwd.is_dir() {
+            return None;
+        }
+        let cwd_canon = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
+        let roots: Vec<std::path::PathBuf> = self
+            .workspaces
+            .iter()
+            .filter(|ws| !ws.path.trim().is_empty())
+            .map(|ws| {
+                let p = std::path::PathBuf::from(ws.path.trim());
+                std::fs::canonicalize(&p).unwrap_or(p)
+            })
+            .collect();
+        Some(EnvSessionCwdBanner {
+            registered: cwd_belongs_to_any(&cwd_canon, &roots),
+            cwd,
+        })
+    }
+
     /// 워크스페이스 표시 이름 — 포커스 세션의 현재 작업 폴더(git 저장소면 프로젝트명)를
     /// name에 자동 저장하고 그걸 표시한다(2026-07-08). 아직 감지 전이면 path 폴더명,
     /// 그것도 없으면 "~". 자동 추적이라 포커스 이동·재시작에도 마지막 폴더가 유지된다.
@@ -4195,6 +4233,10 @@ impl eframe::App for App {
             self.settings_category = ui::settings::Category::Environment;
             self.settings_open = true;
             self.refresh_workspaces();
+            // T1: 우클릭 진입 시에만 focused 세션 cwd를 감지 — env 페이지 상단에
+            // "새 프로젝트로 등록"/"이 폴더를 프로젝트 폴더로 지정" 배너를 띄운다.
+            // refresh_workspaces 이후에 감지해 최신 workspace path 목록과 비교한다.
+            self.env_session_banner = self.detect_session_cwd_banner();
         }
 
         // 알림 센터 렌더 (생성은 logic()에서 끝났다). 활성 workspace의 사라진 세션의
@@ -4614,6 +4656,56 @@ impl eframe::App for App {
                         // 상세 surface=#242424, 프로젝트 rail은 renderer가 #1e1e1e로 덮는다.
                         ui.painter()
                             .rect_filled(ui.clip_rect(), 0.0, ui.visuals().panel_fill);
+                        // T1: 우클릭 진입 시 감지한 세션 폴더 배너 — cwd가 어떤 워크스페이스에도
+                        // 속하지 않으면 새 프로젝트 등록, 활성 워크스페이스가 경로 미설정이면
+                        // 이 폴더 지정 CTA. 클릭 시 기존 ws_create/SetProjectPath 흐름 재사용.
+                        let mut banner_used = false;
+                        if let Some(banner) = &self.env_session_banner {
+                            let show_register = !banner.registered;
+                            let show_set_path = env_project_root.is_none();
+                            if show_register || show_set_path {
+                                egui::Frame::NONE
+                                    .inner_margin(egui::Margin::symmetric(14, 8))
+                                    .show(ui, |ui| {
+                                        ui.horizontal_wrapped(|ui| {
+                                            let display =
+                                                ui::env_project_list::display_project_path(
+                                                    &banner.cwd.to_string_lossy(),
+                                                );
+                                            ui.label(text.t(
+                                                "env.session_cwd.detected",
+                                                &[("path", &display)],
+                                            ));
+                                            if show_register
+                                                && ui
+                                                    .button(text.t("env.session_cwd.register", &[]))
+                                                    .clicked()
+                                            {
+                                                ws_create = Some(banner.cwd.clone());
+                                                banner_used = true;
+                                            }
+                                            if show_set_path
+                                                && ui
+                                                    .button(
+                                                        text.t("env.session_cwd.set_project", &[]),
+                                                    )
+                                                    .clicked()
+                                            {
+                                                env_action = Some(
+                                                    ui::env_profiles::EnvAction::SetProjectPath(
+                                                        banner.cwd.clone(),
+                                                    ),
+                                                );
+                                                banner_used = true;
+                                            }
+                                        });
+                                    });
+                                ui.separator();
+                            }
+                        }
+                        if banner_used {
+                            self.env_session_banner = None;
+                        }
                         // 전체 가용 높이를 **먼저** 캡처해 좌측 리스트/우측 스크롤에 강제한다
                         // — horizontal 안에서 available_height가 줄어 리스트가 수십 px로
                         // 잘리던 회귀 방지(2026-07-09 스크린샷).
@@ -4848,6 +4940,10 @@ impl eframe::App for App {
                 }
             },
         );
+        // T1: 설정 창이 닫히면 세션 폴더 배너를 버린다 — 다음 우클릭 진입에서 재감지.
+        if !self.settings_open {
+            self.env_session_banner = None;
+        }
         // 관리/모니터 액션 처리 (클로저 밖 — self 전체 &mut 필요한 것들)
         if env_live_reload_toggle != self.config.ui.env_live_reload {
             self.config.ui.env_live_reload = env_live_reload_toggle;
@@ -5328,6 +5424,21 @@ fn coalesce_mux_updated(events: &mut Vec<runtime::RuntimeEvent>) {
     }
 }
 
+/// T1: pane 우클릭 → 환경설정 진입 시 감지한 focused 세션 폴더 배너 상태.
+struct EnvSessionCwdBanner {
+    /// focused 세션의 현재 작업 폴더 (agent_detect 워커 lsof 소스 재사용).
+    cwd: std::path::PathBuf,
+    /// cwd가 기존 워크스페이스 path와 일치하거나 그 하위 폴더인가.
+    registered: bool,
+}
+
+/// T1: cwd가 워크스페이스 path 중 하나와 일치하거나 그 하위 폴더인지 판정
+/// (순수 — 테스트 대상). `Path::starts_with`는 컴포넌트 단위라 `/a/bc`가
+/// `/a/b`에 속하는 것으로 오판하지 않는다.
+fn cwd_belongs_to_any(cwd: &std::path::Path, roots: &[std::path::PathBuf]) -> bool {
+    roots.iter().any(|root| cwd.starts_with(root))
+}
+
 /// 영속 pane snapshot에서 이 제목의 세션 cwd를 찾는다 (순수 — 테스트 대상).
 ///
 /// **키는 DB에 저장된 raw 제목**("workspace.spawn.shell 3")이다. 호출측이 i18n 렌더된
@@ -5461,6 +5572,34 @@ mod tests {
         // 빈 cwd는 없는 것으로 취급
         let empty = vec![(raw.to_owned(), String::new())];
         assert_eq!(pane_cwd(&empty, raw), None);
+    }
+
+    /// T1: 세션 cwd가 기존 워크스페이스 경로(또는 하위)에 속하는지 판정 — 등록 배너 조건.
+    #[test]
+    fn 세션_cwd_워크스페이스_소속_판정() {
+        let roots = vec![
+            PathBuf::from("/Users/jr/Desktop/Projects/deppy-sijo"),
+            PathBuf::from("/Users/jr/work"),
+        ];
+        // 정확히 일치 → 소속
+        assert!(cwd_belongs_to_any(Path::new("/Users/jr/work"), &roots));
+        // 하위 폴더 → 소속
+        assert!(cwd_belongs_to_any(
+            Path::new("/Users/jr/Desktop/Projects/deppy-sijo/crates/app"),
+            &roots
+        ));
+        // 무관한 새 폴더 → 미소속 (배너 표시 대상)
+        assert!(!cwd_belongs_to_any(
+            Path::new("/Users/jr/Desktop/Projects/Crawler"),
+            &roots
+        ));
+        // 접두 문자열만 같은 형제 폴더는 오판하지 않는다 (/a/bc vs /a/b)
+        assert!(!cwd_belongs_to_any(
+            Path::new("/Users/jr/workbench"),
+            &roots
+        ));
+        // 루트 목록이 비면 항상 미소속
+        assert!(!cwd_belongs_to_any(Path::new("/tmp"), &[]));
     }
 
     /// 활동 패널(warm/유휴)의 pane 이름: 기본 제목은 프로젝트명으로, rename은 그대로.

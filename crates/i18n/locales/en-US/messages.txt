@@ -127,6 +127,8 @@ settings.locale.zh_hant = Chinese Traditional
 settings.locale.ko_kr = Korean
 settings.terminal = Terminal
 settings.font_size = Font size
+settings.line_height = Line height
+settings.line_height.hint = Row height as a multiple of the font's own metrics. 1.0 = default, 1.2 = 20% roomier. Changing it resizes the grid.
 settings.mono_weight = Terminal font weight
 settings.mono_weight.hint = Weight of the bundled JetBrains Mono terminal font (Korean uses the CJK fallback).
 settings.scrollback_lines = Scrollback lines

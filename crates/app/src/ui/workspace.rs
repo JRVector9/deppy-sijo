@@ -1224,10 +1224,13 @@ impl WorkspaceUi {
         // 터미널 폰트는 UI 배율(zoom_factor)로 같이 커지므로 font_size를 배율로 역보정해
         // 물리 크기를 유지한다(UI만 스케일, 터미널 독립 — 2026-07-13). cell_size·draw가
         // 같은 값을 써야 격자/선택이 일치한다.
-        let term_font = config.font_size / self.ui_scale;
+        let metrics = renderer_egui::CellMetrics {
+            font_size: config.font_size / self.ui_scale,
+            line_height: config.line_height,
+        };
         // pane 크기 → cols/rows. visible pane 전부 대상 — split 직후 기존 pane의
         // PTY 크기가 틀어지는 문제 방지 (runtime도 visible 세션을 모두 push한다)
-        let cell = renderer_egui::cell_size(ui.ctx(), term_font);
+        let cell = renderer_egui::cell_size(ui.ctx(), metrics);
         let avail = ui.available_size();
         let cols =
             ((renderer_egui::grid_width_for_available(avail.x) / cell.x) as u16).clamp(10, 500);
@@ -1271,7 +1274,7 @@ impl WorkspaceUi {
             renderer_egui::draw(
                 ui,
                 &snapshot,
-                term_font,
+                metrics,
                 &mut view.render_cache,
                 preedit,
                 selection_range,

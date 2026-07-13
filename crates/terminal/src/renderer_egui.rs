@@ -192,17 +192,34 @@ fn dim_color(color: egui::Color32) -> egui::Color32 {
     egui::Color32::from_rgb(f(color.r()), f(color.g()), f(color.b()))
 }
 
-/// 주어진 폰트 크기의 셀 크기 (모노스페이스 'M' 폭 × 행 높이).
-pub fn cell_size(ctx: &egui::Context, font_size: f32) -> egui::Vec2 {
-    let font_id = egui::FontId::monospace(font_size);
-    ctx.fonts_mut(|fonts| egui::vec2(fonts.glyph_width(&font_id, 'M'), fonts.row_height(&font_id)))
+/// 셀 격자의 기하를 정하는 두 값 — 항상 함께 다닌다(설정에서 온 값을 그대로 싣는다).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct CellMetrics {
+    /// 모노스페이스 폰트 크기 (UI 배율로 역보정된 값)
+    pub font_size: f32,
+    /// 행 높이 배수 — 폰트가 내장한 행 높이(ascent+descent+line_gap)에 곱한다.
+    /// 1.0이면 폰트 메트릭 그대로. config에서 0.8~2.0으로 clamp된다.
+    pub line_height: f32,
+}
+
+/// 셀 하나의 화면 크기 (모노스페이스 'M' 폭 × 행 높이 × 행 높이 배수).
+///
+/// 셀이 커지면 cols/rows 계산(workspace.rs)이 자동으로 따라가 PTY resize까지 이어진다.
+pub fn cell_size(ctx: &egui::Context, metrics: CellMetrics) -> egui::Vec2 {
+    let font_id = egui::FontId::monospace(metrics.font_size);
+    ctx.fonts_mut(|fonts| {
+        egui::vec2(
+            fonts.glyph_width(&font_id, 'M'),
+            fonts.row_height(&font_id) * metrics.line_height,
+        )
+    })
 }
 
 /// snapshot을 그린다. preedit은 IME 조합 중 텍스트 — 커서 위치에 표시한다.
 pub fn draw(
     ui: &mut egui::Ui,
     snapshot: &TerminalViewportSnapshot,
-    font_size: f32,
+    metrics: CellMetrics,
     cache: &mut TerminalRenderCache,
     preedit: Option<&str>,
     // 선택 영역 (정규화된 선형 셀 인덱스, inclusive) — 셀 배경을 선택색으로 그린다
@@ -211,8 +228,12 @@ pub fn draw(
     // dirty_ranges는 이미 소비된 것이라 재-shaping하지 않는다 (2026-07-14 idle 낭비 수정).
     snapshot_gen: u64,
 ) -> RenderOutput {
-    let font_id = egui::FontId::monospace(font_size);
-    let cell = cell_size(ui.ctx(), font_size);
+    let font_id = egui::FontId::monospace(metrics.font_size);
+    let cell = cell_size(ui.ctx(), metrics);
+    // 셀 안에서 글자를 세로 중앙에 둔다 — 안 그러면 넓힌 행간이 전부 글자 아래로만 몰린다.
+    // cell.y는 글자 높이 × line_height라 나누면 원래 글자 높이가 되고(config에서 0.8 하한으로
+    // clamp되어 0으로 나눌 일이 없다), 그 차이의 절반이 위쪽 여백이다.
+    let text_dy = (cell.y - cell.y / metrics.line_height) * 0.5;
     // hit-test/응답 rect는 pane 영역을 넘지 않게 clamp한다 — split/resize 직후
     // stale(더 큰) snapshot이 이웃 pane의 클릭/스크롤을 가로채는 것 방지 (codex 리뷰).
     // 넘치는 셀은 아래 content_rect로 잘리며 좌우 여백을 침범하지 않는다.
@@ -244,7 +265,9 @@ pub fn draw(
     background_painter.rect_filled(rect, 0.0, default_bg);
 
     let dirty_fresh = cache.dirty_is_fresh(snapshot_gen);
-    cache.prepare(snapshot, font_size, snapshot_gen);
+    // line_height는 갤리 shaping에 영향을 주지 않는다(글자를 그리는 y 위치만 바뀐다) —
+    // 캐시 무효화 기준은 font_size 그대로다.
+    cache.prepare(snapshot, metrics.font_size, snapshot_gen);
     cache.counters.shapes += 1; // 위 배경 rect_filled
     for row in 0..snapshot.rows as usize {
         let dirty = dirty_fresh && row_is_dirty(snapshot, row);
@@ -279,7 +302,7 @@ pub fn draw(
             let selection_shapes =
                 paint_selection_row(&painter, snapshot, row, origin, cell, selection);
             for run in &row_cache.text_runs {
-                let pos = origin + egui::vec2(run.col as f32 * cell.x, row_y);
+                let pos = origin + egui::vec2(run.col as f32 * cell.x, row_y + text_dy);
                 painter.galley(pos, Arc::clone(&run.galley), run.color);
             }
             cache.counters.rows_painted += 1;
@@ -290,6 +313,7 @@ pub fn draw(
 
     // 커서 (스크롤 중이거나 hidden이면 snapshot.visible이 false)
     if snapshot.cursor.visible {
+        // 커서 rect는 셀 전체를 채운다(배경과 동일) — text_dy는 글자에만 적용한다.
         let pos = origin
             + egui::vec2(
                 snapshot.cursor.col as f32 * cell.x,
@@ -311,8 +335,10 @@ pub fn draw(
         if response.has_focus() {
             // 조합 중 텍스트를 커서 위치에 표시
             if let Some(preedit) = preedit.filter(|p| !p.is_empty()) {
+                // 조합 텍스트도 글자이므로 셀 안 세로 중앙 정렬을 따른다.
+                let text_pos = pos + egui::vec2(0.0, text_dy);
                 let galley_rect = painter.text(
-                    pos,
+                    text_pos,
                     egui::Align2::LEFT_TOP,
                     preedit,
                     font_id.clone(),
@@ -320,7 +346,7 @@ pub fn draw(
                 );
                 painter.rect_filled(galley_rect, 0.0, egui::Color32::from_rgb(0xd8, 0xd8, 0xd8));
                 painter.text(
-                    pos,
+                    text_pos,
                     egui::Align2::LEFT_TOP,
                     preedit,
                     font_id,
@@ -744,9 +770,17 @@ mod tests {
         let ctx = egui::Context::default();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.set_min_size(egui::vec2(500.0, 200.0));
-            draw(ui, snapshot, 13.0, cache, None, None, generation);
+            draw(ui, snapshot, m(13.0, 1.0), cache, None, None, generation);
         });
         cache.rebuilt_rows_last_frame()
+    }
+
+    /// 테스트용 CellMetrics — 폰트 크기 + 행 높이 배수.
+    fn m(font_size: f32, line_height: f32) -> CellMetrics {
+        CellMetrics {
+            font_size,
+            line_height,
+        }
     }
 
     /// 테스트용 단조 증가 세대 — 매 호출이 "새 스냅샷"을 뜻한다.
@@ -767,7 +801,7 @@ mod tests {
         let mut measured = None;
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.set_min_size(egui::vec2(500.0, 200.0));
-            let output = draw(ui, &snapshot, 13.0, &mut cache, None, None, next_gen());
+            let output = draw(ui, &snapshot, m(13.0, 1.0), &mut cache, None, None, next_gen());
             measured = Some((output.response.rect, output.origin, output.cell_size));
         });
 
@@ -777,6 +811,36 @@ mod tests {
         assert!(
             (rect.right() - grid_right - 3.0).abs() < 0.01,
             "rect={rect:?}, origin={origin:?}, cell={cell:?}, grid_right={grid_right}"
+        );
+    }
+
+    #[test]
+    fn 행높이_배수는_셀_높이만_키우고_폭은_그대로다() {
+        let ctx = egui::Context::default();
+        // fonts는 첫 프레임에 초기화된다 — run_ui 안에서 재야 한다.
+        let mut measured = None;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            measured = Some((
+                cell_size(ui.ctx(), m(13.0, 1.0)),
+                cell_size(ui.ctx(), m(13.0, 1.5)),
+                cell_size(ui.ctx(), m(13.0, 0.8)),
+            ));
+        });
+        let (base, tall, tight) = measured.expect("cell size measured");
+
+        // 폭은 배수와 무관 — 열 정렬이 깨지면 안 된다.
+        assert_eq!(base.x, tall.x);
+        assert_eq!(base.x, tight.x);
+        // 높이는 정확히 배수만큼.
+        assert!((tall.y - base.y * 1.5).abs() < 0.01, "tall={tall:?}");
+        assert!((tight.y - base.y * 0.8).abs() < 0.01, "tight={tight:?}");
+
+        // 셀이 높아지면 같은 pane 높이에 들어가는 행 수가 줄어든다 (PTY resize로 이어짐).
+        let rows_base = grid_rows_for_available(400.0, base.y);
+        let rows_tall = grid_rows_for_available(400.0, tall.y);
+        assert!(
+            rows_tall < rows_base,
+            "rows_base={rows_base}, rows_tall={rows_tall}"
         );
     }
 
@@ -820,7 +884,7 @@ mod tests {
             let mut out = RenderCounters::default();
             let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
                 ui.set_min_size(egui::vec2(500.0, 200.0));
-                out = draw(ui, snapshot, 13.0, cache, None, None, next_gen()).counters;
+                out = draw(ui, snapshot, m(13.0, 1.0), cache, None, None, next_gen()).counters;
             });
             out
         }

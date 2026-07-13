@@ -127,6 +127,8 @@ settings.locale.zh_hant = 繁体字中国語
 settings.locale.ko_kr = 韓国語
 settings.terminal = ターミナル
 settings.font_size = フォントサイズ
+settings.line_height = 行の高さ
+settings.line_height.hint = フォント本来のメトリクスに対する行の高さの倍率です。1.0 = 既定、1.2 = 20% 広い行間。変更すると grid が再計算されます。
 settings.mono_weight = ターミナルフォントの太さ
 settings.mono_weight.hint = 同梱 JetBrains Mono ターミナルフォントの太さ（日本語・韓国語はCJKフォールバック）。
 settings.scrollback_lines = スクロールバック行数

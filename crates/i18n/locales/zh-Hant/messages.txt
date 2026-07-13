@@ -127,6 +127,8 @@ settings.locale.zh_hant = 繁體中文
 settings.locale.ko_kr = 韓文
 settings.terminal = 終端機
 settings.font_size = 字型大小
+settings.line_height = 行高
+settings.line_height.hint = 相對於字型本身度量的行高倍數。1.0 = 預設，1.2 = 行距增加 20%。修改後會重新計算格線。
 settings.mono_weight = 終端機字型粗細
 settings.mono_weight.hint = 內建 JetBrains Mono 終端機字型的粗細（中日韓字元使用 CJK 回退）。
 settings.scrollback_lines = 回捲行數

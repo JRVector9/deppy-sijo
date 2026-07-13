@@ -127,6 +127,8 @@ settings.locale.zh_hant = 중국어 번체
 settings.locale.ko_kr = 한국어
 settings.terminal = 터미널
 settings.font_size = 폰트 크기
+settings.line_height = 행 높이
+settings.line_height.hint = 폰트 자체 메트릭에 대한 행 높이 배수입니다. 1.0 = 기본, 1.2 = 20% 넓은 행간. 바꾸면 격자 크기가 다시 계산됩니다.
 settings.mono_weight = 터미널 폰트 굵기
 settings.mono_weight.hint = 번들 JetBrains Mono 터미널 폰트의 굵기 (한글은 CJK 폴백 사용).
 settings.scrollback_lines = 스크롤백 줄 수

@@ -1638,6 +1638,19 @@ fn terminal_page(
     });
     row(
         ui,
+        &catalog.t("settings.line_height", &[]),
+        Some(&catalog.t("settings.line_height.hint", &[])),
+        |ui| {
+            let mut v = config.terminal.line_height;
+            // ui_scale과 동일 — 스텝 0.1(10%) + 0.1 격자 스냅으로 부동소수 드리프트 방지.
+            if stepper_f32(ui, &mut v, 0.1, 0.8, 2.0) {
+                config.terminal.line_height = (v * 10.0).round() / 10.0;
+                *changed = true;
+            }
+        },
+    );
+    row(
+        ui,
         &catalog.t("settings.mono_font", &[]),
         Some(&catalog.t("settings.mono_font.hint", &[])),
         |ui| {

@@ -179,6 +179,10 @@ impl Theme {
 pub struct TerminalConfig {
     /// PR-05 terminal renderer에서 소비
     pub font_size: f32,
+    /// 행 높이 배수 (2026-07-14). 1.0 = 폰트가 내장한 메트릭(ascent+descent+line_gap)
+    /// 그대로, 1.2 = 20% 넓은 행간. 폰트 크기와 독립이라 크기를 바꿔도 비율이 유지된다.
+    /// 늘어난 여백은 글자 위/아래로 반씩 나눈다(renderer_egui::draw).
+    pub line_height: f32,
     /// visible session scrollback 상한 (설계문서 14.3)
     pub scrollback_lines: u32,
     /// 종료 세션 백엔드 LRU 상한 — 초과분은 압축 아카이브 (§14.3 확장, 2026-07-11)
@@ -202,6 +206,7 @@ impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
             font_size: 11.0,
+            line_height: 1.0,
             scrollback_lines: 10_000,
             exited_backend_cap: 64,
             cache_budget_mb: 128,
@@ -313,6 +318,13 @@ impl Config {
         } else {
             TerminalConfig::default().font_size
         };
+        // 0.8 미만은 글자가 서로 겹치고, cell.y / line_height 로 원래 글자 높이를 되짚는
+        // draw() 계산이 0에서 나눠지지 않도록 하한을 둔다.
+        t.line_height = if t.line_height.is_finite() {
+            t.line_height.clamp(0.8, 2.0)
+        } else {
+            TerminalConfig::default().line_height
+        };
         t.scrollback_lines = t.scrollback_lines.clamp(100, 100_000);
         t.exited_backend_cap = t.exited_backend_cap.clamp(4, 512);
         t.cache_budget_mb = t.cache_budget_mb.clamp(32, 2048);
@@ -367,6 +379,31 @@ mod tests {
         assert_eq!(config.terminal.scrollback_lines, 100);
         assert_eq!(config.performance.output_batch_ms, MIN_OUTPUT_BATCH_MS);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn 행높이_배수는_범위밖이면_클램프되고_없으면_1_0이다() {
+        // 기존 config.toml에는 line_height 키가 없다 — serde(default)로 1.0이어야 한다.
+        let dir = std::env::temp_dir().join(format!("deppy-cfg-lh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(config_path(&dir), "[terminal]\nfont_size = 12.0\n").unwrap();
+        let config = Config::load_or_create(&dir).unwrap();
+        assert_eq!(config.terminal.line_height, 1.0);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // 위젯 범위(0.8~2.0) 밖은 클램프 — 0에 가까운 값으로 draw가 0으로 나누지 않게.
+        let mut config = Config::default();
+        config.terminal.line_height = 0.0;
+        config.normalize();
+        assert_eq!(config.terminal.line_height, 0.8);
+
+        config.terminal.line_height = 99.0;
+        config.normalize();
+        assert_eq!(config.terminal.line_height, 2.0);
+
+        config.terminal.line_height = f32::NAN;
+        config.normalize();
+        assert_eq!(config.terminal.line_height, 1.0);
     }
 
     #[test]

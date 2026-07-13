@@ -90,6 +90,15 @@ pub struct UiConfig {
     /// 설정 화면의 목록은 시스템에 설치된 한글 지원 폰트에서 고른다(2026-07-07).
     #[serde(default)]
     pub ui_font: Option<String>,
+    /// UI 텍스트 배율 — egui zoom_factor로 UI 전체를 확대/축소한다(사이드바·헤더·설정 등
+    /// 하드코딩 FontId까지 포함). 터미널은 font_size를 이 값으로 역보정해 크기가 유지된다
+    /// (2026-07-13, 터미널과 독립). 1.0 = 기본.
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32,
+}
+
+fn default_ui_scale() -> f32 {
+    1.0
 }
 
 fn default_true() -> bool {
@@ -105,6 +114,7 @@ impl Default for UiConfig {
             agent_status_hooks: true,
             last_workspace_id: None,
             ui_font: None,
+            ui_scale: 1.0,
         }
     }
 }
@@ -279,6 +289,11 @@ impl Config {
         if !crate::fonts::MONO_WEIGHTS.contains(&t.mono_weight.as_str()) {
             t.mono_weight = crate::fonts::DEFAULT_MONO_WEIGHT.to_owned();
         }
+        self.ui.ui_scale = if self.ui.ui_scale.is_finite() {
+            self.ui.ui_scale.clamp(0.7, 1.5)
+        } else {
+            1.0
+        };
         self.performance.output_batch_ms = self
             .performance
             .output_batch_ms

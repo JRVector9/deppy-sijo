@@ -43,6 +43,8 @@ settings.appearance = 外观
 settings.theme.hint = 仅切换外壳 — 终端窗格始终为深色
 settings.ui_font = 界面字体
 settings.ui_font.hint = 界面文本字体（支持韩文的系统字体）
+settings.ui_scale = 界面文字缩放
+settings.ui_scale.hint = 缩放侧边栏、标题、设置等界面文字。1.0 = 默认。终端保持自身大小。
 settings.ui_font.auto = 默认（自动）
 settings.file_tree.hint = 关闭则不创建面板 — 零资源
 settings.auto_resume = 自动恢复会话

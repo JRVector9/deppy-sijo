@@ -43,6 +43,8 @@ settings.appearance = Appearance
 settings.theme.hint = Chrome only — terminal panes stay dark
 settings.ui_font = UI font
 settings.ui_font.hint = Font for UI text (Korean-capable system fonts)
+settings.ui_scale = UI text scale
+settings.ui_scale.hint = Scales all UI text (sidebar, headers, settings). 1.0 = default. The terminal keeps its own size.
 settings.ui_font.auto = Default (auto)
 settings.file_tree.hint = OFF creates no panel — zero resource
 settings.auto_resume = Auto-resume agent sessions

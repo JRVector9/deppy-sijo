@@ -51,6 +51,9 @@ pub struct WorkspaceUi {
     /// 활성 workspace의 프로젝트명(폴더명 ≈ 깃 레포명, 없으면 "~"). 세션 기본 제목이
     /// "셀 134" 대신 이걸로 표시된다. rename한 세션은 그대로 둔다. App이 매 프레임 세팅.
     project_name: Option<String>,
+    /// UI 텍스트 배율(App이 매 프레임 set). 터미널은 zoom_factor로 같이 커지므로 font_size를
+    /// 이 값으로 역보정해 물리 크기를 유지한다(UI만 스케일, 터미널 독립 — 2026-07-13).
+    ui_scale: f32,
     /// 세션별 현재 작업 폴더(App이 매 프레임 set) — 1행 제목 폴더명/프로젝트명 원천.
     session_cwds: std::collections::HashMap<SessionId, String>,
     /// 세션별 에이전트 표시정보(model/effort/context — App이 병합해 set) — 3줄 행 2/3행.
@@ -116,6 +119,7 @@ impl WorkspaceUi {
             confirm_close: None,
             selection: None,
             project_name: None,
+            ui_scale: 1.0,
             session_cwds: std::collections::HashMap::new(),
             agent_info: std::collections::HashMap::new(),
             paste_task: None,
@@ -128,6 +132,15 @@ impl WorkspaceUi {
     /// 이 이름으로 표시한다.
     pub fn set_project_name(&mut self, name: Option<String>) {
         self.project_name = name;
+    }
+
+    /// UI 텍스트 배율을 세팅한다(App이 매 프레임). 터미널 font_size 역보정에 쓴다.
+    pub fn set_ui_scale(&mut self, scale: f32) {
+        self.ui_scale = if scale.is_finite() && scale > 0.1 {
+            scale
+        } else {
+            1.0
+        };
     }
 
     /// 세션별 현재 작업 폴더를 세팅한다(App이 매 프레임, 감지 워커 lsof 결과).
@@ -868,9 +881,13 @@ impl WorkspaceUi {
             return;
         };
 
+        // 터미널 폰트는 UI 배율(zoom_factor)로 같이 커지므로 font_size를 배율로 역보정해
+        // 물리 크기를 유지한다(UI만 스케일, 터미널 독립 — 2026-07-13). cell_size·draw가
+        // 같은 값을 써야 격자/선택이 일치한다.
+        let term_font = config.font_size / self.ui_scale;
         // pane 크기 → cols/rows. visible pane 전부 대상 — split 직후 기존 pane의
         // PTY 크기가 틀어지는 문제 방지 (runtime도 visible 세션을 모두 push한다)
-        let cell = renderer_egui::cell_size(ui.ctx(), config.font_size);
+        let cell = renderer_egui::cell_size(ui.ctx(), term_font);
         let avail = ui.available_size();
         let cols =
             ((renderer_egui::grid_width_for_available(avail.x) / cell.x) as u16).clamp(10, 500);
@@ -913,7 +930,7 @@ impl WorkspaceUi {
             renderer_egui::draw(
                 ui,
                 &snapshot,
-                config.font_size,
+                term_font,
                 &mut view.render_cache,
                 preedit,
                 selection_range,

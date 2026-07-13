@@ -5,6 +5,7 @@
 /// - **D2Coding**(기본, 2026-07-13): 네이버 한글 코딩 폰트 — 한글·영문이 한 폰트에서
 ///   2:1 폭 정합이라 한글 섞인 출력의 정렬이 정확하다. 굵기는 Regular/Bold 2단.
 /// - **JetBrains Mono**: Latin 전용(한글은 CJK 폴백) — 굵기 5단.
+///
 /// egui는 리가처·가변폰트를 셰이핑/해석하지 않으므로 정적 weight 파일을 번들한다.
 const JB_LIGHT: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Light.ttf");
 const JB_REGULAR: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");

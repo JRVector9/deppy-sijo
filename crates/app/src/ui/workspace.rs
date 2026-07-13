@@ -1342,7 +1342,9 @@ impl WorkspaceUi {
                     let step = self.drag_autoscroll_residual.trunc() as i32;
                     if step != 0 {
                         self.drag_autoscroll_residual -= step as f32;
-                        self.send(
+                        // send()가 아니라 선택 보존 경로 — send의 Scroll 선택 해제(휠 UX)와
+                        // 충돌하면 첫 스크롤 직후 선택·오토스크롤이 함께 죽는다(A3 버그 #1).
+                        self.send_keep_selection(
                             client,
                             RuntimeCommand::Scroll {
                                 session,
@@ -2086,6 +2088,8 @@ impl WorkspaceUi {
         // 터미널에 입력/스크롤을 보내면 그 세션 선택을 해제한다 — 선택 중엔 화면이 freeze돼
         // (선택 정확성) 있어, 안 지우면 타이핑·스크롤해도 화면이 멈춘 듯 보인다(사용자:
         // 드래그 선택 후 스크롤이 안 내려감). 공통 지점이라 여기서 한 번에 처리한다.
+        // 예외: 드래그 오토스크롤의 Scroll은 send_keep_selection으로 보낸다 — 이 해제와
+        // 정면 충돌해 첫 스크롤 직후 선택·오토스크롤이 함께 죽었다(감사 A3 버그 #1).
         let touched = match &command {
             RuntimeCommand::WriteInput { session, .. } => Some(*session),
             RuntimeCommand::Scroll { session, .. } => Some(*session),
@@ -2096,6 +2100,12 @@ impl WorkspaceUi {
         {
             self.selection = None;
         }
+        self.send_keep_selection(client, command);
+    }
+
+    /// 선택을 해제하지 않는 send — 드래그 오토스크롤 전용(선택을 유지·확장하며
+    /// 스크롤해야 한다). 휠/타이핑은 반드시 [`Self::send`]를 쓴다.
+    fn send_keep_selection(&mut self, client: &dyn RuntimeClient, command: RuntimeCommand) {
         let is_spawn = matches!(
             command,
             RuntimeCommand::SpawnShell { .. } | RuntimeCommand::SplitPane { .. }

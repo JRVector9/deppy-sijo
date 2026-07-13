@@ -4602,6 +4602,9 @@ impl eframe::App for App {
         let mut ws_switch: Option<String> = None;
         let mut ws_create: Option<std::path::PathBuf> = None;
         let mut ws_delete: Option<String> = None;
+        // 프로젝트 삭제 확인 결정 — 모달은 설정 뷰포트 안에서 렌더하고(T2) 결정만 캡처,
+        // 실제 삭제/전환은 self 전체 &mut가 필요하므로 클로저 밖에서 처리한다.
+        let mut ws_delete_decision: Option<bool> = None;
         let mut workspace_rename: Option<String> = None;
         let mut env_action: Option<ui::env_profiles::EnvAction> = None;
         let mut credentials_changed = false;
@@ -4885,6 +4888,34 @@ impl eframe::App for App {
                                     });
                             });
                         });
+                        // 프로젝트 삭제 확인 모달(5번, 2026-07-10) — 설정 뷰포트 안에서
+                        // 렌더해 설정 창 위 중앙에 뜨게 한다(T2). ui.ctx()는 현재
+                        // immediate 뷰포트(설정 창)라 Window가 그 위에 붙는다. 결정만
+                        // 캡처하고 실제 삭제/전환은 클로저 밖에서 처리(self 전체 &mut).
+                        if let Some((_, del_name)) = self.ws_delete_confirm.clone() {
+                            egui::Window::new(text.t("workspace.delete_confirm.title", &[]))
+                                .collapsible(false)
+                                .resizable(false)
+                                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                                .show(ui.ctx(), |ui| {
+                                    ui.label(text.t(
+                                        "workspace.delete_confirm.body",
+                                        &[("name", &del_name)],
+                                    ));
+                                    ui.add_space(8.0);
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .button(text.t("workspace.delete_confirm.go", &[]))
+                                            .clicked()
+                                        {
+                                            ws_delete_decision = Some(true);
+                                        }
+                                        if ui.button(text.t("action.cancel", &[])).clicked() {
+                                            ws_delete_decision = Some(false);
+                                        }
+                                    });
+                                });
+                        }
                     }
                     C::Agents => {
                         self.agents_ui.contents(
@@ -5020,29 +5051,10 @@ impl eframe::App for App {
                 self.refresh_workspaces();
             }
         }
-        // 프로젝트 삭제 확인 모달(5번, 2026-07-10) — 목록/DB에서만 제거, 폴더·.env는 보존.
-        if let Some((del_id, del_name)) = self.ws_delete_confirm.clone() {
-            let mut decision: Option<bool> = None;
-            egui::Window::new(text.t("workspace.delete_confirm.title", &[]))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ui.ctx(), |ui| {
-                    ui.label(text.t("workspace.delete_confirm.body", &[("name", &del_name)]));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .button(text.t("workspace.delete_confirm.go", &[]))
-                            .clicked()
-                        {
-                            decision = Some(true);
-                        }
-                        if ui.button(text.t("action.cancel", &[])).clicked() {
-                            decision = Some(false);
-                        }
-                    });
-                });
-            match decision {
+        // 프로젝트 삭제 확인 결정 처리(5번, 2026-07-10) — 목록/DB에서만 제거, 폴더·.env는
+        // 보존. 모달 자체는 설정 뷰포트 안에서 렌더하고(T2) 여기서는 캡처한 결정만 처리한다.
+        if let Some((del_id, _del_name)) = self.ws_delete_confirm.clone() {
+            match ws_delete_decision {
                 Some(true) => {
                     // 활성 프로젝트면 다른 프로젝트로 먼저 전환(삭제 가드가 active를 거부).
                     if del_id == self.active.id

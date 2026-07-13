@@ -4,3 +4,8 @@ sijo_font.png
 
 # 디자인 목업(Figma)의 의존성 — 잠금 파일(pnpm-lock)로 재현되므로 추적하지 않는다
 node_modules/
+
+# 벤치·롤백 아티팩트 — 대용량(앱 번들 스냅샷 등)은 추적하지 않는다.
+# 예외: artifacts/render-bench/ 는 하위 .gitignore가 집계본(summary.md/csv)만 추적하게 한다.
+/artifacts/*
+!/artifacts/render-bench/

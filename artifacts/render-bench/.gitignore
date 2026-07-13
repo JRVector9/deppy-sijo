@@ -1,0 +1,16 @@
+# 렌더러 A/B 벤치 산출물의 git 정책 (scripts/render-bench.sh).
+#
+# 원시 데이터(JSONL/CSV/stderr/meta)는 실행 1회에 수 MB~수백 MB까지 커진다
+# (frame 이벤트가 초당 수십~수백 줄). 저장소 용량 폭증을 막기 위해 **커밋하지 않는다**.
+# 커밋 대상은 집계본(summary.md/summary.csv)과 B3의 시각 비교 스크린샷뿐이다.
+# 원시 데이터가 필요하면 각자 `scripts/render-bench.sh matrix`로 재생성한다.
+#
+# Instruments 트레이스(instruments/*.trace)는 수백 MB 번들이라 로컬 보관만 한다.
+*
+!.gitignore
+!summary.md
+!summary.csv
+!screenshots/
+!screenshots/**
+!instruments/
+!instruments/.gitkeep

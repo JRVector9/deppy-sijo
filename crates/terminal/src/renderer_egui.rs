@@ -70,6 +70,11 @@ pub struct TerminalRenderCache {
     font_size_bits: u32,
     rows_cache: Vec<Option<RowRenderCache>>,
     counters: RenderCounters,
+    /// 마지막으로 dirty를 소비한 스냅샷 세대. `snapshot.dirty_ranges`는 "그 스냅샷이
+    /// 만들어질 때 바뀐 행"이라 **같은 스냅샷을 다시 그리면 같은 행이 계속 dirty로 보인다**
+    /// — 새 출력이 없는 repaint(리소스 표시 갱신·애니메이션)마다 전 행을 재-shaping했다
+    /// (2026-07-14 실측: idle에서 rows_rebuilt≈전체 행). 세대가 같으면 이미 소비한 것으로 본다.
+    last_gen: Option<u64>,
 }
 
 impl TerminalRenderCache {
@@ -81,14 +86,22 @@ impl TerminalRenderCache {
         self.is_alt_screen = false;
         self.font_size_bits = 0;
         self.counters = RenderCounters::default();
+        self.last_gen = None;
     }
 
     pub fn rebuilt_rows_last_frame(&self) -> usize {
         self.counters.rows_rebuilt
     }
 
-    fn prepare(&mut self, snapshot: &TerminalViewportSnapshot, font_size: f32) {
+    /// 이번 draw에서 `dirty_ranges`를 신뢰할 수 있는가 — 같은 세대(같은 스냅샷)를 다시
+    /// 그리는 것이면 dirty는 이미 소비됐다(행 캐시가 최신). 위 `last_gen` 주석 참조.
+    fn dirty_is_fresh(&self, generation: u64) -> bool {
+        self.last_gen != Some(generation)
+    }
+
+    fn prepare(&mut self, snapshot: &TerminalViewportSnapshot, font_size: f32, generation: u64) {
         self.counters = RenderCounters::default();
+        self.last_gen = Some(generation);
         let font_size_bits = font_size.to_bits();
         let shape_changed = self.cols != snapshot.cols
             || self.rows != snapshot.rows
@@ -140,6 +153,9 @@ pub fn draw(
     preedit: Option<&str>,
     // 선택 영역 (정규화된 선형 셀 인덱스, inclusive) — 셀 배경을 선택색으로 그린다
     selection: Option<(usize, usize)>,
+    // 스냅샷 세대 — 호출측이 새 스냅샷을 받을 때마다 +1. 같은 세대를 다시 그리면
+    // dirty_ranges는 이미 소비된 것이라 재-shaping하지 않는다 (2026-07-14 idle 낭비 수정).
+    snapshot_gen: u64,
 ) -> RenderOutput {
     let font_id = egui::FontId::monospace(font_size);
     let cell = cell_size(ui.ctx(), font_size);
@@ -173,10 +189,11 @@ pub fn draw(
     let selection = selection.and_then(|(a, b)| normalize_selection_range(snapshot, a, b));
     background_painter.rect_filled(rect, 0.0, default_bg);
 
-    cache.prepare(snapshot, font_size);
+    let dirty_fresh = cache.dirty_is_fresh(snapshot_gen);
+    cache.prepare(snapshot, font_size, snapshot_gen);
     cache.counters.shapes += 1; // 위 배경 rect_filled
     for row in 0..snapshot.rows as usize {
-        let dirty = row_is_dirty(snapshot, row);
+        let dirty = dirty_fresh && row_is_dirty(snapshot, row);
         if dirty {
             cache.counters.dirty_rows += 1;
         }
@@ -465,31 +482,43 @@ fn paint_selection_row(
     }
 
     let selection_bg = egui::Color32::from_rgb(0x2d, 0x4f, 0x77);
+    // 연속 선택 셀을 **run으로 병합**해 rect 하나로 그린다 — 배경색(push_bg_run)이 이미
+    // 쓰는 관례. 셀마다 rect를 발행하던 이전 구현은 200×60 전체 선택에서 shape가 18배
+    // (2.2ms, 프레임 예산 13%)로 폭증했다 (2026-07-14 실측). wide_spacer는 앞선 wide
+    // 셀의 폭에 이미 포함되므로 run을 끊지 않고 건너뛴다(폭 계산은 col 진행으로 처리).
     let mut painted = 0;
+    let mut run_start: Option<usize> = None; // run의 시작 col
+    let mut run_end_col = 0usize; // run의 끝(배타) col
+    let flush = |run_start: &mut Option<usize>, run_end_col: usize, painted: &mut usize| {
+        if let Some(start_col) = run_start.take() {
+            let pos = origin + egui::vec2(start_col as f32 * cell_size.x, row as f32 * cell_size.y);
+            let width = (run_end_col - start_col) as f32 * cell_size.x;
+            painter.rect_filled(
+                egui::Rect::from_min_size(pos, egui::vec2(width, cell_size.y)),
+                0.0,
+                selection_bg,
+            );
+            *painted += 1;
+        }
+    };
     for col in 0..cols {
         let index = row_start + col;
-        if index < start || index > end {
-            continue;
-        }
-        let Some(term_cell) = snapshot.visible_cells.get(index) else {
-            continue;
-        };
-        if term_cell.wide_spacer {
-            continue;
-        }
-        let width = if term_cell.wide {
-            cell_size.x * 2.0
+        let selected = index >= start
+            && index <= end
+            && snapshot
+                .visible_cells
+                .get(index)
+                .is_some_and(|cell| !cell.wide_spacer || run_start.is_some());
+        if selected {
+            if run_start.is_none() {
+                run_start = Some(col);
+            }
+            run_end_col = col + 1;
         } else {
-            cell_size.x
-        };
-        let pos = origin + egui::vec2(col as f32 * cell_size.x, row as f32 * cell_size.y);
-        painter.rect_filled(
-            egui::Rect::from_min_size(pos, egui::vec2(width, cell_size.y)),
-            0.0,
-            selection_bg,
-        );
-        painted += 1;
+            flush(&mut run_start, run_end_col, &mut painted);
+        }
     }
+    flush(&mut run_start, run_end_col, &mut painted);
     painted
 }
 
@@ -642,12 +671,28 @@ mod tests {
         cache: &mut TerminalRenderCache,
         snapshot: &TerminalViewportSnapshot,
     ) -> usize {
+        draw_gen_for_test(cache, snapshot, next_gen())
+    }
+
+    /// 세대를 명시해 draw — 같은 세대 재draw(= 같은 스냅샷 repaint)를 재현한다.
+    fn draw_gen_for_test(
+        cache: &mut TerminalRenderCache,
+        snapshot: &TerminalViewportSnapshot,
+        generation: u64,
+    ) -> usize {
         let ctx = egui::Context::default();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.set_min_size(egui::vec2(500.0, 200.0));
-            draw(ui, snapshot, 13.0, cache, None, None);
+            draw(ui, snapshot, 13.0, cache, None, None, generation);
         });
         cache.rebuilt_rows_last_frame()
+    }
+
+    /// 테스트용 단조 증가 세대 — 매 호출이 "새 스냅샷"을 뜻한다.
+    fn next_gen() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static GEN: AtomicU64 = AtomicU64::new(1);
+        GEN.fetch_add(1, Ordering::Relaxed)
     }
 
     #[test]
@@ -661,7 +706,7 @@ mod tests {
         let mut measured = None;
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.set_min_size(egui::vec2(500.0, 200.0));
-            let output = draw(ui, &snapshot, 13.0, &mut cache, None, None);
+            let output = draw(ui, &snapshot, 13.0, &mut cache, None, None, next_gen());
             measured = Some((output.response.rect, output.origin, output.cell_size));
         });
 
@@ -714,7 +759,7 @@ mod tests {
             let mut out = RenderCounters::default();
             let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
                 ui.set_min_size(egui::vec2(500.0, 200.0));
-                out = draw(ui, snapshot, 13.0, cache, None, None).counters;
+                out = draw(ui, snapshot, 13.0, cache, None, None, next_gen()).counters;
             });
             out
         }
@@ -840,5 +885,54 @@ mod tests {
             })
             .expect("rocket fixture should contain a wide spacer");
         assert_eq!(selection_text(&snapshot, spacer, spacer), "🚀");
+    }
+
+    /// 2026-07-14 실측 회귀: 같은 스냅샷을 다시 그리면(새 출력 없는 repaint —
+    /// 리소스 표시 갱신·애니메이션) dirty_ranges가 남아 있어 전 행을 재-shaping했다.
+    /// 세대가 같으면 dirty는 이미 소비된 것으로 보고 재빌드하지 않아야 한다.
+    #[test]
+    fn 같은_스냅샷_재draw는_행을_재구성하지_않는다() {
+        let mut snapshot = snap(6, 3, &["one", "two", "three"]);
+        // 전 행 dirty인 스냅샷(대량 출력 직후 상태)
+        snapshot.dirty_ranges = vec![CellRange {
+            start: 0,
+            end: 6 * 3,
+        }];
+        let mut cache = TerminalRenderCache::default();
+        let generation = 7;
+        // 첫 draw: 전 행 빌드(캐시 비어 있음)
+        assert_eq!(draw_gen_for_test(&mut cache, &snapshot, generation), 3);
+        // 같은 세대 재draw(= 같은 스냅샷 repaint): 재구성 0
+        assert_eq!(
+            draw_gen_for_test(&mut cache, &snapshot, generation),
+            0,
+            "같은 스냅샷 repaint가 전 행을 재-shaping했다 (idle 낭비 회귀)"
+        );
+        // 새 세대(새 스냅샷): dirty를 다시 신뢰해 재구성
+        assert_eq!(draw_gen_for_test(&mut cache, &snapshot, generation + 1), 3);
+    }
+
+    /// 2026-07-14 실측 회귀: 선택 하이라이트가 셀마다 rect를 발행해 전체 선택 시
+    /// shape가 폭증했다(200×60에서 2.2ms). 연속 셀은 run 하나로 병합해야 한다.
+    #[test]
+    fn 선택_하이라이트는_연속_셀을_run으로_병합한다() {
+        let snapshot = snap(10, 2, &["0123456789", "abcdefghij"]);
+        let ctx = egui::Context::default();
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        let cell = egui::vec2(8.0, 16.0);
+        let origin = egui::Pos2::ZERO;
+        // 첫 행 전체(0..=9) 선택 → rect 1개(셀 10개가 아니라)
+        let painted = paint_selection_row(&painter, &snapshot, 0, origin, cell, Some((0, 9)));
+        assert_eq!(
+            painted, 1,
+            "연속 10셀이 rect 10개로 발행됐다 (run 병합 회귀)"
+        );
+        // 끊긴 선택(0..=2, 5..=7)은 행 안에서 run 2개 — 선택은 선형 범위라 여기선
+        // 행 경계로 잘린 부분 선택만 확인한다(0..=2 = run 1개).
+        let painted = paint_selection_row(&painter, &snapshot, 0, origin, cell, Some((0, 2)));
+        assert_eq!(painted, 1);
+        // 선택이 이 행에 없으면 0
+        let painted = paint_selection_row(&painter, &snapshot, 1, origin, cell, Some((0, 2)));
+        assert_eq!(painted, 0);
     }
 }

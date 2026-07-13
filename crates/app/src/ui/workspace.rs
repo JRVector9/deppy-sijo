@@ -125,6 +125,10 @@ const PASTE_TASK_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 #[derive(Default)]
 struct SessionView {
     snapshot: Option<Arc<TerminalViewportSnapshot>>,
+    /// 스냅샷 세대 — 새 스냅샷을 받을 때마다 +1. 렌더러가 "이 스냅샷의 dirty를 이미
+    /// 소비했는지" 판정해, 새 출력이 없는 repaint에서 전 행을 다시 shaping하지 않게 한다
+    /// (2026-07-14 실측: idle repaint마다 rows_rebuilt≈전체 행 — 캐시 무효화 버그).
+    snapshot_gen: u64,
     /// freeze(선택 중) 동안 도착한 최신 snapshot을 보관 — 선택 해제 시 이걸로 catch-up해
     /// 화면이 선택 당시에 머무는 것을 막는다(codex). 프레임 시작 시 프로모트한다.
     pending_snapshot: Option<Arc<TerminalViewportSnapshot>>,
@@ -561,6 +565,7 @@ impl WorkspaceUi {
                     for (id, view) in self.sessions.iter_mut() {
                         if !visible.contains(id) {
                             view.snapshot = None;
+                            view.snapshot_gen = view.snapshot_gen.wrapping_add(1);
                             view.pending_snapshot = None;
                             view.render_cache.clear();
                         }
@@ -597,6 +602,7 @@ impl WorkspaceUi {
                             view.pending_snapshot = Some(Arc::clone(snapshot));
                         } else {
                             view.snapshot = Some(Arc::clone(snapshot));
+                            view.snapshot_gen = view.snapshot_gen.wrapping_add(1);
                             view.pending_snapshot = None;
                             // 사이드바 세션 요약 — 마지막 비어있지 않은 행 (2026-07-05)
                             view.summary = last_line_summary(snapshot);
@@ -1246,6 +1252,7 @@ impl WorkspaceUi {
             if !selected && let Some(pending) = view.pending_snapshot.take() {
                 view.summary = last_line_summary(&pending);
                 view.snapshot = Some(pending);
+                view.snapshot_gen = view.snapshot_gen.wrapping_add(1);
             }
             let Some(snapshot) = view.snapshot.clone() else {
                 ui.label(catalog.t("workspace.connecting", &[]));
@@ -1268,6 +1275,7 @@ impl WorkspaceUi {
                 &mut view.render_cache,
                 preedit,
                 selection_range,
+                view.snapshot_gen,
             )
         };
         // B1 실측: 이 프레임에 그린 pane들의 렌더 비용을 합산한다 (visible pane 전부).
@@ -1345,6 +1353,7 @@ impl WorkspaceUi {
                         );
                         view.summary = last_line_summary(&pending);
                         view.snapshot = Some(pending);
+                        view.snapshot_gen = view.snapshot_gen.wrapping_add(1);
                     }
                 }
                 self.selection = Some((session, anchor, cell_at(pos)));

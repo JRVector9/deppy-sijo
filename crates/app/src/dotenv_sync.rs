@@ -221,6 +221,66 @@ pub fn write_env_var(root: &std::path::Path, key: &str, value: Option<&str>) -> 
     }
     atomic_write_env(&path, out.as_bytes())
         .with_context(|| format!(".env 기록 실패: {}", path.display()))?;
+    // 유출 방지(E2): deppy가 .env를 기록하는 유일한 지점 — git 저장소면 .gitignore
+    // 보호를 함께 보장한다. best-effort(경고만) — 파일 기록 자체는 실패시키지 않는다.
+    if let Err(e) = ensure_env_gitignored(root) {
+        tracing::warn!(".gitignore 보호 실패: {e:#}");
+    }
+    Ok(())
+}
+
+/// `.env`/`.env.local`이 git에 커밋되지 않게 `.gitignore`를 보장한다 (E2, 2026-07-13).
+///
+/// 시나리오상 에이전트가 프로젝트 안에서 `git add -A`를 자율 실행하므로, deppy가
+/// 비밀값을 .env에 기록하는 순간이 유출 방지의 마지막 지점이다. git 저장소가
+/// 아니면(루트에 .git 없음 — 워크트리 gitfile 포함) 아무것도 하지 않는다.
+/// 이미 커버하는 패턴(.env / /.env / .env* / .env.*)이 있으면 추가하지 않는다.
+fn ensure_env_gitignored(root: &Path) -> anyhow::Result<()> {
+    if !root.join(".git").exists() {
+        return Ok(());
+    }
+    let gitignore = root.join(".gitignore");
+    let content = match std::fs::read_to_string(&gitignore) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!(".gitignore 읽기 실패: {}", gitignore.display()));
+        }
+    };
+    let covers = |name: &str| -> bool {
+        content.lines().map(str::trim).any(|line| {
+            line == name
+                || line == format!("/{name}")
+                || line == ".env*"
+                || (name.starts_with(".env.") && line == ".env.*")
+        })
+    };
+    let missing: Vec<&str> = DOTENV_FILE_NAMES
+        .iter()
+        .copied()
+        .filter(|name| !covers(name))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut block = String::new();
+    if !content.is_empty() && !content.ends_with('\n') {
+        block.push('\n');
+    }
+    block.push_str("# deppy: 환경변수 파일 — 비밀값 커밋 방지\n");
+    for name in &missing {
+        block.push_str(name);
+        block.push('\n');
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&gitignore)
+        .with_context(|| format!(".gitignore 열기 실패: {}", gitignore.display()))?;
+    file.write_all(block.as_bytes())
+        .with_context(|| format!(".gitignore 기록 실패: {}", gitignore.display()))?;
+    tracing::info!(added = ?missing, ".gitignore에 .env 보호 추가");
     Ok(())
 }
 
@@ -708,6 +768,40 @@ INVALID LINE
                 .is_none()
         );
         assert_eq!(db.list_env_vars(&profile.id).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_저장소면_env_기록_시_gitignore_보호가_추가된다() {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-gitignore-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        // 1) .gitignore 없음 → 생성 + .env/.env.local 추가
+        write_env_var(&dir, "KTX_PASSWORD", Some("pw")).unwrap();
+        let ignore = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert!(ignore.lines().any(|l| l.trim() == ".env"), "{ignore}");
+        assert!(ignore.lines().any(|l| l.trim() == ".env.local"), "{ignore}");
+        // 2) 재기록해도 중복 추가 없음(멱등)
+        write_env_var(&dir, "KTX_PASSWORD", Some("pw2")).unwrap();
+        let again = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert_eq!(ignore, again, "중복 추가됨");
+        // 3) 이미 커버 패턴(.env*)이 있으면 건드리지 않음
+        let dir2 = dir.join("sub");
+        std::fs::create_dir_all(dir2.join(".git")).unwrap();
+        std::fs::write(dir2.join(".gitignore"), "node_modules/\n.env*\n").unwrap();
+        write_env_var(&dir2, "PORT_HINT", Some("1")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir2.join(".gitignore")).unwrap(),
+            "node_modules/\n.env*\n"
+        );
+        // 4) git 저장소가 아니면 .gitignore를 만들지 않음
+        let dir3 = dir.join("plain");
+        std::fs::create_dir_all(&dir3).unwrap();
+        write_env_var(&dir3, "PORT_HINT", Some("1")).unwrap();
+        assert!(!dir3.join(".gitignore").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

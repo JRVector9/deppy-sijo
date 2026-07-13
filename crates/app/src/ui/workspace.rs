@@ -45,6 +45,9 @@ pub struct WorkspaceUi {
     /// 닫기 확인 대기 중인 pane — 실행 중 세션이 있는 pane 닫기는 확인을 거친다
     /// (2026-07-05 사용자 보고: 닫기 실수로 셸 전체 즉사 방지).
     confirm_close: Option<runtime::MuxPaneId>,
+    /// pane 우클릭 → "환경변수·API 설정" 요청 (E4 ⑥). App이 프레임에서 take해
+    /// 설정 창을 Environment 카테고리로 연다.
+    open_environment_requested: bool,
     /// 터미널 마우스 선택 (session, anchor 셀, head 셀 — 드래그 방향 그대로,
     /// 렌더/복사 시 정규화). 새 출력(Viewport)이 오면 그 세션의 선택은 해제한다.
     selection: Option<(SessionId, usize, usize)>,
@@ -117,6 +120,7 @@ impl WorkspaceUi {
             pending_spawns: 0,
             split_drag: None,
             confirm_close: None,
+            open_environment_requested: false,
             selection: None,
             project_name: None,
             ui_scale: 1.0,
@@ -1423,7 +1427,22 @@ impl WorkspaceUi {
                 self.request_close_pane(client, pane_id.clone());
                 ui.close();
             }
+            ui.separator();
+            // E4 ⑥: 프로젝트 화면에서 바로 환경변수·API 설정 진입 (에이전트에게 줄
+            // 환경변수를 작업 중 즉시 등록하는 동선 — 사용자 시나리오).
+            if ui
+                .button(catalog.t("workspace.open_environment", &[]))
+                .clicked()
+            {
+                self.open_environment_requested = true;
+                ui.close();
+            }
         });
+    }
+
+    /// pane 우클릭의 환경설정 진입 요청을 소비한다 (E4 ⑥ — App이 프레임마다 확인).
+    pub fn take_open_environment(&mut self) -> bool {
+        std::mem::take(&mut self.open_environment_requested)
     }
 
     fn flush_command_repaint(&mut self, ctx: &egui::Context) {

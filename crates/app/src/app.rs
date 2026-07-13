@@ -4174,6 +4174,12 @@ impl eframe::App for App {
                     &text,
                 );
             });
+        // pane 우클릭 → 환경변수·API 설정 (E4 ⑥) — 프로젝트 화면에서 바로 진입.
+        if self.active.workspace_ui.take_open_environment() {
+            self.settings_category = ui::settings::Category::Environment;
+            self.settings_open = true;
+            self.refresh_workspaces();
+        }
 
         // 알림 센터 렌더 (생성은 logic()에서 끝났다). 활성 workspace의 사라진 세션의
         // 진행형 알림 정리 (다른 workspace 건 alive를 알 수 없어 유지).
@@ -5326,6 +5332,38 @@ mod tests {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+
+    /// ⑦ 검증: .env 외부 수정 감지의 근거인 baseline 상태가 파일 변경/생성/삭제를
+    /// 구분한다 — 2초 점검이 이 값의 변화로 재동기화를 트리거한다(B 경로).
+    #[test]
+    fn dotenv_baseline은_외부_수정과_생성_삭제를_감지한다() {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-dotenv-state-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 파일 없음 → (false, None). 경로 없음도 동일.
+        assert_eq!(dotenv_state_for_root(Some(&dir)), (false, None));
+        assert_eq!(dotenv_state_for_root(None), (false, None));
+        // 생성 감지
+        std::fs::write(dir.join(".env"), "A=1\n").unwrap();
+        let created = dotenv_state_for_root(Some(&dir));
+        assert!(created.0 && created.1.is_some());
+        // 내용 수정(mtime 변화) 감지 — 에디터/터미널로 직접 고친 경우
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        std::fs::write(dir.join(".env"), "A=2\n").unwrap();
+        let edited = dotenv_state_for_root(Some(&dir));
+        assert_ne!(created, edited, "외부 수정이 baseline에 반영되지 않음");
+        // .env.local 추가도 감지(병합 대상 전체를 본다)
+        std::fs::write(dir.join(".env.local"), "B=1\n").unwrap();
+        assert_ne!(edited, dotenv_state_for_root(Some(&dir)));
+        // 삭제 감지
+        std::fs::remove_file(dir.join(".env")).unwrap();
+        std::fs::remove_file(dir.join(".env.local")).unwrap();
+        assert_eq!(dotenv_state_for_root(Some(&dir)), (false, None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// E3: 표시 이름은 폴더명 파생 + 별칭 병기. 기존 이름은 별칭으로 강등(데이터 무변경).
     #[test]

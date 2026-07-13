@@ -25,7 +25,7 @@ BIN_ALLOC="$WORK/bin/deppy-sijo-alloc"      # release + --features bench-alloc �
 REAL_DATA_DIR="$HOME/Library/Application Support/app.vector9.deppy-sijo"
 
 RENDERERS="glow wgpu"
-SCENARIOS="idle dirty1 bulk fullscreen switch createdelete selection"
+SCENARIOS="idle dirty1 bulk fullscreen switch createdelete selection agenttui"
 SAMPLE_INTERVAL="${SAMPLE_INTERVAL:-1}"     # 외부 샘플러 간격(초)
 SETTLE_SECS="${SETTLE_SECS:-5}"             # 실행 간 안정화 대기
 BENCH_ITERS="${DEPPY_BENCH_ITERS:-100}"     # createdelete 반복 횟수
@@ -45,6 +45,7 @@ usage() {
   fullscreen    전체 화면 갱신. 최악 케이스 frame p95
   switch        워크스페이스 전환 반복. 전환 latency
   createdelete  워크스페이스 생성·삭제 반복(기본 100회). RSS 기울기 → 누수 판정
+  agenttui      에이전트 TUI 근사(alt screen + 스피너 10Hz + 부분 갱신 + 스트리밍). 실제 핫패스
   selection     **자동화 불가 — 수동 절차**. 드래그 선택을 사람이 수행한다(아래 참조)
 
 매트릭스 (조합 폭발 방지 — 실제로 도는 것만):
@@ -54,6 +55,7 @@ usage() {
   {glow,wgpu} × fullscreen    × ws 1
   {glow,wgpu} × switch        × ws 5             (전환은 ws≥2 필요)
   {glow,wgpu} × createdelete  × ws 1 (iters=100)
+  {glow,wgpu} × agenttui      × ws 1
   selection 은 매트릭스에서 제외 — `run <renderer> selection` 로 수동 실행.
 
 환경변수(스크립트 → 앱):
@@ -96,7 +98,7 @@ has_bench_alloc_feature() {
 default_secs() { # 시나리오별 기본 실행 시간(초)
   case "$1" in
     idle) echo 60 ;;
-    dirty1|bulk|fullscreen|switch) echo 30 ;;
+    dirty1|bulk|fullscreen|switch|agenttui) echo 30 ;;
     createdelete) echo 300 ;;   # 100회 반복 상한 — 앱이 먼저 끝나면 조기 종료
     selection) echo 60 ;;
     *) echo 30 ;;
@@ -259,8 +261,8 @@ EOF
 # ── matrix ──────────────────────────────────────────────────────────────────
 # 직렬 실행. 각 실행 사이 SETTLE_SECS 안정화(GPU/캐시/썸 잔열 배제).
 matrix() {
-  # 렌더러당 12회 = idle×4(ws) + bulk×4(ws) + dirty1 + fullscreen + switch + createdelete
-  note "매트릭스 24회 직렬 실행 — 예상 25~40분. 실행 중 Mac을 건드리지 마라(측정 오염)."
+  # 렌더러당 13회 = idle×4(ws) + bulk×4(ws) + dirty1 + fullscreen + switch + createdelete + agenttui
+  note "매트릭스 26회 직렬 실행 — 예상 25~40분. 실행 중 Mac을 건드리지 마라(측정 오염)."
   for r in $RENDERERS; do
     for ws in 1 5 10 20; do
       run_one "$r" idle "$ws"; sleep "$SETTLE_SECS"
@@ -270,6 +272,7 @@ matrix() {
     run_one "$r" fullscreen 1;   sleep "$SETTLE_SECS"
     run_one "$r" switch 5;       sleep "$SETTLE_SECS"
     run_one "$r" createdelete 1; sleep "$SETTLE_SECS"
+    run_one "$r" agenttui 1;     sleep "$SETTLE_SECS"
   done
   note "매트릭스 완료 — selection(수동)은 별도 실행 후 report"
   report

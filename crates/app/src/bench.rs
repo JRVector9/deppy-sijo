@@ -98,6 +98,10 @@ pub enum Scenario {
     Fullscreen,
     Switch,
     CreateDelete,
+    /// 에이전트 TUI 근사 — 실제 워크로드(Claude/Codex)의 렌더 구조를 재현한다
+    /// (2026-07-14): alt screen + 스피너(10Hz) + 부분 갱신 + 스트리밍 출력 + 색·박스.
+    /// 합성 벤치(yes 대량 출력)가 대표하지 못하는 이 앱의 실제 핫패스다.
+    AgentTui,
 }
 
 impl Scenario {
@@ -109,6 +113,7 @@ impl Scenario {
             "fullscreen" => Self::Fullscreen,
             "switch" => Self::Switch,
             "createdelete" => Self::CreateDelete,
+            "agenttui" => Self::AgentTui,
             _ => return None,
         })
     }
@@ -121,6 +126,7 @@ impl Scenario {
             Self::Fullscreen => "fullscreen",
             Self::Switch => "switch",
             Self::CreateDelete => "createdelete",
+            Self::AgentTui => "agenttui",
         }
     }
 
@@ -143,6 +149,26 @@ impl Scenario {
             }
             // switch/createdelete는 드라이버가 워크스페이스를 조작한다 — 셸은 조용한 것으로.
             Self::Switch | Self::CreateDelete => "exec sleep 86400",
+            // 에이전트 TUI 근사: alt screen 진입 → 상단 박스 + 스피너(10Hz, 커서 이동으로
+            // 한 셀만 갱신) + 하단에 스트리밍 텍스트(0.5s마다 한 줄) + 8색 사용.
+            // 실제 Claude/Codex TUI의 렌더 구조(부분 갱신 + 애니메이션 + 스크롤)를 흉내낸다.
+            Self::AgentTui => {
+                "printf '\\033[?1049h\\033[2J'; \
+                 printf '\\033[1;1H\\033[36m╭──────────────────────────────╮\\033[0m'; \
+                 printf '\\033[2;1H\\033[36m│\\033[0m \\033[1mdeppy agent\\033[0m  status:      \\033[36m│\\033[0m'; \
+                 printf '\\033[3;1H\\033[36m╰──────────────────────────────╯\\033[0m'; \
+                 i=0; row=5; \
+                 while :; do \
+                   for f in '|' '/' '-' '\\\\'; do \
+                     printf '\\033[2;28H\\033[33m%s\\033[0m' \"$f\"; \
+                     sleep 0.1; \
+                   done; \
+                   i=$((i+1)); \
+                   printf '\\033[%d;1H\\033[32m▸\\033[0m tool call %03d — 한글 출력 테스트 \\033[2mdim\\033[0m\\033[K' $row $i; \
+                   row=$((row+1)); \
+                   [ $row -gt 40 ] && { printf '\\033[5;1H\\033[J'; row=5; }; \
+                 done"
+            }
         };
         Some((
             "/bin/sh".to_owned(),

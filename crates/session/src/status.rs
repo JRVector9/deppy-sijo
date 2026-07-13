@@ -252,6 +252,8 @@ pub struct StatusDetector {
     /// 완성되지 않은 마지막 라인 (chunk 경계 대응).
     /// 바이트로 보관 — UTF-8 문자가 chunk 경계에 걸려도 라인 완성 시 온전하다.
     line_buf: Vec<u8>,
+    /// line_buf에서 이미 개행 스캔을 마친 접두 길이 — 재스캔 방지(2026-07-14 프로파일링).
+    scanned: usize,
     last_output: Instant,
     /// 마지막으로 확정한 상태
     status: SessionStatus,
@@ -280,6 +282,7 @@ impl StatusDetector {
         Self {
             patterns,
             line_buf: Vec::new(),
+            scanned: 0,
             last_output: Instant::now(),
             status: SessionStatus::Running,
             last_reported: SessionStatus::Running,
@@ -352,6 +355,7 @@ impl StatusDetector {
         self.screen_derived = false;
         // 개행 없이 떠 있던 프롬프트가 입력 echo로 라인 완성되며 재매치되는 것 방지
         self.line_buf.clear();
+        self.scanned = 0;
         // 입력도 활동이다 — idle 타이머 리셋 (즉시 Waiting 재발화 방지)
         self.last_output = Instant::now();
     }
@@ -370,9 +374,19 @@ impl StatusDetector {
             self.idle_waiting = false;
         }
         self.line_buf.extend_from_slice(chunk);
-        // 완성된 라인들 평가, 미완 꼬리는 유지 (\n은 ASCII라 UTF-8 문자를 가르지 않는다)
-        while let Some(pos) = self.line_buf.iter().position(|b| *b == b'\n') {
+        // 완성된 라인들 평가, 미완 꼬리는 유지 (\n은 ASCII라 UTF-8 문자를 가르지 않는다).
+        //
+        // **이미 스캔한 구간은 다시 보지 않는다** (2026-07-14 프로파일링): 진행률 표시·
+        // 스피너는 `\r`만 쓰고 `\n`을 보내지 않아 line_buf가 상한까지 차는데, 매 청크마다
+        // 버퍼 전체를 처음부터 스캔하면 O(청크수 × CAP)가 된다. 실측에서 이 함수가
+        // VTE 파서보다 8배 많은 CPU를 먹었다(sample: on_output 802 vs Handler::input 94).
+        while let Some(rel) = self.line_buf[self.scanned..]
+            .iter()
+            .position(|b| *b == b'\n')
+        {
+            let pos = self.scanned + rel;
             let line: Vec<u8> = self.line_buf.drain(..=pos).collect();
+            self.scanned = 0; // 앞을 잘라냈으니 남은 꼬리는 아직 안 본 구간이다
             self.stats.stream_lines += 1;
             let line = String::from_utf8_lossy(&line);
             // 시간상 나중의 stream 매치가 이전 상태를 대체한다 — 우선순위는
@@ -384,9 +398,13 @@ impl StatusDetector {
                 self.screen_derived = false; // stream 유래로 전환 (latch)
             }
         }
-        if self.line_buf.len() > LINE_BUF_CAP {
+        self.scanned = self.line_buf.len(); // 여기까진 개행이 없음이 확정됐다
+        // 상한 초과 트림 — 매번 CAP만큼 memmove하지 않도록 2×CAP에서 한 번에 자른다
+        // (개행 없는 스트림에서 청크마다 drain하면 memmove가 CPU를 먹었다).
+        if self.line_buf.len() > LINE_BUF_CAP * 2 {
             let cut = self.line_buf.len() - LINE_BUF_CAP;
             self.line_buf.drain(..cut);
+            self.scanned = self.line_buf.len();
         }
     }
 
@@ -762,5 +780,28 @@ mod tests {
     fn 잘못된_regex는_무시() {
         let p = StatusPatterns::compile(Some("(unclosed"), None, None, None);
         assert!(p.is_empty());
+    }
+
+    /// 2026-07-14 프로파일링 회귀: 진행률/스피너 출력(`\r`만, 개행 없음)에서
+    /// on_output이 매 청크마다 line_buf 전체를 재스캔해 CPU 1위를 차지했다
+    /// (sample: on_output 802 vs VTE parse 94). 스캔 오프셋으로 새 구간만 본다.
+    #[test]
+    fn 개행_없는_스트림에서_line_buf를_재스캔하지_않는다() {
+        let mut d = StatusDetector::new(patterns());
+        // 개행이 전혀 없는 청크를 상한(8KB)을 넘길 만큼 흘린다
+        for i in 0..4000 {
+            d.on_output(format!("\rprogress={i}").as_bytes());
+        }
+        // 스캔 오프셋은 항상 버퍼 끝(= 개행 없음이 확정된 지점)
+        assert_eq!(d.scanned, d.line_buf.len());
+        // 버퍼는 2×CAP를 넘지 않게 유계 (트림이 동작)
+        assert!(
+            d.line_buf.len() <= LINE_BUF_CAP * 2,
+            "line_buf 무한 증가: {}",
+            d.line_buf.len()
+        );
+        // 개행이 오면 그 라인은 정상 평가된다(기능 회귀 없음)
+        d.on_output(b"\nProceed? [y/n]\n");
+        assert_eq!(d.status, SessionStatus::NeedsApproval);
     }
 }

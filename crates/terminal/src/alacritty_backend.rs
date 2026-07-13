@@ -18,7 +18,7 @@ use crate::backend::{
 };
 use crate::change_set::TerminalChangeSet;
 use crate::viewport_snapshot::{
-    CursorShape, CursorSnapshot, TerminalCell, TerminalViewportSnapshot,
+    CellAttrs, CursorShape, CursorSnapshot, TerminalCell, TerminalViewportSnapshot,
 };
 
 /// 셀의 base char에 alacritty가 붙인 zerowidth(조합) 문자를 NFC로 합성한다.
@@ -276,6 +276,26 @@ impl TerminalBackend for AlacrittyBackend {
             if flags.contains(Flags::INVERSE) {
                 std::mem::swap(&mut fg, &mut bg);
             }
+            // SGR 텍스트 속성 (B-1, 2026-07-14): 이전엔 이 flag들을 읽지도 않고 버려
+            // bold/italic/underline이 화면에 전혀 반영되지 않았다. INVERSE/HIDDEN은
+            // 위에서 이미 fg/bg·문자에 반영했으므로 attrs에 담지 않는다.
+            let mut attrs = CellAttrs::empty();
+            attrs.set(CellAttrs::BOLD, flags.contains(Flags::BOLD));
+            attrs.set(CellAttrs::ITALIC, flags.contains(Flags::ITALIC));
+            // 밑줄 변형(이중/곡선/점선/파선)은 전부 단일 밑줄로 렌더한다 — egui가
+            // 밑줄 스타일을 구분하지 않는다(구분이 필요해지면 attrs에 비트를 늘린다).
+            attrs.set(
+                CellAttrs::UNDERLINE,
+                flags.intersects(
+                    Flags::UNDERLINE
+                        | Flags::DOUBLE_UNDERLINE
+                        | Flags::UNDERCURL
+                        | Flags::DOTTED_UNDERLINE
+                        | Flags::DASHED_UNDERLINE,
+                ),
+            );
+            attrs.set(CellAttrs::STRIKEOUT, flags.contains(Flags::STRIKEOUT));
+            attrs.set(CellAttrs::DIM, flags.contains(Flags::DIM));
             *cell = TerminalCell {
                 // SGR conceal(ESC[8m)은 공백으로 — 속성은 유지
                 c: if flags.contains(Flags::HIDDEN) {
@@ -288,6 +308,7 @@ impl TerminalBackend for AlacrittyBackend {
                 wide: flags.contains(Flags::WIDE_CHAR),
                 wide_spacer: flags
                     .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
+                attrs,
             };
         }
 
@@ -580,6 +601,7 @@ impl Default for TerminalCell {
             bg: DEFAULT_BG,
             wide: false,
             wide_spacer: false,
+            attrs: CellAttrs::empty(),
         }
     }
 }
@@ -991,5 +1013,36 @@ mod tests {
         assert_eq!(result.matches.len(), 10);
         // 최신 10개 = line_from_bottom 0..10 근방 (화면 최하단 우선)
         assert!(result.matches.iter().all(|m| m.line_from_bottom < 12));
+    }
+
+    /// B-1 회귀: SGR 속성(bold/italic/underline/strikeout/dim)이 스냅샷에 실려야 한다.
+    /// 이전엔 backend가 이 flag들을 읽지도 않고 버려 화면에 전혀 반영되지 않았다.
+    #[test]
+    fn sgr_텍스트_속성이_스냅샷_셀에_실린다() {
+        let mut backend = AlacrittyBackend::new(40, 4, 100);
+        // 굵게 B / 기울임 I / 밑줄 U / 취소선 S / 흐리게 D — 각각 리셋(0m) 후 다음 속성
+        backend
+            .feed(b"\x1b[1mB\x1b[0m\x1b[3mI\x1b[0m\x1b[4mU\x1b[0m\x1b[9mS\x1b[0m\x1b[2mD\x1b[0m")
+            .unwrap();
+        let snap = backend.viewport_snapshot().expect("snapshot");
+        let cells = &snap.visible_cells[..5];
+        assert_eq!(cells[0].c, 'B');
+        assert!(cells[0].attrs.contains(CellAttrs::BOLD), "bold 미반영");
+        assert_eq!(cells[1].c, 'I');
+        assert!(cells[1].attrs.contains(CellAttrs::ITALIC), "italic 미반영");
+        assert_eq!(cells[2].c, 'U');
+        assert!(
+            cells[2].attrs.contains(CellAttrs::UNDERLINE),
+            "underline 미반영"
+        );
+        assert_eq!(cells[3].c, 'S');
+        assert!(
+            cells[3].attrs.contains(CellAttrs::STRIKEOUT),
+            "strikeout 미반영"
+        );
+        assert_eq!(cells[4].c, 'D');
+        assert!(cells[4].attrs.contains(CellAttrs::DIM), "dim 미반영");
+        // 속성 없는 셀은 비어 있다
+        assert!(snap.visible_cells[10].attrs.is_empty());
     }
 }

@@ -358,7 +358,23 @@
     ctx.scale(dpr, dpr);
     ctx.fillStyle = '#000000';
     ctx.fillRect(0, 0, cssWidth, cssHeight);
-    ctx.font = (cellH * 0.82).toFixed(2) + 'px ui-monospace, Menlo, monospace';
+    // SGR 속성 비트 (B-1) — 서버 CellAttrs와 동일. run.a가 없으면 0(속성 없음).
+    const A_BOLD = 1, A_ITALIC = 2, A_UNDERLINE = 4, A_STRIKE = 8, A_DIM = 16;
+    const fontPx = (cellH * 0.82).toFixed(2);
+    const fontFor = (a) => {
+      const style = a & A_ITALIC ? 'italic ' : '';
+      const weight = a & A_BOLD ? '700 ' : '';
+      return style + weight + fontPx + 'px ui-monospace, Menlo, monospace';
+    };
+    // dim(SGR 2)은 색을 60%로 낮춘다 — 데스크톱 렌더러와 같은 관례.
+    const dimmed = (hex) => {
+      const m = /^#?([0-9a-f]{6})$/i.exec(hex || '');
+      if (!m) return hex;
+      const n = parseInt(m[1], 16);
+      const f = (v) => Math.round(v * 0.6);
+      return `rgb(${f((n >> 16) & 255)},${f((n >> 8) & 255)},${f(n & 255)})`;
+    };
+    ctx.font = fontFor(0);
     ctx.textBaseline = 'middle';
     for (let row = 0; row < screen.rows; row++) {
       const runs = screen.lines[row];
@@ -367,16 +383,28 @@
       for (const run of runs) {
         const advance = run.w ? cellW * 2 : cellW;
         const chars = Array.from(run.t || '');
+        const attrs = run.a || 0;
         // run 배경 — 시작 열부터 글자 수 × 폭
         ctx.fillStyle = run.bg || '#000000';
         ctx.fillRect(run.s * cellW, y, chars.length * advance, cellH);
-        ctx.fillStyle = run.fg || '#d4d4d4';
+        const fg = attrs & A_DIM ? dimmed(run.fg || '#d4d4d4') : (run.fg || '#d4d4d4');
+        ctx.fillStyle = fg;
+        ctx.font = fontFor(attrs);
         for (let i = 0; i < chars.length; i++) {
           if (chars[i] === ' ') continue;
           ctx.fillText(chars[i], run.s * cellW + i * advance, y + cellH / 2, advance);
         }
+        // underline/strikeout — run 폭 전체에 1px 선(데스크톱과 동일 의미).
+        if (attrs & (A_UNDERLINE | A_STRIKE)) {
+          const x0 = run.s * cellW;
+          const w = chars.length * advance;
+          ctx.fillStyle = fg;
+          if (attrs & A_UNDERLINE) ctx.fillRect(x0, y + cellH - 1.5, w, 1);
+          if (attrs & A_STRIKE) ctx.fillRect(x0, y + cellH / 2, w, 1);
+        }
       }
     }
+    ctx.font = fontFor(0);
     // 커서 — 반투명 블록 오버레이 (모양 구분은 v1 비범위)
     const cursor = screen.cursor;
     if (cursor && cursor.visible) {

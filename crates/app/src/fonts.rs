@@ -104,6 +104,19 @@ pub fn install_cjk_fallback(
         .or_default()
         .insert(0, "term_mono".to_owned());
 
+    // SGR bold 셀용 굵은 모노 패밀리 (B-1, 2026-07-14) — 렌더러가
+    // `terminal::MONO_BOLD_FAMILY` 이름으로 찾는다. 설정 굵기가 이미 Bold면 같은 파일이라
+    // 중복 등록 비용만 미미하게 든다. CJK 폴백은 아래에서 이 패밀리에도 붙인다.
+    fonts.font_data.insert(
+        "term_mono_bold".to_owned(),
+        egui::FontData::from_static(mono_bytes(mono_font, "Bold")).into(),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Name(terminal::MONO_BOLD_FAMILY.into()))
+        .or_default()
+        .insert(0, "term_mono_bold".to_owned());
+
     // 한글 fallback (families 끝에 붙여 Latin은 기본/SF, 한글만 이 폰트가 처리)
     if let Some((path, bytes)) = CJK_FONT_CANDIDATES
         .iter()
@@ -112,7 +125,12 @@ pub fn install_cjk_fallback(
         fonts
             .font_data
             .insert("cjk".to_owned(), egui::FontData::from_owned(bytes).into());
-        for family in [egui::FontFamily::Monospace, egui::FontFamily::Proportional] {
+        for family in [
+            egui::FontFamily::Monospace,
+            egui::FontFamily::Proportional,
+            // bold 셀도 한글이 깨지지 않게 같은 폴백을 붙인다 (B-1).
+            egui::FontFamily::Name(terminal::MONO_BOLD_FAMILY.into()),
+        ] {
             fonts
                 .families
                 .entry(family)

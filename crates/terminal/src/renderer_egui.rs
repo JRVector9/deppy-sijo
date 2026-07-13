@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::viewport_snapshot::{CellRange, CursorShape, TerminalViewportSnapshot};
+use crate::viewport_snapshot::{CellAttrs, CellRange, CursorShape, TerminalViewportSnapshot};
 
 pub struct RenderOutput {
     pub response: egui::Response,
@@ -136,6 +136,60 @@ struct RowTextRun {
     col: usize,
     galley: Arc<egui::Galley>,
     color: egui::Color32,
+}
+
+/// bold 셀에 쓸 모노 굵은 폰트 패밀리 이름 (B-1). 앱(fonts.rs)이 같은 이름으로 등록한다 —
+/// 미등록이면 egui가 기본 Monospace로 폴백하므로 안전하다.
+pub const MONO_BOLD_FAMILY: &str = "mono_bold";
+
+/// 속성이 적용된 셀 텍스트 갤리를 만든다 (B-1). bold는 굵은 패밀리, italic은 egui가
+/// 합성(기울임), underline/strikeout은 TextFormat의 선, dim은 색을 낮춘다.
+fn layout_attr_text(
+    painter: &egui::Painter,
+    text: String,
+    font_id: &egui::FontId,
+    color: egui::Color32,
+    attrs: CellAttrs,
+) -> Arc<egui::Galley> {
+    if attrs.is_empty() {
+        return painter.layout_no_wrap(text, font_id.clone(), color);
+    }
+    let mut font = font_id.clone();
+    if attrs.contains(CellAttrs::BOLD) {
+        font.family = egui::FontFamily::Name(MONO_BOLD_FAMILY.into());
+    }
+    let color = if attrs.contains(CellAttrs::DIM) {
+        dim_color(color)
+    } else {
+        color
+    };
+    let line = egui::Stroke::new(1.0, color);
+    let format = egui::TextFormat {
+        font_id: font,
+        color,
+        italics: attrs.contains(CellAttrs::ITALIC),
+        underline: if attrs.contains(CellAttrs::UNDERLINE) {
+            line
+        } else {
+            egui::Stroke::NONE
+        },
+        strikethrough: if attrs.contains(CellAttrs::STRIKEOUT) {
+            line
+        } else {
+            egui::Stroke::NONE
+        },
+        ..Default::default()
+    };
+    let mut job = egui::text::LayoutJob::default();
+    job.append(&text, 0.0, format);
+    job.wrap.max_width = f32::INFINITY;
+    painter.layout_job(job)
+}
+
+/// SGR 2(dim) — 밝기를 60%로 낮춘다(터미널 관례).
+fn dim_color(color: egui::Color32) -> egui::Color32 {
+    let f = |c: u8| (c as f32 * 0.6) as u8;
+    egui::Color32::from_rgb(f(color.r()), f(color.g()), f(color.b()))
 }
 
 /// 주어진 폰트 크기의 셀 크기 (모노스페이스 'M' 폭 × 행 높이).
@@ -363,19 +417,20 @@ fn build_row_cache(
         }
 
         let fg = rgb(term_cell.fg);
+        let attrs = term_cell.attrs;
         if term_cell.wide {
             pending.flush(&mut text_runs, painter, font_id);
             let text = display_char(term_cell.c).to_string();
             text_runs.push(RowTextRun {
                 col,
-                galley: painter.layout_no_wrap(text, font_id.clone(), fg),
+                galley: layout_attr_text(painter, text, font_id, fg, attrs),
                 color: fg,
             });
         } else {
-            if pending.needs_flush(col, fg) {
+            if pending.needs_flush(col, fg, attrs) {
                 pending.flush(&mut text_runs, painter, font_id);
             }
-            pending.push(col, display_char(term_cell.c), fg);
+            pending.push(col, display_char(term_cell.c), fg, attrs);
         }
     }
     pending.flush(&mut text_runs, painter, font_id);
@@ -388,19 +443,23 @@ struct PendingTextRun {
     start_col: usize,
     next_col: usize,
     color: Option<egui::Color32>,
+    /// run은 색뿐 아니라 **속성이 같을 때만** 이어진다 (B-1).
+    attrs: CellAttrs,
     text: String,
 }
 
 impl PendingTextRun {
-    fn needs_flush(&self, col: usize, color: egui::Color32) -> bool {
-        self.color.is_some() && (self.color != Some(color) || self.next_col != col)
+    fn needs_flush(&self, col: usize, color: egui::Color32, attrs: CellAttrs) -> bool {
+        self.color.is_some()
+            && (self.color != Some(color) || self.attrs != attrs || self.next_col != col)
     }
 
-    fn push(&mut self, col: usize, ch: char, color: egui::Color32) {
+    fn push(&mut self, col: usize, ch: char, color: egui::Color32, attrs: CellAttrs) {
         if self.color.is_none() {
             self.start_col = col;
             self.next_col = col;
             self.color = Some(color);
+            self.attrs = attrs;
         }
         self.text.push(ch);
         self.next_col = col + 1;
@@ -419,9 +478,10 @@ impl PendingTextRun {
             return;
         }
         let text = std::mem::take(&mut self.text);
+        let attrs = std::mem::take(&mut self.attrs);
         text_runs.push(RowTextRun {
             col: self.start_col,
-            galley: painter.layout_no_wrap(text, font_id.clone(), color),
+            galley: layout_attr_text(painter, text, font_id, color, attrs),
             color,
         });
     }
@@ -629,6 +689,7 @@ mod tests {
                     bg: [0x18, 0x18, 0x1c],
                     wide: false,
                     wide_spacer: false,
+                    attrs: Default::default(),
                 });
             }
         }

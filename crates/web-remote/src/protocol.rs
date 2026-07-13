@@ -157,6 +157,14 @@ pub struct RunView {
     pub bg: String,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub w: bool,
+    /// SGR 속성 비트셋 (B-1) — 0이면 생략된다. 비트는 terminal::CellAttrs와 동일
+    /// (1=bold, 2=italic, 4=underline, 8=strikeout, 16=dim). 폰 렌더러가 해석한다.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub a: u8,
+}
+
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
 }
 
 /// 화면 한 행 (P5c). delta 프레임에는 바뀐 행만 실린다.
@@ -241,17 +249,25 @@ fn cursor_view(snapshot: &runtime::TerminalViewportSnapshot) -> CursorView {
 /// wide 전환에서도 run을 끊어 클라이언트가 run 단위 고정 폭(1 또는 2셀)으로 전진한다.
 fn encode_line(cells: &[runtime::TerminalCell], row: u16) -> LineView {
     let mut runs: Vec<RunView> = Vec::new();
-    // 진행 중 run의 (fg, bg, wide, 다음 예상 열) — 셀마다 hex 문자열을 만들지 않는다.
-    let mut open: Option<([u8; 3], [u8; 3], bool, u16)> = None;
+    // 진행 중 run의 (fg, bg, wide, attrs, 다음 예상 열) — 셀마다 hex 문자열을 만들지 않는다.
+    // 속성(B-1)이 다르면 run을 끊는다 — 폰도 bold/underline 등을 그린다.
+    // 진행 중 run의 스타일 키 — clippy type_complexity 회피용 별칭.
+    type OpenRun = ([u8; 3], [u8; 3], bool, u8, u16);
+    let mut open: Option<OpenRun> = None;
     for (col, cell) in cells.iter().enumerate() {
         if cell.wide_spacer {
             continue;
         }
         let col = col as u16;
         let advance = if cell.wide { 2 } else { 1 };
+        let attrs = cell.attrs.0;
         match (&mut open, runs.last_mut()) {
-            (Some((fg, bg, wide, next)), Some(run))
-                if *fg == cell.fg && *bg == cell.bg && *wide == cell.wide && *next == col =>
+            (Some((fg, bg, wide, a, next)), Some(run))
+                if *fg == cell.fg
+                    && *bg == cell.bg
+                    && *wide == cell.wide
+                    && *a == attrs
+                    && *next == col =>
             {
                 run.t.push(cell.c);
                 *next = col + advance;
@@ -263,8 +279,9 @@ fn encode_line(cells: &[runtime::TerminalCell], row: u16) -> LineView {
                     fg: hex_color(cell.fg),
                     bg: hex_color(cell.bg),
                     w: cell.wide,
+                    a: attrs,
                 });
-                open = Some((cell.fg, cell.bg, cell.wide, col + advance));
+                open = Some((cell.fg, cell.bg, cell.wide, attrs, col + advance));
             }
         }
     }
@@ -483,6 +500,7 @@ mod tests {
             bg,
             wide: false,
             wide_spacer: false,
+            attrs: Default::default(),
         }
     }
 
@@ -494,6 +512,7 @@ mod tests {
                 bg,
                 wide: true,
                 wide_spacer: false,
+                attrs: Default::default(),
             },
             runtime::TerminalCell {
                 c: ' ',
@@ -501,6 +520,7 @@ mod tests {
                 bg,
                 wide: false,
                 wide_spacer: true,
+                attrs: Default::default(),
             },
         ]
     }
@@ -618,6 +638,7 @@ mod tests {
             bg: BLACK,
             wide: false,
             wide_spacer: true,
+            attrs: Default::default(),
         }];
         cells.push(cell('a', WHITE, BLACK));
         cells.push(cell('b', WHITE, BLACK));

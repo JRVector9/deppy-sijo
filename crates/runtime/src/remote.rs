@@ -2796,6 +2796,7 @@ mod tests {
             bg: [0, 0, 0],
             wide: false,
             wide_spacer: false,
+            attrs: Default::default(),
         }
     }
 

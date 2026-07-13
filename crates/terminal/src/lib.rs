@@ -42,6 +42,7 @@ pub use backend::{
     substring_matches,
 };
 pub use change_set::TerminalChangeSet;
+pub use renderer_egui::MONO_BOLD_FAMILY;
 pub use viewport_snapshot::{
-    CellRange, CursorShape, CursorSnapshot, TerminalCell, TerminalViewportSnapshot,
+    CellAttrs, CellRange, CursorShape, CursorSnapshot, TerminalCell, TerminalViewportSnapshot,
 };

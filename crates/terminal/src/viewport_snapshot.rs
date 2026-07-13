@@ -27,6 +27,41 @@ pub struct TerminalCell {
     pub wide: bool,
     /// wide char 뒤의 자리 채움 셀 — 렌더링하지 않는다
     pub wide_spacer: bool,
+    /// SGR 텍스트 속성 (2026-07-14 B-1). backend가 이 flag들을 그냥 버리고 있었다 —
+    /// bold/italic/underline이 화면에 전혀 반영되지 않았다. 비트 하나로 유지해
+    /// 셀 크기 증가를 최소화한다(정렬 포함 기존 12B → 12B, wide/spacer 옆 패딩 활용).
+    pub attrs: CellAttrs,
+}
+
+/// 셀의 SGR 텍스트 속성 비트셋 (B-1). INVERSE/HIDDEN은 backend가 이미 fg/bg·문자에
+/// 반영하므로 여기에 없다 — 렌더러가 알아야 하는 것만 담는다.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CellAttrs(pub u8);
+
+impl CellAttrs {
+    pub const BOLD: u8 = 1 << 0;
+    pub const ITALIC: u8 = 1 << 1;
+    pub const UNDERLINE: u8 = 1 << 2;
+    pub const STRIKEOUT: u8 = 1 << 3;
+    /// SGR 2 — 밝기를 낮춘다(색을 어둡게).
+    pub const DIM: u8 = 1 << 4;
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+    pub const fn contains(self, bit: u8) -> bool {
+        self.0 & bit != 0
+    }
+    pub fn set(&mut self, bit: u8, on: bool) {
+        if on {
+            self.0 |= bit;
+        } else {
+            self.0 &= !bit;
+        }
+    }
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]

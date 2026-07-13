@@ -1507,8 +1507,9 @@ fn general_page(
         Some(&catalog.t("settings.ui_scale.hint", &[])),
         |ui| {
             let mut v = config.ui.ui_scale;
-            if stepper_f32(ui, &mut v, 0.05, 0.7, 1.5) {
-                config.ui.ui_scale = v;
+            // 스텝 0.1 + 0.1 격자 스냅 — 1.0→1.1처럼 한 번에 0.1씩, 부동소수 드리프트 방지.
+            if stepper_f32(ui, &mut v, 0.1, 0.7, 1.5) {
+                config.ui.ui_scale = (v * 10.0).round() / 10.0;
                 *changed = true;
             }
         },

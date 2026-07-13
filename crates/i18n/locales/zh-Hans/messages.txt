@@ -445,3 +445,5 @@ settings.session_name_style = 会话位置显示
 settings.session_name_style.hint = 如何显示会话所在位置：当前（最后）文件夹名，或 git 仓库名。
 settings.session_name_style.folder = 当前文件夹名
 settings.session_name_style.repo = 仓库名
+settings.mono_font = 终端字体
+settings.mono_font.hint = 终端等宽字体：D2Coding（默认 — 韩文/拉丁 2:1 宽度对齐，Naver OFL）或 JetBrains Mono（仅拉丁，韩文使用系统回退）。

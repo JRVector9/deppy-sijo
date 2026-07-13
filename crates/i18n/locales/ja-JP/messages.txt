@@ -445,3 +445,5 @@ settings.session_name_style = セッション位置の表示
 settings.session_name_style.hint = セッションのある場所の表示方法: 現在（最後）のフォルダ名、または git リポジトリ名。
 settings.session_name_style.folder = 現在のフォルダ名
 settings.session_name_style.repo = リポジトリ名
+settings.mono_font = ターミナルフォント
+settings.mono_font.hint = ターミナル等幅フォント: D2Coding（既定 — ハングル/ラテン 2:1 幅整合、Naver OFL）または JetBrains Mono（ラテンのみ、ハングルはシステムフォールバック）。

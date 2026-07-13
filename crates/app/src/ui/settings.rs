@@ -1638,10 +1638,32 @@ fn terminal_page(
     });
     row(
         ui,
+        &catalog.t("settings.mono_font", &[]),
+        Some(&catalog.t("settings.mono_font.hint", &[])),
+        |ui| {
+            for f in crate::fonts::MONO_FONTS {
+                if ui
+                    .selectable_label(config.terminal.mono_font == *f, *f)
+                    .clicked()
+                {
+                    config.terminal.mono_font = (*f).to_owned();
+                    // 가족 전환 시 미지원 굵기는 Regular로 — D2Coding은 2단뿐.
+                    if !crate::fonts::mono_weights_for(f)
+                        .contains(&config.terminal.mono_weight.as_str())
+                    {
+                        config.terminal.mono_weight = crate::fonts::DEFAULT_MONO_WEIGHT.to_owned();
+                    }
+                    *changed = true;
+                }
+            }
+        },
+    );
+    row(
+        ui,
         &catalog.t("settings.mono_weight", &[]),
         Some(&catalog.t("settings.mono_weight.hint", &[])),
         |ui| {
-            for w in crate::fonts::MONO_WEIGHTS {
+            for w in crate::fonts::mono_weights_for(&config.terminal.mono_font) {
                 if ui
                     .selectable_label(config.terminal.mono_weight == *w, *w)
                     .clicked()

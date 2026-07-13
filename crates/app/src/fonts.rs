@@ -1,28 +1,52 @@
 //! egui 기본 폰트에는 한글 글리프가 없다 — 시스템 CJK 폰트를 fallback으로 등록한다.
 //! (PR-05 완료 기준: 한글 렌더링 깨짐 없음)
 
-/// 번들 터미널 모노 폰트 (JetBrains Mono, OFL — assets/fonts/JetBrainsMono-OFL.txt). Latin은
-/// 이걸로, 한글은 CJK 폴백(AppleGothic 등)이 처리한다. egui는 리가처·가변폰트를 셰이핑/해석하지
-/// 않으므로 굵기별 **정적 weight 파일**을 번들해 설정에서 고른다.
-const MONO_LIGHT: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Light.ttf");
-const MONO_REGULAR: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
-const MONO_MEDIUM: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Medium.ttf");
-const MONO_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-SemiBold.ttf");
-const MONO_BOLD: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Bold.ttf");
+/// 번들 터미널 모노 폰트 두 가족 (둘 다 OFL — assets/fonts/*-OFL.txt).
+/// - **D2Coding**(기본, 2026-07-13): 네이버 한글 코딩 폰트 — 한글·영문이 한 폰트에서
+///   2:1 폭 정합이라 한글 섞인 출력의 정렬이 정확하다. 굵기는 Regular/Bold 2단.
+/// - **JetBrains Mono**: Latin 전용(한글은 CJK 폴백) — 굵기 5단.
+/// egui는 리가처·가변폰트를 셰이핑/해석하지 않으므로 정적 weight 파일을 번들한다.
+const JB_LIGHT: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Light.ttf");
+const JB_REGULAR: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
+const JB_MEDIUM: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Medium.ttf");
+const JB_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-SemiBold.ttf");
+const JB_BOLD: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Bold.ttf");
+const D2_REGULAR: &[u8] = include_bytes!("../assets/fonts/D2Coding-Regular.ttf");
+const D2_BOLD: &[u8] = include_bytes!("../assets/fonts/D2Coding-Bold.ttf");
 
-/// 설정에서 고를 수 있는 터미널 모노 굵기(가는 것부터).
-pub const MONO_WEIGHTS: &[&str] = &["Light", "Regular", "Medium", "SemiBold", "Bold"];
+/// 설정에서 고를 수 있는 터미널 모노 폰트 가족.
+pub const MONO_FONTS: &[&str] = &["D2Coding", "JetBrainsMono"];
+/// 기본 폰트 가족 (2026-07-13 사용자: D2Coding 기본).
+pub const DEFAULT_MONO_FONT: &str = "D2Coding";
+/// JetBrains Mono 굵기(가는 것부터).
+pub const JB_MONO_WEIGHTS: &[&str] = &["Light", "Regular", "Medium", "SemiBold", "Bold"];
+/// D2Coding 굵기 — 원본이 Regular/Bold 2단만 제공한다.
+pub const D2_MONO_WEIGHTS: &[&str] = &["Regular", "Bold"];
 /// 기본 굵기.
 pub const DEFAULT_MONO_WEIGHT: &str = "Regular";
 
-/// 굵기 이름 → 번들 폰트 바이트. 미지값은 Regular로 폴백.
-fn mono_bytes(weight: &str) -> &'static [u8] {
-    match weight {
-        "Light" => MONO_LIGHT,
-        "Medium" => MONO_MEDIUM,
-        "SemiBold" => MONO_SEMIBOLD,
-        "Bold" => MONO_BOLD,
-        _ => MONO_REGULAR,
+/// 폰트 가족이 지원하는 굵기 목록 — 설정 UI/검증 공용.
+pub fn mono_weights_for(font: &str) -> &'static [&'static str] {
+    match font {
+        "JetBrainsMono" => JB_MONO_WEIGHTS,
+        _ => D2_MONO_WEIGHTS,
+    }
+}
+
+/// (가족, 굵기) → 번들 폰트 바이트. 미지값은 해당 가족 Regular로 폴백.
+fn mono_bytes(font: &str, weight: &str) -> &'static [u8] {
+    match font {
+        "JetBrainsMono" => match weight {
+            "Light" => JB_LIGHT,
+            "Medium" => JB_MEDIUM,
+            "SemiBold" => JB_SEMIBOLD,
+            "Bold" => JB_BOLD,
+            _ => JB_REGULAR,
+        },
+        _ => match weight {
+            "Bold" => D2_BOLD,
+            _ => D2_REGULAR,
+        },
     }
 }
 
@@ -58,20 +82,26 @@ pub const DEFAULT_UI_FONT_NAME: &str = "System";
 /// 한글 fallback 폰트를 등록한다. 실패해도 앱은 계속 뜬다 (한글만 깨짐).
 /// `ui_font`: 설정에서 고른 UI(Proportional) 폰트 파일 경로 — None/로드 실패면 기본
 /// (macOS는 AppleGothic). 설정 변경 시 재호출해 hot reload된다(2026-07-07).
-pub fn install_cjk_fallback(ctx: &egui::Context, ui_font: Option<&str>, mono_weight: &str) {
+pub fn install_cjk_fallback(
+    ctx: &egui::Context,
+    ui_font: Option<&str>,
+    mono_font: &str,
+    mono_weight: &str,
+) {
     let mut fonts = egui::FontDefinitions::default();
 
-    // 터미널 모노(Latin) = 번들 JetBrains Mono(설정 굵기). Monospace 패밀리 **맨 앞**에 넣어
-    // egui 기본 Hack 대신 쓰고, 한글은 아래에서 붙는 CJK 폴백이 처리한다(정렬은 폴백 순서로 유지).
+    // 터미널 모노 = 번들 폰트(설정 가족+굵기). Monospace 패밀리 **맨 앞**에 넣어 egui
+    // 기본 Hack 대신 쓴다. D2Coding은 한글까지 자체 커버(2:1 폭 정합)하고, JetBrains
+    // Mono는 Latin만 — 한글은 아래 CJK 폴백이 처리한다(D2Coding도 미보유 한자 등은 폴백).
     fonts.font_data.insert(
-        "jbmono".to_owned(),
-        egui::FontData::from_static(mono_bytes(mono_weight)).into(),
+        "term_mono".to_owned(),
+        egui::FontData::from_static(mono_bytes(mono_font, mono_weight)).into(),
     );
     fonts
         .families
         .entry(egui::FontFamily::Monospace)
         .or_default()
-        .insert(0, "jbmono".to_owned());
+        .insert(0, "term_mono".to_owned());
 
     // 한글 fallback (families 끝에 붙여 Latin은 기본/SF, 한글만 이 폰트가 처리)
     if let Some((path, bytes)) = CJK_FONT_CANDIDATES

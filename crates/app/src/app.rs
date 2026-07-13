@@ -1186,10 +1186,12 @@ pub struct App {
     ts_detect_overwrite: bool,
     /// 웹 스냅샷 마지막 동기화 시각 — 프레임마다 구축하지 않도록 스로틀(리뷰 P2-2).
     last_web_sync: Option<std::time::Instant>,
-    /// cwd → 프로젝트 표시명 캐시. project_display_name이 마지막 폴더명만 쓰도록
-    /// 단순화(2026-07-13)돼 이제 순수 문자열 연산이지만, 활동 패널/웹 스냅샷이
-    /// 세션마다 부르는 호출 구조는 그대로라 메모이즈를 유지한다(무효화 불필요, 유계).
-    project_name_cache: std::cell::RefCell<std::collections::HashMap<String, Option<String>>>,
+    /// (스타일, cwd) → 프로젝트 표시명 캐시. Repo 스타일은 .git 상향 stat을 하므로
+    /// 활동 패널/웹 스냅샷의 세션별 호출을 메모이즈한다. 키에 스타일을 포함해
+    /// 설정 전환 시 별도 무효화가 필요 없다(유계).
+    project_name_cache: std::cell::RefCell<
+        std::collections::HashMap<(crate::config::SessionNameStyle, String), Option<String>>,
+    >,
     /// serve 진단/설정 1회성 스레드의 결과 수신 (진행 중일 때만 Some) — O1.
     serve_rx: Option<std::sync::mpsc::Receiver<crate::tailscale::ServeState>>,
     /// 마지막 serve 진단 결과. None = 이 세션에서 아직 진단 안 함.
@@ -1637,7 +1639,7 @@ impl App {
             // 세션 행/pane 헤더 1행 폴더명 원천 — WorkspaceUi에 전달.
             self.active
                 .workspace_ui
-                .set_session_cwds(self.session_cwds.clone());
+                .set_session_cwds(self.session_cwds.clone(), self.config.ui.session_name_style);
             // 포커스 세션 cwd → 워크스페이스 이름(현재 작업 폴더/프로젝트명).
             if let Some(cwd) = self
                 .active
@@ -3292,7 +3294,9 @@ impl App {
         if keep {
             return;
         }
-        let Some(name) = crate::agent_detect::project_display_name(cwd) else {
+        let Some(name) =
+            crate::agent_detect::project_display_name(cwd, self.config.ui.session_name_style)
+        else {
             return;
         };
         if name.is_empty() || name == "default" {
@@ -3388,16 +3392,19 @@ impl App {
         })
     }
 
-    /// cwd의 프로젝트 표시명 (메모이즈 — .git 상향 stat이 프레임마다 반복되지 않게).
+    /// cwd의 프로젝트 표시명 (메모이즈 — Repo 스타일의 .git 상향 stat이 프레임마다
+    /// 반복되지 않게). 키에 현재 스타일을 포함해 설정 전환이 즉시 반영된다.
     fn cached_project_name(&self, cwd: &str) -> Option<String> {
-        if let Some(hit) = self.project_name_cache.borrow().get(cwd) {
+        let style = self.config.ui.session_name_style;
+        let key = (style, cwd.to_owned());
+        if let Some(hit) = self.project_name_cache.borrow().get(&key) {
             return hit.clone();
         }
-        let name =
-            crate::agent_detect::project_display_name(cwd).filter(|name| !name.trim().is_empty());
+        let name = crate::agent_detect::project_display_name(cwd, style)
+            .filter(|name| !name.trim().is_empty());
         self.project_name_cache
             .borrow_mut()
-            .insert(cwd.to_owned(), name.clone());
+            .insert(key, name.clone());
         name
     }
 
@@ -5118,9 +5125,12 @@ impl eframe::App for App {
             }) {
                 ws_switch = Some(existing.id.clone());
             } else {
-                let name = crate::agent_detect::project_display_name(&path_str)
-                    .or_else(|| dir.file_name().map(|n| n.to_string_lossy().into_owned()))
-                    .unwrap_or_else(|| "workspace".to_owned());
+                let name = crate::agent_detect::project_display_name(
+                    &path_str,
+                    self.config.ui.session_name_style,
+                )
+                .or_else(|| dir.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "workspace".to_owned());
                 match self.db.create_workspace(&name) {
                     Ok(new_id) => {
                         if let Err(e) = self.db.set_workspace_path(&new_id, &path_str) {
@@ -5625,38 +5635,41 @@ mod tests {
                 "workspace.spawn.shell 1",
                 Some("/Users/jr/Desktop/Projects/deppy-sijo"),
                 &catalog,
-                crate::agent_detect::project_display_name,
+                |cwd| crate::agent_detect::project_display_name(
+                    cwd,
+                    crate::config::SessionNameStyle::Folder
+                ),
             ),
             "deppy-sijo"
         );
         // 사용자 rename은 cwd와 무관하게 그대로
         assert_eq!(
-            activity_session_name(
-                "배포 작업",
-                Some("/tmp/whatever"),
-                &catalog,
-                crate::agent_detect::project_display_name
-            ),
+            activity_session_name("배포 작업", Some("/tmp/whatever"), &catalog, |cwd| {
+                crate::agent_detect::project_display_name(
+                    cwd,
+                    crate::config::SessionNameStyle::Folder,
+                )
+            }),
             "배포 작업"
         );
         // cwd 없음/빈 값 → 기본 제목 i18n 렌더로 폴백(기존 동작)
         let fallback = ui::workspace::display_pane_title("workspace.spawn.shell 3", &catalog);
         assert_eq!(
-            activity_session_name(
-                "workspace.spawn.shell 3",
-                None,
-                &catalog,
-                crate::agent_detect::project_display_name
-            ),
+            activity_session_name("workspace.spawn.shell 3", None, &catalog, |cwd| {
+                crate::agent_detect::project_display_name(
+                    cwd,
+                    crate::config::SessionNameStyle::Folder,
+                )
+            }),
             fallback
         );
         assert_eq!(
-            activity_session_name(
-                "workspace.spawn.shell 3",
-                Some(""),
-                &catalog,
-                crate::agent_detect::project_display_name
-            ),
+            activity_session_name("workspace.spawn.shell 3", Some(""), &catalog, |cwd| {
+                crate::agent_detect::project_display_name(
+                    cwd,
+                    crate::config::SessionNameStyle::Folder,
+                )
+            }),
             fallback
         );
         // 상대경로(비정상) → 폴백
@@ -5665,7 +5678,10 @@ mod tests {
                 "workspace.spawn.shell 3",
                 Some("relative/path"),
                 &catalog,
-                crate::agent_detect::project_display_name
+                |cwd| crate::agent_detect::project_display_name(
+                    cwd,
+                    crate::config::SessionNameStyle::Folder
+                )
             ),
             fallback
         );

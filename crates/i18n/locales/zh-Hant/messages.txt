@@ -441,3 +441,7 @@ workspace.search.capped = 已達上限
 workspace.search.prev = 上一個相符 (Shift+Enter)
 workspace.search.next = 下一個相符 (Enter)
 workspace.search.close = 關閉 (Esc)
+settings.session_name_style = 工作階段位置顯示
+settings.session_name_style.hint = 如何顯示工作階段所在位置：目前（最後）資料夾名，或 git 儲存庫名。
+settings.session_name_style.folder = 目前資料夾名
+settings.session_name_style.repo = 儲存庫名

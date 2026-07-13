@@ -1186,9 +1186,9 @@ pub struct App {
     ts_detect_overwrite: bool,
     /// 웹 스냅샷 마지막 동기화 시각 — 프레임마다 구축하지 않도록 스로틀(리뷰 P2-2).
     last_web_sync: Option<std::time::Instant>,
-    /// cwd → 프로젝트 표시명 캐시. project_display_name은 .git을 상향 탐색하며 stat을
-    /// 최대 40회 호출한다 — 활동 패널/웹 스냅샷이 세션마다 부르므로 메모이즈한다.
-    /// cwd는 거의 안 바뀌고, 바뀌면 새 키로 들어온다(무효화 불필요, 유계).
+    /// cwd → 프로젝트 표시명 캐시. project_display_name이 마지막 폴더명만 쓰도록
+    /// 단순화(2026-07-13)돼 이제 순수 문자열 연산이지만, 활동 패널/웹 스냅샷이
+    /// 세션마다 부르는 호출 구조는 그대로라 메모이즈를 유지한다(무효화 불필요, 유계).
     project_name_cache: std::cell::RefCell<std::collections::HashMap<String, Option<String>>>,
     /// serve 진단/설정 1회성 스레드의 결과 수신 (진행 중일 때만 Some) — O1.
     serve_rx: Option<std::sync::mpsc::Receiver<crate::tailscale::ServeState>>,

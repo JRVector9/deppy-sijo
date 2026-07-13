@@ -445,3 +445,5 @@ settings.session_name_style = 工作階段位置顯示
 settings.session_name_style.hint = 如何顯示工作階段所在位置：目前（最後）資料夾名，或 git 儲存庫名。
 settings.session_name_style.folder = 目前資料夾名
 settings.session_name_style.repo = 儲存庫名
+settings.mono_font = 終端字型
+settings.mono_font.hint = 終端等寬字型：D2Coding（預設 — 韓文/拉丁 2:1 寬度對齊，Naver OFL）或 JetBrains Mono（僅拉丁，韓文使用系統回退）。

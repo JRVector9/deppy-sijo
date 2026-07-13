@@ -92,6 +92,7 @@ fn main() -> anyhow::Result<()> {
             fonts::install_cjk_fallback(
                 &cc.egui_ctx,
                 config.ui.ui_font.as_deref(),
+                &config.terminal.mono_font,
                 &config.terminal.mono_weight,
             );
             install_macos_menu();

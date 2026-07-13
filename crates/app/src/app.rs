@@ -1014,6 +1014,7 @@ pub struct App {
     /// 직전 프레임의 UI 폰트 설정 — 바뀌면 폰트 재등록(hot reload).
     last_ui_font: Option<String>,
     /// 터미널 모노 굵기 변경 감지용(hot reload 트리거).
+    last_mono_font: String,
     last_mono_weight: String,
     /// UI 배율 변경 감지용(zoom_factor 재적용 트리거). 첫 프레임 적용을 위해 sentinel로 시작.
     last_ui_scale: f32,
@@ -1283,6 +1284,7 @@ impl App {
             config_path,
             last_theme_dark: true,
             last_ui_font: None,
+            last_mono_font: String::new(),
             last_mono_weight: String::new(),
             last_ui_scale: -1.0,
             last_dotenv_check: std::time::Instant::now(),
@@ -3910,15 +3912,18 @@ impl eframe::App for App {
         }
         // .env 변경 폴링 fallback (사이드바 OFF 대비 — 2s 스로틀).
         self.poll_dotenv_change();
-        // UI 폰트/터미널 모노 굵기 설정 변경 hot reload — 폰트 재등록 + 렌더 캐시 무효화.
+        // UI 폰트/터미널 모노(가족·굵기) 설정 변경 hot reload — 폰트 재등록 + 렌더 캐시 무효화.
         if self.config.ui.ui_font != self.last_ui_font
+            || self.config.terminal.mono_font != self.last_mono_font
             || self.config.terminal.mono_weight != self.last_mono_weight
         {
             self.last_ui_font = self.config.ui.ui_font.clone();
+            self.last_mono_font = self.config.terminal.mono_font.clone();
             self.last_mono_weight = self.config.terminal.mono_weight.clone();
             crate::fonts::install_cjk_fallback(
                 ui.ctx(),
                 self.config.ui.ui_font.as_deref(),
+                &self.config.terminal.mono_font,
                 &self.config.terminal.mono_weight,
             );
             self.active.workspace_ui.clear_render_caches();

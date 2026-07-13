@@ -445,3 +445,5 @@ settings.session_name_style = Session location label
 settings.session_name_style.hint = How to label where a session is: the current (last) folder name, or the git repository name.
 settings.session_name_style.folder = Current folder
 settings.session_name_style.repo = Repository name
+settings.mono_font = Terminal font
+settings.mono_font.hint = Terminal mono font: D2Coding (default — Korean/Latin 2:1 width alignment, Naver OFL) or JetBrains Mono (Latin only; Hangul uses system fallback).

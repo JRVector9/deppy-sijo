@@ -445,3 +445,5 @@ settings.session_name_style = 세션 위치 표시
 settings.session_name_style.hint = 세션이 있는 폴더를 어떻게 표시할지: 현재(마지막) 폴더명 또는 git 저장소 이름.
 settings.session_name_style.folder = 현재 폴더명
 settings.session_name_style.repo = 저장소(레포) 이름
+settings.mono_font = 터미널 폰트
+settings.mono_font.hint = 터미널 모노 폰트: D2Coding(기본 — 한글·영문 2:1 폭 정합, 네이버 OFL) 또는 JetBrains Mono(라틴 전용, 한글은 시스템 폴백).

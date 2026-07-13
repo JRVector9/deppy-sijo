@@ -26,6 +26,8 @@ pub struct WorkspaceUi {
     sent_sizes: HashMap<SessionId, (u16, u16)>,
     /// 트랙패드 미세 스크롤 누적 (focused pane 기준)
     scroll_residual: f32,
+    /// 드래그 선택 오토스크롤 행 누적 — 경계 초과 속도(행/초)×dt의 소수부 보관 (T4)
+    drag_autoscroll_residual: f32,
     /// 이번 프레임에 명령을 보냈다 — 응답 이벤트 폴링을 위해 repaint 예약
     command_sent: bool,
     /// mux focused_pane 변경 추적
@@ -113,6 +115,7 @@ impl WorkspaceUi {
             preedit: String::new(),
             sent_sizes: HashMap::new(),
             scroll_residual: 0.0,
+            drag_autoscroll_residual: 0.0,
             command_sent: false,
             last_focused_pane: None,
             session_flash: HashMap::new(),
@@ -985,13 +988,64 @@ impl WorkspaceUi {
                     }
                 } else {
                     self.selection = Some((session, idx, idx));
+                    self.drag_autoscroll_residual = 0.0;
                 }
             } else if output.response.dragged()
                 && let Some(pos) = output.response.interact_pointer_pos()
                 && let Some((s, anchor, _)) = self.selection
                 && s == session
             {
+                // 드래그 중 스크롤로 도착한 새 화면은 freeze로 pending에 보관돼 있다 —
+                // 즉시 반영하고, 화면 좌표 기반 선택 앵커를 스크롤량만큼 이동시켜
+                // 같은 텍스트를 계속 가리키게 한다. 끝점은 포인터(화면 위치)를 따른다.
+                let mut anchor = anchor;
+                {
+                    let view = self.sessions.entry(session).or_default();
+                    if view.pending_snapshot.as_ref().is_some_and(|p| {
+                        (p.cols, p.rows) == (snapshot.cols, snapshot.rows)
+                            && p.scroll_offset != snapshot.scroll_offset
+                    }) && let Some(pending) = view.pending_snapshot.take()
+                    {
+                        // scroll_offset 증가(과거로) = 내용이 아래로 이동 → 앵커도 아래로
+                        let delta_rows = pending.scroll_offset - snapshot.scroll_offset;
+                        anchor = shift_selection_cell(
+                            anchor,
+                            delta_rows,
+                            snapshot.cols as usize,
+                            snapshot.rows as usize,
+                        );
+                        view.summary = last_line_summary(&pending);
+                        view.snapshot = Some(pending);
+                    }
+                }
                 self.selection = Some((session, anchor, cell_at(pos)));
+                // 포인터가 pane 세로 경계를 벗어나면 초과 거리에 비례한 속도로
+                // 오토스크롤한다 (iTerm2 관례 — T4). cell_at의 clamp가 끝점을
+                // 마지막/첫 행(좌우는 열 경계)에 붙잡아 선택이 계속 확장된다.
+                let rect = output.response.rect;
+                let rate = drag_autoscroll_rate(pos.y, rect.top(), rect.bottom(), cell.y);
+                if rate != 0.0 {
+                    // 속도(행/초)×dt 누적 → 정수 행만 전송. dt는 정지 프레임 폭주 대비 clamp.
+                    let dt = ui.input(|i| i.stable_dt).min(0.1);
+                    self.drag_autoscroll_residual += rate * dt;
+                    let step = self.drag_autoscroll_residual.trunc() as i32;
+                    if step != 0 {
+                        self.drag_autoscroll_residual -= step as f32;
+                        self.send(
+                            client,
+                            RuntimeCommand::Scroll {
+                                session,
+                                delta: step,
+                            },
+                        );
+                    }
+                    // egui는 이벤트 드리븐 — 포인터가 안 움직여도 매 프레임 이어가도록
+                    // 예약한다. 버튼 릴리즈 시 이 분기에 안 들어와 예약이 끊긴다(idle 0).
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(30));
+                } else {
+                    self.drag_autoscroll_residual = 0.0;
+                }
             } else if output.response.clicked() {
                 self.selection = None; // 단순 클릭은 선택 해제 (더블클릭 아님)
             }
@@ -1823,6 +1877,30 @@ fn selection_range_contains(start: usize, end: usize, idx: usize) -> bool {
     start <= idx && idx <= end
 }
 
+/// 드래그 선택 오토스크롤 속도(행/초, RuntimeCommand::Scroll delta 부호 —
+/// 양수=과거로). 포인터가 pane 세로 경계를 벗어난 거리에 비례해 빨라진다:
+/// 1셀 초과당 8행/초, 최대 60행/초. 경계 안이면 0 (T4).
+fn drag_autoscroll_rate(pointer_y: f32, top: f32, bottom: f32, cell_h: f32) -> f32 {
+    // 위로 벗어남 = 양수(과거로), 아래로 벗어남 = 음수(최신으로)
+    let overshoot = if pointer_y < top {
+        top - pointer_y
+    } else if pointer_y > bottom {
+        bottom - pointer_y
+    } else {
+        return 0.0;
+    };
+    (overshoot / cell_h.max(1.0) * 8.0).clamp(-60.0, 60.0)
+}
+
+/// 스크롤로 화면이 delta_rows행 이동했을 때(양수=과거로 → 내용이 아래로 이동)
+/// 화면 좌표 기반 선택 셀 인덱스를 같은 텍스트로 보정한다. 화면 밖으로 나가면
+/// 선형 경계(첫 행 첫 열 / 마지막 행 마지막 열)로 clamp — 스냅샷이 가시 영역만
+/// 담으므로 화면 밖 선택은 표현할 수 없다 (T4).
+fn shift_selection_cell(idx: usize, delta_rows: i32, cols: usize, rows: usize) -> usize {
+    let max_idx = (cols * rows).saturating_sub(1) as i64;
+    (idx as i64 + delta_rows as i64 * cols as i64).clamp(0, max_idx) as usize
+}
+
 fn terminal_text_paste_bytes(text: &str, bracketed_paste: bool) -> Vec<u8> {
     input_mapper::paste_bytes(text.as_bytes(), bracketed_paste)
 }
@@ -2477,6 +2555,35 @@ mod tests {
         assert!(selection_range_contains(3, 7, 7));
         assert!(!selection_range_contains(3, 7, 2));
         assert!(!selection_range_contains(3, 7, 8));
+    }
+
+    #[test]
+    fn 드래그_오토스크롤_속도는_초과거리_비례_부호는_scroll_delta_규약() {
+        // pane 세로 범위 [100, 500], 셀 높이 16
+        // 경계 안 → 0
+        assert_eq!(drag_autoscroll_rate(300.0, 100.0, 500.0, 16.0), 0.0);
+        assert_eq!(drag_autoscroll_rate(100.0, 100.0, 500.0, 16.0), 0.0);
+        assert_eq!(drag_autoscroll_rate(500.0, 100.0, 500.0, 16.0), 0.0);
+        // 위로 벗어남 → 양수(과거로), 1셀 초과 = 8행/초
+        assert_eq!(drag_autoscroll_rate(84.0, 100.0, 500.0, 16.0), 8.0);
+        // 아래로 벗어남 → 음수(최신으로), 조금 벗어나면 느리게
+        assert_eq!(drag_autoscroll_rate(504.0, 100.0, 500.0, 16.0), -2.0);
+        // 많이 벗어나면 빠르게, 최대 60행/초로 clamp
+        assert_eq!(drag_autoscroll_rate(2000.0, 100.0, 500.0, 16.0), -60.0);
+        assert_eq!(drag_autoscroll_rate(-2000.0, 100.0, 500.0, 16.0), 60.0);
+    }
+
+    #[test]
+    fn 드래그_오토스크롤_앵커는_스크롤량만큼_이동하고_화면_경계에서_clamp() {
+        // 10열 × 5행, 앵커 = 2행 3열(idx 23)
+        // 과거로 1행(내용 아래로 이동) → 앵커도 1행 아래
+        assert_eq!(shift_selection_cell(23, 1, 10, 5), 33);
+        // 최신으로 2행 → 앵커 2행 위
+        assert_eq!(shift_selection_cell(23, -2, 10, 5), 3);
+        // 위로 화면 밖 → 첫 행 첫 열
+        assert_eq!(shift_selection_cell(23, -5, 10, 5), 0);
+        // 아래로 화면 밖 → 마지막 행 마지막 열
+        assert_eq!(shift_selection_cell(23, 5, 10, 5), 49);
     }
 
     #[test]

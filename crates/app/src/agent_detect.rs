@@ -495,10 +495,10 @@ pub(crate) fn session_cwds(_pids: &[u32]) -> HashMap<u32, String> {
     HashMap::new()
 }
 
-/// cwd → 표시명 = **현재 폴더명(마지막 컴포넌트)**. 홈 디렉터리 자체는 "~".
-/// git 루트로 승격하던 이전 동작(2026-07-08)은 제거 — 저장소 하위 깊은 폴더
-/// (예: Crawler/printbakery)에서 작업해도 항상 루트명("Crawler")만 보여
-/// 실제 위치를 알 수 없었다(2026-07-13 사용자: 아무리 깊어도 마지막 폴더가 보여야).
+/// cwd → 표시명 = **레포 + 현재 폴더** (2026-07-13 사용자: 둘 다 보여야).
+/// git 저장소 안이면 `레포명/현재폴더`, 두 단계 이상 깊으면 가운데를 생략해
+/// `레포명/…/현재폴더` — 레포 정체성과 실제 위치가 한 줄에 유계 길이로 보인다.
+/// 레포 루트 자체면 레포명만, 저장소 밖이면 현재 폴더명, 홈 디렉터리는 "~".
 pub(crate) fn project_display_name(cwd: &str) -> Option<String> {
     let path = std::path::Path::new(cwd);
     if !path.is_absolute() {
@@ -508,7 +508,32 @@ pub(crate) fn project_display_name(cwd: &str) -> Option<String> {
     if std::env::var_os("HOME").is_some_and(|h| path == std::path::Path::new(&h)) {
         return Some("~".to_owned());
     }
-    path.file_name().map(|n| n.to_string_lossy().into_owned())
+    let leaf = path.file_name()?.to_string_lossy().into_owned();
+    // .git을 위로 탐색(최대 40단계 — 극단 경로 방어) → 저장소 루트.
+    let mut cur = path.parent();
+    let mut depth = 0usize; // cwd와 레포 루트 사이의 중간 단계 수
+    let mut steps = 0;
+    if path.join(".git").exists() {
+        return Some(leaf); // cwd가 곧 레포 루트
+    }
+    while let Some(dir) = cur {
+        if steps >= 40 {
+            break;
+        }
+        if dir.join(".git").exists() {
+            let root = dir.file_name()?.to_string_lossy();
+            return Some(if depth == 0 {
+                format!("{root}/{leaf}")
+            } else {
+                format!("{root}/…/{leaf}")
+            });
+        }
+        cur = dir.parent();
+        depth += 1;
+        steps += 1;
+    }
+    // 저장소 밖 — 현재 폴더명만.
+    Some(leaf)
 }
 
 /// 프로세스의 cwd (macOS/Unix: `lsof -p <pid> -d cwd`).
@@ -585,22 +610,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn project_display_name은_항상_마지막_폴더명() {
+    fn project_display_name은_레포와_현재폴더를_함께_보여준다() {
         let base = std::env::temp_dir().join(format!("deppy-proj-{}", std::process::id()));
         let repo = base.join("Crawler");
         let sub = repo.join("printbakery");
-        std::fs::create_dir_all(&sub).unwrap();
+        let deep = sub.join("assets").join("fonts");
+        std::fs::create_dir_all(&deep).unwrap();
         std::fs::create_dir_all(repo.join(".git")).unwrap();
-        // 저장소 하위 깊은 폴더도 **현재 폴더명** — git 루트 승격 없음 (2026-07-13).
+        // 한 단계 하위 → "레포/현재폴더" (2026-07-13: 레포도 폴더도 보여야)
         assert_eq!(
             project_display_name(sub.to_str().unwrap()),
-            Some("printbakery".to_owned())
+            Some("Crawler/printbakery".to_owned())
         );
+        // 두 단계 이상 → 가운데 생략 "레포/…/현재폴더"
+        assert_eq!(
+            project_display_name(deep.to_str().unwrap()),
+            Some("Crawler/…/fonts".to_owned())
+        );
+        // 레포 루트 자체 → 레포명만
         assert_eq!(
             project_display_name(repo.to_str().unwrap()),
             Some("Crawler".to_owned())
         );
-        // 저장소 아닌 폴더도 폴더명
+        // 저장소 아닌 폴더는 폴더명
         let plain = base.join("plainfolder");
         std::fs::create_dir_all(&plain).unwrap();
         assert_eq!(

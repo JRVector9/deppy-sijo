@@ -38,11 +38,17 @@ AI Agent Workspace with Muxed Terminal Runtime
 1. UI는 RuntimeClient만 본다.
 2. Runtime은 mux / session / env / terminal / pty를 조율한다.
    (UI가 이들을 직접 조율하지 않는다)
-3. Active pane만 render한다.
+3. Active pane만 render한다. (render = GUI paint/repaint/glyph layout)
 4. Hidden workspace/session은 log/status만 처리한다.
    (단, terminal backend의 grid state 유지는 허용 — reattach 화면 복원용.
-    render/snapshot/glyph layout은 금지. 8.2, 14.2와 일치)
+    render/glyph layout은 금지. snapshot도 금지하되 원칙 5의 원격 시청
+    lease 예외만 허용. 8.2, 14.2와 일치)
 5. Terminal snapshot(TerminalViewportSnapshot)은 visible pane에만 만든다.
+   (예외 — 원격 시청 lease, v3.3 P5: RuntimeCommand::SetRemoteViewing
+    viewing=true(TTL 갱신형, 상한 5분)가 유효한 세션은 lease 동안 visible
+    등가로 보아 hidden tab/Warm에서도 snapshot을 만들 수 있다. 허용 범위는
+    원격 전송용 snapshot 생성뿐이며, GUI repaint는 emit_gated/render_bound로
+    계속 차단한다. lease 해제·TTL 만료·세션 종료 시 hidden 정책으로 복귀한다.)
 6. Raw log 평문은 기본 저장하지 않는다. (기본은 redacted log)
 7. Session은 secret store를 직접 모른다.
    (secret은 EnvInjectionPolicy가 spawn 직전에만 resolve해서 주입)
@@ -2176,6 +2182,7 @@ Archived session:
 절대 금지:
   - 모든 workspace/pane 매 frame paint
   - hidden pane TerminalViewportSnapshot 생성
+    (예외: 원격 시청 lease 세션 — 원칙 5 예외. GUI repaint는 여전히 금지)
   - hidden tab glyph layout
   - background workspace repaint
 
@@ -2223,9 +2230,10 @@ queue pressure 발생 시:
 
 ```text
 - Active workspace만 full render 대상이다.
-- Warm/Suspended workspace는 terminal renderer와 snapshot을 만들지 않는다.
-- RunningHidden session의 PTY output은 terminal grid state update / redacted log / status detector로만 전달한다 (render/snapshot 금지).
-- Hidden session은 TerminalViewportSnapshot 생성을 금지한다.
+- Warm/Suspended workspace는 terminal renderer와 snapshot을 만들지 않는다
+  (원격 시청 lease 세션의 원격 전송용 snapshot만 예외 — 원칙 5 예외).
+- RunningHidden session의 PTY output은 terminal grid state update / redacted log / status detector로만 전달한다 (render/snapshot 금지 — snapshot은 원격 시청 lease 예외).
+- Hidden session은 TerminalViewportSnapshot 생성을 금지한다 (원격 시청 lease 예외).
 - 오래 hidden 상태인 session은 terminal backend render cache를 drop할 수 있다.
 - Exited/Archived session은 terminal backend를 drop하고 logs/index만 유지한다.
 - 모든 output queue는 bounded channel로 제한한다.

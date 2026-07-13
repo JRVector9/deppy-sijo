@@ -224,6 +224,71 @@ pub fn write_env_var(root: &std::path::Path, key: &str, value: Option<&str>) -> 
     Ok(())
 }
 
+/// 레거시(비-dotenv) profile 변수를 `.env` 파일로 이전한다 (.env 일원화 — 2026-07-13 E1).
+///
+/// 과거 UI는 프로젝트 경로 없이도 DB 전용 profile(kind="local")에 변수를 받았고, 그
+/// 변수는 셸 주입도 .env 기록도 되지 않는 유령 상태였다(binjari 사고). 경로가 지정된
+/// 워크스페이스의 force 동기화 시 이 함수가 남은 레거시 변수를 .env로 옮기고 profile을
+/// 정리한다 — 이후 sync가 파일 기준으로 dotenv profile을 재구성한다(.env가 진실).
+///
+/// best-effort: secret의 keyring resolve가 실패하면 그 키만 남기고 계속한다(값 유실
+/// 방지 — 다음 force 동기화가 재시도). UI가 만든 credential은 참조만 사라지고 자격증명
+/// 목록에 보존된다(remove_workspace_dotenv의 provider="env" 전용 삭제 관례와 구분).
+pub fn migrate_legacy_profiles_to_dotenv(
+    db: &mut Db,
+    secret_store: &dyn secret::SecretStore,
+    workspace_id: &str,
+    root: &Path,
+) -> anyhow::Result<usize> {
+    let legacy: Vec<_> = db
+        .list_env_profiles(workspace_id)?
+        .into_iter()
+        .filter(|p| p.kind != DOTENV_PROFILE_KIND)
+        .collect();
+    if legacy.is_empty() {
+        return Ok(0);
+    }
+    let mut migrated = 0usize;
+    for profile in &legacy {
+        let vars = db.list_env_vars(&profile.id)?;
+        let mut remaining = vars.len();
+        for var in &vars {
+            let value = match &var.value {
+                EnvValue::Plain(v) => v.clone(),
+                EnvValue::Secret { credential_id } => {
+                    match secret_store.get_secret(credential_id) {
+                        Ok(secret) => secret.expose().to_owned(),
+                        Err(e) => {
+                            tracing::warn!(
+                                key = var.key,
+                                "레거시 env 이전 — keyring resolve 실패, 보류: {e:#}"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            };
+            if let Err(e) = write_env_var(root, &var.key, Some(&value)) {
+                tracing::warn!(
+                    key = var.key,
+                    "레거시 env 이전 — .env 기록 실패, 보류: {e:#}"
+                );
+                continue;
+            }
+            db.delete_env_var(&profile.id, &var.key)?;
+            migrated += 1;
+            remaining -= 1;
+        }
+        if remaining == 0 {
+            db.delete_env_profile(&profile.id)?;
+        }
+    }
+    if migrated > 0 {
+        tracing::info!(migrated, "레거시 env profile → .env 이전 완료");
+    }
+    Ok(migrated)
+}
+
 /// 프로젝트 폴더 **해제** 시 dotenv 자동 profile을 통째로 정리한다(2026-07-10):
 /// 변수 → 전용 credential(참조 없을 때만) → keyring → profile 순. `.env` 파일이
 /// 원본이므로 재지정 시 그대로 복구된다 — 해제했는데 키가 화면에 남는 문제 해결.
@@ -643,6 +708,93 @@ INVALID LINE
                 .is_none()
         );
         assert_eq!(db.list_env_vars(&profile.id).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 레거시_profile_변수는_env_파일로_이전되고_resolve_실패는_보류된다() {
+        use secret::SecretStore as _;
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-dotenv-migrate-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut db = Db::open(&dir.join("test.db")).unwrap();
+        let store = MemStore(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let ws = db.create_workspace("legacy").unwrap();
+
+        // 과거 UI가 만들던 DB 전용 profile: plain 1 + secret 2(하나는 keyring 값 없음).
+        let legacy = db.insert_env_profile(&ws, "default", "local").unwrap();
+        db.upsert_env_var(&legacy, "GREETING", &EnvValue::Plain("hello".into()))
+            .unwrap();
+        for (key, cred, seed) in [
+            ("KTX_PASSWORD", "cred-ok", true),
+            ("LOST_TOKEN", "cred-gone", false),
+        ] {
+            db.insert_credential(&crate::storage::CredentialMeta {
+                id: cred.to_owned(),
+                provider: "custom".to_owned(),
+                label: key.to_owned(),
+                credential_kind: "api_key".to_owned(),
+                masked_hint: None,
+                workspace_id: Some(ws.clone()),
+            })
+            .unwrap();
+            if seed {
+                store
+                    .set_secret(cred, &secret::SecretString::new("pw-1234".to_owned()))
+                    .unwrap();
+            }
+            db.upsert_env_var(
+                &legacy,
+                key,
+                &EnvValue::Secret {
+                    credential_id: cred.to_owned(),
+                },
+            )
+            .unwrap();
+        }
+
+        let migrated = migrate_legacy_profiles_to_dotenv(&mut db, &store, &ws, &dir).unwrap();
+        assert_eq!(migrated, 2, "plain + resolve 가능한 secret만 이전");
+        let env = std::fs::read_to_string(dir.join(".env")).unwrap();
+        assert!(env.contains("GREETING=hello"), "{env}");
+        assert!(env.contains("KTX_PASSWORD=pw-1234"), "{env}");
+        assert!(
+            !env.contains("LOST_TOKEN"),
+            "resolve 실패 키는 파일에 없음: {env}"
+        );
+        // resolve 실패 키는 legacy profile에 보류(값 유실 방지 — 다음 force가 재시도).
+        let remaining = db.list_env_vars(&legacy).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].key, "LOST_TOKEN");
+        assert!(
+            db.list_env_profiles(&ws)
+                .unwrap()
+                .iter()
+                .any(|p| p.id == legacy),
+            "빈 profile만 삭제 — 보류 키가 있으면 유지"
+        );
+
+        // 보류 키의 keyring 값이 복구되면 다음 이전에서 마저 옮기고 profile을 정리한다.
+        store
+            .set_secret("cred-gone", &secret::SecretString::new("tok-9".to_owned()))
+            .unwrap();
+        let migrated = migrate_legacy_profiles_to_dotenv(&mut db, &store, &ws, &dir).unwrap();
+        assert_eq!(migrated, 1);
+        assert!(
+            std::fs::read_to_string(dir.join(".env"))
+                .unwrap()
+                .contains("LOST_TOKEN=tok-9")
+        );
+        assert!(
+            !db.list_env_profiles(&ws)
+                .unwrap()
+                .iter()
+                .any(|p| p.kind != DOTENV_PROFILE_KIND),
+            "레거시 profile 정리됨"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

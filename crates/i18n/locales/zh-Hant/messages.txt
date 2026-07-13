@@ -425,3 +425,5 @@ env.var_delete_confirm.body_dotenv = 刪除 '{key}' 嗎？.env 檔案中的對�
 env.var_delete_confirm.body = 刪除變數 '{key}' 嗎？
 credentials.delete_confirm.title = 刪除 API 金鑰
 credentials.delete_confirm.body = 刪除 '{name}' 嗎？鑰匙圈中儲存的密鑰也會一併刪除。
+env.no_project_path_note = 環境變數保存在專案資料夾的 .env 檔案中。請先指定專案資料夾。
+env.legacy_pending_note = 舊方式（DB）殘留的變數 — 指定專案資料夾後將自動遷移到 .env 檔案。

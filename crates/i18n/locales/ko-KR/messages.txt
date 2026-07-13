@@ -429,3 +429,5 @@ env.no_project_path_note = 환경변수는 프로젝트 폴더의 .env 파일에
 env.legacy_pending_note = 이전 방식(DB)에 남은 변수입니다 — 프로젝트 폴더가 지정되면 .env 파일로 자동 이전됩니다.
 workspace.alias_hint = 별칭을 입력합니다 — 표시 이름은 항상 "폴더명 (별칭)"입니다. 비우면 폴더명만 표시됩니다.
 workspace.open_environment = 환경변수·API 설정…
+env.live_reload = .env 라이브 반영 (실험적)
+env.live_reload_hint = 켜면 deppy 셸(zsh)이 다음 프롬프트마다 .env 변경을 감지해 이미 떠 있는 셸에도 다시 export합니다. 끄면 새 세션부터만 적용됩니다. 새로 여는 셸부터 동작합니다.

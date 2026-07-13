@@ -429,3 +429,5 @@ env.no_project_path_note = 環境変数はプロジェクトフォルダの .env
 env.legacy_pending_note = 旧方式（DB）に残った変数です — プロジェクトフォルダを指定すると .env ファイルへ自動移行されます。
 workspace.alias_hint = 別名を設定します — 表示名は常に「フォルダ名 (別名)」です。空にするとフォルダ名のみ表示されます。
 workspace.open_environment = 環境変数・API 設定…
+env.live_reload = .env ライブ反映（実験的）
+env.live_reload_hint = オンにすると deppy シェル（zsh）が次のプロンプトで .env の変更を検知し、起動中のシェルにも再 export します。オフの場合は新しいセッションからのみ適用されます。新しく開くシェルから有効です。

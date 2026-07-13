@@ -84,6 +84,10 @@ pub struct UiConfig {
     /// deppy hook을 넣어 승인/입력 대기를 정확히 감지. OFF면 제거(regex fallback만).
     #[serde(default = "default_true")]
     pub agent_status_hooks: bool,
+    /// .env 라이브 반영 (E5 ⑨, 옵트인): deppy 셸(zsh)에 precmd 훅을 주입해 .env
+    /// 변경을 이미 떠 있는 셸에도 다음 프롬프트부터 반영한다. OFF면 새 세션부터만.
+    #[serde(default)]
+    pub env_live_reload: bool,
     /// 다음 실행 때 다시 열 마지막 활성 workspace. 삭제되었거나 없으면 default workspace로 대체.
     pub last_workspace_id: Option<String>,
     /// UI(Proportional) 폰트 파일 경로. None = 기본(자동 — macOS는 Apple SD Gothic Neo).
@@ -112,6 +116,7 @@ impl Default for UiConfig {
             file_tree_enabled: true,
             auto_resume_agents: true,
             agent_status_hooks: true,
+            env_live_reload: false,
             last_workspace_id: None,
             ui_font: None,
             ui_scale: 1.0,

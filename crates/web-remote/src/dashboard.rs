@@ -232,12 +232,16 @@ fn status_str(status: SessionStatus) -> &'static str {
 /// 대시보드 범위는 **활성 workspace worker의 세션**이다(계획 P2 미결정: 비활성 workspace
 /// 메타데이터는 후속). MuxUpdated가 세션 집합의 근거(pane에 붙은 것만 유지), 상태 이벤트가
 /// 상태를 덮는다. 종료된 세션도 pane이 남아 있는 동안은(완료 배지) 목록에 둔다.
+///
+/// 반환값 = Dashboard 프레임 내용이 바뀌었을 수 있는가. Viewport/PtyInputPressure처럼
+/// 대시보드 비범위 이벤트는 false — run()이 이 값으로 Dashboard JSON 재구축을 게이트해
+/// 시청 스트리밍 중(초당 수십 회 Viewport wake) 불필요한 직렬화를 건너뛴다 (PR-F1).
 fn apply_event(
     sessions: &mut BTreeMap<u64, SessionEntry>,
     resource: &mut Option<ResourceView>,
     ids: &mut IdMap,
     event: &RuntimeEvent,
-) {
+) -> bool {
     match event {
         RuntimeEvent::MuxUpdated { snapshot } => {
             // 영속 UUID ↔ worker-로컬 u64 매핑 갱신 — 스냅샷이 진실의 원천이다 (I1).
@@ -267,27 +271,33 @@ fn apply_event(
             for id in live {
                 sessions.entry(id).or_insert_with(new_entry);
             }
+            true
         }
         RuntimeEvent::SessionStatusChanged { session, status } => {
             sessions.entry(session.0).or_insert_with(new_entry).status = *status;
+            true
         }
         RuntimeEvent::SessionStatusViewChanged { session, view } => {
             sessions.entry(session.0).or_insert_with(new_entry).status = view.status;
+            true
         }
         RuntimeEvent::SessionExited { session, .. }
         | RuntimeEvent::SessionRestored { session, .. } => {
             let entry = sessions.entry(session.0).or_insert_with(new_entry);
             entry.exited = true;
             entry.status = SessionStatus::Done;
+            true
         }
         RuntimeEvent::ShellSpawned { session } | RuntimeEvent::AgentSpawned { session } => {
             sessions.entry(session.0).or_insert_with(new_entry);
+            true
         }
         RuntimeEvent::ResourceUsage { snapshot, .. } => {
             *resource = Some(resource_view(snapshot));
+            true
         }
         // Viewport(터미널 뷰어=P5)·PtyInputPressure·SpawnFailed 등은 대시보드 비범위.
-        _ => {}
+        _ => false,
     }
 }
 
@@ -408,6 +418,11 @@ fn workspace_views(
 struct Inner {
     /// 새 이벤트/명령 도착 플래그(웨이크가 세운다).
     dirty: bool,
+    /// Dashboard 프레임 재구축 필요 플래그 (PR-F1). wake는 dirty만 세우고, 대시보드
+    /// 내용이 바뀌는 경로(apply_event 관련 이벤트·워크스페이스/notice/시드 setter·접속
+    /// 등록)만 이 플래그를 세운다 — 시청 스트리밍의 Viewport wake가 매번 Dashboard
+    /// JSON을 재직렬화하지 않게 한다.
+    dashboard_dirty: bool,
     /// 접속 등록/resolve 직후 즉시 1회 폴링을 강제한다(주기와 무관).
     force_poll: bool,
     /// 활성 workspace worker 구독. 전환 시 [`DashboardHandle::set_runtime_source`]가 교체한다.
@@ -470,6 +485,8 @@ struct Shared {
     stop: AtomicBool,
     /// 승인 DB 폴링 횟수(테스트: 접속 0에서 폴링 정지 검증).
     poll_count: AtomicU64,
+    /// Dashboard JSON 재구축 횟수(테스트: Viewport wake만으로는 늘지 않음 검증 — PR-F1).
+    dash_build_count: AtomicU64,
 }
 
 /// 브리지 핸들(복제 가능 — 서버·접속 스레드가 공유). Drop 순서 위험을 피하려 wake 클로저는
@@ -509,6 +526,7 @@ impl DashboardHandle {
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
                 dirty: false,
+                dashboard_dirty: false,
                 force_poll: false,
                 receiver: None,
                 sessions: BTreeMap::new(),
@@ -529,6 +547,7 @@ impl DashboardHandle {
             connections: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
             poll_count: AtomicU64::new(0),
+            dash_build_count: AtomicU64::new(0),
         });
         // wake는 Weak만 — 죽은 구독 정리를 막지 않는다(위 주석). 접속 0이어도 세워 두어야
         // 이벤트 drain으로 durable 큐 overflow를 막는다(연결 시 콜드스타트 회피).
@@ -575,6 +594,7 @@ impl DashboardHandle {
             let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
             inner.receiver = Some(receiver);
             inner.dirty = true;
+            inner.dashboard_dirty = true;
             Self::clear_watch_state(&mut inner, &self.shared);
         }
         self.shared.cvar.notify_all();
@@ -626,6 +646,8 @@ impl DashboardHandle {
             }
             inner.notice = notice;
             inner.dirty = true;
+            // None(TTL 만료 해제) 포함 — 안 세우면 배너가 폰에서 내려가지 않는다 (PR-F1).
+            inner.dashboard_dirty = true;
         }
         self.shared.cvar.notify_all();
     }
@@ -815,6 +837,7 @@ impl DashboardHandle {
             }
             inner.workspaces = seeds;
             inner.dirty = true;
+            inner.dashboard_dirty = true;
         }
         self.shared.cvar.notify_all();
     }
@@ -841,6 +864,7 @@ impl DashboardHandle {
                 })
                 .collect();
             inner.dirty = true;
+            inner.dashboard_dirty = true;
         }
         self.shared.cvar.notify_all();
     }
@@ -852,6 +876,9 @@ impl DashboardHandle {
             let mut inner = self.shared.inner.lock().expect("dashboard inner lock");
             inner.force_poll = true;
             inner.dirty = true;
+            // 첫 접속(접속 0 구간)에는 발행을 건너뛰므로, 등록 시점에 최신 Dashboard를
+            // 반드시 한 번 만들어 Welcome 직후 첫 프레임이 나가게 한다 (PR-F1).
+            inner.dashboard_dirty = true;
         }
         self.shared.cvar.notify_all();
         ConnectionGuard {
@@ -915,6 +942,11 @@ impl DashboardHandle {
         self.shared.poll_count.load(Ordering::SeqCst)
     }
 
+    /// 지금까지의 Dashboard JSON 재구축 횟수(테스트 — PR-F1 게이트 검증).
+    pub fn dash_build_count(&self) -> u64 {
+        self.shared.dash_build_count.load(Ordering::SeqCst)
+    }
+
     /// 브리지 스레드에 종료를 알린다(서버 shutdown이 join 전에 호출).
     pub fn stop(&self) {
         self.shared.stop.store(true, Ordering::SeqCst);
@@ -936,7 +968,7 @@ impl DashboardHandle {
                 ids,
                 ..
             } = &mut *inner;
-            apply_event(sessions, resource, ids, &event);
+            let relevant = apply_event(sessions, resource, ids, &event);
             // 실경로(run)와 동일하게 inner 임계구역 안에서 published를 중첩 취득해
             // 슬롯을 반영한다 (P5 리뷰 ②-P1 — 락 순서 inner→published). 키는 UUID (I1).
             if let RuntimeEvent::Viewport {
@@ -958,6 +990,8 @@ impl DashboardHandle {
                 entry.1 = Arc::clone(snapshot);
             }
             inner.dirty = true;
+            // 실경로(run)와 동일 게이트 — 대시보드 관련 이벤트만 재구축을 켠다 (PR-F1).
+            inner.dashboard_dirty |= relevant;
         }
         self.shared.cvar.notify_all();
     }
@@ -1016,6 +1050,9 @@ fn run(shared: &Arc<Shared>) {
             }
         }
         inner.dirty = false;
+        // Dashboard 재구축 게이트 (PR-F1) — setter/등록이 세운 플래그를 이번 회차로 가져오고,
+        // drain 중 대시보드 관련 이벤트(apply_event=true)가 있으면 함께 켠다.
+        let mut rebuild_dashboard = std::mem::take(&mut inner.dashboard_dirty);
 
         // 1) 런타임 이벤트 drain — 접속 유무와 무관하게 처리해 durable 큐 overflow를 막는다.
         //    시청 중 세션의 Viewport/입력압박은 스테이징해 두었다가 슬롯에 반영한다
@@ -1040,7 +1077,7 @@ fn run(shared: &Arc<Shared>) {
                 ..
             } = &mut *inner;
             for event in &events {
-                apply_event(sessions, resource, ids, event);
+                rebuild_dashboard |= apply_event(sessions, resource, ids, event);
                 // 세션 상태 전이(입력대기/완료)를 웹푸시로 넘긴다 — 앱이 닫혀 있어도 알린다(P4).
                 // notify_session이 Done/Waiting 외 상태는 무시하므로 여기서는 걸러내지 않는다.
                 if let Some(push) = push_sink.as_ref() {
@@ -1144,16 +1181,27 @@ fn run(shared: &Arc<Shared>) {
 
         // 3) 발행 — 접속 0이면 JSON을 만들지 않는다(불필요 작업 회피). 접속 시 등록이
         //    force_poll+dirty를 세우므로 그때 최신 스냅샷이 만들어진다.
+        //    Dashboard JSON은 재구축 게이트가 켜졌거나 승인 폴링 회차일 때만 다시 만든다
+        //    (PR-F1) — Viewport wake만으로는 직렬화/비교를 돌지 않는다.
         if conns > 0 {
-            let dash_json = ServerMsg::Dashboard {
-                workspaces: workspace_views(&inner.workspaces, &inner.sessions, &inner.ids),
-                resource: inner.resource.clone(),
-                notice: inner.notice.clone(),
-            }
-            .encode();
+            let dash_json = (rebuild_dashboard || should_poll).then(|| {
+                shared.dash_build_count.fetch_add(1, Ordering::SeqCst);
+                ServerMsg::Dashboard {
+                    workspaces: workspace_views(&inner.workspaces, &inner.sessions, &inner.ids),
+                    resource: inner.resource.clone(),
+                    notice: inner.notice.clone(),
+                }
+                .encode()
+            });
             let appr_json = approvals.map(|pending| ServerMsg::Approvals { pending }.encode());
             drop(inner);
             publish(shared, dash_json, appr_json);
+        } else if rebuild_dashboard {
+            // 접속 0 — 발행은 생략하되 재구축 필요는 보존해, 다음 접속 등록 회차에
+            // 이번 변화가 반영된 프레임이 만들어지게 한다 (register_connection도 세우지만
+            // 등록과 이 회차가 경합해도 유실되지 않게 되돌려 둔다).
+            inner.dashboard_dirty = true;
+            drop(inner);
         } else {
             drop(inner);
         }
@@ -1161,9 +1209,12 @@ fn run(shared: &Arc<Shared>) {
 }
 
 /// 발행 스냅샷을 갱신한다 — 내용이 바뀐 것만 버전을 올려 접속 스레드가 재전송하게 한다.
-fn publish(shared: &Arc<Shared>, dashboard_json: String, approvals_json: Option<String>) {
+/// `dashboard_json`은 재구축 게이트가 켜진 회차에만 Some이다 (PR-F1).
+fn publish(shared: &Arc<Shared>, dashboard_json: Option<String>, approvals_json: Option<String>) {
     let mut published = shared.published.lock().expect("published lock");
-    if published.dashboard_json != dashboard_json {
+    if let Some(dashboard_json) = dashboard_json
+        && published.dashboard_json != dashboard_json
+    {
         published.dashboard_json = dashboard_json;
         published.dash_version += 1;
     }
@@ -1568,6 +1619,61 @@ mod tests {
         // 마지막 시청자 이탈 → 슬롯 제거 (trailing 스냅샷 없음)
         handle.rebind_watch(Some(&test_uuid(7)), None);
         assert!(handle.viewport_if_newer(&test_uuid(7), 0).is_none());
+        handle.stop();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn viewport_wake만으로는_dashboard를_재구축하지_않는다() {
+        // PR-F1 게이트: 시청 스트리밍의 Viewport 이벤트는 화면 슬롯만 갱신하고,
+        // Dashboard JSON 재구축(직렬화+비교)은 대시보드 관련 변화가 있을 때만 돈다.
+        let (handle, thread) = DashboardHandle::spawn(None);
+        let _conn = handle.register_connection();
+        seed_ids(&handle, &[7]);
+        handle.rebind_watch(None, Some(&test_uuid(7)));
+        // 등록이 켠 초기 재구축이 소진될 때까지 대기 (첫 Dashboard 프레임 발행 확인).
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while handle.dashboard_if_newer(0).is_none() {
+            assert!(Instant::now() < deadline, "초기 Dashboard 미발행");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(30));
+        let base_builds = handle.dash_build_count();
+
+        // Viewport만 반복 주입 — 슬롯 seq는 증가하고 재구축 횟수는 그대로여야 한다.
+        // (등록 시 force_poll이 소진된 뒤라, 다음 승인 폴링 만기(1s)는 이 구간 밖이다.)
+        for _ in 0..5 {
+            handle.inject_event(viewport_event(7));
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some((seq, _)) = handle.viewport_if_newer(&test_uuid(7), 0)
+                && seq >= 5
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "viewport 슬롯 미갱신");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            handle.dash_build_count(),
+            base_builds,
+            "Viewport wake가 Dashboard 재구축을 유발함 (PR-F1 게이트 회귀)"
+        );
+
+        // 대시보드 관련 이벤트(상태 변화)는 재구축을 켠다.
+        handle.inject_event(RuntimeEvent::SessionStatusChanged {
+            session: SessionId(7),
+            status: SessionStatus::NeedsApproval,
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while handle.dash_build_count() == base_builds {
+            assert!(
+                Instant::now() < deadline,
+                "상태 이벤트가 재구축을 켜지 않음"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         handle.stop();
         thread.join().unwrap();
     }

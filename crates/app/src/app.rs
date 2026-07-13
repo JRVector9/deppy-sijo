@@ -2644,6 +2644,7 @@ impl App {
                     tracing::warn!("터미널 글꼴 크기 저장 실패: {error:#}");
                 }
             }
+            A::TerminalSearch => self.active.workspace_ui.open_search(),
             A::ClearRenderCaches => {
                 self.active.workspace_ui.clear_render_caches();
                 for runtime in self.warm.values_mut() {

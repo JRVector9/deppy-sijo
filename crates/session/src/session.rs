@@ -307,6 +307,15 @@ impl Session {
         self.backend.screen_text()
     }
 
+    /// scrollback+화면 전체 텍스트 검색 (T3) — backend에 위임한다.
+    pub fn search_scrollback(
+        &self,
+        query: &str,
+        max_matches: usize,
+    ) -> terminal::ScrollbackSearchResult {
+        self.backend.search_scrollback(query, max_matches)
+    }
+
     /// 이전 실행의 redacted ANSI 로그를 같은 terminal parser에 다시 통과시켜
     /// scrollback과 셀 색상을 복원한다. 로그는 chunk 단위로 읽으므로 큰 세션도
     /// 파일 전체를 메모리에 올리지 않는다. 재생 중 생기는 터미널 질의 응답은 과거

@@ -36,9 +36,10 @@ pub fn new_default_backend(
     Box::new(AlacrittyBackend::new(cols, rows, scrollback_lines))
 }
 pub use backend::{
-    TERMINAL_GLOBAL_CACHE_BUDGET_BYTES, TerminalBackend, TerminalCacheBudget, TerminalCacheClass,
-    TerminalCacheEvent, TerminalCacheEventKind, TerminalCacheFootprint,
-    TerminalExternalSurfaceHandle, TerminalRenderModel,
+    ScrollbackMatch, ScrollbackSearchResult, TERMINAL_GLOBAL_CACHE_BUDGET_BYTES, TerminalBackend,
+    TerminalCacheBudget, TerminalCacheClass, TerminalCacheEvent, TerminalCacheEventKind,
+    TerminalCacheFootprint, TerminalExternalSurfaceHandle, TerminalRenderModel, fold_char,
+    substring_matches,
 };
 pub use change_set::TerminalChangeSet;
 pub use viewport_snapshot::{

@@ -30,7 +30,10 @@ pub(crate) const PROTO_MAGIC: [u8; 4] = *b"DPRT";
 /// **구조체 필드 추가는 기존 메시지(MuxUpdated)의 바이트를 바꾸므로** 버전을 올려야 한다 —
 /// postcard 구조체는 태그 없는 순차 인코딩이다. hello가 정확 일치만 허용하므로 구버전
 /// 피어는 조용한 오해독 대신 접속 단계에서 거부된다.
-pub(crate) const PROTO_VERSION: u16 = 6;
+/// **v7 (T3)**: SearchScrollback 명령 + ScrollbackSearchResult 이벤트를 enum 끝에 append.
+/// variant append만으로는 기존 바이트가 안 바뀌지만, 구버전 피어가 새 variant를 스트림에서
+/// 만나면 오해독하므로 handshake 거부를 위해 버전을 올린다.
+pub(crate) const PROTO_VERSION: u16 = 7;
 
 /// delta viewport 스트리밍 기능 비트 (§3.1).
 pub(crate) const FEAT_DELTA_VIEWPORT: u32 = 1 << 0;

@@ -68,6 +68,34 @@ pub struct WorkspaceUi {
     /// 현재 error 배너가 input backpressure 경고인지 — 해소 이벤트(queued=0)가
     /// 무관한 오류(spawn 실패 등)를 지우지 않게 구분한다(codex 2026-07-09).
     error_is_pressure: bool,
+    /// 터미널 텍스트 검색 상태 (T3). Cmd+F로 열리고, 열려 있으면 focused pane 우상단에
+    /// 검색 바를 그린다. 한 번에 한 세션만 검색한다.
+    search: Option<TerminalSearch>,
+}
+
+/// 터미널 검색 매치 수 상한 (T3) — worker에 보내는 요청 상한. 도달 시 결과가 잘린다.
+const SEARCH_MAX_MATCHES: u32 = 1000;
+
+/// 터미널 텍스트 검색 세션 상태 (T3).
+struct TerminalSearch {
+    /// 검색 대상 세션 — 이 세션의 pane에만 검색 바를 그린다.
+    session: SessionId,
+    /// 현재 입력된 쿼리.
+    query: String,
+    /// worker에 마지막으로 요청한 쿼리 — 바뀔 때만 재검색한다(매 프레임 재검색 금지).
+    requested: Option<String>,
+    /// 최근 검색 결과(화면 최하단 우선 정렬).
+    matches: Vec<terminal::ScrollbackMatch>,
+    /// 검색 시점의 전체 라인 수 — 스크롤 목표 클램프에 쓴다.
+    total_lines: u32,
+    /// 매치 상한 도달로 결과가 잘렸는지.
+    capped: bool,
+    /// 현재 매치 인덱스(0 = 최신). matches가 비면 무의미.
+    current: usize,
+    /// 이번 프레임에 입력창 포커스를 요청해야 하는지.
+    focus_input: bool,
+    /// 다음 렌더에서 current 매치가 화면에 보이도록 스크롤해야 하는지.
+    scroll_to_current: bool,
 }
 
 /// 백그라운드 paste 1건의 컨텍스트 — 요청 시점의 세션/모드를 캡처해 완료 시 그대로 쓴다.
@@ -129,6 +157,255 @@ impl WorkspaceUi {
             paste_task: None,
             error: None,
             error_is_pressure: false,
+            search: None,
+        }
+    }
+
+    /// Cmd+F 등으로 focused 터미널에서 검색 바를 연다 (T3). 이미 같은 세션에 열려 있으면
+    /// 입력창 포커스만 다시 준다. focused pane에 세션이 없으면 무시한다.
+    pub fn open_search(&mut self) {
+        let Some(session) = self.focused_session() else {
+            return;
+        };
+        match &mut self.search {
+            Some(search) if search.session == session => {
+                search.focus_input = true;
+            }
+            _ => {
+                self.search = Some(TerminalSearch {
+                    session,
+                    query: String::new(),
+                    requested: None,
+                    matches: Vec::new(),
+                    total_lines: 0,
+                    capped: false,
+                    current: 0,
+                    focus_input: true,
+                    scroll_to_current: false,
+                });
+            }
+        }
+    }
+
+    /// 검색 바를 닫고 원래 터미널로 포커스를 되돌린다 (T3).
+    fn close_search(&mut self) {
+        self.search = None;
+        // 실제 refocus는 다음 프레임 render_pane에서 pending_focus로 소비된다.
+        self.pending_focus = self.mux.as_ref().and_then(|mux| mux.focused_pane.clone());
+    }
+
+    /// 터미널 검색 UI (T3): 뷰포트에 보이는 매치 하이라이트 + 우상단 검색 바 + 이동 스크롤.
+    /// 검색은 backend(worker)가 수행하고, UI는 결과(라인 오프셋)를 받아 그리고 이동만 한다.
+    #[allow(clippy::too_many_arguments)]
+    fn render_terminal_search(
+        &mut self,
+        ui: &mut egui::Ui,
+        session: SessionId,
+        term_rect: egui::Rect,
+        origin: egui::Pos2,
+        cell_size: egui::Vec2,
+        snapshot: &TerminalViewportSnapshot,
+        client: &dyn RuntimeClient,
+        catalog: &i18n::Catalog,
+    ) {
+        // 이 pane의 세션에 대한 검색만 그린다.
+        if self.search.as_ref().map(|s| s.session) != Some(session) {
+            return;
+        }
+
+        // 1) 뷰포트에 보이는 매치 하이라이트. 뷰포트 행 = scroll_offset + rows-1 - line_from_bottom
+        //    (total_lines와 무관 — 현재 스냅샷 스크롤 위치만으로 매핑된다).
+        if let Some(search) = self.search.as_ref() {
+            let rows = snapshot.rows as i32;
+            let normal = egui::Color32::from_rgba_unmultiplied(0xE5, 0xC0, 0x7B, 70);
+            let current = egui::Color32::from_rgba_unmultiplied(0xF2, 0x8C, 0x28, 140);
+            for (i, m) in search.matches.iter().enumerate() {
+                let vrow = snapshot.scroll_offset + rows - 1 - m.line_from_bottom as i32;
+                if vrow < 0 || vrow >= rows {
+                    continue;
+                }
+                let x0 = origin.x + m.col_start as f32 * cell_size.x;
+                let x1 = origin.x + m.col_end as f32 * cell_size.x;
+                let y0 = origin.y + vrow as f32 * cell_size.y;
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(x0, y0),
+                    egui::vec2((x1 - x0).max(cell_size.x), cell_size.y),
+                );
+                let color = if i == search.current { current } else { normal };
+                ui.painter().rect_filled(rect, 0.0, color);
+            }
+        }
+
+        // 2) current 매치가 화면에 보이도록 스크롤(Scroll delta 양수 = 과거로 = display_offset↑).
+        let scroll_delta = {
+            let Some(search) = self.search.as_mut() else {
+                return;
+            };
+            if search.scroll_to_current {
+                search.scroll_to_current = false;
+                search.matches.get(search.current).and_then(|m| {
+                    let rows = snapshot.rows as i32;
+                    let total = search.total_lines as i32;
+                    let b = m.line_from_bottom as i32;
+                    // 매치를 화면 중앙 근처에 두되, 유효 범위 [0, history]로 클램프.
+                    let desired = (b - rows / 2).clamp(0, (total - rows).max(0));
+                    let delta = desired - snapshot.scroll_offset;
+                    (delta != 0).then_some(delta)
+                })
+            } else {
+                None
+            }
+        };
+        if let Some(delta) = scroll_delta {
+            self.send(client, RuntimeCommand::Scroll { session, delta });
+        }
+
+        // 3) 우상단 검색 바.
+        let (mut query, focus_input, match_count, current, capped) = {
+            let Some(search) = self.search.as_ref() else {
+                return;
+            };
+            (
+                search.query.clone(),
+                search.focus_input,
+                search.matches.len(),
+                search.current,
+                search.capped,
+            )
+        };
+        let mut do_next = false;
+        let mut do_prev = false;
+        let mut do_close = false;
+
+        let bar_width = 280.0;
+        let pos = egui::pos2(
+            (term_rect.right() - bar_width - 8.0).max(term_rect.left() + 4.0),
+            term_rect.top() + 8.0,
+        );
+        egui::Area::new(egui::Id::new(("terminal_search", session)))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .constrain_to(term_rect)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_width(bar_width);
+                    ui.horizontal(|ui| {
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut query)
+                                .desired_width(120.0)
+                                .hint_text(catalog.t("workspace.search.hint", &[])),
+                        );
+                        if focus_input {
+                            resp.request_focus();
+                        }
+                        // 매치 카운트 n/m (쿼리 없으면 공백, 매치 없으면 "없음").
+                        let label = if query.trim().is_empty() {
+                            String::new()
+                        } else if match_count == 0 {
+                            catalog.t("workspace.search.no_match", &[])
+                        } else {
+                            format!("{}/{}", current + 1, match_count)
+                        };
+                        ui.label(label);
+                        if capped {
+                            ui.label(catalog.t("workspace.search.capped", &[]));
+                        }
+                        if ui
+                            .button("‹")
+                            .on_hover_text(catalog.t("workspace.search.prev", &[]))
+                            .clicked()
+                        {
+                            do_prev = true;
+                        }
+                        if ui
+                            .button("›")
+                            .on_hover_text(catalog.t("workspace.search.next", &[]))
+                            .clicked()
+                        {
+                            do_next = true;
+                        }
+                        if ui
+                            .button("×")
+                            .on_hover_text(catalog.t("workspace.search.close", &[]))
+                            .clicked()
+                        {
+                            do_close = true;
+                        }
+                        // 키 입력은 입력창이 포커스일 때만 소비(터미널로 안 흘러감).
+                        // Enter=다음, Shift+Enter=이전, Esc=닫기.
+                        if resp.has_focus() {
+                            let (enter, esc, shift) = ui.input(|i| {
+                                (
+                                    i.key_pressed(egui::Key::Enter),
+                                    i.key_pressed(egui::Key::Escape),
+                                    i.modifiers.shift,
+                                )
+                            });
+                            if esc {
+                                do_close = true;
+                            } else if enter {
+                                if shift {
+                                    do_prev = true;
+                                } else {
+                                    do_next = true;
+                                }
+                            }
+                        }
+                    });
+                });
+            });
+
+        // 4) 검색 바 조작 반영.
+        {
+            let Some(search) = self.search.as_mut() else {
+                return;
+            };
+            search.focus_input = false;
+            if query != search.query {
+                search.query = query;
+            }
+            let m = search.matches.len();
+            if !do_close && m > 0 {
+                if do_next {
+                    search.current = (search.current + 1) % m;
+                    search.scroll_to_current = true;
+                }
+                if do_prev {
+                    search.current = (search.current + m - 1) % m;
+                    search.scroll_to_current = true;
+                }
+            }
+        }
+        if do_close {
+            self.close_search();
+            return;
+        }
+
+        // 5) 쿼리가 바뀌었을 때만 재검색을 요청한다(매 프레임 금지).
+        let pending = self.search.as_ref().and_then(|s| {
+            (s.requested.as_deref() != Some(s.query.as_str())).then(|| (s.session, s.query.clone()))
+        });
+        if let Some((sess, q)) = pending {
+            let empty = q.trim().is_empty();
+            if let Some(s) = self.search.as_mut() {
+                s.requested = Some(q.clone());
+                if empty {
+                    s.matches.clear();
+                    s.total_lines = 0;
+                    s.capped = false;
+                    s.current = 0;
+                }
+            }
+            if !empty {
+                self.send(
+                    client,
+                    RuntimeCommand::SearchScrollback {
+                        session: sess,
+                        query: q,
+                        max_matches: SEARCH_MAX_MATCHES,
+                    },
+                );
+            }
         }
     }
 
@@ -234,6 +511,14 @@ impl WorkspaceUi {
                     let alive = mux_sessions(snapshot);
                     self.sessions.retain(|id, _| alive.contains(id));
                     self.sent_sizes.retain(|id, _| alive.contains(id));
+                    // 검색 중인 세션이 사라지면 검색 바를 닫는다.
+                    if self
+                        .search
+                        .as_ref()
+                        .is_some_and(|s| !alive.contains(&s.session))
+                    {
+                        self.search = None;
+                    }
                     // hidden(active tab 밖) 세션의 마지막 스냅샷은 버린다 —
                     // §14.4 hidden render cache drop. tab 복귀 시 worker가
                     // 전환 즉시 push하므로(emit_mux_and_watched) 공백은 짧다 (codex 리뷰)
@@ -366,6 +651,23 @@ impl WorkspaceUi {
                 }
                 RuntimeEvent::AgentSpawned { .. } => {}
                 RuntimeEvent::ResourceUsage { .. } => {}
+                RuntimeEvent::ScrollbackSearchResult {
+                    session,
+                    query,
+                    result,
+                } => {
+                    // 늦게 도착한 stale 결과(쿼리가 이미 바뀜)는 버린다.
+                    if let Some(search) = self.search.as_mut()
+                        && search.session == *session
+                        && search.query == *query
+                    {
+                        search.matches = result.matches.clone();
+                        search.total_lines = result.total_lines;
+                        search.capped = result.capped;
+                        search.current = 0;
+                        search.scroll_to_current = !search.matches.is_empty();
+                    }
+                }
             }
         }
     }
@@ -1051,6 +1353,18 @@ impl WorkspaceUi {
         }
         // 터미널 위 우클릭도 같은 메뉴 (터미널 위젯이 topmost라 배경 interact가 못 받음)
         self.pane_context_menu(&output.response, pane_id, config, client, catalog);
+
+        // 터미널 텍스트 검색 (T3): 매치 하이라이트 + 우상단 검색 바 + 스크롤 이동.
+        self.render_terminal_search(
+            ui,
+            session,
+            output.response.rect,
+            output.origin,
+            output.cell_size,
+            &snapshot,
+            client,
+            catalog,
+        );
 
         // 입력은 focused pane으로만. egui focus가 세션 목록/버튼으로 튀어도 Claude/vim
         // 같은 terminal TUI 입력은 계속 terminal에 보내야 한다. 단 TextEdit/팝업/별도

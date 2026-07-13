@@ -9,7 +9,8 @@ pub struct TerminalViewportSnapshot {
     pub cursor: CursorSnapshot,
     /// row-major, cols * rows개
     pub visible_cells: Arc<[TerminalCell]>,
-    /// 렌더 최적화용 (PR-21에서 소비 — 현재 렌더러는 전체를 그린다)
+    /// 직전 take_snapshot 이후 바뀐 셀 범위 — renderer_egui가 행 갤리 캐시 무효화에,
+    /// 세션 로직이 dirty 추적에 소비한다 (2026-07-13 감사: "미소비" 주석 stale 교정).
     pub dirty_ranges: Vec<CellRange>,
     pub title: Option<String>,
     pub scroll_offset: i32,

@@ -307,8 +307,9 @@ impl TerminalBackend for AlacrittyBackend {
             rows: rows as u16,
             cursor,
             visible_cells: cells.into(),
-            // 항상 빈 값 — 아직 소비자(부분 렌더러)가 없다. 채우려면 스크롤/리플로우
-            // 좌표계와 함께 설계해야 하므로 부분 렌더 도입 시 같이 간다 (codex 리뷰 기록)
+            // backend 레벨에선 빈 값 — Session::take_snapshot이 누적 dirty rows로
+            // 덮어쓰고(session.rs), renderer_egui가 행 캐시 무효화에 소비한다
+            // (감사 2026-07-13: "소비자 없음" 서술은 stale이라 교정).
             dirty_ranges: Vec::new(),
             // OSC 0/2로 프로그램이 설정한 제목 — 세션 이름 동적 표시(없으면 폴더명 fallback).
             title: self.listener.title.lock().ok().and_then(|t| t.clone()),

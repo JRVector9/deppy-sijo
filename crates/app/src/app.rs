@@ -1655,7 +1655,12 @@ impl App {
     ) -> RuntimeEventReceiver {
         runtime.subscribe_with_wake(std::sync::Arc::new({
             let ctx = ctx.clone();
-            move || ctx.request_repaint()
+            // request_repaint()가 아니라 request_repaint_after(1ms) — egui는 delay==0인
+            // 요청마다 "settle" 프레임을 한 장 더 붙인다(egui 0.35 context.rs:137, outstanding=1).
+            // 0이 아닌 delay는 그 경로를 타지 않고, 이어서 delay -= predicted_dt로 0이 되어
+            // 결국 즉시 리페인트된다 — 지연 없이 헛 프레임만 뺀다. 터미널 내용은 같은 프레임의
+            // handle_events()에서 스냅샷이 반영된 뒤 그려지므로 settle 프레임이 필요 없다.
+            move || ctx.request_repaint_after(std::time::Duration::from_millis(1))
         }))
     }
 
@@ -3997,8 +4002,11 @@ impl eframe::App for App {
             if !self.active.render_active {
                 coalesce_mux_updated(&mut self.active.pending_events);
             }
-            // 보이는 idle 상태에서도 새 출력/상태를 즉시 렌더하도록 프레임 예약
-            ctx.request_repaint();
+            // 여기서 리페인트를 재요청하지 않는다 — 이벤트를 여기까지 실어나른 모든 경로
+            // (emit_gated의 Viewport/InputPressure/ResourceUsage slot + enqueue_durable_event)가
+            // 이미 subscribe_runtime_events의 wake로 리페인트를 요청했다. 재요청하면 이번
+            // 프레임이 그리는 내용을 위해 프레임을 한 장 더 잡고, egui가 거기에 settle 프레임을
+            // 하나 더 붙여 갱신 1회당 3프레임이 된다 (agenttui 실측: 페인트의 70%가 헛 프레임).
         }
         if self.active.events.take_overflowed() {
             self.runtime_stream_warning = true;

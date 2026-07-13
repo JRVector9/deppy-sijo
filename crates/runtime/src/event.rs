@@ -125,6 +125,13 @@ pub enum RuntimeEvent {
         session: SessionId,
         exit_code: Option<u32>,
     },
+    /// `SearchScrollback` 응답 (T3). 요청 query를 되돌려줘 UI가 늦게 온 stale 결과를
+    /// 버릴 수 있게 한다. **variant는 enum 끝에만 추가** (postcard discriminant — wire 호환).
+    ScrollbackSearchResult {
+        session: SessionId,
+        query: String,
+        result: terminal::ScrollbackSearchResult,
+    },
 }
 
 #[cfg(test)]

@@ -451,6 +451,84 @@ impl TerminalBackend for AlacrittyBackend {
         Some(out)
     }
 
+    /// scrollback+화면 전체에서 query를 부분 문자열로(대소문자 무시) 찾는다 (T3).
+    /// 화면 최하단에서 위(과거)로 훑어 상한(max_matches)에 걸리면 최신 매치가 남게 한다.
+    /// 매치 좌표는 line_from_bottom(최하단=0)과 grid 열 범위(wide spacer 포함)로 돌려준다.
+    fn search_scrollback(
+        &self,
+        query: &str,
+        max_matches: usize,
+    ) -> crate::backend::ScrollbackSearchResult {
+        use crate::backend::{
+            ScrollbackMatch, ScrollbackSearchResult, fold_char, substring_matches,
+        };
+
+        let needle: Vec<char> = query.chars().map(fold_char).collect();
+        let grid = self.term.grid();
+        let cols = self.term.columns();
+        let rows = self.term.screen_lines();
+        let history = self.term.history_size();
+        let total = history + rows;
+        if needle.is_empty() || cols == 0 {
+            return ScrollbackSearchResult {
+                matches: Vec::new(),
+                total_lines: total as u32,
+                capped: false,
+            };
+        }
+
+        let mut matches: Vec<ScrollbackMatch> = Vec::new();
+        let mut capped = false;
+        // 라인별 재사용 버퍼 (매 라인 할당 방지)
+        let mut chars: Vec<char> = Vec::with_capacity(cols);
+        let mut spans: Vec<(u16, u16)> = Vec::with_capacity(cols);
+        // 화면 최하단(rows-1)에서 위(가장 오래된 history)로. cap이 걸려도 최신 매치가 남는다.
+        'lines: for line_idx in (-(history as i32)..rows as i32).rev() {
+            chars.clear();
+            spans.clear();
+            let line = &grid[alacritty_terminal::index::Line(line_idx)];
+            for col in 0..cols {
+                let cell = &line[alacritty_terminal::index::Column(col)];
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    // wide char의 자리 채움 셀 — 직전 char의 열 범위를 이 열까지 확장
+                    if let Some(last) = spans.last_mut() {
+                        last.1 = col as u16 + 1;
+                    }
+                    continue;
+                }
+                // conceal(SGR 8)은 화면과 동일하게 공백 취급 (보이지 않는 텍스트로 매치 금지)
+                let c = if cell.flags.contains(Flags::HIDDEN) {
+                    ' '
+                } else {
+                    composed_char(cell.c, cell.zerowidth())
+                };
+                chars.push(fold_char(c));
+                spans.push((col as u16, col as u16 + 1));
+            }
+            let line_from_bottom = ((rows as i32 - 1) - line_idx) as u32;
+            for (s, e) in substring_matches(&chars, &needle) {
+                matches.push(ScrollbackMatch {
+                    line_from_bottom,
+                    col_start: spans[s].0,
+                    col_end: spans[e - 1].1,
+                });
+                if matches.len() >= max_matches {
+                    capped = true;
+                    break 'lines;
+                }
+            }
+        }
+
+        ScrollbackSearchResult {
+            matches,
+            total_lines: total as u32,
+            capped,
+        }
+    }
+
     fn screen_text(&self) -> String {
         // 셀 벡터/Arc 할당 없이 문자만 모은다 — snapshot이 아니다.
         // display_iter는 스크롤된 viewport를 반영하므로 쓰지 않는다 —
@@ -864,5 +942,53 @@ mod tests {
         assert_eq!(indexed_default(231), [255, 255, 255]);
         assert_eq!(indexed_default(255), [238, 238, 238]);
         assert_eq!(indexed_default(16), [0, 0, 0]);
+    }
+
+    #[test]
+    fn search_scrollback는_화면과_history를_모두_찾는다() {
+        let mut b = AlacrittyBackend::new(40, 5, 1000);
+        // 100줄 출력 → 대부분 history로 밀린다
+        for i in 0..100 {
+            feed(&mut b, format!("needle line {i}\r\n").as_bytes());
+        }
+        let result = b.search_scrollback("needle", 1000);
+        // 화면 + history 전부에서 매치되어야 한다 (화면만이면 5줄 미만)
+        assert!(
+            result.matches.len() > 50,
+            "history까지 검색: {}",
+            result.matches.len()
+        );
+        // line_from_bottom 오름차순(최하단 우선)
+        let bottoms: Vec<u32> = result.matches.iter().map(|m| m.line_from_bottom).collect();
+        assert!(bottoms.windows(2).all(|w| w[0] <= w[1]), "최하단 우선 정렬");
+    }
+
+    #[test]
+    fn search_scrollback는_대소문자를_무시한다() {
+        let mut b = AlacrittyBackend::new(40, 5, 100);
+        feed(&mut b, b"Hello WORLD hello\r\n");
+        let result = b.search_scrollback("hello", 1000);
+        assert_eq!(result.matches.len(), 2);
+        // 최하단(출력 라인)의 두 매치 — 열 범위 확인 (0..5, 12..17)
+        let cols: Vec<(u16, u16)> = result
+            .matches
+            .iter()
+            .map(|m| (m.col_start, m.col_end))
+            .collect();
+        assert!(cols.contains(&(0, 5)));
+        assert!(cols.contains(&(12, 17)));
+    }
+
+    #[test]
+    fn search_scrollback_상한은_최신_매치를_남긴다() {
+        let mut b = AlacrittyBackend::new(40, 5, 1000);
+        for i in 0..50 {
+            feed(&mut b, format!("hit {i}\r\n").as_bytes());
+        }
+        let result = b.search_scrollback("hit", 10);
+        assert!(result.capped);
+        assert_eq!(result.matches.len(), 10);
+        // 최신 10개 = line_from_bottom 0..10 근방 (화면 최하단 우선)
+        assert!(result.matches.iter().all(|m| m.line_from_bottom < 12));
     }
 }

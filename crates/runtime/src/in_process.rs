@@ -377,6 +377,9 @@ impl InProcessRuntimeClient {
 
 impl RuntimeClient for InProcessRuntimeClient {}
 
+/// 터미널 검색 매치 수 하드캡 (T3) — 기형 클라이언트가 과대한 상한을 보내도 방어한다.
+const SEARCH_MAX_MATCHES_HARD_CAP: usize = 5_000;
+
 /// exited 세션의 terminal backend(scrollback)를 유지하는 최대 개수 기본값 (§14.2/14.3).
 /// 초과분은 가장 오래 전에 종료된 것부터 압축 아카이브로 내려 메모리를 유계로 만든다
 /// (설정에서 변경 — SetTerminalCachePolicy).
@@ -1173,6 +1176,22 @@ impl Worker {
             RuntimeCommand::Scroll { session, delta } => {
                 if let Some(active) = self.sessions.get_mut(&session) {
                     active.scroll(delta);
+                }
+            }
+            RuntimeCommand::SearchScrollback {
+                session,
+                query,
+                max_matches,
+            } => {
+                // 상한을 하드캡으로 한 번 더 조인다(기형 클라이언트 방어 — remote 경로).
+                let cap = (max_matches as usize).clamp(1, SEARCH_MAX_MATCHES_HARD_CAP);
+                if let Some(active) = self.sessions.get(&session) {
+                    let result = active.search_scrollback(&query, cap);
+                    self.emit(RuntimeEvent::ScrollbackSearchResult {
+                        session,
+                        query,
+                        result,
+                    });
                 }
             }
             RuntimeCommand::SeedRedaction { credential_ids } => {

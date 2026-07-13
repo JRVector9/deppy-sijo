@@ -3022,6 +3022,7 @@ mod tests {
             RuntimeEvent::ResourceUsage { .. } => "ResourceUsage",
             RuntimeEvent::PtyInputPressure { .. } => "PtyInputPressure",
             RuntimeEvent::SessionRestored { .. } => "SessionRestored",
+            RuntimeEvent::ScrollbackSearchResult { .. } => "ScrollbackSearchResult",
         }
     }
 

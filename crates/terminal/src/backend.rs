@@ -78,6 +78,66 @@ impl TerminalCacheEvent {
     }
 }
 
+/// 터미널 텍스트 검색 매치 하나 (T3). 좌표는 화면 최하단 기준으로 매겨 UI가
+/// display_offset(스크롤) 좌표계와 직접 대응시켜 스크롤·하이라이트에 바로 쓴다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScrollbackMatch {
+    /// 화면 최하단(0)부터 위(과거)로 센 라인 번호. 뷰포트 행 = scroll_offset + rows-1 - 이 값.
+    pub line_from_bottom: u32,
+    /// 매치가 차지하는 grid 열 시작(포함).
+    pub col_start: u16,
+    /// 매치가 차지하는 grid 열 끝(제외). wide char의 spacer 열까지 포함한다.
+    pub col_end: u16,
+}
+
+/// scrollback+화면 검색 결과 (T3).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScrollbackSearchResult {
+    /// 화면 최하단에 가까운 순서(line_from_bottom 오름차순, 같은 라인은 좌→우).
+    pub matches: Vec<ScrollbackMatch>,
+    /// 검색 시점의 전체 라인 수(history + 화면). UI의 스크롤 목표 클램프에 쓴다.
+    pub total_lines: u32,
+    /// 매치 수 상한(max_matches)에 도달해 결과가 잘렸는지.
+    pub capped: bool,
+}
+
+impl ScrollbackSearchResult {
+    pub fn empty() -> Self {
+        Self {
+            matches: Vec::new(),
+            total_lines: 0,
+            capped: false,
+        }
+    }
+}
+
+/// char 하나를 소문자로 폴딩한다(대소문자 무시 검색용). 다중 char로 분해되는 드문
+/// 경우(İ 등)는 첫 char만 취해 grid 열과의 1:1 대응을 유지한다 — 열 매핑 안정성 우선.
+pub fn fold_char(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
+/// 한 라인(이미 [`fold_char`]로 폴딩된 char 슬라이스)에서 needle의 겹치지 않는 모든
+/// 부분 문자열 매치를 좌→우 순서로 찾아 (시작, 끝) char 인덱스를 돌려준다.
+/// needle도 폴딩되어 있다고 가정한다.
+pub fn substring_matches(haystack: &[char], needle: &[char]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return out;
+    }
+    let last = haystack.len() - needle.len();
+    let mut i = 0;
+    while i <= last {
+        if haystack[i..i + needle.len()] == *needle {
+            out.push((i, i + needle.len()));
+            i += needle.len(); // 겹치지 않는 매치만
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 /// 설계문서 4.2 TerminalRenderModel.
 pub enum TerminalRenderModel {
     CellGrid,
@@ -132,5 +192,58 @@ pub trait TerminalBackend {
     /// 미지원 백엔드는 None (아카이브 대신 기존 drop 동작).
     fn serialize_scrollback(&self) -> Option<Vec<u8>> {
         None
+    }
+
+    /// scrollback+화면 전체에서 query를 부분 문자열로(대소문자 무시) 찾는다 (T3).
+    /// scrollback에는 이미 라인 수 cap이 있어 탐색 비용은 유계다. 미지원 백엔드는 빈 결과.
+    fn search_scrollback(&self, query: &str, max_matches: usize) -> ScrollbackSearchResult {
+        let _ = (query, max_matches);
+        ScrollbackSearchResult::empty()
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::{fold_char, substring_matches};
+
+    fn fold(s: &str) -> Vec<char> {
+        s.chars().map(fold_char).collect()
+    }
+
+    #[test]
+    fn 대소문자_무시_부분_문자열_매치() {
+        let hay = fold("Error: File Not Found");
+        assert_eq!(substring_matches(&hay, &fold("error")), vec![(0, 5)]);
+        assert_eq!(substring_matches(&hay, &fold("NOT")), vec![(12, 15)]);
+    }
+
+    #[test]
+    fn 한_라인_다중_매치는_좌에서_우_순서() {
+        let hay = fold("foo bar foo baz foo");
+        assert_eq!(
+            substring_matches(&hay, &fold("foo")),
+            vec![(0, 3), (8, 11), (16, 19)]
+        );
+    }
+
+    #[test]
+    fn 겹치는_매치는_비겹침으로만_센다() {
+        let hay = fold("aaaa");
+        // "aa"는 (0,2),(2,4)만 — (1,3)은 겹쳐서 제외
+        assert_eq!(substring_matches(&hay, &fold("aa")), vec![(0, 2), (2, 4)]);
+    }
+
+    #[test]
+    fn 빈_쿼리나_긴_쿼리는_매치_없음() {
+        let hay = fold("abc");
+        assert!(substring_matches(&hay, &fold("")).is_empty());
+        assert!(substring_matches(&hay, &fold("abcd")).is_empty());
+    }
+
+    #[test]
+    fn 유니코드_대소문자_폴딩() {
+        let hay = fold("Grüße HÄLLO");
+        assert_eq!(substring_matches(&hay, &fold("grüße")), vec![(0, 5)]);
+        assert_eq!(substring_matches(&hay, &fold("hällo")), vec![(6, 11)]);
     }
 }

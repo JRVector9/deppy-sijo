@@ -149,6 +149,15 @@ pub enum RuntimeCommand {
         /// lease 유효기간(ms) — worker가 상한 5분으로 캡한다. 시청 유지는 재전송으로 갱신.
         ttl_ms: u32,
     },
+    /// 터미널 텍스트 검색 (T3) — 세션의 scrollback+화면 전체에서 query를 대소문자
+    /// 무시로 찾는다. worker가 backend에서 검색해 `ScrollbackSearchResult`를 이벤트로
+    /// 회신한다. **variant는 끝에만 추가** (postcard discriminant — remote wire 호환).
+    SearchScrollback {
+        session: SessionId,
+        query: String,
+        /// 매치 수 상한 — 도달 시 결과가 잘린다(대형 scrollback 방어).
+        max_matches: u32,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
@@ -294,6 +303,17 @@ impl std::fmt::Debug for RuntimeCommand {
                 .field("session", session)
                 .field("viewing", viewing)
                 .field("ttl_ms", ttl_ms)
+                .finish(),
+            // query 내용은 로그에 남기지 않는다(붙여넣기한 비밀 방어) — 길이만.
+            RuntimeCommand::SearchScrollback {
+                session,
+                query,
+                max_matches,
+            } => f
+                .debug_struct("SearchScrollback")
+                .field("session", session)
+                .field("query_len", &query.len())
+                .field("max_matches", max_matches)
                 .finish(),
         }
     }

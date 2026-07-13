@@ -25,6 +25,7 @@ pub enum ShortcutAction {
     PreviousWorkspace,
     IncreaseTerminalFont,
     DecreaseTerminalFont,
+    TerminalSearch,
     ClearRenderCaches,
 }
 
@@ -48,7 +49,7 @@ impl ShortcutGroup {
 }
 
 impl ShortcutAction {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::ToggleSidebar,
         Self::OpenEnvironment,
         Self::OpenAgents,
@@ -64,6 +65,7 @@ impl ShortcutAction {
         Self::PreviousWorkspace,
         Self::IncreaseTerminalFont,
         Self::DecreaseTerminalFont,
+        Self::TerminalSearch,
         Self::ClearRenderCaches,
     ];
 
@@ -84,6 +86,7 @@ impl ShortcutAction {
             Self::PreviousWorkspace => "previous_workspace",
             Self::IncreaseTerminalFont => "increase_terminal_font",
             Self::DecreaseTerminalFont => "decrease_terminal_font",
+            Self::TerminalSearch => "terminal_search",
             Self::ClearRenderCaches => "clear_render_caches",
         }
     }
@@ -105,6 +108,7 @@ impl ShortcutAction {
             Self::PreviousWorkspace => "shortcuts.action.previous_workspace",
             Self::IncreaseTerminalFont => "shortcuts.action.increase_terminal_font",
             Self::DecreaseTerminalFont => "shortcuts.action.decrease_terminal_font",
+            Self::TerminalSearch => "shortcuts.action.terminal_search",
             Self::ClearRenderCaches => "shortcuts.action.clear_render_caches",
         }
     }
@@ -131,7 +135,8 @@ impl ShortcutAction {
             | Self::FocusNextPane
             | Self::FocusPreviousPane
             | Self::IncreaseTerminalFont
-            | Self::DecreaseTerminalFont => ShortcutGroup::Terminal,
+            | Self::DecreaseTerminalFont
+            | Self::TerminalSearch => ShortcutGroup::Terminal,
             Self::NextWorkspace | Self::PreviousWorkspace | Self::ClearRenderCaches => {
                 ShortcutGroup::Workspace
             }
@@ -155,6 +160,9 @@ impl ShortcutAction {
             Self::PreviousWorkspace => "Command+Alt+Left",
             Self::IncreaseTerminalFont => "Command+Plus",
             Self::DecreaseTerminalFont => "Command+Minus",
+            // macOS Cmd+F 기본. 평문 Ctrl+F는 readline forward-char(C-f)와 충돌하므로
+            // 기본으로 가로채지 않는다 — 사용자는 설정에서 Ctrl+F로 rebind할 수 있다 (T3).
+            Self::TerminalSearch => "Command+F",
             Self::ClearRenderCaches => "Command+Alt+K",
         }
     }

@@ -276,17 +276,24 @@ VAPID 키쌍: 개인키 keyring(tls_identity 관례), 공개키는 JS 노출
 ### 범위
 
 ```text
-crates/web-remote: protocol.rs 확장(ViewportKeyframe/DirtyRows JSON),
-  viewer 스트림 경로(keyframe + dirty rows, RequestKeyframe 재동기화)
-crates/runtime: "원격 시청" 승격 커맨드 신설(아래), session.take_dirty_ranges 재사용
-assets/: 셀 그리드 렌더러(canvas), 세션 선택, Ctrl-C/Enter 버튼
+(2026-07-13 개정 — 구현 완료본 기준으로 교정. 원안의 DirtyRows/take_dirty_ranges
+ 설계는 슬롯 coalesce에서 중간 dirty가 유실되어 채택하지 않았다.)
+
+crates/web-remote: protocol.rs 확장(ServerMsg::Viewport JSON:
+  seq/keyframe/cols/rows/cursor/alt/offset + LineView/RunView 행 스타일 run 인코딩),
+  ClientMsg Watch/Unwatch/RequestKeyframe/Key(+후속 Scroll/Input/Switch).
+  viewer 스트림 = RuntimeEvent::Viewport 최신 스냅샷 슬롯을 접속별 baseline과
+  행 단위 비교해 keyframe 또는 변경 행 delta로 전송. dirty_ranges는 쓰지 않는다.
+crates/runtime: SetRemoteViewing TTL lease 커맨드 신설(아래). 브리지가 영속 UUID
+  기준 watcher refcount를 집계해 0→1/1→0 전이와 주기 갱신(15s, TTL 45s)에만 보낸다.
+assets/: canvas 셀 그리드 렌더러, 세션 선택, key row(화이트리스트), 스크롤백 제어
 ```
 
 ### 구현 요점
 
-- 직렬화 소스는 TerminalViewportSnapshot(serde 이미 지원) + dirty_ranges — remote.rs delta 설계(§4 keyframe/seq/재동기화)를 JSON으로 이식. Viewport는 최신본만 유지·coalesce(슬롯 관례).
-- **§14 충돌 해소가 핵심 설계 결정**: hidden 세션은 스냅샷 생성 금지가 불변 원칙(5번)이다. 폰이 시청하는 동안만 해당 세션을 "visible 등가"로 승격하는 RuntimeCommand(시청 refcount)를 추가하고, 시청 종료·WS 절단·세션 종료 시 반드시 원복(tombstone 관례로 trailing viewport 차단). GUI 렌더 예산에는 영향 없음(스냅샷 생성만 허용, egui repaint 아님).
-- 입력은 Ctrl-C/Enter 버튼만(WriteInput 재사용). 자유 타이핑·IME는 비범위 — 필요해지면 별도 PR.
+- (개정) 직렬화 소스는 RuntimeEvent::Viewport의 TerminalViewportSnapshot **최신본 슬롯**이다. WS 접속마다 baseline 스냅샷을 보관하고, baseline 없음/차원 변경이면 keyframe, 그 외엔 visible_cells 행 비교로 바뀐 LineView만 delta 전송(remote.rs §4 관례의 JSON 이식). RequestKeyframe은 그 접속의 baseline만 리셋한다 — worker 왕복 없음. dirty_ranges는 슬롯 coalesce에서 중간분이 유실되므로 쓰지 않는다.
+- (개정) **§14 충돌 해소**: 원칙 5 예외는 `SetRemoteViewing` **TTL lease**(갱신형 45s, 상한 5분)로 구현됐다 — refcount는 runtime이 아니라 브리지가 영속 UUID 기준으로 집계하고, 전이 시에만 lease on/off를 보낸다. WS 절단·명시 unwatch는 즉시 off, 브리지/워커 교체는 TTL 만료로 원복(옛 워커에 명시 off 없음 — 유계 허용). GUI 렌더 예산 영향 없음은 emit_gated(render_bound 구독자 미wake)로 보장한다. lease 세션은 hidden cap/archive 정책에서도 visible 등가로 처리된다.
+- (개정) 입력/제어 현행: named key 화이트리스트(ctrl_c/ctrl_d/enter/esc/tab/방향키 등 — 서버가 바이트로 매핑), Scroll(스크롤백 열람), composer Input(P6a — C0 strip + bracketed paste wrap), 워크스페이스 Switch까지 확장됐다. 자유 타이핑 raw bytes는 여전히 비허용(named key/Input 정화 경로만).
 
 ### 완료 기준
 
@@ -294,11 +301,11 @@ assets/: 셀 그리드 렌더러(canvas), 세션 선택, Ctrl-C/Enter 버튼
 - 시청 종료/절단 시 세션이 hidden 예산으로 복귀(스냅샷 생성 중단)를 테스트로 고정.
 - seq 불일치 → RequestKeyframe 재동기화 단위 테스트. 한글(wide cell) 렌더 확인.
 
-### 리스크·미결정
+### 리스크·미결정 (2026-07-13 결과 반영)
 
-- JSON 셀 페이로드가 크면(80×24 keyframe 수십 KB) 대역폭·인코딩 CPU가 예산을 칠 수 있다 — 실측 후 행 단위 RLE 또는 permessage-deflate 검토(§4.6 트레이드오프 관례, 선최적화 금지).
-- 시청 승격 커맨드가 mux 상태기계에 넣는 복잡도 — 설계 리뷰(runtime 소유자) 선행 권장.
-- 스크롤백 열람 범위(현재 화면만 vs Scroll 커맨드 연동) 미결정 — v1은 현재 화면만.
+- ~~JSON 셀 페이로드 크기~~ → 해소: 처음부터 행 텍스트+스타일 run(RunView/LineView) 인코딩 채택 — 셀 단위 JSON 대비 수십 배 작다.
+- ~~시청 승격 커맨드의 mux 상태기계 복잡도~~ → 해소: mux 상태기계는 무변경 — worker 레벨 `remote_viewing` lease 맵을 watched 집합과 union하는 방식으로 구현됐다(설계 리뷰 반영).
+- ~~스크롤백 열람 범위 미결정~~ → 해소: ClientMsg::Scroll → RuntimeCommand::Scroll 연동으로 구현됨(P5 후속 PR — 데스크톱과 스크롤 상태 공유, tmux 관례).
 
 ---
 

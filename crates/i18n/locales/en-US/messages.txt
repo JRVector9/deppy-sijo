@@ -425,3 +425,5 @@ env.var_delete_confirm.body_dotenv = Delete '{key}'? The line is also removed fr
 env.var_delete_confirm.body = Delete the variable '{key}'?
 credentials.delete_confirm.title = Delete API key
 credentials.delete_confirm.body = Delete '{name}'? The secret stored in the keychain is deleted as well.
+env.no_project_path_note = Environment variables are stored in the project folder's .env file. Choose a project folder first.
+env.legacy_pending_note = Variables left in the legacy (DB) store — they are migrated to the .env file once a project folder is set.

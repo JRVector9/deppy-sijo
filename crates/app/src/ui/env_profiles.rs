@@ -11,14 +11,14 @@ pub enum EnvAction {
     DotenvWrite { key: String, value: Option<String> },
 }
 
-/// 프로젝트 환경(env profile) 관리 창.
+/// 프로젝트 환경(env) 관리 창 — `.env` 파일 단일 진실 (E1, 2026-07-13).
+/// 프로젝트 폴더가 지정된 워크스페이스만 변수를 편집할 수 있고, 모든 편집은
+/// [`EnvAction::DotenvWrite`]로 `.env`에 기록된다. DB 전용 profile은 더 이상
+/// 만들지 않는다 — 남은 레거시 profile 변수는 force 동기화가 .env로 이전한다.
 pub struct EnvProfilesUi {
     selected: Option<String>,
-    new_name: String,
     var_key: String,
-    var_is_secret: bool,
     var_plain_value: String,
-    var_credential_id: Option<String>,
     error: Option<String>,
     /// '+ 추가' 클릭 시에만 인라인 추가 폼을 펼친다(스크린샷: 기본은 표만 — P2).
     show_add_form: bool,
@@ -26,11 +26,10 @@ pub struct EnvProfilesUi {
     /// profile_id를 함께 저장해 확인 중 프로파일 전환 시 다른 프로파일의 같은 key가
     /// 지워지는 것을 막는다(codex High 2026-07-10).
     delete_confirm: Option<(String, String)>,
-    /// 프로파일 관리 UI 수동 펼침 — 기본 숨김(P1)이어도 '프로파일 관리…' 링크로 접근
-    /// 가능(단일 프로파일에서 두 번째 생성 경로 보존 — codex Med).
-    show_profile_controls: bool,
     profiles: Option<Vec<EnvProfileRow>>,
     vars: Option<Vec<EnvVarRow>>,
+    /// 레거시 secret 행의 기본 마스킹을 1회 시딩했는가 (E1 이행기 — 캐시 무효화 시 재시딩).
+    legacy_mask_seeded: bool,
     /// 사용자가 ○ 토글로 명시적으로 연 secret 평문 캐시. 참조 화면과 안전한 기본값에
     /// 맞춰 secret은 처음에 마스킹하며, keyring 조회도 reveal 시점에만 요청한다.
     revealed: std::collections::HashMap<(String, String), String>,
@@ -51,6 +50,7 @@ impl EnvProfilesUi {
         self.profiles = None;
         self.vars = None;
         self.delete_confirm = None;
+        self.legacy_mask_seeded = false;
         // 외부 .env 동기화가 credential을 새로 만들 수 있으므로 함께 버린다.
         self.credentials = None;
         // .env 동기화가 같은 (profile,key)의 secret 값을 바꿨을 수 있다 — 평문 캐시를
@@ -66,25 +66,21 @@ impl EnvProfilesUi {
         self.masked.clear();
         self.var_key.clear();
         self.var_plain_value.clear();
-        self.var_credential_id = None;
     }
 
     pub fn new() -> Self {
         Self {
             selected: None,
-            new_name: String::new(),
             var_key: String::new(),
-            var_is_secret: false,
             var_plain_value: String::new(),
-            var_credential_id: None,
             error: None,
             revealed: std::collections::HashMap::new(),
             masked: std::collections::HashSet::new(),
             show_add_form: false,
             delete_confirm: None,
-            show_profile_controls: false,
             profiles: None,
             vars: None,
+            legacy_mask_seeded: false,
             credentials: None,
             cached_workspace: None,
         }
@@ -95,6 +91,7 @@ impl EnvProfilesUi {
         ui: &mut egui::Ui,
         db: &mut Db,
         workspace_id: &str,
+        project_root: Option<&std::path::Path>,
         reveal_secret: &mut dyn FnMut(&str) -> Option<String>,
         catalog: &i18n::Catalog,
     ) -> anyhow::Result<Option<EnvAction>> {
@@ -103,71 +100,14 @@ impl EnvProfilesUi {
             self.vars = None;
             self.selected = None;
             self.cached_workspace = Some(workspace_id.to_owned());
+            self.legacy_mask_seeded = false;
             // 이전 워크스페이스에서 펼친 추가 폼/입력값이 넘어와 엉뚱한 곳에 저장되지 않게.
             self.reset_var_form();
-            self.show_profile_controls = false;
             // v19(#2)부터 credential 목록이 workspace별(소속+전역) — 이전 워크스페이스
-            // 목록이 콤보에 남아 교차 참조로 저장되지 않게 캐시를 버린다(codex High).
+            // 목록이 남아 교차 참조되지 않게 캐시를 버린다(codex High).
             self.credentials = None;
         }
 
-        let mut profiles = match &self.profiles {
-            Some(p) => p.clone(),
-            None => {
-                let p = db.list_env_profiles(workspace_id)?;
-                self.profiles = Some(p.clone());
-                p
-            }
-        };
-
-        // 프로파일이 없으면 기본 프로파일을 자동 생성해 곧바로 환경변수 입력을 보여준다 —
-        // 별도 "프로파일 생성" 단계/kind 프리셋 제거(2026-07-12 사용자: 프로필 다중 전환은
-        // 안 쓰고 환경변수를 직접 관리하는 게 편함). 한 번만 만들어지고 이후엔 비어있지 않다.
-        if profiles.is_empty() {
-            db.insert_env_profile(workspace_id, "default", "local")?;
-            profiles = db.list_env_profiles(workspace_id)?;
-            self.profiles = Some(profiles.clone());
-            self.selected = profiles.first().map(|p| p.id.clone());
-            self.vars = None;
-        }
-
-        if self.selected.is_none()
-            || !profiles
-                .iter()
-                .any(|p| Some(p.id.as_str()) == self.selected.as_deref())
-        {
-            self.selected = profiles.first().map(|p| p.id.clone());
-            self.vars = None;
-        }
-
-        // 경고 표시용 production 플래그(선택 변경 프레임엔 1프레임 stale — 무해).
-        let pre_production = self
-            .selected
-            .as_deref()
-            .and_then(|id| profiles.iter().find(|p| p.id == id))
-            .map(|p| p.is_production)
-            .unwrap_or(false);
-
-        // 프로파일 선택기(#5, 상단): 스크린샷은 프로젝트당 환경이 암묵적 1개라 노출하지
-        // 않는다 — **2개 이상이거나 production일 때만** 표시(관리 기능 보존, P1).
-        // 이 안에서 선택 변경/삭제 시 self.selected/self.vars가 바뀔 수 있으므로 아래에서
-        // profile_id·vars를 **재확정**한다(codex High — stale 캐시 오표시/오삭제 방지).
-        let controls_visible = profiles.len() > 1 || pre_production || self.show_profile_controls;
-        if controls_visible {
-            compact_profile_controls(
-                ui,
-                self,
-                db,
-                workspace_id,
-                &profiles,
-                pre_production,
-                catalog,
-            )?;
-            ui.add_space(14.0);
-        }
-
-        // controls가 프로파일을 생성/삭제하면 self.profiles=None로 만든다 — 그 경우 stale
-        // 스냅샷으로 삭제된 id를 재선택하지 않게 **최신 목록을 재조회**한다(codex High).
         let profiles = match &self.profiles {
             Some(p) => p.clone(),
             None => {
@@ -176,27 +116,50 @@ impl EnvProfilesUi {
                 p
             }
         };
-        // 재확정 — 선택이 바뀌었거나 삭제됐으면 first로 폴백. 목록이 비면(마지막 삭제) 종료.
-        if self.selected.is_none()
-            || !profiles
-                .iter()
-                .any(|p| Some(p.id.as_str()) == self.selected.as_deref())
-        {
-            self.selected = profiles.first().map(|p| p.id.clone());
-            self.vars = None;
-            self.reset_var_form();
-        }
-        let Some(profile_id) = self.selected.clone() else {
-            return Ok(None);
-        };
-        let mut action: Option<EnvAction> = None;
-        let is_dotenv = profiles
+
+        // .env 일원화(E1): 편집 대상은 dotenv profile 하나뿐이다. DB 전용 profile은
+        // 더 이상 자동 생성하지 않고, 남은 레거시 profile은 read-only로만 보여준다
+        // (경로가 지정되면 force 동기화가 .env로 이전 — binjari 사고 재발 방지 ⑤).
+        let dotenv_profile_id = profiles
             .iter()
-            .find(|p| p.id == profile_id)
-            .map(|p| p.kind == "dotenv")
-            .unwrap_or(false);
-        if !profiles.iter().any(|p| p.id == profile_id) {
-            return Ok(None);
+            .find(|p| p.kind == "dotenv")
+            .map(|p| p.id.clone());
+        let legacy_profiles: Vec<EnvProfileRow> = profiles
+            .iter()
+            .filter(|p| p.kind != "dotenv")
+            .cloned()
+            .collect();
+        // vars 캐시는 dotenv profile 기준 — profile 생성/삭제(동기화)를 감지해 버린다.
+        if self.selected != dotenv_profile_id {
+            self.selected = dotenv_profile_id.clone();
+            self.vars = None;
+        }
+        let mut action: Option<EnvAction> = None;
+
+        // ⑤ 프로젝트 폴더 미지정: 변수 입력을 차단하고 폴더 지정을 유도한다 — 이름만 있는
+        // 워크스페이스에 변수가 들어가 유령이 되는 경로를 구조적으로 막는다.
+        if project_root.is_none() {
+            env_api_section_header(ui, &catalog.t("env.env_vars", &[]), None, None);
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new(catalog.t("env.no_project_path_note", &[]))
+                    .size(13.0)
+                    .color(ui.visuals().weak_text_color()),
+            );
+            ui.add_space(8.0);
+            if ui
+                .button(catalog.t("env.project_folder.choose", &[]))
+                .clicked()
+                && let Some(dir) = rfd::FileDialog::new().pick_folder()
+            {
+                action = Some(EnvAction::SetProjectPath(dir));
+            }
+            // 레거시 변수는 숨기지 않는다 — 폴더 지정 시 .env로 이전됨을 안내.
+            self.legacy_vars_section(ui, db, &legacy_profiles, reveal_secret, catalog)?;
+            if let Some(error) = &self.error {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+            return Ok(action);
         }
 
         let credentials = match &self.credentials {
@@ -207,25 +170,32 @@ impl EnvProfilesUi {
                 c
             }
         };
-        let vars = match &self.vars {
-            Some(v) => v.clone(),
-            None => {
-                let v = db.list_env_vars(&profile_id)?;
-                // 외부 .env 동기화로 사라진 키의 마스킹 tombstone을 계속 들고 있으면,
-                // 같은 workspace에서 키 이름이 계속 바뀌는 동안 HashSet이 제한 없이 자란다.
-                // 현재 프로파일에 실제로 남은 키만 유지한다.
-                let live_keys: std::collections::HashSet<&str> =
-                    v.iter().map(|var| var.key.as_str()).collect();
-                self.masked.retain(|(masked_profile, key)| {
-                    masked_profile != &profile_id || live_keys.contains(key.as_str())
-                });
-                for var in &v {
-                    if matches!(var.value, EnvValue::Secret { .. }) {
-                        self.masked.insert((profile_id.clone(), var.key.clone()));
+        // dotenv profile이 아직 없으면(.env 파일 없음) 빈 표 + 추가 폼 — 첫 변수 추가가
+        // DotenvWrite로 파일을 만들고, 다음 동기화가 profile을 생성한다.
+        let profile_id = dotenv_profile_id.unwrap_or_default();
+        let vars = if profile_id.is_empty() {
+            Vec::new()
+        } else {
+            match &self.vars {
+                Some(v) => v.clone(),
+                None => {
+                    let v = db.list_env_vars(&profile_id)?;
+                    // 외부 .env 동기화로 사라진 키의 마스킹 tombstone을 계속 들고 있으면,
+                    // 같은 workspace에서 키 이름이 계속 바뀌는 동안 HashSet이 제한 없이 자란다.
+                    // 현재 프로파일에 실제로 남은 키만 유지한다.
+                    let live_keys: std::collections::HashSet<&str> =
+                        v.iter().map(|var| var.key.as_str()).collect();
+                    self.masked.retain(|(masked_profile, key)| {
+                        masked_profile != &profile_id || live_keys.contains(key.as_str())
+                    });
+                    for var in &v {
+                        if matches!(var.value, EnvValue::Secret { .. }) {
+                            self.masked.insert((profile_id.clone(), var.key.clone()));
+                        }
                     }
+                    self.vars = Some(v.clone());
+                    v
                 }
-                self.vars = Some(v.clone());
-                v
             }
         };
         // secret은 기본 마스킹한다. 사용자가 ○를 눌러 masked에서 빠진 항목만 App의
@@ -292,11 +262,9 @@ impl EnvProfilesUi {
         }
 
         if self.show_add_form
-            && let Some(written) =
-                compact_env_var_form(ui, self, db, &profile_id, is_dotenv, &credentials, catalog)?
+            && let Some(written) = compact_env_var_form(ui, self, &profile_id, catalog)
         {
-            // 7번(2026-07-10): dotenv profile 추가/수정은 .env 파일에도 기록 —
-            // 안 쓰면 다음 동기화 때 파일 기준으로 지워진다(.env가 진실).
+            // .env가 진실(E1): 추가/수정은 파일에 기록하고 동기화가 DB를 따라 갱신한다.
             action = Some(EnvAction::DotenvWrite {
                 key: written.0,
                 value: Some(written.1),
@@ -317,12 +285,7 @@ impl EnvProfilesUi {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ui.ctx(), |ui| {
-                    let body_key = if is_dotenv {
-                        "env.var_delete_confirm.body_dotenv"
-                    } else {
-                        "env.var_delete_confirm.body"
-                    };
-                    ui.label(catalog.t(body_key, &[("key", &pending)]));
+                    ui.label(catalog.t("env.var_delete_confirm.body_dotenv", &[("key", &pending)]));
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button(catalog.t("action.delete", &[])).clicked() {
@@ -348,42 +311,107 @@ impl EnvProfilesUi {
             self.revealed.remove(&id);
             self.masked.remove(&id); // 같은 이름의 새 변수에 삭제 전 토글 상태가 남지 않게
             self.error = None;
-            if is_dotenv {
-                // 8번(codex Med 반영): DB를 먼저 지우지 않는다 — 파일 라인 제거 후
-                // sync의 '사라진 키 제거'가 DB row와 전용 credential/keyring까지 일관
-                // 정리한다(먼저 지우면 sync가 credential 회수 기회를 잃음).
-                action = Some(EnvAction::DotenvWrite { key, value: None });
-            } else {
-                db.delete_env_var(&profile_id, &key)?;
-                self.vars = None;
-            }
+            // 8번(codex Med 반영): DB를 먼저 지우지 않는다 — 파일 라인 제거 후
+            // sync의 '사라진 키 제거'가 DB row와 전용 credential/keyring까지 일관
+            // 정리한다(먼저 지우면 sync가 credential 회수 기회를 잃음).
+            action = Some(EnvAction::DotenvWrite { key, value: None });
         }
 
-        // 미리보기 블록은 제거(P3) — 스크린샷은 표 중심. OS override 정보는 각 행
-        // dot hover 툴팁으로 제공(정보 손실 없음).
-        if !controls_visible && self.show_add_form {
-            // 기본 숨김(P1)이어도 프로파일 관리 진입점은 남긴다 — 작은 weak 링크(codex Med).
-            ui.add_space(10.0);
-            let link = ui.add(
-                egui::Label::new(
-                    egui::RichText::new(catalog.t("env.manage_profiles", &[]))
-                        .size(12.0)
-                        .color(ui.visuals().weak_text_color()),
-                )
-                .sense(egui::Sense::click()),
-            );
-            if link.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            if link.clicked() {
-                self.show_profile_controls = true;
-            }
-        }
+        // 레거시(DB 전용) profile 잔여 변수 — force 동기화가 .env로 이전하기 전까지
+        // 숨기지 않고 보여준다(keyring resolve 실패로 보류된 키 포함 — 데이터 은닉 방지).
+        self.legacy_vars_section(ui, db, &legacy_profiles, reveal_secret, catalog)?;
 
         if let Some(error) = &self.error {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
         Ok(action)
+    }
+
+    /// 레거시(비-dotenv) profile 변수를 read-only 표로 보여준다 (E1 이행기).
+    /// 삭제만 허용(DB 직접) — 추가/수정은 .env 일원화 이후 dotenv 경로만 남는다.
+    fn legacy_vars_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        db: &mut Db,
+        legacy_profiles: &[EnvProfileRow],
+        reveal_secret: &mut dyn FnMut(&str) -> Option<String>,
+        catalog: &i18n::Catalog,
+    ) -> anyhow::Result<()> {
+        let mut rows: Vec<(String, EnvVarRow)> = Vec::new();
+        for profile in legacy_profiles {
+            for var in db.list_env_vars(&profile.id)? {
+                rows.push((profile.id.clone(), var));
+            }
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let credentials = match &self.credentials {
+            Some(c) => c.clone(),
+            None => Vec::new(),
+        };
+        ui.add_space(14.0);
+        ui.label(
+            egui::RichText::new(catalog.t("env.legacy_pending_note", &[]))
+                .size(12.0)
+                .color(ui.visuals().warn_fg_color),
+        );
+        env_table_header(
+            ui,
+            &[catalog.t("common.key", &[]), catalog.t("common.value", &[])],
+        );
+        // 처음 보는 legacy secret은 기본 마스킹(메인 표의 로드 시점 시딩과 동일 의미).
+        if !self.legacy_mask_seeded {
+            for (profile_id, var) in &rows {
+                if matches!(var.value, EnvValue::Secret { .. }) {
+                    self.masked.insert((profile_id.clone(), var.key.clone()));
+                }
+            }
+            self.legacy_mask_seeded = true;
+        }
+        let mut delete_row: Option<(String, String)> = None;
+        let mut toggle_row: Option<(String, String)> = None;
+        for (profile_id, var) in &rows {
+            let reveal_id = (profile_id.clone(), var.key.clone());
+            // 사용자가 ○로 연(마스킹 해제된) secret만 keyring resolve를 요청한다.
+            if let EnvValue::Secret { credential_id } = &var.value
+                && !self.masked.contains(&reveal_id)
+                && !self.revealed.contains_key(&reveal_id)
+                && let Some(plain) = reveal_secret(credential_id)
+            {
+                self.revealed.insert(reveal_id.clone(), plain);
+            }
+            let is_masked = self.masked.contains(&reveal_id);
+            let revealed_value = if is_masked {
+                None
+            } else {
+                self.revealed.get(&reveal_id).map(String::as_str)
+            };
+            let row = env_table_row(ui, var, &credentials, revealed_value, is_masked, catalog);
+            if row.delete {
+                delete_row = Some(reveal_id.clone());
+            }
+            if row.toggle_reveal {
+                toggle_row = Some(reveal_id.clone());
+            }
+        }
+        if let Some(id) = toggle_row
+            && !self.masked.remove(&id)
+        {
+            self.revealed.remove(&id);
+            self.masked.insert(id);
+        }
+        if let Some((profile_id, key)) = delete_row {
+            self.revealed.remove(&(profile_id.clone(), key.clone()));
+            self.masked.remove(&(profile_id.clone(), key.clone()));
+            db.delete_env_var(&profile_id, &key)?;
+            if db.list_env_vars(&profile_id)?.is_empty() {
+                db.delete_env_profile(&profile_id)?;
+            }
+            self.profiles = None;
+            self.legacy_mask_seeded = false;
+        }
+        Ok(())
     }
 }
 
@@ -734,12 +762,6 @@ fn paint_table_hline(ui: &egui::Ui, y: f32) {
         .hline(ui.min_rect().x_range(), y, egui::Stroke::new(1.0, color));
 }
 
-fn env_table_divider(ui: &mut egui::Ui) {
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
-    paint_table_hline(ui, rect.center().y);
-}
-
 fn display_env_value(
     value: &EnvValue,
     credentials: &[CredentialMeta],
@@ -756,83 +778,14 @@ fn display_env_value(
     }
 }
 
-fn compact_profile_controls(
-    ui: &mut egui::Ui,
-    state: &mut EnvProfilesUi,
-    db: &mut Db,
-    workspace_id: &str,
-    profiles: &[EnvProfileRow],
-    selected_is_production: bool,
-    catalog: &i18n::Catalog,
-) -> anyhow::Result<()> {
-    // 상단 배치(#5): 프로파일 라벨 + 칩 + 삭제, 생산 경고, 생성 폼. 아래에 구분선.
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(catalog.t("env.profile", &[]))
-                .size(13.0)
-                .weak(),
-        );
-        let mut delete_profile = None;
-        for profile in profiles {
-            let label = if profile.is_production {
-                format!("{} · {}", profile.name, profile.kind)
-            } else {
-                profile.name.clone()
-            };
-            if ui
-                .selectable_label(
-                    state.selected.as_deref() == Some(profile.id.as_str()),
-                    label,
-                )
-                .clicked()
-            {
-                state.selected = Some(profile.id.clone());
-                state.vars = None;
-                // 이전 프로파일 컨텍스트의 추가 폼 draft를 버린다(codex Med).
-                state.reset_var_form();
-            }
-            if ui
-                .small_button("×")
-                .on_hover_text(catalog.t("action.delete", &[]))
-                .clicked()
-            {
-                delete_profile = Some(profile.id.clone());
-            }
-        }
-        if let Some(id) = delete_profile {
-            if let Err(e) = db.delete_env_profile(&id) {
-                state.error = Some(format!("{e:#}"));
-            } else {
-                if state.selected.as_deref() == Some(id.as_str()) {
-                    state.selected = None;
-                }
-                state.profiles = None;
-                state.vars = None;
-                state.error = None;
-            }
-        }
-    });
-    if selected_is_production {
-        ui.colored_label(
-            ui.visuals().warn_fg_color,
-            egui::RichText::new(catalog.t("env.production_warning", &[])).size(13.0),
-        );
-    }
-    compact_profile_form(ui, state, db, workspace_id, catalog)?;
-    ui.add_space(8.0);
-    env_table_divider(ui);
-    Ok(())
-}
-
+/// 변수 추가 폼 — `.env` 단일 모드(E1): 키+값을 그대로 입력받아 파일 기록만 반환한다.
+/// secret 여부는 동기화가 키/값으로 판정해 keyring 사본(로그 마스킹용)을 만든다.
 fn compact_env_var_form(
     ui: &mut egui::Ui,
     state: &mut EnvProfilesUi,
-    db: &mut Db,
     profile_id: &str,
-    is_dotenv: bool,
-    credentials: &[CredentialMeta],
     catalog: &i18n::Catalog,
-) -> anyhow::Result<Option<(String, String)>> {
+) -> Option<(String, String)> {
     let mut written: Option<(String, String)> = None;
     ui.add_space(8.0);
     ui.horizontal(|ui| {
@@ -842,131 +795,34 @@ fn compact_env_var_form(
                 .id_source(env_var_key_input_id())
                 .desired_width(180.0),
         );
-        if is_dotenv {
-            // dotenv profile은 .env 파일이 진실 — 값을 그대로 입력받아 파일에 쓰고,
-            // secret 여부는 동기화가 키/값으로 판정해 keyring 보관한다(7번).
-            state.var_is_secret = false;
-        } else {
-            ui.selectable_value(&mut state.var_is_secret, false, "plain");
-            ui.selectable_value(&mut state.var_is_secret, true, "secret");
-        }
-        if state.var_is_secret {
-            let current = state
-                .var_credential_id
-                .as_ref()
-                .and_then(|id| credentials.iter().find(|c| &c.id == id))
-                .map(|c| c.label.clone())
-                .unwrap_or_else(|| catalog.t("common.select", &[]));
-            egui::ComboBox::from_id_salt("var_credential_compact")
-                .selected_text(current)
-                .show_ui(ui, |ui| {
-                    for cred in credentials {
-                        ui.selectable_value(
-                            &mut state.var_credential_id,
-                            Some(cred.id.clone()),
-                            format!("{} ({})", cred.label, cred.provider),
-                        );
-                    }
-                });
-        } else {
-            ui.add(
-                egui::TextEdit::singleline(&mut state.var_plain_value)
-                    .hint_text(catalog.t("common.value", &[]))
-                    .desired_width(240.0),
-            );
-        }
+        ui.add(
+            egui::TextEdit::singleline(&mut state.var_plain_value)
+                .hint_text(catalog.t("common.value", &[]))
+                .desired_width(240.0),
+        );
         let key = state.var_key.trim();
         let key_valid = !key.is_empty() && !key.contains('=') && !key.contains('\0');
-        let filled = key_valid
-            && if state.var_is_secret {
-                state.var_credential_id.is_some()
-            } else {
-                true
-            };
         if ui
-            .add_enabled(filled, egui::Button::new(catalog.t("env.add_var", &[])))
+            .add_enabled(key_valid, egui::Button::new(catalog.t("env.add_var", &[])))
             .clicked()
         {
-            if is_dotenv {
-                // dotenv는 **파일이 진실**(codex High/Med 통합, 2026-07-10): DB를 직접
-                // 만지지 않고 기록만 반환 — App이 파일에 쓰고 즉시 동기화하면 secret
-                // 판정(keyring)·DB upsert를 sync가 일관 처리한다. (직접 Plain upsert는
-                // secret-like 키에서 storage 검증에 거부됐다 — codex High.)
-                written = Some((key.to_owned(), state.var_plain_value.clone()));
-                let id = (profile_id.to_owned(), key.to_owned());
-                state.revealed.remove(&id);
-                state.masked.remove(&id);
-                state.var_key.clear();
-                state.var_plain_value.clear();
-                state.error = None;
-            } else {
-                let value = if state.var_is_secret {
-                    EnvValue::Secret {
-                        credential_id: state.var_credential_id.clone().unwrap_or_default(),
-                    }
-                } else {
-                    EnvValue::Plain(state.var_plain_value.clone())
-                };
-                match Db::validate_env_var_for_persistence(key, &value)
-                    .and_then(|_| db.upsert_env_var(profile_id, key, &value))
-                {
-                    Ok(()) => {
-                        // 같은 키 갱신 시 이전 평문/가림 상태 stale — 함께 제거(codex).
-                        let id = (profile_id.to_owned(), key.to_owned());
-                        state.revealed.remove(&id);
-                        state.masked.remove(&id);
-                        state.var_key.clear();
-                        state.var_plain_value.clear();
-                        state.vars = None;
-                        state.error = None;
-                    }
-                    Err(e) => state.error = Some(format!("{e:#}")),
-                }
-            }
+            // **파일이 진실**(codex High/Med 통합, 2026-07-10): DB를 직접 만지지 않고
+            // 기록만 반환 — App이 파일에 쓰고 즉시 동기화하면 secret 판정(keyring)·
+            // DB upsert를 sync가 일관 처리한다.
+            written = Some((key.to_owned(), state.var_plain_value.clone()));
+            let id = (profile_id.to_owned(), key.to_owned());
+            state.revealed.remove(&id);
+            state.masked.remove(&id);
+            state.var_key.clear();
+            state.var_plain_value.clear();
+            state.error = None;
         }
     });
-    Ok(written)
+    written
 }
 
 fn env_var_key_input_id() -> egui::Id {
     egui::Id::new("env_var_key_input_compact")
-}
-
-fn compact_profile_form(
-    ui: &mut egui::Ui,
-    state: &mut EnvProfilesUi,
-    db: &mut Db,
-    workspace_id: &str,
-    catalog: &i18n::Catalog,
-) -> anyhow::Result<()> {
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        ui.add(
-            egui::TextEdit::singleline(&mut state.new_name)
-                .hint_text(catalog.t("env.create_profile", &[]))
-                .desired_width(180.0),
-        );
-        // kind 프리셋(local/staging/production/custom) 제거 — production 경고 말곤 아무 역할이
-        // 없었다(2026-07-12 사용자). 추가 프로파일도 그냥 이름만으로 만든다(kind="local").
-        let name_filled = !state.new_name.trim().is_empty();
-        if ui
-            .add_enabled(
-                name_filled,
-                egui::Button::new(catalog.t("env.create_profile", &[])),
-            )
-            .clicked()
-        {
-            match db.insert_env_profile(workspace_id, state.new_name.trim(), "local") {
-                Ok(_) => {
-                    state.new_name.clear();
-                    state.profiles = None;
-                    state.error = None;
-                }
-                Err(e) => state.error = Some(format!("{e:#}")),
-            }
-        }
-    });
-    Ok(())
 }
 
 #[cfg(test)]

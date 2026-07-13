@@ -150,7 +150,21 @@ impl DotenvSyncWorker {
                     let result = if !job.force && job.previous_state == Some(baseline) {
                         Ok(None)
                     } else if let Some(root) = job.root.as_deref() {
-                        Db::open(&db_path).and_then(|db| {
+                        Db::open(&db_path).and_then(|mut db| {
+                            // force 동기화(시작·경로 지정·수동 리프레시)에서만 레거시
+                            // DB-전용 profile 변수를 .env로 이전한다(.env 일원화 E1).
+                            // 2초 주기 폴링의 fast-path에는 DB 조회를 더하지 않는다.
+                            if job.force
+                                && let Err(e) =
+                                    crate::dotenv_sync::migrate_legacy_profiles_to_dotenv(
+                                        &mut db,
+                                        &KeyringSecretStore,
+                                        &job.workspace_id,
+                                        root,
+                                    )
+                            {
+                                tracing::warn!("레거시 env profile 이전 실패: {e:#}");
+                            }
                             crate::dotenv_sync::sync_workspace_dotenv(
                                 &db,
                                 &KeyringSecretStore,
@@ -4514,6 +4528,8 @@ impl eframe::App for App {
             .iter()
             .find(|project| project.id == wsid)
             .cloned();
+        // 환경변수 편집 게이트(E1 ⑤): 프로젝트 폴더가 지정된 워크스페이스만 .env 편집 허용.
+        let env_project_root = self.active_tree_root();
         let env_project_rows_loading =
             self.env_api_projects_cache.is_none() && self.env_project_rows_pending;
         let env_project_rows_failed = self.env_project_rows_failed;
@@ -4698,6 +4714,7 @@ impl eframe::App for App {
                                                     ui,
                                                     &mut self.db,
                                                     &wsid,
+                                                    env_project_root.as_deref(),
                                                     &mut reveal,
                                                     &text,
                                                 ) {

@@ -428,3 +428,4 @@ credentials.delete_confirm.body = 删除 '{name}' 吗？钥匙串中保存的密
 env.no_project_path_note = 环境变量保存在项目文件夹的 .env 文件中。请先指定项目文件夹。
 env.legacy_pending_note = 遗留（DB）存储中的变量 — 指定项目文件夹后将自动迁移到 .env 文件。
 workspace.alias_hint = 设置别名 — 显示名称始终为“文件夹名 (别名)”。留空则仅显示文件夹名。
+workspace.open_environment = 环境变量·API 设置…

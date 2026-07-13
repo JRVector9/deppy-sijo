@@ -1015,6 +1015,8 @@ pub struct App {
     last_ui_font: Option<String>,
     /// 터미널 모노 굵기 변경 감지용(hot reload 트리거).
     last_mono_weight: String,
+    /// UI 배율 변경 감지용(zoom_factor 재적용 트리거). 첫 프레임 적용을 위해 sentinel로 시작.
+    last_ui_scale: f32,
     /// .env mtime 폴링(2s) — 사이드바 OFF면 워처가 없어 .env 변경/삭제 신호가 안 오므로
     /// (존재여부, mtime) 변화를 직접 감지해 재동기화한다(codex — stale secret 주입 방지).
     last_dotenv_check: std::time::Instant,
@@ -1277,6 +1279,7 @@ impl App {
             last_theme_dark: true,
             last_ui_font: None,
             last_mono_weight: String::new(),
+            last_ui_scale: -1.0,
             last_dotenv_check: std::time::Instant::now(),
             last_dotenv_state: None,
             dotenv_sync_worker,
@@ -3847,6 +3850,17 @@ impl eframe::App for App {
             }
             ui.ctx().request_repaint();
         }
+        // UI 배율 변경 hot reload — egui zoom_factor로 UI 전체 확대/축소(터미널은 아래
+        // set_ui_scale 역보정으로 크기 유지). 셀 크기가 변하니 렌더 캐시도 무효화.
+        if (self.config.ui.ui_scale - self.last_ui_scale).abs() > f32::EPSILON {
+            self.last_ui_scale = self.config.ui.ui_scale;
+            ui.ctx().set_zoom_factor(self.config.ui.ui_scale);
+            self.active.workspace_ui.clear_render_caches();
+            for rt in self.warm.values_mut() {
+                rt.workspace_ui.clear_render_caches();
+            }
+            ui.ctx().request_repaint();
+        }
         // 타이틀바 통합 바: 패널 기본 inner_margin(8)을 없애 상단 경계에 붙이고 좌측
         // 여백을 제거한다(#67 사용자). 항목은 신호등 높이(28pt 타이틀바, 중심 y≈14)에
         // 맞춰 세로 중앙 정렬.
@@ -3959,6 +3973,10 @@ impl eframe::App for App {
             .find(|w| w.id == self.active.id)
             .map(Self::workspace_display_name);
         self.active.workspace_ui.set_project_name(project_name);
+        // 터미널 폰트 역보정용 UI 배율 전달(zoom_factor로 커진 만큼 font_size를 되돌린다).
+        self.active
+            .workspace_ui
+            .set_ui_scale(self.config.ui.ui_scale);
 
         // 폴더 트리 사이드바 (FT-1) — CentralPanel보다 먼저 배치해야 한다 (§9-1).
         // OFF(None)면 Panel 자체를 만들지 않는다 (§6 리소스 0).

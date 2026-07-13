@@ -43,6 +43,8 @@ settings.appearance = 外觀
 settings.theme.hint = 僅切換外殼 — 終端機窗格永遠為深色
 settings.ui_font = 介面字體
 settings.ui_font.hint = 介面文字字體（支援韓文的系統字體）
+settings.ui_scale = 介面文字縮放
+settings.ui_scale.hint = 縮放側邊欄、標題、設定等介面文字。1.0 = 預設。終端機保持自身大小。
 settings.ui_font.auto = 預設（自動）
 settings.file_tree.hint = 關閉則不建立面板 — 零資源
 settings.auto_resume = 自動恢復工作階段

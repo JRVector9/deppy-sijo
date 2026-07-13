@@ -43,6 +43,8 @@ settings.appearance = 모양
 settings.theme.hint = 창 크롬만 전환, 터미널 pane은 항상 다크
 settings.ui_font = UI 폰트
 settings.ui_font.hint = 사이드바·설정 등 UI 텍스트 폰트 (한글 지원 시스템 폰트)
+settings.ui_scale = UI 텍스트 배율
+settings.ui_scale.hint = 사이드바·헤더·설정 등 UI 텍스트를 확대/축소합니다. 1.0 = 기본. 터미널은 자기 크기를 유지합니다.
 settings.ui_font.auto = 기본(자동)
 settings.file_tree.hint = OFF면 Panel 미생성 — 리소스 0
 settings.auto_resume = 세션 자동 이어가기

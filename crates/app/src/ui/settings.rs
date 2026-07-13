@@ -1503,6 +1503,18 @@ fn general_page(
     );
     row(
         ui,
+        &catalog.t("settings.ui_scale", &[]),
+        Some(&catalog.t("settings.ui_scale.hint", &[])),
+        |ui| {
+            let mut v = config.ui.ui_scale;
+            if stepper_f32(ui, &mut v, 0.05, 0.7, 1.5) {
+                config.ui.ui_scale = v;
+                *changed = true;
+            }
+        },
+    );
+    row(
+        ui,
         &catalog.t("settings.file_tree_sidebar", &[]),
         Some(&catalog.t("settings.file_tree.hint", &[])),
         |ui| {

@@ -43,6 +43,8 @@ settings.appearance = 外観
 settings.theme.hint = クロームのみ切替 — ターミナルは常にダーク
 settings.ui_font = UIフォント
 settings.ui_font.hint = UIテキストのフォント（韓国語対応システムフォント）
+settings.ui_scale = UIテキストの倍率
+settings.ui_scale.hint = サイドバー・ヘッダー・設定などUIテキストを拡大/縮小します。1.0=既定。ターミナルは独自サイズを維持。
 settings.ui_font.auto = 既定（自動）
 settings.file_tree.hint = OFFでパネル非生成 — リソース0
 settings.auto_resume = セッション自動再開

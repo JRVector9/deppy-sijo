@@ -426,21 +426,12 @@ const DB_CALL_ALLOW: &[BoundaryAllow] = &[
     },
     // env_profiles: dead 비-compact contents() 삭제(PR-ENV-D)로 compact 경로의 실제
     // 스니펫으로 재등록(2026-07-09). 예외 수는 삭제 전과 동일 범주(기존 storage UI 예외).
+    // .env 일원화(E1, eb2bbe4)로 DB 전용 profile 생성/수정 경로가 사라져 insert/upsert
+    // 예외를 제거하고, 대신 **레거시 이전 전용** 조회/삭제 경로를 등록한다(2026-07-14).
+    // 레거시 이전이 끝나 해당 UI가 삭제되면 아래 3개(list/delete)도 함께 지운다.
     BoundaryAllow {
         path: "crates/app/src/ui/env_profiles.rs",
         snippet: "let p = db.list_env_profiles(workspace_id)?;",
-        count: 2, // 초기 조회 + 프로파일 controls 후 재조회(codex High 재확정)
-        reason: "existing env profile storage UI exception",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/env_profiles.rs",
-        snippet: "if let Err(e) = db.delete_env_profile(&id) {",
-        count: 1,
-        reason: "existing env profile storage UI exception",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/env_profiles.rs",
-        snippet: "match db.insert_env_profile(workspace_id, state.new_name.trim(), state.new_kind) {",
         count: 1,
         reason: "existing env profile storage UI exception",
     },
@@ -462,11 +453,24 @@ const DB_CALL_ALLOW: &[BoundaryAllow] = &[
         count: 1,
         reason: "existing env profile storage UI exception",
     },
+    // 아래 3개: 레거시 env profile 이전 UI (E1) 전용 — 이전 완료 후 UI와 함께 제거 대상.
     BoundaryAllow {
         path: "crates/app/src/ui/env_profiles.rs",
-        snippet: ".and_then(|_| db.upsert_env_var(profile_id, key, &value))",
+        snippet: "for var in db.list_env_vars(&profile.id)? {",
         count: 1,
-        reason: "existing env profile storage UI exception",
+        reason: "legacy env profile migration UI (E1) — remove with the migration UI",
+    },
+    BoundaryAllow {
+        path: "crates/app/src/ui/env_profiles.rs",
+        snippet: "if db.list_env_vars(&profile_id)?.is_empty() {",
+        count: 1,
+        reason: "legacy env profile migration UI (E1) — remove with the migration UI",
+    },
+    BoundaryAllow {
+        path: "crates/app/src/ui/env_profiles.rs",
+        snippet: "db.delete_env_profile(&profile_id)?;",
+        count: 1,
+        reason: "legacy env profile migration UI (E1) — remove with the migration UI",
     },
 ];
 

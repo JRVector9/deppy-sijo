@@ -311,61 +311,67 @@ pub fn draw(
         }
     }
 
-    // 커서 (스크롤 중이거나 hidden이면 snapshot.visible이 false)
+    // 커서 좌표는 hidden이어도 유효하다 — IME/preedit 배치에 계속 쓴다.
+    let cursor_pos = origin
+        + egui::vec2(
+            snapshot.cursor.col as f32 * cell.x,
+            snapshot.cursor.row as f32 * cell.y,
+        );
+    // 커서 rect (스크롤 중이거나 hidden이면 snapshot.visible이 false)
     if snapshot.cursor.visible {
         // 커서 rect는 셀 전체를 채운다(배경과 동일) — text_dy는 글자에만 적용한다.
-        let pos = origin
-            + egui::vec2(
-                snapshot.cursor.col as f32 * cell.x,
-                snapshot.cursor.row as f32 * cell.y,
-            );
         let cursor_color = egui::Color32::from_rgba_unmultiplied(0xd8, 0xd8, 0xd8, 0xa0);
         let cursor_rect = match snapshot.cursor.shape {
-            CursorShape::Block => egui::Rect::from_min_size(pos, cell),
+            CursorShape::Block => egui::Rect::from_min_size(cursor_pos, cell),
             CursorShape::Underline => egui::Rect::from_min_size(
-                pos + egui::vec2(0.0, cell.y - 2.0),
+                cursor_pos + egui::vec2(0.0, cell.y - 2.0),
                 egui::vec2(cell.x, 2.0),
             ),
-            CursorShape::Beam => egui::Rect::from_min_size(pos, egui::vec2(2.0, cell.y)),
+            CursorShape::Beam => egui::Rect::from_min_size(cursor_pos, egui::vec2(2.0, cell.y)),
         };
         painter.rect_filled(cursor_rect, 0.0, cursor_color);
         cache.counters.shapes += 1;
+    }
 
-        // IME는 터미널이 포커스를 가질 때만 — 다른 입력창의 조합/후보창을 뺏지 않는다
-        if response.has_focus() {
-            // 조합 중 텍스트를 커서 위치에 표시
-            if let Some(preedit) = preedit.filter(|p| !p.is_empty()) {
-                // 조합 텍스트도 글자이므로 셀 안 세로 중앙 정렬을 따른다.
-                let text_pos = pos + egui::vec2(0.0, text_dy);
-                let galley_rect = painter.text(
-                    text_pos,
-                    egui::Align2::LEFT_TOP,
-                    preedit,
-                    font_id.clone(),
-                    egui::Color32::BLACK,
-                );
-                painter.rect_filled(galley_rect, 0.0, egui::Color32::from_rgb(0xd8, 0xd8, 0xd8));
-                painter.text(
-                    text_pos,
-                    egui::Align2::LEFT_TOP,
-                    preedit,
-                    font_id,
-                    egui::Color32::BLACK,
-                );
-                painter.line_segment(
-                    [galley_rect.left_bottom(), galley_rect.right_bottom()],
-                    egui::Stroke::new(1.5, egui::Color32::BLACK),
-                );
-                cache.counters.shapes += 4; // text ×2 + rect_filled + line_segment
-            }
-            ui.ctx().output_mut(|o| {
-                o.ime = Some(egui::output::IMEOutput {
-                    rect,
-                    cursor_rect: egui::Rect::from_min_size(pos, cell),
-                    should_interrupt_composition: false,
-                });
-            });
+    // IME는 터미널이 포커스를 가질 때만 — 다른 입력창의 조합/후보창을 뺏지 않는다.
+    // **커서 가시성과는 무관하게** 매 프레임 세팅해야 한다: egui-winit은
+    // `allow_ime = ime.is_some()`이라(0.35 handle_platform_output), 한 프레임이라도
+    // 비우면 set_ime_allowed(false)로 macOS가 진행 중인 한글 조합을 강제 커밋한다.
+    // TUI(claude 등)는 리드로우마다 커서를 숨겼다 켜므로(?25l/?25h) 커서 가시성에
+    // 묶으면 조합이 자모 단위로 끊긴다 (2026-07-14 사용자: "ㄹㅗ" 분리).
+    if response.has_focus() {
+        // 조합 중 텍스트를 커서 위치에 표시
+        if let Some(preedit) = preedit.filter(|p| !p.is_empty()) {
+            // 조합 텍스트도 글자이므로 셀 안 세로 중앙 정렬을 따른다.
+            let text_pos = cursor_pos + egui::vec2(0.0, text_dy);
+            let galley_rect = painter.text(
+                text_pos,
+                egui::Align2::LEFT_TOP,
+                preedit,
+                font_id.clone(),
+                egui::Color32::BLACK,
+            );
+            painter.rect_filled(galley_rect, 0.0, egui::Color32::from_rgb(0xd8, 0xd8, 0xd8));
+            painter.text(
+                text_pos,
+                egui::Align2::LEFT_TOP,
+                preedit,
+                font_id,
+                egui::Color32::BLACK,
+            );
+            painter.line_segment(
+                [galley_rect.left_bottom(), galley_rect.right_bottom()],
+                egui::Stroke::new(1.5, egui::Color32::BLACK),
+            );
+            cache.counters.shapes += 4; // text ×2 + rect_filled + line_segment
         }
+        ui.ctx().output_mut(|o| {
+            o.ime = Some(egui::output::IMEOutput {
+                rect,
+                cursor_rect: egui::Rect::from_min_size(cursor_pos, cell),
+                should_interrupt_composition: false,
+            });
+        });
     }
 
     RenderOutput {
@@ -811,6 +817,32 @@ mod tests {
         assert!(
             (rect.right() - grid_right - 3.0).abs() < 0.01,
             "rect={rect:?}, origin={origin:?}, cell={cell:?}, grid_right={grid_right}"
+        );
+    }
+
+    #[test]
+    fn ime_영역은_커서가_숨어도_포커스면_계속_통보된다() {
+        // egui-winit은 o.ime가 비는 프레임마다 set_ime_allowed(false)를 호출해
+        // macOS가 진행 중인 한글 조합을 강제 커밋한다. TUI는 리드로우마다 커서를
+        // 숨기므로(?25l) 커서 가시성에 IME를 묶으면 자모가 분리된다 (2026-07-14).
+        let ctx = egui::Context::default();
+        let mut cache = TerminalRenderCache::default();
+        let mut snapshot = snap(4, 1, &["test"]);
+        snapshot.cursor.visible = false;
+        // 1프레임: 그리고 포커스 요청
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_min_size(egui::vec2(500.0, 200.0));
+            let out = draw(ui, &snapshot, m(13.0, 1.0), &mut cache, None, None, next_gen());
+            out.response.request_focus();
+        });
+        // 2프레임: 포커스 보유 — 커서가 숨어 있어도 IME 영역은 통보돼야 한다
+        let full = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_min_size(egui::vec2(500.0, 200.0));
+            draw(ui, &snapshot, m(13.0, 1.0), &mut cache, None, None, next_gen());
+        });
+        assert!(
+            full.platform_output.ime.is_some(),
+            "커서 숨김 프레임에서 IME가 비면 조합이 끊긴다"
         );
     }
 

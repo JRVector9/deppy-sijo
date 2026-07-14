@@ -25,6 +25,12 @@ pub struct WorkspaceUi {
     /// 세션 → 셸 pid (App이 ResourceUsage에서 매 프레임 갱신). 터미널 경로 더블클릭의
     /// 상대경로를 그 셸의 실제 cwd로 해석하는 데 쓴다 (2026-07-14).
     session_pids: HashMap<SessionId, u32>,
+    /// 마지막으로 egui Event::Paste 텍스트를 직접 전송한 시각. ⌘V는 press에서
+    /// Event::Paste가, release에서 키 이벤트가 **다른 프레임으로** 도착할 수 있다 —
+    /// 그때 release 쪽 이미지 태스크가 클립보드 텍스트 fallback으로 같은 내용을
+    /// 한 번 더 보내 이중 붙여넣기가 됐다 (2026-07-14 사용자). 같은 제스처로 보고
+    /// release 태스크를 건너뛰기 위한 표식.
+    last_text_paste: Option<std::time::Instant>,
     /// 세션별 마지막 전송한 (cols, rows) — 변화 시에만 Resize 전송
     sent_sizes: HashMap<SessionId, (u16, u16)>,
     /// 트랙패드 미세 스크롤 누적 (focused pane 기준)
@@ -168,6 +174,7 @@ impl WorkspaceUi {
             project_name: None,
             ui_scale: 1.0,
             session_pids: HashMap::new(),
+            last_text_paste: None,
             session_cwds: std::collections::HashMap::new(),
             session_name_style: crate::config::SessionNameStyle::default(),
             agent_info: std::collections::HashMap::new(),
@@ -1610,21 +1617,32 @@ impl WorkspaceUi {
                 ui.ctx().copy_text(text);
             }
             if image_paste_requested {
-                // 파일/이미지 판별 + PNG 인코딩은 백그라운드로(UI 딜레이 제거 — 2026-07-07).
-                // 완료는 show()의 poll_paste_task가 소비한다. 연타 ⌘V는 최신 것으로 대체.
-                let text_fallback = text_paste_bytes.take();
-                self.paste_task = Some(PendingPaste {
-                    rx: crate::ui::clipboard_image::paste_clipboard_paths_or_image_background(
-                        ui.ctx().clone(),
-                        text_fallback.is_some(),
-                    ),
-                    session,
-                    bracketed,
-                    shell_kind: self.session_shell_kind(session),
-                    text_fallback,
-                    requested_at: std::time::Instant::now(),
-                });
+                if should_skip_release_paste_task(
+                    text_paste_bytes.is_some(),
+                    self.last_text_paste,
+                ) {
+                    // 같은 ⌘V 제스처의 press에서 Event::Paste 텍스트를 이미 보냈다 —
+                    // release 태스크까지 돌리면 클립보드 fallback이 같은 내용을 한 번 더
+                    // 보낸다(이중 붙여넣기, 2026-07-14). 제스처 1회로 소비하고 스킵.
+                    self.last_text_paste = None;
+                } else {
+                    // 파일/이미지 판별 + PNG 인코딩은 백그라운드로(UI 딜레이 제거 — 2026-07-07).
+                    // 완료는 show()의 poll_paste_task가 소비한다. 연타 ⌘V는 최신 것으로 대체.
+                    let text_fallback = text_paste_bytes.take();
+                    self.paste_task = Some(PendingPaste {
+                        rx: crate::ui::clipboard_image::paste_clipboard_paths_or_image_background(
+                            ui.ctx().clone(),
+                            text_fallback.is_some(),
+                        ),
+                        session,
+                        bracketed,
+                        shell_kind: self.session_shell_kind(session),
+                        text_fallback,
+                        requested_at: std::time::Instant::now(),
+                    });
+                }
             } else if let Some(bytes) = text_paste_bytes {
+                self.last_text_paste = Some(std::time::Instant::now());
                 pending.extend(bytes);
             }
             if !pending.is_empty() {
@@ -2390,6 +2408,26 @@ fn clipboard_terminal_paste_bytes(
     }
 }
 
+/// ⌘V press의 Event::Paste와 release 키 이벤트 사이 간격 상한 — 이 안이면 같은
+/// 붙여넣기 제스처로 본다. 키를 길게 누르는 경우까지 덮되, 별개의 두 붙여넣기
+/// (포커스 상태 변화로 Paste 전달 여부가 바뀐 경우)를 오인하지 않을 만큼 짧게.
+const PASTE_GESTURE_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// ⌘V release가 띄우는 이미지 paste 태스크를 건너뛸지 판정한다.
+///
+/// 같은 프레임에 Event::Paste가 왔으면(text_fallback 보유) 태스크가 그 텍스트를
+/// fallback으로 쓰므로 태스크를 돌려도 1회 전송이다. 문제는 press(Event::Paste)와
+/// release(키 이벤트)가 **다른 프레임**으로 갈라진 경우 — press에서 텍스트를 이미
+/// 직접 전송했는데 release 태스크가 클립보드 텍스트를 다시 읽어 한 번 더 보낸다.
+/// 직전 PASTE_GESTURE_WINDOW 안에 직접 전송이 있었으면 같은 제스처로 보고 스킵한다.
+fn should_skip_release_paste_task(
+    has_text_fallback: bool,
+    last_text_paste: Option<std::time::Instant>,
+) -> bool {
+    !has_text_fallback
+        && last_text_paste.is_some_and(|at| at.elapsed() < PASTE_GESTURE_WINDOW)
+}
+
 fn is_clipboard_paste_shortcut(event: &egui::Event) -> bool {
     let egui::Event::Key {
         key: egui::Key::V,
@@ -2687,6 +2725,21 @@ mod tests {
         assert_eq!(resolve_path_click("hello", Some(&base)), None);
 
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn 페이스트_release_태스크는_같은_제스처의_직접_전송_직후에만_스킵된다() {
+        let now = std::time::Instant::now();
+        let old = now.checked_sub(PASTE_GESTURE_WINDOW * 2);
+        // press에서 Event::Paste 텍스트를 이미 보냈고 fallback이 없다 → 스킵 (이중 방지)
+        assert!(should_skip_release_paste_task(false, Some(now)));
+        // 같은 프레임에 Paste가 왔다(fallback 보유) → 태스크가 fallback을 쓰므로 진행
+        assert!(!should_skip_release_paste_task(true, Some(now)));
+        // 직접 전송 이력이 없거나 오래됐다 → 별개 제스처, 진행
+        assert!(!should_skip_release_paste_task(false, None));
+        if let Some(old) = old {
+            assert!(!should_skip_release_paste_task(false, Some(old)));
+        }
     }
 
     #[test]

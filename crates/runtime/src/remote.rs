@@ -467,7 +467,11 @@ impl OutboundEventQueue {
             if let std::collections::hash_map::Entry::Occupied(mut entry) =
                 self.viewports.entry(session)
             {
-                entry.insert(event);
+                // 아직 송신 안 된 이전 스냅샷의 dirty 델타를 합친다 — 버리면 원격
+                // 뷰어 renderer가 그 행들을 재shaping하지 않아 stale로 남는다
+                // (in_process 슬롯과 동일 클래스, 2026-07-14 codex 리뷰).
+                let prev = entry.insert(event);
+                crate::event::merge_unconsumed_viewport_dirty(&prev, entry.get_mut());
                 return Ok(());
             }
             while self.viewports.len() >= self.viewport_cap {
@@ -2106,11 +2110,20 @@ fn dispatch(subscribers: &Arc<Mutex<Vec<RemoteSubscriber>>>, event: RuntimeEvent
                 if Arc::strong_count(&subscriber.viewports) <= 1 {
                     return false;
                 }
-                subscriber
-                    .viewports
-                    .lock()
-                    .expect("remote viewport slot lock")
-                    .insert(*session, event.clone());
+                {
+                    let mut slot = subscriber
+                        .viewports
+                        .lock()
+                        .expect("remote viewport slot lock");
+                    let prev = slot.insert(*session, event.clone());
+                    // in_process와 동일 — 미소비 스냅샷의 dirty 델타를 합쳐야 renderer가
+                    // 그 행들을 재shaping한다 (2026-07-14 codex 리뷰: 동일 클래스 누락).
+                    if let Some(prev) = prev
+                        && let Some(current) = slot.get_mut(session)
+                    {
+                        crate::event::merge_unconsumed_viewport_dirty(&prev, current);
+                    }
+                }
                 true
             } else if let RuntimeEvent::PtyInputPressure { session, .. } = &event {
                 if Arc::strong_count(&subscriber.input_pressures) <= 1 {

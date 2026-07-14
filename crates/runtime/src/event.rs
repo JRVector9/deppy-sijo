@@ -157,9 +157,21 @@ pub fn merge_unconsumed_viewport_dirty(prev: &RuntimeEvent, next: &mut RuntimeEv
         && !prev_snapshot.dirty_ranges.is_empty()
     {
         // visible_cells는 Arc 공유라 make_mut의 스냅샷 클론은 저렴하다(셀 복사 없음).
-        Arc::make_mut(snapshot)
+        let merged = Arc::make_mut(snapshot);
+        merged
             .dirty_ranges
             .extend(prev_snapshot.dirty_ranges.iter().cloned());
+        // 소비자가 오래 멈춘 채 덮어쓰기가 반복되면 누적 범위가 무한히 자란다
+        // (codex 리뷰 HIGH). 행 수를 넘으면 정보량이 "전체 dirty"와 같으므로
+        // 전체 grid 범위 하나로 붕괴시켜 상한을 둔다.
+        if merged.dirty_ranges.len() > merged.rows as usize {
+            let cells = (merged.cols as usize) * (merged.rows as usize);
+            merged.dirty_ranges.clear();
+            merged.dirty_ranges.push(terminal::CellRange {
+                start: 0,
+                end: cells.saturating_sub(1),
+            });
+        }
     }
 }
 

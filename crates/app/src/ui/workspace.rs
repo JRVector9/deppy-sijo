@@ -1371,23 +1371,43 @@ impl WorkspaceUi {
                 && let Some((s, e)) = word_range_at(&snapshot, cell_at(pos))
             {
                 let word = renderer_egui::selection_text(&snapshot, s, e);
-                if let Some(PathClick::Dir(path)) = self.resolve_path_cached(session, &word) {
+                if matches!(
+                    self.resolve_path_cached(session, &word),
+                    Some(PathClick::Dir(_))
+                ) {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    if output.response.clicked() {
-                        // 더블클릭은 clicked를 두 번 발화 — 같은 경로 연속 cd를 막는다.
-                        let duplicate = self.last_dir_click.as_ref().is_some_and(|(p, at)| {
-                            *p == path && at.elapsed() < std::time::Duration::from_millis(800)
-                        });
-                        if !duplicate {
-                            self.last_dir_click =
-                                Some((path.clone(), std::time::Instant::now()));
-                            // cd로 셸 cwd가 바뀐다 — 상대경로 해석 캐시 즉시 무효화.
-                            self.session_cwd_cache = None;
-                            self.path_click_cache = None;
-                            let bytes =
-                                format!("cd {}\n", shell_single_quote(&path.to_string_lossy()))
-                                    .into_bytes();
-                            self.send(client, RuntimeCommand::WriteInput { session, bytes });
+                    // 포커스된 pane에서만 cd — 비포커스 pane을 포커스하려는 클릭이
+                    // cd까지 주입하면 안 된다 (codex 리뷰 MEDIUM). 첫 클릭은 포커스만,
+                    // 포커스된 뒤의 클릭이 이동한다.
+                    if output.response.clicked() && focused {
+                        // 클릭은 캐시를 거치지 않는다 — 사용자가 방금 손으로 cd를
+                        // 타이핑했으면 2s TTL 캐시가 옛 cwd 기준 경로를 줄 수 있다
+                        // (codex 리뷰 MEDIUM). hover 커서는 캐시(성능), 실행은 신선 해석.
+                        self.session_cwd_cache = None;
+                        self.path_click_cache = None;
+                        if let Some(PathClick::Dir(path)) =
+                            self.resolve_path_cached(session, &word)
+                        {
+                            // 더블클릭은 clicked를 두 번 발화 — 같은 경로 연속 cd를 막는다.
+                            let duplicate = self.last_dir_click.as_ref().is_some_and(|(p, at)| {
+                                *p == path
+                                    && at.elapsed() < std::time::Duration::from_millis(800)
+                            });
+                            if !duplicate {
+                                self.last_dir_click =
+                                    Some((path.clone(), std::time::Instant::now()));
+                                // file tree의 "이 폴더로 이동"과 같은 헬퍼 — 셸별
+                                // cd 문법/인용(PowerShell -LiteralPath, cmd /d)을 공유.
+                                let bytes = cd_paste_bytes(
+                                    &path,
+                                    self.session_shell_kind(session),
+                                    bracketed,
+                                );
+                                self.send(client, RuntimeCommand::WriteInput { session, bytes });
+                                // cd로 셸 cwd가 바뀐다 — 방금 만든 해석 캐시도 무효.
+                                self.session_cwd_cache = None;
+                                self.path_click_cache = None;
+                            }
                         }
                     }
                 }
@@ -2497,9 +2517,11 @@ fn clipboard_terminal_paste_bytes(
 }
 
 /// ⌘V press의 Event::Paste와 release 키 이벤트 사이 간격 상한 — 이 안이면 같은
-/// 붙여넣기 제스처로 본다. 키를 길게 누르는 경우까지 덮되, 별개의 두 붙여넣기
-/// (포커스 상태 변화로 Paste 전달 여부가 바뀐 경우)를 오인하지 않을 만큼 짧게.
-const PASTE_GESTURE_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+/// 붙여넣기 제스처로 본다. 보통 탭의 press→release는 50~200ms. 너무 길면 별개의
+/// 두 붙여넣기를 오인한다 — 메뉴 텍스트 붙여넣기 직후의 ⌘V 이미지 붙여넣기가
+/// 스킵되는 구멍 (codex 리뷰 MEDIUM, 3s→600ms 축소). 600ms 이상 키를 누르고
+/// 있는 경우는 OS 키 반복이 Event::Paste를 다시 보내 타임스탬프가 갱신된다.
+const PASTE_GESTURE_WINDOW: std::time::Duration = std::time::Duration::from_millis(600);
 
 /// ⌘V release가 띄우는 이미지 paste 태스크를 건너뛸지 판정한다.
 ///
@@ -2568,19 +2590,24 @@ const OPENABLE_EXTS: &[&str] = &[
 /// None이면 더블클릭은 기존 동작(단어 선택)만 한다.
 fn resolve_path_click(word: &str, cwd: Option<&Path>) -> Option<PathClick> {
     // 꼬리는 따옴표와 문말 부호가 섞여 올 수 있어("'docs',") 통합 집합으로 벗긴다.
+    // 머리도 여는 괄호류가 붙어 올 수 있다("(docs/report.pdf)" — codex 리뷰).
     let token = word
-        .trim_start_matches(|c: char| "\"'`".contains(c))
+        .trim_start_matches(|c: char| "\"'`([{<".contains(c))
         .trim_end_matches(|c: char| "\"'`.,;!?)]}>".contains(c));
     if token.is_empty() {
         return None;
     }
-    // "path.py:33" → "path.py" 후보도 함께 시도 (Claude/컴파일러 출력 관례)
+    // "path.py:33" / "src/main.rs:12:34" → 숫자 suffix를 반복해서 벗긴 후보도 시도
+    // (Claude/컴파일러 출력 관례 — rustc는 :행:칸 두 개가 붙는다, codex 리뷰).
     let mut candidates = vec![token];
-    if let Some((head, tail)) = token.rsplit_once(':')
-        && !head.is_empty()
+    let mut head = token;
+    while let Some((rest, tail)) = head.rsplit_once(':')
+        && !rest.is_empty()
+        && !tail.is_empty()
         && tail.chars().all(|c| c.is_ascii_digit())
     {
-        candidates.push(head);
+        candidates.push(rest);
+        head = rest;
     }
     for cand in candidates {
         let path = if let Some(rest) = cand.strip_prefix("~/") {
@@ -2597,21 +2624,23 @@ fn resolve_path_click(word: &str, cwd: Option<&Path>) -> Option<PathClick> {
         if meta.is_dir() {
             return Some(PathClick::Dir(path));
         }
-        let openable = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| OPENABLE_EXTS.contains(&e.to_ascii_lowercase().as_str()));
-        if meta.is_file() && openable {
+        let ext_openable = |p: &Path| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| OPENABLE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+        };
+        // 허용목록은 **실체(canonical) 경로의 확장자**로도 검사한다 — "safe.pdf"가
+        // 실행파일을 가리키는 심링크면 open이 실행해버린다 (codex 리뷰 하드닝).
+        if meta.is_file()
+            && ext_openable(&path)
+            && std::fs::canonicalize(&path).is_ok_and(|real| ext_openable(&real))
+        {
             return Some(PathClick::OpenFile(path));
         }
     }
     None
 }
 
-/// 셸 단일따옴표 인용 — 내부 `'`는 `'\''`로. cd 주입에 쓴다.
-fn shell_single_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
-}
 
 fn word_range_at(
     snapshot: &terminal::TerminalViewportSnapshot,
@@ -2854,13 +2883,28 @@ mod tests {
         );
         // cwd 없이 상대경로는 해석 불가
         assert_eq!(resolve_path_click("docs", None), None);
-        // 허용 확장자 파일 → OpenFile, 줄번호 suffix 제거
+        // 허용 확장자 파일 → OpenFile, 줄번호 suffix 제거 (rustc의 :행:칸 이중 포함)
         assert_eq!(
             resolve_path_click("report.pdf:12", Some(&base)),
             Some(PathClick::OpenFile(base.join("report.pdf")))
         );
+        assert_eq!(
+            resolve_path_click("report.pdf:12:34", Some(&base)),
+            Some(PathClick::OpenFile(base.join("report.pdf")))
+        );
+        // 여는 괄호로 감싼 표기도 해석된다
+        assert_eq!(
+            resolve_path_click("(report.pdf)", Some(&base)),
+            Some(PathClick::OpenFile(base.join("report.pdf")))
+        );
         // 스크립트는 열지 않는다 (open은 실행 가능 대상을 실행하므로)
         assert_eq!(resolve_path_click("run.sh", Some(&base)), None);
+        // pdf로 위장한 심링크가 스크립트를 가리키면 열지 않는다 (canonical 확장자 검사)
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(base.join("run.sh"), base.join("fake.pdf")).unwrap();
+            assert_eq!(resolve_path_click("fake.pdf", Some(&base)), None);
+        }
         // 존재하지 않는 일반 단어 → None (기존 더블클릭 선택만)
         assert_eq!(resolve_path_click("hello", Some(&base)), None);
 
@@ -2880,12 +2924,6 @@ mod tests {
         if let Some(old) = old {
             assert!(!should_skip_release_paste_task(false, Some(old)));
         }
-    }
-
-    #[test]
-    fn 셸_단일따옴표_인용은_내부_따옴표를_이스케이프한다() {
-        assert_eq!(shell_single_quote("/a b/c"), "'/a b/c'");
-        assert_eq!(shell_single_quote("it's"), r"'it'\''s'");
     }
 
     fn tab_id(name: &str) -> MuxTabId {

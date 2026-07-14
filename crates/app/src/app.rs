@@ -3954,6 +3954,10 @@ impl eframe::App for App {
         let mut runtime_stream_overflowed = false;
         for rt in self.warm.values_mut() {
             let events = rt.events.drain();
+            // active와 동일 — 예산 초과 backlog는 wake가 이미 소진돼 직접 예약해야 한다.
+            if rt.events.has_backlog() {
+                ctx.request_repaint();
+            }
             if rt.events.take_overflowed() {
                 runtime_stream_overflowed = true;
                 rt.event_overflow_pending = true;
@@ -4011,6 +4015,12 @@ impl eframe::App for App {
             // 이미 subscribe_runtime_events의 wake로 리페인트를 요청했다. 재요청하면 이번
             // 프레임이 그리는 내용을 위해 프레임을 한 장 더 잡고, egui가 거기에 settle 프레임을
             // 하나 더 붙여 갱신 1회당 3프레임이 된다 (agenttui 실측: 페인트의 70%가 헛 프레임).
+        }
+        // 예외: drain이 durable 예산(256/프레임)을 다 써 backlog를 남겼으면 다음
+        // 프레임을 직접 예약한다 — 남은 이벤트의 wake는 이미 coalesce돼 사라졌으므로
+        // 예약하지 않으면 lifecycle 이벤트가 무관한 리페인트까지 굶는다 (codex 리뷰 HIGH).
+        if self.active.events.has_backlog() {
+            ctx.request_repaint();
         }
         if self.active.events.take_overflowed() {
             self.runtime_stream_warning = true;

@@ -43,6 +43,18 @@ impl RuntimeEventReceiver {
     }
 
     /// durable 큐 포화가 있었으면 true를 한 번 반환한다.
+    /// drain()이 durable 예산(DURABLE_DRAIN_BUDGET)을 다 써서 이벤트를 남겨뒀는가.
+    /// wake는 enqueue 시점에만 오고 egui에서 coalesce되므로, 남긴 backlog에는 새
+    /// wake가 없다 — 소비자는 이게 true면 다음 프레임을 직접 예약해야 backlog가
+    /// 굶지 않는다 (2026-07-14 codex 리뷰 HIGH: logic()의 상시 request_repaint 제거로
+    /// 노출된 경로).
+    pub fn has_backlog(&self) -> bool {
+        self.pending_durable
+            .lock()
+            .expect("pending durable lock")
+            .is_some()
+    }
+
     pub fn take_overflowed(&self) -> bool {
         self.overflowed.swap(false, Ordering::AcqRel)
     }

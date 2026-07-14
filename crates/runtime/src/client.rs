@@ -111,10 +111,22 @@ impl RuntimeEventReceiver {
                 Ok(event) => {
                     *self.pending_durable.lock().expect("pending durable lock") = Some(event);
                     // durable 순서를 지키기 위해 최신값은 다음 drain으로 되돌린다. 그 사이
-                    // worker가 더 새 값을 넣었다면 entry를 덮지 않아 진짜 최신본을 보존한다.
+                    // worker가 더 새 값을 넣었다면 콘텐츠는 새 값을 보존하되, 되돌리는
+                    // 이벤트의 dirty 델타는 합쳐 넘긴다 — 버리면 그 행들이 renderer
+                    // 재shaping에서 빠져 stale로 남는다 (event.rs 헬퍼 주석).
                     let mut current_viewports = self.viewports.lock().expect("viewport slot lock");
                     for (session, event) in viewports {
-                        current_viewports.entry(session).or_insert(event);
+                        match current_viewports.entry(session) {
+                            std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                                crate::event::merge_unconsumed_viewport_dirty(
+                                    &event,
+                                    occupied.get_mut(),
+                                );
+                            }
+                            std::collections::hash_map::Entry::Vacant(vacant) => {
+                                vacant.insert(event);
+                            }
+                        }
                     }
                     drop(current_viewports);
                     let mut current_pressures = self

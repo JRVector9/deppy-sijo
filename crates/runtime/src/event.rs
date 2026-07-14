@@ -134,9 +134,91 @@ pub enum RuntimeEvent {
     },
 }
 
+/// 최신값 슬롯에서 Viewport를 교체할 때, **아직 소비되지 않은** 이전 이벤트의
+/// dirty_ranges를 새 이벤트에 합친다.
+///
+/// 슬롯 덮어쓰기는 콘텐츠(전체 grid)에는 안전하지만 `dirty_ranges`는 "직전
+/// take_snapshot 대비 델타"다 — 소비 전에 덮어쓰면 이전 델타의 행들이 renderer의
+/// 행 갤리 재shaping 대상에서 빠져 **화면에 낡은 텍스트가 남는다** (2026-07-14
+/// "붙여넣기 후 커서 앞 글자 미표시" 원인. worker 8ms 페이싱 vs UI vsync 16.6ms라
+/// 출력 버스트에서는 덮어쓰기가 상시 발생한다).
+///
+/// 크기/스크롤이 바뀐 경우 이전 범위가 새 grid와 안 맞을 수 있지만, renderer는
+/// shape 변화(cols/rows/scroll/alt) 시 캐시를 통째로 버리므로 과잉 무효화만
+/// 생길 뿐 유실은 없다 — 무조건 합쳐도 안전하다.
+pub fn merge_unconsumed_viewport_dirty(prev: &RuntimeEvent, next: &mut RuntimeEvent) {
+    if let (
+        RuntimeEvent::Viewport {
+            snapshot: prev_snapshot,
+            ..
+        },
+        RuntimeEvent::Viewport { snapshot, .. },
+    ) = (prev, next)
+        && !prev_snapshot.dirty_ranges.is_empty()
+    {
+        // visible_cells는 Arc 공유라 make_mut의 스냅샷 클론은 저렴하다(셀 복사 없음).
+        Arc::make_mut(snapshot)
+            .dirty_ranges
+            .extend(prev_snapshot.dirty_ranges.iter().cloned());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn viewport_event(dirty: Vec<terminal::CellRange>) -> RuntimeEvent {
+        RuntimeEvent::Viewport {
+            session: SessionId(1),
+            snapshot: Arc::new(TerminalViewportSnapshot {
+                cols: 4,
+                rows: 2,
+                cursor: terminal::CursorSnapshot {
+                    col: 0,
+                    row: 0,
+                    shape: terminal::CursorShape::Block,
+                    visible: true,
+                },
+                visible_cells: Vec::new().into(),
+                dirty_ranges: dirty,
+                title: None,
+                scroll_offset: 0,
+                is_alt_screen: false,
+            }),
+            bracketed_paste: false,
+        }
+    }
+
+    fn dirty_of(event: &RuntimeEvent) -> &[terminal::CellRange] {
+        match event {
+            RuntimeEvent::Viewport { snapshot, .. } => &snapshot.dirty_ranges,
+            _ => panic!("viewport 아님"),
+        }
+    }
+
+    #[test]
+    fn 슬롯_덮어쓰기는_미소비_dirty_델타를_합친다() {
+        let range = |start, end| terminal::CellRange { start, end };
+        let prev = viewport_event(vec![range(0, 3)]);
+        let mut next = viewport_event(vec![range(4, 7)]);
+        merge_unconsumed_viewport_dirty(&prev, &mut next);
+        assert_eq!(dirty_of(&next), &[range(4, 7), range(0, 3)]);
+
+        // 이전 델타가 비었으면 스냅샷 클론(make_mut) 자체를 하지 않는다.
+        let empty_prev = viewport_event(vec![]);
+        let mut next = viewport_event(vec![range(4, 7)]);
+        let before = match &next {
+            RuntimeEvent::Viewport { snapshot, .. } => Arc::as_ptr(snapshot),
+            _ => unreachable!(),
+        };
+        merge_unconsumed_viewport_dirty(&empty_prev, &mut next);
+        let after = match &next {
+            RuntimeEvent::Viewport { snapshot, .. } => Arc::as_ptr(snapshot),
+            _ => unreachable!(),
+        };
+        assert_eq!(before, after);
+        assert_eq!(dirty_of(&next), &[range(4, 7)]);
+    }
 
     #[test]
     fn spawn_failed_payload_uses_stable_message_id_and_args() {

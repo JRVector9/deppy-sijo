@@ -773,11 +773,17 @@ impl Worker {
                     if Arc::strong_count(&subscriber.viewports) <= 1 {
                         return false;
                     }
-                    subscriber
-                        .viewports
-                        .lock()
-                        .expect("viewport slot lock")
-                        .insert(*session, event.clone());
+                    {
+                        let mut slot = subscriber.viewports.lock().expect("viewport slot lock");
+                        let prev = slot.insert(*session, event.clone());
+                        // 미소비 이전 스냅샷의 dirty 델타를 합친다 — 안 그러면 그 행들이
+                        // renderer 재shaping에서 빠져 stale로 남는다 (event.rs 헬퍼 주석).
+                        if let Some(prev) = prev
+                            && let Some(current) = slot.get_mut(session)
+                        {
+                            crate::event::merge_unconsumed_viewport_dirty(&prev, current);
+                        }
+                    }
                     // Viewport(출력)도 wake — push는 dirty(이번 tick 새 출력) 게이트라
                     // idle엔 발생하지 않고, 출력 도착 시에만 UI를 깨운다. 이로써 UI측
                     // 50ms 상시 폴링(가시+running 시 20fps 리페인트 = idle CPU ~10%)을

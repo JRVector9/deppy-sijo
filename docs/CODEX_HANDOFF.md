@@ -1,0 +1,50 @@
+# Codex handoff
+
+## Current task
+
+- Add a real `AgentSession` / `CodexAppServerClient` integration to the Rust desktop app. It must keep the existing PTY terminal byte-for-byte intact while consuming Codex App Server JSON-RPC events into a native, structured result view.
+- Status: implementation complete; live end-to-end model execution remains intentionally unrun in this sandbox because it would require the user's normal Codex state/auth and could spend usage.
+
+## Working area
+
+- Actual application: Rust workspace under `crates/`; terminal rendering passes VT output through `crates/terminal` into the egui workspace.
+- New application-layer modules will live in `crates/app/src/agent_session.rs` and `crates/app/src/codex_app_server.rs`; UI integration belongs beside the workspace UI, rather than in the terminal renderer.
+- The existing agent hook/shim path remains for ordinary interactive PTY agents. It is not the transport for app-server events.
+- Earlier React work in `design/환경설정 메뉴 구성` was a misinterpretation and must not be considered the implementation of this request.
+
+## Plan
+
+1. Completed — define a provider-neutral `AgentSession` reducer for thread, turn, item, error, and approval state.
+2. Completed — implement a stdio JSONL `CodexAppServerClient`: `initialize` / `initialized`, `thread/start`, `turn/start`, streamed notifications, and explicit shutdown.
+3. Completed — add an explicit workspace UI entry point and structured result panel; never mutate raw PTY terminal bytes.
+4. Completed — add focused protocol/reducer tests and run the Rust test suite.
+
+## Status
+
+- 2026-07-15: Inspected project structure and the existing session/settings mockup.
+- 2026-07-15: Confirmed no Vite server is listening on port 8443 in this shell; start one for browser verification after implementation.
+- 2026-07-15: Added a terminal-first agent workspace as the entry screen. It reuses `egui` colors, square 1px panel borders, monospace typography, and the existing desktop three-pane interaction model.
+- 2026-07-15: The mock interaction states model agent runs, Gmail/Slack triage, connector health, developer terminal/diff views, and an explicit external-write approval gate. No external account or connector is contacted.
+- 2026-07-15: `pnpm build` passed after the implementation (Vite 8; 18 modules transformed).
+- 2026-07-15: Initial browser smoke test could not connect because the shared `~/.browser-agent` profile has a lock held by another local process. The app server itself is running on `http://127.0.0.1:8443`; retry browser QA using an isolated temporary browser profile rather than modifying the shared profile.
+- 2026-07-15: Isolated browser-profile retries on ports 9222 and 9223 also failed before CDP came up (Chrome process starts but does not expose CDP in this environment). No code or app runtime error was reported; visual automation remains blocked by the local browser runtime.
+- 2026-07-15: Confirmed a Vite Node process is listening on `127.0.0.1:8443`. The agent shell's direct `curl` connection is denied with `EPERM`, matching the CDP limitation; this is an environment network boundary, not an app response failure.
+- 2026-07-15: Reworked the primary agent output into a default `REVIEW TABLE` view for long diagnostic findings. It groups each result as severity, code location, finding, impact, and recommended action; row selection updates the contextual explanation in the inspector panel.
+- 2026-07-15: Re-ran `pnpm build` after the review-table change; it passed (Vite 8; 18 modules transformed).
+- 2026-07-15: User clarified that a React/HTML review table is not the goal. The desired behavior is a real table-first rendering of an agent's terminal output. Switched investigation to the Rust terminal/agent integration. The earlier mockup approach is a failed interpretation, not a completed feature.
+- 2026-07-15: Confirmed the terminal renderer is a faithful PTY/ANSI renderer, so rewriting terminal bytes would break arbitrary shell and full-screen TUI output. Added a root `AGENTS.md` rule at the Codex agent-output boundary instead: any final response with 2+ independent diagnostics must begin with a deduplicated terminal-legible table (`Priority | Location | Finding | Impact | Next step`), followed by details only as needed.
+- 2026-07-15: Removed the mistaken React mockup entry screen and its styles/component. The previous Vite artifacts will be regenerated from the restored source during verification.
+- 2026-07-15: `pnpm build` passed after restoring the design source (Vite 8; 23 modules transformed), and `git diff --check` passed. A direct `codex debug prompt-input` verification could not run because the local Codex CLI tries to create PATH aliases and this environment returns `Operation not permitted`; the policy file itself was read back and validated.
+- 2026-07-15: Inspected manaflow-ai/cmux source and README. cmux does not rewrite raw terminal output: it treats the terminal as a primitive, receives agent notifications separately (hooks/OSC/CLI), and runs rich agent sessions over structured transports (`codex app-server --listen stdio://`, Claude stream-json, OpenCode loopback HTTP). Therefore a native non-mock table component in this app would require a new structured agent-session transport and UI, not a PTY renderer change. The current root `AGENTS.md` policy remains the correct low-risk path for table-first *terminal text*.
+- 2026-07-15: User selected the structured transport path: add `AgentSession` and `CodexAppServerClient` to the Rust app. Official Codex App Server documentation confirms stdio is newline-delimited JSON-RPC, requires `initialize` then `initialized`, and exposes thread/turn/item streaming primitives. The local manual helper could not resolve `developers.openai.com`, so the official Docs MCP was used instead.
+- 2026-07-15: Added `crates/app/src/agent_session.rs` with a provider-neutral session reducer, typed item rows, bounded delta retention, and explicit command/file approval state. Added `crates/app/src/codex_app_server.rs`, which runs `codex app-server --listen stdio://` in a managed child process, performs the handshake, drives `thread/start` and `turn/start`, streams item notifications, handles command/file approval responses, and reaps the child on shutdown.
+- 2026-07-15: Added `ui::agent_sessions` and wired an `Agents` top-bar entry into `App`. The native panel is backed by live App Server state, presents structured rows (`상태 | 유형 | 작업 | 위치 | 결과`), shows item details, supports explicit approval decisions, interruptions, and follow-up turns. The existing PTY renderer was not modified.
+- 2026-07-15: Ran `cargo check -p deppy-sijo` successfully after implementation. An initial combined test command (`cargo test -p deppy-sijo agent_session codex_app_server`) was invalid because Cargo accepts one test filter; run the two focused filters separately next.
+- 2026-07-15: Corrected the focused test invocation. `cargo test -p deppy-sijo agent_session` (3/3) and `cargo test -p deppy-sijo codex_app_server` (3/3) pass; the full `cargo test -p deppy-sijo` also passes (221 passed, 2 ignored). `git diff --check` passes.
+- 2026-07-15: Live protocol smoke check: the installed Codex v0.144.3 accepted the exact stdio `initialize` / `initialized` flow when `CODEX_HOME` was isolated in `/tmp`, returning an initialize response and `configWarning` notification. A smoke attempt against the real `~/.codex` state failed because this development sandbox cannot initialize Codex's SQLite state there; this is a sandbox filesystem limitation, not an application protocol failure.
+- 2026-07-15: Ran `cargo fmt --all -- --check`; it reports pre-existing formatting differences in unrelated Rust files. A scoped rustfmt invocation initially also touched two unrelated files through module traversal; those changes were explicitly restored, leaving only the intended integration files plus the pre-existing user worktree changes.
+- 2026-07-15: Hardened the client after verification: initialization errors now stop the connection and fail known sessions, sessions that never reached the worker are marked stopped on connection close, missing `turn.id` becomes a clear session failure, and each table column is selectable for the details view.
+- 2026-07-15: A final full `cargo test -p deppy-sijo` rerun was environment-blocked: 214 passed, 7 failed, 2 ignored. The seven failures are unrelated existing tests that need prohibited local capabilities in this sandbox (`bench::rss_샘플은_앱과_자식을_분리한다` cannot read app RSS; six OAuth connector tests cannot bind their local mock listener: `Operation not permitted`). The new focused tests remain green, and the preceding full run passed 221/221 with 2 ignored before this sandbox restriction surfaced.
+- 2026-07-15: Final targeted verification after the last state-ordering hardening passed: `cargo check -p deppy-sijo`, `cargo test -p deppy-sijo agent_session` (4/4), `cargo test -p deppy-sijo codex_app_server` (3/3), scoped rustfmt checks for the new modules, and `git diff --check`.
+- 2026-07-15: Pre-commit verification reran successfully: `git diff --check`, `cargo check -p deppy-sijo`, `cargo test -p deppy-sijo agent_session` (4/4), and `cargo test -p deppy-sijo codex_app_server` (3/3). The commit scope is limited to the native App Server integration, its handoff/policy files, and excludes unrelated design build artifacts and locally installed `.codex` skills.
+- 2026-07-15: Native launch smoke test: a normal `cargo run -p deppy-sijo` built successfully but panicked before UI construction because this sandbox cannot create the app's macOS log file. A second launch with `DEPPY_RENDER_BENCH=1` isolated data/logs under `/tmp`, entered the native startup path, and emitted its benchmark start event. The sandbox then reported unavailable macOS GUI services and did not honor the automatic close signal, so it was manually interrupted; manual UI verification must be done in a normal desktop session. No Codex turn was submitted and no external usage was consumed.

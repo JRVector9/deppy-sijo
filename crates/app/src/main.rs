@@ -1,10 +1,12 @@
 mod agent_detect;
 mod agent_detect_worker;
 mod agent_hooks;
+mod agent_session;
 mod agent_shim;
 mod agent_transcript;
 mod app;
 mod bench;
+mod codex_app_server;
 mod config;
 mod dotenv_sync;
 mod env;

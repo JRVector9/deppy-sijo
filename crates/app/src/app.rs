@@ -1077,6 +1077,8 @@ pub struct App {
     db: Db,
     secret_store: KeyringSecretStore,
     agents_ui: ui::agents::AgentsUi,
+    /// PTY와 분리된 Codex App Server structured session controller.
+    agent_sessions_ui: ui::agent_sessions::AgentSessionsUi,
     connectors_ui: ui::connectors::ConnectorsUi,
     /// OAuth refresh single-flight 조율자 (H5) — 프로세스 단일 인스턴스의 원본.
     /// 현재 소비자는 connectors_ui뿐이지만, 후속 소비자(P2 web 브리지 등)도 반드시
@@ -1333,6 +1335,7 @@ impl App {
             db,
             secret_store: KeyringSecretStore,
             agents_ui: ui::agents::AgentsUi::new(),
+            agent_sessions_ui: ui::agent_sessions::AgentSessionsUi::new(),
             connectors_ui: ui::connectors::ConnectorsUi::new(
                 redaction.clone(),
                 Arc::new(KeyringSecretStore),
@@ -3856,6 +3859,8 @@ impl eframe::App for App {
         if let Some(bench) = self.bench.as_mut() {
             bench.finish();
         }
+        // App Server는 PTY runtime과 독립된 child process라 여기서 명시적으로 종료·reap한다.
+        self.agent_sessions_ui.shutdown();
         self.approval_watcher.stop();
         // 웹서버(모바일 PWA)를 runtime보다 먼저 정지 — 브리지가 쥔 command_sink가
         // worker 채널을 살려둔 채 join을 기다리는 순환을 끊는다 (P5 리뷰 P1 종료 데드락;
@@ -3889,6 +3894,8 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 파일/SQLite/keyring은 worker에서 끝났고, 여기서는 최신 epoch 결과만 짧게 적용한다.
         self.poll_dotenv_sync();
+        // 창이 숨겨져도 App Server JSON-RPC 이벤트를 드레인해 structured session 상태를 최신화한다.
+        self.agent_sessions_ui.poll();
         self.poll_restore_timeout();
         // 설정이 닫혀도 stale generation 결과를 계속 버려 worker의 bounded 결과 큐가
         // 평문 secret을 붙잡은 채 막히지 않게 한다.
@@ -4189,9 +4196,14 @@ impl eframe::App for App {
                             ui.painter().galley(pos, galley, col);
                             resp.clicked()
                         };
-                        // 툴바 = '설정' 버튼 하나만 — 나머지 카테고리는 전부 설정 창의 좌측
-                        // 네비에 이미 있어 중복이었다(사용자 요청, 2026-07-07). 알림 unread는
-                        // 설정 라벨에 뱃지 카운트로 얹는다.
+                        // 구조화된 Codex App Server 세션은 PTY workspace와 별도 창으로 연다.
+                        // raw terminal stream을 파싱/재작성하지 않아 ANSI·full-screen 앱이 보존된다.
+                        let agent_sessions_selected = self.agent_sessions_ui.is_open();
+                        if tbtn(ui, "Agents".to_owned(), agent_sessions_selected) {
+                            self.agent_sessions_ui.toggle();
+                        }
+                        // 설정 카테고리는 통합 설정 창의 좌측 네비에 있고, unread는 설정 라벨에
+                        // 뱃지 카운트로 얹는다.
                         let unread = self.notifications_ui.unread();
                         unread_before = unread;
                         let settings_label = if unread > 0 {
@@ -4425,6 +4437,16 @@ impl eframe::App for App {
                     &text,
                 );
             });
+        // 활성 프로젝트 루트를 Codex thread/start / turn/start의 cwd로 넘긴다. 경로가
+        // 비어 있거나 사라졌으면 생략해 App Server의 현재 작업 폴더를 존중한다.
+        let agent_workspace_cwd = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == self.active.id)
+            .map(|workspace| workspace.path.clone())
+            .filter(|path| !path.trim().is_empty())
+            .filter(|path| std::path::Path::new(path).is_dir());
+        self.agent_sessions_ui.show(ui.ctx(), agent_workspace_cwd);
         // pane 우클릭 → 환경변수·API 설정 (E4 ⑥) — 프로젝트 화면에서 바로 진입.
         if self.active.workspace_ui.take_open_environment() {
             self.settings_category = ui::settings::Category::Environment;

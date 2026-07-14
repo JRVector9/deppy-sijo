@@ -22,6 +22,9 @@ pub struct WorkspaceUi {
     shell_kind: crate::ui::file_tree::ShellKind,
     /// IME 조합 중 텍스트 (focused pane 전용)
     preedit: String,
+    /// 세션 → 셸 pid (App이 ResourceUsage에서 매 프레임 갱신). 터미널 경로 더블클릭의
+    /// 상대경로를 그 셸의 실제 cwd로 해석하는 데 쓴다 (2026-07-14).
+    session_pids: HashMap<SessionId, u32>,
     /// 세션별 마지막 전송한 (cols, rows) — 변화 시에만 Resize 전송
     sent_sizes: HashMap<SessionId, (u16, u16)>,
     /// 트랙패드 미세 스크롤 누적 (focused pane 기준)
@@ -164,6 +167,7 @@ impl WorkspaceUi {
             selection: None,
             project_name: None,
             ui_scale: 1.0,
+            session_pids: HashMap::new(),
             session_cwds: std::collections::HashMap::new(),
             session_name_style: crate::config::SessionNameStyle::default(),
             agent_info: std::collections::HashMap::new(),
@@ -447,6 +451,13 @@ impl WorkspaceUi {
         } else {
             1.0
         };
+    }
+
+    /// 세션 → 셸 pid를 세팅한다(App이 매 프레임, ResourceUsage 스냅샷 기준).
+    /// 터미널 경로 더블클릭의 상대경로 해석(lsof cwd 1회 조회)에 쓴다.
+    pub fn set_session_pids(&mut self, pids: &[(SessionId, u32)]) {
+        self.session_pids.clear();
+        self.session_pids.extend(pids.iter().copied());
     }
 
     /// 세션별 현재 작업 폴더를 세팅한다(App이 매 프레임, 감지 워커 lsof 결과).
@@ -1302,15 +1313,37 @@ impl WorkspaceUi {
                 && let Some(pos) = output.response.interact_pointer_pos()
             {
                 // 더블클릭 → 커서 아래 단어(공백 구분) 선택. 단어가 URL이면 기본 브라우저로
-                // 연다(claude/codex/셸 화면의 링크를 바로 열기).
+                // 연다(claude/codex/셸 화면의 링크를 바로 열기). URL이 아니면 파일시스템
+                // 경로로 해석해 폴더는 cd, 문서류 파일은 외부 프로그램으로 연다 (2026-07-14).
                 if let Some((s, e)) = word_range_at(&snapshot, cell_at(pos)) {
                     self.selection = Some((session, s, e));
                     let word = renderer_egui::selection_text(&snapshot, s, e);
-                    if let Some(url) = extract_url(&word)
-                        && let Err(err) = auth::open_in_browser(url)
-                    {
-                        self.error_is_pressure = false;
-                        self.error = Some(format!("{err:#}"));
+                    if let Some(url) = extract_url(&word) {
+                        if let Err(err) = auth::open_in_browser(url) {
+                            self.error_is_pressure = false;
+                            self.error = Some(format!("{err:#}"));
+                        }
+                    } else {
+                        // 상대경로는 그 셸의 실제 cwd 기준 — 클릭 시점 1회 lsof 조회.
+                        let cwd = self
+                            .session_pids
+                            .get(&session)
+                            .copied()
+                            .and_then(platform::process_cwd);
+                        match resolve_path_click(&word, cwd.as_deref()) {
+                            // alt screen(TUI 실행 중)에는 셸 주입 금지 — 키 입력이 TUI로
+                            // 가는 상태라 cd 텍스트가 TUI 입력으로 오염된다.
+                            Some(PathClick::Dir(path)) if !snapshot.is_alt_screen => {
+                                let bytes = format!(
+                                    "cd {}\n",
+                                    shell_single_quote(&path.to_string_lossy())
+                                )
+                                .into_bytes();
+                                self.send(client, RuntimeCommand::WriteInput { session, bytes });
+                            }
+                            Some(PathClick::OpenFile(path)) => platform::open_path(&path),
+                            _ => {}
+                        }
                     }
                 }
             } else if output.response.drag_started()
@@ -2385,6 +2418,75 @@ fn extract_url(word: &str) -> Option<&str> {
     (trimmed.starts_with("http://") || trimmed.starts_with("https://")).then_some(trimmed)
 }
 
+/// 터미널 텍스트 더블클릭이 가리키는 파일시스템 대상 (2026-07-14 사용자 요청).
+#[derive(Debug, PartialEq)]
+enum PathClick {
+    /// 디렉터리 — 셸에 cd를 보낸다 (alt screen이 아닐 때만)
+    Dir(std::path::PathBuf),
+    /// 외부 프로그램으로 여는 파일 (OPENABLE_EXTS 허용목록)
+    OpenFile(std::path::PathBuf),
+}
+
+/// 더블클릭으로 외부 프로그램에 넘겨도 안전한 확장자 — 문서/이미지/미디어/아카이브.
+/// 실행파일·스크립트는 제외한다: macOS `open`은 실행 가능한 대상을 **실행**하므로
+/// 더블클릭 오조작이 코드 실행이 되면 안 된다.
+const OPENABLE_EXTS: &[&str] = &[
+    "pdf", "html", "htm", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "csv", "hwp", "txt", "md",
+    "rtf", "png", "jpg", "jpeg", "gif", "webp", "svg", "heic", "tiff", "mp4", "mov", "mp3", "wav",
+    "zip", "numbers", "pages", "key",
+];
+
+/// 더블클릭된 단어를 파일시스템 경로로 해석한다. 절대(`/`)·홈(`~/`)·상대(cwd 기준)
+/// 순으로 시도하고, `path.py:33`처럼 줄번호가 붙은 꼴은 `:` 뒤를 떼고 재시도한다.
+/// 존재하지 않거나(오탈자·일반 단어) 허용 확장자가 아닌 파일이면 None — 이 함수가
+/// None이면 더블클릭은 기존 동작(단어 선택)만 한다.
+fn resolve_path_click(word: &str, cwd: Option<&Path>) -> Option<PathClick> {
+    // 꼬리는 따옴표와 문말 부호가 섞여 올 수 있어("'docs',") 통합 집합으로 벗긴다.
+    let token = word
+        .trim_start_matches(|c: char| "\"'`".contains(c))
+        .trim_end_matches(|c: char| "\"'`.,;!?)]}>".contains(c));
+    if token.is_empty() {
+        return None;
+    }
+    // "path.py:33" → "path.py" 후보도 함께 시도 (Claude/컴파일러 출력 관례)
+    let mut candidates = vec![token];
+    if let Some((head, tail)) = token.rsplit_once(':')
+        && !head.is_empty()
+        && tail.chars().all(|c| c.is_ascii_digit())
+    {
+        candidates.push(head);
+    }
+    for cand in candidates {
+        let path = if let Some(rest) = cand.strip_prefix("~/") {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(rest))
+        } else if cand.starts_with('/') {
+            Some(std::path::PathBuf::from(cand))
+        } else {
+            cwd.map(|c| c.join(cand))
+        };
+        let Some(path) = path else { continue };
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            return Some(PathClick::Dir(path));
+        }
+        let openable = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| OPENABLE_EXTS.contains(&e.to_ascii_lowercase().as_str()));
+        if meta.is_file() && openable {
+            return Some(PathClick::OpenFile(path));
+        }
+    }
+    None
+}
+
+/// 셸 단일따옴표 인용 — 내부 `'`는 `'\''`로. cd 주입에 쓴다.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 fn word_range_at(
     snapshot: &terminal::TerminalViewportSnapshot,
     idx: usize,
@@ -2552,6 +2654,45 @@ mod tests {
 
     fn pane_id(name: &str) -> MuxPaneId {
         MuxPaneId(name.to_owned())
+    }
+
+    #[test]
+    fn 경로_더블클릭은_폴더와_허용_문서만_해석한다() {
+        let base = std::env::temp_dir().join(format!("deppy-pathclick-{}", std::process::id()));
+        let dir = base.join("docs");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(base.join("report.pdf"), b"x").unwrap();
+        std::fs::write(base.join("run.sh"), b"x").unwrap();
+
+        // 절대경로 폴더 → Dir
+        assert_eq!(
+            resolve_path_click(dir.to_str().unwrap(), None),
+            Some(PathClick::Dir(dir.clone()))
+        );
+        // 상대경로는 cwd 기준. 따옴표·문말 부호는 벗긴다.
+        assert_eq!(
+            resolve_path_click("'docs',", Some(&base)),
+            Some(PathClick::Dir(dir.clone()))
+        );
+        // cwd 없이 상대경로는 해석 불가
+        assert_eq!(resolve_path_click("docs", None), None);
+        // 허용 확장자 파일 → OpenFile, 줄번호 suffix 제거
+        assert_eq!(
+            resolve_path_click("report.pdf:12", Some(&base)),
+            Some(PathClick::OpenFile(base.join("report.pdf")))
+        );
+        // 스크립트는 열지 않는다 (open은 실행 가능 대상을 실행하므로)
+        assert_eq!(resolve_path_click("run.sh", Some(&base)), None);
+        // 존재하지 않는 일반 단어 → None (기존 더블클릭 선택만)
+        assert_eq!(resolve_path_click("hello", Some(&base)), None);
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn 셸_단일따옴표_인용은_내부_따옴표를_이스케이프한다() {
+        assert_eq!(shell_single_quote("/a b/c"), "'/a b/c'");
+        assert_eq!(shell_single_quote("it's"), r"'it'\''s'");
     }
 
     fn tab_id(name: &str) -> MuxTabId {

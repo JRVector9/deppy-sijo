@@ -62,9 +62,46 @@ pub fn notify(summary: &str, body: &str) {
     }
 }
 
+/// 파일/폴더를 OS 기본 프로그램으로 연다 (터미널 경로 더블클릭, 2026-07-14).
+/// 자식 wait는 별도 스레드 — notify와 동일하게 UI 블로킹/좀비를 방지한다.
+pub fn open_path(path: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    const OPENER: &str = "open";
+    #[cfg(not(target_os = "macos"))]
+    const OPENER: &str = "xdg-open";
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        match std::process::Command::new(OPENER).arg(&path).status() {
+            Ok(status) if !status.success() => {
+                tracing::warn!("외부 열기 실패: {OPENER} {status} ({})", path.display());
+            }
+            Err(e) => tracing::warn!("외부 열기 실패: {e} ({})", path.display()),
+            Ok(_) => {}
+        }
+    });
+}
+
+/// 프로세스의 현재 작업 디렉터리 (lsof 1회). 터미널 상대경로 더블클릭 해석용 —
+/// 사용자 클릭 시점의 일회성 조회라 스폰 비용(수십 ms)을 감수한다.
+pub fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    let output = std::process::Command::new("lsof")
+        .args(["-a", "-d", "cwd", "-p", &pid.to_string(), "-Fn"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix('n').map(std::path::PathBuf::from))
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_cwd는_자기_프로세스의_cwd를_찾는다() {
+        let cwd = process_cwd(std::process::id()).expect("cwd");
+        assert_eq!(cwd, std::env::current_dir().unwrap());
+    }
 
     #[test]
     fn applescript_quote는_따옴표와_백슬래시를_이스케이프() {

@@ -1701,6 +1701,8 @@ impl App {
             .iter()
             .filter_map(|r| r.pid.map(|pid| (r.session, pid)))
             .collect();
+        // 터미널 경로 더블클릭의 상대경로 해석용 — 같은 목록을 workspace UI에도 나른다.
+        self.active.workspace_ui.set_session_pids(&sessions);
         // hook이 보고한 결정적 바인딩(활성 워크스페이스 것만) — 워커 탐색을 대체한다.
         // poll_agent_detect는 매 프레임 돌므로 DB 조회는 1초 스로틀 + 캐시.
         if self.last_hook_query.elapsed() >= std::time::Duration::from_secs(1) {

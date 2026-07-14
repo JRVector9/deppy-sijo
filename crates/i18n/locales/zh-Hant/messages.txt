@@ -211,6 +211,7 @@ workspace.close_pane = 關閉 pane
 workspace.rename_hint = 右鍵或雙擊重新命名
 workspace.close_confirm.title = 關閉窗格
 workspace.close_confirm.body = 執行中的工作階段將被終止。確定關閉嗎？
+workspace.open_file = 開啟 "{name}"
 workspace.split_horizontal = 分割 | (左右)
 workspace.split_vertical = 分割 - (上下)
 workspace.spawn.shell = Shell

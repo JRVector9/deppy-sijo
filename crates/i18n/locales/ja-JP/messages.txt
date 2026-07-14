@@ -211,6 +211,7 @@ workspace.close_pane = paneを閉じる
 workspace.rename_hint = 右クリック/ダブルクリックで名前を変更
 workspace.close_confirm.title = ペインを閉じる
 workspace.close_confirm.body = 実行中のセッションが終了します。閉じますか？
+workspace.open_file = "{name}" を開く
 workspace.split_horizontal = 分割 | (左右)
 workspace.split_vertical = 分割 - (上下)
 workspace.spawn.shell = シェル

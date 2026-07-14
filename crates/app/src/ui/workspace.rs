@@ -25,6 +25,15 @@ pub struct WorkspaceUi {
     /// 세션 → 셸 pid (App이 ResourceUsage에서 매 프레임 갱신). 터미널 경로 더블클릭의
     /// 상대경로를 그 셸의 실제 cwd로 해석하는 데 쓴다 (2026-07-14).
     session_pids: HashMap<SessionId, u32>,
+    /// 경로 해석 캐시: (세션, 단어) → 해석 결과. hover가 매 프레임 도는 경로라
+    /// 같은 단어의 재해석(metadata/lsof)을 막는다. TTL PATH_CACHE_TTL.
+    path_click_cache: Option<(SessionId, String, Option<PathClick>, std::time::Instant)>,
+    /// 세션 셸 cwd 캐시 — lsof는 수십 ms라 hover 단어가 바뀔 때마다 돌리면 UI가
+    /// 버벅인다. TTL PATH_CACHE_TTL, 우리가 cd를 보낼 때 즉시 무효화.
+    session_cwd_cache: Option<(SessionId, std::path::PathBuf, std::time::Instant)>,
+    /// 직전 폴더 클릭 (경로, 시각) — 더블클릭이 clicked를 두 번 발화시켜 같은 cd가
+    /// 연속 주입되는 것을 막는다.
+    last_dir_click: Option<(std::path::PathBuf, std::time::Instant)>,
     /// 마지막으로 egui Event::Paste 텍스트를 직접 전송한 시각. ⌘V는 press에서
     /// Event::Paste가, release에서 키 이벤트가 **다른 프레임으로** 도착할 수 있다 —
     /// 그때 release 쪽 이미지 태스크가 클립보드 텍스트 fallback으로 같은 내용을
@@ -174,6 +183,9 @@ impl WorkspaceUi {
             project_name: None,
             ui_scale: 1.0,
             session_pids: HashMap::new(),
+            path_click_cache: None,
+            session_cwd_cache: None,
+            last_dir_click: None,
             last_text_paste: None,
             session_cwds: std::collections::HashMap::new(),
             session_name_style: crate::config::SessionNameStyle::default(),
@@ -465,6 +477,40 @@ impl WorkspaceUi {
     pub fn set_session_pids(&mut self, pids: &[(SessionId, u32)]) {
         self.session_pids.clear();
         self.session_pids.extend(pids.iter().copied());
+    }
+
+    /// (세션, 단어) 캐시를 거친 경로 해석. hover가 매 프레임 부르므로 같은 단어는
+    /// 재해석하지 않고, 셸 cwd(lsof)도 세션당 TTL 캐시로 조회를 묶는다.
+    fn resolve_path_cached(&mut self, session: SessionId, word: &str) -> Option<PathClick> {
+        const PATH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+        if let Some((s, w, res, at)) = &self.path_click_cache
+            && *s == session
+            && w == word
+            && at.elapsed() < PATH_CACHE_TTL
+        {
+            return res.clone();
+        }
+        let cwd = match &self.session_cwd_cache {
+            Some((s, path, at)) if *s == session && at.elapsed() < PATH_CACHE_TTL => {
+                Some(path.clone())
+            }
+            _ => {
+                let cwd = self
+                    .session_pids
+                    .get(&session)
+                    .copied()
+                    .and_then(platform::process_cwd);
+                if let Some(cwd) = &cwd {
+                    self.session_cwd_cache =
+                        Some((session, cwd.clone(), std::time::Instant::now()));
+                }
+                cwd
+            }
+        };
+        let res = resolve_path_click(word, cwd.as_deref());
+        self.path_click_cache =
+            Some((session, word.to_owned(), res.clone(), std::time::Instant::now()));
+        res
     }
 
     /// 세션별 현재 작업 폴더를 세팅한다(App이 매 프레임, 감지 워커 lsof 결과).
@@ -1316,41 +1362,51 @@ impl WorkspaceUi {
                     as usize;
                 row * snapshot.cols as usize + col
             };
+            // 폴더 hover/단일 클릭 — 이동 가능한 폴더 단어 위에서는 커서를 손가락으로
+            // 바꾸고 클릭하면 그 폴더로 cd한다 (2026-07-14 사용자). 파일은 커서를 바꾸지
+            // 않는다(복사용 선택과 혼동 방지 — 열기는 우클릭 메뉴). alt screen(TUI)은
+            // cd 주입 금지라 통째로 비활성.
+            if !snapshot.is_alt_screen
+                && let Some(pos) = output.response.hover_pos()
+                && let Some((s, e)) = word_range_at(&snapshot, cell_at(pos))
+            {
+                let word = renderer_egui::selection_text(&snapshot, s, e);
+                if let Some(PathClick::Dir(path)) = self.resolve_path_cached(session, &word) {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    if output.response.clicked() {
+                        // 더블클릭은 clicked를 두 번 발화 — 같은 경로 연속 cd를 막는다.
+                        let duplicate = self.last_dir_click.as_ref().is_some_and(|(p, at)| {
+                            *p == path && at.elapsed() < std::time::Duration::from_millis(800)
+                        });
+                        if !duplicate {
+                            self.last_dir_click =
+                                Some((path.clone(), std::time::Instant::now()));
+                            // cd로 셸 cwd가 바뀐다 — 상대경로 해석 캐시 즉시 무효화.
+                            self.session_cwd_cache = None;
+                            self.path_click_cache = None;
+                            let bytes =
+                                format!("cd {}\n", shell_single_quote(&path.to_string_lossy()))
+                                    .into_bytes();
+                            self.send(client, RuntimeCommand::WriteInput { session, bytes });
+                        }
+                    }
+                }
+            }
             if output.response.double_clicked()
                 && let Some(pos) = output.response.interact_pointer_pos()
             {
                 // 더블클릭 → 커서 아래 단어(공백 구분) 선택. 단어가 URL이면 기본 브라우저로
-                // 연다(claude/codex/셸 화면의 링크를 바로 열기). URL이 아니면 파일시스템
-                // 경로로 해석해 폴더는 cd, 문서류 파일은 외부 프로그램으로 연다 (2026-07-14).
+                // 연다(claude/codex/셸 화면의 링크를 바로 열기). 파일 열기는 우클릭 메뉴로
+                // (더블클릭은 복사용 선택과 겹친다 — 2026-07-14 사용자), 폴더 진입은 단일
+                // 클릭(아래 hover/click 블록)이 담당한다.
                 if let Some((s, e)) = word_range_at(&snapshot, cell_at(pos)) {
                     self.selection = Some((session, s, e));
                     let word = renderer_egui::selection_text(&snapshot, s, e);
-                    if let Some(url) = extract_url(&word) {
-                        if let Err(err) = auth::open_in_browser(url) {
-                            self.error_is_pressure = false;
-                            self.error = Some(format!("{err:#}"));
-                        }
-                    } else {
-                        // 상대경로는 그 셸의 실제 cwd 기준 — 클릭 시점 1회 lsof 조회.
-                        let cwd = self
-                            .session_pids
-                            .get(&session)
-                            .copied()
-                            .and_then(platform::process_cwd);
-                        match resolve_path_click(&word, cwd.as_deref()) {
-                            // alt screen(TUI 실행 중)에는 셸 주입 금지 — 키 입력이 TUI로
-                            // 가는 상태라 cd 텍스트가 TUI 입력으로 오염된다.
-                            Some(PathClick::Dir(path)) if !snapshot.is_alt_screen => {
-                                let bytes = format!(
-                                    "cd {}\n",
-                                    shell_single_quote(&path.to_string_lossy())
-                                )
-                                .into_bytes();
-                                self.send(client, RuntimeCommand::WriteInput { session, bytes });
-                            }
-                            Some(PathClick::OpenFile(path)) => platform::open_path(&path),
-                            _ => {}
-                        }
+                    if let Some(url) = extract_url(&word)
+                        && let Err(err) = auth::open_in_browser(url)
+                    {
+                        self.error_is_pressure = false;
+                        self.error = Some(format!("{err:#}"));
                     }
                 }
             } else if output.response.drag_started()
@@ -1817,6 +1873,38 @@ impl WorkspaceUi {
                     .find(|pane| &pane.id == pane_id)
                     .and_then(|pane| pane.session_id)
             });
+            // 선택 텍스트(파일명 드래그)가 열 수 있는 파일이면 "열기" 항목을 맨 위에
+            // (2026-07-14 사용자: 더블클릭 열기는 복사와 겹쳐 우클릭 메뉴로). 메뉴가
+            // 열려 있는 동안만 평가되고, 해석은 resolve_path_cached의 TTL 캐시를 탄다.
+            if let Some(sel_session) = session
+                && let Some((s, a, b)) = self.selection
+                && s == sel_session
+            {
+                let text = self
+                    .sessions
+                    .get(&sel_session)
+                    .and_then(|view| view.snapshot.as_ref())
+                    .map(|snap| renderer_egui::selection_text(snap, a.min(b), a.max(b)));
+                if let Some(text) = text
+                    && !text.trim().is_empty()
+                    && !text.contains('\n')
+                    && let Some(PathClick::OpenFile(path)) =
+                        self.resolve_path_cached(sel_session, text.trim())
+                {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                    if ui
+                        .button(catalog.t("workspace.open_file", &[("name", name.as_str())]))
+                        .clicked()
+                    {
+                        platform::open_path(&path);
+                        ui.close();
+                    }
+                    ui.separator();
+                }
+            }
             if ui
                 .button(catalog.t("workspace.split_horizontal", &[]))
                 .clicked()
@@ -2456,8 +2544,8 @@ fn extract_url(word: &str) -> Option<&str> {
     (trimmed.starts_with("http://") || trimmed.starts_with("https://")).then_some(trimmed)
 }
 
-/// 터미널 텍스트 더블클릭이 가리키는 파일시스템 대상 (2026-07-14 사용자 요청).
-#[derive(Debug, PartialEq)]
+/// 터미널 텍스트가 가리키는 파일시스템 대상 (2026-07-14 사용자 요청).
+#[derive(Debug, Clone, PartialEq)]
 enum PathClick {
     /// 디렉터리 — 셸에 cd를 보낸다 (alt screen이 아닐 때만)
     Dir(std::path::PathBuf),
@@ -2537,10 +2625,11 @@ fn word_range_at(
     let col = idx % cols;
     let base = row * cols;
     let is_word = |c: usize| -> bool {
-        snapshot
-            .visible_cells
-            .get(base + c)
-            .is_some_and(|cell| !cell.c.is_whitespace() && cell.c != '\0')
+        snapshot.visible_cells.get(base + c).is_some_and(|cell| {
+            // wide char(한글 등) 뒤의 자리 채움 셀은 c==' '지만 단어의 일부다 —
+            // 공백으로 취급하면 "nant-성과분석.pdf"가 첫 한글에서 끊긴다 (2026-07-14).
+            cell.wide_spacer || (!cell.c.is_whitespace() && cell.c != '\0')
+        })
     };
     if !is_word(col) {
         return None;
@@ -2692,6 +2781,57 @@ mod tests {
 
     fn pane_id(name: &str) -> MuxPaneId {
         MuxPaneId(name.to_owned())
+    }
+
+    #[test]
+    fn 한글_파일명은_wide_spacer를_넘어_한_단어로_잡힌다() {
+        // "a nant-성과.pdf b" — 한글은 wide+spacer 2셀. 스페이서를 공백 취급하면
+        // 단어가 첫 한글에서 끊긴다 (2026-07-14 "nant-성과분석.pdf 안 열림" 원인).
+        fn push(cells: &mut Vec<TerminalCell>, c: char, wide: bool, spacer: bool) {
+            cells.push(TerminalCell {
+                c,
+                fg: [255; 3],
+                bg: [0; 3],
+                wide,
+                wide_spacer: spacer,
+                attrs: Default::default(),
+            });
+        }
+        let cols = 20usize;
+        let mut cells = Vec::new();
+        for c in "a nant-".chars() {
+            push(&mut cells, c, false, false);
+        }
+        for c in ['성', '과'] {
+            push(&mut cells, c, true, false);
+            push(&mut cells, ' ', false, true);
+        }
+        for c in ".pdf b".chars() {
+            push(&mut cells, c, false, false);
+        }
+        while cells.len() < cols {
+            push(&mut cells, ' ', false, false);
+        }
+        let snap = TerminalViewportSnapshot {
+            cols: cols as u16,
+            rows: 1,
+            cursor: CursorSnapshot {
+                col: 0,
+                row: 0,
+                shape: CursorShape::Block,
+                visible: true,
+            },
+            visible_cells: cells.into(),
+            dirty_ranges: Vec::new(),
+            title: None,
+            scroll_offset: 0,
+            is_alt_screen: false,
+        };
+        // '성'(idx 7) 위를 더블클릭 — 파일명 전체가 한 단어여야 한다
+        let (s, e) = word_range_at(&snap, 7).expect("단어");
+        assert_eq!(renderer_egui::selection_text(&snap, s, e), "nant-성과.pdf");
+        // 공백(idx 1)은 여전히 단어가 아니다
+        assert!(word_range_at(&snap, 1).is_none());
     }
 
     #[test]

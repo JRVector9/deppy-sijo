@@ -17,9 +17,34 @@ use crate::agent_transcript::AgentActivity;
 
 const BINDING_INTERVAL: Duration = Duration::from_millis(2500);
 const ACTIVITY_INTERVAL: Duration = Duration::from_millis(1500);
+/// 창이 숨겨졌을 때(가림/최소화, render_active=false) 두 tier의 폴링 완화 배수.
+/// ps/lsof/transcript 스캔은 pane 배지 표시용이라 안 보일 때 자주 돌 이유가 없다
+/// (2026-07-14 가림 프로파일: 숨김 CPU의 최대 단일 항목이 detect의 ps 스폰이었다).
+/// 알림은 runtime worker의 status detector(출력 regex) 경로라 영향 없다.
+const HIDDEN_INTERVAL_MULT: u32 = 4;
 
-/// App → 스레드 입력: (epoch, 활성 세션 pid 목록, hook 오버라이드). 최신 값 하나만 의미 있다.
-pub type DetectInput = Arc<Mutex<(u64, Vec<(SessionId, u32)>, HashMap<SessionId, AgentBinding>)>>;
+/// tier 주기 — 숨김이면 4배로 늘린다 (바인딩 2.5s→10s, 활동 1.5s→6s).
+fn tier_intervals(hidden: bool) -> (Duration, Duration) {
+    if hidden {
+        (
+            BINDING_INTERVAL * HIDDEN_INTERVAL_MULT,
+            ACTIVITY_INTERVAL * HIDDEN_INTERVAL_MULT,
+        )
+    } else {
+        (BINDING_INTERVAL, ACTIVITY_INTERVAL)
+    }
+}
+
+/// App → 스레드 입력: (epoch, 활성 세션 pid 목록, hook 오버라이드, 창 숨김 여부).
+/// 최신 값 하나만 의미 있다.
+pub type DetectInput = Arc<
+    Mutex<(
+        u64,
+        Vec<(SessionId, u32)>,
+        HashMap<SessionId, AgentBinding>,
+        bool,
+    )>,
+>;
 
 /// 스레드 → App 결과. bindings는 바인딩 tier에서만 Some(활동 tier는 None), activity는 매번.
 pub struct DetectOutcome {
@@ -76,7 +101,7 @@ fn compute_activity_and_info(
 impl AgentDetectWorker {
     /// 전용 스레드를 띄운다. 입력 핸들과 결과 수신 채널을 함께 돌려준다.
     pub fn spawn(ctx: egui::Context) -> (Self, DetectInput, mpsc::Receiver<DetectOutcome>) {
-        let input: DetectInput = Arc::new(Mutex::new((0, Vec::new(), HashMap::new())));
+        let input: DetectInput = Arc::new(Mutex::new((0, Vec::new(), HashMap::new(), false)));
         let (out_tx, out_rx) = mpsc::channel();
         let (stop_tx, stop_rx) = mpsc::channel();
         let input2 = input.clone();
@@ -88,22 +113,30 @@ impl AgentDetectWorker {
                 let mut bindings: HashMap<SessionId, AgentBinding> = HashMap::new();
                 let mut cache = agent_detect::BindingCache::default();
                 let mut last_epoch = 0u64;
+                let mut hidden = false;
                 loop {
                     // 다음 만기까지 잔다. 활동 tier는 바인딩이 있을 때만 (없으면 바인딩 tier만).
-                    let binding_wait = BINDING_INTERVAL.saturating_sub(last_binding.elapsed());
+                    // 숨김이면 주기가 4배지만 대기 슬라이스는 BINDING_INTERVAL로 자른다 —
+                    // 복귀(hidden=false) 후 최대 한 슬라이스 안에 elapsed가 정상 주기를
+                    // 넘어 있으므로 즉시 따라잡는다 (별도 전이 처리 불필요).
+                    let (binding_interval, activity_interval) = tier_intervals(hidden);
+                    let binding_wait = binding_interval.saturating_sub(last_binding.elapsed());
                     let activity_wait = if bindings.is_empty() {
                         Duration::from_secs(3600)
                     } else {
-                        ACTIVITY_INTERVAL.saturating_sub(last_activity.elapsed())
+                        activity_interval.saturating_sub(last_activity.elapsed())
                     };
                     let wait = binding_wait
                         .min(activity_wait)
-                        .max(Duration::from_millis(50));
+                        .clamp(Duration::from_millis(50), BINDING_INTERVAL);
                     match stop_rx.recv_timeout(wait) {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                     }
-                    let (epoch, sessions, overrides) = input2.lock().unwrap().clone();
+                    let (epoch, sessions, overrides, now_hidden) =
+                        input2.lock().unwrap().clone();
+                    hidden = now_hidden;
+                    let (binding_interval, activity_interval) = tier_intervals(hidden);
                     // 워크스페이스 전환(epoch 변경) 시 캐시를 비운다 — SessionId가 워커마다
                     // 1부터라 캐시가 다른 워크스페이스 세션과 충돌하는 것을 막는다.
                     if epoch != last_epoch {
@@ -111,7 +144,7 @@ impl AgentDetectWorker {
                         cache = agent_detect::BindingCache::default();
                         bindings.clear();
                     }
-                    if last_binding.elapsed() >= BINDING_INTERVAL {
+                    if last_binding.elapsed() >= binding_interval {
                         last_binding = Instant::now();
                         last_activity = Instant::now();
                         bindings = agent_detect::detect_cached(&sessions, &overrides, &mut cache);
@@ -135,7 +168,7 @@ impl AgentDetectWorker {
                             break; // 수신측(App) drop → 종료
                         }
                         ctx.request_repaint();
-                    } else if !bindings.is_empty() && last_activity.elapsed() >= ACTIVITY_INTERVAL {
+                    } else if !bindings.is_empty() && last_activity.elapsed() >= activity_interval {
                         last_activity = Instant::now();
                         let activity = compute_activity(&bindings);
                         if out_tx
@@ -174,5 +207,24 @@ impl Drop for AgentDetectWorker {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 숨김이면_두_tier_주기가_4배로_늘고_보이면_원래대로다() {
+        let (b, a) = tier_intervals(false);
+        assert_eq!(b, BINDING_INTERVAL);
+        assert_eq!(a, ACTIVITY_INTERVAL);
+
+        let (b, a) = tier_intervals(true);
+        assert_eq!(b, BINDING_INTERVAL * HIDDEN_INTERVAL_MULT);
+        assert_eq!(a, ACTIVITY_INTERVAL * HIDDEN_INTERVAL_MULT);
+        // 대기 슬라이스 상한(BINDING_INTERVAL)보다 길어야 슬라이스 분할이 의미 있다 —
+        // 복귀 시 elapsed가 이미 정상 주기를 넘어 있어 즉시 따라잡는 전제.
+        assert!(b > BINDING_INTERVAL);
     }
 }

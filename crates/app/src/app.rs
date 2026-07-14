@@ -1749,6 +1749,8 @@ impl App {
                 self.agent_detect_epoch,
                 sessions,
                 self.hook_overrides.clone(),
+                // 창 숨김(가림/최소화) — detect 스레드가 ps/lsof/transcript 폴링을 완화한다.
+                !self.active.render_active,
             );
         }
         // 결과를 논블로킹 드레인 — 최신 것만 취한다(epoch 불일치=전환 잔여는 폐기).

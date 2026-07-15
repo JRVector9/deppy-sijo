@@ -1005,6 +1005,17 @@ struct SessionAlert {
 /// (env key, 값 또는 credential_id) 쌍 목록 — SetSessionDefaultEnv용.
 type EnvPairs = Vec<(String, String)>;
 
+fn font_settings_changed(
+    config: &Config,
+    last_ui_font: &Option<String>,
+    last_mono_font: &str,
+    last_mono_weight: &str,
+) -> bool {
+    &config.ui.ui_font != last_ui_font
+        || config.terminal.mono_font.as_str() != last_mono_font
+        || config.terminal.mono_weight.as_str() != last_mono_weight
+}
+
 pub struct App {
     config: Config,
     config_path: PathBuf,
@@ -1292,13 +1303,19 @@ impl App {
         let dotenv_sync_worker =
             DotenvSyncWorker::spawn(db_path.clone(), redaction.clone(), egui_ctx.clone());
 
+        // main에서 CreationContext를 받자마자 이 설정으로 폰트를 이미 설치했다. sentinel로
+        // 시작하면 첫 프레임에 15MB AppleGothic을 포함한 FontDefinitions를 다시 만들고
+        // 전체 TTF equality 비교까지 하므로, 실제 설치 상태를 초기 snapshot으로 쓴다.
+        let last_ui_font = config.ui.ui_font.clone();
+        let last_mono_font = config.terminal.mono_font.clone();
+        let last_mono_weight = config.terminal.mono_weight.clone();
         let mut app = Self {
             config,
             config_path,
             last_theme_dark: true,
-            last_ui_font: None,
-            last_mono_font: String::new(),
-            last_mono_weight: String::new(),
+            last_ui_font,
+            last_mono_font,
+            last_mono_weight,
             last_ui_scale: -1.0,
             last_dotenv_check: std::time::Instant::now(),
             last_dotenv_state: None,
@@ -4104,10 +4121,12 @@ impl eframe::App for App {
         // .env 변경 폴링 fallback (사이드바 OFF 대비 — 2s 스로틀).
         self.poll_dotenv_change();
         // UI 폰트/터미널 모노(가족·굵기) 설정 변경 hot reload — 폰트 재등록 + 렌더 캐시 무효화.
-        if self.config.ui.ui_font != self.last_ui_font
-            || self.config.terminal.mono_font != self.last_mono_font
-            || self.config.terminal.mono_weight != self.last_mono_weight
-        {
+        if font_settings_changed(
+            &self.config,
+            &self.last_ui_font,
+            &self.last_mono_font,
+            &self.last_mono_weight,
+        ) {
             self.last_ui_font = self.config.ui.ui_font.clone();
             self.last_mono_font = self.config.terminal.mono_font.clone();
             self.last_mono_weight = self.config.terminal.mono_weight.clone();
@@ -5730,6 +5749,29 @@ mod tests {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+
+    #[test]
+    fn 시작_font_snapshot은_첫_frame_재설치를_유발하지_않는다() {
+        let config = Config::default();
+        let last_ui_font = config.ui.ui_font.clone();
+        let last_mono_font = config.terminal.mono_font.clone();
+        let last_mono_weight = config.terminal.mono_weight.clone();
+        assert!(!font_settings_changed(
+            &config,
+            &last_ui_font,
+            &last_mono_font,
+            &last_mono_weight,
+        ));
+
+        let mut changed = config;
+        changed.terminal.mono_weight = "Bold".to_owned();
+        assert!(font_settings_changed(
+            &changed,
+            &last_ui_font,
+            &last_mono_font,
+            &last_mono_weight,
+        ));
+    }
 
     /// ⑦ 검증: .env 외부 수정 감지의 근거인 baseline 상태가 파일 변경/생성/삭제를
     /// 구분한다 — 2초 점검이 이 값의 변화로 재동기화를 트리거한다(B 경로).

@@ -71,6 +71,9 @@ fn main() -> anyhow::Result<()> {
         log_dir = %paths.log_dir.display(),
         "앱 시작"
     );
+    if let Some(log) = &bench_log {
+        log.emit_rss_stage("pre_run_native", 0);
+    }
 
     let result = eframe::run_native(
         "Deppy Sijo",

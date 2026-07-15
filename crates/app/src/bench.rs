@@ -281,6 +281,12 @@ impl BenchLog {
             Sink::Stderr => writeln!(std::io::stderr(), "{text}"),
         };
     }
+
+    /// eframe이 아직 생성되지 않은 시작 구간에서도 같은 RSS 이벤트 형식을 쓴다.
+    /// 샌드박스에서 GUI 초기화가 막혀도 config/DB/복구까지의 회귀를 기준 빌드와 비교할 수 있다.
+    pub fn emit_rss_stage(&self, stage: &str, workspaces: usize) {
+        emit_rss(self, stage, sample_rss(), workspaces);
+    }
 }
 
 fn unix_ms() -> u64 {
@@ -316,7 +322,10 @@ pub struct RssSample {
 /// 그래서 기법만 동일하게 재현했다 — 결과는 같은 `ps` 소스다.
 pub fn sample_rss() -> RssSample {
     let me = std::process::id();
-    let mut app_bytes = 0u64;
+    // macOS의 sandbox/TCC 환경에서는 `ps`가 자신의 프로세스조차 열거하지 못할 수 있다.
+    // 자기 RSS는 커널의 proc_pidinfo로 직접 읽으면 subprocess도, 전체 프로세스 목록 권한도
+    // 필요 없다. 다른 Unix와 proc_pidinfo 실패 시에만 아래 `ps` 행을 fallback으로 쓴다.
+    let mut app_bytes = own_rss_bytes().unwrap_or(0);
     let mut child_bytes = 0u64;
 
     // 측정 도구인 `ps` 자신도 우리 자식으로 잡힌다 — 제외하지 않으면 child_bytes에
@@ -351,6 +360,36 @@ pub fn sample_rss() -> RssSample {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn own_task_info() -> Option<libc::proc_taskinfo> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    // SAFETY: 현재 프로세스 pid와 정확한 크기의 쓰기 가능한 버퍼를 넘긴다.
+    let rc = unsafe {
+        libc::proc_pidinfo(
+            std::process::id() as libc::c_int,
+            libc::PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    (rc == size).then(|| {
+        // SAFETY: proc_pidinfo가 구조체 전체(size 바이트)를 채웠다.
+        unsafe { info.assume_init() }
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn own_rss_bytes() -> Option<u64> {
+    own_task_info().map(|info| info.pti_resident_size)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn own_rss_bytes() -> Option<u64> {
+    None
+}
+
 /// (pid, ppid, rss_bytes) 목록과 **우리가 띄운 `ps` 자신의 pid**(자기 제외용).
 fn process_rows() -> (Vec<(u32, u32, u64)>, Option<u32>) {
     let child = std::process::Command::new("ps")
@@ -383,24 +422,7 @@ fn process_rows() -> (Vec<(u32, u32, u64)>, Option<u32>) {
 /// 이 프로세스의 스레드 수 (macOS: proc_pidinfo PROC_PIDTASKINFO).
 #[cfg(target_os = "macos")]
 fn thread_count() -> Option<usize> {
-    let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::uninit();
-    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
-    // SAFETY: 유효한 크기의 버퍼를 넘긴다. 반환값이 size와 같을 때만 초기화된 것으로 본다.
-    let rc = unsafe {
-        libc::proc_pidinfo(
-            std::process::id() as libc::c_int,
-            libc::PROC_PIDTASKINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            size,
-        )
-    };
-    if rc != size {
-        return None;
-    }
-    // SAFETY: proc_pidinfo가 size 바이트를 채웠다.
-    let info = unsafe { info.assume_init() };
-    Some(info.pti_threadnum.max(0) as usize)
+    own_task_info().map(|info| info.pti_threadnum.max(0) as usize)
 }
 
 #[cfg(not(target_os = "macos"))]

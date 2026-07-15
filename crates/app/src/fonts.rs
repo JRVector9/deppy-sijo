@@ -68,6 +68,24 @@ const CJK_FONT_CANDIDATES: &[&str] = &[
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
 ];
 
+type CachedFontData = (&'static str, std::sync::Arc<egui::FontData>);
+static CJK_FONT_DATA: std::sync::OnceLock<Option<CachedFontData>> = std::sync::OnceLock::new();
+
+fn cjk_font_data() -> Option<CachedFontData> {
+    CJK_FONT_DATA
+        .get_or_init(|| {
+            CJK_FONT_CANDIDATES.iter().find_map(|path| {
+                std::fs::read(path).ok().map(|bytes| {
+                    (
+                        *path,
+                        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+                    )
+                })
+            })
+        })
+        .clone()
+}
+
 /// 기본 UI 폰트 경로 (macOS — AppleGothic, 사용자 선호 2026-07-08. 이전 기본은
 /// Apple SD Gothic Neo였고 목록에서 여전히 선택 가능).
 #[cfg(target_os = "macos")]
@@ -89,6 +107,14 @@ pub fn install_cjk_fallback(
     mono_font: &str,
     mono_weight: &str,
 ) {
+    ctx.set_fonts(build_font_definitions(ui_font, mono_font, mono_weight));
+}
+
+fn build_font_definitions(
+    ui_font: Option<&str>,
+    mono_font: &str,
+    mono_weight: &str,
+) -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
 
     // 터미널 모노 = 번들 폰트(설정 가족+굵기). Monospace 패밀리 **맨 앞**에 넣어 egui
@@ -118,13 +144,10 @@ pub fn install_cjk_fallback(
         .insert(0, "term_mono_bold".to_owned());
 
     // 한글 fallback (families 끝에 붙여 Latin은 기본/SF, 한글만 이 폰트가 처리)
-    if let Some((path, bytes)) = CJK_FONT_CANDIDATES
-        .iter()
-        .find_map(|p| std::fs::read(p).ok().map(|b| (*p, b)))
-    {
-        fonts
-            .font_data
-            .insert("cjk".to_owned(), egui::FontData::from_owned(bytes).into());
+    let mut cjk_font_path = None;
+    if let Some((path, font_data)) = cjk_font_data() {
+        cjk_font_path = Some(path);
+        fonts.font_data.insert("cjk".to_owned(), font_data);
         for family in [
             egui::FontFamily::Monospace,
             egui::FontFamily::Proportional,
@@ -147,6 +170,19 @@ pub fn install_cjk_fallback(
     // .ttc는 index로 로드된다. 모노(터미널)는 위에서 번들 JetBrains Mono + CJK fallback.
     let ui_candidates = [ui_font.unwrap_or_default(), DEFAULT_UI_FONT];
     for path in ui_candidates.iter().filter(|p| !p.is_empty()) {
+        if cjk_font_path == Some(*path) {
+            // 기본 macOS 구성은 UI와 CJK fallback 모두 15MB AppleGothic.ttf다. 같은 파일을
+            // `ui`라는 별도 FontData로 다시 읽고 파싱하면 원본 바이트와 skrifa Font가
+            // 영구 중복된다. 기존 `cjk` 항목을 UI의 첫 후보로 재사용한다.
+            let family = fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default();
+            family.retain(|name| name != "cjk");
+            family.insert(0, "cjk".to_owned());
+            tracing::info!(font = path, "UI 폰트 등록(CJK 데이터 공유)");
+            break;
+        }
         let Ok(bytes) = std::fs::read(path) else {
             tracing::warn!(font = path, "UI 폰트 로드 실패 — 다음 후보로");
             continue;
@@ -163,7 +199,7 @@ pub fn install_cjk_fallback(
         break;
     }
 
-    ctx.set_fonts(fonts);
+    fonts
 }
 
 /// 설정에서 고를 수 있는 UI 폰트 목록 — (표시명, 파일 경로). 시스템에 실제 설치되어
@@ -253,6 +289,34 @@ pub fn effective_ui_font_name(selected_path: Option<&str>, options: &[(String, S
 #[cfg(test)]
 mod tests {
     use super::{DEFAULT_UI_FONT_NAME, effective_ui_font_name};
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn 기본_macos_ui는_applegothic_fontdata를_중복하지_않는다() {
+        let fonts = super::build_font_definitions(
+            None,
+            super::DEFAULT_MONO_FONT,
+            super::DEFAULT_MONO_WEIGHT,
+        );
+        assert!(fonts.font_data.contains_key("cjk"));
+        assert!(
+            !fonts.font_data.contains_key("ui"),
+            "기본 UI와 CJK가 같은 AppleGothic인데 별도 원본을 보관하면 안 됨"
+        );
+        let proportional = &fonts.families[&egui::FontFamily::Proportional];
+        assert_eq!(proportional.first().map(String::as_str), Some("cjk"));
+        assert_eq!(proportional.iter().filter(|name| *name == "cjk").count(), 1);
+
+        let rebuilt = super::build_font_definitions(
+            None,
+            super::DEFAULT_MONO_FONT,
+            super::DEFAULT_MONO_WEIGHT,
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            &fonts.font_data["cjk"],
+            &rebuilt.font_data["cjk"]
+        ));
+    }
 
     #[test]
     fn 기본_ui_font는_실제_플랫폼_폰트명을_표시한다() {

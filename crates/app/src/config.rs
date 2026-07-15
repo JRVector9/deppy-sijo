@@ -423,6 +423,19 @@ mod tests {
     }
 
     #[test]
+    fn 비정상적으로_긴_toml_연산자열은_스택오버플로없이_거부한다() {
+        // toml 1.1.1에서 보강된 parser 회귀 경로. 사용자가 손으로 편집한 config가
+        // 손상돼도 앱 프로세스를 종료하지 않고 일반 parse error로 처리해야 한다.
+        for token in ['=', '+', '-'] {
+            let malformed: String = std::iter::repeat_n(token, 50_000).collect();
+            assert!(
+                toml::from_str::<toml::Value>(&malformed).is_err(),
+                "malformed {token:?} input must be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn 권장_live_warm은_ram에서_유도되고_3에서_8로_클램프() {
         assert_eq!(max_live_warm_for_ram_gb(0), 3); // 하한
         assert_eq!(max_live_warm_for_ram_gb(8), 3); // 8/4=2 → 3으로 클램프

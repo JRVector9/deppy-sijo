@@ -2,6 +2,7 @@
 name = "deppy-sijo"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [features]
@@ -53,11 +54,13 @@ toml_edit = "0.25.12"
 [target.'cfg(target_os = "macos")'.dependencies]
 # renamex_np(RENAME_EXCL) — 덮어쓰기 금지 rename (§9-5 TOCTOU 회피)
 libc = { workspace = true }
-muda = "0.17"
+muda = "0.19.3"
 # 클립보드 PNG 바이트 직행(디코드/재인코딩 없이 파일로 — cmux 방식, 2026-07-08).
 # eframe/winit이 이미 쓰는 crate라 추가 빌드 비용 미미.
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
+    "block2",
+    "NSEvent",
     "NSPasteboard",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
@@ -65,6 +68,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSData",
     "NSString",
 ] }
+block2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

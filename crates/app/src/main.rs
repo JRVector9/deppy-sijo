@@ -13,6 +13,7 @@ mod env;
 mod env_reload;
 mod fonts;
 mod mcp_import;
+mod native_key_monitor;
 mod paths;
 mod perf;
 mod shortcuts;
@@ -114,6 +115,7 @@ fn main() -> anyhow::Result<()> {
                 &config.terminal.mono_weight,
             );
             install_macos_menu();
+            native_key_monitor::install();
             // B1: 실제로 초기화된 백엔드/어댑터를 기록한다 (요청값이 아니라 결과값).
             let bench = bench_log.and_then(|log| {
                 log.emit("renderer", renderer_fields(cc, process_start));

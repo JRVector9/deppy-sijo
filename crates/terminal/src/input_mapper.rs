@@ -41,6 +41,201 @@ pub fn map_event(
     }
 }
 
+/// macOS IME 조합을 끝내는 printable 키의 마지막 안전망이다.
+///
+/// 일반적인 키 입력은 [`egui::Event::Text`]도 함께 오므로 [`map_event`]가 Text만 보내
+/// 중복을 피한다. 하지만 한글 조합 직후의 문장부호는 macOS가 `Key`와 `Ime::Commit`만
+/// 전달하고 Text를 생략할 수 있다. 이 함수는 그 경우에만 UI가 대체 바이트를 보낼 수
+/// 있도록, 현재 키보드 배열에서 확정적인 ASCII 문자만 돌려준다. Ctrl/Command/Option
+/// 조합은 단축키 또는 레이아웃 의존 문자일 수 있으므로 절대 대체하지 않는다.
+pub fn ime_terminator_key_char(event: &egui::Event) -> Option<char> {
+    ime_key_char_with_state(event, true)
+}
+
+/// macOS/winit은 IME가 소비한 printable key의 key-down은 숨기지만, 조합이 끝난 뒤
+/// key-up은 전달한다. UI가 그 key-up에서 실제 문자를 복구할 때 쓴다.
+pub fn ime_terminator_key_release_char(event: &egui::Event) -> Option<char> {
+    ime_key_char_with_state(event, false)
+}
+
+fn ime_key_char_with_state(event: &egui::Event, expected_pressed: bool) -> Option<char> {
+    let egui::Event::Key {
+        key,
+        pressed,
+        modifiers,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    if *pressed != expected_pressed {
+        return None;
+    }
+    if modifiers.ctrl || modifiers.command || modifiers.mac_cmd || modifiers.alt {
+        return None;
+    }
+
+    let shifted = modifiers.shift;
+    Some(match key {
+        egui::Key::Space => ' ',
+        egui::Key::Comma => {
+            if shifted {
+                '<'
+            } else {
+                ','
+            }
+        }
+        egui::Key::Minus => {
+            if shifted {
+                '_'
+            } else {
+                '-'
+            }
+        }
+        egui::Key::Period => {
+            if shifted {
+                '>'
+            } else {
+                '.'
+            }
+        }
+        egui::Key::Slash => {
+            if shifted {
+                '?'
+            } else {
+                '/'
+            }
+        }
+        egui::Key::Semicolon => {
+            if shifted {
+                ':'
+            } else {
+                ';'
+            }
+        }
+        egui::Key::Backslash | egui::Key::IntlBackslash => {
+            if shifted {
+                '|'
+            } else {
+                '\\'
+            }
+        }
+        egui::Key::OpenBracket => {
+            if shifted {
+                '{'
+            } else {
+                '['
+            }
+        }
+        egui::Key::CloseBracket => {
+            if shifted {
+                '}'
+            } else {
+                ']'
+            }
+        }
+        egui::Key::Backtick => {
+            if shifted {
+                '~'
+            } else {
+                '`'
+            }
+        }
+        egui::Key::Quote => {
+            if shifted {
+                '"'
+            } else {
+                '\''
+            }
+        }
+        egui::Key::Equals => {
+            if shifted {
+                '+'
+            } else {
+                '='
+            }
+        }
+        egui::Key::Colon => ':',
+        egui::Key::Pipe => '|',
+        egui::Key::Questionmark => '?',
+        egui::Key::Exclamationmark => '!',
+        egui::Key::OpenCurlyBracket => '{',
+        egui::Key::CloseCurlyBracket => '}',
+        egui::Key::Plus => '+',
+        egui::Key::Num0 => {
+            if shifted {
+                ')'
+            } else {
+                '0'
+            }
+        }
+        egui::Key::Num1 => {
+            if shifted {
+                '!'
+            } else {
+                '1'
+            }
+        }
+        egui::Key::Num2 => {
+            if shifted {
+                '@'
+            } else {
+                '2'
+            }
+        }
+        egui::Key::Num3 => {
+            if shifted {
+                '#'
+            } else {
+                '3'
+            }
+        }
+        egui::Key::Num4 => {
+            if shifted {
+                '$'
+            } else {
+                '4'
+            }
+        }
+        egui::Key::Num5 => {
+            if shifted {
+                '%'
+            } else {
+                '5'
+            }
+        }
+        egui::Key::Num6 => {
+            if shifted {
+                '^'
+            } else {
+                '6'
+            }
+        }
+        egui::Key::Num7 => {
+            if shifted {
+                '&'
+            } else {
+                '7'
+            }
+        }
+        egui::Key::Num8 => {
+            if shifted {
+                '*'
+            } else {
+                '8'
+            }
+        }
+        egui::Key::Num9 => {
+            if shifted {
+                '('
+            } else {
+                '9'
+            }
+        }
+        _ => return None,
+    })
+}
+
 /// bracketed paste 모드(DEC 2004)면 ESC[200~ / ESC[201~로 감싼 paste bytes를 만든다.
 pub fn paste_bytes(payload: &[u8], bracketed: bool) -> Vec<u8> {
     if bracketed {
@@ -274,6 +469,89 @@ mod tests {
                 &NONE
             ),
             Some("글".as_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn 문장부호와_공백은_key와_text_쌍에서도_한번만_전달된다() {
+        // egui-winit은 printable key에 대해 Event::Key와 Event::Text를 모두 보낸다.
+        // 터미널에는 Text만 전달해야 `.`, 공백, `!` 등이 두 번 입력되지 않는다.
+        let cases = [
+            (egui::Key::Period, "."),
+            (egui::Key::Comma, ","),
+            (egui::Key::Slash, "/"),
+            (egui::Key::Questionmark, "?"),
+            (egui::Key::Exclamationmark, "!"),
+            (egui::Key::Space, " "),
+        ];
+        for (key, text) in cases {
+            let events = [key_event(key, NONE), egui::Event::Text(text.to_owned())];
+            let mut bytes = Vec::new();
+            for event in &events {
+                if let Some(mapped) = map_event(event, false, &NONE) {
+                    bytes.extend(mapped);
+                }
+            }
+            assert_eq!(bytes, text.as_bytes(), "{text:?} must be sent once");
+        }
+    }
+
+    #[test]
+    fn ime_조합종료_대체키는_특수문자와_shift_기호를_되살린다() {
+        assert_eq!(
+            ime_terminator_key_char(&key_event(egui::Key::Period, NONE)),
+            Some('.')
+        );
+        assert_eq!(
+            ime_terminator_key_char(&key_event(egui::Key::Period, egui::Modifiers::SHIFT)),
+            Some('>')
+        );
+        assert_eq!(
+            ime_terminator_key_char(&key_event(egui::Key::Num1, egui::Modifiers::SHIFT)),
+            Some('!')
+        );
+        assert_eq!(
+            ime_terminator_key_char(&key_event(egui::Key::Quote, NONE)),
+            Some('\'')
+        );
+        assert_eq!(
+            ime_terminator_key_char(&key_event(egui::Key::Backtick, egui::Modifiers::SHIFT)),
+            Some('~')
+        );
+    }
+
+    #[test]
+    fn ime_조합종료_대체키는_단축키를_가로채지_않는다() {
+        assert_eq!(
+            ime_terminator_key_char(&key_event(egui::Key::Period, egui::Modifiers::CTRL)),
+            None
+        );
+        assert_eq!(
+            ime_terminator_key_char(&key_event(egui::Key::Period, egui::Modifiers::MAC_CMD)),
+            None
+        );
+    }
+
+    #[test]
+    fn ime가_keydown을_삼킨_특수문자는_keyup에서_복구할_수_있다() {
+        let release = |key, modifiers| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers,
+        };
+        assert_eq!(
+            ime_terminator_key_release_char(&release(egui::Key::Period, NONE)),
+            Some('.')
+        );
+        assert_eq!(
+            ime_terminator_key_release_char(&release(egui::Key::Num1, egui::Modifiers::SHIFT)),
+            Some('!')
+        );
+        assert_eq!(
+            ime_terminator_key_release_char(&release(egui::Key::Period, egui::Modifiers::CTRL)),
+            None
         );
     }
 

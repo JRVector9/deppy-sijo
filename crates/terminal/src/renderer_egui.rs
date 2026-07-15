@@ -216,12 +216,16 @@ pub fn cell_size(ctx: &egui::Context, metrics: CellMetrics) -> egui::Vec2 {
 }
 
 /// snapshot을 그린다. preedit은 IME 조합 중 텍스트 — 커서 위치에 표시한다.
+/// `ime_active`는 호출측이 결정한 논리적 터미널 키보드 소유 상태다. 활성 상태면
+/// 같은 프레임에 egui 포커스를 확보한 뒤 공식 IME 소유권을 확인한다.
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     ui: &mut egui::Ui,
     snapshot: &TerminalViewportSnapshot,
     metrics: CellMetrics,
     cache: &mut TerminalRenderCache,
     preedit: Option<&str>,
+    ime_active: bool,
     // 선택 영역 (정규화된 선형 셀 인덱스, inclusive) — 셀 배경을 선택색으로 그린다
     selection: Option<(usize, usize)>,
     // 스냅샷 세대 — 호출측이 새 스냅샷을 받을 때마다 +1. 같은 세대를 다시 그리면
@@ -251,6 +255,13 @@ pub fn draw(
     );
     // click_and_drag: 클릭=포커스, 드래그=선택 (2026-07-05 복사 지원)
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    // egui 0.35에서 커스텀 입력 위젯은 `Memory::owns_ime_events`가 참일 때만 IME를
+    // 출력·소비해야 한다. `request_focus`는 즉시 focus id를 바꾸고 기존 조합 중단도
+    // egui에 알리므로, 논리적 터미널 소유권이 넘어온 프레임 안에 공식 소유자가 된다.
+    if ime_active && !ui.memory(|memory| memory.owns_ime_events(response.id)) {
+        response.request_focus();
+    }
+    let owns_ime_events = ime_active && ui.memory(|memory| memory.owns_ime_events(response.id));
     if response.has_focus() {
         ui.memory_mut(|memory| {
             memory.set_focus_lock_filter(response.id, terminal_focus_lock_filter());
@@ -333,13 +344,14 @@ pub fn draw(
         cache.counters.shapes += 1;
     }
 
-    // IME는 터미널이 포커스를 가질 때만 — 다른 입력창의 조합/후보창을 뺏지 않는다.
+    // IME는 터미널이 egui의 공식 IME 소유자일 때만 — 다른 입력창의 조합/후보창을
+    // 뺏지 않는다. 위에서 논리적 소유권과 egui 포커스를 같은 프레임에 동기화한다.
     // **커서 가시성과는 무관하게** 매 프레임 세팅해야 한다: egui-winit은
     // `allow_ime = ime.is_some()`이라(0.35 handle_platform_output), 한 프레임이라도
     // 비우면 set_ime_allowed(false)로 macOS가 진행 중인 한글 조합을 강제 커밋한다.
     // TUI(claude 등)는 리드로우마다 커서를 숨겼다 켜므로(?25l/?25h) 커서 가시성에
     // 묶으면 조합이 자모 단위로 끊긴다 (2026-07-14 사용자: "ㄹㅗ" 분리).
-    if response.has_focus() {
+    if owns_ime_events {
         // 조합 중 텍스트를 커서 위치에 표시
         if let Some(preedit) = preedit.filter(|p| !p.is_empty()) {
             // 조합 텍스트도 글자이므로 셀 안 세로 중앙 정렬을 따른다.
@@ -776,7 +788,16 @@ mod tests {
         let ctx = egui::Context::default();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.set_min_size(egui::vec2(500.0, 200.0));
-            draw(ui, snapshot, m(13.0, 1.0), cache, None, None, generation);
+            draw(
+                ui,
+                snapshot,
+                m(13.0, 1.0),
+                cache,
+                None,
+                false,
+                None,
+                generation,
+            );
         });
         cache.rebuilt_rows_last_frame()
     }
@@ -807,7 +828,16 @@ mod tests {
         let mut measured = None;
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.set_min_size(egui::vec2(500.0, 200.0));
-            let output = draw(ui, &snapshot, m(13.0, 1.0), &mut cache, None, None, next_gen());
+            let output = draw(
+                ui,
+                &snapshot,
+                m(13.0, 1.0),
+                &mut cache,
+                None,
+                false,
+                None,
+                next_gen(),
+            );
             measured = Some((output.response.rect, output.origin, output.cell_size));
         });
 
@@ -821,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    fn ime_영역은_커서가_숨어도_포커스면_계속_통보된다() {
+    fn ime_영역은_같은_프레임에_공식_소유권을_확보한_뒤_통보된다() {
         // egui-winit은 o.ime가 비는 프레임마다 set_ime_allowed(false)를 호출해
         // macOS가 진행 중인 한글 조합을 강제 커밋한다. TUI는 리드로우마다 커서를
         // 숨기므로(?25l) 커서 가시성에 IME를 묶으면 자모가 분리된다 (2026-07-14).
@@ -829,21 +859,49 @@ mod tests {
         let mut cache = TerminalRenderCache::default();
         let mut snapshot = snap(4, 1, &["test"]);
         snapshot.cursor.visible = false;
-        // 1프레임: 그리고 포커스 요청
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-            ui.set_min_size(egui::vec2(500.0, 200.0));
-            let out = draw(ui, &snapshot, m(13.0, 1.0), &mut cache, None, None, next_gen());
-            out.response.request_focus();
-        });
-        // 2프레임: 포커스 보유 — 커서가 숨어 있어도 IME 영역은 통보돼야 한다
+        let mut owns_ime_events = false;
+        // 논리적 소유권이 넘어온 첫 프레임에도 request_focus 후 공식 소유자가 되어
+        // IME 영역을 내보내야 한다.
         let full = ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.set_min_size(egui::vec2(500.0, 200.0));
-            draw(ui, &snapshot, m(13.0, 1.0), &mut cache, None, None, next_gen());
+            let output = draw(
+                ui,
+                &snapshot,
+                m(13.0, 1.0),
+                &mut cache,
+                None,
+                true,
+                None,
+                next_gen(),
+            );
+            owns_ime_events = ui.memory(|memory| memory.owns_ime_events(output.response.id));
         });
+        assert!(owns_ime_events, "터미널이 egui IME 소유자가 되어야 한다");
         assert!(
             full.platform_output.ime.is_some(),
-            "커서 숨김 프레임에서 IME가 비면 조합이 끊긴다"
+            "소유권 전환 프레임에서 IME가 비면 조합이 끊긴다"
         );
+    }
+
+    #[test]
+    fn ime_영역은_비활성_터미널이_출력하지_않는다() {
+        let ctx = egui::Context::default();
+        let mut cache = TerminalRenderCache::default();
+        let snapshot = snap(4, 1, &["test"]);
+        let full = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_min_size(egui::vec2(500.0, 200.0));
+            draw(
+                ui,
+                &snapshot,
+                m(13.0, 1.0),
+                &mut cache,
+                None,
+                false,
+                None,
+                next_gen(),
+            );
+        });
+        assert!(full.platform_output.ime.is_none());
     }
 
     #[test]
@@ -916,7 +974,17 @@ mod tests {
             let mut out = RenderCounters::default();
             let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
                 ui.set_min_size(egui::vec2(500.0, 200.0));
-                out = draw(ui, snapshot, m(13.0, 1.0), cache, None, None, next_gen()).counters;
+                out = draw(
+                    ui,
+                    snapshot,
+                    m(13.0, 1.0),
+                    cache,
+                    None,
+                    false,
+                    None,
+                    next_gen(),
+                )
+                .counters;
             });
             out
         }

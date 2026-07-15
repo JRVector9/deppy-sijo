@@ -2,6 +2,7 @@
 name = "mcp-proxy"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 # 에이전트가 자신의 stdio MCP 서버로 spawn하는 브리지 바이너리 (agent-proxy 1.5).

@@ -26,6 +26,8 @@ pub enum ShortcutAction {
     IncreaseTerminalFont,
     DecreaseTerminalFont,
     TerminalSearch,
+    /// 스크롤백에서 맨 아래(라이브 화면)로 복귀 (⌘↓ 기본 — pane 메뉴와 동일 동작)
+    ScrollToBottom,
     ClearRenderCaches,
     PreviousAgent,
     NextAgent,
@@ -65,7 +67,7 @@ impl ShortcutGroup {
 }
 
 impl ShortcutAction {
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::ToggleSidebar,
         Self::OpenEnvironment,
         Self::OpenAgents,
@@ -82,6 +84,7 @@ impl ShortcutAction {
         Self::IncreaseTerminalFont,
         Self::DecreaseTerminalFont,
         Self::TerminalSearch,
+        Self::ScrollToBottom,
         Self::ClearRenderCaches,
         Self::PreviousAgent,
         Self::NextAgent,
@@ -112,6 +115,7 @@ impl ShortcutAction {
             Self::IncreaseTerminalFont => "increase_terminal_font",
             Self::DecreaseTerminalFont => "decrease_terminal_font",
             Self::TerminalSearch => "terminal_search",
+            Self::ScrollToBottom => "scroll_to_bottom",
             Self::ClearRenderCaches => "clear_render_caches",
             Self::PreviousAgent => "previous_agent",
             Self::NextAgent => "next_agent",
@@ -143,6 +147,7 @@ impl ShortcutAction {
             Self::IncreaseTerminalFont => "shortcuts.action.increase_terminal_font",
             Self::DecreaseTerminalFont => "shortcuts.action.decrease_terminal_font",
             Self::TerminalSearch => "shortcuts.action.terminal_search",
+            Self::ScrollToBottom => "shortcuts.action.scroll_to_bottom",
             Self::ClearRenderCaches => "shortcuts.action.clear_render_caches",
             Self::PreviousAgent => "shortcuts.action.previous_agent",
             Self::NextAgent => "shortcuts.action.next_agent",
@@ -179,7 +184,8 @@ impl ShortcutAction {
             | Self::FocusPreviousPane
             | Self::IncreaseTerminalFont
             | Self::DecreaseTerminalFont
-            | Self::TerminalSearch => ShortcutGroup::Terminal,
+            | Self::TerminalSearch
+            | Self::ScrollToBottom => ShortcutGroup::Terminal,
             Self::NextWorkspace | Self::PreviousWorkspace | Self::ClearRenderCaches => {
                 ShortcutGroup::Workspace
             }
@@ -216,6 +222,7 @@ impl ShortcutAction {
             // macOS Cmd+F 기본. 평문 Ctrl+F는 readline forward-char(C-f)와 충돌하므로
             // 기본으로 가로채지 않는다 — 사용자는 설정에서 Ctrl+F로 rebind할 수 있다 (T3).
             Self::TerminalSearch => Some("Command+F"),
+            Self::ScrollToBottom => Some("Command+Down"),
             Self::ClearRenderCaches => Some("Command+Alt+K"),
             Self::PreviousAgent
             | Self::NextAgent

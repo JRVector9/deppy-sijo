@@ -1752,10 +1752,10 @@ struct ShortcutPageState {
 
 /// OS/터미널이 직접 처리해 앱이 재바인딩할 수 없는 고정 단축키 — Terminal 그룹 목록에
 /// 표기만 하고 레코딩·초기화·해제 컨트롤은 제공하지 않는다. (title_key, key_label)
+/// (맨 아래로 스크롤은 재바인딩 가능한 ShortcutAction::ScrollToBottom — 여기 아님.)
 const FIXED_TERMINAL_SHORTCUTS: &[(&str, &str)] = &[
     ("shortcuts.action.copy", "⌘C"),
     ("shortcuts.action.paste", "⌘V"),
-    ("shortcuts.action.scroll_to_bottom", "⌘↓"),
 ];
 
 fn shortcuts_page(

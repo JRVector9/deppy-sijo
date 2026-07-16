@@ -3035,6 +3035,10 @@ impl App {
                 .active
                 .workspace_ui
                 .close_focused_pane(&self.active.runtime),
+            A::ScrollToBottom => self
+                .active
+                .workspace_ui
+                .scroll_focused_to_bottom(&self.active.runtime),
             A::SplitVertical | A::SplitHorizontal => {
                 let direction = if action == A::SplitVertical {
                     runtime::SplitDirection::Vertical

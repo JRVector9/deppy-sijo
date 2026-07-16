@@ -1823,6 +1823,20 @@ impl WorkspaceUi {
                         image_paste_trigger.get_or_insert(ClipboardPasteTrigger::EguiShortcut);
                         continue;
                     }
+                    // macOS ⌘ 조합 키는 앱 단축키 영역 — PTY로 보내지 않는다. 전역 단축키
+                    // 소비(take_triggered_action)는 input.events에서만 지워지는데 이 루프는
+                    // input.raw.events(별도 clone)를 읽으므로, 여기서 막지 않으면 ⌘↓ 등이
+                    // 화살표 CSI로 새어 들어간다(기존 ⌘⌥←/→ 워크스페이스 전환도 동일 누수
+                    // — 2026-07-17). mac_cmd만 본다: 비macOS의 command(=Ctrl)는 Ctrl+C 등
+                    // PTY 몫이라 건드리지 않는다.
+                    if let egui::Event::Key {
+                        modifiers: key_modifiers,
+                        ..
+                    } = event
+                        && key_modifiers.mac_cmd
+                    {
+                        continue;
+                    }
                     // Shift+화살표 → 마우스 드래그처럼 선택 확장. 터미널로는 안 보낸다.
                     // alt-screen(vim/less 등 TUI)에선 앱이 shift+화살표를 쓰므로 가로채지
                     // 않고 그대로 통과시킨다.

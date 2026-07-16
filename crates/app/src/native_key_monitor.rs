@@ -2,9 +2,10 @@
 //! 앱 내부 이벤트 관찰기.
 //!
 //! AppKit local monitor는 이벤트를 winit의 NSView가 처리하기 전에 호출된다. 여기서는
-//! 영문자와 단축키를 제외한 ASCII 문장부호/숫자/공백의 원본 key-down만 짧게 보관하고
-//! 이벤트 자체는 수정 없이 그대로 돌려준다. 실제 PTY 전송 여부와 Text/Commit 중복
-//! 제거는 터미널 키보드 소유권을 아는 `WorkspaceUi`가 결정한다.
+//! 영문자와 일반 단축키를 제외한 ASCII 문장부호/숫자/공백, 그리고 egui가 이미지-only
+//! 클립보드에서 소비해 버리는 Command+V의 원본 key-down만 짧게 보관하고 이벤트 자체는
+//! 수정 없이 그대로 돌려준다. 실제 PTY 전송 여부와 Text/Commit/paste 중복 제거는
+//! 터미널 키보드 소유권을 아는 `WorkspaceUi`가 결정한다.
 
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
@@ -14,6 +15,27 @@ use std::time::{Duration, Instant};
 pub(crate) struct NativePrintableKeyDown {
     pub(crate) character: char,
     observed_at: Instant,
+}
+
+#[derive(Default)]
+pub(crate) struct NativeKeyDownBatch {
+    pub(crate) printable: Vec<NativePrintableKeyDown>,
+    pub(crate) clipboard_paste: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeKeyDown {
+    Printable(NativePrintableKeyDown),
+    ClipboardPaste { observed_at: Instant },
+}
+
+impl NativeKeyDown {
+    fn fresh(self) -> bool {
+        match self {
+            Self::Printable(key_down) => key_down.fresh(),
+            Self::ClipboardPaste { observed_at } => observed_at.elapsed() <= NATIVE_KEY_MAX_AGE,
+        }
+    }
 }
 
 impl NativePrintableKeyDown {
@@ -33,35 +55,50 @@ impl NativePrintableKeyDown {
 const NATIVE_KEY_MAX_AGE: Duration = Duration::from_millis(500);
 const NATIVE_KEY_QUEUE_CAPACITY: usize = 64;
 
-static KEY_DOWNS: OnceLock<Mutex<VecDeque<NativePrintableKeyDown>>> = OnceLock::new();
+static KEY_DOWNS: OnceLock<Mutex<VecDeque<NativeKeyDown>>> = OnceLock::new();
 
-fn queue() -> &'static Mutex<VecDeque<NativePrintableKeyDown>> {
+fn queue() -> &'static Mutex<VecDeque<NativeKeyDown>> {
     KEY_DOWNS.get_or_init(|| Mutex::new(VecDeque::with_capacity(NATIVE_KEY_QUEUE_CAPACITY)))
 }
 
-fn record(character: char) {
+fn record(key_down: NativeKeyDown) {
     let Ok(mut key_downs) = queue().lock() else {
         return;
     };
     if key_downs.len() == NATIVE_KEY_QUEUE_CAPACITY {
         key_downs.pop_front();
     }
-    key_downs.push_back(NativePrintableKeyDown {
+    key_downs.push_back(key_down);
+}
+
+fn record_printable(character: char) {
+    record(NativeKeyDown::Printable(NativePrintableKeyDown {
         character,
+        observed_at: Instant::now(),
+    }));
+}
+
+fn record_clipboard_paste() {
+    record(NativeKeyDown::ClipboardPaste {
         observed_at: Instant::now(),
     });
 }
 
-/// 이번 egui 프레임 직전에 AppKit이 본 printable key-down을 모두 꺼낸다. 오래됐거나
-/// 터미널 UI가 비활성인 프레임의 레코드는 다음 입력에 섞이지 않도록 재사용하지 않는다.
-pub(crate) fn drain() -> Vec<NativePrintableKeyDown> {
+/// 이번 egui 프레임 직전에 AppKit이 본 printable/clipboard key-down을 모두 꺼낸다.
+/// 오래됐거나 터미널 UI가 비활성인 프레임의 레코드는 다음 입력에 섞이지 않도록
+/// 재사용하지 않는다. 같은 프레임의 Command+V key repeat은 paste 1회로 합친다.
+pub(crate) fn drain() -> NativeKeyDownBatch {
     let Ok(mut key_downs) = queue().lock() else {
-        return Vec::new();
+        return NativeKeyDownBatch::default();
     };
-    key_downs
-        .drain(..)
-        .filter(|key_down| key_down.fresh())
-        .collect()
+    let mut batch = NativeKeyDownBatch::default();
+    for key_down in key_downs.drain(..).filter(|key_down| key_down.fresh()) {
+        match key_down {
+            NativeKeyDown::Printable(key_down) => batch.printable.push(key_down),
+            NativeKeyDown::ClipboardPaste { .. } => batch.clipboard_paste = true,
+        }
+    }
+    batch
 }
 
 #[cfg(target_os = "macos")]
@@ -82,14 +119,16 @@ pub(crate) fn install() {
         // We only inspect it synchronously and return the exact same pointer unchanged.
         let event_ref = unsafe { event.as_ref() };
         let modifiers = event_ref.modifierFlags();
-        if !modifiers.intersects(
+        if native_clipboard_paste_event(event_ref) {
+            record_clipboard_paste();
+        } else if !modifiers.intersects(
             NSEventModifierFlags::Command
                 | NSEventModifierFlags::Control
                 | NSEventModifierFlags::Option
                 | NSEventModifierFlags::Function,
         ) && let Some(character) = native_printable_character(event_ref)
         {
-            record(character);
+            record_printable(character);
         }
         event.as_ptr()
     });
@@ -107,6 +146,44 @@ pub(crate) fn install() {
         INSTALLED.store(false, Ordering::Release);
         tracing::warn!("macOS native key monitor 설치 실패 — IME key-up 복구만 사용");
     }
+}
+
+#[cfg(target_os = "macos")]
+fn native_clipboard_paste_event(event: &objc2_app_kit::NSEvent) -> bool {
+    use objc2_app_kit::NSEventModifierFlags;
+
+    let modifiers = event.modifierFlags();
+    let characters = event
+        .charactersIgnoringModifiers()
+        .map(|characters| characters.to_string());
+    is_clipboard_paste_key(
+        event.keyCode(),
+        characters.as_deref(),
+        modifiers.contains(NSEventModifierFlags::Command),
+        modifiers.intersects(
+            NSEventModifierFlags::Control
+                | NSEventModifierFlags::Option
+                | NSEventModifierFlags::Function,
+        ),
+    )
+}
+
+/// `charactersIgnoringModifiers`가 Latin `v`를 주는 배열은 논리 키를 따르고, 한글처럼
+/// 비-Latin 문자열을 주거나 비어 있으면 ANSI V 물리 키(0x09)를 fallback으로 쓴다.
+/// Control/Option/Function 조합은 terminal/app shortcut일 수 있어 clipboard paste로
+/// 해석하지 않는다. Shift는 macOS의 Paste and Match Style 계열과 기존 egui 동작을
+/// 보존하기 위해 허용한다.
+fn is_clipboard_paste_key(
+    key_code: u16,
+    characters_ignoring_modifiers: Option<&str>,
+    command: bool,
+    conflicting_modifier: bool,
+) -> bool {
+    if !command || conflicting_modifier {
+        return false;
+    }
+    characters_ignoring_modifiers.is_some_and(|characters| characters.eq_ignore_ascii_case("v"))
+        || key_code == 0x09
 }
 
 #[cfg(target_os = "macos")]
@@ -193,6 +270,16 @@ mod tests {
         assert_eq!(single_ascii_terminator(""), None);
         assert_eq!(single_ascii_terminator(".."), None);
         assert_eq!(single_ascii_terminator("a"), None);
+    }
+
+    #[test]
+    fn command_v는_논리키와_한글배열_물리키_fallback으로_잡는다() {
+        assert!(is_clipboard_paste_key(0x30, Some("v"), true, false));
+        assert!(is_clipboard_paste_key(0x09, Some("ㅍ"), true, false));
+        assert!(is_clipboard_paste_key(0x09, None, true, false));
+        assert!(!is_clipboard_paste_key(0x09, Some("v"), false, false));
+        assert!(!is_clipboard_paste_key(0x09, Some("v"), true, true));
+        assert!(!is_clipboard_paste_key(0x08, Some("c"), true, false));
     }
 
     #[cfg(target_os = "macos")]

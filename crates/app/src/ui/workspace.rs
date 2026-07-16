@@ -28,6 +28,9 @@ pub struct WorkspaceUi {
     /// 이번 UI 프레임 직전에 AppKit local monitor가 본 ASCII 문장부호/숫자/공백
     /// key-down. IME Commit/Text와 대조한 뒤 누락된 문자만 복구하고 프레임 끝에 버린다.
     native_printable_key_downs: Vec<crate::native_key_monitor::NativePrintableKeyDown>,
+    /// egui-winit이 이미지-only clipboard에서 Event::Paste 없이 소비하는 macOS Command+V
+    /// 원본 key-down. 터미널 입력 소유권을 확인한 pane에서만 1회 소비한다.
+    native_clipboard_paste_requested: bool,
     /// 세션 → 셸 pid (App이 ResourceUsage에서 매 프레임 갱신). 터미널 경로 더블클릭의
     /// 상대경로를 그 셸의 실제 cwd로 해석하는 데 쓴다 (2026-07-14).
     session_pids: HashMap<SessionId, u32>,
@@ -46,6 +49,9 @@ pub struct WorkspaceUi {
     /// 한 번 더 보내 이중 붙여넣기가 됐다 (2026-07-14 사용자). 같은 제스처로 보고
     /// release 태스크를 건너뛰기 위한 표식.
     last_text_paste: Option<std::time::Instant>,
+    /// AppKit Command+V key-down에서 이미지 paste 태스크를 시작한 시각. 뒤이어 오는
+    /// egui V key-up fallback이 같은 clipboard를 다시 붙이지 않게 하는 제스처 표식.
+    last_native_paste: Option<std::time::Instant>,
     /// 세션별 마지막 전송한 (cols, rows) — 변화 시에만 Resize 전송
     sent_sizes: HashMap<SessionId, (u16, u16)>,
     /// 트랙패드 미세 스크롤 누적 (focused pane 기준)
@@ -188,6 +194,7 @@ impl WorkspaceUi {
             preedit: String::new(),
             pending_ime_key_release: None,
             native_printable_key_downs: Vec::new(),
+            native_clipboard_paste_requested: false,
             sent_sizes: HashMap::new(),
             scroll_residual: 0.0,
             drag_autoscroll_residual: 0.0,
@@ -207,6 +214,7 @@ impl WorkspaceUi {
             session_cwd_cache: None,
             last_dir_click: None,
             last_text_paste: None,
+            last_native_paste: None,
             session_cwds: std::collections::HashMap::new(),
             session_name_style: crate::config::SessionNameStyle::default(),
             agent_info: std::collections::HashMap::new(),
@@ -807,7 +815,9 @@ impl WorkspaceUi {
         // AppKit local monitor는 winit/egui가 IME 처리 중 숨길 수 있는 원본 key-down을
         // 보존한다. 매 프레임 먼저 비워 두어 검색창/설정창에서 친 키가 나중에 터미널로
         // 이월되지 않게 하고, 실제 전송은 terminal_keyboard_active pane만 수행한다.
-        self.native_printable_key_downs = crate::native_key_monitor::drain();
+        let native_key_downs = crate::native_key_monitor::drain();
+        self.native_printable_key_downs = native_key_downs.printable;
+        self.native_clipboard_paste_requested = native_key_downs.clipboard_paste;
         self.handle_events(events, catalog);
         self.poll_paste_task(client);
 
@@ -1621,6 +1631,8 @@ impl WorkspaceUi {
             // 조정해야 공백·쉼표의 중복과 첫 문장부호 누락을 동시에 막을 수 있다.
             let preedit_active_before_input = !self.preedit.is_empty();
             let native_key_downs = std::mem::take(&mut self.native_printable_key_downs);
+            let native_clipboard_paste_requested =
+                std::mem::take(&mut self.native_clipboard_paste_requested);
             let (ime_reconciliation, ime_release_recovery) = ui.input(|input| {
                 let reconciliation = reconcile_ime_text_events(
                     &native_key_downs,
@@ -1638,7 +1650,8 @@ impl WorkspaceUi {
                 (reconciliation, recovery)
             });
             let mut copy_text: Option<String> = None;
-            let mut image_paste_requested = false;
+            let mut image_paste_trigger =
+                native_clipboard_paste_requested.then_some(ClipboardPasteTrigger::NativeKeyDown);
             let mut text_paste_bytes: Option<Vec<u8>> = None;
             ui.input(|input| {
                 let modifiers = input.modifiers;
@@ -1669,7 +1682,7 @@ impl WorkspaceUi {
                         continue;
                     }
                     if is_clipboard_paste_shortcut(event) {
-                        image_paste_requested = true;
+                        image_paste_trigger.get_or_insert(ClipboardPasteTrigger::EguiShortcut);
                         continue;
                     }
                     // Shift+화살표 → 마우스 드래그처럼 선택 확장. 터미널로는 안 보낸다.
@@ -1747,16 +1760,23 @@ impl WorkspaceUi {
             if let Some(text) = copy_text {
                 ui.ctx().copy_text(text);
             }
-            if image_paste_requested {
-                if should_skip_release_paste_task(text_paste_bytes.is_some(), self.last_text_paste)
-                {
-                    // 같은 ⌘V 제스처의 press에서 Event::Paste 텍스트를 이미 보냈다 —
-                    // release 태스크까지 돌리면 클립보드 fallback이 같은 내용을 한 번 더
-                    // 보낸다(이중 붙여넣기, 2026-07-14). 제스처 1회로 소비하고 스킵.
+            if let Some(paste_trigger) = image_paste_trigger {
+                if should_skip_paste_task(
+                    paste_trigger,
+                    text_paste_bytes.is_some(),
+                    self.last_text_paste,
+                    self.last_native_paste,
+                ) {
+                    // 같은 ⌘V 제스처의 native key-down 또는 Event::Paste에서 이미 처리했다.
+                    // 뒤늦은 key-up fallback까지 돌리면 이미지/텍스트가 한 번 더 붙는다.
                     self.last_text_paste = None;
+                    self.last_native_paste = None;
                 } else {
                     // 파일/이미지 판별 + PNG 인코딩은 백그라운드로(UI 딜레이 제거 — 2026-07-07).
                     // 완료는 show()의 poll_paste_task가 소비한다. 연타 ⌘V는 최신 것으로 대체.
+                    if paste_trigger == ClipboardPasteTrigger::NativeKeyDown {
+                        self.last_native_paste = Some(std::time::Instant::now());
+                    }
                     let text_fallback = text_paste_bytes.take();
                     self.paste_task = Some(PendingPaste {
                         rx: crate::ui::clipboard_image::paste_clipboard_paths_or_image_background(
@@ -2591,18 +2611,31 @@ fn clipboard_terminal_paste_bytes(
 /// 있는 경우는 OS 키 반복이 Event::Paste를 다시 보내 타임스탬프가 갱신된다.
 const PASTE_GESTURE_WINDOW: std::time::Duration = std::time::Duration::from_millis(600);
 
-/// ⌘V release가 띄우는 이미지 paste 태스크를 건너뛸지 판정한다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClipboardPasteTrigger {
+    /// AppKit local monitor가 winit/egui보다 먼저 본 신뢰 가능한 Command+V key-down.
+    NativeKeyDown,
+    /// egui가 전달한 플랫폼 shortcut. macOS에서는 V key-up fallback이다.
+    EguiShortcut,
+}
+
+/// clipboard shortcut이 띄우는 이미지 paste 태스크를 건너뛸지 판정한다.
 ///
-/// 같은 프레임에 Event::Paste가 왔으면(text_fallback 보유) 태스크가 그 텍스트를
-/// fallback으로 쓰므로 태스크를 돌려도 1회 전송이다. 문제는 press(Event::Paste)와
-/// release(키 이벤트)가 **다른 프레임**으로 갈라진 경우 — press에서 텍스트를 이미
-/// 직접 전송했는데 release 태스크가 클립보드 텍스트를 다시 읽어 한 번 더 보낸다.
-/// 직전 PASTE_GESTURE_WINDOW 안에 직접 전송이 있었으면 같은 제스처로 보고 스킵한다.
-fn should_skip_release_paste_task(
+/// NativeKeyDown은 새 제스처의 시작이므로 이전 paste 이력 때문에 건너뛰지 않는다.
+/// macOS key-up fallback만 같은 제스처의 native key-down 또는 press Event::Paste가
+/// 최근 처리됐고 같은 프레임 text fallback도 없을 때 건너뛴다.
+fn should_skip_paste_task(
+    trigger: ClipboardPasteTrigger,
     has_text_fallback: bool,
     last_text_paste: Option<std::time::Instant>,
+    last_native_paste: Option<std::time::Instant>,
 ) -> bool {
-    !has_text_fallback && last_text_paste.is_some_and(|at| at.elapsed() < PASTE_GESTURE_WINDOW)
+    trigger == ClipboardPasteTrigger::EguiShortcut
+        && !has_text_fallback
+        && [last_text_paste, last_native_paste]
+            .into_iter()
+            .flatten()
+            .any(|at| at.elapsed() < PASTE_GESTURE_WINDOW)
 }
 
 fn is_clipboard_paste_shortcut(event: &egui::Event) -> bool {
@@ -2616,9 +2649,9 @@ fn is_clipboard_paste_shortcut(event: &egui::Event) -> bool {
         return false;
     };
     if cfg!(target_os = "macos") {
-        // macOS는 Cmd+V의 key PRESS를 앱에 전달하지 않고 release(pressed=false)만 준다
-        // (실측: Event::Paste도 안 옴). 그래서 press로는 감지가 안 돼 붙여넣기가 무시됐다 —
-        // release로 감지한다. 프레임당 image_paste_requested 불리언 1회로 합쳐진다.
+        // 이미지-only clipboard의 Cmd+V PRESS는 egui-winit이 Event::Paste/Key 없이
+        // 소비한다. AppKit monitor의 native key-down이 주 경로이고, 이 release는 monitor
+        // 설치 실패·포커스 경계 누락을 위한 fallback이다. 제스처 상태가 중복을 제거한다.
         !pressed && modifiers.command && !modifiers.ctrl
     } else {
         *pressed && modifiers.ctrl && modifiers.shift
@@ -3204,17 +3237,51 @@ mod tests {
     }
 
     #[test]
-    fn 페이스트_release_태스크는_같은_제스처의_직접_전송_직후에만_스킵된다() {
+    fn 페이스트_fallback은_같은_제스처의_native또는_text처리_직후에만_스킵된다() {
         let now = std::time::Instant::now();
         let old = now.checked_sub(PASTE_GESTURE_WINDOW * 2);
-        // press에서 Event::Paste 텍스트를 이미 보냈고 fallback이 없다 → 스킵 (이중 방지)
-        assert!(should_skip_release_paste_task(false, Some(now)));
-        // 같은 프레임에 Paste가 왔다(fallback 보유) → 태스크가 fallback을 쓰므로 진행
-        assert!(!should_skip_release_paste_task(true, Some(now)));
-        // 직접 전송 이력이 없거나 오래됐다 → 별개 제스처, 진행
-        assert!(!should_skip_release_paste_task(false, None));
+        // native key-down은 이전 이력과 무관하게 새 제스처를 시작한다.
+        assert!(!should_skip_paste_task(
+            ClipboardPasteTrigger::NativeKeyDown,
+            false,
+            Some(now),
+            Some(now),
+        ));
+        // press에서 Event::Paste 텍스트를 이미 보냈고 fallback이 없다 → key-up 스킵.
+        assert!(should_skip_paste_task(
+            ClipboardPasteTrigger::EguiShortcut,
+            false,
+            Some(now),
+            None,
+        ));
+        // native key-down에서 이미지 작업을 시작한 뒤의 key-up도 스킵.
+        assert!(should_skip_paste_task(
+            ClipboardPasteTrigger::EguiShortcut,
+            false,
+            None,
+            Some(now),
+        ));
+        // 같은 프레임에 Paste가 왔다(fallback 보유) → 태스크가 fallback을 쓰므로 진행.
+        assert!(!should_skip_paste_task(
+            ClipboardPasteTrigger::EguiShortcut,
+            true,
+            Some(now),
+            Some(now),
+        ));
+        // 처리 이력이 없거나 오래됐다 → fallback이 유일한 감지 경로라 진행.
+        assert!(!should_skip_paste_task(
+            ClipboardPasteTrigger::EguiShortcut,
+            false,
+            None,
+            None,
+        ));
         if let Some(old) = old {
-            assert!(!should_skip_release_paste_task(false, Some(old)));
+            assert!(!should_skip_paste_task(
+                ClipboardPasteTrigger::EguiShortcut,
+                false,
+                Some(old),
+                Some(old),
+            ));
         }
     }
 
@@ -3642,7 +3709,8 @@ mod tests {
             },
         };
 
-        // macOS는 Cmd+V의 key PRESS를 앱에 안 주고 release만 준다(실측) — release로 감지한다.
+        // 이미지-only clipboard의 Cmd+V PRESS는 egui가 소비한다. 이 함수는 native
+        // key-down 감시가 없을 때를 위한 release fallback만 잡는다.
         let cmd_v_release = egui::Event::Key {
             key: egui::Key::V,
             physical_key: None,
@@ -3656,7 +3724,7 @@ mod tests {
         };
         if cfg!(target_os = "macos") {
             assert!(is_clipboard_paste_shortcut(&cmd_v_release));
-            assert!(!is_clipboard_paste_shortcut(&cmd_v)); // press는 무시(release만)
+            assert!(!is_clipboard_paste_shortcut(&cmd_v)); // press는 AppKit monitor가 담당
             assert!(!is_clipboard_paste_shortcut(&ctrl_v));
             assert!(!is_clipboard_paste_shortcut(&ctrl_shift_v));
         } else {

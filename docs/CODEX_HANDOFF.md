@@ -2,8 +2,8 @@
 
 ## Current task
 
-- Find and reduce the release-bundle RAM increase reported after the official package rebuild without regressing Korean IME cardinality or structured AgentSession behavior.
-- Status: root cause fixed, verified, and packaged. Current-vs-baseline pre-GUI RSS and Mach-O sections are effectively identical, excluding the IME/dependency update; duplicated 15MB AppleGothic ownership plus an unnecessary first-frame full font reinstall were removed from the signed release bundle.
+- Fix Korean terminal text rendering as literal `???` after moving the app bundle to another Mac, without reintroducing the previously removed duplicated system-font memory cost.
+- Status: fixed, tested, and packaged. Finder-style missing `LANG` now gets a cached system-derived UTF-8 locale at the PTY boundary, while user locale settings are preserved; a signed release app and transfer-safe ZIP are ready for another-Mac testing.
 
 ## Working area
 
@@ -14,12 +14,26 @@
 
 ## Plan
 
-1. Completed — compare five current and five pre-remediation release samples at fixed startup/pre-GUI stages.
-2. Completed — exclude IME/dependency code (0–0.13MB run variance; about 19KB Mach-O section delta) and identify duplicate font ownership/reinstall.
-3. Completed — reuse one cached CJK `FontData` for default UI/fallback and initialize App font snapshots from the definitions already installed by main.
-4. Completed — focused/full checks, strict clippy, official release packaging, and deep/strict code-signature verification completed.
+1. Completed — verify whether Korean glyph fonts are embedded and distinguish missing glyphs from an ASCII shell locale.
+2. Completed — add a conservative UTF-8 locale fallback for PTY children only when the inherited/explicit locale is absent, preserving user-configured locale variables.
+3. Completed — add environment regression coverage and run PTY/app checks.
+4. Completed — rebuild and refresh/sign the portable application bundle for another-machine testing.
 
 ## Status
+
+- 2026-07-16: Investigated another-Mac terminal output rendering Korean as literal `???`. Both D2Coding faces are compiled with `include_bytes!` into `deppy-sijo`, so the terminal does not depend on AppleGothic being installed and the app bundle is not missing a terminal font resource. Reproduced the portability boundary locally: a macOS zsh started with a Finder-like empty environment reports `US-ASCII`, while setting `LANG=en_US.UTF-8` reports `UTF-8`. The PTY backend currently sets terminal capability variables but no locale fallback, so GUI launch environment differences can make shell/agent programs replace Korean with question marks before rendering.
+- 2026-07-16: First implementation attempt used the small `sys-locale` crate, but adding a new direct package required a crates.io index update and the restricted build environment could not resolve `index.crates.io`; the test command was stopped. Replaced that dependency with the already-linked `objc2-foundation` `NSLocale` API, retaining the same system-locale behavior without introducing a new package or network requirement.
+- 2026-07-16: The first offline PTY compile with the Foundation implementation caught a missing tail return in `macos_utf8_locale`; corrected the expression before rerunning tests. No binary or bundle was produced from that failed compile.
+- 2026-07-16: Implemented the locale fallback at the `PortablePtyBackend` boundary so it covers ordinary shells and directly spawned agents. On macOS, an empty/inherited-missing `LANG` is populated from Foundation `NSLocale`, normalized to a supported UTF-8 POSIX locale with `en_US.UTF-8` as the final fallback; explicit user `LANG` and all `LC_*` settings remain untouched. `cargo test -p pty --offline --no-fail-fast` passed 21/21, including a real child `locale charmap` assertion under an empty `LANG`, explicit-locale preservation, and BCP-47 normalization tests.
+- 2026-07-16: Integration verification passed after the locale fix: `cargo test -p terminal -p deppy-sijo --offline --no-fail-fast` completed with app 246 passed/2 ignored and terminal 60 passed; `cargo clippy -p pty --all-targets --offline -- -D warnings` and `cargo build -p deppy-sijo --offline` also passed. Proceeding to a clean release app bundle rather than shipping the larger debug executable used for local iteration.
+- 2026-07-16: Cached the resolved macOS UTF-8 locale in a process-wide `OnceLock`, so Foundation lookup and libc locale validation happen only for the first PTY rather than on every shell/agent spawn. This avoids repeated Objective-C conversion work while retaining per-command explicit `LANG` checks.
+- 2026-07-16: Final post-cache verification passed: PTY tests 21/21, strict PTY Clippy, and the official offline release package build. `target/bundle/Deppy Sijo.app` is a 42MB arm64 release bundle; deep/strict code-signature verification passed. Created `target/bundle/Deppy-Sijo-0.1.0-arm64.zip` (19MB), extracted it into a fresh temp directory, and passed deep/strict signature verification again. ZIP SHA-256: `351180194196fd96ec6f3a1ae979f720f779c6880bf92de1ce862c87942d4317`.
+- 2026-07-16: Pre-commit scope confirmed for the two completed terminal portability fixes: AppKit image-only Command+V capture/deduplication plus macOS PTY UTF-8 locale fallback, their dependency lock entry, and this handoff. Unrelated design `dist` changes, local `.codex`, logs, and the older root-level ZIP remain unstaged.
+- 2026-07-16: Investigated intermittent image clipboard paste requiring a second Command+V. Current egui-winit consumes a recognized paste key-down after attempting a text-only clipboard read; image-only pasteboards therefore produce neither `Event::Paste` nor the original pressed `Event::Key`. The local workspace compensated by detecting only the later V key-up, leaving the first gesture vulnerable to focus/modifier loss. OpenAI Codex #3397/#10523 and Ghostty discussion #10478 report the same macOS image-only Cmd+V gap; Ghostty PR #11571 proposed the same PNG/TIFF-to-temp-path conversion already present locally, while Claude Code's changelog confirms direct Cmd+V mapping as the successful trigger-side fix.
+- 2026-07-16: Extended `native_key_monitor` to retain app-local Command+V key-downs as a bounded/fresh clipboard gesture while continuing to return every `NSEvent` unchanged. Matching prefers layout-aware `charactersIgnoringModifiers == v` with ANSI/Korean physical V fallback, and rejects Control/Option/Function chords. `WorkspaceUi` now starts file/image detection from that native key-down and uses the former egui V key-up only as fallback; a 600ms gesture record removes the delayed release so one physical paste cannot duplicate text or images.
+- 2026-07-16: Focused verification after the image-paste trigger change passed: `cargo test -p deppy-sijo native_key_monitor --no-fail-fast` (4/4), `cargo test -p deppy-sijo ui::workspace::tests --no-fail-fast` (35/35), `cargo test -p terminal --no-fail-fast` (60/60), `cargo check -p deppy-sijo`, scoped rustfmt, and `git diff --check`. No unrelated design build artifacts or local `.codex` files were modified.
+- 2026-07-16: Full `cargo test -p deppy-sijo --no-fail-fast` passed (246 passed, 2 ignored). The follow-up strict `cargo clippy -p deppy-sijo --all-targets -- -D warnings` was blocked by Rust 1.96's `clippy::while_immutable_condition` in the pre-existing `codex_app_server.rs:310` loop; this file is outside the clipboard change and was left untouched. Continue with a normal app build and signed bundle refresh while reporting the unrelated strict-lint blocker.
+- 2026-07-16: Final verification completed: `cargo clippy -p deppy-sijo --all-targets -- --cap-lints warn` completed with only the same unrelated App Server warning, and `cargo build -p deppy-sijo` passed. Replaced the executable in `target/bundle/Deppy Sijo.app`, ad-hoc re-signed `deppy-mcp-proxy` and the outer bundle, and passed `codesign --verify --deep --strict`. No app process was launched; the refreshed bundle is ready for manual Command+V image/text checks.
 
 - 2026-07-15: Inspected project structure and the existing session/settings mockup.
 - 2026-07-15: Confirmed no Vite server is listening on port 8443 in this shell; start one for browser verification after implementation.

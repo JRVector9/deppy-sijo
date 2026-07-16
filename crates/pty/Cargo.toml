@@ -13,3 +13,12 @@ portable-pty = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Finder에서 .app을 실행하면 LANG가 비어 있을 수 있다. CoreFoundation의 시스템 언어를
+# 읽어 PTY 자식에 UTF-8 locale fallback을 주되 사용자 locale은 보존한다.
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSLocale",
+    "NSString",
+] }

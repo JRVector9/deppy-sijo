@@ -104,6 +104,14 @@ impl PortablePtyBackend {
         builder.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
         builder.env("CLICOLOR", "1");
         builder.env_remove("NO_COLOR");
+        #[cfg(target_os = "macos")]
+        if command_env_is_empty(cmd, "LANG") {
+            // Finder/LaunchServices에서 .app을 열면 LANG가 없는 것이 정상이다. 그대로
+            // 셸/에이전트를 띄우면 macOS locale이 US-ASCII가 되어 한글을 렌더러에
+            // 도달하기 전에 `?`로 바꿀 수 있다. 명시된 LANG는 보존하고, 비어 있을 때만
+            // 시스템 선호 언어의 유효한 UTF-8 POSIX locale을 주입한다.
+            builder.env("LANG", macos_utf8_locale());
+        }
         if let Some(cwd) = &cmd.cwd {
             builder.cwd(cwd);
         }
@@ -202,6 +210,70 @@ impl PortablePtyBackend {
             output: Some(rx),
         }))
     }
+}
+
+#[cfg(target_os = "macos")]
+fn command_env_is_empty(cmd: &CommandSpec, key: &str) -> bool {
+    cmd.env
+        .iter()
+        .rev()
+        .find(|(candidate, _)| candidate == key)
+        .map(|(_, value)| value.is_empty())
+        .unwrap_or_else(|| std::env::var_os(key).is_none_or(|value| value.is_empty()))
+}
+
+/// Apple의 BCP-47 선호 언어(예: `ko-KR`, `zh-Hant-TW`)를 macOS libc가 받는
+/// UTF-8 POSIX locale으로 바꾼다. 언어·지역이 모두 있어야 실제 locale 존재 여부를
+/// 검증할 수 있으므로 불완전한 태그는 fallback으로 넘긴다.
+#[cfg(target_os = "macos")]
+fn bcp47_to_posix_utf8(tag: &str) -> Option<String> {
+    let mut subtags = tag.split(['-', '_']);
+    let language = subtags.next()?.to_ascii_lowercase();
+    if !(2..=3).contains(&language.len())
+        || !language.bytes().all(|byte| byte.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    let region = subtags.find(|subtag| {
+        (subtag.len() == 2 && subtag.bytes().all(|byte| byte.is_ascii_alphabetic()))
+            || (subtag.len() == 3 && subtag.bytes().all(|byte| byte.is_ascii_digit()))
+    })?;
+    Some(format!("{language}_{}.UTF-8", region.to_ascii_uppercase()))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_locale_is_supported(locale: &str) -> bool {
+    let Ok(locale) = std::ffi::CString::new(locale) else {
+        return false;
+    };
+    // SAFETY: `locale` is a live NUL-terminated string and the returned locale_t is owned by us.
+    // newlocale/freelocale operate on an isolated locale object and do not mutate process-global
+    // locale state, so this remains safe while PTY workers run concurrently.
+    let locale =
+        unsafe { libc::newlocale(libc::LC_CTYPE_MASK, locale.as_ptr(), std::ptr::null_mut()) };
+    if locale.is_null() {
+        return false;
+    }
+    // SAFETY: non-null `locale` came from the successful newlocale call immediately above.
+    unsafe { libc::freelocale(locale) };
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn macos_utf8_locale() -> &'static str {
+    static UTF8_LOCALE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    UTF8_LOCALE
+        .get_or_init(|| {
+            let locale = objc2_foundation::NSLocale::currentLocale();
+            let language = locale.languageCode().to_string();
+            locale
+                .regionCode()
+                .map(|region| format!("{language}-{}", region))
+                .and_then(|locale| bcp47_to_posix_utf8(&locale))
+                .filter(|locale| macos_locale_is_supported(locale))
+                .unwrap_or_else(|| "en_US.UTF-8".to_owned())
+        })
+        .as_str()
 }
 
 struct PortablePtySession {
@@ -498,6 +570,58 @@ mod tests {
         assert!(text.contains("CLICOLOR=1"));
         assert!(text.contains("NO_COLOR=unset"));
         assert_eq!(wait_exit(&mut session, Duration::from_secs(5)), Some(0));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn finder처럼_lang가_비면_pty는_utf8_locale을_주입한다() {
+        let mut session = PortablePtyBackend
+            .spawn(
+                &CommandSpec {
+                    program: "/bin/sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        "printf 'LANG=%s\\n' \"$LANG\"; locale charmap".into(),
+                    ],
+                    // CommandSpec의 마지막 값이 부모 env를 덮으므로 Finder의 LANG 부재를
+                    // 프로세스 전역 env 변경 없이 결정적으로 재현한다.
+                    env: vec![("LANG".into(), String::new())],
+                    cwd: None,
+                },
+                80,
+                24,
+            )
+            .unwrap();
+        let rx = session.take_output().unwrap();
+        let output = collect_output(&rx, Duration::from_secs(5));
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("LANG="), "{text:?}");
+        assert!(text.contains("UTF-8"), "UTF-8 locale이 아님: {text:?}");
+        assert_eq!(wait_exit(&mut session, Duration::from_secs(5)), Some(0));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn 사용자가_명시한_lang는_덮어쓰지_않는다() {
+        let spec = CommandSpec {
+            program: "/bin/true".into(),
+            args: Vec::new(),
+            env: vec![("LANG".into(), "C".into())],
+            cwd: None,
+        };
+        assert!(!command_env_is_empty(&spec, "LANG"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apple_bcp47_locale을_posix_utf8로_정규화한다() {
+        assert_eq!(bcp47_to_posix_utf8("ko-KR").as_deref(), Some("ko_KR.UTF-8"));
+        assert_eq!(
+            bcp47_to_posix_utf8("zh-Hant-TW").as_deref(),
+            Some("zh_TW.UTF-8")
+        );
+        assert_eq!(bcp47_to_posix_utf8("ko"), None);
+        assert_eq!(bcp47_to_posix_utf8("invalid!"), None);
     }
 
     #[test]

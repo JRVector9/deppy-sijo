@@ -2,27 +2,30 @@
 
 ## Current task
 
-- Diagnose why the app appears to use at least 50% more memory after installation on another Mac than during development.
-- Status: remediation implemented, tested, and packaged. Activity de-duplicates the app PID and exposes app/child RSS separately; the configured terminal-cache budget is divided across resident runtimes; 30-minute warm suspension now admits only conservatively verified idle shell leaders while protecting agents/child jobs; production builds exclude Glow/OpenGL while `render-glow` preserves A/B benchmarking. The signed Wgpu-only bundle is ready for another-Mac measurement. Full-GUI footprint comparison remains external/manual because this sandbox exits before renderer initialization.
+- Implement the approved Agent Workspace scope as parallel logical PRs: distinguish Codex APP/Codex PTY/Claude PTY, normalize status colors, consume authoritative App Server state, add capability-gated actions/shortcuts, integrate structured notifications into the existing settings area, persist structured threads separately from PTY resume metadata, expose supported model/effort/skills/steer controls, and deliver a tested signed release build.
+- Status: in progress. PR-01 provider-neutral `AgentSurface` contract is implemented and its focused tests pass; transport/UI/action tracks are reviewing their isolated integration points before parallel edits. Micro hardware discovery/RGB/reconnect/profile work and Gmail/Slack/MCP external notifications are explicitly out of scope.
 
 ## Working area
 
 - Actual application: Rust workspace under `crates/`; terminal rendering passes VT output through `crates/terminal` into the egui workspace.
 - New application-layer modules will live in `crates/app/src/agent_session.rs` and `crates/app/src/codex_app_server.rs`; UI integration belongs beside the workspace UI, rather than in the terminal renderer.
 - The existing agent hook/shim path remains for ordinary interactive PTY agents. It is not the transport for app-server events.
+- `crates/storage`'s existing `agent_sessions` table remains exclusively for PTY native resume. Structured App Server history must use a separate `structured_threads` table.
+- `crates/app/src/agent_surface.rs` is a read-only projection and capability contract above the existing PTY detector and structured App Server lifecycle; it is not a third source of lifecycle truth.
 - Earlier React work in `design/환경설정 메뉴 구성` was a misinterpretation and must not be considered the implementation of this request.
 
 ## Plan
 
-1. Completed — compare the two transfer archives and identify their embedded build types/sizes.
-2. Completed — measure both embedded executables with the same isolated benchmark environment and self-RSS stages.
-3. Completed — audit whether the app's Activity UI reports app-only RSS or a broader/duplicated total.
-4. Completed — audit workspace retention, terminal-cache scope, lazy child services, renderer features/surface buffering, fonts, and dependency duplication for missed causes.
-5. Completed — fix PID-deduplicated Activity accounting, process-global cache enforcement, and safe idle-shell warm suspension; feature-gate Glow for benchmark-only builds.
-6. Completed locally — focused/full tests, strict Clippy, default/benchmark feature checks, release build, package, link, and signature verification.
-7. Remaining external validation — run an identical full-GUI `footprint` comparison on the development and other Mac with the new signed bundle.
+1. In progress — PR-01 common AgentSurface/provider/transport/capability/visual-state contract and tests.
+2. Pending parallel wave — PR-02 authoritative App Server thread status, PR-03 APP/PTY UI and palette, PR-04 capability-gated actions/shortcuts, PR-05 structured notifications.
+3. Pending checkpoint — integrate PR-01/02/03, build/sign/launch, and report the first visible APP/PTY badges and status colors.
+4. Pending — PR-06 separate structured thread persistence/list/read/resume/archive.
+5. Pending — PR-07 model/effort/skills/steer plus usage/rate-limit capabilities with version-safe fallbacks.
+6. Pending — PR-08 full regressions, strict Clippy, release package/signature, launch, commits, and final handoff.
 
 ## Status
+
+- 2026-07-16: Agent Workspace implementation began under an explicit four-slot parallel plan. Added `agent_surface.rs` with provider (`Codex`/`Claude`), transport (`APP`/`PTY`), six shared visual states, transport capability gates, runtime action targets, and a read-only surface snapshot. Mappings preserve the existing PTY detector and structured lifecycle as their respective sources of truth; PTY capabilities never expose approve/reject. Focused offline tests pass 3/3. Repository-wide `cargo fmt --check` still reports two pre-existing formatting differences in `agent_detect_worker.rs` and `platform/src/lib.rs`; neither file was modified. Unrelated design dist artifacts, local `.codex`, ZIP, and log files remain untouched.
 
 - 2026-07-16: Committed the completed memory remediation as `fix: bound workspace memory usage`, with the commit scope limited to the Rust memory/accounting changes, renderer benchmark feature split, translations, benchmark script, and this handoff. Unrelated design build artifacts, local `.codex`, transfer ZIP, and log files remain uncommitted. This sandbox's direct LaunchServices call again failed with `kLSNoExecutableErr`, and direct execution reached initialization but could not create the real user log file due sandbox permissions. Passing `open -n` to the normal Terminal desktop session succeeded; PID 98586 was confirmed running from `target/bundle/Deppy Sijo.app/Contents/MacOS/deppy-sijo`. Three stale isolated RAM-benchmark processes from the earlier diagnosis were terminated so they do not pollute observation of the relaunched app; the unrelated Vite process was left untouched.
 

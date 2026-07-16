@@ -1750,6 +1750,14 @@ struct ShortcutPageState {
     capture_error: bool,
 }
 
+/// OS/터미널이 직접 처리해 앱이 재바인딩할 수 없는 고정 단축키 — Terminal 그룹 목록에
+/// 표기만 하고 레코딩·초기화·해제 컨트롤은 제공하지 않는다. (title_key, key_label)
+const FIXED_TERMINAL_SHORTCUTS: &[(&str, &str)] = &[
+    ("shortcuts.action.copy", "⌘C"),
+    ("shortcuts.action.paste", "⌘V"),
+    ("shortcuts.action.scroll_to_bottom", "⌘↓"),
+];
+
 fn shortcuts_page(
     ui: &mut egui::Ui,
     config: &mut Config,
@@ -1914,7 +1922,19 @@ fn shortcuts_page(
                         .contains(&query)
             })
             .collect();
-        if actions.is_empty() {
+        // OS/터미널이 직접 처리하는 고정 단축키 — Terminal 그룹에만 표기용으로 덧붙인다.
+        let fixed_shortcuts: Vec<(&str, &str)> = if group == ShortcutGroup::Terminal {
+            FIXED_TERMINAL_SHORTCUTS
+                .iter()
+                .copied()
+                .filter(|entry| {
+                    query.is_empty() || catalog.t(entry.0, &[]).to_lowercase().contains(&query)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if actions.is_empty() && fixed_shortcuts.is_empty() {
             continue;
         }
         section(ui, &catalog.t(group.title_key(), &[]));
@@ -1970,6 +1990,20 @@ fn shortcuts_page(
                     state.capture_error = false;
                 }
             });
+        }
+        for (title_key, key_label) in fixed_shortcuts {
+            rendered += 1;
+            row(
+                ui,
+                &catalog.t(title_key, &[]),
+                Some(&catalog.t("shortcuts.desc.terminal", &[])),
+                |ui| {
+                    ui.add_enabled(
+                        false,
+                        egui::Button::new(key_label).min_size(egui::vec2(172.0, CONTROL_HEIGHT)),
+                    );
+                },
+            );
         }
     }
     if rendered == 0 {

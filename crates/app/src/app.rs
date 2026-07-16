@@ -4676,8 +4676,9 @@ impl eframe::App for App {
                                 self.refresh_workspaces();
                             }
                         }
-                        // 우측: 로케일 · 메모리 (목업의 'ko · 113MB'). 패널 margin 0이라
-                        // 오른쪽 끝 여백을 직접 준다.
+                        // 우측: 로케일 · (옵트인) 메모리. 메모리 수치(phys_footprint)는
+                        // 지표 특성상 오해 소지가 있어 기본 숨김 — 설정 토글로 켠다.
+                        // 패널 margin 0이라 오른쪽 끝 여백을 직접 준다.
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add_space(10.0);
                             let locale_short = self
@@ -4687,13 +4688,22 @@ impl eframe::App for App {
                                 .split('-')
                                 .next()
                                 .unwrap_or(&self.config.i18n.locale);
-                            let label = match self.active.resource_usage {
+                            let memory = self
+                                .config
+                                .ui
+                                .show_memory_indicator
+                                .then_some(self.active.resource_usage)
+                                .flatten();
+                            let label = match memory {
                                 Some(r) => {
                                     format!("{locale_short} · {}MB", r.rss_bytes / (1024 * 1024))
                                 }
                                 None => locale_short.to_owned(),
                             };
-                            ui.weak(label);
+                            let resp = ui.weak(label);
+                            if memory.is_some() {
+                                resp.on_hover_text(text.t("top.memory_hint", &[]));
+                            }
                         });
                     },
                 );

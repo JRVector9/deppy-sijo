@@ -51,6 +51,8 @@ settings.auto_resume = Auto-resume agent sessions
 settings.auto_resume.hint = Re-run claude/codex resume on restart to continue the previous session
 settings.status_hooks = Agent status hooks
 settings.status_hooks.hint = Install hooks in claude/codex to reliably detect approval/input waits (off = screen guess only)
+settings.memory_indicator = Memory indicator
+settings.memory_indicator.hint = Show app memory in the toolbar (same metric as Activity Monitor's Memory column)
 settings.shortcuts = Shortcuts
 shortcuts.help = Select a binding, then press a modifier key combination or F13–F24 alone. Escape cancels; Backspace or Delete clears it.
 shortcuts.reset_all = Reset all
@@ -115,6 +117,7 @@ terminal.paste = Paste into terminal
 resource.cpu = CPU {value}%
 resource.rss = RSS {value}
 top.settings = Settings
+top.memory_hint = App process memory — shells/agents are separate processes (see Activity). Same metric as Activity Monitor's Memory column
 top.credentials = Credentials
 top.connectors = Connectors
 top.environment = Environment & API

@@ -1573,6 +1573,16 @@ fn general_page(
             }
         },
     );
+    row(
+        ui,
+        &catalog.t("settings.memory_indicator", &[]),
+        Some(&catalog.t("settings.memory_indicator.hint", &[])),
+        |ui| {
+            if toggle_switch(ui, &mut config.ui.show_memory_indicator) {
+                *changed = true;
+            }
+        },
+    );
 }
 
 fn language_page(

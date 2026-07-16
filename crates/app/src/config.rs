@@ -88,6 +88,10 @@ pub struct UiConfig {
     /// 변경을 이미 떠 있는 셸에도 다음 프롬프트부터 반영한다. OFF면 새 세션부터만.
     #[serde(default)]
     pub env_live_reload: bool,
+    /// 상단 툴바 우측 앱 메모리 표시(phys_footprint) ON/OFF. 기본 OFF — 메모리 수치는
+    /// 지표 특성상 "많이 쓴다"로 오해되기 쉬워(2026-07-16) 원하는 사용자만 켠다.
+    #[serde(default)]
+    pub show_memory_indicator: bool,
     /// 세션 위치 표시명 스타일 (2026-07-13): 기본 = 현재(마지막) 폴더명,
     /// Repo = git 저장소 루트명(.git 상향 탐색 — 저장소 하위 어디서든 레포명).
     #[serde(default)]
@@ -121,6 +125,7 @@ impl Default for UiConfig {
             auto_resume_agents: true,
             agent_status_hooks: true,
             env_live_reload: false,
+            show_memory_indicator: false,
             session_name_style: SessionNameStyle::default(),
             last_workspace_id: None,
             ui_font: None,

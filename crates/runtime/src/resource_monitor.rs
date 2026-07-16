@@ -8,6 +8,8 @@ use pty::{ProcessIdentity, ProcessIdentitySource};
 pub struct ProcessResourceSnapshot {
     pub pid: u32,
     pub sampled_at_ms: u64,
+    /// 앱 프로세스 메모리. macOS는 phys_footprint(활성 상태 보기 '메모리' 열과 동일),
+    /// 그 외 플랫폼은 RSS — 필드명은 wire 호환을 위해 유지한다.
     pub rss_bytes: u64,
     /// CPU percent over the previous sample window. The first sample has no
     /// baseline and reports `None`.
@@ -337,8 +339,36 @@ fn current_rss_bytes() -> Option<u64> {
     Some(resident_pages.saturating_mul(page_size()))
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+/// macOS는 phys_footprint — 활성 상태 보기(Activity Monitor) '메모리' 열과 같은 지표.
+/// 압축 메모리 포함 + 공유 코드 페이지(dylib) 제외라, 기계 램 크기/메모리 압박과
+/// 무관하게 일관되고 사용자가 활성 상태 보기와 대조할 수 있다. RSS(ps)는 여유 램이
+/// 많은 기계일수록 부풀어 "무거운 앱"으로 오해됐다 (2026-07-16). syscall이라 2초마다
+/// ps 서브프로세스를 스폰하던 비용도 없다. 실패 시 ps RSS 폴백.
+#[cfg(target_os = "macos")]
 fn current_rss_bytes() -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            std::process::id() as libc::c_int,
+            libc::RUSAGE_INFO_V4,
+            info.as_mut_ptr().cast(),
+        )
+    };
+    if rc == 0 {
+        // SAFETY: rc == 0이면 커널이 요청한 flavor 구조체 전체를 채웠다.
+        let info = unsafe { info.assume_init() };
+        return Some(info.ri_phys_footprint);
+    }
+    ps_rss_bytes()
+}
+
+#[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
+fn current_rss_bytes() -> Option<u64> {
+    ps_rss_bytes()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn ps_rss_bytes() -> Option<u64> {
     let output = std::process::Command::new("ps")
         .args(["-o", "rss=", "-p", &std::process::id().to_string()])
         .output()

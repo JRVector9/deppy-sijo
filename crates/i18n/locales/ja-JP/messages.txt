@@ -51,6 +51,8 @@ settings.auto_resume = セッション自動再開
 settings.auto_resume.hint = 再起動時に前回の claude/codex セッションを resume で自動継続
 settings.status_hooks = エージェント状態フック
 settings.status_hooks.hint = claude/codexにフックを設定し承認/入力待ちを正確に検知（オフ=画面推測のみ）
+settings.memory_indicator = メモリ表示
+settings.memory_indicator.hint = ツールバーにアプリのメモリ使用量を表示（アクティビティモニタ「メモリ」列と同じ指標）
 settings.shortcuts = Shortcuts
 shortcuts.help = Select a binding, then press a modifier key combination or F13–F24 alone. Escape cancels; Backspace or Delete clears it.
 shortcuts.reset_all = Reset all
@@ -115,6 +117,7 @@ terminal.paste = ターミナルに貼り付け
 resource.cpu = CPU {value}%
 resource.rss = RSS {value}
 top.settings = 設定
+top.memory_hint = アプリプロセスのメモリ — シェル/エージェントは別プロセス（アクティビティ参照）。アクティビティモニタ「メモリ」列と同じ指標
 top.credentials = 認証情報
 top.connectors = 接続
 top.environment = 環境とAPI

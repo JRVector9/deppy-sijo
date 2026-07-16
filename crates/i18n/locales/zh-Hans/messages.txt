@@ -51,6 +51,8 @@ settings.auto_resume = 自动恢复会话
 settings.auto_resume.hint = 重启时自动运行 claude/codex resume 继续上次会话
 settings.status_hooks = 智能体状态钩子
 settings.status_hooks.hint = 在 claude/codex 中安装钩子以准确检测审批/输入等待（关闭=仅屏幕推测）
+settings.memory_indicator = 内存显示
+settings.memory_indicator.hint = 在工具栏显示应用内存用量（与活动监视器“内存”列相同的指标）
 settings.shortcuts = Shortcuts
 shortcuts.help = Select a binding, then press a modifier key combination or F13–F24 alone. Escape cancels; Backspace or Delete clears it.
 shortcuts.reset_all = Reset all
@@ -115,6 +117,7 @@ terminal.paste = 粘贴到终端
 resource.cpu = CPU {value}%
 resource.rss = RSS {value}
 top.settings = 设置
+top.memory_hint = 应用进程内存 — shell/智能体为独立进程（见活动面板）。与活动监视器“内存”列相同的指标
 top.credentials = 凭据
 top.connectors = 连接
 top.environment = 环境与 API

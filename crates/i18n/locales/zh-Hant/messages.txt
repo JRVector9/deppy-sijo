@@ -51,6 +51,8 @@ settings.auto_resume = 自動恢復工作階段
 settings.auto_resume.hint = 重新啟動時自動執行 claude/codex resume 繼續上次工作階段
 settings.status_hooks = 代理狀態掛鉤
 settings.status_hooks.hint = 在 claude/codex 安裝掛鉤以準確偵測核准/輸入等待（關閉=僅畫面推測）
+settings.memory_indicator = 記憶體顯示
+settings.memory_indicator.hint = 在工具列顯示應用程式記憶體用量（與活動監視器「記憶體」欄相同的指標）
 settings.shortcuts = Shortcuts
 shortcuts.help = Select a binding, then press a modifier key combination or F13–F24 alone. Escape cancels; Backspace or Delete clears it.
 shortcuts.reset_all = Reset all
@@ -115,6 +117,7 @@ terminal.paste = 貼到終端機
 resource.cpu = CPU {value}%
 resource.rss = RSS {value}
 top.settings = 設定
+top.memory_hint = 應用程式行程記憶體 — shell/代理為獨立行程（見活動面板）。與活動監視器「記憶體」欄相同的指標
 top.credentials = 憑證
 top.connectors = 連線
 top.environment = 環境與 API

@@ -56,6 +56,8 @@ pub struct WorkspaceUi {
     /// 직전 폴더 클릭 (경로, 시각) — 더블클릭이 clicked를 두 번 발화시켜 같은 cd가
     /// 연속 주입되는 것을 막는다.
     last_dir_click: Option<(std::path::PathBuf, std::time::Instant)>,
+    /// 직전 URL 클릭 (주소, 시각) — last_dir_click과 같은 이중 발화 방지.
+    last_url_click: Option<(String, std::time::Instant)>,
     /// 마지막으로 egui Event::Paste 텍스트를 직접 전송한 시각. ⌘V는 press에서
     /// Event::Paste가, release에서 키 이벤트가 **다른 프레임으로** 도착할 수 있다 —
     /// 그때 release 쪽 이미지 태스크가 클립보드 텍스트 fallback으로 같은 내용을
@@ -220,6 +222,7 @@ impl WorkspaceUi {
             path_click_cache: None,
             session_cwd_cache: Arc::new(Mutex::new(HashMap::new())),
             last_dir_click: None,
+            last_url_click: None,
             last_text_paste: None,
             last_native_paste: None,
             session_cwds: std::collections::HashMap::new(),
@@ -572,7 +575,14 @@ impl WorkspaceUi {
         session: SessionId,
     ) -> (Option<std::path::PathBuf>, bool) {
         let Some(pid) = self.session_pids.get(&session).copied() else {
-            return (None, false);
+            // 자원 스냅샷(pid)이 아직/원래 없으면 감지 워커의 cwd(에이전트 세션)로 폴백 —
+            // pid 지연이 hover 커서를 통째로 죽이지 않게 한다.
+            return (
+                self.session_cwds
+                    .get(&session)
+                    .map(std::path::PathBuf::from),
+                false,
+            );
         };
         let mut cache = self.session_cwd_cache.lock().expect("cwd cache lock");
         if let Some(entry) = cache.get(&session)
@@ -1541,16 +1551,33 @@ impl WorkspaceUi {
                     as usize;
                 row * snapshot.cols as usize + col
             };
-            // 폴더 hover/단일 클릭 — 이동 가능한 폴더 단어 위에서는 커서를 손가락으로
-            // 바꾸고 클릭하면 그 폴더로 cd한다 (2026-07-14 사용자). 파일은 커서를 바꾸지
-            // 않는다(복사용 선택과 혼동 방지 — 열기는 우클릭 메뉴). alt screen(TUI)은
-            // cd 주입 금지라 통째로 비활성.
+            // 폴더/URL hover·단일 클릭 — 이동 가능한 폴더 단어 위에서는 커서를 손가락으로
+            // 바꾸고 클릭하면 그 폴더로 cd, URL 위에서는 클릭하면 기본 브라우저로 연다
+            // (2026-07-14/2026-07-17 사용자). 파일은 커서를 바꾸지 않는다(복사용 선택과
+            // 혼동 방지 — 열기는 우클릭 메뉴). alt screen(TUI)은 cd 주입 금지라 통째로 비활성.
             if !snapshot.is_alt_screen
                 && let Some(pos) = output.response.hover_pos()
                 && let Some((s, e)) = word_range_at(&snapshot, cell_at(pos))
             {
                 let word = renderer_egui::selection_text(&snapshot, s, e);
-                if matches!(
+                // URL은 cwd 해석이 필요 없는 문자열 판정이라 폴더보다 먼저 본다.
+                if let Some(url) = extract_url(&word) {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    if output.response.clicked() && focused {
+                        // 더블클릭이 clicked를 두 번 발화 — 같은 URL 연속 열기를 막는다
+                        // (last_dir_click과 동일 관례).
+                        let duplicate = self.last_url_click.as_ref().is_some_and(|(u, at)| {
+                            u == url && at.elapsed() < std::time::Duration::from_millis(800)
+                        });
+                        if !duplicate {
+                            self.last_url_click = Some((url.to_owned(), std::time::Instant::now()));
+                            if let Err(err) = auth::open_in_browser(url) {
+                                self.error_is_pressure = false;
+                                self.error = Some(format!("{err:#}"));
+                            }
+                        }
+                    }
+                } else if matches!(
                     self.resolve_path_cached(ui.ctx(), session, &word),
                     Some(PathClick::Dir(_))
                 ) {
@@ -1591,19 +1618,11 @@ impl WorkspaceUi {
             if output.response.double_clicked()
                 && let Some(pos) = output.response.interact_pointer_pos()
             {
-                // 더블클릭 → 커서 아래 단어(공백 구분) 선택. 단어가 URL이면 기본 브라우저로
-                // 연다(claude/codex/셸 화면의 링크를 바로 열기). 파일 열기는 우클릭 메뉴로
-                // (더블클릭은 복사용 선택과 겹친다 — 2026-07-14 사용자), 폴더 진입은 단일
-                // 클릭(아래 hover/click 블록)이 담당한다.
+                // 더블클릭 → 커서 아래 단어(공백 구분) 선택 (복사용). URL 열기는 단일
+                // 클릭(위 hover/click 블록)으로 이동 — 여기서도 열면 이중 발화된다
+                // (2026-07-17). 파일 열기는 우클릭 메뉴, 폴더 진입은 단일 클릭 담당.
                 if let Some((s, e)) = word_range_at(&snapshot, cell_at(pos)) {
                     self.selection = Some((session, s, e));
-                    let word = renderer_egui::selection_text(&snapshot, s, e);
-                    if let Some(url) = extract_url(&word)
-                        && let Err(err) = auth::open_in_browser(url)
-                    {
-                        self.error_is_pressure = false;
-                        self.error = Some(format!("{err:#}"));
-                    }
                 }
             } else if output.response.drag_started()
                 && let Some(pos) = output.response.interact_pointer_pos()
@@ -2783,7 +2802,10 @@ fn is_clipboard_paste_shortcut(event: &egui::Event) -> bool {
 /// 공백 위를 더블클릭하면 None. 더블클릭 단어 선택에 쓴다.
 /// 단어가 URL이면 (뒤따르는 구두점 제거 후) 그 URL을 반환한다. http/https만 연다.
 fn extract_url(word: &str) -> Option<&str> {
-    let trimmed = word.trim_end_matches(|c: char| ".,;:!?)]}>\"'".contains(c));
+    // 머리의 여는 괄호/따옴표도 벗긴다 — "(https://…)" 꼴이 흔하다 (resolve_path_click 관례).
+    let trimmed = word
+        .trim_start_matches(|c: char| "\"'`([{<".contains(c))
+        .trim_end_matches(|c: char| ".,;:!?)]}>\"'".contains(c));
     (trimmed.starts_with("http://") || trimmed.starts_with("https://")).then_some(trimmed)
 }
 
@@ -3159,6 +3181,39 @@ mod tests {
     use runtime::{MuxPaneId, MuxTabId, PaneSnapshot, TabSnapshot};
     use std::sync::Mutex;
     use terminal::{CursorShape, CursorSnapshot, TerminalCell};
+
+    /// hover 커서 회귀 가드 — 백그라운드 cwd 해석(stale-while-revalidate) 후
+    /// 폴더 단어가 Dir로 잡혀야 한다 (2026-07-17 사용자: 커서가 안 바뀜).
+    #[test]
+    fn hover_cwd는_백그라운드_해석_후_폴더를_dir로_잡는다() {
+        let mut ui = WorkspaceUi::new();
+        let session = SessionId(1);
+        ui.set_session_pids(&[(session, std::process::id())]);
+        let ctx = egui::Context::default();
+        // 1차 — 백그라운드 해석 시작, 아직 값 없음(pending)
+        let (first, pending) = ui.hover_cwd(&ctx, session);
+        assert!(first.is_none() && pending);
+        // 해석 완료 대기 (lsof 1회)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let (cwd, still_pending) = ui.hover_cwd(&ctx, session);
+            if let Some(cwd) = cwd {
+                assert!(!still_pending);
+                assert_eq!(cwd, std::env::current_dir().unwrap());
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cwd 해석 결과가 오지 않음"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // 캐시 경유 경로 해석 — 폴더 단어("src")가 Dir이어야 hover 커서가 바뀐다
+        assert!(matches!(
+            ui.resolve_path_cached(&ctx, session, "src"),
+            Some(PathClick::Dir(_))
+        ));
+    }
 
     #[derive(Default)]
     struct RecordingRuntime {

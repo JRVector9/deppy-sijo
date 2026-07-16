@@ -75,3 +75,8 @@ block2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+# egui 공식 테스트 하네스 — AccessKit 트리로 버튼/입력을 찾아 실제 클릭·타이핑을
+# 시뮬레이션한다(인박스 카드 상호작용 자동 검증, 2026-07-17). 렌더 백엔드 불필요.
+egui_kittest = "0.35"

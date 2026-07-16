@@ -268,4 +268,74 @@ mod tests {
             assert!(action.goto.is_none());
         });
     }
+
+    // ── kittest 상호작용 테스트 (2026-07-17) ──
+    // 실제 클릭을 AccessKit 트리로 시뮬레이션한다 — "인박스에서 워크스페이스 전환 없이
+    // 승인"의 UI 절반을 자동 검증(나머지 절반 resolve_approval은 storage 테스트가 커버).
+
+    /// 클릭된 decision들을 프레임 너머로 수집하는 하네스.
+    fn decision_harness<'a>(
+        catalog: &'a i18n::Catalog,
+        rows: &'a [PendingApprovalRow],
+        names: &'a HashMap<String, String>,
+    ) -> egui_kittest::Harness<'a, Vec<ApprovalDecision>> {
+        egui_kittest::Harness::new_ui_state(
+            move |ui, captured: &mut Vec<ApprovalDecision>| {
+                let action = render(ui, catalog, rows, names);
+                if let Some(decision) = action.decision {
+                    captured.push(decision);
+                }
+            },
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn kittest_승인_클릭이_그_row의_allowed_decision을_만든다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let rows = vec![row("a1", Some("ws-1:7"))];
+        let mut names = HashMap::new();
+        names.insert("ws-1".to_owned(), "proj".to_owned());
+        let mut harness = decision_harness(&catalog, &rows, &names);
+        harness.get_by_label("Approve").click();
+        harness.run();
+        assert_eq!(harness.state().len(), 1);
+        let d = &harness.state()[0];
+        assert_eq!(d.id, "a1");
+        assert!(d.allowed);
+    }
+
+    #[test]
+    fn kittest_거부_클릭이_denied_decision을_만든다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let rows = vec![row("a1", Some("ws-1:7"))];
+        let names = HashMap::new();
+        let mut harness = decision_harness(&catalog, &rows, &names);
+        harness.get_by_label("Deny").click();
+        harness.run();
+        assert_eq!(harness.state().len(), 1);
+        assert!(!harness.state()[0].allowed);
+    }
+
+    #[test]
+    fn kittest_카드_여러_장일_때_두번째_카드의_승인이_그_row를_가리킨다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let rows = vec![row("a1", Some("ws-1:7")), row("a2", Some("ws-1:8"))];
+        let names = HashMap::new();
+        let mut harness = decision_harness(&catalog, &rows, &names);
+        let buttons: Vec<_> = harness.get_all_by_label("Approve").collect();
+        assert_eq!(buttons.len(), 2, "카드마다 승인 버튼이 있어야 한다");
+        buttons[1].click();
+        drop(buttons);
+        harness.run();
+        assert_eq!(harness.state().len(), 1);
+        assert_eq!(
+            harness.state()[0].id,
+            "a2",
+            "두번째 카드 클릭이 a2를 승인해야 한다"
+        );
+    }
 }

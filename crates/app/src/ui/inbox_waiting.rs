@@ -456,4 +456,108 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
+
+    // ── kittest 상호작용 테스트 (2026-07-17) ──
+    // "그 세션에 가지 않고 y/n/번호로 응답"의 UI 절반을 실제 클릭·타이핑 시뮬레이션으로
+    // 자동 검증한다(주입 절반 WriteInput은 runtime 테스트가 커버).
+
+    fn card(session: u64) -> WaitingCard {
+        WaitingCard {
+            workspace_id: "ws-1".to_owned(),
+            session: SessionId(session),
+            workspace_name: "proj".to_owned(),
+            session_title: "codex".to_owned(),
+            preview: None,
+        }
+    }
+
+    /// 액션들을 프레임 너머로 수집하는 하네스. InboxWaitingUi(입력 버퍼)도 상태에 넣어
+    /// 프레임 간 유지한다 — 실제 App과 동일한 수명.
+    fn waiting_harness<'a>(
+        catalog: &'a i18n::Catalog,
+        cards: &'a [WaitingCard],
+    ) -> egui_kittest::Harness<'a, (InboxWaitingUi, Vec<WaitingAction>)> {
+        egui_kittest::Harness::new_ui_state(
+            move |ui, (widget, captured): &mut (InboxWaitingUi, Vec<WaitingAction>)| {
+                if let Some(action) = widget.render(ui, catalog, cards) {
+                    captured.push(action);
+                }
+            },
+            (InboxWaitingUi::new(), Vec::new()),
+        )
+    }
+
+    #[test]
+    fn kittest_y_클릭이_answer_y를_만든다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let cards = vec![card(7)];
+        let mut harness = waiting_harness(&catalog, &cards);
+        harness.get_by_label("y").click();
+        harness.run();
+        assert_eq!(
+            harness.state().1,
+            vec![WaitingAction::Answer {
+                workspace_id: "ws-1".to_owned(),
+                session: SessionId(7),
+                reply: "y".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn kittest_자유입력_타이핑_후_enter가_answer를_만들고_버퍼를_비운다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let cards = vec![card(7)];
+        let mut harness = waiting_harness(&catalog, &cards);
+        // 번호 응답("2↵") 시나리오 — claude/codex 메뉴 선택. 실제 사용자처럼 입력칸을
+        // 먼저 클릭(포커스)한다 — kittest type_text는 Event::Text만 넣으므로 포커스가
+        // 없으면 TextEdit이 무시한다.
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .click();
+        harness.run();
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .type_text("2");
+        harness.run();
+        harness.key_combination(&[egui::Key::Enter]);
+        harness.run();
+        let answers = &harness.state().1;
+        assert_eq!(
+            answers,
+            &vec![WaitingAction::Answer {
+                workspace_id: "ws-1".to_owned(),
+                session: SessionId(7),
+                reply: "2".to_owned(),
+            }],
+            "Enter 시 입력 내용이 Answer로 나와야 한다"
+        );
+        // 제출 시 항목이 remove되지만 다음 프레임 렌더의 or_default()가 빈 항목을
+        // 재생성한다 — 계약은 "내용이 비워짐"이다.
+        assert!(
+            harness.state().0.inputs.values().all(|buf| buf.is_empty()),
+            "전송 후 입력 버퍼 내용이 비워져야 한다"
+        );
+    }
+
+    #[test]
+    fn kittest_이동_클릭이_goto_타깃을_만든다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let cards = vec![card(7)];
+        let mut harness = waiting_harness(&catalog, &cards);
+        harness.get_by_label("Go to →").click();
+        harness.run();
+        assert_eq!(
+            harness.state().1,
+            vec![WaitingAction::Goto(
+                crate::ui::notifications::AgentNotificationTarget::Pty {
+                    workspace_id: "ws-1".to_owned(),
+                    session: SessionId(7),
+                }
+            )]
+        );
+    }
 }

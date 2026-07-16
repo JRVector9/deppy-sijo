@@ -27,6 +27,15 @@ pub enum ShortcutAction {
     DecreaseTerminalFont,
     TerminalSearch,
     ClearRenderCaches,
+    PreviousAgent,
+    NextAgent,
+    FocusAgentInput,
+    NewStructuredAgent,
+    InterruptAgent,
+    ApproveAgent,
+    RejectAgent,
+    IncreaseAgentEffort,
+    DecreaseAgentEffort,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,22 +43,29 @@ pub enum ShortcutGroup {
     Navigation,
     Terminal,
     Workspace,
+    Agent,
 }
 
 impl ShortcutGroup {
-    pub const ALL: [Self; 3] = [Self::Navigation, Self::Terminal, Self::Workspace];
+    pub const ALL: [Self; 4] = [
+        Self::Navigation,
+        Self::Terminal,
+        Self::Workspace,
+        Self::Agent,
+    ];
 
     pub const fn title_key(self) -> &'static str {
         match self {
             Self::Navigation => "shortcuts.group.navigation",
             Self::Terminal => "shortcuts.group.terminal",
             Self::Workspace => "shortcuts.group.workspace",
+            Self::Agent => "shortcuts.group.agent",
         }
     }
 }
 
 impl ShortcutAction {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 26] = [
         Self::ToggleSidebar,
         Self::OpenEnvironment,
         Self::OpenAgents,
@@ -67,6 +83,15 @@ impl ShortcutAction {
         Self::DecreaseTerminalFont,
         Self::TerminalSearch,
         Self::ClearRenderCaches,
+        Self::PreviousAgent,
+        Self::NextAgent,
+        Self::FocusAgentInput,
+        Self::NewStructuredAgent,
+        Self::InterruptAgent,
+        Self::ApproveAgent,
+        Self::RejectAgent,
+        Self::IncreaseAgentEffort,
+        Self::DecreaseAgentEffort,
     ];
 
     pub const fn id(self) -> &'static str {
@@ -88,6 +113,15 @@ impl ShortcutAction {
             Self::DecreaseTerminalFont => "decrease_terminal_font",
             Self::TerminalSearch => "terminal_search",
             Self::ClearRenderCaches => "clear_render_caches",
+            Self::PreviousAgent => "previous_agent",
+            Self::NextAgent => "next_agent",
+            Self::FocusAgentInput => "focus_agent_input",
+            Self::NewStructuredAgent => "new_structured_agent",
+            Self::InterruptAgent => "interrupt_agent",
+            Self::ApproveAgent => "approve_agent",
+            Self::RejectAgent => "reject_agent",
+            Self::IncreaseAgentEffort => "increase_agent_effort",
+            Self::DecreaseAgentEffort => "decrease_agent_effort",
         }
     }
 
@@ -110,6 +144,15 @@ impl ShortcutAction {
             Self::DecreaseTerminalFont => "shortcuts.action.decrease_terminal_font",
             Self::TerminalSearch => "shortcuts.action.terminal_search",
             Self::ClearRenderCaches => "shortcuts.action.clear_render_caches",
+            Self::PreviousAgent => "shortcuts.action.previous_agent",
+            Self::NextAgent => "shortcuts.action.next_agent",
+            Self::FocusAgentInput => "shortcuts.action.focus_agent_input",
+            Self::NewStructuredAgent => "shortcuts.action.new_structured_agent",
+            Self::InterruptAgent => "shortcuts.action.interrupt_agent",
+            Self::ApproveAgent => "shortcuts.action.approve_agent",
+            Self::RejectAgent => "shortcuts.action.reject_agent",
+            Self::IncreaseAgentEffort => "shortcuts.action.increase_agent_effort",
+            Self::DecreaseAgentEffort => "shortcuts.action.decrease_agent_effort",
         }
     }
 
@@ -118,6 +161,7 @@ impl ShortcutAction {
             ShortcutGroup::Navigation => "shortcuts.desc.navigation",
             ShortcutGroup::Terminal => "shortcuts.desc.terminal",
             ShortcutGroup::Workspace => "shortcuts.desc.workspace",
+            ShortcutGroup::Agent => "shortcuts.desc.agent",
         }
     }
 
@@ -125,7 +169,6 @@ impl ShortcutAction {
         match self {
             Self::ToggleSidebar
             | Self::OpenEnvironment
-            | Self::OpenAgents
             | Self::OpenActivity
             | Self::OpenNotifications => ShortcutGroup::Navigation,
             Self::NewShell
@@ -140,30 +183,49 @@ impl ShortcutAction {
             Self::NextWorkspace | Self::PreviousWorkspace | Self::ClearRenderCaches => {
                 ShortcutGroup::Workspace
             }
+            Self::OpenAgents
+            | Self::PreviousAgent
+            | Self::NextAgent
+            | Self::FocusAgentInput
+            | Self::NewStructuredAgent
+            | Self::InterruptAgent
+            | Self::ApproveAgent
+            | Self::RejectAgent
+            | Self::IncreaseAgentEffort
+            | Self::DecreaseAgentEffort => ShortcutGroup::Agent,
         }
     }
 
-    fn default_serialized(self) -> &'static str {
+    fn default_serialized(self) -> Option<&'static str> {
         match self {
-            Self::ToggleSidebar => "Command+B",
-            Self::OpenEnvironment => "Command+Shift+E",
-            Self::OpenAgents => "Command+Shift+A",
-            Self::OpenActivity => "Command+Shift+Y",
-            Self::OpenNotifications => "Command+Shift+U",
-            Self::NewShell => "Command+T",
-            Self::ClosePane => "Command+W",
-            Self::SplitVertical => "Command+D",
-            Self::SplitHorizontal => "Command+Shift+D",
-            Self::FocusNextPane => "Command+CloseBracket",
-            Self::FocusPreviousPane => "Command+OpenBracket",
-            Self::NextWorkspace => "Command+Alt+Right",
-            Self::PreviousWorkspace => "Command+Alt+Left",
-            Self::IncreaseTerminalFont => "Command+Plus",
-            Self::DecreaseTerminalFont => "Command+Minus",
+            Self::ToggleSidebar => Some("Command+B"),
+            Self::OpenEnvironment => Some("Command+Shift+E"),
+            Self::OpenAgents => Some("Command+Shift+A"),
+            Self::OpenActivity => Some("Command+Shift+Y"),
+            Self::OpenNotifications => Some("Command+Shift+U"),
+            Self::NewShell => Some("Command+T"),
+            Self::ClosePane => Some("Command+W"),
+            Self::SplitVertical => Some("Command+D"),
+            Self::SplitHorizontal => Some("Command+Shift+D"),
+            Self::FocusNextPane => Some("Command+CloseBracket"),
+            Self::FocusPreviousPane => Some("Command+OpenBracket"),
+            Self::NextWorkspace => Some("Command+Alt+Right"),
+            Self::PreviousWorkspace => Some("Command+Alt+Left"),
+            Self::IncreaseTerminalFont => Some("Command+Plus"),
+            Self::DecreaseTerminalFont => Some("Command+Minus"),
             // macOS Cmd+F 기본. 평문 Ctrl+F는 readline forward-char(C-f)와 충돌하므로
             // 기본으로 가로채지 않는다 — 사용자는 설정에서 Ctrl+F로 rebind할 수 있다 (T3).
-            Self::TerminalSearch => "Command+F",
-            Self::ClearRenderCaches => "Command+Alt+K",
+            Self::TerminalSearch => Some("Command+F"),
+            Self::ClearRenderCaches => Some("Command+Alt+K"),
+            Self::PreviousAgent
+            | Self::NextAgent
+            | Self::FocusAgentInput
+            | Self::NewStructuredAgent
+            | Self::InterruptAgent
+            | Self::ApproveAgent
+            | Self::RejectAgent
+            | Self::IncreaseAgentEffort
+            | Self::DecreaseAgentEffort => None,
         }
     }
 }
@@ -180,7 +242,7 @@ pub fn effective_binding(
         .get(action.id())
         .map(String::as_str)
         .and_then(parse_binding)
-        .or_else(|| parse_binding(action.default_serialized()))
+        .or_else(|| action.default_serialized().and_then(parse_binding))
 }
 
 pub fn set_binding(
@@ -192,7 +254,10 @@ pub fn set_binding(
         Some(binding) => {
             config.disabled.remove(action.id());
             let serialized = serialize_binding(binding);
-            if serialized == action.default_serialized() {
+            if action
+                .default_serialized()
+                .is_some_and(|default| serialized == default)
+            {
                 config.bindings.remove(action.id());
             } else {
                 config.bindings.insert(action.id().to_owned(), serialized);
@@ -232,8 +297,9 @@ pub fn conflicts(config: &ShortcutsConfig) -> BTreeSet<ShortcutAction> {
         .collect()
 }
 
-/// 메인 viewport에서 정확히 일치하는 key-down 이벤트 한 건을 소비한다. 중복 binding은
-/// 어느 동작도 실행하지 않아 예측 불가능한 다중 실행을 막는다.
+/// 메인 viewport에서 정확히 일치하는 key-down batch를 소비한다. 같은 물리 입력에서
+/// repeat/중복 이벤트가 함께 와도 최초 non-repeat 한 건만 실행하고 전부 제거한다.
+/// 중복 binding은 어느 동작도 실행하지 않아 예측 불가능한 다중 실행을 막는다.
 pub fn take_triggered_action(
     ctx: &egui::Context,
     config: &ShortcutsConfig,
@@ -244,34 +310,41 @@ pub fn take_triggered_action(
         .filter(|action| !conflicts.contains(action))
         .filter_map(|action| effective_binding(config, action).map(|binding| (action, binding)))
         .collect();
-    ctx.input_mut(|input| {
-        let found = input.events.iter().enumerate().find_map(|(index, event)| {
-            let egui::Event::Key {
-                key,
-                pressed: true,
-                repeat: false,
-                modifiers,
-                ..
-            } = event
-            else {
-                return None;
-            };
-            bindings
-                .iter()
-                .find(|(_, binding)| {
-                    binding.logical_key == *key && modifiers.matches_exact(binding.modifiers)
-                })
-                .map(|(action, _)| (index, *action))
-        });
-        found.map(|(index, action)| {
-            input.events.remove(index);
-            action
-        })
-    })
+    ctx.input_mut(|input| take_triggered_action_from_events(&mut input.events, &bindings))
+}
+
+fn take_triggered_action_from_events(
+    events: &mut Vec<egui::Event>,
+    bindings: &[(ShortcutAction, egui::KeyboardShortcut)],
+) -> Option<ShortcutAction> {
+    let mut triggered = None;
+    events.retain(|event| {
+        let egui::Event::Key {
+            key,
+            pressed: true,
+            repeat,
+            modifiers,
+            ..
+        } = event
+        else {
+            return true;
+        };
+        let Some((action, _)) = bindings.iter().find(|(_, binding)| {
+            binding.logical_key == *key && modifiers.matches_exact(binding.modifiers)
+        }) else {
+            return true;
+        };
+        if !repeat && triggered.is_none() {
+            triggered = Some(*action);
+        }
+        false
+    });
+    triggered
 }
 
 /// 녹화 중 받은 key-down을 portable shortcut으로 정규화한다. 문자 입력을 가로채지 않도록
-/// Command/Ctrl/Alt 중 하나가 없는 단일 키는 등록하지 않는다.
+/// 일반 문자가 터미널 입력을 가로채지 않도록 Command/Ctrl/Alt 조합만 허용하되,
+/// 외부 키패드가 안전하게 쓸 수 있는 F13~F24는 modifier 없이도 허용한다.
 pub fn captured_binding(event: &egui::Event) -> Option<egui::KeyboardShortcut> {
     let egui::Event::Key {
         key,
@@ -297,8 +370,7 @@ pub fn captured_binding(event: &egui::Event) -> Option<egui::KeyboardShortcut> {
         return None;
     }
     let normalized = normalized_modifiers(*modifiers);
-    (normalized.command || normalized.ctrl || normalized.alt)
-        .then(|| egui::KeyboardShortcut::new(normalized, *key))
+    binding_is_safe(*key, normalized).then(|| egui::KeyboardShortcut::new(normalized, *key))
 }
 
 fn normalized_modifiers(modifiers: egui::Modifiers) -> egui::Modifiers {
@@ -343,8 +415,29 @@ pub fn parse_binding(value: &str) -> Option<egui::KeyboardShortcut> {
         }
     }
     let key = key?;
-    (modifiers.command || modifiers.ctrl || modifiers.alt)
-        .then(|| egui::KeyboardShortcut::new(modifiers, key))
+    binding_is_safe(key, modifiers).then(|| egui::KeyboardShortcut::new(modifiers, key))
+}
+
+fn binding_is_safe(key: egui::Key, modifiers: egui::Modifiers) -> bool {
+    modifiers.command || modifiers.ctrl || modifiers.alt || is_extended_function_key(key)
+}
+
+fn is_extended_function_key(key: egui::Key) -> bool {
+    matches!(
+        key,
+        egui::Key::F13
+            | egui::Key::F14
+            | egui::Key::F15
+            | egui::Key::F16
+            | egui::Key::F17
+            | egui::Key::F18
+            | egui::Key::F19
+            | egui::Key::F20
+            | egui::Key::F21
+            | egui::Key::F22
+            | egui::Key::F23
+            | egui::Key::F24
+    )
 }
 
 fn parse_key(name: &str) -> Option<egui::Key> {
@@ -358,8 +451,10 @@ mod tests {
     #[test]
     fn portable_binding_roundtrip() {
         for action in ShortcutAction::ALL {
-            let binding = parse_binding(action.default_serialized()).unwrap();
-            assert_eq!(parse_binding(&serialize_binding(binding)), Some(binding));
+            if let Some(default) = action.default_serialized() {
+                let binding = parse_binding(default).unwrap();
+                assert_eq!(parse_binding(&serialize_binding(binding)), Some(binding));
+            }
         }
     }
 
@@ -378,5 +473,84 @@ mod tests {
         let mut config = ShortcutsConfig::default();
         set_binding(&mut config, ShortcutAction::NewShell, None);
         assert_eq!(effective_binding(&config, ShortcutAction::NewShell), None);
+    }
+
+    fn key_event(key: egui::Key, modifiers: egui::Modifiers, repeat: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn extended_function_keys_roundtrip_without_modifiers() {
+        for key in [egui::Key::F13, egui::Key::F24] {
+            let event = key_event(key, egui::Modifiers::NONE, false);
+            let binding = captured_binding(&event).expect("F13~F24는 단독 허용");
+            assert_eq!(binding.logical_key, key);
+            assert_eq!(binding.modifiers, egui::Modifiers::NONE);
+            assert_eq!(parse_binding(&serialize_binding(binding)), Some(binding));
+        }
+    }
+
+    #[test]
+    fn ordinary_and_standard_function_keys_still_require_modifiers() {
+        for key in [egui::Key::A, egui::Key::Space, egui::Key::F12] {
+            assert!(captured_binding(&key_event(key, egui::Modifiers::NONE, false)).is_none());
+            assert!(parse_binding(key.name()).is_none());
+        }
+        assert!(
+            captured_binding(&key_event(egui::Key::A, egui::Modifiers::COMMAND, false)).is_some()
+        );
+    }
+
+    #[test]
+    fn agent_actions_are_unassigned_by_default() {
+        let config = ShortcutsConfig::default();
+        for action in [
+            ShortcutAction::PreviousAgent,
+            ShortcutAction::NextAgent,
+            ShortcutAction::FocusAgentInput,
+            ShortcutAction::NewStructuredAgent,
+            ShortcutAction::InterruptAgent,
+            ShortcutAction::ApproveAgent,
+            ShortcutAction::RejectAgent,
+            ShortcutAction::IncreaseAgentEffort,
+            ShortcutAction::DecreaseAgentEffort,
+        ] {
+            assert_eq!(effective_binding(&config, action), None);
+        }
+    }
+
+    #[test]
+    fn matching_repeat_and_duplicate_events_are_all_consumed_once() {
+        let binding = egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::F13);
+        let bindings = [(ShortcutAction::InterruptAgent, binding)];
+        let mut events = vec![
+            key_event(egui::Key::F13, egui::Modifiers::NONE, false),
+            key_event(egui::Key::F13, egui::Modifiers::NONE, true),
+            key_event(egui::Key::F13, egui::Modifiers::NONE, false),
+            egui::Event::Text("kept".to_owned()),
+        ];
+        assert_eq!(
+            take_triggered_action_from_events(&mut events, &bindings),
+            Some(ShortcutAction::InterruptAgent)
+        );
+        assert_eq!(events, vec![egui::Event::Text("kept".to_owned())]);
+    }
+
+    #[test]
+    fn repeat_only_event_is_consumed_without_triggering_again() {
+        let binding = egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::F13);
+        let bindings = [(ShortcutAction::InterruptAgent, binding)];
+        let mut events = vec![key_event(egui::Key::F13, egui::Modifiers::NONE, true)];
+        assert_eq!(
+            take_triggered_action_from_events(&mut events, &bindings),
+            None
+        );
+        assert!(events.is_empty());
     }
 }

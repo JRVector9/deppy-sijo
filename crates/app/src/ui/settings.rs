@@ -1752,7 +1752,8 @@ fn shortcuts_page(
             .unwrap_or_default()
     });
 
-    // 녹화 중에는 Escape=취소, Backspace/Delete=비우기, 나머지 modifier chord=저장.
+    // 녹화 중에는 Escape=취소, Backspace/Delete=비우기, 안전한 chord=저장.
+    // 일반 문자는 modifier가 필요하지만 외부 키패드용 F13~F24는 단독 등록할 수 있다.
     if let Some(action) = state.recording {
         let events = ui.input(|input| input.events.clone());
         for event in &events {

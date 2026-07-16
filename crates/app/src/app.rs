@@ -1943,6 +1943,33 @@ impl App {
         self.active.workspace_ui.set_agent_info(merged);
     }
 
+    fn pty_agent_surfaces(
+        &self,
+        entries: &[ui::file_tree::SessionEntry],
+    ) -> Vec<crate::agent_surface::AgentSurfaceSnapshot> {
+        entries
+            .iter()
+            .filter_map(|entry| {
+                let session_id = entry.session?;
+                let info = self.agent_info.get(&session_id)?;
+                Some(crate::agent_surface::AgentSurfaceSnapshot {
+                    id: crate::agent_surface::AgentSurfaceId::Pty {
+                        workspace_id: self.active.id.clone(),
+                        pane_id: entry.pane.0.clone(),
+                        session_id,
+                    },
+                    provider: crate::agent_surface::AgentProvider::from(info.kind),
+                    transport: crate::agent_surface::AgentTransport::Pty,
+                    title: entry.title.clone(),
+                    model: info.model.clone(),
+                    effort: info.effort.clone(),
+                    context_pct: info.context_pct,
+                    state: crate::agent_surface::AgentVisualState::from_pty(entry.status),
+                })
+            })
+            .collect()
+    }
+
     /// 완료/입력대기 주목(attention) 추적 — 세션 엔트리에 attention/pulse를 채운다.
     /// 규칙(2026-07-07): 알림 발생 시 그 pane이 비포커스면 확인할 때까지 레일 6px 유지,
     /// 이미 포커스 중이면 6px 대신 1회 펄스. 완료는 확인 시 소비(DB clear → 유휴로 복귀).
@@ -2801,6 +2828,77 @@ impl App {
         self.refresh_workspaces();
     }
 
+    fn handle_agent_sessions_request(&mut self, request: ui::agent_sessions::AgentSessionsRequest) {
+        use crate::agent_surface::AgentSurfaceId;
+        match request {
+            ui::agent_sessions::AgentSessionsRequest::FocusPty(AgentSurfaceId::Pty {
+                workspace_id,
+                pane_id,
+                session_id,
+            }) => {
+                if workspace_id != self.active.id {
+                    self.switch_workspace(&workspace_id);
+                    self.refresh_workspaces();
+                    self.pending_focus = Some((workspace_id, session_id));
+                    return;
+                }
+                let target = runtime::MuxPaneId(pane_id);
+                let tab = self.active.workspace_ui.mux().and_then(|mux| {
+                    mux.tabs
+                        .iter()
+                        .find(|tab| tab.panes.iter().any(|pane| pane.id == target))
+                        .map(|tab| tab.id.clone())
+                });
+                if let Some(tab) = tab {
+                    if self
+                        .active
+                        .workspace_ui
+                        .mux()
+                        .and_then(|mux| mux.active_tab.clone())
+                        != Some(tab.clone())
+                    {
+                        let _ = self
+                            .active
+                            .runtime
+                            .send_command(runtime::RuntimeCommand::SelectTab { tab });
+                    }
+                    let _ = self
+                        .active
+                        .runtime
+                        .send_command(runtime::RuntimeCommand::FocusPane { pane: target });
+                }
+            }
+            ui::agent_sessions::AgentSessionsRequest::InterruptPty(AgentSurfaceId::Pty {
+                workspace_id,
+                pane_id,
+                session_id,
+            }) => {
+                let still_matches = workspace_id == self.active.id
+                    && self.active.workspace_ui.mux().is_some_and(|mux| {
+                        mux.tabs
+                            .iter()
+                            .flat_map(|tab| &tab.panes)
+                            .any(|pane| pane.id.0 == pane_id && pane.session_id == Some(session_id))
+                    });
+                if still_matches {
+                    let _ = self
+                        .active
+                        .runtime
+                        .send_command(runtime::RuntimeCommand::WriteInput {
+                            session: session_id,
+                            bytes: vec![0x03],
+                        });
+                }
+            }
+            ui::agent_sessions::AgentSessionsRequest::FocusPty(AgentSurfaceId::Structured {
+                ..
+            })
+            | ui::agent_sessions::AgentSessionsRequest::InterruptPty(
+                AgentSurfaceId::Structured { .. },
+            ) => unreachable!("PTY 요청은 PTY target만 생성한다"),
+        }
+    }
+
     /// 설정에 저장된 전역 단축키 한 건을 실행한다. 설정 창에서는 키 녹화와 검색 입력이
     /// 우선이고, 일반 TextEdit 포커스 중에도 문자 편집 단축키를 가로채지 않는다.
     fn handle_configured_shortcut(&mut self, ctx: &egui::Context) {
@@ -2825,10 +2923,9 @@ impl App {
                     tracing::warn!("단축키 설정 저장 실패: {error:#}");
                 }
             }
-            A::OpenEnvironment | A::OpenAgents | A::OpenActivity | A::OpenNotifications => {
+            A::OpenEnvironment | A::OpenActivity | A::OpenNotifications => {
                 self.settings_category = match action {
                     A::OpenEnvironment => ui::settings::Category::Environment,
-                    A::OpenAgents => ui::settings::Category::Agents,
                     A::OpenActivity => ui::settings::Category::Activity,
                     A::OpenNotifications => ui::settings::Category::Notifications,
                     _ => unreachable!(),
@@ -2836,6 +2933,7 @@ impl App {
                 self.settings_open = true;
                 self.refresh_workspaces();
             }
+            A::OpenAgents => self.handle_agent_shortcut(action, ctx),
             A::NewShell => self.active.workspace_ui.spawn_shell(
                 &self.active.runtime,
                 self.config.terminal.scrollback_lines as usize,
@@ -2889,8 +2987,107 @@ impl App {
                     runtime.workspace_ui.clear_render_caches();
                 }
             }
+            A::PreviousAgent
+            | A::NextAgent
+            | A::FocusAgentInput
+            | A::NewStructuredAgent
+            | A::InterruptAgent
+            | A::ApproveAgent
+            | A::RejectAgent
+            | A::IncreaseAgentEffort
+            | A::DecreaseAgentEffort => {
+                self.handle_agent_shortcut(action, ctx);
+            }
         }
         ctx.request_repaint();
+    }
+
+    fn handle_agent_shortcut(
+        &mut self,
+        shortcut: crate::shortcuts::ShortcutAction,
+        ctx: &egui::Context,
+    ) {
+        use crate::agent_actions::{AgentAction, AgentActionGate, gate_action};
+        use crate::shortcuts::ShortcutAction as A;
+
+        let action = match shortcut {
+            A::OpenAgents => AgentAction::OpenAgents,
+            A::PreviousAgent => AgentAction::SelectPrevious,
+            A::NextAgent => AgentAction::SelectNext,
+            A::FocusAgentInput => AgentAction::FocusInput,
+            A::NewStructuredAgent => AgentAction::NewStructured,
+            A::InterruptAgent => AgentAction::Interrupt,
+            A::ApproveAgent => AgentAction::ApproveOnce,
+            A::RejectAgent => AgentAction::Reject,
+            A::IncreaseAgentEffort => AgentAction::EffortUp,
+            A::DecreaseAgentEffort => AgentAction::EffortDown,
+            _ => return,
+        };
+        let selected = self.agent_sessions_ui.selected_surface_snapshot();
+        let pending = self.agent_sessions_ui.selected_pending_approval_count();
+        let gate = gate_action(action, selected.as_ref(), pending);
+        if !gate.is_allowed() {
+            self.agent_sessions_ui.open();
+            match gate {
+                AgentActionGate::NoTarget => tracing::info!("에이전트 단축키: 선택 없음"),
+                AgentActionGate::Unsupported => {
+                    tracing::info!("에이전트 단축키: 선택 transport에서 지원하지 않음")
+                }
+                AgentActionGate::ApprovalCountMismatch { pending } => {
+                    tracing::info!(pending, "에이전트 승인 단축키 안전 조건 불충족")
+                }
+                AgentActionGate::Allowed => unreachable!(),
+            }
+            return;
+        }
+
+        let request = match action {
+            AgentAction::SelectPrevious => {
+                self.agent_sessions_ui.select_relative(-1);
+                None
+            }
+            AgentAction::SelectNext => {
+                self.agent_sessions_ui.select_relative(1);
+                None
+            }
+            AgentAction::FocusInput => self.agent_sessions_ui.focus_selected_input(),
+            AgentAction::NewStructured => {
+                self.agent_sessions_ui.open_new_prompt();
+                None
+            }
+            AgentAction::Interrupt => match self.agent_sessions_ui.interrupt_selected(ctx) {
+                Ok(request) => request,
+                Err(error) => {
+                    tracing::warn!("에이전트 중단 단축키 실패: {error:#}");
+                    None
+                }
+            },
+            AgentAction::ApproveOnce => {
+                if let Err(error) = self.agent_sessions_ui.approve_selected_once(ctx) {
+                    tracing::warn!("에이전트 승인 단축키 실패: {error:#}");
+                }
+                None
+            }
+            AgentAction::Reject => {
+                if let Err(error) = self.agent_sessions_ui.reject_selected(ctx) {
+                    tracing::warn!("에이전트 거절 단축키 실패: {error:#}");
+                }
+                None
+            }
+            AgentAction::EffortUp | AgentAction::EffortDown => {
+                // PR-07가 version-safe effort control을 연결할 때까지 transport에
+                // 임의 JSON-RPC를 보내지 않는다. 단축키는 이미 소비되며 panel만 연다.
+                self.agent_sessions_ui.open();
+                None
+            }
+            AgentAction::OpenAgents => {
+                self.agent_sessions_ui.open();
+                None
+            }
+        };
+        if let Some(request) = request {
+            self.handle_agent_sessions_request(request);
+        }
     }
 
     /// warm 풀이 max_warm(설정)을 넘으면 가장 오래된 것부터 Suspended로 내린다 (워커
@@ -4361,19 +4558,21 @@ impl eframe::App for App {
 
         // 폴더 트리 사이드바 (FT-1) — CentralPanel보다 먼저 배치해야 한다 (§9-1).
         // OFF(None)면 Panel 자체를 만들지 않는다 (§6 리소스 0).
+        let mut terminal_sessions = self.active.workspace_ui.session_entries(
+            &text,
+            &self.agent_activity,
+            &self.agent_needs_input,
+            &self.agent_turn_done,
+        );
+        // 완료/입력대기 주목(6px 레일·펄스) 갱신 + 확인 시 완료 소비. Agents 패널도
+        // 같은 상태 원천을 사용하므로 사이드바가 꺼져 있어도 계산한다.
+        self.update_session_alerts(&mut terminal_sessions);
+        let pty_agent_surfaces = self.pty_agent_surfaces(&terminal_sessions);
         if self.file_tree.is_some() {
-            let mut sessions = self.active.workspace_ui.session_entries(
-                &text,
-                &self.agent_activity,
-                &self.agent_needs_input,
-                &self.agent_turn_done,
-            );
-            // 완료/입력대기 주목(6px 레일·펄스) 갱신 + 확인 시 완료 소비.
-            self.update_session_alerts(&mut sessions);
             let sidebar_action = self
                 .file_tree
                 .as_mut()
-                .and_then(|tree| tree.panel(ui, &sessions, &text));
+                .and_then(|tree| tree.panel(ui, &terminal_sessions, &text));
             // 워처의 .env* 변경 신호 → 활성 워크스페이스에서 .env가 바뀌거나 사라져도
             // 즉시 재동기화 + 기본 env 재전송 — 시작/전환 시에만 동기화하면 삭제된
             // .env의 secret이 새 셸에 계속 주입된다(codex High).
@@ -4549,7 +4748,16 @@ impl eframe::App for App {
             .map(|workspace| workspace.path.clone())
             .filter(|path| !path.trim().is_empty())
             .filter(|path| std::path::Path::new(path).is_dir());
-        self.agent_sessions_ui.show(ui.ctx(), agent_workspace_cwd);
+        let active_workspace_id = self.active.id.clone();
+        let agent_requests = self.agent_sessions_ui.show(
+            ui.ctx(),
+            &active_workspace_id,
+            agent_workspace_cwd,
+            pty_agent_surfaces,
+        );
+        for request in agent_requests {
+            self.handle_agent_sessions_request(request);
+        }
         // pane 우클릭 → 환경변수·API 설정 (E4 ⑥) — 프로젝트 화면에서 바로 진입.
         if self.active.workspace_ui.take_open_environment() {
             self.settings_category = ui::settings::Category::Environment;

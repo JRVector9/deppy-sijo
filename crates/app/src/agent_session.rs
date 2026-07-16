@@ -348,6 +348,10 @@ pub enum AgentSessionEvent {
 #[derive(Debug, Clone)]
 pub struct AgentSession {
     pub id: AgentSessionId,
+    /// Workspace that owned this structured thread when it was created or
+    /// restored. App Server session IDs are process-global, but notification
+    /// navigation and history filtering remain workspace-scoped.
+    pub workspace_id: Option<String>,
     pub prompt: String,
     pub cwd: Option<String>,
     pub thread_id: Option<String>,
@@ -367,6 +371,7 @@ impl AgentSession {
     pub fn new(id: AgentSessionId, prompt: String, cwd: Option<String>) -> Self {
         Self {
             id,
+            workspace_id: None,
             prompt,
             cwd,
             thread_id: None,
@@ -496,9 +501,8 @@ impl AgentSession {
         // Drop the presentation latch before applying the raw state; otherwise
         // the ordinary idle transition correctly preserves `Completed` again.
         self.status = AgentSessionStatus::Ready;
-        match self.thread_status {
-            Some(status) => self.apply_thread_status(status),
-            None => {}
+        if let Some(status) = self.thread_status {
+            self.apply_thread_status(status);
         }
         true
     }

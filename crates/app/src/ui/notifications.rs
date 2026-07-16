@@ -84,6 +84,7 @@ impl NotificationsUi {
 
     /// 상태 변경을 알림으로 만든다. Running 복귀는 알리지 않는다.
     /// `title`은 tab/세션 제목 (mux 스냅샷에서 조회).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn on_status(
         &mut self,
         workspace_id: &str,
@@ -209,12 +210,25 @@ impl NotificationsUi {
     /// 세션 종료 알림 (완료 기준: done/error). exit code로 Done/Error 결정.
     /// status detector가 방금(직전 항목으로) 같은 결과를 냈으면 중복 발화하지 않되,
     /// 그 사이에 다른 항목(Waiting/재개 등)이 끼었으면 exit은 새 알림으로 낸다.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn on_exit(
         &mut self,
         workspace_id: &str,
         session: SessionId,
         exit_code: Option<u32>,
         title: &str,
+        catalog: &i18n::Catalog,
+    ) {
+        self.on_pty_exit(workspace_id, session, exit_code, title, None, catalog);
+    }
+
+    pub fn on_pty_exit(
+        &mut self,
+        workspace_id: &str,
+        session: SessionId,
+        exit_code: Option<u32>,
+        title: &str,
+        provider: Option<AgentProvider>,
         catalog: &i18n::Catalog,
     ) {
         let status = if exit_code == Some(0) {
@@ -239,7 +253,7 @@ impl NotificationsUi {
             })
             .is_some_and(|item| item.status == status);
         if !dup {
-            self.on_status(workspace_id, session, status, title, catalog);
+            self.on_pty_status(workspace_id, session, status, title, provider, catalog);
         }
     }
 

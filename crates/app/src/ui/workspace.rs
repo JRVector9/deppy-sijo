@@ -574,6 +574,15 @@ impl WorkspaceUi {
         self.agent_info.get(&session).map(agent_info_line)
     }
 
+    pub fn agent_providers(
+        &self,
+    ) -> std::collections::HashMap<SessionId, crate::agent_surface::AgentProvider> {
+        self.agent_info
+            .iter()
+            .map(|(session, display)| (*session, display.kind.into()))
+            .collect()
+    }
+
     /// 세션 표시 제목. 우선순위: ① 사용자 rename(기본 제목이 아니면) → 그대로,
     /// ② OSC 0/2 동적 제목(프로그램이 설정, 예: cwd/명령) → 그 제목, ③ 프로젝트 폴더명(≈깃
     /// 레포명), ④ 원 표기. osc는 이 세션 터미널의 현재 OSC 제목.

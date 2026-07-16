@@ -231,6 +231,27 @@ CREATE TABLE web_push_subscriptions (
     // 그대로 싣는다(조회 없음 — 등록 경로는 fail-closed라 새 실패 지점을 안 만든다).
     // NULL 허용: env 미주입 경로·레거시 행은 "세션 불명"으로 표시.
     mcp_store::MIGRATION_APPROVAL_PANE,
+    // v23: Codex App Server 구조화 thread 복구 메타데이터. 기존 agent_sessions는
+    // Claude/Codex PTY native resume 전용이므로 별도 테이블에서 관리한다. item/turn
+    // 원문은 Codex rollout이 source of truth이며 이 테이블에는 중복 저장하지 않는다.
+    "
+CREATE TABLE structured_threads (
+    local_session_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL DEFAULT '',
+    cwd TEXT NOT NULL DEFAULT '',
+    model TEXT,
+    favorite INTEGER NOT NULL DEFAULT 0 CHECK (favorite IN (0, 1)),
+    archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1)),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(workspace_id) REFERENCES workspaces(id)
+);
+
+CREATE INDEX idx_structured_threads_workspace_recency
+    ON structured_threads(workspace_id, favorite DESC, updated_at DESC);
+",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -241,6 +262,22 @@ pub struct AgentSessionRow {
     pub kind: String,
     /// 에이전트 자신의 세션 ID (`claude --resume <id>` / `codex resume <id>`).
     pub session_id: String,
+}
+
+/// Codex App Server thread의 앱 소유 복구 메타데이터. 구조화 item/turn 원문은
+/// App Server의 `thread/read`/`thread/resume`에서 다시 읽는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredThreadRow {
+    pub local_session_id: String,
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub title: String,
+    pub cwd: String,
+    pub model: Option<String>,
+    pub favorite: bool,
+    pub archived: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 /// hook이 보고한 세션 바인딩 행 (v15).
@@ -1043,6 +1080,127 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// 구조화 Codex thread 메타데이터를 저장한다. local/thread ID는 모두 durable하며,
+    /// 갱신 시 created_at은 보존하고 updated_at만 현재 시각으로 올린다.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_structured_thread(
+        &self,
+        local_session_id: &str,
+        workspace_id: &str,
+        thread_id: &str,
+        title: &str,
+        cwd: &str,
+        model: Option<&str>,
+        favorite: bool,
+        archived: bool,
+    ) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO structured_threads
+                    (local_session_id, workspace_id, thread_id, title, cwd, model,
+                     favorite, archived, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                         CAST(strftime('%s','now') AS INTEGER),
+                         CAST(strftime('%s','now') AS INTEGER))
+                 ON CONFLICT(local_session_id) DO UPDATE SET
+                    workspace_id = excluded.workspace_id,
+                    thread_id = excluded.thread_id,
+                    title = excluded.title,
+                    cwd = excluded.cwd,
+                    model = excluded.model,
+                    favorite = excluded.favorite,
+                    archived = excluded.archived,
+                    updated_at = CAST(strftime('%s','now') AS INTEGER)",
+                rusqlite::params![
+                    local_session_id,
+                    workspace_id,
+                    thread_id,
+                    title,
+                    cwd,
+                    model,
+                    favorite as i64,
+                    archived as i64,
+                ],
+            )
+            .with_context(|| format!("structured thread 저장 실패: {thread_id}"))?;
+        Ok(())
+    }
+
+    pub fn list_structured_threads(
+        &self,
+        workspace_id: &str,
+        include_archived: bool,
+    ) -> anyhow::Result<Vec<StructuredThreadRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT local_session_id, workspace_id, thread_id, title, cwd, model,
+                    favorite, archived, created_at, updated_at
+               FROM structured_threads
+              WHERE workspace_id = ?1 AND (?2 = 1 OR archived = 0)
+              ORDER BY favorite DESC, updated_at DESC, local_session_id",
+        )?;
+        let rows = stmt.query_map((workspace_id, include_archived as i64), |row| {
+            Ok(StructuredThreadRow {
+                local_session_id: row.get(0)?,
+                workspace_id: row.get(1)?,
+                thread_id: row.get(2)?,
+                title: row.get(3)?,
+                cwd: row.get(4)?,
+                model: row.get(5)?,
+                favorite: row.get::<_, i64>(6)? != 0,
+                archived: row.get::<_, i64>(7)? != 0,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn set_structured_thread_favorite(
+        &self,
+        local_session_id: &str,
+        favorite: bool,
+    ) -> anyhow::Result<bool> {
+        let affected = self.conn.execute(
+            "UPDATE structured_threads
+                SET favorite = ?2, updated_at = CAST(strftime('%s','now') AS INTEGER)
+              WHERE local_session_id = ?1",
+            (local_session_id, favorite as i64),
+        )?;
+        Ok(affected == 1)
+    }
+
+    pub fn set_structured_thread_archived(
+        &self,
+        local_session_id: &str,
+        archived: bool,
+    ) -> anyhow::Result<bool> {
+        let affected = self.conn.execute(
+            "UPDATE structured_threads
+                SET archived = ?2, updated_at = CAST(strftime('%s','now') AS INTEGER)
+              WHERE local_session_id = ?1",
+            (local_session_id, archived as i64),
+        )?;
+        Ok(affected == 1)
+    }
+
+    pub fn touch_structured_thread(&self, local_session_id: &str) -> anyhow::Result<bool> {
+        let affected = self.conn.execute(
+            "UPDATE structured_threads
+                SET updated_at = CAST(strftime('%s','now') AS INTEGER)
+              WHERE local_session_id = ?1",
+            [local_session_id],
+        )?;
+        Ok(affected == 1)
+    }
+
+    pub fn delete_structured_thread(&self, local_session_id: &str) -> anyhow::Result<bool> {
+        let affected = self.conn.execute(
+            "DELETE FROM structured_threads WHERE local_session_id = ?1",
+            [local_session_id],
+        )?;
+        Ok(affected == 1)
+    }
+
     /// workspace 이름을 변경한다 (#3 — 사용자 지정 이름).
     pub fn rename_workspace(&self, id: &str, name: &str) -> anyhow::Result<()> {
         let affected = self
@@ -1132,6 +1290,12 @@ impl Db {
         // 옵션2 에이전트 세션 (storage 소유) — 워크스페이스와 함께 정리(orphan 방지).
         tx.execute(
             "DELETE FROM agent_sessions WHERE workspace_id = ?1",
+            [workspace_id],
+        )?;
+        // 구조화 Codex thread 메타데이터도 workspace와 함께 정리한다. 실제 Codex
+        // rollout/thread archive 여부는 App Server가 별도로 소유한다.
+        tx.execute(
+            "DELETE FROM structured_threads WHERE workspace_id = ?1",
             [workspace_id],
         )?;
         tx.execute("DELETE FROM workspaces WHERE id = ?1", [workspace_id])?;
@@ -1710,6 +1874,115 @@ mod tests {
     }
 
     #[test]
+    fn structured_threads_crud와_archive_filter_roundtrip() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("structured").unwrap();
+        db.upsert_structured_thread(
+            "local-1",
+            &ws,
+            "thread-1",
+            "첫 작업",
+            "/repo",
+            Some("gpt-test"),
+            false,
+            false,
+        )
+        .unwrap();
+        db.upsert_structured_thread(
+            "local-2",
+            &ws,
+            "thread-2",
+            "두 번째 작업",
+            "/repo/sub",
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+
+        let active = db.list_structured_threads(&ws, false).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].local_session_id, "local-1");
+        assert_eq!(active[0].thread_id, "thread-1");
+        assert_eq!(active[0].model.as_deref(), Some("gpt-test"));
+
+        let all = db.list_structured_threads(&ws, true).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].local_session_id, "local-2");
+        assert!(all[0].favorite);
+        assert!(all[0].archived);
+
+        assert!(db.set_structured_thread_favorite("local-1", true).unwrap());
+        assert!(db.set_structured_thread_archived("local-1", true).unwrap());
+        assert!(db.touch_structured_thread("local-1").unwrap());
+        assert!(db.list_structured_threads(&ws, false).unwrap().is_empty());
+        assert!(db.delete_structured_thread("local-1").unwrap());
+        assert!(!db.delete_structured_thread("local-missing").unwrap());
+        assert_eq!(db.list_structured_threads(&ws, true).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn structured_thread_upsert는_created_at을_보존하고_메타데이터를_갱신한다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("structured").unwrap();
+        db.upsert_structured_thread(
+            "local-1",
+            &ws,
+            "thread-1",
+            "초기 제목",
+            "/repo",
+            Some("model-a"),
+            false,
+            false,
+        )
+        .unwrap();
+        let created_at = db.list_structured_threads(&ws, true).unwrap()[0].created_at;
+
+        db.upsert_structured_thread(
+            "local-1",
+            &ws,
+            "thread-1",
+            "갱신 제목",
+            "/repo/new",
+            Some("model-b"),
+            true,
+            false,
+        )
+        .unwrap();
+        let rows = db.list_structured_threads(&ws, true).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].created_at, created_at);
+        assert_eq!(rows[0].title, "갱신 제목");
+        assert_eq!(rows[0].cwd, "/repo/new");
+        assert_eq!(rows[0].model.as_deref(), Some("model-b"));
+        assert!(rows[0].favorite);
+    }
+
+    #[test]
+    fn structured_thread_id는_로컬_세션과_일대일이다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("structured").unwrap();
+        db.upsert_structured_thread(
+            "local-1", &ws, "thread-1", "one", "/repo", None, false, false,
+        )
+        .unwrap();
+        assert!(
+            db.upsert_structured_thread(
+                "local-2",
+                &ws,
+                "thread-1",
+                "duplicate",
+                "/repo",
+                None,
+                false,
+                false,
+            )
+            .is_err()
+        );
+        assert_eq!(db.list_structured_threads(&ws, true).unwrap().len(), 1);
+    }
+
+    #[test]
     fn agent_needs_input_set_clear_list() {
         let db = Db::open_in_memory().unwrap();
         db.set_agent_needs_input("pane-1", true).unwrap();
@@ -1763,6 +2036,25 @@ mod tests {
         db.delete_workspace(&ws).unwrap();
         assert!(db.list_agent_sessions(&ws).unwrap().is_empty());
         assert_eq!(db.list_agent_sessions(&other).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_workspace가_structured_threads도_정리() {
+        let mut db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("삭제대상").unwrap();
+        let other = db.create_workspace("유지").unwrap();
+        db.upsert_structured_thread(
+            "local-1", &ws, "thread-1", "delete", "/repo", None, false, false,
+        )
+        .unwrap();
+        db.upsert_structured_thread(
+            "local-2", &other, "thread-2", "keep", "/other", None, false, false,
+        )
+        .unwrap();
+
+        db.delete_workspace(&ws).unwrap();
+        assert!(db.list_structured_threads(&ws, true).unwrap().is_empty());
+        assert_eq!(db.list_structured_threads(&other, true).unwrap().len(), 1);
     }
 
     #[test]
@@ -2751,6 +3043,40 @@ mod tests {
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].endpoint, "https://push.example/a");
         assert_eq!(subs[0].p256dh, "p256");
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn v22에서_structured_threads_마이그레이션이_적용된다() {
+        let dir =
+            std::env::temp_dir().join(format!("deppy-mig-22-structured-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite3");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..22] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 22).unwrap();
+            conn.execute(
+                "INSERT INTO workspaces (id, name, path, created_at, updated_at)
+                 VALUES ('ws-1', 'existing', '/repo', 't', 't')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(Db::read_user_version(&db.conn).unwrap(), MIGRATIONS.len());
+        db.upsert_structured_thread(
+            "local-1", "ws-1", "thread-1", "restored", "/repo", None, false, false,
+        )
+        .unwrap();
+        assert_eq!(
+            db.list_structured_threads("ws-1", false).unwrap()[0].thread_id,
+            "thread-1"
+        );
         drop(db);
         std::fs::remove_dir_all(&dir).unwrap();
     }

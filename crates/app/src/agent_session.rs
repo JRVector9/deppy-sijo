@@ -354,6 +354,9 @@ pub struct AgentSession {
     pub workspace_id: Option<String>,
     pub prompt: String,
     pub cwd: Option<String>,
+    /// Model override retained for structured-thread recovery. `None` means
+    /// the App Server chose its configured default.
+    pub model: Option<String>,
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
     /// Latest authoritative App Server runtime state. `status` may deliberately
@@ -374,6 +377,7 @@ impl AgentSession {
             workspace_id: None,
             prompt,
             cwd,
+            model: None,
             thread_id: None,
             turn_id: None,
             thread_status: None,
@@ -467,6 +471,68 @@ impl AgentSession {
                 }
             }
         }
+    }
+
+    /// Replace the structured item projection from a `thread/read` or
+    /// `thread/resume` result. The App Server remains the source of truth for
+    /// full turn/item history; Deppy only persists enough metadata to ask for
+    /// this snapshot again.
+    pub fn load_thread_snapshot(&mut self, result: &Value) -> anyhow::Result<()> {
+        let thread = result
+            .get("thread")
+            .filter(|thread| thread.is_object())
+            .ok_or_else(|| anyhow::anyhow!("thread 응답에 thread 객체가 없습니다"))?;
+        let thread_id = thread
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("thread 응답에 thread.id가 없습니다"))?;
+        if let Some(expected) = self.thread_id.as_deref() {
+            anyhow::ensure!(
+                expected == thread_id,
+                "thread 응답 ID 불일치: expected {expected}, got {thread_id}"
+            );
+        }
+
+        self.thread_id = Some(thread_id.to_owned());
+        if let Some(cwd) = thread.get("cwd").and_then(Value::as_str) {
+            self.cwd = Some(cwd.to_owned());
+        }
+        if let Some(model) = thread.get("model").and_then(Value::as_str) {
+            self.model = Some(model.to_owned());
+        }
+
+        self.items.clear();
+        self.item_indices.clear();
+        self.turn_id = None;
+        if let Some(turns) = thread.get("turns").and_then(Value::as_array) {
+            for turn in turns {
+                if let Some(turn_id) = turn.get("id").and_then(Value::as_str) {
+                    self.turn_id = Some(turn_id.to_owned());
+                }
+                for item in turn
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(item) = AgentItem::from_codex(item) {
+                        self.upsert_item(item, false);
+                    }
+                }
+            }
+        }
+
+        self.error = None;
+        if let Some(status) = thread.get("status").and_then(AgentThreadStatus::from_codex) {
+            self.thread_status = Some(status);
+            self.apply_thread_status(status);
+        } else if matches!(
+            self.status,
+            AgentSessionStatus::Starting | AgentSessionStatus::Stopped
+        ) {
+            self.status = AgentSessionStatus::Ready;
+        }
+        Ok(())
     }
 
     /// Compact rows for the agent-result table. Unlike terminal text, all cells
@@ -957,6 +1023,56 @@ mod tests {
         session.apply(AgentSessionEvent::ThreadStatusChanged {
             status: AgentThreadStatus::Idle,
         });
+        assert_eq!(session.status, AgentSessionStatus::Ready);
+    }
+
+    #[test]
+    fn thread_snapshot_rebuilds_turn_items_and_authoritative_status() {
+        let mut session = AgentSession::new(
+            "local-1".to_owned(),
+            "restored title".to_owned(),
+            Some("/old".to_owned()),
+        );
+        session.thread_id = Some("thread-1".to_owned());
+        session.status = AgentSessionStatus::Stopped;
+
+        session
+            .load_thread_snapshot(&json!({
+                "thread": {
+                    "id": "thread-1",
+                    "cwd": "/repo",
+                    "model": "gpt-test",
+                    "status": {"type": "idle"},
+                    "turns": [
+                        {
+                            "id": "turn-1",
+                            "items": [{
+                                "id": "user-1",
+                                "type": "userMessage",
+                                "content": [{"type": "text", "text": "first"}]
+                            }]
+                        },
+                        {
+                            "id": "turn-2",
+                            "items": [{
+                                "id": "agent-1",
+                                "type": "agentMessage",
+                                "text": "restored answer",
+                                "status": "completed"
+                            }]
+                        }
+                    ]
+                }
+            }))
+            .unwrap();
+
+        assert_eq!(session.prompt, "restored title");
+        assert_eq!(session.cwd.as_deref(), Some("/repo"));
+        assert_eq!(session.model.as_deref(), Some("gpt-test"));
+        assert_eq!(session.turn_id.as_deref(), Some("turn-2"));
+        assert_eq!(session.items.len(), 2);
+        assert_eq!(session.items[1].summary, "restored answer");
+        assert_eq!(session.thread_status, Some(AgentThreadStatus::Idle));
         assert_eq!(session.status, AgentSessionStatus::Ready);
     }
 }

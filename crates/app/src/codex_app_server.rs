@@ -65,6 +65,12 @@ pub struct CodexAppServerClient {
     worker: Option<thread::JoinHandle<()>>,
 }
 
+/// One-shot asynchronous JSON result for history/catalog requests. Callers can
+/// poll it without blocking the egui frame; the payload stays at the App Server
+/// JSON boundary until a UI-specific view model consumes it.
+#[allow(dead_code)] // PR-06 phase 2 wires the history UI consumer.
+pub type CodexAppServerReply = Receiver<anyhow::Result<Value>>;
+
 impl CodexAppServerClient {
     pub fn spawn(options: CodexAppServerOptions, repaint: egui::Context) -> anyhow::Result<Self> {
         let mut child = Command::new(&options.executable)
@@ -168,6 +174,67 @@ impl CodexAppServerClient {
         })
     }
 
+    /// List Deppy-created App Server threads, newest first. `cursor` is the
+    /// opaque `nextCursor` from the preceding response.
+    #[allow(dead_code)] // PR-06 phase 2 wires the history UI consumer.
+    pub fn list_threads(
+        &self,
+        cursor: Option<String>,
+        limit: Option<u32>,
+        archived: bool,
+    ) -> anyhow::Result<CodexAppServerReply> {
+        let (reply, receiver) = mpsc::channel();
+        self.send(ClientCommand::ListThreads {
+            cursor,
+            limit,
+            archived,
+            reply,
+        })?;
+        Ok(receiver)
+    }
+
+    #[allow(dead_code)] // PR-06 phase 2 wires the history UI consumer.
+    pub fn read_thread(
+        &self,
+        thread_id: String,
+        include_turns: bool,
+    ) -> anyhow::Result<CodexAppServerReply> {
+        let (reply, receiver) = mpsc::channel();
+        self.send(ClientCommand::ReadThread {
+            thread_id,
+            include_turns,
+            reply,
+        })?;
+        Ok(receiver)
+    }
+
+    /// Resume an existing Codex thread under an app-owned local session ID.
+    #[allow(dead_code)] // PR-06 phase 2 wires the history UI consumer.
+    pub fn resume_thread(
+        &self,
+        session_id: AgentSessionId,
+        thread_id: String,
+        cwd: Option<String>,
+        model: Option<String>,
+    ) -> anyhow::Result<CodexAppServerReply> {
+        let (reply, receiver) = mpsc::channel();
+        self.send(ClientCommand::ResumeThread {
+            session_id,
+            thread_id,
+            cwd,
+            model,
+            reply,
+        })?;
+        Ok(receiver)
+    }
+
+    #[allow(dead_code)] // PR-06 phase 2 wires the history UI consumer.
+    pub fn archive_thread(&self, thread_id: String) -> anyhow::Result<CodexAppServerReply> {
+        let (reply, receiver) = mpsc::channel();
+        self.send(ClientCommand::ArchiveThread { thread_id, reply })?;
+        Ok(receiver)
+    }
+
     /// Drain without blocking; worker-side repaint requests make the next frame
     /// arrive when App Server output lands.
     pub fn drain_events(&self) -> Vec<CodexAppServerEvent> {
@@ -216,6 +283,32 @@ enum ClientCommand {
         request_key: String,
         decision: AgentApprovalDecision,
     },
+    #[allow(dead_code)] // Constructed by the phase-2 public API consumer.
+    ListThreads {
+        cursor: Option<String>,
+        limit: Option<u32>,
+        archived: bool,
+        reply: Sender<anyhow::Result<Value>>,
+    },
+    #[allow(dead_code)] // Constructed by the phase-2 public API consumer.
+    ReadThread {
+        thread_id: String,
+        include_turns: bool,
+        reply: Sender<anyhow::Result<Value>>,
+    },
+    #[allow(dead_code)] // Constructed by the phase-2 public API consumer.
+    ResumeThread {
+        session_id: AgentSessionId,
+        thread_id: String,
+        cwd: Option<String>,
+        model: Option<String>,
+        reply: Sender<anyhow::Result<Value>>,
+    },
+    #[allow(dead_code)] // Constructed by the phase-2 public API consumer.
+    ArchiveThread {
+        thread_id: String,
+        reply: Sender<anyhow::Result<Value>>,
+    },
     Shutdown,
 }
 
@@ -241,6 +334,22 @@ enum PendingRequest {
     Interrupt {
         session_id: AgentSessionId,
     },
+    ListThreads {
+        reply: Sender<anyhow::Result<Value>>,
+    },
+    ReadThread {
+        thread_id: String,
+        reply: Sender<anyhow::Result<Value>>,
+    },
+    ResumeThread {
+        session_id: AgentSessionId,
+        thread_id: String,
+        reply: Sender<anyhow::Result<Value>>,
+    },
+    ArchiveThread {
+        thread_id: String,
+        reply: Sender<anyhow::Result<Value>>,
+    },
 }
 
 #[derive(Debug)]
@@ -255,6 +364,7 @@ struct WorkerState {
     initialized: bool,
     pending: HashMap<String, PendingRequest>,
     queued_starts: Vec<QueuedStart>,
+    queued_rpc_commands: Vec<ClientCommand>,
     thread_to_session: HashMap<String, AgentSessionId>,
     session_to_thread: HashMap<AgentSessionId, String>,
     /// A status notification can race ahead of `thread/start`'s response, which
@@ -303,7 +413,6 @@ fn worker_loop(
         ..Default::default()
     };
     let mut last_stderr = String::new();
-    let mut running = true;
 
     if let Err(error) = send_initialize(&mut stdin, &mut state, &options) {
         emit_transport_error(
@@ -311,53 +420,52 @@ fn worker_loop(
             &repaint,
             format!("Codex 초기화 전송 실패: {error:#}"),
         );
-        running = false;
-    }
-
-    while running {
-        drain_incoming(
-            &incoming_rx,
-            &mut stdin,
-            &mut state,
-            &events,
-            &repaint,
-            &mut last_stderr,
-        );
-        if state.stop_requested {
-            break;
-        }
-
-        match commands.recv_timeout(Duration::from_millis(20)) {
-            Ok(ClientCommand::Shutdown) => break,
-            Ok(command) => {
-                handle_client_command(command, &mut stdin, &mut state, &events, &repaint)
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let suffix = if last_stderr.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!(": {}", one_line(&last_stderr, 400))
-                };
-                emit_transport_error(
-                    &events,
-                    &repaint,
-                    format!("Codex App Server가 종료되었습니다 ({status}){suffix}"),
-                );
+    } else {
+        loop {
+            drain_incoming(
+                &incoming_rx,
+                &mut stdin,
+                &mut state,
+                &events,
+                &repaint,
+                &mut last_stderr,
+            );
+            if state.stop_requested {
                 break;
             }
-            Ok(None) => {}
-            Err(error) => {
-                emit_transport_error(
-                    &events,
-                    &repaint,
-                    format!("Codex App Server 상태 확인 실패: {error}"),
-                );
-                break;
+
+            match commands.recv_timeout(Duration::from_millis(20)) {
+                Ok(ClientCommand::Shutdown) => break,
+                Ok(command) => {
+                    handle_client_command(command, &mut stdin, &mut state, &events, &repaint)
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let suffix = if last_stderr.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", one_line(&last_stderr, 400))
+                    };
+                    emit_transport_error(
+                        &events,
+                        &repaint,
+                        format!("Codex App Server가 종료되었습니다 ({status}){suffix}"),
+                    );
+                    break;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    emit_transport_error(
+                        &events,
+                        &repaint,
+                        format!("Codex App Server 상태 확인 실패: {error}"),
+                    );
+                    break;
+                }
             }
         }
     }
@@ -459,12 +567,35 @@ fn handle_client_command(
     events: &Sender<CodexAppServerEvent>,
     repaint: &egui::Context,
 ) {
+    if !state.initialized
+        && matches!(
+            &command,
+            ClientCommand::ListThreads { .. }
+                | ClientCommand::ReadThread { .. }
+                | ClientCommand::ResumeThread { .. }
+                | ClientCommand::ArchiveThread { .. }
+        )
+    {
+        state.queued_rpc_commands.push(command);
+        return;
+    }
     let target = match &command {
         ClientCommand::StartSession { session_id, .. }
         | ClientCommand::SubmitTurn { session_id, .. }
         | ClientCommand::Interrupt { session_id }
-        | ClientCommand::RespondApproval { session_id, .. } => Some(session_id.clone()),
-        ClientCommand::Shutdown => None,
+        | ClientCommand::RespondApproval { session_id, .. }
+        | ClientCommand::ResumeThread { session_id, .. } => Some(session_id.clone()),
+        ClientCommand::ListThreads { .. }
+        | ClientCommand::ReadThread { .. }
+        | ClientCommand::ArchiveThread { .. }
+        | ClientCommand::Shutdown => None,
+    };
+    let rpc_reply = match &command {
+        ClientCommand::ListThreads { reply, .. }
+        | ClientCommand::ReadThread { reply, .. }
+        | ClientCommand::ResumeThread { reply, .. }
+        | ClientCommand::ArchiveThread { reply, .. } => Some(reply.clone()),
+        _ => None,
     };
     let result = match command {
         ClientCommand::StartSession {
@@ -498,21 +629,44 @@ fn handle_client_command(
             request_key,
             decision,
         } => respond_approval(stdin, state, &session_id, &request_key, decision),
+        ClientCommand::ListThreads {
+            cursor,
+            limit,
+            archived,
+            reply,
+        } => request_thread_list(stdin, state, cursor, limit, archived, reply),
+        ClientCommand::ReadThread {
+            thread_id,
+            include_turns,
+            reply,
+        } => request_thread_read(stdin, state, thread_id, include_turns, reply),
+        ClientCommand::ResumeThread {
+            session_id,
+            thread_id,
+            cwd,
+            model,
+            reply,
+        } => request_thread_resume(stdin, state, session_id, thread_id, cwd, model, reply),
+        ClientCommand::ArchiveThread { thread_id, reply } => {
+            request_thread_archive(stdin, state, thread_id, reply)
+        }
         ClientCommand::Shutdown => Ok(()),
     };
 
     if let Err(error) = result {
+        let message = format!("Codex App Server 요청 실패: {error:#}");
+        if let Some(reply) = rpc_reply {
+            send_rpc_reply(reply, repaint, Err(anyhow::anyhow!(message.clone())));
+        }
         if let Some(session_id) = target {
             emit_session(
                 events,
                 repaint,
                 session_id,
-                AgentSessionEvent::Failed {
-                    message: format!("Codex App Server 요청 실패: {error:#}"),
-                },
+                AgentSessionEvent::Failed { message },
             );
         } else {
-            emit_transport_error(events, repaint, format!("Codex 요청 실패: {error:#}"));
+            emit_transport_error(events, repaint, message);
         }
     }
 }
@@ -651,6 +805,146 @@ fn respond_approval(
     )
 }
 
+fn request_thread_list(
+    stdin: &mut ChildStdin,
+    state: &mut WorkerState,
+    cursor: Option<String>,
+    limit: Option<u32>,
+    archived: bool,
+    reply: Sender<anyhow::Result<Value>>,
+) -> anyhow::Result<()> {
+    let id = state.request_id();
+    let key = rpc_key(&id);
+    state
+        .pending
+        .insert(key.clone(), PendingRequest::ListThreads { reply });
+    let frame = json!({
+        "method": "thread/list",
+        "id": id,
+        "params": thread_list_params(cursor, limit, archived),
+    });
+    if let Err(error) = write_message(stdin, &frame) {
+        state.pending.remove(&key);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn request_thread_read(
+    stdin: &mut ChildStdin,
+    state: &mut WorkerState,
+    thread_id: String,
+    include_turns: bool,
+    reply: Sender<anyhow::Result<Value>>,
+) -> anyhow::Result<()> {
+    let id = state.request_id();
+    let key = rpc_key(&id);
+    state.pending.insert(
+        key.clone(),
+        PendingRequest::ReadThread {
+            thread_id: thread_id.clone(),
+            reply,
+        },
+    );
+    let frame = json!({
+        "method": "thread/read",
+        "id": id,
+        "params": {"threadId": thread_id, "includeTurns": include_turns},
+    });
+    if let Err(error) = write_message(stdin, &frame) {
+        state.pending.remove(&key);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn request_thread_resume(
+    stdin: &mut ChildStdin,
+    state: &mut WorkerState,
+    session_id: AgentSessionId,
+    thread_id: String,
+    cwd: Option<String>,
+    model: Option<String>,
+    reply: Sender<anyhow::Result<Value>>,
+) -> anyhow::Result<()> {
+    let id = state.request_id();
+    let key = rpc_key(&id);
+    state.pending.insert(
+        key.clone(),
+        PendingRequest::ResumeThread {
+            session_id,
+            thread_id: thread_id.clone(),
+            reply,
+        },
+    );
+    let frame = json!({
+        "method": "thread/resume",
+        "id": id,
+        "params": thread_resume_params(thread_id, cwd, model),
+    });
+    if let Err(error) = write_message(stdin, &frame) {
+        state.pending.remove(&key);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn request_thread_archive(
+    stdin: &mut ChildStdin,
+    state: &mut WorkerState,
+    thread_id: String,
+    reply: Sender<anyhow::Result<Value>>,
+) -> anyhow::Result<()> {
+    let id = state.request_id();
+    let key = rpc_key(&id);
+    state.pending.insert(
+        key.clone(),
+        PendingRequest::ArchiveThread {
+            thread_id: thread_id.clone(),
+            reply,
+        },
+    );
+    let frame = json!({
+        "method": "thread/archive",
+        "id": id,
+        "params": {"threadId": thread_id},
+    });
+    if let Err(error) = write_message(stdin, &frame) {
+        state.pending.remove(&key);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn thread_list_params(cursor: Option<String>, limit: Option<u32>, archived: bool) -> Value {
+    let mut params = serde_json::Map::from_iter([
+        ("sourceKinds".to_owned(), json!(["appServer"])),
+        ("archived".to_owned(), Value::Bool(archived)),
+        ("sortKey".to_owned(), Value::String("updated_at".to_owned())),
+        ("sortDirection".to_owned(), Value::String("desc".to_owned())),
+    ]);
+    if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
+        params.insert("cursor".to_owned(), Value::String(cursor));
+    }
+    if let Some(limit) = limit {
+        params.insert("limit".to_owned(), Value::from(limit));
+    }
+    Value::Object(params)
+}
+
+fn thread_resume_params(thread_id: String, cwd: Option<String>, model: Option<String>) -> Value {
+    let mut params =
+        serde_json::Map::from_iter([("threadId".to_owned(), Value::String(thread_id))]);
+    if let Some(cwd) = cwd.filter(|cwd| !cwd.trim().is_empty()) {
+        params.insert("cwd".to_owned(), Value::String(cwd));
+    }
+    if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
+        params.insert("model".to_owned(), Value::String(model));
+    }
+    Value::Object(params)
+}
+
 fn handle_server_message(
     message: Value,
     stdin: &mut ChildStdin,
@@ -712,6 +1006,22 @@ fn handle_response(
                 session_id,
                 AgentSessionEvent::Failed { message: text },
             ),
+            PendingRequest::ResumeThread {
+                session_id, reply, ..
+            } => {
+                send_rpc_reply(reply, repaint, Err(anyhow::anyhow!(text.clone())));
+                emit_session(
+                    events,
+                    repaint,
+                    session_id,
+                    AgentSessionEvent::Failed { message: text },
+                );
+            }
+            PendingRequest::ListThreads { reply }
+            | PendingRequest::ReadThread { reply, .. }
+            | PendingRequest::ArchiveThread { reply, .. } => {
+                send_rpc_reply(reply, repaint, Err(anyhow::anyhow!(text)));
+            }
         }
         return;
     }
@@ -744,6 +1054,10 @@ fn handle_response(
                         },
                     );
                 }
+            }
+            let queued_commands = std::mem::take(&mut state.queued_rpc_commands);
+            for command in queued_commands {
+                handle_client_command(command, stdin, state, events, repaint);
             }
             for session_id in &state.known_sessions {
                 emit_session(
@@ -832,7 +1146,107 @@ fn handle_response(
         }
         // Completion is confirmed by turn/completed, not this acknowledgement.
         PendingRequest::Interrupt { .. } => {}
+        PendingRequest::ListThreads { reply } => {
+            let response = validate_thread_list_result(&result).map(|()| result);
+            send_rpc_reply(reply, repaint, response);
+        }
+        PendingRequest::ReadThread { thread_id, reply } => {
+            let response = validate_thread_result(&result, &thread_id).map(|()| result);
+            send_rpc_reply(reply, repaint, response);
+        }
+        PendingRequest::ResumeThread {
+            session_id,
+            thread_id,
+            reply,
+        } => {
+            if let Err(error) = validate_thread_result(&result, &thread_id) {
+                let message = format!("thread/resume 응답 오류: {error:#}");
+                send_rpc_reply(reply, repaint, Err(anyhow::anyhow!(message.clone())));
+                emit_session(
+                    events,
+                    repaint,
+                    session_id,
+                    AgentSessionEvent::Failed { message },
+                );
+                return;
+            }
+            state.known_sessions.insert(session_id.clone());
+            state
+                .thread_to_session
+                .insert(thread_id.clone(), session_id.clone());
+            state
+                .session_to_thread
+                .insert(session_id.clone(), thread_id.clone());
+            emit_session(
+                events,
+                repaint,
+                session_id.clone(),
+                AgentSessionEvent::ThreadStarted {
+                    thread_id: thread_id.clone(),
+                },
+            );
+            if let Some(status) = state.buffered_thread_statuses.remove(&thread_id) {
+                emit_session(
+                    events,
+                    repaint,
+                    session_id,
+                    AgentSessionEvent::ThreadStatusChanged { status },
+                );
+            }
+            send_rpc_reply(reply, repaint, Ok(result));
+        }
+        PendingRequest::ArchiveThread { thread_id, reply } => {
+            let response = if result.is_object() {
+                Ok(result)
+            } else {
+                Err(anyhow::anyhow!("thread/archive 응답이 객체가 아닙니다"))
+            };
+            if response.is_ok()
+                && let Some(session_id) = state.thread_to_session.remove(&thread_id)
+            {
+                state.session_to_thread.remove(&session_id);
+                state.session_to_turn.remove(&session_id);
+                state.known_sessions.remove(&session_id);
+            }
+            send_rpc_reply(reply, repaint, response);
+        }
     }
+}
+
+fn send_rpc_reply(
+    reply: Sender<anyhow::Result<Value>>,
+    repaint: &egui::Context,
+    result: anyhow::Result<Value>,
+) {
+    let _ = reply.send(result);
+    repaint.request_repaint();
+}
+
+fn validate_thread_list_result(result: &Value) -> anyhow::Result<()> {
+    anyhow::ensure!(result.is_object(), "thread/list 응답이 객체가 아닙니다");
+    anyhow::ensure!(
+        result.get("data").is_some_and(Value::is_array),
+        "thread/list 응답에 data 배열이 없습니다"
+    );
+    if let Some(cursor) = result.get("nextCursor") {
+        anyhow::ensure!(
+            cursor.is_null() || cursor.is_string(),
+            "thread/list nextCursor 형식이 잘못되었습니다"
+        );
+    }
+    Ok(())
+}
+
+fn validate_thread_result(result: &Value, expected_thread_id: &str) -> anyhow::Result<()> {
+    let thread_id = result
+        .pointer("/thread/id")
+        .and_then(Value::as_str)
+        .context("thread 응답에 thread.id가 없습니다")?;
+    anyhow::ensure!(
+        thread_id == expected_thread_id,
+        "thread 응답 ID 불일치: expected {expected_thread_id}, got {thread_id}"
+    );
+    Ok(())
 }
 
 fn handle_notification(
@@ -1293,5 +1707,60 @@ mod tests {
         );
 
         assert!(matches!(received.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn thread_list_params_use_stable_app_server_filters_and_cursor() {
+        let params = thread_list_params(Some("cursor-2".to_owned()), Some(40), false);
+        assert_eq!(params["sourceKinds"], json!(["appServer"]));
+        assert_eq!(params["archived"], false);
+        assert_eq!(params["sortKey"], "updated_at");
+        assert_eq!(params["sortDirection"], "desc");
+        assert_eq!(params["cursor"], "cursor-2");
+        assert_eq!(params["limit"], 40);
+
+        let first_page = thread_list_params(Some(String::new()), None, true);
+        assert_eq!(first_page["archived"], true);
+        assert!(first_page.get("cursor").is_none());
+        assert!(first_page.get("limit").is_none());
+    }
+
+    #[test]
+    fn thread_resume_params_only_include_non_empty_overrides() {
+        let params = thread_resume_params(
+            "thread-1".to_owned(),
+            Some("/repo".to_owned()),
+            Some("gpt-test".to_owned()),
+        );
+        assert_eq!(
+            params,
+            json!({"threadId": "thread-1", "cwd": "/repo", "model": "gpt-test"})
+        );
+
+        let defaults = thread_resume_params(
+            "thread-2".to_owned(),
+            Some("  ".to_owned()),
+            Some(String::new()),
+        );
+        assert_eq!(defaults, json!({"threadId": "thread-2"}));
+    }
+
+    #[test]
+    fn history_response_parsers_accept_exact_shapes_and_reject_mismatches() {
+        assert!(
+            validate_thread_list_result(&json!({
+                "data": [{"id": "thread-1"}],
+                "nextCursor": "cursor-2"
+            }))
+            .is_ok()
+        );
+        assert!(validate_thread_list_result(&json!({"data": []})).is_ok());
+        assert!(validate_thread_list_result(&json!({"data": {}})).is_err());
+        assert!(validate_thread_list_result(&json!({"data": [], "nextCursor": 7})).is_err());
+
+        let thread = json!({"thread": {"id": "thread-1", "turns": []}});
+        assert!(validate_thread_result(&thread, "thread-1").is_ok());
+        assert!(validate_thread_result(&thread, "thread-other").is_err());
+        assert!(validate_thread_result(&json!({"thread": {}}), "thread-1").is_err());
     }
 }

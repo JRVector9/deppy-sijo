@@ -2846,7 +2846,11 @@ impl App {
                 let tab = self.active.workspace_ui.mux().and_then(|mux| {
                     mux.tabs
                         .iter()
-                        .find(|tab| tab.panes.iter().any(|pane| pane.id == target))
+                        .find(|tab| {
+                            tab.panes.iter().any(|pane| {
+                                pane.id == target && pane.session_id == Some(session_id)
+                            })
+                        })
                         .map(|tab| tab.id.clone())
                 });
                 if let Some(tab) = tab {
@@ -3140,11 +3144,13 @@ impl App {
                 self.runtime_stream_warning = true;
             }
             Self::record_activity_events(&mut rt, &events);
+            let agent_providers = rt.workspace_ui.agent_providers();
             Self::process_ws_notifications(
                 &mut self.notifications_ui,
                 workspace_id,
                 &events,
                 &mut rt.session_titles,
+                &agent_providers,
                 &self.i18n,
             );
             // 최종 방어: 마지막 drain에서 새 spawn/자식 작업이 관측됐을 수 있다.
@@ -3795,6 +3801,18 @@ impl App {
             Ok(list) => self.workspaces = list,
             Err(e) => tracing::warn!("workspace 목록 조회 실패: {e:#}"),
         }
+        let mut structured_threads = Vec::new();
+        for workspace in &self.workspaces {
+            match self.db.list_structured_threads(&workspace.id, false) {
+                Ok(mut rows) => structured_threads.append(&mut rows),
+                Err(error) => tracing::warn!(
+                    workspace_id = %workspace.id,
+                    "구조화 Codex thread 목록 복구 실패: {error:#}"
+                ),
+            }
+        }
+        self.agent_sessions_ui
+            .import_persisted_threads(structured_threads);
         match self.db.list_persisted_activity_panes() {
             Ok(rows) => {
                 let mut by_workspace: std::collections::HashMap<String, Vec<(String, String)>> =
@@ -3996,6 +4014,10 @@ impl App {
         workspace_id: &str,
         events: &[runtime::RuntimeEvent],
         session_titles: &mut std::collections::HashMap<runtime::SessionId, String>,
+        agent_providers: &std::collections::HashMap<
+            runtime::SessionId,
+            crate::agent_surface::AgentProvider,
+        >,
         catalog: &i18n::Catalog,
     ) {
         for event in events {
@@ -4021,18 +4043,78 @@ impl App {
                 runtime::RuntimeEvent::SessionStatusChanged { session, status } => {
                     if let Some(raw) = session_titles.get(session).cloned() {
                         let title = ui::workspace::display_pane_title(&raw, catalog);
-                        notifications.on_status(workspace_id, *session, *status, &title, catalog);
+                        notifications.on_pty_status(
+                            workspace_id,
+                            *session,
+                            *status,
+                            &title,
+                            agent_providers.get(session).copied(),
+                            catalog,
+                        );
                     }
                 }
                 // regex 없는 agent는 결과가 SessionExited로만 온다 (완료 기준: done/error)
                 runtime::RuntimeEvent::SessionExited { session, exit_code } => {
                     if let Some(raw) = session_titles.get(session).cloned() {
                         let title = ui::workspace::display_pane_title(&raw, catalog);
-                        notifications.on_exit(workspace_id, *session, *exit_code, &title, catalog);
+                        notifications.on_pty_exit(
+                            workspace_id,
+                            *session,
+                            *exit_code,
+                            &title,
+                            agent_providers.get(session).copied(),
+                            catalog,
+                        );
                     }
                     session_titles.remove(session);
                 }
                 _ => {}
+            }
+        }
+    }
+
+    fn persist_agent_session_mutations(&mut self) {
+        use ui::agent_sessions::AgentSessionPersistenceMutation as Mutation;
+        for mutation in self.agent_sessions_ui.drain_persistence_mutations() {
+            let result = match mutation {
+                Mutation::Upsert {
+                    local_session_id,
+                    workspace_id,
+                    thread_id,
+                    title,
+                    cwd,
+                    model,
+                    favorite,
+                    archived,
+                } => self.db.upsert_structured_thread(
+                    &local_session_id,
+                    &workspace_id,
+                    &thread_id,
+                    &title,
+                    &cwd,
+                    model.as_deref(),
+                    favorite,
+                    archived,
+                ),
+                Mutation::SetArchived {
+                    local_session_id,
+                    archived,
+                } => self
+                    .db
+                    .set_structured_thread_archived(&local_session_id, archived)
+                    .and_then(|updated| {
+                        anyhow::ensure!(updated, "보관할 구조화 thread DB 행이 없습니다");
+                        Ok(())
+                    }),
+                Mutation::Delete { local_session_id } => self
+                    .db
+                    .delete_structured_thread(&local_session_id)
+                    .map(|_| ()),
+            };
+            if let Err(error) = result {
+                let message = format!("구조화 Codex thread 저장 실패: {error:#}");
+                tracing::warn!("{message}");
+                self.agent_sessions_ui.report_persistence_error(message);
             }
         }
     }
@@ -4194,6 +4276,7 @@ impl eframe::App for App {
         self.poll_dotenv_sync();
         // 창이 숨겨져도 App Server JSON-RPC 이벤트를 드레인해 structured session 상태를 최신화한다.
         self.agent_sessions_ui.poll();
+        self.persist_agent_session_mutations();
         for notice in self.agent_sessions_ui.drain_status_notices() {
             self.notifications_ui.on_structured_status(
                 &notice.workspace_id,
@@ -4281,6 +4364,7 @@ impl eframe::App for App {
             }
             if !events.is_empty() {
                 Self::record_activity_events(rt, &events);
+                let agent_providers = rt.workspace_ui.agent_providers();
                 // warm workspace도 알림은 만든다 (background 완료/승인 통지) — (ws, session)로
                 // 식별해 워커 간 SessionId 충돌을 피한다. 렌더용으로는 pending에 누적.
                 Self::process_ws_notifications(
@@ -4288,6 +4372,7 @@ impl eframe::App for App {
                     &rt.id,
                     &events,
                     &mut rt.session_titles,
+                    &agent_providers,
                     &self.i18n,
                 );
                 rt.pending_events.extend(events);
@@ -4313,11 +4398,13 @@ impl eframe::App for App {
         let new_events = self.active.events.drain();
         if !new_events.is_empty() {
             Self::record_activity_events(&mut self.active, &new_events);
+            let agent_providers = self.active.workspace_ui.agent_providers();
             Self::process_ws_notifications(
                 &mut self.notifications_ui,
                 &self.active.id,
                 &new_events,
                 &mut self.active.session_titles,
+                &agent_providers,
                 &self.i18n,
             );
             self.active.pending_events.extend(new_events);
@@ -5748,6 +5835,11 @@ impl eframe::App for App {
                     self.agent_sessions_ui.open_session(&session_id);
                 }
             }
+            // Settings는 별도 native viewport다. 대상 전환 후 그대로 앞에 남으면
+            // 이동이 실패한 것처럼 보이므로 닫고 root workspace를 key window로 올린다.
+            self.settings_open = false;
+            ui.ctx()
+                .send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(50));
         }

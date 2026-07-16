@@ -161,6 +161,13 @@ pub trait TerminalBackend {
     fn external_surface(&self) -> Option<TerminalExternalSurfaceHandle>;
 
     fn scroll(&mut self, delta: i32);
+
+    /// 스크롤백에서 맨 아래(라이브 화면)로 복귀한다. 기본 구현은 큰 음수 delta
+    /// (양수 = 과거 방향 관례의 역) — 정확한 백엔드는 재정의한다(alacritty Scroll::Bottom).
+    fn scroll_to_bottom(&mut self) {
+        self.scroll(i32::MIN / 2);
+    }
+
     fn reset(&mut self);
 
     /// 가시성에 따라 scrollback 상한을 조정한다 (설계문서 §14.3).

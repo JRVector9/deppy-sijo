@@ -1192,6 +1192,11 @@ impl Worker {
                     active.scroll(delta);
                 }
             }
+            RuntimeCommand::ScrollToBottom { session } => {
+                if let Some(active) = self.sessions.get_mut(&session) {
+                    active.scroll_to_bottom();
+                }
+            }
             RuntimeCommand::SearchScrollback {
                 session,
                 query,

@@ -347,6 +347,10 @@ impl TerminalBackend for AlacrittyBackend {
         self.term.scroll_display(Scroll::Delta(delta));
     }
 
+    fn scroll_to_bottom(&mut self) {
+        self.term.scroll_display(Scroll::Bottom);
+    }
+
     fn reset(&mut self) {
         // alacritty 0.26에는 reset_state가 없다 — Term 재생성으로 초기화
         let cols = self.term.columns() as u16;

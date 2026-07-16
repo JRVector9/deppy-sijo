@@ -159,6 +159,10 @@ pub enum RuntimeCommand {
         /// 매치 수 상한 — 도달 시 결과가 잘린다(대형 scrollback 방어).
         max_matches: u32,
     },
+    /// 스크롤백에서 맨 아래(라이브 화면)로 복귀 — pane 메뉴/단축키(⌘↓)용.
+    ScrollToBottom {
+        session: SessionId,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
@@ -244,6 +248,10 @@ impl std::fmt::Debug for RuntimeCommand {
                 .debug_struct("Scroll")
                 .field("session", session)
                 .field("delta", delta)
+                .finish(),
+            RuntimeCommand::ScrollToBottom { session } => f
+                .debug_struct("ScrollToBottom")
+                .field("session", session)
                 .finish(),
             RuntimeCommand::KillSession { session } => f
                 .debug_struct("KillSession")

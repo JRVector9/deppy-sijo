@@ -403,6 +403,12 @@ impl Session {
         self.mark_full_dirty();
     }
 
+    /// 스크롤백에서 맨 아래(라이브 화면)로 복귀 (pane 메뉴/단축키).
+    pub fn scroll_to_bottom(&mut self) {
+        self.backend.scroll_to_bottom();
+        self.mark_full_dirty();
+    }
+
     /// 가시성에 따라 scrollback 상한 조정 (§14.3). 전이 시에만 호출할 것.
     pub fn set_visible(&mut self, visible: bool) -> Option<TerminalCacheEvent> {
         let class = if visible {
@@ -764,6 +770,33 @@ mod tests {
         assert_eq!(snapshot.dirty_ranges, vec![CellRange { start: 0, end: 80 }]);
 
         assert!(!session.pump(|_| {}).dirty);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scroll_to_bottom은_라이브_화면으로_복귀한다() {
+        let spec = CommandSpec {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "i=0; while [ $i -lt 60 ]; do echo line-$i; i=$((i+1)); done; sleep 30".into(),
+            ],
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(11), SessionKind::Shell, &spec, 80, 5, 1000)
+                .unwrap();
+        wait(Duration::from_secs(5), || {
+            session.pump(|_| {});
+            (session.cache_footprint().history_lines > 20).then_some(())
+        });
+        session.scroll(10);
+        let scrolled = session.take_snapshot().expect("snapshot");
+        assert!(scrolled.scroll_offset > 0, "{}", scrolled.scroll_offset);
+        session.scroll_to_bottom();
+        let bottom = session.take_snapshot().expect("snapshot");
+        assert_eq!(bottom.scroll_offset, 0);
     }
 
     #[test]

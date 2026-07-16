@@ -3,6 +3,8 @@
 
 use std::sync::Arc;
 
+use egui::emath::GuiRounding as _;
+
 use crate::viewport_snapshot::{CellAttrs, CellRange, CursorShape, TerminalViewportSnapshot};
 
 pub struct RenderOutput {
@@ -304,11 +306,12 @@ pub fn draw(
             for bg in &row_cache.bg_runs {
                 let pos = origin + egui::vec2(bg.start_col as f32 * cell.x, row_y);
                 let width = (bg.end_col - bg.start_col) as f32 * cell.x;
-                painter.rect_filled(
-                    egui::Rect::from_min_size(pos, egui::vec2(width, cell.y)),
-                    0.0,
-                    bg.color,
-                );
+                // 픽셀 경계 스냅 — 소수 좌표 rect가 맞닿으면 feathering이 인접 rect
+                // 사이에 배경이 비치는 이음새(셀 간 여백처럼 보임)를 만든다. min/max를
+                // 각각 반올림하므로 같은 경계를 공유하는 이웃 rect는 틈도 겹침도 없다.
+                let bg_rect = egui::Rect::from_min_size(pos, egui::vec2(width, cell.y))
+                    .round_to_pixels(painter.pixels_per_point());
+                painter.rect_filled(bg_rect, 0.0, bg.color);
             }
             let selection_shapes =
                 paint_selection_row(&painter, snapshot, row, origin, cell, selection);
@@ -597,11 +600,11 @@ fn paint_selection_row(
         if let Some(start_col) = run_start.take() {
             let pos = origin + egui::vec2(start_col as f32 * cell_size.x, row as f32 * cell_size.y);
             let width = (run_end_col - start_col) as f32 * cell_size.x;
-            painter.rect_filled(
-                egui::Rect::from_min_size(pos, egui::vec2(width, cell_size.y)),
-                0.0,
-                selection_bg,
-            );
+            // 픽셀 경계 스냅 — 행마다 rect를 그리므로 소수 좌표면 위/아래 행 사이에
+            // feathering 이음새(셀 간 여백처럼 보임)가 생긴다 (bg_runs와 동일 규약).
+            let run_rect = egui::Rect::from_min_size(pos, egui::vec2(width, cell_size.y))
+                .round_to_pixels(painter.pixels_per_point());
+            painter.rect_filled(run_rect, 0.0, selection_bg);
             *painted += 1;
         }
     };

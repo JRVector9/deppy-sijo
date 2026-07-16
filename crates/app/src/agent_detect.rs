@@ -282,10 +282,41 @@ fn bind_transcript(
 
 /// 저장된 (kind, session_id)로 transcript 파일을 찾는다 — 복원 resume 전에 대상이 아직
 /// 존재하는지 확인해, 이미 지워진 세션에 `--resume`을 던지지 않게 한다.
-pub fn find_transcript(kind: AgentKind, session_id: &str) -> Option<PathBuf> {
-    match kind {
-        AgentKind::Claude => find_claude_transcript(session_id),
-        AgentKind::Codex => find_codex_transcript_by_id(session_id),
+///
+/// codex 확인은 `~/.codex/sessions` 재귀 스캔(최대 4096 stat)이라, 복원 pass가
+/// pane마다 반복하지 않게 스캔 결과를 finder 수명 동안 1회만 수집해 재사용한다 —
+/// 호출측(UI 스레드)이 pane 수 × 스캔 비용을 물지 않는다.
+#[derive(Default)]
+pub struct TranscriptFinder {
+    codex_files: Option<Vec<PathBuf>>,
+}
+
+impl TranscriptFinder {
+    pub fn new() -> Self {
+        Self { codex_files: None }
+    }
+
+    pub fn find(&mut self, kind: AgentKind, session_id: &str) -> Option<PathBuf> {
+        match kind {
+            AgentKind::Claude => find_claude_transcript(session_id),
+            AgentKind::Codex => {
+                let files = self.codex_files.get_or_insert_with(|| {
+                    let mut files = Vec::new();
+                    if let Some(home) = crate::paths::home_dir() {
+                        collect_jsonl(&home.join(".codex/sessions"), &mut files);
+                    }
+                    files
+                });
+                files
+                    .iter()
+                    .find(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.contains(session_id))
+                    })
+                    .cloned()
+            }
+        }
     }
 }
 
@@ -319,18 +350,6 @@ pub fn kind_from_str(s: &str) -> Option<AgentKind> {
         "codex" => Some(AgentKind::Codex),
         _ => None,
     }
-}
-
-/// codex rollout을 session_id(UUID)가 파일명에 든 것으로 찾는다.
-fn find_codex_transcript_by_id(session_id: &str) -> Option<PathBuf> {
-    let root = crate::paths::home_dir()?.join(".codex/sessions");
-    let mut files = Vec::new();
-    collect_jsonl(&root, &mut files);
-    files.into_iter().find(|p| {
-        p.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.contains(session_id))
-    })
 }
 
 /// claude 프로젝트 디렉터리 이름 — cwd의 비영숫자를 전부 '-'로 치환한다

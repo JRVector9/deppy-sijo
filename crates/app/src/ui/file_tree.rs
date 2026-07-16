@@ -299,6 +299,11 @@ impl GitIgnoreCache {
 }
 
 impl GitIgnoreCacheInner {
+    /// 디렉터리별 캐시 항목 상한 — 초과 시 통째로 비운다(다음 조회가 lazy 재구축).
+    /// reset()은 워크스페이스 전환에서만 불리므로, 한 워크스페이스 안에서 대형
+    /// 모노레포를 오래 탐색하면 방문 디렉터리 수만큼 무한히 자라는 것을 막는다.
+    const DIR_RULES_CAP: usize = 4096;
+
     fn rules_for_dir(&mut self, root: &Path, dir: &Path) -> Vec<IgnoreRule> {
         let dir = if dir.starts_with(root) { dir } else { root };
         if let Some(rules) = self.dir_rules.get(dir) {
@@ -315,6 +320,9 @@ impl GitIgnoreCacheInner {
                 current.push(name);
                 rules.extend(load_ignore_file(&current.join(".gitignore"), &current));
             }
+        }
+        if self.dir_rules.len() >= Self::DIR_RULES_CAP {
+            self.dir_rules.clear();
         }
         self.dir_rules.insert(dir.to_path_buf(), rules.clone());
         rules

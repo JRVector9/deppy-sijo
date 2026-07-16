@@ -246,21 +246,30 @@ struct OAuthConnection {
     expires_at_secs: Option<u64>,
 }
 
-/// http 서버의 Bearer 부착 해석 결과 (UI 스레드에서 DB/keyring을 읽어 만든다).
+/// http 서버의 Bearer 바인딩 해석 결과 (UI 스레드에서 DB만 읽어 만든다 — 비밀 없음).
 enum HttpAuth {
     /// 바인딩 없음 — Bearer 없이 요청한다 (401이면 승인 필요 카드).
     None,
     /// 동의 시점 URL ≠ 현재 URL — **부착 거부** (토큰 URL 바인딩). 요청은 Bearer
     /// 없이 나가고, 401이면 재동의(승인 카드) 경로를 탄다.
     UrlMismatch,
-    /// 바인딩 유효 — access 부착 + refresh 재료.
-    Bound {
-        access: Option<SecretString>,
-        state: HttpAuthState,
-    },
+    /// 바인딩 유효 — keyring 해석 재료 (access/DCR secret 조회는 백그라운드 실행
+    /// 스레드의 run_http가 한다 — UI 스레드 KEYRING_SERIAL 경합/프레임 스톨 방지).
+    Bound(HttpAuthBinding),
 }
 
-/// 백그라운드 refresh에 필요한 재료 (스레드로 이동 가능한 소유 데이터).
+/// DB oauth_json에서 온 refresh 재료 (비밀 없음 — 스레드로 이동 가능한 소유 데이터).
+#[derive(Debug)]
+struct HttpAuthBinding {
+    credential_id: String,
+    token_url: String,
+    client_id: String,
+    /// 동의 시점 서버 URL — RFC 8707 resource 고정에 쓴다.
+    server_url: String,
+    expires_at_secs: Option<u64>,
+}
+
+/// 백그라운드 refresh에 필요한 재료 (run_http가 keyring을 읽어 완성한다).
 struct HttpAuthState {
     credential_id: String,
     refresh_params: auth::RefreshParams,
@@ -1567,12 +1576,7 @@ impl ConnectorsUi {
         env_resolver: &dyn McpScopedEnvResolver,
     ) {
         let config = match config_for_invoke(inv, env_resolver) {
-            Ok(config) => config.with_http_auth(
-                db,
-                self.secret_store.as_ref(),
-                &self.redaction,
-                &inv.server_id,
-            ),
+            Ok(config) => config.with_http_auth(db, &inv.server_id),
             Err(e) => {
                 let _ = self.invoke_tx.send((
                     inv.generation,
@@ -1641,12 +1645,7 @@ impl ConnectorsUi {
             return InvokePhase::Failed("정책상 거부됨".to_owned());
         }
         let config = match config_for_invoke(inv, env_resolver) {
-            Ok(config) => config.with_http_auth(
-                db,
-                self.secret_store.as_ref(),
-                &self.redaction,
-                &inv.server_id,
-            ),
+            Ok(config) => config.with_http_auth(db, &inv.server_id),
             Err(e) => return InvokePhase::Failed(format!("{e:#}")),
         };
         let cx = self.exec_context();
@@ -1685,9 +1684,7 @@ impl ConnectorsUi {
         env_resolver: &dyn McpScopedEnvResolver,
     ) {
         let config = match config_for_row(server, env_resolver) {
-            Ok(config) => {
-                config.with_http_auth(db, self.secret_store.as_ref(), &self.redaction, &server.id)
-            }
+            Ok(config) => config.with_http_auth(db, &server.id),
             Err(e) => {
                 self.status
                     .insert(server.id.clone(), ConnStatus::Failed(format!("{e:#}")));
@@ -2082,11 +2079,11 @@ enum ConnectorConfig {
     Http(HttpConnectSpec),
 }
 
-/// http 연결 스펙 (H5): config + Bearer refresh 재료. Debug는 내부가 각각 가린다.
+/// http 연결 스펙 (H5): config + Bearer 바인딩 재료(비밀 없음). Debug는 내부가 각각 가린다.
 #[derive(Debug)]
 struct HttpConnectSpec {
     config: McpHttpServerConfig,
-    auth: Option<HttpAuthState>,
+    auth: Option<HttpAuthBinding>,
 }
 
 impl std::fmt::Debug for HttpAuthState {
@@ -2108,24 +2105,16 @@ struct ExecContext {
 }
 
 impl ConnectorConfig {
-    /// http 스펙에 Bearer/refresh 해석을 부착한다 (UI 스레드 — DB/keyring 접근).
-    /// 동의 시점 URL ≠ 현재 URL이면 부착을 거부한다 (토큰 URL 바인딩, H5).
-    fn with_http_auth(
-        self,
-        db: &Db,
-        store: &dyn SecretStore,
-        redaction: &RedactionService,
-        server_id: &str,
-    ) -> Self {
+    /// http 스펙에 Bearer 바인딩 재료를 부착한다 (UI 스레드 — DB만 접근, keyring은
+    /// run_http가 백그라운드에서 해석). 동의 시점 URL ≠ 현재 URL이면 부착을
+    /// 거부한다 (토큰 URL 바인딩, H5).
+    fn with_http_auth(self, db: &Db, server_id: &str) -> Self {
         match self {
             Self::Stdio(config) => Self::Stdio(config),
             Self::Http(mut spec) => {
-                match resolve_http_auth(db, store, redaction, server_id, &spec.config.url) {
+                match resolve_http_auth(db, server_id, &spec.config.url) {
                     HttpAuth::None | HttpAuth::UrlMismatch => {}
-                    HttpAuth::Bound { access, state } => {
-                        spec.config.bearer = access;
-                        spec.auth = Some(state);
-                    }
+                    HttpAuth::Bound(binding) => spec.auth = Some(binding),
                 }
                 Self::Http(spec)
             }
@@ -2187,10 +2176,40 @@ fn run_http<T>(
     run: impl Fn(&McpHttpServerConfig) -> anyhow::Result<T>,
 ) -> (Result<T, ExecFailure>, Option<RefreshUpdate>) {
     let mut config = spec.config.clone();
+    // keyring 해석(access/DCR secret)은 이 백그라운드 실행 스레드에서만 한다 —
+    // UI 스레드가 프로세스 전역 KEYRING_SERIAL을 잡고(runtime worker와 경합,
+    // 키체인 승인 다이얼로그 시 무기한) 프레임을 멈추지 않게 한다.
+    let auth_state = spec.auth.as_ref().map(|binding| {
+        let access = cx.store.get_secret(&binding.credential_id).ok();
+        if let Some(access) = &access {
+            cx.redaction.register(access);
+        }
+        let client_secret = cx
+            .store
+            .get_secret(&auth::dcr_secret_entry_id(&binding.credential_id))
+            .ok();
+        let expires_at = binding
+            .expires_at_secs
+            .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
+        // access가 유실됐어도 refresh token으로 복구를 시도한다
+        let needs_refresh = access.is_none() || auth::should_refresh(expires_at);
+        config.bearer = access;
+        HttpAuthState {
+            credential_id: binding.credential_id.clone(),
+            refresh_params: auth::RefreshParams {
+                token_url: binding.token_url.clone(),
+                client_id: binding.client_id.clone(),
+                client_secret,
+                // RFC 8707 — refresh 교환에도 대상 리소스를 고정
+                resource: Some(binding.server_url.clone()),
+            },
+            needs_refresh,
+        }
+    });
     let mut update = None;
     let mut refreshed = false;
     // 선제 refresh: 만료 5분 전(H4 REFRESH_MARGIN) 또는 access 유실 시
-    if let Some(auth_state) = &spec.auth
+    if let Some(auth_state) = &auth_state
         && auth_state.needs_refresh
     {
         update = refresh_bearer(cx, auth_state, &mut config);
@@ -2206,7 +2225,7 @@ fn run_http<T>(
     if challenge.is_some()
         && !refreshed
         && config.bearer.is_some()
-        && let Some(auth_state) = &spec.auth
+        && let Some(auth_state) = &auth_state
     {
         update = refresh_bearer(cx, auth_state, &mut config);
         if update.is_some() && config.bearer.is_some() {
@@ -2308,16 +2327,11 @@ fn auth_challenge_of(error: &anyhow::Error) -> Option<AuthChallengeInfo> {
     Some(info)
 }
 
-/// http 서버의 Bearer 부착 해석 (UI 스레드): oauth_json 바인딩 조회 → **토큰 URL
+/// http 서버의 Bearer 바인딩 해석 (UI 스레드): oauth_json 바인딩 조회 → **토큰 URL
 /// 바인딩 검사**(동의 시점 URL ≠ 현재 URL이면 부착 거부 — H3 url 편집 규칙 리셋과
-/// 한 쌍) → keyring access + refresh 재료 준비.
-fn resolve_http_auth(
-    db: &Db,
-    store: &dyn SecretStore,
-    redaction: &RedactionService,
-    server_id: &str,
-    current_url: &str,
-) -> HttpAuth {
+/// 한 쌍). keyring 접근(access/DCR secret)은 하지 않는다 — 백그라운드 실행
+/// 스레드(run_http)가 이 재료로 해석한다.
+fn resolve_http_auth(db: &Db, server_id: &str, current_url: &str) -> HttpAuth {
     let Some((credential_id, connection)) = oauth_binding_for_server(db, server_id) else {
         return HttpAuth::None;
     };
@@ -2328,32 +2342,13 @@ fn resolve_http_auth(
         );
         return HttpAuth::UrlMismatch;
     }
-    let access = store.get_secret(&credential_id).ok();
-    if let Some(access) = &access {
-        redaction.register(access);
-    }
-    let client_secret = store
-        .get_secret(&auth::dcr_secret_entry_id(&credential_id))
-        .ok();
-    let expires_at = connection
-        .expires_at_secs
-        .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
-    // access가 유실됐어도 refresh token으로 복구를 시도한다
-    let needs_refresh = access.is_none() || auth::should_refresh(expires_at);
-    HttpAuth::Bound {
-        access,
-        state: HttpAuthState {
-            credential_id,
-            refresh_params: auth::RefreshParams {
-                token_url: connection.token_endpoint.clone(),
-                client_id: connection.client_id.clone(),
-                client_secret,
-                // RFC 8707 — refresh 교환에도 대상 리소스를 고정
-                resource: Some(connection.server_url.clone()),
-            },
-            needs_refresh,
-        },
-    }
+    HttpAuth::Bound(HttpAuthBinding {
+        credential_id,
+        token_url: connection.token_endpoint,
+        client_id: connection.client_id,
+        server_url: connection.server_url,
+        expires_at_secs: connection.expires_at_secs,
+    })
 }
 
 /// credentials.oauth_json에서 server_id 바인딩을 찾는다 (서버당 1개 유지 규약).
@@ -3805,47 +3800,40 @@ mod tests {
     }
 
     /// 완료 기준: 토큰 URL 바인딩 — 동의 시점 URL과 다르면 Bearer 부착 거부.
+    /// keyring access 해석/needs_refresh 판정은 run_http 소관(선제/반응 refresh 테스트).
     #[test]
     fn url_바인딩_불일치는_bearer_부착_거부() {
         let (db, credential_id) =
             seeded_binding_db("srv-h", "https://a.example/mcp", "https://as.example/token");
-        let store = MemStore::default();
-        store.seed(&credential_id, "at-bound");
-        let redaction = RedactionService::new();
 
-        // 일치 — 부착
-        match resolve_http_auth(&db, &store, &redaction, "srv-h", "https://a.example/mcp") {
-            HttpAuth::Bound { access, state } => {
-                assert_eq!(access.unwrap().expose(), "at-bound");
-                assert_eq!(state.credential_id, credential_id);
-                assert_eq!(state.refresh_params.token_url, "https://as.example/token");
-                assert_eq!(
-                    state.refresh_params.resource.as_deref(),
-                    Some("https://a.example/mcp")
-                );
-                // 만료 미상 + access 보유 → 선제 refresh 없음
-                assert!(!state.needs_refresh);
+        // 일치 — 바인딩 재료 부착 (비밀 없음)
+        match resolve_http_auth(&db, "srv-h", "https://a.example/mcp") {
+            HttpAuth::Bound(binding) => {
+                assert_eq!(binding.credential_id, credential_id);
+                assert_eq!(binding.token_url, "https://as.example/token");
+                assert_eq!(binding.server_url, "https://a.example/mcp");
+                assert_eq!(binding.expires_at_secs, None);
             }
             _ => panic!("Bound가 아님"),
         }
 
         // url 변경(H3 편집 저장 후) — 부착 거부 (재동의 필요)
         assert!(matches!(
-            resolve_http_auth(&db, &store, &redaction, "srv-h", "https://b.example/mcp"),
+            resolve_http_auth(&db, "srv-h", "https://b.example/mcp"),
             HttpAuth::UrlMismatch
         ));
         // 바인딩 없는 서버 — None
         assert!(matches!(
-            resolve_http_auth(&db, &store, &redaction, "srv-없음", "https://a.example/mcp"),
+            resolve_http_auth(&db, "srv-없음", "https://a.example/mcp"),
             HttpAuth::None
         ));
 
-        // with_http_auth 배선: 불일치면 config에 bearer가 붙지 않는다
+        // with_http_auth 배선: 불일치면 바인딩이 붙지 않는다
         let row = http_row("srv-h", Some("https://b.example/mcp"));
         let resolver = MemMcpEnvResolver(std::collections::HashMap::new());
         let config = config_for_row(&row, &resolver)
             .unwrap()
-            .with_http_auth(&db, &store, &redaction, "srv-h");
+            .with_http_auth(&db, "srv-h");
         match config {
             ConnectorConfig::Http(spec) => {
                 assert!(spec.config.bearer.is_none(), "부착 거부돼야 함");
@@ -3885,15 +3873,13 @@ mod tests {
                 url: mcp_url.clone(),
                 bearer: Some(SecretString::new("at-old".to_owned())),
             },
-            auth: Some(HttpAuthState {
+            auth: Some(HttpAuthBinding {
                 credential_id: "cred-h5".to_owned(),
-                refresh_params: auth::RefreshParams {
-                    token_url: server.url("/token"),
-                    client_id: "cid-1".to_owned(),
-                    client_secret: None,
-                    resource: Some(mcp_url.clone()),
-                },
-                needs_refresh: false, // 만료 메타 없음 — 선제 아님, 401 반응 경로
+                token_url: server.url("/token"),
+                client_id: "cid-1".to_owned(),
+                server_url: mcp_url.clone(),
+                // 만료 메타 없음 + store에 access 있음 → 선제 아님, 401 반응 경로
+                expires_at_secs: None,
             }),
         };
 
@@ -3944,15 +3930,13 @@ mod tests {
                 url: mcp_url.clone(),
                 bearer: Some(SecretString::new("at-stale".to_owned())),
             },
-            auth: Some(HttpAuthState {
+            auth: Some(HttpAuthBinding {
                 credential_id: "cred-h5".to_owned(),
-                refresh_params: auth::RefreshParams {
-                    token_url: server.url("/token"),
-                    client_id: "cid-1".to_owned(),
-                    client_secret: None,
-                    resource: Some(mcp_url.clone()),
-                },
-                needs_refresh: true, // 만료 5분 전 판정 결과
+                token_url: server.url("/token"),
+                client_id: "cid-1".to_owned(),
+                server_url: mcp_url.clone(),
+                // 과거 만료 시각 → run_http가 needs_refresh=true로 판정(선제 refresh)
+                expires_at_secs: Some(1),
             }),
         };
 

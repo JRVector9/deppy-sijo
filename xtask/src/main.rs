@@ -237,12 +237,6 @@ const SECRET_STORE_ALLOW: &[BoundaryAllow] = &[
         count: 1,
         reason: "H5 connector ExecContext secret store handle",
     },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "store: &dyn SecretStore,",
-        count: 2,
-        reason: "H5 connector Bearer/refresh resolve signature",
-    },
 ];
 
 // H5: 저장된 access/DCR secret을 붙여 Bearer/refresh를 해석한다 (deferred 경계).
@@ -250,8 +244,8 @@ const GET_SECRET_ALLOW: &[BoundaryAllow] = &[
     BoundaryAllow {
         path: "crates/app/src/ui/connectors.rs",
         snippet: ".get_secret(&auth::dcr_secret_entry_id(&credential_id))",
-        count: 2,
-        reason: "H5 connector DCR client_secret read (stored-client + resolve)",
+        count: 1,
+        reason: "H5 connector DCR client_secret read (stored-client)",
     },
     BoundaryAllow {
         path: "crates/app/src/ui/connectors.rs",
@@ -259,11 +253,19 @@ const GET_SECRET_ALLOW: &[BoundaryAllow] = &[
         count: 1,
         reason: "H5 connector single-flight refresh re-read",
     },
+    // Bearer/DCR 해석은 run_http(백그라운드 실행 스레드)로 이동 — UI 스레드가
+    // KEYRING_SERIAL을 잡지 않는다 (2026-07-16). 파일은 같아 예외로 남는다.
     BoundaryAllow {
         path: "crates/app/src/ui/connectors.rs",
-        snippet: "let access = store.get_secret(&credential_id).ok();",
+        snippet: "let access = cx.store.get_secret(&binding.credential_id).ok();",
         count: 1,
-        reason: "H5 connector access token attach",
+        reason: "H5 connector access token attach (run_http background)",
+    },
+    BoundaryAllow {
+        path: "crates/app/src/ui/connectors.rs",
+        snippet: ".get_secret(&auth::dcr_secret_entry_id(&binding.credential_id))",
+        count: 1,
+        reason: "H5 connector DCR client_secret read (run_http background)",
     },
 ];
 

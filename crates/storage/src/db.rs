@@ -1126,18 +1126,26 @@ impl Db {
         Ok(())
     }
 
+    /// 워크스페이스당 조회 상한 — 유일한 프로덕션 소비자(UI 스레드 목록 import)가
+    /// refresh_workspaces마다 전량 로드해 AgentSession placeholder로 상주시키므로,
+    /// 수개월치 스레드가 무제한 쌓이지 않게 자른다. 정렬이 즐겨찾기 우선·최신순이라
+    /// 잘리는 것은 가장 오래된 비즐겨찾기 스레드다 (행 자체는 DB에 남는다).
+    const STRUCTURED_THREADS_LIST_CAP: usize = 500;
+
     pub fn list_structured_threads(
         &self,
         workspace_id: &str,
         include_archived: bool,
     ) -> anyhow::Result<Vec<StructuredThreadRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT local_session_id, workspace_id, thread_id, title, cwd, model,
                     favorite, archived, created_at, updated_at
                FROM structured_threads
               WHERE workspace_id = ?1 AND (?2 = 1 OR archived = 0)
-              ORDER BY favorite DESC, updated_at DESC, local_session_id",
-        )?;
+              ORDER BY favorite DESC, updated_at DESC, local_session_id
+              LIMIT {}",
+            Self::STRUCTURED_THREADS_LIST_CAP
+        ))?;
         let rows = stmt.query_map((workspace_id, include_archived as i64), |row| {
             Ok(StructuredThreadRow {
                 local_session_id: row.get(0)?,

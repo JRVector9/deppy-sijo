@@ -143,6 +143,10 @@ impl DotenvSyncWorker {
         std::thread::Builder::new()
             .name("dotenv-sync".to_owned())
             .spawn(move || {
+                // 연결은 최초 필요 시 한 번 열어 재사용한다 (EnvProjectRowsWorker 관례) —
+                // job마다 열면 PRAGMA/마이그레이션 버전 점검이 매번 반복된다. 열기 실패는
+                // 캐시하지 않아 다음 job이 재시도한다.
+                let mut cached_db: Option<Db> = None;
                 while let Ok(job) = jobs.recv() {
                     // 기준점은 파일을 읽기 직전에 worker에서 캡처한다. 읽는 도중 파일이 다시
                     // 바뀌면 이 옛 기준점과 다음 점검이 달라져 안전하게 한 번 더 동기화된다.
@@ -150,14 +154,18 @@ impl DotenvSyncWorker {
                     let result = if !job.force && job.previous_state == Some(baseline) {
                         Ok(None)
                     } else if let Some(root) = job.root.as_deref() {
-                        Db::open(&db_path).and_then(|mut db| {
+                        match &mut cached_db {
+                            Some(db) => Ok(db),
+                            slot @ None => Db::open(&db_path).map(|db| slot.insert(db)),
+                        }
+                        .and_then(|db| {
                             // force 동기화(시작·경로 지정·수동 리프레시)에서만 레거시
                             // DB-전용 profile 변수를 .env로 이전한다(.env 일원화 E1).
                             // 2초 주기 폴링의 fast-path에는 DB 조회를 더하지 않는다.
                             if job.force
                                 && let Err(e) =
                                     crate::dotenv_sync::migrate_legacy_profiles_to_dotenv(
-                                        &mut db,
+                                        db,
                                         &KeyringSecretStore,
                                         &job.workspace_id,
                                         root,
@@ -166,7 +174,7 @@ impl DotenvSyncWorker {
                                 tracing::warn!("레거시 env profile 이전 실패: {e:#}");
                             }
                             crate::dotenv_sync::sync_workspace_dotenv(
-                                &db,
+                                &*db,
                                 &KeyringSecretStore,
                                 &redaction,
                                 &job.workspace_id,
@@ -174,7 +182,7 @@ impl DotenvSyncWorker {
                             )
                             .and_then(|report| {
                                 let (env_plain, env_secrets) = if report.is_some() {
-                                    load_dotenv_default_env(&db, &job.workspace_id)?
+                                    load_dotenv_default_env(&*db, &job.workspace_id)?
                                 } else {
                                     (Vec::new(), Vec::new())
                                 };
@@ -2163,6 +2171,9 @@ impl App {
         if self.config.ui.auto_resume_agents
             && let Some(mux) = &mux
         {
+            // codex transcript 존재확인은 세션 디렉터리 스캔이라, 복원 pane마다
+            // 반복하지 않게 finder가 1회 스캔을 이 pass 전체에 재사용한다.
+            let mut transcript_finder = crate::agent_detect::TranscriptFinder::new();
             for pane in mux.tabs.iter().flat_map(|t| &t.panes) {
                 let pane_key = pane.id.0.clone();
                 let Some(saved) = self.restore_agents.get(&pane_key) else {
@@ -2176,8 +2187,7 @@ impl App {
                 }
                 // 대상 transcript가 아직 존재하는지 확인 — 지워진 세션에 --resume 안 던짐.
                 let kind = crate::agent_detect::kind_from_str(&saved.kind);
-                let transcript =
-                    kind.and_then(|k| crate::agent_detect::find_transcript(k, &saved.session_id));
+                let transcript = kind.and_then(|k| transcript_finder.find(k, &saved.session_id));
                 let Some(transcript) = transcript else {
                     let _ = self.db.delete_agent_session(&self.active.id, &pane_key);
                     self.resumed_panes.insert(pane_key);

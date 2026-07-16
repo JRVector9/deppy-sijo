@@ -812,6 +812,13 @@ fn broadcast(shared: &Arc<PushShared>, note: &Notification) -> BroadcastOutcome 
     let payload = note.payload();
     let mut changed = false;
     for sub in subs {
+        // shutdown 중이면 잔여 구독 발송을 중단한다 — stop_and_join(앱 종료, UI 스레드)이
+        // 구독 수 × HTTP 타임아웃만큼 기다리지 않게 한다. 남는 대기는 진행 중이던
+        // POST 1건의 타임아웃뿐이다. 미발송분은 in-memory 마킹과 함께 사라지므로
+        // 재시작 후 같은 pending이 다시 알림된다.
+        if shared.stop.load(Ordering::SeqCst) {
+            break;
+        }
         match deliver(shared, &sub, payload.as_bytes()) {
             Delivery::Ok => {
                 outcome.delivered += 1;
@@ -874,6 +881,10 @@ fn deliver(
 
     // 재시도 1회 — 폭주 방지. 410/404는 재시도 없이 즉시 Gone.
     for attempt in 0..2 {
+        // shutdown 중엔 재시도를 생략한다 (stop_and_join 대기 단축).
+        if attempt > 0 && shared.stop.load(Ordering::SeqCst) {
+            return Delivery::Failed;
+        }
         shared.sent_count.fetch_add(1, Ordering::SeqCst);
         match shared.transport.post(
             &sub.endpoint,

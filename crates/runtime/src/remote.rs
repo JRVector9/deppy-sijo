@@ -657,6 +657,11 @@ struct ConnEntry {
 type ConnHandler =
     Arc<dyn Fn(TcpStream, Arc<InProcessRuntimeClient>, Arc<AtomicBool>) + Send + Sync>;
 
+/// 동시 접속 상한 — 접속마다 전용 스레드(+TLS는 2ms poll 루프)가 붙으므로, 재접속
+/// 폭주나 토큰 추측 시도가 스레드를 무한 증식시키지 않게 한다 (web-remote
+/// MAX_CONNECTIONS 관례). 통상 attach 클라이언트는 0~1개다.
+const MAX_REMOTE_CONNECTIONS: usize = 8;
+
 /// accept 루프를 스레드로 띄운다 — 접속마다 스레드를 붙이고, 등록/self-remove를 관리한다.
 /// 평문과 TLS가 이 골격을 공유하고 접속 처리 로직만 `handler`로 주입한다(§2.4 "IO 경계 1회 재편").
 /// `connections` 등록과 stop 재확인을 같은 락 안에서 하므로 shutdown drain과 race 창이 없다.
@@ -692,6 +697,14 @@ fn spawn_accept(
                         let mut conns = connections.lock().expect("connections lock");
                         if stop.load(Ordering::SeqCst) {
                             drop(conns);
+                            let _ = stream.shutdown(Shutdown::Both);
+                            continue;
+                        }
+                        if conns.len() >= MAX_REMOTE_CONNECTIONS {
+                            drop(conns);
+                            tracing::warn!(
+                                "remote 동시 접속 상한({MAX_REMOTE_CONNECTIONS}) 초과 — 새 접속 거부"
+                            );
                             let _ = stream.shutdown(Shutdown::Both);
                             continue;
                         }

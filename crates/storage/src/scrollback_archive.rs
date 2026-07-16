@@ -96,12 +96,8 @@ pub fn write(
     let bytes = encoder.finish().context("scrollback 압축 마감 실패")?;
 
     // 원자 기록 — 부분 파일이 노출되지 않는다 (프로젝트 관례: tmp+rename)
-    let tmp = path.with_extension("zlib.tmp");
-    std::fs::write(&tmp, &bytes).with_context(|| format!("tmp 기록 실패: {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("아카이브 rename 실패: {}", path.display())
-    })?;
+    deppy_core::fs::atomic_write(&path, &bytes)
+        .with_context(|| format!("아카이브 원자 기록 실패: {}", path.display()))?;
     Ok(bytes.len() as u64)
 }
 
@@ -261,7 +257,12 @@ mod tests {
         assert_eq!(read_meta, meta());
         assert_eq!(read_dump, dump);
         // tmp 잔재 없음 (원자 기록)
-        assert!(!root.join("uuid-1").join("scrollback.zlib.tmp").exists());
+        assert!(
+            !root
+                .join("uuid-1")
+                .join("scrollback.zlib.deppytmp")
+                .exists()
+        );
     }
 
     #[test]

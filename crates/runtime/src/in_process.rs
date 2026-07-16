@@ -143,10 +143,7 @@ impl InProcessRuntimeClient {
         // 세션 id(u64)는 실행마다 1부터 다시 시작한다 — 이전 실행 로그에
         // append되지 않도록 실행(run) 단위 하위 디렉터리로 격리한다.
         // (영속 세션 id 도입은 PR-14)
-        let run_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
+        let run_ms = deppy_core::time::unix_ms();
         // 같은 ms의 다중 인스턴스/테스트 충돌 방지: pid + 프로세스 내 카운터
         static RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

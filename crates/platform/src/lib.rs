@@ -70,19 +70,20 @@ pub fn open_path(path: &std::path::Path) {
     #[cfg(not(target_os = "macos"))]
     const OPENER: &str = "xdg-open";
     let path = path.to_path_buf();
-    std::thread::spawn(move || {
-        match std::process::Command::new(OPENER).arg(&path).status() {
+    std::thread::spawn(
+        move || match std::process::Command::new(OPENER).arg(&path).status() {
             Ok(status) if !status.success() => {
                 tracing::warn!("외부 열기 실패: {OPENER} {status} ({})", path.display());
             }
             Err(e) => tracing::warn!("외부 열기 실패: {e} ({})", path.display()),
             Ok(_) => {}
-        }
-    });
+        },
+    );
 }
 
 /// 프로세스의 현재 작업 디렉터리 (lsof 1회). 터미널 상대경로 더블클릭 해석용 —
 /// 사용자 클릭 시점의 일회성 조회라 스폰 비용(수십 ms)을 감수한다.
+/// -Fn: 'n' 접두 라인이 경로 — 여러 줄이면 마지막 n 라인(agent_detect 실증 관례).
 pub fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
     let output = std::process::Command::new("lsof")
         .args(["-a", "-d", "cwd", "-p", &pid.to_string(), "-Fn"])
@@ -90,7 +91,9 @@ pub fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
         .ok()?;
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .find_map(|line| line.strip_prefix('n').map(std::path::PathBuf::from))
+        .filter_map(|line| line.strip_prefix('n'))
+        .next_back()
+        .map(std::path::PathBuf::from)
 }
 
 #[cfg(all(test, target_os = "macos"))]

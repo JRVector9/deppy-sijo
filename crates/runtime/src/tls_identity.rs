@@ -17,6 +17,7 @@
 use std::path::Path;
 
 use anyhow::Context;
+use secret::hex::{from_hex, to_hex};
 use secret::{SecretStore, SecretString};
 use sha2::{Digest, Sha256};
 
@@ -115,12 +116,9 @@ pub fn get_or_create_identity(
             .with_context(|| format!("cert 디렉터리 생성 실패: {}", parent.display()))?;
     }
     // tmp+rename 원자 쓰기 — 중단/디스크 오류로 빈/부분 DER가 cert_path에 남아
-    // fast-path(is_file)가 손상 cert를 로드하는 일이 없게 한다 (codex P2, config 저장 관례).
-    let tmp = cert_path.with_extension("crt.tmp");
-    std::fs::write(&tmp, &cert_der)
-        .with_context(|| format!("cert 임시 쓰기 실패: {}", tmp.display()))?;
-    std::fs::rename(&tmp, cert_path)
-        .with_context(|| format!("cert rename 실패: {}", cert_path.display()))?;
+    // fast-path(is_file)가 손상 cert를 로드하는 일이 없게 한다 (codex P2).
+    deppy_core::fs::atomic_write(cert_path, &cert_der)
+        .with_context(|| format!("cert 원자 기록 실패: {}", cert_path.display()))?;
 
     Ok(TlsIdentity { cert_der, key_der })
 }
@@ -133,32 +131,6 @@ fn load_identity(store: &dyn SecretStore, cert_path: &Path) -> anyhow::Result<Tl
     let cert_der = std::fs::read(cert_path)
         .with_context(|| format!("cert 읽기 실패: {}", cert_path.display()))?;
     Ok(TlsIdentity { cert_der, key_der })
-}
-
-fn to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn from_hex(s: &str) -> anyhow::Result<Vec<u8>> {
-    // 바이트 기반 파싱 — keyring 값이 손상돼 비ASCII가 섞여 있어도 str 슬라이스 경계
-    // 패닉 없이 Err로 보고한다 (codex P2).
-    let bytes = s.as_bytes();
-    anyhow::ensure!(bytes.len().is_multiple_of(2), "hex 길이가 홀수");
-    bytes
-        .chunks_exact(2)
-        .map(|pair| {
-            let hi = hex_digit(pair[0])?;
-            let lo = hex_digit(pair[1])?;
-            Ok(hi << 4 | lo)
-        })
-        .collect()
-}
-
-fn hex_digit(byte: u8) -> anyhow::Result<u8> {
-    (byte as char)
-        .to_digit(16)
-        .map(|d| d as u8)
-        .with_context(|| format!("hex가 아닌 바이트: 0x{byte:02x}"))
 }
 
 #[cfg(test)]

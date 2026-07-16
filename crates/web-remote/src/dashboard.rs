@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use runtime::{
     ProcessResourceSnapshot, RuntimeCommand, RuntimeEvent, RuntimeEventReceiver, SessionId,
@@ -889,7 +889,7 @@ impl DashboardHandle {
     /// 승인 결정을 DB에 되쓴다(first-writer-wins — 이미 해소된 id는 조용한 no-op). 이후
     /// 즉시 재폴링을 강제해 목록에서 사라진 걸 빠르게 반영한다.
     pub fn resolve(&self, id: &str, allowed: bool, remember: bool) {
-        let now = epoch_secs();
+        let now = deppy_core::time::unix_secs_i64();
         // 재폴링 강제 플래그만 inner에서 세우고 즉시 놓는다 — DB 되쓰기(busy_timeout 최대 5s)를
         // inner 락 밖에서 수행해 브리지의 이벤트 drain·접속 등록이 막히지 않게 한다(P3 리뷰).
         {
@@ -995,14 +995,6 @@ impl DashboardHandle {
         }
         self.shared.cvar.notify_all();
     }
-}
-
-/// 현재 epoch 초.
-fn epoch_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// 승인 행을 표시 뷰로. `arguments_preview`는 proxy가 이미 redact한 텍스트다.

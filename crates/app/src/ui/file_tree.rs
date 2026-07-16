@@ -409,7 +409,7 @@ fn load_global_ignore_rules(root: &Path) -> Vec<IgnoreRule> {
 
 fn global_ignore_files() -> Vec<PathBuf> {
     let mut files = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::paths::home_dir() {
         if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
             files.push(xdg.join("git/ignore"));
         } else {
@@ -880,7 +880,7 @@ impl FileTreeUi {
         let Some(root) = &self.root else {
             return Vec::new();
         };
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = crate::paths::home_dir();
         // 루트→조상 순으로 모은 뒤 뒤집는다. HOME에 도달하면 "~"로 끝맺는다.
         let mut rev: Vec<(String, PathBuf)> = Vec::new();
         let mut cur: &Path = root.as_path();

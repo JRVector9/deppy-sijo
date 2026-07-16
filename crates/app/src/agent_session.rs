@@ -267,6 +267,11 @@ impl AgentItem {
         item.summary = limit_text(item.summary);
         item.output = limit_text(item.output);
         item.detail = item.detail.map(limit_text);
+        // 상세 패널용 원본 diff도 같은 상한 — 파생본(output)만 캡하고 원본을 무캡
+        // 보존하면 대형 파일 변경이 세션 수명 내내 통째로 상주한다 (2026-07-16 리뷰).
+        for change in &mut item.files {
+            change.diff = change.diff.take().map(limit_text);
+        }
         Some(item)
     }
 

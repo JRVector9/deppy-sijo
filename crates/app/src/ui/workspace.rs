@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use runtime::{
     LayoutNode, MuxSnapshot, RuntimeClient, RuntimeCommand, RuntimeEvent, SessionId, SessionStatus,
@@ -12,7 +12,21 @@ use runtime::{
 };
 use terminal::{TerminalViewportSnapshot, input_mapper, renderer_egui};
 
+use super::format_bytes;
 use crate::config::TerminalConfig;
+
+/// 경로 해석 캐시 TTL (path_click_cache · session_cwd_cache 공통).
+const PATH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 세션 셸 cwd 캐시 항목 — hover 경로 해석용. lsof(수십 ms)는 백그라운드 스레드가
+/// 채우고 UI 스레드는 stale 값(있으면)으로 즉시 응답한다.
+struct CwdCacheEntry {
+    cwd: Option<std::path::PathBuf>,
+    fetched_at: std::time::Instant,
+    /// 백그라운드 재해석 진행 중 — 중복 spawn을 막는다. lsof는 항상 종료하므로
+    /// 완료 기록이 반드시 이 플래그를 내린다.
+    inflight: bool,
+}
 
 pub struct WorkspaceUi {
     mux: Option<Arc<MuxSnapshot>>,
@@ -34,9 +48,11 @@ pub struct WorkspaceUi {
     /// 경로 해석 캐시: (세션, 단어) → 해석 결과. hover가 매 프레임 도는 경로라
     /// 같은 단어의 재해석(metadata/lsof)을 막는다. TTL PATH_CACHE_TTL.
     path_click_cache: Option<(SessionId, String, Option<PathClick>, std::time::Instant)>,
-    /// 세션 셸 cwd 캐시 — lsof는 수십 ms라 hover 단어가 바뀔 때마다 돌리면 UI가
-    /// 버벅인다. TTL PATH_CACHE_TTL, 우리가 cd를 보낼 때 즉시 무효화.
-    session_cwd_cache: Option<(SessionId, std::path::PathBuf, std::time::Instant)>,
+    /// 세션별 셸 cwd 캐시 — lsof는 수십 ms라 UI 스레드에서 돌리면 hover 중 프레임이
+    /// 멈춘다. 만료 시 백그라운드 스레드가 재해석하고 그동안 stale 값을 쓴다
+    /// (stale-while-revalidate). 세션별 항목이라 분할 pane 간 hover 이동이 서로
+    /// 캐시를 밀어내지 않는다. 우리가 cd를 보낼 때 해당 세션 항목을 즉시 무효화.
+    session_cwd_cache: Arc<Mutex<HashMap<SessionId, CwdCacheEntry>>>,
     /// 직전 폴더 클릭 (경로, 시각) — 더블클릭이 clicked를 두 번 발화시켜 같은 cd가
     /// 연속 주입되는 것을 막는다.
     last_dir_click: Option<(std::path::PathBuf, std::time::Instant)>,
@@ -199,7 +215,7 @@ impl WorkspaceUi {
             ui_scale: 1.0,
             session_pids: HashMap::new(),
             path_click_cache: None,
-            session_cwd_cache: None,
+            session_cwd_cache: Arc::new(Mutex::new(HashMap::new())),
             last_dir_click: None,
             last_text_paste: None,
             last_native_paste: None,
@@ -502,12 +518,22 @@ impl WorkspaceUi {
     pub fn set_session_pids(&mut self, pids: &[(SessionId, u32)]) {
         self.session_pids.clear();
         self.session_pids.extend(pids.iter().copied());
+        // 죽은 세션의 cwd 캐시 정리 — pid 스냅샷이 최신 live 집합이다.
+        self.session_cwd_cache
+            .lock()
+            .expect("cwd cache lock")
+            .retain(|session, _| self.session_pids.contains_key(session));
     }
 
     /// (세션, 단어) 캐시를 거친 경로 해석. hover가 매 프레임 부르므로 같은 단어는
-    /// 재해석하지 않고, 셸 cwd(lsof)도 세션당 TTL 캐시로 조회를 묶는다.
-    fn resolve_path_cached(&mut self, session: SessionId, word: &str) -> Option<PathClick> {
-        const PATH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+    /// 재해석하지 않고, 셸 cwd(lsof)는 세션별 백그라운드 캐시로 조회한다 — hover
+    /// 경로는 UI 스레드에서 lsof를 직접 돌리지 않는다(프레임 스톨 방지, 2026-07-16).
+    fn resolve_path_cached(
+        &mut self,
+        ctx: &egui::Context,
+        session: SessionId,
+        word: &str,
+    ) -> Option<PathClick> {
         if let Some((s, w, res, at)) = &self.path_click_cache
             && *s == session
             && w == word
@@ -515,31 +541,100 @@ impl WorkspaceUi {
         {
             return res.clone();
         }
-        let cwd = match &self.session_cwd_cache {
-            Some((s, path, at)) if *s == session && at.elapsed() < PATH_CACHE_TTL => {
-                Some(path.clone())
-            }
-            _ => {
-                let cwd = self
-                    .session_pids
-                    .get(&session)
-                    .copied()
-                    .and_then(platform::process_cwd);
-                if let Some(cwd) = &cwd {
-                    self.session_cwd_cache =
-                        Some((session, cwd.clone(), std::time::Instant::now()));
-                }
-                cwd
-            }
-        };
+        let (cwd, cwd_pending) = self.hover_cwd(ctx, session);
         let res = resolve_path_click(word, cwd.as_deref());
-        self.path_click_cache = Some((
-            session,
-            word.to_owned(),
-            res.clone(),
-            std::time::Instant::now(),
-        ));
+        // cwd가 아직 오는 중이면 부정 결과를 굳히지 않는다 — 도착 즉시 다음 프레임에 재해석.
+        if !cwd_pending {
+            self.path_click_cache = Some((
+                session,
+                word.to_owned(),
+                res.clone(),
+                std::time::Instant::now(),
+            ));
+        }
         res
+    }
+
+    /// hover용 셸 cwd — 캐시가 신선하면 그 값을, 만료/부재면 백그라운드 재해석을 걸고
+    /// stale 값(있으면)을 돌려준다. 반환 (cwd, pending): pending은 "값이 아직 없어
+    /// 해석 대기 중"이라는 뜻이다.
+    fn hover_cwd(
+        &mut self,
+        ctx: &egui::Context,
+        session: SessionId,
+    ) -> (Option<std::path::PathBuf>, bool) {
+        let Some(pid) = self.session_pids.get(&session).copied() else {
+            return (None, false);
+        };
+        let mut cache = self.session_cwd_cache.lock().expect("cwd cache lock");
+        if let Some(entry) = cache.get(&session)
+            && (entry.inflight || entry.fetched_at.elapsed() < PATH_CACHE_TTL)
+        {
+            return (entry.cwd.clone(), entry.cwd.is_none() && entry.inflight);
+        }
+        // 만료/부재 — 백그라운드 재해석을 걸고 stale 값으로 즉시 응답한다.
+        let stale = cache.get(&session).and_then(|entry| entry.cwd.clone());
+        cache.insert(
+            session,
+            CwdCacheEntry {
+                cwd: stale.clone(),
+                fetched_at: std::time::Instant::now(),
+                inflight: true,
+            },
+        );
+        drop(cache);
+        let shared = Arc::clone(&self.session_cwd_cache);
+        let ctx = ctx.clone();
+        std::thread::Builder::new()
+            .name("cwd-resolve".to_owned())
+            .spawn(move || {
+                let cwd = platform::process_cwd(pid);
+                shared.lock().expect("cwd cache lock").insert(
+                    session,
+                    CwdCacheEntry {
+                        cwd,
+                        fetched_at: std::time::Instant::now(),
+                        inflight: false,
+                    },
+                );
+                // 마우스가 정지 상태면 자연 repaint가 없다 — 결과가 다음 프레임에
+                // 커서/메뉴에 반영되게 명시 요청.
+                ctx.request_repaint();
+            })
+            .expect("cwd resolve thread spawn");
+        let pending = stale.is_none();
+        (stale, pending)
+    }
+
+    /// 클릭 실행용 신선 해석 — hover 캐시를 거치지 않고 lsof를 동기 1회 실행한다
+    /// (사용자 클릭 시점의 일회성 조회라 수십 ms를 감수 — platform::process_cwd 관례).
+    /// 결과는 hover 캐시에도 반영한다.
+    fn resolve_path_fresh(&mut self, session: SessionId, word: &str) -> Option<PathClick> {
+        let cwd = self
+            .session_pids
+            .get(&session)
+            .copied()
+            .and_then(platform::process_cwd);
+        self.session_cwd_cache
+            .lock()
+            .expect("cwd cache lock")
+            .insert(
+                session,
+                CwdCacheEntry {
+                    cwd: cwd.clone(),
+                    fetched_at: std::time::Instant::now(),
+                    inflight: false,
+                },
+            );
+        resolve_path_click(word, cwd.as_deref())
+    }
+
+    /// cd 주입 등으로 셸 cwd가 바뀌었을 때 해당 세션의 cwd 캐시를 버린다.
+    fn invalidate_session_cwd(&self, session: SessionId) {
+        self.session_cwd_cache
+            .lock()
+            .expect("cwd cache lock")
+            .remove(&session);
     }
 
     /// 세션별 현재 작업 폴더를 세팅한다(App이 매 프레임, 감지 워커 lsof 결과).
@@ -1428,7 +1523,7 @@ impl WorkspaceUi {
             {
                 let word = renderer_egui::selection_text(&snapshot, s, e);
                 if matches!(
-                    self.resolve_path_cached(session, &word),
+                    self.resolve_path_cached(ui.ctx(), session, &word),
                     Some(PathClick::Dir(_))
                 ) {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1439,9 +1534,8 @@ impl WorkspaceUi {
                         // 클릭은 캐시를 거치지 않는다 — 사용자가 방금 손으로 cd를
                         // 타이핑했으면 2s TTL 캐시가 옛 cwd 기준 경로를 줄 수 있다
                         // (codex 리뷰 MEDIUM). hover 커서는 캐시(성능), 실행은 신선 해석.
-                        self.session_cwd_cache = None;
                         self.path_click_cache = None;
-                        if let Some(PathClick::Dir(path)) = self.resolve_path_cached(session, &word)
+                        if let Some(PathClick::Dir(path)) = self.resolve_path_fresh(session, &word)
                         {
                             // 더블클릭은 clicked를 두 번 발화 — 같은 경로 연속 cd를 막는다.
                             let duplicate = self.last_dir_click.as_ref().is_some_and(|(p, at)| {
@@ -1459,7 +1553,7 @@ impl WorkspaceUi {
                                 );
                                 self.send(client, RuntimeCommand::WriteInput { session, bytes });
                                 // cd로 셸 cwd가 바뀐다 — 방금 만든 해석 캐시도 무효.
-                                self.session_cwd_cache = None;
+                                self.invalidate_session_cwd(session);
                                 self.path_click_cache = None;
                             }
                         }
@@ -1966,7 +2060,7 @@ impl WorkspaceUi {
                     && !text.trim().is_empty()
                     && !text.contains('\n')
                     && let Some(PathClick::OpenFile(path)) =
-                        self.resolve_path_cached(sel_session, text.trim())
+                        self.resolve_path_cached(ui.ctx(), sel_session, text.trim())
                 {
                     let name = path
                         .file_name()
@@ -2696,7 +2790,7 @@ fn resolve_path_click(word: &str, cwd: Option<&Path>) -> Option<PathClick> {
     }
     for cand in candidates {
         let path = if let Some(rest) = cand.strip_prefix("~/") {
-            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(rest))
+            crate::paths::home_dir().map(|home| home.join(rest))
         } else if cand.starts_with('/') {
             Some(std::path::PathBuf::from(cand))
         } else {
@@ -3015,15 +3109,6 @@ fn visible_mux_sessions(snapshot: &MuxSnapshot) -> HashSet<SessionId> {
         .flat_map(|tab| &tab.panes)
         .filter_map(|pane| pane.session_id)
         .collect()
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const MIB: u64 = 1024 * 1024;
-    if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 #[cfg(test)]

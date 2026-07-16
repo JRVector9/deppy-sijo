@@ -323,8 +323,7 @@ pub fn kind_from_str(s: &str) -> Option<AgentKind> {
 
 /// codex rollout을 session_id(UUID)가 파일명에 든 것으로 찾는다.
 fn find_codex_transcript_by_id(session_id: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let root = Path::new(&home).join(".codex/sessions");
+    let root = crate::paths::home_dir()?.join(".codex/sessions");
     let mut files = Vec::new();
     collect_jsonl(&root, &mut files);
     files.into_iter().find(|p| {
@@ -345,8 +344,7 @@ fn claude_project_dir_escape(cwd: &str) -> String {
 /// cwd 기준으로 claude transcript를 찾는다 — 그 cwd의 프로젝트 디렉터리에서 최신 mtime
 /// jsonl(활성 대화가 append 중인 것). 파일명(stem) = 세션ID.
 fn find_claude_transcript_by_cwd(cwd: &str) -> Option<(String, PathBuf)> {
-    let home = std::env::var_os("HOME")?;
-    let dir = Path::new(&home)
+    let dir = crate::paths::home_dir()?
         .join(".claude/projects")
         .join(claude_project_dir_escape(cwd));
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
@@ -367,8 +365,7 @@ fn find_claude_transcript_by_cwd(cwd: &str) -> Option<(String, PathBuf)> {
 
 /// 세션ID로 claude transcript를 찾는다 (`~/.claude/projects/*/<sid>.jsonl`).
 fn find_claude_transcript(session_id: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let projects = Path::new(&home).join(".claude/projects");
+    let projects = crate::paths::home_dir()?.join(".claude/projects");
     for proj in std::fs::read_dir(projects).ok()?.flatten() {
         let candidate = proj.path().join(format!("{session_id}.jsonl"));
         if candidate.is_file() {
@@ -380,8 +377,7 @@ fn find_claude_transcript(session_id: &str) -> Option<PathBuf> {
 
 /// cwd로 codex rollout을 찾는다 — session_meta.cwd가 일치하는 것 중 가장 최근.
 fn find_codex_transcript(cwd: &str) -> Option<(String, PathBuf)> {
-    let home = std::env::var_os("HOME")?;
-    let root = Path::new(&home).join(".codex/sessions");
+    let root = crate::paths::home_dir()?.join(".codex/sessions");
     let mut files = Vec::new();
     collect_jsonl(&root, &mut files);
     files.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
@@ -509,7 +505,7 @@ pub(crate) fn project_display_name(
         return None;
     }
     // 홈 루트는 특별 취급 — 폴더명("jr" 등) 대신 "~".
-    if std::env::var_os("HOME").is_some_and(|h| path == std::path::Path::new(&h)) {
+    if crate::paths::home_dir().is_some_and(|home| path == home) {
         return Some("~".to_owned());
     }
     if style == crate::config::SessionNameStyle::Repo {
@@ -531,24 +527,9 @@ pub(crate) fn project_display_name(
     path.file_name().map(|n| n.to_string_lossy().into_owned())
 }
 
-/// 프로세스의 cwd (macOS/Unix: `lsof -p <pid> -d cwd`).
-#[cfg(unix)]
+/// 프로세스의 cwd — platform::process_cwd(lsof) 공용 구현을 쓴다.
 fn process_cwd(pid: u32) -> Option<String> {
-    let out = std::process::Command::new("lsof")
-        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
-        .output()
-        .ok()?;
-    // -Fn: 'n' 접두 라인이 경로. 여러 줄 중 마지막 n 라인.
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.strip_prefix('n'))
-        .next_back()
-        .map(str::to_owned)
-}
-
-#[cfg(not(unix))]
-fn process_cwd(_pid: u32) -> Option<String> {
-    None
+    Some(platform::process_cwd(pid)?.to_string_lossy().into_owned())
 }
 
 /// 셸 pid의 모든 자손 pid 집합 (resource_monitor와 동일한 BFS).

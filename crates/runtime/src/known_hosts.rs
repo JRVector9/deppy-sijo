@@ -127,11 +127,8 @@ impl KnownHosts {
             text.push_str(fp);
             text.push('\n');
         }
-        let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, text)
-            .with_context(|| format!("known_hosts 임시 쓰기 실패: {}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.path)
-            .with_context(|| format!("known_hosts rename 실패: {}", self.path.display()))?;
+        deppy_core::fs::atomic_write(&self.path, text.as_bytes())
+            .with_context(|| format!("known_hosts 원자 기록 실패: {}", self.path.display()))?;
         Ok(())
     }
 }

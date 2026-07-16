@@ -1117,6 +1117,7 @@ dependencies = [
  "audit",
  "auth",
  "block2 0.6.2",
+ "deppy-core",
  "directories",
  "eframe",
  "egui",
@@ -2894,6 +2895,7 @@ dependencies = [
  "anyhow",
  "audit",
  "auth",
+ "deppy-core",
  "libc",
  "mcp",
  "mcp-store",
@@ -4515,6 +4517,7 @@ dependencies = [
  "apple-native-keyring-store",
  "keyring-core",
  "serde_json",
+ "uuid",
  "windows-native-keyring-store",
 ]
 
@@ -5828,6 +5831,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "base64",
+ "deppy-core",
  "getrandom 0.2.17",
  "hkdf",
  "p256",

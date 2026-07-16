@@ -139,7 +139,7 @@ impl EnvProfilesUi {
         // ⑤ 프로젝트 폴더 미지정: 변수 입력을 차단하고 폴더 지정을 유도한다 — 이름만 있는
         // 워크스페이스에 변수가 들어가 유령이 되는 경로를 구조적으로 막는다.
         if project_root.is_none() {
-            env_api_section_header(ui, &catalog.t("env.env_vars", &[]), None, None);
+            super::section_header(ui, &catalog.t("env.env_vars", &[]), None, None);
             ui.add_space(10.0);
             ui.label(
                 egui::RichText::new(catalog.t("env.no_project_path_note", &[]))
@@ -215,7 +215,7 @@ impl EnvProfilesUi {
         // 환경 변수: api-like 분리 없이 **전부 한 표**로(#1/#4). API 키는 App이 별도
         // 자격증명 섹션으로 렌더한다 — 여기서 두 번째 "API Keys" 섹션은 만들지 않는다.
         let add_label = format!("+ {}", catalog.t("action.add", &[]));
-        if env_api_section_header(
+        if super::section_header(
             ui,
             &catalog.t("env.env_vars", &[]),
             Some(vars.len()),
@@ -415,105 +415,6 @@ impl EnvProfilesUi {
     }
 }
 
-fn env_api_section_header(
-    ui: &mut egui::Ui,
-    title: &str,
-    count: Option<usize>,
-    action_label: Option<&str>,
-) -> bool {
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::hover());
-    let painter = ui.painter();
-    let y = rect.center().y;
-    let mut x = rect.left();
-    let title_font = egui::FontId::monospace(14.0);
-    painter.text(
-        egui::pos2(x, y),
-        egui::Align2::LEFT_CENTER,
-        title,
-        title_font.clone(),
-        ui.visuals().text_color(),
-    );
-    x += painter
-        .layout_no_wrap(title.to_owned(), title_font, ui.visuals().text_color())
-        .rect
-        .width()
-        + 6.0;
-    if let Some(count) = count {
-        let count_text = count.to_string();
-        let count_rect =
-            egui::Rect::from_center_size(egui::pos2(x + 10.0, y), egui::vec2(20.0, 20.0));
-        let tag = if ui.visuals().dark_mode {
-            egui::Color32::from_rgb(0x2a, 0x3a, 0x44)
-        } else {
-            egui::Color32::from_rgb(0xd0, 0xe8, 0xf4)
-        };
-        painter.rect_filled(count_rect, 0.0, tag);
-        painter.text(
-            count_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            count_text,
-            egui::FontId::monospace(12.0),
-            ui.visuals().hyperlink_color,
-        );
-    }
-
-    let mut clicked = false;
-    if let Some(action_label) = action_label {
-        let label_font = egui::FontId::monospace(13.0);
-        let label_width = painter
-            .layout_no_wrap(
-                action_label.to_owned(),
-                label_font.clone(),
-                ui.visuals().weak_text_color(),
-            )
-            .rect
-            .width();
-        let button_w = (label_width + 16.0).max(58.0);
-        let button_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.right() - button_w, rect.center().y - 13.0),
-            egui::vec2(button_w, 26.0),
-        );
-        let response = ui.interact(
-            button_rect,
-            ui.id().with(("env_api_section_add", title)),
-            egui::Sense::click(),
-        );
-        let hovered = response.hovered();
-        let fill = if hovered {
-            ui.visuals().selection.bg_fill
-        } else {
-            ui.visuals().extreme_bg_color
-        };
-        let stroke = if hovered {
-            ui.visuals().selection.bg_fill
-        } else {
-            ui.visuals().widgets.noninteractive.bg_stroke.color
-        };
-        painter.rect_filled(button_rect, 0.0, fill);
-        painter.rect_stroke(
-            button_rect,
-            0.0,
-            egui::Stroke::new(1.0, stroke),
-            egui::StrokeKind::Inside,
-        );
-        painter.text(
-            button_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            action_label,
-            label_font,
-            if hovered {
-                egui::Color32::WHITE
-            } else {
-                ui.visuals().weak_text_color()
-            },
-        );
-        clicked = response.clicked();
-    }
-    paint_table_hline(ui, rect.bottom());
-    clicked
-}
-
 fn env_table_header(ui: &mut egui::Ui, columns: &[String]) {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
@@ -530,7 +431,7 @@ fn env_table_header(ui: &mut egui::Ui, columns: &[String]) {
             color,
         );
     }
-    paint_table_hline(ui, rect.bottom());
+    super::hairline_row(ui, rect.bottom());
 }
 
 struct EnvRowResponse {
@@ -677,8 +578,8 @@ fn env_table_row(
         egui::FontId::monospace(11.0),
         text,
     );
-    paint_table_hline(ui, rect.top());
-    paint_table_hline(ui, rect.bottom());
+    super::hairline_row(ui, rect.top());
+    super::hairline_row(ui, rect.bottom());
     EnvRowResponse {
         delete: delete.clicked(),
         toggle_reveal,
@@ -730,8 +631,8 @@ fn env_empty_placeholder_row(ui: &mut egui::Ui, catalog: &i18n::Catalog) -> bool
         egui::FontId::monospace(11.0),
         ui.visuals().weak_text_color(),
     );
-    paint_table_hline(ui, rect.top());
-    paint_table_hline(ui, rect.bottom());
+    super::hairline_row(ui, rect.top());
+    super::hairline_row(ui, rect.bottom());
     clicked
 }
 
@@ -753,13 +654,6 @@ fn env_table_columns(rect: egui::Rect) -> [egui::Rect; 4] {
         egui::vec2(ACTION_W, rect.height()),
     );
     [key, value, mask, delete]
-}
-
-fn paint_table_hline(ui: &egui::Ui, y: f32) {
-    let color = ui.visuals().widgets.noninteractive.bg_stroke.color;
-    let y = ui.painter().round_to_pixel_center(y);
-    ui.painter()
-        .hline(ui.min_rect().x_range(), y, egui::Stroke::new(1.0, color));
 }
 
 fn display_env_value(

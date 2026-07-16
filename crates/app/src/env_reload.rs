@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 /// 훅 루트 (`~/.deppy-sijo/zdot`).
 fn zdot_root() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("HOME")?).join(".deppy-sijo/zdot"))
+    Some(crate::paths::home_dir()?.join(".deppy-sijo/zdot"))
 }
 
 const ZSHENV: &str = r#"# deppy-sijo env-live-reload bootstrap — 사용자 zsh 설정을 그대로 통과시킨다.

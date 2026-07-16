@@ -133,8 +133,7 @@ impl AgentDetectWorker {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                     }
-                    let (epoch, sessions, overrides, now_hidden) =
-                        input2.lock().unwrap().clone();
+                    let (epoch, sessions, overrides, now_hidden) = input2.lock().unwrap().clone();
                     hidden = now_hidden;
                     let (binding_interval, activity_interval) = tier_intervals(hidden);
                     // 워크스페이스 전환(epoch 변경) 시 캐시를 비운다 — SessionId가 워커마다

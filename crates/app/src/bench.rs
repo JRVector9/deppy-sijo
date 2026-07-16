@@ -16,7 +16,9 @@
 use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+
+use deppy_core::time::unix_ms;
 
 // ---------------------------------------------------------------------------
 // alloc 카운터 (cargo feature `bench-alloc` 전용 — 기본 빌드에 코드 자체가 없다)
@@ -287,13 +289,6 @@ impl BenchLog {
     pub fn emit_rss_stage(&self, stage: &str, workspaces: usize) {
         emit_rss(self, stage, sample_rss(), workspaces);
     }
-}
-
-fn unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(0)
 }
 
 macro_rules! fields {

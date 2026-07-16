@@ -1,6 +1,7 @@
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use deppy_core::SessionId;
+use deppy_core::time::unix_ms;
 use pty::{ProcessIdentity, ProcessIdentitySource};
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -306,13 +307,6 @@ fn parse_process_row(line: &str) -> Option<ProcessRow> {
         rss_bytes: rss_kib.saturating_mul(1024),
         cpu_percent,
     })
-}
-
-fn unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(unix)]

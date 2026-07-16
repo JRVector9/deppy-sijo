@@ -63,7 +63,6 @@ pub struct Session {
     /// cache budget manager가 적용한 현재 class. visible이 최우선이고, hidden/exited는
     /// 줄/byte budget으로 scrollback을 줄인다.
     cache_class: TerminalCacheClass,
-    cache_events: Vec<TerminalCacheEvent>,
 }
 
 impl Session {
@@ -131,7 +130,6 @@ impl Session {
             exit_code: None,
             exit_wait_ticks: 0,
             cache_class: TerminalCacheClass::Visible,
-            cache_events: Vec::new(),
         })
     }
 
@@ -168,7 +166,6 @@ impl Session {
             exit_code,
             exit_wait_ticks: 0,
             cache_class: TerminalCacheClass::Exited,
-            cache_events: Vec::new(),
         }
     }
 
@@ -400,13 +397,12 @@ impl Session {
         self.set_cache_class(class)
     }
 
+    /// budget class 적용 — trim이 일어났으면 이벤트를 반환한다. 소비는 반환값으로만
+    /// 한다(worker의 trace_terminal_cache_event) — 내부 누적 Vec을 두면 드레인 없이
+    /// 세션 수명 내내 자란다 (2026-07-16 리뷰에서 제거).
     pub fn set_cache_class(&mut self, class: TerminalCacheClass) -> Option<TerminalCacheEvent> {
         self.cache_class = class;
-        let event = self.backend.set_cache_class(class);
-        if let Some(event) = event {
-            self.cache_events.push(event);
-        }
-        event
+        self.backend.set_cache_class(class)
     }
 
     pub fn cache_class(&self) -> TerminalCacheClass {
@@ -415,10 +411,6 @@ impl Session {
 
     pub fn cache_footprint(&self) -> TerminalCacheFootprint {
         self.backend.cache_footprint()
-    }
-
-    pub fn take_cache_events(&mut self) -> Vec<TerminalCacheEvent> {
-        std::mem::take(&mut self.cache_events)
     }
 
     fn mark_dirty_rows(&mut self, rows: &[u16]) {
@@ -803,8 +795,5 @@ mod tests {
         assert_eq!(session.cache_footprint().class, TerminalCacheClass::Hidden);
         assert!(event.dropped_history_lines() > 0);
         assert!(event.freed_estimated_bytes() > 0);
-
-        let events = session.take_cache_events();
-        assert_eq!(events, vec![event]);
     }
 }

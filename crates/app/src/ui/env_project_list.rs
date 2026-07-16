@@ -112,9 +112,9 @@ pub fn render_with_style(
     let add_requested = paint_header(ui, header_rect, style, catalog);
 
     let divider_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
-    paint_hline(
+    super::hairline_at(
         ui.painter(),
-        header_rect.x_range().into(),
+        header_rect.x_range(),
         header_rect.bottom(),
         divider_color,
     );
@@ -295,15 +295,15 @@ fn render_row(
     painter.rect_filled(rect, 0.0, fill);
     // CSS border-bottom: 1px. 별도 레이아웃 행을 소비하지 않아 총 행 높이가 76px다.
     // 다음 행 fill이 이전 border를 덮어도 현재 top에서 같은 1px을 복원한다.
-    paint_hline(
+    super::hairline_at(
         painter,
-        rect.x_range().into(),
+        rect.x_range(),
         rect.top(),
         ui.visuals().widgets.noninteractive.bg_stroke.color,
     );
-    paint_hline(
+    super::hairline_at(
         painter,
-        rect.x_range().into(),
+        rect.x_range(),
         rect.bottom(),
         ui.visuals().widgets.noninteractive.bg_stroke.color,
     );
@@ -455,22 +455,11 @@ fn paint_delete_button(ui: &mut egui::Ui, rect: egui::Rect, danger: bool) {
     );
 }
 
-fn paint_hline(
-    painter: &egui::Painter,
-    x_range: std::ops::RangeInclusive<f32>,
-    y: f32,
-    color: egui::Color32,
-) {
-    let y = painter.round_to_pixel_center(y);
-    painter.hline(x_range, y, egui::Stroke::new(1.0, color));
-}
-
 pub fn display_project_path(path: &str) -> String {
     if path.trim().is_empty() {
         return "~".to_owned();
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = std::path::PathBuf::from(home);
+    if let Some(home) = crate::paths::home_dir() {
         let path_buf = std::path::PathBuf::from(path);
         if let Ok(stripped) = path_buf.strip_prefix(&home) {
             return format!("~/{}", stripped.display());

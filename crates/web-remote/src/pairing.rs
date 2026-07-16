@@ -26,21 +26,11 @@ pub fn get_or_create_token(store: &dyn SecretStore) -> anyhow::Result<String> {
 
 /// 토큰 재발급 — 새 토큰을 만들어 저장한다. 기존 페어링(QR/브라우저 저장분)은 무효가 된다.
 pub fn rotate_token(store: &dyn SecretStore) -> anyhow::Result<String> {
-    let token = new_token();
+    let token = secret::token::random_hex_token();
     store
         .set_secret(WEB_TOKEN_ID, &SecretString::new(token.clone()))
         .context("페어링 토큰 저장 실패")?;
     Ok(token)
-}
-
-/// 32바이트 랜덤(uuid v4 ×2 ≈ 244bit 엔트로피) hex 64자 — remote.rs new_auth_token 관례.
-/// hex라 URL/QR에 인코딩 없이 실을 수 있다.
-fn new_token() -> String {
-    format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    )
 }
 
 /// 폰이 열 접속 URL. ts.net 호스트명이 있으면 tailscale HTTPS(serve가 443 종단),

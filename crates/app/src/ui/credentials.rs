@@ -126,11 +126,11 @@ impl CredentialsUi {
         // padding을 포함하므로 여기서 다시 10px을 더하지 않는다.
         ui.add_space(2.0);
         let add_label = format!("+ {}", catalog.t("action.add", &[]));
-        if credentials_section_header(
+        if super::section_header(
             ui,
             &catalog.t("credentials.api_keys", &[]),
-            list.len(),
-            &add_label,
+            Some(list.len()),
+            Some(&add_label),
         ) {
             // 토글(P2) — 스크린샷은 기본 표만, 폼은 '+ 추가'를 눌렀을 때만.
             self.show_add_form = !self.show_add_form;
@@ -360,99 +360,6 @@ impl CredentialsUi {
     }
 }
 
-/// 섹션 헤더: 제목 + 카운트 배지 + 우측 액션 버튼. 버튼 클릭 시 true를 반환한다.
-fn credentials_section_header(
-    ui: &mut egui::Ui,
-    title: &str,
-    count: usize,
-    action_label: &str,
-) -> bool {
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::hover());
-    let painter = ui.painter();
-    let y = rect.center().y;
-    let title_font = egui::FontId::monospace(14.0);
-    painter.text(
-        egui::pos2(rect.left(), y),
-        egui::Align2::LEFT_CENTER,
-        title,
-        title_font.clone(),
-        ui.visuals().text_color(),
-    );
-    let title_w = painter
-        .layout_no_wrap(title.to_owned(), title_font, ui.visuals().text_color())
-        .rect
-        .width();
-    let count_rect = egui::Rect::from_center_size(
-        egui::pos2(rect.left() + title_w + 16.0, y),
-        egui::vec2(20.0, 20.0),
-    );
-    let tag = if ui.visuals().dark_mode {
-        egui::Color32::from_rgb(0x2a, 0x3a, 0x44)
-    } else {
-        egui::Color32::from_rgb(0xd0, 0xe8, 0xf4)
-    };
-    painter.rect_filled(count_rect, 0.0, tag);
-    painter.text(
-        count_rect.center(),
-        egui::Align2::CENTER_CENTER,
-        count.to_string(),
-        egui::FontId::monospace(12.0),
-        ui.visuals().hyperlink_color,
-    );
-
-    let button_font = egui::FontId::monospace(13.0);
-    let label_w = painter
-        .layout_no_wrap(
-            action_label.to_owned(),
-            button_font.clone(),
-            ui.visuals().weak_text_color(),
-        )
-        .rect
-        .width();
-    let button_w = (label_w + 16.0).max(58.0);
-    let button_rect = egui::Rect::from_center_size(
-        egui::pos2(rect.right() - button_w / 2.0, y),
-        egui::vec2(button_w, 26.0),
-    );
-    let response = ui.interact(
-        button_rect,
-        ui.id().with("credentials_section_add"),
-        egui::Sense::click(),
-    );
-    let hovered = response.hovered();
-    let fill = if hovered {
-        ui.visuals().selection.bg_fill
-    } else {
-        ui.visuals().extreme_bg_color
-    };
-    let stroke = if hovered {
-        ui.visuals().selection.bg_fill
-    } else {
-        ui.visuals().widgets.noninteractive.bg_stroke.color
-    };
-    painter.rect_filled(button_rect, 0.0, fill);
-    painter.rect_stroke(
-        button_rect,
-        0.0,
-        egui::Stroke::new(1.0, stroke),
-        egui::StrokeKind::Inside,
-    );
-    painter.text(
-        button_rect.center(),
-        egui::Align2::CENTER_CENTER,
-        action_label,
-        button_font,
-        if hovered {
-            egui::Color32::WHITE
-        } else {
-            ui.visuals().weak_text_color()
-        },
-    );
-    paint_credentials_hline(ui, rect.bottom());
-    response.clicked()
-}
-
 /// "+ 추가" 헤더 버튼 클릭 시 포커스를 옮길 provider 입력창의 고정 Id.
 fn credential_provider_input_id() -> egui::Id {
     egui::Id::new("credentials_provider_input")
@@ -474,7 +381,7 @@ fn credentials_table_header(ui: &mut egui::Ui, columns: &[String]) {
             color,
         );
     }
-    paint_credentials_hline(ui, rect.bottom());
+    super::hairline_row(ui, rect.bottom());
 }
 
 struct CredentialRowResponse {
@@ -635,8 +542,8 @@ fn credential_table_row(
         egui::FontId::monospace(12.0),
         text,
     );
-    paint_credentials_hline(ui, rect.top());
-    paint_credentials_hline(ui, rect.bottom());
+    super::hairline_row(ui, rect.top());
+    super::hairline_row(ui, rect.bottom());
     CredentialRowResponse {
         delete: delete.clicked(),
         toggle_reveal: reveal.clicked(),
@@ -684,13 +591,6 @@ fn credential_kind_badge_width(kind: &str, column_width: f32) -> Option<f32> {
     let desired = kind.len() as f32 * 8.0 + 14.0;
     let max = (column_width - 8.0).max(14.0);
     Some(desired.min(max))
-}
-
-fn paint_credentials_hline(ui: &egui::Ui, y: f32) {
-    let color = ui.visuals().widgets.noninteractive.bg_stroke.color;
-    let y = ui.painter().round_to_pixel_center(y);
-    ui.painter()
-        .hline(ui.min_rect().x_range(), y, egui::Stroke::new(1.0, color));
 }
 
 #[cfg(test)]

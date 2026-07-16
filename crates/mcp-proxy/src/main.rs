@@ -12,6 +12,7 @@ mod forwarder;
 mod hook;
 
 use anyhow::Context;
+use deppy_core::time::unix_secs_i64;
 use mcp::{LocalMcpManager, McpHttpServerConfig, McpServerConfig, run_proxy, validate_mcp_url};
 use mcp_store::McpServerRow;
 use secret::{KeyringSecretStore, RedactionService, SecretStore};
@@ -84,7 +85,7 @@ fn main() -> anyhow::Result<()> {
     // 띄우지 않게. best-effort(실패해도 서빙 계속). db를 hook으로 넘기기 전에 한다.
     // cutoff(now-ORPHAN_CUTOFF_SECS)보다 최근 행(다른 살아있는 프록시)은 건드리지 않고,
     // 이 프록시가 앞으로 넣을 행은 아직 없다.
-    let now = unix_secs();
+    let now = unix_secs_i64();
     match db.expire_pending_approvals(now - ORPHAN_CUTOFF_SECS, now) {
         Ok(n) if n > 0 => tracing::info!("orphan pending 승인 {n}건 정리(이전 크래시 잔여)"),
         Ok(_) => {}
@@ -312,14 +313,6 @@ fn chain_user_statusline(json: &serde_json::Value, payload: &str) -> Option<Stri
     }
     let _ = child.wait();
     result.map(|buf| String::from_utf8_lossy(&buf).into_owned())
-}
-
-/// 현재 unix epoch seconds. 정상 시스템 시계에서 UNIX_EPOCH 이후이므로 0으로 폴백.
-fn unix_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// McpServerRow → kind별 BackendConfig (H3): stdio는 command 필수 + scoped env 해석,

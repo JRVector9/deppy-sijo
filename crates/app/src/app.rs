@@ -3678,6 +3678,7 @@ impl App {
 
     fn invalidate_env_profile_ui(&mut self) {
         self.env_profiles_ui.invalidate_cache();
+        self.agents_ui.invalidate_profiles_cache();
         self.credentials_ui.clear_revealed_secrets();
         self.env_secret_generation = self.env_secret_generation.wrapping_add(1);
         self.env_secret_cache.clear();
@@ -3841,7 +3842,7 @@ impl App {
         tree.set_root(
             self.active_tree_root()
                 .filter(|p| p.is_dir())
-                .or_else(|| std::env::var_os("HOME").map(PathBuf::from)),
+                .or_else(crate::paths::home_dir),
         );
         tree
     }
@@ -4250,10 +4251,7 @@ impl App {
     }
 
     fn prune_resolved_approvals(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let now = deppy_core::time::unix_secs_i64();
         match self
             .db
             .prune_resolved_approvals(now.saturating_sub(Self::RESOLVED_APPROVAL_RETENTION_SECS))

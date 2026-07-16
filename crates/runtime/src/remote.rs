@@ -727,15 +727,6 @@ fn spawn_accept(
         .context("remote accept thread 생성 실패")
 }
 
-/// 실행마다 새 attach 토큰 (uuid v4 ×2 ≈ 244bit 엔트로피).
-fn new_auth_token() -> String {
-    format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    )
-}
-
 impl RemoteRuntimeServer {
     /// 127.0.0.1에만 bind한다 (localhost-only는 함수 형태로 보장 — 주소를 받지 않는다).
     /// port 0이면 OS가 할당하고 [`Self::local_addr`]로 확인한다.
@@ -745,7 +736,8 @@ impl RemoteRuntimeServer {
         let backend = Arc::new(backend);
         let stop = Arc::new(AtomicBool::new(false));
         let connections: Arc<Mutex<Vec<ConnEntry>>> = Arc::default();
-        let auth_token = new_auth_token();
+        // 실행마다 새 attach 토큰 (uuid v4 ×2 ≈ 244bit 엔트로피)
+        let auth_token = secret::token::random_hex_token();
 
         // 평문 접속 처리기 — 검증된 reader+pump 2-스레드 모델을 그대로 유지한다.
         let conn_token = auth_token.clone();
@@ -805,7 +797,8 @@ impl RemoteRuntimeServer {
         let backend = Arc::new(backend);
         let stop = Arc::new(AtomicBool::new(false));
         let connections: Arc<Mutex<Vec<ConnEntry>>> = Arc::default();
-        let auth_token = new_auth_token();
+        // 실행마다 새 attach 토큰 (uuid v4 ×2 ≈ 244bit 엔트로피)
+        let auth_token = secret::token::random_hex_token();
 
         let conn_token = auth_token.clone();
         let handler: ConnHandler = Arc::new(move |stream, backend, stop| {

@@ -337,7 +337,8 @@ const DB_CALL_ALLOW: &[BoundaryAllow] = &[
     },
     BoundaryAllow {
         path: "crates/app/src/ui/connectors.rs",
-        snippet: "if let Ok(tools) = db.list_mcp_tools(&server.id) {",
+        // tools_cached 미스 시에만 조회 (2026-07-16 매 프레임 N+1 제거)
+        snippet: "None => match db.list_mcp_tools(&server.id) {",
         count: 1,
         reason: "PR-B00 deferred connector storage boundary",
     },

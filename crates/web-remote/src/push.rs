@@ -33,13 +33,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::Context;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use deppy_core::time::unix_secs;
 use hkdf::Hkdf;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
+use secret::hex::{from_hex, to_hex};
 use secret::{SecretStore, SecretString};
 use sha2::Sha256;
 
@@ -603,7 +605,7 @@ impl PushHandle {
             {
                 return Err(SubscribeError::TooManySubscriptions);
             }
-            db.upsert_web_push_subscription(endpoint, p256dh, auth, now_secs() as i64)
+            db.upsert_web_push_subscription(endpoint, p256dh, auth, unix_secs() as i64)
                 .map_err(SubscribeError::Storage)?;
             let count = db.count_web_push_subscriptions().unwrap_or(0).max(0) as usize;
             self.shared.sub_count.store(count, Ordering::SeqCst);
@@ -814,7 +816,7 @@ fn broadcast(shared: &Arc<PushShared>, note: &Notification) -> BroadcastOutcome 
             Delivery::Ok => {
                 outcome.delivered += 1;
                 let db = shared.db.lock().expect("push db lock");
-                let _ = db.touch_web_push_subscription(&sub.endpoint, now_secs() as i64);
+                let _ = db.touch_web_push_subscription(&sub.endpoint, unix_secs() as i64);
             }
             Delivery::Gone => {
                 let db = shared.db.lock().expect("push db lock");
@@ -868,7 +870,7 @@ fn deliver(
             return Delivery::Broken;
         }
     };
-    let authorization = shared.vapid.authorization_header(&aud, now_secs());
+    let authorization = shared.vapid.authorization_header(&aud, unix_secs());
 
     // 재시도 1회 — 폭주 방지. 410/404는 재시도 없이 즉시 Gone.
     for attempt in 0..2 {
@@ -918,7 +920,7 @@ pub fn route(
 
 /// VAPID 공개키를 JSON으로 노출한다(구독 UI의 applicationServerKey). 토큰 게이트.
 fn vapid_key_response(query: &str, token: &str, push: Option<&PushHandle>) -> Response {
-    if !token_query_matches(query, token) {
+    if !crate::static_srv::token_param_matches(query, token) {
         return Response::plain(401, "unauthorized");
     }
     let Some(push) = push else {
@@ -940,7 +942,7 @@ fn subscribe_response(
     token: &str,
     push: Option<&PushHandle>,
 ) -> Response {
-    if !token_query_matches(query, token) {
+    if !crate::static_srv::token_param_matches(query, token) {
         return Response::plain(401, "unauthorized");
     }
     let Some(push) = push else {
@@ -994,25 +996,9 @@ struct SubscribeKeys {
     auth: String,
 }
 
-/// query의 `token=` 파라미터를 상수시간 비교한다(static_srv 게이트와 동일 규약).
-fn token_query_matches(query: &str, expected: &str) -> bool {
-    let Some(provided) = query.split('&').find_map(|kv| kv.strip_prefix("token=")) else {
-        return false;
-    };
-    crate::static_srv::token_matches(expected, provided.as_bytes())
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // 소도구
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// 현재 epoch 초.
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 /// endpoint URL에서 origin(scheme://authority)을 뽑는다 — VAPID `aud`. url 크레이트 없이 파싱.
 /// authority는 path/query/fragment 앞까지다(`?`/`#`가 aud에 새지 않게).
@@ -1133,30 +1119,6 @@ fn random_p256_scalar() -> [u8; 32] {
             return bytes;
         }
     }
-}
-
-fn to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn from_hex(s: &str) -> anyhow::Result<Vec<u8>> {
-    let bytes = s.as_bytes();
-    anyhow::ensure!(bytes.len().is_multiple_of(2), "hex 길이가 홀수");
-    bytes
-        .chunks_exact(2)
-        .map(|pair| {
-            let hi = hex_digit(pair[0])?;
-            let lo = hex_digit(pair[1])?;
-            Ok(hi << 4 | lo)
-        })
-        .collect()
-}
-
-fn hex_digit(byte: u8) -> anyhow::Result<u8> {
-    (byte as char)
-        .to_digit(16)
-        .map(|d| d as u8)
-        .with_context(|| format!("hex가 아닌 바이트: 0x{byte:02x}"))
 }
 
 #[cfg(test)]

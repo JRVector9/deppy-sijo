@@ -178,7 +178,8 @@ fn fnv1a_hex(chunks: &[&[u8]]) -> String {
 }
 
 /// query에서 `token=` 파라미터를 찾아 상수시간 비교한다. 토큰은 hex라 percent 인코딩이 없다.
-fn token_param_matches(query: &str, expected: &str) -> bool {
+/// push(`/push/*`)·upload(`/upload`) 게이트도 같은 규약으로 이 헬퍼를 쓴다.
+pub(crate) fn token_param_matches(query: &str, expected: &str) -> bool {
     let Some(provided) = query.split('&').find_map(|kv| kv.strip_prefix("token=")) else {
         return false;
     };

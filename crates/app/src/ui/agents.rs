@@ -34,6 +34,9 @@ pub struct AgentsUi {
     pending_launches: u32,
     error: Option<String>,
     cached: Option<Vec<AgentConfigRow>>,
+    /// env profile 목록 캐시 (workspace_id 키) — 매 프레임 SQLite 조회 방지.
+    /// profile 변경 경로(App::invalidate_env_profile_ui)와 workspace 전환이 무효화한다.
+    profiles_cached: Option<(String, Vec<EnvProfileRow>)>,
 }
 
 impl AgentsUi {
@@ -54,7 +57,14 @@ impl AgentsUi {
             pending_launches: 0,
             error: None,
             cached: None,
+            profiles_cached: None,
         }
+    }
+
+    /// env profile 목록 캐시를 버린다 — dotenv 동기화 등으로 profile이 바뀌었을 때
+    /// App이 EnvProfilesUi 무효화와 함께 부른다.
+    pub fn invalidate_profiles_cache(&mut self) {
+        self.profiles_cached = None;
     }
 
     /// pending 카운트를 회수하며 비운다 — workspace 전환 시 물러나는 workspace의
@@ -123,8 +133,17 @@ impl AgentsUi {
         if list.is_empty() {
             ui.label(catalog.t("agents.empty", &[]));
         }
-        // 실행 profile 선택 (설계문서 PR-09: env profile 선택)
-        let profiles = db.list_env_profiles(workspace_id).unwrap_or_default();
+        // 실행 profile 선택 (설계문서 PR-09: env profile 선택). 목록은 workspace 키로
+        // 캐시 — 이 패널이 열려 있는 동안 매 프레임 SQLite 조회를 막는다. profile
+        // 변경(dotenv 동기화)은 App의 invalidate_env_profile_ui가 무효화한다.
+        let profiles = match &self.profiles_cached {
+            Some((cached_ws, profiles)) if cached_ws == workspace_id => profiles.clone(),
+            _ => {
+                let profiles = db.list_env_profiles(workspace_id).unwrap_or_default();
+                self.profiles_cached = Some((workspace_id.to_owned(), profiles.clone()));
+                profiles
+            }
+        };
         ui.horizontal(|ui| {
             ui.label(catalog.t("agents.run_profile", &[]));
             let current = self

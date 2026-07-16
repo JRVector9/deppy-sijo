@@ -1,3 +1,5 @@
+use super::format_bytes;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActivityWorkspaceRow {
     pub name: String,
@@ -503,21 +505,6 @@ fn input_pressure_badge_text(
             ("max", &format_bytes(pressure.max_bytes as u64)),
         ],
     )
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * 1024;
-    const GIB: u64 = 1024 * MIB;
-    if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.1} KiB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 #[cfg(test)]

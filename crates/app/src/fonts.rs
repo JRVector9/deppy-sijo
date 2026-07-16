@@ -237,8 +237,8 @@ pub fn ui_font_options() -> Vec<(String, String)> {
         "kr",
     ];
     let mut dirs = vec![std::path::PathBuf::from("/Library/Fonts")];
-    if let Some(home) = std::env::var_os("HOME") {
-        dirs.push(std::path::PathBuf::from(home).join("Library/Fonts"));
+    if let Some(home) = crate::paths::home_dir() {
+        dirs.push(home.join("Library/Fonts"));
     }
     for dir in dirs {
         let Ok(rd) = std::fs::read_dir(&dir) else {

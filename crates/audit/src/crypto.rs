@@ -11,6 +11,7 @@ use chacha20poly1305::{
     Key, XChaCha20Poly1305, XNonce,
     aead::{Aead, AeadCore, KeyInit, OsRng},
 };
+use secret::hex::{from_hex, to_hex};
 use secret::{SecretStore, SecretString};
 
 /// 현재 audit 암호화 키의 keyring entry id. rotation 시 `-2` 등으로 올리면 새 키가
@@ -85,31 +86,6 @@ pub fn decrypt_input(store: &dyn SecretStore, blob: &[u8]) -> anyhow::Result<Str
         .decrypt(nonce, ciphertext)
         .map_err(|e| anyhow!("audit 입력 복호화 실패(위변조 또는 키 불일치): {e}"))?;
     String::from_utf8(plaintext).context("복호 평문이 utf8이 아님")
-}
-
-fn to_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
-}
-
-fn from_hex(s: &str) -> anyhow::Result<Vec<u8>> {
-    ensure!(s.len().is_multiple_of(2), "hex 길이가 홀수");
-    let mut out = Vec::with_capacity(s.len() / 2);
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let hi = (bytes[i] as char).to_digit(16).context("hex 문자 아님")?;
-        let lo = (bytes[i + 1] as char)
-            .to_digit(16)
-            .context("hex 문자 아님")?;
-        out.push((hi * 16 + lo) as u8);
-        i += 2;
-    }
-    Ok(out)
 }
 
 #[cfg(test)]

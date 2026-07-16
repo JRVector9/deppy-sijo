@@ -6,9 +6,10 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use audit::{AuditRecord, PermissionRule, ToolDecision};
+use deppy_core::time::unix_secs_i64;
 use mcp::{LocalMcpManager, PermissionHook, ProxyDecision};
 use secret::RedactionService;
 use serde_json::Value;
@@ -149,7 +150,7 @@ impl DbPermissionHook {
         let schema_hash = self.schema_hash_for(tool_name);
         let preview = self.redact_preview(arguments);
         let id = uuid::Uuid::new_v4().to_string();
-        let now = unix_secs();
+        let now = unix_secs_i64();
 
         if let Err(e) = self.db.insert_pending_approval(
             &id,
@@ -186,7 +187,7 @@ impl DbPermissionHook {
                         if now >= deadline {
                             // 타임아웃: 대기 행을 거부로 해소해 GUI가 만료 요청을 live 승인처럼
                             // 띄우지 않게 한다 (first-writer-wins라 이미 해소됐으면 no-op).
-                            let _ = self.db.resolve_approval(&id, false, false, unix_secs());
+                            let _ = self.db.resolve_approval(&id, false, false, unix_secs_i64());
                             self.record(tool_name, arguments, ToolDecision::DenyOnce);
                             return ProxyDecision::Deny(
                                 "승인 대기 시간 초과 — 안전을 위해 거부됨".to_owned(),
@@ -274,14 +275,6 @@ impl PermissionHook for DbPermissionHook {
             PermissionRule::Ask => self.ask(tool_name, arguments),
         }
     }
-}
-
-/// 현재 unix epoch seconds (SystemTime). 정상 시스템 시계에서 UNIX_EPOCH 이후이므로 0으로 폴백.
-fn unix_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// 문자(char) 기준으로 자르고, 잘렸으면 말줄임표를 붙인다 (바이트 경계 안전).
@@ -510,7 +503,8 @@ mod tests {
             let db = Db::open(&bg_path).unwrap();
             for _ in 0..500 {
                 if let Some(p) = db.list_pending_approvals().unwrap().first() {
-                    db.resolve_approval(&p.id, true, true, unix_secs()).unwrap();
+                    db.resolve_approval(&p.id, true, true, unix_secs_i64())
+                        .unwrap();
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -557,7 +551,7 @@ mod tests {
             let db = Db::open(&bg_path).unwrap();
             for _ in 0..500 {
                 if let Some(p) = db.list_pending_approvals().unwrap().first() {
-                    db.resolve_approval(&p.id, false, true, unix_secs())
+                    db.resolve_approval(&p.id, false, true, unix_secs_i64())
                         .unwrap();
                     return;
                 }
@@ -670,7 +664,7 @@ mod tests {
             let mut resolved = 0;
             for _ in 0..2000 {
                 if let Some(p) = db.list_pending_approvals().unwrap().first() {
-                    db.resolve_approval(&p.id, true, false, unix_secs())
+                    db.resolve_approval(&p.id, true, false, unix_secs_i64())
                         .unwrap();
                     resolved += 1;
                     if resolved == 2 {

@@ -354,6 +354,28 @@ impl HttpClient {
         )
     }
 
+    /// 협상된 프로토콜 버전 + (credentials=true일 때) Bearer/세션 헤더를 부착한다.
+    /// 프로토콜 버전은 자격이 아니라 항상 부착하고, 자격 헤더는 same-origin 대상에만
+    /// 보낸다 — cross-origin redirect credential 누출 방지 게이트를 호출측이 정한다.
+    fn attach_common_headers(
+        &self,
+        mut request: ureq::Request,
+        credentials: bool,
+    ) -> ureq::Request {
+        if let Some(version) = &self.negotiated_version {
+            request = request.set("MCP-Protocol-Version", version);
+        }
+        if credentials {
+            if let Some(bearer) = &self.bearer {
+                request = request.set("Authorization", &format!("Bearer {}", bearer.expose()));
+            }
+            if let Some(session) = &self.session_id {
+                request = request.set("Mcp-Session-Id", session);
+            }
+        }
+        request
+    }
+
     fn exchange_once(
         &mut self,
         body: &str,
@@ -376,21 +398,10 @@ impl HttpClient {
             if send_body {
                 request = request.set("Content-Type", "application/json");
             }
-            if let Some(version) = &self.negotiated_version {
-                request = request.set("MCP-Protocol-Version", version);
-            }
             // cross-origin redirect 대상에는 자격 헤더를 보내지 않는다
             // (차용: extHostMcp.ts CROSS_ORIGIN_STRIPPED_HEADERS + Mcp-Session-Id).
-            let mut session_attached = false;
-            if same_origin {
-                if let Some(bearer) = &self.bearer {
-                    request = request.set("Authorization", &format!("Bearer {}", bearer.expose()));
-                }
-                if let Some(session) = &self.session_id {
-                    request = request.set("Mcp-Session-Id", session);
-                    session_attached = true;
-                }
-            }
+            let session_attached = same_origin && self.session_id.is_some();
+            let request = self.attach_common_headers(request, same_origin);
             // H2 리뷰 P1: 이 호출은 connect + 요청 전송 + 상태줄/헤더 수신까지
             // 블로킹되는데, timeout_read는 개별 read 단위(매 read마다 리셋)라
             // 느린 드립 서버에 벽시계 상한이 없다 — 오프로드로 deadline을 강제.
@@ -650,20 +661,13 @@ impl HttpClient {
         let Ok(body) = serde_json::to_string(&reply) else {
             return;
         };
-        let mut request = self
+        let request = self
             .agent
             .post(self.url.as_str())
             .set("Accept", "text/event-stream, application/json")
             .set("Content-Type", "application/json");
-        if let Some(version) = &self.negotiated_version {
-            request = request.set("MCP-Protocol-Version", version);
-        }
-        if let Some(bearer) = &self.bearer {
-            request = request.set("Authorization", &format!("Bearer {}", bearer.expose()));
-        }
-        if let Some(session) = &self.session_id {
-            request = request.set("Mcp-Session-Id", session);
-        }
+        // 항상 self.url 직행(redirect 없음) — same-origin이므로 자격 헤더 포함.
+        let request = self.attach_common_headers(request, true);
         // 베스트에포트 회신도 같은 드립 방어(H2 리뷰 P1) — 헤더 대기에 벽시계 상한.
         let _ = send_with_deadline(
             request,
@@ -681,18 +685,13 @@ impl Drop for HttpClient {
         let Some(session) = self.session_id.take() else {
             return;
         };
-        let mut request = self
+        let request = self
             .agent
             .delete(self.url.as_str())
             .timeout(SESSION_DELETE_TIMEOUT)
             .set("Mcp-Session-Id", &session);
-        if let Some(version) = &self.negotiated_version {
-            request = request.set("MCP-Protocol-Version", version);
-        }
-        if let Some(bearer) = &self.bearer {
-            request = request.set("Authorization", &format!("Bearer {}", bearer.expose()));
-        }
-        let _ = request.call();
+        // 세션은 위에서 take()로 소진 — 헬퍼는 버전/Bearer만 마저 부착한다.
+        let _ = self.attach_common_headers(request, true).call();
     }
 }
 

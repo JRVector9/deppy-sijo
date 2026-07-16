@@ -350,14 +350,11 @@ impl Config {
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        // 임시 파일 + rename — 쓰기 중 크래시로 빈/부분 TOML이 남아
-        // 다음 시작이 파싱 실패로 죽는 것 방지 (codex 리뷰. rename은 동일
-        // 디렉터리 내에서 원자적)
+        // 원자 기록 — 쓰기 중 크래시로 빈/부분 TOML이 남아 다음 시작이
+        // 파싱 실패로 죽는 것 방지 (codex 리뷰)
         let text = toml::to_string_pretty(self)?;
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, &text)
-            .with_context(|| format!("config 임시 저장 실패: {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).with_context(|| format!("config 교체 실패: {}", path.display()))
+        deppy_core::fs::atomic_write(path, text.as_bytes())
+            .with_context(|| format!("config 저장 실패: {}", path.display()))
     }
 }
 

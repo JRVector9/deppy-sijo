@@ -13,7 +13,7 @@ use crate::agent_hooks::{hook_command, statusline_command};
 
 /// shim 루트 (`~/.deppy-sijo`).
 fn root() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("HOME")?).join(".deppy-sijo"))
+    Some(crate::paths::home_dir()?.join(".deppy-sijo"))
 }
 
 /// shim 디렉터리 경로 — 셸 PATH 맨 앞에 주입할 값. 설치 후에만 Some.

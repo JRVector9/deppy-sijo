@@ -1,4 +1,6 @@
+pub mod hex;
 mod redaction;
+pub mod token;
 
 pub use redaction::{RedactionService, StreamRedactor};
 

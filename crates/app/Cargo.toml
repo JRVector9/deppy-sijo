@@ -38,6 +38,7 @@ qrcode = { workspace = true }
 rfd = "0.15"
 audit = { path = "../audit" }
 auth = { path = "../auth" }
+deppy-core = { path = "../core" }
 mcp = { path = "../mcp" }
 mcp-store = { path = "../mcp-store" }
 persist = { path = "../persist" }

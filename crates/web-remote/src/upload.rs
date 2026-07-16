@@ -73,7 +73,7 @@ fn upload_response(
     token: &str,
     uploads_dir: Option<&Path>,
 ) -> Response {
-    if !token_query_matches(&head.query, token) {
+    if !authorized(&head.query, token) {
         return Response::plain(401, "unauthorized");
     }
     let Some(dir) = uploads_dir else {
@@ -239,18 +239,9 @@ fn collect_uploads(dir: &Path) -> std::io::Result<Vec<(std::time::SystemTime, u6
 }
 
 /// `/upload` 토큰 인가 — handle_connection(lib.rs)이 **본문을 읽기 전에** 호출한다(리뷰
-/// P2-1: 미인증 요청이 10MB를 선할당하지 않게). route 내부 검사와 같은 상수시간 규약.
+/// P2-1: 미인증 요청이 10MB를 선할당하지 않게). static_srv/push 게이트와 같은 상수시간 규약.
 pub fn authorized(query: &str, token: &str) -> bool {
-    token_query_matches(query, token)
-}
-
-/// query의 `token=` 파라미터를 상수시간 비교한다(static_srv/push 게이트와 동일 규약 —
-/// 두 모듈도 각자 이 짧은 헬퍼를 private로 갖는다).
-fn token_query_matches(query: &str, expected: &str) -> bool {
-    let Some(provided) = query.split('&').find_map(|kv| kv.strip_prefix("token=")) else {
-        return false;
-    };
-    crate::static_srv::token_matches(expected, provided.as_bytes())
+    crate::static_srv::token_param_matches(query, token)
 }
 
 #[cfg(test)]
@@ -280,9 +271,9 @@ mod tests {
 
     #[test]
     fn token_불일치는_거부() {
-        assert!(token_query_matches("token=abc", "abc"));
-        assert!(!token_query_matches("token=abc", "xyz"));
-        assert!(!token_query_matches("", "abc"));
+        assert!(authorized("token=abc", "abc"));
+        assert!(!authorized("token=abc", "xyz"));
+        assert!(!authorized("", "abc"));
     }
 
     #[test]

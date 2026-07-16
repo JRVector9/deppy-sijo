@@ -366,6 +366,10 @@ pub struct ConnectorsUi {
     url_input: String,
     error: Option<String>,
     cached: Option<Vec<McpServerRow>>,
+    /// 서버별 저장된 tool 목록 캐시 — server_card가 열려 있는 동안 매 프레임 SQLite
+    /// 조회(서버 수만큼 N+1)를 반복하지 않게 한다. replace_mcp_tools를 부르는 경로
+    /// (discover 반영/URL 변경/OAuth 사다리)가 해당 서버 키를 무효화한다.
+    tools_cached: HashMap<String, Vec<McpToolRow>>,
     status: HashMap<String, ConnStatus>,
     result_tx: mpsc::Sender<DiscoverOutcome>,
     result_rx: mpsc::Receiver<DiscoverOutcome>,
@@ -413,6 +417,7 @@ impl ConnectorsUi {
             url_input: String::new(),
             error: None,
             cached: None,
+            tools_cached: HashMap::new(),
             status: HashMap::new(),
             result_tx,
             result_rx,
@@ -861,6 +866,7 @@ impl ConnectorsUi {
         let rows = tool_rows(&server_id, &success.tools);
         db.replace_mcp_tools(&server_id, &rows)
             .context("tools 저장 실패")?;
+        self.tools_cached.remove(&server_id);
         Ok(rows.len())
     }
 
@@ -1096,62 +1102,69 @@ impl ConnectorsUi {
             if server.kind == "http" {
                 self.url_edit_controls(ui, db, server, catalog);
             }
-            // 저장된 tool 목록 + 실행 버튼 + 현재 권한 규칙 (PR-16)
-            if let Ok(tools) = db.list_mcp_tools(&server.id) {
-                for tool in tools {
-                    ui.horizontal(|ui| {
-                        ui.monospace(&tool.name);
-                        // 실행 중인 invoke가 있으면 새로 시작 금지 (동시 실행/덮어쓰기 방지)
-                        if ui
-                            .add_enabled(
-                                self.invoke.is_none(),
-                                egui::Button::new(catalog.t("action.run", &[])).small(),
-                            )
-                            .clicked()
-                        {
-                            // http 서버는 최초 연결 신뢰 확인을 먼저 받는다 (H3)
-                            if server.kind == "http" && !self.trusted_http.contains(&server.id) {
-                                self.trust_prompt = Some(TrustPrompt {
-                                    server: server.clone(),
-                                    tool: Some(tool.clone()),
-                                });
-                            } else if let Err(e) = self.begin_invoke(server, &tool) {
-                                self.error = Some(format!("실행 준비 실패: {e:#}"));
-                            }
+            // 저장된 tool 목록 + 실행 버튼 + 현재 권한 규칙 (PR-16). 목록은 캐시로 —
+            // 매 프레임 서버별 SQLite 조회를 막는다. 실패는 캐시하지 않는다(다음
+            // 프레임 재시도 — 기존 매 프레임 조회와 같은 동작).
+            let tools = match self.tools_cached.get(&server.id) {
+                Some(tools) => tools.clone(),
+                None => match db.list_mcp_tools(&server.id) {
+                    Ok(tools) => {
+                        self.tools_cached.insert(server.id.clone(), tools.clone());
+                        tools
+                    }
+                    Err(_) => Vec::new(),
+                },
+            };
+            for tool in tools {
+                ui.horizontal(|ui| {
+                    ui.monospace(&tool.name);
+                    // 실행 중인 invoke가 있으면 새로 시작 금지 (동시 실행/덮어쓰기 방지)
+                    if ui
+                        .add_enabled(
+                            self.invoke.is_none(),
+                            egui::Button::new(catalog.t("action.run", &[])).small(),
+                        )
+                        .clicked()
+                    {
+                        // http 서버는 최초 연결 신뢰 확인을 먼저 받는다 (H3)
+                        if server.kind == "http" && !self.trusted_http.contains(&server.id) {
+                            self.trust_prompt = Some(TrustPrompt {
+                                server: server.clone(),
+                                tool: Some(tool.clone()),
+                            });
+                        } else if let Err(e) = self.begin_invoke(server, &tool) {
+                            self.error = Some(format!("실행 준비 실패: {e:#}"));
                         }
-                        // 현재 규칙 표시 + Ask 아니면 해제 버튼 (잘못 always한 것 되돌리기)
-                        let rule = self.policy.rule(&server.id, &tool.name);
-                        match rule {
-                            audit::PermissionRule::Allow => {
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(0x2e, 0xa0, 0x43),
-                                    catalog.t("connectors.rule_allow", &[]),
-                                );
-                            }
-                            audit::PermissionRule::Deny => {
-                                ui.colored_label(
-                                    egui::Color32::RED,
-                                    catalog.t("connectors.rule_deny", &[]),
-                                );
-                            }
-                            audit::PermissionRule::Ask => {}
-                        }
-                        if rule != audit::PermissionRule::Ask
-                            && ui
-                                .small_button(catalog.t("connectors.clear_rule", &[]))
-                                .clicked()
-                        {
-                            self.policy.set_rule(
-                                &server.id,
-                                &tool.name,
-                                audit::PermissionRule::Ask,
+                    }
+                    // 현재 규칙 표시 + Ask 아니면 해제 버튼 (잘못 always한 것 되돌리기)
+                    let rule = self.policy.rule(&server.id, &tool.name);
+                    match rule {
+                        audit::PermissionRule::Allow => {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0x2e, 0xa0, 0x43),
+                                catalog.t("connectors.rule_allow", &[]),
                             );
-                            if let Err(e) = db.delete_permission_rule(&server.id, &tool.name) {
-                                tracing::warn!("권한 규칙 삭제 실패: {e:#}");
-                            }
                         }
-                    });
-                }
+                        audit::PermissionRule::Deny => {
+                            ui.colored_label(
+                                egui::Color32::RED,
+                                catalog.t("connectors.rule_deny", &[]),
+                            );
+                        }
+                        audit::PermissionRule::Ask => {}
+                    }
+                    if rule != audit::PermissionRule::Ask
+                        && ui
+                            .small_button(catalog.t("connectors.clear_rule", &[]))
+                            .clicked()
+                    {
+                        self.policy
+                            .set_rule(&server.id, &tool.name, audit::PermissionRule::Ask);
+                        if let Err(e) = db.delete_permission_rule(&server.id, &tool.name) {
+                            tracing::warn!("권한 규칙 삭제 실패: {e:#}");
+                        }
+                    }
+                });
             }
         });
     }
@@ -1338,6 +1351,7 @@ impl ConnectorsUi {
         db.update_mcp_server_url(server_id, new_url)?;
         self.trusted_http.remove(server_id);
         self.status.remove(server_id);
+        self.tools_cached.remove(server_id);
         self.cached = None; // 목록 재조회
         Ok(())
     }
@@ -1726,6 +1740,7 @@ impl ConnectorsUi {
             let status = match outcome.result {
                 Ok(tools) => {
                     let rows = tool_rows(&outcome.server_id, &tools);
+                    self.tools_cached.remove(&outcome.server_id);
                     match db.replace_mcp_tools(&outcome.server_id, &rows) {
                         Ok(()) => ConnStatus::Connected { tools: rows.len() },
                         Err(e) => ConnStatus::Failed(format!("tools 저장 실패: {e:#}")),

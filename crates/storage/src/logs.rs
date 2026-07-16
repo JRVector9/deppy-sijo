@@ -137,10 +137,7 @@ impl SessionLogWriter {
 
     /// 세션 이벤트 한 줄 (jsonl). detail은 이미 redaction된 값만 받는다.
     pub fn append_event(&mut self, kind: &str, detail: Option<&str>) -> anyhow::Result<()> {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
+        let ts = deppy_core::time::unix_ms();
         let line = match detail {
             Some(detail) => format!(
                 "{{\"ts_ms\":{ts},\"event\":\"{}\",\"detail\":\"{}\"}}\n",

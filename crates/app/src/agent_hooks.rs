@@ -44,7 +44,7 @@ pub(crate) fn statusline_command(proxy_bin: &str, db_path: &std::path::Path) -> 
 }
 
 fn claude_settings_path() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("HOME")?).join(".claude/settings.json"))
+    Some(crate::paths::home_dir()?.join(".claude/settings.json"))
 }
 
 /// 우리 hook 항목인가 (커맨드에 마커 포함).
@@ -66,9 +66,7 @@ fn write_atomic(path: &std::path::Path, root: &Value) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("json.deppytmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(root)?)?;
-    std::fs::rename(&tmp, path)?;
+    deppy_core::fs::atomic_write(path, serde_json::to_string_pretty(root)?.as_bytes())?;
     Ok(())
 }
 
@@ -101,7 +99,7 @@ pub fn uninstall_claude() -> anyhow::Result<()> {
 // 신뢰 승인이 뜬다(codex 자체 동작, 그 후 영속·자동). deppy는 프롬프트를 띄우지 않는다.
 
 fn codex_config_path() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("HOME")?).join(".codex/config.toml"))
+    Some(crate::paths::home_dir()?.join(".codex/config.toml"))
 }
 
 /// 이 hook 그룹이 우리 것인가(내부 command에 마커 포함).
@@ -131,9 +129,7 @@ fn codex_write(path: &std::path::Path, text: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("toml.deppytmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)?;
+    deppy_core::fs::atomic_write(path, text.as_bytes())?;
     Ok(())
 }
 

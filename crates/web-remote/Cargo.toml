@@ -13,6 +13,7 @@ license.workspace = true
 anyhow = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+deppy-core = { path = "../core" }
 secret = { path = "../secret" }
 # P2 대시보드: 활성 workspace worker 이벤트 구독(subscribe_with_wake) + 승인 DB 직행.
 runtime = { path = "../runtime" }

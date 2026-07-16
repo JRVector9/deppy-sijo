@@ -556,6 +556,33 @@ mod tests {
     }
 
     #[test]
+    fn pty_provider_badge는_status와_exit_경로에서_보존된다() {
+        let mut n = NotificationsUi::new();
+        let catalog = catalog();
+        n.on_pty_status(
+            WS,
+            SessionId(11),
+            SessionStatus::NeedsApproval,
+            "codex",
+            Some(AgentProvider::Codex),
+            &catalog,
+        );
+        n.on_pty_exit(
+            WS,
+            SessionId(12),
+            Some(0),
+            "claude",
+            Some(AgentProvider::Claude),
+            &catalog,
+        );
+
+        assert_eq!(n.items[0].source.badge(), "[Codex PTY]");
+        assert_eq!(n.items[1].source.badge(), "[Claude PTY]");
+        assert!(is_pty(&n.items[0], WS, SessionId(11)));
+        assert!(is_pty(&n.items[1], WS, SessionId(12)));
+    }
+
+    #[test]
     fn structured_active와_idle은_알림이_아니다() {
         let mut n = NotificationsUi::new();
         let catalog = catalog();

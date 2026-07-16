@@ -3142,7 +3142,28 @@ fn format_bytes(bytes: u64) -> String {
 mod tests {
     use super::*;
     use runtime::{MuxPaneId, MuxTabId, PaneSnapshot, TabSnapshot};
+    use std::sync::Mutex;
     use terminal::{CursorShape, CursorSnapshot, TerminalCell};
+
+    #[derive(Default)]
+    struct RecordingRuntime {
+        commands: Mutex<Vec<RuntimeCommand>>,
+    }
+
+    impl runtime::RuntimeCommandSink for RecordingRuntime {
+        fn send_command(&self, command: RuntimeCommand) -> anyhow::Result<()> {
+            self.commands.lock().unwrap().push(command);
+            Ok(())
+        }
+    }
+
+    impl runtime::RuntimeEventStream for RecordingRuntime {
+        fn subscribe(&self) -> runtime::RuntimeEventReceiver {
+            panic!("paste controller test does not subscribe")
+        }
+    }
+
+    impl runtime::RuntimeClient for RecordingRuntime {}
 
     fn pane_id(name: &str) -> MuxPaneId {
         MuxPaneId(name.to_owned())
@@ -3623,6 +3644,40 @@ mod tests {
             clipboard_terminal_paste_bytes(None, Some(text.clone()), ShellKind::Posix, true),
             Some(text)
         );
+    }
+
+    #[test]
+    fn image_clipboard_background_result는_요청_세션에_정확히_한번만_전송된다() {
+        use crate::ui::file_tree::ShellKind;
+
+        let mut ui = WorkspaceUi::new();
+        let runtime = RecordingRuntime::default();
+        let session = SessionId(77);
+        let paths = vec![std::path::PathBuf::from("/tmp/clipboard image.png")];
+        let (tx, rx) = std::sync::mpsc::channel();
+        ui.paste_task = Some(PendingPaste {
+            rx,
+            session,
+            bracketed: true,
+            shell_kind: ShellKind::Posix,
+            text_fallback: None,
+            requested_at: std::time::Instant::now(),
+        });
+        tx.send(Ok(Some(paths.clone()))).unwrap();
+
+        ui.poll_paste_task(&runtime);
+        ui.poll_paste_task(&runtime);
+
+        let commands = runtime.commands.lock().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            &commands[0],
+            RuntimeCommand::WriteInput {
+                session: target,
+                bytes,
+            } if *target == session
+                && *bytes == paths_insert_paste_bytes(&paths, ShellKind::Posix, true)
+        ));
     }
 
     #[test]

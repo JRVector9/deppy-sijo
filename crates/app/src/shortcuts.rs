@@ -487,7 +487,20 @@ mod tests {
 
     #[test]
     fn extended_function_keys_roundtrip_without_modifiers() {
-        for key in [egui::Key::F13, egui::Key::F24] {
+        for key in [
+            egui::Key::F13,
+            egui::Key::F14,
+            egui::Key::F15,
+            egui::Key::F16,
+            egui::Key::F17,
+            egui::Key::F18,
+            egui::Key::F19,
+            egui::Key::F20,
+            egui::Key::F21,
+            egui::Key::F22,
+            egui::Key::F23,
+            egui::Key::F24,
+        ] {
             let event = key_event(key, egui::Modifiers::NONE, false);
             let binding = captured_binding(&event).expect("F13~F24는 단독 허용");
             assert_eq!(binding.logical_key, key);

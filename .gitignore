@@ -9,3 +9,8 @@ node_modules/
 # 예외: artifacts/render-bench/ 는 하위 .gitignore가 집계본(summary.md/csv)만 추적하게 한다.
 /artifacts/*
 !/artifacts/render-bench/
+
+# 런타임 로그 / 패키징 산출물 / codex CLI 세션 디렉터리 — 소스 아님
+/deppy-sijo.log
+/Deppy-Sijo-*.zip
+/.codex/

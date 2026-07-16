@@ -4889,6 +4889,9 @@ impl eframe::App for App {
                     &text,
                 );
             });
+        if self.active.workspace_ui.take_terminal_focus_claimed() {
+            self.agent_sessions_ui.surrender_text_focus(ui.ctx());
+        }
         // 활성 프로젝트 루트를 Codex thread/start / turn/start의 cwd로 넘긴다. 경로가
         // 비어 있거나 사라졌으면 생략해 App Server의 현재 작업 폴더를 존중한다.
         let agent_workspace_cwd = self

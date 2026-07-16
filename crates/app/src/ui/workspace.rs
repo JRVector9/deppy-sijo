@@ -22,9 +22,6 @@ pub struct WorkspaceUi {
     shell_kind: crate::ui::file_tree::ShellKind,
     /// IME 조합 중 텍스트 (focused pane 전용)
     preedit: String,
-    /// macOS/winit은 한글 조합을 확정한 printable key의 key-down을 숨기고 key-up만
-    /// 전달한다. 그 key-up을 원래 세션 입력으로 복구하기 위한 짧은 수명의 상태.
-    pending_ime_key_release: Option<PendingImeKeyRelease>,
     /// 이번 UI 프레임 직전에 AppKit local monitor가 본 ASCII 문장부호/숫자/공백
     /// key-down. IME Commit/Text와 대조한 뒤 누락된 문자만 복구하고 프레임 끝에 버린다.
     native_printable_key_downs: Vec<crate::native_key_monitor::NativePrintableKeyDown>,
@@ -69,6 +66,9 @@ pub struct WorkspaceUi {
     /// egui 포커스 동기화와 입력 대상 전환 대기. Runtime의 `FocusPane` 반영은 비동기라,
     /// 클릭·검색 닫힘 직후에도 이 pane을 먼저 입력 대상으로 삼아 첫 문자를 잃지 않는다.
     pending_focus: Option<runtime::MuxPaneId>,
+    /// 이 프레임에 사용자가 터미널을 직접 클릭해 키보드 소유권을 요청했다. App이
+    /// 뒤이어 렌더하는 Agents TextEdit의 지연 autofocus를 취소하는 one-shot 신호다.
+    terminal_focus_claimed: bool,
     /// 응답(Spawned/Failed)을 아직 못 받은 셸 spawn 수 — 0이 될 때까지 계속 폴링
     pending_spawns: u32,
     /// split 경계 드래그 중 로컬 미리보기 (path, ratio). 드래그 동안은 명령을 보내지
@@ -148,20 +148,8 @@ struct PendingPaste {
     requested_at: std::time::Instant,
 }
 
-struct PendingImeKeyRelease {
-    session: SessionId,
-    /// Commit/Text 또는 같은 프레임 fallback으로 이미 전송된 문자. key-up 문자가
-    /// 여기 있으면 정상 전달된 것이므로 다시 보내지 않는다.
-    delivered: Vec<char>,
-    armed_at: std::time::Instant,
-}
-
 /// 백그라운드 paste 결과의 수명 — 이보다 오래된 완료는 버린다.
 const PASTE_TASK_TTL: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// key-down과 key-up은 보통 수십~수백 ms 차이다. 오래 남은 IME 복구 상태가 이후
-/// 무관한 키를 가로채지 않도록 제한한다.
-const IME_KEY_RELEASE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// 세션별 화면 캐시. hidden tab 세션의 스냅샷은 `MuxUpdated`에서 버린다.
 #[derive(Default)]
@@ -192,7 +180,6 @@ impl WorkspaceUi {
             sessions: HashMap::new(),
             shell_kind: crate::ui::file_tree::default_shell_kind(),
             preedit: String::new(),
-            pending_ime_key_release: None,
             native_printable_key_downs: Vec::new(),
             native_clipboard_paste_requested: false,
             sent_sizes: HashMap::new(),
@@ -202,6 +189,7 @@ impl WorkspaceUi {
             last_focused_pane: None,
             session_flash: HashMap::new(),
             pending_focus: None,
+            terminal_focus_claimed: false,
             pending_spawns: 0,
             split_drag: None,
             confirm_close: None,
@@ -229,6 +217,13 @@ impl WorkspaceUi {
     /// 이번 프레임에 이 워크스페이스가 그린 터미널 렌더 카운터 합 (B1 실측).
     pub fn frame_counters(&self) -> renderer_egui::RenderCounters {
         self.frame_counters
+    }
+
+    /// Consume the one-frame terminal keyboard ownership claim. This is kept
+    /// separate from runtime pane focus because Agents is rendered after the
+    /// workspace and can otherwise re-request its deferred TextEdit focus.
+    pub fn take_terminal_focus_claimed(&mut self) -> bool {
+        std::mem::take(&mut self.terminal_focus_claimed)
     }
 
     /// 세션 스냅샷이 하나라도 도착했는가 — 워크스페이스 생성 burst의 `first_snapshot`
@@ -821,6 +816,7 @@ impl WorkspaceUi {
         catalog: &i18n::Catalog,
     ) {
         self.frame_counters = renderer_egui::RenderCounters::default();
+        self.terminal_focus_claimed = false;
         // AppKit local monitor는 winit/egui가 IME 처리 중 숨길 수 있는 원본 key-down을
         // 보존한다. 매 프레임 먼저 비워 두어 검색창/설정창에서 친 키가 나중에 터미널로
         // 이월되지 않게 하고, 실제 전송은 terminal_keyboard_active pane만 수행한다.
@@ -1373,17 +1369,17 @@ impl WorkspaceUi {
         let terminal_refocus_pending = self.pending_focus.as_ref() == Some(pane_id);
         let terminal_input_owner =
             terminal_input_owner(pane_id, focused, self.pending_focus.as_ref());
-        let any_window_visible = ui.ctx().memory(|mem| {
+        let any_blocking_window_visible = ui.ctx().memory(|mem| {
             mem.areas()
                 .visible_layer_ids()
                 .iter()
-                .any(|layer| layer.order == egui::Order::Middle)
+                .any(is_blocking_terminal_window)
         });
         let terminal_keyboard_active = terminal_input_owner
             && terminal_keyboard_input_allowed(
                 ui.ctx().text_edit_focused(),
                 ui.ctx().any_popup_open(),
-                any_window_visible,
+                any_blocking_window_visible,
                 terminal_refocus_pending,
             );
         let preedit =
@@ -1580,6 +1576,7 @@ impl WorkspaceUi {
             request_terminal_focus(&output.response);
         }
         if output.response.clicked() {
+            self.terminal_focus_claimed = true;
             request_terminal_focus(&output.response);
             // 이미 runtime focus인 pane을 다시 클릭해도 stale TextEdit focus를 누르고
             // 다음 keydown부터 터미널로 받도록 refocus를 예약한다.
@@ -1642,21 +1639,12 @@ impl WorkspaceUi {
             let native_key_downs = std::mem::take(&mut self.native_printable_key_downs);
             let native_clipboard_paste_requested =
                 std::mem::take(&mut self.native_clipboard_paste_requested);
-            let (ime_reconciliation, ime_release_recovery) = ui.input(|input| {
-                let reconciliation = reconcile_ime_text_events(
+            let ime_reconciliation = ui.input(|input| {
+                reconcile_ime_text_events(
                     &native_key_downs,
                     &input.raw.events,
                     preedit_active_before_input,
-                );
-                let recovery = update_ime_key_release_recovery(
-                    &mut self.pending_ime_key_release,
-                    session,
-                    &input.raw.events,
-                    preedit_active_before_input,
-                    &reconciliation.event_text,
-                    &reconciliation.fallback_bytes,
-                );
-                (reconciliation, recovery)
+                )
             });
             let mut copy_text: Option<String> = None;
             let mut image_paste_trigger =
@@ -1753,19 +1741,6 @@ impl WorkspaceUi {
                 }
             });
             pending.extend(&ime_reconciliation.fallback_bytes);
-            if let Some((recovery_session, byte)) = ime_release_recovery {
-                if recovery_session == session {
-                    pending.push(byte);
-                } else {
-                    self.send(
-                        client,
-                        RuntimeCommand::WriteInput {
-                            session: recovery_session,
-                            bytes: vec![byte],
-                        },
-                    );
-                }
-            }
             if let Some(text) = copy_text {
                 ui.ctx().copy_text(text);
             }
@@ -2379,7 +2354,6 @@ impl WorkspaceUi {
     fn begin_terminal_refocus(&mut self, pane: runtime::MuxPaneId) {
         self.pending_focus = Some(pane);
         self.preedit.clear();
-        self.pending_ime_key_release = None;
     }
 
     /// Runtime의 mux snapshot이 도착하기 전에도 입력을 새 pane으로 보낸다. 그렇지 않으면
@@ -2834,6 +2808,13 @@ fn terminal_keyboard_input_allowed(
     !popup_open && !top_window_open && (terminal_refocus_pending || !text_edit_focused)
 }
 
+/// Agents is a floating but non-modal navigator/editor. A terminal click must
+/// be able to reclaim focus while it remains open; confirmation/error windows
+/// continue to block terminal input as before.
+fn is_blocking_terminal_window(layer: &egui::LayerId) -> bool {
+    layer.order == egui::Order::Middle && layer.id != crate::ui::agent_sessions::agents_window_id()
+}
+
 /// Pending focus가 있으면 runtime snapshot의 이전 focused pane 대신 그것이 유일한 입력
 /// 대상이다. 이 규칙이 없으면 pane 전환 직후 문장부호가 이전 pane에 들어가거나 유실된다.
 fn terminal_input_owner(
@@ -2962,99 +2943,6 @@ fn reconcile_ime_text_events(
         event_text,
         fallback_bytes,
     }
-}
-
-/// macOS winit 0.30의 IME 경로는 조합을 확정한 key-down을 의도적으로 숨긴다. 대신
-/// 조합 상태가 Ground로 돌아온 뒤 같은 키의 key-up은 전달하므로, Commit 직후 첫
-/// key-up의 ASCII 문자를 복구한다. Commit/Text/기존 fallback에 이미 같은 문자가
-/// 있었다면 정상 전달된 것이므로 중복하지 않는다.
-fn update_ime_key_release_recovery(
-    pending: &mut Option<PendingImeKeyRelease>,
-    session: SessionId,
-    events: &[egui::Event],
-    preedit_active: bool,
-    reconciled_event_text: &[Option<String>],
-    same_frame_fallbacks: &[u8],
-) -> Option<(SessionId, u8)> {
-    if pending
-        .as_ref()
-        .is_some_and(|pending| pending.armed_at.elapsed() > IME_KEY_RELEASE_TTL)
-    {
-        *pending = None;
-    }
-
-    let mut ime_involved = preedit_active;
-    let mut delivered_in_batch = Vec::new();
-    let mut recovered = None;
-
-    for (event_index, event) in events.iter().enumerate() {
-        match event {
-            egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => {
-                ime_involved |= !text.is_empty();
-            }
-            egui::Event::Ime(egui::ImeEvent::Commit(_)) => {
-                if let Some(text) = reconciled_event_text[event_index].as_ref() {
-                    delivered_in_batch.extend(text.chars());
-                }
-                if ime_involved {
-                    let mut delivered = delivered_in_batch.clone();
-                    delivered.extend(same_frame_fallbacks.iter().copied().map(char::from));
-                    *pending = Some(PendingImeKeyRelease {
-                        session,
-                        delivered,
-                        armed_at: std::time::Instant::now(),
-                    });
-                }
-            }
-            egui::Event::Text(_) => {
-                let text = reconciled_event_text[event_index]
-                    .as_deref()
-                    .unwrap_or_default();
-                delivered_in_batch.extend(text.chars());
-                if let Some(pending) = pending.as_mut() {
-                    pending.delivered.extend(text.chars());
-                }
-            }
-            egui::Event::Key {
-                key:
-                    egui::Key::ShiftLeft
-                    | egui::Key::ShiftRight
-                    | egui::Key::ControlLeft
-                    | egui::Key::ControlRight
-                    | egui::Key::AltLeft
-                    | egui::Key::AltRight
-                    | egui::Key::SuperLeft
-                    | egui::Key::SuperRight,
-                pressed: false,
-                ..
-            } => {
-                // Shift+기호에서 Shift를 먼저 떼더라도 실제 printable key-up을 기다린다.
-            }
-            egui::Event::Key { pressed: false, .. } => {
-                let Some(mut armed) = pending.take() else {
-                    continue;
-                };
-                if armed.armed_at.elapsed() > IME_KEY_RELEASE_TTL {
-                    continue;
-                }
-                let Some(character) = input_mapper::ime_terminator_key_release_char(event) else {
-                    continue;
-                };
-                if let Some(index) = armed
-                    .delivered
-                    .iter()
-                    .position(|delivered| *delivered == character)
-                {
-                    armed.delivered.remove(index);
-                } else {
-                    recovered = Some((armed.session, character as u8));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    recovered
 }
 
 /// 상태 → tab 제목 아이콘 (PR-12).
@@ -3826,6 +3714,29 @@ mod tests {
     }
 
     #[test]
+    fn agents_window는_terminal_refocus를_막는_modal_layer가_아니다() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            egui::Window::new("Agents")
+                .id(crate::ui::agent_sessions::agents_window_id())
+                .show(ui.ctx(), |ui| {
+                    ui.label("agent content");
+                });
+        });
+        let agents = egui::LayerId::new(
+            egui::Order::Middle,
+            crate::ui::agent_sessions::agents_window_id(),
+        );
+        let confirmation = egui::LayerId::new(egui::Order::Middle, egui::Id::new("confirmation"));
+        let background = egui::LayerId::background();
+
+        assert!(ctx.memory(|memory| memory.areas().visible_layer_ids().contains(&agents)));
+        assert!(!is_blocking_terminal_window(&agents));
+        assert!(is_blocking_terminal_window(&confirmation));
+        assert!(!is_blocking_terminal_window(&background));
+    }
+
+    #[test]
     fn pending_focus는_runtime_이전_pane보다_먼저_입력_대상이_된다() {
         let old = pane_id("old");
         let next = pane_id("next");
@@ -3833,6 +3744,15 @@ mod tests {
         assert!(!terminal_input_owner(&old, true, Some(&next)));
         assert!(terminal_input_owner(&next, false, Some(&next)));
         assert!(terminal_input_owner(&next, true, Some(&next)));
+    }
+
+    #[test]
+    fn terminal_focus_claim은_한_frame에서_한번만_소비된다() {
+        let mut workspace = WorkspaceUi::new();
+        workspace.terminal_focus_claimed = true;
+
+        assert!(workspace.take_terminal_focus_claimed());
+        assert!(!workspace.take_terminal_focus_claimed());
     }
 
     fn printable_key(key: egui::Key) -> egui::Event {
@@ -3857,24 +3777,6 @@ mod tests {
         }
         bytes.extend(reconciliation.fallback_bytes);
         bytes
-    }
-
-    fn update_ime_recovery_for_test(
-        pending: &mut Option<PendingImeKeyRelease>,
-        session: SessionId,
-        events: &[egui::Event],
-        preedit_active: bool,
-        fallbacks: &[u8],
-    ) -> Option<(SessionId, u8)> {
-        let reconciled = reconcile_ime_text_events(&[], events, preedit_active);
-        update_ime_key_release_recovery(
-            pending,
-            session,
-            events,
-            preedit_active,
-            &reconciled.event_text,
-            fallbacks,
-        )
     }
 
     #[test]
@@ -4064,98 +3966,6 @@ mod tests {
             '.',
         )];
         assert!(reconciled_text_bytes(&native, &[], false).is_empty());
-    }
-
-    #[test]
-    fn macos_ime가_삼킨_마침표_keydown은_다음_keyup에서_복구된다() {
-        let session = SessionId(77);
-        let mut pending = None;
-        let commit_events = [
-            egui::Event::Ime(egui::ImeEvent::Preedit {
-                text: "ㅁ".into(),
-                active_range_chars: None,
-            }),
-            egui::Event::Ime(egui::ImeEvent::Preedit {
-                text: String::new(),
-                active_range_chars: None,
-            }),
-            egui::Event::Ime(egui::ImeEvent::Commit("ㅁ".into())),
-        ];
-        assert_eq!(
-            update_ime_recovery_for_test(&mut pending, session, &commit_events, false, &[]),
-            None
-        );
-        assert!(pending.is_some());
-
-        let modifier_release = egui::Event::Key {
-            key: egui::Key::ShiftLeft,
-            physical_key: Some(egui::Key::ShiftLeft),
-            pressed: false,
-            repeat: false,
-            modifiers: egui::Modifiers::NONE,
-        };
-        assert_eq!(
-            update_ime_recovery_for_test(&mut pending, session, &[modifier_release], false, &[]),
-            None
-        );
-        assert!(pending.is_some());
-
-        let release = egui::Event::Key {
-            key: egui::Key::Period,
-            physical_key: Some(egui::Key::Period),
-            pressed: false,
-            repeat: false,
-            modifiers: egui::Modifiers::NONE,
-        };
-        assert_eq!(
-            update_ime_recovery_for_test(&mut pending, session, &[release], false, &[]),
-            Some((session, b'.'))
-        );
-        assert!(pending.is_none());
-    }
-
-    #[test]
-    fn ime_commit이_특수문자까지_전달했다면_keyup은_중복하지_않는다() {
-        let session = SessionId(78);
-        let mut pending = None;
-        let commit = egui::Event::Ime(egui::ImeEvent::Commit("ㅁ.".into()));
-        assert_eq!(
-            update_ime_recovery_for_test(&mut pending, session, &[commit], true, &[]),
-            None
-        );
-        let release = egui::Event::Key {
-            key: egui::Key::Period,
-            physical_key: Some(egui::Key::Period),
-            pressed: false,
-            repeat: false,
-            modifiers: egui::Modifiers::NONE,
-        };
-        assert_eq!(
-            update_ime_recovery_for_test(&mut pending, session, &[release], false, &[]),
-            None
-        );
-    }
-
-    #[test]
-    fn 같은_frame_keydown_fallback이_있으면_뒤_keyup은_중복하지_않는다() {
-        let session = SessionId(79);
-        let mut pending = None;
-        let commit = egui::Event::Ime(egui::ImeEvent::Commit("ㅁ".into()));
-        assert_eq!(
-            update_ime_recovery_for_test(&mut pending, session, &[commit], true, b"."),
-            None
-        );
-        let release = egui::Event::Key {
-            key: egui::Key::Period,
-            physical_key: Some(egui::Key::Period),
-            pressed: false,
-            repeat: false,
-            modifiers: egui::Modifiers::NONE,
-        };
-        assert_eq!(
-            update_ime_recovery_for_test(&mut pending, session, &[release], false, &[]),
-            None
-        );
     }
 
     #[test]

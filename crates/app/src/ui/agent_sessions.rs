@@ -34,6 +34,16 @@ pub enum AgentSessionsRequest {
     InterruptPty(AgentSurfaceId),
 }
 
+/// Stable ID for the embedded Agents window.
+///
+/// Do not infer this from the visible title. Since egui 0.35, `Window::new`
+/// accepts `IntoAtoms` and derives its default ID from the resulting optional
+/// text value, which is not equivalent to `Id::new("Agents")`. The workspace
+/// uses this exact ID to classify this window as non-modal for PTY focus.
+pub(crate) fn agents_window_id() -> egui::Id {
+    egui::Id::new("deppy_agents_window")
+}
+
 /// Storage mutations emitted by the structured-session controller. `App` owns
 /// the `Db`, so it drains and executes these after the frame without exposing a
 /// database connection to UI code.
@@ -119,6 +129,7 @@ pub struct AgentSessionsUi {
     pending_model_catalog: Option<CodexModelCatalogReply>,
     pending_skill_catalog: Option<CodexSkillCatalogReply>,
     catalog_error: Option<String>,
+    text_input_ids: Vec<egui::Id>,
 }
 
 impl AgentSessionsUi {
@@ -150,11 +161,26 @@ impl AgentSessionsUi {
             pending_model_catalog: None,
             pending_skill_catalog: None,
             catalog_error: None,
+            text_input_ids: Vec::new(),
         }
     }
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// A terminal click is an explicit keyboard-ownership transfer. Cancel any
+    /// deferred Agents autofocus and release the exact Agents TextEdit if it
+    /// still owns egui focus; never clear an unrelated widget's focus.
+    pub fn surrender_text_focus(&mut self, ctx: &egui::Context) -> bool {
+        self.focus_new_prompt = false;
+        self.focus_follow_up = false;
+        let focused = ctx.memory(|memory| memory.focused());
+        let Some(focused) = focused.filter(|id| self.text_input_ids.contains(id)) else {
+            return false;
+        };
+        ctx.memory_mut(|memory| memory.surrender_focus(focused));
+        true
     }
 
     pub fn toggle(&mut self) {
@@ -949,13 +975,21 @@ impl AgentSessionsUi {
         }
         self.poll();
         if !self.open {
+            self.surrender_text_focus(ctx);
+            self.text_input_ids.clear();
             return Vec::new();
         }
 
+        let focused_before = ctx.memory(|memory| memory.focused());
+        let pointer_pressed = ctx.input(|input| input.pointer.primary_pressed());
+        let pointer_position = ctx.input(|input| input.pointer.interact_pos());
+        let previous_input_ids = std::mem::take(&mut self.text_input_ids);
+        let mut text_input_ids = Vec::new();
         let mut window_open = self.open;
         let mut actions = Vec::new();
         let mut requests = Vec::new();
-        egui::Window::new("Agents")
+        let window_response = egui::Window::new("Agents")
+            .id(agents_window_id())
             .open(&mut window_open)
             .default_width(960.0)
             .default_height(650.0)
@@ -1001,7 +1035,7 @@ impl AgentSessionsUi {
                         ui.weak("카탈로그 응답 대기 중…");
                     }
                 });
-                self.render_agent_controls(ui);
+                self.render_agent_controls(ui, &mut text_input_ids);
                 let prompt_response = ui.add_sized(
                     [ui.available_width(), 72.0],
                     egui::TextEdit::multiline(&mut self.new_prompt)
@@ -1009,6 +1043,7 @@ impl AgentSessionsUi {
                         .hint_text("Codex에게 맡길 작업을 입력하세요")
                         .desired_rows(3),
                 );
+                text_input_ids.push(prompt_response.id);
                 if self.focus_new_prompt {
                     prompt_response.request_focus();
                     self.focus_new_prompt = false;
@@ -1042,7 +1077,13 @@ impl AgentSessionsUi {
                     Some(surface) => {
                         render_selected_surface_header(ui, &surface);
                         if let Some(session) = self.selected_session_snapshot() {
-                            self.render_session(ui, session, workspace_cwd.clone(), &mut actions);
+                            self.render_session(
+                                ui,
+                                session,
+                                workspace_cwd.clone(),
+                                &mut actions,
+                                &mut text_input_ids,
+                            );
                         }
                     }
                     None => {
@@ -1051,6 +1092,30 @@ impl AgentSessionsUi {
                 }
             });
         self.open = window_open;
+        let content_visible = window_open
+            && window_response
+                .as_ref()
+                .is_some_and(|window| window.inner.is_some());
+        let focus_to_surrender = agent_focus_to_surrender(
+            focused_before,
+            &previous_input_ids,
+            pointer_pressed,
+            pointer_position,
+            window_response.as_ref().map(|window| window.response.rect),
+            content_visible,
+        );
+        if let Some(focused) = focus_to_surrender {
+            // `surrender_focus` is conditional on the same id still owning
+            // focus, so a terminal widget that already reclaimed focus in
+            // this frame is never cleared accidentally.
+            ctx.memory_mut(|memory| memory.surrender_focus(focused));
+            ctx.request_repaint();
+        }
+        self.text_input_ids = if self.open && content_visible {
+            text_input_ids
+        } else {
+            Vec::new()
+        };
 
         for action in actions {
             if let Some(request) = self.apply_action(action, ctx) {
@@ -1060,7 +1125,7 @@ impl AgentSessionsUi {
         requests
     }
 
-    fn render_agent_controls(&mut self, ui: &mut egui::Ui) {
+    fn render_agent_controls(&mut self, ui: &mut egui::Ui, text_input_ids: &mut Vec<egui::Id>) {
         let models = self.model_catalog.clone();
         let selected_model = models
             .iter()
@@ -1069,10 +1134,11 @@ impl AgentSessionsUi {
         ui.horizontal_wrapped(|ui| {
             ui.label("모델");
             if models.is_empty() {
-                ui.add_sized(
+                let response = ui.add_sized(
                     [210.0, 24.0],
                     egui::TextEdit::singleline(&mut self.new_model).hint_text("기본 Codex 모델"),
                 );
+                text_input_ids.push(response.id);
             } else {
                 egui::ComboBox::from_id_salt("agent-model-catalog")
                     .selected_text(
@@ -1118,10 +1184,11 @@ impl AgentSessionsUi {
                         }
                     });
             } else {
-                ui.add_sized(
+                let response = ui.add_sized(
                     [110.0, 24.0],
                     egui::TextEdit::singleline(&mut self.new_effort).hint_text("기본 effort"),
                 );
+                text_input_ids.push(response.id);
             }
         });
 
@@ -1238,6 +1305,7 @@ impl AgentSessionsUi {
         ui: &mut egui::Ui,
         session: &AgentSession,
         actions: &mut Vec<PanelAction>,
+        text_input_ids: &mut Vec<egui::Id>,
     ) {
         let mut model = session.model.clone().unwrap_or_default();
         let mut effort = session.effort.clone().unwrap_or_default();
@@ -1256,6 +1324,7 @@ impl AgentSessionsUi {
                 &mut model,
                 &mut effort,
                 &mut skill_paths,
+                text_input_ids,
             );
             ui.weak(
                 "model/effort 변경은 서버 설정을 즉시 바꾸지 않고 다음 turn/start에 적용됩니다.",
@@ -1298,6 +1367,7 @@ impl AgentSessionsUi {
         session: AgentSession,
         workspace_cwd: Option<String>,
         actions: &mut Vec<PanelAction>,
+        text_input_ids: &mut Vec<egui::Id>,
     ) {
         let is_persisted = self.persisted_threads.contains_key(&session.id);
         let is_attached = self.attached_threads.contains(&session.id);
@@ -1357,7 +1427,7 @@ impl AgentSessionsUi {
             });
         }
         if session.thread_id.is_some() {
-            self.render_session_turn_controls(ui, &session, actions);
+            self.render_session_turn_controls(ui, &session, actions, text_input_ids);
         }
         if is_persisted {
             ui.horizontal(|ui| {
@@ -1407,11 +1477,12 @@ impl AgentSessionsUi {
             ui.add_space(4.0);
             ui.label("현재 turn에 추가 지시 (steer)");
             ui.horizontal(|ui| {
-                ui.add_sized(
+                let response = ui.add_sized(
                     [ui.available_width() - 110.0, 38.0],
                     egui::TextEdit::multiline(&mut self.steer_input)
                         .hint_text("진행 중인 작업에 지금 반영할 지시"),
                 );
+                text_input_ids.push(response.id);
                 if ui
                     .add_enabled(
                         !self.steer_input.trim().is_empty(),
@@ -1577,6 +1648,7 @@ impl AgentSessionsUi {
                     .hint_text("같은 thread에 다음 작업을 보냅니다")
                     .desired_rows(2),
             );
+            text_input_ids.push(follow_up_response.id);
             if self.focus_follow_up {
                 follow_up_response.request_focus();
                 self.focus_follow_up = false;
@@ -1873,6 +1945,26 @@ impl AgentSessionsUi {
     }
 }
 
+fn agent_focus_to_surrender(
+    focused: Option<egui::Id>,
+    agent_input_ids: &[egui::Id],
+    pointer_pressed: bool,
+    pointer_position: Option<egui::Pos2>,
+    window_rect: Option<egui::Rect>,
+    content_visible: bool,
+) -> Option<egui::Id> {
+    let focused = focused?;
+    if !agent_input_ids.contains(&focused) {
+        return None;
+    }
+    if !content_visible {
+        return Some(focused);
+    }
+    let pointer = pointer_position?;
+    let window_rect = window_rect?;
+    (pointer_pressed && !window_rect.contains(pointer)).then_some(focused)
+}
+
 enum PanelAction {
     Start {
         workspace_id: String,
@@ -1963,6 +2055,7 @@ fn render_turn_control_fields(
     model_value: &mut String,
     effort_value: &mut String,
     selected_skill_paths: &mut HashSet<String>,
+    text_input_ids: &mut Vec<egui::Id>,
 ) {
     let selected_model = models
         .iter()
@@ -1971,10 +2064,11 @@ fn render_turn_control_fields(
     ui.horizontal_wrapped(|ui| {
         ui.label("모델");
         if models.is_empty() {
-            ui.add_sized(
+            let response = ui.add_sized(
                 [210.0, 24.0],
                 egui::TextEdit::singleline(model_value).hint_text("기본 Codex 모델"),
             );
+            text_input_ids.push(response.id);
         } else {
             egui::ComboBox::from_id_salt(("agent-turn-model", id))
                 .selected_text(
@@ -2016,10 +2110,11 @@ fn render_turn_control_fields(
                     }
                 });
         } else {
-            ui.add_sized(
+            let response = ui.add_sized(
                 [110.0, 24.0],
                 egui::TextEdit::singleline(effort_value).hint_text("기본 effort"),
             );
+            text_input_ids.push(response.id);
         }
     });
     if !skills.is_empty() {
@@ -2670,5 +2765,97 @@ mod tests {
             AgentSessionPersistenceMutation::Upsert { model, .. }
                 if model.as_deref() == Some("gpt-new")
         ));
+    }
+
+    #[test]
+    fn agents_text_focus는_window_밖_primary_click에서만_반납한다() {
+        let field = egui::Id::new("agent-field");
+        let other = egui::Id::new("other-field");
+        let rect = egui::Rect::from_min_max(egui::pos2(10.0, 10.0), egui::pos2(100.0, 100.0));
+
+        assert_eq!(
+            agent_focus_to_surrender(
+                Some(field),
+                &[field],
+                true,
+                Some(egui::pos2(4.0, 4.0)),
+                Some(rect),
+                true,
+            ),
+            Some(field)
+        );
+        assert_eq!(
+            agent_focus_to_surrender(
+                Some(field),
+                &[field],
+                true,
+                Some(egui::pos2(50.0, 50.0)),
+                Some(rect),
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            agent_focus_to_surrender(
+                Some(other),
+                &[field],
+                true,
+                Some(egui::pos2(4.0, 4.0)),
+                Some(rect),
+                true,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn agents가_접히거나_닫히면_숨겨진_text_focus를_즉시_반납한다() {
+        let field = egui::Id::new("agent-field");
+        let rect = egui::Rect::from_min_max(egui::pos2(10.0, 10.0), egui::pos2(100.0, 100.0));
+
+        assert_eq!(
+            agent_focus_to_surrender(Some(field), &[field], false, None, Some(rect), false),
+            Some(field)
+        );
+        assert_eq!(
+            agent_focus_to_surrender(
+                Some(egui::Id::new("terminal")),
+                &[field],
+                false,
+                None,
+                Some(rect),
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn terminal_claim은_agents_text_focus와_지연_autofocus를_함께_반납한다() {
+        let ctx = egui::Context::default();
+        let field = egui::Id::new("agent-field");
+        let mut ui = AgentSessionsUi::new();
+        ui.text_input_ids.push(field);
+        ui.focus_new_prompt = true;
+        ui.focus_follow_up = true;
+        ctx.memory_mut(|memory| memory.request_focus(field));
+
+        assert!(ui.surrender_text_focus(&ctx));
+        assert_eq!(ctx.memory(|memory| memory.focused()), None);
+        assert!(!ui.focus_new_prompt);
+        assert!(!ui.focus_follow_up);
+    }
+
+    #[test]
+    fn terminal_claim은_이미_포커스된_다른_widget을_지우지_않는다() {
+        let ctx = egui::Context::default();
+        let field = egui::Id::new("agent-field");
+        let terminal = egui::Id::new("terminal");
+        let mut ui = AgentSessionsUi::new();
+        ui.text_input_ids.push(field);
+        ctx.memory_mut(|memory| memory.request_focus(terminal));
+
+        assert!(!ui.surrender_text_focus(&ctx));
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(terminal));
     }
 }

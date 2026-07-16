@@ -66,6 +66,7 @@ impl ApprovalsUi {
 
     /// 버튼 클릭 → 결정 매핑 (egui 컨텍스트 없이 테스트할 수 있게 분리).
     /// 맨 앞(가장 오래된) 항목 하나에 대해서만 결정을 만든다.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn decide(&self, allowed: bool) -> Option<ApprovalDecision> {
         self.pending.first().map(|row| ApprovalDecision {
             id: row.id.clone(),
@@ -77,8 +78,14 @@ impl ApprovalsUi {
     /// pending 항목이 있으면 모달식 창을 그린다. 버튼을 누르면 그 결정을 돌려준다.
     /// 한 번에 하나(가장 오래된 것)만 — 해소 후 목록을 갱신하면 다음 항목이 뜬다.
     ///
+    /// **v3.9 N4부터 호출되지 않는다** — 승인은 벨 팝오버 인박스가 처리한다(전역 대기를
+    /// 한 곳에서, 워크스페이스 전환 없이). 이 위젯은 되돌릴 수 있게 남겨 둔 것이다:
+    /// 강제 팝업이 필요하다고 판단되면 app.rs의 호출 한 줄을 되살리면 된다. `pending`
+    /// 목록 자체는 인박스 카드의 소스로 계속 쓰인다.
+    ///
     /// 창이 숨겨져 있으면 ui()가 실행되지 않아 이 팝업도 안 뜬다 — 사용자가 앱을
     /// 전면으로 가져와야 승인할 수 있다(그동안 proxy는 타임아웃까지 폴링). 의도된 동작.
+    #[allow(dead_code, reason = "N4에서 호출 중단 — 되살릴 수 있게 보존 (위 주석)")]
     pub fn show(
         &mut self,
         ctx: &egui::Context,

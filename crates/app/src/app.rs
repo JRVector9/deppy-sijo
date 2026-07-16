@@ -5302,26 +5302,17 @@ impl eframe::App for App {
         }
         // (알림 클릭 → focus/전환 처리는 통합 설정 창 렌더 이후로 이동 — 클로저에서 캡처)
 
-        // agent-proxy 승인 팝업 (option 1.5). logic()이 폴링해 넣어둔 pending 중 가장
-        // 오래된 하나를 모달로 띄운다. 버튼을 누르면 결정을 DB에 되쓴다.
-        if let Some(decision) = self.approvals_ui.show(ui.ctx(), &text) {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            // proxy가 타임아웃으로 먼저 해소했으면 행이 사라졌을 수 있다 —
-            // resolve_approval은 first-writer-wins라 그 경우 조용한 no-op(안전).
-            if let Err(e) =
-                self.db
-                    .resolve_approval(&decision.id, decision.allowed, decision.remember, now)
-            {
-                tracing::warn!("승인 해소 실패: {e:#}");
-            }
-            self.prune_resolved_approvals();
-            // 해소 직후 목록을 갱신해 다음 항목이 바로 뜨게 한다 (다음 폴링을 기다리지 않음).
-            self.poll_pending_approvals();
-            ui.ctx().request_repaint();
-        }
+        // agent-proxy 승인은 벨 팝오버의 「대기 중」 섹션이 처리한다 (v3.9 N4) — 화면 중앙
+        // 모달은 **표시하지 않는다**.
+        //
+        // 모달을 접는 이유: 인박스는 전역(다른 워크스페이스 것 포함) 대기를 한 곳에서
+        // 보여주고 그 자리에서 처리하는데, 모달은 큐의 맨 앞 1건만 강제로 띄워 작업을
+        // 가로챈다 — 같은 일을 두 곳에서 다르게 하는 셈이다. "무시할 수 없게 알린다"는
+        // 모달의 역할은 벨 뱃지 + 기존 OS 알림이 대신한다.
+        //
+        // `ApprovalsUi`(모달 위젯)와 `show()`는 **의도적으로 남겨 둔다** — 인박스를 써 보고
+        // 강제 팝업이 필요하다고 판단되면 이 호출 한 줄을 되살리면 된다. 상태(pending
+        // 목록)는 인박스 카드의 소스로 계속 쓰이므로 set_pending 폴링은 그대로다.
 
         if self.runtime_stream_warning {
             let mut close = false;

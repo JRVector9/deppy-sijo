@@ -17,8 +17,10 @@ use serde_json::{Value, json};
 
 use crate::agent_session::{
     AgentApproval, AgentApprovalDecision, AgentApprovalKind, AgentItem, AgentSessionEvent,
-    AgentSessionId,
+    AgentSessionId, AgentThreadStatus,
 };
+
+const MAX_BUFFERED_THREAD_STATUSES: usize = 64;
 
 /// Configuration for one local App Server connection.
 #[derive(Debug, Clone)]
@@ -255,6 +257,11 @@ struct WorkerState {
     queued_starts: Vec<QueuedStart>,
     thread_to_session: HashMap<String, AgentSessionId>,
     session_to_thread: HashMap<AgentSessionId, String>,
+    /// A status notification can race ahead of `thread/start`'s response, which
+    /// is where the local session mapping becomes known. Keep only the latest
+    /// status for a small bounded number of such threads and replay it once the
+    /// mapping is installed.
+    buffered_thread_statuses: HashMap<String, AgentThreadStatus>,
     session_to_turn: HashMap<AgentSessionId, String>,
     server_requests: HashMap<String, ServerRequest>,
     known_sessions: HashSet<AgentSessionId>,
@@ -775,8 +782,18 @@ fn handle_response(
                 events,
                 repaint,
                 session_id.clone(),
-                AgentSessionEvent::ThreadStarted { thread_id },
+                AgentSessionEvent::ThreadStarted {
+                    thread_id: thread_id.clone(),
+                },
             );
+            if let Some(status) = state.buffered_thread_statuses.remove(&thread_id) {
+                emit_session(
+                    events,
+                    repaint,
+                    session_id.clone(),
+                    AgentSessionEvent::ThreadStatusChanged { status },
+                );
+            }
             if let Err(error) =
                 start_turn_for_session(stdin, state, session_id.clone(), prompt, cwd, model)
             {
@@ -829,6 +846,28 @@ fn handle_notification(
     };
     let params = message.get("params").unwrap_or(&Value::Null);
     match method {
+        "thread/status/changed" => {
+            let Some(thread_id) = params.get("threadId").and_then(Value::as_str) else {
+                return;
+            };
+            let Some(status) = params.get("status").and_then(AgentThreadStatus::from_codex) else {
+                return;
+            };
+            if let Some(session_id) = state.thread_to_session.get(thread_id).cloned() {
+                emit_session(
+                    events,
+                    repaint,
+                    session_id,
+                    AgentSessionEvent::ThreadStatusChanged { status },
+                );
+            } else if state.buffered_thread_statuses.contains_key(thread_id)
+                || state.buffered_thread_statuses.len() < MAX_BUFFERED_THREAD_STATUSES
+            {
+                state
+                    .buffered_thread_statuses
+                    .insert(thread_id.to_owned(), status);
+            }
+        }
         "thread/started" => {
             let Some(thread_id) = params.pointer("/thread/id").and_then(Value::as_str) else {
                 return;
@@ -1169,5 +1208,90 @@ mod tests {
         let frame = json!({"id": id, "result": {"decision": "accept"}});
         assert_eq!(frame["id"], "request-42");
         assert_eq!(frame["result"]["decision"], "accept");
+    }
+
+    #[test]
+    fn thread_status_notification_emits_authoritative_session_event() {
+        let mut state = WorkerState::default();
+        state
+            .thread_to_session
+            .insert("thread-1".to_owned(), "session-1".to_owned());
+        let (events, received) = mpsc::channel();
+
+        handle_notification(
+            json!({
+                "method": "thread/status/changed",
+                "params": {
+                    "threadId": "thread-1",
+                    "status": {
+                        "type": "active",
+                        "activeFlags": ["waitingOnUserInput"]
+                    }
+                }
+            }),
+            &mut state,
+            &events,
+            &egui::Context::default(),
+        );
+
+        assert_eq!(
+            received.try_recv().unwrap(),
+            CodexAppServerEvent::Session {
+                session_id: "session-1".to_owned(),
+                event: AgentSessionEvent::ThreadStatusChanged {
+                    status: AgentThreadStatus::Active {
+                        waiting_on_approval: false,
+                        waiting_on_user_input: true,
+                    },
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn early_thread_status_is_buffered_until_session_mapping_exists() {
+        let mut state = WorkerState::default();
+        let (events, received) = mpsc::channel();
+        handle_notification(
+            json!({
+                "method": "thread/status/changed",
+                "params": {
+                    "threadId": "thread-early",
+                    "status": {"type": "idle"}
+                }
+            }),
+            &mut state,
+            &events,
+            &egui::Context::default(),
+        );
+
+        assert!(matches!(received.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(
+            state.buffered_thread_statuses.get("thread-early"),
+            Some(&AgentThreadStatus::Idle)
+        );
+    }
+
+    #[test]
+    fn unknown_thread_status_variant_is_ignored_without_transport_failure() {
+        let mut state = WorkerState::default();
+        state
+            .thread_to_session
+            .insert("thread-1".to_owned(), "session-1".to_owned());
+        let (events, received) = mpsc::channel();
+        handle_notification(
+            json!({
+                "method": "thread/status/changed",
+                "params": {
+                    "threadId": "thread-1",
+                    "status": {"type": "futureStatus", "futureField": true}
+                }
+            }),
+            &mut state,
+            &events,
+            &egui::Context::default(),
+        );
+
+        assert!(matches!(received.try_recv(), Err(TryRecvError::Empty)));
     }
 }

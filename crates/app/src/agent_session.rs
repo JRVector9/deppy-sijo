@@ -25,6 +25,59 @@ pub enum AgentSessionStatus {
     Stopped,
 }
 
+/// Authoritative runtime status emitted by Codex App Server through
+/// `thread/status/changed`.
+///
+/// Keep this wire-facing type separate from [`AgentSessionStatus`]: the latter
+/// also carries Deppy-owned presentation states such as an unacknowledged
+/// completed turn, while this enum describes only the server's current thread
+/// runtime state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentThreadStatus {
+    NotLoaded,
+    Idle,
+    Active {
+        waiting_on_approval: bool,
+        waiting_on_user_input: bool,
+    },
+    SystemError,
+}
+
+impl AgentThreadStatus {
+    /// Parse the stable tagged-union shape from `thread/status/changed`.
+    /// Unknown future variants are ignored by returning `None`; they must not
+    /// tear down an otherwise healthy App Server connection.
+    pub fn from_codex(value: &Value) -> Option<Self> {
+        match value.get("type").and_then(Value::as_str)? {
+            "notLoaded" => Some(Self::NotLoaded),
+            "idle" => Some(Self::Idle),
+            "systemError" => Some(Self::SystemError),
+            "active" => {
+                let mut waiting_on_approval = false;
+                let mut waiting_on_user_input = false;
+                for flag in value
+                    .get("activeFlags")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
+                    match flag {
+                        "waitingOnApproval" => waiting_on_approval = true,
+                        "waitingOnUserInput" => waiting_on_user_input = true,
+                        _ => {}
+                    }
+                }
+                Some(Self::Active {
+                    waiting_on_approval,
+                    waiting_on_user_input,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
 impl AgentSessionStatus {
     pub fn label(self) -> &'static str {
         match self {
@@ -279,6 +332,7 @@ impl AgentApprovalDecision {
 pub enum AgentSessionEvent {
     ConnectionReady,
     ThreadStarted { thread_id: String },
+    ThreadStatusChanged { status: AgentThreadStatus },
     TurnStarted { turn_id: String },
     ItemStarted { item: AgentItem },
     ItemDelta { item_id: String, delta: String },
@@ -298,6 +352,10 @@ pub struct AgentSession {
     pub cwd: Option<String>,
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
+    /// Latest authoritative App Server runtime state. `status` may deliberately
+    /// retain a completed result until it is acknowledged even after this has
+    /// already advanced to `Idle`.
+    pub thread_status: Option<AgentThreadStatus>,
     pub status: AgentSessionStatus,
     pub items: Vec<AgentItem>,
     pub approvals: Vec<AgentApproval>,
@@ -313,6 +371,7 @@ impl AgentSession {
             cwd,
             thread_id: None,
             turn_id: None,
+            thread_status: None,
             status: AgentSessionStatus::Starting,
             items: Vec::new(),
             approvals: Vec::new(),
@@ -339,8 +398,15 @@ impl AgentSession {
                     self.status = AgentSessionStatus::Ready;
                 }
             }
+            AgentSessionEvent::ThreadStatusChanged { status } => {
+                self.thread_status = Some(status);
+                self.apply_thread_status(status);
+            }
             AgentSessionEvent::TurnStarted { turn_id } => {
                 self.turn_id = Some(turn_id);
+                // The previous idle status is stale as soon as a new turn is
+                // accepted; the next thread/status notification will replace it.
+                self.thread_status = None;
                 self.error = None;
                 self.status = AgentSessionStatus::Running;
             }
@@ -348,7 +414,7 @@ impl AgentSession {
                 item.status.get_or_insert_with(|| "inProgress".to_owned());
                 self.upsert_item(item, false);
                 if !self.status.is_terminal() {
-                    self.status = AgentSessionStatus::Running;
+                    self.apply_running_fallback();
                 }
             }
             AgentSessionEvent::ItemDelta { item_id, delta } => {
@@ -374,7 +440,7 @@ impl AgentSession {
                 self.approvals
                     .retain(|approval| approval.request_key != request_key);
                 if self.approvals.is_empty() && !self.status.is_terminal() {
-                    self.status = AgentSessionStatus::Running;
+                    self.apply_running_fallback();
                 }
             }
             AgentSessionEvent::TurnCompleted { status } => {
@@ -421,6 +487,22 @@ impl AgentSession {
             .collect()
     }
 
+    /// Consume the green completed latch after the user opens the session.
+    /// The newest authoritative runtime status decides the state underneath it.
+    pub fn acknowledge_completion(&mut self) -> bool {
+        if self.status != AgentSessionStatus::Completed {
+            return false;
+        }
+        // Drop the presentation latch before applying the raw state; otherwise
+        // the ordinary idle transition correctly preserves `Completed` again.
+        self.status = AgentSessionStatus::Ready;
+        match self.thread_status {
+            Some(status) => self.apply_thread_status(status),
+            None => {}
+        }
+        true
+    }
+
     fn upsert_item(&mut self, item: AgentItem, preserve_live_text: bool) {
         if let Some(&index) = self.item_indices.get(&item.id) {
             let old = &self.items[index];
@@ -440,6 +522,60 @@ impl AgentSession {
         let index = self.items.len();
         self.item_indices.insert(item.id.clone(), index);
         self.items.push(item);
+    }
+
+    fn apply_thread_status(&mut self, status: AgentThreadStatus) {
+        match status {
+            AgentThreadStatus::NotLoaded => {
+                // A completed/error result stays visible until the user sees it.
+                // A later active status (the next turn) clears that latch.
+                if !self.status.is_terminal() {
+                    self.status = AgentSessionStatus::Stopped;
+                }
+            }
+            AgentThreadStatus::Idle => {
+                if !matches!(
+                    self.status,
+                    AgentSessionStatus::Completed
+                        | AgentSessionStatus::Interrupted
+                        | AgentSessionStatus::Failed
+                ) {
+                    self.status = AgentSessionStatus::Ready;
+                }
+            }
+            AgentThreadStatus::Active {
+                waiting_on_approval,
+                waiting_on_user_input,
+            } => {
+                self.error = None;
+                self.status = if waiting_on_approval || waiting_on_user_input {
+                    AgentSessionStatus::AwaitingApproval
+                } else {
+                    AgentSessionStatus::Running
+                };
+            }
+            AgentThreadStatus::SystemError => {
+                self.error
+                    .get_or_insert_with(|| "Codex App Server system error".to_owned());
+                self.status = AgentSessionStatus::Failed;
+            }
+        }
+    }
+
+    fn apply_running_fallback(&mut self) {
+        self.status = match self.thread_status {
+            Some(
+                AgentThreadStatus::Active {
+                    waiting_on_approval: true,
+                    ..
+                }
+                | AgentThreadStatus::Active {
+                    waiting_on_user_input: true,
+                    ..
+                },
+            ) => AgentSessionStatus::AwaitingApproval,
+            _ => AgentSessionStatus::Running,
+        };
     }
 }
 
@@ -679,5 +815,144 @@ mod tests {
 
         assert_eq!(session.status, AgentSessionStatus::Running);
         assert_eq!(session.thread_id.as_deref(), Some("thread-1"));
+    }
+
+    #[test]
+    fn authoritative_thread_status_maps_all_stable_wire_variants() {
+        let cases = [
+            (json!({"type": "notLoaded"}), AgentThreadStatus::NotLoaded),
+            (json!({"type": "idle"}), AgentThreadStatus::Idle),
+            (
+                json!({"type": "active", "activeFlags": []}),
+                AgentThreadStatus::Active {
+                    waiting_on_approval: false,
+                    waiting_on_user_input: false,
+                },
+            ),
+            (
+                json!({
+                    "type": "active",
+                    "activeFlags": ["waitingOnApproval", "waitingOnUserInput"]
+                }),
+                AgentThreadStatus::Active {
+                    waiting_on_approval: true,
+                    waiting_on_user_input: true,
+                },
+            ),
+            (
+                json!({"type": "systemError"}),
+                AgentThreadStatus::SystemError,
+            ),
+        ];
+
+        for (wire, expected) in cases {
+            assert_eq!(AgentThreadStatus::from_codex(&wire), Some(expected));
+        }
+        assert_eq!(
+            AgentThreadStatus::from_codex(&json!({"type": "futureStatus"})),
+            None
+        );
+    }
+
+    #[test]
+    fn authoritative_wait_flags_project_to_waiting_and_active() {
+        let mut session = AgentSession::new("local-1".to_owned(), "hello".to_owned(), None);
+        session.apply(AgentSessionEvent::ThreadStatusChanged {
+            status: AgentThreadStatus::Active {
+                waiting_on_approval: false,
+                waiting_on_user_input: true,
+            },
+        });
+        assert_eq!(session.status, AgentSessionStatus::AwaitingApproval);
+
+        session.apply(AgentSessionEvent::ThreadStatusChanged {
+            status: AgentThreadStatus::Active {
+                waiting_on_approval: false,
+                waiting_on_user_input: false,
+            },
+        });
+        assert_eq!(session.status, AgentSessionStatus::Running);
+    }
+
+    #[test]
+    fn idle_duplicate_does_not_clear_unacknowledged_completion() {
+        let mut session = AgentSession::new("local-1".to_owned(), "hello".to_owned(), None);
+        session.apply(AgentSessionEvent::TurnCompleted {
+            status: "completed".to_owned(),
+        });
+        session.apply(AgentSessionEvent::ThreadStatusChanged {
+            status: AgentThreadStatus::Idle,
+        });
+        session.apply(AgentSessionEvent::ThreadStatusChanged {
+            status: AgentThreadStatus::Idle,
+        });
+        assert_eq!(session.status, AgentSessionStatus::Completed);
+
+        assert!(session.acknowledge_completion());
+        assert_eq!(session.status, AgentSessionStatus::Ready);
+
+        session.apply(AgentSessionEvent::TurnCompleted {
+            status: "completed".to_owned(),
+        });
+
+        session.apply(AgentSessionEvent::ThreadStatusChanged {
+            status: AgentThreadStatus::Active {
+                waiting_on_approval: false,
+                waiting_on_user_input: false,
+            },
+        });
+        assert_eq!(session.status, AgentSessionStatus::Running);
+    }
+
+    #[test]
+    fn heuristic_item_events_do_not_override_authoritative_waiting() {
+        let mut session = AgentSession::new("local-1".to_owned(), "hello".to_owned(), None);
+        session.apply(AgentSessionEvent::ThreadStatusChanged {
+            status: AgentThreadStatus::Active {
+                waiting_on_approval: false,
+                waiting_on_user_input: true,
+            },
+        });
+        session.apply(AgentSessionEvent::ItemStarted {
+            item: AgentItem::from_codex(&json!({
+                "id": "message-1",
+                "type": "agentMessage",
+                "text": "waiting"
+            }))
+            .unwrap(),
+        });
+
+        assert_eq!(session.status, AgentSessionStatus::AwaitingApproval);
+    }
+
+    #[test]
+    fn system_error_is_authoritative_even_after_completion() {
+        let mut session = AgentSession::new("local-1".to_owned(), "hello".to_owned(), None);
+        session.apply(AgentSessionEvent::TurnCompleted {
+            status: "completed".to_owned(),
+        });
+        session.apply(AgentSessionEvent::ThreadStatusChanged {
+            status: AgentThreadStatus::SystemError,
+        });
+
+        assert_eq!(session.status, AgentSessionStatus::Failed);
+        assert_eq!(
+            session.error.as_deref(),
+            Some("Codex App Server system error")
+        );
+    }
+
+    #[test]
+    fn idle_reactivates_a_thread_that_was_previously_not_loaded() {
+        let mut session = AgentSession::new("local-1".to_owned(), "hello".to_owned(), None);
+        session.apply(AgentSessionEvent::ThreadStatusChanged {
+            status: AgentThreadStatus::NotLoaded,
+        });
+        assert_eq!(session.status, AgentSessionStatus::Stopped);
+
+        session.apply(AgentSessionEvent::ThreadStatusChanged {
+            status: AgentThreadStatus::Idle,
+        });
+        assert_eq!(session.status, AgentSessionStatus::Ready);
     }
 }

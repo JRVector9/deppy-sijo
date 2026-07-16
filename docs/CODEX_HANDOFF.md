@@ -3,7 +3,7 @@
 ## Current task
 
 - Implement the approved Agent Workspace scope as parallel logical PRs: distinguish Codex APP/Codex PTY/Claude PTY, normalize status colors, consume authoritative App Server state, add capability-gated actions/shortcuts, integrate structured notifications into the existing settings area, persist structured threads separately from PTY resume metadata, expose supported model/effort/skills/steer controls, and deliver a tested signed release build.
-- Status: in progress. PR-01 provider-neutral `AgentSurface` contract is implemented and its focused tests pass; transport/UI/action tracks are reviewing their isolated integration points before parallel edits. Micro hardware discovery/RGB/reconnect/profile work and Gmail/Slack/MCP external notifications are explicitly out of scope.
+- Status: in progress. PR-01 provider-neutral `AgentSurface` contract is committed. PR-02 authoritative status handling, PR-03 APP/PTY badges and common colors, PR-04 shortcuts/action gates, and PR-05 structured notification projection are present as isolated worktree changes and are being integrated. Micro hardware discovery/RGB/reconnect/profile work and Gmail/Slack/MCP external notifications are explicitly out of scope.
 
 ## Working area
 
@@ -16,14 +16,18 @@
 
 ## Plan
 
-1. In progress — PR-01 common AgentSurface/provider/transport/capability/visual-state contract and tests.
-2. Pending parallel wave — PR-02 authoritative App Server thread status, PR-03 APP/PTY UI and palette, PR-04 capability-gated actions/shortcuts, PR-05 structured notifications.
+1. Completed — PR-01 common AgentSurface/provider/transport/capability/visual-state contract and tests (`b4f48b7`).
+2. In progress — integrate and commit PR-02 authoritative App Server thread status, PR-03 APP/PTY UI and palette, PR-04 capability-gated actions/shortcuts, and PR-05 structured notifications.
 3. Pending checkpoint — integrate PR-01/02/03, build/sign/launch, and report the first visible APP/PTY badges and status colors.
 4. Pending — PR-06 separate structured thread persistence/list/read/resume/archive.
 5. Pending — PR-07 model/effort/skills/steer plus usage/rate-limit capabilities with version-safe fallbacks.
 6. Pending — PR-08 full regressions, strict Clippy, release package/signature, launch, commits, and final handoff.
 
 ## Status
+
+- 2026-07-16: PR-02 authoritative App Server status implementation reached its first stable checkpoint. `thread/status/changed` parses all known wire variants, preserves waiting flags as authoritative over heuristic item events, buffers up to 64 early status events until `thread/start` mapping exists, ignores future unknown variants, and keeps completed green latched until explicit acknowledgement or a next active turn. An added acknowledgement regression initially failed because the completed guard reapplied itself; the implementation now drops the presentation latch before applying the latest raw thread status. Isolated PR-02 tests pass 10/10.
+- 2026-07-16: PR-03 checkpoint UI is implemented: terminal session metadata is prefixed `[PTY] Codex`/`[PTY] Claude`, the structured window/header/tabs are prefixed `[APP] Codex`, and both surfaces use the exact shared Off/Idle/Active/Waiting/Complete/Error palette. Focused palette and badge tests pass 1/1 each, with scoped rustfmt and diff checks clean.
+- 2026-07-16: PR-04 added an Agent shortcut group, safe F13–F24 unmodified capture, repeat/duplicate event consumption, and provider-neutral action gates that forbid PTY approval/rejection and require exactly one pending APP approval. i18n tests pass 6/6. The first shared cargo integration attempt failed because `shortcuts.rs` was read while the parallel agent was rewriting the enum/API (21 missing-variant errors plus one const-call error); this is a shared-worktree edit race rather than a PR-02/03 defect. Cargo verification is paused until the action owner reports a stable file revision.
 
 - 2026-07-16: Agent Workspace implementation began under an explicit four-slot parallel plan. Added `agent_surface.rs` with provider (`Codex`/`Claude`), transport (`APP`/`PTY`), six shared visual states, transport capability gates, runtime action targets, and a read-only surface snapshot. Mappings preserve the existing PTY detector and structured lifecycle as their respective sources of truth; PTY capabilities never expose approve/reject. Focused offline tests pass 3/3. Repository-wide `cargo fmt --check` still reports two pre-existing formatting differences in `agent_detect_worker.rs` and `platform/src/lib.rs`; neither file was modified. Unrelated design dist artifacts, local `.codex`, ZIP, and log files remain untouched.
 

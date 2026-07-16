@@ -93,6 +93,8 @@ pub struct WorkspaceUi {
     /// 닫기 확인 대기 중인 pane — 실행 중 세션이 있는 pane 닫기는 확인을 거친다
     /// (2026-07-05 사용자 보고: 닫기 실수로 셸 전체 즉사 방지).
     confirm_close: Option<runtime::MuxPaneId>,
+    /// '같은 폴더에서 새 셀'(사이드바) — 다음 ShellSpawned에 cd로 주입할 폴더.
+    pending_spawn_cd: Option<String>,
     /// pane 우클릭 → "환경변수·API 설정" 요청 (E4 ⑥). App이 프레임에서 take해
     /// 설정 창을 Environment 카테고리로 연다.
     open_environment_requested: bool,
@@ -209,6 +211,7 @@ impl WorkspaceUi {
             pending_spawns: 0,
             split_drag: None,
             confirm_close: None,
+            pending_spawn_cd: None,
             open_environment_requested: false,
             selection: None,
             project_name: None,
@@ -513,6 +516,11 @@ impl WorkspaceUi {
         };
     }
 
+    /// 세션 셸 pid (ResourceUsage 스냅샷 기준) — 사이드바 메뉴의 cwd 일회성 조회용.
+    pub fn session_pid(&self, session: SessionId) -> Option<u32> {
+        self.session_pids.get(&session).copied()
+    }
+
     /// 세션 → 셸 pid를 세팅한다(App이 매 프레임, ResourceUsage 스냅샷 기준).
     /// 터미널 경로 더블클릭의 상대경로 해석(lsof cwd 1회 조회)에 쓴다.
     pub fn set_session_pids(&mut self, pids: &[(SessionId, u32)]) {
@@ -731,7 +739,12 @@ impl WorkspaceUi {
         }
     }
 
-    fn handle_events(&mut self, events: &[RuntimeEvent], catalog: &i18n::Catalog) {
+    fn handle_events(
+        &mut self,
+        client: &dyn RuntimeClient,
+        events: &[RuntimeEvent],
+        catalog: &i18n::Catalog,
+    ) {
         for event in events {
             match event {
                 RuntimeEvent::MuxUpdated { snapshot } => {
@@ -876,8 +889,23 @@ impl WorkspaceUi {
                         ],
                     ));
                 }
-                RuntimeEvent::ShellSpawned { .. } => {
+                RuntimeEvent::ShellSpawned { session } => {
                     self.pending_spawns = self.pending_spawns.saturating_sub(1);
+                    // '같은 폴더에서 새 셀' — 스폰 완료 시 cd 1회 주입(spawn_shell_at).
+                    if let Some(cwd) = self.pending_spawn_cd.take() {
+                        let bytes = cd_paste_bytes(
+                            std::path::Path::new(&cwd),
+                            self.session_shell_kind(*session),
+                            false,
+                        );
+                        self.send(
+                            client,
+                            RuntimeCommand::WriteInput {
+                                session: *session,
+                                bytes,
+                            },
+                        );
+                    }
                 }
                 RuntimeEvent::AgentSpawned { .. } => {}
                 RuntimeEvent::ResourceUsage { .. } => {}
@@ -918,7 +946,7 @@ impl WorkspaceUi {
         let native_key_downs = crate::native_key_monitor::drain();
         self.native_printable_key_downs = native_key_downs.printable;
         self.native_clipboard_paste_requested = native_key_downs.clipboard_paste;
-        self.handle_events(events, catalog);
+        self.handle_events(client, events, catalog);
         self.poll_paste_task(client);
 
         // 탭바 제거 (2026-07-05): 셸 전환은 좌측 사이드바 세션 목록이 담당하고,
@@ -1957,7 +1985,8 @@ impl WorkspaceUi {
     /// show()의 모든 return 경로에서 호출할 것.
     /// pane 닫기 요청 — 실행 중 세션이면 확인을 거치고, 아니면 즉시 닫는다.
     /// (세션 상태를 모르면 보수적으로 확인을 띄운다 — 실수 즉사 방지가 목적.)
-    fn request_close_pane(&mut self, client: &dyn RuntimeClient, pane: runtime::MuxPaneId) {
+    /// 사이드바 컨텍스트 메뉴(App 경유)도 같은 경로를 쓴다.
+    pub fn request_close_pane(&mut self, client: &dyn RuntimeClient, pane: runtime::MuxPaneId) {
         let running = self
             .mux
             .as_ref()
@@ -2230,7 +2259,7 @@ impl WorkspaceUi {
                     tab: tab.id.clone(),
                     pane: pane.id.clone(),
                     session: pane.session_id,
-                    user_override,
+                    resumable: false, // App이 restore_agents 기준으로 채운다
                     status_hint,
                     title: self.resolve_session_title(
                         &pane.title,
@@ -2265,6 +2294,19 @@ impl WorkspaceUi {
                 scrollback_lines,
             },
         );
+    }
+
+    /// 새 셸 + 스폰 완료 시 해당 폴더로 cd 1회 주입 — 사이드바 '같은 폴더에서 새 셀'.
+    /// SpawnShell wire에 cwd 필드를 더하는 대신(계약 변경) ShellSpawned 응답에서
+    /// cd를 주입한다 (자동 resume의 cd prefix와 같은 관례). cwd가 None이면 일반 스폰.
+    pub fn spawn_shell_at(
+        &mut self,
+        client: &dyn RuntimeClient,
+        scrollback_lines: usize,
+        cwd: Option<String>,
+    ) {
+        self.pending_spawn_cd = cwd;
+        self.spawn_shell(client, scrollback_lines);
     }
 
     /// 단축키용 현재 pane 닫기. 실행 중인 세션은 마우스 ×와 동일하게 확인창을 거친다.
@@ -3434,6 +3476,7 @@ mod tests {
         );
 
         ui.handle_events(
+            &RecordingRuntime::default(),
             &[
                 RuntimeEvent::MuxUpdated {
                     snapshot: mux("a", vec![tab_a.clone(), tab_b.clone()], "pa"),
@@ -3449,6 +3492,7 @@ mod tests {
         assert!(ui.sessions.get(&hidden).unwrap().snapshot.is_some());
 
         ui.handle_events(
+            &RecordingRuntime::default(),
             &[
                 RuntimeEvent::MuxUpdated {
                     snapshot: mux("b", vec![tab_a, tab_b], "pb"),
@@ -3489,6 +3533,7 @@ mod tests {
         );
 
         ui.handle_events(
+            &RecordingRuntime::default(),
             &[
                 RuntimeEvent::MuxUpdated {
                     snapshot: mux("active", vec![active], "left"),

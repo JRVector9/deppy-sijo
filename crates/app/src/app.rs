@@ -2176,66 +2176,94 @@ impl App {
             let mut transcript_finder = crate::agent_detect::TranscriptFinder::new();
             for pane in mux.tabs.iter().flat_map(|t| &t.panes) {
                 let pane_key = pane.id.0.clone();
-                let Some(saved) = self.restore_agents.get(&pane_key) else {
+                if !self.restore_agents.contains_key(&pane_key) {
                     continue;
-                };
+                }
                 let Some(session) = pane.session_id else {
                     continue;
                 };
                 if self.resumed_panes.contains(&pane_key) || bindings.contains_key(&session) {
                     continue; // 이미 보냈거나 이미 실행 중
                 }
-                // 대상 transcript가 아직 존재하는지 확인 — 지워진 세션에 --resume 안 던짐.
-                let kind = crate::agent_detect::kind_from_str(&saved.kind);
-                let transcript = kind.and_then(|k| transcript_finder.find(k, &saved.session_id));
-                let Some(transcript) = transcript else {
-                    let _ = self.db.delete_agent_session(&self.active.id, &pane_key);
-                    self.resumed_panes.insert(pane_key);
-                    // 폰 안내(I1b-3): 기록이 사라져 이어받지 못함 — 셸은 이미 복원돼 있어
-                    // 조용히 넘어가면 폰 사용자는 에이전트가 왜 없는지 모른다. 제목은
-                    // 활동 패널과 같은 프로젝트명 규칙으로 해석해 보낸다.
-                    let title = self.activity_session_name(&self.active.id, &pane.title);
-                    let msg = self
-                        .i18n
-                        .t("workspace.wake.resume_missing", &[("title", &title)]);
-                    self.set_web_notice(Some(msg));
-                    self.egui_ctx.request_repaint_after(Self::WEB_NOTICE_TTL);
-                    continue;
-                };
-                // session_id는 그대로 셸 문자열에 들어간다 — 안전 문자만 허용(비정상
-                // transcript/DB 값의 셸 메타문자 실행 방지, codex Low).
-                if !saved
-                    .session_id
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                {
-                    tracing::warn!(pane = %pane_key, "비정상 세션 id — resume 생략");
-                    self.resumed_panes.insert(pane_key);
-                    continue;
-                }
-                // 세션의 원래 폴더로 cd 후 resume — 셸이 workspace 루트에서 떠서 대화는
-                // 이어지는데 실제 작업 폴더가 달랐던 문제(2026-07-08 사용자 #6).
-                let cd_prefix = crate::agent_detect::transcript_cwd(&transcript)
-                    .filter(|p| std::path::Path::new(p).is_dir())
-                    .map(|p| format!("cd {} && ", crate::agent_hooks::sh_quote(&p)))
-                    .unwrap_or_default();
-                let cmd = match saved.kind.as_str() {
-                    "claude" => format!("{cd_prefix}claude --resume {}\n", saved.session_id),
-                    "codex" => format!("{cd_prefix}codex resume {}\n", saved.session_id),
-                    _ => continue,
-                };
-                // 선택 중 freeze 해제 — 이 경로도 WorkspaceUi::send를 우회한다(codex).
-                self.active.workspace_ui.clear_selection(session);
-                let _ = self
-                    .active
-                    .runtime
-                    .send_command(runtime::RuntimeCommand::WriteInput {
-                        session,
-                        bytes: cmd.into_bytes(),
-                    });
+                self.send_agent_resume(&pane_key, &pane.title, session, &mut transcript_finder);
                 self.resumed_panes.insert(pane_key);
             }
         }
+    }
+
+    /// 저장된 에이전트를 pane 셸에 resume 명령으로 주입한다 — 시작 자동 이어가기와
+    /// 사이드바 수동 '이어가기'의 공용 경로. transcript가 사라졌으면 저장 행을 지우고
+    /// 웹 공지 후 false.
+    fn send_agent_resume(
+        &mut self,
+        pane_key: &str,
+        pane_title: &str,
+        session: runtime::SessionId,
+        finder: &mut crate::agent_detect::TranscriptFinder,
+    ) -> bool {
+        let Some((saved_kind, saved_sid)) = self
+            .restore_agents
+            .get(pane_key)
+            .map(|saved| (saved.kind.clone(), saved.session_id.clone()))
+        else {
+            return false;
+        };
+        // 대상 transcript가 아직 존재하는지 확인 — 지워진 세션에 --resume 안 던짐.
+        let kind = crate::agent_detect::kind_from_str(&saved_kind);
+        let transcript = kind.and_then(|k| finder.find(k, &saved_sid));
+        let Some(transcript) = transcript else {
+            let _ = self.db.delete_agent_session(&self.active.id, pane_key);
+            // 폰 안내(I1b-3): 기록이 사라져 이어받지 못함 — 셸은 이미 복원돼 있어
+            // 조용히 넘어가면 폰 사용자는 에이전트가 왜 없는지 모른다. 제목은
+            // 활동 패널과 같은 프로젝트명 규칙으로 해석해 보낸다.
+            let title = self.activity_session_name(&self.active.id, pane_title);
+            let msg = self
+                .i18n
+                .t("workspace.wake.resume_missing", &[("title", &title)]);
+            self.set_web_notice(Some(msg));
+            self.egui_ctx.request_repaint_after(Self::WEB_NOTICE_TTL);
+            return false;
+        };
+        // session_id는 그대로 셸 문자열에 들어간다 — 안전 문자만 허용(비정상
+        // transcript/DB 값의 셸 메타문자 실행 방지, codex Low).
+        if !saved_sid
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            tracing::warn!(pane = %pane_key, "비정상 세션 id — resume 생략");
+            return false;
+        }
+        // 세션의 원래 폴더로 cd 후 resume — 셸이 workspace 루트에서 떠서 대화는
+        // 이어지는데 실제 작업 폴더가 달랐던 문제(2026-07-08 사용자 #6).
+        let cd_prefix = crate::agent_detect::transcript_cwd(&transcript)
+            .filter(|p| std::path::Path::new(p).is_dir())
+            .map(|p| format!("cd {} && ", crate::agent_hooks::sh_quote(&p)))
+            .unwrap_or_default();
+        let cmd = match saved_kind.as_str() {
+            "claude" => format!("{cd_prefix}claude --resume {saved_sid}\n"),
+            "codex" => format!("{cd_prefix}codex resume {saved_sid}\n"),
+            _ => return false,
+        };
+        // 선택 중 freeze 해제 — 이 경로도 WorkspaceUi::send를 우회한다(codex).
+        self.active.workspace_ui.clear_selection(session);
+        let _ = self
+            .active
+            .runtime
+            .send_command(runtime::RuntimeCommand::WriteInput {
+                session,
+                bytes: cmd.into_bytes(),
+            });
+        true
+    }
+
+    /// 세션의 현재 작업 폴더 — 감지 워커 캐시 우선, 없으면 pid로 일회성 lsof 조회
+    /// (사용자 클릭 시점의 1회 조회라 스폰 비용 감수 — platform::process_cwd 관례).
+    fn session_cwd_lookup(&self, session: runtime::SessionId) -> Option<String> {
+        if let Some(cwd) = self.session_cwds.get(&session) {
+            return Some(cwd.clone());
+        }
+        let pid = self.active.workspace_ui.session_pid(session)?;
+        platform::process_cwd(pid).map(|path| path.to_string_lossy().into_owned())
     }
 
     /// shim PATH env — hook 토글 ON이고 shim이 설치돼 있으면 셸 PATH 앞에 주입한다.
@@ -4732,6 +4760,11 @@ impl eframe::App for App {
             &self.agent_needs_input,
             &self.agent_turn_done,
         );
+        // 저장된 에이전트가 있고 지금 실행 중이 아닌 pane — 컨텍스트 메뉴 '이어가기' 노출.
+        for entry in &mut terminal_sessions {
+            entry.resumable =
+                entry.agent_line.is_none() && self.restore_agents.contains_key(&entry.pane.0);
+        }
         // 완료/입력대기 주목(6px 레일·펄스) 갱신 + 확인 시 완료 소비. Agents 패널도
         // 같은 상태 원천을 사용하므로 사이드바가 꺼져 있어도 계산한다.
         self.update_session_alerts(&mut terminal_sessions);
@@ -4851,17 +4884,42 @@ impl eframe::App for App {
                         tracing::warn!("세션 이름 변경 실패: {e:#}");
                     }
                 }
-                // U17b: 수동 상태 지정/해제 — 알림은 재발송하지 않는다(표시 전용 의미).
-                Some(ui::file_tree::SidebarAction::OverrideStatus { session, status }) => {
-                    let override_ = match status {
-                        Some(s) => runtime::UserStatusOverride::Mark(s),
-                        None => runtime::UserStatusOverride::Clear,
-                    };
-                    if let Err(e) = self.active.runtime.send_command(
-                        runtime::RuntimeCommand::SetUserStatusOverride { session, override_ },
-                    ) {
-                        tracing::warn!("상태 지정 실패: {e:#}");
+                // 세션 폴더 열기/경로 복사 — cwd는 감지 캐시 우선, 없으면 일회성 lsof.
+                Some(ui::file_tree::SidebarAction::OpenSessionFolder { session }) => {
+                    match self.session_cwd_lookup(session) {
+                        Some(cwd) => platform::open_path(std::path::Path::new(&cwd)),
+                        None => tracing::warn!("세션 cwd 미확인 — Finder 열기 생략"),
                     }
+                }
+                Some(ui::file_tree::SidebarAction::CopySessionPath { session }) => {
+                    match self.session_cwd_lookup(session) {
+                        Some(cwd) => ui.ctx().copy_text(cwd),
+                        None => tracing::warn!("세션 cwd 미확인 — 경로 복사 생략"),
+                    }
+                }
+                // 같은 폴더에서 새 셸 — cwd 미확인이면 일반 새 셸로 폴백.
+                Some(ui::file_tree::SidebarAction::NewShellSameFolder { session }) => {
+                    let cwd = self.session_cwd_lookup(session);
+                    self.active.workspace_ui.spawn_shell_at(
+                        &self.active.runtime,
+                        self.config.terminal.scrollback_lines as usize,
+                        cwd,
+                    );
+                }
+                // 저장된 에이전트 수동 이어가기 — 자동 이어가기 OFF여도 동작한다.
+                Some(ui::file_tree::SidebarAction::ResumeAgent {
+                    pane,
+                    session,
+                    title,
+                }) => {
+                    let mut finder = crate::agent_detect::TranscriptFinder::new();
+                    self.send_agent_resume(&pane.0.clone(), &title, session, &mut finder);
+                    self.resumed_panes.insert(pane.0);
+                }
+                Some(ui::file_tree::SidebarAction::ClosePane { pane }) => {
+                    self.active
+                        .workspace_ui
+                        .request_close_pane(&self.active.runtime, pane);
                 }
                 None => {}
             }

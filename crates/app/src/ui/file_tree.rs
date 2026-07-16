@@ -29,8 +29,8 @@ pub struct SessionEntry {
     pub pulse: Option<(f32, egui::Color32)>,
     /// 에이전트 2행: "Codex · gpt-5.5 · xhigh" (에이전트일 때만 Some → 3줄 렌더).
     pub agent_line: Option<String>,
-    /// 수동 상태 지정(오버라이드) 값 — 컨텍스트 메뉴 체크 표시용(U17b).
-    pub user_override: Option<runtime::SessionStatus>,
+    /// 저장된 에이전트 세션이 있고 지금 실행 중이 아님 — 컨텍스트 메뉴 '이어가기' 노출.
+    pub resumable: bool,
     /// 상태 hover 힌트 — 감지 출처/신뢰도 또는 '수동 지정'(U17b).
     pub status_hint: Option<String>,
     /// 에이전트 3행: "실행 중 · ctx 69%" (상태 라벨 + 남은 컨텍스트).
@@ -55,11 +55,20 @@ pub enum SidebarAction {
         pane: runtime::MuxPaneId,
         title: String,
     },
-    /// 수동 상태 지정(U17b) — None이면 자동 감지로 복귀(오버라이드 해제).
-    OverrideStatus {
+    /// 세션의 현재 작업 폴더를 Finder(OS 기본)로 연다.
+    OpenSessionFolder { session: runtime::SessionId },
+    /// 세션의 현재 작업 폴더 경로를 클립보드에 복사한다.
+    CopySessionPath { session: runtime::SessionId },
+    /// 이 세션과 같은 작업 폴더에서 새 셸을 연다 (tmux식 복제).
+    NewShellSameFolder { session: runtime::SessionId },
+    /// 저장된 에이전트 세션을 이 pane 셸에서 resume한다 (수동 이어가기).
+    ResumeAgent {
+        pane: runtime::MuxPaneId,
         session: runtime::SessionId,
-        status: Option<runtime::SessionStatus>,
+        title: String,
     },
+    /// pane 닫기 — 실행 중 세션이면 기존 확인 모달을 거친다.
+    ClosePane { pane: runtime::MuxPaneId },
 }
 
 /// 트리 노드. `children == None`은 아직 나열 안 됨(lazy).
@@ -949,13 +958,9 @@ impl FileTreeUi {
                             matches!(&self.session_name_edit, Some((p, _)) if *p == entry.pane);
                         if editing {
                             // 인라인 이름 편집 — Enter 확정(RenameSession), Esc 취소.
+                            // 행(레일/상태줄) 레이아웃은 유지하고 제목 자리만 편집기로.
                             let buf = &mut self.session_name_edit.as_mut().unwrap().1;
-                            let resp = ui.add(
-                                egui::TextEdit::singleline(buf)
-                                    .desired_width(f32::INFINITY)
-                                    .font(egui::FontId::proportional(13.0)),
-                            );
-                            resp.request_focus();
+                            session_row_editing(ui, entry, buf);
                             let (enter, esc) = ui.input(|i| {
                                 (
                                     i.key_pressed(egui::Key::Enter),
@@ -981,8 +986,9 @@ impl FileTreeUi {
                                 None => catalog.t("workspace.rename_hint", &[]),
                             };
                             let resp = session_row(ui, entry).on_hover_text(hover);
-                            // 우클릭 → 컨텍스트 메뉴(이름 변경 + 상태 지정, U17b).
+                            // 우클릭 → 컨텍스트 메뉴(이름 변경/폴더/새 셸/이어가기/닫기).
                             // 더블클릭 → 이름 편집. 단순 클릭 → 세션 전환.
+                            // (수동 상태 지정 U17b는 hook 감지 정착으로 제거 — 2026-07-17 사용자.)
                             if let Some(session) = entry.session {
                                 resp.context_menu(|ui| {
                                     if ui.button(catalog.t("workspace.rename_menu", &[])).clicked()
@@ -992,40 +998,47 @@ impl FileTreeUi {
                                         ui.close();
                                     }
                                     ui.separator();
-                                    ui.label(
-                                        egui::RichText::new(catalog.t("status.override.menu", &[]))
-                                            .small()
-                                            .weak(),
-                                    );
-                                    use runtime::SessionStatus as S;
-                                    for (status, key) in [
-                                        (S::Running, "status.override.running"),
-                                        (S::NeedsApproval, "status.override.waiting"),
-                                        (S::Done, "status.override.done"),
-                                        (S::Error, "status.override.error"),
-                                    ] {
-                                        let selected = entry.user_override == Some(status);
-                                        if ui
-                                            .selectable_label(selected, catalog.t(key, &[]))
-                                            .clicked()
-                                        {
-                                            action = Some(SidebarAction::OverrideStatus {
-                                                session,
-                                                status: Some(status),
-                                            });
-                                            ui.close();
-                                        }
-                                    }
                                     if ui
-                                        .selectable_label(
-                                            entry.user_override.is_none(),
-                                            catalog.t("status.override.clear", &[]),
-                                        )
+                                        .button(catalog.t("sidebar.menu.open_folder", &[]))
                                         .clicked()
                                     {
-                                        action = Some(SidebarAction::OverrideStatus {
+                                        action = Some(SidebarAction::OpenSessionFolder { session });
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .button(catalog.t("sidebar.menu.copy_path", &[]))
+                                        .clicked()
+                                    {
+                                        action = Some(SidebarAction::CopySessionPath { session });
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .button(catalog.t("sidebar.menu.new_shell_here", &[]))
+                                        .clicked()
+                                    {
+                                        action =
+                                            Some(SidebarAction::NewShellSameFolder { session });
+                                        ui.close();
+                                    }
+                                    if entry.resumable
+                                        && ui
+                                            .button(catalog.t("sidebar.menu.resume_agent", &[]))
+                                            .clicked()
+                                    {
+                                        action = Some(SidebarAction::ResumeAgent {
+                                            pane: entry.pane.clone(),
                                             session,
-                                            status: None,
+                                            title: entry.title.clone(),
+                                        });
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui
+                                        .button(catalog.t("sidebar.menu.close_pane", &[]))
+                                        .clicked()
+                                    {
+                                        action = Some(SidebarAction::ClosePane {
+                                            pane: entry.pane.clone(),
                                         });
                                         ui.close();
                                     }
@@ -2308,6 +2321,21 @@ pub enum ShellKind {
 /// 마름모를 도형으로 그려 회피한다. 선택 시 액센트 배경 + 좌측 레일, agent는 레일 표시,
 /// 요약 한 줄(dim/mono). 반환 Response로 클릭을 처리한다.
 fn session_row(ui: &mut egui::Ui, entry: &SessionEntry) -> egui::Response {
+    session_row_impl(ui, entry, None)
+}
+
+/// 이름 인라인 편집 중인 행 — 레일/보조 행(2·3행)은 그대로 유지하고 **제목 자리만**
+/// TextEdit로 바꾼다. 행 전체를 편집기로 대체하면 편집 중 레이아웃이 무너진다
+/// (2026-07-16 사용자).
+fn session_row_editing(ui: &mut egui::Ui, entry: &SessionEntry, buf: &mut String) {
+    session_row_impl(ui, entry, Some(buf));
+}
+
+fn session_row_impl(
+    ui: &mut egui::Ui,
+    entry: &SessionEntry,
+    edit_buf: Option<&mut String>,
+) -> egui::Response {
     // 에이전트면 3줄(제목/에이전트·모델·effort/상태·ctx%), 아니면 2줄(제목/요약).
     // 요약이 없어도(유휴/시작 직후) 2행에 '~'를 표시해 행 높이를 유지한다(2026-07-07).
     let agent = entry.agent_line.is_some();
@@ -2354,8 +2382,10 @@ fn session_row(ui: &mut egui::Ui, entry: &SessionEntry) -> egui::Response {
     let line3_galley = line3.map(|t| clipped_line(ui, t, egui::FontId::monospace(10.5), max_w));
 
     let painter = ui.painter();
-    // 선택/hover 배경
-    if entry.focused {
+    // 선택/hover 배경 — 편집 중에는 hover 톤으로 상시 칠해 편집 상태를 표시.
+    if edit_buf.is_some() {
+        painter.rect_filled(rect, 4.0, hover_bg);
+    } else if entry.focused {
         painter.rect_filled(rect, 4.0, accent.gamma_multiply(0.18));
     } else if resp.hovered() {
         painter.rect_filled(rect, 4.0, hover_bg);
@@ -2377,14 +2407,17 @@ fn session_row(ui: &mut egui::Ui, entry: &SessionEntry) -> egui::Response {
     );
     painter.rect_filled(rail, 1.0, rail_color);
     // 제목(1행) + 2행 + 3행 — 세로 위치는 행 수에 맞춰.
-    painter.galley(
-        egui::pos2(
-            rect.left() + 16.0,
-            rect.top() + 13.0 - title_galley.size().y / 2.0,
-        ),
-        title_galley,
-        title_color,
-    );
+    // 편집 중에는 제목 갤리 대신 같은 자리에 TextEdit를 얹는다 (아래 edit_buf 분기).
+    if edit_buf.is_none() {
+        painter.galley(
+            egui::pos2(
+                rect.left() + 16.0,
+                rect.top() + 13.0 - title_galley.size().y / 2.0,
+            ),
+            title_galley,
+            title_color,
+        );
+    }
     if let Some(g) = line2_galley {
         painter.galley(
             egui::pos2(rect.left() + 16.0, rect.top() + 27.0 - g.size().y / 2.0),
@@ -2398,6 +2431,22 @@ fn session_row(ui: &mut egui::Ui, entry: &SessionEntry) -> egui::Response {
             g,
             sub_color,
         );
+    }
+    if let Some(buf) = edit_buf {
+        // 제목 1행 자리에 프레임 없는 TextEdit — 글꼴/x 위치를 제목 갤리와 맞춘다.
+        let title_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 16.0, rect.top() + 4.0),
+            egui::pos2(rect.right() - 8.0, rect.top() + 22.0),
+        );
+        let edit_resp = ui.put(
+            title_rect,
+            egui::TextEdit::singleline(buf)
+                .font(egui::FontId::proportional(13.0))
+                .frame(egui::Frame::NONE)
+                .margin(egui::Margin::ZERO)
+                .vertical_align(egui::Align::Center),
+        );
+        edit_resp.request_focus();
     }
     resp
 }

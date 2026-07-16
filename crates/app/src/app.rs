@@ -4194,6 +4194,18 @@ impl eframe::App for App {
         self.poll_dotenv_sync();
         // 창이 숨겨져도 App Server JSON-RPC 이벤트를 드레인해 structured session 상태를 최신화한다.
         self.agent_sessions_ui.poll();
+        for notice in self.agent_sessions_ui.drain_status_notices() {
+            self.notifications_ui.on_structured_status(
+                &notice.workspace_id,
+                &notice.session_id,
+                notice.status,
+                &notice.title,
+                &self.i18n,
+            );
+        }
+        let structured_alive = self.agent_sessions_ui.session_ids();
+        self.notifications_ui
+            .retain_structured_sessions(&structured_alive);
         self.poll_restore_timeout();
         // 설정이 닫혀도 stale generation 결과를 계속 버려 worker의 bounded 결과 큐가
         // 평문 secret을 붙잡은 채 막히지 않게 한다.
@@ -5698,20 +5710,42 @@ impl eframe::App for App {
             }
             None => {}
         }
-        if let Some((ws_id, session)) = notif_click {
-            if ws_id == self.active.id {
-                if let Some(pane) = mux.as_ref().and_then(|m| pane_of_session(m, session)) {
-                    let _ = self
-                        .active
-                        .runtime
-                        .send_command(runtime::RuntimeCommand::FocusPane { pane });
+        if let Some(target) = notif_click {
+            match target {
+                ui::notifications::AgentNotificationTarget::Pty {
+                    workspace_id: ws_id,
+                    session,
+                } => {
+                    if ws_id == self.active.id {
+                        if let Some(pane) = mux.as_ref().and_then(|m| pane_of_session(m, session)) {
+                            let _ = self
+                                .active
+                                .runtime
+                                .send_command(runtime::RuntimeCommand::FocusPane { pane });
+                        }
+                    } else {
+                        let reused = self.warm.contains_key(&ws_id);
+                        self.switch_workspace(&ws_id);
+                        self.refresh_workspaces();
+                        if reused {
+                            self.pending_focus = Some((ws_id, session));
+                        }
+                    }
                 }
-            } else {
-                let reused = self.warm.contains_key(&ws_id);
-                self.switch_workspace(&ws_id);
-                self.refresh_workspaces();
-                if reused {
-                    self.pending_focus = Some((ws_id, session));
+                ui::notifications::AgentNotificationTarget::Structured {
+                    workspace_id,
+                    session_id,
+                } => {
+                    if workspace_id != self.active.id
+                        && self
+                            .workspaces
+                            .iter()
+                            .any(|workspace| workspace.id == workspace_id)
+                    {
+                        self.switch_workspace(&workspace_id);
+                        self.refresh_workspaces();
+                    }
+                    self.agent_sessions_ui.open_session(&session_id);
                 }
             }
             ui.ctx()

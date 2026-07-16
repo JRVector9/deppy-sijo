@@ -4,14 +4,59 @@
 
 use runtime::{SessionId, SessionStatus};
 
+use crate::agent_session::AgentSessionStatus;
+use crate::agent_surface::AgentProvider;
+
+/// Focus target carried by an item in the existing Settings > Notifications
+/// area. PTY runtime IDs are namespaced by workspace; structured session IDs
+/// are application-owned and likewise retain their workspace for pruning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentNotificationTarget {
+    Pty {
+        workspace_id: String,
+        session: SessionId,
+    },
+    Structured {
+        workspace_id: String,
+        session_id: String,
+    },
+}
+
+impl AgentNotificationTarget {
+    fn workspace_id(&self) -> &str {
+        match self {
+            Self::Pty { workspace_id, .. } | Self::Structured { workspace_id, .. } => workspace_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentNotificationSource {
+    Pty(Option<AgentProvider>),
+    App(AgentProvider),
+}
+
+impl AgentNotificationSource {
+    fn badge(self) -> &'static str {
+        match self {
+            Self::Pty(Some(AgentProvider::Codex)) => "[Codex PTY]",
+            Self::Pty(Some(AgentProvider::Claude)) => "[Claude PTY]",
+            Self::Pty(None) => "[PTY]",
+            Self::App(AgentProvider::Codex) => "[Codex APP]",
+            // There is no Claude structured transport today, but preserving the
+            // provider in the source keeps this view model transport-neutral.
+            Self::App(AgentProvider::Claude) => "[Claude APP]",
+        }
+    }
+}
+
 pub struct NotificationsUi {
     items: Vec<NotificationItem>,
 }
 
 struct NotificationItem {
-    /// 어느 workspace의 세션인지 — 워커마다 SessionId가 리셋돼 충돌하므로 함께 키로 쓴다.
-    workspace_id: String,
-    session: SessionId,
+    target: AgentNotificationTarget,
+    source: AgentNotificationSource,
     status: SessionStatus,
     title: String,
     message_id: String,
@@ -47,6 +92,74 @@ impl NotificationsUi {
         title: &str,
         catalog: &i18n::Catalog,
     ) {
+        self.on_pty_status(workspace_id, session, status, title, None, catalog);
+    }
+
+    /// PTY status with an optional detected provider. Existing runtime-only
+    /// callers can keep using `on_status`; agent-aware callers get a precise
+    /// `[Codex PTY]`/`[Claude PTY]` source badge.
+    pub fn on_pty_status(
+        &mut self,
+        workspace_id: &str,
+        session: SessionId,
+        status: SessionStatus,
+        title: &str,
+        provider: Option<AgentProvider>,
+        catalog: &i18n::Catalog,
+    ) {
+        let target = AgentNotificationTarget::Pty {
+            workspace_id: workspace_id.to_owned(),
+            session,
+        };
+        self.push_status(
+            target,
+            AgentNotificationSource::Pty(provider),
+            status,
+            title,
+            catalog,
+        );
+    }
+
+    /// Structured App Server lifecycle projected into the same notification
+    /// semantics as PTY sessions. Active/idle/off transitions do not notify.
+    pub fn on_structured_status(
+        &mut self,
+        workspace_id: &str,
+        session_id: &str,
+        status: AgentSessionStatus,
+        title: &str,
+        catalog: &i18n::Catalog,
+    ) {
+        let status = match status {
+            AgentSessionStatus::AwaitingApproval => SessionStatus::NeedsApproval,
+            AgentSessionStatus::Completed => SessionStatus::Done,
+            AgentSessionStatus::Failed => SessionStatus::Error,
+            AgentSessionStatus::Starting
+            | AgentSessionStatus::Ready
+            | AgentSessionStatus::Running
+            | AgentSessionStatus::Interrupted
+            | AgentSessionStatus::Stopped => return,
+        };
+        self.push_status(
+            AgentNotificationTarget::Structured {
+                workspace_id: workspace_id.to_owned(),
+                session_id: session_id.to_owned(),
+            },
+            AgentNotificationSource::App(AgentProvider::Codex),
+            status,
+            title,
+            catalog,
+        );
+    }
+
+    fn push_status(
+        &mut self,
+        target: AgentNotificationTarget,
+        source: AgentNotificationSource,
+        status: SessionStatus,
+        title: &str,
+        catalog: &i18n::Catalog,
+    ) {
         let Some(message_id) = notification_message_id(status) else {
             // 진행 재개는 알림 아님
             return;
@@ -60,12 +173,23 @@ impl NotificationsUi {
             | SessionStatus::Error
             | SessionStatus::Done => {}
         };
+        // Duplicate provider events are common around reconnect/resume. Only a
+        // state transition for the same logical target creates a new item.
+        let duplicate = self
+            .items
+            .iter()
+            .rev()
+            .find(|item| item.target == target)
+            .is_some_and(|item| item.status == status);
+        if duplicate {
+            return;
+        }
         #[cfg(not(test))] // 테스트에서 실제 OS 알림을 띄우지 않는다
         platform::notify(&rendered, title);
         let _ = rendered;
         self.items.push(NotificationItem {
-            workspace_id: workspace_id.to_owned(),
-            session,
+            target,
+            source,
             status,
             title: title.to_owned(),
             message_id: message_id.to_owned(),
@@ -106,7 +230,13 @@ impl NotificationsUi {
             .items
             .iter()
             .rev()
-            .find(|item| item.workspace_id == workspace_id && item.session == session)
+            .find(|item| {
+                item.target
+                    == (AgentNotificationTarget::Pty {
+                        workspace_id: workspace_id.to_owned(),
+                        session,
+                    })
+            })
             .is_some_and(|item| item.status == status);
         if !dup {
             self.on_status(workspace_id, session, status, title, catalog);
@@ -115,14 +245,15 @@ impl NotificationsUi {
 
     /// workspace가 삭제되면 그 workspace의 모든 알림을 제거한다.
     pub fn prune_workspace(&mut self, workspace_id: &str) {
-        self.items.retain(|item| item.workspace_id != workspace_id);
+        self.items
+            .retain(|item| item.target.workspace_id() != workspace_id);
     }
 
     /// workspace가 Suspended(축출)되면 그 workspace의 진행형(Waiting/승인) 알림을 제거한다 —
     /// 워커가 죽어 더는 조치 불가하므로. 결과(Done/Error)는 기록이라 유지한다.
     pub fn prune_transient(&mut self, workspace_id: &str) {
         self.items.retain(|item| {
-            item.workspace_id != workspace_id
+            item.target.workspace_id() != workspace_id
                 || matches!(item.status, SessionStatus::Done | SessionStatus::Error)
         });
     }
@@ -133,8 +264,25 @@ impl NotificationsUi {
     pub fn retain_sessions(&mut self, active_workspace_id: &str, alive: &[SessionId]) {
         self.items.retain(|item| {
             matches!(item.status, SessionStatus::Done | SessionStatus::Error)
-                || item.workspace_id != active_workspace_id
-                || alive.contains(&item.session)
+                || item.target.workspace_id() != active_workspace_id
+                || match &item.target {
+                    AgentNotificationTarget::Pty { session, .. } => alive.contains(session),
+                    // Structured liveness is owned by AgentSessionsUi rather
+                    // than the active PTY mux and is pruned separately.
+                    AgentNotificationTarget::Structured { .. } => true,
+                }
+        });
+    }
+
+    pub fn retain_structured_sessions(&mut self, alive: &[String]) {
+        self.items.retain(|item| {
+            matches!(item.status, SessionStatus::Done | SessionStatus::Error)
+                || match &item.target {
+                    AgentNotificationTarget::Structured { session_id, .. } => {
+                        alive.contains(session_id)
+                    }
+                    AgentNotificationTarget::Pty { .. } => true,
+                }
         });
     }
 
@@ -143,7 +291,7 @@ impl NotificationsUi {
         &mut self,
         ui: &mut egui::Ui,
         catalog: &i18n::Catalog,
-    ) -> Option<(String, SessionId)> {
+    ) -> Option<AgentNotificationTarget> {
         let mut clicked = None;
         if self.items.is_empty() {
             ui.label(catalog.t("notification.empty", &[]));
@@ -159,16 +307,25 @@ impl NotificationsUi {
         for item in self.items.iter().rev() {
             let icon = status_icon(item.status);
             let label = catalog.t(&item.message_id, &[("title", &item.title)]);
-            if ui
-                .button(format!("{icon} {label}"))
-                .on_hover_text(catalog.t("notification.goto_session", &[]))
-                .clicked()
-            {
-                clicked = Some((item.workspace_id.clone(), item.session));
-            }
+            ui.horizontal(|ui| {
+                ui.colored_label(notification_status_color(item.status), "●");
+                if ui
+                    .button(format!("{} {icon} {label}", item.source.badge()))
+                    .on_hover_text(catalog.t("notification.goto_session", &[]))
+                    .clicked()
+                {
+                    clicked = Some(item.target.clone());
+                }
+            });
         }
         clicked
     }
+}
+
+fn notification_status_color(status: SessionStatus) -> egui::Color32 {
+    crate::ui::agent_visuals::status_color(crate::agent_surface::AgentVisualState::from_pty(Some(
+        status,
+    )))
 }
 
 fn status_icon(status: SessionStatus) -> &'static str {
@@ -201,6 +358,16 @@ mod tests {
 
     fn catalog() -> i18n::Catalog {
         i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap()
+    }
+
+    fn is_pty(item: &NotificationItem, workspace_id: &str, session: SessionId) -> bool {
+        matches!(
+            &item.target,
+            AgentNotificationTarget::Pty {
+                workspace_id: item_workspace,
+                session: item_session,
+            } if item_workspace == workspace_id && *item_session == session
+        )
     }
 
     #[test]
@@ -260,7 +427,7 @@ mod tests {
         let has = |ws: &str, sess: u64, st: SessionStatus| {
             n.items
                 .iter()
-                .any(|i| i.workspace_id == ws && i.session == SessionId(sess) && i.status == st)
+                .any(|i| is_pty(i, ws, SessionId(sess)) && i.status == st)
         };
         assert!(has("ws-a", 1, SessionStatus::Done));
         assert!(!has("ws-a", 2, SessionStatus::Waiting));
@@ -294,7 +461,14 @@ mod tests {
         n.on_status(WS, SessionId(3), SessionStatus::Error, "c", &catalog); // 결과 → 유지
         // 1·2 사라짐(닫힘/archive). Done(1)·Error(3)는 기록이라 유지, 승인(2)만 정리
         n.retain_sessions(WS, &[SessionId(3)]);
-        let sessions: Vec<_> = n.items.iter().map(|i| i.session).collect();
+        let sessions: Vec<_> = n
+            .items
+            .iter()
+            .filter_map(|item| match item.target {
+                AgentNotificationTarget::Pty { session, .. } => Some(session),
+                AgentNotificationTarget::Structured { .. } => None,
+            })
+            .collect();
         assert!(sessions.contains(&SessionId(1)));
         assert!(sessions.contains(&SessionId(3)));
         assert!(!sessions.contains(&SessionId(2)));
@@ -311,7 +485,10 @@ mod tests {
         // regex 없는 agent: status 없이 exit만 → Done 알림 생성
         n.on_exit(WS, SessionId(2), Some(0), "b", &catalog);
         assert_eq!(
-            n.items.iter().filter(|i| i.session == SessionId(2)).count(),
+            n.items
+                .iter()
+                .filter(|item| is_pty(item, WS, SessionId(2)))
+                .count(),
             1
         );
         // 비정상 종료 → Error
@@ -319,7 +496,7 @@ mod tests {
         assert!(matches!(
             n.items
                 .iter()
-                .find(|i| i.session == SessionId(3))
+                .find(|item| is_pty(item, WS, SessionId(3)))
                 .unwrap()
                 .status,
             SessionStatus::Error
@@ -338,5 +515,65 @@ mod tests {
         // session 2(진행형)가 사라짐 → 정리되어 unread 0, 옛 읽은 Done(1)은 남아도 unread 0
         n.retain_sessions(WS, &[SessionId(1)]);
         assert_eq!(n.unread(), 0);
+    }
+
+    #[test]
+    fn structured_status_알림은_target과_source를_보존한다() {
+        let mut n = NotificationsUi::new();
+        let catalog = catalog();
+        n.on_structured_status(
+            WS,
+            "structured-1",
+            AgentSessionStatus::AwaitingApproval,
+            "review",
+            &catalog,
+        );
+        assert_eq!(n.items.len(), 1);
+        let item = &n.items[0];
+        assert_eq!(item.source.badge(), "[Codex APP]");
+        assert_eq!(item.status, SessionStatus::NeedsApproval);
+        assert_eq!(
+            item.target,
+            AgentNotificationTarget::Structured {
+                workspace_id: WS.to_owned(),
+                session_id: "structured-1".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn structured_active와_idle은_알림이_아니다() {
+        let mut n = NotificationsUi::new();
+        let catalog = catalog();
+        for status in [
+            AgentSessionStatus::Starting,
+            AgentSessionStatus::Ready,
+            AgentSessionStatus::Running,
+            AgentSessionStatus::Stopped,
+        ] {
+            n.on_structured_status(WS, "structured-1", status, "review", &catalog);
+        }
+        assert!(n.items.is_empty());
+    }
+
+    #[test]
+    fn structured_duplicate_status는_한번만_알린다() {
+        let mut n = NotificationsUi::new();
+        let catalog = catalog();
+        n.on_structured_status(
+            WS,
+            "structured-1",
+            AgentSessionStatus::Completed,
+            "review",
+            &catalog,
+        );
+        n.on_structured_status(
+            WS,
+            "structured-1",
+            AgentSessionStatus::Completed,
+            "review",
+            &catalog,
+        );
+        assert_eq!(n.items.len(), 1);
     }
 }

@@ -1,5 +1,6 @@
 pub mod activity;
 pub mod agent_sessions;
+pub mod agent_visuals;
 pub mod agents;
 pub mod approvals;
 pub mod clipboard_image;

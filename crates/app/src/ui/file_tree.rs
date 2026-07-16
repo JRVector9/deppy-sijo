@@ -2554,25 +2554,13 @@ fn paint_file(p: &egui::Painter, c: egui::Pos2, col: egui::Color32, carve: egui:
     ));
 }
 
-/// 세션 상태 → 상태 점 색 (목업 상태 색과 일치). 유휴(None)는 흐린 회색.
+/// PTY 세션 상태 → 공통 에이전트 상태 색. 기존 호출부(App의 pulse, pane glyph)가
+/// 같은 팔레트를 공유하도록 이 wrapper를 유지한다.
 pub(crate) fn session_status_color(
     status: Option<runtime::SessionStatus>,
     _visuals: &egui::Visuals,
 ) -> egui::Color32 {
-    use runtime::SessionStatus as S;
-    match status {
-        Some(S::Running) => egui::Color32::from_rgb(0x43, 0xb8, 0xcd), // 실행(시안)
-        // 대기는 입력대기로 통합(2026-07-07) — merge에서 이미 흡수되지만 방어적으로 같은 색.
-        Some(S::Waiting | S::NeedsApproval) => egui::Color32::from_rgb(0xe0, 0xa8, 0x3e), // 입력대기(주황)
-        // 완료 = 바이올렛(팔레트 유일 보라 — 유휴 초록과 확실히 구분, 2026-07-07 결정).
-        Some(S::Done) => egui::Color32::from_rgb(0x9a, 0x7f, 0xd1),
-        Some(S::Error) => egui::Color32::from_rgb(0xe0, 0x5c, 0x53), // 오류(빨강)
-        // 유휴(에이전트 붙어있고 대기) — 차분한 초록. 이전엔 미감지와 같은 회색이라
-        // "감지 안 됨"과 구분이 안 됐다(2026-07-07 사용자: 실행중인데 안 잡혀 보임).
-        Some(S::Idle) => egui::Color32::from_rgb(0x56, 0xa0, 0x6a),
-        // status 미보고(에이전트 없음/첫 평가 전) — 회색.
-        None => egui::Color32::from_rgb(0x8b, 0x8f, 0x98),
-    }
+    crate::ui::agent_visuals::status_color(crate::agent_surface::AgentVisualState::from_pty(status))
 }
 
 /// 현재 플랫폼/환경에서 새 shell session이 사용할 것으로 예상되는 기본 shell kind.

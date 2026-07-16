@@ -93,7 +93,7 @@ impl AgentSessionsUi {
 
         let mut window_open = self.open;
         let mut actions = Vec::new();
-        egui::Window::new("Agent Sessions")
+        egui::Window::new("Agents · [APP] Codex")
             .open(&mut window_open)
             .default_width(960.0)
             .default_height(650.0)
@@ -101,7 +101,7 @@ impl AgentSessionsUi {
             .resizable(true)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("Codex App Server");
+                    ui.heading("[APP] Codex");
                     ui.weak("structured thread · turn · item stream");
                 });
                 ui.label(
@@ -172,7 +172,11 @@ impl AgentSessionsUi {
             .map(|session| {
                 (
                     session.id.clone(),
-                    format!("{} · {}", short_id(&session.id), session.status.label()),
+                    format!(
+                        "[APP] Codex · {} · {}",
+                        short_id(&session.id),
+                        session.status.label()
+                    ),
                 )
             })
             .collect::<Vec<_>>();
@@ -516,16 +520,7 @@ fn short_id(value: &str) -> String {
 }
 
 fn status_color(status: AgentSessionStatus) -> egui::Color32 {
-    match status {
-        AgentSessionStatus::Running => egui::Color32::from_rgb(0x58, 0xa6, 0xff),
-        AgentSessionStatus::AwaitingApproval => egui::Color32::from_rgb(0xff, 0xbf, 0x69),
-        AgentSessionStatus::Completed => egui::Color32::from_rgb(0x56, 0xd3, 0x64),
-        AgentSessionStatus::Interrupted | AgentSessionStatus::Stopped => {
-            egui::Color32::from_rgb(0x8b, 0x94, 0x9e)
-        }
-        AgentSessionStatus::Failed => egui::Color32::from_rgb(0xff, 0x7b, 0x72),
-        AgentSessionStatus::Starting | AgentSessionStatus::Ready => {
-            egui::Color32::from_rgb(0xc9, 0xd1, 0xd9)
-        }
-    }
+    crate::ui::agent_visuals::status_color(crate::agent_surface::AgentVisualState::from_structured(
+        status,
+    ))
 }

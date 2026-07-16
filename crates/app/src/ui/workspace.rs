@@ -2515,14 +2515,16 @@ fn terminal_text_paste_bytes(text: &str, bracketed_paste: bool) -> Vec<u8> {
     input_mapper::paste_bytes(text.as_bytes(), bracketed_paste)
 }
 
-/// 세션 행 2행: "Codex · gpt-5.5 · xhigh" (빈 부분은 생략). 2026-07-08.
+/// 세션 행 2행: "[PTY] Codex · gpt-5.5 · xhigh" (빈 부분은 생략).
 fn agent_info_line(d: &crate::agent_detect::AgentDisplay) -> String {
-    use crate::agent_detect::AgentKind;
-    let name = match d.kind {
-        AgentKind::Claude => "Claude",
-        AgentKind::Codex => "Codex",
-    };
-    let mut parts = vec![name.to_owned()];
+    use crate::agent_surface::{AgentProvider, AgentTransport};
+
+    let provider = AgentProvider::from(d.kind);
+    let mut parts = vec![format!(
+        "[{}] {}",
+        AgentTransport::Pty.badge(),
+        provider.label()
+    )];
     if let Some(m) = d.model.as_deref().filter(|s| !s.is_empty()) {
         parts.push(m.to_owned());
     }
@@ -3135,6 +3137,18 @@ mod tests {
 
     fn pane_id(name: &str) -> MuxPaneId {
         MuxPaneId(name.to_owned())
+    }
+
+    #[test]
+    fn agent_info_line_distinguishes_pty_transport() {
+        let display = crate::agent_detect::AgentDisplay {
+            kind: crate::agent_detect::AgentKind::Codex,
+            model: Some("gpt-test".to_owned()),
+            effort: Some("high".to_owned()),
+            context_pct: None,
+        };
+
+        assert_eq!(agent_info_line(&display), "[PTY] Codex · gpt-test · high");
     }
 
     #[test]

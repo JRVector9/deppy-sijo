@@ -2153,43 +2153,8 @@ impl WorkspaceUi {
                 ui.close();
             }
             ui.separator();
-            if let Some(session) = session {
-                ui.menu_button(catalog.t("status.override.menu", &[]), |ui| {
-                    // mark_waiting은 제거 — 대기는 입력대기(NeedsApproval)로 통합(2026-07-07).
-                    for (key, status) in [
-                        ("status.override.mark_running", SessionStatus::Running),
-                        (
-                            "status.override.mark_needs_approval",
-                            SessionStatus::NeedsApproval,
-                        ),
-                        ("status.override.mark_idle", SessionStatus::Idle),
-                        ("status.override.mark_done", SessionStatus::Done),
-                        ("status.override.mark_error", SessionStatus::Error),
-                    ] {
-                        if ui.button(catalog.t(key, &[])).clicked() {
-                            self.send(
-                                client,
-                                RuntimeCommand::SetUserStatusOverride {
-                                    session,
-                                    override_: runtime::UserStatusOverride::Mark(status),
-                                },
-                            );
-                            ui.close();
-                        }
-                    }
-                    if ui.button(catalog.t("status.override.clear", &[])).clicked() {
-                        self.send(
-                            client,
-                            RuntimeCommand::SetUserStatusOverride {
-                                session,
-                                override_: runtime::UserStatusOverride::Clear,
-                            },
-                        );
-                        ui.close();
-                    }
-                });
-                ui.separator();
-            }
+            // (수동 상태 지정 U17b 서브메뉴는 사이드바와 함께 제거 — hook 감지 정착,
+            // 2026-07-17 사용자. wire 명령 SetUserStatusOverride는 계약상 유지.)
             if ui.button(catalog.t("workspace.close_pane", &[])).clicked() {
                 self.request_close_pane(client, pane_id.clone());
                 ui.close();

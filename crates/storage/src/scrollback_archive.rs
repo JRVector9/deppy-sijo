@@ -105,26 +105,112 @@ pub fn write(
 /// 파일 없음 → Ok(None). 손상(헤더/범위/inflate 실패) → 파일 삭제 후 Ok(None)
 /// (graceful skip — 복원 실패가 치명이 되지 않게).
 pub fn read(logs_root: &Path, session_key: &str) -> anyhow::Result<Option<(ArchiveMeta, Vec<u8>)>> {
+    let Some(mut stream) = open(logs_root, session_key)? else {
+        return Ok(None);
+    };
+    let meta = stream.meta;
+    let mut dump = Vec::with_capacity(stream.expected_len as usize);
+    if stream.read_to_end(&mut dump).is_err() {
+        stream.discard();
+        return Ok(None);
+    }
+    if !stream.finish() {
+        return Ok(None);
+    }
+    Ok(Some((meta, dump)))
+}
+
+/// 아카이브를 스트리밍으로 연다 — 헤더를 검증하고 해제 [`Read`] 핸들을 돌려준다.
+/// dump 전체(≤32MB)를 메모리에 올리지 않고 소비측이 청크 단위로 feed할 수 있다
+/// (복원 시 순간 메모리 스파이크 방지, 2026-07-16). 파일 없음 → Ok(None),
+/// 헤더 손상 → 파일 삭제 후 Ok(None) — [`read`]와 동일 규약.
+pub fn open(logs_root: &Path, session_key: &str) -> anyhow::Result<Option<ArchiveStream>> {
     let path = archive_path(logs_root, session_key)?;
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(error).with_context(|| format!("아카이브 읽기 실패: {}", path.display()));
+            return Err(error).with_context(|| format!("아카이브 열기 실패: {}", path.display()));
         }
     };
-    match parse(&bytes) {
-        Some(parsed) => Ok(Some(parsed)),
-        None => {
-            tracing::warn!(path = %path.display(), "scrollback 아카이브 손상 — 폐기");
-            let _ = std::fs::remove_file(&path);
-            Ok(None)
+    let mut reader = std::io::BufReader::new(file);
+    let mut header = [0u8; HEADER_LEN];
+    let parsed = reader
+        .read_exact(&mut header)
+        .ok()
+        .and_then(|()| parse_header(&header));
+    let Some((meta, uncompressed_len)) = parsed else {
+        tracing::warn!(path = %path.display(), "scrollback 아카이브 손상 — 폐기");
+        let _ = std::fs::remove_file(&path);
+        return Ok(None);
+    };
+    // take로 선언 길이 초과 해제를 차단 (압축 폭탄/오염 방어) — 정확 길이 검증은 finish
+    let decoder = flate2::read::ZlibDecoder::new(reader).take(u64::from(uncompressed_len) + 1);
+    Ok(Some(ArchiveStream {
+        meta,
+        decoder,
+        expected_len: uncompressed_len,
+        fed: 0,
+        saw_error: false,
+        path,
+    }))
+}
+
+/// [`open`]이 돌려주는 스트리밍 핸들. [`Read`]로 해제 바이트를 내보내며, 소비가 끝나면
+/// [`ArchiveStream::finish`]로 완결성을 확인한다 — false면 부분 feed 결과물을 버릴 것.
+pub struct ArchiveStream {
+    pub meta: ArchiveMeta,
+    decoder: std::io::Take<flate2::read::ZlibDecoder<std::io::BufReader<std::fs::File>>>,
+    expected_len: u32,
+    fed: u64,
+    saw_error: bool,
+    path: PathBuf,
+}
+
+impl Read for ArchiveStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self.decoder.read(buf) {
+            Ok(read) => {
+                self.fed += read as u64;
+                Ok(read)
+            }
+            Err(error) => {
+                self.saw_error = true;
+                Err(error)
+            }
         }
     }
 }
 
-fn parse(bytes: &[u8]) -> Option<(ArchiveMeta, Vec<u8>)> {
-    if bytes.len() < HEADER_LEN || &bytes[0..4] != MAGIC || bytes[4] != VERSION {
+impl ArchiveStream {
+    /// 소비 완료 후 완결성 확인 — 잔여 바이트를 마저 세고(소비측 조기 중단 대비)
+    /// 선언 길이와 정확히 일치 + 해제 오류(adler 불일치 등) 없음이어야 true.
+    /// 손상이면 파일을 삭제하고 false — 호출측은 feed된 부분 결과물을 버려야 한다.
+    pub fn finish(mut self) -> bool {
+        let mut sink = [0u8; 16 * 1024];
+        loop {
+            match self.read(&mut sink) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        let ok = !self.saw_error && self.fed == u64::from(self.expected_len);
+        if !ok {
+            self.discard();
+        }
+        ok
+    }
+
+    /// 손상 확정 — 경고 후 파일 삭제 (graceful skip 규약).
+    fn discard(self) {
+        tracing::warn!(path = %self.path.display(), "scrollback 아카이브 손상 — 폐기");
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn parse_header(bytes: &[u8; HEADER_LEN]) -> Option<(ArchiveMeta, u32)> {
+    if &bytes[0..4] != MAGIC || bytes[4] != VERSION {
         return None;
     }
     let kind = bytes[5];
@@ -142,13 +228,6 @@ fn parse(bytes: &[u8]) -> Option<(ArchiveMeta, Vec<u8>)> {
     if !valid {
         return None;
     }
-    // take로 선언 길이 초과 해제를 차단 (압축 폭탄/오염 방어) — 정확 길이 검증까지
-    let mut dump = Vec::with_capacity(uncompressed_len as usize);
-    let mut decoder =
-        flate2::read::ZlibDecoder::new(&bytes[HEADER_LEN..]).take(u64::from(uncompressed_len) + 1);
-    if decoder.read_to_end(&mut dump).is_err() || dump.len() != uncompressed_len as usize {
-        return None;
-    }
     Some((
         ArchiveMeta {
             kind,
@@ -157,7 +236,7 @@ fn parse(bytes: &[u8]) -> Option<(ArchiveMeta, Vec<u8>)> {
             scrollback_lines,
             exit_code: (has_exit == 1).then_some(exit_code),
         },
-        dump,
+        uncompressed_len,
     ))
 }
 

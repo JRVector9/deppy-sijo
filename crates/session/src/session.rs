@@ -135,6 +135,9 @@ impl Session {
 
     /// 압축 아카이브에서 복원한 열람 전용 세션 (§14.3 확장 — exited 백엔드 복원).
     /// 프로세스 없음(pty None) — 백엔드에 아카이브 ANSI를 재주입해 스크롤백을 되살린다.
+    /// dump는 [`Read`]로 64KB 청크 스트리밍 feed — 전체(≤32MB)를 통째로 메모리에
+    /// 올리지 않는다 (복원 시 순간 메모리 스파이크 방지, 2026-07-16). 읽기/feed 오류는
+    /// 경고 후 부분 복원으로 진행한다 — 완결성 판정은 호출측(ArchiveStream::finish) 소관.
     pub fn restore_archived(
         id: SessionId,
         kind: SessionKind,
@@ -142,12 +145,25 @@ impl Session {
         rows: u16,
         scrollback_lines: usize,
         exit_code: Option<u32>,
-        ansi_dump: &[u8],
+        ansi_dump: &mut impl Read,
     ) -> Self {
         let (_tx, output) = std::sync::mpsc::channel();
         let mut backend = terminal::new_default_backend(cols, rows, scrollback_lines);
-        if let Err(e) = backend.feed(ansi_dump) {
-            tracing::warn!("아카이브 복원 feed 실패: {e:#}");
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            match ansi_dump.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    if let Err(e) = backend.feed(&buffer[..read]) {
+                        tracing::warn!("아카이브 복원 feed 실패: {e:#}");
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("아카이브 복원 읽기 실패: {e:#}");
+                    break;
+                }
+            }
         }
         // 복원 즉시 exited budget 적용 (visible 한도로 부풀지 않게)
         backend.set_cache_class(TerminalCacheClass::Exited);
@@ -498,8 +514,15 @@ mod tests {
             .serialize_scrollback()
             .expect("alacritty는 직렬화 지원");
 
-        let mut restored =
-            Session::restore_archived(SessionId(9), SessionKind::Shell, 40, 5, 100, Some(0), &dump);
+        let mut restored = Session::restore_archived(
+            SessionId(9),
+            SessionKind::Shell,
+            40,
+            5,
+            100,
+            Some(0),
+            &mut dump.as_slice(),
+        );
         assert!(!restored.lifecycle().is_running());
         assert_eq!(restored.cache_footprint().class, TerminalCacheClass::Exited);
         // 화면 마지막 줄 + 스크롤백 히스토리 보존

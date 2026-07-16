@@ -1748,20 +1748,31 @@ impl Worker {
         {
             return false;
         }
-        let restored = match storage::scrollback_archive::read(&self.logs_root, persistent_id) {
-            Ok(Some((meta, dump))) => {
-                self.archived_on_disk.insert(id);
-                Session::restore_archived(
+        // 아카이브는 스트리밍으로 backend에 직접 feed — dump(≤32MB)를 통째로 올리면
+        // 시작 복원이 pane 수만큼 순간 메모리 스파이크를 만든다 (2026-07-16).
+        let archived = match storage::scrollback_archive::open(&self.logs_root, persistent_id) {
+            Ok(Some(mut stream)) => {
+                let meta = stream.meta;
+                let session = Session::restore_archived(
                     id,
                     archive_kind_from_u8(meta.kind),
                     meta.cols,
                     meta.rows,
                     meta.scrollback_lines as usize,
                     meta.exit_code,
-                    &dump,
-                )
+                    &mut stream,
+                );
+                // 손상(절단/초과)이면 부분 feed된 세션을 버리고 폴백 — read() 손상 규약과 동일
+                stream.finish().then_some(session)
             }
-            _ => {
+            _ => None,
+        };
+        let restored = match archived {
+            Some(session) => {
+                self.archived_on_disk.insert(id);
+                session
+            }
+            None => {
                 // 폴백: 아카이브 부재(레거시/GC/손상) — redacted.ansi.log tail을
                 // 열람 전용 세션에 재생 (VS Code revive/reconnection 2계층 차용)
                 let (cols, rows) = Self::restored_terminal_size(&self.logs_root, persistent_id);
@@ -1772,7 +1783,7 @@ impl Worker {
                     rows,
                     Self::RESTORE_SCROLLBACK_LINES,
                     None,
-                    &[],
+                    &mut std::io::empty(),
                 );
                 // 열람 전용 — 모드 경계 리셋 생략(alt-screen 화면 보존, codex 리뷰 P2)
                 Self::replay_saved_ansi_ext(&self.logs_root, persistent_id, &mut session, false);
@@ -2529,18 +2540,26 @@ impl Worker {
         else {
             return;
         };
-        match storage::scrollback_archive::read(&self.logs_root, &key) {
-            Ok(Some((meta, dump))) => {
-                self.insert_restored_session(
+        // 디스크 dump도 스트리밍 feed — 열람 복원이 순간 메모리 스파이크를 만들지 않게.
+        match storage::scrollback_archive::open(&self.logs_root, &key) {
+            Ok(Some(mut stream)) => {
+                let meta = stream.meta;
+                let restored = Session::restore_archived(
                     session,
                     archive_kind_from_u8(meta.kind),
                     meta.cols,
                     meta.rows,
                     meta.scrollback_lines as usize,
                     meta.exit_code,
-                    &dump,
+                    &mut stream,
                 );
-                tracing::info!(session = session.0, "archived scrollback 복원 (디스크)");
+                if stream.finish() {
+                    self.adopt_restored_session(session, restored);
+                    tracing::info!(session = session.0, "archived scrollback 복원 (디스크)");
+                } else {
+                    // 손상 — 부분 feed된 세션은 버린다 (아카이브는 finish가 삭제)
+                    self.archived_on_disk.remove(&session);
+                }
             }
             Ok(None) => {
                 self.archived_on_disk.remove(&session);
@@ -2549,7 +2568,7 @@ impl Worker {
         }
     }
 
-    /// 아카이브 덤프로 열람 전용 세션을 만들어 편입한다 (inflate 공통 경로).
+    /// 아카이브 덤프로 열람 전용 세션을 만들어 편입한다 (인메모리 아카이브 inflate 경로).
     #[expect(clippy::too_many_arguments, reason = "아카이브 메타 필드 그대로")]
     fn insert_restored_session(
         &mut self,
@@ -2561,8 +2580,21 @@ impl Worker {
         exit_code: Option<u32>,
         dump: &[u8],
     ) {
-        let restored =
-            Session::restore_archived(session, kind, cols, rows, scrollback_lines, exit_code, dump);
+        let mut reader = dump;
+        let restored = Session::restore_archived(
+            session,
+            kind,
+            cols,
+            rows,
+            scrollback_lines,
+            exit_code,
+            &mut reader,
+        );
+        self.adopt_restored_session(session, restored);
+    }
+
+    /// 복원된 열람 전용 세션을 세션 테이블 + exited LRU에 편입한다.
+    fn adopt_restored_session(&mut self, session: SessionId, restored: Session) {
         self.sessions.insert(session, restored);
         self.exited_order.push_back(session);
     }

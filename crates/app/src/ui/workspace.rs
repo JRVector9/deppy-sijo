@@ -2124,6 +2124,48 @@ impl WorkspaceUi {
                     ui.separator();
                 }
             }
+            // 복사: 선택 텍스트가 있으면 표시 ("열기" 항목의 selection 판별 코드를 재사용).
+            if let Some(sel_session) = session
+                && let Some((s, a, b)) = self.selection
+                && s == sel_session
+            {
+                let text = self
+                    .sessions
+                    .get(&sel_session)
+                    .and_then(|view| view.snapshot.as_ref())
+                    .map(|snap| renderer_egui::selection_text(snap, a.min(b), a.max(b)));
+                if let Some(text) = text
+                    && !text.trim().is_empty()
+                    && ui.button(catalog.t("workspace.menu.copy", &[])).clicked()
+                {
+                    ui.ctx().copy_text(text);
+                    ui.close();
+                }
+            }
+            // 붙여넣기: 세션이 있으면 항상 표시. 드래그앤드롭 텍스트 붙여넣기(위 dnd_release_payload
+            // 처리)와 동일한 경로(terminal_text_paste_bytes + session_bracketed_paste)로 주입한다.
+            // send()가 WriteInput 공통 지점에서 선택 해제를 처리하므로 별도 clear_selection 불필요.
+            if let Some(paste_session) = session
+                && ui.button(catalog.t("workspace.menu.paste", &[])).clicked()
+            {
+                match crate::ui::clipboard_image::read_clipboard_text() {
+                    Some(text) => {
+                        let bytes = terminal_text_paste_bytes(
+                            &text,
+                            self.session_bracketed_paste(paste_session),
+                        );
+                        self.send(
+                            client,
+                            RuntimeCommand::WriteInput {
+                                session: paste_session,
+                                bytes,
+                            },
+                        );
+                    }
+                    None => tracing::warn!("컨텍스트 메뉴 붙여넣기: 클립보드에 텍스트 없음"),
+                }
+                ui.close();
+            }
             if ui
                 .button(catalog.t("workspace.split_horizontal", &[]))
                 .clicked()

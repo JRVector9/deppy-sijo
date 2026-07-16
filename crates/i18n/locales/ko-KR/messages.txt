@@ -219,6 +219,7 @@ workspace.start_shell_prompt = + 새 셸 로 시작하세요
 workspace.new_shell = + 새 셸
 workspace.split_horizontal_short = 분할 |
 workspace.split_vertical_short = 분할 -
+workspace.menu.scroll_bottom = 맨 아래로 스크롤
 workspace.close_pane = pane 닫기
 workspace.rename_hint = 우클릭/더블클릭으로 이름 변경
 workspace.close_confirm.title = pane 닫기

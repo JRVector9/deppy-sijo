@@ -2195,6 +2195,15 @@ impl WorkspaceUi {
                 ui.close();
             }
             ui.separator();
+            // 스크롤백에서 맨 아래(라이브 화면)로 복귀 — 세션이 있는 pane에서만 노출.
+            if let Some(session) = session
+                && ui
+                    .button(catalog.t("workspace.menu.scroll_bottom", &[]))
+                    .clicked()
+            {
+                self.send(client, RuntimeCommand::ScrollToBottom { session });
+                ui.close();
+            }
             // (수동 상태 지정 U17b 서브메뉴는 사이드바와 함께 제거 — hook 감지 정착,
             // 2026-07-17 사용자. wire 명령 SetUserStatusOverride는 계약상 유지.)
             if ui.button(catalog.t("workspace.close_pane", &[])).clicked() {
@@ -2339,6 +2348,24 @@ impl WorkspaceUi {
     pub fn close_focused_pane(&mut self, client: &dyn RuntimeClient) {
         if let Some(pane) = self.mux.as_ref().and_then(|mux| mux.focused_pane.clone()) {
             self.request_close_pane(client, pane);
+        }
+    }
+
+    /// 단축키(⌘↓)용 포커스된 pane을 스크롤백 맨 아래로 되돌린다. close_focused_pane과
+    /// 동일 구조 — 호출부(app crate의 단축키 처리부) 배선은 workspace.rs 밖이라 이 PR
+    /// 범위 밖이다 (호출부가 없어 현재는 미사용).
+    pub fn scroll_focused_to_bottom(&mut self, client: &dyn RuntimeClient) {
+        let session = self.mux.as_ref().and_then(|mux| {
+            mux.focused_pane.as_ref().and_then(|pane| {
+                mux.tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .find(|p| &p.id == pane)
+                    .and_then(|p| p.session_id)
+            })
+        });
+        if let Some(session) = session {
+            self.send(client, RuntimeCommand::ScrollToBottom { session });
         }
     }
 

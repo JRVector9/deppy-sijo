@@ -219,6 +219,7 @@ workspace.start_shell_prompt = Start with + New Shell
 workspace.new_shell = + New Shell
 workspace.split_horizontal_short = Split |
 workspace.split_vertical_short = Split -
+workspace.menu.scroll_bottom = Scroll to bottom
 workspace.close_pane = Close pane
 workspace.rename_hint = Right-click or double-click to rename
 workspace.close_confirm.title = Close pane

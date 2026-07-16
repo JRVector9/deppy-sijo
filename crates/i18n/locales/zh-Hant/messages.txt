@@ -219,6 +219,7 @@ workspace.start_shell_prompt = 使用 + 新增 Shell 開始
 workspace.new_shell = + 新增 Shell
 workspace.split_horizontal_short = 分割 |
 workspace.split_vertical_short = 分割 -
+workspace.menu.scroll_bottom = 捲動到底部
 workspace.close_pane = 關閉 pane
 workspace.rename_hint = 右鍵或雙擊重新命名
 workspace.close_confirm.title = 關閉窗格

@@ -92,6 +92,11 @@ pub struct UiConfig {
     /// 지표 특성상 "많이 쓴다"로 오해되기 쉬워(2026-07-16) 원하는 사용자만 켠다.
     #[serde(default)]
     pub show_memory_indicator: bool,
+    /// 터미널 선택 → "에이전트로 보내기" 프리셋 프롬프트 (2026-07-17 시나리오 ①).
+    /// 선택 텍스트 앞에 붙는 지시문 목록 — 비우면 "그대로 보내기"만 뜬다.
+    /// 사용자가 config.toml에서 자유롭게 편집한다(설정 UI는 후속).
+    #[serde(default = "default_agent_send_presets")]
+    pub agent_send_presets: Vec<String>,
     /// 세션 위치 표시명 스타일 (2026-07-13): 기본 = 현재(마지막) 폴더명,
     /// Repo = git 저장소 루트명(.git 상향 탐색 — 저장소 하위 어디서든 레포명).
     #[serde(default)]
@@ -113,6 +118,17 @@ fn default_ui_scale() -> f32 {
     1.0
 }
 
+/// 「에이전트로 보내기」 기본 프리셋 — 에러 트리아지·설명·리뷰가 실사용 상위 3개다.
+/// 로케일 무관 고정 문자열: 사용자가 쓰는 에이전트 언어에 맞춰 직접 고치는 값이고,
+/// i18n 카탈로그로 번역하면 config에 저장된 사용자 편집분과 충돌한다.
+fn default_agent_send_presets() -> Vec<String> {
+    vec![
+        "이 에러 고쳐줘".to_owned(),
+        "이 출력 설명해줘".to_owned(),
+        "이 코드 리뷰해줘".to_owned(),
+    ]
+}
+
 fn default_true() -> bool {
     true
 }
@@ -126,6 +142,7 @@ impl Default for UiConfig {
             agent_status_hooks: true,
             env_live_reload: false,
             show_memory_indicator: false,
+            agent_send_presets: default_agent_send_presets(),
             session_name_style: SessionNameStyle::default(),
             last_workspace_id: None,
             ui_font: None,

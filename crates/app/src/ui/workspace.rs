@@ -97,6 +97,8 @@ pub struct WorkspaceUi {
     confirm_close: Option<runtime::MuxPaneId>,
     /// '같은 폴더에서 새 셀'(사이드바) — 다음 ShellSpawned에 cd로 주입할 폴더.
     pending_spawn_cd: Option<String>,
+    /// 「에이전트로 보내기」 프리셋 프롬프트 (설정 미러 — App이 매 프레임 갱신).
+    agent_send_presets: Vec<String>,
     /// pane 우클릭 → "환경변수·API 설정" 요청 (E4 ⑥). App이 프레임에서 take해
     /// 설정 창을 Environment 카테고리로 연다.
     open_environment_requested: bool,
@@ -214,6 +216,7 @@ impl WorkspaceUi {
             split_drag: None,
             confirm_close: None,
             pending_spawn_cd: None,
+            agent_send_presets: Vec::new(),
             open_environment_requested: false,
             selection: None,
             project_name: None,
@@ -664,6 +667,11 @@ impl WorkspaceUi {
     ) {
         self.session_cwds = cwds;
         self.session_name_style = style;
+    }
+
+    /// 「에이전트로 보내기」 프리셋을 세팅한다(App이 설정에서 매 프레임 미러).
+    pub fn set_agent_send_presets(&mut self, presets: Vec<String>) {
+        self.agent_send_presets = presets;
     }
 
     /// 세션별 에이전트 표시정보를 세팅한다(App이 병합한 최종본 — 3줄 행 렌더용).
@@ -2016,6 +2024,102 @@ impl WorkspaceUi {
     /// 명령을 보냈거나 spawn 응답 대기 중이면 repaint를 예약한다 —
     /// 느린 spawn(keyring 등)도 응답 이벤트가 올 때까지 폴링이 끊기지 않는다.
     /// show()의 모든 return 경로에서 호출할 것.
+    /// 「에이전트로 보내기 ▸」 서브메뉴 — 실행 중 에이전트 pane마다 (그대로 보내기 +
+    /// 프리셋들), 2개 이상이면 「모든 에이전트에게 (N)」까지. 대상이 없으면 아무것도
+    /// 그리지 않는다(등록만 되고 실행 중이 아닌 에이전트는 대상이 아니다 — 2026-07-17).
+    fn send_to_agent_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        selection: &str,
+        client: &dyn RuntimeClient,
+        catalog: &i18n::Catalog,
+    ) {
+        // 실행 중 에이전트 = 감지 워커가 채운 agent_info의 세션들. 표시 순서를 프레임마다
+        // 흔들지 않게 mux pane 순서로 정렬한다.
+        let targets: Vec<(SessionId, String)> = self
+            .mux
+            .iter()
+            .flat_map(|mux| mux.tabs.iter().flat_map(|tab| &tab.panes))
+            .filter_map(|pane| {
+                let session = pane.session_id?;
+                let line = self.agent_line_for(session)?;
+                Some((session, line))
+            })
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let mut send_to: Vec<SessionId> = Vec::new();
+        let mut body: Option<String> = None;
+        ui.menu_button(catalog.t("workspace.menu.send_agent", &[]), |ui| {
+            for (session, agent_line) in &targets {
+                ui.label(egui::RichText::new(agent_line).small().weak());
+                if ui
+                    .button(catalog.t("workspace.menu.send_agent.raw", &[]))
+                    .clicked()
+                {
+                    send_to = vec![*session];
+                    body = Some(selection.to_owned());
+                    ui.close();
+                }
+                for preset in &self.agent_send_presets {
+                    if ui.button(format!("\"{preset}\"")).clicked() {
+                        send_to = vec![*session];
+                        body = Some(format!("{preset}:\n{selection}"));
+                        ui.close();
+                    }
+                }
+                ui.separator();
+            }
+            // 대상이 둘 이상일 때만 — 하나뿐이면 개별 전송과 같아 의미가 없다.
+            if targets.len() > 1
+                && ui
+                    .button(catalog.t(
+                        "workspace.menu.send_agent.all",
+                        &[("count", &targets.len().to_string())],
+                    ))
+                    .clicked()
+            {
+                send_to = targets.iter().map(|(session, _)| *session).collect();
+                body = Some(selection.to_owned());
+                ui.close();
+            }
+        });
+        let Some(body) = body else {
+            return;
+        };
+        for session in &send_to {
+            self.send_agent_prompt(client, *session, &body);
+        }
+        // 단일 대상이면 그 pane으로 포커스를 옮겨 Enter만 치면 되게 한다. **자동 전송은
+        // 하지 않는다** — 보내기 전에 프롬프트를 다듬을 수 있어야 한다(확정 사항).
+        // 여러 대상(브로드캐스트)은 포커스를 옮기지 않는다 — 어디로 갈지 정할 수 없고,
+        // 사용자가 각 pane에서 직접 출발시키는 것이 비교 실행의 의도다.
+        if let Some(session) = send_to.first().filter(|_| send_to.len() == 1)
+            && let Some(pane) = self.pane_of_session(*session)
+        {
+            self.send(client, RuntimeCommand::FocusPane { pane });
+        }
+    }
+
+    /// 세션이 붙어 있는 pane id (mux 스냅샷 조회).
+    fn pane_of_session(&self, session: SessionId) -> Option<runtime::MuxPaneId> {
+        self.mux
+            .as_ref()?
+            .tabs
+            .iter()
+            .flat_map(|tab| &tab.panes)
+            .find_map(|pane| (pane.session_id == Some(session)).then(|| pane.id.clone()))
+    }
+
+    /// 에이전트 pane 입력창에 텍스트를 주입한다(전송은 사용자 Enter). 여러 줄이 안전하게
+    /// 한 덩어리로 들어가도록 붙여넣기 경로(bracketed paste)를 그대로 쓴다 — 개행이
+    /// 즉시 전송으로 해석되지 않는다.
+    fn send_agent_prompt(&mut self, client: &dyn RuntimeClient, session: SessionId, body: &str) {
+        let bytes = terminal_text_paste_bytes(body, self.session_bracketed_paste(session));
+        self.send(client, RuntimeCommand::WriteInput { session, bytes });
+    }
+
     /// pane 닫기 요청 — 실행 중 세션이면 확인을 거치고, 아니면 즉시 닫는다.
     /// (세션 상태를 모르면 보수적으로 확인을 띄운다 — 실수 즉사 방지가 목적.)
     /// 사이드바 컨텍스트 메뉴(App 경유)도 같은 경로를 쓴다.
@@ -2138,7 +2242,8 @@ impl WorkspaceUi {
                     ui.separator();
                 }
             }
-            // 복사: 선택 텍스트가 있으면 표시 ("열기" 항목의 selection 판별 코드를 재사용).
+            // 복사 + 에이전트로 보내기: 선택 텍스트가 있으면 표시
+            // ("열기" 항목의 selection 판별 코드를 재사용).
             if let Some(sel_session) = session
                 && let Some((s, a, b)) = self.selection
                 && s == sel_session
@@ -2150,10 +2255,16 @@ impl WorkspaceUi {
                     .map(|snap| renderer_egui::selection_text(snap, a.min(b), a.max(b)));
                 if let Some(text) = text
                     && !text.trim().is_empty()
-                    && ui.button(catalog.t("workspace.menu.copy", &[])).clicked()
                 {
-                    ui.ctx().copy_text(text);
-                    ui.close();
+                    if ui.button(catalog.t("workspace.menu.copy", &[])).clicked() {
+                        ui.ctx().copy_text(text.clone());
+                        ui.close();
+                    }
+                    // 선택 → 에이전트로 보내기 (2026-07-17 시나리오 ①): 에러 출력을
+                    // 복사→pane 전환→붙여넣기→타이핑하던 흐름을 우클릭 두 번으로 줄인다.
+                    // 대상은 **실행 중으로 감지된 에이전트 pane**(등록 목록이 아니라
+                    // agent_info) — 없으면 이 메뉴 자체가 안 보인다.
+                    self.send_to_agent_menu(ui, &text, client, catalog);
                 }
             }
             // 붙여넣기: 세션이 있으면 항상 표시. 드래그앤드롭 텍스트 붙여넣기(위 dnd_release_payload

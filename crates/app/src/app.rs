@@ -5023,6 +5023,10 @@ impl eframe::App for App {
         self.active
             .workspace_ui
             .set_ui_scale(self.config.ui.ui_scale);
+        // 「에이전트로 보내기」 프리셋(설정) 미러 — pane 우클릭 메뉴가 쓴다.
+        self.active
+            .workspace_ui
+            .set_agent_send_presets(self.config.ui.agent_send_presets.clone());
 
         // 폴더 트리 사이드바 (FT-1) — CentralPanel보다 먼저 배치해야 한다 (§9-1).
         // OFF(None)면 Panel 자체를 만들지 않는다 (§6 리소스 0).

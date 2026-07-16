@@ -3016,11 +3016,14 @@ impl App {
                     tracing::warn!("단축키 설정 저장 실패: {error:#}");
                 }
             }
-            A::OpenEnvironment | A::OpenActivity | A::OpenNotifications => {
+            // 알림은 설정 창이 아니라 벨 팝오버를 토글한다 (v3.9 N1) — 승인/응답을
+            // 빠르게 처리하는 경로라 통합 설정 창 전체를 열지 않는다. 전체 기록은
+            // 팝오버의 「전체 보기」가 설정→알림으로 연결한다.
+            A::OpenNotifications => egui::Popup::toggle_id(ctx, Self::inbox_popup_id()),
+            A::OpenEnvironment | A::OpenActivity => {
                 self.settings_category = match action {
                     A::OpenEnvironment => ui::settings::Category::Environment,
                     A::OpenActivity => ui::settings::Category::Activity,
-                    A::OpenNotifications => ui::settings::Category::Notifications,
                     _ => unreachable!(),
                 };
                 self.settings_open = true;
@@ -4292,6 +4295,60 @@ impl App {
         }
     }
 
+    /// 벨 팝오버(대기 인박스 + 최근 알림)의 고정 Id — 단축키(⌘⇧U) 토글이 같은 팝오버를
+    /// 가리켜야 하므로 상수 Id를 쓴다.
+    fn inbox_popup_id() -> egui::Id {
+        egui::Id::new("inbox_popup")
+    }
+
+    /// 벨 팝오버 본문 (v3.9 N1). 설정 창과 독립 — 밖을 클릭하면 닫힌다.
+    /// 반환: 최근 알림에서 클릭한 대상(있으면 호출측이 기존 네비게이션 경로로 처리).
+    ///
+    /// 대기 섹션(N2 MCP 승인 카드 / N3 PTY 대기 카드)은 후속 PR이 여기에 붙인다.
+    fn inbox_popup(
+        &mut self,
+        bell: &egui::Response,
+        text: &i18n::Catalog,
+    ) -> Option<ui::notifications::AgentNotificationTarget> {
+        const RECENT_IN_POPOVER: usize = 5;
+        let mut clicked = None;
+        let mut open_full = false;
+        egui::Popup::from_response(bell)
+            .id(Self::inbox_popup_id())
+            .open_memory(bell.clicked().then_some(egui::SetOpenCommand::Toggle))
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .align(egui::RectAlign::BOTTOM_START)
+            .show(|ui| {
+                ui.set_min_width(260.0);
+                ui.set_max_width(300.0);
+                clicked = self
+                    .notifications_ui
+                    .recent_section(ui, text, RECENT_IN_POPOVER);
+                ui.add_space(6.0);
+                // 전체 기록·비우기는 설정→알림이 계속 담당한다 (팝오버는 빠른 확인만).
+                if ui
+                    .button(text.t("inbox.view_all", &[]))
+                    .on_hover_text(text.t("inbox.view_all.hint", &[]))
+                    .clicked()
+                {
+                    open_full = true;
+                }
+            });
+        if open_full {
+            self.settings_category = ui::settings::Category::Notifications;
+            self.settings_open = true;
+            self.refresh_workspaces();
+            egui::Popup::close_id(&self.egui_ctx, Self::inbox_popup_id());
+        }
+        // 팝오버를 연 동안은 읽음 처리 — 설정→알림 카테고리와 같은 규약.
+        if egui::Popup::is_id_open(&self.egui_ctx, Self::inbox_popup_id())
+            && self.notifications_ui.mark_all_read()
+        {
+            self.egui_ctx.request_repaint();
+        }
+        clicked
+    }
+
     fn prune_resolved_approvals(&self) {
         let now = deppy_core::time::unix_secs_i64();
         match self
@@ -4577,6 +4634,9 @@ impl eframe::App for App {
         let text = self.i18n.clone();
         self.handle_configured_shortcut(ui.ctx());
         let mut unread_before = 0;
+        // 벨 팝오버의 최근 알림 클릭 — 설정→알림(notif_click)과 같은 네비게이션 경로로
+        // 아래에서 함께 처리한다.
+        let mut inbox_click = None;
         // 실효 테마(다크 여부)가 바뀌면 터미널 렌더 캐시를 비운다 — stale galley로 글자가
         // 깨진 채 남던 문제(#7). 설정에서의 명시 변경과 System 테마의 OS 레벨 전환(raw
         // input system_theme, config_changed 안 거침, codex 지적)을 모두 여기서 커버한다.
@@ -4657,34 +4717,9 @@ impl eframe::App for App {
                         ui.add_space(76.0);
                         // 프레임 없는 텍스트 버튼 — 선택(열린 창)이면 accent-soft 둥근 박스로
                         // 강조, hover 시 옅은 배경 (목업 §타이틀바 선택 하이라이트).
+                        // 팝오버 앵커가 필요한 곳(벨)은 tbtn_response로 Response를 받는다.
                         let tbtn = |ui: &mut egui::Ui, label: String, selected: bool| -> bool {
-                            let accent = ui.visuals().selection.bg_fill;
-                            let col = if selected {
-                                accent
-                            } else {
-                                ui.visuals().weak_text_color()
-                            };
-                            let font = egui::FontId::proportional(13.0);
-                            let galley = ui.painter().layout_no_wrap(label, font, col);
-                            let w = galley.size().x + 20.0;
-                            let (rect, resp) =
-                                ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::click());
-                            if selected {
-                                ui.painter()
-                                    .rect_filled(rect, 6.0, accent.gamma_multiply(0.15));
-                            } else if resp.hovered() {
-                                ui.painter().rect_filled(
-                                    rect,
-                                    6.0,
-                                    ui.visuals().widgets.hovered.weak_bg_fill,
-                                );
-                            }
-                            let pos = egui::pos2(
-                                rect.center().x - galley.size().x / 2.0,
-                                rect.center().y - galley.size().y / 2.0,
-                            );
-                            ui.painter().galley(pos, galley, col);
-                            resp.clicked()
+                            tbtn_response(ui, label, selected).clicked()
                         };
                         // 구조화된 Codex App Server 세션은 PTY workspace와 별도 창으로 연다.
                         // raw terminal stream을 파싱/재작성하지 않아 ANSI·full-screen 앱이 보존된다.
@@ -4692,17 +4727,23 @@ impl eframe::App for App {
                         if tbtn(ui, "Agents".to_owned(), agent_sessions_selected) {
                             self.agent_sessions_ui.toggle();
                         }
-                        // 설정 카테고리는 통합 설정 창의 좌측 네비에 있고, unread는 설정 라벨에
-                        // 뱃지 카운트로 얹는다.
+                        // 벨(대기 인박스 + 최근 알림) — 설정 창과 독립된 경량 팝오버(v3.9 N1).
+                        // 알림 확인에 통합 설정 창 전체를 여는 마찰을 없앤다. unread 뱃지는
+                        // 설정 라벨에서 여기로 이관했다.
                         let unread = self.notifications_ui.unread();
                         unread_before = unread;
-                        let settings_label = if unread > 0 {
-                            format!("{} ({unread})", text.t("top.settings", &[]))
+                        let bell_label = if unread > 0 {
+                            format!("🔔 {unread}")
                         } else {
-                            text.t("top.settings", &[])
+                            "🔔".to_owned()
                         };
+                        let bell_open = egui::Popup::is_id_open(ui.ctx(), Self::inbox_popup_id());
+                        let bell = tbtn_response(ui, bell_label, bell_open)
+                            .on_hover_text(text.t("top.notifications", &[]));
+                        inbox_click = self.inbox_popup(&bell, &text);
+
                         let sel = self.settings_open;
-                        if tbtn(ui, settings_label, sel) {
+                        if tbtn(ui, text.t("top.settings", &[]), sel) {
                             self.settings_open = !sel;
                             if self.settings_open {
                                 self.refresh_workspaces();
@@ -5958,7 +5999,8 @@ impl eframe::App for App {
             }
             None => {}
         }
-        if let Some(target) = notif_click {
+        // 설정→알림과 벨 팝오버는 같은 대상 타입을 돌려준다 — 네비게이션 경로 공유.
+        if let Some(target) = notif_click.or(inbox_click) {
             let workspace_ids = self
                 .workspaces
                 .iter()
@@ -6138,6 +6180,34 @@ fn parse_known_hosts(text: &str) -> Vec<(String, String)> {
 }
 
 /// 세션이 붙어 있는 pane id를 mux 스냅샷에서 찾는다 (알림 클릭 → focus용).
+/// 상단바 텍스트 버튼 — 프레임 없이 라벨만, 선택 시 accent-soft 박스.
+/// Response를 돌려주므로 팝오버 앵커/hover 텍스트에 쓸 수 있다.
+fn tbtn_response(ui: &mut egui::Ui, label: String, selected: bool) -> egui::Response {
+    let accent = ui.visuals().selection.bg_fill;
+    let col = if selected {
+        accent
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let font = egui::FontId::proportional(13.0);
+    let galley = ui.painter().layout_no_wrap(label, font, col);
+    let w = galley.size().x + 20.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 26.0), egui::Sense::click());
+    if selected {
+        ui.painter()
+            .rect_filled(rect, 6.0, accent.gamma_multiply(0.15));
+    } else if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, 6.0, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    let pos = egui::pos2(
+        rect.center().x - galley.size().x / 2.0,
+        rect.center().y - galley.size().y / 2.0,
+    );
+    ui.painter().galley(pos, galley, col);
+    resp
+}
+
 fn pane_of_session(
     mux: &runtime::MuxSnapshot,
     session: runtime::SessionId,

@@ -300,6 +300,46 @@ impl NotificationsUi {
         });
     }
 
+    /// 벨 팝오버의 「최근 알림」 섹션 (v3.9 N1) — 최신 N개만. 전체 목록/비우기는
+    /// 설정→알림(contents)이 계속 담당한다. 팝오버는 "빠른 확인"만 한다.
+    ///
+    /// 팝오버 본문은 이 함수 + 대기 섹션(N2 승인 카드 / N3 PTY 카드)으로 구성된다 —
+    /// 세 섹션이 서로 다른 PR에서 채워지므로 렌더 함수를 분리해 둔다.
+    pub fn recent_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        catalog: &i18n::Catalog,
+        max_items: usize,
+    ) -> Option<AgentNotificationTarget> {
+        section_label(ui, &catalog.t("inbox.recent", &[]));
+        if self.items.is_empty() {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(catalog.t("notification.empty", &[]))
+                    .size(11.0)
+                    .weak(),
+            );
+            return None;
+        }
+        let mut clicked = None;
+        // 최신 항목이 위로 — 팝오버는 최근 max_items개만 보여준다.
+        for item in self.items.iter().rev().take(max_items) {
+            let icon = status_icon(item.status);
+            let label = catalog.t(&item.message_id, &[("title", &item.title)]);
+            ui.horizontal(|ui| {
+                ui.colored_label(notification_status_color(item.status), "●");
+                if ui
+                    .button(format!("{} {icon} {label}", item.source.badge()))
+                    .on_hover_text(catalog.t("notification.goto_session", &[]))
+                    .clicked()
+                {
+                    clicked = Some(item.target.clone());
+                }
+            });
+        }
+        clicked
+    }
+
     /// 창 프레임 없이 본문만 렌더 (통합 설정 창 우측 패널용). 읽음 처리는 show()가 한다.
     pub fn contents(
         &mut self,
@@ -334,6 +374,20 @@ impl NotificationsUi {
         }
         clicked
     }
+}
+
+/// 팝오버 섹션 제목 — 좌측 세로 막대 + 작은 라벨 (대기/최근 공용).
+pub fn section_label(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, 12.0), egui::Sense::hover());
+        ui.painter().rect_filled(
+            rect,
+            1.0,
+            ui.visuals().widgets.noninteractive.bg_stroke.color,
+        );
+        ui.label(egui::RichText::new(text).size(11.0).strong().weak());
+    });
 }
 
 fn notification_status_color(status: SessionStatus) -> egui::Color32 {

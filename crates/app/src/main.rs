@@ -78,8 +78,8 @@ fn main() -> anyhow::Result<()> {
     let result = eframe::run_native(
         "Deppy Sijo",
         eframe::NativeOptions {
-            // 렌더러 A/B(B1): env 미지정이면 `Renderer::default()` — eframe 0.35 기본 feature가
-            // wgpu라 이 값은 **Wgpu**이고, 이는 B1 이전과 완전히 동일한 경로다(회귀 없음).
+            // production은 Wgpu/Metal 전용. A/B 벤치 빌드(`render-glow`)에서만
+            // DEPPY_RENDERER=glow 선택을 허용한다.
             renderer: select_renderer(),
             // 창 위치/크기 영속 안 함 — 외부 모니터 분리 후 저장된 좌표로 복원되면
             // 창이 화면 밖에 떠서 "앱이 죽은 것처럼" 보인다 (2026-07-05 실증:
@@ -148,16 +148,22 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
-/// `DEPPY_RENDERER=glow|wgpu`. 미지정/오타면 eframe 기본값 — 즉 **현재 동작(wgpu) 유지**.
+/// production은 항상 Wgpu. `DEPPY_RENDERER=glow`는 `render-glow` 벤치 feature에서만 유효.
 fn select_renderer() -> eframe::Renderer {
     match std::env::var("DEPPY_RENDERER").as_deref() {
+        #[cfg(feature = "render-glow")]
         Ok("glow") => eframe::Renderer::Glow,
+        #[cfg(not(feature = "render-glow"))]
+        Ok("glow") => {
+            eprintln!("DEPPY_RENDERER=glow는 render-glow 벤치 빌드에서만 지원 — wgpu 사용");
+            eframe::Renderer::Wgpu
+        }
         Ok("wgpu") => eframe::Renderer::Wgpu,
         Ok(other) => {
-            eprintln!("DEPPY_RENDERER='{other}' 알 수 없음 — 기본 렌더러 사용");
-            eframe::Renderer::default()
+            eprintln!("DEPPY_RENDERER='{other}' 알 수 없음 — wgpu 사용");
+            eframe::Renderer::Wgpu
         }
-        Err(_) => eframe::Renderer::default(),
+        Err(_) => eframe::Renderer::Wgpu,
     }
 }
 
@@ -187,6 +193,7 @@ fn renderer_fields(
 }
 
 /// glow 경로의 (GL_RENDERER, GL_VERSION). 컨텍스트가 없으면 "unknown".
+#[cfg(feature = "render-glow")]
 fn gl_strings(cc: &eframe::CreationContext<'_>) -> (String, String) {
     use eframe::glow::HasContext as _;
     let Some(gl) = cc.gl.as_ref() else {
@@ -199,6 +206,11 @@ fn gl_strings(cc: &eframe::CreationContext<'_>) -> (String, String) {
             gl.get_parameter_string(eframe::glow::VERSION),
         )
     }
+}
+
+#[cfg(not(feature = "render-glow"))]
+fn gl_strings(_cc: &eframe::CreationContext<'_>) -> (String, String) {
+    ("unavailable".to_owned(), "render-glow disabled".to_owned())
 }
 
 /// 벤치 전용 임시 루트 (pid로 구분 — 동시 실행/실데이터 오염 방지).

@@ -134,7 +134,8 @@ pub enum RuntimeCommand {
     },
     /// exited 백엔드 캐시 정책 (§14.3 확장, 2026-07-11 — 설정에서 변경).
     /// max_exited_backends = live 백엔드 LRU 상한(초과분은 압축 아카이브),
-    /// cache_budget_bytes = 전역 터미널 캐시 예산. **variant는 끝에만 추가** (wire 계약).
+    /// cache_budget_bytes = 이 runtime에 배정된 프로세스 전역 터미널 캐시 예산의 share.
+    /// **variant는 끝에만 추가** (wire 계약).
     SetTerminalCachePolicy {
         max_exited_backends: usize,
         cache_budget_bytes: usize,

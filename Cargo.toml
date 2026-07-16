@@ -31,11 +31,9 @@ rust-version = "1.96.1"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-# eframe 0.35의 **기본 feature는 wgpu**다(glow 아님) — 즉 이 앱은 이미 wgpu/Metal로 돌고
-# 있었다(docs/terminal-current-state-audit.md의 "현재 glow 확정"은 오류). 렌더러 A/B 실측
-# (B1)을 위해 glow를 **추가로** 켠다. 둘 다 켜지면 `Renderer::default()`는 여전히 Wgpu라
-# (eframe epi.rs) 기본 실행 경로는 불변이고, `DEPPY_RENDERER=glow`로만 glow가 선택된다.
-eframe = { version = "0.35", features = ["glow"] }
+# 기본 feature의 wgpu/Metal만 production에 포함한다. Glow/OpenGL A/B 벤치는 app의
+# `render-glow` feature가 필요할 때만 추가해 일반 배포의 코드/프레임워크 매핑을 줄인다.
+eframe = "0.35"
 egui = "0.35"
 anyhow = "1"
 serde = { version = "1", features = ["derive", "rc"] }

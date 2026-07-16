@@ -388,6 +388,16 @@ const SEARCH_MAX_MATCHES_HARD_CAP: usize = 5_000;
 const REMOTE_VIEWING_TTL_CAP: Duration = Duration::from_secs(300);
 
 const DEFAULT_MAX_EXITED_BACKENDS: usize = 64;
+const MIN_RUNTIME_CACHE_BUDGET_BYTES: usize = 1024 * 1024;
+const MAX_RUNTIME_CACHE_BUDGET_BYTES: usize = 2048 * 1024 * 1024;
+
+fn clamp_runtime_cache_budget_bytes(bytes: usize) -> usize {
+    bytes.clamp(
+        MIN_RUNTIME_CACHE_BUDGET_BYTES,
+        MAX_RUNTIME_CACHE_BUDGET_BYTES,
+    )
+}
+
 /// 압축 아카이브 총 바이트 예산 — 초과 시 오래된 아카이브부터 제거 (LRU).
 /// 개당 압축 ANSI ~수십 KB라 넉넉한 개수를 담는다.
 const ARCHIVED_SCROLLBACK_BUDGET_BYTES: usize = 16 * 1024 * 1024;
@@ -436,7 +446,7 @@ struct Worker {
     exited_order: std::collections::VecDeque<SessionId>,
     /// exited 백엔드 LRU 상한 (SetTerminalCachePolicy로 변경 — 설정 UI).
     max_exited_backends: usize,
-    /// 전역 터미널 캐시 바이트 예산 (SetTerminalCachePolicy로 변경).
+    /// 이 runtime에 배정된 프로세스 전역 터미널 캐시 바이트 예산의 share.
     cache_budget_bytes: usize,
     /// 압축 아카이브 — 백엔드를 내린 exited 세션의 zlib(ANSI) 덤프. pane이 다시
     /// 보이면 복원(inflate)한다 (§14.3 확장, 2026-07-11).
@@ -1092,8 +1102,9 @@ impl Worker {
                 // 원값 방어 (remote wire 포함) — 설정 UI clamp와 동일 기준.
                 // 적용은 다음 pump tick의 archive_over_cap이 처리한다.
                 self.max_exited_backends = max_exited_backends.clamp(4, 512);
-                self.cache_budget_bytes =
-                    cache_budget_bytes.clamp(32 * 1024 * 1024, 2048 * 1024 * 1024);
+                // 앱의 전역 최소 설정은 32MiB지만 resident runtime 사이에 나눈 share는
+                // 그보다 작을 수 있다. 워커 경계에서는 비정상 0만 1MiB로 방어한다.
+                self.cache_budget_bytes = clamp_runtime_cache_budget_bytes(cache_budget_bytes);
             }
             RuntimeCommand::SetRemoteViewing {
                 session,
@@ -2722,6 +2733,19 @@ mod tests {
     use super::*;
     use crate::command::{SplitDirection, WorkspaceRuntimeState};
     use std::time::Instant;
+
+    #[test]
+    fn runtime_cache_share_accepts_values_below_global_32mib_minimum() {
+        assert_eq!(clamp_runtime_cache_budget_bytes(0), 1024 * 1024);
+        assert_eq!(
+            clamp_runtime_cache_budget_bytes(8 * 1024 * 1024),
+            8 * 1024 * 1024
+        );
+        assert_eq!(
+            clamp_runtime_cache_budget_bytes(usize::MAX),
+            2048 * 1024 * 1024
+        );
+    }
 
     fn test_store() -> Arc<dyn SecretStore> {
         Arc::new(secret::KeyringSecretStore)

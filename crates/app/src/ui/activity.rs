@@ -113,6 +113,8 @@ struct ActivitySummary {
     idle: usize,
     sessions: usize,
     cpu_percent: Option<f32>,
+    app_rss_bytes: u64,
+    child_rss_bytes: u64,
     rss_bytes: u64,
     warnings: usize,
 }
@@ -125,11 +127,16 @@ fn activity_summary(rows: &[ActivityWorkspaceRow]) -> ActivitySummary {
         idle: 0,
         sessions: 0,
         cpu_percent: None,
+        app_rss_bytes: 0,
+        child_rss_bytes: 0,
         rss_bytes: 0,
         warnings: 0,
     };
     let mut cpu = 0.0;
     let mut cpu_seen = false;
+    // Runtime worker는 workspace마다 하나지만 모두 같은 in-process 앱 PID/RSS를
+    // 샘플링한다. 요약에서는 PID별 한 번만 더해야 warm 수만큼 앱 메모리가 중복되지 않는다.
+    let mut seen_app_pids = std::collections::HashSet::new();
     for row in rows {
         match row.state {
             ActivityWorkspaceState::Active => summary.active += 1,
@@ -137,15 +144,17 @@ fn activity_summary(rows: &[ActivityWorkspaceRow]) -> ActivitySummary {
             ActivityWorkspaceState::Idle => summary.idle += 1,
         }
         summary.sessions += row.session_count;
-        if let Some(resource) = &row.resource {
-            summary.rss_bytes = summary.rss_bytes.saturating_add(resource.rss_bytes);
+        if let Some(resource) = &row.resource
+            && seen_app_pids.insert(resource.pid)
+        {
+            summary.app_rss_bytes = summary.app_rss_bytes.saturating_add(resource.rss_bytes);
             if let Some(value) = resource.cpu_percent {
                 cpu += value;
                 cpu_seen = true;
             }
         }
         for resource in &row.session_resources {
-            summary.rss_bytes = summary.rss_bytes.saturating_add(resource.rss_bytes);
+            summary.child_rss_bytes = summary.child_rss_bytes.saturating_add(resource.rss_bytes);
             if let Some(value) = resource.cpu_percent {
                 cpu += value;
                 cpu_seen = true;
@@ -155,6 +164,9 @@ fn activity_summary(rows: &[ActivityWorkspaceRow]) -> ActivitySummary {
             summary.warnings += 1;
         }
     }
+    summary.rss_bytes = summary
+        .app_rss_bytes
+        .saturating_add(summary.child_rss_bytes);
     summary.cpu_percent = cpu_seen.then_some(cpu);
     summary
 }
@@ -191,8 +203,12 @@ fn summary_cards(ui: &mut egui::Ui, catalog: &i18n::Catalog, summary: ActivitySu
             catalog.t("activity.summary.memory", &[]),
             format_bytes(summary.rss_bytes),
             catalog.t(
-                "activity.summary.warning_detail",
-                &[("count", &summary.warnings.to_string())],
+                "activity.summary.memory_detail",
+                &[
+                    ("app", &format_bytes(summary.app_rss_bytes)),
+                    ("children", &format_bytes(summary.child_rss_bytes)),
+                    ("count", &summary.warnings.to_string()),
+                ],
             ),
         ),
     ];
@@ -521,8 +537,55 @@ mod tests {
         assert_eq!(summary.idle, 0);
         assert_eq!(summary.sessions, 0);
         assert_eq!(summary.cpu_percent, None);
+        assert_eq!(summary.app_rss_bytes, 0);
+        assert_eq!(summary.child_rss_bytes, 0);
         assert_eq!(summary.rss_bytes, 0);
         assert_eq!(summary.warnings, 0);
+    }
+
+    #[test]
+    fn summary_deduplicates_app_pid_but_keeps_distinct_session_children() {
+        let row =
+            |name: &str, app_cpu: f32, child_session: u64, child_rss: u64| ActivityWorkspaceRow {
+                name: name.to_owned(),
+                state: ActivityWorkspaceState::Warm,
+                session_count: 1,
+                pending_events: 0,
+                input_pressure: None,
+                backgrounded_for_secs: Some(1),
+                auto_suspend_remaining_secs: Some(1),
+                resource: Some(runtime::ProcessResourceSnapshot {
+                    pid: 42,
+                    sampled_at_ms: 0,
+                    rss_bytes: 100,
+                    cpu_percent: Some(app_cpu),
+                    high_cpu: false,
+                    high_rss: false,
+                }),
+                session_resources: vec![runtime::SessionResourceUsage {
+                    session: runtime::SessionId(child_session),
+                    pid: Some(child_session as u32),
+                    process_group: Some(child_session as u32),
+                    identity_source: runtime::ProcessIdentitySource::PortablePty,
+                    sampled_at_ms: 0,
+                    process_count: 1,
+                    rss_bytes: child_rss,
+                    cpu_percent: Some(child_rss as f32),
+                    high_cpu: false,
+                    high_rss: false,
+                }],
+                sessions: Vec::new(),
+            };
+
+        let summary = activity_summary(&[row("one", 10.0, 7, 20), row("two", 99.0, 8, 30)]);
+        assert_eq!(summary.app_rss_bytes, 100, "동일 앱 PID는 한 번만 합산");
+        assert_eq!(summary.child_rss_bytes, 50, "세션 자식은 각각 합산");
+        assert_eq!(summary.rss_bytes, 150);
+        assert_eq!(
+            summary.cpu_percent,
+            Some(60.0),
+            "중복 앱 CPU도 한 번만 합산"
+        );
     }
 
     #[test]

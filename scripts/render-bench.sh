@@ -109,16 +109,16 @@ default_secs() { # 시나리오별 기본 실행 시간(초)
 # release만 만든다. Debug 바이너리는 이 스크립트가 쓰지 않는다(성능 결론 금지).
 build() {
   mkdir -p "$WORK/bin"
-  note "release 빌드 (기본 — glow/wgpu 선택은 런타임 DEPPY_RENDERER)"
-  (cd "$ROOT" && cargo build --release -p deppy-sijo)
+  note "release 벤치 빌드 (--features render-glow — glow/wgpu A/B 전용)"
+  (cd "$ROOT" && cargo build --release -p deppy-sijo --features render-glow)
   cp "$ROOT/target/release/deppy-sijo" "$BIN_PLAIN"
 
   if has_bench_alloc_feature; then
-    note "release 빌드 (--features bench-alloc — frame allocation 계측용)"
-    (cd "$ROOT" && cargo build --release -p deppy-sijo --features bench-alloc)
+    note "release 빌드 (--features render-glow,bench-alloc — A/B + frame allocation)"
+    (cd "$ROOT" && cargo build --release -p deppy-sijo --features render-glow,bench-alloc)
     cp "$ROOT/target/release/deppy-sijo" "$BIN_ALLOC"
     # 기본 사본이 alloc 빌드로 덮이지 않도록 plain을 다시 만든다(같은 산출물 경로 공유).
-    (cd "$ROOT" && cargo build --release -p deppy-sijo)
+    (cd "$ROOT" && cargo build --release -p deppy-sijo --features render-glow)
     cp "$ROOT/target/release/deppy-sijo" "$BIN_PLAIN"
   else
     rm -f "$BIN_ALLOC"

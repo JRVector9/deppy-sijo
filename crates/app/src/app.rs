@@ -909,6 +909,22 @@ impl WorkspaceRuntime {
             self.created.elapsed(),
         )
     }
+
+    /// 30분 warm timeout 뒤 안전하게 재생성 가능한 "프롬프트 대기 셸만" 남았는지.
+    /// 에이전트/미분류 세션, 자식 프로세스, resource 샘플 부재는 모두 작업 중으로 보고
+    /// 보호한다. 셸 자체는 layout/cwd에서 다시 spawn되므로 이 조건에서만 suspend 가능하다.
+    fn can_auto_suspend_idle_shells(&self) -> bool {
+        if self.workspace_ui.pending_spawns() + self.pending_agent_spawns > 0 || !self.live.seen_mux
+        {
+            return false;
+        }
+        let Some(sessions) = self.live.live_shell_sessions() else {
+            return false;
+        };
+        shell_sessions_are_idle(&sessions, &self.session_resource_usage, |session| {
+            self.workspace_ui.agent_line_for(session).is_some()
+        })
+    }
 }
 
 /// suspend 보호의 live 판정 (순수 함수 — 테스트 용이).
@@ -942,6 +958,9 @@ struct LiveSessionTracker {
     mux_sessions: std::collections::HashSet<runtime::SessionId>,
     /// SessionExited를 관측한 세션 (mux_sessions에 남은 것만 유지해 유계).
     exited_sessions: std::collections::HashSet<runtime::SessionId>,
+    /// Spawn 이벤트로 확인한 세션 종류. MuxUpdated가 먼저 오므로 종류 미확인 창은
+    /// unknown으로 남겨 suspend를 보수적으로 막는다.
+    session_kinds: std::collections::HashMap<runtime::SessionId, runtime::SpawnKind>,
     /// MuxUpdated를 한 번이라도 관측했다 — 관측 전에는 restore 유예가 적용된다.
     seen_mux: bool,
 }
@@ -959,6 +978,16 @@ impl LiveSessionTracker {
                     .collect();
                 self.exited_sessions
                     .retain(|s| self.mux_sessions.contains(s));
+                self.session_kinds
+                    .retain(|s, _| self.mux_sessions.contains(s));
+            }
+            runtime::RuntimeEvent::ShellSpawned { session } => {
+                self.session_kinds
+                    .insert(*session, runtime::SpawnKind::Shell);
+            }
+            runtime::RuntimeEvent::AgentSpawned { session } => {
+                self.session_kinds
+                    .insert(*session, runtime::SpawnKind::Agent);
             }
             runtime::RuntimeEvent::SessionExited { session, .. }
             // 재시작 시 archived 복원된 세션도 이미 종료됨 — 생존 추적에서 제외해야
@@ -974,6 +1003,25 @@ impl LiveSessionTracker {
         self.mux_sessions
             .iter()
             .any(|s| !self.exited_sessions.contains(s))
+    }
+
+    /// live 세션이 하나 이상이고 전부 명시적으로 Shell일 때만 목록을 반환한다.
+    /// MuxUpdated→Spawned 사이 unknown 또는 Agent가 하나라도 있으면 None(작업 보호).
+    fn live_shell_sessions(&self) -> Option<Vec<runtime::SessionId>> {
+        let live = self
+            .mux_sessions
+            .iter()
+            .copied()
+            .filter(|session| !self.exited_sessions.contains(session))
+            .collect::<Vec<_>>();
+        if live.is_empty()
+            || live
+                .iter()
+                .any(|session| self.session_kinds.get(session) != Some(&runtime::SpawnKind::Shell))
+        {
+            return None;
+        }
+        Some(live)
     }
 }
 
@@ -1461,8 +1509,8 @@ impl App {
     /// 폰 미러 진입(I1b-2) 안내 배너 표시 시간 — 이 뒤 앱이 notice를 None으로 돌린다.
     const WEB_NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(6);
     /// Warm workspace가 이 시간 동안 재활성화되지 않으면 Suspended로 내린다. 세션/PTY는
-    /// 종료되고 layout/session metadata만 DB에 남는다 (§14.1). live 세션이 있으면
-    /// 시간이 지나도 내리지 않는다.
+    /// 종료되고 layout/session metadata만 DB에 남는다 (§14.1). 에이전트·자식 작업은
+    /// 계속 보호하고, 단일 저CPU 셸 리더만 남은 경우에만 fresh 셸 복원 전제로 내린다.
     const WARM_AUTO_SUSPEND_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
     /// 승인 watcher 폴링 간격(ms). frame 예약은 하지 않고, pending 상태 변화 때만 UI를 깨운다.
@@ -1661,6 +1709,7 @@ impl App {
             runtime.runtime.shutdown();
         }
         self.warm_order.retain(|id| id != delete_id);
+        self.broadcast_terminal_cache_policy();
         self.notifications_ui.prune_workspace(delete_id);
         if let Err(e) = self.db.delete_workspace(delete_id) {
             tracing::warn!("벤치 워크스페이스 삭제 실패: {e:#}");
@@ -2732,6 +2781,9 @@ impl App {
         self.egui_ctx.request_repaint();
 
         self.evict_warm();
+        // 새 runtime 생성 또는 warm 축출로 resident 수가 바뀌었을 수 있다. 설정의
+        // 전역 예산을 현재 active+warm 전체에 다시 나눠 각 워커에 반영한다.
+        self.broadcast_terminal_cache_policy();
     }
 
     fn cycle_workspace(&mut self, delta: isize) {
@@ -2852,11 +2904,12 @@ impl App {
         });
         for evict_id in evictable {
             self.warm_order.retain(|id| id != &evict_id);
-            self.suspend_warm_workspace(&evict_id);
+            self.suspend_warm_workspace(&evict_id, false);
         }
     }
 
     fn evict_idle_warm(&mut self, now: std::time::Instant) {
+        let resident_before = 1 + self.warm.len();
         let expired = expired_warm_workspace_ids(
             &self.warm_order,
             |id| self.warm.get(id).and_then(|rt| rt.backgrounded_at),
@@ -2864,16 +2917,24 @@ impl App {
             Self::WARM_AUTO_SUSPEND_AFTER,
         );
         for id in expired {
-            // live 세션이 있으면 시간이 지나도 suspend하지 않는다 (작업 보호).
-            if self.warm.get(&id).is_some_and(|rt| rt.has_live_sessions()) {
+            // 에이전트/자식 작업은 계속 보호한다. 30분 동안 background였고 resource
+            // 샘플로 프롬프트 대기 셸 리더만 확인된 경우에만 셸을 재생성 가능한 상태로 내린다.
+            if self
+                .warm
+                .get(&id)
+                .is_some_and(|rt| rt.has_live_sessions() && !rt.can_auto_suspend_idle_shells())
+            {
                 continue;
             }
             self.warm_order.retain(|warm_id| warm_id != &id);
-            self.suspend_warm_workspace(&id);
+            self.suspend_warm_workspace(&id, true);
+        }
+        if 1 + self.warm.len() != resident_before {
+            self.broadcast_terminal_cache_policy();
         }
     }
 
-    fn suspend_warm_workspace(&mut self, workspace_id: &str) {
+    fn suspend_warm_workspace(&mut self, workspace_id: &str, allow_idle_shells: bool) {
         if let Some(mut rt) = self.warm.remove(workspace_id) {
             // 마지막으로 큐에 남은 이벤트를 처리해 방금 끝난 background 작업의 완료/오류
             // 알림을 놓치지 않는다 (codex 리뷰 — 축출 시 receiver drop으로 유실되던 것).
@@ -2889,9 +2950,12 @@ impl App {
                 &mut rt.session_titles,
                 &self.i18n,
             );
-            // 최종 방어: 마지막 drain에서 새 spawn이 관측됐을 수 있다 — live 세션이
-            // 있으면 suspend를 취소하고 warm으로 되돌린다 (워커/PTY 유지).
-            if rt.has_live_sessions() {
+            // 최종 방어: 마지막 drain에서 새 spawn/자식 작업이 관측됐을 수 있다.
+            // 일반 축출은 live를 모두 보호하고, timeout 축출도 안전한 idle 셸 조건을
+            // 다시 만족할 때만 진행한다.
+            let has_live = rt.has_live_sessions();
+            let idle_shells = allow_idle_shells && rt.can_auto_suspend_idle_shells();
+            if has_live && !idle_shells {
                 tracing::info!(
                     workspace_id,
                     "suspend 취소 — 실행 중 세션이 있어 warm 유지 (작업 보호)"
@@ -2902,6 +2966,9 @@ impl App {
                 self.warm.insert(workspace_id.to_owned(), rt);
                 self.warm_order.push(workspace_id.to_owned());
                 return;
+            }
+            if idle_shells {
+                tracing::info!(workspace_id, "30분 유휴 셸 workspace를 suspend");
             }
             // 축출 = Suspended(워커 종료) — 그 workspace의 진행형 알림은 더는 조치
             // 불가하므로 정리한다 (결과 알림은 기록이라 유지, codex 리뷰).
@@ -3123,15 +3190,20 @@ impl App {
         }
     }
 
-    /// 설정의 exited cap / 캐시 예산을 워커 정책 명령으로 만든다 (§14.3 확장).
+    /// 설정의 exited cap / **프로세스 전역** 캐시 예산을 워커 정책 명령으로 만든다.
+    /// 각 runtime은 자기 세션만 볼 수 있으므로 active+warm resident 수로 균등 분배해
+    /// 합산 허용량이 설정값을 넘지 않게 한다(§14.3 확장).
     fn terminal_cache_policy_command(&self) -> runtime::RuntimeCommand {
         runtime::RuntimeCommand::SetTerminalCachePolicy {
             max_exited_backends: self.config.terminal.exited_backend_cap as usize,
-            cache_budget_bytes: self.config.terminal.cache_budget_mb as usize * 1024 * 1024,
+            cache_budget_bytes: per_runtime_cache_budget_bytes(
+                self.config.terminal.cache_budget_mb,
+                1 + self.warm.len(),
+            ),
         }
     }
 
-    /// 캐시 정책을 활성 + warm 워커 전체에 반영한다 (설정 변경 시).
+    /// 캐시 정책을 활성 + warm 워커 전체에 반영한다 (설정 또는 resident 수 변경 시).
     fn broadcast_terminal_cache_policy(&mut self) {
         let command = self.terminal_cache_policy_command();
         let _ = self.active.runtime.send_command(command.clone());
@@ -3642,7 +3714,9 @@ impl App {
                     let elapsed = rt
                         .backgrounded_at
                         .map(|at| now.saturating_duration_since(at));
-                    let remaining = elapsed.map(|duration| {
+                    let auto_suspend_eligible =
+                        !rt.has_live_sessions() || rt.can_auto_suspend_idle_shells();
+                    let remaining = elapsed.filter(|_| auto_suspend_eligible).map(|duration| {
                         Self::WARM_AUTO_SUSPEND_AFTER
                             .as_secs()
                             .saturating_sub(duration.as_secs())
@@ -3865,12 +3939,10 @@ impl App {
             Err(e) => tracing::warn!("resolved MCP approval 정리 실패: {e:#}"),
         }
     }
-}
 
-impl eframe::App for App {
-    // eframe의 `glow` feature가 켜지면(B1의 렌더러 A/B) 이 트레이트 메서드에 GL 컨텍스트
-    // 인자가 생긴다 — glow 정리 훅이 필요 없어 무시한다(우리는 GL 객체를 직접 만들지 않는다).
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    /// eframe renderer feature와 무관한 공통 종료 경로. `App::on_exit` 시그니처만
+    /// `glow` feature에 따라 달라지므로 실제 정리는 여기 한 번만 유지한다.
+    fn shutdown_on_exit(&mut self) {
         // B1: 링버퍼에 모은 frame 이벤트 flush + 요약/gpu 이벤트. shutdown보다 **먼저** —
         // egui 텍스처 상태가 살아 있어야 gpu 이벤트가 실제 값을 낸다.
         if let Some(bench) = self.bench.as_mut() {
@@ -3901,6 +3973,18 @@ impl eframe::App for App {
         for (_, handle) in self.pending_shutdowns.drain(..) {
             let _ = handle.join();
         }
+    }
+}
+
+impl eframe::App for App {
+    #[cfg(feature = "render-glow")]
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.shutdown_on_exit();
+    }
+
+    #[cfg(not(feature = "render-glow"))]
+    fn on_exit(&mut self) {
+        self.shutdown_on_exit();
     }
 
     // §14.1 Active↔Warm: 창이 안 보이면(최소화/완전 가림) worker가 snapshot 생성을
@@ -5336,6 +5420,7 @@ impl eframe::App for App {
                     runtime.runtime.shutdown();
                 }
                 self.warm_order.retain(|id| id != &delete_id);
+                self.broadcast_terminal_cache_policy();
                 self.notifications_ui.prune_workspace(&delete_id);
                 match self.db.delete_workspace(&delete_id) {
                     Ok(()) => self.refresh_workspaces(),
@@ -5590,6 +5675,40 @@ fn warm_eviction_candidates(
         .take(overflow)
         .cloned()
         .collect()
+}
+
+/// 설정의 전역 MB 예산을 resident runtime 수로 나눈 워커별 share.
+/// 설정 최소값(32MB)과 resident 최대값(active 1 + warm 12)에서는 1MB 아래로 내려가지
+/// 않지만, 잘못된 호출에도 0바이트 정책이 생기지 않도록 1MiB를 최종 하한으로 둔다.
+fn per_runtime_cache_budget_bytes(global_budget_mb: u32, resident_runtimes: usize) -> usize {
+    const MIB: usize = 1024 * 1024;
+    let total = global_budget_mb as usize * MIB;
+    (total / resident_runtimes.max(1)).max(MIB)
+}
+
+/// live shell 세션 모두가 단일 저CPU 셸 리더만 보유하는지 확인한다.
+/// 직접 셸에서 실행한 Codex/Claude는 UI 감지 또는 같은 process group의 자식 수로 보호한다.
+fn shell_sessions_are_idle(
+    sessions: &[runtime::SessionId],
+    usage: &[runtime::SessionResourceUsage],
+    is_detected_agent: impl Fn(runtime::SessionId) -> bool,
+) -> bool {
+    !sessions.is_empty()
+        && sessions.iter().all(|session| {
+            if is_detected_agent(*session) {
+                return false;
+            }
+            usage
+                .iter()
+                .find(|sample| sample.session == *session)
+                .is_some_and(|sample| {
+                    sample.pid.is_some()
+                        && sample.process_count == 1
+                        && sample.cpu_percent.is_some_and(|cpu| cpu <= 1.0)
+                        && !sample.high_cpu
+                        && !sample.high_rss
+                })
+        })
 }
 
 fn expired_warm_workspace_ids(
@@ -6515,6 +6634,54 @@ h:1 EE:FF
     }
 
     #[test]
+    fn global_terminal_cache_budget_is_divided_across_resident_runtimes() {
+        const MIB: usize = 1024 * 1024;
+        assert_eq!(per_runtime_cache_budget_bytes(128, 1), 128 * MIB);
+        assert_eq!(per_runtime_cache_budget_bytes(128, 2), 64 * MIB);
+        assert_eq!(per_runtime_cache_budget_bytes(128, 4), 32 * MIB);
+
+        let share = per_runtime_cache_budget_bytes(128, 3);
+        assert!(share * 3 <= 128 * MIB);
+        assert!((128 * MIB) - share * 3 < 3, "나눗셈 나머지만 미배정");
+
+        // 방어적 0 count는 active runtime 하나로 취급하고, 비정상 0MB도 1MiB로 제한한다.
+        assert_eq!(per_runtime_cache_budget_bytes(32, 0), 32 * MIB);
+        assert_eq!(per_runtime_cache_budget_bytes(0, 12), MIB);
+    }
+
+    #[test]
+    fn only_sampled_single_process_low_cpu_shells_are_auto_suspendable() {
+        let s1 = runtime::SessionId(1);
+        let s2 = runtime::SessionId(2);
+        let sample = |session, process_count, cpu_percent| runtime::SessionResourceUsage {
+            session,
+            pid: Some(session.0 as u32),
+            process_group: Some(session.0 as u32),
+            identity_source: runtime::ProcessIdentitySource::PortablePty,
+            sampled_at_ms: 1,
+            process_count,
+            rss_bytes: 1024,
+            cpu_percent,
+            high_cpu: false,
+            high_rss: false,
+        };
+        let sessions = [s1, s2];
+        let idle = [sample(s1, 1, Some(0.0)), sample(s2, 1, Some(0.5))];
+        assert!(shell_sessions_are_idle(&sessions, &idle, |_| false));
+        assert!(!shell_sessions_are_idle(&sessions, &idle, |s| s == s2));
+        assert!(!shell_sessions_are_idle(&sessions, &idle[..1], |_| false));
+
+        let child_work = [sample(s1, 2, Some(0.0)), sample(s2, 1, Some(0.0))];
+        assert!(!shell_sessions_are_idle(&sessions, &child_work, |_| false));
+        let busy = [sample(s1, 1, Some(1.1)), sample(s2, 1, Some(0.0))];
+        assert!(!shell_sessions_are_idle(&sessions, &busy, |_| false));
+        let unsampled_cpu = [sample(s1, 1, None), sample(s2, 1, Some(0.0))];
+        assert!(!shell_sessions_are_idle(&sessions, &unsampled_cpu, |_| {
+            false
+        }));
+    }
+
+    #[test]
     fn warm_eviction은_live_workspace를_건너뛴다() {
         let ids = vec![
             "a".to_owned(),
@@ -6598,6 +6765,12 @@ h:1 EE:FF
         // 세션 attach → live
         tracker.observe(&mux(&[s1]));
         assert!(tracker.has_live());
+        assert!(
+            tracker.live_shell_sessions().is_none(),
+            "spawn 종류 확인 전은 보호"
+        );
+        tracker.observe(&runtime::RuntimeEvent::ShellSpawned { session: s1 });
+        assert_eq!(tracker.live_shell_sessions(), Some(vec![s1]));
 
         // Exited → live 아님 (pane은 남아 있어도 프로세스는 죽음 — agent 결과 pane)
         tracker.observe(&runtime::RuntimeEvent::SessionExited {
@@ -6605,11 +6778,44 @@ h:1 EE:FF
             exit_code: Some(0),
         });
         assert!(!tracker.has_live());
+        assert!(tracker.live_shell_sessions().is_none());
 
         // pane 제거 MuxUpdated → exited 집합도 정리(유계)
         tracker.observe(&mux(&[]));
         assert!(tracker.exited_sessions.is_empty());
         assert!(!tracker.has_live());
+    }
+
+    #[test]
+    fn agent가_섞인_live_session은_idle_shell_suspend에서_제외된다() {
+        use std::sync::Arc;
+        let shell = runtime::SessionId(1);
+        let agent = runtime::SessionId(2);
+        let mut tracker = LiveSessionTracker::default();
+        tracker.observe(&runtime::RuntimeEvent::MuxUpdated {
+            snapshot: Arc::new(runtime::MuxSnapshot {
+                tabs: vec![runtime::TabSnapshot {
+                    id: runtime::MuxTabId::new(),
+                    title: "t".into(),
+                    layout: runtime::LayoutNode::Pane(runtime::MuxPaneId::new()),
+                    panes: [shell, agent]
+                        .into_iter()
+                        .map(|session| runtime::PaneSnapshot {
+                            id: runtime::MuxPaneId::new(),
+                            session_id: Some(session),
+                            title: "p".into(),
+                            persistent_session_id: None,
+                        })
+                        .collect(),
+                }],
+                active_tab: None,
+                focused_pane: None,
+            }),
+        });
+        tracker.observe(&runtime::RuntimeEvent::ShellSpawned { session: shell });
+        tracker.observe(&runtime::RuntimeEvent::AgentSpawned { session: agent });
+        assert!(tracker.has_live());
+        assert!(tracker.live_shell_sessions().is_none());
     }
 
     /// PR-A2 회귀 방지: 재시작 시 archived 복원된 세션은 SessionRestored로 오고,

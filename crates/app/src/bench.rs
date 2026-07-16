@@ -5,7 +5,7 @@
 //! 렌더 경로 자체는 바꾸지 않는다 (egui/epaint + dirty-row galley cache 유지).
 //!
 //! ## 환경변수
-//! - `DEPPY_RENDERER=glow|wgpu` — 렌더러 선택 (미지정 시 eframe 기본값 유지, main.rs)
+//! - `DEPPY_RENDERER=glow|wgpu` — `render-glow` 벤치 빌드의 렌더러 선택 (main.rs)
 //! - `DEPPY_RENDER_BENCH=1` — 벤치 모드(시나리오 드라이버 + JSONL)
 //! - `DEPPY_BENCH_OUT=<path>` — JSONL 경로 (미지정 시 stderr)
 //! - `DEPPY_BENCH_SCENARIO=idle|dirty1|bulk|fullscreen|switch|createdelete`

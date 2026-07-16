@@ -4321,6 +4321,11 @@ impl App {
             .show(|ui| {
                 ui.set_min_width(260.0);
                 ui.set_max_width(300.0);
+                // ── 대기 중 섹션 (처리하면 사라지는 액션 큐) ──
+                // [N2] MCP 승인 카드가 여기에 붙는다 (ui::inbox_approvals).
+                // [N3] PTY 입력 대기 카드가 여기에 붙는다 (ui::inbox_waiting).
+                //
+                // ── 최근 알림 섹션 (지나간 기록) ──
                 clicked = self
                     .notifications_ui
                     .recent_section(ui, text, RECENT_IN_POPOVER);

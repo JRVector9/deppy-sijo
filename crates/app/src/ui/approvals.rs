@@ -57,6 +57,13 @@ impl ApprovalsUi {
         self.remote_urls = remote_urls;
     }
 
+    /// 벨 인박스 카드용 읽기 전용 접근자 (v3.9 N2). 이미 폴링된 목록을 그대로 노출한다 —
+    /// 인박스도 새 DB 조회를 만들지 않고 이 값을 재사용한다(App::poll_pending_approvals가
+    /// 채운다).
+    pub fn pending(&self) -> &[PendingApprovalRow] {
+        &self.pending
+    }
+
     /// 버튼 클릭 → 결정 매핑 (egui 컨텍스트 없이 테스트할 수 있게 분리).
     /// 맨 앞(가장 오래된) 항목 하나에 대해서만 결정을 만든다.
     fn decide(&self, allowed: bool) -> Option<ApprovalDecision> {

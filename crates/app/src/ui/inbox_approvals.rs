@@ -1,0 +1,271 @@
+//! 벨 팝오버 「대기 중」 섹션의 MCP 승인 카드 (v3.9 PR-N2,
+//! `ai_agent_workspace_v3_9_waiting_inbox_pr_plan.md`).
+//!
+//! 데이터는 `App::poll_pending_approvals`가 이미 폴링해 둔 `ApprovalsUi::pending()`을
+//! 그대로 읽는다 — 팝오버는 매 프레임 렌더되므로 이 모듈은 새 DB 조회를 하지 않는다.
+//! 승인/거부 되쓰기와 [이동→] 네비게이션은 호출측(`App::inbox_popup`)이 기존 경로
+//! (`Db::resolve_approval`, `plan_agent_notification_navigation`)로 처리한다 — 이 모듈은
+//! 렌더 + 사용자 의도([`ApprovalCardsAction`]) 산출만 한다(leaf UI가 DB를 직접 만지지
+//! 않는다, xtask check-boundary).
+//!
+//! ## 워크스페이스 해석 (① — "가지 않고 판단"이 이 PR의 핵심 요구)
+//! `PendingApprovalRow.session_uuid`/`session_title`는 mcp-store가 `pane_id` 컬럼으로
+//! `mux_panes`를 조인해 채운다(I2). 그런데 실제 `pane_id` 값은 PTY 런타임(runtime crate,
+//! in_process.rs)이 DEPPY_SESSION_ID로 주입하는 `session_key()` 규칙이 만드는
+//! `"{workspace_id}:{live_session_id}"` 형식의 **런타임 세션 키**이고, `mux_panes.id`는
+//! 이것과 무관한 UUID(`MuxPaneId::new()`)다 — 그래서 이 조인은 실제 승인에서는 매칭되지
+//! 않는다(세션 id가 앱 실행마다 1부터 재시작하는 것도 별개 근거, in_process.rs 주석
+//! "세션 id(u64)는 실행마다 1부터 다시 시작한다" 참고). 즉 session_uuid/session_title는
+//! 사실상 항상 None이라, mux_panes 조인에 workspace_id 컬럼을 추가해도 워크스페이스를
+//! 얻지 못한다(모듈 앞단에서 join 확장을 시도했다가 이 사실을 확인하고 되돌렸다).
+//!
+//! 대신 `pane_id` 문자열을 직접 파싱해 workspace_id·세션을 뽑는다([`parse_session_key`]).
+//! workspace_id는 UUID라 ':'를 포함하지 않아 안전하고, DB 스키마/쿼리 변경 없이 항상
+//! 동작한다. `session_title`은 값이 있으면(조인이 다른 경로로 고쳐지면) 그대로 병기한다.
+
+use std::collections::HashMap;
+
+use runtime::SessionId;
+use storage::PendingApprovalRow;
+
+use super::approvals::ApprovalDecision;
+use super::notifications::{AgentNotificationTarget, section_label};
+
+/// 팝오버에 한 번에 그리는 카드 최대 수 — 초과분은 "+N건 더"로 뭉친다(②).
+const MAX_CARDS: usize = 5;
+/// 인자 미리보기를 카드 폭(팝오버 260~300px)에서 2줄 안팎으로 자르는 문자 수 예산.
+const PREVIEW_CLIP_CHARS: usize = 110;
+
+/// 카드 섹션이 만든 사용자 액션 — 호출측(App)이 DB 되쓰기/네비게이션을 수행한다.
+#[derive(Default)]
+pub struct ApprovalCardsAction {
+    /// [승인]/[거부] 클릭 — 호출측이 `Db::resolve_approval`로 처리한다.
+    pub decision: Option<ApprovalDecision>,
+    /// [이동→] 클릭 — 호출측이 기존 알림 네비게이션 경로로 처리한다.
+    pub goto: Option<AgentNotificationTarget>,
+}
+
+/// 「대기 중」 섹션의 승인 카드들을 그린다. pending이 비어 있으면 아무것도 그리지
+/// 않는다 — N3의 PTY 대기 카드가 있으면 그쪽 섹션 헤더만 보인다.
+///
+/// `workspace_names`는 workspace_id → 표시 이름(`App::workspace_display_name` 결과) 맵.
+/// 이 모듈은 App을 모르므로 호출측이 `self.workspaces`에서 미리 만들어 넘긴다.
+pub fn render(
+    ui: &mut egui::Ui,
+    catalog: &i18n::Catalog,
+    pending: &[PendingApprovalRow],
+    workspace_names: &HashMap<String, String>,
+) -> ApprovalCardsAction {
+    let mut action = ApprovalCardsAction::default();
+    if pending.is_empty() {
+        return action;
+    }
+    section_label(ui, &catalog.t("inbox.approval.section", &[]));
+    ui.add_space(2.0);
+    for row in pending.iter().take(MAX_CARDS) {
+        render_card(ui, catalog, row, workspace_names, &mut action);
+    }
+    let hidden = pending.len().saturating_sub(MAX_CARDS);
+    if hidden > 0 {
+        ui.label(
+            egui::RichText::new(
+                catalog.t("inbox.approval.more", &[("count", &hidden.to_string())]),
+            )
+            .size(11.0)
+            .weak(),
+        );
+    }
+    ui.add_space(4.0);
+    action
+}
+
+fn render_card(
+    ui: &mut egui::Ui,
+    catalog: &i18n::Catalog,
+    row: &PendingApprovalRow,
+    workspace_names: &HashMap<String, String>,
+    action: &mut ApprovalCardsAction,
+) {
+    let session_key = row.pane_id.as_deref().and_then(parse_session_key);
+    let workspace_label =
+        session_key.and_then(|(workspace_id, _)| workspace_names.get(workspace_id).cloned());
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        // 워크스페이스/세션 컨텍스트 — ① 핵심 요구(가지 않고 판단).
+        let context = match (&workspace_label, &row.session_title) {
+            (Some(ws), Some(title)) => format!("{ws} · {title}"),
+            (Some(ws), None) => ws.clone(),
+            (None, Some(title)) => title.clone(),
+            (None, None) => catalog.t("inbox.approval.unknown_session", &[]),
+        };
+        ui.label(egui::RichText::new(context).size(11.0).weak());
+        ui.strong(row.tool_name.as_str());
+        // arguments_preview는 proxy가 이미 redact한 표시용 텍스트 — 추가 redaction
+        // 불필요, 원문 조회 금지(설계 제약). 그대로 자르고 wrap만 건다.
+        ui.add(
+            egui::Label::new(egui::RichText::new(clip_preview(&row.arguments_preview)).monospace())
+                .wrap(),
+        );
+        ui.horizontal(|ui| {
+            if ui
+                .button(catalog.t("inbox.approval.approve", &[]))
+                .clicked()
+            {
+                action.decision = Some(decision_for(row, true));
+            }
+            if ui.button(catalog.t("inbox.approval.deny", &[])).clicked() {
+                action.decision = Some(decision_for(row, false));
+            }
+            // pane_id가 파싱되는 행만 [이동→]를 보여준다 — 세션 불명 행은 이동할 곳이 없다.
+            if let Some((workspace_id, session)) = session_key
+                && ui.button(catalog.t("inbox.approval.goto", &[])).clicked()
+            {
+                action.goto = Some(AgentNotificationTarget::Pty {
+                    workspace_id: workspace_id.to_owned(),
+                    session,
+                });
+            }
+        });
+    });
+    ui.add_space(4.0);
+}
+
+fn decision_for(row: &PendingApprovalRow, allowed: bool) -> ApprovalDecision {
+    ApprovalDecision {
+        id: row.id.clone(),
+        allowed,
+        // 인박스 빠른 조치는 "이 도구 항상 허용" 규칙 저장을 다루지 않는다 — 그 옵션은
+        // 기존 모달(approvals_ui.show)의 체크박스로 남겨둔다(요구사항 범위 밖).
+        remember: false,
+    }
+}
+
+/// pane_id(=DEPPY_SESSION_ID)에서 workspace_id·라이브 세션 id를 뽑는다. 형식은
+/// PTY 런타임의 session_key() 생성 규칙이 만드는 "{workspace_id}:{session_id}"
+/// — 모듈 상단 문서의 조인 불일치 설명 참고.
+fn parse_session_key(pane_id: &str) -> Option<(&str, SessionId)> {
+    let (workspace_id, session_num) = pane_id.split_once(':')?;
+    if workspace_id.is_empty() {
+        return None;
+    }
+    let session_num: u64 = session_num.parse().ok()?;
+    Some((workspace_id, SessionId(session_num)))
+}
+
+/// 인자 미리보기를 문자 수 기준으로 자른다(2줄 안팎). arguments_preview는 proxy가
+/// 만든 압축 JSON 한 줄이라 개행 정규화는 불필요하다.
+fn clip_preview(text: &str) -> String {
+    if text.chars().count() <= PREVIEW_CLIP_CHARS {
+        return text.to_owned();
+    }
+    let mut out: String = text.chars().take(PREVIEW_CLIP_CHARS).collect();
+    out.push('…');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(id: &str, pane_id: Option<&str>) -> PendingApprovalRow {
+        PendingApprovalRow {
+            id: id.to_owned(),
+            server_id: "srv".to_owned(),
+            tool_name: "read_file".to_owned(),
+            arguments_preview: "{}".to_owned(),
+            schema_hash: None,
+            created_at: 0,
+            pane_id: pane_id.map(str::to_owned),
+            session_uuid: None,
+            session_title: None,
+        }
+    }
+
+    #[test]
+    fn parse_session_key_workspace_id와_세션번호를_나눈다() {
+        let (ws, session) = parse_session_key("ws-abc-123:42").unwrap();
+        assert_eq!(ws, "ws-abc-123");
+        assert_eq!(session, SessionId(42));
+    }
+
+    #[test]
+    fn parse_session_key_콜론_없으면_none() {
+        assert_eq!(parse_session_key("no-colon-here"), None);
+    }
+
+    #[test]
+    fn parse_session_key_세션번호가_숫자가_아니면_none() {
+        assert_eq!(parse_session_key("ws:not-a-number"), None);
+    }
+
+    #[test]
+    fn parse_session_key_workspace_id가_비어있으면_none() {
+        assert_eq!(parse_session_key(":42"), None);
+    }
+
+    #[test]
+    fn clip_preview_짧은_텍스트는_그대로_둔다() {
+        assert_eq!(clip_preview("short"), "short");
+    }
+
+    #[test]
+    fn clip_preview_긴_텍스트는_말줄임표로_자른다() {
+        let long = "a".repeat(PREVIEW_CLIP_CHARS + 50);
+        let clipped = clip_preview(&long);
+        assert_eq!(clipped.chars().count(), PREVIEW_CLIP_CHARS + 1);
+        assert!(clipped.ends_with('…'));
+    }
+
+    #[test]
+    fn decision_for_row_id와_allowed를_싣고_remember는_항상_false() {
+        let r = row("a1", None);
+        let d = decision_for(&r, true);
+        assert_eq!(d.id, "a1");
+        assert!(d.allowed);
+        assert!(!d.remember);
+    }
+
+    #[test]
+    fn render_pending_비어있으면_아무것도_안그리고_액션도_없다() {
+        let ctx = egui::Context::default();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspace_names = HashMap::new();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let action = render(ui, &catalog, &[], &workspace_names);
+            assert!(action.decision.is_none());
+            assert!(action.goto.is_none());
+        });
+    }
+
+    #[test]
+    fn render_클릭_없으면_카드가_있어도_액션이_없다_스모크() {
+        let ctx = egui::Context::default();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut workspace_names = HashMap::new();
+        workspace_names.insert("ws-1".to_owned(), "my-project".to_owned());
+        let rows = vec![
+            row("a1", Some("ws-1:7")),
+            row("a2", None),
+            row("a3", Some("ws-unknown:1")),
+        ];
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let action = render(ui, &catalog, &rows, &workspace_names);
+            assert!(action.decision.is_none());
+            assert!(action.goto.is_none());
+        });
+    }
+
+    #[test]
+    fn render_max_cards_초과행도_패닉없이_그려진다_스모크() {
+        let ctx = egui::Context::default();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspace_names = HashMap::new();
+        let rows: Vec<_> = (0..MAX_CARDS + 3)
+            .map(|i| row(&format!("a{i}"), None))
+            .collect();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let action = render(ui, &catalog, &rows, &workspace_names);
+            assert!(action.decision.is_none());
+            assert!(action.goto.is_none());
+        });
+    }
+}

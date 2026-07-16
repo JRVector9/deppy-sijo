@@ -9,6 +9,7 @@ pub mod credentials;
 pub mod env_profiles;
 pub mod env_project_list;
 pub mod file_tree;
+pub mod inbox_approvals;
 pub mod notifications;
 pub mod settings;
 pub mod workspace;

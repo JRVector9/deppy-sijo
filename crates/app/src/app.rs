@@ -4302,9 +4302,11 @@ impl App {
     }
 
     /// 벨 팝오버 본문 (v3.9 N1). 설정 창과 독립 — 밖을 클릭하면 닫힌다.
-    /// 반환: 최근 알림에서 클릭한 대상(있으면 호출측이 기존 네비게이션 경로로 처리).
+    /// 반환: 최근 알림 또는 승인 카드 [이동→]에서 클릭한 대상(있으면 호출측이 기존
+    /// 네비게이션 경로로 처리).
     ///
-    /// 대기 섹션(N2 MCP 승인 카드 / N3 PTY 대기 카드)은 후속 PR이 여기에 붙인다.
+    /// 대기 섹션: N2가 MCP 승인 카드(`// [N2]` 마커)를 채웠다. PTY 대기 카드(N3,
+    /// `// [N3]` 마커)는 후속 PR이 여기에 붙인다.
     fn inbox_popup(
         &mut self,
         bell: &egui::Response,
@@ -4313,6 +4315,16 @@ impl App {
         const RECENT_IN_POPOVER: usize = 5;
         let mut clicked = None;
         let mut open_full = false;
+        // [N2] 카드마다 워크스페이스명이 필요하다(① 핵심 요구 — 가지 않고 판단). 표시
+        // 이름은 .show() 진입 전에 소유 데이터로 미리 계산해 둔다 — closure 안에서
+        // self.workspaces를 빌리면 아래 self.notifications_ui(&mut) 차용과 얽힌다.
+        let approval_workspace_names: std::collections::HashMap<String, String> = self
+            .workspaces
+            .iter()
+            .map(|w| (w.id.clone(), Self::workspace_display_name(w)))
+            .collect();
+        let mut approval_decision = None;
+        // [/N2]
         egui::Popup::from_response(bell)
             .id(Self::inbox_popup_id())
             .open_memory(bell.clicked().then_some(egui::SetOpenCommand::Toggle))
@@ -4322,13 +4334,27 @@ impl App {
                 ui.set_min_width(260.0);
                 ui.set_max_width(300.0);
                 // ── 대기 중 섹션 (처리하면 사라지는 액션 큐) ──
-                // [N2] MCP 승인 카드가 여기에 붙는다 (ui::inbox_approvals).
+                // [N2] MCP 승인 카드 — 이미 폴링된 목록만 읽는다
+                // (App::poll_pending_approvals가 approval-watcher 신호로 채운다) —
+                // 새 DB 조회 없음.
+                let approval_action = ui::inbox_approvals::render(
+                    ui,
+                    text,
+                    self.approvals_ui.pending(),
+                    &approval_workspace_names,
+                );
+                approval_decision = approval_action.decision;
+                clicked = approval_action.goto;
+                // [/N2]
                 // [N3] PTY 입력 대기 카드가 여기에 붙는다 (ui::inbox_waiting).
                 //
                 // ── 최근 알림 섹션 (지나간 기록) ──
-                clicked = self
-                    .notifications_ui
-                    .recent_section(ui, text, RECENT_IN_POPOVER);
+                if let Some(target) =
+                    self.notifications_ui
+                        .recent_section(ui, text, RECENT_IN_POPOVER)
+                {
+                    clicked = Some(target);
+                }
                 ui.add_space(6.0);
                 // 전체 기록·비우기는 설정→알림이 계속 담당한다 (팝오버는 빠른 확인만).
                 if ui
@@ -4351,6 +4377,24 @@ impl App {
         {
             self.egui_ctx.request_repaint();
         }
+        // [N2] 승인/거부 결정 되쓰기 — 기존 모달 경로(approvals_ui.show 처리부, 아래
+        // prune_resolved_approvals 호출부)와 동일한 resolve_approval 호출.
+        // first-writer-wins라 모달·인박스 어느 쪽으로 먼저 처리해도 정합. 워크스페이스
+        // 전환 없이 여기서 바로 처리되는 것이 이 PR의 존재 이유(③).
+        if let Some(decision) = approval_decision {
+            let now = deppy_core::time::unix_secs_i64();
+            if let Err(e) =
+                self.db
+                    .resolve_approval(&decision.id, decision.allowed, decision.remember, now)
+            {
+                tracing::warn!("승인 해소 실패(인박스): {e:#}");
+            }
+            self.prune_resolved_approvals();
+            // 해소 직후 목록을 갱신해 카드가 바로 사라지게 한다(다음 폴링을 기다리지 않음).
+            self.poll_pending_approvals();
+            self.egui_ctx.request_repaint();
+        }
+        // [/N2]
         clicked
     }
 
@@ -4737,11 +4781,19 @@ impl eframe::App for App {
                         // 설정 라벨에서 여기로 이관했다.
                         let unread = self.notifications_ui.unread();
                         unread_before = unread;
-                        let bell_label = if unread > 0 {
+                        // [N2] 뱃지 우선순위(⑤): 대기(승인) 건수가 있으면 unread보다 먼저
+                        // 보인다 — 승인 대기는 즉시 조치가 필요해 정보성 unread 알림보다
+                        // 우선한다. `waiting`에 모아 두면 N3가 PTY 입력 대기 건수를
+                        // 더하기 쉽다(예: `+ self.<pty_waiting_count>`).
+                        let waiting = self.approvals_ui.pending().len();
+                        let bell_label = if waiting > 0 {
+                            format!("🔔 {waiting}")
+                        } else if unread > 0 {
                             format!("🔔 {unread}")
                         } else {
                             "🔔".to_owned()
                         };
+                        // [/N2]
                         let bell_open = egui::Popup::is_id_open(ui.ctx(), Self::inbox_popup_id());
                         let bell = tbtn_response(ui, bell_label, bell_open)
                             .on_hover_text(text.t("top.notifications", &[]));

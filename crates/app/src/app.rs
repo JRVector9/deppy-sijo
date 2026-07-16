@@ -1138,6 +1138,10 @@ pub struct App {
     agents_ui: ui::agents::AgentsUi,
     /// PTY와 분리된 Codex App Server structured session controller.
     agent_sessions_ui: ui::agent_sessions::AgentSessionsUi,
+    /// DB mutation은 controller projection과 분리돼 실패할 수 있다. 성공할 때까지 FIFO로
+    /// 보존해 새 thread가 복구 불가능해지거나 archive가 재시작 후 되살아나는 것을 막는다.
+    agent_persistence_queue: Vec<ui::agent_sessions::AgentSessionPersistenceMutation>,
+    agent_persistence_retry_at: Option<std::time::Instant>,
     connectors_ui: ui::connectors::ConnectorsUi,
     /// OAuth refresh single-flight 조율자 (H5) — 프로세스 단일 인스턴스의 원본.
     /// 현재 소비자는 connectors_ui뿐이지만, 후속 소비자(P2 web 브리지 등)도 반드시
@@ -1264,6 +1268,56 @@ pub struct App {
     known_hosts_cache: Option<Vec<(String, String)>>,
     /// 폴더 트리 사이드바 (file-tree-design §6). OFF면 None — Panel 미생성 + 상태 drop(리소스 0).
     file_tree: Option<ui::file_tree::FileTreeUi>,
+}
+
+fn apply_agent_persistence_batch(
+    db: &Db,
+    queue: &mut Vec<ui::agent_sessions::AgentSessionPersistenceMutation>,
+) -> anyhow::Result<()> {
+    use ui::agent_sessions::AgentSessionPersistenceMutation as Mutation;
+
+    let pending = std::mem::take(queue);
+    let mut pending = pending.into_iter();
+    while let Some(mutation) = pending.next() {
+        let result = match &mutation {
+            Mutation::Upsert {
+                local_session_id,
+                workspace_id,
+                thread_id,
+                title,
+                cwd,
+                model,
+                favorite,
+                archived,
+            } => db.upsert_structured_thread(
+                local_session_id,
+                workspace_id,
+                thread_id,
+                title,
+                cwd,
+                model.as_deref(),
+                *favorite,
+                *archived,
+            ),
+            Mutation::SetArchived {
+                local_session_id,
+                archived,
+            } => db
+                .set_structured_thread_archived(local_session_id, *archived)
+                .map(|_| ()),
+            Mutation::Delete { local_session_id } => {
+                db.delete_structured_thread(local_session_id).map(|_| ())
+            }
+        };
+        if let Err(error) = result {
+            // 같은 local_session_id의 후속 archive/delete가 앞선 upsert를 추월하면
+            // 재시작 복구 상태가 뒤집힌다. 첫 실패부터 남은 FIFO 전체를 보존한다.
+            queue.push(mutation);
+            queue.extend(pending);
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 impl App {
@@ -1401,6 +1455,8 @@ impl App {
             secret_store: KeyringSecretStore,
             agents_ui: ui::agents::AgentsUi::new(),
             agent_sessions_ui: ui::agent_sessions::AgentSessionsUi::new(),
+            agent_persistence_queue: Vec::new(),
+            agent_persistence_retry_at: None,
             connectors_ui: ui::connectors::ConnectorsUi::new(
                 redaction.clone(),
                 Arc::new(KeyringSecretStore),
@@ -2843,16 +2899,11 @@ impl App {
                     return;
                 }
                 let target = runtime::MuxPaneId(pane_id);
-                let tab = self.active.workspace_ui.mux().and_then(|mux| {
-                    mux.tabs
-                        .iter()
-                        .find(|tab| {
-                            tab.panes.iter().any(|pane| {
-                                pane.id == target && pane.session_id == Some(session_id)
-                            })
-                        })
-                        .map(|tab| tab.id.clone())
-                });
+                let tab = self
+                    .active
+                    .workspace_ui
+                    .mux()
+                    .and_then(|mux| tab_of_agent_target(mux, &target, session_id));
                 if let Some(tab) = tab {
                     if self
                         .active
@@ -3079,9 +3130,15 @@ impl App {
                 None
             }
             AgentAction::EffortUp | AgentAction::EffortDown => {
-                // PR-07가 version-safe effort control을 연결할 때까지 transport에
-                // 임의 JSON-RPC를 보내지 않는다. 단축키는 이미 소비되며 panel만 연다.
                 self.agent_sessions_ui.open();
+                let delta = if action == AgentAction::EffortUp {
+                    1
+                } else {
+                    -1
+                };
+                if let Err(error) = self.agent_sessions_ui.adjust_selected_effort(delta) {
+                    tracing::warn!("에이전트 effort 단축키 실패: {error:#}");
+                }
                 None
             }
             AgentAction::OpenAgents => {
@@ -4074,49 +4131,37 @@ impl App {
     }
 
     fn persist_agent_session_mutations(&mut self) {
-        use ui::agent_sessions::AgentSessionPersistenceMutation as Mutation;
-        for mutation in self.agent_sessions_ui.drain_persistence_mutations() {
-            let result = match mutation {
-                Mutation::Upsert {
-                    local_session_id,
-                    workspace_id,
-                    thread_id,
-                    title,
-                    cwd,
-                    model,
-                    favorite,
-                    archived,
-                } => self.db.upsert_structured_thread(
-                    &local_session_id,
-                    &workspace_id,
-                    &thread_id,
-                    &title,
-                    &cwd,
-                    model.as_deref(),
-                    favorite,
-                    archived,
-                ),
-                Mutation::SetArchived {
-                    local_session_id,
-                    archived,
-                } => self
-                    .db
-                    .set_structured_thread_archived(&local_session_id, archived)
-                    .and_then(|updated| {
-                        anyhow::ensure!(updated, "보관할 구조화 thread DB 행이 없습니다");
-                        Ok(())
-                    }),
-                Mutation::Delete { local_session_id } => self
-                    .db
-                    .delete_structured_thread(&local_session_id)
-                    .map(|_| ()),
-            };
-            if let Err(error) = result {
-                let message = format!("구조화 Codex thread 저장 실패: {error:#}");
-                tracing::warn!("{message}");
-                self.agent_sessions_ui.report_persistence_error(message);
-            }
+        self.persist_agent_session_mutations_with_policy(false);
+    }
+
+    fn persist_agent_session_mutations_with_policy(&mut self, force: bool) {
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+        self.agent_persistence_queue
+            .extend(self.agent_sessions_ui.drain_persistence_mutations());
+        if self.agent_persistence_queue.is_empty() {
+            self.agent_persistence_retry_at = None;
+            return;
         }
+        let now = std::time::Instant::now();
+        if !force
+            && self
+                .agent_persistence_retry_at
+                .is_some_and(|retry_at| now < retry_at)
+        {
+            return;
+        }
+
+        if let Err(error) =
+            apply_agent_persistence_batch(&self.db, &mut self.agent_persistence_queue)
+        {
+            let message = format!("구조화 Codex thread 저장 실패: {error:#}");
+            tracing::warn!("{message}");
+            self.agent_sessions_ui.report_persistence_error(message);
+            self.agent_persistence_retry_at = Some(now + RETRY_DELAY);
+            return;
+        }
+        self.agent_persistence_retry_at = None;
     }
 
     fn record_activity_events(rt: &mut WorkspaceRuntime, events: &[runtime::RuntimeEvent]) {
@@ -4227,8 +4272,14 @@ impl App {
         if let Some(bench) = self.bench.as_mut() {
             bench.finish();
         }
+        // 마지막 App Server 이벤트가 만든 thread metadata를 종료 전에 한 번 더 반영한다.
+        // 평상시 실패분도 FIFO queue에 남아 있으므로 retry deadline과 무관하게 flush한다.
+        self.agent_sessions_ui.poll();
+        self.persist_agent_session_mutations_with_policy(true);
         // App Server는 PTY runtime과 독립된 child process라 여기서 명시적으로 종료·reap한다.
         self.agent_sessions_ui.shutdown();
+        // shutdown join 중 도착한 마지막 thread/start/resume 결과도 controller가 drain한다.
+        self.persist_agent_session_mutations_with_policy(true);
         self.approval_watcher.stop();
         // 웹서버(모바일 PWA)를 runtime보다 먼저 정지 — 브리지가 쥔 command_sink가
         // worker 채널을 살려둔 채 join을 기다리는 순환을 끊는다 (P5 리뷰 P1 종료 데드락;
@@ -5685,29 +5736,51 @@ impl eframe::App for App {
         if let Some((del_id, _del_name)) = self.ws_delete_confirm.clone() {
             match ws_delete_decision {
                 Some(true) => {
-                    // 활성 프로젝트면 다른 프로젝트로 먼저 전환(삭제 가드가 active를 거부).
-                    if del_id == self.active.id
-                        && let Some(other) = self
-                            .workspaces
-                            .iter()
-                            .find(|w| w.id != del_id)
-                            .map(|w| w.id.clone())
-                    {
-                        self.switch_workspace(&other);
-                        self.refresh_workspaces();
+                    if let Err(error) = self.agent_sessions_ui.prepare_workspace_delete(&del_id) {
+                        let message = format!("workspace 삭제 중단: {error:#}");
+                        tracing::warn!("{message}");
+                        self.agent_sessions_ui.report_persistence_error(message);
+                        self.ws_delete_confirm = None;
+                        // APP thread가 살아 있으면 runtime/credential/DB 어느 것도 건드리지 않는다.
+                    } else {
+                        // Controller에서 이미 drain된 upsert도 삭제 뒤 workspace를 되살리려
+                        // 재시도하면 안 된다. archive/delete는 cascade 뒤 no-op이어도 안전하다.
+                        self.agent_persistence_queue.retain(|mutation| {
+                            !matches!(
+                                mutation,
+                                ui::agent_sessions::AgentSessionPersistenceMutation::Upsert {
+                                    workspace_id,
+                                    ..
+                                } if workspace_id == &del_id
+                            )
+                        });
+                        if self.agent_persistence_queue.is_empty() {
+                            self.agent_persistence_retry_at = None;
+                        }
+                        // 활성 프로젝트면 다른 프로젝트로 먼저 전환(삭제 가드가 active를 거부).
+                        if del_id == self.active.id
+                            && let Some(other) = self
+                                .workspaces
+                                .iter()
+                                .find(|w| w.id != del_id)
+                                .map(|w| w.id.clone())
+                        {
+                            self.switch_workspace(&other);
+                            self.refresh_workspaces();
+                        }
+                        // keyring까지 정리(dotenv 소유 credential) 후 DB 삭제 — 화면·DB에서만
+                        // 제거되고 폴더/.env 파일은 보존(재등록 시 복구).
+                        if let Err(e) = crate::dotenv_sync::remove_workspace_dotenv(
+                            &mut self.db,
+                            &self.secret_store,
+                            &del_id,
+                        ) {
+                            tracing::warn!("dotenv 정리 실패: {e:#}");
+                        }
+                        ws_delete = Some(del_id);
+                        self.invalidate_env_api_projects();
+                        self.ws_delete_confirm = None;
                     }
-                    // keyring까지 정리(dotenv 소유 credential) 후 DB 삭제 — 화면·DB에서만
-                    // 제거되고 폴더/.env 파일은 보존(재등록 시 복구).
-                    if let Err(e) = crate::dotenv_sync::remove_workspace_dotenv(
-                        &mut self.db,
-                        &self.secret_store,
-                        &del_id,
-                    ) {
-                        tracing::warn!("dotenv 정리 실패: {e:#}");
-                    }
-                    ws_delete = Some(del_id);
-                    self.invalidate_env_api_projects();
-                    self.ws_delete_confirm = None;
                 }
                 Some(false) => self.ws_delete_confirm = None,
                 None => {}
@@ -5731,7 +5804,12 @@ impl eframe::App for App {
                 self.notifications_ui.prune_workspace(&delete_id);
                 match self.db.delete_workspace(&delete_id) {
                     Ok(()) => self.refresh_workspaces(),
-                    Err(e) => tracing::warn!("워크스페이스 삭제 실패: {e:#}"),
+                    Err(e) => {
+                        tracing::warn!("워크스페이스 삭제 실패: {e:#}");
+                        // Controller projection was pruned before the cascade guard. DB가
+                        // 남았다면 다시 import해 UI와 durable metadata를 즉시 맞춘다.
+                        self.refresh_workspaces();
+                    }
                 }
             }
         }
@@ -5798,50 +5876,50 @@ impl eframe::App for App {
             None => {}
         }
         if let Some(target) = notif_click {
-            match target {
-                ui::notifications::AgentNotificationTarget::Pty {
-                    workspace_id: ws_id,
-                    session,
-                } => {
-                    if ws_id == self.active.id {
+            let workspace_ids = self
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.id.clone())
+                .collect::<Vec<_>>();
+            let navigation =
+                plan_agent_notification_navigation(&target, &self.active.id, &workspace_ids);
+            if let Some(navigation) = navigation {
+                match navigation {
+                    AgentNotificationNavigation::FocusCurrentPty { session } => {
                         if let Some(pane) = mux.as_ref().and_then(|m| pane_of_session(m, session)) {
                             let _ = self
                                 .active
                                 .runtime
                                 .send_command(runtime::RuntimeCommand::FocusPane { pane });
                         }
-                    } else {
-                        let reused = self.warm.contains_key(&ws_id);
-                        self.switch_workspace(&ws_id);
-                        self.refresh_workspaces();
-                        if reused {
-                            self.pending_focus = Some((ws_id, session));
-                        }
                     }
-                }
-                ui::notifications::AgentNotificationTarget::Structured {
-                    workspace_id,
-                    session_id,
-                } => {
-                    if workspace_id != self.active.id
-                        && self
-                            .workspaces
-                            .iter()
-                            .any(|workspace| workspace.id == workspace_id)
-                    {
+                    AgentNotificationNavigation::SwitchAndFocusPty {
+                        workspace_id,
+                        session,
+                    } => {
                         self.switch_workspace(&workspace_id);
                         self.refresh_workspaces();
+                        self.pending_focus = Some((workspace_id, session));
                     }
-                    self.agent_sessions_ui.open_session(&session_id);
+                    AgentNotificationNavigation::OpenStructured {
+                        switch_workspace,
+                        session_id,
+                    } => {
+                        if let Some(workspace_id) = switch_workspace {
+                            self.switch_workspace(&workspace_id);
+                            self.refresh_workspaces();
+                        }
+                        self.agent_sessions_ui.open_session(&session_id);
+                    }
                 }
+                // Settings는 별도 native viewport다. 대상 전환 후 그대로 앞에 남으면
+                // 이동이 실패한 것처럼 보이므로 닫고 root workspace를 key window로 올린다.
+                self.settings_open = false;
+                ui.ctx()
+                    .send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(50));
             }
-            // Settings는 별도 native viewport다. 대상 전환 후 그대로 앞에 남으면
-            // 이동이 실패한 것처럼 보이므로 닫고 root workspace를 key window로 올린다.
-            self.settings_open = false;
-            ui.ctx()
-                .send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(50));
         }
         if out.config_changed {
             self.config.i18n.locale = i18n::normalize_locale(&self.config.i18n.locale);
@@ -5986,6 +6064,82 @@ fn pane_of_session(
         .flat_map(|tab| &tab.panes)
         .find(|pane| pane.session_id == Some(session))
         .map(|pane| pane.id.clone())
+}
+
+fn tab_of_agent_target(
+    mux: &runtime::MuxSnapshot,
+    pane_id: &runtime::MuxPaneId,
+    session_id: runtime::SessionId,
+) -> Option<runtime::MuxTabId> {
+    mux.tabs
+        .iter()
+        .find(|tab| {
+            tab.panes
+                .iter()
+                .any(|pane| &pane.id == pane_id && pane.session_id == Some(session_id))
+        })
+        .map(|tab| tab.id.clone())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AgentNotificationNavigation {
+    FocusCurrentPty {
+        session: runtime::SessionId,
+    },
+    SwitchAndFocusPty {
+        workspace_id: String,
+        session: runtime::SessionId,
+    },
+    OpenStructured {
+        switch_workspace: Option<String>,
+        session_id: String,
+    },
+}
+
+/// Resolve notification navigation before mutating runtimes. Deleted/stale
+/// workspace targets fail closed; a cross-workspace PTY target always keeps a
+/// deferred exact-session focus, including when the runtime must be rebuilt.
+fn plan_agent_notification_navigation(
+    target: &ui::notifications::AgentNotificationTarget,
+    active_workspace_id: &str,
+    known_workspace_ids: &[String],
+) -> Option<AgentNotificationNavigation> {
+    match target {
+        ui::notifications::AgentNotificationTarget::Pty {
+            workspace_id,
+            session,
+        } if workspace_id == active_workspace_id => {
+            Some(AgentNotificationNavigation::FocusCurrentPty { session: *session })
+        }
+        ui::notifications::AgentNotificationTarget::Pty {
+            workspace_id,
+            session,
+        } if known_workspace_ids.contains(workspace_id) => {
+            Some(AgentNotificationNavigation::SwitchAndFocusPty {
+                workspace_id: workspace_id.clone(),
+                session: *session,
+            })
+        }
+        ui::notifications::AgentNotificationTarget::Structured {
+            workspace_id,
+            session_id,
+        } if workspace_id == active_workspace_id => {
+            Some(AgentNotificationNavigation::OpenStructured {
+                switch_workspace: None,
+                session_id: session_id.clone(),
+            })
+        }
+        ui::notifications::AgentNotificationTarget::Structured {
+            workspace_id,
+            session_id,
+        } if known_workspace_ids.contains(workspace_id) => {
+            Some(AgentNotificationNavigation::OpenStructured {
+                switch_workspace: Some(workspace_id.clone()),
+                session_id: session_id.clone(),
+            })
+        }
+        _ => None,
+    }
 }
 
 fn load_catalog(locale: &str) -> i18n::Catalog {
@@ -6202,6 +6356,166 @@ mod tests {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+
+    #[test]
+    fn agent_notification_navigation_preserves_transport_workspace_and_session() {
+        use ui::notifications::AgentNotificationTarget as Target;
+
+        let known = vec!["ws-a".to_owned(), "ws-b".to_owned()];
+        let current_pty = Target::Pty {
+            workspace_id: "ws-a".to_owned(),
+            session: runtime::SessionId(7),
+        };
+        assert_eq!(
+            plan_agent_notification_navigation(&current_pty, "ws-a", &known),
+            Some(AgentNotificationNavigation::FocusCurrentPty {
+                session: runtime::SessionId(7),
+            })
+        );
+
+        let cross_pty = Target::Pty {
+            workspace_id: "ws-b".to_owned(),
+            session: runtime::SessionId(8),
+        };
+        assert_eq!(
+            plan_agent_notification_navigation(&cross_pty, "ws-a", &known),
+            Some(AgentNotificationNavigation::SwitchAndFocusPty {
+                workspace_id: "ws-b".to_owned(),
+                session: runtime::SessionId(8),
+            })
+        );
+
+        let current_app = Target::Structured {
+            workspace_id: "ws-a".to_owned(),
+            session_id: "app-1".to_owned(),
+        };
+        assert_eq!(
+            plan_agent_notification_navigation(&current_app, "ws-a", &known),
+            Some(AgentNotificationNavigation::OpenStructured {
+                switch_workspace: None,
+                session_id: "app-1".to_owned(),
+            })
+        );
+
+        let cross_app = Target::Structured {
+            workspace_id: "ws-b".to_owned(),
+            session_id: "app-2".to_owned(),
+        };
+        assert_eq!(
+            plan_agent_notification_navigation(&cross_app, "ws-a", &known),
+            Some(AgentNotificationNavigation::OpenStructured {
+                switch_workspace: Some("ws-b".to_owned()),
+                session_id: "app-2".to_owned(),
+            })
+        );
+
+        let stale = Target::Structured {
+            workspace_id: "deleted".to_owned(),
+            session_id: "app-stale".to_owned(),
+        };
+        assert_eq!(
+            plan_agent_notification_navigation(&stale, "ws-a", &known),
+            None
+        );
+    }
+
+    #[test]
+    fn agent_pty_focus_requires_matching_pane_and_session_pair() {
+        let pane_id = runtime::MuxPaneId("pane-1".to_owned());
+        let tab_id = runtime::MuxTabId("tab-1".to_owned());
+        let session_id = runtime::SessionId(9);
+        let mux = runtime::MuxSnapshot {
+            tabs: vec![runtime::TabSnapshot {
+                id: tab_id.clone(),
+                title: "agents".to_owned(),
+                layout: runtime::LayoutNode::Pane(pane_id.clone()),
+                panes: vec![runtime::PaneSnapshot {
+                    id: pane_id.clone(),
+                    session_id: Some(session_id),
+                    title: "Codex".to_owned(),
+                    persistent_session_id: None,
+                }],
+            }],
+            active_tab: Some(tab_id.clone()),
+            focused_pane: Some(pane_id.clone()),
+        };
+
+        assert_eq!(
+            tab_of_agent_target(&mux, &pane_id, session_id),
+            Some(tab_id)
+        );
+        assert_eq!(
+            tab_of_agent_target(&mux, &pane_id, runtime::SessionId(10)),
+            None
+        );
+        assert_eq!(
+            tab_of_agent_target(
+                &mux,
+                &runtime::MuxPaneId("stale-pane".to_owned()),
+                session_id
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn structured_persistence_batch_preserves_fifo_from_first_db_failure() {
+        use ui::agent_sessions::AgentSessionPersistenceMutation as Mutation;
+
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-agent-persistence-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("metadata.sqlite3")).unwrap();
+        let mut failed = vec![
+            Mutation::Upsert {
+                local_session_id: "local-bad".to_owned(),
+                workspace_id: "missing-workspace".to_owned(),
+                thread_id: "thread-bad".to_owned(),
+                title: "bad".to_owned(),
+                cwd: "/repo".to_owned(),
+                model: None,
+                favorite: false,
+                archived: false,
+            },
+            Mutation::Delete {
+                local_session_id: "must-not-overtake".to_owned(),
+            },
+        ];
+        assert!(apply_agent_persistence_batch(&db, &mut failed).is_err());
+        assert!(matches!(
+            failed.as_slice(),
+            [Mutation::Upsert { local_session_id, .. }, Mutation::Delete { .. }]
+                if local_session_id == "local-bad"
+        ));
+
+        let workspace_id = db.create_workspace("retry-ok").unwrap();
+        let mut successful = vec![
+            Mutation::Upsert {
+                local_session_id: "local-1".to_owned(),
+                workspace_id: workspace_id.clone(),
+                thread_id: "thread-1".to_owned(),
+                title: "saved".to_owned(),
+                cwd: "/repo".to_owned(),
+                model: Some("gpt-test".to_owned()),
+                favorite: false,
+                archived: false,
+            },
+            Mutation::SetArchived {
+                local_session_id: "local-1".to_owned(),
+                archived: true,
+            },
+        ];
+        apply_agent_persistence_batch(&db, &mut successful).unwrap();
+        assert!(successful.is_empty());
+        let rows = db.list_structured_threads(&workspace_id, true).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].archived);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn 시작_font_snapshot은_첫_frame_재설치를_유발하지_않는다() {

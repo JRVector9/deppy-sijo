@@ -9,12 +9,14 @@ use std::sync::mpsc::TryRecvError;
 
 use crate::agent_session::{
     AgentApprovalDecision, AgentSession, AgentSessionEvent, AgentSessionId, AgentSessionStatus,
+    AgentSkillSelection,
 };
 use crate::agent_surface::{
     AgentProvider, AgentSurfaceId, AgentSurfaceSnapshot, AgentTransport, AgentVisualState,
 };
 use crate::codex_app_server::{
     CodexAppServerClient, CodexAppServerEvent, CodexAppServerOptions, CodexAppServerReply,
+    CodexModelCatalogReply, CodexModelInfo, CodexSkillCatalogReply, CodexSkillInfo,
 };
 use storage::StructuredThreadRow;
 
@@ -100,7 +102,9 @@ pub struct AgentSessionsUi {
     selected_item: Option<String>,
     new_prompt: String,
     new_model: String,
+    new_effort: String,
     follow_up: String,
+    steer_input: String,
     focus_new_prompt: bool,
     focus_follow_up: bool,
     status_notices: Vec<AgentSessionStatusNotice>,
@@ -109,6 +113,12 @@ pub struct AgentSessionsUi {
     attached_threads: HashSet<AgentSessionId>,
     pending_thread_requests: Vec<PendingThreadRequest>,
     persistence_mutations: Vec<AgentSessionPersistenceMutation>,
+    model_catalog: Vec<CodexModelInfo>,
+    skill_catalog: Vec<CodexSkillInfo>,
+    selected_skill_paths: HashSet<String>,
+    pending_model_catalog: Option<CodexModelCatalogReply>,
+    pending_skill_catalog: Option<CodexSkillCatalogReply>,
+    catalog_error: Option<String>,
 }
 
 impl AgentSessionsUi {
@@ -123,7 +133,9 @@ impl AgentSessionsUi {
             selected_item: None,
             new_prompt: String::new(),
             new_model: String::new(),
+            new_effort: String::new(),
             follow_up: String::new(),
+            steer_input: String::new(),
             focus_new_prompt: false,
             focus_follow_up: false,
             status_notices: Vec::new(),
@@ -132,6 +144,12 @@ impl AgentSessionsUi {
             attached_threads: HashSet::new(),
             pending_thread_requests: Vec::new(),
             persistence_mutations: Vec::new(),
+            model_catalog: Vec::new(),
+            skill_catalog: Vec::new(),
+            selected_skill_paths: HashSet::new(),
+            pending_model_catalog: None,
+            pending_skill_catalog: None,
+            catalog_error: None,
         }
     }
 
@@ -248,6 +266,10 @@ impl AgentSessionsUi {
 
     pub fn archive_selected_persisted(&mut self, ctx: &egui::Context) -> anyhow::Result<()> {
         let (session_id, row) = self.selected_persisted_thread()?;
+        anyhow::ensure!(
+            !self.attached_threads.contains(&session_id),
+            "재개된 APP thread는 연결이 종료된 뒤 보관하세요"
+        );
         self.ensure_client(ctx)?;
         let reply = self
             .client
@@ -291,6 +313,63 @@ impl AgentSessionsUi {
         Ok(())
     }
 
+    /// Fail-closed guard called before App deletes a workspace and cascades its
+    /// storage rows. An attached or in-flight structured thread keeps the
+    /// workspace alive; detached projections can be discarded safely.
+    #[allow(dead_code)] // Called by the App-level workspace deletion path.
+    pub fn prepare_workspace_delete(&mut self, workspace_id: &str) -> anyhow::Result<()> {
+        let target_ids = self
+            .sessions
+            .iter()
+            .filter(|session| session.workspace_id.as_deref() == Some(workspace_id))
+            .map(|session| session.id.clone())
+            .collect::<HashSet<_>>();
+        anyhow::ensure!(
+            !target_ids
+                .iter()
+                .any(|session_id| self.attached_threads.contains(session_id)),
+            "연결된 APP thread가 있어 workspace를 삭제할 수 없습니다"
+        );
+        anyhow::ensure!(
+            !self
+                .pending_thread_requests
+                .iter()
+                .any(|pending| target_ids.contains(pending.session_id())),
+            "응답 대기 중인 APP thread가 있어 workspace를 삭제할 수 없습니다"
+        );
+
+        self.sessions
+            .retain(|session| !target_ids.contains(&session.id));
+        self.persisted_threads
+            .retain(|session_id, _| !target_ids.contains(session_id));
+        self.status_notices
+            .retain(|notice| notice.workspace_id != workspace_id);
+        self.persistence_mutations
+            .retain(|mutation| match mutation {
+                AgentSessionPersistenceMutation::Upsert {
+                    workspace_id: id, ..
+                } => id != workspace_id,
+                AgentSessionPersistenceMutation::SetArchived {
+                    local_session_id, ..
+                }
+                | AgentSessionPersistenceMutation::Delete { local_session_id } => {
+                    !target_ids.contains(local_session_id)
+                }
+            });
+        if self
+            .selected_session
+            .as_ref()
+            .is_some_and(|selected| target_ids.contains(selected))
+        {
+            self.selected_session = None;
+            self.selected_surface = None;
+            self.selected_item = None;
+            self.follow_up.clear();
+            self.steer_input.clear();
+        }
+        Ok(())
+    }
+
     pub fn open_session(&mut self, session_id: &str) -> bool {
         if !self.sessions.iter().any(|session| session.id == session_id) {
             return false;
@@ -325,7 +404,7 @@ impl AgentSessionsUi {
                     transport: AgentTransport::AppServer,
                     title: one_line_title(&session.prompt),
                     model: session.model.clone(),
-                    effort: None,
+                    effort: session.effort.clone(),
                     context_pct: None,
                     state: AgentVisualState::from_structured(session.status),
                 })
@@ -419,6 +498,62 @@ impl AgentSessionsUi {
         self.respond_selected_approval(AgentApprovalDecision::Decline, ctx)
     }
 
+    /// Cycle the selected APP session's next-turn effort using the authoritative
+    /// model catalog. This is local state only; it is sent on the next
+    /// `turn/start` and never uses the experimental thread settings API.
+    pub fn adjust_selected_effort(&mut self, delta: isize) -> anyhow::Result<()> {
+        anyhow::ensure!(delta != 0, "effort 조정값이 0입니다");
+        let Some(AgentSurfaceId::Structured { session_id }) = self.selected_surface.as_ref() else {
+            anyhow::bail!("선택된 Codex APP 세션이 없습니다");
+        };
+        let session = self
+            .sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+            .ok_or_else(|| anyhow::anyhow!("선택된 Codex APP 세션을 찾을 수 없습니다"))?;
+        let model = session
+            .model
+            .as_deref()
+            .and_then(|selected| {
+                self.model_catalog
+                    .iter()
+                    .find(|model| model.model == selected || model.id == selected)
+            })
+            .or_else(|| self.model_catalog.iter().find(|model| model.is_default))
+            .ok_or_else(|| anyhow::anyhow!("모델 카탈로그를 먼저 불러오세요"))?;
+        anyhow::ensure!(
+            !model.supported_reasoning_efforts.is_empty(),
+            "선택 모델이 지원 effort를 제공하지 않습니다"
+        );
+        let current = session
+            .effort
+            .as_deref()
+            .unwrap_or(&model.default_reasoning_effort);
+        let current_index = model
+            .supported_reasoning_efforts
+            .iter()
+            .position(|effort| effort.reasoning_effort == current)
+            .or_else(|| {
+                model
+                    .supported_reasoning_efforts
+                    .iter()
+                    .position(|effort| effort.reasoning_effort == model.default_reasoning_effort)
+            })
+            .unwrap_or(0);
+        let next = (current_index as isize + delta)
+            .rem_euclid(model.supported_reasoning_efforts.len() as isize)
+            as usize;
+        let next_effort = model.supported_reasoning_efforts[next]
+            .reasoning_effort
+            .clone();
+        self.sessions
+            .iter_mut()
+            .find(|session| &session.id == session_id)
+            .expect("위에서 검증된 APP 세션")
+            .effort = Some(next_effort);
+        Ok(())
+    }
+
     fn respond_selected_approval(
         &mut self,
         decision: AgentApprovalDecision,
@@ -451,6 +586,11 @@ impl AgentSessionsUi {
         if let Some(client) = self.client.as_mut() {
             client.shutdown();
         }
+        // The joined worker may have produced final turn/thread events and
+        // one-shot replies immediately before acknowledging Shutdown. Drain
+        // them while the receivers are still owned so App can flush any newly
+        // emitted persistence mutations once more after this call.
+        self.poll();
         self.client = None;
         self.attached_threads.clear();
     }
@@ -463,6 +603,110 @@ impl AgentSessionsUi {
         self.transport_error = None;
         self.client = Some(client);
         Ok(())
+    }
+
+    fn request_catalogs(
+        &mut self,
+        ctx: &egui::Context,
+        cwd: Option<String>,
+        force_reload: bool,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.pending_model_catalog.is_none() && self.pending_skill_catalog.is_none(),
+            "모델/skill 카탈로그를 이미 불러오는 중입니다"
+        );
+        self.ensure_client(ctx)?;
+        let client = self
+            .client
+            .as_ref()
+            .expect("ensure_client 성공 후 client 존재");
+        self.pending_model_catalog = Some(client.list_models(None, Some(100), false)?);
+        self.pending_skill_catalog = Some(
+            client.list_skills(
+                cwd.filter(|cwd| !cwd.trim().is_empty())
+                    .into_iter()
+                    .collect(),
+                force_reload,
+            )?,
+        );
+        self.catalog_error = None;
+        Ok(())
+    }
+
+    fn poll_catalog_replies(&mut self) {
+        if let Some(reply) = self.pending_model_catalog.take() {
+            match reply.try_recv() {
+                Ok(Ok(page)) => {
+                    self.model_catalog = page.data;
+                    if self.new_model.trim().is_empty()
+                        && let Some(default) = self
+                            .model_catalog
+                            .iter()
+                            .find(|model| model.is_default)
+                            .or_else(|| self.model_catalog.first())
+                    {
+                        self.new_model = default.model.clone();
+                        self.new_effort = default.default_reasoning_effort.clone();
+                    }
+                }
+                Ok(Err(error)) => {
+                    self.catalog_error = Some(format!("모델 카탈로그 실패: {error:#}"));
+                }
+                Err(TryRecvError::Empty) => self.pending_model_catalog = Some(reply),
+                Err(TryRecvError::Disconnected) => {
+                    self.catalog_error =
+                        Some("모델 카탈로그 응답 채널이 종료되었습니다".to_owned());
+                }
+            }
+        }
+        if let Some(reply) = self.pending_skill_catalog.take() {
+            match reply.try_recv() {
+                Ok(Ok(skills)) => {
+                    self.skill_catalog = skills;
+                    self.selected_skill_paths.retain(|path| {
+                        self.skill_catalog
+                            .iter()
+                            .any(|skill| skill.enabled && skill.path == *path)
+                    });
+                }
+                Ok(Err(error)) => {
+                    self.catalog_error = Some(format!("skill 카탈로그 실패: {error:#}"));
+                }
+                Err(TryRecvError::Empty) => self.pending_skill_catalog = Some(reply),
+                Err(TryRecvError::Disconnected) => {
+                    self.catalog_error =
+                        Some("skill 카탈로그 응답 채널이 종료되었습니다".to_owned());
+                }
+            }
+        }
+    }
+
+    fn selected_skills(&self) -> Vec<AgentSkillSelection> {
+        self.skill_catalog
+            .iter()
+            .filter(|skill| skill.enabled && self.selected_skill_paths.contains(&skill.path))
+            .map(|skill| AgentSkillSelection {
+                name: skill.name.clone(),
+                path: skill.path.clone(),
+            })
+            .collect()
+    }
+
+    fn session_turn_settings(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<(Option<String>, Option<String>, Vec<AgentSkillSelection>)> {
+        self.sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .map(|session| {
+                (
+                    session.model.clone(),
+                    session.effort.clone(),
+                    session.skills.clone(),
+                )
+            })
+            .ok_or_else(|| anyhow::anyhow!("후속 작업 세션을 찾을 수 없습니다"))
     }
 
     fn selected_persisted_thread(&self) -> anyhow::Result<(AgentSessionId, StructuredThreadRow)> {
@@ -650,6 +894,11 @@ impl AgentSessionsUi {
     /// Poll continuously even when the window is closed so an active structured
     /// session reaches a consistent terminal state in the background.
     pub fn poll(&mut self) {
+        // App Server sends a one-shot resume/read reply before later stream
+        // deltas can be observed by this controller. Apply the snapshot first
+        // so a stale snapshot can never erase a newer streamed item update.
+        self.poll_thread_replies();
+        self.poll_catalog_replies();
         let mut connection_stopped = false;
         let events = self
             .client
@@ -667,7 +916,6 @@ impl AgentSessionsUi {
                 CodexAppServerEvent::ConnectionStopped => connection_stopped = true,
             }
         }
-        self.poll_thread_replies();
         if connection_stopped {
             self.attached_threads.clear();
             let active = self
@@ -727,9 +975,33 @@ impl AgentSessionsUi {
                 if let Some(error) = &self.transport_error {
                     ui.colored_label(egui::Color32::from_rgb(0xff, 0x7b, 0x72), error);
                 }
+                if let Some(error) = &self.catalog_error {
+                    ui.colored_label(egui::Color32::from_rgb(0xff, 0xbf, 0x69), error);
+                    ui.weak("카탈로그 없이도 모델/effort를 직접 입력해 계속 사용할 수 있습니다.");
+                }
                 crate::ui::hairline(ui);
 
                 ui.label("새 작업");
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            self.pending_model_catalog.is_none()
+                                && self.pending_skill_catalog.is_none(),
+                            egui::Button::new("모델 · skills 불러오기"),
+                        )
+                        .clicked()
+                    {
+                        actions.push(PanelAction::RefreshCatalog {
+                            cwd: workspace_cwd.clone(),
+                            force_reload: !self.skill_catalog.is_empty(),
+                        });
+                    }
+                    if self.pending_model_catalog.is_some() || self.pending_skill_catalog.is_some()
+                    {
+                        ui.weak("카탈로그 응답 대기 중…");
+                    }
+                });
+                self.render_agent_controls(ui);
                 let prompt_response = ui.add_sized(
                     [ui.available_width(), 72.0],
                     egui::TextEdit::multiline(&mut self.new_prompt)
@@ -742,12 +1014,6 @@ impl AgentSessionsUi {
                     self.focus_new_prompt = false;
                 }
                 ui.horizontal(|ui| {
-                    ui.label("모델 (선택)");
-                    ui.add_sized(
-                        [180.0, 24.0],
-                        egui::TextEdit::singleline(&mut self.new_model)
-                            .hint_text("기본 Codex 모델"),
-                    );
                     let can_start = !self.new_prompt.trim().is_empty();
                     if ui
                         .add_enabled(can_start, egui::Button::new("Codex 실행"))
@@ -756,7 +1022,9 @@ impl AgentSessionsUi {
                         actions.push(PanelAction::Start {
                             workspace_id: workspace_id.to_owned(),
                             prompt: std::mem::take(&mut self.new_prompt),
-                            model: std::mem::take(&mut self.new_model),
+                            model: self.new_model.clone(),
+                            effort: self.new_effort.clone(),
+                            skills: self.selected_skills(),
                             cwd: workspace_cwd.clone(),
                         });
                     }
@@ -790,6 +1058,102 @@ impl AgentSessionsUi {
             }
         }
         requests
+    }
+
+    fn render_agent_controls(&mut self, ui: &mut egui::Ui) {
+        let models = self.model_catalog.clone();
+        let selected_model = models
+            .iter()
+            .find(|model| model.model == self.new_model)
+            .cloned();
+        ui.horizontal_wrapped(|ui| {
+            ui.label("모델");
+            if models.is_empty() {
+                ui.add_sized(
+                    [210.0, 24.0],
+                    egui::TextEdit::singleline(&mut self.new_model).hint_text("기본 Codex 모델"),
+                );
+            } else {
+                egui::ComboBox::from_id_salt("agent-model-catalog")
+                    .selected_text(
+                        selected_model
+                            .as_ref()
+                            .map_or(self.new_model.as_str(), |model| model.display_name.as_str()),
+                    )
+                    .show_ui(ui, |ui| {
+                        for model in &models {
+                            if ui
+                                .selectable_label(
+                                    self.new_model == model.model,
+                                    &model.display_name,
+                                )
+                                .on_hover_text(&model.description)
+                                .clicked()
+                            {
+                                self.new_model = model.model.clone();
+                                if !model
+                                    .supported_reasoning_efforts
+                                    .iter()
+                                    .any(|effort| effort.reasoning_effort == self.new_effort)
+                                {
+                                    self.new_effort = model.default_reasoning_effort.clone();
+                                }
+                            }
+                        }
+                    });
+            }
+
+            ui.label("effort");
+            if let Some(model) = selected_model {
+                egui::ComboBox::from_id_salt("agent-effort-catalog")
+                    .selected_text(&self.new_effort)
+                    .show_ui(ui, |ui| {
+                        for effort in &model.supported_reasoning_efforts {
+                            ui.selectable_value(
+                                &mut self.new_effort,
+                                effort.reasoning_effort.clone(),
+                                &effort.reasoning_effort,
+                            )
+                            .on_hover_text(&effort.description);
+                        }
+                    });
+            } else {
+                ui.add_sized(
+                    [110.0, 24.0],
+                    egui::TextEdit::singleline(&mut self.new_effort).hint_text("기본 effort"),
+                );
+            }
+        });
+
+        if !self.skill_catalog.is_empty() {
+            let skills = self.skill_catalog.clone();
+            egui::CollapsingHeader::new(format!(
+                "skills · {}개 선택",
+                self.selected_skill_paths.len()
+            ))
+            .id_salt("agent-skills-catalog")
+            .show(ui, |ui| {
+                for skill in skills {
+                    let selected = self.selected_skill_paths.contains(&skill.path);
+                    let mut checked = selected;
+                    let response = ui.add_enabled(
+                        skill.enabled,
+                        egui::Checkbox::new(
+                            &mut checked,
+                            format!("{} · {}", skill.name, skill.scope),
+                        ),
+                    );
+                    response.on_hover_text(format!("{}\n{}", skill.description, skill.path));
+                    if checked != selected {
+                        if checked {
+                            self.selected_skill_paths.insert(skill.path);
+                        } else {
+                            self.selected_skill_paths.remove(&skill.path);
+                        }
+                    }
+                }
+            });
+        }
     }
 
     fn render_surface_tabs(&mut self, ui: &mut egui::Ui, actions: &mut Vec<PanelAction>) {
@@ -869,6 +1233,56 @@ impl AgentSessionsUi {
         });
     }
 
+    fn render_session_turn_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        session: &AgentSession,
+        actions: &mut Vec<PanelAction>,
+    ) {
+        let mut model = session.model.clone().unwrap_or_default();
+        let mut effort = session.effort.clone().unwrap_or_default();
+        let mut skill_paths = session
+            .skills
+            .iter()
+            .map(|skill| skill.path.clone())
+            .collect::<HashSet<_>>();
+        let before = (model.clone(), effort.clone(), skill_paths.clone());
+        ui.collapsing("다음 turn 설정", |ui| {
+            render_turn_control_fields(
+                ui,
+                &session.id,
+                &self.model_catalog,
+                &self.skill_catalog,
+                &mut model,
+                &mut effort,
+                &mut skill_paths,
+            );
+            ui.weak(
+                "model/effort 변경은 서버 설정을 즉시 바꾸지 않고 다음 turn/start에 적용됩니다.",
+            );
+        });
+        if before != (model.clone(), effort.clone(), skill_paths.clone()) {
+            let skills = if self.skill_catalog.is_empty() {
+                session.skills.clone()
+            } else {
+                self.skill_catalog
+                    .iter()
+                    .filter(|skill| skill.enabled && skill_paths.contains(&skill.path))
+                    .map(|skill| AgentSkillSelection {
+                        name: skill.name.clone(),
+                        path: skill.path.clone(),
+                    })
+                    .collect()
+            };
+            actions.push(PanelAction::UpdateTurnControls {
+                session_id: session.id.clone(),
+                model: non_empty(model),
+                effort: non_empty(effort),
+                skills,
+            });
+        }
+    }
+
     fn selected_session_snapshot(&self) -> Option<AgentSession> {
         self.selected_session.as_ref().and_then(|id| {
             self.sessions
@@ -928,6 +1342,23 @@ impl AgentSessionsUi {
                 ui.monospace(model);
             });
         }
+        if let Some(effort) = &session.effort {
+            ui.horizontal(|ui| {
+                ui.weak("effort");
+                ui.monospace(effort);
+            });
+        }
+        if !session.skills.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.weak("skills");
+                for skill in &session.skills {
+                    ui.monospace(&skill.name).on_hover_text(&skill.path);
+                }
+            });
+        }
+        if session.thread_id.is_some() {
+            self.render_session_turn_controls(ui, &session, actions);
+        }
         if is_persisted {
             ui.horizontal(|ui| {
                 if ui
@@ -946,7 +1377,7 @@ impl AgentSessionsUi {
                     actions.push(PanelAction::ReadPersisted(session.id.clone()));
                 }
                 if ui
-                    .add_enabled(!request_pending, egui::Button::new("보관"))
+                    .add_enabled(!request_pending && !is_attached, egui::Button::new("보관"))
                     .clicked()
                 {
                     actions.push(PanelAction::ArchivePersisted(session.id.clone()));
@@ -967,6 +1398,34 @@ impl AgentSessionsUi {
         }
         if let Some(error) = &session.error {
             ui.colored_label(egui::Color32::from_rgb(0xff, 0x7b, 0x72), error);
+        }
+
+        if session.status == AgentSessionStatus::Running
+            && (!is_persisted || is_attached)
+            && session.turn_id.is_some()
+        {
+            ui.add_space(4.0);
+            ui.label("현재 turn에 추가 지시 (steer)");
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [ui.available_width() - 110.0, 38.0],
+                    egui::TextEdit::multiline(&mut self.steer_input)
+                        .hint_text("진행 중인 작업에 지금 반영할 지시"),
+                );
+                if ui
+                    .add_enabled(
+                        !self.steer_input.trim().is_empty(),
+                        egui::Button::new("steer 전송"),
+                    )
+                    .clicked()
+                {
+                    actions.push(PanelAction::Steer {
+                        session_id: session.id.clone(),
+                        prompt: std::mem::take(&mut self.steer_input),
+                        skills: session.skills.clone(),
+                    });
+                }
+            });
         }
 
         for approval in &session.approvals {
@@ -1132,7 +1591,6 @@ impl AgentSessionsUi {
                 actions.push(PanelAction::Submit {
                     session_id: session.id,
                     prompt: std::mem::take(&mut self.follow_up),
-                    model: String::new(),
                     cwd: workspace_cwd,
                 });
             }
@@ -1150,26 +1608,77 @@ impl AgentSessionsUi {
                 workspace_id,
                 prompt,
                 model,
+                effort,
+                skills,
                 cwd,
-            } => self.start(workspace_id, prompt, model, cwd, ctx),
+            } => self.start(workspace_id, prompt, model, effort, skills, cwd, ctx),
             PanelAction::Submit {
                 session_id,
                 prompt,
-                model,
                 cwd,
             } => {
+                let settings = self.session_turn_settings(&session_id);
                 let result = self
                     .client
                     .as_ref()
                     .ok_or_else(|| {
                         anyhow::anyhow!("Codex App Server 연결이 없습니다. 새 세션을 시작하세요.")
                     })
-                    .and_then(|client| {
-                        client.submit_turn(session_id.clone(), prompt, cwd, non_empty(model))
+                    .and_then(|client| settings.map(|settings| (client, settings)))
+                    .and_then(|(client, (model, effort, skills))| {
+                        client.submit_turn(
+                            session_id.clone(),
+                            prompt,
+                            cwd,
+                            model.clone(),
+                            effort.clone(),
+                            skills.clone(),
+                        )
                     });
                 if let Err(error) = result {
                     self.fail_session(&session_id, format!("후속 작업 전송 실패: {error:#}"));
                 }
+            }
+            PanelAction::Steer {
+                session_id,
+                prompt,
+                skills,
+            } => {
+                let result = self
+                    .client
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Codex App Server 연결이 없습니다"))
+                    .and_then(|client| client.steer_turn(session_id.clone(), prompt, skills));
+                if let Err(error) = result {
+                    self.apply_session_event(
+                        &session_id,
+                        AgentSessionEvent::ControlError {
+                            message: format!("turn steer 실패: {error:#}"),
+                        },
+                    );
+                }
+            }
+            PanelAction::RefreshCatalog { cwd, force_reload } => {
+                if let Err(error) = self.request_catalogs(ctx, cwd, force_reload) {
+                    self.catalog_error = Some(format!("카탈로그 요청 실패: {error:#}"));
+                }
+            }
+            PanelAction::UpdateTurnControls {
+                session_id,
+                model,
+                effort,
+                skills,
+            } => {
+                if let Some(session) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == session_id)
+                {
+                    session.model = model;
+                    session.effort = effort;
+                    session.skills = skills;
+                }
+                self.queue_thread_upsert(&session_id, false);
             }
             PanelAction::Interrupt(session_id) => {
                 let result = self
@@ -1237,11 +1746,14 @@ impl AgentSessionsUi {
         external_request
     }
 
+    #[allow(clippy::too_many_arguments)] // UI start action mirrors stable turn controls.
     fn start(
         &mut self,
         workspace_id: String,
         prompt: String,
         model: String,
+        effort: String,
+        skills: Vec<AgentSkillSelection>,
         cwd: Option<String>,
         ctx: &egui::Context,
     ) {
@@ -1249,11 +1761,20 @@ impl AgentSessionsUi {
         let mut session = AgentSession::new(session_id.clone(), prompt.clone(), cwd.clone());
         session.workspace_id = Some(workspace_id);
         session.model = non_empty(model.clone());
+        session.effort = non_empty(effort.clone());
+        session.skills = skills.clone();
         let result = self.ensure_client(ctx).and_then(|()| {
             self.client
                 .as_ref()
                 .expect("성공한 App Server client가 존재")
-                .start_session(session_id.clone(), prompt, cwd, non_empty(model))
+                .start_session(
+                    session_id.clone(),
+                    prompt,
+                    cwd,
+                    non_empty(model),
+                    non_empty(effort),
+                    skills,
+                )
         });
         if let Err(error) = result {
             session.apply(AgentSessionEvent::Failed {
@@ -1357,13 +1878,29 @@ enum PanelAction {
         workspace_id: String,
         prompt: String,
         model: String,
+        effort: String,
+        skills: Vec<AgentSkillSelection>,
         cwd: Option<String>,
     },
     Submit {
         session_id: AgentSessionId,
         prompt: String,
-        model: String,
         cwd: Option<String>,
+    },
+    Steer {
+        session_id: AgentSessionId,
+        prompt: String,
+        skills: Vec<AgentSkillSelection>,
+    },
+    RefreshCatalog {
+        cwd: Option<String>,
+        force_reload: bool,
+    },
+    UpdateTurnControls {
+        session_id: AgentSessionId,
+        model: Option<String>,
+        effort: Option<String>,
+        skills: Vec<AgentSkillSelection>,
     },
     Interrupt(AgentSessionId),
     Acknowledge(AgentSessionId),
@@ -1415,6 +1952,101 @@ fn render_selected_surface_header(ui: &mut egui::Ui, surface: &AgentSurfaceSnaps
         AgentTransport::AppServer => "structured thread · turn · item stream",
         AgentTransport::Pty => "interactive terminal · raw ANSI/IME input",
     });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_turn_control_fields(
+    ui: &mut egui::Ui,
+    id: &str,
+    models: &[CodexModelInfo],
+    skills: &[CodexSkillInfo],
+    model_value: &mut String,
+    effort_value: &mut String,
+    selected_skill_paths: &mut HashSet<String>,
+) {
+    let selected_model = models
+        .iter()
+        .find(|model| model.model == *model_value)
+        .cloned();
+    ui.horizontal_wrapped(|ui| {
+        ui.label("모델");
+        if models.is_empty() {
+            ui.add_sized(
+                [210.0, 24.0],
+                egui::TextEdit::singleline(model_value).hint_text("기본 Codex 모델"),
+            );
+        } else {
+            egui::ComboBox::from_id_salt(("agent-turn-model", id))
+                .selected_text(
+                    selected_model
+                        .as_ref()
+                        .map_or(model_value.as_str(), |model| model.display_name.as_str()),
+                )
+                .show_ui(ui, |ui| {
+                    for model in models {
+                        if ui
+                            .selectable_label(*model_value == model.model, &model.display_name)
+                            .on_hover_text(&model.description)
+                            .clicked()
+                        {
+                            *model_value = model.model.clone();
+                            if !model
+                                .supported_reasoning_efforts
+                                .iter()
+                                .any(|effort| effort.reasoning_effort == *effort_value)
+                            {
+                                *effort_value = model.default_reasoning_effort.clone();
+                            }
+                        }
+                    }
+                });
+        }
+        ui.label("effort");
+        if let Some(model) = selected_model {
+            egui::ComboBox::from_id_salt(("agent-turn-effort", id))
+                .selected_text(effort_value.as_str())
+                .show_ui(ui, |ui| {
+                    for effort in &model.supported_reasoning_efforts {
+                        ui.selectable_value(
+                            effort_value,
+                            effort.reasoning_effort.clone(),
+                            &effort.reasoning_effort,
+                        )
+                        .on_hover_text(&effort.description);
+                    }
+                });
+        } else {
+            ui.add_sized(
+                [110.0, 24.0],
+                egui::TextEdit::singleline(effort_value).hint_text("기본 effort"),
+            );
+        }
+    });
+    if !skills.is_empty() {
+        egui::CollapsingHeader::new(format!("skills · {}개 선택", selected_skill_paths.len()))
+            .id_salt(("agent-turn-skills", id))
+            .show(ui, |ui| {
+                for skill in skills {
+                    let selected = selected_skill_paths.contains(&skill.path);
+                    let mut checked = selected;
+                    ui.add_enabled(
+                        skill.enabled,
+                        egui::Checkbox::new(
+                            &mut checked,
+                            format!("{} · {}", skill.name, skill.scope),
+                        ),
+                    )
+                    .on_hover_text(format!("{}\n{}", skill.description, skill.path));
+                    if checked != selected {
+                        if checked {
+                            selected_skill_paths.insert(skill.path.clone());
+                        } else {
+                            selected_skill_paths.remove(&skill.path);
+                        }
+                    }
+                }
+            });
+    }
 }
 
 fn non_empty(value: String) -> Option<String> {
@@ -1800,5 +2432,243 @@ mod tests {
             AgentVisualState::from_structured(ui.sessions[0].status),
             AgentVisualState::Idle
         );
+    }
+
+    #[test]
+    fn history_snapshot_is_applied_before_newer_stream_delta() {
+        let mut ui = AgentSessionsUi::new();
+        ui.import_persisted_threads(vec![persisted_row("local-1", "thread-1")]);
+        let (reply_tx, reply_rx) = mpsc::channel();
+        ui.pending_thread_requests.push(PendingThreadRequest::Read {
+            session_id: "local-1".to_owned(),
+            reply: reply_rx,
+        });
+        reply_tx.send(Ok(thread_result("thread-1"))).unwrap();
+
+        // This is the same seam used by poll(): reply/snapshot first, stream
+        // events second. Reversing it would erase " newer" here.
+        ui.poll_thread_replies();
+        ui.apply_session_event(
+            "local-1",
+            AgentSessionEvent::ItemDelta {
+                item_id: "answer-1".to_owned(),
+                delta: " newer".to_owned(),
+            },
+        );
+
+        assert_eq!(ui.sessions[0].items[0].summary, "restored newer");
+    }
+
+    #[test]
+    fn workspace_delete_is_fail_closed_for_attached_or_pending_threads_and_prunes_safe_rows() {
+        let mut attached = AgentSessionsUi::new();
+        attached.import_persisted_threads(vec![persisted_row("local-1", "thread-1")]);
+        attached.attached_threads.insert("local-1".to_owned());
+        assert!(attached.prepare_workspace_delete("ws-1").is_err());
+        assert!(attached.persisted_threads.contains_key("local-1"));
+
+        let mut pending = AgentSessionsUi::new();
+        pending.import_persisted_threads(vec![persisted_row("local-1", "thread-1")]);
+        let (_reply_tx, reply_rx) = mpsc::channel();
+        pending
+            .pending_thread_requests
+            .push(PendingThreadRequest::Read {
+                session_id: "local-1".to_owned(),
+                reply: reply_rx,
+            });
+        assert!(pending.prepare_workspace_delete("ws-1").is_err());
+        assert_eq!(pending.pending_thread_requests.len(), 1);
+
+        let mut safe = AgentSessionsUi::new();
+        let ws1 = persisted_row("local-1", "thread-1");
+        let mut ws2 = persisted_row("local-2", "thread-2");
+        ws2.workspace_id = "ws-2".to_owned();
+        safe.import_persisted_threads(vec![ws1, ws2]);
+        safe.open_session("local-1");
+        safe.persistence_mutations
+            .push(AgentSessionPersistenceMutation::Delete {
+                local_session_id: "local-1".to_owned(),
+            });
+        safe.persistence_mutations
+            .push(AgentSessionPersistenceMutation::Delete {
+                local_session_id: "local-2".to_owned(),
+            });
+
+        safe.prepare_workspace_delete("ws-1").unwrap();
+        assert_eq!(safe.session_ids(), vec!["local-2".to_owned()]);
+        assert!(!safe.persisted_threads.contains_key("local-1"));
+        assert!(safe.persisted_threads.contains_key("local-2"));
+        assert!(safe.selected_surface.is_none());
+        assert_eq!(safe.persistence_mutations.len(), 1);
+        assert!(matches!(
+            &safe.persistence_mutations[0],
+            AgentSessionPersistenceMutation::Delete { local_session_id }
+                if local_session_id == "local-2"
+        ));
+    }
+
+    #[test]
+    fn attached_persisted_thread_cannot_be_archived_or_deleted() {
+        let mut ui = AgentSessionsUi::new();
+        ui.import_persisted_threads(vec![persisted_row("local-1", "thread-1")]);
+        ui.open_session("local-1");
+        ui.attached_threads.insert("local-1".to_owned());
+
+        assert!(
+            ui.archive_selected_persisted(&egui::Context::default())
+                .unwrap_err()
+                .to_string()
+                .contains("연결이 종료된 뒤")
+        );
+        assert!(ui.delete_selected_persisted().is_err());
+        assert!(ui.client.is_none());
+        assert!(ui.persisted_threads.contains_key("local-1"));
+    }
+
+    #[test]
+    fn effort_shortcut_cycles_selected_session_and_submit_reads_that_value() {
+        use crate::codex_app_server::{CodexModelInfo, CodexReasoningEffort};
+
+        let mut ui = AgentSessionsUi::new();
+        ui.model_catalog = vec![CodexModelInfo {
+            id: "model-id".to_owned(),
+            model: "gpt-test".to_owned(),
+            display_name: "GPT Test".to_owned(),
+            description: "test".to_owned(),
+            is_default: true,
+            default_reasoning_effort: "medium".to_owned(),
+            supported_reasoning_efforts: ["low", "medium", "high"]
+                .into_iter()
+                .map(|effort| CodexReasoningEffort {
+                    reasoning_effort: effort.to_owned(),
+                    description: effort.to_owned(),
+                })
+                .collect(),
+        }];
+        let mut first = AgentSession::new("app-1".to_owned(), "first".to_owned(), None);
+        first.model = Some("gpt-test".to_owned());
+        first.effort = Some("medium".to_owned());
+        first.skills = vec![AgentSkillSelection {
+            name: "first-skill".to_owned(),
+            path: "/skills/first".to_owned(),
+        }];
+        let mut second = AgentSession::new("app-2".to_owned(), "second".to_owned(), None);
+        second.model = Some("gpt-test".to_owned());
+        second.effort = Some("low".to_owned());
+        second.skills = vec![AgentSkillSelection {
+            name: "second-skill".to_owned(),
+            path: "/skills/second".to_owned(),
+        }];
+        ui.sessions.extend([first, second]);
+
+        ui.open_session("app-1");
+        ui.adjust_selected_effort(1).unwrap();
+        assert_eq!(
+            ui.selected_surface_snapshot().unwrap().effort.as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            ui.session_turn_settings("app-1").unwrap().1.as_deref(),
+            Some("high")
+        );
+
+        ui.open_session("app-2");
+        assert_eq!(
+            ui.session_turn_settings("app-2").unwrap().1.as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            ui.session_turn_settings("app-2").unwrap().2[0].name,
+            "second-skill"
+        );
+        ui.open_session("app-1");
+        assert_eq!(
+            ui.session_turn_settings("app-1").unwrap().1.as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            ui.session_turn_settings("app-1").unwrap().2[0].name,
+            "first-skill"
+        );
+    }
+
+    #[test]
+    fn catalog_failure_keeps_manual_controls_as_safe_fallback() {
+        let mut ui = AgentSessionsUi::new();
+        ui.new_model = "manual-model".to_owned();
+        ui.new_effort = "manual-effort".to_owned();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        ui.pending_model_catalog = Some(reply_rx);
+        reply_tx
+            .send(Err(anyhow::anyhow!("method unavailable")))
+            .unwrap();
+
+        ui.poll_catalog_replies();
+
+        assert_eq!(ui.new_model, "manual-model");
+        assert_eq!(ui.new_effort, "manual-effort");
+        assert!(
+            ui.catalog_error
+                .as_deref()
+                .unwrap()
+                .contains("method unavailable")
+        );
+        assert!(ui.pending_model_catalog.is_none());
+    }
+
+    #[test]
+    fn stale_steer_error_preserves_completed_controller_status() {
+        let mut ui = AgentSessionsUi::new();
+        let mut session = AgentSession::new("app-1".to_owned(), "done".to_owned(), None);
+        session.status = AgentSessionStatus::Completed;
+        ui.sessions.push(session);
+
+        ui.apply_session_event(
+            "app-1",
+            AgentSessionEvent::ControlError {
+                message: "stale expectedTurnId".to_owned(),
+            },
+        );
+
+        assert_eq!(ui.sessions[0].status, AgentSessionStatus::Completed);
+        assert_eq!(
+            ui.sessions[0].error.as_deref(),
+            Some("stale expectedTurnId")
+        );
+        assert!(ui.drain_status_notices().is_empty());
+    }
+
+    #[test]
+    fn next_turn_model_change_queues_deduplicated_structured_upsert() {
+        let mut ui = AgentSessionsUi::new();
+        ui.import_persisted_threads(vec![persisted_row("local-1", "thread-1")]);
+
+        ui.apply_action(
+            PanelAction::UpdateTurnControls {
+                session_id: "local-1".to_owned(),
+                model: Some("gpt-new".to_owned()),
+                effort: Some("high".to_owned()),
+                skills: Vec::new(),
+            },
+            &egui::Context::default(),
+        );
+        ui.apply_action(
+            PanelAction::UpdateTurnControls {
+                session_id: "local-1".to_owned(),
+                model: Some("gpt-new".to_owned()),
+                effort: Some("high".to_owned()),
+                skills: Vec::new(),
+            },
+            &egui::Context::default(),
+        );
+
+        assert_eq!(ui.sessions[0].model.as_deref(), Some("gpt-new"));
+        let mutations = ui.drain_persistence_mutations();
+        assert_eq!(mutations.len(), 1);
+        assert!(matches!(
+            &mutations[0],
+            AgentSessionPersistenceMutation::Upsert { model, .. }
+                if model.as_deref() == Some("gpt-new")
+        ));
     }
 }

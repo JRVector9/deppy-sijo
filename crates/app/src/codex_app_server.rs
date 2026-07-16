@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 
 use crate::agent_session::{
     AgentApproval, AgentApprovalDecision, AgentApprovalKind, AgentItem, AgentSessionEvent,
-    AgentSessionId, AgentThreadStatus,
+    AgentSessionId, AgentSkillSelection, AgentThreadStatus,
 };
 
 const MAX_BUFFERED_THREAD_STATUSES: usize = 64;
@@ -70,6 +70,42 @@ pub struct CodexAppServerClient {
 /// JSON boundary until a UI-specific view model consumes it.
 #[allow(dead_code)] // PR-06 phase 2 wires the history UI consumer.
 pub type CodexAppServerReply = Receiver<anyhow::Result<Value>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexReasoningEffort {
+    pub reasoning_effort: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexModelInfo {
+    pub id: String,
+    pub model: String,
+    pub display_name: String,
+    pub description: String,
+    pub is_default: bool,
+    pub default_reasoning_effort: String,
+    pub supported_reasoning_efforts: Vec<CodexReasoningEffort>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexModelCatalogPage {
+    pub data: Vec<CodexModelInfo>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexSkillInfo {
+    pub cwd: String,
+    pub name: String,
+    pub path: String,
+    pub description: String,
+    pub enabled: bool,
+    pub scope: String,
+}
+
+pub type CodexModelCatalogReply = Receiver<anyhow::Result<CodexModelCatalogPage>>;
+pub type CodexSkillCatalogReply = Receiver<anyhow::Result<Vec<CodexSkillInfo>>>;
 
 impl CodexAppServerClient {
     pub fn spawn(options: CodexAppServerOptions, repaint: egui::Context) -> anyhow::Result<Self> {
@@ -130,12 +166,16 @@ impl CodexAppServerClient {
         prompt: String,
         cwd: Option<String>,
         model: Option<String>,
+        effort: Option<String>,
+        skills: Vec<AgentSkillSelection>,
     ) -> anyhow::Result<()> {
         self.send(ClientCommand::StartSession {
             session_id,
             prompt,
             cwd,
             model,
+            effort,
+            skills,
         })
     }
 
@@ -146,13 +186,62 @@ impl CodexAppServerClient {
         prompt: String,
         cwd: Option<String>,
         model: Option<String>,
+        effort: Option<String>,
+        skills: Vec<AgentSkillSelection>,
     ) -> anyhow::Result<()> {
         self.send(ClientCommand::SubmitTurn {
             session_id,
             prompt,
             cwd,
             model,
+            effort,
+            skills,
         })
+    }
+
+    /// Add input to the selected active turn. The worker supplies the exact
+    /// current `expectedTurnId`; no steer request is sent for idle sessions.
+    pub fn steer_turn(
+        &self,
+        session_id: AgentSessionId,
+        prompt: String,
+        skills: Vec<AgentSkillSelection>,
+    ) -> anyhow::Result<()> {
+        self.send(ClientCommand::SteerTurn {
+            session_id,
+            prompt,
+            skills,
+        })
+    }
+
+    pub fn list_models(
+        &self,
+        cursor: Option<String>,
+        limit: Option<u32>,
+        include_hidden: bool,
+    ) -> anyhow::Result<CodexModelCatalogReply> {
+        let (reply, receiver) = mpsc::channel();
+        self.send(ClientCommand::ListModels {
+            cursor,
+            limit,
+            include_hidden,
+            reply,
+        })?;
+        Ok(receiver)
+    }
+
+    pub fn list_skills(
+        &self,
+        cwds: Vec<String>,
+        force_reload: bool,
+    ) -> anyhow::Result<CodexSkillCatalogReply> {
+        let (reply, receiver) = mpsc::channel();
+        self.send(ClientCommand::ListSkills {
+            cwds,
+            force_reload,
+            reply,
+        })?;
+        Ok(receiver)
     }
 
     /// Interrupt only the selected thread/turn. The shared App Server process
@@ -268,12 +357,21 @@ enum ClientCommand {
         prompt: String,
         cwd: Option<String>,
         model: Option<String>,
+        effort: Option<String>,
+        skills: Vec<AgentSkillSelection>,
     },
     SubmitTurn {
         session_id: AgentSessionId,
         prompt: String,
         cwd: Option<String>,
         model: Option<String>,
+        effort: Option<String>,
+        skills: Vec<AgentSkillSelection>,
+    },
+    SteerTurn {
+        session_id: AgentSessionId,
+        prompt: String,
+        skills: Vec<AgentSkillSelection>,
     },
     Interrupt {
         session_id: AgentSessionId,
@@ -309,7 +407,35 @@ enum ClientCommand {
         thread_id: String,
         reply: Sender<anyhow::Result<Value>>,
     },
+    ListModels {
+        cursor: Option<String>,
+        limit: Option<u32>,
+        include_hidden: bool,
+        reply: Sender<anyhow::Result<CodexModelCatalogPage>>,
+    },
+    ListSkills {
+        cwds: Vec<String>,
+        force_reload: bool,
+        reply: Sender<anyhow::Result<Vec<CodexSkillInfo>>>,
+    },
     Shutdown,
+}
+
+#[derive(Debug)]
+enum ClientCommandReply {
+    Json(Sender<anyhow::Result<Value>>),
+    Models(Sender<anyhow::Result<CodexModelCatalogPage>>),
+    Skills(Sender<anyhow::Result<Vec<CodexSkillInfo>>>),
+}
+
+impl ClientCommandReply {
+    fn send_error(self, repaint: &egui::Context, message: String) {
+        match self {
+            Self::Json(reply) => send_typed_reply(reply, repaint, Err(anyhow::anyhow!(message))),
+            Self::Models(reply) => send_typed_reply(reply, repaint, Err(anyhow::anyhow!(message))),
+            Self::Skills(reply) => send_typed_reply(reply, repaint, Err(anyhow::anyhow!(message))),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -327,12 +453,18 @@ enum PendingRequest {
         prompt: String,
         cwd: Option<String>,
         model: Option<String>,
+        effort: Option<String>,
+        skills: Vec<AgentSkillSelection>,
     },
     StartTurn {
         session_id: AgentSessionId,
     },
     Interrupt {
         session_id: AgentSessionId,
+    },
+    SteerTurn {
+        session_id: AgentSessionId,
+        expected_turn_id: String,
     },
     ListThreads {
         reply: Sender<anyhow::Result<Value>>,
@@ -349,6 +481,12 @@ enum PendingRequest {
     ArchiveThread {
         thread_id: String,
         reply: Sender<anyhow::Result<Value>>,
+    },
+    ListModels {
+        reply: Sender<anyhow::Result<CodexModelCatalogPage>>,
+    },
+    ListSkills {
+        reply: Sender<anyhow::Result<Vec<CodexSkillInfo>>>,
     },
 }
 
@@ -384,6 +522,8 @@ struct QueuedStart {
     prompt: String,
     cwd: Option<String>,
     model: Option<String>,
+    effort: Option<String>,
+    skills: Vec<AgentSkillSelection>,
 }
 
 impl WorkerState {
@@ -567,6 +707,7 @@ fn handle_client_command(
     events: &Sender<CodexAppServerEvent>,
     repaint: &egui::Context,
 ) {
+    let preserves_lifecycle_on_error = matches!(&command, ClientCommand::SteerTurn { .. });
     if !state.initialized
         && matches!(
             &command,
@@ -574,6 +715,8 @@ fn handle_client_command(
                 | ClientCommand::ReadThread { .. }
                 | ClientCommand::ResumeThread { .. }
                 | ClientCommand::ArchiveThread { .. }
+                | ClientCommand::ListModels { .. }
+                | ClientCommand::ListSkills { .. }
         )
     {
         state.queued_rpc_commands.push(command);
@@ -582,19 +725,26 @@ fn handle_client_command(
     let target = match &command {
         ClientCommand::StartSession { session_id, .. }
         | ClientCommand::SubmitTurn { session_id, .. }
+        | ClientCommand::SteerTurn { session_id, .. }
         | ClientCommand::Interrupt { session_id }
         | ClientCommand::RespondApproval { session_id, .. }
         | ClientCommand::ResumeThread { session_id, .. } => Some(session_id.clone()),
         ClientCommand::ListThreads { .. }
         | ClientCommand::ReadThread { .. }
         | ClientCommand::ArchiveThread { .. }
+        | ClientCommand::ListModels { .. }
+        | ClientCommand::ListSkills { .. }
         | ClientCommand::Shutdown => None,
     };
     let rpc_reply = match &command {
         ClientCommand::ListThreads { reply, .. }
         | ClientCommand::ReadThread { reply, .. }
         | ClientCommand::ResumeThread { reply, .. }
-        | ClientCommand::ArchiveThread { reply, .. } => Some(reply.clone()),
+        | ClientCommand::ArchiveThread { reply, .. } => {
+            Some(ClientCommandReply::Json(reply.clone()))
+        }
+        ClientCommand::ListModels { reply, .. } => Some(ClientCommandReply::Models(reply.clone())),
+        ClientCommand::ListSkills { reply, .. } => Some(ClientCommandReply::Skills(reply.clone())),
         _ => None,
     };
     let result = match command {
@@ -603,16 +753,20 @@ fn handle_client_command(
             prompt,
             cwd,
             model,
+            effort,
+            skills,
         } => {
             state.known_sessions.insert(session_id.clone());
             if state.initialized {
-                start_thread(stdin, state, session_id, prompt, cwd, model)
+                start_thread(stdin, state, session_id, prompt, cwd, model, effort, skills)
             } else {
                 state.queued_starts.push(QueuedStart {
                     session_id,
                     prompt,
                     cwd,
                     model,
+                    effort,
+                    skills,
                 });
                 Ok(())
             }
@@ -622,7 +776,14 @@ fn handle_client_command(
             prompt,
             cwd,
             model,
-        } => start_turn_for_session(stdin, state, session_id, prompt, cwd, model),
+            effort,
+            skills,
+        } => start_turn_for_session(stdin, state, session_id, prompt, cwd, model, effort, skills),
+        ClientCommand::SteerTurn {
+            session_id,
+            prompt,
+            skills,
+        } => steer_turn_for_session(stdin, state, session_id, prompt, skills),
         ClientCommand::Interrupt { session_id } => interrupt_turn(stdin, state, session_id),
         ClientCommand::RespondApproval {
             session_id,
@@ -650,20 +811,35 @@ fn handle_client_command(
         ClientCommand::ArchiveThread { thread_id, reply } => {
             request_thread_archive(stdin, state, thread_id, reply)
         }
+        ClientCommand::ListModels {
+            cursor,
+            limit,
+            include_hidden,
+            reply,
+        } => request_model_list(stdin, state, cursor, limit, include_hidden, reply),
+        ClientCommand::ListSkills {
+            cwds,
+            force_reload,
+            reply,
+        } => request_skills_list(stdin, state, cwds, force_reload, reply),
         ClientCommand::Shutdown => Ok(()),
     };
 
     if let Err(error) = result {
         let message = format!("Codex App Server 요청 실패: {error:#}");
         if let Some(reply) = rpc_reply {
-            send_rpc_reply(reply, repaint, Err(anyhow::anyhow!(message.clone())));
+            reply.send_error(repaint, message.clone());
         }
         if let Some(session_id) = target {
             emit_session(
                 events,
                 repaint,
                 session_id,
-                AgentSessionEvent::Failed { message },
+                if preserves_lifecycle_on_error {
+                    AgentSessionEvent::ControlError { message }
+                } else {
+                    AgentSessionEvent::Failed { message }
+                },
             );
         } else {
             emit_transport_error(events, repaint, message);
@@ -696,6 +872,7 @@ fn send_initialize(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // Mirrors stable thread/start + first turn controls.
 fn start_thread(
     stdin: &mut ChildStdin,
     state: &mut WorkerState,
@@ -703,6 +880,8 @@ fn start_thread(
     prompt: String,
     cwd: Option<String>,
     model: Option<String>,
+    effort: Option<String>,
+    skills: Vec<AgentSkillSelection>,
 ) -> anyhow::Result<()> {
     let id = state.request_id();
     state.pending.insert(
@@ -712,6 +891,8 @@ fn start_thread(
             prompt,
             cwd: cwd.clone(),
             model: model.clone(),
+            effort,
+            skills,
         },
     );
     let mut params = serde_json::Map::new();
@@ -727,6 +908,7 @@ fn start_thread(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // Mirrors stable turn/start control fields.
 fn start_turn_for_session(
     stdin: &mut ChildStdin,
     state: &mut WorkerState,
@@ -734,30 +916,117 @@ fn start_turn_for_session(
     prompt: String,
     cwd: Option<String>,
     model: Option<String>,
+    effort: Option<String>,
+    skills: Vec<AgentSkillSelection>,
 ) -> anyhow::Result<()> {
     let Some(thread_id) = state.session_to_thread.get(&session_id).cloned() else {
         anyhow::bail!("아직 Codex thread가 준비되지 않았습니다");
     };
+    let params = turn_start_params(thread_id, prompt, cwd, model, effort, skills)?;
     let id = state.request_id();
     state
         .pending
         .insert(rpc_key(&id), PendingRequest::StartTurn { session_id });
-    let mut params = serde_json::Map::new();
-    params.insert("threadId".to_owned(), Value::String(thread_id));
-    params.insert(
-        "input".to_owned(),
-        json!([{ "type": "text", "text": prompt }]),
-    );
-    if let Some(cwd) = cwd.filter(|cwd| !cwd.trim().is_empty()) {
-        params.insert("cwd".to_owned(), Value::String(cwd));
-    }
-    if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
-        params.insert("model".to_owned(), Value::String(model));
-    }
     write_message(
         stdin,
         &json!({"method": "turn/start", "id": id, "params": params}),
     )
+}
+
+fn turn_start_params(
+    thread_id: String,
+    prompt: String,
+    cwd: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    skills: Vec<AgentSkillSelection>,
+) -> anyhow::Result<Value> {
+    let mut params = serde_json::Map::new();
+    params.insert("threadId".to_owned(), Value::String(thread_id));
+    params.insert(
+        "input".to_owned(),
+        Value::Array(user_input(prompt, skills)?),
+    );
+    insert_non_empty(&mut params, "cwd", cwd);
+    insert_non_empty(&mut params, "model", model);
+    insert_non_empty(&mut params, "effort", effort);
+    Ok(Value::Object(params))
+}
+
+fn steer_turn_for_session(
+    stdin: &mut ChildStdin,
+    state: &mut WorkerState,
+    session_id: AgentSessionId,
+    prompt: String,
+    skills: Vec<AgentSkillSelection>,
+) -> anyhow::Result<()> {
+    let (thread_id, expected_turn_id) = active_turn_ids(state, &session_id)?;
+    let id = state.request_id();
+    let params = turn_steer_params(thread_id, expected_turn_id.clone(), prompt, skills)?;
+    state.pending.insert(
+        rpc_key(&id),
+        PendingRequest::SteerTurn {
+            session_id,
+            expected_turn_id,
+        },
+    );
+    write_message(
+        stdin,
+        &json!({"method": "turn/steer", "id": id, "params": params}),
+    )
+}
+
+fn active_turn_ids(state: &WorkerState, session_id: &str) -> anyhow::Result<(String, String)> {
+    let thread_id = state
+        .session_to_thread
+        .get(session_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("steer할 Codex thread가 없습니다"))?;
+    let turn_id = state
+        .session_to_turn
+        .get(session_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("실행 중인 turn에만 steer할 수 있습니다"))?;
+    Ok((thread_id, turn_id))
+}
+
+fn turn_steer_params(
+    thread_id: String,
+    expected_turn_id: String,
+    prompt: String,
+    skills: Vec<AgentSkillSelection>,
+) -> anyhow::Result<Value> {
+    Ok(json!({
+        "threadId": thread_id,
+        "expectedTurnId": expected_turn_id,
+        "input": user_input(prompt, skills)?,
+    }))
+}
+
+fn user_input(prompt: String, skills: Vec<AgentSkillSelection>) -> anyhow::Result<Vec<Value>> {
+    let mut input = Vec::with_capacity(1 + skills.len());
+    if !prompt.trim().is_empty() {
+        input.push(json!({"type": "text", "text": prompt}));
+    }
+    for skill in skills {
+        anyhow::ensure!(
+            !skill.name.trim().is_empty() && !skill.path.trim().is_empty(),
+            "skill name/path가 비어 있습니다"
+        );
+        input.push(json!({
+            "type": "skill",
+            "name": skill.name,
+            "path": skill.path,
+        }));
+    }
+    anyhow::ensure!(!input.is_empty(), "turn input이 비어 있습니다");
+    Ok(input)
+}
+
+fn insert_non_empty(params: &mut serde_json::Map<String, Value>, key: &str, value: Option<String>) {
+    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        params.insert(key.to_owned(), Value::String(value));
+    }
 }
 
 fn interrupt_turn(
@@ -917,6 +1186,77 @@ fn request_thread_archive(
     Ok(())
 }
 
+fn request_model_list(
+    stdin: &mut ChildStdin,
+    state: &mut WorkerState,
+    cursor: Option<String>,
+    limit: Option<u32>,
+    include_hidden: bool,
+    reply: Sender<anyhow::Result<CodexModelCatalogPage>>,
+) -> anyhow::Result<()> {
+    let id = state.request_id();
+    let key = rpc_key(&id);
+    state
+        .pending
+        .insert(key.clone(), PendingRequest::ListModels { reply });
+    let frame = json!({
+        "method": "model/list",
+        "id": id,
+        "params": model_list_params(cursor, limit, include_hidden),
+    });
+    if let Err(error) = write_message(stdin, &frame) {
+        state.pending.remove(&key);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn request_skills_list(
+    stdin: &mut ChildStdin,
+    state: &mut WorkerState,
+    cwds: Vec<String>,
+    force_reload: bool,
+    reply: Sender<anyhow::Result<Vec<CodexSkillInfo>>>,
+) -> anyhow::Result<()> {
+    let id = state.request_id();
+    let key = rpc_key(&id);
+    state
+        .pending
+        .insert(key.clone(), PendingRequest::ListSkills { reply });
+    let frame = json!({
+        "method": "skills/list",
+        "id": id,
+        "params": skills_list_params(cwds, force_reload),
+    });
+    if let Err(error) = write_message(stdin, &frame) {
+        state.pending.remove(&key);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn model_list_params(cursor: Option<String>, limit: Option<u32>, include_hidden: bool) -> Value {
+    let mut params = serde_json::Map::new();
+    if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
+        params.insert("cursor".to_owned(), Value::String(cursor));
+    }
+    if let Some(limit) = limit {
+        params.insert("limit".to_owned(), Value::from(limit));
+    }
+    params.insert("includeHidden".to_owned(), Value::Bool(include_hidden));
+    Value::Object(params)
+}
+
+fn skills_list_params(cwds: Vec<String>, force_reload: bool) -> Value {
+    json!({
+        "cwds": cwds
+            .into_iter()
+            .filter(|cwd| !cwd.trim().is_empty())
+            .collect::<Vec<_>>(),
+        "forceReload": force_reload,
+    })
+}
+
 fn thread_list_params(cursor: Option<String>, limit: Option<u32>, archived: bool) -> Value {
     let mut params = serde_json::Map::from_iter([
         ("sourceKinds".to_owned(), json!(["appServer"])),
@@ -1006,6 +1346,12 @@ fn handle_response(
                 session_id,
                 AgentSessionEvent::Failed { message: text },
             ),
+            PendingRequest::SteerTurn { session_id, .. } => emit_session(
+                events,
+                repaint,
+                session_id,
+                AgentSessionEvent::ControlError { message: text },
+            ),
             PendingRequest::ResumeThread {
                 session_id, reply, ..
             } => {
@@ -1021,6 +1367,12 @@ fn handle_response(
             | PendingRequest::ReadThread { reply, .. }
             | PendingRequest::ArchiveThread { reply, .. } => {
                 send_rpc_reply(reply, repaint, Err(anyhow::anyhow!(text)));
+            }
+            PendingRequest::ListModels { reply } => {
+                send_typed_reply(reply, repaint, Err(anyhow::anyhow!(text)));
+            }
+            PendingRequest::ListSkills { reply } => {
+                send_typed_reply(reply, repaint, Err(anyhow::anyhow!(text)));
             }
         }
         return;
@@ -1044,6 +1396,8 @@ fn handle_response(
                     start.prompt,
                     start.cwd,
                     start.model,
+                    start.effort,
+                    start.skills,
                 ) {
                     emit_session(
                         events,
@@ -1073,6 +1427,8 @@ fn handle_response(
             prompt,
             cwd,
             model,
+            effort,
+            skills,
         } => {
             let Some(thread_id) = result.pointer("/thread/id").and_then(Value::as_str) else {
                 emit_session(
@@ -1108,9 +1464,16 @@ fn handle_response(
                     AgentSessionEvent::ThreadStatusChanged { status },
                 );
             }
-            if let Err(error) =
-                start_turn_for_session(stdin, state, session_id.clone(), prompt, cwd, model)
-            {
+            if let Err(error) = start_turn_for_session(
+                stdin,
+                state,
+                session_id.clone(),
+                prompt,
+                cwd,
+                model,
+                effort,
+                skills,
+            ) {
                 emit_session(
                     events,
                     repaint,
@@ -1140,6 +1503,25 @@ fn handle_response(
                     session_id,
                     AgentSessionEvent::Failed {
                         message: "turn/start 응답에 turn.id가 없습니다".to_owned(),
+                    },
+                );
+            }
+        }
+        PendingRequest::SteerTurn {
+            session_id,
+            expected_turn_id,
+        } => {
+            let response_turn_id = result.get("turnId").and_then(Value::as_str);
+            if response_turn_id != Some(expected_turn_id.as_str()) {
+                emit_session(
+                    events,
+                    repaint,
+                    session_id,
+                    AgentSessionEvent::ControlError {
+                        message: format!(
+                            "turn/steer 응답 ID 불일치: expected {expected_turn_id}, got {}",
+                            response_turn_id.unwrap_or("missing")
+                        ),
                     },
                 );
             }
@@ -1177,6 +1559,11 @@ fn handle_response(
             state
                 .session_to_thread
                 .insert(session_id.clone(), thread_id.clone());
+            // Cross-channel ordering barrier: make the authoritative snapshot
+            // observable before any mapping-dependent stream event. The UI
+            // also polls replies before events, so a later delta/status cannot
+            // be erased by an older resume snapshot on the next frame.
+            send_rpc_reply(reply, repaint, Ok(result));
             emit_session(
                 events,
                 repaint,
@@ -1193,7 +1580,6 @@ fn handle_response(
                     AgentSessionEvent::ThreadStatusChanged { status },
                 );
             }
-            send_rpc_reply(reply, repaint, Ok(result));
         }
         PendingRequest::ArchiveThread { thread_id, reply } => {
             let response = if result.is_object() {
@@ -1210,6 +1596,12 @@ fn handle_response(
             }
             send_rpc_reply(reply, repaint, response);
         }
+        PendingRequest::ListModels { reply } => {
+            send_typed_reply(reply, repaint, parse_model_catalog(&result));
+        }
+        PendingRequest::ListSkills { reply } => {
+            send_typed_reply(reply, repaint, parse_skill_catalog(&result));
+        }
     }
 }
 
@@ -1218,8 +1610,96 @@ fn send_rpc_reply(
     repaint: &egui::Context,
     result: anyhow::Result<Value>,
 ) {
+    send_typed_reply(reply, repaint, result);
+}
+
+fn send_typed_reply<T>(
+    reply: Sender<anyhow::Result<T>>,
+    repaint: &egui::Context,
+    result: anyhow::Result<T>,
+) {
     let _ = reply.send(result);
     repaint.request_repaint();
+}
+
+fn parse_model_catalog(result: &Value) -> anyhow::Result<CodexModelCatalogPage> {
+    let data = result
+        .get("data")
+        .and_then(Value::as_array)
+        .context("model/list 응답에 data 배열이 없습니다")?;
+    let mut models = Vec::with_capacity(data.len());
+    for model in data {
+        let efforts = model
+            .get("supportedReasoningEfforts")
+            .and_then(Value::as_array)
+            .context("model/list 모델에 supportedReasoningEfforts 배열이 없습니다")?
+            .iter()
+            .map(|effort| {
+                Ok(CodexReasoningEffort {
+                    reasoning_effort: required_string(effort, "reasoningEffort")?,
+                    description: required_string(effort, "description")?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        models.push(CodexModelInfo {
+            id: required_string(model, "id")?,
+            model: required_string(model, "model")?,
+            display_name: required_string(model, "displayName")?,
+            description: required_string(model, "description")?,
+            is_default: model
+                .get("isDefault")
+                .and_then(Value::as_bool)
+                .context("model/list 모델에 isDefault boolean이 없습니다")?,
+            default_reasoning_effort: required_string(model, "defaultReasoningEffort")?,
+            supported_reasoning_efforts: efforts,
+        });
+    }
+    let next_cursor = match result.get("nextCursor") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(cursor)) => Some(cursor.clone()),
+        Some(_) => anyhow::bail!("model/list nextCursor 형식이 잘못되었습니다"),
+    };
+    Ok(CodexModelCatalogPage {
+        data: models,
+        next_cursor,
+    })
+}
+
+fn parse_skill_catalog(result: &Value) -> anyhow::Result<Vec<CodexSkillInfo>> {
+    let entries = result
+        .get("data")
+        .and_then(Value::as_array)
+        .context("skills/list 응답에 data 배열이 없습니다")?;
+    let mut catalog = Vec::new();
+    for entry in entries {
+        let cwd = required_string(entry, "cwd")?;
+        let skills = entry
+            .get("skills")
+            .and_then(Value::as_array)
+            .context("skills/list entry에 skills 배열이 없습니다")?;
+        for skill in skills {
+            catalog.push(CodexSkillInfo {
+                cwd: cwd.clone(),
+                name: required_string(skill, "name")?,
+                path: required_string(skill, "path")?,
+                description: required_string(skill, "description")?,
+                enabled: skill
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .context("skills/list skill에 enabled boolean이 없습니다")?,
+                scope: required_string(skill, "scope")?,
+            });
+        }
+    }
+    Ok(catalog)
+}
+
+fn required_string(value: &Value, key: &str) -> anyhow::Result<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .with_context(|| format!("응답에 {key} string이 없습니다"))
 }
 
 fn validate_thread_list_result(result: &Value) -> anyhow::Result<()> {
@@ -1762,5 +2242,162 @@ mod tests {
         assert!(validate_thread_result(&thread, "thread-1").is_ok());
         assert!(validate_thread_result(&thread, "thread-other").is_err());
         assert!(validate_thread_result(&json!({"thread": {}}), "thread-1").is_err());
+    }
+
+    #[test]
+    fn stable_catalog_params_use_exact_field_names_and_omit_empty_cursor() {
+        assert_eq!(
+            model_list_params(Some("cursor-1".to_owned()), Some(50), false),
+            json!({"cursor": "cursor-1", "limit": 50, "includeHidden": false})
+        );
+        assert_eq!(
+            model_list_params(Some(String::new()), None, true),
+            json!({"includeHidden": true})
+        );
+        assert_eq!(
+            skills_list_params(vec!["/repo".to_owned(), "  ".to_owned()], true),
+            json!({"cwds": ["/repo"], "forceReload": true})
+        );
+    }
+
+    #[test]
+    fn turn_start_and_steer_params_include_effort_and_exact_skill_input() {
+        let skill = AgentSkillSelection {
+            name: "review".to_owned(),
+            path: "/repo/.codex/skills/review/SKILL.md".to_owned(),
+        };
+        let start = turn_start_params(
+            "thread-1".to_owned(),
+            "check this".to_owned(),
+            Some("/repo".to_owned()),
+            Some("gpt-test".to_owned()),
+            Some("high".to_owned()),
+            vec![skill.clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            start,
+            json!({
+                "threadId": "thread-1",
+                "input": [
+                    {"type": "text", "text": "check this"},
+                    {"type": "skill", "name": "review", "path": "/repo/.codex/skills/review/SKILL.md"}
+                ],
+                "cwd": "/repo",
+                "model": "gpt-test",
+                "effort": "high"
+            })
+        );
+        assert!(start.get("reasoningEffort").is_none());
+        assert!(start.get("threadSettings").is_none());
+
+        assert_eq!(
+            turn_steer_params(
+                "thread-1".to_owned(),
+                "turn-9".to_owned(),
+                "prioritize tests".to_owned(),
+                vec![skill],
+            )
+            .unwrap(),
+            json!({
+                "threadId": "thread-1",
+                "expectedTurnId": "turn-9",
+                "input": [
+                    {"type": "text", "text": "prioritize tests"},
+                    {"type": "skill", "name": "review", "path": "/repo/.codex/skills/review/SKILL.md"}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn steer_requires_an_exact_active_turn_mapping() {
+        let mut state = WorkerState::default();
+        assert!(
+            active_turn_ids(&state, "session-1")
+                .unwrap_err()
+                .to_string()
+                .contains("thread")
+        );
+
+        state
+            .session_to_thread
+            .insert("session-1".to_owned(), "thread-1".to_owned());
+        assert!(
+            active_turn_ids(&state, "session-1")
+                .unwrap_err()
+                .to_string()
+                .contains("실행 중")
+        );
+
+        state
+            .session_to_turn
+            .insert("session-1".to_owned(), "turn-1".to_owned());
+        assert_eq!(
+            active_turn_ids(&state, "session-1").unwrap(),
+            ("thread-1".to_owned(), "turn-1".to_owned())
+        );
+        assert!(
+            turn_steer_params(
+                "thread-1".to_owned(),
+                "turn-1".to_owned(),
+                String::new(),
+                Vec::new(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn stable_model_and_skill_catalog_parsers_are_strict() {
+        let models = parse_model_catalog(&json!({
+            "data": [{
+                "id": "model-id",
+                "model": "gpt-test",
+                "displayName": "GPT Test",
+                "description": "test model",
+                "isDefault": true,
+                "defaultReasoningEffort": "medium",
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": "low", "description": "fast"},
+                    {"reasoningEffort": "medium", "description": "balanced"}
+                ]
+            }],
+            "nextCursor": "next-1"
+        }))
+        .unwrap();
+        assert_eq!(models.data[0].model, "gpt-test");
+        assert_eq!(models.data[0].default_reasoning_effort, "medium");
+        assert_eq!(
+            models.data[0].supported_reasoning_efforts[0].reasoning_effort,
+            "low"
+        );
+        assert_eq!(models.next_cursor.as_deref(), Some("next-1"));
+        assert!(
+            parse_model_catalog(&json!({
+                "data": [{
+                    "id": "bad", "model": "bad", "displayName": "Bad",
+                    "description": "bad", "isDefault": false,
+                    "defaultReasoningEffort": "low",
+                    "supportedReasoningEfforts": [{"effort": "low", "description": "wrong key"}]
+                }]
+            }))
+            .is_err()
+        );
+
+        let skills = parse_skill_catalog(&json!({
+            "data": [{
+                "cwd": "/repo",
+                "errors": [],
+                "skills": [{
+                    "name": "review", "path": "/skills/review/SKILL.md",
+                    "description": "review code", "enabled": true, "scope": "repo"
+                }]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(skills[0].cwd, "/repo");
+        assert_eq!(skills[0].scope, "repo");
+        assert!(parse_skill_catalog(&json!({"data": [{"cwd": "/repo", "skills": {}}]})).is_err());
     }
 }

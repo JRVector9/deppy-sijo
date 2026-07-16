@@ -331,17 +331,51 @@ impl AgentApprovalDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentSessionEvent {
     ConnectionReady,
-    ThreadStarted { thread_id: String },
-    ThreadStatusChanged { status: AgentThreadStatus },
-    TurnStarted { turn_id: String },
-    ItemStarted { item: AgentItem },
-    ItemDelta { item_id: String, delta: String },
-    ItemCompleted { item: AgentItem },
-    ApprovalRequested { approval: AgentApproval },
-    ApprovalResolved { request_key: String },
-    TurnCompleted { status: String },
-    Failed { message: String },
+    ThreadStarted {
+        thread_id: String,
+    },
+    ThreadStatusChanged {
+        status: AgentThreadStatus,
+    },
+    TurnStarted {
+        turn_id: String,
+    },
+    ItemStarted {
+        item: AgentItem,
+    },
+    ItemDelta {
+        item_id: String,
+        delta: String,
+    },
+    ItemCompleted {
+        item: AgentItem,
+    },
+    ApprovalRequested {
+        approval: AgentApproval,
+    },
+    ApprovalResolved {
+        request_key: String,
+    },
+    TurnCompleted {
+        status: String,
+    },
+    /// A control-plane operation (for example stale `turn/steer`) failed, but
+    /// the thread lifecycle remains authoritative and must not regress.
+    ControlError {
+        message: String,
+    },
+    Failed {
+        message: String,
+    },
     Stopped,
+}
+
+/// Stable `UserInput::Skill` reference accepted by `turn/start` and
+/// `turn/steer`. Keep only the protocol identity fields in session state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSkillSelection {
+    pub name: String,
+    pub path: String,
 }
 
 /// The stable UI-facing state of a structured agent conversation.
@@ -357,6 +391,10 @@ pub struct AgentSession {
     /// Model override retained for structured-thread recovery. `None` means
     /// the App Server chose its configured default.
     pub model: Option<String>,
+    /// Stable next-turn reasoning override. The App Server applies it to the
+    /// submitted turn and subsequent turns.
+    pub effort: Option<String>,
+    pub skills: Vec<AgentSkillSelection>,
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
     /// Latest authoritative App Server runtime state. `status` may deliberately
@@ -378,6 +416,8 @@ impl AgentSession {
             prompt,
             cwd,
             model: None,
+            effort: None,
+            skills: Vec::new(),
             thread_id: None,
             turn_id: None,
             thread_status: None,
@@ -460,6 +500,9 @@ impl AgentSession {
                     "failed" | "error" => AgentSessionStatus::Failed,
                     _ => AgentSessionStatus::Completed,
                 };
+            }
+            AgentSessionEvent::ControlError { message } => {
+                self.error = Some(limit_text(message));
             }
             AgentSessionEvent::Failed { message } => {
                 self.error = Some(limit_text(message));
@@ -1074,5 +1117,19 @@ mod tests {
         assert_eq!(session.items[1].summary, "restored answer");
         assert_eq!(session.thread_status, Some(AgentThreadStatus::Idle));
         assert_eq!(session.status, AgentSessionStatus::Ready);
+    }
+
+    #[test]
+    fn late_steer_control_error_does_not_regress_completed_status() {
+        let mut session = AgentSession::new("local-1".to_owned(), "done".to_owned(), None);
+        session.apply(AgentSessionEvent::TurnCompleted {
+            status: "completed".to_owned(),
+        });
+        session.apply(AgentSessionEvent::ControlError {
+            message: "stale expectedTurnId".to_owned(),
+        });
+
+        assert_eq!(session.status, AgentSessionStatus::Completed);
+        assert_eq!(session.error.as_deref(), Some("stale expectedTurnId"));
     }
 }

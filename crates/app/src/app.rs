@@ -1165,6 +1165,9 @@ pub struct App {
     inbox_waiting_ui: ui::inbox_waiting::InboxWaitingUi,
     /// agent-proxy 승인 팝업 (option 1.5). proxy가 DB에 쓴 pending 행을 폴링해 표시한다.
     approvals_ui: ui::approvals::ApprovalsUi,
+    /// 이미 알림을 발화한 pending 승인 id — 폴링마다 재발화하지 않기 위한 기억.
+    /// 매 폴링에서 현재 pending 집합으로 통째 교체되므로 성장하지 않는다.
+    approval_notified: std::collections::HashSet<String>,
     /// watcher가 pending approval 목록 변화를 감지하면 logic()이 한 번만 DB를 읽게 하는 플래그.
     approval_poll_requested: Arc<AtomicBool>,
     /// 외부 proxy가 DB에 쓴 pending approval 변화를 감지해 UI를 깨운다.
@@ -1485,6 +1488,7 @@ impl App {
             notifications_ui: ui::notifications::NotificationsUi::new(),
             inbox_waiting_ui: ui::inbox_waiting::InboxWaitingUi::new(),
             approvals_ui: ui::approvals::ApprovalsUi::new(),
+            approval_notified: std::collections::HashSet::new(),
             approval_poll_requested,
             approval_watcher,
             last_offscreen_fix: std::time::Instant::now(),
@@ -1980,9 +1984,13 @@ impl App {
         // v3.9 N3: 전역(모든 워크스페이스) 대기 — 같은 DB 조회 결과를 재사용해 새 쿼리
         // 없이 벨 팝오버 PTY 카드 소스를 채운다. 표시용 제목/미리보기는 팝오버가 열렸을
         // 때 build_waiting_cards가 지연 해석한다.
+        // 활성/warm 워크스페이스로 필터 — suspended는 카드도 주입도 불가능하므로 세면
+        // 뱃지 수와 카드 수가 어긋나 지울 수 없는 유령 뱃지가 된다(리뷰 P2). 뱃지와
+        // 카드가 같은 이 목록을 쓰므로 항상 일치한다.
         self.global_waiting = waiting_keys
             .iter()
             .filter_map(|k| ui::inbox_waiting::parse_session_key(k))
+            .filter(|(ws, _)| *ws == self.active.id || self.warm.contains_key(ws))
             .collect();
         // 턴 완료(Stop hook) — 확인(포커스) 시 update_session_alerts가 소비한다.
         // updated_at을 함께 들고 있다가 조건부 clear의 세대 기준으로 쓴다(레이스 방지).
@@ -4278,6 +4286,25 @@ impl App {
     fn poll_pending_approvals(&mut self) {
         match self.db.list_pending_approvals() {
             Ok(rows) => {
+                // 새로 나타난 pending은 알림으로도 얹는다(OS 알림 + 목록·뱃지) — 승인
+                // 행은 터미널에 아무것도 출력하지 않아 기존 상태 감지 경로로는 어떤
+                // 알림도 나가지 않는다(리뷰 P2: 벨을 안 보면 proxy 타임아웃까지 방치).
+                for row in &rows {
+                    if !self.approval_notified.contains(&row.id)
+                        && let Some((ws, session)) = row
+                            .pane_id
+                            .as_deref()
+                            .and_then(ui::inbox_waiting::parse_session_key)
+                    {
+                        self.notifications_ui.on_mcp_approval(
+                            &ws,
+                            session,
+                            &row.tool_name,
+                            &self.i18n,
+                        );
+                    }
+                }
+                self.approval_notified = rows.iter().map(|row| row.id.clone()).collect();
                 let remote_urls = self.approval_remote_urls(&rows);
                 self.approvals_ui.set_pending(rows, remote_urls);
             }
@@ -4453,6 +4480,13 @@ impl App {
         }
         // suspended/사라진 워크스페이스면 runtime이 없어 자연히 no-op(I1) — build_waiting_cards가
         // 애초에 그런 세션의 카드를 만들지 않으므로 정상 경로에서는 도달하지 않는다.
+        //
+        // 주입 후 낙관적으로 카드를 즉시 내린다 — hook의 waiting=0 기록 + 다음 detect
+        // tick(~2.5s)까지 카드가 남아 있으면 재클릭이 DB 재확인(아직 waiting=1)을 통과해
+        // 이중 주입된다(리뷰 P2). 진실은 다음 refresh_needs_input이 복원한다.
+        self.global_waiting
+            .retain(|(ws, s)| !(ws == workspace_id && *s == session));
+        self.egui_ctx.request_repaint();
     }
 
     /// 벨 팝오버 본문 (v3.9 N1). 설정 창과 독립 — 밖을 클릭하면 닫힌다.
@@ -4469,16 +4503,24 @@ impl App {
         const RECENT_IN_POPOVER: usize = 5;
         let mut clicked = None;
         let mut open_full = false;
+        // 벨 클릭의 Toggle은 아래 Popup::show() **내부**에서 적용된다 — is_id_open만 보면
+        // 클릭으로 여는 프레임에 카드가 1프레임 늦는다(리뷰 P3). XOR로 이번 프레임의
+        // 실제 표시 여부를 미리 계산한다.
+        let popup_open =
+            egui::Popup::is_id_open(&self.egui_ctx, Self::inbox_popup_id()) ^ bell.clicked();
         // 승인 카드마다 워크스페이스명이 필요하다(핵심 요구 — 가지 않고 판단). 표시
         // 이름은 .show() 진입 전에 소유 데이터로 미리 계산해 둔다 — closure 안에서
         // self.workspaces를 빌리면 아래 self.notifications_ui(&mut) 차용과 얽힌다.
-        let approval_workspace_names: std::collections::HashMap<String, String> = self
-            .workspaces
-            .iter()
-            .map(|w| (w.id.clone(), Self::workspace_display_name(w)))
-            .collect();
+        // 팝오버가 닫혀 있으면 만들지 않는다(idle 비용 0 원칙, 리뷰 P3).
+        let approval_workspace_names: std::collections::HashMap<String, String> = if popup_open {
+            self.workspaces
+                .iter()
+                .map(|w| (w.id.clone(), Self::workspace_display_name(w)))
+                .collect()
+        } else {
+            Default::default()
+        };
         let mut approval_decision = None;
-        let popup_open = egui::Popup::is_id_open(&self.egui_ctx, Self::inbox_popup_id());
         // PTY 입력 대기 카드 — 팝오버가 열려 있을 때만 조립한다(idle 비용 0:
         // 닫혀 있으면 tail 조회·캐시 갱신을 전혀 하지 않는다).
         let waiting_cards = popup_open.then(|| self.build_waiting_cards());
@@ -4565,7 +4607,13 @@ impl App {
             self.poll_pending_approvals();
             self.egui_ctx.request_repaint();
         }
-        clicked.or(goto)
+        let target = clicked.or(goto);
+        // [이동→]/최근 알림 클릭으로 다른 화면으로 가면 팝오버를 닫는다 — 열린 채 두면
+        // 전환된 화면 위에 계속 떠 있다(리뷰 P3).
+        if target.is_some() {
+            egui::Popup::close_id(&self.egui_ctx, Self::inbox_popup_id());
+        }
+        target
     }
 
     fn prune_resolved_approvals(&self) {

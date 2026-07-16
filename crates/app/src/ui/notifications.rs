@@ -153,6 +153,29 @@ impl NotificationsUi {
         );
     }
 
+    /// MCP-proxy 승인 대기 알림 (v3.9 리뷰 P2). 승인 행은 도구 호출이 proxy에서 블록되는
+    /// 방식이라 PTY 화면에 아무 프롬프트도 출력되지 않는다 — 상태 감지기(BUILTIN.approval
+    /// regex)가 볼 게 없어, pending 행 발견 시점에 직접 알린다(OS 알림 + 목록 항목·뱃지).
+    /// `title`은 도구 이름 — 세션 제목보다 "무엇을 승인하나"가 판단에 유용하다.
+    pub fn on_mcp_approval(
+        &mut self,
+        workspace_id: &str,
+        session: SessionId,
+        tool_name: &str,
+        catalog: &i18n::Catalog,
+    ) {
+        self.push_status(
+            AgentNotificationTarget::Pty {
+                workspace_id: workspace_id.to_owned(),
+                session,
+            },
+            AgentNotificationSource::Pty(None),
+            SessionStatus::NeedsApproval,
+            tool_name,
+            catalog,
+        );
+    }
+
     fn push_status(
         &mut self,
         target: AgentNotificationTarget,
@@ -386,7 +409,9 @@ pub fn section_label(ui: &mut egui::Ui, text: &str) {
             1.0,
             ui.visuals().widgets.noninteractive.bg_stroke.color,
         );
-        ui.label(egui::RichText::new(text).size(11.0).strong().weak());
+        // 보조 라벨 의도라 weak만 — strong과 함께 걸면 egui가 strong을 우선해
+        // weak가 조용히 무시된다(리뷰 P3).
+        ui.label(egui::RichText::new(text).size(11.0).weak());
     });
 }
 

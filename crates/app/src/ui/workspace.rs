@@ -2021,9 +2021,6 @@ impl WorkspaceUi {
         }
     }
 
-    /// 명령을 보냈거나 spawn 응답 대기 중이면 repaint를 예약한다 —
-    /// 느린 spawn(keyring 등)도 응답 이벤트가 올 때까지 폴링이 끊기지 않는다.
-    /// show()의 모든 return 경로에서 호출할 것.
     /// 「에이전트로 보내기 ▸」 서브메뉴 — 실행 중 에이전트 pane마다 (그대로 보내기 +
     /// 프리셋들), 2개 이상이면 「모든 에이전트에게 (N)」까지. 대상이 없으면 아무것도
     /// 그리지 않는다(등록만 되고 실행 중이 아닌 에이전트는 대상이 아니다 — 2026-07-17).
@@ -2088,6 +2085,9 @@ impl WorkspaceUi {
         let Some(body) = body else {
             return;
         };
+        // 클릭 처리 시점에 대상을 재확인한다 — 메뉴가 열린 사이 감지 tick(2.5s)이
+        // 에이전트를 제거했을 수 있다(stale 대상 오주입 방지, 2026-07-17 리뷰 P3).
+        send_to.retain(|session| self.agent_info.contains_key(session));
         for session in &send_to {
             self.send_agent_prompt(client, *session, &body);
         }
@@ -2098,7 +2098,10 @@ impl WorkspaceUi {
         if let Some(session) = send_to.first().filter(|_| send_to.len() == 1)
             && let Some(pane) = self.pane_of_session(*session)
         {
-            self.send(client, RuntimeCommand::FocusPane { pane });
+            // request_pane_focus로 pending_focus까지 세팅한다 — FocusPane 직접 전송은
+            // 스냅샷이 돌아올 때까지 terminal_input_owner가 이전 pane을 보므로 첫
+            // 타이핑/Enter가 소스 pane에 들어갈 수 있다(리뷰 P2).
+            self.request_pane_focus(client, pane);
         }
     }
 
@@ -2115,8 +2118,22 @@ impl WorkspaceUi {
     /// 에이전트 pane 입력창에 텍스트를 주입한다(전송은 사용자 Enter). 여러 줄이 안전하게
     /// 한 덩어리로 들어가도록 붙여넣기 경로(bracketed paste)를 그대로 쓴다 — 개행이
     /// 즉시 전송으로 해석되지 않는다.
+    ///
+    /// bracketed paste가 **꺼진** 세션(감지가 ^Z 중단·백그라운드 에이전트를 아직 대상으로
+    /// 보는 사이 셸 프롬프트로 돌아온 pane, bash 3.2 등)에는 개행을 공백으로 접어 한 줄로
+    /// 보낸다 — raw 개행은 줄마다 즉시 명령으로 실행돼 선택문 안의 문장이 셸 명령이 될 수
+    /// 있다(2026-07-17 리뷰 P1). claude/codex는 실행 중 bracketed paste를 켜므로 정상
+    /// 대상에는 영향이 없다.
     fn send_agent_prompt(&mut self, client: &dyn RuntimeClient, session: SessionId, body: &str) {
-        let bytes = terminal_text_paste_bytes(body, self.session_bracketed_paste(session));
+        let bracketed = self.session_bracketed_paste(session);
+        let folded;
+        let body = if bracketed {
+            body
+        } else {
+            folded = body.replace(['\r', '\n'], " ");
+            folded.as_str()
+        };
+        let bytes = terminal_text_paste_bytes(body, bracketed);
         self.send(client, RuntimeCommand::WriteInput { session, bytes });
     }
 
@@ -2353,6 +2370,9 @@ impl WorkspaceUi {
         std::mem::take(&mut self.open_environment_requested)
     }
 
+    /// 명령을 보냈거나 spawn 응답 대기 중이면 repaint를 예약한다 —
+    /// 느린 spawn(keyring 등)도 응답 이벤트가 올 때까지 폴링이 끊기지 않는다.
+    /// show()의 모든 return 경로에서 호출할 것.
     fn flush_command_repaint(&mut self, ctx: &egui::Context) {
         if self.command_sent || self.pending_spawns > 0 {
             self.command_sent = false;

@@ -86,6 +86,20 @@ impl InboxWaitingUi {
         session_uuid: &str,
     ) -> Option<Vec<String>> {
         let mut cache = self.tail_cache.lock().expect("tail cache lock");
+        // 상한 초과 시 가장 오래된 항목부터 버린다 — 세션이 사라져도 항목이 남는 맵이라
+        // 장기 실행에서 무한 성장한다(리뷰 P2). 대기 카드는 동시 수십 개 수준이라 넉넉.
+        const TAIL_CACHE_CAP: usize = 64;
+        while cache.len() >= TAIL_CACHE_CAP {
+            let Some(oldest) = cache
+                .iter()
+                .filter(|(_, entry)| !entry.inflight)
+                .min_by_key(|(_, entry)| entry.fetched_at)
+                .map(|(key, _)| key.clone())
+            else {
+                break; // 전부 inflight — 곧 끝난다, 이번 프레임은 그냥 둔다
+            };
+            cache.remove(&oldest);
+        }
         if let Some(entry) = cache.get(session_uuid)
             && (entry.inflight || entry.fetched_at.elapsed() < PREVIEW_CACHE_TTL)
         {
@@ -149,6 +163,14 @@ impl InboxWaitingUi {
         catalog: &i18n::Catalog,
         cards: &[WaitingCard],
     ) -> Option<WaitingAction> {
+        // 사라진 카드(대기 해소·워크스페이스 소멸)의 입력 버퍼를 정리한다 — SessionId는
+        // 워커마다 1부터 재배정되므로 방치하면 다른 논리 세션이 과거 드래프트를 물려받는다
+        // (2026-07-17 리뷰 P2). 카드가 비어도 실행해 마지막 카드 해소 시의 잔존을 막는다.
+        self.inputs.retain(|(workspace_id, session), _| {
+            cards
+                .iter()
+                .any(|card| card.workspace_id == *workspace_id && card.session == *session)
+        });
         if cards.is_empty() {
             return None;
         }
@@ -196,11 +218,18 @@ impl InboxWaitingUi {
             let buf = self.inputs.entry(input_key.clone()).or_default();
             let resp = ui.add(
                 egui::TextEdit::singleline(buf)
+                    // auto-Id는 위치 기반이라 위쪽 카드가 해소되면 포커스가 다음 카드
+                    // 입력칸으로 밀린다(다른 세션 오입력, 2026-07-17 리뷰 P2) —
+                    // 세션 고유 Id로 고정한다.
+                    .id_salt(("inbox_waiting_input", &card.workspace_id, card.session.0))
                     .desired_width(72.0)
                     .hint_text(catalog.t("inbox.waiting.answer_hint", &[])),
             );
             let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if submit {
+            // 빈 Enter는 무시한다 — 빈 reply는 PTY에 "\n"만 주입해 프롬프트의 기본
+            // 항목을 실행할 수 있다(의도치 않은 승인 효과, 리뷰 P3). 기본값 수락이
+            // 필요하면 y/n 버튼이나 [이동→]을 쓴다.
+            if submit && !buf.trim().is_empty() {
                 let reply = buf.clone();
                 self.inputs.remove(&input_key);
                 *action = Some(WaitingAction::Answer {
@@ -248,7 +277,12 @@ fn render_preview(ui: &mut egui::Ui, catalog: &i18n::Catalog, preview: Option<&[
         );
         ui.vertical(|ui| {
             for line in lines {
-                ui.label(egui::RichText::new(line).monospace().size(10.0).weak());
+                // truncate로 시각 1줄 고정 — wrap되면 좌측 bar 높이(줄 수 × row_h)와
+                // 어긋나고, 4KB 단일 줄 tail이면 카드가 수십 행으로 폭발한다(리뷰 P3).
+                ui.add(
+                    egui::Label::new(egui::RichText::new(line).monospace().size(10.0).weak())
+                        .truncate(),
+                );
             }
         });
     });
@@ -305,7 +339,14 @@ fn read_tail_lines(path: &Path, max_bytes: u64, n: usize) -> Option<Vec<String>>
     let mut buf = Vec::new();
     file.read_to_end(&mut buf).ok()?;
     let text = String::from_utf8_lossy(&buf);
-    let lines = last_lines(&text, n);
+    // 중간부터 읽었으면 첫 줄은 잘린 조각(멀티바이트 경계면 U+FFFD로 시작)이다 —
+    // 첫 개행까지 버린다(tail 관례, 리뷰 P3).
+    let text = if start > 0 {
+        text.split_once('\n').map(|(_, rest)| rest).unwrap_or("")
+    } else {
+        &text
+    };
+    let lines = last_lines(text, n);
     (!lines.is_empty()).then_some(lines)
 }
 
@@ -457,6 +498,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn read_tail_lines_중간_seek_시_잘린_첫_줄을_버린다() {
+        let path = std::env::temp_dir().join(format!(
+            "deppy-tail-seek-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "aaaa\nbbbb\ncccc\ndddd\n").unwrap();
+        // len=20, max=12 → start=8: "bb\ncccc\ndddd\n" — 첫 조각 "bb"는 버려야 한다.
+        assert_eq!(
+            read_tail_lines(&path, 12, 3),
+            Some(vec!["cccc".to_owned(), "dddd".to_owned()])
+        );
+        // 파일 전체를 읽으면(start=0) 첫 줄도 온전하다.
+        assert_eq!(
+            read_tail_lines(&path, 4096, 2),
+            Some(vec!["cccc".to_owned(), "dddd".to_owned()])
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_tail_lines_utf8_경계에서_잘려도_깨진_조각이_노출되지_않는다() {
+        let path = std::env::temp_dir().join(format!(
+            "deppy-tail-utf8-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // "가나다\n라마바\n" = 20B, start=8이 '다'(6..9)의 중간에 떨어진다.
+        std::fs::write(&path, "가나다\n라마바\n").unwrap();
+        assert_eq!(
+            read_tail_lines(&path, 12, 3),
+            Some(vec!["라마바".to_owned()])
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
     // ── kittest 상호작용 테스트 (2026-07-17) ──
     // "그 세션에 가지 않고 y/n/번호로 응답"의 UI 절반을 실제 클릭·타이핑 시뮬레이션으로
     // 자동 검증한다(주입 절반 WriteInput은 runtime 테스트가 커버).
@@ -539,6 +623,24 @@ mod tests {
         assert!(
             harness.state().0.inputs.values().all(|buf| buf.is_empty()),
             "전송 후 입력 버퍼 내용이 비워져야 한다"
+        );
+    }
+
+    #[test]
+    fn kittest_빈_입력_enter는_아무것도_보내지_않는다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let cards = vec![card(7)];
+        let mut harness = waiting_harness(&catalog, &cards);
+        harness
+            .get_by_role(egui::accesskit::Role::TextInput)
+            .click();
+        harness.run();
+        harness.key_combination(&[egui::Key::Enter]);
+        harness.run();
+        assert!(
+            harness.state().1.is_empty(),
+            "빈 reply는 PTY에 개행만 주입해 기본 항목을 실행할 수 있어 무시해야 한다"
         );
     }
 

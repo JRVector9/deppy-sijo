@@ -29,7 +29,7 @@ tungstenite = { workspace = true, features = ["handshake"] }
 # 기존 web-push 크레이트는 hyper(async) 의존이라 배제 — 여기 수제 구현(RFC 8291/8292 벡터로 검증).
 p256 = { version = "0.13", features = ["ecdh"] }
 hkdf = "0.12"
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 base64 = "0.22"
 getrandom = "0.2"
 sha2 = { workspace = true }

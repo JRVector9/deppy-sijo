@@ -16,6 +16,10 @@ use crate::prompt_marks::PromptMarks;
 
 /// 한 pump에 backend로 넘기는 PTY 출력 상한 (호출 스레드 독점 방지)
 const FEED_PER_PUMP_CAP: usize = 256 * 1024;
+
+/// 마지막 명령 출력 추출 상한 (셸 통합 2단계). 초과 시 앞(오래된)쪽을 버리고 뒤를
+/// 남긴다 — 최근 출력이 판단에 더 중요하다.
+const LAST_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 /// EOF 후 exit code를 못 받은 채 전이를 유예할 최대 pump tick 수.
 /// EOF 직후엔 wait이 아직 안 끝난 race가 흔하다 — tick 간격으로 재시도하되
 /// (worker를 sleep으로 막지 않는다), 이 상한을 넘으면 exit_code=None으로 마감한다.
@@ -435,6 +439,46 @@ impl Session {
             self.backend.scroll(delta);
             self.mark_full_dirty();
         }
+    }
+
+    /// OSC 133 C~D 마크 범위의 마지막 명령 출력 텍스트 (셸 통합 2단계 — pane 메뉴
+    /// 「마지막 출력 복사/에이전트로」). 반환 `(text, truncated)`. 마크가 없거나 범위가
+    /// 비면 빈 text — 판정(알림)은 UI 몫. 최신 라인부터 위로 모아 64KB 상한이나 트림
+    /// 경계에 닿으면 멈춘다 — 뒤(최근)쪽이 남는다. 텍스트 읽기는 T3 검색과 같은 backend
+    /// grid 경로([`terminal::TerminalBackend::line_text_back_from_cursor`]).
+    pub fn extract_last_output(&self) -> (String, bool) {
+        let Some((start_back, end_back)) = self.prompt_marks.last_output_back_range() else {
+            return (String::new(), false);
+        };
+        let mut pieces: Vec<(String, bool)> = Vec::new();
+        let mut bytes = 0usize;
+        let mut truncated = false;
+        for back in end_back..=start_back {
+            // 트림된 라인/미지원 백엔드는 None — 모은 최근 라인까지만.
+            let Some((text, wrapped)) = self
+                .backend
+                .line_text_back_from_cursor(usize::try_from(back).unwrap_or(usize::MAX))
+            else {
+                break;
+            };
+            bytes += text.len() + 1;
+            pieces.push((text, wrapped));
+            if bytes > LAST_OUTPUT_MAX_BYTES {
+                truncated = true;
+                break;
+            }
+        }
+        // 최신→과거로 모았으니 뒤집어 조립 — soft wrap 라인은 개행 없이 잇는다.
+        let mut out = String::new();
+        let mut newline_before_next = false;
+        for (text, wrapped) in pieces.iter().rev() {
+            if newline_before_next {
+                out.push('\n');
+            }
+            out.push_str(text);
+            newline_before_next = !wrapped;
+        }
+        (out, truncated)
     }
 
     /// 가시성에 따라 scrollback 상한 조정 (§14.3). 전이 시에만 호출할 것.
@@ -896,6 +940,72 @@ mod tests {
         // 다음 마크(prompt-2)는 이미 현재 위치(델타 0) — 스크롤 유지.
         session.scroll_to_prompt(1);
         assert_eq!(session.take_snapshot().unwrap().scroll_offset, 0);
+    }
+
+    /// 셸 통합 2단계: C~D 마크 범위의 출력 추출. 화면(24행)이 다 안 찬 프레시 셸도
+    /// 커서 기준이라 정확하다.
+    #[test]
+    #[cfg(unix)]
+    fn 마지막_출력을_추출한다() {
+        let spec = CommandSpec {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                concat!(
+                    "printf '\\033]133;A\\007$ cmd\\n\\033]133;C\\007'; ",
+                    "echo out-1; echo out-2; ",
+                    "printf '\\033]133;D;0\\007\\033]133;A\\007ready\\n'; sleep 30"
+                )
+                .into(),
+            ],
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(31), SessionKind::Shell, &spec, 80, 24, 1000)
+                .unwrap();
+        wait(Duration::from_secs(5), || {
+            session.pump(|_| {});
+            session.screen_text().contains("ready").then_some(())
+        });
+        let (text, truncated) = session.extract_last_output();
+        assert_eq!(text, "out-1\nout-2");
+        assert!(!truncated);
+    }
+
+    /// 64KB 상한 — 초과분은 앞(오래된)쪽부터 버려지고 truncated가 선다.
+    #[test]
+    #[cfg(unix)]
+    fn 마지막_출력_추출은_상한_초과_시_뒤쪽을_남긴다() {
+        let spec = CommandSpec {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                concat!(
+                    "printf '\\033]133;C\\007'; ",
+                    "i=0; while [ $i -lt 1000 ]; do printf 'line-%04d-%060d\\n' $i 7; ",
+                    "i=$((i+1)); done; ",
+                    "printf '\\033]133;D;0\\007\\033]133;A\\007ready\\n'; sleep 30"
+                )
+                .into(),
+            ],
+            env: Vec::new(),
+            cwd: None,
+        };
+        // 라인 70자 × 1000 = 70KB > 64KB. cols 120이라 wrap 없음, scrollback은 충분히.
+        let mut session =
+            Session::spawn_with_spec(SessionId(32), SessionKind::Shell, &spec, 120, 24, 2000)
+                .unwrap();
+        wait(Duration::from_secs(10), || {
+            session.pump(|_| {});
+            session.screen_text().contains("ready").then_some(())
+        });
+        let (text, truncated) = session.extract_last_output();
+        assert!(truncated);
+        assert!(text.len() <= LAST_OUTPUT_MAX_BYTES + 128, "{}", text.len());
+        // 뒤(최근)쪽이 남는다 — 마지막 라인은 있고 첫 라인은 잘렸다.
+        assert!(text.ends_with(&format!("line-0999-{:060}", 7)), "잘림 방향");
+        assert!(!text.contains("line-0000-"));
     }
 
     #[test]

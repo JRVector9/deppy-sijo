@@ -1,7 +1,7 @@
-//! OSC 133 프롬프트 마크 (셸 통합 1단계 — 2026-07-17).
+//! OSC 133 프롬프트 마크 (셸 통합 1단계 — 2026-07-17. 2단계에서 C/D 추가).
 //!
-//! zdot 래퍼(app crate env_reload.rs)의 zsh precmd 훅이 프롬프트 직전에
-//! `ESC]133;A BEL`을 쏘고, 이 스캐너가 PTY 출력 스트림에서 그 마크를 찾아
+//! zdot 래퍼(app crate env_reload.rs)의 zsh 훅이 precmd에서 `133;D;<exit>`+`133;A`,
+//! preexec에서 `133;C`를 쏘고, 이 스캐너가 PTY 출력 스트림에서 그 마크들을 찾아
 //! **절대 라인 번호**로 저장한다. 스캐너는 storage::logs의 StripState와 같은
 //! "chunk 경계에 안전한 상태머신" 문제를 푼다 — 그 모델을 133 전용으로 축소했다.
 //!
@@ -35,6 +35,17 @@ enum ScanPhase {
     OscEsc,
 }
 
+/// OSC 133 마크 종류 (셸 통합 2단계 — C/D 추가. zdot 훅: precmd D+A, preexec C).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkKind {
+    /// `133;A` — 프롬프트 시작 (프롬프트 점프 대상, 1단계).
+    PromptStart,
+    /// `133;C` — 명령 출력 시작 (preexec — Enter 직후의 새 라인).
+    OutputStart,
+    /// `133;D[;exit]` — 명령 종료 (precmd — 다음 프롬프트가 그려질 라인).
+    CommandDone,
+}
+
 /// OSC 133 스캐너 + 마크 저장소. [`crate::Session`]이 pump마다 출력 chunk를 넘긴다.
 #[derive(Debug, Default)]
 pub(crate) struct PromptMarks {
@@ -51,6 +62,9 @@ pub(crate) struct PromptMarks {
     line: u64,
     /// 프롬프트 시작(133;A) 마크의 절대 라인 번호 — 오래된 순.
     marks: VecDeque<u64>,
+    /// 출력 경계(C 시작/D 종료) 마크 — (종류, 절대 라인), 오래된 순. A와 분리 보관해
+    /// C/D가 프롬프트 점프 마크를 밀어내지 않는다 (상한·좌표 규칙은 동일).
+    output_marks: VecDeque<(MarkKind, u64)>,
 }
 
 impl PromptMarks {
@@ -117,21 +131,67 @@ impl PromptMarks {
         }
     }
 
-    /// OSC 종결 — payload가 `133;A`(옵션 파라미터 `133;A;…` 허용)면 마크로 기록한다.
+    /// OSC 종결 — payload가 `133;A|C|D`(옵션 파라미터 `133;X;…` 허용)면 마크로
+    /// 기록한다. head는 [`OSC_HEAD_CAP`]에서 잘리므로 "133;D;0"도 "133;D;"로 판별된다.
     fn finish_osc(&mut self) {
         self.phase = ScanPhase::Ground;
         let head = &self.osc_head[..self.osc_len as usize];
-        if head != b"133;A" && head != b"133;A;" {
-            return;
+        let kind = match head {
+            b"133;A" | b"133;A;" => MarkKind::PromptStart,
+            b"133;C" | b"133;C;" => MarkKind::OutputStart,
+            b"133;D" | b"133;D;" => MarkKind::CommandDone,
+            _ => return,
+        };
+        match kind {
+            MarkKind::PromptStart => {
+                // 같은 라인의 중복 마크(redraw 등)는 한 번만.
+                if self.marks.back() == Some(&self.line) {
+                    return;
+                }
+                if self.marks.len() >= MAX_PROMPT_MARKS {
+                    self.marks.pop_front();
+                }
+                self.marks.push_back(self.line);
+            }
+            MarkKind::OutputStart | MarkKind::CommandDone => {
+                if self.output_marks.back() == Some(&(kind, self.line)) {
+                    return;
+                }
+                if self.output_marks.len() >= MAX_PROMPT_MARKS {
+                    self.output_marks.pop_front();
+                }
+                self.output_marks.push_back((kind, self.line));
+            }
         }
-        // 같은 라인의 중복 마크(redraw 등)는 한 번만.
-        if self.marks.back() == Some(&self.line) {
-            return;
+    }
+
+    /// 마지막 명령 출력의 라인 범위 — "현재 라인에서 몇 라인 위인가"(back) 좌표로
+    /// `(start_back, end_back)`, start_back ≥ end_back(둘 다 포함). 마지막 C(출력 시작)
+    /// 라인부터 그 뒤 첫 D(명령 종료) **직전** 라인까지 — D 라인에는 다음 프롬프트가
+    /// 그려진다. D가 아직 없으면(실행 중) 현재 라인까지. wrapped 시각 라인 오차는
+    /// 점프와 같은 베스트 에포트. alt screen(vim/less) 중에는 None — 마크 좌표는
+    /// main screen 것이라 alt grid 텍스트와 맞지 않는다.
+    pub(crate) fn last_output_back_range(&self) -> Option<(u64, u64)> {
+        if self.alt_screen {
+            return None;
         }
-        if self.marks.len() >= MAX_PROMPT_MARKS {
-            self.marks.pop_front();
+        let c_idx = self
+            .output_marks
+            .iter()
+            .rposition(|(kind, _)| *kind == MarkKind::OutputStart)?;
+        let c_line = self.output_marks[c_idx].1;
+        let end_exclusive = self
+            .output_marks
+            .iter()
+            .skip(c_idx + 1)
+            .find(|(kind, _)| *kind == MarkKind::CommandDone)
+            .map(|(_, line)| *line)
+            .unwrap_or(self.line + 1);
+        // C와 D가 같은 라인 = 출력 없는 명령 — 빈 범위.
+        if c_line >= end_exclusive {
+            return None;
         }
-        self.marks.push_back(self.line);
+        Some((self.line - c_line, self.line + 1 - end_exclusive))
     }
 
     /// 이전(−)/다음(+) 프롬프트로 가는 스크롤 델타 (양수 = 과거로 — Scroll 관례).
@@ -241,6 +301,59 @@ mod tests {
         // history 20 + rows 10 = 총 30라인만 남음 — 라인 0의 old 마크(b=102)는 제거
         assert_eq!(marks.jump_delta(-1, 0, 10, 20), None);
         assert_eq!(marks.mark_count(), 1);
+    }
+
+    #[test]
+    fn c_d_마크는_출력_경계로_기록되고_점프_마크는_무변경이다() {
+        let mut marks = PromptMarks::default();
+        marks.scan(b"\x1b]133;A\x07$ cmd\n\x1b]133;C\x07out\n\x1b]133;D;0\x07\x1b]133;A\x07");
+        // 점프 대상은 여전히 A만 (1단계 동작 무변경).
+        assert_eq!(marks.marks, [0, 2]);
+        assert_eq!(
+            marks.output_marks,
+            [(MarkKind::OutputStart, 1), (MarkKind::CommandDone, 2)]
+        );
+    }
+
+    #[test]
+    fn 출력_마크도_상한을_넘으면_오래된_것부터_버린다() {
+        let mut marks = PromptMarks::default();
+        for _ in 0..(MAX_PROMPT_MARKS + 10) {
+            marks.scan(b"\x1b]133;C\x07out\n\x1b]133;D;0\x07prompt\n");
+        }
+        assert_eq!(marks.output_marks.len(), MAX_PROMPT_MARKS);
+    }
+
+    #[test]
+    fn 마지막_출력_범위는_c부터_d_직전_라인까지다() {
+        let mut marks = PromptMarks::default();
+        // 완료된 명령: C(라인 1) → out1(1)/out2(2) → D(라인 3). 현재 라인 3.
+        marks
+            .scan(b"\x1b]133;A\x07$ a\n\x1b]133;C\x07out1\nout2\n\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        // back 좌표: out1 = 3−1 = 2, out2 = 3−2 = 1.
+        assert_eq!(marks.last_output_back_range(), Some((2, 1)));
+    }
+
+    #[test]
+    fn d가_없으면_현재_라인까지가_출력_범위다() {
+        let mut marks = PromptMarks::default();
+        marks.scan(b"\x1b]133;C\x07running\npartial");
+        // C 라인 0, 현재 라인 1(부분 출력) — back (1, 0).
+        assert_eq!(marks.last_output_back_range(), Some((1, 0)));
+    }
+
+    #[test]
+    fn 마크가_없거나_출력이_없으면_범위도_없다() {
+        let mut marks = PromptMarks::default();
+        assert_eq!(marks.last_output_back_range(), None);
+        // 출력 없는 명령 — C와 D가 같은 라인.
+        marks.scan(b"\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07");
+        assert_eq!(marks.last_output_back_range(), None);
+        // alt screen 중에는 마크 좌표가 alt grid와 안 맞는다 — None, 복귀하면 재개.
+        marks.scan(b"\x1b]133;C\x07out\n\x1b[?1049h");
+        assert_eq!(marks.last_output_back_range(), None);
+        marks.scan(b"\x1b[?1049l");
+        assert_eq!(marks.last_output_back_range(), Some((1, 0)));
     }
 
     /// 점프 수식은 T3 검색(app ui/workspace.rs)의 스크롤 수식과 동치다:

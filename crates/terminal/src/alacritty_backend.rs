@@ -555,6 +555,47 @@ impl TerminalBackend for AlacrittyBackend {
         }
     }
 
+    /// 커서 기준 `back` 라인 위의 텍스트 (셸 통합 2단계 — 마지막 출력 추출).
+    /// 셀 읽기는 search_scrollback과 동일한 규칙, wrapped 판정은 serialize_scrollback과
+    /// 동일하게 마지막 열의 WRAPLINE flag.
+    fn line_text_back_from_cursor(&self, back: usize) -> Option<(String, bool)> {
+        let cols = self.term.columns();
+        let history = self.term.history_size();
+        let back = i32::try_from(back).ok()?;
+        // cursor.point.line은 화면 좌표(0=최상단) — display_offset(스크롤)과 무관하다.
+        let line_idx = self.term.grid().cursor.point.line.0 - back;
+        if cols == 0 || line_idx < -(history as i32) {
+            return None; // 스크롤백 밖으로 트림된 라인
+        }
+        let line = &self.term.grid()[alacritty_terminal::index::Line(line_idx)];
+        let wrapped = line[alacritty_terminal::index::Column(cols - 1)]
+            .flags
+            .contains(Flags::WRAPLINE);
+        let mut out = String::with_capacity(cols);
+        for col in 0..cols {
+            let cell = &line[alacritty_terminal::index::Column(col)];
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            // conceal(SGR 8)은 화면과 동일하게 공백 취급 (search_scrollback 관례)
+            if cell.flags.contains(Flags::HIDDEN) {
+                out.push(' ');
+            } else {
+                out.push(cell.c);
+                if let Some(zerowidth) = cell.zerowidth() {
+                    out.extend(zerowidth.iter().copied());
+                }
+            }
+        }
+        if !wrapped {
+            out.truncate(out.trim_end().len());
+        }
+        Some((out, wrapped))
+    }
+
     fn screen_text(&self) -> String {
         // 셀 벡터/Arc 할당 없이 문자만 모은다 — snapshot이 아니다.
         // display_iter는 스크롤된 viewport를 반영하므로 쓰지 않는다 —
@@ -1017,6 +1058,39 @@ mod tests {
         assert_eq!(result.matches.len(), 10);
         // 최신 10개 = line_from_bottom 0..10 근방 (화면 최하단 우선)
         assert!(result.matches.iter().all(|m| m.line_from_bottom < 12));
+    }
+
+    /// 셸 통합 2단계: 마지막 출력 추출은 grid 최하단이 아니라 **커서** 기준이다 —
+    /// 화면이 아직 안 찬 프레시 셸의 첫 명령에서도 정확해야 한다.
+    #[test]
+    fn line_text_back_from_cursor는_커서_기준으로_위_라인을_읽는다() {
+        let mut b = AlacrittyBackend::new(10, 5, 100);
+        feed(&mut b, b"one\r\ntwo\r\nthree");
+        assert_eq!(
+            b.line_text_back_from_cursor(0),
+            Some(("three".to_owned(), false))
+        );
+        assert_eq!(
+            b.line_text_back_from_cursor(2),
+            Some(("one".to_owned(), false))
+        );
+        // history가 없으니 커서 위 3번째 라인은 범위 밖 — None.
+        assert_eq!(b.line_text_back_from_cursor(3), None);
+    }
+
+    #[test]
+    fn line_text_back_from_cursor는_wrapped_라인을_표시한다() {
+        let mut b = AlacrittyBackend::new(4, 5, 100);
+        feed(&mut b, b"abcdef\r\ng");
+        // "abcdef"는 4열에서 "abcd"/"ef" 두 시각 라인 — 위쪽이 soft wrap.
+        assert_eq!(
+            b.line_text_back_from_cursor(2),
+            Some(("abcd".to_owned(), true))
+        );
+        assert_eq!(
+            b.line_text_back_from_cursor(1),
+            Some(("ef".to_owned(), false))
+        );
     }
 
     /// B-1 회귀: SGR 속성(bold/italic/underline/strikeout/dim)이 스냅샷에 실려야 한다.

@@ -3043,6 +3043,7 @@ mod tests {
             RuntimeEvent::PtyInputPressure { .. } => "PtyInputPressure",
             RuntimeEvent::SessionRestored { .. } => "SessionRestored",
             RuntimeEvent::ScrollbackSearchResult { .. } => "ScrollbackSearchResult",
+            RuntimeEvent::LastOutputExtracted { .. } => "LastOutputExtracted",
         }
     }
 

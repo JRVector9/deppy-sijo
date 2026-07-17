@@ -1204,6 +1204,18 @@ impl Worker {
                     active.scroll_to_prompt(direction);
                 }
             }
+            RuntimeCommand::ExtractLastOutput { session } => {
+                // 추출(마크 좌표 ↔ backend 텍스트)은 세션 소유. 마크가 없으면 빈 text로
+                // 회신한다 — 복원 세션/훅 없는 셸의 판정·알림은 UI 몫 (조용한 실패 금지).
+                if let Some(active) = self.sessions.get(&session) {
+                    let (text, truncated) = active.extract_last_output();
+                    self.emit(RuntimeEvent::LastOutputExtracted {
+                        session,
+                        text,
+                        truncated,
+                    });
+                }
+            }
             RuntimeCommand::SearchScrollback {
                 session,
                 query,
@@ -3224,6 +3236,70 @@ mod tests {
             } if *s == session && snapshot.scroll_offset == 0 => Some(()),
             _ => None,
         });
+    }
+
+    /// 셸 통합 2단계: C/D 마크를 심은 세션에 ExtractLastOutput을 보내면
+    /// LastOutputExtracted로 C~D 범위 텍스트가 돌아온다 (ScrollToPrompt 통합 테스트 관례).
+    #[test]
+    #[cfg(unix)]
+    fn extract_last_output는_마지막_명령_출력을_돌려준다() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("last-output"),
+            RedactionService::new(),
+            spec(
+                "/bin/sh",
+                &[
+                    "-c",
+                    concat!(
+                        "printf '\\033]133;A\\007$ cmd\\n\\033]133;C\\007'; ",
+                        "echo out-1; echo out-2; ",
+                        "printf '\\033]133;D;0\\007\\033]133;A\\007ready\\n'; sleep 30"
+                    ),
+                ],
+            ),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 5,
+                scrollback_lines: 1000,
+            })
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            _ => None,
+        });
+        // 마지막 마크 뒤 텍스트까지 반영된 뒤에 추출한다.
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::Viewport {
+                session: s,
+                snapshot,
+                ..
+            } if *s == session
+                && (0..5).any(|row| snapshot_text(snapshot, row).contains("ready")) =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
+
+        client
+            .send_command(RuntimeCommand::ExtractLastOutput { session })
+            .unwrap();
+        let (text, truncated) = probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::LastOutputExtracted {
+                session: s,
+                text,
+                truncated,
+            } if *s == session => Some((text.clone(), *truncated)),
+            _ => None,
+        });
+        assert_eq!(text, "out-1\nout-2");
+        assert!(!truncated);
     }
 
     #[test]

@@ -207,6 +207,17 @@ pub trait TerminalBackend {
         let _ = (query, max_matches);
         ScrollbackSearchResult::empty()
     }
+
+    /// 커서 라인에서 `back` 시각 라인 위의 텍스트 한 줄 — 마지막 출력 추출용 (셸 통합
+    /// 2단계). 반환 `(텍스트, soft_wrapped)` — wrapped면 다음(아래) 라인과 개행 없이
+    /// 이어진다. 셀 해석(wide spacer 스킵, conceal→공백)은 search_scrollback과 동일하고
+    /// trailing 공백은 wrapped가 아닐 때만 잘라낸다. 화면이 아직 안 찬 프레시 셸에서도
+    /// 정확하도록 grid 최하단이 아니라 **커서 라인**이 기준이다.
+    /// 범위 밖(스크롤백 트림)이나 미지원 백엔드는 None.
+    fn line_text_back_from_cursor(&self, back: usize) -> Option<(String, bool)> {
+        let _ = back;
+        None
+    }
 }
 
 #[cfg(test)]

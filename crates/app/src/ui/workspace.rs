@@ -127,6 +127,13 @@ pub struct WorkspaceUi {
     /// 터미널 텍스트 검색 상태 (T3). Cmd+F로 열리고, 열려 있으면 focused pane 우상단에
     /// 검색 바를 그린다. 한 번에 한 세션만 검색한다.
     search: Option<TerminalSearch>,
+    /// 「마지막 출력 …」 pending intent (셸 통합 2단계) — ExtractLastOutput 응답이 오면
+    /// handle_events가 실행한다. 세션당 1칸(새 요청이 교체), 세션 소멸 시 MuxUpdated에서
+    /// 정리한다.
+    last_output_intents: HashMap<SessionId, LastOutputIntent>,
+    /// handle_events가 예약한 「마지막 출력 복사」 텍스트 — 그 자리엔 egui Context가
+    /// 없어 show()가 같은 프레임에 ctx.copy_text로 수행한다.
+    pending_copy: Option<String>,
     /// 이번 프레임에 그린 pane들의 렌더 카운터 합 (B1 실측). show() 시작에서 리셋하고
     /// pane마다 누적한다 — 정수 덧셈뿐이라 게이트 없이 항상 집계한다.
     frame_counters: renderer_egui::RenderCounters,
@@ -134,6 +141,18 @@ pub struct WorkspaceUi {
 
 /// 터미널 검색 매치 수 상한 (T3) — worker에 보내는 요청 상한. 도달 시 결과가 잘린다.
 const SEARCH_MAX_MATCHES: u32 = 1000;
+
+/// 「마지막 출력 …」 메뉴가 예약한 후속 동작 (셸 통합 2단계) — ExtractLastOutput 응답
+/// (LastOutputExtracted)이 오면 handle_events가 실행한다.
+enum LastOutputIntent {
+    /// 클립보드로 복사 (pending_copy 경유 — show()가 ctx로 수행).
+    Copy,
+    /// 에이전트 pane 입력창에 주입 — preset이 있으면 `"{preset}:\n{출력}"`.
+    SendToAgent {
+        targets: Vec<SessionId>,
+        preset: Option<String>,
+    },
+}
 
 /// 터미널 텍스트 검색 세션 상태 (T3).
 struct TerminalSearch {
@@ -235,6 +254,8 @@ impl WorkspaceUi {
             error: None,
             error_is_pressure: false,
             search: None,
+            last_output_intents: HashMap::new(),
+            pending_copy: None,
             frame_counters: renderer_egui::RenderCounters::default(),
         }
     }
@@ -779,6 +800,7 @@ impl WorkspaceUi {
                     let alive = mux_sessions(snapshot);
                     self.sessions.retain(|id, _| alive.contains(id));
                     self.sent_sizes.retain(|id, _| alive.contains(id));
+                    self.last_output_intents.retain(|id, _| alive.contains(id));
                     // 검색 중인 세션이 사라지면 검색 바를 닫는다.
                     if self
                         .search
@@ -953,6 +975,35 @@ impl WorkspaceUi {
                         search.scroll_to_current = !search.matches.is_empty();
                     }
                 }
+                RuntimeEvent::LastOutputExtracted {
+                    session,
+                    text,
+                    truncated,
+                } => {
+                    // intent가 없으면 stale 응답(세션 소멸/교체) — 무시.
+                    let Some(intent) = self.last_output_intents.remove(session) else {
+                        continue;
+                    };
+                    if text.is_empty() {
+                        // 마크 없음(복원 세션·훅 없는 셸·alt screen) 또는 출력 없는 명령 —
+                        // 조용한 실패 금지, 1회 알림.
+                        platform::notify(&catalog.t("shell.no_output_marks", &[]), "");
+                        continue;
+                    }
+                    if *truncated {
+                        tracing::debug!("마지막 출력이 64KB 상한으로 잘림 — 뒤쪽만 유지");
+                    }
+                    match intent {
+                        LastOutputIntent::Copy => self.pending_copy = Some(text.clone()),
+                        LastOutputIntent::SendToAgent { targets, preset } => {
+                            let body = match &preset {
+                                None => text.clone(),
+                                Some(preset) => format!("{preset}:\n{text}"),
+                            };
+                            self.dispatch_agent_prompt(client, targets, &body);
+                        }
+                    }
+                }
             }
         }
     }
@@ -974,6 +1025,10 @@ impl WorkspaceUi {
         self.native_printable_key_downs = native_key_downs.printable;
         self.native_clipboard_paste_requested = native_key_downs.clipboard_paste;
         self.handle_events(client, events, catalog);
+        // 「마지막 출력 복사」 — handle_events에는 Context가 없어 여기서 수행한다.
+        if let Some(text) = self.pending_copy.take() {
+            ui.ctx().copy_text(text);
+        }
         self.poll_paste_task(client);
 
         // 탭바 제거 (2026-07-05): 셸 전환은 좌측 사이드바 세션 목록이 담당하고,
@@ -2033,20 +2088,10 @@ impl WorkspaceUi {
         }
     }
 
-    /// 「에이전트로 보내기 ▸」 서브메뉴 — 실행 중 에이전트 pane마다 (그대로 보내기 +
-    /// 프리셋들), 2개 이상이면 「모든 에이전트에게 (N)」까지. 대상이 없으면 아무것도
-    /// 그리지 않는다(등록만 되고 실행 중이 아닌 에이전트는 대상이 아니다 — 2026-07-17).
-    fn send_to_agent_menu(
-        &mut self,
-        ui: &mut egui::Ui,
-        selection: &str,
-        client: &dyn RuntimeClient,
-        catalog: &i18n::Catalog,
-    ) {
-        // 실행 중 에이전트 = 감지 워커가 채운 agent_info의 세션들. 표시 순서를 프레임마다
-        // 흔들지 않게 mux pane 순서로 정렬한다.
-        let targets: Vec<(SessionId, String)> = self
-            .mux
+    /// 실행 중 에이전트 pane 대상 목록 — 감지 워커가 채운 agent_info의 세션들.
+    /// 표시 순서를 프레임마다 흔들지 않게 mux pane 순서로 정렬한다.
+    fn agent_send_targets(&self) -> Vec<(SessionId, String)> {
+        self.mux
             .iter()
             .flat_map(|mux| mux.tabs.iter().flat_map(|tab| &tab.panes))
             .filter_map(|pane| {
@@ -2054,21 +2099,28 @@ impl WorkspaceUi {
                 let line = self.agent_line_for(session)?;
                 Some((session, line))
             })
-            .collect();
-        if targets.is_empty() {
-            return;
-        }
-        let mut send_to: Vec<SessionId> = Vec::new();
-        let mut body: Option<String> = None;
-        ui.menu_button(catalog.t("workspace.menu.send_agent", &[]), |ui| {
-            for (session, agent_line) in &targets {
+            .collect()
+    }
+
+    /// 대상×프리셋 서브메뉴를 그리고 선택을 돌려준다 — 「에이전트로 보내기」(선택 텍스트)
+    /// 와 「마지막 출력을 에이전트로」(셸 통합 2단계)가 같은 구조를 공유한다.
+    /// 반환: (보낼 세션들, 프리셋 — None이면 그대로 보내기).
+    fn draw_agent_send_menu(
+        &self,
+        ui: &mut egui::Ui,
+        title: String,
+        targets: &[(SessionId, String)],
+        catalog: &i18n::Catalog,
+    ) -> Option<(Vec<SessionId>, Option<String>)> {
+        let mut choice: Option<(Vec<SessionId>, Option<String>)> = None;
+        ui.menu_button(title, |ui| {
+            for (session, agent_line) in targets {
                 ui.label(egui::RichText::new(agent_line).small().weak());
                 if ui
                     .button(catalog.t("workspace.menu.send_agent.raw", &[]))
                     .clicked()
                 {
-                    send_to = vec![*session];
-                    body = Some(selection.to_owned());
+                    choice = Some((vec![*session], None));
                     ui.close();
                 }
                 // 빈 항목은 건너뛴다 — 설정에서 "추가"만 누르고 안 채운 경우 메뉴에
@@ -2079,8 +2131,7 @@ impl WorkspaceUi {
                     .filter(|p| !p.trim().is_empty())
                 {
                     if ui.button(format!("\"{preset}\"")).clicked() {
-                        send_to = vec![*session];
-                        body = Some(format!("{preset}:\n{selection}"));
+                        choice = Some((vec![*session], Some(preset.clone())));
                         ui.close();
                     }
                 }
@@ -2095,19 +2146,27 @@ impl WorkspaceUi {
                     ))
                     .clicked()
             {
-                send_to = targets.iter().map(|(session, _)| *session).collect();
-                body = Some(selection.to_owned());
+                choice = Some((targets.iter().map(|(session, _)| *session).collect(), None));
                 ui.close();
             }
         });
-        let Some(body) = body else {
-            return;
-        };
-        // 클릭 처리 시점에 대상을 재확인한다 — 메뉴가 열린 사이 감지 tick(2.5s)이
-        // 에이전트를 제거했을 수 있다(stale 대상 오주입 방지, 2026-07-17 리뷰 P3).
+        choice
+    }
+
+    /// 본문을 대상 에이전트들에 주입하고 단일 대상이면 pane 포커스까지 옮긴다 —
+    /// 메뉴 클릭(선택 텍스트)과 LastOutputExtracted 응답(추출 텍스트)의 공용 후반부.
+    fn dispatch_agent_prompt(
+        &mut self,
+        client: &dyn RuntimeClient,
+        mut send_to: Vec<SessionId>,
+        body: &str,
+    ) {
+        // 주입 시점에 대상을 재확인한다 — 메뉴가 열린(또는 추출 응답을 기다린) 사이 감지
+        // tick(2.5s)이 에이전트를 제거했을 수 있다(stale 대상 오주입 방지, 2026-07-17
+        // 리뷰 P3).
         send_to.retain(|session| self.agent_info.contains_key(session));
         for session in &send_to {
-            self.send_agent_prompt(client, *session, &body);
+            self.send_agent_prompt(client, *session, body);
         }
         // 단일 대상이면 그 pane으로 포커스를 옮겨 Enter만 치면 되게 한다. **자동 전송은
         // 하지 않는다** — 보내기 전에 프롬프트를 다듬을 수 있어야 한다(확정 사항).
@@ -2120,6 +2179,77 @@ impl WorkspaceUi {
             // 스냅샷이 돌아올 때까지 terminal_input_owner가 이전 pane을 보므로 첫
             // 타이핑/Enter가 소스 pane에 들어갈 수 있다(리뷰 P2).
             self.request_pane_focus(client, pane);
+        }
+    }
+
+    /// 「에이전트로 보내기 ▸」 서브메뉴 — 실행 중 에이전트 pane마다 (그대로 보내기 +
+    /// 프리셋들), 2개 이상이면 「모든 에이전트에게 (N)」까지. 대상이 없으면 아무것도
+    /// 그리지 않는다(등록만 되고 실행 중이 아닌 에이전트는 대상이 아니다 — 2026-07-17).
+    /// 그리기/선택은 draw_agent_send_menu, 주입/포커스는 dispatch_agent_prompt로 분리
+    /// (셸 통합 2단계에서 「마지막 출력을 에이전트로」와 공유 — 동작 무변경).
+    fn send_to_agent_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        selection: &str,
+        client: &dyn RuntimeClient,
+        catalog: &i18n::Catalog,
+    ) {
+        let targets = self.agent_send_targets();
+        if targets.is_empty() {
+            return;
+        }
+        let Some((send_to, preset)) = self.draw_agent_send_menu(
+            ui,
+            catalog.t("workspace.menu.send_agent", &[]),
+            &targets,
+            catalog,
+        ) else {
+            return;
+        };
+        let body = match &preset {
+            None => selection.to_owned(),
+            Some(preset) => format!("{preset}:\n{selection}"),
+        };
+        self.dispatch_agent_prompt(client, send_to, &body);
+    }
+
+    /// 「마지막 출력 복사 / 마지막 출력을 에이전트로 ▸」 (셸 통합 2단계) — 드래그 선택
+    /// 없이 OSC 133 C~D 범위를 워커에서 추출한다. 클릭 시 intent를 저장하고 추출을
+    /// 요청한다 — 응답(LastOutputExtracted)은 handle_events가 intent대로 실행한다.
+    fn last_output_menu_items(
+        &mut self,
+        ui: &mut egui::Ui,
+        session: SessionId,
+        client: &dyn RuntimeClient,
+        catalog: &i18n::Catalog,
+    ) {
+        if ui
+            .button(catalog.t("workspace.menu.copy_last_output", &[]))
+            .clicked()
+        {
+            self.last_output_intents
+                .insert(session, LastOutputIntent::Copy);
+            self.send(client, RuntimeCommand::ExtractLastOutput { session });
+            ui.close();
+        }
+        // 「에이전트로 보내기」와 같은 대상×프리셋 메뉴 — 본문만 "추출 예정" 텍스트다.
+        let targets = self.agent_send_targets();
+        if !targets.is_empty()
+            && let Some((send_to, preset)) = self.draw_agent_send_menu(
+                ui,
+                catalog.t("workspace.menu.send_last_output", &[]),
+                &targets,
+                catalog,
+            )
+        {
+            self.last_output_intents.insert(
+                session,
+                LastOutputIntent::SendToAgent {
+                    targets: send_to,
+                    preset,
+                },
+            );
+            self.send(client, RuntimeCommand::ExtractLastOutput { session });
         }
     }
 
@@ -2301,6 +2431,11 @@ impl WorkspaceUi {
                     // agent_info) — 없으면 이 메뉴 자체가 안 보인다.
                     self.send_to_agent_menu(ui, &text, client, catalog);
                 }
+            }
+            // 마지막 명령 출력 복사/전송 (셸 통합 2단계) — 드래그 선택 없이도 세션이
+            // 있으면 표시. OSC 133 C~D 마크 범위를 워커에서 추출해 되받는다.
+            if let Some(out_session) = session {
+                self.last_output_menu_items(ui, out_session, client, catalog);
             }
             // 붙여넣기: 세션이 있으면 항상 표시. 드래그앤드롭 텍스트 붙여넣기(위 dnd_release_payload
             // 처리)와 동일한 경로(terminal_text_paste_bytes + session_bracketed_paste)로 주입한다.
@@ -3832,6 +3967,125 @@ mod tests {
         assert!(ui.sessions.get(&right).unwrap().bracketed_paste);
         assert!(!ui.session_bracketed_paste(left));
         assert!(ui.session_bracketed_paste(right));
+    }
+
+    fn agent_display() -> crate::agent_detect::AgentDisplay {
+        crate::agent_detect::AgentDisplay {
+            kind: crate::agent_detect::AgentKind::Codex,
+            model: None,
+            effort: None,
+            context_pct: None,
+        }
+    }
+
+    /// 셸 통합 2단계: LastOutputExtracted가 intent(Copy/SendToAgent)대로 실행된다.
+    #[test]
+    fn last_output_extracted는_intent대로_복사_또는_주입한다() {
+        let mut ui = WorkspaceUi::new();
+        let catalog = catalog();
+        let client = RecordingRuntime::default();
+        let source = SessionId(1);
+        let agent = SessionId(2);
+
+        // intent가 없으면 stale 응답 — 무시된다.
+        ui.handle_events(
+            &client,
+            &[RuntimeEvent::LastOutputExtracted {
+                session: source,
+                text: "stale".to_owned(),
+                truncated: false,
+            }],
+            &catalog,
+        );
+        assert!(ui.pending_copy.is_none());
+
+        // Copy intent — pending_copy에 예약되고 intent는 1회용으로 소비된다.
+        ui.last_output_intents
+            .insert(source, LastOutputIntent::Copy);
+        ui.handle_events(
+            &client,
+            &[RuntimeEvent::LastOutputExtracted {
+                session: source,
+                text: "out".to_owned(),
+                truncated: false,
+            }],
+            &catalog,
+        );
+        assert_eq!(ui.pending_copy.as_deref(), Some("out"));
+        assert!(ui.last_output_intents.is_empty());
+
+        // SendToAgent intent — 프리셋 머리말을 붙여 대상 pane에 주입(WriteInput)한다.
+        ui.set_agent_info([(agent, agent_display())].into_iter().collect());
+        ui.last_output_intents.insert(
+            source,
+            LastOutputIntent::SendToAgent {
+                targets: vec![agent],
+                preset: Some("리뷰해줘".to_owned()),
+            },
+        );
+        ui.handle_events(
+            &client,
+            &[RuntimeEvent::LastOutputExtracted {
+                session: source,
+                text: "error: boom".to_owned(),
+                truncated: false,
+            }],
+            &catalog,
+        );
+        let commands = client.commands.lock().unwrap();
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                RuntimeCommand::WriteInput { session, bytes }
+                    if *session == agent
+                        && String::from_utf8_lossy(bytes).contains("리뷰해줘:")
+                        && String::from_utf8_lossy(bytes).contains("error: boom")
+            )),
+            "{commands:?}"
+        );
+    }
+
+    /// 셸 통합 2단계 kittest 스모크: 「마지막 출력 복사」·「마지막 출력을 에이전트로 ▸」
+    /// 항목이 존재하고, 복사 클릭이 intent 저장 + ExtractLastOutput 전송을 일으킨다.
+    #[test]
+    fn kittest_마지막_출력_메뉴가_추출을_요청한다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let client = RecordingRuntime::default();
+        let session = SessionId(7);
+        let mut ws = WorkspaceUi::new();
+        // 실행 중 에이전트 하나 — 「마지막 출력을 에이전트로 ▸」의 대상.
+        ws.mux = Some(mux(
+            "a",
+            vec![tab(
+                "a",
+                vec![pane("pa", session)],
+                LayoutNode::Pane(pane_id("pa")),
+            )],
+            "pa",
+        ));
+        ws.set_agent_info([(session, agent_display())].into_iter().collect());
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, ws: &mut WorkspaceUi| {
+                ws.last_output_menu_items(ui, SessionId(7), &client, &catalog);
+            },
+            ws,
+        );
+        harness.run();
+        // 두 항목이 존재한다 (없으면 get_by_label이 panic).
+        harness.get_by_label(&catalog.t("workspace.menu.send_last_output", &[]));
+        harness
+            .get_by_label(&catalog.t("workspace.menu.copy_last_output", &[]))
+            .click();
+        harness.run();
+        assert!(matches!(
+            harness.state().last_output_intents.get(&SessionId(7)),
+            Some(LastOutputIntent::Copy)
+        ));
+        assert!(client.commands.lock().unwrap().iter().any(|c| matches!(
+            c,
+            RuntimeCommand::ExtractLastOutput { session } if *session == SessionId(7)
+        )));
     }
 
     #[test]

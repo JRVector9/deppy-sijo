@@ -132,6 +132,14 @@ pub enum RuntimeEvent {
         query: String,
         result: terminal::ScrollbackSearchResult,
     },
+    /// `ExtractLastOutput` 응답 (셸 통합 2단계). 마크가 없거나 범위가 비면 빈 text —
+    /// 판정(알림)은 UI 몫. truncated는 64KB 상한으로 앞(오래된)쪽이 잘렸다는 표시.
+    /// **variant는 enum 끝에만 추가** (postcard discriminant — wire 호환).
+    LastOutputExtracted {
+        session: SessionId,
+        text: String,
+        truncated: bool,
+    },
 }
 
 /// 최신값 슬롯에서 Viewport를 교체할 때, **아직 소비되지 않은** 이전 이벤트의

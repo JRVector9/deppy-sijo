@@ -170,6 +170,13 @@ pub enum RuntimeCommand {
         session: SessionId,
         direction: i8,
     },
+    /// 마지막 명령 출력(OSC 133 C~D 범위) 추출 요청 (셸 통합 2단계 — pane 메뉴
+    /// 「마지막 출력 복사/에이전트로」). 응답은 `RuntimeEvent::LastOutputExtracted` —
+    /// 마크가 없으면 빈 text로 회신한다(판정은 UI 몫).
+    /// **variant는 끝에만 추가** (postcard discriminant — wire 호환).
+    ExtractLastOutput {
+        session: SessionId,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
@@ -264,6 +271,10 @@ impl std::fmt::Debug for RuntimeCommand {
                 .debug_struct("ScrollToPrompt")
                 .field("session", session)
                 .field("direction", direction)
+                .finish(),
+            RuntimeCommand::ExtractLastOutput { session } => f
+                .debug_struct("ExtractLastOutput")
+                .field("session", session)
                 .finish(),
             RuntimeCommand::KillSession { session } => f
                 .debug_struct("KillSession")

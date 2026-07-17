@@ -115,6 +115,13 @@ fn main() -> anyhow::Result<()> {
             // 등록해야 프리퍼런스 적용 시 커스텀 색이 선택된다.
             theme::install_palette(&cc.egui_ctx);
             cc.egui_ctx.set_theme(config.ui.theme.to_egui());
+            // egui 디버그 빌드 기본값인 위젯 ID 충돌 경고(빨간 테두리 + 🔥)를 끈다 —
+            // dev-run 디버그 빌드를 일상 사용하는 앱이라 파일 트리 토글·설정 화면에서
+            // 빨간 영역이 깜빡여 사용자에게 그대로 노출된다(2026-07-18 보고). 릴리스
+            // 빌드는 원래 안 그리므로 이 설정으로 디버그/릴리스 화면이 같아진다.
+            // ID 충돌 자체를 잡을 때는 이 줄을 잠시 주석 처리하고 재현하면 된다.
+            cc.egui_ctx
+                .options_mut(|options| options.warn_on_id_clash = false);
             fonts::install_cjk_fallback(
                 &cc.egui_ctx,
                 config.ui.ui_font.as_deref(),

@@ -54,8 +54,45 @@ pub struct SidebarWorkspaceEntry {
     pub id: String,
     pub name: String,
     pub state: SidebarWorkspaceState,
-    pub session_count: usize,
-    pub waiting_count: usize,
+    pub summary: SidebarSessionSummary,
+}
+
+/// 접힌 워크스페이스 행에 표시할 세션 상태 총합. 한 세션은 정확히 한 상태에만 들어간다.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SidebarSessionSummary {
+    pub running: usize,
+    pub waiting: usize,
+    pub done: usize,
+    pub error: usize,
+    pub idle: usize,
+    /// 런타임이 내려가 현재 상태를 관측할 수 없는 복원 세션.
+    pub inactive: usize,
+}
+
+impl SidebarSessionSummary {
+    pub fn add(&mut self, status: Option<runtime::SessionStatus>, waiting: bool) {
+        use runtime::SessionStatus as S;
+        if waiting || matches!(status, Some(S::Waiting | S::NeedsApproval)) {
+            self.waiting += 1;
+        } else {
+            match status {
+                Some(S::Done) => self.done += 1,
+                Some(S::Error) => self.error += 1,
+                Some(S::Idle) => self.idle += 1,
+                Some(S::Running) | None => self.running += 1,
+                Some(S::Waiting | S::NeedsApproval) => unreachable!("handled above"),
+            }
+        }
+    }
+
+    pub fn inactive(count: usize) -> Self {
+        Self {
+            // 0은 "등록됐지만 복원 세션도 없는 비활성 워크스페이스" 표식으로 1칸 유지.
+            // 단독 표시는 개수를 노출하지 않고 항상 "비활성"이라 사용자에게 과장되지 않는다.
+            inactive: count.max(1),
+            ..Self::default()
+        }
+    }
 }
 
 pub struct SidebarSnapshot<'a> {
@@ -167,6 +204,8 @@ pub struct FileTreeUi {
     /// 가시 행 평탄화 캐시 — 펼침/접힘/조작 시에만 재계산(§3).
     flat: Vec<FlatRow>,
     show_hidden: bool,
+    file_search_open: bool,
+    file_search: String,
     /// 사이드바 접힘 (Panel 폭만 줄인다 — 상태/캐시는 유지).
     collapsed: bool,
     /// 마지막 조작 에러 (하단 빨간 라벨, §4).
@@ -559,6 +598,11 @@ enum EditState {
         buffer: String,
         focus: bool,
     },
+    NewFile {
+        parent: PathBuf,
+        buffer: String,
+        focus: bool,
+    },
 }
 
 impl FileTreeUi {
@@ -573,6 +617,8 @@ impl FileTreeUi {
             children: None,
             flat: Vec::new(),
             show_hidden: false,
+            file_search_open: false,
+            file_search: String::new(),
             collapsed: false,
             error: None,
             ops_tx,
@@ -631,6 +677,8 @@ impl FileTreeUi {
         self.root_error = None;
         self.children = None;
         self.flat.clear();
+        self.file_search.clear();
+        self.file_search_open = false;
         self.error = None;
         self.edit = None;
         self.confirm_delete = None;
@@ -963,36 +1011,6 @@ impl FileTreeUi {
             .inner
     }
 
-    /// 루트 경로 표시용 — 홈은 `~`로 축약.
-    /// 현재 루트의 breadcrumb 세그먼트 — (표시 라벨, 이동 대상 경로)를 조상→현재 순으로.
-    /// HOME 아래면 첫 세그먼트가 "~"(=HOME), 아니면 파일시스템 루트("/")부터(2026-07-08).
-    fn breadcrumb_segments(&self) -> Vec<(String, PathBuf)> {
-        let Some(root) = &self.root else {
-            return Vec::new();
-        };
-        let home = crate::paths::home_dir();
-        // 루트→조상 순으로 모은 뒤 뒤집는다. HOME에 도달하면 "~"로 끝맺는다.
-        let mut rev: Vec<(String, PathBuf)> = Vec::new();
-        let mut cur: &Path = root.as_path();
-        loop {
-            if home.as_deref() == Some(cur) {
-                rev.push(("~".to_owned(), cur.to_path_buf()));
-                break;
-            }
-            let label = match cur.file_name() {
-                Some(name) => name.to_string_lossy().into_owned(),
-                None => "/".to_owned(), // 파일시스템 루트
-            };
-            rev.push((label, cur.to_path_buf()));
-            match cur.parent() {
-                Some(p) => cur = p,
-                None => break,
-            }
-        }
-        rev.reverse();
-        rev
-    }
-
     fn contents(
         &mut self,
         ui: &mut egui::Ui,
@@ -1215,7 +1233,8 @@ impl FileTreeUi {
 
         egui::ScrollArea::vertical()
             .id_salt("workspace_list_scroll")
-            .max_height(118.0)
+            // 접힌 상태에서는 등록된 워크스페이스 전체와 각 상태 합계가 한눈에 보여야 한다.
+            .max_height((ui.available_height() * 0.34).clamp(118.0, 232.0))
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 for workspace in sidebar
@@ -1223,7 +1242,7 @@ impl FileTreeUi {
                     .iter()
                     .filter(|workspace| workspace.id != sidebar.active_workspace_id)
                 {
-                    if workspace_row(ui, workspace, false, None).clicked() {
+                    if workspace_row(ui, workspace, false, Some(false)).clicked() {
                         action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
                     }
                 }
@@ -1231,140 +1250,99 @@ impl FileTreeUi {
         ui.add_space(4.0);
         crate::ui::hairline_full(ui);
 
-        // 헤더: breadcrumb(현재 위치) + 새로고침/숨김 토글/접기 (§6). 헤더 전체가
-        // 루트로의 드롭 대상이다 (§4 — 루트 영역 dnd_drop_zone).
-        // 헤더는 dnd_drop_zone을 쓰지 않는다 — 그 API는 항상 inactive.bg_stroke로
-        // 프레임 박스를 그려 네모 라인이 보였다(#74). 수동 rect 기반 드롭으로 대체.
-        let mut go_parent = false;
-        let mut nav_to: Option<PathBuf> = None;
-        let header_scope = ui.scope(|ui| {
-            ui.horizontal(|ui| {
-                // 루트 폴더 아이콘 — 도형 (이모지 □ 깨짐 회피). 드롭 대상 앵커.
-                let (fr, _) = ui.allocate_exact_size(egui::vec2(18.0, 16.0), egui::Sense::hover());
-                paint_folder(ui.painter(), fr.center(), ui.visuals().weak_text_color());
+        // 첨부 시안과 같은 파일 도크: 독립 제목행 → 선택 가능한 검색 → 루트행 → 트리.
+        // 새 파일/폴더/검색은 실제 동작하며, 더보기에는 새로고침·숨김·사이드바 접기를 둔다.
+        let mut create_file = false;
+        let mut create_folder = false;
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), 42.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("파일").strong().size(15.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // 아이콘 3종 전부 18x18 painter 셀로 통일 (#74)
-                    // 접기: ◂는 폰트에 없어 □로 깨진다 — 도형 캐럿
-                    let (cr, collapse) =
-                        ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-                    let ccol = if collapse.hovered() {
-                        ui.visuals().text_color()
-                    } else {
-                        ui.visuals().weak_text_color()
-                    };
-                    {
-                        let c = cr.center();
-                        let d = 4.0;
-                        ui.painter().add(egui::Shape::convex_polygon(
-                            vec![
-                                egui::pos2(c.x + d * 0.6, c.y - d),
-                                egui::pos2(c.x + d * 0.6, c.y + d),
-                                egui::pos2(c.x - d * 0.8, c.y),
-                            ],
-                            ccol,
-                            egui::Stroke::NONE,
-                        ));
-                    }
-                    if collapse
-                        .on_hover_text(catalog.t("file_tree.collapse_sidebar", &[]))
-                        .clicked()
-                    {
-                        self.collapsed = true;
-                    }
-                    // 새로고침 ⟳ — 18x18 셀 중앙
-                    let (rr, refresh) =
-                        ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-                    let rcol = if refresh.hovered() {
-                        ui.visuals().text_color()
-                    } else {
-                        ui.visuals().weak_text_color()
-                    };
-                    ui.painter().text(
-                        rr.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "⟳",
-                        egui::FontId::proportional(14.0),
-                        rcol,
-                    );
-                    if refresh
-                        .on_hover_text(catalog.t("file_tree.refresh", &[]))
-                        .clicked()
-                    {
-                        self.refresh();
-                    }
-                    // 숨김 토글 — 텍스트 대신 눈 아이콘, 켜짐이면 accent (#74)
-                    let (er, eye) =
-                        ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-                    let ecol = if self.show_hidden {
-                        ui.visuals().selection.bg_fill
-                    } else if eye.hovered() {
-                        ui.visuals().text_color()
-                    } else {
-                        ui.visuals().weak_text_color()
-                    };
-                    paint_eye(ui.painter(), er.center(), ecol);
-                    if eye
-                        .on_hover_text(catalog.t("file_tree.show_hidden", &[]))
-                        .clicked()
-                    {
-                        self.show_hidden = !self.show_hidden;
-                        // 워처 콜백 스레드와 동기화 (숨김 이벤트 필터)
-                        self.watch_show_hidden
-                            .store(self.show_hidden, std::sync::atomic::Ordering::Relaxed);
-                        self.rebuild_flat();
-                    }
-                });
-            });
-            // breadcrumb 행 — 현재 위치를 구간별로 표시(클릭 시 그 조상으로 점프,
-            // 여러 단계 위로 한 번에). 좁은 사이드바에서 길면 다음 줄로 넘어간다(2026-07-08).
-            let segments = self.breadcrumb_segments();
-            if !segments.is_empty() {
-                // 깊은 경로도 끝(현재 폴더)이 항상 보이게 가로 스크롤 + 우측 고정.
-                // 조상은 왼쪽으로 스크롤해 보고 클릭할 수 있다(2026-07-08).
-                egui::ScrollArea::horizontal()
-                    .stick_to_right(true)
-                    .max_width(f32::INFINITY)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 2.0;
-                            let last = segments.len() - 1;
-                            for (i, (label, path)) in segments.iter().enumerate() {
-                                if i > 0 {
-                                    ui.add(egui::Label::new(
-                                        egui::RichText::new("›")
-                                            .color(ui.visuals().weak_text_color()),
-                                    ));
-                                }
-                                if i == last {
-                                    // 현재 폴더 — 강조, 클릭 불가.
-                                    ui.add(egui::Label::new(egui::RichText::new(label).strong()));
-                                } else {
-                                    let resp = ui
-                                        .add(
-                                            egui::Label::new(
-                                                egui::RichText::new(label)
-                                                    .color(ui.visuals().weak_text_color()),
-                                            )
-                                            .sense(egui::Sense::click()),
-                                        )
-                                        .on_hover_text(path.display().to_string());
-                                    if resp.hovered() {
-                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                    }
-                                    if resp.clicked() {
-                                        nav_to = Some(path.clone());
-                                    }
-                                }
-                            }
-                        });
+                    ui.add_space(5.0);
+                    ui.menu_button("•••", |ui| {
+                        if ui.button(catalog.t("file_tree.refresh", &[])).clicked() {
+                            self.refresh();
+                            ui.close();
+                        }
+                        let hidden_label = if self.show_hidden {
+                            "숨김 파일 감추기"
+                        } else {
+                            "숨김 파일 표시"
+                        };
+                        if ui.button(hidden_label).clicked() {
+                            self.show_hidden = !self.show_hidden;
+                            self.watch_show_hidden
+                                .store(self.show_hidden, std::sync::atomic::Ordering::Relaxed);
+                            self.rebuild_flat();
+                            ui.close();
+                        }
+                        if ui
+                            .button(catalog.t("file_tree.collapse_sidebar", &[]))
+                            .clicked()
+                        {
+                            self.collapsed = true;
+                            ui.close();
+                        }
                     });
-            }
-        });
-        // 헤더 전체 폭 = 루트로의 드롭 대상 (§4). 드래그 중 hover면 강조 스트로크.
-        let header_rect = egui::Rect::from_min_max(
-            egui::pos2(ui.max_rect().left(), header_scope.response.rect.min.y),
-            egui::pos2(ui.max_rect().right(), header_scope.response.rect.max.y),
+                    let search =
+                        file_toolbar_icon(ui, FileToolbarIcon::Search).on_hover_text("파일 검색");
+                    if search.clicked() {
+                        self.file_search_open = !self.file_search_open;
+                        if !self.file_search_open {
+                            self.file_search.clear();
+                        }
+                    }
+                    let folder = file_toolbar_icon(ui, FileToolbarIcon::Folder)
+                        .on_hover_text(catalog.t("file_tree.new_folder_root", &[]));
+                    create_folder = folder.clicked();
+                    let file =
+                        file_toolbar_icon(ui, FileToolbarIcon::File).on_hover_text("새 파일");
+                    create_file = file.clicked();
+                });
+            },
         );
+        crate::ui::hairline_full(ui);
+        if self.file_search_open {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.file_search)
+                    .hint_text("파일 이름 검색")
+                    .desired_width(f32::INFINITY)
+                    .margin(egui::Margin::symmetric(8, 5)),
+            );
+            response.request_focus();
+            if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                self.file_search_open = false;
+                self.file_search.clear();
+            }
+            crate::ui::hairline_full(ui);
+        }
+
+        let root_row = ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), 38.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.add_space(10.0);
+                let (icon, _) =
+                    ui.allocate_exact_size(egui::vec2(22.0, 18.0), egui::Sense::hover());
+                paint_folder(ui.painter(), icon.center(), ui.visuals().text_color());
+                if let Some(root) = &self.root {
+                    let name = root
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| root.display().to_string());
+                    ui.label(egui::RichText::new(name).strong().size(13.5));
+                    ui.weak(
+                        egui::RichText::new(compact_root_path(root))
+                            .monospace()
+                            .size(11.0),
+                    );
+                }
+            },
+        );
+        let header_rect = root_row.response.rect;
         let header_drop = ui.interact(
             header_rect,
             egui::Id::new("file_tree_root_drop"),
@@ -1386,61 +1364,20 @@ impl FileTreeUi {
         }
         crate::ui::hairline_full(ui);
 
-        // ".." 고정 행 — 트리 맨 위, 스크롤과 무관하게 항상 보인다. 루트에 부모가
-        // 있을 때만(‘/’이면 숨김). 표준 파일매니저 관용으로 "한 단계 위"를 명확히 한다
-        // (헤더 ▲ 아이콘 대체, 사용자 2026-07-08).
-        if self.root.as_ref().and_then(|r| r.parent()).is_some() {
-            let up_h = 22.0;
-            let (rect, resp) = ui
-                .allocate_exact_size(egui::vec2(ui.available_width(), up_h), egui::Sense::click());
-            if resp.hovered() {
-                ui.painter().rect_filled(
-                    rect,
-                    0.0,
-                    ui.visuals().selection.bg_fill.gamma_multiply(0.14),
-                );
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        if let Some(root) = self.root.clone() {
+            if create_file {
+                self.edit = Some(EditState::NewFile {
+                    parent: root.clone(),
+                    buffer: String::new(),
+                    focus: true,
+                });
+            } else if create_folder {
+                self.edit = Some(EditState::NewFolder {
+                    parent: root,
+                    buffer: String::new(),
+                    focus: true,
+                });
             }
-            let accent = ui.visuals().selection.stroke.color;
-            // 좌측 accent 핀
-            ui.painter().rect_filled(
-                egui::Rect::from_min_size(rect.min, egui::vec2(2.0, rect.height())),
-                0.0,
-                accent.gamma_multiply(0.6),
-            );
-            ui.painter().text(
-                egui::pos2(rect.left() + 12.0, rect.center().y),
-                egui::Align2::LEFT_CENTER,
-                "↑  ..",
-                egui::FontId::monospace(13.0),
-                accent,
-            );
-            ui.painter().text(
-                egui::pos2(rect.right() - 10.0, rect.center().y),
-                egui::Align2::RIGHT_CENTER,
-                catalog.t("file_tree.parent", &[]),
-                egui::FontId::proportional(11.0),
-                ui.visuals().weak_text_color(),
-            );
-            if resp.clicked() {
-                go_parent = true;
-            }
-            crate::ui::hairline_full(ui);
-        }
-
-        // breadcrumb 구간 클릭 → 그 조상으로 점프 (여러 단계 위로 한 번에).
-        if let Some(target) = nav_to {
-            self.set_root(Some(target));
-        }
-        // ".." → 부모로 한 단계. set_root(부모)로 리스팅/워처까지 재구성.
-        else if go_parent
-            && let Some(parent) = self
-                .root
-                .as_ref()
-                .and_then(|r| r.parent())
-                .map(Path::to_path_buf)
-        {
-            self.set_root(Some(parent));
         }
 
         if self.root.is_none() {
@@ -1491,6 +1428,37 @@ impl FileTreeUi {
                 &[("path", &parent.display().to_string())],
             ));
         }
+        if let Some(EditState::NewFile {
+            parent,
+            buffer,
+            focus,
+        }) = &mut edit
+        {
+            ui.horizontal(|ui| {
+                ui.label("새 파일");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(buffer)
+                        .hint_text(catalog.t("common.name", &[]))
+                        .desired_width(150.0),
+                );
+                if *focus {
+                    resp.request_focus();
+                    *focus = false;
+                }
+                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.small_button(catalog.t("action.new", &[])).clicked() || enter {
+                    edit_done = Some(true);
+                } else if ui.small_button(catalog.t("action.cancel", &[])).clicked()
+                    || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                {
+                    edit_done = Some(false);
+                }
+            });
+            ui.weak(catalog.t(
+                "file_tree.location",
+                &[("path", &parent.display().to_string())],
+            ));
+        }
 
         // 헤더 우클릭: 루트에 새 폴더 (FT-3)
         if let Some(root) = self.root.clone() {
@@ -1507,17 +1475,24 @@ impl FileTreeUi {
 
         // 가상화: 고정 행높이 + path 기반 explicit Id (§9-6).
         // 행높이는 실측 자기보정 — 선언값과 실제가 어긋나면 클릭 대상이 밀린다(필드 주석).
-        let row_height = self
-            .measured_row_height
-            .unwrap_or_else(|| ui.text_style_height(&egui::TextStyle::Body));
-        let total = self.flat.len();
+        let row_height = self.measured_row_height.unwrap_or(25.0);
+        let query = self.file_search.trim().to_lowercase();
+        let visible_rows: Vec<usize> = self
+            .flat
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| query.is_empty() || row.name.to_lowercase().contains(&query))
+            .map(|(index, _)| index)
+            .collect();
+        let total = visible_rows.len();
         let mut toggle: Option<PathBuf> = None;
         let mut drop_action: Option<(PathBuf, PathBuf)> = None; // (src, dst_dir)
         let mut observed_row_height: Option<f32> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_rows(ui, row_height, total, |ui, range| {
-                for row in &self.flat[range] {
+                for index in &visible_rows[range] {
+                    let row = &self.flat[*index];
                     // 이름 변경 중인 행은 인라인 TextEdit로 대체 (FT-3, §9-8)
                     if let Some(EditState::Rename {
                         path,
@@ -1527,7 +1502,7 @@ impl FileTreeUi {
                         && path == &row.path
                     {
                         ui.horizontal(|ui| {
-                            ui.add_space(row.depth as f32 * 12.0);
+                            ui.add_space(12.0 + row.depth as f32 * 18.0);
                             let resp = ui.add(
                                 egui::TextEdit::singleline(buffer)
                                     .margin(egui::Margin::ZERO) // 고정 행높이 유지 (§9-6)
@@ -1556,7 +1531,7 @@ impl FileTreeUi {
                     if ui.rect_contains_pointer(hover_rect) {
                         ui.painter().rect_filled(
                             hover_rect,
-                            3.0,
+                            1.0,
                             ui.visuals().widgets.hovered.weak_bg_fill,
                         );
                     }
@@ -1567,39 +1542,49 @@ impl FileTreeUi {
                         inner: label_resp,
                         response,
                     } = ui.dnd_drag_source(drag_id, row.path.clone(), |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 5.0;
-                            ui.add_space(row.depth as f32 * 12.0);
-                            // 캐럿+폴더/파일 아이콘을 도형으로 (이모지 □ 깨짐 회피, 목업 §트리)
-                            let icon_col = ui.visuals().weak_text_color();
-                            let carve = ui.visuals().extreme_bg_color;
-                            let (cr, _) = ui
-                                .allocate_exact_size(egui::vec2(10.0, 16.0), egui::Sense::hover());
-                            if row.is_dir {
-                                paint_caret(ui.painter(), cr.center(), row.expanded, icon_col);
-                            }
-                            let (ir, _) = ui
-                                .allocate_exact_size(egui::vec2(17.0, 16.0), egui::Sense::hover());
-                            if row.is_dir {
-                                paint_folder(ui.painter(), ir.center(), icon_col);
-                            } else {
-                                let fc = if row.name.starts_with('.') {
-                                    ui.visuals().weak_text_color()
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), row_height),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.x = 5.0;
+                                ui.add_space(10.0 + row.depth as f32 * 18.0);
+                                // 캐럿+폴더/파일 아이콘을 도형으로 (이모지 □ 깨짐 회피, 목업 §트리)
+                                let caret_col = ui.visuals().weak_text_color();
+                                let folder_col = egui::Color32::from_rgb(0x4c, 0xa8, 0xdf);
+                                let carve = ui.visuals().extreme_bg_color;
+                                let (cr, _) = ui.allocate_exact_size(
+                                    egui::vec2(10.0, 16.0),
+                                    egui::Sense::hover(),
+                                );
+                                if row.is_dir {
+                                    paint_caret(ui.painter(), cr.center(), row.expanded, caret_col);
+                                }
+                                let (ir, _) = ui.allocate_exact_size(
+                                    egui::vec2(17.0, 16.0),
+                                    egui::Sense::hover(),
+                                );
+                                if row.is_dir {
+                                    paint_folder(ui.painter(), ir.center(), folder_col);
                                 } else {
-                                    egui::Color32::from_rgb(0xc8, 0xcc, 0xd2)
-                                };
-                                paint_file(ui.painter(), ir.center(), fc, carve);
-                            }
-                            let mut rich = egui::RichText::new(&row.name);
-                            if row.name.starts_with('.') {
-                                rich = rich.weak().italics();
-                            }
-                            ui.add(
-                                egui::Label::new(rich)
-                                    .sense(egui::Sense::click())
-                                    .truncate(),
-                            )
-                        })
+                                    let fc = if row.name.starts_with('.') {
+                                        ui.visuals().weak_text_color()
+                                    } else {
+                                        egui::Color32::from_rgb(0xc8, 0xcc, 0xd2)
+                                    };
+                                    paint_file(ui.painter(), ir.center(), fc, carve);
+                                }
+                                let mut rich =
+                                    egui::RichText::new(&row.name).monospace().size(12.5);
+                                if row.name.starts_with('.') {
+                                    rich = rich.weak();
+                                }
+                                ui.add(
+                                    egui::Label::new(rich)
+                                        .sense(egui::Sense::click())
+                                        .truncate(),
+                                )
+                            },
+                        )
                         .inner
                     });
                     // 행 전체(패널 폭)를 클릭/드롭/메뉴 대상으로 — 텍스트만 클릭 가능하면
@@ -1735,6 +1720,23 @@ impl FileTreeUi {
                         Err(msg) => {
                             self.error = Some(msg);
                             edit = Some(EditState::NewFolder {
+                                parent,
+                                buffer,
+                                focus: true,
+                            });
+                        }
+                    }
+                }
+                Some(EditState::NewFile { parent, buffer, .. }) => {
+                    match apply_new_file(&parent, &buffer) {
+                        Ok(_) => {
+                            self.error = None;
+                            self.reveal_dir(&parent);
+                            edit = None;
+                        }
+                        Err(msg) => {
+                            self.error = Some(msg);
+                            edit = Some(EditState::NewFile {
                                 parent,
                                 buffer,
                                 focus: true,
@@ -2538,6 +2540,23 @@ fn apply_new_folder(parent: &Path, name: &str) -> Result<PathBuf, String> {
     }
 }
 
+/// 새 빈 파일 생성 (덮어쓰기 금지). 성공 시 생성 경로.
+fn apply_new_file(parent: &Path, name: &str) -> Result<PathBuf, String> {
+    let name = validate_name(name)?;
+    let dst = parent.join(&name);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&dst)
+    {
+        Ok(_) => Ok(dst),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(format!("같은 이름이 이미 있습니다: {name}"))
+        }
+        Err(e) => Err(format!("파일 생성 실패: {e}")),
+    }
+}
+
 /// 터미널 경로 삽입 대상 셸 계열. 세션별 셸 metadata 배선은 후속 PR 범위이므로,
 /// 현재 call site는 `shell_quote`/`shell_path_insert_bytes` 기본 wrapper를 쓴다.
 #[allow(dead_code)]
@@ -2564,7 +2583,7 @@ fn workspace_row(
     expanded: Option<bool>,
 ) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 43.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 58.0), egui::Sense::click());
     if !ui.is_rect_visible(rect) {
         return response;
     }
@@ -2584,8 +2603,8 @@ fn workspace_row(
         SidebarWorkspaceState::Idle => ui.visuals().weak_text_color(),
     };
     let avatar = egui::Rect::from_min_size(
-        egui::pos2(rect.left() + 4.0, rect.top() + 5.0),
-        egui::vec2(32.0, 32.0),
+        egui::pos2(rect.left() + 8.0, rect.top() + 9.0),
+        egui::vec2(40.0, 40.0),
     );
     // 워크스페이스 마크는 별도 테두리 없이 상태색을 채운다(HTML 목업과 같은 규칙).
     ui.painter()
@@ -2594,60 +2613,42 @@ fn workspace_row(
         avatar.center(),
         egui::Align2::CENTER_CENTER,
         workspace.name.chars().next().unwrap_or('W'),
-        egui::FontId::proportional(17.0),
+        egui::FontId::proportional(19.0),
         color,
     );
-    let name_width = (rect.width() - 176.0).max(56.0);
+    let name_width = (rect.width() - 230.0).max(72.0);
     let name = clipped_line(
         ui,
         &workspace.name,
-        egui::FontId::proportional(14.0),
+        egui::FontId::proportional(15.0),
         name_width,
     );
     ui.painter().galley(
         egui::pos2(
             avatar.right() + 10.0,
-            rect.top() + 14.0 - name.size().y / 2.0,
+            rect.top() + 19.0 - name.size().y / 2.0,
         ),
         name,
         ui.visuals().text_color(),
     );
     let state = match workspace.state {
-        SidebarWorkspaceState::Active => "active",
-        SidebarWorkspaceState::Warm => "background",
-        SidebarWorkspaceState::Idle => "idle",
+        SidebarWorkspaceState::Active => "활성 · local",
+        SidebarWorkspaceState::Warm => "백그라운드 · local",
+        SidebarWorkspaceState::Idle => "비활성",
     };
     ui.painter().text(
-        egui::pos2(avatar.right() + 10.0, rect.top() + 31.0),
+        egui::pos2(avatar.right() + 10.0, rect.top() + 41.0),
         egui::Align2::LEFT_CENTER,
         state,
-        egui::FontId::monospace(10.5),
+        egui::FontId::monospace(11.0),
         color,
     );
-    let summary = if workspace.waiting_count > 0 {
-        format!(
-            "{} 세션 · {} 입력 대기",
-            workspace.session_count, workspace.waiting_count
-        )
-    } else {
-        format!("{} 세션", workspace.session_count)
-    };
     let right = if expanded.is_some() {
         rect.right() - 22.0
     } else {
         rect.right() - 8.0
     };
-    ui.painter().text(
-        egui::pos2(right, rect.center().y),
-        egui::Align2::RIGHT_CENTER,
-        summary,
-        egui::FontId::proportional(11.0),
-        if workspace.waiting_count > 0 {
-            egui::Color32::from_rgb(0xe7, 0x9a, 0x3b)
-        } else {
-            ui.visuals().weak_text_color()
-        },
-    );
+    paint_workspace_summary(ui, right, rect.top() + 20.0, workspace.summary);
     if let Some(expanded) = expanded {
         let center = egui::pos2(rect.right() - 9.0, rect.center().y);
         let points = if expanded {
@@ -2670,6 +2671,76 @@ fn workspace_row(
         ));
     }
     response
+}
+
+fn paint_workspace_summary(
+    ui: &egui::Ui,
+    right: f32,
+    center_y: f32,
+    summary: SidebarSessionSummary,
+) {
+    let weak = ui.visuals().weak_text_color();
+    let values = workspace_summary_segments(summary, weak);
+    let font = egui::FontId::proportional(11.0);
+    let mut cursor = right;
+    for (text, color) in values.iter().rev() {
+        let galley = ui
+            .painter()
+            .layout_no_wrap(text.clone(), font.clone(), *color);
+        cursor -= galley.size().x;
+        ui.painter().galley(
+            egui::pos2(cursor, center_y - galley.size().y / 2.0),
+            galley,
+            *color,
+        );
+    }
+}
+
+fn workspace_summary_segments(
+    summary: SidebarSessionSummary,
+    weak: egui::Color32,
+) -> Vec<(String, egui::Color32)> {
+    let blue = egui::Color32::from_rgb(0x4c, 0xa8, 0xdf);
+    let orange = egui::Color32::from_rgb(0xe7, 0x9a, 0x3b);
+    let green = egui::Color32::from_rgb(0x55, 0xc8, 0x79);
+    let red = egui::Color32::from_rgb(0xed, 0x5b, 0x61);
+    let mut parts = Vec::new();
+    let push = |parts: &mut Vec<(String, egui::Color32)>, label: String, color| {
+        if !parts.is_empty() {
+            parts.push((" · ".to_owned(), weak));
+        }
+        parts.push((label, color));
+    };
+    if summary.running > 0 {
+        push(&mut parts, format!("{} 실행 중", summary.running), blue);
+    }
+    if summary.waiting > 0 {
+        push(&mut parts, format!("{} 입력 대기", summary.waiting), orange);
+    }
+    if summary.done > 0 {
+        push(&mut parts, format!("완료 {}", summary.done), green);
+    }
+    if summary.error > 0 {
+        push(&mut parts, format!("오류 {}", summary.error), red);
+    }
+    if summary.idle > 0 {
+        if summary.idle == 1 && parts.is_empty() {
+            push(&mut parts, "유휴".to_owned(), weak);
+        } else {
+            push(&mut parts, format!("유휴 {}", summary.idle), weak);
+        }
+    }
+    if summary.inactive > 0 {
+        if parts.is_empty() {
+            push(&mut parts, "비활성".to_owned(), weak);
+        } else {
+            push(&mut parts, format!("비활성 {}", summary.inactive), weak);
+        }
+    }
+    if parts.is_empty() {
+        parts.push(("유휴".to_owned(), weak));
+    }
+    parts
 }
 
 fn session_row(ui: &mut egui::Ui, entry: &SessionEntry) -> egui::Response {
@@ -2901,27 +2972,47 @@ pub(crate) fn paint_split(ui: &mut egui::Ui, horizontal: bool) -> egui::Response
     resp
 }
 
-/// 눈 아이콘 — 숨김 파일 토글 (#74). 아몬드형 윤곽 + 동공.
-fn paint_eye(p: &egui::Painter, c: egui::Pos2, col: egui::Color32) {
-    let s = egui::Stroke::new(1.3, col);
-    let w = 6.5;
-    let h = 4.2;
-    // 위/아래 눈꺼풀 곡선을 짧은 선분으로 근사
-    let mut top = Vec::new();
-    let mut bot = Vec::new();
-    for i in 0..=8 {
-        let t = i as f32 / 8.0;
-        let x = c.x - w + 2.0 * w * t;
-        let dy = h * (std::f32::consts::PI * t).sin();
-        top.push(egui::pos2(x, c.y - dy));
-        bot.push(egui::pos2(x, c.y + dy));
-    }
-    p.add(egui::Shape::line(top, s));
-    p.add(egui::Shape::line(bot, s));
-    p.circle_filled(c, 1.8, col);
+enum FileToolbarIcon {
+    File,
+    Folder,
+    Search,
 }
 
-/// 폴더 아이콘 — 탭 + 본체 (채움).
+fn file_toolbar_icon(ui: &mut egui::Ui, icon: FileToolbarIcon) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(25.0, 25.0), egui::Sense::click());
+    let color = if response.hovered() {
+        ui.visuals().text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    match icon {
+        FileToolbarIcon::File => {
+            paint_file(ui.painter(), rect.center(), color, ui.visuals().panel_fill)
+        }
+        FileToolbarIcon::Folder => paint_folder(ui.painter(), rect.center(), color),
+        FileToolbarIcon::Search => {
+            let center = rect.center() + egui::vec2(-2.0, -2.0);
+            ui.painter()
+                .circle_stroke(center, 5.5, egui::Stroke::new(1.5, color));
+            ui.painter().line_segment(
+                [center + egui::vec2(4.0, 4.0), center + egui::vec2(8.0, 8.0)],
+                egui::Stroke::new(1.5, color),
+            );
+        }
+    }
+    response
+}
+
+fn compact_root_path(root: &Path) -> String {
+    if let Some(home) = crate::paths::home_dir()
+        && let Ok(relative) = root.strip_prefix(home)
+    {
+        return format!("~/{}", relative.display());
+    }
+    root.display().to_string()
+}
+
+/// 폴더 아이콘 — 참고 시안처럼 탭 + 본체의 얇은 윤곽선.
 fn paint_folder(p: &egui::Painter, c: egui::Pos2, col: egui::Color32) {
     let w = 15.0;
     let h = 11.0;
@@ -2930,8 +3021,9 @@ fn paint_folder(p: &egui::Painter, c: egui::Pos2, col: egui::Color32) {
         egui::pos2(body.left(), body.top() - 3.0),
         egui::vec2(w * 0.45, 4.0),
     );
-    p.rect_filled(tab, 1.5, col);
-    p.rect_filled(body, 2.0, col);
+    let stroke = egui::Stroke::new(1.2, col);
+    p.rect_stroke(tab, 1.0, stroke, egui::StrokeKind::Inside);
+    p.rect_stroke(body, 1.0, stroke, egui::StrokeKind::Inside);
 }
 
 /// 파일 아이콘 — 문서(접힌 모서리). `carve`는 접힌 모서리를 파낼 배경색.
@@ -3657,6 +3749,43 @@ fn reread(base: &Path, old: &[TreeNode]) -> std::io::Result<Vec<TreeNode>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn 접힌_워크스페이스_요약은_세션상태를_한번씩_집계한다() {
+        use runtime::SessionStatus as S;
+        let mut summary = SidebarSessionSummary::default();
+        summary.add(Some(S::Running), false);
+        summary.add(Some(S::NeedsApproval), false);
+        summary.add(Some(S::Done), false);
+        summary.add(Some(S::Error), false);
+        summary.add(Some(S::Idle), false);
+        summary.add(None, true);
+        assert_eq!(summary.running, 1);
+        assert_eq!(summary.waiting, 2);
+        assert_eq!(summary.done, 1);
+        assert_eq!(summary.error, 1);
+        assert_eq!(summary.idle, 1);
+
+        let segments = workspace_summary_segments(summary, egui::Color32::GRAY);
+        let text = segments
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect::<String>();
+        assert_eq!(text, "1 실행 중 · 2 입력 대기 · 완료 1 · 오류 1 · 유휴 1");
+    }
+
+    #[test]
+    fn 상태없는_워크스페이스는_유휴_복원세션은_비활성으로_표시한다() {
+        let weak = egui::Color32::GRAY;
+        assert_eq!(
+            workspace_summary_segments(SidebarSessionSummary::default(), weak)[0].0,
+            "유휴"
+        );
+        assert_eq!(
+            workspace_summary_segments(SidebarSessionSummary::inactive(3), weak)[0].0,
+            "비활성"
+        );
+    }
+
     /// 안정성 감사 High #2: 워커가 stale epoch(루트 전환/refresh 후) 청크를
     /// bounded 결과 채널에 stale 청크를 밀어넣지 않는다 — 송신 전에 중단.
     #[test]
@@ -4041,6 +4170,19 @@ mod tests {
         assert!(err.contains("이미 있습니다"), "err={err}");
         // 구분자 거부
         assert!(apply_new_folder(&base, "a/b").is_err());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn apply_new_file_성공과_덮어쓰기_거부() {
+        let base = temp_root("newfile");
+        let created = apply_new_file(&base, " note.md ").unwrap();
+        assert_eq!(created, base.join("note.md"));
+        assert!(created.is_file());
+        std::fs::write(&created, b"keep").unwrap();
+        let err = apply_new_file(&base, "note.md").unwrap_err();
+        assert!(err.contains("이미 있습니다"), "err={err}");
+        assert_eq!(std::fs::read(&created).unwrap(), b"keep");
         std::fs::remove_dir_all(&base).unwrap();
     }
 

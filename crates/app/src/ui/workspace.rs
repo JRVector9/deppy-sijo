@@ -711,6 +711,12 @@ impl WorkspaceUi {
         self.agent_info.get(&session).map(agent_info_line)
     }
 
+    /// 비활성(warm) 워크스페이스의 접힌 행 상태 집계용 마지막 감지값.
+    /// 활성 워크스페이스는 `session_entries`가 hook/transcript까지 병합한 값을 사용한다.
+    pub fn last_session_status(&self, session: SessionId) -> Option<SessionStatus> {
+        self.sessions.get(&session).and_then(|view| view.status)
+    }
+
     /// 세션에서 감지된 에이전트 종류 — 셸이거나 미감지면 None.
     /// warm으로 내려가도 agent_info는 마지막 감지값을 유지한다(위 agent_line_for 주석).
     pub fn agent_provider_for(

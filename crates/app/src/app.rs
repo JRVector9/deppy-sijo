@@ -5278,35 +5278,47 @@ impl eframe::App for App {
             .workspaces
             .iter()
             .map(|workspace| {
-                let (state, session_count) = if workspace.id == active_workspace_id {
-                    (
-                        ui::file_tree::SidebarWorkspaceState::Active,
-                        terminal_sessions.len(),
-                    )
-                } else if let Some(runtime) = self.warm.get(&workspace.id) {
-                    (
-                        ui::file_tree::SidebarWorkspaceState::Warm,
-                        runtime.session_titles.len(),
-                    )
-                } else {
-                    (
-                        ui::file_tree::SidebarWorkspaceState::Idle,
-                        self.persisted_activity_panes
-                            .get(&workspace.id)
-                            .map_or(0, Vec::len),
-                    )
-                };
-                let waiting_count = self
+                let waiting_sessions: std::collections::HashSet<_> = self
                     .global_waiting
                     .iter()
                     .filter(|(workspace_id, _, _)| workspace_id == &workspace.id)
-                    .count();
+                    .map(|(_, session, _)| *session)
+                    .collect();
+                let (state, summary) = if workspace.id == active_workspace_id {
+                    let mut summary = ui::file_tree::SidebarSessionSummary::default();
+                    for entry in &terminal_sessions {
+                        summary.add(
+                            entry.status,
+                            entry
+                                .session
+                                .is_some_and(|session| waiting_sessions.contains(&session)),
+                        );
+                    }
+                    (ui::file_tree::SidebarWorkspaceState::Active, summary)
+                } else if let Some(runtime) = self.warm.get(&workspace.id) {
+                    let mut summary = ui::file_tree::SidebarSessionSummary::default();
+                    for session in runtime.session_titles.keys().copied() {
+                        summary.add(
+                            runtime.workspace_ui.last_session_status(session),
+                            waiting_sessions.contains(&session),
+                        );
+                    }
+                    (ui::file_tree::SidebarWorkspaceState::Warm, summary)
+                } else {
+                    (
+                        ui::file_tree::SidebarWorkspaceState::Idle,
+                        ui::file_tree::SidebarSessionSummary::inactive(
+                            self.persisted_activity_panes
+                                .get(&workspace.id)
+                                .map_or(0, Vec::len),
+                        ),
+                    )
+                };
                 ui::file_tree::SidebarWorkspaceEntry {
                     id: workspace.id.clone(),
                     name: Self::workspace_display_name(workspace),
                     state,
-                    session_count,
-                    waiting_count,
+                    summary,
                 }
             })
             .collect();

@@ -224,9 +224,11 @@ impl ComposerUi {
             // 접힘 바인딩이 현재 **전송 코드와 같으면 전송이 우선**한다 — FocusComposer를
             // ⌘/Ctrl+Enter로 리바인드하면 접힘이 먼저 소비해 키보드 전송이 불가능해진다
             // (codex P2). 판정은 dispatcher와 같은 matches_exact 규칙(shadows_send_chord).
-            let collapse_shortcut = ctx
-                .collapse_shortcut
-                .filter(|shortcut| !shadows_send_chord(shortcut, send_modifiers));
+            let collapse_shortcut = ctx.collapse_shortcut.filter(|shortcut| {
+                // 별칭 접기는 비-macOS만 — 물리 Ctrl이 두 플래그를 켜는 플랫폼 한정
+                // (shadows_send_chord 주석 참조, codex P2 7차).
+                !shadows_send_chord(shortcut, send_modifiers, cfg!(not(target_os = "macos")))
+            });
             if let Some(shortcut) = collapse_shortcut
                 && consume_key_exact(&egui_ctx, shortcut.modifiers, shortcut.logical_key)
             {
@@ -561,11 +563,18 @@ impl ComposerUi {
         }
         self.attach_seq += 1;
         let token = attach_token(self.attach_seq);
+        // 캐럿 소스로 쓴 예약은 소진한다(take) — 남겨두면 post-show에 옛 인덱스(토큰
+        // 앞/안)가 지금 저장할 캐럿을 덮는다.
         let cursor = self
             .pending_cursor
+            .take()
             .or_else(|| cursor_char_index(egui_ctx, Self::text_id(workspace_id)));
         let inserted = insert_snippet(buffer, cursor, &token);
-        self.pending_cursor = Some(inserted.cursor);
+        // 토큰 삽입 캐럿도 show **전에** 즉시 저장한다(resolve_attach와 동일 원칙 —
+        // codex P2 7차, 마지막 남은 post-show 예약 자리였다). 붙여넣기 제스처와 Text
+        // 이벤트가 한 입력 프레임에 배치되면 예약으로는 그 프레임의 텍스트가 옛 캐럿
+        // (토큰 앞/안)에 들어가고 예약 인덱스도 토큰 안을 가리키게 된다.
+        store_caret_now(egui_ctx, Self::text_id(workspace_id), inserted.cursor);
         self.attach_task = Some(PendingAttach {
             rx,
             target: AttachTarget {
@@ -992,14 +1001,29 @@ fn fold_command_into_ctrl(modifiers: egui::Modifiers) -> egui::Modifiers {
 }
 
 /// 접힘 바인딩이 현재 전송 코드(…+Enter)와 같은 물리 이벤트를 소비할 수 있는가.
-/// 구조(Eq) 비교도, matches_exact 양방향 OR도 부족하다: 비-macOS 물리 Ctrl 이벤트는
-/// ctrl|command를 **둘 다** 켜서, `Command+Enter` 바인딩과 `Ctrl+Enter` 전송이 서로는
-/// 매치되지 않아도 실제 이벤트는 양쪽을 만족한다(codex P2, 6차). 별칭을 접은 뒤
-/// 비교하면 그 겹침이 그대로 드러난다 — macOS에서 Cmd/Ctrl 교차 코드까지 가림으로
-/// 보는 보수적 판정이지만, 실패 방향이 "전송 우선"이라 안전하다.
-fn shadows_send_chord(collapse: &egui::KeyboardShortcut, send_modifiers: egui::Modifiers) -> bool {
-    collapse.logical_key == egui::Key::Enter
-        && fold_command_into_ctrl(collapse.modifiers) == fold_command_into_ctrl(send_modifiers)
+///
+/// `fold_ctrl_command_alias`(호출측이 `cfg!(not(target_os = "macos"))`를 넘긴다 —
+/// 인자화해 양 플랫폼을 유닛으로 검증):
+/// - **true(비-macOS)**: 물리 Ctrl 이벤트가 ctrl|command를 **둘 다** 켜서,
+///   `Command+Enter` 바인딩과 `Ctrl+Enter` 전송이 서로는 매치되지 않아도 실제
+///   이벤트는 양쪽을 만족한다(codex P2 6차) — 별칭을 접은 뒤 구조 비교.
+/// - **false(macOS)**: Cmd와 Ctrl은 서로 다른 물리 키다 — 접으면 Cmd+Enter 바인딩
+///   vs Ctrl+Enter 전송을 충돌로 오판해 접힘 단축키가 죽는다(codex P2 7차 회귀).
+///   dispatcher와 같은 matches_exact 양방향 OR(5차)로 판정한다.
+fn shadows_send_chord(
+    collapse: &egui::KeyboardShortcut,
+    send_modifiers: egui::Modifiers,
+    fold_ctrl_command_alias: bool,
+) -> bool {
+    if collapse.logical_key != egui::Key::Enter {
+        return false;
+    }
+    if fold_ctrl_command_alias {
+        fold_command_into_ctrl(collapse.modifiers) == fold_command_into_ctrl(send_modifiers)
+    } else {
+        collapse.modifiers.matches_exact(send_modifiers)
+            || send_modifiers.matches_exact(collapse.modifiers)
+    }
 }
 
 /// 치환 델타에 따른 캐럿 리베이스(codex P1) — 치환 구간 앞이면 그대로, 뒤면 델타만큼
@@ -1344,11 +1368,14 @@ mod tests {
         ui.begin_attach(&egui_ctx, rx, TEST_WS, None, &mut active);
         let token = ui.attach_task.as_ref().unwrap().target.token.clone();
         assert_eq!(active, token, "토큰이 동기로 삽입돼야 한다");
+        // codex P2(7차): 삽입 캐럿은 예약이 아니라 **즉시** TextEditState에 — 같은
+        // 프레임에 배치된 Text 이벤트가 토큰 뒤에서 시작해야 한다.
         assert_eq!(
-            ui.pending_cursor,
-            Some(token.chars().count()),
-            "동기 삽입은 기존 커서 예약 경로로 캐럿을 토큰 뒤에 둔다"
+            stored_char_range(&egui_ctx, ComposerUi::text_id(TEST_WS)),
+            Some((token.chars().count(), token.chars().count())),
+            "동기 삽입 캐럿은 show 전에 즉시 토큰 뒤로 저장된다"
         );
+        assert_eq!(ui.pending_cursor, None, "post-show 예약을 남기지 않는다");
         // 변환 중 사용자 입력 — 토큰 앞뒤로 타이핑.
         active = format!("before {active} after");
         tx.send(Ok(Some(vec![PathBuf::from("/x/shot.png")])))
@@ -1537,39 +1564,69 @@ mod tests {
             command: true,
             ..Default::default()
         };
+        const NON_MACOS: bool = true; // fold_ctrl_command_alias — 인자화로 양 플랫폼 검증
+        const MACOS: bool = false;
+        // ── 비-macOS(별칭 접기, codex P2 6차): 물리 Ctrl 이벤트는 ctrl|command를
+        // 둘 다 켜 — Command+Enter 바인딩과 Ctrl+Enter 전송이 서로는 매치 안 돼도
+        // 같은 이벤트를 만족한다.
         assert!(
-            shadows_send_chord(&chord(ctrl_and_command), egui::Modifiers::CTRL),
-            "비-macOS 캡처(CTRL|COMMAND)도 Ctrl+Enter 전송을 가린다"
+            shadows_send_chord(&chord(ctrl_and_command), egui::Modifiers::CTRL, NON_MACOS),
+            "비-macOS 캡처(CTRL|COMMAND)는 Ctrl+Enter 전송을 가린다"
         );
-        assert!(shadows_send_chord(
-            &chord(egui::Modifiers::COMMAND),
-            egui::Modifiers::COMMAND
-        ));
-        // codex P2(6차): 비-macOS 물리 Ctrl 이벤트는 ctrl|command를 둘 다 켜 —
-        // Command+Enter 바인딩과 Ctrl+Enter 전송이 서로는 매치 안 돼도 같은 이벤트를
-        // 만족한다. 별칭 접기 후 비교로 가림 판정이 참이어야 한다.
         assert!(
-            shadows_send_chord(&chord(egui::Modifiers::COMMAND), egui::Modifiers::CTRL),
-            "Command+Enter 바인딩은 Ctrl+Enter 전송을 가린다(별칭 접기)"
+            shadows_send_chord(
+                &chord(egui::Modifiers::COMMAND),
+                egui::Modifiers::CTRL,
+                NON_MACOS
+            ),
+            "비-macOS Command+Enter 바인딩은 Ctrl+Enter 전송을 가린다(별칭 접기)"
         );
         assert!(shadows_send_chord(
             &chord(egui::Modifiers::CTRL),
-            egui::Modifiers::COMMAND
+            egui::Modifiers::COMMAND,
+            NON_MACOS
         ));
+        // ── macOS(구분 복원, codex P2 7차 회귀): Cmd와 Ctrl은 다른 물리 키 — 접으면
+        // Cmd+Enter 바인딩 vs Ctrl+Enter 전송을 충돌로 오판해 접힘 단축키가 죽는다.
         assert!(
             !shadows_send_chord(
-                &chord(egui::Modifiers::CTRL | egui::Modifiers::SHIFT),
-                egui::Modifiers::CTRL
+                &chord(egui::Modifiers::COMMAND),
+                egui::Modifiers::CTRL,
+                MACOS
             ),
-            "Shift가 다르면 다른 코드다"
+            "macOS에선 Cmd+Enter 바인딩이 Ctrl+Enter 전송과 다른 코드다"
         );
         assert!(
-            !shadows_send_chord(
-                &egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::J),
-                egui::Modifiers::COMMAND
+            shadows_send_chord(
+                &chord(egui::Modifiers::COMMAND),
+                egui::Modifiers::COMMAND,
+                MACOS
             ),
-            "Enter가 아니면 가리지 않는다"
+            "같은 Cmd+Enter는 여전히 가린다"
         );
+        assert!(
+            shadows_send_chord(&chord(ctrl_and_command), egui::Modifiers::CTRL, MACOS),
+            "두 플래그가 켜진 캡처는 matches_exact 양방향으로 여전히 잡힌다(5차)"
+        );
+        // ── 공통: shift/alt 차이와 비-Enter 키는 어느 플랫폼에서도 가리지 않는다.
+        for platform in [NON_MACOS, MACOS] {
+            assert!(
+                !shadows_send_chord(
+                    &chord(egui::Modifiers::CTRL | egui::Modifiers::SHIFT),
+                    egui::Modifiers::CTRL,
+                    platform
+                ),
+                "Shift가 다르면 다른 코드다"
+            );
+            assert!(
+                !shadows_send_chord(
+                    &egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::J),
+                    egui::Modifiers::COMMAND,
+                    platform
+                ),
+                "Enter가 아니면 가리지 않는다"
+            );
+        }
     }
 
     /// codex P2 회귀(5차): 첨부 완료 치환이 사용자 선택을 무너뜨리면 안 된다 —
@@ -2020,6 +2077,49 @@ mod tests {
         harness.run();
         assert!(buffer_of(&harness).is_empty());
         assert!(harness.state().0.history_pos.is_none());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// codex P2 회귀(7차): 토큰 삽입 캐럿도 즉시 저장 — 붙여넣기 제스처와 Text 이벤트가
+    /// 한 입력 프레임에 배치되면 post-show 예약으로는 그 프레임의 텍스트가 옛 캐럿
+    /// (토큰 앞)에 들어간다. begin 직후의 첫 TextEdit 패스가 토큰 뒤 캐럿을 봐야 한다.
+    #[test]
+    fn kittest_토큰_삽입과_같은_프레임의_텍스트는_토큰_뒤에_들어간다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let path = test_history_path("attach-same-frame-text");
+        let mut harness = composer_harness(&catalog, ComposerSendKey::Enter, path.clone());
+        focus_composer(&mut harness);
+        // 붙여넣기 제스처 시뮬레이션: begin_attach를 harness ctx로 직접 호출(macOS 테스트
+        // 러너에선 native monitor/Ctrl+Shift+V 트리거를 이벤트로 주입할 수 없다) —
+        // 토큰 삽입 + 캐럿 즉시 저장까지가 "그 프레임 show 전" 상태다.
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let harness_ctx = harness.ctx.clone();
+        {
+            let ui = &mut harness.state_mut().0;
+            let mut buffer = ui.buffers.remove(TEST_WS).unwrap_or_default();
+            ui.begin_attach(&harness_ctx, rx, TEST_WS, None, &mut buffer);
+            ui.buffers.insert(TEST_WS.to_owned(), buffer);
+        }
+        let token = harness
+            .state()
+            .0
+            .attach_task
+            .as_ref()
+            .unwrap()
+            .target
+            .token
+            .clone();
+        // 같은 입력 프레임에 배치된 Text 이벤트 — 정확히 1프레임만 돌린다.
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text("x".to_owned()));
+        harness.step();
+        assert_eq!(
+            buffer_of(&harness),
+            format!("{token}x"),
+            "같은 프레임의 텍스트는 토큰 **뒤**에 들어가야 한다(토큰 무손상)"
+        );
         std::fs::remove_file(&path).ok();
     }
 

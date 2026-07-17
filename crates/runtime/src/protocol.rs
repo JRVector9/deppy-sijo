@@ -35,7 +35,11 @@ pub(crate) const PROTO_MAGIC: [u8; 4] = *b"DPRT";
 /// 만나면 오해독하므로 handshake 거부를 위해 버전을 올린다.
 /// **v8 (B-1)**: TerminalCell에 attrs(SGR bold/italic/underline/strikeout/dim) 필드 추가 —
 /// 구조체 필드 추가라 Viewport 바이트가 바뀐다(v6과 같은 이유로 필수 bump).
-pub(crate) const PROTO_VERSION: u16 = 8;
+/// **v9 (셸 통합 1·2단계, 2026-07-17)**: ScrollToPrompt 명령 + ExtractLastOutput 명령/
+/// LastOutputExtracted 이벤트를 enum 끝에 append — v7과 같은 이유(구버전 피어의 미지
+/// variant 오해독 방지)로 handshake에서 거부되도록 버전을 올린다. 1단계(ScrollToPrompt)가
+/// bump를 누락해 이 bump가 두 변경을 함께 커버한다.
+pub(crate) const PROTO_VERSION: u16 = 9;
 
 /// delta viewport 스트리밍 기능 비트 (§3.1).
 pub(crate) const FEAT_DELTA_VIEWPORT: u32 = 1 << 0;

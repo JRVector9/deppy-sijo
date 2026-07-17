@@ -555,45 +555,74 @@ impl TerminalBackend for AlacrittyBackend {
         }
     }
 
-    /// 커서 기준 `back` 라인 위의 텍스트 (셸 통합 2단계 — 마지막 출력 추출).
+    /// 커서 기준 `back` **논리 라인** 위의 텍스트 (셸 통합 2단계 — 마지막 출력 추출).
+    /// soft wrap(WRAPLINE) 행들을 한 논리 라인으로 병합해 세션의 LF 카운터 좌표와
+    /// 일치시킨다 — 긴 출력 wrap은 물론, zsh PROMPT_SP가 개행 없는 출력 뒤에 만드는
+    /// wrap 행(EOL 마커+프롬프트)도 LF 없이 생기므로 시각 행 인덱스는 어긋난다.
     /// 셀 읽기는 search_scrollback과 동일한 규칙, wrapped 판정은 serialize_scrollback과
     /// 동일하게 마지막 열의 WRAPLINE flag.
-    fn line_text_back_from_cursor(&self, back: usize) -> Option<(String, bool)> {
+    fn logical_line_back_from_cursor(&self, back: usize) -> Option<String> {
         let cols = self.term.columns();
+        let rows = self.term.screen_lines() as i32;
         let history = self.term.history_size();
-        let back = i32::try_from(back).ok()?;
-        // cursor.point.line은 화면 좌표(0=최상단) — display_offset(스크롤)과 무관하다.
-        let line_idx = self.term.grid().cursor.point.line.0 - back;
-        if cols == 0 || line_idx < -(history as i32) {
-            return None; // 스크롤백 밖으로 트림된 라인
+        if cols == 0 {
+            return None;
         }
-        let line = &self.term.grid()[alacritty_terminal::index::Line(line_idx)];
-        let wrapped = line[alacritty_terminal::index::Column(cols - 1)]
-            .flags
-            .contains(Flags::WRAPLINE);
-        let mut out = String::with_capacity(cols);
-        for col in 0..cols {
-            let cell = &line[alacritty_terminal::index::Column(col)];
-            if cell
+        let grid = self.term.grid();
+        let oldest = -(history as i32);
+        let soft_wrapped = |idx: i32| {
+            grid[alacritty_terminal::index::Line(idx)][alacritty_terminal::index::Column(cols - 1)]
                 .flags
-                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-            {
-                continue;
+                .contains(Flags::WRAPLINE)
+        };
+        // 커서가 속한 논리 라인의 첫 행 — 위 행이 soft wrap이면 계속 위로.
+        // cursor.point.line은 화면 좌표(0=최상단) — display_offset(스크롤)과 무관하다.
+        let mut start = grid.cursor.point.line.0;
+        while start > oldest && soft_wrapped(start - 1) {
+            start -= 1;
+        }
+        // back 논리 라인 위로 — 각 단계는 이전 논리 라인의 첫 행까지 걷는다.
+        for _ in 0..back {
+            if start <= oldest {
+                return None; // 스크롤백 밖으로 트림된 라인
             }
-            // conceal(SGR 8)은 화면과 동일하게 공백 취급 (search_scrollback 관례)
-            if cell.flags.contains(Flags::HIDDEN) {
-                out.push(' ');
-            } else {
-                out.push(cell.c);
-                if let Some(zerowidth) = cell.zerowidth() {
-                    out.extend(zerowidth.iter().copied());
+            start -= 1;
+            while start > oldest && soft_wrapped(start - 1) {
+                start -= 1;
+            }
+        }
+        // start부터 wrap run을 이어붙인다. 중간(wrapped) 행은 전체 폭(내용이 이어짐),
+        // 마지막 행 뒤에서만 trailing 공백을 trim.
+        let mut out = String::with_capacity(cols);
+        let mut idx = start;
+        loop {
+            let wrapped = soft_wrapped(idx);
+            let line = &grid[alacritty_terminal::index::Line(idx)];
+            for col in 0..cols {
+                let cell = &line[alacritty_terminal::index::Column(col)];
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                // conceal(SGR 8)은 화면과 동일하게 공백 취급 (search_scrollback 관례)
+                if cell.flags.contains(Flags::HIDDEN) {
+                    out.push(' ');
+                } else {
+                    out.push(cell.c);
+                    if let Some(zerowidth) = cell.zerowidth() {
+                        out.extend(zerowidth.iter().copied());
+                    }
                 }
             }
+            idx += 1;
+            if !wrapped || idx >= rows {
+                break;
+            }
         }
-        if !wrapped {
-            out.truncate(out.trim_end().len());
-        }
-        Some((out, wrapped))
+        out.truncate(out.trim_end().len());
+        Some(out)
     }
 
     fn screen_text(&self) -> String {
@@ -1063,34 +1092,40 @@ mod tests {
     /// 셸 통합 2단계: 마지막 출력 추출은 grid 최하단이 아니라 **커서** 기준이다 —
     /// 화면이 아직 안 찬 프레시 셸의 첫 명령에서도 정확해야 한다.
     #[test]
-    fn line_text_back_from_cursor는_커서_기준으로_위_라인을_읽는다() {
+    fn logical_line_back은_커서_기준으로_위_라인을_읽는다() {
         let mut b = AlacrittyBackend::new(10, 5, 100);
         feed(&mut b, b"one\r\ntwo\r\nthree");
-        assert_eq!(
-            b.line_text_back_from_cursor(0),
-            Some(("three".to_owned(), false))
-        );
-        assert_eq!(
-            b.line_text_back_from_cursor(2),
-            Some(("one".to_owned(), false))
-        );
+        assert_eq!(b.logical_line_back_from_cursor(0), Some("three".to_owned()));
+        assert_eq!(b.logical_line_back_from_cursor(2), Some("one".to_owned()));
         // history가 없으니 커서 위 3번째 라인은 범위 밖 — None.
-        assert_eq!(b.line_text_back_from_cursor(3), None);
+        assert_eq!(b.logical_line_back_from_cursor(3), None);
     }
 
+    /// soft wrap(WRAPLINE) 행들은 한 논리 라인으로 병합된다 — LF 카운터 좌표와 일치.
     #[test]
-    fn line_text_back_from_cursor는_wrapped_라인을_표시한다() {
+    fn logical_line_back은_wrap_행을_병합한다() {
         let mut b = AlacrittyBackend::new(4, 5, 100);
         feed(&mut b, b"abcdef\r\ng");
-        // "abcdef"는 4열에서 "abcd"/"ef" 두 시각 라인 — 위쪽이 soft wrap.
+        // "abcdef"는 4열에서 "abcd"/"ef" 두 시각 행이지만 논리 라인은 하나.
+        assert_eq!(b.logical_line_back_from_cursor(0), Some("g".to_owned()));
         assert_eq!(
-            b.line_text_back_from_cursor(2),
-            Some(("abcd".to_owned(), true))
+            b.logical_line_back_from_cursor(1),
+            Some("abcdef".to_owned())
         );
-        assert_eq!(
-            b.line_text_back_from_cursor(1),
-            Some(("ef".to_owned(), false))
-        );
+        assert_eq!(b.logical_line_back_from_cursor(2), None);
+    }
+
+    /// zsh PROMPT_SP 형태: 개행 없는 출력 뒤 EOL 마커+공백이 autowrap을 만들고 다음
+    /// 시각 행에 프롬프트가 그려진다 — LF가 없으므로 전부 한 논리 라인이어야 커서
+    /// 기준 back 좌표가 어긋나지 않는다.
+    #[test]
+    fn logical_line_back은_prompt_sp_wrap도_한_라인으로_본다() {
+        let mut b = AlacrittyBackend::new(10, 5, 100);
+        // "foo" + "%" + 공백 6개(autowrap 유발) → 다음 행 "$ " — LF 없음.
+        feed(&mut b, b"foo%      $ ");
+        let line = b.logical_line_back_from_cursor(0).unwrap();
+        assert!(line.starts_with("foo%"), "{line:?}");
+        assert!(line.ends_with('$'), "{line:?}");
     }
 
     /// B-1 회귀: SGR 속성(bold/italic/underline/strikeout/dim)이 스냅샷에 실려야 한다.

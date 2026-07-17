@@ -445,40 +445,50 @@ impl Session {
     /// 「마지막 출력 복사/에이전트로」). 반환 `(text, truncated)`. 마크가 없거나 범위가
     /// 비면 빈 text — 판정(알림)은 UI 몫. 최신 라인부터 위로 모아 64KB 상한이나 트림
     /// 경계에 닿으면 멈춘다 — 뒤(최근)쪽이 남는다. 텍스트 읽기는 T3 검색과 같은 backend
-    /// grid 경로([`terminal::TerminalBackend::line_text_back_from_cursor`]).
+    /// grid 경로([`terminal::TerminalBackend::logical_line_back_from_cursor`], 논리 라인
+    /// = soft wrap 병합 — LF 카운터 좌표와 일치). 개행 없이 끝난 출력은 D 라인의 선두
+    /// `last_line_chars`만 남겨 뒤에 그려진 프롬프트를 배제한다 (codex P2).
     pub fn extract_last_output(&self) -> (String, bool) {
-        let Some((start_back, end_back)) = self.prompt_marks.last_output_back_range() else {
+        let Some(range) = self.prompt_marks.last_output_back_range() else {
             return (String::new(), false);
         };
-        let mut pieces: Vec<(String, bool)> = Vec::new();
+        let mut pieces: Vec<String> = Vec::new();
         let mut bytes = 0usize;
         let mut truncated = false;
-        for back in end_back..=start_back {
+        for back in range.end_back..=range.start_back {
             // 트림된 라인/미지원 백엔드는 None — 모은 최근 라인까지만.
-            let Some((text, wrapped)) = self
+            let Some(mut text) = self
                 .backend
-                .line_text_back_from_cursor(usize::try_from(back).unwrap_or(usize::MAX))
+                .logical_line_back_from_cursor(usize::try_from(back).unwrap_or(usize::MAX))
             else {
                 break;
             };
-            bytes += text.len() + 1;
-            pieces.push((text, wrapped));
-            if bytes > LAST_OUTPUT_MAX_BYTES {
+            // 개행 없는 마지막 출력 라인 — D 이후 같은 논리 라인에 그려진 프롬프트·
+            // EOL 마커를 잘라낸다 (char 카운트 근사 — prompt_marks 참조).
+            if back == range.end_back
+                && let Some(chars) = range.last_line_chars
+            {
+                text = text.chars().take(chars).collect();
+            }
+            if bytes + text.len() + 1 > LAST_OUTPUT_MAX_BYTES {
                 truncated = true;
+                if pieces.is_empty() {
+                    // 최신 라인 하나가 이미 상한 초과(개행 없는 거대 출력) —
+                    // 뒤(최근)쪽 상한만큼만 남긴다.
+                    let mut cut = text.len() - LAST_OUTPUT_MAX_BYTES;
+                    while !text.is_char_boundary(cut) {
+                        cut += 1;
+                    }
+                    pieces.push(text.split_off(cut));
+                }
                 break;
             }
+            bytes += text.len() + 1;
+            pieces.push(text);
         }
-        // 최신→과거로 모았으니 뒤집어 조립 — soft wrap 라인은 개행 없이 잇는다.
-        let mut out = String::new();
-        let mut newline_before_next = false;
-        for (text, wrapped) in pieces.iter().rev() {
-            if newline_before_next {
-                out.push('\n');
-            }
-            out.push_str(text);
-            newline_before_next = !wrapped;
-        }
-        (out, truncated)
+        // 최신→과거로 모았으니 뒤집어 개행으로 잇는다.
+        pieces.reverse();
+        (pieces.join("\n"), truncated)
     }
 
     /// 가시성에 따라 scrollback 상한 조정 (§14.3). 전이 시에만 호출할 것.
@@ -970,6 +980,40 @@ mod tests {
         });
         let (text, truncated) = session.extract_last_output();
         assert_eq!(text, "out-1\nout-2");
+        assert!(!truncated);
+    }
+
+    /// codex P2 회귀: `printf foo`처럼 개행 없이 끝난 출력 — D가 그 출력과 같은 라인에
+    /// 찍혀도 그 라인이 추출에 포함되고, D 이후에 그려지는 EOL 마커(zsh PROMPT_SP의
+    /// `%`+공백 autowrap)와 다음 프롬프트는 잘려 나간다.
+    #[test]
+    #[cfg(unix)]
+    fn 개행_없이_끝난_마지막_출력도_추출된다() {
+        let spec = CommandSpec {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                // "foo"(개행 없음) → D+A → zsh PROMPT_SP 모사: '%'+공백 autowrap → 프롬프트
+                concat!(
+                    "printf '\\033]133;A\\007$ cmd\\n\\033]133;C\\007'; ",
+                    "printf foo; ",
+                    "printf '\\033]133;D;0\\007\\033]133;A\\007'; ",
+                    "printf '%%%76sPS1>' ''; sleep 30"
+                )
+                .into(),
+            ],
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(33), SessionKind::Shell, &spec, 80, 24, 1000)
+                .unwrap();
+        wait(Duration::from_secs(5), || {
+            session.pump(|_| {});
+            session.screen_text().contains("PS1>").then_some(())
+        });
+        let (text, truncated) = session.extract_last_output();
+        assert_eq!(text, "foo");
         assert!(!truncated);
     }
 

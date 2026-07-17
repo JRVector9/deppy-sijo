@@ -60,11 +60,30 @@ pub(crate) struct PromptMarks {
     alt_screen: bool,
     /// Ground에서 센 LF 누적 = 현재 라인의 절대 번호.
     line: u64,
+    /// 현재 라인에 찍힌 출력 char 수 근사 — UTF-8 continuation이 아닌 출력 바이트를
+    /// 세고 \r/\n에서 리셋한다. D 마크가 개행 없는 출력과 같은 라인에 찍혔는지
+    /// (컬럼 > 0) 판정 + 그 라인에서 출력 부분만 잘라내는 데 쓴다 (codex P2).
+    /// 탭·커서 이동 escape는 화면 컬럼을 움직여도 여기엔 안 잡힌다 — 베스트 에포트.
+    col: u32,
     /// 프롬프트 시작(133;A) 마크의 절대 라인 번호 — 오래된 순.
     marks: VecDeque<u64>,
-    /// 출력 경계(C 시작/D 종료) 마크 — (종류, 절대 라인), 오래된 순. A와 분리 보관해
-    /// C/D가 프롬프트 점프 마크를 밀어내지 않는다 (상한·좌표 규칙은 동일).
-    output_marks: VecDeque<(MarkKind, u64)>,
+    /// 출력 경계(C 시작/D 종료) 마크 — (종류, 절대 라인, 그 시점의 컬럼), 오래된 순.
+    /// A와 분리 보관해 C/D가 프롬프트 점프 마크를 밀어내지 않는다 (상한·좌표 규칙 동일).
+    output_marks: VecDeque<(MarkKind, u64, u32)>,
+}
+
+/// [`PromptMarks::last_output_back_range`] 결과 — back("현재 라인에서 몇 라인 위")
+/// 좌표의 마지막 명령 출력 범위. `start_back ≥ end_back`(둘 다 포함).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LastOutputRange {
+    /// 출력 첫 라인 (가장 과거 — C 마크 라인).
+    pub(crate) start_back: u64,
+    /// 출력 마지막 라인 (가장 최근).
+    pub(crate) end_back: u64,
+    /// 출력이 개행 없이 끝나 D가 그 라인에 찍혔을 때(D 컬럼 > 0), 마지막 라인에서
+    /// 출력에 해당하는 선두 char 수 — D 이후 같은 (논리) 라인에 그려지는 프롬프트·
+    /// EOL 마커를 잘라내는 용도.
+    pub(crate) last_line_chars: Option<usize>,
 }
 
 impl PromptMarks {
@@ -74,7 +93,16 @@ impl PromptMarks {
             match self.phase {
                 ScanPhase::Ground => match byte {
                     0x1b => self.phase = ScanPhase::Esc,
-                    b'\n' if !self.alt_screen => self.line += 1,
+                    b'\n' if !self.alt_screen => {
+                        self.line += 1;
+                        self.col = 0;
+                    }
+                    b'\r' if !self.alt_screen => self.col = 0,
+                    0x08 if !self.alt_screen => self.col = self.col.saturating_sub(1),
+                    // UTF-8 continuation(10xxxxxx)이 아닌 출력 바이트만 — char 수 근사.
+                    b if !self.alt_screen && b >= 0x20 && b & 0xc0 != 0x80 => {
+                        self.col = self.col.saturating_add(1);
+                    }
                     _ => {}
                 },
                 ScanPhase::Esc => match byte {
@@ -154,44 +182,63 @@ impl PromptMarks {
                 self.marks.push_back(self.line);
             }
             MarkKind::OutputStart | MarkKind::CommandDone => {
-                if self.output_marks.back() == Some(&(kind, self.line)) {
+                // 같은 라인의 같은 종류 중복(redraw 등)은 한 번만 — 컬럼은 첫 기록 유지.
+                if self
+                    .output_marks
+                    .back()
+                    .is_some_and(|(k, l, _)| *k == kind && *l == self.line)
+                {
                     return;
                 }
                 if self.output_marks.len() >= MAX_PROMPT_MARKS {
                     self.output_marks.pop_front();
                 }
-                self.output_marks.push_back((kind, self.line));
+                self.output_marks.push_back((kind, self.line, self.col));
             }
         }
     }
 
-    /// 마지막 명령 출력의 라인 범위 — "현재 라인에서 몇 라인 위인가"(back) 좌표로
-    /// `(start_back, end_back)`, start_back ≥ end_back(둘 다 포함). 마지막 C(출력 시작)
-    /// 라인부터 그 뒤 첫 D(명령 종료) **직전** 라인까지 — D 라인에는 다음 프롬프트가
-    /// 그려진다. D가 아직 없으면(실행 중) 현재 라인까지. wrapped 시각 라인 오차는
-    /// 점프와 같은 베스트 에포트. alt screen(vim/less) 중에는 None — 마크 좌표는
-    /// main screen 것이라 alt grid 텍스트와 맞지 않는다.
-    pub(crate) fn last_output_back_range(&self) -> Option<(u64, u64)> {
+    /// 마지막 명령 출력의 라인 범위 — 마지막 C(출력 시작) 라인부터 그 뒤 첫 D(명령
+    /// 종료)까지. D가 아직 없으면(실행 중) 현재 라인까지.
+    ///
+    /// **D 라인 경계 (codex P2)**: 출력이 개행 없이 끝나면(`printf foo`) D는 그 출력과
+    /// 같은 라인에 찍힌다 — D 컬럼 > 0이면 그 라인을 **포함**하고 D 시점의 char 카운트
+    /// (`last_line_chars`)로 이후에 그려지는 프롬프트를 잘라내게 한다. D 컬럼 0(출력이
+    /// 개행으로 끝남 또는 출력 없음)이면 D 직전 라인까지 — C 직후 D(출력 0)는 None.
+    /// 컬럼은 스트림 char 카운트 근사(탭·커서 이동 escape 미반영 — 베스트 에포트).
+    ///
+    /// alt screen(vim/less) 중에는 None — 마크 좌표는 main screen 것이라 alt grid
+    /// 텍스트와 맞지 않는다. wrapped 시각 라인 오차는 점프와 같은 베스트 에포트.
+    pub(crate) fn last_output_back_range(&self) -> Option<LastOutputRange> {
         if self.alt_screen {
             return None;
         }
         let c_idx = self
             .output_marks
             .iter()
-            .rposition(|(kind, _)| *kind == MarkKind::OutputStart)?;
+            .rposition(|(kind, _, _)| *kind == MarkKind::OutputStart)?;
         let c_line = self.output_marks[c_idx].1;
-        let end_exclusive = self
+        let done = self
             .output_marks
             .iter()
             .skip(c_idx + 1)
-            .find(|(kind, _)| *kind == MarkKind::CommandDone)
-            .map(|(_, line)| *line)
-            .unwrap_or(self.line + 1);
-        // C와 D가 같은 라인 = 출력 없는 명령 — 빈 범위.
-        if c_line >= end_exclusive {
+            .find(|(kind, _, _)| *kind == MarkKind::CommandDone);
+        let (end_line, last_line_chars) = match done {
+            // 개행 없는 마지막 출력 — D 라인 포함 + 출력 부분 char 수.
+            Some((_, d_line, d_col)) if *d_col > 0 => (*d_line, Some(*d_col as usize)),
+            // 출력이 개행으로 끝남(또는 출력 0) — D 직전 라인까지. d_line 0이면 출력 0.
+            Some((_, d_line, _)) => (d_line.checked_sub(1)?, None),
+            None => (self.line, None),
+        };
+        // C보다 앞이면 출력 0 (C 직후 D — 마크는 있으나 복사할 것이 없다).
+        if end_line < c_line {
             return None;
         }
-        Some((self.line - c_line, self.line + 1 - end_exclusive))
+        Some(LastOutputRange {
+            start_back: self.line - c_line,
+            end_back: self.line - end_line,
+            last_line_chars,
+        })
     }
 
     /// 이전(−)/다음(+) 프롬프트로 가는 스크롤 델타 (양수 = 과거로 — Scroll 관례).
@@ -311,7 +358,7 @@ mod tests {
         assert_eq!(marks.marks, [0, 2]);
         assert_eq!(
             marks.output_marks,
-            [(MarkKind::OutputStart, 1), (MarkKind::CommandDone, 2)]
+            [(MarkKind::OutputStart, 1, 0), (MarkKind::CommandDone, 2, 0)]
         );
     }
 
@@ -330,30 +377,96 @@ mod tests {
         // 완료된 명령: C(라인 1) → out1(1)/out2(2) → D(라인 3). 현재 라인 3.
         marks
             .scan(b"\x1b]133;A\x07$ a\n\x1b]133;C\x07out1\nout2\n\x1b]133;D;0\x07\x1b]133;A\x07$ ");
-        // back 좌표: out1 = 3−1 = 2, out2 = 3−2 = 1.
-        assert_eq!(marks.last_output_back_range(), Some((2, 1)));
+        // back 좌표: out1 = 3−1 = 2, out2 = 3−2 = 1. 출력이 개행으로 끝나 D 컬럼 0 —
+        // D 라인(다음 프롬프트)은 제외, 마지막 라인 자르기 없음.
+        assert_eq!(
+            marks.last_output_back_range(),
+            Some(LastOutputRange {
+                start_back: 2,
+                end_back: 1,
+                last_line_chars: None,
+            })
+        );
+    }
+
+    /// codex P2: `printf foo`처럼 출력이 개행 없이 끝나면 D가 그 출력과 같은 라인에
+    /// 찍힌다 — D 라인을 포함하고, D 시점의 char 수로 이후의 프롬프트를 잘라낸다.
+    #[test]
+    fn 개행_없는_마지막_출력은_d_라인을_포함하고_char_수로_자른다() {
+        let mut marks = PromptMarks::default();
+        marks.scan(b"\x1b]133;C\x07foo\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        assert_eq!(
+            marks.last_output_back_range(),
+            Some(LastOutputRange {
+                start_back: 0,
+                end_back: 0,
+                last_line_chars: Some(3),
+            })
+        );
+
+        // 멀티바이트(UTF-8)도 char 수로 센다 — "한글" = 6바이트 2char.
+        let mut marks = PromptMarks::default();
+        marks.scan("\x1b]133;C\x07한글\x1b]133;D;0\x07\x1b]133;A\x07$ ".as_bytes());
+        assert_eq!(
+            marks.last_output_back_range().unwrap().last_line_chars,
+            Some(2)
+        );
+
+        // \r 덮어쓰기(진행바)는 마지막 세그먼트만 남는다 — "abc\rde" → 2char.
+        let mut marks = PromptMarks::default();
+        marks.scan(b"\x1b]133;C\x07abc\rde\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        assert_eq!(
+            marks.last_output_back_range().unwrap().last_line_chars,
+            Some(2)
+        );
+
+        // 여러 라인 뒤 개행 없는 마지막 라인 — 그 라인까지 포함.
+        let mut marks = PromptMarks::default();
+        marks.scan(b"\x1b]133;C\x07out1\npar\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        assert_eq!(
+            marks.last_output_back_range(),
+            Some(LastOutputRange {
+                start_back: 1,
+                end_back: 0,
+                last_line_chars: Some(3),
+            })
+        );
     }
 
     #[test]
     fn d가_없으면_현재_라인까지가_출력_범위다() {
         let mut marks = PromptMarks::default();
         marks.scan(b"\x1b]133;C\x07running\npartial");
-        // C 라인 0, 현재 라인 1(부분 출력) — back (1, 0).
-        assert_eq!(marks.last_output_back_range(), Some((1, 0)));
+        // C 라인 0, 현재 라인 1(부분 출력) — back (1, 0). 실행 중이라 자르기 없음.
+        assert_eq!(
+            marks.last_output_back_range(),
+            Some(LastOutputRange {
+                start_back: 1,
+                end_back: 0,
+                last_line_chars: None,
+            })
+        );
     }
 
     #[test]
     fn 마크가_없거나_출력이_없으면_범위도_없다() {
         let mut marks = PromptMarks::default();
         assert_eq!(marks.last_output_back_range(), None);
-        // 출력 없는 명령 — C와 D가 같은 라인.
+        // 출력 없는 명령 — C 직후 D(같은 라인, 컬럼 0). 개행 없는 출력(컬럼>0)과 구분.
         marks.scan(b"\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07");
         assert_eq!(marks.last_output_back_range(), None);
         // alt screen 중에는 마크 좌표가 alt grid와 안 맞는다 — None, 복귀하면 재개.
         marks.scan(b"\x1b]133;C\x07out\n\x1b[?1049h");
         assert_eq!(marks.last_output_back_range(), None);
         marks.scan(b"\x1b[?1049l");
-        assert_eq!(marks.last_output_back_range(), Some((1, 0)));
+        assert_eq!(
+            marks.last_output_back_range(),
+            Some(LastOutputRange {
+                start_back: 1,
+                end_back: 0,
+                last_line_chars: None,
+            })
+        );
     }
 
     /// 점프 수식은 T3 검색(app ui/workspace.rs)의 스크롤 수식과 동치다:

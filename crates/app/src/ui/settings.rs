@@ -1583,6 +1583,34 @@ fn general_page(
             }
         },
     );
+    // 컴포저 전송 키 (2026-07-17) — 개행 키는 자동 보완(Enter 전송이면 Shift+Enter=개행,
+    // ⌘/Ctrl+Enter 전송이면 Enter=개행).
+    row(
+        ui,
+        &catalog.t("settings.composer_send_key", &[]),
+        Some(&catalog.t("settings.composer_send_key.hint", &[])),
+        |ui| {
+            use crate::config::ComposerSendKey;
+            for (value, key) in [
+                (ComposerSendKey::Enter, "settings.composer_send_key.enter"),
+                (
+                    ComposerSendKey::CmdEnter,
+                    "settings.composer_send_key.cmd_enter",
+                ),
+                (
+                    ComposerSendKey::CtrlEnter,
+                    "settings.composer_send_key.ctrl_enter",
+                ),
+            ] {
+                if ui
+                    .radio_value(&mut config.ui.composer_send_key, value, catalog.t(key, &[]))
+                    .changed()
+                {
+                    *changed = true;
+                }
+            }
+        },
+    );
     agent_send_presets_section(ui, config, changed, catalog);
 }
 

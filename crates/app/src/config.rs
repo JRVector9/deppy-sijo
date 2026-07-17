@@ -112,6 +112,23 @@ pub struct UiConfig {
     /// (2026-07-13, 터미널과 독립). 1.0 = 기본.
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
+    /// 하단 도크 컴포저의 전송 키 (2026-07-17). 개행 키는 자동 보완 —
+    /// Enter 전송이면 Shift+Enter=개행, ⌘/Ctrl+Enter 전송이면 Enter=개행.
+    #[serde(default)]
+    pub composer_send_key: ComposerSendKey,
+}
+
+/// 컴포저 전송 키 — "프롬프트가 길면 실수로 Enter를 누를 가능성"(사용자) 대응 옵션.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerSendKey {
+    /// Enter로 전송, Shift+Enter로 개행 (기본).
+    #[default]
+    Enter,
+    /// ⌘+Enter로 전송, Enter로 개행.
+    CmdEnter,
+    /// Ctrl+Enter로 전송, Enter로 개행.
+    CtrlEnter,
 }
 
 fn default_ui_scale() -> f32 {
@@ -147,6 +164,7 @@ impl Default for UiConfig {
             last_workspace_id: None,
             ui_font: None,
             ui_scale: 1.0,
+            composer_send_key: ComposerSendKey::default(),
         }
     }
 }

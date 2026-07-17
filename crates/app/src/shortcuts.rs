@@ -28,6 +28,9 @@ pub enum ShortcutAction {
     TerminalSearch,
     /// 스크롤백에서 맨 아래(라이브 화면)로 복귀 (⌘↓ 기본 — pane 메뉴와 동일 동작)
     ScrollToBottom,
+    /// 하단 도크 컴포저 포커스+펼침 (⌘J 기본). 이미 포커스면 컴포저 안에서 접는다
+    /// (전역 단축키는 text edit 포커스 중 비활성 — 접기는 composer가 직접 처리).
+    FocusComposer,
     ClearRenderCaches,
     PreviousAgent,
     NextAgent,
@@ -67,7 +70,7 @@ impl ShortcutGroup {
 }
 
 impl ShortcutAction {
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::ToggleSidebar,
         Self::OpenEnvironment,
         Self::OpenAgents,
@@ -85,6 +88,7 @@ impl ShortcutAction {
         Self::DecreaseTerminalFont,
         Self::TerminalSearch,
         Self::ScrollToBottom,
+        Self::FocusComposer,
         Self::ClearRenderCaches,
         Self::PreviousAgent,
         Self::NextAgent,
@@ -116,6 +120,7 @@ impl ShortcutAction {
             Self::DecreaseTerminalFont => "decrease_terminal_font",
             Self::TerminalSearch => "terminal_search",
             Self::ScrollToBottom => "scroll_to_bottom",
+            Self::FocusComposer => "focus_composer",
             Self::ClearRenderCaches => "clear_render_caches",
             Self::PreviousAgent => "previous_agent",
             Self::NextAgent => "next_agent",
@@ -148,6 +153,7 @@ impl ShortcutAction {
             Self::DecreaseTerminalFont => "shortcuts.action.decrease_terminal_font",
             Self::TerminalSearch => "shortcuts.action.terminal_search",
             Self::ScrollToBottom => "shortcuts.action.scroll_to_bottom",
+            Self::FocusComposer => "shortcuts.action.focus_composer",
             Self::ClearRenderCaches => "shortcuts.action.clear_render_caches",
             Self::PreviousAgent => "shortcuts.action.previous_agent",
             Self::NextAgent => "shortcuts.action.next_agent",
@@ -185,7 +191,8 @@ impl ShortcutAction {
             | Self::IncreaseTerminalFont
             | Self::DecreaseTerminalFont
             | Self::TerminalSearch
-            | Self::ScrollToBottom => ShortcutGroup::Terminal,
+            | Self::ScrollToBottom
+            | Self::FocusComposer => ShortcutGroup::Terminal,
             Self::NextWorkspace | Self::PreviousWorkspace | Self::ClearRenderCaches => {
                 ShortcutGroup::Workspace
             }
@@ -223,6 +230,7 @@ impl ShortcutAction {
             // 기본으로 가로채지 않는다 — 사용자는 설정에서 Ctrl+F로 rebind할 수 있다 (T3).
             Self::TerminalSearch => Some("Command+F"),
             Self::ScrollToBottom => Some("Command+Down"),
+            Self::FocusComposer => Some("Command+J"),
             Self::ClearRenderCaches => Some("Command+Alt+K"),
             Self::PreviousAgent
             | Self::NextAgent

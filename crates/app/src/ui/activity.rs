@@ -473,7 +473,7 @@ fn input_pressure_badge(
     let text = input_pressure_badge_text(catalog, pressure);
     egui::Frame::new()
         .fill(color.gamma_multiply(0.15))
-        .corner_radius(egui::CornerRadius::same(4))
+        .corner_radius(egui::CornerRadius::same(2))
         .inner_margin(egui::Margin::symmetric(6, 1))
         .show(ui, |ui| {
             ui.colored_label(color, egui::RichText::new(text).small());

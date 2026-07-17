@@ -307,7 +307,7 @@ impl ComposerUi {
         let card = egui::Frame::new()
             .fill(card_fill)
             .stroke(card_stroke)
-            .corner_radius(11)
+            .corner_radius(2)
             .inner_margin(egui::Margin::symmetric(12, 10))
             .shadow(shadow);
         let card_response = card.show(ui, |ui| {
@@ -814,7 +814,7 @@ impl ComposerUi {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let enabled = ctx.can_send && !buffer.trim().is_empty() && !attach_pending;
                 if ui
-                    .add_enabled(enabled, egui::Button::new("↑").corner_radius(8))
+                    .add_enabled(enabled, egui::Button::new("↑").corner_radius(1))
                     .on_hover_text(catalog.t("composer.send", &[]))
                     .clicked()
                 {

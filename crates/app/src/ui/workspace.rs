@@ -1008,10 +1008,9 @@ impl WorkspaceUi {
         }
     }
 
-    pub fn show(
+    fn prepare_frame(
         &mut self,
-        ui: &mut egui::Ui,
-        config: &TerminalConfig,
+        ctx: &egui::Context,
         client: &dyn RuntimeClient,
         events: &[RuntimeEvent],
         catalog: &i18n::Catalog,
@@ -1027,9 +1026,32 @@ impl WorkspaceUi {
         self.handle_events(client, events, catalog);
         // 「마지막 출력 복사」 — handle_events에는 Context가 없어 여기서 수행한다.
         if let Some(text) = self.pending_copy.take() {
-            ui.ctx().copy_text(text);
+            ctx.copy_text(text);
         }
         self.poll_paste_task(client);
+    }
+
+    /// 홈 대시보드가 중앙 표면을 차지한 프레임에도 런타임 이벤트와 비동기 붙여넣기
+    /// 결과를 계속 소비한다. 렌더만 생략하고 WorkspaceUi의 수명주기 상태는 동일하게 유지한다.
+    pub fn update_hidden(
+        &mut self,
+        ctx: &egui::Context,
+        client: &dyn RuntimeClient,
+        events: &[RuntimeEvent],
+        catalog: &i18n::Catalog,
+    ) {
+        self.prepare_frame(ctx, client, events, catalog);
+    }
+
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        config: &TerminalConfig,
+        client: &dyn RuntimeClient,
+        events: &[RuntimeEvent],
+        catalog: &i18n::Catalog,
+    ) {
+        self.prepare_frame(ui.ctx(), client, events, catalog);
 
         // 탭바 제거 (2026-07-05): 셸 전환은 좌측 사이드바 세션 목록이 담당하고,
         // 새 셸/분할/닫기는 각 pane 헤더가 담당한다 — 셸 수만큼 탭이 늘어나

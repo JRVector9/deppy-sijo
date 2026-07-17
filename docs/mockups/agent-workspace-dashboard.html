@@ -1,0 +1,2559 @@
+<!doctype html>
+<!--
+  Native egui port map:
+  - .topbar / .statusbar        -> Panel::top / Panel::bottom
+  - .workspace-rail            -> SidePanel::left (workspace navigation)
+  - .session-rail               -> SidePanel::left (session navigation)
+  - .inbox-panel                -> SidePanel::right or movable overlay Window
+  - .work-area                  -> CentralPanel + updates/composer bottom Panels
+  - colors/strokes/radii        -> crates/app/src/theme.rs Visuals and painters
+
+  The mockup intentionally uses no remote assets, blur, or layout behavior
+  that requires a browser-only rendering primitive.
+-->
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Deppy Sijo — Agent Workspace 목업</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #131317;
+      --terminal: #101116;
+      --panel: #1b1b21;
+      --panel-2: #22222a;
+      --panel-hi: #2a2a33;
+      --panel-low: #17171c;
+      --border: #3a3a42;
+      --border-soft: #2d2d36;
+      --text: #d7d8db;
+      --text-strong: #f0f1f3;
+      --dim: #8b8f98;
+      --faint: #5b5f68;
+      --accent: #43b8cd;
+      --accent-soft: #223e46;
+      --green: #55c879;
+      --green-soft: #1d3b29;
+      --orange: #e79a3b;
+      --orange-soft: #3a2b1c;
+      --red: #df5b5b;
+      --red-soft: #3a2023;
+      --violet: #7f78e8;
+      --violet-soft: #2c2a55;
+      --topbar-h: 68px;
+      --statusbar-h: 30px;
+      --sidebar-w: 470px;
+      --workspace-w: 254px;
+      --sessions-w: 216px;
+      --inbox-w: 366px;
+      --radius: 2px;
+      --radius-sm: 1px;
+      --font-ui: AppleGothic, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+      --font-mono: Menlo, Monaco, "SFMono-Regular", Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body { height: 100%; }
+
+    body {
+      min-width: 900px;
+      margin: 0;
+      overflow: hidden;
+      background: #0e0e12;
+      color: var(--text);
+      font-family: var(--font-ui);
+      font-size: 14px;
+      line-height: 1.45;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    button, input, textarea { font: inherit; }
+
+    button {
+      color: inherit;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    svg.icon {
+      width: 18px;
+      height: 18px;
+      flex: 0 0 auto;
+      stroke: currentColor;
+      stroke-width: 1.7;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      fill: none;
+    }
+
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+
+    .app-shell {
+      width: 100vw;
+      height: 100vh;
+      display: grid;
+      grid-template-rows: var(--topbar-h) minmax(0, 1fr) var(--statusbar-h);
+      background: var(--bg);
+      overflow: hidden;
+    }
+
+    .topbar {
+      min-width: 0;
+      display: grid;
+      grid-template-columns: var(--sidebar-w) minmax(0, 1fr) var(--inbox-w);
+      align-items: stretch;
+      border-bottom: 1px solid var(--border-soft);
+      background: var(--panel-low);
+      user-select: none;
+    }
+
+    .brand-zone,
+    .context-zone,
+    .action-zone {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+    }
+
+    .brand-zone {
+      gap: 14px;
+      padding: 0 18px;
+      border-right: 1px solid var(--border-soft);
+    }
+
+    .traffic-lights { display: flex; gap: 9px; }
+
+    .traffic-light {
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: var(--faint);
+    }
+
+    .traffic-light.red { background: #ff5f57; }
+    .traffic-light.yellow { background: #ffbd2e; }
+    .traffic-light.green { background: #28c840; }
+
+    .brand-copy { min-width: 0; }
+
+    .brand-title {
+      color: var(--text-strong);
+      font-size: 16px;
+      font-weight: 600;
+      line-height: 1.2;
+      white-space: nowrap;
+    }
+
+    .brand-subtitle {
+      margin-top: 2px;
+      color: var(--dim);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .context-zone {
+      pointer-events: none;
+    }
+
+    .icon-button,
+    .plain-button,
+    .select-button,
+    .answer-button {
+      border: 1px solid var(--border-soft);
+      background: var(--panel-2);
+      cursor: pointer;
+    }
+
+    .icon-button:hover,
+    .plain-button:hover,
+    .select-button:hover,
+    .answer-button:hover {
+      border-color: var(--border);
+      background: var(--panel-hi);
+      color: var(--text-strong);
+    }
+
+    .icon-button:focus-visible,
+    .plain-button:focus-visible,
+    .select-button:focus-visible,
+    .answer-button:focus-visible,
+    .nav-item:focus-visible,
+    .workspace-card:focus-visible,
+    .session-card:focus-visible,
+    .insight-action:focus-visible,
+    .composer textarea:focus-visible {
+      outline: 1px solid var(--accent);
+      outline-offset: 1px;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      flex: 0 0 auto;
+      border-radius: 50%;
+      background: var(--faint);
+    }
+
+    .dot.green { background: var(--green); }
+    .dot.orange { background: var(--orange); }
+    .dot.violet { background: var(--violet); }
+
+    .action-zone {
+      justify-content: flex-end;
+      gap: 9px;
+      padding: 0 14px;
+    }
+
+    .icon-button {
+      position: relative;
+      width: 36px;
+      height: 36px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      border-color: transparent;
+      border-radius: var(--radius-sm);
+      background: transparent;
+      color: var(--text);
+    }
+
+    .badge {
+      min-width: 19px;
+      height: 19px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0 5px;
+      border-radius: 10px;
+      background: #cc3d3d;
+      color: white;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-weight: 700;
+    }
+
+    .icon-button .badge {
+      position: absolute;
+      top: -2px;
+      right: -1px;
+    }
+
+    .avatar {
+      width: 34px;
+      height: 34px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      margin-left: 4px;
+      border: 1px solid #4a4680;
+      border-radius: 50%;
+      background: var(--violet-soft);
+      color: #efeeff;
+      font-size: 15px;
+    }
+
+    .workspace-layout {
+      position: relative;
+      min-width: 0;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: var(--sidebar-w) minmax(440px, 1fr) var(--inbox-w);
+      overflow: hidden;
+    }
+
+    .app-shell.inbox-closed .workspace-layout {
+      grid-template-columns: var(--sidebar-w) minmax(440px, 1fr) 0;
+    }
+
+    .app-shell.inbox-closed .inbox-panel { display: none; }
+
+    .workspace-rail,
+    .session-rail,
+    .inbox-panel {
+      min-width: 0;
+      min-height: 0;
+      background: var(--panel-low);
+    }
+
+    .workspace-rail {
+      display: flex;
+      flex-direction: column;
+      padding: 14px 10px 10px;
+      border-right: 1px solid var(--border-soft);
+    }
+
+    .rail-heading {
+      height: 36px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 7px;
+      color: var(--dim);
+      font-size: 13px;
+    }
+
+    .rail-heading .icon-button { width: 28px; height: 28px; }
+
+    .workspace-list {
+      display: grid;
+      gap: 4px;
+      margin-bottom: 12px;
+    }
+
+    .workspace-card {
+      width: 100%;
+      min-height: 62px;
+      display: grid;
+      grid-template-columns: 42px minmax(0, 1fr);
+      align-items: center;
+      gap: 10px;
+      padding: 8px;
+      border: 1px solid transparent;
+      border-radius: var(--radius);
+      background: transparent;
+      color: var(--text);
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .workspace-card:hover { background: var(--panel-2); }
+
+    .workspace-card.active {
+      border-color: var(--border-soft);
+      background: var(--panel-2);
+    }
+
+    .workspace-avatar {
+      width: 40px;
+      height: 40px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: 0;
+      border-radius: var(--radius-sm);
+      background: #1d4a2e;
+      color: #b8f2c8;
+      font-size: 17px;
+    }
+
+    .workspace-avatar.orange { background: #4b2c16; color: #ffd29b; }
+    .workspace-avatar.violet { background: #34266d; color: #d2c8ff; }
+    .workspace-avatar.cyan { background: #164950; color: #b8f3f6; }
+    .workspace-avatar.blue { background: #1d3e70; color: #c8ddff; }
+    .workspace-avatar.micro { width: 22px; height: 22px; font-size: 11px; }
+
+    .workspace-name {
+      overflow: hidden;
+      color: var(--text-strong);
+      font-size: 15px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .workspace-state {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      margin-top: 4px;
+      color: var(--dim);
+      font-size: 11px;
+    }
+
+    .rail-divider {
+      height: 1px;
+      margin: 0 8px 9px;
+      background: var(--border-soft);
+    }
+
+    .nav-list { display: grid; gap: 3px; }
+
+    .nav-item {
+      width: 100%;
+      height: 44px;
+      display: grid;
+      grid-template-columns: 28px minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 6px;
+      padding: 0 10px;
+      border: 1px solid transparent;
+      border-radius: var(--radius);
+      background: transparent;
+      color: #b8bbc2;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .nav-item:hover { background: var(--panel-2); color: var(--text-strong); }
+
+    .nav-item.active {
+      border-color: var(--border-soft);
+      background: var(--panel-2);
+      color: var(--text-strong);
+    }
+
+    .nav-item .badge { justify-self: end; }
+
+    .system-card {
+      margin-top: auto;
+      padding: 12px 10px 0;
+      border-top: 1px solid var(--border-soft);
+    }
+
+    .system-title { color: var(--dim); font-size: 12px; }
+
+    .sparkline {
+      width: 100%;
+      height: 42px;
+      display: block;
+      margin: 7px 0 4px;
+    }
+
+    .sparkline polyline {
+      fill: none;
+      stroke: var(--green);
+      stroke-width: 1.5;
+      vector-effect: non-scaling-stroke;
+    }
+
+    .system-stat {
+      display: flex;
+      justify-content: space-between;
+      margin-top: 7px;
+      color: var(--dim);
+      font-size: 12px;
+    }
+
+    .system-stat strong { color: #aeb1ba; font-weight: 400; }
+
+    .settings-link {
+      width: 100%;
+      height: 42px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 11px;
+      padding: 0 1px;
+      border: 0;
+      border-top: 1px solid var(--border-soft);
+      background: transparent;
+      color: #b8bbc2;
+      cursor: pointer;
+    }
+
+    .settings-link:hover { color: var(--text-strong); }
+
+    .session-rail {
+      display: flex;
+      flex-direction: column;
+      padding: 14px 8px 10px;
+      border-right: 1px solid var(--border-soft);
+    }
+
+    .session-list {
+      min-height: 0;
+      display: grid;
+      gap: 6px;
+      overflow-y: auto;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border) transparent;
+    }
+
+    .session-card {
+      width: 100%;
+      min-height: 118px;
+      display: flex;
+      flex-direction: column;
+      padding: 12px 11px;
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius);
+      background: transparent;
+      color: var(--text);
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .session-card:hover { background: #1e1e25; }
+
+    .session-card.active {
+      border-color: var(--border);
+      background: var(--panel-2);
+    }
+
+    .session-title-row {
+      display: grid;
+      grid-template-columns: 22px minmax(0, 1fr);
+      align-items: center;
+      gap: 7px;
+    }
+
+    .provider-mark {
+      width: 20px;
+      height: 20px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 50%;
+      background: #29272b;
+      color: var(--orange);
+      font-family: var(--font-mono);
+      font-size: 12px;
+    }
+
+    .provider-mark.codex { color: #d9dbe2; }
+    .provider-mark.shell { border-radius: 1px; color: #b7c7df; }
+    .provider-mark.gemini { color: #b9a7ff; }
+
+    .session-title {
+      overflow: hidden;
+      color: var(--text-strong);
+      font-size: 14px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .session-meta {
+      margin-top: 8px;
+      color: var(--dim);
+      font-size: 12px;
+    }
+
+    .session-status-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      margin-top: 3px;
+      color: var(--dim);
+      font-size: 12px;
+    }
+
+    .status-label.green { color: var(--green); }
+    .status-label.orange { color: var(--orange); }
+    .status-label.violet { color: var(--violet); }
+
+    .session-time {
+      margin-top: auto;
+      color: var(--dim);
+      font-size: 11px;
+      text-align: right;
+    }
+
+    .new-session-button {
+      height: 42px;
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      margin: 8px 4px 0;
+      padding: 0 7px;
+      border: 0;
+      border-top: 1px solid var(--border-soft);
+      background: transparent;
+      color: #b8bbc2;
+      cursor: pointer;
+    }
+
+    .new-session-button:hover { color: var(--text-strong); }
+
+    .legacy-rail { display: none !important; }
+
+    .unified-sidebar {
+      position: relative;
+      min-width: 0;
+      min-height: 0;
+      display: grid;
+      grid-template-rows: minmax(300px, 1.12fr) minmax(240px, .88fr) 108px;
+      gap: 4px;
+      padding: 4px;
+      border-right: 1px solid var(--border-soft);
+      background: var(--terminal);
+      overflow: hidden;
+    }
+
+    .sidebar-resizer {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: calc(var(--sidebar-w) - 4px);
+      z-index: 32;
+      width: 8px;
+      border: 0;
+      background: transparent;
+      cursor: col-resize;
+      touch-action: none;
+    }
+
+    .sidebar-resizer::after {
+      content: "";
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 3px;
+      width: 1px;
+      background: transparent;
+      transition: background 120ms ease;
+    }
+
+    .sidebar-resizer:hover::after,
+    .sidebar-resizer:focus-visible::after,
+    .sidebar-resizer.dragging::after { background: var(--accent); }
+
+    .sidebar-section {
+      min-width: 0;
+      min-height: 0;
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius);
+      background: #15171d;
+      overflow: hidden;
+    }
+
+    .sidebar-section-header {
+      height: 42px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 0 10px 0 14px;
+      border-bottom: 1px solid var(--border-soft);
+      color: var(--text-strong);
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .sidebar-section-header .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 2px;
+      margin-left: auto;
+    }
+
+    .sidebar-section-header .icon-button { width: 28px; height: 28px; }
+
+    .workspace-session-scroll,
+    .file-tree-scroll {
+      min-height: 0;
+      height: calc(100% - 42px);
+      overflow: auto;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border) transparent;
+    }
+
+    .workspace-session-scroll { padding: 7px 8px 8px; }
+
+    .unified-sidebar .workspace-card {
+      min-height: 38px;
+      grid-template-columns: 28px minmax(0, 1fr) auto;
+      gap: 8px;
+      padding: 5px 6px;
+      border-radius: var(--radius-sm);
+    }
+
+    .workspace-tail {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+
+    .workspace-chevron {
+      width: 14px;
+      flex: 0 0 14px;
+      color: var(--dim);
+      font-family: var(--font-ui);
+      font-size: 13px;
+      text-align: center;
+    }
+
+    .unified-sidebar .workspace-card.active {
+      min-height: 48px;
+      border-color: transparent;
+      background: transparent;
+    }
+
+    .unified-sidebar .workspace-card.active:hover { background: var(--panel-2); }
+
+    .unified-sidebar .workspace-avatar {
+      width: 28px;
+      height: 28px;
+      margin: 0;
+      font-size: 13px;
+    }
+
+    .unified-sidebar .workspace-name {
+      display: block;
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .unified-workspace-meta {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      margin-top: 1px;
+      overflow: hidden;
+      color: var(--dim);
+      font-family: var(--font-mono);
+      font-size: 9px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .branch-accent { color: var(--green); }
+
+    .workspace-summary {
+      color: var(--dim);
+      font-size: 10px;
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    .workspace-summary.orange { color: var(--orange); }
+
+    .workspace-cluster {
+      margin-bottom: 3px;
+      padding-bottom: 5px;
+      border-bottom: 1px solid var(--border-soft);
+    }
+
+    .session-tree {
+      position: relative;
+      margin-left: 37px;
+      padding-left: 11px;
+      border-left: 1px solid var(--border-soft);
+    }
+
+    .session-tree[hidden] { display: none; }
+
+    .unified-sidebar .session-card {
+      --status-color: var(--faint);
+      position: relative;
+      min-height: 38px;
+      display: grid;
+      grid-template-columns: 22px minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 7px;
+      padding: 4px 5px 4px 10px;
+      border-color: transparent;
+      border-radius: var(--radius-sm);
+      background: transparent;
+    }
+
+    .unified-sidebar .session-card[data-status="입력 대기"] { --status-color: var(--orange); }
+    .unified-sidebar .session-card[data-status="실행 중"] { --status-color: #4ca8df; }
+    .unified-sidebar .session-card[data-status="완료"] { --status-color: var(--green); }
+    .unified-sidebar .session-card[data-status="오류"] { --status-color: var(--red); }
+    .unified-sidebar .session-card[data-status="유휴"],
+    .unified-sidebar .session-card[data-status="비활성"] { --status-color: var(--faint); }
+
+    .unified-sidebar .session-card::before {
+      content: "";
+      position: absolute;
+      top: 50%;
+      left: -12px;
+      width: 10px;
+      border-top: 1px solid var(--border-soft);
+    }
+
+    .unified-sidebar .session-card::after {
+      content: "";
+      position: absolute;
+      top: 7px;
+      bottom: 7px;
+      left: 2px;
+      width: 3px;
+      border-radius: 0;
+      background: var(--status-color);
+    }
+
+    .unified-sidebar .session-card:hover,
+    .unified-sidebar .session-card.active {
+      border-color: transparent;
+      background: var(--panel-2);
+    }
+
+    .unified-sidebar .provider-mark {
+      width: 22px;
+      height: 22px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      font-size: 10px;
+    }
+
+    .unified-session-copy { min-width: 0; }
+
+    .unified-session-copy strong,
+    .unified-session-copy small {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .unified-session-copy strong {
+      color: #d6d8de;
+      font-size: 11px;
+      font-weight: 500;
+    }
+
+    .unified-session-copy small {
+      margin-top: 1px;
+      color: var(--dim);
+      font-size: 9px;
+    }
+
+    .unified-session-state {
+      font-size: 9px;
+      white-space: nowrap;
+    }
+
+    .unified-session-state.orange { color: var(--orange); }
+    .unified-session-state.blue { color: #5da9e9; }
+    .unified-session-state.violet { color: var(--violet); }
+
+    .file-tree-scroll { padding: 7px 8px 10px; }
+
+    .file-root {
+      height: 28px;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 0 5px;
+      color: var(--text-strong);
+      font-size: 11px;
+      font-weight: 600;
+    }
+
+    .file-root .root-path {
+      overflow: hidden;
+      color: var(--dim);
+      font-family: var(--font-mono);
+      font-size: 9px;
+      font-weight: 400;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .tree-row {
+      width: 100%;
+      height: 24px;
+      display: grid;
+      grid-template-columns: 12px 16px minmax(0, 1fr);
+      align-items: center;
+      gap: 3px;
+      padding: 0 5px 0 calc(5px + var(--depth, 0) * 18px);
+      border: 0;
+      border-radius: 1px;
+      background: transparent;
+      color: #aeb1ba;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .tree-row:hover { background: var(--panel-2); color: var(--text-strong); }
+
+    .tree-row.depth-1 { --depth: 1; }
+    .tree-row.depth-2 { --depth: 2; }
+
+    .tree-row .icon {
+      width: 14px;
+      height: 14px;
+      color: #4b87b4;
+    }
+
+    .tree-row.file .icon { color: #9aa0aa; }
+    .tree-row.secret .icon { color: var(--orange); }
+
+    .tree-caret {
+      color: var(--faint);
+      font-family: var(--font-ui);
+      font-size: 9px;
+      text-align: center;
+    }
+
+    .tree-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .sidebar-nav-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-rows: repeat(2, 1fr);
+      gap: 3px;
+      padding: 7px 8px;
+    }
+
+    .unified-sidebar .sidebar-nav-grid .nav-item {
+      position: relative;
+      height: auto;
+      min-height: 42px;
+      grid-template-columns: 24px minmax(0, 1fr) auto;
+      justify-items: start;
+      gap: 7px;
+      padding: 0 9px;
+      color: #bfc2c9;
+      font-size: 12px;
+    }
+
+    .unified-sidebar .sidebar-nav-grid .nav-item.active {
+      border-color: transparent;
+      background: #19232d;
+      color: #dbe9f2;
+    }
+
+    .unified-sidebar .sidebar-nav-grid .nav-item.active .icon { color: #4ca8df; }
+
+    .unified-sidebar .sidebar-nav-grid .nav-item .badge {
+      position: static;
+      justify-self: end;
+      transform: none;
+    }
+
+    .work-area {
+      min-width: 0;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: 53px minmax(260px, 1fr) auto;
+      background: var(--terminal);
+      overflow: hidden;
+    }
+
+    .work-area.home-mode {
+      grid-template-rows: minmax(0, 1fr);
+    }
+
+    .work-area.home-mode > :not(.home-view) { display: none; }
+
+    .home-view {
+      min-width: 0;
+      min-height: 0;
+      display: grid;
+      grid-template-rows: 320px auto auto;
+      align-content: start;
+      gap: 14px;
+      padding: 22px;
+      background: var(--terminal);
+      overflow: auto;
+    }
+
+    .home-view[hidden] { display: none; }
+
+    .home-updates-slot {
+      min-width: 0;
+      min-height: 0;
+    }
+
+    .home-updates-slot .updates-panel {
+      height: 100%;
+      grid-template-rows: 54px minmax(0, 1fr);
+    }
+
+    .home-updates-slot .updates-header { padding-inline: 16px; gap: 10px; }
+    .home-updates-slot .updates-title { font-size: 16px; }
+    .home-updates-slot .sample-chip,
+    .home-updates-slot .source-filter { height: 30px; padding-inline: 12px; font-size: 11px; }
+    .home-updates-slot .updates-grid { gap: 12px; padding: 14px 16px 16px; }
+    .home-updates-slot .update-card { gap: 7px; padding: 16px 18px; }
+    .home-updates-slot .update-card-head { font-size: 11px; }
+    .home-updates-slot .announcement-provider { width: 26px; height: 26px; }
+    .home-updates-slot .update-title { font-size: 16px; }
+    .home-updates-slot .update-summary { font-size: 12px; line-height: 1.65; }
+    .home-updates-slot .update-footer { font-size: 11px; }
+
+    .orchestration-panel {
+      min-width: 0;
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius);
+      background: var(--panel-low);
+      overflow: hidden;
+    }
+
+    .orchestration-header {
+      min-height: 42px;
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      padding: 0 14px;
+      border-bottom: 1px solid var(--border-soft);
+    }
+
+    .orchestration-header h2 {
+      margin: 0;
+      color: var(--text-strong);
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .orchestration-kicker {
+      color: var(--dim);
+      font-size: 10px;
+    }
+
+    .orchestration-count {
+      margin-left: auto;
+      color: var(--accent);
+      font-family: var(--font-mono);
+      font-size: 10px;
+    }
+
+    .orchestration-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .orchestration-item {
+      --insight-color: var(--accent);
+      min-width: 0;
+      min-height: 108px;
+      display: grid;
+      grid-template-columns: 3px minmax(0, 1fr) auto;
+      grid-template-rows: auto 1fr auto;
+      column-gap: 10px;
+      padding: 13px 14px;
+      border: 0;
+      border-right: 1px solid var(--border-soft);
+      background: #17181e;
+      color: var(--text);
+      text-align: left;
+    }
+
+    .orchestration-item:last-child { border-right: 0; }
+    .orchestration-item.risk { --insight-color: var(--red); }
+    .orchestration-item.waiting { --insight-color: var(--orange); }
+    .orchestration-item.opportunity { --insight-color: #4ca8df; }
+
+    .insight-bar {
+      grid-row: 1 / 4;
+      width: 3px;
+      background: var(--insight-color);
+    }
+
+    .insight-label {
+      color: var(--insight-color);
+      font-size: 10px;
+      font-weight: 600;
+    }
+
+    .insight-scope {
+      color: var(--faint);
+      font-family: var(--font-mono);
+      font-size: 9px;
+      white-space: nowrap;
+    }
+
+    .insight-title {
+      grid-column: 2 / 4;
+      align-self: center;
+      margin: 5px 0;
+      color: var(--text-strong);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .insight-action {
+      grid-column: 2 / 4;
+      justify-self: start;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: var(--accent);
+      font-size: 10px;
+      cursor: pointer;
+    }
+
+    .insight-action:hover { color: var(--text-strong); }
+
+    .home-status-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .home-status-card {
+      min-width: 0;
+      min-height: 82px;
+      display: grid;
+      grid-template-columns: 4px minmax(0, 1fr);
+      gap: 12px;
+      padding: 13px 15px;
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius);
+      background: var(--panel-low);
+    }
+
+    .home-status-bar { border-radius: 0; background: var(--faint); }
+    .home-status-card.running .home-status-bar { background: #4ca8df; }
+    .home-status-card.waiting .home-status-bar { background: var(--orange); }
+    .home-status-card.done .home-status-bar { background: var(--green); }
+    .home-status-card.error .home-status-bar { background: var(--red); }
+    .home-status-card.idle .home-status-bar { background: var(--dim); }
+    .home-status-card.inactive .home-status-bar { background: var(--faint); }
+
+    .home-status-label { display: block; color: var(--dim); font-size: 11px; }
+    .home-status-value { display: block; margin-top: 4px; color: var(--text-strong); font-size: 18px; }
+    .home-status-detail { display: block; margin-top: 1px; color: var(--dim); font-size: 10px; }
+
+    .tabbar {
+      display: flex;
+      align-items: flex-end;
+      gap: 5px;
+      padding: 8px 8px 0;
+      border-bottom: 1px solid var(--border-soft);
+      background: var(--panel-low);
+    }
+
+    .tabbar-actions {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      margin: 0 4px 6px auto;
+    }
+
+    .active-tab {
+      height: 44px;
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      padding: 0 12px;
+      border: 1px solid var(--border-soft);
+      border-bottom-color: var(--panel-2);
+      border-radius: var(--radius) var(--radius) 0 0;
+      background: var(--panel-2);
+      color: var(--text-strong);
+    }
+
+    .active-tab .icon-button { width: 26px; height: 26px; }
+
+    .add-tab {
+      width: 38px;
+      height: 38px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 3px;
+      border: 0;
+      background: transparent;
+      color: var(--text);
+      cursor: pointer;
+    }
+
+    .add-tab:hover { color: var(--accent); }
+
+    .terminal-pane {
+      min-width: 0;
+      min-height: 0;
+      margin: 0 8px 7px;
+      border: 1px solid var(--border-soft);
+      border-top: 0;
+      border-radius: 0 0 var(--radius) var(--radius);
+      background: #0f1117;
+      overflow: auto;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border) transparent;
+    }
+
+    .terminal-stream {
+      min-height: 100%;
+      position: relative;
+      padding: 18px;
+      color: #ced1d9;
+      font-family: var(--font-mono);
+      font-size: 13px;
+      line-height: 1.7;
+    }
+
+    .permission-card {
+      width: min(485px, 82%);
+      padding: 13px 16px 16px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: #12151c;
+    }
+
+    .permission-card p { margin: 0 0 8px; }
+
+    .command-line {
+      margin: 16px 0 11px;
+      padding: 11px 13px;
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius-sm);
+      background: #111721;
+      color: #73c8f2;
+    }
+
+    .terminal-cursor {
+      width: 7px;
+      height: 17px;
+      display: inline-block;
+      margin-left: 5px;
+      vertical-align: -3px;
+      background: #dfe2e9;
+      animation: blink 1.1s step-end infinite;
+    }
+
+    @keyframes blink { 50% { opacity: 0; } }
+
+    @media (prefers-reduced-motion: reduce) {
+      .terminal-cursor { animation: none; }
+      .updates-header .icon-button.refreshing svg { transition: none; }
+    }
+
+    .sent-line {
+      margin-top: 14px;
+      color: #aeb3bd;
+      white-space: pre-wrap;
+    }
+
+    .terminal-size {
+      position: absolute;
+      right: 16px;
+      bottom: 16px;
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      margin: 0;
+      padding: 8px 11px;
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius-sm);
+      background: #151923;
+      color: var(--dim);
+      font-family: var(--font-ui);
+      font-size: 11px;
+    }
+
+    .updates-dock {
+      display: none;
+    }
+
+    .updates-panel {
+      height: 100%;
+      min-width: 0;
+      display: grid;
+      grid-template-rows: 43px minmax(0, 1fr);
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius);
+      background: var(--panel-low);
+      overflow: hidden;
+    }
+
+    .updates-header {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 0 10px;
+      border-bottom: 1px solid var(--border-soft);
+    }
+
+    .updates-title {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--text-strong);
+      font-size: 13px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .live-dot {
+      width: 7px;
+      height: 7px;
+      display: inline-block;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 0 3px #193222;
+    }
+
+    .sample-chip,
+    .source-filter {
+      height: 24px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0 7px;
+      border: 1px solid var(--border-soft);
+      border-radius: 12px;
+      background: transparent;
+      color: var(--dim);
+      font-size: 10px;
+      white-space: nowrap;
+    }
+
+    .sample-chip {
+      border-color: #59492e;
+      background: #2d281e;
+      color: #d5ae70;
+    }
+
+    .source-filter { cursor: pointer; }
+
+    .source-filter:hover,
+    .source-filter.active {
+      border-color: #376674;
+      background: var(--accent-soft);
+      color: #8cdae7;
+    }
+
+    .sync-state {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      margin-left: auto;
+      color: var(--dim);
+      font-size: 10px;
+      white-space: nowrap;
+    }
+
+    .updates-header .icon-button { width: 28px; height: 28px; }
+
+    .updates-header .icon-button.refreshing svg {
+      transform: rotate(180deg);
+      transition: transform 320ms ease;
+    }
+
+    .updates-grid {
+      min-width: 0;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 7px;
+      padding: 8px 10px 10px;
+    }
+
+    .update-card {
+      min-width: 0;
+      height: 100%;
+      display: grid;
+      grid-template-rows: auto auto 1fr auto;
+      gap: 4px;
+      padding: 9px 10px;
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius-sm);
+      background: #191a20;
+      color: var(--text);
+      text-align: left;
+      cursor: pointer;
+      overflow: hidden;
+    }
+
+    .update-card:hover {
+      border-color: var(--border);
+      background: var(--panel-2);
+    }
+
+    .update-card[hidden] { display: none; }
+
+    .update-card-head {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--dim);
+      font-size: 9px;
+      white-space: nowrap;
+    }
+
+    .announcement-provider {
+      width: 19px;
+      height: 19px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid #4b4e57;
+      border-radius: 50%;
+      background: #23252c;
+      color: #f0f1f3;
+      font-family: var(--font-mono);
+      font-size: 9px;
+      font-weight: 700;
+    }
+
+    .announcement-provider.anthropic {
+      border-color: #7d5a38;
+      background: #35281d;
+      color: #efc18b;
+    }
+
+    .update-kind {
+      margin-left: auto;
+      color: var(--faint);
+    }
+
+    .update-title {
+      overflow: hidden;
+      color: var(--text-strong);
+      font-size: 11px;
+      font-weight: 600;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .update-summary {
+      display: -webkit-box;
+      overflow: hidden;
+      color: var(--dim);
+      font-size: 10px;
+      line-height: 1.4;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 2;
+    }
+
+    .update-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      color: var(--faint);
+      font-size: 9px;
+      white-space: nowrap;
+    }
+
+    .update-footer .read-link { color: var(--accent); }
+
+    .composer-dock {
+      padding: 0 8px 7px;
+      background: var(--terminal);
+    }
+
+    .composer {
+      min-height: 156px;
+      display: grid;
+      grid-template-rows: minmax(72px, 1fr) 58px;
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius);
+      background: var(--panel-low);
+      overflow: hidden;
+    }
+
+    .composer textarea {
+      width: 100%;
+      min-height: 72px;
+      resize: none;
+      padding: 18px 20px 10px;
+      border: 0;
+      outline: 0;
+      background: transparent;
+      color: var(--text);
+      line-height: 1.5;
+    }
+
+    .composer textarea::placeholder { color: var(--faint); }
+
+    .composer-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 0 10px;
+      border-top: 1px solid var(--border-soft);
+    }
+
+    .plain-button,
+    .select-button,
+    .answer-button {
+      min-height: 36px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      padding: 0 11px;
+      border-radius: var(--radius-sm);
+      color: #c5c8cf;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .composer-toolbar .select-button { padding-inline: 8px; }
+
+    .composer-toolbar .plain-button:first-child { border-color: transparent; background: transparent; }
+
+    .expand-hint {
+      margin-left: auto;
+      color: var(--dim);
+      font-size: 10px;
+      white-space: nowrap;
+    }
+
+    .send-button {
+      min-width: 110px;
+      height: 40px;
+      margin-left: 8px;
+      border: 1px solid #3f7580;
+      border-radius: var(--radius-sm);
+      background: #285c67;
+      color: #f0fbfd;
+      cursor: pointer;
+    }
+
+    .send-button:hover { background: #31707d; }
+
+    .send-button:disabled {
+      border-color: var(--border-soft);
+      background: var(--panel-2);
+      color: var(--faint);
+      cursor: default;
+    }
+
+    .inbox-panel {
+      display: flex;
+      flex-direction: column;
+      border-left: 1px solid var(--border-soft);
+      overflow: hidden;
+    }
+
+    .inbox-header {
+      height: 53px;
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      padding: 0 14px;
+      border-bottom: 1px solid var(--border-soft);
+    }
+
+    .inbox-header h2 {
+      margin: 0;
+      color: var(--text-strong);
+      font-size: 15px;
+    }
+
+    .inbox-header .icon-button { margin-left: auto; }
+
+    .inbox-scroll {
+      min-height: 0;
+      flex: 1;
+      padding: 12px 12px 14px;
+      overflow-y: auto;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border) transparent;
+    }
+
+    .section-heading {
+      height: 36px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--dim);
+      font-size: 12px;
+    }
+
+    .count-chip {
+      min-width: 22px;
+      height: 22px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0 6px;
+      border-radius: 11px;
+      background: var(--panel-2);
+      color: #b4b7bf;
+      font-family: var(--font-mono);
+      font-size: 10px;
+    }
+
+    .inbox-card {
+      margin-bottom: 10px;
+      padding: 12px;
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius);
+      background: #18191f;
+    }
+
+    .inbox-card.resolved {
+      border-color: #31523b;
+      background: #171f1a;
+    }
+
+    .inbox-card-head {
+      display: grid;
+      grid-template-columns: 22px minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 7px;
+      color: var(--text-strong);
+      font-size: 12px;
+    }
+
+    .inbox-card-head time {
+      color: var(--dim);
+      font-size: 10px;
+    }
+
+    .wait-state {
+      margin-top: 2px;
+      color: var(--orange);
+      font-size: 10px;
+      text-align: right;
+    }
+
+    .inbox-message {
+      margin: 13px 0 10px;
+      color: #d1d3d8;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      line-height: 1.7;
+    }
+
+    .inbox-command {
+      margin: 10px 0;
+      padding: 9px 10px;
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius-sm);
+      background: #131820;
+      color: #73c8f2;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .preview-toggle {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin: 4px 0 7px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: #b3b6be;
+      font-size: 11px;
+      cursor: pointer;
+    }
+
+    .preview-toggle:hover { color: var(--text-strong); }
+
+    .preview-toggle .chevron { transition: transform 140ms ease; }
+    .preview-toggle[aria-expanded="true"] .chevron { transform: rotate(90deg); }
+
+    .preview-body {
+      margin-bottom: 8px;
+      padding: 9px 10px;
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius-sm);
+      background: #101218;
+      color: #b8bbc4;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      white-space: pre-line;
+    }
+
+    .preview-body[hidden] { display: none; }
+
+    .answer-row {
+      display: grid;
+      grid-template-columns: auto auto minmax(80px, 1fr) auto;
+      gap: 7px;
+    }
+
+    .answer-button {
+      min-width: 62px;
+      min-height: 34px;
+      padding: 0 9px;
+      background: #151922;
+    }
+
+    .answer-button.yes { border-color: #34764a; color: #82dc9a; }
+    .answer-button.no { border-color: #823b43; color: #ef878d; }
+
+    .recent-card {
+      display: grid;
+      grid-template-columns: 22px minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: start;
+      margin-bottom: 10px;
+      padding: 12px;
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius);
+      background: #18191f;
+    }
+
+    .recent-title { color: var(--text-strong); font-size: 12px; }
+    .recent-time { color: var(--dim); font-size: 10px; }
+    .recent-status { color: var(--green); font-size: 10px; text-align: right; }
+    .recent-copy { grid-column: 2 / 4; color: var(--dim); font-size: 11px; }
+
+    .inbox-footer {
+      height: 62px;
+      display: flex;
+      align-items: center;
+      padding: 0 14px;
+      border-top: 1px solid var(--border-soft);
+    }
+
+    .all-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      border: 0;
+      background: transparent;
+      color: #b9bbc2;
+      cursor: pointer;
+    }
+
+    .all-link:hover { color: var(--accent); }
+    .inbox-footer .icon-button { margin-left: auto; }
+
+    .statusbar {
+      min-width: 0;
+      display: grid;
+      grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+      align-items: center;
+      border-top: 1px solid var(--border-soft);
+      background: var(--panel-low);
+      color: var(--dim);
+      font-size: 11px;
+      user-select: none;
+    }
+
+    .status-left {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding-left: 27px;
+    }
+
+    .status-right {
+      display: flex;
+      justify-content: flex-end;
+      gap: 28px;
+      padding-right: 26px;
+    }
+
+    .status-item { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; }
+    .status-item .icon { width: 15px; height: 15px; }
+
+    .metric-spark {
+      width: 42px;
+      height: 15px;
+      flex: 0 0 auto;
+    }
+
+    .metric-spark polyline {
+      fill: none;
+      stroke: #3e7ec8;
+      stroke-width: 1.5;
+      vector-effect: non-scaling-stroke;
+    }
+
+    .metric-spark.green polyline { stroke: var(--green); }
+    .metric-spark.violet polyline { stroke: #a15cd1; }
+
+    .toast {
+      position: fixed;
+      left: 50%;
+      bottom: 45px;
+      z-index: 50;
+      max-width: min(420px, 80vw);
+      padding: 10px 14px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--panel-hi);
+      color: var(--text-strong);
+      font-size: 12px;
+      opacity: 0;
+      pointer-events: none;
+      transform: translate(-50%, 8px);
+      transition: opacity 120ms ease, transform 120ms ease;
+    }
+
+    .toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+    @media (max-width: 1380px) {
+      :root {
+        --sidebar-w: 424px;
+        --workspace-w: 226px;
+        --sessions-w: 198px;
+        --inbox-w: 338px;
+      }
+
+      .brand-zone { padding-left: 13px; gap: 10px; }
+      .traffic-lights { gap: 7px; }
+      .traffic-light { width: 12px; height: 12px; }
+      .action-zone { gap: 4px; padding-inline: 9px; }
+      .composer-toolbar { gap: 6px; padding-inline: 12px; }
+      .send-button { min-width: 104px; }
+    }
+
+    @media (max-width: 1180px) {
+      :root { --inbox-w: 360px; }
+
+      .topbar { grid-template-columns: var(--sidebar-w) minmax(0, 1fr) auto; }
+      .workspace-layout,
+      .app-shell.inbox-closed .workspace-layout {
+        grid-template-columns: var(--sidebar-w) minmax(430px, 1fr);
+      }
+
+      .inbox-panel {
+        position: absolute;
+        inset: 0 0 0 auto;
+        z-index: 20;
+        width: var(--inbox-w);
+        border-left-color: var(--border);
+        box-shadow: -18px 0 36px rgb(0 0 0 / 32%);
+      }
+
+      .app-shell.inbox-closed .inbox-panel { display: none; }
+      .brand-subtitle { display: none; }
+      .home-view { padding: 18px; }
+      .home-status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 980px) {
+      :root {
+        --sidebar-w: 310px;
+        --workspace-w: 76px;
+        --sessions-w: 192px;
+      }
+
+      .brand-zone { justify-content: center; padding: 0; }
+      .brand-copy { display: none; }
+      .workspace-rail { padding-inline: 8px; }
+      .workspace-rail .rail-heading > span,
+      .workspace-copy,
+      .workspace-rail .nav-item > span:not(.badge),
+      .system-card { display: none; }
+      .workspace-card { grid-template-columns: 1fr; min-height: 52px; padding: 6px; }
+      .workspace-avatar { margin: auto; }
+      .nav-item { grid-template-columns: 1fr; justify-items: center; padding: 0; }
+      .nav-item .badge { position: absolute; transform: translate(15px, -12px); }
+      .settings-link { justify-content: center; border: 0; }
+      .action-zone .icon-button:nth-of-type(n+3) { display: none; }
+      .expand-hint { display: none; }
+
+      .unified-sidebar .workspace-card {
+        min-height: 38px;
+        grid-template-columns: 28px minmax(0, 1fr) auto;
+        justify-items: stretch;
+        padding: 5px 6px;
+      }
+
+      .unified-sidebar .workspace-copy { display: block; }
+      .unified-sidebar .workspace-avatar { margin: 0; }
+      .unified-sidebar .sidebar-nav-grid .nav-item {
+        grid-template-columns: 24px minmax(0, 1fr) auto;
+        justify-items: start;
+        padding: 0 8px;
+      }
+
+      .home-updates-slot .updates-grid { grid-template-columns: 1fr; overflow-y: auto; }
+      .orchestration-grid { grid-template-columns: 1fr; }
+      .orchestration-item {
+        min-height: 96px;
+        border-right: 0;
+        border-bottom: 1px solid var(--border-soft);
+      }
+      .orchestration-item:last-child { border-bottom: 0; }
+      .orchestration-kicker { display: none; }
+      .home-status-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <svg class="sr-only" aria-hidden="true" width="0" height="0">
+    <defs>
+      <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-4-4"></path></symbol>
+      <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"></path></symbol>
+      <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"></path></symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"></path></symbol>
+      <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 11 9-8 9 8"></path><path d="M5 10v10h14V10M9 20v-6h6v6"></path></symbol>
+      <symbol id="i-inbox" viewBox="0 0 24 24"><path d="M4 5h16v14H4z"></path><path d="m4 8 8 6 8-6"></path></symbol>
+      <symbol id="i-agents" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><path d="m12 3 3 7 6 2-6 2-3 7-3-7-6-2 6-2z"></path></symbol>
+      <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6z"></path><path d="M14 3v5h5"></path></symbol>
+      <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="m7 9 3 3-3 3M13 15h4"></path></symbol>
+      <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"></circle><path d="M19 13.5v-3l-2.2-.8-.7-1.7 1-2-2.1-2.1-2 1-1.7-.7L10.5 2h-3l-.8 2.2-1.7.7-2-1L.9 6l1 2-.7 1.7-2.2.8v3l2.2.8.7 1.7-1 2L3 20.1l2-1 1.7.7.8 2.2h3l.8-2.2 1.7-.7 2 1 2.1-2.1-1-2 .7-1.7z" transform="translate(2)"></path></symbol>
+      <symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"></path><path d="M10 21h4"></path></symbol>
+      <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h7M15 7h5M4 17h5M13 17h7"></path><circle cx="13" cy="7" r="2"></circle><circle cx="11" cy="17" r="2"></circle></symbol>
+      <symbol id="i-filter" viewBox="0 0 24 24"><path d="M4 5h16M7 12h10M10 19h4"></path></symbol>
+      <symbol id="i-x" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"></path></symbol>
+      <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M7 7l1 14h8l1-14"></path></symbol>
+      <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1" fill="currentColor" stroke="none"></circle><circle cx="12" cy="12" r="1" fill="currentColor" stroke="none"></circle><circle cx="19" cy="12" r="1" fill="currentColor" stroke="none"></circle></symbol>
+      <symbol id="i-paperclip" viewBox="0 0 24 24"><path d="m8 12 6.5-6.5a3.5 3.5 0 0 1 5 5L10 20a5 5 0 0 1-7-7l9-9"></path></symbol>
+      <symbol id="i-briefcase" viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="13" rx="2"></rect><path d="M8 7V4h8v3M3 12h18"></path></symbol>
+      <symbol id="i-box" viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5z"></path><path d="m3 8 9 5 9-5v8l-9 5-9-5z"></path></symbol>
+      <symbol id="i-expand" viewBox="0 0 24 24"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"></path></symbol>
+      <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 5h7l2 3h9v11H3z"></path></symbol>
+      <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 4 6v6c0 5 3.5 8 8 10 4.5-2 8-5 8-10V6z"></path><path d="m9 12 2 2 4-4"></path></symbol>
+      <symbol id="i-bolt" viewBox="0 0 24 24"><path d="m13 2-8 12h7l-1 8 8-12h-7z"></path></symbol>
+      <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14M14 7l5 5-5 5"></path></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"></path></symbol>
+      <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5"></path><path d="M4 17v-5h5"></path><path d="M6.1 9a7 7 0 0 1 11.6-2.6L20 9M4 15l2.3 2.6A7 7 0 0 0 17.9 15"></path></symbol>
+    </defs>
+  </svg>
+
+  <main class="app-shell" id="appShell">
+    <header class="topbar">
+      <div class="brand-zone">
+        <div class="traffic-lights" aria-hidden="true">
+          <span class="traffic-light red"></span>
+          <span class="traffic-light yellow"></span>
+          <span class="traffic-light green"></span>
+        </div>
+        <div class="brand-copy">
+          <div class="brand-title">Deppy Sijo</div>
+          <div class="brand-subtitle">AI Agent Workspace</div>
+        </div>
+      </div>
+
+      <div class="context-zone" aria-hidden="true"></div>
+
+      <div class="action-zone">
+        <button class="icon-button" id="bellButton" type="button" aria-label="작업함 열기" aria-pressed="true">
+          <svg class="icon"><use href="#i-bell"></use></svg><span class="badge" id="topBadge">3</span>
+        </button>
+        <button class="icon-button" type="button" aria-label="터미널 열기"><svg class="icon"><use href="#i-terminal"></use></svg></button>
+        <button class="icon-button" type="button" aria-label="빠른 설정"><svg class="icon"><use href="#i-sliders"></use></svg></button>
+        <div class="avatar" aria-label="사용자 J">J</div>
+      </div>
+    </header>
+
+    <section class="workspace-layout" aria-label="에이전트 워크스페이스">
+      <aside class="workspace-rail legacy-rail" aria-label="워크스페이스 탐색">
+        <div class="rail-heading">
+          <span>워크스페이스</span>
+          <button class="icon-button" type="button" aria-label="워크스페이스 추가"><svg class="icon"><use href="#i-plus"></use></svg></button>
+        </div>
+
+        <div class="workspace-list" id="workspaceList">
+          <button class="workspace-card active" type="button" data-workspace="SKRT">
+            <span class="workspace-avatar">S</span>
+            <span class="workspace-copy"><span class="workspace-name">SKRT</span><span class="workspace-state"><span class="dot green"></span>2 실행 중</span></span>
+          </button>
+          <button class="workspace-card" type="button" data-workspace="arteawiki">
+            <span class="workspace-avatar orange">A</span>
+            <span class="workspace-copy"><span class="workspace-name">arteawiki</span><span class="workspace-state"><span class="dot orange"></span>1 대기 중</span></span>
+          </button>
+          <button class="workspace-card" type="button" data-workspace="VisionAI">
+            <span class="workspace-avatar violet">V</span>
+            <span class="workspace-copy"><span class="workspace-name">VisionAI</span><span class="workspace-state"><span class="dot green"></span>1 실행 중</span></span>
+          </button>
+          <button class="workspace-card" type="button" data-workspace="Crawler">
+            <span class="workspace-avatar cyan">C</span>
+            <span class="workspace-copy"><span class="workspace-name">Crawler</span><span class="workspace-state"><span class="dot"></span>유휴</span></span>
+          </button>
+          <button class="workspace-card" type="button" data-workspace="Personal">
+            <span class="workspace-avatar blue">P</span>
+            <span class="workspace-copy"><span class="workspace-name">Personal</span><span class="workspace-state"><span class="dot"></span>비활성</span></span>
+          </button>
+        </div>
+
+        <div class="rail-divider"></div>
+        <nav class="nav-list" aria-label="주 메뉴">
+          <button class="nav-item active" type="button" data-nav="홈"><svg class="icon"><use href="#i-home"></use></svg><span>홈</span></button>
+          <button class="nav-item" type="button" data-nav="작업함"><svg class="icon"><use href="#i-inbox"></use></svg><span>작업함</span><span class="badge" id="legacyNavBadge">3</span></button>
+          <button class="nav-item" type="button" data-nav="에이전트"><svg class="icon"><use href="#i-agents"></use></svg><span>에이전트</span></button>
+          <button class="nav-item" type="button" data-nav="파일"><svg class="icon"><use href="#i-file"></use></svg><span>파일</span></button>
+          <button class="nav-item" type="button" data-nav="터미널"><svg class="icon"><use href="#i-terminal"></use></svg><span>터미널</span></button>
+        </nav>
+
+        <div class="system-card">
+          <div class="system-title">시스템 상태</div>
+          <svg class="sparkline" viewBox="0 0 220 42" preserveAspectRatio="none" aria-label="시스템 사용량 추이">
+            <polyline points="0,27 8,27 15,23 22,20 30,28 38,30 46,22 54,18 62,27 70,28 78,20 87,17 95,24 104,22 112,30 120,25 128,26 136,24 144,28 152,27 160,30 168,26 176,18 184,17 192,24 201,25 210,18 220,17"></polyline>
+          </svg>
+          <div class="system-stat"><span>CPU</span><strong>18%</strong></div>
+          <div class="system-stat"><span>RAM</span><strong>3.2GB / 16GB</strong></div>
+          <div class="system-stat"><span>DISK</span><strong>120GB / 512GB</strong></div>
+        </div>
+        <button class="settings-link" type="button"><svg class="icon"><use href="#i-settings"></use></svg><span>설정</span></button>
+      </aside>
+
+      <aside class="session-rail legacy-rail" aria-label="세션 목록">
+        <div class="rail-heading">
+          <span>세션</span>
+          <button class="icon-button" type="button" aria-label="세션 정렬"><svg class="icon"><use href="#i-filter"></use></svg></button>
+        </div>
+        <div class="session-list" id="sessionList">
+          <button class="session-card active" type="button" data-title="API 수정 작업" data-model="Claude 3.5 Sonnet" data-provider="claude" data-status="입력 대기">
+            <span class="session-title-row"><span class="provider-mark">☀</span><span class="session-title">API 수정 작업</span></span>
+            <span class="session-meta">Claude 3.5 Sonnet</span>
+            <span class="session-status-row"><span>xhigh</span><span class="status-label orange">입력 대기</span></span>
+            <span class="session-time">24초</span>
+          </button>
+          <button class="session-card" type="button" data-title="PR 코드 리뷰" data-model="Codex · gpt-5.5" data-provider="codex" data-status="실행 중">
+            <span class="session-title-row"><span class="provider-mark codex">◉</span><span class="session-title">PR 코드 리뷰</span></span>
+            <span class="session-meta">Codex</span>
+            <span class="session-status-row"><span>high</span><span class="status-label violet">실행 중</span></span>
+            <span class="session-time">8분</span>
+          </button>
+          <button class="session-card" type="button" data-title="개발 서버" data-model="Shell (zsh)" data-provider="shell" data-status="실행 중">
+            <span class="session-title-row"><span class="provider-mark shell">›_</span><span class="session-title">개발 서버</span></span>
+            <span class="session-meta">Shell (zsh)</span>
+            <span class="session-status-row"><span></span><span class="status-label green">실행 중</span></span>
+            <span class="session-time">12분</span>
+          </button>
+          <button class="session-card" type="button" data-title="DB 마이그레이션" data-model="Postgres" data-provider="shell" data-status="실행 중">
+            <span class="session-title-row"><span class="provider-mark shell">DB</span><span class="session-title">DB 마이그레이션</span></span>
+            <span class="session-meta">Postgres</span>
+            <span class="session-status-row"><span></span><span class="status-label green">실행 중</span></span>
+            <span class="session-time">3분</span>
+          </button>
+          <button class="session-card" type="button" data-title="문서 정리" data-model="Gemini 1.5 Pro" data-provider="gemini" data-status="유휴">
+            <span class="session-title-row"><span class="provider-mark gemini">✦</span><span class="session-title">문서 정리</span></span>
+            <span class="session-meta">Gemini 1.5 Pro</span>
+            <span class="session-status-row"><span>medium</span><span>유휴</span></span>
+            <span class="session-time"></span>
+          </button>
+        </div>
+        <button class="new-session-button" type="button"><svg class="icon"><use href="#i-plus"></use></svg>새 세션</button>
+      </aside>
+
+      <aside class="unified-sidebar" aria-label="통합 워크스페이스 사이드바">
+        <section class="sidebar-section workspace-session-section" aria-labelledby="workspaceSessionsTitle">
+          <header class="sidebar-section-header">
+            <span id="workspaceSessionsTitle">워크스페이스 &amp; 세션</span>
+            <span class="header-actions">
+              <button class="icon-button" type="button" aria-label="워크스페이스 추가"><svg class="icon"><use href="#i-plus"></use></svg></button>
+              <button class="icon-button" type="button" aria-label="워크스페이스 메뉴"><svg class="icon"><use href="#i-more"></use></svg></button>
+            </span>
+          </header>
+          <div class="workspace-session-scroll">
+            <div class="workspace-cluster">
+              <button class="workspace-card active" type="button" data-workspace="SKRT" aria-expanded="true" aria-controls="skrtSessionTree">
+                <span class="workspace-avatar">S</span>
+                <span class="workspace-copy">
+                  <span class="workspace-name">SKRT</span>
+                  <span class="unified-workspace-meta"><span class="branch-accent">●main</span><span>·</span><span>local</span></span>
+                </span>
+                <span class="workspace-tail"><span class="workspace-summary">2 실행 중 · 1 입력 대기</span><span class="workspace-chevron" aria-hidden="true">⌄</span></span>
+              </button>
+              <div class="session-tree" id="skrtSessionTree" aria-label="SKRT 세션">
+                <button class="session-card active" type="button" data-title="테스트 수정 작업" data-model="Claude 3.5 Sonnet" data-provider="claude" data-status="입력 대기">
+                  <span class="provider-mark">☀</span>
+                  <span class="unified-session-copy"><strong>Claude 3.5 Sonnet</strong><small>테스트 수정 작업</small></span>
+                  <span class="unified-session-state orange">입력 대기</span>
+                </button>
+                <button class="session-card" type="button" data-title="PR #124 코드 리뷰" data-model="Codex · gpt-5.5" data-provider="codex" data-status="실행 중">
+                  <span class="provider-mark codex">◉</span>
+                  <span class="unified-session-copy"><strong>Codex</strong><small>PR #124 코드 리뷰</small></span>
+                  <span class="unified-session-state blue">실행 중</span>
+                </button>
+                <button class="session-card" type="button" data-title="개발 셸" data-model="Shell (zsh)" data-provider="shell" data-status="실행 중">
+                  <span class="provider-mark shell">›_</span>
+                  <span class="unified-session-copy"><strong>Shell (zsh)</strong><small>개발 셸</small></span>
+                  <span class="unified-session-state blue">실행 중</span>
+                </button>
+                <button class="session-card" type="button" data-title="DB 마이그레이션" data-model="Postgres" data-provider="shell" data-status="완료">
+                  <span class="provider-mark shell">DB</span>
+                  <span class="unified-session-copy"><strong>Postgres</strong><small>DB 마이그레이션</small></span>
+                  <span class="unified-session-state violet">완료</span>
+                </button>
+              </div>
+            </div>
+
+            <button class="workspace-card" type="button" data-workspace="arteawiki" aria-expanded="false">
+              <span class="workspace-avatar orange">A</span>
+              <span class="workspace-copy"><span class="workspace-name">arteawiki</span><span class="unified-workspace-meta"><span>feature/wiki-import</span><span>·</span><span>staging</span></span></span>
+              <span class="workspace-tail"><span class="workspace-summary orange">1 입력 대기</span><span class="workspace-chevron" aria-hidden="true">›</span></span>
+            </button>
+            <button class="workspace-card" type="button" data-workspace="VisionAI" aria-expanded="false">
+              <span class="workspace-avatar violet">V</span>
+              <span class="workspace-copy"><span class="workspace-name">VisionAI</span><span class="unified-workspace-meta"><span class="branch-accent">●dev</span><span>·</span><span>local</span></span></span>
+              <span class="workspace-tail"><span class="workspace-summary">1 실행 중 · 오류 1</span><span class="workspace-chevron" aria-hidden="true">›</span></span>
+            </button>
+            <button class="workspace-card" type="button" data-workspace="Crawler" aria-expanded="false">
+              <span class="workspace-avatar cyan">C</span>
+              <span class="workspace-copy"><span class="workspace-name">Crawler</span><span class="unified-workspace-meta"><span class="branch-accent">●main</span><span>·</span><span>local</span></span></span>
+              <span class="workspace-tail"><span class="workspace-summary">유휴</span><span class="workspace-chevron" aria-hidden="true">›</span></span>
+            </button>
+            <button class="workspace-card" type="button" data-workspace="Personal" aria-expanded="false">
+              <span class="workspace-avatar blue">P</span>
+              <span class="workspace-copy"><span class="workspace-name">Personal</span></span>
+              <span class="workspace-tail"><span class="workspace-summary">비활성</span><span class="workspace-chevron" aria-hidden="true">›</span></span>
+            </button>
+          </div>
+        </section>
+
+        <section class="sidebar-section file-section" aria-labelledby="fileTreeTitle">
+          <header class="sidebar-section-header">
+            <span id="fileTreeTitle">파일</span>
+            <span class="header-actions">
+              <button class="icon-button" type="button" aria-label="새 파일"><svg class="icon"><use href="#i-file"></use></svg></button>
+              <button class="icon-button" type="button" aria-label="새 폴더"><svg class="icon"><use href="#i-folder"></use></svg></button>
+              <button class="icon-button" type="button" aria-label="파일 검색"><svg class="icon"><use href="#i-search"></use></svg></button>
+              <button class="icon-button" type="button" aria-label="파일 메뉴"><svg class="icon"><use href="#i-more"></use></svg></button>
+            </span>
+          </header>
+          <div class="file-tree-scroll">
+            <div class="file-root"><svg class="icon"><use href="#i-folder"></use></svg><span>SKRT</span><span class="root-path">~/Projects/SKRT</span></div>
+            <button class="tree-row" type="button"><span class="tree-caret">›</span><svg class="icon"><use href="#i-folder"></use></svg><span class="tree-name">.git</span></button>
+            <button class="tree-row" type="button"><span class="tree-caret">›</span><svg class="icon"><use href="#i-folder"></use></svg><span class="tree-name">.github</span></button>
+            <button class="tree-row" type="button"><span class="tree-caret">⌄</span><svg class="icon"><use href="#i-folder"></use></svg><span class="tree-name">apps</span></button>
+            <button class="tree-row depth-1" type="button"><span class="tree-caret">›</span><svg class="icon"><use href="#i-folder"></use></svg><span class="tree-name">api</span></button>
+            <button class="tree-row depth-1" type="button"><span class="tree-caret">›</span><svg class="icon"><use href="#i-folder"></use></svg><span class="tree-name">web</span></button>
+            <button class="tree-row depth-1" type="button"><span class="tree-caret">›</span><svg class="icon"><use href="#i-folder"></use></svg><span class="tree-name">worker</span></button>
+            <button class="tree-row" type="button"><span class="tree-caret">⌄</span><svg class="icon"><use href="#i-folder"></use></svg><span class="tree-name">crates</span></button>
+            <button class="tree-row depth-1" type="button"><span class="tree-caret">›</span><svg class="icon"><use href="#i-folder"></use></svg><span class="tree-name">core</span></button>
+            <button class="tree-row depth-1" type="button"><span class="tree-caret">›</span><svg class="icon"><use href="#i-folder"></use></svg><span class="tree-name">db</span></button>
+            <button class="tree-row depth-1" type="button"><span class="tree-caret">›</span><svg class="icon"><use href="#i-folder"></use></svg><span class="tree-name">http</span></button>
+            <button class="tree-row depth-1" type="button"><span class="tree-caret">›</span><svg class="icon"><use href="#i-folder"></use></svg><span class="tree-name">utils</span></button>
+            <button class="tree-row" type="button"><span class="tree-caret">›</span><svg class="icon"><use href="#i-folder"></use></svg><span class="tree-name">scripts</span></button>
+            <button class="tree-row" type="button"><span class="tree-caret">›</span><svg class="icon"><use href="#i-folder"></use></svg><span class="tree-name">tests</span></button>
+            <button class="tree-row file secret" type="button"><span class="tree-caret"></span><svg class="icon"><use href="#i-file"></use></svg><span class="tree-name">.env.local</span></button>
+            <button class="tree-row file" type="button"><span class="tree-caret"></span><svg class="icon"><use href="#i-file"></use></svg><span class="tree-name">Cargo.toml</span></button>
+            <button class="tree-row file" type="button"><span class="tree-caret"></span><svg class="icon"><use href="#i-file"></use></svg><span class="tree-name">README.md</span></button>
+          </div>
+        </section>
+
+        <nav class="sidebar-section sidebar-nav-grid" aria-label="주 메뉴">
+          <button class="nav-item" type="button" data-nav="홈"><svg class="icon"><use href="#i-home"></use></svg><span>홈</span></button>
+          <button class="nav-item active" type="button" data-nav="터미널"><svg class="icon"><use href="#i-terminal"></use></svg><span>터미널</span></button>
+          <button class="nav-item" type="button" data-nav="작업함"><svg class="icon"><use href="#i-inbox"></use></svg><span>작업함</span><span class="badge" id="navBadge">3</span></button>
+          <button class="nav-item" type="button" data-nav="설정"><svg class="icon"><use href="#i-settings"></use></svg><span>설정</span></button>
+        </nav>
+      </aside>
+
+      <div class="sidebar-resizer" id="sidebarResizer" role="separator" tabindex="0" aria-label="좌측 메뉴 너비 조절" aria-orientation="vertical" aria-valuemin="340" aria-valuemax="680" aria-valuenow="470"></div>
+
+      <section class="work-area" aria-label="활성 세션">
+        <section class="home-view" id="homeView" aria-label="홈" hidden>
+          <div class="home-updates-slot" id="homeUpdatesSlot"></div>
+          <section class="orchestration-panel" aria-labelledby="orchestrationTitle">
+            <header class="orchestration-header">
+              <h2 id="orchestrationTitle">오케스트레이션 인사이트</h2>
+              <span class="orchestration-kicker">워크스페이스 간 영향을 먼저 탐지합니다</span>
+              <span class="orchestration-count">3 SIGNALS</span>
+            </header>
+            <div class="orchestration-grid">
+              <article class="orchestration-item risk">
+                <span class="insight-bar" aria-hidden="true"></span>
+                <span class="insight-label">변경 충돌 가능성</span>
+                <span class="insight-scope">SKRT · 2 sessions</span>
+                <strong class="insight-title">Claude와 Codex가 동시에 Cargo.toml을 수정 중입니다.</strong>
+                <button class="insight-action" type="button" data-insight="conflict">변경 비교 열기 →</button>
+              </article>
+              <article class="orchestration-item waiting">
+                <span class="insight-bar" aria-hidden="true"></span>
+                <span class="insight-label">응답 대기 묶음</span>
+                <span class="insight-scope">2 workspaces</span>
+                <strong class="insight-title">SKRT와 arteawiki의 입력 대기를 한 번에 검토할 수 있습니다.</strong>
+                <button class="insight-action" type="button" data-insight="waiting">작업함에서 검토 →</button>
+              </article>
+              <article class="orchestration-item opportunity">
+                <span class="insight-bar" aria-hidden="true"></span>
+                <span class="insight-label">병렬화 제안</span>
+                <span class="insight-scope">Crawler → VisionAI</span>
+                <strong class="insight-title">유휴 중인 Crawler에 VisionAI 오류 로그 분석을 할당할 수 있습니다.</strong>
+                <button class="insight-action" type="button" data-insight="delegate">분석 세션 만들기 →</button>
+              </article>
+            </div>
+          </section>
+          <div class="home-status-grid" aria-label="전체 워크스페이스 상태 요약">
+            <article class="home-status-card running"><span class="home-status-bar"></span><span><span class="home-status-label">실행 중</span><strong class="home-status-value">3</strong><span class="home-status-detail">SKRT 2 · VisionAI 1</span></span></article>
+            <article class="home-status-card waiting"><span class="home-status-bar"></span><span><span class="home-status-label">입력 대기</span><strong class="home-status-value">2</strong><span class="home-status-detail">SKRT 1 · arteawiki 1</span></span></article>
+            <article class="home-status-card done"><span class="home-status-bar"></span><span><span class="home-status-label">완료</span><strong class="home-status-value">1</strong><span class="home-status-detail">SKRT · Postgres</span></span></article>
+            <article class="home-status-card error"><span class="home-status-bar"></span><span><span class="home-status-label">오류</span><strong class="home-status-value">1</strong><span class="home-status-detail">VisionAI</span></span></article>
+            <article class="home-status-card idle"><span class="home-status-bar"></span><span><span class="home-status-label">유휴</span><strong class="home-status-value">1</strong><span class="home-status-detail">Crawler</span></span></article>
+            <article class="home-status-card inactive"><span class="home-status-bar"></span><span><span class="home-status-label">비활성</span><strong class="home-status-value">1</strong><span class="home-status-detail">Personal</span></span></article>
+          </div>
+        </section>
+
+        <div class="tabbar">
+          <div class="active-tab"><span class="dot green"></span><span id="activeTabTitle">테스트 수정 작업</span><button class="icon-button" type="button" aria-label="탭 닫기"><svg class="icon"><use href="#i-x"></use></svg></button></div>
+          <button class="add-tab" type="button" aria-label="탭 추가"><svg class="icon"><use href="#i-plus"></use></svg></button>
+          <div class="tabbar-actions">
+            <button class="icon-button" type="button" aria-label="세션 검색"><svg class="icon"><use href="#i-search"></use></svg></button>
+            <button class="icon-button" type="button" aria-label="세션 삭제"><svg class="icon"><use href="#i-trash"></use></svg></button>
+            <button class="icon-button" type="button" aria-label="더 보기"><svg class="icon"><use href="#i-more"></use></svg></button>
+          </div>
+        </div>
+
+        <div class="terminal-pane">
+          <div class="terminal-stream" id="terminalStream">
+            <div class="permission-card">
+              <p>Claude needs your permission to use Bash</p>
+              <p>The following command may modify files in your workspace.</p>
+              <div class="command-line">$ cargo test --workspace</div>
+              <p>Proceed? (y/n/?)</p>
+              <p>&gt;<span class="terminal-cursor" aria-hidden="true"></span></p>
+            </div>
+            <div class="terminal-size"><span>zsh</span><span>▣</span><span>120×32</span></div>
+          </div>
+        </div>
+
+        <div class="updates-dock" id="sessionUpdatesDock">
+          <section class="updates-panel" aria-labelledby="updatesTitle">
+            <header class="updates-header">
+              <div class="updates-title" id="updatesTitle"><span class="live-dot"></span>AI 공지</div>
+              <span class="sample-chip">목업 데이터</span>
+              <button class="source-filter active" type="button" data-source="all">전체</button>
+              <button class="source-filter" type="button" data-source="openai">OpenAI</button>
+              <button class="source-filter" type="button" data-source="anthropic">Anthropic</button>
+              <span class="sync-state"><span class="dot green"></span><span id="syncText">15분마다 자동 갱신</span></span>
+              <button class="icon-button" id="refreshUpdates" type="button" aria-label="AI 공지 새로고침"><svg class="icon"><use href="#i-refresh"></use></svg></button>
+            </header>
+            <div class="updates-grid">
+              <button class="update-card" type="button" data-provider="openai">
+                <span class="update-card-head"><span class="announcement-provider">O</span><span>OpenAI</span><span class="update-kind">API</span></span>
+                <span class="update-title">API 플랫폼 업데이트</span>
+                <span class="update-summary">새 모델과 개발자 도구의 주요 변경 사항을 한눈에 확인합니다.</span>
+                <span class="update-footer"><span>예시 · 12분 전</span><span class="read-link">원문 보기 →</span></span>
+              </button>
+              <button class="update-card" type="button" data-provider="anthropic">
+                <span class="update-card-head"><span class="announcement-provider anthropic">A</span><span>Anthropic</span><span class="update-kind">Claude</span></span>
+                <span class="update-title">Claude 릴리스 노트</span>
+                <span class="update-summary">웹·데스크톱·API 기능 변경과 새로운 사용 경험을 요약합니다.</span>
+                <span class="update-footer"><span>예시 · 28분 전</span><span class="read-link">원문 보기 →</span></span>
+              </button>
+              <button class="update-card" type="button" data-provider="openai">
+                <span class="update-card-head"><span class="announcement-provider">O</span><span>OpenAI</span><span class="update-kind">Codex</span></span>
+                <span class="update-title">Codex 제품 업데이트</span>
+                <span class="update-summary">에이전트 워크플로와 코드 작업 도구의 개선 소식을 보여줍니다.</span>
+                <span class="update-footer"><span>예시 · 1시간 전</span><span class="read-link">원문 보기 →</span></span>
+              </button>
+            </div>
+          </section>
+        </div>
+
+        <div class="composer-dock">
+          <form class="composer" id="composerForm">
+            <textarea id="composerInput" aria-label="에이전트에게 보낼 내용" placeholder="에이전트에게 보낼 내용…"></textarea>
+            <div class="composer-toolbar">
+              <button class="plain-button" type="button"><svg class="icon"><use href="#i-paperclip"></use></svg>첨부</button>
+              <button class="select-button" type="button"><svg class="icon"><use href="#i-briefcase"></use></svg>Context<svg class="icon"><use href="#i-down"></use></svg></button>
+              <button class="select-button" type="button"><svg class="icon"><use href="#i-box"></use></svg>Model<svg class="icon"><use href="#i-down"></use></svg></button>
+              <button class="select-button" type="button">◈ MCP<svg class="icon"><use href="#i-down"></use></svg></button>
+              <span class="expand-hint">⌘J로 펼치기</span>
+              <button class="icon-button" type="button" aria-label="컴포저 펼치기"><svg class="icon"><use href="#i-expand"></use></svg></button>
+              <button class="send-button" id="sendButton" type="submit" disabled>⌘↵ 전송</button>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <aside class="inbox-panel" id="inboxPanel" aria-label="작업함">
+        <div class="inbox-header"><h2>작업함</h2><span class="badge" id="inboxBadge">3</span><button class="icon-button" id="closeInbox" type="button" aria-label="작업함 닫기"><svg class="icon"><use href="#i-x"></use></svg></button></div>
+        <div class="inbox-scroll">
+          <div class="section-heading">대기 중 <span class="count-chip" id="waitingCount">2</span></div>
+
+          <article class="inbox-card waiting-card">
+            <div class="inbox-card-head"><span class="provider-mark">☀</span><strong>SKRT · Claude 3.5 Sonnet</strong><time>24초 전</time></div>
+            <div class="wait-state">입력 대기</div>
+            <div class="inbox-message">Claude needs your permission to use Bash<div class="inbox-command">$ cargo test --workspace</div>Proceed? (y/n/?)</div>
+            <button class="preview-toggle" type="button" aria-expanded="false"><span class="chevron">›</span>화면 미리보기</button>
+            <div class="preview-body" hidden>Claude needs your permission to use Bash
+$ cargo test --workspace
+Proceed? (y/n/?)</div>
+            <div class="answer-row">
+              <button class="answer-button yes" type="button" data-answer="y">y ↵</button>
+              <button class="answer-button no" type="button" data-answer="n">n ↵</button>
+              <button class="answer-button" type="button" data-answer="직접 입력">직접 입력…</button>
+              <button class="answer-button" type="button" data-answer="이동">이동 →</button>
+            </div>
+          </article>
+
+          <article class="inbox-card waiting-card">
+            <div class="inbox-card-head"><span class="workspace-avatar orange micro">A</span><strong>arteawiki · Codex</strong><time>1분 전</time></div>
+            <div class="wait-state">입력 대기</div>
+            <div class="inbox-message">Continue with option 1 or 2?<br /><br />1) Update README<br />2) Add tests</div>
+            <button class="preview-toggle" type="button" aria-expanded="false"><span class="chevron">›</span>화면 미리보기</button>
+            <div class="preview-body" hidden>Continue with option 1 or 2?
+1) Update README
+2) Add tests</div>
+            <div class="answer-row">
+              <button class="answer-button yes" type="button" data-answer="1">1 ↵</button>
+              <button class="answer-button yes" type="button" data-answer="2">2 ↵</button>
+              <button class="answer-button" type="button" data-answer="직접 입력">직접 입력…</button>
+              <button class="answer-button" type="button" data-answer="이동">이동 →</button>
+            </div>
+          </article>
+
+          <div class="section-heading">최근 알림 <span class="count-chip">1</span></div>
+          <article class="recent-card">
+            <span class="provider-mark gemini">✦</span><div><div class="recent-title">VisionAI · Gemini 1.5 Pro</div><div class="recent-time">3분 전</div></div><div class="recent-status">작업 완료</div><div class="recent-copy">벡터 검색 로직 개선 완료</div>
+          </article>
+        </div>
+        <div class="inbox-footer"><button class="all-link" type="button">모두 보기 <svg class="icon"><use href="#i-arrow"></use></svg></button><button class="icon-button" type="button" aria-label="작업함 설정"><svg class="icon"><use href="#i-settings"></use></svg></button></div>
+      </aside>
+    </section>
+
+    <footer class="statusbar">
+      <div class="status-left"><span class="dot green"></span>Deppy Sijo v0.2.0</div>
+      <div class="status-right">
+        <span class="status-item"><span class="dot green"></span>연결됨</span>
+        <span class="status-item"><svg class="icon"><use href="#i-terminal"></use></svg>MCP 2 연결</span>
+        <span class="status-item">CPU <strong>18%</strong><svg class="metric-spark" viewBox="0 0 42 15" preserveAspectRatio="none"><polyline points="0,12 6,11 12,12 18,9 24,10 30,3 36,10 42,8"></polyline></svg></span>
+        <span class="status-item">RAM <strong>3.2GB / 16GB</strong><svg class="metric-spark green" viewBox="0 0 42 15" preserveAspectRatio="none"><polyline points="0,3 6,5 12,4 18,8 24,10 30,11 36,8 42,7"></polyline></svg></span>
+        <span class="status-item">DISK <strong>120GB / 512GB</strong><svg class="metric-spark violet" viewBox="0 0 42 15" preserveAspectRatio="none"><polyline points="0,4 6,5 12,8 18,10 24,11 30,8 36,9 42,6"></polyline></svg></span>
+      </div>
+    </footer>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script>
+    const appShell = document.querySelector('#appShell');
+    const bellButton = document.querySelector('#bellButton');
+    const closeInbox = document.querySelector('#closeInbox');
+    const composerForm = document.querySelector('#composerForm');
+    const composerInput = document.querySelector('#composerInput');
+    const sendButton = document.querySelector('#sendButton');
+    const terminalStream = document.querySelector('#terminalStream');
+    const refreshUpdates = document.querySelector('#refreshUpdates');
+    const syncText = document.querySelector('#syncText');
+    const workArea = document.querySelector('.work-area');
+    const homeView = document.querySelector('#homeView');
+    const homeUpdatesSlot = document.querySelector('#homeUpdatesSlot');
+    const sessionUpdatesDock = document.querySelector('#sessionUpdatesDock');
+    const updatesPanel = document.querySelector('.updates-panel');
+    const sidebarResizer = document.querySelector('#sidebarResizer');
+    const toast = document.querySelector('#toast');
+    let toastTimer;
+    let inboxWasOpenBeforeHome = true;
+
+    function showToast(message) {
+      window.clearTimeout(toastTimer);
+      toast.textContent = message;
+      toast.classList.add('show');
+      toastTimer = window.setTimeout(() => toast.classList.remove('show'), 1700);
+    }
+
+    function setInbox(open) {
+      appShell.classList.toggle('inbox-closed', !open);
+      bellButton.setAttribute('aria-pressed', String(open));
+      bellButton.setAttribute('aria-label', open ? '작업함 닫기' : '작업함 열기');
+    }
+
+    bellButton.addEventListener('click', () => setInbox(appShell.classList.contains('inbox-closed')));
+    closeInbox.addEventListener('click', () => setInbox(false));
+
+    function setActiveNav(name) {
+      document.querySelectorAll('.unified-sidebar .nav-item').forEach((nav) => {
+        nav.classList.toggle('active', nav.dataset.nav === name);
+      });
+    }
+
+    function showHome() {
+      if (!workArea.classList.contains('home-mode')) {
+        inboxWasOpenBeforeHome = !appShell.classList.contains('inbox-closed');
+      }
+      homeUpdatesSlot.append(updatesPanel);
+      homeView.hidden = false;
+      workArea.classList.add('home-mode');
+      workArea.setAttribute('aria-label', '홈');
+      setInbox(false);
+      setActiveNav('홈');
+    }
+
+    function showTerminal() {
+      const wasHome = workArea.classList.contains('home-mode');
+      sessionUpdatesDock.append(updatesPanel);
+      workArea.classList.remove('home-mode');
+      homeView.hidden = true;
+      workArea.setAttribute('aria-label', '활성 세션');
+      if (wasHome && inboxWasOpenBeforeHome) setInbox(true);
+      setActiveNav('터미널');
+    }
+
+    document.querySelectorAll('.workspace-card').forEach((card) => {
+      card.addEventListener('click', () => {
+        document.querySelectorAll('.workspace-card').forEach((item) => item.classList.remove('active'));
+        card.classList.add('active');
+        const cluster = card.closest('.workspace-cluster');
+        const sessionTree = cluster?.querySelector('.session-tree');
+        const chevron = card.querySelector('.workspace-chevron');
+        if (sessionTree) {
+          const expanded = sessionTree.hidden;
+          sessionTree.hidden = !expanded;
+          card.setAttribute('aria-expanded', String(expanded));
+          if (chevron) chevron.textContent = expanded ? '⌄' : '›';
+        }
+        showToast(`${card.dataset.workspace} 워크스페이스로 전환했습니다`);
+      });
+    });
+
+    document.querySelectorAll('.nav-item').forEach((item) => {
+      item.addEventListener('click', () => {
+        if (item.closest('.legacy-rail')) return;
+        if (item.dataset.nav === '홈') {
+          showHome();
+          showToast('AI 공지와 에이전트 상태를 홈에 표시합니다');
+        } else if (item.dataset.nav === '터미널') {
+          showTerminal();
+        } else if (item.dataset.nav === '작업함') {
+          setActiveNav('작업함');
+          setInbox(true);
+        } else {
+          setActiveNav(item.dataset.nav);
+          showToast(`${item.dataset.nav} 화면은 목업 내비게이션 상태입니다`);
+        }
+      });
+    });
+
+    document.querySelectorAll('.session-card').forEach((card) => {
+      card.addEventListener('click', () => {
+        document.querySelectorAll('.session-card').forEach((item) => item.classList.remove('active'));
+        card.classList.add('active');
+        document.querySelector('#activeTabTitle').textContent = card.dataset.title;
+        showTerminal();
+        showToast(`${card.dataset.title} 세션을 선택했습니다`);
+      });
+    });
+
+    function setSidebarWidth(width, announce = false) {
+      const nextWidth = Math.max(340, Math.min(680, Math.round(width)));
+      appShell.style.setProperty('--sidebar-w', `${nextWidth}px`);
+      sidebarResizer.setAttribute('aria-valuenow', String(nextWidth));
+      if (announce) showToast(`좌측 메뉴 너비 ${nextWidth}px`);
+    }
+
+    let resizingSidebar = false;
+
+    sidebarResizer.addEventListener('mousedown', (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      resizingSidebar = true;
+      sidebarResizer.classList.add('dragging');
+    });
+
+    window.addEventListener('mousemove', (event) => {
+      if (!resizingSidebar) return;
+      setSidebarWidth(event.clientX);
+    });
+
+    window.addEventListener('mouseup', (event) => {
+      if (!resizingSidebar) return;
+      resizingSidebar = false;
+      sidebarResizer.classList.remove('dragging');
+      setSidebarWidth(event.clientX, true);
+    });
+
+    sidebarResizer.addEventListener('dblclick', () => setSidebarWidth(470, true));
+    sidebarResizer.addEventListener('keydown', (event) => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home'].includes(event.key)) return;
+      event.preventDefault();
+      const current = Number(sidebarResizer.getAttribute('aria-valuenow')) || 470;
+      if (event.key === 'Home') setSidebarWidth(470, true);
+      else setSidebarWidth(current + (event.key === 'ArrowRight' ? 20 : -20), true);
+    });
+
+    document.querySelectorAll('.source-filter').forEach((filter) => {
+      filter.addEventListener('click', () => {
+        const source = filter.dataset.source;
+        document.querySelectorAll('.source-filter').forEach((item) => item.classList.remove('active'));
+        filter.classList.add('active');
+        document.querySelectorAll('.update-card').forEach((card) => {
+          card.hidden = source !== 'all' && card.dataset.provider !== source;
+        });
+      });
+    });
+
+    refreshUpdates.addEventListener('click', () => {
+      refreshUpdates.classList.add('refreshing');
+      syncText.textContent = '공지 확인 중…';
+      window.setTimeout(() => {
+        refreshUpdates.classList.remove('refreshing');
+        syncText.textContent = '방금 동기화 · 다음 확인 15분 후';
+        showToast('예시 공지 3건을 갱신했습니다');
+      }, 360);
+    });
+
+    document.querySelectorAll('.update-card').forEach((card) => {
+      card.addEventListener('click', () => {
+        showToast('실제 앱에서는 공식 공지 원문을 기본 브라우저로 엽니다');
+      });
+    });
+
+    document.querySelectorAll('[data-insight]').forEach((button) => {
+      button.addEventListener('click', () => {
+        if (button.dataset.insight === 'waiting') {
+          setInbox(true);
+          setActiveNav('작업함');
+          showToast('두 워크스페이스의 입력 대기 작업을 함께 표시합니다');
+          return;
+        }
+        if (button.dataset.insight === 'conflict') {
+          showToast('Cargo.toml 변경 2건의 비교 뷰를 준비했습니다');
+          return;
+        }
+        showToast('Crawler에 VisionAI 오류 분석 세션 초안을 만들었습니다');
+      });
+    });
+
+    document.querySelectorAll('.tree-row').forEach((row) => {
+      row.addEventListener('click', () => {
+        showToast(`${row.querySelector('.tree-name').textContent} 항목을 선택했습니다`);
+      });
+    });
+
+    document.querySelectorAll('.preview-toggle').forEach((button) => {
+      button.addEventListener('click', () => {
+        const preview = button.nextElementSibling;
+        const expanded = button.getAttribute('aria-expanded') === 'true';
+        button.setAttribute('aria-expanded', String(!expanded));
+        preview.hidden = expanded;
+      });
+    });
+
+    function updateWaitingCounts() {
+      const waiting = document.querySelectorAll('.waiting-card:not(.resolved)').length;
+      document.querySelector('#waitingCount').textContent = String(waiting);
+      const total = waiting + 1;
+      ['#topBadge', '#navBadge', '#inboxBadge'].forEach((selector) => {
+        const badge = document.querySelector(selector);
+        badge.textContent = String(total);
+        badge.hidden = total === 0;
+      });
+    }
+
+    document.querySelectorAll('[data-answer]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const card = button.closest('.inbox-card');
+        const value = button.dataset.answer;
+        if (value === '이동') {
+          showToast('해당 세션으로 이동했습니다');
+          return;
+        }
+        if (value === '직접 입력') {
+          showToast('직접 입력 필드는 네이티브 구현에서 인라인 TextEdit로 연결됩니다');
+          return;
+        }
+        card.classList.add('resolved');
+        const state = card.querySelector('.wait-state');
+        state.textContent = `${value} 전송됨`;
+        state.style.color = 'var(--green)';
+        card.querySelectorAll('.answer-button').forEach((answer) => { answer.disabled = true; });
+        updateWaitingCounts();
+        showToast(`응답 “${value}”을 전송했습니다`);
+      });
+    });
+
+    composerInput.addEventListener('input', () => {
+      sendButton.disabled = composerInput.value.trim().length === 0;
+    });
+
+    composerForm.addEventListener('submit', (event) => {
+      event.preventDefault();
+      const prompt = composerInput.value.trim();
+      if (!prompt) return;
+      const line = document.createElement('div');
+      line.className = 'sent-line';
+      line.textContent = `> ${prompt}\n전송됨 — 에이전트 응답 대기 중`;
+      terminalStream.append(line);
+      composerInput.value = '';
+      sendButton.disabled = true;
+      showToast('활성 세션으로 프롬프트를 전송했습니다');
+    });
+
+    document.addEventListener('keydown', (event) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'j') {
+        event.preventDefault();
+        composerInput.focus();
+        showToast('컴포저 포커스');
+      }
+    });
+
+    document.querySelectorAll('.settings-link, .all-link, .new-session-button').forEach((button) => {
+      button.addEventListener('click', () => showToast(`${button.textContent.trim()} 동작은 네이티브 화면에 연결됩니다`));
+    });
+  </script>
+</body>
+</html>

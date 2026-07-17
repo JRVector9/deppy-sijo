@@ -1161,6 +1161,8 @@ pub struct App {
     credentials_ui: ui::credentials::CredentialsUi,
     env_profiles_ui: ui::env_profiles::EnvProfilesUi,
     activity_ui: ui::activity::ActivityUi,
+    /// 목업 기반 홈/터미널 전환과 전체 워크스페이스 대시보드 상태.
+    agent_terminal_ui: ui::agent_terminal::AgentTerminalUi,
     notifications_ui: ui::notifications::NotificationsUi,
     /// 벨 팝오버 「대기 중」 섹션의 PTY 입력 대기 카드 렌더 상태 (v3.9 N3) — 자유 입력칸
     /// 버퍼 + 로그 tail 미리보기 캐시. 팝오버가 열려 있을 때만 조회한다(idle 비용 0).
@@ -1505,6 +1507,7 @@ impl App {
             credentials_ui: ui::credentials::CredentialsUi::new(),
             env_profiles_ui: ui::env_profiles::EnvProfilesUi::new(),
             activity_ui: ui::activity::ActivityUi::new(),
+            agent_terminal_ui: ui::agent_terminal::AgentTerminalUi::new(),
             notifications_ui: ui::notifications::NotificationsUi::new(),
             inbox_waiting_ui: ui::inbox_waiting::InboxWaitingUi::new(),
             // 히스토리 파일은 앱 데이터 디렉터리(= 메타데이터 파일과 같은 폴더) 아래.
@@ -5127,9 +5130,9 @@ impl eframe::App for App {
             ui.ctx().request_repaint();
         }
         // 타이틀바 통합 바: 패널 기본 inner_margin(8)을 없애 상단 경계에 붙이고 좌측
-        // 여백을 제거한다(#67 사용자). 항목은 신호등 높이(28pt 타이틀바, 중심 y≈14)에
+        // 여백을 제거한다(#67 사용자). 항목은 신호등과 38pt 브랜드 바 안에서
         // 맞춰 세로 중앙 정렬.
-        let bar_h = 28.0;
+        let bar_h = 38.0;
         let top_frame =
             egui::Frame::side_top_panel(&ui.ctx().global_style()).inner_margin(egui::Margin::ZERO);
         egui::Panel::top("top_bar")
@@ -5157,53 +5160,12 @@ impl eframe::App for App {
                         // 신호등(닫기/최소화/전체화면) 폭만큼 왼쪽 여백 — macOS.
                         #[cfg(target_os = "macos")]
                         ui.add_space(76.0);
-                        // 프레임 없는 텍스트 버튼 — 선택(열린 창)이면 accent-soft 둥근 박스로
-                        // 강조, hover 시 옅은 배경 (목업 §타이틀바 선택 하이라이트).
-                        // 팝오버 앵커가 필요한 곳(벨)은 tbtn_response로 Response를 받는다.
-                        let tbtn = |ui: &mut egui::Ui, label: String, selected: bool| -> bool {
-                            tbtn_response(ui, label, selected).clicked()
-                        };
-                        // 구조화된 Codex App Server 세션은 PTY workspace와 별도 창으로 연다.
-                        // raw terminal stream을 파싱/재작성하지 않아 ANSI·full-screen 앱이 보존된다.
-                        let agent_sessions_selected = self.agent_sessions_ui.is_open();
-                        if tbtn(ui, "Agents".to_owned(), agent_sessions_selected) {
-                            self.agent_sessions_ui.toggle();
-                        }
-                        // 벨(대기 인박스 + 최근 알림) — 설정 창과 독립된 경량 팝오버(v3.9 N1).
-                        // 알림 확인에 통합 설정 창 전체를 여는 마찰을 없앤다. unread 뱃지는
-                        // 설정 라벨에서 여기로 이관했다.
-                        let unread = self.notifications_ui.unread();
-                        unread_before = unread;
-                        // 뱃지 우선순위: 「대기 중」(MCP 승인 + PTY 입력 대기) 건수가 있으면
-                        // unread보다 먼저 보인다 — 대기는 즉시 조치가 필요해 정보성 알림보다
-                        // 우선한다. 둘 다 이미 폴링된 값이라 여기서 새 조회가 없다
-                        // (승인=approval-watcher, PTY=refresh_needs_input).
-                        let waiting = self.approvals_ui.pending().len() + self.global_waiting.len();
-                        let bell_label = if waiting > 0 {
-                            format!("🔔 {waiting}")
-                        } else if unread > 0 {
-                            format!("🔔 {unread}")
-                        } else {
-                            "🔔".to_owned()
-                        };
-                        // [/N2]
-                        let bell_open = egui::Popup::is_id_open(ui.ctx(), Self::inbox_popup_id());
-                        let bell = tbtn_response(ui, bell_label, bell_open)
-                            .on_hover_text(text.t("top.notifications", &[]));
-                        inbox_click = self.inbox_popup(&bell, &text);
-
-                        let sel = self.settings_open;
-                        if tbtn(ui, text.t("top.settings", &[]), sel) {
-                            self.settings_open = !sel;
-                            if self.settings_open {
-                                self.refresh_workspaces();
-                            }
-                        }
-                        // 우측: 로케일 · (옵트인) 메모리. 메모리 수치(phys_footprint)는
-                        // 지표 특성상 오해 소지가 있어 기본 숨김 — 설정 토글로 켠다.
-                        // 패널 margin 0이라 오른쪽 끝 여백을 직접 준다.
+                        ui.label(egui::RichText::new("Deppy Sijo").strong().size(14.0));
+                        ui.weak(egui::RichText::new("AI Agent Workspace").size(11.0));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add_space(10.0);
+                            // 우측: 로케일 · (옵트인) 메모리. 중앙에는 검색/워크스페이스
+                            // 선택기를 두지 않아 목업처럼 작업 표면이 비어 있게 한다.
                             let locale_short = self
                                 .config
                                 .i18n
@@ -5226,6 +5188,38 @@ impl eframe::App for App {
                             let resp = ui.weak(label);
                             if memory.is_some() {
                                 resp.on_hover_text(text.t("top.memory_hint", &[]));
+                            }
+                            let tbtn = |ui: &mut egui::Ui, label: String, selected: bool| -> bool {
+                                tbtn_response(ui, label, selected).clicked()
+                            };
+                            let sel = self.settings_open;
+                            if tbtn(ui, text.t("top.settings", &[]), sel) {
+                                self.settings_open = !sel;
+                                if self.settings_open {
+                                    self.refresh_workspaces();
+                                }
+                            }
+                            let unread = self.notifications_ui.unread();
+                            unread_before = unread;
+                            let waiting =
+                                self.approvals_ui.pending().len() + self.global_waiting.len();
+                            let bell_label = if waiting > 0 {
+                                format!("🔔 {waiting}")
+                            } else if unread > 0 {
+                                format!("🔔 {unread}")
+                            } else {
+                                "🔔".to_owned()
+                            };
+                            let bell_open =
+                                egui::Popup::is_id_open(ui.ctx(), Self::inbox_popup_id());
+                            let bell = tbtn_response(ui, bell_label, bell_open)
+                                .on_hover_text(text.t("top.notifications", &[]));
+                            inbox_click = self.inbox_popup(&bell, &text);
+
+                            // 구조화된 Codex App Server 세션은 PTY workspace와 별도 창으로 연다.
+                            let agent_sessions_selected = self.agent_sessions_ui.is_open();
+                            if tbtn(ui, "Agents".to_owned(), agent_sessions_selected) {
+                                self.agent_sessions_ui.toggle();
                             }
                         });
                     },
@@ -5279,11 +5273,57 @@ impl eframe::App for App {
         // 같은 상태 원천을 사용하므로 사이드바가 꺼져 있어도 계산한다.
         self.update_session_alerts(&mut terminal_sessions);
         let pty_agent_surfaces = self.pty_agent_surfaces(&terminal_sessions);
+        let active_workspace_id = self.active.id.clone();
+        let sidebar_workspaces: Vec<_> = self
+            .workspaces
+            .iter()
+            .map(|workspace| {
+                let (state, session_count) = if workspace.id == active_workspace_id {
+                    (
+                        ui::file_tree::SidebarWorkspaceState::Active,
+                        terminal_sessions.len(),
+                    )
+                } else if let Some(runtime) = self.warm.get(&workspace.id) {
+                    (
+                        ui::file_tree::SidebarWorkspaceState::Warm,
+                        runtime.session_titles.len(),
+                    )
+                } else {
+                    (
+                        ui::file_tree::SidebarWorkspaceState::Idle,
+                        self.persisted_activity_panes
+                            .get(&workspace.id)
+                            .map_or(0, Vec::len),
+                    )
+                };
+                let waiting_count = self
+                    .global_waiting
+                    .iter()
+                    .filter(|(workspace_id, _, _)| workspace_id == &workspace.id)
+                    .count();
+                ui::file_tree::SidebarWorkspaceEntry {
+                    id: workspace.id.clone(),
+                    name: Self::workspace_display_name(workspace),
+                    state,
+                    session_count,
+                    waiting_count,
+                }
+            })
+            .collect();
+        let inbox_count = self.approvals_ui.pending().len()
+            + self.global_waiting.len()
+            + self.notifications_ui.unread();
+        let sidebar_snapshot = ui::file_tree::SidebarSnapshot {
+            active_workspace_id: &active_workspace_id,
+            workspaces: &sidebar_workspaces,
+            view: self.agent_terminal_ui.view(),
+            inbox_count,
+        };
         if self.file_tree.is_some() {
             let sidebar_action = self
                 .file_tree
                 .as_mut()
-                .and_then(|tree| tree.panel(ui, &terminal_sessions, &text));
+                .and_then(|tree| tree.panel(ui, &terminal_sessions, &sidebar_snapshot, &text));
             // 워처의 .env* 변경 신호 → 활성 워크스페이스에서 .env가 바뀌거나 사라져도
             // 즉시 재동기화 + 기본 env 재전송 — 시작/전환 시에만 동기화하면 삭제된
             // .env의 secret이 새 셸에 계속 주입된다(codex High).
@@ -5295,6 +5335,29 @@ impl eframe::App for App {
                 self.sync_dotenv_env();
             }
             match sidebar_action {
+                Some(ui::file_tree::SidebarAction::SwitchWorkspace(workspace_id)) => {
+                    self.agent_terminal_ui
+                        .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+                    self.switch_workspace(&workspace_id);
+                }
+                Some(ui::file_tree::SidebarAction::ShowHome) => {
+                    self.agent_terminal_ui
+                        .set_view(ui::agent_terminal::AgentTerminalView::Home);
+                }
+                Some(ui::file_tree::SidebarAction::ShowTerminal) => {
+                    self.agent_terminal_ui
+                        .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
+                }
+                Some(ui::file_tree::SidebarAction::OpenInbox) => {
+                    egui::Popup::toggle_id(ui.ctx(), Self::inbox_popup_id());
+                }
+                Some(ui::file_tree::SidebarAction::OpenSettings) => {
+                    self.settings_open = true;
+                    self.refresh_workspaces();
+                }
+                Some(ui::file_tree::SidebarAction::OpenAgents) => {
+                    self.agent_sessions_ui.open();
+                }
                 // "터미널에 경로 삽입" (FT-3): 포커스된 pane의 세션에 WriteInput —
                 // 파일 트리의 유일한 runtime 접점 (§6).
                 Some(ui::file_tree::SidebarAction::InsertPath(path)) => {
@@ -5355,6 +5418,8 @@ impl eframe::App for App {
                 }
                 // 세션 목록 클릭 — 해당 tab/pane으로 전환 (workspace 사이드바)
                 Some(ui::file_tree::SidebarAction::FocusSession { tab, pane }) => {
+                    self.agent_terminal_ui
+                        .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
                     let is_active_tab = self
                         .active
                         .workspace_ui
@@ -5379,6 +5444,8 @@ impl eframe::App for App {
                 }
                 // 사이드바 + 버튼 — 새 셸 (탭바 제거 후 대체 진입점)
                 Some(ui::file_tree::SidebarAction::NewShell) => {
+                    self.agent_terminal_ui
+                        .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
                     self.active.workspace_ui.spawn_shell(
                         &self.active.runtime,
                         self.config.terminal.scrollback_lines as usize,
@@ -5651,11 +5718,30 @@ impl eframe::App for App {
             self.invalidate_env_profile_ui();
             ui.ctx().request_repaint();
         }
-        // ── 하단 도크 프롬프트 컴포저 (2026-07-17) — CentralPanel보다 먼저 배치해야
-        // 터미널 영역이 자동으로 줄어든다(통합 도크 — 팝업/오버레이 금지 사양).
-        // 설정 OFF면 패널 자체를 만들지 않는다 — 도크가 사라지고 터미널이 공간을
-        // 회수한다(사용자 요청 토글, file_tree_enabled의 "OFF면 Panel 미생성" 관례).
-        if self.config.ui.composer_enabled {
+        let home_visible = self.agent_terminal_ui.is_home();
+        if home_visible {
+            self.active
+                .workspace_ui
+                .update_hidden(ui.ctx(), &self.active.runtime, &events, &text);
+        }
+        let activity_rows = self.activity_rows();
+        let waiting_count = self.approvals_ui.pending().len() + self.global_waiting.len();
+        // 목업의 전역 상태 스트립. 가장 먼저 bottom panel로 선언해 창 최하단에 고정하고,
+        // 컴포저는 그 위에 쌓는다.
+        egui::Panel::bottom("agent_terminal_status_bar")
+            .resizable(false)
+            .exact_size(26.0)
+            .frame(
+                egui::Frame::side_top_panel(&ui.ctx().global_style())
+                    .inner_margin(egui::Margin::ZERO),
+            )
+            .show(ui, |ui| {
+                self.agent_terminal_ui
+                    .status_bar(ui, &activity_rows, waiting_count);
+            });
+
+        // 컴포저는 터미널 표면에만 붙는다. 홈은 전체 폭 대시보드가 남은 중앙 영역을 쓴다.
+        if !home_visible && self.config.ui.composer_enabled {
             self.render_composer_dock(ui, &text);
         }
 
@@ -5666,17 +5752,42 @@ impl eframe::App for App {
         let central_frame = egui::Frame::central_panel(&ui.ctx().global_style())
             .inner_margin(egui::Margin::ZERO)
             .fill(egui::Color32::from_rgb(0x18, 0x18, 0x1c));
+        let mut home_action = None;
         egui::CentralPanel::default()
             .frame(central_frame)
             .show(ui, |ui| {
-                self.active.workspace_ui.show(
-                    ui,
-                    &self.config.terminal,
-                    &self.active.runtime,
-                    &events,
-                    &text,
-                );
+                if home_visible {
+                    home_action = self.agent_terminal_ui.home(
+                        ui,
+                        &activity_rows,
+                        ui::agent_terminal::HomeMetrics {
+                            waiting: waiting_count,
+                            unread: self.notifications_ui.unread(),
+                        },
+                    );
+                } else {
+                    self.active.workspace_ui.show(
+                        ui,
+                        &self.config.terminal,
+                        &self.active.runtime,
+                        &events,
+                        &text,
+                    );
+                }
             });
+        match home_action {
+            Some(ui::agent_terminal::HomeAction::Inbox) => {
+                egui::Popup::toggle_id(ui.ctx(), Self::inbox_popup_id());
+            }
+            Some(ui::agent_terminal::HomeAction::Activity) => {
+                self.settings_category = ui::settings::Category::Activity;
+                self.settings_open = true;
+            }
+            Some(ui::agent_terminal::HomeAction::Agents) => {
+                self.agent_sessions_ui.open();
+            }
+            None => {}
+        }
         if self.active.workspace_ui.take_terminal_focus_claimed() {
             self.agent_sessions_ui.surrender_text_focus(ui.ctx());
         }

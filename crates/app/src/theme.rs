@@ -78,6 +78,8 @@ fn palette(
     v.panel_fill = panel;
     v.window_fill = panel;
     v.window_stroke = Stroke::new(1.0, hair);
+    v.window_corner_radius = egui::CornerRadius::same(2);
+    v.menu_corner_radius = egui::CornerRadius::same(1);
     v.extreme_bg_color = bg; // TextEdit/깊은 배경
     v.faint_bg_color = panel2;
     v.hyperlink_color = accent;
@@ -90,21 +92,26 @@ fn palette(
     w.noninteractive.weak_bg_fill = panel;
     w.noninteractive.bg_stroke = Stroke::new(1.0, hair); // 헤어라인 기본색
     w.noninteractive.fg_stroke = Stroke::new(1.0, text);
+    w.noninteractive.corner_radius = egui::CornerRadius::same(2);
     w.inactive.bg_fill = panel2;
     w.inactive.weak_bg_fill = panel2;
     w.inactive.bg_stroke = Stroke::new(1.0, hair);
     w.inactive.fg_stroke = Stroke::new(1.0, dim);
+    w.inactive.corner_radius = egui::CornerRadius::same(1);
     w.hovered.bg_fill = panel_hi;
     w.hovered.weak_bg_fill = panel_hi;
     w.hovered.bg_stroke = Stroke::new(1.0, hair);
     w.hovered.fg_stroke = Stroke::new(1.0, text);
+    w.hovered.corner_radius = egui::CornerRadius::same(1);
     w.active.bg_fill = panel_hi;
     w.active.weak_bg_fill = panel_hi;
     w.active.bg_stroke = Stroke::new(1.0, accent);
     w.active.fg_stroke = Stroke::new(1.0, text);
+    w.active.corner_radius = egui::CornerRadius::same(1);
     w.open.bg_fill = panel_hi;
     w.open.weak_bg_fill = panel_hi;
     w.open.fg_stroke = Stroke::new(1.0, text);
+    w.open.corner_radius = egui::CornerRadius::same(1);
     v
 }
 

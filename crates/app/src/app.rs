@@ -5857,6 +5857,27 @@ impl eframe::App for App {
             // refresh_workspaces 이후에 감지해 최신 workspace path 목록과 비교한다.
             self.env_session_banner = self.detect_session_cwd_banner();
         }
+        // pane 우클릭 → 세션 폴더 동선 (2026-07-18): 파일 트리 이동은 사이드바 트리의
+        // set_root(브레드크럼·'..'과 같은 탐색 메커니즘), Finder는 사이드바
+        // OpenSessionFolder와 같은 경로. cwd 미확인 시 경고 로그(사이드바 관례).
+        match self.active.workspace_ui.take_session_folder_request() {
+            Some(ui::workspace::SessionFolderRequest::RevealInTree(session)) => {
+                match self.session_cwd_lookup(session) {
+                    Some(cwd) => match self.file_tree.as_mut() {
+                        Some(tree) => tree.set_root(Some(std::path::PathBuf::from(cwd))),
+                        None => tracing::info!("파일 트리 OFF — 트리 이동 생략"),
+                    },
+                    None => tracing::warn!("세션 cwd 미확인 — 트리 이동 생략"),
+                }
+            }
+            Some(ui::workspace::SessionFolderRequest::OpenInFinder(session)) => {
+                match self.session_cwd_lookup(session) {
+                    Some(cwd) => platform::open_path(std::path::Path::new(&cwd)),
+                    None => tracing::warn!("세션 cwd 미확인 — Finder 열기 생략"),
+                }
+            }
+            None => {}
+        }
 
         // 알림 센터 렌더 (생성은 logic()에서 끝났다). 활성 workspace의 사라진 세션의
         // 진행형 알림 정리 (다른 workspace 건 alive를 알 수 없어 유지).

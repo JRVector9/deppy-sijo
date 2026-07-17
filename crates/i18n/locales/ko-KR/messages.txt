@@ -265,6 +265,7 @@ workspace.new_shell = + 새 셸
 workspace.split_horizontal_short = 분할 |
 workspace.split_vertical_short = 분할 -
 workspace.menu.scroll_bottom = 맨 아래로 스크롤
+workspace.menu.reveal_in_tree = 파일 트리를 이 폴더로 이동
 workspace.close_pane = pane 닫기
 workspace.rename_hint = 우클릭/더블클릭으로 이름 변경
 workspace.close_confirm.title = pane 닫기

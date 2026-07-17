@@ -675,7 +675,7 @@
     }
 
     .unified-sidebar .workspace-card.active {
-      min-height: 48px;
+      min-height: 38px;
       border-color: transparent;
       background: transparent;
     }
@@ -693,19 +693,6 @@
       display: block;
       font-size: 13px;
       font-weight: 600;
-    }
-
-    .unified-workspace-meta {
-      display: flex;
-      align-items: center;
-      gap: 7px;
-      margin-top: 1px;
-      overflow: hidden;
-      color: var(--dim);
-      font-family: var(--font-mono);
-      font-size: 9px;
-      text-overflow: ellipsis;
-      white-space: nowrap;
     }
 
     .branch-accent { color: var(--green); }
@@ -927,7 +914,7 @@
       min-height: 0;
       display: grid;
       grid-template-columns: minmax(0, 1fr);
-      grid-template-rows: 53px minmax(260px, 1fr) auto;
+      grid-template-rows: minmax(260px, 1fr) auto;
       background: var(--terminal);
       overflow: hidden;
     }
@@ -1107,58 +1094,58 @@
     .home-status-value { display: block; margin-top: 4px; color: var(--text-strong); font-size: 18px; }
     .home-status-detail { display: block; margin-top: 1px; color: var(--dim); font-size: 10px; }
 
-    .tabbar {
-      display: flex;
-      align-items: flex-end;
-      gap: 5px;
-      padding: 8px 8px 0;
-      border-bottom: 1px solid var(--border-soft);
-      background: var(--panel-low);
-    }
-
-    .tabbar-actions {
-      display: flex;
-      align-items: center;
-      gap: 4px;
-      margin: 0 4px 6px auto;
-    }
-
-    .active-tab {
-      height: 44px;
-      display: flex;
-      align-items: center;
-      gap: 9px;
-      padding: 0 12px;
-      border: 1px solid var(--border-soft);
-      border-bottom-color: var(--panel-2);
-      border-radius: var(--radius) var(--radius) 0 0;
-      background: var(--panel-2);
-      color: var(--text-strong);
-    }
-
-    .active-tab .icon-button { width: 26px; height: 26px; }
-
     .terminal-pane {
       min-width: 0;
       min-height: 0;
-      margin: 0 8px 7px;
-      border: 1px solid var(--border-soft);
-      border-top: 0;
-      border-radius: 0 0 var(--radius) var(--radius);
+      display: grid;
+      grid-template-rows: 30px minmax(0, 1fr);
+      border: 0;
+      border-radius: 0;
       background: #0f1117;
-      overflow: auto;
-      scrollbar-width: thin;
-      scrollbar-color: var(--border) transparent;
+      overflow: hidden;
+    }
+
+    .terminal-pane-header {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 0 4px 0 7px;
+      border-top: 2px solid var(--accent);
+      border-bottom: 1px solid var(--border-soft);
+      background: var(--panel-low);
+      color: var(--text-strong);
+    }
+
+    .terminal-pane-title {
+      min-width: 0;
+      overflow: hidden;
+      font-size: 12px;
+      font-weight: 600;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .terminal-pane-header .icon-button { width: 24px; height: 24px; }
+
+    .terminal-pane-actions {
+      display: flex;
+      align-items: center;
+      gap: 2px;
+      margin-left: auto;
     }
 
     .terminal-stream {
       min-height: 100%;
       position: relative;
-      padding: 18px;
+      padding: 6px;
       color: #ced1d9;
       font-family: var(--font-mono);
       font-size: 13px;
       line-height: 1.7;
+      overflow: auto;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border) transparent;
     }
 
     .permission-card {
@@ -2008,7 +1995,6 @@
                 <span class="workspace-avatar">S</span>
                 <span class="workspace-copy">
                   <span class="workspace-name">SKRT</span>
-                  <span class="unified-workspace-meta"><span class="branch-accent">●main</span><span>·</span><span>local</span></span>
                 </span>
                 <span class="workspace-tail"><span class="workspace-summary">2 실행 중 · 1 입력 대기</span><span class="workspace-chevron" aria-hidden="true">⌄</span></span>
               </button>
@@ -2038,17 +2024,17 @@
 
             <button class="workspace-card" type="button" data-workspace="arteawiki" aria-expanded="false">
               <span class="workspace-avatar orange">A</span>
-              <span class="workspace-copy"><span class="workspace-name">arteawiki</span><span class="unified-workspace-meta"><span>feature/wiki-import</span><span>·</span><span>staging</span></span></span>
+              <span class="workspace-copy"><span class="workspace-name">arteawiki</span></span>
               <span class="workspace-tail"><span class="workspace-summary orange">1 입력 대기</span><span class="workspace-chevron" aria-hidden="true">›</span></span>
             </button>
             <button class="workspace-card" type="button" data-workspace="VisionAI" aria-expanded="false">
               <span class="workspace-avatar violet">V</span>
-              <span class="workspace-copy"><span class="workspace-name">VisionAI</span><span class="unified-workspace-meta"><span class="branch-accent">●dev</span><span>·</span><span>local</span></span></span>
+              <span class="workspace-copy"><span class="workspace-name">VisionAI</span></span>
               <span class="workspace-tail"><span class="workspace-summary">1 실행 중 · 오류 1</span><span class="workspace-chevron" aria-hidden="true">›</span></span>
             </button>
             <button class="workspace-card" type="button" data-workspace="Crawler" aria-expanded="false">
               <span class="workspace-avatar cyan">C</span>
-              <span class="workspace-copy"><span class="workspace-name">Crawler</span><span class="unified-workspace-meta"><span class="branch-accent">●main</span><span>·</span><span>local</span></span></span>
+              <span class="workspace-copy"><span class="workspace-name">Crawler</span></span>
               <span class="workspace-tail"><span class="workspace-summary">유휴</span><span class="workspace-chevron" aria-hidden="true">›</span></span>
             </button>
             <button class="workspace-card" type="button" data-workspace="Personal" aria-expanded="false">
@@ -2143,17 +2129,18 @@
           </div>
         </section>
 
-        <div class="tabbar">
-          <div class="active-tab"><span class="dot green"></span><span id="activeTabTitle">테스트 수정 작업</span><button class="icon-button" type="button" aria-label="탭 닫기"><svg class="icon"><use href="#i-x"></use></svg></button></div>
-          <div class="tabbar-actions">
+        <div class="terminal-pane">
+          <header class="terminal-pane-header">
+            <svg class="icon"><use href="#i-terminal"></use></svg>
+            <span class="terminal-pane-title" id="activeTabTitle">테스트 수정 작업</span>
+            <button class="icon-button" type="button" aria-label="패널 닫기"><svg class="icon"><use href="#i-x"></use></svg></button>
+            <span class="terminal-pane-actions">
             <button class="icon-button" type="button" aria-label="세션 검색"><svg class="icon"><use href="#i-search"></use></svg></button>
             <button class="icon-button" type="button" aria-label="새 터미널"><svg class="icon"><use href="#i-terminal"></use></svg></button>
             <button class="icon-button" type="button" aria-label="좌우 분할"><svg class="icon"><use href="#i-split-columns"></use></svg></button>
             <button class="icon-button" type="button" aria-label="상하 분할"><svg class="icon"><use href="#i-split-rows"></use></svg></button>
-          </div>
-        </div>
-
-        <div class="terminal-pane">
+            </span>
+          </header>
           <div class="terminal-stream" id="terminalStream">
             <div class="permission-card">
               <p>Claude needs your permission to use Bash</p>

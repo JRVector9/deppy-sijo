@@ -18,62 +18,35 @@ use crate::config::TerminalConfig;
 /// 경로 해석 캐시 TTL (path_click_cache · session_cwd_cache 공통).
 const PATH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
-// AgentTerminal 목업의 중앙 작업면 치수. 실제 PTY를 가짜 카드로 바꾸지 않고,
-// 탭 strip + inset terminal surface라는 시각 구조만 그대로 적용한다.
-const TERMINAL_TAB_STRIP_HEIGHT: f32 = 54.0;
-const TERMINAL_TAB_TOP: f32 = 8.0;
-const TERMINAL_TAB_HEIGHT: f32 = 44.0;
-const TERMINAL_SURFACE_MARGIN_X: f32 = 8.0;
-const TERMINAL_SURFACE_MARGIN_BOTTOM: f32 = 7.0;
-const TERMINAL_STREAM_PADDING: f32 = 18.0;
+// 각 split leaf가 독립 터미널이 되는 패널형 구조. 헤더는 한 줄로 얇게 유지하고
+// PTY는 외곽 카드 여백 없이 패널 면을 채운다.
+const TERMINAL_PANE_HEADER_HEIGHT: f32 = 30.0;
+const TERMINAL_STREAM_PADDING: f32 = 6.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct TerminalSurfaceLayout {
-    strip: egui::Rect,
+struct TerminalPaneLayout {
+    header: egui::Rect,
     surface: egui::Rect,
     content: egui::Rect,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct TerminalPaneSurfaceLayout {
-    surface: egui::Rect,
-    content: egui::Rect,
-}
-
-fn terminal_pane_surface_layout(rect: egui::Rect) -> TerminalPaneSurfaceLayout {
-    let margin_x = TERMINAL_SURFACE_MARGIN_X.min(rect.width().max(0.0) * 0.25);
-    let margin_bottom = TERMINAL_SURFACE_MARGIN_BOTTOM.min(rect.height().max(0.0) * 0.25);
-    let surface = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + margin_x, rect.top()),
-        egui::pos2(
-            (rect.right() - margin_x).max(rect.left() + margin_x),
-            (rect.bottom() - margin_bottom).max(rect.top()),
-        ),
+fn terminal_pane_layout(rect: egui::Rect) -> TerminalPaneLayout {
+    let header_height = TERMINAL_PANE_HEADER_HEIGHT.min(rect.height().max(0.0) * 0.5);
+    let header = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(rect.right(), rect.top() + header_height),
     );
+    let surface = egui::Rect::from_min_max(egui::pos2(rect.left(), header.bottom()), rect.max);
     let pad_x = TERMINAL_STREAM_PADDING.min(surface.width().max(0.0) * 0.25);
     let pad_y = TERMINAL_STREAM_PADDING.min(surface.height().max(0.0) * 0.25);
     let content = egui::Rect::from_min_max(
         egui::pos2(surface.left() + pad_x, surface.top() + pad_y),
         egui::pos2(surface.right() - pad_x, surface.bottom() - pad_y),
     );
-    TerminalPaneSurfaceLayout { surface, content }
-}
-
-fn terminal_surface_layout(rect: egui::Rect) -> TerminalSurfaceLayout {
-    let strip_height = TERMINAL_TAB_STRIP_HEIGHT.min(rect.height().max(0.0));
-    let strip = egui::Rect::from_min_max(
-        rect.min,
-        egui::pos2(rect.right(), rect.top() + strip_height),
-    );
-    let body = egui::Rect::from_min_max(
-        egui::pos2(rect.left(), strip.bottom().min(rect.bottom())),
-        rect.max,
-    );
-    let pane = terminal_pane_surface_layout(body);
-    TerminalSurfaceLayout {
-        strip,
-        surface: pane.surface,
-        content: pane.content,
+    TerminalPaneLayout {
+        header,
+        surface,
+        content,
     }
 }
 
@@ -101,56 +74,63 @@ fn terminal_toolbar_button(
     } else {
         egui::Color32::from_rgb(0xc8, 0xcc, 0xd2)
     };
+    paint_terminal_toolbar_icon(ui.painter(), rect, icon, color);
+    response
+}
+
+fn paint_terminal_toolbar_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    icon: TerminalToolbarIcon,
+    color: egui::Color32,
+) {
     let stroke = egui::Stroke::new(1.25, color);
     let center = rect.center();
     match icon {
         TerminalToolbarIcon::Search => {
             let lens = center + egui::vec2(-1.5, -1.5);
-            ui.painter().circle_stroke(lens, 5.0, stroke);
-            ui.painter().line_segment(
+            painter.circle_stroke(lens, 5.0, stroke);
+            painter.line_segment(
                 [lens + egui::vec2(3.8, 3.8), lens + egui::vec2(7.0, 7.0)],
                 stroke,
             );
         }
         TerminalToolbarIcon::NewTerminal => {
             let body = egui::Rect::from_center_size(center, egui::vec2(18.0, 14.0));
-            ui.painter()
-                .rect_stroke(body, 1.5, stroke, egui::StrokeKind::Inside);
-            ui.painter().line_segment(
+            painter.rect_stroke(body, 1.5, stroke, egui::StrokeKind::Inside);
+            painter.line_segment(
                 [
                     center + egui::vec2(-5.5, -2.5),
                     center + egui::vec2(-2.5, 0.0),
                 ],
                 stroke,
             );
-            ui.painter().line_segment(
+            painter.line_segment(
                 [
                     center + egui::vec2(-2.5, 0.0),
                     center + egui::vec2(-5.5, 2.5),
                 ],
                 stroke,
             );
-            ui.painter().line_segment(
+            painter.line_segment(
                 [center + egui::vec2(0.0, 3.0), center + egui::vec2(5.0, 3.0)],
                 stroke,
             );
         }
         TerminalToolbarIcon::SplitColumns | TerminalToolbarIcon::SplitRows => {
             let body = egui::Rect::from_center_size(center, egui::vec2(16.0, 16.0));
-            ui.painter()
-                .rect_stroke(body, 1.5, stroke, egui::StrokeKind::Inside);
+            painter.rect_stroke(body, 1.5, stroke, egui::StrokeKind::Inside);
             match icon {
                 TerminalToolbarIcon::SplitColumns => {
-                    ui.painter().vline(center.x, body.y_range(), stroke);
+                    painter.vline(center.x, body.y_range(), stroke);
                 }
                 TerminalToolbarIcon::SplitRows => {
-                    ui.painter().hline(body.x_range(), center.y, stroke);
+                    painter.hline(body.x_range(), center.y, stroke);
                 }
                 _ => unreachable!(),
             }
         }
     }
-    response
 }
 
 /// 세션 셸 cwd 캐시 항목 — hover 경로 해석용. lsof(수십 ms)는 백그라운드 스레드가
@@ -237,6 +217,10 @@ pub struct WorkspaceUi {
     /// pane 우클릭 → "환경변수·API 설정" 요청 (E4 ⑥). App이 프레임에서 take해
     /// 설정 창을 Environment 카테고리로 연다.
     open_environment_requested: bool,
+    /// pane 우클릭 → 세션 폴더 요청(파일 트리 이동/Finder 열기, 2026-07-18). cwd
+    /// 해석(lsof 폴백 포함)과 트리·Finder 라우팅은 App 몫이라 요청만 쌓는다 — E4 ⑥
+    /// take_open_environment와 같은 프레임 소비 패턴.
+    session_folder_request: Option<SessionFolderRequest>,
     /// 터미널 마우스 선택 (session, anchor 셀, head 셀 — 드래그 방향 그대로,
     /// 렌더/복사 시 정규화). 새 출력(Viewport)이 오면 그 세션의 선택은 해제한다.
     selection: Option<(SessionId, usize, usize)>,
@@ -276,6 +260,16 @@ pub struct WorkspaceUi {
 
 /// 터미널 검색 매치 수 상한 (T3) — worker에 보내는 요청 상한. 도달 시 결과가 잘린다.
 const SEARCH_MAX_MATCHES: u32 = 1000;
+
+/// pane 우클릭 「세션 폴더 …」 메뉴의 요청 (2026-07-18) — App이 프레임마다 take해
+/// cwd를 해석(session_cwd_lookup, lsof 폴백)하고 파일 트리/Finder로 라우팅한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionFolderRequest {
+    /// 사이드바 파일 트리 루트를 이 세션의 현재 폴더로 이동.
+    RevealInTree(SessionId),
+    /// 이 세션의 현재 폴더를 Finder(OS 기본)로 연다.
+    OpenInFinder(SessionId),
+}
 
 /// 「마지막 출력 …」 메뉴가 예약한 후속 동작 (셸 통합 2단계) — ExtractLastOutput 응답
 /// (LastOutputExtracted)이 오면 handle_events가 실행한다.
@@ -372,6 +366,7 @@ impl WorkspaceUi {
             pending_spawn_cd: None,
             agent_send_presets: Vec::new(),
             open_environment_requested: false,
+            session_folder_request: None,
             selection: None,
             project_name: None,
             ui_scale: 1.0,
@@ -419,6 +414,10 @@ impl WorkspaceUi {
         let Some(session) = self.focused_session() else {
             return;
         };
+        self.open_search_for_session(session);
+    }
+
+    fn open_search_for_session(&mut self, session: SessionId) {
         match &mut self.search {
             Some(search) if search.session == session => {
                 search.focus_input = true;
@@ -1288,30 +1287,12 @@ impl WorkspaceUi {
         self.close_confirm_dialog(ui.ctx(), client, catalog);
 
         let rect = ui.available_rect_before_wrap();
-        let surface = terminal_surface_layout(rect);
-        let strip_fill = egui::Color32::from_rgb(0x17, 0x17, 0x1c);
-        ui.painter().rect_filled(surface.strip, 0.0, strip_fill);
-        ui.painter().hline(
-            surface.strip.x_range(),
-            surface.strip.bottom() - 0.5,
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(0x2a, 0x2a, 0x33)),
-        );
-        if let Some(pane) = mux
-            .focused_pane
-            .as_ref()
-            .and_then(|id| active_tab.panes.iter().find(|pane| &pane.id == id))
-            .or_else(|| active_tab.panes.first())
-        {
-            self.render_terminal_tab_strip(ui, surface.strip, pane, config, client, catalog);
-        }
         let layout = active_tab.layout.clone();
         let tab_id = active_tab.id.clone();
         let mut split_path = Vec::new();
-        let pane_area =
-            egui::Rect::from_min_max(egui::pos2(rect.left(), surface.strip.bottom()), rect.max);
         self.render_node(
             ui,
-            pane_area,
+            rect,
             &layout,
             &mux,
             config,
@@ -1326,79 +1307,90 @@ impl WorkspaceUi {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn render_terminal_tab_strip(
+    fn render_pane_header(
         &mut self,
         ui: &mut egui::Ui,
-        strip: egui::Rect,
+        header: egui::Rect,
         pane: &runtime::PaneSnapshot,
+        focused: bool,
         config: &TerminalConfig,
         client: &dyn RuntimeClient,
         catalog: &i18n::Catalog,
     ) {
+        let header_fill = egui::Color32::from_rgb(0x17, 0x17, 0x1c);
+        let border = egui::Color32::from_rgb(0x2a, 0x2a, 0x33);
+        ui.painter().rect_filled(header, 0.0, header_fill);
+        ui.painter().hline(
+            header.x_range(),
+            header.bottom() - 0.5,
+            egui::Stroke::new(1.0, border),
+        );
+        if focused {
+            ui.painter().hline(
+                header.x_range(),
+                header.top() + 0.5,
+                egui::Stroke::new(1.5, ui.visuals().selection.stroke.color),
+            );
+        }
+
+        let header_response = ui.interact(
+            header,
+            egui::Id::new(("terminal_pane_header", &pane.id)),
+            egui::Sense::click(),
+        );
+        if header_response.clicked() && !focused {
+            self.request_pane_focus(client, pane.id.clone());
+        }
+        self.pane_context_menu(&header_response, &pane.id, config, client, catalog);
+
         let osc = self.session_osc_title(pane.session_id);
         let title =
             self.resolve_session_title(&pane.title, pane.session_id, osc.as_deref(), catalog);
-        let font = egui::FontId::proportional(13.0);
+        let font = egui::FontId::proportional(12.0);
         let title_width = ui
             .painter()
             .layout_no_wrap(title.clone(), font.clone(), egui::Color32::WHITE)
             .size()
             .x;
-        let toolbar_button = 32.0;
-        let toolbar_gap = 4.0;
-        let toolbar_width = toolbar_button * 4.0 + toolbar_gap * 3.0;
-        let toolbar_left = strip.right() - 8.0 - toolbar_width;
-        let tab_available = (toolbar_left - 12.0 - (strip.left() + 8.0)).max(64.0);
-        let tab_width = (title_width + 78.0).max(124.0).min(tab_available);
-        let tab = egui::Rect::from_min_size(
-            strip.min + egui::vec2(8.0, TERMINAL_TAB_TOP),
-            egui::vec2(tab_width, TERMINAL_TAB_HEIGHT.min(strip.height())),
-        );
-        let tab_fill = egui::Color32::from_rgb(0x22, 0x22, 0x2a);
-        let tab_border = egui::Color32::from_rgb(0x3a, 0x3a, 0x42);
-        ui.painter().rect_filled(tab, 2.0, tab_fill);
-        ui.painter().rect_stroke(
-            tab,
-            2.0,
-            egui::Stroke::new(1.0, tab_border),
-            egui::StrokeKind::Inside,
-        );
-        // active tab의 아래 변은 terminal surface 쪽으로 열린 것처럼 보이게 채운다.
-        ui.painter().hline(
-            tab.x_range(),
-            tab.bottom() - 0.5,
-            egui::Stroke::new(1.5, tab_fill),
-        );
-        let tab_response = ui.interact(
-            tab,
-            egui::Id::new(("terminal_active_tab", &pane.id)),
-            egui::Sense::click(),
-        );
-        if tab_response.clicked()
-            && self.mux.as_ref().and_then(|mux| mux.focused_pane.as_ref()) != Some(&pane.id)
-        {
-            self.request_pane_focus(client, pane.id.clone());
-        }
-        self.pane_context_menu(&tab_response, &pane.id, config, client, catalog);
+        let toolbar_button = 24.0;
+        let toolbar_gap = 2.0;
+        let toolbar_icons = [
+            TerminalToolbarIcon::Search,
+            TerminalToolbarIcon::NewTerminal,
+            TerminalToolbarIcon::SplitColumns,
+            TerminalToolbarIcon::SplitRows,
+        ];
+        let visible_toolbar = (((header.width() - 84.0) / (toolbar_button + toolbar_gap)).floor()
+            as usize)
+            .clamp(1, toolbar_icons.len());
+        let toolbar_width = toolbar_button * visible_toolbar as f32
+            + toolbar_gap * visible_toolbar.saturating_sub(1) as f32;
+        let toolbar_left = header.right() - 4.0 - toolbar_width;
+        let center_y = header.center().y;
 
-        let status = pane
-            .session_id
-            .and_then(|session| self.sessions.get(&session))
-            .and_then(|view| view.status);
-        let status_color = status
-            .map(|status| crate::ui::file_tree::session_status_color(Some(status), ui.visuals()))
-            .unwrap_or(egui::Color32::from_rgb(0x55, 0xc8, 0x79));
-        let center_y = tab.center().y;
-        ui.painter()
-            .circle_filled(egui::pos2(tab.left() + 16.0, center_y), 4.0, status_color);
+        let terminal_mark = egui::Rect::from_center_size(
+            egui::pos2(header.left() + 14.0, center_y),
+            egui::vec2(20.0, 20.0),
+        );
+        paint_terminal_toolbar_icon(
+            ui.painter(),
+            terminal_mark,
+            TerminalToolbarIcon::NewTerminal,
+            egui::Color32::from_rgb(0xc8, 0xcc, 0xd2),
+        );
 
+        let title_left = header.left() + 29.0;
+        let close_center_x = (title_left + title_width + 12.0)
+            .min(toolbar_left - 12.0)
+            .max(title_left + 8.0);
         let close = egui::Rect::from_center_size(
-            egui::pos2(tab.right() - 17.0, center_y),
-            egui::vec2(26.0, 26.0),
+            egui::pos2(close_center_x, center_y),
+            egui::vec2(22.0, 22.0),
         );
+        let title_right = (close.left() - 3.0).max(title_left);
         let title_clip = egui::Rect::from_min_max(
-            egui::pos2(tab.left() + 29.0, tab.top()),
-            egui::pos2(close.left() - 4.0, tab.bottom()),
+            egui::pos2(title_left, header.top()),
+            egui::pos2(title_right, header.bottom()),
         );
         let title_galley =
             ui.painter()
@@ -1440,14 +1432,9 @@ impl WorkspaceUi {
             self.request_close_pane(client, pane.id.clone());
         }
 
-        let toolbar_top = strip.center().y - toolbar_button * 0.5;
-        let toolbar_icons = [
-            TerminalToolbarIcon::Search,
-            TerminalToolbarIcon::NewTerminal,
-            TerminalToolbarIcon::SplitColumns,
-            TerminalToolbarIcon::SplitRows,
-        ];
-        for (index, icon) in toolbar_icons.into_iter().enumerate() {
+        let toolbar_top = center_y - toolbar_button * 0.5;
+        let first_toolbar = toolbar_icons.len() - visible_toolbar;
+        for (index, icon) in toolbar_icons[first_toolbar..].iter().copied().enumerate() {
             let rect = egui::Rect::from_min_size(
                 egui::pos2(
                     toolbar_left + index as f32 * (toolbar_button + toolbar_gap),
@@ -1458,7 +1445,7 @@ impl WorkspaceUi {
             let response = terminal_toolbar_button(
                 ui,
                 rect,
-                egui::Id::new(("terminal_toolbar", &pane.id, index)),
+                egui::Id::new(("terminal_toolbar", &pane.id, first_toolbar + index)),
                 icon,
             );
             let tooltip = match icon {
@@ -1468,6 +1455,9 @@ impl WorkspaceUi {
                 TerminalToolbarIcon::SplitRows => catalog.t("workspace.split_vertical", &[]),
             };
             if response.on_hover_text(tooltip).clicked() {
+                if !focused {
+                    self.request_pane_focus(client, pane.id.clone());
+                }
                 self.activate_terminal_toolbar(icon, &pane.id, config, client);
             }
         }
@@ -1481,7 +1471,21 @@ impl WorkspaceUi {
         client: &dyn RuntimeClient,
     ) {
         match icon {
-            TerminalToolbarIcon::Search => self.open_search(),
+            TerminalToolbarIcon::Search => {
+                if let Some(session) = self
+                    .mux
+                    .as_ref()
+                    .and_then(|mux| {
+                        mux.tabs
+                            .iter()
+                            .flat_map(|tab| &tab.panes)
+                            .find(|candidate| &candidate.id == pane)
+                    })
+                    .and_then(|pane| pane.session_id)
+                {
+                    self.open_search_for_session(session);
+                }
+            }
             TerminalToolbarIcon::NewTerminal => self.send(
                 client,
                 RuntimeCommand::SpawnShell {
@@ -1530,8 +1534,7 @@ impl WorkspaceUi {
                 // 덮어 그리지 않게 페인터 클립도 pane 영역으로 줄인다
                 child.set_clip_rect(rect.intersect(ui.clip_rect()));
                 self.render_pane(&mut child, pane_id, mux, config, client, catalog);
-                // 포커스된 pane 표시는 pane 헤더의 accent 하이라이트가 담당한다 —
-                // 상단 2px 강조선은 헤더 색과 겹쳐 라인만 늘어 제거(#66 사용자).
+                // 포커스 표시는 각 pane 헤더의 accent top line이 담당한다.
             }
             LayoutNode::Split {
                 direction,
@@ -1682,17 +1685,18 @@ impl WorkspaceUi {
             return;
         };
         let focused = mux.focused_pane.as_ref() == Some(pane_id);
-        // split leaf마다 Target surface를 독립 적용한다. 전체 layout을 한 번만 감싸면
-        // 두 번째 pane은 여백/테두리가 사라져 가로·세로 분할의 스타일이 달라졌다.
-        let pane_surface = terminal_pane_surface_layout(ui.max_rect());
-        let pane_rect = pane_surface.surface;
+        let pane_layout = terminal_pane_layout(ui.max_rect());
+        let pane_rect = pane_layout.surface;
         ui.painter()
             .rect_filled(pane_rect, 0.0, egui::Color32::from_rgb(0x0f, 0x11, 0x17));
-        ui.painter().rect_stroke(
-            pane_rect,
-            0.0,
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(0x3a, 0x3a, 0x42)),
-            egui::StrokeKind::Inside,
+        self.render_pane_header(
+            ui,
+            pane_layout.header,
+            pane,
+            focused,
+            config,
+            client,
+            catalog,
         );
         // pane 전체 배경 interact — 터미널 위젯보다 먼저 등록해 터미널 밖 영역과
         // "세션 없음"/"연결 중"(스냅샷 지연) 상태에서도 우클릭 메뉴·드롭이 동작한다
@@ -1707,8 +1711,8 @@ impl WorkspaceUi {
         }
         self.pane_context_menu(&pane_resp, pane_id, config, client, catalog);
 
-        // 활성 pane의 제목/닫기/새 셸은 작업면 상단의 단일 tab strip에서 렌더한다.
-        // 여기에는 실제 PTY만 남겨 Target처럼 tab 아래 inset surface로 바로 이어진다.
+        // 제목/닫기/검색/새 셸/분할은 각 leaf의 얇은 헤더에 있고, 본문은 그 아래를
+        // 카드 외곽 여백 없이 채운다.
         if pane.session_id.is_some() {
             if pane_resp
                 .dnd_hover_payload::<std::path::PathBuf>()
@@ -1744,10 +1748,10 @@ impl WorkspaceUi {
         }
         let mut terminal_ui = ui.new_child(
             egui::UiBuilder::new()
-                .max_rect(pane_surface.content)
+                .max_rect(pane_layout.content)
                 .layout(egui::Layout::top_down(egui::Align::LEFT)),
         );
-        terminal_ui.set_clip_rect(pane_surface.content.intersect(ui.clip_rect()));
+        terminal_ui.set_clip_rect(pane_layout.content.intersect(ui.clip_rect()));
         terminal_ui.spacing_mut().item_spacing.y = 0.0;
         let ui = &mut terminal_ui;
         let Some(session) = pane.session_id else {
@@ -2742,6 +2746,11 @@ impl WorkspaceUi {
                 self.send(client, RuntimeCommand::ScrollToBottom { session });
                 ui.close();
             }
+            // 세션 폴더 진입 동선 (2026-07-18 사용자): 파일 트리를 이 세션의 현재
+            // 폴더로 이동 / Finder로 열기. cwd 해석·라우팅은 App이 take해 수행한다.
+            if let Some(session) = session {
+                self.session_folder_menu_items(ui, session, catalog);
+            }
             // (수동 상태 지정 U17b 서브메뉴는 사이드바와 함께 제거 — hook 감지 정착,
             // 2026-07-17 사용자. wire 명령 SetUserStatusOverride는 계약상 유지.)
             if ui.button(catalog.t("workspace.close_pane", &[])).clicked() {
@@ -2764,6 +2773,36 @@ impl WorkspaceUi {
     /// pane 우클릭의 환경설정 진입 요청을 소비한다 (E4 ⑥ — App이 프레임마다 확인).
     pub fn take_open_environment(&mut self) -> bool {
         std::mem::take(&mut self.open_environment_requested)
+    }
+
+    /// pane 우클릭의 세션 폴더 요청(트리 이동/Finder)을 소비한다 — App이 프레임마다
+    /// 확인해 cwd 해석 후 라우팅한다(2026-07-18).
+    pub fn take_session_folder_request(&mut self) -> Option<SessionFolderRequest> {
+        self.session_folder_request.take()
+    }
+
+    /// 「파일 트리를 이 폴더로 이동 / Finder에서 폴더 열기」 (2026-07-18 사용자) —
+    /// pane_context_menu에서 분리해 kittest 대상(last_output_menu_items 관례).
+    fn session_folder_menu_items(
+        &mut self,
+        ui: &mut egui::Ui,
+        session: SessionId,
+        catalog: &i18n::Catalog,
+    ) {
+        if ui
+            .button(catalog.t("workspace.menu.reveal_in_tree", &[]))
+            .clicked()
+        {
+            self.session_folder_request = Some(SessionFolderRequest::RevealInTree(session));
+            ui.close();
+        }
+        if ui
+            .button(catalog.t("sidebar.menu.open_folder", &[]))
+            .clicked()
+        {
+            self.session_folder_request = Some(SessionFolderRequest::OpenInFinder(session));
+            ui.close();
+        }
     }
 
     /// 명령을 보냈거나 spawn 응답 대기 중이면 repaint를 예약한다 —
@@ -3782,36 +3821,36 @@ mod tests {
     use terminal::{CursorShape, CursorSnapshot, TerminalCell};
 
     #[test]
-    fn target_터미널은_54pt_탭과_8_18pt_inset을_유지한다() {
-        // 사용자 Target(1178×716 @2x)의 논리 크기와 같은 589×358 surface.
-        let layout = terminal_surface_layout(egui::Rect::from_min_size(
+    fn 분할_터미널은_30pt_헤더와_6pt_본문여백을_유지한다() {
+        let layout = terminal_pane_layout(egui::Rect::from_min_size(
             egui::Pos2::ZERO,
             egui::vec2(589.0, 358.0),
         ));
-        assert_eq!(layout.strip.height(), 54.0);
-        assert_eq!(layout.surface.left(), 8.0);
-        assert_eq!(layout.surface.right(), 581.0);
-        assert_eq!(layout.surface.top(), 54.0);
-        assert_eq!(layout.surface.bottom(), 351.0);
-        assert_eq!(layout.content.left(), 26.0);
-        assert_eq!(layout.content.top(), 72.0);
-        assert_eq!(layout.content.right(), 563.0);
-        assert_eq!(layout.content.bottom(), 333.0);
+        assert_eq!(layout.header.height(), 30.0);
+        assert_eq!(layout.surface.left(), 0.0);
+        assert_eq!(layout.surface.right(), 589.0);
+        assert_eq!(layout.surface.top(), 30.0);
+        assert_eq!(layout.surface.bottom(), 358.0);
+        assert_eq!(layout.content.left(), 6.0);
+        assert_eq!(layout.content.top(), 36.0);
+        assert_eq!(layout.content.right(), 583.0);
+        assert_eq!(layout.content.bottom(), 352.0);
     }
 
     #[test]
-    fn target_터미널_inset은_아주_작은_split에서도_뒤집히지_않는다() {
-        let layout = terminal_surface_layout(egui::Rect::from_min_size(
+    fn 소형_분할에서도_헤더와_본문이_뒤집히지_않는다() {
+        let layout = terminal_pane_layout(egui::Rect::from_min_size(
             egui::Pos2::ZERO,
-            egui::vec2(30.0, 60.0),
+            egui::vec2(30.0, 40.0),
         ));
+        assert!(layout.header.is_positive());
         assert!(layout.surface.is_positive());
         assert!(layout.content.is_positive());
         assert!(layout.surface.contains_rect(layout.content));
     }
 
     #[test]
-    fn 가로와_세로_split의_모든_leaf가_같은_surface_inset을_갖는다() {
+    fn 가로와_세로_split의_모든_leaf가_같은_밀착형_layout을_갖는다() {
         let slots = [
             // 좌우 분할
             egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(294.0, 300.0)),
@@ -3821,15 +3860,17 @@ mod tests {
             egui::Rect::from_min_size(egui::pos2(0.0, 150.0), egui::vec2(589.0, 150.0)),
         ];
         for slot in slots {
-            let layout = terminal_pane_surface_layout(slot);
-            assert_eq!(layout.surface.left() - slot.left(), 8.0);
-            assert_eq!(slot.right() - layout.surface.right(), 8.0);
-            assert_eq!(layout.surface.top(), slot.top());
-            assert_eq!(slot.bottom() - layout.surface.bottom(), 7.0);
-            assert_eq!(layout.content.left() - layout.surface.left(), 18.0);
-            assert_eq!(layout.content.top() - layout.surface.top(), 18.0);
-            assert_eq!(layout.surface.right() - layout.content.right(), 18.0);
-            assert_eq!(layout.surface.bottom() - layout.content.bottom(), 18.0);
+            let layout = terminal_pane_layout(slot);
+            assert_eq!(layout.header.left(), slot.left());
+            assert_eq!(layout.header.right(), slot.right());
+            assert_eq!(layout.header.height(), 30.0);
+            assert_eq!(layout.surface.left(), slot.left());
+            assert_eq!(layout.surface.right(), slot.right());
+            assert_eq!(layout.surface.bottom(), slot.bottom());
+            assert_eq!(layout.content.left() - layout.surface.left(), 6.0);
+            assert_eq!(layout.content.top() - layout.surface.top(), 6.0);
+            assert_eq!(layout.surface.right() - layout.content.right(), 6.0);
+            assert_eq!(layout.surface.bottom() - layout.content.bottom(), 6.0);
         }
     }
 
@@ -4432,6 +4473,42 @@ mod tests {
             c,
             RuntimeCommand::ExtractLastOutput { session } if *session == SessionId(7)
         )));
+    }
+
+    #[test]
+    fn kittest_세션_폴더_메뉴가_트리이동과_finder_요청을_쌓는다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, ws: &mut WorkspaceUi| {
+                ws.session_folder_menu_items(ui, SessionId(7), &catalog);
+            },
+            WorkspaceUi::new(),
+        );
+        harness.run();
+        harness
+            .get_by_label(&catalog.t("workspace.menu.reveal_in_tree", &[]))
+            .click();
+        harness.run();
+        assert_eq!(
+            harness.state_mut().take_session_folder_request(),
+            Some(SessionFolderRequest::RevealInTree(SessionId(7))),
+            "트리 이동 요청이 쌓여야 한다"
+        );
+        assert_eq!(
+            harness.state_mut().take_session_folder_request(),
+            None,
+            "take는 1회 소비다"
+        );
+        harness
+            .get_by_label(&catalog.t("sidebar.menu.open_folder", &[]))
+            .click();
+        harness.run();
+        assert_eq!(
+            harness.state_mut().take_session_folder_request(),
+            Some(SessionFolderRequest::OpenInFinder(SessionId(7))),
+            "Finder 요청이 쌓여야 한다"
+        );
     }
 
     #[test]

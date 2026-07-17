@@ -265,6 +265,7 @@ workspace.new_shell = + 新建 Shell
 workspace.split_horizontal_short = 拆分 |
 workspace.split_vertical_short = 拆分 -
 workspace.menu.scroll_bottom = 滚动到底部
+workspace.menu.reveal_in_tree = 将文件树移到此文件夹
 workspace.close_pane = 关闭 pane
 workspace.rename_hint = 右键或双击重命名
 workspace.close_confirm.title = 关闭窗格

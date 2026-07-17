@@ -1040,10 +1040,16 @@ impl FileTreeUi {
             });
         });
         ui.add_space(4.0);
-        if let Some(active) = sidebar
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.id == sidebar.active_workspace_id)
+        // DB list_workspaces가 보장하는 created_at 순서를 그대로 그린다. 이전 구현은
+        // 활성 workspace를 먼저 뽑아 맨 위에 렌더해 선택할 때마다 행이 이동했다.
+        let (before_active, active, after_active) =
+            workspace_creation_order_partition(sidebar.workspaces, sidebar.active_workspace_id);
+        for workspace in before_active {
+            if workspace_row(ui, workspace, false, Some(false)).clicked() {
+                action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
+            }
+        }
+        if let Some(active) = active
             && workspace_row(ui, active, true, Some(self.workspace_sessions_expanded)).clicked()
         {
             self.workspace_sessions_expanded = !self.workspace_sessions_expanded;
@@ -1233,15 +1239,10 @@ impl FileTreeUi {
 
         egui::ScrollArea::vertical()
             .id_salt("workspace_list_scroll")
-            // 접힌 상태에서는 등록된 워크스페이스 전체와 각 상태 합계가 한눈에 보여야 한다.
             .max_height((ui.available_height() * 0.34).clamp(118.0, 232.0))
             .auto_shrink([false, true])
             .show(ui, |ui| {
-                for workspace in sidebar
-                    .workspaces
-                    .iter()
-                    .filter(|workspace| workspace.id != sidebar.active_workspace_id)
-                {
+                for workspace in after_active {
                     if workspace_row(ui, workspace, false, Some(false)).clicked() {
                         action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
                     }
@@ -2583,7 +2584,7 @@ fn workspace_row(
     expanded: Option<bool>,
 ) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 58.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 46.0), egui::Sense::click());
     if !ui.is_rect_visible(rect) {
         return response;
     }
@@ -2603,8 +2604,8 @@ fn workspace_row(
         SidebarWorkspaceState::Idle => ui.visuals().weak_text_color(),
     };
     let avatar = egui::Rect::from_min_size(
-        egui::pos2(rect.left() + 8.0, rect.top() + 9.0),
-        egui::vec2(40.0, 40.0),
+        egui::pos2(rect.left() + 8.0, rect.top() + 8.0),
+        egui::vec2(30.0, 30.0),
     );
     // 워크스페이스 마크는 별도 테두리 없이 상태색을 채운다(HTML 목업과 같은 규칙).
     ui.painter()
@@ -2613,7 +2614,7 @@ fn workspace_row(
         avatar.center(),
         egui::Align2::CENTER_CENTER,
         workspace.name.chars().next().unwrap_or('W'),
-        egui::FontId::proportional(19.0),
+        egui::FontId::proportional(15.0),
         color,
     );
     let name_width = (rect.width() - 230.0).max(72.0);
@@ -2624,31 +2625,16 @@ fn workspace_row(
         name_width,
     );
     ui.painter().galley(
-        egui::pos2(
-            avatar.right() + 10.0,
-            rect.top() + 19.0 - name.size().y / 2.0,
-        ),
+        egui::pos2(avatar.right() + 9.0, rect.center().y - name.size().y / 2.0),
         name,
         ui.visuals().text_color(),
-    );
-    let state = match workspace.state {
-        SidebarWorkspaceState::Active => "활성 · local",
-        SidebarWorkspaceState::Warm => "백그라운드 · local",
-        SidebarWorkspaceState::Idle => "비활성",
-    };
-    ui.painter().text(
-        egui::pos2(avatar.right() + 10.0, rect.top() + 41.0),
-        egui::Align2::LEFT_CENTER,
-        state,
-        egui::FontId::monospace(11.0),
-        color,
     );
     let right = if expanded.is_some() {
         rect.right() - 22.0
     } else {
         rect.right() - 8.0
     };
-    paint_workspace_summary(ui, right, rect.top() + 20.0, workspace.summary);
+    paint_workspace_summary(ui, right, rect.center().y, workspace.summary);
     if let Some(expanded) = expanded {
         let center = egui::pos2(rect.right() - 9.0, rect.center().y);
         let points = if expanded {
@@ -2671,6 +2657,27 @@ fn workspace_row(
         ));
     }
     response
+}
+
+fn workspace_creation_order_partition<'a>(
+    workspaces: &'a [SidebarWorkspaceEntry],
+    active_id: &str,
+) -> (
+    &'a [SidebarWorkspaceEntry],
+    Option<&'a SidebarWorkspaceEntry>,
+    &'a [SidebarWorkspaceEntry],
+) {
+    match workspaces
+        .iter()
+        .position(|workspace| workspace.id == active_id)
+    {
+        Some(index) => (
+            &workspaces[..index],
+            Some(&workspaces[index]),
+            &workspaces[index + 1..],
+        ),
+        None => (workspaces, None, &[]),
+    }
 }
 
 fn paint_workspace_summary(
@@ -3695,6 +3702,26 @@ fn reread(base: &Path, old: &[TreeNode]) -> std::io::Result<Vec<TreeNode>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 워크스페이스_선택이_바뀌어도_생성순서가_고정된다() {
+        let workspaces = ["first", "second", "third"].map(|id| SidebarWorkspaceEntry {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            state: SidebarWorkspaceState::Idle,
+            summary: SidebarSessionSummary::default(),
+        });
+        for selected in ["first", "second", "third"] {
+            let (before, active, after) = workspace_creation_order_partition(&workspaces, selected);
+            let rendered = before
+                .iter()
+                .chain(active)
+                .chain(after)
+                .map(|workspace| workspace.id.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(rendered, ["first", "second", "third"]);
+        }
+    }
 
     #[test]
     fn 접힌_워크스페이스_요약은_세션상태를_한번씩_집계한다() {

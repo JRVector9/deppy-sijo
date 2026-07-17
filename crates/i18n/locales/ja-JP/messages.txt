@@ -265,6 +265,7 @@ workspace.new_shell = + 新規シェル
 workspace.split_horizontal_short = 分割 |
 workspace.split_vertical_short = 分割 -
 workspace.menu.scroll_bottom = 最下部へスクロール
+workspace.menu.reveal_in_tree = ファイルツリーをこのフォルダへ移動
 workspace.close_pane = paneを閉じる
 workspace.rename_hint = 右クリック/ダブルクリックで名前を変更
 workspace.close_confirm.title = ペインを閉じる

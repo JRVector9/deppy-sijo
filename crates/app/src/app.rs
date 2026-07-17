@@ -4460,7 +4460,7 @@ impl App {
             // 목록을 갱신한다.
             return;
         }
-        let bytes = format!("{reply}\n").into_bytes();
+        let bytes = waiting_answer_bytes(reply);
         if workspace_id == self.active.id {
             // 선택 중 freeze 해제 — 이 경로도 WorkspaceUi::send를 우회한다
             // (resume 주입 경로와 동일 관례, app.rs의 다른 WriteInput 직접 전송 참고).
@@ -6487,6 +6487,15 @@ fn parse_known_hosts(text: &str) -> Vec<(String, String)> {
 }
 
 /// 세션이 붙어 있는 pane id를 mux 스냅샷에서 찾는다 (알림 클릭 → focus용).
+/// 인박스 응답을 PTY에 보낼 바이트 — 끝은 **CR(`\r`)이다**.
+///
+/// 터미널 raw 모드에서 실행을 일으키는 건 CR이고, 실제 Enter 키도 그렇게 매핑된다
+/// (terminal::input_mapper `Key::Enter => b"\r"`). LF(`\n`)를 보내면 줄만 바뀌고
+/// 명령이 쌓이기만 한다 — 2026-07-17 사용자가 실제로 겪은 증상.
+fn waiting_answer_bytes(reply: &str) -> Vec<u8> {
+    format!("{reply}\r").into_bytes()
+}
+
 /// 상단바 텍스트 버튼 — 프레임 없이 라벨만, 선택 시 accent-soft 박스.
 /// Response를 돌려주므로 팝오버 앵커/hover 텍스트에 쓸 수 있다.
 fn tbtn_response(ui: &mut egui::Ui, label: String, selected: bool) -> egui::Response {
@@ -6816,6 +6825,37 @@ mod tests {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+
+    /// 2026-07-17 사용자 회귀: 인박스에서 답을 보내면 "명령어가 줄에 쌓이고 실행은
+    /// 안 되는" 증상. LF는 줄만 바꾼다 — PTY에서 실행을 일으키는 건 CR이고, 실제
+    /// Enter 키 매핑(terminal::input_mapper)도 CR이다.
+    #[test]
+    fn waiting_answer는_실제_enter키와_같은_cr로_끝난다() {
+        assert_eq!(waiting_answer_bytes("y"), b"y\r".to_vec());
+        assert_eq!(waiting_answer_bytes("2"), b"2\r".to_vec());
+        assert!(
+            !waiting_answer_bytes("y").contains(&b'\n'),
+            "LF를 보내면 실행되지 않는다"
+        );
+        // 실제 Enter 키가 내는 바이트와 종결이 같아야 한다(같은 경로로 취급되도록).
+        let enter = terminal::input_mapper::map_event(
+            &egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            false,
+            &egui::Modifiers::NONE,
+        )
+        .expect("Enter 매핑");
+        assert_eq!(
+            waiting_answer_bytes("y").last(),
+            enter.last(),
+            "인박스 응답의 종결 바이트가 실제 Enter와 같아야 한다"
+        );
+    }
 
     #[test]
     fn agent_notification_navigation_preserves_transport_workspace_and_session() {

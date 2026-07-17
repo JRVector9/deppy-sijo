@@ -2285,6 +2285,26 @@ impl WorkspaceUi {
         self.send(client, RuntimeCommand::WriteInput { session, bytes });
     }
 
+    /// session이 지금 어느 pane에 붙어 있는지 — 워크트리 삭제 후 같은 cwd를 쓰던
+    /// 형제 pane을 모두 찾을 때 쓴다(2026-07-18).
+    pub fn pane_for_session(&self, session: runtime::SessionId) -> Option<runtime::MuxPaneId> {
+        self.mux.as_ref().and_then(|mux| {
+            mux.tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .find(|p| p.session_id == Some(session))
+                .map(|p| p.id.clone())
+        })
+    }
+
+    /// pane을 확인 없이 즉시 닫는다 — cwd가 이미 사라져 세션을 보존할 이유가 없을 때만
+    /// 쓴다(워크트리 삭제 완료 후, 2026-07-18). `request_close_pane`과 달리 실행 중
+    /// 세션이어도 확인창을 띄우지 않는다 — 지운 뒤라 "닫을지 말지"가 아니라 이미
+    /// 죽은 셸을 치우는 것뿐이라 확인이 의미 없다.
+    pub fn close_pane_now(&mut self, client: &dyn RuntimeClient, pane: runtime::MuxPaneId) {
+        self.send(client, RuntimeCommand::ClosePane { pane });
+    }
+
     /// pane 닫기 요청 — 실행 중 세션이면 확인을 거치고, 아니면 즉시 닫는다.
     /// (세션 상태를 모르면 보수적으로 확인을 띄운다 — 실수 즉사 방지가 목적.)
     /// 사이드바 컨텍스트 메뉴(App 경유)도 같은 경로를 쓴다.
@@ -2592,8 +2612,9 @@ impl WorkspaceUi {
                     tab: tab.id.clone(),
                     pane: pane.id.clone(),
                     session: pane.session_id,
-                    resumable: false, // App이 restore_agents 기준으로 채운다
-                    has_cwd: false,   // App이 session_cwds 기준으로 채운다 (PR-W)
+                    resumable: false,   // App이 restore_agents 기준으로 채운다
+                    has_cwd: false,     // App이 session_cwds 기준으로 채운다 (PR-W)
+                    in_worktree: false, // App이 session_cwds 기준으로 채운다 (2026-07-18)
                     status_hint,
                     title: self.resolve_session_title(
                         &pane.title,

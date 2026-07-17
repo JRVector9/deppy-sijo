@@ -35,6 +35,9 @@ pub struct SessionEntry {
     pub status_hint: Option<String>,
     /// 세션 cwd가 감지 캐시에 있음 — 워크트리 메뉴 노출 조건. App이 채운다(PR-W).
     pub has_cwd: bool,
+    /// 세션 cwd가 `.deppy/worktrees/` 하위 — 「워크트리 삭제」 메뉴 노출 조건.
+    /// App이 채운다(2026-07-18).
+    pub in_worktree: bool,
     /// 에이전트 3행: "실행 중 · ctx 69%" (상태 라벨 + 남은 컨텍스트).
     pub status_line: Option<String>,
 }
@@ -75,6 +78,10 @@ pub enum SidebarAction {
     ShowDiff { session: runtime::SessionId },
     /// 이 세션 레포의 새 git worktree를 만들고 그 폴더에서 셸을 연다 (PR-W).
     NewWorktreeCell { session: runtime::SessionId },
+    /// 이 세션 cwd가 속한 워크트리를 지운다(작업 디렉터리만 — 브랜치는 남긴다).
+    /// 성공하면 같은 cwd를 쓰던 pane을 전부 닫는다(같은 폴더에서 새 셀로 만든
+    /// 형제 pane 포함) — cwd가 사라진 셸을 남기지 않기 위함(2026-07-18).
+    RemoveWorktree { session: runtime::SessionId },
 }
 
 /// 트리 노드. `children == None`은 아직 나열 안 됨(lazy).
@@ -1044,6 +1051,16 @@ impl FileTreeUi {
                                             .clicked()
                                     {
                                         action = Some(SidebarAction::NewWorktreeCell { session });
+                                        ui.close();
+                                    }
+                                    // 워크트리 삭제 — 이 세션 cwd가 `.deppy/worktrees/`
+                                    // 하위일 때만 노출(2026-07-18 사용자 제안).
+                                    if entry.in_worktree
+                                        && ui
+                                            .button(catalog.t("sidebar.menu.remove_worktree", &[]))
+                                            .clicked()
+                                    {
+                                        action = Some(SidebarAction::RemoveWorktree { session });
                                         ui.close();
                                     }
                                     if entry.resumable

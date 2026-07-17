@@ -1277,6 +1277,14 @@ pub struct App {
         String,
         std::sync::mpsc::Receiver<anyhow::Result<std::path::PathBuf>>,
     )>,
+    /// 진행 중인 워크트리 삭제 — (요청 시점 workspace id, 결과 채널). 결과는 지운
+    /// 워크트리 루트 경로 — 성공하면 요청 시점 워크스페이스가 여전히 활성일 때만,
+    /// 그 루트 하위 cwd를 쓰던 세션의 pane을 전부 닫는다(같은 폴더에서 새 셀로
+    /// 만든 형제 pane, 하위 폴더로 cd한 pane 포함, 2026-07-18).
+    worktree_remove_rx: Option<(
+        String,
+        std::sync::mpsc::Receiver<anyhow::Result<std::path::PathBuf>>,
+    )>,
     ts_detect_rx: Option<std::sync::mpsc::Receiver<crate::tailscale::Detected>>,
     /// 마지막 감지 결과 — 설정 UI 표시용. None = 이 세션에서 아직 시도 안 함.
     ts_detected: Option<crate::tailscale::Detected>,
@@ -1553,6 +1561,7 @@ impl App {
             web_reveal_url: false,
             web_qr: None,
             worktree_rx: None,
+            worktree_remove_rx: None,
             ts_detect_rx: None,
             ts_detected: None,
             ts_detect_overwrite: false,
@@ -4538,7 +4547,7 @@ impl App {
                             .list_mcp_tools(&server.id)
                             .unwrap_or_default()
                             .into_iter()
-                            .map(|tool| tool.name)
+                            .map(|tool| (tool.name, tool.description.unwrap_or_default()))
                             .collect();
                         (server.name, tools)
                     })
@@ -5259,6 +5268,12 @@ impl eframe::App for App {
             entry.has_cwd = entry
                 .session
                 .is_some_and(|s| self.session_cwds.contains_key(&s));
+            // 워크트리 삭제 메뉴 노출 조건 — cwd가 이 앱이 만든 워크트리 하위인가.
+            entry.in_worktree = entry.session.is_some_and(|s| {
+                self.session_cwds
+                    .get(&s)
+                    .is_some_and(|cwd| cwd.contains("/.deppy/worktrees/"))
+            });
         }
         // 완료/입력대기 주목(6px 레일·펄스) 갱신 + 확인 시 완료 소비. Agents 패널도
         // 같은 상태 원천을 사용하므로 사이드바가 꺼져 있어도 계산한다.
@@ -5451,6 +5466,35 @@ impl eframe::App for App {
                         }
                     }
                 }
+                // 워크트리 삭제 — dirty/미병합 판정은 git worktree remove 자체가 거부로
+                // 처리한다(강제 삭제 없음, 2026-07-18 사용자 제안).
+                Some(ui::file_tree::SidebarAction::RemoveWorktree { session }) => {
+                    if self.worktree_remove_rx.is_some() {
+                        tracing::info!("워크트리 삭제가 이미 진행 중 — 요청 무시");
+                    } else {
+                        match self.session_cwd_lookup(session) {
+                            Some(cwd) => {
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                self.worktree_remove_rx = Some((self.active.id.clone(), rx));
+                                let ctx = ui.ctx().clone();
+                                std::thread::spawn(move || {
+                                    let result = crate::worktree::remove_worktree(
+                                        std::path::Path::new(&cwd),
+                                    );
+                                    let _ = tx.send(result);
+                                    ctx.request_repaint();
+                                });
+                            }
+                            None => {
+                                tracing::warn!("세션 cwd 미확인 — 워크트리 삭제 생략");
+                                platform::notify(
+                                    &text.t("worktree.remove_failed", &[]),
+                                    &text.t("worktree.no_cwd", &[]),
+                                );
+                            }
+                        }
+                    }
+                }
                 // 같은 폴더에서 새 셸 — cwd 미확인이면 일반 새 셸로 폴백.
                 Some(ui::file_tree::SidebarAction::NewShellSameFolder { session }) => {
                     let cwd = self.session_cwd_lookup(session);
@@ -5533,6 +5577,55 @@ impl eframe::App for App {
                         tracing::warn!("워크트리 생성 스레드가 결과 없이 종료");
                     }
                 },
+            }
+        }
+
+        // 워크트리 삭제 완료 수령 — 성공하면 그 루트 하위 cwd를 쓰던 세션의 pane을
+        // 전부 확인 없이 닫는다(같은 폴더에서 새 셀로 만든 형제 pane, 하위 폴더로
+        // cd한 pane 포함 — codex P2: 지운 cwd 문자열과 정확히 같은 세션만 닫으면
+        // 하위 폴더에 있던 pane이 죽은 채 남는다). 요청 시점 워크스페이스가 여전히
+        // 활성일 때만 — 다른 워크스페이스는 이 App 프레임에서 그 workspace_ui에
+        // 닿을 수 없다(create_worktree의 NotifyOnly와 같은 한계, codex P2).
+        if let Some((requested_ws, rx)) = &self.worktree_remove_rx {
+            match rx.try_recv() {
+                Ok(Ok(root)) => {
+                    if *requested_ws == self.active.id {
+                        let workspace_ui = &self.active.workspace_ui;
+                        let panes: Vec<_> = self
+                            .session_cwds
+                            .iter()
+                            .filter(|(_, cwd)| std::path::Path::new(cwd).starts_with(&root))
+                            .filter_map(|(session, _)| workspace_ui.pane_for_session(*session))
+                            .collect();
+                        for pane in panes {
+                            self.active
+                                .workspace_ui
+                                .close_pane_now(&self.active.runtime, pane);
+                        }
+                        platform::notify(&text.t("worktree.removed", &[]), "");
+                    } else {
+                        let root_display = root.display().to_string();
+                        tracing::info!("워크스페이스 전환 — 워크트리만 삭제됨: {root_display}");
+                        platform::notify(&text.t("worktree.removed_elsewhere", &[]), &root_display);
+                    }
+                    self.worktree_remove_rx = None;
+                }
+                Ok(Err(e)) => {
+                    // dirty/미병합/무시된 파일 등 git·자체 검사의 거부 사유를 그대로
+                    // 알린다 — 조용한 실패 금지.
+                    tracing::warn!("워크트리 삭제 실패: {e:#}");
+                    let detail = format!("{e:#}");
+                    platform::notify(
+                        &text.t("worktree.remove_failed", &[]),
+                        detail.lines().next().unwrap_or_default(),
+                    );
+                    self.worktree_remove_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    tracing::warn!("워크트리 삭제 스레드가 결과 없이 종료");
+                    self.worktree_remove_rx = None;
+                }
             }
         }
 

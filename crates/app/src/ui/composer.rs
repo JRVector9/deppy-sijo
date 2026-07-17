@@ -122,7 +122,10 @@ pub struct ComposerUi {
     /// 캐럿이 경로 안에 박히는 문제).
     pending_caret: HashMap<String, (usize, usize)>,
     /// MCP 서버별 도구 이름 (서버명, 도구들) — App이 펼침 시 1회 채운다(경계: 평면 값만).
-    mcp_tools: Vec<(String, Vec<String>)>,
+    /// (서버명, [(도구명, 설명)]). 설명은 서버가 등록한 것을 그대로 보여준다 —
+    /// 사용자가 "이거 눌러도 뭐가 되는지 모르겠다"고 한 것(2026-07-18)에 대한 답:
+    /// 고르기 전에 뭘 하는 도구인지 hover로 보여준다.
+    mcp_tools: Vec<(String, Vec<(String, String)>)>,
     /// 이번 펼침에서 MCP 목록을 이미 받았다 — 접히면 리셋해 다음 펼침에 재조회.
     mcp_loaded: bool,
 }
@@ -159,7 +162,7 @@ impl ComposerUi {
         self.expanded && !self.mcp_loaded
     }
 
-    pub fn set_mcp_tools(&mut self, tools: Vec<(String, Vec<String>)>) {
+    pub fn set_mcp_tools(&mut self, tools: Vec<(String, Vec<(String, String)>)>) {
         self.mcp_tools = tools;
         self.mcp_loaded = true;
     }
@@ -766,7 +769,7 @@ impl ComposerUi {
                     }
                 });
             }
-            // ③ MCP 도구 — App이 넘긴 서버/도구 이름을 커서 위치에 삽입.
+            // ③ MCP 도구 — 설명을 hover로 보여주고, 커서 위치에 실행 지시 문장으로 삽입.
             let resp = ui
                 .small_button("MCP")
                 .on_hover_text(catalog.t("composer.tools_hint", &[]));
@@ -780,10 +783,27 @@ impl ComposerUi {
                     ui.weak(catalog.t("composer.tools_empty", &[]));
                 }
                 for (server, tools) in &self.mcp_tools {
-                    for tool in tools {
-                        if ui.button(format!("{server} · {tool}")).clicked() {
+                    for (tool, description) in tools {
+                        // 도구 이름만 맨몸으로 삽입하면 에이전트가 명령으로도 함수
+                        // 호출로도 못 읽는다("directory_tree" 자체는 아무 의미가 없다,
+                        // 2026-07-17 사용자 실사용 확인). 자연어 지시문으로 감싸 삽입한다.
+                        let btn = ui.button(format!("{server} · {tool}"));
+                        let btn = if description.is_empty() {
+                            btn
+                        } else {
+                            btn.on_hover_text(description)
+                        };
+                        if btn.clicked() {
                             let cursor = cursor_char_index(egui_ctx, text_id);
-                            inserted_cursor = Some(insert_snippet(buffer, cursor, tool).cursor);
+                            // locale 파일 파싱이 값의 앞뒤 공백을 trim하므로(i18n
+                            // parse_locale_file) 이어 쓸 공백은 여기서 직접 붙인다 —
+                            // insert_snippet의 trailing_space 보정은 커서 뒤에 이미
+                            // 텍스트가 있을 때만 동작해 빈 버퍼(가장 흔한 경우)엔 안 붙는다.
+                            let phrase = format!(
+                                "{} ",
+                                catalog.t("composer.mcp_insert_template", &[("tool", tool)])
+                            );
+                            inserted_cursor = Some(insert_snippet(buffer, cursor, &phrase).cursor);
                         }
                     }
                 }
@@ -2185,15 +2205,15 @@ mod tests {
     }
 
     #[test]
-    fn kittest_mcp_셀렉터가_도구_이름을_버퍼에_삽입한다() {
+    fn kittest_mcp_셀렉터가_실행_지시_문장을_버퍼에_삽입한다() {
         use egui_kittest::kittest::Queryable;
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let path = test_history_path("mcp-insert");
         let mut harness = composer_harness(&catalog, ComposerSendKey::Enter, path.clone());
-        harness
-            .state_mut()
-            .0
-            .set_mcp_tools(vec![("srv".to_owned(), vec!["mytool".to_owned()])]);
+        harness.state_mut().0.set_mcp_tools(vec![(
+            "srv".to_owned(),
+            vec![("mytool".to_owned(), "설명 텍스트".to_owned())],
+        )]);
         // 펼침(툴바 노출) — ⌘J 경로와 동일.
         harness.state_mut().0.request_focus();
         harness.run();
@@ -2202,9 +2222,16 @@ mod tests {
         harness.run();
         harness.get_by_label("srv · mytool").click();
         harness.run();
-        assert_eq!(buffer_of(&harness), "mytool");
+        // 도구 이름만 맨몸으로 삽입하면 에이전트가 못 알아듣는다(2026-07-17 사용자
+        // 실사용 확인, "directory_tree"만 보내니 에이전트가 반문) — 자연어 지시
+        // 문장으로 감싸 삽입해야 한다.
+        let expected = format!(
+            "{} ",
+            catalog.t("composer.mcp_insert_template", &[("tool", "mytool")])
+        );
+        assert_eq!(buffer_of(&harness), expected);
         // 삽입 후 커서는 삽입 끝이어야 한다 — 옛 위치(0)에 남으면 다음 타이핑이
-        // 도구 이름 앞/안에 끼어 깨진다(codex P2).
+        // 문장 앞/안에 끼어 깨진다(codex P2, 기존 검증 유지).
         let state =
             egui::text_edit::TextEditState::load(&harness.ctx, ComposerUi::text_id(TEST_WS))
                 .expect("TextEdit 상태가 저장돼 있어야 한다");
@@ -2215,7 +2242,7 @@ mod tests {
             .primary
             .index
             .into();
-        assert_eq!(cursor, "mytool".chars().count());
+        assert_eq!(cursor, expected.chars().count());
         std::fs::remove_file(&path).ok();
     }
 }

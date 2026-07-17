@@ -431,7 +431,15 @@ fn render_diff_row(ui: &mut egui::Ui, catalog: &i18n::Catalog, row: &DiffRow) {
         // `show_rows`(고정 행높이 가상화)라 이 행만 커지면 스크롤 위치가 어긋난다.
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            ui.add(egui::Label::new(egui::RichText::new(path).monospace().strong()).truncate());
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(path)
+                        .monospace()
+                        .strong()
+                        .color(ui.visuals().hyperlink_color),
+                )
+                .truncate(),
+            );
             if *additions > 0 {
                 ui.label(
                     egui::RichText::new(format!("+{additions}"))

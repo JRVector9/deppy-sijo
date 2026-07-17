@@ -6,8 +6,9 @@
 //!   exclude를 읽으므로 트리가 오염되지 않는다.
 //! - git 실행은 [`crate::git_cli`] 공용 헬퍼만 사용 — 블로킹이라 **백그라운드 스레드
 //!   전용**(UI 스레드 호출 금지, 호출측 App이 mpsc로 결과를 수령).
-//! - 1차 범위는 생성+스폰뿐이다. **워크트리 정리(`git worktree remove`)는 후속 PR** —
-//!   여기서는 만들기만 하고 지우지 않는다.
+//! - [`remove_worktree`]는 작업 디렉터리만 지운다 — `deppy/<slug>` 브랜치는 남긴다.
+//!   커밋되지 않은 변경/미병합 커밋이 브랜치에만 남아 있을 수 있어, 브랜치까지
+//!   지우는 건 되돌릴 수 없는 별도 결정이라 범위 밖(2026-07-18 사용자 논의).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -54,6 +55,86 @@ pub fn create_worktree(cwd: &Path) -> anyhow::Result<PathBuf> {
         ADD_TIMEOUT,
     )?;
     Ok(root.join(rel))
+}
+
+/// 세션 cwd(워크트리 내부 아무 경로)로부터 그 워크트리를 제거하고 지운 워크트리
+/// 루트를 돌려준다(호출측이 같은 폴더를 쓰던 다른 pane을 찾을 때 씀). 블로킹(git
+/// 실행) — 반드시 백그라운드 스레드에서 호출한다. deppy가 만든 `.deppy/worktrees/`
+/// 하위가 아니면 거부한다(다른 워크트리를 잘못 지우는 사고 방지). 삭제되지 않은
+/// 커밋/변경이 있으면 git이 그대로 거부하며(`--force` 미사용), 그 에러를 그대로
+/// 올린다 — 조용한 데이터 손실 금지.
+///
+/// 알려진 한계(codex 리뷰, 범위 밖으로 남김):
+/// - cwd가 워크트리 안의 중첩 서브모듈/레포 안이면 `repo_root`가 그 안쪽 레포를
+///   반환해 `is_deppy_worktree`가 거부한다 — 삭제가 안 될 뿐 잘못 지우지는 않는다.
+/// - 전처리 스캔과 `worktree remove` 실행 사이에 그 폴더의 셸/에이전트가 새
+///   무시된 파일을 쓰면 그 파일은 걸러지지 않는다(TOCTOU) — 창이 git 프로세스
+///   두 번 호출 사이로 매우 좁고, 막으려면 그 폴더의 모든 프로세스를 먼저 멈춰야
+///   해 사용자가 요청한 "삭제 메뉴" 범위를 넘는다.
+/// - `session_cwd_lookup`은 캐시(수 초 지연 가능)라, 방금 다른 폴더로 cd한 세션의
+///   메뉴가 아주 짧게 이전 워크트리를 대상으로 남을 수 있다 — 이 앱의 cwd 의존
+///   메뉴 전부(diff 보기·같은 폴더 새 셸 등)가 공유하는 기존 신뢰 모델이라 이
+///   기능만 별도로 고치지 않는다.
+pub fn remove_worktree(cwd: &Path) -> anyhow::Result<PathBuf> {
+    let worktree_root = crate::git_cli::repo_root(cwd, ROOT_TIMEOUT)?;
+    anyhow::ensure!(
+        is_deppy_worktree(&worktree_root),
+        "deppy 워크트리가 아님: {}",
+        worktree_root.display()
+    );
+    // git worktree remove의 dirty 판정은 추적/미추적 변경만 본다 — gitignore된
+    // 내용(.env.local, 빌드 산출물, 심지어 중첩 워크트리)은 "깨끗함"으로 보고
+    // 그대로 rm -rf에 딸려 지워진다(codex P1 실증). `--untracked-files=all`을
+    // 명시해야 한다 — `status.showUntrackedFiles=no` 설정이 있으면 플래그 없이는
+    // `??`/`!!` 둘 다 안 뜬다(codex 재검증, 같은 설정이 worktree remove 자체의
+    // dirty 판정에도 적용돼 무방비로 지운다).
+    let status = crate::git_cli::run_git(
+        &worktree_root,
+        &[
+            "status",
+            "--porcelain",
+            "--ignored",
+            "--untracked-files=all",
+        ],
+        ROOT_TIMEOUT,
+    )?;
+    if let Some(first) = status
+        .lines()
+        .find(|l| l.starts_with("!! ") || l.starts_with("?? "))
+    {
+        anyhow::bail!(
+            "정리 안 된 파일이 있어 삭제를 거부합니다({}…) — 직접 정리 후 다시 시도하세요",
+            &first[3..]
+        );
+    }
+    // worktree remove는 지울 경로 안에서는 실행할 수 없다 — 메인 워크트리에서
+    // 실행해야 한다. `--git-common-dir`의 부모로 추정하면 서브모듈/
+    // `--separate-git-dir` 레포에서 틀린 경로가 나온다(codex P2) — 대신
+    // `worktree list --porcelain`의 첫 항목이 항상 메인 워크트리라는 git 자체
+    // 보장을 쓴다.
+    let listing = crate::git_cli::run_git(
+        &worktree_root,
+        &["worktree", "list", "--porcelain"],
+        ROOT_TIMEOUT,
+    )?;
+    let main_root = listing
+        .lines()
+        .find_map(|l| l.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("워크트리 목록에서 메인 레포를 찾지 못함"))?;
+    let target = worktree_root.to_str().ok_or_else(|| {
+        anyhow::anyhow!("워크트리 경로가 UTF-8이 아님: {}", worktree_root.display())
+    })?;
+    crate::git_cli::run_git(&main_root, &["worktree", "remove", target], ADD_TIMEOUT)?;
+    Ok(worktree_root)
+}
+
+/// `<repo>/.deppy/worktrees/<slug>` 형태인가 — 이 앱이 만든 워크트리만 지우기 위한 판정.
+fn is_deppy_worktree(worktree_root: &Path) -> bool {
+    let mut comps = worktree_root.components().rev();
+    comps.next().is_some() // slug — 형식은 검사하지 않는다, 부모 경로가 판정 근거.
+        && matches!(comps.next(), Some(c) if c.as_os_str() == "worktrees")
+        && matches!(comps.next(), Some(c) if c.as_os_str() == ".deppy")
 }
 
 /// 생성 완료 시 App 폴링부의 처리 결정 (codex P2 두 건의 순수 판정 — 유닛 테스트 대상).
@@ -256,6 +337,162 @@ mod tests {
         let exclude = std::fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
         assert!(exclude_has_entry(&exclude), "{exclude:?}");
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn is_deppy_worktree는_deppy_worktrees_하위만_인정한다() {
+        assert!(is_deppy_worktree(Path::new(
+            "/repo/.deppy/worktrees/wt-260718-000000"
+        )));
+        assert!(!is_deppy_worktree(Path::new("/repo")));
+        assert!(!is_deppy_worktree(Path::new("/repo/src")));
+        assert!(!is_deppy_worktree(Path::new("/repo/worktrees/wt-x")));
+    }
+
+    #[test]
+    fn remove_worktree는_깨끗한_워크트리를_지운다() {
+        let repo = temp_repo();
+        let path = create_worktree(&repo).unwrap();
+        assert!(path.is_dir());
+        remove_worktree(&path).unwrap();
+        assert!(!path.exists(), "{}", path.display());
+        // 삭제는 작업 디렉터리만 — 브랜치는 남는다(2026-07-18 논의: 브랜치 삭제는
+        // 되돌릴 수 없는 별도 결정이라 이 함수의 범위 밖).
+        let branches = crate::git_cli::run_git(&repo, &["branch", "--list"], ADD_TIMEOUT).unwrap();
+        assert!(branches.contains("deppy/"), "{branches:?}");
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn remove_worktree는_무시된_파일이_있으면_거부한다() {
+        // git worktree remove의 dirty 판정은 gitignore된 내용을 안 본다 — .env.local
+        // 같은 파일이 있어도 "깨끗함"으로 보고 rm -rf에 딸려 지운다(codex P1 실증).
+        let repo = temp_repo();
+        std::fs::write(repo.join(".gitignore"), "*.local\n").unwrap();
+        crate::git_cli::run_git(
+            &repo,
+            &["add", ".gitignore"],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        crate::git_cli::run_git(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "gitignore",
+            ],
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let path = create_worktree(&repo).unwrap();
+        std::fs::write(path.join("secret.local"), "x").unwrap();
+        let err = remove_worktree(&path).unwrap_err();
+        assert!(
+            path.exists(),
+            "무시된 파일이 있으면 지워지면 안 된다: {}",
+            path.display()
+        );
+        assert!(format!("{err:#}").contains("정리 안 된 파일"));
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn remove_worktree는_dirty하면_거부한다() {
+        // 미추적 파일도 전처리 스캔이 먼저 잡는다(git 자체의 dirty 거부까지
+        // 가지 않음 — status.showUntrackedFiles=no 우회를 막기 위해 앱이 먼저
+        // --untracked-files=all로 본다, codex P1).
+        let repo = temp_repo();
+        let path = create_worktree(&repo).unwrap();
+        std::fs::write(path.join("dirty.txt"), "x").unwrap();
+        let err = remove_worktree(&path).unwrap_err();
+        assert!(
+            path.exists(),
+            "dirty면 지워지면 안 된다: {}",
+            path.display()
+        );
+        assert!(format!("{err:#}").contains("정리 안 된 파일"));
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn remove_worktree는_showuntrackedfiles_no_설정을_우회하지_않는다() {
+        // codex 재검증: status.showUntrackedFiles=no면 --ignored만으로는 무시된
+        // 파일도 안 보인다 — --untracked-files=all을 명시해야 우회가 안 된다.
+        let repo = temp_repo();
+        crate::git_cli::run_git(
+            &repo,
+            &["config", "status.showUntrackedFiles", "no"],
+            ADD_TIMEOUT,
+        )
+        .unwrap();
+        let path = create_worktree(&repo).unwrap();
+        std::fs::write(path.join("dirty.txt"), "x").unwrap();
+        let err = remove_worktree(&path).unwrap_err();
+        assert!(path.exists(), "{}", path.display());
+        assert!(format!("{err:#}").contains("정리 안 된 파일"));
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn remove_worktree는_deppy_워크트리가_아니면_거부한다() {
+        let repo = temp_repo();
+        let err = remove_worktree(&repo).unwrap_err();
+        assert!(format!("{err:#}").contains("deppy 워크트리가 아님"));
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn remove_worktree는_separate_git_dir_레포에서도_동작한다() {
+        // codex 재검증: `--git-common-dir`의 부모를 메인 루트로 가정하면
+        // --separate-git-dir/서브모듈 레포에서 틀린 경로가 나와 삭제가 깨진다(P2) —
+        // `worktree list --porcelain`의 첫 항목(항상 메인)을 쓰는 게 이 테스트가
+        // 지키는 고정 계약.
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "deppy-worktree-sep-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        let repo = base.join("repo");
+        let gitdir = base.join("meta.git");
+        std::fs::create_dir_all(&repo).unwrap();
+        crate::git_cli::run_git(
+            &repo,
+            &["init", "-q", "--separate-git-dir", gitdir.to_str().unwrap()],
+            ADD_TIMEOUT,
+        )
+        .unwrap();
+        crate::git_cli::run_git(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "init",
+            ],
+            ADD_TIMEOUT,
+        )
+        .unwrap();
+        let path = create_worktree(&repo).unwrap();
+        assert!(path.is_dir());
+        remove_worktree(&path).unwrap();
+        assert!(!path.exists(), "{}", path.display());
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

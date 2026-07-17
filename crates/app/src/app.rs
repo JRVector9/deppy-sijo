@@ -5394,10 +5394,29 @@ impl eframe::App for App {
                 }
                 // 변경 보기 — 세션 cwd 레포의 diff 패널(독립 창)을 연다.
                 // cwd 미확인이어도 패널은 열어 안내를 표시한다 (조용한 실패 금지).
+                // 제목은 인박스와 같은 관례로 해석 — "세션 #2"보다 "SKRT · Claude"가
+                // 무엇의 변경분인지 바로 판단된다(2026-07-18 사용자: 가독성 개선 요청).
                 Some(ui::file_tree::SidebarAction::ShowDiff { session }) => {
                     let cwd = self.session_cwd_lookup(session);
-                    self.diff_panel_ui
-                        .open_for(ui.ctx(), self.active.id.clone(), session, cwd);
+                    let ws_name = self
+                        .workspaces
+                        .iter()
+                        .find(|w| w.id == self.active.id)
+                        .map(Self::workspace_display_name);
+                    let session_label = self.inbox_session_label(&self.active.id, session);
+                    let title = match (ws_name, session_label) {
+                        (Some(ws), Some(s)) => format!("{ws} · {s}"),
+                        (Some(ws), None) => ws,
+                        (None, Some(s)) => s,
+                        (None, None) => String::new(),
+                    };
+                    self.diff_panel_ui.open_for(
+                        ui.ctx(),
+                        self.active.id.clone(),
+                        session,
+                        cwd,
+                        title,
+                    );
                 }
                 // 새 워크트리 셸 (PR-W) — 백그라운드에서 repo_root → exclude 보장 →
                 // worktree add 후, 아래 worktree_rx 폴링부가 그 폴더에서 셸을 연다.

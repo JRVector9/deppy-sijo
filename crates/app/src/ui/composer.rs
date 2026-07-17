@@ -771,7 +771,12 @@ impl ComposerUi {
                 .small_button("MCP")
                 .on_hover_text(catalog.t("composer.tools_hint", &[]));
             egui::Popup::menu(&resp).show(|ui| {
-                if self.mcp_tools.is_empty() {
+                // 서버는 등록됐어도 도구가 아직 발견(discover)되지 않은 경우가 흔하다
+                // (Connector Center 미연결) — `mcp_tools`가 그런 서버로만 차 있으면
+                // is_empty()는 false라 안내가 안 뜨고 팝업이 설명 없이 텅 빈다
+                // (2026-07-18 사용자 회귀). 실제 도구 총합으로 판정한다.
+                let has_any_tool = self.mcp_tools.iter().any(|(_, tools)| !tools.is_empty());
+                if !has_any_tool {
                     ui.weak(catalog.t("composer.tools_empty", &[]));
                 }
                 for (server, tools) in &self.mcp_tools {
@@ -2145,6 +2150,36 @@ mod tests {
             cursor_char_index(&harness.ctx, ComposerUi::text_id(TEST_WS)),
             Some("/x/a.png".chars().count()),
             "드롭 프레임에 캐럿이 즉시 삽입 끝이어야 한다"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 2026-07-18 사용자 회귀: 서버는 등록됐지만 도구가 아직 발견(discover)되지 않은
+    /// 상태(Connector Center 미연결)가 실사용 DB에 흔하다 — 사용자 DB 실측: 4서버 중
+    /// 2개(도구 0개). `mcp_tools`는 서버 목록이라 이 경우 `is_empty()`가 false를 반환해
+    /// "MCP 도구 없음" 안내가 안 뜬다. **전 서버가 0개**면(신규 설치 등) 메뉴가 설명
+    /// 없이 완전히 빈 채로 뜬다 — 사용자가 "이거 동작하는 게 맞나" 확신을 못 한다.
+    #[test]
+    fn kittest_mcp_도구가_0개인_서버만_있으면_안내문구가_뜬다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let path = test_history_path("mcp-empty-servers");
+        let mut harness = composer_harness(&catalog, ComposerSendKey::Enter, path.clone());
+        // 서버는 있지만(빈 Vec 아님) 전부 도구 0개 — 실사용 DB의 "111"/"깃헙" 상태.
+        harness.state_mut().0.set_mcp_tools(vec![
+            ("111".to_owned(), vec![]),
+            ("깃헙".to_owned(), vec![]),
+        ]);
+        harness.state_mut().0.request_focus();
+        harness.run();
+        harness.run();
+        harness.get_by_label("MCP").click();
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(&catalog.t("composer.tools_empty", &[]))
+                .is_some(),
+            "도구 0개 서버만 있으면 안내 문구가 보여야 한다 — 지금은 빈 팝업만 뜬다"
         );
         std::fs::remove_file(&path).ok();
     }

@@ -36,7 +36,6 @@ worktree.no_cwd = Could not determine the session folder
 worktree.created_elsewhere = Workspace changed — shell not opened; the worktree was created
 sidebar.menu.show_diff = View changes
 diff.title = Changes
-diff.session = Session #{id}
 diff.refresh = Refresh
 diff.loading = Collecting changes…
 diff.no_cwd = Session working folder not detected yet

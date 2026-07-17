@@ -100,6 +100,16 @@ enum DiffRow {
     Section(&'static str),
     /// `status --short` 한 줄.
     Status(String),
+    /// 파일 하나의 시작 — raw `diff --git a/X b/X` 줄 대신 파일명 + 변경 통계 +
+    /// 수정 시각으로 보여준다(2026-07-18 사용자: "파일명이나 날짜를 좀더 가독성
+    /// 좋게"). mtime은 diff에 실려오지 않아 수집 시점에 파일시스템에서 stat한다 —
+    /// 삭제된 파일 등 stat 실패는 None(생략, 에러 아님).
+    FileHeader {
+        path: String,
+        additions: usize,
+        removals: usize,
+        mtime: Option<String>,
+    },
     /// diff 본문 한 줄.
     Line(DiffLineKind, String),
     /// 상한 잘림 안내 (i18n `diff.truncated`).
@@ -203,8 +213,15 @@ fn collect_diff(cwd: &Path) -> anyhow::Result<DiffData> {
         "diff.section.unstaged",
         &unstaged,
         unstaged_truncated,
+        &root,
     );
-    append_diff_section(&mut rows, "diff.section.staged", &staged, staged_truncated);
+    append_diff_section(
+        &mut rows,
+        "diff.section.staged",
+        &staged,
+        staged_truncated,
+        &root,
+    );
     append_untracked_section(&mut rows, &root, &entries)?;
     Ok(DiffData {
         repo_root: root.display().to_string(),
@@ -255,7 +272,7 @@ fn append_untracked_section(
         truncated |= out_truncated;
         shown += 1;
     }
-    append_diff_section(rows, "diff.section.untracked", &diff, truncated);
+    append_diff_section(rows, "diff.section.untracked", &diff, truncated, root);
     if untracked.len() > shown {
         rows.push(DiffRow::UntrackedMore(untracked.len() - shown));
     }
@@ -267,20 +284,108 @@ fn append_diff_section(
     key: &'static str,
     diff: &str,
     collector_truncated: bool,
+    root: &Path,
 ) {
     if diff.trim().is_empty() {
         return;
     }
     let (clipped, clip_truncated) = clip_diff(diff);
     rows.push(DiffRow::Section(key));
-    rows.extend(
-        parse_unified_diff(clipped)
-            .into_iter()
-            .map(|(kind, line)| DiffRow::Line(kind, line.to_owned())),
-    );
+    rows.extend(build_file_rows(clipped, root));
     if clip_truncated || collector_truncated {
         rows.push(DiffRow::Truncated);
     }
+}
+
+/// `diff --git a/X b/Y` 줄에서 표시할 경로를 뽑는다 — b측(새/현재 경로, rename도
+/// 최신명)을 우선한다. 경로 자체에 " b/"가 들어간 극단적 케이스는 놓칠 수 있으나
+/// (git 자체도 헤더 줄만으로는 완전히 무손실 파싱이 안 되는 형식), 실사용 경로에서는
+/// 항상 맞는다.
+fn diff_git_header_path(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("diff --git ")?;
+    let b_at = rest.rfind(" b/")?;
+    Some(&rest[b_at + 3..])
+}
+
+/// 헤더 직후의 `index …`/`--- …`/`+++ …`는 파일명 헤더가 이미 보여주는 정보라 그대로
+/// 두면 중복만 늘린다 — 생략한다. mode/rename/binary/개행누락 등 **새 정보를 담은**
+/// 줄은 그대로 보여준다(가독성 개선이 정보 손실이 되면 안 된다).
+fn is_redundant_file_meta(line: &str) -> bool {
+    line.starts_with("index ") || line.starts_with("--- ") || line.starts_with("+++ ")
+}
+
+/// 파일 대상 상대경로의 최근 수정 시각을 사람이 읽는 상대 표기로 — "언제 바뀌었는지"
+/// (2026-07-18 사용자). git diff 자체엔 시각 정보가 없어(작업 트리 변경이라 커밋
+/// 없음) 파일시스템 mtime으로 답한다. 이 워크스페이스엔 시간대 변환 없이 std만
+/// 쓰는 관례가 있어(PR-W slug — chrono 미의존) 상대 표기를 택했다: 절대시각은
+/// 타임존 변환이 필요하지만 "N분 전"은 지금과의 차이만 있으면 된다.
+fn file_mtime_label(root: &Path, rel_path: &str) -> Option<String> {
+    let modified = std::fs::metadata(root.join(rel_path))
+        .ok()?
+        .modified()
+        .ok()?;
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or_default();
+    Some(relative_time_label(elapsed))
+}
+
+fn relative_time_label(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        "방금 전".to_owned()
+    } else if secs < 3600 {
+        format!("{}분 전", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}시간 전", secs / 3600)
+    } else {
+        format!("{}일 전", secs / 86_400)
+    }
+}
+
+/// 줄 단위 분류(`parse_unified_diff`)를 파일 블록으로 묶어 렌더 행을 만든다 —
+/// 각 파일의 시작에 raw 헤더 대신 `FileHeader`(경로+±통계+mtime)를 놓고, 중복
+/// 메타 줄은 걸러낸다.
+fn build_file_rows(clipped: &str, root: &Path) -> Vec<DiffRow> {
+    let classified = parse_unified_diff(clipped);
+    let mut rows = Vec::new();
+    let mut i = 0;
+    while i < classified.len() {
+        let (kind, line) = classified[i];
+        if kind != DiffLineKind::FileHeader {
+            rows.push(DiffRow::Line(kind, line.to_owned()));
+            i += 1;
+            continue;
+        }
+        // 다음 FileHeader 전까지가 이 파일의 블록 — 그 안의 +/- 줄을 세어 통계로.
+        let mut j = i + 1;
+        let mut additions = 0usize;
+        let mut removals = 0usize;
+        while j < classified.len() && classified[j].0 != DiffLineKind::FileHeader {
+            match classified[j].0 {
+                DiffLineKind::Addition => additions += 1,
+                DiffLineKind::Removal => removals += 1,
+                _ => {}
+            }
+            j += 1;
+        }
+        let path = diff_git_header_path(line).unwrap_or(line).to_owned();
+        let mtime = file_mtime_label(root, &path);
+        rows.push(DiffRow::FileHeader {
+            path,
+            additions,
+            removals,
+            mtime,
+        });
+        for &(k, l) in &classified[i + 1..j] {
+            if is_redundant_file_meta(l) {
+                continue;
+            }
+            rows.push(DiffRow::Line(k, l.to_owned()));
+        }
+        i = j;
+    }
+    rows
 }
 
 /// diff 패널 창의 고정 Id — workspace가 이 창을 터미널 입력을 막지 않는 비모달로
@@ -314,20 +419,48 @@ fn diff_line_color(visuals: &egui::Visuals, kind: DiffLineKind) -> egui::Color32
 
 /// 한 행 렌더 — 모노스페이스, 가로는 truncate(줄바꿈 금지 — 코드다).
 fn render_diff_row(ui: &mut egui::Ui, catalog: &i18n::Catalog, row: &DiffRow) {
+    if let DiffRow::FileHeader {
+        path,
+        additions,
+        removals,
+        mtime,
+    } = row
+    {
+        // raw "diff --git a/X b/X" 한 줄 대신 파일명·±통계·수정시각을 한 줄에
+        // (2026-07-18 사용자: 가독성 개선 요청). **한 줄 고정** — 위 ScrollArea가
+        // `show_rows`(고정 행높이 가상화)라 이 행만 커지면 스크롤 위치가 어긋난다.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.add(egui::Label::new(egui::RichText::new(path).monospace().strong()).truncate());
+            if *additions > 0 {
+                ui.label(
+                    egui::RichText::new(format!("+{additions}"))
+                        .monospace()
+                        .color(diff_line_color(ui.visuals(), DiffLineKind::Addition)),
+                );
+            }
+            if *removals > 0 {
+                ui.label(
+                    egui::RichText::new(format!("−{removals}"))
+                        .monospace()
+                        .color(diff_line_color(ui.visuals(), DiffLineKind::Removal)),
+                );
+            }
+            if let Some(mtime) = mtime {
+                ui.label(egui::RichText::new(format!("· {mtime}")).monospace().weak());
+            }
+        });
+        return;
+    }
     let text = match row {
+        DiffRow::FileHeader { .. } => unreachable!("above early-return handles this"),
         DiffRow::Section(key) => egui::RichText::new(catalog.t(key, &[]))
             .monospace()
             .strong(),
         DiffRow::Status(line) => egui::RichText::new(line).monospace(),
-        DiffRow::Line(kind, line) => {
-            let mut text = egui::RichText::new(line)
-                .monospace()
-                .color(diff_line_color(ui.visuals(), *kind));
-            if *kind == DiffLineKind::FileHeader {
-                text = text.strong();
-            }
-            text
-        }
+        DiffRow::Line(kind, line) => egui::RichText::new(line)
+            .monospace()
+            .color(diff_line_color(ui.visuals(), *kind)),
         DiffRow::Truncated => egui::RichText::new(catalog.t("diff.truncated", &[]))
             .monospace()
             .weak(),
@@ -347,6 +480,11 @@ pub struct DiffPanelUi {
     workspace_id: String,
     session: Option<runtime::SessionId>,
     cwd: Option<String>,
+    /// 표시용 제목 "워크스페이스 · 세션" — "세션 #2" 같은 내부 id 대신 사람이 읽는
+    /// 이름(2026-07-18 사용자: 가독성 개선 요청). App이 인박스와 같은 방식으로
+    /// 해석해 넘긴다(workspace_display_name + display_pane_title) — 이 모듈은
+    /// App을 몰라 직접 해석할 수 없다.
+    title: String,
     /// 진행 중 백그라운드 수집 (닫으면 drop — 늦게 온 결과는 버려진다).
     pending: Option<Receiver<anyhow::Result<DiffData>>>,
     data: Option<DiffData>,
@@ -360,6 +498,7 @@ impl DiffPanelUi {
             workspace_id: String::new(),
             session: None,
             cwd: None,
+            title: String::new(),
             pending: None,
             data: None,
             error: None,
@@ -374,11 +513,13 @@ impl DiffPanelUi {
         workspace_id: String,
         session: runtime::SessionId,
         cwd: Option<String>,
+        title: String,
     ) {
         self.open = true;
         self.workspace_id = workspace_id;
         self.session = Some(session);
         self.cwd = cwd;
+        self.title = title;
         self.pending = None;
         self.data = None;
         self.error = None;
@@ -443,6 +584,7 @@ impl DiffPanelUi {
             self.workspace_id.clear();
             self.session = None;
             self.cwd = None;
+            self.title.clear();
             self.pending = None;
             self.data = None;
             self.error = None;
@@ -451,9 +593,10 @@ impl DiffPanelUi {
 
     fn render_body(&mut self, ui: &mut egui::Ui, catalog: &i18n::Catalog) {
         ui.horizontal(|ui| {
-            if let Some(session) = self.session {
-                ui.weak(catalog.t("diff.session", &[("id", &session.0.to_string())]))
-                    .on_hover_text(&self.workspace_id);
+            if !self.title.is_empty() {
+                // "세션 #2" 같은 내부 id 대신 App이 해석한 표시명 — hover에 워크스페이스
+                // id(디버그용)만 보조로 남긴다(2026-07-18 사용자: 가독성 개선 요청).
+                ui.strong(&self.title).on_hover_text(&self.workspace_id);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let can_refresh = self.pending.is_none() && self.cwd.is_some();
@@ -760,6 +903,98 @@ mod tests {
         std::fs::remove_dir_all(&repo).ok();
     }
 
+    /// 2026-07-18 사용자 회귀: raw "diff --git a/X b/X" + "index …"/"---"/"+++" 4줄이
+    /// 파일 하나당 그대로 노출돼 "파일명이나 변경 이력이 가독성이 나쁘다"는 지적을
+    /// 받았다. FileHeader 행이 경로·±통계를 담고, 중복 메타 줄은 걸러져야 한다.
+    #[test]
+    fn build_file_rows는_raw_헤더_대신_경로와_통계를_담는다() {
+        let repo = temp_repo();
+        std::fs::write(repo.join("a.txt"), "1\n2\n3\n").unwrap();
+        commit_all(&repo, "init");
+        std::fs::write(repo.join("a.txt"), "1\nX\n3\n4\n").unwrap();
+        let (diff, _) = crate::git_cli::run_git_limited(
+            &repo,
+            &["diff", "--no-ext-diff"],
+            GIT_TIMEOUT,
+            MAX_DIFF_BYTES,
+        )
+        .unwrap();
+
+        let rows = build_file_rows(&diff, &repo);
+        let header = rows
+            .iter()
+            .find_map(|row| match row {
+                DiffRow::FileHeader {
+                    path,
+                    additions,
+                    removals,
+                    mtime,
+                } => Some((path.clone(), *additions, *removals, mtime.clone())),
+                _ => None,
+            })
+            .expect("FileHeader 행이 있어야 한다");
+        assert_eq!(header.0, "a.txt");
+        assert_eq!(header.1, 2, "+X +4 두 줄"); // +X, +4
+        assert_eq!(header.2, 1, "-2 한 줄");
+        assert!(
+            header.3.is_some(),
+            "방금 고친 파일이라 mtime이 있어야 한다: {rows:?}"
+        );
+        // index/---/+++ 는 파일명 헤더가 이미 보여주는 정보라 생략돼야 한다.
+        assert!(
+            !rows.iter().any(|row| matches!(
+                row,
+                DiffRow::Line(_, l) if l.starts_with("index ")
+                    || l.starts_with("--- ")
+                    || l.starts_with("+++ ")
+            )),
+            "중복 메타 줄이 남아 있다: {rows:?}"
+        );
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// 파일 여러 개가 섞인 diff에서 각 파일의 ±통계가 서로 새지 않는지.
+    #[test]
+    fn build_file_rows는_파일별_통계를_분리한다() {
+        let repo = temp_repo();
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        std::fs::write(repo.join("b.txt"), "b1\nb2\n").unwrap();
+        commit_all(&repo, "init");
+        std::fs::write(repo.join("a.txt"), "a\na2\na3\n").unwrap(); // +2
+        std::fs::write(repo.join("b.txt"), "b1\n").unwrap(); // -1
+        let (diff, _) = crate::git_cli::run_git_limited(
+            &repo,
+            &["diff", "--no-ext-diff"],
+            GIT_TIMEOUT,
+            MAX_DIFF_BYTES,
+        )
+        .unwrap();
+
+        let rows = build_file_rows(&diff, &repo);
+        let headers: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row {
+                DiffRow::FileHeader {
+                    path,
+                    additions,
+                    removals,
+                    ..
+                } => Some((path.as_str(), *additions, *removals)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(headers, vec![("a.txt", 2, 0), ("b.txt", 0, 1)], "{rows:?}");
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn relative_time_label은_구간별로_다른_문구를_낸다() {
+        assert_eq!(relative_time_label(Duration::from_secs(5)), "방금 전");
+        assert_eq!(relative_time_label(Duration::from_secs(90)), "1분 전");
+        assert_eq!(relative_time_label(Duration::from_secs(3661)), "1시간 전");
+        assert_eq!(relative_time_label(Duration::from_secs(90_000)), "1일 전");
+    }
+
     #[test]
     fn collect는_레포가_아니면_에러다() {
         let dir = std::env::temp_dir().join(format!(
@@ -786,11 +1021,17 @@ mod tests {
         panel.workspace_id = "ws-1".to_owned();
         panel.session = Some(runtime::SessionId(3));
         panel.cwd = Some("/tmp/repo".to_owned());
+        panel.title = "SKRT · Claude".to_owned();
         panel.data = Some(DiffData {
             repo_root: "/tmp/repo".to_owned(),
             rows: vec![
                 DiffRow::Section("diff.section.unstaged"),
-                DiffRow::Line(DiffLineKind::FileHeader, "diff --git a/f b/f".to_owned()),
+                DiffRow::FileHeader {
+                    path: "f.txt".to_owned(),
+                    additions: 1,
+                    removals: 1,
+                    mtime: Some("3분 전".to_owned()),
+                },
                 DiffRow::Line(DiffLineKind::Removal, "-old line".to_owned()),
                 DiffRow::Line(DiffLineKind::Addition, "+new line".to_owned()),
             ],
@@ -800,7 +1041,14 @@ mod tests {
             panel,
         );
         harness.run();
+        // "세션 #3" 같은 내부 id 대신 App이 넘긴 표시명이 보여야 한다.
+        harness.get_by_label("SKRT · Claude");
         harness.get_by_label("Unstaged changes");
+        // 파일 헤더 — raw "diff --git a/f b/f" 대신 파일명·±통계·mtime 각각 라벨로.
+        harness.get_by_label("f.txt");
+        harness.get_by_label("+1");
+        harness.get_by_label("−1");
+        harness.get_by_label("· 3분 전");
         harness.get_by_label("-old line");
         harness.get_by_label("+new line");
         harness.get_by_label("Refresh");

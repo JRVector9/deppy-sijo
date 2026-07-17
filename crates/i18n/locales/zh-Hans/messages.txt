@@ -36,7 +36,6 @@ worktree.no_cwd = 无法确定会话文件夹
 worktree.created_elsewhere = 工作区已切换，未打开 Shell — 工作树已创建
 sidebar.menu.show_diff = 查看更改
 diff.title = 更改
-diff.session = 会话 #{id}
 diff.refresh = 刷新
 diff.loading = 正在收集更改…
 diff.no_cwd = 尚未检测到会话工作文件夹

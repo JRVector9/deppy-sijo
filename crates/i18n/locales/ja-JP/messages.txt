@@ -36,7 +36,6 @@ worktree.no_cwd = セッションのフォルダを特定できませんでし�
 worktree.created_elsewhere = ワークスペースが切り替わったためシェルは開きませんでした — ワークツリーは作成済み
 sidebar.menu.show_diff = 変更を表示
 diff.title = 変更内容
-diff.session = セッション #{id}
 diff.refresh = 更新
 diff.loading = 変更内容を収集中…
 diff.no_cwd = セッションの作業フォルダはまだ検出されていません

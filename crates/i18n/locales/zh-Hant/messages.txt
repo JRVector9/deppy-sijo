@@ -36,7 +36,6 @@ worktree.no_cwd = 無法確定工作階段資料夾
 worktree.created_elsewhere = 工作區已切換，未開啟 Shell — 工作樹已建立
 sidebar.menu.show_diff = 檢視變更
 diff.title = 變更
-diff.session = 工作階段 #{id}
 diff.refresh = 重新整理
 diff.loading = 正在收集變更…
 diff.no_cwd = 尚未偵測到工作階段的工作資料夾

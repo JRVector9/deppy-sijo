@@ -92,13 +92,17 @@ mod tests {
     use super::*;
 
     fn temp_repo() -> std::path::PathBuf {
+        // 전역 카운터 — 병렬 러너에서 nanos까지 같아도 경로가 겹치지 않는다
+        // (worktree.rs temp_repo와 같은 패턴, codex P1).
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "deppy-gitcli-{}-{}",
+            "deppy-gitcli-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ));
         std::fs::create_dir_all(&dir).unwrap();
         run_git(&dir, &["init", "-q"], Duration::from_secs(10)).unwrap();

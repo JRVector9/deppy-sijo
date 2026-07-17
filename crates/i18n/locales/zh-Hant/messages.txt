@@ -33,6 +33,7 @@ sidebar.menu.resume_agent = 恢復代理
 sidebar.menu.close_pane = 關閉 Shell
 worktree.create_failed = 工作樹建立失敗
 worktree.no_cwd = 無法確定工作階段資料夾
+worktree.created_elsewhere = 工作區已切換，未開啟 Shell — 工作樹已建立
 sidebar.menu.show_diff = 檢視變更
 diff.title = 變更
 diff.session = 工作階段 #{id}

@@ -33,6 +33,7 @@ sidebar.menu.resume_agent = 恢复智能体
 sidebar.menu.close_pane = 关闭 Shell
 worktree.create_failed = 工作树创建失败
 worktree.no_cwd = 无法确定会话文件夹
+worktree.created_elsewhere = 工作区已切换，未打开 Shell — 工作树已创建
 sidebar.menu.show_diff = 查看更改
 diff.title = 更改
 diff.session = 会话 #{id}

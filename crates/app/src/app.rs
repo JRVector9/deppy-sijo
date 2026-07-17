@@ -1270,9 +1270,13 @@ pub struct App {
     /// 접속 URL QR 텍스처 캐시 — URL이 바뀔 때만 재생성, 설정창 닫으면 반환.
     web_qr: ui::settings::WebQrCache,
     /// ts.net 호스트명 자동 감지 1회성 스레드의 결과 수신 (진행 중일 때만 Some).
-    /// [PR-W] 진행 중인 워크트리 생성의 결과 채널 — 백그라운드 git 작업 완료를
-    /// 프레임 폴링으로 수령해 그 폴더에서 셸을 스폰한다. None = 진행 중 아님.
-    worktree_rx: Option<std::sync::mpsc::Receiver<anyhow::Result<std::path::PathBuf>>>,
+    /// [PR-W] 진행 중인 워크트리 생성 — (요청 시점 workspace id, 결과 채널). 백그라운드
+    /// git 작업 완료를 프레임 폴링으로 수령해, 그 워크스페이스가 여전히 활성일 때만
+    /// 그 폴더에서 셸을 스폰한다(전환됐으면 오배치 대신 알림). None = 진행 중 아님.
+    worktree_rx: Option<(
+        String,
+        std::sync::mpsc::Receiver<anyhow::Result<std::path::PathBuf>>,
+    )>,
     ts_detect_rx: Option<std::sync::mpsc::Receiver<crate::tailscale::Detected>>,
     /// 마지막 감지 결과 — 설정 UI 표시용. None = 이 세션에서 아직 시도 안 함.
     ts_detected: Option<crate::tailscale::Detected>,
@@ -5397,7 +5401,8 @@ impl eframe::App for App {
                         match self.session_cwd_lookup(session) {
                             Some(cwd) => {
                                 let (tx, rx) = std::sync::mpsc::channel();
-                                self.worktree_rx = Some(rx);
+                                // 요청 시점 워크스페이스 캡처 — 완료 시 전환 여부 판정용.
+                                self.worktree_rx = Some((self.active.id.clone(), rx));
                                 let ctx = ui.ctx().clone();
                                 std::thread::spawn(move || {
                                     let result = crate::worktree::create_worktree(
@@ -5450,32 +5455,57 @@ impl eframe::App for App {
         // 워크트리 생성 완료 수령 (PR-W) — 성공이면 그 폴더에서 새 셸을 연다(cd 주입은
         // spawn_shell_at → ShellSpawned 경로). 사이드바가 꺼져도 진행돼야 하므로
         // dispatch 블록 밖에서 폴링한다 (완료 스레드가 repaint를 예약 — ts_detect 관례).
-        if let Some(rx) = &self.worktree_rx {
-            match rx.try_recv() {
-                Ok(Ok(path)) => {
-                    self.worktree_rx = None;
-                    self.active.workspace_ui.spawn_shell_at(
-                        &self.active.runtime,
-                        self.config.terminal.scrollback_lines as usize,
-                        Some(path.to_string_lossy().into_owned()),
-                    );
+        if let Some((requested_ws, rx)) = &self.worktree_rx {
+            let same_workspace = *requested_ws == self.active.id;
+            // pending_spawn_cd는 다음 ShellSpawned가 소비한다 — 응답 대기 spawn이 있으면
+            // cd가 그 셸에 붙으므로 보류. 0이면 다음 ShellSpawned는 반드시 우리 spawn이다
+            // (spawn_shell_at이 슬롯을 덮어쓰고, 명령/이벤트는 순서 보존).
+            let spawn_busy = self.active.workspace_ui.pending_spawns() > 0;
+            match crate::worktree::spawn_decision(same_workspace, spawn_busy) {
+                crate::worktree::SpawnDecision::Defer => {
+                    // 결과를 채널에 남겨두는 1칸 대기 큐 — 다음 프레임에 재판정.
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(50));
                 }
-                Ok(Err(e)) => {
-                    // 레포 아님·git 거부·CLT 없음 등 — 조용한 실패 금지, OS 알림 1줄.
-                    self.worktree_rx = None;
-                    tracing::warn!("워크트리 생성 실패: {e:#}");
-                    let detail = format!("{e:#}");
-                    platform::notify(
-                        &text.t("worktree.create_failed", &[]),
-                        detail.lines().next().unwrap_or_default(),
-                    );
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // 결과 없이 끊김 = 워커 스레드 panic — 로그로 종결.
-                    self.worktree_rx = None;
-                    tracing::warn!("워크트리 생성 스레드가 결과 없이 종료");
-                }
+                decision => match rx.try_recv() {
+                    Ok(Ok(path)) => {
+                        self.worktree_rx = None;
+                        if decision == crate::worktree::SpawnDecision::Spawn {
+                            self.active.workspace_ui.spawn_shell_at(
+                                &self.active.runtime,
+                                self.config.terminal.scrollback_lines as usize,
+                                Some(path.to_string_lossy().into_owned()),
+                            );
+                        } else {
+                            // 워크스페이스 전환됨(NotifyOnly) — 비활성 워크스페이스로의
+                            // warm 원격 스폰은 이 PR 범위 밖. 스폰 없이 정직하게 알린다.
+                            tracing::info!(
+                                "워크스페이스 전환 — 워크트리만 생성: {}",
+                                path.display()
+                            );
+                            platform::notify(
+                                &text.t("worktree.created_elsewhere", &[]),
+                                &path.display().to_string(),
+                            );
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        // 레포 아님·git 거부·CLT 없음 등 — 조용한 실패 금지, OS 알림 1줄.
+                        self.worktree_rx = None;
+                        tracing::warn!("워크트리 생성 실패: {e:#}");
+                        let detail = format!("{e:#}");
+                        platform::notify(
+                            &text.t("worktree.create_failed", &[]),
+                            detail.lines().next().unwrap_or_default(),
+                        );
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // 결과 없이 끊김 = 워커 스레드 panic — 로그로 종결.
+                        self.worktree_rx = None;
+                        tracing::warn!("워크트리 생성 스레드가 결과 없이 종료");
+                    }
+                },
             }
         }
 

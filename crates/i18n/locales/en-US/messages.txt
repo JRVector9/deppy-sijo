@@ -33,6 +33,7 @@ sidebar.menu.resume_agent = Resume agent
 sidebar.menu.close_pane = Close shell
 worktree.create_failed = Worktree creation failed
 worktree.no_cwd = Could not determine the session folder
+worktree.created_elsewhere = Workspace changed — shell not opened; the worktree was created
 sidebar.menu.show_diff = View changes
 diff.title = Changes
 diff.session = Session #{id}

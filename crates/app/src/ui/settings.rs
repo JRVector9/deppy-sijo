@@ -1583,6 +1583,18 @@ fn general_page(
             }
         },
     );
+    // 하단 도크 컴포저 표시 (2026-07-17 사용자) — OFF면 도크 패널 미생성(터미널이
+    // 공간 회수) + FocusComposer 단축키 무시.
+    row(
+        ui,
+        &catalog.t("settings.composer_enabled", &[]),
+        Some(&catalog.t("settings.composer_enabled.hint", &[])),
+        |ui| {
+            if toggle_switch(ui, &mut config.ui.composer_enabled) {
+                *changed = true;
+            }
+        },
+    );
     // 컴포저 전송 키 (2026-07-17) — 개행 키는 자동 보완(Enter 전송이면 Shift+Enter=개행,
     // ⌘/Ctrl+Enter 전송이면 Enter=개행).
     row(

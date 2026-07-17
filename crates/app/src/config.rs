@@ -112,6 +112,10 @@ pub struct UiConfig {
     /// (2026-07-13, 터미널과 독립). 1.0 = 기본.
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
+    /// 하단 도크 컴포저 표시 (2026-07-17 사용자, 기본 ON). OFF면 도크 패널 자체를
+    /// 만들지 않아 터미널이 그 공간을 회수하고, FocusComposer 단축키도 무시된다.
+    #[serde(default = "default_true")]
+    pub composer_enabled: bool,
     /// 하단 도크 컴포저의 전송 키 (2026-07-17). 개행 키는 자동 보완 —
     /// Enter 전송이면 Shift+Enter=개행, ⌘/Ctrl+Enter 전송이면 Enter=개행.
     #[serde(default)]
@@ -164,6 +168,7 @@ impl Default for UiConfig {
             last_workspace_id: None,
             ui_font: None,
             ui_scale: 1.0,
+            composer_enabled: true,
             composer_send_key: ComposerSendKey::default(),
         }
     }
@@ -401,6 +406,21 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 컴포저 토글(2026-07-17 사용자): 기본은 **켜짐**이어야 한다 — `#[serde(default)]`를
+    /// 쓰면 bool이 false가 되어 기존 사용자의 도크가 조용히 사라진다(default_true 함수 필수).
+    #[test]
+    fn composer_enabled_기본값은_켜짐이고_명시_off는_라운드트립된다() {
+        assert!(UiConfig::default().composer_enabled);
+        // 키가 없는 기존 config.toml — 하위호환으로 켜짐.
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.ui.composer_enabled);
+        // 명시적으로 끈 값은 저장→재로드에서 유지된다.
+        let mut config = Config::default();
+        config.ui.composer_enabled = false;
+        let reloaded: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert!(!reloaded.ui.composer_enabled);
+    }
 
     #[test]
     fn 손으로_고친_범위밖_config는_로드시_정규화() {

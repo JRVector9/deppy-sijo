@@ -3131,7 +3131,12 @@ impl App {
             A::TerminalSearch => self.active.workspace_ui.open_search(),
             // 컴포저 포커스+펼침. 이미 포커스면 이 경로는 오지 않는다(text_edit_focused
             // 조기 반환) — 접기는 컴포저가 ⌘J를 직접 소비해 처리한다.
-            A::FocusComposer => self.composer.request_focus(),
+            // 설정 OFF면 무시 — 숨겨진(미생성) 도크에 포커스를 줄 수 없다.
+            A::FocusComposer => {
+                if self.config.ui.composer_enabled {
+                    self.composer.request_focus();
+                }
+            }
             A::ClearRenderCaches => {
                 self.active.workspace_ui.clear_render_caches();
                 for runtime in self.warm.values_mut() {
@@ -4498,6 +4503,76 @@ impl App {
         self.egui_ctx.request_repaint();
     }
 
+    /// 하단 도크 컴포저 렌더 (2026-07-17) — CentralPanel보다 먼저 호출해야 터미널
+    /// 영역이 자동으로 줄어든다(통합 도크 — 팝업/오버레이 금지 사양). 설정 OFF면
+    /// 호출측이 아예 부르지 않는다(Panel 미생성 — 리소스 0).
+    /// MCP 목록은 펼침당 1회만 조회한다(프레임 경로 저장소 조회 방지).
+    fn render_composer_dock(&mut self, ui: &mut egui::Ui, text: &i18n::Catalog) {
+        if self.composer.mcp_refresh_needed() {
+            let tools = match self.db.list_mcp_servers() {
+                Ok(servers) => servers
+                    .into_iter()
+                    .filter(|server| server.enabled)
+                    .map(|server| {
+                        let tools = self
+                            .db
+                            .list_mcp_tools(&server.id)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|tool| tool.name)
+                            .collect();
+                        (server.name, tools)
+                    })
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!("컴포저 MCP 목록 조회 실패: {e:#}");
+                    Vec::new()
+                }
+            };
+            self.composer.set_mcp_tools(tools);
+        }
+        let composer_session = self.active.workspace_ui.focused_session();
+        let composer_agent = composer_session
+            .and_then(|session| self.active.workspace_ui.agent_provider_for(session));
+        let composer_root = self
+            .workspaces
+            .iter()
+            .find(|w| w.id == self.active.id)
+            .map(|w| std::path::PathBuf::from(&w.path))
+            .filter(|path| path.is_dir());
+        let composer_workspace_id = self.active.id.clone();
+        let composer_action = {
+            // 도크 배경은 패널색(테마 파생) — 카드가 살짝 떠 보이도록 여백을 준다.
+            let dock_frame =
+                egui::Frame::side_top_panel(&ui.ctx().global_style()).inner_margin(egui::Margin {
+                    left: 10,
+                    right: 10,
+                    top: 8,
+                    bottom: 10,
+                });
+            let composer = &mut self.composer;
+            let composer_ctx = ui::composer::ComposerContext {
+                workspace_id: &composer_workspace_id,
+                send_key: self.config.ui.composer_send_key,
+                can_send: composer_session.is_some(),
+                agent: composer_agent,
+                workspace_root: composer_root.as_deref(),
+                // 접힘 단축키 = FocusComposer의 유효 바인딩 + dispatcher와 같은 충돌
+                // 억제 — 리바인드/비활성/충돌을 열기와 동일 규칙으로 반영한다(codex P2).
+                collapse_shortcut: composer_collapse_shortcut(&self.config.shortcuts),
+            };
+            egui::Panel::bottom("composer_dock")
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(dock_frame)
+                .show(ui, |ui| composer.render(ui, text, &composer_ctx))
+                .inner
+        };
+        if let Some(ui::composer::ComposerAction::Send(prompt)) = composer_action {
+            self.send_composer_prompt(&prompt);
+        }
+    }
+
     /// 컴포저 프롬프트를 활성 워크스페이스의 포커스 세션에 주입한다 (2026-07-17).
     /// 인코딩은 web P6a 미러(composer::encode_prompt_input — C0 strip·\n→\r·bracketed
     /// wrap·submit CR). 주입 전 clear_selection은 WriteInput 직접 전송 관례
@@ -5345,69 +5420,10 @@ impl eframe::App for App {
         }
         // ── 하단 도크 프롬프트 컴포저 (2026-07-17) — CentralPanel보다 먼저 배치해야
         // 터미널 영역이 자동으로 줄어든다(통합 도크 — 팝업/오버레이 금지 사양).
-        // MCP 목록은 펼침당 1회만 조회한다(프레임 경로 저장소 조회 방지).
-        if self.composer.mcp_refresh_needed() {
-            let tools = match self.db.list_mcp_servers() {
-                Ok(servers) => servers
-                    .into_iter()
-                    .filter(|server| server.enabled)
-                    .map(|server| {
-                        let tools = self
-                            .db
-                            .list_mcp_tools(&server.id)
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|tool| tool.name)
-                            .collect();
-                        (server.name, tools)
-                    })
-                    .collect(),
-                Err(e) => {
-                    tracing::warn!("컴포저 MCP 목록 조회 실패: {e:#}");
-                    Vec::new()
-                }
-            };
-            self.composer.set_mcp_tools(tools);
-        }
-        let composer_session = self.active.workspace_ui.focused_session();
-        let composer_agent = composer_session
-            .and_then(|session| self.active.workspace_ui.agent_provider_for(session));
-        let composer_root = self
-            .workspaces
-            .iter()
-            .find(|w| w.id == self.active.id)
-            .map(|w| std::path::PathBuf::from(&w.path))
-            .filter(|path| path.is_dir());
-        let composer_workspace_id = self.active.id.clone();
-        let composer_action = {
-            // 도크 배경은 패널색(테마 파생) — 카드가 살짝 떠 보이도록 여백을 준다.
-            let dock_frame =
-                egui::Frame::side_top_panel(&ui.ctx().global_style()).inner_margin(egui::Margin {
-                    left: 10,
-                    right: 10,
-                    top: 8,
-                    bottom: 10,
-                });
-            let composer = &mut self.composer;
-            let composer_ctx = ui::composer::ComposerContext {
-                workspace_id: &composer_workspace_id,
-                send_key: self.config.ui.composer_send_key,
-                can_send: composer_session.is_some(),
-                agent: composer_agent,
-                workspace_root: composer_root.as_deref(),
-                // 접힘 단축키 = FocusComposer의 유효 바인딩 + dispatcher와 같은 충돌
-                // 억제 — 리바인드/비활성/충돌을 열기와 동일 규칙으로 반영한다(codex P2).
-                collapse_shortcut: composer_collapse_shortcut(&self.config.shortcuts),
-            };
-            egui::Panel::bottom("composer_dock")
-                .resizable(false)
-                .show_separator_line(false)
-                .frame(dock_frame)
-                .show(ui, |ui| composer.render(ui, &text, &composer_ctx))
-                .inner
-        };
-        if let Some(ui::composer::ComposerAction::Send(prompt)) = composer_action {
-            self.send_composer_prompt(&prompt);
+        // 설정 OFF면 패널 자체를 만들지 않는다 — 도크가 사라지고 터미널이 공간을
+        // 회수한다(사용자 요청 토글, file_tree_enabled의 "OFF면 Panel 미생성" 관례).
+        if self.config.ui.composer_enabled {
+            self.render_composer_dock(ui, &text);
         }
 
         // 작업창은 여백 없이 경계까지 채운다 — CentralPanel 기본 inner_margin(8) 탓에

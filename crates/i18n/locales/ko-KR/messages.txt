@@ -507,3 +507,5 @@ settings.composer_send_key.enter = Enter
 settings.composer_send_key.cmd_enter = ⌘+Enter
 settings.composer_send_key.ctrl_enter = Ctrl+Enter
 composer.attach_pending = 파일 첨부 변환 중… 완료 후 전송됩니다
+settings.composer_enabled = 하단 프롬프트 컴포저
+settings.composer_enabled.hint = 하단 도크 프롬프트 컴포저를 표시합니다. 끄면 도크가 사라지고 터미널이 그 공간을 사용합니다.

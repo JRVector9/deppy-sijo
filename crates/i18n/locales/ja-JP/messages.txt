@@ -507,3 +507,5 @@ settings.composer_send_key.enter = Enter
 settings.composer_send_key.cmd_enter = ⌘+Enter
 settings.composer_send_key.ctrl_enter = Ctrl+Enter
 composer.attach_pending = ファイルを添付中… 完了後に送信できます
+settings.composer_enabled = プロンプトコンポーザードック
+settings.composer_enabled.hint = 下部ドックのプロンプトコンポーザーを表示します。オフにするとドックが消え、ターミナルがその領域を使います。

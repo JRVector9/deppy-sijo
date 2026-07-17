@@ -157,6 +157,12 @@ impl NotificationsUi {
     /// 방식이라 PTY 화면에 아무 프롬프트도 출력되지 않는다 — 상태 감지기(BUILTIN.approval
     /// regex)가 볼 게 없어, pending 행 발견 시점에 직접 알린다(OS 알림 + 목록 항목·뱃지).
     /// `title`은 도구 이름 — 세션 제목보다 "무엇을 승인하나"가 판단에 유용하다.
+    ///
+    /// 같은 세션의 연속 승인도 **매번** 알린다(dedupe=false) — 상태 전이 알림과 달리
+    /// 승인 행은 각각이 개별 사건이고, 에이전트는 도구 승인을 연달아 요청한다. 상태
+    /// 기반 중복 억제를 그대로 걸면 첫 건만 알리고 나머지는 조용해진다(2026-07-17 실측:
+    /// 같은 세션 2번째 승인에서 osascript 미발화 확인). 스팸 방지는 호출측
+    /// (`App::approval_notified`)이 승인 id 단위로 이미 한다.
     pub fn on_mcp_approval(
         &mut self,
         workspace_id: &str,
@@ -164,7 +170,7 @@ impl NotificationsUi {
         tool_name: &str,
         catalog: &i18n::Catalog,
     ) {
-        self.push_status(
+        self.push_status_with_dedupe(
             AgentNotificationTarget::Pty {
                 workspace_id: workspace_id.to_owned(),
                 session,
@@ -173,9 +179,12 @@ impl NotificationsUi {
             SessionStatus::NeedsApproval,
             tool_name,
             catalog,
+            false,
         );
     }
 
+    /// 상태 전이 알림 — 같은 대상의 같은 상태가 반복되면 억제한다(재연결/resume 시
+    /// 같은 이벤트가 다시 오는 게 흔하다).
     fn push_status(
         &mut self,
         target: AgentNotificationTarget,
@@ -183,6 +192,18 @@ impl NotificationsUi {
         status: SessionStatus,
         title: &str,
         catalog: &i18n::Catalog,
+    ) {
+        self.push_status_with_dedupe(target, source, status, title, catalog, true);
+    }
+
+    fn push_status_with_dedupe(
+        &mut self,
+        target: AgentNotificationTarget,
+        source: AgentNotificationSource,
+        status: SessionStatus,
+        title: &str,
+        catalog: &i18n::Catalog,
+        dedupe: bool,
     ) {
         let Some(message_id) = notification_message_id(status) else {
             // 진행 재개는 알림 아님
@@ -199,12 +220,13 @@ impl NotificationsUi {
         };
         // Duplicate provider events are common around reconnect/resume. Only a
         // state transition for the same logical target creates a new item.
-        let duplicate = self
-            .items
-            .iter()
-            .rev()
-            .find(|item| item.target == target)
-            .is_some_and(|item| item.status == status);
+        let duplicate = dedupe
+            && self
+                .items
+                .iter()
+                .rev()
+                .find(|item| item.target == target)
+                .is_some_and(|item| item.status == status);
         if duplicate {
             return;
         }
@@ -490,6 +512,33 @@ mod tests {
             catalog.t(&item.message_id, &[("title", &item.title)]),
             "Approval needed: review"
         );
+    }
+
+    /// 2026-07-17 실측 회귀: 실행 중인 앱에 같은 세션의 승인 행을 연달아 넣었을 때
+    /// 두 번째부터 osascript(OS 알림)가 발화되지 않았다 — 상태 전이용 중복 억제가
+    /// 개별 사건인 승인에까지 걸렸다. 에이전트는 도구 승인을 연달아 요청하므로
+    /// 첫 건만 알리면 나머지를 놓친다.
+    #[test]
+    fn 같은_세션의_연속_mcp승인은_매번_알린다() {
+        let mut n = NotificationsUi::new();
+        let catalog = catalog();
+        n.on_mcp_approval(WS, SessionId(1), "write_file", &catalog);
+        n.on_mcp_approval(WS, SessionId(1), "run_command", &catalog);
+        assert_eq!(n.items.len(), 2, "두 승인 모두 알림 항목이 되어야 한다");
+        assert_eq!(n.unread(), 2);
+        assert_eq!(n.items[0].title, "write_file");
+        assert_eq!(n.items[1].title, "run_command");
+    }
+
+    /// 반면 상태 전이(PTY 감지)는 같은 대상·같은 상태가 반복되면 억제한다 —
+    /// 위 수정이 이 규약을 깨지 않았는지 함께 고정한다.
+    #[test]
+    fn 상태전이_알림의_중복_억제는_유지된다() {
+        let mut n = NotificationsUi::new();
+        let catalog = catalog();
+        n.on_status(WS, SessionId(1), SessionStatus::Waiting, "t", &catalog);
+        n.on_status(WS, SessionId(1), SessionStatus::Waiting, "t", &catalog);
+        assert_eq!(n.items.len(), 1, "같은 상태 반복은 한 번만 알린다");
     }
 
     #[test]

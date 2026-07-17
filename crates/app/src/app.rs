@@ -1163,6 +1163,10 @@ pub struct App {
     activity_ui: ui::activity::ActivityUi,
     /// 목업 기반 홈/터미널 전환과 전체 워크스페이스 대시보드 상태.
     agent_terminal_ui: ui::agent_terminal::AgentTerminalUi,
+    /// 상태바·홈이 쓰는 activity_rows 500ms 캐시 — 매 프레임(타이핑 중 60~120fps)
+    /// 전 워크스페이스 × 세션의 String/Vec 재조립을 피한다. 리소스 샘플 주기(2s)보다
+    /// 짧아 표시 신선도는 유지된다.
+    activity_rows_cache: Option<(std::time::Instant, Vec<ui::activity::ActivityWorkspaceRow>)>,
     notifications_ui: ui::notifications::NotificationsUi,
     /// 벨 팝오버 「대기 중」 섹션의 PTY 입력 대기 카드 렌더 상태 (v3.9 N3) — 자유 입력칸
     /// 버퍼 + 로그 tail 미리보기 캐시. 팝오버가 열려 있을 때만 조회한다(idle 비용 0).
@@ -1508,6 +1512,7 @@ impl App {
             env_profiles_ui: ui::env_profiles::EnvProfilesUi::new(),
             activity_ui: ui::activity::ActivityUi::new(),
             agent_terminal_ui: ui::agent_terminal::AgentTerminalUi::new(),
+            activity_rows_cache: None,
             notifications_ui: ui::notifications::NotificationsUi::new(),
             inbox_waiting_ui: ui::inbox_waiting::InboxWaitingUi::new(),
             // 히스토리 파일은 앱 데이터 디렉터리(= 메타데이터 파일과 같은 폴더) 아래.
@@ -5736,7 +5741,23 @@ impl eframe::App for App {
                 .workspace_ui
                 .update_hidden(ui.ctx(), &self.active.runtime, &events, &text);
         }
-        let activity_rows = self.activity_rows();
+        // 500ms 캐시에서 꺼내 쓰고 프레임 끝에 되돌린다(take/put-back) — 참조로 들면
+        // 아래 render_composer_dock(&mut self)와 빌림이 충돌한다. 매 프레임 전체
+        // 재조립(String/Vec, 타이핑 중 60~120fps)을 피하는 게 목적. 리소스 샘플
+        // 주기(2s)보다 짧아 표시 신선도는 충분하다.
+        const ACTIVITY_ROWS_TTL: std::time::Duration = std::time::Duration::from_millis(500);
+        let (activity_rows_stamp, activity_rows) = match self.activity_rows_cache.take() {
+            Some((at, rows)) if at.elapsed() <= ACTIVITY_ROWS_TTL => {
+                // 만료 시점 리프레시 예약 — 이벤트가 TTL 안에 몰리고 그 뒤 프레임이
+                // 없으면 stale 표시가 다음 무관한 wake까지 남는다(codex P2). 캐시를
+                // 새로 지은 프레임은 예약하지 않으므로 자가 반복 repaint 루프는 없다
+                // (유휴 = 프레임 없음 = 예약 없음, 비용-0 계약 유지).
+                ui.ctx()
+                    .request_repaint_after(ACTIVITY_ROWS_TTL.saturating_sub(at.elapsed()));
+                (at, rows)
+            }
+            _ => (std::time::Instant::now(), self.activity_rows()),
+        };
         let waiting_count = self.approvals_ui.pending().len() + self.global_waiting.len();
         // 목업의 전역 상태 스트립. 가장 먼저 bottom panel로 선언해 창 최하단에 고정하고,
         // 컴포저는 그 위에 쌓는다.
@@ -5787,6 +5808,8 @@ impl eframe::App for App {
                     );
                 }
             });
+        // take/put-back 마무리 — 위 take에서 꺼낸 rows를 타임스탬프 그대로 되돌린다.
+        self.activity_rows_cache = Some((activity_rows_stamp, activity_rows));
         match home_action {
             Some(ui::agent_terminal::HomeAction::Inbox) => {
                 egui::Popup::toggle_id(ui.ctx(), Self::inbox_popup_id());

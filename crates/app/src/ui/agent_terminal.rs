@@ -38,7 +38,12 @@ struct WorkspaceTotals {
     warnings: usize,
     cpu_percent: f32,
     cpu_seen: bool,
-    rss_bytes: u64,
+    /// 앱 프로세스 자체(phys_footprint, pid 중복 제거).
+    app_rss_bytes: u64,
+    /// 전 워크스페이스 세션 프로세스 트리(셸+에이전트) 합 — 앱 메모리가 아니다.
+    /// 합쳐서 "RAM"으로 표시하면 에이전트 몇 개에 수 GB로 보여 앱 메모리 급증으로
+    /// 오독된다(2026-07-18 사용자 실측 보고).
+    session_rss_bytes: u64,
 }
 
 pub struct AgentTerminalUi {
@@ -103,7 +108,6 @@ impl AgentTerminalUi {
         } else {
             "CPU —".to_owned()
         };
-        let memory = format!("RAM {}", super::format_bytes(totals.rss_bytes));
         ui.allocate_ui_with_layout(
             egui::vec2(ui.available_width(), 25.0),
             egui::Layout::left_to_right(egui::Align::Center),
@@ -124,7 +128,18 @@ impl AgentTerminalUi {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(10.0);
-                    ui.weak(memory);
+                    // 사이드바 최대 확장 시 남는 폭이 좁아 두 값 라벨이 좌측 카운터를
+                    // 덮는다(codex P2) — 좁으면 세션 합을 hover로 내리고 앱 값만 남긴다.
+                    let compact = ui.available_width() < 400.0;
+                    let memory = memory_label(
+                        totals.app_rss_bytes,
+                        totals.session_rss_bytes,
+                        compact,
+                    );
+                    ui.weak(memory).on_hover_text(format!(
+                        "앱 = 이 앱 프로세스 메모리 · 세션 {} = 모든 워크스페이스의 셸/에이전트 프로세스 합",
+                        super::format_bytes(totals.session_rss_bytes),
+                    ));
                     ui.separator();
                     ui.weak(cpu);
                     ui.separator();
@@ -439,6 +454,21 @@ fn workspace_rows(ui: &mut egui::Ui, rows: &[ActivityWorkspaceRow]) {
     }
 }
 
+/// 상태바 메모리 라벨. 앱/세션 분리 표시 — 합산 단일 "RAM"은 세션 에이전트 몇 개에
+/// 수 GB로 보여 앱 메모리 급증으로 오독된다(2026-07-18 사용자 보고). compact(좁은 폭)
+/// 에서는 세션 합을 hover로 내리고 앱 값만 남긴다 — 오독 방지가 우선이라 앱 값을 남긴다.
+fn memory_label(app_rss: u64, session_rss: u64, compact: bool) -> String {
+    if compact {
+        format!("앱 {}", super::format_bytes(app_rss))
+    } else {
+        format!(
+            "앱 {} · 세션 {}",
+            super::format_bytes(app_rss),
+            super::format_bytes(session_rss),
+        )
+    }
+}
+
 fn workspace_totals(rows: &[ActivityWorkspaceRow]) -> WorkspaceTotals {
     let mut totals = WorkspaceTotals {
         workspaces: rows.len(),
@@ -456,14 +486,14 @@ fn workspace_totals(rows: &[ActivityWorkspaceRow]) -> WorkspaceTotals {
         if let Some(resource) = row.resource
             && app_pids.insert(resource.pid)
         {
-            totals.rss_bytes = totals.rss_bytes.saturating_add(resource.rss_bytes);
+            totals.app_rss_bytes = totals.app_rss_bytes.saturating_add(resource.rss_bytes);
             if let Some(cpu) = resource.cpu_percent {
                 totals.cpu_percent += cpu;
                 totals.cpu_seen = true;
             }
         }
         for resource in &row.session_resources {
-            totals.rss_bytes = totals.rss_bytes.saturating_add(resource.rss_bytes);
+            totals.session_rss_bytes = totals.session_rss_bytes.saturating_add(resource.rss_bytes);
             if let Some(cpu) = resource.cpu_percent {
                 totals.cpu_percent += cpu;
                 totals.cpu_seen = true;
@@ -537,5 +567,57 @@ mod tests {
         assert_eq!(totals.workspaces, 0);
         assert_eq!(totals.sessions, 0);
         assert!(!totals.cpu_seen);
+    }
+
+    #[test]
+    fn totals_split_app_and_session_rss() {
+        // 앱(중복 pid 1회)과 세션 프로세스 합을 분리 집계해야 한다 — 합쳐 "RAM"으로
+        // 표시하면 에이전트 메모리가 앱 급증으로 오독된다(2026-07-18 사용자 보고).
+        let row = |child_session: u64, child_rss: u64| ActivityWorkspaceRow {
+            name: "ws".to_owned(),
+            state: ActivityWorkspaceState::Warm,
+            session_count: 1,
+            pending_events: 0,
+            input_pressure: None,
+            backgrounded_for_secs: None,
+            auto_suspend_remaining_secs: None,
+            resource: Some(runtime::ProcessResourceSnapshot {
+                pid: 42,
+                sampled_at_ms: 0,
+                rss_bytes: 100,
+                cpu_percent: None,
+                high_cpu: false,
+                high_rss: false,
+            }),
+            session_resources: vec![runtime::SessionResourceUsage {
+                session: runtime::SessionId(child_session),
+                pid: Some(child_session as u32),
+                process_group: None,
+                identity_source: runtime::ProcessIdentitySource::PortablePty,
+                sampled_at_ms: 0,
+                process_count: 1,
+                rss_bytes: child_rss,
+                cpu_percent: None,
+                high_cpu: false,
+                high_rss: false,
+            }],
+            sessions: Vec::new(),
+        };
+        let totals = workspace_totals(&[row(1, 700), row(2, 300)]);
+        assert_eq!(totals.app_rss_bytes, 100, "같은 앱 pid는 한 번만");
+        assert_eq!(totals.session_rss_bytes, 1000, "세션 프로세스는 각각 합산");
+    }
+
+    #[test]
+    fn memory_label_은_좁은_폭에서_앱_값만_남긴다() {
+        let mib = 1024 * 1024;
+        let full = memory_label(150 * mib, 3 * 1024 * mib, false);
+        assert!(full.contains("앱") && full.contains("세션"), "{full}");
+        // 좁은 폭에서는 좌측 카운터를 덮지 않게 세션 합을 hover로 내린다(codex P2).
+        let compact = memory_label(150 * mib, 3 * 1024 * mib, true);
+        assert!(
+            compact.contains("앱") && !compact.contains("세션"),
+            "{compact}"
+        );
     }
 }

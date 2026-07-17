@@ -63,6 +63,30 @@ if [[ -f "$ZDOTDIR/.zshrc" ]]; then
 fi
 # 여기서부터 ZDOTDIR는 사용자 값 — 중첩 zsh는 재주입되지 않는다.
 
+# ── deppy prompt marks (OSC 133 — 셸 통합 1단계. zsh 전용, bash/fish는 후속) ──
+# 세션(워커)이 출력 스트림에서 133;A를 스캔해 프롬프트 점프(⌘⇧↑/↓)에 쓴다.
+# 이미 다른 셸 통합(iTerm2 등)이 등록한 훅이 OSC 133을 쏘면 중복 마크를 피해
+# 설치하지 않는다. env-reload 훅보다 먼저 등록해 D의 $? 오염을 줄인다.
+if [[ "$(builtin typeset -f ${precmd_functions[@]:-} ${preexec_functions[@]:-} precmd preexec 2>/dev/null)" != *'133;'* ]]; then
+  __deppy_prompt_precmd() {
+    # 직전 명령 종료(D;exit code) 후 프롬프트 시작(A). D는 2단계(출력 추출)용.
+    builtin printf '\e]133;D;%s\a\e]133;A\a' $?
+  }
+  __deppy_prompt_preexec() {
+    # 명령 실행 — 출력 시작(C).
+    builtin printf '\e]133;C\a'
+  }
+  autoload -Uz add-zsh-hook 2>/dev/null
+  if (( $+functions[add-zsh-hook] )); then
+    add-zsh-hook precmd __deppy_prompt_precmd
+    add-zsh-hook preexec __deppy_prompt_preexec
+  else
+    typeset -ga precmd_functions preexec_functions
+    precmd_functions+=(__deppy_prompt_precmd)
+    preexec_functions+=(__deppy_prompt_preexec)
+  fi
+fi
+
 # ── deppy env live-reload (옵트인 — 설정 › 환경) ──────────────────────────
 if [[ "$DEPPY_ENV_LIVE_RELOAD" == "1" && -n "$DEPPY_PROJECT_ROOT" ]]; then
   zmodload -F zsh/stat b:zstat 2>/dev/null
@@ -179,6 +203,106 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// OSC 133 프롬프트 마크 훅(셸 통합 1단계): precmd가 D(종료 코드)+A, preexec가
+    /// C를 찍는다 — 세션 스캐너(session crate)가 A를 마크로 저장하는 계약의 셸 쪽 절반.
+    #[test]
+    fn 프롬프트_마크_훅은_osc_133을_찍는다() {
+        if !std::path::Path::new("/bin/zsh").exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-zdot-osc133-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let zdot = dir.join("zdot");
+        let user = dir.join("user");
+        std::fs::create_dir_all(&zdot).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(zdot.join(".zshrc"), ZSHRC).unwrap();
+        // 비대화형이라 훅이 자동으로 안 돈다 — 프롬프트 흐름을 직접 흉내낸다.
+        let script = format!(
+            r#"
+export DEPPY_USER_ZDOTDIR={user}
+builtin source {zdot}/.zshrc
+echo "installed:$+functions[__deppy_prompt_precmd]"
+false
+__deppy_prompt_precmd
+__deppy_prompt_preexec
+"#,
+            zdot = zdot.display(),
+            user = user.display(),
+        );
+        let out = std::process::Command::new("/bin/zsh")
+            .arg("-c")
+            .arg(&script)
+            .env_remove("ZDOTDIR")
+            .output()
+            .unwrap();
+        let stdout = out.stdout;
+        let text = String::from_utf8_lossy(&stdout);
+        assert!(text.contains("installed:1"), "훅 미설치: {text}");
+        // false 직후 precmd → D;1 + A, preexec → C
+        let expect_da: &[u8] = b"\x1b]133;D;1\x07\x1b]133;A\x07";
+        assert!(
+            stdout.windows(expect_da.len()).any(|w| w == expect_da),
+            "D+A 마크 없음: {text:?}"
+        );
+        let expect_c: &[u8] = b"\x1b]133;C\x07";
+        assert!(
+            stdout.windows(expect_c.len()).any(|w| w == expect_c),
+            "C 마크 없음: {text:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 사용자 셸 통합(iTerm 등)이 이미 OSC 133을 쏘면 중복 마크를 피해 설치하지 않는다.
+    #[test]
+    fn 기존_133_훅이_있으면_프롬프트_마크_훅을_설치하지_않는다() {
+        if !std::path::Path::new("/bin/zsh").exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-zdot-osc133-guard-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let zdot = dir.join("zdot");
+        let user = dir.join("user");
+        std::fs::create_dir_all(&zdot).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(zdot.join(".zshrc"), ZSHRC).unwrap();
+        std::fs::write(
+            user.join(".zshrc"),
+            "__user_integration_precmd() { printf '\\e]133;A\\a'; }\n\
+             typeset -ga precmd_functions\n\
+             precmd_functions+=(__user_integration_precmd)\n",
+        )
+        .unwrap();
+        let script = format!(
+            r#"
+export DEPPY_USER_ZDOTDIR={user}
+builtin source {zdot}/.zshrc
+echo "installed:$+functions[__deppy_prompt_precmd]"
+"#,
+            zdot = zdot.display(),
+            user = user.display(),
+        );
+        let out = std::process::Command::new("/bin/zsh")
+            .arg("-c")
+            .arg(&script)
+            .env_remove("ZDOTDIR")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("installed:0"),
+            "기존 133 훅에도 설치됨: {text} / {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

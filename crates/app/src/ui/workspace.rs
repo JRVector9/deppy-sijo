@@ -1856,7 +1856,9 @@ impl WorkspaceUi {
                     }
                     // Shift+화살표 → 마우스 드래그처럼 선택 확장. 터미널로는 안 보낸다.
                     // alt-screen(vim/less 등 TUI)에선 앱이 shift+화살표를 쓰므로 가로채지
-                    // 않고 그대로 통과시킨다.
+                    // 않고 그대로 통과시킨다. command 조합(비macOS에선 Ctrl+Shift+화살표 —
+                    // 프롬프트 점프 ⌘⇧↑/↓의 기본 chord)은 앱 단축키 몫이라 선택 확장으로
+                    // 겹쳐 실행하지 않는다 (macOS는 위 mac_cmd 가드가 이미 걸렀다).
                     if !snapshot.is_alt_screen
                         && let egui::Event::Key {
                             key,
@@ -1865,6 +1867,7 @@ impl WorkspaceUi {
                             ..
                         } = event
                         && m.shift
+                        && !m.command
                         && matches!(
                             key,
                             egui::Key::ArrowLeft
@@ -2527,6 +2530,26 @@ impl WorkspaceUi {
         });
         if let Some(session) = session {
             self.send(client, RuntimeCommand::ScrollToBottom { session });
+        }
+    }
+
+    /// 단축키(⌘⇧↑/↓)용 포커스된 pane을 이전/다음 프롬프트 마크(OSC 133)로 점프한다.
+    /// 마크 조회·델타 계산은 워커(세션) 소유 — scroll_focused_to_bottom과 동일 구조.
+    pub fn scroll_focused_to_prompt(&mut self, client: &dyn RuntimeClient, direction: i8) {
+        let session = self.mux.as_ref().and_then(|mux| {
+            mux.focused_pane.as_ref().and_then(|pane| {
+                mux.tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .find(|p| &p.id == pane)
+                    .and_then(|p| p.session_id)
+            })
+        });
+        if let Some(session) = session {
+            self.send(
+                client,
+                RuntimeCommand::ScrollToPrompt { session, direction },
+            );
         }
     }
 

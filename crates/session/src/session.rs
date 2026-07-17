@@ -12,6 +12,7 @@ use terminal::{
 };
 
 use crate::lifecycle::SessionLifecycle;
+use crate::prompt_marks::PromptMarks;
 
 /// 한 pump에 backend로 넘기는 PTY 출력 상한 (호출 스레드 독점 방지)
 const FEED_PER_PUMP_CAP: usize = 256 * 1024;
@@ -63,6 +64,8 @@ pub struct Session {
     /// cache budget manager가 적용한 현재 class. visible이 최우선이고, hidden/exited는
     /// 줄/byte budget으로 scrollback을 줄인다.
     cache_class: TerminalCacheClass,
+    /// OSC 133 프롬프트 마크 (셸 통합 1단계) — pump의 출력 스트림에서 스캔한다.
+    prompt_marks: PromptMarks,
 }
 
 impl Session {
@@ -130,6 +133,7 @@ impl Session {
             exit_code: None,
             exit_wait_ticks: 0,
             cache_class: TerminalCacheClass::Visible,
+            prompt_marks: PromptMarks::default(),
         })
     }
 
@@ -182,6 +186,7 @@ impl Session {
             exit_code,
             exit_wait_ticks: 0,
             cache_class: TerminalCacheClass::Exited,
+            prompt_marks: PromptMarks::default(),
         }
     }
 
@@ -225,6 +230,9 @@ impl Session {
                 Ok(chunk) => {
                     fed += chunk.len();
                     on_output(&chunk);
+                    // OSC 133 프롬프트 마크 스캔 (셸 통합 1단계) — 로그/감지와 같은
+                    // raw output stream 기반이다 (설계문서 4.1).
+                    self.prompt_marks.scan(&chunk);
                     match self.backend.feed(&chunk) {
                         Ok(changes) => {
                             if !changes.dirty_rows.is_empty()
@@ -407,6 +415,26 @@ impl Session {
     pub fn scroll_to_bottom(&mut self) {
         self.backend.scroll_to_bottom();
         self.mark_full_dirty();
+    }
+
+    /// OSC 133 프롬프트 마크로 점프 (−1=이전/과거, +1=다음/최신 — 단축키 ⌘⇧↑/↓).
+    /// 델타 수식은 T3 검색의 스크롤 수식과 동치 (prompt_marks.rs 참조).
+    pub fn scroll_to_prompt(&mut self, direction: i8) {
+        let footprint = self.backend.cache_footprint();
+        // 현재 스크롤 오프셋은 snapshot으로만 읽는다 — 키 입력 빈도라 비용 무시 가능.
+        let offset = self
+            .backend
+            .viewport_snapshot()
+            .map_or(0, |snapshot| snapshot.scroll_offset);
+        if let Some(delta) = self.prompt_marks.jump_delta(
+            direction,
+            offset,
+            footprint.screen_lines,
+            footprint.history_lines,
+        ) {
+            self.backend.scroll(delta);
+            self.mark_full_dirty();
+        }
     }
 
     /// 가시성에 따라 scrollback 상한 조정 (§14.3). 전이 시에만 호출할 것.
@@ -821,6 +849,53 @@ mod tests {
                 end: 80 * 24,
             }]
         );
+    }
+
+    /// 셸 통합 1단계: OSC 133;A 마크 2개를 심고 ⌘⇧↑/↓ 점프가 T3 검색과 같은
+    /// 수식으로 스크롤백을 오간다.
+    #[test]
+    #[cfg(unix)]
+    fn 프롬프트_마크로_점프하고_복귀한다() {
+        let spec = CommandSpec {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                concat!(
+                    "printf '\\033]133;A\\007prompt-1\\n'; ",
+                    "i=0; while [ $i -lt 40 ]; do echo fill-$i; i=$((i+1)); done; ",
+                    "printf '\\033]133;A\\007prompt-2\\n'; sleep 30"
+                )
+                .into(),
+            ],
+            env: Vec::new(),
+            cwd: None,
+        };
+        let mut session =
+            Session::spawn_with_spec(SessionId(30), SessionKind::Shell, &spec, 80, 5, 1000)
+                .unwrap();
+        wait(Duration::from_secs(5), || {
+            session.pump(|_| {});
+            session.screen_text().contains("prompt-2").then_some(())
+        });
+
+        // 이전 프롬프트(prompt-1, 라인 0)로 — history 상단 클램프까지 스크롤된다.
+        session.scroll_to_prompt(-1);
+        let jumped = session.take_snapshot().unwrap();
+        assert!(jumped.scroll_offset > 0, "{}", jumped.scroll_offset);
+        assert!(
+            row_text(&jumped, 0).contains("prompt-1"),
+            "{:?}",
+            row_text(&jumped, 0)
+        );
+
+        // 다음 프롬프트(prompt-2, 최하단 근처)로 — 맨 아래 복귀.
+        session.scroll_to_prompt(1);
+        let back = session.take_snapshot().unwrap();
+        assert_eq!(back.scroll_offset, 0);
+
+        // 다음 마크(prompt-2)는 이미 현재 위치(델타 0) — 스크롤 유지.
+        session.scroll_to_prompt(1);
+        assert_eq!(session.take_snapshot().unwrap().scroll_offset, 0);
     }
 
     #[test]

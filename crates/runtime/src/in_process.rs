@@ -1197,6 +1197,13 @@ impl Worker {
                     active.scroll_to_bottom();
                 }
             }
+            RuntimeCommand::ScrollToPrompt { session, direction } => {
+                // 마크 조회·델타 계산은 세션 소유 — 이동은 기존 Scroll과 같은 경로
+                // (scroll → mark_full_dirty → 다음 pump이 Viewport emit).
+                if let Some(active) = self.sessions.get_mut(&session) {
+                    active.scroll_to_prompt(direction);
+                }
+            }
             RuntimeCommand::SearchScrollback {
                 session,
                 query,
@@ -3126,6 +3133,95 @@ mod tests {
             {
                 Some(())
             }
+            _ => None,
+        });
+    }
+
+    /// 셸 통합 1단계: 출력에 OSC 133;A 마크 2개를 심으면 ScrollToPrompt가
+    /// 기존 Scroll과 같은 경로(dirty → Viewport)로 프롬프트 사이를 오간다.
+    #[test]
+    #[cfg(unix)]
+    fn scroll_to_prompt는_프롬프트_마크_사이를_오간다() {
+        let client = InProcessRuntimeClient::with_shell(
+            5,
+            test_store(),
+            test_logs_root("prompt-jump"),
+            RedactionService::new(),
+            spec(
+                "/bin/sh",
+                &[
+                    "-c",
+                    concat!(
+                        "printf '\\033]133;A\\007prompt-1\\n'; ",
+                        "i=0; while [ $i -lt 40 ]; do echo fill-$i; i=$((i+1)); done; ",
+                        "printf '\\033]133;A\\007prompt-2\\n'; sleep 30"
+                    ),
+                ],
+            ),
+            None,
+        );
+        let mut probe = Probe::new(client.subscribe());
+        client
+            .send_command(RuntimeCommand::SpawnShell {
+                cols: 80,
+                rows: 5,
+                scrollback_lines: 1000,
+            })
+            .unwrap();
+        let session = probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::ShellSpawned { session } => Some(*session),
+            _ => None,
+        });
+        // 출력이 모두 반영될 때까지 — 마지막 마크 뒤 텍스트가 화면에 보인다.
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::Viewport {
+                session: s,
+                snapshot,
+                ..
+            } if *s == session
+                && (0..5).any(|row| snapshot_text(snapshot, row).contains("prompt-2")) =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
+
+        // 이전 프롬프트(prompt-1, 첫 라인)로 점프 → 스크롤된 Viewport가 흐른다.
+        probe.seen.clear();
+        client
+            .send_command(RuntimeCommand::ScrollToPrompt {
+                session,
+                direction: -1,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::Viewport {
+                session: s,
+                snapshot,
+                ..
+            } if *s == session
+                && snapshot.scroll_offset > 0
+                && snapshot_text(snapshot, 0).contains("prompt-1") =>
+            {
+                Some(())
+            }
+            _ => None,
+        });
+
+        // 다음 프롬프트(prompt-2)로 — 맨 아래 복귀.
+        probe.seen.clear();
+        client
+            .send_command(RuntimeCommand::ScrollToPrompt {
+                session,
+                direction: 1,
+            })
+            .unwrap();
+        probe.wait_for(Duration::from_secs(15), |e| match e {
+            RuntimeEvent::Viewport {
+                session: s,
+                snapshot,
+                ..
+            } if *s == session && snapshot.scroll_offset == 0 => Some(()),
             _ => None,
         });
     }

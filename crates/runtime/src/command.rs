@@ -163,6 +163,13 @@ pub enum RuntimeCommand {
     ScrollToBottom {
         session: SessionId,
     },
+    /// OSC 133 프롬프트 마크로 스크롤 점프 (셸 통합 1단계 — 단축키 ⌘⇧↑/↓).
+    /// direction −1=이전(과거)/+1=다음(최신). 마크는 세션(워커)이 출력 스트림에서
+    /// 스캔해 보관한다. **variant는 끝에만 추가** (postcard discriminant — wire 호환).
+    ScrollToPrompt {
+        session: SessionId,
+        direction: i8,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
@@ -252,6 +259,11 @@ impl std::fmt::Debug for RuntimeCommand {
             RuntimeCommand::ScrollToBottom { session } => f
                 .debug_struct("ScrollToBottom")
                 .field("session", session)
+                .finish(),
+            RuntimeCommand::ScrollToPrompt { session, direction } => f
+                .debug_struct("ScrollToPrompt")
+                .field("session", session)
+                .field("direction", direction)
                 .finish(),
             RuntimeCommand::KillSession { session } => f
                 .debug_struct("KillSession")

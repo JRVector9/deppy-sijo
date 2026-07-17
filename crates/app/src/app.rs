@@ -3101,6 +3101,14 @@ impl App {
                 .active
                 .workspace_ui
                 .scroll_focused_to_bottom(&self.active.runtime),
+            A::PromptJumpPrev => self
+                .active
+                .workspace_ui
+                .scroll_focused_to_prompt(&self.active.runtime, -1),
+            A::PromptJumpNext => self
+                .active
+                .workspace_ui
+                .scroll_focused_to_prompt(&self.active.runtime, 1),
             A::SplitVertical | A::SplitHorizontal => {
                 let direction = if action == A::SplitVertical {
                     runtime::SplitDirection::Vertical

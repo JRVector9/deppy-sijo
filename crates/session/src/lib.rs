@@ -6,6 +6,7 @@
 
 mod agent_session;
 mod lifecycle;
+mod prompt_marks;
 mod session;
 mod shell_session;
 mod status;

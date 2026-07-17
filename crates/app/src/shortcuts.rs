@@ -28,6 +28,10 @@ pub enum ShortcutAction {
     TerminalSearch,
     /// 스크롤백에서 맨 아래(라이브 화면)로 복귀 (⌘↓ 기본 — pane 메뉴와 동일 동작)
     ScrollToBottom,
+    /// 이전 프롬프트 마크(OSC 133)로 점프 (⌘⇧↑ 기본 — 셸 통합 1단계)
+    PromptJumpPrev,
+    /// 다음 프롬프트 마크(OSC 133)로 점프 (⌘⇧↓ 기본)
+    PromptJumpNext,
     /// 하단 도크 컴포저 포커스+펼침 (⌘J 기본). 이미 포커스면 컴포저 안에서 접는다
     /// (전역 단축키는 text edit 포커스 중 비활성 — 접기는 composer가 직접 처리).
     FocusComposer,
@@ -70,7 +74,7 @@ impl ShortcutGroup {
 }
 
 impl ShortcutAction {
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 30] = [
         Self::ToggleSidebar,
         Self::OpenEnvironment,
         Self::OpenAgents,
@@ -88,6 +92,8 @@ impl ShortcutAction {
         Self::DecreaseTerminalFont,
         Self::TerminalSearch,
         Self::ScrollToBottom,
+        Self::PromptJumpPrev,
+        Self::PromptJumpNext,
         Self::FocusComposer,
         Self::ClearRenderCaches,
         Self::PreviousAgent,
@@ -120,6 +126,8 @@ impl ShortcutAction {
             Self::DecreaseTerminalFont => "decrease_terminal_font",
             Self::TerminalSearch => "terminal_search",
             Self::ScrollToBottom => "scroll_to_bottom",
+            Self::PromptJumpPrev => "prompt_jump_prev",
+            Self::PromptJumpNext => "prompt_jump_next",
             Self::FocusComposer => "focus_composer",
             Self::ClearRenderCaches => "clear_render_caches",
             Self::PreviousAgent => "previous_agent",
@@ -153,6 +161,8 @@ impl ShortcutAction {
             Self::DecreaseTerminalFont => "shortcuts.action.decrease_terminal_font",
             Self::TerminalSearch => "shortcuts.action.terminal_search",
             Self::ScrollToBottom => "shortcuts.action.scroll_to_bottom",
+            Self::PromptJumpPrev => "shortcuts.action.prompt_jump_prev",
+            Self::PromptJumpNext => "shortcuts.action.prompt_jump_next",
             Self::FocusComposer => "shortcuts.action.focus_composer",
             Self::ClearRenderCaches => "shortcuts.action.clear_render_caches",
             Self::PreviousAgent => "shortcuts.action.previous_agent",
@@ -192,6 +202,8 @@ impl ShortcutAction {
             | Self::DecreaseTerminalFont
             | Self::TerminalSearch
             | Self::ScrollToBottom
+            | Self::PromptJumpPrev
+            | Self::PromptJumpNext
             | Self::FocusComposer => ShortcutGroup::Terminal,
             Self::NextWorkspace | Self::PreviousWorkspace | Self::ClearRenderCaches => {
                 ShortcutGroup::Workspace
@@ -230,6 +242,9 @@ impl ShortcutAction {
             // 기본으로 가로채지 않는다 — 사용자는 설정에서 Ctrl+F로 rebind할 수 있다 (T3).
             Self::TerminalSearch => Some("Command+F"),
             Self::ScrollToBottom => Some("Command+Down"),
+            // egui Key::name()은 화살표를 "Up"/"Down"으로 직렬화한다 (⌘⇧↑/⌘⇧↓).
+            Self::PromptJumpPrev => Some("Command+Shift+Up"),
+            Self::PromptJumpNext => Some("Command+Shift+Down"),
             Self::FocusComposer => Some("Command+J"),
             Self::ClearRenderCaches => Some("Command+Alt+K"),
             Self::PreviousAgent

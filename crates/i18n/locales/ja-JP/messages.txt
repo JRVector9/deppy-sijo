@@ -506,3 +506,4 @@ settings.composer_send_key.hint = 下部ドックコンポーザーのプロン�
 settings.composer_send_key.enter = Enter
 settings.composer_send_key.cmd_enter = ⌘+Enter
 settings.composer_send_key.ctrl_enter = Ctrl+Enter
+composer.attach_pending = ファイルを添付中… 完了後に送信できます

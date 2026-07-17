@@ -5395,6 +5395,9 @@ impl eframe::App for App {
                 can_send: composer_session.is_some(),
                 agent: composer_agent,
                 workspace_root: composer_root.as_deref(),
+                // 접힘 단축키 = FocusComposer의 유효 바인딩 + dispatcher와 같은 충돌
+                // 억제 — 리바인드/비활성/충돌을 열기와 동일 규칙으로 반영한다(codex P2).
+                collapse_shortcut: composer_collapse_shortcut(&self.config.shortcuts),
             };
             egui::Panel::bottom("composer_dock")
                 .resizable(false)
@@ -6595,6 +6598,20 @@ fn waiting_answer_bytes(reply: &str) -> Vec<u8> {
     format!("{reply}\r").into_bytes()
 }
 
+/// 컴포저 접힘 단축키 — FocusComposer의 유효 바인딩에 **dispatcher와 같은 충돌 억제**를
+/// 적용한다. dispatcher(take_triggered_action)는 충돌 바인딩의 모든 액션을 억제하는데,
+/// 여기서 바인딩만 넘기면 "열기는 안 되고 닫기만 되는" 비대칭이 생긴다(codex P2).
+fn composer_collapse_shortcut(
+    config: &crate::config::ShortcutsConfig,
+) -> Option<egui::KeyboardShortcut> {
+    if crate::shortcuts::conflicts(config)
+        .contains(&crate::shortcuts::ShortcutAction::FocusComposer)
+    {
+        return None;
+    }
+    crate::shortcuts::effective_binding(config, crate::shortcuts::ShortcutAction::FocusComposer)
+}
+
 /// 상단바 텍스트 버튼 — 프레임 없이 라벨만, 선택 시 accent-soft 박스.
 /// Response를 돌려주므로 팝오버 앵커/hover 텍스트에 쓸 수 있다.
 fn tbtn_response(ui: &mut egui::Ui, label: String, selected: bool) -> egui::Response {
@@ -6924,6 +6941,40 @@ mod tests {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+
+    /// codex P2 회귀: FocusComposer 바인딩이 다른 액션과 충돌하면 dispatcher가 열기를
+    /// 억제하므로 접힘 단축키도 함께 없어져야 한다(비대칭 방지).
+    #[test]
+    fn composer_collapse_shortcut_은_충돌_시_none이다() {
+        use crate::shortcuts::{self, ShortcutAction};
+        let mut config = crate::config::ShortcutsConfig::default();
+        assert_eq!(
+            composer_collapse_shortcut(&config),
+            shortcuts::parse_binding("Command+J"),
+            "기본은 ⌘J"
+        );
+        // 다른 액션을 ⌘J로 리바인드 → 충돌 → 열기/닫기 모두 억제.
+        shortcuts::set_binding(
+            &mut config,
+            ShortcutAction::NewShell,
+            shortcuts::parse_binding("Command+J"),
+        );
+        assert!(
+            shortcuts::conflicts(&config).contains(&ShortcutAction::FocusComposer),
+            "전제: 충돌 집합에 FocusComposer가 있어야 한다"
+        );
+        assert_eq!(composer_collapse_shortcut(&config), None);
+        // 충돌 해소(FocusComposer 리바인드) → 새 바인딩이 접힘 키.
+        shortcuts::set_binding(
+            &mut config,
+            ShortcutAction::FocusComposer,
+            shortcuts::parse_binding("Command+Shift+J"),
+        );
+        assert_eq!(
+            composer_collapse_shortcut(&config),
+            shortcuts::parse_binding("Command+Shift+J")
+        );
+    }
 
     /// 2026-07-17 사용자 회귀: 인박스에서 답을 보내면 "명령어가 줄에 쌓이고 실행은
     /// 안 되는" 증상. LF는 줄만 바꾼다 — PTY에서 실행을 일으키는 건 CR이고, 실제

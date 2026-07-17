@@ -506,3 +506,4 @@ settings.composer_send_key.hint = 底部停靠編輯器用哪個鍵傳送提示�
 settings.composer_send_key.enter = Enter
 settings.composer_send_key.cmd_enter = ⌘+Enter
 settings.composer_send_key.ctrl_enter = Ctrl+Enter
+composer.attach_pending = 正在附加檔案… 完成後才能傳送

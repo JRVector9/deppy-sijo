@@ -506,3 +506,4 @@ settings.composer_send_key.hint = Which key sends the bottom-dock composer promp
 settings.composer_send_key.enter = Enter
 settings.composer_send_key.cmd_enter = ⌘+Enter
 settings.composer_send_key.ctrl_enter = Ctrl+Enter
+composer.attach_pending = Attaching file… finishes before send

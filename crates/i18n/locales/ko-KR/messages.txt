@@ -506,3 +506,4 @@ settings.composer_send_key.hint = 하단 도크 컴포저의 프롬프트를 어
 settings.composer_send_key.enter = Enter
 settings.composer_send_key.cmd_enter = ⌘+Enter
 settings.composer_send_key.ctrl_enter = Ctrl+Enter
+composer.attach_pending = 파일 첨부 변환 중… 완료 후 전송됩니다

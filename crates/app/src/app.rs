@@ -1167,6 +1167,9 @@ pub struct App {
     /// 전 워크스페이스 × 세션의 String/Vec 재조립을 피한다. 리소스 샘플 주기(2s)보다
     /// 짧아 표시 신선도는 유지된다.
     activity_rows_cache: Option<(std::time::Instant, Vec<ui::activity::ActivityWorkspaceRow>)>,
+    /// 하단 상태바 「MCP N」용 활성 MCP 서버 수 캐시 — 매 프레임 DB 조회 금지
+    /// (30s TTL — 커넥터 변경은 다음 갱신에 반영되면 충분한 준정적 값).
+    mcp_count_cache: Option<(std::time::Instant, usize)>,
     notifications_ui: ui::notifications::NotificationsUi,
     /// 벨 팝오버 「대기 중」 섹션의 PTY 입력 대기 카드 렌더 상태 (v3.9 N3) — 자유 입력칸
     /// 버퍼 + 로그 tail 미리보기 캐시. 팝오버가 열려 있을 때만 조회한다(idle 비용 0).
@@ -1513,6 +1516,7 @@ impl App {
             activity_ui: ui::activity::ActivityUi::new(),
             agent_terminal_ui: ui::agent_terminal::AgentTerminalUi::new(),
             activity_rows_cache: None,
+            mcp_count_cache: None,
             notifications_ui: ui::notifications::NotificationsUi::new(),
             inbox_waiting_ui: ui::inbox_waiting::InboxWaitingUi::new(),
             // 히스토리 파일은 앱 데이터 디렉터리(= 메타데이터 파일과 같은 폴더) 아래.
@@ -5169,8 +5173,10 @@ impl eframe::App for App {
                         ui.weak(egui::RichText::new("AI Agent Workspace").size(11.0));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add_space(10.0);
-                            // 우측: 로케일 · (옵트인) 메모리. 중앙에는 검색/워크스페이스
-                            // 선택기를 두지 않아 목업처럼 작업 표면이 비어 있게 한다.
+                            // 우측: 로케일. 중앙에는 검색/워크스페이스 선택기를 두지
+                            // 않아 목업처럼 작업 표면이 비어 있게 한다. 메모리 표시는
+                            // 하단 상태바로 일원화(2026-07-18 사용자 — 상/하단 수치가
+                            // 샘플 시점 차이로 어긋나 보였음).
                             let locale_short = self
                                 .config
                                 .i18n
@@ -5178,22 +5184,7 @@ impl eframe::App for App {
                                 .split('-')
                                 .next()
                                 .unwrap_or(&self.config.i18n.locale);
-                            let memory = self
-                                .config
-                                .ui
-                                .show_memory_indicator
-                                .then_some(self.active.resource_usage)
-                                .flatten();
-                            let label = match memory {
-                                Some(r) => {
-                                    format!("{locale_short} · {}MB", r.rss_bytes / (1024 * 1024))
-                                }
-                                None => locale_short.to_owned(),
-                            };
-                            let resp = ui.weak(label);
-                            if memory.is_some() {
-                                resp.on_hover_text(text.t("top.memory_hint", &[]));
-                            }
+                            ui.weak(locale_short.to_owned());
                             let tbtn = |ui: &mut egui::Ui, label: String, selected: bool| -> bool {
                                 tbtn_response(ui, label, selected).clicked()
                             };
@@ -5759,6 +5750,19 @@ impl eframe::App for App {
             _ => (std::time::Instant::now(), self.activity_rows()),
         };
         let waiting_count = self.approvals_ui.pending().len() + self.global_waiting.len();
+        // 활성 MCP 서버 수 — 30s TTL 캐시 (하단 상태바 「MCP N」, 2026-07-18 사용자).
+        let mcp_count = match self.mcp_count_cache {
+            Some((at, count)) if at.elapsed() <= std::time::Duration::from_secs(30) => count,
+            _ => {
+                let count = self
+                    .db
+                    .list_mcp_servers()
+                    .map(|servers| servers.iter().filter(|server| server.enabled).count())
+                    .unwrap_or(0);
+                self.mcp_count_cache = Some((std::time::Instant::now(), count));
+                count
+            }
+        };
         // 목업의 전역 상태 스트립. 가장 먼저 bottom panel로 선언해 창 최하단에 고정하고,
         // 컴포저는 그 위에 쌓는다.
         egui::Panel::bottom("agent_terminal_status_bar")
@@ -5770,7 +5774,7 @@ impl eframe::App for App {
             )
             .show(ui, |ui| {
                 self.agent_terminal_ui
-                    .status_bar(ui, &activity_rows, waiting_count);
+                    .status_bar(ui, &activity_rows, waiting_count, mcp_count);
             });
 
         // 컴포저는 터미널 표면에만 붙는다. 홈은 전체 폭 대시보드가 남은 중앙 영역을 쓴다.

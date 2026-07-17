@@ -1573,16 +1573,8 @@ fn general_page(
             }
         },
     );
-    row(
-        ui,
-        &catalog.t("settings.memory_indicator", &[]),
-        Some(&catalog.t("settings.memory_indicator.hint", &[])),
-        |ui| {
-            if toggle_switch(ui, &mut config.ui.show_memory_indicator) {
-                *changed = true;
-            }
-        },
-    );
+    // (「메모리 표시」 토글 제거 — 2026-07-18 사용자: 메모리는 하단 상태바로 일원화,
+    // 상단 옵트인 표시와 그 토글은 수치 불일치의 원천이라 삭제.)
     // 하단 도크 컴포저 표시 (2026-07-17 사용자) — OFF면 도크 패널 미생성(터미널이
     // 공간 회수) + FocusComposer 단축키 무시.
     row(

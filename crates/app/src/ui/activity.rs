@@ -137,8 +137,11 @@ fn activity_summary(rows: &[ActivityWorkspaceRow]) -> ActivitySummary {
     let mut cpu = 0.0;
     let mut cpu_seen = false;
     // Runtime worker는 workspace마다 하나지만 모두 같은 in-process 앱 PID/RSS를
-    // 샘플링한다. 요약에서는 PID별 한 번만 더해야 warm 수만큼 앱 메모리가 중복되지 않는다.
-    let mut seen_app_pids = std::collections::HashSet::new();
+    // 샘플링한다. 요약에서는 PID별 한 번만 더해야 warm 수만큼 앱 메모리가 중복되지
+    // 않는다. 채택은 pid별 **최신 샘플** — 워커마다 샘플 시점이 제각각이라 먼저 만난
+    // 행을 쓰면 하단 상태바와 수치가 어긋난다(2026-07-18 사용자, 하단과 동일 규칙).
+    let mut app_latest: std::collections::HashMap<u32, runtime::ProcessResourceSnapshot> =
+        std::collections::HashMap::new();
     for row in rows {
         match row.state {
             ActivityWorkspaceState::Active => summary.active += 1,
@@ -146,14 +149,15 @@ fn activity_summary(rows: &[ActivityWorkspaceRow]) -> ActivitySummary {
             ActivityWorkspaceState::Idle => summary.idle += 1,
         }
         summary.sessions += row.session_count;
-        if let Some(resource) = &row.resource
-            && seen_app_pids.insert(resource.pid)
-        {
-            summary.app_rss_bytes = summary.app_rss_bytes.saturating_add(resource.rss_bytes);
-            if let Some(value) = resource.cpu_percent {
-                cpu += value;
-                cpu_seen = true;
-            }
+        if let Some(resource) = row.resource {
+            app_latest
+                .entry(resource.pid)
+                .and_modify(|kept| {
+                    if resource.sampled_at_ms > kept.sampled_at_ms {
+                        *kept = resource;
+                    }
+                })
+                .or_insert(resource);
         }
         for resource in &row.session_resources {
             summary.child_rss_bytes = summary.child_rss_bytes.saturating_add(resource.rss_bytes);
@@ -164,6 +168,13 @@ fn activity_summary(rows: &[ActivityWorkspaceRow]) -> ActivitySummary {
         }
         if workspace_has_warning(row) {
             summary.warnings += 1;
+        }
+    }
+    for snapshot in app_latest.values() {
+        summary.app_rss_bytes = summary.app_rss_bytes.saturating_add(snapshot.rss_bytes);
+        if let Some(value) = snapshot.cpu_percent {
+            cpu += value;
+            cpu_seen = true;
         }
     }
     summary.rss_bytes = summary

@@ -20,8 +20,10 @@ const PATH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
 // 각 split leaf가 독립 터미널이 되는 패널형 구조. 헤더는 한 줄로 얇게 유지하고
 // PTY는 외곽 카드 여백 없이 패널 면을 채운다.
-const TERMINAL_PANE_HEADER_HEIGHT: f32 = 30.0;
-const TERMINAL_STREAM_PADDING: f32 = 6.0;
+const TERMINAL_PANE_HEADER_HEIGHT: f32 = 34.0;
+const TERMINAL_STREAM_LEFT_PADDING: f32 = 3.0;
+const TERMINAL_STREAM_RIGHT_PADDING: f32 = 3.0;
+const TERMINAL_STREAM_VERTICAL_PADDING: f32 = 6.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TerminalPaneLayout {
@@ -37,11 +39,12 @@ fn terminal_pane_layout(rect: egui::Rect) -> TerminalPaneLayout {
         egui::pos2(rect.right(), rect.top() + header_height),
     );
     let surface = egui::Rect::from_min_max(egui::pos2(rect.left(), header.bottom()), rect.max);
-    let pad_x = TERMINAL_STREAM_PADDING.min(surface.width().max(0.0) * 0.25);
-    let pad_y = TERMINAL_STREAM_PADDING.min(surface.height().max(0.0) * 0.25);
+    let pad_left = TERMINAL_STREAM_LEFT_PADDING.min(surface.width().max(0.0) * 0.25);
+    let pad_right = TERMINAL_STREAM_RIGHT_PADDING.min(surface.width().max(0.0) * 0.25);
+    let pad_y = TERMINAL_STREAM_VERTICAL_PADDING.min(surface.height().max(0.0) * 0.25);
     let content = egui::Rect::from_min_max(
-        egui::pos2(surface.left() + pad_x, surface.top() + pad_y),
-        egui::pos2(surface.right() - pad_x, surface.bottom() - pad_y),
+        egui::pos2(surface.left() + pad_left, surface.top() + pad_y),
+        egui::pos2(surface.right() - pad_right, surface.bottom() - pad_y),
     );
     TerminalPaneLayout {
         header,
@@ -88,19 +91,19 @@ fn paint_terminal_toolbar_icon(
     let center = rect.center();
     match icon {
         TerminalToolbarIcon::Search => {
-            let lens = center + egui::vec2(-1.5, -1.5);
-            painter.circle_stroke(lens, 5.0, stroke);
+            let lens = center + egui::vec2(-2.0, -2.0);
+            painter.circle_stroke(lens, 6.5, stroke);
             painter.line_segment(
-                [lens + egui::vec2(3.8, 3.8), lens + egui::vec2(7.0, 7.0)],
+                [lens + egui::vec2(4.8, 4.8), lens + egui::vec2(9.0, 9.0)],
                 stroke,
             );
         }
         TerminalToolbarIcon::NewTerminal => {
-            let body = egui::Rect::from_center_size(center, egui::vec2(18.0, 14.0));
+            let body = egui::Rect::from_center_size(center, egui::vec2(20.0, 16.0));
             painter.rect_stroke(body, 1.5, stroke, egui::StrokeKind::Inside);
             painter.line_segment(
                 [
-                    center + egui::vec2(-5.5, -2.5),
+                    center + egui::vec2(-6.0, -3.0),
                     center + egui::vec2(-2.5, 0.0),
                 ],
                 stroke,
@@ -108,17 +111,17 @@ fn paint_terminal_toolbar_icon(
             painter.line_segment(
                 [
                     center + egui::vec2(-2.5, 0.0),
-                    center + egui::vec2(-5.5, 2.5),
+                    center + egui::vec2(-6.0, 3.0),
                 ],
                 stroke,
             );
             painter.line_segment(
-                [center + egui::vec2(0.0, 3.0), center + egui::vec2(5.0, 3.0)],
+                [center + egui::vec2(0.0, 4.0), center + egui::vec2(6.0, 4.0)],
                 stroke,
             );
         }
         TerminalToolbarIcon::SplitColumns | TerminalToolbarIcon::SplitRows => {
-            let body = egui::Rect::from_center_size(center, egui::vec2(16.0, 16.0));
+            let body = egui::Rect::from_center_size(center, egui::vec2(18.0, 18.0));
             painter.rect_stroke(body, 1.5, stroke, egui::StrokeKind::Inside);
             match icon {
                 TerminalToolbarIcon::SplitColumns => {
@@ -1317,21 +1320,88 @@ impl WorkspaceUi {
         client: &dyn RuntimeClient,
         catalog: &i18n::Catalog,
     ) {
+        let osc = self.session_osc_title(pane.session_id);
+        let full_title =
+            self.resolve_session_title(&pane.title, pane.session_id, osc.as_deref(), catalog);
+        let font = egui::FontId::proportional(13.0);
+        let full_title_width = ui
+            .painter()
+            .layout_no_wrap(full_title.clone(), font.clone(), egui::Color32::WHITE)
+            .size()
+            .x;
+        let toolbar_button = 20.0;
+        let toolbar_gap = 2.0;
+        let toolbar_icons = [
+            TerminalToolbarIcon::Search,
+            TerminalToolbarIcon::NewTerminal,
+            TerminalToolbarIcon::SplitColumns,
+            TerminalToolbarIcon::SplitRows,
+        ];
+        let title_left = header.left() + 17.0;
+
+        // 우측 도구 4개를 모두 표시하던 기존 제목 폭을 기준으로 실제 글자 수를 구한 뒤
+        // 10자를 더 허용한다. 추가 폭이 필요하면 기존 규칙대로 왼쪽 도구부터 숨긴다.
+        let full_toolbar_width = toolbar_button * toolbar_icons.len() as f32
+            + toolbar_gap * toolbar_icons.len().saturating_sub(1) as f32;
+        let original_title_width =
+            (header.right() - 4.0 - full_toolbar_width - 24.0 - title_left).max(0.0);
+        let full_char_count = full_title.chars().count();
+        let original_char_capacity = if full_title_width > 0.0 {
+            ((full_char_count as f32 * original_title_width / full_title_width).floor() as usize)
+                .min(full_char_count)
+        } else {
+            full_char_count
+        };
+        let title_char_limit = (original_char_capacity + 10).min(full_char_count);
+        let title = if title_char_limit < full_char_count {
+            let mut shortened: String = full_title.chars().take(title_char_limit).collect();
+            shortened.push('…');
+            shortened
+        } else {
+            full_title
+        };
+        let title_width = ui
+            .painter()
+            .layout_no_wrap(title.clone(), font.clone(), egui::Color32::WHITE)
+            .size()
+            .x;
+
+        // 제목과 닫기 버튼을 먼저 온전히 확보한다. 분할 pane이 좁아지면 우측 도구를
+        // 왼쪽부터 단계적으로 숨겨 제목 글자가 중간에서 잘리는 일을 막는다.
+        let toolbar_available = (header.width() - title_width - 61.0).max(0.0);
+        let visible_toolbar = (((toolbar_available + toolbar_gap) / (toolbar_button + toolbar_gap))
+            .floor() as usize)
+            .min(toolbar_icons.len());
+        let toolbar_width = toolbar_button * visible_toolbar as f32
+            + toolbar_gap * visible_toolbar.saturating_sub(1) as f32;
+        let toolbar_left = header.right() - 4.0 - toolbar_width;
+        let center_y = header.center().y;
+
+        let close_center_x = (title_left + title_width + 11.0)
+            .min(toolbar_left - 11.0)
+            .max(title_left + 8.0);
+        let close = egui::Rect::from_center_size(
+            egui::pos2(close_center_x, center_y),
+            egui::vec2(20.0, 20.0),
+        );
+        let tab_right = (close.right() + 6.0)
+            .min(toolbar_left - 4.0)
+            .max(header.left());
+        let tab = egui::Rect::from_min_max(header.min, egui::pos2(tab_right, header.bottom()));
+
         let header_fill = egui::Color32::from_rgb(0x17, 0x17, 0x1c);
+        let active_tab_fill = egui::Color32::from_rgb(0x1b, 0x29, 0x33);
         let border = egui::Color32::from_rgb(0x2a, 0x2a, 0x33);
+        let status_green = egui::Color32::from_rgb(0x55, 0xc8, 0x79);
         ui.painter().rect_filled(header, 0.0, header_fill);
+        if focused {
+            ui.painter().rect_filled(tab, 0.0, active_tab_fill);
+        }
         ui.painter().hline(
             header.x_range(),
             header.bottom() - 0.5,
             egui::Stroke::new(1.0, border),
         );
-        if focused {
-            ui.painter().hline(
-                header.x_range(),
-                header.top() + 0.5,
-                egui::Stroke::new(1.5, ui.visuals().selection.stroke.color),
-            );
-        }
 
         let header_response = ui.interact(
             header,
@@ -1343,74 +1413,55 @@ impl WorkspaceUi {
         }
         self.pane_context_menu(&header_response, &pane.id, config, client, catalog);
 
-        let osc = self.session_osc_title(pane.session_id);
-        let title =
-            self.resolve_session_title(&pane.title, pane.session_id, osc.as_deref(), catalog);
-        let font = egui::FontId::proportional(12.0);
-        let title_width = ui
-            .painter()
-            .layout_no_wrap(title.clone(), font.clone(), egui::Color32::WHITE)
-            .size()
-            .x;
-        let toolbar_button = 24.0;
-        let toolbar_gap = 2.0;
-        let toolbar_icons = [
-            TerminalToolbarIcon::Search,
-            TerminalToolbarIcon::NewTerminal,
-            TerminalToolbarIcon::SplitColumns,
-            TerminalToolbarIcon::SplitRows,
-        ];
-        let visible_toolbar = (((header.width() - 84.0) / (toolbar_button + toolbar_gap)).floor()
-            as usize)
-            .clamp(1, toolbar_icons.len());
-        let toolbar_width = toolbar_button * visible_toolbar as f32
-            + toolbar_gap * visible_toolbar.saturating_sub(1) as f32;
-        let toolbar_left = header.right() - 4.0 - toolbar_width;
-        let center_y = header.center().y;
+        let status_color = if focused {
+            status_green
+        } else {
+            egui::Color32::from_rgb(0x72, 0x76, 0x80)
+        };
+        ui.painter()
+            .circle_filled(egui::pos2(header.left() + 7.0, center_y), 4.0, status_color);
 
-        let terminal_mark = egui::Rect::from_center_size(
-            egui::pos2(header.left() + 14.0, center_y),
-            egui::vec2(20.0, 20.0),
-        );
-        paint_terminal_toolbar_icon(
-            ui.painter(),
-            terminal_mark,
-            TerminalToolbarIcon::NewTerminal,
-            egui::Color32::from_rgb(0xc8, 0xcc, 0xd2),
-        );
-
-        let title_left = header.left() + 29.0;
-        let close_center_x = (title_left + title_width + 12.0)
-            .min(toolbar_left - 12.0)
-            .max(title_left + 8.0);
-        let close = egui::Rect::from_center_size(
-            egui::pos2(close_center_x, center_y),
-            egui::vec2(22.0, 22.0),
-        );
         let title_right = (close.left() - 3.0).max(title_left);
         let title_clip = egui::Rect::from_min_max(
             egui::pos2(title_left, header.top()),
             egui::pos2(title_right, header.bottom()),
         );
-        let title_galley =
-            ui.painter()
-                .layout_no_wrap(title, font, egui::Color32::from_rgb(0xd7, 0xd8, 0xdb));
+        let title_color = if focused {
+            egui::Color32::from_rgb(0xee, 0xef, 0xf1)
+        } else {
+            egui::Color32::from_rgb(0xa6, 0xaa, 0xb2)
+        };
+        let mut title_job = egui::text::LayoutJob::single_section(
+            title,
+            egui::TextFormat {
+                font_id: font,
+                color: title_color,
+                ..Default::default()
+            },
+        );
+        title_job.wrap = egui::text::TextWrapping {
+            max_width: title_clip.width().max(0.0),
+            max_rows: 1,
+            break_anywhere: true,
+            overflow_character: Some('…'),
+        };
+        let title_galley = ui.painter().layout_job(title_job);
         ui.painter().with_clip_rect(title_clip).galley(
             egui::pos2(title_clip.left(), center_y - title_galley.size().y / 2.0),
             title_galley,
-            egui::Color32::from_rgb(0xd7, 0xd8, 0xdb),
+            title_color,
         );
         let close_response = ui.interact(
             close,
             egui::Id::new(("terminal_close_tab", &pane.id)),
             egui::Sense::click(),
         );
-        let close_color = if close_response.hovered() {
-            egui::Color32::from_rgb(0xf2, 0xf2, 0xf2)
+        let close_color = if close_response.hovered() || close_response.has_focus() {
+            status_green
         } else {
-            egui::Color32::from_rgb(0xc8, 0xcc, 0xd2)
+            egui::Color32::from_rgb(0xf2, 0xf2, 0xf2)
         };
-        let d = 4.5;
+        let d = 4.0;
         ui.painter().line_segment(
             [
                 close.center() + egui::vec2(-d, -d),
@@ -2708,6 +2759,34 @@ impl WorkspaceUi {
                 }
                 ui.close();
             }
+            // 공백 정리 후 붙여넣기 (2026-07-18 사용자): 코드블록/문서에서 복사한
+            // 명령은 앞 들여쓰기·끝 줄바꿈을 달고 와서, claude/codex `!` 셸 모드에
+            // 그대로 넣으면 인식이 어긋나거나 즉시 실행된다. 앞뒤 공백(끝 줄바꿈
+            // 포함)만 잘라 넣는다 — 내부 줄바꿈은 보존(bracketed paste가 감싼다).
+            // 기본 붙여넣기는 원문 보존 계약이라 별도 항목으로 둔다.
+            if let Some(paste_session) = session
+                && ui
+                    .button(catalog.t("workspace.menu.paste_trimmed", &[]))
+                    .clicked()
+            {
+                match crate::ui::clipboard_image::read_clipboard_text() {
+                    Some(text) => {
+                        let bytes = terminal_text_paste_bytes(
+                            text.trim(),
+                            self.session_bracketed_paste(paste_session),
+                        );
+                        self.send(
+                            client,
+                            RuntimeCommand::WriteInput {
+                                session: paste_session,
+                                bytes,
+                            },
+                        );
+                    }
+                    None => tracing::warn!("공백 정리 붙여넣기: 클립보드에 텍스트 없음"),
+                }
+                ui.close();
+            }
             if ui
                 .button(catalog.t("workspace.split_horizontal", &[]))
                 .clicked()
@@ -3821,20 +3900,31 @@ mod tests {
     use terminal::{CursorShape, CursorSnapshot, TerminalCell};
 
     #[test]
-    fn 분할_터미널은_30pt_헤더와_6pt_본문여백을_유지한다() {
+    fn 분할_터미널은_34pt_헤더와_좌우3_상하6_본문여백을_유지한다() {
+        // 상수 조정(헤더 30→34pt, 좌우 여백 6→3pt — 2026-07-18 디자인 트랙)에 맞춘
+        // 기대값. 상수의 단일 원천은 TERMINAL_PANE_HEADER_HEIGHT/STREAM_*_PADDING.
         let layout = terminal_pane_layout(egui::Rect::from_min_size(
             egui::Pos2::ZERO,
             egui::vec2(589.0, 358.0),
         ));
-        assert_eq!(layout.header.height(), 30.0);
+        assert_eq!(layout.header.height(), TERMINAL_PANE_HEADER_HEIGHT);
         assert_eq!(layout.surface.left(), 0.0);
         assert_eq!(layout.surface.right(), 589.0);
-        assert_eq!(layout.surface.top(), 30.0);
+        assert_eq!(layout.surface.top(), TERMINAL_PANE_HEADER_HEIGHT);
         assert_eq!(layout.surface.bottom(), 358.0);
-        assert_eq!(layout.content.left(), 6.0);
-        assert_eq!(layout.content.top(), 36.0);
-        assert_eq!(layout.content.right(), 583.0);
-        assert_eq!(layout.content.bottom(), 352.0);
+        assert_eq!(layout.content.left(), TERMINAL_STREAM_LEFT_PADDING);
+        assert_eq!(
+            layout.content.top(),
+            TERMINAL_PANE_HEADER_HEIGHT + TERMINAL_STREAM_VERTICAL_PADDING
+        );
+        assert_eq!(
+            layout.content.right(),
+            589.0 - TERMINAL_STREAM_RIGHT_PADDING
+        );
+        assert_eq!(
+            layout.content.bottom(),
+            358.0 - TERMINAL_STREAM_VERTICAL_PADDING
+        );
     }
 
     #[test]
@@ -3863,14 +3953,26 @@ mod tests {
             let layout = terminal_pane_layout(slot);
             assert_eq!(layout.header.left(), slot.left());
             assert_eq!(layout.header.right(), slot.right());
-            assert_eq!(layout.header.height(), 30.0);
+            assert_eq!(layout.header.height(), TERMINAL_PANE_HEADER_HEIGHT);
             assert_eq!(layout.surface.left(), slot.left());
             assert_eq!(layout.surface.right(), slot.right());
             assert_eq!(layout.surface.bottom(), slot.bottom());
-            assert_eq!(layout.content.left() - layout.surface.left(), 6.0);
-            assert_eq!(layout.content.top() - layout.surface.top(), 6.0);
-            assert_eq!(layout.surface.right() - layout.content.right(), 6.0);
-            assert_eq!(layout.surface.bottom() - layout.content.bottom(), 6.0);
+            assert_eq!(
+                layout.content.left() - layout.surface.left(),
+                TERMINAL_STREAM_LEFT_PADDING
+            );
+            assert_eq!(
+                layout.content.top() - layout.surface.top(),
+                TERMINAL_STREAM_VERTICAL_PADDING
+            );
+            assert_eq!(
+                layout.surface.right() - layout.content.right(),
+                TERMINAL_STREAM_RIGHT_PADDING
+            );
+            assert_eq!(
+                layout.surface.bottom() - layout.content.bottom(),
+                TERMINAL_STREAM_VERTICAL_PADDING
+            );
         }
     }
 

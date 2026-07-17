@@ -101,7 +101,13 @@ impl AgentTerminalUi {
         action
     }
 
-    pub fn status_bar(&self, ui: &mut egui::Ui, rows: &[ActivityWorkspaceRow], waiting: usize) {
+    pub fn status_bar(
+        &self,
+        ui: &mut egui::Ui,
+        rows: &[ActivityWorkspaceRow],
+        waiting: usize,
+        mcp_count: usize,
+    ) {
         let totals = workspace_totals(rows);
         let cpu = if totals.cpu_seen {
             format!("CPU {:.1}%", totals.cpu_percent)
@@ -119,6 +125,10 @@ impl AgentTerminalUi {
                 ui.weak(format!("워크스페이스 {}", totals.workspaces));
                 ui.separator();
                 ui.weak(format!("세션 {}", totals.sessions));
+                ui.separator();
+                // 등록·활성화된 MCP 서버 수 (2026-07-18 사용자 요청).
+                ui.weak(format!("MCP {mcp_count}"))
+                    .on_hover_text("활성화된 MCP 서버 수 (커넥터 센터에서 관리)");
                 if waiting > 0 {
                     ui.separator();
                     ui.colored_label(
@@ -474,7 +484,11 @@ fn workspace_totals(rows: &[ActivityWorkspaceRow]) -> WorkspaceTotals {
         workspaces: rows.len(),
         ..WorkspaceTotals::default()
     };
-    let mut app_pids = std::collections::HashSet::new();
+    // 앱 스냅샷은 pid별 **최신 샘플**을 고른다 — 워크스페이스 워커마다 2초 주기
+    // 샘플 시점이 제각각이라, 먼저 만난 행을 쓰면 다른 표시(구 상단 표시·설정)와
+    // 수 MB 어긋났다(2026-07-18 사용자 보고 — 표시 수치 불일치의 원인).
+    let mut app_latest: std::collections::HashMap<u32, runtime::ProcessResourceSnapshot> =
+        std::collections::HashMap::new();
     for row in rows {
         match row.state {
             ActivityWorkspaceState::Active => totals.active += 1,
@@ -483,14 +497,15 @@ fn workspace_totals(rows: &[ActivityWorkspaceRow]) -> WorkspaceTotals {
         }
         totals.sessions += row.session_count;
         totals.warnings += usize::from(workspace_has_warning(row));
-        if let Some(resource) = row.resource
-            && app_pids.insert(resource.pid)
-        {
-            totals.app_rss_bytes = totals.app_rss_bytes.saturating_add(resource.rss_bytes);
-            if let Some(cpu) = resource.cpu_percent {
-                totals.cpu_percent += cpu;
-                totals.cpu_seen = true;
-            }
+        if let Some(resource) = row.resource {
+            app_latest
+                .entry(resource.pid)
+                .and_modify(|kept| {
+                    if resource.sampled_at_ms > kept.sampled_at_ms {
+                        *kept = resource;
+                    }
+                })
+                .or_insert(resource);
         }
         for resource in &row.session_resources {
             totals.session_rss_bytes = totals.session_rss_bytes.saturating_add(resource.rss_bytes);
@@ -498,6 +513,13 @@ fn workspace_totals(rows: &[ActivityWorkspaceRow]) -> WorkspaceTotals {
                 totals.cpu_percent += cpu;
                 totals.cpu_seen = true;
             }
+        }
+    }
+    for snapshot in app_latest.values() {
+        totals.app_rss_bytes = totals.app_rss_bytes.saturating_add(snapshot.rss_bytes);
+        if let Some(cpu) = snapshot.cpu_percent {
+            totals.cpu_percent += cpu;
+            totals.cpu_seen = true;
         }
     }
     totals

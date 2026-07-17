@@ -153,16 +153,28 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
     let (Some(db_path), Some(event)) = (db_path, event) else {
         return Ok(());
     };
+    // payload는 아래 바인딩 기록에도 쓰이므로 한 번만 파싱한다.
+    let parsed = serde_json::from_str::<serde_json::Value>(&payload).ok();
     if let Ok(db) = storage::Db::open(&db_path) {
         // needsInput 이벤트만 대기 상태를 바꾼다. session-start 등은 바인딩만 기록.
         if event == "needs-input" || event == "clear" {
-            let _ = db.set_agent_needs_input(&session_key, event == "needs-input");
+            // claude Notification hook은 payload.message에 대기 사유를 싣는다
+            // ("Claude needs your permission to use Bash"). 벨 인박스가 이 문구를
+            // 헤드라인으로 쓴다 — 로그 tail은 TUI 재그리기라 상태줄이 섞인다(2026-07-17).
+            // 문구를 안 싣는 에이전트는 None → 인박스가 tail로 폴백한다.
+            let message = parsed
+                .as_ref()
+                .and_then(|v| v.get("message"))
+                .and_then(|m| m.as_str())
+                .map(str::trim)
+                .filter(|m| !m.is_empty());
+            let _ = db.set_agent_needs_input(&session_key, event == "needs-input", message);
         } else if event == "turn-done" {
             // Stop hook = 턴 완료 → 상태 레일 '완료(바이올렛)' 트랜지언트 트리거.
             let _ = db.set_agent_turn_done(&session_key);
         }
         // 어떤 이벤트든 payload에 (session_id, transcript_path)가 오면 최신 바인딩으로 갱신.
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
+        if let Some(v) = parsed.as_ref() {
             let sid = v.get("session_id").and_then(|x| x.as_str());
             let path = v.get("transcript_path").and_then(|x| x.as_str());
             if let (Some(sid), Some(path)) = (sid, path) {

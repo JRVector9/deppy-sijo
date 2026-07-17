@@ -13,10 +13,14 @@ use std::sync::{Arc, Mutex};
 
 use runtime::{MuxSnapshot, SessionId};
 
-/// 로그 tail 읽기 상한 — 4KB만 읽는다(계획서 §PR-N3, UI 스레드 블로킹 방지).
-const PREVIEW_TAIL_BYTES: u64 = 4096;
-/// 미리보기 줄 수 — 1차는 상수로 고정한다(2026-07-17 확정 사항, 설정화하지 않음).
-const PREVIEW_LINES: usize = 3;
+/// 로그 tail 읽기 상한 — 화면 한 장(80×24 기준 ~2KB)을 여유 있게 담되 UI가 부담되지
+/// 않는 선. 줄 수를 12로 늘리면서 함께 키웠다(4KB면 재그리기 반복 탓에 12줄이 안 찰 수 있다).
+const PREVIEW_TAIL_BYTES: u64 = 16_384;
+/// 미리보기 줄 수 — claude/codex는 화면을 통째로 다시 그려 로그에 남기므로, tail
+/// 마지막 몇 줄은 **항상 상태줄**이다(2026-07-17 실측: 3줄일 때 `⏵⏵ auto mode on`만
+/// 보이고 정작 질문이 안 보였다). 승인 프롬프트 박스는 화면 하단이라 12줄이면
+/// 박스째 들어온다. 아래 last_lines가 빈 줄·연속 중복을 접어 실제 표시는 더 짧다.
+const PREVIEW_LINES: usize = 12;
 /// 미리보기 캐시 TTL — ui/workspace.rs의 hover_cwd(PATH_CACHE_TTL=2s)와 같은
 /// stale-while-revalidate 관례. tail은 lsof보다 무거운 파일 IO라 조금 더 넉넉히 둔다.
 const PREVIEW_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(4);
@@ -29,6 +33,11 @@ pub struct WaitingCard {
     pub session: SessionId,
     pub workspace_name: String,
     pub session_title: String,
+    /// hook이 보고한 대기 사유 — claude Notification payload의 message
+    /// ("Claude needs your permission to use Bash"). 에이전트가 직접 말한 "무엇을
+    /// 묻는지"라 아래 tail보다 정확하다(tail은 TUI 재그리기라 상태줄이 섞인다).
+    /// 문구를 안 싣는 에이전트는 None — 그 경우 tail만 보인다.
+    pub headline: Option<String>,
     /// 화면 마지막 N줄(비어있지 않은 줄만). 조회 실패/미지원이면 None — 미리보기만
     /// 비고 카드(버튼)는 정상 동작한다(계획서 §PR-N3 폴백 규약).
     pub preview: Option<Vec<String>>,
@@ -190,6 +199,20 @@ impl InboxWaitingUi {
         card: &WaitingCard,
         action: &mut Option<WaitingAction>,
     ) {
+        // 승인 카드(inbox_approvals)와 같은 박스로 감싼다 — 카드가 여러 장일 때
+        // 경계가 없으면 어느 미리보기가 어느 세션 것인지 뭉쳐 보인다(2026-07-17 사용자).
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            self.render_card_body(ui, catalog, card, action);
+        });
+    }
+
+    fn render_card_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        catalog: &i18n::Catalog,
+        card: &WaitingCard,
+        action: &mut Option<WaitingAction>,
+    ) {
         ui.horizontal(|ui| {
             ui.label("⏳");
             ui.label(
@@ -198,6 +221,11 @@ impl InboxWaitingUi {
                     .strong(),
             );
         });
+        // 헤드라인(hook이 말한 대기 사유)이 있으면 tail보다 위에, 눈에 띄게 — 이게
+        // "무엇을 승인/응답하는지"의 답이다. tail은 그 아래에서 선택지 번호를 보여준다.
+        if let Some(headline) = &card.headline {
+            ui.add(egui::Label::new(egui::RichText::new(headline).size(12.0)).wrap());
+        }
         render_preview(ui, catalog, card.preview.as_deref());
         ui.horizontal(|ui| {
             if ui.small_button("y").clicked() {
@@ -222,7 +250,9 @@ impl InboxWaitingUi {
                     // 입력칸으로 밀린다(다른 세션 오입력, 2026-07-17 리뷰 P2) —
                     // 세션 고유 Id로 고정한다.
                     .id_salt(("inbox_waiting_input", &card.workspace_id, card.session.0))
-                    .desired_width(72.0)
+                    // 남는 폭을 [이동→] 몫만 남기고 입력칸에 준다 — 72px 고정일 때
+                    // hint("답장 후 Enter")조차 잘렸다(2026-07-17 사용자).
+                    .desired_width((ui.available_width() - 72.0).max(96.0))
                     .hint_text(catalog.t("inbox.waiting.answer_hint", &[])),
             );
             let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -313,15 +343,27 @@ pub fn parse_session_key(key: &str) -> Option<(String, SessionId)> {
 }
 
 /// 텍스트의 마지막 n줄(비어있지 않은 줄만, 원래 순서 유지) — 로그 tail 미리보기 추출.
+///
+/// **연속 중복은 접는다**: TUI가 상태줄을 주기적으로 다시 그려 같은 줄이 로그에 연달아
+/// 쌓인다(2026-07-17 실측 — `⏵⏵ auto mode on`이 반복되며 12줄을 다 먹었다). 접지 않으면
+/// 줄 수를 늘려도 상태줄만 늘어난다.
 /// 순수 함수(유닛 테스트 대상) — 파일 IO는 read_tail_lines가 감싼다.
 fn last_lines(text: &str, n: usize) -> Vec<String> {
-    let mut lines: Vec<String> = text
-        .lines()
-        .rev()
-        .filter(|line| !line.trim().is_empty())
-        .take(n)
-        .map(str::to_owned)
-        .collect();
+    let mut lines: Vec<String> = Vec::with_capacity(n);
+    for line in text.lines().rev() {
+        let trimmed = line.trim_end();
+        if trimmed.trim().is_empty() {
+            continue;
+        }
+        // 역순 순회라 "직전에 담은 것"이 로그상 바로 다음 줄 — 연속 중복 판정에 맞다.
+        if lines.last().map(String::as_str) == Some(trimmed) {
+            continue;
+        }
+        lines.push(trimmed.to_owned());
+        if lines.len() == n {
+            break;
+        }
+    }
     lines.reverse();
     lines
 }
@@ -451,9 +493,15 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if let Some(lines) = ui.preview(&ctx, &dir, session_uuid) {
+                // PREVIEW_LINES=12라 4줄 파일은 전부 나온다(빈 줄만 제외).
                 assert_eq!(
                     lines,
-                    vec!["line2".to_owned(), "line3".to_owned(), "line4".to_owned()]
+                    vec![
+                        "line1".to_owned(),
+                        "line2".to_owned(),
+                        "line3".to_owned(),
+                        "line4".to_owned()
+                    ]
                 );
                 break;
             }
@@ -496,6 +544,39 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    /// 2026-07-17 실측 회귀: claude가 상태줄을 주기적으로 다시 그려 같은 줄이 로그에
+    /// 연달아 쌓인다 — 접지 않으면 줄 수를 늘려도 `⏵⏵ auto mode on`만 12줄 나온다.
+    #[test]
+    fn last_lines_연속_중복_상태줄을_접어_질문이_보이게_한다() {
+        let log = "Do you want to proceed?\n\
+                   1. Yes\n\
+                   2. No\n\
+                   auto mode on\n\
+                   auto mode on\n\
+                   auto mode on\n\
+                   auto mode on\n";
+        assert_eq!(
+            last_lines(log, 4),
+            vec![
+                "Do you want to proceed?".to_owned(),
+                "1. Yes".to_owned(),
+                "2. No".to_owned(),
+                "auto mode on".to_owned(),
+            ],
+            "반복 상태줄은 한 줄로 접혀 질문·선택지가 살아남아야 한다"
+        );
+    }
+
+    /// 떨어져 있는 같은 줄은 접지 않는다 — 연속만 중복으로 본다(맥락 유지).
+    #[test]
+    fn last_lines_떨어진_같은_줄은_접지_않는다() {
+        let log = "a\nb\na\n";
+        assert_eq!(
+            last_lines(log, 3),
+            vec!["a".to_owned(), "b".to_owned(), "a".to_owned()]
+        );
     }
 
     #[test]
@@ -551,6 +632,7 @@ mod tests {
             session: SessionId(session),
             workspace_name: "proj".to_owned(),
             session_title: "codex".to_owned(),
+            headline: None,
             preview: None,
         }
     }

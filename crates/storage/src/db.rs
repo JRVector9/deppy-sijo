@@ -252,6 +252,14 @@ CREATE TABLE structured_threads (
 CREATE INDEX idx_structured_threads_workspace_recency
     ON structured_threads(workspace_id, favorite DESC, updated_at DESC);
 ",
+    // v24: hook이 보고한 대기 사유 문구 — claude Notification hook payload의 `message`
+    // ("Claude needs your permission to use Bash"). 벨 인박스 대기 카드의 헤드라인으로
+    // 쓴다: 로그 tail은 TUI가 화면을 다시 그린 흔적이라 상태줄이 섞이는데, 이 문구는
+    // 에이전트가 직접 말한 "무엇을 묻는지"다(2026-07-17).
+    // NULL 허용 — 기존 행과 message를 안 보내는 에이전트(codex 등)는 그대로 tail로 폴백한다.
+    "
+ALTER TABLE agent_needs_input ADD COLUMN message TEXT;
+",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -964,26 +972,35 @@ impl Db {
         Ok(rows)
     }
 
-    pub fn set_agent_needs_input(&self, session_key: &str, waiting: bool) -> anyhow::Result<()> {
+    /// needsInput 기록. `message`는 hook이 보고한 대기 사유 문구(claude Notification의
+    /// payload.message) — 없으면 None. clear(waiting=false) 시에는 문구도 함께 지운다
+    /// (해소된 질문이 다음 대기에 되살아나면 안 된다).
+    pub fn set_agent_needs_input(
+        &self,
+        session_key: &str,
+        waiting: bool,
+        message: Option<&str>,
+    ) -> anyhow::Result<()> {
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO agent_needs_input (session_key, waiting, updated_at)
-                 VALUES (?1, ?2, CAST(strftime('%s','now') AS INTEGER))",
-                (session_key, waiting as i64),
+                "INSERT OR REPLACE INTO agent_needs_input
+                     (session_key, waiting, updated_at, message)
+                 VALUES (?1, ?2, CAST(strftime('%s','now') AS INTEGER), ?3)",
+                (session_key, waiting as i64, message.filter(|_| waiting)),
             )
             .with_context(|| format!("needsInput 저장 실패: {session_key}"))?;
         Ok(())
     }
 
-    /// 현재 입력 대기(waiting) 중인 세션 키 목록. stale(1시간 초과)은 제외해 죽은 hook의
-    /// 잔여가 영원히 주황으로 남지 않게 한다.
-    pub fn list_waiting_sessions(&self) -> anyhow::Result<Vec<String>> {
+    /// 현재 입력 대기(waiting) 중인 세션 키 + hook이 보고한 사유 문구. stale(1시간 초과)은
+    /// 제외해 죽은 hook의 잔여가 영원히 주황으로 남지 않게 한다.
+    pub fn list_waiting_sessions(&self) -> anyhow::Result<Vec<(String, Option<String>)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT session_key FROM agent_needs_input
+            "SELECT session_key, message FROM agent_needs_input
              WHERE waiting = 1
                AND updated_at > CAST(strftime('%s','now') AS INTEGER) - 3600",
         )?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -1993,17 +2010,49 @@ mod tests {
     #[test]
     fn agent_needs_input_set_clear_list() {
         let db = Db::open_in_memory().unwrap();
-        db.set_agent_needs_input("pane-1", true).unwrap();
-        db.set_agent_needs_input("pane-2", true).unwrap();
-        db.set_agent_needs_input("pane-3", false).unwrap();
-        let mut waiting = db.list_waiting_sessions().unwrap();
+        db.set_agent_needs_input("pane-1", true, None).unwrap();
+        db.set_agent_needs_input("pane-2", true, None).unwrap();
+        db.set_agent_needs_input("pane-3", false, None).unwrap();
+        let mut waiting: Vec<String> = db
+            .list_waiting_sessions()
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
         waiting.sort();
         assert_eq!(waiting, vec!["pane-1".to_string(), "pane-2".to_string()]);
         // clear → 목록에서 빠짐
-        db.set_agent_needs_input("pane-1", false).unwrap();
+        db.set_agent_needs_input("pane-1", false, None).unwrap();
         assert_eq!(
             db.list_waiting_sessions().unwrap(),
-            vec!["pane-2".to_string()]
+            vec![("pane-2".to_string(), None)]
+        );
+    }
+
+    /// hook이 보고한 대기 사유 문구는 그대로 실려 나오고, clear 시 함께 지워진다 —
+    /// 해소된 질문이 다음 대기에 되살아나면 안 된다(2026-07-17).
+    #[test]
+    fn agent_needs_input_message_저장과_clear시_소거() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_agent_needs_input(
+            "pane-1",
+            true,
+            Some("Claude needs your permission to use Bash"),
+        )
+        .unwrap();
+        assert_eq!(
+            db.list_waiting_sessions().unwrap(),
+            vec![(
+                "pane-1".to_string(),
+                Some("Claude needs your permission to use Bash".to_string())
+            )]
+        );
+        // clear 후 다시 대기 — 이전 문구가 남아 있으면 안 된다.
+        db.set_agent_needs_input("pane-1", false, None).unwrap();
+        db.set_agent_needs_input("pane-1", true, None).unwrap();
+        assert_eq!(
+            db.list_waiting_sessions().unwrap(),
+            vec![("pane-1".to_string(), None)]
         );
     }
 
@@ -2025,11 +2074,11 @@ mod tests {
         assert!(db.list_turn_done_sessions().unwrap().is_empty());
         // needs-input(REPLACE)이 turn_done을 자연 리셋
         db.set_agent_turn_done("pane-2").unwrap();
-        db.set_agent_needs_input("pane-2", true).unwrap();
+        db.set_agent_needs_input("pane-2", true, None).unwrap();
         assert!(db.list_turn_done_sessions().unwrap().is_empty());
         assert_eq!(
             db.list_waiting_sessions().unwrap(),
-            vec!["pane-2".to_string()]
+            vec![("pane-2".to_string(), None)]
         );
     }
 

@@ -690,6 +690,15 @@ impl WorkspaceUi {
         self.agent_info.get(&session).map(agent_info_line)
     }
 
+    /// 세션에서 감지된 에이전트 종류 — 셸이거나 미감지면 None.
+    /// warm으로 내려가도 agent_info는 마지막 감지값을 유지한다(위 agent_line_for 주석).
+    pub fn agent_provider_for(
+        &self,
+        session: SessionId,
+    ) -> Option<crate::agent_surface::AgentProvider> {
+        self.agent_info.get(&session).map(|d| d.kind.into())
+    }
+
     pub fn agent_providers(
         &self,
     ) -> std::collections::HashMap<SessionId, crate::agent_surface::AgentProvider> {

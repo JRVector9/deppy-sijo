@@ -55,6 +55,7 @@ pub fn render(
     catalog: &i18n::Catalog,
     pending: &[PendingApprovalRow],
     workspace_names: &HashMap<String, String>,
+    session_titles: &HashMap<(String, SessionId), String>,
 ) -> ApprovalCardsAction {
     let mut action = ApprovalCardsAction::default();
     if pending.is_empty() {
@@ -63,7 +64,14 @@ pub fn render(
     section_label(ui, &catalog.t("inbox.approval.section", &[]));
     ui.add_space(2.0);
     for row in pending.iter().take(MAX_CARDS) {
-        render_card(ui, catalog, row, workspace_names, &mut action);
+        render_card(
+            ui,
+            catalog,
+            row,
+            workspace_names,
+            session_titles,
+            &mut action,
+        );
     }
     let hidden = pending.len().saturating_sub(MAX_CARDS);
     if hidden > 0 {
@@ -84,14 +92,25 @@ fn render_card(
     catalog: &i18n::Catalog,
     row: &PendingApprovalRow,
     workspace_names: &HashMap<String, String>,
+    session_titles: &HashMap<(String, SessionId), String>,
     action: &mut ApprovalCardsAction,
 ) {
     let session_key = row.pane_id.as_deref().and_then(parse_session_key);
     let workspace_label =
         session_key.and_then(|(workspace_id, _)| workspace_names.get(workspace_id).cloned());
+    // 세션 제목은 DB 조인(row.session_title)이 프로덕션에서 늘 None이라(모듈 상단 문서)
+    // 호출측이 메모리에서 해석해 넘긴 것을 우선 쓴다 — "어느 셀의 에이전트인가"가
+    // 없으면 워크스페이스명만으로는 무엇을 승인하는지 판단할 수 없다(2026-07-17 사용자).
+    let session_label = session_key
+        .and_then(|(workspace_id, session)| {
+            session_titles
+                .get(&(workspace_id.to_owned(), session))
+                .cloned()
+        })
+        .or_else(|| row.session_title.clone());
     egui::Frame::group(ui.style()).show(ui, |ui| {
         // 워크스페이스/세션 컨텍스트 — ① 핵심 요구(가지 않고 판단).
-        let context = match (&workspace_label, &row.session_title) {
+        let context = match (&workspace_label, &session_label) {
             (Some(ws), Some(title)) => format!("{ws} · {title}"),
             (Some(ws), None) => ws.clone(),
             (None, Some(title)) => title.clone(),
@@ -100,11 +119,22 @@ fn render_card(
         ui.label(egui::RichText::new(context).size(11.0).weak());
         ui.strong(row.tool_name.as_str());
         // arguments_preview는 proxy가 이미 redact한 표시용 텍스트 — 추가 redaction
-        // 불필요, 원문 조회 금지(설계 제약). 그대로 자르고 wrap만 건다.
-        ui.add(
-            egui::Label::new(egui::RichText::new(clip_preview(&row.arguments_preview)).monospace())
-                .wrap(),
-        );
+        // 불필요, 원문 조회 금지(설계 제약).
+        //
+        // raw JSON을 그대로 뿌리면 "무엇을 승인하는지"가 안 보인다(2026-07-17 사용자:
+        // 긴 경로가 네 줄로 접히며 정작 파일명이 묻혔다). 인자별 한 줄로 펴고, 값은
+        // 뒤쪽(파일명·명령 꼬리)을 남기며 줄인다 — 판단에 필요한 건 대개 뒤쪽이다.
+        for (key, value) in format_arguments(&row.arguments_preview) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                if !key.is_empty() {
+                    ui.label(egui::RichText::new(format!("{key}:")).size(11.0).weak());
+                }
+                ui.add(
+                    egui::Label::new(egui::RichText::new(value).monospace().size(11.0)).truncate(),
+                );
+            });
+        }
         ui.horizontal(|ui| {
             if ui
                 .button(catalog.t("inbox.approval.approve", &[]))
@@ -151,15 +181,47 @@ fn parse_session_key(pane_id: &str) -> Option<(&str, SessionId)> {
     Some((workspace_id, SessionId(session_num)))
 }
 
-/// 인자 미리보기를 문자 수 기준으로 자른다(2줄 안팎). arguments_preview는 proxy가
-/// 만든 압축 JSON 한 줄이라 개행 정규화는 불필요하다.
-fn clip_preview(text: &str) -> String {
-    if text.chars().count() <= PREVIEW_CLIP_CHARS {
-        return text.to_owned();
+/// 인자 미리보기를 "키 → 값" 목록으로 편다. JSON object가 아니면(파싱 실패·배열 등)
+/// 키 없이 원문 한 줄로 돌려준다 — proxy가 무엇을 싣든 카드는 그려져야 한다.
+fn format_arguments(preview: &str) -> Vec<(String, String)> {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(preview)
+    else {
+        return vec![(String::new(), clip_value(preview))];
+    };
+    if map.is_empty() {
+        return Vec::new();
     }
-    let mut out: String = text.chars().take(PREVIEW_CLIP_CHARS).collect();
-    out.push('…');
-    out
+    map.into_iter()
+        .map(|(key, value)| (key, summarize_value(&value)))
+        .collect()
+}
+
+/// JSON 값 한 개를 카드 한 줄로 요약한다.
+fn summarize_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => clip_value(s),
+        serde_json::Value::Array(items) => format!("[{}개 항목]", items.len()),
+        serde_json::Value::Object(map) => format!("{{{}개 필드}}", map.len()),
+        other => other.to_string(),
+    }
+}
+
+/// 값이 길면 **뒤쪽을 남기고** 앞을 줄인다 — 경로는 파일명이, 명령은 인자가 뒤에 있어
+/// 판단에 필요한 정보가 대개 뒤쪽이다(앞을 남기면 홈 경로만 보인다).
+/// 홈 디렉터리는 `~`로 접는다.
+fn clip_value(text: &str) -> String {
+    let text = match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && text.starts_with(&home) => {
+            format!("~{}", &text[home.len()..])
+        }
+        _ => text.to_owned(),
+    };
+    let count = text.chars().count();
+    if count <= PREVIEW_CLIP_CHARS {
+        return text;
+    }
+    let tail: String = text.chars().skip(count - PREVIEW_CLIP_CHARS).collect();
+    format!("…{tail}")
 }
 
 #[cfg(test)]
@@ -203,16 +265,45 @@ mod tests {
     }
 
     #[test]
-    fn clip_preview_짧은_텍스트는_그대로_둔다() {
-        assert_eq!(clip_preview("short"), "short");
+    fn clip_value_짧은_텍스트는_그대로_둔다() {
+        assert_eq!(clip_value("short"), "short");
+    }
+
+    /// 2026-07-17 사용자 회귀: raw JSON을 그대로 뿌리자 긴 경로가 네 줄로 접히며
+    /// 정작 판단에 필요한 파일명이 묻혔다. 값은 **뒤쪽**(파일명)을 남겨야 한다.
+    #[test]
+    fn clip_value_긴_값은_뒤쪽_파일명을_남긴다() {
+        let long = format!("/Users/jr/{}/src/main.rs", "deep/".repeat(40));
+        let clipped = clip_value(&long);
+        assert!(clipped.starts_with('…'), "앞을 줄였음을 표시해야 한다");
+        assert!(
+            clipped.ends_with("src/main.rs"),
+            "무엇을 승인하는지 = 파일명이 남아야 한다: {clipped}"
+        );
+        assert_eq!(clipped.chars().count(), PREVIEW_CLIP_CHARS + 1);
     }
 
     #[test]
-    fn clip_preview_긴_텍스트는_말줄임표로_자른다() {
-        let long = "a".repeat(PREVIEW_CLIP_CHARS + 50);
-        let clipped = clip_preview(&long);
-        assert_eq!(clipped.chars().count(), PREVIEW_CLIP_CHARS + 1);
-        assert!(clipped.ends_with('…'));
+    fn format_arguments_json을_키별_한줄로_편다() {
+        let args = format_arguments(r#"{"cmd":"npm test","timeout":30}"#);
+        assert_eq!(args.len(), 2);
+        assert!(args.contains(&("cmd".to_owned(), "npm test".to_owned())));
+        assert!(args.contains(&("timeout".to_owned(), "30".to_owned())));
+    }
+
+    #[test]
+    fn format_arguments_큰_값은_크기만_요약한다() {
+        let args = format_arguments(r#"{"files":["a","b","c"],"opts":{"x":1}}"#);
+        let map: HashMap<_, _> = args.into_iter().collect();
+        assert_eq!(map.get("files").unwrap(), "[3개 항목]");
+        assert_eq!(map.get("opts").unwrap(), "{1개 필드}");
+    }
+
+    /// proxy가 무엇을 싣든 카드는 그려져야 한다 — JSON이 아니면 원문 한 줄로 폴백.
+    #[test]
+    fn format_arguments_json이_아니면_원문_한줄로_폴백한다() {
+        let args = format_arguments("not json at all");
+        assert_eq!(args, vec![(String::new(), "not json at all".to_owned())]);
     }
 
     #[test]
@@ -230,7 +321,7 @@ mod tests {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let workspace_names = HashMap::new();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let action = render(ui, &catalog, &[], &workspace_names);
+            let action = render(ui, &catalog, &[], &workspace_names, &HashMap::new());
             assert!(action.decision.is_none());
             assert!(action.goto.is_none());
         });
@@ -248,7 +339,7 @@ mod tests {
             row("a3", Some("ws-unknown:1")),
         ];
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let action = render(ui, &catalog, &rows, &workspace_names);
+            let action = render(ui, &catalog, &rows, &workspace_names, &HashMap::new());
             assert!(action.decision.is_none());
             assert!(action.goto.is_none());
         });
@@ -263,7 +354,7 @@ mod tests {
             .map(|i| row(&format!("a{i}"), None))
             .collect();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let action = render(ui, &catalog, &rows, &workspace_names);
+            let action = render(ui, &catalog, &rows, &workspace_names, &HashMap::new());
             assert!(action.decision.is_none());
             assert!(action.goto.is_none());
         });
@@ -281,7 +372,7 @@ mod tests {
     ) -> egui_kittest::Harness<'a, Vec<ApprovalDecision>> {
         egui_kittest::Harness::new_ui_state(
             move |ui, captured: &mut Vec<ApprovalDecision>| {
-                let action = render(ui, catalog, rows, names);
+                let action = render(ui, catalog, rows, names, &HashMap::new());
                 if let Some(decision) = action.decision {
                     captured.push(decision);
                 }

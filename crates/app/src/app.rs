@@ -1223,11 +1223,11 @@ pub struct App {
     persisted_agents: std::collections::HashMap<String, crate::storage::AgentSessionRow>,
     /// hook이 보고한 입력 대기(needsInput) 세션들 — DB에서 주기적으로 읽어 레일 주황 반영.
     agent_needs_input: std::collections::HashSet<runtime::SessionId>,
-    /// v3.9 N3: 전역(모든 워크스페이스) 입력 대기 — 벨 팝오버 PTY 카드의 소스. 세션 키
-    /// (`{workspace_id}:{u64}`) 그대로를 (workspace_id, SessionId)로 파싱만 해 둔다 —
-    /// 제목/미리보기 등 표시용 데이터는 팝오버가 열렸을 때만 지연 해석한다(idle 비용 0).
+    /// v3.9 N3: 전역(모든 워크스페이스) 입력 대기 — 벨 팝오버 PTY 카드의 소스.
+    /// (workspace_id, SessionId, hook이 보고한 대기 사유 문구). 제목/미리보기 등 나머지
+    /// 표시 데이터는 팝오버가 열렸을 때만 지연 해석한다(idle 비용 0).
     /// agent_needs_input(활성 전용, 사이드바/상태 레일이 쓴다)과는 별개 필드다.
-    global_waiting: Vec<(String, runtime::SessionId)>,
+    global_waiting: Vec<(String, runtime::SessionId, Option<String>)>,
     /// hook이 보고한 턴 완료(Stop) 세션 → updated_at — 레일 '완료(바이올렛)' 트랜지언트
     /// 소스. 값(updated_at)은 소비 시 조건부 clear의 세대 기준(레이스 방지, codex 리뷰).
     agent_turn_done: std::collections::HashMap<runtime::SessionId, i64>,
@@ -1980,17 +1980,35 @@ impl App {
             (w == ws).then_some(())?;
             s.parse::<u64>().ok().map(runtime::SessionId)
         };
-        self.agent_needs_input = waiting_keys.iter().filter_map(|k| to_id(k)).collect();
+        self.agent_needs_input = waiting_keys
+            .iter()
+            .filter_map(|(key, _)| to_id(key))
+            .collect();
         // v3.9 N3: 전역(모든 워크스페이스) 대기 — 같은 DB 조회 결과를 재사용해 새 쿼리
         // 없이 벨 팝오버 PTY 카드 소스를 채운다. 표시용 제목/미리보기는 팝오버가 열렸을
         // 때 build_waiting_cards가 지연 해석한다.
-        // 활성/warm 워크스페이스로 필터 — suspended는 카드도 주입도 불가능하므로 세면
-        // 뱃지 수와 카드 수가 어긋나 지울 수 없는 유령 뱃지가 된다(리뷰 P2). 뱃지와
-        // 카드가 같은 이 목록을 쓰므로 항상 일치한다.
+        // **카드를 만들 수 있는 대기만** 남긴다 — 뱃지는 이 목록을 세고 카드도 이
+        // 목록으로 만들어지므로 둘이 항상 일치한다. 조건은 build_waiting_cards와 같다:
+        //  ① 워크스페이스가 활성이거나 warm이어야 한다(suspended는 주입할 런타임이 없다).
+        //  ② 그 워크스페이스에 세션이 실제로 있어야 한다(hook 행은 세션이 죽어도 TTL
+        //     1시간 동안 남는다 — 세션 존재를 안 보면 카드 없는 유령 뱃지가 된다,
+        //     2026-07-17 실측: PTY 대기 3건이 뱃지에만 잡히고 카드는 0장).
+        let session_alive = |ws: &str, session: &runtime::SessionId| -> bool {
+            if ws == self.active.id {
+                self.active.session_titles.contains_key(session)
+            } else if let Some(rt) = self.warm.get(ws) {
+                rt.session_titles.contains_key(session)
+            } else {
+                false
+            }
+        };
         self.global_waiting = waiting_keys
             .iter()
-            .filter_map(|k| ui::inbox_waiting::parse_session_key(k))
-            .filter(|(ws, _)| *ws == self.active.id || self.warm.contains_key(ws))
+            .filter_map(|(key, message)| {
+                let (ws, session) = ui::inbox_waiting::parse_session_key(key)?;
+                Some((ws, session, message.clone()))
+            })
+            .filter(|(ws, session, _)| session_alive(ws, session))
             .collect();
         // 턴 완료(Stop hook) — 확인(포커스) 시 update_session_alerts가 소비한다.
         // updated_at을 함께 들고 있다가 조건부 clear의 세대 기준으로 쓴다(레이스 방지).
@@ -4341,93 +4359,71 @@ impl App {
         egui::Id::new("inbox_popup")
     }
 
+    /// 인박스 카드의 세션 표시 라벨 — **감지된 에이전트 이름**(Claude/Codex)을 우선하고,
+    /// 에이전트가 없는 셸이면 셀 제목으로 폴백한다. "셀 2"보다 "Codex"가 무엇을
+    /// 승인/응답하는지 판단하는 데 직접적이다(2026-07-17 사용자).
+    /// 활성/warm 모두 워크스페이스별 agent_info를 쓴다(warm도 마지막 감지값 유지).
+    fn inbox_session_label(&self, ws_id: &str, session: runtime::SessionId) -> Option<String> {
+        let rt = if ws_id == self.active.id {
+            &self.active
+        } else {
+            self.warm.get(ws_id)?
+        };
+        if let Some(provider) = rt.workspace_ui.agent_provider_for(session) {
+            return Some(provider.label().to_owned());
+        }
+        let raw = rt.session_titles.get(&session)?;
+        Some(ui::workspace::display_pane_title(raw, &self.i18n))
+    }
+
     /// [N3] 전역 PTY 대기 카드 데이터 조립 — 팝오버가 열렸을 때만 호출된다(호출부 게이트,
     /// idle 비용 0). suspended/사라진 워크스페이스는 카드에서 제외한다(I1 "모르는/사라진
     /// 세션이면 명령 미생성" 원칙 — 이동 외엔 아무것도 할 수 없는 죽은 카드를 안 보인다).
     fn build_waiting_cards(&mut self) -> Vec<ui::inbox_waiting::WaitingCard> {
         let global_waiting = self.global_waiting.clone();
-        // 활성 워크스페이스 세션의 미리보기(요약)는 session_entries에서 온다 — mux 전체를
-        // 순회하는 함수라 카드마다 부르면 팝오버가 열린 동안 매 프레임 × 카드 수만큼
-        // 재구성된다. 활성 카드가 하나라도 있을 때 **1회만** 만들어 공유한다.
-        let active_summaries: std::collections::HashMap<runtime::SessionId, String> =
-            if global_waiting.iter().any(|(ws, _)| *ws == self.active.id) {
-                self.active
-                    .workspace_ui
-                    .session_entries(
-                        &self.i18n,
-                        &self.agent_activity,
-                        &self.agent_needs_input,
-                        &self.agent_turn_done,
-                    )
-                    .into_iter()
-                    .filter_map(|entry| Some((entry.session?, entry.summary)))
-                    .collect()
-            } else {
-                std::collections::HashMap::new()
-            };
         let mut cards = Vec::with_capacity(global_waiting.len());
-        for (ws_id, session) in global_waiting {
+        for (ws_id, session, headline) in global_waiting {
             let Some(ws_row) = self.workspaces.iter().find(|w| w.id == ws_id) else {
                 continue;
             };
             let workspace_name = Self::workspace_display_name(ws_row);
-            let card = if ws_id == self.active.id {
-                self.build_active_waiting_card(&ws_id, session, workspace_name, &active_summaries)
-            } else if self.warm.contains_key(&ws_id) {
-                self.build_warm_waiting_card(&ws_id, session, workspace_name)
-            } else {
-                None
-            };
-            if let Some(card) = card {
+            if let Some(card) = self.build_waiting_card(&ws_id, session, workspace_name, headline) {
                 cards.push(card);
             }
         }
         cards
     }
 
-    /// [N3] 활성 워크스페이스의 카드 — 미리보기는 tail 재조회 없이 기존 메모리 summary를
-    /// 재사용한다(사이드바가 이미 쓰는 것과 같은 "마지막 비어있지 않은 행" 데이터).
-    /// `summaries`는 호출측이 1회 만들어 넘긴다(카드마다 재구성 방지).
-    fn build_active_waiting_card(
-        &self,
-        ws_id: &str,
-        session: runtime::SessionId,
-        workspace_name: String,
-        summaries: &std::collections::HashMap<runtime::SessionId, String>,
-    ) -> Option<ui::inbox_waiting::WaitingCard> {
-        let raw_title = self.active.session_titles.get(&session)?.clone();
-        let session_title = ui::workspace::display_pane_title(&raw_title, &self.i18n);
-        let preview = summaries
-            .get(&session)
-            .filter(|summary| !summary.trim().is_empty())
-            .map(|summary| vec![summary.clone()]);
-        Some(ui::inbox_waiting::WaitingCard {
-            workspace_id: ws_id.to_owned(),
-            session,
-            workspace_name,
-            session_title,
-            preview,
-        })
-    }
-
-    /// [N3] warm 워크스페이스의 카드 — 미리보기는 로그 tail(persistent_session_id로 찾은
-    /// 파일)에서 읽는다. §14.1: warm은 render 경로가 아니라 mux 스냅샷이 최신이 아닐 수
-    /// 있다 — 그 경우 UUID를 못 찾아 미리보기만 비고 카드(버튼)는 정상 동작한다(폴백).
-    fn build_warm_waiting_card(
+    /// [N3] 대기 카드 하나 — 활성/warm 워크스페이스를 같은 방식으로 만든다.
+    ///
+    /// 미리보기는 **양쪽 다 로그 tail**에서 읽는다. 활성 워크스페이스만 사이드바용
+    /// `session_entries` summary를 쓰던 때는 마지막 한 줄(claude 상태줄이나 셸 프롬프트)만
+    /// 나와서, 정작 지금 보고 있는 워크스페이스의 카드가 "무엇을 묻는지"를 못 보여줬다
+    /// (2026-07-17 실측 — 카드에 `▶▶ auto mode on …`만 뜨고 질문은 안 보임). tail은
+    /// 백그라운드 조회 + TTL 캐시라 활성이라고 더 싸지도 않다.
+    ///
+    /// §14.1: warm은 렌더 경로가 아니라 mux 스냅샷이 최신이 아닐 수 있다 — UUID를 못
+    /// 찾으면 미리보기만 비고 카드(버튼)는 정상 동작한다(폴백).
+    fn build_waiting_card(
         &mut self,
         ws_id: &str,
         session: runtime::SessionId,
         workspace_name: String,
+        headline: Option<String>,
     ) -> Option<ui::inbox_waiting::WaitingCard> {
-        let rt = self.warm.get(ws_id)?;
-        let raw_title = rt.session_titles.get(&session)?.clone();
+        let session_title = self.inbox_session_label(ws_id, session)?;
+        let active = ws_id == self.active.id;
+        let rt = if active {
+            &self.active
+        } else {
+            self.warm.get(ws_id)?
+        };
         let uuid = rt
             .workspace_ui
             .mux()
             .and_then(|mux| ui::inbox_waiting::find_persistent_session_id(mux, session));
-        // rt(= self.warm의 대여)는 여기서 끝난다 — 아래 미리보기 조회가 self.inbox_waiting_ui를
-        // 가변 대여해야 하므로 self.warm을 다시 빌리지 않도록 순서를 나눴다.
-        let session_title = ui::workspace::display_pane_title(&raw_title, &self.i18n);
+        // rt(= self.active/self.warm 대여)는 여기서 끝난다 — 아래 미리보기 조회가
+        // self.inbox_waiting_ui를 가변 대여하므로 순서를 나눴다.
         let preview = uuid.and_then(|uuid| {
             let logs_root = self.logs_base.join(ws_id);
             self.inbox_waiting_ui
@@ -4438,6 +4434,7 @@ impl App {
             session,
             workspace_name,
             session_title,
+            headline,
             preview,
         })
     }
@@ -4457,7 +4454,7 @@ impl App {
             .list_waiting_sessions()
             .unwrap_or_default()
             .iter()
-            .any(|k| k == &key);
+            .any(|(k, _)| k == &key);
         if !still_waiting {
             // 대기가 이미 해소됨 — 조용히 무시한다. 다음 refresh_needs_input이 카드
             // 목록을 갱신한다.
@@ -4485,7 +4482,7 @@ impl App {
         // tick(~2.5s)까지 카드가 남아 있으면 재클릭이 DB 재확인(아직 waiting=1)을 통과해
         // 이중 주입된다(리뷰 P2). 진실은 다음 refresh_needs_input이 복원한다.
         self.global_waiting
-            .retain(|(ws, s)| !(ws == workspace_id && *s == session));
+            .retain(|(ws, s, _)| !(ws == workspace_id && *s == session));
         self.egui_ctx.request_repaint();
     }
 
@@ -4520,6 +4517,34 @@ impl App {
         } else {
             Default::default()
         };
+        // 승인 카드의 세션 라벨 — DB 조인은 프로덕션에서 늘 None이라(pane_id는 런타임
+        // 세션 키, mux_panes.id는 UUID) 메모리에서 해석해 넘긴다. 활성 + warm 전부:
+        // 인박스의 존재 이유가 "다른 워크스페이스 것도 여기서 판단"이다.
+        // 라벨 규칙은 PTY 카드와 같다(inbox_session_label — 에이전트명 우선, 셸이면 셀 제목).
+        let approval_session_titles: std::collections::HashMap<
+            (String, runtime::SessionId),
+            String,
+        > = if popup_open {
+            let keys: Vec<(String, runtime::SessionId)> = self
+                .active
+                .session_titles
+                .keys()
+                .map(|session| (self.active.id.clone(), *session))
+                .chain(self.warm.iter().flat_map(|(ws, rt)| {
+                    rt.session_titles
+                        .keys()
+                        .map(move |session| (ws.clone(), *session))
+                }))
+                .collect();
+            keys.into_iter()
+                .filter_map(|(ws, session)| {
+                    let label = self.inbox_session_label(&ws, session)?;
+                    Some(((ws, session), label))
+                })
+                .collect()
+        } else {
+            Default::default()
+        };
         let mut approval_decision = None;
         // PTY 입력 대기 카드 — 팝오버가 열려 있을 때만 조립한다(idle 비용 0:
         // 닫혀 있으면 tail 조회·캐시 갱신을 전혀 하지 않는다).
@@ -4531,42 +4556,54 @@ impl App {
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .align(egui::RectAlign::BOTTOM_START)
             .show(|ui| {
-                ui.set_min_width(260.0);
-                ui.set_max_width(300.0);
-                // ── 대기 중 섹션 (처리하면 사라지는 액션 큐) ──
-                // MCP 승인 카드 — 이미 폴링된 목록만 읽는다(App::poll_pending_approvals가
-                // approval-watcher 신호로 채운다) — 새 DB 조회 없음.
-                let approval_action = ui::inbox_approvals::render(
-                    ui,
-                    text,
-                    self.approvals_ui.pending(),
-                    &approval_workspace_names,
-                );
-                approval_decision = approval_action.decision;
-                clicked = approval_action.goto;
-                // PTY 입력 대기 카드 — 카드가 없으면 아무것도 그리지 않는다.
-                if let Some(cards) = &waiting_cards {
-                    waiting_action = self.inbox_waiting_ui.render(ui, text, cards);
-                    if !cards.is_empty() {
+                // 카드는 "가지 않고 판단"이 목적이라 폭이 정보량을 좌우한다 — 좁으면
+                // 경로·명령·미리보기가 죄다 잘린다(2026-07-17 사용자). 화면 폭의 절반까지
+                // 허용하되 상한을 둔다(작은 화면에서 팝오버가 창을 덮지 않게).
+                let content = ui.ctx().content_rect();
+                ui.set_min_width(420.0_f32.min(content.width() - 40.0));
+                ui.set_max_width(560.0_f32.min(content.width() * 0.5).max(420.0));
+                // 미리보기가 12줄까지 늘어 카드가 길어졌다 — 대기가 여러 건이면 팝오버가
+                // 창을 덮으므로 스크롤에 담는다(높이는 창의 70%까지).
+                egui::ScrollArea::vertical()
+                    .max_height(content.height() * 0.7)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        // ── 대기 중 섹션 (처리하면 사라지는 액션 큐) ──
+                        // MCP 승인 카드 — 이미 폴링된 목록만 읽는다(App::poll_pending_approvals가
+                        // approval-watcher 신호로 채운다) — 새 DB 조회 없음.
+                        let approval_action = ui::inbox_approvals::render(
+                            ui,
+                            text,
+                            self.approvals_ui.pending(),
+                            &approval_workspace_names,
+                            &approval_session_titles,
+                        );
+                        approval_decision = approval_action.decision;
+                        clicked = approval_action.goto;
+                        // PTY 입력 대기 카드 — 카드가 없으면 아무것도 그리지 않는다.
+                        if let Some(cards) = &waiting_cards {
+                            waiting_action = self.inbox_waiting_ui.render(ui, text, cards);
+                            if !cards.is_empty() {
+                                ui.add_space(6.0);
+                            }
+                        }
+                        // ── 최근 알림 섹션 (지나간 기록) ──
+                        if let Some(target) =
+                            self.notifications_ui
+                                .recent_section(ui, text, RECENT_IN_POPOVER)
+                        {
+                            clicked = Some(target);
+                        }
                         ui.add_space(6.0);
-                    }
-                }
-                // ── 최근 알림 섹션 (지나간 기록) ──
-                if let Some(target) =
-                    self.notifications_ui
-                        .recent_section(ui, text, RECENT_IN_POPOVER)
-                {
-                    clicked = Some(target);
-                }
-                ui.add_space(6.0);
-                // 전체 기록·비우기는 설정→알림이 계속 담당한다 (팝오버는 빠른 확인만).
-                if ui
-                    .button(text.t("inbox.view_all", &[]))
-                    .on_hover_text(text.t("inbox.view_all.hint", &[]))
-                    .clicked()
-                {
-                    open_full = true;
-                }
+                        // 전체 기록·비우기는 설정→알림이 계속 담당한다 (팝오버는 빠른 확인만).
+                        if ui
+                            .button(text.t("inbox.view_all", &[]))
+                            .on_hover_text(text.t("inbox.view_all.hint", &[]))
+                            .clicked()
+                        {
+                            open_full = true;
+                        }
+                    });
             });
         if open_full {
             self.settings_category = ui::settings::Category::Notifications;

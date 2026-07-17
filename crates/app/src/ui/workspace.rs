@@ -34,22 +34,20 @@ struct TerminalSurfaceLayout {
     content: egui::Rect,
 }
 
-fn terminal_surface_layout(rect: egui::Rect) -> TerminalSurfaceLayout {
-    let strip_height = TERMINAL_TAB_STRIP_HEIGHT.min(rect.height().max(0.0));
-    let strip = egui::Rect::from_min_max(
-        rect.min,
-        egui::pos2(rect.right(), rect.top() + strip_height),
-    );
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TerminalPaneSurfaceLayout {
+    surface: egui::Rect,
+    content: egui::Rect,
+}
+
+fn terminal_pane_surface_layout(rect: egui::Rect) -> TerminalPaneSurfaceLayout {
     let margin_x = TERMINAL_SURFACE_MARGIN_X.min(rect.width().max(0.0) * 0.25);
-    let surface_top = strip.bottom().min(rect.bottom());
-    let remaining_height = (rect.bottom() - surface_top).max(0.0);
-    let margin_bottom = TERMINAL_SURFACE_MARGIN_BOTTOM.min(remaining_height * 0.25);
-    let surface_bottom = (rect.bottom() - margin_bottom).max(surface_top);
+    let margin_bottom = TERMINAL_SURFACE_MARGIN_BOTTOM.min(rect.height().max(0.0) * 0.25);
     let surface = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + margin_x, surface_top),
+        egui::pos2(rect.left() + margin_x, rect.top()),
         egui::pos2(
             (rect.right() - margin_x).max(rect.left() + margin_x),
-            surface_bottom,
+            (rect.bottom() - margin_bottom).max(rect.top()),
         ),
     );
     let pad_x = TERMINAL_STREAM_PADDING.min(surface.width().max(0.0) * 0.25);
@@ -58,11 +56,101 @@ fn terminal_surface_layout(rect: egui::Rect) -> TerminalSurfaceLayout {
         egui::pos2(surface.left() + pad_x, surface.top() + pad_y),
         egui::pos2(surface.right() - pad_x, surface.bottom() - pad_y),
     );
+    TerminalPaneSurfaceLayout { surface, content }
+}
+
+fn terminal_surface_layout(rect: egui::Rect) -> TerminalSurfaceLayout {
+    let strip_height = TERMINAL_TAB_STRIP_HEIGHT.min(rect.height().max(0.0));
+    let strip = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(rect.right(), rect.top() + strip_height),
+    );
+    let body = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), strip.bottom().min(rect.bottom())),
+        rect.max,
+    );
+    let pane = terminal_pane_surface_layout(body);
     TerminalSurfaceLayout {
         strip,
-        surface,
-        content,
+        surface: pane.surface,
+        content: pane.content,
     }
+}
+
+#[derive(Clone, Copy)]
+enum TerminalToolbarIcon {
+    Search,
+    NewTerminal,
+    SplitColumns,
+    SplitRows,
+}
+
+fn terminal_toolbar_button(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: egui::Id,
+    icon: TerminalToolbarIcon,
+) -> egui::Response {
+    let response = ui.interact(rect, id, egui::Sense::click());
+    if response.hovered() || response.has_focus() {
+        ui.painter()
+            .rect_filled(rect, 1.0, egui::Color32::from_rgb(0x22, 0x22, 0x2a));
+    }
+    let color = if response.hovered() || response.has_focus() {
+        egui::Color32::from_rgb(0xf2, 0xf2, 0xf2)
+    } else {
+        egui::Color32::from_rgb(0xc8, 0xcc, 0xd2)
+    };
+    let stroke = egui::Stroke::new(1.25, color);
+    let center = rect.center();
+    match icon {
+        TerminalToolbarIcon::Search => {
+            let lens = center + egui::vec2(-1.5, -1.5);
+            ui.painter().circle_stroke(lens, 5.0, stroke);
+            ui.painter().line_segment(
+                [lens + egui::vec2(3.8, 3.8), lens + egui::vec2(7.0, 7.0)],
+                stroke,
+            );
+        }
+        TerminalToolbarIcon::NewTerminal => {
+            let body = egui::Rect::from_center_size(center, egui::vec2(18.0, 14.0));
+            ui.painter()
+                .rect_stroke(body, 1.5, stroke, egui::StrokeKind::Inside);
+            ui.painter().line_segment(
+                [
+                    center + egui::vec2(-5.5, -2.5),
+                    center + egui::vec2(-2.5, 0.0),
+                ],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [
+                    center + egui::vec2(-2.5, 0.0),
+                    center + egui::vec2(-5.5, 2.5),
+                ],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [center + egui::vec2(0.0, 3.0), center + egui::vec2(5.0, 3.0)],
+                stroke,
+            );
+        }
+        TerminalToolbarIcon::SplitColumns | TerminalToolbarIcon::SplitRows => {
+            let body = egui::Rect::from_center_size(center, egui::vec2(16.0, 16.0));
+            ui.painter()
+                .rect_stroke(body, 1.5, stroke, egui::StrokeKind::Inside);
+            match icon {
+                TerminalToolbarIcon::SplitColumns => {
+                    ui.painter().vline(center.x, body.y_range(), stroke);
+                }
+                TerminalToolbarIcon::SplitRows => {
+                    ui.painter().hline(body.x_range(), center.y, stroke);
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+    response
 }
 
 /// 세션 셸 cwd 캐시 항목 — hover 경로 해석용. lsof(수십 ms)는 백그라운드 스레드가
@@ -1202,31 +1290,11 @@ impl WorkspaceUi {
         let rect = ui.available_rect_before_wrap();
         let surface = terminal_surface_layout(rect);
         let strip_fill = egui::Color32::from_rgb(0x17, 0x17, 0x1c);
-        let terminal_fill = egui::Color32::from_rgb(0x0f, 0x11, 0x17);
-        let border = egui::Stroke::new(1.0, egui::Color32::from_rgb(0x3a, 0x3a, 0x42));
         ui.painter().rect_filled(surface.strip, 0.0, strip_fill);
         ui.painter().hline(
             surface.strip.x_range(),
             surface.strip.bottom() - 0.5,
             egui::Stroke::new(1.0, egui::Color32::from_rgb(0x2a, 0x2a, 0x33)),
-        );
-        ui.painter()
-            .rect_filled(surface.surface, 0.0, terminal_fill);
-        // 목업의 terminal-pane은 tab과 이어지도록 위쪽 border가 없다.
-        ui.painter().line_segment(
-            [surface.surface.left_top(), surface.surface.left_bottom()],
-            border,
-        );
-        ui.painter().line_segment(
-            [surface.surface.right_top(), surface.surface.right_bottom()],
-            border,
-        );
-        ui.painter().line_segment(
-            [
-                surface.surface.left_bottom(),
-                surface.surface.right_bottom(),
-            ],
-            border,
         );
         if let Some(pane) = mux
             .focused_pane
@@ -1239,9 +1307,11 @@ impl WorkspaceUi {
         let layout = active_tab.layout.clone();
         let tab_id = active_tab.id.clone();
         let mut split_path = Vec::new();
+        let pane_area =
+            egui::Rect::from_min_max(egui::pos2(rect.left(), surface.strip.bottom()), rect.max);
         self.render_node(
             ui,
-            surface.content,
+            pane_area,
             &layout,
             &mux,
             config,
@@ -1274,8 +1344,11 @@ impl WorkspaceUi {
             .layout_no_wrap(title.clone(), font.clone(), egui::Color32::WHITE)
             .size()
             .x;
-        let controls_width = 38.0 + 5.0;
-        let tab_available = (strip.width() - 16.0 - controls_width).max(64.0);
+        let toolbar_button = 32.0;
+        let toolbar_gap = 4.0;
+        let toolbar_width = toolbar_button * 4.0 + toolbar_gap * 3.0;
+        let toolbar_left = strip.right() - 8.0 - toolbar_width;
+        let tab_available = (toolbar_left - 12.0 - (strip.left() + 8.0)).max(64.0);
         let tab_width = (title_width + 78.0).max(124.0).min(tab_available);
         let tab = egui::Rect::from_min_size(
             strip.min + egui::vec2(8.0, TERMINAL_TAB_TOP),
@@ -1367,54 +1440,76 @@ impl WorkspaceUi {
             self.request_close_pane(client, pane.id.clone());
         }
 
-        let plus = egui::Rect::from_min_size(
-            egui::pos2(tab.right() + 5.0, strip.bottom() - 41.0),
-            egui::vec2(38.0, 38.0),
-        );
-        let plus_response = ui.interact(
-            plus,
-            egui::Id::new(("terminal_add_tab", &pane.id)),
-            egui::Sense::click(),
-        );
-        if plus_response.hovered() {
-            ui.painter().rect_filled(plus, 1.0, tab_fill);
+        let toolbar_top = strip.center().y - toolbar_button * 0.5;
+        let toolbar_icons = [
+            TerminalToolbarIcon::Search,
+            TerminalToolbarIcon::NewTerminal,
+            TerminalToolbarIcon::SplitColumns,
+            TerminalToolbarIcon::SplitRows,
+        ];
+        for (index, icon) in toolbar_icons.into_iter().enumerate() {
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    toolbar_left + index as f32 * (toolbar_button + toolbar_gap),
+                    toolbar_top,
+                ),
+                egui::vec2(toolbar_button, toolbar_button),
+            );
+            let response = terminal_toolbar_button(
+                ui,
+                rect,
+                egui::Id::new(("terminal_toolbar", &pane.id, index)),
+                icon,
+            );
+            let tooltip = match icon {
+                TerminalToolbarIcon::Search => catalog.t("shortcuts.action.terminal_search", &[]),
+                TerminalToolbarIcon::NewTerminal => catalog.t("workspace.new_shell", &[]),
+                TerminalToolbarIcon::SplitColumns => catalog.t("workspace.split_horizontal", &[]),
+                TerminalToolbarIcon::SplitRows => catalog.t("workspace.split_vertical", &[]),
+            };
+            if response.on_hover_text(tooltip).clicked() {
+                self.activate_terminal_toolbar(icon, &pane.id, config, client);
+            }
         }
-        let plus_color = if plus_response.hovered() {
-            ui.visuals().selection.stroke.color
-        } else {
-            egui::Color32::from_rgb(0xc8, 0xcc, 0xd2)
-        };
-        ui.painter().line_segment(
-            [
-                plus.center() + egui::vec2(-5.0, 0.0),
-                plus.center() + egui::vec2(5.0, 0.0),
-            ],
-            egui::Stroke::new(1.5, plus_color),
-        );
-        ui.painter().line_segment(
-            [
-                plus.center() + egui::vec2(0.0, -5.0),
-                plus.center() + egui::vec2(0.0, 5.0),
-            ],
-            egui::Stroke::new(1.5, plus_color),
-        );
-        if plus_response
-            .on_hover_text(catalog.t("workspace.new_shell", &[]))
-            .clicked()
-        {
-            self.send(
+    }
+
+    fn activate_terminal_toolbar(
+        &mut self,
+        icon: TerminalToolbarIcon,
+        pane: &runtime::MuxPaneId,
+        config: &TerminalConfig,
+        client: &dyn RuntimeClient,
+    ) {
+        match icon {
+            TerminalToolbarIcon::Search => self.open_search(),
+            TerminalToolbarIcon::NewTerminal => self.send(
                 client,
                 RuntimeCommand::SpawnShell {
                     cols: 80,
                     rows: 24,
                     scrollback_lines: config.scrollback_lines as usize,
                 },
-            );
+            ),
+            TerminalToolbarIcon::SplitColumns => self.send(
+                client,
+                RuntimeCommand::SplitPane {
+                    pane: pane.clone(),
+                    direction: SplitDirection::Horizontal,
+                    scrollback_lines: config.scrollback_lines as usize,
+                },
+            ),
+            TerminalToolbarIcon::SplitRows => self.send(
+                client,
+                RuntimeCommand::SplitPane {
+                    pane: pane.clone(),
+                    direction: SplitDirection::Vertical,
+                    scrollback_lines: config.scrollback_lines as usize,
+                },
+            ),
         }
     }
 
     /// layout 트리를 rect 분할로 재귀 렌더한다.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn render_node(
         &mut self,
@@ -1578,8 +1673,6 @@ impl WorkspaceUi {
         client: &dyn RuntimeClient,
         catalog: &i18n::Catalog,
     ) {
-        // 헤더-터미널 사이 기본 item_spacing 틈에 패널색이 비쳤다(#81) — 0으로.
-        ui.spacing_mut().item_spacing.y = 0.0;
         let Some(pane) = mux
             .tabs
             .iter()
@@ -1589,10 +1682,21 @@ impl WorkspaceUi {
             return;
         };
         let focused = mux.focused_pane.as_ref() == Some(pane_id);
+        // split leaf마다 Target surface를 독립 적용한다. 전체 layout을 한 번만 감싸면
+        // 두 번째 pane은 여백/테두리가 사라져 가로·세로 분할의 스타일이 달라졌다.
+        let pane_surface = terminal_pane_surface_layout(ui.max_rect());
+        let pane_rect = pane_surface.surface;
+        ui.painter()
+            .rect_filled(pane_rect, 0.0, egui::Color32::from_rgb(0x0f, 0x11, 0x17));
+        ui.painter().rect_stroke(
+            pane_rect,
+            0.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(0x3a, 0x3a, 0x42)),
+            egui::StrokeKind::Inside,
+        );
         // pane 전체 배경 interact — 터미널 위젯보다 먼저 등록해 터미널 밖 영역과
         // "세션 없음"/"연결 중"(스냅샷 지연) 상태에서도 우클릭 메뉴·드롭이 동작한다
         // (codex P2). 터미널 위에서는 나중에 등록되는 터미널 위젯이 입력을 받는다.
-        let pane_rect = ui.max_rect();
         let pane_resp = ui.interact(
             pane_rect,
             egui::Id::new(("pane_bg", pane_id)),
@@ -1638,6 +1742,14 @@ impl WorkspaceUi {
                 }
             }
         }
+        let mut terminal_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(pane_surface.content)
+                .layout(egui::Layout::top_down(egui::Align::LEFT)),
+        );
+        terminal_ui.set_clip_rect(pane_surface.content.intersect(ui.clip_rect()));
+        terminal_ui.spacing_mut().item_spacing.y = 0.0;
+        let ui = &mut terminal_ui;
         let Some(session) = pane.session_id else {
             ui.label(catalog.t("workspace.no_session", &[]));
             return;
@@ -3698,6 +3810,29 @@ mod tests {
         assert!(layout.surface.contains_rect(layout.content));
     }
 
+    #[test]
+    fn 가로와_세로_split의_모든_leaf가_같은_surface_inset을_갖는다() {
+        let slots = [
+            // 좌우 분할
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(294.0, 300.0)),
+            egui::Rect::from_min_size(egui::pos2(295.0, 0.0), egui::vec2(294.0, 300.0)),
+            // 상하 분할
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(589.0, 149.0)),
+            egui::Rect::from_min_size(egui::pos2(0.0, 150.0), egui::vec2(589.0, 150.0)),
+        ];
+        for slot in slots {
+            let layout = terminal_pane_surface_layout(slot);
+            assert_eq!(layout.surface.left() - slot.left(), 8.0);
+            assert_eq!(slot.right() - layout.surface.right(), 8.0);
+            assert_eq!(layout.surface.top(), slot.top());
+            assert_eq!(slot.bottom() - layout.surface.bottom(), 7.0);
+            assert_eq!(layout.content.left() - layout.surface.left(), 18.0);
+            assert_eq!(layout.content.top() - layout.surface.top(), 18.0);
+            assert_eq!(layout.surface.right() - layout.content.right(), 18.0);
+            assert_eq!(layout.surface.bottom() - layout.content.bottom(), 18.0);
+        }
+    }
+
     /// hover 커서 회귀 가드 — 백그라운드 cwd 해석(stale-while-revalidate) 후
     /// 폴더 단어가 Dir로 잡혀야 한다 (2026-07-17 사용자: 커서가 안 바뀜).
     #[test]
@@ -3753,6 +3888,56 @@ mod tests {
 
     fn pane_id(name: &str) -> MuxPaneId {
         MuxPaneId(name.to_owned())
+    }
+
+    #[test]
+    fn 상단_터미널_툴바는_검색_새셸_좌우_상하분할을_정확히_호출한다() {
+        let mut ui = WorkspaceUi::new();
+        ui.mux = Some(mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("p", SessionId(7))],
+                LayoutNode::Pane(pane_id("p")),
+            )],
+            "p",
+        ));
+        let runtime = RecordingRuntime::default();
+        let config = TerminalConfig::default();
+        let target = pane_id("p");
+
+        ui.activate_terminal_toolbar(TerminalToolbarIcon::Search, &target, &config, &runtime);
+        assert_eq!(
+            ui.search.as_ref().map(|search| search.session),
+            Some(SessionId(7))
+        );
+        ui.activate_terminal_toolbar(TerminalToolbarIcon::NewTerminal, &target, &config, &runtime);
+        ui.activate_terminal_toolbar(
+            TerminalToolbarIcon::SplitColumns,
+            &target,
+            &config,
+            &runtime,
+        );
+        ui.activate_terminal_toolbar(TerminalToolbarIcon::SplitRows, &target, &config, &runtime);
+
+        let commands = runtime.commands.lock().unwrap();
+        assert!(matches!(commands[0], RuntimeCommand::SpawnShell { .. }));
+        assert!(matches!(
+            &commands[1],
+            RuntimeCommand::SplitPane {
+                pane,
+                direction: SplitDirection::Horizontal,
+                ..
+            } if pane == &target
+        ));
+        assert!(matches!(
+            &commands[2],
+            RuntimeCommand::SplitPane {
+                pane,
+                direction: SplitDirection::Vertical,
+                ..
+            } if pane == &target
+        ));
     }
 
     #[test]

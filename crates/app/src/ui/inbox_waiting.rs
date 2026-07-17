@@ -75,6 +75,8 @@ pub struct InboxWaitingUi {
     tail_cache: Arc<Mutex<HashMap<String, TailCacheEntry>>>,
     /// 카드별 자유 입력 버퍼 — (workspace_id, session)으로 프레임 간 유지한다.
     inputs: HashMap<(String, SessionId), String>,
+    /// 미리보기를 펼쳐 둔 카드들 — 기본은 접힘(카드가 화면을 덮지 않게).
+    expanded: std::collections::HashSet<(String, SessionId)>,
 }
 
 impl InboxWaitingUi {
@@ -82,6 +84,7 @@ impl InboxWaitingUi {
         Self {
             tail_cache: Arc::new(Mutex::new(HashMap::new())),
             inputs: HashMap::new(),
+            expanded: std::collections::HashSet::new(),
         }
     }
 
@@ -175,11 +178,16 @@ impl InboxWaitingUi {
         // 사라진 카드(대기 해소·워크스페이스 소멸)의 입력 버퍼를 정리한다 — SessionId는
         // 워커마다 1부터 재배정되므로 방치하면 다른 논리 세션이 과거 드래프트를 물려받는다
         // (2026-07-17 리뷰 P2). 카드가 비어도 실행해 마지막 카드 해소 시의 잔존을 막는다.
-        self.inputs.retain(|(workspace_id, session), _| {
+        let alive = |workspace_id: &String, session: &SessionId| {
             cards
                 .iter()
                 .any(|card| card.workspace_id == *workspace_id && card.session == *session)
-        });
+        };
+        self.inputs
+            .retain(|(workspace_id, session), _| alive(workspace_id, session));
+        // 펼침 상태도 같은 규칙으로 정리 — 세션이 재배정되면 남의 카드가 펼쳐진 채 뜬다.
+        self.expanded
+            .retain(|(workspace_id, session)| alive(workspace_id, session));
         if cards.is_empty() {
             return None;
         }
@@ -222,11 +230,35 @@ impl InboxWaitingUi {
             );
         });
         // 헤드라인(hook이 말한 대기 사유)이 있으면 tail보다 위에, 눈에 띄게 — 이게
-        // "무엇을 승인/응답하는지"의 답이다. tail은 그 아래에서 선택지 번호를 보여준다.
+        // "무엇을 승인/응답하는지"의 답이다. tail은 펼쳤을 때 선택지 번호를 보여준다.
         if let Some(headline) = &card.headline {
             ui.add(egui::Label::new(egui::RichText::new(headline).size(12.0)).wrap());
         }
-        render_preview(ui, catalog, card.preview.as_deref());
+        // 미리보기는 **기본 접힘** — 12줄이라 펼쳐두면 카드 하나가 화면 절반을 먹는다
+        // (2026-07-17 사용자). 헤드라인이 주 정보이고, tail은 선택지 번호를 확인할 때만
+        // 필요하다. 접힘 상태는 세션별로 프레임 간 유지한다.
+        if card.preview.is_some() {
+            let key = (card.workspace_id.clone(), card.session);
+            let expanded = self.expanded.contains(&key);
+            let label = if expanded {
+                catalog.t("inbox.waiting.hide_screen", &[])
+            } else {
+                catalog.t("inbox.waiting.show_screen", &[])
+            };
+            if ui
+                .add(egui::Button::new(egui::RichText::new(label).size(11.0)).frame(false))
+                .clicked()
+            {
+                if expanded {
+                    self.expanded.remove(&key);
+                } else {
+                    self.expanded.insert(key);
+                }
+            }
+            if expanded {
+                render_preview(ui, catalog, card.preview.as_deref());
+            }
+        }
         ui.horizontal(|ui| {
             if ui.small_button("y").clicked() {
                 *action = Some(WaitingAction::Answer {

@@ -2937,6 +2937,7 @@ name = "mcp-store"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "deppy-core",
  "rusqlite",
  "serde_json",
 ]

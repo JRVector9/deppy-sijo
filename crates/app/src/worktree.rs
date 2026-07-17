@@ -64,9 +64,13 @@ pub fn create_worktree(cwd: &Path) -> anyhow::Result<PathBuf> {
 /// 커밋/변경이 있으면 git이 그대로 거부하며(`--force` 미사용), 그 에러를 그대로
 /// 올린다 — 조용한 데이터 손실 금지.
 ///
-/// 알려진 한계(codex 리뷰, 범위 밖으로 남김):
+/// 알려진 한계(codex 리뷰, 모두 안전 실패 쪽이라 범위 밖으로 남김 — 데이터 손실이
+/// 아니라 "삭제가 거부되거나 정리가 한 프레임 늦는" 쪽):
 /// - cwd가 워크트리 안의 중첩 서브모듈/레포 안이면 `repo_root`가 그 안쪽 레포를
 ///   반환해 `is_deppy_worktree`가 거부한다 — 삭제가 안 될 뿐 잘못 지우지는 않는다.
+/// - 워크트리 안에 초기화된 서브모듈이 있으면 루트와 서브모듈 둘 다 깨끗해도 git이
+///   `--force` 없이는 거부한다 — 재귀적으로 서브모듈까지 확인하려면 이 함수가 상당히
+///   커져야 해 뒤로 미룬다(마찬가지로 실패는 거부일 뿐 손실이 아니다).
 /// - 전처리 스캔과 `worktree remove` 실행 사이에 그 폴더의 셸/에이전트가 새
 ///   무시된 파일을 쓰면 그 파일은 걸러지지 않는다(TOCTOU) — 창이 git 프로세스
 ///   두 번 호출 사이로 매우 좁고, 막으려면 그 폴더의 모든 프로세스를 먼저 멈춰야
@@ -75,6 +79,10 @@ pub fn create_worktree(cwd: &Path) -> anyhow::Result<PathBuf> {
 ///   메뉴가 아주 짧게 이전 워크트리를 대상으로 남을 수 있다 — 이 앱의 cwd 의존
 ///   메뉴 전부(diff 보기·같은 폴더 새 셸 등)가 공유하는 기존 신뢰 모델이라 이
 ///   기능만 별도로 고치지 않는다.
+/// - 삭제 성공 후 pane 정리는 **활성 워크스페이스만** 훑는다 — 같은 워크트리를 쓰는
+///   세션이 warm(비활성, 상주) 워크스페이스에 있으면 거기 pane은 안 닫힌다. 그
+///   워크스페이스로 전환하면 죽은 cwd가 드러날 뿐 자동 정리는 안 됨(App 쪽 한계,
+///   `self.warm`이 활성 workspace_ui와 다른 구조라 이번 라운드에서는 안 건드림).
 pub fn remove_worktree(cwd: &Path) -> anyhow::Result<PathBuf> {
     let worktree_root = crate::git_cli::repo_root(cwd, ROOT_TIMEOUT)?;
     anyhow::ensure!(
@@ -84,17 +92,20 @@ pub fn remove_worktree(cwd: &Path) -> anyhow::Result<PathBuf> {
     );
     // git worktree remove의 dirty 판정은 추적/미추적 변경만 본다 — gitignore된
     // 내용(.env.local, 빌드 산출물, 심지어 중첩 워크트리)은 "깨끗함"으로 보고
-    // 그대로 rm -rf에 딸려 지워진다(codex P1 실증). `--untracked-files=all`을
-    // 명시해야 한다 — `status.showUntrackedFiles=no` 설정이 있으면 플래그 없이는
+    // 그대로 rm -rf에 딸려 지워진다(codex P1 실증). `--untracked-files=`을 명시
+    // 해야 한다 — `status.showUntrackedFiles=no` 설정이 있으면 플래그 없이는
     // `??`/`!!` 둘 다 안 뜬다(codex 재검증, 같은 설정이 worktree remove 자체의
-    // dirty 판정에도 적용돼 무방비로 지운다).
+    // dirty 판정에도 적용돼 무방비로 지운다). `normal`(git 기본값)을 쓴다 — `all`은
+    // 거대 미추적 디렉터리 전체를 한 줄씩 나열해 거부 판정 하나에 출력을 통째로
+    // 버퍼링시킨다(codex 재검증 2); `normal`도 디렉터리를 한 줄로 묶을 뿐 존재
+    // 여부 판정(및 config 우회 방지)은 동일하게 한다.
     let status = crate::git_cli::run_git(
         &worktree_root,
         &[
             "status",
             "--porcelain",
             "--ignored",
-            "--untracked-files=all",
+            "--untracked-files=normal",
         ],
         ROOT_TIMEOUT,
     )?;

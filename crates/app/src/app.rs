@@ -5368,6 +5368,14 @@ impl eframe::App for App {
                         None => tracing::warn!("세션 cwd 미확인 — 경로 복사 생략"),
                     }
                 }
+                // [PR-D] 변경 보기 — diff 패널 배선이 여기에 붙는다.
+                Some(ui::file_tree::SidebarAction::ShowDiff { session }) => {
+                    let _ = session; // PR-D가 채운다
+                }
+                // [PR-W] 새 워크트리 셸 — worktree 생성+스폰 배선이 여기에 붙는다.
+                Some(ui::file_tree::SidebarAction::NewWorktreeCell { session }) => {
+                    let _ = session; // PR-W가 채운다
+                }
                 // 같은 폴더에서 새 셸 — cwd 미확인이면 일반 새 셸로 폴백.
                 Some(ui::file_tree::SidebarAction::NewShellSameFolder { session }) => {
                     let cwd = self.session_cwd_lookup(session);

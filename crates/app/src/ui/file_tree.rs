@@ -69,6 +69,10 @@ pub enum SidebarAction {
     },
     /// pane 닫기 — 실행 중 세션이면 기존 확인 모달을 거친다.
     ClosePane { pane: runtime::MuxPaneId },
+    /// [PR-D] 이 세션 cwd 레포의 변경분(diff)을 본다.
+    ShowDiff { session: runtime::SessionId },
+    /// [PR-W] 이 세션 레포의 새 git worktree를 만들고 그 폴더에서 셸을 연다.
+    NewWorktreeCell { session: runtime::SessionId },
 }
 
 /// 트리 노드. `children == None`은 아직 나열 안 됨(lazy).
@@ -1020,6 +1024,8 @@ impl FileTreeUi {
                                             Some(SidebarAction::NewShellSameFolder { session });
                                         ui.close();
                                     }
+                                    // [PR-D] 「변경 보기」 메뉴가 여기에 붙는다 (ShowDiff).
+                                    // [PR-W] 「새 워크트리에서 셸」 메뉴가 여기에 붙는다 (NewWorktreeCell).
                                     if entry.resumable
                                         && ui
                                             .button(catalog.t("sidebar.menu.resume_agent", &[]))

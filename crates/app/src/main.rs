@@ -14,6 +14,7 @@ mod dotenv_sync;
 mod env;
 mod env_reload;
 mod fonts;
+mod git_cli;
 mod mcp_import;
 mod native_key_monitor;
 mod paths;

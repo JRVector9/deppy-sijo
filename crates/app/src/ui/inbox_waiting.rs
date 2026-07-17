@@ -363,15 +363,11 @@ pub fn find_persistent_session_id(mux: &MuxSnapshot, session: SessionId) -> Opti
         .and_then(|pane| pane.persistent_session_id.clone())
 }
 
-/// hook 세션 키(`{workspace_id}:{u64}`) 파싱 — runtime::in_process의 session_key와 같은
-/// 규약(SessionId가 워커마다 1부터 재배정되므로 workspace_id로 스코프한다, v3.7 codex High).
+/// hook 세션 키(`{workspace_id}:{u64}`) 파싱 — 규칙과 문서는 `deppy_core`에 있다
+/// (runtime이 만들고 app·web-remote가 소비하므로 최하층 공용). 소유 String이 필요한
+/// 호출부(카드 조립)를 위해 얇게 감싼다.
 pub fn parse_session_key(key: &str) -> Option<(String, SessionId)> {
-    let (workspace_id, session_id) = key.rsplit_once(':')?;
-    if workspace_id.is_empty() {
-        return None;
-    }
-    let session_id = session_id.parse::<u64>().ok()?;
-    Some((workspace_id.to_owned(), SessionId(session_id)))
+    deppy_core::parse_session_key(key).map(|(ws, session)| (ws.to_owned(), session))
 }
 
 /// 에이전트가 화면 하단에 **늘** 그리는 장식 줄인가 — 승인/응답 판단에 아무 정보도

@@ -49,6 +49,10 @@ settings.auto_resume = Auto-resume agent sessions
 settings.auto_resume.hint = Re-run claude/codex resume on restart to continue the previous session
 settings.status_hooks = Agent status hooks
 settings.status_hooks.hint = Install hooks in claude/codex to reliably detect approval/input waits (off = screen guess only)
+settings.agent_presets = Send-to-agent presets
+settings.agent_presets.hint = Phrases shown when you select text in a terminal and right-click. Each is prepended to the selection.
+settings.agent_presets.add = + Add preset
+settings.agent_presets.remove = Remove
 settings.memory_indicator = Memory indicator
 settings.memory_indicator.hint = Show app memory in the toolbar (same metric as Activity Monitor's Memory column)
 settings.shortcuts = Shortcuts

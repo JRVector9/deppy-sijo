@@ -49,6 +49,10 @@ settings.auto_resume = 自动恢复会话
 settings.auto_resume.hint = 重启时自动运行 claude/codex resume 继续上次会话
 settings.status_hooks = 智能体状态钩子
 settings.status_hooks.hint = 在 claude/codex 中安装钩子以准确检测审批/输入等待（关闭=仅屏幕推测）
+settings.agent_presets = 发送给智能体的预设
+settings.agent_presets.hint = 在终端中选择文本并右键时显示的语句，会加在所选内容前面。
+settings.agent_presets.add = + 添加预设
+settings.agent_presets.remove = 删除
 settings.memory_indicator = 内存显示
 settings.memory_indicator.hint = 在工具栏显示应用内存用量（与活动监视器“内存”列相同的指标）
 settings.shortcuts = Shortcuts

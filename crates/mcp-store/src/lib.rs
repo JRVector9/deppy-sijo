@@ -137,11 +137,15 @@ pub struct PendingApprovalRow {
     pub arguments_preview: String,
     pub schema_hash: Option<String>,
     pub created_at: i64,
-    /// 승인을 요청한 pane_id (I2 — proxy env DEPPY_SESSION_ID). NULL이면 세션 불명.
+    /// 승인을 요청한 세션 키 — proxy가 env `DEPPY_SESSION_ID`를 그대로 싣는다(I2).
+    /// 형식은 `{workspace_id}:{session_id}`(`deppy_core::parse_session_key`).
+    /// NULL이면 세션 불명.
+    ///
+    /// 컬럼 이름이 `pane_id`지만 **`mux_panes.id`가 아니다** — 이름에 속아 조인하면
+    /// 절대 매칭되지 않는다(2026-07-17 실측: 그 조인이 여기 있었고, 그래서 세션
+    /// UUID/제목이 프로덕션에서 늘 NULL이었다). 세션 해석은 파싱 후 런타임 상태에서
+    /// 한다 — 소비처가 아는 정보이지 DB가 아는 정보가 아니다.
     pub pane_id: Option<String>,
-    /// pane → 세션 조인 결과 (I2). 세션 UUID(딥링크용)와 표시 제목.
-    pub session_uuid: Option<String>,
-    pub session_title: Option<String>,
 }
 
 /// 새 pending approval insert 요청. 표시 문자열은 이미 redacted된 preview만 허용한다.
@@ -284,15 +288,15 @@ pub fn poll_approval(conn: &Connection, id: &str) -> anyhow::Result<ApprovalOutc
 
 /// pending 상태 요청만, 오래된 순으로 (GUI 목록). id는 tie-break(결정적 순서).
 pub fn list_pending_approvals(conn: &Connection) -> anyhow::Result<Vec<PendingApprovalRow>> {
-    // pane_id로 mux_panes → sessions를 조인해 세션 UUID/제목을 함께 가져온다 (I2).
-    // LEFT JOIN이라 pane_id NULL·pane 소멸 시에도 승인 행은 그대로 나온다("세션 불명").
-    // 조인 비용은 무시 수준(pending 행 수 ≤ 수십, 1초 폴링).
+    // 승인 행만 읽는다. 예전엔 여기서 `LEFT JOIN mux_panes p ON p.id = a.pane_id`로
+    // 세션 UUID/제목을 채우려 했지만, a.pane_id는 런타임 세션 키(`{ws}:{u64}`)이고
+    // mux_panes.id는 UUID라 **절대 매칭되지 않았다** — 2026-07-17 실측으로 확인하고
+    // 조인을 걷어냈다(500ms 폴링마다 헛돌던 조인 2개도 함께 사라진다).
+    // 세션 해석은 pane_id를 파싱해 런타임 상태에서 하는 소비처의 몫이다.
     let mut stmt = conn.prepare(
         "SELECT a.id, a.server_id, a.tool_name, a.arguments_preview, a.schema_hash,
-                a.created_at, a.pane_id, s.id, s.title
+                a.created_at, a.pane_id
          FROM pending_approvals a
-         LEFT JOIN mux_panes p ON p.id = a.pane_id
-         LEFT JOIN sessions s ON s.id = p.session_id
          WHERE a.status = 'pending' ORDER BY a.created_at, a.id",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -304,8 +308,6 @@ pub fn list_pending_approvals(conn: &Connection) -> anyhow::Result<Vec<PendingAp
             schema_hash: row.get(4)?,
             created_at: row.get(5)?,
             pane_id: row.get(6)?,
-            session_uuid: row.get(7)?,
-            session_title: row.get(8)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1004,21 +1006,29 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    /// I2: 승인의 pane_id로 세션 UUID/제목을 조인해 함께 반환한다. pane_id NULL이나
-    /// pane 소멸(조인 miss)이면 승인 행은 나오되 세션 필드는 None("세션 불명").
+    /// 승인 행은 pane_id(=런타임 세션 키)를 **그대로** 돌려준다. 세션 해석은 소비처
+    /// (app 인박스 / web-remote 대시보드)가 파싱해서 런타임 상태에서 하는 몫이다.
+    ///
+    /// 2026-07-17까지 여기서 `pane_id = mux_panes.id` 조인으로 세션 UUID/제목을 채웠는데,
+    /// **프로덕션에서 매칭된 적이 없다** — pane_id는 `{workspace}:{u64}`이고 mux_panes.id는
+    /// UUID다. 옛 테스트는 양쪽에 같은 가짜 문자열('pane-1')을 넣어 통과했을 뿐이라
+    /// 버그를 몇 달간 가렸다. 그래서 이 테스트는 **실제 형식**을 쓴다.
     #[test]
-    fn 승인은_pane_id로_세션을_조인해_uuid와_제목을_반환한다() {
+    fn 승인은_pane_id를_그대로_반환하고_세션해석은_하지_않는다() {
         let conn = test_conn();
+        // 실제 mux_panes 행이 있어도(=옛 조인의 상대) 결과에 영향을 주지 않아야 한다.
         conn.execute(
             "INSERT INTO sessions (id, title) VALUES ('sess-uuid-1', 'deppy-sijo')",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO mux_panes (id, session_id) VALUES ('pane-1', 'sess-uuid-1')",
+            "INSERT INTO mux_panes (id, session_id) VALUES ('130d9017-be25-469e-8f8d-984abacae701', 'sess-uuid-1')",
             [],
         )
         .unwrap();
+        // proxy가 싣는 실제 값 형식: DEPPY_SESSION_ID = {workspace_id}:{session_id}
+        let real_key = "315f68b6-333f-409f-a2c5-922b9eacfd7e:2";
         insert_pending_approval(
             &conn,
             "a1",
@@ -1027,24 +1037,21 @@ mod tests {
             "prev",
             None,
             100,
-            Some("pane-1"),
+            Some(real_key),
         )
         .unwrap();
         insert_pending_approval(&conn, "a2", "srv", "write", "prev", None, 200, None).unwrap();
-        insert_pending_approval(&conn, "a3", "srv", "exec", "prev", None, 300, Some("gone"))
-            .unwrap();
 
         let rows = list_pending_approvals(&conn).unwrap();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 2);
         let by_id = |id: &str| rows.iter().find(|r| r.id == id).unwrap();
-        assert_eq!(by_id("a1").pane_id.as_deref(), Some("pane-1"));
-        assert_eq!(by_id("a1").session_uuid.as_deref(), Some("sess-uuid-1"));
-        assert_eq!(by_id("a1").session_title.as_deref(), Some("deppy-sijo"));
+        assert_eq!(by_id("a1").pane_id.as_deref(), Some(real_key));
         assert_eq!(by_id("a2").pane_id, None);
-        assert_eq!(by_id("a2").session_uuid, None);
-        assert_eq!(by_id("a2").session_title, None);
-        assert_eq!(by_id("a3").pane_id.as_deref(), Some("gone"));
-        assert_eq!(by_id("a3").session_uuid, None);
+        // 세션 키는 core 파서로만 해석된다 — DB는 세션을 모른다.
+        let (ws, session) = deppy_core::parse_session_key(by_id("a1").pane_id.as_deref().unwrap())
+            .expect("실제 형식은 파싱된다");
+        assert_eq!(ws, "315f68b6-333f-409f-a2c5-922b9eacfd7e");
+        assert_eq!(session.0, 2);
     }
 
     #[test]

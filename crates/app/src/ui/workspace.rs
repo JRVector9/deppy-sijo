@@ -2068,7 +2068,13 @@ impl WorkspaceUi {
                     body = Some(selection.to_owned());
                     ui.close();
                 }
-                for preset in &self.agent_send_presets {
+                // 빈 항목은 건너뛴다 — 설정에서 "추가"만 누르고 안 채운 경우 메뉴에
+                // 빈 줄이 생긴다(2026-07-17 설정 UI 도입).
+                for preset in self
+                    .agent_send_presets
+                    .iter()
+                    .filter(|p| !p.trim().is_empty())
+                {
                     if ui.button(format!("\"{preset}\"")).clicked() {
                         send_to = vec![*session];
                         body = Some(format!("{preset}:\n{selection}"));

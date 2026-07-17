@@ -672,10 +672,13 @@
     card.appendChild(head);
 
     // 어느 세션의 승인인지 (I2). 세션 불명이면 표시하지 않는다. textContent만.
-    if (item.session_title) {
+    // 어느 세션의 승인인지 — 제목은 이미 받은 세션 목록에서 찾고, 없으면 서버 폴백.
+    const known = item.session && lastSessions.find((x) => x.id === item.session);
+    const title = (known && known.title) || item.session_title;
+    if (title) {
       const sess = document.createElement('div');
       sess.className = 'approval-session';
-      sess.textContent = '세션: ' + item.session_title;
+      sess.textContent = '세션: ' + title;
       card.appendChild(sess);
     }
 
@@ -697,7 +700,8 @@
 
     const actions = document.createElement('div');
     actions.className = 'actions';
-    // 승인 전 맥락 확인 — 그 세션 화면을 연다 (I2). session UUID가 있을 때만.
+    // 승인 전 맥락 확인 — 그 세션 화면을 연다 (I2). session(영속 UUID)이 있을 때만.
+    // 서버는 활성 워크스페이스의 승인에만 이 값을 채운다(u64 앨리어싱 방지).
     if (item.session) {
       const view = document.createElement('button');
       view.className = 'approval-view';

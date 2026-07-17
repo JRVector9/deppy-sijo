@@ -1583,6 +1583,66 @@ fn general_page(
             }
         },
     );
+    agent_send_presets_section(ui, config, changed, catalog);
+}
+
+/// 「에이전트로 보내기」 프리셋 편집 (2026-07-17 사용자) — 터미널 선택 → 우클릭 메뉴에
+/// 뜨는 문구들. 지금까지 config.toml을 직접 고쳐야 했다.
+///
+/// 목록 편집이라 `row`(라벨 + 위젯 1개) 틀에 안 맞아 전용 섹션으로 둔다. 저장은 다른
+/// 설정과 같은 규약(`*changed = true` → 호출측이 config.save).
+fn agent_send_presets_section(
+    ui: &mut egui::Ui,
+    config: &mut Config,
+    changed: &mut bool,
+    catalog: &i18n::Catalog,
+) {
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new(catalog.t("settings.agent_presets", &[]))
+            .strong()
+            .size(13.0),
+    );
+    ui.label(
+        egui::RichText::new(catalog.t("settings.agent_presets.hint", &[]))
+            .size(11.0)
+            .weak(),
+    );
+    ui.add_space(4.0);
+
+    let mut remove_at = None;
+    for (i, preset) in config.ui.agent_send_presets.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            // 항목이 지워지거나 순서가 바뀌면 위치 기반 auto-Id가 밀려 포커스가 옆 칸으로
+            // 튄다 — 인덱스로 고정한다(인박스 입력칸에서 같은 문제를 겪었다).
+            let resp = ui.add(
+                egui::TextEdit::singleline(preset)
+                    .id_salt(("agent_preset", i))
+                    .desired_width(ui.available_width() - 40.0),
+            );
+            if resp.changed() {
+                *changed = true;
+            }
+            if ui
+                .button("✕")
+                .on_hover_text(catalog.t("settings.agent_presets.remove", &[]))
+                .clicked()
+            {
+                remove_at = Some(i);
+            }
+        });
+    }
+    if let Some(i) = remove_at {
+        config.ui.agent_send_presets.remove(i);
+        *changed = true;
+    }
+    if ui
+        .button(catalog.t("settings.agent_presets.add", &[]))
+        .clicked()
+    {
+        config.ui.agent_send_presets.push(String::new());
+        *changed = true;
+    }
 }
 
 fn language_page(

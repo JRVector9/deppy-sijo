@@ -129,11 +129,20 @@ pub struct ApprovalView {
     pub tool: String,
     pub preview: String,
     pub created_at: i64,
-    /// 이 승인을 요청한 세션의 **영속 UUID** (I2). 폰의 "화면 보기"가 이걸로 watch한다.
-    /// 세션 불명(pane_id NULL/pane 소멸)이면 생략된다.
+    /// 이 승인을 요청한 세션의 **영속 UUID** — 폰의 "화면 보기"가 이걸로 watch한다
+    /// (모듈 상단 규약: 폰은 worker-로컬 u64를 모른다). [`SessionView::id`]와 같은 공간.
+    ///
+    /// 채우는 경로: 승인 행의 `pane_id`(= 런타임 세션 키 `{ws}:{u64}`)를 파싱해 u64를
+    /// 얻고, 브리지의 IdMap으로 UUID를 찾는다. **활성 워크스페이스의 승인만** 값이 있다 —
+    /// IdMap은 활성 워커의 mux 스냅샷에서 오고, u64는 워크스페이스마다 1부터라 다른
+    /// 워크스페이스 번호로 조회하면 엉뚱한 세션이 잡힌다.
+    ///
+    /// 2026-07-17 이전엔 DB 조인(`pane_id = mux_panes.id`)으로 채우려 했으나 두 값이 다른
+    /// 식별자 공간이라 매칭된 적이 없어, 이 필드가 늘 None이었다(= 딥링크가 죽어 있었다).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
-    /// 세션 표시 제목 (I2). 승인 카드에 "어느 세션인지"를 보인다.
+    /// 세션 표시 제목 — 승인 카드에 "어느 세션인지"를 보인다. 세션 목록에 아직 없는
+    /// 경우(막 뜬 세션 등)의 폴백이라, 폰은 목록에서 찾은 제목을 우선한다.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_title: Option<String>,
 }

@@ -49,6 +49,10 @@ settings.auto_resume = セッション自動再開
 settings.auto_resume.hint = 再起動時に前回の claude/codex セッションを resume で自動継続
 settings.status_hooks = エージェント状態フック
 settings.status_hooks.hint = claude/codexにフックを設定し承認/入力待ちを正確に検知（オフ=画面推測のみ）
+settings.agent_presets = エージェントに送るプリセット
+settings.agent_presets.hint = ターミナルでテキストを選択して右クリックすると表示される文言です。選択内容の前に付きます。
+settings.agent_presets.add = + プリセットを追加
+settings.agent_presets.remove = 削除
 settings.memory_indicator = メモリ表示
 settings.memory_indicator.hint = ツールバーにアプリのメモリ使用量を表示（アクティビティモニタ「メモリ」列と同じ指標）
 settings.shortcuts = Shortcuts

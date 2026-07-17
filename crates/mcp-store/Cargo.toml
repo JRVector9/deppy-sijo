@@ -8,3 +8,8 @@ rust-version.workspace = true
 anyhow = { workspace = true }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# 테스트가 pane_id의 실제 형식(런타임 세션 키)을 파서로 검증한다 — 옛 조인 테스트가
+# 가짜 문자열로 통과하며 버그를 가렸던 재발 방지.
+deppy-core = { path = "../core" }

@@ -998,17 +998,34 @@ impl DashboardHandle {
 }
 
 /// 승인 행을 표시 뷰로. `arguments_preview`는 proxy가 이미 redact한 텍스트다.
-fn approval_views(rows: Vec<storage::PendingApprovalRow>) -> Vec<ApprovalView> {
+///
+/// 세션 해석(I2 딥링크): `pane_id`(= 런타임 세션 키 `{ws}:{u64}`)를 파싱해 u64를 얻고,
+/// `ids`로 폰이 아는 영속 UUID로 바꾼다. **DB 조인으로는 못 찾는다** — mux_panes.id는
+/// 다른 식별자 공간이라 예전 조인은 매칭된 적이 없다(2026-07-17 실측, 그래서 이 필드가
+/// 늘 None이었고 "화면 보기" 버튼이 아예 안 떴다).
+///
+/// `ids`는 **활성 워커**의 mux에서 만들어지므로 다른 워크스페이스의 승인은 None으로
+/// 남는다 — 그게 맞다: u64는 워크스페이스마다 1부터라 남의 번호로 조회하면 엉뚱한
+/// 세션이 잡힌다(모듈 상단 앨리어싱 경고).
+fn approval_views(rows: Vec<storage::PendingApprovalRow>, ids: &IdMap) -> Vec<ApprovalView> {
     rows.into_iter()
-        .map(|row| ApprovalView {
-            id: row.id,
-            server: row.server_id,
-            tool: row.tool_name,
-            preview: row.arguments_preview,
-            created_at: row.created_at,
-            // 세션 UUID/제목 (I2 — pane_id로 sessions 조인). 세션 불명이면 None.
-            session: row.session_uuid,
-            session_title: row.session_title,
+        .map(|row| {
+            let session = row
+                .pane_id
+                .as_deref()
+                .and_then(deppy_core::parse_session_key)
+                .and_then(|(_, session)| ids.uuid(session.0).map(str::to_owned));
+            ApprovalView {
+                id: row.id,
+                server: row.server_id,
+                tool: row.tool_name,
+                preview: row.arguments_preview,
+                created_at: row.created_at,
+                session,
+                // 제목은 폰이 이미 받은 세션 목록에서 찾는다(중복 전송 불필요) —
+                // 목록에 없을 때만 쓰는 폴백 자리라 지금은 비운다.
+                session_title: None,
+            }
         })
         .collect()
 }
@@ -1146,7 +1163,7 @@ fn run(shared: &Arc<Shared>) {
             // db를 잡으므로 교착이 생기지 않는다.
             match shared.db.lock().expect("dashboard db lock").as_ref() {
                 Some(db) => match db.list_pending_approvals() {
-                    Ok(rows) => approvals = Some(approval_views(rows)),
+                    Ok(rows) => approvals = Some(approval_views(rows, &inner.ids)),
                     Err(e) => tracing::warn!("web-remote 승인 목록 폴링 실패: {e:#}"),
                 },
                 None => approvals = Some(Vec::new()),
@@ -1902,5 +1919,56 @@ mod tests {
         assert_eq!(due, vec![test_uuid(1)]);
         // 갱신 직후엔 만기가 리셋돼 due가 비어야 한다 (매 tick 재전송 방지)
         assert!(due_lease_renewals(&mut watchers, now, Duration::from_secs(15)).is_empty());
+    }
+    /// 2026-07-17 회귀: 승인 카드의 "화면 보기"(I2 딥링크)가 만들어진 이후 한 번도
+    /// 동작한 적이 없었다 — `pending_approvals.pane_id`(런타임 세션 키 `{ws}:{u64}`)를
+    /// `mux_panes.id`(UUID)와 조인해 세션 UUID를 채우려 했는데 두 값이 다른 식별자
+    /// 공간이라 늘 None이었고, 폰은 `session`이 없으면 버튼 자체를 안 만든다.
+    /// 이제 세션 키를 파싱해 IdMap으로 UUID를 찾는다.
+    #[test]
+    fn 승인의_세션키가_폰이_watch할_uuid로_해석된다() {
+        let mut sessions = BTreeMap::new();
+        let mut resource = None;
+        let mut ids = IdMap::default();
+        // 활성 워커의 mux가 IdMap을 채운다(u64 7 ↔ uuid-7).
+        apply_event(
+            &mut sessions,
+            &mut resource,
+            &mut ids,
+            &mux_event(&[(7, "claude")]),
+        );
+
+        let row = |id: &str, pane: Option<&str>| storage::PendingApprovalRow {
+            id: id.to_owned(),
+            server_id: "srv".to_owned(),
+            tool_name: "write_file".to_owned(),
+            arguments_preview: "{}".to_owned(),
+            schema_hash: None,
+            created_at: 0,
+            pane_id: pane.map(str::to_owned),
+        };
+        let views = approval_views(
+            vec![
+                // proxy가 싣는 실제 형식 — 워크스페이스 uuid + 런타임 세션 번호.
+                row("a1", Some("315f68b6-333f-409f-a2c5-922b9eacfd7e:7")),
+                // 세션 불명(pane_id 없음) → 딥링크 없음.
+                row("a2", None),
+                // 다른 워크스페이스의 번호 9 — IdMap(활성 워커)에 없으니 None이어야 한다.
+                // (u64는 워크스페이스마다 1부터라 남의 번호를 그대로 쓰면 오시청이 된다.)
+                row("a3", Some("other-workspace-uuid:9")),
+                // mux_panes.id를 넣어도(옛 조인이 기대하던 값) 세션 키가 아니라 None.
+                row("a4", Some("130d9017-be25-469e-8f8d-984abacae701")),
+            ],
+            &ids,
+        );
+        let by_id = |id: &str| views.iter().find(|v| v.id == id).unwrap();
+        assert_eq!(
+            by_id("a1").session.as_deref(),
+            Some(test_uuid(7).as_str()),
+            "폰이 watch에 쓰는 영속 UUID로 해석돼야 딥링크가 뜬다"
+        );
+        assert_eq!(by_id("a2").session, None);
+        assert_eq!(by_id("a3").session, None);
+        assert_eq!(by_id("a4").session, None);
     }
 }

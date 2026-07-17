@@ -49,6 +49,10 @@ settings.auto_resume = 自動恢復工作階段
 settings.auto_resume.hint = 重新啟動時自動執行 claude/codex resume 繼續上次工作階段
 settings.status_hooks = 代理狀態掛鉤
 settings.status_hooks.hint = 在 claude/codex 安裝掛鉤以準確偵測核准/輸入等待（關閉=僅畫面推測）
+settings.agent_presets = 傳送給代理的預設
+settings.agent_presets.hint = 在終端機中選取文字並按右鍵時顯示的語句，會加在所選內容前面。
+settings.agent_presets.add = + 新增預設
+settings.agent_presets.remove = 刪除
 settings.memory_indicator = 記憶體顯示
 settings.memory_indicator.hint = 在工具列顯示應用程式記憶體用量（與活動監視器「記憶體」欄相同的指標）
 settings.shortcuts = Shortcuts

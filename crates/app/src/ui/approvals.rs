@@ -100,10 +100,10 @@ impl ApprovalsUi {
             .show(ctx, |ui| {
                 ui.label(catalog.t("approval.server", &[("value", &row.server_id)]));
                 ui.label(catalog.t("approval.tool", &[("value", &row.tool_name)]));
-                // 어느 세션의 승인인지 (I2) — 여러 에이전트가 동시에 돌 때 맥락을 준다.
-                if let Some(title) = &row.session_title {
-                    ui.label(catalog.t("approval.session", &[("value", title)]));
-                }
+                // 어느 세션의 승인인지는 여기서 안 보인다 — 세션명은 DB가 아니라 런타임
+                // 상태에서 와야 하는데(2026-07-17: pane_id↔mux_panes 조인이 매칭되지 않아
+                // 늘 비어 있었다), 이 모달은 N4에서 호출을 접었으므로 배선을 되살리지
+                // 않았다. 세션 맥락이 필요하면 벨 인박스가 보여준다(에이전트명까지).
                 // http 서버면 원격 전송 고지 — 이 승인이 신뢰 확인을 겸한다 (H3 리뷰 P1)
                 if let Some(url) = self.remote_urls.get(&row.server_id) {
                     ui.colored_label(
@@ -153,8 +153,6 @@ mod tests {
             schema_hash: None,
             created_at: 0,
             pane_id: None,
-            session_uuid: None,
-            session_title: None,
         }
     }
 

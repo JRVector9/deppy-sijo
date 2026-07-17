@@ -8,23 +8,18 @@
 //! 렌더 + 사용자 의도([`ApprovalCardsAction`]) 산출만 한다(leaf UI가 DB를 직접 만지지
 //! 않는다, xtask check-boundary).
 //!
-//! ## 워크스페이스 해석 (① — "가지 않고 판단"이 이 PR의 핵심 요구)
-//! `PendingApprovalRow.session_uuid`/`session_title`는 mcp-store가 `pane_id` 컬럼으로
-//! `mux_panes`를 조인해 채운다(I2). 그런데 실제 `pane_id` 값은 PTY 런타임(runtime crate,
-//! in_process.rs)이 DEPPY_SESSION_ID로 주입하는 `session_key()` 규칙이 만드는
-//! `"{workspace_id}:{live_session_id}"` 형식의 **런타임 세션 키**이고, `mux_panes.id`는
-//! 이것과 무관한 UUID(`MuxPaneId::new()`)다 — 그래서 이 조인은 실제 승인에서는 매칭되지
-//! 않는다(세션 id가 앱 실행마다 1부터 재시작하는 것도 별개 근거, in_process.rs 주석
-//! "세션 id(u64)는 실행마다 1부터 다시 시작한다" 참고). 즉 session_uuid/session_title는
-//! 사실상 항상 None이라, mux_panes 조인에 workspace_id 컬럼을 추가해도 워크스페이스를
-//! 얻지 못한다(모듈 앞단에서 join 확장을 시도했다가 이 사실을 확인하고 되돌렸다).
+//! ## 워크스페이스/세션 해석 (① — "가지 않고 판단"이 이 PR의 핵심 요구)
+//! `PendingApprovalRow.pane_id`는 이름과 달리 `mux_panes.id`가 아니라 런타임 세션 키
+//! (`{workspace_id}:{session_id}`)다 — `deppy_core::parse_session_key`로 파싱한다.
+//! 워크스페이스명·세션명은 **DB가 모르는 정보**라 호출측(App)이 메모리에서 해석해
+//! 넘겨준다(에이전트가 감지되면 그 이름, 아니면 셀 제목).
 //!
-//! 대신 `pane_id` 문자열을 직접 파싱해 workspace_id·세션을 뽑는다([`parse_session_key`]).
-//! workspace_id는 UUID라 ':'를 포함하지 않아 안전하고, DB 스키마/쿼리 변경 없이 항상
-//! 동작한다. `session_title`은 값이 있으면(조인이 다른 경로로 고쳐지면) 그대로 병기한다.
+//! 예전엔 mcp-store가 `pane_id = mux_panes.id` 조인으로 세션 UUID/제목을 채우려 했지만
+//! 두 값은 다른 식별자 공간이라 매칭된 적이 없다 — 2026-07-17에 조인을 걷어냈다.
 
 use std::collections::HashMap;
 
+use deppy_core::parse_session_key;
 use runtime::SessionId;
 use storage::PendingApprovalRow;
 
@@ -98,16 +93,14 @@ fn render_card(
     let session_key = row.pane_id.as_deref().and_then(parse_session_key);
     let workspace_label =
         session_key.and_then(|(workspace_id, _)| workspace_names.get(workspace_id).cloned());
-    // 세션 제목은 DB 조인(row.session_title)이 프로덕션에서 늘 None이라(모듈 상단 문서)
-    // 호출측이 메모리에서 해석해 넘긴 것을 우선 쓴다 — "어느 셀의 에이전트인가"가
-    // 없으면 워크스페이스명만으로는 무엇을 승인하는지 판단할 수 없다(2026-07-17 사용자).
-    let session_label = session_key
-        .and_then(|(workspace_id, session)| {
-            session_titles
-                .get(&(workspace_id.to_owned(), session))
-                .cloned()
-        })
-        .or_else(|| row.session_title.clone());
+    // 세션 라벨은 호출측이 메모리에서 해석해 넘긴다 — DB는 이 정보를 모른다(모듈 상단
+    // 문서). "어느 셀의 에이전트인가"가 없으면 워크스페이스명만으로는 무엇을 승인하는지
+    // 판단할 수 없다(2026-07-17 사용자).
+    let session_label = session_key.and_then(|(workspace_id, session)| {
+        session_titles
+            .get(&(workspace_id.to_owned(), session))
+            .cloned()
+    });
     egui::Frame::group(ui.style()).show(ui, |ui| {
         // 워크스페이스/세션 컨텍스트 — ① 핵심 요구(가지 않고 판단).
         let context = match (&workspace_label, &session_label) {
@@ -169,18 +162,6 @@ fn decision_for(row: &PendingApprovalRow, allowed: bool) -> ApprovalDecision {
     }
 }
 
-/// pane_id(=DEPPY_SESSION_ID)에서 workspace_id·라이브 세션 id를 뽑는다. 형식은
-/// PTY 런타임의 session_key() 생성 규칙이 만드는 "{workspace_id}:{session_id}"
-/// — 모듈 상단 문서의 조인 불일치 설명 참고.
-fn parse_session_key(pane_id: &str) -> Option<(&str, SessionId)> {
-    let (workspace_id, session_num) = pane_id.split_once(':')?;
-    if workspace_id.is_empty() {
-        return None;
-    }
-    let session_num: u64 = session_num.parse().ok()?;
-    Some((workspace_id, SessionId(session_num)))
-}
-
 /// 인자 미리보기를 "키 → 값" 목록으로 편다. JSON object가 아니면(파싱 실패·배열 등)
 /// 키 없이 원문 한 줄로 돌려준다 — proxy가 무엇을 싣든 카드는 그려져야 한다.
 fn format_arguments(preview: &str) -> Vec<(String, String)> {
@@ -237,8 +218,6 @@ mod tests {
             schema_hash: None,
             created_at: 0,
             pane_id: pane_id.map(str::to_owned),
-            session_uuid: None,
-            session_title: None,
         }
     }
 

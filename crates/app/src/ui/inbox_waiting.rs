@@ -374,6 +374,26 @@ pub fn parse_session_key(key: &str) -> Option<(String, SessionId)> {
     Some((workspace_id.to_owned(), SessionId(session_id)))
 }
 
+/// 에이전트가 화면 하단에 **늘** 그리는 장식 줄인가 — 승인/응답 판단에 아무 정보도
+/// 주지 않으면서 tail을 통째로 차지한다(2026-07-17 사용자: "하단에 이것까진 안 나와도
+/// 될 것 같다"). 걸러야 그 위의 실제 질문·선택지가 미리보기에 들어온다.
+///
+/// statusline은 사용자가 설정한 명령의 출력을 그대로 체인하므로(mcp-proxy의
+/// chain_user_statusline) 형식을 특정할 수 없다 — 대신 claude가 제공하는 컨텍스트
+/// 게이지(`[█░░] 23%`)라는 공통 특징으로 거른다. 못 걸러도 손해는 tail 한 줄뿐이다.
+fn is_screen_chrome(line: &str) -> bool {
+    let t = line.trim();
+    // claude 모드 표시: "⏵⏵ auto mode on (shift+tab to cycle)", "⏸ ..."
+    if t.starts_with('⏵') || t.starts_with('⏸') {
+        return true;
+    }
+    // 컨텍스트 게이지가 있는 statusline.
+    if (t.contains('█') || t.contains('░')) && t.contains('%') {
+        return true;
+    }
+    t == "Checking for updates" || t.starts_with("? for shortcuts")
+}
+
 /// 텍스트의 마지막 n줄(비어있지 않은 줄만, 원래 순서 유지) — 로그 tail 미리보기 추출.
 ///
 /// **연속 중복은 접는다**: TUI가 상태줄을 주기적으로 다시 그려 같은 줄이 로그에 연달아
@@ -384,7 +404,7 @@ fn last_lines(text: &str, n: usize) -> Vec<String> {
     let mut lines: Vec<String> = Vec::with_capacity(n);
     for line in text.lines().rev() {
         let trimmed = line.trim_end();
-        if trimmed.trim().is_empty() {
+        if trimmed.trim().is_empty() || is_screen_chrome(trimmed) {
             continue;
         }
         // 역순 순회라 "직전에 담은 것"이 로그상 바로 다음 줄 — 연속 중복 판정에 맞다.
@@ -599,6 +619,33 @@ mod tests {
             ],
             "반복 상태줄은 한 줄로 접혀 질문·선택지가 살아남아야 한다"
         );
+    }
+
+    /// 2026-07-17 사용자 회귀: 화면 하단 장식(모드 표시 + statusline)이 미리보기를
+    /// 차지했다. 아래 3줄은 실제 화면에서 그대로 가져온 것.
+    #[test]
+    fn last_lines_화면하단_장식을_걸러_질문이_보이게_한다() {
+        let log = "Do you want to proceed?\n\
+                   ❯ 1. Yes\n\
+                   ⏵⏵ auto mode on (shift+tab to cycle)\n\
+                   SKRT  docs/selected-train-alert-p an  Opus 4.8 (1M context)  [█░░░░░░░░░] 23%\n\
+                   ⏵⏵ auto mode on (shift+tab to cycle)\n";
+        assert_eq!(
+            last_lines(log, 4),
+            vec!["Do you want to proceed?".to_owned(), "❯ 1. Yes".to_owned()],
+            "모드 표시·statusline은 빠지고 질문·선택지만 남아야 한다"
+        );
+    }
+
+    /// 게이지가 없는 평범한 출력은 걸러선 안 된다 — %가 있다는 이유만으로 버리면
+    /// "coverage 23%" 같은 진짜 결과가 사라진다.
+    #[test]
+    fn is_screen_chrome_일반_출력은_걸러지지_않는다() {
+        assert!(!is_screen_chrome("All tests passed: coverage 23%"));
+        assert!(!is_screen_chrome("Do you want to proceed?"));
+        assert!(!is_screen_chrome("  2. No"));
+        assert!(is_screen_chrome("⏵⏵ auto mode on (shift+tab to cycle)"));
+        assert!(is_screen_chrome("SKRT  Opus 4.8 (1M context)  [█░░░] 23%"));
     }
 
     /// 떨어져 있는 같은 줄은 접지 않는다 — 연속만 중복으로 본다(맥락 유지).

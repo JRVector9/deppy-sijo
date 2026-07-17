@@ -1,8 +1,9 @@
 //! 세션 cwd 레포의 git 변경분(diff) 리뷰 패널 (PR-D).
 //!
 //! 사이드바 세션 우클릭 「변경 보기」 → 독립 egui Window. 백그라운드 스레드에서
-//! git_cli(status --short / diff / diff --cached)를 수집하고, unified diff를 줄
-//! 단위로 분류해 색으로 렌더한다. 명시적 조회형 — 캐시 없이 닫으면 상태를 버린다.
+//! git_cli(status --porcelain / diff / diff --cached / untracked별 diff --no-index)를
+//! 수집하고, unified diff를 줄 단위로 분류해 색으로 렌더한다. 명시적 조회형 —
+//! 캐시 없이 닫으면 상태를 버린다.
 
 use std::path::Path;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -14,6 +15,18 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// 수 MB로 상주하지 않게 줄 경계에서 자른다).
 const MAX_DIFF_BYTES: usize = 200 * 1024;
 const MAX_DIFF_LINES: usize = 4000;
+/// untracked 새 파일 diff를 수집할 최대 파일 수 — 넘치면 개수 라벨로 접는다.
+const MAX_UNTRACKED_FILES: usize = 50;
+/// git 설정 무력화 — 사용자/레포 설정(color.ui=always, diff.external, pager)이
+/// 파서를 깨거나 외부 앱을 띄우지 않게 모든 수집 호출 앞에 강제한다 (codex 리뷰).
+const GIT_CONFIG_OVERRIDES: &[&str] = &[
+    "-c",
+    "color.ui=false",
+    "-c",
+    "diff.external=",
+    "-c",
+    "core.pager=cat",
+];
 
 /// unified diff 한 줄의 의미 분류.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +104,8 @@ enum DiffRow {
     Line(DiffLineKind, String),
     /// 상한 잘림 안내 (i18n `diff.truncated`).
     Truncated,
+    /// 표시 상한을 넘어 생략된 untracked 파일 수 (i18n `diff.untracked_more`).
+    UntrackedMore(usize),
 }
 
 /// 백그라운드 수집 결과. rows가 비면 작업 트리가 깨끗한 것이다.
@@ -99,38 +114,171 @@ struct DiffData {
     rows: Vec<DiffRow>,
 }
 
-/// cwd 레포의 status/diff(unstaged+staged)를 수집해 렌더 행으로 만든다.
+/// `status --porcelain -z` 항목 — XY 상태와 경로 (rename/copy는 원경로 포함).
+struct StatusEntry {
+    xy: String,
+    path: String,
+    orig: Option<String>,
+}
+
+/// porcelain v1 `-z` 파싱 — NUL 구분이라 경로 인용/이스케이프가 없고, XY에 R/C가
+/// 있으면 다음 필드가 원경로다. 잘린 출력이면 마지막 부분 항목을 버린다
+/// (`-z`는 항상 NUL로 끝나므로 비어 있지 않은 마지막 조각 = 불완전 항목).
+fn parse_status_z(raw: &str, truncated: bool) -> Vec<StatusEntry> {
+    let mut fields: Vec<&str> = raw.split('\0').collect();
+    if truncated {
+        fields.pop();
+    }
+    let mut fields = fields.into_iter().filter(|field| !field.is_empty());
+    let mut entries = Vec::new();
+    while let Some(field) = fields.next() {
+        // "XY path" 최소형 — XY 2자 + 공백 1 + 경로. 형식 미달은 방어적으로 버린다.
+        if field.len() < 4 || !field.is_char_boundary(2) || !field.is_char_boundary(3) {
+            continue;
+        }
+        let xy = &field[..2];
+        let path = &field[3..];
+        let orig = (xy.contains('R') || xy.contains('C'))
+            .then(|| fields.next())
+            .flatten()
+            .map(str::to_owned);
+        entries.push(StatusEntry {
+            xy: xy.to_owned(),
+            path: path.to_owned(),
+            orig,
+        });
+    }
+    entries
+}
+
+/// status 섹션 표시용 한 줄 — `--short`가 보여주던 `XY old -> new` 모양을 유지한다.
+fn status_display(entry: &StatusEntry) -> String {
+    match &entry.orig {
+        Some(orig) => format!("{} {} -> {}", entry.xy, orig, entry.path),
+        None => format!("{} {}", entry.xy, entry.path),
+    }
+}
+
+/// 설정 무력화 접두어를 붙여 상한부 git 실행 — 수집 호출은 전부 이 경로를 쓴다.
+fn run_limited(root: &Path, tail: &[&str], max_bytes: usize) -> anyhow::Result<(String, bool)> {
+    let mut args: Vec<&str> = GIT_CONFIG_OVERRIDES.to_vec();
+    args.extend_from_slice(tail);
+    crate::git_cli::run_git_limited(root, &args, GIT_TIMEOUT, max_bytes)
+}
+
+/// cwd 레포의 status/diff(unstaged+staged+untracked)를 수집해 렌더 행으로 만든다.
 /// 블로킹 — 백그라운드 스레드에서만 호출한다 (git_cli 규칙).
 fn collect_diff(cwd: &Path) -> anyhow::Result<DiffData> {
     let root = crate::git_cli::repo_root(cwd, GIT_TIMEOUT)?;
-    let status = crate::git_cli::run_git(&root, &["status", "--short"], GIT_TIMEOUT)?;
-    let unstaged = crate::git_cli::run_git(&root, &["diff"], GIT_TIMEOUT)?;
-    let staged = crate::git_cli::run_git(&root, &["diff", "--cached"], GIT_TIMEOUT)?;
+    // -uall: 디렉터리 접힘 없이 untracked를 파일 단위로 나열 (신규 파일 diff 대상).
+    let (status_raw, status_truncated) = run_limited(
+        &root,
+        &["status", "--porcelain", "-z", "-uall"],
+        MAX_DIFF_BYTES,
+    )?;
+    let entries = parse_status_z(&status_raw, status_truncated);
+    let (unstaged, unstaged_truncated) =
+        run_limited(&root, &["diff", "--no-ext-diff"], MAX_DIFF_BYTES)?;
+    let (staged, staged_truncated) = run_limited(
+        &root,
+        &["diff", "--no-ext-diff", "--cached"],
+        MAX_DIFF_BYTES,
+    )?;
+
     let mut rows = Vec::new();
-    if !status.trim().is_empty() {
+    if !entries.is_empty() {
         rows.push(DiffRow::Section("diff.section.status"));
-        rows.extend(status.lines().map(|line| DiffRow::Status(line.to_owned())));
+        rows.extend(
+            entries
+                .iter()
+                .take(MAX_DIFF_LINES)
+                .map(|entry| DiffRow::Status(status_display(entry))),
+        );
+        if status_truncated || entries.len() > MAX_DIFF_LINES {
+            rows.push(DiffRow::Truncated);
+        }
     }
-    append_diff_section(&mut rows, "diff.section.unstaged", &unstaged);
-    append_diff_section(&mut rows, "diff.section.staged", &staged);
+    append_diff_section(
+        &mut rows,
+        "diff.section.unstaged",
+        &unstaged,
+        unstaged_truncated,
+    );
+    append_diff_section(&mut rows, "diff.section.staged", &staged, staged_truncated);
+    append_untracked_section(&mut rows, &root, &entries)?;
     Ok(DiffData {
         repo_root: root.display().to_string(),
         rows,
     })
 }
 
-fn append_diff_section(rows: &mut Vec<DiffRow>, key: &'static str, diff: &str) {
+/// untracked(`??`) 새 파일 내용 — 스테이징 전 신규 파일은 "에이전트가 뭘 바꿨나"의
+/// 흔한 핵심인데 `git diff`에는 나오지 않는다 (codex 리뷰 P1). 파일별
+/// `diff --no-index /dev/null`로 수집하고(차이 있으면 종료코드 1 —
+/// run_git_limited가 성공으로 본다), 섹션 전체에 같은 바이트 상한과 파일 수 상한을
+/// 적용한다. 바이너리는 git이 주는 "Binary files …" 한 줄이 그대로 표시된다.
+fn append_untracked_section(
+    rows: &mut Vec<DiffRow>,
+    root: &Path,
+    entries: &[StatusEntry],
+) -> anyhow::Result<()> {
+    let untracked: Vec<&str> = entries
+        .iter()
+        .filter(|entry| entry.xy == "??")
+        .map(|entry| entry.path.as_str())
+        .collect();
+    if untracked.is_empty() {
+        return Ok(());
+    }
+    let mut diff = String::new();
+    let mut truncated = false;
+    let mut shown = 0usize;
+    for path in untracked.iter().take(MAX_UNTRACKED_FILES) {
+        let budget = MAX_DIFF_BYTES.saturating_sub(diff.len());
+        if budget == 0 {
+            truncated = true;
+            break;
+        }
+        let (out, out_truncated) = run_limited(
+            root,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-index",
+                "--",
+                "/dev/null",
+                path,
+            ],
+            budget,
+        )?;
+        diff.push_str(&out);
+        truncated |= out_truncated;
+        shown += 1;
+    }
+    append_diff_section(rows, "diff.section.untracked", &diff, truncated);
+    if untracked.len() > shown {
+        rows.push(DiffRow::UntrackedMore(untracked.len() - shown));
+    }
+    Ok(())
+}
+
+fn append_diff_section(
+    rows: &mut Vec<DiffRow>,
+    key: &'static str,
+    diff: &str,
+    collector_truncated: bool,
+) {
     if diff.trim().is_empty() {
         return;
     }
-    let (clipped, truncated) = clip_diff(diff);
+    let (clipped, clip_truncated) = clip_diff(diff);
     rows.push(DiffRow::Section(key));
     rows.extend(
         parse_unified_diff(clipped)
             .into_iter()
             .map(|(kind, line)| DiffRow::Line(kind, line.to_owned())),
     );
-    if truncated {
+    if clip_truncated || collector_truncated {
         rows.push(DiffRow::Truncated);
     }
 }
@@ -183,6 +331,11 @@ fn render_diff_row(ui: &mut egui::Ui, catalog: &i18n::Catalog, row: &DiffRow) {
         DiffRow::Truncated => egui::RichText::new(catalog.t("diff.truncated", &[]))
             .monospace()
             .weak(),
+        DiffRow::UntrackedMore(count) => {
+            egui::RichText::new(catalog.t("diff.untracked_more", &[("count", &count.to_string())]))
+                .monospace()
+                .weak()
+        }
     };
     ui.add(egui::Label::new(text).truncate());
 }
@@ -435,6 +588,23 @@ mod tests {
         assert!(clipped.lines().all(|line| line == "+한글변경줄한글변경줄"));
     }
 
+    #[test]
+    fn status_z_파싱은_rename의_원경로를_함께_담는다() {
+        let raw = "RM new.txt\0old.txt\0?? add.txt\0 M mod.txt\0";
+        let entries = parse_status_z(raw, false);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].xy, "RM");
+        assert_eq!(entries[0].path, "new.txt");
+        assert_eq!(entries[0].orig.as_deref(), Some("old.txt"));
+        assert_eq!(status_display(&entries[0]), "RM old.txt -> new.txt");
+        assert_eq!(entries[1].xy, "??");
+        assert_eq!(entries[2].xy, " M");
+        // 잘린 출력이면 NUL로 끝나지 않은 마지막 부분 항목을 버린다.
+        let clipped = parse_status_z("?? a.txt\0?? b.tx", true);
+        assert_eq!(clipped.len(), 1);
+        assert_eq!(clipped[0].path, "a.txt");
+    }
+
     // ── 통합: 임시 git repo (git_cli::tests::temp_repo 패턴) ──
 
     fn temp_repo() -> std::path::PathBuf {
@@ -523,6 +693,70 @@ mod tests {
         commit_all(&repo, "init");
         let data = collect_diff(&repo).unwrap();
         assert!(data.rows.is_empty(), "{:?}", data.rows);
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn collect는_untracked_새_파일_내용을_잡는다() {
+        // codex 리뷰 P1 회귀 — 스테이징 전 신규 파일은 status에만 뜨고 diff 본문이
+        // 없었다. untracked 섹션이 + 줄로 내용을 보여줘야 한다.
+        let repo = temp_repo();
+        std::fs::write(repo.join("a.txt"), "line\n").unwrap();
+        commit_all(&repo, "init");
+        std::fs::write(repo.join("fresh.txt"), "untracked content\n").unwrap();
+
+        let data = collect_diff(&repo).unwrap();
+        let rows = &data.rows;
+        let untracked = section_index(rows, "diff.section.untracked");
+        assert!(
+            rows.iter().skip(untracked).any(|row| matches!(
+                row,
+                DiffRow::Line(DiffLineKind::Addition, l) if l == "+untracked content"
+            )),
+            "untracked 내용의 + 줄: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row, DiffRow::Status(l) if l == "?? fresh.txt")),
+            "status의 ?? 항목: {rows:?}"
+        );
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn collect는_color_와_external_diff_설정이_있어도_정상_출력을_받는다() {
+        // codex 리뷰 P2 회귀 — color.ui=always는 파이프에도 ANSI를 섞고
+        // diff.external은 외부 명령을 띄운다. -c 무력화 + --no-ext-diff로 차단한다.
+        let repo = temp_repo();
+        std::fs::write(repo.join("a.txt"), "old\n").unwrap();
+        commit_all(&repo, "init");
+        crate::git_cli::run_git(&repo, &["config", "color.ui", "always"], GIT_TIMEOUT).unwrap();
+        crate::git_cli::run_git(
+            &repo,
+            &["config", "diff.external", "/nonexistent-external-diff"],
+            GIT_TIMEOUT,
+        )
+        .unwrap();
+        std::fs::write(repo.join("a.txt"), "new\n").unwrap();
+        std::fs::write(repo.join("fresh.txt"), "u\n").unwrap();
+
+        let data = collect_diff(&repo).unwrap();
+        for row in &data.rows {
+            let text = match row {
+                DiffRow::Status(line) | DiffRow::Line(_, line) => line.as_str(),
+                _ => continue,
+            };
+            assert!(!text.contains('\u{1b}'), "ANSI 이스케이프 발견: {text:?}");
+        }
+        // 색이 섞였다면 ±가 Context로 빠진다 — 분류까지 확인.
+        assert!(
+            data.rows.iter().any(|row| matches!(
+                row,
+                DiffRow::Line(DiffLineKind::Addition, l) if l == "+new"
+            )),
+            "{:?}",
+            data.rows
+        );
         std::fs::remove_dir_all(&repo).ok();
     }
 

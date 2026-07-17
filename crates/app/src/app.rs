@@ -5759,11 +5759,11 @@ impl eframe::App for App {
 
         // 작업창은 여백 없이 경계까지 채운다 — CentralPanel 기본 inner_margin(8) 탓에
         // pane 좌/상/우 여백이 보였다(#69 사용자).
-        // 작업창 배경은 테마 무관 항상 다크(#18181c) — 라이트 테마에서 터미널 하단
-        // 여백/pane 틈에 밝은 패널색이 드러났다(#80·#81).
+        // 작업창 배경은 Target의 tab strip 바탕(#17171c)으로 고정한다. 실제 PTY는
+        // WorkspaceUi가 한 단계 더 어두운 inset surface(#0f1117)에 렌더한다.
         let central_frame = egui::Frame::central_panel(&ui.ctx().global_style())
             .inner_margin(egui::Margin::ZERO)
-            .fill(egui::Color32::from_rgb(0x18, 0x18, 0x1c));
+            .fill(egui::Color32::from_rgb(0x17, 0x17, 0x1c));
         let mut home_action = None;
         egui::CentralPanel::default()
             .frame(central_frame)

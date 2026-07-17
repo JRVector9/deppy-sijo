@@ -47,6 +47,11 @@ impl std::ops::AddAssign for RenderCounters {
 /// 잘리지 않는다.
 pub const HORIZONTAL_PADDING: f32 = 3.0;
 
+/// backend snapshot이 기본 셀 배경에 쓰는 레거시 색. 새 AgentTerminal surface에서는
+/// 이 색을 아래의 더 어두운 작업면 색으로 remap하고, 그 밖의 ANSI 배경색은 유지한다.
+const SNAPSHOT_DEFAULT_BG: egui::Color32 = egui::Color32::from_rgb(0x18, 0x18, 0x1c);
+const TERMINAL_SURFACE_BG: egui::Color32 = egui::Color32::from_rgb(0x0f, 0x11, 0x17);
+
 /// 전체 터미널 폭에서 좌우 내부 여백을 제외한 셀 그리드 가용 폭.
 pub fn grid_width_for_available(available_width: f32) -> f32 {
     (available_width.max(0.0) - HORIZONTAL_PADDING * 2.0).max(0.0)
@@ -273,7 +278,7 @@ pub fn draw(
     let content_rect = terminal_content_rect(rect);
     let painter = background_painter.with_clip_rect(content_rect);
     let origin = content_rect.min;
-    let default_bg = egui::Color32::from_rgb(0x18, 0x18, 0x1c);
+    let default_bg = TERMINAL_SURFACE_BG;
     let selection = selection.and_then(|(a, b)| normalize_selection_range(snapshot, a, b));
     background_painter.rect_filled(rect, 0.0, default_bg);
 
@@ -294,7 +299,7 @@ pub fn draw(
                 .and_then(|cached| cached.as_ref())
                 .is_none();
         if needs_rebuild {
-            let row_cache = build_row_cache(&painter, snapshot, row, &font_id, default_bg);
+            let row_cache = build_row_cache(&painter, snapshot, row, &font_id, SNAPSHOT_DEFAULT_BG);
             if let Some(slot) = cache.rows_cache.get_mut(row) {
                 *slot = Some(row_cache);
                 cache.counters.rows_rebuilt += 1;

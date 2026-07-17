@@ -18,6 +18,53 @@ use crate::config::TerminalConfig;
 /// 경로 해석 캐시 TTL (path_click_cache · session_cwd_cache 공통).
 const PATH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
+// AgentTerminal 목업의 중앙 작업면 치수. 실제 PTY를 가짜 카드로 바꾸지 않고,
+// 탭 strip + inset terminal surface라는 시각 구조만 그대로 적용한다.
+const TERMINAL_TAB_STRIP_HEIGHT: f32 = 54.0;
+const TERMINAL_TAB_TOP: f32 = 8.0;
+const TERMINAL_TAB_HEIGHT: f32 = 44.0;
+const TERMINAL_SURFACE_MARGIN_X: f32 = 8.0;
+const TERMINAL_SURFACE_MARGIN_BOTTOM: f32 = 7.0;
+const TERMINAL_STREAM_PADDING: f32 = 18.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TerminalSurfaceLayout {
+    strip: egui::Rect,
+    surface: egui::Rect,
+    content: egui::Rect,
+}
+
+fn terminal_surface_layout(rect: egui::Rect) -> TerminalSurfaceLayout {
+    let strip_height = TERMINAL_TAB_STRIP_HEIGHT.min(rect.height().max(0.0));
+    let strip = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(rect.right(), rect.top() + strip_height),
+    );
+    let margin_x = TERMINAL_SURFACE_MARGIN_X.min(rect.width().max(0.0) * 0.25);
+    let surface_top = strip.bottom().min(rect.bottom());
+    let remaining_height = (rect.bottom() - surface_top).max(0.0);
+    let margin_bottom = TERMINAL_SURFACE_MARGIN_BOTTOM.min(remaining_height * 0.25);
+    let surface_bottom = (rect.bottom() - margin_bottom).max(surface_top);
+    let surface = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + margin_x, surface_top),
+        egui::pos2(
+            (rect.right() - margin_x).max(rect.left() + margin_x),
+            surface_bottom,
+        ),
+    );
+    let pad_x = TERMINAL_STREAM_PADDING.min(surface.width().max(0.0) * 0.25);
+    let pad_y = TERMINAL_STREAM_PADDING.min(surface.height().max(0.0) * 0.25);
+    let content = egui::Rect::from_min_max(
+        egui::pos2(surface.left() + pad_x, surface.top() + pad_y),
+        egui::pos2(surface.right() - pad_x, surface.bottom() - pad_y),
+    );
+    TerminalSurfaceLayout {
+        strip,
+        surface,
+        content,
+    }
+}
+
 /// 세션 셸 cwd 캐시 항목 — hover 경로 해석용. lsof(수십 ms)는 백그라운드 스레드가
 /// 채우고 UI 스레드는 stale 값(있으면)으로 즉시 응답한다.
 struct CwdCacheEntry {
@@ -1153,12 +1200,48 @@ impl WorkspaceUi {
         self.close_confirm_dialog(ui.ctx(), client, catalog);
 
         let rect = ui.available_rect_before_wrap();
+        let surface = terminal_surface_layout(rect);
+        let strip_fill = egui::Color32::from_rgb(0x17, 0x17, 0x1c);
+        let terminal_fill = egui::Color32::from_rgb(0x0f, 0x11, 0x17);
+        let border = egui::Stroke::new(1.0, egui::Color32::from_rgb(0x3a, 0x3a, 0x42));
+        ui.painter().rect_filled(surface.strip, 0.0, strip_fill);
+        ui.painter().hline(
+            surface.strip.x_range(),
+            surface.strip.bottom() - 0.5,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(0x2a, 0x2a, 0x33)),
+        );
+        ui.painter()
+            .rect_filled(surface.surface, 0.0, terminal_fill);
+        // 목업의 terminal-pane은 tab과 이어지도록 위쪽 border가 없다.
+        ui.painter().line_segment(
+            [surface.surface.left_top(), surface.surface.left_bottom()],
+            border,
+        );
+        ui.painter().line_segment(
+            [surface.surface.right_top(), surface.surface.right_bottom()],
+            border,
+        );
+        ui.painter().line_segment(
+            [
+                surface.surface.left_bottom(),
+                surface.surface.right_bottom(),
+            ],
+            border,
+        );
+        if let Some(pane) = mux
+            .focused_pane
+            .as_ref()
+            .and_then(|id| active_tab.panes.iter().find(|pane| &pane.id == id))
+            .or_else(|| active_tab.panes.first())
+        {
+            self.render_terminal_tab_strip(ui, surface.strip, pane, config, client, catalog);
+        }
         let layout = active_tab.layout.clone();
         let tab_id = active_tab.id.clone();
         let mut split_path = Vec::new();
         self.render_node(
             ui,
-            rect,
+            surface.content,
             &layout,
             &mux,
             config,
@@ -1170,6 +1253,164 @@ impl WorkspaceUi {
 
         // 응답(MuxUpdated/Viewport)을 다음 프레임에서 수신하도록 보장
         self.flush_command_repaint(ui.ctx());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_terminal_tab_strip(
+        &mut self,
+        ui: &mut egui::Ui,
+        strip: egui::Rect,
+        pane: &runtime::PaneSnapshot,
+        config: &TerminalConfig,
+        client: &dyn RuntimeClient,
+        catalog: &i18n::Catalog,
+    ) {
+        let osc = self.session_osc_title(pane.session_id);
+        let title =
+            self.resolve_session_title(&pane.title, pane.session_id, osc.as_deref(), catalog);
+        let font = egui::FontId::proportional(13.0);
+        let title_width = ui
+            .painter()
+            .layout_no_wrap(title.clone(), font.clone(), egui::Color32::WHITE)
+            .size()
+            .x;
+        let controls_width = 38.0 + 5.0;
+        let tab_available = (strip.width() - 16.0 - controls_width).max(64.0);
+        let tab_width = (title_width + 78.0).max(124.0).min(tab_available);
+        let tab = egui::Rect::from_min_size(
+            strip.min + egui::vec2(8.0, TERMINAL_TAB_TOP),
+            egui::vec2(tab_width, TERMINAL_TAB_HEIGHT.min(strip.height())),
+        );
+        let tab_fill = egui::Color32::from_rgb(0x22, 0x22, 0x2a);
+        let tab_border = egui::Color32::from_rgb(0x3a, 0x3a, 0x42);
+        ui.painter().rect_filled(tab, 2.0, tab_fill);
+        ui.painter().rect_stroke(
+            tab,
+            2.0,
+            egui::Stroke::new(1.0, tab_border),
+            egui::StrokeKind::Inside,
+        );
+        // active tab의 아래 변은 terminal surface 쪽으로 열린 것처럼 보이게 채운다.
+        ui.painter().hline(
+            tab.x_range(),
+            tab.bottom() - 0.5,
+            egui::Stroke::new(1.5, tab_fill),
+        );
+        let tab_response = ui.interact(
+            tab,
+            egui::Id::new(("terminal_active_tab", &pane.id)),
+            egui::Sense::click(),
+        );
+        if tab_response.clicked()
+            && self.mux.as_ref().and_then(|mux| mux.focused_pane.as_ref()) != Some(&pane.id)
+        {
+            self.request_pane_focus(client, pane.id.clone());
+        }
+        self.pane_context_menu(&tab_response, &pane.id, config, client, catalog);
+
+        let status = pane
+            .session_id
+            .and_then(|session| self.sessions.get(&session))
+            .and_then(|view| view.status);
+        let status_color = status
+            .map(|status| crate::ui::file_tree::session_status_color(Some(status), ui.visuals()))
+            .unwrap_or(egui::Color32::from_rgb(0x55, 0xc8, 0x79));
+        let center_y = tab.center().y;
+        ui.painter()
+            .circle_filled(egui::pos2(tab.left() + 16.0, center_y), 4.0, status_color);
+
+        let close = egui::Rect::from_center_size(
+            egui::pos2(tab.right() - 17.0, center_y),
+            egui::vec2(26.0, 26.0),
+        );
+        let title_clip = egui::Rect::from_min_max(
+            egui::pos2(tab.left() + 29.0, tab.top()),
+            egui::pos2(close.left() - 4.0, tab.bottom()),
+        );
+        let title_galley =
+            ui.painter()
+                .layout_no_wrap(title, font, egui::Color32::from_rgb(0xd7, 0xd8, 0xdb));
+        ui.painter().with_clip_rect(title_clip).galley(
+            egui::pos2(title_clip.left(), center_y - title_galley.size().y / 2.0),
+            title_galley,
+            egui::Color32::from_rgb(0xd7, 0xd8, 0xdb),
+        );
+        let close_response = ui.interact(
+            close,
+            egui::Id::new(("terminal_close_tab", &pane.id)),
+            egui::Sense::click(),
+        );
+        let close_color = if close_response.hovered() {
+            egui::Color32::from_rgb(0xf2, 0xf2, 0xf2)
+        } else {
+            egui::Color32::from_rgb(0xc8, 0xcc, 0xd2)
+        };
+        let d = 4.5;
+        ui.painter().line_segment(
+            [
+                close.center() + egui::vec2(-d, -d),
+                close.center() + egui::vec2(d, d),
+            ],
+            egui::Stroke::new(1.5, close_color),
+        );
+        ui.painter().line_segment(
+            [
+                close.center() + egui::vec2(-d, d),
+                close.center() + egui::vec2(d, -d),
+            ],
+            egui::Stroke::new(1.5, close_color),
+        );
+        if close_response
+            .on_hover_text(catalog.t("workspace.close_pane", &[]))
+            .clicked()
+        {
+            self.request_close_pane(client, pane.id.clone());
+        }
+
+        let plus = egui::Rect::from_min_size(
+            egui::pos2(tab.right() + 5.0, strip.bottom() - 41.0),
+            egui::vec2(38.0, 38.0),
+        );
+        let plus_response = ui.interact(
+            plus,
+            egui::Id::new(("terminal_add_tab", &pane.id)),
+            egui::Sense::click(),
+        );
+        if plus_response.hovered() {
+            ui.painter().rect_filled(plus, 1.0, tab_fill);
+        }
+        let plus_color = if plus_response.hovered() {
+            ui.visuals().selection.stroke.color
+        } else {
+            egui::Color32::from_rgb(0xc8, 0xcc, 0xd2)
+        };
+        ui.painter().line_segment(
+            [
+                plus.center() + egui::vec2(-5.0, 0.0),
+                plus.center() + egui::vec2(5.0, 0.0),
+            ],
+            egui::Stroke::new(1.5, plus_color),
+        );
+        ui.painter().line_segment(
+            [
+                plus.center() + egui::vec2(0.0, -5.0),
+                plus.center() + egui::vec2(0.0, 5.0),
+            ],
+            egui::Stroke::new(1.5, plus_color),
+        );
+        if plus_response
+            .on_hover_text(catalog.t("workspace.new_shell", &[]))
+            .clicked()
+        {
+            self.send(
+                client,
+                RuntimeCommand::SpawnShell {
+                    cols: 80,
+                    rows: 24,
+                    scrollback_lines: config.scrollback_lines as usize,
+                },
+            );
+        }
     }
 
     /// layout 트리를 rect 분할로 재귀 렌더한다.
@@ -1362,159 +1603,8 @@ impl WorkspaceUi {
         }
         self.pane_context_menu(&pane_resp, pane_id, config, client, catalog);
 
-        // pane 헤더 바 (2026-07-05): [상태 제목] [×] ... [+셸] [분할│] [분할─]
-        // 닫기/분할 대상이 "이 pane"임이 시각적으로 자명하다 — 탭바 제거의 대체 UI.
-        // pane 헤더는 터미널과 동일한 다크 배경(별도 틴트 없음 — 사용자 요청 2026-07-07).
-        // 아래 hairline 한 줄로만 최소 분리한다. 포커스는 제목/글리프 accent 색으로 표시.
-        let status = pane
-            .session_id
-            .and_then(|s| self.sessions.get(&s))
-            .and_then(|v| v.status);
-        let is_agent = status.is_some();
-        let accent = ui.visuals().selection.bg_fill;
-        // 터미널 렌더러의 default_bg와 동일 (renderer_egui) — 헤더가 터미널로 이어져 보이게.
-        let header_fill = egui::Color32::from_rgb(0x18, 0x18, 0x1c);
-        let header = egui::Frame::new()
-            .fill(header_fill)
-            // 좌측 여백 축소 — ◆ 아이콘이 왼쪽 가까이 붙게(사용자 요청).
-            .inner_margin(egui::Margin {
-                left: 3,
-                right: 8,
-                top: 4,
-                bottom: 4,
-            })
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    // 아이콘-제목 간격을 좁힌다(사용자 요청). 글리프 박스도 축소.
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    // 타입 글리프(◆/▸)를 도형으로 — 상태 있으면 상태색, 없으면 focus/dim
-                    let (grect, _) =
-                        ui.allocate_exact_size(egui::vec2(11.0, 14.0), egui::Sense::hover());
-                    let glyph_color = if let Some(s) = status {
-                        crate::ui::file_tree::session_status_color(Some(s), ui.visuals())
-                    } else if focused {
-                        accent
-                    } else {
-                        egui::Color32::from_rgb(0x8b, 0x8f, 0x98)
-                    };
-                    crate::ui::file_tree::paint_type_glyph(
-                        ui.painter(),
-                        grect.center(),
-                        is_agent,
-                        glyph_color,
-                    );
-                    // 타이틀 — 다크 헤더 위이므로 밝은 색 명시 (theme text는 라이트
-                    // 테마에서 어두워 안 보인다). focused는 accent.
-                    let title_color = if focused {
-                        accent
-                    } else {
-                        egui::Color32::from_rgb(0xc8, 0xcc, 0xd2)
-                    };
-                    // 우측 컨트롤 폭 예약 — 긴 제목이 닫기/분할 버튼을 밀어내지
-                    // 않게 truncate 최대폭 제한 (codex, 사이드바 헤더와 동일 패턴)
-                    let osc = self.session_osc_title(pane.session_id);
-                    let pane_title = self.resolve_session_title(
-                        &pane.title,
-                        pane.session_id,
-                        osc.as_deref(),
-                        catalog,
-                    );
-                    let title_resp = ui
-                        .scope(|ui| {
-                            ui.set_max_width((ui.available_width() - 120.0).max(30.0));
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(pane_title)
-                                        .size(13.0)
-                                        .strong()
-                                        .color(title_color),
-                                )
-                                .sense(egui::Sense::click())
-                                .truncate(),
-                            )
-                        })
-                        .inner;
-                    if title_resp.clicked() && !focused {
-                        self.request_pane_focus(client, pane_id.clone());
-                    }
-                    ui.add_space(4.0); // × 앞 여백 (목업 §pane-head)
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new("×")
-                                    .color(egui::Color32::from_rgb(0x8b, 0x8f, 0x98)),
-                            )
-                            .frame(false),
-                        )
-                        .on_hover_text(catalog.t("workspace.close_pane", &[]))
-                        .clicked()
-                    {
-                        self.request_close_pane(client, pane_id.clone());
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if crate::ui::file_tree::paint_split(ui, true)
-                            .on_hover_text(catalog.t("workspace.split_vertical_short", &[]))
-                            .clicked()
-                        {
-                            self.send(
-                                client,
-                                RuntimeCommand::SplitPane {
-                                    pane: pane_id.clone(),
-                                    direction: SplitDirection::Vertical,
-                                    scrollback_lines: config.scrollback_lines as usize,
-                                },
-                            );
-                        }
-                        if crate::ui::file_tree::paint_split(ui, false)
-                            .on_hover_text(catalog.t("workspace.split_horizontal_short", &[]))
-                            .clicked()
-                        {
-                            self.send(
-                                client,
-                                RuntimeCommand::SplitPane {
-                                    pane: pane_id.clone(),
-                                    direction: SplitDirection::Horizontal,
-                                    scrollback_lines: config.scrollback_lines as usize,
-                                },
-                            );
-                        }
-                        let (pr, plus_resp) =
-                            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-                        let pcol = if plus_resp.hovered() {
-                            egui::Color32::from_rgb(0xc8, 0xcc, 0xd2)
-                        } else {
-                            egui::Color32::from_rgb(0x8b, 0x8f, 0x98)
-                        };
-                        ui.painter().text(
-                            pr.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "+",
-                            egui::FontId::proportional(15.0),
-                            pcol,
-                        );
-                        if plus_resp
-                            .on_hover_text(catalog.t("workspace.new_shell", &[]))
-                            .clicked()
-                        {
-                            self.send(
-                                client,
-                                RuntimeCommand::SpawnShell {
-                                    cols: 80,
-                                    rows: 24,
-                                    scrollback_lines: config.scrollback_lines as usize,
-                                },
-                            );
-                        }
-                    });
-                });
-            });
-        // 헤더-터미널 최소 구분선(1px hairline) — 배경색이 같아 경계가 없어지므로.
-        let hr = header.response.rect;
-        ui.painter().hline(
-            hr.x_range(),
-            hr.bottom() - 0.5,
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(0x2a, 0x2a, 0x30)),
-        );
+        // 활성 pane의 제목/닫기/새 셸은 작업면 상단의 단일 tab strip에서 렌더한다.
+        // 여기에는 실제 PTY만 남겨 Target처럼 tab 아래 inset surface로 바로 이어진다.
         if pane.session_id.is_some() {
             if pane_resp
                 .dnd_hover_payload::<std::path::PathBuf>()
@@ -2083,20 +2173,13 @@ impl WorkspaceUi {
             );
         }
 
-        // 포커스 pane 탑라인 — 포인트색 1px 라인을 상단에 항상 유지(단일/다중 pane 동일).
-        if focused {
-            ui.painter().hline(
-                pane_rect.x_range(),
-                pane_rect.top() + 0.5,
-                egui::Stroke::new(1.0, accent),
-            );
-        }
         // pane 전체 강조 플래시 — 포커스 이동·입력요청·작업완료 시 2초 페이드(2026-07-12 사용자).
         if let Some(session) = pane.session_id
             && let Some(&until) = self.session_flash.get(&session)
         {
             let now = std::time::Instant::now();
             if now < until {
+                let accent = ui.visuals().selection.bg_fill;
                 let remain = (until - now).as_secs_f32() / PANE_FLASH.as_secs_f32();
                 let alpha = (remain.clamp(0.0, 1.0) * 255.0) as u8;
                 let color = egui::Color32::from_rgba_unmultiplied(
@@ -3585,6 +3668,35 @@ mod tests {
     use runtime::{MuxPaneId, MuxTabId, PaneSnapshot, TabSnapshot};
     use std::sync::Mutex;
     use terminal::{CursorShape, CursorSnapshot, TerminalCell};
+
+    #[test]
+    fn target_터미널은_54pt_탭과_8_18pt_inset을_유지한다() {
+        // 사용자 Target(1178×716 @2x)의 논리 크기와 같은 589×358 surface.
+        let layout = terminal_surface_layout(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(589.0, 358.0),
+        ));
+        assert_eq!(layout.strip.height(), 54.0);
+        assert_eq!(layout.surface.left(), 8.0);
+        assert_eq!(layout.surface.right(), 581.0);
+        assert_eq!(layout.surface.top(), 54.0);
+        assert_eq!(layout.surface.bottom(), 351.0);
+        assert_eq!(layout.content.left(), 26.0);
+        assert_eq!(layout.content.top(), 72.0);
+        assert_eq!(layout.content.right(), 563.0);
+        assert_eq!(layout.content.bottom(), 333.0);
+    }
+
+    #[test]
+    fn target_터미널_inset은_아주_작은_split에서도_뒤집히지_않는다() {
+        let layout = terminal_surface_layout(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(30.0, 60.0),
+        ));
+        assert!(layout.surface.is_positive());
+        assert!(layout.content.is_positive());
+        assert!(layout.surface.contains_rect(layout.content));
+    }
 
     /// hover 커서 회귀 가드 — 백그라운드 cwd 해석(stale-while-revalidate) 후
     /// 폴더 단어가 Dir로 잡혀야 한다 (2026-07-17 사용자: 커서가 안 바뀜).

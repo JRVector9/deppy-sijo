@@ -2900,32 +2900,6 @@ fn clipped_line(
     ui.painter().layout_job(job)
 }
 
-/// 타입 글리프를 도형으로 그린다: agent=마름모(◆), shell=삼각형(▸). 폰트에 없는
-/// 글리프(□ 깨짐)를 피하려 painter로 직접 그린다. `center` 중심, `d`≈3.5 반경.
-pub(crate) fn paint_type_glyph(
-    painter: &egui::Painter,
-    center: egui::Pos2,
-    is_agent: bool,
-    color: egui::Color32,
-) {
-    let d = 3.5;
-    let pts = if is_agent {
-        vec![
-            egui::pos2(center.x, center.y - d),
-            egui::pos2(center.x + d, center.y),
-            egui::pos2(center.x, center.y + d),
-            egui::pos2(center.x - d, center.y),
-        ]
-    } else {
-        vec![
-            egui::pos2(center.x - 2.5, center.y - d),
-            egui::pos2(center.x - 2.5, center.y + d),
-            egui::pos2(center.x + 3.0, center.y),
-        ]
-    };
-    painter.add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
-}
-
 /// 트리 확장 캐럿 (▸ 접힘 / ▾ 펼침) — 작은 삼각형 (이모지 □ 깨짐 회피).
 fn paint_caret(p: &egui::Painter, c: egui::Pos2, expanded: bool, col: egui::Color32) {
     let d = 3.0;
@@ -2943,33 +2917,6 @@ fn paint_caret(p: &egui::Painter, c: egui::Pos2, expanded: bool, col: egui::Colo
         ]
     };
     p.add(egui::Shape::convex_polygon(pts, col, egui::Stroke::NONE));
-}
-
-/// pane 헤더 분할 아이콘 — 작은 사각형 + 가운데 분할선. horizontal=가로선(위/아래
-/// 분할 표현), false=세로선. 클릭 Response 반환 (이모지 □ 깨짐 회피, 목업 §pane-head).
-pub(crate) fn paint_split(ui: &mut egui::Ui, horizontal: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-    // pane 헤더는 테마 무관 항상 다크 — theme 색을 쓰면 light 테마에서 어두운 아이콘이
-    // 다크 헤더에 묻힌다(codex Step4). ×와 같은 고정 밝은 회색을 쓴다.
-    let col = if resp.hovered() {
-        egui::Color32::from_rgb(0xc8, 0xcc, 0xd2)
-    } else {
-        egui::Color32::from_rgb(0x8b, 0x8f, 0x98)
-    };
-    let p = ui.painter();
-    let sq = egui::Rect::from_center_size(rect.center(), egui::vec2(11.0, 11.0));
-    p.rect_stroke(
-        sq,
-        1.5,
-        egui::Stroke::new(1.0, col),
-        egui::StrokeKind::Inside,
-    );
-    if horizontal {
-        p.hline(sq.x_range(), sq.center().y, egui::Stroke::new(1.0, col));
-    } else {
-        p.vline(sq.center().x, sq.y_range(), egui::Stroke::new(1.0, col));
-    }
-    resp
 }
 
 enum FileToolbarIcon {

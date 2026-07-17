@@ -2455,6 +2455,7 @@ impl WorkspaceUi {
                     pane: pane.id.clone(),
                     session: pane.session_id,
                     resumable: false, // App이 restore_agents 기준으로 채운다
+                    has_cwd: false,   // App이 session_cwds 기준으로 채운다 (PR-W)
                     status_hint,
                     title: self.resolve_session_title(
                         &pane.title,

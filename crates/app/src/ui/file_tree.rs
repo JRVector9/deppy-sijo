@@ -33,6 +33,8 @@ pub struct SessionEntry {
     pub resumable: bool,
     /// 상태 hover 힌트 — 감지 출처/신뢰도 또는 '수동 지정'(U17b).
     pub status_hint: Option<String>,
+    /// 세션 cwd가 감지 캐시에 있음 — 워크트리 메뉴 노출 조건. App이 채운다(PR-W).
+    pub has_cwd: bool,
     /// 에이전트 3행: "실행 중 · ctx 69%" (상태 라벨 + 남은 컨텍스트).
     pub status_line: Option<String>,
 }
@@ -72,8 +74,7 @@ pub enum SidebarAction {
     /// [PR-D] 이 세션 cwd 레포의 변경분(diff)을 본다.
     #[allow(dead_code, reason = "PR-D가 메뉴를 붙이면 구성된다 — 병렬 개발 seam")]
     ShowDiff { session: runtime::SessionId },
-    /// [PR-W] 이 세션 레포의 새 git worktree를 만들고 그 폴더에서 셸을 연다.
-    #[allow(dead_code, reason = "PR-W가 메뉴를 붙이면 구성된다 — 병렬 개발 seam")]
+    /// 이 세션 레포의 새 git worktree를 만들고 그 폴더에서 셸을 연다 (PR-W).
     NewWorktreeCell { session: runtime::SessionId },
 }
 
@@ -1027,7 +1028,18 @@ impl FileTreeUi {
                                         ui.close();
                                     }
                                     // [PR-D] 「변경 보기」 메뉴가 여기에 붙는다 (ShowDiff).
-                                    // [PR-W] 「새 워크트리에서 셸」 메뉴가 여기에 붙는다 (NewWorktreeCell).
+                                    // 새 워크트리에서 셸 — cwd를 아는 세션만 (레포 판정은
+                                    // dispatch의 백그라운드 repo_root가 한다, PR-W).
+                                    if entry.has_cwd
+                                        && ui
+                                            .button(
+                                                catalog.t("sidebar.menu.new_worktree_cell", &[]),
+                                            )
+                                            .clicked()
+                                    {
+                                        action = Some(SidebarAction::NewWorktreeCell { session });
+                                        ui.close();
+                                    }
                                     if entry.resumable
                                         && ui
                                             .button(catalog.t("sidebar.menu.resume_agent", &[]))

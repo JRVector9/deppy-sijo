@@ -24,6 +24,7 @@ mod storage;
 mod tailscale;
 mod theme;
 mod ui;
+mod worktree;
 
 use std::path::{Path, PathBuf};
 

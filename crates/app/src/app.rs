@@ -1268,6 +1268,9 @@ pub struct App {
     /// 접속 URL QR 텍스처 캐시 — URL이 바뀔 때만 재생성, 설정창 닫으면 반환.
     web_qr: ui::settings::WebQrCache,
     /// ts.net 호스트명 자동 감지 1회성 스레드의 결과 수신 (진행 중일 때만 Some).
+    /// [PR-W] 진행 중인 워크트리 생성의 결과 채널 — 백그라운드 git 작업 완료를
+    /// 프레임 폴링으로 수령해 그 폴더에서 셸을 스폰한다. None = 진행 중 아님.
+    worktree_rx: Option<std::sync::mpsc::Receiver<anyhow::Result<std::path::PathBuf>>>,
     ts_detect_rx: Option<std::sync::mpsc::Receiver<crate::tailscale::Detected>>,
     /// 마지막 감지 결과 — 설정 UI 표시용. None = 이 세션에서 아직 시도 안 함.
     ts_detected: Option<crate::tailscale::Detected>,
@@ -1542,6 +1545,7 @@ impl App {
             web_error: None,
             web_reveal_url: false,
             web_qr: None,
+            worktree_rx: None,
             ts_detect_rx: None,
             ts_detected: None,
             ts_detect_overwrite: false,
@@ -5235,6 +5239,11 @@ impl eframe::App for App {
         for entry in &mut terminal_sessions {
             entry.resumable =
                 entry.agent_line.is_none() && self.restore_agents.contains_key(&entry.pane.0);
+            // 워크트리 메뉴 노출 조건 — 프레임마다 도는 경로라 lsof fallback 없이
+            // 감지 캐시만 본다 (실제 조회는 dispatch의 session_cwd_lookup, PR-W).
+            entry.has_cwd = entry
+                .session
+                .is_some_and(|s| self.session_cwds.contains_key(&s));
         }
         // 완료/입력대기 주목(6px 레일·펄스) 갱신 + 확인 시 완료 소비. Agents 패널도
         // 같은 상태 원천을 사용하므로 사이드바가 꺼져 있어도 계산한다.
@@ -5372,9 +5381,37 @@ impl eframe::App for App {
                 Some(ui::file_tree::SidebarAction::ShowDiff { session }) => {
                     let _ = session; // PR-D가 채운다
                 }
-                // [PR-W] 새 워크트리 셸 — worktree 생성+스폰 배선이 여기에 붙는다.
+                // 새 워크트리 셸 (PR-W) — 백그라운드에서 repo_root → exclude 보장 →
+                // worktree add 후, 아래 worktree_rx 폴링부가 그 폴더에서 셸을 연다.
                 Some(ui::file_tree::SidebarAction::NewWorktreeCell { session }) => {
-                    let _ = session; // PR-W가 채운다
+                    if self.worktree_rx.is_some() {
+                        // 동시 생성은 채널이 1개라 받지 않는다 — 완료 후 다시.
+                        tracing::info!("워크트리 생성이 이미 진행 중 — 요청 무시");
+                    } else {
+                        match self.session_cwd_lookup(session) {
+                            Some(cwd) => {
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                self.worktree_rx = Some(rx);
+                                let ctx = ui.ctx().clone();
+                                std::thread::spawn(move || {
+                                    let result = crate::worktree::create_worktree(
+                                        std::path::Path::new(&cwd),
+                                    );
+                                    let _ = tx.send(result);
+                                    ctx.request_repaint();
+                                });
+                            }
+                            None => {
+                                // 메뉴는 cwd 캐시가 있어야 보이므로 여기는 레이스뿐 —
+                                // 그래도 조용한 실패 금지(사용자가 클릭했다).
+                                tracing::warn!("세션 cwd 미확인 — 워크트리 생성 생략");
+                                platform::notify(
+                                    &text.t("worktree.create_failed", &[]),
+                                    &text.t("worktree.no_cwd", &[]),
+                                );
+                            }
+                        }
+                    }
                 }
                 // 같은 폴더에서 새 셸 — cwd 미확인이면 일반 새 셸로 폴백.
                 Some(ui::file_tree::SidebarAction::NewShellSameFolder { session }) => {
@@ -5401,6 +5438,38 @@ impl eframe::App for App {
                         .request_close_pane(&self.active.runtime, pane);
                 }
                 None => {}
+            }
+        }
+
+        // 워크트리 생성 완료 수령 (PR-W) — 성공이면 그 폴더에서 새 셸을 연다(cd 주입은
+        // spawn_shell_at → ShellSpawned 경로). 사이드바가 꺼져도 진행돼야 하므로
+        // dispatch 블록 밖에서 폴링한다 (완료 스레드가 repaint를 예약 — ts_detect 관례).
+        if let Some(rx) = &self.worktree_rx {
+            match rx.try_recv() {
+                Ok(Ok(path)) => {
+                    self.worktree_rx = None;
+                    self.active.workspace_ui.spawn_shell_at(
+                        &self.active.runtime,
+                        self.config.terminal.scrollback_lines as usize,
+                        Some(path.to_string_lossy().into_owned()),
+                    );
+                }
+                Ok(Err(e)) => {
+                    // 레포 아님·git 거부·CLT 없음 등 — 조용한 실패 금지, OS 알림 1줄.
+                    self.worktree_rx = None;
+                    tracing::warn!("워크트리 생성 실패: {e:#}");
+                    let detail = format!("{e:#}");
+                    platform::notify(
+                        &text.t("worktree.create_failed", &[]),
+                        detail.lines().next().unwrap_or_default(),
+                    );
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // 결과 없이 끊김 = 워커 스레드 panic — 로그로 종결.
+                    self.worktree_rx = None;
+                    tracing::warn!("워크트리 생성 스레드가 결과 없이 종료");
+                }
             }
         }
 

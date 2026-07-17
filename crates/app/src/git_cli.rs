@@ -13,6 +13,10 @@
 //!   가득참 데드락을 피하려고 리더 스레드로 계속 비운다(diff는 64KB 파이프 버퍼를
 //!   쉽게 넘는다).
 
+// PR-D/PR-W가 병렬 개발 중 — 첫 소비자가 붙기 전까지의 일시적 미사용.
+// 둘 중 하나가 머지되면 이 allow를 제거한다.
+#![allow(dead_code)]
+
 use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, Instant};

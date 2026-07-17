@@ -70,8 +70,10 @@ pub enum SidebarAction {
     /// pane 닫기 — 실행 중 세션이면 기존 확인 모달을 거친다.
     ClosePane { pane: runtime::MuxPaneId },
     /// [PR-D] 이 세션 cwd 레포의 변경분(diff)을 본다.
+    #[allow(dead_code, reason = "PR-D가 메뉴를 붙이면 구성된다 — 병렬 개발 seam")]
     ShowDiff { session: runtime::SessionId },
     /// [PR-W] 이 세션 레포의 새 git worktree를 만들고 그 폴더에서 셸을 연다.
+    #[allow(dead_code, reason = "PR-W가 메뉴를 붙이면 구성된다 — 병렬 개발 seam")]
     NewWorktreeCell { session: runtime::SessionId },
 }
 

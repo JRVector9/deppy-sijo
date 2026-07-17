@@ -1146,6 +1146,8 @@ pub struct App {
     agents_ui: ui::agents::AgentsUi,
     /// PTY와 분리된 Codex App Server structured session controller.
     agent_sessions_ui: ui::agent_sessions::AgentSessionsUi,
+    /// 세션 cwd 레포의 git 변경분 리뷰 패널 (사이드바 「변경 보기」).
+    diff_panel_ui: ui::diff_panel::DiffPanelUi,
     /// DB mutation은 controller projection과 분리돼 실패할 수 있다. 성공할 때까지 FIFO로
     /// 보존해 새 thread가 복구 불가능해지거나 archive가 재시작 후 되살아나는 것을 막는다.
     agent_persistence_queue: Vec<ui::agent_sessions::AgentSessionPersistenceMutation>,
@@ -1479,6 +1481,7 @@ impl App {
             secret_store: KeyringSecretStore,
             agents_ui: ui::agents::AgentsUi::new(),
             agent_sessions_ui: ui::agent_sessions::AgentSessionsUi::new(),
+            diff_panel_ui: ui::diff_panel::DiffPanelUi::new(),
             agent_persistence_queue: Vec::new(),
             agent_persistence_retry_at: None,
             connectors_ui: ui::connectors::ConnectorsUi::new(
@@ -5377,9 +5380,12 @@ impl eframe::App for App {
                         None => tracing::warn!("세션 cwd 미확인 — 경로 복사 생략"),
                     }
                 }
-                // [PR-D] 변경 보기 — diff 패널 배선이 여기에 붙는다.
+                // 변경 보기 — 세션 cwd 레포의 diff 패널(독립 창)을 연다.
+                // cwd 미확인이어도 패널은 열어 안내를 표시한다 (조용한 실패 금지).
                 Some(ui::file_tree::SidebarAction::ShowDiff { session }) => {
-                    let _ = session; // PR-D가 채운다
+                    let cwd = self.session_cwd_lookup(session);
+                    self.diff_panel_ui
+                        .open_for(ui.ctx(), self.active.id.clone(), session, cwd);
                 }
                 // 새 워크트리 셸 (PR-W) — 백그라운드에서 repo_root → exclude 보장 →
                 // worktree add 후, 아래 worktree_rx 폴링부가 그 폴더에서 셸을 연다.
@@ -5543,6 +5549,8 @@ impl eframe::App for App {
         for request in agent_requests {
             self.handle_agent_sessions_request(request);
         }
+        // 「변경 보기」 diff 패널 — 매 프레임 렌더 + 백그라운드 수집 결과 poll.
+        self.diff_panel_ui.show(ui.ctx(), &text);
         // pane 우클릭 → 환경변수·API 설정 (E4 ⑥) — 프로젝트 화면에서 바로 진입.
         if self.active.workspace_ui.take_open_environment() {
             self.settings_category = ui::settings::Category::Environment;

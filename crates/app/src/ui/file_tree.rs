@@ -71,8 +71,7 @@ pub enum SidebarAction {
     },
     /// pane 닫기 — 실행 중 세션이면 기존 확인 모달을 거친다.
     ClosePane { pane: runtime::MuxPaneId },
-    /// [PR-D] 이 세션 cwd 레포의 변경분(diff)을 본다.
-    #[allow(dead_code, reason = "PR-D가 메뉴를 붙이면 구성된다 — 병렬 개발 seam")]
+    /// 이 세션 cwd 레포의 변경분(diff)을 본다 (「변경 보기」 메뉴).
     ShowDiff { session: runtime::SessionId },
     /// 이 세션 레포의 새 git worktree를 만들고 그 폴더에서 셸을 연다 (PR-W).
     NewWorktreeCell { session: runtime::SessionId },
@@ -1027,7 +1026,14 @@ impl FileTreeUi {
                                             Some(SidebarAction::NewShellSameFolder { session });
                                         ui.close();
                                     }
-                                    // [PR-D] 「변경 보기」 메뉴가 여기에 붙는다 (ShowDiff).
+                                    // 변경 보기 — 세션 cwd 레포의 git diff 패널 (PR-D).
+                                    if ui
+                                        .button(catalog.t("sidebar.menu.show_diff", &[]))
+                                        .clicked()
+                                    {
+                                        action = Some(SidebarAction::ShowDiff { session });
+                                        ui.close();
+                                    }
                                     // 새 워크트리에서 셸 — cwd를 아는 세션만 (레포 판정은
                                     // dispatch의 백그라운드 repo_root가 한다, PR-W).
                                     if entry.has_cwd

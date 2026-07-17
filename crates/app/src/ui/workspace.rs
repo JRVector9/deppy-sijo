@@ -3161,11 +3161,13 @@ fn terminal_keyboard_input_allowed(
     !popup_open && !top_window_open && (terminal_refocus_pending || !text_edit_focused)
 }
 
-/// Agents is a floating but non-modal navigator/editor. A terminal click must
-/// be able to reclaim focus while it remains open; confirmation/error windows
-/// continue to block terminal input as before.
+/// Agents and the diff review panel are floating but non-modal. A terminal
+/// click must be able to reclaim focus while they remain open;
+/// confirmation/error windows continue to block terminal input as before.
 fn is_blocking_terminal_window(layer: &egui::LayerId) -> bool {
-    layer.order == egui::Order::Middle && layer.id != crate::ui::agent_sessions::agents_window_id()
+    layer.order == egui::Order::Middle
+        && layer.id != crate::ui::agent_sessions::agents_window_id()
+        && layer.id != crate::ui::diff_panel::diff_window_id()
 }
 
 /// Pending focus가 있으면 runtime snapshot의 이전 focused pane 대신 그것이 유일한 입력
@@ -4114,6 +4116,9 @@ mod tests {
         assert!(!is_blocking_terminal_window(&agents));
         assert!(is_blocking_terminal_window(&confirmation));
         assert!(!is_blocking_terminal_window(&background));
+        // diff 리뷰 패널도 같은 규약의 비모달 창이다 (PR-D).
+        let diff = egui::LayerId::new(egui::Order::Middle, crate::ui::diff_panel::diff_window_id());
+        assert!(!is_blocking_terminal_window(&diff));
     }
 
     #[test]

@@ -1152,6 +1152,9 @@ pub struct App {
     /// 사이드바 「워크스페이스 종료」 확인 대기 — Some((id, 표시명, 세션 수, 실행 중 수)).
     /// 확정 시 세션(pane)만 일괄 닫고 워크스페이스(경로·설정·DB 기록)는 보존한다.
     ws_close_confirm: Option<(String, String, usize, usize)>,
+    /// 사이드바 「이름 바꾸기」 모달 — Some((id, 편집 버퍼)). 별칭(name 컬럼)만
+    /// 바꾸고 실제 폴더/경로는 불변. 빈 값 확정 = 별칭 해제(폴더명 복귀).
+    ws_rename_edit: Option<(String, String)>,
     /// runtime durable 이벤트 큐가 포화돼 느린 구독자가 끊긴 경우 사용자 경고 모달.
     runtime_stream_warning: bool,
     /// live warm hard cap을 넘기는 workspace 전환을 거부했을 때 대상 표시명.
@@ -1546,6 +1549,7 @@ impl App {
             workspace_rename_prompt: None,
             ws_delete_confirm: None,
             ws_close_confirm: None,
+            ws_rename_edit: None,
             runtime_stream_warning: false,
             warm_limit_warning: None,
             web_switch_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -3937,14 +3941,13 @@ impl App {
         })
     }
 
-    /// 워크스페이스 표시 이름 — 포커스 세션의 현재 작업 폴더(git 저장소면 프로젝트명)를
-    /// name에 자동 저장하고 그걸 표시한다(2026-07-08). 아직 감지 전이면 path 폴더명,
-    /// 그것도 없으면 "~". 자동 추적이라 포커스 이동·재시작에도 마지막 폴더가 유지된다.
-    /// 워크스페이스 표시 이름 (E3, 2026-07-13): **프로젝트 폴더명에서 파생**하고
-    /// 사용자 이름(name 컬럼 = 별칭)은 `폴더명 (별칭)`으로 병기한다. 정체성이 항상
-    /// 실제 폴더에 고정되어, 이름과 경로가 어긋난 워크스페이스에 환경변수를 넣는
-    /// 사고(binjari)가 표시 차원에서 재발하지 않는다. 기존에 폴더명과 다른 이름을
-    /// 저장한 워크스페이스는 그 이름이 자동으로 별칭으로 강등된다(데이터 무변경).
+    /// 워크스페이스 표시 이름 (2026-07-18): **별칭 우선** — 사용자가 지정한
+    /// 별칭(name 컬럼, 비어있지 않고 "default" 아님)이 있으면 폴더명 병기 없이
+    /// 별칭만 보여준다(사이드바 「이름 바꾸기」 요구). 별칭이 없으면 E3(2026-07-13)
+    /// 규칙대로 프로젝트 폴더명에서 파생, 그것도 없으면 "~". 실제 폴더/경로는
+    /// 이 함수가 절대 건드리지 않는다 — 표시 전용. 자동 폴더명 추종
+    /// (update_workspace_folder_name)은 경로·별칭이 모두 없는 부트스트랩에만
+    /// 남아 있어 사용자 별칭을 덮어쓰지 않는다.
     fn workspace_display_name(row: &crate::storage::WorkspaceRow) -> String {
         let alias = row.name.trim();
         let alias = (!alias.is_empty() && alias != "default").then_some(alias);
@@ -3956,9 +3959,8 @@ impl App {
                 .map(|base| base.to_string_lossy().into_owned())
         };
         match (folder, alias) {
-            (Some(folder), Some(alias)) if alias != folder => format!("{folder} ({alias})"),
-            (Some(folder), _) => folder,
-            (None, Some(alias)) => alias.to_owned(),
+            (_, Some(alias)) => alias.to_owned(),
+            (Some(folder), None) => folder,
             (None, None) => "~".to_owned(),
         }
     }
@@ -5946,6 +5948,19 @@ impl eframe::App for App {
                         }
                     }
                 }
+                Some(ui::file_tree::SidebarAction::RenameWorkspace(workspace_id)) => {
+                    // 편집 초기값은 표시명이 아니라 **별칭 원본**이다(E3 설정 창 관례) —
+                    // 별칭이 없으면 빈 버퍼로 시작하고 placeholder가 폴더명을 보여준다.
+                    let alias = self
+                        .workspaces
+                        .iter()
+                        .find(|w| w.id == workspace_id)
+                        .map(|w| w.name.trim())
+                        .filter(|name| !name.is_empty() && *name != "default")
+                        .unwrap_or_default()
+                        .to_owned();
+                    self.ws_rename_edit = Some((workspace_id, alias));
+                }
                 None => {}
             }
         }
@@ -6378,6 +6393,88 @@ impl eframe::App for App {
                 }
                 Some(false) => self.ws_close_confirm = None,
                 None => {}
+            }
+        }
+
+        // 사이드바 「이름 바꾸기」 모달 — 별칭(name 컬럼)만 편집하고 실제 폴더/경로는
+        // 불변. Enter/저장 = 확정, Esc/취소 = 폐기. 빈 값 확정 = 별칭 해제(폴더명 복귀).
+        if let Some((rename_id, mut buf)) = self.ws_rename_edit.take() {
+            // 대상이 사라졌으면(프레임 사이 삭제) 모달을 접는다 — take()가 이미 닫았다.
+            if let Some(row) = self.workspaces.iter().find(|w| w.id == rename_id) {
+                let folder_hint = {
+                    let path = row.path.trim();
+                    (!path.is_empty())
+                        .then(|| std::path::Path::new(path).file_name())
+                        .flatten()
+                        .map(|base| base.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "~".to_owned())
+                };
+                let current_alias = {
+                    let name = row.name.trim();
+                    if name == "default" { "" } else { name }.to_owned()
+                };
+                let mut decision: Option<bool> = None; // Some(true)=저장, Some(false)=취소
+                egui::Window::new(text.t("workspace.rename_ws.title", &[]))
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ui.ctx(), |ui| {
+                        ui.label(text.t("workspace.rename_ws.body", &[("folder", &folder_hint)]));
+                        ui.add_space(4.0);
+                        let edit = ui.add(
+                            egui::TextEdit::singleline(&mut buf)
+                                .hint_text(folder_hint.as_str())
+                                .desired_width(240.0),
+                        );
+                        // 세션 인라인 편집과 같은 관례 — 키가 터미널로 새지 않게 포커스 고정.
+                        edit.request_focus();
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(text.t("workspace.rename_ws.confirm", &[]))
+                                .clicked()
+                            {
+                                decision = Some(true);
+                            }
+                            if ui.button(text.t("action.cancel", &[])).clicked() {
+                                decision = Some(false);
+                            }
+                        });
+                        let (enter, esc) = ui.input(|i| {
+                            (
+                                i.key_pressed(egui::Key::Enter),
+                                i.key_pressed(egui::Key::Escape),
+                            )
+                        });
+                        if enter {
+                            decision = Some(true);
+                        } else if esc {
+                            decision = Some(false);
+                        }
+                    });
+                match decision {
+                    Some(true) => {
+                        let next = buf.trim();
+                        // 별칭이 그대로면 DB 쓰기 생략(churn 방지). 실패는 로그 + OS 알림
+                        // 으로 표면화한다 — 조용한 실패 금지.
+                        if next != current_alias {
+                            if let Err(e) = self.db.rename_workspace(&rename_id, next) {
+                                tracing::warn!(
+                                    workspace = %rename_id,
+                                    "워크스페이스 이름 저장 실패: {e:#}"
+                                );
+                                platform::notify(
+                                    &text.t("workspace.rename_ws.failed", &[]),
+                                    &format!("{e:#}"),
+                                );
+                            } else {
+                                self.refresh_workspaces();
+                            }
+                        }
+                    }
+                    Some(false) => {}
+                    None => self.ws_rename_edit = Some((rename_id, buf)),
+                }
             }
         }
 
@@ -8056,16 +8153,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// E3: 표시 이름은 폴더명 파생 + 별칭 병기. 기존 이름은 별칭으로 강등(데이터 무변경).
+    /// 별칭 우선(2026-07-18): 별칭이 있으면 폴더명 병기 없이 별칭만, 없으면 폴더명.
     #[test]
-    fn 워크스페이스_표시명은_폴더명_파생에_별칭을_병기한다() {
+    fn 워크스페이스_표시명은_별칭이_있으면_별칭만_보여준다() {
         let row = |name: &str, path: &str| crate::storage::WorkspaceRow {
             id: "w".into(),
             name: name.into(),
             path: path.into(),
             created_at: String::new(),
         };
-        // 폴더명만 (별칭 없음/기본값/폴더명과 동일 → 병기 생략)
+        // 별칭 없음/기본값 → 폴더명
         assert_eq!(
             App::workspace_display_name(&row("", "/p/binjari")),
             "binjari"
@@ -8078,10 +8175,10 @@ mod tests {
             App::workspace_display_name(&row("binjari", "/p/binjari")),
             "binjari"
         );
-        // 별칭 병기 — 레거시의 폴더와 다른 이름은 자동으로 별칭으로 강등
+        // 별칭이 폴더명과 달라도 별칭만 — 「이름 바꾸기」 후 폴더명 병기 없음
         assert_eq!(
             App::workspace_display_name(&row("예매봇", "/p/binjari")),
-            "binjari (예매봇)"
+            "예매봇"
         );
         // 경로 없음 — 별칭만, 그것도 없으면 "~"
         assert_eq!(App::workspace_display_name(&row("예매봇", "")), "예매봇");

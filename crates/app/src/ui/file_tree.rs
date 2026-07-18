@@ -168,6 +168,10 @@ pub enum SidebarAction {
     /// 기록)는 보존한다(설정의 「프로젝트 삭제」와 구분). 실행 중 에이전트를 죽일 수
     /// 있어 App이 확인 다이얼로그를 거친 뒤 수행한다.
     CloseWorkspace(String),
+    /// 워크스페이스 표시명(별칭) 편집 모달을 연다 — 실제 폴더/경로는 불변.
+    /// 편집 자체는 App 소유 모달이 하고(현재 별칭 원본은 App만 안다), 여기서는
+    /// 대상 id만 올린다.
+    RenameWorkspace(String),
 }
 
 /// 트리 노드. `children == None`은 아직 나열 안 됨(lazy).
@@ -1087,7 +1091,7 @@ impl FileTreeUi {
             .show(ui, |ui| {
                 for workspace in before_active {
                     let resp = workspace_row(ui, workspace, false, Some(false));
-                    workspace_close_menu(&resp, workspace, catalog, &mut action);
+                    workspace_context_menu(&resp, workspace, catalog, &mut action);
                     if resp.clicked() {
                         action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
                     }
@@ -1095,7 +1099,7 @@ impl FileTreeUi {
                 if let Some(active) = active {
                     let resp =
                         workspace_row(ui, active, true, Some(self.workspace_sessions_expanded));
-                    workspace_close_menu(&resp, active, catalog, &mut action);
+                    workspace_context_menu(&resp, active, catalog, &mut action);
                     if resp.clicked() {
                         self.workspace_sessions_expanded = !self.workspace_sessions_expanded;
                     }
@@ -1315,7 +1319,7 @@ impl FileTreeUi {
                 }
                 for workspace in after_active {
                     let resp = workspace_row(ui, workspace, false, Some(false));
-                    workspace_close_menu(&resp, workspace, catalog, &mut action);
+                    workspace_context_menu(&resp, workspace, catalog, &mut action);
                     if resp.clicked() {
                         action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
                     }
@@ -2875,32 +2879,37 @@ fn workspace_row(
     response
 }
 
-/// 워크스페이스 행 우클릭 메뉴 — 「워크스페이스 종료」(세션 일괄 닫기, 확인은 App).
-/// Idle은 닫을 세션도 내릴 런타임도 없어 메뉴를 붙이지 않는다.
-fn workspace_close_menu(
+/// 워크스페이스 행 우클릭 메뉴 — 「이름 바꾸기」(별칭 편집)는 세션이 없어도 항상,
+/// 「워크스페이스 종료」(세션 일괄 닫기, 확인은 App)는 닫을 세션이 있는 비 Idle만.
+fn workspace_context_menu(
     resp: &egui::Response,
     workspace: &SidebarWorkspaceEntry,
     catalog: &i18n::Catalog,
     action: &mut Option<SidebarAction>,
 ) {
-    if workspace.state == SidebarWorkspaceState::Idle {
-        return;
-    }
-    resp.context_menu(|ui| workspace_close_menu_items(ui, workspace, catalog, action));
+    resp.context_menu(|ui| workspace_context_menu_items(ui, workspace, catalog, action));
 }
 
-/// 종료 메뉴 본문 — 팝업 없이 렌더할 수 있게 분리해 kittest 대상으로 삼는다
+/// 메뉴 본문 — 팝업 없이 렌더할 수 있게 분리해 kittest 대상으로 삼는다
 /// (workspace.rs last_output_menu_items 관례 — kittest는 press/release를 다른
 /// 프레임에 재생해 실제 팝업 안 버튼의 clicked를 관측하지 못한다).
-fn workspace_close_menu_items(
+fn workspace_context_menu_items(
     ui: &mut egui::Ui,
     workspace: &SidebarWorkspaceEntry,
     catalog: &i18n::Catalog,
     action: &mut Option<SidebarAction>,
 ) {
     if ui
-        .button(catalog.t("sidebar.menu.close_workspace", &[]))
+        .button(catalog.t("sidebar.menu.rename_workspace", &[]))
         .clicked()
+    {
+        *action = Some(SidebarAction::RenameWorkspace(workspace.id.clone()));
+        ui.close();
+    }
+    if workspace.state != SidebarWorkspaceState::Idle
+        && ui
+            .button(catalog.t("sidebar.menu.close_workspace", &[]))
+            .clicked()
     {
         *action = Some(SidebarAction::CloseWorkspace(workspace.id.clone()));
         ui.close();
@@ -5675,7 +5684,7 @@ mod tests {
         };
         let mut harness = egui_kittest::Harness::new_ui_state(
             |ui, action: &mut Option<SidebarAction>| {
-                workspace_close_menu_items(ui, &workspace, &catalog, action);
+                workspace_context_menu_items(ui, &workspace, &catalog, action);
             },
             None,
         );
@@ -5691,7 +5700,38 @@ mod tests {
         );
     }
 
-    /// Idle(비활성) 워크스페이스에는 종료 메뉴가 붙지 않는다 — 닫을 세션이 없다.
+    /// 「이름 바꾸기」 클릭 → RenameWorkspace(id) 액션 방출. Idle이어도 노출된다 —
+    /// 세션이 없어도 이름은 바꿀 수 있다.
+    #[test]
+    fn kittest_이름바꾸기_클릭이_rename_workspace_액션을_낸다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspace = SidebarWorkspaceEntry {
+            id: "ws-rename".to_owned(),
+            name: "sleeper".to_owned(),
+            state: SidebarWorkspaceState::Idle,
+            summary: SidebarSessionSummary::inactive(0),
+        };
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, action: &mut Option<SidebarAction>| {
+                workspace_context_menu_items(ui, &workspace, &catalog, action);
+            },
+            None,
+        );
+        harness.run();
+        harness.get_by_label("Rename workspace").click();
+        harness.run();
+        assert!(
+            matches!(
+                harness.state(),
+                Some(SidebarAction::RenameWorkspace(id)) if id == "ws-rename"
+            ),
+            "이름 바꾸기 클릭이 RenameWorkspace 액션을 내지 않음"
+        );
+    }
+
+    /// Idle(비활성) 워크스페이스 메뉴에는 「이름 바꾸기」만 있고 종료 항목은 없다 —
+    /// 닫을 세션이 없다.
     #[test]
     fn kittest_비활성_워크스페이스에는_종료메뉴가_없다() {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
@@ -5702,6 +5742,10 @@ mod tests {
             summary: SidebarSessionSummary::inactive(0),
         }];
         let mut harness = close_menu_harness(&workspaces, "ws-active-elsewhere", &catalog);
+        assert!(
+            right_click_scan(&mut harness, "Rename workspace"),
+            "Idle 워크스페이스 행에 이름 바꾸기 메뉴가 없다"
+        );
         assert!(
             !right_click_scan(&mut harness, "Close workspace sessions"),
             "Idle 워크스페이스 행에 종료 메뉴가 떴다"

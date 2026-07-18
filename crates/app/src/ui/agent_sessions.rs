@@ -709,6 +709,7 @@ impl AgentSessionsUi {
         self.llm_override = codex_llm_override_from_config(
             agents_config.codex_llm_provider.as_deref(),
             agents_config.codex_llm_base_url.as_deref(),
+            agents_config.codex_llm_wire.as_deref(),
         )
         .map_err(|error| format!("{error:#}"));
         let Ok(target) = &self.llm_override else {
@@ -1387,6 +1388,27 @@ impl AgentSessionsUi {
             );
         }
         if agents_config.codex_llm_provider.as_deref() == Some("custom") {
+            // upstream이 실제로 말하는 API (PR-L5). Chat이면 내장 변환 프록시 경유 —
+            // 대부분의 ollama 계열 원격/로컬이 /v1/chat/completions만 지원한다.
+            ui.horizontal_wrapped(|ui| {
+                ui.label("API 형식");
+                // 콤보 닫힌 상태 표시용 복제 — 클릭 반영은 아래에서 config에 쓴다.
+                let selected = agents_config.codex_llm_wire.clone();
+                let selected = selected.as_deref();
+                egui::ComboBox::from_id_salt("agent-llm-wire")
+                    .selected_text(llm_wire_label(selected))
+                    .show_ui(ui, |ui| {
+                        for value in [None, Some("responses")] {
+                            let current = llm_wire_label(selected) == llm_wire_label(value);
+                            if ui
+                                .selectable_label(current, llm_wire_label(value))
+                                .clicked()
+                            {
+                                agents_config.codex_llm_wire = value.map(str::to_owned);
+                            }
+                        }
+                    });
+            });
             self.render_llm_api_key_controls(ui, text_input_ids);
         }
         // OSS 선택 시 감지된 ollama 모델을 클릭 후보로 (PR-L3 — local_llm 감지 배선.
@@ -2438,6 +2460,15 @@ fn llm_provider_label(provider: Option<&str>) -> &str {
     }
 }
 
+/// custom wire API 콤보 표시 (PR-L5). None/chat = 기본(내장 변환 프록시 경유).
+fn llm_wire_label(wire: Option<&str>) -> &str {
+    match wire {
+        None | Some("chat") => "Chat Completions (기본)",
+        Some("responses") => "Responses",
+        Some(other) => other,
+    }
+}
+
 fn short_id(value: &str) -> String {
     value.chars().take(8).collect()
 }
@@ -2461,6 +2492,7 @@ fn status_color(status: AgentSessionStatus) -> egui::Color32 {
 mod tests {
     use super::*;
     use crate::agent_session::{AgentApproval, AgentApprovalKind};
+    use crate::codex_app_server::CodexLlmWire;
     use serde_json::json;
     use std::sync::mpsc;
 
@@ -2539,22 +2571,39 @@ mod tests {
         ui.sync_llm_config(&AgentsConfig {
             codex_llm_provider: Some("oss".to_owned()),
             codex_llm_base_url: None,
+            codex_llm_wire: None,
         });
         assert_eq!(ui.llm_override, Ok(Some(CodexLlmOverride::Oss)));
         ui.sync_llm_config(&AgentsConfig {
             codex_llm_provider: Some("custom".to_owned()),
             codex_llm_base_url: Some("http://localhost:11434/v1".to_owned()),
+            codex_llm_wire: None,
         });
         assert_eq!(
             ui.llm_override,
             Ok(Some(CodexLlmOverride::Custom {
-                base_url: "http://localhost:11434/v1".to_owned()
+                base_url: "http://localhost:11434/v1".to_owned(),
+                wire: CodexLlmWire::Chat,
+            }))
+        );
+        // wire responses는 직결 경로로 반영된다 (PR-L5).
+        ui.sync_llm_config(&AgentsConfig {
+            codex_llm_provider: Some("custom".to_owned()),
+            codex_llm_base_url: Some("http://localhost:11434/v1".to_owned()),
+            codex_llm_wire: Some("responses".to_owned()),
+        });
+        assert_eq!(
+            ui.llm_override,
+            Ok(Some(CodexLlmOverride::Custom {
+                base_url: "http://localhost:11434/v1".to_owned(),
+                wire: CodexLlmWire::Responses,
             }))
         );
         // custom인데 base URL 없음 → Err (spawn 차단 사유 보존).
         ui.sync_llm_config(&AgentsConfig {
             codex_llm_provider: Some("custom".to_owned()),
             codex_llm_base_url: None,
+            codex_llm_wire: None,
         });
         assert!(ui.llm_override.is_err());
     }
@@ -2565,6 +2614,7 @@ mod tests {
         ui.sync_llm_config(&AgentsConfig {
             codex_llm_provider: Some("custom".to_owned()),
             codex_llm_base_url: None,
+            codex_llm_wire: None,
         });
         let ctx = egui::Context::default();
         let error = ui.ensure_client(&ctx).unwrap_err();
@@ -2642,6 +2692,7 @@ mod tests {
         ui.sync_llm_config(&AgentsConfig {
             codex_llm_provider: Some("custom".to_owned()),
             codex_llm_base_url: Some("http://localhost:11434/v1".to_owned()),
+            codex_llm_wire: None,
         });
         let ctx = egui::Context::default();
         let error = ui.ensure_client(&ctx).unwrap_err();
@@ -2656,6 +2707,15 @@ mod tests {
         assert_eq!(llm_provider_label(Some("custom")), "커스텀 (OpenAI 호환)");
         // 미지값은 방어적으로 원문 표시 (config 로드 정규화가 1차 방어선).
         assert_eq!(llm_provider_label(Some("weird")), "weird");
+    }
+
+    #[test]
+    fn llm_wire_라벨_매핑() {
+        // None과 "chat"은 같은 기본 항목이다 (config에는 None으로 저장).
+        assert_eq!(llm_wire_label(None), "Chat Completions (기본)");
+        assert_eq!(llm_wire_label(Some("chat")), "Chat Completions (기본)");
+        assert_eq!(llm_wire_label(Some("responses")), "Responses");
+        assert_eq!(llm_wire_label(Some("weird")), "weird");
     }
 
     #[test]

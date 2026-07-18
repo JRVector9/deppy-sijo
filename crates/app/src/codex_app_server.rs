@@ -57,8 +57,23 @@ impl Default for CodexAppServerOptions {
 pub enum CodexLlmOverride {
     /// 로컬 OSS (ollama) — codex 내장 oss 프로바이더.
     Oss,
-    /// OpenAI 호환 커스텀 엔드포인트 (chat wire API).
-    Custom { base_url: String },
+    /// OpenAI 호환 커스텀 엔드포인트.
+    Custom {
+        base_url: String,
+        wire: CodexLlmWire,
+    },
+}
+
+/// custom upstream이 실제로 말하는 API (PR-L5). codex 쪽은 wire_api=responses만
+/// 허용하므로 Chat이면 내장 변환 프록시(llm_proxy)를 경유한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CodexLlmWire {
+    /// upstream은 /v1/chat/completions만 지원 — 변환 프록시 경유 (기본,
+    /// ollama 계열 원격/로컬 대부분이 여기 해당).
+    #[default]
+    Chat,
+    /// upstream이 /v1/responses를 직접 지원 — 직결 (env_key 경로 유지).
+    Responses,
 }
 
 /// config 문자열 → 오버라이드. custom인데 base URL이 없거나 잘못되면 Err —
@@ -66,6 +81,7 @@ pub enum CodexLlmOverride {
 pub fn codex_llm_override_from_config(
     provider: Option<&str>,
     base_url: Option<&str>,
+    wire: Option<&str>,
 ) -> anyhow::Result<Option<CodexLlmOverride>> {
     match provider {
         None => Ok(None),
@@ -73,8 +89,15 @@ pub fn codex_llm_override_from_config(
         Some("custom") => {
             let base_url = base_url
                 .ok_or_else(|| anyhow::anyhow!("custom 프로바이더는 base URL이 필요합니다"))?;
+            // None/chat = 변환 프록시 경유(기본). 미지값은 조용히 폴백하지 않는다.
+            let wire = match wire {
+                None | Some("chat") => CodexLlmWire::Chat,
+                Some("responses") => CodexLlmWire::Responses,
+                Some(other) => anyhow::bail!("알 수 없는 LLM wire API: {other}"),
+            };
             Ok(Some(CodexLlmOverride::Custom {
                 base_url: validate_llm_base_url(base_url)?,
+                wire,
             }))
         }
         Some(other) => anyhow::bail!("알 수 없는 LLM 프로바이더: {other}"),
@@ -135,7 +158,13 @@ fn codex_app_server_args(
         Some(CodexLlmOverride::Oss) => {
             args.extend(["-c", "model_provider=ollama"].map(str::to_owned));
         }
-        Some(CodexLlmOverride::Custom { base_url }) => {
+        Some(CodexLlmOverride::Custom { base_url, wire }) => {
+            // Chat wire는 spawn이 변환 프록시를 띄워 Responses+프록시 주소로 치환한
+            // 뒤에만 여기 도달해야 한다 — upstream 직결 argv가 새는 것을 막는다 (PR-L5).
+            anyhow::ensure!(
+                *wire == CodexLlmWire::Responses,
+                "chat wire는 변환 프록시 치환 후에만 argv로 조립할 수 있습니다"
+            );
             // enum 생성 경로가 검증을 거치지만, spawn 경계에서 한 번 더 — 잘못된 값이
             // 프로세스 argv로 새는 것을 막는다.
             let base_url = validate_llm_base_url(base_url)?;
@@ -184,6 +213,8 @@ pub struct CodexAppServerClient {
     commands: Sender<ClientCommand>,
     events: Receiver<CodexAppServerEvent>,
     worker: Option<thread::JoinHandle<()>>,
+    /// chat wire 변환 프록시 (PR-L5) — client 수명에 묶여 shutdown/Drop 시 종료.
+    llm_proxy: Option<crate::llm_proxy::LlmProxyHandle>,
 }
 
 /// One-shot asynchronous JSON result for history/catalog requests. Callers can
@@ -234,8 +265,24 @@ impl CodexAppServerClient {
         repaint: egui::Context,
     ) -> anyhow::Result<Self> {
         // 키는 spawn에서만 쓰고 worker로 넘기지 않는다 — 이 스코프가 끝나면 평문은
-        // 자식 프로세스 env에만 남는다.
-        let llm_api_key = options.llm_api_key.take();
+        // 자식 프로세스 env 또는 변환 프록시에만 남는다.
+        let mut llm_api_key = options.llm_api_key.take();
+        // chat wire custom이면 변환 프록시를 먼저 띄워 base_url을 치환한다 (PR-L5).
+        // 키는 프록시가 upstream Authorization으로 붙인다 — 자식 env 노출 불필요.
+        let mut llm_proxy = None;
+        if let Some(CodexLlmOverride::Custom {
+            base_url,
+            wire: CodexLlmWire::Chat,
+        }) = &options.llm_override
+        {
+            let upstream_base = validate_llm_base_url(base_url)?;
+            let handle = crate::llm_proxy::spawn(upstream_base, llm_api_key.take())?;
+            options.llm_override = Some(CodexLlmOverride::Custom {
+                base_url: format!("http://127.0.0.1:{}/v1", handle.port),
+                wire: CodexLlmWire::Responses,
+            });
+            llm_proxy = Some(handle);
+        }
         let args = codex_app_server_args(options.llm_override.as_ref(), llm_api_key.is_some())?;
         let mut command = Command::new(&options.executable);
         command
@@ -291,6 +338,7 @@ impl CodexAppServerClient {
             commands: commands_tx,
             events: events_rx,
             worker: Some(worker),
+            llm_proxy,
         })
     }
 
@@ -470,6 +518,8 @@ impl CodexAppServerClient {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        // 자식(app-server) 종료 후 변환 프록시도 내린다 (PR-L5).
+        self.llm_proxy.take();
     }
 
     fn send(&self, command: ClientCommand) -> anyhow::Result<()> {
@@ -2215,6 +2265,7 @@ mod tests {
         let args = codex_app_server_args(
             Some(&CodexLlmOverride::Custom {
                 base_url: "http://localhost:11434/v1".to_owned(),
+                wire: CodexLlmWire::Responses,
             }),
             false,
         )
@@ -2242,6 +2293,7 @@ mod tests {
         let args = codex_app_server_args(
             Some(&CodexLlmOverride::Custom {
                 base_url: "http://localhost:11434/v1".to_owned(),
+                wire: CodexLlmWire::Responses,
             }),
             true,
         )
@@ -2293,6 +2345,7 @@ mod tests {
                 codex_app_server_args(
                     Some(&CodexLlmOverride::Custom {
                         base_url: bad.to_owned(),
+                        wire: CodexLlmWire::Responses,
                     }),
                     false,
                 )
@@ -2304,6 +2357,7 @@ mod tests {
         let args = codex_app_server_args(
             Some(&CodexLlmOverride::Custom {
                 base_url: "  http://localhost:8000/v1  ".to_owned(),
+                wire: CodexLlmWire::Responses,
             }),
             false,
         )
@@ -2332,22 +2386,62 @@ mod tests {
 
     #[test]
     fn llm_override_from_config_변환과_검증() {
-        assert_eq!(codex_llm_override_from_config(None, None).unwrap(), None);
         assert_eq!(
-            codex_llm_override_from_config(Some("oss"), None).unwrap(),
-            Some(CodexLlmOverride::Oss)
+            codex_llm_override_from_config(None, None, None).unwrap(),
+            None
         );
         assert_eq!(
-            codex_llm_override_from_config(Some("custom"), Some("http://h:1/v1")).unwrap(),
+            codex_llm_override_from_config(Some("oss"), None, None).unwrap(),
+            Some(CodexLlmOverride::Oss)
+        );
+        // wire 미지정/chat → Chat(기본, 변환 프록시 경유), responses → 직결.
+        for wire in [None, Some("chat")] {
+            assert_eq!(
+                codex_llm_override_from_config(Some("custom"), Some("http://h:1/v1"), wire)
+                    .unwrap(),
+                Some(CodexLlmOverride::Custom {
+                    base_url: "http://h:1/v1".to_owned(),
+                    wire: CodexLlmWire::Chat,
+                })
+            );
+        }
+        assert_eq!(
+            codex_llm_override_from_config(
+                Some("custom"),
+                Some("http://h:1/v1"),
+                Some("responses")
+            )
+            .unwrap(),
             Some(CodexLlmOverride::Custom {
-                base_url: "http://h:1/v1".to_owned()
+                base_url: "http://h:1/v1".to_owned(),
+                wire: CodexLlmWire::Responses,
             })
         );
         // custom인데 base URL이 없거나 잘못되면 조용한 폴백 대신 에러.
-        assert!(codex_llm_override_from_config(Some("custom"), None).is_err());
-        assert!(codex_llm_override_from_config(Some("custom"), Some("a b")).is_err());
+        assert!(codex_llm_override_from_config(Some("custom"), None, None).is_err());
+        assert!(codex_llm_override_from_config(Some("custom"), Some("a b"), None).is_err());
+        // 미지 wire도 에러 (config 로드 정규화가 막지만 spawn 경계 fail-closed).
+        assert!(
+            codex_llm_override_from_config(Some("custom"), Some("http://h:1/v1"), Some("nope"))
+                .is_err()
+        );
         // 미지 프로바이더도 에러 (config 로드 정규화가 막지만 spawn 경계 fail-closed).
-        assert!(codex_llm_override_from_config(Some("nope"), None).is_err());
+        assert!(codex_llm_override_from_config(Some("nope"), None, None).is_err());
+    }
+
+    #[test]
+    fn app_server_args는_chat_wire_직결_조립을_거부한다() {
+        // Chat wire는 spawn의 프록시 치환 후(Responses+프록시 주소)에만 argv가 된다 —
+        // upstream 직결 argv가 새면 codex가 /v1/responses 404를 만나는 오설정이다.
+        let error = codex_app_server_args(
+            Some(&CodexLlmOverride::Custom {
+                base_url: "http://h:1/v1".to_owned(),
+                wire: CodexLlmWire::Chat,
+            }),
+            false,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("변환 프록시"));
     }
 
     #[test]

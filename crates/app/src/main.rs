@@ -15,6 +15,7 @@ mod env;
 mod env_reload;
 mod fonts;
 mod git_cli;
+mod llm_proxy;
 mod local_llm;
 mod mcp_import;
 mod native_key_monitor;

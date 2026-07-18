@@ -76,8 +76,12 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSData",
     "NSString",
+    # 파일 트리 「복사」 — NSPasteboard writeObjects에 파일 URL 배열을 쓴다 (2026-07-19).
+    "NSArray",
+    "NSURL",
 ] }
-# MainThreadMarker(NSScreen 조회) 등 objc2 코어 타입 직접 사용 (2026-07-19).
+# MainThreadMarker(NSScreen 조회)·ProtocolObject(NSPasteboardWriting 배열) 등
+# objc2 코어 타입 직접 사용 (2026-07-19).
 objc2 = "0.6"
 block2 = "0.6"
 

@@ -1731,6 +1731,7 @@ impl FileTreeUi {
             .flatten();
         // 포인터 밑 행 기준 반입 대상(폴더 행=자신, 파일 행=부모) — 드롭(①)/⌘V(②) 공유.
         let mut hover_target_dir: Option<PathBuf> = None;
+        let mut hover_row_path: Option<PathBuf> = None;
         let mut drop_target_dir: Option<PathBuf> = None;
         let mut drag_row_highlighted = false;
         let scroll_output = egui::ScrollArea::vertical()
@@ -1780,9 +1781,10 @@ impl FileTreeUi {
                             1.0,
                             ui.visuals().widgets.hovered.weak_bg_fill,
                         );
-                        // ⌘V 대상 폴더 — hover 판정을 그대로 재사용(§과제②).
+                        // ⌘V 대상 폴더/⌘C 대상 행 — hover 판정을 그대로 재사용(§과제②③).
                         if !inaccessible {
                             hover_target_dir = Some(row_target_dir(row, self.root.as_deref()));
+                            hover_row_path = Some(row.path.clone());
                         }
                     }
                     // Finder 드래그 대상: 폴더 행 하이라이트 + 드롭 대상 기록 (§과제①).
@@ -1964,6 +1966,11 @@ impl FileTreeUi {
                                 ui.close();
                             }
                             ui.separator();
+                            // 파일 복사(③) — pasteboard 파일 URL로 써서 Finder ⌘V 대상.
+                            if ui.button(catalog.t("file_tree.copy_file", &[])).clicked() {
+                                menu_action = Some(MenuAction::CopyFile(row.path.clone()));
+                                ui.close();
+                            }
                             if ui.button(catalog.t("file_tree.copy_path", &[])).clicked() {
                                 menu_action = Some(MenuAction::CopyPath(row.path.clone()));
                                 ui.close();
@@ -2034,7 +2041,7 @@ impl FileTreeUi {
             let dst_dir = drop_target_dir.unwrap_or(root);
             self.start_copy_into(os_dropped, dst_dir);
         }
-        self.handle_clipboard_shortcuts(ui, tree_area, hover_target_dir);
+        self.handle_clipboard_shortcuts(ui, tree_area, hover_target_dir, hover_row_path);
 
         // 인라인 편집 커밋/취소 처리 (실패 시 편집 유지 — 이름을 고칠 수 있게)
         match edit_done {
@@ -2117,6 +2124,7 @@ impl FileTreeUi {
                 });
             }
             Some(MenuAction::Delete(path)) => self.spawn_trash(path),
+            Some(MenuAction::CopyFile(path)) => self.copy_files_to_clipboard(&[path]),
             Some(MenuAction::CopyPath(path)) => ui.ctx().copy_text(path.display().to_string()),
             Some(MenuAction::InsertPath(path)) => action = Some(SidebarAction::InsertPath(path)),
             Some(MenuAction::CdPath(path)) => action = Some(SidebarAction::CdPath(path)),
@@ -2304,7 +2312,7 @@ impl FileTreeUi {
         self.spawn_op(refresh, move || copy_sources_into_dir(&sources, &dst_dir));
     }
 
-    /// 파일 트리 위 ⌘V — 클립보드 파일 목록 붙여넣기(§과제②).
+    /// 파일 트리 위 ⌘C/⌘V — Finder와의 파일 전송(§과제②③).
     ///
     /// 게이트: 포인터가 트리 영역 위 + 텍스트에딧 포커스 없음 + 팝업 없음. 터미널(기본
     /// 키보드 소유자)/컴포저와의 이중 처리는 소비 플래그(take_clipboard_shortcut_
@@ -2314,6 +2322,7 @@ impl FileTreeUi {
         ui: &egui::Ui,
         tree_area: egui::Rect,
         target_dir: Option<PathBuf>,
+        row_path: Option<PathBuf>,
     ) {
         let Some(root) = self.root.clone() else {
             return;
@@ -2326,6 +2335,13 @@ impl FileTreeUi {
             .is_some_and(|pos| tree_area.contains(pos));
         if !pointer_over {
             return;
+        }
+        // ⌘C(③): 포인터 밑 행을 파일 URL로 pasteboard에 — Finder에서 ⌘V 가능.
+        if let Some(path) = row_path
+            && ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)))
+        {
+            self.consumed_copy_shortcut = true;
+            self.copy_files_to_clipboard(std::slice::from_ref(&path));
         }
         // ⌘V(②): 클립보드 파일 목록을 대상 폴더로 복사. macOS는 press가 native
         // key-down(peek)으로, 텍스트 표현이 있으면 Event::Paste로, release가 V key-up
@@ -2352,6 +2368,14 @@ impl FileTreeUi {
         self.consumed_paste_shortcut = true;
         self.last_external_paste = Some(std::time::Instant::now());
         self.start_copy_into(paths, target_dir.unwrap_or(root));
+    }
+
+    /// 파일 URL pasteboard 쓰기 — 실패는 하단 에러 라벨로 표면화(조용한 실패 금지).
+    fn copy_files_to_clipboard(&mut self, paths: &[PathBuf]) {
+        match crate::ui::clipboard_image::copy_file_urls_to_clipboard(paths) {
+            Ok(()) => self.error = None,
+            Err(e) => self.error = Some(format!("파일 복사(클립보드) 실패: {e}")),
+        }
     }
 
     /// 백그라운드 파일 조작 실행 — 완료/에러는 채널로 UI에 전달되고 repaint를 깨운다(§9-3).
@@ -2903,6 +2927,8 @@ enum MenuAction {
     NewFolder(PathBuf),
     Rename(PathBuf),
     Delete(PathBuf),
+    /// 파일/폴더를 pasteboard에 파일 URL로 복사 — Finder ⌘V 대상(§과제③).
+    CopyFile(PathBuf),
     CopyPath(PathBuf),
     InsertPath(PathBuf),
     CdPath(PathBuf),

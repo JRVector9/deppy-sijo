@@ -506,6 +506,7 @@ file_tree.new_folder_inside = 新增資料夾（內部）
 file_tree.new_folder_alongside = 新增資料夾（相同位置）
 file_tree.rename = 重新命名
 file_tree.move_to_trash = 移到垃圾桶
+file_tree.copy_file = 複製
 file_tree.copy_path = 複製路徑
 file_tree.insert_path_terminal = 插入路徑到終端機
 file_tree.cd_here = 切換到此資料夾 (cd)

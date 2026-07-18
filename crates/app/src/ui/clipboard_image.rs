@@ -68,6 +68,50 @@ pub fn read_clipboard_file_list() -> Option<Vec<PathBuf>> {
     clipboard_file_list(&mut clipboard).ok().flatten()
 }
 
+/// 파일 경로들을 OS 클립보드에 **파일 URL**로 쓴다 — Finder가 ⌘V로 붙여넣을 수 있는
+/// 형식(public.file-url). 파일 트리 「복사」/⌘C가 쓴다.
+#[cfg(target_os = "macos")]
+pub fn copy_file_urls_to_clipboard(paths: &[PathBuf]) -> anyhow::Result<()> {
+    use objc2::rc::Retained;
+    use objc2::runtime::ProtocolObject;
+    use objc2_app_kit::{NSPasteboard, NSPasteboardWriting};
+    use objc2_foundation::{NSArray, NSString, NSURL};
+    anyhow::ensure!(!paths.is_empty(), "복사할 파일이 없습니다");
+    // generalPasteboard 싱글턴에 UI 이벤트(메인 스레드)에서만 쓴다. NSURL은
+    // NSPasteboardWriting 적합(AppKit 문서)이라 writeObjects로 파일 URL 배열이 된다.
+    let pasteboard = NSPasteboard::generalPasteboard();
+    let urls: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = paths
+        .iter()
+        .map(|path| {
+            let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+            ProtocolObject::from_retained(url)
+        })
+        .collect();
+    let array = NSArray::from_retained_slice(&urls);
+    pasteboard.clearContents();
+    anyhow::ensure!(
+        pasteboard.writeObjects(&array),
+        "pasteboard 파일 URL 쓰기 실패"
+    );
+    Ok(())
+}
+
+/// 비macOS 폴백 — 파일 URL pasteboard 배선이 없어 경로 텍스트로만 복사한다
+/// (주 타깃은 macOS, §과제③).
+#[cfg(not(target_os = "macos"))]
+pub fn copy_file_urls_to_clipboard(paths: &[PathBuf]) -> anyhow::Result<()> {
+    anyhow::ensure!(!paths.is_empty(), "복사할 파일이 없습니다");
+    let mut clipboard = arboard::Clipboard::new().context("clipboard 열기 실패")?;
+    let text = paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    clipboard
+        .set_text(text)
+        .context("clipboard 텍스트 쓰기 실패")
+}
+
 /// macOS: pasteboard의 PNG 바이트를 **디코드 없이 그대로** 가져온다 — cmux와 동일 접근.
 /// 스크린샷은 pasteboard에 이미 PNG로 있으므로 파일로 쓰기만 하면 된다(수 ms).
 /// arboard get_image()는 RGBA 디코드 + PNG 재인코딩 왕복이라 수백 ms 걸렸다(2026-07-08).
@@ -213,6 +257,31 @@ mod tests {
         ));
         let err = write_rgba_png(&path, 2, 2, &[0, 0, 0, 255]).unwrap_err();
         assert!(err.to_string().contains("RGBA"));
+    }
+
+    /// 실기기 pasteboard 왕복 — 파일 URL write(③) 후 arboard file_list로 읽혀야
+    /// Finder ⌘V/트리 ⌘V(②)가 동작한다. 사용자 클립보드를 덮어쓰므로 기본 제외:
+    /// `cargo test -p deppy-sijo pasteboard_파일_url -- --ignored`로 수동 실행.
+    #[test]
+    #[ignore = "실기기 클립보드를 덮어쓴다 — 수동 검증 전용"]
+    fn pasteboard_파일_url_왕복() {
+        let path = std::env::temp_dir().join(format!(
+            "deppy-sijo-pasteboard-roundtrip-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"roundtrip").unwrap();
+        let canonical = path.canonicalize().unwrap();
+        copy_file_urls_to_clipboard(std::slice::from_ref(&canonical)).unwrap();
+        let listed = read_clipboard_file_list().expect("pasteboard에서 파일 목록을 읽어야 한다");
+        assert!(
+            listed.iter().any(|p| {
+                p.canonicalize()
+                    .map(|c| c == canonical)
+                    .unwrap_or(p == &canonical)
+            }),
+            "왕복 파일 목록에 원본 경로가 없다: {listed:?}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

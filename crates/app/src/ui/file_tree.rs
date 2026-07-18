@@ -2818,7 +2818,15 @@ fn workspace_row(
     let show_summary = rect.width() >= 270.0;
     let show_disclosure = expanded.is_some() && rect.width() >= 56.0;
     if rect.width() >= 64.0 {
-        let reserved_right = if show_summary { 198.0 } else { 8.0 };
+        // 요약 배지 자리를 **실제 폭**만큼만 예약한다 — 고정 198px는 "유휴 5"처럼
+        // 짧은 요약에도 이름을 훨씬 일찍 잘라 옆 여백이 남았다(2026-07-18 사용자).
+        // 우측 여백 8 + 이름/요약 간격 16 + disclosure 폭(있으면 14)을 더한다.
+        let reserved_right = if show_summary {
+            let disclosure = if show_disclosure { 14.0 } else { 0.0 };
+            workspace_summary_width(ui, workspace.summary) + 24.0 + disclosure
+        } else {
+            8.0
+        };
         let name_width = (rect.right() - reserved_right - avatar.right() - 9.0).max(0.0);
         if name_width > 4.0 {
             let uppercase_name = workspace.name.to_uppercase();
@@ -2918,6 +2926,22 @@ fn workspace_creation_order_partition<'a>(
         ),
         None => (workspaces, None, &[]),
     }
+}
+
+/// 요약 배지의 렌더 폭 — workspace_row가 이름 자리를 이 폭만큼만 비워 두게 한다.
+/// paint_workspace_summary와 같은 세그먼트·폰트를 써야 실제 렌더와 어긋나지 않는다.
+fn workspace_summary_width(ui: &egui::Ui, summary: SidebarSessionSummary) -> f32 {
+    let weak = ui.visuals().weak_text_color();
+    let font = egui::FontId::proportional(11.0);
+    workspace_summary_segments(summary, weak)
+        .iter()
+        .map(|(text, color)| {
+            ui.painter()
+                .layout_no_wrap(text.clone(), font.clone(), *color)
+                .size()
+                .x
+        })
+        .sum()
 }
 
 fn paint_workspace_summary(

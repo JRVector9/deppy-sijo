@@ -1,11 +1,10 @@
 //! 로컬 LLM 감지 (PR-L1) — ollama(`GET {base}/api/tags`)와 OpenAI 호환
 //! 엔드포인트(`GET {base}/v1/models`)에서 사용 가능한 모델 목록을 가져온다.
-//! 에이전트 설정 UI의 모델 후보로 쓰인다(PR-L3 배선 예정). UI 스레드 네트워크
+//! Agents 창 OSS 프로바이더의 모델 후보로 쓰인다(PR-L3 배선). UI 스레드 네트워크
 //! 금지 관례 — 일회성 워커(notice_translate 스타일)가 감지 후 mpsc로 결과를
 //! 보내고 종료한다. 연결 실패는 미설치/미실행으로 정상 처리(None), 에러 아님.
-
-// PR-L3가 에이전트 설정 UI에 배선하기 전까지 bin 크레이트 미사용 pub 경고 억제 (배선 시 제거).
-#![allow(dead_code)]
+//! 커스텀 OpenAI 호환 쪽 목록 조회는 배선하지 않는다 — 사용자 지시(2026-07-18):
+//! 커스텀 API는 검색 없이 입력값이 다음 실행에 적용되면 충분.
 
 use std::sync::mpsc::Receiver;
 use std::time::Duration;

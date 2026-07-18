@@ -1180,6 +1180,11 @@ pub struct App {
     /// LLM(claude CLI) 미연결·영어 로케일이면 항상 비어 있고 원문을 그대로 쓴다.
     notice_translations: std::collections::HashMap<String, String>,
     notice_translate_rx: Option<std::sync::mpsc::Receiver<Vec<(String, String)>>>,
+    /// ollama 모델 감지 (PR-L3) — Agents 창에서 OSS 프로바이더 선택 시 1회 감지해
+    /// 새 작업 폼의 모델 후보로 보여준다. None=미감지/실패(표시 안 함).
+    ollama_models: Option<Vec<String>>,
+    ollama_detect_done: bool,
+    ollama_detect_rx: Option<std::sync::mpsc::Receiver<crate::local_llm::LocalLlmSnapshot>>,
     notifications_ui: ui::notifications::NotificationsUi,
     /// 벨 팝오버 「대기 중」 섹션의 PTY 입력 대기 카드 렌더 상태 (v3.9 N3) — 자유 입력칸
     /// 버퍼 + 로그 tail 미리보기 캐시. 팝오버가 열려 있을 때만 조회한다(idle 비용 0).
@@ -1533,6 +1538,9 @@ impl App {
             status_feed: crate::status_feed::StatusFeedSnapshot::default(),
             notice_translations: std::collections::HashMap::new(),
             notice_translate_rx: None,
+            ollama_models: None,
+            ollama_detect_done: false,
+            ollama_detect_rx: None,
             notifications_ui: ui::notifications::NotificationsUi::new(),
             inbox_waiting_ui: ui::inbox_waiting::InboxWaitingUi::new(),
             // 히스토리 파일은 앱 데이터 디렉터리(= 메타데이터 파일과 같은 폴더) 아래.
@@ -4131,6 +4139,37 @@ impl App {
         ));
     }
 
+    /// ollama 모델 감지 펌프 (PR-L3) — Agents 창이 열려 있고 OSS 프로바이더가 선택된
+    /// 첫 시점에 1회 감지(local_llm 일회성 워커). 앱 실행 중 재감지는 하지 않는다 —
+    /// ollama를 나중에 켠 경우는 모델명을 직접 입력하면 된다(입력 즉시 적용 원칙).
+    fn pump_ollama_detect(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.ollama_detect_rx {
+            match rx.try_recv() {
+                Ok(snapshot) => {
+                    self.ollama_models = snapshot.ollama;
+                    self.ollama_detect_done = true;
+                    self.ollama_detect_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.ollama_detect_done = true;
+                    self.ollama_detect_rx = None;
+                }
+            }
+        }
+        if !self.ollama_detect_done
+            && self.ollama_detect_rx.is_none()
+            && self.agent_sessions_ui.is_open()
+            && self.config.agents.codex_llm_provider.as_deref() == Some("oss")
+        {
+            self.ollama_detect_rx = Some(crate::local_llm::spawn_detect(
+                ctx.clone(),
+                crate::local_llm::DEFAULT_OLLAMA_BASE.to_owned(),
+                None,
+            ));
+        }
+    }
+
     fn activity_rows(&self) -> Vec<ui::activity::ActivityWorkspaceRow> {
         let now = std::time::Instant::now();
         self.workspaces
@@ -5425,6 +5464,7 @@ impl eframe::App for App {
             }
         }
         self.pump_notice_translations(ui.ctx());
+        self.pump_ollama_detect(ui.ctx());
         egui::Panel::bottom("agent_terminal_status_bar")
             .resizable(false)
             .exact_size(26.0)
@@ -5931,6 +5971,7 @@ impl eframe::App for App {
             agent_workspace_cwd,
             pty_agent_surfaces,
             &mut self.config.agents,
+            self.ollama_models.as_deref(),
         );
         if self.config.agents != agents_config_before
             && let Err(e) = self.config.save(&self.config_path)

@@ -1005,6 +1005,7 @@ impl AgentSessionsUi {
         workspace_cwd: Option<String>,
         pty_surfaces: Vec<AgentSurfaceSnapshot>,
         agents_config: &mut AgentsConfig,
+        ollama_models: Option<&[String]>,
     ) -> Vec<AgentSessionsRequest> {
         // 창이 닫혀 있어도 동기화 — App 단축키 경로의 ensure_client도 최신 설정을 쓴다.
         self.sync_llm_config(agents_config);
@@ -1079,7 +1080,7 @@ impl AgentSessionsUi {
                         ui.weak("카탈로그 응답 대기 중…");
                     }
                 });
-                self.render_agent_controls(ui, &mut text_input_ids, agents_config);
+                self.render_agent_controls(ui, &mut text_input_ids, agents_config, ollama_models);
                 let prompt_response = ui.add_sized(
                     [ui.available_width(), 72.0],
                     egui::TextEdit::multiline(&mut self.new_prompt)
@@ -1174,6 +1175,7 @@ impl AgentSessionsUi {
         ui: &mut egui::Ui,
         text_input_ids: &mut Vec<egui::Id>,
         agents_config: &mut AgentsConfig,
+        ollama_models: Option<&[String]>,
     ) {
         let models = self.model_catalog.clone();
         let selected_model = models
@@ -1241,7 +1243,7 @@ impl AgentSessionsUi {
             }
         });
 
-        self.render_llm_provider_controls(ui, text_input_ids, agents_config);
+        self.render_llm_provider_controls(ui, text_input_ids, agents_config, ollama_models);
 
         if !self.skill_catalog.is_empty() {
             let skills = self.skill_catalog.clone();
@@ -1281,6 +1283,7 @@ impl AgentSessionsUi {
         ui: &mut egui::Ui,
         text_input_ids: &mut Vec<egui::Id>,
         agents_config: &mut AgentsConfig,
+        ollama_models: Option<&[String]>,
     ) {
         ui.horizontal_wrapped(|ui| {
             ui.label("LLM 프로바이더");
@@ -1327,6 +1330,26 @@ impl AgentSessionsUi {
                 ui.visuals().warn_fg_color,
                 "커스텀 프로바이더는 base URL이 필요합니다 (공백/제어문자 불가)",
             );
+        }
+        // OSS 선택 시 감지된 ollama 모델을 클릭 후보로 (PR-L3 — local_llm 감지 배선.
+        // 커스텀은 사용자 지시로 검색 없이 입력값 그대로 쓴다, 2026-07-18).
+        if agents_config.codex_llm_provider.as_deref() == Some("oss") {
+            match ollama_models {
+                Some([]) => {
+                    ui.weak("설치된 ollama 모델 없음 — `ollama pull <모델>`로 받으세요.");
+                }
+                Some(models) => {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.weak("ollama 모델:");
+                        for model in models.iter().take(8) {
+                            if ui.small_button(model).clicked() {
+                                self.new_model = model.clone();
+                            }
+                        }
+                    });
+                }
+                None => {}
+            }
         }
         // 프로바이더는 프로세스 레벨이라 살아 있는 app-server에는 적용되지 않는다.
         // 유휴 상태면 sync_llm_config가 자동으로 내렸다가 다음 실행에 반영한다.

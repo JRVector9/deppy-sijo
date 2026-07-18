@@ -93,8 +93,9 @@ pub fn validate_llm_base_url(raw: &str) -> anyhow::Result<String> {
 
 /// `codex app-server` spawn argv 조립 (순수 함수 — 단위 테스트 가능하게).
 /// 기본 `app-server --listen stdio://` 뒤에 프로바이더 `-c` 오버라이드를 붙인다.
-/// FLAG: `-c` 키 형식(model_provider / model_providers.*)은 오프라인 지식 기반 —
-/// 실기기 codex로 미검증(통합 단계에서 실검증 예정).
+/// `-c` 키는 실기기 codex(2026-07-18)로 검증됨: 내장 로컬 프로바이더 이름은
+/// `ollama`(`oss`는 없음, `--oss` 플래그도 app-server에선 거부), custom의
+/// wire_api는 `responses`만 허용(`chat`은 폐기 — codex#7782).
 fn codex_app_server_args(llm_override: Option<&CodexLlmOverride>) -> anyhow::Result<Vec<String>> {
     let mut args: Vec<String> = ["app-server", "--listen", "stdio://"]
         .map(str::to_owned)
@@ -102,7 +103,7 @@ fn codex_app_server_args(llm_override: Option<&CodexLlmOverride>) -> anyhow::Res
     match llm_override {
         None => {}
         Some(CodexLlmOverride::Oss) => {
-            args.extend(["-c", "model_provider=oss"].map(str::to_owned));
+            args.extend(["-c", "model_provider=ollama"].map(str::to_owned));
         }
         Some(CodexLlmOverride::Custom { base_url }) => {
             // enum 생성 경로가 검증을 거치지만, spawn 경계에서 한 번 더 — 잘못된 값이
@@ -116,7 +117,7 @@ fn codex_app_server_args(llm_override: Option<&CodexLlmOverride>) -> anyhow::Res
                 "-c".to_owned(),
                 format!("model_providers.deppy_local.base_url={base_url}"),
                 "-c".to_owned(),
-                "model_providers.deppy_local.wire_api=chat".to_owned(),
+                "model_providers.deppy_local.wire_api=responses".to_owned(),
             ]);
         }
     }
@@ -2144,7 +2145,7 @@ mod tests {
     }
 
     #[test]
-    fn app_server_args_oss는_model_provider_oss를_붙인다() {
+    fn app_server_args_oss는_내장_ollama_프로바이더를_지정한다() {
         assert_eq!(
             codex_app_server_args(Some(&CodexLlmOverride::Oss)).unwrap(),
             vec![
@@ -2152,7 +2153,7 @@ mod tests {
                 "--listen",
                 "stdio://",
                 "-c",
-                "model_provider=oss",
+                "model_provider=ollama",
             ]
         );
     }
@@ -2176,7 +2177,7 @@ mod tests {
                 "-c",
                 "model_providers.deppy_local.base_url=http://localhost:11434/v1",
                 "-c",
-                "model_providers.deppy_local.wire_api=chat",
+                "model_providers.deppy_local.wire_api=responses",
             ]
         );
     }

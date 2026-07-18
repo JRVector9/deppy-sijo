@@ -5048,4 +5048,92 @@ mod tests {
 
         std::fs::remove_dir_all(&base).unwrap();
     }
+
+    /// 파일 트리 스크롤과 같은 구조의 최소 재현: show_rows 가상화 + 행 내용(경로)
+    /// 기반 id + 행 전폭 interact. offset이 정확히 행높이 배수만큼 이동하면 직전
+    /// 프레임과 같은 rect에 다른 행 id가 들어온다.
+    fn tree_like_show_rows(ui: &mut egui::Ui, offset: f32) {
+        // 행 간격 0 — 실측 좌표를 행높이 배수로 고정해 rect 일치를 결정적으로 만든다.
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let row_height = 25.0;
+        egui::ScrollArea::vertical()
+            .vertical_scroll_offset(offset)
+            .show_rows(ui, row_height, 100, |ui, range| {
+                for i in range {
+                    let row_top = ui.cursor().min.y;
+                    let row_rect = egui::Rect::from_min_max(
+                        egui::pos2(ui.max_rect().left(), row_top),
+                        egui::pos2(ui.max_rect().right(), row_top + row_height),
+                    );
+                    // 실제 트리의 행 id 체계와 동일: 경로(여기선 인덱스) 기반 + "row" salt
+                    let drag_id = egui::Id::new(("file_tree_row", i)).with("row");
+                    ui.interact(row_rect, drag_id, egui::Sense::click_and_drag());
+                    ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), row_height),
+                        egui::Sense::hover(),
+                    );
+                }
+            });
+    }
+
+    /// egui 0.35 `warn_if_rect_changes_id` 경고가 그리는 도형(순수 RED 2px 테두리,
+    /// context.rs `warn_if_rect_changes_id` 참조) 개수를 센다.
+    fn red_warning_rect_count(output: &egui::FullOutput) -> usize {
+        output
+            .shapes
+            .iter()
+            .filter(|clipped| match &clipped.shape {
+                egui::Shape::Rect(rect) => {
+                    rect.stroke.color == egui::Color32::RED
+                        && rect.stroke.width == 2.0
+                        && rect.fill == egui::Color32::TRANSPARENT
+                }
+                _ => false,
+            })
+            .count()
+    }
+
+    /// 원인 특정(2026-07-18 "트리 스크롤 중 빨간 네모" 보고): egui 0.35 신설
+    /// `Style.debug.warn_if_rect_changes_id`(디버그 빌드 기본 on)는 같은 rect의
+    /// 위젯 id가 패스 사이에 바뀌면 Color32::RED 2px 테두리를 그린다. show_rows
+    /// 가상화 트리에서 스크롤이 행높이만큼 이동하면 이것이 오발화함을 고정한다.
+    #[test]
+    fn kittest_행높이만큼_스크롤하면_rect_id변경_빨간경고가_발화한다() {
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, offset: &mut f32| tree_like_show_rows(ui, *offset),
+            0.0_f32,
+        );
+        // 테스트 프로필과 무관하게 결정적이도록 경고를 명시적으로 켠다 (디버그 기본값).
+        harness
+            .ctx
+            .all_styles_mut(|style| style.debug.warn_if_rect_changes_id = true);
+        harness.step();
+        harness.step(); // 첫 프레임 정착(초기 사이징 재패스 영향 제거)
+        *harness.state_mut() = 25.0; // 정확히 행높이 한 칸 스크롤
+        harness.step();
+        assert!(
+            red_warning_rect_count(harness.output()) > 0,
+            "행높이 배수 스크롤 프레임에서 warn_if_rect_changes_id 빨간 테두리가 나와야 원인 재현"
+        );
+    }
+
+    /// 수정 검증: main.rs `disable_egui_debug_warnings`를 적용하면 같은 스크롤
+    /// 시나리오에서 빨간 경고 테두리가 그려지지 않는다.
+    #[test]
+    fn kittest_디버그경고를_끄면_스크롤중_빨간네모가_없다() {
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, offset: &mut f32| tree_like_show_rows(ui, *offset),
+            0.0_f32,
+        );
+        crate::disable_egui_debug_warnings(&harness.ctx);
+        harness.step();
+        harness.step();
+        *harness.state_mut() = 25.0;
+        harness.step();
+        assert_eq!(
+            red_warning_rect_count(harness.output()),
+            0,
+            "디버그 경고를 끈 뒤에는 스크롤 중 빨간 테두리가 없어야 한다"
+        );
+    }
 }

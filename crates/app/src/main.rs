@@ -118,13 +118,7 @@ fn main() -> anyhow::Result<()> {
             // 등록해야 프리퍼런스 적용 시 커스텀 색이 선택된다.
             theme::install_palette(&cc.egui_ctx);
             cc.egui_ctx.set_theme(config.ui.theme.to_egui());
-            // egui 디버그 빌드 기본값인 위젯 ID 충돌 경고(빨간 테두리 + 🔥)를 끈다 —
-            // dev-run 디버그 빌드를 일상 사용하는 앱이라 파일 트리 토글·설정 화면에서
-            // 빨간 영역이 깜빡여 사용자에게 그대로 노출된다(2026-07-18 보고). 릴리스
-            // 빌드는 원래 안 그리므로 이 설정으로 디버그/릴리스 화면이 같아진다.
-            // ID 충돌 자체를 잡을 때는 이 줄을 잠시 주석 처리하고 재현하면 된다.
-            cc.egui_ctx
-                .options_mut(|options| options.warn_on_id_clash = false);
+            disable_egui_debug_warnings(&cc.egui_ctx);
             fonts::install_cjk_fallback(
                 &cc.egui_ctx,
                 config.ui.ui_font.as_deref(),
@@ -308,6 +302,24 @@ fn install_macos_menu() {
 
 #[cfg(not(target_os = "macos"))]
 fn install_macos_menu() {}
+
+/// egui 디버그 빌드 전용 화면 경고(빨간 표시 계열)를 끈다 — dev-run 디버그 빌드를
+/// 일상 사용하는 앱이라 개발용 경고가 사용자에게 그대로 노출된다. 릴리스 빌드는
+/// 원래 안 그리므로 이 설정으로 디버그/릴리스 화면이 같아진다.
+/// 경고 자체를 조사할 때는 해당 줄을 잠시 주석 처리하고 재현하면 된다.
+pub fn disable_egui_debug_warnings(ctx: &egui::Context) {
+    // 위젯 ID 충돌 경고(error_fg_color 테두리 + 🔥 텍스트) — 파일 트리 토글·설정
+    // 화면에서 깜빡였다(2026-07-18 보고, 1faeb30).
+    ctx.options_mut(|options| options.warn_on_id_clash = false);
+    // egui 0.35 신설 `Style.debug.warn_if_rect_changes_id`(디버그 빌드 기본 on)는
+    // "직전 패스와 같은 rect에 전혀 다른 위젯 id가 오면" Color32::RED 2px 테두리를
+    // 그린다. 파일 트리는 show_rows 가상화 + 경로 기반 행 id라, 스크롤이 정확히
+    // 행높이 배수만큼 이동한 프레임마다 같은 rect에 다른 행(id)이 들어와 정상
+    // 동작인데도 오발화한다(2026-07-18 "트리 스크롤 중 빨간 네모" 보고).
+    // warn_on_id_clash(Options)와는 별개 플래그(Style.debug)라 위 설정으로는 안 꺼진다.
+    // 다크/라이트 스타일 모두에 적용해야 런타임 테마 전환 후에도 유지된다.
+    ctx.all_styles_mut(|style| style.debug.warn_if_rect_changes_id = false);
+}
 
 fn init_logging(paths: &paths::AppPaths) -> tracing_appender::non_blocking::WorkerGuard {
     let file_appender = tracing_appender::rolling::daily(&paths.log_dir, "app.log");

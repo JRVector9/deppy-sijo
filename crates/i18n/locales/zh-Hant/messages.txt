@@ -38,6 +38,7 @@ worktree.created_elsewhere = 工作區已切換，未開啟 Shell — 工作樹�
 worktree.remove_failed = 工作樹刪除失敗
 worktree.removed = 工作樹已刪除
 worktree.removed_elsewhere = 工作區已切換，未能關閉該 Shell — 工作樹已刪除
+worktree.branch_preserved = 分支已保留（存在未合併提交）
 sidebar.menu.show_diff = 檢視變更
 diff.title = 變更
 diff.refresh = 重新整理

@@ -1108,6 +1108,10 @@ fn font_settings_changed(
         || config.terminal.mono_weight.as_str() != last_mono_weight
 }
 
+/// 워크트리 삭제 백그라운드 작업의 성공 결과 — (지운 워크트리 루트, 브랜치 처리
+/// 결과). worktree_remove_rx 참조.
+type WorktreeRemoveOutcome = (std::path::PathBuf, crate::worktree::BranchCleanup);
+
 pub struct App {
     config: Config,
     config_path: PathBuf,
@@ -1339,13 +1343,14 @@ pub struct App {
         String,
         std::sync::mpsc::Receiver<anyhow::Result<std::path::PathBuf>>,
     )>,
-    /// 진행 중인 워크트리 삭제 — (요청 시점 workspace id, 결과 채널). 결과는 지운
-    /// 워크트리 루트 경로 — 성공하면 요청 시점 워크스페이스가 여전히 활성일 때만,
-    /// 그 루트 하위 cwd를 쓰던 세션의 pane을 전부 닫는다(같은 폴더에서 새 셀로
-    /// 만든 형제 pane, 하위 폴더로 cd한 pane 포함, 2026-07-18).
+    /// 진행 중인 워크트리 삭제 — (요청 시점 workspace id, 결과 채널). 결과는 (지운
+    /// 워크트리 루트, 브랜치 처리 결과) — 성공하면 요청 시점 워크스페이스가 여전히
+    /// 활성일 때만, 그 루트 하위 cwd를 쓰던 세션의 pane을 전부 닫는다(같은 폴더에서
+    /// 새 셀로 만든 형제 pane, 하위 폴더로 cd한 pane 포함, 2026-07-18). 브랜치가
+    /// 보존됐으면(미병합 커밋) 알림 본문에 표시한다.
     worktree_remove_rx: Option<(
         String,
-        std::sync::mpsc::Receiver<anyhow::Result<std::path::PathBuf>>,
+        std::sync::mpsc::Receiver<anyhow::Result<WorktreeRemoveOutcome>>,
     )>,
     ts_detect_rx: Option<std::sync::mpsc::Receiver<crate::tailscale::Detected>>,
     /// 마지막 감지 결과 — 설정 UI 표시용. None = 이 세션에서 아직 시도 안 함.
@@ -5878,7 +5883,11 @@ impl eframe::App for App {
         // 닿을 수 없다(create_worktree의 NotifyOnly와 같은 한계, codex P2).
         if let Some((requested_ws, rx)) = &self.worktree_remove_rx {
             match rx.try_recv() {
-                Ok(Ok(root)) => {
+                Ok(Ok((root, branch))) => {
+                    // 브랜치가 보존됐으면(미병합 커밋) 알림 본문에 명시 — 조용히
+                    // 남겨두면 "왜 브랜치가 남았지"가 된다.
+                    let branch_note = (branch == crate::worktree::BranchCleanup::PreservedUnmerged)
+                        .then(|| text.t("worktree.branch_preserved", &[]));
                     if *requested_ws == self.active.id {
                         let workspace_ui = &self.active.workspace_ui;
                         let panes: Vec<_> = self
@@ -5892,11 +5901,18 @@ impl eframe::App for App {
                                 .workspace_ui
                                 .close_pane_now(&self.active.runtime, pane);
                         }
-                        platform::notify(&text.t("worktree.removed", &[]), "");
+                        platform::notify(
+                            &text.t("worktree.removed", &[]),
+                            branch_note.as_deref().unwrap_or(""),
+                        );
                     } else {
                         let root_display = root.display().to_string();
                         tracing::info!("워크스페이스 전환 — 워크트리만 삭제됨: {root_display}");
-                        platform::notify(&text.t("worktree.removed_elsewhere", &[]), &root_display);
+                        let body = match &branch_note {
+                            Some(note) => format!("{root_display} — {note}"),
+                            None => root_display,
+                        };
+                        platform::notify(&text.t("worktree.removed_elsewhere", &[]), &body);
                     }
                     self.worktree_remove_rx = None;
                 }

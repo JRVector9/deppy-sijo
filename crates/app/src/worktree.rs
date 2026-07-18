@@ -6,9 +6,10 @@
 //!   exclude를 읽으므로 트리가 오염되지 않는다.
 //! - git 실행은 [`crate::git_cli`] 공용 헬퍼만 사용 — 블로킹이라 **백그라운드 스레드
 //!   전용**(UI 스레드 호출 금지, 호출측 App이 mpsc로 결과를 수령).
-//! - [`remove_worktree`]는 작업 디렉터리만 지운다 — `deppy/<slug>` 브랜치는 남긴다.
-//!   커밋되지 않은 변경/미병합 커밋이 브랜치에만 남아 있을 수 있어, 브랜치까지
-//!   지우는 건 되돌릴 수 없는 별도 결정이라 범위 밖(2026-07-18 사용자 논의).
+//! - [`remove_worktree`]는 작업 디렉터리를 지우고, `deppy/<slug>` 브랜치는 **고유
+//!   커밋이 없을 때만**(tip이 다른 로컬/원격 브랜치에서 도달 가능) 함께 지운다 —
+//!   미병합 커밋이 있으면 보존하고 [`BranchCleanup`]으로 알린다(2026-07-18 논의
+//!   "무조건 보존"의 후속: 도달 가능성이 확인된 삭제는 손실이 아니다).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -57,11 +58,27 @@ pub fn create_worktree(cwd: &Path) -> anyhow::Result<PathBuf> {
     Ok(root.join(rel))
 }
 
-/// 세션 cwd(워크트리 내부 아무 경로)로부터 그 워크트리를 제거하고 지운 워크트리
-/// 루트를 돌려준다(호출측이 같은 폴더를 쓰던 다른 pane을 찾을 때 씀). 블로킹(git
-/// 실행) — 반드시 백그라운드 스레드에서 호출한다. deppy가 만든 `.deppy/worktrees/`
-/// 하위가 아니면 거부한다(다른 워크트리를 잘못 지우는 사고 방지). 삭제되지 않은
-/// 커밋/변경이 있으면 거부 에러를 그대로 올린다 — 조용한 데이터 손실 금지.
+/// 삭제 성공 시 `deppy/<slug>` 브랜치 처리 결과 — App 알림 문구 분기용.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchCleanup {
+    /// 고유 커밋이 없어 브랜치도 지웠다 — tip이 자기 자신 외 다른 ref(로컬/원격
+    /// 브랜치)에서 도달 가능함을 확인한 뒤라 커밋 손실이 없다.
+    Deleted,
+    /// tip이 자기 자신에서만 도달 가능(미병합 커밋)이라 브랜치를 보존했다 —
+    /// App이 알림에 "브랜치 보존됨"을 표시한다.
+    PreservedUnmerged,
+    /// 손대지 않음 — HEAD가 `deppy/*` 브랜치가 아니거나(사용자가 체크아웃을 바꿈,
+    /// detached) 판정/삭제 git 명령이 실패. 모두 보존 쪽 안전 실패라, 워크트리는
+    /// 이미 지워진 뒤이므로 에러로 올리지 않고 로그만 남긴다.
+    Kept,
+}
+
+/// 세션 cwd(워크트리 내부 아무 경로)로부터 그 워크트리를 제거하고 (지운 워크트리
+/// 루트, 브랜치 처리 결과)를 돌려준다(루트는 호출측이 같은 폴더를 쓰던 다른 pane을
+/// 찾을 때 씀). 블로킹(git 실행) — 반드시 백그라운드 스레드에서 호출한다. deppy가
+/// 만든 `.deppy/worktrees/` 하위가 아니면 거부한다(다른 워크트리를 잘못 지우는 사고
+/// 방지). 삭제되지 않은 커밋/변경이 있으면 거부 에러를 그대로 올린다 — 조용한
+/// 데이터 손실 금지.
 ///
 /// 서브모듈: 상주(populated) 서브모듈이 있으면 git이 깨끗해도 `worktree remove`를
 /// 거부한다("working trees containing submodules cannot be moved or removed",
@@ -96,13 +113,22 @@ pub fn create_worktree(cwd: &Path) -> anyhow::Result<PathBuf> {
 ///   세션이 warm(비활성, 상주) 워크스페이스에 있으면 거기 pane은 안 닫힌다. 그
 ///   워크스페이스로 전환하면 죽은 cwd가 드러날 뿐 자동 정리는 안 됨(App 쪽 한계,
 ///   `self.warm`이 활성 workspace_ui와 다른 구조라 이번 라운드에서는 안 건드림).
-pub fn remove_worktree(cwd: &Path) -> anyhow::Result<PathBuf> {
+pub fn remove_worktree(cwd: &Path) -> anyhow::Result<(PathBuf, BranchCleanup)> {
     let worktree_root = crate::git_cli::repo_root(cwd, ROOT_TIMEOUT)?;
     anyhow::ensure!(
         is_deppy_worktree(&worktree_root),
         "deppy 워크트리가 아님: {}",
         worktree_root.display()
     );
+    // 브랜치 정리 판정용 — 삭제 후에는 이 워크트리에서 물을 수 없으니 먼저 캡처.
+    // detached면 "HEAD"가 나온다(→ Kept).
+    let head_branch = crate::git_cli::run_git(
+        &worktree_root,
+        &["rev-parse", "--abbrev-ref", "HEAD"],
+        ROOT_TIMEOUT,
+    )?
+    .trim()
+    .to_owned();
     let submodules = populated_submodules(&worktree_root)?;
     // git worktree remove의 dirty 판정은 추적/미추적 변경만 본다 — gitignore된
     // 내용(.env.local, 빌드 산출물, 심지어 중첩 워크트리)은 "깨끗함"으로 보고
@@ -206,7 +232,7 @@ pub fn remove_worktree(cwd: &Path) -> anyhow::Result<PathBuf> {
         &["worktree", "remove", "--force", target]
     };
     crate::git_cli::run_git(&main_root, remove_args, ADD_TIMEOUT)?;
-    Ok(worktree_root)
+    Ok((worktree_root, cleanup_branch(&main_root, &head_branch)))
 }
 
 /// repo 안 상주(populated) 서브모듈의 절대 경로 목록 — 중첩 서브모듈까지 재귀.
@@ -232,6 +258,51 @@ fn populated_submodules(repo: &Path) -> anyhow::Result<Vec<PathBuf>> {
         }
     }
     Ok(found)
+}
+
+/// 워크트리 삭제 성공 후 `deppy/<slug>` 브랜치 정리 — 고유 커밋이 없을 때만 지운다.
+/// 판정: `git branch --all --format=%(refname:short) --contains <branch>`가 자기
+/// 자신 외의 ref를 나열하면 tip이 다른 브랜치(로컬/원격)에서 도달 가능 = 지워도
+/// 커밋 손실 없음. `branch -d`를 안 쓰는 이유: -d는 HEAD/upstream 병합만 보므로
+/// 다른 브랜치에 병합된 경우를 놓친다 — 도달 가능성 판정을 직접 한 뒤 -D를 쓴다.
+/// 실패는 전부 보존 쪽(Kept)으로 — 워크트리는 이미 지워졌으니 에러로 안 올린다.
+fn cleanup_branch(main_root: &Path, branch: &str) -> BranchCleanup {
+    if !branch.starts_with("deppy/") {
+        // detached("HEAD") 또는 사용자가 체크아웃을 바꾼 브랜치 — 앱 소유가 아니다.
+        return BranchCleanup::Kept;
+    }
+    let contains = crate::git_cli::run_git(
+        main_root,
+        &[
+            "branch",
+            "--all",
+            "--format=%(refname:short)",
+            "--contains",
+            branch,
+        ],
+        ROOT_TIMEOUT,
+    );
+    let contains = match contains {
+        Ok(out) => out,
+        Err(e) => {
+            tracing::warn!("브랜치 병합 판정 실패({branch}) — 보존: {e:#}");
+            return BranchCleanup::Kept;
+        }
+    };
+    let reachable_elsewhere = contains
+        .lines()
+        .map(str::trim)
+        .any(|l| !l.is_empty() && l != branch);
+    if !reachable_elsewhere {
+        return BranchCleanup::PreservedUnmerged;
+    }
+    match crate::git_cli::run_git(main_root, &["branch", "-D", branch], ROOT_TIMEOUT) {
+        Ok(_) => BranchCleanup::Deleted,
+        Err(e) => {
+            tracing::warn!("브랜치 삭제 실패({branch}) — 보존: {e:#}");
+            BranchCleanup::Kept
+        }
+    }
 }
 
 /// `<repo>/.deppy/worktrees/<slug>` 형태인가 — 이 앱이 만든 워크트리만 지우기 위한 판정.
@@ -459,10 +530,42 @@ mod tests {
         let repo = temp_repo();
         let path = create_worktree(&repo).unwrap();
         assert!(path.is_dir());
-        remove_worktree(&path).unwrap();
+        let (root, branch) = remove_worktree(&path).unwrap();
+        assert_eq!(root, path);
         assert!(!path.exists(), "{}", path.display());
-        // 삭제는 작업 디렉터리만 — 브랜치는 남는다(2026-07-18 논의: 브랜치 삭제는
-        // 되돌릴 수 없는 별도 결정이라 이 함수의 범위 밖).
+        // 고유 커밋이 없는 브랜치(tip이 기본 브랜치에서 도달 가능)는 함께 지운다 —
+        // 2026-07-18 "무조건 보존" 논의의 후속: 다른 ref에서 전부 도달 가능함을
+        // 확인한 삭제는 손실이 아니다. 미병합 커밋이 있으면 아래 보존 테스트.
+        assert_eq!(branch, BranchCleanup::Deleted);
+        let branches = crate::git_cli::run_git(&repo, &["branch", "--list"], ADD_TIMEOUT).unwrap();
+        assert!(!branches.contains("deppy/"), "{branches:?}");
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn remove_worktree는_미병합_커밋_브랜치를_보존한다() {
+        let repo = temp_repo();
+        let path = create_worktree(&repo).unwrap();
+        // 워크트리 브랜치에만 있는 커밋 — tip이 자기 자신에서만 도달 가능해진다.
+        crate::git_cli::run_git(
+            &path,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "unique",
+            ],
+            ADD_TIMEOUT,
+        )
+        .unwrap();
+        let (_, branch) = remove_worktree(&path).unwrap();
+        assert!(!path.exists(), "{}", path.display());
+        assert_eq!(branch, BranchCleanup::PreservedUnmerged);
         let branches = crate::git_cli::run_git(&repo, &["branch", "--list"], ADD_TIMEOUT).unwrap();
         assert!(branches.contains("deppy/"), "{branches:?}");
         std::fs::remove_dir_all(&repo).ok();
@@ -709,7 +812,7 @@ mod tests {
         // 2.50 실측) — 앱이 루트·서브모듈 전부 검사한 뒤 --force로 지우는 경로.
         let (base, repo) = temp_repo_with_submodule();
         let wt = worktree_with_populated_submodule(&repo);
-        let root = remove_worktree(&wt).unwrap();
+        let (root, _) = remove_worktree(&wt).unwrap();
         assert_eq!(root, wt);
         assert!(!wt.exists(), "{}", wt.display());
         std::fs::remove_dir_all(&base).ok();

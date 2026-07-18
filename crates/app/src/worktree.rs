@@ -61,16 +61,29 @@ pub fn create_worktree(cwd: &Path) -> anyhow::Result<PathBuf> {
 /// 루트를 돌려준다(호출측이 같은 폴더를 쓰던 다른 pane을 찾을 때 씀). 블로킹(git
 /// 실행) — 반드시 백그라운드 스레드에서 호출한다. deppy가 만든 `.deppy/worktrees/`
 /// 하위가 아니면 거부한다(다른 워크트리를 잘못 지우는 사고 방지). 삭제되지 않은
-/// 커밋/변경이 있으면 git이 그대로 거부하며(`--force` 미사용), 그 에러를 그대로
-/// 올린다 — 조용한 데이터 손실 금지.
+/// 커밋/변경이 있으면 거부 에러를 그대로 올린다 — 조용한 데이터 손실 금지.
+///
+/// 서브모듈: 상주(populated) 서브모듈이 있으면 git이 깨끗해도 `worktree remove`를
+/// 거부한다("working trees containing submodules cannot be moved or removed",
+/// git 2.50 실측 — `check_clean_worktree`가 `validate_no_submodules`를 부른다).
+/// 그래서 이 경우에만 `--force`를 쓰는데, `--force`는 git 자체의 추적 변경 dirty
+/// 검사까지 통째로 끈다 — 따라서 앱이 루트는 **모든** status 줄을, 각 서브모듈은
+/// 재귀적으로 `--ignored` 포함 전체를 검사해 전부 깨끗할 때만 진행한다(서브모듈
+/// 안의 ignored 파일은 바깥 status에 전혀 안 보인다 — 실측; ccac979의 "무시된 파일
+/// 조용한 삭제 금지"와 같은 시나리오다). 서브모듈 git 저장소는 워크트리 메타데이터
+/// (`.git/worktrees/<id>/modules/`) 안에 있어 워크트리와 함께 지워지므로, push 안 된
+/// HEAD 커밋이 있으면(원격 ref 어디에도 없음) 그것도 거부 사유다.
 ///
 /// 알려진 한계(codex 리뷰, 모두 안전 실패 쪽이라 범위 밖으로 남김 — 데이터 손실이
 /// 아니라 "삭제가 거부되거나 정리가 한 프레임 늦는" 쪽):
 /// - cwd가 워크트리 안의 중첩 서브모듈/레포 안이면 `repo_root`가 그 안쪽 레포를
 ///   반환해 `is_deppy_worktree`가 거부한다 — 삭제가 안 될 뿐 잘못 지우지는 않는다.
-/// - 워크트리 안에 초기화된 서브모듈이 있으면 루트와 서브모듈 둘 다 깨끗해도 git이
-///   `--force` 없이는 거부한다 — 재귀적으로 서브모듈까지 확인하려면 이 함수가 상당히
-///   커져야 해 뒤로 미룬다(마찬가지로 실패는 거부일 뿐 손실이 아니다).
+/// - 상주 서브모듈의 HEAD 외 로컬 브랜치에만 있는 커밋은 push 검사에 안 걸린다 —
+///   서브모듈 안에서 브랜치 작업까지 한 극단 사례라 HEAD 검사만 둔다(그 커밋도
+///   워크트리 메타데이터와 함께 지워지는 건 동일 — 필요해지면 전 브랜치 검사로 확장).
+/// - 미상주(빈 폴더) 서브모듈이어도 과거 상주 이력이 있으면(`.git/worktrees/<id>/
+///   modules/` 잔존) git이 force 없는 삭제를 거부한다 — 앱은 상주만 세므로 force를
+///   안 쓰고, git의 거부가 그대로 표면화된다(거부일 뿐 손실 아님).
 /// - 전처리 스캔과 `worktree remove` 실행 사이에 그 폴더의 셸/에이전트가 새
 ///   무시된 파일을 쓰면 그 파일은 걸러지지 않는다(TOCTOU) — 창이 git 프로세스
 ///   두 번 호출 사이로 매우 좁고, 막으려면 그 폴더의 모든 프로세스를 먼저 멈춰야
@@ -90,6 +103,7 @@ pub fn remove_worktree(cwd: &Path) -> anyhow::Result<PathBuf> {
         "deppy 워크트리가 아님: {}",
         worktree_root.display()
     );
+    let submodules = populated_submodules(&worktree_root)?;
     // git worktree remove의 dirty 판정은 추적/미추적 변경만 본다 — gitignore된
     // 내용(.env.local, 빌드 산출물, 심지어 중첩 워크트리)은 "깨끗함"으로 보고
     // 그대로 rm -rf에 딸려 지워진다(codex P1 실증). `--untracked-files=`을 명시
@@ -99,24 +113,71 @@ pub fn remove_worktree(cwd: &Path) -> anyhow::Result<PathBuf> {
     // 거대 미추적 디렉터리 전체를 한 줄씩 나열해 거부 판정 하나에 출력을 통째로
     // 버퍼링시킨다(codex 재검증 2); `normal`도 디렉터리를 한 줄로 묶을 뿐 존재
     // 여부 판정(및 config 우회 방지)은 동일하게 한다.
-    let status = crate::git_cli::run_git(
-        &worktree_root,
-        &[
-            "status",
-            "--porcelain",
-            "--ignored",
-            "--untracked-files=normal",
-        ],
-        ROOT_TIMEOUT,
-    )?;
-    if let Some(first) = status
-        .lines()
-        .find(|l| l.starts_with("!! ") || l.starts_with("?? "))
-    {
-        anyhow::bail!(
-            "정리 안 된 파일이 있어 삭제를 거부합니다({}…) — 직접 정리 후 다시 시도하세요",
-            &first[3..]
-        );
+    const STATUS_ARGS: [&str; 4] = [
+        "status",
+        "--porcelain",
+        "--ignored",
+        "--untracked-files=normal",
+    ];
+    let status = crate::git_cli::run_git(&worktree_root, &STATUS_ARGS, ROOT_TIMEOUT)?;
+    if submodules.is_empty() {
+        // 추적 변경(` M` 등)은 git 자신이 --force 없는 remove에서 거부하므로 앱은
+        // git이 못 보는 미추적/무시 파일만 판정한다.
+        if let Some(first) = status
+            .lines()
+            .find(|l| l.starts_with("!! ") || l.starts_with("?? "))
+        {
+            anyhow::bail!(
+                "정리 안 된 파일이 있어 삭제를 거부합니다({}…) — 직접 정리 후 다시 시도하세요",
+                &first[3..]
+            );
+        }
+    } else {
+        // 서브모듈 모드 — 아래에서 --force를 쓰면 git 자체 dirty 검사가 통째로
+        // 꺼지므로, 추적 변경 포함 모든 status 줄이 앱의 거부 사유로 승격된다.
+        // (서브모듈 내부의 미추적/커밋 변경도 바깥에는 ` M <sub>` 한 줄로 보인다 —
+        // 실측. 그래서 이 검사 하나가 서브모듈의 추적/미추적 변경까지 함께 막는다.)
+        if let Some(first) = status.lines().find(|l| !l.trim().is_empty()) {
+            anyhow::bail!(
+                "정리 안 된 변경이 있어 삭제를 거부합니다({}…) — 서브모듈이 있는 워크트리는 완전히 깨끗해야 합니다",
+                first.get(3..).unwrap_or(first)
+            );
+        }
+        for sub in &submodules {
+            let rel = sub
+                .strip_prefix(&worktree_root)
+                .unwrap_or(sub.as_path())
+                .display();
+            // 서브모듈 안의 ignored 파일은 바깥 status에 전혀 안 보인다(실측) —
+            // 재귀 스캔 없이는 --force가 그대로 지워버린다(루트의 codex P1과 동일).
+            let sub_status = crate::git_cli::run_git(sub, &STATUS_ARGS, ROOT_TIMEOUT)?;
+            if let Some(first) = sub_status.lines().find(|l| !l.trim().is_empty()) {
+                anyhow::bail!(
+                    "서브모듈에 정리 안 된 파일이 있어 삭제를 거부합니다({rel}: {}…) — 직접 정리 후 다시 시도하세요",
+                    first.get(3..).unwrap_or(first)
+                );
+            }
+            // 서브모듈 git 저장소는 `.git/worktrees/<id>/modules/` 안에 있어
+            // 워크트리와 함께 지워진다 — HEAD 커밋이 어떤 원격 ref에도 없으면
+            // 그 커밋 객체의 유일한 사본이 사라진다(바깥 status는 gitlink가
+            // 커밋돼 있으면 깨끗하다). push로 사본이 생긴 뒤에만 지운다.
+            let remote_refs = crate::git_cli::run_git(
+                sub,
+                &[
+                    "branch",
+                    "--remotes",
+                    "--format=%(refname:short)",
+                    "--contains",
+                    "HEAD",
+                ],
+                ROOT_TIMEOUT,
+            )?;
+            if remote_refs.lines().all(|l| l.trim().is_empty()) {
+                anyhow::bail!(
+                    "서브모듈에 push 안 된 커밋이 있어 삭제를 거부합니다({rel}) — push 후 다시 시도하세요"
+                );
+            }
+        }
     }
     // worktree remove는 지울 경로 안에서는 실행할 수 없다 — 메인 워크트리에서
     // 실행해야 한다. `--git-common-dir`의 부모로 추정하면 서브모듈/
@@ -136,8 +197,41 @@ pub fn remove_worktree(cwd: &Path) -> anyhow::Result<PathBuf> {
     let target = worktree_root.to_str().ok_or_else(|| {
         anyhow::anyhow!("워크트리 경로가 UTF-8이 아님: {}", worktree_root.display())
     })?;
-    crate::git_cli::run_git(&main_root, &["worktree", "remove", target], ADD_TIMEOUT)?;
+    // 상주 서브모듈이 있으면 git이 깨끗해도 거부한다(위 doc 참조) — 위에서 루트·
+    // 서브모듈 전부를 앱이 검사한 뒤에만 --force로 그 판정을 대신한다. 없으면
+    // 기존대로 force 미사용(추적 변경 거부를 git에 맡긴다).
+    let remove_args: &[&str] = if submodules.is_empty() {
+        &["worktree", "remove", target]
+    } else {
+        &["worktree", "remove", "--force", target]
+    };
+    crate::git_cli::run_git(&main_root, remove_args, ADD_TIMEOUT)?;
     Ok(worktree_root)
+}
+
+/// repo 안 상주(populated) 서브모듈의 절대 경로 목록 — 중첩 서브모듈까지 재귀.
+/// gitlink(mode 160000) 항목 중 `<path>/.git`이 실존하는 것만 센다 — 미상주(빈
+/// 폴더)는 git worktree remove가 force 없이도 지운다(git 2.50 실측).
+fn populated_submodules(repo: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    // -z: 경로에 특수문자가 있어도 인용 없이 NUL 구분 — 파싱이 흔들리지 않는다.
+    let listing = crate::git_cli::run_git(repo, &["ls-files", "-z", "--stage"], ROOT_TIMEOUT)?;
+    let mut found = Vec::new();
+    for entry in listing.split('\0') {
+        // 항목 형식: "<mode> <sha> <stage>\t<path>".
+        let Some((meta, path)) = entry.split_once('\t') else {
+            continue;
+        };
+        if !meta.starts_with("160000 ") {
+            continue;
+        }
+        let sub = repo.join(path);
+        // `.git`은 파일(gitdir 포인터)일 수도 디렉터리일 수도 있다 — 존재 = 상주.
+        if sub.join(".git").exists() {
+            found.extend(populated_submodules(&sub)?);
+            found.push(sub);
+        }
+    }
+    Ok(found)
 }
 
 /// `<repo>/.deppy/worktrees/<slug>` 형태인가 — 이 앱이 만든 워크트리만 지우기 위한 판정.
@@ -503,6 +597,185 @@ mod tests {
         assert!(path.is_dir());
         remove_worktree(&path).unwrap();
         assert!(!path.exists(), "{}", path.display());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// temp_repo + 커밋된 로컬 경로 서브모듈(sub) — 서브모듈 테스트 공용.
+    /// 반환 (base, 메인 repo 경로) — base 하나만 지우면 서브레포까지 정리된다.
+    /// 서브레포에는 ignored 파일 테스트용 `.gitignore`(*.local)를 커밋해 둔다.
+    fn temp_repo_with_submodule() -> (PathBuf, PathBuf) {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "deppy-worktree-sub-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        let subrepo = base.join("subrepo");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&subrepo).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |dir: &Path, args: &[&str]| {
+            crate::git_cli::run_git(dir, args, ADD_TIMEOUT).unwrap();
+        };
+        run(&subrepo, &["init", "-q"]);
+        std::fs::write(subrepo.join(".gitignore"), "*.local\n").unwrap();
+        run(&subrepo, &["add", ".gitignore"]);
+        run(
+            &subrepo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
+        );
+        run(&repo, &["init", "-q"]);
+        run(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "init",
+            ],
+        );
+        // 로컬 경로 서브모듈은 file 프로토콜 — git 기본 차단이라 allow=always 필요.
+        run(
+            &repo,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                subrepo.to_str().unwrap(),
+                "sub",
+            ],
+        );
+        run(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "sub",
+            ],
+        );
+        (base, repo)
+    }
+
+    /// 워크트리 생성 + 서브모듈 상주(populate) — `worktree add`는 서브모듈 폴더를
+    /// 비워 두므로(미상주, 실측) 명시적으로 update --init 해야 상주 케이스가 된다.
+    fn worktree_with_populated_submodule(repo: &Path) -> PathBuf {
+        let wt = create_worktree(repo).unwrap();
+        crate::git_cli::run_git(
+            &wt,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "-q",
+            ],
+            ADD_TIMEOUT,
+        )
+        .unwrap();
+        assert!(wt.join("sub/.git").exists(), "서브모듈 populate 실패");
+        wt
+    }
+
+    #[test]
+    fn remove_worktree는_깨끗한_서브모듈_워크트리를_지운다() {
+        // git은 상주 서브모듈이 있으면 깨끗해도 force 없는 remove를 거부한다
+        // ("working trees containing submodules cannot be moved or removed",
+        // 2.50 실측) — 앱이 루트·서브모듈 전부 검사한 뒤 --force로 지우는 경로.
+        let (base, repo) = temp_repo_with_submodule();
+        let wt = worktree_with_populated_submodule(&repo);
+        let root = remove_worktree(&wt).unwrap();
+        assert_eq!(root, wt);
+        assert!(!wt.exists(), "{}", wt.display());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn remove_worktree는_서브모듈이_dirty면_거부한다() {
+        let (base, repo) = temp_repo_with_submodule();
+        let wt = worktree_with_populated_submodule(&repo);
+        // ① 서브모듈 안 미추적 파일 — 바깥 status에 " M sub" 한 줄로 떠(실측)
+        //    루트 전체-깨끗 검사가 잡는다.
+        std::fs::write(wt.join("sub/dirty.txt"), "x").unwrap();
+        let err = remove_worktree(&wt).unwrap_err();
+        assert!(wt.exists(), "dirty 서브모듈이면 지워지면 안 된다");
+        assert!(format!("{err:#}").contains("거부"), "{err:#}");
+        std::fs::remove_file(wt.join("sub/dirty.txt")).unwrap();
+        // ② 서브모듈 안 ignored 파일 — 바깥 status에는 전혀 안 보인다(실측).
+        //    재귀 스캔만 잡는다 — ccac979 P1(무시된 파일 조용한 삭제)의 서브모듈판.
+        std::fs::write(wt.join("sub/secret.local"), "x").unwrap();
+        let err = remove_worktree(&wt).unwrap_err();
+        assert!(wt.exists(), "ignored 파일이 있으면 지워지면 안 된다");
+        assert!(format!("{err:#}").contains("서브모듈"), "{err:#}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn remove_worktree는_push_안_된_서브모듈_커밋이_있으면_거부한다() {
+        // 서브모듈 git 저장소는 워크트리 메타데이터(modules/) 안에 있어 워크트리와
+        // 함께 지워진다 — gitlink를 커밋해 바깥이 깨끗해도, 서브모듈 HEAD 커밋이
+        // 원격에 없으면 유일한 객체 사본이 사라지므로 거부해야 한다.
+        let (base, repo) = temp_repo_with_submodule();
+        let wt = worktree_with_populated_submodule(&repo);
+        let run = |dir: &Path, args: &[&str]| {
+            crate::git_cli::run_git(dir, args, ADD_TIMEOUT).unwrap();
+        };
+        run(
+            &wt.join("sub"),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "local",
+            ],
+        );
+        run(&wt, &["add", "sub"]);
+        run(
+            &wt,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "bump",
+            ],
+        );
+        let err = remove_worktree(&wt).unwrap_err();
+        assert!(wt.exists(), "push 안 된 서브모듈 커밋이면 지워지면 안 된다");
+        assert!(format!("{err:#}").contains("push"), "{err:#}");
         std::fs::remove_dir_all(&base).ok();
     }
 

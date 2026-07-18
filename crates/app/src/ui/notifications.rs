@@ -61,6 +61,8 @@ struct NotificationItem {
     title: String,
     message_id: String,
     read: bool,
+    /// 생성 시각(unix 초) — 작업함 전체 페이지의 「N분 전」 표시용 (2026-07-18).
+    created_at_secs: i64,
 }
 
 impl NotificationsUi {
@@ -244,6 +246,7 @@ impl NotificationsUi {
             // 보지 못한 background 알림이 읽음이 돼 unread 신호를 잃는다. 실제 읽음은
             // show()(=가시일 때만 호출)가 처리한다.
             read: false,
+            created_at_secs: deppy_core::time::unix_secs_i64(),
         });
         // 최근 100개만 유지
         if self.items.len() > 100 {
@@ -385,6 +388,61 @@ impl NotificationsUi {
         clicked
     }
 
+    /// 작업함 전체 페이지의 「최근 알림」 목록 (2026-07-18) — 시간·워크스페이스·본문을
+    /// 전부 보여준다(팝오버 recent_section은 최신 N개 요약만). 클릭 시 대상 반환 —
+    /// 점프 계약은 recent_section과 동일(호출측이 같은 네비게이션 경로로 처리).
+    /// 읽음 처리는 호출측(페이지 가시 시 mark_all_read — 팝오버와 같은 규약).
+    ///
+    /// `workspace_names`는 workspace_id → 표시 이름 맵(inbox_approvals::render와 같은
+    /// 계약) — 이 모듈은 App을 모르므로 호출측이 미리 만들어 넘긴다.
+    pub fn history_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        catalog: &i18n::Catalog,
+        workspace_names: &std::collections::HashMap<String, String>,
+    ) -> Option<AgentNotificationTarget> {
+        if self.items.is_empty() {
+            ui.label(
+                egui::RichText::new(catalog.t("notification.empty", &[]))
+                    .size(11.0)
+                    .weak(),
+            );
+            return None;
+        }
+        let now = deppy_core::time::unix_secs_i64();
+        let mut clicked = None;
+        // 최신 항목이 위로 — 전체 기록(총량은 push의 100개 cap으로 유계).
+        for item in self.items.iter().rev() {
+            let icon = status_icon(item.status);
+            let label = catalog.t(&item.message_id, &[("title", &item.title)]);
+            let workspace = workspace_names
+                .get(item.target.workspace_id())
+                .cloned()
+                .unwrap_or_else(|| item.target.workspace_id().to_owned());
+            ui.horizontal(|ui| {
+                ui.colored_label(notification_status_color(item.status), "●");
+                // 시간·워크스페이스는 판단 맥락(어디서 언제) — 본문 왼쪽에 고정 톤으로.
+                ui.label(
+                    egui::RichText::new(relative_time_label(
+                        catalog,
+                        now.saturating_sub(item.created_at_secs),
+                    ))
+                    .size(11.0)
+                    .weak(),
+                );
+                ui.label(egui::RichText::new(workspace).size(11.0).weak());
+                if ui
+                    .button(format!("{} {icon} {label}", item.source.badge()))
+                    .on_hover_text(catalog.t("notification.goto_session", &[]))
+                    .clicked()
+                {
+                    clicked = Some(item.target.clone());
+                }
+            });
+        }
+        clicked
+    }
+
     /// 창 프레임 없이 본문만 렌더 (통합 설정 창 우측 패널용). 읽음 처리는 show()가 한다.
     pub fn contents(
         &mut self,
@@ -435,6 +493,31 @@ pub fn section_label(ui: &mut egui::Ui, text: &str) {
         // weak가 조용히 무시된다(리뷰 P3).
         ui.label(egui::RichText::new(text).size(11.0).weak());
     });
+}
+
+/// 경과 초 → 「방금/N분 전/N시간 전/N일 전」 로케일 문구 (작업함 페이지 시간 표시).
+/// diff_panel의 relative_time_label과 같은 구간 규칙이되, 새 사용자 문자열 규칙에 따라
+/// i18n 카탈로그를 쓴다.
+fn relative_time_label(catalog: &i18n::Catalog, elapsed_secs: i64) -> String {
+    let secs = elapsed_secs.max(0);
+    if secs < 60 {
+        catalog.t("inbox.time.just_now", &[])
+    } else if secs < 3600 {
+        catalog.t(
+            "inbox.time.minutes_ago",
+            &[("count", &(secs / 60).to_string())],
+        )
+    } else if secs < 86_400 {
+        catalog.t(
+            "inbox.time.hours_ago",
+            &[("count", &(secs / 3600).to_string())],
+        )
+    } else {
+        catalog.t(
+            "inbox.time.days_ago",
+            &[("count", &(secs / 86_400).to_string())],
+        )
+    }
 }
 
 fn notification_status_color(status: SessionStatus) -> egui::Color32 {
@@ -744,5 +827,17 @@ mod tests {
             &catalog,
         );
         assert_eq!(n.items.len(), 1);
+    }
+
+    /// 작업함 페이지의 시간 표시 — 구간별 로케일 문구 (2026-07-18).
+    #[test]
+    fn relative_time_label은_구간별_로케일_문구를_낸다() {
+        let catalog = i18n::Catalog::load("ko-KR").expect("ko-KR catalog");
+        assert_eq!(relative_time_label(&catalog, 5), "방금");
+        assert_eq!(relative_time_label(&catalog, 90), "1분 전");
+        assert_eq!(relative_time_label(&catalog, 2 * 3600), "2시간 전");
+        assert_eq!(relative_time_label(&catalog, 3 * 86_400), "3일 전");
+        // 음수(시계 역행)는 방금으로 고정 — 미래 표기를 만들지 않는다.
+        assert_eq!(relative_time_label(&catalog, -10), "방금");
     }
 }

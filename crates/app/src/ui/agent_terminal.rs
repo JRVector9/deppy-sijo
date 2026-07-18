@@ -4,6 +4,9 @@ use crate::status_feed::{ProviderStatus, ServiceIndicator, StatusFeedSnapshot};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AgentTerminalView {
     Home,
+    /// 「작업함」 전체 페이지 — 벨 팝오버와 같은 대기 카드 + 전체 알림 목록
+    /// (2026-07-18 사용자 확정 디자인, 사이드바 하단 nav로 진입).
+    Inbox,
     #[default]
     Terminal,
 }
@@ -68,10 +71,6 @@ impl AgentTerminalUi {
 
     pub fn set_view(&mut self, view: AgentTerminalView) {
         self.view = view;
-    }
-
-    pub fn is_home(&self) -> bool {
-        self.view == AgentTerminalView::Home
     }
 
     pub fn home(
@@ -189,6 +188,7 @@ impl AgentTerminalUi {
                     ui.separator();
                     ui.weak(match self.view {
                         AgentTerminalView::Home => catalog.t("status_bar.view.home", &[]),
+                        AgentTerminalView::Inbox => catalog.t("status_bar.view.inbox", &[]),
                         AgentTerminalView::Terminal => catalog.t("status_bar.view.terminal", &[]),
                     });
                 });

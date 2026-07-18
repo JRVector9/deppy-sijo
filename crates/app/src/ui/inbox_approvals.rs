@@ -27,7 +27,9 @@ use super::approvals::ApprovalDecision;
 use super::notifications::{AgentNotificationTarget, section_label};
 
 /// 팝오버에 한 번에 그리는 카드 최대 수 — 초과분은 "+N건 더"로 뭉친다(②).
-const MAX_CARDS: usize = 5;
+/// 전체 「작업함」 페이지는 상한 없이 그린다 — 팝오버 전용 값이라 페이지에 쓰면
+/// 6번째 이후 요청을 조작할 수 없다(codex P2). 호출측이 max_cards로 구분한다.
+pub const POPUP_MAX_CARDS: usize = 5;
 /// 인자 미리보기를 카드 폭(팝오버 260~300px)에서 2줄 안팎으로 자르는 문자 수 예산.
 const PREVIEW_CLIP_CHARS: usize = 110;
 
@@ -51,6 +53,7 @@ pub fn render(
     pending: &[PendingApprovalRow],
     workspace_names: &HashMap<String, String>,
     session_titles: &HashMap<(String, SessionId), String>,
+    max_cards: usize,
 ) -> ApprovalCardsAction {
     let mut action = ApprovalCardsAction::default();
     if pending.is_empty() {
@@ -58,7 +61,7 @@ pub fn render(
     }
     section_label(ui, &catalog.t("inbox.approval.section", &[]));
     ui.add_space(2.0);
-    for row in pending.iter().take(MAX_CARDS) {
+    for row in pending.iter().take(max_cards) {
         render_card(
             ui,
             catalog,
@@ -68,7 +71,7 @@ pub fn render(
             &mut action,
         );
     }
-    let hidden = pending.len().saturating_sub(MAX_CARDS);
+    let hidden = pending.len().saturating_sub(max_cards);
     if hidden > 0 {
         ui.label(
             egui::RichText::new(
@@ -300,7 +303,7 @@ mod tests {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let workspace_names = HashMap::new();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let action = render(ui, &catalog, &[], &workspace_names, &HashMap::new());
+            let action = render(ui, &catalog, &[], &workspace_names, &HashMap::new(), POPUP_MAX_CARDS);
             assert!(action.decision.is_none());
             assert!(action.goto.is_none());
         });
@@ -318,7 +321,14 @@ mod tests {
             row("a3", Some("ws-unknown:1")),
         ];
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let action = render(ui, &catalog, &rows, &workspace_names, &HashMap::new());
+            let action = render(
+                ui,
+                &catalog,
+                &rows,
+                &workspace_names,
+                &HashMap::new(),
+                POPUP_MAX_CARDS,
+            );
             assert!(action.decision.is_none());
             assert!(action.goto.is_none());
         });
@@ -329,11 +339,18 @@ mod tests {
         let ctx = egui::Context::default();
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let workspace_names = HashMap::new();
-        let rows: Vec<_> = (0..MAX_CARDS + 3)
+        let rows: Vec<_> = (0..POPUP_MAX_CARDS + 3)
             .map(|i| row(&format!("a{i}"), None))
             .collect();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let action = render(ui, &catalog, &rows, &workspace_names, &HashMap::new());
+            let action = render(
+                ui,
+                &catalog,
+                &rows,
+                &workspace_names,
+                &HashMap::new(),
+                POPUP_MAX_CARDS,
+            );
             assert!(action.decision.is_none());
             assert!(action.goto.is_none());
         });
@@ -351,7 +368,7 @@ mod tests {
     ) -> egui_kittest::Harness<'a, Vec<ApprovalDecision>> {
         egui_kittest::Harness::new_ui_state(
             move |ui, captured: &mut Vec<ApprovalDecision>| {
-                let action = render(ui, catalog, rows, names, &HashMap::new());
+                let action = render(ui, catalog, rows, names, &HashMap::new(), POPUP_MAX_CARDS);
                 if let Some(decision) = action.decision {
                     captured.push(decision);
                 }

@@ -696,6 +696,14 @@ impl Worker {
                     .shutdown_requested
                     .load(std::sync::atomic::Ordering::Acquire)
             {
+                // 종료 직전 잔여 명령을 **전량** 소화한다 — burst cap(128)만 처리하고
+                // 끊으면 대량 ClosePane 꼬리(예: 워크스페이스 종료가 pane 수만큼 보낸
+                // 닫기)가 유실돼 빈 레이아웃이 저장되지 않고 재활성 시 pane이 부활한다
+                // (codex P2). cap은 평시 PTY pump 공정성용이고, 종료 시엔 더 이상
+                // 새 명령이 들어오지 않아 큐가 유한하므로 전량 드레인이 안전하다.
+                while let Ok(command) = self.command_rx.try_recv() {
+                    self.handle_command(command);
+                }
                 // 기존 recv_timeout 루프처럼 마지막 command batch 뒤 한 번은 pump해
                 // command 직후 도착한 PTY tail과 status/persistence를 반영하고 종료한다.
                 // shutdown 플래그 경로: command_sink 클론(웹 브리지)이 채널을 살려둬도

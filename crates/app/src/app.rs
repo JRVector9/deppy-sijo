@@ -3548,6 +3548,10 @@ impl App {
             // 내려간 워크스페이스의 진행형 알림은 더는 조치 불가 — suspend와 같은 정리
             // (결과 알림은 기록이라 유지).
             self.notifications_ui.prune_transient(workspace_id);
+            // persisted pane 스냅샷 재적재 — shutdown()이 worker join까지 하므로 빈
+            // 레이아웃 저장이 끝난 뒤다. 안 하면 이제 비활성이 된 이 워크스페이스가
+            // 사이드바/홈/웹 대시보드에 옛 세션 수로 계속 표시된다(codex P2).
+            self.refresh_workspaces();
         } else {
             // 확인 모달이 떠 있는 사이 auto-suspend 등으로 이미 내려간 경우 — 조용히
             // 지나가지 않고 로그로 남긴다(닫을 세션이 없으니 실행할 것도 없다).
@@ -5018,6 +5022,7 @@ impl App {
                             self.approvals_ui.pending(),
                             &approval_workspace_names,
                             &approval_session_titles,
+                            ui::inbox_approvals::POPUP_MAX_CARDS,
                         );
                         approval_decision = approval_action.decision;
                         clicked = approval_action.goto;
@@ -5112,15 +5117,26 @@ impl App {
                             if self.approvals_ui.pending().is_empty() && waiting_cards.is_empty() {
                                 ui.weak(text.t("inbox.page.no_waiting", &[]));
                             } else {
+                                // 전체 페이지는 팝오버 카드 상한(5) 없이 전부 그린다 —
+                                // 상한이 있으면 6번째 이후 요청을 조작할 수 없다(codex P2).
                                 let approval_action = ui::inbox_approvals::render(
                                     ui,
                                     text,
                                     self.approvals_ui.pending(),
                                     &workspace_names,
                                     &session_titles,
+                                    usize::MAX,
                                 );
                                 approval_decision = approval_action.decision;
                                 clicked = approval_action.goto;
+                                waiting_action =
+                                    self.inbox_waiting_ui.render(ui, text, &waiting_cards);
+                            }
+                            // 카드가 비어도 render의 정리 경로는 돌아야 한다 — SessionId가
+                            // 워커마다 재배정되므로 마지막 카드 해소 시 드래프트를 안 지우면
+                            // 다른 논리 세션이 과거 입력을 물려받는다(codex P2, 팝오버와
+                            // 같은 규칙). 위 else에서 이미 그렸으면 중복 호출하지 않는다.
+                            if self.approvals_ui.pending().is_empty() && waiting_cards.is_empty() {
                                 waiting_action =
                                     self.inbox_waiting_ui.render(ui, text, &waiting_cards);
                             }
@@ -6266,6 +6282,13 @@ impl eframe::App for App {
             self.active
                 .workspace_ui
                 .update_hidden(ui.ctx(), &self.active.runtime, &events, &text);
+        }
+        if inbox_visible {
+            // 최근 알림의 상대시간("방금 전"/"N분 전")이 경계를 넘어도 갱신되게 —
+            // 페이지가 보일 때만 30s 주기 repaint(codex P3). 페이지를 닫으면 예약이
+            // 끊겨 유휴 비용-0 계약 유지.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs(30));
         }
 
         // 컴포저는 터미널 표면에만 붙는다. 홈/작업함은 전체 폭 페이지가 중앙 영역을 쓴다.

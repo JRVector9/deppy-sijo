@@ -1022,6 +1022,12 @@ impl FileTreeUi {
             // 아이콘 레일까지 축소할 수 있도록 최소 폭을 40pt로 둔다. 내부 행은 폭에
             // 따라 제목/요약/도구를 단계적으로 생략해 콘텐츠가 패널을 다시 밀지 않는다.
             .size_range(egui::Rangef::new(40.0, 680.0))
+            // 패널 기본 inner_margin 제거 — 첫 워크스페이스가 상단 라인에 붙게
+            // (2026-07-18 사용자). 각 행이 자체 좌측 인셋을 그리므로 여백 0이 안전.
+            .frame(
+                egui::Frame::side_top_panel(&ui.ctx().global_style())
+                    .inner_margin(egui::Margin::ZERO),
+            )
             .show(ui, |ui| {
                 // hairline(6)+간격(3)+위(6)+행 36×3+행간 2×2+마지막 간격(2)+아래(10)
                 // = 139 — 하단 고정 nav 예약 높이(실소비와 정확 일치, 잘림 방지).
@@ -1098,7 +1104,7 @@ impl FileTreeUi {
             // 최악 높이를 유지하면서 before 행들만 스크롤로 흡수한다.
             let session_block_h = if sessions_visible { session_max_h } else { 0.0 };
             let list_max_h =
-                (ui.available_height() * 0.34).clamp(118.0, 232.0) + 46.0 + session_block_h;
+                (ui.available_height() * 0.34).clamp(118.0, 232.0) + 39.1 + session_block_h;
             egui::ScrollArea::vertical()
                 .id_salt("workspace_list_scroll")
                 .max_height(list_max_h)
@@ -1459,7 +1465,9 @@ impl FileTreeUi {
         let path_left = header_rect.left() + 10.0;
         if tool_right - path_left >= 20.0 {
             let icon_center = egui::pos2(path_left + 8.0, header_rect.center().y);
-            paint_folder(
+            // 최상단은 "현재 열린 폴더" 헤더 — 트리의 닫힌 폴더와 구분해 열린 폴더로
+            // (고정 앵커 아님, 2026-07-19 사용자).
+            paint_folder_open(
                 ui.painter(),
                 icon_center,
                 ui.visuals().text_color(),
@@ -2834,11 +2842,17 @@ fn workspace_row(
     active: bool,
     expanded: Option<bool>,
 ) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 46.0), egui::Sense::click());
-    if !ui.is_rect_visible(rect) {
+    // 가로세로 여백 15% 축소(2026-07-18 사용자) — 행 높이 46→39.1, 좌측 인셋
+    // 8→6.8, 이름 간격 9→7.65. 아바타(30)는 유지하고 세로 중앙 재정렬.
+    let (full_rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 39.1), egui::Sense::click());
+    if !ui.is_rect_visible(full_rect) {
         return response;
     }
+    // 좌우 여백(2026-07-19 사용자) — 패널 좌우 margin이 0이라 pill이 가장자리에
+    // 붙었다. 그리기 rect만 좌우 8px 안으로 들여 pill·내용에 숨 공간을 준다
+    // (클릭 판정은 full_rect라 가장자리도 눌린다).
+    let rect = full_rect.shrink2(egui::vec2(8.0, 0.0));
     if active {
         ui.painter().rect_filled(
             rect,
@@ -2852,8 +2866,8 @@ fn workspace_row(
     // 선택/실행 상태와 무관한 프로젝트 고유색. 40pt 아이콘 레일에서도 워크스페이스를
     // 색만으로 빠르게 구분할 수 있게 비활성 행도 같은 색을 유지한다.
     let color = workspace_accent(&workspace.name);
-    let avatar = egui::Rect::from_min_size(
-        egui::pos2(rect.left() + 8.0, rect.top() + 8.0),
+    let avatar = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 6.8 + 15.0, rect.center().y),
         egui::vec2(30.0, 30.0),
     );
     // 워크스페이스 마크는 별도 테두리 없이 상태색을 채운다(HTML 목업과 같은 규칙).
@@ -2884,11 +2898,11 @@ fn workspace_row(
         // 우측 여백 8 + 이름/요약 간격 16 + disclosure 폭(있으면 14)을 더한다.
         let reserved_right = if show_summary {
             let disclosure = if show_disclosure { 14.0 } else { 0.0 };
-            workspace_summary_width(ui, workspace.summary) + 24.0 + disclosure
+            workspace_summary_width(ui, workspace.summary) + 20.4 + disclosure
         } else {
-            8.0
+            6.8
         };
-        let name_width = (rect.right() - reserved_right - avatar.right() - 9.0).max(0.0);
+        let name_width = (rect.right() - reserved_right - avatar.right() - 7.65).max(0.0);
         if name_width > 4.0 {
             let uppercase_name = workspace.name.to_uppercase();
             let name = clipped_line(
@@ -2898,7 +2912,7 @@ fn workspace_row(
                 name_width,
             );
             ui.painter().galley(
-                egui::pos2(avatar.right() + 9.0, rect.center().y - name.size().y / 2.0),
+                egui::pos2(avatar.right() + 7.65, rect.center().y - name.size().y / 2.0),
                 name,
                 ui.visuals().text_color(),
             );
@@ -3346,6 +3360,41 @@ fn file_toolbar_icon_at(
         }
     }
     response
+}
+
+/// 현재 위치(파일 도크 루트) 표식 — 열린 폴더. 아래 트리의 닫힌 폴더와 구분해
+/// "지금 이 폴더가 열려 있다"를 나타낸다(고정 앵커 아님 — `..`로 자유 이동,
+/// 2026-07-19 사용자). `size`는 전체 (폭, 높이).
+fn paint_folder_open(p: &egui::Painter, c: egui::Pos2, col: egui::Color32, size: egui::Vec2) {
+    let w = size.x;
+    let stroke = egui::Stroke::new(1.2, col);
+    let rise = (size.y * 0.24).round().max(2.0);
+    // 뒤판(탭 달린 몸통) — paint_folder와 같은 비율.
+    let body = egui::Rect::from_min_size(
+        egui::pos2(c.x - w / 2.0, c.y - size.y / 2.0 + rise),
+        egui::vec2(w, size.y - rise),
+    );
+    let tab = egui::Rect::from_min_size(
+        egui::pos2(body.left(), body.top() - rise),
+        egui::vec2(w * 0.45, rise + 1.0),
+    );
+    p.rect_stroke(tab, 1.0, stroke, egui::StrokeKind::Inside);
+    p.rect_stroke(body, 1.0, stroke, egui::StrokeKind::Inside);
+    // 앞면(열린 덮개) — 몸통 안쪽에서 오른쪽으로 벌어진 사다리꼴로 "열림"을 표현.
+    let inset = 1.5;
+    let flap = vec![
+        egui::pos2(body.left() + inset, body.bottom() - inset),
+        egui::pos2(body.right() - inset, body.bottom() - inset),
+        egui::pos2(
+            body.right() - inset - w * 0.14,
+            body.top() + body.height() * 0.42,
+        ),
+        egui::pos2(
+            body.left() + inset + w * 0.14,
+            body.top() + body.height() * 0.42,
+        ),
+    ];
+    p.add(egui::Shape::closed_line(flap, stroke));
 }
 
 fn compact_root_path(root: &Path) -> String {

@@ -1246,12 +1246,21 @@ impl AgentSessionsUi {
             .iter()
             .find(|model| model.model == self.new_model)
             .cloned();
+        // 커스텀/OSS 프로바이더는 codex 카탈로그(OpenAI 모델 목록)와 무관한 백엔드
+        // 모델명(qwen3-coder:30b 등)을 쓴다 — 카탈로그 드롭다운에 가두면 입력이
+        // 불가능해 실작업이 막힌다(2026-07-18 사용자 스크린샷). 자유 입력 유지.
+        let free_model_input = agents_config.codex_llm_provider.is_some();
         ui.horizontal_wrapped(|ui| {
             ui.label("모델");
-            if models.is_empty() {
+            if models.is_empty() || free_model_input {
+                let hint = if free_model_input {
+                    "백엔드 모델명 (예: qwen3-coder:30b)"
+                } else {
+                    "기본 Codex 모델"
+                };
                 let response = ui.add_sized(
                     [210.0, 24.0],
-                    egui::TextEdit::singleline(&mut self.new_model).hint_text("기본 Codex 모델"),
+                    egui::TextEdit::singleline(&mut self.new_model).hint_text(hint),
                 );
                 text_input_ids.push(response.id);
             } else {
@@ -1285,7 +1294,8 @@ impl AgentSessionsUi {
             }
 
             ui.label("effort");
-            if let Some(model) = selected_model {
+            // 커스텀/OSS는 카탈로그 모델이 아니므로 effort도 자유 입력(백엔드가 무시할 수 있음).
+            if let Some(model) = selected_model.filter(|_| !free_model_input) {
                 egui::ComboBox::from_id_salt("agent-effort-catalog")
                     .selected_text(&self.new_effort)
                     .show_ui(ui, |ui| {

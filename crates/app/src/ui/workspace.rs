@@ -3542,6 +3542,21 @@ const OPENABLE_EXTS: &[&str] = &[
     "zip", "numbers", "pages", "key",
 ];
 
+/// 연결된 프로그램으로 열어도 안전한 실존 파일인가 — OPENABLE_EXTS 허용목록을
+/// 원본과 **실체(canonical) 경로**의 확장자 양쪽으로 검사한다 ("safe.pdf"가
+/// 실행파일을 가리키는 심링크면 open이 실행해버린다 — codex 리뷰 하드닝).
+/// 터미널 경로 「열기」와 파일 트리 더블클릭(2026-07-18)이 같은 판정을 공유한다.
+pub(crate) fn openable_file(path: &Path) -> bool {
+    let ext_openable = |p: &Path| {
+        p.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| OPENABLE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+    };
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
+        && ext_openable(path)
+        && std::fs::canonicalize(path).is_ok_and(|real| ext_openable(&real))
+}
+
 /// 더블클릭된 단어를 파일시스템 경로로 해석한다. 절대(`/`)·홈(`~/`)·상대(cwd 기준)
 /// 순으로 시도하고, `path.py:33`처럼 줄번호가 붙은 꼴은 `:` 뒤를 떼고 재시도한다.
 /// 존재하지 않거나(오탈자·일반 단어) 허용 확장자가 아닌 파일이면 None — 이 함수가
@@ -3582,17 +3597,7 @@ fn resolve_path_click(word: &str, cwd: Option<&Path>) -> Option<PathClick> {
         if meta.is_dir() {
             return Some(PathClick::Dir(path));
         }
-        let ext_openable = |p: &Path| {
-            p.extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| OPENABLE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-        };
-        // 허용목록은 **실체(canonical) 경로의 확장자**로도 검사한다 — "safe.pdf"가
-        // 실행파일을 가리키는 심링크면 open이 실행해버린다 (codex 리뷰 하드닝).
-        if meta.is_file()
-            && ext_openable(&path)
-            && std::fs::canonicalize(&path).is_ok_and(|real| ext_openable(&real))
-        {
+        if openable_file(&path) {
             return Some(PathClick::OpenFile(path));
         }
     }

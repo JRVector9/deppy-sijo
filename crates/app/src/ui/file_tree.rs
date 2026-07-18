@@ -114,6 +114,8 @@ pub enum SidebarAction {
     InsertPath(PathBuf),
     /// 포커스된 터미널에서 이 폴더로 cd 실행 (디렉터리 컨텍스트 메뉴, 2026-07-08)
     CdPath(PathBuf),
+    /// 파일 행 더블클릭 — OS 연결 프로그램으로 연다 (터미널 「열기」와 동일 판정, 2026-07-18)
+    OpenExternal(PathBuf),
     /// 세션 목록에서 선택 — 해당 tab/pane으로 전환
     FocusSession {
         tab: runtime::MuxTabId,
@@ -1565,6 +1567,7 @@ impl FileTreeUi {
         let total = visible_rows.len();
         let mut toggle: Option<PathBuf> = None;
         let mut navigate_root: Option<PathBuf> = None;
+        let mut open_file: Option<PathBuf> = None; // 파일 더블클릭 → 연결 프로그램 열기
         let mut drop_action: Option<(PathBuf, PathBuf)> = None; // (src, dst_dir)
         let mut observed_row_height: Option<f32> = None;
         egui::ScrollArea::vertical()
@@ -1727,6 +1730,13 @@ impl FileTreeUi {
                         } else if row_resp.clicked() || label_resp.clicked() {
                             toggle = Some(row.path.clone());
                         }
+                    } else if (row_resp.double_clicked() || label_resp.double_clicked())
+                        && crate::ui::workspace::openable_file(&row.path)
+                    {
+                        // 파일 더블클릭 → 연결된 프로그램으로 열기 (2026-07-18 사용자).
+                        // 터미널 우클릭 「열기」와 같은 판정(openable_file)을 공유한다 —
+                        // 허용 확장자가 아니면(실행파일·스크립트 등) 아무 동작도 안 한다.
+                        open_file = Some(row.path.clone());
                     }
                     // 우클릭 컨텍스트 메뉴 (FT-3) — 행 전체에서 열리게 row_resp에 단다
                     if !inaccessible {
@@ -1796,6 +1806,9 @@ impl FileTreeUi {
         }
         if let Some(path) = toggle {
             self.toggle_dir(&path);
+        }
+        if let Some(path) = open_file {
+            action = Some(SidebarAction::OpenExternal(path));
         }
         if let Some((src, dst_dir)) = drop_action {
             self.start_move(src, dst_dir);
@@ -5135,5 +5148,65 @@ mod tests {
             0,
             "디버그 경고를 끈 뒤에는 스크롤 중 빨간 테두리가 없어야 한다"
         );
+    }
+
+    /// 파일 행 더블클릭 → 연결 프로그램 열기(OpenExternal) 회귀 (2026-07-18).
+    /// 실제 open 실행은 App 쪽 처리라 여기서는 반환 액션만 검증한다 — 허용
+    /// 확장자(pdf)는 액션을 내고, 실행 위험군(sh)은 아무것도 내지 않는다.
+    #[test]
+    fn kittest_파일_더블클릭은_외부_열기_액션을_낸다() {
+        use egui_kittest::kittest::Queryable;
+        let base = std::env::temp_dir().join(format!("deppy-ft-dclick-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // set_root는 canonicalize해 보관 — 행 경로 비교 기준을 맞춘다 (macOS /var→/private/var).
+        let base = base.canonicalize().unwrap();
+        std::fs::write(base.join("a.pdf"), b"x").unwrap();
+        std::fs::write(base.join("run.sh"), b"x").unwrap();
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        // step_dt를 더블클릭 판정 한계(0.3s) 아래로 — 클릭 2번이 한 스텝 간격으로 온다.
+        let mut harness = egui_kittest::Harness::builder()
+            .with_step_dt(0.05)
+            .build_ui_state(
+                |ui, state: &mut (FileTreeUi, Vec<SidebarAction>)| {
+                    if let Some(a) = state.0.panel(ui, &[], &catalog) {
+                        state.1.push(a);
+                    }
+                },
+                (tree, Vec::new()),
+            );
+        // 리스팅은 백그라운드 워커 — 파일 행이 나타날 때까지 프레임을 돌린다.
+        for _ in 0..200 {
+            harness.step();
+            if harness.query_by_label("a.pdf").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // 실행 위험군(.sh) 더블클릭 — 아무 액션도 내지 않는다.
+        harness.get_by_label("run.sh").click();
+        harness.step();
+        harness.get_by_label("run.sh").click();
+        harness.step();
+        assert!(harness.state().1.is_empty(), "sh 더블클릭이 액션을 냄");
+        // 시뮬레이션 시간 경과 — 직전 클릭 연쇄를 끊는다 (egui triple 판정 창 0.6s는
+        // 마지막 클릭과의 거리만 보므로, 붙여서 클릭하면 pdf 2번째가 triple로 잡힌다).
+        for _ in 0..15 {
+            harness.step();
+        }
+        // 허용 확장자(.pdf) 더블클릭 → OpenExternal(경로).
+        harness.get_by_label("a.pdf").click();
+        harness.step();
+        harness.get_by_label("a.pdf").click();
+        harness.step();
+        let opened = harness.state().1.iter().find_map(|a| match a {
+            SidebarAction::OpenExternal(p) => Some(p.clone()),
+            _ => None,
+        });
+        assert_eq!(opened.as_deref(), Some(base.join("a.pdf").as_path()));
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

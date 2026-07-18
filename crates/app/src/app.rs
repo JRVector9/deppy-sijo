@@ -5591,6 +5591,11 @@ impl eframe::App for App {
                         None => tracing::warn!("세션 cwd 미확인 — Finder 열기 생략"),
                     }
                 }
+                // 파일 트리 파일 행 더블클릭 — 연결된 기본 프로그램으로 연다
+                // (안전 판정은 사이드바 쪽 openable_file에서 완료, 2026-07-18).
+                Some(ui::file_tree::SidebarAction::OpenExternal(path)) => {
+                    platform::open_path(&path);
+                }
                 Some(ui::file_tree::SidebarAction::CopySessionPath { session }) => {
                     match self.session_cwd_lookup(session) {
                         Some(cwd) => ui.ctx().copy_text(cwd),

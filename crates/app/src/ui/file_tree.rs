@@ -1695,7 +1695,25 @@ impl FileTreeUi {
         let mut open_file: Option<PathBuf> = None; // 파일 더블클릭 → 연결 프로그램 열기
         let mut drop_action: Option<(PathBuf, PathBuf)> = None; // (src, dst_dir)
         let mut observed_row_height: Option<f32> = None;
-        egui::ScrollArea::vertical()
+        // ── OS 파일 반입 상태 (Finder → 트리, §드롭·⌘V) ──
+        // winit 0.30은 macOS draggingUpdated:를 구현하지 않아 드래그 중 포인터 이벤트가
+        // 오지 않는다 — 대상 행 판정은 AppKit 마우스 위치를 창 좌표로 환산해 쓰고,
+        // 실패(viewport 미상 — kittest 등)면 egui 포인터로 폴백한다.
+        let os_drag_active = ui.input(|i| !i.raw.hovered_files.is_empty());
+        let os_dropped: Vec<PathBuf> = ui.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .collect()
+        });
+        let drag_pos = (os_drag_active || !os_dropped.is_empty())
+            .then(|| os_drag_pointer_pos(ui.ctx()).or_else(|| ui.input(|i| i.pointer.latest_pos())))
+            .flatten();
+        // 포인터 밑 행 기준 반입 대상(폴더 행=자신, 파일 행=부모).
+        let mut drop_target_dir: Option<PathBuf> = None;
+        let mut drag_row_highlighted = false;
+        let scroll_output = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_rows(ui, row_height, total, |ui, range| {
                 for index in &visible_rows[range] {
@@ -1742,6 +1760,23 @@ impl FileTreeUi {
                             1.0,
                             ui.visuals().widgets.hovered.weak_bg_fill,
                         );
+                    }
+                    // Finder 드래그 대상: 폴더 행 하이라이트 + 드롭 대상 기록 (§과제①).
+                    // 드래그 중엔 egui 포인터가 멎으므로 drag_pos(AppKit 위치)로 판정한다.
+                    if !inaccessible
+                        && let Some(pos) = drag_pos
+                        && hover_rect.contains(pos)
+                    {
+                        drop_target_dir = Some(row_target_dir(row, self.root.as_deref()));
+                        if row.is_dir && os_drag_active {
+                            ui.painter().rect_stroke(
+                                hover_rect,
+                                2.0,
+                                ui.visuals().widgets.active.bg_stroke,
+                                egui::StrokeKind::Inside,
+                            );
+                            drag_row_highlighted = true;
+                        }
                     }
 
                     // 행 전체 = 드래그 소스 (payload = 절대 경로, §4). Id는 path 기반(§9-6).
@@ -1948,6 +1983,32 @@ impl FileTreeUi {
         }
         if let Some((src, dst_dir)) = drop_action {
             self.start_move(src, dst_dir);
+        }
+
+        // ── Finder → 트리 반입: OS 드롭(①)·클립보드 ⌘V(②) — 원본 보존 복사 ──
+        // 반입 영역 = 파일 헤더 + 행 목록 (워크스페이스 목록/하단 nav 제외).
+        let tree_area = header_rect.union(scroll_output.inner_rect);
+        if os_drag_active && drag_pos.is_some_and(|pos| tree_area.contains(pos)) {
+            if !drag_row_highlighted {
+                // 특정 폴더 행 위가 아니면 루트 반입 — 트리 영역 전체 테두리로 표시.
+                ui.painter().rect_stroke(
+                    tree_area,
+                    2.0,
+                    ui.visuals().widgets.active.bg_stroke,
+                    egui::StrokeKind::Inside,
+                );
+            }
+            // 드래그 중엔 winit 이벤트가 없어 repaint 예약이 있어야 하이라이트가
+            // 포인터를 따라온다(종료 시 hovered_files가 비어 예약도 함께 끝난다).
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        if !os_dropped.is_empty()
+            && drag_pos.is_some_and(|pos| tree_area.contains(pos))
+            && let Some(root) = self.root.clone()
+        {
+            let dst_dir = drop_target_dir.unwrap_or(root);
+            self.start_copy_into(os_dropped, dst_dir);
         }
 
         // 인라인 편집 커밋/취소 처리 (실패 시 편집 유지 — 이름을 고칠 수 있게)
@@ -2197,6 +2258,25 @@ impl FileTreeUi {
                 Err(e) => self.error = Some(format!("이동 실패: {e}")),
             },
         }
+    }
+
+    /// Finder 드롭(①)/⌘V(②) 반입 — 외부 원본을 대상 폴더로 **복사**한다(원본 보존).
+    /// 이동(start_move)과 달리 루트 밖 원본을 허용하고 원본을 지우지 않는다.
+    /// 실제 IO는 백그라운드(§9-3), 실패는 하단 에러 라벨로 표면화.
+    fn start_copy_into(&mut self, sources: Vec<PathBuf>, dst_dir: PathBuf) {
+        if sources.is_empty() {
+            return;
+        }
+        // 대상은 canonicalize해 자기 자신/자손 가드(copy_into_dir)의 비교 기준을 맞춘다.
+        let dst_dir = match dst_dir.canonicalize() {
+            Ok(dir) => dir,
+            Err(e) => {
+                self.error = Some(format!("대상 폴더 확인 실패: {e}"));
+                return;
+            }
+        };
+        let refresh = vec![dst_dir.clone()];
+        self.spawn_op(refresh, move || copy_sources_into_dir(&sources, &dst_dir));
     }
 
     /// 백그라운드 파일 조작 실행 — 완료/에러는 채널로 UI에 전달되고 repaint를 깨운다(§9-3).
@@ -3905,6 +3985,111 @@ fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         return Ok(());
     }
     std::fs::copy(src, dst).map(|_| ())
+}
+
+/// 외부 반입 복사(§과제①②) — 원본별 실패를 모아 표면화하고 나머지는 계속 진행한다
+/// (조용한 스킵 금지). 성공 원본은 그대로 두고 대상에만 사본을 만든다.
+fn copy_sources_into_dir(sources: &[PathBuf], dst_dir: &Path) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for src in sources {
+        if let Err(e) = copy_into_dir(src, dst_dir) {
+            errors.push(e);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join(" · "))
+    }
+}
+
+/// 한 원본을 dst_dir/<이름>으로 복사한다 — move_cross_volume과 같은 관례(tmp 스테이징
+/// → rename_no_replace, 덮어쓰기 금지 §9-5)에서 원본 삭제만 없다. 자기 자신/자손으로의
+/// 복사는 무한 재귀라 사전 차단한다(호출부가 dst_dir을 canonicalize해 비교 기준 일치).
+fn copy_into_dir(src: &Path, dst_dir: &Path) -> Result<(), String> {
+    let name = src
+        .file_name()
+        .ok_or_else(|| format!("복사할 수 없는 경로입니다: {}", src.display()))?;
+    if let Ok(src_c) = src.canonicalize()
+        && dst_dir.starts_with(&src_c)
+    {
+        return Err(format!(
+            "자기 자신/하위 폴더로는 복사할 수 없습니다: {}",
+            src.display()
+        ));
+    }
+    let dst = dst_dir.join(name);
+    let tmp = dst_dir.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
+    if let Err(e) = copy_recursive(src, &tmp) {
+        let _ = remove_all(&tmp);
+        return Err(format!("복사 실패: {e}"));
+    }
+    match rename_no_replace(&tmp, &dst) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = remove_all(&tmp);
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                Err(format!(
+                    "같은 이름이 이미 있습니다 — 덮어쓰지 않습니다: {}",
+                    dst.display()
+                ))
+            } else {
+                Err(format!("복사 마무리 실패: {e}"))
+            }
+        }
+    }
+}
+
+/// 행 기준 반입 대상 폴더 — 폴더 행이면 자신, 파일 행이면 부모(§과제 판정 규칙).
+fn row_target_dir(row: &FlatRow, root: Option<&Path>) -> PathBuf {
+    if row.is_dir {
+        row.path.clone()
+    } else {
+        row.path
+            .parent()
+            .map(Path::to_path_buf)
+            .or_else(|| root.map(Path::to_path_buf))
+            .unwrap_or_else(|| row.path.clone())
+    }
+}
+
+/// OS 파일 드래그/드롭 중 포인터 위치(egui 창 좌표). winit 0.30은 macOS
+/// `draggingUpdated:`를 구현하지 않아 드래그 중 CursorMoved가 오지 않는다 — AppKit
+/// 전역 마우스 위치(bottom-left 스크린 좌표)를 primary 스크린 기준으로 뒤집고
+/// viewport inner_rect(모니터 공간 egui points)를 빼서 환산한다. viewport 미상
+/// (kittest 등)이면 None → 호출부가 egui 포인터로 폴백한다.
+#[cfg(target_os = "macos")]
+fn os_drag_pointer_pos(ctx: &egui::Context) -> Option<egui::Pos2> {
+    let inner = ctx.input(|i| i.viewport().inner_rect)?;
+    let mtm = objc2::MainThreadMarker::new()?;
+    let location = objc2_app_kit::NSEvent::mouseLocation();
+    let primary = objc2_app_kit::NSScreen::screens(mtm).firstObject()?;
+    let primary_height = primary.frame().size.height;
+    Some(screen_to_window_pos(
+        (location.x as f32, location.y as f32),
+        primary_height as f32,
+        ctx.zoom_factor(),
+        inner.min,
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn os_drag_pointer_pos(_ctx: &egui::Context) -> Option<egui::Pos2> {
+    None
+}
+
+/// AppKit 스크린 좌표(bottom-left, points) → egui 창 좌표(points). zoom_factor로
+/// egui points 스케일(native ppp × zoom)을 맞춘 뒤 창 내용 원점(inner_min)을 뺀다.
+fn screen_to_window_pos(
+    mouse: (f32, f32),
+    primary_height: f32,
+    zoom_factor: f32,
+    inner_min: egui::Pos2,
+) -> egui::Pos2 {
+    egui::pos2(
+        mouse.0 / zoom_factor - inner_min.x,
+        (primary_height - mouse.1) / zoom_factor - inner_min.y,
+    )
 }
 
 /// 파일/링크/디렉터리를 삭제한다 (링크는 링크 자체만).
@@ -6171,5 +6356,170 @@ mod tests {
             vec!["home", "inbox", "agents"],
             "nav 3항목 클릭이 각각의 액션을 순서대로 내야 한다"
         );
+    }
+
+    /// 반입 대상 폴더 판정(§과제①②) — 폴더 행은 자신, 파일 행은 부모.
+    #[test]
+    fn 반입_대상은_폴더행_자신_파일행_부모() {
+        let root = PathBuf::from("/ws");
+        let dir_row = FlatRow {
+            path: root.join("sub"),
+            name: "sub".to_owned(),
+            depth: 0,
+            is_dir: true,
+            expanded: false,
+        };
+        let file_row = FlatRow {
+            path: root.join("sub/a.txt"),
+            name: "a.txt".to_owned(),
+            depth: 1,
+            is_dir: false,
+            expanded: false,
+        };
+        assert_eq!(row_target_dir(&dir_row, Some(&root)), root.join("sub"));
+        assert_eq!(row_target_dir(&file_row, Some(&root)), root.join("sub"));
+    }
+
+    /// 외부 반입 복사 유틸 — 원본 보존·덮어쓰기 거부·자기 자손 차단·tmp 잔재 없음.
+    #[test]
+    fn copy_into_dir은_원본보존_충돌거부_자기자손차단() {
+        let base = temp_root("copy-into");
+        let src = base.join("src.txt");
+        std::fs::write(&src, b"payload").unwrap();
+        let dst_dir = base.join("dst");
+        std::fs::create_dir(&dst_dir).unwrap();
+        let dst_dir = dst_dir.canonicalize().unwrap();
+
+        copy_into_dir(&src, &dst_dir).unwrap();
+        assert_eq!(std::fs::read(dst_dir.join("src.txt")).unwrap(), b"payload");
+        assert!(src.exists(), "복사는 원본을 보존해야 한다");
+
+        // 같은 이름 재복사 — 덮어쓰기 거부(§9-5 관례) + tmp 잔재 없음.
+        std::fs::write(&src, b"changed").unwrap();
+        let err = copy_into_dir(&src, &dst_dir).unwrap_err();
+        assert!(err.contains("같은 이름"), "충돌 메시지가 아님: {err}");
+        assert_eq!(
+            std::fs::read(dst_dir.join("src.txt")).unwrap(),
+            b"payload",
+            "충돌 시 기존 파일이 덮이면 안 된다"
+        );
+        let names: Vec<String> = std::fs::read_dir(&dst_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["src.txt"], "tmp 잔재가 남음: {names:?}");
+
+        // 디렉터리를 자기 자손으로 복사 — 무한 재귀 사전 차단.
+        let outer = base.join("outer");
+        std::fs::create_dir_all(outer.join("inner")).unwrap();
+        let inner = outer.join("inner").canonicalize().unwrap();
+        let err = copy_into_dir(&outer, &inner).unwrap_err();
+        assert!(err.contains("자기 자신"), "자손 차단 메시지가 아님: {err}");
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// AppKit 스크린 좌표(bottom-left) → egui 창 좌표 환산 — 드래그 중 winit 포인터
+    /// 부재(draggingUpdated 미구현) 보강 경로의 순수 수식 검증.
+    #[test]
+    fn 스크린좌표_변환은_bottomleft를_뒤집고_창원점을_뺀다() {
+        // primary 높이 1000, 마우스 (500, 900)(bottom-left) → top-left y=100.
+        // 창 내용 원점 (100, 50) → 창 좌표 (400, 50).
+        assert_eq!(
+            screen_to_window_pos((500.0, 900.0), 1000.0, 1.0, egui::pos2(100.0, 50.0)),
+            egui::pos2(400.0, 50.0)
+        );
+        // zoom 2배면 AppKit points를 절반 스케일로 환산한 뒤 원점을 뺀다.
+        assert_eq!(
+            screen_to_window_pos((500.0, 900.0), 1000.0, 2.0, egui::pos2(100.0, 50.0)),
+            egui::pos2(150.0, 0.0)
+        );
+    }
+
+    fn drop_harness(
+        catalog: &i18n::Catalog,
+        tree: FileTreeUi,
+    ) -> egui_kittest::Harness<'_, (FileTreeUi, Vec<SidebarAction>)> {
+        egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 700.0))
+            .build_ui_state(
+                |ui, state: &mut (FileTreeUi, Vec<SidebarAction>)| {
+                    let snapshot = SidebarSnapshot {
+                        active_workspace_id: "ws-test",
+                        workspaces: &[],
+                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        inbox_count: 0,
+                        agents_open: false,
+                    };
+                    if let Some(a) = state.0.panel(ui, &[], &snapshot, catalog) {
+                        state.1.push(a);
+                    }
+                },
+                (tree, Vec::new()),
+            )
+    }
+
+    fn wait_for_path(
+        harness: &mut egui_kittest::Harness<'_, (FileTreeUi, Vec<SidebarAction>)>,
+        path: &Path,
+    ) {
+        for _ in 0..200 {
+            harness.step();
+            if path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Finder → 트리 OS 드롭(§과제①): 포인터 밑 **폴더 행**으로 복사된다. 실제 fs는
+    /// temp dir, 복사는 백그라운드 op — 완료를 폴링한다.
+    #[test]
+    fn kittest_finder_드롭은_포인터_밑_폴더로_복사한다() {
+        use egui_kittest::kittest::Queryable;
+        let base = temp_root("os-drop-dir");
+        let base = base.canonicalize().unwrap();
+        std::fs::create_dir(base.join("dropdir")).unwrap();
+        let src_home = temp_root("os-drop-src");
+        let src = src_home.join("payload.txt");
+        std::fs::write(&src, b"drop").unwrap();
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        let mut harness = drop_harness(&catalog, tree);
+        for _ in 0..200 {
+            harness.step();
+            if harness.query_by_label("dropdir").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // 포인터를 폴더 행 위에 두고 OS 드롭 주입 — drag_pos는 egui 포인터 폴백을 쓴다
+        // (kittest는 viewport inner_rect가 없어 NSEvent 경로가 꺼진다).
+        let row_pos = harness.get_by_label("dropdir").rect().center();
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(row_pos));
+        harness.input_mut().dropped_files.push(egui::DroppedFile {
+            path: Some(src.clone()),
+            ..Default::default()
+        });
+        let copied = base.join("dropdir").join("payload.txt");
+        wait_for_path(&mut harness, &copied);
+        assert_eq!(
+            std::fs::read(&copied).unwrap(),
+            b"drop",
+            "폴더 행으로 복사돼야 한다"
+        );
+        assert!(src.exists(), "드롭은 원본을 보존해야 한다(복사)");
+        assert!(
+            harness.state().0.error.is_none(),
+            "에러 라벨이 남음: {:?}",
+            harness.state().0.error
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+        std::fs::remove_dir_all(&src_home).unwrap();
     }
 }

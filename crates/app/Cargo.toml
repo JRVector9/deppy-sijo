@@ -68,12 +68,17 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "block2",
     "NSEvent",
     "NSPasteboard",
+    # 파일 드래그 중 winit이 포인터를 안 줘(draggingUpdated 미구현) NSEvent
+    # mouseLocation을 창 좌표로 환산할 때 primary 스크린 프레임이 필요 (2026-07-19).
+    "NSScreen",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSData",
     "NSString",
 ] }
+# MainThreadMarker(NSScreen 조회) 등 objc2 코어 타입 직접 사용 (2026-07-19).
+objc2 = "0.6"
 block2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]

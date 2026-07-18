@@ -242,7 +242,15 @@ impl EnvProfilesUi {
             } else {
                 self.revealed.get(&reveal_id).map(String::as_str)
             };
-            let row = env_table_row(ui, var, &credentials, revealed_value, is_masked, catalog);
+            let row = env_table_row(
+                ui,
+                &profile_id,
+                var,
+                &credentials,
+                revealed_value,
+                is_masked,
+                catalog,
+            );
             if row.delete {
                 self.delete_confirm = Some((profile_id.clone(), var.key.clone()));
             }
@@ -387,7 +395,15 @@ impl EnvProfilesUi {
             } else {
                 self.revealed.get(&reveal_id).map(String::as_str)
             };
-            let row = env_table_row(ui, var, &credentials, revealed_value, is_masked, catalog);
+            let row = env_table_row(
+                ui,
+                profile_id,
+                var,
+                &credentials,
+                revealed_value,
+                is_masked,
+                catalog,
+            );
             if row.delete {
                 delete_row = Some(reveal_id.clone());
             }
@@ -439,8 +455,14 @@ struct EnvRowResponse {
     toggle_reveal: bool,
 }
 
+/// `row_scope` = 이 행이 속한 profile id. 위젯 id를 key만으로 만들면 dotenv 표와
+/// legacy 섹션(또는 두 legacy 프로파일)에 **같은 키**가 있을 때 같은 id가 서로 다른
+/// rect에 두 번 등록돼 egui ID 충돌이 난다(디버그 빌드 🔥 경고 + 클릭 오배송,
+/// 2026-07-18 "설정 화면 빨간 경고" 보고의 실제 충돌 지점). profile 스코프를 salt에
+/// 포함해 유일화한다.
 fn env_table_row(
     ui: &mut egui::Ui,
+    row_scope: &str,
     var: &EnvVarRow,
     credentials: &[CredentialMeta],
     revealed_value: Option<&str>,
@@ -516,7 +538,7 @@ fn env_table_row(
     }
     let dot_resp = ui.interact(
         dot_rect,
-        ui.id().with(("env_dot", &var.key)),
+        ui.id().with(("env_dot", row_scope, &var.key)),
         egui::Sense::click(),
     );
     let mut toggle_reveal = false;
@@ -542,7 +564,7 @@ fn env_table_row(
     let delete = ui
         .interact(
             delete_rect,
-            ui.id().with(("env_var_delete", &var.key)),
+            ui.id().with(("env_var_delete", row_scope, &var.key)),
             egui::Sense::click(),
         )
         .on_hover_text(catalog.t("action.delete", &[]));
@@ -721,7 +743,7 @@ fn env_var_key_input_id() -> egui::Id {
 
 #[cfg(test)]
 mod tests {
-    use super::env_table_columns;
+    use super::{EnvValue, EnvVarRow, env_table_columns, env_table_row};
 
     #[test]
     fn env_columns는_두_flex열과_두_action열을_정확히_배치한다() {
@@ -732,5 +754,67 @@ mod tests {
         assert_eq!(columns[2].width(), 24.0);
         assert_eq!(columns[3].width(), 24.0);
         assert_eq!(columns[3].right(), rect.right());
+    }
+
+    /// egui `check_for_id_clash`가 그리는 "🔥 … use of … ID" 경고 텍스트 수집
+    /// (file_tree.rs 테스트의 동명 헬퍼와 같은 판정).
+    fn clash_warning_texts(output: &egui::FullOutput) -> Vec<String> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => {
+                    let s = text.galley.text();
+                    s.contains("use of").then(|| s.to_owned())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 같은 키를 가진 두 행(dotenv 표 + legacy 섹션, 또는 legacy 프로파일 2개)을
+    /// 한 프레임에 그리는 재현. profile 스코프를 salt에 넣기 전에는 `("env_dot", key)`
+    /// id가 서로 다른 rect에 두 번 등록돼 경고가 발화했다(2026-07-18 "설정 화면
+    /// 빨간 경고" 보고). 스코프 분리 후에는 경고가 없어야 한다.
+    #[test]
+    fn kittest_같은_키가_두_프로파일에_있어도_행_위젯_id가_충돌하지_않는다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let var = EnvVarRow {
+            key: "OPENAI_API_KEY".to_owned(),
+            value: EnvValue::Plain("x".to_owned()),
+        };
+        // 수정 후 호출 형태: 행마다 자신이 속한 profile id를 스코프로 넘긴다.
+        let mut harness = egui_kittest::Harness::new_ui(|ui| {
+            env_table_row(ui, "profile-dotenv", &var, &[], None, false, &catalog);
+            env_table_row(ui, "profile-legacy", &var, &[], None, false, &catalog);
+        });
+        harness.ctx.options_mut(|o| o.warn_on_id_clash = true);
+        harness.step();
+        assert_eq!(
+            clash_warning_texts(harness.output()),
+            Vec::<String>::new(),
+            "profile 스코프가 다른 같은 키 행은 id가 충돌하면 안 된다"
+        );
+    }
+
+    /// 대조군: 스코프 없이(=수정 전 id 체계와 동일하게 같은 스코프로) 같은 키를 두 번
+    /// 그리면 경고가 실제로 발화한다 — 검출 방법 자체가 살아 있음을 함께 고정한다.
+    #[test]
+    fn kittest_같은_스코프에_같은_키_두_행이면_id_충돌_경고가_발화한다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let var = EnvVarRow {
+            key: "OPENAI_API_KEY".to_owned(),
+            value: EnvValue::Plain("x".to_owned()),
+        };
+        let mut harness = egui_kittest::Harness::new_ui(|ui| {
+            env_table_row(ui, "same-scope", &var, &[], None, false, &catalog);
+            env_table_row(ui, "same-scope", &var, &[], None, false, &catalog);
+        });
+        harness.ctx.options_mut(|o| o.warn_on_id_clash = true);
+        harness.step();
+        assert!(
+            !clash_warning_texts(harness.output()).is_empty(),
+            "같은 스코프의 같은 키 행은 수정 전과 동일하게 충돌 경고가 나와야 한다"
+        );
     }
 }

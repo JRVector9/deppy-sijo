@@ -2574,6 +2574,162 @@ mod tests {
         truncate_fingerprint,
     };
 
+    /// egui `check_for_id_clash`가 그리는 "🔥 … use of … ID" 경고 텍스트 수집
+    /// (env_profiles.rs 테스트의 동명 헬퍼와 같은 판정 — 그쪽 발화 테스트가 이 판정이
+    /// 실제 충돌을 잡는다는 것을 함께 고정한다).
+    fn clash_warning_texts(output: &egui::FullOutput) -> Vec<(String, egui::Pos2)> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => {
+                    let s = text.galley.text();
+                    if s.contains("use of") {
+                        Some((s.to_owned(), text.pos))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 회귀 고정(2026-07-18 "설정 화면 빨간 경고" 보고 후속): 인라인 설정 페이지
+    /// 7종 × 로케일 2종을 네비와 함께 `warn_on_id_clash`를 켠 채 렌더해도 같은-ID
+    /// 위젯 쌍 경고(🔥)가 없어야 한다. (당시 보고의 실제 충돌은 관리 카테고리인
+    /// 환경 변수 표 — env_profiles.rs 테스트 참조.)
+    #[test]
+    fn kittest_설정_인라인_페이지에_widget_id_충돌이_없다() {
+        use super::{Category, RemoteAction, RemoteView, WebRemoteAction, WebRemoteView};
+        use crate::config::Config;
+        for locale in [i18n::FALLBACK_LOCALE, "ko-KR"] {
+            let catalog = i18n::Catalog::load(locale).unwrap();
+            for category in [
+                Category::General,
+                Category::Language,
+                Category::Terminal,
+                Category::Shortcuts,
+                Category::Performance,
+                Category::RemoteTls,
+                Category::MobileWeb,
+            ] {
+                let mut config = Config::default();
+                config.ui.agent_send_presets = vec!["preset-a".to_owned(), "preset-b".to_owned()];
+                let catalog_ref = &catalog;
+                let mut harness = egui_kittest::Harness::builder()
+                    .with_size(egui::vec2(1280.0, 730.0))
+                    .build_ui_state(
+                        move |ui, state: &mut (Config, Category, String)| {
+                            let (config, cat, query) = state;
+                            let known_hosts =
+                                vec![("host-a".to_owned(), "AA:BB:CC:DD:EE:FF".to_owned())];
+                            let remote = RemoteView {
+                                running: true,
+                                addr: Some("127.0.0.1:7070".to_owned()),
+                                fingerprint: Some("AB:CD"),
+                                token: Some("secret-token"),
+                                error: Some("boom"),
+                                known_hosts_path: "/tmp/kh".to_owned(),
+                                known_hosts: &known_hosts,
+                            };
+                            let web = WebRemoteView {
+                                running: true,
+                                addr: Some("127.0.0.1:8080".to_owned()),
+                                url: Some("https://host.ts.net/?token=tok".to_owned()),
+                                error: Some("boom"),
+                                ts_detect: super::TsDetectView::Found("machine.ts.net"),
+                                serve: super::ServeView::NotConfigured,
+                            };
+                            let mut changed = false;
+                            let mut remote_action = RemoteAction::None;
+                            let mut web_action = WebRemoteAction::None;
+                            let mut reveal = true;
+                            let mut qr: super::WebQrCache = None;
+                            super::apply_settings_palette(ui);
+                            egui::Panel::left("settings_nav")
+                                .resizable(false)
+                                .exact_size(190.0)
+                                .show(ui, |ui| {
+                                    super::nav(ui, cat, 3, query, catalog_ref);
+                                });
+                            egui::CentralPanel::default().show(ui, |ui| {
+                                super::apply_component_style(ui);
+                                egui::ScrollArea::vertical()
+                                    .id_salt(("settings_detail_scroll", *cat))
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        super::apply_component_style(ui);
+                                        super::settings_detail_shell(ui, |ui| match *cat {
+                                            Category::General => super::general_page(
+                                                ui,
+                                                config,
+                                                &mut changed,
+                                                catalog_ref,
+                                            ),
+                                            Category::Language => super::language_page(
+                                                ui,
+                                                config,
+                                                &mut changed,
+                                                catalog_ref,
+                                            ),
+                                            Category::Terminal => super::terminal_page(
+                                                ui,
+                                                config,
+                                                &mut changed,
+                                                catalog_ref,
+                                            ),
+                                            Category::Shortcuts => super::shortcuts_page(
+                                                ui,
+                                                config,
+                                                &mut changed,
+                                                catalog_ref,
+                                            ),
+                                            Category::Performance => super::performance_page(
+                                                ui,
+                                                config,
+                                                &mut changed,
+                                                catalog_ref,
+                                            ),
+                                            Category::RemoteTls => super::remote_page(
+                                                ui,
+                                                config,
+                                                &remote,
+                                                &mut reveal,
+                                                &mut changed,
+                                                &mut remote_action,
+                                                catalog_ref,
+                                            ),
+                                            Category::MobileWeb => super::mobile_web_page(
+                                                ui,
+                                                config,
+                                                &web,
+                                                &mut reveal,
+                                                &mut qr,
+                                                &mut changed,
+                                                &mut web_action,
+                                                catalog_ref,
+                                            ),
+                                            _ => {}
+                                        });
+                                    });
+                            });
+                        },
+                        (config, category, String::new()),
+                    );
+                harness.ctx.options_mut(|o| o.warn_on_id_clash = true);
+                harness.step();
+                harness.step();
+                harness.step();
+                let warnings = clash_warning_texts(harness.output());
+                assert!(
+                    warnings.is_empty(),
+                    "[{locale}/{category:?}] 위젯 ID 충돌 경고 발생: {warnings:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn 모양_화면_타이포그래피는_참조_font_map을_고정한다() {
         assert_eq!(SETTINGS_TYPE.page_title, 15.0);

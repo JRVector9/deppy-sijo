@@ -109,10 +109,6 @@ pub enum BranchCleanup {
 ///   메뉴가 아주 짧게 이전 워크트리를 대상으로 남을 수 있다 — 이 앱의 cwd 의존
 ///   메뉴 전부(diff 보기·같은 폴더 새 셸 등)가 공유하는 기존 신뢰 모델이라 이
 ///   기능만 별도로 고치지 않는다.
-/// - 삭제 성공 후 pane 정리는 **활성 워크스페이스만** 훑는다 — 같은 워크트리를 쓰는
-///   세션이 warm(비활성, 상주) 워크스페이스에 있으면 거기 pane은 안 닫힌다. 그
-///   워크스페이스로 전환하면 죽은 cwd가 드러날 뿐 자동 정리는 안 됨(App 쪽 한계,
-///   `self.warm`이 활성 workspace_ui와 다른 구조라 이번 라운드에서는 안 건드림).
 pub fn remove_worktree(cwd: &Path) -> anyhow::Result<(PathBuf, BranchCleanup)> {
     let worktree_root = crate::git_cli::repo_root(cwd, ROOT_TIMEOUT)?;
     anyhow::ensure!(

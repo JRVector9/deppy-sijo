@@ -1109,8 +1109,12 @@ fn font_settings_changed(
 }
 
 /// 워크트리 삭제 백그라운드 작업의 성공 결과 — (지운 워크트리 루트, 브랜치 처리
-/// 결과). worktree_remove_rx 참조.
-type WorktreeRemoveOutcome = (std::path::PathBuf, crate::worktree::BranchCleanup);
+/// 결과, 그 루트 하위 cwd였던 (workspace id, 세션) 목록). worktree_remove_rx 참조.
+type WorktreeRemoveOutcome = (
+    std::path::PathBuf,
+    crate::worktree::BranchCleanup,
+    Vec<(String, runtime::SessionId)>,
+);
 
 pub struct App {
     config: Config,
@@ -1344,10 +1348,12 @@ pub struct App {
         std::sync::mpsc::Receiver<anyhow::Result<std::path::PathBuf>>,
     )>,
     /// 진행 중인 워크트리 삭제 — (요청 시점 workspace id, 결과 채널). 결과는 (지운
-    /// 워크트리 루트, 브랜치 처리 결과) — 성공하면 요청 시점 워크스페이스가 여전히
-    /// 활성일 때만, 그 루트 하위 cwd를 쓰던 세션의 pane을 전부 닫는다(같은 폴더에서
-    /// 새 셀로 만든 형제 pane, 하위 폴더로 cd한 pane 포함, 2026-07-18). 브랜치가
-    /// 보존됐으면(미병합 커밋) 알림 본문에 표시한다.
+    /// 워크트리 루트, 브랜치 처리 결과, 그 루트 하위 cwd였던 (workspace id, 세션)
+    /// 목록). 목록은 요청 시점 활성+warm 전체의 (세션, 셸 pid) 스냅샷을 백그라운드
+    /// 스레드가 삭제 성공 후 lsof(process_cwd)로 실측해 만든다 — warm 세션은 cwd
+    /// 캐시가 없고(감지 워커 입력이 활성 pid뿐), UI 스레드에서의 lsof 다건 호출은
+    /// 스톨 위험이라 스레드에서 한다. 성공하면 그 pane들을 활성/warm 가리지 않고
+    /// 닫는다(같은 폴더 형제 pane·하위 폴더로 cd한 pane 포함, 2026-07-18).
     worktree_remove_rx: Option<(
         String,
         std::sync::mpsc::Receiver<anyhow::Result<WorktreeRemoveOutcome>>,
@@ -5761,21 +5767,51 @@ impl eframe::App for App {
                         }
                     }
                 }
-                // 워크트리 삭제 — dirty/미병합 판정은 git worktree remove 자체가 거부로
-                // 처리한다(강제 삭제 없음, 2026-07-18 사용자 제안).
+                // 워크트리 삭제 — dirty/무시 파일 거부와 서브모듈·브랜치 처리는
+                // worktree::remove_worktree가 맡는다(조용한 데이터 손실 금지).
                 Some(ui::file_tree::SidebarAction::RemoveWorktree { session }) => {
                     if self.worktree_remove_rx.is_some() {
                         tracing::info!("워크트리 삭제가 이미 진행 중 — 요청 무시");
                     } else {
                         match self.session_cwd_lookup(session) {
                             Some(cwd) => {
+                                // 삭제 성공 후 pane 정리용 (workspace id, 세션, 셸 pid)
+                                // 스냅샷 — 활성+warm 전부. warm 세션은 cwd 캐시가 없어
+                                // (감지 워커 입력이 활성 pid뿐 — session_cwds는 활성
+                                // 전용) 백그라운드 스레드가 삭제 성공 후 pid→cwd를
+                                // lsof로 실측한다. session_resource_usage는 warm도
+                                // record_activity_events가 drain마다 갱신해 살아 있다.
+                                let session_pids: Vec<(String, runtime::SessionId, u32)> =
+                                    std::iter::once(&self.active)
+                                        .chain(self.warm.values())
+                                        .flat_map(|rt| {
+                                            rt.session_resource_usage.iter().filter_map(|usage| {
+                                                usage
+                                                    .pid
+                                                    .map(|pid| (rt.id.clone(), usage.session, pid))
+                                            })
+                                        })
+                                        .collect();
                                 let (tx, rx) = std::sync::mpsc::channel();
                                 self.worktree_remove_rx = Some((self.active.id.clone(), rx));
                                 let ctx = ui.ctx().clone();
                                 std::thread::spawn(move || {
                                     let result = crate::worktree::remove_worktree(
                                         std::path::Path::new(&cwd),
-                                    );
+                                    )
+                                    .map(|(root, branch)| {
+                                        // 지운 루트 하위 cwd였던 세션 실측 — lsof는
+                                        // 삭제 성공 후에만(실패면 닫을 것도 없다).
+                                        let hits: Vec<(String, runtime::SessionId)> = session_pids
+                                            .into_iter()
+                                            .filter(|(_, _, pid)| {
+                                                platform::process_cwd(*pid)
+                                                    .is_some_and(|p| p.starts_with(&root))
+                                            })
+                                            .map(|(ws, session, _)| (ws, session))
+                                            .collect();
+                                        (root, branch, hits)
+                                    });
                                     let _ = tx.send(result);
                                     ctx.request_repaint();
                                 });
@@ -5878,36 +5914,72 @@ impl eframe::App for App {
         // 워크트리 삭제 완료 수령 — 성공하면 그 루트 하위 cwd를 쓰던 세션의 pane을
         // 전부 확인 없이 닫는다(같은 폴더에서 새 셀로 만든 형제 pane, 하위 폴더로
         // cd한 pane 포함 — codex P2: 지운 cwd 문자열과 정확히 같은 세션만 닫으면
-        // 하위 폴더에 있던 pane이 죽은 채 남는다). 요청 시점 워크스페이스가 여전히
-        // 활성일 때만 — 다른 워크스페이스는 이 App 프레임에서 그 workspace_ui에
-        // 닿을 수 없다(create_worktree의 NotifyOnly와 같은 한계, codex P2).
+        // 하위 폴더에 있던 pane이 죽은 채 남는다). 대상은 두 경로의 합집합:
+        // ① 요청 시점 pid 스냅샷의 lsof 실측(hits) — 활성·warm 모두 커버하고,
+        //    삭제 중 워크스페이스가 전환됐어도 workspace id로 지금 위치(활성/warm)를
+        //    찾아 닫는다(과거 "활성만" 한계 해소, 2026-07-18 후속).
+        // ② 활성 cwd 캐시(session_cwds) — 요청 이후 감지된 활성 세션 보강(기존 경로).
+        // 남는 한계: warm으로 있는 동안 새로 생긴 pane은 mux 스냅샷이 backgrounded
+        // 시점에 얼어 있어 pane_for_session이 못 찾는다 — 재활성 replay 후 죽은
+        // 셸로 드러날 뿐 잘못 닫히지는 않는다(스냅샷 기반이라 안전 실패 쪽).
         if let Some((requested_ws, rx)) = &self.worktree_remove_rx {
             match rx.try_recv() {
-                Ok(Ok((root, branch))) => {
+                Ok(Ok((root, branch, hits))) => {
+                    // (workspace id, pane)으로 모아 중복 제거 — 같은 세션이 ①·②
+                    // 양쪽에 잡혀도 ClosePane을 두 번 보내지 않는다.
+                    let mut targets: Vec<(String, runtime::MuxPaneId)> = Vec::new();
+                    for (ws_id, session) in &hits {
+                        let workspace_ui = if *ws_id == self.active.id {
+                            Some(&self.active.workspace_ui)
+                        } else {
+                            self.warm.get(ws_id).map(|rt| &rt.workspace_ui)
+                        };
+                        let Some(pane) = workspace_ui.and_then(|w| w.pane_for_session(*session))
+                        else {
+                            continue;
+                        };
+                        if !targets.iter().any(|(w, p)| w == ws_id && *p == pane) {
+                            targets.push((ws_id.clone(), pane));
+                        }
+                    }
+                    for (session, cwd) in &self.session_cwds {
+                        if !std::path::Path::new(cwd).starts_with(&root) {
+                            continue;
+                        }
+                        let Some(pane) = self.active.workspace_ui.pane_for_session(*session) else {
+                            continue;
+                        };
+                        if !targets
+                            .iter()
+                            .any(|(w, p)| *w == self.active.id && *p == pane)
+                        {
+                            targets.push((self.active.id.clone(), pane));
+                        }
+                    }
+                    for (ws_id, pane) in targets {
+                        if ws_id == self.active.id {
+                            self.active
+                                .workspace_ui
+                                .close_pane_now(&self.active.runtime, pane);
+                        } else if let Some(rt) = self.warm.get_mut(&ws_id) {
+                            // warm도 같은 WorkspaceRuntime — 살아 있는 워커 핸들로
+                            // ClosePane을 보내면 결과 이벤트는 pending_events에 쌓여
+                            // 재활성 replay 때 반영된다(렌더만 안 할 뿐 정리는 즉시).
+                            rt.workspace_ui.close_pane_now(&rt.runtime, pane);
+                        }
+                    }
                     // 브랜치가 보존됐으면(미병합 커밋) 알림 본문에 명시 — 조용히
                     // 남겨두면 "왜 브랜치가 남았지"가 된다.
                     let branch_note = (branch == crate::worktree::BranchCleanup::PreservedUnmerged)
                         .then(|| text.t("worktree.branch_preserved", &[]));
                     if *requested_ws == self.active.id {
-                        let workspace_ui = &self.active.workspace_ui;
-                        let panes: Vec<_> = self
-                            .session_cwds
-                            .iter()
-                            .filter(|(_, cwd)| std::path::Path::new(cwd).starts_with(&root))
-                            .filter_map(|(session, _)| workspace_ui.pane_for_session(*session))
-                            .collect();
-                        for pane in panes {
-                            self.active
-                                .workspace_ui
-                                .close_pane_now(&self.active.runtime, pane);
-                        }
                         platform::notify(
                             &text.t("worktree.removed", &[]),
                             branch_note.as_deref().unwrap_or(""),
                         );
                     } else {
                         let root_display = root.display().to_string();
-                        tracing::info!("워크스페이스 전환 — 워크트리만 삭제됨: {root_display}");
+                        tracing::info!("다른 워크스페이스의 워크트리 삭제됨: {root_display}");
                         let body = match &branch_note {
                             Some(note) => format!("{root_display} — {note}"),
                             None => root_display,

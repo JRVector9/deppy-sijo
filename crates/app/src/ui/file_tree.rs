@@ -174,6 +174,10 @@ pub enum SidebarAction {
     /// 편집 자체는 App 소유 모달이 하고(현재 별칭 원본은 App만 안다), 여기서는
     /// 대상 id만 올린다.
     RenameWorkspace(String),
+    /// 워크스페이스가 하나도 없을 때의 빈 상태 CTA(큰 + 버튼) — 폴더 선택으로 새
+    /// 워크스페이스를 만들어 전환한다. rfd 다이얼로그는 UI leaf가 아니라 App이 연다
+    /// (기존 ws_create 관례, 2026-07-18).
+    CreateWorkspaceFromPicker,
 }
 
 /// 트리 노드. `children == None`은 아직 나열 안 됨(lazy).
@@ -1052,201 +1056,237 @@ impl FileTreeUi {
         // ── 통합 워크스페이스·세션 계층 ──
         ui.add_space(3.0);
         let compact_sidebar = ui.available_width() < 120.0;
-        ui.horizontal(|ui| {
-            if !compact_sidebar {
-                ui.label(
-                    egui::RichText::new("워크스페이스 & 세션")
-                        .strong()
-                        .size(14.0),
-                );
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if sidebar.workspaces.is_empty() {
+            // 빈 상태 — 워크스페이스가 하나도 없으면(종료 숨김 반영) 헤더/목록 대신
+            // 가운데 큰 + 버튼과 안내문을 보여준다. 클릭 = 폴더 선택(App이 rfd로 열고
+            // 기존 ws_create 흐름으로 생성·전환, 2026-07-18 사용자 요구).
+            ui.add_space(18.0);
+            ui.vertical_centered(|ui| {
+                let side = 44.0_f32.min((ui.available_width() - 8.0).max(24.0));
+                let plus = egui::Button::new(egui::RichText::new("+").size(24.0))
+                    .min_size(egui::vec2(side, side));
                 if ui
-                    .small_button("+")
-                    .on_hover_text(catalog.t("workspace.new_shell", &[]))
+                    .add(plus)
+                    .on_hover_text(catalog.t("sidebar.empty.start_workspace", &[]))
                     .clicked()
                 {
-                    action = Some(SidebarAction::NewShell);
+                    action = Some(SidebarAction::CreateWorkspaceFromPicker);
+                }
+                if !compact_sidebar {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(catalog.t("sidebar.empty.start_workspace", &[])).weak(),
+                    );
                 }
             });
-        });
-        ui.add_space(4.0);
-        // DB list_workspaces가 보장하는 created_at 순서를 그대로 그린다. 이전 구현은
-        // 활성 workspace를 먼저 뽑아 맨 위에 렌더해 선택할 때마다 행이 이동했다.
-        let (before_active, active, after_active) =
-            workspace_creation_order_partition(sidebar.workspaces, sidebar.active_workspace_id);
-        // 세션 블록 상한은 스크롤 진입 **전** 실제 패널 높이로 계산한다 — ScrollArea
-        // 내부의 available_height는 사실상 무한이라 비례 계산이 무의미해진다.
-        let session_max_h = (ui.available_height() * 0.34).clamp(70.0, 230.0);
-        let sessions_visible = self.workspace_sessions_expanded && !sessions.is_empty();
-        // 활성 워크스페이스가 생성순 뒤쪽이면 before_active 행들이 스크롤 밖에 그려져
-        // 46px씩 사이드바 고정 높이를 잠식했다 (codex P2 — 세션·파일 트리가 클립 밖으로
-        // 밀리는데 스크롤할 방법이 없었다). 전체 순서 목록(before + 활성 + 세션 + after)을
-        // 하나의 bounded 스크롤 영역이 공유한다. 상한은 기존 워크스페이스 목록 예산에
-        // 활성 행(46px)과 세션 블록 예산을 더한 값 — before가 없던 기존 화면과 동일한
-        // 최악 높이를 유지하면서 before 행들만 스크롤로 흡수한다.
-        let session_block_h = if sessions_visible { session_max_h } else { 0.0 };
-        let list_max_h =
-            (ui.available_height() * 0.34).clamp(118.0, 232.0) + 46.0 + session_block_h;
-        egui::ScrollArea::vertical()
-            .id_salt("workspace_list_scroll")
-            .max_height(list_max_h)
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                for workspace in before_active {
-                    let resp = workspace_row(ui, workspace, false, Some(false));
-                    workspace_context_menu(&resp, workspace, catalog, &mut action);
-                    if resp.clicked() {
-                        action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
-                    }
+            ui.add_space(14.0);
+        } else {
+            ui.horizontal(|ui| {
+                if !compact_sidebar {
+                    ui.label(
+                        egui::RichText::new("워크스페이스 & 세션")
+                            .strong()
+                            .size(14.0),
+                    );
                 }
-                if let Some(active) = active {
-                    let resp =
-                        workspace_row(ui, active, true, Some(self.workspace_sessions_expanded));
-                    workspace_context_menu(&resp, active, catalog, &mut action);
-                    if resp.clicked() {
-                        self.workspace_sessions_expanded = !self.workspace_sessions_expanded;
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("+")
+                        .on_hover_text(catalog.t("workspace.new_shell", &[]))
+                        .clicked()
+                    {
+                        action = Some(SidebarAction::NewShell);
                     }
-                }
+                });
+            });
+            ui.add_space(4.0);
+            // DB list_workspaces가 보장하는 created_at 순서를 그대로 그린다. 이전 구현은
+            // 활성 workspace를 먼저 뽑아 맨 위에 렌더해 선택할 때마다 행이 이동했다.
+            let (before_active, active, after_active) =
+                workspace_creation_order_partition(sidebar.workspaces, sidebar.active_workspace_id);
+            // 세션 블록 상한은 스크롤 진입 **전** 실제 패널 높이로 계산한다 — ScrollArea
+            // 내부의 available_height는 사실상 무한이라 비례 계산이 무의미해진다.
+            let session_max_h = (ui.available_height() * 0.34).clamp(70.0, 230.0);
+            let sessions_visible = self.workspace_sessions_expanded && !sessions.is_empty();
+            // 활성 워크스페이스가 생성순 뒤쪽이면 before_active 행들이 스크롤 밖에 그려져
+            // 46px씩 사이드바 고정 높이를 잠식했다 (codex P2 — 세션·파일 트리가 클립 밖으로
+            // 밀리는데 스크롤할 방법이 없었다). 전체 순서 목록(before + 활성 + 세션 + after)을
+            // 하나의 bounded 스크롤 영역이 공유한다. 상한은 기존 워크스페이스 목록 예산에
+            // 활성 행(46px)과 세션 블록 예산을 더한 값 — before가 없던 기존 화면과 동일한
+            // 최악 높이를 유지하면서 before 행들만 스크롤로 흡수한다.
+            let session_block_h = if sessions_visible { session_max_h } else { 0.0 };
+            let list_max_h =
+                (ui.available_height() * 0.34).clamp(118.0, 232.0) + 46.0 + session_block_h;
+            egui::ScrollArea::vertical()
+                .id_salt("workspace_list_scroll")
+                .max_height(list_max_h)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for workspace in before_active {
+                        let resp = workspace_row(ui, workspace, false, Some(false));
+                        workspace_context_menu(&resp, workspace, catalog, &mut action);
+                        if resp.clicked() {
+                            action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
+                        }
+                    }
+                    if let Some(active) = active {
+                        let resp =
+                            workspace_row(ui, active, true, Some(self.workspace_sessions_expanded));
+                        workspace_context_menu(&resp, active, catalog, &mut action);
+                        if resp.clicked() {
+                            self.workspace_sessions_expanded = !self.workspace_sessions_expanded;
+                        }
+                    }
 
-                // 현재 workspace의 셸/에이전트를 활성 워크스페이스 아래에 들여써 나열한다.
-                if sessions_visible {
-                    // 세션이 많으면 목록이 패널을 다 먹고 아래로 넘쳐 잘렸다 (2026-07-05
-                    // 사용자 보고). 세션 목록은 자기 상한 안에서만 스크롤하고, 나머지는
-                    // 파일 트리가 갖는다. auto_shrink[_, true]로 세션이 적으면 줄어든다.
-                    egui::ScrollArea::vertical()
-                        .id_salt("session_list_scroll")
-                        .max_height(session_max_h)
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            ui.add_space(2.0);
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            for entry in sessions {
-                                ui.horizontal(|ui| {
-                                    ui.add_space(20.0);
-                                    ui.vertical(|ui| {
-                                        let editing = matches!(
-                                            &self.session_name_edit,
-                                            Some((p, _)) if *p == entry.pane
-                                        );
-                                        if editing {
-                                            // 인라인 이름 편집 — Enter 확정(RenameSession), Esc 취소.
-                                            // 행(레일/상태줄) 레이아웃은 유지하고 제목 자리만 편집기로.
-                                            let buf =
-                                                &mut self.session_name_edit.as_mut().unwrap().1;
-                                            session_row_editing(ui, entry, buf);
-                                            let (enter, esc) = ui.input(|i| {
-                                                (
-                                                    i.key_pressed(egui::Key::Enter),
-                                                    i.key_pressed(egui::Key::Escape),
-                                                )
-                                            });
-                                            if enter {
-                                                if let Some((pane, title)) =
-                                                    self.session_name_edit.take()
-                                                {
-                                                    let title = title.trim().to_owned();
-                                                    if !title.is_empty() {
-                                                        action =
-                                                            Some(SidebarAction::RenameSession {
-                                                                pane,
-                                                                title,
-                                                            });
-                                                    }
-                                                }
-                                            } else if esc {
-                                                self.session_name_edit = None;
-                                            }
-                                        } else {
-                                            // hover 힌트: 상태 감지 출처/신뢰도(U17b)가 있으면 함께.
-                                            let hover = match &entry.status_hint {
-                                                Some(hint) => {
-                                                    format!(
-                                                        "{}\n{}",
-                                                        hint,
-                                                        catalog.t("workspace.rename_hint", &[])
+                    // 현재 workspace의 셸/에이전트를 활성 워크스페이스 아래에 들여써 나열한다.
+                    if sessions_visible {
+                        // 세션이 많으면 목록이 패널을 다 먹고 아래로 넘쳐 잘렸다 (2026-07-05
+                        // 사용자 보고). 세션 목록은 자기 상한 안에서만 스크롤하고, 나머지는
+                        // 파일 트리가 갖는다. auto_shrink[_, true]로 세션이 적으면 줄어든다.
+                        egui::ScrollArea::vertical()
+                            .id_salt("session_list_scroll")
+                            .max_height(session_max_h)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.add_space(2.0);
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                for entry in sessions {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(20.0);
+                                        ui.vertical(|ui| {
+                                            let editing = matches!(
+                                                &self.session_name_edit,
+                                                Some((p, _)) if *p == entry.pane
+                                            );
+                                            if editing {
+                                                // 인라인 이름 편집 — Enter 확정(RenameSession), Esc 취소.
+                                                // 행(레일/상태줄) 레이아웃은 유지하고 제목 자리만 편집기로.
+                                                let buf =
+                                                    &mut self.session_name_edit.as_mut().unwrap().1;
+                                                session_row_editing(ui, entry, buf);
+                                                let (enter, esc) = ui.input(|i| {
+                                                    (
+                                                        i.key_pressed(egui::Key::Enter),
+                                                        i.key_pressed(egui::Key::Escape),
                                                     )
+                                                });
+                                                if enter {
+                                                    if let Some((pane, title)) =
+                                                        self.session_name_edit.take()
+                                                    {
+                                                        let title = title.trim().to_owned();
+                                                        if !title.is_empty() {
+                                                            action = Some(
+                                                                SidebarAction::RenameSession {
+                                                                    pane,
+                                                                    title,
+                                                                },
+                                                            );
+                                                        }
+                                                    }
+                                                } else if esc {
+                                                    self.session_name_edit = None;
                                                 }
-                                                None => catalog.t("workspace.rename_hint", &[]),
-                                            };
-                                            let resp = session_row(ui, entry).on_hover_text(hover);
-                                            // 우클릭 → 컨텍스트 메뉴(이름 변경/폴더/새 셸/이어가기/닫기).
-                                            // 더블클릭 → 이름 편집. 단순 클릭 → 세션 전환.
-                                            // (수동 상태 지정 U17b는 hook 감지 정착으로 제거 — 2026-07-17 사용자.)
-                                            if let Some(session) = entry.session {
-                                                resp.context_menu(|ui| {
-                                                    if ui
-                                                        .button(
-                                                            catalog.t("workspace.rename_menu", &[]),
+                                            } else {
+                                                // hover 힌트: 상태 감지 출처/신뢰도(U17b)가 있으면 함께.
+                                                let hover = match &entry.status_hint {
+                                                    Some(hint) => {
+                                                        format!(
+                                                            "{}\n{}",
+                                                            hint,
+                                                            catalog.t("workspace.rename_hint", &[])
                                                         )
-                                                        .clicked()
-                                                    {
-                                                        self.session_name_edit = Some((
-                                                            entry.pane.clone(),
-                                                            entry.title.clone(),
-                                                        ));
-                                                        ui.close();
                                                     }
-                                                    ui.separator();
-                                                    if ui
-                                                        .button(
-                                                            catalog
-                                                                .t("sidebar.menu.open_folder", &[]),
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        action = Some(
-                                                            SidebarAction::OpenSessionFolder {
-                                                                session,
-                                                            },
-                                                        );
-                                                        ui.close();
-                                                    }
-                                                    if ui
-                                                        .button(
-                                                            catalog
-                                                                .t("sidebar.menu.copy_path", &[]),
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        action =
-                                                            Some(SidebarAction::CopySessionPath {
-                                                                session,
-                                                            });
-                                                        ui.close();
-                                                    }
-                                                    if ui
-                                                        .button(
-                                                            catalog.t(
+                                                    None => catalog.t("workspace.rename_hint", &[]),
+                                                };
+                                                let resp =
+                                                    session_row(ui, entry).on_hover_text(hover);
+                                                // 우클릭 → 컨텍스트 메뉴(이름 변경/폴더/새 셸/이어가기/닫기).
+                                                // 더블클릭 → 이름 편집. 단순 클릭 → 세션 전환.
+                                                // (수동 상태 지정 U17b는 hook 감지 정착으로 제거 — 2026-07-17 사용자.)
+                                                if let Some(session) = entry.session {
+                                                    resp.context_menu(|ui| {
+                                                        if ui
+                                                            .button(
+                                                                catalog.t(
+                                                                    "workspace.rename_menu",
+                                                                    &[],
+                                                                ),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            self.session_name_edit = Some((
+                                                                entry.pane.clone(),
+                                                                entry.title.clone(),
+                                                            ));
+                                                            ui.close();
+                                                        }
+                                                        ui.separator();
+                                                        if ui
+                                                            .button(
+                                                                catalog.t(
+                                                                    "sidebar.menu.open_folder",
+                                                                    &[],
+                                                                ),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            action = Some(
+                                                                SidebarAction::OpenSessionFolder {
+                                                                    session,
+                                                                },
+                                                            );
+                                                            ui.close();
+                                                        }
+                                                        if ui
+                                                            .button(
+                                                                catalog.t(
+                                                                    "sidebar.menu.copy_path",
+                                                                    &[],
+                                                                ),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            action = Some(
+                                                                SidebarAction::CopySessionPath {
+                                                                    session,
+                                                                },
+                                                            );
+                                                            ui.close();
+                                                        }
+                                                        if ui
+                                                            .button(catalog.t(
                                                                 "sidebar.menu.new_shell_here",
                                                                 &[],
-                                                            ),
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        action = Some(
-                                                            SidebarAction::NewShellSameFolder {
-                                                                session,
-                                                            },
-                                                        );
-                                                        ui.close();
-                                                    }
-                                                    // 변경 보기 — 세션 cwd 레포의 git diff 패널 (PR-D).
-                                                    if ui
-                                                        .button(
-                                                            catalog
-                                                                .t("sidebar.menu.show_diff", &[]),
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        action = Some(SidebarAction::ShowDiff {
-                                                            session,
-                                                        });
-                                                        ui.close();
-                                                    }
-                                                    // 새 워크트리에서 셸 — cwd를 아는 세션만 (레포 판정은
-                                                    // dispatch의 백그라운드 repo_root가 한다, PR-W).
-                                                    if entry.has_cwd
+                                                            ))
+                                                            .clicked()
+                                                        {
+                                                            action = Some(
+                                                                SidebarAction::NewShellSameFolder {
+                                                                    session,
+                                                                },
+                                                            );
+                                                            ui.close();
+                                                        }
+                                                        // 변경 보기 — 세션 cwd 레포의 git diff 패널 (PR-D).
+                                                        if ui
+                                                            .button(
+                                                                catalog.t(
+                                                                    "sidebar.menu.show_diff",
+                                                                    &[],
+                                                                ),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            action =
+                                                                Some(SidebarAction::ShowDiff {
+                                                                    session,
+                                                                });
+                                                            ui.close();
+                                                        }
+                                                        // 새 워크트리에서 셸 — cwd를 아는 세션만 (레포 판정은
+                                                        // dispatch의 백그라운드 repo_root가 한다, PR-W).
+                                                        if entry.has_cwd
                                                         && ui
                                                             .button(catalog.t(
                                                                 "sidebar.menu.new_worktree_cell",
@@ -1260,75 +1300,83 @@ impl FileTreeUi {
                                                             });
                                                         ui.close();
                                                     }
-                                                    // 워크트리 삭제 — 이 세션 cwd가 `.deppy/worktrees/`
-                                                    // 하위일 때만 노출(2026-07-18 사용자 제안).
-                                                    if entry.in_worktree
-                                                        && ui
-                                                            .button(catalog.t(
-                                                                "sidebar.menu.remove_worktree",
-                                                                &[],
-                                                            ))
+                                                        // 워크트리 삭제 — 이 세션 cwd가 `.deppy/worktrees/`
+                                                        // 하위일 때만 노출(2026-07-18 사용자 제안).
+                                                        if entry.in_worktree
+                                                            && ui
+                                                                .button(catalog.t(
+                                                                    "sidebar.menu.remove_worktree",
+                                                                    &[],
+                                                                ))
+                                                                .clicked()
+                                                        {
+                                                            action = Some(
+                                                                SidebarAction::RemoveWorktree {
+                                                                    session,
+                                                                },
+                                                            );
+                                                            ui.close();
+                                                        }
+                                                        if entry.resumable
+                                                            && ui
+                                                                .button(catalog.t(
+                                                                    "sidebar.menu.resume_agent",
+                                                                    &[],
+                                                                ))
+                                                                .clicked()
+                                                        {
+                                                            action =
+                                                                Some(SidebarAction::ResumeAgent {
+                                                                    pane: entry.pane.clone(),
+                                                                    session,
+                                                                    title: entry.title.clone(),
+                                                                });
+                                                            ui.close();
+                                                        }
+                                                        ui.separator();
+                                                        if ui
+                                                            .button(
+                                                                catalog.t(
+                                                                    "sidebar.menu.close_pane",
+                                                                    &[],
+                                                                ),
+                                                            )
                                                             .clicked()
-                                                    {
-                                                        action =
-                                                            Some(SidebarAction::RemoveWorktree {
-                                                                session,
-                                                            });
-                                                        ui.close();
-                                                    }
-                                                    if entry.resumable
-                                                        && ui
-                                                            .button(catalog.t(
-                                                                "sidebar.menu.resume_agent",
-                                                                &[],
-                                                            ))
-                                                            .clicked()
-                                                    {
-                                                        action = Some(SidebarAction::ResumeAgent {
-                                                            pane: entry.pane.clone(),
-                                                            session,
-                                                            title: entry.title.clone(),
-                                                        });
-                                                        ui.close();
-                                                    }
-                                                    ui.separator();
-                                                    if ui
-                                                        .button(
-                                                            catalog
-                                                                .t("sidebar.menu.close_pane", &[]),
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        action = Some(SidebarAction::ClosePane {
-                                                            pane: entry.pane.clone(),
-                                                        });
-                                                        ui.close();
-                                                    }
-                                                });
+                                                        {
+                                                            action =
+                                                                Some(SidebarAction::ClosePane {
+                                                                    pane: entry.pane.clone(),
+                                                                });
+                                                            ui.close();
+                                                        }
+                                                    });
+                                                }
+                                                if resp.double_clicked() {
+                                                    self.session_name_edit = Some((
+                                                        entry.pane.clone(),
+                                                        entry.title.clone(),
+                                                    ));
+                                                } else if resp.clicked() && !entry.focused {
+                                                    action = Some(SidebarAction::FocusSession {
+                                                        tab: entry.tab.clone(),
+                                                        pane: entry.pane.clone(),
+                                                    });
+                                                }
                                             }
-                                            if resp.double_clicked() {
-                                                self.session_name_edit =
-                                                    Some((entry.pane.clone(), entry.title.clone()));
-                                            } else if resp.clicked() && !entry.focused {
-                                                action = Some(SidebarAction::FocusSession {
-                                                    tab: entry.tab.clone(),
-                                                    pane: entry.pane.clone(),
-                                                });
-                                            }
-                                        }
+                                        });
                                     });
-                                });
-                            }
-                        });
-                }
-                for workspace in after_active {
-                    let resp = workspace_row(ui, workspace, false, Some(false));
-                    workspace_context_menu(&resp, workspace, catalog, &mut action);
-                    if resp.clicked() {
-                        action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
+                                }
+                            });
                     }
-                }
-            });
+                    for workspace in after_active {
+                        let resp = workspace_row(ui, workspace, false, Some(false));
+                        workspace_context_menu(&resp, workspace, catalog, &mut action);
+                        if resp.clicked() {
+                            action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
+                        }
+                    }
+                });
+        }
         ui.add_space(4.0);
         crate::ui::hairline_full(ui);
 
@@ -5933,6 +5981,46 @@ mod tests {
             "Idle 워크스페이스 행에 종료 메뉴가 떴다"
         );
         assert!(harness.state().1.is_empty(), "Idle 행 우클릭이 액션을 냄");
+    }
+
+    /// 워크스페이스가 하나도 없으면(종료 숨김 반영) 목록 헤더 대신 빈 상태 CTA가 뜨고,
+    /// 큰 + 버튼 클릭이 CreateWorkspaceFromPicker 액션을 낸다 — 폴더 선택/생성·전환은
+    /// App 소관(rfd + ws_create 흐름)이라 여기서는 방출까지만 검증한다.
+    #[test]
+    fn kittest_워크스페이스_없으면_빈상태_cta가_액션을_낸다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 700.0))
+            .build_ui_state(
+                |ui, state: &mut (FileTreeUi, Vec<SidebarAction>)| {
+                    let snapshot = SidebarSnapshot {
+                        active_workspace_id: "ws-hidden",
+                        workspaces: &[],
+                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        inbox_count: 0,
+                        agents_open: false,
+                    };
+                    if let Some(a) = state.0.panel(ui, &[], &snapshot, &catalog) {
+                        state.1.push(a);
+                    }
+                },
+                (FileTreeUi::new(egui::Context::default()), Vec::new()),
+            );
+        harness.run();
+        assert!(
+            harness.query_by_label("Start a workspace").is_some(),
+            "빈 상태 안내문이 보이지 않음"
+        );
+        harness.get_by_label("+").click();
+        harness.run();
+        assert!(
+            matches!(
+                harness.state().1.as_slice(),
+                [SidebarAction::CreateWorkspaceFromPicker]
+            ),
+            "빈 상태 + 클릭이 CreateWorkspaceFromPicker를 내지 않음"
+        );
     }
 
     /// 하단 nav 작업함 배지 — 0이면 숨김(None), 그 외엔 카운트 문구.

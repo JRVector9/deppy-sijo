@@ -34,6 +34,7 @@ sidebar.menu.resume_agent = 恢复智能体
 sidebar.menu.close_pane = 关闭 Shell
 sidebar.menu.close_workspace = 关闭工作区会话
 sidebar.menu.rename_workspace = 重命名
+sidebar.empty.start_workspace = 开始一个工作区
 sidebar.nav.home = 主页
 sidebar.nav.inbox = 收件箱
 sidebar.nav.agents = 代理

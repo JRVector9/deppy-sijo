@@ -34,6 +34,7 @@ sidebar.menu.resume_agent = 恢復代理
 sidebar.menu.close_pane = 關閉 Shell
 sidebar.menu.close_workspace = 關閉工作區工作階段
 sidebar.menu.rename_workspace = 重新命名
+sidebar.empty.start_workspace = 開始一個工作區
 sidebar.nav.home = 首頁
 sidebar.nav.inbox = 收件匣
 sidebar.nav.agents = 代理

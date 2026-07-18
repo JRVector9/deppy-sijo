@@ -34,6 +34,7 @@ sidebar.menu.resume_agent = エージェントを再開
 sidebar.menu.close_pane = シェルを閉じる
 sidebar.menu.close_workspace = ワークスペースのセッションを終了
 sidebar.menu.rename_workspace = 名前を変更
+sidebar.empty.start_workspace = ワークスペースを始めましょう
 sidebar.nav.home = ホーム
 sidebar.nav.inbox = インボックス
 sidebar.nav.agents = エージェント

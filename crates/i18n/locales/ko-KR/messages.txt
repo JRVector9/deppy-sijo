@@ -34,6 +34,7 @@ sidebar.menu.resume_agent = 에이전트 이어가기
 sidebar.menu.close_pane = 셀 닫기
 sidebar.menu.close_workspace = 워크스페이스 종료
 sidebar.menu.rename_workspace = 이름 바꾸기
+sidebar.empty.start_workspace = 워크스페이스를 시작하세요
 sidebar.nav.home = 홈
 sidebar.nav.inbox = 작업함
 sidebar.nav.agents = 에이전트

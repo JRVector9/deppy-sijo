@@ -5790,6 +5790,9 @@ impl eframe::App for App {
                 );
             });
 
+        // 새 워크스페이스로 만들 폴더 — 사이드바 빈 상태 CTA와 설정 화면 양쪽이 채우고,
+        // 프레임 끝의 공통 생성/전환 흐름이 소비한다(선언을 사이드바 dispatch보다 앞에).
+        let mut ws_create: Option<std::path::PathBuf> = None;
         if self.file_tree.is_some() {
             let sidebar_action = self
                 .file_tree
@@ -6134,6 +6137,14 @@ impl eframe::App for App {
                         .unwrap_or_default()
                         .to_owned();
                     self.ws_rename_edit = Some((workspace_id, alias));
+                }
+                Some(ui::file_tree::SidebarAction::CreateWorkspaceFromPicker) => {
+                    // 빈 상태 CTA — rfd는 App에서 연다(UI leaf 금지 관례). 선택한 폴더는
+                    // 기존 ws_create 흐름(같은 경로면 그 워크스페이스로 전환, 아니면
+                    // 생성 후 전환)을 그대로 탄다.
+                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                        ws_create = Some(dir);
+                    }
                 }
                 None => {}
             }
@@ -6955,7 +6966,6 @@ impl eframe::App for App {
         let mut activity_action = None;
         let mut notif_click = None;
         let mut ws_switch: Option<String> = None;
-        let mut ws_create: Option<std::path::PathBuf> = None;
         let mut ws_delete: Option<String> = None;
         // 프로젝트 삭제 확인 결정 — 모달은 설정 뷰포트 안에서 렌더하고(T2) 결정만 캡처,
         // 실제 삭제/전환은 self 전체 &mut가 필요하므로 클로저 밖에서 처리한다.

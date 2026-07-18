@@ -34,6 +34,7 @@ sidebar.menu.resume_agent = Resume agent
 sidebar.menu.close_pane = Close shell
 sidebar.menu.close_workspace = Close workspace sessions
 sidebar.menu.rename_workspace = Rename workspace
+sidebar.empty.start_workspace = Start a workspace
 sidebar.nav.home = Home
 sidebar.nav.inbox = Inbox
 sidebar.nav.agents = Agents

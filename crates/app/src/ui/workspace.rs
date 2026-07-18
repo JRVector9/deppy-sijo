@@ -53,6 +53,82 @@ fn terminal_pane_layout(rect: egui::Rect) -> TerminalPaneLayout {
     }
 }
 
+/// pane 헤더 우측 도구 버튼 한 변(정사각)과 간격 — pane_header_buttons와
+/// render_pane_header의 제목 폭 계산이 공유하는 단일 원천.
+const PANE_HEADER_TOOLBAR_BUTTON: f32 = 20.0;
+const PANE_HEADER_TOOLBAR_GAP: f32 = 2.0;
+
+/// pane 헤더 버튼 기하 — 닫기(×)는 마지막까지 남는 버튼이다.
+struct PaneHeaderButtons {
+    /// 닫기(×) 히트박스. 항상 존재한다.
+    close: egui::Rect,
+    /// 표시할 우측 도구 히트박스(왼쪽→오른쪽). 아이콘은 전체 목록의 뒤에서부터
+    /// `toolbar.len()`개를 대응시킨다 (왼쪽 도구부터 숨김).
+    toolbar: Vec<egui::Rect>,
+    /// 우측 도구 묶음의 왼쪽 경계 (탭 폭 계산용, 도구 0개면 우측 여백 기준).
+    toolbar_left: f32,
+}
+
+/// 헤더 폭·제목 폭으로 닫기(×)와 우측 도구의 히트박스를 계산한다.
+///
+/// codex 리뷰 P2 회귀 가드: compact 헤더(3e3e909)는 visible_toolbar를
+/// clamp(1,·)로 최소 1개 강제해 589pt 픽스처의 10% pane(≈59px)에서 Split
+/// 버튼이 닫기 히트박스 22px 중 17px를 덮었고, 도구 interact가 나중에
+/// 등록되므로 겹침 클릭이 닫기 대신 분할을 실행했다. 지금은 도구 0개를
+/// 허용하고, 만에 하나 기하가 어긋나 도구가 닫기를 덮으면 왼쪽 도구를 더
+/// 숨겨 닫기가 항상 우선하도록 보장한다.
+fn pane_header_buttons(
+    header: egui::Rect,
+    title_width: f32,
+    icon_count: usize,
+) -> PaneHeaderButtons {
+    let title_left = header.left() + 17.0;
+    let center_y = header.center().y;
+    // 제목과 닫기 버튼을 먼저 온전히 확보한다. 분할 pane이 좁아지면 우측 도구를
+    // 왼쪽부터 단계적으로 숨겨(0개 허용) 제목 글자가 중간에서 잘리는 일을 막는다.
+    let toolbar_available = (header.width() - title_width - 61.0).max(0.0);
+    let mut visible_toolbar = (((toolbar_available + PANE_HEADER_TOOLBAR_GAP)
+        / (PANE_HEADER_TOOLBAR_BUTTON + PANE_HEADER_TOOLBAR_GAP))
+        .floor() as usize)
+        .min(icon_count);
+    loop {
+        let toolbar_width = PANE_HEADER_TOOLBAR_BUTTON * visible_toolbar as f32
+            + PANE_HEADER_TOOLBAR_GAP * visible_toolbar.saturating_sub(1) as f32;
+        let toolbar_left = header.right() - 4.0 - toolbar_width;
+        let close_center_x = (title_left + title_width + 14.0)
+            .min(toolbar_left - 11.0)
+            .max(title_left + 8.0);
+        let close = egui::Rect::from_center_size(
+            egui::pos2(close_center_x, center_y),
+            egui::vec2(20.0, 20.0),
+        );
+        let toolbar: Vec<egui::Rect> = (0..visible_toolbar)
+            .map(|index| {
+                egui::Rect::from_min_size(
+                    egui::pos2(
+                        toolbar_left
+                            + index as f32 * (PANE_HEADER_TOOLBAR_BUTTON + PANE_HEADER_TOOLBAR_GAP),
+                        center_y - PANE_HEADER_TOOLBAR_BUTTON * 0.5,
+                    ),
+                    egui::vec2(PANE_HEADER_TOOLBAR_BUTTON, PANE_HEADER_TOOLBAR_BUTTON),
+                )
+            })
+            .collect();
+        // 닫기 우선 가드 — 가장 왼쪽 도구가 닫기를 덮으면 하나 더 숨기고 재계산.
+        if let Some(leftmost) = toolbar.first()
+            && close.intersects(*leftmost)
+        {
+            visible_toolbar -= 1;
+            continue;
+        }
+        return PaneHeaderButtons {
+            close,
+            toolbar,
+            toolbar_left,
+        };
+    }
+}
+
 #[derive(Clone, Copy)]
 enum TerminalToolbarIcon {
     Search,
@@ -1329,8 +1405,6 @@ impl WorkspaceUi {
             .layout_no_wrap(full_title.clone(), font.clone(), egui::Color32::WHITE)
             .size()
             .x;
-        let toolbar_button = 20.0;
-        let toolbar_gap = 2.0;
         let toolbar_icons = [
             TerminalToolbarIcon::Search,
             TerminalToolbarIcon::NewTerminal,
@@ -1341,8 +1415,8 @@ impl WorkspaceUi {
 
         // 우측 도구 4개를 모두 표시하던 기존 제목 폭을 기준으로 실제 글자 수를 구한 뒤
         // 10자를 더 허용한다. 추가 폭이 필요하면 기존 규칙대로 왼쪽 도구부터 숨긴다.
-        let full_toolbar_width = toolbar_button * toolbar_icons.len() as f32
-            + toolbar_gap * toolbar_icons.len().saturating_sub(1) as f32;
+        let full_toolbar_width = PANE_HEADER_TOOLBAR_BUTTON * toolbar_icons.len() as f32
+            + PANE_HEADER_TOOLBAR_GAP * toolbar_icons.len().saturating_sub(1) as f32;
         let original_title_width =
             (header.right() - 4.0 - full_toolbar_width - 24.0 - title_left).max(0.0);
         let full_char_count = full_title.chars().count();
@@ -1366,26 +1440,11 @@ impl WorkspaceUi {
             .size()
             .x;
 
-        // 제목과 닫기 버튼을 먼저 온전히 확보한다. 분할 pane이 좁아지면 우측 도구를
-        // 왼쪽부터 단계적으로 숨겨 제목 글자가 중간에서 잘리는 일을 막는다.
-        let toolbar_available = (header.width() - title_width - 61.0).max(0.0);
-        let visible_toolbar = (((toolbar_available + toolbar_gap) / (toolbar_button + toolbar_gap))
-            .floor() as usize)
-            .min(toolbar_icons.len());
-        let toolbar_width = toolbar_button * visible_toolbar as f32
-            + toolbar_gap * visible_toolbar.saturating_sub(1) as f32;
-        let toolbar_left = header.right() - 4.0 - toolbar_width;
+        let buttons = pane_header_buttons(header, title_width, toolbar_icons.len());
         let center_y = header.center().y;
-
-        let close_center_x = (title_left + title_width + 14.0)
-            .min(toolbar_left - 11.0)
-            .max(title_left + 8.0);
-        let close = egui::Rect::from_center_size(
-            egui::pos2(close_center_x, center_y),
-            egui::vec2(20.0, 20.0),
-        );
+        let close = buttons.close;
         let tab_right = (close.right() + 6.0)
-            .min(toolbar_left - 4.0)
+            .min(buttons.toolbar_left - 4.0)
             .max(header.left());
         let tab = egui::Rect::from_min_max(header.min, egui::pos2(tab_right, header.bottom()));
 
@@ -1483,16 +1542,13 @@ impl WorkspaceUi {
             self.request_close_pane(client, pane.id.clone());
         }
 
-        let toolbar_top = center_y - toolbar_button * 0.5;
-        let first_toolbar = toolbar_icons.len() - visible_toolbar;
-        for (index, icon) in toolbar_icons[first_toolbar..].iter().copied().enumerate() {
-            let rect = egui::Rect::from_min_size(
-                egui::pos2(
-                    toolbar_left + index as f32 * (toolbar_button + toolbar_gap),
-                    toolbar_top,
-                ),
-                egui::vec2(toolbar_button, toolbar_button),
-            );
+        let first_toolbar = toolbar_icons.len() - buttons.toolbar.len();
+        for (index, (icon, rect)) in toolbar_icons[first_toolbar..]
+            .iter()
+            .copied()
+            .zip(buttons.toolbar.iter().copied())
+            .enumerate()
+        {
             let response = terminal_toolbar_button(
                 ui,
                 rect,
@@ -3981,6 +4037,50 @@ mod tests {
         }
     }
 
+    /// codex 리뷰 P2 재현 가드 — compact 헤더(3e3e909)는 visible_toolbar를
+    /// clamp(1,·)로 최소 1개 강제해, 589pt 픽스처의 10% pane(58.9px)에서
+    /// SplitRows 버튼([30.9, 54.9])이 닫기(×) 히트박스 22px 중 17.1px([26, 48])를
+    /// 덮었다. 도구 interact가 나중에 등록되므로 겹침 클릭은 닫기 대신 분할을
+    /// 실행했다. 지금은 도구 0개 허용 + 겹침 시 왼쪽 도구 추가 숨김으로 닫기가
+    /// 항상 우선한다.
+    #[test]
+    fn 지원되는_모든_좁은_split에서_도구가_닫기를_덮지_않는다() {
+        // 589pt 픽스처의 지원 최소 split 비율 10%(resize clamp 0.1) — 58.9px pane.
+        let narrow = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(58.9, TERMINAL_PANE_HEADER_HEIGHT),
+        );
+        for title_width in [0.0_f32, 13.0, 26.0, 70.0, 130.0] {
+            let buttons = pane_header_buttons(narrow, title_width, 4);
+            assert!(
+                buttons.toolbar.is_empty(),
+                "59px pane은 도구 0개가 정상 (title_width {title_width})"
+            );
+            assert!(
+                narrow.contains_rect(buttons.close),
+                "닫기는 헤더 안에 남는다 (title_width {title_width})"
+            );
+        }
+        // 폭·제목 폭 sweep — 어떤 조합에서도 도구 히트박스가 닫기를 덮지 않는다.
+        for width_quarter in 96..=3200u32 {
+            let width = width_quarter as f32 * 0.25; // 24.0 ..= 800.0
+            let header = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, TERMINAL_PANE_HEADER_HEIGHT),
+            );
+            for title_width in [0.0_f32, 13.0, 40.0, 90.0, 200.0] {
+                let buttons = pane_header_buttons(header, title_width, 4);
+                for rect in &buttons.toolbar {
+                    assert!(
+                        !rect.intersects(buttons.close),
+                        "width {width} title {title_width}: 도구 {rect:?}가 닫기 {:?}를 덮는다",
+                        buttons.close
+                    );
+                }
+            }
+        }
+    }
+
     /// hover 커서 회귀 가드 — 백그라운드 cwd 해석(stale-while-revalidate) 후
     /// 폴더 단어가 Dir로 잡혀야 한다 (2026-07-17 사용자: 커서가 안 바뀜).
     #[test]
@@ -4615,6 +4715,62 @@ mod tests {
             harness.state_mut().take_session_folder_request(),
             Some(SessionFolderRequest::OpenInFinder(SessionId(7))),
             "Finder 요청이 쌓여야 한다"
+        );
+    }
+
+    /// kittest 재현 — 10% pane(58.9px) 헤더에서 닫기(×) 자리를 클릭하면 분할이
+    /// 아니라 닫기 확인이 떠야 한다. compact 헤더(3e3e909)에서는 강제 표시된
+    /// Split 버튼이 닫기 히트박스를 덮고 interact가 나중 등록이라 SplitPane이
+    /// 나갔다 (codex 리뷰 P2).
+    #[test]
+    fn kittest_좁은_pane_닫기_클릭은_분할이_아니라_닫기를_요청한다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let client = RecordingRuntime::default();
+        let config = TerminalConfig::default();
+        let mut ws = WorkspaceUi::new();
+        ws.mux = Some(mux(
+            "t",
+            vec![tab(
+                "t",
+                vec![pane("p", SessionId(7))],
+                LayoutNode::Pane(pane_id("p")),
+            )],
+            "p",
+        ));
+        let header = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(58.9, TERMINAL_PANE_HEADER_HEIGHT),
+        );
+        let snapshot = pane("p", SessionId(7));
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, ws: &mut WorkspaceUi| {
+                ws.render_pane_header(ui, header, &snapshot, true, &config, &client, &catalog);
+            },
+            ws,
+        );
+        harness.run();
+        // 닫기 중심 x의 가능 범위는 clamp상 [25, 43.9] → 어떤 제목 폭에서도 닫기
+        // 히트박스(20px)에 들어가는 공통 구간은 x ∈ [33.9, 35). 34.5를 클릭한다.
+        let hit = egui::pos2(34.5, TERMINAL_PANE_HEADER_HEIGHT * 0.5);
+        harness.hover_at(hit);
+        harness.run();
+        harness.drag_at(hit);
+        harness.run();
+        harness.drop_at(hit);
+        harness.run();
+        assert_eq!(
+            harness.state().confirm_close,
+            Some(pane_id("p")),
+            "닫기 자리 클릭은 닫기 확인을 띄워야 한다"
+        );
+        assert!(
+            !client
+                .commands
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|command| matches!(command, RuntimeCommand::SplitPane { .. })),
+            "닫기 자리 클릭이 분할을 실행하면 안 된다"
         );
     }
 

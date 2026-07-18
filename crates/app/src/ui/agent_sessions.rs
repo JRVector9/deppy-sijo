@@ -129,6 +129,8 @@ pub struct AgentSessionsUi {
     new_prompt: String,
     new_model: String,
     new_effort: String,
+    /// OSS 섹션 ⟳ 클릭 — App이 take해 ollama 모델 재감지를 돌린다(2026-07-18).
+    ollama_redetect_requested: bool,
     follow_up: String,
     steer_input: String,
     focus_new_prompt: bool,
@@ -179,6 +181,7 @@ impl AgentSessionsUi {
             new_prompt: String::new(),
             new_model: String::new(),
             new_effort: String::new(),
+            ollama_redetect_requested: false,
             follow_up: String::new(),
             steer_input: String::new(),
             focus_new_prompt: false,
@@ -215,6 +218,11 @@ impl AgentSessionsUi {
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// OSS 섹션 ⟳(모델 재감지) 클릭을 소비한다 — App이 프레임마다 확인.
+    pub fn take_ollama_redetect(&mut self) -> bool {
+        std::mem::take(&mut self.ollama_redetect_requested)
     }
 
     /// A terminal click is an explicit keyboard-ownership transfer. Cancel any
@@ -1414,22 +1422,33 @@ impl AgentSessionsUi {
         // OSS 선택 시 감지된 ollama 모델을 클릭 후보로 (PR-L3 — local_llm 감지 배선.
         // 커스텀은 사용자 지시로 검색 없이 입력값 그대로 쓴다, 2026-07-18).
         if agents_config.codex_llm_provider.as_deref() == Some("oss") {
-            match ollama_models {
-                Some([]) => {
-                    ui.weak("설치된 ollama 모델 없음 — `ollama pull <모델>`로 받으세요.");
-                }
-                Some(models) => {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.weak("ollama 모델:");
+            ui.horizontal_wrapped(|ui| {
+                ui.weak("ollama 모델:");
+                match ollama_models {
+                    Some([]) => {
+                        ui.weak("없음 — `ollama pull <모델>`로 받으세요.");
+                    }
+                    Some(models) => {
                         for model in models.iter().take(8) {
                             if ui.small_button(model).clicked() {
                                 self.new_model = model.clone();
                             }
                         }
-                    });
+                    }
+                    None => {
+                        ui.weak("감지 안 됨 (ollama 미실행?)");
+                    }
                 }
-                None => {}
-            }
+                // 수동 재감지 (2026-07-18 사용자) — 앱 실행 중 ollama를 켰거나
+                // 모델을 받은 뒤 목록을 다시 가져온다. App이 take해 감지 워커 재가동.
+                if ui
+                    .small_button("⟳")
+                    .on_hover_text("ollama 모델 다시 감지")
+                    .clicked()
+                {
+                    self.ollama_redetect_requested = true;
+                }
+            });
         }
         // 프로바이더는 프로세스 레벨이라 살아 있는 app-server에는 적용되지 않는다.
         // 유휴 상태면 sync_llm_config가 자동으로 내렸다가 다음 실행에 반영한다.

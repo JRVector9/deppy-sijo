@@ -1221,6 +1221,8 @@ pub struct App {
     ollama_models: Option<Vec<String>>,
     ollama_detect_done: bool,
     ollama_detect_rx: Option<std::sync::mpsc::Receiver<crate::local_llm::LocalLlmSnapshot>>,
+    /// Agents 창 열림 전환 감지용 직전 프레임 상태 — 재오픈마다 ollama 자동 재감지.
+    agent_sessions_was_open: bool,
     notifications_ui: ui::notifications::NotificationsUi,
     /// 벨 팝오버 「대기 중」 섹션의 PTY 입력 대기 카드 렌더 상태 (v3.9 N3) — 자유 입력칸
     /// 버퍼 + 로그 tail 미리보기 캐시. 팝오버가 열려 있을 때만 조회한다(idle 비용 0).
@@ -1581,6 +1583,7 @@ impl App {
             ollama_models: None,
             ollama_detect_done: false,
             ollama_detect_rx: None,
+            agent_sessions_was_open: false,
             notifications_ui: ui::notifications::NotificationsUi::new(),
             inbox_waiting_ui: ui::inbox_waiting::InboxWaitingUi::new(),
             // 히스토리 파일은 앱 데이터 디렉터리(= 메타데이터 파일과 같은 폴더) 아래.
@@ -4197,9 +4200,20 @@ impl App {
                 }
             }
         }
+        // 자동 재감지 (2026-07-18 사용자): Agents 창이 닫혔다 다시 열리는 전환마다
+        // done을 리셋 — 앱 실행 중 ollama를 켜거나 모델을 받은 경우를 창 재오픈이
+        // 자연스럽게 반영한다. 수동 ⟳(OSS 섹션)도 같은 리셋 경로.
+        let agents_open = self.agent_sessions_ui.is_open();
+        if agents_open && !self.agent_sessions_was_open {
+            self.ollama_detect_done = false;
+        }
+        self.agent_sessions_was_open = agents_open;
+        if self.agent_sessions_ui.take_ollama_redetect() {
+            self.ollama_detect_done = false;
+        }
         if !self.ollama_detect_done
             && self.ollama_detect_rx.is_none()
-            && self.agent_sessions_ui.is_open()
+            && agents_open
             && self.config.agents.codex_llm_provider.as_deref() == Some("oss")
         {
             self.ollama_detect_rx = Some(crate::local_llm::spawn_detect(

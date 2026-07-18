@@ -5561,12 +5561,8 @@ impl eframe::App for App {
                             let bell = tbtn_response(ui, bell_label, bell_open)
                                 .on_hover_text(text.t("top.notifications", &[]));
                             inbox_click = self.inbox_popup(&bell, &text);
-
-                            // 구조화된 Codex App Server 세션은 PTY workspace와 별도 창으로 연다.
-                            let agent_sessions_selected = self.agent_sessions_ui.is_open();
-                            if tbtn(ui, "Agents".to_owned(), agent_sessions_selected) {
-                                self.agent_sessions_ui.toggle();
-                            }
+                            // Agents 진입은 사이드바 하단 nav가 담당한다 — 상단바 버튼은
+                            // 삭제(2026-07-18 사용자 확정). 단축키·기타 진입점은 유지.
                         });
                     },
                 );

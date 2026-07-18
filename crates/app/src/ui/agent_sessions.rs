@@ -239,10 +239,6 @@ impl AgentSessionsUi {
         true
     }
 
-    pub fn toggle(&mut self) {
-        self.open = !self.open;
-    }
-
     pub fn open(&mut self) {
         self.open = true;
     }

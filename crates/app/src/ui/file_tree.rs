@@ -2959,18 +2959,28 @@ fn workspace_context_menu_items(
     catalog: &i18n::Catalog,
     action: &mut Option<SidebarAction>,
 ) {
-    if ui
-        .button(catalog.t("sidebar.menu.rename_workspace", &[]))
-        .clicked()
-    {
+    let rename_label = catalog.t("sidebar.menu.rename_workspace", &[]);
+    let close_label = catalog.t("sidebar.menu.close_workspace", &[]);
+    // 메뉴 폭이 좁으면 「워크스페이스 종료」가 두 줄로 접혀 잘렸다(2026-07-18 사용자
+    // 스샷). 가장 긴 항목의 no-wrap 폭으로 최소 폭을 강제해(max_rect까지 확장된다)
+    // 어느 로케일에서도 모든 항목이 항상 한 줄로 그려지게 한다. Idle이라 종료 항목이
+    // 빠져도 두 항목 모두 재서 메뉴 폭이 상태에 따라 널뛰지 않게 한다.
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let widest = [rename_label.as_str(), close_label.as_str()]
+        .into_iter()
+        .map(|label| {
+            ui.painter()
+                .layout_no_wrap(label.to_owned(), font.clone(), egui::Color32::WHITE)
+                .size()
+                .x
+        })
+        .fold(0.0_f32, f32::max);
+    ui.set_min_width(widest + ui.spacing().button_padding.x * 2.0 + 2.0);
+    if ui.button(rename_label).clicked() {
         *action = Some(SidebarAction::RenameWorkspace(workspace.id.clone()));
         ui.close();
     }
-    if workspace.state != SidebarWorkspaceState::Idle
-        && ui
-            .button(catalog.t("sidebar.menu.close_workspace", &[]))
-            .clicked()
-    {
+    if workspace.state != SidebarWorkspaceState::Idle && ui.button(close_label).clicked() {
         *action = Some(SidebarAction::CloseWorkspace(workspace.id.clone()));
         ui.close();
     }
@@ -5981,6 +5991,44 @@ mod tests {
             "Idle 워크스페이스 행에 종료 메뉴가 떴다"
         );
         assert!(harness.state().1.is_empty(), "Idle 행 우클릭이 액션을 냄");
+    }
+
+    /// 좁은 폭에서도 워크스페이스 메뉴 항목은 한 줄로 그려진다 — 이전에는 메뉴가
+    /// 좁은 폭을 물려받아 「워크스페이스 종료」가 두 줄로 잘렸다(2026-07-18 스샷).
+    /// 메뉴 본문이 가장 긴 항목의 no-wrap 폭으로 최소 폭을 강제하므로 100px 제약
+    /// 안에서도 버튼이 제약 밖으로 확장되고(줄바꿈 없음) 두 항목의 행 높이가 같다.
+    #[test]
+    fn kittest_좁은_폭에서도_워크스페이스_메뉴가_한줄로_그려진다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspace = SidebarWorkspaceEntry {
+            id: "ws-narrow".to_owned(),
+            name: "narrow".to_owned(),
+            state: SidebarWorkspaceState::Active,
+            summary: SidebarSessionSummary::default(),
+        };
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, action: &mut Option<SidebarAction>| {
+                ui.allocate_ui(egui::vec2(100.0, 300.0), |ui| {
+                    workspace_context_menu_items(ui, &workspace, &catalog, action);
+                });
+            },
+            None,
+        );
+        harness.run();
+        let close = harness.get_by_label("Close workspace sessions").rect();
+        let rename = harness.get_by_label("Rename workspace").rect();
+        assert!(
+            close.width() > 100.0,
+            "종료 버튼이 최소 폭으로 확장되지 않음 (width={})",
+            close.width()
+        );
+        assert!(
+            (close.height() - rename.height()).abs() < 0.5,
+            "종료 항목이 여러 줄로 접힘 (close={}, rename={})",
+            close.height(),
+            rename.height()
+        );
     }
 
     /// 워크스페이스가 하나도 없으면(종료 숨김 반영) 목록 헤더 대신 빈 상태 CTA가 뜨고,

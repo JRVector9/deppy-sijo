@@ -5926,14 +5926,6 @@ impl eframe::App for App {
                     }
                 }
                 // 사이드바 + 버튼 — 새 셸 (탭바 제거 후 대체 진입점)
-                Some(ui::file_tree::SidebarAction::NewShell) => {
-                    self.agent_terminal_ui
-                        .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
-                    self.active.workspace_ui.spawn_shell(
-                        &self.active.runtime,
-                        self.config.terminal.scrollback_lines as usize,
-                    );
-                }
                 // 세션 이름 변경 — pane 제목 갱신(mux 반영 + 영속).
                 Some(ui::file_tree::SidebarAction::RenameSession { pane, title }) => {
                     if let Err(e) = self
@@ -7553,6 +7545,13 @@ impl eframe::App for App {
             // 첫 셸부터 그 폴더의 env를 받게 한다(B안).
             if switched_new {
                 self.sync_dotenv_env();
+                // 새 워크스페이스는 빈 채로 두지 않고 세션 하나를 바로 연다
+                // (2026-07-18 사용자) — 전환 직후 활성이 새 워크스페이스라 그 셸이
+                // 해당 폴더에서 뜬다.
+                self.active.workspace_ui.spawn_shell(
+                    &self.active.runtime,
+                    self.config.terminal.scrollback_lines as usize,
+                );
             }
         }
         match activity_action {

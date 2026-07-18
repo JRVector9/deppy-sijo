@@ -123,8 +123,6 @@ pub enum SidebarAction {
         tab: runtime::MuxTabId,
         pane: runtime::MuxPaneId,
     },
-    /// 새 셸 생성 (세션 섹션의 + 버튼)
-    NewShell,
     /// 세션 이름 변경 — pane 제목을 갱신한다(더블클릭/메뉴 인라인 편집).
     RenameSession {
         pane: runtime::MuxPaneId,
@@ -1054,9 +1052,9 @@ impl FileTreeUi {
         let mut action: Option<SidebarAction> = None;
 
         // ── 통합 워크스페이스·세션 계층 ──
-        ui.add_space(3.0);
         let compact_sidebar = ui.available_width() < 120.0;
         if sidebar.workspaces.is_empty() {
+            ui.add_space(3.0);
             // 빈 상태 — 워크스페이스가 하나도 없으면(종료 숨김 반영) 헤더/목록 대신
             // 가운데 큰 + 버튼과 안내문을 보여준다. 클릭 = 폴더 선택(App이 rfd로 열고
             // 기존 ws_create 흐름으로 생성·전환, 2026-07-18 사용자 요구).
@@ -1081,25 +1079,9 @@ impl FileTreeUi {
             });
             ui.add_space(14.0);
         } else {
-            ui.horizontal(|ui| {
-                if !compact_sidebar {
-                    ui.label(
-                        egui::RichText::new("워크스페이스 & 세션")
-                            .strong()
-                            .size(14.0),
-                    );
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button("+")
-                        .on_hover_text(catalog.t("workspace.new_shell", &[]))
-                        .clicked()
-                    {
-                        action = Some(SidebarAction::NewShell);
-                    }
-                });
-            });
-            ui.add_space(4.0);
+            // 헤더 바("워크스페이스 & 세션 +") 제거 — 첫 워크스페이스가 여백 없이
+            // 상단에 붙는다(2026-07-18 사용자). 워크스페이스 추가(+)는 목록 아래로
+            // 옮기고, 새 세션은 워크스페이스 우클릭 메뉴가 담당한다.
             // DB list_workspaces가 보장하는 created_at 순서를 그대로 그린다. 이전 구현은
             // 활성 workspace를 먼저 뽑아 맨 위에 렌더해 선택할 때마다 행이 이동했다.
             let (before_active, active, after_active) =
@@ -1374,6 +1356,21 @@ impl FileTreeUi {
                         if resp.clicked() {
                             action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
                         }
+                    }
+                    // 워크스페이스 추가(+) — 헤더에서 옮겨온 폴더 선택 진입점. 목록
+                    // 마지막에 얇게 붙여 첫 워크스페이스 상단 밀착을 해치지 않는다.
+                    ui.add_space(2.0);
+                    if ui
+                        .add_sized(
+                            egui::vec2(ui.available_width(), 26.0),
+                            egui::Button::new(
+                                egui::RichText::new(catalog.t("sidebar.add_workspace", &[])).weak(),
+                            )
+                            .frame(false),
+                        )
+                        .clicked()
+                    {
+                        action = Some(SidebarAction::CreateWorkspaceFromPicker);
                     }
                 });
         }

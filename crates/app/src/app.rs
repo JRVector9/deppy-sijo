@@ -5519,6 +5519,7 @@ impl eframe::App for App {
                     waiting_count,
                     mcp_count,
                     &self.status_feed,
+                    &text,
                 );
             });
 
@@ -5959,6 +5960,7 @@ impl eframe::App for App {
                         },
                         &self.status_feed,
                         &self.notice_translations,
+                        &text,
                     );
                 } else {
                     self.active.workspace_ui.show(

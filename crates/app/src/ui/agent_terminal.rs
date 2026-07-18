@@ -81,6 +81,7 @@ impl AgentTerminalUi {
         metrics: HomeMetrics,
         feed: &StatusFeedSnapshot,
         translations: &std::collections::HashMap<String, String>,
+        catalog: &i18n::Catalog,
     ) -> Option<HomeAction> {
         let totals = workspace_totals(rows);
         let mut action = None;
@@ -92,17 +93,17 @@ impl AgentTerminalUi {
                     .inner_margin(egui::Margin::same(22))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        if self.announcements(ui, feed, translations) {
+                        if self.announcements(ui, feed, translations, catalog) {
                             action = Some(HomeAction::RefreshNotices);
                         }
                         ui.add_space(14.0);
-                        if let Some(next) = orchestration_insights(ui, totals, metrics) {
+                        if let Some(next) = orchestration_insights(ui, totals, metrics, catalog) {
                             action = Some(next);
                         }
                         ui.add_space(14.0);
-                        workspace_summary(ui, totals, metrics);
+                        workspace_summary(ui, totals, metrics, catalog);
                         ui.add_space(14.0);
-                        workspace_rows(ui, rows);
+                        workspace_rows(ui, rows, catalog);
                     });
             });
         action
@@ -115,6 +116,7 @@ impl AgentTerminalUi {
         waiting: usize,
         mcp_count: usize,
         feed: &StatusFeedSnapshot,
+        catalog: &i18n::Catalog,
     ) {
         let totals = workspace_totals(rows);
         let cpu = if totals.cpu_seen {
@@ -128,15 +130,21 @@ impl AgentTerminalUi {
             |ui| {
                 ui.add_space(10.0);
                 status_dot(ui, egui::Color32::from_rgb(0x55, 0xc8, 0x79));
-                ui.weak("연결됨");
+                ui.weak(catalog.t("status_bar.connected", &[]));
                 ui.separator();
-                ui.weak(format!("워크스페이스 {}", totals.workspaces));
+                ui.weak(catalog.t(
+                    "status_bar.workspaces",
+                    &[("count", &totals.workspaces.to_string())],
+                ));
                 ui.separator();
-                ui.weak(format!("세션 {}", totals.sessions));
+                ui.weak(catalog.t(
+                    "status_bar.sessions",
+                    &[("count", &totals.sessions.to_string())],
+                ));
                 ui.separator();
                 // 등록·활성화된 MCP 서버 수 (2026-07-18 사용자 요청).
-                ui.weak(format!("MCP {mcp_count}"))
-                    .on_hover_text("활성화된 MCP 서버 수 (커넥터 센터에서 관리)");
+                ui.weak(catalog.t("status_bar.mcp", &[("count", &mcp_count.to_string())]))
+                    .on_hover_text(catalog.t("status_bar.mcp_hover", &[]));
                 // AI 서비스 상태 점등 (2026-07-18 사용자) — status.claude.com /
                 // status.openai.com 5분 폴링. 클릭 시 상태 페이지를 연다.
                 ui.separator();
@@ -145,18 +153,20 @@ impl AgentTerminalUi {
                     "Claude",
                     feed.claude.as_ref(),
                     crate::status_feed::CLAUDE_STATUS_URL,
+                    catalog,
                 );
                 service_status_light(
                     ui,
                     "OpenAI",
                     feed.openai.as_ref(),
                     crate::status_feed::OPENAI_STATUS_URL,
+                    catalog,
                 );
                 if waiting > 0 {
                     ui.separator();
                     ui.colored_label(
                         egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
-                        format!("입력 대기 {waiting}"),
+                        catalog.t("status_bar.waiting", &[("count", &waiting.to_string())]),
                     );
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -165,20 +175,21 @@ impl AgentTerminalUi {
                     // 덮는다(codex P2) — 좁으면 세션 합을 hover로 내리고 앱 값만 남긴다.
                     let compact = ui.available_width() < 400.0;
                     let memory = memory_label(
+                        catalog,
                         totals.app_rss_bytes,
                         totals.session_rss_bytes,
                         compact,
                     );
-                    ui.weak(memory).on_hover_text(format!(
-                        "앱 = 이 앱 프로세스 메모리 · 세션 {} = 모든 워크스페이스의 셸/에이전트 프로세스 합",
-                        super::format_bytes(totals.session_rss_bytes),
+                    ui.weak(memory).on_hover_text(catalog.t(
+                        "status_bar.memory_hover",
+                        &[("sessions", &super::format_bytes(totals.session_rss_bytes))],
                     ));
                     ui.separator();
                     ui.weak(cpu);
                     ui.separator();
                     ui.weak(match self.view {
-                        AgentTerminalView::Home => "홈",
-                        AgentTerminalView::Terminal => "터미널",
+                        AgentTerminalView::Home => catalog.t("status_bar.view.home", &[]),
+                        AgentTerminalView::Terminal => catalog.t("status_bar.view.terminal", &[]),
                     });
                 });
             },
@@ -191,6 +202,7 @@ impl AgentTerminalUi {
         ui: &mut egui::Ui,
         feed: &StatusFeedSnapshot,
         translations: &std::collections::HashMap<String, String>,
+        catalog: &i18n::Catalog,
     ) -> bool {
         let mut refresh_clicked = false;
         let panel = egui::Frame::NONE
@@ -201,11 +213,15 @@ impl AgentTerminalUi {
         panel.show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 status_dot(ui, egui::Color32::from_rgb(0x55, 0xc8, 0x79));
-                ui.label(egui::RichText::new("AI 공지").strong().size(17.0));
+                ui.label(
+                    egui::RichText::new(catalog.t("home.notices.title", &[]))
+                        .strong()
+                        .size(17.0),
+                );
                 ui.add_space(8.0);
                 source_filter(
                     ui,
-                    "전체",
+                    &catalog.t("home.notices.filter_all", &[]),
                     &mut self.announcement_filter,
                     AnnouncementFilter::All,
                 );
@@ -224,12 +240,12 @@ impl AgentTerminalUi {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .small_button("⟳")
-                        .on_hover_text("지금 갱신 (공지는 60분마다 자동 갱신)")
+                        .on_hover_text(catalog.t("home.notices.refresh_hover", &[]))
                         .clicked()
                     {
                         refresh_clicked = true;
                     }
-                    ui.weak("status.claude.com · status.openai.com — 60분마다 갱신");
+                    ui.weak(catalog.t("home.notices.sources", &[]));
                 });
             });
             ui.add_space(12.0);
@@ -270,9 +286,9 @@ impl AgentTerminalUi {
             .collect();
             if cards.is_empty() {
                 ui.weak(if feed.claude.is_none() && feed.openai.is_none() {
-                    "공지를 불러오는 중… (상태 페이지 조회)"
+                    catalog.t("home.notices.loading", &[])
                 } else {
-                    "최근 공지 없음"
+                    catalog.t("home.notices.empty", &[])
                 });
             } else {
                 // 리스트 형태(2026-07-18 사용자) — 카드 그리드 대신 전체 폭 행.
@@ -280,7 +296,7 @@ impl AgentTerminalUi {
                     if index > 0 {
                         crate::ui::hairline(ui);
                     }
-                    announcement_row(ui, card, translations);
+                    announcement_row(ui, card, translations, catalog);
                 }
             }
         });
@@ -296,15 +312,15 @@ struct AnnouncementCard<'a> {
     accent: egui::Color32,
 }
 
-/// Statuspage 인시던트 상태 → 한국어 라벨 (미지 값은 원문 그대로).
-fn incident_status_label(status: &str) -> &str {
+/// Statuspage 인시던트 상태 → 로케일 라벨 (미지 값은 원문 그대로).
+fn incident_status_label(catalog: &i18n::Catalog, status: &str) -> String {
     match status {
-        "resolved" => "해결됨",
-        "investigating" => "조사 중",
-        "identified" => "원인 파악됨",
-        "monitoring" => "관찰 중",
-        "postmortem" => "사후 분석",
-        other => other,
+        "resolved" => catalog.t("home.notices.status.resolved", &[]),
+        "investigating" => catalog.t("home.notices.status.investigating", &[]),
+        "identified" => catalog.t("home.notices.status.identified", &[]),
+        "monitoring" => catalog.t("home.notices.status.monitoring", &[]),
+        "postmortem" => catalog.t("home.notices.status.postmortem", &[]),
+        other => other.to_owned(),
     }
 }
 
@@ -328,6 +344,7 @@ fn announcement_row(
     ui: &mut egui::Ui,
     card: &AnnouncementCard<'_>,
     translations: &std::collections::HashMap<String, String>,
+    catalog: &i18n::Catalog,
 ) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
@@ -351,9 +368,12 @@ fn announcement_row(
             title.on_hover_text(title_text);
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.hyperlink_to("원문 →", &card.incident.url);
+            ui.hyperlink_to(
+                catalog.t("home.notices.original_link", &[]),
+                &card.incident.url,
+            );
             ui.weak(&card.incident.date);
-            ui.weak(incident_status_label(&card.incident.status));
+            ui.weak(incident_status_label(catalog, &card.incident.status));
         });
     });
 }
@@ -362,6 +382,7 @@ fn orchestration_insights(
     ui: &mut egui::Ui,
     totals: WorkspaceTotals,
     metrics: HomeMetrics,
+    catalog: &i18n::Catalog,
 ) -> Option<HomeAction> {
     let mut action = None;
     let panel = egui::Frame::NONE
@@ -372,12 +393,12 @@ fn orchestration_insights(
     panel.show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("오케스트레이션 인사이트")
+                egui::RichText::new(catalog.t("home.insights.title", &[]))
                     .strong()
                     .size(16.0),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.weak("전체 워크스페이스 신호");
+                ui.weak(catalog.t("home.insights.subtitle", &[]));
             });
         });
         ui.add_space(10.0);
@@ -385,46 +406,48 @@ fn orchestration_insights(
         if metrics.waiting > 0 {
             insights.push((
                 egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
-                "입력 대기를 한 번에 검토하세요",
-                format!(
-                    "{0}건의 권한 확인 또는 응답이 작업 진행을 막고 있습니다.",
-                    metrics.waiting
+                catalog.t("home.insights.waiting.title", &[]),
+                catalog.t(
+                    "home.insights.waiting.detail",
+                    &[("count", &metrics.waiting.to_string())],
                 ),
-                "작업함 열기",
+                catalog.t("home.insights.waiting.button", &[]),
                 HomeAction::Inbox,
             ));
         }
         if totals.warnings > 0 {
             insights.push((
                 egui::Color32::from_rgb(0xed, 0x5b, 0x61),
-                "리소스 또는 입력 압력을 확인하세요",
-                format!(
-                    "{}개 워크스페이스에서 주의 신호가 감지됐습니다.",
-                    totals.warnings
+                catalog.t("home.insights.warnings.title", &[]),
+                catalog.t(
+                    "home.insights.warnings.detail",
+                    &[("count", &totals.warnings.to_string())],
                 ),
-                "활동 보기",
+                catalog.t("home.insights.action.activity", &[]),
                 HomeAction::Activity,
             ));
         }
         if totals.active + totals.warm > 1 || totals.idle > 0 {
             insights.push((
                 egui::Color32::from_rgb(0x43, 0xb8, 0xcd),
-                "가용 워크스페이스에 작업을 분산할 수 있습니다",
-                format!(
-                    "실행 가능 {} · 유휴 {} 워크스페이스",
-                    totals.active + totals.warm,
-                    totals.idle
+                catalog.t("home.insights.distribute.title", &[]),
+                catalog.t(
+                    "home.insights.distribute.detail",
+                    &[
+                        ("runnable", &(totals.active + totals.warm).to_string()),
+                        ("idle", &totals.idle.to_string()),
+                    ],
                 ),
-                "에이전트 열기",
+                catalog.t("home.insights.distribute.button", &[]),
                 HomeAction::Agents,
             ));
         }
         if insights.is_empty() {
             insights.push((
                 egui::Color32::from_rgb(0x55, 0xc8, 0x79),
-                "현재 막힌 작업이 없습니다",
-                "모든 워크스페이스가 정상 범위에서 동작하고 있습니다.".to_owned(),
-                "활동 보기",
+                catalog.t("home.insights.clear.title", &[]),
+                catalog.t("home.insights.clear.detail", &[]),
+                catalog.t("home.insights.action.activity", &[]),
                 HomeAction::Activity,
             ));
         }
@@ -445,12 +468,12 @@ fn orchestration_insights(
                     ui.set_min_height(102.0);
                     ui.horizontal(|ui| {
                         status_dot(ui, *color);
-                        ui.label(egui::RichText::new(*title).strong());
+                        ui.label(egui::RichText::new(title.as_str()).strong());
                     });
                     ui.add_space(6.0);
                     ui.weak(detail);
                     ui.add_space(8.0);
-                    if ui.small_button(*button).clicked() {
+                    if ui.small_button(button.as_str()).clicked() {
                         action = Some(*next);
                     }
                 });
@@ -459,16 +482,49 @@ fn orchestration_insights(
     action
 }
 
-fn workspace_summary(ui: &mut egui::Ui, totals: WorkspaceTotals, metrics: HomeMetrics) {
+fn workspace_summary(
+    ui: &mut egui::Ui,
+    totals: WorkspaceTotals,
+    metrics: HomeMetrics,
+    catalog: &i18n::Catalog,
+) {
     let values = [
-        ("전체 워크스페이스", totals.workspaces, "등록된 프로젝트"),
-        ("실행 중", totals.active + totals.warm, "active + warm"),
-        ("전체 세션", totals.sessions, "모든 워크스페이스"),
-        ("입력 대기", metrics.waiting, "권한 확인과 응답"),
-        ("확인 필요", totals.warnings, "리소스·입력 압력"),
-        ("유휴", totals.idle, "작업 위임 가능"),
+        (
+            catalog.t("home.summary.workspaces", &[]),
+            totals.workspaces,
+            catalog.t("home.summary.workspaces_detail", &[]),
+        ),
+        (
+            catalog.t("home.summary.running", &[]),
+            totals.active + totals.warm,
+            catalog.t("home.summary.running_detail", &[]),
+        ),
+        (
+            catalog.t("home.summary.sessions", &[]),
+            totals.sessions,
+            catalog.t("home.summary.sessions_detail", &[]),
+        ),
+        (
+            catalog.t("home.summary.waiting", &[]),
+            metrics.waiting,
+            catalog.t("home.summary.waiting_detail", &[]),
+        ),
+        (
+            catalog.t("home.summary.attention", &[]),
+            totals.warnings,
+            catalog.t("home.summary.attention_detail", &[]),
+        ),
+        (
+            catalog.t("home.summary.idle", &[]),
+            totals.idle,
+            catalog.t("home.summary.idle_detail", &[]),
+        ),
     ];
-    ui.label(egui::RichText::new("전체 작업 상태").strong().size(16.0));
+    ui.label(
+        egui::RichText::new(catalog.t("home.summary.title", &[]))
+            .strong()
+            .size(16.0),
+    );
     ui.add_space(8.0);
     let columns = if ui.available_width() >= 850.0 { 3 } else { 2 };
     for chunk in values.chunks(columns) {
@@ -481,29 +537,43 @@ fn workspace_summary(ui: &mut egui::Ui, totals: WorkspaceTotals, metrics: HomeMe
                     .inner_margin(egui::Margin::same(13))
                     .show(column, |ui| {
                         ui.set_min_height(78.0);
-                        ui.weak(*label);
+                        ui.weak(label.as_str());
                         ui.label(egui::RichText::new(value.to_string()).strong().size(22.0));
-                        ui.weak(egui::RichText::new(*detail).size(11.0));
+                        ui.weak(egui::RichText::new(detail.as_str()).size(11.0));
                     });
             }
         });
         ui.add_space(6.0);
     }
     if metrics.unread > 0 {
-        ui.weak(format!("읽지 않은 최근 알림 {}건", metrics.unread));
+        ui.weak(catalog.t(
+            "home.summary.unread",
+            &[("count", &metrics.unread.to_string())],
+        ));
     }
 }
 
-fn workspace_rows(ui: &mut egui::Ui, rows: &[ActivityWorkspaceRow]) {
-    ui.label(egui::RichText::new("워크스페이스").strong().size(16.0));
+fn workspace_rows(ui: &mut egui::Ui, rows: &[ActivityWorkspaceRow], catalog: &i18n::Catalog) {
+    ui.label(
+        egui::RichText::new(catalog.t("home.workspaces.title", &[]))
+            .strong()
+            .size(16.0),
+    );
     ui.add_space(8.0);
     for row in rows {
         let (state, color) = match row.state {
-            ActivityWorkspaceState::Active => ("활성", egui::Color32::from_rgb(0x55, 0xc8, 0x79)),
-            ActivityWorkspaceState::Warm => {
-                ("백그라운드", egui::Color32::from_rgb(0x4c, 0xa8, 0xdf))
-            }
-            ActivityWorkspaceState::Idle => ("유휴", ui.visuals().weak_text_color()),
+            ActivityWorkspaceState::Active => (
+                catalog.t("home.workspaces.state.active", &[]),
+                egui::Color32::from_rgb(0x55, 0xc8, 0x79),
+            ),
+            ActivityWorkspaceState::Warm => (
+                catalog.t("home.workspaces.state.warm", &[]),
+                egui::Color32::from_rgb(0x4c, 0xa8, 0xdf),
+            ),
+            ActivityWorkspaceState::Idle => (
+                catalog.t("home.workspaces.state.idle", &[]),
+                ui.visuals().weak_text_color(),
+            ),
         };
         egui::Frame::NONE
             .fill(ui.visuals().panel_fill)
@@ -514,9 +584,15 @@ fn workspace_rows(ui: &mut egui::Ui, rows: &[ActivityWorkspaceRow]) {
                 ui.horizontal(|ui| {
                     status_dot(ui, color);
                     ui.label(egui::RichText::new(&row.name).strong());
-                    ui.weak(format!("세션 {}", row.session_count));
+                    ui.weak(catalog.t(
+                        "home.workspaces.sessions",
+                        &[("count", &row.session_count.to_string())],
+                    ));
                     if workspace_has_warning(row) {
-                        ui.colored_label(egui::Color32::from_rgb(0xed, 0x5b, 0x61), "확인 필요");
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xed, 0x5b, 0x61),
+                            catalog.t("home.workspaces.attention", &[]),
+                        );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.weak(state);
@@ -530,14 +606,19 @@ fn workspace_rows(ui: &mut egui::Ui, rows: &[ActivityWorkspaceRow]) {
 /// 상태바 메모리 라벨. 앱/세션 분리 표시 — 합산 단일 "RAM"은 세션 에이전트 몇 개에
 /// 수 GB로 보여 앱 메모리 급증으로 오독된다(2026-07-18 사용자 보고). compact(좁은 폭)
 /// 에서는 세션 합을 hover로 내리고 앱 값만 남긴다 — 오독 방지가 우선이라 앱 값을 남긴다.
-fn memory_label(app_rss: u64, session_rss: u64, compact: bool) -> String {
+fn memory_label(catalog: &i18n::Catalog, app_rss: u64, session_rss: u64, compact: bool) -> String {
     if compact {
-        format!("앱 {}", super::format_bytes(app_rss))
+        catalog.t(
+            "status_bar.memory_compact",
+            &[("app", &super::format_bytes(app_rss))],
+        )
     } else {
-        format!(
-            "앱 {} · 세션 {}",
-            super::format_bytes(app_rss),
-            super::format_bytes(session_rss),
+        catalog.t(
+            "status_bar.memory_full",
+            &[
+                ("app", &super::format_bytes(app_rss)),
+                ("sessions", &super::format_bytes(session_rss)),
+            ],
         )
     }
 }
@@ -655,15 +736,17 @@ fn service_status_light(
     name: &str,
     provider: Option<&ProviderStatus>,
     page_url: &str,
+    catalog: &i18n::Catalog,
 ) {
     status_dot(ui, indicator_color(ui, provider));
     let hover = match provider {
         Some(p) => p.description.clone(),
-        None => "상태 확인 중…".to_owned(),
+        None => catalog.t("status_bar.service_checking", &[]),
     };
+    let click = catalog.t("status_bar.service_click", &[("url", page_url)]);
     let label = ui
         .add(egui::Label::new(egui::RichText::new(name).weak()).sense(egui::Sense::click()))
-        .on_hover_text(format!("{hover}\n클릭: {page_url}"));
+        .on_hover_text(format!("{hover}\n{click}"));
     if label.clicked() {
         ui.ctx().open_url(egui::OpenUrl::new_tab(page_url));
     }
@@ -727,11 +810,12 @@ mod tests {
 
     #[test]
     fn memory_label_은_좁은_폭에서_앱_값만_남긴다() {
+        let catalog = i18n::Catalog::load("ko-KR").expect("ko-KR catalog");
         let mib = 1024 * 1024;
-        let full = memory_label(150 * mib, 3 * 1024 * mib, false);
+        let full = memory_label(&catalog, 150 * mib, 3 * 1024 * mib, false);
         assert!(full.contains("앱") && full.contains("세션"), "{full}");
         // 좁은 폭에서는 좌측 카운터를 덮지 않게 세션 합을 hover로 내린다(codex P2).
-        let compact = memory_label(150 * mib, 3 * 1024 * mib, true);
+        let compact = memory_label(&catalog, 150 * mib, 3 * 1024 * mib, true);
         assert!(
             compact.contains("앱") && !compact.contains("세션"),
             "{compact}"

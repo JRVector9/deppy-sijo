@@ -1331,6 +1331,12 @@ pub struct App {
     /// 전환으로 background 정리 중인 옛 워커 shutdown 스레드들 (workspace_id, handle).
     /// 앱 종료 시 join(자식 reap 보장) + 같은 workspace 재오픈 전 직렬화(layout 경합 방지).
     pending_shutdowns: Vec<(String, std::thread::JoinHandle<()>)>,
+    /// 사이드바 「워크스페이스 종료」로 숨긴 워크스페이스 → 종료 시점에 닫히던 pane id들.
+    /// 종료 ≠ 삭제(DB·경로·별칭 보존) — 사이드바 목록에서만 감춘다(2026-07-18 사용자 요구).
+    /// 값의 pane 집합은 활성 종료 직후 몇 프레임 동안 mux에 남는 "죽어가는 pane"을 새
+    /// 세션과 구분하는 기준 — 기록에 없는 pane이 활성에 나타나면(새 셸/에이전트) 숨김을
+    /// 해제해 목록에 복귀시킨다. 명시적 전환(switch_workspace)·같은 폴더 재선택도 해제.
+    closed_workspaces: std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// remote TLS 서버 (켜져 있을 때만 Some). 활성 workspace worker와 별개의 전용 worker를 노출.
     remote: Option<RemoteTlsState>,
     /// remote 시작 실패 시 settings에 표시할 에러 (best-effort — 앱은 계속, 크래시 금지).
@@ -1651,6 +1657,7 @@ impl App {
             resumed_panes: std::collections::HashSet::new(),
             pending_focus: None,
             pending_shutdowns: Vec::new(),
+            closed_workspaces: std::collections::HashMap::new(),
             remote: None,
             remote_error: None,
             remote_reveal_token: false,
@@ -2954,6 +2961,9 @@ impl App {
     }
 
     fn switch_workspace(&mut self, target_id: &str) {
+        // 명시적 전환은 종료 숨김 해제 — 사용자가 다시 연 것이다(사이드바 행 클릭·
+        // 워크스페이스 순환·알림/에이전트 이동·같은 폴더 재선택 모두 이 경로).
+        self.closed_workspaces.remove(target_id);
         if target_id == self.active.id {
             return;
         }
@@ -3509,12 +3519,22 @@ impl App {
                 panes = panes.len(),
                 "워크스페이스 종료 — 활성 pane 일괄 닫기"
             );
+            // 종료 숨김 표식 — 닫히는 pane 집합을 기록한다. ClosePane은 비동기라 이
+            // pane들은 exit 이벤트가 돌아올 때까지 몇 프레임 mux에 남는데, 이 기록으로
+            // "죽어가는 pane"과 이후의 진짜 새 세션(숨김 해제 조건)을 구분한다.
+            self.closed_workspaces.insert(
+                workspace_id.to_owned(),
+                panes.iter().map(|pane| pane.0.clone()).collect(),
+            );
             for pane in panes {
                 self.active
                     .workspace_ui
                     .close_pane_now(&self.active.runtime, pane);
             }
         } else if self.warm.contains_key(workspace_id) {
+            // warm 종료는 runtime shutdown까지 동기로 끝난다 — 죽어가는 pane 추적 불필요.
+            self.closed_workspaces
+                .insert(workspace_id.to_owned(), std::collections::HashSet::new());
             // warm: 살아 있는 워커에 ClosePane을 모두 보낸 뒤 runtime을 내린다(idle 전환,
             // 프로젝트 삭제의 warm 종료 경로와 같은 순서). worker 루프는 shutdown 판정
             // 전에 큐 명령을 전부 소화하므로 pane 정리(persist layout 갱신)가 종료 전에
@@ -3555,6 +3575,9 @@ impl App {
         } else {
             // 확인 모달이 떠 있는 사이 auto-suspend 등으로 이미 내려간 경우 — 조용히
             // 지나가지 않고 로그로 남긴다(닫을 세션이 없으니 실행할 것도 없다).
+            // 사용자가 종료를 확정했으므로 숨김 표식은 동일하게 남긴다.
+            self.closed_workspaces
+                .insert(workspace_id.to_owned(), std::collections::HashSet::new());
             tracing::info!(
                 workspace = %workspace_id,
                 "워크스페이스 종료 생략 — 이미 비활성(세션 없음)"
@@ -4159,6 +4182,11 @@ impl App {
             Ok(list) => self.workspaces = list,
             Err(e) => tracing::warn!("workspace 목록 조회 실패: {e:#}"),
         }
+        // 종료 숨김 표식 정리 — 프로젝트 삭제 등으로 목록에서 사라진 id의 표식을 지워
+        // 유계로 유지한다(표식 자체는 세션 한정 in-memory).
+        let workspaces = &self.workspaces;
+        self.closed_workspaces
+            .retain(|id, _| workspaces.iter().any(|workspace| workspace.id == *id));
         let mut structured_threads = Vec::new();
         for workspace in &self.workspaces {
             match self.db.list_structured_threads(&workspace.id, false) {
@@ -5632,9 +5660,21 @@ impl eframe::App for App {
         self.update_session_alerts(&mut terminal_sessions);
         let pty_agent_surfaces = self.pty_agent_surfaces(&terminal_sessions);
         let active_workspace_id = self.active.id.clone();
+        // 종료 숨김 해제 — 종료 때 닫히던 pane이 아닌 **새** 세션이 활성에 나타나면
+        // (새 셸/에이전트) 목록에 복귀시킨다. 종료 직후 exit 이벤트를 기다리는 옛
+        // pane은 기록된 집합에 있어 해제 조건에 걸리지 않는다.
+        if let Some(closing) = self.closed_workspaces.get(&active_workspace_id)
+            && terminal_sessions
+                .iter()
+                .any(|entry| !closing.contains(&entry.pane.0))
+        {
+            self.closed_workspaces.remove(&active_workspace_id);
+        }
+        // 명시적으로 종료한 워크스페이스는 목록에서 숨긴다(DB는 보존 — 종료 ≠ 삭제).
         let sidebar_workspaces: Vec<_> = self
             .workspaces
             .iter()
+            .filter(|workspace| !self.closed_workspaces.contains_key(&workspace.id))
             .map(|workspace| {
                 let waiting_sessions: std::collections::HashSet<_> = self
                     .global_waiting
@@ -6542,7 +6582,25 @@ impl eframe::App for App {
             match decision {
                 Some(true) => {
                     self.ws_close_confirm = None;
+                    let was_active = close_id == self.active.id;
                     self.close_workspace_sessions(&close_id);
+                    // 활성을 종료하면 사이드바에서도 숨는다(closed_workspaces) — 남은
+                    // (숨김 아닌) 워크스페이스가 있으면 생성순 첫 항목으로 전환하고,
+                    // 없으면 활성인 채 빈 상태로 남아 사이드바가 빈 상태 CTA를 보인다.
+                    // switch_workspace가 warm 상한으로 거부하면(방금 닫은 pane의 exit
+                    // 이벤트가 아직 안 와 live로 집계될 수 있다) 활성 유지 — 기존
+                    // 상한 경고 모달이 사유를 안내한다.
+                    if was_active {
+                        let fallback = self
+                            .workspaces
+                            .iter()
+                            .map(|workspace| workspace.id.clone())
+                            .find(|id| *id != close_id && !self.closed_workspaces.contains_key(id));
+                        if let Some(id) = fallback {
+                            self.switch_workspace(&id);
+                            self.refresh_workspaces();
+                        }
+                    }
                 }
                 Some(false) => self.ws_close_confirm = None,
                 None => {}
@@ -7468,6 +7526,12 @@ impl eframe::App for App {
                     Err(e) => tracing::warn!("워크스페이스 생성 실패: {e:#}"),
                 }
             }
+        }
+        // 같은 폴더 재선택 등으로 대상이 **이미 활성**이면 아래 filter가 전환을 걸러
+        // switch_workspace의 숨김 해제가 안 돈다 — 여기서 명시적으로 해제해 종료로
+        // 숨긴 활성 워크스페이스도 목록에 복귀시킨다.
+        if let Some(id) = &ws_switch {
+            self.closed_workspaces.remove(id);
         }
         if let Some(id) = ws_switch.filter(|id| *id != self.active.id) {
             let switched_new = ws_created;

@@ -1173,6 +1173,8 @@ pub struct App {
     /// AI 서비스 상태 피드 수신(status.claude.com/openai — 5분 폴링 워커) + 최신
     /// 스냅샷. provider별 조회 실패(None)면 마지막 성공값을 유지한다.
     status_feed_rx: std::sync::mpsc::Receiver<crate::status_feed::StatusFeedSnapshot>,
+    /// 수동 갱신(홈 「AI 공지」 ⟳ 버튼) — 워커를 즉시 깨워 상태+공지 재조회.
+    status_feed_refresh: std::sync::mpsc::Sender<()>,
     status_feed: crate::status_feed::StatusFeedSnapshot,
     /// 공지 제목 번역 캐시(원문 → 로케일 번역) + 진행 중 일회성 번역 수신.
     /// LLM(claude CLI) 미연결·영어 로케일이면 항상 비어 있고 원문을 그대로 쓴다.
@@ -1459,6 +1461,7 @@ impl App {
         let env_secret_reveal_worker = EnvSecretRevealWorker::spawn(egui_ctx.clone());
         let dotenv_sync_worker =
             DotenvSyncWorker::spawn(db_path.clone(), redaction.clone(), egui_ctx.clone());
+        let status_feed_rx_channel = crate::status_feed::spawn(egui_ctx.clone());
 
         // main에서 CreationContext를 받자마자 이 설정으로 폰트를 이미 설치했다. sentinel로
         // 시작하면 첫 프레임에 15MB AppleGothic을 포함한 FontDefinitions를 다시 만들고
@@ -1525,7 +1528,8 @@ impl App {
             agent_terminal_ui: ui::agent_terminal::AgentTerminalUi::new(),
             activity_rows_cache: None,
             mcp_count_cache: None,
-            status_feed_rx: crate::status_feed::spawn(egui_ctx.clone()),
+            status_feed_rx: status_feed_rx_channel.0,
+            status_feed_refresh: status_feed_rx_channel.1,
             status_feed: crate::status_feed::StatusFeedSnapshot::default(),
             notice_translations: std::collections::HashMap::new(),
             notice_translate_rx: None,
@@ -5893,6 +5897,11 @@ impl eframe::App for App {
             }
             Some(ui::agent_terminal::HomeAction::Agents) => {
                 self.agent_sessions_ui.open();
+            }
+            Some(ui::agent_terminal::HomeAction::RefreshNotices) => {
+                // 워커를 즉시 깨워 상태+공지 강제 재조회 — 결과는 기존 스냅샷
+                // 채널로 돌아온다(추가 상태 불필요).
+                let _ = self.status_feed_refresh.send(());
             }
             None => {}
         }

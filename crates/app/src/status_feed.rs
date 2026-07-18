@@ -1,16 +1,19 @@
 //! AI 서비스 상태 피드 — status.claude.com / status.openai.com (Statuspage v2 JSON).
 //! 하단 상태바의 서비스 점등과 홈 「AI 공지」 카드(최신 인시던트 3건씩)가 쓴다
-//! (2026-07-18 사용자). 백그라운드 워커 1개가 5분마다 두 페이지를 폴링해 mpsc로
-//! 스냅샷을 보낸다 — UI 스레드 네트워크 금지 관례. 실패 시 해당 provider만 None
-//! (오프라인이어도 앱 동작 무영향, 표시만 "확인 불가").
+//! (2026-07-18 사용자). 백그라운드 워커 1개가 폴링해 mpsc로 스냅샷을 보낸다 —
+//! UI 스레드 네트워크 금지 관례. 주기는 이원화: **상태 점등 5분**(터미널 작업용
+//! 신선도), **공지 60분**(사용자 지정) + 홈의 수동 갱신 버튼(refresh 채널).
+//! 실패 시 해당 provider만 None (오프라인이어도 앱 동작 무영향).
 
-use std::sync::mpsc::Receiver;
-use std::time::Duration;
+use std::sync::mpsc::{Receiver, Sender};
+use std::time::{Duration, Instant};
 
 pub const CLAUDE_STATUS_URL: &str = "https://status.claude.com";
 pub const OPENAI_STATUS_URL: &str = "https://status.openai.com";
-/// 폴링 주기 — 상태 페이지 부하와 신선도의 절충(인시던트 대응 용도로 충분).
-const POLL_INTERVAL: Duration = Duration::from_secs(300);
+/// 상태(점등) 폴링 주기 — 장애 감지용이라 짧게 유지.
+const STATUS_INTERVAL: Duration = Duration::from_secs(300);
+/// 공지(인시던트 목록) 갱신 주기 (2026-07-18 사용자: 60분).
+const INCIDENTS_INTERVAL: Duration = Duration::from_secs(3600);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// 홈 공지 카드 수 (provider당, 2026-07-18 사용자: "최신 3개씩").
 const INCIDENTS_PER_PROVIDER: usize = 3;
@@ -63,52 +66,91 @@ pub struct StatusFeedSnapshot {
     pub openai: Option<ProviderStatus>,
 }
 
-/// 백그라운드 폴링 워커를 띄우고 수신 채널을 돌려준다. 앱 수명 내내 돈다 —
-/// App(수신측)이 드롭되면 send 실패로 스스로 종료한다.
-pub fn spawn(egui_ctx: egui::Context) -> Receiver<StatusFeedSnapshot> {
+/// 백그라운드 폴링 워커를 띄우고 (스냅샷 수신, 수동 갱신 송신) 채널 쌍을 돌려준다.
+/// 앱 수명 내내 돈다 — App(수신측)이 드롭되면 send 실패로 스스로 종료한다.
+/// 수동 갱신 신호가 오면 즉시 상태+공지를 모두 다시 가져온다.
+pub fn spawn(egui_ctx: egui::Context) -> (Receiver<StatusFeedSnapshot>, Sender<()>) {
     let (tx, rx) = std::sync::mpsc::channel();
+    let (refresh_tx, refresh_rx) = std::sync::mpsc::channel::<()>();
     let spawned = std::thread::Builder::new()
         .name("status-feed".into())
         .spawn(move || {
             let agent = ureq::builder().timeout(HTTP_TIMEOUT).build();
+            // 공지는 60분 주기 — 사이 틱에서는 마지막 성공 목록을 스냅샷에 실어
+            // 보낸다(상태만 갱신돼도 공지가 사라지지 않게).
+            let mut incidents_at: Option<Instant> = None;
+            let mut claude_incidents: Vec<IncidentNotice> = Vec::new();
+            let mut openai_incidents: Vec<IncidentNotice> = Vec::new();
             loop {
+                let incidents_due =
+                    incidents_at.is_none_or(|at| at.elapsed() >= INCIDENTS_INTERVAL);
+                if incidents_due {
+                    if let Ok(list) = fetch_incidents(&agent, CLAUDE_STATUS_URL)
+                        .map_err(|e| tracing::debug!("Claude 공지 조회 실패: {e:#}"))
+                    {
+                        claude_incidents = list;
+                    }
+                    if let Ok(list) = fetch_incidents(&agent, OPENAI_STATUS_URL)
+                        .map_err(|e| tracing::debug!("OpenAI 공지 조회 실패: {e:#}"))
+                    {
+                        openai_incidents = list;
+                    }
+                    incidents_at = Some(Instant::now());
+                }
                 let snapshot = StatusFeedSnapshot {
-                    claude: fetch_provider(&agent, CLAUDE_STATUS_URL)
+                    claude: fetch_status(&agent, CLAUDE_STATUS_URL)
                         .map_err(|e| tracing::debug!("Claude 상태 조회 실패: {e:#}"))
-                        .ok(),
-                    openai: fetch_provider(&agent, OPENAI_STATUS_URL)
+                        .ok()
+                        .map(|(indicator, description)| ProviderStatus {
+                            indicator,
+                            description,
+                            incidents: claude_incidents.clone(),
+                        }),
+                    openai: fetch_status(&agent, OPENAI_STATUS_URL)
                         .map_err(|e| tracing::debug!("OpenAI 상태 조회 실패: {e:#}"))
-                        .ok(),
+                        .ok()
+                        .map(|(indicator, description)| ProviderStatus {
+                            indicator,
+                            description,
+                            incidents: openai_incidents.clone(),
+                        }),
                 };
                 if tx.send(snapshot).is_err() {
                     return; // App 종료
                 }
                 egui_ctx.request_repaint();
-                std::thread::sleep(POLL_INTERVAL);
+                // 상태 주기만큼 대기하되, 수동 갱신 신호가 오면 즉시 깨어나
+                // 공지까지 강제 재조회한다(recv_timeout이 sleep 역할).
+                match refresh_rx.recv_timeout(STATUS_INTERVAL) {
+                    Ok(()) => {
+                        while refresh_rx.try_recv().is_ok() {} // 연타 병합
+                        incidents_at = None;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                }
             }
         });
     if let Err(e) = spawned {
         tracing::warn!("status-feed 워커 spawn 실패: {e}");
     }
-    rx
+    (rx, refresh_tx)
 }
 
-fn fetch_provider(agent: &ureq::Agent, base: &str) -> anyhow::Result<ProviderStatus> {
+fn fetch_status(agent: &ureq::Agent, base: &str) -> anyhow::Result<(ServiceIndicator, String)> {
     let status_json = agent
         .get(&format!("{base}/api/v2/status.json"))
         .call()?
         .into_string()?;
-    let (indicator, description) = parse_status(&status_json)?;
+    parse_status(&status_json)
+}
+
+fn fetch_incidents(agent: &ureq::Agent, base: &str) -> anyhow::Result<Vec<IncidentNotice>> {
     let incidents_json = agent
         .get(&format!("{base}/api/v2/incidents.json"))
         .call()?
         .into_string()?;
-    let incidents = parse_incidents(&incidents_json, base)?;
-    Ok(ProviderStatus {
-        indicator,
-        description,
-        incidents,
-    })
+    parse_incidents(&incidents_json, base)
 }
 
 /// `/api/v2/status.json` → (indicator, description).

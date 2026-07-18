@@ -21,6 +21,8 @@ pub enum HomeAction {
     Inbox,
     Activity,
     Agents,
+    /// 「AI 공지」 수동 갱신(⟳) — App이 status_feed 워커를 즉시 깨운다.
+    RefreshNotices,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -90,7 +92,9 @@ impl AgentTerminalUi {
                     .inner_margin(egui::Margin::same(22))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        self.announcements(ui, feed, translations);
+                        if self.announcements(ui, feed, translations) {
+                            action = Some(HomeAction::RefreshNotices);
+                        }
                         ui.add_space(14.0);
                         if let Some(next) = orchestration_insights(ui, totals, metrics) {
                             action = Some(next);
@@ -181,12 +185,14 @@ impl AgentTerminalUi {
         );
     }
 
+    /// 반환: 수동 갱신(⟳) 클릭 여부.
     fn announcements(
         &mut self,
         ui: &mut egui::Ui,
         feed: &StatusFeedSnapshot,
         translations: &std::collections::HashMap<String, String>,
-    ) {
+    ) -> bool {
+        let mut refresh_clicked = false;
         let panel = egui::Frame::NONE
             .fill(ui.visuals().panel_fill)
             .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
@@ -216,7 +222,14 @@ impl AgentTerminalUi {
                     AnnouncementFilter::Anthropic,
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak("status.claude.com · status.openai.com — 5분마다 갱신");
+                    if ui
+                        .small_button("⟳")
+                        .on_hover_text("지금 갱신 (공지는 60분마다 자동 갱신)")
+                        .clicked()
+                    {
+                        refresh_clicked = true;
+                    }
+                    ui.weak("status.claude.com · status.openai.com — 60분마다 갱신");
                 });
             });
             ui.add_space(12.0);
@@ -271,6 +284,7 @@ impl AgentTerminalUi {
                 }
             }
         });
+        refresh_clicked
     }
 }
 

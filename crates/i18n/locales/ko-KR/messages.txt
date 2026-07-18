@@ -480,6 +480,7 @@ file_tree.edit_workspace_path_hint = 환경 메뉴 › 프로젝트 폴더에서
 file_tree.new_folder_label = 새 폴더:
 file_tree.location = 위치: {path}
 file_tree.new_folder_root = 새 폴더 (루트)
+file_tree.new_file_root = 새 파일 (루트)
 file_tree.new_folder_inside = 새 폴더 (이 안에)
 file_tree.new_folder_alongside = 새 폴더 (같은 위치)
 file_tree.rename = 이름 변경

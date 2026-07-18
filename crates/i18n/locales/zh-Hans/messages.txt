@@ -480,6 +480,7 @@ file_tree.edit_workspace_path_hint = 在 环境 › 项目文件夹 中设置
 file_tree.new_folder_label = 新建文件夹：
 file_tree.location = 位置：{path}
 file_tree.new_folder_root = 新建文件夹（根）
+file_tree.new_file_root = 新建文件（根）
 file_tree.new_folder_inside = 新建文件夹（内部）
 file_tree.new_folder_alongside = 新建文件夹（相同位置）
 file_tree.rename = 重命名

@@ -480,6 +480,7 @@ file_tree.edit_workspace_path_hint = Set it in Environment › Project folder
 file_tree.new_folder_label = New folder:
 file_tree.location = Location: {path}
 file_tree.new_folder_root = New folder (root)
+file_tree.new_file_root = New file (root)
 file_tree.new_folder_inside = New folder (inside)
 file_tree.new_folder_alongside = New folder (same location)
 file_tree.rename = Rename

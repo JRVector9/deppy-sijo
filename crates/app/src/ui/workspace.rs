@@ -91,38 +91,38 @@ fn paint_terminal_toolbar_icon(
     let center = rect.center();
     match icon {
         TerminalToolbarIcon::Search => {
-            let lens = center + egui::vec2(-2.0, -2.0);
-            painter.circle_stroke(lens, 6.5, stroke);
+            let lens = center + egui::vec2(-0.9, -0.9);
+            painter.circle_stroke(lens, 3.2, stroke);
             painter.line_segment(
-                [lens + egui::vec2(4.8, 4.8), lens + egui::vec2(9.0, 9.0)],
+                [lens + egui::vec2(2.3, 2.3), lens + egui::vec2(4.5, 4.5)],
                 stroke,
             );
         }
         TerminalToolbarIcon::NewTerminal => {
-            let body = egui::Rect::from_center_size(center, egui::vec2(20.0, 16.0));
-            painter.rect_stroke(body, 1.5, stroke, egui::StrokeKind::Inside);
+            let body = egui::Rect::from_center_size(center, egui::vec2(9.0, 7.0));
+            painter.rect_stroke(body, 0.75, stroke, egui::StrokeKind::Inside);
             painter.line_segment(
                 [
-                    center + egui::vec2(-6.0, -3.0),
-                    center + egui::vec2(-2.5, 0.0),
+                    center + egui::vec2(-2.8, -1.5),
+                    center + egui::vec2(-1.2, 0.0),
                 ],
                 stroke,
             );
             painter.line_segment(
                 [
-                    center + egui::vec2(-2.5, 0.0),
-                    center + egui::vec2(-6.0, 3.0),
+                    center + egui::vec2(-1.2, 0.0),
+                    center + egui::vec2(-2.8, 1.5),
                 ],
                 stroke,
             );
             painter.line_segment(
-                [center + egui::vec2(0.0, 4.0), center + egui::vec2(6.0, 4.0)],
+                [center + egui::vec2(0.0, 2.0), center + egui::vec2(2.7, 2.0)],
                 stroke,
             );
         }
         TerminalToolbarIcon::SplitColumns | TerminalToolbarIcon::SplitRows => {
-            let body = egui::Rect::from_center_size(center, egui::vec2(18.0, 18.0));
-            painter.rect_stroke(body, 1.5, stroke, egui::StrokeKind::Inside);
+            let body = egui::Rect::from_center_size(center, egui::vec2(9.0, 9.0));
+            painter.rect_stroke(body, 0.75, stroke, egui::StrokeKind::Inside);
             match icon {
                 TerminalToolbarIcon::SplitColumns => {
                     painter.vline(center.x, body.y_range(), stroke);
@@ -1377,7 +1377,7 @@ impl WorkspaceUi {
         let toolbar_left = header.right() - 4.0 - toolbar_width;
         let center_y = header.center().y;
 
-        let close_center_x = (title_left + title_width + 11.0)
+        let close_center_x = (title_left + title_width + 14.0)
             .min(toolbar_left - 11.0)
             .max(title_left + 8.0);
         let close = egui::Rect::from_center_size(
@@ -1419,7 +1419,7 @@ impl WorkspaceUi {
             egui::Color32::from_rgb(0x72, 0x76, 0x80)
         };
         ui.painter()
-            .circle_filled(egui::pos2(header.left() + 7.0, center_y), 4.0, status_color);
+            .circle_filled(egui::pos2(header.left() + 8.0, center_y), 4.0, status_color);
 
         let title_right = (close.left() - 3.0).max(title_left);
         let title_clip = egui::Rect::from_min_max(

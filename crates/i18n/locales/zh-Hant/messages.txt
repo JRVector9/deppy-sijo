@@ -480,6 +480,7 @@ file_tree.edit_workspace_path_hint = 在 環境 › 專案資料夾 中設定
 file_tree.new_folder_label = 新增資料夾：
 file_tree.location = 位置：{path}
 file_tree.new_folder_root = 新增資料夾（根）
+file_tree.new_file_root = 新增檔案（根）
 file_tree.new_folder_inside = 新增資料夾（內部）
 file_tree.new_folder_alongside = 新增資料夾（相同位置）
 file_tree.rename = 重新命名

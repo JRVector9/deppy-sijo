@@ -5327,6 +5327,48 @@ impl eframe::App for App {
             view: self.agent_terminal_ui.view(),
             inbox_count,
         };
+
+        // 500ms 캐시에서 꺼내 쓰고 프레임 끝에 되돌린다(take/put-back) — 참조로 들면
+        // 아래 render_composer_dock(&mut self)와 빌림이 충돌한다. 상태 스트립은
+        // 사이드바보다 먼저 선언해야 좌측 도크 아래까지 창 전체 폭을 차지한다.
+        const ACTIVITY_ROWS_TTL: std::time::Duration = std::time::Duration::from_millis(500);
+        let (activity_rows_stamp, activity_rows) = match self.activity_rows_cache.take() {
+            Some((at, rows)) if at.elapsed() <= ACTIVITY_ROWS_TTL => {
+                // 만료 시점 리프레시 예약 — 이벤트가 TTL 안에 몰리고 그 뒤 프레임이
+                // 없으면 stale 표시가 다음 무관한 wake까지 남는다(codex P2). 캐시를
+                // 새로 지은 프레임은 예약하지 않으므로 자가 반복 repaint 루프는 없다.
+                ui.ctx()
+                    .request_repaint_after(ACTIVITY_ROWS_TTL.saturating_sub(at.elapsed()));
+                (at, rows)
+            }
+            _ => (std::time::Instant::now(), self.activity_rows()),
+        };
+        let waiting_count = self.approvals_ui.pending().len() + self.global_waiting.len();
+        // 활성 MCP 서버 수 — 30s TTL 캐시 (하단 상태바 「MCP N」, 2026-07-18 사용자).
+        let mcp_count = match self.mcp_count_cache {
+            Some((at, count)) if at.elapsed() <= std::time::Duration::from_secs(30) => count,
+            _ => {
+                let count = self
+                    .db
+                    .list_mcp_servers()
+                    .map(|servers| servers.iter().filter(|server| server.enabled).count())
+                    .unwrap_or(0);
+                self.mcp_count_cache = Some((std::time::Instant::now(), count));
+                count
+            }
+        };
+        egui::Panel::bottom("agent_terminal_status_bar")
+            .resizable(false)
+            .exact_size(26.0)
+            .frame(
+                egui::Frame::side_top_panel(&ui.ctx().global_style())
+                    .inner_margin(egui::Margin::ZERO),
+            )
+            .show(ui, |ui| {
+                self.agent_terminal_ui
+                    .status_bar(ui, &activity_rows, waiting_count, mcp_count);
+            });
+
         if self.file_tree.is_some() {
             let sidebar_action = self
                 .file_tree
@@ -5732,50 +5774,6 @@ impl eframe::App for App {
                 .workspace_ui
                 .update_hidden(ui.ctx(), &self.active.runtime, &events, &text);
         }
-        // 500ms 캐시에서 꺼내 쓰고 프레임 끝에 되돌린다(take/put-back) — 참조로 들면
-        // 아래 render_composer_dock(&mut self)와 빌림이 충돌한다. 매 프레임 전체
-        // 재조립(String/Vec, 타이핑 중 60~120fps)을 피하는 게 목적. 리소스 샘플
-        // 주기(2s)보다 짧아 표시 신선도는 충분하다.
-        const ACTIVITY_ROWS_TTL: std::time::Duration = std::time::Duration::from_millis(500);
-        let (activity_rows_stamp, activity_rows) = match self.activity_rows_cache.take() {
-            Some((at, rows)) if at.elapsed() <= ACTIVITY_ROWS_TTL => {
-                // 만료 시점 리프레시 예약 — 이벤트가 TTL 안에 몰리고 그 뒤 프레임이
-                // 없으면 stale 표시가 다음 무관한 wake까지 남는다(codex P2). 캐시를
-                // 새로 지은 프레임은 예약하지 않으므로 자가 반복 repaint 루프는 없다
-                // (유휴 = 프레임 없음 = 예약 없음, 비용-0 계약 유지).
-                ui.ctx()
-                    .request_repaint_after(ACTIVITY_ROWS_TTL.saturating_sub(at.elapsed()));
-                (at, rows)
-            }
-            _ => (std::time::Instant::now(), self.activity_rows()),
-        };
-        let waiting_count = self.approvals_ui.pending().len() + self.global_waiting.len();
-        // 활성 MCP 서버 수 — 30s TTL 캐시 (하단 상태바 「MCP N」, 2026-07-18 사용자).
-        let mcp_count = match self.mcp_count_cache {
-            Some((at, count)) if at.elapsed() <= std::time::Duration::from_secs(30) => count,
-            _ => {
-                let count = self
-                    .db
-                    .list_mcp_servers()
-                    .map(|servers| servers.iter().filter(|server| server.enabled).count())
-                    .unwrap_or(0);
-                self.mcp_count_cache = Some((std::time::Instant::now(), count));
-                count
-            }
-        };
-        // 목업의 전역 상태 스트립. 가장 먼저 bottom panel로 선언해 창 최하단에 고정하고,
-        // 컴포저는 그 위에 쌓는다.
-        egui::Panel::bottom("agent_terminal_status_bar")
-            .resizable(false)
-            .exact_size(26.0)
-            .frame(
-                egui::Frame::side_top_panel(&ui.ctx().global_style())
-                    .inner_margin(egui::Margin::ZERO),
-            )
-            .show(ui, |ui| {
-                self.agent_terminal_ui
-                    .status_bar(ui, &activity_rows, waiting_count, mcp_count);
-            });
 
         // 컴포저는 터미널 표면에만 붙는다. 홈은 전체 폭 대시보드가 남은 중앙 영역을 쓴다.
         if !home_visible && self.config.ui.composer_enabled {

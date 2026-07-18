@@ -480,6 +480,7 @@ file_tree.edit_workspace_path_hint = 環境メニュー › プロジェクト�
 file_tree.new_folder_label = 新しいフォルダ:
 file_tree.location = 場所: {path}
 file_tree.new_folder_root = 新しいフォルダ (ルート)
+file_tree.new_file_root = 新しいファイル (ルート)
 file_tree.new_folder_inside = 新しいフォルダ (この中)
 file_tree.new_folder_alongside = 新しいフォルダ (同じ場所)
 file_tree.rename = 名前変更

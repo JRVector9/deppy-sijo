@@ -22,7 +22,7 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 regex = { workspace = true }
 serde_json = { workspace = true }
-# AI 서비스 상태 피드(status.claude.com/status.openai.com) 폴링 — sync ureq만
+# AI 서비스 상태 피드(status_feed) + 로컬 LLM 감지(local_llm) — sync ureq만
 # (tokio 금지 관례, auth/mcp/web-remote와 동일 클라이언트).
 ureq = { workspace = true }
 toml = { workspace = true }
@@ -37,8 +37,6 @@ arboard = { workspace = true }
 image = { workspace = true }
 # 모바일 웹 페어링 QR (mobile-pwa v3.3 P1) — 접속 URL을 egui 텍스처로 렌더
 qrcode = { workspace = true }
-# 로컬 LLM 감지 (PR-L1) — ollama/OpenAI 호환 endpoint 모델 목록 조회 (sync, tokio 금지 관례)
-ureq = { workspace = true }
 # 프로젝트 폴더 선택 네이티브 다이얼로그 (환경 메뉴 — 워크스페이스 path 지정, 2026-07-08)
 rfd = "0.15"
 audit = { path = "../audit" }

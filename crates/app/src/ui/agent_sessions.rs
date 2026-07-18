@@ -16,8 +16,10 @@ use crate::agent_surface::{
 };
 use crate::codex_app_server::{
     CodexAppServerClient, CodexAppServerEvent, CodexAppServerOptions, CodexAppServerReply,
-    CodexModelCatalogReply, CodexModelInfo, CodexSkillCatalogReply, CodexSkillInfo,
+    CodexLlmOverride, CodexModelCatalogReply, CodexModelInfo, CodexSkillCatalogReply,
+    CodexSkillInfo, codex_llm_override_from_config, validate_llm_base_url,
 };
+use crate::config::AgentsConfig;
 use storage::StructuredThreadRow;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +132,11 @@ pub struct AgentSessionsUi {
     pending_skill_catalog: Option<CodexSkillCatalogReply>,
     catalog_error: Option<String>,
     text_input_ids: Vec<egui::Id>,
+    /// config에서 동기화한 LLM 프로바이더 오버라이드 (PR-L2) — ensure_client가 spawn 시
+    /// 사용한다. Err = 잘못된 설정(예: custom인데 base URL 없음) — spawn을 명확히 중단.
+    llm_override: Result<Option<CodexLlmOverride>, String>,
+    /// 현재 client가 spawn될 때 적용한 오버라이드 — 설정 변경 시 유휴 재시작 판단용.
+    client_llm_override: Option<CodexLlmOverride>,
 }
 
 impl AgentSessionsUi {
@@ -162,6 +169,8 @@ impl AgentSessionsUi {
             pending_skill_catalog: None,
             catalog_error: None,
             text_input_ids: Vec::new(),
+            llm_override: Ok(None),
+            client_llm_override: None,
         }
     }
 
@@ -625,10 +634,42 @@ impl AgentSessionsUi {
         if self.client.is_some() {
             return Ok(());
         }
-        let client = CodexAppServerClient::spawn(CodexAppServerOptions::default(), ctx.clone())?;
+        // 잘못된 프로바이더 설정으로는 spawn하지 않는다 — 기본 프로바이더로 조용히
+        // 폴백하면 사용자가 명시한 로컬 LLM 선택이 무력화된다 (PR-L2).
+        let llm_override = match &self.llm_override {
+            Ok(value) => value.clone(),
+            Err(message) => anyhow::bail!("LLM 프로바이더 설정 오류: {message}"),
+        };
+        let options = CodexAppServerOptions {
+            llm_override: llm_override.clone(),
+            ..CodexAppServerOptions::default()
+        };
+        let client = CodexAppServerClient::spawn(options, ctx.clone())?;
         self.transport_error = None;
         self.client = Some(client);
+        self.client_llm_override = llm_override;
         Ok(())
+    }
+
+    /// config → LLM 프로바이더 오버라이드 동기화 (매 프레임, PR-L2). 프로바이더는
+    /// 프로세스 argv라 살아 있는 app-server에는 적용되지 않는다 — 진행 중 작업이
+    /// 전혀 없으면 기존 shutdown 경로로 client를 내려 다음 실행부터 새 설정을 쓴다.
+    fn sync_llm_config(&mut self, agents_config: &AgentsConfig) {
+        self.llm_override = codex_llm_override_from_config(
+            agents_config.codex_llm_provider.as_deref(),
+            agents_config.codex_llm_base_url.as_deref(),
+        )
+        .map_err(|error| format!("{error:#}"));
+        let Ok(target) = &self.llm_override else {
+            return;
+        };
+        let idle = self.sessions.iter().all(|s| s.status.is_terminal())
+            && self.pending_thread_requests.is_empty()
+            && self.pending_model_catalog.is_none()
+            && self.pending_skill_catalog.is_none();
+        if self.client.is_some() && &self.client_llm_override != target && idle {
+            self.shutdown();
+        }
     }
 
     fn request_catalogs(
@@ -963,7 +1004,10 @@ impl AgentSessionsUi {
         workspace_id: &str,
         workspace_cwd: Option<String>,
         pty_surfaces: Vec<AgentSurfaceSnapshot>,
+        agents_config: &mut AgentsConfig,
     ) -> Vec<AgentSessionsRequest> {
+        // 창이 닫혀 있어도 동기화 — App 단축키 경로의 ensure_client도 최신 설정을 쓴다.
+        self.sync_llm_config(agents_config);
         self.pty_surfaces = pty_surfaces;
         if matches!(self.selected_surface, Some(AgentSurfaceId::Pty { .. }))
             && !self
@@ -1035,7 +1079,7 @@ impl AgentSessionsUi {
                         ui.weak("카탈로그 응답 대기 중…");
                     }
                 });
-                self.render_agent_controls(ui, &mut text_input_ids);
+                self.render_agent_controls(ui, &mut text_input_ids, agents_config);
                 let prompt_response = ui.add_sized(
                     [ui.available_width(), 72.0],
                     egui::TextEdit::multiline(&mut self.new_prompt)
@@ -1125,7 +1169,12 @@ impl AgentSessionsUi {
         requests
     }
 
-    fn render_agent_controls(&mut self, ui: &mut egui::Ui, text_input_ids: &mut Vec<egui::Id>) {
+    fn render_agent_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        text_input_ids: &mut Vec<egui::Id>,
+        agents_config: &mut AgentsConfig,
+    ) {
         let models = self.model_catalog.clone();
         let selected_model = models
             .iter()
@@ -1192,6 +1241,8 @@ impl AgentSessionsUi {
             }
         });
 
+        self.render_llm_provider_controls(ui, text_input_ids, agents_config);
+
         if !self.skill_catalog.is_empty() {
             let skills = self.skill_catalog.clone();
             egui::CollapsingHeader::new(format!(
@@ -1220,6 +1271,67 @@ impl AgentSessionsUi {
                     }
                 }
             });
+        }
+    }
+
+    /// LLM 프로바이더 선택 (PR-L2): 기본(구독/기존 codex 설정) / 로컬 OSS (ollama) /
+    /// 커스텀 OpenAI 호환. 값은 config에 저장되고 다음 app-server spawn부터 적용된다.
+    fn render_llm_provider_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        text_input_ids: &mut Vec<egui::Id>,
+        agents_config: &mut AgentsConfig,
+    ) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("LLM 프로바이더");
+            // 콤보 닫힌 상태 표시용 복제 — 닫힌 뒤 클릭 반영은 아래에서 config에 쓴다.
+            let selected = agents_config.codex_llm_provider.clone();
+            let selected = selected.as_deref();
+            egui::ComboBox::from_id_salt("agent-llm-provider")
+                .selected_text(llm_provider_label(selected))
+                .show_ui(ui, |ui| {
+                    for value in [None, Some("oss"), Some("custom")] {
+                        if ui
+                            .selectable_label(selected == value, llm_provider_label(value))
+                            .clicked()
+                        {
+                            agents_config.codex_llm_provider = value.map(str::to_owned);
+                        }
+                    }
+                });
+            if agents_config.codex_llm_provider.as_deref() == Some("custom") {
+                ui.label("base URL");
+                let mut base_url = agents_config.codex_llm_base_url.clone().unwrap_or_default();
+                let response = ui.add_sized(
+                    [240.0, 24.0],
+                    egui::TextEdit::singleline(&mut base_url)
+                        .hint_text("http://localhost:11434/v1")
+                        .font(egui::TextStyle::Monospace),
+                );
+                text_input_ids.push(response.id);
+                if response.changed() {
+                    // 공백/제어문자는 argv `-c` 오설정이 되므로 입력 단계에서 거부한다
+                    // (validate_mcp_config_flag 내부 공백 거부와 동일 관례). 빈값은 None.
+                    if base_url.trim().is_empty() {
+                        agents_config.codex_llm_base_url = None;
+                    } else if let Ok(valid) = validate_llm_base_url(&base_url) {
+                        agents_config.codex_llm_base_url = Some(valid);
+                    }
+                }
+            }
+        });
+        if agents_config.codex_llm_provider.as_deref() == Some("custom")
+            && agents_config.codex_llm_base_url.is_none()
+        {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "커스텀 프로바이더는 base URL이 필요합니다 (공백/제어문자 불가)",
+            );
+        }
+        // 프로바이더는 프로세스 레벨이라 살아 있는 app-server에는 적용되지 않는다.
+        // 유휴 상태면 sync_llm_config가 자동으로 내렸다가 다음 실행에 반영한다.
+        if agents_config.codex_llm_provider.is_some() {
+            ui.weak("프로바이더 설정은 다음 Codex 실행부터 적용됩니다.");
         }
     }
 
@@ -2148,6 +2260,17 @@ fn non_empty(value: String) -> Option<String> {
     (!value.trim().is_empty()).then_some(value)
 }
 
+/// LLM 프로바이더 콤보 표시 문자열 (PR-L2). 미지값은 config 로드 정규화가 막지만
+/// 방어적으로 원문을 그대로 보여준다.
+fn llm_provider_label(provider: Option<&str>) -> &str {
+    match provider {
+        None => "기본 (구독/기존 설정)",
+        Some("oss") => "로컬 OSS (ollama)",
+        Some("custom") => "커스텀 (OpenAI 호환)",
+        Some(other) => other,
+    }
+}
+
 fn short_id(value: &str) -> String {
     value.chars().take(8).collect()
 }
@@ -2237,6 +2360,58 @@ mod tests {
             command: Some("cargo test".to_owned()),
             cwd: None,
         }
+    }
+
+    #[test]
+    fn sync_llm_config는_config를_오버라이드로_반영한다() {
+        let mut ui = AgentSessionsUi::new();
+        // 기본: 오버라이드 없음.
+        ui.sync_llm_config(&AgentsConfig::default());
+        assert_eq!(ui.llm_override, Ok(None));
+        // oss / custom 반영.
+        ui.sync_llm_config(&AgentsConfig {
+            codex_llm_provider: Some("oss".to_owned()),
+            codex_llm_base_url: None,
+        });
+        assert_eq!(ui.llm_override, Ok(Some(CodexLlmOverride::Oss)));
+        ui.sync_llm_config(&AgentsConfig {
+            codex_llm_provider: Some("custom".to_owned()),
+            codex_llm_base_url: Some("http://localhost:11434/v1".to_owned()),
+        });
+        assert_eq!(
+            ui.llm_override,
+            Ok(Some(CodexLlmOverride::Custom {
+                base_url: "http://localhost:11434/v1".to_owned()
+            }))
+        );
+        // custom인데 base URL 없음 → Err (spawn 차단 사유 보존).
+        ui.sync_llm_config(&AgentsConfig {
+            codex_llm_provider: Some("custom".to_owned()),
+            codex_llm_base_url: None,
+        });
+        assert!(ui.llm_override.is_err());
+    }
+
+    #[test]
+    fn 잘못된_llm_설정은_ensure_client가_spawn_전에_거부한다() {
+        let mut ui = AgentSessionsUi::new();
+        ui.sync_llm_config(&AgentsConfig {
+            codex_llm_provider: Some("custom".to_owned()),
+            codex_llm_base_url: None,
+        });
+        let ctx = egui::Context::default();
+        let error = ui.ensure_client(&ctx).unwrap_err();
+        assert!(format!("{error:#}").contains("LLM 프로바이더 설정 오류"));
+        assert!(ui.client.is_none());
+    }
+
+    #[test]
+    fn llm_provider_라벨_매핑() {
+        assert_eq!(llm_provider_label(None), "기본 (구독/기존 설정)");
+        assert_eq!(llm_provider_label(Some("oss")), "로컬 OSS (ollama)");
+        assert_eq!(llm_provider_label(Some("custom")), "커스텀 (OpenAI 호환)");
+        // 미지값은 방어적으로 원문 표시 (config 로드 정규화가 1차 방어선).
+        assert_eq!(llm_provider_label(Some("weird")), "weird");
     }
 
     #[test]

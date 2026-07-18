@@ -29,6 +29,9 @@ pub struct CodexAppServerOptions {
     pub client_name: String,
     pub client_title: String,
     pub client_version: String,
+    /// 로컬 LLM 프로바이더 오버라이드 (PR-L2). None = 기본(구독/기존 codex 설정).
+    /// 프로세스 argv `-c` 오버라이드라 spawn 시점에만 적용된다.
+    pub llm_override: Option<CodexLlmOverride>,
 }
 
 impl Default for CodexAppServerOptions {
@@ -38,8 +41,86 @@ impl Default for CodexAppServerOptions {
             client_name: "deppy_sijo".to_owned(),
             client_title: "Deppy Sijo".to_owned(),
             client_version: env!("CARGO_PKG_VERSION").to_owned(),
+            llm_override: None,
         }
     }
+}
+
+/// Agents(APP) Codex의 로컬 LLM 프로바이더 오버라이드 (PR-L2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexLlmOverride {
+    /// 로컬 OSS (ollama) — codex 내장 oss 프로바이더.
+    Oss,
+    /// OpenAI 호환 커스텀 엔드포인트 (chat wire API).
+    Custom { base_url: String },
+}
+
+/// config 문자열 → 오버라이드. custom인데 base URL이 없거나 잘못되면 Err —
+/// 사용자가 명시한 프로바이더를 조용히 기본으로 폴백하지 않는다(권한계층 관례와 동일).
+pub fn codex_llm_override_from_config(
+    provider: Option<&str>,
+    base_url: Option<&str>,
+) -> anyhow::Result<Option<CodexLlmOverride>> {
+    match provider {
+        None => Ok(None),
+        Some("oss") => Ok(Some(CodexLlmOverride::Oss)),
+        Some("custom") => {
+            let base_url = base_url
+                .ok_or_else(|| anyhow::anyhow!("custom 프로바이더는 base URL이 필요합니다"))?;
+            Ok(Some(CodexLlmOverride::Custom {
+                base_url: validate_llm_base_url(base_url)?,
+            }))
+        }
+        Some(other) => anyhow::bail!("알 수 없는 LLM 프로바이더: {other}"),
+    }
+}
+
+/// base URL 검증 — 단일 argv `-c key=value`로 들어가므로 내부 공백/제어문자가 있으면
+/// 한 덩어리 오설정이 된다 (agents.rs validate_mcp_config_flag 공백 거부와 동일 관례).
+pub fn validate_llm_base_url(raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    anyhow::ensure!(!trimmed.is_empty(), "base URL이 비어 있습니다");
+    anyhow::ensure!(
+        !trimmed.contains(char::is_whitespace),
+        "base URL에 공백을 넣을 수 없습니다"
+    );
+    anyhow::ensure!(
+        !trimmed.contains(char::is_control),
+        "base URL에 제어문자를 넣을 수 없습니다"
+    );
+    Ok(trimmed.to_owned())
+}
+
+/// `codex app-server` spawn argv 조립 (순수 함수 — 단위 테스트 가능하게).
+/// 기본 `app-server --listen stdio://` 뒤에 프로바이더 `-c` 오버라이드를 붙인다.
+/// FLAG: `-c` 키 형식(model_provider / model_providers.*)은 오프라인 지식 기반 —
+/// 실기기 codex로 미검증(통합 단계에서 실검증 예정).
+fn codex_app_server_args(llm_override: Option<&CodexLlmOverride>) -> anyhow::Result<Vec<String>> {
+    let mut args: Vec<String> = ["app-server", "--listen", "stdio://"]
+        .map(str::to_owned)
+        .into();
+    match llm_override {
+        None => {}
+        Some(CodexLlmOverride::Oss) => {
+            args.extend(["-c", "model_provider=oss"].map(str::to_owned));
+        }
+        Some(CodexLlmOverride::Custom { base_url }) => {
+            // enum 생성 경로가 검증을 거치지만, spawn 경계에서 한 번 더 — 잘못된 값이
+            // 프로세스 argv로 새는 것을 막는다.
+            let base_url = validate_llm_base_url(base_url)?;
+            args.extend([
+                "-c".to_owned(),
+                "model_provider=deppy_local".to_owned(),
+                "-c".to_owned(),
+                "model_providers.deppy_local.name=deppy_local".to_owned(),
+                "-c".to_owned(),
+                format!("model_providers.deppy_local.base_url={base_url}"),
+                "-c".to_owned(),
+                "model_providers.deppy_local.wire_api=chat".to_owned(),
+            ]);
+        }
+    }
+    Ok(args)
 }
 
 /// Events are either tied to one local agent session or describe the transport
@@ -109,8 +190,9 @@ pub type CodexSkillCatalogReply = Receiver<anyhow::Result<Vec<CodexSkillInfo>>>;
 
 impl CodexAppServerClient {
     pub fn spawn(options: CodexAppServerOptions, repaint: egui::Context) -> anyhow::Result<Self> {
+        let args = codex_app_server_args(options.llm_override.as_ref())?;
         let mut child = Command::new(&options.executable)
-            .args(["app-server", "--listen", "stdio://"])
+            .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2052,6 +2134,102 @@ fn one_line(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_server_args_기본은_오버라이드_없이_고정_argv다() {
+        assert_eq!(
+            codex_app_server_args(None).unwrap(),
+            vec!["app-server", "--listen", "stdio://"]
+        );
+    }
+
+    #[test]
+    fn app_server_args_oss는_model_provider_oss를_붙인다() {
+        assert_eq!(
+            codex_app_server_args(Some(&CodexLlmOverride::Oss)).unwrap(),
+            vec![
+                "app-server",
+                "--listen",
+                "stdio://",
+                "-c",
+                "model_provider=oss",
+            ]
+        );
+    }
+
+    #[test]
+    fn app_server_args_custom은_deppy_local_프로바이더를_정의한다() {
+        let args = codex_app_server_args(Some(&CodexLlmOverride::Custom {
+            base_url: "http://localhost:11434/v1".to_owned(),
+        }))
+        .unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "app-server",
+                "--listen",
+                "stdio://",
+                "-c",
+                "model_provider=deppy_local",
+                "-c",
+                "model_providers.deppy_local.name=deppy_local",
+                "-c",
+                "model_providers.deppy_local.base_url=http://localhost:11434/v1",
+                "-c",
+                "model_providers.deppy_local.wire_api=chat",
+            ]
+        );
+    }
+
+    #[test]
+    fn app_server_args_custom은_공백_제어문자_base_url을_거부한다() {
+        for bad in [
+            "",
+            "   ",
+            "http://a b/v1",
+            "http://a\tb",
+            "http://a\nb",
+            "http://a\u{7}b",
+        ] {
+            assert!(
+                codex_app_server_args(Some(&CodexLlmOverride::Custom {
+                    base_url: bad.to_owned(),
+                }))
+                .is_err(),
+                "{bad:?}는 거부되어야 한다"
+            );
+        }
+        // 앞뒤 공백은 trim 후 통과.
+        let args = codex_app_server_args(Some(&CodexLlmOverride::Custom {
+            base_url: "  http://localhost:8000/v1  ".to_owned(),
+        }))
+        .unwrap();
+        assert!(
+            args.contains(
+                &"model_providers.deppy_local.base_url=http://localhost:8000/v1".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn llm_override_from_config_변환과_검증() {
+        assert_eq!(codex_llm_override_from_config(None, None).unwrap(), None);
+        assert_eq!(
+            codex_llm_override_from_config(Some("oss"), None).unwrap(),
+            Some(CodexLlmOverride::Oss)
+        );
+        assert_eq!(
+            codex_llm_override_from_config(Some("custom"), Some("http://h:1/v1")).unwrap(),
+            Some(CodexLlmOverride::Custom {
+                base_url: "http://h:1/v1".to_owned()
+            })
+        );
+        // custom인데 base URL이 없거나 잘못되면 조용한 폴백 대신 에러.
+        assert!(codex_llm_override_from_config(Some("custom"), None).is_err());
+        assert!(codex_llm_override_from_config(Some("custom"), Some("a b")).is_err());
+        // 미지 프로바이더도 에러 (config 로드 정규화가 막지만 spawn 경계 fail-closed).
+        assert!(codex_llm_override_from_config(Some("nope"), None).is_err());
+    }
 
     #[test]
     fn initialize_frame_uses_json_rpc_without_the_jsonrpc_header() {

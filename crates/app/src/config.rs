@@ -59,6 +59,19 @@ pub struct Config {
     /// 기본 단축키에서 달라진 항목만 저장한다. 키 이름은 `shortcuts` 모듈이 해석하며,
     /// 알 수 없는 항목은 무시해 이전/이후 버전의 config와 호환한다.
     pub shortcuts: ShortcutsConfig,
+    pub agents: AgentsConfig,
+}
+
+/// Agents 창 (APP) Codex app-server 설정 (PR-L2). 프로바이더는 프로세스 레벨 `-c`
+/// 오버라이드라 이미 떠 있는 app-server에는 적용되지 않는다 — 다음 spawn부터.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentsConfig {
+    /// LLM 프로바이더: None = 기본(구독/기존 codex 설정), "oss" = 로컬 ollama,
+    /// "custom" = OpenAI 호환 커스텀 엔드포인트. 미지값은 로드 시 None으로 정규화.
+    pub codex_llm_provider: Option<String>,
+    /// custom 프로바이더의 OpenAI 호환 base URL (예: http://localhost:11434/v1).
+    pub codex_llm_base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -387,6 +400,25 @@ impl Config {
         self.performance.max_warm = self.performance.max_warm.clamp(0, 8);
         self.performance.max_live_warm = self.performance.max_live_warm.clamp(1, 12);
         self.i18n.locale = i18n::normalize_locale(&self.i18n.locale);
+        // TOML을 손으로 고친 미지 프로바이더는 기본(None)으로 — spawn 경계의 검증과 별개로
+        // UI 콤보가 미지값을 표시할 수 없어 로드 경계에서 정규화한다.
+        if self
+            .agents
+            .codex_llm_provider
+            .as_deref()
+            .is_some_and(|p| !matches!(p, "oss" | "custom"))
+        {
+            self.agents.codex_llm_provider = None;
+        }
+        // 빈/공백 base URL은 None으로 (mcp_proxy_server_id 빈값 정규화와 동일 관례).
+        if self
+            .agents
+            .codex_llm_base_url
+            .as_deref()
+            .is_some_and(|url| url.trim().is_empty())
+        {
+            self.agents.codex_llm_base_url = None;
+        }
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
@@ -611,6 +643,39 @@ mod tests {
         let text = toml::to_string_pretty(&c).unwrap();
         let parsed: Config = toml::from_str(&text).unwrap();
         assert_eq!(parsed, c);
+    }
+
+    #[test]
+    fn agents_섹션_누락시_기본값이고_roundtrip된다() {
+        // 옛 config([agents] 섹션 없음)도 로드된다 (serde default) — 기본은 프로바이더 없음.
+        let parsed: Config = toml::from_str("[ui]\ntheme = \"dark\"\n").unwrap();
+        assert_eq!(parsed.agents, AgentsConfig::default());
+        assert_eq!(parsed.agents.codex_llm_provider, None);
+        // 설정값은 저장→재로드에서 유지된다.
+        let mut c = Config::default();
+        c.agents.codex_llm_provider = Some("custom".to_owned());
+        c.agents.codex_llm_base_url = Some("http://localhost:11434/v1".to_owned());
+        let parsed: Config = toml::from_str(&toml::to_string_pretty(&c).unwrap()).unwrap();
+        assert_eq!(parsed, c);
+    }
+
+    #[test]
+    fn agents_미지_프로바이더와_빈_base_url은_정규화된다() {
+        let mut c = Config::default();
+        c.agents.codex_llm_provider = Some("what-is-this".to_owned());
+        c.agents.codex_llm_base_url = Some("   ".to_owned());
+        c.normalize();
+        assert_eq!(c.agents.codex_llm_provider, None);
+        assert_eq!(c.agents.codex_llm_base_url, None);
+        // 유효값은 그대로 유지.
+        c.agents.codex_llm_provider = Some("oss".to_owned());
+        c.agents.codex_llm_base_url = Some("http://localhost:11434/v1".to_owned());
+        c.normalize();
+        assert_eq!(c.agents.codex_llm_provider.as_deref(), Some("oss"));
+        assert_eq!(
+            c.agents.codex_llm_base_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
     }
 
     #[test]

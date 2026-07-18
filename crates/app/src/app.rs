@@ -5923,12 +5923,20 @@ impl eframe::App for App {
             .filter(|path| !path.trim().is_empty())
             .filter(|path| std::path::Path::new(path).is_dir());
         let active_workspace_id = self.active.id.clone();
+        // Agents 창의 LLM 프로바이더 설정은 config 소유(App) — 창이 바꾸면 저장한다 (PR-L2).
+        let agents_config_before = self.config.agents.clone();
         let agent_requests = self.agent_sessions_ui.show(
             ui.ctx(),
             &active_workspace_id,
             agent_workspace_cwd,
             pty_agent_surfaces,
+            &mut self.config.agents,
         );
+        if self.config.agents != agents_config_before
+            && let Err(e) = self.config.save(&self.config_path)
+        {
+            tracing::warn!("에이전트 LLM 프로바이더 설정 저장 실패: {e:#}");
+        }
         for request in agent_requests {
             self.handle_agent_sessions_request(request);
         }

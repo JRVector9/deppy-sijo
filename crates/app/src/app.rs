@@ -383,6 +383,42 @@ impl Drop for ApprovalWatcher {
     }
 }
 
+/// Agents(APP) custom LLM 프로바이더 API 키의 고정 keyring entry id (PR-L4).
+/// config에는 키도 존재 플래그도 저장하지 않는다 — keyring 존재 여부가 단일 진실.
+const CODEX_LLM_API_KEY_ENTRY_ID: &str = "codex-llm-custom-api-key";
+
+/// Agents 창 custom LLM API 키의 keyring 어댑터 (PR-L4) — leaf UI 대신 secret_store를
+/// 만진다 (AppCredentialService와 동일한 check-boundary 관례).
+struct AppCodexLlmApiKeyStore {
+    secret_store: KeyringSecretStore,
+}
+
+impl ui::agent_sessions::CodexLlmApiKeyStore for AppCodexLlmApiKeyStore {
+    fn save(&self, key: &secret::SecretString) -> anyhow::Result<()> {
+        secret::SecretStore::set_secret(&self.secret_store, CODEX_LLM_API_KEY_ENTRY_ID, key)
+    }
+
+    fn delete(&self) -> anyhow::Result<()> {
+        secret::SecretStore::delete_secret(&self.secret_store, CODEX_LLM_API_KEY_ENTRY_ID)
+    }
+
+    fn exists(&self) -> anyhow::Result<bool> {
+        secret::SecretStore::has_secret(&self.secret_store, CODEX_LLM_API_KEY_ENTRY_ID)
+    }
+
+    fn load(&self) -> anyhow::Result<Option<secret::SecretString>> {
+        // "없음"과 "오류"를 구별한다 (has_secret 관례) — 없으면 키 없이 spawn,
+        // 조회 오류면 UI 쪽에서 spawn을 중단한다 (fail-closed).
+        if !secret::SecretStore::has_secret(&self.secret_store, CODEX_LLM_API_KEY_ENTRY_ID)? {
+            return Ok(None);
+        }
+        Ok(Some(secret::SecretStore::get_secret(
+            &self.secret_store,
+            CODEX_LLM_API_KEY_ENTRY_ID,
+        )?))
+    }
+}
+
 struct AppCredentialService<'a> {
     db: &'a Db,
     secret_store: &'a dyn secret::SecretStore,
@@ -1517,7 +1553,11 @@ impl App {
             db,
             secret_store: KeyringSecretStore,
             agents_ui: ui::agents::AgentsUi::new(),
-            agent_sessions_ui: ui::agent_sessions::AgentSessionsUi::new(),
+            agent_sessions_ui: ui::agent_sessions::AgentSessionsUi::new().with_api_key_store(
+                Arc::new(AppCodexLlmApiKeyStore {
+                    secret_store: KeyringSecretStore,
+                }),
+            ),
             diff_panel_ui: ui::diff_panel::DiffPanelUi::new(),
             agent_persistence_queue: Vec::new(),
             agent_persistence_retry_at: None,

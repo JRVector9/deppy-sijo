@@ -23,7 +23,8 @@ use crate::agent_session::{
 const MAX_BUFFERED_THREAD_STATUSES: usize = 64;
 
 /// Configuration for one local App Server connection.
-#[derive(Debug, Clone)]
+// Clone 미파생: llm_api_key(SecretString)는 평문 복제를 만들지 않는다 (사용처도 없음).
+#[derive(Debug)]
 pub struct CodexAppServerOptions {
     pub executable: OsString,
     pub client_name: String,
@@ -32,6 +33,10 @@ pub struct CodexAppServerOptions {
     /// 로컬 LLM 프로바이더 오버라이드 (PR-L2). None = 기본(구독/기존 codex 설정).
     /// 프로세스 argv `-c` 오버라이드라 spawn 시점에만 적용된다.
     pub llm_override: Option<CodexLlmOverride>,
+    /// custom 프로바이더 API 키 (PR-L4). argv가 아니라 자식 프로세스 env
+    /// `DEPPY_LLM_API_KEY`로만 전달한다 — argv는 ps로 노출되기 때문.
+    /// custom이 아니면 무시된다.
+    pub llm_api_key: Option<secret::SecretString>,
 }
 
 impl Default for CodexAppServerOptions {
@@ -42,6 +47,7 @@ impl Default for CodexAppServerOptions {
             client_title: "Deppy Sijo".to_owned(),
             client_version: env!("CARGO_PKG_VERSION").to_owned(),
             llm_override: None,
+            llm_api_key: None,
         }
     }
 }
@@ -75,6 +81,27 @@ pub fn codex_llm_override_from_config(
     }
 }
 
+/// custom 프로바이더 API 키를 자식 프로세스에 전달하는 env var 이름 (PR-L4).
+/// argv에는 `-c model_providers.deppy_local.env_key=DEPPY_LLM_API_KEY`로 이름만 넘기고,
+/// 값은 spawn 시 Command::env로만 주입한다.
+pub const CODEX_LLM_API_KEY_ENV: &str = "DEPPY_LLM_API_KEY";
+
+/// API 키 검증 (PR-L4) — env 값으로 주입되지만 붙여넣기 개행/제어문자 오염은
+/// 인증 실패로 이어지므로 입력 단계에서 거부한다 (validate_llm_base_url과 동일 관례).
+pub fn validate_llm_api_key(raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    anyhow::ensure!(!trimmed.is_empty(), "API 키가 비어 있습니다");
+    anyhow::ensure!(
+        !trimmed.contains(char::is_whitespace),
+        "API 키에 공백을 넣을 수 없습니다"
+    );
+    anyhow::ensure!(
+        !trimmed.contains(char::is_control),
+        "API 키에 제어문자를 넣을 수 없습니다"
+    );
+    Ok(trimmed.to_owned())
+}
+
 /// base URL 검증 — 단일 argv `-c key=value`로 들어가므로 내부 공백/제어문자가 있으면
 /// 한 덩어리 오설정이 된다 (agents.rs validate_mcp_config_flag 공백 거부와 동일 관례).
 pub fn validate_llm_base_url(raw: &str) -> anyhow::Result<String> {
@@ -96,7 +123,10 @@ pub fn validate_llm_base_url(raw: &str) -> anyhow::Result<String> {
 /// `-c` 키는 실기기 codex(2026-07-18)로 검증됨: 내장 로컬 프로바이더 이름은
 /// `ollama`(`oss`는 없음, `--oss` 플래그도 app-server에선 거부), custom의
 /// wire_api는 `responses`만 허용(`chat`은 폐기 — codex#7782).
-fn codex_app_server_args(llm_override: Option<&CodexLlmOverride>) -> anyhow::Result<Vec<String>> {
+fn codex_app_server_args(
+    llm_override: Option<&CodexLlmOverride>,
+    llm_api_key_present: bool,
+) -> anyhow::Result<Vec<String>> {
     let mut args: Vec<String> = ["app-server", "--listen", "stdio://"]
         .map(str::to_owned)
         .into();
@@ -119,6 +149,15 @@ fn codex_app_server_args(llm_override: Option<&CodexLlmOverride>) -> anyhow::Res
                 "-c".to_owned(),
                 "model_providers.deppy_local.wire_api=responses".to_owned(),
             ]);
+            // 키가 있을 때만 env_key를 선언한다 (PR-L4) — env_key가 선언되어 있는데
+            // env var가 비어 있으면 codex가 요청 시점에 인증 오류를 낸다. 키 자체는
+            // argv가 아니라 spawn의 Command::env로만 주입한다.
+            if llm_api_key_present {
+                args.extend([
+                    "-c".to_owned(),
+                    format!("model_providers.deppy_local.env_key={CODEX_LLM_API_KEY_ENV}"),
+                ]);
+            }
         }
     }
     Ok(args)
@@ -190,20 +229,33 @@ pub type CodexModelCatalogReply = Receiver<anyhow::Result<CodexModelCatalogPage>
 pub type CodexSkillCatalogReply = Receiver<anyhow::Result<Vec<CodexSkillInfo>>>;
 
 impl CodexAppServerClient {
-    pub fn spawn(options: CodexAppServerOptions, repaint: egui::Context) -> anyhow::Result<Self> {
-        let args = codex_app_server_args(options.llm_override.as_ref())?;
-        let mut child = Command::new(&options.executable)
+    pub fn spawn(
+        mut options: CodexAppServerOptions,
+        repaint: egui::Context,
+    ) -> anyhow::Result<Self> {
+        // 키는 spawn에서만 쓰고 worker로 넘기지 않는다 — 이 스코프가 끝나면 평문은
+        // 자식 프로세스 env에만 남는다.
+        let llm_api_key = options.llm_api_key.take();
+        let args = codex_app_server_args(options.llm_override.as_ref(), llm_api_key.is_some())?;
+        let mut command = Command::new(&options.executable);
+        command
             .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "Codex App Server 실행 실패: {} app-server --listen stdio://",
-                    options.executable.to_string_lossy()
-                )
-            })?;
+            .stderr(Stdio::piped());
+        // custom + 키 존재 시에만 env 주입 (PR-L4). Command::env는 부모 env를 그대로
+        // 상속한 위에 이 var 하나만 더한다 — env_clear 전체 재구성이 아니다.
+        if let (Some(CodexLlmOverride::Custom { .. }), Some(key)) =
+            (options.llm_override.as_ref(), llm_api_key.as_ref())
+        {
+            command.env(CODEX_LLM_API_KEY_ENV, key.expose());
+        }
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "Codex App Server 실행 실패: {} app-server --listen stdio://",
+                options.executable.to_string_lossy()
+            )
+        })?;
         let stdin = child
             .stdin
             .take()
@@ -2139,7 +2191,7 @@ mod tests {
     #[test]
     fn app_server_args_기본은_오버라이드_없이_고정_argv다() {
         assert_eq!(
-            codex_app_server_args(None).unwrap(),
+            codex_app_server_args(None, false).unwrap(),
             vec!["app-server", "--listen", "stdio://"]
         );
     }
@@ -2147,7 +2199,7 @@ mod tests {
     #[test]
     fn app_server_args_oss는_내장_ollama_프로바이더를_지정한다() {
         assert_eq!(
-            codex_app_server_args(Some(&CodexLlmOverride::Oss)).unwrap(),
+            codex_app_server_args(Some(&CodexLlmOverride::Oss), false).unwrap(),
             vec![
                 "app-server",
                 "--listen",
@@ -2160,9 +2212,12 @@ mod tests {
 
     #[test]
     fn app_server_args_custom은_deppy_local_프로바이더를_정의한다() {
-        let args = codex_app_server_args(Some(&CodexLlmOverride::Custom {
-            base_url: "http://localhost:11434/v1".to_owned(),
-        }))
+        let args = codex_app_server_args(
+            Some(&CodexLlmOverride::Custom {
+                base_url: "http://localhost:11434/v1".to_owned(),
+            }),
+            false,
+        )
         .unwrap();
         assert_eq!(
             args,
@@ -2183,6 +2238,48 @@ mod tests {
     }
 
     #[test]
+    fn app_server_args_custom은_키_존재_시_env_key를_선언한다() {
+        let args = codex_app_server_args(
+            Some(&CodexLlmOverride::Custom {
+                base_url: "http://localhost:11434/v1".to_owned(),
+            }),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "app-server",
+                "--listen",
+                "stdio://",
+                "-c",
+                "model_provider=deppy_local",
+                "-c",
+                "model_providers.deppy_local.name=deppy_local",
+                "-c",
+                "model_providers.deppy_local.base_url=http://localhost:11434/v1",
+                "-c",
+                "model_providers.deppy_local.wire_api=responses",
+                "-c",
+                "model_providers.deppy_local.env_key=DEPPY_LLM_API_KEY",
+            ]
+        );
+        // 키 값 자체는 어떤 경우에도 argv에 나타나지 않는다 (env로만 주입).
+        assert!(args.iter().all(|arg| !arg.contains("sk-")));
+    }
+
+    #[test]
+    fn app_server_args_custom이_아니면_키가_있어도_env_key를_만들지_않는다() {
+        for llm_override in [None, Some(&CodexLlmOverride::Oss)] {
+            let args = codex_app_server_args(llm_override, true).unwrap();
+            assert!(
+                args.iter().all(|arg| !arg.contains("env_key")),
+                "{llm_override:?}에서 env_key가 나오면 안 된다"
+            );
+        }
+    }
+
+    #[test]
     fn app_server_args_custom은_공백_제어문자_base_url을_거부한다() {
         for bad in [
             "",
@@ -2193,22 +2290,43 @@ mod tests {
             "http://a\u{7}b",
         ] {
             assert!(
-                codex_app_server_args(Some(&CodexLlmOverride::Custom {
-                    base_url: bad.to_owned(),
-                }))
+                codex_app_server_args(
+                    Some(&CodexLlmOverride::Custom {
+                        base_url: bad.to_owned(),
+                    }),
+                    false,
+                )
                 .is_err(),
                 "{bad:?}는 거부되어야 한다"
             );
         }
         // 앞뒤 공백은 trim 후 통과.
-        let args = codex_app_server_args(Some(&CodexLlmOverride::Custom {
-            base_url: "  http://localhost:8000/v1  ".to_owned(),
-        }))
+        let args = codex_app_server_args(
+            Some(&CodexLlmOverride::Custom {
+                base_url: "  http://localhost:8000/v1  ".to_owned(),
+            }),
+            false,
+        )
         .unwrap();
         assert!(
             args.contains(
                 &"model_providers.deppy_local.base_url=http://localhost:8000/v1".to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn validate_llm_api_key는_공백_제어문자를_거부한다() {
+        for bad in ["", "   ", "sk a", "sk\tb", "sk\nb", "sk\u{7}b"] {
+            assert!(
+                validate_llm_api_key(bad).is_err(),
+                "{bad:?}는 거부되어야 한다"
+            );
+        }
+        // 앞뒤 공백(붙여넣기 잔여물)은 trim 후 통과.
+        assert_eq!(
+            validate_llm_api_key("  sk-test-123  ").unwrap(),
+            "sk-test-123"
         );
     }
 

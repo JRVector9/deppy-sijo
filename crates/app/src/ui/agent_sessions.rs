@@ -5,6 +5,7 @@
 //! terminal bytes exactly as before.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
 
 use crate::agent_session::{
@@ -17,10 +18,23 @@ use crate::agent_surface::{
 use crate::codex_app_server::{
     CodexAppServerClient, CodexAppServerEvent, CodexAppServerOptions, CodexAppServerReply,
     CodexLlmOverride, CodexModelCatalogReply, CodexModelInfo, CodexSkillCatalogReply,
-    CodexSkillInfo, codex_llm_override_from_config, validate_llm_base_url,
+    CodexSkillInfo, codex_llm_override_from_config, validate_llm_api_key, validate_llm_base_url,
 };
 use crate::config::AgentsConfig;
+use secret::SecretString;
 use storage::StructuredThreadRow;
+
+/// custom LLM 프로바이더 API 키의 저장 경계 (PR-L4) — leaf UI는 keyring을 직접 만지지
+/// 않는다 (check-boundary 관례). App이 고정 entry id의 keyring 어댑터로 구현해 주입한다.
+/// config에는 키도 존재 플래그도 두지 않는다 — keyring 존재 여부가 단일 진실.
+pub trait CodexLlmApiKeyStore: Send + Sync {
+    fn save(&self, key: &SecretString) -> anyhow::Result<()>;
+    fn delete(&self) -> anyhow::Result<()>;
+    /// 저장된 키 존재 여부 — UI 상태 표시용 (렌더 캐시 뒤에서만 호출).
+    fn exists(&self) -> anyhow::Result<bool>;
+    /// spawn 직전 env 주입에서만 호출한다 (secret 크레이트 get 관례). 없으면 None.
+    fn load(&self) -> anyhow::Result<Option<SecretString>>;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSessionStatusNotice {
@@ -137,6 +151,19 @@ pub struct AgentSessionsUi {
     llm_override: Result<Option<CodexLlmOverride>, String>,
     /// 현재 client가 spawn될 때 적용한 오버라이드 — 설정 변경 시 유휴 재시작 판단용.
     client_llm_override: Option<CodexLlmOverride>,
+    /// custom LLM API 키 저장소 (PR-L4). App이 keyring 어댑터를 주입한다.
+    /// None(테스트/미주입)이면 키 UI를 렌더하지 않고 spawn도 키 없이 진행한다.
+    api_key_store: Option<Arc<dyn CodexLlmApiKeyStore>>,
+    /// API 키 입력 버퍼 (password 렌더). 저장 성공 시 즉시 비운다.
+    api_key_input: String,
+    /// keyring 존재 여부 캐시 — 매 프레임 keychain 조회 방지. None = 미확인(다음 렌더에서 조회).
+    api_key_present: Option<bool>,
+    api_key_error: Option<String>,
+    /// 키 저장/삭제 세대. client가 spawn 시 기록한 세대와 다르고 유휴면
+    /// sync_llm_config가 재시작해 다음 spawn부터 새 키를 반영한다.
+    api_key_generation: u64,
+    /// 현재 client가 spawn될 때의 키 세대 (프로바이더 오버라이드 비교와 동일 관례).
+    client_api_key_generation: u64,
 }
 
 impl AgentSessionsUi {
@@ -171,7 +198,19 @@ impl AgentSessionsUi {
             text_input_ids: Vec::new(),
             llm_override: Ok(None),
             client_llm_override: None,
+            api_key_store: None,
+            api_key_input: String::new(),
+            api_key_present: None,
+            api_key_error: None,
+            api_key_generation: 0,
+            client_api_key_generation: 0,
         }
+    }
+
+    /// App 배선용 — custom LLM API 키 keyring 어댑터를 주입한다 (PR-L4).
+    pub fn with_api_key_store(mut self, store: Arc<dyn CodexLlmApiKeyStore>) -> Self {
+        self.api_key_store = Some(store);
+        self
     }
 
     pub fn is_open(&self) -> bool {
@@ -640,14 +679,26 @@ impl AgentSessionsUi {
             Ok(value) => value.clone(),
             Err(message) => anyhow::bail!("LLM 프로바이더 설정 오류: {message}"),
         };
+        // custom + 저장된 키가 있으면 spawn 직전에만 keyring에서 읽는다 (PR-L4,
+        // secret 크레이트 get 관례). 로드 실패는 키 없이 조용히 진행하지 않고 중단 —
+        // 인증 실패로 늦게 표면화되는 것보다 명확하다.
+        let llm_api_key = match (&llm_override, &self.api_key_store) {
+            (Some(CodexLlmOverride::Custom { .. }), Some(store)) => store
+                .load()
+                .map_err(|error| anyhow::anyhow!("LLM API 키 로드 실패: {error:#}"))?,
+            _ => None,
+        };
+        let api_key_generation = self.api_key_generation;
         let options = CodexAppServerOptions {
             llm_override: llm_override.clone(),
+            llm_api_key,
             ..CodexAppServerOptions::default()
         };
         let client = CodexAppServerClient::spawn(options, ctx.clone())?;
         self.transport_error = None;
         self.client = Some(client);
         self.client_llm_override = llm_override;
+        self.client_api_key_generation = api_key_generation;
         Ok(())
     }
 
@@ -667,7 +718,11 @@ impl AgentSessionsUi {
             && self.pending_thread_requests.is_empty()
             && self.pending_model_catalog.is_none()
             && self.pending_skill_catalog.is_none();
-        if self.client.is_some() && &self.client_llm_override != target && idle {
+        // 키 저장/삭제(세대 증가)도 프로바이더 변경과 같은 프로세스 레벨 설정이다 —
+        // 유휴면 내렸다가 다음 spawn에 새 키를 반영한다 (PR-L4).
+        let stale = &self.client_llm_override != target
+            || self.client_api_key_generation != self.api_key_generation;
+        if self.client.is_some() && stale && idle {
             self.shutdown();
         }
     }
@@ -1331,6 +1386,9 @@ impl AgentSessionsUi {
                 "커스텀 프로바이더는 base URL이 필요합니다 (공백/제어문자 불가)",
             );
         }
+        if agents_config.codex_llm_provider.as_deref() == Some("custom") {
+            self.render_llm_api_key_controls(ui, text_input_ids);
+        }
         // OSS 선택 시 감지된 ollama 모델을 클릭 후보로 (PR-L3 — local_llm 감지 배선.
         // 커스텀은 사용자 지시로 검색 없이 입력값 그대로 쓴다, 2026-07-18).
         if agents_config.codex_llm_provider.as_deref() == Some("oss") {
@@ -1355,6 +1413,92 @@ impl AgentSessionsUi {
         // 유휴 상태면 sync_llm_config가 자동으로 내렸다가 다음 실행에 반영한다.
         if agents_config.codex_llm_provider.is_some() {
             ui.weak("프로바이더 설정은 다음 Codex 실행부터 적용됩니다.");
+        }
+    }
+
+    /// custom 프로바이더 API 키 (PR-L4). 키는 keyring에만 저장한다 — config/argv에
+    /// 남기지 않고, spawn 시 자식 프로세스 env로만 전달된다.
+    fn render_llm_api_key_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        text_input_ids: &mut Vec<egui::Id>,
+    ) {
+        // 저장소 미주입(테스트 등)이면 키 UI를 렌더하지 않는다.
+        let Some(store) = self.api_key_store.clone() else {
+            return;
+        };
+        // keyring 존재 확인은 캐시 미스에서 한 번만 — 매 프레임 keychain 조회 방지.
+        if self.api_key_present.is_none() {
+            match store.exists() {
+                Ok(present) => self.api_key_present = Some(present),
+                Err(error) => {
+                    self.api_key_present = Some(false);
+                    self.api_key_error = Some(format!("API 키 확인 실패: {error:#}"));
+                }
+            }
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("API 키");
+            let hint = if self.api_key_present == Some(true) {
+                "저장됨 — 새 키 입력 시 교체"
+            } else {
+                "(선택) 인증이 필요한 엔드포인트용"
+            };
+            let response = ui.add_sized(
+                [240.0, 24.0],
+                egui::TextEdit::singleline(&mut self.api_key_input)
+                    .password(true)
+                    .hint_text(hint),
+            );
+            text_input_ids.push(response.id);
+            let has_input = !self.api_key_input.trim().is_empty();
+            if ui
+                .add_enabled(has_input, egui::Button::new("저장"))
+                .clicked()
+            {
+                self.save_api_key(store.as_ref());
+            }
+            if self.api_key_present == Some(true) && ui.button("삭제").clicked() {
+                self.delete_api_key(store.as_ref());
+            }
+        });
+        if let Some(error) = &self.api_key_error {
+            ui.colored_label(ui.visuals().warn_fg_color, error);
+        } else if self.api_key_present == Some(true) {
+            ui.weak("API 키가 keyring에 저장되어 있습니다 — 다음 Codex 실행부터 적용됩니다.");
+        }
+    }
+
+    /// 입력 버퍼의 키를 검증해 keyring에 저장한다. 성공 시 버퍼를 즉시 비운다.
+    fn save_api_key(&mut self, store: &dyn CodexLlmApiKeyStore) {
+        // env 값으로 주입되지만 붙여넣기 개행/제어문자는 인증 실패로 이어진다 — 입력 거부.
+        let key = match validate_llm_api_key(&self.api_key_input) {
+            Ok(key) => key,
+            Err(error) => {
+                self.api_key_error = Some(format!("{error:#}"));
+                return;
+            }
+        };
+        match store.save(&SecretString::new(key)) {
+            Ok(()) => {
+                self.api_key_input.clear();
+                self.api_key_present = Some(true);
+                self.api_key_error = None;
+                // 유휴 client는 sync_llm_config가 내렸다가 다음 spawn에 새 키를 쓴다.
+                self.api_key_generation += 1;
+            }
+            Err(error) => self.api_key_error = Some(format!("API 키 저장 실패: {error:#}")),
+        }
+    }
+
+    fn delete_api_key(&mut self, store: &dyn CodexLlmApiKeyStore) {
+        match store.delete() {
+            Ok(()) => {
+                self.api_key_present = Some(false);
+                self.api_key_error = None;
+                self.api_key_generation += 1;
+            }
+            Err(error) => self.api_key_error = Some(format!("API 키 삭제 실패: {error:#}")),
         }
     }
 
@@ -2425,6 +2569,83 @@ mod tests {
         let ctx = egui::Context::default();
         let error = ui.ensure_client(&ctx).unwrap_err();
         assert!(format!("{error:#}").contains("LLM 프로바이더 설정 오류"));
+        assert!(ui.client.is_none());
+    }
+
+    /// 실제 keyring을 만지지 않는 인메모리 API 키 저장소 (MemSecretStore 관례).
+    #[derive(Default)]
+    struct MemApiKeyStore {
+        key: std::sync::Mutex<Option<String>>,
+        fail_load: bool,
+    }
+
+    impl CodexLlmApiKeyStore for MemApiKeyStore {
+        fn save(&self, key: &SecretString) -> anyhow::Result<()> {
+            *self.key.lock().unwrap() = Some(key.expose().to_owned());
+            Ok(())
+        }
+        fn delete(&self) -> anyhow::Result<()> {
+            *self.key.lock().unwrap() = None;
+            Ok(())
+        }
+        fn exists(&self) -> anyhow::Result<bool> {
+            Ok(self.key.lock().unwrap().is_some())
+        }
+        fn load(&self) -> anyhow::Result<Option<SecretString>> {
+            anyhow::ensure!(!self.fail_load, "keyring 조회 실패 (테스트)");
+            Ok(self.key.lock().unwrap().clone().map(SecretString::new))
+        }
+    }
+
+    #[test]
+    fn api_key_저장은_trim_후_어댑터에_쓰고_버퍼를_비운다() {
+        let store = Arc::new(MemApiKeyStore::default());
+        let mut ui = AgentSessionsUi::new().with_api_key_store(store.clone());
+        ui.api_key_input = "  sk-test-123  ".to_owned();
+        ui.save_api_key(store.as_ref());
+        assert_eq!(store.key.lock().unwrap().as_deref(), Some("sk-test-123"));
+        assert!(ui.api_key_input.is_empty());
+        assert_eq!(ui.api_key_present, Some(true));
+        assert_eq!(ui.api_key_error, None);
+        assert_eq!(ui.api_key_generation, 1);
+
+        ui.delete_api_key(store.as_ref());
+        assert_eq!(*store.key.lock().unwrap(), None);
+        assert_eq!(ui.api_key_present, Some(false));
+        assert_eq!(ui.api_key_generation, 2);
+    }
+
+    #[test]
+    fn api_key_공백_제어문자는_저장을_거부한다() {
+        let store = Arc::new(MemApiKeyStore::default());
+        let mut ui = AgentSessionsUi::new().with_api_key_store(store.clone());
+        for bad in ["", "   ", "sk a", "sk\nb"] {
+            ui.api_key_input = bad.to_owned();
+            ui.save_api_key(store.as_ref());
+            assert_eq!(
+                *store.key.lock().unwrap(),
+                None,
+                "{bad:?}는 거부되어야 한다"
+            );
+            assert!(ui.api_key_error.is_some());
+            assert_eq!(ui.api_key_generation, 0);
+        }
+    }
+
+    #[test]
+    fn api_key_로드_실패는_ensure_client가_spawn_전에_중단한다() {
+        let store = Arc::new(MemApiKeyStore {
+            fail_load: true,
+            ..Default::default()
+        });
+        let mut ui = AgentSessionsUi::new().with_api_key_store(store);
+        ui.sync_llm_config(&AgentsConfig {
+            codex_llm_provider: Some("custom".to_owned()),
+            codex_llm_base_url: Some("http://localhost:11434/v1".to_owned()),
+        });
+        let ctx = egui::Context::default();
+        let error = ui.ensure_client(&ctx).unwrap_err();
+        assert!(format!("{error:#}").contains("LLM API 키 로드 실패"));
         assert!(ui.client.is_none());
     }
 

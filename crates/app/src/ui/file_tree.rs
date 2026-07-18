@@ -100,15 +100,17 @@ pub struct SidebarSnapshot<'a> {
     pub workspaces: &'a [SidebarWorkspaceEntry],
     pub view: super::agent_terminal::AgentTerminalView,
     pub inbox_count: usize,
+    /// Agents 창 열림 여부 — 하단 nav 「에이전트」 행의 선택 상태 (2026-07-18).
+    pub agents_open: bool,
 }
 
 /// 사이드바에서 App으로 올라가는 액션.
 pub enum SidebarAction {
     SwitchWorkspace(String),
     ShowHome,
-    ShowTerminal,
-    OpenInbox,
-    OpenSettings,
+    /// 「작업함」 전체 페이지로 전환 (하단 nav, 2026-07-18). 재클릭 토글(터미널 복귀)은
+    /// App이 현재 view를 보고 결정한다 — 이 모듈은 view를 바꾸지 않는다.
+    ShowInbox,
     OpenAgents,
     /// 경로를 포커스된 터미널에 삽입 (FT-3)
     InsertPath(PathBuf),
@@ -1019,7 +1021,8 @@ impl FileTreeUi {
             // 따라 제목/요약/도구를 단계적으로 생략해 콘텐츠가 패널을 다시 밀지 않는다.
             .size_range(egui::Rangef::new(40.0, 680.0))
             .show(ui, |ui| {
-                let nav_h = 96.0;
+                // 세로 3행(38px) + 위 여백 — 하단 고정 nav 예약 높이.
+                let nav_h = 124.0;
                 let body_h = (ui.available_height() - nav_h).max(180.0);
                 let body = ui
                     .allocate_ui_with_layout(
@@ -1029,7 +1032,7 @@ impl FileTreeUi {
                     )
                     .inner;
                 crate::ui::hairline_full(ui);
-                let navigation = self.navigation(ui, sidebar);
+                let navigation = self.navigation(ui, sidebar, catalog);
                 body.or(navigation)
             })
             .inner
@@ -2013,66 +2016,48 @@ impl FileTreeUi {
         action
     }
 
+    /// 사이드바 최하단 고정 nav — 세로 3항목: 홈 / 작업함 / 에이전트 (2026-07-18
+    /// 사용자 확정 디자인). 각 행은 painter 아이콘 + 라벨의 둥근 필(pill)이고,
+    /// 작업함 행 우측에 대기+안읽음 카운트 배지가 붙는다(0이면 숨김).
+    /// 홈/작업함 재클릭 시 터미널 복귀 토글은 App이 처리한다(view 소유자).
     fn navigation(
         &mut self,
         ui: &mut egui::Ui,
         sidebar: &SidebarSnapshot<'_>,
+        catalog: &i18n::Catalog,
     ) -> Option<SidebarAction> {
         let mut action = None;
-        let selected = ui.visuals().selection.bg_fill.gamma_multiply(0.16);
-        let labels = [
-            (
-                "⌂  홈",
-                sidebar.view == super::agent_terminal::AgentTerminalView::Home,
-                SidebarAction::ShowHome,
-            ),
-            (
-                "▣  터미널",
-                sidebar.view == super::agent_terminal::AgentTerminalView::Terminal,
-                SidebarAction::ShowTerminal,
-            ),
-            ("▤  작업함", false, SidebarAction::OpenInbox),
-            ("⚙  설정", false, SidebarAction::OpenSettings),
-        ];
-        for pair in labels.chunks(2) {
-            ui.columns(2, |columns| {
-                for (column, (label, active, next)) in columns.iter_mut().zip(pair) {
-                    let label =
-                        if matches!(next, SidebarAction::OpenInbox) && sidebar.inbox_count > 0 {
-                            format!("{label}  {}", sidebar.inbox_count)
-                        } else {
-                            (*label).to_owned()
-                        };
-                    let button = egui::Button::new(label)
-                        .selected(*active)
-                        .fill(if *active {
-                            selected
-                        } else {
-                            egui::Color32::TRANSPARENT
-                        })
-                        .stroke(egui::Stroke::NONE)
-                        .corner_radius(egui::CornerRadius::same(1))
-                        .min_size(egui::vec2(column.available_width(), 34.0));
-                    if column.add(button).clicked() {
-                        action = Some(match next {
-                            SidebarAction::ShowHome => SidebarAction::ShowHome,
-                            SidebarAction::ShowTerminal => SidebarAction::ShowTerminal,
-                            SidebarAction::OpenInbox => SidebarAction::OpenInbox,
-                            SidebarAction::OpenSettings => SidebarAction::OpenSettings,
-                            _ => unreachable!("fixed navigation action"),
-                        });
-                    }
-                }
-            });
+        ui.add_space(4.0);
+        if nav_row(
+            ui,
+            NavIcon::Home,
+            &catalog.t("sidebar.nav.home", &[]),
+            sidebar.view == super::agent_terminal::AgentTerminalView::Home,
+            None,
+        )
+        .clicked()
+        {
+            action = Some(SidebarAction::ShowHome);
         }
-        // 에이전트 관리 표면은 터미널/홈과 별도 창이므로 작은 보조 진입점으로 유지한다.
-        if ui
-            .add(
-                egui::Button::new("Agents")
-                    .frame(false)
-                    .corner_radius(egui::CornerRadius::same(1)),
-            )
-            .clicked()
+        if nav_row(
+            ui,
+            NavIcon::Inbox,
+            &catalog.t("sidebar.nav.inbox", &[]),
+            sidebar.view == super::agent_terminal::AgentTerminalView::Inbox,
+            nav_badge_text(sidebar.inbox_count).as_deref(),
+        )
+        .clicked()
+        {
+            action = Some(SidebarAction::ShowInbox);
+        }
+        if nav_row(
+            ui,
+            NavIcon::Agents,
+            &catalog.t("sidebar.nav.agents", &[]),
+            sidebar.agents_open,
+            None,
+        )
+        .clicked()
         {
             action = Some(SidebarAction::OpenAgents);
         }
@@ -3395,6 +3380,141 @@ fn paint_file(p: &egui::Painter, c: egui::Pos2, col: egui::Color32, carve: egui:
         carve,
         egui::Stroke::NONE,
     ));
+}
+
+/// 하단 nav 아이콘 종류 (2026-07-18 확정 디자인).
+enum NavIcon {
+    Home,
+    Inbox,
+    Agents,
+}
+
+/// 작업함 배지 문구 — 0이면 숨김(None).
+fn nav_badge_text(count: usize) -> Option<String> {
+    (count > 0).then(|| count.to_string())
+}
+
+/// 하단 nav 행 하나 — 외곽선 아이콘 + 라벨, hover/선택 시 둥근 필(pill) 배경
+/// (workspace_row와 같은 색 계열). painter 텍스트라 접근성 라벨은 widget_info로 단다.
+fn nav_row(
+    ui: &mut egui::Ui,
+    icon: NavIcon,
+    label: &str,
+    selected: bool,
+    badge: Option<&str>,
+) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let pill = rect.shrink2(egui::vec2(6.0, 2.0));
+    if selected {
+        ui.painter().rect_filled(
+            pill,
+            6.0,
+            ui.visuals().selection.bg_fill.gamma_multiply(0.16),
+        );
+    } else if response.hovered() {
+        ui.painter()
+            .rect_filled(pill, 6.0, ui.visuals().widgets.hovered.bg_fill);
+    }
+    let color = if selected || response.hovered() {
+        ui.visuals().text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    // 아이콘 레일(좁은 폭)에서는 아이콘만 중앙에 — workspace_row의 폭 단계 규칙과 동일.
+    let show_label = rect.width() >= 64.0;
+    let icon_center = if show_label {
+        egui::pos2(pill.left() + 16.0, rect.center().y)
+    } else {
+        egui::pos2(rect.center().x, rect.center().y)
+    };
+    paint_nav_icon(ui.painter(), icon_center, icon, color);
+    if show_label {
+        ui.painter().text(
+            egui::pos2(pill.left() + 32.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(13.0),
+            color,
+        );
+        if let Some(badge) = badge {
+            paint_nav_badge(ui, pill, badge);
+        }
+    }
+    response
+}
+
+/// 작업함 카운트 배지 — 빨간 원형(두 자리부터는 알약꼴), 흰 숫자.
+fn paint_nav_badge(ui: &egui::Ui, pill: egui::Rect, text: &str) {
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        egui::FontId::proportional(10.0),
+        egui::Color32::WHITE,
+    );
+    let h = 16.0;
+    let w = (galley.size().x + 8.0).max(h);
+    let center = egui::pos2(pill.right() - 8.0 - w / 2.0, pill.center().y);
+    let rect = egui::Rect::from_center_size(center, egui::vec2(w, h));
+    ui.painter()
+        .rect_filled(rect, h / 2.0, egui::Color32::from_rgb(0xed, 0x5b, 0x61));
+    ui.painter()
+        .galley(center - galley.size() / 2.0, galley, egui::Color32::WHITE);
+}
+
+/// 하단 nav 아이콘 — 이모지는 폰트 글리프가 없어 □로 깨진다(레포 관례: painter 직접
+/// 드로잉 — paint_folder/file_toolbar_icon_at 참고). 1.3px 스트로크로 기존 톤과 맞춘다.
+fn paint_nav_icon(p: &egui::Painter, c: egui::Pos2, icon: NavIcon, col: egui::Color32) {
+    let stroke = egui::Stroke::new(1.3, col);
+    match icon {
+        // 집 — 지붕(꺾은선) + 몸통(사각).
+        NavIcon::Home => {
+            let roof = vec![
+                egui::pos2(c.x - 6.5, c.y - 0.5),
+                egui::pos2(c.x, c.y - 6.0),
+                egui::pos2(c.x + 6.5, c.y - 0.5),
+            ];
+            p.add(egui::Shape::line(roof, stroke));
+            let body = egui::Rect::from_min_max(
+                egui::pos2(c.x - 4.5, c.y - 0.5),
+                egui::pos2(c.x + 4.5, c.y + 6.0),
+            );
+            p.rect_stroke(body, 0.0, stroke, egui::StrokeKind::Inside);
+        }
+        // 서류함 — 상자 + 투입구 슬롯.
+        NavIcon::Inbox => {
+            let body = egui::Rect::from_center_size(c, egui::vec2(13.0, 11.0));
+            p.rect_stroke(body, 1.5, stroke, egui::StrokeKind::Inside);
+            p.line_segment(
+                [
+                    egui::pos2(c.x - 3.5, c.y - 2.0),
+                    egui::pos2(c.x + 3.5, c.y - 2.0),
+                ],
+                stroke,
+            );
+        }
+        // 봇 — 머리(사각) + 눈 2점 + 안테나.
+        NavIcon::Agents => {
+            let head =
+                egui::Rect::from_center_size(egui::pos2(c.x, c.y + 1.0), egui::vec2(12.0, 9.0));
+            p.rect_stroke(head, 1.5, stroke, egui::StrokeKind::Inside);
+            p.line_segment(
+                [
+                    egui::pos2(c.x, head.top()),
+                    egui::pos2(c.x, head.top() - 2.5),
+                ],
+                stroke,
+            );
+            p.circle_filled(egui::pos2(c.x, head.top() - 3.5), 1.2, col);
+            p.circle_filled(egui::pos2(c.x - 2.5, c.y + 1.0), 1.2, col);
+            p.circle_filled(egui::pos2(c.x + 2.5, c.y + 1.0), 1.2, col);
+        }
+    }
 }
 
 /// PTY 세션 상태 → 공통 에이전트 상태 색. 기존 호출부(App의 pulse, pane glyph)가
@@ -4949,6 +5069,7 @@ mod tests {
             workspaces: &[],
             view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
             inbox_count: 0,
+            agents_open: false,
         };
         egui::__run_test_ui(|ui| {
             assert!(tree.panel(ui, &[], &sidebar, &catalog).is_none());
@@ -5356,6 +5477,7 @@ mod tests {
                         workspaces: &workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         inbox_count: 0,
+                        agents_open: false,
                     };
                     state.0.panel(ui, &sessions, &snapshot, &catalog);
                 },
@@ -5483,6 +5605,7 @@ mod tests {
                         workspaces: &workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         inbox_count: 0,
+                        agents_open: false,
                     };
                     state.0.panel(ui, &[], &snapshot, &catalog);
                 },
@@ -5504,11 +5627,11 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         // 라벨 노드는 클립 밖에서도 만들어지므로 존재가 아니라 **위치**를 본다.
-        // 사이드바 본문은 패널 높이 700 − 하단 네비 96 = 최대 604 안이어야 보인다.
+        // 사이드바 본문은 패널 높이 700 − 하단 네비 124 = 최대 576 안이어야 보인다.
         // 이전 구현은 before_active 12행(552px)이 본문을 잠식해 행이 그 밖으로 밀렸다.
         let row_top = harness.get_by_label("root.txt").rect().top();
         assert!(
-            row_top < 604.0,
+            row_top < 576.0,
             "루트 파일 행이 사이드바 본문 밖(y={row_top})으로 밀렸다 — 워크스페이스 목록이 bounded 스크롤을 공유해야 한다"
         );
         std::fs::remove_dir_all(&base).unwrap();
@@ -5542,6 +5665,7 @@ mod tests {
                         workspaces: &[],
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         inbox_count: 0,
+                        agents_open: false,
                     };
                     if let Some(a) = state.0.panel(ui, &[], &snapshot, &catalog) {
                         state.1.push(a);
@@ -5632,6 +5756,7 @@ mod tests {
                         workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
                         inbox_count: 0,
+                        agents_open: false,
                     };
                     if let Some(a) = state.0.panel(ui, &[], &snapshot, catalog) {
                         state.1.push(a);
@@ -5751,5 +5876,61 @@ mod tests {
             "Idle 워크스페이스 행에 종료 메뉴가 떴다"
         );
         assert!(harness.state().1.is_empty(), "Idle 행 우클릭이 액션을 냄");
+    }
+
+    /// 하단 nav 작업함 배지 — 0이면 숨김(None), 그 외엔 카운트 문구.
+    #[test]
+    fn nav_badge는_0이면_숨긴다() {
+        assert_eq!(nav_badge_text(0), None);
+        assert_eq!(nav_badge_text(3), Some("3".to_owned()));
+        assert_eq!(nav_badge_text(12), Some("12".to_owned()));
+    }
+
+    /// 하단 nav 3항목(홈/작업함/에이전트) 렌더 + 클릭 → 액션 방출 (2026-07-18 확정
+    /// 디자인). 재클릭 토글은 App 로직이라 여기서는 방출까지만 검증한다.
+    #[test]
+    fn kittest_하단_nav_클릭이_홈_작업함_에이전트_액션을_낸다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 700.0))
+            .build_ui_state(
+                |ui, state: &mut (FileTreeUi, Vec<SidebarAction>)| {
+                    let snapshot = SidebarSnapshot {
+                        active_workspace_id: "ws-test",
+                        workspaces: &[],
+                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        inbox_count: 2,
+                        agents_open: false,
+                    };
+                    if let Some(a) = state.0.panel(ui, &[], &snapshot, &catalog) {
+                        state.1.push(a);
+                    }
+                },
+                (FileTreeUi::new(egui::Context::default()), Vec::new()),
+            );
+        harness.run();
+        harness.get_by_label("Home").click();
+        harness.run();
+        harness.get_by_label("Inbox").click();
+        harness.run();
+        harness.get_by_label("Agents").click();
+        harness.run();
+        let kinds: Vec<&'static str> = harness
+            .state()
+            .1
+            .iter()
+            .map(|action| match action {
+                SidebarAction::ShowHome => "home",
+                SidebarAction::ShowInbox => "inbox",
+                SidebarAction::OpenAgents => "agents",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["home", "inbox", "agents"],
+            "nav 3항목 클릭이 각각의 액션을 순서대로 내야 한다"
+        );
     }
 }

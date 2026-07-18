@@ -5676,6 +5676,7 @@ impl eframe::App for App {
             workspaces: &sidebar_workspaces,
             view: self.agent_terminal_ui.view(),
             inbox_count,
+            agents_open: self.agent_sessions_ui.is_open(),
         };
 
         // 500ms 캐시에서 꺼내 쓰고 프레임 끝에 되돌린다(take/put-back) — 참조로 들면
@@ -5759,19 +5760,28 @@ impl eframe::App for App {
                     self.switch_workspace(&workspace_id);
                 }
                 Some(ui::file_tree::SidebarAction::ShowHome) => {
-                    self.agent_terminal_ui
-                        .set_view(ui::agent_terminal::AgentTerminalView::Home);
+                    // 재클릭 토글 — 이미 홈이면 터미널로 복귀 (2026-07-18 확정 디자인).
+                    self.agent_terminal_ui.set_view(
+                        if self.agent_terminal_ui.view()
+                            == ui::agent_terminal::AgentTerminalView::Home
+                        {
+                            ui::agent_terminal::AgentTerminalView::Terminal
+                        } else {
+                            ui::agent_terminal::AgentTerminalView::Home
+                        },
+                    );
                 }
-                Some(ui::file_tree::SidebarAction::ShowTerminal) => {
-                    self.agent_terminal_ui
-                        .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
-                }
-                Some(ui::file_tree::SidebarAction::OpenInbox) => {
-                    egui::Popup::toggle_id(ui.ctx(), Self::inbox_popup_id());
-                }
-                Some(ui::file_tree::SidebarAction::OpenSettings) => {
-                    self.settings_open = true;
-                    self.refresh_workspaces();
+                Some(ui::file_tree::SidebarAction::ShowInbox) => {
+                    // 작업함 전체 페이지 — 재클릭 토글 규칙은 홈과 동일.
+                    self.agent_terminal_ui.set_view(
+                        if self.agent_terminal_ui.view()
+                            == ui::agent_terminal::AgentTerminalView::Inbox
+                        {
+                            ui::agent_terminal::AgentTerminalView::Terminal
+                        } else {
+                            ui::agent_terminal::AgentTerminalView::Inbox
+                        },
+                    );
                 }
                 Some(ui::file_tree::SidebarAction::OpenAgents) => {
                     self.agent_sessions_ui.open();

@@ -1,4 +1,5 @@
 use super::activity::{ActivityWorkspaceRow, ActivityWorkspaceState};
+use crate::status_feed::{ProviderStatus, ServiceIndicator, StatusFeedSnapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AgentTerminalView {
@@ -76,6 +77,8 @@ impl AgentTerminalUi {
         ui: &mut egui::Ui,
         rows: &[ActivityWorkspaceRow],
         metrics: HomeMetrics,
+        feed: &StatusFeedSnapshot,
+        translations: &std::collections::HashMap<String, String>,
     ) -> Option<HomeAction> {
         let totals = workspace_totals(rows);
         let mut action = None;
@@ -87,7 +90,7 @@ impl AgentTerminalUi {
                     .inner_margin(egui::Margin::same(22))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        self.announcements(ui);
+                        self.announcements(ui, feed, translations);
                         ui.add_space(14.0);
                         if let Some(next) = orchestration_insights(ui, totals, metrics) {
                             action = Some(next);
@@ -107,6 +110,7 @@ impl AgentTerminalUi {
         rows: &[ActivityWorkspaceRow],
         waiting: usize,
         mcp_count: usize,
+        feed: &StatusFeedSnapshot,
     ) {
         let totals = workspace_totals(rows);
         let cpu = if totals.cpu_seen {
@@ -129,6 +133,21 @@ impl AgentTerminalUi {
                 // 등록·활성화된 MCP 서버 수 (2026-07-18 사용자 요청).
                 ui.weak(format!("MCP {mcp_count}"))
                     .on_hover_text("활성화된 MCP 서버 수 (커넥터 센터에서 관리)");
+                // AI 서비스 상태 점등 (2026-07-18 사용자) — status.claude.com /
+                // status.openai.com 5분 폴링. 클릭 시 상태 페이지를 연다.
+                ui.separator();
+                service_status_light(
+                    ui,
+                    "Claude",
+                    feed.claude.as_ref(),
+                    crate::status_feed::CLAUDE_STATUS_URL,
+                );
+                service_status_light(
+                    ui,
+                    "OpenAI",
+                    feed.openai.as_ref(),
+                    crate::status_feed::OPENAI_STATUS_URL,
+                );
                 if waiting > 0 {
                     ui.separator();
                     ui.colored_label(
@@ -162,7 +181,12 @@ impl AgentTerminalUi {
         );
     }
 
-    fn announcements(&mut self, ui: &mut egui::Ui) {
+    fn announcements(
+        &mut self,
+        ui: &mut egui::Ui,
+        feed: &StatusFeedSnapshot,
+        translations: &std::collections::HashMap<String, String>,
+    ) {
         let panel = egui::Frame::NONE
             .fill(ui.visuals().panel_fill)
             .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
@@ -192,65 +216,82 @@ impl AgentTerminalUi {
                     AnnouncementFilter::Anthropic,
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak("공식 변경 로그 채널");
+                    ui.weak("status.claude.com · status.openai.com — 5분마다 갱신");
                 });
             });
             ui.add_space(12.0);
-            let cards = [
-                AnnouncementCard {
-                    provider: AnnouncementFilter::OpenAi,
-                    source: "OpenAI",
-                    product: "API",
-                    title: "API 플랫폼 업데이트",
-                    description: "새 모델과 개발자 도구의 공식 변경 사항을 확인합니다.",
-                    url: "https://developers.openai.com/api/docs/changelog",
-                    accent: egui::Color32::from_rgb(0xa7, 0xae, 0xbc),
-                },
-                AnnouncementCard {
-                    provider: AnnouncementFilter::Anthropic,
-                    source: "Anthropic",
-                    product: "Claude",
-                    title: "Claude 릴리스 노트",
-                    description: "Claude API와 제품의 공식 릴리스 기록으로 이동합니다.",
-                    url: "https://platform.claude.com/docs/en/release-notes/overview",
-                    accent: egui::Color32::from_rgb(0xd2, 0x91, 0x55),
-                },
-                AnnouncementCard {
-                    provider: AnnouncementFilter::OpenAi,
-                    source: "OpenAI",
-                    product: "Codex",
-                    title: "Codex 제품 업데이트",
-                    description: "에이전트 워크플로와 코드 작업 도구의 변경 기록을 엽니다.",
-                    url: "https://learn.chatgpt.com/docs/changelog",
-                    accent: egui::Color32::from_rgb(0x76, 0x87, 0xff),
-                },
-            ];
-            let visible: Vec<_> = cards
-                .iter()
-                .filter(|card| {
-                    self.announcement_filter == AnnouncementFilter::All
-                        || self.announcement_filter == card.provider
-                })
-                .collect();
-            let columns = if ui.available_width() >= 760.0 {
-                visible.len().clamp(1, 3)
+            // 실제 상태 페이지의 최신 인시던트 3건씩 (2026-07-18 사용자 — 정적 링크
+            // 카드에서 교체). 아직 첫 조회 전이면 안내 문구.
+            let cards: Vec<AnnouncementCard> = [
+                (
+                    AnnouncementFilter::Anthropic,
+                    "Claude",
+                    feed.claude.as_ref(),
+                    egui::Color32::from_rgb(0xd2, 0x91, 0x55),
+                ),
+                (
+                    AnnouncementFilter::OpenAi,
+                    "OpenAI",
+                    feed.openai.as_ref(),
+                    egui::Color32::from_rgb(0xa7, 0xae, 0xbc),
+                ),
+            ]
+            .into_iter()
+            .filter(|(provider, ..)| {
+                self.announcement_filter == AnnouncementFilter::All
+                    || self.announcement_filter == *provider
+            })
+            .filter_map(|(provider, source, status, accent)| {
+                status.map(|status| (provider, source, status, accent))
+            })
+            .flat_map(|(_, source, status, accent)| {
+                status
+                    .incidents
+                    .iter()
+                    .map(move |incident| AnnouncementCard {
+                        source,
+                        incident,
+                        accent,
+                    })
+            })
+            .collect();
+            if cards.is_empty() {
+                ui.weak(if feed.claude.is_none() && feed.openai.is_none() {
+                    "공지를 불러오는 중… (상태 페이지 조회)"
+                } else {
+                    "최근 공지 없음"
+                });
             } else {
-                1
-            };
-            card_columns(ui, columns, visible, announcement_card);
+                // 리스트 형태(2026-07-18 사용자) — 카드 그리드 대신 전체 폭 행.
+                for (index, card) in cards.iter().enumerate() {
+                    if index > 0 {
+                        crate::ui::hairline(ui);
+                    }
+                    announcement_row(ui, card, translations);
+                }
+            }
         });
     }
 }
 
+/// 홈 공지 카드 1장 — 상태 페이지 인시던트 1건.
 #[derive(Clone, Copy)]
-struct AnnouncementCard {
-    provider: AnnouncementFilter,
+struct AnnouncementCard<'a> {
     source: &'static str,
-    product: &'static str,
-    title: &'static str,
-    description: &'static str,
-    url: &'static str,
+    incident: &'a crate::status_feed::IncidentNotice,
     accent: egui::Color32,
+}
+
+/// Statuspage 인시던트 상태 → 한국어 라벨 (미지 값은 원문 그대로).
+fn incident_status_label(status: &str) -> &str {
+    match status {
+        "resolved" => "해결됨",
+        "investigating" => "조사 중",
+        "identified" => "원인 파악됨",
+        "monitoring" => "관찰 중",
+        "postmortem" => "사후 분석",
+        other => other,
+    }
 }
 
 fn source_filter(
@@ -267,32 +308,40 @@ fn source_filter(
     }
 }
 
-fn announcement_card(ui: &mut egui::Ui, card: &&AnnouncementCard) {
-    let response = egui::Frame::NONE
-        .fill(ui.visuals().faint_bg_color)
-        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-        .corner_radius(egui::CornerRadius::same(2))
-        .inner_margin(egui::Margin::same(13))
-        .show(ui, |ui| {
-            ui.set_min_height(126.0);
-            ui.horizontal(|ui| {
-                provider_mark(ui, card.source, card.accent);
-                ui.weak(card.source);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak(card.product);
-                });
-            });
-            ui.add_space(10.0);
-            ui.label(egui::RichText::new(card.title).strong().size(15.0));
-            ui.add_space(5.0);
-            ui.weak(card.description);
-            ui.add_space(10.0);
-            ui.hyperlink_to("원문 보기 →", card.url);
-        })
-        .response;
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
+/// 공지 리스트 행 1개 — 제공자 마크 · 제목(번역 있으면 번역, hover에 원문) ·
+/// 우측에 상태/날짜/원문 링크.
+fn announcement_row(
+    ui: &mut egui::Ui,
+    card: &AnnouncementCard<'_>,
+    translations: &std::collections::HashMap<String, String>,
+) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        provider_mark(ui, card.source, card.accent);
+        // 우측 메타(상태·날짜·링크) 폭을 예약하고 제목은 남는 폭에서 truncate —
+        // 긴 제목이 우측 메타를 밀어내지 않게 한다.
+        let reserved = 250.0;
+        let title_width = (ui.available_width() - reserved).max(120.0);
+        let translated = translations.get(&card.incident.title);
+        let title_text = translated.unwrap_or(&card.incident.title);
+        let title = ui.add_sized(
+            [title_width, 20.0],
+            egui::Label::new(egui::RichText::new(title_text).strong())
+                .truncate()
+                .halign(egui::Align::LEFT),
+        );
+        if let Some(_translated) = translated {
+            // 번역 표시 중 — 원문은 hover로 보존.
+            title.on_hover_text(&card.incident.title);
+        } else {
+            title.on_hover_text(title_text);
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.hyperlink_to("원문 →", &card.incident.url);
+            ui.weak(&card.incident.date);
+            ui.weak(incident_status_label(&card.incident.status));
+        });
+    });
 }
 
 fn orchestration_insights(
@@ -572,6 +621,38 @@ fn provider_mark(ui: &mut egui::Ui, source: &str, color: egui::Color32) {
 fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
     ui.painter().circle_filled(rect.center(), 4.0, color);
+}
+
+/// indicator → 점등 색. 미조회(None)/미지 값은 회색.
+fn indicator_color(ui: &egui::Ui, provider: Option<&ProviderStatus>) -> egui::Color32 {
+    match provider.map(|p| p.indicator) {
+        Some(ServiceIndicator::Operational) => egui::Color32::from_rgb(0x55, 0xc8, 0x79),
+        Some(ServiceIndicator::Minor) => egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
+        Some(ServiceIndicator::Major) | Some(ServiceIndicator::Critical) => {
+            egui::Color32::from_rgb(0xed, 0x5b, 0x61)
+        }
+        Some(ServiceIndicator::Unknown) | None => ui.visuals().weak_text_color(),
+    }
+}
+
+/// 상태바의 서비스 점등 1개 — 점 + 이름, hover에 상태 문구, 클릭 시 상태 페이지.
+fn service_status_light(
+    ui: &mut egui::Ui,
+    name: &str,
+    provider: Option<&ProviderStatus>,
+    page_url: &str,
+) {
+    status_dot(ui, indicator_color(ui, provider));
+    let hover = match provider {
+        Some(p) => p.description.clone(),
+        None => "상태 확인 중…".to_owned(),
+    };
+    let label = ui
+        .add(egui::Label::new(egui::RichText::new(name).weak()).sense(egui::Sense::click()))
+        .on_hover_text(format!("{hover}\n클릭: {page_url}"));
+    if label.clicked() {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(page_url));
+    }
 }
 
 #[cfg(test)]

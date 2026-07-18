@@ -1170,6 +1170,14 @@ pub struct App {
     /// 하단 상태바 「MCP N」용 활성 MCP 서버 수 캐시 — 매 프레임 DB 조회 금지
     /// (30s TTL — 커넥터 변경은 다음 갱신에 반영되면 충분한 준정적 값).
     mcp_count_cache: Option<(std::time::Instant, usize)>,
+    /// AI 서비스 상태 피드 수신(status.claude.com/openai — 5분 폴링 워커) + 최신
+    /// 스냅샷. provider별 조회 실패(None)면 마지막 성공값을 유지한다.
+    status_feed_rx: std::sync::mpsc::Receiver<crate::status_feed::StatusFeedSnapshot>,
+    status_feed: crate::status_feed::StatusFeedSnapshot,
+    /// 공지 제목 번역 캐시(원문 → 로케일 번역) + 진행 중 일회성 번역 수신.
+    /// LLM(claude CLI) 미연결·영어 로케일이면 항상 비어 있고 원문을 그대로 쓴다.
+    notice_translations: std::collections::HashMap<String, String>,
+    notice_translate_rx: Option<std::sync::mpsc::Receiver<Vec<(String, String)>>>,
     notifications_ui: ui::notifications::NotificationsUi,
     /// 벨 팝오버 「대기 중」 섹션의 PTY 입력 대기 카드 렌더 상태 (v3.9 N3) — 자유 입력칸
     /// 버퍼 + 로그 tail 미리보기 캐시. 팝오버가 열려 있을 때만 조회한다(idle 비용 0).
@@ -1517,6 +1525,10 @@ impl App {
             agent_terminal_ui: ui::agent_terminal::AgentTerminalUi::new(),
             activity_rows_cache: None,
             mcp_count_cache: None,
+            status_feed_rx: crate::status_feed::spawn(egui_ctx.clone()),
+            status_feed: crate::status_feed::StatusFeedSnapshot::default(),
+            notice_translations: std::collections::HashMap::new(),
+            notice_translate_rx: None,
             notifications_ui: ui::notifications::NotificationsUi::new(),
             inbox_waiting_ui: ui::inbox_waiting::InboxWaitingUi::new(),
             // 히스토리 파일은 앱 데이터 디렉터리(= 메타데이터 파일과 같은 폴더) 아래.
@@ -4074,6 +4086,47 @@ impl App {
         name
     }
 
+    /// 홈 공지 제목 번역 펌프 (2026-07-18) — 진행 중 결과를 캐시에 합치고, 캐시에
+    /// 없는 새 제목이 있으면 일회성 번역을 하나만 띄운다(rx 보유가 동시 실행 게이트).
+    /// 영어 로케일이거나 claude CLI가 없으면 아무것도 하지 않는다(원문 표시).
+    fn pump_notice_translations(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.notice_translate_rx {
+            match rx.try_recv() {
+                Ok(pairs) => {
+                    self.notice_translations.extend(pairs);
+                    self.notice_translate_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // CLI 없음/실패로 결과 없이 종료 — 원문 유지로 종결.
+                    self.notice_translate_rx = None;
+                }
+            }
+        }
+        if self.notice_translate_rx.is_some() {
+            return;
+        }
+        let Some(language) = crate::notice_translate::language_for_locale(&self.config.i18n.locale)
+        else {
+            return;
+        };
+        let pending: Vec<String> = [&self.status_feed.claude, &self.status_feed.openai]
+            .into_iter()
+            .flatten()
+            .flat_map(|provider| provider.incidents.iter())
+            .map(|incident| incident.title.clone())
+            .filter(|title| !self.notice_translations.contains_key(title))
+            .collect();
+        if pending.is_empty() || crate::notice_translate::claude_bin().is_none() {
+            return;
+        }
+        self.notice_translate_rx = Some(crate::notice_translate::spawn_translate(
+            pending,
+            language.to_owned(),
+            ctx.clone(),
+        ));
+    }
+
     fn activity_rows(&self) -> Vec<ui::activity::ActivityWorkspaceRow> {
         let now = std::time::Instant::now();
         self.workspaces
@@ -5357,6 +5410,17 @@ impl eframe::App for App {
                 count
             }
         };
+        // AI 서비스 상태 스냅샷 수신 — provider별 실패(None)는 마지막 성공값 유지
+        // (일시적 네트워크 오류로 점등이 회색으로 깜빡이지 않게).
+        while let Ok(snapshot) = self.status_feed_rx.try_recv() {
+            if snapshot.claude.is_some() {
+                self.status_feed.claude = snapshot.claude;
+            }
+            if snapshot.openai.is_some() {
+                self.status_feed.openai = snapshot.openai;
+            }
+        }
+        self.pump_notice_translations(ui.ctx());
         egui::Panel::bottom("agent_terminal_status_bar")
             .resizable(false)
             .exact_size(26.0)
@@ -5365,8 +5429,13 @@ impl eframe::App for App {
                     .inner_margin(egui::Margin::ZERO),
             )
             .show(ui, |ui| {
-                self.agent_terminal_ui
-                    .status_bar(ui, &activity_rows, waiting_count, mcp_count);
+                self.agent_terminal_ui.status_bar(
+                    ui,
+                    &activity_rows,
+                    waiting_count,
+                    mcp_count,
+                    &self.status_feed,
+                );
             });
 
         if self.file_tree.is_some() {
@@ -5799,6 +5868,8 @@ impl eframe::App for App {
                             waiting: waiting_count,
                             unread: self.notifications_ui.unread(),
                         },
+                        &self.status_feed,
+                        &self.notice_translations,
                     );
                 } else {
                     self.active.workspace_ui.show(

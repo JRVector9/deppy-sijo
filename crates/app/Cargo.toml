@@ -22,6 +22,9 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 regex = { workspace = true }
 serde_json = { workspace = true }
+# AI 서비스 상태 피드(status.claude.com/status.openai.com) 폴링 — sync ureq만
+# (tokio 금지 관례, auth/mcp/web-remote와 동일 클라이언트).
+ureq = { workspace = true }
 toml = { workspace = true }
 directories = { workspace = true }
 tracing = { workspace = true }

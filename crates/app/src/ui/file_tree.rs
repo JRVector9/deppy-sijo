@@ -1021,8 +1021,9 @@ impl FileTreeUi {
             // 따라 제목/요약/도구를 단계적으로 생략해 콘텐츠가 패널을 다시 밀지 않는다.
             .size_range(egui::Rangef::new(40.0, 680.0))
             .show(ui, |ui| {
-                // 세로 3행(38px) + 위 여백 — 하단 고정 nav 예약 높이.
-                let nav_h = 124.0;
+                // hairline(6)+간격(3)+위(6)+행 36×3+행간 2×2+마지막 간격(2)+아래(10)
+                // = 139 — 하단 고정 nav 예약 높이(실소비와 정확 일치, 잘림 방지).
+                let nav_h = 139.0;
                 let body_h = (ui.available_height() - nav_h).max(180.0);
                 let body = ui
                     .allocate_ui_with_layout(
@@ -1338,23 +1339,23 @@ impl FileTreeUi {
         let mut create_file = false;
         let (header_rect, _) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::hover());
-        let visible_tools = (((header_rect.width() - 4.0).max(0.0) / 25.0).floor() as usize).min(4);
+        let visible_tools = (((header_rect.width() - 4.0).max(0.0) / 20.0).floor() as usize).min(4);
         let mut tool_right = header_rect.right() - 4.0;
         if visible_tools >= 2 {
             let rect = egui::Rect::from_min_size(
-                egui::pos2(tool_right - 25.0, header_rect.top() + 6.5),
-                egui::vec2(25.0, 25.0),
+                egui::pos2(tool_right - 20.0, header_rect.top() + 9.0),
+                egui::vec2(20.0, 20.0),
             );
             create_folder =
                 file_toolbar_icon_at(ui, rect, "new_folder", FileToolbarIcon::Folder, false)
                     .on_hover_text(catalog.t("file_tree.new_folder_root", &[]))
                     .clicked();
-            tool_right -= 25.0;
+            tool_right -= 20.0;
         }
         if visible_tools >= 1 {
             let rect = egui::Rect::from_min_size(
-                egui::pos2(tool_right - 25.0, header_rect.top() + 6.5),
-                egui::vec2(25.0, 25.0),
+                egui::pos2(tool_right - 20.0, header_rect.top() + 9.0),
+                egui::vec2(20.0, 20.0),
             );
             let search = file_toolbar_icon_at(
                 ui,
@@ -1370,12 +1371,12 @@ impl FileTreeUi {
                     self.file_search.clear();
                 }
             }
-            tool_right -= 25.0;
+            tool_right -= 20.0;
         }
         if visible_tools >= 3 {
             let rect = egui::Rect::from_min_size(
-                egui::pos2(tool_right - 25.0, header_rect.top() + 6.5),
-                egui::vec2(25.0, 25.0),
+                egui::pos2(tool_right - 20.0, header_rect.top() + 9.0),
+                egui::vec2(20.0, 20.0),
             );
             let hidden = file_toolbar_icon_at(
                 ui,
@@ -1395,25 +1396,30 @@ impl FileTreeUi {
                     .store(self.show_hidden, std::sync::atomic::Ordering::Relaxed);
                 self.rebuild_flat();
             }
-            tool_right -= 25.0;
+            tool_right -= 20.0;
         }
         // 새 파일 — 툴바 리팩토링(2026-07-18)에서 빠졌던 버튼 복원. EditState::NewFile
         // 소비 흐름(인라인 편집·커밋)은 그대로 살아 있어 생성 지점만 다시 잇는다.
         if visible_tools >= 4 {
             let rect = egui::Rect::from_min_size(
-                egui::pos2(tool_right - 25.0, header_rect.top() + 6.5),
-                egui::vec2(25.0, 25.0),
+                egui::pos2(tool_right - 20.0, header_rect.top() + 9.0),
+                egui::vec2(20.0, 20.0),
             );
             create_file = file_toolbar_icon_at(ui, rect, "new_file", FileToolbarIcon::File, false)
                 .on_hover_text(catalog.t("file_tree.new_file_root", &[]))
                 .clicked();
-            tool_right -= 25.0;
+            tool_right -= 20.0;
         }
 
         let path_left = header_rect.left() + 10.0;
         if tool_right - path_left >= 20.0 {
             let icon_center = egui::pos2(path_left + 8.0, header_rect.center().y);
-            paint_folder(ui.painter(), icon_center, ui.visuals().text_color());
+            paint_folder(
+                ui.painter(),
+                icon_center,
+                ui.visuals().text_color(),
+                egui::vec2(12.825, 11.875),
+            );
             let text_left = path_left + 27.0;
             let text_width = (tool_right - text_left - 5.0).max(0.0);
             if text_width > 8.0
@@ -1491,7 +1497,12 @@ impl FileTreeUi {
             ui.visuals().weak_text_color()
         };
         let parent_icon_center = egui::pos2(parent_rect.left() + 28.5, parent_rect.center().y);
-        paint_folder(ui.painter(), parent_icon_center, parent_color);
+        paint_folder(
+            ui.painter(),
+            parent_icon_center,
+            parent_color,
+            egui::vec2(12.825, 11.875),
+        );
         ui.painter().text(
             egui::pos2(parent_rect.left() + 47.0, parent_rect.center().y),
             egui::Align2::LEFT_CENTER,
@@ -1717,7 +1728,12 @@ impl FileTreeUi {
                                     egui::Sense::hover(),
                                 );
                                 if row.is_dir {
-                                    paint_folder(ui.painter(), ir.center(), folder_col);
+                                    paint_folder(
+                                        ui.painter(),
+                                        ir.center(),
+                                        folder_col,
+                                        egui::vec2(12.825, 11.875),
+                                    );
                                 } else {
                                     let file_color = if inaccessible {
                                         ui.visuals().weak_text_color()
@@ -1726,7 +1742,13 @@ impl FileTreeUi {
                                     } else {
                                         entry_color
                                     };
-                                    paint_file(ui.painter(), ir.center(), file_color, carve);
+                                    paint_file(
+                                        ui.painter(),
+                                        ir.center(),
+                                        file_color,
+                                        carve,
+                                        egui::vec2(9.5, 11.97),
+                                    );
                                 }
                                 let text_color = if inaccessible {
                                     ui.visuals().weak_text_color()
@@ -2027,7 +2049,11 @@ impl FileTreeUi {
         catalog: &i18n::Catalog,
     ) -> Option<SidebarAction> {
         let mut action = None;
-        ui.add_space(4.0);
+        // 여백 대칭(2026-07-18 사용자): 구분선→홈 = 에이전트→바닥 = 12px.
+        // 위 = hairline 잔여 3 + 위젯 간격 3 + add_space 6 = 12,
+        // 아래 = 마지막 행 간격 2 + add_space 10 = 12. nav_h(139)와 정확 일치.
+        ui.spacing_mut().item_spacing.y = 2.0;
+        ui.add_space(6.0);
         if nav_row(
             ui,
             NavIcon::Home,
@@ -2061,6 +2087,7 @@ impl FileTreeUi {
         {
             action = Some(SidebarAction::OpenAgents);
         }
+        ui.add_space(10.0);
         action
     }
 
@@ -3214,35 +3241,52 @@ fn file_toolbar_icon_at(
         FileToolbarIcon::Hidden => {
             let center = rect.center();
             let stroke = egui::Stroke::new(1.2, color);
+            // 원본(±7, ±4, 동공 r2)의 14.5% 축소 (2026-07-18 사용자).
             let upper = vec![
-                egui::pos2(center.x - 7.0, center.y),
-                egui::pos2(center.x - 3.5, center.y - 3.2),
-                egui::pos2(center.x, center.y - 4.0),
-                egui::pos2(center.x + 3.5, center.y - 3.2),
-                egui::pos2(center.x + 7.0, center.y),
+                egui::pos2(center.x - 5.985, center.y),
+                egui::pos2(center.x - 2.9925, center.y - 2.736),
+                egui::pos2(center.x, center.y - 3.42),
+                egui::pos2(center.x + 2.9925, center.y - 2.736),
+                egui::pos2(center.x + 5.985, center.y),
             ];
             let lower = vec![
-                egui::pos2(center.x - 7.0, center.y),
-                egui::pos2(center.x - 3.5, center.y + 3.2),
-                egui::pos2(center.x, center.y + 4.0),
-                egui::pos2(center.x + 3.5, center.y + 3.2),
-                egui::pos2(center.x + 7.0, center.y),
+                egui::pos2(center.x - 5.985, center.y),
+                egui::pos2(center.x - 2.9925, center.y + 2.736),
+                egui::pos2(center.x, center.y + 3.42),
+                egui::pos2(center.x + 2.9925, center.y + 2.736),
+                egui::pos2(center.x + 5.985, center.y),
             ];
             ui.painter().add(egui::Shape::line(upper, stroke));
             ui.painter().add(egui::Shape::line(lower, stroke));
-            ui.painter().circle_filled(center, 2.0, color);
+            ui.painter().circle_filled(center, 1.71, color);
         }
-        FileToolbarIcon::Folder => paint_folder(ui.painter(), rect.center(), color),
-        FileToolbarIcon::File => {
-            paint_file(ui.painter(), rect.center(), color, ui.visuals().panel_fill)
+        FileToolbarIcon::Folder => {
+            // 원본 15×14의 14.5% 축소 (2026-07-18 사용자).
+            paint_folder(
+                ui.painter(),
+                rect.center(),
+                color,
+                egui::vec2(12.825, 11.875),
+            )
         }
+        FileToolbarIcon::File => paint_file(
+            ui.painter(),
+            rect.center(),
+            color,
+            ui.visuals().panel_fill,
+            // 원본 11×14의 23% 축소 (툴바 파일만 추가 10%, 2026-07-18 사용자).
+            egui::vec2(8.4645, 10.773),
+        ),
         FileToolbarIcon::Search => {
-            let center = rect.center() + egui::vec2(-2.0, -2.0);
-            ui.painter()
-                .circle_stroke(center, 5.5, egui::Stroke::new(1.5, color));
+            // 터미널 pane 헤더 검색(workspace.rs paint_terminal_toolbar_icon)과 동일
+            // 디자인 — 렌즈 r3.2·얇은 스트로크·짧은 핸들. 크기만 툴바에 맞춰 1.3배
+            // (스트로크는 헤더의 1.25 유지, 2026-07-18 사용자).
+            let lens = rect.center() + egui::vec2(-1.17, -1.17);
+            let stroke = egui::Stroke::new(1.25, color);
+            ui.painter().circle_stroke(lens, 4.16, stroke);
             ui.painter().line_segment(
-                [center + egui::vec2(4.0, 4.0), center + egui::vec2(8.0, 8.0)],
-                egui::Stroke::new(1.5, color),
+                [lens + egui::vec2(2.99, 2.99), lens + egui::vec2(5.85, 5.85)],
+                stroke,
             );
         }
     }
@@ -3340,13 +3384,19 @@ fn workspace_accent(name: &str) -> egui::Color32 {
 }
 
 /// 폴더 아이콘 — 참고 시안처럼 탭 + 본체의 얇은 윤곽선.
-fn paint_folder(p: &egui::Painter, c: egui::Pos2, col: egui::Color32) {
-    let w = 15.0;
-    let h = 11.0;
-    let body = egui::Rect::from_center_size(egui::pos2(c.x, c.y + 1.0), egui::vec2(w, h));
+/// 폴더 아이콘 — `size`는 탭 돌출까지 포함한 전체 (폭, 높이). 헤더/트리 행은
+/// 13.5×12.5, 툴바는 10×10 (2026-07-18 사용자 확정 수치).
+fn paint_folder(p: &egui::Painter, c: egui::Pos2, col: egui::Color32, size: egui::Vec2) {
+    let w = size.x;
+    let rise = (size.y * 0.24).round().max(2.0); // 12.5 기준 3px 탭 돌출 비례
+    let body_h = size.y - rise;
+    let body = egui::Rect::from_min_size(
+        egui::pos2(c.x - w / 2.0, c.y - size.y / 2.0 + rise),
+        egui::vec2(w, body_h),
+    );
     let tab = egui::Rect::from_min_size(
-        egui::pos2(body.left(), body.top() - 3.0),
-        egui::vec2(w * 0.45, 4.0),
+        egui::pos2(body.left(), body.top() - rise),
+        egui::vec2(w * 0.45, rise + 1.0),
     );
     let stroke = egui::Stroke::new(1.2, col);
     p.rect_stroke(tab, 1.0, stroke, egui::StrokeKind::Inside);
@@ -3354,10 +3404,17 @@ fn paint_folder(p: &egui::Painter, c: egui::Pos2, col: egui::Color32) {
 }
 
 /// 파일 아이콘 — 문서(접힌 모서리). `carve`는 접힌 모서리를 파낼 배경색.
-fn paint_file(p: &egui::Painter, c: egui::Pos2, col: egui::Color32, carve: egui::Color32) {
-    let w = 11.0;
-    let h = 14.0;
-    let fold = 4.0;
+/// `size` = (폭, 높이) — 트리 행 10×12.6, 툴바 7.9×10 (2026-07-18 사용자 확정).
+fn paint_file(
+    p: &egui::Painter,
+    c: egui::Pos2,
+    col: egui::Color32,
+    carve: egui::Color32,
+    size: egui::Vec2,
+) {
+    let w = size.x;
+    let h = size.y;
+    let fold = (h * 0.29).round(); // 14 기준 4px 접힘 비례
     let l = c.x - w / 2.0;
     let r = c.x + w / 2.0;
     let top = c.y - h / 2.0;
@@ -3404,7 +3461,7 @@ fn nav_row(
     badge: Option<&str>,
 ) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
@@ -5627,11 +5684,11 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         // 라벨 노드는 클립 밖에서도 만들어지므로 존재가 아니라 **위치**를 본다.
-        // 사이드바 본문은 패널 높이 700 − 하단 네비 124 = 최대 576 안이어야 보인다.
+        // 사이드바 본문은 패널 높이 700 − 하단 네비 139 = 최대 561 안이어야 보인다.
         // 이전 구현은 before_active 12행(552px)이 본문을 잠식해 행이 그 밖으로 밀렸다.
         let row_top = harness.get_by_label("root.txt").rect().top();
         assert!(
-            row_top < 576.0,
+            row_top < 561.0,
             "루트 파일 행이 사이드바 본문 밖(y={row_top})으로 밀렸다 — 워크스페이스 목록이 bounded 스크롤을 공유해야 한다"
         );
         std::fs::remove_dir_all(&base).unwrap();

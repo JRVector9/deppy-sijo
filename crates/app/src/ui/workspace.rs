@@ -20,7 +20,7 @@ const PATH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
 // 각 split leaf가 독립 터미널이 되는 패널형 구조. 헤더는 한 줄로 얇게 유지하고
 // PTY는 외곽 카드 여백 없이 패널 면을 채운다.
-const TERMINAL_PANE_HEADER_HEIGHT: f32 = 34.0;
+const TERMINAL_PANE_HEADER_HEIGHT: f32 = 32.0;
 const TERMINAL_STREAM_LEFT_PADDING: f32 = 3.0;
 const TERMINAL_STREAM_RIGHT_PADDING: f32 = 3.0;
 const TERMINAL_STREAM_VERTICAL_PADDING: f32 = 6.0;
@@ -3961,7 +3961,7 @@ mod tests {
     use terminal::{CursorShape, CursorSnapshot, TerminalCell};
 
     #[test]
-    fn 분할_터미널은_34pt_헤더와_좌우3_상하6_본문여백을_유지한다() {
+    fn 분할_터미널은_32pt_헤더와_좌우3_상하6_본문여백을_유지한다() {
         // 상수 조정(헤더 30→34pt, 좌우 여백 6→3pt — 2026-07-18 디자인 트랙)에 맞춘
         // 기대값. 상수의 단일 원천은 TERMINAL_PANE_HEADER_HEIGHT/STREAM_*_PADDING.
         let layout = terminal_pane_layout(egui::Rect::from_min_size(

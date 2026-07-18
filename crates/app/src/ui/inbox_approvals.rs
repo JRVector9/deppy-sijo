@@ -303,7 +303,14 @@ mod tests {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let workspace_names = HashMap::new();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let action = render(ui, &catalog, &[], &workspace_names, &HashMap::new(), POPUP_MAX_CARDS);
+            let action = render(
+                ui,
+                &catalog,
+                &[],
+                &workspace_names,
+                &HashMap::new(),
+                POPUP_MAX_CARDS,
+            );
             assert!(action.decision.is_none());
             assert!(action.goto.is_none());
         });

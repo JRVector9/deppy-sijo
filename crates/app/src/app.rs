@@ -1149,6 +1149,9 @@ pub struct App {
     workspace_rename_prompt: Option<(String, String)>,
     /// 프로젝트 삭제 확인 대기 — Some((id, 표시명)). 확인 모달에서 확정/취소(2026-07-10).
     ws_delete_confirm: Option<(String, String)>,
+    /// 사이드바 「워크스페이스 종료」 확인 대기 — Some((id, 표시명, 세션 수, 실행 중 수)).
+    /// 확정 시 세션(pane)만 일괄 닫고 워크스페이스(경로·설정·DB 기록)는 보존한다.
+    ws_close_confirm: Option<(String, String, usize, usize)>,
     /// runtime durable 이벤트 큐가 포화돼 느린 구독자가 끊긴 경우 사용자 경고 모달.
     runtime_stream_warning: bool,
     /// live warm hard cap을 넘기는 workspace 전환을 거부했을 때 대상 표시명.
@@ -1542,6 +1545,7 @@ impl App {
             dotenv_sync_deferred: None,
             workspace_rename_prompt: None,
             ws_delete_confirm: None,
+            ws_close_confirm: None,
             runtime_stream_warning: false,
             warm_limit_warning: None,
             web_switch_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -3476,6 +3480,77 @@ impl App {
             } else {
                 i += 1;
             }
+        }
+    }
+
+    /// 워크스페이스의 세션(pane)을 전부 닫는다 — 사이드바 「워크스페이스 종료」 확정 경로.
+    /// 워크스페이스 자체(경로·설정·DB 기록)는 보존한다(설정의 「프로젝트 삭제」와 구분).
+    fn close_workspace_sessions(&mut self, workspace_id: &str) {
+        if workspace_id == self.active.id {
+            // 활성: 전 pane을 확인 없이 즉시 닫는다(확인은 모달이 이미 했다). 워크스
+            // 페이스는 활성인 채 빈 상태로 남는다 — 바로 새 셸을 열 수 있다.
+            let panes: Vec<runtime::MuxPaneId> = self
+                .active
+                .workspace_ui
+                .mux()
+                .map(|mux| {
+                    mux.tabs
+                        .iter()
+                        .flat_map(|tab| tab.panes.iter().map(|p| p.id.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            tracing::info!(
+                workspace = %workspace_id,
+                panes = panes.len(),
+                "워크스페이스 종료 — 활성 pane 일괄 닫기"
+            );
+            for pane in panes {
+                self.active
+                    .workspace_ui
+                    .close_pane_now(&self.active.runtime, pane);
+            }
+        } else if self.warm.contains_key(workspace_id) {
+            // warm: 살아 있는 워커에 ClosePane을 모두 보낸 뒤 runtime을 내린다(idle 전환,
+            // 프로젝트 삭제의 warm 종료 경로와 같은 순서). worker 루프는 shutdown 판정
+            // 전에 큐 명령을 전부 소화하므로 pane 정리(persist layout 갱신)가 종료 전에
+            // 반영된다 — 재활성 시 세션이 부활하지 않는다. 한계: warm 동안 새로 생긴
+            // pane은 mux 스냅샷이 얼어 못 찾는다(워크트리 삭제 경로와 동일) — layout에
+            // 남아 재활성 시 fresh 셸로만 뜬다.
+            self.join_pending_shutdown(workspace_id);
+            if let Some(mut rt) = self.warm.remove(workspace_id) {
+                let panes: Vec<runtime::MuxPaneId> = rt
+                    .workspace_ui
+                    .mux()
+                    .map(|mux| {
+                        mux.tabs
+                            .iter()
+                            .flat_map(|tab| tab.panes.iter().map(|p| p.id.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                tracing::info!(
+                    workspace = %workspace_id,
+                    panes = panes.len(),
+                    "워크스페이스 종료 — warm pane 정리 후 runtime shutdown"
+                );
+                for pane in panes {
+                    rt.workspace_ui.close_pane_now(&rt.runtime, pane);
+                }
+                rt.runtime.shutdown();
+            }
+            self.warm_order.retain(|id| id != workspace_id);
+            self.broadcast_terminal_cache_policy();
+            // 내려간 워크스페이스의 진행형 알림은 더는 조치 불가 — suspend와 같은 정리
+            // (결과 알림은 기록이라 유지).
+            self.notifications_ui.prune_transient(workspace_id);
+        } else {
+            // 확인 모달이 떠 있는 사이 auto-suspend 등으로 이미 내려간 경우 — 조용히
+            // 지나가지 않고 로그로 남긴다(닫을 세션이 없으니 실행할 것도 없다).
+            tracing::info!(
+                workspace = %workspace_id,
+                "워크스페이스 종료 생략 — 이미 비활성(세션 없음)"
+            );
         }
     }
 
@@ -5850,6 +5925,27 @@ impl eframe::App for App {
                         .workspace_ui
                         .request_close_pane(&self.active.runtime, pane);
                 }
+                Some(ui::file_tree::SidebarAction::CloseWorkspace(workspace_id)) => {
+                    // 세션·실행 중 수는 사이드바 행이 그린 것과 같은 원천(summary) —
+                    // 다이얼로그 숫자가 방금 본 행 요약과 어긋나지 않는다.
+                    match sidebar_workspaces.iter().find(|w| w.id == workspace_id) {
+                        Some(entry)
+                            if entry.state != ui::file_tree::SidebarWorkspaceState::Idle =>
+                        {
+                            let s = entry.summary;
+                            let total = s.running + s.waiting + s.done + s.error + s.idle;
+                            self.ws_close_confirm =
+                                Some((workspace_id, entry.name.clone(), total, s.running));
+                        }
+                        _ => {
+                            // 메뉴는 Idle에 안 붙지만 요청 프레임 사이 상태 변화 방어.
+                            tracing::info!(
+                                workspace = %workspace_id,
+                                "워크스페이스 종료 무시 — 닫을 세션/런타임 없음"
+                            );
+                        }
+                    }
+                }
                 None => {}
             }
         }
@@ -6242,6 +6338,46 @@ impl eframe::App for App {
                 });
             if close {
                 self.warm_limit_warning = None;
+            }
+        }
+
+        // 「워크스페이스 종료」 확인 모달 — 실행 중 에이전트를 죽일 수 있어 반드시
+        // 확인을 거친다(pane 닫기 confirm_close와 같은 중앙 egui::Window 관례).
+        if let Some((close_id, close_name, total, running)) = self.ws_close_confirm.clone() {
+            let mut decision: Option<bool> = None; // Some(true)=모두 종료, Some(false)=취소
+            egui::Window::new(text.t("workspace.close_ws_confirm.title", &[]))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    ui.label(text.t(
+                        "workspace.close_ws_confirm.body",
+                        &[
+                            ("name", close_name.as_str()),
+                            ("count", &total.to_string()),
+                            ("running", &running.to_string()),
+                        ],
+                    ));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(text.t("workspace.close_ws_confirm.confirm", &[]))
+                            .clicked()
+                        {
+                            decision = Some(true);
+                        }
+                        if ui.button(text.t("action.cancel", &[])).clicked() {
+                            decision = Some(false);
+                        }
+                    });
+                });
+            match decision {
+                Some(true) => {
+                    self.ws_close_confirm = None;
+                    self.close_workspace_sessions(&close_id);
+                }
+                Some(false) => self.ws_close_confirm = None,
+                None => {}
             }
         }
 

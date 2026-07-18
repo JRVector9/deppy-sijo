@@ -164,6 +164,10 @@ pub enum SidebarAction {
     RemoveWorktree {
         session: runtime::SessionId,
     },
+    /// 워크스페이스의 세션(pane)을 전부 닫는다 — 워크스페이스 자체(경로·설정·DB
+    /// 기록)는 보존한다(설정의 「프로젝트 삭제」와 구분). 실행 중 에이전트를 죽일 수
+    /// 있어 App이 확인 다이얼로그를 거친 뒤 수행한다.
+    CloseWorkspace(String),
 }
 
 /// 트리 노드. `children == None`은 아직 나열 안 됨(lazy).
@@ -1082,15 +1086,19 @@ impl FileTreeUi {
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 for workspace in before_active {
-                    if workspace_row(ui, workspace, false, Some(false)).clicked() {
+                    let resp = workspace_row(ui, workspace, false, Some(false));
+                    workspace_close_menu(&resp, workspace, catalog, &mut action);
+                    if resp.clicked() {
                         action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
                     }
                 }
-                if let Some(active) = active
-                    && workspace_row(ui, active, true, Some(self.workspace_sessions_expanded))
-                        .clicked()
-                {
-                    self.workspace_sessions_expanded = !self.workspace_sessions_expanded;
+                if let Some(active) = active {
+                    let resp =
+                        workspace_row(ui, active, true, Some(self.workspace_sessions_expanded));
+                    workspace_close_menu(&resp, active, catalog, &mut action);
+                    if resp.clicked() {
+                        self.workspace_sessions_expanded = !self.workspace_sessions_expanded;
+                    }
                 }
 
                 // 현재 workspace의 셸/에이전트를 활성 워크스페이스 아래에 들여써 나열한다.
@@ -1306,7 +1314,9 @@ impl FileTreeUi {
                         });
                 }
                 for workspace in after_active {
-                    if workspace_row(ui, workspace, false, Some(false)).clicked() {
+                    let resp = workspace_row(ui, workspace, false, Some(false));
+                    workspace_close_menu(&resp, workspace, catalog, &mut action);
+                    if resp.clicked() {
                         action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
                     }
                 }
@@ -2855,6 +2865,38 @@ fn workspace_row(
         ));
     }
     response
+}
+
+/// 워크스페이스 행 우클릭 메뉴 — 「워크스페이스 종료」(세션 일괄 닫기, 확인은 App).
+/// Idle은 닫을 세션도 내릴 런타임도 없어 메뉴를 붙이지 않는다.
+fn workspace_close_menu(
+    resp: &egui::Response,
+    workspace: &SidebarWorkspaceEntry,
+    catalog: &i18n::Catalog,
+    action: &mut Option<SidebarAction>,
+) {
+    if workspace.state == SidebarWorkspaceState::Idle {
+        return;
+    }
+    resp.context_menu(|ui| workspace_close_menu_items(ui, workspace, catalog, action));
+}
+
+/// 종료 메뉴 본문 — 팝업 없이 렌더할 수 있게 분리해 kittest 대상으로 삼는다
+/// (workspace.rs last_output_menu_items 관례 — kittest는 press/release를 다른
+/// 프레임에 재생해 실제 팝업 안 버튼의 clicked를 관측하지 못한다).
+fn workspace_close_menu_items(
+    ui: &mut egui::Ui,
+    workspace: &SidebarWorkspaceEntry,
+    catalog: &i18n::Catalog,
+    action: &mut Option<SidebarAction>,
+) {
+    if ui
+        .button(catalog.t("sidebar.menu.close_workspace", &[]))
+        .clicked()
+    {
+        *action = Some(SidebarAction::CloseWorkspace(workspace.id.clone()));
+        ui.close();
+    }
 }
 
 fn workspace_creation_order_partition<'a>(
@@ -5504,5 +5546,142 @@ mod tests {
         });
         assert_eq!(opened.as_deref(), Some(base.join("a.pdf").as_path()));
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// 워크스페이스 행(painter 기반 — 라벨 노드 없음) 우클릭용 헬퍼: 행 높이(46px)
+    /// 범위를 훑으며 우클릭해 메뉴 라벨이 나타나는지 본다. 실제 App 연결은 app.rs의
+    /// CloseWorkspace 핸들러가 하고, 여기서는 메뉴 → 액션 방출만 검증한다.
+    fn right_click_scan(
+        harness: &mut egui_kittest::Harness<'_, (FileTreeUi, Vec<SidebarAction>, bool)>,
+        label: &str,
+    ) -> bool {
+        use egui_kittest::kittest::Queryable;
+        for y_step in 0..20 {
+            let pos = egui::pos2(100.0, 24.0 + y_step as f32 * 6.0);
+            harness.event(egui::Event::PointerMoved(pos));
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            });
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            });
+            harness.step();
+            if harness.query_by_label(label).is_some() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn close_menu_harness<'a>(
+        workspaces: &'a [SidebarWorkspaceEntry],
+        active_id: &'static str,
+        catalog: &'a i18n::Catalog,
+    ) -> egui_kittest::Harness<'a, (FileTreeUi, Vec<SidebarAction>, bool)> {
+        let tree = FileTreeUi::new(egui::Context::default());
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 700.0))
+            .with_step_dt(0.05)
+            .build_ui_state(
+                |ui, state: &mut (FileTreeUi, Vec<SidebarAction>, bool)| {
+                    // 폰트(mono_bold) 설치 전 빌드 프레임은 건너뛴다.
+                    if !state.2 {
+                        return;
+                    }
+                    let snapshot = SidebarSnapshot {
+                        active_workspace_id: active_id,
+                        workspaces,
+                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        inbox_count: 0,
+                    };
+                    if let Some(a) = state.0.panel(ui, &[], &snapshot, catalog) {
+                        state.1.push(a);
+                    }
+                },
+                (tree, Vec::new(), false),
+            );
+        // workspace_row가 쓰는 mono_bold 패밀리를 테스트 컨텍스트에도 설치한다.
+        let font_config = crate::config::Config::default();
+        crate::fonts::install_cjk_fallback(
+            &harness.ctx,
+            None,
+            &font_config.terminal.mono_font,
+            &font_config.terminal.mono_weight,
+        );
+        harness.state_mut().2 = true;
+        harness.step();
+        harness
+    }
+
+    /// 워크스페이스 행 우클릭 → 「워크스페이스 종료」 메뉴가 열린다 (실제 팝업 경로).
+    /// 팝업 안 버튼 클릭은 kittest가 press/release를 다른 프레임에 재생해 관측 불가
+    /// — 액션 방출은 아래 분리 본문 테스트가 검증한다.
+    #[test]
+    fn kittest_워크스페이스_우클릭이_종료메뉴를_연다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspaces = vec![SidebarWorkspaceEntry {
+            id: "ws-close".to_owned(),
+            name: "closer".to_owned(),
+            state: SidebarWorkspaceState::Active,
+            summary: SidebarSessionSummary::default(),
+        }];
+        let mut harness = close_menu_harness(&workspaces, "ws-close", &catalog);
+        assert!(
+            right_click_scan(&mut harness, "Close workspace sessions"),
+            "워크스페이스 행 우클릭이 종료 메뉴를 열지 못함"
+        );
+    }
+
+    /// 종료 메뉴 본문 클릭 → CloseWorkspace(id) 액션 방출 (last_output_menu_items 관례).
+    #[test]
+    fn kittest_종료메뉴_클릭이_close_workspace_액션을_낸다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspace = SidebarWorkspaceEntry {
+            id: "ws-close".to_owned(),
+            name: "closer".to_owned(),
+            state: SidebarWorkspaceState::Warm,
+            summary: SidebarSessionSummary::default(),
+        };
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, action: &mut Option<SidebarAction>| {
+                workspace_close_menu_items(ui, &workspace, &catalog, action);
+            },
+            None,
+        );
+        harness.run();
+        harness.get_by_label("Close workspace sessions").click();
+        harness.run();
+        assert!(
+            matches!(
+                harness.state(),
+                Some(SidebarAction::CloseWorkspace(id)) if id == "ws-close"
+            ),
+            "종료 메뉴 클릭이 CloseWorkspace 액션을 내지 않음"
+        );
+    }
+
+    /// Idle(비활성) 워크스페이스에는 종료 메뉴가 붙지 않는다 — 닫을 세션이 없다.
+    #[test]
+    fn kittest_비활성_워크스페이스에는_종료메뉴가_없다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspaces = vec![SidebarWorkspaceEntry {
+            id: "ws-idle".to_owned(),
+            name: "sleeper".to_owned(),
+            state: SidebarWorkspaceState::Idle,
+            summary: SidebarSessionSummary::inactive(0),
+        }];
+        let mut harness = close_menu_harness(&workspaces, "ws-active-elsewhere", &catalog);
+        assert!(
+            !right_click_scan(&mut harness, "Close workspace sessions"),
+            "Idle 워크스페이스 행에 종료 메뉴가 떴다"
+        );
+        assert!(harness.state().1.is_empty(), "Idle 행 우클릭이 액션을 냄");
     }
 }

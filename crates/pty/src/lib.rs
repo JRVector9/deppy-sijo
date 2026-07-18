@@ -103,6 +103,27 @@ impl PortablePtyBackend {
         builder.env("TERM_PROGRAM", "deppy-sijo");
         builder.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
         builder.env("CLICOLOR", "1");
+        #[cfg(unix)]
+        if command_env_is_empty(cmd, "LS_COLORS") {
+            // GNU ls/eza 계열: 파일 확장자까지 파일 트리 팔레트와 비슷하게 구분한다.
+            builder.env(
+                "LS_COLORS",
+                concat!(
+                    "di=1;34:ln=1;35:so=1;36:pi=0;33:ex=1;32:bd=1;33:cd=1;33:",
+                    "*.rs=38;5;208:*.toml=38;5;214:*.json=38;5;220:",
+                    "*.yaml=38;5;220:*.yml=38;5;220:*.md=38;5;114:",
+                    "*.png=38;5;177:*.jpg=38;5;177:*.jpeg=38;5;177:",
+                    "*.gif=38;5;177:*.svg=38;5;177:*.ts=38;5;75:*.tsx=38;5;75:",
+                    "*.js=38;5;221:*.jsx=38;5;221:*.py=38;5;114:*.sh=38;5;114:",
+                    "*.zip=38;5;141:*.tar=38;5;141:*.gz=38;5;141"
+                ),
+            );
+        }
+        #[cfg(target_os = "macos")]
+        if command_env_is_empty(cmd, "LSCOLORS") {
+            // BSD ls: 디렉터리/링크/실행파일 등 파일 종류를 선명한 기본색으로 표시한다.
+            builder.env("LSCOLORS", "ExFxCxDxBxegedabagacad");
+        }
         builder.env_remove("NO_COLOR");
         #[cfg(target_os = "macos")]
         if command_env_is_empty(cmd, "LANG") {
@@ -212,7 +233,6 @@ impl PortablePtyBackend {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn command_env_is_empty(cmd: &CommandSpec, key: &str) -> bool {
     cmd.env
         .iter()

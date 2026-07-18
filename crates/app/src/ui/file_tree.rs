@@ -1630,10 +1630,15 @@ impl FileTreeUi {
                                 ui.add_space(10.0 + row.depth as f32 * 18.0);
                                 // 캐럿+폴더/파일 아이콘을 도형으로 (이모지 □ 깨짐 회피, 목업 §트리)
                                 let caret_col = ui.visuals().weak_text_color();
+                                let entry_color = file_entry_color(
+                                    &row.name,
+                                    row.is_dir,
+                                    egui::Color32::from_rgb(0xc8, 0xcc, 0xd2),
+                                );
                                 let folder_col = if inaccessible {
                                     ui.visuals().weak_text_color()
                                 } else {
-                                    egui::Color32::from_rgb(0x4c, 0xa8, 0xdf)
+                                    entry_color
                                 };
                                 let carve = ui.visuals().extreme_bg_color;
                                 let (cr, _) = ui.allocate_exact_size(
@@ -1650,18 +1655,26 @@ impl FileTreeUi {
                                 if row.is_dir {
                                     paint_folder(ui.painter(), ir.center(), folder_col);
                                 } else {
-                                    let fc = if row.name.starts_with('.') {
+                                    let file_color = if inaccessible {
                                         ui.visuals().weak_text_color()
+                                    } else if row.name.starts_with('.') {
+                                        entry_color.gamma_multiply(0.62)
                                     } else {
-                                        egui::Color32::from_rgb(0xc8, 0xcc, 0xd2)
+                                        entry_color
                                     };
-                                    paint_file(ui.painter(), ir.center(), fc, carve);
+                                    paint_file(ui.painter(), ir.center(), file_color, carve);
                                 }
-                                let mut rich =
-                                    egui::RichText::new(&row.name).monospace().size(12.5);
-                                if row.name.starts_with('.') || inaccessible {
-                                    rich = rich.weak();
-                                }
+                                let text_color = if inaccessible {
+                                    ui.visuals().weak_text_color()
+                                } else if row.name.starts_with('.') {
+                                    entry_color.gamma_multiply(0.62)
+                                } else {
+                                    entry_color
+                                };
+                                let rich = egui::RichText::new(&row.name)
+                                    .monospace()
+                                    .size(12.5)
+                                    .color(text_color);
                                 ui.add(
                                     egui::Label::new(rich)
                                         .sense(egui::Sense::click())
@@ -2708,24 +2721,32 @@ fn workspace_row(
         ui.painter()
             .rect_filled(rect, 1.0, ui.visuals().widgets.hovered.bg_fill);
     }
-    let color = match workspace.state {
-        SidebarWorkspaceState::Active => egui::Color32::from_rgb(0x55, 0xc8, 0x79),
-        SidebarWorkspaceState::Warm => egui::Color32::from_rgb(0x4c, 0xa8, 0xdf),
-        SidebarWorkspaceState::Idle => ui.visuals().weak_text_color(),
-    };
+    // 선택/실행 상태와 무관한 프로젝트 고유색. 40pt 아이콘 레일에서도 워크스페이스를
+    // 색만으로 빠르게 구분할 수 있게 비활성 행도 같은 색을 유지한다.
+    let color = workspace_accent(&workspace.name);
     let avatar = egui::Rect::from_min_size(
         egui::pos2(rect.left() + 8.0, rect.top() + 8.0),
         egui::vec2(30.0, 30.0),
     );
     // 워크스페이스 마크는 별도 테두리 없이 상태색을 채운다(HTML 목업과 같은 규칙).
-    ui.painter()
-        .rect_filled(avatar, 1.0, color.gamma_multiply(0.28));
+    ui.painter().rect_filled(
+        avatar,
+        1.0,
+        color.gamma_multiply(if active { 0.48 } else { 0.36 }),
+    );
+    let bold_family = egui::FontFamily::Name(terminal::MONO_BOLD_FAMILY.into());
+    let initial = workspace
+        .name
+        .chars()
+        .next()
+        .and_then(|character| character.to_uppercase().next())
+        .unwrap_or('W');
     ui.painter().text(
         avatar.center(),
         egui::Align2::CENTER_CENTER,
-        workspace.name.chars().next().unwrap_or('W'),
-        egui::FontId::proportional(15.0),
-        color,
+        initial,
+        egui::FontId::new(15.0, bold_family.clone()),
+        egui::Color32::WHITE,
     );
     let show_summary = rect.width() >= 270.0;
     let show_disclosure = expanded.is_some() && rect.width() >= 56.0;
@@ -2733,10 +2754,11 @@ fn workspace_row(
         let reserved_right = if show_summary { 198.0 } else { 8.0 };
         let name_width = (rect.right() - reserved_right - avatar.right() - 9.0).max(0.0);
         if name_width > 4.0 {
+            let uppercase_name = workspace.name.to_uppercase();
             let name = clipped_line(
                 ui,
-                &workspace.name,
-                egui::FontId::proportional(15.0),
+                &uppercase_name,
+                egui::FontId::new(14.0, bold_family),
                 name_width,
             );
             ui.painter().galley(
@@ -3117,6 +3139,87 @@ fn compact_root_path(root: &Path) -> String {
         return format!("~/{}", relative.display());
     }
     root.display().to_string()
+}
+
+/// 파일 트리와 셸 `LS_COLORS`가 공유하는 어두운 배경용 유형 팔레트.
+fn file_entry_color(name: &str, is_dir: bool, fallback: egui::Color32) -> egui::Color32 {
+    if is_dir {
+        return egui::Color32::from_rgb(0x4c, 0xa8, 0xdf);
+    }
+    let lower = name.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "cargo.toml"
+            | "cargo.lock"
+            | "package.json"
+            | "package-lock.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | ".gitignore"
+            | ".gitattributes"
+            | ".env"
+    ) {
+        return egui::Color32::from_rgb(0xd7, 0xa6, 0x5f);
+    }
+    match Path::new(&lower)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+    {
+        "rs" => egui::Color32::from_rgb(0xe5, 0x8c, 0x55),
+        "js" | "jsx" | "mjs" | "cjs" => egui::Color32::from_rgb(0xe5, 0xc0, 0x7b),
+        "ts" | "tsx" => egui::Color32::from_rgb(0x61, 0xaf, 0xef),
+        "html" | "htm" | "css" | "scss" | "sass" | "less" => {
+            egui::Color32::from_rgb(0x56, 0xb6, 0xc2)
+        }
+        "py" | "rb" | "go" | "sh" | "bash" | "zsh" | "fish" => {
+            egui::Color32::from_rgb(0x98, 0xc3, 0x79)
+        }
+        "toml" | "json" | "jsonc" | "yaml" | "yml" | "xml" | "ini" | "conf" | "config" => {
+            egui::Color32::from_rgb(0xd7, 0xa6, 0x5f)
+        }
+        "md" | "mdx" | "txt" | "rst" | "pdf" | "doc" | "docx" => {
+            egui::Color32::from_rgb(0x7e, 0xc6, 0x99)
+        }
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "heic" | "avif" | "bmp" | "tif"
+        | "tiff" => egui::Color32::from_rgb(0xc6, 0x78, 0xdd),
+        "mp3" | "wav" | "flac" | "aac" | "m4a" | "mp4" | "mov" | "mkv" | "webm" => {
+            egui::Color32::from_rgb(0xe0, 0x6c, 0x75)
+        }
+        "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "7z" | "rar" => {
+            egui::Color32::from_rgb(0xa8, 0x78, 0xd4)
+        }
+        _ => fallback,
+    }
+}
+
+fn workspace_accent(name: &str) -> egui::Color32 {
+    match name
+        .chars()
+        .next()
+        .and_then(|character| character.to_uppercase().next())
+        .unwrap_or('W')
+    {
+        'S' => egui::Color32::from_rgb(0x55, 0xc8, 0x79),
+        'A' => egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
+        'V' => egui::Color32::from_rgb(0x9a, 0x78, 0xe8),
+        'C' => egui::Color32::from_rgb(0x43, 0xb8, 0xcd),
+        'P' => egui::Color32::from_rgb(0x4c, 0x84, 0xdf),
+        _ => {
+            let palette = [
+                egui::Color32::from_rgb(0x55, 0xc8, 0x79),
+                egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
+                egui::Color32::from_rgb(0x9a, 0x78, 0xe8),
+                egui::Color32::from_rgb(0x43, 0xb8, 0xcd),
+                egui::Color32::from_rgb(0x4c, 0x84, 0xdf),
+                egui::Color32::from_rgb(0xe0, 0x6c, 0x75),
+            ];
+            let hash = name.bytes().fold(0usize, |acc, byte| {
+                acc.wrapping_mul(31).wrapping_add(byte as usize)
+            });
+            palette[hash % palette.len()]
+        }
+    }
 }
 
 /// 폴더 아이콘 — 참고 시안처럼 탭 + 본체의 얇은 윤곽선.

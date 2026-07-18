@@ -5172,7 +5172,14 @@ mod tests {
             .with_step_dt(0.05)
             .build_ui_state(
                 |ui, state: &mut (FileTreeUi, Vec<SidebarAction>)| {
-                    if let Some(a) = state.0.panel(ui, &[], &catalog) {
+                    // 워크스페이스 목록은 이 테스트와 무관 — 최소 스냅샷.
+                    let snapshot = SidebarSnapshot {
+                        active_workspace_id: "ws-test",
+                        workspaces: &[],
+                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        inbox_count: 0,
+                    };
+                    if let Some(a) = state.0.panel(ui, &[], &snapshot, &catalog) {
                         state.1.push(a);
                     }
                 },

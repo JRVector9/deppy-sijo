@@ -101,6 +101,18 @@ pub(crate) fn drain() -> NativeKeyDownBatch {
     batch
 }
 
+/// drain하지 않고 fresh한 Command+V key-down이 있는지만 본다. 파일 트리 ⌘V 게이트가
+/// 터미널의 drain(prepare_frame)보다 **같은 프레임 먼저** 신호를 봐야 붙여넣기 소유권을
+/// 정하고 터미널 이중 처리를 누를 수 있다 — 소비(drain)는 여전히 WorkspaceUi만 한다.
+pub(crate) fn peek_clipboard_paste() -> bool {
+    let Ok(key_downs) = queue().lock() else {
+        return false;
+    };
+    key_downs
+        .iter()
+        .any(|kd| matches!(kd, NativeKeyDown::ClipboardPaste { .. }) && kd.fresh())
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn install() {
     use std::ptr::NonNull;

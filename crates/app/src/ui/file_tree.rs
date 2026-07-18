@@ -296,6 +296,13 @@ pub struct FileTreeUi {
     session_name_edit: Option<(runtime::MuxPaneId, String)>,
     /// 활성 워크스페이스의 세션 트리 접힘 상태. 접혀도 요약 수치는 워크스페이스 행에 남긴다.
     workspace_sessions_expanded: bool,
+    /// 마지막 외부 파일 붙여넣기(⌘V) 처리 시각 — 같은 제스처의 press(native)와
+    /// release(egui fallback)가 두 번 복사하는 것을 막는다(터미널 PASTE_GESTURE 관례).
+    last_external_paste: Option<std::time::Instant>,
+    /// 이번 프레임 트리가 ⌘V를 소비했는지 — App이 터미널의 같은 제스처 붙여넣기를 누른다.
+    consumed_paste_shortcut: bool,
+    /// 이번 프레임 트리가 ⌘C를 소비했는지 — App이 터미널 선택 복사의 덮어쓰기를 누른다.
+    consumed_copy_shortcut: bool,
 }
 
 /// 백그라운드 파일 조작 결과 — 완료 후 재나열할 부모 디렉터리 + 에러(있으면).
@@ -673,7 +680,19 @@ impl FileTreeUi {
             last_watch_reload: std::time::Instant::now(),
             session_name_edit: None,
             workspace_sessions_expanded: true,
+            last_external_paste: None,
+            consumed_paste_shortcut: false,
+            consumed_copy_shortcut: false,
         }
+    }
+
+    /// 이번 프레임 트리가 소비한 (⌘V, ⌘C). App이 같은 프레임 터미널 이중 처리
+    /// (경로 삽입 붙여넣기/선택 복사 pasteboard 덮어쓰기)를 누르는 데 쓴다. 읽으면 리셋.
+    pub fn take_clipboard_shortcut_consumption(&mut self) -> (bool, bool) {
+        (
+            std::mem::take(&mut self.consumed_paste_shortcut),
+            std::mem::take(&mut self.consumed_copy_shortcut),
+        )
     }
 
     /// 루트 교체 (workspace 전환/경로 변경). 캐시를 버리고 루트만 다시 나열한다.
@@ -1710,7 +1729,8 @@ impl FileTreeUi {
         let drag_pos = (os_drag_active || !os_dropped.is_empty())
             .then(|| os_drag_pointer_pos(ui.ctx()).or_else(|| ui.input(|i| i.pointer.latest_pos())))
             .flatten();
-        // 포인터 밑 행 기준 반입 대상(폴더 행=자신, 파일 행=부모).
+        // 포인터 밑 행 기준 반입 대상(폴더 행=자신, 파일 행=부모) — 드롭(①)/⌘V(②) 공유.
+        let mut hover_target_dir: Option<PathBuf> = None;
         let mut drop_target_dir: Option<PathBuf> = None;
         let mut drag_row_highlighted = false;
         let scroll_output = egui::ScrollArea::vertical()
@@ -1760,6 +1780,10 @@ impl FileTreeUi {
                             1.0,
                             ui.visuals().widgets.hovered.weak_bg_fill,
                         );
+                        // ⌘V 대상 폴더 — hover 판정을 그대로 재사용(§과제②).
+                        if !inaccessible {
+                            hover_target_dir = Some(row_target_dir(row, self.root.as_deref()));
+                        }
                     }
                     // Finder 드래그 대상: 폴더 행 하이라이트 + 드롭 대상 기록 (§과제①).
                     // 드래그 중엔 egui 포인터가 멎으므로 drag_pos(AppKit 위치)로 판정한다.
@@ -2010,6 +2034,7 @@ impl FileTreeUi {
             let dst_dir = drop_target_dir.unwrap_or(root);
             self.start_copy_into(os_dropped, dst_dir);
         }
+        self.handle_clipboard_shortcuts(ui, tree_area, hover_target_dir);
 
         // 인라인 편집 커밋/취소 처리 (실패 시 편집 유지 — 이름을 고칠 수 있게)
         match edit_done {
@@ -2277,6 +2302,56 @@ impl FileTreeUi {
         };
         let refresh = vec![dst_dir.clone()];
         self.spawn_op(refresh, move || copy_sources_into_dir(&sources, &dst_dir));
+    }
+
+    /// 파일 트리 위 ⌘V — 클립보드 파일 목록 붙여넣기(§과제②).
+    ///
+    /// 게이트: 포인터가 트리 영역 위 + 텍스트에딧 포커스 없음 + 팝업 없음. 터미널(기본
+    /// 키보드 소유자)/컴포저와의 이중 처리는 소비 플래그(take_clipboard_shortcut_
+    /// consumption)를 App이 WorkspaceUi에 전달해 같은 프레임에 누른다.
+    fn handle_clipboard_shortcuts(
+        &mut self,
+        ui: &egui::Ui,
+        tree_area: egui::Rect,
+        target_dir: Option<PathBuf>,
+    ) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        if ui.ctx().text_edit_focused() || ui.ctx().any_popup_open() {
+            return;
+        }
+        let pointer_over = ui
+            .input(|i| i.pointer.latest_pos())
+            .is_some_and(|pos| tree_area.contains(pos));
+        if !pointer_over {
+            return;
+        }
+        // ⌘V(②): 클립보드 파일 목록을 대상 폴더로 복사. macOS는 press가 native
+        // key-down(peek)으로, 텍스트 표현이 있으면 Event::Paste로, release가 V key-up
+        // fallback으로 온다(터미널 관례) — 어느 쪽이든 한 제스처는 한 번만 처리한다.
+        let paste_signal = ui.input(|i| i.events.iter().any(is_tree_paste_signal))
+            || crate::native_key_monitor::peek_clipboard_paste();
+        if !paste_signal {
+            return;
+        }
+        if self
+            .last_external_paste
+            .is_some_and(|at| at.elapsed() < EXTERNAL_PASTE_GESTURE_WINDOW)
+        {
+            // 같은 ⌘V 제스처의 후속 신호(press→release) — 재복사 없이 터미널 이중
+            // 처리만 계속 누른다.
+            self.consumed_paste_shortcut = true;
+            return;
+        }
+        // 파일이 없으면(텍스트/이미지만) no-op — 소비하지 않아 터미널/컴포저의 기존
+        // 붙여넣기가 그대로 동작한다.
+        let Some(paths) = clipboard_file_list_for_paste() else {
+            return;
+        };
+        self.consumed_paste_shortcut = true;
+        self.last_external_paste = Some(std::time::Instant::now());
+        self.start_copy_into(paths, target_dir.unwrap_or(root));
     }
 
     /// 백그라운드 파일 조작 실행 — 완료/에러는 채널로 UI에 전달되고 repaint를 깨운다(§9-3).
@@ -4040,6 +4115,25 @@ fn copy_into_dir(src: &Path, dst_dir: &Path) -> Result<(), String> {
     }
 }
 
+/// ⌘V가 읽는 클립보드 파일 목록. 테스트는 실제 pasteboard 없이 주입 목록으로 흐름을
+/// 검증한다(테스트는 --test-threads=1 직렬 실행 전제 — thread_local이라 간섭 없음).
+fn clipboard_file_list_for_paste() -> Option<Vec<PathBuf>> {
+    #[cfg(test)]
+    {
+        if let Some(paths) = TEST_CLIPBOARD_FILES.with(|cell| cell.borrow_mut().take()) {
+            return Some(paths);
+        }
+    }
+    crate::ui::clipboard_image::read_clipboard_file_list()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// 테스트 전용 ⌘V 클립보드 파일 주입 지점 (한 번 읽으면 소진).
+    static TEST_CLIPBOARD_FILES: std::cell::RefCell<Option<Vec<PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// 행 기준 반입 대상 폴더 — 폴더 행이면 자신, 파일 행이면 부모(§과제 판정 규칙).
 fn row_target_dir(row: &FlatRow, root: Option<&Path>) -> PathBuf {
     if row.is_dir {
@@ -4050,6 +4144,26 @@ fn row_target_dir(row: &FlatRow, root: Option<&Path>) -> PathBuf {
             .map(Path::to_path_buf)
             .or_else(|| root.map(Path::to_path_buf))
             .unwrap_or_else(|| row.path.clone())
+    }
+}
+
+/// 같은 ⌘V 제스처(press+release) 이중 처리 방지 창 — 터미널 PASTE_GESTURE_WINDOW 관례.
+const EXTERNAL_PASTE_GESTURE_WINDOW: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// 트리 ⌘V 신호(egui 이벤트 기반). macOS는 press가 Event::Paste(클립보드에 텍스트
+/// 표현이 있을 때만)로 오고 파일-only pasteboard면 press 이벤트가 없다 — release
+/// (V key-up)가 fallback이다(터미널 is_clipboard_paste_shortcut 관례). native
+/// key-down은 peek_clipboard_paste로 별도 감지한다.
+fn is_tree_paste_signal(event: &egui::Event) -> bool {
+    match event {
+        egui::Event::Paste(_) => true,
+        egui::Event::Key {
+            key: egui::Key::V,
+            pressed,
+            modifiers,
+            ..
+        } => cfg!(target_os = "macos") && !*pressed && modifiers.command && !modifiers.ctrl,
+        _ => false,
     }
 }
 
@@ -6436,6 +6550,29 @@ mod tests {
         );
     }
 
+    /// 트리 ⌘V 신호 판정 — Event::Paste 또는 (macOS) command+V key-up.
+    #[test]
+    fn 트리_paste_신호는_paste이벤트나_v_keyup이다() {
+        assert!(is_tree_paste_signal(&egui::Event::Paste(String::new())));
+        let v_up = egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        };
+        assert_eq!(is_tree_paste_signal(&v_up), cfg!(target_os = "macos"));
+        let v_down = egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        };
+        assert!(!is_tree_paste_signal(&v_down), "press는 신호가 아니다");
+        assert!(!is_tree_paste_signal(&egui::Event::Copy));
+    }
+
     fn drop_harness(
         catalog: &i18n::Catalog,
         tree: FileTreeUi,
@@ -6514,6 +6651,60 @@ mod tests {
             "폴더 행으로 복사돼야 한다"
         );
         assert!(src.exists(), "드롭은 원본을 보존해야 한다(복사)");
+        assert!(
+            harness.state().0.error.is_none(),
+            "에러 라벨이 남음: {:?}",
+            harness.state().0.error
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+        std::fs::remove_dir_all(&src_home).unwrap();
+    }
+
+    /// 클립보드 ⌘V 붙여넣기(§과제②): 트리 빈 영역(hover 행 없음)에서는 루트로 복사되고,
+    /// 트리가 신호를 소비했음을 App에 알린다(터미널 이중 처리 억제 배선).
+    #[test]
+    fn kittest_클립보드_파일_붙여넣기는_트리영역에서_루트로_복사한다() {
+        use egui_kittest::kittest::Queryable;
+        let base = temp_root("paste-root");
+        let base = base.canonicalize().unwrap();
+        std::fs::write(base.join("seed.txt"), b"x").unwrap();
+        let src_home = temp_root("paste-src");
+        let src = src_home.join("payload2.txt");
+        std::fs::write(&src, b"paste").unwrap();
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(base.clone()));
+        let mut harness = drop_harness(&catalog, tree);
+        for _ in 0..200 {
+            harness.step();
+            if harness.query_by_label("seed.txt").is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // 행 아래 빈 트리 영역에 포인터 — 대상 행이 없으니 루트로 복사돼야 한다.
+        TEST_CLIPBOARD_FILES.with(|cell| *cell.borrow_mut() = Some(vec![src.clone()]));
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(egui::pos2(200.0, 400.0)));
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Paste(String::new()));
+        let copied = base.join("payload2.txt");
+        wait_for_path(&mut harness, &copied);
+        assert_eq!(
+            std::fs::read(&copied).unwrap(),
+            b"paste",
+            "루트로 복사돼야 한다"
+        );
+        assert!(src.exists(), "붙여넣기는 원본을 보존해야 한다(복사)");
+        let (paste_consumed, copy_consumed) =
+            harness.state_mut().0.take_clipboard_shortcut_consumption();
+        assert!(paste_consumed, "트리가 ⌘V 소비를 App에 알려야 한다");
+        assert!(!copy_consumed);
         assert!(
             harness.state().0.error.is_none(),
             "에러 라벨이 남음: {:?}",

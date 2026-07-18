@@ -61,6 +61,13 @@ fn clipboard_file_list(clipboard: &mut arboard::Clipboard) -> anyhow::Result<Opt
     }
 }
 
+/// OS 클립보드의 파일 목록만 읽는다(없거나 실패면 None). 파일 트리 ⌘V 붙여넣기용 —
+/// 이미지 디코드 없이 pasteboard 파일 URL 조회뿐이라 UI 스레드에서도 짧다(수 ms).
+pub fn read_clipboard_file_list() -> Option<Vec<PathBuf>> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    clipboard_file_list(&mut clipboard).ok().flatten()
+}
+
 /// macOS: pasteboard의 PNG 바이트를 **디코드 없이 그대로** 가져온다 — cmux와 동일 접근.
 /// 스크린샷은 pasteboard에 이미 PNG로 있으므로 파일로 쓰기만 하면 된다(수 ms).
 /// arboard get_image()는 RGBA 디코드 + PNG 재인코딩 왕복이라 수백 ms 걸렸다(2026-07-08).

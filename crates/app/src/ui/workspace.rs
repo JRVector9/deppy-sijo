@@ -236,6 +236,14 @@ pub struct WorkspaceUi {
     /// egui-winit이 이미지-only clipboard에서 Event::Paste 없이 소비하는 macOS Command+V
     /// 원본 key-down. 터미널 입력 소유권을 확인한 pane에서만 1회 소비한다.
     native_clipboard_paste_requested: bool,
+    /// 파일 트리가 이번 프레임 ⌘V/⌘C를 소비 — 같은 제스처의 터미널 붙여넣기/선택 복사
+    /// 이중 처리를 누른다(App이 사이드바 렌더 직후 설정, prepare_frame이 프레임
+    /// 플래그로 옮긴다. 파일 트리 §과제②③ 충돌 금지).
+    suppress_paste_request: bool,
+    suppress_copy_request: bool,
+    /// 위 요청의 이번-프레임 확정값 (prepare_frame이 매 프레임 재계산 — 이월 없음).
+    paste_suppressed: bool,
+    copy_suppressed: bool,
     /// 세션 → 셸 pid (App이 ResourceUsage에서 매 프레임 갱신). 터미널 경로 더블클릭의
     /// 상대경로를 그 셸의 실제 cwd로 해석하는 데 쓴다 (2026-07-14).
     session_pids: HashMap<SessionId, u32>,
@@ -431,6 +439,10 @@ impl WorkspaceUi {
             preedit: String::new(),
             native_printable_key_downs: Vec::new(),
             native_clipboard_paste_requested: false,
+            suppress_paste_request: false,
+            suppress_copy_request: false,
+            paste_suppressed: false,
+            copy_suppressed: false,
             sent_sizes: HashMap::new(),
             scroll_residual: 0.0,
             drag_autoscroll_residual: 0.0,
@@ -1227,6 +1239,14 @@ impl WorkspaceUi {
         }
     }
 
+    /// 파일 트리가 이번 프레임 ⌘V/⌘C를 소비했음을 알린다 — 같은 제스처가 터미널로도
+    /// 흘러 경로 삽입 붙여넣기/선택 복사가 이중 실행되는 것을 막는다(§과제②③).
+    /// App이 사이드바 렌더 직후·show() 이전에 호출한다.
+    pub fn suppress_clipboard_shortcuts_this_frame(&mut self, paste: bool, copy: bool) {
+        self.suppress_paste_request |= paste;
+        self.suppress_copy_request |= copy;
+    }
+
     fn prepare_frame(
         &mut self,
         ctx: &egui::Context,
@@ -1242,6 +1262,9 @@ impl WorkspaceUi {
         let native_key_downs = crate::native_key_monitor::drain();
         self.native_printable_key_downs = native_key_downs.printable;
         self.native_clipboard_paste_requested = native_key_downs.clipboard_paste;
+        // 파일 트리 ⌘V/⌘C 소비 프레임 — 요청을 이번 프레임 확정값으로 옮긴다(이월 없음).
+        self.paste_suppressed = std::mem::take(&mut self.suppress_paste_request);
+        self.copy_suppressed = std::mem::take(&mut self.suppress_copy_request);
         self.handle_events(client, events, catalog);
         // 「마지막 출력 복사」 — handle_events에는 Context가 없어 여기서 수행한다.
         if let Some(text) = self.pending_copy.take() {
@@ -2201,8 +2224,9 @@ impl WorkspaceUi {
                 )
             });
             let mut copy_text: Option<String> = None;
-            let mut image_paste_trigger =
-                native_clipboard_paste_requested.then_some(ClipboardPasteTrigger::NativeKeyDown);
+            let mut image_paste_trigger = (native_clipboard_paste_requested
+                && !self.paste_suppressed)
+                .then_some(ClipboardPasteTrigger::NativeKeyDown);
             let mut text_paste_bytes: Option<Vec<u8>> = None;
             ui.input(|input| {
                 let modifiers = input.modifiers;
@@ -2219,6 +2243,10 @@ impl WorkspaceUi {
                         continue;
                     }
                     if matches!(event, egui::Event::Paste(_)) {
+                        // 파일 트리가 이번 ⌘V를 소비 — 같은 제스처의 텍스트 붙여넣기 스킵.
+                        if self.paste_suppressed {
+                            continue;
+                        }
                         text_paste_bytes = input_mapper::map_event(event, bracketed, &modifiers);
                         continue;
                     }
@@ -2228,12 +2256,19 @@ impl WorkspaceUi {
                         && let Some((sel_session, a, b)) = self.selection
                         && sel_session == session
                     {
+                        // 파일 트리가 이번 ⌘C를 소비 — 프레임 끝 copy_text가 트리의
+                        // pasteboard 파일 URL을 덮어쓰지 않게 선택 복사를 스킵한다.
+                        if self.copy_suppressed {
+                            continue;
+                        }
                         copy_text =
                             Some(renderer_egui::selection_text(&snapshot, a.min(b), a.max(b)));
                         continue;
                     }
                     if is_clipboard_paste_shortcut(event) {
-                        image_paste_trigger.get_or_insert(ClipboardPasteTrigger::EguiShortcut);
+                        if !self.paste_suppressed {
+                            image_paste_trigger.get_or_insert(ClipboardPasteTrigger::EguiShortcut);
+                        }
                         continue;
                     }
                     // macOS ⌘ 조합 키는 앱 단축키 영역 — PTY로 보내지 않는다. 전역 단축키

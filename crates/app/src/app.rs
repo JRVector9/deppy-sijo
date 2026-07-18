@@ -5808,6 +5808,19 @@ impl eframe::App for App {
             if env_changed {
                 self.sync_dotenv_env();
             }
+            // 파일 트리가 이번 프레임 ⌘V/⌘C를 소비했으면 같은 제스처가 터미널로도 흘러
+            // 이중 처리(경로 삽입 붙여넣기/선택 복사 pasteboard 덮어쓰기)되는 것을
+            // 누른다 — 사이드바(좌측 패널)가 workspace show()보다 먼저 도는 순서 전제.
+            if let Some((paste_consumed, copy_consumed)) = self
+                .file_tree
+                .as_mut()
+                .map(|tree| tree.take_clipboard_shortcut_consumption())
+                && (paste_consumed || copy_consumed)
+            {
+                self.active
+                    .workspace_ui
+                    .suppress_clipboard_shortcuts_this_frame(paste_consumed, copy_consumed);
+            }
             match sidebar_action {
                 Some(ui::file_tree::SidebarAction::SwitchWorkspace(workspace_id)) => {
                     self.agent_terminal_ui

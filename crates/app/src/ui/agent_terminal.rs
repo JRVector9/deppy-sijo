@@ -79,7 +79,8 @@ impl AgentTerminalUi {
         rows: &[ActivityWorkspaceRow],
         metrics: HomeMetrics,
         feed: &StatusFeedSnapshot,
-        translations: &std::collections::HashMap<String, String>,
+        translations: &crate::notice_translate::TranslationCache,
+        locale: &str,
         catalog: &i18n::Catalog,
     ) -> Option<HomeAction> {
         let totals = workspace_totals(rows);
@@ -92,7 +93,7 @@ impl AgentTerminalUi {
                     .inner_margin(egui::Margin::same(22))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        if self.announcements(ui, feed, translations, catalog) {
+                        if self.announcements(ui, feed, translations, locale, catalog) {
                             action = Some(HomeAction::RefreshNotices);
                         }
                         ui.add_space(14.0);
@@ -201,7 +202,8 @@ impl AgentTerminalUi {
         &mut self,
         ui: &mut egui::Ui,
         feed: &StatusFeedSnapshot,
-        translations: &std::collections::HashMap<String, String>,
+        translations: &crate::notice_translate::TranslationCache,
+        locale: &str,
         catalog: &i18n::Catalog,
     ) -> bool {
         let mut refresh_clicked = false;
@@ -296,7 +298,7 @@ impl AgentTerminalUi {
                     if index > 0 {
                         crate::ui::hairline(ui);
                     }
-                    announcement_row(ui, card, translations, catalog);
+                    announcement_row(ui, card, translations, locale, catalog);
                 }
             }
         });
@@ -343,7 +345,8 @@ fn source_filter(
 fn announcement_row(
     ui: &mut egui::Ui,
     card: &AnnouncementCard<'_>,
-    translations: &std::collections::HashMap<String, String>,
+    translations: &crate::notice_translate::TranslationCache,
+    locale: &str,
     catalog: &i18n::Catalog,
 ) {
     ui.horizontal(|ui| {
@@ -353,7 +356,7 @@ fn announcement_row(
         // 긴 제목이 우측 메타를 밀어내지 않게 한다.
         let reserved = 250.0;
         let title_width = (ui.available_width() - reserved).max(120.0);
-        let translated = translations.get(&card.incident.title);
+        let translated = translations.get(card.source, locale, &card.incident.title);
         let title_text = translated.unwrap_or(&card.incident.title);
         let title = ui.add_sized(
             [title_width, 20.0],

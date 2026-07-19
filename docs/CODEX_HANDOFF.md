@@ -2,8 +2,8 @@
 
 ## Current task
 
-- Implement `docs/mockups/agent-workspace-dashboard.html` in the native Rust/egui application on the dedicated `AgentTerminal` branch.
-- Status: complete, committed, packaged, and opened for visual review on the `AgentTerminal` branch.
+- Persist Home Claude/OpenAI notice translations across app restarts.
+- Status: complete, committed, packaged, launched, and verified with a real persisted cache.
 
 ## Working area
 
@@ -14,14 +14,17 @@
 
 ## Plan
 
-1. Completed — mapped the mockup onto the native app shell and preserved existing controllers/runtime state.
-2. Completed — implemented the unified resizable workspace/session/file/navigation sidebar.
-3. Completed — aligned the top bar, inbox entry points, square composer styling, and global status bar.
-4. Completed — implemented Home official channels, aggregate status, workspace rows, and orchestration insights from live native state.
-5. Completed — ran formatting, full tests, strict workspace Clippy, build, diff checks, official-link verification, and isolated native launch smoke testing.
+1. Completed — mapped the existing in-memory notice translation flow and app data storage conventions.
+2. Completed — added provider+locale+original-title JSON persistence with atomic writes and startup restoration.
+3. Completed — wired Home rendering and translation scheduling to the persistent cache.
+4. Completed — ran focused cache/UI tests, app check, formatting, and diff checks without launching the app.
 
 ## Status
 
+- 2026-07-19: 사용자의 커밋·재빌드·실행 요청을 완료했다. `feat(app): persist notice translations` 커밋을 만든 뒤 `CARGO_NET_OFFLINE=true sh scripts/package-macos.sh`가 release 컴파일 26.51s에 성공했고 Developer ID `VectorNine INC (ZDTU5LS35K)`로 `target/bundle/Deppy Sijo.app`을 교체했다. `codesign --verify --deep --strict --verbose=2`가 통과했으며 arm64 메인 실행 파일 SHA-256은 `8f8280505bc388db2acd8346e5dbbff7572749b91dff6dce1574027c0be211a2`다. 정확한 기존 bundle PID 51179를 경로 대조 후 TERM으로 정상 종료하고 새 번들을 실행·활성화했다. 새 PID 18077은 2026-07-19 19:45:56 KST부터 살아 있고 foreground가 `deppy-sijo`임을 확인했다. 실제 `<data>/notice_translations.json`도 19:46:06 KST에 version 1, 6 entries, 1,242 bytes로 생성돼 번역 결과 영속 기록까지 확인했다. 이 최종 증거를 같은 기능 커밋에 amend한다.
+- 2026-07-19: 홈 Claude/OpenAI 공지 번역 디스크 캐시 구현과 검증을 마쳤다. `<data>/notice_translations.json`에 versioned JSON을 원자 기록하고 앱 생성 시 best-effort로 복원하며, 키는 provider+정규화 locale+원문 제목이라 재시작·언어 변경 뒤에도 올바른 번역만 재사용한다. 손상/미지원 버전/읽기·쓰기 실패는 경고 후 빈 캐시 또는 현재 메모리 캐시로 완화해 앱 시작을 막지 않는다. `notice_translate::tests` 5 passed, `ui::agent_terminal::tests` 4 passed, `cargo check -p deppy-sijo`, `git diff --check`가 모두 통과했다. 앱 패키징·실행 및 실제 Claude 호출은 하지 않았다. 변경은 아직 커밋하지 않았다.
+- 2026-07-19: pending-key iterator의 소유권 경계를 로케일/캐시 독립 참조로 수정한 뒤 `cargo test -p deppy-sijo notice_translate::tests --no-fail-fast`가 5 passed/0 failed로 통과했다. 기존 언어·응답·프롬프트 테스트와 함께 제공자/언어 키 분리 및 JSON 원자 저장→새 캐시 인스턴스 복원 회귀 테스트가 통과했다. 다음: 홈 UI 집중 테스트, 앱 check, diff 검증.
+- 2026-07-19: 공지 번역 디스크 캐시 구현 후 첫 `cargo test -p deppy-sijo notice_translate::tests --no-fail-fast`는 테스트 실행 전에 `app.rs` pending-key iterator의 내부 `move` 클로저가 `&mut self`를 이동시키는 E0507/E0505/E0382 3건으로 컴파일 중단됐다. 캐시 직렬화나 동작 실패는 아니며, 로케일 `&str`과 캐시 참조를 iterator 밖에서 분리해 캡처하도록 수정한 뒤 같은 테스트를 재실행한다.
 - 2026-07-19: 사용자의 커밋 요청에 따라 세션 로그 상한/GC, D2Coding Bold 제거, Apple SD Gothic 사이드바 적용, 워크스페이스·세션 하이라이트 우측 정렬 및 항상 표시되는 워크스페이스 상태 구현과 검증 결과를 하나의 기능 커밋으로 마감했다. 후속 읽기 전용 확인에서 홈의 Claude/OpenAI 공지와 번역은 디스크·DB가 아니라 프로세스 메모리에만 보관됨을 확인했다. 공지는 시작 시 즉시 조회하고 60분마다(수동 새로고침 시 즉시) 다시 가져오며, 서비스 상태는 5분마다 조회한다. 같은 실행 중 이미 번역한 제목은 메모리 캐시를 재사용하지만 재시작하면 공지와 번역을 다시 조회·번역한다. 번역은 로컬 `claude -p --model haiku`를 사용하며 앱은 실행하지 않았다.
 - 2026-07-19: 이번 요청 구현과 최종 읽기 전용 점검을 마쳤다. source font assets는 D2Coding Regular 4,185,844 bytes + JetBrains 5 weights 1,360,972 bytes = 5,546,816 bytes이며 D2Coding Bold 4,359,956 bytes는 삭제됐다. 사이드바용 AppleSDGothicNeo.ttc는 55,373,848 bytes(52.81MiB) 시스템 리소스를 한 번 읽고 실행 파일에는 포함하지 않는다. 실제 사용자 로그 디렉터리는 아직 797,892KiB(779.19MiB)다. 사용자가 빌드·실행을 금지했으므로 기존 로그/실행 프로세스는 건드리지 않았고, 새 소스 앱의 다음 시작 때 파일별 상한+전체 256MiB GC가 적용된다. `git diff --check`, D2 Bold 파일 부재와 소스 참조 부재가 통과했다. 앱 패키징·재실행·커밋은 하지 않았다.
 - 2026-07-19: 폰트/사이드바 집중 검증이 완료됐다. `cargo test -p deppy-sijo fonts::tests --no-fail-fast`는 4 passed/0 failed, `cargo test -p deppy-sijo ui::file_tree::tests --no-fail-fast` 최종 재실행은 58 passed/0 failed다. 후자는 Apple SD Gothic named-family 초기화, 워크스페이스 하이라이트의 좌측 인셋 유지+세션과 동일한 우측 끝, 정상/좁은/icon-rail 폭별 항상 존재하는 상태 표시를 포함한다. 요청대로 앱 패키징·실행은 하지 않았다. 다음: 전체 diff/리소스 크기/실제 로그 용량을 읽기 전용으로 점검하고 handoff를 마감한다.

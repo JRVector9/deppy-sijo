@@ -1226,10 +1226,13 @@ pub struct App {
     /// 수동 갱신(홈 「AI 공지」 ⟳ 버튼) — 워커를 즉시 깨워 상태+공지 재조회.
     status_feed_refresh: std::sync::mpsc::Sender<()>,
     status_feed: crate::status_feed::StatusFeedSnapshot,
-    /// 공지 제목 번역 캐시(원문 → 로케일 번역) + 진행 중 일회성 번역 수신.
-    /// LLM(claude CLI) 미연결·영어 로케일이면 항상 비어 있고 원문을 그대로 쓴다.
-    notice_translations: std::collections::HashMap<String, String>,
-    notice_translate_rx: Option<std::sync::mpsc::Receiver<Vec<(String, String)>>>,
+    /// 공지 제목 번역 영속 캐시(제공자+로케일+원문 → 번역) + 진행 중 번역 수신.
+    /// 앱 재시작 뒤에도 같은 제목은 재번역하지 않으며, 저장 실패는 원문 표시로 완화한다.
+    notice_translation_cache: crate::notice_translate::TranslationCache,
+    notice_translation_cache_path: PathBuf,
+    notice_translate_rx: Option<
+        std::sync::mpsc::Receiver<Vec<(crate::notice_translate::TranslationCacheKey, String)>>,
+    >,
     /// ollama 모델 감지 (PR-L3) — Agents 창에서 OSS 프로바이더 선택 시 1회 감지해
     /// 새 작업 폼의 모델 후보로 보여준다. None=미감지/실패(표시 안 함).
     ollama_models: Option<Vec<String>>,
@@ -1528,6 +1531,21 @@ impl App {
         let dotenv_sync_worker =
             DotenvSyncWorker::spawn(db_path.clone(), redaction.clone(), egui_ctx.clone());
         let status_feed_rx_channel = crate::status_feed::spawn(egui_ctx.clone());
+        let notice_translation_cache_path = db_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("notice_translations.json");
+        let notice_translation_cache =
+            match crate::notice_translate::TranslationCache::load(&notice_translation_cache_path) {
+                Ok(cache) => cache,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %notice_translation_cache_path.display(),
+                        "공지 번역 캐시를 읽지 못해 빈 캐시로 시작: {error:#}"
+                    );
+                    crate::notice_translate::TranslationCache::default()
+                }
+            };
 
         // main에서 CreationContext를 받자마자 이 설정으로 폰트를 이미 설치했다. sentinel로
         // 시작하면 첫 프레임에 15MB AppleGothic을 포함한 FontDefinitions를 다시 만들고
@@ -1603,7 +1621,8 @@ impl App {
             status_feed_rx: status_feed_rx_channel.0,
             status_feed_refresh: status_feed_rx_channel.1,
             status_feed: crate::status_feed::StatusFeedSnapshot::default(),
-            notice_translations: std::collections::HashMap::new(),
+            notice_translation_cache,
+            notice_translation_cache_path,
             notice_translate_rx: None,
             ollama_models: None,
             ollama_detect_done: false,
@@ -4261,14 +4280,23 @@ impl App {
         name
     }
 
-    /// 홈 공지 제목 번역 펌프 (2026-07-18) — 진행 중 결과를 캐시에 합치고, 캐시에
-    /// 없는 새 제목이 있으면 일회성 번역을 하나만 띄운다(rx 보유가 동시 실행 게이트).
+    /// 홈 공지 제목 번역 펌프 — 진행 중 결과를 메모리+디스크 캐시에 합치고, 캐시에
+    /// 없는 새 제공자·로케일·제목만 번역한다(rx 보유가 동시 실행 게이트).
     /// 영어 로케일이거나 claude CLI가 없으면 아무것도 하지 않는다(원문 표시).
     fn pump_notice_translations(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.notice_translate_rx {
             match rx.try_recv() {
                 Ok(pairs) => {
-                    self.notice_translations.extend(pairs);
+                    self.notice_translation_cache.extend(pairs);
+                    if let Err(error) = self
+                        .notice_translation_cache
+                        .save(&self.notice_translation_cache_path)
+                    {
+                        tracing::warn!(
+                            path = %self.notice_translation_cache_path.display(),
+                            "공지 번역 캐시 저장 실패: {error:#}"
+                        );
+                    }
                     self.notice_translate_rx = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -4285,13 +4313,21 @@ impl App {
         else {
             return;
         };
-        let pending: Vec<String> = [&self.status_feed.claude, &self.status_feed.openai]
-            .into_iter()
-            .flatten()
-            .flat_map(|provider| provider.incidents.iter())
-            .map(|incident| incident.title.clone())
-            .filter(|title| !self.notice_translations.contains_key(title))
-            .collect();
+        let locale = self.config.i18n.locale.as_str();
+        let translation_cache = &self.notice_translation_cache;
+        let pending: Vec<crate::notice_translate::TranslationCacheKey> = [
+            ("Claude", &self.status_feed.claude),
+            ("OpenAI", &self.status_feed.openai),
+        ]
+        .into_iter()
+        .filter_map(|(provider, status)| status.as_ref().map(|status| (provider, status)))
+        .flat_map(|(provider, status)| {
+            status.incidents.iter().map(move |incident| {
+                crate::notice_translate::TranslationCacheKey::new(provider, locale, &incident.title)
+            })
+        })
+        .filter(|key| !translation_cache.contains_key(key))
+        .collect();
         if pending.is_empty() || crate::notice_translate::claude_bin().is_none() {
             return;
         }
@@ -6383,7 +6419,8 @@ impl eframe::App for App {
                             unread: self.notifications_ui.unread(),
                         },
                         &self.status_feed,
-                        &self.notice_translations,
+                        &self.notice_translation_cache,
+                        &self.config.i18n.locale,
                         &text,
                     );
                 } else if inbox_visible {

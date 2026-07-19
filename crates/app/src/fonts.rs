@@ -3,7 +3,7 @@
 
 /// 번들 터미널 모노 폰트 두 가족 (둘 다 OFL — assets/fonts/*-OFL.txt).
 /// - **D2Coding**(기본, 2026-07-13): 네이버 한글 코딩 폰트 — 한글·영문이 한 폰트에서
-///   2:1 폭 정합이라 한글 섞인 출력의 정렬이 정확하다. 굵기는 Regular/Bold 2단.
+///   2:1 폭 정합이라 한글 섞인 출력의 정렬이 정확하다. 번들은 Regular만 유지한다.
 /// - **JetBrains Mono**: Latin 전용(한글은 CJK 폴백) — 굵기 5단.
 ///
 /// egui는 리가처·가변폰트를 셰이핑/해석하지 않으므로 정적 weight 파일을 번들한다.
@@ -13,7 +13,6 @@ const JB_MEDIUM: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Medium.tt
 const JB_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-SemiBold.ttf");
 const JB_BOLD: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Bold.ttf");
 const D2_REGULAR: &[u8] = include_bytes!("../assets/fonts/D2Coding-Regular.ttf");
-const D2_BOLD: &[u8] = include_bytes!("../assets/fonts/D2Coding-Bold.ttf");
 
 /// 설정에서 고를 수 있는 터미널 모노 폰트 가족.
 pub const MONO_FONTS: &[&str] = &["D2Coding", "JetBrainsMono"];
@@ -21,8 +20,8 @@ pub const MONO_FONTS: &[&str] = &["D2Coding", "JetBrainsMono"];
 pub const DEFAULT_MONO_FONT: &str = "D2Coding";
 /// JetBrains Mono 굵기(가는 것부터).
 pub const JB_MONO_WEIGHTS: &[&str] = &["Light", "Regular", "Medium", "SemiBold", "Bold"];
-/// D2Coding 굵기 — 원본이 Regular/Bold 2단만 제공한다.
-pub const D2_MONO_WEIGHTS: &[&str] = &["Regular", "Bold"];
+/// D2Coding은 실행 파일 중복을 줄이기 위해 Regular만 번들한다.
+pub const D2_MONO_WEIGHTS: &[&str] = &["Regular"];
 /// 기본 굵기.
 pub const DEFAULT_MONO_WEIGHT: &str = "Regular";
 
@@ -44,10 +43,7 @@ fn mono_bytes(font: &str, weight: &str) -> &'static [u8] {
             "Bold" => JB_BOLD,
             _ => JB_REGULAR,
         },
-        _ => match weight {
-            "Bold" => D2_BOLD,
-            _ => D2_REGULAR,
-        },
+        _ => D2_REGULAR,
     }
 }
 
@@ -71,6 +67,16 @@ const CJK_FONT_CANDIDATES: &[&str] = &[
 type CachedFontData = (&'static str, std::sync::Arc<egui::FontData>);
 static CJK_FONT_DATA: std::sync::OnceLock<Option<CachedFontData>> = std::sync::OnceLock::new();
 
+/// 워크스페이스·세션·파일 트리·하단 내비게이션이 공유하는 좌측 사이드바 전용 가족.
+/// 전역 UI 폰트 설정은 유지하고 이 named family를 사이드바 scope에만 적용한다.
+pub const SIDEBAR_FONT_FAMILY: &str = "sidebar_apple_sd_gothic";
+
+#[cfg(target_os = "macos")]
+const SIDEBAR_FONT_PATH: &str = "/System/Library/Fonts/AppleSDGothicNeo.ttc";
+
+#[cfg(target_os = "macos")]
+static SIDEBAR_FONT_DATA: std::sync::OnceLock<Option<CachedFontData>> = std::sync::OnceLock::new();
+
 fn cjk_font_data() -> Option<CachedFontData> {
     CJK_FONT_DATA
         .get_or_init(|| {
@@ -84,6 +90,32 @@ fn cjk_font_data() -> Option<CachedFontData> {
             })
         })
         .clone()
+}
+
+#[cfg(target_os = "macos")]
+fn sidebar_font_data() -> Option<CachedFontData> {
+    SIDEBAR_FONT_DATA
+        .get_or_init(|| {
+            std::fs::read(SIDEBAR_FONT_PATH).ok().map(|bytes| {
+                let mut data = egui::FontData::from_owned(bytes);
+                data.index = 0;
+                (SIDEBAR_FONT_PATH, std::sync::Arc::new(data))
+            })
+        })
+        .clone()
+}
+
+/// 사이드바 painter/TextEdit에서 같은 Apple SD Gothic named family를 지정한다.
+pub fn sidebar_font(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name(SIDEBAR_FONT_FAMILY.into()))
+}
+
+/// Panel 내부 기본 label/button/menu/TextEdit 스타일도 사이드바 가족을 쓰게 한다.
+pub fn apply_sidebar_text_styles(ui: &mut egui::Ui) {
+    let family = egui::FontFamily::Name(SIDEBAR_FONT_FAMILY.into());
+    for font_id in ui.style_mut().text_styles.values_mut() {
+        font_id.family = family.clone();
+    }
 }
 
 /// 기본 UI 폰트 경로 (macOS — AppleGothic, 사용자 선호 2026-07-08. 이전 기본은
@@ -131,8 +163,8 @@ fn build_font_definitions(
         .insert(0, "term_mono".to_owned());
 
     // SGR bold 셀용 굵은 모노 패밀리 (B-1, 2026-07-14) — 렌더러가
-    // `terminal::MONO_BOLD_FAMILY` 이름으로 찾는다. 설정 굵기가 이미 Bold면 같은 파일이라
-    // 중복 등록 비용만 미미하게 든다. CJK 폴백은 아래에서 이 패밀리에도 붙인다.
+    // `terminal::MONO_BOLD_FAMILY` 이름으로 찾는다. D2Coding은 Bold 번들을 제거했으므로
+    // Regular를 재사용하고, JetBrains Mono를 고르면 실제 Bold 파일을 사용한다.
     fonts.font_data.insert(
         "term_mono_bold".to_owned(),
         egui::FontData::from_static(mono_bytes(mono_font, "Bold")).into(),
@@ -198,6 +230,26 @@ fn build_font_definitions(
         tracing::info!(font = path, "UI 폰트 등록");
         break;
     }
+
+    // 좌측 사이드바 전용 Apple SD Gothic Neo. 시스템 폰트를 실행 파일에 포함하지 않고
+    // 시작 시 한 번만 읽어 Arc로 재사용한다. 비-macOS/로드 실패에서는 현재 UI
+    // Proportional 가족을 그대로 복제해 named family가 항상 해석되게 한다.
+    let sidebar_family = egui::FontFamily::Name(SIDEBAR_FONT_FAMILY.into());
+    let mut sidebar_fallback = fonts
+        .families
+        .get(&egui::FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    #[cfg(target_os = "macos")]
+    if let Some((path, font_data)) = sidebar_font_data() {
+        fonts
+            .font_data
+            .insert("sidebar_apple_sd_gothic".to_owned(), font_data);
+        sidebar_fallback.retain(|name| name != "sidebar_apple_sd_gothic");
+        sidebar_fallback.insert(0, "sidebar_apple_sd_gothic".to_owned());
+        tracing::info!(font = path, "좌측 사이드바 Apple SD Gothic 폰트 등록");
+    }
+    fonts.families.insert(sidebar_family, sidebar_fallback);
 
     fonts
 }
@@ -290,6 +342,15 @@ pub fn effective_ui_font_name(selected_path: Option<&str>, options: &[(String, S
 mod tests {
     use super::{DEFAULT_UI_FONT_NAME, effective_ui_font_name};
 
+    #[test]
+    fn d2coding은_regular만_번들하고_bold요청도_regular로_폴백한다() {
+        assert_eq!(super::mono_weights_for("D2Coding"), &["Regular"]);
+        assert!(std::ptr::eq(
+            super::mono_bytes("D2Coding", "Regular"),
+            super::mono_bytes("D2Coding", "Bold")
+        ));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn 기본_macos_ui는_applegothic_fontdata를_중복하지_않는다() {
@@ -315,6 +376,16 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(
             &fonts.font_data["cjk"],
             &rebuilt.font_data["cjk"]
+        ));
+
+        let sidebar = egui::FontFamily::Name(super::SIDEBAR_FONT_FAMILY.into());
+        assert_eq!(
+            fonts.families[&sidebar].first().map(String::as_str),
+            Some("sidebar_apple_sd_gothic")
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            &fonts.font_data["sidebar_apple_sd_gothic"],
+            &rebuilt.font_data["sidebar_apple_sd_gothic"]
         ));
     }
 

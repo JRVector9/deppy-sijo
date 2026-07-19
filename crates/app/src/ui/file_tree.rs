@@ -760,6 +760,7 @@ impl FileTreeUi {
                 .resizable(false)
                 .exact_size(22.0)
                 .show(ui, |ui| {
+                    crate::fonts::apply_sidebar_text_styles(ui);
                     if ui
                         .small_button("▸")
                         .on_hover_text(catalog.t("file_tree.expand_sidebar", &[]))
@@ -783,6 +784,7 @@ impl FileTreeUi {
                     .inner_margin(egui::Margin::ZERO),
             )
             .show(ui, |ui| {
+                crate::fonts::apply_sidebar_text_styles(ui);
                 // hairline(6)+간격(3)+위(6)+행 36×3+행간 2×2+마지막 간격(2)+아래(10)
                 // = 139 — 하단 고정 nav 예약 높이(실소비와 정확 일치, 잘림 방지).
                 let nav_h = 139.0;
@@ -1237,7 +1239,7 @@ impl FileTreeUi {
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| root.display().to_string());
                 let label = format!("{name}  {}", compact_root_path(root));
-                let galley = clipped_line(ui, &label, egui::FontId::monospace(11.5), text_width);
+                let galley = clipped_line(ui, &label, crate::fonts::sidebar_font(11.5), text_width);
                 ui.painter().galley(
                     egui::pos2(text_left, header_rect.center().y - galley.size().y / 2.0),
                     galley,
@@ -1314,7 +1316,7 @@ impl FileTreeUi {
             egui::pos2(parent_rect.left() + 47.0, parent_rect.center().y),
             egui::Align2::LEFT_CENTER,
             "..",
-            egui::FontId::monospace(12.5),
+            crate::fonts::sidebar_font(12.5),
             parent_color,
         );
         if parent_response.clicked()
@@ -1607,7 +1609,9 @@ impl FileTreeUi {
                                     entry_color
                                 };
                                 let rich = egui::RichText::new(&row.name)
-                                    .monospace()
+                                    .family(egui::FontFamily::Name(
+                                        crate::fonts::SIDEBAR_FONT_FAMILY.into(),
+                                    ))
                                     .size(12.5)
                                     .color(text_color);
                                 ui.add(
@@ -2698,7 +2702,7 @@ pub enum ShellKind {
 /// 세션 행을 painter로 직접 그린다 (2026-07-06 목업 반영). 상태를 이모지 글리프로
 /// 쓰면 폰트(AppleGothic)에 ⏳/✋/▸/◆ 글리프가 없어 □(두부)로 깨진다 — 색 점·삼각형·
 /// 마름모를 도형으로 그려 회피한다. 선택 시 액센트 배경 + 좌측 레일, agent는 레일 표시,
-/// 요약 한 줄(dim/mono). 반환 Response로 클릭을 처리한다.
+/// 요약 한 줄(dim/Apple SD Gothic). 반환 Response로 클릭을 처리한다.
 fn workspace_row(
     ui: &mut egui::Ui,
     workspace: &SidebarWorkspaceEntry,
@@ -2716,15 +2720,16 @@ fn workspace_row(
     // 붙었다. 그리기 rect만 좌우 8px 안으로 들여 pill·내용에 숨 공간을 준다
     // (클릭 판정은 full_rect라 가장자리도 눌린다).
     let rect = full_rect.shrink2(egui::vec2(8.0, 0.0));
+    let highlight_rect = workspace_highlight_rect(full_rect);
     if active {
         ui.painter().rect_filled(
-            rect,
+            highlight_rect,
             1.0,
             ui.visuals().selection.bg_fill.gamma_multiply(0.12),
         );
     } else if response.hovered() {
         ui.painter()
-            .rect_filled(rect, 1.0, ui.visuals().widgets.hovered.bg_fill);
+            .rect_filled(highlight_rect, 1.0, ui.visuals().widgets.hovered.bg_fill);
     }
     // 선택/실행 상태와 무관한 프로젝트 고유색. 40pt 아이콘 레일에서도 워크스페이스를
     // 색만으로 빠르게 구분할 수 있게 비활성 행도 같은 색을 유지한다.
@@ -2739,7 +2744,6 @@ fn workspace_row(
         1.0,
         color.gamma_multiply(if active { 0.48 } else { 0.36 }),
     );
-    let avatar_family = egui::FontFamily::Name(terminal::MONO_BOLD_FAMILY.into());
     // 아바타는 빠른 식별용 마크라 첫 글자를 항상 대문자로 고정한다. 반대로 실제
     // 워크스페이스 이름은 사용자가 지정한 대소문자를 그대로 보존한다.
     let initial = workspace_initial(&workspace.name);
@@ -2747,10 +2751,11 @@ fn workspace_row(
         avatar.center(),
         egui::Align2::CENTER_CENTER,
         initial,
-        egui::FontId::new(15.0, avatar_family),
+        crate::fonts::sidebar_font(15.0),
         egui::Color32::WHITE,
     );
-    let show_summary = rect.width() >= 270.0;
+    let summary_mode = workspace_summary_mode(rect.width());
+    let show_summary = summary_mode != WorkspaceSummaryMode::IconOnly;
     let show_disclosure = expanded.is_some() && rect.width() >= 56.0;
     if rect.width() >= 64.0 {
         // 요약 배지 자리를 **실제 폭**만큼만 예약한다 — 고정 198px는 "유휴 5"처럼
@@ -2758,7 +2763,7 @@ fn workspace_row(
         // 우측 여백 8 + 이름/요약 간격 16 + disclosure 폭(있으면 14)을 더한다.
         let reserved_right = if show_summary {
             let disclosure = if show_disclosure { 14.0 } else { 0.0 };
-            workspace_summary_width(ui, workspace.summary) + 20.4 + disclosure
+            workspace_summary_width(ui, workspace.summary, summary_mode) + 20.4 + disclosure
         } else {
             6.8
         };
@@ -2767,9 +2772,9 @@ fn workspace_row(
             let name = clipped_line(
                 ui,
                 workspace_label(&workspace.name),
-                // 워크스페이스명은 터미널 고정폭과 무관한 UI 라벨이다. 설정에서 고른
-                // 비례 UI 폰트를 따라가게 해 원래 대소문자와 자연스러운 자폭을 보존한다.
-                egui::FontId::proportional(14.0),
+                // 워크스페이스명은 좌측 사이드바 전용 Apple SD Gothic 가족을 사용해
+                // 원래 대소문자와 자연스러운 자폭을 보존한다.
+                crate::fonts::sidebar_font(14.0),
                 name_width,
             );
             ui.painter().galley(
@@ -2785,7 +2790,17 @@ fn workspace_row(
         } else {
             rect.right() - 8.0
         };
-        paint_workspace_summary(ui, right, rect.center().y, workspace.summary);
+        paint_workspace_summary(ui, right, rect.center().y, workspace.summary, summary_mode);
+    } else {
+        // 40pt 아이콘 레일까지 줄였을 때는 상태 문구 자리가 없으므로 아바타 우하단의
+        // 작은 점으로 primary state를 계속 표시한다. 이름이 보이는 폭부터는 반드시
+        // 위의 텍스트 요약으로 바뀐다.
+        let (_, color) = workspace_primary_summary_segment(workspace.summary);
+        ui.painter().circle_filled(
+            egui::pos2(avatar.right() - 2.5, avatar.bottom() - 2.5),
+            2.5,
+            color,
+        );
     }
     if show_disclosure && let Some(expanded) = expanded {
         let center = egui::pos2(rect.right() - 9.0, rect.center().y);
@@ -2796,6 +2811,13 @@ fn workspace_row(
         ));
     }
     response
+}
+
+fn workspace_highlight_rect(full_rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(full_rect.left() + 8.0, full_rect.top()),
+        full_rect.right_bottom(),
+    )
 }
 
 fn workspace_initial(name: &str) -> char {
@@ -2896,10 +2918,31 @@ fn workspace_creation_order_partition<'a>(
 
 /// 요약 배지의 렌더 폭 — workspace_row가 이름 자리를 이 폭만큼만 비워 두게 한다.
 /// paint_workspace_summary와 같은 세그먼트·폰트를 써야 실제 렌더와 어긋나지 않는다.
-fn workspace_summary_width(ui: &egui::Ui, summary: SidebarSessionSummary) -> f32 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceSummaryMode {
+    IconOnly,
+    Compact,
+    Full,
+}
+
+fn workspace_summary_mode(width: f32) -> WorkspaceSummaryMode {
+    if width >= 270.0 {
+        WorkspaceSummaryMode::Full
+    } else if width >= 104.0 {
+        WorkspaceSummaryMode::Compact
+    } else {
+        WorkspaceSummaryMode::IconOnly
+    }
+}
+
+fn workspace_summary_width(
+    ui: &egui::Ui,
+    summary: SidebarSessionSummary,
+    mode: WorkspaceSummaryMode,
+) -> f32 {
     let weak = ui.visuals().weak_text_color();
-    let font = egui::FontId::proportional(11.0);
-    workspace_summary_segments(summary, weak)
+    let font = crate::fonts::sidebar_font(11.0);
+    workspace_summary_segments_for_mode(summary, weak, mode)
         .iter()
         .map(|(text, color)| {
             ui.painter()
@@ -2915,10 +2958,11 @@ fn paint_workspace_summary(
     right: f32,
     center_y: f32,
     summary: SidebarSessionSummary,
+    mode: WorkspaceSummaryMode,
 ) {
     let weak = ui.visuals().weak_text_color();
-    let values = workspace_summary_segments(summary, weak);
-    let font = egui::FontId::proportional(11.0);
+    let values = workspace_summary_segments_for_mode(summary, weak, mode);
+    let font = crate::fonts::sidebar_font(11.0);
     let mut cursor = right;
     for (text, color) in values.iter().rev() {
         let galley = ui
@@ -2931,6 +2975,67 @@ fn paint_workspace_summary(
             *color,
         );
     }
+}
+
+fn workspace_summary_segments_for_mode(
+    summary: SidebarSessionSummary,
+    weak: egui::Color32,
+    mode: WorkspaceSummaryMode,
+) -> Vec<(String, egui::Color32)> {
+    match mode {
+        WorkspaceSummaryMode::IconOnly => Vec::new(),
+        WorkspaceSummaryMode::Compact => vec![workspace_primary_summary_segment(summary)],
+        WorkspaceSummaryMode::Full => workspace_summary_segments(summary, weak),
+    }
+}
+
+fn workspace_primary_summary_segment(summary: SidebarSessionSummary) -> (String, egui::Color32) {
+    use crate::agent_surface::AgentVisualState as VisualState;
+
+    if summary.error > 0 {
+        return (
+            format!("오류 {}", summary.error),
+            crate::ui::agent_visuals::status_color(VisualState::Error),
+        );
+    }
+    if summary.waiting > 0 {
+        return (
+            format!("{} 입력 대기", summary.waiting),
+            crate::ui::agent_visuals::status_color(VisualState::Waiting),
+        );
+    }
+    if summary.running > 0 {
+        return (
+            format!("{} 실행 중", summary.running),
+            crate::ui::agent_visuals::status_color(VisualState::Active),
+        );
+    }
+    if summary.done > 0 {
+        return (
+            format!("완료 {}", summary.done),
+            crate::ui::agent_visuals::status_color(VisualState::Complete),
+        );
+    }
+    if summary.idle > 0 {
+        return (
+            if summary.idle == 1 {
+                "유휴".to_owned()
+            } else {
+                format!("유휴 {}", summary.idle)
+            },
+            crate::ui::agent_visuals::status_color(VisualState::Idle),
+        );
+    }
+    if summary.inactive > 0 {
+        return (
+            "비활성".to_owned(),
+            crate::ui::agent_visuals::status_color(VisualState::Off),
+        );
+    }
+    (
+        "유휴".to_owned(),
+        crate::ui::agent_visuals::status_color(VisualState::Idle),
+    )
 }
 
 fn workspace_summary_segments(
@@ -3042,15 +3147,15 @@ fn session_row_impl(
     // 텍스트는 행 폭(좌 16 + 우 여백 8) 안으로 잘라 '…' 처리 — 고정 글자수 truncate는
     // 좁은 사이드바에서 박스 밖으로 삐져나갔다(#91 사용자).
     let max_w = (rect.width() - 16.0 - 8.0).max(10.0);
-    let title_galley = clipped_line(ui, &entry.title, egui::FontId::proportional(13.0), max_w);
+    let title_galley = clipped_line(ui, &entry.title, crate::fonts::sidebar_font(13.0), max_w);
     // 2행/3행: 에이전트면 agent_line/status_line, 아니면 요약(2행)만.
     let (line2, line3) = if agent {
         (entry.agent_line.as_deref(), entry.status_line.as_deref())
     } else {
         (Some(summary_text), None)
     };
-    let line2_galley = line2.map(|t| clipped_line(ui, t, egui::FontId::monospace(10.5), max_w));
-    let line3_galley = line3.map(|t| clipped_line(ui, t, egui::FontId::monospace(10.5), max_w));
+    let line2_galley = line2.map(|t| clipped_line(ui, t, crate::fonts::sidebar_font(10.5), max_w));
+    let line3_galley = line3.map(|t| clipped_line(ui, t, crate::fonts::sidebar_font(10.5), max_w));
 
     let painter = ui.painter();
     // 선택/hover 배경 — 편집 중에는 hover 톤으로 상시 칠해 편집 상태를 표시.
@@ -3112,7 +3217,7 @@ fn session_row_impl(
         let edit_resp = ui.put(
             title_rect,
             egui::TextEdit::singleline(buf)
-                .font(egui::FontId::proportional(13.0))
+                .font(crate::fonts::sidebar_font(13.0))
                 .frame(egui::Frame::NONE)
                 .margin(egui::Margin::ZERO)
                 .vertical_align(egui::Align::Center),
@@ -3483,7 +3588,7 @@ fn nav_row(
             egui::pos2(pill.left() + 32.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
             label,
-            egui::FontId::proportional(13.0),
+            crate::fonts::sidebar_font(13.0),
             color,
         );
         if let Some(badge) = badge {
@@ -3497,7 +3602,7 @@ fn nav_row(
 fn paint_nav_badge(ui: &egui::Ui, pill: egui::Rect, text: &str) {
     let galley = ui.painter().layout_no_wrap(
         text.to_owned(),
-        egui::FontId::proportional(10.0),
+        crate::fonts::sidebar_font(10.0),
         egui::Color32::WHITE,
     );
     let h = 16.0;
@@ -4392,6 +4497,23 @@ fn reread(base: &Path, old: &[TreeNode]) -> std::io::Result<Vec<TreeNode>> {
 mod tests {
     use super::*;
 
+    /// App 시작 경로는 fonts::install_cjk_fallback에서 named family를 등록한다. 파일 트리
+    /// 단위 harness는 그 초기화를 거치지 않으므로 기본 Proportional face를 같은 이름에
+    /// 연결해 레이아웃만 가볍게 검증한다(55MB 시스템 TTC를 test context마다 파싱하지 않음).
+    fn install_sidebar_test_fonts(ctx: &egui::Context) {
+        let mut fonts = egui::FontDefinitions::default();
+        let fallback = fonts
+            .families
+            .get(&egui::FontFamily::Proportional)
+            .cloned()
+            .unwrap_or_default();
+        fonts.families.insert(
+            egui::FontFamily::Name(crate::fonts::SIDEBAR_FONT_FAMILY.into()),
+            fallback,
+        );
+        ctx.set_fonts(fonts);
+    }
+
     #[test]
     fn 워크스페이스_아바타만_대문자이고_이름표기는_보존한다() {
         assert_eq!(workspace_initial("arteawiki"), 'A');
@@ -4508,6 +4630,41 @@ mod tests {
             inactive[0].1,
             crate::ui::agent_visuals::status_color(VisualState::Off)
         );
+
+        let primary = workspace_primary_summary_segment(SidebarSessionSummary::default());
+        assert_eq!(primary, idle[0]);
+    }
+
+    #[test]
+    fn 워크스페이스_하이라이트는_왼쪽만_들여쓰고_세션과_오른쪽끝을_맞춘다() {
+        let full = egui::Rect::from_min_max(egui::pos2(0.0, 10.0), egui::pos2(500.0, 49.1));
+        let highlight = workspace_highlight_rect(full);
+        assert_eq!(highlight.left(), 8.0, "워크스페이스 왼쪽 인셋은 유지");
+        assert_eq!(
+            highlight.right(),
+            full.right(),
+            "세션 행과 같은 우측 끝 사용"
+        );
+        assert_eq!(highlight.top(), full.top());
+        assert_eq!(highlight.bottom(), full.bottom());
+    }
+
+    #[test]
+    fn 워크스페이스_상태는_이름폭부터_문구로_항상_표시한다() {
+        assert_eq!(
+            workspace_summary_mode(103.9),
+            WorkspaceSummaryMode::IconOnly
+        );
+        assert_eq!(workspace_summary_mode(104.0), WorkspaceSummaryMode::Compact);
+        assert_eq!(workspace_summary_mode(269.9), WorkspaceSummaryMode::Compact);
+        assert_eq!(workspace_summary_mode(270.0), WorkspaceSummaryMode::Full);
+
+        let compact = workspace_summary_segments_for_mode(
+            SidebarSessionSummary::default(),
+            egui::Color32::GRAY,
+            WorkspaceSummaryMode::Compact,
+        );
+        assert_eq!(compact[0].0, "유휴");
     }
 
     /// 안정성 감사 High #2: 워커가 stale epoch(루트 전환/refresh 후) 청크를
@@ -5310,8 +5467,12 @@ mod tests {
             inbox_count: 0,
             agents_open: false,
         };
-        egui::__run_test_ui(|ui| {
-            assert!(tree.panel(ui, &[], &sidebar, &catalog).is_none());
+        let ctx = egui::Context::default();
+        install_sidebar_test_fonts(&ctx);
+        let _ = ctx.run_ui(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert!(tree.panel(ui, &[], &sidebar, &catalog).is_none());
+            });
         });
         drain_listings(&mut tree);
 
@@ -5883,10 +6044,16 @@ mod tests {
         let mut tree = FileTreeUi::new(egui::Context::default());
         tree.set_root(Some(base.clone()));
         // step_dt를 더블클릭 판정 한계(0.3s) 아래로 — 클릭 2번이 한 스텝 간격으로 온다.
+        let mut fonts_ready = false;
         let mut harness = egui_kittest::Harness::builder()
             .with_step_dt(0.05)
             .build_ui_state(
-                |ui, state: &mut (FileTreeUi, Vec<SidebarAction>)| {
+                move |ui, state: &mut (FileTreeUi, Vec<SidebarAction>)| {
+                    if !fonts_ready {
+                        install_sidebar_test_fonts(ui.ctx());
+                        fonts_ready = true;
+                        return;
+                    }
                     // 워크스페이스 목록은 이 테스트와 무관 — 최소 스냅샷.
                     let snapshot = SidebarSnapshot {
                         active_workspace_id: "ws-test",
@@ -6151,10 +6318,16 @@ mod tests {
     fn kittest_워크스페이스_없으면_빈상태_cta가_액션을_낸다() {
         use egui_kittest::kittest::Queryable;
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut fonts_ready = false;
         let mut harness = egui_kittest::Harness::builder()
             .with_size(egui::vec2(420.0, 700.0))
             .build_ui_state(
-                |ui, state: &mut (FileTreeUi, Vec<SidebarAction>)| {
+                move |ui, state: &mut (FileTreeUi, Vec<SidebarAction>)| {
+                    if !fonts_ready {
+                        install_sidebar_test_fonts(ui.ctx());
+                        fonts_ready = true;
+                        return;
+                    }
                     let snapshot = SidebarSnapshot {
                         active_workspace_id: "ws-hidden",
                         workspaces: &[],
@@ -6198,10 +6371,16 @@ mod tests {
     fn kittest_하단_nav_클릭이_홈_작업함_에이전트_액션을_낸다() {
         use egui_kittest::kittest::Queryable;
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut fonts_ready = false;
         let mut harness = egui_kittest::Harness::builder()
             .with_size(egui::vec2(420.0, 700.0))
             .build_ui_state(
-                |ui, state: &mut (FileTreeUi, Vec<SidebarAction>)| {
+                move |ui, state: &mut (FileTreeUi, Vec<SidebarAction>)| {
+                    if !fonts_ready {
+                        install_sidebar_test_fonts(ui.ctx());
+                        fonts_ready = true;
+                        return;
+                    }
                     let snapshot = SidebarSnapshot {
                         active_workspace_id: "ws-test",
                         workspaces: &[],
@@ -6345,10 +6524,16 @@ mod tests {
         catalog: &i18n::Catalog,
         tree: FileTreeUi,
     ) -> egui_kittest::Harness<'_, (FileTreeUi, Vec<SidebarAction>)> {
+        let mut fonts_ready = false;
         egui_kittest::Harness::builder()
             .with_size(egui::vec2(420.0, 700.0))
             .build_ui_state(
-                |ui, state: &mut (FileTreeUi, Vec<SidebarAction>)| {
+                move |ui, state: &mut (FileTreeUi, Vec<SidebarAction>)| {
+                    if !fonts_ready {
+                        install_sidebar_test_fonts(ui.ctx());
+                        fonts_ready = true;
+                        return;
+                    }
                     let snapshot = SidebarSnapshot {
                         active_workspace_id: "ws-test",
                         workspaces: &[],

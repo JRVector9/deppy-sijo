@@ -1,19 +1,102 @@
-//! 세션당 append-only redacted 로그 3종 (설계문서 7장):
+//! 세션당 tail-bounded redacted 로그 3종 (설계문서 7장):
 //! redacted.ansi.log / redacted.plain.txt / events.redacted.jsonl
 //! 호출측(runtime worker)이 redaction을 끝낸 바이트만 넘긴다 —
 //! 이 모듈은 평문 secret을 받지 않는 것이 계약이다.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use deppy_core::SessionId;
 
+const ANSI_LOG_FILE: &str = "redacted.ansi.log";
+const PLAIN_LOG_FILE: &str = "redacted.plain.txt";
+const EVENTS_LOG_FILE: &str = "events.redacted.jsonl";
+
+/// 런타임 복원이 읽는 ANSI tail 상한과 동일하다. 이보다 오래된 출력은 재시작 때도
+/// 사용되지 않으므로 디스크에 무기한 중복 보관하지 않는다.
+pub const ANSI_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// inbox 미리보기는 마지막 16KiB만 읽는다. 사람이 최근 출력을 넉넉히 확인할 수 있게
+/// 4MiB를 남기되 ANSI 원본과 같은 전체 스트림을 계속 중복 저장하지 않는다.
+pub const PLAIN_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// lifecycle 이벤트는 한 줄이 작고 최근 이벤트가 복구/진단에 중요하다.
+pub const EVENTS_LOG_MAX_BYTES: u64 = 1024 * 1024;
+/// 모든 워크스페이스의 redacted 세션 로그 합계 예산. 앱 시작 시 오래된 세션 묶음부터
+/// 제거한다. provider transcript/agent session mapping과 scrollback.zlib은 대상이 아니다.
+pub const SESSION_LOG_DISK_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
+struct BoundedLogFile {
+    file: File,
+    path: PathBuf,
+    max_bytes: u64,
+}
+
+impl BoundedLogFile {
+    fn open(path: &Path, max_bytes: u64) -> anyhow::Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("로그 파일 열기 실패: {}", path.display()))?;
+        let mut bounded = Self {
+            file,
+            path: path.to_path_buf(),
+            max_bytes,
+        };
+        bounded.compact_if_oversized(max_bytes / 2)?;
+        Ok(bounded)
+    }
+
+    fn len(&self) -> std::io::Result<u64> {
+        self.file.metadata().map(|metadata| metadata.len())
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let incoming = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let current = self.len().unwrap_or(0);
+        if current.saturating_add(incoming) > self.max_bytes {
+            let retain = self
+                .max_bytes
+                .saturating_sub(incoming)
+                .min(self.max_bytes / 2);
+            compact_open_file_to_tail(&mut self.file, retain)
+                .with_context(|| format!("로그 tail 압축 실패: {}", self.path.display()))?;
+        }
+        if incoming >= self.max_bytes {
+            let start = bytes.len().saturating_sub(self.max_bytes as usize);
+            self.file
+                .write_all(&bytes[start..])
+                .with_context(|| format!("로그 기록 실패: {}", self.path.display()))?;
+        } else {
+            self.file
+                .write_all(bytes)
+                .with_context(|| format!("로그 기록 실패: {}", self.path.display()))?;
+        }
+        Ok(())
+    }
+
+    fn compact_if_oversized(&mut self, retain_bytes: u64) -> anyhow::Result<()> {
+        if self.len().unwrap_or(0) > self.max_bytes {
+            compact_open_file_to_tail(&mut self.file, retain_bytes)
+                .with_context(|| format!("기존 로그 tail 압축 실패: {}", self.path.display()))?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) {
+        self.file.flush().ok();
+    }
+}
+
 pub struct SessionLogWriter {
-    ansi: File,
-    plain: File,
-    events: File,
+    ansi: BoundedLogFile,
+    plain: BoundedLogFile,
+    events: BoundedLogFile,
     /// chunk 경계에 걸친 escape 시퀀스 대응 — plain 변환기 상태 유지
     strip_state: StripState,
 }
@@ -32,9 +115,9 @@ impl SessionLogWriter {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("로그 디렉터리 생성 실패: {}", dir.display()))?;
         Ok(Self {
-            ansi: append_only(&dir.join("redacted.ansi.log"))?,
-            plain: append_only(&dir.join("redacted.plain.txt"))?,
-            events: append_only(&dir.join("events.redacted.jsonl"))?,
+            ansi: BoundedLogFile::open(&dir.join(ANSI_LOG_FILE), ANSI_LOG_MAX_BYTES)?,
+            plain: BoundedLogFile::open(&dir.join(PLAIN_LOG_FILE), PLAIN_LOG_MAX_BYTES)?,
+            events: BoundedLogFile::open(&dir.join(EVENTS_LOG_FILE), EVENTS_LOG_MAX_BYTES)?,
             strip_state: StripState::default(),
         })
     }
@@ -57,7 +140,7 @@ impl SessionLogWriter {
     }
 
     pub fn ansi_path(logs_root: &Path, session_key: &str) -> anyhow::Result<PathBuf> {
-        Ok(Self::session_dir_key(logs_root, session_key)?.join("redacted.ansi.log"))
+        Ok(Self::session_dir_key(logs_root, session_key)?.join(ANSI_LOG_FILE))
     }
 
     /// 마지막으로 UI가 확정한 터미널 grid 크기. ANSI 로그의 zsh/ZLE redraw는 당시
@@ -116,7 +199,7 @@ impl SessionLogWriter {
 
     /// append 재개 시 offset을 기존 파일 길이부터 이어가기 위한 길이 조회.
     pub fn ansi_len(&self) -> std::io::Result<u64> {
-        self.ansi.metadata().map(|metadata| metadata.len())
+        self.ansi.len()
     }
 
     /// redaction이 끝난 출력 chunk를 기록한다.
@@ -125,13 +208,9 @@ impl SessionLogWriter {
         if redacted.is_empty() {
             return Ok(());
         }
-        self.ansi
-            .write_all(redacted)
-            .context("ansi.log 기록 실패")?;
+        self.ansi.append(redacted).context("ansi.log 기록 실패")?;
         let plain = strip_ansi_stateful(redacted, &mut self.strip_state);
-        self.plain
-            .write_all(&plain)
-            .context("plain.txt 기록 실패")?;
+        self.plain.append(&plain).context("plain.txt 기록 실패")?;
         Ok(())
     }
 
@@ -147,26 +226,159 @@ impl SessionLogWriter {
             None => format!("{{\"ts_ms\":{ts},\"event\":\"{}\"}}\n", json_escape(kind)),
         };
         self.events
-            .write_all(line.as_bytes())
+            .append(line.as_bytes())
             .context("events.jsonl 기록 실패")?;
-        self.events.flush().ok();
+        self.events.flush();
         Ok(())
     }
 
     /// 종료/주기 flush.
     pub fn flush(&mut self) {
-        self.ansi.flush().ok();
-        self.plain.flush().ok();
-        self.events.flush().ok();
+        self.ansi.flush();
+        self.plain.flush();
+        self.events.flush();
     }
 }
 
-fn append_only(path: &Path) -> anyhow::Result<File> {
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("로그 파일 열기 실패: {}", path.display()))
+/// 열린 파일의 끝 `retain_bytes`만 같은 inode에 다시 쓴다. writer handle을 교체/rename하지
+/// 않으므로 런타임이 계속 가진 append handle에도 즉시 적용된다. 첫 불완전 줄은 버려 ANSI
+/// escape·UTF-8·JSONL 중간에서 재생/미리보기가 시작될 가능성을 줄인다.
+fn compact_open_file_to_tail(file: &mut File, retain_bytes: u64) -> std::io::Result<u64> {
+    file.flush()?;
+    let len = file.metadata()?.len();
+    if len <= retain_bytes {
+        return Ok(len);
+    }
+    if retain_bytes == 0 {
+        file.set_len(0)?;
+        return Ok(0);
+    }
+    let start = len.saturating_sub(retain_bytes);
+    file.seek(std::io::SeekFrom::Start(start))?;
+    let mut tail = Vec::with_capacity(usize::try_from(len - start).unwrap_or(0));
+    file.read_to_end(&mut tail)?;
+    if start > 0 {
+        if let Some(newline) = tail.iter().position(|byte| *byte == b'\n') {
+            tail.drain(..=newline);
+        } else {
+            tail.clear();
+        }
+    }
+    file.set_len(0)?;
+    file.write_all(&tail)?;
+    file.flush()?;
+    Ok(tail.len() as u64)
+}
+
+struct SessionLogBundle {
+    paths: Vec<(PathBuf, u64)>,
+    bytes: u64,
+    modified: std::time::SystemTime,
+}
+
+impl Default for SessionLogBundle {
+    fn default() -> Self {
+        Self {
+            paths: Vec::new(),
+            bytes: 0,
+            modified: std::time::UNIX_EPOCH,
+        }
+    }
+}
+
+/// 앱 로그 루트 전체를 스캔해 파일별 상한을 먼저 적용하고, 그래도 전체 예산을 넘으면
+/// 세션의 redacted 로그 3종을 오래된 묶음부터 제거한다. 앱 자체 `app.log`, provider
+/// transcript, terminal.size, scrollback.zlib은 이름이 다르므로 건드리지 않는다.
+pub fn gc_session_logs(logs_root: &Path, budget_bytes: u64) -> anyhow::Result<u64> {
+    let mut bundles = collect_session_log_bundles(logs_root)?;
+    let mut total = bundles.iter().map(|bundle| bundle.bytes).sum::<u64>();
+    if total <= budget_bytes {
+        return Ok(total);
+    }
+    bundles.sort_by_key(|bundle| bundle.modified);
+    for bundle in bundles {
+        if total <= budget_bytes {
+            break;
+        }
+        let mut removed = 0u64;
+        for (path, len) in bundle.paths {
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed = removed.saturating_add(len),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    removed = removed.saturating_add(len);
+                }
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), "세션 로그 GC 삭제 실패: {error:#}")
+                }
+            }
+        }
+        total = total.saturating_sub(removed);
+        if removed > 0 {
+            tracing::info!(bytes = removed, "오래된 세션 로그 GC — 전체 예산 초과 제거");
+        }
+    }
+    Ok(total)
+}
+
+fn path_len_or_zero(path: &Path) -> u64 {
+    path.metadata().map(|metadata| metadata.len()).unwrap_or(0)
+}
+
+fn collect_session_log_bundles(logs_root: &Path) -> anyhow::Result<Vec<SessionLogBundle>> {
+    let mut by_dir = std::collections::HashMap::<PathBuf, SessionLogBundle>::new();
+    let mut stack = vec![(logs_root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("로그 디렉터리 나열 실패: {}", dir.display()));
+            }
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() && depth < 4 {
+                stack.push((entry.path(), depth + 1));
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some((max_bytes, retain_bytes)) = log_limits_for_name(&name) else {
+                continue;
+            };
+            let path = entry.path();
+            let original = path
+                .metadata()
+                .with_context(|| format!("세션 로그 metadata 실패: {}", path.display()))?;
+            if original.len() > max_bytes {
+                let mut file = OpenOptions::new().read(true).append(true).open(&path)?;
+                compact_open_file_to_tail(&mut file, retain_bytes).with_context(|| {
+                    format!("기존 세션 로그 상한 적용 실패: {}", path.display())
+                })?;
+            }
+            let len = path_len_or_zero(&path);
+            let bundle = by_dir.entry(dir.clone()).or_default();
+            bundle.paths.push((path, len));
+            bundle.bytes = bundle.bytes.saturating_add(len);
+            let modified = original.modified().unwrap_or(std::time::UNIX_EPOCH);
+            bundle.modified = bundle.modified.max(modified);
+        }
+    }
+    Ok(by_dir.into_values().collect())
+}
+
+fn log_limits_for_name(name: &std::ffi::OsStr) -> Option<(u64, u64)> {
+    match name.to_str()? {
+        ANSI_LOG_FILE => Some((ANSI_LOG_MAX_BYTES, ANSI_LOG_MAX_BYTES / 2)),
+        PLAIN_LOG_FILE => Some((PLAIN_LOG_MAX_BYTES, PLAIN_LOG_MAX_BYTES / 2)),
+        EVENTS_LOG_FILE => Some((EVENTS_LOG_MAX_BYTES, EVENTS_LOG_MAX_BYTES / 2)),
+        _ => None,
+    }
 }
 
 /// 표시용 plain 텍스트 변환기 단계 — escape가 chunk 경계에 걸려도 이어간다.
@@ -327,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn 세_파일_생성과_append_only() {
+    fn 세_파일_생성과_append() {
         let root = temp_root("basic");
         let session = SessionId(7);
         {
@@ -405,6 +617,61 @@ mod tests {
         assert!(SessionLogWriter::save_terminal_size(&root, key, 0, 47).is_err());
         std::fs::remove_dir_all(&root).unwrap();
     }
+
+    #[test]
+    fn bounded_log는_상한을_넘으면_최근_완전한_줄만_남긴다() {
+        let root = temp_root("bounded-tail");
+        let path = root.join("bounded.log");
+        let mut log = BoundedLogFile::open(&path, 64).unwrap();
+        for index in 0..12 {
+            log.append(format!("line-{index:02}-payload\n").as_bytes())
+                .unwrap();
+        }
+        log.flush();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() <= 64, "파일별 상한을 넘으면 안 됨");
+        assert!(bytes.starts_with(b"line-"), "중간 줄에서 시작하면 안 됨");
+        assert!(bytes.ends_with(b"line-11-payload\n"));
+        assert!(!bytes.windows(7).any(|window| window == b"line-00"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn 전체_gc는_오래된_세션_로그만_지우고_다른_리소스는_보존한다() {
+        let root = temp_root("global-gc");
+        let app_log = root.join("app.log.2026-07-19");
+        std::fs::write(&app_log, b"application log").unwrap();
+
+        for (index, key) in ["old", "new"].iter().enumerate() {
+            let dir = root.join("workspace").join(key);
+            std::fs::create_dir_all(&dir).unwrap();
+            for name in [ANSI_LOG_FILE, PLAIN_LOG_FILE, EVENTS_LOG_FILE] {
+                let path = dir.join(name);
+                std::fs::write(&path, vec![b'x'; 40]).unwrap();
+                let file = OpenOptions::new().append(true).open(&path).unwrap();
+                file.set_modified(
+                    std::time::UNIX_EPOCH
+                        + std::time::Duration::from_secs(1_000 + index as u64 * 1_000),
+                )
+                .unwrap();
+            }
+            std::fs::write(dir.join("scrollback.zlib"), b"archive").unwrap();
+            std::fs::write(dir.join("terminal.size"), b"120 40\n").unwrap();
+        }
+
+        let total = gc_session_logs(&root, 150).unwrap();
+        assert_eq!(total, 120);
+        for name in [ANSI_LOG_FILE, PLAIN_LOG_FILE, EVENTS_LOG_FILE] {
+            assert!(!root.join("workspace/old").join(name).exists());
+            assert!(root.join("workspace/new").join(name).exists());
+        }
+        assert!(root.join("workspace/old/scrollback.zlib").exists());
+        assert!(root.join("workspace/old/terminal.size").exists());
+        assert!(app_log.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// 2026-07-17 실측 회귀: claude는 정렬에 공백이 아니라 커서 이동을 쓴다
     /// (`auto ESC[11G mode ESC[16G on`). escape를 통째로 버리던 때는 plain.txt에
     /// `automodeon`으로 남아 사람이 읽을 수 없었다 — 벨 인박스 미리보기가 이 파일을

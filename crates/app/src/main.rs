@@ -73,6 +73,10 @@ fn main() -> anyhow::Result<()> {
     // 세션 로그 베이스 (설계문서 7장: logs/<workspace_id>/<session_id>/) —
     // workspace별 하위 디렉터리는 App이 workspace_id로 만든다 (전환 지원).
     let logs_base = paths.data_dir.join("logs");
+    match storage::gc_session_logs(&logs_base, storage::SESSION_LOG_DISK_BUDGET_BYTES) {
+        Ok(bytes) => tracing::info!(bytes, "세션 로그 디스크 예산 적용"),
+        Err(error) => tracing::warn!("세션 로그 GC 실패 — 기동 계속: {error:#}"),
+    }
     tracing::info!(
         config_dir = %paths.config_dir.display(),
         data_dir = %paths.data_dir.display(),

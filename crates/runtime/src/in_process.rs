@@ -25,8 +25,8 @@ use crate::resource_monitor::{
     ProcessResourceMonitor, ProcessResourceMonitorConfig, SessionResourceTarget,
 };
 
-/// 재시작 시 한 세션에서 terminal parser로 다시 읽는 ANSI tail 상한. 전체 audit 로그는
-/// append-only로 보존하되 시작 I/O/CPU는 세션당 유계로 유지한다.
+/// 재시작 시 한 세션에서 terminal parser로 다시 읽는 ANSI tail 상한. storage의
+/// 파일별 보존 상한도 이 값과 같아 시작 I/O/CPU와 디스크를 함께 유계로 유지한다.
 const MAX_ANSI_REPLAY_BYTES: u64 = 16 * 1024 * 1024;
 /// `terminal.size`가 없던 구버전 로그에서 마지막 zsh ZLE redraw 너비를 찾는 tail 상한.
 /// geometry 복구는 최초 한 번뿐이고 이후 resize가 sidecar를 기록한다.

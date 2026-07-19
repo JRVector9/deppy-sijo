@@ -2739,18 +2739,15 @@ fn workspace_row(
         1.0,
         color.gamma_multiply(if active { 0.48 } else { 0.36 }),
     );
-    let bold_family = egui::FontFamily::Name(terminal::MONO_BOLD_FAMILY.into());
-    let initial = workspace
-        .name
-        .chars()
-        .next()
-        .and_then(|character| character.to_uppercase().next())
-        .unwrap_or('W');
+    let avatar_family = egui::FontFamily::Name(terminal::MONO_BOLD_FAMILY.into());
+    // 아바타는 빠른 식별용 마크라 첫 글자를 항상 대문자로 고정한다. 반대로 실제
+    // 워크스페이스 이름은 사용자가 지정한 대소문자를 그대로 보존한다.
+    let initial = workspace_initial(&workspace.name);
     ui.painter().text(
         avatar.center(),
         egui::Align2::CENTER_CENTER,
         initial,
-        egui::FontId::new(15.0, bold_family.clone()),
+        egui::FontId::new(15.0, avatar_family),
         egui::Color32::WHITE,
     );
     let show_summary = rect.width() >= 270.0;
@@ -2767,11 +2764,12 @@ fn workspace_row(
         };
         let name_width = (rect.right() - reserved_right - avatar.right() - 7.65).max(0.0);
         if name_width > 4.0 {
-            let uppercase_name = workspace.name.to_uppercase();
             let name = clipped_line(
                 ui,
-                &uppercase_name,
-                egui::FontId::new(14.0, bold_family),
+                workspace_label(&workspace.name),
+                // 워크스페이스명은 터미널 고정폭과 무관한 UI 라벨이다. 설정에서 고른
+                // 비례 UI 폰트를 따라가게 해 원래 대소문자와 자연스러운 자폭을 보존한다.
+                egui::FontId::proportional(14.0),
                 name_width,
             );
             ui.painter().galley(
@@ -2791,26 +2789,41 @@ fn workspace_row(
     }
     if show_disclosure && let Some(expanded) = expanded {
         let center = egui::pos2(rect.right() - 9.0, rect.center().y);
-        let points = if expanded {
-            vec![
-                egui::pos2(center.x - 4.0, center.y - 2.0),
-                egui::pos2(center.x + 4.0, center.y - 2.0),
-                egui::pos2(center.x, center.y + 3.0),
-            ]
-        } else {
-            vec![
-                egui::pos2(center.x - 2.0, center.y - 4.0),
-                egui::pos2(center.x - 2.0, center.y + 4.0),
-                egui::pos2(center.x + 3.0, center.y),
-            ]
-        };
-        ui.painter().add(egui::Shape::convex_polygon(
-            points,
-            ui.visuals().weak_text_color(),
-            egui::Stroke::NONE,
+        let points = disclosure_chevron_points(center, expanded);
+        ui.painter().add(egui::Shape::line(
+            points.to_vec(),
+            egui::Stroke::new(1.0, ui.visuals().weak_text_color()),
         ));
     }
     response
+}
+
+fn workspace_initial(name: &str) -> char {
+    name.chars()
+        .next()
+        .and_then(|character| character.to_uppercase().next())
+        .unwrap_or('W')
+}
+
+fn workspace_label(name: &str) -> &str {
+    name
+}
+
+/// 첨부 시안의 얇은 선형 chevron. 접힘은 `>`이고 펼침은 `⌄` 방향이다.
+fn disclosure_chevron_points(center: egui::Pos2, expanded: bool) -> [egui::Pos2; 3] {
+    if expanded {
+        [
+            egui::pos2(center.x - 4.5, center.y - 2.5),
+            egui::pos2(center.x, center.y + 2.5),
+            egui::pos2(center.x + 4.5, center.y - 2.5),
+        ]
+    } else {
+        [
+            egui::pos2(center.x - 2.5, center.y - 4.5),
+            egui::pos2(center.x + 2.5, center.y),
+            egui::pos2(center.x - 2.5, center.y + 4.5),
+        ]
+    }
 }
 
 /// 워크스페이스 행 우클릭 메뉴 — 「이름 바꾸기」(별칭 편집)는 세션이 없어도 항상,
@@ -2924,10 +2937,16 @@ fn workspace_summary_segments(
     summary: SidebarSessionSummary,
     weak: egui::Color32,
 ) -> Vec<(String, egui::Color32)> {
-    let blue = egui::Color32::from_rgb(0x4c, 0xa8, 0xdf);
-    let orange = egui::Color32::from_rgb(0xe7, 0x9a, 0x3b);
-    let green = egui::Color32::from_rgb(0x55, 0xc8, 0x79);
-    let red = egui::Color32::from_rgb(0xed, 0x5b, 0x61);
+    use crate::agent_surface::AgentVisualState as VisualState;
+
+    // 세션 행·Agents·알림과 같은 단일 팔레트를 사용한다. 워크스페이스 요약만 별도
+    // RGB를 가지면 같은 상태가 표면마다 다른 색으로 보여 상태 의미가 흐려진다.
+    let running = crate::ui::agent_visuals::status_color(VisualState::Active);
+    let waiting = crate::ui::agent_visuals::status_color(VisualState::Waiting);
+    let done = crate::ui::agent_visuals::status_color(VisualState::Complete);
+    let error = crate::ui::agent_visuals::status_color(VisualState::Error);
+    let idle = crate::ui::agent_visuals::status_color(VisualState::Idle);
+    let inactive = crate::ui::agent_visuals::status_color(VisualState::Off);
     let mut parts = Vec::new();
     let push = |parts: &mut Vec<(String, egui::Color32)>, label: String, color| {
         if !parts.is_empty() {
@@ -2936,33 +2955,38 @@ fn workspace_summary_segments(
         parts.push((label, color));
     };
     if summary.running > 0 {
-        push(&mut parts, format!("{} 실행 중", summary.running), blue);
+        push(&mut parts, format!("{} 실행 중", summary.running), running);
     }
     if summary.waiting > 0 {
-        push(&mut parts, format!("{} 입력 대기", summary.waiting), orange);
+        push(
+            &mut parts,
+            format!("{} 입력 대기", summary.waiting),
+            waiting,
+        );
     }
     if summary.done > 0 {
-        push(&mut parts, format!("완료 {}", summary.done), green);
+        push(&mut parts, format!("완료 {}", summary.done), done);
     }
     if summary.error > 0 {
-        push(&mut parts, format!("오류 {}", summary.error), red);
+        push(&mut parts, format!("오류 {}", summary.error), error);
     }
     if summary.idle > 0 {
         if summary.idle == 1 && parts.is_empty() {
-            push(&mut parts, "유휴".to_owned(), weak);
+            push(&mut parts, "유휴".to_owned(), idle);
         } else {
-            push(&mut parts, format!("유휴 {}", summary.idle), weak);
+            push(&mut parts, format!("유휴 {}", summary.idle), idle);
         }
     }
     if summary.inactive > 0 {
         if parts.is_empty() {
-            push(&mut parts, "비활성".to_owned(), weak);
+            push(&mut parts, "비활성".to_owned(), inactive);
         } else {
-            push(&mut parts, format!("비활성 {}", summary.inactive), weak);
+            push(&mut parts, format!("비활성 {}", summary.inactive), inactive);
         }
     }
+    // 세션이 아직 생성되지 않은 활성/warm 워크스페이스도 상태 영역을 비워 두지 않는다.
     if parts.is_empty() {
-        parts.push(("유휴".to_owned(), weak));
+        parts.push(("유휴".to_owned(), idle));
     }
     parts
 }
@@ -3322,12 +3346,7 @@ fn file_entry_color(name: &str, is_dir: bool, fallback: egui::Color32) -> egui::
 }
 
 fn workspace_accent(name: &str) -> egui::Color32 {
-    match name
-        .chars()
-        .next()
-        .and_then(|character| character.to_uppercase().next())
-        .unwrap_or('W')
-    {
+    match workspace_initial(name) {
         'S' => egui::Color32::from_rgb(0x55, 0xc8, 0x79),
         'A' => egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
         'V' => egui::Color32::from_rgb(0x9a, 0x78, 0xe8),
@@ -4374,6 +4393,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn 워크스페이스_아바타만_대문자이고_이름표기는_보존한다() {
+        assert_eq!(workspace_initial("arteawiki"), 'A');
+        assert_eq!(workspace_initial("VisionAI"), 'V');
+        assert_eq!(workspace_initial(""), 'W');
+        assert_eq!(workspace_label("arteawiki"), "arteawiki");
+        assert_eq!(workspace_label("VisionAI"), "VisionAI");
+    }
+
+    #[test]
+    fn 워크스페이스_chevron은_얇은_접힘과_펼침_방향을_가진다() {
+        let center = egui::pos2(10.0, 20.0);
+        let collapsed = disclosure_chevron_points(center, false);
+        assert!(collapsed[1].x > collapsed[0].x);
+        assert!(collapsed[1].x > collapsed[2].x);
+        assert!(collapsed[0].y < collapsed[1].y);
+        assert!(collapsed[2].y > collapsed[1].y);
+
+        let expanded = disclosure_chevron_points(center, true);
+        assert!(expanded[1].y > expanded[0].y);
+        assert!(expanded[1].y > expanded[2].y);
+        assert!(expanded[0].x < expanded[1].x);
+        assert!(expanded[2].x > expanded[1].x);
+    }
+
+    #[test]
     fn 워크스페이스_선택이_바뀌어도_생성순서가_고정된다() {
         let workspaces = ["first", "second", "third"].map(|id| SidebarWorkspaceEntry {
             id: id.to_owned(),
@@ -4410,6 +4454,37 @@ mod tests {
         assert_eq!(summary.idle, 1);
 
         let segments = workspace_summary_segments(summary, egui::Color32::GRAY);
+        use crate::agent_surface::AgentVisualState as VisualState;
+        let status_segments = segments
+            .iter()
+            .filter(|(text, _)| text != " · ")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            status_segments,
+            vec![
+                (
+                    "1 실행 중".to_owned(),
+                    crate::ui::agent_visuals::status_color(VisualState::Active),
+                ),
+                (
+                    "2 입력 대기".to_owned(),
+                    crate::ui::agent_visuals::status_color(VisualState::Waiting),
+                ),
+                (
+                    "완료 1".to_owned(),
+                    crate::ui::agent_visuals::status_color(VisualState::Complete),
+                ),
+                (
+                    "오류 1".to_owned(),
+                    crate::ui::agent_visuals::status_color(VisualState::Error),
+                ),
+                (
+                    "유휴 1".to_owned(),
+                    crate::ui::agent_visuals::status_color(VisualState::Idle),
+                ),
+            ]
+        );
         let text = segments
             .into_iter()
             .map(|(text, _)| text)
@@ -4419,14 +4494,19 @@ mod tests {
 
     #[test]
     fn 상태없는_워크스페이스는_유휴_복원세션은_비활성으로_표시한다() {
+        use crate::agent_surface::AgentVisualState as VisualState;
         let weak = egui::Color32::GRAY;
+        let idle = workspace_summary_segments(SidebarSessionSummary::default(), weak);
+        assert_eq!(idle[0].0, "유휴");
         assert_eq!(
-            workspace_summary_segments(SidebarSessionSummary::default(), weak)[0].0,
-            "유휴"
+            idle[0].1,
+            crate::ui::agent_visuals::status_color(VisualState::Idle)
         );
+        let inactive = workspace_summary_segments(SidebarSessionSummary::inactive(3), weak);
+        assert_eq!(inactive[0].0, "비활성");
         assert_eq!(
-            workspace_summary_segments(SidebarSessionSummary::inactive(3), weak)[0].0,
-            "비활성"
+            inactive[0].1,
+            crate::ui::agent_visuals::status_color(VisualState::Off)
         );
     }
 

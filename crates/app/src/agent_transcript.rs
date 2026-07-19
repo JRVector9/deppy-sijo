@@ -5,6 +5,7 @@
 //! - 세션 ID: claude는 파일명, codex는 파일명 내 UUID. → 복원 시 native resume에 그대로 씀.
 //! - cwd: claude는 매 이벤트, codex는 session_meta(첫 줄)에 기록 → pane 바인딩 앵커.
 //! - 활동: 마지막 의미있는 이벤트로 working/idle 판정.
+//! - 작업 설명: 최신 agent 응답/진행 메시지를 한 줄로 축약해 사이드바에 표시.
 //! - 승인(needsInput)은 transcript에 없다 → regex fallback(status detector)이 담당.
 
 use std::io::{Read, Seek, SeekFrom};
@@ -32,6 +33,8 @@ pub struct TranscriptState {
     pub effort: Option<String>,
     /// 남은 컨텍스트 %(0~100). codex는 rollout에서 계산.
     pub context_pct: Option<u8>,
+    /// 최신 에이전트 응답/진행 메시지의 한 줄 요약. 별도 LLM 호출 없이 원문을 축약한다.
+    pub last_agent_summary: Option<String>,
 }
 
 /// 파일 끝 `max_bytes`만 읽는다 — transcript는 수십 MB가 될 수 있어 tail만 본다.
@@ -46,6 +49,47 @@ fn tail_text(path: &Path, max_bytes: u64) -> std::io::Result<String> {
 }
 
 const TAIL_BYTES: u64 = 256 * 1024;
+const AGENT_SUMMARY_CHARS: usize = 120;
+
+fn clean_agent_summary(text: &str) -> Option<String> {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut visible = compact.as_str();
+    // 렌더링용 이미지 첨부 표식이 앞에 붙은 메시지는 경로 표식만 걷어낸다.
+    while visible.starts_with("<image ") {
+        visible = visible.split_once('>')?.1.trim_start();
+    }
+    if visible.is_empty()
+        || visible.starts_with("<system-reminder")
+        || visible.starts_with("<local-command")
+        || visible.starts_with("<command-name")
+        || visible.starts_with("<environment_context")
+        || visible.starts_with("<permissions")
+        || visible.starts_with("<INSTRUCTIONS")
+    {
+        return None;
+    }
+    let mut chars = visible.chars();
+    let mut summary: String = chars.by_ref().take(AGENT_SUMMARY_CHARS).collect();
+    if chars.next().is_some() {
+        summary.push('…');
+    }
+    Some(summary)
+}
+
+fn claude_assistant_summary(value: &Value) -> Option<String> {
+    let content = value.pointer("/message/content")?;
+    if let Some(text) = content.as_str() {
+        return clean_agent_summary(text);
+    }
+    let text = content
+        .as_array()?
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    clean_agent_summary(&text)
+}
 
 /// claude transcript(`~/.claude/projects/<cwd>/<session-id>.jsonl`) 파싱.
 /// 파일명이 곧 세션 ID. 마지막 assistant/user 이벤트로 상태를 파생한다:
@@ -57,6 +101,7 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
     let mut activity: Option<AgentActivity> = None;
     // 최신 assistant message.model = 현재 모델(effort/context는 statusLine→DB, Phase 2b).
     let mut model: Option<String> = None;
+    let mut last_agent_summary: Option<String> = None;
     for line in text.lines().rev() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -66,6 +111,9 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
         }
         match v.get("type").and_then(Value::as_str) {
             Some("assistant") => {
+                if last_agent_summary.is_none() {
+                    last_agent_summary = claude_assistant_summary(&v);
+                }
                 if model.is_none() {
                     model = v
                         .pointer("/message/model")
@@ -83,12 +131,14 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
                 }
             }
             // user 이벤트(툴 결과/유저 입력) 직후는 에이전트가 이어받아 작업한다.
-            Some("user") if activity.is_none() => {
-                activity = Some(AgentActivity::Working);
+            Some("user") => {
+                if activity.is_none() {
+                    activity = Some(AgentActivity::Working);
+                }
             }
             _ => {}
         }
-        if activity.is_some() && model.is_some() && cwd.is_some() {
+        if activity.is_some() && model.is_some() && cwd.is_some() && last_agent_summary.is_some() {
             break;
         }
     }
@@ -99,6 +149,7 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
         model,
         effort: None,
         context_pct: None,
+        last_agent_summary,
     })
 }
 
@@ -115,17 +166,31 @@ pub fn parse_codex(path: &Path) -> Option<TranscriptState> {
     let mut model: Option<String> = None;
     let mut effort: Option<String> = None;
     let mut context_pct: Option<u8> = None;
+    let mut last_agent_summary: Option<String> = None;
     for line in text.lines().rev() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         match v.get("type").and_then(Value::as_str) {
-            Some("event_msg") if activity.is_none() => {
-                activity = match v.pointer("/payload/type").and_then(Value::as_str) {
-                    Some("task_complete") | Some("turn_aborted") => Some(AgentActivity::Idle),
-                    Some(_) => Some(AgentActivity::Working),
-                    None => None,
-                };
+            Some("event_msg") => {
+                let event_type = v.pointer("/payload/type").and_then(Value::as_str);
+                if activity.is_none() {
+                    activity = match event_type {
+                        Some("task_complete") | Some("turn_aborted") => Some(AgentActivity::Idle),
+                        Some(_) => Some(AgentActivity::Working),
+                        None => None,
+                    };
+                }
+                if last_agent_summary.is_none() {
+                    let message = match event_type {
+                        Some("task_complete") => v.pointer("/payload/last_agent_message"),
+                        Some("agent_message") => v.pointer("/payload/message"),
+                        _ => None,
+                    };
+                    last_agent_summary = message
+                        .and_then(Value::as_str)
+                        .and_then(clean_agent_summary);
+                }
             }
             Some("turn_context") if model.is_none() => {
                 model = v
@@ -154,7 +219,11 @@ pub fn parse_codex(path: &Path) -> Option<TranscriptState> {
             }
             _ => {}
         }
-        if activity.is_some() && model.is_some() && context_pct.is_some() {
+        if activity.is_some()
+            && model.is_some()
+            && context_pct.is_some()
+            && last_agent_summary.is_some()
+        {
             break;
         }
     }
@@ -165,6 +234,7 @@ pub fn parse_codex(path: &Path) -> Option<TranscriptState> {
         model,
         effort,
         context_pct,
+        last_agent_summary,
     })
 }
 
@@ -216,8 +286,8 @@ mod tests {
     fn claude_idle_when_end_turn() {
         let p = write_tmp(
             "sess-abc.jsonl",
-            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":[{"type":"text"}]}}
-{"type":"assistant","cwd":"/proj","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text"}]}}
+            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":[{"type":"text","text":"Fix sidebar status"}]}}
+{"type":"assistant","cwd":"/proj","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"Updated the sidebar status and tests."}]}}
 {"type":"file-history-snapshot"}
 "#,
         );
@@ -225,6 +295,20 @@ mod tests {
         assert_eq!(s.session_id, "sess-abc");
         assert_eq!(s.cwd.as_deref(), Some("/proj"));
         assert_eq!(s.activity, AgentActivity::Idle);
+        assert_eq!(
+            s.last_agent_summary.as_deref(),
+            Some("Updated the sidebar status and tests.")
+        );
+    }
+
+    #[test]
+    fn 에이전트작업설명은_이미지표식을_제거하고_내부메시지를_거른다() {
+        assert_eq!(
+            clean_agent_summary("<image name=[Image #1] path=/tmp/a.png> 사이드바 수정 완료"),
+            Some("사이드바 수정 완료".to_owned())
+        );
+        assert_eq!(clean_agent_summary("<system-reminder> internal"), None);
+        assert_eq!(clean_agent_summary("   \n\t"), None);
     }
 
     #[test]
@@ -234,8 +318,10 @@ mod tests {
             "rollout-2026-01-01T00-00-00-11111111-2222-3333-4444-555555555555.jsonl",
             r#"{"type":"session_meta","payload":{"cwd":"/proj"}}
 {"type":"turn_context","payload":{"model":"gpt-5.5","effort":"xhigh","cwd":"/proj"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"Review PR #124"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"Reviewing changed files"}}
 {"type":"token_count","payload":{"info":{"model_context_window":200000,"last_token_usage":{"input_tokens":60000}}}}
-{"type":"event_msg","payload":{"type":"task_complete"}}
+{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Reviewed PR #124 and found two issues"}}
 "#,
         );
         let s = parse_codex(&p).unwrap();
@@ -243,6 +329,29 @@ mod tests {
         assert_eq!(s.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(s.effort.as_deref(), Some("xhigh"));
         assert_eq!(s.context_pct, Some(70)); // 60000/200000 = 30% used → 70% 남음
+        assert_eq!(
+            s.last_agent_summary.as_deref(),
+            Some("Reviewed PR #124 and found two issues")
+        );
+    }
+
+    #[test]
+    fn codex_실행중에는_최신_agent_message를_작업설명으로_쓴다() {
+        let p = write_tmp(
+            "rollout-2026-01-01T00-00-00-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl",
+            r#"{"type":"session_meta","payload":{"cwd":"/proj"}}
+{"type":"turn_context","payload":{"model":"gpt-5.5","effort":"high"}}
+{"type":"token_count","payload":{"info":{"model_context_window":100000,"last_token_usage":{"input_tokens":1000}}}}
+{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"Running the focused sidebar tests"}}
+"#,
+        );
+        let s = parse_codex(&p).unwrap();
+        assert_eq!(s.activity, AgentActivity::Working);
+        assert_eq!(
+            s.last_agent_summary.as_deref(),
+            Some("Running the focused sidebar tests")
+        );
     }
 
     #[test]

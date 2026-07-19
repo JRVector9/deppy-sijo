@@ -91,6 +91,7 @@ fn compute_activity_and_info(
                     model: state.model,
                     effort: state.effort,
                     context_pct: state.context_pct,
+                    last_agent_summary: state.last_agent_summary,
                 },
             );
         }

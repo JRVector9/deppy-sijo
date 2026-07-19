@@ -61,7 +61,11 @@ fn main() -> anyhow::Result<()> {
 
     let db_path = paths.data_dir.join("metadata.sqlite3");
     let db = storage::Db::open(&db_path)?;
-    let workspace_id = initial_workspace_id(&db, config.ui.last_workspace_id.as_deref())?;
+    let workspace_id = initial_workspace_id(
+        &db,
+        config.ui.last_workspace_id.as_deref(),
+        &config.ui.closed_workspace_ids,
+    )?;
     // 이전 실행이 비정상 종료됐다면 남은 세션을 Exited로 정리 (crash recovery).
     // 실패는 기동 중단 — 거짓 running 상태로 복원 UI가 뜨면 안 된다 (codex 리뷰 반영)
     let reconciled = db
@@ -246,20 +250,23 @@ fn bench_paths(root: &Path) -> anyhow::Result<paths::AppPaths> {
 fn initial_workspace_id(
     db: &storage::Db,
     last_workspace_id: Option<&str>,
+    closed_workspace_ids: &std::collections::BTreeSet<String>,
 ) -> anyhow::Result<String> {
     let fallback = db.ensure_default_workspace()?;
-    let Some(last) = last_workspace_id else {
-        return Ok(fallback);
-    };
-    let exists = db
-        .list_workspaces()?
-        .iter()
-        .any(|workspace| workspace.id == last);
-    if exists {
-        Ok(last.to_owned())
-    } else {
-        Ok(fallback)
+    let workspaces = db.list_workspaces()?;
+    if let Some(last) = last_workspace_id
+        && !closed_workspace_ids.contains(last)
+        && workspaces.iter().any(|workspace| workspace.id == last)
+    {
+        return Ok(last.to_owned());
     }
+    Ok(workspaces
+        .iter()
+        .find(|workspace| !closed_workspace_ids.contains(&workspace.id))
+        .map(|workspace| workspace.id.clone())
+        // 모든 워크스페이스를 종료한 경우에도 앱은 런타임 기반 workspace 하나가
+        // 필요하므로 default를 내부 활성으로 두되 사이드바/Home에서는 계속 숨긴다.
+        .unwrap_or(fallback))
 }
 
 /// macOS 네이티브 메뉴바 (2026-07-05 사용자 요청) — About/설정(⌘,)/종료(⌘Q).
@@ -358,7 +365,10 @@ mod tests {
         let (dir, db) = temp_db("last-existing");
         let _default = db.ensure_default_workspace().unwrap();
         let last = db.create_workspace("last").unwrap();
-        assert_eq!(initial_workspace_id(&db, Some(&last)).unwrap(), last);
+        assert_eq!(
+            initial_workspace_id(&db, Some(&last), &Default::default()).unwrap(),
+            last
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -366,7 +376,23 @@ mod tests {
     fn initial_workspace_falls_back_when_last_workspace_is_missing() {
         let (dir, db) = temp_db("last-missing");
         let default = db.ensure_default_workspace().unwrap();
-        assert_eq!(initial_workspace_id(&db, Some("missing")).unwrap(), default);
+        assert_eq!(
+            initial_workspace_id(&db, Some("missing"), &Default::default()).unwrap(),
+            default
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn initial_workspace_skips_persisted_closed_workspace() {
+        let (dir, db) = temp_db("last-closed");
+        let closed = db.ensure_default_workspace().unwrap();
+        let visible = db.create_workspace("visible").unwrap();
+        let closed_ids = std::collections::BTreeSet::from([closed.clone()]);
+        assert_eq!(
+            initial_workspace_id(&db, Some(&closed), &closed_ids).unwrap(),
+            visible
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

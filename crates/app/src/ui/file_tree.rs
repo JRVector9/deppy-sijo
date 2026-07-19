@@ -29,16 +29,16 @@ pub struct SessionEntry {
     pub pulse: Option<(f32, egui::Color32)>,
     /// 에이전트 2행: "Codex · gpt-5.5 · xhigh" (에이전트일 때만 Some → 3줄 렌더).
     pub agent_line: Option<String>,
+    /// 에이전트 제목 옆 상태: "실행 중"/"유휴"/"승인 필요" 등.
+    pub status_label: Option<String>,
     /// 저장된 에이전트 세션이 있고 지금 실행 중이 아님 — 컨텍스트 메뉴 '이어가기' 노출.
     pub resumable: bool,
-    /// 상태 hover 힌트 — 감지 출처/신뢰도 또는 '수동 지정'(U17b).
-    pub status_hint: Option<String>,
     /// 세션 cwd가 감지 캐시에 있음 — 워크트리 메뉴 노출 조건. App이 채운다(PR-W).
     pub has_cwd: bool,
     /// 세션 cwd가 `.deppy/worktrees/` 하위 — 「워크트리 삭제」 메뉴 노출 조건.
     /// App이 채운다(2026-07-18).
     pub in_worktree: bool,
-    /// 에이전트 3행: "실행 중 · ctx 69%" (상태 라벨 + 남은 컨텍스트).
+    /// 에이전트 3행: 최신 에이전트 응답/진행 메시지, 없으면 터미널 현재 줄/일반 활동 설명.
     pub status_line: Option<String>,
 }
 
@@ -67,6 +67,8 @@ pub struct SidebarSessionSummary {
     pub idle: usize,
     /// 런타임이 내려가 현재 상태를 관측할 수 없는 복원 세션.
     pub inactive: usize,
+    /// 런타임도 저장된 복원 세션도 없는 비활성 워크스페이스.
+    pub no_sessions: bool,
 }
 
 impl SidebarSessionSummary {
@@ -87,9 +89,8 @@ impl SidebarSessionSummary {
 
     pub fn inactive(count: usize) -> Self {
         Self {
-            // 0은 "등록됐지만 복원 세션도 없는 비활성 워크스페이스" 표식으로 1칸 유지.
-            // 단독 표시는 개수를 노출하지 않고 항상 "비활성"이라 사용자에게 과장되지 않는다.
-            inactive: count.max(1),
+            inactive: count,
+            no_sessions: count == 0,
             ..Self::default()
         }
     }
@@ -533,12 +534,9 @@ impl FileTreeUi {
                 let show_hidden_now = show_hidden.load(std::sync::atomic::Ordering::Relaxed);
                 let mut sent = false;
                 for path in &event.paths {
-                    for event in watch_events_for_path(
-                        &watch_root,
-                        path,
-                        show_hidden_now,
-                        ignore.as_ref(),
-                    ) {
+                    for event in
+                        watch_events_for_path(&watch_root, path, show_hidden_now, ignore.as_ref())
+                    {
                         match tx.try_send(event) {
                             Ok(()) => sent = true,
                             Err(TrySendError::Full(_)) => {
@@ -932,19 +930,10 @@ impl FileTreeUi {
                                                     self.session_name_edit = None;
                                                 }
                                             } else {
-                                                // hover 힌트: 상태 감지 출처/신뢰도(U17b)가 있으면 함께.
-                                                let hover = match &entry.status_hint {
-                                                    Some(hint) => {
-                                                        format!(
-                                                            "{}\n{}",
-                                                            hint,
-                                                            catalog.t("workspace.rename_hint", &[])
-                                                        )
-                                                    }
-                                                    None => catalog.t("workspace.rename_hint", &[]),
-                                                };
-                                                let resp =
-                                                    session_row(ui, entry).on_hover_text(hover);
+                                                // 세션 행 자체에는 hover tooltip을 띄우지 않는다.
+                                                // 상태 감지 출처/신뢰도 같은 내부 진단과 이름 변경
+                                                // 안내가 터미널 위를 가리는 문제(2026-07-19 사용자).
+                                                let resp = session_row(ui, entry);
                                                 // 우클릭 → 컨텍스트 메뉴(이름 변경/폴더/새 셸/이어가기/닫기).
                                                 // 더블클릭 → 이름 편집. 단순 클릭 → 세션 전환.
                                                 // (수동 상태 지정 U17b는 hook 감지 정착으로 제거 — 2026-07-17 사용자.)
@@ -2816,7 +2805,7 @@ fn workspace_row(
 fn workspace_highlight_rect(full_rect: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_max(
         egui::pos2(full_rect.left() + 8.0, full_rect.top()),
-        full_rect.right_bottom(),
+        egui::pos2(full_rect.right() - 8.0, full_rect.bottom()),
     )
 }
 
@@ -2992,6 +2981,12 @@ fn workspace_summary_segments_for_mode(
 fn workspace_primary_summary_segment(summary: SidebarSessionSummary) -> (String, egui::Color32) {
     use crate::agent_surface::AgentVisualState as VisualState;
 
+    if summary.no_sessions {
+        return (
+            "세션 없음".to_owned(),
+            crate::ui::agent_visuals::status_color(VisualState::Off),
+        );
+    }
     if summary.error > 0 {
         return (
             format!("오류 {}", summary.error),
@@ -3089,6 +3084,9 @@ fn workspace_summary_segments(
             push(&mut parts, format!("비활성 {}", summary.inactive), inactive);
         }
     }
+    if summary.no_sessions && parts.is_empty() {
+        parts.push(("세션 없음".to_owned(), inactive));
+    }
     // 세션이 아직 생성되지 않은 활성/warm 워크스페이스도 상태 영역을 비워 두지 않는다.
     if parts.is_empty() {
         parts.push(("유휴".to_owned(), idle));
@@ -3105,6 +3103,66 @@ fn session_row(ui: &mut egui::Ui, entry: &SessionEntry) -> egui::Response {
 /// (2026-07-16 사용자).
 fn session_row_editing(ui: &mut egui::Ui, entry: &SessionEntry, buf: &mut String) {
     session_row_impl(ui, entry, Some(buf));
+}
+
+const SESSION_HIGHLIGHT_RIGHT_INSET: f32 = 8.0;
+/// 최대 6px 레일 뒤 여백을 기존 약 10px에서 약 5px로 줄인 텍스트 시작점.
+const SESSION_TEXT_INSET: f32 = 11.0;
+const SESSION_CONTENT_RIGHT_INSET: f32 = 16.0;
+
+fn session_highlight_rect(rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        rect.left_top(),
+        egui::pos2(
+            (rect.right() - SESSION_HIGHLIGHT_RIGHT_INSET).max(rect.left()),
+            rect.bottom(),
+        ),
+    )
+}
+
+fn session_title_lines(
+    ui: &egui::Ui,
+    entry: &SessionEntry,
+    status_color: egui::Color32,
+    separator_color: egui::Color32,
+    max_width: f32,
+) -> (
+    std::sync::Arc<egui::Galley>,
+    Option<std::sync::Arc<egui::Galley>>,
+) {
+    let title_font_id = crate::fonts::sidebar_font(13.0);
+    // 제목보다 상태를 1pt 작게 두어 `폴더명 · 상태`의 시각적 위계를 분리한다.
+    let status_font_id = crate::fonts::sidebar_font(12.0);
+    let status_galley = entry
+        .status_label
+        .as_deref()
+        .filter(|status| !status.is_empty())
+        .map(|status| {
+            let mut job = egui::text::LayoutJob::default();
+            job.append(
+                " · ",
+                0.0,
+                egui::TextFormat {
+                    font_id: status_font_id.clone(),
+                    color: separator_color,
+                    ..Default::default()
+                },
+            );
+            job.append(
+                status,
+                0.0,
+                egui::TextFormat {
+                    font_id: status_font_id,
+                    color: status_color,
+                    ..Default::default()
+                },
+            );
+            ui.painter().layout_job(job)
+        });
+    let status_width = status_galley.as_ref().map_or(0.0, |galley| galley.size().x);
+    let title_width = (max_width - status_width).max(10.0);
+    let title_galley = clipped_line(ui, &entry.title, title_font_id, title_width);
+    (title_galley, status_galley)
 }
 
 fn session_row_impl(
@@ -3144,10 +3202,10 @@ fn session_row_impl(
     } else {
         ui.visuals().text_color()
     };
-    // 텍스트는 행 폭(좌 16 + 우 여백 8) 안으로 잘라 '…' 처리 — 고정 글자수 truncate는
+    // 텍스트는 행 폭(좌 11 + 우 여백 16) 안으로 잘라 '…' 처리 — 고정 글자수 truncate는
     // 좁은 사이드바에서 박스 밖으로 삐져나갔다(#91 사용자).
-    let max_w = (rect.width() - 16.0 - 8.0).max(10.0);
-    let title_galley = clipped_line(ui, &entry.title, crate::fonts::sidebar_font(13.0), max_w);
+    let max_w = (rect.width() - SESSION_TEXT_INSET - SESSION_CONTENT_RIGHT_INSET).max(10.0);
+    let (title_galley, status_galley) = session_title_lines(ui, entry, dot, sub_color, max_w);
     // 2행/3행: 에이전트면 agent_line/status_line, 아니면 요약(2행)만.
     let (line2, line3) = if agent {
         (entry.agent_line.as_deref(), entry.status_line.as_deref())
@@ -3158,18 +3216,19 @@ fn session_row_impl(
     let line3_galley = line3.map(|t| clipped_line(ui, t, crate::fonts::sidebar_font(10.5), max_w));
 
     let painter = ui.painter();
+    let highlight_rect = session_highlight_rect(rect);
     // 선택/hover 배경 — 편집 중에는 hover 톤으로 상시 칠해 편집 상태를 표시.
     if edit_buf.is_some() {
-        painter.rect_filled(rect, 1.0, hover_bg);
+        painter.rect_filled(highlight_rect, 1.0, hover_bg);
     } else if entry.focused {
-        painter.rect_filled(rect, 1.0, accent.gamma_multiply(0.18));
+        painter.rect_filled(highlight_rect, 1.0, accent.gamma_multiply(0.18));
     } else if resp.hovered() {
-        painter.rect_filled(rect, 1.0, hover_bg);
+        painter.rect_filled(highlight_rect, 1.0, hover_bg);
     }
     // 좌측 상태 레일 — 항상 표시, 상태 색으로 세로로 훑어 파악 (목업 §세션).
     // 폭 = 두 번째 채널(2026-07-07): 평시 3px, 미확인 완료/입력대기(attention)는 6px로
     // 굵힌다. 알림 도착 시 이미 보고 있던 pane은 6px 대신 1회 펄스(3→6→3px).
-    // 자리는 최대 6px 기준으로 상시 예약(텍스트 x=16 고정)이라 폭이 바뀌어도 안 밀린다.
+    // 자리는 최대 6px 기준으로 상시 예약(텍스트 x=11 고정)이라 폭이 바뀌어도 안 밀린다.
     let (rail_w, rail_color) = if let Some((t, color)) = entry.pulse {
         (3.0 + 3.0 * (t * std::f32::consts::PI).sin(), color)
     } else if entry.attention {
@@ -3185,25 +3244,38 @@ fn session_row_impl(
     // 제목(1행) + 2행 + 3행 — 세로 위치는 행 수에 맞춰.
     // 편집 중에는 제목 갤리 대신 같은 자리에 TextEdit를 얹는다 (아래 edit_buf 분기).
     if edit_buf.is_none() {
-        painter.galley(
-            egui::pos2(
-                rect.left() + 16.0,
-                rect.top() + 13.0 - title_galley.size().y / 2.0,
-            ),
-            title_galley,
-            title_color,
+        let title_pos = egui::pos2(
+            rect.left() + SESSION_TEXT_INSET,
+            rect.top() + 13.0 - title_galley.size().y / 2.0,
         );
+        painter.galley(title_pos, title_galley.clone(), title_color);
+        if let Some(status_galley) = status_galley {
+            painter.galley(
+                egui::pos2(
+                    title_pos.x + title_galley.size().x,
+                    rect.top() + 13.0 - status_galley.size().y / 2.0,
+                ),
+                status_galley,
+                egui::Color32::WHITE,
+            );
+        }
     }
     if let Some(g) = line2_galley {
         painter.galley(
-            egui::pos2(rect.left() + 16.0, rect.top() + 27.0 - g.size().y / 2.0),
+            egui::pos2(
+                rect.left() + SESSION_TEXT_INSET,
+                rect.top() + 27.0 - g.size().y / 2.0,
+            ),
             g,
             sub_color,
         );
     }
     if let Some(g) = line3_galley {
         painter.galley(
-            egui::pos2(rect.left() + 16.0, rect.top() + 41.0 - g.size().y / 2.0),
+            egui::pos2(
+                rect.left() + SESSION_TEXT_INSET,
+                rect.top() + 41.0 - g.size().y / 2.0,
+            ),
             g,
             sub_color,
         );
@@ -3211,8 +3283,11 @@ fn session_row_impl(
     if let Some(buf) = edit_buf {
         // 제목 1행 자리에 프레임 없는 TextEdit — 글꼴/x 위치를 제목 갤리와 맞춘다.
         let title_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + 16.0, rect.top() + 4.0),
-            egui::pos2(rect.right() - 8.0, rect.top() + 22.0),
+            egui::pos2(rect.left() + SESSION_TEXT_INSET, rect.top() + 4.0),
+            egui::pos2(
+                rect.right() - SESSION_CONTENT_RIGHT_INSET,
+                rect.top() + 22.0,
+            ),
         );
         let edit_resp = ui.put(
             title_rect,
@@ -4206,11 +4281,7 @@ fn run_listing_job(job: ListingJob) {
     if epoch.is_stale() || shutdown.load(std::sync::atomic::Ordering::Acquire) {
         return;
     }
-    match read_children_guarded(
-        &path,
-        root.as_deref(),
-        Some((&epoch, shutdown.as_ref())),
-    ) {
+    match read_children_guarded(&path, root.as_deref(), Some((&epoch, shutdown.as_ref()))) {
         Ok(nodes) => {
             send_listing_chunks_bounded(&tx, &ctx, &epoch, shutdown.as_ref(), token, path, nodes)
         }
@@ -4340,10 +4411,7 @@ fn send_listing_chunks_bounded(
 }
 
 #[cfg(test)]
-fn read_children(
-    path: &Path,
-    _root: Option<&Path>,
-) -> std::io::Result<Vec<TreeNode>> {
+fn read_children(path: &Path, _root: Option<&Path>) -> std::io::Result<Vec<TreeNode>> {
     read_children_guarded(path, _root, None)
 }
 
@@ -4615,7 +4683,7 @@ mod tests {
     }
 
     #[test]
-    fn 상태없는_워크스페이스는_유휴_복원세션은_비활성으로_표시한다() {
+    fn 상태없는_활성은_유휴_복원세션은_비활성_빈비활성은_세션없음으로_표시한다() {
         use crate::agent_surface::AgentVisualState as VisualState;
         let weak = egui::Color32::GRAY;
         let idle = workspace_summary_segments(SidebarSessionSummary::default(), weak);
@@ -4630,23 +4698,46 @@ mod tests {
             inactive[0].1,
             crate::ui::agent_visuals::status_color(VisualState::Off)
         );
+        let no_sessions = workspace_summary_segments(SidebarSessionSummary::inactive(0), weak);
+        assert_eq!(no_sessions[0].0, "세션 없음");
+        assert_eq!(
+            no_sessions[0].1,
+            crate::ui::agent_visuals::status_color(VisualState::Off)
+        );
 
         let primary = workspace_primary_summary_segment(SidebarSessionSummary::default());
         assert_eq!(primary, idle[0]);
+        assert_eq!(
+            workspace_primary_summary_segment(SidebarSessionSummary::inactive(0)),
+            no_sessions[0]
+        );
     }
 
     #[test]
-    fn 워크스페이스_하이라이트는_왼쪽만_들여쓰고_세션과_오른쪽끝을_맞춘다() {
+    fn 워크스페이스_하이라이트는_좌우_여백이_같다() {
         let full = egui::Rect::from_min_max(egui::pos2(0.0, 10.0), egui::pos2(500.0, 49.1));
         let highlight = workspace_highlight_rect(full);
         assert_eq!(highlight.left(), 8.0, "워크스페이스 왼쪽 인셋은 유지");
         assert_eq!(
             highlight.right(),
-            full.right(),
-            "세션 행과 같은 우측 끝 사용"
+            full.right() - 8.0,
+            "오른쪽에도 왼쪽과 같은 인셋 유지"
         );
         assert_eq!(highlight.top(), full.top());
         assert_eq!(highlight.bottom(), full.bottom());
+    }
+
+    #[test]
+    fn 세션_하이라이트는_오른쪽_여백을_두고_레일텍스트간격은_절반이다() {
+        let full = egui::Rect::from_min_max(egui::pos2(20.0, 10.0), egui::pos2(500.0, 62.0));
+        let highlight = session_highlight_rect(full);
+        assert_eq!(highlight.left(), full.left());
+        assert_eq!(highlight.right(), full.right() - 8.0);
+        assert_eq!(
+            SESSION_TEXT_INSET - 6.0,
+            5.0,
+            "최대 6px 컬러 레일과 텍스트 사이 여백"
+        );
     }
 
     #[test]
@@ -5841,11 +5932,11 @@ mod tests {
             attention: false,
             pulse: None,
             agent_line: agent.then(|| "Codex · gpt-5.5 · high".to_owned()),
+            status_label: agent.then(|| "실행 중".to_owned()),
             resumable: agent,
-            status_hint: None,
             has_cwd: true,
             in_worktree: false,
-            status_line: agent.then(|| "실행 중 · ctx 69%".to_owned()),
+            status_line: agent.then(|| "PR #124 코드 리뷰".to_owned()),
         };
         let sessions = vec![
             make_session(0, false),

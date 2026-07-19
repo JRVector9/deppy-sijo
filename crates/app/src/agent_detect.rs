@@ -133,6 +133,8 @@ pub struct AgentDisplay {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub context_pct: Option<u8>,
+    /// transcript의 최신 에이전트 응답/진행 메시지 — 사이드바 작업 설명용.
+    pub last_agent_summary: Option<String>,
 }
 
 /// 셸 pid의 자손 중 claude/codex를 찾아 transcript까지 바인딩한다. 캐시 생존 확인용으로

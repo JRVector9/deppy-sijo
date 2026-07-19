@@ -1336,6 +1336,7 @@ pub struct App {
     pending_shutdowns: Vec<(String, std::thread::JoinHandle<()>)>,
     /// 사이드바 「워크스페이스 종료」로 숨긴 워크스페이스 → 종료 시점에 닫히던 pane id들.
     /// 종료 ≠ 삭제(DB·경로·별칭 보존) — 사이드바 목록에서만 감춘다(2026-07-18 사용자 요구).
+    /// 숨김 ID는 config에도 영속화하고, 값의 pane 집합만 현재 프로세스에서 사용한다.
     /// 값의 pane 집합은 활성 종료 직후 몇 프레임 동안 mux에 남는 "죽어가는 pane"을 새
     /// 세션과 구분하는 기준 — 기록에 없는 pane이 활성에 나타나면(새 셸/에이전트) 숨김을
     /// 해제해 목록에 복귀시킨다. 명시적 전환(switch_workspace)·같은 폴더 재선택도 해제.
@@ -1446,6 +1447,13 @@ fn apply_agent_persistence_batch(
     Ok(())
 }
 
+fn workspace_visible_after_close(
+    closed: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+    workspace_id: &str,
+) -> bool {
+    !closed.contains_key(workspace_id)
+}
+
 impl App {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1460,6 +1468,7 @@ impl App {
     ) -> Self {
         // output_batch_ms는 시작 시 고정, scrollback_lines는 세션 spawn 시점에 전달
         config.ui.last_workspace_id = Some(workspace_id.clone());
+        let persisted_closed_workspaces = config.ui.closed_workspace_ids.clone();
         // 벤치(B1): DEPPY_BENCH_WORKSPACES=N개가 실제로 상주해야 RSS 비교가 성립한다.
         // warm 상한은 **설정값**이므로(코드 경로 변경 아님) 벤치 임시 config에서만 올린다.
         // clamp(max_warm ≤ 8) 때문에 실효 상한은 active 1 + warm 8 = 9개다.
@@ -1676,7 +1685,10 @@ impl App {
             resumed_panes: std::collections::HashSet::new(),
             pending_focus: None,
             pending_shutdowns: Vec::new(),
-            closed_workspaces: std::collections::HashMap::new(),
+            closed_workspaces: persisted_closed_workspaces
+                .into_iter()
+                .map(|workspace_id| (workspace_id, std::collections::HashSet::new()))
+                .collect(),
             remote: None,
             remote_error: None,
             remote_reveal_token: false,
@@ -2700,6 +2712,7 @@ impl App {
         let empty_turn_done = std::collections::HashMap::new();
         self.workspaces
             .iter()
+            .filter(|ws| workspace_visible_after_close(&self.closed_workspaces, &ws.id))
             .map(|ws| {
                 if ws.id == self.active.id {
                     let sessions = self
@@ -2982,7 +2995,7 @@ impl App {
     fn switch_workspace(&mut self, target_id: &str) {
         // 명시적 전환은 종료 숨김 해제 — 사용자가 다시 연 것이다(사이드바 행 클릭·
         // 워크스페이스 순환·알림/에이전트 이동·같은 폴더 재선택 모두 이 경로).
-        self.closed_workspaces.remove(target_id);
+        self.reveal_closed_workspace(target_id);
         if target_id == self.active.id {
             return;
         }
@@ -3602,6 +3615,32 @@ impl App {
                 "워크스페이스 종료 생략 — 이미 비활성(세션 없음)"
             );
         }
+        // 재빌드·앱 재시작 뒤에도 종료한 워크스페이스가 되살아나지 않게 ID를 config에
+        // 영속화한다. pane 집합은 위의 현재 프로세스 종료 판정에만 필요하다.
+        self.config
+            .ui
+            .closed_workspace_ids
+            .insert(workspace_id.to_owned());
+        if let Err(error) = self.config.save(&self.config_path) {
+            tracing::warn!(workspace = %workspace_id, "종료 워크스페이스 저장 실패: {error:#}");
+        }
+        // 홈/상태바가 최대 500ms 전 activity_rows를 재사용하므로 종료 직후 즉시 폐기한다.
+        self.activity_rows_cache = None;
+    }
+
+    /// 종료 숨김을 해제하고 config에도 즉시 반영한다. 같은 활성 워크스페이스 재선택처럼
+    /// switch의 나머지 저장 경로를 타지 않는 경우도 있어 이 함수가 직접 저장한다.
+    fn reveal_closed_workspace(&mut self, workspace_id: &str) -> bool {
+        let runtime_removed = self.closed_workspaces.remove(workspace_id).is_some();
+        let config_removed = self.config.ui.closed_workspace_ids.remove(workspace_id);
+        let changed = runtime_removed || config_removed;
+        if changed {
+            self.activity_rows_cache = None;
+            if let Err(error) = self.config.save(&self.config_path) {
+                tracing::warn!(workspace = %workspace_id, "종료 워크스페이스 재열기 저장 실패: {error:#}");
+            }
+        }
+        changed
     }
 
     /// 활성 workspace의 `.env`를 환경 profile로 동기화하고, 그 env를 워커 기본 env로
@@ -4201,11 +4240,21 @@ impl App {
             Ok(list) => self.workspaces = list,
             Err(e) => tracing::warn!("workspace 목록 조회 실패: {e:#}"),
         }
-        // 종료 숨김 표식 정리 — 프로젝트 삭제 등으로 목록에서 사라진 id의 표식을 지워
-        // 유계로 유지한다(표식 자체는 세션 한정 in-memory).
+        // 종료 숨김 표식 정리 — 프로젝트 삭제 등으로 목록에서 사라진 id의 표식을
+        // 메모리와 config 양쪽에서 지워 유계로 유지한다.
         let workspaces = &self.workspaces;
         self.closed_workspaces
             .retain(|id, _| workspaces.iter().any(|workspace| workspace.id == *id));
+        let persisted_before = self.config.ui.closed_workspace_ids.len();
+        self.config
+            .ui
+            .closed_workspace_ids
+            .retain(|id| workspaces.iter().any(|workspace| workspace.id == *id));
+        if self.config.ui.closed_workspace_ids.len() != persisted_before
+            && let Err(error) = self.config.save(&self.config_path)
+        {
+            tracing::warn!("삭제 워크스페이스 종료 표식 정리 저장 실패: {error:#}");
+        }
         let mut structured_threads = Vec::new();
         for workspace in &self.workspaces {
             match self.db.list_structured_threads(&workspace.id, false) {
@@ -4384,6 +4433,10 @@ impl App {
         let now = std::time::Instant::now();
         self.workspaces
             .iter()
+            // 사이드바 「워크스페이스 종료」는 DB 프로젝트 삭제가 아니라 이번 실행의
+            // 명시적 숨김이다. 홈도 사이드바와 같은 visible set을 써야 종료한 프로젝트가
+            // 유휴 카드로 되살아나지 않는다(2026-07-19 사용자).
+            .filter(|ws| workspace_visible_after_close(&self.closed_workspaces, &ws.id))
             .map(|ws| {
                 if ws.id == self.active.id {
                     // pane별 서브행 — 사이드바 3줄 행과 같은 원천(session_entries)에
@@ -5714,13 +5767,15 @@ impl eframe::App for App {
                 .iter()
                 .any(|entry| !closing.contains(&entry.pane.0))
         {
-            self.closed_workspaces.remove(&active_workspace_id);
+            self.reveal_closed_workspace(&active_workspace_id);
         }
         // 명시적으로 종료한 워크스페이스는 목록에서 숨긴다(DB는 보존 — 종료 ≠ 삭제).
         let sidebar_workspaces: Vec<_> = self
             .workspaces
             .iter()
-            .filter(|workspace| !self.closed_workspaces.contains_key(&workspace.id))
+            .filter(|workspace| {
+                workspace_visible_after_close(&self.closed_workspaces, &workspace.id)
+            })
             .map(|workspace| {
                 let waiting_sessions: std::collections::HashSet<_> = self
                     .global_waiting
@@ -7593,7 +7648,7 @@ impl eframe::App for App {
         // switch_workspace의 숨김 해제가 안 돈다 — 여기서 명시적으로 해제해 종료로
         // 숨긴 활성 워크스페이스도 목록에 복귀시킨다.
         if let Some(id) = &ws_switch {
-            self.closed_workspaces.remove(id);
+            self.reveal_closed_workspace(id);
         }
         if let Some(id) = ws_switch.filter(|id| *id != self.active.id) {
             let switched_new = ws_created;
@@ -9400,5 +9455,14 @@ h:1 EE:FF
             Some(base + std::time::Duration::from_secs(5)),
             base
         ));
+    }
+
+    #[test]
+    fn 종료한_워크스페이스는_사이드바와_홈의_공통_visible_set에서_빠진다() {
+        let mut closed = std::collections::HashMap::new();
+        closed.insert("closed".to_owned(), std::collections::HashSet::new());
+
+        assert!(!workspace_visible_after_close(&closed, "closed"));
+        assert!(workspace_visible_after_close(&closed, "open"));
     }
 }

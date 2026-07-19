@@ -3024,7 +3024,6 @@ impl WorkspaceUi {
                     .and_then(|v| v.status_view.as_ref());
                 let user_override = view.and_then(|v| v.user_override);
                 let status = user_override.or(merged);
-                let status_hint = view.map(status_view_hint_text(catalog));
                 let summary = pane
                     .session_id
                     .and_then(|s| self.sessions.get(&s))
@@ -3033,12 +3032,13 @@ impl WorkspaceUi {
                 let osc = self.session_osc_title(pane.session_id);
                 // 에이전트 정보(2/3행) — 있으면 3줄 렌더. codex/claude 병합본(App).
                 let info = pane.session_id.and_then(|s| self.agent_info.get(&s));
-                let (agent_line, status_line) = match info {
+                let (agent_line, status_label, status_line) = match info {
                     Some(d) => (
                         Some(agent_info_line(d)),
-                        Some(status_ctx_line(status, d.context_pct, catalog)),
+                        Some(session_status_label(status, catalog)),
+                        Some(agent_activity_line(d, &summary, status, catalog)),
                     ),
-                    None => (None, None),
+                    None => (None, None, None),
                 };
                 crate::ui::file_tree::SessionEntry {
                     tab: tab.id.clone(),
@@ -3047,7 +3047,6 @@ impl WorkspaceUi {
                     resumable: false,   // App이 restore_agents 기준으로 채운다
                     has_cwd: false,     // App이 session_cwds 기준으로 채운다 (PR-W)
                     in_worktree: false, // App이 session_cwds 기준으로 채운다 (2026-07-18)
-                    status_hint,
                     title: self.resolve_session_title(
                         &pane.title,
                         pane.session_id,
@@ -3060,6 +3059,7 @@ impl WorkspaceUi {
                     attention: false, // App의 alert 추적이 채운다 (update_session_alerts)
                     pulse: None,
                     agent_line,
+                    status_label,
                     status_line,
                 }
             })
@@ -3459,7 +3459,7 @@ fn terminal_text_paste_bytes(text: &str, bracketed_paste: bool) -> Vec<u8> {
     input_mapper::paste_bytes(text.as_bytes(), bracketed_paste)
 }
 
-/// 세션 행 2행: "[PTY] Codex · gpt-5.5 · xhigh" (빈 부분은 생략).
+/// 세션 행 2행: "[PTY] Codex · gpt-5.5 · xhigh · ctx 69%" (빈 부분은 생략).
 fn agent_info_line(d: &crate::agent_detect::AgentDisplay) -> String {
     use crate::agent_surface::{AgentProvider, AgentTransport};
 
@@ -3475,59 +3475,53 @@ fn agent_info_line(d: &crate::agent_detect::AgentDisplay) -> String {
     if let Some(e) = d.effort.as_deref().filter(|s| !s.is_empty()) {
         parts.push(e.to_owned());
     }
+    if let Some(context_pct) = d.context_pct {
+        parts.push(format!("ctx {context_pct}%"));
+    }
     parts.join(" · ")
 }
 
-/// 세션 행 3행: "실행 중 · ctx 69%" (상태 라벨 + 남은 컨텍스트%). 상태 없으면 ctx만.
-/// 상태 view의 hover 힌트 — 출처(감지 방법)와 신뢰도, 수동 지정 여부(U17b).
-fn status_view_hint_text(
-    catalog: &i18n::Catalog,
-) -> impl Fn(&runtime::SessionStatusView) -> String + '_ {
-    move |view| {
-        if view.user_override.is_some() {
-            return catalog.t("status.hint.user_override", &[]);
-        }
-        let source_key = match view.source {
-            runtime::StatusSource::ProcessExit => "status.hint.source.process_exit",
-            runtime::StatusSource::StreamRegex => "status.hint.source.stream_regex",
-            runtime::StatusSource::ScreenText => "status.hint.source.screen_text",
-            runtime::StatusSource::IdleHeuristic => "status.hint.source.idle_heuristic",
-            runtime::StatusSource::UserOverride => "status.hint.user_override",
-        };
-        let mut out = catalog.t(source_key, &[]);
-        if let Some(conf) = &view.confidence {
-            out.push_str(" · ");
-            out.push_str(&catalog.t(
-                "status.hint.confidence",
-                &[("score", &format!("{:.0}%", conf.score * 100.0))],
-            ));
-        }
-        out
-    }
-}
-
-fn status_ctx_line(
-    status: Option<runtime::SessionStatus>,
-    context_pct: Option<u8>,
-    catalog: &i18n::Catalog,
-) -> String {
+fn session_status_label(status: Option<runtime::SessionStatus>, catalog: &i18n::Catalog) -> String {
     use runtime::SessionStatus as S;
-    let label = status.map(|s| {
-        let key = match s {
+    let key = match status {
+        Some(s) => match s {
             S::Running => "status.running",
             S::Waiting | S::NeedsApproval => "status.needs_approval",
             S::Done => "status.done",
             S::Error => "status.error",
             S::Idle => "status.idle",
-        };
-        catalog.t(key, &[])
-    });
-    match (label, context_pct) {
-        (Some(l), Some(p)) => format!("{l} · ctx {p}%"),
-        (Some(l), None) => l,
-        (None, Some(p)) => format!("ctx {p}%"),
-        (None, None) => String::new(),
+        },
+        None => "status.detecting",
+    };
+    catalog.t(key, &[])
+}
+
+fn agent_activity_line(
+    display: &crate::agent_detect::AgentDisplay,
+    terminal_summary: &str,
+    status: Option<runtime::SessionStatus>,
+    catalog: &i18n::Catalog,
+) -> String {
+    if let Some(task) = display
+        .last_agent_summary
+        .as_deref()
+        .filter(|task| !task.is_empty())
+    {
+        return task.to_owned();
     }
+    if !terminal_summary.trim().is_empty() {
+        return terminal_summary.to_owned();
+    }
+    use runtime::SessionStatus as S;
+    let key = match status {
+        Some(S::Running) => "session.activity.running",
+        Some(S::Waiting | S::NeedsApproval) => "session.activity.waiting",
+        Some(S::Done) => "session.activity.done",
+        Some(S::Error) => "session.activity.error",
+        Some(S::Idle) => "session.activity.idle",
+        None => "session.activity.detecting",
+    };
+    catalog.t(key, &[])
 }
 
 fn request_terminal_focus(response: &egui::Response) {
@@ -4229,10 +4223,28 @@ mod tests {
             kind: crate::agent_detect::AgentKind::Codex,
             model: Some("gpt-test".to_owned()),
             effort: Some("high".to_owned()),
-            context_pct: None,
+            context_pct: Some(69),
+            last_agent_summary: Some("PR #124 코드 리뷰 완료".to_owned()),
         };
 
-        assert_eq!(agent_info_line(&display), "[PTY] Codex · gpt-test · high");
+        assert_eq!(
+            agent_info_line(&display),
+            "[PTY] Codex · gpt-test · high · ctx 69%"
+        );
+        let catalog = catalog();
+        assert_eq!(
+            agent_activity_line(
+                &display,
+                "터미널 폴백",
+                Some(SessionStatus::Running),
+                &catalog
+            ),
+            "PR #124 코드 리뷰 완료"
+        );
+        assert_eq!(
+            session_status_label(Some(SessionStatus::Idle), &catalog),
+            "Idle"
+        );
     }
 
     #[test]
@@ -4604,6 +4616,7 @@ mod tests {
             model: None,
             effort: None,
             context_pct: None,
+            last_agent_summary: None,
         }
     }
 

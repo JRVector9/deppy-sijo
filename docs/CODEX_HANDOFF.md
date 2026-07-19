@@ -2,8 +2,8 @@
 
 ## Current task
 
-- Reproduce every finding from the 2026-07-19 code/translation audit and fix only confirmed problems.
-- Status: every confirmed finding is fixed, fully verified, and committed. Translations were generated/reviewed only with `gpt-5.3-codex-spark` at `xhigh`.
+- Reproduce and fix restart recovery regressions where Codex shows an older activity summary and Claude loses its resumable session surface.
+- Status: fixed and fully verified, including two real packaged-app restarts; the already-deleted historical Claude mapping cannot be reconstructed retroactively.
 
 ## Working area
 
@@ -14,14 +14,18 @@
 
 ## Plan
 
-1. Completed — reproduce the closed-workspace, ANSI-tail, i18n bypass, and strict-Clippy findings.
-2. Completed — fix confirmed runtime/data-loss regressions with focused tests.
-3. Completed — move confirmed hard-coded UI strings into the catalog and complete/review locale translations using the required model.
-4. Completed — run final diff review, focused/full tests, strict Clippy, and workspace build.
-5. Completed — create the requested final commit and verify the repository state.
+1. Completed — reproduce Codex/Claude latest-activity selection against real transcript tails and add regression tests.
+2. Completed — preserve the pane→agent resume mapping while the pane exists, pruning only deleted panes.
+3. Completed — focused/full verification passed and the actual restart path preserved/resumed the same Codex mapping.
+4. Completed — record the outcome and the historical Claude mapping limitation.
 
 ## Status
 
+- 2026-07-19: 사용자가 재시작 복원 수정의 커밋과 push를 요청했다. 커밋 직전 `cargo fmt --all -- --check`, `git diff --check`가 통과했고 변경 범위는 `agent_transcript.rs`, `app.rs`, 이 handoff 3개 파일뿐이다. `fix: preserve agent state across restarts`로 커밋한 뒤 `origin/main`과 HEAD 일치를 확인한다.
+- 2026-07-19: release 패키징은 1m10s에 성공했고 Developer ID `VectorNine INC (ZDTU5LS35K)` deep/strict 서명 및 arm64 확인이 통과했다. 실행 파일 SHA-256은 `46807c0d5ae76f15926697626bfc5eed50da956fe57b31548ca869a220dba3b0`다. 기존 PID 58802를 정확히 종료하고 수정본 PID 53246으로 재시작한 뒤, 실제 활성 DB가 레거시 `deppy.db`가 아니라 `metadata.sqlite3`임을 재확인했다. Codex mapping `21d0323e…/85b0688d… -> 019f7a71…`은 유지됐고 같은 ID의 `codex resume`가 실행됐다. 이어 수정본 PID 53246을 다시 정상 종료했을 때도 행이 그대로 남았으며 새 PID 64237 아래 `zsh -> node codex resume 019f7a71… -> native codex`가 재생성됐다. 14:00:49Z 이후 시작 로그에는 orphan 정리, 254.7MiB 로그 예산 적용, Apple SD Gothic 등록, web server, ANSI scrollback 복원만 있고 warn/error/panic은 없다. 과거 Claude mapping은 수정 전 이미 실제 DB에서 삭제됐다. terminal 로그에는 transcript ID가 남지만 같은 workspace에 서로 다른 과거 Claude ID가 여러 개이고 현재 pane과 일대일 대응하지 않아 잘못된 대화를 여는 추측 복원은 하지 않았다. 새 코드는 이후 Claude pane이 존재하는 동안 같은 행을 보존한다.
+- 2026-07-19: 수정 후 `cargo test --workspace --no-fail-fast -- --test-threads=1` 전체가 exit 0으로 통과했다(app 540 passed/5 ignored, runtime 119, storage 73, web-remote 138, 나머지 crate/doc-test 실패 0). 최초 기본 병렬 전체 실행은 `web_remote::dashboard::request_switch...`에서 60초 이상 정체되어 중단했지만, 해당 exact test 단독과 web-remote 전체 직렬 138/138은 즉시 통과해 이번 변경의 기능 실패가 아닌 기존 병렬 test interference로 분류했다. 앞서 transcript 12 passed/1 ignored, mapping helper 1/1, 실제 transcript smoke 6개, app check, strict workspace Clippy, fmt/diff check도 통과했다. 다음은 release package/sign/relaunch 뒤 실제 DB mapping과 resume process 보존 확인이다.
+- 2026-07-19: transcript 선택과 resume mapping을 수정했다. Codex는 `token_count`/`patch_apply_end` 같은 metadata를 활동으로 보지 않고 최신 `user_message`/`task_started`를 요약 경계로 삼아 이전 turn 설명을 재사용하지 않는다. Claude는 `/exit`의 local-command 및 `stop_sequence`/`No response requested.` 합성 이벤트를 무시하되 tool result는 같은 turn 경계를 끊지 않는다. `agent_sessions`는 감지 프로세스가 사라져도 pane이 존재하면 마지막 mapping을 유지하고, restore 전 빈 mux snapshot에는 정리하지 않으며 실제로 layout에서 사라진 pane만 DB에서 삭제한다. 성공한 새 binding은 resume map에도 즉시 반영한다. transcript 집중 테스트 12 passed/1 ignored, mapping helper 1/1 통과. 다음은 app check/strict Clippy/full tests와 실제 restart 검증이다.
+- 2026-07-19: 재시작 후속 제보를 실측 중이다. 실제 Codex rollout은 최신 `task_complete.last_agent_message`를 보유하지만 현재 역순 파서는 새 turn이 시작돼 아직 agent message가 없을 때도 이전 turn까지 넘어가 요약을 선택할 수 있다. 실제 Claude transcript 끝에는 `/exit`가 만든 `<local-command-*>` user 이벤트와 `stop_sequence`/`No response requested.` assistant 이벤트가 반복돼 현재 파서가 이를 실제 작업으로 오인한다. 더 중요한 복원 결함은 `process_agent_bindings`가 agent 프로세스가 사라지는 순간 pane이 여전히 살아 있어도 `agent_sessions` 행을 삭제한다는 점이다. 이 행이 재시작 시 `claude --resume`/`codex resume`의 유일한 매핑이므로 정상 종료·종료 race에서 Claude 복원 화면이 사라질 수 있다. 최신 turn 경계/Claude synthetic 이벤트 필터와 pane 생존 기반 mapping 보존을 테스트부터 추가한다.
 - 2026-07-19: 사용자 요청으로 감사 수정의 최신 HEAD를 `CARGO_NET_OFFLINE=true sh scripts/package-macos.sh`로 다시 패키징했다(release 29.65s). Developer ID `VectorNine INC (ZDTU5LS35K)` deep/strict 서명 검증과 arm64 확인이 통과했고, 메인 실행 파일 SHA-256은 `1b3ffd1f1604b1fd1d5bcbac04acf669e45ea2f2e8a67866ceeedc7d374cbbad`다. 실행 경로를 재확인한 이전 bundle PID 19303만 TERM 종료하고 새 bundle을 실행·활성화했다. 새 PID 58802는 22:28:08 KST부터 생존 중이며 시작 로그에는 log GC, Apple SD Gothic 등록, web server, ANSI scrollback 복원이 정상 기록되고 panic/error/warn은 없다. 이 기록을 감사 수정 커밋에 amend한 뒤 `origin/main`에 push한다.
 - 2026-07-19: 감사 수정 19개 파일을 `fix: resolve workspace and localization audit findings`로 커밋했다. 이 handoff 완료 기록을 같은 커밋에 포함하고 clean worktree와 최종 commit hash를 확인한다.
 - 2026-07-19: 압축 후 AGENTS/handoff/status/diff를 다시 읽고 최종 변경을 모듈별로 재검토했다. 두 차례 병렬 read-only 리뷰의 마지막 확정 사항(settings→Agents 성공 실행의 종료표식 해제, locale 변경 뒤 기존 합성 title/UI 오류 재번역)까지 반영된 상태다. 최종 `cargo test --workspace --no-fail-fast`는 exit 0/실패 0, `cargo fmt --all -- --check`, `git diff --check`, `cargo build --workspace`가 모두 통과했다. 직전 코드 변경 뒤 실행한 strict `cargo clippy --workspace --all-targets -- -D warnings`도 통과했다. 다음은 전체 변경 커밋과 clean 상태 확인이다.

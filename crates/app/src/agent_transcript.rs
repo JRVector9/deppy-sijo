@@ -91,6 +91,41 @@ fn claude_assistant_summary(value: &Value) -> Option<String> {
     clean_agent_summary(&text)
 }
 
+fn claude_internal_user_event(value: &Value) -> bool {
+    value
+        .pointer("/message/content")
+        .and_then(Value::as_str)
+        .is_some_and(|content| {
+            let content = content.trim_start();
+            content.starts_with("<local-command") || content.starts_with("<command-name")
+        })
+}
+
+fn claude_user_starts_new_turn(value: &Value) -> bool {
+    let Some(content) = value.pointer("/message/content") else {
+        return false;
+    };
+    if content.is_string() {
+        return !claude_internal_user_event(value);
+    }
+    content.as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            !matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("tool_result")
+            )
+        })
+    })
+}
+
+fn claude_synthetic_assistant_event(value: &Value, summary: Option<&str>) -> bool {
+    value
+        .pointer("/message/stop_reason")
+        .and_then(Value::as_str)
+        == Some("stop_sequence")
+        && summary == Some("No response requested.")
+}
+
 /// claude transcript(`~/.claude/projects/<cwd>/<session-id>.jsonl`) 파싱.
 /// 파일명이 곧 세션 ID. 마지막 assistant/user 이벤트로 상태를 파생한다:
 /// assistant `stop_reason=end_turn` → Idle(유저 차례), 그 외(tool_use) → Working.
@@ -102,6 +137,8 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
     // 최신 assistant message.model = 현재 모델(effort/context는 statusLine→DB, Phase 2b).
     let mut model: Option<String> = None;
     let mut last_agent_summary: Option<String> = None;
+    // 최신 실제 user 입력 뒤 아직 assistant 응답이 없으면 이전 turn의 요약을 재사용하지 않는다.
+    let mut summary_boundary_reached = false;
     for line in text.lines().rev() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -111,8 +148,12 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
         }
         match v.get("type").and_then(Value::as_str) {
             Some("assistant") => {
-                if last_agent_summary.is_none() {
-                    last_agent_summary = claude_assistant_summary(&v);
+                let summary = claude_assistant_summary(&v);
+                if claude_synthetic_assistant_event(&v, summary.as_deref()) {
+                    continue;
+                }
+                if last_agent_summary.is_none() && !summary_boundary_reached {
+                    last_agent_summary = summary;
                 }
                 if model.is_none() {
                     model = v
@@ -131,12 +172,21 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
                 }
             }
             // user 이벤트(툴 결과/유저 입력) 직후는 에이전트가 이어받아 작업한다.
-            Some("user") if activity.is_none() => {
-                activity = Some(AgentActivity::Working);
+            Some("user") if !claude_internal_user_event(&v) => {
+                if activity.is_none() {
+                    activity = Some(AgentActivity::Working);
+                }
+                if last_agent_summary.is_none() && claude_user_starts_new_turn(&v) {
+                    summary_boundary_reached = true;
+                }
             }
             _ => {}
         }
-        if activity.is_some() && model.is_some() && cwd.is_some() && last_agent_summary.is_some() {
+        if activity.is_some()
+            && model.is_some()
+            && cwd.is_some()
+            && (last_agent_summary.is_some() || summary_boundary_reached)
+        {
             break;
         }
     }
@@ -165,6 +215,8 @@ pub fn parse_codex(path: &Path) -> Option<TranscriptState> {
     let mut effort: Option<String> = None;
     let mut context_pct: Option<u8> = None;
     let mut last_agent_summary: Option<String> = None;
+    // 새 user/task가 시작됐지만 agent 메시지가 아직 없으면 이전 turn의 설명을 표시하지 않는다.
+    let mut summary_boundary_reached = false;
     for line in text.lines().rev() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -175,11 +227,13 @@ pub fn parse_codex(path: &Path) -> Option<TranscriptState> {
                 if activity.is_none() {
                     activity = match event_type {
                         Some("task_complete") | Some("turn_aborted") => Some(AgentActivity::Idle),
-                        Some(_) => Some(AgentActivity::Working),
-                        None => None,
+                        Some("task_started" | "user_message" | "agent_message") => {
+                            Some(AgentActivity::Working)
+                        }
+                        _ => None,
                     };
                 }
-                if last_agent_summary.is_none() {
+                if last_agent_summary.is_none() && !summary_boundary_reached {
                     let message = match event_type {
                         Some("task_complete") => v.pointer("/payload/last_agent_message"),
                         Some("agent_message") => v.pointer("/payload/message"),
@@ -188,6 +242,11 @@ pub fn parse_codex(path: &Path) -> Option<TranscriptState> {
                     last_agent_summary = message
                         .and_then(Value::as_str)
                         .and_then(clean_agent_summary);
+                }
+                if last_agent_summary.is_none()
+                    && matches!(event_type, Some("task_started" | "user_message"))
+                {
+                    summary_boundary_reached = true;
                 }
             }
             Some("turn_context") if model.is_none() => {
@@ -220,7 +279,7 @@ pub fn parse_codex(path: &Path) -> Option<TranscriptState> {
         if activity.is_some()
             && model.is_some()
             && context_pct.is_some()
-            && last_agent_summary.is_some()
+            && (last_agent_summary.is_some() || summary_boundary_reached)
         {
             break;
         }
@@ -300,6 +359,54 @@ mod tests {
     }
 
     #[test]
+    fn claude_재시작요약은_exit_합성이벤트를_무시한다() {
+        let p = write_tmp(
+            "sess-exit.jsonl",
+            r#"{"type":"assistant","cwd":"/proj","message":{"role":"assistant","model":"claude-opus-4-8","stop_reason":"end_turn","content":[{"type":"text","text":"최신 실제 작업을 저장했습니다."}]}}
+{"type":"user","cwd":"/proj","message":{"role":"user","content":"<local-command-caveat>internal</local-command-caveat>"}}
+{"type":"user","cwd":"/proj","message":{"role":"user","content":"<command-name>/exit</command-name>"}}
+{"type":"assistant","cwd":"/proj","message":{"role":"assistant","model":"claude-opus-4-8","stop_reason":"stop_sequence","content":[{"type":"text","text":"No response requested."}]}}
+"#,
+        );
+        let s = parse_claude(&p).unwrap();
+        assert_eq!(s.activity, AgentActivity::Idle);
+        assert_eq!(
+            s.last_agent_summary.as_deref(),
+            Some("최신 실제 작업을 저장했습니다.")
+        );
+    }
+
+    #[test]
+    fn claude_새_user_turn은_이전_agent요약을_재사용하지_않는다() {
+        let p = write_tmp(
+            "sess-new-turn.jsonl",
+            r#"{"type":"assistant","cwd":"/proj","message":{"role":"assistant","model":"claude-opus-4-8","stop_reason":"end_turn","content":[{"type":"text","text":"이전 작업 완료"}]}}
+{"type":"user","cwd":"/proj","message":{"role":"user","content":"새 작업을 시작해"}}
+"#,
+        );
+        let s = parse_claude(&p).unwrap();
+        assert_eq!(s.activity, AgentActivity::Working);
+        assert_eq!(s.last_agent_summary, None);
+    }
+
+    #[test]
+    fn claude_tool_result는_같은_turn의_agent요약_경계를_끊지_않는다() {
+        let p = write_tmp(
+            "sess-tool-result.jsonl",
+            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"테스트를 실행해"}}
+{"type":"assistant","cwd":"/proj","message":{"role":"assistant","model":"claude-opus-4-8","stop_reason":"tool_use","content":[{"type":"text","text":"집중 테스트를 실행하고 있습니다."}]}}
+{"type":"user","cwd":"/proj","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":"running"}]}}
+"#,
+        );
+        let s = parse_claude(&p).unwrap();
+        assert_eq!(s.activity, AgentActivity::Working);
+        assert_eq!(
+            s.last_agent_summary.as_deref(),
+            Some("집중 테스트를 실행하고 있습니다.")
+        );
+    }
+
+    #[test]
     fn 에이전트작업설명은_이미지표식을_제거하고_내부메시지를_거른다() {
         assert_eq!(
             clean_agent_summary("<image name=[Image #1] path=/tmp/a.png> 사이드바 수정 완료"),
@@ -350,6 +457,40 @@ mod tests {
             s.last_agent_summary.as_deref(),
             Some("Running the focused sidebar tests")
         );
+    }
+
+    #[test]
+    fn codex_새_turn은_이전_task_complete_요약을_재사용하지_않는다() {
+        let p = write_tmp(
+            "rollout-2026-01-01T00-00-00-bbbbbbbb-cccc-dddd-eeee-ffffffffffff.jsonl",
+            r#"{"type":"session_meta","payload":{"cwd":"/proj"}}
+{"type":"turn_context","payload":{"model":"gpt-5.6-sol","effort":"xhigh"}}
+{"type":"event_msg","payload":{"type":"task_started"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"이전 작업 진행"}}
+{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"이전 작업 완료"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"새 작업"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"model_context_window":200000,"last_token_usage":{"input_tokens":1000}}}}
+"#,
+        );
+        let s = parse_codex(&p).unwrap();
+        assert_eq!(s.activity, AgentActivity::Working);
+        assert_eq!(s.last_agent_summary, None);
+    }
+
+    #[test]
+    fn codex_비활동_metadata는_완료상태를_실행중으로_덮지_않는다() {
+        let p = write_tmp(
+            "rollout-2026-01-01T00-00-00-cccccccc-dddd-eeee-ffff-000000000000.jsonl",
+            r#"{"type":"session_meta","payload":{"cwd":"/proj"}}
+{"type":"turn_context","payload":{"model":"gpt-5.6-sol","effort":"xhigh"}}
+{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"최신 작업 완료"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"model_context_window":200000,"last_token_usage":{"input_tokens":1000}}}}
+{"type":"event_msg","payload":{"type":"patch_apply_end"}}
+"#,
+        );
+        let s = parse_codex(&p).unwrap();
+        assert_eq!(s.activity, AgentActivity::Idle);
+        assert_eq!(s.last_agent_summary.as_deref(), Some("최신 작업 완료"));
     }
 
     #[test]

@@ -1480,6 +1480,19 @@ fn clear_closed_workspace_state(
     runtime_removed || persisted_removed
 }
 
+fn stale_agent_session_panes<'a>(
+    persisted_panes: impl IntoIterator<Item = &'a str>,
+    live_panes: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut stale: Vec<String> = persisted_panes
+        .into_iter()
+        .filter(|pane_id| !live_panes.contains(*pane_id))
+        .map(str::to_owned)
+        .collect();
+    stale.sort_unstable();
+    stale
+}
+
 impl App {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -2351,14 +2364,38 @@ impl App {
                 .into_iter()
                 .map(|r| (r.pane_id.clone(), r))
                 .collect();
-            // persisted_agents는 "이번 세션에 감지해 저장한 것"만 추적한다(빈 맵 시작 — 아직
-            // 감지 전인 복원 데이터를 삭제 루프가 지우지 않게, codex).
-            self.persisted_agents = std::collections::HashMap::new();
+            // pane이 살아 있는 동안 마지막 agent mapping은 resume 원천으로 보존한다.
+            // 프로세스 미감지는 정상 종료·앱 shutdown race에서도 발생하므로 삭제 조건이 아니다.
+            self.persisted_agents = self.restore_agents.clone();
             self.resumed_panes.clear();
             self.restore_loaded_for = Some(self.active.id.clone());
         }
 
         let mux = self.active.workspace_ui.mux().cloned();
+        // RestoreWorkspace가 아직 layout을 emit하기 전의 빈 snapshot은 삭제 근거가 아니다.
+        // pane 하나 이상을 관측한 뒤에만 실제로 사라진 mapping을 정리한다.
+        if let Some(mux) = &mux
+            && mux.tabs.iter().any(|tab| !tab.panes.is_empty())
+        {
+            let live_panes: std::collections::HashSet<String> = mux
+                .tabs
+                .iter()
+                .flat_map(|tab| tab.panes.iter().map(|pane| pane.id.0.clone()))
+                .collect();
+            let stale = stale_agent_session_panes(
+                self.persisted_agents.keys().map(String::as_str),
+                &live_panes,
+            );
+            for pane_id in stale {
+                if let Err(error) = self.db.delete_agent_session(&self.active.id, &pane_id) {
+                    tracing::warn!(pane = %pane_id, "삭제된 pane의 agent session 정리 실패: {error:#}");
+                    continue;
+                }
+                self.persisted_agents.remove(&pane_id);
+                self.restore_agents.remove(&pane_id);
+                self.resumed_panes.remove(&pane_id);
+            }
+        }
         let current: std::collections::HashMap<String, crate::storage::AgentSessionRow> = bindings
             .iter()
             .filter_map(|(sid, b)| {
@@ -2378,23 +2415,20 @@ impl App {
             })
             .collect();
         for (pane_id, row) in &current {
-            if self.persisted_agents.get(pane_id) != Some(row)
-                && let Err(e) = self.db.upsert_agent_session(
-                    &self.active.id,
-                    pane_id,
-                    &row.kind,
-                    &row.session_id,
-                )
+            if self.persisted_agents.get(pane_id) == Some(row) {
+                continue;
+            }
+            match self
+                .db
+                .upsert_agent_session(&self.active.id, pane_id, &row.kind, &row.session_id)
             {
-                tracing::warn!("agent session 저장 실패: {e:#}");
+                Ok(()) => {
+                    self.persisted_agents.insert(pane_id.clone(), row.clone());
+                    self.restore_agents.insert(pane_id.clone(), row.clone());
+                }
+                Err(error) => tracing::warn!("agent session 저장 실패: {error:#}"),
             }
         }
-        for pane_id in self.persisted_agents.keys() {
-            if !current.contains_key(pane_id) {
-                let _ = self.db.delete_agent_session(&self.active.id, pane_id);
-            }
-        }
-        self.persisted_agents = current;
 
         // 복원 resume 주입: 저장된 에이전트가 있는 pane에 에이전트가 아직 안 떠 있으면
         // native resume 명령을 셸에 한 번 보낸다(설정으로 끌 수 있다, 기본 ON).
@@ -9552,5 +9586,15 @@ h:1 EE:FF
             &mut persisted,
             "closed"
         ));
+    }
+
+    #[test]
+    fn agent_resume_mapping은_프로세스가_아니라_pane_생존기준으로_정리한다() {
+        let live_panes = std::collections::HashSet::from(["claude-pane".to_owned()]);
+        let stale = stale_agent_session_panes(["claude-pane", "deleted-pane"], &live_panes);
+
+        // claude 프로세스가 잠시 없더라도 pane이 남으면 mapping을 유지하고,
+        // 실제 layout에서 사라진 pane의 mapping만 삭제한다.
+        assert_eq!(stale, vec!["deleted-pane".to_owned()]);
     }
 }

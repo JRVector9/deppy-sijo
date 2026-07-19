@@ -319,6 +319,7 @@ pub fn disable_egui_debug_warnings(ctx: &egui::Context) {
     // 동작인데도 오발화한다(2026-07-18 "트리 스크롤 중 빨간 네모" 보고).
     // warn_on_id_clash(Options)와는 별개 플래그(Style.debug)라 위 설정으로는 안 꺼진다.
     // 다크/라이트 스타일 모두에 적용해야 런타임 테마 전환 후에도 유지된다.
+    #[cfg(debug_assertions)]
     ctx.all_styles_mut(|style| style.debug.warn_if_rect_changes_id = false);
 }
 

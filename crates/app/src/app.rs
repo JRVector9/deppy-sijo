@@ -4884,25 +4884,35 @@ impl App {
     }
 
     /// 컴포저 프롬프트를 활성 워크스페이스의 포커스 세션에 주입한다 (2026-07-17).
-    /// 인코딩은 web P6a 미러(composer::encode_prompt_input — C0 strip·\n→\r·bracketed
-    /// wrap·submit CR). 주입 전 clear_selection은 WriteInput 직접 전송 관례
-    /// (inject_waiting_answer와 동일).
+    /// bracketed-paste TUI에는 짧은 한 줄도 명시적 paste 본문과 별도 submit CR로
+    /// 보낸다. Codex 감지 워커가 아직 결과를 내기 전에는 일반 키 입력 경로를 타던
+    /// 타이밍 의존을 없애고, PTY writer의 FIFO 순서로 두 입력을 전달한다.
+    /// 주입 전 clear_selection은 WriteInput 직접 전송 관례(inject_waiting_answer와 동일).
     fn send_composer_prompt(&mut self, prompt: &str) {
         let Some(session) = self.active.workspace_ui.focused_session() else {
             tracing::info!("컴포저 전송: 포커스된 터미널 세션 없음 — 무시");
             return;
         };
         let bracketed = self.active.workspace_ui.session_bracketed_paste(session);
-        let Some(bytes) = ui::composer::encode_prompt_input(prompt, true, bracketed) else {
+        let provider = self.active.workspace_ui.agent_provider_for(session);
+        self.active.workspace_ui.clear_selection(session);
+        let Some(plan) = ui::composer::plan_composer_input(prompt, true, bracketed, provider)
+        else {
             return;
         };
-        self.active.workspace_ui.clear_selection(session);
-        if let Err(e) = self
-            .active
-            .runtime
-            .send_command(runtime::RuntimeCommand::WriteInput { session, bytes })
-        {
-            tracing::warn!("컴포저 전송 실패: {e:#}");
+        let writes = match plan {
+            ui::composer::ComposerInputPlan::Single(bytes) => vec![bytes],
+            ui::composer::ComposerInputPlan::BracketedPaste { body, submit } => vec![body, submit],
+        };
+        for bytes in writes {
+            if let Err(e) = self
+                .active
+                .runtime
+                .send_command(runtime::RuntimeCommand::WriteInput { session, bytes })
+            {
+                tracing::warn!("컴포저 전송 실패: {e:#}");
+                return;
+            }
         }
     }
 

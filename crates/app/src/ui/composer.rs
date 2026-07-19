@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::agent_surface::AgentProvider;
 use crate::config::ComposerSendKey;
 
 /// 히스토리 상한 — 초과분은 오래된 것부터 버린다.
@@ -1189,6 +1190,73 @@ pub fn encode_prompt_input(text: &str, submit: bool, bracketed: bool) -> Option<
     Some(bytes)
 }
 
+/// 도크 컴포저 전송을 bracketed-paste TUI 세션에 맞게 인코딩한다.
+///
+/// Codex 같은 TUI는 bracketed paste 이벤트를 명시적으로 인식하므로, 본문을
+/// `ESC[200~ ... ESC[201~`로 감싸 단일 paste로 만든다. 이렇게 하면 본문 안의
+/// 개행이나 뒤따르는 Enter가 paste-burst heuristic으로 잘못 처리되는 것을 막을 수
+/// 있다. 본문과 submit용 CR은 반드시 별도 `WriteInput`으로 나뉘어 전송되어야
+/// 한다(호출측 `app.rs`가 그렇게 한다).
+///
+/// bracketed paste 안의 개행은 literal `\n`으로 남긴다. 공용 인코더의 `\n→\r`
+/// 변환은 "Enter 키" 의미를 위한 것이고, paste 안에서는 오히려 불필요한 Enter
+/// 이벤트를 만들 수 있다.
+pub fn encode_tui_paste_submission(text: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let cleaned: String = normalized
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\t' || *c == '\n')
+        .collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    let mut body = Vec::with_capacity(cleaned.len() + 12);
+    body.extend_from_slice(b"\x1b[200~");
+    body.extend_from_slice(cleaned.as_bytes());
+    body.extend_from_slice(b"\x1b[201~");
+    Some((body, b"\r".to_vec()))
+}
+
+/// 전송 대상 에이전트에 따라 한 번에 복수 WriteInput이 필요한지 미리 결정한다.
+/// App은 이 계획대로 runtime에 순서대로 명령을 보낸다.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ComposerInputPlan {
+    /// Claude·일반 셸용: 단일 WriteInput.
+    Single(Vec<u8>),
+    /// TUI용: bracketed paste 본문과 분리된 submit CR.
+    BracketedPaste {
+        body: Vec<u8>,
+        submit: Vec<u8>,
+    },
+}
+
+/// 프로바이더/터미널 상태에 맞는 입력 계획을 만든다.
+///
+/// - Codex로 감지됐거나 터미널이 DEC 2004를 켠 세션은 명시적 bracketed paste + 별도
+///   CR을 쓴다. 짧은 입력을 일반 키 입력으로 보내면서 Codex 감지 타이밍에 의존하던
+///   문제를 없앤다.
+/// - bracketed paste를 쓰지 않는 일반 셸은 기존 `encode_prompt_input` 경로를 유지한다.
+pub fn plan_composer_input(
+    text: &str,
+    submit: bool,
+    bracketed: bool,
+    provider: Option<AgentProvider>,
+) -> Option<ComposerInputPlan> {
+    let force_bracketed = bracketed || provider == Some(AgentProvider::Codex);
+    if force_bracketed {
+        let (body, enter) = encode_tui_paste_submission(text)?;
+        return Some(if submit {
+            ComposerInputPlan::BracketedPaste {
+                body,
+                submit: enter,
+            }
+        } else {
+            ComposerInputPlan::Single(body)
+        });
+    }
+    encode_prompt_input(text, submit, false).map(ComposerInputPlan::Single)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1226,6 +1294,47 @@ mod tests {
         let encoded = encode_prompt_input(&long, true, true).unwrap();
         assert!(encoded.starts_with(b"\x1b[200~"));
         assert!(encoded.ends_with(b"\x1b[201~\r"));
+    }
+
+    #[test]
+    fn tui_paste_submission은_본문과_enter를_별도_write로_나눈다() {
+        assert_eq!(
+            encode_tui_paste_submission("hello"),
+            Some((
+                b"\x1b[200~hello\x1b[201~".to_vec(),
+                b"\r".to_vec(),
+            )),
+            "짧은 한 줄도 Codex에는 명시적 paste로 보내야 burst 판정을 피한다"
+        );
+        assert_eq!(
+            encode_tui_paste_submission("one\ntwo"),
+            Some((
+                b"\x1b[200~one\ntwo\x1b[201~".to_vec(),
+                b"\r".to_vec(),
+            ))
+        );
+    }
+
+    #[test]
+    fn composer_plan은_감지_전_codex도_bracketed_세션이면_명시적_paste로_보낸다() {
+        assert_eq!(
+            plan_composer_input("hi", true, true, None),
+            Some(ComposerInputPlan::BracketedPaste {
+                body: b"\x1b[200~hi\x1b[201~".to_vec(),
+                submit: b"\r".to_vec(),
+            })
+        );
+        assert_eq!(
+            plan_composer_input("hi", true, false, Some(AgentProvider::Codex)),
+            Some(ComposerInputPlan::BracketedPaste {
+                body: b"\x1b[200~hi\x1b[201~".to_vec(),
+                submit: b"\r".to_vec(),
+            })
+        );
+        assert_eq!(
+            plan_composer_input("hi", true, false, None),
+            Some(ComposerInputPlan::Single(b"hi\r".to_vec()))
+        );
     }
 
     #[test]

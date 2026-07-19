@@ -941,11 +941,11 @@ impl ConnectorsUi {
                         ui.label(catalog.t("connectors.oauth_manual_note", &[("reason", reason)]));
                         ui.weak(catalog.t("connectors.oauth_manual_hint", &[]));
                         ui.horizontal(|ui| {
-                            ui.label("client id");
+                            ui.label(catalog.t("connectors.client_id", &[]));
                             ui.text_edit_singleline(client_id);
                         });
                         ui.horizontal(|ui| {
-                            ui.label("client secret");
+                            ui.label(catalog.t("connectors.client_secret", &[]));
                             ui.add(egui::TextEdit::singleline(client_secret).password(true));
                         });
                         ui.add_space(8.0);

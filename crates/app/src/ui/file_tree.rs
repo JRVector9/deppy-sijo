@@ -865,15 +865,20 @@ impl FileTreeUi {
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     for workspace in before_active {
-                        let resp = workspace_row(ui, workspace, false, Some(false));
+                        let resp = workspace_row(ui, workspace, false, Some(false), catalog);
                         workspace_context_menu(&resp, workspace, catalog, &mut action);
                         if resp.clicked() {
                             action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
                         }
                     }
                     if let Some(active) = active {
-                        let resp =
-                            workspace_row(ui, active, true, Some(self.workspace_sessions_expanded));
+                        let resp = workspace_row(
+                            ui,
+                            active,
+                            true,
+                            Some(self.workspace_sessions_expanded),
+                            catalog,
+                        );
                         workspace_context_menu(&resp, active, catalog, &mut action);
                         if resp.clicked() {
                             self.workspace_sessions_expanded = !self.workspace_sessions_expanded;
@@ -1102,7 +1107,7 @@ impl FileTreeUi {
                             });
                     }
                     for workspace in after_active {
-                        let resp = workspace_row(ui, workspace, false, Some(false));
+                        let resp = workspace_row(ui, workspace, false, Some(false), catalog);
                         workspace_context_menu(&resp, workspace, catalog, &mut action);
                         if resp.clicked() {
                             action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
@@ -1160,7 +1165,7 @@ impl FileTreeUi {
                 FileToolbarIcon::Search,
                 self.file_search_open,
             )
-            .on_hover_text("파일 검색");
+            .on_hover_text(catalog.t("file_tree.search", &[]));
             if search.clicked() {
                 self.file_search_open = !self.file_search_open;
                 if !self.file_search_open {
@@ -1240,7 +1245,7 @@ impl FileTreeUi {
         if self.file_search_open {
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.file_search)
-                    .hint_text("파일 이름 검색")
+                    .hint_text(catalog.t("file_tree.search_hint", &[]))
                     .desired_width(f32::INFINITY)
                     .margin(egui::Margin::symmetric(8, 5)),
             );
@@ -1385,7 +1390,7 @@ impl FileTreeUi {
         }) = &mut edit
         {
             ui.horizontal(|ui| {
-                ui.label("새 파일");
+                ui.label(catalog.t("file_tree.new_file_label", &[]));
                 let resp = ui.add(
                     egui::TextEdit::singleline(buffer)
                         .hint_text(catalog.t("common.name", &[]))
@@ -1622,7 +1627,7 @@ impl FileTreeUi {
                     let row_resp =
                         ui.interact(row_rect, drag_id.with("row"), egui::Sense::click_and_drag());
                     let row_resp = if inaccessible {
-                        row_resp.on_hover_text("macOS 접근 권한 없음")
+                        row_resp.on_hover_text(catalog.t("file_tree.macos_access_denied", &[]))
                     } else {
                         row_resp
                     };
@@ -2697,6 +2702,7 @@ fn workspace_row(
     workspace: &SidebarWorkspaceEntry,
     active: bool,
     expanded: Option<bool>,
+    catalog: &i18n::Catalog,
 ) -> egui::Response {
     // 가로세로 여백 15% 축소(2026-07-18 사용자) — 행 높이 46→39.1, 좌측 인셋
     // 8→6.8, 이름 간격 9→7.65. 아바타(30)는 유지하고 세로 중앙 재정렬.
@@ -2752,7 +2758,9 @@ fn workspace_row(
         // 우측 여백 8 + 이름/요약 간격 16 + disclosure 폭(있으면 14)을 더한다.
         let reserved_right = if show_summary {
             let disclosure = if show_disclosure { 14.0 } else { 0.0 };
-            workspace_summary_width(ui, workspace.summary, summary_mode) + 20.4 + disclosure
+            workspace_summary_width(ui, workspace.summary, summary_mode, catalog)
+                + 20.4
+                + disclosure
         } else {
             6.8
         };
@@ -2779,12 +2787,19 @@ fn workspace_row(
         } else {
             rect.right() - 8.0
         };
-        paint_workspace_summary(ui, right, rect.center().y, workspace.summary, summary_mode);
+        paint_workspace_summary(
+            ui,
+            right,
+            rect.center().y,
+            workspace.summary,
+            summary_mode,
+            catalog,
+        );
     } else {
         // 40pt 아이콘 레일까지 줄였을 때는 상태 문구 자리가 없으므로 아바타 우하단의
         // 작은 점으로 primary state를 계속 표시한다. 이름이 보이는 폭부터는 반드시
         // 위의 텍스트 요약으로 바뀐다.
-        let (_, color) = workspace_primary_summary_segment(workspace.summary);
+        let (_, color) = workspace_primary_summary_segment(workspace.summary, catalog);
         ui.painter().circle_filled(
             egui::pos2(avatar.right() - 2.5, avatar.bottom() - 2.5),
             2.5,
@@ -2928,10 +2943,11 @@ fn workspace_summary_width(
     ui: &egui::Ui,
     summary: SidebarSessionSummary,
     mode: WorkspaceSummaryMode,
+    catalog: &i18n::Catalog,
 ) -> f32 {
     let weak = ui.visuals().weak_text_color();
     let font = crate::fonts::sidebar_font(11.0);
-    workspace_summary_segments_for_mode(summary, weak, mode)
+    workspace_summary_segments_for_mode(summary, weak, mode, catalog)
         .iter()
         .map(|(text, color)| {
             ui.painter()
@@ -2948,9 +2964,10 @@ fn paint_workspace_summary(
     center_y: f32,
     summary: SidebarSessionSummary,
     mode: WorkspaceSummaryMode,
+    catalog: &i18n::Catalog,
 ) {
     let weak = ui.visuals().weak_text_color();
-    let values = workspace_summary_segments_for_mode(summary, weak, mode);
+    let values = workspace_summary_segments_for_mode(summary, weak, mode, catalog);
     let font = crate::fonts::sidebar_font(11.0);
     let mut cursor = right;
     for (text, color) in values.iter().rev() {
@@ -2970,65 +2987,86 @@ fn workspace_summary_segments_for_mode(
     summary: SidebarSessionSummary,
     weak: egui::Color32,
     mode: WorkspaceSummaryMode,
+    catalog: &i18n::Catalog,
 ) -> Vec<(String, egui::Color32)> {
     match mode {
         WorkspaceSummaryMode::IconOnly => Vec::new(),
-        WorkspaceSummaryMode::Compact => vec![workspace_primary_summary_segment(summary)],
-        WorkspaceSummaryMode::Full => workspace_summary_segments(summary, weak),
+        WorkspaceSummaryMode::Compact => {
+            vec![workspace_primary_summary_segment(summary, catalog)]
+        }
+        WorkspaceSummaryMode::Full => workspace_summary_segments(summary, weak, catalog),
     }
 }
 
-fn workspace_primary_summary_segment(summary: SidebarSessionSummary) -> (String, egui::Color32) {
+fn workspace_primary_summary_segment(
+    summary: SidebarSessionSummary,
+    catalog: &i18n::Catalog,
+) -> (String, egui::Color32) {
     use crate::agent_surface::AgentVisualState as VisualState;
 
     if summary.no_sessions {
         return (
-            "세션 없음".to_owned(),
+            catalog.t("workspace.summary.no_sessions", &[]),
             crate::ui::agent_visuals::status_color(VisualState::Off),
         );
     }
     if summary.error > 0 {
         return (
-            format!("오류 {}", summary.error),
+            catalog.t(
+                "workspace.summary.error",
+                &[("count", &summary.error.to_string())],
+            ),
             crate::ui::agent_visuals::status_color(VisualState::Error),
         );
     }
     if summary.waiting > 0 {
         return (
-            format!("{} 입력 대기", summary.waiting),
+            catalog.t(
+                "workspace.summary.waiting",
+                &[("count", &summary.waiting.to_string())],
+            ),
             crate::ui::agent_visuals::status_color(VisualState::Waiting),
         );
     }
     if summary.running > 0 {
         return (
-            format!("{} 실행 중", summary.running),
+            catalog.t(
+                "workspace.summary.running",
+                &[("count", &summary.running.to_string())],
+            ),
             crate::ui::agent_visuals::status_color(VisualState::Active),
         );
     }
     if summary.done > 0 {
         return (
-            format!("완료 {}", summary.done),
+            catalog.t(
+                "workspace.summary.done",
+                &[("count", &summary.done.to_string())],
+            ),
             crate::ui::agent_visuals::status_color(VisualState::Complete),
         );
     }
     if summary.idle > 0 {
         return (
             if summary.idle == 1 {
-                "유휴".to_owned()
+                catalog.t("workspace.summary.idle", &[])
             } else {
-                format!("유휴 {}", summary.idle)
+                catalog.t(
+                    "workspace.summary.idle_count",
+                    &[("count", &summary.idle.to_string())],
+                )
             },
             crate::ui::agent_visuals::status_color(VisualState::Idle),
         );
     }
     if summary.inactive > 0 {
         return (
-            "비활성".to_owned(),
+            catalog.t("workspace.summary.inactive", &[]),
             crate::ui::agent_visuals::status_color(VisualState::Off),
         );
     }
     (
-        "유휴".to_owned(),
+        catalog.t("workspace.summary.idle", &[]),
         crate::ui::agent_visuals::status_color(VisualState::Idle),
     )
 }
@@ -3036,6 +3074,7 @@ fn workspace_primary_summary_segment(summary: SidebarSessionSummary) -> (String,
 fn workspace_summary_segments(
     summary: SidebarSessionSummary,
     weak: egui::Color32,
+    catalog: &i18n::Catalog,
 ) -> Vec<(String, egui::Color32)> {
     use crate::agent_surface::AgentVisualState as VisualState;
 
@@ -3055,41 +3094,83 @@ fn workspace_summary_segments(
         parts.push((label, color));
     };
     if summary.running > 0 {
-        push(&mut parts, format!("{} 실행 중", summary.running), running);
+        push(
+            &mut parts,
+            catalog.t(
+                "workspace.summary.running",
+                &[("count", &summary.running.to_string())],
+            ),
+            running,
+        );
     }
     if summary.waiting > 0 {
         push(
             &mut parts,
-            format!("{} 입력 대기", summary.waiting),
+            catalog.t(
+                "workspace.summary.waiting",
+                &[("count", &summary.waiting.to_string())],
+            ),
             waiting,
         );
     }
     if summary.done > 0 {
-        push(&mut parts, format!("완료 {}", summary.done), done);
+        push(
+            &mut parts,
+            catalog.t(
+                "workspace.summary.done",
+                &[("count", &summary.done.to_string())],
+            ),
+            done,
+        );
     }
     if summary.error > 0 {
-        push(&mut parts, format!("오류 {}", summary.error), error);
+        push(
+            &mut parts,
+            catalog.t(
+                "workspace.summary.error",
+                &[("count", &summary.error.to_string())],
+            ),
+            error,
+        );
     }
     if summary.idle > 0 {
         if summary.idle == 1 && parts.is_empty() {
-            push(&mut parts, "유휴".to_owned(), idle);
+            push(&mut parts, catalog.t("workspace.summary.idle", &[]), idle);
         } else {
-            push(&mut parts, format!("유휴 {}", summary.idle), idle);
+            push(
+                &mut parts,
+                catalog.t(
+                    "workspace.summary.idle_count",
+                    &[("count", &summary.idle.to_string())],
+                ),
+                idle,
+            );
         }
     }
     if summary.inactive > 0 {
         if parts.is_empty() {
-            push(&mut parts, "비활성".to_owned(), inactive);
+            push(
+                &mut parts,
+                catalog.t("workspace.summary.inactive", &[]),
+                inactive,
+            );
         } else {
-            push(&mut parts, format!("비활성 {}", summary.inactive), inactive);
+            push(
+                &mut parts,
+                catalog.t(
+                    "workspace.summary.inactive_count",
+                    &[("count", &summary.inactive.to_string())],
+                ),
+                inactive,
+            );
         }
     }
     if summary.no_sessions && parts.is_empty() {
-        parts.push(("세션 없음".to_owned(), inactive));
+        parts.push((catalog.t("workspace.summary.no_sessions", &[]), inactive));
     }
     // 세션이 아직 생성되지 않은 활성/warm 워크스페이스도 상태 영역을 비워 두지 않는다.
     if parts.is_empty() {
-        parts.push(("유휴".to_owned(), idle));
+        parts.push((catalog.t("workspace.summary.idle", &[]), idle));
     }
     parts
 }
@@ -4582,6 +4663,10 @@ mod tests {
         ctx.set_fonts(fonts);
     }
 
+    fn catalog() -> i18n::Catalog {
+        i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap()
+    }
+
     #[test]
     fn 워크스페이스_아바타만_대문자이고_이름표기는_보존한다() {
         assert_eq!(workspace_initial("arteawiki"), 'A');
@@ -4643,7 +4728,8 @@ mod tests {
         assert_eq!(summary.error, 1);
         assert_eq!(summary.idle, 1);
 
-        let segments = workspace_summary_segments(summary, egui::Color32::GRAY);
+        let catalog = catalog();
+        let segments = workspace_summary_segments(summary, egui::Color32::GRAY, &catalog);
         use crate::agent_surface::AgentVisualState as VisualState;
         let status_segments = segments
             .iter()
@@ -4654,23 +4740,23 @@ mod tests {
             status_segments,
             vec![
                 (
-                    "1 실행 중".to_owned(),
+                    "1 running".to_owned(),
                     crate::ui::agent_visuals::status_color(VisualState::Active),
                 ),
                 (
-                    "2 입력 대기".to_owned(),
+                    "2 waiting for input".to_owned(),
                     crate::ui::agent_visuals::status_color(VisualState::Waiting),
                 ),
                 (
-                    "완료 1".to_owned(),
+                    "1 completed".to_owned(),
                     crate::ui::agent_visuals::status_color(VisualState::Complete),
                 ),
                 (
-                    "오류 1".to_owned(),
+                    "1 errors".to_owned(),
                     crate::ui::agent_visuals::status_color(VisualState::Error),
                 ),
                 (
-                    "유휴 1".to_owned(),
+                    "1 idle".to_owned(),
                     crate::ui::agent_visuals::status_color(VisualState::Idle),
                 ),
             ]
@@ -4679,36 +4765,42 @@ mod tests {
             .into_iter()
             .map(|(text, _)| text)
             .collect::<String>();
-        assert_eq!(text, "1 실행 중 · 2 입력 대기 · 완료 1 · 오류 1 · 유휴 1");
+        assert_eq!(
+            text,
+            "1 running · 2 waiting for input · 1 completed · 1 errors · 1 idle"
+        );
     }
 
     #[test]
     fn 상태없는_활성은_유휴_복원세션은_비활성_빈비활성은_세션없음으로_표시한다() {
         use crate::agent_surface::AgentVisualState as VisualState;
         let weak = egui::Color32::GRAY;
-        let idle = workspace_summary_segments(SidebarSessionSummary::default(), weak);
-        assert_eq!(idle[0].0, "유휴");
+        let catalog = catalog();
+        let idle = workspace_summary_segments(SidebarSessionSummary::default(), weak, &catalog);
+        assert_eq!(idle[0].0, "Idle");
         assert_eq!(
             idle[0].1,
             crate::ui::agent_visuals::status_color(VisualState::Idle)
         );
-        let inactive = workspace_summary_segments(SidebarSessionSummary::inactive(3), weak);
-        assert_eq!(inactive[0].0, "비활성");
+        let inactive =
+            workspace_summary_segments(SidebarSessionSummary::inactive(3), weak, &catalog);
+        assert_eq!(inactive[0].0, "Inactive");
         assert_eq!(
             inactive[0].1,
             crate::ui::agent_visuals::status_color(VisualState::Off)
         );
-        let no_sessions = workspace_summary_segments(SidebarSessionSummary::inactive(0), weak);
-        assert_eq!(no_sessions[0].0, "세션 없음");
+        let no_sessions =
+            workspace_summary_segments(SidebarSessionSummary::inactive(0), weak, &catalog);
+        assert_eq!(no_sessions[0].0, "No sessions");
         assert_eq!(
             no_sessions[0].1,
             crate::ui::agent_visuals::status_color(VisualState::Off)
         );
 
-        let primary = workspace_primary_summary_segment(SidebarSessionSummary::default());
+        let primary = workspace_primary_summary_segment(SidebarSessionSummary::default(), &catalog);
         assert_eq!(primary, idle[0]);
         assert_eq!(
-            workspace_primary_summary_segment(SidebarSessionSummary::inactive(0)),
+            workspace_primary_summary_segment(SidebarSessionSummary::inactive(0), &catalog),
             no_sessions[0]
         );
     }
@@ -4754,8 +4846,9 @@ mod tests {
             SidebarSessionSummary::default(),
             egui::Color32::GRAY,
             WorkspaceSummaryMode::Compact,
+            &catalog(),
         );
-        assert_eq!(compact[0].0, "유휴");
+        assert_eq!(compact[0].0, "Idle");
     }
 
     /// 안정성 감사 High #2: 워커가 stale epoch(루트 전환/refresh 후) 청크를

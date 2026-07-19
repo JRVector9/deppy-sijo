@@ -131,10 +131,8 @@ pub fn parse_claude(path: &Path) -> Option<TranscriptState> {
                 }
             }
             // user 이벤트(툴 결과/유저 입력) 직후는 에이전트가 이어받아 작업한다.
-            Some("user") => {
-                if activity.is_none() {
-                    activity = Some(AgentActivity::Working);
-                }
+            Some("user") if activity.is_none() => {
+                activity = Some(AgentActivity::Working);
             }
             _ => {}
         }

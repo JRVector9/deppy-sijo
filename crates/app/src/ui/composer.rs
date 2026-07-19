@@ -1224,10 +1224,7 @@ pub enum ComposerInputPlan {
     /// Claude·일반 셸용: 단일 WriteInput.
     Single(Vec<u8>),
     /// TUI용: bracketed paste 본문과 분리된 submit CR.
-    BracketedPaste {
-        body: Vec<u8>,
-        submit: Vec<u8>,
-    },
+    BracketedPaste { body: Vec<u8>, submit: Vec<u8> },
 }
 
 /// 프로바이더/터미널 상태에 맞는 입력 계획을 만든다.
@@ -1300,18 +1297,12 @@ mod tests {
     fn tui_paste_submission은_본문과_enter를_별도_write로_나눈다() {
         assert_eq!(
             encode_tui_paste_submission("hello"),
-            Some((
-                b"\x1b[200~hello\x1b[201~".to_vec(),
-                b"\r".to_vec(),
-            )),
+            Some((b"\x1b[200~hello\x1b[201~".to_vec(), b"\r".to_vec(),)),
             "짧은 한 줄도 Codex에는 명시적 paste로 보내야 burst 판정을 피한다"
         );
         assert_eq!(
             encode_tui_paste_submission("one\ntwo"),
-            Some((
-                b"\x1b[200~one\ntwo\x1b[201~".to_vec(),
-                b"\r".to_vec(),
-            ))
+            Some((b"\x1b[200~one\ntwo\x1b[201~".to_vec(), b"\r".to_vec(),))
         );
     }
 

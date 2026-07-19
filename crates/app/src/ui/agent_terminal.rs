@@ -34,6 +34,11 @@ pub struct HomeMetrics {
     pub unread: usize,
 }
 
+pub struct NoticeTranslations<'a> {
+    pub cache: &'a crate::notice_translate::TranslationCache,
+    pub locale: &'a str,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct WorkspaceTotals {
     workspaces: usize,
@@ -79,8 +84,7 @@ impl AgentTerminalUi {
         rows: &[ActivityWorkspaceRow],
         metrics: HomeMetrics,
         feed: &StatusFeedSnapshot,
-        translations: &crate::notice_translate::TranslationCache,
-        locale: &str,
+        translations: NoticeTranslations<'_>,
         catalog: &i18n::Catalog,
     ) -> Option<HomeAction> {
         let totals = workspace_totals(rows);
@@ -93,7 +97,13 @@ impl AgentTerminalUi {
                     .inner_margin(egui::Margin::same(22))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        if self.announcements(ui, feed, translations, locale, catalog) {
+                        if self.announcements(
+                            ui,
+                            feed,
+                            translations.cache,
+                            translations.locale,
+                            catalog,
+                        ) {
                             action = Some(HomeAction::RefreshNotices);
                         }
                         ui.add_space(14.0);

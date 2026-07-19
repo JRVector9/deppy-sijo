@@ -1334,13 +1334,12 @@ pub struct App {
     /// 전환으로 background 정리 중인 옛 워커 shutdown 스레드들 (workspace_id, handle).
     /// 앱 종료 시 join(자식 reap 보장) + 같은 workspace 재오픈 전 직렬화(layout 경합 방지).
     pending_shutdowns: Vec<(String, std::thread::JoinHandle<()>)>,
-    /// 사이드바 「워크스페이스 종료」로 숨긴 워크스페이스 → 종료 시점에 닫히던 pane id들.
+    /// 사이드바 「워크스페이스 종료」로 숨긴 워크스페이스의 실행 중 상태.
     /// 종료 ≠ 삭제(DB·경로·별칭 보존) — 사이드바 목록에서만 감춘다(2026-07-18 사용자 요구).
-    /// 숨김 ID는 config에도 영속화하고, 값의 pane 집합만 현재 프로세스에서 사용한다.
-    /// 값의 pane 집합은 활성 종료 직후 몇 프레임 동안 mux에 남는 "죽어가는 pane"을 새
-    /// 세션과 구분하는 기준 — 기록에 없는 pane이 활성에 나타나면(새 셸/에이전트) 숨김을
-    /// 해제해 목록에 복귀시킨다. 명시적 전환(switch_workspace)·같은 폴더 재선택도 해제.
-    closed_workspaces: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// 영속 복원된 숨김은 stale layout pane만으로 자동 해제하면 안 된다. 현재 프로세스에서
+    /// 막 닫는 활성 workspace만 closing pane 집합을 보유하고, 그 집합에 없는 새 pane이
+    /// 생겼을 때만 자동 복귀한다. 명시적 전환/같은 폴더 재선택은 양쪽 상태를 모두 해제한다.
+    closed_workspaces: std::collections::HashMap<String, ClosedWorkspaceState>,
     /// remote TLS 서버 (켜져 있을 때만 Some). 활성 workspace worker와 별개의 전용 worker를 노출.
     remote: Option<RemoteTlsState>,
     /// remote 시작 실패 시 settings에 표시할 에러 (best-effort — 앱은 계속, 크래시 금지).
@@ -1447,11 +1446,38 @@ fn apply_agent_persistence_batch(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClosedWorkspaceState {
+    /// config에서 복원했거나 비활성/warm 상태에서 종료해 자동 재노출하면 안 되는 숨김.
+    Persisted,
+    /// 현재 프로세스에서 활성 pane을 닫는 중. 이 집합에 없는 pane만 명시적인 새 세션이다.
+    ClosingPanes(std::collections::HashSet<String>),
+}
+
+impl ClosedWorkspaceState {
+    fn should_auto_reveal<'a>(&self, pane_ids: impl IntoIterator<Item = &'a str>) -> bool {
+        match self {
+            Self::Persisted => false,
+            Self::ClosingPanes(closing) => pane_ids.into_iter().any(|pane| !closing.contains(pane)),
+        }
+    }
+}
+
 fn workspace_visible_after_close(
-    closed: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+    closed: &std::collections::HashMap<String, ClosedWorkspaceState>,
     workspace_id: &str,
 ) -> bool {
     !closed.contains_key(workspace_id)
+}
+
+fn clear_closed_workspace_state(
+    closed: &mut std::collections::HashMap<String, ClosedWorkspaceState>,
+    persisted: &mut std::collections::BTreeSet<String>,
+    workspace_id: &str,
+) -> bool {
+    let runtime_removed = closed.remove(workspace_id).is_some();
+    let persisted_removed = persisted.remove(workspace_id);
+    runtime_removed || persisted_removed
 }
 
 impl App {
@@ -1607,11 +1633,11 @@ impl App {
             db,
             secret_store: KeyringSecretStore,
             agents_ui: ui::agents::AgentsUi::new(),
-            agent_sessions_ui: ui::agent_sessions::AgentSessionsUi::new().with_api_key_store(
-                Arc::new(AppCodexLlmApiKeyStore {
+            agent_sessions_ui: ui::agent_sessions::AgentSessionsUi::new()
+                .with_catalog(&i18n)
+                .with_api_key_store(Arc::new(AppCodexLlmApiKeyStore {
                     secret_store: KeyringSecretStore,
-                }),
-            ),
+                })),
             diff_panel_ui: ui::diff_panel::DiffPanelUi::new(),
             agent_persistence_queue: Vec::new(),
             agent_persistence_retry_at: None,
@@ -1687,7 +1713,7 @@ impl App {
             pending_shutdowns: Vec::new(),
             closed_workspaces: persisted_closed_workspaces
                 .into_iter()
-                .map(|workspace_id| (workspace_id, std::collections::HashSet::new()))
+                .map(|workspace_id| (workspace_id, ClosedWorkspaceState::Persisted))
                 .collect(),
             remote: None,
             remote_error: None,
@@ -3133,6 +3159,9 @@ impl App {
     fn handle_agent_sessions_request(&mut self, request: ui::agent_sessions::AgentSessionsRequest) {
         use crate::agent_surface::AgentSurfaceId;
         match request {
+            ui::agent_sessions::AgentSessionsRequest::RevealWorkspace(workspace_id) => {
+                self.reveal_closed_workspace(&workspace_id);
+            }
             ui::agent_sessions::AgentSessionsRequest::FocusPty(AgentSurfaceId::Pty {
                 workspace_id,
                 pane_id,
@@ -3238,10 +3267,13 @@ impl App {
                 self.refresh_workspaces();
             }
             A::OpenAgents => self.handle_agent_shortcut(action, ctx),
-            A::NewShell => self.active.workspace_ui.spawn_shell(
-                &self.active.runtime,
-                self.config.terminal.scrollback_lines as usize,
-            ),
+            A::NewShell => {
+                self.reveal_active_workspace_for_new_session();
+                self.active.workspace_ui.spawn_shell(
+                    &self.active.runtime,
+                    self.config.terminal.scrollback_lines as usize,
+                );
+            }
             A::ClosePane => self
                 .active
                 .workspace_ui
@@ -3259,6 +3291,7 @@ impl App {
                 .workspace_ui
                 .scroll_focused_to_prompt(&self.active.runtime, 1),
             A::SplitVertical | A::SplitHorizontal => {
+                self.reveal_active_workspace_for_new_session();
                 let direction = if action == A::SplitVertical {
                     runtime::SplitDirection::Vertical
                 } else {
@@ -3556,7 +3589,9 @@ impl App {
             // "죽어가는 pane"과 이후의 진짜 새 세션(숨김 해제 조건)을 구분한다.
             self.closed_workspaces.insert(
                 workspace_id.to_owned(),
-                panes.iter().map(|pane| pane.0.clone()).collect(),
+                ClosedWorkspaceState::ClosingPanes(
+                    panes.iter().map(|pane| pane.0.clone()).collect(),
+                ),
             );
             for pane in panes {
                 self.active
@@ -3566,7 +3601,7 @@ impl App {
         } else if self.warm.contains_key(workspace_id) {
             // warm 종료는 runtime shutdown까지 동기로 끝난다 — 죽어가는 pane 추적 불필요.
             self.closed_workspaces
-                .insert(workspace_id.to_owned(), std::collections::HashSet::new());
+                .insert(workspace_id.to_owned(), ClosedWorkspaceState::Persisted);
             // warm: 살아 있는 워커에 ClosePane을 모두 보낸 뒤 runtime을 내린다(idle 전환,
             // 프로젝트 삭제의 warm 종료 경로와 같은 순서). worker 루프는 shutdown 판정
             // 전에 큐 명령을 전부 소화하므로 pane 정리(persist layout 갱신)가 종료 전에
@@ -3609,7 +3644,7 @@ impl App {
             // 지나가지 않고 로그로 남긴다(닫을 세션이 없으니 실행할 것도 없다).
             // 사용자가 종료를 확정했으므로 숨김 표식은 동일하게 남긴다.
             self.closed_workspaces
-                .insert(workspace_id.to_owned(), std::collections::HashSet::new());
+                .insert(workspace_id.to_owned(), ClosedWorkspaceState::Persisted);
             tracing::info!(
                 workspace = %workspace_id,
                 "워크스페이스 종료 생략 — 이미 비활성(세션 없음)"
@@ -3631,9 +3666,11 @@ impl App {
     /// 종료 숨김을 해제하고 config에도 즉시 반영한다. 같은 활성 워크스페이스 재선택처럼
     /// switch의 나머지 저장 경로를 타지 않는 경우도 있어 이 함수가 직접 저장한다.
     fn reveal_closed_workspace(&mut self, workspace_id: &str) -> bool {
-        let runtime_removed = self.closed_workspaces.remove(workspace_id).is_some();
-        let config_removed = self.config.ui.closed_workspace_ids.remove(workspace_id);
-        let changed = runtime_removed || config_removed;
+        let changed = clear_closed_workspace_state(
+            &mut self.closed_workspaces,
+            &mut self.config.ui.closed_workspace_ids,
+            workspace_id,
+        );
         if changed {
             self.activity_rows_cache = None;
             if let Err(error) = self.config.save(&self.config_path) {
@@ -3641,6 +3678,11 @@ impl App {
             }
         }
         changed
+    }
+
+    fn reveal_active_workspace_for_new_session(&mut self) {
+        let workspace_id = self.active.id.clone();
+        self.reveal_closed_workspace(&workspace_id);
     }
 
     /// 활성 workspace의 `.env`를 환경 profile로 동기화하고, 그 env를 워커 기본 env로
@@ -5762,10 +5804,13 @@ impl eframe::App for App {
         // 종료 숨김 해제 — 종료 때 닫히던 pane이 아닌 **새** 세션이 활성에 나타나면
         // (새 셸/에이전트) 목록에 복귀시킨다. 종료 직후 exit 이벤트를 기다리는 옛
         // pane은 기록된 집합에 있어 해제 조건에 걸리지 않는다.
-        if let Some(closing) = self.closed_workspaces.get(&active_workspace_id)
-            && terminal_sessions
-                .iter()
-                .any(|entry| !closing.contains(&entry.pane.0))
+        if self
+            .closed_workspaces
+            .get(&active_workspace_id)
+            .is_some_and(|state| {
+                state
+                    .should_auto_reveal(terminal_sessions.iter().map(|entry| entry.pane.0.as_str()))
+            })
         {
             self.reveal_closed_workspace(&active_workspace_id);
         }
@@ -6189,6 +6234,7 @@ impl eframe::App for App {
                 // 같은 폴더에서 새 셸 — cwd 미확인이면 일반 새 셸로 폴백.
                 Some(ui::file_tree::SidebarAction::NewShellSameFolder { session }) => {
                     let cwd = self.session_cwd_lookup(session);
+                    self.reveal_active_workspace_for_new_session();
                     self.active.workspace_ui.spawn_shell_at(
                         &self.active.runtime,
                         self.config.terminal.scrollback_lines as usize,
@@ -6275,6 +6321,7 @@ impl eframe::App for App {
                     Ok(Ok(path)) => {
                         self.worktree_rx = None;
                         if decision == crate::worktree::SpawnDecision::Spawn {
+                            self.reveal_active_workspace_for_new_session();
                             self.active.workspace_ui.spawn_shell_at(
                                 &self.active.runtime,
                                 self.config.terminal.scrollback_lines as usize,
@@ -6474,8 +6521,10 @@ impl eframe::App for App {
                             unread: self.notifications_ui.unread(),
                         },
                         &self.status_feed,
-                        &self.notice_translation_cache,
-                        &self.config.i18n.locale,
+                        ui::agent_terminal::NoticeTranslations {
+                            cache: &self.notice_translation_cache,
+                            locale: &self.config.i18n.locale,
+                        },
                         &text,
                     );
                 } else if inbox_visible {
@@ -6531,6 +6580,7 @@ impl eframe::App for App {
         let active_workspace_id = self.active.id.clone();
         // Agents 창의 LLM 프로바이더 설정은 config 소유(App) — 창이 바꾸면 저장한다 (PR-L2).
         let agents_config_before = self.config.agents.clone();
+        self.agent_sessions_ui.set_catalog(&text);
         let agent_requests = self.agent_sessions_ui.show(
             ui.ctx(),
             &active_workspace_id,
@@ -7080,6 +7130,7 @@ impl eframe::App for App {
         let mut workspace_rename: Option<String> = None;
         let mut env_action: Option<ui::env_profiles::EnvAction> = None;
         let mut credentials_changed = false;
+        let mut legacy_agent_started = false;
         // .env 라이브 반영 토글(E5 ⑨) — 클로저 안에서 편집하고 밖에서 저장/적용.
         let mut env_live_reload_toggle = self.config.ui.env_live_reload;
         // #3 워크스페이스 이름 편집 캡처 (클로저 밖에서 db/refresh 처리 — self 전체 &mut).
@@ -7390,7 +7441,7 @@ impl eframe::App for App {
                         }
                     }
                     C::Agents => {
-                        self.agents_ui.contents(
+                        legacy_agent_started |= self.agents_ui.contents(
                             ui,
                             &self.db,
                             &wsid,
@@ -7446,6 +7497,9 @@ impl eframe::App for App {
         // T1: 설정 창이 닫히면 세션 폴더 배너를 버린다 — 다음 우클릭 진입에서 재감지.
         if !self.settings_open {
             self.env_session_banner = None;
+        }
+        if legacy_agent_started {
+            self.reveal_active_workspace_for_new_session();
         }
         // 관리/모니터 액션 처리 (클로저 밖 — self 전체 &mut 필요한 것들)
         if env_live_reload_toggle != self.config.ui.env_live_reload {
@@ -7731,6 +7785,7 @@ impl eframe::App for App {
             self.config.i18n.locale = i18n::normalize_locale(&self.config.i18n.locale);
             if self.i18n.locale() != self.config.i18n.locale {
                 self.i18n = load_catalog(&self.config.i18n.locale);
+                self.agent_sessions_ui.set_catalog(&self.i18n);
             }
             // hot reload: 테마는 즉시 적용 (터미널 캐시 clear는 ui() 상단의 실효 테마
             // 감지가 다음 프레임에 처리 — System 전환까지 한 경로로 커버).
@@ -9460,9 +9515,42 @@ h:1 EE:FF
     #[test]
     fn 종료한_워크스페이스는_사이드바와_홈의_공통_visible_set에서_빠진다() {
         let mut closed = std::collections::HashMap::new();
-        closed.insert("closed".to_owned(), std::collections::HashSet::new());
+        closed.insert("closed".to_owned(), ClosedWorkspaceState::Persisted);
 
         assert!(!workspace_visible_after_close(&closed, "closed"));
         assert!(workspace_visible_after_close(&closed, "open"));
+    }
+
+    #[test]
+    fn 영속_종료는_stale_pane으로_재노출되지_않고_현재종료만_새_pane을_인식한다() {
+        let persisted = ClosedWorkspaceState::Persisted;
+        assert!(!persisted.should_auto_reveal(["stale-pane"]));
+
+        let closing =
+            ClosedWorkspaceState::ClosingPanes(["closing-pane".to_owned()].into_iter().collect());
+        assert!(!closing.should_auto_reveal(["closing-pane"]));
+        assert!(closing.should_auto_reveal(["closing-pane", "new-pane"]));
+    }
+
+    #[test]
+    fn 사용자_세션_시작은_영속_종료_표식을_메모리와_config에서_함께_해제한다() {
+        let mut closed = std::collections::HashMap::from([(
+            "closed".to_owned(),
+            ClosedWorkspaceState::Persisted,
+        )]);
+        let mut persisted = std::collections::BTreeSet::from(["closed".to_owned()]);
+
+        assert!(clear_closed_workspace_state(
+            &mut closed,
+            &mut persisted,
+            "closed"
+        ));
+        assert!(!closed.contains_key("closed"));
+        assert!(!persisted.contains("closed"));
+        assert!(!clear_closed_workspace_state(
+            &mut closed,
+            &mut persisted,
+            "closed"
+        ));
     }
 }

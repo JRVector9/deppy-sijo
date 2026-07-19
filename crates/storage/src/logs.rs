@@ -30,10 +30,21 @@ struct BoundedLogFile {
     file: File,
     path: PathBuf,
     max_bytes: u64,
+    tail_boundary: TailBoundary,
+}
+
+#[derive(Clone, Copy)]
+enum TailBoundary {
+    /// ANSI는 line-oriented 데이터가 아니다. CR/CSI만으로 그리는 TUI의 tail도 보존하되
+    /// UTF-8 문자나 CSI/OSC/string escape 한가운데서는 시작하지 않는다.
+    Ansi,
+    /// 사람이 읽는 text/JSONL은 가능하면 첫 완전한 LF 뒤에서 시작한다. LF가 전혀 없는
+    /// 구간은 전량 삭제하지 않고 그대로 보존해 pathological giant line의 데이터 손실을 막는다.
+    NextNewlineIfPresent,
 }
 
 impl BoundedLogFile {
-    fn open(path: &Path, max_bytes: u64) -> anyhow::Result<Self> {
+    fn open(path: &Path, max_bytes: u64, tail_boundary: TailBoundary) -> anyhow::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -44,6 +55,7 @@ impl BoundedLogFile {
             file,
             path: path.to_path_buf(),
             max_bytes,
+            tail_boundary,
         };
         bounded.compact_if_oversized(max_bytes / 2)?;
         Ok(bounded)
@@ -58,31 +70,35 @@ impl BoundedLogFile {
             return Ok(());
         }
         let incoming = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if incoming >= self.max_bytes {
+            // giant chunk 자체가 이전 chunk의 UTF-8/ANSI sequence를 이어갈 수 있으므로
+            // 임의 slice를 먼저 만들지 않는다. 전체 stream을 append한 다음 시작부터
+            // parser state를 계산해 안전한 최근 tail로 줄인다.
+            self.file
+                .write_all(bytes)
+                .with_context(|| format!("로그 기록 실패: {}", self.path.display()))?;
+            compact_open_file_to_tail(&mut self.file, self.max_bytes, self.tail_boundary)
+                .with_context(|| format!("로그 tail 압축 실패: {}", self.path.display()))?;
+            return Ok(());
+        }
         let current = self.len().unwrap_or(0);
         if current.saturating_add(incoming) > self.max_bytes {
             let retain = self
                 .max_bytes
                 .saturating_sub(incoming)
                 .min(self.max_bytes / 2);
-            compact_open_file_to_tail(&mut self.file, retain)
+            compact_open_file_to_tail(&mut self.file, retain, self.tail_boundary)
                 .with_context(|| format!("로그 tail 압축 실패: {}", self.path.display()))?;
         }
-        if incoming >= self.max_bytes {
-            let start = bytes.len().saturating_sub(self.max_bytes as usize);
-            self.file
-                .write_all(&bytes[start..])
-                .with_context(|| format!("로그 기록 실패: {}", self.path.display()))?;
-        } else {
-            self.file
-                .write_all(bytes)
-                .with_context(|| format!("로그 기록 실패: {}", self.path.display()))?;
-        }
+        self.file
+            .write_all(bytes)
+            .with_context(|| format!("로그 기록 실패: {}", self.path.display()))?;
         Ok(())
     }
 
     fn compact_if_oversized(&mut self, retain_bytes: u64) -> anyhow::Result<()> {
         if self.len().unwrap_or(0) > self.max_bytes {
-            compact_open_file_to_tail(&mut self.file, retain_bytes)
+            compact_open_file_to_tail(&mut self.file, retain_bytes, self.tail_boundary)
                 .with_context(|| format!("기존 로그 tail 압축 실패: {}", self.path.display()))?;
         }
         Ok(())
@@ -115,9 +131,21 @@ impl SessionLogWriter {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("로그 디렉터리 생성 실패: {}", dir.display()))?;
         Ok(Self {
-            ansi: BoundedLogFile::open(&dir.join(ANSI_LOG_FILE), ANSI_LOG_MAX_BYTES)?,
-            plain: BoundedLogFile::open(&dir.join(PLAIN_LOG_FILE), PLAIN_LOG_MAX_BYTES)?,
-            events: BoundedLogFile::open(&dir.join(EVENTS_LOG_FILE), EVENTS_LOG_MAX_BYTES)?,
+            ansi: BoundedLogFile::open(
+                &dir.join(ANSI_LOG_FILE),
+                ANSI_LOG_MAX_BYTES,
+                TailBoundary::Ansi,
+            )?,
+            plain: BoundedLogFile::open(
+                &dir.join(PLAIN_LOG_FILE),
+                PLAIN_LOG_MAX_BYTES,
+                TailBoundary::NextNewlineIfPresent,
+            )?,
+            events: BoundedLogFile::open(
+                &dir.join(EVENTS_LOG_FILE),
+                EVENTS_LOG_MAX_BYTES,
+                TailBoundary::NextNewlineIfPresent,
+            )?,
             strip_state: StripState::default(),
         })
     }
@@ -241,9 +269,13 @@ impl SessionLogWriter {
 }
 
 /// 열린 파일의 끝 `retain_bytes`만 같은 inode에 다시 쓴다. writer handle을 교체/rename하지
-/// 않으므로 런타임이 계속 가진 append handle에도 즉시 적용된다. 첫 불완전 줄은 버려 ANSI
-/// escape·UTF-8·JSONL 중간에서 재생/미리보기가 시작될 가능성을 줄인다.
-fn compact_open_file_to_tail(file: &mut File, retain_bytes: u64) -> std::io::Result<u64> {
+/// 않으므로 런타임이 계속 가진 append handle에도 즉시 적용된다. text/JSONL은 LF가 있으면
+/// 첫 완전한 줄로 정렬하고, line-oriented가 아닌 ANSI는 UTF-8/escape 경계에 맞춘다.
+fn compact_open_file_to_tail(
+    file: &mut File,
+    retain_bytes: u64,
+    tail_boundary: TailBoundary,
+) -> std::io::Result<u64> {
     file.flush()?;
     let len = file.metadata()?.len();
     if len <= retain_bytes {
@@ -253,21 +285,165 @@ fn compact_open_file_to_tail(file: &mut File, retain_bytes: u64) -> std::io::Res
         file.set_len(0)?;
         return Ok(0);
     }
-    let start = len.saturating_sub(retain_bytes);
+    let mut start = len.saturating_sub(retain_bytes);
+    if matches!(tail_boundary, TailBoundary::Ansi) {
+        start = seek_ansi_tail_boundary(file, start, false)?;
+    }
     file.seek(std::io::SeekFrom::Start(start))?;
     let mut tail = Vec::with_capacity(usize::try_from(len - start).unwrap_or(0));
     file.read_to_end(&mut tail)?;
-    if start > 0 {
-        if let Some(newline) = tail.iter().position(|byte| *byte == b'\n') {
-            tail.drain(..=newline);
-        } else {
-            tail.clear();
-        }
+    if start > 0
+        && matches!(tail_boundary, TailBoundary::NextNewlineIfPresent)
+        && let Some(newline) = tail.iter().position(|byte| *byte == b'\n')
+    {
+        tail.drain(..=newline);
+    } else if start > 0 && matches!(tail_boundary, TailBoundary::NextNewlineIfPresent) {
+        let continuation_bytes = tail.iter().take_while(|byte| **byte & 0xc0 == 0x80).count();
+        tail.drain(..continuation_bytes);
     }
     file.set_len(0)?;
     file.write_all(&tail)?;
     file.flush()?;
     Ok(tail.len() as u64)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum AnsiBoundaryPhase {
+    #[default]
+    Ground,
+    Escape,
+    EscapeIntermediate,
+    Csi,
+    Osc,
+    OscEscape,
+    String,
+    StringEscape,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AnsiBoundaryScanner {
+    phase: AnsiBoundaryPhase,
+    utf8_remaining: u8,
+}
+
+impl AnsiBoundaryScanner {
+    fn at_boundary(self) -> bool {
+        self.phase == AnsiBoundaryPhase::Ground && self.utf8_remaining == 0
+    }
+
+    fn advance(&mut self, byte: u8) {
+        use AnsiBoundaryPhase as Phase;
+
+        match self.phase {
+            Phase::Ground if self.utf8_remaining > 0 => {
+                if byte & 0xc0 == 0x80 {
+                    self.utf8_remaining -= 1;
+                    return;
+                }
+                // 손상 UTF-8은 현재 바이트에서 다시 동기화한다.
+                self.utf8_remaining = 0;
+                self.advance(byte);
+            }
+            Phase::Ground => match byte {
+                0x1b => self.phase = Phase::Escape,
+                0xc2..=0xdf => self.utf8_remaining = 1,
+                0xe0..=0xef => self.utf8_remaining = 2,
+                0xf0..=0xf4 => self.utf8_remaining = 3,
+                _ => {}
+            },
+            Phase::Escape => match byte {
+                b'[' => self.phase = Phase::Csi,
+                b']' => self.phase = Phase::Osc,
+                b'P' | b'X' | b'^' | b'_' => self.phase = Phase::String,
+                0x20..=0x2f => self.phase = Phase::EscapeIntermediate,
+                0x1b => {}
+                _ => self.phase = Phase::Ground,
+            },
+            Phase::EscapeIntermediate => match byte {
+                0x30..=0x7e => self.phase = Phase::Ground,
+                0x1b => self.phase = Phase::Escape,
+                _ => {}
+            },
+            Phase::Csi => match byte {
+                0x40..=0x7e | 0x18 | 0x1a => self.phase = Phase::Ground,
+                0x1b => self.phase = Phase::Escape,
+                _ => {}
+            },
+            Phase::Osc => match byte {
+                0x07 | 0x18 | 0x1a => self.phase = Phase::Ground,
+                0x1b => self.phase = Phase::OscEscape,
+                _ => {}
+            },
+            Phase::OscEscape => {
+                self.phase = if byte == b'\\' {
+                    Phase::Ground
+                } else if byte == 0x1b {
+                    Phase::OscEscape
+                } else {
+                    Phase::Osc
+                };
+            }
+            Phase::String => match byte {
+                0x18 | 0x1a => self.phase = Phase::Ground,
+                0x1b => self.phase = Phase::StringEscape,
+                _ => {}
+            },
+            Phase::StringEscape => {
+                self.phase = if byte == b'\\' {
+                    Phase::Ground
+                } else if byte == 0x1b {
+                    Phase::StringEscape
+                } else {
+                    Phase::String
+                };
+            }
+        }
+    }
+}
+
+/// `requested_start` 이후에서 UTF-8 문자와 ANSI control string이 모두 끝난 첫 경계를
+/// 찾는다. `prefer_newline`이면 ground-state LF 뒤를 우선하고, LF가 없는 TUI stream은
+/// 첫 안전 경계를 사용한다. 시작부터 상태만 streaming scan하므로 파일 전체를 메모리에
+/// 올리지 않는다.
+pub fn seek_ansi_tail_boundary(
+    file: &mut File,
+    requested_start: u64,
+    prefer_newline: bool,
+) -> std::io::Result<u64> {
+    let len = file.metadata()?.len();
+    let requested_start = requested_start.min(len);
+    file.seek(std::io::SeekFrom::Start(0))?;
+
+    let mut scanner = AnsiBoundaryScanner::default();
+    let mut first_safe = (requested_start == 0).then_some(0);
+    let mut position = 0u64;
+    let mut buffer = [0u8; 8192];
+    while position < len {
+        let remaining = usize::try_from((len - position).min(buffer.len() as u64)).unwrap_or(0);
+        let read = file.read(&mut buffer[..remaining])?;
+        if read == 0 {
+            break;
+        }
+        for &byte in &buffer[..read] {
+            if position >= requested_start && first_safe.is_none() && scanner.at_boundary() {
+                first_safe = Some(position);
+            }
+            let was_ground = scanner.at_boundary();
+            scanner.advance(byte);
+            position += 1;
+            if position >= requested_start && scanner.at_boundary() {
+                first_safe.get_or_insert(position);
+                if prefer_newline && was_ground && byte == b'\n' {
+                    file.seek(std::io::SeekFrom::Start(position))?;
+                    return Ok(position);
+                }
+            }
+        }
+    }
+
+    let start = first_safe.unwrap_or(len);
+    file.seek(std::io::SeekFrom::Start(start))?;
+    Ok(start)
 }
 
 struct SessionLogBundle {
@@ -348,7 +524,7 @@ fn collect_session_log_bundles(logs_root: &Path) -> anyhow::Result<Vec<SessionLo
                 continue;
             }
             let name = entry.file_name();
-            let Some((max_bytes, retain_bytes)) = log_limits_for_name(&name) else {
+            let Some((max_bytes, retain_bytes, tail_boundary)) = log_limits_for_name(&name) else {
                 continue;
             };
             let path = entry.path();
@@ -357,9 +533,9 @@ fn collect_session_log_bundles(logs_root: &Path) -> anyhow::Result<Vec<SessionLo
                 .with_context(|| format!("세션 로그 metadata 실패: {}", path.display()))?;
             if original.len() > max_bytes {
                 let mut file = OpenOptions::new().read(true).append(true).open(&path)?;
-                compact_open_file_to_tail(&mut file, retain_bytes).with_context(|| {
-                    format!("기존 세션 로그 상한 적용 실패: {}", path.display())
-                })?;
+                compact_open_file_to_tail(&mut file, retain_bytes, tail_boundary).with_context(
+                    || format!("기존 세션 로그 상한 적용 실패: {}", path.display()),
+                )?;
             }
             let len = path_len_or_zero(&path);
             let bundle = by_dir.entry(dir.clone()).or_default();
@@ -372,11 +548,23 @@ fn collect_session_log_bundles(logs_root: &Path) -> anyhow::Result<Vec<SessionLo
     Ok(by_dir.into_values().collect())
 }
 
-fn log_limits_for_name(name: &std::ffi::OsStr) -> Option<(u64, u64)> {
+fn log_limits_for_name(name: &std::ffi::OsStr) -> Option<(u64, u64, TailBoundary)> {
     match name.to_str()? {
-        ANSI_LOG_FILE => Some((ANSI_LOG_MAX_BYTES, ANSI_LOG_MAX_BYTES / 2)),
-        PLAIN_LOG_FILE => Some((PLAIN_LOG_MAX_BYTES, PLAIN_LOG_MAX_BYTES / 2)),
-        EVENTS_LOG_FILE => Some((EVENTS_LOG_MAX_BYTES, EVENTS_LOG_MAX_BYTES / 2)),
+        ANSI_LOG_FILE => Some((
+            ANSI_LOG_MAX_BYTES,
+            ANSI_LOG_MAX_BYTES / 2,
+            TailBoundary::Ansi,
+        )),
+        PLAIN_LOG_FILE => Some((
+            PLAIN_LOG_MAX_BYTES,
+            PLAIN_LOG_MAX_BYTES / 2,
+            TailBoundary::NextNewlineIfPresent,
+        )),
+        EVENTS_LOG_FILE => Some((
+            EVENTS_LOG_MAX_BYTES,
+            EVENTS_LOG_MAX_BYTES / 2,
+            TailBoundary::NextNewlineIfPresent,
+        )),
         _ => None,
     }
 }
@@ -622,7 +810,7 @@ mod tests {
     fn bounded_log는_상한을_넘으면_최근_완전한_줄만_남긴다() {
         let root = temp_root("bounded-tail");
         let path = root.join("bounded.log");
-        let mut log = BoundedLogFile::open(&path, 64).unwrap();
+        let mut log = BoundedLogFile::open(&path, 64, TailBoundary::NextNewlineIfPresent).unwrap();
         for index in 0..12 {
             log.append(format!("line-{index:02}-payload\n").as_bytes())
                 .unwrap();
@@ -635,6 +823,57 @@ mod tests {
         assert!(bytes.ends_with(b"line-11-payload\n"));
         assert!(!bytes.windows(7).any(|window| window == b"line-00"));
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn ansi_bounded_log는_lf가_없어도_최근_tail을_보존한다() {
+        let root = temp_root("bounded-ansi-no-lf");
+        let path = root.join("bounded.log");
+        let mut log = BoundedLogFile::open(&path, 64, TailBoundary::Ansi).unwrap();
+        log.append(&[b'a'; 48]).unwrap();
+        log.append(&[b'b'; 48]).unwrap();
+        log.flush();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 64);
+        assert_eq!(&bytes[..16], &[b'a'; 16]);
+        assert_eq!(&bytes[16..], &[b'b'; 48]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn ansi_tail은_csi_osc와_utf8_중간에서_시작하지_않는다() {
+        fn compact(data: &[u8], requested_start: usize) -> Vec<u8> {
+            let root = temp_root("ansi-safe-boundary");
+            let path = root.join(format!("{}.log", requested_start));
+            std::fs::write(&path, data).unwrap();
+            let mut file = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            compact_open_file_to_tail(
+                &mut file,
+                (data.len() - requested_start) as u64,
+                TailBoundary::Ansi,
+            )
+            .unwrap();
+            let result = std::fs::read(&path).unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+            result
+        }
+
+        let csi = b"prefix\x1b[38;2;12;34;56mVISIBLE";
+        assert_eq!(compact(csi, 10), b"VISIBLE");
+
+        let osc = b"prefix\x1b]0;window title\x07BODY";
+        assert_eq!(compact(osc, 12), b"BODY");
+
+        let utf8 = "prefix한글-tail".as_bytes();
+        assert_eq!(
+            std::str::from_utf8(&compact(utf8, "prefix".len() + 1)).unwrap(),
+            "글-tail"
+        );
     }
 
     #[test]

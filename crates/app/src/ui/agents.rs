@@ -112,7 +112,8 @@ impl AgentsUi {
         client: &dyn RuntimeClient,
         db_path: &Path,
         catalog: &i18n::Catalog,
-    ) {
+    ) -> bool {
+        let mut launched = false;
         let list = match &self.cached {
             Some(list) => list.clone(),
             None => match db.list_agent_configs() {
@@ -125,7 +126,7 @@ impl AgentsUi {
                         ui.visuals().error_fg_color,
                         catalog.t("common.list_failed", &[("message", &format!("{e:#}"))]),
                     );
-                    return;
+                    return false;
                 }
             },
         };
@@ -208,7 +209,7 @@ impl AgentsUi {
             });
         }
         if let Some((agent, profile_id)) = run_config {
-            self.launch_agent(
+            launched |= self.launch_agent(
                 ui.ctx(),
                 db,
                 config,
@@ -347,7 +348,7 @@ impl AgentsUi {
                 .collect();
             if let Err(e) = Db::validate_agent_args_for_persistence(&args) {
                 self.error = Some(format!("{e:#}"));
-                return;
+                return launched;
             }
             let opt = |s: &str| {
                 let t = s.trim();
@@ -366,7 +367,7 @@ impl AgentsUi {
                     && let Err(e) = regex::Regex::new(trimmed)
                 {
                     self.error = Some(format!("{kind} regex 오류: {e}"));
-                    return;
+                    return launched;
                 }
             }
             // 플래그는 proxy 경유를 켰을 때만 저장 — trim 후 None/Some (빈값은 DB에서 None 정규화).
@@ -411,7 +412,7 @@ impl AgentsUi {
         if let Some(error) = &self.error {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
-        self.production_confirm_window(
+        launched |= self.production_confirm_window(
             ui.ctx(),
             db,
             config,
@@ -420,6 +421,7 @@ impl AgentsUi {
             db_path,
             catalog,
         );
+        launched
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -432,9 +434,9 @@ impl AgentsUi {
         workspace_id: &str,
         db_path: &Path,
         catalog: &i18n::Catalog,
-    ) {
+    ) -> bool {
         let Some(pending) = self.pending_production_run.clone() else {
-            return;
+            return false;
         };
         let mut action = ProductionConfirmAction::None;
         egui::Window::new(catalog.t("agents.production_confirm_title", &[]))
@@ -459,9 +461,10 @@ impl AgentsUi {
                 });
             });
         match action {
-            ProductionConfirmAction::None => {}
+            ProductionConfirmAction::None => false,
             ProductionConfirmAction::Cancel => {
                 self.pending_production_run = None;
+                false
             }
             ProductionConfirmAction::Run => {
                 self.pending_production_run = None;
@@ -474,7 +477,7 @@ impl AgentsUi {
                     workspace_id,
                     db_path,
                     Some(pending.profile_id.as_str()),
-                );
+                )
             }
         }
     }
@@ -490,13 +493,15 @@ impl AgentsUi {
         workspace_id: &str,
         db_path: &Path,
         profile_id: Option<&str>,
-    ) {
+    ) -> bool {
         if let Err(e) = self.run(db, config, client, agent, workspace_id, db_path, profile_id) {
             self.error = Some(format!("{e:#}"));
+            false
         } else {
             self.error = None;
             self.pending_launches += 1;
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            true
         }
     }
 

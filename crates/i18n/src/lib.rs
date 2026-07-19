@@ -124,6 +124,33 @@ mod tests {
     }
 
     #[test]
+    fn all_bundled_locales_match_fallback_order_and_placeholders() {
+        let fallback_source = locale_source(FALLBACK_LOCALE).unwrap();
+        let fallback = parse_locale_file(FALLBACK_LOCALE, fallback_source).unwrap();
+        let fallback_order = locale_key_order(fallback_source);
+        for locale in REQUIRED_LOCALES.iter().chain(OPTIONAL_LOCALES.iter()) {
+            let source = locale_source(locale).unwrap();
+            let entries = parse_locale_file(locale, source).unwrap();
+            assert_eq!(
+                locale_key_order(source),
+                fallback_order,
+                "{locale} key order"
+            );
+            assert_eq!(
+                entries.keys().collect::<Vec<_>>(),
+                fallback.keys().collect::<Vec<_>>()
+            );
+            for (key, fallback_value) in &fallback {
+                assert_eq!(
+                    placeholders(entries.get(key).unwrap()),
+                    placeholders(fallback_value),
+                    "{locale} placeholder mismatch for {key}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn fallback_locale_normalizes_unknown_locale() {
         assert_eq!(normalize_locale("xx-YY"), FALLBACK_LOCALE);
     }
@@ -200,5 +227,32 @@ mod tests {
         text.chars()
             .map(|ch| if ch.is_ascii() { 1 } else { 2 })
             .sum()
+    }
+
+    fn locale_key_order(source: &str) -> Vec<&str> {
+        source
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                (!line.is_empty() && !line.starts_with('#'))
+                    .then(|| line.split_once('=').map(|(key, _)| key.trim()))
+                    .flatten()
+            })
+            .collect()
+    }
+
+    fn placeholders(value: &str) -> Vec<&str> {
+        let mut placeholders = Vec::new();
+        let mut rest = value;
+        while let Some(start) = rest.find('{') {
+            rest = &rest[start + 1..];
+            let Some(end) = rest.find('}') else {
+                break;
+            };
+            placeholders.push(&rest[..end]);
+            rest = &rest[end + 1..];
+        }
+        placeholders.sort_unstable();
+        placeholders
     }
 }

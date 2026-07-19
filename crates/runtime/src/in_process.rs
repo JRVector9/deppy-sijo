@@ -2707,36 +2707,16 @@ fn infer_zsh_terminal_cols_from_bytes(bytes: &[u8]) -> Option<u16> {
     latest
 }
 
-/// ANSI tail cutoff가 escape/UTF-8 sequence 한가운데 놓이지 않게 다음 newline 뒤로
-/// 정렬한다. newline 없는 병적 giant line은 복원하지 않는다. 어느 경우든 cutoff 이후
-/// 최대 `max_bytes`만 읽으므로 시작 지연이 로그 전체 크기에 비례하지 않는다.
+/// ANSI tail cutoff를 UTF-8/escape 경계에 맞추고 ground-state newline 뒤를 우선한다.
+/// full-screen TUI처럼 LF 없이 CR/CSI만 쓰는 구간도 안전한 다음 경계부터 복원한다.
 fn seek_ansi_replay_tail(file: &mut std::fs::File, max_bytes: u64) -> std::io::Result<u64> {
-    use std::io::{Read as _, Seek as _};
-
     let len = file.metadata()?.len();
     if len <= max_bytes {
-        file.seek(std::io::SeekFrom::Start(0))?;
+        std::io::Seek::seek(file, std::io::SeekFrom::Start(0))?;
         return Ok(0);
     }
     let cutoff = len.saturating_sub(max_bytes);
-    file.seek(std::io::SeekFrom::Start(cutoff))?;
-    let mut position = cutoff;
-    let mut buffer = [0u8; 8192];
-    while position < len {
-        let remaining = usize::try_from((len - position).min(buffer.len() as u64)).unwrap_or(0);
-        let read = file.read(&mut buffer[..remaining])?;
-        if read == 0 {
-            break;
-        }
-        if let Some(index) = buffer[..read].iter().position(|byte| *byte == b'\n') {
-            let start = position + index as u64 + 1;
-            file.seek(std::io::SeekFrom::Start(start))?;
-            return Ok(start);
-        }
-        position += read as u64;
-    }
-    file.seek(std::io::SeekFrom::Start(len))?;
-    Ok(len)
+    storage::seek_ansi_tail_boundary(file, cutoff, true)
 }
 
 /// exit 순서(오래된 것이 앞)에서 cap 초과분을 archive(backend drop) 대상으로 돌려준다
@@ -5538,13 +5518,41 @@ mod tests {
         assert_eq!(restored, recent);
         assert!(restored.len() as u64 <= recent.len() as u64 + 8);
 
-        // cutoff 뒤에도 newline이 없는 giant line은 중간 escape/text를 그리지 않고 생략.
+        // full-screen TUI처럼 LF가 없는 giant 구간도 최근 tail은 보존한다.
         std::fs::write(&path, vec![b'x'; 128]).unwrap();
         let mut file = std::fs::File::open(&path).unwrap();
-        assert_eq!(super::seek_ansi_replay_tail(&mut file, 16).unwrap(), 128);
+        assert_eq!(super::seek_ansi_replay_tail(&mut file, 16).unwrap(), 112);
         let mut restored = Vec::new();
         file.read_to_end(&mut restored).unwrap();
-        assert!(restored.is_empty());
+        assert_eq!(restored, vec![b'x'; 16]);
+
+        // LF 없는 tail의 cutoff가 CSI나 UTF-8 문자 중간이어도 안전한 다음 경계부터 읽는다.
+        let data = b"old\x1b[38;2;12;34;56mVISIBLE";
+        std::fs::write(&path, data).unwrap();
+        let requested_start = 9usize;
+        let visible_start = data
+            .windows(b"VISIBLE".len())
+            .position(|window| window == b"VISIBLE")
+            .unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        assert_eq!(
+            super::seek_ansi_replay_tail(&mut file, (data.len() - requested_start) as u64).unwrap(),
+            visible_start as u64
+        );
+        let mut restored = Vec::new();
+        file.read_to_end(&mut restored).unwrap();
+        assert_eq!(restored, b"VISIBLE");
+
+        let data = "old한글-tail".as_bytes();
+        std::fs::write(&path, data).unwrap();
+        let requested_start = "old".len() + 1;
+        let mut file = std::fs::File::open(&path).unwrap();
+        let start =
+            super::seek_ansi_replay_tail(&mut file, (data.len() - requested_start) as u64).unwrap();
+        assert_eq!(start, "old한".len() as u64);
+        let mut restored = Vec::new();
+        file.read_to_end(&mut restored).unwrap();
+        assert_eq!(std::str::from_utf8(&restored).unwrap(), "글-tail");
         std::fs::remove_file(path).ok();
     }
 

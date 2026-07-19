@@ -11,7 +11,9 @@ pub use mcp_store::PendingApprovalInsert;
 
 mod logs;
 
-pub use logs::{SESSION_LOG_DISK_BUDGET_BYTES, SessionLogWriter, gc_session_logs};
+pub use logs::{
+    SESSION_LOG_DISK_BUDGET_BYTES, SessionLogWriter, gc_session_logs, seek_ansi_tail_boundary,
+};
 
 /// 종료 세션 스크롤백 압축 아카이브 (§14.3 확장 — PR-A1)
 pub mod scrollback_archive;

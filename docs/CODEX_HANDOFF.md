@@ -2,8 +2,8 @@
 
 ## Current task
 
-- Align sidebar/Home workspace visibility and improve session status/activity rows from the 2026-07-19 screenshots.
-- Status: persistent workspace-close state, no-session summary, and last-agent activity text implemented, tested, packaged, relaunched, and committed as `4e91fa3`; today's commits have been reviewed and the full locale set audited with the user-requested model.
+- Reproduce every finding from the 2026-07-19 code/translation audit and fix only confirmed problems.
+- Status: every confirmed finding is fixed, fully verified, and committed. Translations were generated/reviewed only with `gpt-5.3-codex-spark` at `xhigh`.
 
 ## Working area
 
@@ -14,13 +14,35 @@
 
 ## Plan
 
-1. Completed — persist closed workspace IDs in config and synchronize close/reopen/delete/startup selection.
-2. Completed — distinguish suspended workspaces with zero saved sessions as `세션 없음`.
-3. Completed — replace latest-user-prompt text with latest agent response/progress text while preserving shared status/rail state.
-4. Completed — focused tests, release package, signature, relaunch, config persistence, and runtime-log verification passed.
+1. Completed — reproduce the closed-workspace, ANSI-tail, i18n bypass, and strict-Clippy findings.
+2. Completed — fix confirmed runtime/data-loss regressions with focused tests.
+3. Completed — move confirmed hard-coded UI strings into the catalog and complete/review locale translations using the required model.
+4. Completed — run final diff review, focused/full tests, strict Clippy, and workspace build.
+5. Completed — create the requested final commit and verify the repository state.
 
 ## Status
 
+- 2026-07-19: 사용자 요청으로 감사 수정의 최신 HEAD를 `CARGO_NET_OFFLINE=true sh scripts/package-macos.sh`로 다시 패키징했다(release 29.65s). Developer ID `VectorNine INC (ZDTU5LS35K)` deep/strict 서명 검증과 arm64 확인이 통과했고, 메인 실행 파일 SHA-256은 `1b3ffd1f1604b1fd1d5bcbac04acf669e45ea2f2e8a67866ceeedc7d374cbbad`다. 실행 경로를 재확인한 이전 bundle PID 19303만 TERM 종료하고 새 bundle을 실행·활성화했다. 새 PID 58802는 22:28:08 KST부터 생존 중이며 시작 로그에는 log GC, Apple SD Gothic 등록, web server, ANSI scrollback 복원이 정상 기록되고 panic/error/warn은 없다. 이 기록을 감사 수정 커밋에 amend한 뒤 `origin/main`에 push한다.
+- 2026-07-19: 감사 수정 19개 파일을 `fix: resolve workspace and localization audit findings`로 커밋했다. 이 handoff 완료 기록을 같은 커밋에 포함하고 clean worktree와 최종 commit hash를 확인한다.
+- 2026-07-19: 압축 후 AGENTS/handoff/status/diff를 다시 읽고 최종 변경을 모듈별로 재검토했다. 두 차례 병렬 read-only 리뷰의 마지막 확정 사항(settings→Agents 성공 실행의 종료표식 해제, locale 변경 뒤 기존 합성 title/UI 오류 재번역)까지 반영된 상태다. 최종 `cargo test --workspace --no-fail-fast`는 exit 0/실패 0, `cargo fmt --all -- --check`, `git diff --check`, `cargo build --workspace`가 모두 통과했다. 직전 코드 변경 뒤 실행한 strict `cargo clippy --workspace --all-targets -- -D warnings`도 통과했다. 다음은 전체 변경 커밋과 clean 상태 확인이다.
+- 2026-07-19: 추가 두 경로 수정 후 집중 검증은 Agent Sessions 30/30(새 locale 재렌더 테스트 포함), Agents 6/6, 종료표식 helper 1/1, app check, strict workspace Clippy 모두 통과했다. 최종 full workspace test/fmt/build를 한 번 더 실행한다.
+- 2026-07-19: 병렬 최종 read-only 리뷰가 추가로 settings→Agents PTY 실행의 종료표식 해제 누락과 locale 변경 뒤 이미 합성된 persisted title/오류 String 잔존을 확정했다. `AgentsUi::contents/launch_agent`가 성공 여부를 App으로 반환해 active workspace를 reveal하도록 했고, Agent Sessions는 catalog 오류를 key+detail로 보존하며 UI가 만든 session 오류도 별도 metadata map으로 재번역하고 빈 persisted title을 DB 원본 기준으로 재합성한다. `cargo check -p deppy-sijo` 통과; 집중/전체 검증을 재실행한다.
+- 2026-07-19: 첫 `cargo fmt --all -- --check`는 시작 시부터 알려진 `ui/composer.rs`의 rustfmt 차이 3곳만 보고했다. 해당 파일에 rustfmt만 적용했으며 재실행한 full fmt check와 `git diff --check`가 모두 통과했다. 기능 변경은 없다.
+- 2026-07-19: `cargo build --workspace`가 성공했고 `git diff --check`도 통과했다. 최종 구현 설명을 실제 동작(ANSI UTF-8/control 경계 정렬, Agent catalog 생성/locale 변경 주입)에 맞게 정리했다. 병렬 최종 read-only 리뷰 결과를 기다린 뒤 이상 없으면 커밋한다.
+- 2026-07-19: `cargo test --workspace --no-fail-fast` 전체가 통과했다. 주요 집계는 app 533 passed/5 ignored, runtime 119, storage 73, i18n 7이며 모든 나머지 crate와 doc-test도 실패 0이다. 최종 read-only diff 재검토와 workspace build/diff 상태 확인 후 커밋한다.
+- 2026-07-19: `AgentSessionsUi::show` 인자 정리 후 `cargo clippy --workspace --all-targets -- -D warnings`가 통과했다. strict audit에서 원래 확인된 `collapsible_match`/`too_many_arguments`와 이후 구현 중 드러난 lint까지 모두 해소됐다. 다음은 full workspace test/build/diff/commit이다.
+- 2026-07-19: strict workspace Clippy 첫 재실행은 `AgentSessionsUi::show`가 catalog 인자 추가로 8/7 `too_many_arguments`가 된 1건만 검출했다. catalog는 이미 controller snapshot으로 소유하므로 show 인자를 제거하고 App이 호출 직전 `set_catalog`를 수행한 뒤 show 내부에서 동일-frame snapshot을 쓰도록 정리해 재실행한다.
+- 2026-07-19: 타입 수정 뒤 집중 검증이 모두 통과했다: storage logs 14/14, runtime ANSI replay 1/1, Agent Sessions 29/29, 사용자 시작 종료표식 해제 1/1. startup catalog 주입은 한국어 빈 persisted title이 첫 import부터 `Codex 스레드 …`로 생성되는 테스트를 포함한다. 다음은 strict workspace Clippy와 전체 테스트다.
+- 2026-07-19: helper re-export/type 수정 뒤 storage 14/14와 runtime ANSI 1/1은 통과했다. 이어 app test compile에서 `UiConfig.closed_workspace_ids`의 실제 타입이 `BTreeSet`인데 새 순수 helper/test가 `HashSet`을 요구한 E0308 1건으로 중단되어 helper/test를 `BTreeSet`으로 바로잡고 재실행한다.
+- 2026-07-19: 최종 리뷰에서 확정된 사용자 세션 시작 시 영속 종료 해제, Agent Sessions catalog 조기 주입/hot reload, ANSI UTF-8/control-sequence 경계 3건을 구현했다. 첫 집중 실행에서 storage logs 14/14는 통과했으나 runtime compile이 새 storage helper의 crate-root re-export 누락과 test `usize`/`u64` 비교로 중단됐다. helper re-export와 형 변환을 수정해 같은 집중 묶음을 재실행한다.
+- 2026-07-19: 의미 교정과 미사용 키 제거 후 `cargo test -p i18n`이 7/7 통과했다. 새 parity 테스트가 5개 locale의 721개 키 순서와 placeholder multiset 일치를 함께 확인하며 `git diff --check`도 통과했다. 다음은 병렬 코드 리뷰 결과 반영과 전체 workspace test/strict Clippy/build다.
+- 2026-07-19: exact `gpt-5.3-codex-spark`/`xhigh` 의미 재검수(session `019f7a6a-6f1f-7722-8c56-c01fd921d52b`)가 로케일당 신규·잔존 215키를 검사해 일본어 추론 강도 6곳, 한국어 APP thread 삭제 조건 1곳, 4개 비영어 locale의 `active + warm` 4곳만 의미 문제로 확정했다. 제시된 11개 교체안을 그대로 적용했다. 별도 구조 검수는 이전 후보 61개가 production/test/dynamic key provider 모두에서 참조 0임을 재현했고 5개 locale에서 동일하게 제거했다. 각 locale은 동일한 721키이며 다음은 parity/placeholder 테스트와 전체 검증이다.
+
+- 2026-07-19: exact 번역 실행 헤더는 `gpt-5.3-codex-spark`/`xhigh`/session `019f7a64-edf9-7ec3-a64d-c921f909ac98`였으나, 해당 child가 context compaction 뒤 최종 요약에서 `gpt-5`/normal이라고 잘못 자가보고하고 신규 키를 target 파일 끝에 append해 “동일 순서” 보고와 실파일이 어긋났다. 번역값은 exact-model 산출물로 유지하고 4개 locale을 en-US key order로 기계 재정렬해 최초 순서 불일치가 모두 사라졌다. `cargo test -p i18n` 6/6 통과. strict workspace Clippy 재실행은 새 ANSI 회귀 테스트의 `useless_vec` 2건만 검출했으며 고정 배열 slice로 수정했다. 기존 audit Clippy 2건은 재발하지 않았다. 병렬 exact-model 의미 재검토/미사용 키 증명/전체 diff 리뷰가 진행 중이다.
+- 2026-07-19: `agent_sessions.rs`의 사용자 노출 렌더 문자열뿐 아니라 비동기 catalog/thread/실행 오류와 복구 thread 기본 제목도 현재 locale catalog를 사용하도록 완결했다. locale catalog snapshot은 매 프레임이 아니라 언어 변경 시에만 갱신해 background poll/단축키 경로와 성능을 함께 보존한다. `ui::agent_sessions::tests` 28/28 통과. strict scoped Clippy는 기존 audit의 `agent_transcript`/`agent_terminal` 2건이 사라졌고 새 ANSI boundary 코드의 `collapsible_if` 1건만 검출해 즉시 결합 조건으로 수정했다. 다음은 Clippy 재실행과 exact Spark xhigh locale 번역이다.
+- 2026-07-19: catalog 전환 중 발생한 `agent_sessions.rs` 구문 오류와 file-tree test signature를 정리했다. `AgentApprovalKind::label`은 catalog 기반 표시로 대체돼 실제 참조가 0인 것을 확인하고 제거했다. `cargo check -p deppy-sijo`와 `ui::file_tree::tests` 59/59가 통과했으며 workspace summary의 en-US catalog 출력과 기존 상태색 매핑을 함께 검증한다. 다음은 agent session의 사용자 노출 오류까지 catalog로 완결하고 exact Spark xhigh 번역을 실행한다.
+- 2026-07-19: 두 핵심 runtime finding이 실제임을 코드 경로와 회귀 테스트로 확인하고 수정했다. 종료 workspace 상태를 `Persisted`와 현재 프로세스의 `ClosingPanes`로 분리해 config에서 복원된 숨김은 stale layout pane으로 자동 재노출되지 않고, 현재 종료 뒤 사용자가 새 pane을 만든 경우만 복귀한다. ANSI log compaction은 ANSI raw tail을 LF 유무와 무관하게 보존하고 text/JSONL만 LF가 있으면 line 정렬하며, runtime replay도 LF 없는 full-screen TUI tail을 cutoff부터 복원한다. `storage logs::tests` 13 passed, runtime ANSI tail 1 passed, app stale-pane 종료 회귀 1 passed. 다음은 catalog 우회 UI와 strict Clippy 수정이다.
+- 2026-07-19: 사용자가 감사 finding 전부를 실측하고 실제 문제만 수정하라고 요청했다. 저장소는 `161e459`에서 clean 상태로 시작했다. 번역은 이전 요구를 유지해 exact `gpt-5.3-codex-spark` + `xhigh`만 사용한다. 우선 종료 워크스페이스 startup race와 LF 없는 ANSI compaction을 회귀 테스트로 재현하고, catalog 우회 literal/locale 잔존/strict Clippy를 수정한다. 미사용 61키 후보는 동적 키 조합을 포함한 생산 코드 참조를 검증하기 전에는 삭제하지 않는다.
 - 2026-07-19: 오늘 10개 커밋(`d4ee225^..4e91fa3`)의 누적 코드 리뷰와 전체 번역 감사를 완료했다. 오늘 도입 회귀는 3건이다: 영속 종료 ID를 빈 pane 집합으로 복원해 stale pane이 종료 워크스페이스를 재노출할 수 있음(`app.rs`), LF 없는 ANSI tail을 compaction 때 전부 비움(`storage/logs.rs`), 워크스페이스 compact/full 상태 문구가 catalog를 우회해 한국어로 고정됨(`ui/file_tree.rs`). `cargo test --workspace --no-fail-fast`는 전체 통과했고 `git diff --check`도 통과했다. 추가 strict `cargo clippy --workspace --all-targets -- -D warnings`는 오늘 추가된 `agent_transcript.rs`의 `collapsible_match`와 `ui/agent_terminal.rs`의 `too_many_arguments` 2건으로 실패했다. 리뷰 요청이므로 제품 코드는 수정하지 않았다.
 - 2026-07-19: 번역 감사 서브에이전트는 로컬 exact model `gpt-5.3-codex-spark`, `model_reasoning_effort="xhigh"`, read-only/ephemeral로 실행했으며 대체 모델은 사용하지 않았다. 5개 locale 각 626개(총 3,130항목)의 key/placeholder parity는 완전 일치했다. exact 영어값 중 실제 미번역은 ja-JP 49개, zh-Hans 49개, zh-Hant 49개, ko-KR 4개이며, 한국어 설정 hint 3개에도 영어 혼용이 남았다. 코드 구조 감사에서는 `ui/agent_sessions.rs`의 광범위한 한국어/영어 literal, `ui/file_tree.rs`의 파일 검색·새 파일·권한 tooltip, `ui/connectors.rs`의 client id/secret literal도 catalog 우회로 확인했다. 생산 코드에서 사용되지 않는 i18n 키 후보는 61개이나 삭제 전 동적/복구 UI 여부 확인이 필요하다. 오늘 추가된 `status.detecting`, `session.activity.*`, pane→session 용어, split 오류, `file_tree.copy_file` 번역은 의미/자연스러움 문제가 없었다. 번역 요청이 아니라 상태 감사 요청이므로 locale/제품 파일은 수정하지 않았다.
 - 2026-07-19: 최종 release package가 20.49s에 성공했고 Developer ID deep/strict 서명 검증이 통과했다. 메인 실행 파일 SHA-256은 `03829ebdfdf1877013f069596f8df2c1591508949632f844e3ba57274f951108`다. 재빌드 직전 실제 종료 로그와 DB를 대조한 `key_experiments`/`printbakery` 두 ID를 사용자 config의 새 `closed_workspace_ids`에 복원한 뒤 정확한 이전 PID 53902만 TERM 종료하고 새 bundle PID 19303을 20:53:39 KST에 실행·활성화했다. 시작 뒤 config에 두 ID가 그대로 남고 새 로그에는 orphan 정리, 로그 GC, Apple SD Gothic 등록, web server, scrollback 복원이 정상 기록됐으며 panic/error/warn은 없다. 최종 `git diff --check`도 통과했다. 현재 변경은 미커밋이다.

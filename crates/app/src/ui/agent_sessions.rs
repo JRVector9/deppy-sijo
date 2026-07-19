@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
 
 use crate::agent_session::{
-    AgentApprovalDecision, AgentSession, AgentSessionEvent, AgentSessionId, AgentSessionStatus,
-    AgentSkillSelection,
+    AgentApprovalDecision, AgentApprovalKind, AgentSession, AgentSessionEvent, AgentSessionId,
+    AgentSessionStatus, AgentSkillSelection,
 };
 use crate::agent_surface::{
     AgentProvider, AgentSurfaceId, AgentSurfaceSnapshot, AgentTransport, AgentVisualState,
@@ -46,8 +46,37 @@ pub struct AgentSessionStatusNotice {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentSessionsRequest {
+    RevealWorkspace(String),
     FocusPty(AgentSurfaceId),
     InterruptPty(AgentSurfaceId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CatalogMessage {
+    Raw(String),
+    Key(&'static str),
+    Error { key: &'static str, detail: String },
+}
+
+impl CatalogMessage {
+    fn raw(message: impl Into<String>) -> Self {
+        Self::Raw(message.into())
+    }
+
+    fn error(key: &'static str, error: &anyhow::Error) -> Self {
+        Self::Error {
+            key,
+            detail: format!("{error:#}"),
+        }
+    }
+
+    fn render(&self, catalog: &i18n::Catalog) -> String {
+        match self {
+            Self::Raw(message) => message.clone(),
+            Self::Key(key) => catalog.t(key, &[]),
+            Self::Error { key, detail } => catalog.t(key, &[("error", detail)]),
+        }
+    }
 }
 
 /// Stable ID for the embedded Agents window.
@@ -136,7 +165,7 @@ pub struct AgentSessionsUi {
     focus_new_prompt: bool,
     focus_follow_up: bool,
     status_notices: Vec<AgentSessionStatusNotice>,
-    transport_error: Option<String>,
+    transport_error: Option<CatalogMessage>,
     persisted_threads: HashMap<AgentSessionId, StructuredThreadRow>,
     attached_threads: HashSet<AgentSessionId>,
     pending_thread_requests: Vec<PendingThreadRequest>,
@@ -146,7 +175,7 @@ pub struct AgentSessionsUi {
     selected_skill_paths: HashSet<String>,
     pending_model_catalog: Option<CodexModelCatalogReply>,
     pending_skill_catalog: Option<CodexSkillCatalogReply>,
-    catalog_error: Option<String>,
+    catalog_error: Option<CatalogMessage>,
     text_input_ids: Vec<egui::Id>,
     /// config에서 동기화한 LLM 프로바이더 오버라이드 (PR-L2) — ensure_client가 spawn 시
     /// 사용한다. Err = 잘못된 설정(예: custom인데 base URL 없음) — spawn을 명확히 중단.
@@ -160,12 +189,17 @@ pub struct AgentSessionsUi {
     api_key_input: String,
     /// keyring 존재 여부 캐시 — 매 프레임 keychain 조회 방지. None = 미확인(다음 렌더에서 조회).
     api_key_present: Option<bool>,
-    api_key_error: Option<String>,
+    api_key_error: Option<CatalogMessage>,
     /// 키 저장/삭제 세대. client가 spawn 시 기록한 세대와 다르고 유휴면
     /// sync_llm_config가 재시작해 다음 spawn부터 새 키를 반영한다.
     api_key_generation: u64,
     /// 현재 client가 spawn될 때의 키 세대 (프로바이더 오버라이드 비교와 동일 관례).
     client_api_key_generation: u64,
+    /// 비동기 poll·단축키 경로에서도 현재 UI 언어로 오류를 만들기 위한 catalog snapshot.
+    /// App 생성 시 주입하고 locale 변경 시 즉시 갱신한다.
+    catalog: i18n::Catalog,
+    /// UI가 만든 session 오류만 원문 detail+catalog key로 보존해 locale 변경 시 재렌더한다.
+    localized_session_errors: HashMap<AgentSessionId, CatalogMessage>,
 }
 
 impl AgentSessionsUi {
@@ -207,6 +241,9 @@ impl AgentSessionsUi {
             api_key_error: None,
             api_key_generation: 0,
             client_api_key_generation: 0,
+            catalog: i18n::Catalog::load(i18n::FALLBACK_LOCALE)
+                .expect("fallback locale catalog must load"),
+            localized_session_errors: HashMap::new(),
         }
     }
 
@@ -214,6 +251,32 @@ impl AgentSessionsUi {
     pub fn with_api_key_store(mut self, store: Arc<dyn CodexLlmApiKeyStore>) -> Self {
         self.api_key_store = Some(store);
         self
+    }
+
+    /// App 생성·locale hot reload 시 비동기 poll보다 먼저 현재 catalog를 주입한다.
+    pub fn with_catalog(mut self, catalog: &i18n::Catalog) -> Self {
+        self.set_catalog(catalog);
+        self
+    }
+
+    pub fn set_catalog(&mut self, catalog: &i18n::Catalog) {
+        if self.catalog.locale() != catalog.locale() {
+            self.catalog = catalog.clone();
+            let synthesized_titles = self
+                .persisted_threads
+                .iter()
+                .filter(|(_, row)| row.title.trim().is_empty())
+                .map(|(session_id, row)| (session_id.clone(), persisted_title(row, &self.catalog)))
+                .collect::<HashMap<_, _>>();
+            for session in &mut self.sessions {
+                if let Some(title) = synthesized_titles.get(&session.id) {
+                    session.prompt = title.clone();
+                }
+                if let Some(error) = self.localized_session_errors.get(&session.id) {
+                    session.error = Some(error.render(&self.catalog));
+                }
+            }
+        }
     }
 
     pub fn is_open(&self) -> bool {
@@ -279,17 +342,17 @@ impl AgentSessionsUi {
                 // A repeated DB projection may refresh a placeholder, but it
                 // must never regress a live session that already owns events.
                 if was_persisted && session.status == AgentSessionStatus::Stopped {
-                    apply_persisted_metadata(session, &row);
+                    apply_persisted_metadata(session, &row, &self.catalog);
                 }
                 continue;
             }
 
             let mut session = AgentSession::new(
                 local_session_id,
-                persisted_title(&row),
+                persisted_title(&row, &self.catalog),
                 non_empty(row.cwd.clone()),
             );
-            apply_persisted_metadata(&mut session, &row);
+            apply_persisted_metadata(&mut session, &row, &self.catalog);
             session.status = AgentSessionStatus::Stopped;
             self.sessions.push(session);
         }
@@ -306,7 +369,7 @@ impl AgentSessionsUi {
     /// Mutation execution and any retry policy remain with `App`.
     #[allow(dead_code)] // Called by the App-level Db mutation executor.
     pub fn report_persistence_error(&mut self, message: String) {
-        self.transport_error = Some(message);
+        self.transport_error = Some(CatalogMessage::raw(message));
     }
 
     pub fn read_selected_persisted(&mut self, ctx: &egui::Context) -> anyhow::Result<()> {
@@ -346,7 +409,8 @@ impl AgentSessionsUi {
         let (session_id, row) = self.selected_persisted_thread()?;
         anyhow::ensure!(
             !self.attached_threads.contains(&session_id),
-            "재개된 APP thread는 연결이 종료된 뒤 보관하세요"
+            self.catalog
+                .t("agent_sessions.error.archive_attached_thread", &[])
         );
         self.ensure_client(ctx)?;
         let reply = self
@@ -372,10 +436,12 @@ impl AgentSessionsUi {
         let (session_id, _) = self.selected_persisted_thread()?;
         anyhow::ensure!(
             !self.attached_threads.contains(&session_id),
-            "재개된 APP thread는 보관하거나 연결이 종료된 뒤 로컬 기록을 삭제하세요"
+            self.catalog
+                .t("agent_sessions.error.delete_attached_thread", &[])
         );
         self.persisted_threads.remove(&session_id);
         self.sessions.retain(|session| session.id != session_id);
+        self.localized_session_errors.remove(&session_id);
         self.pending_thread_requests
             .retain(|pending| pending.session_id() != session_id);
         self.persistence_mutations
@@ -406,19 +472,23 @@ impl AgentSessionsUi {
             !target_ids
                 .iter()
                 .any(|session_id| self.attached_threads.contains(session_id)),
-            "연결된 APP thread가 있어 workspace를 삭제할 수 없습니다"
+            self.catalog
+                .t("agent_sessions.error.workspace_has_attached_thread", &[])
         );
         anyhow::ensure!(
             !self
                 .pending_thread_requests
                 .iter()
                 .any(|pending| target_ids.contains(pending.session_id())),
-            "응답 대기 중인 APP thread가 있어 workspace를 삭제할 수 없습니다"
+            self.catalog
+                .t("agent_sessions.error.workspace_has_pending_thread", &[])
         );
 
         self.sessions
             .retain(|session| !target_ids.contains(&session.id));
         self.persisted_threads
+            .retain(|session_id, _| !target_ids.contains(session_id));
+        self.localized_session_errors
             .retain(|session_id, _| !target_ids.contains(session_id));
         self.status_notices
             .retain(|notice| notice.workspace_id != workspace_id);
@@ -480,7 +550,7 @@ impl AgentSessionsUi {
                     },
                     provider: AgentProvider::Codex,
                     transport: AgentTransport::AppServer,
-                    title: one_line_title(&session.prompt),
+                    title: one_line_title(&session.prompt, &self.catalog),
                     model: session.model.clone(),
                     effort: session.effort.clone(),
                     context_pct: None,
@@ -553,14 +623,19 @@ impl AgentSessionsUi {
         ctx: &egui::Context,
     ) -> anyhow::Result<Option<AgentSessionsRequest>> {
         let Some(selected) = self.selected_surface.clone() else {
-            anyhow::bail!("선택된 에이전트가 없습니다");
+            anyhow::bail!(
+                self.catalog
+                    .t("agent_sessions.error.no_selected_agent", &[])
+            );
         };
         match selected {
             id @ AgentSurfaceId::Pty { .. } => Ok(Some(AgentSessionsRequest::InterruptPty(id))),
             AgentSurfaceId::Structured { session_id } => {
                 self.client
                     .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Codex App Server 연결이 없습니다"))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(self.catalog.t("agent_sessions.error.no_app_server", &[]))
+                    })?
                     .interrupt(session_id)?;
                 ctx.request_repaint();
                 Ok(None)
@@ -580,15 +655,27 @@ impl AgentSessionsUi {
     /// model catalog. This is local state only; it is sent on the next
     /// `turn/start` and never uses the experimental thread settings API.
     pub fn adjust_selected_effort(&mut self, delta: isize) -> anyhow::Result<()> {
-        anyhow::ensure!(delta != 0, "effort 조정값이 0입니다");
+        anyhow::ensure!(
+            delta != 0,
+            self.catalog
+                .t("agent_sessions.error.zero_effort_delta", &[])
+        );
         let Some(AgentSurfaceId::Structured { session_id }) = self.selected_surface.as_ref() else {
-            anyhow::bail!("선택된 Codex APP 세션이 없습니다");
+            anyhow::bail!(
+                self.catalog
+                    .t("agent_sessions.error.no_selected_app_session", &[])
+            );
         };
         let session = self
             .sessions
             .iter()
             .find(|session| &session.id == session_id)
-            .ok_or_else(|| anyhow::anyhow!("선택된 Codex APP 세션을 찾을 수 없습니다"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    self.catalog
+                        .t("agent_sessions.error.selected_app_session_missing", &[])
+                )
+            })?;
         let model = session
             .model
             .as_deref()
@@ -598,10 +685,16 @@ impl AgentSessionsUi {
                     .find(|model| model.model == selected || model.id == selected)
             })
             .or_else(|| self.model_catalog.iter().find(|model| model.is_default))
-            .ok_or_else(|| anyhow::anyhow!("모델 카탈로그를 먼저 불러오세요"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    self.catalog
+                        .t("agent_sessions.error.load_model_catalog_first", &[])
+                )
+            })?;
         anyhow::ensure!(
             !model.supported_reasoning_efforts.is_empty(),
-            "선택 모델이 지원 effort를 제공하지 않습니다"
+            self.catalog
+                .t("agent_sessions.error.model_has_no_efforts", &[])
         );
         let current = session
             .effort
@@ -638,23 +731,33 @@ impl AgentSessionsUi {
         ctx: &egui::Context,
     ) -> anyhow::Result<()> {
         let Some(AgentSurfaceId::Structured { session_id }) = self.selected_surface.clone() else {
-            anyhow::bail!("선택된 APP 에이전트가 없습니다");
+            anyhow::bail!(
+                self.catalog
+                    .t("agent_sessions.error.no_selected_app_agent", &[])
+            );
         };
         let session = self
             .sessions
             .iter()
             .find(|session| session.id == session_id)
-            .ok_or_else(|| anyhow::anyhow!("선택된 APP 세션을 찾을 수 없습니다"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    self.catalog
+                        .t("agent_sessions.error.selected_app_session_missing", &[])
+                )
+            })?;
         if session.approvals.len() != 1 {
-            anyhow::bail!(
-                "승인 요청이 정확히 하나일 때만 실행할 수 있습니다 (현재 {})",
-                session.approvals.len()
-            );
+            anyhow::bail!(self.catalog.t(
+                "agent_sessions.error.approval_count",
+                &[("count", &session.approvals.len().to_string())],
+            ));
         }
         let request_key = session.approvals[0].request_key.clone();
         self.client
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Codex App Server 연결이 없습니다"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(self.catalog.t("agent_sessions.error.no_app_server", &[]))
+            })?
             .respond_approval(session_id, request_key, decision)?;
         ctx.request_repaint();
         Ok(())
@@ -681,15 +784,24 @@ impl AgentSessionsUi {
         // 폴백하면 사용자가 명시한 로컬 LLM 선택이 무력화된다 (PR-L2).
         let llm_override = match &self.llm_override {
             Ok(value) => value.clone(),
-            Err(message) => anyhow::bail!("LLM 프로바이더 설정 오류: {message}"),
+            Err(message) => anyhow::bail!(self.catalog.t(
+                "agent_sessions.error.provider_config",
+                &[("error", message)],
+            )),
         };
         // custom + 저장된 키가 있으면 spawn 직전에만 keyring에서 읽는다 (PR-L4,
         // secret 크레이트 get 관례). 로드 실패는 키 없이 조용히 진행하지 않고 중단 —
         // 인증 실패로 늦게 표면화되는 것보다 명확하다.
         let llm_api_key = match (&llm_override, &self.api_key_store) {
-            (Some(CodexLlmOverride::Custom { .. }), Some(store)) => store
-                .load()
-                .map_err(|error| anyhow::anyhow!("LLM API 키 로드 실패: {error:#}"))?,
+            (Some(CodexLlmOverride::Custom { .. }), Some(store)) => {
+                store.load().map_err(|error| {
+                    anyhow::anyhow!(localized_error(
+                        &self.catalog,
+                        "agent_sessions.error.api_key_load",
+                        &error,
+                    ))
+                })?
+            }
             _ => None,
         };
         let api_key_generation = self.api_key_generation;
@@ -740,7 +852,8 @@ impl AgentSessionsUi {
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.pending_model_catalog.is_none() && self.pending_skill_catalog.is_none(),
-            "모델/skill 카탈로그를 이미 불러오는 중입니다"
+            self.catalog
+                .t("agent_sessions.error.catalog_already_loading", &[])
         );
         self.ensure_client(ctx)?;
         let client = self
@@ -777,12 +890,16 @@ impl AgentSessionsUi {
                     }
                 }
                 Ok(Err(error)) => {
-                    self.catalog_error = Some(format!("모델 카탈로그 실패: {error:#}"));
+                    self.catalog_error = Some(CatalogMessage::error(
+                        "agent_sessions.error.model_catalog_failed",
+                        &error,
+                    ));
                 }
                 Err(TryRecvError::Empty) => self.pending_model_catalog = Some(reply),
                 Err(TryRecvError::Disconnected) => {
-                    self.catalog_error =
-                        Some("모델 카탈로그 응답 채널이 종료되었습니다".to_owned());
+                    self.catalog_error = Some(CatalogMessage::Key(
+                        "agent_sessions.error.model_catalog_disconnected",
+                    ));
                 }
             }
         }
@@ -797,12 +914,16 @@ impl AgentSessionsUi {
                     });
                 }
                 Ok(Err(error)) => {
-                    self.catalog_error = Some(format!("skill 카탈로그 실패: {error:#}"));
+                    self.catalog_error = Some(CatalogMessage::error(
+                        "agent_sessions.error.skill_catalog_failed",
+                        &error,
+                    ));
                 }
                 Err(TryRecvError::Empty) => self.pending_skill_catalog = Some(reply),
                 Err(TryRecvError::Disconnected) => {
-                    self.catalog_error =
-                        Some("skill 카탈로그 응답 채널이 종료되었습니다".to_owned());
+                    self.catalog_error = Some(CatalogMessage::Key(
+                        "agent_sessions.error.skill_catalog_disconnected",
+                    ));
                 }
             }
         }
@@ -833,30 +954,49 @@ impl AgentSessionsUi {
                     session.skills.clone(),
                 )
             })
-            .ok_or_else(|| anyhow::anyhow!("후속 작업 세션을 찾을 수 없습니다"))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    self.catalog
+                        .t("agent_sessions.error.follow_up_session_missing", &[])
+                )
+            })
     }
 
     fn selected_persisted_thread(&self) -> anyhow::Result<(AgentSessionId, StructuredThreadRow)> {
         let Some(AgentSurfaceId::Structured { session_id }) = self.selected_surface.as_ref() else {
-            anyhow::bail!("선택된 저장 APP thread가 없습니다");
+            anyhow::bail!(
+                self.catalog
+                    .t("agent_sessions.error.no_selected_saved_thread", &[])
+            );
         };
         let row = self
             .persisted_threads
             .get(session_id)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("선택된 APP thread는 저장된 복구 항목이 아닙니다"))?;
-        anyhow::ensure!(!row.archived, "이미 보관된 APP thread입니다");
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    self.catalog
+                        .t("agent_sessions.error.not_persisted_thread", &[])
+                )
+            })?;
+        anyhow::ensure!(
+            !row.archived,
+            self.catalog
+                .t("agent_sessions.error.thread_already_archived", &[])
+        );
         anyhow::ensure!(
             !self
                 .pending_thread_requests
                 .iter()
                 .any(|pending| pending.session_id() == session_id),
-            "선택된 APP thread 요청이 이미 진행 중입니다"
+            self.catalog
+                .t("agent_sessions.error.thread_request_pending", &[])
         );
         Ok((session_id.clone(), row))
     }
 
     fn mark_history_request_started(&mut self, session_id: &str) {
+        self.localized_session_errors.remove(session_id);
         if let Some(session) = self
             .sessions
             .iter_mut()
@@ -877,7 +1017,8 @@ impl AgentSessionsUi {
                 Err(TryRecvError::Disconnected) => self.finish_thread_request(
                     request,
                     Err(anyhow::anyhow!(
-                        "Codex App Server 응답 채널이 종료되었습니다"
+                        self.catalog
+                            .t("agent_sessions.error.app_server_disconnected", &[])
                     )),
                 ),
             }
@@ -894,7 +1035,11 @@ impl AgentSessionsUi {
             PendingThreadRequest::Read { session_id, .. } => match result {
                 Ok(result) => self.load_history_result(&session_id, &result, false),
                 Err(error) => {
-                    self.fail_session(&session_id, format!("thread 기록 읽기 실패: {error:#}"));
+                    self.fail_session_localized(
+                        &session_id,
+                        "agent_sessions.error.read_history_failed",
+                        &error,
+                    );
                 }
             },
             PendingThreadRequest::Resume { session_id, .. } => match result {
@@ -903,7 +1048,11 @@ impl AgentSessionsUi {
                     self.load_history_result(&session_id, &result, true);
                 }
                 Err(error) => {
-                    self.fail_session(&session_id, format!("thread 복구 실패: {error:#}"));
+                    self.fail_session_localized(
+                        &session_id,
+                        "agent_sessions.error.resume_failed",
+                        &error,
+                    );
                 }
             },
             PendingThreadRequest::Archive { session_id, .. } => match result {
@@ -911,6 +1060,7 @@ impl AgentSessionsUi {
                     self.attached_threads.remove(&session_id);
                     self.persisted_threads.remove(&session_id);
                     self.sessions.retain(|session| session.id != session_id);
+                    self.localized_session_errors.remove(&session_id);
                     if self.selected_session.as_deref() == Some(session_id.as_str()) {
                         self.selected_session = None;
                         self.selected_surface = None;
@@ -924,7 +1074,11 @@ impl AgentSessionsUi {
                         });
                 }
                 Err(error) => {
-                    self.fail_session(&session_id, format!("thread 보관 실패: {error:#}"));
+                    self.fail_session_localized(
+                        &session_id,
+                        "agent_sessions.error.archive_failed",
+                        &error,
+                    );
                 }
             },
         }
@@ -940,7 +1094,12 @@ impl AgentSessionsUi {
             .sessions
             .iter_mut()
             .find(|session| session.id == session_id)
-            .ok_or_else(|| anyhow::anyhow!("복구할 로컬 APP 세션이 없습니다"))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    self.catalog
+                        .t("agent_sessions.error.local_session_missing", &[])
+                )
+            })
             .and_then(|session| session.load_thread_snapshot(result));
         match loaded {
             Ok(()) => {
@@ -950,7 +1109,11 @@ impl AgentSessionsUi {
                 self.queue_current_status_notice(session_id);
             }
             Err(error) => {
-                self.fail_session(session_id, format!("thread 응답 적용 실패: {error:#}"));
+                self.fail_session_localized(
+                    session_id,
+                    "agent_sessions.error.apply_thread_response_failed",
+                    &error,
+                );
             }
         }
     }
@@ -972,7 +1135,7 @@ impl AgentSessionsUi {
         let existing = self.persisted_threads.get(session_id);
         let favorite = existing.is_some_and(|row| row.favorite);
         let archived = existing.is_some_and(|row| row.archived);
-        let title = one_line_title(&session.prompt);
+        let title = one_line_title(&session.prompt, &self.catalog);
         let cwd = session.cwd.clone().unwrap_or_default();
         let unchanged = existing.is_some_and(|row| {
             row.workspace_id == workspace_id
@@ -1038,7 +1201,7 @@ impl AgentSessionsUi {
                     self.apply_session_event(&session_id, event);
                 }
                 CodexAppServerEvent::TransportError { message } => {
-                    self.transport_error = Some(message);
+                    self.transport_error = Some(CatalogMessage::raw(message));
                 }
                 CodexAppServerEvent::ConnectionStopped => connection_stopped = true,
             }
@@ -1067,6 +1230,9 @@ impl AgentSessionsUi {
         agents_config: &mut AgentsConfig,
         ollama_models: Option<&[String]>,
     ) -> Vec<AgentSessionsRequest> {
+        // 렌더 도중 self를 변경하면서도 동일 frame의 locale snapshot을 유지한다.
+        let catalog = self.catalog.clone();
+        let catalog = &catalog;
         // 창이 닫혀 있어도 동기화 — App 단축키 경로의 ensure_client도 최신 설정을 쓴다.
         self.sync_llm_config(agents_config);
         self.pty_surfaces = pty_surfaces;
@@ -1093,7 +1259,7 @@ impl AgentSessionsUi {
         let mut window_open = self.open;
         let mut actions = Vec::new();
         let mut requests = Vec::new();
-        let window_response = egui::Window::new("Agents")
+        let window_response = egui::Window::new(catalog.t("agent_sessions.title", &[]))
             .id(agents_window_id())
             .open(&mut window_open)
             .default_width(960.0)
@@ -1101,32 +1267,41 @@ impl AgentSessionsUi {
             .min_width(700.0)
             .resizable(true)
             .show(ctx, |ui| {
-                ui.heading("Agents");
+                ui.heading(catalog.t("agent_sessions.title", &[]));
                 ui.horizontal(|ui| {
-                    ui.weak("작업 폴더");
+                    ui.weak(catalog.t("agent_sessions.working_directory", &[]));
                     ui.monospace(
                         workspace_cwd
                             .as_deref()
                             .filter(|path| !path.is_empty())
-                            .unwrap_or("현재 앱 작업 폴더"),
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| {
+                                catalog.t("agent_sessions.app_working_directory", &[])
+                            }),
                     );
                 });
                 if let Some(error) = &self.transport_error {
-                    ui.colored_label(egui::Color32::from_rgb(0xff, 0x7b, 0x72), error);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xff, 0x7b, 0x72),
+                        error.render(catalog),
+                    );
                 }
                 if let Some(error) = &self.catalog_error {
-                    ui.colored_label(egui::Color32::from_rgb(0xff, 0xbf, 0x69), error);
-                    ui.weak("카탈로그 없이도 모델/effort를 직접 입력해 계속 사용할 수 있습니다.");
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xff, 0xbf, 0x69),
+                        error.render(catalog),
+                    );
+                    ui.weak(catalog.t("agent_sessions.catalog_fallback_hint", &[]));
                 }
                 crate::ui::hairline(ui);
 
-                ui.label("새 작업");
+                ui.label(catalog.t("agent_sessions.new_task", &[]));
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(
                             self.pending_model_catalog.is_none()
                                 && self.pending_skill_catalog.is_none(),
-                            egui::Button::new("모델 · skills 불러오기"),
+                            egui::Button::new(catalog.t("agent_sessions.load_catalogs", &[])),
                         )
                         .clicked()
                     {
@@ -1137,15 +1312,21 @@ impl AgentSessionsUi {
                     }
                     if self.pending_model_catalog.is_some() || self.pending_skill_catalog.is_some()
                     {
-                        ui.weak("카탈로그 응답 대기 중…");
+                        ui.weak(catalog.t("agent_sessions.catalog_waiting", &[]));
                     }
                 });
-                self.render_agent_controls(ui, &mut text_input_ids, agents_config, ollama_models);
+                self.render_agent_controls(
+                    ui,
+                    &mut text_input_ids,
+                    agents_config,
+                    ollama_models,
+                    catalog,
+                );
                 let prompt_response = ui.add_sized(
                     [ui.available_width(), 72.0],
                     egui::TextEdit::multiline(&mut self.new_prompt)
                         .id_salt("agent-new-prompt")
-                        .hint_text("Codex에게 맡길 작업을 입력하세요")
+                        .hint_text(catalog.t("agent_sessions.prompt_hint", &[]))
                         .desired_rows(3),
                 );
                 text_input_ids.push(prompt_response.id);
@@ -1156,7 +1337,10 @@ impl AgentSessionsUi {
                 ui.horizontal(|ui| {
                     let can_start = !self.new_prompt.trim().is_empty();
                     if ui
-                        .add_enabled(can_start, egui::Button::new("Codex 실행"))
+                        .add_enabled(
+                            can_start,
+                            egui::Button::new(catalog.t("agent_sessions.run_codex", &[])),
+                        )
                         .clicked()
                     {
                         actions.push(PanelAction::Start {
@@ -1171,16 +1355,16 @@ impl AgentSessionsUi {
                 });
 
                 crate::ui::hairline(ui);
-                self.render_surface_tabs(ui, &mut actions);
+                self.render_surface_tabs(ui, &mut actions, catalog);
                 crate::ui::hairline(ui);
 
                 match self.selected_surface_snapshot() {
                     Some(surface) if surface.transport == AgentTransport::Pty => {
-                        render_selected_surface_header(ui, &surface);
-                        self.render_pty_surface(ui, surface, &mut actions);
+                        render_selected_surface_header(ui, &surface, catalog);
+                        self.render_pty_surface(ui, surface, &mut actions, catalog);
                     }
                     Some(surface) => {
-                        render_selected_surface_header(ui, &surface);
+                        render_selected_surface_header(ui, &surface, catalog);
                         if let Some(session) = self.selected_session_snapshot() {
                             self.render_session(
                                 ui,
@@ -1188,11 +1372,12 @@ impl AgentSessionsUi {
                                 workspace_cwd.clone(),
                                 &mut actions,
                                 &mut text_input_ids,
+                                catalog,
                             );
                         }
                     }
                     None => {
-                        ui.weak("탐색할 에이전트를 선택하거나 새 Codex APP 작업을 시작하세요.");
+                        ui.weak(catalog.t("agent_sessions.empty_selection", &[]));
                     }
                 }
             });
@@ -1236,6 +1421,7 @@ impl AgentSessionsUi {
         text_input_ids: &mut Vec<egui::Id>,
         agents_config: &mut AgentsConfig,
         ollama_models: Option<&[String]>,
+        catalog: &i18n::Catalog,
     ) {
         let models = self.model_catalog.clone();
         let selected_model = models
@@ -1247,12 +1433,12 @@ impl AgentSessionsUi {
         // 불가능해 실작업이 막힌다(2026-07-18 사용자 스크린샷). 자유 입력 유지.
         let free_model_input = agents_config.codex_llm_provider.is_some();
         ui.horizontal_wrapped(|ui| {
-            ui.label("모델");
+            ui.label(catalog.t("agent_sessions.model", &[]));
             if models.is_empty() || free_model_input {
                 let hint = if free_model_input {
-                    "백엔드 모델명 (예: qwen3-coder:30b)"
+                    catalog.t("agent_sessions.backend_model_hint", &[])
                 } else {
-                    "기본 Codex 모델"
+                    catalog.t("agent_sessions.default_codex_model", &[])
                 };
                 let response = ui.add_sized(
                     [210.0, 24.0],
@@ -1289,7 +1475,7 @@ impl AgentSessionsUi {
                     });
             }
 
-            ui.label("effort");
+            ui.label(catalog.t("agent_sessions.effort", &[]));
             // 커스텀/OSS는 카탈로그 모델이 아니므로 effort도 자유 입력(백엔드가 무시할 수 있음).
             if let Some(model) = selected_model.filter(|_| !free_model_input) {
                 egui::ComboBox::from_id_salt("agent-effort-catalog")
@@ -1307,19 +1493,26 @@ impl AgentSessionsUi {
             } else {
                 let response = ui.add_sized(
                     [110.0, 24.0],
-                    egui::TextEdit::singleline(&mut self.new_effort).hint_text("기본 effort"),
+                    egui::TextEdit::singleline(&mut self.new_effort)
+                        .hint_text(catalog.t("agent_sessions.default_effort", &[])),
                 );
                 text_input_ids.push(response.id);
             }
         });
 
-        self.render_llm_provider_controls(ui, text_input_ids, agents_config, ollama_models);
+        self.render_llm_provider_controls(
+            ui,
+            text_input_ids,
+            agents_config,
+            ollama_models,
+            catalog,
+        );
 
         if !self.skill_catalog.is_empty() {
             let skills = self.skill_catalog.clone();
-            egui::CollapsingHeader::new(format!(
-                "skills · {}개 선택",
-                self.selected_skill_paths.len()
+            egui::CollapsingHeader::new(catalog.t(
+                "agent_sessions.skills_selected",
+                &[("count", &self.selected_skill_paths.len().to_string())],
             ))
             .id_salt("agent-skills-catalog")
             .show(ui, |ui| {
@@ -1354,18 +1547,19 @@ impl AgentSessionsUi {
         text_input_ids: &mut Vec<egui::Id>,
         agents_config: &mut AgentsConfig,
         ollama_models: Option<&[String]>,
+        catalog: &i18n::Catalog,
     ) {
         ui.horizontal_wrapped(|ui| {
-            ui.label("LLM 프로바이더");
+            ui.label(catalog.t("agent_sessions.llm_provider", &[]));
             // 콤보 닫힌 상태 표시용 복제 — 닫힌 뒤 클릭 반영은 아래에서 config에 쓴다.
             let selected = agents_config.codex_llm_provider.clone();
             let selected = selected.as_deref();
             egui::ComboBox::from_id_salt("agent-llm-provider")
-                .selected_text(llm_provider_label(selected))
+                .selected_text(llm_provider_label(selected, catalog))
                 .show_ui(ui, |ui| {
                     for value in [None, Some("oss"), Some("custom")] {
                         if ui
-                            .selectable_label(selected == value, llm_provider_label(value))
+                            .selectable_label(selected == value, llm_provider_label(value, catalog))
                             .clicked()
                         {
                             agents_config.codex_llm_provider = value.map(str::to_owned);
@@ -1373,7 +1567,7 @@ impl AgentSessionsUi {
                     }
                 });
             if agents_config.codex_llm_provider.as_deref() == Some("custom") {
-                ui.label("base URL");
+                ui.label(catalog.t("agent_sessions.base_url", &[]));
                 let mut base_url = agents_config.codex_llm_base_url.clone().unwrap_or_default();
                 let response = ui.add_sized(
                     [240.0, 24.0],
@@ -1398,24 +1592,25 @@ impl AgentSessionsUi {
         {
             ui.colored_label(
                 ui.visuals().warn_fg_color,
-                "커스텀 프로바이더는 base URL이 필요합니다 (공백/제어문자 불가)",
+                catalog.t("agent_sessions.custom_base_url_required", &[]),
             );
         }
         if agents_config.codex_llm_provider.as_deref() == Some("custom") {
             // upstream이 실제로 말하는 API (PR-L5). Chat이면 내장 변환 프록시 경유 —
             // 대부분의 ollama 계열 원격/로컬이 /v1/chat/completions만 지원한다.
             ui.horizontal_wrapped(|ui| {
-                ui.label("API 형식");
+                ui.label(catalog.t("agent_sessions.api_format", &[]));
                 // 콤보 닫힌 상태 표시용 복제 — 클릭 반영은 아래에서 config에 쓴다.
                 let selected = agents_config.codex_llm_wire.clone();
                 let selected = selected.as_deref();
                 egui::ComboBox::from_id_salt("agent-llm-wire")
-                    .selected_text(llm_wire_label(selected))
+                    .selected_text(llm_wire_label(selected, catalog))
                     .show_ui(ui, |ui| {
                         for value in [None, Some("responses")] {
-                            let current = llm_wire_label(selected) == llm_wire_label(value);
+                            let current =
+                                llm_wire_label(selected, catalog) == llm_wire_label(value, catalog);
                             if ui
-                                .selectable_label(current, llm_wire_label(value))
+                                .selectable_label(current, llm_wire_label(value, catalog))
                                 .clicked()
                             {
                                 agents_config.codex_llm_wire = value.map(str::to_owned);
@@ -1423,16 +1618,16 @@ impl AgentSessionsUi {
                         }
                     });
             });
-            self.render_llm_api_key_controls(ui, text_input_ids);
+            self.render_llm_api_key_controls(ui, text_input_ids, catalog);
         }
         // OSS 선택 시 감지된 ollama 모델을 클릭 후보로 (PR-L3 — local_llm 감지 배선.
         // 커스텀은 사용자 지시로 검색 없이 입력값 그대로 쓴다, 2026-07-18).
         if agents_config.codex_llm_provider.as_deref() == Some("oss") {
             ui.horizontal_wrapped(|ui| {
-                ui.weak("ollama 모델:");
+                ui.weak(catalog.t("agent_sessions.ollama_models", &[]));
                 match ollama_models {
                     Some([]) => {
-                        ui.weak("없음 — `ollama pull <모델>`로 받으세요.");
+                        ui.weak(catalog.t("agent_sessions.ollama_empty", &[]));
                     }
                     Some(models) => {
                         for model in models.iter().take(8) {
@@ -1442,14 +1637,14 @@ impl AgentSessionsUi {
                         }
                     }
                     None => {
-                        ui.weak("감지 안 됨 (ollama 미실행?)");
+                        ui.weak(catalog.t("agent_sessions.ollama_not_detected", &[]));
                     }
                 }
                 // 수동 재감지 (2026-07-18 사용자) — 앱 실행 중 ollama를 켰거나
                 // 모델을 받은 뒤 목록을 다시 가져온다. App이 take해 감지 워커 재가동.
                 if ui
                     .small_button("⟳")
-                    .on_hover_text("ollama 모델 다시 감지")
+                    .on_hover_text(catalog.t("agent_sessions.ollama_redetect", &[]))
                     .clicked()
                 {
                     self.ollama_redetect_requested = true;
@@ -1459,7 +1654,7 @@ impl AgentSessionsUi {
         // 프로바이더는 프로세스 레벨이라 살아 있는 app-server에는 적용되지 않는다.
         // 유휴 상태면 sync_llm_config가 자동으로 내렸다가 다음 실행에 반영한다.
         if agents_config.codex_llm_provider.is_some() {
-            ui.weak("프로바이더 설정은 다음 Codex 실행부터 적용됩니다.");
+            ui.weak(catalog.t("agent_sessions.provider_next_run", &[]));
         }
     }
 
@@ -1469,6 +1664,7 @@ impl AgentSessionsUi {
         &mut self,
         ui: &mut egui::Ui,
         text_input_ids: &mut Vec<egui::Id>,
+        catalog: &i18n::Catalog,
     ) {
         // 저장소 미주입(테스트 등)이면 키 UI를 렌더하지 않는다.
         let Some(store) = self.api_key_store.clone() else {
@@ -1480,16 +1676,19 @@ impl AgentSessionsUi {
                 Ok(present) => self.api_key_present = Some(present),
                 Err(error) => {
                     self.api_key_present = Some(false);
-                    self.api_key_error = Some(format!("API 키 확인 실패: {error:#}"));
+                    self.api_key_error = Some(CatalogMessage::Error {
+                        key: "agent_sessions.api_key_check_failed",
+                        detail: format!("{error:#}"),
+                    });
                 }
             }
         }
         ui.horizontal_wrapped(|ui| {
-            ui.label("API 키");
+            ui.label(catalog.t("agent_sessions.api_key", &[]));
             let hint = if self.api_key_present == Some(true) {
-                "저장됨 — 새 키 입력 시 교체"
+                catalog.t("agent_sessions.api_key_replace_hint", &[])
             } else {
-                "(선택) 인증이 필요한 엔드포인트용"
+                catalog.t("agent_sessions.api_key_optional_hint", &[])
             };
             let response = ui.add_sized(
                 [240.0, 24.0],
@@ -1500,19 +1699,21 @@ impl AgentSessionsUi {
             text_input_ids.push(response.id);
             let has_input = !self.api_key_input.trim().is_empty();
             if ui
-                .add_enabled(has_input, egui::Button::new("저장"))
+                .add_enabled(has_input, egui::Button::new(catalog.t("action.save", &[])))
                 .clicked()
             {
                 self.save_api_key(store.as_ref());
             }
-            if self.api_key_present == Some(true) && ui.button("삭제").clicked() {
+            if self.api_key_present == Some(true)
+                && ui.button(catalog.t("action.delete", &[])).clicked()
+            {
                 self.delete_api_key(store.as_ref());
             }
         });
         if let Some(error) = &self.api_key_error {
-            ui.colored_label(ui.visuals().warn_fg_color, error);
+            ui.colored_label(ui.visuals().warn_fg_color, error.render(catalog));
         } else if self.api_key_present == Some(true) {
-            ui.weak("API 키가 keyring에 저장되어 있습니다 — 다음 Codex 실행부터 적용됩니다.");
+            ui.weak(catalog.t("agent_sessions.api_key_stored", &[]));
         }
     }
 
@@ -1522,7 +1723,7 @@ impl AgentSessionsUi {
         let key = match validate_llm_api_key(&self.api_key_input) {
             Ok(key) => key,
             Err(error) => {
-                self.api_key_error = Some(format!("{error:#}"));
+                self.api_key_error = Some(CatalogMessage::raw(format!("{error:#}")));
                 return;
             }
         };
@@ -1534,7 +1735,12 @@ impl AgentSessionsUi {
                 // 유휴 client는 sync_llm_config가 내렸다가 다음 spawn에 새 키를 쓴다.
                 self.api_key_generation += 1;
             }
-            Err(error) => self.api_key_error = Some(format!("API 키 저장 실패: {error:#}")),
+            Err(error) => {
+                self.api_key_error = Some(CatalogMessage::Error {
+                    key: "agent_sessions.api_key_save_failed",
+                    detail: format!("{error:#}"),
+                });
+            }
         }
     }
 
@@ -1545,12 +1751,22 @@ impl AgentSessionsUi {
                 self.api_key_error = None;
                 self.api_key_generation += 1;
             }
-            Err(error) => self.api_key_error = Some(format!("API 키 삭제 실패: {error:#}")),
+            Err(error) => {
+                self.api_key_error = Some(CatalogMessage::Error {
+                    key: "agent_sessions.api_key_delete_failed",
+                    detail: format!("{error:#}"),
+                });
+            }
         }
     }
 
-    fn render_surface_tabs(&mut self, ui: &mut egui::Ui, actions: &mut Vec<PanelAction>) {
-        ui.strong("에이전트");
+    fn render_surface_tabs(
+        &mut self,
+        ui: &mut egui::Ui,
+        actions: &mut Vec<PanelAction>,
+        catalog: &i18n::Catalog,
+    ) {
+        ui.strong(catalog.t("agent_sessions.agents_heading", &[]));
         let pty_tabs = self
             .pty_surfaces
             .iter()
@@ -1574,8 +1790,8 @@ impl AgentSessionsUi {
                     },
                     format!(
                         "[APP] Codex · {} · {}",
-                        one_line_title(&session.prompt),
-                        session.status.label()
+                        one_line_title(&session.prompt, catalog),
+                        structured_status_label(session.status, catalog)
                     ),
                     AgentVisualState::from_structured(session.status),
                 )
@@ -1597,29 +1813,38 @@ impl AgentSessionsUi {
         ui: &mut egui::Ui,
         surface: AgentSurfaceSnapshot,
         actions: &mut Vec<PanelAction>,
+        catalog: &i18n::Catalog,
     ) {
         ui.horizontal_wrapped(|ui| {
             if let Some(model) = &surface.model {
-                ui.weak("model");
+                ui.weak(catalog.t("agent_sessions.model", &[]));
                 ui.monospace(model);
             }
             if let Some(effort) = &surface.effort {
-                ui.weak("effort");
+                ui.weak(catalog.t("agent_sessions.effort", &[]));
                 ui.monospace(effort);
             }
             if let Some(context_pct) = surface.context_pct {
-                ui.weak(format!("ctx {context_pct}%"));
+                ui.weak(catalog.t(
+                    "agent_sessions.context_percent",
+                    &[("percent", &context_pct.to_string())],
+                ));
             }
         });
-        ui.label("이 에이전트는 기존 PTY 터미널에서 실행됩니다. 원본 ANSI 출력과 IME 입력 경로는 그대로 유지됩니다.");
+        ui.label(catalog.t("agent_sessions.pty_description", &[]));
         ui.horizontal(|ui| {
-            if ui.button("터미널로 이동").clicked() {
+            if ui
+                .button(catalog.t("agent_sessions.focus_terminal", &[]))
+                .clicked()
+            {
                 actions.push(PanelAction::FocusPty(surface.id.clone()));
             }
             if matches!(
                 surface.state,
                 AgentVisualState::Active | AgentVisualState::Waiting
-            ) && ui.button("중단 (Ctrl-C)").clicked()
+            ) && ui
+                .button(catalog.t("agent_sessions.interrupt_ctrl_c", &[]))
+                .clicked()
             {
                 actions.push(PanelAction::InterruptPty(surface.id));
             }
@@ -1632,6 +1857,7 @@ impl AgentSessionsUi {
         session: &AgentSession,
         actions: &mut Vec<PanelAction>,
         text_input_ids: &mut Vec<egui::Id>,
+        catalog: &i18n::Catalog,
     ) {
         let mut model = session.model.clone().unwrap_or_default();
         let mut effort = session.effort.clone().unwrap_or_default();
@@ -1641,7 +1867,7 @@ impl AgentSessionsUi {
             .map(|skill| skill.path.clone())
             .collect::<HashSet<_>>();
         let before = (model.clone(), effort.clone(), skill_paths.clone());
-        ui.collapsing("다음 turn 설정", |ui| {
+        ui.collapsing(catalog.t("agent_sessions.next_turn_settings", &[]), |ui| {
             render_turn_control_fields(
                 ui,
                 &session.id,
@@ -1651,10 +1877,9 @@ impl AgentSessionsUi {
                 &mut effort,
                 &mut skill_paths,
                 text_input_ids,
+                catalog,
             );
-            ui.weak(
-                "model/effort 변경은 서버 설정을 즉시 바꾸지 않고 다음 turn/start에 적용됩니다.",
-            );
+            ui.weak(catalog.t("agent_sessions.next_turn_hint", &[]));
         });
         if before != (model.clone(), effort.clone(), skill_paths.clone()) {
             let skills = if self.skill_catalog.is_empty() {
@@ -1694,6 +1919,7 @@ impl AgentSessionsUi {
         workspace_cwd: Option<String>,
         actions: &mut Vec<PanelAction>,
         text_input_ids: &mut Vec<egui::Id>,
+        catalog: &i18n::Catalog,
     ) {
         let is_persisted = self.persisted_threads.contains_key(&session.id);
         let is_attached = self.attached_threads.contains(&session.id);
@@ -1703,77 +1929,91 @@ impl AgentSessionsUi {
             .any(|pending| pending.session_id() == session.id);
         ui.horizontal(|ui| {
             let color = status_color(session.status);
-            ui.colored_label(color, format!("● {}", session.status.label()));
+            ui.colored_label(
+                color,
+                format!("● {}", structured_status_label(session.status, catalog)),
+            );
             if let Some(thread_id) = &session.thread_id {
-                ui.weak("thread");
+                ui.weak(catalog.t("agent_sessions.thread", &[]));
                 ui.monospace(short_id(thread_id));
             }
             if matches!(
                 session.status,
                 AgentSessionStatus::Running | AgentSessionStatus::AwaitingApproval
             ) && (!is_persisted || is_attached)
-                && ui.button("중단").clicked()
+                && ui
+                    .button(catalog.t("agent_sessions.interrupt", &[]))
+                    .clicked()
             {
                 actions.push(PanelAction::Interrupt(session.id.clone()));
             }
-            if session.status == AgentSessionStatus::Completed && ui.button("완료 확인").clicked()
+            if session.status == AgentSessionStatus::Completed
+                && ui
+                    .button(catalog.t("agent_sessions.acknowledge_completion", &[]))
+                    .clicked()
             {
                 actions.push(PanelAction::Acknowledge(session.id.clone()));
             }
         });
         ui.horizontal(|ui| {
-            ui.weak("요청");
+            ui.weak(catalog.t("agent_sessions.request", &[]));
             ui.add(egui::Label::new(&session.prompt).truncate())
                 .on_hover_text(&session.prompt);
         });
         if let Some(cwd) = &session.cwd {
             ui.horizontal(|ui| {
-                ui.weak("cwd");
+                ui.weak(catalog.t("agent_sessions.working_directory", &[]));
                 ui.monospace(cwd);
             });
         }
         if let Some(model) = &session.model {
             ui.horizontal(|ui| {
-                ui.weak("model");
+                ui.weak(catalog.t("agent_sessions.model", &[]));
                 ui.monospace(model);
             });
         }
         if let Some(effort) = &session.effort {
             ui.horizontal(|ui| {
-                ui.weak("effort");
+                ui.weak(catalog.t("agent_sessions.effort", &[]));
                 ui.monospace(effort);
             });
         }
         if !session.skills.is_empty() {
             ui.horizontal_wrapped(|ui| {
-                ui.weak("skills");
+                ui.weak(catalog.t("agent_sessions.skills", &[]));
                 for skill in &session.skills {
                     ui.monospace(&skill.name).on_hover_text(&skill.path);
                 }
             });
         }
         if session.thread_id.is_some() {
-            self.render_session_turn_controls(ui, &session, actions, text_input_ids);
+            self.render_session_turn_controls(ui, &session, actions, text_input_ids, catalog);
         }
         if is_persisted {
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(
                         !request_pending && !is_attached,
-                        egui::Button::new("thread 재개"),
+                        egui::Button::new(catalog.t("agent_sessions.resume_thread", &[])),
                     )
                     .clicked()
                 {
                     actions.push(PanelAction::ResumePersisted(session.id.clone()));
                 }
                 if ui
-                    .add_enabled(!request_pending, egui::Button::new("기록 읽기"))
+                    .add_enabled(
+                        !request_pending,
+                        egui::Button::new(catalog.t("agent_sessions.read_history", &[])),
+                    )
                     .clicked()
                 {
                     actions.push(PanelAction::ReadPersisted(session.id.clone()));
                 }
                 if ui
-                    .add_enabled(!request_pending && !is_attached, egui::Button::new("보관"))
+                    .add_enabled(
+                        !request_pending && !is_attached,
+                        egui::Button::new(catalog.t("agent_sessions.archive", &[])),
+                    )
                     .clicked()
                 {
                     actions.push(PanelAction::ArchivePersisted(session.id.clone()));
@@ -1781,14 +2021,14 @@ impl AgentSessionsUi {
                 if ui
                     .add_enabled(
                         !request_pending && !is_attached,
-                        egui::Button::new("로컬 기록 삭제"),
+                        egui::Button::new(catalog.t("agent_sessions.delete_local", &[])),
                     )
                     .clicked()
                 {
                     actions.push(PanelAction::DeletePersisted(session.id.clone()));
                 }
                 if request_pending {
-                    ui.weak("App Server 응답 대기 중…");
+                    ui.weak(catalog.t("agent_sessions.server_waiting", &[]));
                 }
             });
         }
@@ -1801,18 +2041,18 @@ impl AgentSessionsUi {
             && session.turn_id.is_some()
         {
             ui.add_space(4.0);
-            ui.label("현재 turn에 추가 지시 (steer)");
+            ui.label(catalog.t("agent_sessions.steer_label", &[]));
             ui.horizontal(|ui| {
                 let response = ui.add_sized(
                     [ui.available_width() - 110.0, 38.0],
                     egui::TextEdit::multiline(&mut self.steer_input)
-                        .hint_text("진행 중인 작업에 지금 반영할 지시"),
+                        .hint_text(catalog.t("agent_sessions.steer_hint", &[])),
                 );
                 text_input_ids.push(response.id);
                 if ui
                     .add_enabled(
                         !self.steer_input.trim().is_empty(),
-                        egui::Button::new("steer 전송"),
+                        egui::Button::new(catalog.t("agent_sessions.send_steer", &[])),
                     )
                     .clicked()
                 {
@@ -1830,9 +2070,14 @@ impl AgentSessionsUi {
                 ui.horizontal(|ui| {
                     ui.colored_label(
                         egui::Color32::from_rgb(0xff, 0xbf, 0x69),
-                        approval.kind.label(),
+                        approval_kind_label(approval.kind, catalog),
                     );
-                    ui.strong(approval.command.as_deref().unwrap_or("사용자 승인 필요"));
+                    ui.strong(
+                        approval
+                            .command
+                            .clone()
+                            .unwrap_or_else(|| catalog.t("agent_sessions.approval_required", &[])),
+                    );
                 });
                 if let Some(reason) = &approval.reason {
                     ui.label(reason);
@@ -1841,28 +2086,40 @@ impl AgentSessionsUi {
                     ui.monospace(cwd);
                 }
                 ui.horizontal(|ui| {
-                    if ui.button("이번만 허용").clicked() {
+                    if ui
+                        .button(catalog.t("agent_sessions.allow_once", &[]))
+                        .clicked()
+                    {
                         actions.push(PanelAction::Approval {
                             session_id: session.id.clone(),
                             request_key: approval.request_key.clone(),
                             decision: AgentApprovalDecision::Accept,
                         });
                     }
-                    if ui.button("세션 동안 허용").clicked() {
+                    if ui
+                        .button(catalog.t("agent_sessions.allow_for_session", &[]))
+                        .clicked()
+                    {
                         actions.push(PanelAction::Approval {
                             session_id: session.id.clone(),
                             request_key: approval.request_key.clone(),
                             decision: AgentApprovalDecision::AcceptForSession,
                         });
                     }
-                    if ui.button("거절").clicked() {
+                    if ui
+                        .button(catalog.t("agent_sessions.decline", &[]))
+                        .clicked()
+                    {
                         actions.push(PanelAction::Approval {
                             session_id: session.id.clone(),
                             request_key: approval.request_key.clone(),
                             decision: AgentApprovalDecision::Decline,
                         });
                     }
-                    if ui.button("작업 취소").clicked() {
+                    if ui
+                        .button(catalog.t("agent_sessions.cancel_task", &[]))
+                        .clicked()
+                    {
                         actions.push(PanelAction::Approval {
                             session_id: session.id.clone(),
                             request_key: approval.request_key.clone(),
@@ -1874,7 +2131,7 @@ impl AgentSessionsUi {
             ui.add_space(4.0);
         }
 
-        ui.strong("구조화 결과");
+        ui.strong(catalog.t("agent_sessions.structured_results", &[]));
         let rows = session.table_rows();
         egui::ScrollArea::vertical()
             .id_salt(("agent-session-table", &session.id))
@@ -1885,24 +2142,24 @@ impl AgentSessionsUi {
                     .striped(true)
                     .min_col_width(64.0)
                     .show(ui, |ui| {
-                        ui.strong("상태");
-                        ui.strong("유형");
-                        ui.strong("작업");
-                        ui.strong("위치");
-                        ui.strong("결과");
+                        ui.strong(catalog.t("agent_sessions.column.status", &[]));
+                        ui.strong(catalog.t("agent_sessions.column.type", &[]));
+                        ui.strong(catalog.t("agent_sessions.column.task", &[]));
+                        ui.strong(catalog.t("agent_sessions.column.location", &[]));
+                        ui.strong(catalog.t("agent_sessions.column.result", &[]));
                         ui.end_row();
                         for row in rows {
                             let item_id = row.item_id;
                             let selected = self.selected_item.as_deref() == Some(item_id.as_str());
                             let state_response = ui.add_sized(
                                 [90.0, 20.0],
-                                egui::Label::new(row.state)
+                                egui::Label::new(localized_item_state(&row.state, catalog))
                                     .sense(egui::Sense::click())
                                     .truncate(),
                             );
                             let kind_response = ui.add_sized(
                                 [86.0, 20.0],
-                                egui::Label::new(row.kind)
+                                egui::Label::new(localized_item_kind(&row.kind, catalog))
                                     .sense(egui::Sense::click())
                                     .truncate(),
                             );
@@ -1942,7 +2199,10 @@ impl AgentSessionsUi {
             && let Some(item) = session.items.iter().find(|item| &item.id == item_id)
         {
             ui.add_space(6.0);
-            ui.strong(format!("상세 · {}", item.kind.label()));
+            ui.strong(catalog.t(
+                "agent_sessions.details",
+                &[("kind", &localized_item_kind(item.kind.label(), catalog))],
+            ));
             if let Some(detail) = &item.detail {
                 ui.label(detail);
             }
@@ -1967,11 +2227,11 @@ impl AgentSessionsUi {
         {
             ui.add_space(6.0);
             crate::ui::hairline(ui);
-            ui.label("후속 작업");
+            ui.label(catalog.t("agent_sessions.follow_up", &[]));
             let follow_up_response = ui.add_sized(
                 [ui.available_width(), 48.0],
                 egui::TextEdit::multiline(&mut self.follow_up)
-                    .hint_text("같은 thread에 다음 작업을 보냅니다")
+                    .hint_text(catalog.t("agent_sessions.follow_up_hint", &[]))
                     .desired_rows(2),
             );
             text_input_ids.push(follow_up_response.id);
@@ -1982,7 +2242,7 @@ impl AgentSessionsUi {
             if ui
                 .add_enabled(
                     !self.follow_up.trim().is_empty(),
-                    egui::Button::new("후속 작업 전송"),
+                    egui::Button::new(catalog.t("agent_sessions.send_follow_up", &[])),
                 )
                 .clicked()
             {
@@ -2009,7 +2269,18 @@ impl AgentSessionsUi {
                 effort,
                 skills,
                 cwd,
-            } => self.start(workspace_id, prompt, model, effort, skills, cwd, ctx),
+            } => {
+                self.start(
+                    workspace_id.clone(),
+                    prompt,
+                    model,
+                    effort,
+                    skills,
+                    cwd,
+                    ctx,
+                );
+                external_request = Some(AgentSessionsRequest::RevealWorkspace(workspace_id));
+            }
             PanelAction::Submit {
                 session_id,
                 prompt,
@@ -2020,7 +2291,10 @@ impl AgentSessionsUi {
                     .client
                     .as_ref()
                     .ok_or_else(|| {
-                        anyhow::anyhow!("Codex App Server 연결이 없습니다. 새 세션을 시작하세요.")
+                        anyhow::anyhow!(
+                            self.catalog
+                                .t("agent_sessions.error.no_app_server_start", &[])
+                        )
                     })
                     .and_then(|client| settings.map(|settings| (client, settings)))
                     .and_then(|(client, (model, effort, skills))| {
@@ -2034,7 +2308,11 @@ impl AgentSessionsUi {
                         )
                     });
                 if let Err(error) = result {
-                    self.fail_session(&session_id, format!("후속 작업 전송 실패: {error:#}"));
+                    self.fail_session_localized(
+                        &session_id,
+                        "agent_sessions.error.follow_up_send_failed",
+                        &error,
+                    );
                 }
             }
             PanelAction::Steer {
@@ -2045,20 +2323,24 @@ impl AgentSessionsUi {
                 let result = self
                     .client
                     .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Codex App Server 연결이 없습니다"))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(self.catalog.t("agent_sessions.error.no_app_server", &[]))
+                    })
                     .and_then(|client| client.steer_turn(session_id.clone(), prompt, skills));
                 if let Err(error) = result {
-                    self.apply_session_event(
+                    self.control_error_localized(
                         &session_id,
-                        AgentSessionEvent::ControlError {
-                            message: format!("turn steer 실패: {error:#}"),
-                        },
+                        "agent_sessions.error.steer_failed",
+                        &error,
                     );
                 }
             }
             PanelAction::RefreshCatalog { cwd, force_reload } => {
                 if let Err(error) = self.request_catalogs(ctx, cwd, force_reload) {
-                    self.catalog_error = Some(format!("카탈로그 요청 실패: {error:#}"));
+                    self.catalog_error = Some(CatalogMessage::error(
+                        "agent_sessions.error.catalog_request_failed",
+                        &error,
+                    ));
                 }
             }
             PanelAction::UpdateTurnControls {
@@ -2082,10 +2364,16 @@ impl AgentSessionsUi {
                 let result = self
                     .client
                     .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Codex App Server 연결이 없습니다"))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(self.catalog.t("agent_sessions.error.no_app_server", &[]))
+                    })
                     .and_then(|client| client.interrupt(session_id.clone()));
                 if let Err(error) = result {
-                    self.fail_session(&session_id, format!("작업 중단 실패: {error:#}"));
+                    self.fail_session_localized(
+                        &session_id,
+                        "agent_sessions.error.interrupt_failed",
+                        &error,
+                    );
                 }
             }
             PanelAction::Acknowledge(session_id) => {
@@ -2105,32 +2393,54 @@ impl AgentSessionsUi {
                 let result = self
                     .client
                     .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Codex App Server 연결이 없습니다"))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(self.catalog.t("agent_sessions.error.no_app_server", &[]))
+                    })
                     .and_then(|client| {
                         client.respond_approval(session_id.clone(), request_key, decision)
                     });
                 if let Err(error) = result {
-                    self.fail_session(&session_id, format!("승인 응답 전송 실패: {error:#}"));
+                    self.fail_session_localized(
+                        &session_id,
+                        "agent_sessions.error.approval_response_failed",
+                        &error,
+                    );
                 }
             }
             PanelAction::ReadPersisted(session_id) => {
                 if let Err(error) = self.read_selected_persisted(ctx) {
-                    self.fail_session(&session_id, format!("thread 기록 읽기 실패: {error:#}"));
+                    self.fail_session_localized(
+                        &session_id,
+                        "agent_sessions.error.read_history_start_failed",
+                        &error,
+                    );
                 }
             }
             PanelAction::ResumePersisted(session_id) => {
                 if let Err(error) = self.resume_selected_persisted(ctx) {
-                    self.fail_session(&session_id, format!("thread 복구 시작 실패: {error:#}"));
+                    self.fail_session_localized(
+                        &session_id,
+                        "agent_sessions.error.resume_start_failed",
+                        &error,
+                    );
                 }
             }
             PanelAction::ArchivePersisted(session_id) => {
                 if let Err(error) = self.archive_selected_persisted(ctx) {
-                    self.fail_session(&session_id, format!("thread 보관 시작 실패: {error:#}"));
+                    self.fail_session_localized(
+                        &session_id,
+                        "agent_sessions.error.archive_start_failed",
+                        &error,
+                    );
                 }
             }
             PanelAction::DeletePersisted(session_id) => {
                 if let Err(error) = self.delete_selected_persisted() {
-                    self.fail_session(&session_id, format!("로컬 thread 삭제 실패: {error:#}"));
+                    self.fail_session_localized(
+                        &session_id,
+                        "agent_sessions.error.delete_local_failed",
+                        &error,
+                    );
                 }
             }
             PanelAction::FocusPty(id) => {
@@ -2161,6 +2471,7 @@ impl AgentSessionsUi {
         session.model = non_empty(model.clone());
         session.effort = non_empty(effort.clone());
         session.skills = skills.clone();
+        let mut localized_failure = None;
         let result = self.ensure_client(ctx).and_then(|()| {
             self.client
                 .as_ref()
@@ -2175,16 +2486,25 @@ impl AgentSessionsUi {
                 )
         });
         if let Err(error) = result {
+            let failure = CatalogMessage::error("agent_sessions.error.codex_run_failed", &error);
             session.apply(AgentSessionEvent::Failed {
-                message: format!("Codex 실행 실패: {error:#}"),
+                message: failure.render(&self.catalog),
             });
-            self.transport_error = Some(format!("Codex App Server 연결 실패: {error:#}"));
+            localized_failure = Some(failure);
+            self.transport_error = Some(CatalogMessage::error(
+                "agent_sessions.error.app_server_connect_failed",
+                &error,
+            ));
         }
         let failed = session.status == AgentSessionStatus::Failed;
         if !failed {
             self.attached_threads.insert(session_id.clone());
         }
         self.sessions.push(session);
+        if let Some(error) = localized_failure {
+            self.localized_session_errors
+                .insert(session_id.clone(), error);
+        }
         self.selected_session = Some(session_id.clone());
         self.selected_surface = Some(AgentSurfaceId::Structured { session_id });
         self.selected_item = None;
@@ -2194,11 +2514,45 @@ impl AgentSessionsUi {
         }
     }
 
-    fn fail_session(&mut self, session_id: &str, message: String) {
-        self.apply_session_event(session_id, AgentSessionEvent::Failed { message });
+    fn fail_session_localized(
+        &mut self,
+        session_id: &str,
+        key: &'static str,
+        error: &anyhow::Error,
+    ) {
+        self.apply_localized_session_error(session_id, key, error, true);
+    }
+
+    fn control_error_localized(
+        &mut self,
+        session_id: &str,
+        key: &'static str,
+        error: &anyhow::Error,
+    ) {
+        self.apply_localized_session_error(session_id, key, error, false);
+    }
+
+    fn apply_localized_session_error(
+        &mut self,
+        session_id: &str,
+        key: &'static str,
+        error: &anyhow::Error,
+        fatal: bool,
+    ) {
+        let message = CatalogMessage::error(key, error);
+        let rendered = message.render(&self.catalog);
+        let event = if fatal {
+            AgentSessionEvent::Failed { message: rendered }
+        } else {
+            AgentSessionEvent::ControlError { message: rendered }
+        };
+        self.apply_session_event(session_id, event);
+        self.localized_session_errors
+            .insert(session_id.to_owned(), message);
     }
 
     fn apply_session_event(&mut self, session_id: &str, event: AgentSessionEvent) {
+        self.localized_session_errors.remove(session_id);
         let gained_thread = matches!(&event, AgentSessionEvent::ThreadStarted { .. });
         let changed = self
             .sessions
@@ -2234,7 +2588,7 @@ impl AgentSessionsUi {
         self.status_notices.push(AgentSessionStatusNotice {
             workspace_id,
             session_id: session.id.clone(),
-            title: one_line_title(&session.prompt),
+            title: one_line_title(&session.prompt, &self.catalog),
             status: session.status,
         });
     }
@@ -2336,25 +2690,36 @@ enum PanelAction {
 }
 
 #[allow(dead_code)] // Reachable from the pending App-level history import.
-fn persisted_title(row: &StructuredThreadRow) -> String {
+fn persisted_title(row: &StructuredThreadRow, catalog: &i18n::Catalog) -> String {
     let title = row.title.trim();
     if title.is_empty() {
-        format!("Codex thread {}", short_id(&row.thread_id))
+        catalog.t(
+            "agent_sessions.persisted_thread_title",
+            &[("id", &short_id(&row.thread_id))],
+        )
     } else {
         title.to_owned()
     }
 }
 
 #[allow(dead_code)] // Reachable from the pending App-level history import.
-fn apply_persisted_metadata(session: &mut AgentSession, row: &StructuredThreadRow) {
+fn apply_persisted_metadata(
+    session: &mut AgentSession,
+    row: &StructuredThreadRow,
+    catalog: &i18n::Catalog,
+) {
     session.workspace_id = Some(row.workspace_id.clone());
-    session.prompt = persisted_title(row);
+    session.prompt = persisted_title(row, catalog);
     session.cwd = non_empty(row.cwd.clone());
     session.model = row.model.clone();
     session.thread_id = Some(row.thread_id.clone());
 }
 
-fn render_selected_surface_header(ui: &mut egui::Ui, surface: &AgentSurfaceSnapshot) {
+fn render_selected_surface_header(
+    ui: &mut egui::Ui,
+    surface: &AgentSurfaceSnapshot,
+    catalog: &i18n::Catalog,
+) {
     ui.horizontal(|ui| {
         ui.colored_label(
             crate::ui::agent_visuals::status_color(surface.state),
@@ -2366,10 +2731,11 @@ fn render_selected_surface_header(ui: &mut egui::Ui, surface: &AgentSurfaceSnaps
         );
         ui.strong(&surface.title);
     });
-    ui.weak(match surface.transport {
-        AgentTransport::AppServer => "structured thread · turn · item stream",
-        AgentTransport::Pty => "interactive terminal · raw ANSI/IME input",
-    });
+    let key = match surface.transport {
+        AgentTransport::AppServer => "agent_sessions.surface.app_description",
+        AgentTransport::Pty => "agent_sessions.surface.pty_description",
+    };
+    ui.weak(catalog.t(key, &[]));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2382,17 +2748,19 @@ fn render_turn_control_fields(
     effort_value: &mut String,
     selected_skill_paths: &mut HashSet<String>,
     text_input_ids: &mut Vec<egui::Id>,
+    catalog: &i18n::Catalog,
 ) {
     let selected_model = models
         .iter()
         .find(|model| model.model == *model_value)
         .cloned();
     ui.horizontal_wrapped(|ui| {
-        ui.label("모델");
+        ui.label(catalog.t("agent_sessions.model", &[]));
         if models.is_empty() {
             let response = ui.add_sized(
                 [210.0, 24.0],
-                egui::TextEdit::singleline(model_value).hint_text("기본 Codex 모델"),
+                egui::TextEdit::singleline(model_value)
+                    .hint_text(catalog.t("agent_sessions.default_codex_model", &[])),
             );
             text_input_ids.push(response.id);
         } else {
@@ -2421,7 +2789,7 @@ fn render_turn_control_fields(
                     }
                 });
         }
-        ui.label("effort");
+        ui.label(catalog.t("agent_sessions.effort", &[]));
         if let Some(model) = selected_model {
             egui::ComboBox::from_id_salt(("agent-turn-effort", id))
                 .selected_text(effort_value.as_str())
@@ -2438,36 +2806,42 @@ fn render_turn_control_fields(
         } else {
             let response = ui.add_sized(
                 [110.0, 24.0],
-                egui::TextEdit::singleline(effort_value).hint_text("기본 effort"),
+                egui::TextEdit::singleline(effort_value)
+                    .hint_text(catalog.t("agent_sessions.default_effort", &[])),
             );
             text_input_ids.push(response.id);
         }
     });
     if !skills.is_empty() {
-        egui::CollapsingHeader::new(format!("skills · {}개 선택", selected_skill_paths.len()))
-            .id_salt(("agent-turn-skills", id))
-            .show(ui, |ui| {
-                for skill in skills {
-                    let selected = selected_skill_paths.contains(&skill.path);
-                    let mut checked = selected;
-                    ui.add_enabled(
-                        skill.enabled,
-                        egui::Checkbox::new(
-                            &mut checked,
-                            format!("{} · {}", skill.name, skill.scope),
-                        ),
-                    )
-                    .on_hover_text(format!("{}\n{}", skill.description, skill.path));
-                    if checked != selected {
-                        if checked {
-                            selected_skill_paths.insert(skill.path.clone());
-                        } else {
-                            selected_skill_paths.remove(&skill.path);
-                        }
+        egui::CollapsingHeader::new(catalog.t(
+            "agent_sessions.skills_selected",
+            &[("count", &selected_skill_paths.len().to_string())],
+        ))
+        .id_salt(("agent-turn-skills", id))
+        .show(ui, |ui| {
+            for skill in skills {
+                let selected = selected_skill_paths.contains(&skill.path);
+                let mut checked = selected;
+                ui.add_enabled(
+                    skill.enabled,
+                    egui::Checkbox::new(&mut checked, format!("{} · {}", skill.name, skill.scope)),
+                )
+                .on_hover_text(format!("{}\n{}", skill.description, skill.path));
+                if checked != selected {
+                    if checked {
+                        selected_skill_paths.insert(skill.path.clone());
+                    } else {
+                        selected_skill_paths.remove(&skill.path);
                     }
                 }
-            });
+            }
+        });
     }
+}
+
+fn localized_error(catalog: &i18n::Catalog, key: &str, error: &anyhow::Error) -> String {
+    let detail = format!("{error:#}");
+    catalog.t(key, &[("error", &detail)])
 }
 
 fn non_empty(value: String) -> Option<String> {
@@ -2476,32 +2850,88 @@ fn non_empty(value: String) -> Option<String> {
 
 /// LLM 프로바이더 콤보 표시 문자열 (PR-L2). 미지값은 config 로드 정규화가 막지만
 /// 방어적으로 원문을 그대로 보여준다.
-fn llm_provider_label(provider: Option<&str>) -> &str {
+fn llm_provider_label(provider: Option<&str>, catalog: &i18n::Catalog) -> String {
     match provider {
-        None => "기본 (구독/기존 설정)",
-        Some("oss") => "로컬 OSS (ollama)",
-        Some("custom") => "커스텀 (OpenAI 호환)",
-        Some(other) => other,
+        None => catalog.t("agent_sessions.provider.default", &[]),
+        Some("oss") => catalog.t("agent_sessions.provider.oss", &[]),
+        Some("custom") => catalog.t("agent_sessions.provider.custom", &[]),
+        Some(other) => other.to_owned(),
     }
 }
 
 /// custom wire API 콤보 표시 (PR-L5). None/chat = 기본(내장 변환 프록시 경유).
-fn llm_wire_label(wire: Option<&str>) -> &str {
+fn llm_wire_label(wire: Option<&str>, catalog: &i18n::Catalog) -> String {
     match wire {
-        None | Some("chat") => "Chat Completions (기본)",
-        Some("responses") => "Responses",
-        Some(other) => other,
+        None | Some("chat") => catalog.t("agent_sessions.wire.chat_default", &[]),
+        Some("responses") => catalog.t("agent_sessions.wire.responses", &[]),
+        Some(other) => other.to_owned(),
     }
+}
+
+fn structured_status_label(status: AgentSessionStatus, catalog: &i18n::Catalog) -> String {
+    let key = match status {
+        AgentSessionStatus::Starting => "agent_sessions.status.starting",
+        AgentSessionStatus::Ready => "agent_sessions.status.ready",
+        AgentSessionStatus::Running => "agent_sessions.status.running",
+        AgentSessionStatus::AwaitingApproval => "agent_sessions.status.awaiting_approval",
+        AgentSessionStatus::Completed => "agent_sessions.status.completed",
+        AgentSessionStatus::Interrupted => "agent_sessions.status.interrupted",
+        AgentSessionStatus::Failed => "agent_sessions.status.failed",
+        AgentSessionStatus::Stopped => "agent_sessions.status.stopped",
+    };
+    catalog.t(key, &[])
+}
+
+fn approval_kind_label(kind: AgentApprovalKind, catalog: &i18n::Catalog) -> String {
+    let key = match kind {
+        AgentApprovalKind::CommandExecution => "agent_sessions.approval.command",
+        AgentApprovalKind::FileChange => "agent_sessions.approval.file_change",
+    };
+    catalog.t(key, &[])
+}
+
+fn localized_item_state(state: &str, catalog: &i18n::Catalog) -> String {
+    let key = match state {
+        "starting" => Some("agent_sessions.status.starting"),
+        "ready" | "idle" => Some("agent_sessions.status.ready"),
+        "running" | "inProgress" => Some("agent_sessions.status.running"),
+        "approval" => Some("agent_sessions.status.awaiting_approval"),
+        "completed" => Some("agent_sessions.status.completed"),
+        "interrupted" => Some("agent_sessions.status.interrupted"),
+        "failed" => Some("agent_sessions.status.failed"),
+        "stopped" => Some("agent_sessions.status.stopped"),
+        _ => None,
+    };
+    key.map_or_else(|| state.to_owned(), |key| catalog.t(key, &[]))
+}
+
+fn localized_item_kind(kind: &str, catalog: &i18n::Catalog) -> String {
+    let key = match kind {
+        "input" => Some("agent_sessions.item.input"),
+        "answer" => Some("agent_sessions.item.answer"),
+        "plan" => Some("agent_sessions.item.plan"),
+        "reasoning" => Some("agent_sessions.item.reasoning"),
+        "command" => Some("agent_sessions.item.command"),
+        "file change" => Some("agent_sessions.item.file_change"),
+        "connector" => Some("agent_sessions.item.connector"),
+        "web search" => Some("agent_sessions.item.web_search"),
+        "image" => Some("agent_sessions.item.image"),
+        "review" => Some("agent_sessions.item.review"),
+        "context" => Some("agent_sessions.item.context"),
+        "event" => Some("agent_sessions.item.event"),
+        _ => None,
+    };
+    key.map_or_else(|| kind.to_owned(), |key| catalog.t(key, &[]))
 }
 
 fn short_id(value: &str) -> String {
     value.chars().take(8).collect()
 }
 
-fn one_line_title(value: &str) -> String {
+fn one_line_title(value: &str, catalog: &i18n::Catalog) -> String {
     let title = value.lines().next().unwrap_or_default().trim();
     if title.is_empty() {
-        "Codex 작업".to_owned()
+        catalog.t("agent_sessions.default_task", &[])
     } else {
         title.chars().take(80).collect()
     }
@@ -2520,6 +2950,10 @@ mod tests {
     use crate::codex_app_server::CodexLlmWire;
     use serde_json::json;
     use std::sync::mpsc;
+
+    fn catalog() -> i18n::Catalog {
+        i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap()
+    }
 
     fn persisted_row(local_session_id: &str, thread_id: &str) -> StructuredThreadRow {
         StructuredThreadRow {
@@ -2643,7 +3077,7 @@ mod tests {
         });
         let ctx = egui::Context::default();
         let error = ui.ensure_client(&ctx).unwrap_err();
-        assert!(format!("{error:#}").contains("LLM 프로바이더 설정 오류"));
+        assert!(format!("{error:#}").contains("LLM provider configuration error"));
         assert!(ui.client.is_none());
     }
 
@@ -2721,26 +3155,40 @@ mod tests {
         });
         let ctx = egui::Context::default();
         let error = ui.ensure_client(&ctx).unwrap_err();
-        assert!(format!("{error:#}").contains("LLM API 키 로드 실패"));
+        assert!(format!("{error:#}").contains("Failed to load the LLM API key"));
         assert!(ui.client.is_none());
     }
 
     #[test]
     fn llm_provider_라벨_매핑() {
-        assert_eq!(llm_provider_label(None), "기본 (구독/기존 설정)");
-        assert_eq!(llm_provider_label(Some("oss")), "로컬 OSS (ollama)");
-        assert_eq!(llm_provider_label(Some("custom")), "커스텀 (OpenAI 호환)");
+        let catalog = catalog();
+        assert_eq!(
+            llm_provider_label(None, &catalog),
+            "Default (subscription/existing settings)"
+        );
+        assert_eq!(
+            llm_provider_label(Some("oss"), &catalog),
+            "Local OSS (ollama)"
+        );
+        assert_eq!(
+            llm_provider_label(Some("custom"), &catalog),
+            "Custom (OpenAI-compatible)"
+        );
         // 미지값은 방어적으로 원문 표시 (config 로드 정규화가 1차 방어선).
-        assert_eq!(llm_provider_label(Some("weird")), "weird");
+        assert_eq!(llm_provider_label(Some("weird"), &catalog), "weird");
     }
 
     #[test]
     fn llm_wire_라벨_매핑() {
+        let catalog = catalog();
         // None과 "chat"은 같은 기본 항목이다 (config에는 None으로 저장).
-        assert_eq!(llm_wire_label(None), "Chat Completions (기본)");
-        assert_eq!(llm_wire_label(Some("chat")), "Chat Completions (기본)");
-        assert_eq!(llm_wire_label(Some("responses")), "Responses");
-        assert_eq!(llm_wire_label(Some("weird")), "weird");
+        assert_eq!(llm_wire_label(None, &catalog), "Chat Completions (default)");
+        assert_eq!(
+            llm_wire_label(Some("chat"), &catalog),
+            "Chat Completions (default)"
+        );
+        assert_eq!(llm_wire_label(Some("responses"), &catalog), "Responses");
+        assert_eq!(llm_wire_label(Some("weird"), &catalog), "weird");
     }
 
     #[test]
@@ -2814,15 +3262,15 @@ mod tests {
         let ctx = egui::Context::default();
 
         let zero = ui.approve_selected_once(&ctx).unwrap_err().to_string();
-        assert!(zero.contains("현재 0"));
+        assert!(zero.contains("currently 0"));
 
         ui.sessions[0].approvals.push(approval("one"));
         let one = ui.approve_selected_once(&ctx).unwrap_err().to_string();
-        assert!(one.contains("App Server 연결"));
+        assert!(one.contains("Codex App Server is not connected"));
 
         ui.sessions[0].approvals.push(approval("two"));
         let many = ui.reject_selected(&ctx).unwrap_err().to_string();
-        assert!(many.contains("현재 2"));
+        assert!(many.contains("currently 2"));
     }
 
     #[test]
@@ -2848,6 +3296,66 @@ mod tests {
             ui.selected_surface,
             Some(AgentSurfaceId::Structured { ref session_id }) if session_id == "local-1"
         ));
+    }
+
+    #[test]
+    fn 생성_시_주입한_catalog가_첫_persisted_import에도_적용된다() {
+        let en = i18n::Catalog::load("en-US").unwrap();
+        let ko = i18n::Catalog::load("ko-KR").unwrap();
+        let mut ui = AgentSessionsUi::new().with_catalog(&en);
+        let mut row = persisted_row("local-ko", "thread-korean");
+        row.title.clear();
+
+        ui.import_persisted_threads(vec![row]);
+
+        assert_eq!(ui.sessions[0].prompt, "Codex thread thread-k");
+        ui.set_catalog(&ko);
+        assert_eq!(ui.catalog.locale(), "ko-KR");
+        assert_eq!(ui.sessions[0].prompt, "Codex 스레드 thread-k");
+    }
+
+    #[test]
+    fn locale_변경은_보관된_catalog와_session_오류를_다시_렌더한다() {
+        let en = i18n::Catalog::load("en-US").unwrap();
+        let ko = i18n::Catalog::load("ko-KR").unwrap();
+        let mut ui = AgentSessionsUi::new().with_catalog(&en);
+        ui.sessions.push(AgentSession::new(
+            "localized-error".to_owned(),
+            "task".to_owned(),
+            None,
+        ));
+        let error = anyhow::anyhow!("wire detail");
+        ui.fail_session_localized(
+            "localized-error",
+            "agent_sessions.error.interrupt_failed",
+            &error,
+        );
+        ui.catalog_error = Some(CatalogMessage::error(
+            "agent_sessions.error.model_catalog_failed",
+            &error,
+        ));
+
+        let english = ui.sessions[0].error.clone().unwrap();
+        ui.set_catalog(&ko);
+
+        assert_ne!(ui.sessions[0].error.as_deref(), Some(english.as_str()));
+        assert_eq!(
+            ui.sessions[0].error.as_deref(),
+            Some(
+                ko.t(
+                    "agent_sessions.error.interrupt_failed",
+                    &[("error", "wire detail")]
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            ui.catalog_error.as_ref().unwrap().render(&ko),
+            ko.t(
+                "agent_sessions.error.model_catalog_failed",
+                &[("error", "wire detail")]
+            )
+        );
     }
 
     #[test]
@@ -3117,7 +3625,7 @@ mod tests {
             ui.archive_selected_persisted(&egui::Context::default())
                 .unwrap_err()
                 .to_string()
-                .contains("연결이 종료된 뒤")
+                .contains("Disconnect the resumed APP thread")
         );
         assert!(ui.delete_selected_persisted().is_err());
         assert!(ui.client.is_none());
@@ -3208,8 +3716,9 @@ mod tests {
         assert_eq!(ui.new_effort, "manual-effort");
         assert!(
             ui.catalog_error
-                .as_deref()
+                .as_ref()
                 .unwrap()
+                .render(&ui.catalog)
                 .contains("method unavailable")
         );
         assert!(ui.pending_model_catalog.is_none());

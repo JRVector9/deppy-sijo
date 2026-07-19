@@ -304,15 +304,6 @@ pub enum AgentApprovalKind {
     FileChange,
 }
 
-impl AgentApprovalKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::CommandExecution => "command approval",
-            Self::FileChange => "file-change approval",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentApprovalDecision {
     Accept,

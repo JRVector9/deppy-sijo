@@ -20,6 +20,12 @@
 
 ## Status
 
+- 2026-07-20: Terminal 표시 이름 활성화 후 exact-name 기존 `deppy-sijo`만 TERM 종료하고 정확한 `/Users/jr/Desktop/Projects/deppy-sijo/target/bundle/Deppy Sijo.app`을 열었다. marker와 app lock 모두 새 PID `70880`을 가리키고 실행 경로도 해당 bundle의 `Contents/MacOS/deppy-sijo`와 일치한다. 22:34:24 KST 시작 로그에는 log budget, AppleGothic/Apple SD Gothic 등록, web-remote `127.0.0.1:8737` 시작, dotenv timeout 안전 폴백 뒤 profile 정상 동기화와 ANSI scrollback 복원이 기록됐으며 새 panic/error는 없다. 임시 재실행 스크립트를 제거하고 최종 delivery 기록을 docs-only commit으로 push한다.
+- 2026-07-20: exact-name 종료/정확한 bundle open 스크립트를 Terminal bundle ID로 바로 전달한 첫 재실행 시도는 Terminal 대상 해석 오류 `-1728`로 스크립트 실행 전에 중단됐다. 따라서 기존 앱/프로세스 상태는 바뀌지 않았다. Terminal을 표시 이름으로 먼저 활성화한 뒤 같은 스크립트를 전달한다.
+- 2026-07-20: 새 bundle과 `deppy-mcp-proxy`의 deep/strict codesign 및 arm64 검증이 통과했다. 메인 SHA-256은 `698e2d1ec9b7a9acb9c535ae605dcd87f73bb5ea10126ab3c6fb3f61c32571d7`, bundle id `app.vector9.deppy-sijo`, version `0.1.0`, minimum macOS `11.0`이다. 다음은 exact-name 기존 앱만 종료하고 이 exact bundle을 실행해 새 PID와 시작 로그를 확인하는 단계다.
+- 2026-07-20: `f8607cb` 기준 `CARGO_NET_OFFLINE=true sh scripts/package-macos.sh`가 54.64초에 release profile을 완료하고 `target/bundle/Deppy Sijo.app`을 재생성했다. 현재 환경에서는 Developer ID 대신 ad-hoc 서명이 적용됐다. 다음은 app/proxy deep·strict 서명, arm64와 bundle metadata/hash 검증이다.
+- 2026-07-20: `f8607cb8f3bd5de78c1fbc34214cd94b6795bb12`를 `origin/HomeV1`에 push했고 로컬 HEAD와 원격 추적 ref가 일치한다. 다음은 이 커밋 기준 공식 macOS release package다.
+- 2026-07-20: Environment 전용 닫기 변경을 `f8607cb` (`fix(settings): isolate environment project closing`)로 커밋했다. 다음은 `origin/HomeV1` push와 원격 ref 확인이다.
 - 2026-07-20: 사용자가 검증된 Environment 전용 닫기 변경의 커밋·push·release build·앱 재실행을 요청했다. 현재 9개 의도된 변경 파일을 기능 커밋으로 고정하고 `HomeV1`에 push한 뒤 공식 package script, codesign/arm64 검증, exact-name 기존 앱 종료와 정확한 bundle 재실행/로그 확인을 진행한다.
 - 2026-07-20: 최종 diff 검사를 완료했다. 변경은 app/config/env project list, 5개 locale, handoff 9개 파일로 한정되고 `git diff --check`가 통과했다. 실행 중인 앱은 이전 release 그대로이며 이번 요청에서는 commit/build/restart를 수행하지 않았다.
 - 2026-07-20: 최종 회귀가 통과했다. localhost bind가 필요한 기존 7개 proxy/connector fixture만 명시 제외한 직렬 app 전체는 564 passed/0 failed/5 ignored/7 filtered였고, `cargo clippy -p deppy-sijo --all-targets -- -D warnings`, 적용 후 rustfmt check도 성공했다. Environment 닫기 처리 블록에는 `db.delete_workspace`, `switch_workspace`, runtime shutdown, sidebar `closed_workspaces` 변경이 없다. 다음은 최종 diff/check와 사용자 전달이다.

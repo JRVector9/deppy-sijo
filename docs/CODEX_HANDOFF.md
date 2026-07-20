@@ -2,8 +2,8 @@
 
 ## Current task
 
-- Fix the sidebar provider label staying on `Codex` after the same PTY exits Codex and starts Claude.
-- Status: provider-aware hook/cache validation is implemented and verified. The user has now requested commit, release rebuild, and relaunch; source verification is complete and delivery is in progress.
+- Prevent automatic agent resume from injecting `claude --resume` into a pane after an intentional agent exit or while the user is running SSH/another process.
+- Status: the restore decision now treats an already-running agent or any additional session process as handled, and only resumes when the background resource snapshot proves exactly one local shell process. Focused regressions and strict app Clippy/fmt/diff checks pass. Home changes are committed as `2d2118a`; the auto-resume fix is ready for its own commit.
 
 ## Working area
 
@@ -14,15 +14,28 @@
 
 ## Plan
 
-1. Completed — trace the sidebar provider label through hook overrides, process discovery, and the binding cache.
-2. Completed — accept a hook override only when a live descendant agent has the same provider kind; otherwise fall through to current-process discovery.
-3. Completed — reuse a cached binding only when its owner pid still classifies as the same provider.
-4. Completed — add provider-switch regression coverage and run the full agent-detect unit group.
-5. Completed — app check, strict Clippy, formatting/diff checks pass.
-6. In progress — commit the verified source, build/sign the macOS release bundle, stop only the previous project app process, and launch the new bundle.
+1. Completed — trace automatic resume from persisted pane mapping through binding loss and raw PTY input injection.
+2. Completed — add a fail-closed restore decision using the existing background `SessionResourceUsage.process_count`, without spawning `ps` on the UI thread.
+3. Completed — mark panes with a running agent or another job as handled so later process exit cannot trigger delayed resume.
+4. Completed — focused decision regressions and app Clippy/fmt/diff checks pass while preserving the pending Home changes.
+5. Completed — commit Home changes separately, then commit the verified auto-resume fix with the final handoff.
 
 ## Status
 
+- 2026-07-20: git metadata write access is available again. Home announcement changes were committed separately as `2d2118a` (`feat(home): refine announcement list`). The verified auto-resume guard and final handoff are now the only pending files and will be committed as a second focused commit. No release build or app relaunch was performed.
+- 2026-07-20: 검증 후 Home 변경과 auto-resume 수정 4개 파일을 함께 commit하려 했지만 sandbox가 다시 `/Users/jr/desktop/projects/deppy-sijo/.git/index.lock` 생성을 `Operation not permitted`로 거부했다. staged/commit된 추가 변경은 없고 네 파일은 working tree에 그대로 보존돼 있으며 diff check는 통과한다. 외부 Terminal 우회, release build, app relaunch는 하지 않았다.
+- 2026-07-20: 자동 resume 수정 검증이 완료됐다. `자동_resume` 필터 2/2, agent-exit 단독 1/1, `cargo clippy -p deppy-sijo --all-targets -- -D warnings`, fmt check, diff check가 모두 통과했다. 회귀는 shell 단독(1 process)만 Resume, shell+ssh(2+) MarkHandled, snapshot 없음/0 Wait, 최초 실행 agent MarkHandled 후 종료 시 Skip을 고정한다. release package build와 app relaunch는 수행하지 않았다. 다음은 현재 sandbox에서 전체 pending 변경 commit 재시도다.
+- 2026-07-20: 자동 resume 오주입 수정을 구현했다. 기존 코드는 저장 mapping이 있고 현재 binding이 없으면 어느 시점이든 resume을 보냈으며, 실행 중 agent가 최초 관측될 때 pane을 handled로 표시하지 않아 의도적 종료 직후에도 조건이 성립했다. 또한 SSH는 로컬 agent binding이 아니어서 같은 오판을 만들었다. 새 `AutoResumeDecision`은 이미 처리/agent 실행/프로세스 snapshot 없음/셸 단독/추가 child를 구분한다. background resource snapshot이 `process_count == 1`인 로컬 셸만 Resume, agent 실행 또는 shell+ssh(2+)는 MarkHandled, snapshot 없음/0은 fail-closed Wait다. 다음은 agent-exit/SSH 회귀와 정적 검증이다.
+- 2026-07-20: 최종 `git add`/commit은 현재 sandbox가 `/Users/jr/desktop/projects/deppy-sijo/.git/index.lock` 생성을 `Operation not permitted`로 거부해 실행되지 않았다. 제품 코드 2개와 handoff 1개가 unstaged로 남아 있고 `git diff --check`는 깨끗하다. `.git` 권한을 외부 Terminal로 우회하지 않았으며, 사용자 지시대로 release package build와 app relaunch도 하지 않았다. 다음 작업은 권한이 복구된 turn에서 세 파일을 그대로 커밋하는 것뿐이다.
+- 2026-07-20: Home 공지 목록 최종 검증이 통과했다. status-feed 5/5, Home kittest 2/2, `cargo clippy -p deppy-sijo --all-targets -- -D warnings`, fmt check, diff check가 모두 성공했다. UI는 horizontal frame margin 8px, hidden scrollbar로 동일한 좌우 content 폭, exact row rect divider, source mark/name 제거, `전체/OpenAI/Anthropic/Grok/Hugging Face`, 5×48px viewport를 사용한다. feed는 provider당 5개/HF limit 5이고 Grok은 whitespace+case normalized title로 최신 첫 항목만 유지한다. 다음은 모든 tracked 변경 커밋이며 package build/relaunch는 하지 않는다.
+- 2026-07-20: 좌우 divider 여백을 scrollbar 예약폭까지 포함해 동일하게 만들려고 `AlwaysHidden`을 추가한 뒤, 타입이 egui root에 re-export되지 않아 집중 테스트/Clippy compile이 E0433으로 중단됐다. 실제 공개 경로 `egui::scroll_area::ScrollBarVisibility`로만 수정하고 동일 검증을 재실행한다.
+- 2026-07-20: 수정 후 status-feed parser 5/5와 기존 Home/tab-order kittest 1/1은 통과했다. 새 5행 kittest는 `show_rows`가 viewport 경계의 6번째 행을 접근성 트리에 overscan해 “label node 없음” assertion만 실패했다. 제품 viewport는 5×48=240px로 고정돼 있으므로, 6번째 title top이 첫 title top보다 최소 240px 아래인지 실제 rect 위치로 검증하도록 바꾼다.
+- 2026-07-20: 첫 status-feed/Home 집중 테스트는 제품 코드 실행 전 새 kittest의 동적 `String` 라벨을 `get_by_label(&str)`에 값으로 넘긴 E0308 1건으로 test compile이 중단됐다. `&format!(...)`로 테스트 호출만 수정하고 같은 parser/UI 범위를 재실행한다.
+- 2026-07-20: 새 Home 공지 목록 요청을 시작했다. 현재 UI는 horizontal panel margin 16px, provider mark+고정폭 source label, 3×48px viewport, `전체/OpenAI/Anthropic/Hugging Face/Grok` 탭 순서이고 separator가 content-sized response rect를 써 우측까지 늘지 않는다. feed도 provider당 3개와 HF API `limit=3`이며 Grok RSS는 중복 제거가 없다. 목표는 horizontal 8px, exact full row rect, source decoration 제거, `전체/OpenAI/Anthropic/Grok/Hugging Face`, 5×48px와 provider당 5개, normalized Grok title dedupe다. 릴리스 build/relaunch는 금지한다.
+- 2026-07-20: `login:false`만으로도 macOS가 physical cwd를 소문자 `/Users/jr/desktop/...`로 반환해 같은 index.lock 거부가 반복됐다. `git rev-parse --absolute-git-dir`는 허용된 대문자 `/Users/jr/Desktop/Projects/deppy-sijo/.git`를 정확히 반환한다. 상대 `.git` 발견을 피하고 `--git-dir`/`--work-tree`를 허용된 절대 경로로 명시해 최종 docs-only amend한다.
+- 2026-07-20: 실행 결과 handoff를 기존 커밋에 amend하려던 첫 `git add`는 login shell이 git lock 경로를 소문자 `/Users/jr/desktop/...`로 해석해 managed sandbox 허용 경로 `/Users/jr/Desktop/...`와 불일치하면서 `index.lock: Operation not permitted`로 실패했다. 기존 source commit `f9d1b05`에는 영향이 없고 lock도 생성되지 않았다. `login:false`와 정확한 대문자 workdir로 docs-only amend를 재시도한다.
+- 2026-07-20: provider 전환 수정의 커밋·재빌드·실행을 완료했다. 최초 커밋은 `f9d1b05`; 최종 delivery 기록을 같은 커밋에 amend한다. 공식 package script release build는 48.84초, deep/strict codesign 검증과 arm64 확인을 통과했고 main SHA-256은 `f978c7cc0a5ea2ce6435e8782d120f104ed093f984f5cc69005fd1c4d2a9b3ef`다. managed shell의 LaunchServices/sysmond 제한 때문에 직접 `open`은 거짓 `kLSNoExecutableErr`로 실패했지만, 일반 macOS Terminal에서 exact-name `deppy-sijo`만 TERM 종료하고 exact project bundle을 열어 PID 80175 생존을 확인했다. 16:11 KST 시작 로그에는 log budget, AppleGothic/Apple SD Gothic 등록, web-remote 시작, scrollback 3건 복원이 있고 새 error/panic은 없다. 이번 환경에서는 signing identity 조회가 차단돼 bundle은 유효한 ad-hoc signature다.
+- 2026-07-20: 공식 package script가 release build를 48.84초에 완료했고 `target/bundle/Deppy Sijo.app`을 생성했다. 현재 managed shell에서는 signing identity 조회가 차단돼 ad-hoc 서명됐지만 `codesign --verify --deep --strict`는 helper와 bundle 모두 통과했고 id `app.vector9.deppy-sijo`, arm64, main SHA-256 `f978c7cc0a5ea2ce6435e8782d120f104ed093f984f5cc69005fd1c4d2a9b3ef`를 확인했다. 이 sandbox의 LaunchServices는 실제 executable과 plist가 일치하고 실행 권한도 있는데 `kLSNoExecutableErr(-10827)`로 `open`을 거부하고, process enumeration도 sysmond 부재로 차단했다. 코드/번들 결함과 구분하기 위해 기존에 검증된 일반 macOS Terminal 경유로 exact project bundle 재시작을 시도한다.
 - 2026-07-20: 사용자가 provider 전환 수정의 커밋·재빌드·실행을 요청했다. 현재 worktree에는 검증된 `agent_detect.rs`와 handoff 변경만 있으며 diff check가 깨끗하다. 다음은 커밋 후 공식 macOS 패키징, 서명/아키텍처 검증, 기존 project bundle 프로세스 한정 재시작이다.
 - 2026-07-20: Codex→Claude provider 전환 수정의 최종 검증을 완료했다. agent-detect 전체는 9 passed/1 ignored, `cargo check -p deppy-sijo --all-targets`와 `cargo clippy -p deppy-sijo --all-targets -- -D warnings`, fmt check, diff check가 모두 통과했다. 수정 파일은 `crates/app/src/agent_detect.rs`와 handoff뿐이며, 사용자 요청에 없던 커밋·패키징·앱 재실행은 하지 않았다.
 - 2026-07-20: provider 전환 수정 후 `cargo check -p deppy-sijo --all-targets`는 통과했다. 첫 strict app Clippy는 기능 오류가 아니라 새 override 분기의 중첩 `if let`에 대한 `clippy::collapsible-if` 1건으로 중단됐다. let-chain으로만 정리했으며 전체 agent-detect 테스트와 strict Clippy를 다시 실행한다.

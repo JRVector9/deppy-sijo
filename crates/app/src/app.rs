@@ -1327,7 +1327,9 @@ pub struct App {
     restore_agents: std::collections::HashMap<String, crate::storage::AgentSessionRow>,
     /// restore_agents를 로드한 워크스페이스 id (전환 시 재로드 판정).
     restore_loaded_for: Option<String>,
-    /// 이번 실행에서 이미 resume 명령을 보낸 pane (중복 주입 방지).
+    /// 이번 workspace 활성화에서 자동 resume 판단을 끝낸 pane. 명령을 보낸 경우뿐 아니라
+    /// 이미 에이전트/ssh 등 다른 작업이 있어 건너뛴 경우도 포함한다. 그래야 사용자가
+    /// 작업을 종료한 뒤 뒤늦게 resume 명령이 주입되지 않는다.
     resumed_panes: std::collections::HashSet<String>,
     /// 알림 클릭으로 다른 workspace 전환 후, mux 재구성되면 이동할 (workspace, session).
     pending_focus: Option<(String, runtime::SessionId)>,
@@ -1491,6 +1493,40 @@ fn stale_agent_session_panes<'a>(
         .collect();
     stale.sort_unstable();
     stale
+}
+
+/// 저장된 에이전트 세션을 자동으로 이어갈지 결정한다. 자동 주입은 workspace restore 때
+/// 비어 있는 로컬 셸에만 허용한다. 이미 에이전트가 실행 중이었거나 ssh/tmux/editor 같은
+/// 다른 프로세스가 붙은 pane은 이번 활성화에서 처리 완료로 표시해, 그 작업/에이전트가
+/// 나중에 끝나도 resume 명령을 뒤늦게 주입하지 않는다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoResumeDecision {
+    /// 이미 판단을 끝낸 pane.
+    Skip,
+    /// 자원 스냅샷이 아직 없어 안전 여부를 판단할 수 없음 — fail closed 후 다음 poll 대기.
+    Wait,
+    /// 셸만 살아 있어 자동 resume 가능.
+    Resume,
+    /// 에이전트나 다른 foreground 작업이 있으므로 자동 주입 없이 처리 완료.
+    MarkHandled,
+}
+
+fn auto_resume_decision(
+    already_handled: bool,
+    agent_running: bool,
+    live_process_count: Option<usize>,
+) -> AutoResumeDecision {
+    if already_handled {
+        return AutoResumeDecision::Skip;
+    }
+    if agent_running {
+        return AutoResumeDecision::MarkHandled;
+    }
+    match live_process_count {
+        Some(1) => AutoResumeDecision::Resume,
+        Some(2..) => AutoResumeDecision::MarkHandled,
+        Some(0) | None => AutoResumeDecision::Wait,
+    }
 }
 
 impl App {
@@ -2430,8 +2466,10 @@ impl App {
             }
         }
 
-        // 복원 resume 주입: 저장된 에이전트가 있는 pane에 에이전트가 아직 안 떠 있으면
-        // native resume 명령을 셸에 한 번 보낸다(설정으로 끌 수 있다, 기본 ON).
+        // 복원 resume 주입: workspace 활성화 시 저장된 에이전트가 있고 **셸만** 살아 있는
+        // pane에 한해 native resume 명령을 한 번 보낸다(설정으로 끌 수 있다, 기본 ON).
+        // 이미 실행 중인 agent나 ssh/tmux/editor 등 다른 child process가 있으면 처리 완료로
+        // 표시한다. 이후 그 프로세스가 끝나도 자동 resume이 뒤늦게 끼어들면 안 된다.
         if self.config.ui.auto_resume_agents
             && let Some(mux) = &mux
         {
@@ -2446,8 +2484,25 @@ impl App {
                 let Some(session) = pane.session_id else {
                     continue;
                 };
-                if self.resumed_panes.contains(&pane_key) || bindings.contains_key(&session) {
-                    continue; // 이미 보냈거나 이미 실행 중
+                // ResourceUsage는 background sampler가 셸 pid/process tree를 이미 계산한 값.
+                // UI 스레드에서 ps를 새로 spawn하지 않고, snapshot이 없거나 0이면 fail closed.
+                let live_process_count = self
+                    .active
+                    .session_resource_usage
+                    .iter()
+                    .find(|usage| usage.session == session)
+                    .and_then(|usage| usage.pid.map(|_| usage.process_count));
+                match auto_resume_decision(
+                    self.resumed_panes.contains(&pane_key),
+                    bindings.contains_key(&session),
+                    live_process_count,
+                ) {
+                    AutoResumeDecision::Skip | AutoResumeDecision::Wait => continue,
+                    AutoResumeDecision::MarkHandled => {
+                        self.resumed_panes.insert(pane_key);
+                        continue;
+                    }
+                    AutoResumeDecision::Resume => {}
                 }
                 self.send_agent_resume(&pane_key, &pane.title, session, &mut transcript_finder);
                 self.resumed_panes.insert(pane_key);
@@ -9606,5 +9661,39 @@ h:1 EE:FF
         // claude 프로세스가 잠시 없더라도 pane이 남으면 mapping을 유지하고,
         // 실제 layout에서 사라진 pane의 mapping만 삭제한다.
         assert_eq!(stale, vec!["deleted-pane".to_owned()]);
+    }
+
+    #[test]
+    fn 자동_resume은_비어있는_로컬_셸에만_허용한다() {
+        assert_eq!(
+            auto_resume_decision(false, false, Some(1)),
+            AutoResumeDecision::Resume,
+            "셸 프로세스 하나만 있을 때만 자동 이어가기"
+        );
+        assert_eq!(
+            auto_resume_decision(false, false, Some(2)),
+            AutoResumeDecision::MarkHandled,
+            "shell+ssh 같은 다른 작업이 있으면 주입 금지"
+        );
+        assert_eq!(
+            auto_resume_decision(false, false, None),
+            AutoResumeDecision::Wait,
+            "프로세스 스냅샷이 없으면 안전하게 대기"
+        );
+        assert_eq!(
+            auto_resume_decision(false, false, Some(0)),
+            AutoResumeDecision::Wait,
+            "불완전한 프로세스 스냅샷도 자동 주입 금지"
+        );
+    }
+
+    #[test]
+    fn 실행중이던_agent가_끝나도_자동_resume하지_않는다() {
+        let initial = auto_resume_decision(false, true, Some(2));
+        assert_eq!(initial, AutoResumeDecision::MarkHandled);
+
+        // 최초 관측에서 처리 완료로 표시한 뒤 agent가 종료돼 셸만 남더라도 재주입 금지.
+        let after_exit = auto_resume_decision(true, false, Some(1));
+        assert_eq!(after_exit, AutoResumeDecision::Skip);
     }
 }

@@ -22,7 +22,9 @@ enum AnnouncementFilter {
 }
 
 const ANNOUNCEMENT_VISIBLE_ROWS: usize = 5;
-const ANNOUNCEMENT_ROW_HEIGHT: f32 = 48.0;
+const ANNOUNCEMENT_ROW_HEIGHT: f32 = 64.0;
+const ANNOUNCEMENT_DATE_WIDTH: f32 = 82.0;
+const ANNOUNCEMENT_LINK_WIDTH: f32 = 30.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HomeAction {
@@ -242,7 +244,10 @@ impl AgentTerminalUi {
             .inner_margin(egui::Margin::symmetric(8, 16));
         panel.show(ui, |ui| {
             ui.set_min_height(250.0);
-            ui.horizontal_wrapped(|ui| {
+            ui.horizontal(|ui| {
+                // 시안처럼 필터는 하나의 segmented control로 붙이고, 새로고침은
+                // 같은 행의 맨 오른쪽에 독립된 정사각 버튼으로 둔다.
+                ui.spacing_mut().item_spacing.x = 0.0;
                 source_filter(
                     ui,
                     &catalog.t("home.notices.filter_all", &[]),
@@ -275,7 +280,13 @@ impl AgentTerminalUi {
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .small_button("⟳")
+                        .add(
+                            egui::Button::new(egui::RichText::new("⟳").size(18.0))
+                                .min_size(egui::vec2(32.0, 32.0))
+                                .fill(ui.visuals().extreme_bg_color)
+                                .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+                                .corner_radius(egui::CornerRadius::same(3)),
+                        )
                         .on_hover_text(catalog.t("home.notices.refresh_hover", &[]))
                         .clicked()
                     {
@@ -284,6 +295,8 @@ impl AgentTerminalUi {
                 });
             });
             ui.add_space(12.0);
+            crate::ui::hairline(ui);
+            ui.add_space(8.0);
             // 실제 상태 페이지의 최신 인시던트 5건씩 (2026-07-20 사용자 — 정적 링크
             // 카드에서 교체). 아직 첫 조회 전이면 안내 문구.
             let mut cards: Vec<AnnouncementCard> = [
@@ -334,7 +347,7 @@ impl AgentTerminalUi {
                 let viewport_height = ANNOUNCEMENT_ROW_HEIGHT * ANNOUNCEMENT_VISIBLE_ROWS as f32;
                 ui.scope(|ui| {
                     // show_rows는 전역 item spacing을 행 높이에 더한다. 여기서는 0으로
-                    // 고정해 48px × 5행 viewport가 정확히 다섯 행과 일치하게 한다.
+                    // 고정해 64px × 5행 viewport가 정확히 다섯 행과 일치하게 한다.
                     ui.spacing_mut().item_spacing.y = 0.0;
                     egui::ScrollArea::vertical()
                         .id_salt("home-announcement-rows")
@@ -435,36 +448,92 @@ struct AnnouncementCard<'a> {
     incident: &'a crate::status_feed::IncidentNotice,
 }
 
-/// Statuspage 인시던트 상태 → 로케일 라벨 (미지 값은 원문 그대로).
-fn incident_status_label(catalog: &i18n::Catalog, status: &str) -> String {
-    match status {
-        "resolved" => catalog.t("home.notices.status.resolved", &[]),
-        "investigating" => catalog.t("home.notices.status.investigating", &[]),
-        "identified" => catalog.t("home.notices.status.identified", &[]),
-        "monitoring" => catalog.t("home.notices.status.monitoring", &[]),
-        "postmortem" => catalog.t("home.notices.status.postmortem", &[]),
-        "trending" => catalog.t("home.notices.status.trending", &[]),
-        "release" => catalog.t("home.notices.status.release", &[]),
-        "update" => catalog.t("home.notices.status.update", &[]),
-        other => other.to_owned(),
-    }
-}
-
 fn source_filter(
     ui: &mut egui::Ui,
     label: &str,
     selected: &mut AnnouncementFilter,
     value: AnnouncementFilter,
 ) {
-    let button = egui::Button::new(label)
-        .selected(*selected == value)
+    let is_selected = *selected == value;
+    let foreground = if is_selected {
+        ui.visuals().hyperlink_color
+    } else {
+        ui.visuals().text_color()
+    };
+    let stroke = if is_selected {
+        egui::Stroke::new(1.0, ui.visuals().hyperlink_color)
+    } else {
+        ui.visuals().widgets.noninteractive.bg_stroke
+    };
+    let button = egui::Button::new(egui::RichText::new(label).color(foreground).size(14.0))
+        .min_size(egui::vec2(0.0, 32.0))
+        .fill(ui.visuals().extreme_bg_color)
+        .stroke(stroke)
         .corner_radius(egui::CornerRadius::same(1));
     if ui.add(button).clicked() {
         *selected = value;
     }
 }
 
-/// 공지 리스트 행 1개 — 중복되는 제공자 장식 없이 제목·상태·날짜·원문만 표시한다.
+fn announcement_source_label(source: &str) -> &str {
+    match source {
+        "Claude" => "Anthropic",
+        other => other,
+    }
+}
+
+fn announcement_source_color(ui: &egui::Ui, source: &str) -> egui::Color32 {
+    match source {
+        "Claude" => egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
+        "Grok" => egui::Color32::from_rgb(0xa5, 0x70, 0xff),
+        "Hugging Face" => egui::Color32::from_rgb(0xe3, 0xb3, 0x41),
+        _ => ui.visuals().hyperlink_color,
+    }
+}
+
+fn announcement_cell(ui: &mut egui::Ui, rect: egui::Rect, text: egui::RichText) -> egui::Response {
+    let mut cell = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    cell.set_clip_rect(rect.intersect(ui.clip_rect()));
+    cell.add_sized(
+        rect.size(),
+        egui::Label::new(text).truncate().halign(egui::Align::LEFT),
+    )
+}
+
+fn paint_external_link_icon(painter: &egui::Painter, center: egui::Pos2, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.5, color);
+    let body = egui::Rect::from_center_size(center + egui::vec2(-1.5, 1.5), egui::vec2(11.0, 11.0));
+    painter.line_segment([body.left_top(), body.left_bottom()], stroke);
+    painter.line_segment([body.left_bottom(), body.right_bottom()], stroke);
+    painter.line_segment([body.right_bottom(), body.right_top()], stroke);
+    painter.line_segment(
+        [
+            center + egui::vec2(-0.5, 0.5),
+            center + egui::vec2(5.0, -5.0),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            center + egui::vec2(1.0, -5.0),
+            center + egui::vec2(5.0, -5.0),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            center + egui::vec2(5.0, -5.0),
+            center + egui::vec2(5.0, -1.0),
+        ],
+        stroke,
+    );
+}
+
+/// 공지 리스트 행 1개 — 최신 시안의 `날짜 | 공급자 | 제목 | 외부 링크` 구조.
 fn announcement_row(
     ui: &mut egui::Ui,
     card: &AnnouncementCard<'_>,
@@ -472,49 +541,107 @@ fn announcement_row(
     locale: &str,
     catalog: &i18n::Catalog,
 ) {
-    // allocate_ui의 response rect는 자식 content 폭으로 줄 수 있어 divider 길이가 행마다
-    // 달라졌다. 먼저 viewport 전체 폭을 확정하고 같은 rect로 content와 divider를 그린다.
-    let (row_rect, _) = ui.allocate_exact_size(
+    // 먼저 viewport 전체 폭을 확정하고 같은 rect에서 셀·구분선·hover를 그린다.
+    let (row_rect, row_response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), ANNOUNCEMENT_ROW_HEIGHT),
         egui::Sense::hover(),
     );
-    let content_rect = row_rect.shrink2(egui::vec2(0.0, 2.0));
-    let mut row_ui = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(content_rect)
-            .layout(egui::Layout::top_down(egui::Align::Min)),
+    if row_response.hovered() {
+        ui.painter()
+            .rect_filled(row_rect, 0.0, ui.visuals().faint_bg_color);
+    }
+
+    let content_rect = row_rect.shrink2(egui::vec2(12.0, 0.0));
+    let date_right = content_rect.left() + ANNOUNCEMENT_DATE_WIDTH.min(content_rect.width() * 0.24);
+    let divider_x = date_right + 4.0;
+    let source_left = divider_x + 18.0;
+    let source_width = (content_rect.width() * 0.22).clamp(72.0, 108.0);
+    let title_left = source_left + source_width + 10.0;
+    let link_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            content_rect.right() - ANNOUNCEMENT_LINK_WIDTH,
+            content_rect.top(),
+        ),
+        content_rect.right_bottom(),
     );
-    row_ui.set_clip_rect(content_rect.intersect(ui.clip_rect()));
-    row_ui.spacing_mut().item_spacing.y = 1.0;
+    let title_rect = egui::Rect::from_min_max(
+        egui::pos2(title_left, content_rect.top()),
+        egui::pos2(
+            (link_rect.left() - 8.0).max(title_left),
+            content_rect.bottom(),
+        ),
+    );
+    let date_rect = egui::Rect::from_min_max(
+        content_rect.left_top(),
+        egui::pos2(date_right, content_rect.bottom()),
+    );
+    let source_rect = egui::Rect::from_min_max(
+        egui::pos2(source_left, content_rect.top()),
+        egui::pos2(
+            (source_left + source_width).min(title_rect.left()),
+            content_rect.bottom(),
+        ),
+    );
+
+    announcement_cell(
+        ui,
+        date_rect,
+        egui::RichText::new(&card.incident.date)
+            .color(ui.visuals().weak_text_color())
+            .size(12.5),
+    );
+    ui.painter().vline(
+        divider_x,
+        egui::Rangef::new(row_rect.center().y - 20.0, row_rect.center().y + 20.0),
+        ui.visuals().widgets.noninteractive.bg_stroke,
+    );
+    announcement_cell(
+        ui,
+        source_rect,
+        egui::RichText::new(announcement_source_label(card.source))
+            .color(announcement_source_color(ui, card.source))
+            .size(13.0),
+    );
 
     let translated = translations.get(card.source, locale, &card.incident.title);
     let title_text = translated.unwrap_or(&card.incident.title);
-    let title = row_ui.add_sized(
-        [row_ui.available_width(), 20.0],
-        egui::Label::new(egui::RichText::new(title_text).strong())
-            .truncate()
-            .halign(egui::Align::LEFT),
+    let title = announcement_cell(
+        ui,
+        title_rect,
+        egui::RichText::new(title_text).strong().size(14.0),
     );
     if translated.is_some() {
         title.on_hover_text(&card.incident.title);
     } else {
         title.on_hover_text(title_text);
     }
-    row_ui.horizontal(|ui| {
-        ui.weak(incident_status_label(catalog, &card.incident.status));
-        if !card.incident.date.is_empty() {
-            ui.weak(&card.incident.date);
-        }
-        ui.hyperlink_to(
-            catalog.t("home.notices.original_link", &[]),
-            &card.incident.url,
-        );
+    let link_label = catalog.t("home.notices.original_link", &[]);
+    let link = ui
+        .interact(
+            link_rect,
+            ui.id().with(("home-announcement-link", &card.incident.url)),
+            egui::Sense::click(),
+        )
+        .on_hover_text(&link_label);
+    link.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Link, ui.is_enabled(), &link_label)
     });
+    let link_color = if link.hovered() {
+        ui.visuals().text_color()
+    } else {
+        ui.visuals().hyperlink_color
+    };
+    paint_external_link_icon(ui.painter(), link_rect.center(), link_color);
+    if link.clicked() {
+        ui.ctx()
+            .open_url(egui::OpenUrl::new_tab(&card.incident.url));
+    }
 
-    ui.painter().hline(
+    crate::ui::hairline_at(
+        ui.painter(),
         row_rect.x_range(),
-        row_rect.bottom() - 0.5,
-        ui.visuals().widgets.noninteractive.bg_stroke,
+        row_rect.bottom(),
+        ui.visuals().widgets.noninteractive.bg_stroke.color,
     );
 }
 
@@ -758,8 +885,15 @@ mod tests {
         let openai = harness.get_by_label("OpenAI").rect().left();
         let anthropic = harness.get_by_label("Anthropic").rect().left();
         let grok = harness.get_by_label("Grok").rect().left();
-        let hugging_face = harness.get_by_label("Hugging Face").rect().left();
-        assert!(all < openai && openai < anthropic && anthropic < grok && grok < hugging_face);
+        let hugging_face = harness.get_by_label("Hugging Face").rect();
+        let refresh = harness.get_by_label("⟳").rect();
+        assert!(
+            all < openai && openai < anthropic && anthropic < grok && grok < hugging_face.left()
+        );
+        assert!(
+            hugging_face.right() <= refresh.left(),
+            "필터와 우측 새로고침 버튼이 겹치면 안 됨"
+        );
         assert!(harness.query_by_label("MLX").is_none());
         assert!(harness.query_by_label("Home").is_none());
 
@@ -769,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn kittest_home_공지는_공급자장식없이_정확히_5행을_보인다() {
+    fn kittest_home_공지는_날짜_공급자_제목_링크를_정확히_5행_보인다() {
         use egui_kittest::kittest::Queryable;
 
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
@@ -808,6 +942,15 @@ mod tests {
 
         assert_eq!(ANNOUNCEMENT_VISIBLE_ROWS, 5);
         assert!(harness.query_by_label("Claude").is_none());
+        assert!(
+            harness.get_all_by_label("Anthropic").count() >= 2,
+            "필터 외에 각 행에도 Anthropic 공급자명이 보여야 함"
+        );
+        harness.get_by_label("2026-07-20");
+        assert!(
+            harness.get_all_by_label("Source →").count() >= ANNOUNCEMENT_VISIBLE_ROWS,
+            "각 행에 접근 가능한 외부 링크가 있어야 함"
+        );
         let first_top = harness.get_by_label("Announcement 1").rect().top();
         for index in 2..=5 {
             harness.get_by_label(&format!("Announcement {index}"));

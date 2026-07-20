@@ -2,8 +2,8 @@
 
 ## Current task
 
-- Prevent automatic agent resume from injecting `claude --resume` into a pane after an intentional agent exit or while the user is running SSH/another process.
-- Status: the restore decision now treats an already-running agent or any additional session process as handled, and only resumes when the background resource snapshot proves exactly one local shell process. Focused regressions and strict app Clippy/fmt/diff checks pass. Home changes are committed as `2d2118a`; the auto-resume fix is ready for its own commit.
+- Redesign the Home news list to match the latest reference while preserving the existing outer panel border.
+- Status: implementation and verification are complete. The user requested commit, release rebuild, and a portable ZIP; app relaunch remains explicitly forbidden.
 
 ## Working area
 
@@ -14,14 +14,22 @@
 
 ## Plan
 
-1. Completed — trace automatic resume from persisted pane mapping through binding loss and raw PTY input injection.
-2. Completed — add a fail-closed restore decision using the existing background `SessionResourceUsage.process_count`, without spawning `ps` on the UI thread.
-3. Completed — mark panes with a running agent or another job as handled so later process exit cannot trigger delayed resume.
-4. Completed — focused decision regressions and app Clippy/fmt/diff checks pass while preserving the pending Home changes.
-5. Completed — commit Home changes separately, then commit the verified auto-resume fix with the final handoff.
+1. Completed — inspect the current announcement renderer, feed contract, icons, and kittest coverage.
+2. Completed — implement the bordered-panel table layout from the latest reference.
+3. Completed — update focused UI regressions and run app tests/Clippy/fmt/diff checks.
+4. Completed — record final evidence and remaining delivery state.
 
 ## Status
 
+- 2026-07-20: 사용자가 검증된 Home 뉴스 표형 디자인을 커밋한 뒤 release 재빌드와 ZIP 생성을 요청했다. 앱 실행·재시작은 금지한다. 변경 범위는 `ui/agent_terminal.rs`와 누적 handoff이며, 먼저 커밋한 뒤 공식 package script와 metadata-preserving ZIP 검증을 수행한다.
+- 2026-07-20: Home 뉴스 표형 디자인의 최종 검증을 완료했다. AgentTerminal 전체 7/7, Home 집중 2/2가 통과했고, 2열 Home 폭에서 마지막 Hugging Face 탭과 우측 새로고침 버튼이 겹치지 않는 rect assertion도 통과했다. `cargo clippy -p deppy-sijo --all-targets -- -D warnings`, fmt check, diff check가 성공했다. 변경은 `ui/agent_terminal.rs`와 handoff뿐이며 release 재빌드/앱 재실행은 하지 않았다.
+- 2026-07-20: 새 Home kittest 2/2가 통과했다. 기본 Home 구성/탭 순서/Slack manage 동작과 함께, 표형 공지의 날짜·Anthropic 공급자명·행별 접근성 Source 링크·64px×5행 viewport를 검증했다. 다음은 AgentTerminal 전체 테스트와 strict app Clippy/fmt/diff다.
+- 2026-07-20: Home 공지 표형 UI를 구현했다. 기존 announcements Frame의 fill/stroke/corner/margin은 보존하고, 필터를 어두운 segmented control로 붙였으며 선택 탭은 accent 테두리·글자로 표시한다. 헤더 아래 hairline과 64px 행 5개를 두고 각 행에 날짜, 40px 세로선, 공급자별 색상명(OpenAI cyan/Anthropic orange/Grok purple/Hugging Face gold), 번역 제목, painter 기반 외부 링크 아이콘을 배치했다. 행 전체 폭 구분선·hover와 접근성 Link label을 추가했고 기존 최신순 정렬/필터/스크롤/번역 cache를 유지했다. 다음은 fmt와 집중 kittest/Clippy다.
+- 2026-07-20: 사용자가 Home 뉴스 내부를 최신 이미지처럼 바꾸고 기존 바깥 테두리는 유지하도록 요청했다. 최신 시안은 로고 카드를 사용하지 않고 탭/새로고침 아래에 날짜, 세로 구분선, 공급자 색상명, 제목, 외부 링크 아이콘을 5행으로 배치한다. 기존 provider 필터, 최신순 정렬, 섹션 내부 스크롤, 번역 캐시는 유지한다.
+- 2026-07-20: 배포용 ZIP 생성과 검증을 완료했다. `target/bundle/Deppy-Sijo-0.1.0-macos-arm64-HomeV1-fdad98e.zip`은 17MiB, SHA-256 `abdf80879273813b6664ca07272cb23c82df00d9ff64582c85d8b05ba4f4ebcc`이며 `unzip -t`가 오류 없이 통과했다. 원본 `.app`과 helper의 deep/strict codesign 검증, 두 실행 파일의 arm64 확인, bundle id `app.vector9.deppy-sijo`, version `0.1.0`, minimum macOS `11.0` 확인도 통과했다. 메인 바이너리 SHA-256은 `dfa7107bfb0b27c734dd64a3fbf1a10a34ab34a3d86122ac84e8590736e7510e`다. 앱 실행/재시작 명령은 수행하지 않았다.
+- 2026-07-20: 첫 ZIP 명령은 기존 산출물 제거를 위한 `rm -f`가 안전 정책에 차단돼 전체 명령이 실행되지 않았다. 목표 ZIP은 존재하지 않음을 확인했으며 삭제 없이 `ditto --keepParent --sequesterRsrc`만 실행한다.
+- 2026-07-20: `CARGO_NET_OFFLINE=true sh scripts/package-macos.sh`가 release build를 23.86초에 완료하고 `target/bundle/Deppy Sijo.app`을 재생성했다. 이 managed 환경에서는 signing identity를 읽지 못해 ad-hoc 서명됐으며, 앱 종료·실행·LaunchServices 명령은 수행하지 않았다. 다음은 `ditto` ZIP 생성과 추출본 검증이다.
+- 2026-07-20: 사용자가 최신 Home 공지 목록이 포함된 앱을 재빌드하되 실행하지 않고 다른 Mac에서 사용할 ZIP으로 만들도록 요청했다. `HomeV1`은 `fdad98e`에서 clean이고 공지 목록 변경은 `2d2118a`에 포함돼 있다. 공식 package script와 ZIP 검증을 진행하며 앱 실행 명령은 사용하지 않는다.
 - 2026-07-20: git metadata write access is available again. Home announcement changes were committed separately as `2d2118a` (`feat(home): refine announcement list`). The verified auto-resume guard and final handoff are now the only pending files and will be committed as a second focused commit. No release build or app relaunch was performed.
 - 2026-07-20: 검증 후 Home 변경과 auto-resume 수정 4개 파일을 함께 commit하려 했지만 sandbox가 다시 `/Users/jr/desktop/projects/deppy-sijo/.git/index.lock` 생성을 `Operation not permitted`로 거부했다. staged/commit된 추가 변경은 없고 네 파일은 working tree에 그대로 보존돼 있으며 diff check는 통과한다. 외부 Terminal 우회, release build, app relaunch는 하지 않았다.
 - 2026-07-20: 자동 resume 수정 검증이 완료됐다. `자동_resume` 필터 2/2, agent-exit 단독 1/1, `cargo clippy -p deppy-sijo --all-targets -- -D warnings`, fmt check, diff check가 모두 통과했다. 회귀는 shell 단독(1 process)만 Resume, shell+ssh(2+) MarkHandled, snapshot 없음/0 Wait, 최초 실행 agent MarkHandled 후 종료 시 Skip을 고정한다. release package build와 app relaunch는 수행하지 않았다. 다음은 현재 sandbox에서 전체 pending 변경 commit 재시도다.

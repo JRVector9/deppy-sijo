@@ -12,15 +12,15 @@ pub const CLAUDE_STATUS_URL: &str = "https://status.claude.com";
 pub const OPENAI_STATUS_URL: &str = "https://status.openai.com";
 pub const GITHUB_STATUS_URL: &str = "https://www.githubstatus.com";
 const HUGGING_FACE_MODELS_API: &str =
-    "https://huggingface.co/api/models?sort=trendingScore&direction=-1&limit=3";
+    "https://huggingface.co/api/models?sort=trendingScore&direction=-1&limit=5";
 const GROK_STATUS_RSS: &str = "https://status.x.ai/feed.xml";
 /// 상태(점등) 폴링 주기 — 장애 감지용이라 짧게 유지.
 const STATUS_INTERVAL: Duration = Duration::from_secs(300);
 /// 공지(인시던트 목록) 갱신 주기 (2026-07-18 사용자: 60분).
 const INCIDENTS_INTERVAL: Duration = Duration::from_secs(3600);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-/// 홈 공지 카드 수 (provider당, 2026-07-18 사용자: "최신 3개씩").
-const INCIDENTS_PER_PROVIDER: usize = 3;
+/// 홈 공지 카드 수 (provider당, 2026-07-20 사용자: "5줄").
+const INCIDENTS_PER_PROVIDER: usize = 5;
 
 /// Statuspage `status.indicator` 매핑.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,7 +232,7 @@ fn parse_status(json: &str) -> anyhow::Result<(ServiceIndicator, String)> {
     Ok((indicator, description))
 }
 
-/// `/api/v2/incidents.json` → 최신 3건. 링크는 shortlink 우선, 없으면(OpenAI가 그렇다)
+/// `/api/v2/incidents.json` → 최신 5건. 링크는 shortlink 우선, 없으면(OpenAI가 그렇다)
 /// Statuspage 표준 경로 `{base}/incidents/{id}`로 조립한다.
 fn parse_incidents(json: &str, base: &str) -> anyhow::Result<Vec<IncidentNotice>> {
     let value: serde_json::Value = serde_json::from_str(json)?;
@@ -323,19 +323,35 @@ struct GrokRssItem {
 
 fn parse_grok_status_rss(xml: &str) -> anyhow::Result<Vec<IncidentNotice>> {
     let feed: GrokRss = quick_xml::de::from_str(xml)?;
-    Ok(feed
-        .channel
-        .item
-        .into_iter()
-        .filter(|item| !item.title.trim().is_empty() && !item.link.trim().is_empty())
-        .map(|item| IncidentNotice {
-            title: item.title,
+    let mut seen_titles = std::collections::HashSet::new();
+    let mut notices = Vec::with_capacity(INCIDENTS_PER_PROVIDER);
+    for item in feed.channel.item {
+        let title = item.title.trim();
+        let link = item.link.trim();
+        if title.is_empty() || link.is_empty() {
+            continue;
+        }
+        // Status RSS가 같은 사건을 반복 게시하는 경우가 있어, 대소문자와 연속 공백을
+        // 무시한 제목 기준으로 첫 항목만 남긴다. 원래 최신순은 그대로 보존한다.
+        let dedupe_key = title
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        if !seen_titles.insert(dedupe_key) {
+            continue;
+        }
+        notices.push(IncidentNotice {
+            title: title.to_owned(),
             status: "update".to_owned(),
             date: rss_date(&item.published_at),
-            url: item.link,
-        })
-        .take(INCIDENTS_PER_PROVIDER)
-        .collect())
+            url: link.to_owned(),
+        });
+        if notices.len() == INCIDENTS_PER_PROVIDER {
+            break;
+        }
+    }
+    Ok(notices)
 }
 
 fn rss_date(value: &str) -> String {
@@ -392,16 +408,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_incidents는_최신_3건과_링크_폴백을_처리한다() {
-        // Claude형(shortlink 있음) 2건 + OpenAI형(shortlink 없음, id만) 1건 + 초과 1건.
+    fn parse_incidents는_최신_5건과_링크_폴백을_처리한다() {
+        // Claude형(shortlink 있음)과 OpenAI형(shortlink 없음) 5건 + 초과 1건.
         let json = r#"{"incidents":[
             {"name":"A","status":"resolved","created_at":"2026-07-17T18:32:32.629Z","shortlink":"https://stspg.io/a"},
             {"name":"B","status":"investigating","created_at":"2026-07-17T06:47:54.909Z"},
             {"name":"C","status":"resolved","created_at":"2026-07-16T22:54:01Z","id":"abc123"},
-            {"name":"D","status":"resolved","created_at":"2026-07-15T00:00:00Z"}
+            {"name":"D","status":"resolved","created_at":"2026-07-15T00:00:00Z"},
+            {"name":"E","status":"resolved","created_at":"2026-07-14T00:00:00Z"},
+            {"name":"F","status":"resolved","created_at":"2026-07-13T00:00:00Z"}
         ]}"#;
         let notices = parse_incidents(json, "https://status.openai.com").unwrap();
-        assert_eq!(notices.len(), 3, "최신 3건만");
+        assert_eq!(notices.len(), 5, "최신 5건만");
         assert_eq!(notices[0].url, "https://stspg.io/a");
         assert_eq!(notices[0].date, "2026-07-17");
         assert_eq!(
@@ -415,15 +433,17 @@ mod tests {
     }
 
     #[test]
-    fn hugging_face_trending_models를_최신_3건으로_변환한다() {
+    fn hugging_face_trending_models를_최신_5건으로_변환한다() {
         let json = r#"[
             {"id":"org/model-a","createdAt":"2026-07-14T13:23:14.000Z"},
             {"modelId":"org/model-b","createdAt":"2026-07-13T00:00:00.000Z"},
             {"id":"org/model-c","createdAt":"2026-07-12T00:00:00.000Z"},
-            {"id":"org/model-d","createdAt":"2026-07-11T00:00:00.000Z"}
+            {"id":"org/model-d","createdAt":"2026-07-11T00:00:00.000Z"},
+            {"id":"org/model-e","createdAt":"2026-07-10T00:00:00.000Z"},
+            {"id":"org/model-f","createdAt":"2026-07-09T00:00:00.000Z"}
         ]"#;
         let notices = parse_hugging_face_models(json).unwrap();
-        assert_eq!(notices.len(), 3);
+        assert_eq!(notices.len(), 5);
         assert_eq!(notices[0].title, "org/model-a");
         assert_eq!(notices[0].url, "https://huggingface.co/org/model-a");
         assert_eq!(notices[0].status, "trending");
@@ -431,21 +451,29 @@ mod tests {
     }
 
     #[test]
-    fn grok_공식_rss를_최신_3건으로_변환한다() {
+    fn grok_공식_rss를_중복없이_최신_5건으로_변환한다() {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
         <rss version="2.0"><channel>
           <item><title><![CDATA[Grok Web unavailable]]></title><link>https://status.x.ai/incidents/one</link><pubDate>Mon, 20 Jul 2026 10:20:00 +0000</pubDate></item>
           <item><title>API latency</title><link>https://status.x.ai/incidents/two</link><pubDate>2026-07-19T08:00:00Z</pubDate></item>
+          <item><title> api   LATENCY </title><link>https://status.x.ai/incidents/two-duplicate</link><pubDate>2026-07-19T07:00:00Z</pubDate></item>
           <item><title>Grok in X</title><link>https://status.x.ai/incidents/three</link><pubDate>Sat, 18 Jul 2026 03:00:00 +0000</pubDate></item>
           <item><title>Older incident</title><link>https://status.x.ai/incidents/four</link><pubDate>Fri, 17 Jul 2026 03:00:00 +0000</pubDate></item>
+          <item><title>Account issue</title><link>https://status.x.ai/incidents/five</link><pubDate>Thu, 16 Jul 2026 03:00:00 +0000</pubDate></item>
+          <item><title>Developer API</title><link>https://status.x.ai/incidents/six</link><pubDate>Wed, 15 Jul 2026 03:00:00 +0000</pubDate></item>
         </channel></rss>"#;
         let notices = parse_grok_status_rss(xml).unwrap();
-        assert_eq!(notices.len(), 3);
+        assert_eq!(notices.len(), 5);
         assert_eq!(notices[0].title, "Grok Web unavailable");
         assert_eq!(notices[0].url, "https://status.x.ai/incidents/one");
         assert_eq!(notices[0].status, "update");
         assert_eq!(notices[0].date, "2026-07-20");
         assert_eq!(notices[1].date, "2026-07-19");
+        assert_eq!(notices[4].title, "Account issue");
+        assert_eq!(
+            notices.iter().filter(|n| n.title == "API latency").count(),
+            1
+        );
     }
 
     #[test]

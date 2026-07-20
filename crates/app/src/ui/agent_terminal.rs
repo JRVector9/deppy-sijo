@@ -17,11 +17,11 @@ enum AnnouncementFilter {
     All,
     OpenAi,
     Anthropic,
-    HuggingFace,
     Grok,
+    HuggingFace,
 }
 
-const ANNOUNCEMENT_VISIBLE_ROWS: usize = 3;
+const ANNOUNCEMENT_VISIBLE_ROWS: usize = 5;
 const ANNOUNCEMENT_ROW_HEIGHT: f32 = 48.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,7 +238,8 @@ impl AgentTerminalUi {
             .fill(ui.visuals().panel_fill)
             .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
             .corner_radius(egui::CornerRadius::same(2))
-            .inner_margin(egui::Margin::same(16));
+            // 기존 16px 좌우 여백을 절반으로 줄이고 양쪽을 정확히 맞춘다.
+            .inner_margin(egui::Margin::symmetric(8, 16));
         panel.show(ui, |ui| {
             ui.set_min_height(250.0);
             ui.horizontal_wrapped(|ui| {
@@ -262,15 +263,15 @@ impl AgentTerminalUi {
                 );
                 source_filter(
                     ui,
-                    "Hugging Face",
-                    &mut self.announcement_filter,
-                    AnnouncementFilter::HuggingFace,
-                );
-                source_filter(
-                    ui,
                     "Grok",
                     &mut self.announcement_filter,
                     AnnouncementFilter::Grok,
+                );
+                source_filter(
+                    ui,
+                    "Hugging Face",
+                    &mut self.announcement_filter,
+                    AnnouncementFilter::HuggingFace,
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -283,32 +284,20 @@ impl AgentTerminalUi {
                 });
             });
             ui.add_space(12.0);
-            // 실제 상태 페이지의 최신 인시던트 3건씩 (2026-07-18 사용자 — 정적 링크
+            // 실제 상태 페이지의 최신 인시던트 5건씩 (2026-07-20 사용자 — 정적 링크
             // 카드에서 교체). 아직 첫 조회 전이면 안내 문구.
             let mut cards: Vec<AnnouncementCard> = [
+                (AnnouncementFilter::OpenAi, "OpenAI", feed.openai.as_ref()),
                 (
                     AnnouncementFilter::Anthropic,
                     "Claude",
                     feed.claude.as_ref(),
-                    egui::Color32::from_rgb(0xd2, 0x91, 0x55),
                 ),
-                (
-                    AnnouncementFilter::OpenAi,
-                    "OpenAI",
-                    feed.openai.as_ref(),
-                    egui::Color32::from_rgb(0xa7, 0xae, 0xbc),
-                ),
+                (AnnouncementFilter::Grok, "Grok", feed.grok.as_ref()),
                 (
                     AnnouncementFilter::HuggingFace,
                     "Hugging Face",
                     feed.hugging_face.as_ref(),
-                    egui::Color32::from_rgb(0xff, 0xc1, 0x07),
-                ),
-                (
-                    AnnouncementFilter::Grok,
-                    "Grok",
-                    feed.grok.as_ref(),
-                    egui::Color32::from_rgb(0xe0, 0x6c, 0x75),
                 ),
             ]
             .into_iter()
@@ -316,18 +305,14 @@ impl AgentTerminalUi {
                 self.announcement_filter == AnnouncementFilter::All
                     || self.announcement_filter == *provider
             })
-            .filter_map(|(provider, source, status, accent)| {
-                status.map(|status| (provider, source, status, accent))
+            .filter_map(|(provider, source, status)| {
+                status.map(|status| (provider, source, status))
             })
-            .flat_map(|(_, source, status, accent)| {
+            .flat_map(|(_, source, status)| {
                 status
                     .incidents
                     .iter()
-                    .map(move |incident| AnnouncementCard {
-                        source,
-                        incident,
-                        accent,
-                    })
+                    .map(move |incident| AnnouncementCard { source, incident })
             })
             .collect();
             if cards.is_empty() {
@@ -343,16 +328,19 @@ impl AgentTerminalUi {
                     },
                 );
             } else {
-                // 공급자를 가로질러 최신 날짜순으로 정렬한다. 화면에는 정확히 3행만
+                // 공급자를 가로질러 최신 날짜순으로 정렬한다. 화면에는 정확히 5행만
                 // 보이고 나머지는 이 패널 안에서만 스크롤한다(2026-07-20 사용자).
                 cards.sort_by(|left, right| right.incident.date.cmp(&left.incident.date));
                 let viewport_height = ANNOUNCEMENT_ROW_HEIGHT * ANNOUNCEMENT_VISIBLE_ROWS as f32;
                 ui.scope(|ui| {
                     // show_rows는 전역 item spacing을 행 높이에 더한다. 여기서는 0으로
-                    // 고정해 48px × 3행 viewport가 정확히 세 행과 일치하게 한다.
+                    // 고정해 48px × 5행 viewport가 정확히 다섯 행과 일치하게 한다.
                     ui.spacing_mut().item_spacing.y = 0.0;
                     egui::ScrollArea::vertical()
                         .id_salt("home-announcement-rows")
+                        // scrollbar가 우측 폭을 예약하면 divider의 우측 여백만 커진다.
+                        // wheel/drag 스크롤은 유지하면서 숨겨 좌우 8px을 정확히 맞춘다.
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .max_height(viewport_height)
                         .min_scrolled_height(viewport_height)
                         .auto_shrink([false, false])
@@ -445,7 +433,6 @@ fn connections_panel(
 struct AnnouncementCard<'a> {
     source: &'static str,
     incident: &'a crate::status_feed::IncidentNotice,
-    accent: egui::Color32,
 }
 
 /// Statuspage 인시던트 상태 → 로케일 라벨 (미지 값은 원문 그대로).
@@ -477,7 +464,7 @@ fn source_filter(
     }
 }
 
-/// 공지 리스트 행 1개 — 제공자·제목·상태·날짜·원문 링크를 모두 좌측 정렬한다.
+/// 공지 리스트 행 1개 — 중복되는 제공자 장식 없이 제목·상태·날짜·원문만 표시한다.
 fn announcement_row(
     ui: &mut egui::Ui,
     card: &AnnouncementCard<'_>,
@@ -485,54 +472,48 @@ fn announcement_row(
     locale: &str,
     catalog: &i18n::Catalog,
 ) {
-    let row = ui.allocate_ui_with_layout(
+    // allocate_ui의 response rect는 자식 content 폭으로 줄 수 있어 divider 길이가 행마다
+    // 달라졌다. 먼저 viewport 전체 폭을 확정하고 같은 rect로 content와 divider를 그린다.
+    let (row_rect, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), ANNOUNCEMENT_ROW_HEIGHT),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            provider_mark(ui, card.source, card.accent);
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), ANNOUNCEMENT_ROW_HEIGHT),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    ui.spacing_mut().item_spacing.y = 1.0;
-                    ui.horizontal(|ui| {
-                        ui.add_sized(
-                            [82.0, 20.0],
-                            egui::Label::new(egui::RichText::new(card.source).strong())
-                                .halign(egui::Align::LEFT),
-                        );
-                        let translated =
-                            translations.get(card.source, locale, &card.incident.title);
-                        let title_text = translated.unwrap_or(&card.incident.title);
-                        let title = ui.add(
-                            egui::Label::new(egui::RichText::new(title_text).strong())
-                                .truncate()
-                                .halign(egui::Align::LEFT),
-                        );
-                        if translated.is_some() {
-                            title.on_hover_text(&card.incident.title);
-                        } else {
-                            title.on_hover_text(title_text);
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.weak(incident_status_label(catalog, &card.incident.status));
-                        if !card.incident.date.is_empty() {
-                            ui.weak(&card.incident.date);
-                        }
-                        ui.hyperlink_to(
-                            catalog.t("home.notices.original_link", &[]),
-                            &card.incident.url,
-                        );
-                    });
-                },
-            );
-        },
+        egui::Sense::hover(),
     );
+    let content_rect = row_rect.shrink2(egui::vec2(0.0, 2.0));
+    let mut row_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(content_rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    row_ui.set_clip_rect(content_rect.intersect(ui.clip_rect()));
+    row_ui.spacing_mut().item_spacing.y = 1.0;
+
+    let translated = translations.get(card.source, locale, &card.incident.title);
+    let title_text = translated.unwrap_or(&card.incident.title);
+    let title = row_ui.add_sized(
+        [row_ui.available_width(), 20.0],
+        egui::Label::new(egui::RichText::new(title_text).strong())
+            .truncate()
+            .halign(egui::Align::LEFT),
+    );
+    if translated.is_some() {
+        title.on_hover_text(&card.incident.title);
+    } else {
+        title.on_hover_text(title_text);
+    }
+    row_ui.horizontal(|ui| {
+        ui.weak(incident_status_label(catalog, &card.incident.status));
+        if !card.incident.date.is_empty() {
+            ui.weak(&card.incident.date);
+        }
+        ui.hyperlink_to(
+            catalog.t("home.notices.original_link", &[]),
+            &card.incident.url,
+        );
+    });
+
     ui.painter().hline(
-        row.response.rect.x_range(),
-        row.response.rect.bottom() - 0.5,
+        row_rect.x_range(),
+        row_rect.bottom() - 0.5,
         ui.visuals().widgets.noninteractive.bg_stroke,
     );
 }
@@ -616,19 +597,6 @@ fn workspace_has_warning(row: &ActivityWorkspaceRow) -> bool {
             .sessions
             .iter()
             .any(|session| session.pressure.is_some())
-}
-
-fn provider_mark(ui: &mut egui::Ui, source: &str, color: egui::Color32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
-    ui.painter()
-        .rect_filled(rect, 1.0, color.gamma_multiply(0.22));
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        source.chars().next().unwrap_or('A'),
-        egui::FontId::monospace(12.0),
-        color,
-    );
 }
 
 fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
@@ -786,13 +754,68 @@ mod tests {
         harness.get_by_label("My Connections");
         harness.get_by_label("Slack");
         harness.get_by_label("Not connected");
-        harness.get_by_label("Hugging Face");
-        harness.get_by_label("Grok");
+        let all = harness.get_by_label("All").rect().left();
+        let openai = harness.get_by_label("OpenAI").rect().left();
+        let anthropic = harness.get_by_label("Anthropic").rect().left();
+        let grok = harness.get_by_label("Grok").rect().left();
+        let hugging_face = harness.get_by_label("Hugging Face").rect().left();
+        assert!(all < openai && openai < anthropic && anthropic < grok && grok < hugging_face);
         assert!(harness.query_by_label("MLX").is_none());
         assert!(harness.query_by_label("Home").is_none());
 
         harness.get_by_label("Manage").click();
         harness.run();
         assert_eq!(harness.state().1, vec![HomeAction::Connectors]);
+    }
+
+    #[test]
+    fn kittest_home_공지는_공급자장식없이_정확히_5행을_보인다() {
+        use egui_kittest::kittest::Queryable;
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let feed = StatusFeedSnapshot {
+            claude: Some(ProviderStatus {
+                indicator: ServiceIndicator::Operational,
+                description: "Operational".to_owned(),
+                incidents: (1..=6)
+                    .map(|index| crate::status_feed::IncidentNotice {
+                        title: format!("Announcement {index}"),
+                        status: "resolved".to_owned(),
+                        date: format!("2026-07-{:02}", 21 - index),
+                        url: format!("https://status.claude.com/incidents/{index}"),
+                    })
+                    .collect(),
+            }),
+            ..StatusFeedSnapshot::default()
+        };
+        let translations = crate::notice_translate::TranslationCache::default();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, home: &mut AgentTerminalUi| {
+                home.home(
+                    ui,
+                    &feed,
+                    NoticeTranslations {
+                        cache: &translations,
+                        locale: i18n::FALLBACK_LOCALE,
+                    },
+                    super::super::connectors::SlackMcpStatus::NotConfigured,
+                    &catalog,
+                );
+            },
+            AgentTerminalUi::new(),
+        );
+        harness.run();
+
+        assert_eq!(ANNOUNCEMENT_VISIBLE_ROWS, 5);
+        assert!(harness.query_by_label("Claude").is_none());
+        let first_top = harness.get_by_label("Announcement 1").rect().top();
+        for index in 2..=5 {
+            harness.get_by_label(&format!("Announcement {index}"));
+        }
+        // show_rows는 경계의 다음 행을 접근성 트리에 준비할 수 있다. 실제 위치를 재서
+        // 여섯째 행이 정확히 5행 viewport 밖에서 시작하는지 확인한다.
+        let sixth_top = harness.get_by_label("Announcement 6").rect().top();
+        let viewport_height = ANNOUNCEMENT_ROW_HEIGHT * ANNOUNCEMENT_VISIBLE_ROWS as f32;
+        assert!(sixth_top - first_top >= viewport_height - 0.5);
     }
 }

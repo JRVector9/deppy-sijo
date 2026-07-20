@@ -81,6 +81,29 @@ pub fn open_path(path: &std::path::Path) {
     );
 }
 
+/// macOS 「개인정보 보호 및 보안 → 파일 및 폴더」 설정을 연다.
+///
+/// 한 번 거부한 TCC 파일 접근은 앱이 같은 prompt를 강제로 다시 띄울 수 없으므로,
+/// Apple이 안내하는 설정 화면에서 사용자가 직접 권한을 변경하도록 연결한다.
+pub fn open_file_access_settings() {
+    #[cfg(target_os = "macos")]
+    {
+        const URL: &str =
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders";
+        std::thread::spawn(
+            move || match std::process::Command::new("open").arg(URL).status() {
+                Ok(status) if !status.success() => {
+                    tracing::warn!("macOS 파일 및 폴더 권한 설정 열기 실패: open {status}");
+                }
+                Err(error) => tracing::warn!("macOS 파일 및 폴더 권한 설정 열기 실패: {error}"),
+                Ok(_) => {}
+            },
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    tracing::warn!("파일 접근 권한 설정 열기는 macOS에서만 지원됨");
+}
+
 /// 프로세스의 현재 작업 디렉터리 (lsof 1회). 터미널 상대경로 더블클릭 해석용 —
 /// 사용자 클릭 시점의 일회성 조회라 스폰 비용(수십 ms)을 감수한다.
 /// -Fn: 'n' 접두 라인이 경로 — 여러 줄이면 마지막 n 라인(agent_detect 실증 관례).

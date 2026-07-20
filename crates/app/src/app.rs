@@ -6150,6 +6150,9 @@ impl eframe::App for App {
                 Some(ui::file_tree::SidebarAction::OpenAgents) => {
                     self.agent_sessions_ui.open();
                 }
+                Some(ui::file_tree::SidebarAction::OpenMacosFileAccessSettings) => {
+                    platform::open_file_access_settings();
+                }
                 // "터미널에 경로 삽입" (FT-3): 포커스된 pane의 세션에 WriteInput —
                 // 파일 트리의 유일한 runtime 접점 (§6).
                 Some(ui::file_tree::SidebarAction::InsertPath(path)) => {

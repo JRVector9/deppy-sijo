@@ -113,6 +113,8 @@ pub enum SidebarAction {
     /// App이 현재 view를 보고 결정한다 — 이 모듈은 view를 바꾸지 않는다.
     ShowInbox,
     OpenAgents,
+    /// root folder를 macOS가 거부한 상태에서 「개인정보 보호 및 보안 → 파일 및 폴더」를 연다.
+    OpenMacosFileAccessSettings,
     /// 경로를 포커스된 터미널에 삽입 (FT-3)
     InsertPath(PathBuf),
     /// 포커스된 터미널에서 이 폴더로 cd 실행 (디렉터리 컨텍스트 메뉴, 2026-07-08)
@@ -210,11 +212,17 @@ struct FlatRow {
     expanded: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RootListingError {
+    PermissionDenied,
+    Other(String),
+}
+
 pub struct FileTreeUi {
     /// workspace 루트. None = path 미설정 → 안내 표시(§9-2).
     root: Option<PathBuf>,
     /// 루트 나열 실패 사유 (invalid root — 에러 라벨 + 트리 비활성, §9-2).
-    root_error: Option<String>,
+    root_error: Option<RootListingError>,
     /// 루트 디렉터리의 자식들. 루트 자체는 행으로 그리지 않는다.
     children: Option<Vec<TreeNode>>,
     /// 가시 행 평탄화 캐시 — 펼침/접힘/조작 시에만 재계산(§3).
@@ -1430,8 +1438,36 @@ impl FileTreeUi {
             ui.weak(catalog.t("file_tree.edit_workspace_path_hint", &[]));
             return action;
         }
-        if let Some(err) = &self.root_error {
-            ui.colored_label(ui.visuals().error_fg_color, err);
+        if let Some(error) = &self.root_error {
+            match error {
+                RootListingError::PermissionDenied => {
+                    let available = ui.available_size();
+                    let button_width = (available.x - 16.0).clamp(24.0, 320.0);
+                    let mut open_settings = false;
+                    ui.allocate_ui_with_layout(
+                        available,
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            ui.add_space(((available.y - 40.0) * 0.5).max(0.0));
+                            open_settings = ui
+                                .add_sized(
+                                    [button_width, 40.0],
+                                    egui::Button::new(
+                                        catalog.t("file_tree.macos_access_denied", &[]),
+                                    )
+                                    .wrap(),
+                                )
+                                .clicked();
+                        },
+                    );
+                    if open_settings {
+                        action = Some(SidebarAction::OpenMacosFileAccessSettings);
+                    }
+                }
+                RootListingError::Other(message) => {
+                    ui.colored_label(ui.visuals().error_fg_color, message);
+                }
+            }
             return action;
         }
 
@@ -2470,9 +2506,9 @@ impl FileTreeUi {
         if path == root {
             self.children = None;
             self.root_error = Some(if permission_denied {
-                "이 폴더는 macOS 접근 권한이 없습니다.".to_owned()
+                RootListingError::PermissionDenied
             } else {
-                format!("루트 나열 실패: {error}")
+                RootListingError::Other(format!("루트 나열 실패: {error}"))
             });
             self.rebuild_flat();
             return;
@@ -5676,6 +5712,85 @@ mod tests {
             "이전 root late result는 epoch mismatch로 폐기"
         );
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn kittest_root_권한거부는_가운데_버튼으로_설정열기_action을_낸다() {
+        use egui_kittest::kittest::Queryable;
+
+        struct State {
+            tree: FileTreeUi,
+            open_settings: bool,
+            fonts_ready: bool,
+        }
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspaces = vec![SidebarWorkspaceEntry {
+            id: "workspace-a".to_owned(),
+            name: "Workspace A".to_owned(),
+            state: SidebarWorkspaceState::Active,
+            summary: SidebarSessionSummary::default(),
+        }];
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        let denied = PathBuf::from("/permission-denied-fixture");
+        tree.root = Some(denied.clone());
+        tree.apply_listing_error(
+            &denied,
+            "operation not permitted".to_owned(),
+            std::io::ErrorKind::PermissionDenied,
+        );
+        assert_eq!(
+            tree.root_error,
+            Some(RootListingError::PermissionDenied),
+            "PermissionDenied는 일반 문자열 오류와 구분돼야 한다"
+        );
+
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 700.0))
+            .build_ui_state(
+                |ui, state: &mut State| {
+                    if !state.fonts_ready {
+                        return;
+                    }
+                    let sidebar = SidebarSnapshot {
+                        active_workspace_id: "workspace-a",
+                        workspaces: &workspaces,
+                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        inbox_count: 0,
+                        agents_open: false,
+                    };
+                    if matches!(
+                        state.tree.contents(
+                            ui,
+                            &std::collections::HashMap::new(),
+                            &sidebar,
+                            &catalog,
+                        ),
+                        Some(SidebarAction::OpenMacosFileAccessSettings)
+                    ) {
+                        state.open_settings = true;
+                    }
+                },
+                State {
+                    tree,
+                    open_settings: false,
+                    fonts_ready: false,
+                },
+            );
+        install_sidebar_test_fonts(&harness.ctx);
+        harness.state_mut().fonts_ready = true;
+        harness.run();
+
+        let label = catalog.t("file_tree.macos_access_denied", &[]);
+        let button = harness.get_by_label(&label);
+        assert!(
+            (button.rect().center().x - 210.0).abs() <= 1.0,
+            "권한 버튼은 파일 트리 가로 중앙에 있어야 한다: {:?}",
+            button.rect()
+        );
+        button.click();
+        harness.run();
+        assert!(harness.state().open_settings);
     }
 
     #[test]

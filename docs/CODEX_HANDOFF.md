@@ -2,8 +2,8 @@
 
 ## Current task
 
-- Move the macOS folder-access denial CTA to the sidebar screen center with a vivid accent treatment, and decouple Settings workspace selection from sidebar visibility/runtime focus.
-- Status: fixed and verified. The CTA follows the sidebar screen center with an accent fill, and Settings Workspaces/Environment use an independent workspace context that does not reveal or focus sidebar runtimes.
+- Decouple the Environment & API project-list close action from workspace deletion/sidebar lifecycle.
+- Status: fixed and verified. `X` now persists only an Environment-list hidden ID; sidebar workspaces, runtimes, sessions, focus, DB workspace rows, credentials, and `.env` remain untouched.
 
 ## Working area
 
@@ -14,14 +14,19 @@
 
 ## Plan
 
-1. Completed — trace the permission CTA geometry and both Settings workspace selection paths.
-2. Completed — implement screen-center accent CTA and settings-only workspace context.
-3. Completed — add geometry and no-sidebar-side-effect regressions.
-4. Completed — run focused/full tests, strict Clippy, format, and diff checks.
-5. Completed — record final evidence and delivery state.
+1. Completed — trace Environment & API `X` from list action through confirmation into workspace DB/runtime deletion.
+2. Completed — add persisted Environment-only hidden project IDs and replace destructive delete handling.
+3. Completed — run config/selection/sidebar-isolation regressions and focused/full verification.
 
 ## Status
 
+- 2026-07-20: 사용자가 검증된 Environment 전용 닫기 변경의 커밋·push·release build·앱 재실행을 요청했다. 현재 9개 의도된 변경 파일을 기능 커밋으로 고정하고 `HomeV1`에 push한 뒤 공식 package script, codesign/arm64 검증, exact-name 기존 앱 종료와 정확한 bundle 재실행/로그 확인을 진행한다.
+- 2026-07-20: 최종 diff 검사를 완료했다. 변경은 app/config/env project list, 5개 locale, handoff 9개 파일로 한정되고 `git diff --check`가 통과했다. 실행 중인 앱은 이전 release 그대로이며 이번 요청에서는 commit/build/restart를 수행하지 않았다.
+- 2026-07-20: 최종 회귀가 통과했다. localhost bind가 필요한 기존 7개 proxy/connector fixture만 명시 제외한 직렬 app 전체는 564 passed/0 failed/5 ignored/7 filtered였고, `cargo clippy -p deppy-sijo --all-targets -- -D warnings`, 적용 후 rustfmt check도 성공했다. Environment 닫기 처리 블록에는 `db.delete_workspace`, `switch_workspace`, runtime shutdown, sidebar `closed_workspaces` 변경이 없다. 다음은 최종 diff/check와 사용자 전달이다.
+- 2026-07-20: 첫 `cargo fmt --all -- --check`는 `app.rs` 새 코드의 줄바꿈 형식 차이만 지적해 실패했다. 동작/타입 문제는 아니며 `cargo fmt --all`로 기계적 포맷을 적용한 뒤 check를 재실행한다.
+- 2026-07-20: 1차 검증이 통과했다. `cargo check -p deppy-sijo`, Environment 닫기 sidebar/active 격리 회귀 1/1, config hidden ID roundtrip 1/1, env project list UI 1/1, i18n 전체 7/7이 성공했다. 다음은 rustfmt/strict Clippy, destructive-call 부재 정적 검사와 전체 app 회귀다.
+- 2026-07-20: Environment `X` 분리를 구현했다. `UiConfig.hidden_env_project_ids`가 설정 목록 숨김만 영속하고, 프로젝트 row action/tooltip/확인 문구를 Delete가 아닌 Close로 바꿨다. 확정 경로에서 agent persistence drain, runtime 전환/종료, dotenv credential 정리, `db.delete_workspace`를 모두 제거했다. 현재 선택을 닫으면 다음 visible 프로젝트만 설정 context로 선택하며 sidebar active/closed state는 입력하지 않는다. `+`로 같은 폴더를 고르면 숨김을 해제하고, 마지막 visible 프로젝트는 닫지 않는다. config roundtrip과 sidebar/active 불변 회귀를 추가했으며 다음은 compile/test다.
+- 2026-07-20: 새 요청 원인을 확인했다. Environment & API의 `X`는 `DeleteRequested` → `ws_delete_confirm` → agent persistence 정리/runtime 종료/`db.delete_workspace`로 이어져 실제 sidebar workspace까지 제거한다. `UiConfig`에 Environment 전용 숨김 ID를 두고 목록만 필터링하며, 같은 폴더를 `+`로 다시 선택하면 복원한다. 닫기 처리에는 `closed_workspaces`, active runtime, session, DB workspace delete를 입력하거나 수정하지 않는 회귀를 추가한다.
 - 2026-07-20: Terminal bundle ID AppleEvent 경로로 exact-name 기존 `deppy-sijo`만 TERM 종료하고 정확한 `/Users/jr/Desktop/Projects/deppy-sijo/target/bundle/Deppy Sijo.app`을 새로 열었다. marker와 app lock 모두 새 PID `84554`를 가리키고 실행 경로도 해당 bundle의 `Contents/MacOS/deppy-sijo`와 일치한다. 22:08:52 KST 시작 로그에는 log budget, AppleGothic/Apple SD Gothic 등록, web-remote `127.0.0.1:8737` 시작이 기록됐으며 새 panic/error는 없다. 임시 재실행 스크립트를 제거하고 이 최종 delivery 기록을 docs-only commit으로 push한다.
 - 2026-07-20: Terminal 절대 bundle 경로 전달도 이 관리 세션의 LaunchServices가 존재하는 실행 파일을 `kLSNoExecutableErr -10827`로 잘못 판정해 스크립트 실행 전에 실패했다. 제품 bundle이나 앱 상태에는 변화가 없다. LaunchServices 이름/경로 해석 대신 Terminal의 고정 bundle ID AppleEvent 경로를 시도한다.
 - 2026-07-20: exact-name 종료/정확한 bundle open만 담은 재실행 스크립트를 만든 뒤 `open -a Terminal`로 전달한 첫 시도는 관리 셸이 Terminal의 표시 이름을 찾지 못해 실행 전에 중단됐다. 따라서 앱/프로세스 상태 변화는 없다. Terminal의 `/System/Applications/Utilities/Terminal.app` 절대 경로로 같은 스크립트를 다시 전달한다.

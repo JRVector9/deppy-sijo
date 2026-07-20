@@ -18,7 +18,7 @@ pub enum EnvProjectListAction {
     None,
     Select(String),
     AddRequested,
-    DeleteRequested(String),
+    CloseRequested(String),
 }
 
 #[derive(Debug, Clone)]
@@ -398,21 +398,22 @@ fn render_row(
         },
     );
 
-    // 선택 행은 항상, 나머지는 hover 때만 ×를 노출한다.
+    // 선택 행은 항상, 나머지는 hover 때만 ×를 노출한다. 이 버튼은 Environment & API
+    // 목록만 닫으며 workspace 자체를 삭제하거나 sidebar runtime을 종료하지 않는다.
     if selected || response.hovered() {
-        // 선택(활성) 행에서도 삭제 요청을 발행한다 — 확인 다이얼로그·활성 워크스페이스
-        // 전환은 App(오케스트레이터) 담당(2026-07-10). 마지막 1개 제한만 유지.
-        let delete_enabled = project_count > 1;
-        let delete = ui
+        // 마지막 프로젝트는 상세 context가 비지 않도록 유지한다. 닫힌 프로젝트는 `+`로
+        // 같은 폴더를 다시 고르면 App이 목록에 복원한다.
+        let close_enabled = project_count > 1;
+        let close = ui
             .interact(
                 delete_rect,
-                ui.id().with(("env_project_delete", &project.id)),
+                ui.id().with(("env_project_close", &project.id)),
                 egui::Sense::click(),
             )
-            .on_hover_text(catalog.t("action.delete", &[]));
-        paint_delete_button(ui, delete_rect, delete.hovered() && delete_enabled);
-        if delete.clicked() && delete_enabled {
-            return EnvProjectListAction::DeleteRequested(project.id.clone());
+            .on_hover_text(catalog.t("action.close", &[]));
+        paint_close_button(ui, delete_rect, close.hovered() && close_enabled);
+        if close.clicked() && close_enabled {
+            return EnvProjectListAction::CloseRequested(project.id.clone());
         }
     }
 
@@ -423,19 +424,19 @@ fn render_row(
     }
 }
 
-fn paint_delete_button(ui: &mut egui::Ui, rect: egui::Rect, danger: bool) {
-    let fill = if danger {
-        ui.visuals().error_fg_color
+fn paint_close_button(ui: &mut egui::Ui, rect: egui::Rect, hovered: bool) {
+    let fill = if hovered {
+        ui.visuals().widgets.hovered.weak_bg_fill
     } else {
         egui::Color32::TRANSPARENT
     };
-    let stroke = if danger {
-        ui.visuals().error_fg_color
+    let stroke = if hovered {
+        ui.visuals().widgets.hovered.bg_stroke.color
     } else {
         ui.visuals().widgets.noninteractive.bg_stroke.color
     };
-    let text = if danger {
-        ui.visuals().window_fill
+    let text = if hovered {
+        ui.visuals().text_color()
     } else {
         ui.visuals().weak_text_color()
     };

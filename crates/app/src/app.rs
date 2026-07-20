@@ -1147,8 +1147,8 @@ pub struct App {
     dotenv_sync_deferred: Option<DotenvSyncJob>,
     /// 프로젝트 폴더 rename 복구 확인 모달 — Some((old, new))이면 표시(2026-07-08).
     workspace_rename_prompt: Option<(String, String)>,
-    /// 프로젝트 삭제 확인 대기 — Some((id, 표시명)). 확인 모달에서 확정/취소(2026-07-10).
-    ws_delete_confirm: Option<(String, String)>,
+    /// Environment & API 프로젝트 닫기 확인 대기 — sidebar/DB 삭제와 무관하다.
+    env_project_close_confirm: Option<(String, String)>,
     /// 사이드바 「워크스페이스 종료」 확인 대기 — Some((id, 표시명, 세션 수, 실행 중 수)).
     /// 확정 시 세션(pane)만 일괄 닫고 워크스페이스(경로·설정·DB 기록)는 보존한다.
     ws_close_confirm: Option<(String, String, usize, usize)>,
@@ -1495,6 +1495,53 @@ fn resolve_settings_workspace_id(
         .or_else(|| workspaces.first().map(|workspace| workspace.id.clone()))
 }
 
+/// Environment & API 목록 안에서만 설정 context를 결정한다. sidebar visibility와
+/// runtime active는 후보 우선순위에만 쓰고 수정하지 않는다.
+fn resolve_settings_env_project_id(
+    projects: &[ui::env_project_list::EnvProjectRow],
+    requested: Option<&str>,
+    current: Option<&str>,
+    active_id: &str,
+) -> Option<String> {
+    [requested, current, Some(active_id)]
+        .into_iter()
+        .flatten()
+        .find(|candidate| projects.iter().any(|project| project.id == *candidate))
+        .map(str::to_owned)
+        .or_else(|| projects.first().map(|project| project.id.clone()))
+}
+
+/// Environment & API에서 프로젝트를 닫는다. 설정 목록의 숨김 집합과 다음 설정 선택만
+/// 바꾸며 workspace DB/sidebar/runtime/session 상태는 입력으로 받지 않는다.
+fn close_settings_env_project(
+    hidden: &mut std::collections::BTreeSet<String>,
+    visible_projects: &[ui::env_project_list::EnvProjectRow],
+    workspace_id: &str,
+    current: Option<&str>,
+) -> Option<String> {
+    if visible_projects.len() <= 1
+        || !visible_projects
+            .iter()
+            .any(|project| project.id == workspace_id)
+    {
+        return current.map(str::to_owned);
+    }
+    hidden.insert(workspace_id.to_owned());
+    if current != Some(workspace_id) {
+        return current
+            .filter(|current| {
+                visible_projects
+                    .iter()
+                    .any(|project| project.id == *current)
+            })
+            .map(str::to_owned);
+    }
+    visible_projects
+        .iter()
+        .find(|project| project.id != workspace_id)
+        .map(|project| project.id.clone())
+}
+
 fn clear_closed_workspace_state(
     closed: &mut std::collections::HashMap<String, ClosedWorkspaceState>,
     persisted: &mut std::collections::BTreeSet<String>,
@@ -1678,7 +1725,7 @@ impl App {
             dotenv_sync_worker_failed: false,
             dotenv_sync_deferred: None,
             workspace_rename_prompt: None,
-            ws_delete_confirm: None,
+            env_project_close_confirm: None,
             ws_close_confirm: None,
             ws_rename_edit: None,
             runtime_stream_warning: false,
@@ -4472,10 +4519,34 @@ impl App {
             .ui
             .closed_workspace_ids
             .retain(|id| workspaces.iter().any(|workspace| workspace.id == *id));
-        if self.config.ui.closed_workspace_ids.len() != persisted_before
+        let hidden_env_before = self.config.ui.hidden_env_project_ids.clone();
+        self.config
+            .ui
+            .hidden_env_project_ids
+            .retain(|id| workspaces.iter().any(|workspace| workspace.id == *id));
+        // UI는 마지막 visible 프로젝트의 X를 비활성화하지만, config 수동 편집이나
+        // workspace DB 삭제 뒤에도 Environment 상세 context가 완전히 비지 않게 정규화한다.
+        if !workspaces.is_empty()
+            && workspaces.iter().all(|workspace| {
+                self.config
+                    .ui
+                    .hidden_env_project_ids
+                    .contains(&workspace.id)
+            })
+        {
+            let fallback = workspaces
+                .iter()
+                .find(|workspace| workspace.id == self.active.id)
+                .or_else(|| workspaces.first());
+            if let Some(fallback) = fallback {
+                self.config.ui.hidden_env_project_ids.remove(&fallback.id);
+            }
+        }
+        if (self.config.ui.closed_workspace_ids.len() != persisted_before
+            || self.config.ui.hidden_env_project_ids != hidden_env_before)
             && let Err(error) = self.config.save(&self.config_path)
         {
-            tracing::warn!("삭제 워크스페이스 종료 표식 정리 저장 실패: {error:#}");
+            tracing::warn!("삭제 워크스페이스 UI 숨김 표식 정리 저장 실패: {error:#}");
         }
         let mut structured_threads = Vec::new();
         for workspace in &self.workspaces {
@@ -7178,7 +7249,7 @@ impl eframe::App for App {
         // 다른 카테고리 프레임에는 마지막 캐시를 그대로 넘긴다 — category가 show() 안에서
         // 갱신되므로(activity_rows 주석 참조) 탭 전환 프레임에 빈 목록이 번쩍이지 않게.
         // remote_view가 self를 immutable 차용하기 전에 갱신한다(&mut self, borrow 분리).
-        let env_api_projects = if self.settings_open
+        let mut env_api_projects = if self.settings_open
             && self.settings_category == ui::settings::Category::Environment
         {
             self.env_api_project_rows_cached()
@@ -7190,6 +7261,8 @@ impl eframe::App for App {
         } else {
             Vec::new()
         };
+        env_api_projects
+            .retain(|project| !self.config.ui.hidden_env_project_ids.contains(&project.id));
         // 설정창 닫힘 전이 — env secret 평문 캐시를 메모리에서 정리(codex Med:
         // 기본 노출로 상주하는 평문의 수명을 설정창 열림 동안으로 한정). remote_view가
         // self 일부를 immutable 차용하기 전에 처리한다.
@@ -7355,12 +7428,21 @@ impl eframe::App for App {
         };
         let term_cfg = self.config.terminal.clone();
         let wsid = self.active.id.clone();
-        let settings_wsid = resolve_settings_workspace_id(
-            &self.workspaces,
-            None,
-            self.settings_workspace_id.as_deref(),
-            &wsid,
-        )
+        let settings_wsid = if self.settings_category == ui::settings::Category::Environment {
+            resolve_settings_env_project_id(
+                &env_api_projects,
+                None,
+                self.settings_workspace_id.as_deref(),
+                &wsid,
+            )
+        } else {
+            resolve_settings_workspace_id(
+                &self.workspaces,
+                None,
+                self.settings_workspace_id.as_deref(),
+                &wsid,
+            )
+        }
         .unwrap_or_else(|| wsid.clone());
         if self.settings_open
             && self.settings_workspace_id.as_deref() != Some(settings_wsid.as_str())
@@ -7381,10 +7463,8 @@ impl eframe::App for App {
         let mut notif_click = None;
         let mut settings_workspace_select: Option<String> = None;
         let mut settings_ws_create: Option<std::path::PathBuf> = None;
-        let mut ws_delete: Option<String> = None;
-        // 프로젝트 삭제 확인 결정 — 모달은 설정 뷰포트 안에서 렌더하고(T2) 결정만 캡처,
-        // 실제 삭제/전환은 self 전체 &mut가 필요하므로 클로저 밖에서 처리한다.
-        let mut ws_delete_decision: Option<bool> = None;
+        // Environment 프로젝트 닫기 확인 결정 — 설정 목록 숨김만 클로저 밖에서 처리한다.
+        let mut env_project_close_decision: Option<bool> = None;
         let mut workspace_rename: Option<String> = None;
         let mut env_action: Option<ui::env_profiles::EnvAction> = None;
         let mut credentials_changed = false;
@@ -7519,14 +7599,15 @@ impl eframe::App for App {
                                         settings_ws_create = Some(dir);
                                     }
                                 }
-                                ui::env_project_list::EnvProjectListAction::DeleteRequested(id) => {
-                                    // 즉시 삭제하지 않고 확인 모달로(5번, 2026-07-10).
+                                ui::env_project_list::EnvProjectListAction::CloseRequested(id) => {
+                                    // Environment 목록에서만 닫는 확인 모달. workspace DB,
+                                    // sidebar 표시 상태, runtime/session은 건드리지 않는다.
                                     let name = env_api_projects
                                         .iter()
                                         .find(|p| p.id == id)
                                         .map(|p| p.name.clone())
                                         .unwrap_or_default();
-                                    self.ws_delete_confirm = Some((id, name));
+                                    self.env_project_close_confirm = Some((id, name));
                                 }
                             }
                             // 리스트/상세 경계 — separator(6px 스트립)는 우측에 배경
@@ -7671,30 +7752,25 @@ impl eframe::App for App {
                                     });
                             });
                         });
-                        // 프로젝트 삭제 확인 모달(5번, 2026-07-10) — 설정 뷰포트 안에서
-                        // 렌더해 설정 창 위 중앙에 뜨게 한다(T2). ui.ctx()는 현재
-                        // immediate 뷰포트(설정 창)라 Window가 그 위에 붙는다. 결정만
-                        // 캡처하고 실제 삭제/전환은 클로저 밖에서 처리(self 전체 &mut).
-                        if let Some((_, del_name)) = self.ws_delete_confirm.clone() {
-                            egui::Window::new(text.t("workspace.delete_confirm.title", &[]))
+                        // Environment 목록 닫기 확인 모달 — 결정만 캡처하고 설정 전용
+                        // 숨김 상태 반영은 클로저 밖에서 처리한다.
+                        if let Some((_, project_name)) = self.env_project_close_confirm.clone() {
+                            egui::Window::new(text.t("env.project_close_confirm.title", &[]))
                                 .collapsible(false)
                                 .resizable(false)
                                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                                 .show(ui.ctx(), |ui| {
                                     ui.label(text.t(
-                                        "workspace.delete_confirm.body",
-                                        &[("name", &del_name)],
+                                        "env.project_close_confirm.body",
+                                        &[("name", &project_name)],
                                     ));
                                     ui.add_space(8.0);
                                     ui.horizontal(|ui| {
-                                        if ui
-                                            .button(text.t("workspace.delete_confirm.go", &[]))
-                                            .clicked()
-                                        {
-                                            ws_delete_decision = Some(true);
+                                        if ui.button(text.t("action.close", &[])).clicked() {
+                                            env_project_close_decision = Some(true);
                                         }
                                         if ui.button(text.t("action.cancel", &[])).clicked() {
-                                            ws_delete_decision = Some(false);
+                                            env_project_close_decision = Some(false);
                                         }
                                     });
                                 });
@@ -7771,6 +7847,14 @@ impl eframe::App for App {
                 })
                 .map(|workspace| workspace.id.clone())
             {
+                if self.config.ui.hidden_env_project_ids.remove(&existing_id)
+                    && let Err(error) = self.config.save(&self.config_path)
+                {
+                    tracing::warn!(
+                        workspace_id = %existing_id,
+                        "Environment 프로젝트 복원 상태 저장 실패: {error:#}"
+                    );
+                }
                 settings_workspace_select = Some(existing_id);
             } else {
                 let name = crate::agent_detect::project_display_name(
@@ -7901,86 +7985,32 @@ impl eframe::App for App {
                 self.refresh_workspaces();
             }
         }
-        // 프로젝트 삭제 확인 결정 처리(5번, 2026-07-10) — 목록/DB에서만 제거, 폴더·.env는
-        // 보존. 모달 자체는 설정 뷰포트 안에서 렌더하고(T2) 여기서는 캡처한 결정만 처리한다.
-        if let Some((del_id, _del_name)) = self.ws_delete_confirm.clone() {
-            match ws_delete_decision {
+        // Environment 프로젝트 닫기는 설정 목록의 영속 숨김 상태만 바꾼다. workspace
+        // DB/side bar closed state/runtime/session/credential/.env는 의도적으로 건드리지 않는다.
+        if let Some((close_id, _project_name)) = self.env_project_close_confirm.clone() {
+            match env_project_close_decision {
                 Some(true) => {
-                    if let Err(error) = self.agent_sessions_ui.prepare_workspace_delete(&del_id) {
-                        let message = format!("workspace 삭제 중단: {error:#}");
-                        tracing::warn!("{message}");
-                        self.agent_sessions_ui.report_persistence_error(message);
-                        self.ws_delete_confirm = None;
-                        // APP thread가 살아 있으면 runtime/credential/DB 어느 것도 건드리지 않는다.
-                    } else {
-                        // Controller에서 이미 drain된 upsert도 삭제 뒤 workspace를 되살리려
-                        // 재시도하면 안 된다. archive/delete는 cascade 뒤 no-op이어도 안전하다.
-                        self.agent_persistence_queue.retain(|mutation| {
-                            !matches!(
-                                mutation,
-                                ui::agent_sessions::AgentSessionPersistenceMutation::Upsert {
-                                    workspace_id,
-                                    ..
-                                } if workspace_id == &del_id
-                            )
-                        });
-                        if self.agent_persistence_queue.is_empty() {
-                            self.agent_persistence_retry_at = None;
-                        }
-                        // 활성 프로젝트면 다른 프로젝트로 먼저 전환(삭제 가드가 active를 거부).
-                        if del_id == self.active.id
-                            && let Some(other) = self
-                                .workspaces
-                                .iter()
-                                .find(|w| w.id != del_id)
-                                .map(|w| w.id.clone())
-                        {
-                            self.switch_workspace(&other);
-                            self.refresh_workspaces();
-                        }
-                        // keyring까지 정리(dotenv 소유 credential) 후 DB 삭제 — 화면·DB에서만
-                        // 제거되고 폴더/.env 파일은 보존(재등록 시 복구).
-                        if let Err(e) = crate::dotenv_sync::remove_workspace_dotenv(
-                            &mut self.db,
-                            &self.secret_store,
-                            &del_id,
-                        ) {
-                            tracing::warn!("dotenv 정리 실패: {e:#}");
-                        }
-                        ws_delete = Some(del_id);
-                        self.invalidate_env_api_projects();
-                        self.ws_delete_confirm = None;
+                    let was_hidden = self.config.ui.hidden_env_project_ids.contains(&close_id);
+                    self.settings_workspace_id = close_settings_env_project(
+                        &mut self.config.ui.hidden_env_project_ids,
+                        &env_api_projects,
+                        &close_id,
+                        self.settings_workspace_id.as_deref(),
+                    );
+                    if !was_hidden
+                        && self.config.ui.hidden_env_project_ids.contains(&close_id)
+                        && let Err(error) = self.config.save(&self.config_path)
+                    {
+                        tracing::warn!(
+                            workspace_id = %close_id,
+                            "Environment 프로젝트 닫기 상태 저장 실패: {error:#}"
+                        );
                     }
+                    self.invalidate_env_profile_ui();
+                    self.env_project_close_confirm = None;
                 }
-                Some(false) => self.ws_delete_confirm = None,
+                Some(false) => self.env_project_close_confirm = None,
                 None => {}
-            }
-        }
-
-        if let Some(delete_id) = ws_delete {
-            if delete_id == self.active.id {
-                tracing::info!(
-                    "활성 워크스페이스 삭제 요청 무시 — 다른 워크스페이스로 전환 후 삭제 필요"
-                );
-            } else if self.workspaces.len() <= 1 {
-                tracing::info!("마지막 워크스페이스 삭제 요청 무시");
-            } else {
-                self.join_pending_shutdown(&delete_id);
-                if let Some(mut runtime) = self.warm.remove(&delete_id) {
-                    runtime.runtime.shutdown();
-                }
-                self.warm_order.retain(|id| id != &delete_id);
-                self.broadcast_terminal_cache_policy();
-                self.notifications_ui.prune_workspace(&delete_id);
-                match self.db.delete_workspace(&delete_id) {
-                    Ok(()) => self.refresh_workspaces(),
-                    Err(e) => {
-                        tracing::warn!("워크스페이스 삭제 실패: {e:#}");
-                        // Controller projection was pruned before the cascade guard. DB가
-                        // 남았다면 다시 import해 UI와 durable metadata를 즉시 맞춘다.
-                        self.refresh_workspaces();
-                    }
-                }
             }
         }
         // 새 워크스페이스 생성(B안) — 폴더명으로 만들고 path/앵커 저장 후 즉시 전환.
@@ -9870,6 +9900,46 @@ h:1 EE:FF
         assert!(
             closed.contains_key("closed"),
             "설정 선택은 sidebar 숨김 표식을 해제하지 않는다"
+        );
+    }
+
+    #[test]
+    fn 환경_프로젝트_닫기는_설정목록만_숨기고_sidebar와_active를_유지한다() {
+        let project = |id: &str| ui::env_project_list::EnvProjectRow {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            alias: String::new(),
+            path: format!("/projects/{id}"),
+            path_missing: false,
+            env_count: 0,
+            key_count: 0,
+        };
+        let visible = vec![project("SKRT"), project("mjm")];
+        let mut hidden = std::collections::BTreeSet::new();
+        let active = "mjm".to_owned();
+        let sidebar_closed: std::collections::HashMap<String, ClosedWorkspaceState> =
+            std::collections::HashMap::new();
+
+        let next = close_settings_env_project(&mut hidden, &visible, "mjm", Some("mjm"));
+
+        assert_eq!(next.as_deref(), Some("SKRT"));
+        assert_eq!(hidden, std::collections::BTreeSet::from(["mjm".to_owned()]));
+        assert_eq!(
+            active, "mjm",
+            "Environment 닫기는 active runtime을 바꾸지 않는다"
+        );
+        assert!(
+            sidebar_closed.is_empty(),
+            "Environment 닫기는 sidebar 종료 표식을 만들지 않는다"
+        );
+        assert_eq!(visible.len(), 2, "workspace 원본 목록은 삭제되지 않는다");
+
+        let only_remaining = vec![project("SKRT")];
+        let kept = close_settings_env_project(&mut hidden, &only_remaining, "SKRT", Some("SKRT"));
+        assert_eq!(kept.as_deref(), Some("SKRT"));
+        assert!(
+            !hidden.contains("SKRT"),
+            "마지막 Environment 프로젝트는 유지한다"
         );
     }
 

@@ -120,6 +120,10 @@ pub struct UiConfig {
     /// DB 행은 보존하고, 사용자가 워크스페이스 선택기로 다시 열 때까지 목록에서 숨긴다.
     #[serde(default)]
     pub closed_workspace_ids: BTreeSet<String>,
+    /// 환경 및 API 프로젝트 목록에서 사용자가 `X`로 닫은 workspace ID. 이 상태는
+    /// sidebar의 workspace 종료/실행 상태와 독립이며 `+`로 같은 폴더를 다시 고르면 해제된다.
+    #[serde(default)]
+    pub hidden_env_project_ids: BTreeSet<String>,
     /// UI(Proportional) 폰트 파일 경로. None = 기본(자동 — macOS는 Apple SD Gothic Neo).
     /// 설정 화면의 목록은 시스템에 설치된 한글 지원 폰트에서 고른다(2026-07-07).
     #[serde(default)]
@@ -183,6 +187,7 @@ impl Default for UiConfig {
             session_name_style: SessionNameStyle::default(),
             last_workspace_id: None,
             closed_workspace_ids: BTreeSet::new(),
+            hidden_env_project_ids: BTreeSet::new(),
             ui_font: None,
             ui_scale: 1.0,
             composer_enabled: true,
@@ -575,6 +580,7 @@ mod tests {
         assert!(parsed.ui.file_tree_enabled);
         assert_eq!(parsed.ui.last_workspace_id, None);
         assert!(parsed.ui.closed_workspace_ids.is_empty());
+        assert!(parsed.ui.hidden_env_project_ids.is_empty());
     }
 
     #[test]
@@ -605,12 +611,17 @@ mod tests {
         let mut c = Config::default();
         c.ui.last_workspace_id = Some("ws-last".to_owned());
         c.ui.closed_workspace_ids.insert("ws-closed".to_owned());
+        c.ui.hidden_env_project_ids.insert("env-hidden".to_owned());
         let text = toml::to_string_pretty(&c).unwrap();
         let parsed: Config = toml::from_str(&text).unwrap();
         assert_eq!(parsed.ui.last_workspace_id.as_deref(), Some("ws-last"));
         assert_eq!(
             parsed.ui.closed_workspace_ids,
             BTreeSet::from(["ws-closed".to_owned()])
+        );
+        assert_eq!(
+            parsed.ui.hidden_env_project_ids,
+            BTreeSet::from(["env-hidden".to_owned()])
         );
     }
 

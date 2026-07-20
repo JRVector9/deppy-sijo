@@ -121,6 +121,7 @@ pub enum SidebarAction {
     OpenExternal(PathBuf),
     /// 세션 목록에서 선택 — 해당 tab/pane으로 전환
     FocusSession {
+        workspace_id: String,
         tab: runtime::MuxTabId,
         pane: runtime::MuxPaneId,
     },
@@ -292,8 +293,12 @@ pub struct FileTreeUi {
     last_watch_reload: std::time::Instant,
     /// 세션 목록 이름 인라인 편집 중 (pane, 편집 버퍼). 우클릭/더블클릭으로 시작.
     session_name_edit: Option<(runtime::MuxPaneId, String)>,
-    /// 활성 워크스페이스의 세션 트리 접힘 상태. 접혀도 요약 수치는 워크스페이스 행에 남긴다.
-    workspace_sessions_expanded: bool,
+    /// 워크스페이스별 세션 트리 펼침 상태. 포커스 전환과 독립적이어서 다른 workspace를
+    /// 선택해도 기존 트리는 사용자가 직접 접기 전까지 유지된다.
+    workspace_sessions_expanded: HashMap<String, bool>,
+    /// 활성 변경을 감지해 이전 활성의 기본-open 상태를 map에 고정한다. 이 기록이 없으면
+    /// 명시값이 없던 이전 workspace가 inactive가 되는 순간 default false로 닫힌다.
+    last_sidebar_active_workspace: Option<String>,
     /// 마지막 외부 파일 붙여넣기(⌘V) 처리 시각 — 같은 제스처의 press(native)와
     /// release(egui fallback)가 두 번 복사하는 것을 막는다(터미널 PASTE_GESTURE 관례).
     last_external_paste: Option<std::time::Instant>,
@@ -422,7 +427,8 @@ impl FileTreeUi {
             env_warning_candidates: BTreeSet::new(),
             last_watch_reload: std::time::Instant::now(),
             session_name_edit: None,
-            workspace_sessions_expanded: true,
+            workspace_sessions_expanded: HashMap::new(),
+            last_sidebar_active_workspace: None,
             last_external_paste: None,
             consumed_paste_shortcut: false,
             consumed_copy_shortcut: false,
@@ -744,7 +750,7 @@ impl FileTreeUi {
     pub fn panel(
         &mut self,
         ui: &mut egui::Ui,
-        sessions: &[SessionEntry],
+        sessions_by_workspace: &HashMap<String, Vec<SessionEntry>>,
         sidebar: &SidebarSnapshot<'_>,
         catalog: &i18n::Catalog,
     ) -> Option<SidebarAction> {
@@ -791,7 +797,7 @@ impl FileTreeUi {
                     .allocate_ui_with_layout(
                         egui::vec2(ui.available_width(), body_h),
                         egui::Layout::top_down(egui::Align::Min),
-                        |ui| self.contents(ui, sessions, sidebar, catalog),
+                        |ui| self.contents(ui, sessions_by_workspace, sidebar, catalog),
                     )
                     .inner;
                 crate::ui::hairline_full(ui);
@@ -804,7 +810,7 @@ impl FileTreeUi {
     fn contents(
         &mut self,
         ui: &mut egui::Ui,
-        sessions: &[SessionEntry],
+        sessions_by_workspace: &HashMap<String, Vec<SessionEntry>>,
         sidebar: &SidebarSnapshot<'_>,
         catalog: &i18n::Catalog,
     ) -> Option<SidebarAction> {
@@ -813,6 +819,23 @@ impl FileTreeUi {
 
         // ── 통합 워크스페이스·세션 계층 ──
         let compact_sidebar = ui.available_width() < 120.0;
+        self.workspace_sessions_expanded.retain(|workspace_id, _| {
+            sidebar
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == *workspace_id)
+        });
+        if self.last_sidebar_active_workspace.as_deref() != Some(sidebar.active_workspace_id) {
+            if let Some(previous) = self.last_sidebar_active_workspace.as_ref() {
+                self.workspace_sessions_expanded
+                    .entry(previous.clone())
+                    .or_insert(true);
+            }
+            self.workspace_sessions_expanded
+                .entry(sidebar.active_workspace_id.to_owned())
+                .or_insert(true);
+            self.last_sidebar_active_workspace = Some(sidebar.active_workspace_id.to_owned());
+        }
         if sidebar.workspaces.is_empty() {
             ui.add_space(3.0);
             // 빈 상태 — 워크스페이스가 하나도 없으면(종료 숨김 반영) 헤더/목록 대신
@@ -849,14 +872,30 @@ impl FileTreeUi {
             // 세션 블록 상한은 스크롤 진입 **전** 실제 패널 높이로 계산한다 — ScrollArea
             // 내부의 available_height는 사실상 무한이라 비례 계산이 무의미해진다.
             let session_max_h = (ui.available_height() * 0.34).clamp(70.0, 230.0);
-            let sessions_visible = self.workspace_sessions_expanded && !sessions.is_empty();
+            let active_sessions = sessions_by_workspace
+                .get(sidebar.active_workspace_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let any_sessions_visible = sidebar.workspaces.iter().any(|workspace| {
+                self.workspace_sessions_expanded
+                    .get(&workspace.id)
+                    .copied()
+                    .unwrap_or(false)
+                    && sessions_by_workspace
+                        .get(&workspace.id)
+                        .is_some_and(|sessions| !sessions.is_empty())
+            });
             // 활성 워크스페이스가 생성순 뒤쪽이면 before_active 행들이 스크롤 밖에 그려져
             // 46px씩 사이드바 고정 높이를 잠식했다 (codex P2 — 세션·파일 트리가 클립 밖으로
             // 밀리는데 스크롤할 방법이 없었다). 전체 순서 목록(before + 활성 + 세션 + after)을
             // 하나의 bounded 스크롤 영역이 공유한다. 상한은 기존 워크스페이스 목록 예산에
             // 활성 행(46px)과 세션 블록 예산을 더한 값 — before가 없던 기존 화면과 동일한
             // 최악 높이를 유지하면서 before 행들만 스크롤로 흡수한다.
-            let session_block_h = if sessions_visible { session_max_h } else { 0.0 };
+            let session_block_h = if any_sessions_visible {
+                session_max_h
+            } else {
+                0.0
+            };
             let list_max_h =
                 (ui.available_height() * 0.34).clamp(118.0, 232.0) + 39.1 + session_block_h;
             egui::ScrollArea::vertical()
@@ -866,30 +905,54 @@ impl FileTreeUi {
                 .show(ui, |ui| {
                     for workspace in before_active {
                         let color = workspace_accent(sidebar.workspaces, &workspace.id);
-                        let resp = workspace_row(ui, workspace, color, false, Some(false), catalog);
+                        let expanded = self
+                            .workspace_sessions_expanded
+                            .get(&workspace.id)
+                            .copied()
+                            .unwrap_or(false);
+                        let resp =
+                            workspace_row(ui, workspace, color, false, Some(expanded), catalog);
                         workspace_context_menu(&resp, workspace, catalog, &mut action);
                         if resp.clicked() {
+                            self.workspace_sessions_expanded
+                                .insert(workspace.id.clone(), true);
                             action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
+                        }
+                        if expanded
+                            && let Some(sessions) = sessions_by_workspace.get(&workspace.id)
+                            && let Some(session_action) = inactive_workspace_sessions(
+                                ui,
+                                &workspace.id,
+                                sessions,
+                                session_max_h,
+                            )
+                        {
+                            action = Some(session_action);
                         }
                     }
                     if let Some(active) = active {
                         let color = workspace_accent(sidebar.workspaces, &active.id);
-                        let resp = workspace_row(
-                            ui,
-                            active,
-                            color,
-                            true,
-                            Some(self.workspace_sessions_expanded),
-                            catalog,
-                        );
+                        let expanded = self
+                            .workspace_sessions_expanded
+                            .get(&active.id)
+                            .copied()
+                            .unwrap_or(true);
+                        let resp = workspace_row(ui, active, color, true, Some(expanded), catalog);
                         workspace_context_menu(&resp, active, catalog, &mut action);
                         if resp.clicked() {
-                            self.workspace_sessions_expanded = !self.workspace_sessions_expanded;
+                            self.workspace_sessions_expanded
+                                .insert(active.id.clone(), !expanded);
                         }
                     }
 
                     // 현재 workspace의 셸/에이전트를 활성 워크스페이스 아래에 들여써 나열한다.
-                    if sessions_visible {
+                    let active_sessions_visible = self
+                        .workspace_sessions_expanded
+                        .get(sidebar.active_workspace_id)
+                        .copied()
+                        .unwrap_or(true)
+                        && !active_sessions.is_empty();
+                    if active_sessions_visible {
                         // 세션이 많으면 목록이 패널을 다 먹고 아래로 넘쳐 잘렸다 (2026-07-05
                         // 사용자 보고). 세션 목록은 자기 상한 안에서만 스크롤하고, 나머지는
                         // 파일 트리가 갖는다. auto_shrink[_, true]로 세션이 적으면 줄어든다.
@@ -900,7 +963,7 @@ impl FileTreeUi {
                             .show(ui, |ui| {
                                 ui.add_space(2.0);
                                 ui.spacing_mut().item_spacing.y = 0.0;
-                                for entry in sessions {
+                                for entry in active_sessions {
                                     ui.horizontal(|ui| {
                                         ui.add_space(20.0);
                                         ui.vertical(|ui| {
@@ -1099,6 +1162,9 @@ impl FileTreeUi {
                                                     ));
                                                 } else if resp.clicked() && !entry.focused {
                                                     action = Some(SidebarAction::FocusSession {
+                                                        workspace_id: sidebar
+                                                            .active_workspace_id
+                                                            .to_owned(),
                                                         tab: entry.tab.clone(),
                                                         pane: entry.pane.clone(),
                                                     });
@@ -1111,10 +1177,29 @@ impl FileTreeUi {
                     }
                     for workspace in after_active {
                         let color = workspace_accent(sidebar.workspaces, &workspace.id);
-                        let resp = workspace_row(ui, workspace, color, false, Some(false), catalog);
+                        let expanded = self
+                            .workspace_sessions_expanded
+                            .get(&workspace.id)
+                            .copied()
+                            .unwrap_or(false);
+                        let resp =
+                            workspace_row(ui, workspace, color, false, Some(expanded), catalog);
                         workspace_context_menu(&resp, workspace, catalog, &mut action);
                         if resp.clicked() {
+                            self.workspace_sessions_expanded
+                                .insert(workspace.id.clone(), true);
                             action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
+                        }
+                        if expanded
+                            && let Some(sessions) = sessions_by_workspace.get(&workspace.id)
+                            && let Some(session_action) = inactive_workspace_sessions(
+                                ui,
+                                &workspace.id,
+                                sessions,
+                                session_max_h,
+                            )
+                        {
+                            action = Some(session_action);
                         }
                     }
                     // 워크스페이스 추가(+) — 헤더에서 옮겨온 폴더 선택 진입점. 목록
@@ -2713,6 +2798,15 @@ fn workspace_row(
     // 8→6.8, 이름 간격 9→7.65. 아바타(30)는 유지하고 세로 중앙 재정렬.
     let (full_rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 39.1), egui::Sense::click());
+    // 이름은 painter galley라 행 Response에 명시적으로 연결해야 키보드/스크린리더가
+    // workspace 선택 대상을 식별할 수 있다(세션 행과 같은 접근성 계약).
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            workspace.name.as_str(),
+        )
+    });
     if !ui.is_rect_visible(full_rect) {
         return response;
     }
@@ -3179,6 +3273,44 @@ fn workspace_summary_segments(
     parts
 }
 
+/// 비활성(warm) workspace의 마지막 세션 스냅샷. 편집/컨텍스트 작업은 활성 runtime을
+/// 전제로 하므로 노출하지 않고, 클릭만 workspace 전환 + 정확한 tab/pane focus로 보낸다.
+fn inactive_workspace_sessions(
+    ui: &mut egui::Ui,
+    workspace_id: &str,
+    sessions: &[SessionEntry],
+    max_height: f32,
+) -> Option<SidebarAction> {
+    if sessions.is_empty() {
+        return None;
+    }
+    let mut action = None;
+    egui::ScrollArea::vertical()
+        .id_salt(("inactive_session_list_scroll", workspace_id))
+        .max_height(max_height)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.add_space(2.0);
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for entry in sessions {
+                ui.horizontal(|ui| {
+                    ui.add_space(20.0);
+                    ui.vertical(|ui| {
+                        let response = session_row(ui, entry);
+                        if response.clicked() {
+                            action = Some(SidebarAction::FocusSession {
+                                workspace_id: workspace_id.to_owned(),
+                                tab: entry.tab.clone(),
+                                pane: entry.pane.clone(),
+                            });
+                        }
+                    });
+                });
+            }
+        });
+    action
+}
+
 fn session_row(ui: &mut egui::Ui, entry: &SessionEntry) -> egui::Response {
     session_row_impl(ui, entry, None)
 }
@@ -3268,6 +3400,15 @@ fn session_row_impl(
         egui::vec2(ui.available_width(), row_h),
         egui::Sense::click(),
     );
+    // 제목은 painter galley로 그리므로 별도 접근성 라벨이 없으면 키보드/스크린리더와
+    // kittest가 세션 행을 식별할 수 없다. 클릭 행 자체를 제목이 있는 버튼으로 노출한다.
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            entry.title.as_str(),
+        )
+    });
     if !ui.is_rect_visible(rect) {
         return resp;
     }
@@ -5690,7 +5831,10 @@ mod tests {
         install_sidebar_test_fonts(&ctx);
         let _ = ctx.run_ui(Default::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                assert!(tree.panel(ui, &[], &sidebar, &catalog).is_none());
+                assert!(
+                    tree.panel(ui, &std::collections::HashMap::new(), &sidebar, &catalog,)
+                        .is_none()
+                );
             });
         });
         drain_listings(&mut tree);
@@ -6066,11 +6210,14 @@ mod tests {
             in_worktree: false,
             status_line: agent.then(|| "PR #124 코드 리뷰".to_owned()),
         };
-        let sessions = vec![
-            make_session(0, false),
-            make_session(1, false),
-            make_session(2, true),
-        ];
+        let sessions = std::collections::HashMap::from([(
+            "ws-2".to_owned(),
+            vec![
+                make_session(0, false),
+                make_session(1, false),
+                make_session(2, true),
+            ],
+        )]);
         let mut harness = egui_kittest::Harness::builder()
             .with_size(egui::vec2(420.0, 700.0))
             .with_step_dt(0.05)
@@ -6175,6 +6322,118 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
+    #[test]
+    fn kittest_워크스페이스_포커스이동은_기존_세션트리를_닫지않는다() {
+        use egui_kittest::kittest::Queryable;
+
+        struct State {
+            tree: FileTreeUi,
+            active: String,
+            focus_target: Option<String>,
+            fonts_ready: bool,
+        }
+
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let workspaces = vec![
+            SidebarWorkspaceEntry {
+                id: "workspace-a".to_owned(),
+                name: "Workspace A".to_owned(),
+                state: SidebarWorkspaceState::Active,
+                summary: SidebarSessionSummary::default(),
+            },
+            SidebarWorkspaceEntry {
+                id: "workspace-b".to_owned(),
+                name: "Workspace B".to_owned(),
+                state: SidebarWorkspaceState::Warm,
+                summary: SidebarSessionSummary::default(),
+            },
+        ];
+        let session = |workspace: &str, title: &str| SessionEntry {
+            tab: runtime::MuxTabId(format!("tab-{workspace}")),
+            pane: runtime::MuxPaneId(format!("pane-{workspace}")),
+            session: Some(runtime::SessionId(1)),
+            title: title.to_owned(),
+            status: None,
+            summary: String::new(),
+            focused: false,
+            attention: false,
+            pulse: None,
+            agent_line: None,
+            status_label: None,
+            resumable: false,
+            has_cwd: false,
+            in_worktree: false,
+            status_line: None,
+        };
+        let sessions = std::collections::HashMap::from([
+            ("workspace-a".to_owned(), vec![session("a", "Session A")]),
+            ("workspace-b".to_owned(), vec![session("b", "Session B")]),
+        ]);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 700.0))
+            .with_step_dt(0.05)
+            .build_ui_state(
+                |ui, state: &mut State| {
+                    if !state.fonts_ready {
+                        return;
+                    }
+                    let snapshot = SidebarSnapshot {
+                        active_workspace_id: &state.active,
+                        workspaces: &workspaces,
+                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        inbox_count: 0,
+                        agents_open: false,
+                    };
+                    match state.tree.panel(ui, &sessions, &snapshot, &catalog) {
+                        Some(SidebarAction::SwitchWorkspace(workspace_id)) => {
+                            state.active = workspace_id;
+                        }
+                        Some(SidebarAction::FocusSession { workspace_id, .. }) => {
+                            state.focus_target = Some(workspace_id.clone());
+                            state.active = workspace_id;
+                        }
+                        _ => {}
+                    }
+                },
+                State {
+                    tree: FileTreeUi::new(egui::Context::default()),
+                    active: "workspace-a".to_owned(),
+                    focus_target: None,
+                    fonts_ready: false,
+                },
+            );
+        install_sidebar_test_fonts(&harness.ctx);
+        harness.state_mut().fonts_ready = true;
+        harness.run();
+
+        harness.get_by_label("Session A");
+        assert!(harness.query_by_label("Session B").is_none());
+
+        harness.get_by_label("Workspace B").click();
+        harness.run();
+        assert_eq!(harness.state().active, "workspace-b");
+        harness.get_by_label("Session A");
+        harness.get_by_label("Session B");
+
+        harness.get_by_label("Workspace A").click();
+        harness.run();
+        assert_eq!(harness.state().active, "workspace-a");
+        harness.get_by_label("Session A");
+        harness.get_by_label("Session B");
+
+        // 활성 행을 다시 누르는 것은 사용자의 명시적 접기다. A만 닫히고 B는 유지된다.
+        harness.get_by_label("Workspace A").click();
+        harness.run();
+        assert!(harness.query_by_label("Session A").is_none());
+        harness.get_by_label("Session B");
+
+        // 열린 비활성 세션 클릭은 workspace뿐 아니라 정확한 세션 focus 요청을 낸다.
+        harness.get_by_label("Session B").click();
+        harness.run();
+        assert_eq!(harness.state().active, "workspace-b");
+        assert_eq!(harness.state().focus_target.as_deref(), Some("workspace-b"));
+    }
+
     /// codex 리뷰 P2 회귀: 활성 워크스페이스가 생성순 뒤쪽이면 이전 구현은
     /// `before_active` 행들을 유일한 스크롤 영역 **밖**에 그려 46px씩 사이드바를
     /// 잠식했고, 워크스페이스가 많으면 파일 트리가 클립 밖으로 밀려도 스크롤할
@@ -6215,7 +6474,9 @@ mod tests {
                         inbox_count: 0,
                         agents_open: false,
                     };
-                    state.0.panel(ui, &[], &snapshot, &catalog);
+                    state
+                        .0
+                        .panel(ui, &std::collections::HashMap::new(), &snapshot, &catalog);
                 },
                 (tree, false),
             );
@@ -6281,7 +6542,11 @@ mod tests {
                         inbox_count: 0,
                         agents_open: false,
                     };
-                    if let Some(a) = state.0.panel(ui, &[], &snapshot, &catalog) {
+                    if let Some(a) =
+                        state
+                            .0
+                            .panel(ui, &std::collections::HashMap::new(), &snapshot, &catalog)
+                    {
                         state.1.push(a);
                     }
                 },
@@ -6372,7 +6637,11 @@ mod tests {
                         inbox_count: 0,
                         agents_open: false,
                     };
-                    if let Some(a) = state.0.panel(ui, &[], &snapshot, catalog) {
+                    if let Some(a) =
+                        state
+                            .0
+                            .panel(ui, &std::collections::HashMap::new(), &snapshot, catalog)
+                    {
                         state.1.push(a);
                     }
                 },
@@ -6554,7 +6823,11 @@ mod tests {
                         inbox_count: 0,
                         agents_open: false,
                     };
-                    if let Some(a) = state.0.panel(ui, &[], &snapshot, &catalog) {
+                    if let Some(a) =
+                        state
+                            .0
+                            .panel(ui, &std::collections::HashMap::new(), &snapshot, &catalog)
+                    {
                         state.1.push(a);
                     }
                 },
@@ -6607,7 +6880,11 @@ mod tests {
                         inbox_count: 2,
                         agents_open: false,
                     };
-                    if let Some(a) = state.0.panel(ui, &[], &snapshot, &catalog) {
+                    if let Some(a) =
+                        state
+                            .0
+                            .panel(ui, &std::collections::HashMap::new(), &snapshot, &catalog)
+                    {
                         state.1.push(a);
                     }
                 },
@@ -6760,7 +7037,11 @@ mod tests {
                         inbox_count: 0,
                         agents_open: false,
                     };
-                    if let Some(a) = state.0.panel(ui, &[], &snapshot, catalog) {
+                    if let Some(a) =
+                        state
+                            .0
+                            .panel(ui, &std::collections::HashMap::new(), &snapshot, catalog)
+                    {
                         state.1.push(a);
                     }
                 },

@@ -5956,6 +5956,51 @@ impl eframe::App for App {
                 }
             })
             .collect();
+        // 사이드바 펼침은 활성 선택과 독립적이다. 활성 세션뿐 아니라 warm runtime의
+        // 마지막 mux 스냅샷도 workspace별로 넘겨 이전 트리를 전환 후에도 유지한다.
+        // active 전용 transcript map은 SessionId가 workspace마다 재사용될 수 있어 warm에
+        // 섞지 않고, workspace namespace가 있는 global_waiting만 해당 id로 필터한다.
+        let no_activity: std::collections::HashMap<
+            runtime::SessionId,
+            crate::agent_transcript::AgentActivity,
+        > = std::collections::HashMap::new();
+        let no_turn_done: std::collections::HashMap<runtime::SessionId, i64> =
+            std::collections::HashMap::new();
+        let mut sidebar_sessions: std::collections::HashMap<
+            String,
+            Vec<ui::file_tree::SessionEntry>,
+        > = std::collections::HashMap::new();
+        for workspace in &sidebar_workspaces {
+            if workspace.id == active_workspace_id {
+                continue;
+            }
+            let Some(warm_runtime) = self.warm.get(&workspace.id) else {
+                continue;
+            };
+            let needs_input: std::collections::HashSet<_> = self
+                .global_waiting
+                .iter()
+                .filter(|(workspace_id, _, _)| workspace_id == &workspace.id)
+                .map(|(_, session, _)| *session)
+                .collect();
+            let mut entries = warm_runtime.workspace_ui.session_entries(
+                &text,
+                &no_activity,
+                &needs_input,
+                &no_turn_done,
+            );
+            for entry in &mut entries {
+                // workspace가 warm이면 그 안의 과거 focused_pane은 전역 포커스가 아니다.
+                entry.focused = false;
+                entry.attention = entry
+                    .session
+                    .is_some_and(|session| needs_input.contains(&session));
+                entry.resumable =
+                    entry.agent_line.is_none() && self.restore_agents.contains_key(&entry.pane.0);
+            }
+            sidebar_sessions.insert(workspace.id.clone(), entries);
+        }
+        sidebar_sessions.insert(active_workspace_id.clone(), terminal_sessions);
         let inbox_count = self.approvals_ui.pending().len()
             + self.global_waiting.len()
             + self.notifications_ui.unread();
@@ -6042,7 +6087,7 @@ impl eframe::App for App {
             let sidebar_action = self
                 .file_tree
                 .as_mut()
-                .and_then(|tree| tree.panel(ui, &terminal_sessions, &sidebar_snapshot, &text));
+                .and_then(|tree| tree.panel(ui, &sidebar_sessions, &sidebar_snapshot, &text));
             // 워처의 .env* 변경 신호 → 활성 워크스페이스에서 .env가 바뀌거나 사라져도
             // 즉시 재동기화 + 기본 env 재전송 — 시작/전환 시에만 동기화하면 삭제된
             // .env의 secret이 새 셸에 계속 주입된다(codex High).
@@ -6158,29 +6203,40 @@ impl eframe::App for App {
                     }
                 }
                 // 세션 목록 클릭 — 해당 tab/pane으로 전환 (workspace 사이드바)
-                Some(ui::file_tree::SidebarAction::FocusSession { tab, pane }) => {
+                Some(ui::file_tree::SidebarAction::FocusSession {
+                    workspace_id,
+                    tab,
+                    pane,
+                }) => {
                     self.agent_terminal_ui
                         .set_view(ui::agent_terminal::AgentTerminalView::Terminal);
-                    let is_active_tab = self
-                        .active
-                        .workspace_ui
-                        .mux()
-                        .and_then(|m| m.active_tab.clone())
-                        == Some(tab.clone());
-                    if !is_active_tab
-                        && let Err(e) = self
+                    if workspace_id != self.active.id {
+                        self.switch_workspace(&workspace_id);
+                    }
+                    // live-warm 상한으로 전환이 거부된 경우 다른 runtime의 pane id를
+                    // 현재 active에 보내면 안 된다. workspace 행 포커스만 그대로 둔다.
+                    if workspace_id == self.active.id {
+                        let is_active_tab = self
+                            .active
+                            .workspace_ui
+                            .mux()
+                            .and_then(|m| m.active_tab.clone())
+                            == Some(tab.clone());
+                        if !is_active_tab
+                            && let Err(e) = self
+                                .active
+                                .runtime
+                                .send_command(runtime::RuntimeCommand::SelectTab { tab })
+                        {
+                            tracing::warn!("탭 전환 실패: {e:#}");
+                        }
+                        if let Err(e) = self
                             .active
                             .runtime
-                            .send_command(runtime::RuntimeCommand::SelectTab { tab })
-                    {
-                        tracing::warn!("탭 전환 실패: {e:#}");
-                    }
-                    if let Err(e) = self
-                        .active
-                        .runtime
-                        .send_command(runtime::RuntimeCommand::FocusPane { pane })
-                    {
-                        tracing::warn!("pane 포커스 실패: {e:#}");
+                            .send_command(runtime::RuntimeCommand::FocusPane { pane })
+                        {
+                            tracing::warn!("pane 포커스 실패: {e:#}");
+                        }
                     }
                 }
                 // 사이드바 + 버튼 — 새 셸 (탭바 제거 후 대체 진입점)

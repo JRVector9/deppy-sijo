@@ -2,8 +2,8 @@
 
 ## Current task
 
-- Redesign the Home news list to match the latest reference while preserving the existing outer panel border.
-- Status: complete. Implementation commit `7369603` was release-built and archived without launching the app. The verified ZIP is `target/bundle/Deppy-Sijo-0.1.0-macos-arm64-HomeV1-7369603.zip`.
+- Keep multiple workspace session trees expanded in the sidebar when focus moves between workspaces.
+- Status: implementation and verification are complete. The user requested commit, release build, and a portable ZIP; app launch remains out of scope.
 
 ## Working area
 
@@ -14,13 +14,20 @@
 
 ## Plan
 
-1. Completed — inspect the current announcement renderer, feed contract, icons, and kittest coverage.
-2. Completed — implement the bordered-panel table layout from the latest reference.
-3. Completed — update focused UI regressions and run app tests/Clippy/fmt/diff checks.
-4. Completed — record final evidence and remaining delivery state.
+1. Completed — trace workspace selection, expansion state, session snapshots, and focus dispatch.
+2. Completed — retain per-workspace expansion and render active/warm session snapshots together.
+3. Completed — add focus-only/multi-expanded regression and run focused/strict checks.
+4. Completed — record final evidence and delivery state.
 
 ## Status
 
+- 2026-07-20: 사용자가 검증된 다중 workspace 확장 변경의 커밋, release build, ZIP 생성을 요청했다. 앱 실행/재시작은 수행하지 않는다. 현재 변경 3개 파일을 먼저 커밋해 패키징 기준점을 고정한 뒤 공식 package script와 metadata-preserving ZIP 검증을 진행한다.
+- 2026-07-20: 다중 workspace 확장 변경의 최종 검증을 완료했다. 새 focus-only kittest 1/1, FileTree 전체 61/61, `cargo clippy -p deppy-sijo --all-targets -- -D warnings`, fmt check, diff check가 통과했다. workspace/session painter 행에는 제목 기반 접근성 Button label도 추가됐다. 변경은 `app.rs`, `ui/file_tree.rs`, handoff이며 아직 commit/release build/app relaunch는 수행하지 않았다.
+- 2026-07-20: FileTree 전체 회귀 61/61이 통과했다. 새 다중확장 동작과 함께 기존 workspace 접기/생성순/상태요약/종료 메뉴, 파일 트리 조작, 접근성 ID 충돌 검사가 모두 유지됐다. 다음은 strict app all-target Clippy와 fmt/diff 최종 검사다.
+- 2026-07-20: workspace/session painter 행에 접근성 Button label을 연결한 뒤 새 다중확장 kittest 1/1이 통과했다. 실제 클릭으로 A 초기 open, B 선택 후 A+B 유지, A 재포커스 후 둘 다 유지, 활성 A 재클릭 때 A만 접힘, 열린 inactive B session 클릭 시 focus target `workspace-b`를 검증했다. 다음은 FileTree 전체 회귀와 strict app Clippy/fmt/diff다.
+- 2026-07-20: 첫 다중확장 kittest는 로직 assertion 전 기존 session row가 painter galley만 그리고 접근성 label을 제공하지 않아 `Session A` query에서 실패했다. session 접근성 label 추가 후 다음 실행은 같은 이유로 painter-only workspace row의 `Workspace B` query에서 중단됐다. 제품의 키보드/스크린리더 식별 공백이기도 하므로 두 행 Response 모두 제목 기반 Button widget_info를 제공하고 같은 실제 클릭 회귀를 재실행한다.
+- 2026-07-20: 다중 workspace 확장 구현을 완료했다. 단일 bool을 workspace id별 bool map으로 교체하고 활성 변경 때 이전 기본-open 값을 고정해 자동 접힘을 막는다. App은 active `terminal_sessions`와 warm `WorkspaceUi.session_entries`를 map으로 전달하며 warm의 과거 focused flag는 제거한다. inactive session은 편집/context menu 없이 표시하고 클릭 시 workspace id+tab+pane을 담은 FocusSession을 보내 App이 switch 후 focus한다. 새 kittest는 A→B 포커스 이동 후 두 트리 유지, 활성 A 재클릭 때 A만 명시 접힘, 열린 inactive B session 클릭의 정확한 focus target을 검증한다. 다음은 fmt/compile/집중 테스트다.
+- 2026-07-20: workspace 전환 시 기존 세션 트리가 닫히는 원인을 확인했다. `FileTreeUi.workspace_sessions_expanded`가 활성 workspace 하나만 표현하는 bool이고 `panel`도 `terminal_sessions` 한 slice만 받아, inactive 행은 항상 `Some(false)`로 렌더된다. 이를 workspace id별 expansion map과 active/warm session map으로 바꾸고, 다른 workspace 클릭은 기존 expansion을 보존한 채 대상만 열고 포커스를 이동하도록 한다. inactive session 클릭도 workspace 전환 후 정확한 tab/pane을 focus해야 한다.
 - 2026-07-20: Home 뉴스 표형 디자인 delivery를 완료했다. 구현 커밋은 `7369603` (`feat(home): redesign announcement table`)이다. 공식 package script의 release build는 22.31초였고, 생성된 arm64 `.app`과 helper는 deep/strict codesign 검증을 통과했다. `target/bundle/Deppy-Sijo-0.1.0-macos-arm64-HomeV1-7369603.zip`은 17MiB, SHA-256 `6165e2228ec9189a2924e2f7076ef612108ab8e9665885da6670d6d0bfd83664`이며 `unzip -t`가 오류 없이 통과했다. 메인 바이너리 SHA-256은 `92c0fc8175f62c4cc1c330edc362d2ab8de91d67bab78aa65d8555e0aa64ca4b`, bundle id `app.vector9.deppy-sijo`, version `0.1.0`, minimum macOS `11.0`이다. managed 환경 제약으로 ad-hoc 서명됐으며 앱 실행/재시작은 수행하지 않았다.
 - 2026-07-20: `7369603` (`feat(home): redesign announcement table`)을 생성한 뒤 `CARGO_NET_OFFLINE=true sh scripts/package-macos.sh`가 release build를 22.31초에 완료하고 `target/bundle/Deppy Sijo.app`을 재생성했다. managed 환경에서 Developer ID identity를 읽지 못해 ad-hoc 서명됐고 앱 실행/재시작 명령은 수행하지 않았다. 다음은 commit-specific ZIP 생성과 검증이다.
 - 2026-07-20: 사용자가 검증된 Home 뉴스 표형 디자인을 커밋한 뒤 release 재빌드와 ZIP 생성을 요청했다. 앱 실행·재시작은 금지한다. 변경 범위는 `ui/agent_terminal.rs`와 누적 handoff이며, 먼저 커밋한 뒤 공식 package script와 metadata-preserving ZIP 검증을 수행한다.

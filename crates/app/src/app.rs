@@ -4359,10 +4359,16 @@ impl App {
         tree
     }
 
-    /// 활성 workspace의 트리 루트가 바뀌었을 수 있을 때 (전환/경로 저장) 트리를 재구성한다.
+    /// 활성 workspace의 트리 루트가 바뀌었을 수 있을 때 (전환/경로 저장) 파일 루트만
+    /// 교체한다. FileTreeUi 전체를 재생성하면 workspace별 세션 펼침 상태까지 사라져,
+    /// 다른 workspace를 선택하는 순간 이전 세션 트리가 자동으로 닫힌다.
     fn refresh_file_tree_root(&mut self) {
-        if self.file_tree.is_some() {
-            self.file_tree = Some(self.make_file_tree());
+        let root = self
+            .active_tree_root()
+            .filter(|path| path.is_dir())
+            .or_else(crate::paths::home_dir);
+        if let Some(tree) = self.file_tree.as_mut() {
+            tree.set_root(root);
         }
     }
 

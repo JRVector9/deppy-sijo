@@ -3,7 +3,7 @@
 ## Current task
 
 - Keep multiple workspace session trees expanded in the sidebar when focus moves between workspaces.
-- Status: implementation and verification are complete. The user requested commit, release build, and a portable ZIP; app launch remains out of scope.
+- Status: fixed and verified. Workspace switching now retargets the existing file tree instead of replacing it, so expanded workspace session trees remain open until explicitly collapsed.
 
 ## Working area
 
@@ -21,6 +21,15 @@
 
 ## Status
 
+- 2026-07-20: 사용자가 실제 전환 경로 수정의 커밋, release build, ZIP 생성을 요청했다. 검증된 `app.rs`, `ui/file_tree.rs`와 누적 handoff를 수정 커밋으로 고정한 뒤 공식 package script와 commit-specific ZIP 검증을 수행하며 앱은 실행하지 않는다.
+- 2026-07-20: 실제 전환 경로의 확장 초기화 수정 검증을 완료했다. 루트 변경 포함 집중 kittest 1/1, FileTree 전체 61/61, `cargo clippy -p deppy-sijo --all-targets -- -D warnings`, fmt check, diff check가 모두 통과했다. `refresh_file_tree_root()`는 이제 기존 `FileTreeUi`에 `set_root()`만 호출하므로 workspace 전환 시 per-workspace 확장 map이 보존된다. release build/앱 실행/추가 commit은 아직 수행하지 않았다.
+- 2026-07-20: 수정 후 루트 변경을 실제로 끼운 다중 workspace 확장 kittest가 1/1 통과했다. B 선택 후 A+B가 열린 상태에서 `FileTreeUi::set_root()`를 호출해도 두 세션 트리가 유지되고, A를 다시 눌렀을 때만 A가 접히며 B session focus 대상도 유지된다. 다음은 FileTree 전체 회귀와 strict Clippy/fmt/diff다.
+- 2026-07-20: 루트 변경 포함 회귀의 첫 실행은 테스트 이름에 모듈 경로를 붙이지 않은 채 `--exact`를 사용해 0개 실행(571 filtered)으로 끝났다. compile은 성공했지만 검증 증거로 사용할 수 없으므로 `--exact` 없이 고유 이름 필터로 같은 테스트를 재실행한다.
+- 2026-07-20: 사용자의 실제 화면에서 `e425770` 이후에도 다른 workspace 선택 시 이전 세션 트리가 닫히는 것을 확인했다. per-workspace map 로직 자체가 아니라 `switch_workspace()`가 호출하는 `refresh_file_tree_root()`가 `FileTreeUi` 전체를 `make_file_tree()`로 재생성해 확장 map을 버리는 것이 원인이다. 기존 인스턴스의 `set_root()`만 호출하도록 수정하고, 파일 루트 교체 후에도 복수 확장이 유지되는 회귀를 추가한다.
+- 2026-07-20: 대문자 절대 `--git-dir`/`--work-tree`를 지정한 두 번째 docs-only commit도 현재 sandbox가 `.git/index.lock` 생성을 거부해 완료하지 못했다. 기능 소스는 이미 `e425770`에 커밋됐고 release 앱/ZIP도 검증 완료 상태다. worktree에는 이 최종 배포 기록인 `docs/CODEX_HANDOFF.md`만 unstaged로 남는다. 다음 쓰기 가능한 환경에서 이 문서만 `docs: record multi-workspace package`로 커밋하면 된다.
+- 2026-07-20: 배포 결과를 기록하는 docs-only commit의 첫 `git add`는 macOS가 worktree의 physical path를 소문자 `/Users/jr/desktop/...`로 반환해 managed sandbox 허용 경로와 불일치하면서 `.git/index.lock` 생성이 거부됐다. 구현 커밋과 앱/ZIP 산출물에는 영향이 없고 lock도 생성되지 않았다. 허용된 대문자 절대 `--git-dir`/`--work-tree`를 명시해 같은 docs-only commit을 재시도한다.
+- 2026-07-20: 다중 workspace 확장 유지 기능의 배포 준비를 완료했다. 구현 커밋은 `e425770`이다. `target/bundle/Deppy-Sijo-0.1.0-macos-arm64-HomeV1-e425770.zip`은 18MiB, SHA-256 `6991f7f94dda9012f3e4f396b9a54ebe75e14cb46cce422b0e55773a5dd602b7`이며 `unzip -t`가 오류 없이 통과했다. 원본 `.app`과 helper의 deep/strict codesign 검증 및 두 실행 파일의 arm64 확인도 통과했다. 메인 바이너리 SHA-256은 `3702f8422ae144c7150e2dc9089d68ed436f93c63ba4df044e6739513d99516c`, bundle id `app.vector9.deppy-sijo`, version `0.1.0`, minimum macOS `11.0`이다. 앱은 실행/재시작하지 않았다.
+- 2026-07-20: 기능 커밋 `e425770` (`feat(sidebar): retain expanded workspaces`)을 생성했다. `CARGO_NET_OFFLINE=true sh scripts/package-macos.sh`의 release build는 20.12초에 완료됐고 `target/bundle/Deppy Sijo.app`을 재생성했다. 현재 managed 환경에서는 Developer ID를 사용할 수 없어 ad-hoc 서명됐으며 앱 실행/재시작은 하지 않았다. 다음은 commit-specific ZIP 생성과 무결성/서명/아키텍처 검증이다.
 - 2026-07-20: 사용자가 검증된 다중 workspace 확장 변경의 커밋, release build, ZIP 생성을 요청했다. 앱 실행/재시작은 수행하지 않는다. 현재 변경 3개 파일을 먼저 커밋해 패키징 기준점을 고정한 뒤 공식 package script와 metadata-preserving ZIP 검증을 진행한다.
 - 2026-07-20: 다중 workspace 확장 변경의 최종 검증을 완료했다. 새 focus-only kittest 1/1, FileTree 전체 61/61, `cargo clippy -p deppy-sijo --all-targets -- -D warnings`, fmt check, diff check가 통과했다. workspace/session painter 행에는 제목 기반 접근성 Button label도 추가됐다. 변경은 `app.rs`, `ui/file_tree.rs`, handoff이며 아직 commit/release build/app relaunch는 수행하지 않았다.
 - 2026-07-20: FileTree 전체 회귀 61/61이 통과했다. 새 다중확장 동작과 함께 기존 workspace 접기/생성순/상태요약/종료 메뉴, 파일 트리 조작, 접근성 ID 충돌 검사가 모두 유지됐다. 다음은 strict app all-target Clippy와 fmt/diff 최종 검사다.

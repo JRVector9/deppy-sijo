@@ -6415,6 +6415,18 @@ mod tests {
         harness.get_by_label("Session A");
         harness.get_by_label("Session B");
 
+        // 실제 App의 workspace 전환은 파일 트리 루트도 바꾼다. 루트 교체가 sidebar
+        // 인스턴스/확장 map을 초기화하면 이 시점에 A가 다시 닫히는 회귀가 생긴다.
+        let root = std::env::temp_dir().join(format!(
+            "deppy-ft-multi-workspace-root-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        harness.state_mut().tree.set_root(Some(root.clone()));
+        harness.run();
+        harness.get_by_label("Session A");
+        harness.get_by_label("Session B");
+
         harness.get_by_label("Workspace A").click();
         harness.run();
         assert_eq!(harness.state().active, "workspace-a");
@@ -6432,6 +6444,7 @@ mod tests {
         harness.run();
         assert_eq!(harness.state().active, "workspace-b");
         assert_eq!(harness.state().focus_target.as_deref(), Some("workspace-b"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// codex 리뷰 P2 회귀: 활성 워크스페이스가 생성순 뒤쪽이면 이전 구현은

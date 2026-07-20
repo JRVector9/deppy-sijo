@@ -3,7 +3,7 @@
 ## Current task
 
 - Redesign the Home news list to match the latest reference while preserving the existing outer panel border.
-- Status: implementation and verification are complete. The user requested commit, release rebuild, and a portable ZIP; app relaunch remains explicitly forbidden.
+- Status: complete. Implementation commit `7369603` was release-built and archived without launching the app. The verified ZIP is `target/bundle/Deppy-Sijo-0.1.0-macos-arm64-HomeV1-7369603.zip`.
 
 ## Working area
 
@@ -21,6 +21,8 @@
 
 ## Status
 
+- 2026-07-20: Home 뉴스 표형 디자인 delivery를 완료했다. 구현 커밋은 `7369603` (`feat(home): redesign announcement table`)이다. 공식 package script의 release build는 22.31초였고, 생성된 arm64 `.app`과 helper는 deep/strict codesign 검증을 통과했다. `target/bundle/Deppy-Sijo-0.1.0-macos-arm64-HomeV1-7369603.zip`은 17MiB, SHA-256 `6165e2228ec9189a2924e2f7076ef612108ab8e9665885da6670d6d0bfd83664`이며 `unzip -t`가 오류 없이 통과했다. 메인 바이너리 SHA-256은 `92c0fc8175f62c4cc1c330edc362d2ab8de91d67bab78aa65d8555e0aa64ca4b`, bundle id `app.vector9.deppy-sijo`, version `0.1.0`, minimum macOS `11.0`이다. managed 환경 제약으로 ad-hoc 서명됐으며 앱 실행/재시작은 수행하지 않았다.
+- 2026-07-20: `7369603` (`feat(home): redesign announcement table`)을 생성한 뒤 `CARGO_NET_OFFLINE=true sh scripts/package-macos.sh`가 release build를 22.31초에 완료하고 `target/bundle/Deppy Sijo.app`을 재생성했다. managed 환경에서 Developer ID identity를 읽지 못해 ad-hoc 서명됐고 앱 실행/재시작 명령은 수행하지 않았다. 다음은 commit-specific ZIP 생성과 검증이다.
 - 2026-07-20: 사용자가 검증된 Home 뉴스 표형 디자인을 커밋한 뒤 release 재빌드와 ZIP 생성을 요청했다. 앱 실행·재시작은 금지한다. 변경 범위는 `ui/agent_terminal.rs`와 누적 handoff이며, 먼저 커밋한 뒤 공식 package script와 metadata-preserving ZIP 검증을 수행한다.
 - 2026-07-20: Home 뉴스 표형 디자인의 최종 검증을 완료했다. AgentTerminal 전체 7/7, Home 집중 2/2가 통과했고, 2열 Home 폭에서 마지막 Hugging Face 탭과 우측 새로고침 버튼이 겹치지 않는 rect assertion도 통과했다. `cargo clippy -p deppy-sijo --all-targets -- -D warnings`, fmt check, diff check가 성공했다. 변경은 `ui/agent_terminal.rs`와 handoff뿐이며 release 재빌드/앱 재실행은 하지 않았다.
 - 2026-07-20: 새 Home kittest 2/2가 통과했다. 기본 Home 구성/탭 순서/Slack manage 동작과 함께, 표형 공지의 날짜·Anthropic 공급자명·행별 접근성 Source 링크·64px×5행 viewport를 검증했다. 다음은 AgentTerminal 전체 테스트와 strict app Clippy/fmt/diff다.

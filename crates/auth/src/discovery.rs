@@ -40,6 +40,8 @@ pub struct AuthorizationServerMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scopes_supported: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_endpoint_auth_methods_supported: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_challenge_methods_supported: Option<Vec<String>>,
 }
 
@@ -219,6 +221,7 @@ fn default_authorization_server_metadata(issuer: &Url) -> AuthorizationServerMet
         registration_endpoint: Some(format!("{origin}/register")),
         grant_types_supported: None,
         scopes_supported: None,
+        token_endpoint_auth_methods_supported: None,
         code_challenge_methods_supported: None,
     }
 }
@@ -308,6 +311,7 @@ mod tests {
             "token_endpoint": format!("{issuer}/token"),
             "registration_endpoint": format!("{issuer}/register"),
             "grant_types_supported": ["authorization_code", "refresh_token"],
+            "token_endpoint_auth_methods_supported": ["client_secret_post"],
         })
         .to_string()
     }
@@ -502,6 +506,10 @@ mod tests {
                 "authorization_code".to_owned(),
                 "refresh_token".to_owned()
             ])
+        );
+        assert_eq!(
+            metadata.token_endpoint_auth_methods_supported,
+            Some(vec!["client_secret_post".to_owned()])
         );
         assert_eq!(server.requests().len(), 1);
     }

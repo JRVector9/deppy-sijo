@@ -482,12 +482,20 @@ impl HttpClient {
             );
         }
         let snippet = self.read_error_snippet(response);
+        let is_jsonrpc_error = serde_json::from_str::<Value>(&snippet)
+            .ok()
+            .is_some_and(|value| {
+                value.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+                    && value.get("error").is_some()
+            });
         // initialize 자체가 4xx(401/403 제외)면 구 HTTP+SSE transport 서버일 수
-        // 있다 — legacy SSE는 미지원(계획 §차용 안 함 #1), 폴백 신호 감지만 안내.
+        // 있다. 단, JSON-RPC error를 정상 반환한 서버는 Streamable HTTP transport가
+        // 이미 동작 중이므로 Slack app 설정 오류 등을 legacy transport로 오진하지 않는다.
         let legacy_hint = if method == "initialize"
             && (400..500).contains(&status)
             && status != 401
             && status != 403
+            && !is_jsonrpc_error
         {
             " (구 HTTP+SSE transport 서버일 수 있음 — Streamable HTTP만 지원)"
         } else {
@@ -1878,6 +1886,18 @@ mod tests {
             text.contains("구 HTTP+SSE transport 서버일 수 있음"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn initialize_jsonrpc_400은_legacy_sse로_오진하지_않는다() {
+        let body = br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"App is not enabled"}}"#;
+        let server = spawn_mock(move |_, _| Reply::Raw(http_response(400, &[], body)));
+        let error = manager()
+            .discover_tools_http(&http_config(&server, None))
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("App is not enabled"), "{text}");
+        assert!(!text.contains("구 HTTP+SSE"), "{text}");
     }
 
     #[test]

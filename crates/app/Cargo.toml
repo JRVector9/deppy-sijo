@@ -22,6 +22,7 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 regex = { workspace = true }
 serde_json = { workspace = true }
+quick-xml = { workspace = true }
 # AI 서비스 상태 피드(status_feed) + 로컬 LLM 감지(local_llm) — sync ureq만
 # (tokio 금지 관례, auth/mcp/web-remote와 동일 클라이언트).
 ureq = { workspace = true }

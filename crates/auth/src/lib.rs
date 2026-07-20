@@ -30,7 +30,7 @@ pub use discovery::{
 };
 pub use flow::{
     OAuthProviderConfig, OAuthToken, PendingAuthorization, begin, begin_with_resource, complete,
-    run_flow, run_flow_with_resource,
+    run_flow, run_flow_with_resource, run_flow_with_resource_fixed_localhost,
 };
 pub use refresh::{
     REFRESH_MARGIN, RefreshCoordinator, RefreshOutcome, RefreshParams, refresh_access_token,
@@ -187,6 +187,7 @@ mod tests {
             access_token: SecretString::new("at-123".to_owned()),
             refresh_token: Some(SecretString::new("rt-456".to_owned())),
             expires_in_secs: Some(3600),
+            provider_workspace_id: None,
         };
         store_token(&store, "cred-1", &token).unwrap();
         // env secret으로 선택돼도 access token만 주입된다 (blob 아님)

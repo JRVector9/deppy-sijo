@@ -13,9 +13,12 @@
 //! credentials(oauth_json 바인딩 메타) 등록 + redaction 시드. Bearer는 동의 시점
 //! 서버 URL과 현재 url이 일치할 때만 부착한다 (토큰 URL 바인딩 — H3 url 편집
 //! 규칙 리셋과 한 쌍). 구 OAuth 수동 폼(auth/token URL 입력)은 발견 체인이
-//! 대체해 제거했다.
+//! 대체해 제거했다. Slack은 DCR 미지원이 고정된 built-in provider이므로 일반 서버의
+//! authority 동의/DCR 단계를 생략하고 곧바로 수동 Client ID/Secret 입력으로 간다.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, SystemTime};
 
@@ -35,6 +38,17 @@ const OAUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// 외부 브라우저 승인 대기 상한 (구 PR-18 run_flow과 동일).
 const BROWSER_FLOW_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// Slack가 운영하는 공식 streamable-HTTP MCP endpoint.
+/// OAuth client secret은 배포 바이너리에 넣지 않고 기존 수동 client fallback을 통해
+/// 사용자가 등록한 Slack app의 값을 keyring에 저장한다.
+pub const SLACK_MCP_URL: &str = "https://mcp.slack.com/mcp";
+const SLACK_MCP_NAME: &str = "Slack";
+/// Client ID/Secret을 확인할 Slack 앱 관리 진입점. app id는 사용자가 앱을
+/// 선택하기 전에는 알 수 없으므로 특정 `/apps/{id}/general` 대신 공식 목록을 연다.
+const SLACK_APP_MANAGEMENT_URL: &str = "https://api.slack.com/apps";
+const SLACK_MANUAL_CLIENT_REASON: &str =
+    "Slack MCP는 자동 클라이언트 등록(DCR)을 지원하지 않습니다";
+
 /// 서버별 연결 상태 (완료 기준: 연결 상태 표시).
 enum ConnStatus {
     Checking,
@@ -48,6 +62,18 @@ enum ConnStatus {
         message: String,
         challenge: AuthChallengeInfo,
     },
+}
+
+/// Home과 Connector Center가 공유하는 Slack 연결 요약. 오류 본문은 커넥터 카드에만
+/// 표시하고 Home에는 상태만 노출해 네트워크/인증 세부정보가 대시보드를 밀지 않게 한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlackMcpStatus {
+    NotConfigured,
+    Ready,
+    Checking,
+    NeedsAuth,
+    Connected { tools: usize },
+    Failed,
 }
 
 /// 401 응답의 Bearer 챌린지에서 추출한 정보 (H5 사다리 입력).
@@ -143,6 +169,9 @@ struct OAuthFlow {
     server_url: String,
     /// stale 결과 폐기용 세대 — 취소/재시작 시 증가한다.
     generation: u64,
+    /// 저장된 Slack team 힌트를 이번 승인에서만 비워 브라우저의 workspace
+    /// chooser를 다시 연다. 성공 전까지 영속된 기존 바인딩은 건드리지 않는다.
+    force_slack_workspace_choice: bool,
     stage: OAuthStage,
 }
 
@@ -155,11 +184,16 @@ enum OAuthStage {
     ManualClient {
         discovered: DiscoveredAuth,
         reason: String,
+        /// 비워 두면 Slack 브라우저 chooser를 쓴다. chooser가 잘못된
+        /// workspace로 고정될 때만 `vector9.slack.com` 형태로 입력한다.
+        workspace_address: String,
         client_id: String,
         client_secret: String,
     },
     /// 등록 → 브라우저 승인 → 사다리 재시도 진행 중.
     Authorizing,
+    /// 브라우저 실행/callback/token 교환 실패 — 조용히 모달을 닫지 않고 원인을 표시한다.
+    Failed(String),
 }
 
 /// 발견 체인의 결과 — AS 메타데이터 + 요청할 scope.
@@ -176,6 +210,8 @@ enum ClientPlan {
         client_id: String,
         client_secret: Option<SecretString>,
         manual: bool,
+        slack_team_id: Option<String>,
+        slack_workspace_domain: Option<String>,
     },
     /// RFC 7591 동적 등록.
     Dcr,
@@ -183,6 +219,7 @@ enum ClientPlan {
     Manual {
         client_id: String,
         client_secret: Option<SecretString>,
+        slack_workspace_address: Option<String>,
     },
 }
 
@@ -209,6 +246,9 @@ enum LadderEnd {
 /// OAuth flow 백그라운드 메시지.
 enum OAuthMsg {
     Discovered(Box<Result<DiscoveredAuth, String>>),
+    /// OAuth worker가 만든 authorize URL. 실제 브라우저 실행은 UI 프레임의
+    /// egui platform output으로 보내 앱 backend와 수명주기를 맞춘다.
+    OpenBrowser(String),
     /// discovered를 되돌려줘 수동 입력 단계가 이어서 쓴다.
     NeedManualClient {
         discovered: Box<DiscoveredAuth>,
@@ -235,10 +275,23 @@ struct OAuthConnection {
     issuer: String,
     authorization_endpoint: String,
     token_endpoint: String,
+    /// RFC 8707 canonical resource. 구 저장분은 server_url로 폴백한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    oauth_resource: Option<String>,
     client_id: String,
+    /// RFC 8414 token_endpoint_auth_methods_supported에서 선택한 방식.
+    #[serde(default)]
+    client_secret_post: bool,
     /// true면 수동 입력 client — 재등록(DCR) 사다리를 건너뛴다.
     #[serde(default)]
     manual_client: bool,
+    /// Slack token 응답으로 확인한 workspace ID. 다음 승인 URL의
+    /// optional `team` 힌트로만 쓴다. 기존 저장분은 None 호환.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slack_team_id: Option<String>,
+    /// 사용자가 fallback으로 입력한 친숙한 workspace domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slack_workspace_domain: Option<String>,
     #[serde(default)]
     scopes: Vec<String>,
     /// access token 만료 시각 (unix 초) — 만료 5분 전 선제 refresh 판정 (H4 정책).
@@ -264,8 +317,9 @@ struct HttpAuthBinding {
     credential_id: String,
     token_url: String,
     client_id: String,
-    /// 동의 시점 서버 URL — RFC 8707 resource 고정에 쓴다.
-    server_url: String,
+    client_secret_post: bool,
+    /// RFC 8707 canonical resource — Slack처럼 endpoint path와 resource가 다를 수 있다.
+    oauth_resource: String,
     expires_at_secs: Option<u64>,
 }
 
@@ -374,6 +428,9 @@ pub struct ConnectorsUi {
     /// http 서버 URL 입력 (H3) — 저장 전 https/localhost 정책 검증
     url_input: String,
     error: Option<String>,
+    /// Slack initialize가 app별 MCP access 비활성화를 반환하면 오류 본문의
+    /// Slack 소유 설정 URL만 검증해 보관하고 featured card에 복구 버튼을 낸다.
+    slack_mcp_enable_url: Option<String>,
     cached: Option<Vec<McpServerRow>>,
     /// 서버별 저장된 tool 목록 캐시 — server_card가 열려 있는 동안 매 프레임 SQLite
     /// 조회(서버 수만큼 N+1)를 반복하지 않게 한다. replace_mcp_tools를 부르는 경로
@@ -393,6 +450,8 @@ pub struct ConnectorsUi {
     import_report: Vec<String>,
     // OAuth 승인 flow (H5, 401 사다리)
     oauth_flow: Option<OAuthFlow>,
+    /// 승인 취소 시 callback worker가 listener를 즉시 drop하도록 공유하는 신호.
+    oauth_cancel: Option<Arc<AtomicBool>>,
     oauth_gen: u64,
     oauth_tx: mpsc::Sender<OAuthFlowResult>,
     oauth_rx: mpsc::Receiver<OAuthFlowResult>,
@@ -404,6 +463,8 @@ pub struct ConnectorsUi {
     invoke_gen: u64,
     /// 저장된 권한 규칙을 policy로 1회 로드했는지 (contents 최초 진입 시)
     rules_loaded: bool,
+    /// 등록 목록이 바뀌면 App의 하단 MCP count TTL 캐시를 즉시 무효화한다.
+    server_list_changed: bool,
 }
 
 impl ConnectorsUi {
@@ -425,6 +486,7 @@ impl ConnectorsUi {
             args_input: String::new(),
             url_input: String::new(),
             error: None,
+            slack_mcp_enable_url: None,
             cached: None,
             tools_cached: HashMap::new(),
             status: HashMap::new(),
@@ -436,6 +498,7 @@ impl ConnectorsUi {
             import_input: String::new(),
             import_report: Vec::new(),
             oauth_flow: None,
+            oauth_cancel: None,
             oauth_gen: 0,
             oauth_tx,
             oauth_rx,
@@ -445,6 +508,7 @@ impl ConnectorsUi {
             invoke_rx,
             invoke_gen: 0,
             rules_loaded: false,
+            server_list_changed: false,
         }
     }
 
@@ -452,6 +516,32 @@ impl ConnectorsUi {
     /// 실행/감사되지 않도록). 백그라운드 스레드는 계속 돌지만 결과는 세대 불일치로 무시된다.
     pub fn clear_invoke(&mut self) {
         self.invoke = None;
+    }
+
+    pub fn take_server_list_changed(&mut self) -> bool {
+        std::mem::take(&mut self.server_list_changed)
+    }
+
+    /// 저장 상태와 이번 실행의 연결 결과를 합쳐 Home용 Slack 상태를 만든다.
+    /// 재시작 직후에도 저장된 tool 목록이 있으면 마지막 검증 성공 상태를 복원한다.
+    pub fn slack_status(&self, db: &Db) -> SlackMcpStatus {
+        let Ok(servers) = db.list_mcp_servers() else {
+            return SlackMcpStatus::Failed;
+        };
+        let Some(server) = find_slack_server(&servers) else {
+            return SlackMcpStatus::NotConfigured;
+        };
+        match self.status.get(&server.id) {
+            Some(ConnStatus::Checking) => SlackMcpStatus::Checking,
+            Some(ConnStatus::Connected { tools }) => SlackMcpStatus::Connected { tools: *tools },
+            Some(ConnStatus::NeedsAuth { .. }) => SlackMcpStatus::NeedsAuth,
+            Some(ConnStatus::Failed(_)) => SlackMcpStatus::Failed,
+            None => match db.list_mcp_tools(&server.id) {
+                Ok(tools) if !tools.is_empty() => SlackMcpStatus::Connected { tools: tools.len() },
+                Ok(_) => SlackMcpStatus::Ready,
+                Err(_) => SlackMcpStatus::Failed,
+            },
+        }
     }
 
     /// 백그라운드 tools/call 결과를 현재 invoke 상태에 반영.
@@ -538,6 +628,8 @@ impl ConnectorsUi {
             },
         };
 
+        self.slack_provider_card(ui, ctx, db, &servers, env_resolver, catalog);
+        ui.add_space(16.0);
         ui.heading(catalog.t("connectors.local_mcp", &[]));
         if servers.is_empty() {
             ui.label(catalog.t("connectors.empty_mcp", &[]));
@@ -668,6 +760,16 @@ impl ConnectorsUi {
         server: &McpServerRow,
         challenge: AuthChallengeInfo,
     ) {
+        self.start_oauth_discovery_mode(ctx, server, challenge, false);
+    }
+
+    fn start_oauth_discovery_mode(
+        &mut self,
+        ctx: &egui::Context,
+        server: &McpServerRow,
+        challenge: AuthChallengeInfo,
+        force_slack_workspace_choice: bool,
+    ) {
         if self.oauth_flow.is_some() {
             return; // 브라우저 flow는 한 번에 하나
         }
@@ -688,6 +790,7 @@ impl ConnectorsUi {
             server_name: server.name.clone(),
             server_url: url.clone(),
             generation,
+            force_slack_workspace_choice,
             stage: OAuthStage::Discovering,
         });
         let tx = self.oauth_tx.clone();
@@ -719,11 +822,40 @@ impl ConnectorsUi {
         let manager = LocalMcpManager::new(self.redaction.clone());
         let tx = self.oauth_tx.clone();
         let ctx = ctx.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        if let Some(previous) = self.oauth_cancel.replace(cancelled.clone()) {
+            previous.store(true, Ordering::Release);
+        }
         std::thread::spawn(move || {
-            // 브라우저 왕복 추상화 — 테스트는 이 자리를 콜백 직접 호출로 대체한다.
-            let resource = server_url.clone();
+            // worker는 callback listener/PKCE state를 먼저 준비한 뒤 authorize URL만
+            // UI로 보낸다. 외부 프로세스 `open`을 worker에서 fire-and-forget하면
+            // 실패가 화면과 동기화되지 않으므로 실제 브라우저 실행은 drain_oauth의
+            // egui platform command가 맡는다.
+            let resource = oauth_resource_for_server(&server_url);
+            let fixed_localhost = server_url.trim().trim_end_matches('/') == SLACK_MCP_URL;
+            let browser_tx = tx.clone();
+            let browser_ctx = ctx.clone();
             let authorize = move |config: &auth::OAuthProviderConfig| {
-                auth::run_flow_with_resource(config, BROWSER_FLOW_TIMEOUT, Some(&resource))
+                let callback = if fixed_localhost {
+                    bind_fixed_slack_callback(&cancelled)
+                } else {
+                    auth::LocalhostCallbackServer::bind()
+                }?;
+                let pending =
+                    auth::begin_with_resource(config, callback.redirect_uri(), Some(&resource))?;
+                browser_tx
+                    .send((
+                        generation,
+                        OAuthMsg::OpenBrowser(pending.authorize_url.clone()),
+                    ))
+                    .map_err(|_| anyhow::anyhow!("OAuth 브라우저 요청 채널 종료"))?;
+                browser_ctx.request_repaint();
+                let params = callback.wait_for_callback_cancellable(
+                    BROWSER_FLOW_TIMEOUT,
+                    pending.state(),
+                    &cancelled,
+                )?;
+                auth::complete(pending, params)
             };
             let end = run_oauth_ladder(
                 &manager,
@@ -752,7 +884,12 @@ impl ConnectorsUi {
     /// client_id 폴백 전환, 사다리 성공 시 keyring 저장 + credentials(oauth_json
     /// 바인딩) 등록 + redaction 시드 + tools 반영(자동 재시도 결과).
     /// credential을 추가/갱신했으면 true (호출측 캐시 무효화).
-    pub fn drain_oauth(&mut self, db: &mut Db, oauth_store: &dyn OAuthCredentialStore) -> bool {
+    pub fn drain_oauth(
+        &mut self,
+        ctx: &egui::Context,
+        db: &mut Db,
+        oauth_store: &dyn OAuthCredentialStore,
+    ) -> bool {
         let mut added = false;
         while let Ok((generation, msg)) = self.oauth_rx.try_recv() {
             // 취소됐거나(None) 재시작한(세대 불일치) flow의 결과는 폐기한다
@@ -763,9 +900,32 @@ impl ConnectorsUi {
                 _ => continue,
             };
             match msg {
+                OAuthMsg::OpenBrowser(url) => {
+                    ctx.open_url(egui::OpenUrl::new_tab(url));
+                    tracing::info!(server_id, "OAuth 승인 브라우저 열기 요청");
+                }
                 OAuthMsg::Discovered(result) => match *result {
                     Ok(discovered) => {
-                        if let Some(flow) = &mut self.oauth_flow {
+                        let is_slack = self.oauth_flow.as_ref().is_some_and(|flow| {
+                            flow.server_url.trim().trim_end_matches('/') == SLACK_MCP_URL
+                        });
+                        if is_slack {
+                            // Slack은 DCR 미지원과 인증 authority가 제품 계약으로 고정돼
+                            // 있다. 일반 MCP용 authority 확인 모달을 한 번 더 보여준 뒤
+                            // DCR 실패를 기다리지 말고, 저장된 client가 있으면 즉시 승인,
+                            // 없으면 곧바로 Client ID/Secret 입력으로 이동한다.
+                            if let Some(plan) = self.stored_client_plan(db, &discovered) {
+                                self.start_oauth_authorize(ctx, discovered, plan);
+                            } else if let Some(flow) = &mut self.oauth_flow {
+                                flow.stage = OAuthStage::ManualClient {
+                                    discovered,
+                                    reason: SLACK_MANUAL_CLIENT_REASON.to_owned(),
+                                    workspace_address: String::new(),
+                                    client_id: String::new(),
+                                    client_secret: String::new(),
+                                };
+                            }
+                        } else if let Some(flow) = &mut self.oauth_flow {
                             flow.stage = OAuthStage::Consent(discovered);
                         }
                     }
@@ -778,19 +938,27 @@ impl ConnectorsUi {
                     }
                 },
                 OAuthMsg::NeedManualClient { discovered, reason } => {
+                    self.oauth_cancel = None;
                     if let Some(flow) = &mut self.oauth_flow {
                         flow.stage = OAuthStage::ManualClient {
                             discovered: *discovered,
                             reason,
+                            workspace_address: String::new(),
                             client_id: String::new(),
                             client_secret: String::new(),
                         };
                     }
                 }
                 OAuthMsg::Finished(result) => {
-                    self.oauth_flow = None;
+                    self.oauth_cancel = None;
                     match *result {
                         Ok(success) => {
+                            if success.connection.server_url.trim().trim_end_matches('/')
+                                == SLACK_MCP_URL
+                            {
+                                self.slack_mcp_enable_url = None;
+                            }
+                            self.oauth_flow = None;
                             match self.store_ladder_success(db, oauth_store, &server_name, success)
                             {
                                 Ok(tools) => {
@@ -807,8 +975,19 @@ impl ConnectorsUi {
                             }
                         }
                         Err(message) => {
-                            // 승인 실패는 다시 시도할 수 있는 상태 — 기존 챌린지를
-                            // 유지한 채 "승인 필요"로 되돌린다.
+                            // 승인 실패는 다시 시도할 수 있는 상태다. 기존 구현은 여기서
+                            // 모달을 닫고 오류를 hover에만 숨겨 "무반응"처럼 보였다.
+                            // flow를 유지해 오류를 모달 본문에 직접 표시한다.
+                            tracing::warn!(server_id, "OAuth 승인 실패 — UI에 오류 표시");
+                            if self.oauth_flow.as_ref().is_some_and(|flow| {
+                                flow.server_url.trim().trim_end_matches('/') == SLACK_MCP_URL
+                            }) && let Some(url) = slack_mcp_enable_url(&message)
+                            {
+                                self.slack_mcp_enable_url = Some(url);
+                            }
+                            if let Some(flow) = &mut self.oauth_flow {
+                                flow.stage = OAuthStage::Failed(message.clone());
+                            }
                             let challenge = match self.status.get(&server_id) {
                                 Some(ConnStatus::NeedsAuth { challenge, .. }) => challenge.clone(),
                                 _ => AuthChallengeInfo::default(),
@@ -888,6 +1067,7 @@ impl ConnectorsUi {
         db: &Db,
         catalog: &i18n::Catalog,
     ) {
+        let slack_mcp_enable_url = self.slack_mcp_enable_url.clone();
         let Some(flow) = &mut self.oauth_flow else {
             return;
         };
@@ -895,10 +1075,11 @@ impl ConnectorsUi {
             None,
             Cancel,
             Consent(DiscoveredAuth),
-            Manual(DiscoveredAuth, String, String),
+            Manual(DiscoveredAuth, String, String, String),
         }
         let mut act = Act::None;
         let server_name = flow.server_name.clone();
+        let is_slack = flow.server_url.trim().trim_end_matches('/') == SLACK_MCP_URL;
         egui::Window::new(catalog.t("connectors.oauth_flow_title", &[]))
             .collapsible(false)
             .resizable(false)
@@ -935,11 +1116,42 @@ impl ConnectorsUi {
                     OAuthStage::ManualClient {
                         discovered,
                         reason,
+                        workspace_address,
                         client_id,
                         client_secret,
                     } => {
                         ui.label(catalog.t("connectors.oauth_manual_note", &[("reason", reason)]));
-                        ui.weak(catalog.t("connectors.oauth_manual_hint", &[]));
+                        if is_slack {
+                            ui.weak(catalog.t("connectors.slack.credentials_path", &[]));
+                            if ui
+                                .button(catalog.t("connectors.slack.open_app_settings", &[]))
+                                .clicked()
+                            {
+                                ctx.open_url(egui::OpenUrl::new_tab(SLACK_APP_MANAGEMENT_URL));
+                            }
+                            ui.add_space(6.0);
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0xd0, 0x8a, 0x00),
+                                catalog.t("connectors.slack.redirect_required", &[]),
+                            );
+                            ui.horizontal(|ui| {
+                                ui.monospace(slack_callback_redirect_uri());
+                                if ui.small_button(catalog.t("action.copy", &[])).clicked() {
+                                    ctx.copy_text(slack_callback_redirect_uri());
+                                }
+                            });
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.label(catalog.t("connectors.slack.workspace_address", &[]));
+                                ui.add(
+                                    egui::TextEdit::singleline(workspace_address)
+                                        .hint_text("vector9.slack.com"),
+                                );
+                            });
+                            ui.weak(catalog.t("connectors.slack.workspace_address_hint", &[]));
+                        } else {
+                            ui.weak(catalog.t("connectors.oauth_manual_hint", &[]));
+                        }
                         ui.horizontal(|ui| {
                             ui.label(catalog.t("connectors.client_id", &[]));
                             ui.text_edit_singleline(client_id);
@@ -950,15 +1162,18 @@ impl ConnectorsUi {
                         });
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
+                            let credentials_ready = !client_id.trim().is_empty()
+                                && (!is_slack || !client_secret.trim().is_empty());
                             if ui
                                 .add_enabled(
-                                    !client_id.trim().is_empty(),
+                                    credentials_ready,
                                     egui::Button::new(catalog.t("connectors.oauth_continue", &[])),
                                 )
                                 .clicked()
                             {
                                 act = Act::Manual(
                                     discovered.clone(),
+                                    workspace_address.trim().to_owned(),
                                     client_id.trim().to_owned(),
                                     client_secret.trim().to_owned(),
                                 );
@@ -977,13 +1192,35 @@ impl ConnectorsUi {
                             act = Act::Cancel;
                         }
                     }
+                    OAuthStage::Failed(message) => {
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            catalog.t("connectors.failed", &[("message", message)]),
+                        );
+                        ui.add_space(8.0);
+                        if is_slack
+                            && let Some(url) = &slack_mcp_enable_url
+                            && ui
+                                .button(catalog.t("connectors.slack.enable_mcp_access", &[]))
+                                .clicked()
+                        {
+                            ctx.open_url(egui::OpenUrl::new_tab(url));
+                        }
+                        if ui.button(catalog.t("action.close", &[])).clicked() {
+                            act = Act::Cancel;
+                        }
+                    }
                 }
             });
         match act {
             Act::None => {}
             Act::Cancel => {
-                // 진행 중 백그라운드 결과는 세대 증가로 폐기된다. 브라우저 flow
-                // 스레드는 자체 timeout(BROWSER_FLOW_TIMEOUT)으로 소멸한다.
+                // 진행 중 백그라운드 결과는 세대 증가로 폐기하고 listener에는 취소를
+                // 알려 고정 포트를 즉시 해제한다. 재시도가 180초 timeout을 기다리거나
+                // 이전 Deppy listener와 bind 충돌하지 않게 한다.
+                if let Some(cancelled) = self.oauth_cancel.take() {
+                    cancelled.store(true, Ordering::Release);
+                }
                 self.oauth_gen += 1;
                 self.oauth_flow = None;
             }
@@ -994,7 +1231,7 @@ impl ConnectorsUi {
                     .unwrap_or(ClientPlan::Dcr);
                 self.start_oauth_authorize(ctx, discovered, plan);
             }
-            Act::Manual(discovered, client_id, client_secret) => {
+            Act::Manual(discovered, workspace_address, client_id, client_secret) => {
                 let secret = if client_secret.is_empty() {
                     None
                 } else {
@@ -1006,6 +1243,8 @@ impl ConnectorsUi {
                     ClientPlan::Manual {
                         client_id,
                         client_secret: secret,
+                        slack_workspace_address: (!workspace_address.is_empty())
+                            .then_some(workspace_address),
                     },
                 );
             }
@@ -1027,7 +1266,186 @@ impl ConnectorsUi {
             client_id: connection.client_id,
             client_secret,
             manual: connection.manual_client,
+            slack_team_id: (!flow.force_slack_workspace_choice)
+                .then_some(connection.slack_team_id)
+                .flatten(),
+            slack_workspace_domain: (!flow.force_slack_workspace_choice)
+                .then_some(connection.slack_workspace_domain)
+                .flatten(),
         })
+    }
+
+    /// Slack를 featured provider로 고정 노출한다. 버튼은 미등록이면 공식 endpoint를
+    /// 중복 없이 추가하고, 등록 상태면 연결 확인 또는 OAuth 승인 흐름을 이어간다.
+    fn slack_provider_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        db: &mut Db,
+        servers: &[McpServerRow],
+        env_resolver: &dyn McpScopedEnvResolver,
+        catalog: &i18n::Catalog,
+    ) {
+        ui.label(
+            egui::RichText::new(catalog.t("connectors.featured", &[]))
+                .strong()
+                .size(15.0),
+        );
+        ui.add_space(7.0);
+        let server = find_slack_server(servers).cloned();
+        let status = server
+            .as_ref()
+            .map(|server| slack_status_for_server(self.status.get(&server.id), db, server))
+            .unwrap_or(SlackMcpStatus::NotConfigured);
+        let has_saved_workspace = server.as_ref().is_some_and(|server| {
+            oauth_binding_for_server(db, &server.id)
+                .and_then(|(_, connection)| connection.slack_team_id)
+                .is_some()
+        });
+        let slack_mcp_enable_url = self.slack_mcp_enable_url.clone();
+        let mut connect_clicked = false;
+        let mut choose_workspace_clicked = false;
+        egui::Frame::NONE
+            .fill(ui.visuals().panel_fill)
+            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+            .corner_radius(egui::CornerRadius::same(2))
+            .inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    slack_mark(ui);
+                    ui.vertical(|ui| {
+                        ui.strong("Slack");
+                        ui.weak(catalog.t("connectors.slack.description", &[]));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (label, enabled) = match status {
+                            SlackMcpStatus::Checking => {
+                                (catalog.t("connectors.checking", &[]), false)
+                            }
+                            SlackMcpStatus::NeedsAuth => {
+                                (catalog.t("connectors.approve_browser", &[]), true)
+                            }
+                            SlackMcpStatus::Connected { .. } => {
+                                (catalog.t("connectors.connected", &[]), false)
+                            }
+                            SlackMcpStatus::NotConfigured
+                            | SlackMcpStatus::Ready
+                            | SlackMcpStatus::Failed => {
+                                (catalog.t("connectors.trust_connect", &[]), true)
+                            }
+                        };
+                        connect_clicked =
+                            ui.add_enabled(enabled, egui::Button::new(label)).clicked();
+                    });
+                });
+                ui.add_space(8.0);
+                ui.weak(
+                    egui::RichText::new(catalog.t("connectors.slack.requirements", &[])).size(11.0),
+                );
+                ui.weak(
+                    egui::RichText::new(catalog.t("connectors.slack.redirect", &[])).size(11.0),
+                );
+                ui.horizontal(|ui| match status {
+                    SlackMcpStatus::NotConfigured => {
+                        ui.weak(catalog.t("home.connections.not_connected", &[]));
+                    }
+                    SlackMcpStatus::Ready => {
+                        ui.weak(catalog.t("connectors.slack.ready", &[]));
+                    }
+                    SlackMcpStatus::Checking => {
+                        ui.weak(catalog.t("connectors.checking", &[]));
+                    }
+                    SlackMcpStatus::NeedsAuth => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xd0, 0x8a, 0x00),
+                            catalog.t("connectors.needs_auth", &[]),
+                        );
+                    }
+                    SlackMcpStatus::Connected { tools } => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0x2e, 0xa0, 0x43),
+                            catalog.t(
+                                "connectors.connected_tools",
+                                &[("count", &tools.to_string())],
+                            ),
+                        );
+                    }
+                    SlackMcpStatus::Failed => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xed, 0x5b, 0x61),
+                            catalog.t("connectors.slack.retry", &[]),
+                        );
+                    }
+                });
+                if let Some(url) = &slack_mcp_enable_url {
+                    ui.add_space(6.0);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xd0, 0x8a, 0x00),
+                        catalog.t("connectors.slack.mcp_access_disabled", &[]),
+                    );
+                    if ui
+                        .button(catalog.t("connectors.slack.enable_mcp_access", &[]))
+                        .clicked()
+                    {
+                        ctx.open_url(egui::OpenUrl::new_tab(url));
+                    }
+                }
+                if has_saved_workspace {
+                    choose_workspace_clicked = ui
+                        .add_enabled(
+                            self.oauth_flow.is_none(),
+                            egui::Button::new(
+                                catalog.t("connectors.slack.choose_another_workspace", &[]),
+                            )
+                            .small(),
+                        )
+                        .clicked();
+                }
+            });
+
+        if choose_workspace_clicked {
+            let Some(server) = server.as_ref() else {
+                return;
+            };
+            self.start_oauth_discovery_mode(ctx, server, AuthChallengeInfo::default(), true);
+            return;
+        }
+
+        if !connect_clicked {
+            return;
+        }
+        // Slack는 DCR을 지원하지 않는다. 등록된 OAuth 바인딩이 없다면 Connect 즉시
+        // 앱 관리 페이지를 열어 Client ID/Secret의 위치부터 보여준다. 이 URL은
+        // Slack 고정 origin이며 원격 MCP 신뢰/데이터 전송은 아래 별도 확인을 유지한다.
+        let needs_app_credentials = server
+            .as_ref()
+            .is_none_or(|server| oauth_binding_for_server(db, &server.id).is_none());
+        if needs_app_credentials {
+            ctx.open_url(egui::OpenUrl::new_tab(SLACK_APP_MANAGEMENT_URL));
+        }
+        let server = match server {
+            Some(server) => server,
+            None => match ensure_slack_server(db, servers) {
+                Ok(server) => {
+                    self.cached = None;
+                    self.server_list_changed = true;
+                    server
+                }
+                Err(error) => {
+                    self.error = Some(format!("Slack MCP 추가 실패: {error:#}"));
+                    return;
+                }
+            },
+        };
+        match self.status.get(&server.id) {
+            Some(ConnStatus::NeedsAuth { challenge, .. }) => {
+                self.start_oauth_discovery(ctx, &server, challenge.clone());
+            }
+            Some(ConnStatus::Checking) | Some(ConnStatus::Connected { .. }) => {}
+            Some(ConnStatus::Failed(_)) | None => {
+                self.request_discover(ctx, db, &server, env_resolver);
+            }
+        }
     }
 
     fn server_card(
@@ -1734,8 +2152,15 @@ impl ConnectorsUi {
                     continue;
                 }
             }
+            let is_slack = outcome
+                .request_url
+                .as_deref()
+                .is_some_and(|url| url.trim().trim_end_matches('/') == SLACK_MCP_URL);
             let status = match outcome.result {
                 Ok(tools) => {
+                    if is_slack {
+                        self.slack_mcp_enable_url = None;
+                    }
                     let rows = tool_rows(&outcome.server_id, &tools);
                     self.tools_cached.remove(&outcome.server_id);
                     match db.replace_mcp_tools(&outcome.server_id, &rows) {
@@ -1744,13 +2169,18 @@ impl ConnectorsUi {
                     }
                 }
                 // 401/403은 에러가 아니라 승인 필요 (H5 상태 분리)
-                Err(failure) => match failure.auth {
-                    Some(challenge) => ConnStatus::NeedsAuth {
-                        message: failure.message,
-                        challenge,
-                    },
-                    None => ConnStatus::Failed(failure.message),
-                },
+                Err(failure) => {
+                    if is_slack && let Some(url) = slack_mcp_enable_url(&failure.message) {
+                        self.slack_mcp_enable_url = Some(url);
+                    }
+                    match failure.auth {
+                        Some(challenge) => ConnStatus::NeedsAuth {
+                            message: failure.message,
+                            challenge,
+                        },
+                        None => ConnStatus::Failed(failure.message),
+                    }
+                }
             };
             self.status.insert(outcome.server_id, status);
         }
@@ -1827,6 +2257,7 @@ impl ConnectorsUi {
                 self.url_input.clear();
                 self.error = None;
                 self.cached = None; // 목록 재조회
+                self.server_list_changed = true;
             }
             Err(e) => self.error = Some(format!("추가 실패: {e:#}")),
         }
@@ -1992,6 +2423,7 @@ impl ConnectorsUi {
         }
         if added > 0 {
             self.cached = None; // 목록 재조회
+            self.server_list_changed = true;
         }
         added
     }
@@ -2032,6 +2464,107 @@ impl ConnectorsUi {
                 false
             }
         }
+    }
+}
+
+fn find_slack_server(servers: &[McpServerRow]) -> Option<&McpServerRow> {
+    servers.iter().find(|server| {
+        server.kind == "http"
+            && server
+                .url
+                .as_deref()
+                .is_some_and(|url| url.trim().trim_end_matches('/') == SLACK_MCP_URL)
+    })
+}
+
+fn slack_status_for_server(
+    transient: Option<&ConnStatus>,
+    db: &Db,
+    server: &McpServerRow,
+) -> SlackMcpStatus {
+    match transient {
+        Some(ConnStatus::Checking) => SlackMcpStatus::Checking,
+        Some(ConnStatus::Connected { tools }) => SlackMcpStatus::Connected { tools: *tools },
+        Some(ConnStatus::NeedsAuth { .. }) => SlackMcpStatus::NeedsAuth,
+        Some(ConnStatus::Failed(_)) => SlackMcpStatus::Failed,
+        None => match db.list_mcp_tools(&server.id) {
+            Ok(tools) if !tools.is_empty() => SlackMcpStatus::Connected { tools: tools.len() },
+            Ok(_) => SlackMcpStatus::Ready,
+            Err(_) => SlackMcpStatus::Failed,
+        },
+    }
+}
+
+/// 공식 URL 기준으로 멱등 등록한다. 이름은 사용자가 바꿀 수 있으므로 중복 판정에 쓰지 않는다.
+fn ensure_slack_server(db: &Db, known_servers: &[McpServerRow]) -> anyhow::Result<McpServerRow> {
+    if let Some(existing) = find_slack_server(known_servers) {
+        return Ok(existing.clone());
+    }
+    validate_mcp_url(SLACK_MCP_URL)?;
+    let row = McpServerRow {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: SLACK_MCP_NAME.to_owned(),
+        kind: "http".to_owned(),
+        command: None,
+        args: Vec::new(),
+        env_plain: Vec::new(),
+        env_secrets: Vec::new(),
+        inherit_env: true,
+        url: Some(SLACK_MCP_URL.to_owned()),
+        enabled: true,
+    };
+    db.insert_mcp_server(&row)?;
+    Ok(row)
+}
+
+/// Slack가 app별 MCP access 비활성화 오류에 넣어 준 설정 링크에서 app ID만
+/// 추출해 canonical Slack URL을 다시 만든다. 임의 오류 URL을 그대로 열지 않는다.
+fn slack_mcp_enable_url(message: &str) -> Option<String> {
+    if !message.contains("App is not enabled for Slack MCP server access") {
+        return None;
+    }
+    let normalized = message.replace("\\/", "/");
+    let rest = normalized.split_once("https://api.slack.com/apps/")?.1;
+    let (app_id, tail) = rest.split_once('/')?;
+    if tail != "app-assistant" && !tail.starts_with("app-assistant\"") {
+        return None;
+    }
+    if !(9..=32).contains(&app_id.len())
+        || !app_id.starts_with('A')
+        || !app_id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some(format!("https://api.slack.com/apps/{app_id}/app-assistant"))
+}
+
+/// 외부 이미지 리소스 없이 그리는 Slack 식별 마크. 작은 크기에서도 네 가지 브랜드 색이
+/// 유지돼 provider card와 Home 연결 행을 같은 시각 언어로 묶는다.
+pub(super) fn slack_mark(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, 3.0, egui::Color32::from_rgb(0xf2, 0xf2, 0xf4));
+    let center = rect.center();
+    let radius = 3.2;
+    for (offset, color) in [
+        (
+            egui::vec2(-4.0, -4.0),
+            egui::Color32::from_rgb(0x36, 0xc5, 0xf0),
+        ),
+        (
+            egui::vec2(4.0, -4.0),
+            egui::Color32::from_rgb(0x2e, 0xb6, 0x7d),
+        ),
+        (
+            egui::vec2(-4.0, 4.0),
+            egui::Color32::from_rgb(0xec, 0xb2, 0x2e),
+        ),
+        (
+            egui::vec2(4.0, 4.0),
+            egui::Color32::from_rgb(0xe0, 0x1e, 0x5a),
+        ),
+    ] {
+        ui.painter().circle_filled(center + offset, radius, color);
     }
 }
 
@@ -2200,8 +2733,9 @@ fn run_http<T>(
                 token_url: binding.token_url.clone(),
                 client_id: binding.client_id.clone(),
                 client_secret,
+                client_secret_post: binding.client_secret_post,
                 // RFC 8707 — refresh 교환에도 대상 리소스를 고정
-                resource: Some(binding.server_url.clone()),
+                resource: Some(binding.oauth_resource.clone()),
             },
             needs_refresh,
         }
@@ -2346,7 +2880,10 @@ fn resolve_http_auth(db: &Db, server_id: &str, current_url: &str) -> HttpAuth {
         credential_id,
         token_url: connection.token_endpoint,
         client_id: connection.client_id,
-        server_url: connection.server_url,
+        client_secret_post: connection.client_secret_post,
+        oauth_resource: connection
+            .oauth_resource
+            .unwrap_or_else(|| connection.server_url.clone()),
         expires_at_secs: connection.expires_at_secs,
     })
 }
@@ -2424,9 +2961,13 @@ fn discover_auth_metadata(
     let origin = auth::validate_https_or_loopback(server_url)?
         .origin()
         .ascii_serialization();
+    // Slack endpoint는 `/mcp`지만 RFC 9728 metadata의 canonical resource는 origin이다.
+    // endpoint 전체로 검증하면 정상 PRM을 resource mismatch로 버리고 scopes_supported도
+    // 잃는다. 일반 서버는 oauth_resource_for_server가 원래 URL을 그대로 돌려준다.
+    let protected_resource = oauth_resource_for_server(server_url);
     let prm = auth::discover_protected_resource(
         timeout,
-        server_url,
+        &protected_resource,
         challenge.resource_metadata.as_deref(),
         Some(&headers),
     );
@@ -2485,33 +3026,82 @@ fn run_oauth_ladder(
 ) -> LadderEnd {
     let metadata = &discovered.metadata;
     let mut scopes = discovered.scopes.clone();
-    let (mut client_id, mut client_secret, manual) = match plan {
-        ClientPlan::Stored {
-            client_id,
-            client_secret,
-            manual,
-        } => (client_id, client_secret, manual),
-        ClientPlan::Manual {
-            client_id,
-            client_secret,
-        } => (client_id, client_secret, true),
-        ClientPlan::Dcr => match register_ladder_client(timeout, metadata, &scopes) {
-            Ok((client_id, client_secret)) => (client_id, client_secret, false),
-            Err(auth::RegistrationError::Other(e)) => {
-                return LadderEnd::Failed(format!("클라이언트 등록 실패: {e:#}"));
-            }
-            // DCR 미지원/거부 → 수동 client_id 입력 폴백 (완료 기준)
-            Err(e) => {
-                return LadderEnd::NeedManualClient {
-                    reason: e.to_string(),
+    let is_slack = server_url.trim().trim_end_matches('/') == SLACK_MCP_URL;
+    let (mut client_id, mut client_secret, manual, mut slack_team_id, slack_workspace_domain) =
+        match plan {
+            ClientPlan::Stored {
+                client_id,
+                client_secret,
+                manual,
+                slack_team_id,
+                slack_workspace_domain,
+            } => (
+                client_id,
+                client_secret,
+                manual,
+                slack_team_id,
+                slack_workspace_domain,
+            ),
+            ClientPlan::Manual {
+                client_id,
+                client_secret,
+                slack_workspace_address,
+            } => {
+                let workspace = if is_slack {
+                    match slack_workspace_address {
+                        Some(address) => match resolve_slack_workspace(timeout, &address) {
+                            Ok(workspace) => Some(workspace),
+                            Err(error) => {
+                                return LadderEnd::Failed(format!(
+                                    "Slack workspace 주소 확인 실패: {error:#}"
+                                ));
+                            }
+                        },
+                        None => None,
+                    }
+                } else {
+                    None
                 };
+                (
+                    client_id,
+                    client_secret,
+                    true,
+                    workspace
+                        .as_ref()
+                        .map(|workspace| workspace.team_id.clone()),
+                    workspace.map(|workspace| workspace.domain),
+                )
             }
-        },
-    };
-    let mut token = match authorize(&provider_config(metadata, &client_id, &scopes)) {
+            ClientPlan::Dcr => match register_ladder_client(timeout, metadata, &scopes) {
+                Ok((client_id, client_secret)) => (client_id, client_secret, false, None, None),
+                Err(auth::RegistrationError::Other(e)) => {
+                    return LadderEnd::Failed(format!("클라이언트 등록 실패: {e:#}"));
+                }
+                // DCR 미지원/거부 → 수동 client_id 입력 폴백 (완료 기준)
+                Err(e) => {
+                    return LadderEnd::NeedManualClient {
+                        reason: e.to_string(),
+                    };
+                }
+            },
+        };
+    let mut token = match authorize(&provider_config(
+        metadata,
+        &client_id,
+        client_secret.as_ref(),
+        &scopes,
+        slack_team_id.as_deref(),
+    )) {
         Ok(token) => token,
         Err(e) => return LadderEnd::Failed(format!("브라우저 승인 실패: {e:#}")),
     };
+    if let Err(message) = validate_slack_authorized_team(is_slack, slack_team_id.as_deref(), &token)
+    {
+        return LadderEnd::Failed(message);
+    }
+    if is_slack {
+        slack_team_id = token.provider_workspace_id.clone().or(slack_team_id);
+    }
     let mut scope_refreshed = false;
     let mut reregistered = manual; // 수동 client는 재등록 단을 쓰지 않는다
     loop {
@@ -2529,8 +3119,12 @@ fn run_oauth_ladder(
                     issuer: metadata.issuer.clone(),
                     authorization_endpoint: metadata.authorization_endpoint.clone(),
                     token_endpoint: metadata.token_endpoint.clone(),
+                    oauth_resource: Some(oauth_resource_for_server(server_url)),
                     client_id,
+                    client_secret_post: uses_client_secret_post(metadata),
                     manual_client: manual,
+                    slack_team_id,
+                    slack_workspace_domain,
                     scopes,
                     expires_at_secs: token
                         .expires_in_secs
@@ -2560,12 +3154,23 @@ fn run_oauth_ladder(
         {
             scope_refreshed = true;
             scopes = new_scopes;
-            token = match authorize(&provider_config(metadata, &client_id, &scopes)) {
+            token = match authorize(&provider_config(
+                metadata,
+                &client_id,
+                client_secret.as_ref(),
+                &scopes,
+                slack_team_id.as_deref(),
+            )) {
                 Ok(token) => token,
                 Err(e) => {
                     return LadderEnd::Failed(format!("브라우저 승인 실패 (scope 갱신): {e:#}"));
                 }
             };
+            if let Err(message) =
+                validate_slack_authorized_team(is_slack, slack_team_id.as_deref(), &token)
+            {
+                return LadderEnd::Failed(message);
+            }
             continue;
         }
         // 단 ③: Authorization을 붙였는데도 401 — 등록 폐기 + 재등록(DCR) 1회만
@@ -2578,10 +3183,21 @@ fn run_oauth_ladder(
                 }
                 Err(e) => return LadderEnd::Failed(format!("클라이언트 재등록 실패: {e}")),
             }
-            token = match authorize(&provider_config(metadata, &client_id, &scopes)) {
+            token = match authorize(&provider_config(
+                metadata,
+                &client_id,
+                client_secret.as_ref(),
+                &scopes,
+                slack_team_id.as_deref(),
+            )) {
                 Ok(token) => token,
                 Err(e) => return LadderEnd::Failed(format!("브라우저 승인 실패 (재등록): {e:#}")),
             };
+            if let Err(message) =
+                validate_slack_authorized_team(is_slack, slack_team_id.as_deref(), &token)
+            {
+                return LadderEnd::Failed(message);
+            }
             continue;
         }
         return LadderEnd::Failed(format!(
@@ -2611,14 +3227,188 @@ fn register_ladder_client(
 fn provider_config(
     metadata: &auth::AuthorizationServerMetadata,
     client_id: &str,
+    client_secret: Option<&SecretString>,
     scopes: &[String],
+    slack_team_id: Option<&str>,
 ) -> auth::OAuthProviderConfig {
     auth::OAuthProviderConfig {
         auth_url: metadata.authorization_endpoint.clone(),
         token_url: metadata.token_endpoint.clone(),
         client_id: client_id.to_owned(),
+        client_secret: client_secret.map(|secret| SecretString::new(secret.expose().to_owned())),
+        client_secret_post: uses_client_secret_post(metadata),
         scopes: scopes.to_vec(),
+        extra_authorize_params: slack_team_id
+            .filter(|team_id| is_valid_slack_team_id(team_id))
+            .map(|team_id| vec![("team".to_owned(), team_id.to_owned())])
+            .unwrap_or_default(),
     }
+}
+
+fn uses_client_secret_post(metadata: &auth::AuthorizationServerMetadata) -> bool {
+    metadata
+        .token_endpoint_auth_methods_supported
+        .as_ref()
+        .is_some_and(|methods| methods.iter().any(|method| method == "client_secret_post"))
+}
+
+/// Slack PRM은 MCP endpoint(`/mcp`)가 아니라 origin을 canonical resource로 선언한다.
+/// 다른 provider는 사용자가 동의한 정확한 서버 URL을 계속 사용한다.
+fn oauth_resource_for_server(server_url: &str) -> String {
+    if server_url.trim().trim_end_matches('/') == SLACK_MCP_URL {
+        "https://mcp.slack.com".to_owned()
+    } else {
+        server_url.to_owned()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SlackWorkspaceTarget {
+    domain: String,
+    team_id: String,
+}
+
+/// 사용자에게는 친숙한 `vector9.slack.com` 주소만 받고 Slack이
+/// 로그인 페이지에 게시한 `encodedTeamId`를 확인한다. 이 경로는
+/// 브라우저 chooser가 잘못된 workspace로 고정될 때만 쓰는 fallback이다.
+/// 입력은 Slack 소유 HTTPS host로만 정규화하고 redirect를 따라가지
+/// 않아 임의 URL fetch/SSRF 경로로 확장되지 않게 한다.
+fn resolve_slack_workspace(timeout: Duration, input: &str) -> anyhow::Result<SlackWorkspaceTarget> {
+    let domain = normalize_slack_workspace_domain(input)?;
+    let url = format!("https://{domain}/");
+    let http = ureq::AgentBuilder::new()
+        .timeout(timeout)
+        .redirects(0)
+        .build();
+    let response = http
+        .get(&url)
+        .set("Accept", "text/html")
+        .set("User-Agent", "Deppy-Sijo/Slack-Workspace-Resolver")
+        .call()
+        .map_err(|error| anyhow::anyhow!("{domain} 조회 실패: {error}"))?;
+    if response.status() != 200 {
+        anyhow::bail!("{domain}이 HTTP {}를 반환했습니다", response.status());
+    }
+    let mut html = String::new();
+    response
+        .into_reader()
+        .take(2 * 1024 * 1024)
+        .read_to_string(&mut html)
+        .context("Slack workspace 페이지 읽기 실패")?;
+    parse_slack_workspace_html(&domain, &html)
+}
+
+fn parse_slack_workspace_html(domain: &str, html: &str) -> anyhow::Result<SlackWorkspaceTarget> {
+    let expected_slug = domain.trim_end_matches(".slack.com");
+    let returned_slug = slack_html_string_property(html, "teamDomain")
+        .context("Slack workspace 응답에 teamDomain이 없습니다")?;
+    if returned_slug != expected_slug {
+        anyhow::bail!("workspace domain 불일치: 요청={expected_slug}, 응답={returned_slug}");
+    }
+    let team_id = slack_html_string_property(html, "encodedTeamId")
+        .context("Slack workspace 응답에 Team ID가 없습니다")?;
+    if !is_valid_slack_team_id(&team_id) {
+        anyhow::bail!("Slack workspace 응답의 Team ID 형식이 잘못됐습니다");
+    }
+    Ok(SlackWorkspaceTarget {
+        domain: domain.to_owned(),
+        team_id,
+    })
+}
+
+fn normalize_slack_workspace_domain(input: &str) -> anyhow::Result<String> {
+    let input = input.trim().to_ascii_lowercase();
+    if input.is_empty() {
+        anyhow::bail!("workspace 주소가 비어 있습니다");
+    }
+    if input.starts_with("http://") {
+        anyhow::bail!("Slack workspace 주소는 HTTPS만 허용됩니다");
+    }
+    let without_scheme = input.strip_prefix("https://").unwrap_or(&input);
+    let host = without_scheme.trim_end_matches('/');
+    if host.contains('/') || host.contains('?') || host.contains('#') || host.contains('@') {
+        anyhow::bail!("workspace 주소에는 host만 입력하세요");
+    }
+    let slug = host.strip_suffix(".slack.com").unwrap_or(host);
+    if slug.is_empty()
+        || slug.len() > 80
+        || slug.contains('.')
+        || !slug
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        || !slug
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        || !slug
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+    {
+        anyhow::bail!("Slack workspace 주소 형식이 아닙니다");
+    }
+    Ok(format!("{slug}.slack.com"))
+}
+
+fn slack_html_string_property(html: &str, key: &str) -> Option<String> {
+    let marker = format!("&quot;{key}&quot;:&quot;");
+    let value = html.split_once(&marker)?.1.split_once("&quot;")?.0;
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn is_valid_slack_team_id(team_id: &str) -> bool {
+    (9..=32).contains(&team_id.len())
+        && team_id.starts_with('T')
+        && team_id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn validate_slack_authorized_team(
+    is_slack: bool,
+    expected_team_id: Option<&str>,
+    token: &auth::OAuthToken,
+) -> Result<(), String> {
+    if !is_slack {
+        return Ok(());
+    }
+    let Some(actual_team_id) = token.provider_workspace_id.as_deref() else {
+        return Err("Slack token 응답에 workspace ID(team.id)가 없습니다".to_owned());
+    };
+    if !is_valid_slack_team_id(actual_team_id) {
+        return Err("Slack token 응답의 workspace ID 형식이 잘못됐습니다".to_owned());
+    }
+    if let Some(expected) = expected_team_id
+        && expected != actual_team_id
+    {
+        return Err(format!(
+            "Slack workspace 불일치: 지정한 {expected}가 아닌 {actual_team_id}으로 승인됐습니다"
+        ));
+    }
+    Ok(())
+}
+
+/// 취소 직후 worker가 listener를 drop하는 수십 ms 동안만 고정 포트 bind를 재시도한다.
+/// 다른 프로세스가 점유한 경우에는 1초 안에 원래 bind 오류를 그대로 반환한다.
+fn bind_fixed_slack_callback(
+    cancelled: &AtomicBool,
+) -> anyhow::Result<auth::LocalhostCallbackServer> {
+    let mut last_error = None;
+    for attempt in 0..20 {
+        if cancelled.load(Ordering::Acquire) {
+            anyhow::bail!("authorization 취소됨");
+        }
+        match auth::LocalhostCallbackServer::bind_fixed_localhost() {
+            Ok(callback) => return Ok(callback),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt < 19 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    Err(last_error.expect("고정 callback bind는 성공 또는 오류를 반환"))
+}
+
+fn slack_callback_redirect_uri() -> String {
+    format!("http://localhost:{}/callback", auth::FIXED_CALLBACK_PORT)
 }
 
 /// 동의 다이얼로그에 표시할 인증 서버 authority — "https://as.example" 형태.
@@ -2860,6 +3650,29 @@ mod tests {
         }
         fn has_secret(&self, id: &str) -> anyhow::Result<bool> {
             Ok(self.value(id).is_some())
+        }
+    }
+
+    struct NoopOAuthStore;
+
+    impl OAuthCredentialStore for NoopOAuthStore {
+        fn store_oauth_token(
+            &self,
+            _token: &auth::OAuthToken,
+        ) -> anyhow::Result<StoredOAuthCredential> {
+            anyhow::bail!("unexpected OAuth token store")
+        }
+
+        fn update_oauth_token(&self, _id: &str, _token: &auth::OAuthToken) -> anyhow::Result<()> {
+            anyhow::bail!("unexpected OAuth token update")
+        }
+
+        fn set_dcr_secret(&self, _id: &str, _secret: Option<&SecretString>) -> anyhow::Result<()> {
+            anyhow::bail!("unexpected OAuth secret store")
+        }
+
+        fn delete_oauth_token(&self, _id: &str) -> anyhow::Result<()> {
+            anyhow::bail!("unexpected OAuth token delete")
         }
     }
 
@@ -3131,6 +3944,7 @@ mod tests {
                 access_token: SecretString::new(format!("{prefix}{n}")),
                 refresh_token: None,
                 expires_in_secs: Some(3600),
+                provider_workspace_id: None,
             })
         }
     }
@@ -3143,6 +3957,7 @@ mod tests {
             registration_endpoint: Some(format!("{base}/register")),
             grant_types_supported: None,
             scopes_supported: None,
+            token_endpoint_auth_methods_supported: None,
             code_challenge_methods_supported: None,
         }
     }
@@ -3352,6 +4167,287 @@ mod tests {
             url: url.map(str::to_owned),
             enabled: true,
         }
+    }
+
+    #[test]
+    fn slack_공식_url은_끝_slash와_이름에_무관하게_식별한다() {
+        let mut row = http_row("slack-existing", Some("https://mcp.slack.com/mcp/"));
+        row.name = "팀 메시지".to_owned();
+        assert_eq!(
+            find_slack_server(&[row]).map(|row| row.id.as_str()),
+            Some("slack-existing")
+        );
+
+        let stdio = McpServerRow {
+            id: "wrong-kind".to_owned(),
+            name: "Slack".to_owned(),
+            kind: "stdio".to_owned(),
+            command: Some("slack".to_owned()),
+            args: Vec::new(),
+            env_plain: Vec::new(),
+            env_secrets: Vec::new(),
+            inherit_env: true,
+            url: Some(SLACK_MCP_URL.to_owned()),
+            enabled: true,
+        };
+        assert!(find_slack_server(&[stdio]).is_none());
+    }
+
+    #[test]
+    fn slack_featured_등록은_공식_http_row를_한번만_만든다() {
+        let path = temp_db_path();
+        let db = Db::open(&path).unwrap();
+
+        let first = ensure_slack_server(&db, &[]).unwrap();
+        let stored = db.list_mcp_servers().unwrap();
+        let second = ensure_slack_server(&db, &stored).unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.kind, "http");
+        assert_eq!(first.url.as_deref(), Some(SLACK_MCP_URL));
+        assert_eq!(db.list_mcp_servers().unwrap().len(), 1);
+        assert_eq!(test_ui().slack_status(&db), SlackMcpStatus::Ready);
+    }
+
+    #[test]
+    fn slack_oauth는_origin_resource와_client_secret_post를_사용한다() {
+        let mut metadata = as_metadata("https://mcp.slack.com");
+        metadata.authorization_endpoint = "https://slack.com/oauth/v2_user/authorize".to_owned();
+        metadata.token_endpoint = "https://slack.com/api/oauth.v2.user.access".to_owned();
+        metadata.token_endpoint_auth_methods_supported =
+            Some(vec!["client_secret_post".to_owned()]);
+        metadata.code_challenge_methods_supported = Some(vec!["S256".to_owned()]);
+        let secret = SecretString::new("slack-secret".to_owned());
+        let config = provider_config(
+            &metadata,
+            "slack-client",
+            Some(&secret),
+            &["search:read.public".to_owned()],
+            Some("T0ACREG25T6"),
+        );
+
+        assert_eq!(
+            oauth_resource_for_server(SLACK_MCP_URL),
+            "https://mcp.slack.com"
+        );
+        assert_eq!(
+            oauth_resource_for_server("https://other.example/mcp"),
+            "https://other.example/mcp"
+        );
+        assert!(config.client_secret_post);
+        assert_eq!(
+            config.client_secret.as_ref().map(SecretString::expose),
+            Some("slack-secret")
+        );
+        assert_eq!(
+            slack_callback_redirect_uri(),
+            format!("http://localhost:{}/callback", auth::FIXED_CALLBACK_PORT)
+        );
+        let pending = auth::begin_with_resource(
+            &config,
+            &slack_callback_redirect_uri(),
+            Some("https://mcp.slack.com"),
+        )
+        .unwrap();
+        assert!(
+            pending
+                .authorize_url
+                .starts_with("https://slack.com/oauth/v2_user/authorize?")
+        );
+        assert_eq!(
+            query_param(&pending.authorize_url, "redirect_uri").as_deref(),
+            Some("http%3A%2F%2Flocalhost%3A47456%2Fcallback")
+        );
+        assert_eq!(
+            query_param(&pending.authorize_url, "resource").as_deref(),
+            Some("https%3A%2F%2Fmcp.slack.com")
+        );
+        assert_eq!(
+            query_param(&pending.authorize_url, "code_challenge_method").as_deref(),
+            Some("S256")
+        );
+        assert_eq!(
+            query_param(&pending.authorize_url, "team").as_deref(),
+            Some("T0ACREG25T6")
+        );
+        assert!(query_param(&pending.authorize_url, "state").is_some());
+
+        let chooser_config = provider_config(
+            &metadata,
+            "slack-client",
+            Some(&secret),
+            &["search:read.public".to_owned()],
+            None,
+        );
+        let chooser = auth::begin_with_resource(
+            &chooser_config,
+            &slack_callback_redirect_uri(),
+            Some("https://mcp.slack.com"),
+        )
+        .unwrap();
+        assert!(query_param(&chooser.authorize_url, "team").is_none());
+    }
+
+    #[test]
+    fn slack_workspace_주소는_team_id로_안전하게_해석한다() {
+        assert_eq!(
+            normalize_slack_workspace_domain("https://Vector9.slack.com/").unwrap(),
+            "vector9.slack.com"
+        );
+        assert_eq!(
+            normalize_slack_workspace_domain("vector9").unwrap(),
+            "vector9.slack.com"
+        );
+        assert!(normalize_slack_workspace_domain("http://vector9.slack.com").is_err());
+        assert!(normalize_slack_workspace_domain("evil.example").is_err());
+        assert!(normalize_slack_workspace_domain("vector9.slack.com/path").is_err());
+
+        let html = r#"<main data-props="{&quot;teamDomain&quot;:&quot;vector9&quot;,&quot;encodedTeamId&quot;:&quot;T0ACREG25T6&quot;}"></main>"#;
+        assert_eq!(
+            parse_slack_workspace_html("vector9.slack.com", html).unwrap(),
+            SlackWorkspaceTarget {
+                domain: "vector9.slack.com".to_owned(),
+                team_id: "T0ACREG25T6".to_owned(),
+            }
+        );
+        assert!(parse_slack_workspace_html("other.slack.com", html).is_err());
+    }
+
+    #[test]
+    fn slack_token의_team_id를_검증한다() {
+        let token = auth::OAuthToken {
+            access_token: SecretString::new("secret".to_owned()),
+            refresh_token: None,
+            expires_in_secs: None,
+            provider_workspace_id: Some("T0ACREG25T6".to_owned()),
+        };
+        assert!(validate_slack_authorized_team(true, None, &token).is_ok());
+        assert!(validate_slack_authorized_team(true, Some("T0ACREG25T6"), &token).is_ok());
+        assert!(validate_slack_authorized_team(true, Some("T111111111"), &token).is_err());
+    }
+
+    #[test]
+    fn slack_mcp_비활성화_오류에서_검증된_설정_url만_추출한다() {
+        let error = r#"HTTP 400: {"message":"App is not enabled for Slack MCP server access. Please enable it here: https:\/\/api.slack.com\/apps\/A0BJCDKHCJE\/app-assistant"}"#;
+        assert_eq!(
+            slack_mcp_enable_url(error).as_deref(),
+            Some("https://api.slack.com/apps/A0BJCDKHCJE/app-assistant")
+        );
+        assert!(slack_mcp_enable_url(
+            "App is not enabled for Slack MCP server access: https://evil.example/apps/A0BJCDKHCJE/app-assistant"
+        )
+        .is_none());
+        assert!(slack_mcp_enable_url(
+            "App is not enabled for Slack MCP server access: https://api.slack.com/apps/not-valid/app-assistant"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn kittest_slack_연결버튼은_공식_server를_등록하고_신뢰확인을_연다() {
+        use egui_kittest::kittest::Queryable;
+
+        let db = Db::open(&temp_db_path()).unwrap();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let resolver = MemMcpEnvResolver(std::collections::HashMap::new());
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, (connectors, db): &mut (ConnectorsUi, Db)| {
+                let ctx = ui.ctx().clone();
+                connectors.contents(ui, &ctx, db, "ws-1", &resolver, &catalog);
+            },
+            (test_ui(), db),
+        );
+        harness.run();
+        harness.get_by_label("Connect").click();
+        harness.step();
+
+        assert!(
+            harness
+                .output()
+                .platform_output
+                .commands
+                .iter()
+                .any(|command| matches!(
+                    command,
+                    egui::OutputCommand::OpenUrl(url) if url.url == SLACK_APP_MANAGEMENT_URL
+                ))
+        );
+
+        let (connectors, db) = harness.state();
+        let servers = db.list_mcp_servers().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].url.as_deref(), Some(SLACK_MCP_URL));
+        assert!(connectors.trust_prompt.is_some());
+        assert!(connectors.server_list_changed);
+    }
+
+    #[test]
+    fn slack_oauth_발견후_중복동의없이_수동_client입력으로_간다() {
+        let mut ui = test_ui();
+        let mut db = Db::open(&temp_db_path()).unwrap();
+        let server = http_row("slack", Some(SLACK_MCP_URL));
+        db.insert_mcp_server(&server).unwrap();
+        ui.oauth_gen += 1;
+        ui.oauth_flow = Some(OAuthFlow {
+            server_id: server.id,
+            server_name: SLACK_MCP_NAME.to_owned(),
+            server_url: SLACK_MCP_URL.to_owned(),
+            generation: ui.oauth_gen,
+            force_slack_workspace_choice: false,
+            stage: OAuthStage::Discovering,
+        });
+        ui.oauth_tx
+            .send((
+                ui.oauth_gen,
+                OAuthMsg::Discovered(Box::new(Ok(DiscoveredAuth {
+                    metadata: as_metadata("https://slack.com"),
+                    scopes: vec!["search:read.public".to_owned()],
+                }))),
+            ))
+            .unwrap();
+
+        assert!(!ui.drain_oauth(&egui::Context::default(), &mut db, &NoopOAuthStore));
+        assert!(matches!(
+            ui.oauth_flow.as_ref().map(|flow| &flow.stage),
+            Some(OAuthStage::ManualClient {
+                reason,
+                client_id,
+                client_secret,
+                ..
+            }) if reason == SLACK_MANUAL_CLIENT_REASON
+                && client_id.is_empty()
+                && client_secret.is_empty()
+        ));
+    }
+
+    #[test]
+    fn 일반_oauth_발견후에는_authority_동의를_유지한다() {
+        let mut ui = test_ui();
+        let mut db = Db::open(&temp_db_path()).unwrap();
+        ui.oauth_gen += 1;
+        ui.oauth_flow = Some(OAuthFlow {
+            server_id: "generic".to_owned(),
+            server_name: "Generic".to_owned(),
+            server_url: "https://mcp.example.com/mcp".to_owned(),
+            generation: ui.oauth_gen,
+            force_slack_workspace_choice: false,
+            stage: OAuthStage::Discovering,
+        });
+        ui.oauth_tx
+            .send((
+                ui.oauth_gen,
+                OAuthMsg::Discovered(Box::new(Ok(DiscoveredAuth {
+                    metadata: as_metadata("https://auth.example.com"),
+                    scopes: Vec::new(),
+                }))),
+            ))
+            .unwrap();
+
+        assert!(!ui.drain_oauth(&egui::Context::default(), &mut db, &NoopOAuthStore));
+        assert!(matches!(
+            ui.oauth_flow.as_ref().map(|flow| &flow.stage),
+            Some(OAuthStage::Consent(_))
+        ));
     }
 
     #[test]
@@ -3632,6 +4728,8 @@ mod tests {
                 client_id: "cid-x".to_owned(),
                 client_secret: None,
                 manual: false,
+                slack_team_id: None,
+                slack_workspace_domain: None,
             },
             &authorize,
         );
@@ -3763,6 +4861,7 @@ mod tests {
             ClientPlan::Manual {
                 client_id: "cid-manual".to_owned(),
                 client_secret: None,
+                slack_workspace_address: None,
             },
             &authorize,
         );
@@ -3789,14 +4888,65 @@ mod tests {
             issuer: "https://as.example".to_owned(),
             authorization_endpoint: "https://as.example/authorize".to_owned(),
             token_endpoint: token_url.to_owned(),
+            oauth_resource: Some(server_url.to_owned()),
             client_id: "cid-1".to_owned(),
+            client_secret_post: false,
             manual_client: false,
+            slack_team_id: None,
+            slack_workspace_domain: None,
             scopes: vec!["mcp.read".to_owned()],
             expires_at_secs: None,
         };
         db.set_credential_oauth_json(&credential_id, &serde_json::to_string(&connection).unwrap())
             .unwrap();
         (db, credential_id)
+    }
+
+    #[test]
+    fn slack_재선택은_저장_client를_유지하고_team_hint만_이번_승인에서_비운다() {
+        let (db, credential_id) = seeded_binding_db(
+            "slack",
+            SLACK_MCP_URL,
+            "https://slack.com/api/oauth.v2.user.access",
+        );
+        let (_, mut connection) = oauth_binding_for_server(&db, "slack").unwrap();
+        connection.slack_team_id = Some("T0ACREG25T6".to_owned());
+        connection.slack_workspace_domain = Some("vector9.slack.com".to_owned());
+        db.set_credential_oauth_json(&credential_id, &serde_json::to_string(&connection).unwrap())
+            .unwrap();
+
+        let discovered = DiscoveredAuth {
+            metadata: as_metadata("https://as.example"),
+            scopes: Vec::new(),
+        };
+        let mut ui = test_ui();
+        ui.oauth_flow = Some(OAuthFlow {
+            server_id: "slack".to_owned(),
+            server_name: "Slack".to_owned(),
+            server_url: SLACK_MCP_URL.to_owned(),
+            generation: 1,
+            force_slack_workspace_choice: true,
+            stage: OAuthStage::Discovering,
+        });
+        assert!(matches!(
+            ui.stored_client_plan(&db, &discovered),
+            Some(ClientPlan::Stored {
+                client_id,
+                slack_team_id: None,
+                slack_workspace_domain: None,
+                ..
+            }) if client_id == "cid-1"
+        ));
+
+        ui.oauth_flow.as_mut().unwrap().force_slack_workspace_choice = false;
+        assert!(matches!(
+            ui.stored_client_plan(&db, &discovered),
+            Some(ClientPlan::Stored {
+                slack_team_id: Some(team_id),
+                slack_workspace_domain: Some(domain),
+                ..
+            }) if team_id == "T0ACREG25T6" && domain == "vector9.slack.com"
+        ));
     }
 
     /// 완료 기준: 토큰 URL 바인딩 — 동의 시점 URL과 다르면 Bearer 부착 거부.
@@ -3811,7 +4961,7 @@ mod tests {
             HttpAuth::Bound(binding) => {
                 assert_eq!(binding.credential_id, credential_id);
                 assert_eq!(binding.token_url, "https://as.example/token");
-                assert_eq!(binding.server_url, "https://a.example/mcp");
+                assert_eq!(binding.oauth_resource, "https://a.example/mcp");
                 assert_eq!(binding.expires_at_secs, None);
             }
             _ => panic!("Bound가 아님"),
@@ -3877,7 +5027,8 @@ mod tests {
                 credential_id: "cred-h5".to_owned(),
                 token_url: server.url("/token"),
                 client_id: "cid-1".to_owned(),
-                server_url: mcp_url.clone(),
+                client_secret_post: false,
+                oauth_resource: mcp_url.clone(),
                 // 만료 메타 없음 + store에 access 있음 → 선제 아님, 401 반응 경로
                 expires_at_secs: None,
             }),
@@ -3934,7 +5085,8 @@ mod tests {
                 credential_id: "cred-h5".to_owned(),
                 token_url: server.url("/token"),
                 client_id: "cid-1".to_owned(),
-                server_url: mcp_url.clone(),
+                client_secret_post: false,
+                oauth_resource: mcp_url.clone(),
                 // 과거 만료 시각 → run_http가 needs_refresh=true로 판정(선제 refresh)
                 expires_at_secs: Some(1),
             }),
@@ -4011,6 +5163,34 @@ mod tests {
                 other.map(|_| "다른 상태").unwrap_or("없음")
             ),
         }
+    }
+
+    #[test]
+    fn drain_results는_slack_mcp_비활성화_설정_link를_보존한다() {
+        let mut db = Db::open(&temp_db_path()).unwrap();
+        let mut ui = test_ui();
+        db.insert_mcp_server(&http_row("slack", Some(SLACK_MCP_URL)))
+            .unwrap();
+        ui.result_tx
+            .send(DiscoverOutcome {
+                server_id: "slack".to_owned(),
+                request_url: Some(SLACK_MCP_URL.to_owned()),
+                result: Err(ExecFailure {
+                    message: r#"App is not enabled for Slack MCP server access: https:\/\/api.slack.com\/apps\/A0BJCDKHCJE\/app-assistant"#.to_owned(),
+                    auth: None,
+                }),
+                refresh: None,
+            })
+            .unwrap();
+        ui.drain_results(&mut db);
+        assert_eq!(
+            ui.slack_mcp_enable_url.as_deref(),
+            Some("https://api.slack.com/apps/A0BJCDKHCJE/app-assistant")
+        );
+        assert!(matches!(
+            ui.status.get("slack"),
+            Some(ConnStatus::Failed(_))
+        ));
     }
 
     /// url 편집 저장 race (H3 리뷰 P2): 구 url로 시작된 discover 결과는 폐기된다.
@@ -4113,8 +5293,12 @@ mod tests {
                 issuer: "https://as.example".to_owned(),
                 authorization_endpoint: "https://as.example/authorize".to_owned(),
                 token_endpoint: "https://as.example/token".to_owned(),
+                oauth_resource: Some("https://a.example/mcp".to_owned()),
                 client_id: "cid-1".to_owned(),
+                client_secret_post: false,
                 manual_client: false,
+                slack_team_id: None,
+                slack_workspace_domain: None,
                 scopes: vec!["mcp.read".to_owned()],
                 expires_at_secs: Some(1_900_000_000),
             },
@@ -4122,6 +5306,7 @@ mod tests {
                 access_token: SecretString::new("at-1".to_owned()),
                 refresh_token: Some(SecretString::new("rt-1".to_owned())),
                 expires_in_secs: Some(3600),
+                provider_workspace_id: None,
             },
             client_secret: Some(SecretString::new("cs-1".to_owned())),
             tools: vec![McpTool {
@@ -4137,12 +5322,13 @@ mod tests {
             server_name: "remote".to_owned(),
             server_url: "https://a.example/mcp".to_owned(),
             generation: ui.oauth_gen,
+            force_slack_workspace_choice: false,
             stage: OAuthStage::Authorizing,
         });
         ui.oauth_tx
             .send((ui.oauth_gen, OAuthMsg::Finished(Box::new(Ok(success)))))
             .unwrap();
-        assert!(ui.drain_oauth(&mut db, &oauth_store));
+        assert!(ui.drain_oauth(&egui::Context::default(), &mut db, &oauth_store));
         assert!(ui.oauth_flow.is_none());
         assert!(matches!(
             ui.status.get("srv-h"),
@@ -4179,6 +5365,7 @@ mod tests {
                 access_token: SecretString::new("at-2".to_owned()),
                 refresh_token: None,
                 expires_in_secs: None,
+                provider_workspace_id: None,
             },
             client_secret: None,
             tools: Vec::new(),
@@ -4189,17 +5376,120 @@ mod tests {
             server_name: "remote".to_owned(),
             server_url: "https://a.example/mcp".to_owned(),
             generation: ui.oauth_gen,
+            force_slack_workspace_choice: false,
             stage: OAuthStage::Authorizing,
         });
         ui.oauth_tx
             .send((ui.oauth_gen, OAuthMsg::Finished(Box::new(Ok(success2)))))
             .unwrap();
-        assert!(ui.drain_oauth(&mut db, &oauth_store));
+        assert!(ui.drain_oauth(&egui::Context::default(), &mut db, &oauth_store));
         assert_eq!(db.list_credentials().unwrap().len(), 1, "credential 재사용");
         assert_eq!(store.value(&credential_id).as_deref(), Some("at-2"));
         assert_eq!(
             store.value(&auth::dcr_secret_entry_id(&credential_id)),
             None
+        );
+    }
+
+    #[test]
+    fn drain_oauth는_브라우저_url을_ui_platform_command로_보낸다() {
+        let mut ui = test_ui();
+        let mut db = Db::open(&temp_db_path()).unwrap();
+        ui.oauth_gen += 1;
+        ui.oauth_flow = Some(OAuthFlow {
+            server_id: "slack".to_owned(),
+            server_name: "Slack".to_owned(),
+            server_url: SLACK_MCP_URL.to_owned(),
+            generation: ui.oauth_gen,
+            force_slack_workspace_choice: false,
+            stage: OAuthStage::Authorizing,
+        });
+        let authorize_url = "https://slack.com/oauth/v2_user/authorize?client_id=test";
+        ui.oauth_tx
+            .send((
+                ui.oauth_gen,
+                OAuthMsg::OpenBrowser(authorize_url.to_owned()),
+            ))
+            .unwrap();
+
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(egui::RawInput::default(), |frame_ui| {
+            assert!(!ui.drain_oauth(frame_ui.ctx(), &mut db, &NoopOAuthStore));
+        });
+
+        assert!(
+            output
+                .platform_output
+                .commands
+                .iter()
+                .any(|command| matches!(
+                    command,
+                    egui::OutputCommand::OpenUrl(url) if url.url == authorize_url
+                ))
+        );
+        assert!(matches!(
+            ui.oauth_flow.as_ref().map(|flow| &flow.stage),
+            Some(OAuthStage::Authorizing)
+        ));
+    }
+
+    #[test]
+    fn drain_oauth_실패는_모달을_닫지_않고_오류단계로_남긴다() {
+        let mut ui = test_ui();
+        let mut db = Db::open(&temp_db_path()).unwrap();
+        ui.oauth_gen += 1;
+        ui.oauth_flow = Some(OAuthFlow {
+            server_id: "slack".to_owned(),
+            server_name: "Slack".to_owned(),
+            server_url: SLACK_MCP_URL.to_owned(),
+            generation: ui.oauth_gen,
+            force_slack_workspace_choice: false,
+            stage: OAuthStage::Authorizing,
+        });
+        ui.oauth_tx
+            .send((
+                ui.oauth_gen,
+                OAuthMsg::Finished(Box::new(Err("callback 포트 사용 중".to_owned()))),
+            ))
+            .unwrap();
+
+        assert!(!ui.drain_oauth(&egui::Context::default(), &mut db, &NoopOAuthStore,));
+        assert!(matches!(
+            ui.oauth_flow.as_ref().map(|flow| &flow.stage),
+            Some(OAuthStage::Failed(message)) if message == "callback 포트 사용 중"
+        ));
+        assert!(matches!(
+            ui.status.get("slack"),
+            Some(ConnStatus::NeedsAuth { .. })
+        ));
+    }
+
+    #[test]
+    fn drain_oauth는_slack_mcp_비활성화_설정_link를_보존한다() {
+        let mut ui = test_ui();
+        let mut db = Db::open(&temp_db_path()).unwrap();
+        ui.oauth_gen += 1;
+        ui.oauth_flow = Some(OAuthFlow {
+            server_id: "slack".to_owned(),
+            server_name: "Slack".to_owned(),
+            server_url: SLACK_MCP_URL.to_owned(),
+            generation: ui.oauth_gen,
+            force_slack_workspace_choice: false,
+            stage: OAuthStage::Authorizing,
+        });
+        ui.oauth_tx
+            .send((
+                ui.oauth_gen,
+                OAuthMsg::Finished(Box::new(Err(
+                    r#"App is not enabled for Slack MCP server access: https:\/\/api.slack.com\/apps\/A0BJCDKHCJE\/app-assistant"#.to_owned(),
+                ))),
+            ))
+            .unwrap();
+
+        assert!(!ui.drain_oauth(&egui::Context::default(), &mut db, &NoopOAuthStore,));
+        assert_eq!(
+            ui.slack_mcp_enable_url.as_deref(),
+            Some("https://api.slack.com/apps/A0BJCDKHCJE/app-assistant")
         );
     }
 }

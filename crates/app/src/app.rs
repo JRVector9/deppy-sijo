@@ -1220,7 +1220,7 @@ pub struct App {
     /// 하단 상태바 「MCP N」용 활성 MCP 서버 수 캐시 — 매 프레임 DB 조회 금지
     /// (30s TTL — 커넥터 변경은 다음 갱신에 반영되면 충분한 준정적 값).
     mcp_count_cache: Option<(std::time::Instant, usize)>,
-    /// AI 서비스 상태 피드 수신(status.claude.com/openai — 5분 폴링 워커) + 최신
+    /// 홈 업데이트 피드 수신(Claude/OpenAI 상태 5분, 공지/HF/Grok 60분) + 최신
     /// 스냅샷. provider별 조회 실패(None)면 마지막 성공값을 유지한다.
     status_feed_rx: std::sync::mpsc::Receiver<crate::status_feed::StatusFeedSnapshot>,
     /// 수동 갱신(홈 「AI 공지」 ⟳ 버튼) — 워커를 즉시 깨워 상태+공지 재조회.
@@ -4443,6 +4443,7 @@ impl App {
         let pending: Vec<crate::notice_translate::TranslationCacheKey> = [
             ("Claude", &self.status_feed.claude),
             ("OpenAI", &self.status_feed.openai),
+            ("Grok", &self.status_feed.grok),
         ]
         .into_iter()
         .filter_map(|(provider, status)| status.as_ref().map(|status| (provider, status)))
@@ -5949,6 +5950,15 @@ impl eframe::App for App {
             if snapshot.openai.is_some() {
                 self.status_feed.openai = snapshot.openai;
             }
+            if snapshot.github.is_some() {
+                self.status_feed.github = snapshot.github;
+            }
+            if snapshot.hugging_face.is_some() {
+                self.status_feed.hugging_face = snapshot.hugging_face;
+            }
+            if snapshot.grok.is_some() {
+                self.status_feed.grok = snapshot.grok;
+            }
         }
         self.pump_notice_translations(ui.ctx());
         self.pump_ollama_detect(ui.ctx());
@@ -6504,7 +6514,8 @@ impl eframe::App for App {
                 secret_store: &self.secret_store,
                 redaction: &self.redaction,
             };
-            self.connectors_ui.drain_oauth(&mut self.db, &oauth_store)
+            self.connectors_ui
+                .drain_oauth(ui.ctx(), &mut self.db, &oauth_store)
         };
         if credential_added {
             self.credentials_ui.invalidate_cache();
@@ -6515,6 +6526,11 @@ impl eframe::App for App {
         let central_view = self.agent_terminal_ui.view();
         let home_visible = central_view == ui::agent_terminal::AgentTerminalView::Home;
         let inbox_visible = central_view == ui::agent_terminal::AgentTerminalView::Inbox;
+        let slack_status = if home_visible {
+            self.connectors_ui.slack_status(&self.db)
+        } else {
+            ui::connectors::SlackMcpStatus::NotConfigured
+        };
         // 홈/작업함이 중앙을 차지해도 활성 워크스페이스 이벤트는 계속 소화한다.
         if home_visible || inbox_visible {
             self.active
@@ -6549,16 +6565,12 @@ impl eframe::App for App {
                 if home_visible {
                     home_action = self.agent_terminal_ui.home(
                         ui,
-                        &activity_rows,
-                        ui::agent_terminal::HomeMetrics {
-                            waiting: waiting_count,
-                            unread: self.notifications_ui.unread(),
-                        },
                         &self.status_feed,
                         ui::agent_terminal::NoticeTranslations {
                             cache: &self.notice_translation_cache,
                             locale: &self.config.i18n.locale,
                         },
+                        slack_status,
                         &text,
                     );
                 } else if inbox_visible {
@@ -6582,15 +6594,9 @@ impl eframe::App for App {
         // take/put-back 마무리 — 위 take에서 꺼낸 rows를 타임스탬프 그대로 되돌린다.
         self.activity_rows_cache = Some((activity_rows_stamp, activity_rows));
         match home_action {
-            Some(ui::agent_terminal::HomeAction::Inbox) => {
-                egui::Popup::toggle_id(ui.ctx(), Self::inbox_popup_id());
-            }
-            Some(ui::agent_terminal::HomeAction::Activity) => {
-                self.settings_category = ui::settings::Category::Activity;
+            Some(ui::agent_terminal::HomeAction::Connectors) => {
+                self.settings_category = ui::settings::Category::Connectors;
                 self.settings_open = true;
-            }
-            Some(ui::agent_terminal::HomeAction::Agents) => {
-                self.agent_sessions_ui.open();
             }
             Some(ui::agent_terminal::HomeAction::RefreshNotices) => {
                 // 워커를 즉시 깨워 상태+공지 강제 재조회 — 결과는 기존 스냅샷
@@ -7528,6 +7534,9 @@ impl eframe::App for App {
                 }
             },
         );
+        if self.connectors_ui.take_server_list_changed() {
+            self.mcp_count_cache = None;
+        }
         // T1: 설정 창이 닫히면 세션 폴더 배너를 버린다 — 다음 우클릭 진입에서 재감지.
         if !self.settings_open {
             self.env_session_banner = None;
@@ -8920,6 +8929,7 @@ mod tests {
             access_token: secret::SecretString::new("access-token-secret".to_owned()),
             refresh_token: Some(secret::SecretString::new("refresh-token-secret".to_owned())),
             expires_in_secs: Some(3600),
+            provider_workspace_id: None,
         };
 
         let stored =

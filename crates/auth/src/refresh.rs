@@ -12,8 +12,8 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::Context;
 use oauth2::basic::BasicClient;
 use oauth2::{
-    ClientId, ClientSecret, HttpClientError, RefreshToken, RequestTokenError, TokenResponse,
-    TokenUrl,
+    AuthType, ClientId, ClientSecret, HttpClientError, RefreshToken, RequestTokenError,
+    TokenResponse, TokenUrl,
 };
 use secret::{SecretStore, SecretString};
 
@@ -77,6 +77,8 @@ pub struct RefreshParams {
     pub client_id: String,
     /// DCR이 client_secret을 발급했다면 keyring `{id}.dcr`에서 꺼내 넣는다.
     pub client_secret: Option<SecretString>,
+    /// AS 메타데이터가 `client_secret_post`를 요구하면 true.
+    pub client_secret_post: bool,
     /// RFC 8707 resource — MCP 서버 canonical URL.
     pub resource: Option<String>,
 }
@@ -164,6 +166,11 @@ fn do_refresh(
         Some(secret) => client.set_client_secret(ClientSecret::new(secret.expose().to_owned())),
         None => client,
     };
+    let client = if params.client_secret_post {
+        client.set_auth_type(AuthType::RequestBody)
+    } else {
+        client
+    };
 
     let grant = RefreshToken::new(refresh_token.expose().to_owned());
     let mut request = client.exchange_refresh_token(&grant);
@@ -187,6 +194,7 @@ fn do_refresh(
                         .unwrap_or(refresh_token),
                 ),
                 expires_in_secs: response.expires_in().map(|d| d.as_secs()),
+                provider_workspace_id: None,
             };
             store_token(store, credential_id, &token).context("갱신 토큰 저장 실패")?;
             Ok(RefreshOutcome::Refreshed(token))
@@ -286,6 +294,7 @@ mod tests {
             token_url,
             client_id: "client-1".to_owned(),
             client_secret: None,
+            client_secret_post: false,
             resource: Some("https://mcp.example/api".to_owned()),
         }
     }
@@ -316,14 +325,11 @@ mod tests {
         });
         let store = seeded_store();
         let coordinator = RefreshCoordinator::new();
-        let outcome = refresh_access_token(
-            &coordinator,
-            TIMEOUT,
-            &store,
-            "cred",
-            &params(server.url("/token")),
-        )
-        .unwrap();
+        let mut request_params = params(server.url("/token"));
+        request_params.client_secret = Some(SecretString::new("refresh-secret".to_owned()));
+        request_params.client_secret_post = true;
+        let outcome =
+            refresh_access_token(&coordinator, TIMEOUT, &store, "cred", &request_params).unwrap();
         let RefreshOutcome::Refreshed(token) = outcome else {
             panic!("Refreshed가 아님: {outcome:?}");
         };
@@ -342,6 +348,7 @@ mod tests {
         let body = &requests[0].body;
         assert!(body.contains("grant_type=refresh_token"), "{body}");
         assert!(body.contains("refresh_token=old-rt"), "{body}");
+        assert!(body.contains("client_secret=refresh-secret"), "{body}");
         // RFC 8707 resource 파라미터
         assert!(
             body.contains("resource=https%3A%2F%2Fmcp.example%2Fapi"),

@@ -1,5 +1,5 @@
-//! AI 서비스 상태 피드 — status.claude.com / status.openai.com (Statuspage v2 JSON).
-//! 하단 상태바의 서비스 점등과 홈 「AI 공지」 카드(최신 인시던트 3건씩)가 쓴다
+//! 홈 업데이트 피드 — Claude/OpenAI/GitHub Statuspage, Hugging Face trending
+//! models, Grok 공식 상태 RSS. 하단 상태바의 서비스 점등과 홈 업데이트 목록이 쓴다
 //! (2026-07-18 사용자). 백그라운드 워커 1개가 폴링해 mpsc로 스냅샷을 보낸다 —
 //! UI 스레드 네트워크 금지 관례. 주기는 이원화: **상태 점등 5분**(터미널 작업용
 //! 신선도), **공지 60분**(사용자 지정) + 홈의 수동 갱신 버튼(refresh 채널).
@@ -10,6 +10,10 @@ use std::time::{Duration, Instant};
 
 pub const CLAUDE_STATUS_URL: &str = "https://status.claude.com";
 pub const OPENAI_STATUS_URL: &str = "https://status.openai.com";
+pub const GITHUB_STATUS_URL: &str = "https://www.githubstatus.com";
+const HUGGING_FACE_MODELS_API: &str =
+    "https://huggingface.co/api/models?sort=trendingScore&direction=-1&limit=3";
+const GROK_STATUS_RSS: &str = "https://status.x.ai/feed.xml";
 /// 상태(점등) 폴링 주기 — 장애 감지용이라 짧게 유지.
 const STATUS_INTERVAL: Duration = Duration::from_secs(300);
 /// 공지(인시던트 목록) 갱신 주기 (2026-07-18 사용자: 60분).
@@ -64,6 +68,9 @@ pub struct ProviderStatus {
 pub struct StatusFeedSnapshot {
     pub claude: Option<ProviderStatus>,
     pub openai: Option<ProviderStatus>,
+    pub github: Option<ProviderStatus>,
+    pub hugging_face: Option<ProviderStatus>,
+    pub grok: Option<ProviderStatus>,
 }
 
 /// 백그라운드 폴링 워커를 띄우고 (스냅샷 수신, 수동 갱신 송신) 채널 쌍을 돌려준다.
@@ -81,6 +88,8 @@ pub fn spawn(egui_ctx: egui::Context) -> (Receiver<StatusFeedSnapshot>, Sender<(
             let mut incidents_at: Option<Instant> = None;
             let mut claude_incidents: Vec<IncidentNotice> = Vec::new();
             let mut openai_incidents: Vec<IncidentNotice> = Vec::new();
+            let mut hugging_face_updates: Option<Vec<IncidentNotice>> = None;
+            let mut grok_updates: Option<Vec<IncidentNotice>> = None;
             loop {
                 let incidents_due =
                     incidents_at.is_none_or(|at| at.elapsed() >= INCIDENTS_INTERVAL);
@@ -94,6 +103,16 @@ pub fn spawn(egui_ctx: egui::Context) -> (Receiver<StatusFeedSnapshot>, Sender<(
                         .map_err(|e| tracing::debug!("OpenAI 공지 조회 실패: {e:#}"))
                     {
                         openai_incidents = list;
+                    }
+                    if let Ok(list) = fetch_hugging_face_models(&agent)
+                        .map_err(|e| tracing::debug!("Hugging Face 모델 조회 실패: {e:#}"))
+                    {
+                        hugging_face_updates = Some(list);
+                    }
+                    if let Ok(list) = fetch_grok_status(&agent)
+                        .map_err(|e| tracing::debug!("Grok 상태 RSS 조회 실패: {e:#}"))
+                    {
+                        grok_updates = Some(list);
                     }
                     incidents_at = Some(Instant::now());
                 }
@@ -114,6 +133,24 @@ pub fn spawn(egui_ctx: egui::Context) -> (Receiver<StatusFeedSnapshot>, Sender<(
                             description,
                             incidents: openai_incidents.clone(),
                         }),
+                    github: fetch_status(&agent, GITHUB_STATUS_URL)
+                        .map_err(|e| tracing::debug!("GitHub 상태 조회 실패: {e:#}"))
+                        .ok()
+                        .map(|(indicator, description)| ProviderStatus {
+                            indicator,
+                            description,
+                            incidents: Vec::new(),
+                        }),
+                    hugging_face: hugging_face_updates.as_ref().map(|updates| ProviderStatus {
+                        indicator: ServiceIndicator::Operational,
+                        description: "Trending models".to_owned(),
+                        incidents: updates.clone(),
+                    }),
+                    grok: grok_updates.as_ref().map(|updates| ProviderStatus {
+                        indicator: ServiceIndicator::Operational,
+                        description: "Grok status updates".to_owned(),
+                        incidents: updates.clone(),
+                    }),
                 };
                 if tx.send(snapshot).is_err() {
                     return; // App 종료
@@ -151,6 +188,29 @@ fn fetch_incidents(agent: &ureq::Agent, base: &str) -> anyhow::Result<Vec<Incide
         .call()?
         .into_string()?;
     parse_incidents(&incidents_json, base)
+}
+
+fn fetch_hugging_face_models(agent: &ureq::Agent) -> anyhow::Result<Vec<IncidentNotice>> {
+    let json = agent
+        .get(HUGGING_FACE_MODELS_API)
+        .set("Accept", "application/json")
+        .set("User-Agent", "Deppy-Sijo/External-Updates")
+        .call()?
+        .into_string()?;
+    parse_hugging_face_models(&json)
+}
+
+fn fetch_grok_status(agent: &ureq::Agent) -> anyhow::Result<Vec<IncidentNotice>> {
+    let json = agent
+        .get(GROK_STATUS_RSS)
+        .set(
+            "Accept",
+            "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8",
+        )
+        .set("User-Agent", "Deppy-Sijo/External-Updates")
+        .call()?
+        .into_string()?;
+    parse_grok_status_rss(&json)
 }
 
 /// `/api/v2/status.json` → (indicator, description).
@@ -216,6 +276,104 @@ fn parse_incidents(json: &str, base: &str) -> anyhow::Result<Vec<IncidentNotice>
         .collect())
 }
 
+fn parse_hugging_face_models(json: &str) -> anyhow::Result<Vec<IncidentNotice>> {
+    let models: Vec<serde_json::Value> = serde_json::from_str(json)?;
+    Ok(models
+        .into_iter()
+        .filter_map(|model| {
+            let title = model
+                .get("id")
+                .or_else(|| model.get("modelId"))?
+                .as_str()?
+                .to_owned();
+            let date = model
+                .get("createdAt")
+                .and_then(|value| value.as_str())
+                .map(|value| value.chars().take(10).collect())
+                .unwrap_or_default();
+            Some(IncidentNotice {
+                url: format!("https://huggingface.co/{title}"),
+                title,
+                status: "trending".to_owned(),
+                date,
+            })
+        })
+        .take(INCIDENTS_PER_PROVIDER)
+        .collect())
+}
+
+#[derive(serde::Deserialize)]
+struct GrokRss {
+    channel: GrokRssChannel,
+}
+
+#[derive(serde::Deserialize)]
+struct GrokRssChannel {
+    #[serde(default)]
+    item: Vec<GrokRssItem>,
+}
+
+#[derive(serde::Deserialize)]
+struct GrokRssItem {
+    title: String,
+    link: String,
+    #[serde(rename = "pubDate", default)]
+    published_at: String,
+}
+
+fn parse_grok_status_rss(xml: &str) -> anyhow::Result<Vec<IncidentNotice>> {
+    let feed: GrokRss = quick_xml::de::from_str(xml)?;
+    Ok(feed
+        .channel
+        .item
+        .into_iter()
+        .filter(|item| !item.title.trim().is_empty() && !item.link.trim().is_empty())
+        .map(|item| IncidentNotice {
+            title: item.title,
+            status: "update".to_owned(),
+            date: rss_date(&item.published_at),
+            url: item.link,
+        })
+        .take(INCIDENTS_PER_PROVIDER)
+        .collect())
+}
+
+fn rss_date(value: &str) -> String {
+    let value = value.trim();
+    if value.len() >= 10
+        && value.as_bytes().get(4) == Some(&b'-')
+        && value.as_bytes().get(7) == Some(&b'-')
+    {
+        return value[..10].to_owned();
+    }
+    let parts: Vec<_> = value
+        .trim_start_matches(|c: char| c.is_ascii_alphabetic() || c == ',')
+        .split_whitespace()
+        .collect();
+    let [day, month, year, ..] = parts.as_slice() else {
+        return String::new();
+    };
+    let month = match *month {
+        "Jan" => "01",
+        "Feb" => "02",
+        "Mar" => "03",
+        "Apr" => "04",
+        "May" => "05",
+        "Jun" => "06",
+        "Jul" => "07",
+        "Aug" => "08",
+        "Sep" => "09",
+        "Oct" => "10",
+        "Nov" => "11",
+        "Dec" => "12",
+        _ => return String::new(),
+    };
+    let Ok(day) = day.parse::<u8>() else {
+        return String::new();
+    };
+    format!("{year}-{month}-{day:02}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +412,52 @@ mod tests {
             notices[2].url, "https://status.openai.com/incidents/abc123",
             "shortlink 없으면 id로 조립"
         );
+    }
+
+    #[test]
+    fn hugging_face_trending_models를_최신_3건으로_변환한다() {
+        let json = r#"[
+            {"id":"org/model-a","createdAt":"2026-07-14T13:23:14.000Z"},
+            {"modelId":"org/model-b","createdAt":"2026-07-13T00:00:00.000Z"},
+            {"id":"org/model-c","createdAt":"2026-07-12T00:00:00.000Z"},
+            {"id":"org/model-d","createdAt":"2026-07-11T00:00:00.000Z"}
+        ]"#;
+        let notices = parse_hugging_face_models(json).unwrap();
+        assert_eq!(notices.len(), 3);
+        assert_eq!(notices[0].title, "org/model-a");
+        assert_eq!(notices[0].url, "https://huggingface.co/org/model-a");
+        assert_eq!(notices[0].status, "trending");
+        assert_eq!(notices[0].date, "2026-07-14");
+    }
+
+    #[test]
+    fn grok_공식_rss를_최신_3건으로_변환한다() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <rss version="2.0"><channel>
+          <item><title><![CDATA[Grok Web unavailable]]></title><link>https://status.x.ai/incidents/one</link><pubDate>Mon, 20 Jul 2026 10:20:00 +0000</pubDate></item>
+          <item><title>API latency</title><link>https://status.x.ai/incidents/two</link><pubDate>2026-07-19T08:00:00Z</pubDate></item>
+          <item><title>Grok in X</title><link>https://status.x.ai/incidents/three</link><pubDate>Sat, 18 Jul 2026 03:00:00 +0000</pubDate></item>
+          <item><title>Older incident</title><link>https://status.x.ai/incidents/four</link><pubDate>Fri, 17 Jul 2026 03:00:00 +0000</pubDate></item>
+        </channel></rss>"#;
+        let notices = parse_grok_status_rss(xml).unwrap();
+        assert_eq!(notices.len(), 3);
+        assert_eq!(notices[0].title, "Grok Web unavailable");
+        assert_eq!(notices[0].url, "https://status.x.ai/incidents/one");
+        assert_eq!(notices[0].status, "update");
+        assert_eq!(notices[0].date, "2026-07-20");
+        assert_eq!(notices[1].date, "2026-07-19");
+    }
+
+    #[test]
+    fn grok_rss는_빈_제목과_링크를_제외한다() {
+        let xml = r#"<rss><channel>
+          <item><title></title><link>https://status.x.ai/incidents/one</link></item>
+          <item><title>Valid</title><link></link></item>
+          <item><title>Visible</title><link>https://status.x.ai/incidents/three</link></item>
+        </channel></rss>"#;
+        let notices = parse_grok_status_rss(xml).unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].title, "Visible");
+        assert!(notices[0].date.is_empty());
     }
 }

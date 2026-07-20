@@ -5,26 +5,77 @@
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use oauth2::basic::BasicClient;
+use oauth2::basic::{
+    BasicErrorResponse, BasicRevocationErrorResponse, BasicTokenIntrospectionResponse,
+    BasicTokenType,
+};
 use oauth2::{
-    AuthUrl, AuthorizationCode, ClientId, CsrfToken, EndpointNotSet, EndpointSet,
-    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse, TokenUrl,
+    AuthType, AuthUrl, AuthorizationCode, Client, ClientId, ClientSecret, CsrfToken,
+    EndpointNotSet, EndpointSet, ExtraTokenFields, PkceCodeChallenge, PkceCodeVerifier,
+    RedirectUrl, Scope, StandardRevocableToken, StandardTokenResponse, TokenResponse, TokenUrl,
 };
 use secret::SecretString;
 
 use crate::callback::{CallbackParams, LocalhostCallbackServer};
 
-/// authorize + token endpoint가 설정된 클라이언트 (oauth2 5 typestate).
+/// Slack `oauth.v2.user.access`는 표준 token 필드 외에 승인된 workspace를
+/// `team.id`(구 응답은 `team_id`)로 준다. 다른 provider에서는 모두 None이다.
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+struct ProviderExtraTokenFields {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    team: Option<ProviderWorkspace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    team_id: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct ProviderWorkspace {
+    id: String,
+}
+
+impl ExtraTokenFields for ProviderExtraTokenFields {}
+
+type ProviderTokenResponse = StandardTokenResponse<ProviderExtraTokenFields, BasicTokenType>;
+
+/// BasicClient의 endpoint/error 규약은 유지하면서 provider 확장 token 필드를
+/// 보존하는 클라이언트 (oauth2 5 typestate).
+type ProviderClient<
+    HasAuthUrl = EndpointNotSet,
+    HasDeviceAuthUrl = EndpointNotSet,
+    HasIntrospectionUrl = EndpointNotSet,
+    HasRevocationUrl = EndpointNotSet,
+    HasTokenUrl = EndpointNotSet,
+> = Client<
+    BasicErrorResponse,
+    ProviderTokenResponse,
+    BasicTokenIntrospectionResponse,
+    StandardRevocableToken,
+    BasicRevocationErrorResponse,
+    HasAuthUrl,
+    HasDeviceAuthUrl,
+    HasIntrospectionUrl,
+    HasRevocationUrl,
+    HasTokenUrl,
+>;
+
 type ConfiguredClient =
-    BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
+    ProviderClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
 
 /// 사용자가 입력하는 provider 설정 (§11.0 mcp_servers.url과 별개 — 커넥터 등록 폼).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct OAuthProviderConfig {
     pub auth_url: String,
     pub token_url: String,
     pub client_id: String,
+    /// confidential client secret. SecretString이라 Debug에도 평문이 노출되지 않는다.
+    pub client_secret: Option<SecretString>,
+    /// true면 RFC 6749 `client_secret_post`로 token endpoint body에 인증한다.
+    /// false는 oauth2 기본인 `client_secret_basic`이다.
+    pub client_secret_post: bool,
     pub scopes: Vec<String>,
+    /// provider authorize 힌트. Slack은 이전 승인에서 확인한 workspace ID를
+    /// `team` 파라미터로 넣어 다음 승인 대상을 고정한다.
+    pub extra_authorize_params: Vec<(String, String)>,
 }
 
 /// begin이 만든 진행 상태 — 브라우저가 돌아올 때까지 보관한다.
@@ -41,6 +92,17 @@ pub struct OAuthToken {
     pub access_token: SecretString,
     pub refresh_token: Option<SecretString>,
     pub expires_in_secs: Option<u64>,
+    /// provider가 token 응답으로 확정해 준 workspace ID. 인증 힌트로만
+    /// 쓰며 비밀이 아니다. Slack 외 provider는 보통 None이다.
+    pub provider_workspace_id: Option<String>,
+}
+
+impl PendingAuthorization {
+    /// Local callback listener가 이번 flow의 redirect만 수락하도록 비교할 CSRF state.
+    /// 호출자는 로그/영속 없이 callback 검증에만 사용해야 한다.
+    pub fn state(&self) -> &str {
+        self.state.secret()
+    }
 }
 
 // 토큰 평문이 로그/panic 메시지로 새지 않게 은닉 (§2.1)
@@ -53,6 +115,7 @@ impl std::fmt::Debug for OAuthToken {
                 &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field("expires_in_secs", &self.expires_in_secs)
+            .field("provider_workspace_id", &self.provider_workspace_id)
             .finish()
     }
 }
@@ -80,12 +143,21 @@ pub fn begin_with_resource(
     crate::validate_redirect_uri(&config.token_url)
         .context("token URL은 HTTPS(또는 로컬 테스트용 loopback)여야 합니다")?;
 
-    let client = BasicClient::new(ClientId::new(config.client_id.clone()))
+    let client = ProviderClient::new(ClientId::new(config.client_id.clone()))
         .set_auth_uri(AuthUrl::new(config.auth_url.clone()).context("auth URL 파싱 실패")?)
         .set_token_uri(TokenUrl::new(config.token_url.clone()).context("token URL 파싱 실패")?)
         .set_redirect_uri(
             RedirectUrl::new(redirect_uri.to_owned()).context("redirect URL 파싱 실패")?,
         );
+    let client = match &config.client_secret {
+        Some(secret) => client.set_client_secret(ClientSecret::new(secret.expose().to_owned())),
+        None => client,
+    };
+    let client = if config.client_secret_post {
+        client.set_auth_type(AuthType::RequestBody)
+    } else {
+        client
+    };
 
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
     let mut request = client
@@ -95,6 +167,9 @@ pub fn begin_with_resource(
     if let Some(resource) = resource {
         // RFC 8707: 발급 대상 리소스를 authorize 단계부터 고정한다
         request = request.add_extra_param("resource", resource.to_owned());
+    }
+    for (name, value) in &config.extra_authorize_params {
+        request = request.add_extra_param(name, value);
     }
     let (authorize_url, state) = request.url();
 
@@ -129,12 +204,19 @@ pub fn complete(
         request = request.add_extra_param("resource", resource.as_str());
     }
     let response = request.request(&http).context("token 교환 실패")?;
+    let provider_workspace_id = response
+        .extra_fields()
+        .team
+        .as_ref()
+        .map(|team| team.id.clone())
+        .or_else(|| response.extra_fields().team_id.clone());
     Ok(OAuthToken {
         access_token: SecretString::new(response.access_token().secret().clone()),
         refresh_token: response
             .refresh_token()
             .map(|t| SecretString::new(t.secret().clone())),
         expires_in_secs: response.expires_in().map(|d| d.as_secs()),
+        provider_workspace_id,
     })
 }
 
@@ -157,6 +239,21 @@ pub fn run_flow_with_resource(
     complete(pending, params)
 }
 
+/// provider console에 redirect URL을 사전 등록해야 하는 데스크톱 client용 flow.
+/// `http://localhost:47456/callback`을 고정 사용하며 포트가 점유됐으면 임의 포트로
+/// 바꾸지 않고 실패해 redirect URI 불일치를 방지한다.
+pub fn run_flow_with_resource_fixed_localhost(
+    config: &OAuthProviderConfig,
+    timeout: Duration,
+    resource: Option<&str>,
+) -> anyhow::Result<OAuthToken> {
+    let server = LocalhostCallbackServer::bind_fixed_localhost()?;
+    let pending = begin_with_resource(config, server.redirect_uri(), resource)?;
+    crate::open_in_browser(&pending.authorize_url)?;
+    let params = server.wait_for_callback(timeout, pending.state.secret())?;
+    complete(pending, params)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,7 +266,10 @@ mod tests {
             auth_url: "https://provider.example/authorize".to_owned(),
             token_url: token_url.to_owned(),
             client_id: "client-123".to_owned(),
+            client_secret: None,
+            client_secret_post: false,
             scopes: vec!["mcp.read".to_owned()],
+            extra_authorize_params: Vec::new(),
         }
     }
 
@@ -231,6 +331,14 @@ mod tests {
     }
 
     #[test]
+    fn authorize_url에_provider_hint를_추가한다() {
+        let mut config = config("https://provider.example/token");
+        config.extra_authorize_params = vec![("team".to_owned(), "T0ACREG25T6".to_owned())];
+        let pending = begin(&config, "http://127.0.0.1:9/callback").unwrap();
+        assert_eq!(query_map(&pending.authorize_url)["team"], "T0ACREG25T6");
+    }
+
+    #[test]
     fn 비보안_redirect_uri는_begin에서_거부() {
         let result = begin(
             &config("https://provider.example/token"),
@@ -272,7 +380,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request = read_full_request(&mut stream);
-            let body = r#"{"access_token":"at-ok","token_type":"bearer","refresh_token":"rt-ok","expires_in":3600}"#;
+            let body = r#"{"access_token":"at-ok","token_type":"bearer","refresh_token":"rt-ok","expires_in":3600,"team":{"id":"T0ACREG25T6","name":"Vector9"}}"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -282,7 +390,10 @@ mod tests {
             request
         });
 
-        let pending = begin(&config(&token_url), "http://127.0.0.1:9/callback").unwrap();
+        let mut confidential = config(&token_url);
+        confidential.client_secret = Some(SecretString::new("client-secret-456".to_owned()));
+        confidential.client_secret_post = true;
+        let pending = begin(&confidential, "http://127.0.0.1:9/callback").unwrap();
         let state = pending.state.secret().clone();
         let token = complete(
             pending,
@@ -296,11 +407,20 @@ mod tests {
         assert_eq!(token.access_token.expose(), "at-ok");
         assert_eq!(token.refresh_token.unwrap().expose(), "rt-ok");
         assert_eq!(token.expires_in_secs, Some(3600));
+        assert_eq!(token.provider_workspace_id.as_deref(), Some("T0ACREG25T6"));
 
         // token 요청 body에 code와 PKCE verifier가 실려 있어야 한다 (PKCE 필수 실증)
         let request = server.join().unwrap();
         assert!(request.contains("code=auth-code-1"), "{request}");
         assert!(request.contains("code_verifier="), "{request}");
+        assert!(
+            request.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A9%2Fcallback"),
+            "authorize에 쓴 redirect URI가 token 교환에 동일하게 실리지 않음: {request}"
+        );
+        assert!(
+            request.contains("client_secret=client-secret-456"),
+            "confidential client secret가 request body에 없음: {request}"
+        );
         assert!(
             request.contains("grant_type=authorization_code"),
             "{request}"

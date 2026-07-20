@@ -188,6 +188,7 @@ mod tests {
             registration_endpoint,
             grant_types_supported: grants.map(|list| list.into_iter().map(str::to_owned).collect()),
             scopes_supported: None,
+            token_endpoint_auth_methods_supported: None,
             code_challenge_methods_supported: None,
         }
     }

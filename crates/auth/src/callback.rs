@@ -4,6 +4,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
@@ -49,6 +50,18 @@ impl LocalhostCallbackServer {
         })
     }
 
+    /// 수동 등록한 데스크톱 OAuth client용 고정 callback. provider 설정에 미리 등록할
+    /// 수 있도록 포트 fallback을 허용하지 않고, PKCE provider가 desktop redirect로
+    /// 분류하는 `localhost` host를 사용한다.
+    pub fn bind_fixed_localhost() -> anyhow::Result<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", FIXED_CALLBACK_PORT))
+            .context("고정 OAuth callback 포트 bind 실패")?;
+        Ok(Self {
+            listener,
+            redirect_uri: format!("http://localhost:{FIXED_CALLBACK_PORT}/callback"),
+        })
+    }
+
     pub fn redirect_uri(&self) -> &str {
         &self.redirect_uri
     }
@@ -62,12 +75,27 @@ impl LocalhostCallbackServer {
         timeout: Duration,
         expected_state: &str,
     ) -> anyhow::Result<CallbackParams> {
+        self.wait_for_callback_cancellable(timeout, expected_state, &AtomicBool::new(false))
+    }
+
+    /// [`Self::wait_for_callback`]과 같지만 UI가 flow를 취소하면 짧은 polling 주기 안에
+    /// listener를 drop한다. 고정 redirect 포트를 쓰는 데스크톱 OAuth에서 취소 직후
+    /// 재시도가 이전 listener와 충돌하지 않게 한다.
+    pub fn wait_for_callback_cancellable(
+        self,
+        timeout: Duration,
+        expected_state: &str,
+        cancelled: &AtomicBool,
+    ) -> anyhow::Result<CallbackParams> {
         let deadline = Instant::now() + timeout;
         // accept에 타임아웃이 없으므로 nonblocking + 짧은 sleep 폴링
         self.listener
             .set_nonblocking(true)
             .context("callback 서버 nonblocking 설정 실패")?;
         loop {
+            if cancelled.load(Ordering::Acquire) {
+                bail!("authorization 취소됨");
+            }
             if Instant::now() >= deadline {
                 bail!("authorization 대기 시간 초과 ({timeout:?})");
             }
@@ -246,6 +274,32 @@ mod tests {
         let server = LocalhostCallbackServer::bind().unwrap();
         let result = server.wait_for_callback(Duration::from_millis(120), "s");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn 취소하면_callback_listener를_즉시_해제한다() {
+        use std::sync::Arc;
+
+        let server = LocalhostCallbackServer::bind().unwrap();
+        let port: u16 = oauth2::url::Url::parse(server.redirect_uri())
+            .unwrap()
+            .port()
+            .unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let handle = std::thread::spawn(move || {
+            server.wait_for_callback_cancellable(
+                Duration::from_secs(10),
+                "state",
+                &worker_cancelled,
+            )
+        });
+
+        cancelled.store(true, Ordering::Release);
+        let error = handle.join().unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains("취소"));
+        let rebound = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        drop(rebound);
     }
 
     #[test]

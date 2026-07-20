@@ -865,16 +865,19 @@ impl FileTreeUi {
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     for workspace in before_active {
-                        let resp = workspace_row(ui, workspace, false, Some(false), catalog);
+                        let color = workspace_accent(sidebar.workspaces, &workspace.id);
+                        let resp = workspace_row(ui, workspace, color, false, Some(false), catalog);
                         workspace_context_menu(&resp, workspace, catalog, &mut action);
                         if resp.clicked() {
                             action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
                         }
                     }
                     if let Some(active) = active {
+                        let color = workspace_accent(sidebar.workspaces, &active.id);
                         let resp = workspace_row(
                             ui,
                             active,
+                            color,
                             true,
                             Some(self.workspace_sessions_expanded),
                             catalog,
@@ -1107,7 +1110,8 @@ impl FileTreeUi {
                             });
                     }
                     for workspace in after_active {
-                        let resp = workspace_row(ui, workspace, false, Some(false), catalog);
+                        let color = workspace_accent(sidebar.workspaces, &workspace.id);
+                        let resp = workspace_row(ui, workspace, color, false, Some(false), catalog);
                         workspace_context_menu(&resp, workspace, catalog, &mut action);
                         if resp.clicked() {
                             action = Some(SidebarAction::SwitchWorkspace(workspace.id.clone()));
@@ -2700,6 +2704,7 @@ pub enum ShellKind {
 fn workspace_row(
     ui: &mut egui::Ui,
     workspace: &SidebarWorkspaceEntry,
+    color: egui::Color32,
     active: bool,
     expanded: Option<bool>,
     catalog: &i18n::Catalog,
@@ -2726,9 +2731,8 @@ fn workspace_row(
         ui.painter()
             .rect_filled(highlight_rect, 1.0, ui.visuals().widgets.hovered.bg_fill);
     }
-    // 선택/실행 상태와 무관한 프로젝트 고유색. 40pt 아이콘 레일에서도 워크스페이스를
-    // 색만으로 빠르게 구분할 수 있게 비활성 행도 같은 색을 유지한다.
-    let color = workspace_accent(&workspace.name);
+    // 선택/실행 상태와 무관한 프로젝트 고유색. 목록 전체에서 같은 계열이 겹치지 않게
+    // 미리 배정된 색을 받아 비활성 행과 40pt 아이콘 레일에서도 그대로 유지한다.
     let avatar = egui::Rect::from_center_size(
         egui::pos2(rect.left() + 6.8 + 15.0, rect.center().y),
         egui::vec2(30.0, 30.0),
@@ -3606,28 +3610,33 @@ fn file_entry_color(name: &str, is_dir: bool, fallback: egui::Color32) -> egui::
     }
 }
 
-fn workspace_accent(name: &str) -> egui::Color32 {
-    match workspace_initial(name) {
-        'S' => egui::Color32::from_rgb(0x55, 0xc8, 0x79),
-        'A' => egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
-        'V' => egui::Color32::from_rgb(0x9a, 0x78, 0xe8),
-        'C' => egui::Color32::from_rgb(0x43, 0xb8, 0xcd),
-        'P' => egui::Color32::from_rgb(0x4c, 0x84, 0xdf),
-        _ => {
-            let palette = [
-                egui::Color32::from_rgb(0x55, 0xc8, 0x79),
-                egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
-                egui::Color32::from_rgb(0x9a, 0x78, 0xe8),
-                egui::Color32::from_rgb(0x43, 0xb8, 0xcd),
-                egui::Color32::from_rgb(0x4c, 0x84, 0xdf),
-                egui::Color32::from_rgb(0xe0, 0x6c, 0x75),
-            ];
-            let hash = name.bytes().fold(0usize, |acc, byte| {
+const WORKSPACE_ACCENT_PALETTE: [(u8, u8, u8); 8] = [
+    (0x55, 0xc8, 0x79), // emerald
+    (0xe7, 0x9a, 0x3b), // orange
+    (0x9a, 0x78, 0xe8), // violet
+    (0xe0, 0x5d, 0x69), // crimson
+    (0xc8, 0xaa, 0x35), // gold
+    (0x4c, 0x84, 0xdf), // blue
+    (0xcc, 0x65, 0xae), // pink
+    (0x3b, 0xa3, 0xa0), // teal
+];
+
+/// 안정 ID가 DB 생성순 목록에서 차지하는 slot으로 색을 배정한다. palette 앞쪽 여섯
+/// 계열은 녹색·주황·보라·빨강·금색·파랑 순으로 의도적으로 떨어뜨렸다. 따라서 선택/
+/// 접힘으로 렌더 순서가 바뀌어도 색은 유지되고, 같은 이니셜도 서로 다른 계열을 갖는다.
+/// 생성순 목록 끝에 새 워크스페이스를 추가해도 기존 배정은 변하지 않는다.
+fn workspace_accent(workspaces: &[SidebarWorkspaceEntry], workspace_id: &str) -> egui::Color32 {
+    let slot = workspaces
+        .iter()
+        .position(|workspace| workspace.id == workspace_id)
+        .map(|ordinal| ordinal % WORKSPACE_ACCENT_PALETTE.len())
+        .unwrap_or_else(|| {
+            workspace_id.bytes().fold(0usize, |acc, byte| {
                 acc.wrapping_mul(31).wrapping_add(byte as usize)
-            });
-            palette[hash % palette.len()]
-        }
-    }
+            }) % WORKSPACE_ACCENT_PALETTE.len()
+        });
+    let (red, green, blue) = WORKSPACE_ACCENT_PALETTE[slot];
+    egui::Color32::from_rgb(red, green, blue)
 }
 
 /// 폴더 아이콘 — 참고 시안처럼 탭 + 본체의 얇은 윤곽선.
@@ -4674,6 +4683,32 @@ mod tests {
         assert_eq!(workspace_initial(""), 'W');
         assert_eq!(workspace_label("arteawiki"), "arteawiki");
         assert_eq!(workspace_label("VisionAI"), "VisionAI");
+    }
+
+    #[test]
+    fn 같은_이니셜의_워크스페이스도_서로_다른_색상_계열을_쓴다() {
+        let workspaces = (0..6)
+            .map(|index| SidebarWorkspaceEntry {
+                id: format!("stable-id-{index}"),
+                name: format!("same-{index}"),
+                state: SidebarWorkspaceState::Idle,
+                summary: SidebarSessionSummary::default(),
+            })
+            .collect::<Vec<_>>();
+        let colors = workspaces
+            .iter()
+            .map(|workspace| workspace_accent(&workspaces, &workspace.id).to_array())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(colors.len(), workspaces.len());
+
+        let original = workspace_accent(&workspaces, &workspaces[0].id);
+        let mut selected_elsewhere = workspaces.clone();
+        selected_elsewhere[4].state = SidebarWorkspaceState::Active;
+        assert_eq!(
+            workspace_accent(&selected_elsewhere, &workspaces[0].id),
+            original,
+            "선택 상태는 아바타 색상 배정에 영향을 주지 않는다"
+        );
     }
 
     #[test]

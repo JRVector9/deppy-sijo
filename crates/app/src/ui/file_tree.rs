@@ -1441,25 +1441,30 @@ impl FileTreeUi {
         if let Some(error) = &self.root_error {
             match error {
                 RootListingError::PermissionDenied => {
-                    let available = ui.available_size();
-                    let button_width = (available.x - 16.0).clamp(24.0, 320.0);
-                    let mut open_settings = false;
-                    ui.allocate_ui_with_layout(
-                        available,
-                        egui::Layout::top_down(egui::Align::Center),
-                        |ui| {
-                            ui.add_space(((available.y - 40.0) * 0.5).max(0.0));
-                            open_settings = ui
-                                .add_sized(
-                                    [button_width, 40.0],
-                                    egui::Button::new(
-                                        catalog.t("file_tree.macos_access_denied", &[]),
-                                    )
-                                    .wrap(),
+                    let area = ui.available_rect_before_wrap();
+                    let button_rect = permission_denied_button_rect(area, ui.max_rect().center());
+                    let accent = ui.visuals().selection.bg_fill;
+                    let text_color = if ui.visuals().dark_mode {
+                        egui::Color32::from_rgb(0x0f, 0x11, 0x17)
+                    } else {
+                        egui::Color32::WHITE
+                    };
+                    let open_settings = ui
+                        .put(
+                            button_rect,
+                            egui::Button::new(
+                                egui::RichText::new(
+                                    catalog.t("file_tree.macos_access_denied", &[]),
                                 )
-                                .clicked();
-                        },
-                    );
+                                .color(text_color)
+                                .strong(),
+                            )
+                            .fill(accent)
+                            .stroke(egui::Stroke::new(1.0, accent))
+                            .corner_radius(2.0)
+                            .wrap(),
+                        )
+                        .clicked();
                     if open_settings {
                         action = Some(SidebarAction::OpenMacosFileAccessSettings);
                     }
@@ -2625,6 +2630,19 @@ impl FileTreeUi {
             .map(|node| path.join(&node.name))
             .collect()
     }
+}
+
+fn permission_denied_button_rect(area: egui::Rect, screen_center: egui::Pos2) -> egui::Rect {
+    let button_width = (area.width() - 24.0).clamp(24.0, 360.0);
+    let button_height = area.height().clamp(0.0, 44.0);
+    let half_height = button_height * 0.5;
+    let center = egui::pos2(
+        area.center().x,
+        screen_center
+            .y
+            .clamp(area.top() + half_height, area.bottom() - half_height),
+    );
+    egui::Rect::from_center_size(center, egui::vec2(button_width, button_height))
 }
 
 impl Drop for FileTreeUi {
@@ -5712,6 +5730,23 @@ mod tests {
             "이전 root late result는 epoch mismatch로 폐기"
         );
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn 권한거부_버튼_rect는_사이드바_화면중앙을_따른다() {
+        let area = egui::Rect::from_min_max(egui::pos2(16.0, 180.0), egui::pos2(656.0, 780.0));
+        let screen_center = egui::pos2(336.0, 360.0);
+        let button = permission_denied_button_rect(area, screen_center);
+
+        assert_eq!(button.center(), screen_center);
+        assert_eq!(button.size(), egui::vec2(360.0, 44.0));
+
+        let above_file_area = permission_denied_button_rect(area, egui::pos2(336.0, 100.0));
+        assert_eq!(
+            above_file_area.top(),
+            area.top(),
+            "화면 중앙이 파일 영역 위면 버튼은 겹치지 않고 파일 영역 상단에 붙는다"
+        );
     }
 
     #[test]

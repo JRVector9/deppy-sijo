@@ -2,8 +2,8 @@
 
 ## Current task
 
-- Center the macOS folder-access denial state as a button that opens Files & Folders settings, and remove the context-menu feature that sends last command output to an agent.
-- Status: fixed and verified. The permission denial is an actionable centered button, and last-output-to-agent has been removed end-to-end while last-output copy remains.
+- Move the macOS folder-access denial CTA to the sidebar screen center with a vivid accent treatment, and decouple Settings workspace selection from sidebar visibility/runtime focus.
+- Status: fixed and verified. The CTA follows the sidebar screen center with an accent fill, and Settings Workspaces/Environment use an independent workspace context that does not reveal or focus sidebar runtimes.
 
 ## Working area
 
@@ -14,13 +14,22 @@
 
 ## Plan
 
-1. Completed — trace workspace selection, expansion state, session snapshots, and focus dispatch.
-2. Completed — retain per-workspace expansion and render active/warm session snapshots together.
-3. Completed — add focus-only/multi-expanded regression and run focused/strict checks.
-4. Completed — record final evidence and delivery state.
+1. Completed — trace the permission CTA geometry and both Settings workspace selection paths.
+2. Completed — implement screen-center accent CTA and settings-only workspace context.
+3. Completed — add geometry and no-sidebar-side-effect regressions.
+4. Completed — run focused/full tests, strict Clippy, format, and diff checks.
+5. Completed — record final evidence and delivery state.
 
 ## Status
 
+- 2026-07-20: 사용자가 검증된 accent 권한 CTA와 Settings workspace isolation 변경의 커밋·push·공식 release build·앱 재실행을 요청했다. 현재 3개 의도된 변경 파일을 기능 커밋으로 고정해 `HomeV1` 원격에 push한 뒤 package script, deep/strict codesign·arm64 검증, exact-name 기존 앱 종료와 exact bundle 실행/시작 로그 확인을 진행한다.
+- 2026-07-20: 최종 검증을 완료했다. localhost bind가 필요한 기존 7개 fixture만 명시 skip한 직렬 app 회귀는 563 passed/0 failed/5 ignored/7 filtered, FileTree는 63/63, 새 geometry·settings isolation 회귀는 각각 1/1, 기존 권한 클릭 kittest 1/1, env project list 1/1이 통과했다. `cargo clippy -p deppy-sijo --all-targets -- -D warnings`, fmt check, diff check와 Settings Select→`ws_switch` 부재 정적 검사도 통과했다. 변경은 `app.rs`, `ui/file_tree.rs`, handoff 3개 파일이며 아직 commit/release build/relaunch는 수행하지 않았다.
+- 2026-07-20: 직렬 전체 app test는 563 passed, 7 failed, 5 ignored였다. 실패 7개는 변경 범위 밖 `llm_proxy` localhost fixture 1개와 connector mock-server 6개가 모두 bind 시 managed sandbox `Operation not permitted`를 받은 것으로, 제품 assertion 회귀가 아니다. 이 환경에서 반복돼 온 로컬 소켓 제한이므로 해당 7개 fixture만 명시 skip한 직렬 전체 회귀를 완주하고 strict Clippy/fmt/diff를 별도로 실행한다.
+- 2026-07-20: 구현 후 기존 권한 설정 클릭 kittest 1/1, FileTree 전체 63/63, env project list 1/1이 통과했다. CTA는 sidebar body screen-center y를 따르고 theme selection accent(#43b8cd dark / #1c93aa light) fill, 대비 text, accent stroke, 44pt 높이를 사용한다. 설정에는 독립 `settings_workspace_id`가 생겼고 Workspaces 목록과 Environment rail 모두 이를 갱신한다. 선택 자체는 reveal/switch/spawn 경로를 타지 않으며, 설정에서 새로 만든 workspace는 숨김 상태로 시작한다. 비활성 Environment 편집/명시 sync도 선택 ID의 DB/.env만 갱신하고 active와 같을 때만 runtime cwd/file tree를 반영한다. 다음은 full app regression과 strict Clippy/fmt/diff다.
+- 2026-07-20: 새 집중 회귀 2개가 실제로 각각 1/1 통과했다. 첫 CTA rect 버전은 임의 file-area center와 정확히 일치했고, 설정에서 숨긴 workspace를 요청하면 settings selection만 그 ID로 바뀌고 active ID와 closed visibility map은 그대로 유지됐다. 사용자 표현인 “화면 가운데”를 더 정확히 반영하려고 CTA y는 전체 sidebar body center를 따르되 파일 영역 밖으로 겹치면 안전하게 clamp하는 방식으로 한 단계 보정했다. 보정된 geometry test를 다시 실행한다.
+- 2026-07-20: 설정 전용 workspace context와 exact-center accent CTA를 적용한 뒤 `cargo check -p deppy-sijo`가 통과했다. 이어 두 집중 테스트에 모듈 경로 없는 이름과 `--exact`를 함께 써 각각 0개 실행(575 filtered)됐으므로 검증 증거로 인정하지 않는다. 같은 고유 테스트 이름을 `--exact` 없이 다시 실행한다.
+- 2026-07-20: 1차 `cargo check -p deppy-sijo`는 설정 전용 explicit dotenv sync helper가 `migrate_legacy_profiles_to_dotenv`에 `&Db`를 넘긴 한 곳에서 실패했다. 해당 API는 legacy profile row를 수정하므로 `&mut Db`가 필요하다. 호출 차용만 `&mut self.db`로 교정하고 재실행한다; 나머지 새 설정 선택/CTA 코드는 이 단계까지 컴파일 진단이 없었다.
+- 2026-07-20: 새 UI 후속 분석을 완료했다. 권한 CTA는 workspace/session 계층과 파일 헤더/상위폴더 행을 그린 뒤 `available_size`를 top-down layout으로 분배해 실제 파일 영역 중심을 명시적으로 고정하지 않고, 기본 widget fill이라 강조도 약하다. 남은 file-area rect의 center에 직접 배치하고 theme accent fill/대비 text/stroke를 적용한다. 설정 쪽은 Workspaces 목록과 Environment project rail의 선택이 모두 공용 `ws_switch`를 채우고 프레임 말미에 `reveal_closed_workspace`+`switch_workspace`를 호출해 sidebar 숨김과 runtime focus를 변경한다. 설정 전용 workspace id/action으로 두 선택 경로를 분리하고 클릭만으로는 reveal/switch/spawn하지 않게 한다.
 - 2026-07-20: macOS 폴더 권한 버튼/last-output agent 제거 변경의 커밋·release build·재실행을 완료했다. 최초 구현 커밋은 `b3b1463`이고 최종 delivery 기록을 같은 커밋에 amend한다. 공식 release build는 18.78초였으며 app/proxy deep·strict codesign과 arm64 검증이 통과했고 main SHA-256은 `1c7cb7f4dd29cf82a5715eaaa3ebd32f9a13952a6a3b5b6d7a0881a32a568a9d`다. managed shell의 process-list 제한을 피해 `open -a Terminal`로 exact-name 기존 `deppy-sijo`만 TERM 종료하고 정확한 `/Users/jr/Desktop/Projects/deppy-sijo/target/bundle/Deppy Sijo.app`을 열었다. 새 PID `98062`와 동일한 executable path를 marker/lock으로 확인했으며 21:38:48 KST 시작 로그에는 log budget, AppleGothic/Apple SD Gothic 등록, web-remote `127.0.0.1:8737` 시작, ANSI scrollback 3건 복원이 기록됐다. 새 panic/error는 없고 기존 SKRT `.env`의 macOS `Operation not permitted` warn은 계속되다가 profile sync fallback이 정상 완료됐다.
 - 2026-07-20: 임시 zsh script를 만든 뒤 Terminal AppleScript에는 경로만 전달한 두 번째 시도도 현재 Terminal automation dictionary가 `do script` token 자체를 parse error `-2741`로 거부해 실행 전에 중단됐다. 앱/프로세스 상태 변화는 없다. AppleScript 없이 macOS `open -a Terminal <script>`로 같은 제한된 script를 실행하고 marker 파일을 확인한다.
 - 2026-07-20: 일반 macOS Terminal에 재실행 명령을 직접 한 줄 AppleScript로 전달한 첫 시도는 중첩 인용부호가 `osascript` parse error `-2741`을 내 실행 전에 중단됐다. 따라서 기존 앱 종료나 새 앱 실행은 일어나지 않았다. 안전한 exact-name 종료/정확한 bundle open 명령을 `/private/tmp`의 명시적 임시 zsh script로 분리해 Terminal에는 script 경로만 전달한다.

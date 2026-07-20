@@ -1172,6 +1172,9 @@ pub struct App {
     settings_was_open: bool,
     /// 통합 설정 창의 선택된 카테고리.
     settings_category: ui::settings::Category,
+    /// 설정 창 안에서만 선택된 workspace. 사이드바 표시/활성 runtime/terminal focus와
+    /// 독립이며 Environment/Workspaces 관리 화면의 대상만 바꾼다.
+    settings_workspace_id: Option<String>,
     settings_search: String,
     env_api_project_edit: EnvApiProjectEditState,
     /// env/API 프로젝트 행 캐시 (행, 계산 시각) — 설정창이 열려 있는 동안 매 프레임
@@ -1472,6 +1475,26 @@ fn workspace_visible_after_close(
     !closed.contains_key(workspace_id)
 }
 
+/// 설정 창의 workspace context만 결정한다. DB 목록 존재 여부만 보며 sidebar의
+/// `closed_workspaces`나 active runtime은 입력조차 받지 않아 선택만으로 재노출/전환할 수 없다.
+fn resolve_settings_workspace_id(
+    workspaces: &[crate::storage::WorkspaceRow],
+    requested: Option<&str>,
+    current: Option<&str>,
+    active_id: &str,
+) -> Option<String> {
+    [requested, current, Some(active_id)]
+        .into_iter()
+        .flatten()
+        .find(|candidate| {
+            workspaces
+                .iter()
+                .any(|workspace| workspace.id == *candidate)
+        })
+        .map(str::to_owned)
+        .or_else(|| workspaces.first().map(|workspace| workspace.id.clone()))
+}
+
 fn clear_closed_workspace_state(
     closed: &mut std::collections::HashMap<String, ClosedWorkspaceState>,
     persisted: &mut std::collections::BTreeSet<String>,
@@ -1666,6 +1689,7 @@ impl App {
             settings_open: false,
             settings_was_open: false,
             settings_category: ui::settings::Category::default(),
+            settings_workspace_id: None,
             settings_search: String::new(),
             env_api_project_edit: EnvApiProjectEditState::default(),
             env_api_projects_cache: None,
@@ -3781,6 +3805,49 @@ impl App {
         self.request_dotenv_sync(true);
     }
 
+    /// 설정 창에서 선택한 비활성 workspace의 `.env`를 DB/keyring에 명시적으로 동기화한다.
+    /// 활성 workspace는 기존 bounded worker 경로를 사용해 runtime 기본 env까지 갱신한다.
+    /// 비활성 workspace에는 runtime이 없으므로 명시적 저장/새로고침 동작에서만 동기로
+    /// 반영하고, sidebar visibility나 active runtime은 절대 변경하지 않는다.
+    fn sync_settings_workspace_dotenv(&mut self, workspace_id: &str) {
+        if workspace_id == self.active.id {
+            self.sync_dotenv_env();
+            return;
+        }
+        let Some(root) = self.workspace_tree_root(workspace_id) else {
+            return;
+        };
+        if let Err(error) = crate::dotenv_sync::migrate_legacy_profiles_to_dotenv(
+            &mut self.db,
+            &self.secret_store,
+            workspace_id,
+            &root,
+        ) {
+            tracing::warn!(
+                workspace_id,
+                "설정 workspace 레거시 env 이전 실패: {error:#}"
+            );
+        }
+        match crate::dotenv_sync::sync_workspace_dotenv(
+            &self.db,
+            &self.secret_store,
+            &self.redaction,
+            workspace_id,
+            &root,
+        ) {
+            Ok(Some(report)) => tracing::info!(
+                workspace_id,
+                upserted = report.upserted,
+                removed = report.removed,
+                "설정 workspace .env 동기화"
+            ),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(workspace_id, "설정 workspace .env 동기화 실패: {error:#}");
+            }
+        }
+    }
+
     fn request_dotenv_sync(&mut self, force: bool) {
         if self.dotenv_sync_worker_failed {
             return;
@@ -4030,18 +4097,23 @@ impl App {
         }
     }
 
-    /// 활성 workspace의 프로젝트 폴더 앵커(dev,ino)를 현재 경로 기준으로 저장한다.
-    fn save_workspace_anchor(&self) {
+    /// 지정 workspace의 프로젝트 폴더 앵커(dev,ino)를 현재 경로 기준으로 저장한다.
+    fn save_workspace_anchor_for(&self, workspace_id: &str) {
         let anchor = self
             .db
-            .workspace_path(&self.active.id)
+            .workspace_path(workspace_id)
             .ok()
             .flatten()
             .filter(|p| !p.trim().is_empty())
             .and_then(|p| Self::folder_anchor(&p));
         let _ =
             self.db
-                .set_workspace_anchor(&self.active.id, anchor.map(|a| a.0), anchor.map(|a| a.1));
+                .set_workspace_anchor(workspace_id, anchor.map(|a| a.0), anchor.map(|a| a.1));
+    }
+
+    /// 활성 workspace의 프로젝트 폴더 앵커(dev,ino)를 저장한다.
+    fn save_workspace_anchor(&self) {
+        self.save_workspace_anchor_for(&self.active.id);
     }
 
     /// 프로젝트 폴더 rename/이동 감지(2s 폴링). 저장된 경로가 stale(사라짐)이고, 세션 cwd 중
@@ -4112,15 +4184,20 @@ impl App {
         self.request_dotenv_sync(false);
     }
 
-    /// 활성 workspace의 트리 루트 (path 미설정/조회 실패 → None → 안내 표시 §9-2).
-    fn active_tree_root(&self) -> Option<PathBuf> {
-        match self.db.workspace_path(&self.active.id) {
+    /// 지정 workspace의 프로젝트 루트 (path 미설정/조회 실패 → None).
+    fn workspace_tree_root(&self, workspace_id: &str) -> Option<PathBuf> {
+        match self.db.workspace_path(workspace_id) {
             Ok(path) => Self::workspace_path_to_tree_root(path),
             Err(e) => {
-                tracing::warn!("workspace 경로 조회 실패: {e:#}");
+                tracing::warn!(workspace_id, "workspace 경로 조회 실패: {e:#}");
                 None
             }
         }
+    }
+
+    /// 활성 workspace의 트리 루트 (path 미설정/조회 실패 → None → 안내 표시 §9-2).
+    fn active_tree_root(&self) -> Option<PathBuf> {
+        self.workspace_tree_root(&self.active.id)
     }
 
     /// T1: focused pane 세션의 현재 작업 폴더 — agent_detect 워커(lsof)가 채운
@@ -4376,6 +4453,14 @@ impl App {
         match self.db.list_workspaces() {
             Ok(list) => self.workspaces = list,
             Err(e) => tracing::warn!("workspace 목록 조회 실패: {e:#}"),
+        }
+        if self.settings_workspace_id.as_ref().is_some_and(|selected| {
+            !self
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == *selected)
+        }) {
+            self.settings_workspace_id = None;
         }
         // 종료 숨김 표식 정리 — 프로젝트 삭제 등으로 목록에서 사라진 id의 표식을
         // 메모리와 config 양쪽에서 지워 유계로 유지한다.
@@ -7270,19 +7355,32 @@ impl eframe::App for App {
         };
         let term_cfg = self.config.terminal.clone();
         let wsid = self.active.id.clone();
-        let active_env_api_project = env_api_projects
+        let settings_wsid = resolve_settings_workspace_id(
+            &self.workspaces,
+            None,
+            self.settings_workspace_id.as_deref(),
+            &wsid,
+        )
+        .unwrap_or_else(|| wsid.clone());
+        if self.settings_open
+            && self.settings_workspace_id.as_deref() != Some(settings_wsid.as_str())
+        {
+            self.settings_workspace_id = Some(settings_wsid.clone());
+        }
+        let settings_env_api_project = env_api_projects
             .iter()
-            .find(|project| project.id == wsid)
+            .find(|project| project.id == settings_wsid)
             .cloned();
         // 환경변수 편집 게이트(E1 ⑤): 프로젝트 폴더가 지정된 워크스페이스만 .env 편집 허용.
-        let env_project_root = self.active_tree_root();
+        let env_project_root = self.workspace_tree_root(&settings_wsid);
         let env_project_rows_loading =
             self.env_api_projects_cache.is_none() && self.env_project_rows_pending;
         let env_project_rows_failed = self.env_project_rows_failed;
         let db_path = self.db_path.clone();
         let mut activity_action = None;
         let mut notif_click = None;
-        let mut ws_switch: Option<String> = None;
+        let mut settings_workspace_select: Option<String> = None;
+        let mut settings_ws_create: Option<std::path::PathBuf> = None;
         let mut ws_delete: Option<String> = None;
         // 프로젝트 삭제 확인 결정 — 모달은 설정 뷰포트 안에서 렌더하고(T2) 결정만 캡처,
         // 실제 삭제/전환은 self 전체 &mut가 필요하므로 클로저 밖에서 처리한다.
@@ -7346,7 +7444,9 @@ impl eframe::App for App {
                         // 속하지 않으면 새 프로젝트 등록, 활성 워크스페이스가 경로 미설정이면
                         // 이 폴더 지정 CTA. 클릭 시 기존 ws_create/SetProjectPath 흐름 재사용.
                         let mut banner_used = false;
-                        if let Some(banner) = &self.env_session_banner {
+                        if settings_wsid == wsid
+                            && let Some(banner) = &self.env_session_banner
+                        {
                             let show_register = !banner.registered;
                             let show_set_path = env_project_root.is_none();
                             if show_register || show_set_path {
@@ -7367,7 +7467,7 @@ impl eframe::App for App {
                                                     .button(text.t("env.session_cwd.register", &[]))
                                                     .clicked()
                                             {
-                                                ws_create = Some(banner.cwd.clone());
+                                                settings_ws_create = Some(banner.cwd.clone());
                                                 banner_used = true;
                                             }
                                             if show_set_path
@@ -7406,17 +7506,17 @@ impl eframe::App for App {
                             match ui::env_project_list::render_with_style(
                                 ui,
                                 &env_api_projects,
-                                &wsid,
+                                &settings_wsid,
                                 &text,
                                 &project_list_style,
                             ) {
                                 ui::env_project_list::EnvProjectListAction::None => {}
                                 ui::env_project_list::EnvProjectListAction::Select(id) => {
-                                    ws_switch = Some(id);
+                                    settings_workspace_select = Some(id);
                                 }
                                 ui::env_project_list::EnvProjectListAction::AddRequested => {
                                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                                        ws_create = Some(dir);
+                                        settings_ws_create = Some(dir);
                                     }
                                 }
                                 ui::env_project_list::EnvProjectListAction::DeleteRequested(id) => {
@@ -7451,7 +7551,7 @@ impl eframe::App for App {
                                 ui.set_width(ui.available_width());
                                 render_env_api_project_header(
                                     ui,
-                                    active_env_api_project.as_ref(),
+                                    settings_env_api_project.as_ref(),
                                     &mut env_action,
                                     &mut workspace_rename,
                                     &mut self.env_api_project_edit,
@@ -7514,7 +7614,7 @@ impl eframe::App for App {
                                                 match self.env_profiles_ui.contents_compact(
                                                     ui,
                                                     &mut self.db,
-                                                    &wsid,
+                                                    &settings_wsid,
                                                     env_project_root.as_deref(),
                                                     &mut reveal,
                                                     &text,
@@ -7536,7 +7636,7 @@ impl eframe::App for App {
                                                     db: &self.db,
                                                     secret_store: &self.secret_store,
                                                     redaction: &self.redaction,
-                                                    workspace_id: &wsid,
+                                                    workspace_id: &settings_wsid,
                                                 };
                                                 if self.credentials_ui.contents_compact(
                                                     ui,
@@ -7612,36 +7712,28 @@ impl eframe::App for App {
                         );
                     }
                     C::Workspaces => {
-                        // 목록 + 전환 + 이름 편집(#3). 전환·저장은 워커 재구성/refresh라
-                        // 창 밖에서 처리하도록 캡처만 한다.
+                        // 설정 전용 선택 목록. 여기서 workspace를 눌러도 sidebar 숨김 상태,
+                        // active runtime, terminal focus는 바꾸지 않는다.
                         // 이름 지정(이름 변경) 기능은 제거(2026-07-08 사용자) — 워크스페이스
                         // 이름은 항상 프로젝트 폴더명(경로 미설정이면 "~"). 세부 구분은
                         // 세션(pane) 이름 직접 수정으로 한다.
-                        // 새 워크스페이스(B안 2026-07-08): 폴더 선택 → 프로젝트별 격리
-                        // 워크스페이스 생성 + 즉시 전환. 처리(생성/전환)는 창 밖에서.
                         if ui
                             .button(text.t("workspace.manager.new", &[]))
                             .on_hover_text(text.t("workspace.manager.new_hint", &[]))
                             .clicked()
                             && let Some(dir) = rfd::FileDialog::new().pick_folder()
                         {
-                            ws_create = Some(dir);
+                            settings_ws_create = Some(dir);
                         }
                         ui.add_space(6.0);
                         for ws in &self.workspaces {
-                            ui.horizontal(|ui| {
-                                let display = Self::workspace_display_name(ws);
-                                if ws.id == wsid {
-                                    ui.strong(&display);
-                                    ui.weak(text.t("workspace.manager.current", &[]));
-                                } else {
-                                    ui.label(&display);
-                                    if ui.button(text.t("workspace.manager.switch", &[])).clicked()
-                                    {
-                                        ws_switch = Some(ws.id.clone());
-                                    }
-                                }
-                            });
+                            let display = Self::workspace_display_name(ws);
+                            if ui
+                                .selectable_label(ws.id == settings_wsid, display)
+                                .clicked()
+                            {
+                                settings_workspace_select = Some(ws.id.clone());
+                            }
                         }
                     }
                     C::Activity => {
@@ -7660,6 +7752,72 @@ impl eframe::App for App {
         // T1: 설정 창이 닫히면 세션 폴더 배너를 버린다 — 다음 우클릭 진입에서 재감지.
         if !self.settings_open {
             self.env_session_banner = None;
+        }
+        // 설정 안의 선택/생성은 sidebar runtime 전환 경로와 완전히 분리한다. 기존 숨김
+        // workspace 선택은 숨김 표식을 그대로 두고, 새로 만든 항목도 설정에서만 관리할 수
+        // 있도록 숨김 상태로 시작한다. sidebar에는 사용자가 명시적으로 열 때만 나타난다.
+        if let Some(dir) = settings_ws_create {
+            let path_str = dir.to_string_lossy().into_owned();
+            if let Some(existing_id) = self
+                .workspaces
+                .iter()
+                .find(|workspace| {
+                    self.db
+                        .workspace_path(&workspace.id)
+                        .ok()
+                        .flatten()
+                        .as_deref()
+                        == Some(path_str.as_str())
+                })
+                .map(|workspace| workspace.id.clone())
+            {
+                settings_workspace_select = Some(existing_id);
+            } else {
+                let name = crate::agent_detect::project_display_name(
+                    &path_str,
+                    self.config.ui.session_name_style,
+                )
+                .or_else(|| {
+                    dir.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| "workspace".to_owned());
+                match self.db.create_workspace(&name) {
+                    Ok(new_id) => {
+                        if let Err(error) = self.db.set_workspace_path(&new_id, &path_str) {
+                            tracing::warn!(
+                                workspace_id = %new_id,
+                                "설정 workspace 경로 저장 실패: {error:#}"
+                            );
+                        } else {
+                            self.save_workspace_anchor_for(&new_id);
+                            self.closed_workspaces
+                                .insert(new_id.clone(), ClosedWorkspaceState::Persisted);
+                            self.config.ui.closed_workspace_ids.insert(new_id.clone());
+                            if let Err(error) = self.config.save(&self.config_path) {
+                                tracing::warn!(
+                                    workspace_id = %new_id,
+                                    "설정 전용 workspace 숨김 상태 저장 실패: {error:#}"
+                                );
+                            }
+                            settings_workspace_select = Some(new_id);
+                            self.refresh_workspaces();
+                        }
+                    }
+                    Err(error) => tracing::warn!("설정 workspace 생성 실패: {error:#}"),
+                }
+            }
+        }
+        if let Some(workspace_id) = settings_workspace_select
+            && let Some(selected) = resolve_settings_workspace_id(
+                &self.workspaces,
+                Some(&workspace_id),
+                self.settings_workspace_id.as_deref(),
+                &self.active.id,
+            )
+        {
+            self.settings_workspace_id = Some(selected);
+            self.invalidate_env_profile_ui();
         }
         if legacy_agent_started {
             self.reveal_active_workspace_for_new_session();
@@ -7680,7 +7838,7 @@ impl eframe::App for App {
         if let Some(name) = workspace_rename {
             // E3: name 컬럼은 별칭 — 빈 값 허용(별칭 해제, 폴더명만 표시).
             let name = name.trim();
-            if let Err(e) = self.db.rename_workspace(&self.active.id, name) {
+            if let Err(e) = self.db.rename_workspace(&settings_wsid, name) {
                 tracing::warn!("워크스페이스 이름 저장 실패: {e:#}");
             } else {
                 self.refresh_workspaces();
@@ -7693,7 +7851,7 @@ impl eframe::App for App {
                 if let Err(e) = crate::dotenv_sync::write_env_var(&root, key, value.as_deref()) {
                     tracing::warn!(".env 기록 실패: {e:#}");
                 } else {
-                    self.sync_dotenv_env();
+                    self.sync_settings_workspace_dotenv(&settings_wsid);
                     self.invalidate_env_profile_ui();
                     self.invalidate_env_api_projects();
                 }
@@ -7701,14 +7859,14 @@ impl eframe::App for App {
         }
         if let Some(ui::env_profiles::EnvAction::Resync) = env_action {
             // 리프레시(4번): .env 계열 재스캔 + UI/카운트 캐시 무효화.
-            self.sync_dotenv_env();
+            self.sync_settings_workspace_dotenv(&settings_wsid);
             self.invalidate_env_profile_ui();
             self.credentials_ui.invalidate_cache();
             self.invalidate_env_api_projects();
         }
         if let Some(ui::env_profiles::EnvAction::SetProjectPath(path)) = env_action {
             let path_str = path.to_string_lossy().into_owned();
-            if let Err(e) = self.db.set_workspace_path(&self.active.id, &path_str) {
+            if let Err(e) = self.db.set_workspace_path(&settings_wsid, &path_str) {
                 tracing::warn!("프로젝트 폴더 저장 실패: {e:#}");
             } else {
                 if path_str.trim().is_empty() {
@@ -7717,7 +7875,7 @@ impl eframe::App for App {
                     if let Err(e) = crate::dotenv_sync::remove_workspace_dotenv(
                         &mut self.db,
                         &self.secret_store,
-                        &self.active.id,
+                        &settings_wsid,
                     ) {
                         tracing::warn!("dotenv 정리 실패: {e:#}");
                     }
@@ -7725,18 +7883,21 @@ impl eframe::App for App {
                     self.credentials_ui.invalidate_cache();
                     self.invalidate_env_api_projects();
                 }
-                self.save_workspace_anchor(); // rename 복구용 (dev,ino) 앵커
-                self.dismissed_renames.remove(&self.active.id);
-                self.sync_dotenv_env(); // .env → profile + SetSessionDefaultEnv(새 셸에 적용)
-                // active runtime의 셸 cwd도 갱신 — 새 셸/에이전트가 이 폴더에서 뜨게(codex High).
-                let new_cwd = std::path::PathBuf::from(&path_str);
-                let cwd = (new_cwd.is_dir()).then_some(new_cwd);
-                let _ = self
-                    .active
-                    .runtime
-                    .send_command(runtime::RuntimeCommand::SetShellCwd(cwd.clone()));
+                self.save_workspace_anchor_for(&settings_wsid); // rename 복구용 (dev,ino) 앵커
+                self.dismissed_renames.remove(&settings_wsid);
+                self.sync_settings_workspace_dotenv(&settings_wsid);
+                // 설정 대상이 실제 active와 같을 때만 runtime/file-tree에 반영한다. 비활성
+                // settings selection은 sidebar focus/runtime을 건드리지 않는다.
+                if settings_wsid == self.active.id {
+                    let new_cwd = std::path::PathBuf::from(&path_str);
+                    let cwd = (new_cwd.is_dir()).then_some(new_cwd);
+                    let _ = self
+                        .active
+                        .runtime
+                        .send_command(runtime::RuntimeCommand::SetShellCwd(cwd));
+                    self.refresh_file_tree_root();
+                }
                 // 표시명은 workspace_display_name이 path에서 파생한다(E3) — 별도 갱신 불필요.
-                self.refresh_file_tree_root();
                 self.refresh_workspaces();
             }
         }
@@ -7824,6 +7985,7 @@ impl eframe::App for App {
         }
         // 새 워크스페이스 생성(B안) — 폴더명으로 만들고 path/앵커 저장 후 즉시 전환.
         // 전환(switch_workspace → make_runtime)이 DB의 path/.env를 읽으므로 저장이 먼저다.
+        let mut ws_switch: Option<String> = None;
         let mut ws_created = false;
         if let Some(dir) = ws_create {
             let path_str = dir.to_string_lossy().into_owned();
@@ -9683,6 +9845,32 @@ h:1 EE:FF
 
         assert!(!workspace_visible_after_close(&closed, "closed"));
         assert!(workspace_visible_after_close(&closed, "open"));
+    }
+
+    #[test]
+    fn 설정_워크스페이스_선택은_숨김과_active를_변경하지_않는다() {
+        let row = |id: &str| crate::storage::WorkspaceRow {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            path: format!("/projects/{id}"),
+            created_at: String::new(),
+        };
+        let workspaces = vec![row("open"), row("closed")];
+        let active = "open".to_owned();
+        let closed = std::collections::HashMap::from([(
+            "closed".to_owned(),
+            ClosedWorkspaceState::Persisted,
+        )]);
+
+        let selected =
+            resolve_settings_workspace_id(&workspaces, Some("closed"), Some("open"), &active);
+
+        assert_eq!(selected.as_deref(), Some("closed"));
+        assert_eq!(active, "open", "설정 선택은 active runtime을 바꾸지 않는다");
+        assert!(
+            closed.contains_key("closed"),
+            "설정 선택은 sidebar 숨김 표식을 해제하지 않는다"
+        );
     }
 
     #[test]

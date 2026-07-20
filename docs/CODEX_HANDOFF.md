@@ -2,8 +2,8 @@
 
 ## Current task
 
-- Decouple the Environment & API project-list close action from workspace deletion/sidebar lifecycle.
-- Status: fixed and verified. `X` now persists only an Environment-list hidden ID; sidebar workspaces, runtimes, sessions, focus, DB workspace rows, credentials, and `.env` remain untouched.
+- Allow the last Environment & API project to close, leaving the list and detail surface empty while the `+` control remains available.
+- Status: fixed and verified. The last row can close, the list/detail body stays blank with only `+` available, and sidebar/runtime/session state remains untouched.
 
 ## Working area
 
@@ -14,12 +14,19 @@
 
 ## Plan
 
-1. Completed — trace Environment & API `X` from list action through confirmation into workspace DB/runtime deletion.
-2. Completed — add persisted Environment-only hidden project IDs and replace destructive delete handling.
-3. Completed — run config/selection/sidebar-isolation regressions and focused/full verification.
+1. Completed — remove the last-project guard and empty-list fallback selection/detail rendering.
+2. Completed — update empty-list and last-close regressions.
+3. Completed — run focused/full verification and record final state.
 
 ## Status
 
+- 2026-07-20: 사용자가 검증된 마지막 Environment 프로젝트 닫기 변경의 커밋, 공식 release build, 앱 재실행을 요청했다. 현재 3개 의도된 변경 파일을 기능 커밋으로 고정한 뒤 package script, bundle/helper 서명·아키텍처 검증, exact-name 기존 앱 종료와 exact bundle 재실행/시작 로그 확인을 진행한다. Push는 요청하지 않아 수행하지 않는다.
+- 2026-07-20: 최종 범위 검사를 마쳤다. `git diff --check`와 재실행한 rustfmt check가 통과했고 변경은 `app.rs`, `ui/env_project_list.rs`, handoff 3개 파일로 한정된다. Environment 목록에는 마지막 항목 개수 guard와 빈 목록 문구가 남아 있지 않으며 이번 요청에서는 commit/build/restart를 수행하지 않았다.
+- 2026-07-20: 최종 검증을 완료했다. localhost bind가 필요한 기존 7개 fixture만 명시 skip한 직렬 app 회귀는 564 passed/0 failed/5 ignored/7 filtered였고, `cargo clippy -p deppy-sijo --all-targets -- -D warnings`, rustfmt check가 모두 통과했다. 마지막 Environment 프로젝트를 닫아도 active runtime/sidebar state는 유지되고 설정 목록과 우측 상세만 빈 상태가 된다.
+- 2026-07-20: 첫 rustfmt check는 새 마지막-닫기 테스트의 assertion 두 곳 줄바꿈만 지적했다. 제품 코드 문제는 아니며 `cargo fmt --all` 적용 후 check를 재실행한다.
+- 2026-07-20: `cargo check -p deppy-sijo`와 확장된 Environment 마지막 닫기 회귀 1/1이 통과했다. 마지막 ID는 hidden set에 남고 settings selection은 `None`이며 active runtime/sidebar closed state는 그대로다. 다음은 rustfmt/strict Clippy와 전체 app 회귀다.
+- 2026-07-20: 마지막 Environment 프로젝트 닫기를 구현했다. row action은 개수와 무관하게 CloseRequested를 내고 helper는 마지막 ID도 hidden set에 넣은 뒤 선택을 `None`으로 돌린다. `refresh_workspaces`의 all-hidden 자동 복원을 제거했으며 Environment 전용 선택은 visible row가 0개일 때 active workspace로 폴백하지 않는다. 목록은 `+` header 아래를 empty-state 문구 없이 비우고, 우측 detail vertical도 project가 없으면 header/body를 전혀 그리지 않는다. 기존 sidebar/active 불변 회귀를 마지막 닫기·빈 selection까지 확장했다.
+- 2026-07-20: 사용자가 Environment & API의 마지막 프로젝트도 닫고 `+`만 남은 빈 목록/빈 상세 화면을 허용해 달라고 요청했다. 현재 UI는 row의 `project_count > 1`, close helper의 `len <= 1`, `refresh_workspaces`의 all-hidden 자동 복원, Environment settings ID의 active fallback 네 겹으로 마지막 항목을 유지한다. 네 제한을 제거하고 프로젝트가 0개면 설정 선택을 `None`으로 두며 우측 header/body와 빈 목록 문구를 렌더하지 않는다.
 - 2026-07-20: Terminal 표시 이름 활성화 후 exact-name 기존 `deppy-sijo`만 TERM 종료하고 정확한 `/Users/jr/Desktop/Projects/deppy-sijo/target/bundle/Deppy Sijo.app`을 열었다. marker와 app lock 모두 새 PID `70880`을 가리키고 실행 경로도 해당 bundle의 `Contents/MacOS/deppy-sijo`와 일치한다. 22:34:24 KST 시작 로그에는 log budget, AppleGothic/Apple SD Gothic 등록, web-remote `127.0.0.1:8737` 시작, dotenv timeout 안전 폴백 뒤 profile 정상 동기화와 ANSI scrollback 복원이 기록됐으며 새 panic/error는 없다. 임시 재실행 스크립트를 제거하고 최종 delivery 기록을 docs-only commit으로 push한다.
 - 2026-07-20: exact-name 종료/정확한 bundle open 스크립트를 Terminal bundle ID로 바로 전달한 첫 재실행 시도는 Terminal 대상 해석 오류 `-1728`로 스크립트 실행 전에 중단됐다. 따라서 기존 앱/프로세스 상태는 바뀌지 않았다. Terminal을 표시 이름으로 먼저 활성화한 뒤 같은 스크립트를 전달한다.
 - 2026-07-20: 새 bundle과 `deppy-mcp-proxy`의 deep/strict codesign 및 arm64 검증이 통과했다. 메인 SHA-256은 `698e2d1ec9b7a9acb9c535ae605dcd87f73bb5ea10126ab3c6fb3f61c32571d7`, bundle id `app.vector9.deppy-sijo`, version `0.1.0`, minimum macOS `11.0`이다. 다음은 exact-name 기존 앱만 종료하고 이 exact bundle을 실행해 새 PID와 시작 로그를 확인하는 단계다.

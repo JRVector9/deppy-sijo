@@ -1519,10 +1519,9 @@ fn close_settings_env_project(
     workspace_id: &str,
     current: Option<&str>,
 ) -> Option<String> {
-    if visible_projects.len() <= 1
-        || !visible_projects
-            .iter()
-            .any(|project| project.id == workspace_id)
+    if !visible_projects
+        .iter()
+        .any(|project| project.id == workspace_id)
     {
         return current.map(str::to_owned);
     }
@@ -4524,24 +4523,6 @@ impl App {
             .ui
             .hidden_env_project_ids
             .retain(|id| workspaces.iter().any(|workspace| workspace.id == *id));
-        // UI는 마지막 visible 프로젝트의 X를 비활성화하지만, config 수동 편집이나
-        // workspace DB 삭제 뒤에도 Environment 상세 context가 완전히 비지 않게 정규화한다.
-        if !workspaces.is_empty()
-            && workspaces.iter().all(|workspace| {
-                self.config
-                    .ui
-                    .hidden_env_project_ids
-                    .contains(&workspace.id)
-            })
-        {
-            let fallback = workspaces
-                .iter()
-                .find(|workspace| workspace.id == self.active.id)
-                .or_else(|| workspaces.first());
-            if let Some(fallback) = fallback {
-                self.config.ui.hidden_env_project_ids.remove(&fallback.id);
-            }
-        }
         if (self.config.ui.closed_workspace_ids.len() != persisted_before
             || self.config.ui.hidden_env_project_ids != hidden_env_before)
             && let Err(error) = self.config.save(&self.config_path)
@@ -7428,13 +7409,19 @@ impl eframe::App for App {
         };
         let term_cfg = self.config.terminal.clone();
         let wsid = self.active.id.clone();
-        let settings_wsid = if self.settings_category == ui::settings::Category::Environment {
-            resolve_settings_env_project_id(
-                &env_api_projects,
-                None,
-                self.settings_workspace_id.as_deref(),
-                &wsid,
-            )
+        let is_environment = self.settings_category == ui::settings::Category::Environment;
+        let settings_env_wsid = is_environment
+            .then(|| {
+                resolve_settings_env_project_id(
+                    &env_api_projects,
+                    None,
+                    self.settings_workspace_id.as_deref(),
+                    &wsid,
+                )
+            })
+            .flatten();
+        let settings_wsid = if is_environment {
+            settings_env_wsid.clone()
         } else {
             resolve_settings_workspace_id(
                 &self.workspaces,
@@ -7444,17 +7431,26 @@ impl eframe::App for App {
             )
         }
         .unwrap_or_else(|| wsid.clone());
-        if self.settings_open
-            && self.settings_workspace_id.as_deref() != Some(settings_wsid.as_str())
-        {
-            self.settings_workspace_id = Some(settings_wsid.clone());
+        if self.settings_open {
+            let next_settings_id = if is_environment {
+                settings_env_wsid.clone()
+            } else {
+                Some(settings_wsid.clone())
+            };
+            if self.settings_workspace_id != next_settings_id {
+                self.settings_workspace_id = next_settings_id;
+            }
         }
-        let settings_env_api_project = env_api_projects
-            .iter()
-            .find(|project| project.id == settings_wsid)
-            .cloned();
+        let settings_env_api_project = settings_env_wsid.as_deref().and_then(|settings_id| {
+            env_api_projects
+                .iter()
+                .find(|project| project.id == settings_id)
+                .cloned()
+        });
         // 환경변수 편집 게이트(E1 ⑤): 프로젝트 폴더가 지정된 워크스페이스만 .env 편집 허용.
-        let env_project_root = self.workspace_tree_root(&settings_wsid);
+        let env_project_root = settings_env_wsid
+            .as_deref()
+            .and_then(|settings_id| self.workspace_tree_root(settings_id));
         let env_project_rows_loading =
             self.env_api_projects_cache.is_none() && self.env_project_rows_pending;
         let env_project_rows_failed = self.env_project_rows_failed;
@@ -7524,7 +7520,7 @@ impl eframe::App for App {
                         // 속하지 않으면 새 프로젝트 등록, 활성 워크스페이스가 경로 미설정이면
                         // 이 폴더 지정 CTA. 클릭 시 기존 ws_create/SetProjectPath 흐름 재사용.
                         let mut banner_used = false;
-                        if settings_wsid == wsid
+                        if settings_env_wsid.as_deref() == Some(wsid.as_str())
                             && let Some(banner) = &self.env_session_banner
                         {
                             let show_register = !banner.registered;
@@ -7586,7 +7582,7 @@ impl eframe::App for App {
                             match ui::env_project_list::render_with_style(
                                 ui,
                                 &env_api_projects,
-                                &settings_wsid,
+                                settings_env_wsid.as_deref().unwrap_or(""),
                                 &text,
                                 &project_list_style,
                             ) {
@@ -7630,6 +7626,9 @@ impl eframe::App for App {
                                 ui.spacing_mut().item_spacing.y = 0.0;
                                 ui.set_min_height(full_h);
                                 ui.set_width(ui.available_width());
+                                if settings_env_api_project.is_none() {
+                                    return;
+                                }
                                 render_env_api_project_header(
                                     ui,
                                     settings_env_api_project.as_ref(),
@@ -9936,10 +9935,20 @@ h:1 EE:FF
 
         let only_remaining = vec![project("SKRT")];
         let kept = close_settings_env_project(&mut hidden, &only_remaining, "SKRT", Some("SKRT"));
-        assert_eq!(kept.as_deref(), Some("SKRT"));
+        assert_eq!(kept, None);
         assert!(
-            !hidden.contains("SKRT"),
-            "마지막 Environment 프로젝트는 유지한다"
+            hidden.contains("SKRT"),
+            "마지막 프로젝트도 설정 목록에서 닫힌다"
+        );
+        assert_eq!(
+            resolve_settings_env_project_id(&[], None, kept.as_deref(), &active),
+            None,
+            "빈 Environment 목록은 active workspace로 폴백하지 않는다"
+        );
+        assert_eq!(active, "mjm", "마지막 닫기도 active runtime을 유지한다");
+        assert!(
+            sidebar_closed.is_empty(),
+            "마지막 닫기도 sidebar를 유지한다"
         );
     }
 

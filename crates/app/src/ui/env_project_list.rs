@@ -128,13 +128,8 @@ pub fn render_with_style(
     };
 
     if projects.is_empty() {
-        ui.painter().text(
-            list_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            catalog.t("env.projects_empty", &[]),
-            egui::FontId::proportional(14.0),
-            ui.visuals().weak_text_color(),
-        );
+        // 사용자가 마지막 항목까지 닫을 수 있다. 상단 `+`만 유지하고 목록 본문은
+        // 별도 empty-state 문구 없이 비워 둔다.
         return action;
     }
 
@@ -192,15 +187,7 @@ fn render_rows(
     ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
     for project in projects {
         let selected = project.id == active_id;
-        let next = render_row(
-            ui,
-            project,
-            selected,
-            projects.len(),
-            row_width,
-            style,
-            catalog,
-        );
+        let next = render_row(ui, project, selected, row_width, style, catalog);
         if !matches!(next, EnvProjectListAction::None) {
             *action = next;
         }
@@ -270,7 +257,6 @@ fn render_row(
     ui: &mut egui::Ui,
     project: &EnvProjectRow,
     selected: bool,
-    project_count: usize,
     row_width: f32,
     style: &EnvProjectListStyle,
     catalog: &i18n::Catalog,
@@ -401,9 +387,6 @@ fn render_row(
     // 선택 행은 항상, 나머지는 hover 때만 ×를 노출한다. 이 버튼은 Environment & API
     // 목록만 닫으며 workspace 자체를 삭제하거나 sidebar runtime을 종료하지 않는다.
     if selected || response.hovered() {
-        // 마지막 프로젝트는 상세 context가 비지 않도록 유지한다. 닫힌 프로젝트는 `+`로
-        // 같은 폴더를 다시 고르면 App이 목록에 복원한다.
-        let close_enabled = project_count > 1;
         let close = ui
             .interact(
                 delete_rect,
@@ -411,8 +394,8 @@ fn render_row(
                 egui::Sense::click(),
             )
             .on_hover_text(catalog.t("action.close", &[]));
-        paint_close_button(ui, delete_rect, close.hovered() && close_enabled);
-        if close.clicked() && close_enabled {
+        paint_close_button(ui, delete_rect, close.hovered());
+        if close.clicked() {
             return EnvProjectListAction::CloseRequested(project.id.clone());
         }
     }

@@ -2,8 +2,8 @@
 
 ## Current task
 
-- Finish and commit `HomeV1`: keep the completed three-row Grok/Home and distinct workspace color work, then add GitHub beside Claude/OpenAI in the bottom service status strip without relaunching the app.
-- Status: GitHub is wired to the official `https://www.githubstatus.com/api/v2/status.json` Statuspage endpoint and reuses the existing 5-minute indicator/hover/click component. Implementation and verification are complete and included in the HomeV1 commit; relaunch is explicitly excluded.
+- Fix the sidebar provider label staying on `Codex` after the same PTY exits Codex and starts Claude.
+- Status: provider-aware hook/cache validation is implemented and verified. The user has now requested commit, release rebuild, and relaunch; source verification is complete and delivery is in progress.
 
 ## Working area
 
@@ -14,14 +14,19 @@
 
 ## Plan
 
-1. Completed — inspect the Home update list and workspace avatar color allocation.
-2. Completed — remove the update heading/source caption and replace MLX with the official Grok RSS feed.
-3. Completed — left-align row content and constrain the list to an exact three-row, section-local scroll viewport.
-4. Completed — assign distinct categorical workspace avatar colors independently of the initial letter.
-5. Completed — run parser, Home kittest, workspace color, i18n, all-target check, formatting, diff, and strict Clippy verification.
+1. Completed — trace the sidebar provider label through hook overrides, process discovery, and the binding cache.
+2. Completed — accept a hook override only when a live descendant agent has the same provider kind; otherwise fall through to current-process discovery.
+3. Completed — reuse a cached binding only when its owner pid still classifies as the same provider.
+4. Completed — add provider-switch regression coverage and run the full agent-detect unit group.
+5. Completed — app check, strict Clippy, formatting/diff checks pass.
+6. In progress — commit the verified source, build/sign the macOS release bundle, stop only the previous project app process, and launch the new bundle.
 
 ## Status
 
+- 2026-07-20: 사용자가 provider 전환 수정의 커밋·재빌드·실행을 요청했다. 현재 worktree에는 검증된 `agent_detect.rs`와 handoff 변경만 있으며 diff check가 깨끗하다. 다음은 커밋 후 공식 macOS 패키징, 서명/아키텍처 검증, 기존 project bundle 프로세스 한정 재시작이다.
+- 2026-07-20: Codex→Claude provider 전환 수정의 최종 검증을 완료했다. agent-detect 전체는 9 passed/1 ignored, `cargo check -p deppy-sijo --all-targets`와 `cargo clippy -p deppy-sijo --all-targets -- -D warnings`, fmt check, diff check가 모두 통과했다. 수정 파일은 `crates/app/src/agent_detect.rs`와 handoff뿐이며, 사용자 요청에 없던 커밋·패키징·앱 재실행은 하지 않았다.
+- 2026-07-20: provider 전환 수정 후 `cargo check -p deppy-sijo --all-targets`는 통과했다. 첫 strict app Clippy는 기능 오류가 아니라 새 override 분기의 중첩 `if let`에 대한 `clippy::collapsible-if` 1건으로 중단됐다. let-chain으로만 정리했으며 전체 agent-detect 테스트와 strict Clippy를 다시 실행한다.
+- 2026-07-20: 같은 PTY에서 Codex를 종료하고 Claude를 시작해도 sidebar가 Codex로 남는 원인을 수정했다. `detect_cached`가 hook override의 공급자와 실제 descendant 프로세스 공급자를 대조하고, 불일치하면 override를 건너뛰어 현재 프로세스를 재탐색한다. cache도 owner pid 생존 여부뿐 아니라 공급자 종류까지 일치해야 재사용한다. 신규 회귀 2/2와 전체 agent-detect 테스트 9 passed/1 ignored, fmt/diff check가 통과했다. 처음 `--exact`로 실행한 두 테스트는 모듈 경로가 빠져 0개가 선택됐고, substring 실행으로 각각 1/1을 실제 수행해 통과시켰다. 다음은 app check와 strict Clippy다.
 - 2026-07-20: GitHub 상태 추가 후 `kittest_하단상태바에_claude_openai_github가_함께_표시된다` 1/1과 `cargo clippy --workspace --all-targets -- -D warnings`가 통과했다. 기존 Home/Grok/workspace/i18n 집중 테스트와 all-target check도 통과했고 fmt/diff/staged-diff final check까지 깨끗하다. 현재 HomeV1 변경 전체를 단일 커밋에 포함하며, 사용자 지시대로 패키징/재실행은 하지 않는다.
 - 2026-07-20: 하단 상태 표시줄에 `GitHub`를 Claude·OpenAI와 같은 방식으로 추가했다. 공식 `https://www.githubstatus.com/api/v2/status.json`이 기존 parser와 같은 Statuspage v2 `indicator`/`description` 구조임을 live endpoint로 확인했고, `StatusFeedSnapshot.github`를 5분 worker에서 채워 App이 마지막 성공값을 유지하도록 연결했다. 표시 문구는 `GitHub`, 클릭 URL은 `https://www.githubstatus.com`이며 Home 공지 목록에는 추가하지 않는다. 다음은 새 status-bar kittest, app check/Clippy/fmt/diff 후 전체 HomeV1 커밋이며 앱 재실행은 하지 않는다.
 - 2026-07-20: 최종 수정 후 3행 viewport 계산에서 egui `show_rows`가 전역 item spacing을 더한다는 점을 확인해 해당 scroll scope의 y spacing을 0으로 고정했다. 이로써 48px×3 = 144px가 정확히 3행과 일치한다. 재실행한 Home kittest 1/1, workspace color 1/1, app all-target strict Clippy, fmt/diff check가 모두 통과했다. 현재 작업은 완료됐고 커밋·패키징·재실행은 이번 요청 범위가 아니다.

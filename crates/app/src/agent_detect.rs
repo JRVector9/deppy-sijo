@@ -52,24 +52,25 @@ pub fn detect_cached(
     cache: &mut BindingCache,
 ) -> HashMap<SessionId, AgentBinding> {
     let rows = process_rows();
-    let live_pids: std::collections::HashSet<u32> = rows.iter().map(|r| r.pid).collect();
     let mut out = HashMap::new();
     for (sid, shell_pid) in sessions {
-        // hook(SessionStart 등)이 보고한 바인딩이 있으면 그것이 결정적 — 프로세스 생존만
-        // 확인하고 탐색 전체를 스킵한다(cmux식 이벤트 바인딩, 2026-07-07).
-        if let Some(b) = overrides.get(sid) {
-            if let Some(owner) = find_agent_pid(*shell_pid, &rows) {
-                cache.entries.insert(*sid, (b.clone(), owner, true));
-                out.insert(*sid, b.clone());
-            } else {
-                cache.entries.remove(sid);
-            }
+        // hook(SessionStart 등)이 보고한 바인딩이 있으면 그것이 결정적이다. 단 같은 pane에서
+        // Codex를 종료한 뒤 Claude를 실행할 수 있으므로, 살아 있는 에이전트의 종류까지 hook
+        // 기록과 일치할 때만 사용한다. 종류가 다르면 오래된 hook을 무시하고 아래 탐색으로
+        // 현재 에이전트를 다시 바인딩한다(2026-07-20 실증).
+        if let Some(b) = overrides.get(sid)
+            && let Some(owner) = find_agent_pid(*shell_pid, &rows, b.kind)
+        {
+            cache.entries.insert(*sid, (b.clone(), owner, true));
+            out.insert(*sid, b.clone());
             continue;
         }
-        // 캐시 히트 + owner 프로세스 생존 → 재발견 스킵. 단 휴리스틱 바인딩은 lsof로
-        // 결정적 업그레이드를 시도한다(작업 중 rollout이 열리면 정확한 파일로 교체).
+        // 캐시 히트 + owner 프로세스 종류 일치 → 재발견 스킵. pid 생존만 확인하면 오래된
+        // Codex 바인딩에 새 Claude pid가 들어간 캐시가 계속 재사용될 수 있다. 단 휴리스틱
+        // 바인딩은 lsof로 결정적 업그레이드를 시도한다(작업 중 rollout이 열리면 정확한
+        // 파일로 교체).
         if let Some((binding, owner_pid, det)) = cache.entries.get(sid)
-            && live_pids.contains(owner_pid)
+            && agent_pid_matches_kind(*owner_pid, binding.kind, &rows)
         {
             let (owner_pid, det) = (*owner_pid, *det);
             {
@@ -139,13 +140,24 @@ pub struct AgentDisplay {
 
 /// 셸 pid의 자손 중 claude/codex를 찾아 transcript까지 바인딩한다. 캐시 생존 확인용으로
 /// 그 에이전트 프로세스 pid도 함께 돌려준다.
-/// 셸 자손 중 에이전트 프로세스가 있으면 그 pid (생존 확인용 — 바인딩은 hook이 제공).
-fn find_agent_pid(shell_pid: u32, rows: &[ProcRow]) -> Option<u32> {
+/// 셸 자손 중 hook 바인딩과 같은 종류의 에이전트 프로세스가 있으면 그 pid를 돌려준다.
+/// 종류를 대조하지 않으면 같은 PTY에서 Codex → Claude 전환 시 오래된 Codex hook이 새
+/// Claude 프로세스를 자신의 owner로 오인한다.
+fn find_agent_pid(shell_pid: u32, rows: &[ProcRow], expected: AgentKind) -> Option<u32> {
     let descendants = descendant_pids(shell_pid, rows);
     rows.iter()
         .filter(|r| descendants.contains(&r.pid))
-        .find(|r| classify(&r.command).is_some())
+        .find(|r| classify(&r.command).is_some_and(|(kind, _)| kind == expected))
         .map(|r| r.pid)
+}
+
+/// 캐시 owner pid가 여전히 같은 종류의 에이전트인지 확인한다. 프로세스가 끝났거나 pid가
+/// 다른 공급자 프로세스로 바뀌면 false여서 transcript를 다시 탐색한다.
+fn agent_pid_matches_kind(owner_pid: u32, expected: AgentKind, rows: &[ProcRow]) -> bool {
+    rows.iter()
+        .find(|r| r.pid == owner_pid)
+        .and_then(|r| classify(&r.command))
+        .is_some_and(|(kind, _)| kind == expected)
 }
 
 fn find_agent(shell_pid: u32, rows: &[ProcRow]) -> Option<(AgentBinding, u32, bool)> {
@@ -709,6 +721,38 @@ mod tests {
         let d = descendant_pids(100, &rows);
         assert!(d.contains(&200) && d.contains(&300));
         assert!(!d.contains(&999));
+    }
+
+    #[test]
+    fn hook_owner는_저장된_에이전트_종류와_같아야_한다() {
+        let rows = vec![
+            ProcRow {
+                pid: 100,
+                ppid: Some(1),
+                command: "zsh".into(),
+            },
+            ProcRow {
+                pid: 200,
+                ppid: Some(100),
+                command: "/Users/jr/.local/bin/claude --session-id current-claude".into(),
+            },
+        ];
+
+        assert_eq!(find_agent_pid(100, &rows, AgentKind::Claude), Some(200));
+        assert_eq!(find_agent_pid(100, &rows, AgentKind::Codex), None);
+    }
+
+    #[test]
+    fn 캐시_owner의_공급자가_바뀌면_재사용하지_않는다() {
+        let rows = vec![ProcRow {
+            pid: 200,
+            ppid: Some(100),
+            command: "/Users/jr/.local/bin/claude --session-id current-claude".into(),
+        }];
+
+        assert!(agent_pid_matches_kind(200, AgentKind::Claude, &rows));
+        assert!(!agent_pid_matches_kind(200, AgentKind::Codex, &rows));
+        assert!(!agent_pid_matches_kind(999, AgentKind::Claude, &rows));
     }
 
     #[test]

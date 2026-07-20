@@ -2,8 +2,8 @@
 
 ## Current task
 
-- Keep multiple workspace session trees expanded in the sidebar when focus moves between workspaces.
-- Status: fixed and verified. Workspace switching now retargets the existing file tree instead of replacing it, so expanded workspace session trees remain open until explicitly collapsed.
+- Make the terminal selection context action actually clean wrapped command whitespace and copy the result.
+- Status: fixed and verified. The context action now cleans the selected terminal text into one line and copies it; ordinary paste remains unchanged.
 
 ## Working area
 
@@ -21,6 +21,14 @@
 
 ## Status
 
+- 2026-07-20: 사용자가 검증된 터미널 선택 공백 정리 복사 변경의 커밋, release 재빌드, 앱 실행을 요청했다. 7개 변경 파일을 기능 커밋으로 고정한 뒤 공식 package script, deep/strict codesign·arm64 검증, 기존 exact-name 앱 프로세스 한정 종료와 exact project bundle 실행 및 시작 로그 확인을 진행한다.
+- 2026-07-20: 터미널 선택 공백 정리 복사의 최종 검증을 완료했다. 집중 회귀 1/1, Workspace 전체 47/47, i18n 7/7, `cargo clippy -p deppy-sijo --all-targets -- -D warnings`, fmt/diff check, legacy `workspace.menu.paste_trimmed` 부재 검사가 통과했다. 메뉴는 선택 영역에만 `공백 정리 후 복사하기`로 표시되고 선택 원문을 정리해 OS clipboard에 복사하며, 기존 일반 `붙여넣기`는 원문 보존 경로 그대로다. commit/release build/app 실행은 아직 수행하지 않았다.
+- 2026-07-20: 선택 기반 정리 helper와 회귀 테스트를 추가했고 집중 테스트 1/1이 통과했다. 첨부 화면 형태를 익명화한 명령이 `! curl ...` 한 줄로 합쳐지며 빈 행, 행 들여쓰기, 다음 행이 있는 unescaped trailing/standalone `\`는 제거되고, 행 내부 및 인용 값의 연속 공백과 escaped backslash는 보존된다. 다음은 Workspace 전체 회귀, locale parity, strict Clippy/fmt/diff다.
+- 2026-07-20: 터미널 선택 후 `공백 정리 후 붙여넣기`가 내부 공백을 정리하지 않는 원인을 확인했다. 메뉴는 선택 영역이 아니라 기존 OS clipboard를 읽고 `text.trim()`만 적용한 뒤 터미널에 다시 주입해, selection의 화면 행 개행·들여쓰기·독립 `\`를 전혀 처리하지 않았다. 선택 텍스트를 대상으로 빈 행/행 들여쓰기/line-continuation을 정리해 한 줄로 복사하고 메뉴명을 `공백 정리 후 복사하기`로 바꾸며, 일반 붙여넣기는 원문 보존 동작으로 유지한다.
+- 2026-07-20: 대문자 절대 Git 경로를 지정한 docs-only commit 재시도도 현재 sandbox가 `.git/index.lock` 생성을 거부했다. 기능 변경은 `a6e55a1`에 정상 커밋됐고 release 앱/ZIP 검증도 완료됐다. worktree에는 최종 배포 기록인 `docs/CODEX_HANDOFF.md`만 unstaged로 남으며, 다음 Git metadata 쓰기 가능 환경에서 이 문서만 `docs: record workspace expansion package`로 커밋하면 된다.
+- 2026-07-20: 배포 결과를 기록하는 docs-only commit의 첫 `git add`는 macOS가 worktree physical path를 소문자 `/Users/jr/desktop/...`로 반환해 sandbox 허용 경로와 불일치하면서 `.git/index.lock` 생성이 거부됐다. 기능 커밋 `a6e55a1`과 앱/ZIP에는 영향이 없고 lock도 생성되지 않았다. 대문자 절대 `--git-dir`/`--work-tree`로 한 번 재시도한다.
+- 2026-07-20: 실제 전환 경로 수정의 배포 준비를 완료했다. 구현 커밋은 `a6e55a1`이다. `target/bundle/Deppy-Sijo-0.1.0-macos-arm64-HomeV1-a6e55a1.zip`은 17MiB, SHA-256 `7a9034ff6302ba35404bc7567f946ceabdf3a90450f85a974f6a29fb52ea7e6a`이며 `unzip -t`가 오류 없이 통과했다. 원본 `.app`과 helper의 deep/strict codesign 검증 및 두 실행 파일의 arm64 확인도 통과했다. 메인 바이너리 SHA-256은 `6026df3c811d97c10653a40c27a7f11c498b2f4c03d784094640683451e6d6f9`, bundle id `app.vector9.deppy-sijo`, version `0.1.0`, minimum macOS `11.0`이다. 앱은 실행/재시작하지 않았다.
+- 2026-07-20: 수정 커밋 `a6e55a1` (`fix(sidebar): preserve expanded workspaces on switch`)을 생성했다. `CARGO_NET_OFFLINE=true sh scripts/package-macos.sh`의 release build는 25.70초에 완료됐고 `target/bundle/Deppy Sijo.app`을 재생성했다. 현재 managed 환경에서는 Developer ID를 사용할 수 없어 ad-hoc 서명됐으며 앱 실행/재시작은 하지 않았다. 다음은 commit-specific ZIP 생성과 무결성/서명/아키텍처 검증이다.
 - 2026-07-20: 사용자가 실제 전환 경로 수정의 커밋, release build, ZIP 생성을 요청했다. 검증된 `app.rs`, `ui/file_tree.rs`와 누적 handoff를 수정 커밋으로 고정한 뒤 공식 package script와 commit-specific ZIP 검증을 수행하며 앱은 실행하지 않는다.
 - 2026-07-20: 실제 전환 경로의 확장 초기화 수정 검증을 완료했다. 루트 변경 포함 집중 kittest 1/1, FileTree 전체 61/61, `cargo clippy -p deppy-sijo --all-targets -- -D warnings`, fmt check, diff check가 모두 통과했다. `refresh_file_tree_root()`는 이제 기존 `FileTreeUi`에 `set_root()`만 호출하므로 workspace 전환 시 per-workspace 확장 map이 보존된다. release build/앱 실행/추가 commit은 아직 수행하지 않았다.
 - 2026-07-20: 수정 후 루트 변경을 실제로 끼운 다중 workspace 확장 kittest가 1/1 통과했다. B 선택 후 A+B가 열린 상태에서 `FileTreeUi::set_root()`를 호출해도 두 세션 트리가 유지되고, A를 다시 눌렀을 때만 A가 접히며 B session focus 대상도 유지된다. 다음은 FileTree 전체 회귀와 strict Clippy/fmt/diff다.

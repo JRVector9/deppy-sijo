@@ -2814,6 +2814,17 @@ impl WorkspaceUi {
                         ui.ctx().copy_text(text.clone());
                         ui.close();
                     }
+                    // 터미널 화면에서 여러 행을 드래그하면 selection_text가 화면 행마다
+                    // 개행을 넣는다. 문서형 명령의 들여쓰기/빈 행/줄 연속 `\`까지 그대로
+                    // 복사하면 다시 붙였을 때 명령이 여러 조각으로 깨지므로, 선택 원문을
+                    // 한 줄 명령으로 정리해 클립보드에 넣는 명시적 복사 동작을 제공한다.
+                    if ui
+                        .button(catalog.t("workspace.menu.copy_trimmed", &[]))
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(clean_terminal_selection_for_copy(&text));
+                        ui.close();
+                    }
                     // 선택 → 에이전트로 보내기 (2026-07-17 시나리오 ①): 에러 출력을
                     // 복사→pane 전환→붙여넣기→타이핑하던 흐름을 우클릭 두 번으로 줄인다.
                     // 대상은 **실행 중으로 감지된 에이전트 pane**(등록 목록이 아니라
@@ -2847,34 +2858,6 @@ impl WorkspaceUi {
                         );
                     }
                     None => tracing::warn!("컨텍스트 메뉴 붙여넣기: 클립보드에 텍스트 없음"),
-                }
-                ui.close();
-            }
-            // 공백 정리 후 붙여넣기 (2026-07-18 사용자): 코드블록/문서에서 복사한
-            // 명령은 앞 들여쓰기·끝 줄바꿈을 달고 와서, claude/codex `!` 셸 모드에
-            // 그대로 넣으면 인식이 어긋나거나 즉시 실행된다. 앞뒤 공백(끝 줄바꿈
-            // 포함)만 잘라 넣는다 — 내부 줄바꿈은 보존(bracketed paste가 감싼다).
-            // 기본 붙여넣기는 원문 보존 계약이라 별도 항목으로 둔다.
-            if let Some(paste_session) = session
-                && ui
-                    .button(catalog.t("workspace.menu.paste_trimmed", &[]))
-                    .clicked()
-            {
-                match crate::ui::clipboard_image::read_clipboard_text() {
-                    Some(text) => {
-                        let bytes = terminal_text_paste_bytes(
-                            text.trim(),
-                            self.session_bracketed_paste(paste_session),
-                        );
-                        self.send(
-                            client,
-                            RuntimeCommand::WriteInput {
-                                session: paste_session,
-                                bytes,
-                            },
-                        );
-                    }
-                    None => tracing::warn!("공백 정리 붙여넣기: 클립보드에 텍스트 없음"),
                 }
                 ui.close();
             }
@@ -3457,6 +3440,35 @@ fn shift_selection_cell(idx: usize, delta_rows: i32, cols: usize, rows: usize) -
 
 fn terminal_text_paste_bytes(text: &str, bracketed_paste: bool) -> Vec<u8> {
     input_mapper::paste_bytes(text.as_bytes(), bracketed_paste)
+}
+
+/// 터미널 화면에서 드래그한 여러 행을 다시 붙일 수 있는 한 줄 명령으로 정리한다.
+///
+/// - 행 앞뒤 공백과 빈 행은 제거한다.
+/// - 다음 내용이 있는 행 끝의 unescaped `\`는 shell line-continuation이므로 제거한다.
+/// - 남은 행은 공백 하나로 잇는다.
+///
+/// 행 내부는 건드리지 않아 `"value  with  spaces"` 같은 인용 값의 공백을 보존한다.
+fn clean_terminal_selection_for_copy(text: &str) -> String {
+    let mut lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .peekable();
+    let mut cleaned = Vec::new();
+    while let Some(line) = lines.next() {
+        let mut line = line.to_owned();
+        if lines.peek().is_some()
+            && line.chars().rev().take_while(|ch| *ch == '\\').count() % 2 == 1
+        {
+            line.pop();
+            line.truncate(line.trim_end().len());
+        }
+        if !line.is_empty() {
+            cleaned.push(line);
+        }
+    }
+    cleaned.join(" ")
 }
 
 /// 세션 행 2행: "[PTY] Codex · gpt-5.5 · xhigh · ctx 69%" (빈 부분은 생략).
@@ -5000,6 +5012,33 @@ mod tests {
             let inner = &wrapped[b"\x1b[200~".len()..wrapped.len() - b"\x1b[201~".len()];
             assert_eq!(inner, fixture.as_bytes(), "{fixture}");
         }
+    }
+
+    #[test]
+    fn 터미널_선택_공백정리_복사는_화면행과_line_continuation을_한줄로_합친다() {
+        let selected = r#"! curl -s
+https://example.test/login \
+        -c /tmp/cookies.txt \
+        --data-urlencode "method=login" --data-urlencode "tenant=502"
+
+\
+        --data-urlencode "id=user" --data-urlencode
+"pw=secret  value!""#;
+
+        assert_eq!(
+            clean_terminal_selection_for_copy(selected),
+            "! curl -s https://example.test/login -c /tmp/cookies.txt --data-urlencode \"method=login\" --data-urlencode \"tenant=502\" --data-urlencode \"id=user\" --data-urlencode \"pw=secret  value!\""
+        );
+        assert_eq!(
+            clean_terminal_selection_for_copy("  echo   'a  b'  "),
+            "echo   'a  b'",
+            "행 내부와 인용 값의 공백은 보존해야 한다"
+        );
+        assert_eq!(
+            clean_terminal_selection_for_copy("printf '\\\\'\\\\\nnext"),
+            "printf '\\\\'\\\\ next",
+            "짝수 trailing backslash는 line-continuation이 아니므로 보존해야 한다"
+        );
     }
 
     #[test]

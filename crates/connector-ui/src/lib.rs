@@ -8,8 +8,8 @@ use std::mem;
 
 use connector_contract::{
     ApprovalDecision, ApprovalPrompt, ConnectionState, ConnectorIntent, ConnectorSnapshot,
-    PermissionRule, SensitiveInput, ServerDraft, ServerId, ServerSummary, SlackStatus,
-    ToolListItem, ToolPage, TransportDraft, TransportKind,
+    OAuthClientPrompt, OperationId, PermissionRule, SensitiveInput, ServerDraft, ServerId,
+    ServerSummary, SlackStatus, ToolListItem, ToolPage, TransportDraft, TransportKind,
 };
 use egui::{Button, ComboBox, Label, ScrollArea, TextEdit, Ui};
 use i18n::Catalog;
@@ -53,6 +53,11 @@ impl ConnectorUi {
     /// Renders one frame from an immutable snapshot and returns at most one intent.
     #[must_use]
     pub fn render(&mut self, ui: &mut Ui, snapshot: &ConnectorSnapshot) -> Option<ConnectorIntent> {
+        if self.oauth_client.is_none()
+            && let Some(prompt) = snapshot.oauth_client_prompt.as_ref()
+        {
+            self.oauth_client = Some(OAuthClientDraft::from_prompt(prompt));
+        }
         let mut intent = None;
         let has_modal = self.add_server.is_some()
             || self.invoke.is_some()
@@ -117,7 +122,7 @@ fn render_main(
         }
     });
 
-    render_slack_summary(ui, snapshot, labels);
+    render_slack_summary(ui, snapshot, labels, intent);
     ui.separator();
     render_server_overview(ui, snapshot, labels, intent);
 
@@ -126,12 +131,18 @@ fn render_main(
         .as_ref()
         .and_then(|id| snapshot.servers.iter().find(|server| &server.id == id));
     if let Some(server) = selected {
+        let selected_config = snapshot
+            .selected_server_config
+            .as_ref()
+            .filter(|config| config.id.as_ref() == Some(&server.id));
         ui.separator();
         render_selected_server(
             ui,
             snapshot,
             server,
+            selected_config,
             labels,
+            add_server,
             invoke,
             oauth_client,
             delete_server,
@@ -160,7 +171,12 @@ fn render_main(
     }
 }
 
-fn render_slack_summary(ui: &mut Ui, snapshot: &ConnectorSnapshot, labels: &Labels) {
+fn render_slack_summary(
+    ui: &mut Ui,
+    snapshot: &ConnectorSnapshot,
+    labels: &Labels,
+    intent: &mut Option<ConnectorIntent>,
+) {
     let status = match snapshot.slack_status {
         SlackStatus::NotConfigured => &labels.not_configured,
         SlackStatus::Ready => &labels.ready,
@@ -175,6 +191,11 @@ fn render_slack_summary(ui: &mut Ui, snapshot: &ConnectorSnapshot, labels: &Labe
         if snapshot.slack_tool_count > 0 {
             ui.label(snapshot.slack_tool_count.to_string());
             ui.label(&labels.tools);
+        }
+        if snapshot.slack_status == SlackStatus::NotConfigured
+            && ui.button(&labels.configure).clicked()
+        {
+            offer_intent(intent, ConnectorIntent::EnsureSlackServer);
         }
     });
 }
@@ -220,7 +241,9 @@ fn render_selected_server(
     ui: &mut Ui,
     snapshot: &ConnectorSnapshot,
     server: &ServerSummary,
+    selected_config: Option<&ServerDraft>,
     labels: &Labels,
+    server_form: &mut Option<ServerFormDraft>,
     invoke: &mut Option<InvokeDraft>,
     oauth_client: &mut Option<OAuthClientDraft>,
     delete_server: &mut Option<DeleteServerDraft>,
@@ -231,6 +254,11 @@ fn render_selected_server(
         ui.label(transport_label(server.transport, labels));
         if ui.button(&labels.discover).clicked() {
             offer_intent(intent, ConnectorIntent::Discover(server.id.clone()));
+        }
+        if let Some(config) = selected_config
+            && ui.button(&labels.edit).clicked()
+        {
+            *server_form = Some(ServerFormDraft::from_contract(config));
         }
         if ui.button(&labels.authorize).clicked() {
             offer_intent(intent, ConnectorIntent::BeginOAuth(server.id.clone()));
@@ -495,6 +523,9 @@ fn render_oauth_modal(
             });
         });
     if close {
+        if let Some(operation_id) = current.operation_id.clone() {
+            offer_intent(intent, ConnectorIntent::Cancel(operation_id));
+        }
         *draft = None;
     } else if submit {
         let mut current = draft.take().expect("draft exists while submitting OAuth");
@@ -502,6 +533,7 @@ fn render_oauth_modal(
         offer_intent(
             intent,
             ConnectorIntent::SubmitOAuthClient {
+                operation_id: current.operation_id.clone(),
                 server_id: current.server_id.clone(),
                 client_id: mem::take(&mut current.client_id),
                 client_secret: SensitiveInput::from(mem::take(&mut current.client_secret)),
@@ -642,28 +674,78 @@ impl FormTransport {
 }
 
 struct ServerFormDraft {
+    id: Option<ServerId>,
     name: String,
     transport: FormTransport,
     url: String,
     command: String,
     arguments: String,
+    plain_env: Vec<(String, String)>,
+    secret_env: Vec<(String, connector_contract::CredentialId)>,
+    inherit_env: bool,
     enabled: bool,
 }
 
 impl Default for ServerFormDraft {
     fn default() -> Self {
         Self {
+            id: None,
             name: String::new(),
             transport: FormTransport::Http,
             url: String::new(),
             command: String::new(),
             arguments: String::new(),
+            plain_env: Vec::new(),
+            secret_env: Vec::new(),
+            inherit_env: true,
             enabled: true,
         }
     }
 }
 
 impl ServerFormDraft {
+    fn from_contract(config: &ServerDraft) -> Self {
+        let (transport, url, command, arguments, plain_env, secret_env, inherit_env) =
+            match &config.transport {
+                TransportDraft::Http { url } => (
+                    FormTransport::Http,
+                    url.clone(),
+                    String::new(),
+                    String::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    true,
+                ),
+                TransportDraft::Stdio {
+                    command,
+                    args,
+                    plain_env,
+                    secret_env,
+                    inherit_env,
+                } => (
+                    FormTransport::Stdio,
+                    String::new(),
+                    command.clone(),
+                    args.join("\n"),
+                    plain_env.clone(),
+                    secret_env.clone(),
+                    *inherit_env,
+                ),
+            };
+        Self {
+            id: config.id.clone(),
+            name: config.name.clone(),
+            transport,
+            url,
+            command,
+            arguments,
+            plain_env,
+            secret_env,
+            inherit_env,
+            enabled: config.enabled,
+        }
+    }
+
     fn is_valid(&self) -> bool {
         !self.name.trim().is_empty()
             && match self.transport {
@@ -684,13 +766,13 @@ impl ServerFormDraft {
                     .filter(|arg| !arg.is_empty())
                     .map(str::to_owned)
                     .collect(),
-                plain_env: Vec::new(),
-                secret_env: Vec::new(),
-                inherit_env: true,
+                plain_env: self.plain_env,
+                secret_env: self.secret_env,
+                inherit_env: self.inherit_env,
             },
         };
         ServerDraft {
-            id: None,
+            id: self.id,
             name: self.name,
             transport,
             enabled: self.enabled,
@@ -712,6 +794,7 @@ impl Drop for InvokeDraft {
 }
 
 struct OAuthClientDraft {
+    operation_id: Option<OperationId>,
     server_id: ServerId,
     server_name: String,
     client_id: String,
@@ -722,11 +805,23 @@ struct OAuthClientDraft {
 impl OAuthClientDraft {
     fn new(server: &ServerSummary) -> Self {
         Self {
+            operation_id: None,
             server_id: server.id.clone(),
             server_name: server.name.clone(),
             client_id: String::new(),
             client_secret: String::new(),
             workspace_hint: String::new(),
+        }
+    }
+
+    fn from_prompt(prompt: &OAuthClientPrompt) -> Self {
+        Self {
+            operation_id: Some(prompt.operation_id.clone()),
+            server_id: prompt.server_id.clone(),
+            server_name: prompt.server_name.clone(),
+            client_id: String::new(),
+            client_secret: String::new(),
+            workspace_hint: prompt.workspace_hint.clone().unwrap_or_default(),
         }
     }
 }
@@ -756,6 +851,7 @@ struct Labels {
     add_server: String,
     import_file: String,
     open_slack_settings: String,
+    configure: String,
     refresh: String,
     empty: String,
     ready: String,
@@ -768,6 +864,7 @@ struct Labels {
     unchecked: String,
     tools: String,
     discover: String,
+    edit: String,
     authorize: String,
     oauth_client: String,
     delete: String,
@@ -811,6 +908,7 @@ impl Labels {
             add_server: catalog.t("connectors.add_mcp", &[]),
             import_file: catalog.t("connectors.import_file", &[]),
             open_slack_settings: catalog.t("connectors.slack.open_app_settings", &[]),
+            configure: "Set up Slack".to_owned(),
             refresh: "Refresh".to_owned(),
             empty: catalog.t("connectors.empty_mcp", &[]),
             ready: catalog.t("connectors.slack.ready", &[]),
@@ -823,6 +921,7 @@ impl Labels {
             unchecked: catalog.t("connectors.unchecked", &[]),
             tools: "Tools".to_owned(),
             discover: catalog.t("connectors.test", &[]),
+            edit: "Edit".to_owned(),
             authorize: catalog.t("connectors.approve_browser", &[]),
             oauth_client: catalog.t("connectors.oauth_flow_title", &[]),
             delete: catalog.t("action.delete", &[]),
@@ -877,8 +976,9 @@ mod tests {
     use std::sync::Arc;
 
     use connector_contract::{
-        ConnectorSnapshot, PermissionRule, Revision, ServerId, ServerSummary, SlackStatus, ToolId,
-        ToolListItem, ToolPage, TransportKind,
+        ConnectorSnapshot, OAuthClientPrompt, OperationId, PermissionRule, Revision, ServerDraft,
+        ServerId, ServerSummary, SlackStatus, ToolId, ToolListItem, ToolPage, TransportDraft,
+        TransportKind,
     };
 
     use super::*;
@@ -1054,6 +1154,38 @@ mod tests {
     }
 
     #[test]
+    fn unconfigured_slack_emits_the_same_intent_boundary() {
+        let catalog = Catalog::load("en-US").unwrap();
+        let snapshot = ConnectorSnapshot::default();
+        let mut connector_ui = ConnectorUi::new(&catalog);
+        assert!(matches!(
+            activate_accessible_label(&mut connector_ui, &snapshot, "Set up Slack"),
+            Some(ConnectorIntent::EnsureSlackServer)
+        ));
+    }
+
+    #[test]
+    fn oauth_prompt_cancel_preserves_operation_correlation() {
+        let catalog = Catalog::load("en-US").unwrap();
+        let snapshot = ConnectorSnapshot {
+            oauth_client_prompt: Some(OAuthClientPrompt {
+                operation_id: OperationId::new("oauth-op-1"),
+                server_id: ServerId::new("server-1"),
+                server_name: "Slack".to_owned(),
+                workspace_hint: Some("example.slack.com".to_owned()),
+                reason: Some("manual_client_required".to_owned()),
+            }),
+            ..ConnectorSnapshot::default()
+        };
+        let mut connector_ui = ConnectorUi::new(&catalog);
+        assert!(matches!(
+            activate_accessible_label(&mut connector_ui, &snapshot, "Cancel"),
+            Some(ConnectorIntent::Cancel(operation_id))
+                if operation_id.as_str() == "oauth-op-1"
+        ));
+    }
+
+    #[test]
     fn selected_server_requests_its_tool_page_only_after_explicit_action() {
         let catalog = Catalog::load("en-US").unwrap();
         let mut connector_ui = ConnectorUi::new(&catalog);
@@ -1081,15 +1213,35 @@ mod tests {
         let draft = ServerFormDraft {
             name: "local".to_owned(),
             transport: FormTransport::Stdio,
-            url: String::new(),
             command: "example".to_owned(),
             arguments: "--one\n\n --two ".to_owned(),
-            enabled: true,
+            ..ServerFormDraft::default()
         };
         let saved = draft.into_contract();
         let TransportDraft::Stdio { args, .. } = saved.transport else {
             panic!("expected stdio draft");
         };
         assert_eq!(args, ["--one", "--two"]);
+    }
+
+    #[test]
+    fn selected_server_edit_roundtrips_hidden_env_bindings() {
+        let original = ServerDraft {
+            id: Some(ServerId::new("server-1")),
+            name: "local".to_owned(),
+            transport: TransportDraft::Stdio {
+                command: "example".to_owned(),
+                args: vec!["--one".to_owned()],
+                plain_env: vec![("SAFE".to_owned(), "yes".to_owned())],
+                secret_env: vec![(
+                    "TOKEN".to_owned(),
+                    connector_contract::CredentialId::new("credential-1"),
+                )],
+                inherit_env: false,
+            },
+            enabled: false,
+        };
+        let roundtrip = ServerFormDraft::from_contract(&original).into_contract();
+        assert_eq!(roundtrip, original);
     }
 }

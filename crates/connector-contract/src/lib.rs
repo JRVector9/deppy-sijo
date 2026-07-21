@@ -351,8 +351,14 @@ pub struct ConnectorSnapshot {
     pub slack_tool_count: usize,
     pub servers: Arc<[ServerSummary]>,
     pub selected_server: Option<ServerId>,
+    /// Editable transport configuration is loaded only for the selected server.
+    #[serde(default)]
+    pub selected_server_config: Option<ServerDraft>,
     pub tool_page: Option<ToolPage>,
     pub approval: Option<ApprovalPrompt>,
+    /// Service request for manual OAuth client input. Contains no token/client secret.
+    #[serde(default)]
+    pub oauth_client_prompt: Option<OAuthClientPrompt>,
     pub operations: Arc<[OperationSummary]>,
     pub result: Option<OperationResult>,
     pub diagnostics: DiagnosticsSnapshot,
@@ -367,8 +373,10 @@ impl Default for ConnectorSnapshot {
             slack_tool_count: 0,
             servers: Arc::from([]),
             selected_server: None,
+            selected_server_config: None,
             tool_page: None,
             approval: None,
+            oauth_client_prompt: None,
             operations: Arc::from([]),
             result: None,
             diagnostics: DiagnosticsSnapshot::default(),
@@ -381,6 +389,16 @@ pub struct OperationResult {
     pub operation_id: OperationId,
     pub text: String,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthClientPrompt {
+    pub operation_id: OperationId,
+    pub server_id: ServerId,
+    pub server_name: String,
+    pub workspace_hint: Option<String>,
+    /// Sanitized, user-facing reason; raw HTTP/OAuth errors are not allowed here.
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -547,6 +565,7 @@ pub enum ConnectorIntent {
     Cancel(OperationId),
     BeginOAuth(ServerId),
     SubmitOAuthClient {
+        operation_id: Option<OperationId>,
         server_id: ServerId,
         client_id: String,
         client_secret: SensitiveInput,
@@ -561,7 +580,14 @@ pub enum ConnectorIntent {
         tool_id: ToolId,
         rule: PermissionRule,
     },
+    EnsureSlackServer,
     RequestImportPicker,
+    /// App-owned file picker/read path re-enters the same intent dispatcher with bounded bytes.
+    /// The service validates the byte/item ceilings before parsing or persistence.
+    ImportConfiguration {
+        source_name: String,
+        contents: SensitiveInput,
+    },
     OpenExternalUrl {
         url: String,
     },
@@ -625,5 +651,16 @@ mod tests {
         let cloned = original.clone();
         assert!(Arc::ptr_eq(&original.servers, &cloned.servers));
         assert!(Arc::ptr_eq(&original.operations, &cloned.operations));
+    }
+
+    #[test]
+    fn import_intent_never_debugs_file_contents() {
+        let intent = ConnectorIntent::ImportConfiguration {
+            source_name: "mcp.json".to_owned(),
+            contents: SensitiveInput::from("client_secret=do-not-log".to_owned()),
+        };
+        let debug = format!("{intent:?}");
+        assert!(debug.contains("REDACTED"));
+        assert!(!debug.contains("do-not-log"));
     }
 }

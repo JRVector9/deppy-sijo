@@ -67,3 +67,21 @@ and pointer swap, audit preflight commit, pre-send, unknown post-send, HTTP time
 and process crash boundaries. `FailureInjection { point, skip }` injects once after a deterministic
 number of matching operations. Production has no runtime enable switch; owning crates provide
 test-only injectors at these named seams.
+
+## Wave-1 parity amendment
+
+The first pure renderer proved four missing commands would otherwise force a second app-to-service
+path. The same transport-neutral boundary was therefore extended, without adding dependencies or
+exposing storage/runtime types:
+
+- `ImportConfiguration { source_name, contents: SensitiveInput }` lets the app-owned picker/read
+  path re-enter the single intent dispatcher.
+- `selected_server_config: Option<ServerDraft>` loads editable configuration only for the selected
+  server rather than bloating every overview row.
+- `EnsureSlackServer` represents first-time built-in registration without inventing a server ID in
+  the UI.
+- `OAuthClientPrompt` and correlated `SubmitOAuthClient`/`Cancel` preserve a single OAuth state
+  machine and operation ID.
+
+This is an additive completeness correction found by UI01, not a change to the crate direction.
+Import bytes and OAuth/tool inputs remain non-Clone/non-Serialize and redacted in Debug output.

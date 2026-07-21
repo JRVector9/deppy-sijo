@@ -78,15 +78,12 @@ checks both AccessKit `label` and label-role `value`, matching the accessibility
 - Handle `RequestImportPicker` and `OpenExternalUrl` in the app adapter. Read/parse the selected file
   outside the leaf UI and enforce the contract import byte/item ceilings before service dispatch.
 - On locale changes call `set_catalog`; do not rebuild `ConnectorUi` and discard drafts.
-- The frozen snapshot has no dedicated "manual OAuth client input requested" state, so this PR
-  exposes that draft as an explicit selected-server action. If the service requires automatic
-  presentation later, it must use an existing operation/error state or a separately reviewed
-  contract revision, not leaf-service coupling.
-- Three additional frozen-contract gaps must be resolved before deleting the old Connector UI:
-  `RequestImportPicker` has no follow-up intent carrying bounded import data, `ServerSummary` has no
-  editable transport config (so URL/stdio edits and enabled toggles cannot be reconstructed), and
-  `SlackStatus::NotConfigured` has no server ID or ensure/add intent. Calling service-specific app
-  methods for those cases would create a second command path; PR-IN01 must not silently do that.
+- The Wave-1 root review closed the renderer-discovered contract gaps without leaf-service
+  coupling: bounded import bytes re-enter as `ImportConfiguration`, selected configuration is lazy,
+  first-time Slack registration is `EnsureSlackServer`, and manual OAuth prompts retain their
+  operation ID through submit/cancel.
+- Editing round-trips stdio plain/credential env bindings even though the compact form does not
+  display those rows yet, so saving another field cannot erase hidden bindings.
 - Four generic UI words without existing catalog keys (`Refresh`, `Tools`, `Enabled/Disabled`, and
-  `Truncated`) currently use stable English fallback text. Before PR-IN01 production cutover, add
+  `Truncated`; plus `Edit` and `Set up Slack`) currently use stable English fallback text. Before PR-IN01 production cutover, add
   matching keys to every locale and switch the cached labels; do not add an i18n dependency bypass.

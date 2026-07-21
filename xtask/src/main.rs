@@ -339,8 +339,24 @@ const DB_CALL_ALLOW: &[BoundaryAllow] = &[
     },
     BoundaryAllow {
         path: "crates/app/src/ui/connectors.rs",
-        // tools_cached 미스 시에만 조회 (2026-07-16 매 프레임 N+1 제거)
+        // tools_cached 미스 시에만 조회 (2026-07-16 매 프레임 N+1 제거) +
+        // HomeV1 Slack 상태 조회 slack_status/slack_status_for_server 2곳이
+        // 동일 패턴을 재사용 (a5d1d1e, 2026-07-20)
         snippet: "None => match db.list_mcp_tools(&server.id) {",
+        count: 3,
+        reason: "PR-B00 deferred connector storage boundary",
+    },
+    BoundaryAllow {
+        path: "crates/app/src/ui/connectors.rs",
+        // HomeV1 Slack 연결 상태 표시 (slack_status, a5d1d1e, 2026-07-20)
+        snippet: "let Ok(servers) = db.list_mcp_servers() else {",
+        count: 1,
+        reason: "PR-B00 deferred connector storage boundary",
+    },
+    BoundaryAllow {
+        path: "crates/app/src/ui/connectors.rs",
+        // HomeV1 Slack 커넥터 멱등 등록 (ensure_slack_server, a5d1d1e, 2026-07-20)
+        snippet: "db.insert_mcp_server(&row)?;",
         count: 1,
         reason: "PR-B00 deferred connector storage boundary",
     },

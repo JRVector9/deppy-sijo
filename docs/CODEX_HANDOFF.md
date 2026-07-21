@@ -21,6 +21,7 @@
 
 ## Status
 
+- 2026-07-21: Home 공지 치수/left glyph 정렬과 활성 workspace 재클릭 복귀 변경을 `2b01a92` (`fix(home): tighten notice layout and restore workspace focus`)로 커밋하고 `origin/main`에 push했다. 원격은 `d0445da..2b01a92`로 fast-forward 됐고 build/relaunch는 수행하지 않았다. 이 delivery 기록도 docs-only commit으로 push해 로컬/원격을 다시 일치시킨다.
 - 2026-07-21: 사용자가 검증 완료된 Home 공지 치수/실제 glyph 좌측 정렬과 활성 workspace 재클릭 Terminal 복귀 변경의 commit+push를 요청했다. 의도된 `ui/agent_terminal.rs`, `ui/file_tree.rs`, handoff 3개 파일만 기능 커밋으로 고정하고 `origin/main`에 push한 뒤 원격 SHA 일치를 확인한다. build/relaunch는 요청하지 않아 수행하지 않는다.
 - 2026-07-21: 최종 검증이 통과했다. `cargo check -p deppy-sijo`, Home UI 8/8, active workspace 재클릭 1/1, localhost bind가 필요한 기존 7개 fixture만 제외한 직렬 app 전체 569 passed/0 failed/5 ignored/7 filtered, strict Clippy가 모두 성공했다. 다음은 rustfmt/diff 범위 최종 확인이며 이번 요청에는 commit/build/relaunch가 없으므로 수행하지 않는다.
 - 2026-07-21: 24pt refresh의 실제 overflow 실측은 26.2×25pt였다. 기본 Button을 정확한 24×24 `allocate_exact_size` hitbox+painter glyph로 교체했고 focused Home test와 Home UI 전체 8/8이 통과했다. 실제 Label response가 이제 글자 폭/left에서 시작해 날짜와 1~6번째 제목이 동일 anchor인 회귀도 성공했다. 활성 workspace 재클릭 `SwitchWorkspace(A)` 방출/기존 세션 트리 유지 회귀도 1/1 통과했다. 다음은 strict Clippy, 전체 app 회귀와 최종 diff 검사다.

@@ -1,63 +1,35 @@
 //! 실제 백엔드 MCP 서버로 tools/list·tools/call을 위임하는 ToolForwarder 구현.
 //!
-//! 연결 수명: **호출당 connect**. LocalMcpManager의 discover_tools/call_tool은
-//! 이미 매 호출마다 백엔드 subprocess를 spawn→initialize→요청→종료(kill/reap)한다
-//! (manager.rs "stdio 서버는 매 호출마다 새 subprocess" MVP 단순화). 여기서도 그 관행을
-//! 그대로 따른다 — 영속 연결 상태를 들고 다니지 않아 단순하고, 백엔드 프로세스 누수가 없다.
-//! (프록시 자체가 짧게 사는 per-agent 프로세스라 재spawn 비용은 MVP에서 허용된다.)
-//! HTTP 백엔드(H3)도 같은 관례 — 호출마다 connect(initialize+세션)→요청→drop(DELETE).
+//! Hook의 live schema discovery와 forwarding이 하나의 lazy BackendSession을 공유한다.
+//! warm request는 initialize handshake를 반복하지 않으며 idle TTL/revision/poison 때만 연결을
+//! 폐기한다.
 
 use anyhow::Context;
-use mcp::{LocalMcpManager, McpHttpServerConfig, McpServerConfig, McpTool, ToolForwarder};
+#[cfg(test)]
+use mcp::LocalMcpManager;
+use mcp::ToolForwarder;
 use serde_json::{Value, json};
+use std::sync::Arc;
 
-/// kind별 백엔드 config (H3) — mcp_servers.kind('stdio'|'http')에 대응한다.
-/// H2가 stdio/http config를 분리 타입으로 만들어 여기서 enum으로 감싼다.
-#[derive(Clone, Debug)]
-pub enum BackendConfig {
-    Stdio(McpServerConfig),
-    Http(McpHttpServerConfig),
-}
+use crate::session::BackendClient;
+pub use crate::session::BackendConfig;
 
-impl BackendConfig {
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Stdio(config) => &config.name,
-            Self::Http(config) => &config.name,
-        }
-    }
-
-    /// connect → tools/list — transport별 manager 경로로 위임.
-    pub fn discover_tools(&self, manager: &LocalMcpManager) -> anyhow::Result<Vec<McpTool>> {
-        match self {
-            Self::Stdio(config) => manager.discover_tools(config),
-            Self::Http(config) => manager.discover_tools_http(config),
-        }
-    }
-
-    /// connect → tools/call — transport별 manager 경로로 위임.
-    pub fn call_tool(
-        &self,
-        manager: &LocalMcpManager,
-        name: &str,
-        arguments: Value,
-    ) -> anyhow::Result<Value> {
-        match self {
-            Self::Stdio(config) => manager.call_tool(config, name, arguments),
-            Self::Http(config) => manager.call_tool_http(config, name, arguments),
-        }
-    }
-}
-
-/// 백엔드 서버 spec + manager를 소유하고 매 호출마다 새로 연결해 포워딩한다.
+/// Permission hook과 같은 BackendClient를 공유하는 forwarder.
 pub struct ManagerToolForwarder {
-    manager: LocalMcpManager,
-    config: BackendConfig,
+    backend: Arc<BackendClient>,
 }
 
 impl ManagerToolForwarder {
+    /// 독립 사용/테스트용 constructor. Production main은 `from_backend`로 hook과 공유한다.
+    #[cfg(test)]
     pub fn new(manager: LocalMcpManager, config: BackendConfig) -> Self {
-        Self { manager, config }
+        Self {
+            backend: BackendClient::production(config.name().to_owned(), config, manager),
+        }
+    }
+
+    pub fn from_backend(backend: Arc<BackendClient>) -> Self {
+        Self { backend }
     }
 }
 
@@ -65,9 +37,9 @@ impl ToolForwarder for ManagerToolForwarder {
     /// tools/list → 백엔드에서 발견한 tool을 MCP `{"tools":[...]}` result로 재구성한다.
     fn list_tools(&self) -> anyhow::Result<Value> {
         let discovered = self
-            .config
-            .discover_tools(&self.manager)
-            .with_context(|| format!("백엔드 '{}' tools/list 실패", self.config.name()))?;
+            .backend
+            .list_tools()
+            .context("백엔드 tools/list 실패")?;
         let tools: Vec<Value> = discovered
             .into_iter()
             .map(|tool| {
@@ -87,9 +59,9 @@ impl ToolForwarder for ManagerToolForwarder {
 
     /// tools/call → 백엔드로 그대로 위임. 결과 Value({content, isError})를 그대로 돌려준다.
     fn call_tool(&self, name: &str, arguments: Value) -> anyhow::Result<Value> {
-        self.config
-            .call_tool(&self.manager, name, arguments)
-            .with_context(|| format!("백엔드 '{}' tools/call({name}) 실패", self.config.name()))
+        self.backend
+            .call_tool(name, arguments)
+            .with_context(|| format!("백엔드 tools/call({name}) 실패"))
     }
 }
 
@@ -97,6 +69,7 @@ impl ToolForwarder for ManagerToolForwarder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mcp::{McpHttpServerConfig, McpServerConfig};
     use secret::RedactionService;
     use std::io::{Read, Write};
     use std::net::TcpListener;

@@ -10,6 +10,9 @@
 mod cli;
 mod forwarder;
 mod hook;
+mod session;
+
+use std::sync::Arc;
 
 use anyhow::Context;
 use deppy_core::time::unix_secs_i64;
@@ -20,6 +23,9 @@ use secret::{KeyringSecretStore, RedactionService, SecretStore};
 use crate::cli::Cli;
 use crate::forwarder::{BackendConfig, ManagerToolForwarder};
 use crate::hook::DbPermissionHook;
+#[cfg(unix)]
+use crate::session::IdleDeadlineReader;
+use crate::session::{BackendClient, BackendSession, DEFAULT_BACKEND_IDLE_TTL};
 
 /// orphan 판정 컷오프(초): created_at이 (now - 이 값)보다 오래된 pending은 죽은 프록시가
 /// 남긴 것으로 보고 시작 시 정리한다. **승인 대기 상한(MAX_APPROVAL_TIMEOUT_SECS)과 같게**
@@ -97,30 +103,38 @@ fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!("resolved approval 정리 실패(무시하고 계속): {e:#}"),
     }
 
-    // 백엔드 stderr redaction을 위해 manager도 같은 redaction을 공유한다.
-    // hook도 live 스키마 검증용으로 자신의 manager+config를 갖는다 (forwarder와 별개 인스턴스).
+    // hook live-schema와 forwarder call이 같은 lazy initialized connection을 공유한다.
     let manager = LocalMcpManager::new(redaction.clone());
-    let hook_manager = LocalMcpManager::new(redaction.clone());
-    let hook_config = config.clone();
-    let forwarder = ManagerToolForwarder::new(manager, config);
+    let backend_session = BackendSession::production(manager, DEFAULT_BACKEND_IDLE_TTL);
+    let backend = Arc::new(BackendClient::new(
+        cli.server_id.clone(),
+        config,
+        Arc::clone(&backend_session),
+    ));
+    let forwarder = ManagerToolForwarder::from_backend(Arc::clone(&backend));
     // pane_id = env DEPPY_SESSION_ID — 승인이 어느 세션에서 났는지 표시/딥링크용 (I2).
     let pane_id = std::env::var("DEPPY_SESSION_ID")
         .ok()
         .filter(|s| !s.is_empty());
-    let hook = DbPermissionHook::new(
+    let hook = DbPermissionHook::with_backend(
         db,
         cli.server_id,
         redaction,
         cli.poll_interval,
         cli.approval_timeout,
-        hook_manager,
-        hook_config,
+        backend,
         pane_id,
     );
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    run_proxy(stdin.lock(), stdout.lock(), forwarder, hook)
+    #[cfg(unix)]
+    let reader = IdleDeadlineReader::new(stdin.lock(), Arc::clone(&backend_session));
+    #[cfg(not(unix))]
+    let reader = stdin.lock();
+    let result = run_proxy(reader, stdout.lock(), forwarder, hook);
+    backend_session.shutdown();
+    result
 }
 
 /// claude/codex hook 수신: `--db <path> --event <needs-input|clear>`, 세션은 env

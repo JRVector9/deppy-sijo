@@ -5,17 +5,21 @@
 //! fail-closed 원칙: 정책 조회 실패·승인 행 소실·대기 시간 초과는 전부 **거부**로 처리한다.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use audit::{AuditRecord, PermissionRule, ToolDecision};
 use deppy_core::time::unix_secs_i64;
-use mcp::{LocalMcpManager, PermissionHook, ProxyDecision};
+#[cfg(test)]
+use mcp::LocalMcpManager;
+use mcp::{PermissionHook, ProxyDecision};
 use secret::RedactionService;
 use serde_json::Value;
 use storage::{ApprovalStatus, Db};
 
+#[cfg(test)]
 use crate::forwarder::BackendConfig;
+use crate::session::{BackendClient, ConfigRevision};
 
 /// 승인 미리보기 최대 길이 (문자 수). 긴 인자가 GUI/DB를 압박하지 않도록 자른다.
 const PREVIEW_MAX_CHARS: usize = 500;
@@ -27,21 +31,21 @@ pub struct DbPermissionHook {
     redaction: RedactionService,
     poll_interval: Duration,
     approval_timeout: Duration,
-    /// live 스키마 검증용 백엔드 spec + manager (DB 캐시가 아니라 실제 백엔드에서 해시 계산).
-    /// kind별 config(stdio|http)는 forwarder와 동일한 BackendConfig로 분기한다 (H3).
-    manager: LocalMcpManager,
-    config: BackendConfig,
+    /// Forwarder와 공유하는 live backend session. Schema discovery와 허용된 call이 같은
+    /// initialized connection을 사용한다.
+    backend: Arc<BackendClient>,
     /// 이 프록시가 붙은 pane_id (I2 — env DEPPY_SESSION_ID). 승인 등록 시 그대로 싣는다.
     /// **조회하지 않는다**: 등록은 fail-closed 경로라 새 실패 지점을 만들지 않기 위함.
     /// None이면 "세션 불명"으로 등록되고 승인 자체는 정상 진행된다.
     pane_id: Option<String>,
     /// live 스키마 해시 캐시 (tool_name → schema_hash). 프록시 세션당 최초 필요 시 한 번만
     /// 백엔드를 discover해 채운다(성공 시). None = 아직 성공 discover 못 함(다음 호출에서 재시도).
-    schema_cache: Mutex<Option<HashMap<String, String>>>,
+    schema_cache: Mutex<Option<(ConfigRevision, HashMap<String, String>)>>,
 }
 
 impl DbPermissionHook {
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn new(
         db: Db,
         server_id: String,
@@ -52,14 +56,35 @@ impl DbPermissionHook {
         config: BackendConfig,
         pane_id: Option<String>,
     ) -> Self {
+        let backend = BackendClient::production(server_id.clone(), config, manager);
+        Self::with_backend(
+            db,
+            server_id,
+            redaction,
+            poll_interval,
+            approval_timeout,
+            backend,
+            pane_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_backend(
+        db: Db,
+        server_id: String,
+        redaction: RedactionService,
+        poll_interval: Duration,
+        approval_timeout: Duration,
+        backend: Arc<BackendClient>,
+        pane_id: Option<String>,
+    ) -> Self {
         Self {
             db,
             server_id,
             redaction,
             poll_interval,
             approval_timeout,
-            manager,
-            config,
+            backend,
             pane_id,
             schema_cache: Mutex::new(None),
         }
@@ -95,15 +120,19 @@ impl DbPermissionHook {
     /// 갱신되지 않아 재검출되지 않는다. 프록시는 per-session 프로세스라 허용 가능하다 —
     /// 백엔드가 바뀌면 새 프록시 세션이 다시 discover한다.
     fn schema_hash_for(&self, tool_name: &str) -> Option<String> {
+        let revision = self.backend.revision();
         let mut cache = self.schema_cache.lock().unwrap();
-        if cache.is_none() {
-            match self.config.discover_tools(&self.manager) {
+        if !cache
+            .as_ref()
+            .is_some_and(|(cached_revision, _)| *cached_revision == revision)
+        {
+            match self.backend.list_tools() {
                 Ok(tools) => {
                     let map = tools
                         .into_iter()
                         .map(|t| (t.name, audit::schema_hash(&t.input_schema_json)))
                         .collect();
-                    *cache = Some(map);
+                    *cache = Some((revision, map));
                 }
                 Err(e) => {
                     tracing::warn!(tool = %tool_name, "live 스키마 discover 실패 — 재승인 유도: {e:#}");
@@ -111,7 +140,9 @@ impl DbPermissionHook {
                 }
             }
         }
-        cache.as_ref().and_then(|m| m.get(tool_name).cloned())
+        cache
+            .as_ref()
+            .and_then(|(_, tools)| tools.get(tool_name).cloned())
     }
 
     /// 감사 로그 한 건 기록. 기본 경로는 redacted JSON만 저장하고 encrypted raw blob은 NULL이다.
@@ -290,7 +321,11 @@ fn truncate_chars(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forwarder::ManagerToolForwarder;
+    use crate::session::{BackendClient, BackendSession, DEFAULT_BACKEND_IDLE_TTL};
+    use mcp::ToolForwarder;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -403,6 +438,71 @@ mod tests {
         let decision = hook.check("read_file", &serde_json::json!({"path": "/tmp/x"}));
         assert!(matches!(decision, ProxyDecision::Allow));
         assert_eq!(audit_count(&path), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_schema_permission과_forwarded_call은_같은_backend_process를_재사용한다() {
+        let path = temp_db_path();
+        let counter = path.with_extension("spawn-count");
+        let script = format!(
+            r#"echo spawn >> '{}'
+read -r _init
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-11-25","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"mock","version":"1"}}}}}}'
+read -r _initialized
+read -r _list
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[{{"name":"read_file","inputSchema":{{"type":"object"}}}}]}}}}'
+read -r _call
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"content":[{{"type":"text","text":"shared"}}],"isError":false}}}}'
+read -r _until_cancel
+"#,
+            counter.display()
+        );
+        let session = BackendSession::production(
+            LocalMcpManager::new(RedactionService::new())
+                .with_request_timeout(Duration::from_secs(5)),
+            DEFAULT_BACKEND_IDLE_TTL,
+        );
+        let backend = Arc::new(BackendClient::new(
+            "srv-1".to_owned(),
+            sh_config(script),
+            Arc::clone(&session),
+        ));
+        let hook = DbPermissionHook::with_backend(
+            Db::open(&path).unwrap(),
+            "srv-1".to_owned(),
+            RedactionService::new(),
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+            Arc::clone(&backend),
+            Some("pane-test".to_owned()),
+        );
+        hook.db
+            .upsert_permission_rule(
+                "srv-1",
+                "read_file",
+                "allow",
+                Some(&audit::schema_hash(r#"{"type":"object"}"#)),
+            )
+            .unwrap();
+        let forwarder = ManagerToolForwarder::from_backend(backend);
+
+        assert!(matches!(
+            hook.check("read_file", &serde_json::json!({})),
+            ProxyDecision::Allow
+        ));
+        let result = forwarder
+            .call_tool("read_file", serde_json::json!({}))
+            .unwrap();
+
+        assert_eq!(
+            result.pointer("/content/0/text").and_then(Value::as_str),
+            Some("shared")
+        );
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "spawn\n");
+        assert_eq!(session.stats().cold_connects, 1);
+        assert_eq!(session.stats().warm_reuses, 1);
+        session.shutdown();
     }
 
     #[cfg(unix)]

@@ -44,6 +44,7 @@ pub struct Db {
 ///     --mcp-config로 에이전트를 deppy-mcp-proxy 권한계층에 태운다).
 /// 11: agent_configs.mcp_config_flag (에이전트별 주입 플래그 커스텀 — NULL=기본 --mcp-config).
 /// 12: mcp_servers scoped env metadata (plain-safe env + credential ids, PR-U10b).
+/// 25: tool audit operation lifecycle (PR-ST01).
 /// 4~6은 각 crate가 소유한 DDL 상수를 그대로 붙인다 (스키마 정의는 한 곳에서만).
 pub(crate) const MIGRATIONS: &[&str] = &[
     "
@@ -260,6 +261,9 @@ CREATE INDEX idx_structured_threads_workspace_recency
     "
 ALTER TABLE agent_needs_input ADD COLUMN message TEXT;
 ",
+    // v25: 외부 tool call durable lifecycle. Prepared에서 crash한 operation은 시작 시
+    // Unknown으로 종결하며 operation_id unique guard로 같은 호출의 자동 retry를 막는다.
+    audit::MIGRATION_AUDIT_LIFECYCLE,
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -315,6 +319,13 @@ pub struct CredentialMeta {
     pub masked_hint: Option<String>,
     /// 소속 workspace — None이면 전역 공유(커넥터/OAuth·레거시). (#2, v19)
     pub workspace_id: Option<String>,
+}
+
+/// logical credential id가 가리키는 keyring physical slot. 실제 secret 값은 포함하지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialSecretLocation {
+    pub keyring_service: String,
+    pub keyring_username: String,
 }
 
 /// workspace 한 행 (WorkspaceSidebar 표시용).
@@ -603,6 +614,71 @@ fn looks_like_token_literal(value: &str) -> bool {
             || lower.starts_with("xoxp-"))
 }
 
+fn validate_physical_secret_slot(slot: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !slot.is_empty() && slot.len() <= 255,
+        "physical secret slot 길이가 잘못됐습니다"
+    );
+    anyhow::ensure!(
+        slot.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'@')
+        }),
+        "physical secret slot 형식이 잘못됐습니다"
+    );
+    Ok(())
+}
+
+fn validate_oauth_metadata_json(json: &str) -> anyhow::Result<()> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).context("OAuth metadata JSON 검증 실패")?;
+    anyhow::ensure!(
+        !oauth_metadata_contains_secret(&value),
+        "OAuth metadata에 concrete secret/token 필드 또는 secret-like 값이 있습니다"
+    );
+    Ok(())
+}
+
+fn oauth_metadata_contains_secret(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+            matches!(
+                normalize_identifier(key).as_str(),
+                "ACCESS_TOKEN" | "REFRESH_TOKEN" | "CLIENT_SECRET" | "DCR_CLIENT_SECRET"
+            ) || oauth_metadata_contains_secret(value)
+        }),
+        serde_json::Value::Array(values) => values.iter().any(oauth_metadata_contains_secret),
+        serde_json::Value::String(value) => secret_like_value(value).is_some(),
+        _ => false,
+    }
+}
+
+fn validate_remembered_rule(
+    record: &audit::AuditRecord<'_>,
+    remembered_rule: Option<&PermissionRuleRow>,
+) -> anyhow::Result<()> {
+    let Some(rule) = remembered_rule else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        record.server_id == Some(rule.server_id.as_str()) && record.tool_name == rule.tool_name,
+        "permission rule과 audit 대상이 일치하지 않습니다"
+    );
+    match (rule.rule.as_str(), record.decision) {
+        ("allow", audit::ToolDecision::AllowAlways) => anyhow::ensure!(
+            rule.approved_schema_hash.as_deref().is_some_and(
+                |hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            ),
+            "AllowAlways permission에는 64자리 hex schema hash가 필요합니다"
+        ),
+        ("deny", audit::ToolDecision::DenyAlways) => anyhow::ensure!(
+            rule.approved_schema_hash.is_none(),
+            "DenyAlways permission에는 schema hash를 저장하지 않습니다"
+        ),
+        _ => anyhow::bail!("remembered permission과 tool decision이 일치하지 않습니다"),
+    }
+    Ok(())
+}
+
 impl Db {
     /// DB 열기 + 마이그레이션. infra(PRAGMA/백업/IMMEDIATE 러너)는 storage-core가 담당하고
     /// (v2.8 §6.1), 이 crate는 **마이그레이션 원장(MIGRATIONS, v1..vN 순서 불변)** 조립과
@@ -705,6 +781,53 @@ impl Db {
             .with_context(|| format!("credential oauth 메타 저장 실패: {id}"))?;
         anyhow::ensure!(affected == 1, "credential 없음: {id}");
         Ok(())
+    }
+
+    /// 새 access/refresh/DCR bundle이 이미 기록된 physical slot을 OAuth metadata와 함께
+    /// 한 transaction으로 publish한다. 이 함수는 secret 값을 받거나 저장하지 않는다.
+    /// 호출자는 commit 성공 후에만 이전 slot을 지우고, 실패 시 새 orphan slot을 정리한다.
+    pub fn rotate_credential_secret_slot(
+        &self,
+        id: &str,
+        physical_slot: &str,
+        oauth_json: &str,
+        masked_hint: Option<&str>,
+    ) -> anyhow::Result<()> {
+        validate_physical_secret_slot(physical_slot)?;
+        validate_oauth_metadata_json(oauth_json)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let affected = tx
+            .execute(
+                "UPDATE credentials
+                 SET keyring_username = ?2, oauth_json = ?3, masked_hint = ?4,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE id = ?1",
+                (id, physical_slot, oauth_json, masked_hint),
+            )
+            .with_context(|| format!("credential secret slot publish 실패: {id}"))?;
+        anyhow::ensure!(affected == 1, "credential 없음: {id}");
+        tx.commit()
+            .context("credential secret slot/metadata commit 실패")
+    }
+
+    /// logical credential id를 keyring physical slot으로 해석한다. secret 본문은 반환하지 않는다.
+    pub fn credential_secret_location(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<CredentialSecretLocation>> {
+        self.conn
+            .query_row(
+                "SELECT keyring_service, keyring_username FROM credentials WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok(CredentialSecretLocation {
+                        keyring_service: row.get(0)?,
+                        keyring_username: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     /// oauth_json이 있는 credential (id, json) 목록 — H5가 서버 바인딩을 찾는 데 쓴다.
@@ -1349,6 +1472,22 @@ impl Db {
         mcp_store::insert_server(&self.conn, row)
     }
 
+    /// canonical URL 기준 멱등 등록. built-in provider(Slack 등)의 중복 행을 막는다.
+    pub fn ensure_mcp_server_by_url(
+        &mut self,
+        row: &mcp_store::McpServerRow,
+    ) -> anyhow::Result<mcp_store::McpServerRow> {
+        mcp_store::ensure_server_by_url(&mut self.conn, row)
+    }
+
+    /// import 대상 전체를 all-or-nothing으로 저장한다.
+    pub fn insert_mcp_servers_batch(
+        &mut self,
+        rows: &[mcp_store::McpServerRow],
+    ) -> anyhow::Result<usize> {
+        mcp_store::insert_servers_batch(&mut self.conn, rows)
+    }
+
     /// http MCP 서버의 url 갱신 (H3). 호출측(UI)이 Allow 규칙 초기화 +
     /// mcp_tools 캐시 무효화 + 최초 연결 재확인을 함께 수행한다.
     pub fn update_mcp_server_url(&self, server_id: &str, url: &str) -> anyhow::Result<()> {
@@ -1543,6 +1682,56 @@ impl Db {
         encryptor: Option<&dyn secret::SecretStore>,
     ) -> anyhow::Result<String> {
         audit::record_audit(&self.conn, redaction, record, encryptor)
+    }
+
+    /// optional AllowAlways/DenyAlways 규칙 갱신과 audit preflight를 한 transaction으로
+    /// commit한다. 반환되기 전에는 외부 call을 시작하면 안 된다. Invalid JSON/audit write/
+    /// permission write 실패는 모두 rollback된다.
+    pub fn commit_tool_authorization_preflight(
+        &self,
+        operation_id: &str,
+        record: &audit::AuditRecord<'_>,
+        remembered_rule: Option<&PermissionRuleRow>,
+        redaction: &secret::RedactionService,
+        encryptor: Option<&dyn secret::SecretStore>,
+    ) -> anyhow::Result<audit::AuditOperation> {
+        validate_remembered_rule(record, remembered_rule)?;
+        let tx = self.conn.unchecked_transaction()?;
+        if let Some(rule) = remembered_rule {
+            mcp_store::upsert_permission_rule(
+                &tx,
+                &rule.server_id,
+                &rule.tool_name,
+                &rule.rule,
+                rule.approved_schema_hash.as_deref(),
+            )?;
+        }
+        let operation =
+            audit::prepare_audit_operation(&tx, operation_id, redaction, record, encryptor)?;
+        tx.commit()
+            .context("permission/audit preflight commit 실패")?;
+        Ok(operation)
+    }
+
+    pub fn complete_tool_audit(
+        &self,
+        operation_id: &str,
+        outcome: audit::AuditLifecycle,
+        error_code: Option<&str>,
+    ) -> anyhow::Result<()> {
+        audit::complete_audit_operation(&self.conn, operation_id, outcome, error_code)
+    }
+
+    pub fn tool_audit_lifecycle(
+        &self,
+        operation_id: &str,
+    ) -> anyhow::Result<Option<audit::AuditLifecycle>> {
+        audit::audit_lifecycle(&self.conn, operation_id)
+    }
+
+    /// 앱 bootstrap에서 외부 call worker를 시작하기 전에 호출한다.
+    pub fn reconcile_prepared_tool_audits(&self) -> anyhow::Result<usize> {
+        audit::reconcile_prepared_audits(&self.conn)
     }
 
     /// 앱 시작 시 crash recovery (설계문서 PR-14): 이전 실행이 남긴 세션 중
@@ -2421,6 +2610,197 @@ mod tests {
         );
         // 없는 credential은 에러
         assert!(db.set_credential_oauth_json("cred-missing", "{}").is_err());
+    }
+
+    #[test]
+    fn oauth_secret_slot_pointer와_metadata는_원자적으로_publish된다() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_credential(&sample("cred-oauth")).unwrap();
+        db.rotate_credential_secret_slot(
+            "cred-oauth",
+            "cred-oauth.v2",
+            r#"{"server_id":"srv-1","client_id":"cid-1"}"#,
+            Some("…7890"),
+        )
+        .unwrap();
+
+        let location = db
+            .credential_secret_location("cred-oauth")
+            .unwrap()
+            .unwrap();
+        assert_eq!(location.keyring_service, secret::KEYRING_SERVICE);
+        assert_eq!(location.keyring_username, "cred-oauth.v2");
+        assert_eq!(
+            db.list_credential_oauth_json().unwrap()[0].1,
+            r#"{"server_id":"srv-1","client_id":"cid-1"}"#
+        );
+    }
+
+    #[test]
+    fn oauth_secret_slot_publish_실패는_pointer와_metadata를_rollback한다() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_credential(&sample("cred-oauth")).unwrap();
+        db.set_credential_oauth_json("cred-oauth", r#"{"server_id":"old"}"#)
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_slot_publish AFTER UPDATE OF keyring_username ON credentials
+                 WHEN NEW.keyring_username = 'cred-oauth.v2'
+                 BEGIN SELECT RAISE(ABORT, 'injected slot publish failure'); END;",
+            )
+            .unwrap();
+
+        assert!(
+            db.rotate_credential_secret_slot(
+                "cred-oauth",
+                "cred-oauth.v2",
+                r#"{"server_id":"new"}"#,
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            db.credential_secret_location("cred-oauth")
+                .unwrap()
+                .unwrap()
+                .keyring_username,
+            "cred-oauth"
+        );
+        assert_eq!(
+            db.list_credential_oauth_json().unwrap()[0].1,
+            r#"{"server_id":"old"}"#
+        );
+    }
+
+    #[test]
+    fn oauth_metadata에는_concrete_token을_저장하지_않는다() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_credential(&sample("cred-oauth")).unwrap();
+        assert!(
+            db.rotate_credential_secret_slot(
+                "cred-oauth",
+                "cred-oauth.v2",
+                r#"{"access_token":"plaintext"}"#,
+                None,
+            )
+            .is_err()
+        );
+        assert!(db.list_credential_oauth_json().unwrap().is_empty());
+    }
+
+    #[test]
+    fn permission과_audit_preflight는_같이_commit되고_outcome으로_종결된다() {
+        let db = Db::open_in_memory().unwrap();
+        let rule = PermissionRuleRow {
+            server_id: "srv-1".to_owned(),
+            tool_name: "read".to_owned(),
+            rule: "allow".to_owned(),
+            approved_schema_hash: Some("a".repeat(64)),
+        };
+        let record = audit::AuditRecord {
+            workspace_id: Some("ws-1"),
+            session_id: Some("session-1"),
+            server_id: Some("srv-1"),
+            tool_name: "read",
+            input_json: r#"{"path":"/tmp/x"}"#,
+            decision: audit::ToolDecision::AllowAlways,
+        };
+        let operation = db
+            .commit_tool_authorization_preflight(
+                "operation-1",
+                &record,
+                Some(&rule),
+                &secret::RedactionService::new(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(operation.lifecycle, audit::AuditLifecycle::Prepared);
+        assert_eq!(db.list_permission_rules().unwrap(), vec![rule]);
+
+        db.complete_tool_audit(
+            "operation-1",
+            audit::AuditLifecycle::Failed,
+            Some("transport_timeout"),
+        )
+        .unwrap();
+        assert_eq!(
+            db.tool_audit_lifecycle("operation-1").unwrap(),
+            Some(audit::AuditLifecycle::Failed)
+        );
+    }
+
+    #[test]
+    fn audit_preflight_insert_실패는_permission도_rollback한다() {
+        let db = Db::open_in_memory().unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_audit_preflight BEFORE INSERT ON tool_audit_logs
+                 BEGIN SELECT RAISE(ABORT, 'injected audit failure'); END;",
+            )
+            .unwrap();
+        let rule = PermissionRuleRow {
+            server_id: "srv-1".to_owned(),
+            tool_name: "read".to_owned(),
+            rule: "allow".to_owned(),
+            approved_schema_hash: Some("a".repeat(64)),
+        };
+        let record = audit::AuditRecord {
+            workspace_id: None,
+            session_id: None,
+            server_id: Some("srv-1"),
+            tool_name: "read",
+            input_json: r#"{"path":"/tmp/x"}"#,
+            decision: audit::ToolDecision::AllowAlways,
+        };
+
+        assert!(
+            db.commit_tool_authorization_preflight(
+                "operation-fail",
+                &record,
+                Some(&rule),
+                &secret::RedactionService::new(),
+                None,
+            )
+            .is_err()
+        );
+        assert!(db.list_permission_rules().unwrap().is_empty());
+        assert_eq!(db.tool_audit_lifecycle("operation-fail").unwrap(), None);
+    }
+
+    #[test]
+    fn prepared_crash_recovery는_unknown으로_종결하고_id_reuse를_막는다() {
+        let db = Db::open_in_memory().unwrap();
+        let record = audit::AuditRecord {
+            workspace_id: None,
+            session_id: None,
+            server_id: Some("srv-1"),
+            tool_name: "read",
+            input_json: r#"{"path":"/tmp/x"}"#,
+            decision: audit::ToolDecision::AllowOnce,
+        };
+        db.commit_tool_authorization_preflight(
+            "operation-crash",
+            &record,
+            None,
+            &secret::RedactionService::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(db.reconcile_prepared_tool_audits().unwrap(), 1);
+        assert_eq!(
+            db.tool_audit_lifecycle("operation-crash").unwrap(),
+            Some(audit::AuditLifecycle::Unknown)
+        );
+        assert!(
+            db.commit_tool_authorization_preflight(
+                "operation-crash",
+                &record,
+                None,
+                &secret::RedactionService::new(),
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]

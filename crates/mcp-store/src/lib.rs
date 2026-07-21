@@ -9,7 +9,7 @@
 //! storage의 MIGRATIONS가 소유한다 (재배열 금지 — docs/dependency-graph.md).
 
 use anyhow::Context;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 /// §11.4 mcp_servers + §11.5 mcp_tools DDL — 전역 마이그레이션 v5 슬롯.
 pub const MIGRATION_SQL: &str = "
@@ -676,11 +676,24 @@ pub fn insert_server(conn: &Connection, row: &McpServerRow) -> anyhow::Result<()
     Ok(())
 }
 
-/// http 서버의 url 갱신 (H3). url 변경은 신뢰 리셋 훅과 한 쌍 — 호출측(UI)이
-/// tool_permission_rules Allow 초기화 + mcp_tools 캐시 무효화 + 재확인을 함께 수행한다
-/// (VS Code cacheNonce 신뢰 모델의 "편집 저장 시점 훅" 등가 구현 — 스키마 추가 없음).
+/// http 서버의 URL과 그 URL에 묶인 신뢰 상태를 한 transaction으로 갱신한다.
+/// 허용 규칙은 Ask(행 없음)로 되돌리고 tool cache를 비운다. Deny 규칙은 새 endpoint에도
+/// 권한을 넓히지 않는 안전한 제약이므로 보존한다. 같은 URL이면 아무 것도 지우지 않는다.
 pub fn update_server_url(conn: &Connection, server_id: &str, url: &str) -> anyhow::Result<()> {
-    let affected = conn
+    let tx = conn.unchecked_transaction()?;
+    let old_url: Option<Option<String>> = tx
+        .query_row(
+            "SELECT url FROM mcp_servers WHERE id = ?1",
+            [server_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let old_url = old_url.with_context(|| format!("mcp_server url 갱신 대상 없음: {server_id}"))?;
+    if old_url.as_deref() == Some(url) {
+        tx.commit()?;
+        return Ok(());
+    }
+    let affected = tx
         .execute(
             "UPDATE mcp_servers
              SET url = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -689,7 +702,68 @@ pub fn update_server_url(conn: &Connection, server_id: &str, url: &str) -> anyho
         )
         .with_context(|| format!("mcp_server url 갱신 실패: {server_id}"))?;
     anyhow::ensure!(affected == 1, "mcp_server url 갱신 대상 없음: {server_id}");
-    Ok(())
+    tx.execute(
+        "DELETE FROM tool_permission_rules WHERE server_id = ?1 AND rule = 'allow'",
+        [server_id],
+    )
+    .with_context(|| format!("mcp_server Allow 권한 초기화 실패: {server_id}"))?;
+    tx.execute("DELETE FROM mcp_tools WHERE server_id = ?1", [server_id])
+        .with_context(|| format!("mcp_server tool cache 초기화 실패: {server_id}"))?;
+    tx.commit().context("mcp_server URL/신뢰상태 commit 실패")
+}
+
+/// 같은 canonical URL(`trim` + trailing slash 제거)의 서버를 멱등 등록한다. Slack 같은
+/// built-in provider가 render/UI cache 경쟁과 무관하게 하나의 durable row를 얻는 경로다.
+/// IMMEDIATE transaction으로 read-then-insert를 직렬화한다.
+pub fn ensure_server_by_url(
+    conn: &mut Connection,
+    row: &McpServerRow,
+) -> anyhow::Result<McpServerRow> {
+    let url = row
+        .url
+        .as_deref()
+        .context("멱등 URL 등록에는 URL이 필요합니다")?;
+    validate_server_args_for_persistence(&row.args)?;
+    validate_server_env_for_persistence(&row.env_plain, &row.env_secrets)?;
+    let canonical = canonical_url(url);
+    anyhow::ensure!(!canonical.is_empty(), "멱등 등록 URL이 비어 있습니다");
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let existing = list_servers(&tx)?.into_iter().find(|server| {
+        server
+            .url
+            .as_deref()
+            .is_some_and(|url| canonical_url(url) == canonical)
+    });
+    if let Some(existing) = existing {
+        tx.commit()?;
+        return Ok(existing);
+    }
+    insert_server(&tx, row)?;
+    tx.commit().context("MCP 서버 멱등 등록 commit 실패")?;
+    Ok(row.clone())
+}
+
+/// import에서 선택된 서버 전체를 all-or-nothing으로 저장한다. 모든 행의 secret-like
+/// validation을 transaction 전에 끝내며, ID 충돌/trigger/commit 실패 시 일부 서버가
+/// 남지 않는다.
+pub fn insert_servers_batch(conn: &mut Connection, rows: &[McpServerRow]) -> anyhow::Result<usize> {
+    for row in rows {
+        validate_server_args_for_persistence(&row.args)
+            .with_context(|| format!("mcp_server args validation 실패: {}", row.name))?;
+        validate_server_env_for_persistence(&row.env_plain, &row.env_secrets)
+            .with_context(|| format!("mcp_server env validation 실패: {}", row.name))?;
+    }
+    let tx = conn.transaction()?;
+    for row in rows {
+        insert_server(&tx, row)?;
+    }
+    tx.commit().context("MCP server import batch commit 실패")?;
+    Ok(rows.len())
+}
+
+fn canonical_url(url: &str) -> &str {
+    url.trim().trim_end_matches('/')
 }
 
 pub fn list_servers(conn: &Connection) -> anyhow::Result<Vec<McpServerRow>> {
@@ -810,6 +884,13 @@ pub fn replace_tools_for_server(
     server_id: &str,
     rows: &[McpToolRow],
 ) -> anyhow::Result<()> {
+    for row in rows {
+        anyhow::ensure!(
+            row.server_id == server_id,
+            "mcp_tool server_id 불일치: {} != {server_id}",
+            row.server_id
+        );
+    }
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM mcp_tools WHERE server_id = ?1", [server_id])
         .with_context(|| format!("mcp_tools 삭제 실패: {server_id}"))?;
@@ -893,7 +974,7 @@ mod tests {
     }
 
     #[test]
-    fn server_url_갱신은_기존_행만_바꾼다() {
+    fn server_url_갱신은_allow와_tools를_같이_초기화하고_deny는_보존한다() {
         let conn = test_conn();
         let mut server = sample_server();
         server.kind = "http".to_owned();
@@ -901,13 +982,104 @@ mod tests {
         server.args = Vec::new();
         server.url = Some("https://old.example.com/mcp".to_owned());
         insert_server(&conn, &server).unwrap();
+        upsert_permission_rule(&conn, "srv-1", "read", "allow", Some("hash")).unwrap();
+        upsert_permission_rule(&conn, "srv-1", "delete", "deny", None).unwrap();
+        insert_tool(
+            &conn,
+            &McpToolRow {
+                id: "tool-old".to_owned(),
+                server_id: "srv-1".to_owned(),
+                name: "read".to_owned(),
+                description: None,
+                input_schema_json: None,
+                trust_level: "unknown".to_owned(),
+                schema_hash: None,
+            },
+        )
+        .unwrap();
 
         update_server_url(&conn, "srv-1", "https://new.example.com/mcp").unwrap();
         let rows = list_servers(&conn).unwrap();
         assert_eq!(rows[0].url.as_deref(), Some("https://new.example.com/mcp"));
+        assert!(list_tools_for_server(&conn, "srv-1").unwrap().is_empty());
+        let rules = list_permission_rules(&conn).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].tool_name, "delete");
+        assert_eq!(rules[0].rule, "deny");
 
         // 없는 id는 에러 (조용한 no-op이면 신뢰 리셋 훅이 헛돈다)
         assert!(update_server_url(&conn, "no-such", "https://x.example.com").is_err());
+    }
+
+    #[test]
+    fn server_url_transaction_중간실패는_url과_신뢰상태를_모두_rollback한다() {
+        let conn = test_conn();
+        let mut server = sample_server();
+        server.kind = "http".to_owned();
+        server.command = None;
+        server.url = Some("https://old.example.com/mcp".to_owned());
+        insert_server(&conn, &server).unwrap();
+        upsert_permission_rule(&conn, "srv-1", "read", "allow", Some("hash")).unwrap();
+        let tool = McpToolRow {
+            id: "tool-old".to_owned(),
+            server_id: "srv-1".to_owned(),
+            name: "read".to_owned(),
+            description: None,
+            input_schema_json: None,
+            trust_level: "unknown".to_owned(),
+            schema_hash: None,
+        };
+        insert_tool(&conn, &tool).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_tool_clear BEFORE DELETE ON mcp_tools
+             BEGIN SELECT RAISE(ABORT, 'injected tool clear failure'); END;",
+        )
+        .unwrap();
+
+        assert!(update_server_url(&conn, "srv-1", "https://new.example.com/mcp").is_err());
+        assert_eq!(
+            list_servers(&conn).unwrap()[0].url.as_deref(),
+            Some("https://old.example.com/mcp")
+        );
+        assert_eq!(list_permission_rules(&conn).unwrap().len(), 1);
+        assert_eq!(list_tools_for_server(&conn, "srv-1").unwrap(), vec![tool]);
+    }
+
+    #[test]
+    fn canonical_url_멱등등록은_기존_server를_재사용한다() {
+        let mut conn = test_conn();
+        let mut slack = sample_server();
+        slack.kind = "http".to_owned();
+        slack.command = None;
+        slack.url = Some("https://mcp.slack.com/mcp/".to_owned());
+        let first = ensure_server_by_url(&mut conn, &slack).unwrap();
+
+        let mut duplicate = slack.clone();
+        duplicate.id = "different-id".to_owned();
+        duplicate.name = "renamed".to_owned();
+        duplicate.url = Some(" https://mcp.slack.com/mcp ".to_owned());
+        let second = ensure_server_by_url(&mut conn, &duplicate).unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(list_servers(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn import_batch_중간실패는_앞선_insert도_rollback한다() {
+        let mut conn = test_conn();
+        let first = sample_server();
+        let mut second = sample_server();
+        second.id = "srv-2".to_owned();
+        second.name = "trigger-failure".to_owned();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_import BEFORE INSERT ON mcp_servers
+             WHEN NEW.id = 'srv-2'
+             BEGIN SELECT RAISE(ABORT, 'injected import failure'); END;",
+        )
+        .unwrap();
+
+        assert!(insert_servers_batch(&mut conn, &[first, second]).is_err());
+        assert!(list_servers(&conn).unwrap().is_empty());
     }
 
     #[test]
@@ -1135,6 +1307,49 @@ mod tests {
             .map(|t| t.name)
             .collect();
         assert_eq!(names, vec!["new_a", "new_b"]);
+    }
+
+    #[test]
+    fn replace_tools의_server_id_불일치는_기존목록을_보존한다() {
+        let mut conn = test_conn();
+        insert_server(&conn, &sample_server()).unwrap();
+        let old = McpToolRow {
+            id: "old".to_owned(),
+            server_id: "srv-1".to_owned(),
+            name: "old".to_owned(),
+            description: None,
+            input_schema_json: None,
+            trust_level: "unknown".to_owned(),
+            schema_hash: None,
+        };
+        insert_tool(&conn, &old).unwrap();
+        let mut wrong = old.clone();
+        wrong.id = "new".to_owned();
+        wrong.server_id = "srv-other".to_owned();
+
+        assert!(replace_tools_for_server(&mut conn, "srv-1", &[wrong]).is_err());
+        assert_eq!(list_tools_for_server(&conn, "srv-1").unwrap(), vec![old]);
+    }
+
+    #[test]
+    fn replace_tools_두번째_insert_실패는_delete와_첫insert를_rollback한다() {
+        let mut conn = test_conn();
+        insert_server(&conn, &sample_server()).unwrap();
+        let tool = |id: &str, name: &str| McpToolRow {
+            id: id.to_owned(),
+            server_id: "srv-1".to_owned(),
+            name: name.to_owned(),
+            description: None,
+            input_schema_json: None,
+            trust_level: "unknown".to_owned(),
+            schema_hash: None,
+        };
+        let old = tool("old", "old");
+        insert_tool(&conn, &old).unwrap();
+        let duplicate_id = [tool("new", "first"), tool("new", "second")];
+
+        assert!(replace_tools_for_server(&mut conn, "srv-1", &duplicate_id).is_err());
+        assert_eq!(list_tools_for_server(&conn, "srv-1").unwrap(), vec![old]);
     }
 
     #[test]

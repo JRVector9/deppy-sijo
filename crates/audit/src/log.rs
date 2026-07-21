@@ -10,6 +10,49 @@ use secret::RedactionService;
 
 use crate::ToolDecision;
 
+/// 외부 tool call 한 건의 durable 상태. `Unknown`은 Prepared 상태에서 프로세스가
+/// 종료되어 전송 여부를 증명할 수 없는 경우이며, 다시 Prepared로 되돌릴 수 없다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditLifecycle {
+    Prepared,
+    Succeeded,
+    Failed,
+    Unknown,
+    Denied,
+}
+
+impl AuditLifecycle {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+            Self::Denied => "denied",
+        }
+    }
+
+    fn from_persisted(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "prepared" => Ok(Self::Prepared),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "unknown" => Ok(Self::Unknown),
+            "denied" => Ok(Self::Denied),
+            _ => anyhow::bail!("알 수 없는 audit lifecycle: {value}"),
+        }
+    }
+}
+
+/// preflight commit 결과. `audit_id`는 내부 row 식별자, `operation_id`는 policy/call/
+/// outcome을 잇는 호출자 제공 correlation key다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditOperation {
+    pub audit_id: String,
+    pub operation_id: String,
+    pub lifecycle: AuditLifecycle,
+}
+
 /// 감사 로그 한 행의 입력 model. input_json은 평문으로 받되
 /// record_audit 내부에서 redaction을 거친 뒤에만 DB에 닿는다.
 #[derive(Clone)]
@@ -119,34 +162,8 @@ pub fn record_audit(
     // 선택 기능). None이면 blob은 NULL. 암호화 실패는 감사 저장을 막지 않는다(로그만).
     encryptor: Option<&dyn secret::SecretStore>,
 ) -> anyhow::Result<String> {
-    // 1차: key 이름 기반 마스킹 — RedactionService에 아직 등록되지 않은 secret 대비
-    let keyed = match serde_json::from_str::<serde_json::Value>(record.input_json) {
-        Ok(mut value) => {
-            mask_sensitive_keys(&mut value);
-            value.to_string()
-        }
-        // 파싱 불가면 redaction 확실성이 없다 — 본문 폐기, marker만 (codex 리뷰 반영)
-        Err(_) => INVALID_INPUT_MARKER.to_owned(),
-    };
-    // 2차: 등록된 secret 패턴(원본 + base64/URL/JSON-escape 변형) redaction.
-    //      한 번에 들어온 입력이므로 redact_chunk + flush로 전체를 처리한다.
-    let mut redactor = redaction.stream_redactor();
-    let mut redacted = redactor.redact_chunk(keyed.as_bytes());
-    redacted.extend(redactor.flush());
-    let input_redacted = String::from_utf8_lossy(&redacted).into_owned();
-
-    // 선택: 전체 원본 입력을 AEAD 암호화 (redacted와 별개로 사고 조사용 보존, 7장).
-    // 암호화 실패(keyring 미가용 등)는 감사 자체를 막지 않는다 — blob만 NULL로 둔다.
-    let encrypted_blob: Option<Vec<u8>> =
-        encryptor.and_then(
-            |store| match crate::encrypt_input(store, record.input_json) {
-                Ok(blob) => Some(blob),
-                Err(e) => {
-                    tracing::warn!("audit 입력 암호화 실패 (blob NULL로 저장): {e:#}");
-                    None
-                }
-            },
-        );
+    let (input_redacted, encrypted_blob) =
+        prepare_payload(redaction, record.input_json, encryptor, false)?;
 
     let id = uuid::Uuid::new_v4().to_string();
     conn.execute(
@@ -169,6 +186,183 @@ pub fn record_audit(
     )
     .with_context(|| format!("tool audit log 저장 실패: {}", record.tool_name))?;
     Ok(id)
+}
+
+/// permission 검사가 끝난 tool call을 durable preflight로 기록한다. 허용 결정은
+/// `Prepared`, 거부 결정은 `Denied`로 바로 종결한다. Invalid JSON은 행을 만들지 않으며,
+/// 같은 operation id는 lifecycle과 무관하게 다시 준비할 수 없다.
+pub fn prepare_audit_operation(
+    conn: &Connection,
+    operation_id: &str,
+    redaction: &RedactionService,
+    record: &AuditRecord<'_>,
+    encryptor: Option<&dyn secret::SecretStore>,
+) -> anyhow::Result<AuditOperation> {
+    validate_operation_id(operation_id)?;
+    let (input_redacted, encrypted_blob) =
+        prepare_payload(redaction, record.input_json, encryptor, true)?;
+    let lifecycle = if record.decision.is_allowed() {
+        AuditLifecycle::Prepared
+    } else {
+        AuditLifecycle::Denied
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO tool_audit_logs
+           (id, operation_id, workspace_id, session_id, server_id, tool_name,
+            input_redacted_json, input_encrypted_blob, decision, lifecycle, created_at,
+            completed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+            strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            CASE WHEN ?10 = 'denied' THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') END)",
+        (
+            &id,
+            operation_id,
+            record.workspace_id,
+            record.session_id,
+            record.server_id,
+            record.tool_name,
+            &input_redacted,
+            encrypted_blob,
+            record.decision.as_str(),
+            lifecycle.as_str(),
+        ),
+    )
+    .with_context(|| format!("tool audit preflight 저장 실패: {}", record.tool_name))?;
+    Ok(AuditOperation {
+        audit_id: id,
+        operation_id: operation_id.to_owned(),
+        lifecycle,
+    })
+}
+
+/// Prepared call을 알려진 최종 상태로 한 번만 전이한다. Unknown/Denied/이미 완료된 행은
+/// 갱신하지 않고 오류를 반환하므로 호출자가 무심코 같은 call 결과를 덮어쓰지 못한다.
+pub fn complete_audit_operation(
+    conn: &Connection,
+    operation_id: &str,
+    outcome: AuditLifecycle,
+    error_code: Option<&str>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        matches!(outcome, AuditLifecycle::Succeeded | AuditLifecycle::Failed),
+        "audit 완료 상태는 succeeded 또는 failed만 허용됩니다"
+    );
+    validate_error_code(outcome, error_code)?;
+    let affected = conn
+        .execute(
+            "UPDATE tool_audit_logs
+             SET lifecycle = ?2, outcome_error_code = ?3,
+                 completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE operation_id = ?1 AND lifecycle = 'prepared'",
+            (operation_id, outcome.as_str(), error_code),
+        )
+        .with_context(|| format!("tool audit outcome 저장 실패: {operation_id}"))?;
+    anyhow::ensure!(
+        affected == 1,
+        "완료 가능한 prepared audit가 없음: {operation_id}"
+    );
+    Ok(())
+}
+
+/// 시작 시 남아 있는 Prepared는 전송 여부를 증명할 수 없으므로 Unknown으로 종결한다.
+/// 이 상태는 `prepare_audit_operation`의 unique operation id guard 때문에 자동 retry되지 않는다.
+pub fn reconcile_prepared_audits(conn: &Connection) -> anyhow::Result<usize> {
+    let affected = conn
+        .execute(
+            "UPDATE tool_audit_logs
+             SET lifecycle = 'unknown', outcome_error_code = 'process_interrupted',
+                 completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE lifecycle = 'prepared'",
+            [],
+        )
+        .context("prepared audit crash reconciliation 실패")?;
+    Ok(affected)
+}
+
+pub fn audit_lifecycle(
+    conn: &Connection,
+    operation_id: &str,
+) -> anyhow::Result<Option<AuditLifecycle>> {
+    use rusqlite::OptionalExtension as _;
+
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT lifecycle FROM tool_audit_logs WHERE operation_id = ?1",
+            [operation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    value
+        .map(|value| AuditLifecycle::from_persisted(&value))
+        .transpose()
+}
+
+fn prepare_payload(
+    redaction: &RedactionService,
+    input_json: &str,
+    encryptor: Option<&dyn secret::SecretStore>,
+    reject_invalid_json: bool,
+) -> anyhow::Result<(String, Option<Vec<u8>>)> {
+    let keyed = match serde_json::from_str::<serde_json::Value>(input_json) {
+        Ok(mut value) => {
+            mask_sensitive_keys(&mut value);
+            value.to_string()
+        }
+        Err(error) if reject_invalid_json => {
+            return Err(error).context("tool input JSON 검증 실패");
+        }
+        Err(_) => INVALID_INPUT_MARKER.to_owned(),
+    };
+    let mut redactor = redaction.stream_redactor();
+    let mut redacted = redactor.redact_chunk(keyed.as_bytes());
+    redacted.extend(redactor.flush());
+    let input_redacted = String::from_utf8_lossy(&redacted).into_owned();
+    let encrypted_blob =
+        encryptor.and_then(|store| match crate::encrypt_input(store, input_json) {
+            Ok(blob) => Some(blob),
+            Err(error) => {
+                tracing::warn!("audit 입력 암호화 실패 (blob NULL로 저장): {error:#}");
+                None
+            }
+        });
+    Ok((input_redacted, encrypted_blob))
+}
+
+fn validate_operation_id(operation_id: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        operation_id == operation_id.trim(),
+        "operation id 앞뒤 공백은 허용되지 않습니다"
+    );
+    anyhow::ensure!(!operation_id.is_empty(), "operation id가 비어 있습니다");
+    anyhow::ensure!(operation_id.len() <= 128, "operation id가 너무 깁니다");
+    anyhow::ensure!(
+        operation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')),
+        "operation id 형식이 잘못됐습니다"
+    );
+    Ok(())
+}
+
+fn validate_error_code(outcome: AuditLifecycle, error_code: Option<&str>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        outcome != AuditLifecycle::Succeeded || error_code.is_none(),
+        "succeeded audit에는 error code를 저장할 수 없습니다"
+    );
+    if let Some(code) = error_code {
+        anyhow::ensure!(
+            !code.is_empty() && code.len() <= 64,
+            "audit error code 길이가 잘못됐습니다"
+        );
+        anyhow::ensure!(
+            code.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+            }),
+            "audit error code 형식이 잘못됐습니다"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -206,13 +400,14 @@ mod tests {
     }
 
     use super::*;
-    use crate::MIGRATION_SQL;
+    use crate::{MIGRATION_AUDIT_LIFECYCLE, MIGRATION_SQL};
 
     const SECRET: &str = "sk-abcdef123456";
 
     fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(MIGRATION_SQL).unwrap();
+        conn.execute_batch(MIGRATION_AUDIT_LIFECYCLE).unwrap();
         conn
     }
 
@@ -471,5 +666,145 @@ mod tests {
         let input = format!(r#"{{"token":"{SECRET}"}}"#);
         let debug = format!("{:?}", record(&input));
         assert!(!debug.contains(SECRET), "{debug}");
+    }
+
+    #[test]
+    fn audit_operation은_prepared에서_한번만_완료된다() {
+        let conn = test_conn();
+        let operation = prepare_audit_operation(
+            &conn,
+            "op-allow-1",
+            &RedactionService::new(),
+            &record(r#"{"path":"/tmp/x"}"#),
+            None,
+        )
+        .unwrap();
+        assert_eq!(operation.lifecycle, AuditLifecycle::Prepared);
+        assert_eq!(
+            audit_lifecycle(&conn, "op-allow-1").unwrap(),
+            Some(AuditLifecycle::Prepared)
+        );
+
+        complete_audit_operation(&conn, "op-allow-1", AuditLifecycle::Succeeded, None).unwrap();
+        assert_eq!(
+            audit_lifecycle(&conn, "op-allow-1").unwrap(),
+            Some(AuditLifecycle::Succeeded)
+        );
+        assert!(
+            complete_audit_operation(&conn, "op-allow-1", AuditLifecycle::Failed, Some("late"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn denied는_종결되고_invalid_json은_행을_만들지_않는다() {
+        let conn = test_conn();
+        let denied = AuditRecord {
+            decision: ToolDecision::DenyOnce,
+            ..record(r#"{"path":"/tmp/x"}"#)
+        };
+        let operation = prepare_audit_operation(
+            &conn,
+            "op-denied-1",
+            &RedactionService::new(),
+            &denied,
+            None,
+        )
+        .unwrap();
+        assert_eq!(operation.lifecycle, AuditLifecycle::Denied);
+
+        assert!(
+            prepare_audit_operation(
+                &conn,
+                "op-invalid-1",
+                &RedactionService::new(),
+                &record("not-json"),
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(audit_lifecycle(&conn, "op-invalid-1").unwrap(), None);
+    }
+
+    #[test]
+    fn crash_recovery는_prepared를_unknown으로_바꾸고_같은_id_retry를_막는다() {
+        let conn = test_conn();
+        prepare_audit_operation(
+            &conn,
+            "op-unknown-1",
+            &RedactionService::new(),
+            &record(r#"{"path":"/tmp/x"}"#),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(reconcile_prepared_audits(&conn).unwrap(), 1);
+        assert_eq!(
+            audit_lifecycle(&conn, "op-unknown-1").unwrap(),
+            Some(AuditLifecycle::Unknown)
+        );
+        assert!(
+            prepare_audit_operation(
+                &conn,
+                "op-unknown-1",
+                &RedactionService::new(),
+                &record(r#"{"path":"/tmp/x"}"#),
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn 실패_outcome에는_low_cardinality_error_code만_허용한다() {
+        let conn = test_conn();
+        prepare_audit_operation(
+            &conn,
+            "op-failed-1",
+            &RedactionService::new(),
+            &record(r#"{"path":"/tmp/x"}"#),
+            None,
+        )
+        .unwrap();
+        assert!(
+            complete_audit_operation(
+                &conn,
+                "op-failed-1",
+                AuditLifecycle::Failed,
+                Some("raw error: token=secret"),
+            )
+            .is_err()
+        );
+        complete_audit_operation(
+            &conn,
+            "op-failed-1",
+            AuditLifecycle::Failed,
+            Some("transport_timeout"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn lifecycle_migration은_legacy_audit을_succeeded로_보존한다() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATION_SQL).unwrap();
+        let legacy_id = record_audit(
+            &conn,
+            &RedactionService::new(),
+            &record(r#"{"path":"/tmp/legacy"}"#),
+            None,
+        )
+        .unwrap();
+
+        conn.execute_batch(MIGRATION_AUDIT_LIFECYCLE).unwrap();
+        let (lifecycle, operation_id): (String, Option<String>) = conn
+            .query_row(
+                "SELECT lifecycle, operation_id FROM tool_audit_logs WHERE id = ?1",
+                [&legacy_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lifecycle, "succeeded");
+        assert_eq!(operation_id, None);
     }
 }

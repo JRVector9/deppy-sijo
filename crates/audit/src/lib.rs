@@ -8,7 +8,10 @@ mod log;
 mod policy;
 
 pub use crypto::{decrypt_input, encrypt_input};
-pub use log::{AuditRecord, mask_sensitive_keys, record_audit};
+pub use log::{
+    AuditLifecycle, AuditOperation, AuditRecord, audit_lifecycle, complete_audit_operation,
+    mask_sensitive_keys, prepare_audit_operation, reconcile_prepared_audits, record_audit,
+};
 pub use policy::{
     ApprovalReason, PermissionPolicy, PermissionRule, PolicyEvaluation, ToolApprovalRequest,
     ToolDecision,
@@ -32,6 +35,21 @@ CREATE TABLE tool_audit_logs (
 );
 
 CREATE INDEX idx_tool_audit_workspace_id ON tool_audit_logs(workspace_id);
+";
+
+/// Tool call의 durable 실행 수명주기. 기존 감사 행은 완료된 legacy 기록이므로
+/// `succeeded`로 backfill한다. `operation_id`의 partial unique index가 Prepared/Unknown
+/// operation을 같은 ID로 다시 준비하는 것을 막아 전송 여부 불명 호출의 자동 재시도를
+/// 저장 계층에서도 차단한다.
+pub const MIGRATION_AUDIT_LIFECYCLE: &str = "
+ALTER TABLE tool_audit_logs ADD COLUMN operation_id TEXT;
+ALTER TABLE tool_audit_logs ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'succeeded'
+    CHECK (lifecycle IN ('prepared', 'succeeded', 'failed', 'unknown', 'denied'));
+ALTER TABLE tool_audit_logs ADD COLUMN outcome_error_code TEXT;
+ALTER TABLE tool_audit_logs ADD COLUMN completed_at TEXT;
+CREATE UNIQUE INDEX idx_tool_audit_operation_id
+    ON tool_audit_logs(operation_id) WHERE operation_id IS NOT NULL;
+CREATE INDEX idx_tool_audit_lifecycle ON tool_audit_logs(lifecycle);
 ";
 
 /// mcp_tools.schema_hash (설계문서 11.0) — tool input schema의 sha256 hex(64자).

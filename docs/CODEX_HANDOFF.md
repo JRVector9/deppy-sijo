@@ -2,8 +2,8 @@
 
 ## Current task
 
-- Refine Home announcements: poll every 4 hours, badge newly arrived notices on the Home sidebar row, compact rows by 30%, and replace provider names with consistently left-aligned logos.
-- Status: implementation and verification complete; user requested commit, release package rebuild, and a portable ZIP without relaunching the app.
+- Refine Home announcement spacing/alignment and make the active workspace row return from Home to Terminal.
+- Status: implementation and verification complete; exact dimensions, true glyph alignment, and active-row Terminal return regressions are green. Awaiting any requested commit/build/relaunch.
 
 ## Working area
 
@@ -14,13 +14,18 @@
 
 ## Plan
 
-1. Completed — inspected announcement cache/read-state options, provider logo resources, and sidebar badge contracts.
-2. Completed — changed automatic notice refresh to 4 hours and persisted/derived newly arrived notice count.
-3. Completed — rendered 44.8px rows with date/logo/title columns sharing fixed left anchors.
-4. Completed — added feed, badge, and layout regressions; check/test/Clippy/fmt verification passed.
+1. Completed — traced the centered title glyphs to `add_sized` and the active-row no-action branch.
+2. Completed — applied requested announcement dimensions and direct left-aligned label layout.
+3. Completed — made active workspace clicks emit the existing `SwitchWorkspace` action while preserving expand/collapse.
+4. Completed — updated geometry/navigation regressions; check/test/Clippy/fmt verification passed.
 
 ## Status
 
+- 2026-07-21: 사용자가 검증 완료된 Home 공지 치수/실제 glyph 좌측 정렬과 활성 workspace 재클릭 Terminal 복귀 변경의 commit+push를 요청했다. 의도된 `ui/agent_terminal.rs`, `ui/file_tree.rs`, handoff 3개 파일만 기능 커밋으로 고정하고 `origin/main`에 push한 뒤 원격 SHA 일치를 확인한다. build/relaunch는 요청하지 않아 수행하지 않는다.
+- 2026-07-21: 최종 검증이 통과했다. `cargo check -p deppy-sijo`, Home UI 8/8, active workspace 재클릭 1/1, localhost bind가 필요한 기존 7개 fixture만 제외한 직렬 app 전체 569 passed/0 failed/5 ignored/7 filtered, strict Clippy가 모두 성공했다. 다음은 rustfmt/diff 범위 최종 확인이며 이번 요청에는 commit/build/relaunch가 없으므로 수행하지 않는다.
+- 2026-07-21: 24pt refresh의 실제 overflow 실측은 26.2×25pt였다. 기본 Button을 정확한 24×24 `allocate_exact_size` hitbox+painter glyph로 교체했고 focused Home test와 Home UI 전체 8/8이 통과했다. 실제 Label response가 이제 글자 폭/left에서 시작해 날짜와 1~6번째 제목이 동일 anchor인 회귀도 성공했다. 활성 workspace 재클릭 `SwitchWorkspace(A)` 방출/기존 세션 트리 유지 회귀도 1/1 통과했다. 다음은 strict Clippy, 전체 app 회귀와 최종 diff 검사다.
+- 2026-07-21: 첫 Home UI 8-test 실행은 7 passed/1 failed였다. 실패는 새 24pt 새로고침 회귀가 18pt `⟳` 글리프+egui 기본 button padding의 intrinsic width overflow를 정확히 감지한 것으로, 다른 geometry/실제 제목 left anchor 테스트는 모두 통과했다. 버튼 response 실측값을 assertion에 노출해 글리프를 24×24 안에 맞춘 뒤 재실행한다.
+- 2026-07-21: 새 UI/탐색 후속 요청을 구현 중이다. Home 공지의 새로고침 hitbox는 24×24pt, 탭 간격은 1pt, 탭 아래 여백은 10pt, 행 위 여백은 8pt 대비 40% 줄인 4.8pt, 날짜 divider는 26pt, divider→logo는 2.4pt, 우측 inset은 8pt로 바꿨다. `announcement_cell`의 `add_sized`가 고정 셀 안에서 실제 글리프를 중앙 배치하던 원인이므로 직접 Label을 추가해 날짜/제목 glyph가 같은 left anchor를 쓰게 했다. 활성 workspace 행도 expand/collapse와 함께 `SwitchWorkspace(active.id)`를 방출해 Home에서 같은 A 행을 다시 눌러 Terminal view로 돌아가게 했다. 다음은 compile/UI/navigation regression과 strict 검증이다.
 - 2026-07-21: 사용자의 push 요청에 따라 기능 `2872f71`과 패키지 기록 `1dee2ad`를 `origin/main`에 push했고 원격은 `dc35d7e..1dee2ad`로 fast-forward 됐다. 이 delivery 기록도 docs-only commit으로 push해 로컬 `main`과 `origin/main`을 일치시킨다.
 - 2026-07-21: Home 공지 기능을 `2872f71` (`feat(home): add announcement alerts and compact logo rows`)로 커밋했다. 이 커밋 기준 `CARGO_NET_OFFLINE=true sh scripts/package-macos.sh`가 19.72초에 release bundle을 재생성했고, app/helper의 deep·strict codesign과 arm64, bundle id `app.vector9.deppy-sijo`, version `0.1.0`, minimum macOS `11.0` 검증이 모두 통과했다. 서명은 인증서가 없어 ad-hoc이다. `ditto --sequesterRsrc --keepParent`로 `target/bundle/Deppy-Sijo-0.1.0-macos-arm64-main-2872f71.zip`을 만들었고 unzip 무결성 검사는 오류 0, 크기는 17,799,310 bytes(18M), SHA-256은 `d81c0cfff694fa8c777ba5de5b7cd465b56564f6127a659ca9b1f61bc51a032e`다. 앱은 재실행하지 않았고 push도 하지 않았다.
 - 2026-07-21: 사용자가 검증 완료된 Home 공지 변경을 커밋하고 공식 macOS release bundle을 다시 만든 뒤 휴대 가능한 ZIP으로 압축하라고 요청했다. 현재 의도된 5개 파일만 기능 커밋으로 고정하고 `scripts/package-macos.sh`, app/helper strict codesign·arm64·metadata 검증, `ditto --keepParent` ZIP 생성과 무결성 검사를 진행한다. 앱 재실행과 push는 요청 범위가 아니므로 수행하지 않는다.

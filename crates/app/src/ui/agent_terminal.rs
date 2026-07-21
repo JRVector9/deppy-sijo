@@ -27,9 +27,14 @@ const ANNOUNCEMENT_ROW_HEIGHT: f32 = 44.8;
 const ANNOUNCEMENT_DATE_WIDTH: f32 = 82.0;
 const ANNOUNCEMENT_LINK_WIDTH: f32 = 30.0;
 const ANNOUNCEMENT_LOGO_SIZE: f32 = 22.0;
-const ANNOUNCEMENT_LOGO_LEFT_GAP: f32 = 1.8;
+const ANNOUNCEMENT_LOGO_LEFT_GAP: f32 = 2.4;
 const ANNOUNCEMENT_TITLE_GAP: f32 = 8.0;
-const ANNOUNCEMENT_RIGHT_INSET: f32 = 12.0;
+const ANNOUNCEMENT_RIGHT_INSET: f32 = 8.0;
+const ANNOUNCEMENT_REFRESH_SIZE: f32 = 24.0;
+const ANNOUNCEMENT_TAB_GAP: f32 = 1.0;
+const ANNOUNCEMENT_HEADER_BOTTOM_GAP: f32 = 10.0;
+const ANNOUNCEMENT_ROWS_TOP_GAP: f32 = 4.8;
+const ANNOUNCEMENT_DIVIDER_HEIGHT: f32 = 26.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HomeAction {
@@ -252,7 +257,7 @@ impl AgentTerminalUi {
             ui.horizontal(|ui| {
                 // 시안처럼 필터는 하나의 segmented control로 붙이고, 새로고침은
                 // 같은 행의 맨 오른쪽에 독립된 정사각 버튼으로 둔다.
-                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.spacing_mut().item_spacing.x = ANNOUNCEMENT_TAB_GAP;
                 source_filter(
                     ui,
                     &catalog.t("home.notices.filter_all", &[]),
@@ -284,24 +289,19 @@ impl AgentTerminalUi {
                     AnnouncementFilter::HuggingFace,
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(egui::RichText::new("⟳").size(18.0))
-                                .min_size(egui::vec2(32.0, 32.0))
-                                .fill(ui.visuals().extreme_bg_color)
-                                .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-                                .corner_radius(egui::CornerRadius::same(3)),
-                        )
-                        .on_hover_text(catalog.t("home.notices.refresh_hover", &[]))
-                        .clicked()
+                    if announcement_refresh_button(
+                        ui,
+                        &catalog.t("home.notices.refresh_hover", &[]),
+                    )
+                    .clicked()
                     {
                         refresh_clicked = true;
                     }
                 });
             });
-            ui.add_space(12.0);
+            ui.add_space(ANNOUNCEMENT_HEADER_BOTTOM_GAP);
             crate::ui::hairline(ui);
-            ui.add_space(8.0);
+            ui.add_space(ANNOUNCEMENT_ROWS_TOP_GAP);
             // 실제 상태 페이지의 최신 인시던트 5건씩 (2026-07-20 사용자 — 정적 링크
             // 카드에서 교체). 아직 첫 조회 전이면 안내 문구.
             let mut cards: Vec<AnnouncementCard> = [
@@ -480,6 +480,39 @@ fn source_filter(
     }
 }
 
+fn announcement_refresh_button(ui: &mut egui::Ui, hover_text: &str) -> egui::Response {
+    // egui Button은 glyph intrinsic size+padding이 24pt를 넘으면 add_sized에서도 overflow
+    // 한다. 정확한 hitbox를 먼저 할당하고 painter로 글리프를 그려 24×24를 보장한다.
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ANNOUNCEMENT_REFRESH_SIZE, ANNOUNCEMENT_REFRESH_SIZE),
+        egui::Sense::click(),
+    );
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "⟳"));
+    if ui.is_rect_visible(rect) {
+        let fill = if response.hovered() {
+            ui.visuals().widgets.hovered.weak_bg_fill
+        } else {
+            ui.visuals().extreme_bg_color
+        };
+        ui.painter().rect(
+            rect,
+            3.0,
+            fill,
+            ui.visuals().widgets.noninteractive.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "⟳",
+            egui::FontId::proportional(18.0),
+            ui.style().interact(&response).text_color(),
+        );
+    }
+    response.on_hover_text(hover_text)
+}
+
 fn announcement_source_label(source: &str) -> &str {
     match source {
         "Claude" => "Anthropic",
@@ -498,7 +531,7 @@ struct AnnouncementColumns {
 
 /// 모든 가상화 행이 같은 row 폭에서 정확히 같은 x anchor를 쓰게 열 geometry를 한 곳에서
 /// 계산한다. 날짜는 상단 `전체` 탭의 바깥 시작선과 맞추고, 로고는 divider 뒤 기존 18px
-/// 여백을 정확히 90% 줄인 1.8px에서 시작한다.
+/// 여백 2.4pt에서 시작한다.
 fn announcement_columns(row_rect: egui::Rect) -> AnnouncementColumns {
     let content_left = row_rect.left();
     let content_right = (row_rect.right() - ANNOUNCEMENT_RIGHT_INSET).max(content_left);
@@ -628,10 +661,10 @@ fn announcement_cell(ui: &mut egui::Ui, rect: egui::Rect, text: egui::RichText) 
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     cell.set_clip_rect(rect.intersect(ui.clip_rect()));
-    cell.add_sized(
-        rect.size(),
-        egui::Label::new(text).truncate().halign(egui::Align::LEFT),
-    )
+    // add_sized는 내부에 centered_and_justified layout을 만들어 실제 글리프를 셀 중앙에
+    // 놓는다. 고정된 column 시작선에서 Label 자체를 바로 추가해 날짜·제목의 첫 글자가
+    // 모든 행에서 정확히 같은 x에 오게 한다.
+    cell.add(egui::Label::new(text).truncate().halign(egui::Align::LEFT))
 }
 
 fn paint_external_link_icon(painter: &egui::Painter, center: egui::Pos2, color: egui::Color32) {
@@ -692,7 +725,10 @@ fn announcement_row(
     );
     ui.painter().vline(
         columns.divider_x,
-        egui::Rangef::new(row_rect.center().y - 14.0, row_rect.center().y + 14.0),
+        egui::Rangef::new(
+            row_rect.center().y - ANNOUNCEMENT_DIVIDER_HEIGHT / 2.0,
+            row_rect.center().y + ANNOUNCEMENT_DIVIDER_HEIGHT / 2.0,
+        ),
         ui.visuals().widgets.noninteractive.bg_stroke,
     );
     paint_announcement_provider_logo(ui, columns.logo, card.source);
@@ -975,14 +1011,33 @@ mod tests {
         harness.get_by_label("My Connections");
         harness.get_by_label("Slack");
         harness.get_by_label("Not connected");
-        let all = harness.get_by_label("All").rect().left();
-        let openai = harness.get_by_label("OpenAI").rect().left();
-        let anthropic = harness.get_by_label("Anthropic").rect().left();
-        let grok = harness.get_by_label("Grok").rect().left();
+        let all_rect = harness.get_by_label("All").rect();
+        let openai_rect = harness.get_by_label("OpenAI").rect();
+        let anthropic_rect = harness.get_by_label("Anthropic").rect();
+        let grok_rect = harness.get_by_label("Grok").rect();
         let hugging_face = harness.get_by_label("Hugging Face").rect();
         let refresh = harness.get_by_label("⟳").rect();
         assert!(
-            all < openai && openai < anthropic && anthropic < grok && grok < hugging_face.left()
+            all_rect.left() < openai_rect.left()
+                && openai_rect.left() < anthropic_rect.left()
+                && anthropic_rect.left() < grok_rect.left()
+                && grok_rect.left() < hugging_face.left()
+        );
+        for (left, right) in [
+            (all_rect, openai_rect),
+            (openai_rect, anthropic_rect),
+            (anthropic_rect, grok_rect),
+            (grok_rect, hugging_face),
+        ] {
+            assert!((right.left() - left.right() - ANNOUNCEMENT_TAB_GAP).abs() <= 0.1);
+        }
+        assert!(
+            (refresh.width() - ANNOUNCEMENT_REFRESH_SIZE).abs() <= 0.1,
+            "새로고침 폭은 24pt여야 함: {refresh:?}"
+        );
+        assert!(
+            (refresh.height() - ANNOUNCEMENT_REFRESH_SIZE).abs() <= 0.1,
+            "새로고침 높이는 24pt여야 함: {refresh:?}"
         );
         assert!(
             hugging_face.right() <= refresh.left(),
@@ -1081,10 +1136,11 @@ mod tests {
 
     #[test]
     fn 공지_열_geometry는_행이_달라도_같고_요청한_여백을_쓴다() {
-        let first = announcement_columns(egui::Rect::from_min_size(
+        let first_row = egui::Rect::from_min_size(
             egui::pos2(20.0, 10.0),
             egui::vec2(900.0, ANNOUNCEMENT_ROW_HEIGHT),
-        ));
+        );
+        let first = announcement_columns(first_row);
         let later = announcement_columns(egui::Rect::from_min_size(
             egui::pos2(20.0, 310.0),
             egui::vec2(900.0, ANNOUNCEMENT_ROW_HEIGHT),
@@ -1092,7 +1148,12 @@ mod tests {
 
         assert!((ANNOUNCEMENT_ROW_HEIGHT - 64.0 * 0.7).abs() < f32::EPSILON);
         assert_eq!(first.date.left(), 20.0, "날짜 앞쪽 별도 inset 없음");
-        assert!((first.logo.left() - first.divider_x - 1.8).abs() < 0.01);
+        assert!((first.logo.left() - first.divider_x - 2.4).abs() < 0.01);
+        assert!((first.title.left() - first.logo.right() - 8.0).abs() < 0.01);
+        assert!((first_row.right() - first.link.right() - 8.0).abs() < 0.01);
+        assert_eq!(ANNOUNCEMENT_DIVIDER_HEIGHT, 26.0);
+        assert_eq!(ANNOUNCEMENT_HEADER_BOTTOM_GAP, 10.0);
+        assert!((ANNOUNCEMENT_ROWS_TOP_GAP - 8.0 * 0.6).abs() < f32::EPSILON);
         assert_eq!(first.date.left(), later.date.left());
         assert_eq!(first.logo.left(), later.logo.left());
         assert_eq!(first.title.left(), later.title.left());

@@ -952,6 +952,10 @@ impl FileTreeUi {
                         if resp.clicked() {
                             self.workspace_sessions_expanded
                                 .insert(active.id.clone(), !expanded);
+                            // Home/Inbox/Agents에서 현재 활성 워크스페이스를 다시 눌러도
+                            // App dispatch가 Terminal view로 복귀할 수 있게 명시적 전환을
+                            // 방출한다. 같은 id의 runtime 전환은 App에서 no-op이다.
+                            action = Some(SidebarAction::SwitchWorkspace(active.id.clone()));
                         }
                     }
 
@@ -6484,6 +6488,7 @@ mod tests {
         struct State {
             tree: FileTreeUi,
             active: String,
+            switch_target: Option<String>,
             focus_target: Option<String>,
             fonts_ready: bool,
         }
@@ -6542,6 +6547,7 @@ mod tests {
                     };
                     match state.tree.panel(ui, &sessions, &snapshot, &catalog) {
                         Some(SidebarAction::SwitchWorkspace(workspace_id)) => {
+                            state.switch_target = Some(workspace_id.clone());
                             state.active = workspace_id;
                         }
                         Some(SidebarAction::FocusSession { workspace_id, .. }) => {
@@ -6554,6 +6560,7 @@ mod tests {
                 State {
                     tree: FileTreeUi::new(egui::Context::default()),
                     active: "workspace-a".to_owned(),
+                    switch_target: None,
                     focus_target: None,
                     fonts_ready: false,
                 },
@@ -6586,12 +6593,22 @@ mod tests {
         harness.get_by_label("Workspace A").click();
         harness.run();
         assert_eq!(harness.state().active, "workspace-a");
+        assert_eq!(
+            harness.state().switch_target.as_deref(),
+            Some("workspace-a")
+        );
         harness.get_by_label("Session A");
         harness.get_by_label("Session B");
 
-        // 활성 행을 다시 누르는 것은 사용자의 명시적 접기다. A만 닫히고 B는 유지된다.
+        // 활성 행을 다시 누르면 접기와 함께 SwitchWorkspace(A)를 다시 방출한다. App은
+        // 같은 runtime 전환은 생략하되 Home/Inbox에서 Terminal view로 복귀한다.
+        harness.state_mut().switch_target = None;
         harness.get_by_label("Workspace A").click();
         harness.run();
+        assert_eq!(
+            harness.state().switch_target.as_deref(),
+            Some("workspace-a")
+        );
         assert!(harness.query_by_label("Session A").is_none());
         harness.get_by_label("Session B");
 

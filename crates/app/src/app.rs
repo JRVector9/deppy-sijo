@@ -1223,12 +1223,17 @@ pub struct App {
     /// 하단 상태바 「MCP N」용 활성 MCP 서버 수 캐시 — 매 프레임 DB 조회 금지
     /// (30s TTL — 커넥터 변경은 다음 갱신에 반영되면 충분한 준정적 값).
     mcp_count_cache: Option<(std::time::Instant, usize)>,
-    /// 홈 업데이트 피드 수신(Claude/OpenAI 상태 5분, 공지/HF/Grok 60분) + 최신
+    /// 홈 업데이트 피드 수신(Claude/OpenAI 상태 5분, 공지/HF/Grok 4시간) + 최신
     /// 스냅샷. provider별 조회 실패(None)면 마지막 성공값을 유지한다.
     status_feed_rx: std::sync::mpsc::Receiver<crate::status_feed::StatusFeedSnapshot>,
     /// 수동 갱신(홈 「AI 공지」 ⟳ 버튼) — 워커를 즉시 깨워 상태+공지 재조회.
     status_feed_refresh: std::sync::mpsc::Sender<()>,
     status_feed: crate::status_feed::StatusFeedSnapshot,
+    /// Home을 마지막으로 본 시점의 provider별 공지 ID와 현재 신규 공지 배지 수.
+    /// 별도 작은 JSON으로 영속해 앱 재시작 때 기존 공지가 다시 새 알림이 되지 않는다.
+    notice_read_state: crate::status_feed::NoticeReadState,
+    notice_read_state_path: PathBuf,
+    home_notice_unread: usize,
     /// 공지 제목 번역 영속 캐시(제공자+로케일+원문 → 번역) + 진행 중 번역 수신.
     /// 앱 재시작 뒤에도 같은 제목은 재번역하지 않으며, 저장 실패는 원문 표시로 완화한다.
     notice_translation_cache: crate::notice_translate::TranslationCache,
@@ -1699,6 +1704,21 @@ impl App {
                     crate::notice_translate::TranslationCache::default()
                 }
             };
+        let notice_read_state_path = db_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("notice_read_state.json");
+        let notice_read_state =
+            match crate::status_feed::NoticeReadState::load(&notice_read_state_path) {
+                Ok(state) => state,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %notice_read_state_path.display(),
+                        "공지 읽음 상태를 읽지 못해 새 기준으로 시작: {error:#}"
+                    );
+                    crate::status_feed::NoticeReadState::default()
+                }
+            };
 
         // main에서 CreationContext를 받자마자 이 설정으로 폰트를 이미 설치했다. sentinel로
         // 시작하면 첫 프레임에 15MB AppleGothic을 포함한 FontDefinitions를 다시 만들고
@@ -1775,6 +1795,9 @@ impl App {
             status_feed_rx: status_feed_rx_channel.0,
             status_feed_refresh: status_feed_rx_channel.1,
             status_feed: crate::status_feed::StatusFeedSnapshot::default(),
+            notice_read_state,
+            notice_read_state_path,
+            home_notice_unread: 0,
             notice_translation_cache,
             notice_translation_cache_path,
             notice_translate_rx: None,
@@ -4603,6 +4626,28 @@ impl App {
         name
     }
 
+    /// 최신 feed를 읽음 기준과 대조해 Home 배지 수를 갱신한다. Home이 선택된 동안에는
+    /// 현재 목록을 곧바로 읽음 처리한다. 디스크 쓰기는 기준이 실제로 달라질 때만 한다.
+    fn sync_home_notice_badge(&mut self, mark_read: bool, ctx: &egui::Context) {
+        let state_changed = self
+            .notice_read_state
+            .reconcile(&self.status_feed, mark_read);
+        let unread = self.notice_read_state.unread_count(&self.status_feed);
+        let count_changed = unread != self.home_notice_unread;
+        self.home_notice_unread = unread;
+        if state_changed
+            && let Err(error) = self.notice_read_state.save(&self.notice_read_state_path)
+        {
+            tracing::warn!(
+                path = %self.notice_read_state_path.display(),
+                "공지 읽음 상태 저장 실패: {error:#}"
+            );
+        }
+        if state_changed || count_changed {
+            ctx.request_repaint();
+        }
+    }
+
     /// 홈 공지 제목 번역 펌프 — 진행 중 결과를 메모리+디스크 캐시에 합치고, 캐시에
     /// 없는 새 제공자·로케일·제목만 번역한다(rx 보유가 동시 실행 게이트).
     /// 영어 로케일이거나 claude CLI가 없으면 아무것도 하지 않는다(원문 표시).
@@ -6144,6 +6189,11 @@ impl eframe::App for App {
             sidebar_sessions.insert(workspace.id.clone(), entries);
         }
         sidebar_sessions.insert(active_workspace_id.clone(), terminal_sessions);
+        // Home을 보고 있는 동안 도착했거나 이미 표시 중인 공지는 읽음이다. sidebar
+        // snapshot을 만들기 전에 반영해 같은 프레임에 Home 배지가 사라지게 한다.
+        if self.agent_terminal_ui.view() == ui::agent_terminal::AgentTerminalView::Home {
+            self.sync_home_notice_badge(true, ui.ctx());
+        }
         let inbox_count = self.approvals_ui.pending().len()
             + self.global_waiting.len()
             + self.notifications_ui.unread();
@@ -6151,6 +6201,7 @@ impl eframe::App for App {
             active_workspace_id: &active_workspace_id,
             workspaces: &sidebar_workspaces,
             view: self.agent_terminal_ui.view(),
+            home_notice_count: self.home_notice_unread,
             inbox_count,
             agents_open: self.agent_sessions_ui.is_open(),
         };
@@ -6186,7 +6237,9 @@ impl eframe::App for App {
         };
         // AI 서비스 상태 스냅샷 수신 — provider별 실패(None)는 마지막 성공값 유지
         // (일시적 네트워크 오류로 점등이 회색으로 깜빡이지 않게).
+        let mut status_feed_received = false;
         while let Ok(snapshot) = self.status_feed_rx.try_recv() {
+            status_feed_received = true;
             if snapshot.claude.is_some() {
                 self.status_feed.claude = snapshot.claude;
             }
@@ -6202,6 +6255,11 @@ impl eframe::App for App {
             if snapshot.grok.is_some() {
                 self.status_feed.grok = snapshot.grok;
             }
+        }
+        if status_feed_received {
+            let home_visible =
+                self.agent_terminal_ui.view() == ui::agent_terminal::AgentTerminalView::Home;
+            self.sync_home_notice_badge(home_visible, ui.ctx());
         }
         self.pump_notice_translations(ui.ctx());
         self.pump_ollama_detect(ui.ctx());

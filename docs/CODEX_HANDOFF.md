@@ -2,8 +2,8 @@
 
 ## Current task
 
-- Allow the last Environment & API project to close, leaving the list and detail surface empty while the `+` control remains available.
-- Status: fixed and verified. The last row can close, the list/detail body stays blank with only `+` available, and sidebar/runtime/session state remains untouched.
+- Refine Home announcements: poll every 4 hours, badge newly arrived notices on the Home sidebar row, compact rows by 30%, and replace provider names with consistently left-aligned logos.
+- Status: implementation and verification complete; user requested commit, release package rebuild, and a portable ZIP without relaunching the app.
 
 ## Working area
 
@@ -14,12 +14,18 @@
 
 ## Plan
 
-1. Completed — remove the last-project guard and empty-list fallback selection/detail rendering.
-2. Completed — update empty-list and last-close regressions.
-3. Completed — run focused/full verification and record final state.
+1. Completed — inspected announcement cache/read-state options, provider logo resources, and sidebar badge contracts.
+2. Completed — changed automatic notice refresh to 4 hours and persisted/derived newly arrived notice count.
+3. Completed — rendered 44.8px rows with date/logo/title columns sharing fixed left anchors.
+4. Completed — added feed, badge, and layout regressions; check/test/Clippy/fmt verification passed.
 
 ## Status
 
+- 2026-07-21: 사용자가 검증 완료된 Home 공지 변경을 커밋하고 공식 macOS release bundle을 다시 만든 뒤 휴대 가능한 ZIP으로 압축하라고 요청했다. 현재 의도된 5개 파일만 기능 커밋으로 고정하고 `scripts/package-macos.sh`, app/helper strict codesign·arm64·metadata 검증, `ditto --keepParent` ZIP 생성과 무결성 검사를 진행한다. 앱 재실행과 push는 요청 범위가 아니므로 수행하지 않는다.
+- 2026-07-21: 최종 검증이 통과했다. localhost bind가 필요한 기존 7개 proxy/connector fixture만 명시 제외한 직렬 app 전체는 569 passed/0 failed/5 ignored/7 filtered였고, `cargo clippy -p deppy-sijo --all-targets -- -D warnings`, rustfmt check와 `git diff --check`가 모두 성공했다. 변경은 app/status feed/Home UI/sidebar/handoff 5개 파일로 한정되며 커밋·release build·재실행은 요청받지 않아 수행하지 않았다.
+- 2026-07-21: 1차 검증이 통과했다. `cargo check -p deppy-sijo`, status feed 9/9(4시간 상수·첫 성공 baseline·신규 URL·Home 읽음·늦은 provider·disk roundtrip 포함), Home UI 8/8(44.8px 5행 viewport·공급자명 제거/로고·탭/날짜 정렬·모든 제목 anchor 포함), sidebar nav 클릭 회귀 1/1이 성공했다. 처음 status 테스트에서 영문 대문자 `URL`이 Rust non-snake-case 경고를 냈으나 테스트 이름만 소문자 `url`로 고쳐 제거했다. 다음은 strict Clippy, 전체 범위 테스트와 최종 diff 검사다.
+- 2026-07-21: 공지 데이터/UI 구조 변경을 구현했다. 공지 자동 조회는 4시간이며 수동 새로고침과 서비스 상태 5분 폴링은 유지된다. `notice_read_state.json`에 공급자별 최초 성공 기준과 읽은 URL을 누적 저장해 재시작·목록 재진입에서도 같은 공지를 다시 알리지 않고, 신규 수는 Inbox와 같은 Home nav 배지에 연결했다. Home을 열면 현재 공지를 읽음 처리한다. 행은 64px에서 44.8px로 30% 줄였고, 날짜는 상단 전체 탭 시작선에 맞추며 공급자명 대신 코드로 그린 로고를 divider 뒤 1.8px에서 시작하고 모든 제목이 동일한 고정 x anchor를 쓰도록 했다. 다음은 컴파일과 회귀 검증이다.
+- 2026-07-21: 새 홈 공지 요청을 시작했다. 자동 공지 조회를 60분에서 4시간으로 바꾸되 서비스 상태 5분 폴링과 수동 새로고침은 유지한다. 새 공지는 사이드바 Home 행에 작업함과 같은 숫자 배지로 표시하고, 64px 행은 정확히 30% 줄인 44.8px로 변경한다. 공급자명은 로고로 대체하며 날짜는 상단 필터 시작선에, 로고/제목은 모든 행에서 동일한 고정 left anchor에 맞춘다. HTTP 10초는 요청 하나의 최대 대기시간일 뿐 상시 CPU/RAM 사용이 아니라고 사용자에게 설명했다.
 - 2026-07-20: guarded docs commit 스크립트의 첫 Terminal 전달은 macOS automation service가 일시적으로 Terminal 표시 이름을 해석하지 못해 `-1728`로 실행 전에 중단됐다. Git/index에는 변화가 없다. 이전 재실행 때 성공한 것처럼 Terminal 활성화와 `do script`를 별도 AppleEvent로 나눠 재시도한다.
 - 2026-07-20: `login:false`와 정확한 대문자 absolute git/worktree 경로를 쓴 두 번째 docs-only commit 시도도 현재 관리 셸의 `.git/index.lock` 쓰기 제한으로 실패했다. HEAD `4619bac`과 index에는 영향이 없고 handoff만 unstaged다. 일반 macOS Terminal에서 tracked 변경이 handoff 하나뿐임을 guard한 뒤 그 파일만 별도 docs commit한다.
 - 2026-07-20: 최종 docs-only 커밋의 첫 `git add`는 login shell이 checkout 경로를 소문자 `/Users/jr/desktop/...`로 정규화해 허용된 대문자 `.git` 경계와 어긋나면서 `index.lock: Operation not permitted`로 실패했다. 기능 커밋과 실행 앱에는 영향이 없고 index도 변경되지 않았다. `login:false`와 대문자 절대 `--git-dir`/`--work-tree`로 같은 handoff 파일만 커밋한다.

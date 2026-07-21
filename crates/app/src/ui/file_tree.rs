@@ -100,6 +100,8 @@ pub struct SidebarSnapshot<'a> {
     pub active_workspace_id: &'a str,
     pub workspaces: &'a [SidebarWorkspaceEntry],
     pub view: super::agent_terminal::AgentTerminalView,
+    /// 마지막 Home 열람 뒤 새로 도착한 공지 수 — Home 행에 작업함과 같은 배지로 표시.
+    pub home_notice_count: usize,
     pub inbox_count: usize,
     /// Agents 창 열림 여부 — 하단 nav 「에이전트」 행의 선택 상태 (2026-07-18).
     pub agents_open: bool,
@@ -2069,7 +2071,7 @@ impl FileTreeUi {
             NavIcon::Home,
             &catalog.t("sidebar.nav.home", &[]),
             sidebar.view == super::agent_terminal::AgentTerminalView::Home,
-            None,
+            nav_badge_text(sidebar.home_notice_count).as_deref(),
         )
         .clicked()
         {
@@ -5791,6 +5793,7 @@ mod tests {
                         active_workspace_id: "workspace-a",
                         workspaces: &workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 0,
                         inbox_count: 0,
                         agents_open: false,
                     };
@@ -5974,6 +5977,7 @@ mod tests {
             active_workspace_id: "default",
             workspaces: &[],
             view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+            home_notice_count: 0,
             inbox_count: 0,
             agents_open: false,
         };
@@ -6381,6 +6385,7 @@ mod tests {
                         active_workspace_id: "ws-2",
                         workspaces: &workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 0,
                         inbox_count: 0,
                         agents_open: false,
                     };
@@ -6531,6 +6536,7 @@ mod tests {
                         active_workspace_id: &state.active,
                         workspaces: &workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 0,
                         inbox_count: 0,
                         agents_open: false,
                     };
@@ -6634,6 +6640,7 @@ mod tests {
                         active_workspace_id: "ws-12",
                         workspaces: &workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 0,
                         inbox_count: 0,
                         agents_open: false,
                     };
@@ -6702,6 +6709,7 @@ mod tests {
                         active_workspace_id: "ws-test",
                         workspaces: &[],
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 0,
                         inbox_count: 0,
                         agents_open: false,
                     };
@@ -6797,6 +6805,7 @@ mod tests {
                         active_workspace_id: active_id,
                         workspaces,
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 0,
                         inbox_count: 0,
                         agents_open: false,
                     };
@@ -6983,6 +6992,7 @@ mod tests {
                         active_workspace_id: "ws-hidden",
                         workspaces: &[],
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 0,
                         inbox_count: 0,
                         agents_open: false,
                     };
@@ -7040,6 +7050,7 @@ mod tests {
                         active_workspace_id: "ws-test",
                         workspaces: &[],
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 4,
                         inbox_count: 2,
                         agents_open: false,
                     };
@@ -7197,6 +7208,7 @@ mod tests {
                         active_workspace_id: "ws-test",
                         workspaces: &[],
                         view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 0,
                         inbox_count: 0,
                         agents_open: false,
                     };

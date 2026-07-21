@@ -7,6 +7,7 @@
 
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
+use std::{collections::BTreeSet, path::Path};
 
 pub const CLAUDE_STATUS_URL: &str = "https://status.claude.com";
 pub const OPENAI_STATUS_URL: &str = "https://status.openai.com";
@@ -16,11 +17,12 @@ const HUGGING_FACE_MODELS_API: &str =
 const GROK_STATUS_RSS: &str = "https://status.x.ai/feed.xml";
 /// 상태(점등) 폴링 주기 — 장애 감지용이라 짧게 유지.
 const STATUS_INTERVAL: Duration = Duration::from_secs(300);
-/// 공지(인시던트 목록) 갱신 주기 (2026-07-18 사용자: 60분).
-const INCIDENTS_INTERVAL: Duration = Duration::from_secs(3600);
+/// 공지(인시던트 목록) 갱신 주기 (2026-07-21 사용자: 4시간).
+const INCIDENTS_INTERVAL: Duration = Duration::from_secs(4 * 60 * 60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// 홈 공지 카드 수 (provider당, 2026-07-20 사용자: "5줄").
 const INCIDENTS_PER_PROVIDER: usize = 5;
+const NOTICE_READ_STATE_VERSION: u32 = 1;
 
 /// Statuspage `status.indicator` 매핑.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +75,132 @@ pub struct StatusFeedSnapshot {
     pub grok: Option<ProviderStatus>,
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct NoticeReadStateFile {
+    version: u32,
+    initialized_providers: Vec<String>,
+    read_ids: Vec<String>,
+}
+
+/// 홈 공지의 읽음 기준. 공급자별 첫 성공 조회는 기존 공지로 기준화하고, 이후 새 URL만
+/// 배지에 센다. 읽은 ID는 누적해 한때 최신 5건 밖으로 밀린 공지가 다시 목록에 들어와도
+/// 새 공지로 잘못 세지 않으며, 앱을 재시작해도 같은 공지를 다시 알리지 않는다.
+#[derive(Debug, Default)]
+pub struct NoticeReadState {
+    initialized_providers: BTreeSet<String>,
+    read_ids: BTreeSet<String>,
+}
+
+impl NoticeReadState {
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let file: NoticeReadStateFile = serde_json::from_slice(&bytes)?;
+        if file.version != NOTICE_READ_STATE_VERSION {
+            anyhow::bail!(
+                "지원하지 않는 공지 읽음 상태 버전: {} (현재 {NOTICE_READ_STATE_VERSION})",
+                file.version
+            );
+        }
+        Ok(Self {
+            initialized_providers: file
+                .initialized_providers
+                .into_iter()
+                .filter(|provider| !provider.trim().is_empty())
+                .collect(),
+            read_ids: file
+                .read_ids
+                .into_iter()
+                .filter(|id| !id.trim().is_empty())
+                .collect(),
+        })
+    }
+
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = NoticeReadStateFile {
+            version: NOTICE_READ_STATE_VERSION,
+            initialized_providers: self.initialized_providers.iter().cloned().collect(),
+            read_ids: self.read_ids.iter().cloned().collect(),
+        };
+        deppy_core::fs::atomic_write(path, &serde_json::to_vec_pretty(&file)?)?;
+        Ok(())
+    }
+
+    /// 새 공급자의 첫 성공 응답은 baseline으로 읽음 처리한다. `mark_read`는 Home이 실제
+    /// 선택된 경우이며, 현재 목록의 URL을 그 공급자의 누적 읽음 기준에 추가한다.
+    pub fn reconcile(&mut self, feed: &StatusFeedSnapshot, mark_read: bool) -> bool {
+        let mut changed = false;
+        for (provider, status) in announcement_providers(feed) {
+            let Some(status) = status else { continue };
+            let first_success = self.initialized_providers.insert(provider.to_owned());
+            changed |= first_success;
+            if first_success || mark_read {
+                changed |= self.mark_provider_read(provider, status);
+            }
+        }
+        changed
+    }
+
+    pub fn unread_count(&self, feed: &StatusFeedSnapshot) -> usize {
+        announcement_providers(feed)
+            .into_iter()
+            .filter_map(|(provider, status)| {
+                if !self.initialized_providers.contains(provider) {
+                    return None;
+                }
+                status.map(|status| (provider, status))
+            })
+            .flat_map(|(provider, status)| {
+                status
+                    .incidents
+                    .iter()
+                    .map(move |incident| notice_id(provider, incident))
+            })
+            .filter(|id| !self.read_ids.contains(id))
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
+    fn mark_provider_read(&mut self, provider: &str, status: &ProviderStatus) -> bool {
+        let before = self.read_ids.len();
+        self.read_ids.extend(
+            status
+                .incidents
+                .iter()
+                .map(|incident| notice_id(provider, incident)),
+        );
+        self.read_ids.len() != before
+    }
+}
+
+fn announcement_providers(
+    feed: &StatusFeedSnapshot,
+) -> [(&'static str, Option<&ProviderStatus>); 4] {
+    [
+        ("OpenAI", feed.openai.as_ref()),
+        ("Claude", feed.claude.as_ref()),
+        ("Grok", feed.grok.as_ref()),
+        ("Hugging Face", feed.hugging_face.as_ref()),
+    ]
+}
+
+fn notice_id(provider: &str, incident: &IncidentNotice) -> String {
+    let identity = if incident.url.trim().is_empty() {
+        format!("{}\u{1f}{}", incident.date, incident.title)
+    } else {
+        incident.url.trim().to_owned()
+    };
+    format!("{provider}\u{1f}{identity}")
+}
+
 /// 백그라운드 폴링 워커를 띄우고 (스냅샷 수신, 수동 갱신 송신) 채널 쌍을 돌려준다.
 /// 앱 수명 내내 돈다 — App(수신측)이 드롭되면 send 실패로 스스로 종료한다.
 /// 수동 갱신 신호가 오면 즉시 상태+공지를 모두 다시 가져온다.
@@ -83,7 +211,7 @@ pub fn spawn(egui_ctx: egui::Context) -> (Receiver<StatusFeedSnapshot>, Sender<(
         .name("status-feed".into())
         .spawn(move || {
             let agent = ureq::builder().timeout(HTTP_TIMEOUT).build();
-            // 공지는 60분 주기 — 사이 틱에서는 마지막 성공 목록을 스냅샷에 실어
+            // 공지는 4시간 주기 — 사이 틱에서는 마지막 성공 목록을 스냅샷에 실어
             // 보낸다(상태만 갱신돼도 공지가 사라지지 않게).
             let mut incidents_at: Option<Instant> = None;
             let mut claude_incidents: Vec<IncidentNotice> = Vec::new();
@@ -393,6 +521,93 @@ fn rss_date(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_notice(url: &str) -> IncidentNotice {
+        IncidentNotice {
+            title: format!("Notice {url}"),
+            status: "resolved".to_owned(),
+            date: "2026-07-21".to_owned(),
+            url: url.to_owned(),
+        }
+    }
+
+    fn test_provider(urls: &[&str]) -> ProviderStatus {
+        ProviderStatus {
+            indicator: ServiceIndicator::Operational,
+            description: "Operational".to_owned(),
+            incidents: urls.iter().map(|url| test_notice(url)).collect(),
+        }
+    }
+
+    #[test]
+    fn 공지_자동_조회_주기는_4시간이다() {
+        assert_eq!(INCIDENTS_INTERVAL, Duration::from_secs(4 * 60 * 60));
+    }
+
+    #[test]
+    fn 첫_성공_목록은_기준화하고_그_다음_url만_새_공지로_센다() {
+        let mut state = NoticeReadState::default();
+        let mut feed = StatusFeedSnapshot {
+            openai: Some(test_provider(&["https://status.openai.com/old"])),
+            ..StatusFeedSnapshot::default()
+        };
+
+        assert!(state.reconcile(&feed, false));
+        assert_eq!(state.unread_count(&feed), 0, "첫 조회는 기존 공지 기준");
+
+        feed.openai = Some(test_provider(&[
+            "https://status.openai.com/new",
+            "https://status.openai.com/old",
+        ]));
+        assert!(!state.reconcile(&feed, false));
+        assert_eq!(state.unread_count(&feed), 1);
+
+        assert!(state.reconcile(&feed, true));
+        assert_eq!(
+            state.unread_count(&feed),
+            0,
+            "Home을 열면 현재 공지를 읽음 처리"
+        );
+    }
+
+    #[test]
+    fn 늦게_처음_성공한_공급자도_과거_공지를_새_알림으로_만들지_않는다() {
+        let mut state = NoticeReadState::default();
+        let mut feed = StatusFeedSnapshot {
+            openai: Some(test_provider(&["openai-old"])),
+            ..StatusFeedSnapshot::default()
+        };
+        state.reconcile(&feed, false);
+
+        feed.claude = Some(test_provider(&["claude-old"]));
+        assert!(state.reconcile(&feed, false));
+        assert_eq!(state.unread_count(&feed), 0);
+    }
+
+    #[test]
+    fn 읽음_url은_재시작_뒤에도_유지되고_목록_재진입을_다시_세지_않는다() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "deppy-notice-read-state-{}-{unique}.json",
+            std::process::id()
+        ));
+        let mut state = NoticeReadState::default();
+        let feed = StatusFeedSnapshot {
+            grok: Some(test_provider(&["grok-a", "grok-b"])),
+            ..StatusFeedSnapshot::default()
+        };
+        state.reconcile(&feed, false);
+        state.save(&path).unwrap();
+
+        let loaded = NoticeReadState::load(&path).unwrap();
+        assert_eq!(loaded.initialized_providers, state.initialized_providers);
+        assert_eq!(loaded.read_ids, state.read_ids);
+        assert_eq!(loaded.unread_count(&feed), 0);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn parse_status는_indicator와_설명을_뽑는다() {

@@ -22,9 +22,14 @@ enum AnnouncementFilter {
 }
 
 const ANNOUNCEMENT_VISIBLE_ROWS: usize = 5;
-const ANNOUNCEMENT_ROW_HEIGHT: f32 = 64.0;
+/// 64px 기존 행에서 정확히 30% 축소.
+const ANNOUNCEMENT_ROW_HEIGHT: f32 = 44.8;
 const ANNOUNCEMENT_DATE_WIDTH: f32 = 82.0;
 const ANNOUNCEMENT_LINK_WIDTH: f32 = 30.0;
+const ANNOUNCEMENT_LOGO_SIZE: f32 = 22.0;
+const ANNOUNCEMENT_LOGO_LEFT_GAP: f32 = 1.8;
+const ANNOUNCEMENT_TITLE_GAP: f32 = 8.0;
+const ANNOUNCEMENT_RIGHT_INSET: f32 = 12.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HomeAction {
@@ -347,7 +352,7 @@ impl AgentTerminalUi {
                 let viewport_height = ANNOUNCEMENT_ROW_HEIGHT * ANNOUNCEMENT_VISIBLE_ROWS as f32;
                 ui.scope(|ui| {
                     // show_rows는 전역 item spacing을 행 높이에 더한다. 여기서는 0으로
-                    // 고정해 64px × 5행 viewport가 정확히 다섯 행과 일치하게 한다.
+                    // 고정해 44.8px × 5행 viewport가 정확히 다섯 행과 일치하게 한다.
                     ui.spacing_mut().item_spacing.y = 0.0;
                     egui::ScrollArea::vertical()
                         .id_salt("home-announcement-rows")
@@ -482,12 +487,137 @@ fn announcement_source_label(source: &str) -> &str {
     }
 }
 
-fn announcement_source_color(ui: &egui::Ui, source: &str) -> egui::Color32 {
+#[derive(Debug, Clone, Copy)]
+struct AnnouncementColumns {
+    date: egui::Rect,
+    divider_x: f32,
+    logo: egui::Rect,
+    title: egui::Rect,
+    link: egui::Rect,
+}
+
+/// 모든 가상화 행이 같은 row 폭에서 정확히 같은 x anchor를 쓰게 열 geometry를 한 곳에서
+/// 계산한다. 날짜는 상단 `전체` 탭의 바깥 시작선과 맞추고, 로고는 divider 뒤 기존 18px
+/// 여백을 정확히 90% 줄인 1.8px에서 시작한다.
+fn announcement_columns(row_rect: egui::Rect) -> AnnouncementColumns {
+    let content_left = row_rect.left();
+    let content_right = (row_rect.right() - ANNOUNCEMENT_RIGHT_INSET).max(content_left);
+    let content_width = content_right - content_left;
+    let date_right = content_left + ANNOUNCEMENT_DATE_WIDTH.min(content_width * 0.24);
+    let divider_x = date_right + 4.0;
+    let logo_left = divider_x + ANNOUNCEMENT_LOGO_LEFT_GAP;
+    let logo = egui::Rect::from_min_size(
+        egui::pos2(
+            logo_left,
+            row_rect.center().y - ANNOUNCEMENT_LOGO_SIZE / 2.0,
+        ),
+        egui::vec2(ANNOUNCEMENT_LOGO_SIZE, ANNOUNCEMENT_LOGO_SIZE),
+    );
+    let link = egui::Rect::from_min_max(
+        egui::pos2(
+            (content_right - ANNOUNCEMENT_LINK_WIDTH).max(logo.right()),
+            row_rect.top(),
+        ),
+        egui::pos2(content_right, row_rect.bottom()),
+    );
+    let title_left = logo.right() + ANNOUNCEMENT_TITLE_GAP;
+    let title = egui::Rect::from_min_max(
+        egui::pos2(title_left, row_rect.top()),
+        egui::pos2((link.left() - 8.0).max(title_left), row_rect.bottom()),
+    );
+    let date = egui::Rect::from_min_max(
+        row_rect.left_top(),
+        egui::pos2(date_right, row_rect.bottom()),
+    );
+    AnnouncementColumns {
+        date,
+        divider_x,
+        logo,
+        title,
+        link,
+    }
+}
+
+/// 외부 이미지 없이 작은 크기에 맞춰 그리는 provider mark. 공급자명은 화면에서 제거하되
+/// hover/accessibility에는 남겨 로고만으로 구분하기 어려운 사용자도 확인할 수 있게 한다.
+fn paint_announcement_provider_logo(ui: &mut egui::Ui, rect: egui::Rect, source: &str) {
+    let label = format!("{} logo", announcement_source_label(source));
+    let response = ui
+        .interact(
+            rect,
+            ui.id().with((
+                "home-announcement-provider-logo",
+                source,
+                rect.min.y.to_bits(),
+            )),
+            egui::Sense::hover(),
+        )
+        .on_hover_text(announcement_source_label(source));
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Image, ui.is_enabled(), &label)
+    });
+    let painter = ui.painter();
+    let center = rect.center();
     match source {
-        "Claude" => egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
-        "Grok" => egui::Color32::from_rgb(0xa5, 0x70, 0xff),
-        "Hugging Face" => egui::Color32::from_rgb(0xe3, 0xb3, 0x41),
-        _ => ui.visuals().hyperlink_color,
+        "Claude" => {
+            let color = egui::Color32::from_rgb(0xe7, 0x9a, 0x3b);
+            let stroke = egui::Stroke::new(1.8, color);
+            for index in 0..8 {
+                let angle = index as f32 * std::f32::consts::TAU / 8.0;
+                let direction = egui::vec2(angle.cos(), angle.sin());
+                painter.line_segment([center + direction * 2.8, center + direction * 8.0], stroke);
+            }
+            painter.circle_filled(center, 2.2, color);
+        }
+        "Grok" => {
+            let color = egui::Color32::from_rgb(0xa5, 0x70, 0xff);
+            let stroke = egui::Stroke::new(2.0, color);
+            painter.line_segment(
+                [
+                    center + egui::vec2(-7.0, 7.0),
+                    center + egui::vec2(7.0, -7.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    center + egui::vec2(-5.0, -6.0),
+                    center + egui::vec2(5.0, 6.0),
+                ],
+                stroke,
+            );
+            painter.circle_stroke(center + egui::vec2(4.0, -4.0), 3.0, stroke);
+        }
+        "Hugging Face" => {
+            let yellow = egui::Color32::from_rgb(0xf4, 0xc4, 0x30);
+            let ink = egui::Color32::from_rgb(0x4a, 0x3b, 0x16);
+            painter.circle_filled(center, 8.0, yellow);
+            painter.circle_filled(center + egui::vec2(-2.8, -1.5), 1.0, ink);
+            painter.circle_filled(center + egui::vec2(2.8, -1.5), 1.0, ink);
+            let smile = egui::Stroke::new(1.2, ink);
+            painter.line_segment(
+                [
+                    center + egui::vec2(-3.0, 2.5),
+                    center + egui::vec2(0.0, 4.0),
+                ],
+                smile,
+            );
+            painter.line_segment(
+                [center + egui::vec2(0.0, 4.0), center + egui::vec2(3.0, 2.5)],
+                smile,
+            );
+        }
+        _ => {
+            // OpenAI knot를 작은 크기에서 읽히는 여섯 개의 연결 루프로 단순화한다.
+            let color = ui.visuals().hyperlink_color;
+            let stroke = egui::Stroke::new(1.35, color);
+            for index in 0..6 {
+                let angle = index as f32 * std::f32::consts::TAU / 6.0;
+                let loop_center = center + egui::vec2(angle.cos(), angle.sin()) * 4.2;
+                painter.circle_stroke(loop_center, 3.4, stroke);
+            }
+            painter.circle_stroke(center, 2.2, stroke);
+        }
     }
 }
 
@@ -533,7 +663,7 @@ fn paint_external_link_icon(painter: &egui::Painter, center: egui::Pos2, color: 
     );
 }
 
-/// 공지 리스트 행 1개 — 최신 시안의 `날짜 | 공급자 | 제목 | 외부 링크` 구조.
+/// 공지 리스트 행 1개 — `날짜 | 공급자 로고 | 제목 | 외부 링크` 구조.
 fn announcement_row(
     ui: &mut egui::Ui,
     card: &AnnouncementCard<'_>,
@@ -551,63 +681,27 @@ fn announcement_row(
             .rect_filled(row_rect, 0.0, ui.visuals().faint_bg_color);
     }
 
-    let content_rect = row_rect.shrink2(egui::vec2(12.0, 0.0));
-    let date_right = content_rect.left() + ANNOUNCEMENT_DATE_WIDTH.min(content_rect.width() * 0.24);
-    let divider_x = date_right + 4.0;
-    let source_left = divider_x + 18.0;
-    let source_width = (content_rect.width() * 0.22).clamp(72.0, 108.0);
-    let title_left = source_left + source_width + 10.0;
-    let link_rect = egui::Rect::from_min_max(
-        egui::pos2(
-            content_rect.right() - ANNOUNCEMENT_LINK_WIDTH,
-            content_rect.top(),
-        ),
-        content_rect.right_bottom(),
-    );
-    let title_rect = egui::Rect::from_min_max(
-        egui::pos2(title_left, content_rect.top()),
-        egui::pos2(
-            (link_rect.left() - 8.0).max(title_left),
-            content_rect.bottom(),
-        ),
-    );
-    let date_rect = egui::Rect::from_min_max(
-        content_rect.left_top(),
-        egui::pos2(date_right, content_rect.bottom()),
-    );
-    let source_rect = egui::Rect::from_min_max(
-        egui::pos2(source_left, content_rect.top()),
-        egui::pos2(
-            (source_left + source_width).min(title_rect.left()),
-            content_rect.bottom(),
-        ),
-    );
+    let columns = announcement_columns(row_rect);
 
     announcement_cell(
         ui,
-        date_rect,
+        columns.date,
         egui::RichText::new(&card.incident.date)
             .color(ui.visuals().weak_text_color())
             .size(12.5),
     );
     ui.painter().vline(
-        divider_x,
-        egui::Rangef::new(row_rect.center().y - 20.0, row_rect.center().y + 20.0),
+        columns.divider_x,
+        egui::Rangef::new(row_rect.center().y - 14.0, row_rect.center().y + 14.0),
         ui.visuals().widgets.noninteractive.bg_stroke,
     );
-    announcement_cell(
-        ui,
-        source_rect,
-        egui::RichText::new(announcement_source_label(card.source))
-            .color(announcement_source_color(ui, card.source))
-            .size(13.0),
-    );
+    paint_announcement_provider_logo(ui, columns.logo, card.source);
 
     let translated = translations.get(card.source, locale, &card.incident.title);
     let title_text = translated.unwrap_or(&card.incident.title);
     let title = announcement_cell(
         ui,
-        title_rect,
+        columns.title,
         egui::RichText::new(title_text).strong().size(14.0),
     );
     if translated.is_some() {
@@ -618,7 +712,7 @@ fn announcement_row(
     let link_label = catalog.t("home.notices.original_link", &[]);
     let link = ui
         .interact(
-            link_rect,
+            columns.link,
             ui.id().with(("home-announcement-link", &card.incident.url)),
             egui::Sense::click(),
         )
@@ -631,7 +725,7 @@ fn announcement_row(
     } else {
         ui.visuals().hyperlink_color
     };
-    paint_external_link_icon(ui.painter(), link_rect.center(), link_color);
+    paint_external_link_icon(ui.painter(), columns.link.center(), link_color);
     if link.clicked() {
         ui.ctx()
             .open_url(egui::OpenUrl::new_tab(&card.incident.url));
@@ -942,23 +1036,66 @@ mod tests {
 
         assert_eq!(ANNOUNCEMENT_VISIBLE_ROWS, 5);
         assert!(harness.query_by_label("Claude").is_none());
-        assert!(
-            harness.get_all_by_label("Anthropic").count() >= 2,
-            "필터 외에 각 행에도 Anthropic 공급자명이 보여야 함"
+        assert_eq!(
+            harness.get_all_by_label("Anthropic").count(),
+            1,
+            "공급자명은 필터에만 남고 행에서는 로고로 대체돼야 함"
         );
-        harness.get_by_label("2026-07-20");
+        assert!(
+            harness.get_all_by_label("Anthropic logo").count() >= ANNOUNCEMENT_VISIBLE_ROWS,
+            "보이는 각 행에는 공급자 로고가 있어야 함"
+        );
+        let all_left = harness.get_by_label("All").rect().left();
+        let date_left = harness.get_by_label("2026-07-20").rect().left();
+        assert!(
+            (date_left - all_left).abs() <= 0.5,
+            "날짜 시작선({date_left})은 전체 탭 시작선({all_left})과 같아야 함"
+        );
         assert!(
             harness.get_all_by_label("Source →").count() >= ANNOUNCEMENT_VISIBLE_ROWS,
             "각 행에 접근 가능한 외부 링크가 있어야 함"
         );
-        let first_top = harness.get_by_label("Announcement 1").rect().top();
+        let first = harness.get_by_label("Announcement 1").rect();
+        let first_top = first.top();
+        let title_left = first.left();
         for index in 2..=5 {
-            harness.get_by_label(&format!("Announcement {index}"));
+            let row = harness
+                .get_by_label(&format!("Announcement {index}"))
+                .rect();
+            assert!(
+                (row.left() - title_left).abs() <= 0.5,
+                "{index}번째 제목도 첫 행과 같은 x anchor를 써야 함"
+            );
         }
         // show_rows는 경계의 다음 행을 접근성 트리에 준비할 수 있다. 실제 위치를 재서
         // 여섯째 행이 정확히 5행 viewport 밖에서 시작하는지 확인한다.
-        let sixth_top = harness.get_by_label("Announcement 6").rect().top();
+        let sixth = harness.get_by_label("Announcement 6").rect();
+        let sixth_top = sixth.top();
+        assert!(
+            (sixth.left() - title_left).abs() <= 0.5,
+            "스크롤 뒤 후속 행도 첫 행과 같은 제목 x anchor를 써야 함"
+        );
         let viewport_height = ANNOUNCEMENT_ROW_HEIGHT * ANNOUNCEMENT_VISIBLE_ROWS as f32;
         assert!(sixth_top - first_top >= viewport_height - 0.5);
+    }
+
+    #[test]
+    fn 공지_열_geometry는_행이_달라도_같고_요청한_여백을_쓴다() {
+        let first = announcement_columns(egui::Rect::from_min_size(
+            egui::pos2(20.0, 10.0),
+            egui::vec2(900.0, ANNOUNCEMENT_ROW_HEIGHT),
+        ));
+        let later = announcement_columns(egui::Rect::from_min_size(
+            egui::pos2(20.0, 310.0),
+            egui::vec2(900.0, ANNOUNCEMENT_ROW_HEIGHT),
+        ));
+
+        assert!((ANNOUNCEMENT_ROW_HEIGHT - 64.0 * 0.7).abs() < f32::EPSILON);
+        assert_eq!(first.date.left(), 20.0, "날짜 앞쪽 별도 inset 없음");
+        assert!((first.logo.left() - first.divider_x - 1.8).abs() < 0.01);
+        assert_eq!(first.date.left(), later.date.left());
+        assert_eq!(first.logo.left(), later.logo.left());
+        assert_eq!(first.title.left(), later.title.left());
+        assert_eq!(first.link.left(), later.link.left());
     }
 }

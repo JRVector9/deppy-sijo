@@ -2,25 +2,30 @@
 
 ## Current task
 
-- Refine Home announcement spacing/alignment and make the active workspace row return from Home to Terminal.
-- Status: implementation and verification complete; exact dimensions, true glyph alignment, and active-row Terminal return regressions are green. Awaiting any requested commit/build/relaunch.
+- Implement the Connector boundary/resource refactor program through PR-CX00..PR-BG01 as root integrator, using three non-overlapping parallel lanes.
+- Status: Wave 0 PR-CX00 is implemented and green; Wave 1 parallel lanes are ready to start. The program branch is `codex/connector-refactor` from clean `main@ef4abf01996a5261b91f475d0f740b0d50a4cc26`.
 
 ## Working area
 
-- Native application: Rust + `eframe/egui 0.35`; relevant code is in `crates/app/src/app.rs`, `ui/agent_terminal.rs`, `ui/connectors.rs`, and the locale catalogs under `crates/i18n/locales/`.
-- Native dark tokens come from `crates/app/src/theme.rs`: `#131317`, `#1b1b21`, `#22222a`, `#2a2a33`, `#3a3a42`, `#d7d8db`, `#8b8f98`, and accent `#43b8cd`.
-- Slack uses the official streamable-HTTP endpoint `https://mcp.slack.com/mcp`; its confidential OAuth credentials must not be embedded in the desktop binary.
-- Scope constraint: only External News and Slack become live Home V1 integrations now; the other screenshot concepts are prioritized in a roadmap rather than presented with fake data.
+- Root-only choke points: root `Cargo.toml`, `Cargo.lock`, `xtask`, `crates/app/src/app.rs`, `crates/app/src/main.rs`, `crates/app/src/ui/mod.rs`, and this handoff.
+- Target crates: new `connector-contract`, `connector-ui`, `connector-service`; existing `storage`, `mcp-store`, `audit`, `mcp`, `mcp-proxy`, `auth`, `secret`, `runtime`, and `app`.
+- Non-negotiable gates: no new boundary allowlist, no Connector variant in `RuntimeCommand`, no Tokio/new async runtime, no long-lived dual production path, no leaf render-path I/O, and no unbounded job/result/secret/diagnostic retention.
+- Release Scenario A-E RSS/CPU/frame-p95 remains a real-hardware measurement gate; automated perf smoke is evidence but not release approval.
 
 ## Plan
 
-1. Completed — traced the centered title glyphs to `add_sized` and the active-row no-action branch.
-2. Completed — applied requested announcement dimensions and direct left-aligned label layout.
-3. Completed — made active workspace clicks emit the existing `SwitchWorkspace` action while preserving expand/collapse.
-4. Completed — updated geometry/navigation regressions; check/test/Clippy/fmt verification passed.
+1. Completed — PR-CX00: froze transport-neutral contracts/resource limits, added workspace/dependency gates, and recorded the performance/failure-injection baseline.
+2. In progress, parallel Wave 1 — PR-ST01 storage/audit transactions; PR-MC01 MCP limits/cancellation; PR-UI01 pure virtualized connector UI.
+3. Pending, parallel Wave 2 — PR-SC01 secret slots/redaction; PR-SV01 lazy coordinator/latest snapshot; PR-MP01 proxy session reuse.
+4. Pending — PR-AU01 shared authorization/audit, then root-only PR-IN01 atomic app cutover.
+5. Pending, parallel Wave 4 — PR-SB01 settings boundary; PR-B00b RuntimeHost; PR-OD01 diagnostics/soak/log GC.
+6. Pending — root-only PR-CR01 composition root and PR-BG01 zero-allowlist/production gates.
 
 ## Status
 
+- 2026-07-22: CX00 implementation is green. `connector-contract` tests 4/4, `connector-ui`/`connector-service` checks, xtask tests 4/4, strict Clippy for the three Connector crates plus xtask, workspace fmt check, diff check, `check-deps` (23 crates), and `check-boundary` (still 53 exceptions; increase 0) all pass. `docs/build/PR-CX00-summary.md` records exact ceilings, dependency laws, failure seams, and the honest performance baseline. Next: commit CX00 and start the three isolated Wave 1 lanes.
+- 2026-07-22: CX00 first strict Clippy run stopped on one test-only `field_reassign_with_default` warning in the lowered-limit fixture. No production behavior failed; the fixture now initializes the lowered field in the struct literal before separately testing an over-ceiling mutation. The same strict gate is being rerun.
+- 2026-07-22: Connector refactor program started from a clean `main@ef4abf0`. `cargo run -q -p xtask -- check-boundary` passed with 53 explicit UI DB/MCP/audit/secret exceptions; `check-deps` passed for 20 crates. `cargo run -q -p xtask -- perf-smoke` passed (app perf 3/3, runtime hidden 2/2; the backpressure name filter selected 0 existing tests and is therefore not treated as coverage). Focused baseline: audit 32/32 and storage 73/73 passed; MCP had 43 pass/28 fail and mcp-proxy 19 pass/2 fail, with all 30 failures occurring at localhost listener bind (`Operation not permitted`) in this managed sandbox. No source changes existed before the program.
 - 2026-07-21: Home 공지 치수/left glyph 정렬과 활성 workspace 재클릭 복귀 변경을 `2b01a92` (`fix(home): tighten notice layout and restore workspace focus`)로 커밋하고 `origin/main`에 push했다. 원격은 `d0445da..2b01a92`로 fast-forward 됐고 build/relaunch는 수행하지 않았다. 이 delivery 기록도 docs-only commit으로 push해 로컬/원격을 다시 일치시킨다.
 - 2026-07-21: 사용자가 검증 완료된 Home 공지 치수/실제 glyph 좌측 정렬과 활성 workspace 재클릭 Terminal 복귀 변경의 commit+push를 요청했다. 의도된 `ui/agent_terminal.rs`, `ui/file_tree.rs`, handoff 3개 파일만 기능 커밋으로 고정하고 `origin/main`에 push한 뒤 원격 SHA 일치를 확인한다. build/relaunch는 요청하지 않아 수행하지 않는다.
 - 2026-07-21: 최종 검증이 통과했다. `cargo check -p deppy-sijo`, Home UI 8/8, active workspace 재클릭 1/1, localhost bind가 필요한 기존 7개 fixture만 제외한 직렬 app 전체 569 passed/0 failed/5 ignored/7 filtered, strict Clippy가 모두 성공했다. 다음은 rustfmt/diff 범위 최종 확인이며 이번 요청에는 commit/build/relaunch가 없으므로 수행하지 않는다.

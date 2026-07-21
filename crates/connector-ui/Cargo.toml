@@ -1,0 +1,11 @@
+[package]
+name = "connector-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+connector-contract = { path = "../connector-contract" }
+egui = { workspace = true }
+i18n = { workspace = true }

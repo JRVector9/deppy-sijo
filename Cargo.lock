@@ -962,6 +962,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-contract"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "connector-service"
+version = "0.1.0"
+dependencies = [
+ "audit",
+ "auth",
+ "connector-contract",
+ "mcp",
+ "secret",
+ "tracing",
+]
+
+[[package]]
+name = "connector-ui"
+version = "0.1.0"
+dependencies = [
+ "connector-contract",
+ "egui",
+ "i18n",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

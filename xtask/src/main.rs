@@ -77,6 +77,24 @@ const FORBIDDEN_EDGES: &[(&str, &str)] = &[
     ("persist", "app"),
 ];
 
+/// Connector 계층은 deny-list만으로는 새 edge를 모두 막을 수 없으므로 direct dependency
+/// 전체를 allow-list로 고정한다. dev/build/target dependency도 같은 규칙을 적용한다.
+const STRICT_CRATE_DEPS: &[(&str, &[&str])] = &[
+    ("connector-contract", &["serde"]),
+    ("connector-ui", &["connector-contract", "egui", "i18n"]),
+    (
+        "connector-service",
+        &[
+            "audit",
+            "auth",
+            "connector-contract",
+            "mcp",
+            "secret",
+            "tracing",
+        ],
+    ),
+];
+
 fn main() -> anyhow::Result<()> {
     let command = std::env::args().nth(1).unwrap_or_default();
     match command.as_str() {
@@ -733,6 +751,22 @@ fn check_deps() -> anyhow::Result<()> {
         }
     }
 
+    // Connector contract/UI/service의 direct dependency는 역할별 정확한 집합만 허용한다.
+    for (crate_name, allowed) in STRICT_CRATE_DEPS {
+        let mut actual = direct_dependency_names(crate_name)?;
+        let mut expected: Vec<String> = allowed.iter().map(|dep| (*dep).to_owned()).collect();
+        actual.sort();
+        actual.dedup();
+        expected.sort();
+        if actual != expected {
+            violations.push(format!(
+                "strict dependency drift: {crate_name} expected [{}], actual [{}]",
+                expected.join(", "),
+                actual.join(", ")
+            ));
+        }
+    }
+
     // 2) 순환 검사 (로컬 그래프 DFS)
     for start in graph.keys() {
         let mut stack = vec![(start.clone(), vec![start.clone()])];
@@ -763,6 +797,33 @@ fn check_deps() -> anyhow::Result<()> {
         }
         bail!("check-deps 실패: {}건", violations.len());
     }
+}
+
+fn direct_dependency_names(crate_name: &str) -> anyhow::Result<Vec<String>> {
+    let root = workspace_root()?;
+    let manifest_path = root.join("crates").join(crate_name).join("Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .with_context(|| format!("{} 읽기 실패", manifest_path.display()))?;
+    let mut in_deps_section = false;
+    let mut dependencies = Vec::new();
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_deps_section = trimmed.contains("dependencies");
+            continue;
+        }
+        if !in_deps_section || trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((name, _)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        if !name.is_empty() {
+            dependencies.push(name.to_owned());
+        }
+    }
+    Ok(dependencies)
 }
 
 /// crates/*/Cargo.toml + xtask에서 로컬 path 의존을 추출한다 (dev-dependencies 포함 —
@@ -853,5 +914,17 @@ mod tests {
         assert!(graph["storage"].contains(&"mcp".to_owned()) || !graph["storage"].is_empty());
         assert!(graph["runtime"].contains(&"mux".to_owned()));
         assert!(graph.contains_key("xtask"));
+    }
+
+    #[test]
+    fn connector_crate_direct_dependency는_역할별_allowlist와_일치한다() {
+        for (crate_name, allowed) in STRICT_CRATE_DEPS {
+            let mut actual = direct_dependency_names(crate_name).unwrap();
+            let mut expected: Vec<String> = allowed.iter().map(|dep| (*dep).to_owned()).collect();
+            actual.sort();
+            actual.dedup();
+            expected.sort();
+            assert_eq!(actual, expected, "{crate_name}");
+        }
     }
 }

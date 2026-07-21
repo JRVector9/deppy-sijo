@@ -1,8 +1,18 @@
+mod bundle;
 pub mod hex;
 mod redaction;
 pub mod token;
 
-pub use redaction::{RedactionService, StreamRedactor};
+pub use bundle::{
+    BundleDeleteResult, BundleEntryPresence, LogicalCredentialId, PhysicalSecretSlot,
+    ReconcileSecretSlotsResult, SecretBundle, SecretBundleRef, SecretBundleStagePlan,
+    StagedSecretBundle, delete_secret_bundle, inspect_secret_bundle, list_secret_bundle_slots,
+    read_secret_bundle, reconcile_orphan_secret_slots, stage_secret_bundle,
+};
+pub use redaction::{
+    RedactionCapacityError, RedactionClock, RedactionCorpusLimits, RedactionCorpusStats,
+    RedactionLease, RedactionService, StreamRedactor,
+};
 
 use anyhow::Context;
 
@@ -30,6 +40,17 @@ impl std::fmt::Debug for SecretString {
     }
 }
 
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        // SAFETY: this value exclusively owns the String and only overwrites existing bytes.
+        for byte in unsafe { self.0.as_mut_vec() } {
+            // SAFETY: `byte` is an exclusively borrowed byte in the owned allocation.
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// UI 표시용 힌트. 평문 복원이 불가능하도록 끝 4자만 남긴다 (8자 미만은 전부 마스킹).
 pub fn masked_hint(secret: &str) -> String {
     if secret.chars().count() >= 8 {
@@ -48,16 +69,22 @@ pub fn masked_hint(secret: &str) -> String {
 }
 
 /// secret 저장소 추상화 (설계문서 Secret 모듈).
-/// 접근 직렬화(설계문서 1.4): 쓰기/삭제는 UI 스레드, 읽기(get)는 runtime
-/// worker 단일 스레드에서만 일어난다 — 동일 credential 동시 접근 없음.
+/// 모든 호출은 composition root가 조립한 service/coordinator worker에서만 수행하며,
+/// render 경로는 이 trait을 보거나 호출하지 않는다.
 pub trait SecretStore: Send + Sync {
     fn set_secret(&self, id: &str, secret: &SecretString) -> anyhow::Result<()>;
     /// spawn 직전 env 주입에서만 호출 (설계문서 6.3, PR-09)
     fn get_secret(&self, id: &str) -> anyhow::Result<SecretString>;
+    /// Deletes an entry idempotently. A confirmed missing entry is success.
     fn delete_secret(&self, id: &str) -> anyhow::Result<()>;
     /// secret 존재 여부. 확인된 부재는 Ok(false), 조회 오류(일시 장애 등)는 Err —
     /// "없음"과 "오류"를 구별해야 하는 경로(암호화 키 get-or-create)에서 쓴다.
     fn has_secret(&self, id: &str) -> anyhow::Result<bool>;
+    /// Returns usernames with the requested prefix. Implementations that cannot enumerate entries
+    /// must return an error rather than pretending the inventory is empty.
+    fn list_secret_ids(&self, _prefix: &str) -> anyhow::Result<Vec<String>> {
+        anyhow::bail!("secret store does not support entry enumeration")
+    }
 }
 
 /// keyring-core 기본 store 기반 구현. 사용 전 플랫폼 store가
@@ -110,6 +137,21 @@ impl SecretStore for KeyringSecretStore {
             Err(keyring_core::Error::NoEntry) => Ok(false),
             Err(e) => Err(e).with_context(|| format!("keyring 존재 확인 실패: {id}")),
         }
+    }
+
+    fn list_secret_ids(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        let _serial = KEYRING_SERIAL.lock().expect("keyring serial lock");
+        let spec = std::collections::HashMap::from([("service", KEYRING_SERVICE)]);
+        let mut users = keyring_core::Entry::search(&spec)
+            .context("keyring entry inventory 조회 실패")?
+            .into_iter()
+            .filter_map(|entry| entry.get_specifiers())
+            .filter_map(|(service, user)| (service == KEYRING_SERVICE).then_some(user))
+            .filter(|user| user.starts_with(prefix))
+            .collect::<Vec<_>>();
+        users.sort();
+        users.dedup();
+        Ok(users)
     }
 }
 
@@ -180,5 +222,31 @@ mod tests {
     fn 없는_entry_삭제는_성공() {
         init_mock_store();
         KeyringSecretStore.delete_secret("cred-missing").unwrap();
+    }
+
+    #[test]
+    fn keyring_inventory는_service와_prefix로_제한된다() {
+        init_mock_store();
+        let store = KeyringSecretStore;
+        store
+            .set_secret(
+                "deppy.oauth.v1.test.inventory",
+                &SecretString::new("inventory-secret".to_owned()),
+            )
+            .unwrap();
+        store
+            .set_secret(
+                "legacy-credential",
+                &SecretString::new("legacy-secret".to_owned()),
+            )
+            .unwrap();
+        assert_eq!(
+            store.list_secret_ids("deppy.oauth.v1.test").unwrap(),
+            ["deppy.oauth.v1.test.inventory"]
+        );
+        store
+            .delete_secret("deppy.oauth.v1.test.inventory")
+            .unwrap();
+        store.delete_secret("legacy-credential").unwrap();
     }
 }

@@ -15,7 +15,9 @@ use oauth2::{
     AuthType, ClientId, ClientSecret, HttpClientError, RefreshToken, RequestTokenError,
     TokenResponse, TokenUrl,
 };
-use secret::{SecretStore, SecretString};
+use secret::{
+    LogicalCredentialId, PhysicalSecretSlot, SecretStore, SecretString, read_secret_bundle,
+};
 
 use crate::{OAuthToken, oauth_http_agent, refresh_entry_id, store_token};
 
@@ -86,12 +88,14 @@ pub struct RefreshParams {
 /// refresh 결과.
 #[derive(Debug)]
 pub enum RefreshOutcome {
-    /// 이 호출이 직접 갱신했고 keyring 저장까지 끝났다.
-    /// 만료 시각 메타데이터(expires_in_secs) 갱신은 호출측 몫.
+    /// 이 호출이 직접 갱신했다. Legacy [`refresh_access_token`]은 기존 username에 저장한
+    /// 뒤 반환하고, [`refresh_access_token_for_slot`]은 publish callback의 pointer commit이
+    /// 성공한 뒤 반환한다.
     Refreshed(OAuthToken),
     /// 대기 중 다른 호출이 이미 갱신을 끝냈다 — access token은 keyring 재조회로 얻는다.
     AlreadyRefreshed,
-    /// AS가 refresh를 거부 — access+refresh keyring 폐기 완료, 재승인(브라우저 flow) 필요.
+    /// AS가 refresh를 거부했다. Legacy 경로는 기존 access+refresh를 폐기하며, typed slot
+    /// 경로는 pointer transaction/reconciliation을 위해 기존 slot을 건드리지 않는다.
     ReauthorizationRequired { reason: String },
 }
 
@@ -107,7 +111,71 @@ pub fn refresh_access_token(
     credential_id: &str,
     params: &RefreshParams,
 ) -> anyhow::Result<RefreshOutcome> {
-    let slot = coordinator.slot(credential_id);
+    coordinate_refresh(coordinator, credential_id, || {
+        do_refresh_legacy(timeout, store, credential_id, params)
+    })
+}
+
+/// Exchanges the refresh token read from a resolved physical slot but does not overwrite that
+/// slot itself. The `publish` callback runs inside the credential's single-flight critical section;
+/// it receives the DCR secret already read from the current bundle and must stage the returned
+/// token plus DCR, publish the new pointer transactionally, and return success only after that
+/// commit. Waiters receive `AlreadyRefreshed` only after `publish` succeeds.
+/// A rejected grant remains present for startup reconciliation and is never automatically retried.
+pub fn refresh_access_token_for_slot(
+    coordinator: &RefreshCoordinator,
+    timeout: Duration,
+    store: &dyn SecretStore,
+    logical_id: &LogicalCredentialId,
+    current_slot: &PhysicalSecretSlot,
+    params: &RefreshParams,
+    publish: impl FnOnce(&OAuthToken, Option<&SecretString>) -> anyhow::Result<()>,
+) -> anyhow::Result<RefreshOutcome> {
+    anyhow::ensure!(
+        current_slot.belongs_to(logical_id),
+        "current physical slot does not belong to logical credential"
+    );
+    refresh_access_token_for_slot_with(
+        coordinator,
+        store,
+        logical_id,
+        current_slot,
+        |refresh_token| exchange_refresh(timeout, refresh_token, params),
+        publish,
+    )
+}
+
+fn refresh_access_token_for_slot_with(
+    coordinator: &RefreshCoordinator,
+    store: &dyn SecretStore,
+    logical_id: &LogicalCredentialId,
+    current_slot: &PhysicalSecretSlot,
+    exchange: impl FnOnce(SecretString) -> anyhow::Result<RefreshOutcome>,
+    publish: impl FnOnce(&OAuthToken, Option<&SecretString>) -> anyhow::Result<()>,
+) -> anyhow::Result<RefreshOutcome> {
+    coordinate_refresh(coordinator, logical_id.as_str(), || {
+        let current = read_secret_bundle(store, current_slot)
+            .context("current physical OAuth bundle read failed")?;
+        let (_, refresh_token, dcr_secret) = current.into_parts();
+        let Some(refresh_token) = refresh_token else {
+            return Ok(RefreshOutcome::ReauthorizationRequired {
+                reason: "저장된 refresh token 없음".to_owned(),
+            });
+        };
+        let outcome = exchange(refresh_token)?;
+        if let RefreshOutcome::Refreshed(token) = &outcome {
+            publish(token, dcr_secret.as_ref()).context("refreshed OAuth bundle publish failed")?;
+        }
+        Ok(outcome)
+    })
+}
+
+fn coordinate_refresh(
+    coordinator: &RefreshCoordinator,
+    coordination_id: &str,
+    refresh: impl FnOnce() -> anyhow::Result<RefreshOutcome>,
+) -> anyhow::Result<RefreshOutcome> {
+    let slot = coordinator.slot(coordination_id);
     let entered = Instant::now();
     // 선행 refresh가 진행 중이면 여기서 대기한다 (single-flight)
     let mut last = slot.last.lock().expect("refresh slot lock");
@@ -125,7 +193,7 @@ pub fn refresh_access_token(
             SharedOutcome::Failed(message) => Err(anyhow::anyhow!("선행 refresh 실패: {message}")),
         };
     }
-    let result = do_refresh(timeout, store, credential_id, params);
+    let result = refresh();
     let shared = match &result {
         Ok(RefreshOutcome::ReauthorizationRequired { reason }) => {
             SharedOutcome::ReauthorizationRequired(reason.clone())
@@ -137,7 +205,7 @@ pub fn refresh_access_token(
     result
 }
 
-fn do_refresh(
+fn do_refresh_legacy(
     timeout: Duration,
     store: &dyn SecretStore,
     credential_id: &str,
@@ -158,6 +226,24 @@ fn do_refresh(
         .get_secret(&refresh_id)
         .context("refresh token 조회 실패")?;
 
+    let outcome = exchange_refresh(timeout, refresh_token, params)?;
+    match &outcome {
+        RefreshOutcome::Refreshed(token) => {
+            store_token(store, credential_id, token).context("갱신 토큰 저장 실패")?;
+        }
+        RefreshOutcome::ReauthorizationRequired { .. } => {
+            discard_tokens(store, credential_id);
+        }
+        RefreshOutcome::AlreadyRefreshed => {}
+    }
+    Ok(outcome)
+}
+
+fn exchange_refresh(
+    timeout: Duration,
+    refresh_token: SecretString,
+    params: &RefreshParams,
+) -> anyhow::Result<RefreshOutcome> {
     crate::validate_https_or_loopback(&params.token_url)
         .context("token URL은 HTTPS(또는 로컬 테스트용 loopback)여야 합니다")?;
     let client = BasicClient::new(ClientId::new(params.client_id.clone()))
@@ -196,7 +282,6 @@ fn do_refresh(
                 expires_in_secs: response.expires_in().map(|d| d.as_secs()),
                 provider_workspace_id: None,
             };
-            store_token(store, credential_id, &token).context("갱신 토큰 저장 실패")?;
             Ok(RefreshOutcome::Refreshed(token))
         }
         // AS가 명시적으로 거부(invalid_grant 등) — 이 grant는 죽었다.
@@ -204,7 +289,6 @@ fn do_refresh(
         // Transient 분기(Err)로 가며 폐기하지 않는다 — 토큰이 살아 있을 수 있다.
         Err(error) => match classify_refresh_error(error) {
             RefreshFailure::Rejected(reason) => {
-                discard_tokens(store, credential_id);
                 Ok(RefreshOutcome::ReauthorizationRequired { reason })
             }
             RefreshFailure::Transient(error) => Err(error).context("refresh 교환 실패"),
@@ -278,6 +362,7 @@ fn discard_tokens(store: &dyn SecretStore, credential_id: &str) {
 mod tests {
     use super::*;
     use crate::test_support::{MemStore, MockHttpServer, MockResponse};
+    use secret::{SecretBundleStagePlan, stage_secret_bundle};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const TIMEOUT: Duration = Duration::from_secs(5);
@@ -473,6 +558,42 @@ mod tests {
     }
 
     #[test]
+    fn typed_slot_refresh_token이_없으면_slot을_변경하지_않는다() {
+        let store = MemStore::default();
+        let logical = LogicalCredentialId::new("logical-refresh").unwrap();
+        let physical = PhysicalSecretSlot::allocate(&logical);
+        let plan =
+            SecretBundleStagePlan::with_slot(logical.clone(), physical.clone(), None).unwrap();
+        let access = SecretString::new("existing-access-token".to_owned());
+        stage_secret_bundle(
+            &store,
+            &plan,
+            secret::SecretBundleRef::new(&access, None, None),
+        )
+        .unwrap();
+
+        let outcome = refresh_access_token_for_slot(
+            &RefreshCoordinator::new(),
+            TIMEOUT,
+            &store,
+            &logical,
+            &physical,
+            &params("https://as.example/token".to_owned()),
+            |_, _| panic!("missing refresh token must not publish"),
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            RefreshOutcome::ReauthorizationRequired { .. }
+        ));
+        assert_eq!(
+            store.value(physical.as_str()).as_deref(),
+            Some("existing-access-token")
+        );
+        assert_eq!(store.value(&physical.refresh_entry_id()), None);
+    }
+
+    #[test]
     fn 동시_refresh는_한_번만_발사() {
         let hits = Arc::new(AtomicUsize::new(0));
         let server = {
@@ -527,5 +648,125 @@ mod tests {
             "{outcomes:?}"
         );
         assert_eq!(store.value("cred").as_deref(), Some("new-at"));
+    }
+
+    #[test]
+    fn typed_refresh_publish실패는_waiter에게_성공으로_공유되지_않는다() {
+        use std::sync::{Barrier, mpsc};
+
+        let store = Arc::new(MemStore::default());
+        let logical = Arc::new(LogicalCredentialId::new("logical-race").unwrap());
+        let physical = Arc::new(PhysicalSecretSlot::allocate(&logical));
+        let plan = SecretBundleStagePlan::with_slot(
+            logical.as_ref().clone(),
+            physical.as_ref().clone(),
+            None,
+        )
+        .unwrap();
+        let access = SecretString::new("existing-access-token".to_owned());
+        let refresh = SecretString::new("existing-refresh-token".to_owned());
+        let dcr = SecretString::new("existing-dcr-secret".to_owned());
+        stage_secret_bundle(
+            &*store,
+            &plan,
+            secret::SecretBundleRef::new(&access, Some(&refresh), Some(&dcr)),
+        )
+        .unwrap();
+
+        let coordinator = Arc::new(RefreshCoordinator::new());
+        let publish_started = Arc::new(Barrier::new(2));
+        let publish_release = Arc::new(Barrier::new(2));
+        let first = {
+            let store = Arc::clone(&store);
+            let logical = Arc::clone(&logical);
+            let physical = Arc::clone(&physical);
+            let coordinator = Arc::clone(&coordinator);
+            let publish_started = Arc::clone(&publish_started);
+            let publish_release = Arc::clone(&publish_release);
+            std::thread::spawn(move || {
+                refresh_access_token_for_slot_with(
+                    &coordinator,
+                    &*store,
+                    &logical,
+                    &physical,
+                    |_| {
+                        Ok(RefreshOutcome::Refreshed(OAuthToken {
+                            access_token: SecretString::new("rotated-at".to_owned()),
+                            refresh_token: Some(SecretString::new("rotated-rt".to_owned())),
+                            expires_in_secs: Some(3600),
+                            provider_workspace_id: None,
+                        }))
+                    },
+                    |_, dcr_secret| {
+                        assert_eq!(
+                            dcr_secret.map(SecretString::expose),
+                            Some("existing-dcr-secret")
+                        );
+                        publish_started.wait();
+                        publish_release.wait();
+                        anyhow::bail!("injected pointer publish failure")
+                    },
+                )
+            })
+        };
+        publish_started.wait();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let second = {
+            let store = Arc::clone(&store);
+            let logical = Arc::clone(&logical);
+            let physical = Arc::clone(&physical);
+            let coordinator = Arc::clone(&coordinator);
+            std::thread::spawn(move || {
+                let result = refresh_access_token_for_slot_with(
+                    &coordinator,
+                    &*store,
+                    &logical,
+                    &physical,
+                    |_| panic!("waiter must not exchange after leader failure"),
+                    |_, _| panic!("waiter must not publish after leader failure"),
+                );
+                done_tx.send(result).unwrap();
+            })
+        };
+
+        assert!(
+            matches!(
+                done_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "waiter completed before leader publish finished"
+        );
+        publish_release.wait();
+        assert!(first.join().unwrap().is_err());
+        let waiter = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            waiter.is_err(),
+            "waiter must receive shared publish failure"
+        );
+        second.join().unwrap();
+        assert_eq!(
+            store.value(physical.as_str()).as_deref(),
+            Some("existing-access-token")
+        );
+    }
+
+    #[test]
+    fn typed_refresh_rejects_slot_from_another_logical_id_before_keyring_access() {
+        let store = MemStore::default();
+        let logical = LogicalCredentialId::new("expected-logical").unwrap();
+        let other = LogicalCredentialId::new("other-logical").unwrap();
+        let other_slot = PhysicalSecretSlot::allocate(&other);
+
+        let result = refresh_access_token_for_slot(
+            &RefreshCoordinator::new(),
+            TIMEOUT,
+            &store,
+            &logical,
+            &other_slot,
+            &params("https://as.example/token".to_owned()),
+            |_, _| panic!("mismatched slot must not publish"),
+        );
+        assert!(result.is_err());
     }
 }

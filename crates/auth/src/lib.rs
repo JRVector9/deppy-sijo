@@ -34,7 +34,7 @@ pub use flow::{
 };
 pub use refresh::{
     REFRESH_MARGIN, RefreshCoordinator, RefreshOutcome, RefreshParams, refresh_access_token,
-    should_refresh, should_refresh_at,
+    refresh_access_token_for_slot, should_refresh, should_refresh_at,
 };
 pub use registration::{
     DynamicRegistration, RegistrationError, RegistrationOptions, register_client,
@@ -43,7 +43,10 @@ pub use www_authenticate::{AuthChallenge, find_bearer_challenge, parse_www_authe
 
 use std::time::Duration;
 
-use secret::SecretStore;
+use secret::{
+    SecretBundleRef, SecretBundleStagePlan, SecretStore, SecretString, StagedSecretBundle,
+    stage_secret_bundle,
+};
 
 /// redirect URI는 localhost 또는 HTTPS만 허용한다 (설계 §1.5 / PR-18 완료 기준).
 /// 이 crate가 만드는 콜백 URI는 항상 127.0.0.1 loopback이지만, provider 설정에
@@ -97,15 +100,38 @@ pub fn oauth_http_agent(timeout: Duration) -> ureq::Agent {
 }
 
 /// refresh token이 저장되는 keyring entry id (access와 분리).
-pub fn refresh_entry_id(credential_id: &str) -> String {
-    format!("{credential_id}.refresh")
+///
+/// 신규 회전 경로는 logical credential ID가 아니라 resolved physical keyring username을
+/// 넘겨야 한다. Typed code should prefer [`secret::PhysicalSecretSlot::refresh_entry_id`].
+pub fn refresh_entry_id(keyring_username: &str) -> String {
+    format!("{keyring_username}.refresh")
 }
 
 /// DCR client_secret이 저장되는 keyring entry id (PR-H4).
 /// [`register_client`]가 client_secret을 돌려주면 호출측이 이 entry에 저장한다 —
 /// client_id(비밀 아님)는 credentials 메타데이터(SQLite)에.
-pub fn dcr_secret_entry_id(credential_id: &str) -> String {
-    format!("{credential_id}.dcr")
+pub fn dcr_secret_entry_id(keyring_username: &str) -> String {
+    format!("{keyring_username}.dcr")
+}
+
+/// Stages an access/refresh/DCR OAuth bundle in a new physical slot without publishing storage
+/// metadata. The caller must publish `staged.new_slot`, then delete `staged.previous_slot` only
+/// after the database commit succeeds.
+pub fn stage_oauth_token_bundle(
+    store: &dyn SecretStore,
+    plan: &SecretBundleStagePlan,
+    token: &OAuthToken,
+    dcr_secret: Option<&SecretString>,
+) -> anyhow::Result<StagedSecretBundle> {
+    stage_secret_bundle(
+        store,
+        plan,
+        SecretBundleRef::new(
+            &token.access_token,
+            token.refresh_token.as_ref(),
+            dcr_secret,
+        ),
+    )
 }
 
 /// 획득한 토큰을 keyring에 저장한다 (완료 기준: token keyring 저장).
@@ -115,15 +141,15 @@ pub fn dcr_secret_entry_id(credential_id: &str) -> String {
 /// SQLite에는 평문이 가지 않는다 (§2.1, metadata는 호출측이 credentials 테이블에).
 pub fn store_token(
     store: &dyn SecretStore,
-    credential_id: &str,
+    keyring_username: &str,
     token: &OAuthToken,
 ) -> anyhow::Result<()> {
-    store.set_secret(credential_id, &token.access_token)?;
+    store.set_secret(keyring_username, &token.access_token)?;
     if let Some(refresh) = &token.refresh_token
-        && let Err(e) = store.set_secret(&refresh_entry_id(credential_id), refresh)
+        && let Err(e) = store.set_secret(&refresh_entry_id(keyring_username), refresh)
     {
         // 부분 실패 시 access 고아 entry가 남지 않게 롤백 — 호출측은 id를 버린다
-        if let Err(rollback) = store.delete_secret(credential_id) {
+        if let Err(rollback) = store.delete_secret(keyring_username) {
             tracing::warn!("access token 롤백 실패 (고아 keyring entry 가능): {rollback:#}");
         }
         return Err(e);
@@ -134,7 +160,10 @@ pub fn store_token(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use secret::SecretString;
+    use secret::{
+        LogicalCredentialId, PhysicalSecretSlot, SecretString, inspect_secret_bundle,
+        read_secret_bundle,
+    };
 
     #[test]
     fn redirect_uri는_localhost_또는_https만() {
@@ -196,5 +225,60 @@ mod tests {
             store.get_secret("cred-1.refresh").unwrap().expose(),
             "rt-456"
         );
+    }
+
+    #[test]
+    fn oauth_token과_dcr은_typed_physical_bundle로_stage된다() {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct MemStore(Mutex<HashMap<String, String>>);
+        impl SecretStore for MemStore {
+            fn set_secret(&self, id: &str, secret: &SecretString) -> anyhow::Result<()> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .insert(id.to_owned(), secret.expose().to_owned());
+                Ok(())
+            }
+            fn get_secret(&self, id: &str) -> anyhow::Result<SecretString> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .get(id)
+                    .cloned()
+                    .map(SecretString::new)
+                    .ok_or_else(|| anyhow::anyhow!("no entry: {id}"))
+            }
+            fn delete_secret(&self, id: &str) -> anyhow::Result<()> {
+                self.0.lock().unwrap().remove(id);
+                Ok(())
+            }
+            fn has_secret(&self, id: &str) -> anyhow::Result<bool> {
+                Ok(self.0.lock().unwrap().contains_key(id))
+            }
+        }
+
+        let store = MemStore::default();
+        let logical = LogicalCredentialId::new("credential-typed").unwrap();
+        let physical = PhysicalSecretSlot::allocate(&logical);
+        let plan = SecretBundleStagePlan::with_slot(logical, physical.clone(), None).unwrap();
+        let token = OAuthToken {
+            access_token: SecretString::new("access-token-typed".to_owned()),
+            refresh_token: Some(SecretString::new("refresh-token-typed".to_owned())),
+            expires_in_secs: Some(3600),
+            provider_workspace_id: None,
+        };
+        let dcr = SecretString::new("dcr-secret-typed".to_owned());
+
+        let staged = stage_oauth_token_bundle(&store, &plan, &token, Some(&dcr)).unwrap();
+        assert_eq!(staged.new_slot, physical);
+        assert_eq!(staged.entries.count(), 3);
+        assert_eq!(inspect_secret_bundle(&store, &physical).unwrap().count(), 3);
+        let read = read_secret_bundle(&store, &physical).unwrap();
+        assert_eq!(read.access().expose(), "access-token-typed");
+        assert_eq!(read.refresh().unwrap().expose(), "refresh-token-typed");
+        assert_eq!(read.dcr().unwrap().expose(), "dcr-secret-typed");
     }
 }

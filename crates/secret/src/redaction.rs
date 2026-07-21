@@ -2,49 +2,418 @@
 //! chunk 경계 분할·ANSI escape 삽입·base64/URL/JSON-escape 변형에 대응한다.
 //! 패턴 corpus 확장·encrypted raw log는 PR-22.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::SecretString;
 
 const REPLACEMENT: &[u8] = b"[REDACTED]";
 /// 치환 오탐을 피하기 위한 최소 등록 길이 (이보다 짧은 값은 힌트 수준)
 const MIN_SECRET_LEN: usize = 6;
+const DEFAULT_GRACE: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedactionCorpusLimits {
+    pub max_items: usize,
+    pub max_bytes: usize,
+}
+
+impl RedactionCorpusLimits {
+    pub const PRODUCTION: Self = Self {
+        max_items: 4_096,
+        max_bytes: 4 * 1024 * 1024,
+    };
+
+    fn validate(self) -> Result<Self, RedactionCapacityError> {
+        if self.max_items == 0 || self.max_bytes == 0 {
+            return Err(RedactionCapacityError::InvalidLimits);
+        }
+        Ok(self)
+    }
+}
+
+impl Default for RedactionCorpusLimits {
+    fn default() -> Self {
+        Self::PRODUCTION
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RedactionCorpusStats {
+    pub items: usize,
+    pub bytes: usize,
+    pub permanent_items: usize,
+    pub rotating_items: usize,
+    pub active_leases: usize,
+    pub fail_closed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedactionCapacityError {
+    InvalidLimits,
+    NoSecrets,
+    SecretTooShort { length: usize, minimum: usize },
+    SecretTooLarge { length: usize, maximum: usize },
+    ItemLimit { requested: usize, maximum: usize },
+    ByteLimit { requested: usize, maximum: usize },
+    LegacyRegistrationFailed,
+}
+
+impl std::fmt::Display for RedactionCapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidLimits => f.write_str("redaction corpus limits must be non-zero"),
+            Self::NoSecrets => f.write_str("secret-backed execution has no redaction inputs"),
+            Self::SecretTooShort { length, minimum } => {
+                write!(f, "secret length {length} is below safe minimum {minimum}")
+            }
+            Self::SecretTooLarge { length, maximum } => {
+                write!(
+                    f,
+                    "secret length {length} exceeds redaction input maximum {maximum}"
+                )
+            }
+            Self::ItemLimit { requested, maximum } => {
+                write!(
+                    f,
+                    "redaction corpus needs {requested} items (maximum {maximum})"
+                )
+            }
+            Self::ByteLimit { requested, maximum } => {
+                write!(
+                    f,
+                    "redaction corpus needs {requested} bytes (maximum {maximum})"
+                )
+            }
+            Self::LegacyRegistrationFailed => {
+                f.write_str("a legacy redaction registration failed closed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RedactionCapacityError {}
+
+pub trait RedactionClock: Send + Sync {
+    fn now(&self) -> Duration;
+}
+
+struct MonotonicClock {
+    origin: Instant,
+}
+
+impl RedactionClock for MonotonicClock {
+    fn now(&self) -> Duration {
+        self.origin.elapsed()
+    }
+}
 
 /// 프로세스 전역 secret 패턴 레지스트리. 등록은 UI/worker 어디서든,
 /// 매칭은 StreamRedactor가 수행한다.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RedactionService {
-    inner: Arc<Mutex<Patterns>>,
+    inner: Arc<RedactionInner>,
+}
+
+struct RedactionInner {
+    patterns: Mutex<Patterns>,
+    limits: RedactionCorpusLimits,
+    grace: Duration,
+    clock: Arc<dyn RedactionClock>,
 }
 
 #[derive(Default)]
 struct Patterns {
-    /// 원본 + 파생 변형. 긴 패턴 우선 매칭.
-    entries: Vec<Vec<u8>>,
+    entries: Vec<PatternEntry>,
     max_len: usize,
+    bytes: usize,
+    next_id: u64,
+    active_leases: usize,
+    fail_closed: bool,
+}
+
+struct PatternEntry {
+    id: u64,
+    bytes: PatternBytes,
+    permanent: bool,
+    rotating_refs: usize,
+    expires_at: Option<Duration>,
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct PatternBytes(Vec<u8>);
+
+impl PatternBytes {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for PatternBytes {
+    fn drop(&mut self) {
+        for byte in &mut self.0 {
+            // SAFETY: `byte` is an exclusively borrowed byte in the owned allocation.
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Patterns {
+    fn prune(&mut self, now: Duration) {
+        self.entries.retain(|entry| {
+            entry.permanent
+                || entry.rotating_refs > 0
+                || entry.expires_at.is_some_and(|expires| expires > now)
+        });
+        self.recompute();
+    }
+
+    fn recompute(&mut self) {
+        self.bytes = self.entries.iter().map(|entry| entry.bytes.len()).sum();
+        self.max_len = self
+            .entries
+            .iter()
+            .map(|entry| entry.bytes.len())
+            .max()
+            .unwrap_or(0);
+        self.entries
+            .sort_by_key(|entry| std::cmp::Reverse(entry.bytes.len()));
+    }
+
+    fn stats(&self) -> RedactionCorpusStats {
+        RedactionCorpusStats {
+            items: self.entries.len(),
+            bytes: self.bytes,
+            permanent_items: self.entries.iter().filter(|entry| entry.permanent).count(),
+            rotating_items: self.entries.iter().filter(|entry| !entry.permanent).count(),
+            active_leases: self.active_leases,
+            fail_closed: self.fail_closed,
+        }
+    }
 }
 
 impl RedactionService {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_clock(
+            RedactionCorpusLimits::default(),
+            DEFAULT_GRACE,
+            Arc::new(MonotonicClock {
+                origin: Instant::now(),
+            }),
+        )
+        .expect("production redaction limits are valid")
+    }
+
+    pub fn with_clock(
+        limits: RedactionCorpusLimits,
+        grace: Duration,
+        clock: Arc<dyn RedactionClock>,
+    ) -> Result<Self, RedactionCapacityError> {
+        Ok(Self {
+            inner: Arc::new(RedactionInner {
+                patterns: Mutex::new(Patterns::default()),
+                limits: limits.validate()?,
+                grace,
+                clock,
+            }),
+        })
     }
 
     /// secret과 그 변형(base64, URL-encoded/form-encoded, JSON-escaped)을
     /// 등록한다 (설계문서 7장, corpus는 PR-22에서 확장).
     pub fn register(&self, secret: &SecretString) {
-        let plain = secret.expose().as_bytes();
-        if plain.len() < MIN_SECRET_LEN {
+        // Preserve the legacy API's historical short-value behavior. Secret-backed execution must
+        // use the checked lease/permanent APIs below, which reject an unprotectable short value.
+        if secret.expose().len() < MIN_SECRET_LEN {
             return;
         }
-        let mut variants: Vec<Vec<u8>> = vec![
-            plain.to_vec(),
-            base64_encode(plain).into_bytes(),
-            url_encode(plain, false).into_bytes(),
-            url_encode(plain, true).into_bytes(), // 소문자 %xx 인코더 대응
-            json_escape(secret.expose()).into_bytes(),
+        if self.register_permanent(secret).is_err() {
+            self.mark_fail_closed();
+        }
+    }
+
+    pub fn register_permanent(&self, secret: &SecretString) -> Result<(), RedactionCapacityError> {
+        let variants = self.variants_for(secret, true)?;
+        let now = self.inner.clock.now();
+        let mut patterns = self.inner.patterns.lock().expect("redaction patterns lock");
+        patterns.prune(now);
+        ensure_capacity(&patterns, &variants, self.inner.limits)?;
+        for variant in variants {
+            if let Some(entry) = patterns
+                .entries
+                .iter_mut()
+                .find(|entry| entry.bytes == variant)
+            {
+                entry.permanent = true;
+                entry.expires_at = None;
+            } else {
+                let id = patterns.next_id;
+                patterns.next_id = patterns.next_id.saturating_add(1);
+                patterns.entries.push(PatternEntry {
+                    id,
+                    bytes: variant,
+                    permanent: true,
+                    rotating_refs: 0,
+                    expires_at: None,
+                });
+            }
+        }
+        patterns.recompute();
+        Ok(())
+    }
+
+    /// Atomically registers every secret needed by one secret-backed operation. Failure leaves the
+    /// corpus unchanged and the caller must not execute the operation.
+    pub fn acquire_execution_lease(
+        &self,
+        secrets: &[&SecretString],
+    ) -> Result<RedactionLease, RedactionCapacityError> {
+        if secrets.is_empty() {
+            return Err(RedactionCapacityError::NoSecrets);
+        }
+        let mut variants = BTreeSet::new();
+        let mut variant_bytes = 0usize;
+        let mut seen_secrets = BTreeSet::new();
+        for secret in secrets {
+            if !seen_secrets.insert(secret.expose()) {
+                continue;
+            }
+            for variant in self.variants_for(secret, true)? {
+                if variants.contains(&variant) {
+                    continue;
+                }
+                let requested_items = variants.len().saturating_add(1);
+                if requested_items > self.inner.limits.max_items {
+                    return Err(RedactionCapacityError::ItemLimit {
+                        requested: requested_items,
+                        maximum: self.inner.limits.max_items,
+                    });
+                }
+                let requested_bytes = variant_bytes.saturating_add(variant.len());
+                if requested_bytes > self.inner.limits.max_bytes {
+                    return Err(RedactionCapacityError::ByteLimit {
+                        requested: requested_bytes,
+                        maximum: self.inner.limits.max_bytes,
+                    });
+                }
+                variant_bytes = requested_bytes;
+                variants.insert(variant);
+            }
+        }
+        let now = self.inner.clock.now();
+        let mut patterns = self.inner.patterns.lock().expect("redaction patterns lock");
+        patterns.prune(now);
+        ensure_capacity(&patterns, &variants, self.inner.limits)?;
+        let mut pattern_ids = Vec::with_capacity(variants.len());
+        for variant in variants {
+            if let Some(entry) = patterns
+                .entries
+                .iter_mut()
+                .find(|entry| entry.bytes == variant)
+            {
+                entry.rotating_refs = entry.rotating_refs.saturating_add(1);
+                entry.expires_at = None;
+                pattern_ids.push(entry.id);
+            } else {
+                let id = patterns.next_id;
+                patterns.next_id = patterns.next_id.saturating_add(1);
+                patterns.entries.push(PatternEntry {
+                    id,
+                    bytes: variant,
+                    permanent: false,
+                    rotating_refs: 1,
+                    expires_at: None,
+                });
+                pattern_ids.push(id);
+            }
+        }
+        patterns.active_leases = patterns.active_leases.saturating_add(1);
+        patterns.recompute();
+        Ok(RedactionLease {
+            service: self.clone(),
+            pattern_ids,
+            released: false,
+        })
+    }
+
+    pub fn acquire_rotating(
+        &self,
+        secret: &SecretString,
+    ) -> Result<RedactionLease, RedactionCapacityError> {
+        self.acquire_execution_lease(&[secret])
+    }
+
+    pub fn corpus_stats(&self) -> RedactionCorpusStats {
+        let now = self.inner.clock.now();
+        let mut patterns = self.inner.patterns.lock().expect("redaction patterns lock");
+        patterns.prune(now);
+        patterns.stats()
+    }
+
+    pub fn ensure_safe(&self) -> Result<(), RedactionCapacityError> {
+        if self
+            .inner
+            .patterns
+            .lock()
+            .expect("redaction patterns lock")
+            .fail_closed
+        {
+            Err(RedactionCapacityError::LegacyRegistrationFailed)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn mark_fail_closed(&self) {
+        self.inner
+            .patterns
+            .lock()
+            .expect("redaction patterns lock")
+            .fail_closed = true;
+    }
+
+    fn maximum_input_len(&self) -> usize {
+        (self.inner.limits.max_bytes / 128).max(MIN_SECRET_LEN)
+    }
+
+    fn variants_for(
+        &self,
+        secret: &SecretString,
+        require_minimum: bool,
+    ) -> Result<Vec<PatternBytes>, RedactionCapacityError> {
+        let plain = secret.expose().as_bytes();
+        if plain.len() < MIN_SECRET_LEN {
+            return if require_minimum {
+                Err(RedactionCapacityError::SecretTooShort {
+                    length: plain.len(),
+                    minimum: MIN_SECRET_LEN,
+                })
+            } else {
+                Ok(Vec::new())
+            };
+        }
+        let maximum = self.maximum_input_len();
+        if plain.len() > maximum {
+            return Err(RedactionCapacityError::SecretTooLarge {
+                length: plain.len(),
+                maximum,
+            });
+        }
+        let mut variants: Vec<PatternBytes> = vec![
+            PatternBytes(plain.to_vec()),
+            PatternBytes(base64_encode(plain).into_bytes()),
+            PatternBytes(url_encode(plain, false).into_bytes()),
+            PatternBytes(url_encode(plain, true).into_bytes()), // 소문자 %xx 인코더 대응
+            PatternBytes(json_escape(secret.expose()).into_bytes()),
             // \uXXXX 스타일 직렬화 대응 — hex 대·소문자 각각 (codex 리뷰)
-            json_escape_unicode(secret.expose(), false).into_bytes(),
-            json_escape_unicode(secret.expose(), true).into_bytes(),
+            PatternBytes(json_escape_unicode(secret.expose(), false).into_bytes()),
+            PatternBytes(json_escape_unicode(secret.expose(), true).into_bytes()),
         ];
         // 스페이스를 +로 쓰는 form 인코더 대응. 방언마다 safe set이 다르다 —
         // URLSearchParams(*safe/~enc), python·go quote_plus(~safe/*enc) 등 —
@@ -52,37 +421,36 @@ impl RedactionService {
         for tilde_safe in [false, true] {
             for star_safe in [false, true] {
                 for lowercase in [false, true] {
-                    variants
-                        .push(form_encode(plain, lowercase, tilde_safe, star_safe).into_bytes());
+                    variants.push(PatternBytes(
+                        form_encode(plain, lowercase, tilde_safe, star_safe).into_bytes(),
+                    ));
                 }
             }
         }
         variants.sort();
         variants.dedup();
-        let mut patterns = self.inner.lock().expect("redaction patterns lock");
-        for variant in variants.drain(..) {
-            if variant.len() >= MIN_SECRET_LEN && !patterns.entries.contains(&variant) {
-                patterns.max_len = patterns.max_len.max(variant.len());
-                patterns.entries.push(variant);
-            }
-        }
-        // 긴 패턴 우선 (부분 문자열 관계일 때 넓게 지우도록)
-        patterns
-            .entries
-            .sort_by_key(|entry| std::cmp::Reverse(entry.len()));
+        variants.retain(|variant| variant.len() >= MIN_SECRET_LEN);
+        Ok(variants)
     }
 
     /// secret 값이 JSON이면(예: OAuth 토큰 blob — PR-18) 안의 문자열 필드들을
     /// 개별 패턴으로도 등록한다. 로그에는 blob 전체가 아니라 access token 같은
     /// 개별 값이 찍히기 때문. JSON이 아니면 아무것도 하지 않는다 (register와 병행 사용).
     pub fn register_json_fields(&self, secret: &SecretString) {
+        // Bound temporary serde allocations as well as the retained corpus. The legacy void API
+        // cannot report capacity, so an oversized blob switches matching to fail-closed output.
+        if secret.expose().len() > self.maximum_input_len() {
+            self.mark_fail_closed();
+            return;
+        }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(secret.expose()) else {
             return;
         };
-        fn walk(value: &serde_json::Value, service: &RedactionService) {
+        fn walk(value: serde_json::Value, service: &RedactionService) {
             match value {
                 serde_json::Value::String(s) => {
-                    service.register(&SecretString::new(s.clone()));
+                    // Move the parsed allocation into SecretString so its Drop zeroizes it.
+                    service.register(&SecretString::new(s));
                 }
                 serde_json::Value::Array(items) => {
                     for item in items {
@@ -90,14 +458,14 @@ impl RedactionService {
                     }
                 }
                 serde_json::Value::Object(map) => {
-                    for item in map.values() {
+                    for item in map.into_values() {
                         walk(item, service);
                     }
                 }
                 _ => {}
             }
         }
-        walk(&value, self);
+        walk(value, self);
     }
 
     pub fn stream_redactor(&self) -> StreamRedactor {
@@ -106,6 +474,104 @@ impl RedactionService {
             carry: Vec::new(),
         }
     }
+}
+
+impl Default for RedactionService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct RedactionLease {
+    service: RedactionService,
+    pattern_ids: Vec<u64>,
+    released: bool,
+}
+
+impl std::fmt::Debug for RedactionLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RedactionLease(REDACTED)")
+    }
+}
+
+impl RedactionLease {
+    pub fn release(mut self) {
+        self.release_inner();
+    }
+
+    fn release_inner(&mut self) {
+        if self.released {
+            return;
+        }
+        let now = self.service.inner.clock.now();
+        let expires_at = now.saturating_add(self.service.inner.grace);
+        let mut patterns = self
+            .service
+            .inner
+            .patterns
+            .lock()
+            .expect("redaction patterns lock");
+        for id in &self.pattern_ids {
+            if let Some(entry) = patterns.entries.iter_mut().find(|entry| entry.id == *id) {
+                entry.rotating_refs = entry.rotating_refs.saturating_sub(1);
+                if entry.rotating_refs == 0 && !entry.permanent {
+                    entry.expires_at = Some(expires_at);
+                }
+            }
+        }
+        patterns.active_leases = patterns.active_leases.saturating_sub(1);
+        self.released = true;
+    }
+}
+
+impl Drop for RedactionLease {
+    fn drop(&mut self) {
+        self.release_inner();
+    }
+}
+
+impl Drop for StreamRedactor {
+    fn drop(&mut self) {
+        for byte in &mut self.carry {
+            // SAFETY: `byte` is an exclusively borrowed byte in the owned carry allocation.
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn ensure_capacity<'a>(
+    patterns: &Patterns,
+    variants: impl IntoIterator<Item = &'a PatternBytes>,
+    limits: RedactionCorpusLimits,
+) -> Result<(), RedactionCapacityError> {
+    let mut new_items = 0usize;
+    let mut new_bytes = 0usize;
+    for variant in variants {
+        if !patterns
+            .entries
+            .iter()
+            .any(|entry| entry.bytes.as_slice() == variant.as_slice())
+        {
+            new_items = new_items.saturating_add(1);
+            new_bytes = new_bytes.saturating_add(variant.len());
+        }
+    }
+    let requested_items = patterns.entries.len().saturating_add(new_items);
+    if requested_items > limits.max_items {
+        return Err(RedactionCapacityError::ItemLimit {
+            requested: requested_items,
+            maximum: limits.max_items,
+        });
+    }
+    let requested_bytes = patterns.bytes.saturating_add(new_bytes);
+    if requested_bytes > limits.max_bytes {
+        return Err(RedactionCapacityError::ByteLimit {
+            requested: requested_bytes,
+            maximum: limits.max_bytes,
+        });
+    }
+    Ok(())
 }
 
 /// 세션 output 스트림 하나의 redaction 상태 (lookbehind carry 보유).
@@ -120,16 +586,19 @@ impl StreamRedactor {
     /// 꼬리(최대 secret 길이 − 1, stripped 기준)는 다음 chunk와 합쳐 재검사한다.
     pub fn redact_chunk(&mut self, chunk: &[u8]) -> Vec<u8> {
         self.carry.extend_from_slice(chunk);
-        let (mut redacted, stripped_len) = {
-            let patterns = self.service.inner.lock().expect("redaction patterns lock");
-            redact_buffer(&self.carry, &patterns.entries)
+        let (mut redacted, stripped_len, max_len) = {
+            let now = self.service.inner.clock.now();
+            let mut patterns = self
+                .service
+                .inner
+                .patterns
+                .lock()
+                .expect("redaction patterns lock");
+            patterns.prune(now);
+            let (redacted, stripped_len) =
+                redact_buffer(&self.carry, &patterns.entries, patterns.fail_closed);
+            (redacted, stripped_len, patterns.max_len)
         };
-        let max_len = self
-            .service
-            .inner
-            .lock()
-            .expect("redaction patterns lock")
-            .max_len;
         if max_len == 0 {
             self.carry.clear();
             return std::mem::take(&mut redacted);
@@ -150,8 +619,15 @@ impl StreamRedactor {
 
     /// 스트림 종료 — 남은 carry를 마지막 검사 후 배출한다.
     pub fn flush(&mut self) -> Vec<u8> {
-        let patterns = self.service.inner.lock().expect("redaction patterns lock");
-        let (redacted, _) = redact_buffer(&self.carry, &patterns.entries);
+        let now = self.service.inner.clock.now();
+        let mut patterns = self
+            .service
+            .inner
+            .patterns
+            .lock()
+            .expect("redaction patterns lock");
+        patterns.prune(now);
+        let (redacted, _) = redact_buffer(&self.carry, &patterns.entries, patterns.fail_closed);
         self.carry.clear();
         redacted
     }
@@ -160,14 +636,18 @@ impl StreamRedactor {
 /// buffer에서 패턴을 찾아 [REDACTED]로 치환한다.
 /// 매칭은 ANSI escape를 제거한 텍스트에서 하고(escape 삽입 우회 방지 — 7장),
 /// 치환은 원본 범위(escape 포함)에 적용한다. (stripped 길이도 반환)
-fn redact_buffer(buffer: &[u8], patterns: &[Vec<u8>]) -> (Vec<u8>, usize) {
+fn redact_buffer(buffer: &[u8], patterns: &[PatternEntry], fail_closed: bool) -> (Vec<u8>, usize) {
     let (stripped, index_map) = strip_ansi_with_map(buffer);
+    if fail_closed && !stripped.is_empty() {
+        return (REPLACEMENT.to_vec(), stripped.len());
+    }
     if patterns.is_empty() || stripped.is_empty() {
         return (buffer.to_vec(), stripped.len());
     }
     // 원본 기준 (start, end) 치환 구간 수집
     let mut spans: Vec<(usize, usize)> = Vec::new();
     for pattern in patterns {
+        let pattern = pattern.bytes.as_slice();
         let mut from = 0;
         while let Some(pos) = find(&stripped[from..], pattern) {
             let start = from + pos;
@@ -367,7 +847,45 @@ fn json_escape(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    #[derive(Default)]
+    struct ManualClock(AtomicU64);
+
+    impl ManualClock {
+        fn advance(&self, duration: Duration) {
+            self.0.fetch_add(
+                u64::try_from(duration.as_millis()).unwrap(),
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    impl RedactionClock for ManualClock {
+        fn now(&self) -> Duration {
+            Duration::from_millis(self.0.load(Ordering::SeqCst))
+        }
+    }
+
+    fn bounded_service(
+        max_items: usize,
+        max_bytes: usize,
+        grace: Duration,
+    ) -> (RedactionService, Arc<ManualClock>) {
+        let clock = Arc::new(ManualClock::default());
+        let service = RedactionService::with_clock(
+            RedactionCorpusLimits {
+                max_items,
+                max_bytes,
+            },
+            grace,
+            clock.clone(),
+        )
+        .unwrap();
+        (service, clock)
+    }
 
     fn service_with(secret: &str) -> RedactionService {
         let service = RedactionService::new();
@@ -555,5 +1073,146 @@ mod tests {
         let text = String::from_utf8_lossy(&out);
         assert_eq!(text.matches("[REDACTED]").count(), 2);
         assert!(!text.contains("secret-value-1"));
+    }
+
+    #[test]
+    fn rotating_lease_refcount와_grace_expiry는_match시_prune된다() {
+        let (service, clock) = bounded_service(256, 256 * 1024, Duration::from_secs(10));
+        let permanent = SecretString::new("permanent-secret-value".to_owned());
+        service.register_permanent(&permanent).unwrap();
+        let baseline = service.corpus_stats();
+
+        let rotating = SecretString::new("rotating-secret-value".to_owned());
+        let first = service.acquire_rotating(&rotating).unwrap();
+        let second = service.acquire_rotating(&rotating).unwrap();
+        let active = service.corpus_stats();
+        assert_eq!(active.active_leases, 2);
+        assert!(active.items > baseline.items);
+        drop(first);
+        assert_eq!(service.corpus_stats().active_leases, 1);
+        drop(second);
+        assert_eq!(service.corpus_stats().active_leases, 0);
+
+        clock.advance(Duration::from_secs(9));
+        let mut within_grace = service.stream_redactor();
+        assert_eq!(
+            redact_all(&mut within_grace, &[b"rotating-secret-value"]),
+            REPLACEMENT
+        );
+        clock.advance(Duration::from_secs(2));
+        let mut after_grace = service.stream_redactor();
+        assert_eq!(
+            redact_all(&mut after_grace, &[b"rotating-secret-value"]),
+            b"rotating-secret-value"
+        );
+        assert_eq!(service.corpus_stats(), baseline);
+    }
+
+    #[test]
+    fn corpus_capacity_failure_blocks_secret_backed_execution_without_partial_registration() {
+        let (service, _) = bounded_service(1, 4_096, Duration::ZERO);
+        let secret = SecretString::new("capacity-secret-value".to_owned());
+        let result = service.acquire_execution_lease(&[&secret]);
+        assert!(matches!(
+            result,
+            Err(RedactionCapacityError::ItemLimit { .. })
+                | Err(RedactionCapacityError::ByteLimit { .. })
+        ));
+        assert_eq!(service.corpus_stats(), RedactionCorpusStats::default());
+
+        let mut external_call_count = 0;
+        if service.acquire_execution_lease(&[&secret]).is_ok() {
+            external_call_count += 1;
+        }
+        assert_eq!(
+            external_call_count, 0,
+            "registration failure must fail closed"
+        );
+    }
+
+    #[test]
+    fn many_secrets_keep_temporary_variants_bounded_and_never_partially_register() {
+        let (service, _) = bounded_service(32, 64 * 1024, Duration::ZERO);
+        let secrets = (0..256)
+            .map(|index| SecretString::new(format!("distinct-secret-value-{index}")))
+            .collect::<Vec<_>>();
+        let refs = secrets.iter().collect::<Vec<_>>();
+        assert!(matches!(
+            service.acquire_execution_lease(&refs),
+            Err(RedactionCapacityError::ItemLimit {
+                requested: 33,
+                maximum: 32
+            })
+        ));
+        assert_eq!(service.corpus_stats(), RedactionCorpusStats::default());
+
+        let (duplicate_service, _) = bounded_service(32, 64 * 1024, Duration::ZERO);
+        let repeated = SecretString::new("one-repeated-secret-value".to_owned());
+        let duplicate_refs = vec![&repeated; 10_000];
+        let lease = duplicate_service
+            .acquire_execution_lease(&duplicate_refs)
+            .unwrap();
+        assert!(duplicate_service.corpus_stats().items <= 32);
+        drop(lease);
+    }
+
+    #[test]
+    fn legacy_capacity_failure_marks_service_fail_closed_and_redacts_whole_output() {
+        let (service, _) = bounded_service(1, 4_096, Duration::ZERO);
+        service.register(&SecretString::new("legacy-secret-value".to_owned()));
+        assert!(service.ensure_safe().is_err());
+        assert!(service.corpus_stats().fail_closed);
+        let mut redactor = service.stream_redactor();
+        assert_eq!(
+            redact_all(&mut redactor, &[b"unrelated output"]),
+            REPLACEMENT
+        );
+    }
+
+    #[test]
+    fn oversized_legacy_json_registration_fails_closed_before_parse() {
+        let (service, _) = bounded_service(64, 4_096, Duration::ZERO);
+        let oversized = SecretString::new(format!(
+            r#"{{"access_token":"{}"}}"#,
+            "sensitive-value".repeat(8)
+        ));
+        service.register_json_fields(&oversized);
+        assert!(service.ensure_safe().is_err());
+        assert!(service.corpus_stats().fail_closed);
+    }
+
+    #[test]
+    fn one_hundred_token_rotations_have_zero_item_and_byte_growth() {
+        let (service, clock) = bounded_service(256, 256 * 1024, Duration::ZERO);
+        let dcr = SecretString::new("permanent-dcr-secret".to_owned());
+        service.register_permanent(&dcr).unwrap();
+        let baseline = service.corpus_stats();
+
+        for generation in 0..100 {
+            let access = SecretString::new(format!("access-token-generation-{generation}"));
+            let refresh = SecretString::new(format!("refresh-token-generation-{generation}"));
+            let lease = service
+                .acquire_execution_lease(&[&access, &refresh, &dcr])
+                .unwrap();
+            assert_eq!(service.corpus_stats().active_leases, 1);
+            drop(lease);
+            clock.advance(Duration::from_millis(1));
+            let stats = service.corpus_stats();
+            assert_eq!(stats, baseline, "corpus grew at rotation {generation}");
+        }
+    }
+
+    #[test]
+    fn too_short_execution_secret_fails_closed() {
+        let service = RedactionService::new();
+        let short = SecretString::new("tiny".to_owned());
+        assert!(matches!(
+            service.acquire_rotating(&short),
+            Err(RedactionCapacityError::SecretTooShort { .. })
+        ));
+        assert!(matches!(
+            service.register_permanent(&short),
+            Err(RedactionCapacityError::SecretTooShort { .. })
+        ));
     }
 }

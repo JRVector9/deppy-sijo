@@ -10,14 +10,18 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use secret::RedactionService;
 use serde_json::{Value, json};
 
+use crate::limits::MAX_RAW_MCP_RESPONSE_BYTES;
+use crate::metrics::{ThreadGuard, ThreadKind};
+
 /// stdout 한 줄 최대 길이 — newline 없는 무한 스트림으로 인한 메모리 폭주 방지
-const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_LINE_BYTES: usize = MAX_RAW_MCP_RESPONSE_BYTES;
 /// stdin으로 보내는 JSON-RPC 한 줄 최대 길이. 큰 tools/call payload는 pipe를
 /// 채워 blocking write가 될 수 있으므로 transport 경계에서 한 번 더 제한한다.
 pub(crate) const MAX_WRITE_LINE_BYTES: usize = 64 * 1024;
@@ -38,13 +42,23 @@ enum ReaderEvent {
     Violation(String),
 }
 
+struct StdioWiring {
+    stdin: ChildStdin,
+    events: Receiver<ReaderEvent>,
+    stderr_log: SharedStderrLog,
+    stdout_thread: JoinHandle<()>,
+    stderr_thread: JoinHandle<()>,
+}
+
 /// local stdio MCP 서버 하나와의 JSON-RPC 연결.
 /// 요청은 단일 스레드(호출측)에서 순차 실행을 전제한다 — v0 discovery flow(§1.5).
 #[derive(Debug)]
 pub(crate) struct StdioClient {
     child: Child,
     stdin: Option<ChildStdin>,
-    events: Receiver<ReaderEvent>,
+    events: Option<Receiver<ReaderEvent>>,
+    stdout_thread: Option<JoinHandle<()>>,
+    stderr_thread: Option<JoinHandle<()>>,
     next_id: u64,
     request_timeout: Duration,
     stderr_log: SharedStderrLog,
@@ -85,13 +99,15 @@ impl StdioClient {
         // spawn 이후 배선(pipe 인수/thread 기동)이 실패하면 child가 StdioClient에
         // 들어가기 전이므로 Drop 정리가 없다 — 여기서 직접 kill + reap 한다.
         match Self::wire(&mut child, redaction) {
-            Ok((stdin, events, stderr_log)) => Ok(Self {
+            Ok(wiring) => Ok(Self {
                 child,
-                stdin: Some(stdin),
-                events,
+                stdin: Some(wiring.stdin),
+                events: Some(wiring.events),
+                stdout_thread: Some(wiring.stdout_thread),
+                stderr_thread: Some(wiring.stderr_thread),
                 next_id: 1,
                 request_timeout,
-                stderr_log,
+                stderr_log: wiring.stderr_log,
                 violation: None,
                 reaped: false,
             }),
@@ -104,10 +120,7 @@ impl StdioClient {
 
     /// pipe 인수 + stdout/stderr reader thread 기동.
     /// 실패 시 child 정리는 호출측(spawn)이 담당한다.
-    fn wire(
-        child: &mut Child,
-        redaction: &RedactionService,
-    ) -> anyhow::Result<(ChildStdin, Receiver<ReaderEvent>, SharedStderrLog)> {
+    fn wire(child: &mut Child, redaction: &RedactionService) -> anyhow::Result<StdioWiring> {
         let stdin = child.stdin.take().context("MCP 서버 stdin pipe 없음")?;
         let stdout = child.stdout.take().context("MCP 서버 stdout pipe 없음")?;
         let mut stderr = child.stderr.take().context("MCP 서버 stderr pipe 없음")?;
@@ -116,9 +129,12 @@ impl StdioClient {
         // bounded 채널: 소비가 느리면 reader가 send에서 블록 → 표준 backpressure.
         let (tx, rx) = sync_channel(64);
         let stdout_redaction = redaction.clone();
-        std::thread::Builder::new()
+        let stdout_thread = std::thread::Builder::new()
             .name("mcp-stdout".into())
-            .spawn(move || read_stdout(stdout, tx, stdout_redaction))
+            .spawn(move || {
+                let _thread = ThreadGuard::enter(ThreadKind::StdioStdout);
+                read_stdout(stdout, tx, stdout_redaction);
+            })
             .context("mcp stdout thread 생성 실패")?;
 
         // stderr reader: chunk 단위 캡처 → redact → 보관.
@@ -128,9 +144,10 @@ impl StdioClient {
         let stderr_log = Arc::new(Mutex::new(Vec::new()));
         let log = Arc::clone(&stderr_log);
         let mut redactor = redaction.stream_redactor();
-        std::thread::Builder::new()
+        let stderr_thread = std::thread::Builder::new()
             .name("mcp-stderr".into())
             .spawn(move || {
+                let _thread = ThreadGuard::enter(ThreadKind::StdioStderr);
                 let mut buf = [0u8; 8192];
                 loop {
                     match stderr.read(&mut buf) {
@@ -143,7 +160,13 @@ impl StdioClient {
             })
             .context("mcp stderr thread 생성 실패")?;
 
-        Ok((stdin, rx, stderr_log))
+        Ok(StdioWiring {
+            stdin,
+            events: rx,
+            stderr_log,
+            stdout_thread,
+            stderr_thread,
+        })
     }
 
     /// JSON-RPC request 전송 → 같은 id의 response 대기 (result 반환).
@@ -183,7 +206,8 @@ impl StdioClient {
     /// 상관 위반으로 오염 처리하고, server발 request/notification은 무시한다.
     fn drain_unsolicited(&mut self) -> anyhow::Result<()> {
         loop {
-            match self.events.try_recv() {
+            let events = self.events.as_ref().context("MCP stdout이 이미 닫힘")?;
+            match events.try_recv() {
                 Ok(ReaderEvent::Message(value)) => {
                     if value.get("method").is_some() {
                         debug_unsupported_server_message(&value, true);
@@ -217,28 +241,34 @@ impl StdioClient {
         }
         let mut stdin = self.stdin.take().context("stdin이 이미 닫힘")?;
         let (tx, rx) = sync_channel(1);
-        std::thread::Builder::new()
+        let writer = std::thread::Builder::new()
             .name("mcp-stdin-write".into())
             .spawn(move || {
+                let _thread = ThreadGuard::enter(ThreadKind::StdioWriter);
                 let result = stdin.write_all(&line).and_then(|()| stdin.flush());
                 let _ = tx.send(result.map(|()| stdin));
             })
             .context("mcp stdin write thread 생성 실패")?;
         match rx.recv_timeout(self.request_timeout) {
             Ok(Ok(stdin)) => {
+                let _ = writer.join();
                 self.stdin = Some(stdin);
                 Ok(())
             }
-            Ok(Err(e)) => Err(e.into()),
+            Ok(Err(e)) => {
+                let _ = writer.join();
+                Err(e.into())
+            }
             Err(RecvTimeoutError::Timeout) => {
-                let status = kill_and_reap(&mut self.child);
-                self.reaped = true;
+                let status = self.terminate();
+                let _ = writer.join();
                 bail!(
                     "MCP stdin write timeout ({:?}, exit: {status:?})",
                     self.request_timeout
                 )
             }
             Err(RecvTimeoutError::Disconnected) => {
+                let _ = writer.join();
                 bail!("MCP stdin write thread 종료")
             }
         }
@@ -252,9 +282,18 @@ impl StdioClient {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                bail!("{method} 응답 timeout ({:?})", self.request_timeout);
+                let status = self.terminate();
+                bail!(
+                    "{method} 응답 timeout ({:?}, exit: {status:?})",
+                    self.request_timeout
+                );
             }
-            match self.events.recv_timeout(remaining) {
+            let event = self
+                .events
+                .as_ref()
+                .context("MCP stdout이 이미 닫힘")?
+                .recv_timeout(remaining);
+            match event {
                 Ok(ReaderEvent::Message(value)) => {
                     if value.get("method").is_some() {
                         // server발 메시지. notification은 무시하되, id가 있는
@@ -286,19 +325,46 @@ impl StdioClient {
                     bail!("{desc}");
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    bail!("{method} 응답 timeout ({:?})", self.request_timeout);
+                    let status = self.terminate();
+                    bail!(
+                        "{method} 응답 timeout ({:?}, exit: {status:?})",
+                        self.request_timeout
+                    );
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     // stdout이 닫혔다 — 서버가 죽었거나 죽어가는 중. 이 자리에서
                     // 그룹까지 정리한다. 순서가 핵심: killpg → reap.
                     // reap 전(zombie) PID는 커널이 재사용하지 않으므로 killpg가 안전하고,
                     // wrapper가 남긴 grandchild도 그룹 정리로 함께 끝난다 (codex 리뷰 2건 동시 해소)
-                    let status = kill_and_reap(&mut self.child);
-                    self.reaped = true;
+                    let status = self.terminate();
                     bail!("MCP 서버가 {method} 응답 전에 종료됨 (exit: {status:?})");
                 }
             }
         }
+    }
+
+    pub(crate) fn cancel(&mut self) {
+        self.terminate();
+    }
+
+    fn terminate(&mut self) -> Option<std::process::ExitStatus> {
+        drop(self.stdin.take());
+        let status = if self.reaped {
+            None
+        } else {
+            self.reaped = true;
+            kill_and_reap(&mut self.child)
+        };
+        // A reader may be blocked on the bounded channel. Drop the receiver before
+        // joining so the send fails, then wait for both pipe-owning threads to exit.
+        drop(self.events.take());
+        if let Some(thread) = self.stdout_thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.stderr_thread.take() {
+            let _ = thread.join();
+        }
+        status
     }
 }
 
@@ -315,10 +381,7 @@ impl Drop for StdioClient {
     /// 연결을 버릴 때 서버 프로세스를 정리한다 (pty crate와 동일 규약).
     /// reader thread들은 pipe EOF로 스스로 끝난다.
     fn drop(&mut self) {
-        drop(self.stdin.take()); // stdin 닫힘 → 서버 입장에서 정상 종료 신호
-        if !self.reaped {
-            kill_and_reap(&mut self.child);
-        }
+        self.terminate();
     }
 }
 
@@ -505,11 +568,49 @@ fn append_capped(log: &Mutex<Vec<u8>>, chunk: Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secret::RedactionService;
     use std::io::Cursor;
     use std::sync::{Arc, Mutex};
     use tracing::field::{Field, Visit};
     use tracing::span::{Attributes, Id, Record};
     use tracing::{Event, Metadata, Subscriber};
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_cancel_kills_reaps_and_joins_stdio_resources() {
+        let started = Instant::now();
+        let mut client = StdioClient::spawn(
+            "/bin/sh",
+            &["-c".to_owned(), "sleep 30".to_owned()],
+            &[],
+            true,
+            &RedactionService::new(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let active = crate::metrics::transport_metrics();
+            if active.stdio_stdout_threads >= 1 && active.stdio_stderr_threads >= 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stdio reader metrics not observed"
+            );
+            std::thread::yield_now();
+        }
+
+        client.cancel();
+
+        assert!(client.reaped);
+        assert!(client.stdin.is_none());
+        assert!(client.events.is_none());
+        assert!(client.stdout_thread.is_none());
+        assert!(client.stderr_thread.is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     #[test]
     fn jsonrpc_검증() {

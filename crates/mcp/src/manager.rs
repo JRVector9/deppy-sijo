@@ -3,6 +3,7 @@
 //! transport는 local stdio + Streamable HTTP(H2, crates/mcp/src/http.rs) —
 //! OAuth 사다리는 H4/H5.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -10,6 +11,10 @@ use secret::RedactionService;
 use serde_json::{Value, json};
 
 use crate::http::{HttpClient, McpHttpServerConfig};
+use crate::limits::{
+    MAX_TOOL_DESCRIPTOR_BYTES, MAX_TOOLS_PER_SERVER, McpPayloadKind, enforce_json_payload,
+    serialized_json_len,
+};
 use crate::transport::StdioClient;
 
 /// initialize 요청에 싣는 기준 스펙 개정판 (§1.5 — 최신 우선).
@@ -24,7 +29,7 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
     &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// tools/list cursor 페이지네이션 상한 — 악의적 서버의 무한 cursor 방어
+/// tools/list cursor 페이지네이션 상한 — item/byte/cursor cycle과 별도의 왕복 상한.
 const MAX_TOOL_PAGES: usize = 100;
 
 /// local stdio MCP 서버 실행 스펙 (§11.4 kind='stdio' 행에 대응).
@@ -169,6 +174,7 @@ impl LocalMcpManager {
         name: &str,
         arguments: Value,
     ) -> anyhow::Result<Value> {
+        validate_tool_arguments(&arguments)?;
         let mut connection = self.connect(config)?;
         connection.call_tool(name, arguments)
         // connection drop → 서버 프로세스 정리
@@ -192,6 +198,7 @@ impl LocalMcpManager {
         name: &str,
         arguments: Value,
     ) -> anyhow::Result<Value> {
+        validate_tool_arguments(&arguments)?;
         let mut connection = self.connect_http(config)?;
         connection.call_tool(name, arguments)
         // connection drop → 세션 DELETE (베스트에포트)
@@ -235,6 +242,15 @@ impl TransportClient {
             Self::Http(client) => client.request(method, params),
         }
     }
+
+    fn cancel(&mut self) {
+        match self {
+            Self::Stdio(client) => client.cancel(),
+            // sync ureq는 실행 중 요청을 강제 중단할 수 없다. 호출측 deadline이
+            // 반환된 뒤에도 sender가 permit을 소유하며 bounded reaper가 회수한다.
+            Self::Http(_) => {}
+        }
+    }
 }
 
 /// initialize를 마친 MCP 연결 (stdio 또는 Streamable HTTP).
@@ -254,7 +270,7 @@ pub struct McpConnection {
 impl McpConnection {
     /// tools/list 요청 → tool 목록 (cursor 페이지네이션 포함).
     pub fn list_tools(&mut self) -> anyhow::Result<Vec<McpTool>> {
-        let mut tools = Vec::new();
+        let mut discovery = ToolDiscovery::production();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_TOOL_PAGES {
             let params = match &cursor {
@@ -262,16 +278,9 @@ impl McpConnection {
                 None => json!({}),
             };
             let result = self.client.request("tools/list", params)?;
-            let list = result
-                .get("tools")
-                .and_then(Value::as_array)
-                .context("tools/list 응답에 tools 배열 없음")?;
-            for item in list {
-                tools.push(parse_tool(item)?);
-            }
-            match result.get("nextCursor").and_then(Value::as_str) {
-                Some(next) => cursor = Some(next.to_owned()),
-                None => return Ok(tools),
+            match discovery.push_page(&result)? {
+                Some(next) => cursor = Some(next),
+                None => return Ok(discovery.finish()),
             }
         }
         anyhow::bail!("tools/list 페이지가 {MAX_TOOL_PAGES}를 초과 — cursor 순환 의심");
@@ -281,8 +290,17 @@ impl McpConnection {
     /// `arguments`는 JSON object여야 한다 (MCP 스펙). isError=true는 프로토콜
     /// 오류가 아니라 tool이 보고한 실패이므로 결과를 그대로 돌려준다 — 판단은 호출측.
     pub fn call_tool(&mut self, name: &str, arguments: Value) -> anyhow::Result<Value> {
+        validate_tool_arguments(&arguments)?;
         self.client
             .request("tools/call", json!({"name": name, "arguments": arguments}))
+    }
+
+    /// Cancel and release transport-owned resources. Stdio cancellation closes stdin,
+    /// kills the entire process group, reaps the direct child, and joins pipe threads.
+    /// Sync ureq cannot be force-cancelled; its deadline returns to the caller while the
+    /// bounded HTTP sender retains its permit until the socket operation exits.
+    pub fn cancel(&mut self) {
+        self.client.cancel();
     }
 
     /// 지금까지 캡처된 redacted stderr 로그 (stdio 전용 — HTTP는 stderr가
@@ -292,6 +310,97 @@ impl McpConnection {
             TransportClient::Stdio(client) => client.stderr_log(),
             TransportClient::Http(_) => String::new(),
         }
+    }
+}
+
+fn validate_tool_arguments(arguments: &Value) -> anyhow::Result<()> {
+    if !arguments.is_object() {
+        anyhow::bail!("tools/call arguments가 JSON object가 아님");
+    }
+    enforce_json_payload(McpPayloadKind::ToolInput, arguments)?;
+    Ok(())
+}
+
+struct ToolDiscovery {
+    tools: Vec<McpTool>,
+    descriptor_bytes: usize,
+    seen_cursors: HashSet<String>,
+    max_tools: usize,
+    max_descriptor_bytes: usize,
+}
+
+impl ToolDiscovery {
+    fn production() -> Self {
+        Self::with_limits(MAX_TOOLS_PER_SERVER, MAX_TOOL_DESCRIPTOR_BYTES)
+    }
+
+    fn with_limits(max_tools: usize, max_descriptor_bytes: usize) -> Self {
+        Self {
+            tools: Vec::new(),
+            descriptor_bytes: 0,
+            seen_cursors: HashSet::new(),
+            max_tools,
+            max_descriptor_bytes,
+        }
+    }
+
+    fn push_page(&mut self, result: &Value) -> anyhow::Result<Option<String>> {
+        let list = result
+            .get("tools")
+            .and_then(Value::as_array)
+            .context("tools/list 응답에 tools 배열 없음")?;
+        let new_len = self
+            .tools
+            .len()
+            .checked_add(list.len())
+            .context("tools/list tool 수 overflow")?;
+        if new_len > self.max_tools {
+            anyhow::bail!(
+                "tools/list 누적 tool 수가 상한({})을 초과: {new_len}",
+                self.max_tools
+            );
+        }
+        for item in list {
+            let item_bytes = serialized_json_len(item)?;
+            self.descriptor_bytes = self
+                .descriptor_bytes
+                .checked_add(item_bytes)
+                .context("tools/list descriptor byte 수 overflow")?;
+            if self.descriptor_bytes > self.max_descriptor_bytes {
+                anyhow::bail!(
+                    "tools/list 누적 descriptor가 상한({} bytes)을 초과: {} bytes",
+                    self.max_descriptor_bytes,
+                    self.descriptor_bytes
+                );
+            }
+            self.tools.push(parse_tool(item)?);
+        }
+        let Some(next) = result.get("nextCursor") else {
+            return Ok(None);
+        };
+        let next = next
+            .as_str()
+            .context("tools/list nextCursor가 string이 아님")?
+            .to_owned();
+        self.descriptor_bytes = self
+            .descriptor_bytes
+            .checked_add(next.len())
+            .context("tools/list cursor byte 수 overflow")?;
+        if self.descriptor_bytes > self.max_descriptor_bytes {
+            anyhow::bail!(
+                "tools/list 누적 descriptor/cursor metadata가 상한({} bytes)을 초과: {} bytes",
+                self.max_descriptor_bytes,
+                self.descriptor_bytes
+            );
+        }
+        if !self.seen_cursors.insert(next.clone()) {
+            anyhow::bail!("tools/list cursor cycle 감지");
+        }
+        Ok(Some(next))
+    }
+
+    fn finish(self) -> Vec<McpTool> {
+        self.tools
     }
 }
 
@@ -338,6 +447,53 @@ mod tests {
         LocalMcpManager::new(RedactionService::new()).with_request_timeout(Duration::from_secs(5))
     }
 
+    #[test]
+    fn discovery_limits_are_cumulative_across_pages() {
+        let item = json!({"name":"a","description":"1234","inputSchema":{}});
+        let item_bytes = serialized_json_len(&item).unwrap();
+        let mut discovery = ToolDiscovery::with_limits(2, item_bytes * 2);
+        assert_eq!(
+            discovery
+                .push_page(&json!({"tools":[item.clone()],"nextCursor":"p2"}))
+                .unwrap()
+                .as_deref(),
+            Some("p2")
+        );
+        assert!(
+            discovery
+                .push_page(&json!({"tools":[item.clone(), item]}))
+                .unwrap_err()
+                .to_string()
+                .contains("tool 수")
+        );
+    }
+
+    #[test]
+    fn discovery_descriptor_bytes_and_cursor_cycles_fail_closed() {
+        let item = json!({"name":"a","description":"1234","inputSchema":{}});
+        let item_bytes = serialized_json_len(&item).unwrap();
+        let mut bytes = ToolDiscovery::with_limits(10, item_bytes - 1);
+        assert!(
+            bytes
+                .push_page(&json!({"tools":[item.clone()]}))
+                .unwrap_err()
+                .to_string()
+                .contains("descriptor")
+        );
+
+        let mut cursor = ToolDiscovery::with_limits(10, usize::MAX);
+        cursor
+            .push_page(&json!({"tools":[],"nextCursor":"same"}))
+            .unwrap();
+        assert!(
+            cursor
+                .push_page(&json!({"tools":[],"nextCursor":"same"}))
+                .unwrap_err()
+                .to_string()
+                .contains("cycle")
+        );
+    }
+
     // 요청 id는 결정적이다: initialize=1, tools/list=2, ...
     const HAPPY_SCRIPT: &str = r#"
 read -r _init
@@ -380,26 +536,27 @@ printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"%s","inputSchema":{"
 
     #[test]
     fn call_tool_큰_payload는_stdio_write전에_거부() {
-        let script = r#"
-read -r _init
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"mock","version":"0.1"}}}'
-read -r _initialized
-sleep 30
-"#;
         let manager = manager();
         let started = Instant::now();
         let error = manager
             .call_tool(
-                &sh_config(script),
+                &McpServerConfig::stdio(
+                    "must-not-spawn".to_owned(),
+                    "/definitely/missing/mcp-server".to_owned(),
+                    Vec::new(),
+                    Vec::new(),
+                    true,
+                ),
                 "echo_tool",
                 json!({"msg": "x".repeat(crate::transport::MAX_WRITE_LINE_BYTES)}),
             )
             .unwrap_err();
 
         assert!(
-            format!("{error:#}").contains("MCP 요청 크기 초과"),
+            format!("{error:#}").contains("MCP tool input 크기 초과"),
             "{error:#}"
         );
+        assert!(!format!("{error:#}").contains("spawn"), "{error:#}");
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "큰 payload 거부가 timeout에 의존하면 안 됨"

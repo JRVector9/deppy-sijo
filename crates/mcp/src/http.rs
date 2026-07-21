@@ -17,6 +17,8 @@
 
 use std::io::Read;
 use std::sync::mpsc;
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
@@ -24,17 +26,23 @@ use secret::SecretString;
 use serde_json::{Value, json};
 use url::{Host, Url};
 
+use crate::limits::{MAX_HTTP_SENDS, MAX_RAW_MCP_RESPONSE_BYTES};
 use crate::manager::{PROTOCOL_VERSION, negotiate_protocol_version};
+use crate::metrics::{
+    ThreadGuard, ThreadKind, http_send_permit_acquired, http_send_permit_released,
+    set_reaper_pending_http_senders,
+};
 
 /// SSE 한 라인 최대 길이 — stdio `MAX_LINE_BYTES` 8MiB 관례 이식.
-const MAX_SSE_LINE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SSE_LINE_BYTES: usize = MAX_RAW_MCP_RESPONSE_BYTES;
 /// SSE 이벤트 하나의 data 누적 상한 (멀티라인 data 조립 크기) — 같은 8MiB 관례.
-const MAX_SSE_DATA_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SSE_DATA_BYTES: usize = MAX_RAW_MCP_RESPONSE_BYTES;
 /// SSE 스트림 누적 수신 상한 — 요청 응답이 나올 때까지 소비하는 총량 방어.
-/// 단일 메시지 상한(8MiB)보다 커야 중간 notification들 + 응답을 수용한다.
-const MAX_SSE_STREAM_BYTES: usize = 64 * 1024 * 1024;
+/// 중간 notification을 포함한 전체 network input도 frozen raw-response ceiling을
+/// 넘지 않는다.
+const MAX_SSE_STREAM_BYTES: usize = MAX_RAW_MCP_RESPONSE_BYTES;
 /// application/json 응답 바디 상한 (stdio 라인 상한과 동일 관례).
-const MAX_JSON_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_JSON_BODY_BYTES: usize = MAX_RAW_MCP_RESPONSE_BYTES;
 /// 에러 메시지에 싣는 서버 텍스트 snippet 최대 문자 수 (transport.rs 관례).
 const ERROR_SNIPPET_CHARS: usize = 200;
 /// 수동 redirect 추적 상한 (VS Code `MAX_FOLLOW_REDIRECTS` 차용).
@@ -110,6 +118,27 @@ impl std::fmt::Display for McpAuthRequired {
 }
 
 impl std::error::Error for McpAuthRequired {}
+
+/// A `tools/call` may have reached the server, but no trustworthy outcome was
+/// received. Callers must persist `Unknown` and must not retry automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpDeliveryUnknown {
+    pub status: Option<u16>,
+}
+
+impl std::fmt::Display for McpDeliveryUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.status {
+            Some(status) => write!(
+                f,
+                "tools/call 전달 여부 불명 (HTTP {status}) — 자동 재시도 금지"
+            ),
+            None => write!(f, "tools/call 전달 여부 불명 — 자동 재시도 금지"),
+        }
+    }
+}
+
+impl std::error::Error for McpDeliveryUnknown {}
 
 fn parse_validated_url(input: &str) -> anyhow::Result<Url> {
     let parsed = Url::parse(input)
@@ -243,7 +272,8 @@ impl HttpClient {
     }
 
     /// JSON-RPC request 전송 → 같은 id의 response 대기 (result 반환).
-    /// 세션 만료(400/404)면 세션 재수립 후 정확히 1회 재시도한다.
+    /// 세션 만료(400/404)면 안전한 조회만 세션 재수립 후 정확히 1회 재시도한다.
+    /// `tools/call`은 이미 전달됐을 수 있으므로 Unknown으로 반환하고 재시도하지 않는다.
     pub(crate) fn request(&mut self, method: &str, params: Value) -> anyhow::Result<Value> {
         self.request_inner(method, &params)
             .map_err(|error| self.masked(error))
@@ -252,6 +282,11 @@ impl HttpClient {
     fn request_inner(&mut self, method: &str, params: &Value) -> anyhow::Result<Value> {
         match self.send_request(method, params) {
             Err(ExchangeError::SessionExpired { status }) => {
+                if method == "tools/call" {
+                    return Err(anyhow::Error::new(McpDeliveryUnknown {
+                        status: Some(status),
+                    }));
+                }
                 // 차용: mcpServer.ts:1292-1297 — 재시도는 1회 한정(allowRetry).
                 tracing::info!(
                     server = %self.server_name,
@@ -435,19 +470,22 @@ impl HttpClient {
                     continue;
                 }
                 Ok(response) => response,
-                Err(ureq::Error::Status(status, response)) => {
-                    return Err(self.classify_error_status(
-                        status,
-                        response,
-                        session_attached,
-                        method,
-                    ));
-                }
-                Err(error) => {
-                    return Err(ExchangeError::Other(
-                        anyhow::Error::new(error).context(format!("MCP HTTP {method} 요청 실패")),
-                    ));
-                }
+                Err(error) => match *error {
+                    ureq::Error::Status(status, response) => {
+                        return Err(self.classify_error_status(
+                            status,
+                            response,
+                            session_attached,
+                            method,
+                        ));
+                    }
+                    error => {
+                        return Err(ExchangeError::Other(
+                            anyhow::Error::new(error)
+                                .context(format!("MCP HTTP {method} 요청 실패")),
+                        ));
+                    }
+                },
             };
             return self.handle_success(response, expect_id, method, deadline);
         }
@@ -699,7 +737,12 @@ impl Drop for HttpClient {
             .timeout(SESSION_DELETE_TIMEOUT)
             .set("Mcp-Session-Id", &session);
         // 세션은 위에서 take()로 소진 — 헬퍼는 버전/Bearer만 마저 부착한다.
-        let _ = self.attach_common_headers(request, true).call();
+        let _ = send_with_deadline(
+            self.attach_common_headers(request, true),
+            None,
+            Instant::now() + SESSION_DELETE_TIMEOUT,
+            "session DELETE",
+        );
     }
 }
 
@@ -715,6 +758,7 @@ fn run_with_progress<T>(
     let ticker = std::thread::Builder::new()
         .name("mcp-http-progress".into())
         .spawn(move || {
+            let _thread = ThreadGuard::enter(ThreadKind::HttpProgress);
             while let Err(mpsc::RecvTimeoutError::Timeout) = stop_rx.recv_timeout(interval) {
                 on_tick(started.elapsed());
             }
@@ -736,30 +780,158 @@ fn run_with_progress<T>(
 /// 절단하는 함정이 있어 못 쓰므로(모듈 주석), 헤더 수신까지만 스레드로 분리해
 /// deadline을 강제하고 2xx 확인 후 바디(JSON/SSE)는 기존 경로에서 읽는다.
 ///
-/// 한계: deadline 초과로 결과를 포기해도 진행 중인 ureq 호출은 중단시킬 수
-/// 없다. 서버가 침묵하면 오프로드 스레드는 timeout_read로 자멸하지만, 계속
-/// 흘리는 드립 서버는 detached 스레드+소켓을 (호출당 최대 1개, connect-per-call
-/// 관례라 누적 없음) 더 오래 잡아둘 수 있다 — 이 수정의 목표는 호출측 스레드가
-/// deadline에 해방되는 것이다.
+/// ureq 2는 진행 중 요청을 강제 중단할 수 없다. deadline 뒤 sender는 caller와
+/// 분리되지만 permit을 종료까지 소유하고, bounded handle reaper가 join한다.
+/// 따라서 UI 반환 latency와 background socket lifetime을 거짓으로 동일시하지
+/// 않으면서도 sender/socket 수는 `MAX_HTTP_SENDS`를 넘지 않는다.
 fn send_with_deadline(
     request: ureq::Request,
     body: Option<String>,
     deadline: Instant,
     method: &str,
-) -> anyhow::Result<Result<ureq::Response, ureq::Error>> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
+) -> anyhow::Result<Result<ureq::Response, Box<ureq::Error>>> {
+    run_blocking_send(
+        http_send_governor(),
+        deadline,
+        method,
+        move || match &body {
+            Some(body) => request.send_string(body).map_err(Box::new),
+            None => request.call().map_err(Box::new),
+        },
+    )
+}
+
+struct HttpSendState {
+    active: usize,
+    reaper: Vec<JoinHandle<()>>,
+}
+
+struct HttpSendGovernor {
+    state: Mutex<HttpSendState>,
+    available: Condvar,
+}
+
+impl HttpSendGovernor {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(HttpSendState {
+                active: 0,
+                reaper: Vec::with_capacity(MAX_HTTP_SENDS),
+            }),
+            available: Condvar::new(),
+        }
+    }
+
+    fn acquire(&'static self, deadline: Instant, method: &str) -> anyhow::Result<HttpSendPermit> {
+        let mut state = self.state.lock().expect("HTTP send governor lock");
+        Self::reap_finished(&mut state);
+        while state.active >= MAX_HTTP_SENDS {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!(
+                    "{method} HTTP 전송 backpressure timeout (max {MAX_HTTP_SENDS} active sends)"
+                );
+            }
+            let (next, timeout) = self
+                .available
+                .wait_timeout(state, remaining)
+                .expect("HTTP send governor wait");
+            state = next;
+            Self::reap_finished(&mut state);
+            if timeout.timed_out() && state.active >= MAX_HTTP_SENDS {
+                bail!(
+                    "{method} HTTP 전송 backpressure timeout (max {MAX_HTTP_SENDS} active sends)"
+                );
+            }
+        }
+        state.active += 1;
+        http_send_permit_acquired();
+        Ok(HttpSendPermit { governor: self })
+    }
+
+    fn adopt(&self, sender: JoinHandle<()>) {
+        let mut state = self.state.lock().expect("HTTP send governor lock");
+        Self::reap_finished(&mut state);
+        if state.reaper.len() >= MAX_HTTP_SENDS {
+            // Permit ownership still bounds the live sender/socket. Dropping the
+            // handle detaches only this impossible-by-invariant overflow case and
+            // preserves the hard retained-handle bound in release builds.
+            tracing::error!(
+                max_http_sends = MAX_HTTP_SENDS,
+                "HTTP sender reaper capacity invariant violated"
+            );
+            drop(sender);
+            return;
+        }
+        state.reaper.push(sender);
+        set_reaper_pending_http_senders(state.reaper.len());
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().expect("HTTP send governor lock");
+        state.active = state.active.saturating_sub(1);
+        http_send_permit_released();
+        self.available.notify_one();
+    }
+
+    fn reap_finished(state: &mut HttpSendState) {
+        let mut index = 0;
+        while index < state.reaper.len() {
+            if state.reaper[index].is_finished() {
+                let sender = state.reaper.swap_remove(index);
+                let _ = sender.join();
+            } else {
+                index += 1;
+            }
+        }
+        set_reaper_pending_http_senders(state.reaper.len());
+    }
+
+    #[cfg(test)]
+    fn counts(&self) -> (usize, usize) {
+        let mut state = self.state.lock().expect("HTTP send governor lock");
+        Self::reap_finished(&mut state);
+        (state.active, state.reaper.len())
+    }
+}
+
+struct HttpSendPermit {
+    governor: &'static HttpSendGovernor,
+}
+
+impl Drop for HttpSendPermit {
+    fn drop(&mut self) {
+        self.governor.release();
+    }
+}
+
+fn http_send_governor() -> &'static HttpSendGovernor {
+    static GOVERNOR: OnceLock<HttpSendGovernor> = OnceLock::new();
+    GOVERNOR.get_or_init(HttpSendGovernor::new)
+}
+
+fn run_blocking_send<T: Send + 'static>(
+    governor: &'static HttpSendGovernor,
+    deadline: Instant,
+    method: &str,
+    send: impl FnOnce() -> T + Send + 'static,
+) -> anyhow::Result<T> {
+    if deadline.saturating_duration_since(Instant::now()).is_zero() {
         // redirect 등으로 deadline이 이미 소진 — 무의미한 연결을 열지 않는다.
         bail!("{method} 응답 timeout (상태줄/헤더 수신 전)");
     }
-    let (result_tx, result_rx) = mpsc::channel();
+    let permit = governor.acquire(deadline, method)?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        bail!("{method} 응답 timeout (전송 슬롯 대기 후)");
+    }
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
     let sender = std::thread::Builder::new()
         .name("mcp-http-send".into())
         .spawn(move || {
-            let result = match &body {
-                Some(body) => request.send_string(body),
-                None => request.call(),
-            };
+            let _thread = ThreadGuard::enter(ThreadKind::HttpSender);
+            let _permit = permit;
+            let result = send();
             // 호출측이 deadline으로 먼저 포기했으면(disconnect) 결과는 버려진다.
             let _ = result_tx.send(result);
         })
@@ -771,9 +943,15 @@ fn send_with_deadline(
             Ok(result)
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            bail!("{method} 응답 timeout (상태줄/헤더 수신 전)")
+            governor.adopt(sender);
+            if method == "tools/call" {
+                Err(anyhow::Error::new(McpDeliveryUnknown { status: None }))
+            } else {
+                bail!("{method} 응답 timeout (상태줄/헤더 수신 전)")
+            }
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = sender.join();
             bail!("{method} 전송 스레드가 결과 없이 종료됨 (panic 추정)")
         }
     }
@@ -1082,6 +1260,40 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn timed_out_http_senders_keep_permits_and_reaper_is_bounded() {
+        let governor: &'static HttpSendGovernor = Box::leak(Box::new(HttpSendGovernor::new()));
+        for _round in 0..4 {
+            for _ in 0..MAX_HTTP_SENDS {
+                let error = run_blocking_send(
+                    governor,
+                    Instant::now() + Duration::from_millis(10),
+                    "fixture",
+                    || {
+                        std::thread::sleep(Duration::from_millis(80));
+                        1usize
+                    },
+                )
+                .unwrap_err();
+                assert!(format!("{error:#}").contains("timeout"), "{error:#}");
+            }
+            assert_eq!(governor.counts(), (MAX_HTTP_SENDS, MAX_HTTP_SENDS));
+
+            let error = run_blocking_send(
+                governor,
+                Instant::now() + Duration::from_millis(20),
+                "fixture",
+                || 2usize,
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("backpressure"), "{error:#}");
+            assert_eq!(governor.counts(), (MAX_HTTP_SENDS, MAX_HTTP_SENDS));
+
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(governor.counts(), (0, 0));
+        }
+    }
 
     // ---------- SSE 파서 단위 테스트 (Cursor / DripRead) ----------
 
@@ -1657,6 +1869,43 @@ mod tests {
         // drop DELETE도 새 세션으로
         assert_eq!(requests[6].method, "DELETE");
         assert_eq!(requests[6].header("mcp-session-id"), Some("s2"));
+    }
+
+    #[test]
+    fn tools_call_세션_만료는_unknown이며_자동_재시도하지_않는다() {
+        let server = spawn_mock(|index, request| match index {
+            0 => json_reply(request, init_result(), Some("s1")),
+            1 => accepted(),
+            2 => Reply::Raw(http_response(400, &[], b"session expired")),
+            _ => not_found(),
+        });
+        let config = http_config(&server, None);
+
+        let error = manager()
+            .call_tool_http(&config, "mutating_tool", json!({"value": 1}))
+            .unwrap_err();
+        let unknown = error
+            .downcast_ref::<McpDeliveryUnknown>()
+            .expect("McpDeliveryUnknown downcast");
+        assert_eq!(unknown.status, Some(400));
+
+        // initialize + initialized + exactly one call; drop may add DELETE, but no
+        // second initialize/call sequence is allowed after an unknown delivery.
+        let requests = server.wait_captured(4);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.rpc_method() == "tools/call")
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.rpc_method() == "initialize")
+                .count(),
+            1
+        );
     }
 
     #[test]

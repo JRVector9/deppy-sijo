@@ -7,6 +7,7 @@
 //!
 //! 로그는 반드시 **stderr**로만 나간다 — stdout은 JSON-RPC 전용이라 오염되면 안 된다.
 
+mod approval_notify;
 mod cli;
 mod forwarder;
 mod hook;
@@ -21,6 +22,7 @@ use mcp::{LocalMcpManager, run_authorized_proxy};
 use mcp_store::McpServerRow;
 use secret::RedactionService;
 
+use crate::approval_notify::ApprovalWakeNotifier;
 use crate::cli::Cli;
 use crate::hook::authorized_proxy_executor;
 #[cfg(unix)]
@@ -102,6 +104,7 @@ fn main() -> anyhow::Result<()> {
     let owner_id = owner_id.context(
         "DEPPY_SESSION_ID 또는 DEPPY_AUTHORIZATION_OWNER가 authorization scope에 필요합니다",
     )?;
+    let cleanup_session_key = pane_id.clone();
     let authorization_scope = format!("proxy:{owner_id}:{}", cli.server_id);
     let owner = db
         .lock()
@@ -131,6 +134,8 @@ fn main() -> anyhow::Result<()> {
         cli.approval_timeout,
         backend,
         pane_id,
+        cli.approval_notifier
+            .map(|notifier| Arc::new(notifier) as Arc<dyn ApprovalWakeNotifier>),
     );
 
     let stdin = std::io::stdin();
@@ -141,7 +146,25 @@ fn main() -> anyhow::Result<()> {
     let reader = stdin.lock();
     let result = run_authorized_proxy(reader, stdout.lock(), executor);
     backend_session.shutdown();
-    result
+    let cleanup_result = deny_proxy_session_pending(&db, cleanup_session_key.as_deref());
+    match (result, cleanup_result) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(_)) => Err(anyhow::anyhow!("proxy session cleanup failed")),
+        (Ok(()), Ok(_)) => Ok(()),
+    }
+}
+
+fn deny_proxy_session_pending(
+    db: &Arc<Mutex<storage::Db>>,
+    session_key: Option<&str>,
+) -> anyhow::Result<usize> {
+    let Some(session_key) = session_key else {
+        return Ok(0);
+    };
+    db.lock()
+        .map_err(|_| anyhow::anyhow!("proxy DB unavailable"))?
+        .deny_pending_approvals_for_session(session_key, unix_secs_i64())
+        .map_err(|_| anyhow::anyhow!("proxy session cleanup failed"))
 }
 
 /// claude/codex hook 수신: `--db <path> --event <needs-input|clear>`, 세션은 env
@@ -377,5 +400,40 @@ mod tests {
             config.env_credentials,
             vec![("TOKEN".to_owned(), "credential-logical".to_owned())]
         );
+    }
+
+    #[test]
+    fn normal_proxy_exit_cleanup은_exact_session_pending만_deny한다() {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-proxy-exit-cleanup-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite3");
+        let db = Arc::new(Mutex::new(storage::Db::open(&path).unwrap()));
+        let target = "315f68b6-333f-409f-a2c5-922b9eacfd7e:1";
+        let other = "315f68b6-333f-409f-a2c5-922b9eacfd7e:2";
+        for (id, session) in [("target", target), ("other", other)] {
+            db.lock()
+                .unwrap()
+                .insert_pending_approval(id, "server", "tool", "{}", None, 1, Some(session))
+                .unwrap();
+        }
+
+        assert_eq!(deny_proxy_session_pending(&db, Some(target)).unwrap(), 1);
+        assert_eq!(
+            db.lock().unwrap().poll_approval("target").unwrap().status,
+            storage::ApprovalStatus::Denied
+        );
+        assert_eq!(
+            db.lock().unwrap().poll_approval("other").unwrap().status,
+            storage::ApprovalStatus::Pending
+        );
+        assert_eq!(deny_proxy_session_pending(&db, Some(target)).unwrap(), 0);
+        assert_eq!(deny_proxy_session_pending(&db, None).unwrap(), 0);
+
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -1089,6 +1089,17 @@ mod tests {
         (dir, Arc::new(Mutex::new(db)))
     }
 
+    fn stage_secret_slot(
+        db: &Arc<Mutex<storage::Db>>,
+        logical: &LogicalCredentialId,
+        slot: &PhysicalSecretSlot,
+    ) {
+        db.lock()
+            .unwrap()
+            .register_physical_secret_slot_staging(logical.as_str(), slot.as_str())
+            .unwrap();
+    }
+
     fn read_http_json(stream: &mut TcpStream) -> Option<Value> {
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
         let mut bytes = Vec::new();
@@ -1242,6 +1253,7 @@ mod tests {
             })
             .unwrap();
         let slot_one = PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        stage_secret_slot(&db, &logical, &slot_one);
         db.lock()
             .unwrap()
             .rotate_credential_secret_slot(logical.as_str(), slot_one.as_str(), "{}", None)
@@ -1292,6 +1304,7 @@ mod tests {
 
         let slot_two = PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
         store.seed(slot_two.as_str(), "access-token-generation-two");
+        stage_secret_slot(&db, &logical, &slot_two);
         db.lock()
             .unwrap()
             .rotate_credential_secret_slot(logical.as_str(), slot_two.as_str(), "{}", None)
@@ -1334,6 +1347,7 @@ mod tests {
             .unwrap();
         let own_slot = PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
         let other_slot = PhysicalSecretSlot::with_version(&other, uuid::Uuid::new_v4());
+        stage_secret_slot(&db, &logical, &own_slot);
         db.lock()
             .unwrap()
             .rotate_credential_secret_slot(logical.as_str(), own_slot.as_str(), "{}", None)
@@ -1416,6 +1430,7 @@ mod tests {
                 workspace_id: None,
             })
             .unwrap();
+        stage_secret_slot(&db, &logical, &slot);
         db.lock()
             .unwrap()
             .rotate_credential_secret_slot(logical.as_str(), slot.as_str(), "{}", None)

@@ -23,6 +23,7 @@ use secret::RedactionService;
 use serde_json::Value;
 use storage::{ActiveAuthorizationOwner, ApprovalStatus, Db};
 
+use crate::approval_notify::ApprovalWakeNotifier;
 #[cfg(test)]
 use crate::session::ConfigRevision;
 use crate::session::{BackendClient, BackendVersion};
@@ -128,6 +129,7 @@ pub struct ProxyAuthorizationExecutor {
     approval_timeout: Duration,
     backend: Arc<dyn ToolBackend>,
     pane_id: Option<String>,
+    approval_notifier: Option<Arc<dyn ApprovalWakeNotifier>>,
     pending_outcome: RefCell<Option<PendingOutcome>>,
     counters: Rc<StageCounters>,
     #[cfg(test)]
@@ -137,7 +139,7 @@ pub struct ProxyAuthorizationExecutor {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn authorized_proxy_executor(
+pub(crate) fn authorized_proxy_executor(
     db: Arc<Mutex<Db>>,
     owner: ActiveAuthorizationOwner,
     server_id: String,
@@ -146,6 +148,7 @@ pub fn authorized_proxy_executor(
     approval_timeout: Duration,
     backend: Arc<BackendClient>,
     pane_id: Option<String>,
+    approval_notifier: Option<Arc<dyn ApprovalWakeNotifier>>,
 ) -> ProxyAuthorizationExecutor {
     ProxyAuthorizationExecutor {
         db,
@@ -156,6 +159,7 @@ pub fn authorized_proxy_executor(
         approval_timeout,
         backend,
         pane_id,
+        approval_notifier,
         pending_outcome: RefCell::new(None),
         counters: Rc::new(StageCounters::default()),
         #[cfg(test)]
@@ -260,6 +264,16 @@ impl ProxyAuthorizationExecutor {
         self.counters
             .approval
             .set(self.counters.approval.get().saturating_add(1));
+        if self
+            .approval_notifier
+            .as_ref()
+            .is_some_and(|notifier| notifier.notify().is_err())
+        {
+            if let Ok(db) = self.db.lock() {
+                let _ = db.resolve_approval(pending.operation_id(), false, false, unix_secs_i64());
+            }
+            return pending.resolve(ApprovalDecision::DenyOnce);
+        }
 
         let deadline = Instant::now() + self.approval_timeout;
         loop {
@@ -579,6 +593,8 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    #[cfg(unix)]
+    use crate::approval_notify::UnixDatagramApprovalNotifier;
 
     const SCHEMA_A: &str = r#"{"type":"object","properties":{"value":{"type":"string"}}}"#;
     const SCHEMA_B: &str = r#"{"type":"object","properties":{"value":{"type":"number"}}}"#;
@@ -672,6 +688,60 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct CountingNotifier {
+        sends: AtomicUsize,
+    }
+
+    impl ApprovalWakeNotifier for CountingNotifier {
+        fn notify(&self) -> anyhow::Result<()> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct ResolvingNotifier {
+        db: Arc<Mutex<Db>>,
+        sends: AtomicUsize,
+        durable_operation_ids: Mutex<Vec<String>>,
+    }
+
+    impl ResolvingNotifier {
+        fn new(db: Arc<Mutex<Db>>) -> Arc<Self> {
+            Arc::new(Self {
+                db,
+                sends: AtomicUsize::new(0),
+                durable_operation_ids: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl ApprovalWakeNotifier for ResolvingNotifier {
+        fn notify(&self) -> anyhow::Result<()> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            let db = self
+                .db
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test approval DB unavailable"))?;
+            let pending = db.list_pending_approvals()?;
+            anyhow::ensure!(
+                pending.len() == 1,
+                "wake must observe exactly one durable pending approval"
+            );
+            self.durable_operation_ids
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test operation id lock unavailable"))?
+                .push(pending[0].id.clone());
+            db.resolve_approval(&pending[0].id, true, false, unix_secs_i64())
+        }
+    }
+
+    fn attach_counting_notifier(context: &mut TestContext) -> Arc<CountingNotifier> {
+        let notifier = Arc::new(CountingNotifier::default());
+        context.executor.approval_notifier = Some(notifier.clone());
+        notifier
+    }
+
     struct TestContext {
         dir: PathBuf,
         path: PathBuf,
@@ -747,6 +817,7 @@ mod tests {
                 approval_timeout: Duration::from_secs(2),
                 backend: backend.clone(),
                 pane_id: Some("workspace:session".to_owned()),
+                approval_notifier: None,
                 pending_outcome: RefCell::new(None),
                 counters: Rc::new(StageCounters::default()),
                 fail_post_preflight_parse: Cell::new(false),
@@ -870,10 +941,11 @@ mod tests {
     #[test]
     fn invalid_arguments는_authorization_audit_backend를_전부_건너뛴다() {
         let schema_hash = audit::schema_hash(SCHEMA_A);
-        let context = TestContext::new(
+        let mut context = TestContext::new(
             vec![vec![FakeBackend::tool("echo", SCHEMA_A)]],
             Some(("allow", Some(&schema_hash))),
         );
+        let notifier = attach_counting_notifier(&mut context);
         let mut input = String::new();
         for (id, arguments) in [Value::Null, json!([]), json!("string")]
             .into_iter()
@@ -890,18 +962,43 @@ mod tests {
         assert_eq!(counters.snapshot(), AuthorizationStageCounters::default());
         assert_eq!(context.backend.lists.load(Ordering::SeqCst), 0);
         assert_eq!(context.backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(notifier.sends.load(Ordering::SeqCst), 0);
         assert!(audit_rows(&context.path).is_empty());
         drop(context.db);
         std::fs::remove_dir_all(context.dir).unwrap();
     }
 
     #[test]
+    fn malformed_json_request는_approval_wake를_발생시키지_않는다() {
+        let mut context = TestContext::new(vec![vec![FakeBackend::tool("echo", SCHEMA_A)]], None);
+        let notifier = attach_counting_notifier(&mut context);
+        let backend = Arc::clone(&context.backend);
+        let db = Arc::clone(&context.db);
+        let mut output = Vec::new();
+
+        mcp::run_authorized_proxy(b"{not-json}\n".as_slice(), &mut output, context.executor)
+            .unwrap();
+
+        assert_eq!(notifier.sends.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.lists.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            db.lock()
+                .unwrap()
+                .list_pending_approvals()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn allow는_live_schema_permission_preflight_call_outcome을_정확히_한번씩_수행한다() {
         let schema_hash = audit::schema_hash(SCHEMA_A);
-        let context = TestContext::new(
+        let mut context = TestContext::new(
             vec![vec![FakeBackend::tool("echo", SCHEMA_A)]],
             Some(("allow", Some(&schema_hash))),
         );
+        let notifier = attach_counting_notifier(&mut context);
         let counters = Rc::clone(&context.counters);
         let backend = Arc::clone(&context.backend);
         let path = context.path.clone();
@@ -929,6 +1026,7 @@ mod tests {
             }
         );
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(notifier.sends.load(Ordering::SeqCst), 0);
         let rows = audit_rows(&path);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].lifecycle, "succeeded");
@@ -947,10 +1045,11 @@ mod tests {
 
     #[test]
     fn deny는_durable_denied를_남기고_external_call을_하지_않는다() {
-        let context = TestContext::new(
+        let mut context = TestContext::new(
             vec![vec![FakeBackend::tool("echo", SCHEMA_A)]],
             Some(("deny", None)),
         );
+        let notifier = attach_counting_notifier(&mut context);
         let backend = Arc::clone(&context.backend);
         let path = context.path.clone();
         let dir = context.dir.clone();
@@ -961,6 +1060,7 @@ mod tests {
             Some("permission_denied")
         );
         assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(notifier.sends.load(Ordering::SeqCst), 0);
         let rows = audit_rows(&path);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].lifecycle, "denied");
@@ -1027,6 +1127,116 @@ mod tests {
         assert_eq!(audit_rows(&path)[0].lifecycle, "denied");
         drop(db);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ask는_durable_insert후_payload_free_wake를_정확히_한번씩_보낸다() {
+        let mut context = TestContext::new(vec![vec![FakeBackend::tool("echo", SCHEMA_A)]], None);
+        let notifier = ResolvingNotifier::new(Arc::clone(&context.db));
+        context.executor.approval_notifier = Some(notifier.clone());
+
+        let backend = Arc::clone(&context.backend);
+        let input = format!("{}{}", call_line(1, json!({})), call_line(2, json!({})));
+        let responses = run_lines(context.executor, input);
+        let operation_ids = notifier.durable_operation_ids.lock().unwrap();
+
+        assert_eq!(responses.len(), 2);
+        assert!(
+            responses
+                .iter()
+                .all(|response| response.pointer("/result/isError") == Some(&Value::Bool(false)))
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(notifier.sends.load(Ordering::SeqCst), 2);
+        assert_eq!(operation_ids.len(), 2);
+        assert_ne!(operation_ids[0], operation_ids[1]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_notify_socket은_pending을_deny하고_external_call을_막는다() {
+        let mut context = TestContext::new(vec![vec![FakeBackend::tool("echo", SCHEMA_A)]], None);
+        let missing = PathBuf::from(format!(
+            "/tmp/daw-missing-{}.sock",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        context.executor.approval_notifier = Some(Arc::new(
+            UnixDatagramApprovalNotifier::new(missing).unwrap(),
+        ));
+        let backend = Arc::clone(&context.backend);
+        let db = Arc::clone(&context.db);
+        let path = context.path.clone();
+        let responses = run_lines(context.executor, call_line(1, json!({})));
+
+        assert_eq!(
+            response_error_code(&responses[0]),
+            Some("permission_denied")
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            db.lock()
+                .unwrap()
+                .list_pending_approvals()
+                .unwrap()
+                .is_empty()
+        );
+        let denied: i64 = rusqlite::Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM pending_approvals WHERE status = 'denied'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(denied, 1, "failed delivery must terminate the durable row");
+    }
+
+    #[test]
+    fn pending_insert_failure는_wake와_external_call을_모두_막는다() {
+        let mut context = TestContext::new(vec![vec![FakeBackend::tool("echo", SCHEMA_A)]], None);
+        let notifier = attach_counting_notifier(&mut context);
+        let conn = rusqlite::Connection::open(&context.path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_pending_insert BEFORE INSERT ON pending_approvals
+             BEGIN SELECT RAISE(ABORT, 'injected pending insert failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+        let backend = Arc::clone(&context.backend);
+        let responses = run_lines(context.executor, call_line(1, json!({})));
+
+        assert_eq!(
+            response_error_code(&responses[0]),
+            Some("permission_denied")
+        );
+        assert_eq!(notifier.sends.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn policy_allow_preflight_failure는_wake와_external_call을_모두_막는다() {
+        let schema_hash = audit::schema_hash(SCHEMA_A);
+        let mut context = TestContext::new(
+            vec![vec![FakeBackend::tool("echo", SCHEMA_A)]],
+            Some(("allow", Some(&schema_hash))),
+        );
+        let notifier = attach_counting_notifier(&mut context);
+        let conn = rusqlite::Connection::open(&context.path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_policy_preflight BEFORE INSERT ON tool_audit_logs
+             BEGIN SELECT RAISE(ABORT, 'injected policy preflight failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+        let backend = Arc::clone(&context.backend);
+        let responses = run_lines(context.executor, call_line(1, json!({})));
+
+        assert_eq!(
+            response_error_code(&responses[0]),
+            Some("audit_unavailable")
+        );
+        assert_eq!(notifier.sends.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

@@ -3,11 +3,14 @@
 //!   --server <mcp_server_id>     프론트할 백엔드 MCP 서버 id
 //!   --poll-ms <n>                승인 폴링 간격 (기본 200ms)
 //!   --approval-timeout-secs <n>  Ask 승인 대기 상한 (기본 120s)
+//!   --approval-notify-socket <p> 새 durable Ask를 알릴 optional local datagram socket
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+
+use crate::approval_notify::UnixDatagramApprovalNotifier;
 
 /// 파싱된 실행 설정.
 pub struct Cli {
@@ -15,6 +18,7 @@ pub struct Cli {
     pub server_id: String,
     pub poll_interval: Duration,
     pub approval_timeout: Duration,
+    pub approval_notifier: Option<UnixDatagramApprovalNotifier>,
 }
 
 const DEFAULT_POLL_MS: u64 = 200;
@@ -39,6 +43,7 @@ impl Cli {
         let mut server_id: Option<String> = None;
         let mut poll_ms = DEFAULT_POLL_MS;
         let mut approval_timeout_secs = DEFAULT_APPROVAL_TIMEOUT_SECS;
+        let mut approval_notifier = None;
 
         while let Some(flag) = args.next() {
             match flag.as_str() {
@@ -53,6 +58,11 @@ impl Cli {
                     approval_timeout_secs = value(&mut args, "--approval-timeout-secs")?
                         .parse()
                         .context("--approval-timeout-secs는 정수여야 함")?;
+                }
+                "--approval-notify-socket" => {
+                    approval_notifier = Some(UnixDatagramApprovalNotifier::new(PathBuf::from(
+                        value(&mut args, "--approval-notify-socket")?,
+                    ))?);
                 }
                 other => bail!("알 수 없는 인자: {other}"),
             }
@@ -71,6 +81,7 @@ impl Cli {
             server_id,
             poll_interval: Duration::from_millis(poll_ms),
             approval_timeout: Duration::from_secs(approval_timeout_secs),
+            approval_notifier,
         })
     }
 }
@@ -102,6 +113,7 @@ mod tests {
             cli.approval_timeout,
             Duration::from_secs(DEFAULT_APPROVAL_TIMEOUT_SECS)
         );
+        assert!(cli.approval_notifier.is_none());
     }
 
     #[test]
@@ -119,6 +131,21 @@ mod tests {
         .unwrap();
         assert_eq!(cli.poll_interval, Duration::from_millis(50));
         assert_eq!(cli.approval_timeout, Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approval_notify_socket은_optional_bounded_local_path다() {
+        let cli = Cli::parse(argv(&[
+            "--db",
+            "/tmp/x",
+            "--server",
+            "s",
+            "--approval-notify-socket",
+            "/tmp/deppy-approval.sock",
+        ]))
+        .unwrap();
+        assert!(cli.approval_notifier.is_some());
     }
 
     #[test]

@@ -81,3 +81,13 @@ Remaining development before final BG01 hardware approval is tracked in the hand
 app-server queues, bounded Git/local-LLM/Tailscale output, clipboard-cache limits, and latest-only
 agent-detection delivery. The 30-minute and Scenario A-E measurements remain deferred until those
 development changes freeze.
+
+## Second resource-wave update
+
+The bounded app-server, Git/worktree, local-LLM/Tailscale, clipboard-cache, and AppHost file-
+operation changes are now integrated and independently verified. The full app suite passes 720
+tests with five explicit hardware/external-resource ignores, logging policy passes 15/15, and the
+strict app/xtask, zero-allowlist, dependency, fmt, and diff gates are green. The only named
+development blocker from the preceding paragraph is now latest-only agent-detection delivery plus
+bounded detector process/file inputs; long-duration and Scenario A-E measurements remain deferred
+until that code freezes.

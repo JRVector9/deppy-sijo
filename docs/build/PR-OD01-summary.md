@@ -158,3 +158,22 @@ and timeout. Debug redacts title-like content, and no 30-minute measurement is i
 Focused status-feed tests pass 17/17 and notice-translation tests pass 11/11. The integrated app
 all-target check, strict Clippy, full rustfmt, diff-check, zero-allowlist boundary, and dependency
 gates pass.
+
+## App host and external-process resource closeout
+
+The remaining app-owned host pipelines now have explicit finite retention and shutdown rules.
+Recursive file operations admit at most 50,000 items, 4 GiB of streamed data, and depth 128, copy
+through one 64-KiB buffer, reject special files, and observe cancellation before publishing a
+temporary destination. Git and worktree commands share bounded stdout/stderr readers and process-
+group kill/reap/join cleanup; submodule discovery, slug probes, and exclude-file updates have
+operation-wide caps. Codex App Server handoffs are bounded to 8/64/16/1 items with fatal
+backpressure and bounded protocol projections. Local model discovery, Tailscale commands, and
+clipboard ingress/cache paths have explicit item, byte, time, file-count, and TTL ceilings.
+
+Root focused verification passes Git 12/12, worktree 27/27, app-server 35/35, local-LLM 10/10,
+Tailscale 16/16, clipboard-image 12/12 with one real-clipboard ignore, and AppHost 3/3. The full
+app suite passes 720 tests with five explicit hardware/external-resource ignores; logging policy
+passes 15/15. App and xtask all-target check, strict Clippy with `-D warnings`, xtask 9/9,
+zero-allowlist boundary, the 23-crate dependency DAG, full rustfmt, and diff-check pass. No
+30-minute or Scenario A-E measurement was performed; latest-only agent-detection delivery remains
+development work before the final hardware gate.

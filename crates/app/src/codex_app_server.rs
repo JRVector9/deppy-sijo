@@ -4,11 +4,13 @@
 //! speaks newline-delimited JSON-RPC and streams typed thread/turn/item events,
 //! which lets the UI render a real result table without altering terminal bytes.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 
@@ -21,6 +23,30 @@ use crate::agent_session::{
 };
 
 const MAX_BUFFERED_THREAD_STATUSES: usize = 64;
+const COMMAND_QUEUE_CAPACITY: usize = 8;
+const EVENT_QUEUE_CAPACITY: usize = 64;
+const INCOMING_QUEUE_CAPACITY: usize = 16;
+const INCOMING_DRAIN_PER_TICK: usize = 64;
+const REPLY_QUEUE_CAPACITY: usize = 1;
+const PREINITIALIZE_BACKLOG_CAPACITY: usize = 8;
+const MAX_PENDING_REQUESTS: usize = 32;
+const MAX_SERVER_REQUESTS: usize = 32;
+const MAX_TRACKED_SESSIONS: usize = 256;
+const MAX_COMMAND_SKILLS: usize = 64;
+const MAX_LIST_SKILL_CWDS: usize = 256;
+const MAX_CATALOG_ITEMS: usize = 4096;
+const MAX_REASONING_EFFORTS_PER_MODEL: usize = 64;
+const MAX_SKILL_GROUPS: usize = 256;
+const MAX_THREAD_RESULT_ITEMS: usize = 4096;
+const MAX_IDENTIFIER_BYTES: usize = 1024;
+const MAX_RETAINED_IDENTIFIER_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CLIENT_COMMAND_BYTES: usize = 256 * 1024;
+const MAX_EVENT_BYTES: usize = 256 * 1024;
+const MAX_STDOUT_LINE_BYTES: usize = 1024 * 1024;
+const MAX_STDERR_LINE_BYTES: usize = 16 * 1024;
+const EVENT_BACKPRESSURE_ERROR: &str = "resource_backpressure:event_queue_full";
+const COMMAND_BACKPRESSURE_ERROR: &str = "resource_backpressure:command_queue_full";
+const REQUEST_BACKPRESSURE_ERROR: &str = "resource_backpressure:request_limit";
 
 /// Configuration for one local App Server connection.
 // Clone 미파생: llm_api_key(SecretString)는 평문 복제를 만들지 않는다 (사용처도 없음).
@@ -207,11 +233,172 @@ pub enum CodexAppServerEvent {
     ConnectionStopped,
 }
 
+/// Capacity-limited UI event handoff. The worker never waits for a render
+/// consumer: adjacent deltas/statuses coalesce, while a full non-coalescible
+/// backlog fails the transport closed instead of growing or silently losing a
+/// lifecycle/approval event.
+#[derive(Debug, Default)]
+struct EventBacklog {
+    queue: Mutex<VecDeque<CodexAppServerEvent>>,
+    overflowed: AtomicBool,
+    overflow_reported: AtomicBool,
+}
+
+impl EventBacklog {
+    fn push(&self, event: CodexAppServerEvent) -> bool {
+        if event_retained_bytes(&event) > MAX_EVENT_BYTES {
+            self.overflowed.store(true, Ordering::Release);
+            return false;
+        }
+        let mut queue = lock_unpoisoned(&self.queue);
+        if coalesce_event(queue.back_mut(), &event) {
+            return true;
+        }
+        if queue.len() == EVENT_QUEUE_CAPACITY {
+            self.overflowed.store(true, Ordering::Release);
+            return false;
+        }
+        queue.push_back(event);
+        true
+    }
+
+    fn drain(&self) -> Vec<CodexAppServerEvent> {
+        let mut queue = lock_unpoisoned(&self.queue);
+        let mut events = queue.drain(..).collect::<Vec<_>>();
+        drop(queue);
+        if self.overflowed.load(Ordering::Acquire)
+            && !self.overflow_reported.swap(true, Ordering::AcqRel)
+        {
+            events.push(CodexAppServerEvent::TransportError {
+                message: EVENT_BACKPRESSURE_ERROR.to_owned(),
+            });
+            events.push(CodexAppServerEvent::ConnectionStopped);
+        }
+        events
+    }
+
+    fn overflowed(&self) -> bool {
+        self.overflowed.load(Ordering::Acquire)
+    }
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn coalesce_event(last: Option<&mut CodexAppServerEvent>, next: &CodexAppServerEvent) -> bool {
+    match (last, next) {
+        (
+            Some(CodexAppServerEvent::Session {
+                session_id: last_session,
+                event:
+                    AgentSessionEvent::ItemDelta {
+                        item_id: last_item,
+                        delta: last_delta,
+                    },
+            }),
+            CodexAppServerEvent::Session {
+                session_id: next_session,
+                event:
+                    AgentSessionEvent::ItemDelta {
+                        item_id: next_item,
+                        delta: next_delta,
+                    },
+            },
+        ) if last_session == next_session && last_item == next_item => {
+            let merged_bytes = last_session
+                .len()
+                .saturating_add(last_item.len())
+                .saturating_add(last_delta.len())
+                .saturating_add(next_delta.len());
+            if merged_bytes > MAX_EVENT_BYTES {
+                return false;
+            }
+            last_delta.push_str(next_delta);
+            true
+        }
+        (
+            Some(CodexAppServerEvent::Session {
+                session_id: last_session,
+                event:
+                    AgentSessionEvent::ThreadStatusChanged {
+                        status: last_status,
+                    },
+            }),
+            CodexAppServerEvent::Session {
+                session_id: next_session,
+                event:
+                    AgentSessionEvent::ThreadStatusChanged {
+                        status: next_status,
+                    },
+            },
+        ) if last_session == next_session => {
+            *last_status = *next_status;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn event_retained_bytes(event: &CodexAppServerEvent) -> usize {
+    // Debug is never used here because it can expose command/output text.
+    match event {
+        CodexAppServerEvent::Session { session_id, event } => session_id
+            .len()
+            .saturating_add(session_event_retained_bytes(event)),
+        CodexAppServerEvent::TransportError { message } => message.len(),
+        CodexAppServerEvent::ConnectionStopped => 0,
+    }
+}
+
+fn session_event_retained_bytes(event: &AgentSessionEvent) -> usize {
+    match event {
+        AgentSessionEvent::ThreadStarted { thread_id } => thread_id.len(),
+        AgentSessionEvent::TurnStarted { turn_id } => turn_id.len(),
+        AgentSessionEvent::ItemStarted { item } | AgentSessionEvent::ItemCompleted { item } => item
+            .id
+            .len()
+            .saturating_add(item.status.as_ref().map_or(0, String::len))
+            .saturating_add(item.summary.len())
+            .saturating_add(item.location.as_ref().map_or(0, String::len))
+            .saturating_add(item.detail.as_ref().map_or(0, String::len))
+            .saturating_add(item.output.len())
+            .saturating_add(item.files.iter().fold(0usize, |bytes, file| {
+                bytes
+                    .saturating_add(file.path.len())
+                    .saturating_add(file.kind.len())
+                    .saturating_add(file.diff.as_ref().map_or(0, String::len))
+            })),
+        AgentSessionEvent::ItemDelta { item_id, delta } => {
+            item_id.len().saturating_add(delta.len())
+        }
+        AgentSessionEvent::ApprovalRequested { approval } => approval
+            .request_key
+            .len()
+            .saturating_add(approval.thread_id.len())
+            .saturating_add(approval.turn_id.len())
+            .saturating_add(approval.item_id.len())
+            .saturating_add(approval.reason.as_ref().map_or(0, String::len))
+            .saturating_add(approval.command.as_ref().map_or(0, String::len))
+            .saturating_add(approval.cwd.as_ref().map_or(0, String::len)),
+        AgentSessionEvent::ApprovalResolved { request_key } => request_key.len(),
+        AgentSessionEvent::TurnCompleted { status }
+        | AgentSessionEvent::ControlError { message: status }
+        | AgentSessionEvent::Failed { message: status } => status.len(),
+        AgentSessionEvent::ConnectionReady
+        | AgentSessionEvent::ThreadStatusChanged { .. }
+        | AgentSessionEvent::Stopped => 0,
+    }
+}
+
 /// A running local App Server process. It owns one writer worker and two reader
 /// threads; all JSON-RPC writes occur on the worker to preserve message order.
 pub struct CodexAppServerClient {
-    commands: Sender<ClientCommand>,
-    events: Receiver<CodexAppServerEvent>,
+    commands: SyncSender<ClientCommand>,
+    events: Arc<EventBacklog>,
+    stop_requested: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
     /// chat wire 변환 프록시 (PR-L5) — client 수명에 묶여 shutdown/Drop 시 종료.
     llm_proxy: Option<crate::llm_proxy::LlmProxyHandle>,
@@ -290,6 +477,7 @@ impl CodexAppServerClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        configure_process_group(&mut command);
         // custom + 키 존재 시에만 env 주입 (PR-L4). Command::env는 부모 env를 그대로
         // 상속한 위에 이 var 하나만 더한다 — env_clear 전체 재구성이 아니다.
         if let (Some(CodexLlmOverride::Custom { .. }), Some(key)) =
@@ -297,46 +485,57 @@ impl CodexAppServerClient {
         {
             command.env(CODEX_LLM_API_KEY_ENV, key.expose());
         }
-        let mut child = command.spawn().with_context(|| {
+        let child = command.spawn().with_context(|| {
             format!(
                 "Codex App Server 실행 실패: {} app-server --listen stdio://",
                 options.executable.to_string_lossy()
             )
         })?;
+        let mut child = ChildTreeGuard::new(child);
         let stdin = child
+            .child_mut()
             .stdin
             .take()
             .context("Codex App Server stdin을 열 수 없음")?;
         let stdout = child
+            .child_mut()
             .stdout
             .take()
             .context("Codex App Server stdout을 열 수 없음")?;
         let stderr = child
+            .child_mut()
             .stderr
             .take()
             .context("Codex App Server stderr을 열 수 없음")?;
 
-        let (commands_tx, commands_rx) = mpsc::channel();
-        let (events_tx, events_rx) = mpsc::channel();
+        let (commands_tx, commands_rx) = mpsc::sync_channel(COMMAND_QUEUE_CAPACITY);
+        let events = Arc::new(EventBacklog::default());
+        let stop_requested = Arc::new(AtomicBool::new(false));
         let worker = thread::Builder::new()
             .name("codex-app-server".to_owned())
-            .spawn(move || {
-                worker_loop(
-                    child,
-                    stdin,
-                    stdout,
-                    stderr,
-                    options,
-                    commands_rx,
-                    events_tx,
-                    repaint,
-                )
+            .spawn({
+                let events = Arc::clone(&events);
+                let stop_requested = Arc::clone(&stop_requested);
+                move || {
+                    worker_loop(
+                        child,
+                        stdin,
+                        stdout,
+                        stderr,
+                        options,
+                        commands_rx,
+                        events,
+                        stop_requested,
+                        repaint,
+                    )
+                }
             })
             .context("Codex App Server 워커 생성 실패")?;
 
         Ok(Self {
             commands: commands_tx,
-            events: events_rx,
+            events,
+            stop_requested,
             worker: Some(worker),
             llm_proxy,
         })
@@ -403,7 +602,7 @@ impl CodexAppServerClient {
         limit: Option<u32>,
         include_hidden: bool,
     ) -> anyhow::Result<CodexModelCatalogReply> {
-        let (reply, receiver) = mpsc::channel();
+        let (reply, receiver) = mpsc::sync_channel(REPLY_QUEUE_CAPACITY);
         self.send(ClientCommand::ListModels {
             cursor,
             limit,
@@ -418,7 +617,7 @@ impl CodexAppServerClient {
         cwds: Vec<String>,
         force_reload: bool,
     ) -> anyhow::Result<CodexSkillCatalogReply> {
-        let (reply, receiver) = mpsc::channel();
+        let (reply, receiver) = mpsc::sync_channel(REPLY_QUEUE_CAPACITY);
         self.send(ClientCommand::ListSkills {
             cwds,
             force_reload,
@@ -455,7 +654,7 @@ impl CodexAppServerClient {
         limit: Option<u32>,
         archived: bool,
     ) -> anyhow::Result<CodexAppServerReply> {
-        let (reply, receiver) = mpsc::channel();
+        let (reply, receiver) = mpsc::sync_channel(REPLY_QUEUE_CAPACITY);
         self.send(ClientCommand::ListThreads {
             cursor,
             limit,
@@ -471,7 +670,7 @@ impl CodexAppServerClient {
         thread_id: String,
         include_turns: bool,
     ) -> anyhow::Result<CodexAppServerReply> {
-        let (reply, receiver) = mpsc::channel();
+        let (reply, receiver) = mpsc::sync_channel(REPLY_QUEUE_CAPACITY);
         self.send(ClientCommand::ReadThread {
             thread_id,
             include_turns,
@@ -489,7 +688,7 @@ impl CodexAppServerClient {
         cwd: Option<String>,
         model: Option<String>,
     ) -> anyhow::Result<CodexAppServerReply> {
-        let (reply, receiver) = mpsc::channel();
+        let (reply, receiver) = mpsc::sync_channel(REPLY_QUEUE_CAPACITY);
         self.send(ClientCommand::ResumeThread {
             session_id,
             thread_id,
@@ -502,7 +701,7 @@ impl CodexAppServerClient {
 
     #[allow(dead_code)] // PR-06 phase 2 wires the history UI consumer.
     pub fn archive_thread(&self, thread_id: String) -> anyhow::Result<CodexAppServerReply> {
-        let (reply, receiver) = mpsc::channel();
+        let (reply, receiver) = mpsc::sync_channel(REPLY_QUEUE_CAPACITY);
         self.send(ClientCommand::ArchiveThread { thread_id, reply })?;
         Ok(receiver)
     }
@@ -510,11 +709,11 @@ impl CodexAppServerClient {
     /// Drain without blocking; worker-side repaint requests make the next frame
     /// arrive when App Server output lands.
     pub fn drain_events(&self) -> Vec<CodexAppServerEvent> {
-        self.events.try_iter().collect()
+        self.events.drain()
     }
 
     pub fn shutdown(&mut self) {
-        let _ = self.commands.send(ClientCommand::Shutdown);
+        self.stop_requested.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -523,9 +722,105 @@ impl CodexAppServerClient {
     }
 
     fn send(&self, command: ClientCommand) -> anyhow::Result<()> {
-        self.commands
-            .send(command)
-            .map_err(|_| anyhow::anyhow!("Codex App Server 연결이 이미 종료되었습니다"))
+        anyhow::ensure!(
+            command_retained_bytes(&command) <= MAX_CLIENT_COMMAND_BYTES,
+            "resource_limit:command_too_large"
+        );
+        anyhow::ensure!(
+            command_item_count_is_valid(&command),
+            "resource_limit:command_items"
+        );
+        anyhow::ensure!(
+            command_identifiers_are_valid(&command),
+            "resource_limit:identifier"
+        );
+        match self.commands.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(anyhow::anyhow!(COMMAND_BACKPRESSURE_ERROR)),
+            Err(TrySendError::Disconnected(_)) => Err(anyhow::anyhow!(
+                "Codex App Server 연결이 이미 종료되었습니다"
+            )),
+        }
+    }
+}
+
+fn configure_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    #[cfg(not(unix))]
+    let _ = command;
+}
+
+fn terminate_child_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        // SAFETY: spawn always places this child in its own process group, so
+        // its pid is the pgid until every descendant is gone. Kill the group
+        // before reaping the leader; this avoids signaling a reused pid.
+        unsafe {
+            libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[derive(Debug)]
+struct ChildTreeGuard {
+    child: Option<Child>,
+}
+
+impl ChildTreeGuard {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("child guard is active")
+    }
+
+    fn terminate(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            terminate_child_tree(&mut child);
+        }
+    }
+
+    fn leader_exited_without_reap(&mut self) -> io::Result<bool> {
+        #[cfg(unix)]
+        {
+            let child_id = self.child_mut().id() as libc::id_t;
+            let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+            // SAFETY: `info` points to writable siginfo storage. WNOWAIT keeps
+            // an exited leader waitable, so the pgid cannot be reused before
+            // `terminate` kills the group and reaps the direct child.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    child_id,
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: waitid initialized `info` on success; si_pid is zero
+            // when WNOHANG found no waitable state change.
+            Ok(unsafe { info.assume_init().si_pid() } != 0)
+        }
+        #[cfg(not(unix))]
+        {
+            self.child_mut().try_wait().map(|status| status.is_some())
+        }
+    }
+}
+
+impl Drop for ChildTreeGuard {
+    fn drop(&mut self) {
+        self.terminate();
     }
 }
 
@@ -571,13 +866,13 @@ enum ClientCommand {
         cursor: Option<String>,
         limit: Option<u32>,
         archived: bool,
-        reply: Sender<anyhow::Result<Value>>,
+        reply: SyncSender<anyhow::Result<Value>>,
     },
     #[allow(dead_code)] // Constructed by the phase-2 public API consumer.
     ReadThread {
         thread_id: String,
         include_turns: bool,
-        reply: Sender<anyhow::Result<Value>>,
+        reply: SyncSender<anyhow::Result<Value>>,
     },
     #[allow(dead_code)] // Constructed by the phase-2 public API consumer.
     ResumeThread {
@@ -585,32 +880,151 @@ enum ClientCommand {
         thread_id: String,
         cwd: Option<String>,
         model: Option<String>,
-        reply: Sender<anyhow::Result<Value>>,
+        reply: SyncSender<anyhow::Result<Value>>,
     },
     #[allow(dead_code)] // Constructed by the phase-2 public API consumer.
     ArchiveThread {
         thread_id: String,
-        reply: Sender<anyhow::Result<Value>>,
+        reply: SyncSender<anyhow::Result<Value>>,
     },
     ListModels {
         cursor: Option<String>,
         limit: Option<u32>,
         include_hidden: bool,
-        reply: Sender<anyhow::Result<CodexModelCatalogPage>>,
+        reply: SyncSender<anyhow::Result<CodexModelCatalogPage>>,
     },
     ListSkills {
         cwds: Vec<String>,
         force_reload: bool,
-        reply: Sender<anyhow::Result<Vec<CodexSkillInfo>>>,
+        reply: SyncSender<anyhow::Result<Vec<CodexSkillInfo>>>,
     },
-    Shutdown,
+}
+
+fn command_retained_bytes(command: &ClientCommand) -> usize {
+    fn option_bytes(value: &Option<String>) -> usize {
+        value.as_ref().map_or(0, String::len)
+    }
+
+    fn skill_bytes(skills: &[AgentSkillSelection]) -> usize {
+        skills.iter().fold(0usize, |bytes, skill| {
+            bytes
+                .saturating_add(skill.name.len())
+                .saturating_add(skill.path.len())
+        })
+    }
+
+    match command {
+        ClientCommand::StartSession {
+            session_id,
+            prompt,
+            cwd,
+            model,
+            effort,
+            skills,
+        }
+        | ClientCommand::SubmitTurn {
+            session_id,
+            prompt,
+            cwd,
+            model,
+            effort,
+            skills,
+        } => session_id
+            .len()
+            .saturating_add(prompt.len())
+            .saturating_add(option_bytes(cwd))
+            .saturating_add(option_bytes(model))
+            .saturating_add(option_bytes(effort))
+            .saturating_add(skill_bytes(skills)),
+        ClientCommand::SteerTurn {
+            session_id,
+            prompt,
+            skills,
+        } => session_id
+            .len()
+            .saturating_add(prompt.len())
+            .saturating_add(skill_bytes(skills)),
+        ClientCommand::Interrupt { session_id } => session_id.len(),
+        ClientCommand::RespondApproval {
+            session_id,
+            request_key,
+            ..
+        } => session_id.len().saturating_add(request_key.len()),
+        ClientCommand::ListThreads { cursor, .. } => option_bytes(cursor),
+        ClientCommand::ReadThread { thread_id, .. }
+        | ClientCommand::ArchiveThread { thread_id, .. } => thread_id.len(),
+        ClientCommand::ResumeThread {
+            session_id,
+            thread_id,
+            cwd,
+            model,
+            ..
+        } => session_id
+            .len()
+            .saturating_add(thread_id.len())
+            .saturating_add(option_bytes(cwd))
+            .saturating_add(option_bytes(model)),
+        ClientCommand::ListModels { cursor, .. } => option_bytes(cursor),
+        ClientCommand::ListSkills { cwds, .. } => cwds
+            .iter()
+            .fold(0usize, |bytes, cwd| bytes.saturating_add(cwd.len())),
+    }
+}
+
+fn command_creates_pending_request(command: &ClientCommand) -> bool {
+    !matches!(command, ClientCommand::RespondApproval { .. })
+}
+
+fn command_item_count_is_valid(command: &ClientCommand) -> bool {
+    match command {
+        ClientCommand::StartSession { skills, .. }
+        | ClientCommand::SubmitTurn { skills, .. }
+        | ClientCommand::SteerTurn { skills, .. } => skills.len() <= MAX_COMMAND_SKILLS,
+        ClientCommand::ListSkills { cwds, .. } => cwds.len() <= MAX_LIST_SKILL_CWDS,
+        _ => true,
+    }
+}
+
+fn command_identifiers_are_valid(command: &ClientCommand) -> bool {
+    match command {
+        ClientCommand::StartSession { session_id, .. }
+        | ClientCommand::SubmitTurn { session_id, .. }
+        | ClientCommand::SteerTurn { session_id, .. }
+        | ClientCommand::Interrupt { session_id } => valid_identifier(session_id),
+        ClientCommand::RespondApproval {
+            session_id,
+            request_key,
+            ..
+        } => valid_identifier(session_id) && valid_identifier(request_key),
+        ClientCommand::ReadThread { thread_id, .. }
+        | ClientCommand::ArchiveThread { thread_id, .. } => valid_identifier(thread_id),
+        ClientCommand::ResumeThread {
+            session_id,
+            thread_id,
+            ..
+        } => valid_identifier(session_id) && valid_identifier(thread_id),
+        ClientCommand::ListThreads { .. }
+        | ClientCommand::ListModels { .. }
+        | ClientCommand::ListSkills { .. } => true,
+    }
+}
+
+fn valid_identifier(value: &str) -> bool {
+    !value.is_empty() && value.len() <= MAX_IDENTIFIER_BYTES && !value.as_bytes().contains(&0)
+}
+
+fn preinitialize_backlog_len(state: &WorkerState) -> usize {
+    state
+        .queued_starts
+        .len()
+        .saturating_add(state.queued_rpc_commands.len())
 }
 
 #[derive(Debug)]
 enum ClientCommandReply {
-    Json(Sender<anyhow::Result<Value>>),
-    Models(Sender<anyhow::Result<CodexModelCatalogPage>>),
-    Skills(Sender<anyhow::Result<Vec<CodexSkillInfo>>>),
+    Json(SyncSender<anyhow::Result<Value>>),
+    Models(SyncSender<anyhow::Result<CodexModelCatalogPage>>),
+    Skills(SyncSender<anyhow::Result<Vec<CodexSkillInfo>>>),
 }
 
 impl ClientCommandReply {
@@ -623,11 +1037,12 @@ impl ClientCommandReply {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum Incoming {
     Json(Value),
     StdoutError(String),
-    Stderr(String),
+    StdoutClosed,
+    Stderr,
 }
 
 #[derive(Debug)]
@@ -652,26 +1067,26 @@ enum PendingRequest {
         expected_turn_id: String,
     },
     ListThreads {
-        reply: Sender<anyhow::Result<Value>>,
+        reply: SyncSender<anyhow::Result<Value>>,
     },
     ReadThread {
         thread_id: String,
-        reply: Sender<anyhow::Result<Value>>,
+        reply: SyncSender<anyhow::Result<Value>>,
     },
     ResumeThread {
         session_id: AgentSessionId,
         thread_id: String,
-        reply: Sender<anyhow::Result<Value>>,
+        reply: SyncSender<anyhow::Result<Value>>,
     },
     ArchiveThread {
         thread_id: String,
-        reply: Sender<anyhow::Result<Value>>,
+        reply: SyncSender<anyhow::Result<Value>>,
     },
     ListModels {
-        reply: Sender<anyhow::Result<CodexModelCatalogPage>>,
+        reply: SyncSender<anyhow::Result<CodexModelCatalogPage>>,
     },
     ListSkills {
-        reply: Sender<anyhow::Result<Vec<CodexSkillInfo>>>,
+        reply: SyncSender<anyhow::Result<Vec<CodexSkillInfo>>>,
     },
 }
 
@@ -717,33 +1132,109 @@ impl WorkerState {
         self.next_request_id += 1;
         Value::from(id)
     }
+
+    fn retained_identifier_bytes(&self) -> usize {
+        fn map_bytes(map: &HashMap<String, String>) -> usize {
+            map.iter().fold(0usize, |bytes, (key, value)| {
+                bytes.saturating_add(key.len()).saturating_add(value.len())
+            })
+        }
+
+        map_bytes(&self.thread_to_session)
+            .saturating_add(map_bytes(&self.session_to_thread))
+            .saturating_add(map_bytes(&self.session_to_turn))
+            .saturating_add(
+                self.buffered_thread_statuses
+                    .keys()
+                    .fold(0usize, |bytes, key| bytes.saturating_add(key.len())),
+            )
+            .saturating_add(
+                self.server_requests
+                    .iter()
+                    .fold(0usize, |bytes, (key, request)| {
+                        bytes
+                            .saturating_add(key.len())
+                            .saturating_add(request.session_id.len())
+                            .saturating_add(rpc_key(&request.id).len())
+                    }),
+            )
+            .saturating_add(
+                self.known_sessions
+                    .iter()
+                    .fold(0usize, |bytes, id| bytes.saturating_add(id.len())),
+            )
+    }
+
+    fn can_retain_identifier_bytes(&self, additional: usize) -> bool {
+        self.retained_identifier_bytes().saturating_add(additional) <= MAX_RETAINED_IDENTIFIER_BYTES
+    }
+
+    fn insert_turn(&mut self, session_id: &str, turn_id: &str) -> bool {
+        if !valid_identifier(session_id)
+            || !valid_identifier(turn_id)
+            || !self.can_retain_identifier_bytes(session_id.len().saturating_add(turn_id.len()))
+        {
+            return false;
+        }
+        self.session_to_turn
+            .insert(session_id.to_owned(), turn_id.to_owned());
+        true
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn worker_loop(
-    mut child: Child,
+    mut child: ChildTreeGuard,
     mut stdin: ChildStdin,
     stdout: ChildStdout,
     stderr: ChildStderr,
     options: CodexAppServerOptions,
     commands: Receiver<ClientCommand>,
-    events: Sender<CodexAppServerEvent>,
+    events: Arc<EventBacklog>,
+    stop_requested: Arc<AtomicBool>,
     repaint: egui::Context,
 ) {
-    let (incoming_tx, incoming_rx) = mpsc::channel();
-    let stdout_reader = spawn_stdout_reader(stdout, incoming_tx.clone());
-    let stderr_reader = spawn_stderr_reader(stderr, incoming_tx);
+    let (incoming_tx, incoming_rx) = mpsc::sync_channel(INCOMING_QUEUE_CAPACITY);
+    let stdout_reader = match spawn_stdout_reader(stdout, incoming_tx.clone()) {
+        Ok(reader) => reader,
+        Err(_) => {
+            emit_transport_error(
+                &events,
+                &repaint,
+                "transport_error:stdout_reader_spawn_failed".to_owned(),
+            );
+            child.terminate();
+            drop(incoming_rx);
+            emit(&events, &repaint, CodexAppServerEvent::ConnectionStopped);
+            return;
+        }
+    };
+    let stderr_reader = match spawn_stderr_reader(stderr, incoming_tx) {
+        Ok(reader) => reader,
+        Err(_) => {
+            emit_transport_error(
+                &events,
+                &repaint,
+                "transport_error:stderr_reader_spawn_failed".to_owned(),
+            );
+            child.terminate();
+            drop(incoming_rx);
+            let _ = stdout_reader.join();
+            emit(&events, &repaint, CodexAppServerEvent::ConnectionStopped);
+            return;
+        }
+    };
     let mut state = WorkerState {
         next_request_id: 1,
         ..Default::default()
     };
-    let mut last_stderr = String::new();
+    let mut stderr_seen = false;
 
-    if let Err(error) = send_initialize(&mut stdin, &mut state, &options) {
+    if send_initialize(&mut stdin, &mut state, &options).is_err() {
         emit_transport_error(
             &events,
             &repaint,
-            format!("Codex 초기화 전송 실패: {error:#}"),
+            "transport_error:initialize_send_failed".to_owned(),
         );
     } else {
         loop {
@@ -753,14 +1244,14 @@ fn worker_loop(
                 &mut state,
                 &events,
                 &repaint,
-                &mut last_stderr,
+                &mut stderr_seen,
             );
-            if state.stop_requested {
+            if state.stop_requested || stop_requested.load(Ordering::Acquire) || events.overflowed()
+            {
                 break;
             }
 
             match commands.recv_timeout(Duration::from_millis(20)) {
-                Ok(ClientCommand::Shutdown) => break,
                 Ok(command) => {
                     handle_client_command(command, &mut stdin, &mut state, &events, &repaint)
                 }
@@ -768,26 +1259,25 @@ fn worker_loop(
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
 
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let suffix = if last_stderr.trim().is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {}", one_line(&last_stderr, 400))
-                    };
+            match child.leader_exited_without_reap() {
+                Ok(true) => {
                     emit_transport_error(
                         &events,
                         &repaint,
-                        format!("Codex App Server가 종료되었습니다 ({status}){suffix}"),
+                        if stderr_seen {
+                            "transport_error:child_exited:stderr_present".to_owned()
+                        } else {
+                            "transport_error:child_exited".to_owned()
+                        },
                     );
                     break;
                 }
-                Ok(None) => {}
-                Err(error) => {
+                Ok(false) => {}
+                Err(_) => {
                     emit_transport_error(
                         &events,
                         &repaint,
-                        format!("Codex App Server 상태 확인 실패: {error}"),
+                        "transport_error:child_status_failed".to_owned(),
                     );
                     break;
                 }
@@ -798,10 +1288,8 @@ fn worker_loop(
     // Closing stdin requests a graceful shutdown first. If it does not exit
     // quickly, kill/reap prevents a detached helper from surviving app exit.
     drop(stdin);
-    if child.try_wait().ok().flatten().is_none() {
-        let _ = child.kill();
-    }
-    let _ = child.wait();
+    child.terminate();
+    drop(incoming_rx);
     let _ = stdout_reader.join();
     let _ = stderr_reader.join();
 
@@ -816,40 +1304,51 @@ fn worker_loop(
     emit(&events, &repaint, CodexAppServerEvent::ConnectionStopped);
 }
 
-fn spawn_stdout_reader(stdout: ChildStdout, tx: Sender<Incoming>) -> thread::JoinHandle<()> {
+fn spawn_stdout_reader(
+    stdout: ChildStdout,
+    tx: SyncSender<Incoming>,
+) -> io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("codex-app-server-stdout".to_owned())
         .spawn(move || read_json_lines(stdout, tx))
-        .expect("Codex App Server stdout reader 생성 실패")
 }
 
-fn spawn_stderr_reader(stderr: ChildStderr, tx: Sender<Incoming>) -> thread::JoinHandle<()> {
+fn spawn_stderr_reader(
+    stderr: ChildStderr,
+    tx: SyncSender<Incoming>,
+) -> io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("codex-app-server-stderr".to_owned())
         .spawn(move || read_stderr_lines(stderr, tx))
-        .expect("Codex App Server stderr reader 생성 실패")
 }
 
-fn read_json_lines(reader: impl Read, tx: Sender<Incoming>) {
-    for line in BufReader::new(reader).lines() {
-        match line {
-            Ok(line) if line.trim().is_empty() => {}
-            Ok(line) => match serde_json::from_str::<Value>(&line) {
+fn read_json_lines(reader: impl Read, tx: SyncSender<Incoming>) {
+    let mut reader = BufReader::new(reader);
+    loop {
+        match read_line_limited(&mut reader, MAX_STDOUT_LINE_BYTES) {
+            Ok(None) => {
+                let _ = tx.send(Incoming::StdoutClosed);
+                return;
+            }
+            Ok(Some(line)) if line.trim().is_empty() => {}
+            Ok(Some(line)) => match serde_json::from_str::<Value>(&line) {
                 Ok(value) => {
                     if tx.send(Incoming::Json(value)).is_err() {
                         return;
                     }
                 }
                 Err(error) => {
-                    let _ = tx.send(Incoming::StdoutError(format!(
-                        "Codex App Server JSONL 파싱 실패: {error}: {}",
-                        one_line(&line, 240)
-                    )));
+                    let _ = error;
+                    let _ = tx.send(Incoming::StdoutError(
+                        "protocol_error:invalid_json".to_owned(),
+                    ));
+                    return;
                 }
             },
             Err(error) => {
                 let _ = tx.send(Incoming::StdoutError(format!(
-                    "Codex App Server stdout 읽기 실패: {error}"
+                    "Codex App Server stdout 읽기 실패: {}",
+                    io_error_code(&error)
                 )));
                 return;
             }
@@ -857,11 +1356,52 @@ fn read_json_lines(reader: impl Read, tx: Sender<Incoming>) {
     }
 }
 
-fn read_stderr_lines(reader: impl Read, tx: Sender<Incoming>) {
-    for line in BufReader::new(reader).lines().map_while(Result::ok) {
-        if tx.send(Incoming::Stderr(line)).is_err() {
-            return;
+fn read_stderr_lines(reader: impl Read, tx: SyncSender<Incoming>) {
+    let mut reader = BufReader::new(reader);
+    loop {
+        match read_line_limited(&mut reader, MAX_STDERR_LINE_BYTES) {
+            Ok(Some(line)) => {
+                let _ = line;
+                if tx.send(Incoming::Stderr).is_err() {
+                    return;
+                }
+            }
+            Ok(None) | Err(_) => return,
         }
+    }
+}
+
+fn read_line_limited(reader: &mut impl BufRead, max_bytes: usize) -> io::Result<Option<String>> {
+    let mut bytes = Vec::with_capacity(max_bytes.min(8 * 1024));
+    let read = (&mut *reader)
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_until(b'\n', &mut bytes)?;
+    if read == 0 {
+        return Ok(None);
+    }
+
+    let has_newline = bytes.last() == Some(&b'\n');
+    if has_newline {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "line_too_large"));
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid_utf8"))
+}
+
+fn io_error_code(error: &io::Error) -> &'static str {
+    match error.kind() {
+        io::ErrorKind::InvalidData if error.to_string() == "line_too_large" => "line_too_large",
+        io::ErrorKind::InvalidData => "invalid_data",
+        io::ErrorKind::UnexpectedEof => "unexpected_eof",
+        io::ErrorKind::BrokenPipe => "broken_pipe",
+        _ => "io_error",
     }
 }
 
@@ -869,18 +1409,33 @@ fn drain_incoming(
     incoming: &Receiver<Incoming>,
     stdin: &mut ChildStdin,
     state: &mut WorkerState,
-    events: &Sender<CodexAppServerEvent>,
+    events: &EventBacklog,
     repaint: &egui::Context,
-    last_stderr: &mut String,
+    stderr_seen: &mut bool,
 ) {
-    loop {
+    for _ in 0..INCOMING_DRAIN_PER_TICK {
         match incoming.try_recv() {
             Ok(Incoming::Json(message)) => {
                 handle_server_message(message, stdin, state, events, repaint)
             }
-            Ok(Incoming::StdoutError(message)) => emit_transport_error(events, repaint, message),
-            Ok(Incoming::Stderr(line)) => append_limited(last_stderr, &line),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
+            Ok(Incoming::StdoutError(message)) => {
+                emit_transport_error(events, repaint, message);
+                state.stop_requested = true;
+            }
+            Ok(Incoming::StdoutClosed) => {
+                emit_transport_error(
+                    events,
+                    repaint,
+                    if *stderr_seen {
+                        "transport_error:stdout_closed:stderr_present".to_owned()
+                    } else {
+                        "transport_error:stdout_closed".to_owned()
+                    },
+                );
+                state.stop_requested = true;
+            }
+            Ok(Incoming::Stderr) => *stderr_seen = true,
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
         }
     }
 }
@@ -889,10 +1444,58 @@ fn handle_client_command(
     command: ClientCommand,
     stdin: &mut ChildStdin,
     state: &mut WorkerState,
-    events: &Sender<CodexAppServerEvent>,
+    events: &EventBacklog,
     repaint: &egui::Context,
 ) {
     let preserves_lifecycle_on_error = matches!(&command, ClientCommand::SteerTurn { .. });
+    let target = match &command {
+        ClientCommand::StartSession { session_id, .. }
+        | ClientCommand::SubmitTurn { session_id, .. }
+        | ClientCommand::SteerTurn { session_id, .. }
+        | ClientCommand::Interrupt { session_id }
+        | ClientCommand::RespondApproval { session_id, .. }
+        | ClientCommand::ResumeThread { session_id, .. } => Some(session_id.clone()),
+        ClientCommand::ListThreads { .. }
+        | ClientCommand::ReadThread { .. }
+        | ClientCommand::ArchiveThread { .. }
+        | ClientCommand::ListModels { .. }
+        | ClientCommand::ListSkills { .. } => None,
+    };
+    let rpc_reply = match &command {
+        ClientCommand::ListThreads { reply, .. }
+        | ClientCommand::ReadThread { reply, .. }
+        | ClientCommand::ResumeThread { reply, .. }
+        | ClientCommand::ArchiveThread { reply, .. } => {
+            Some(ClientCommandReply::Json(reply.clone()))
+        }
+        ClientCommand::ListModels { reply, .. } => Some(ClientCommandReply::Models(reply.clone())),
+        ClientCommand::ListSkills { reply, .. } => Some(ClientCommandReply::Skills(reply.clone())),
+        _ => None,
+    };
+    let queues_before_initialize = !state.initialized
+        && matches!(
+            &command,
+            ClientCommand::StartSession { .. }
+                | ClientCommand::ListThreads { .. }
+                | ClientCommand::ReadThread { .. }
+                | ClientCommand::ResumeThread { .. }
+                | ClientCommand::ArchiveThread { .. }
+                | ClientCommand::ListModels { .. }
+                | ClientCommand::ListSkills { .. }
+        );
+    if queues_before_initialize
+        && preinitialize_backlog_len(state) >= PREINITIALIZE_BACKLOG_CAPACITY
+    {
+        reject_client_command(
+            target,
+            rpc_reply,
+            events,
+            repaint,
+            REQUEST_BACKPRESSURE_ERROR,
+            preserves_lifecycle_on_error,
+        );
+        return;
+    }
     if !state.initialized
         && matches!(
             &command,
@@ -907,31 +1510,50 @@ fn handle_client_command(
         state.queued_rpc_commands.push(command);
         return;
     }
-    let target = match &command {
+    if command_creates_pending_request(&command) && state.pending.len() >= MAX_PENDING_REQUESTS {
+        reject_client_command(
+            target,
+            rpc_reply,
+            events,
+            repaint,
+            REQUEST_BACKPRESSURE_ERROR,
+            preserves_lifecycle_on_error,
+        );
+        return;
+    }
+    let adds_session = match &command {
         ClientCommand::StartSession { session_id, .. }
-        | ClientCommand::SubmitTurn { session_id, .. }
-        | ClientCommand::SteerTurn { session_id, .. }
-        | ClientCommand::Interrupt { session_id }
-        | ClientCommand::RespondApproval { session_id, .. }
-        | ClientCommand::ResumeThread { session_id, .. } => Some(session_id.clone()),
-        ClientCommand::ListThreads { .. }
-        | ClientCommand::ReadThread { .. }
-        | ClientCommand::ArchiveThread { .. }
-        | ClientCommand::ListModels { .. }
-        | ClientCommand::ListSkills { .. }
-        | ClientCommand::Shutdown => None,
-    };
-    let rpc_reply = match &command {
-        ClientCommand::ListThreads { reply, .. }
-        | ClientCommand::ReadThread { reply, .. }
-        | ClientCommand::ResumeThread { reply, .. }
-        | ClientCommand::ArchiveThread { reply, .. } => {
-            Some(ClientCommandReply::Json(reply.clone()))
+        | ClientCommand::ResumeThread { session_id, .. } => {
+            !state.known_sessions.contains(session_id)
         }
-        ClientCommand::ListModels { reply, .. } => Some(ClientCommandReply::Models(reply.clone())),
-        ClientCommand::ListSkills { reply, .. } => Some(ClientCommandReply::Skills(reply.clone())),
-        _ => None,
+        _ => false,
     };
+    if adds_session && state.known_sessions.len() >= MAX_TRACKED_SESSIONS {
+        reject_client_command(
+            target,
+            rpc_reply,
+            events,
+            repaint,
+            "resource_backpressure:session_limit",
+            preserves_lifecycle_on_error,
+        );
+        return;
+    }
+    if adds_session
+        && target
+            .as_ref()
+            .is_some_and(|session_id| !state.can_retain_identifier_bytes(session_id.len()))
+    {
+        reject_client_command(
+            target,
+            rpc_reply,
+            events,
+            repaint,
+            "resource_backpressure:identifier_bytes",
+            preserves_lifecycle_on_error,
+        );
+        return;
+    }
     let result = match command {
         ClientCommand::StartSession {
             session_id,
@@ -1007,11 +1629,10 @@ fn handle_client_command(
             force_reload,
             reply,
         } => request_skills_list(stdin, state, cwds, force_reload, reply),
-        ClientCommand::Shutdown => Ok(()),
     };
 
-    if let Err(error) = result {
-        let message = format!("Codex App Server 요청 실패: {error:#}");
+    if result.is_err() {
+        let message = "request_failed".to_owned();
         if let Some(reply) = rpc_reply {
             reply.send_error(repaint, message.clone());
         }
@@ -1029,6 +1650,35 @@ fn handle_client_command(
         } else {
             emit_transport_error(events, repaint, message);
         }
+    }
+}
+
+fn reject_client_command(
+    target: Option<AgentSessionId>,
+    rpc_reply: Option<ClientCommandReply>,
+    events: &EventBacklog,
+    repaint: &egui::Context,
+    error_code: &str,
+    preserves_lifecycle_on_error: bool,
+) {
+    let message = error_code.to_owned();
+    let had_rpc_reply = rpc_reply.is_some();
+    if let Some(reply) = rpc_reply {
+        reply.send_error(repaint, message.clone());
+    }
+    if let Some(session_id) = target {
+        emit_session(
+            events,
+            repaint,
+            session_id,
+            if preserves_lifecycle_on_error {
+                AgentSessionEvent::ControlError { message }
+            } else {
+                AgentSessionEvent::Failed { message }
+            },
+        );
+    } else if !had_rpc_reply {
+        emit_transport_error(events, repaint, message);
     }
 }
 
@@ -1265,7 +1915,7 @@ fn request_thread_list(
     cursor: Option<String>,
     limit: Option<u32>,
     archived: bool,
-    reply: Sender<anyhow::Result<Value>>,
+    reply: SyncSender<anyhow::Result<Value>>,
 ) -> anyhow::Result<()> {
     let id = state.request_id();
     let key = rpc_key(&id);
@@ -1289,7 +1939,7 @@ fn request_thread_read(
     state: &mut WorkerState,
     thread_id: String,
     include_turns: bool,
-    reply: Sender<anyhow::Result<Value>>,
+    reply: SyncSender<anyhow::Result<Value>>,
 ) -> anyhow::Result<()> {
     let id = state.request_id();
     let key = rpc_key(&id);
@@ -1320,7 +1970,7 @@ fn request_thread_resume(
     thread_id: String,
     cwd: Option<String>,
     model: Option<String>,
-    reply: Sender<anyhow::Result<Value>>,
+    reply: SyncSender<anyhow::Result<Value>>,
 ) -> anyhow::Result<()> {
     let id = state.request_id();
     let key = rpc_key(&id);
@@ -1348,7 +1998,7 @@ fn request_thread_archive(
     stdin: &mut ChildStdin,
     state: &mut WorkerState,
     thread_id: String,
-    reply: Sender<anyhow::Result<Value>>,
+    reply: SyncSender<anyhow::Result<Value>>,
 ) -> anyhow::Result<()> {
     let id = state.request_id();
     let key = rpc_key(&id);
@@ -1377,7 +2027,7 @@ fn request_model_list(
     cursor: Option<String>,
     limit: Option<u32>,
     include_hidden: bool,
-    reply: Sender<anyhow::Result<CodexModelCatalogPage>>,
+    reply: SyncSender<anyhow::Result<CodexModelCatalogPage>>,
 ) -> anyhow::Result<()> {
     let id = state.request_id();
     let key = rpc_key(&id);
@@ -1401,7 +2051,7 @@ fn request_skills_list(
     state: &mut WorkerState,
     cwds: Vec<String>,
     force_reload: bool,
-    reply: Sender<anyhow::Result<Vec<CodexSkillInfo>>>,
+    reply: SyncSender<anyhow::Result<Vec<CodexSkillInfo>>>,
 ) -> anyhow::Result<()> {
     let id = state.request_id();
     let key = rpc_key(&id);
@@ -1474,7 +2124,7 @@ fn handle_server_message(
     message: Value,
     stdin: &mut ChildStdin,
     state: &mut WorkerState,
-    events: &Sender<CodexAppServerEvent>,
+    events: &EventBacklog,
     repaint: &egui::Context,
 ) {
     if message.get("method").is_some() && message.get("id").is_some() {
@@ -1484,22 +2134,15 @@ fn handle_server_message(
     } else if message.get("id").is_some() {
         handle_response(message, stdin, state, events, repaint);
     } else {
-        emit_transport_error(
-            events,
-            repaint,
-            format!(
-                "알 수 없는 Codex App Server 메시지: {}",
-                one_line(&message.to_string(), 240)
-            ),
-        );
+        emit_transport_error(events, repaint, "protocol_error:unknown_message".to_owned());
     }
 }
 
 fn handle_response(
-    message: Value,
+    mut message: Value,
     stdin: &mut ChildStdin,
     state: &mut WorkerState,
-    events: &Sender<CodexAppServerEvent>,
+    events: &EventBacklog,
     repaint: &egui::Context,
 ) {
     let Some(id) = message.get("id") else { return };
@@ -1525,18 +2168,22 @@ fn handle_response(
             }
             PendingRequest::StartThread { session_id, .. }
             | PendingRequest::StartTurn { session_id }
-            | PendingRequest::Interrupt { session_id } => emit_session(
-                events,
-                repaint,
-                session_id,
-                AgentSessionEvent::Failed { message: text },
-            ),
-            PendingRequest::SteerTurn { session_id, .. } => emit_session(
-                events,
-                repaint,
-                session_id,
-                AgentSessionEvent::ControlError { message: text },
-            ),
+            | PendingRequest::Interrupt { session_id } => {
+                emit_session(
+                    events,
+                    repaint,
+                    session_id,
+                    AgentSessionEvent::Failed { message: text },
+                );
+            }
+            PendingRequest::SteerTurn { session_id, .. } => {
+                emit_session(
+                    events,
+                    repaint,
+                    session_id,
+                    AgentSessionEvent::ControlError { message: text },
+                );
+            }
             PendingRequest::ResumeThread {
                 session_id, reply, ..
             } => {
@@ -1562,19 +2209,24 @@ fn handle_response(
         }
         return;
     }
-    let result = message.get("result").cloned().unwrap_or(Value::Null);
+    let result = message
+        .get_mut("result")
+        .map(Value::take)
+        .unwrap_or(Value::Null);
     match pending {
         PendingRequest::Initialize => {
             state.initialized = true;
-            if let Err(error) =
-                write_message(stdin, &json!({"method": "initialized", "params": {}}))
-            {
-                emit_transport_error(events, repaint, format!("initialized 전송 실패: {error:#}"));
+            if write_message(stdin, &json!({"method": "initialized", "params": {}})).is_err() {
+                emit_transport_error(
+                    events,
+                    repaint,
+                    "transport_error:initialized_send_failed".to_owned(),
+                );
                 return;
             }
             let starts = std::mem::take(&mut state.queued_starts);
             for start in starts {
-                if let Err(error) = start_thread(
+                if start_thread(
                     stdin,
                     state,
                     start.session_id.clone(),
@@ -1583,13 +2235,15 @@ fn handle_response(
                     start.model,
                     start.effort,
                     start.skills,
-                ) {
+                )
+                .is_err()
+                {
                     emit_session(
                         events,
                         repaint,
                         start.session_id,
                         AgentSessionEvent::Failed {
-                            message: format!("thread 시작 실패: {error:#}"),
+                            message: "request_failed:thread_start".to_owned(),
                         },
                     );
                 }
@@ -1626,6 +2280,24 @@ fn handle_response(
                 );
                 return;
             };
+            if !valid_identifier(thread_id)
+                || !state.can_retain_identifier_bytes(
+                    thread_id
+                        .len()
+                        .saturating_add(session_id.len())
+                        .saturating_mul(2),
+                )
+            {
+                emit_session(
+                    events,
+                    repaint,
+                    session_id,
+                    AgentSessionEvent::Failed {
+                        message: "resource_limit:thread_identifier".to_owned(),
+                    },
+                );
+                return;
+            }
             let thread_id = thread_id.to_owned();
             state
                 .thread_to_session
@@ -1649,7 +2321,7 @@ fn handle_response(
                     AgentSessionEvent::ThreadStatusChanged { status },
                 );
             }
-            if let Err(error) = start_turn_for_session(
+            if start_turn_for_session(
                 stdin,
                 state,
                 session_id.clone(),
@@ -1658,13 +2330,15 @@ fn handle_response(
                 model,
                 effort,
                 skills,
-            ) {
+            )
+            .is_err()
+            {
                 emit_session(
                     events,
                     repaint,
                     session_id,
                     AgentSessionEvent::Failed {
-                        message: format!("turn 시작 실패: {error:#}"),
+                        message: "request_failed:turn_start".to_owned(),
                     },
                 );
             }
@@ -1672,9 +2346,17 @@ fn handle_response(
         PendingRequest::StartTurn { session_id } => {
             if let Some(turn_id) = result.pointer("/turn/id").and_then(Value::as_str) {
                 let turn_id = turn_id.to_owned();
-                state
-                    .session_to_turn
-                    .insert(session_id.clone(), turn_id.clone());
+                if !state.insert_turn(&session_id, &turn_id) {
+                    emit_session(
+                        events,
+                        repaint,
+                        session_id,
+                        AgentSessionEvent::Failed {
+                            message: "resource_limit:turn_identifier".to_owned(),
+                        },
+                    );
+                    return;
+                }
                 emit_session(
                     events,
                     repaint,
@@ -1726,8 +2408,18 @@ fn handle_response(
             thread_id,
             reply,
         } => {
-            if let Err(error) = validate_thread_result(&result, &thread_id) {
-                let message = format!("thread/resume 응답 오류: {error:#}");
+            if validate_thread_result(&result, &thread_id).is_err()
+                || !valid_identifier(&thread_id)
+                || !valid_identifier(&session_id)
+                || !state.can_retain_identifier_bytes(
+                    thread_id
+                        .len()
+                        .saturating_add(session_id.len())
+                        .saturating_mul(2)
+                        .saturating_add(session_id.len()),
+                )
+            {
+                let message = "protocol_error:thread_resume_response".to_owned();
                 send_rpc_reply(reply, repaint, Err(anyhow::anyhow!(message.clone())));
                 emit_session(
                     events,
@@ -1791,7 +2483,7 @@ fn handle_response(
 }
 
 fn send_rpc_reply(
-    reply: Sender<anyhow::Result<Value>>,
+    reply: SyncSender<anyhow::Result<Value>>,
     repaint: &egui::Context,
     result: anyhow::Result<Value>,
 ) {
@@ -1799,11 +2491,11 @@ fn send_rpc_reply(
 }
 
 fn send_typed_reply<T>(
-    reply: Sender<anyhow::Result<T>>,
+    reply: SyncSender<anyhow::Result<T>>,
     repaint: &egui::Context,
     result: anyhow::Result<T>,
 ) {
-    let _ = reply.send(result);
+    let _ = reply.try_send(result);
     repaint.request_repaint();
 }
 
@@ -1812,12 +2504,25 @@ fn parse_model_catalog(result: &Value) -> anyhow::Result<CodexModelCatalogPage> 
         .get("data")
         .and_then(Value::as_array)
         .context("model/list 응답에 data 배열이 없습니다")?;
+    anyhow::ensure!(
+        data.len() <= MAX_CATALOG_ITEMS,
+        "resource_limit:model_catalog_items"
+    );
     let mut models = Vec::with_capacity(data.len());
+    let mut total_efforts = 0usize;
     for model in data {
-        let efforts = model
+        let effort_values = model
             .get("supportedReasoningEfforts")
             .and_then(Value::as_array)
-            .context("model/list 모델에 supportedReasoningEfforts 배열이 없습니다")?
+            .context("model/list 모델에 supportedReasoningEfforts 배열이 없습니다")?;
+        add_bounded_items(
+            &mut total_efforts,
+            effort_values.len(),
+            MAX_REASONING_EFFORTS_PER_MODEL,
+            MAX_CATALOG_ITEMS,
+            "resource_limit:model_effort_items",
+        )?;
+        let efforts = effort_values
             .iter()
             .map(|effort| {
                 Ok(CodexReasoningEffort {
@@ -1855,6 +2560,10 @@ fn parse_skill_catalog(result: &Value) -> anyhow::Result<Vec<CodexSkillInfo>> {
         .get("data")
         .and_then(Value::as_array)
         .context("skills/list 응답에 data 배열이 없습니다")?;
+    anyhow::ensure!(
+        entries.len() <= MAX_SKILL_GROUPS,
+        "resource_limit:skill_groups"
+    );
     let mut catalog = Vec::new();
     for entry in entries {
         let cwd = required_string(entry, "cwd")?;
@@ -1862,6 +2571,14 @@ fn parse_skill_catalog(result: &Value) -> anyhow::Result<Vec<CodexSkillInfo>> {
             .get("skills")
             .and_then(Value::as_array)
             .context("skills/list entry에 skills 배열이 없습니다")?;
+        let mut total = catalog.len();
+        add_bounded_items(
+            &mut total,
+            skills.len(),
+            MAX_CATALOG_ITEMS,
+            MAX_CATALOG_ITEMS,
+            "resource_limit:skill_catalog_items",
+        )?;
         for skill in skills {
             catalog.push(CodexSkillInfo {
                 cwd: cwd.clone(),
@@ -1879,6 +2596,20 @@ fn parse_skill_catalog(result: &Value) -> anyhow::Result<Vec<CodexSkillInfo>> {
     Ok(catalog)
 }
 
+fn add_bounded_items(
+    total: &mut usize,
+    count: usize,
+    per_container_max: usize,
+    aggregate_max: usize,
+    error_code: &'static str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(count <= per_container_max, error_code);
+    let next = total.saturating_add(count);
+    anyhow::ensure!(next <= aggregate_max, error_code);
+    *total = next;
+    Ok(())
+}
+
 fn required_string(value: &Value, key: &str) -> anyhow::Result<String> {
     value
         .get(key)
@@ -1893,6 +2624,12 @@ fn validate_thread_list_result(result: &Value) -> anyhow::Result<()> {
         result.get("data").is_some_and(Value::is_array),
         "thread/list 응답에 data 배열이 없습니다"
     );
+    let data = result.get("data").and_then(Value::as_array).unwrap();
+    anyhow::ensure!(
+        data.len() <= MAX_THREAD_RESULT_ITEMS
+            && json_container_items_within(result, MAX_THREAD_RESULT_ITEMS),
+        "resource_limit:thread_list_items"
+    );
     if let Some(cursor) = result.get("nextCursor") {
         anyhow::ensure!(
             cursor.is_null() || cursor.is_string(),
@@ -1903,6 +2640,10 @@ fn validate_thread_list_result(result: &Value) -> anyhow::Result<()> {
 }
 
 fn validate_thread_result(result: &Value, expected_thread_id: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        json_container_items_within(result, MAX_THREAD_RESULT_ITEMS),
+        "resource_limit:thread_result_items"
+    );
     let thread_id = result
         .pointer("/thread/id")
         .and_then(Value::as_str)
@@ -1914,10 +2655,35 @@ fn validate_thread_result(result: &Value, expected_thread_id: &str) -> anyhow::R
     Ok(())
 }
 
+fn json_container_items_within(value: &Value, max_items: usize) -> bool {
+    fn visit(value: &Value, items: &mut usize, max_items: usize) -> bool {
+        match value {
+            Value::Array(values) => {
+                *items = items.saturating_add(values.len());
+                if *items > max_items {
+                    return false;
+                }
+                values.iter().all(|value| visit(value, items, max_items))
+            }
+            Value::Object(values) => values.values().all(|value| visit(value, items, max_items)),
+            _ => true,
+        }
+    }
+
+    visit(value, &mut 0, max_items)
+}
+
+fn item_projection_within_limits(item: &Value) -> bool {
+    item.get("id")
+        .and_then(Value::as_str)
+        .is_some_and(valid_identifier)
+        && json_container_items_within(item, MAX_CATALOG_ITEMS)
+}
+
 fn handle_notification(
     message: Value,
     state: &mut WorkerState,
-    events: &Sender<CodexAppServerEvent>,
+    events: &EventBacklog,
     repaint: &egui::Context,
 ) {
     let Some(method) = message.get("method").and_then(Value::as_str) else {
@@ -1929,6 +2695,9 @@ fn handle_notification(
             let Some(thread_id) = params.get("threadId").and_then(Value::as_str) else {
                 return;
             };
+            if !valid_identifier(thread_id) {
+                return;
+            }
             let Some(status) = params.get("status").and_then(AgentThreadStatus::from_codex) else {
                 return;
             };
@@ -1966,9 +2735,10 @@ fn handle_notification(
             let Some((session_id, turn_id)) = session_and_turn(params, state) else {
                 return;
             };
-            state
-                .session_to_turn
-                .insert(session_id.clone(), turn_id.clone());
+            if !state.insert_turn(&session_id, &turn_id) {
+                emit_transport_error(events, repaint, "resource_limit:turn_identifier".to_owned());
+                return;
+            }
             emit_session(
                 events,
                 repaint,
@@ -1980,7 +2750,15 @@ fn handle_notification(
             let Some(session_id) = session_for_params(params, state) else {
                 return;
             };
-            let Some(item) = params.get("item").and_then(AgentItem::from_codex) else {
+            let Some(raw_item) = params.get("item") else {
+                return;
+            };
+            if !item_projection_within_limits(raw_item) {
+                emit_transport_error(events, repaint, "resource_limit:item_projection".to_owned());
+                state.stop_requested = true;
+                return;
+            }
+            let Some(item) = AgentItem::from_codex(raw_item) else {
                 return;
             };
             emit_session(
@@ -1994,7 +2772,15 @@ fn handle_notification(
             let Some(session_id) = session_for_params(params, state) else {
                 return;
             };
-            let Some(item) = params.get("item").and_then(AgentItem::from_codex) else {
+            let Some(raw_item) = params.get("item") else {
+                return;
+            };
+            if !item_projection_within_limits(raw_item) {
+                emit_transport_error(events, repaint, "resource_limit:item_projection".to_owned());
+                state.stop_requested = true;
+                return;
+            }
+            let Some(item) = AgentItem::from_codex(raw_item) else {
                 return;
             };
             emit_session(
@@ -2070,7 +2856,7 @@ fn handle_server_request(
     message: Value,
     stdin: &mut ChildStdin,
     state: &mut WorkerState,
-    events: &Sender<CodexAppServerEvent>,
+    events: &EventBacklog,
     repaint: &egui::Context,
 ) {
     let Some(id) = message.get("id").cloned() else {
@@ -2087,47 +2873,67 @@ fn handle_server_request(
         _ => None,
     };
     let Some(kind) = kind else {
-        let _ = write_message(
-            stdin,
-            &json!({
-                "id": id,
-                "error": {"code": -32601, "message": format!("Unsupported App Server request: {method}")}
-            }),
-        );
+        let _ = write_server_error(stdin, id, -32601, "unsupported_request");
         emit_transport_error(
             events,
             repaint,
-            format!("지원하지 않는 Codex App Server 요청: {method}"),
+            "protocol_error:unsupported_request".to_owned(),
         );
         return;
     };
     let Some(thread_id) = params.get("threadId").and_then(Value::as_str) else {
+        let _ = write_server_error(stdin, id, -32602, "invalid_request");
         return;
     };
     let Some(session_id) = state.thread_to_session.get(thread_id).cloned() else {
+        let _ = write_server_error(stdin, id, -32602, "unknown_thread");
         return;
     };
     let Some(turn_id) = params.get("turnId").and_then(Value::as_str) else {
+        let _ = write_server_error(stdin, id, -32602, "invalid_request");
         return;
     };
     let Some(item_id) = params.get("itemId").and_then(Value::as_str) else {
+        let _ = write_server_error(stdin, id, -32602, "invalid_request");
         return;
     };
     let request_key = rpc_key(&id);
+    if !valid_identifier(thread_id)
+        || !valid_identifier(&session_id)
+        || !valid_identifier(turn_id)
+        || !valid_identifier(item_id)
+        || !valid_identifier(&request_key)
+    {
+        let _ = write_server_error(stdin, id, -32602, "identifier_limit");
+        return;
+    }
+    if state.server_requests.len() >= MAX_SERVER_REQUESTS {
+        let _ = write_server_error(stdin, id, -32000, REQUEST_BACKPRESSURE_ERROR);
+        emit_transport_error(events, repaint, REQUEST_BACKPRESSURE_ERROR.to_owned());
+        return;
+    };
+    let additional_identifier_bytes = request_key
+        .len()
+        .saturating_mul(2)
+        .saturating_add(session_id.len());
+    if !state.can_retain_identifier_bytes(additional_identifier_bytes) {
+        let _ = write_server_error(stdin, id, -32000, "identifier_backpressure");
+        return;
+    }
     state.server_requests.insert(
         request_key.clone(),
         ServerRequest {
             session_id: session_id.clone(),
-            id,
+            id: id.clone(),
         },
     );
-    emit_session(
+    let accepted = emit_session(
         events,
         repaint,
         session_id,
         AgentSessionEvent::ApprovalRequested {
             approval: AgentApproval {
-                request_key,
+                request_key: request_key.clone(),
                 kind,
                 thread_id: thread_id.to_owned(),
                 turn_id: turn_id.to_owned(),
@@ -2144,19 +2950,39 @@ fn handle_server_request(
             },
         },
     );
+    if !accepted {
+        state.server_requests.remove(&request_key);
+        let _ = write_server_error(stdin, id, -32000, EVENT_BACKPRESSURE_ERROR);
+    }
+}
+
+fn write_server_error(
+    stdin: &mut ChildStdin,
+    id: Value,
+    code: i64,
+    message: &'static str,
+) -> anyhow::Result<()> {
+    write_message(
+        stdin,
+        &json!({"id": id, "error": {"code": code, "message": message}}),
+    )
 }
 
 fn session_for_params(params: &Value, state: &WorkerState) -> Option<AgentSessionId> {
     let thread_id = params.get("threadId").and_then(Value::as_str)?;
+    if !valid_identifier(thread_id) {
+        return None;
+    }
     state.thread_to_session.get(thread_id).cloned()
 }
 
 fn session_and_turn(params: &Value, state: &WorkerState) -> Option<(AgentSessionId, String)> {
     let session_id = session_for_params(params, state)?;
-    let turn_id = params
-        .pointer("/turn/id")
-        .and_then(Value::as_str)?
-        .to_owned();
+    let turn_id = params.pointer("/turn/id").and_then(Value::as_str)?;
+    if !valid_identifier(turn_id) {
+        return None;
+    }
+    let turn_id = turn_id.to_owned();
     Some((session_id, turn_id))
 }
 
@@ -2172,66 +2998,35 @@ fn rpc_key(id: &Value) -> String {
 }
 
 fn rpc_error_text(error: &Value) -> String {
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("Codex App Server 오류");
-    match error.get("code").and_then(Value::as_i64) {
-        Some(code) => format!("{message} (code {code})"),
-        None => message.to_owned(),
-    }
+    let _ = error;
+    "protocol_error:rpc_error".to_owned()
 }
 
-fn emit(events: &Sender<CodexAppServerEvent>, repaint: &egui::Context, event: CodexAppServerEvent) {
-    let _ = events.send(event);
+fn emit(events: &EventBacklog, repaint: &egui::Context, event: CodexAppServerEvent) -> bool {
+    let accepted = events.push(event);
     repaint.request_repaint();
+    accepted
 }
 
 fn emit_session(
-    events: &Sender<CodexAppServerEvent>,
+    events: &EventBacklog,
     repaint: &egui::Context,
     session_id: AgentSessionId,
     event: AgentSessionEvent,
-) {
+) -> bool {
     emit(
         events,
         repaint,
         CodexAppServerEvent::Session { session_id, event },
-    );
+    )
 }
 
-fn emit_transport_error(
-    events: &Sender<CodexAppServerEvent>,
-    repaint: &egui::Context,
-    message: String,
-) {
+fn emit_transport_error(events: &EventBacklog, repaint: &egui::Context, message: String) -> bool {
     emit(
         events,
         repaint,
         CodexAppServerEvent::TransportError { message },
-    );
-}
-
-fn append_limited(target: &mut String, line: &str) {
-    if target.len() >= 4096 {
-        return;
-    }
-    if !target.is_empty() {
-        target.push('\n');
-    }
-    target.push_str(line);
-    if target.len() > 4096 {
-        target.truncate(4096);
-    }
-}
-
-fn one_line(text: &str, max_chars: usize) -> String {
-    let condensed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut indices = condensed.char_indices();
-    let Some((cut, _)) = indices.nth(max_chars) else {
-        return condensed;
-    };
-    format!("{}…", &condensed[..cut])
+    )
 }
 
 #[cfg(test)]
@@ -2501,7 +3296,7 @@ mod tests {
         state
             .thread_to_session
             .insert("thread-1".to_owned(), "session-1".to_owned());
-        let (events, received) = mpsc::channel();
+        let events = EventBacklog::default();
 
         handle_notification(
             json!({
@@ -2520,7 +3315,7 @@ mod tests {
         );
 
         assert_eq!(
-            received.try_recv().unwrap(),
+            events.drain().pop().unwrap(),
             CodexAppServerEvent::Session {
                 session_id: "session-1".to_owned(),
                 event: AgentSessionEvent::ThreadStatusChanged {
@@ -2536,7 +3331,7 @@ mod tests {
     #[test]
     fn early_thread_status_is_buffered_until_session_mapping_exists() {
         let mut state = WorkerState::default();
-        let (events, received) = mpsc::channel();
+        let events = EventBacklog::default();
         handle_notification(
             json!({
                 "method": "thread/status/changed",
@@ -2550,7 +3345,7 @@ mod tests {
             &egui::Context::default(),
         );
 
-        assert!(matches!(received.try_recv(), Err(TryRecvError::Empty)));
+        assert!(events.drain().is_empty());
         assert_eq!(
             state.buffered_thread_statuses.get("thread-early"),
             Some(&AgentThreadStatus::Idle)
@@ -2563,7 +3358,7 @@ mod tests {
         state
             .thread_to_session
             .insert("thread-1".to_owned(), "session-1".to_owned());
-        let (events, received) = mpsc::channel();
+        let events = EventBacklog::default();
         handle_notification(
             json!({
                 "method": "thread/status/changed",
@@ -2577,7 +3372,7 @@ mod tests {
             &egui::Context::default(),
         );
 
-        assert!(matches!(received.try_recv(), Err(TryRecvError::Empty)));
+        assert!(events.drain().is_empty());
     }
 
     #[test]
@@ -2790,5 +3585,394 @@ mod tests {
         assert_eq!(skills[0].cwd, "/repo");
         assert_eq!(skills[0].scope, "repo");
         assert!(parse_skill_catalog(&json!({"data": [{"cwd": "/repo", "skills": {}}]})).is_err());
+    }
+
+    #[test]
+    fn jsonl_reader_accepts_exact_cap_and_rejects_first_extra_byte() {
+        let mut exact = vec![b'a'; MAX_STDOUT_LINE_BYTES];
+        exact.push(b'\n');
+        assert_eq!(
+            read_line_limited(&mut std::io::Cursor::new(exact), MAX_STDOUT_LINE_BYTES)
+                .unwrap()
+                .unwrap()
+                .len(),
+            MAX_STDOUT_LINE_BYTES
+        );
+
+        let oversized = vec![b'b'; MAX_STDOUT_LINE_BYTES + 1];
+        let error = read_line_limited(&mut std::io::Cursor::new(oversized), MAX_STDOUT_LINE_BYTES)
+            .unwrap_err();
+        assert_eq!(io_error_code(&error), "line_too_large");
+        assert!(read_line_limited(&mut std::io::Cursor::new([0xff]), 1).is_err());
+    }
+
+    #[test]
+    fn hostile_stdout_and_stderr_are_sanitized_before_queueing() {
+        let (stdout_tx, stdout_rx) = mpsc::sync_channel(1);
+        read_json_lines(std::io::Cursor::new(b"SECRET-not-json\n"), stdout_tx);
+        assert_eq!(
+            stdout_rx.recv().unwrap(),
+            Incoming::StdoutError("protocol_error:invalid_json".to_owned())
+        );
+
+        let (stderr_tx, stderr_rx) = mpsc::sync_channel(1);
+        read_stderr_lines(std::io::Cursor::new(b"SECRET-stderr\n"), stderr_tx);
+        assert!(matches!(stderr_rx.recv().unwrap(), Incoming::Stderr));
+    }
+
+    #[test]
+    fn incoming_reader_disconnect_unblocks_a_stalled_producer() {
+        let input = b"{}\n{}\n{}\n".to_vec();
+        let (tx, rx) = mpsc::sync_channel(1);
+        let reader = thread::spawn(move || read_json_lines(std::io::Cursor::new(input), tx));
+        assert!(matches!(rx.recv().unwrap(), Incoming::Json(_)));
+        drop(rx);
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn stdout_error_stops_command_acceptance_state() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "cat >/dev/null"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_process_group(&mut command);
+        let mut child = ChildTreeGuard::new(command.spawn().unwrap());
+        let mut stdin = child.child_mut().stdin.take().unwrap();
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(Incoming::StdoutError(
+            "protocol_error:invalid_json".to_owned(),
+        ))
+        .unwrap();
+        drop(tx);
+        let mut state = WorkerState::default();
+        drain_incoming(
+            &rx,
+            &mut stdin,
+            &mut state,
+            &EventBacklog::default(),
+            &egui::Context::default(),
+            &mut false,
+        );
+        assert!(state.stop_requested);
+        child.terminate();
+    }
+
+    #[test]
+    fn command_queue_is_nonblocking_at_cap_plus_one() {
+        let (commands, stalled_receiver) = mpsc::sync_channel(COMMAND_QUEUE_CAPACITY);
+        let client = CodexAppServerClient {
+            commands,
+            events: Arc::new(EventBacklog::default()),
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            worker: None,
+            llm_proxy: None,
+        };
+        for index in 0..COMMAND_QUEUE_CAPACITY {
+            client
+                .send(ClientCommand::Interrupt {
+                    session_id: format!("session-{index}"),
+                })
+                .unwrap();
+        }
+        let error = client
+            .send(ClientCommand::Interrupt {
+                session_id: "session-overflow".to_owned(),
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), COMMAND_BACKPRESSURE_ERROR);
+        drop(stalled_receiver);
+    }
+
+    #[test]
+    fn command_bytes_and_items_reject_cap_plus_one() {
+        let exact = ClientCommand::StartSession {
+            session_id: "s".to_owned(),
+            prompt: "x".repeat(MAX_CLIENT_COMMAND_BYTES - 1),
+            cwd: None,
+            model: None,
+            effort: None,
+            skills: Vec::new(),
+        };
+        assert_eq!(command_retained_bytes(&exact), MAX_CLIENT_COMMAND_BYTES);
+        let oversized = ClientCommand::StartSession {
+            session_id: "s".to_owned(),
+            prompt: "x".repeat(MAX_CLIENT_COMMAND_BYTES),
+            cwd: None,
+            model: None,
+            effort: None,
+            skills: Vec::new(),
+        };
+        assert_eq!(
+            command_retained_bytes(&oversized),
+            MAX_CLIENT_COMMAND_BYTES + 1
+        );
+        let too_many_skills = ClientCommand::SteerTurn {
+            session_id: "s".to_owned(),
+            prompt: "x".to_owned(),
+            skills: (0..=MAX_COMMAND_SKILLS)
+                .map(|index| AgentSkillSelection {
+                    name: format!("skill-{index}"),
+                    path: format!("/skill/{index}"),
+                })
+                .collect(),
+        };
+        assert!(!command_item_count_is_valid(&too_many_skills));
+    }
+
+    fn delta_event(session_id: &str, item_id: &str, delta: String) -> CodexAppServerEvent {
+        CodexAppServerEvent::Session {
+            session_id: session_id.to_owned(),
+            event: AgentSessionEvent::ItemDelta {
+                item_id: item_id.to_owned(),
+                delta,
+            },
+        }
+    }
+
+    #[test]
+    fn adjacent_delta_coalescing_counts_identifier_overhead_exactly() {
+        let session_id = "session";
+        let item_id = "item";
+        let backlog = EventBacklog::default();
+        assert!(backlog.push(delta_event(session_id, item_id, "a".to_owned())));
+        let remaining = MAX_EVENT_BYTES - session_id.len() - item_id.len() - 1;
+        assert!(backlog.push(delta_event(session_id, item_id, "b".repeat(remaining))));
+        let events = backlog.drain();
+        assert_eq!(events.len(), 1);
+        assert_eq!(event_retained_bytes(&events[0]), MAX_EVENT_BYTES);
+
+        let full = EventBacklog::default();
+        for _ in 0..EVENT_QUEUE_CAPACITY - 1 {
+            assert!(full.push(CodexAppServerEvent::ConnectionStopped));
+        }
+        assert!(full.push(delta_event(session_id, item_id, "a".to_owned())));
+        assert!(!full.push(delta_event(session_id, item_id, "b".repeat(remaining + 1))));
+        let events = full.drain();
+        assert_eq!(events.len(), EVENT_QUEUE_CAPACITY + 2);
+        assert!(matches!(
+            events.get(EVENT_QUEUE_CAPACITY),
+            Some(CodexAppServerEvent::TransportError { message })
+                if message == EVENT_BACKPRESSURE_ERROR
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(CodexAppServerEvent::ConnectionStopped)
+        ));
+        assert!(full.drain().is_empty());
+    }
+
+    #[test]
+    fn identifier_and_aggregate_retention_have_exact_caps() {
+        assert!(valid_identifier(&"i".repeat(MAX_IDENTIFIER_BYTES)));
+        assert!(!valid_identifier(&"i".repeat(MAX_IDENTIFIER_BYTES + 1)));
+
+        let mut state = WorkerState::default();
+        for index in 0..MAX_TRACKED_SESSIONS {
+            let session = format!("session-{index}");
+            let thread_id = format!("thread-{index}");
+            state.known_sessions.insert(session.clone());
+            state
+                .thread_to_session
+                .insert(thread_id.clone(), session.clone());
+            state.session_to_thread.insert(session.clone(), thread_id);
+            state
+                .session_to_turn
+                .insert(session, format!("turn-{index}"));
+        }
+        let retained = state.retained_identifier_bytes();
+        assert!(retained < MAX_RETAINED_IDENTIFIER_BYTES);
+        let remaining = MAX_RETAINED_IDENTIFIER_BYTES - retained;
+        assert!(state.can_retain_identifier_bytes(remaining));
+        assert!(!state.can_retain_identifier_bytes(remaining + 1));
+    }
+
+    #[test]
+    fn nested_catalog_and_thread_items_have_exact_aggregate_caps() {
+        let mut efforts = 0usize;
+        for _ in 0..(MAX_CATALOG_ITEMS / MAX_REASONING_EFFORTS_PER_MODEL) {
+            add_bounded_items(
+                &mut efforts,
+                MAX_REASONING_EFFORTS_PER_MODEL,
+                MAX_REASONING_EFFORTS_PER_MODEL,
+                MAX_CATALOG_ITEMS,
+                "effort_limit",
+            )
+            .unwrap();
+        }
+        assert_eq!(efforts, MAX_CATALOG_ITEMS);
+        assert!(
+            add_bounded_items(
+                &mut efforts,
+                1,
+                MAX_REASONING_EFFORTS_PER_MODEL,
+                MAX_CATALOG_ITEMS,
+                "effort_limit",
+            )
+            .is_err()
+        );
+
+        let exact = Value::Array(vec![Value::Null; MAX_THREAD_RESULT_ITEMS]);
+        assert!(json_container_items_within(&exact, MAX_THREAD_RESULT_ITEMS));
+        let oversized = Value::Array(vec![Value::Null; MAX_THREAD_RESULT_ITEMS + 1]);
+        assert!(!json_container_items_within(
+            &oversized,
+            MAX_THREAD_RESULT_ITEMS
+        ));
+
+        let exact_groups = json!({
+            "data": (0..MAX_SKILL_GROUPS)
+                .map(|index| json!({"cwd": format!("/{index}"), "skills": []}))
+                .collect::<Vec<_>>()
+        });
+        assert!(parse_skill_catalog(&exact_groups).is_ok());
+        let too_many_groups = json!({
+            "data": (0..=MAX_SKILL_GROUPS)
+                .map(|index| json!({"cwd": format!("/{index}"), "skills": []}))
+                .collect::<Vec<_>>()
+        });
+        assert!(parse_skill_catalog(&too_many_groups).is_err());
+    }
+
+    #[test]
+    fn item_projection_rejects_nested_cap_plus_one_before_allocation() {
+        let mut state = WorkerState::default();
+        state
+            .thread_to_session
+            .insert("thread-1".to_owned(), "session-1".to_owned());
+        let events = EventBacklog::default();
+        handle_notification(
+            json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "id": "item-exact",
+                        "type": "userMessage",
+                        "content": vec![json!({"text": ""}); MAX_CATALOG_ITEMS]
+                    }
+                }
+            }),
+            &mut state,
+            &events,
+            &egui::Context::default(),
+        );
+        assert!(!state.stop_requested);
+        assert!(matches!(
+            events.drain().as_slice(),
+            [CodexAppServerEvent::Session {
+                event: AgentSessionEvent::ItemStarted { .. },
+                ..
+            }]
+        ));
+
+        handle_notification(
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "item": {
+                        "id": "item-over",
+                        "type": "fileChange",
+                        "changes": vec![json!({}); MAX_CATALOG_ITEMS + 1]
+                    }
+                }
+            }),
+            &mut state,
+            &events,
+            &egui::Context::default(),
+        );
+        assert!(state.stop_requested);
+        assert!(matches!(
+            events.drain().as_slice(),
+            [CodexAppServerEvent::TransportError { message }]
+                if message == "resource_limit:item_projection"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repeated_process_group_shutdown_reaps_every_cycle() {
+        for _ in 0..8 {
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", "sleep 30 & wait"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            configure_process_group(&mut command);
+            let mut child = ChildTreeGuard::new(command.spawn().unwrap());
+            let process_group = child.child_mut().id() as libc::pid_t;
+            child.terminate();
+            // SAFETY: signal 0 performs a read-only existence check.
+            assert_ne!(unsafe { libc::killpg(process_group, 0) }, 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_parent_is_detected_without_reap_while_descendant_holds_stdout() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 30 & exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        configure_process_group(&mut command);
+        let mut child = ChildTreeGuard::new(command.spawn().unwrap());
+        let process_group = child.child_mut().id() as libc::pid_t;
+        let inherited_stdout = child.child_mut().stdout.take().unwrap();
+        let mut exited = false;
+        for _ in 0..100 {
+            if child.leader_exited_without_reap().unwrap() {
+                exited = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            exited,
+            "parent must become waitable without closing descendant pipe"
+        );
+        child.terminate();
+        drop(inherited_stdout);
+        let mut group_gone = false;
+        for _ in 0..100 {
+            // SAFETY: signal 0 performs a read-only existence check.
+            if unsafe { libc::killpg(process_group, 0) } != 0 {
+                group_gone = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(group_gone, "killed descendant group must be collected");
+    }
+
+    #[test]
+    fn production_source_has_only_bounded_queue_and_guarded_process_paths() {
+        let source = include_str!("codex_app_server.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(!production.contains("mpsc::channel()"));
+        assert!(!production.contains("discard_until_newline"));
+        assert!(!production.contains(".expect(\"Codex App Server stdout reader"));
+        assert!(!production.contains(".expect(\"Codex App Server stderr reader"));
+        assert!(production.contains("mpsc::sync_channel(COMMAND_QUEUE_CAPACITY)"));
+        assert!(production.contains("mpsc::sync_channel(INCOMING_QUEUE_CAPACITY)"));
+        assert!(production.contains("ChildTreeGuard::new(child)"));
+        assert!(production.contains("configure_process_group(&mut command)"));
+        assert!(production.contains("libc::WNOWAIT"));
+        assert!(production.contains("child.terminate();\n    drop(incoming_rx);"));
+        assert!(production.contains("EVENT_BACKPRESSURE_ERROR"));
+        assert!(!production.contains(".get(\"result\").cloned()"));
+        let worker = production
+            .split("fn worker_loop(")
+            .nth(1)
+            .unwrap()
+            .split("fn spawn_stdout_reader")
+            .next()
+            .unwrap();
+        assert!(!worker.contains("try_wait"));
     }
 }

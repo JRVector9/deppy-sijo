@@ -18,9 +18,119 @@ use std::time::Duration;
 const ROOT_TIMEOUT: Duration = Duration::from_secs(10);
 /// worktree add 타임아웃 — 체크아웃을 동반하므로 넉넉히.
 const ADD_TIMEOUT: Duration = Duration::from_secs(30);
+const UNIQUE_SLUG_MAX_ATTEMPTS: u32 = 64;
+const POPULATED_SUBMODULE_MAX_ITEMS: usize = 256;
+const POPULATED_SUBMODULE_MAX_DEPTH: usize = 16;
+const POPULATED_SUBMODULE_MAX_INDEX_BYTES: usize = 32 * 1024 * 1024;
+const EXCLUDE_MAX_BYTES: usize = 256 * 1024;
+
+#[derive(Clone, Copy)]
+struct GitOutputLimit {
+    bytes: usize,
+    items: usize,
+    delimiter: char,
+    kind: &'static str,
+}
+
+const GIT_SCALAR_LIMIT: GitOutputLimit = GitOutputLimit {
+    bytes: 32 * 1024,
+    items: 1,
+    delimiter: '\n',
+    kind: "scalar",
+};
+const GIT_MUTATION_LIMIT: GitOutputLimit = GitOutputLimit {
+    bytes: 256 * 1024,
+    items: 256,
+    delimiter: '\n',
+    kind: "mutation",
+};
+const GIT_STATUS_LIMIT: GitOutputLimit = GitOutputLimit {
+    bytes: 256 * 1024,
+    items: 4_096,
+    delimiter: '\n',
+    kind: "status",
+};
+const GIT_REF_LIST_LIMIT: GitOutputLimit = GitOutputLimit {
+    bytes: 1024 * 1024,
+    items: 8_192,
+    delimiter: '\n',
+    kind: "ref-list",
+};
+const GIT_WORKTREE_LIST_LIMIT: GitOutputLimit = GitOutputLimit {
+    bytes: 2 * 1024 * 1024,
+    items: 4_096 * 4,
+    delimiter: '\n',
+    kind: "worktree-list",
+};
+const GIT_INDEX_LIST_LIMIT: GitOutputLimit = GitOutputLimit {
+    bytes: 8 * 1024 * 1024,
+    items: 100_000,
+    delimiter: '\0',
+    kind: "index-list",
+};
+
+fn validate_git_output_items(output: &str, limit: GitOutputLimit) -> anyhow::Result<()> {
+    let items = output
+        .split_terminator(limit.delimiter)
+        .take(limit.items.saturating_add(1))
+        .count();
+    anyhow::ensure!(items <= limit.items, "git_{}_item_limit", limit.kind);
+    Ok(())
+}
+
+fn run_git_with_limit(
+    repo: &Path,
+    args: &[&str],
+    timeout: Duration,
+    limit: GitOutputLimit,
+) -> anyhow::Result<String> {
+    let output = crate::git_cli::run_git_bounded(repo, args, timeout, limit.bytes)?;
+    validate_git_output_items(&output, limit)?;
+    Ok(output)
+}
+
+fn run_git_scalar(repo: &Path, args: &[&str], timeout: Duration) -> anyhow::Result<String> {
+    run_git_with_limit(repo, args, timeout, GIT_SCALAR_LIMIT)
+}
+
+fn run_git_mutation(repo: &Path, args: &[&str], timeout: Duration) -> anyhow::Result<String> {
+    run_git_with_limit(repo, args, timeout, GIT_MUTATION_LIMIT)
+}
+
+fn run_git_status(repo: &Path, args: &[&str], timeout: Duration) -> anyhow::Result<String> {
+    run_git_with_limit(repo, args, timeout, GIT_STATUS_LIMIT)
+}
+
+fn run_git_ref_list(repo: &Path, args: &[&str], timeout: Duration) -> anyhow::Result<String> {
+    run_git_with_limit(repo, args, timeout, GIT_REF_LIST_LIMIT)
+}
+
+fn run_git_worktree_list(repo: &Path, args: &[&str], timeout: Duration) -> anyhow::Result<String> {
+    run_git_with_limit(repo, args, timeout, GIT_WORKTREE_LIST_LIMIT)
+}
+
+fn run_git_index_list(
+    repo: &Path,
+    args: &[&str],
+    timeout: Duration,
+    remaining_bytes: usize,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(remaining_bytes > 0, "worktree_submodule_byte_limit");
+    run_git_with_limit(
+        repo,
+        args,
+        timeout,
+        GitOutputLimit {
+            bytes: GIT_INDEX_LIST_LIMIT.bytes.min(remaining_bytes),
+            ..GIT_INDEX_LIST_LIMIT
+        },
+    )
+}
 
 /// exclude에 추가하는 항목 — `.deppy/` 하위 전체(워크트리·후속 메타데이터).
 const EXCLUDE_ENTRY: &str = ".deppy/";
+const EXCLUDE_APPEND: &[u8] = b".deppy/\n";
+const EXCLUDE_APPEND_WITH_SEPARATOR: &[u8] = b"\n.deppy/\n";
 
 /// 세션 cwd에서 격리 워크트리를 만들고 절대 경로를 돌려준다.
 /// 블로킹(git 실행) — 반드시 백그라운드 스레드에서 호출한다. 에러(레포 아님·git 거부·
@@ -36,7 +146,7 @@ pub fn create_worktree(cwd: &Path) -> anyhow::Result<PathBuf> {
     // 종료(run_git Err) → 미사용으로 판정.
     let slug = unique_slug(&stamp, |s| {
         base.join(s).exists()
-            || crate::git_cli::run_git(
+            || run_git_scalar(
                 &root,
                 &[
                     "rev-parse",
@@ -47,10 +157,10 @@ pub fn create_worktree(cwd: &Path) -> anyhow::Result<PathBuf> {
                 ROOT_TIMEOUT,
             )
             .is_ok()
-    });
+    })?;
     let rel = format!(".deppy/worktrees/{slug}");
     let branch = format!("deppy/{slug}");
-    crate::git_cli::run_git(
+    run_git_mutation(
         &root,
         &["worktree", "add", "-b", &branch, &rel],
         ADD_TIMEOUT,
@@ -111,14 +221,10 @@ pub enum BranchCleanup {
 ///   기능만 별도로 고치지 않는다.
 pub fn remove_worktree(cwd: &Path) -> anyhow::Result<(PathBuf, BranchCleanup)> {
     let worktree_root = crate::git_cli::repo_root(cwd, ROOT_TIMEOUT)?;
-    anyhow::ensure!(
-        is_deppy_worktree(&worktree_root),
-        "deppy 워크트리가 아님: {}",
-        worktree_root.display()
-    );
+    anyhow::ensure!(is_deppy_worktree(&worktree_root), "deppy 워크트리가 아님");
     // 브랜치 정리 판정용 — 삭제 후에는 이 워크트리에서 물을 수 없으니 먼저 캡처.
     // detached면 "HEAD"가 나온다(→ Kept).
-    let head_branch = crate::git_cli::run_git(
+    let head_branch = run_git_scalar(
         &worktree_root,
         &["rev-parse", "--abbrev-ref", "HEAD"],
         ROOT_TIMEOUT,
@@ -141,49 +247,36 @@ pub fn remove_worktree(cwd: &Path) -> anyhow::Result<(PathBuf, BranchCleanup)> {
         "--ignored",
         "--untracked-files=normal",
     ];
-    let status = crate::git_cli::run_git(&worktree_root, &STATUS_ARGS, ROOT_TIMEOUT)?;
+    let status = run_git_status(&worktree_root, &STATUS_ARGS, ROOT_TIMEOUT)?;
     if submodules.is_empty() {
         // 추적 변경(` M` 등)은 git 자신이 --force 없는 remove에서 거부하므로 앱은
         // git이 못 보는 미추적/무시 파일만 판정한다.
-        if let Some(first) = status
+        if status
             .lines()
-            .find(|l| l.starts_with("!! ") || l.starts_with("?? "))
+            .any(|line| line.starts_with("!! ") || line.starts_with("?? "))
         {
-            anyhow::bail!(
-                "정리 안 된 파일이 있어 삭제를 거부합니다({}…) — 직접 정리 후 다시 시도하세요",
-                &first[3..]
-            );
+            anyhow::bail!("정리 안 된 파일이 있어 삭제를 거부합니다");
         }
     } else {
         // 서브모듈 모드 — 아래에서 --force를 쓰면 git 자체 dirty 검사가 통째로
         // 꺼지므로, 추적 변경 포함 모든 status 줄이 앱의 거부 사유로 승격된다.
         // (서브모듈 내부의 미추적/커밋 변경도 바깥에는 ` M <sub>` 한 줄로 보인다 —
         // 실측. 그래서 이 검사 하나가 서브모듈의 추적/미추적 변경까지 함께 막는다.)
-        if let Some(first) = status.lines().find(|l| !l.trim().is_empty()) {
-            anyhow::bail!(
-                "정리 안 된 변경이 있어 삭제를 거부합니다({}…) — 서브모듈이 있는 워크트리는 완전히 깨끗해야 합니다",
-                first.get(3..).unwrap_or(first)
-            );
+        if status.lines().any(|line| !line.trim().is_empty()) {
+            anyhow::bail!("정리 안 된 변경이 있어 삭제를 거부합니다");
         }
         for sub in &submodules {
-            let rel = sub
-                .strip_prefix(&worktree_root)
-                .unwrap_or(sub.as_path())
-                .display();
             // 서브모듈 안의 ignored 파일은 바깥 status에 전혀 안 보인다(실측) —
             // 재귀 스캔 없이는 --force가 그대로 지워버린다(루트의 codex P1과 동일).
-            let sub_status = crate::git_cli::run_git(sub, &STATUS_ARGS, ROOT_TIMEOUT)?;
-            if let Some(first) = sub_status.lines().find(|l| !l.trim().is_empty()) {
-                anyhow::bail!(
-                    "서브모듈에 정리 안 된 파일이 있어 삭제를 거부합니다({rel}: {}…) — 직접 정리 후 다시 시도하세요",
-                    first.get(3..).unwrap_or(first)
-                );
+            let sub_status = run_git_status(sub, &STATUS_ARGS, ROOT_TIMEOUT)?;
+            if sub_status.lines().any(|line| !line.trim().is_empty()) {
+                anyhow::bail!("서브모듈에 정리 안 된 파일이 있어 삭제를 거부합니다");
             }
             // 서브모듈 git 저장소는 `.git/worktrees/<id>/modules/` 안에 있어
             // 워크트리와 함께 지워진다 — HEAD 커밋이 어떤 원격 ref에도 없으면
             // 그 커밋 객체의 유일한 사본이 사라진다(바깥 status는 gitlink가
             // 커밋돼 있으면 깨끗하다). push로 사본이 생긴 뒤에만 지운다.
-            let remote_refs = crate::git_cli::run_git(
+            let remote_refs = run_git_ref_list(
                 sub,
                 &[
                     "branch",
@@ -195,9 +288,7 @@ pub fn remove_worktree(cwd: &Path) -> anyhow::Result<(PathBuf, BranchCleanup)> {
                 ROOT_TIMEOUT,
             )?;
             if remote_refs.lines().all(|l| l.trim().is_empty()) {
-                anyhow::bail!(
-                    "서브모듈에 push 안 된 커밋이 있어 삭제를 거부합니다({rel}) — push 후 다시 시도하세요"
-                );
+                anyhow::bail!("서브모듈에 push 안 된 커밋이 있어 삭제를 거부합니다");
             }
         }
     }
@@ -206,7 +297,7 @@ pub fn remove_worktree(cwd: &Path) -> anyhow::Result<(PathBuf, BranchCleanup)> {
     // `--separate-git-dir` 레포에서 틀린 경로가 나온다(codex P2) — 대신
     // `worktree list --porcelain`의 첫 항목이 항상 메인 워크트리라는 git 자체
     // 보장을 쓴다.
-    let listing = crate::git_cli::run_git(
+    let listing = run_git_worktree_list(
         &worktree_root,
         &["worktree", "list", "--porcelain"],
         ROOT_TIMEOUT,
@@ -216,9 +307,9 @@ pub fn remove_worktree(cwd: &Path) -> anyhow::Result<(PathBuf, BranchCleanup)> {
         .find_map(|l| l.strip_prefix("worktree "))
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("워크트리 목록에서 메인 레포를 찾지 못함"))?;
-    let target = worktree_root.to_str().ok_or_else(|| {
-        anyhow::anyhow!("워크트리 경로가 UTF-8이 아님: {}", worktree_root.display())
-    })?;
+    let target = worktree_root
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("worktree_path_invalid"))?;
     // 상주 서브모듈이 있으면 git이 깨끗해도 거부한다(위 doc 참조) — 위에서 루트·
     // 서브모듈 전부를 앱이 검사한 뒤에만 --force로 그 판정을 대신한다. 없으면
     // 기존대로 force 미사용(추적 변경 거부를 git에 맡긴다).
@@ -227,7 +318,7 @@ pub fn remove_worktree(cwd: &Path) -> anyhow::Result<(PathBuf, BranchCleanup)> {
     } else {
         &["worktree", "remove", "--force", target]
     };
-    crate::git_cli::run_git(&main_root, remove_args, ADD_TIMEOUT)?;
+    run_git_mutation(&main_root, remove_args, ADD_TIMEOUT)?;
     Ok((worktree_root, cleanup_branch(&main_root, &head_branch)))
 }
 
@@ -235,9 +326,65 @@ pub fn remove_worktree(cwd: &Path) -> anyhow::Result<(PathBuf, BranchCleanup)> {
 /// gitlink(mode 160000) 항목 중 `<path>/.git`이 실존하는 것만 센다 — 미상주(빈
 /// 폴더)는 git worktree remove가 force 없이도 지운다(git 2.50 실측).
 fn populated_submodules(repo: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut budget = PopulatedSubmoduleBudget::default();
+    let mut found = Vec::with_capacity(POPULATED_SUBMODULE_MAX_ITEMS.min(32));
+    collect_populated_submodules(repo, 0, &mut budget, &mut found)?;
+    Ok(found)
+}
+
+#[derive(Default)]
+struct PopulatedSubmoduleBudget {
+    candidates: usize,
+    index_bytes: usize,
+}
+
+impl PopulatedSubmoduleBudget {
+    fn reserve_candidate(&mut self, depth: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            depth <= POPULATED_SUBMODULE_MAX_DEPTH,
+            "worktree_submodule_depth_limit"
+        );
+        anyhow::ensure!(
+            self.candidates < POPULATED_SUBMODULE_MAX_ITEMS,
+            "worktree_submodule_item_limit"
+        );
+        self.candidates += 1;
+        Ok(())
+    }
+
+    fn remaining_index_bytes(&self) -> anyhow::Result<usize> {
+        let remaining = POPULATED_SUBMODULE_MAX_INDEX_BYTES.saturating_sub(self.index_bytes);
+        anyhow::ensure!(remaining > 0, "worktree_submodule_byte_limit");
+        Ok(remaining)
+    }
+
+    fn charge_index_bytes(&mut self, bytes: usize) -> anyhow::Result<()> {
+        self.index_bytes = self
+            .index_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| anyhow::anyhow!("worktree_submodule_byte_limit"))?;
+        anyhow::ensure!(
+            self.index_bytes <= POPULATED_SUBMODULE_MAX_INDEX_BYTES,
+            "worktree_submodule_byte_limit"
+        );
+        Ok(())
+    }
+}
+
+fn collect_populated_submodules(
+    repo: &Path,
+    depth: usize,
+    budget: &mut PopulatedSubmoduleBudget,
+    found: &mut Vec<PathBuf>,
+) -> anyhow::Result<()> {
     // -z: 경로에 특수문자가 있어도 인용 없이 NUL 구분 — 파싱이 흔들리지 않는다.
-    let listing = crate::git_cli::run_git(repo, &["ls-files", "-z", "--stage"], ROOT_TIMEOUT)?;
-    let mut found = Vec::new();
+    let listing = run_git_index_list(
+        repo,
+        &["ls-files", "-z", "--stage"],
+        ROOT_TIMEOUT,
+        budget.remaining_index_bytes()?,
+    )?;
+    budget.charge_index_bytes(listing.len())?;
     for entry in listing.split('\0') {
         // 항목 형식: "<mode> <sha> <stage>\t<path>".
         let Some((meta, path)) = entry.split_once('\t') else {
@@ -246,14 +393,18 @@ fn populated_submodules(repo: &Path) -> anyhow::Result<Vec<PathBuf>> {
         if !meta.starts_with("160000 ") {
             continue;
         }
+        let nested_depth = depth.saturating_add(1);
+        // Count every gitlink conservatively before allocating its path or starting nested Git.
+        // Unpopulated candidates therefore consume budget too, closing sparse/cyclic layouts.
+        budget.reserve_candidate(nested_depth)?;
         let sub = repo.join(path);
         // `.git`은 파일(gitdir 포인터)일 수도 디렉터리일 수도 있다 — 존재 = 상주.
         if sub.join(".git").exists() {
-            found.extend(populated_submodules(&sub)?);
+            collect_populated_submodules(&sub, nested_depth, budget, found)?;
             found.push(sub);
         }
     }
-    Ok(found)
+    Ok(())
 }
 
 /// 워크트리 삭제 성공 후 `deppy/<slug>` 브랜치 정리 — 고유 커밋이 없을 때만 지운다.
@@ -267,7 +418,7 @@ fn cleanup_branch(main_root: &Path, branch: &str) -> BranchCleanup {
         // detached("HEAD") 또는 사용자가 체크아웃을 바꾼 브랜치 — 앱 소유가 아니다.
         return BranchCleanup::Kept;
     }
-    let contains = crate::git_cli::run_git(
+    let contains = run_git_ref_list(
         main_root,
         &[
             "branch",
@@ -280,8 +431,13 @@ fn cleanup_branch(main_root: &Path, branch: &str) -> BranchCleanup {
     );
     let contains = match contains {
         Ok(out) => out,
-        Err(e) => {
-            tracing::warn!("브랜치 병합 판정 실패({branch}) — 보존: {e:#}");
+        Err(_) => {
+            tracing::warn!(
+                kind = "worktree",
+                phase = "branch_reachability",
+                error_code = "git_failed",
+                "worktree branch reachability check failed; preserving branch"
+            );
             return BranchCleanup::Kept;
         }
     };
@@ -292,10 +448,15 @@ fn cleanup_branch(main_root: &Path, branch: &str) -> BranchCleanup {
     if !reachable_elsewhere {
         return BranchCleanup::PreservedUnmerged;
     }
-    match crate::git_cli::run_git(main_root, &["branch", "-D", branch], ROOT_TIMEOUT) {
+    match run_git_mutation(main_root, &["branch", "-D", branch], ROOT_TIMEOUT) {
         Ok(_) => BranchCleanup::Deleted,
-        Err(e) => {
-            tracing::warn!("브랜치 삭제 실패({branch}) — 보존: {e:#}");
+        Err(_) => {
+            tracing::warn!(
+                kind = "worktree",
+                phase = "branch_cleanup",
+                error_code = "git_failed",
+                "worktree branch cleanup failed; preserving branch"
+            );
             BranchCleanup::Kept
         }
     }
@@ -354,14 +515,18 @@ fn slug_stamp(unix_secs: u64) -> String {
 
 /// 같은 초에 이미 슬러그가 있으면 `-2`, `-3`… 부번을 붙인다. 존재 판정을 클로저로
 /// 받아 파일시스템 없이 유닛 테스트 가능.
-fn unique_slug(stamp: &str, taken: impl Fn(&str) -> bool) -> String {
-    if !taken(stamp) {
-        return stamp.to_owned();
+fn unique_slug(stamp: &str, taken: impl Fn(&str) -> bool) -> anyhow::Result<String> {
+    for attempt in 1..=UNIQUE_SLUG_MAX_ATTEMPTS {
+        let candidate = if attempt == 1 {
+            stamp.to_owned()
+        } else {
+            format!("{stamp}-{attempt}")
+        };
+        if !taken(&candidate) {
+            return Ok(candidate);
+        }
     }
-    (2u32..)
-        .map(|n| format!("{stamp}-{n}"))
-        .find(|cand| !taken(cand))
-        .expect("부번은 언젠가 비어 있다")
+    anyhow::bail!("worktree_slug_attempt_limit")
 }
 
 /// exclude 내용에 `.deppy/` 항목이 이미 있는가 — 멱등 판정(유닛 테스트 대상).
@@ -369,14 +534,19 @@ fn exclude_has_entry(content: &str) -> bool {
     content.lines().any(|line| line.trim() == EXCLUDE_ENTRY)
 }
 
+fn exclude_append_fits(existing_bytes: usize, append_bytes: usize) -> bool {
+    existing_bytes
+        .checked_add(append_bytes)
+        .is_some_and(|final_bytes| final_bytes <= EXCLUDE_MAX_BYTES)
+}
+
 /// 레포의 `info/exclude`에 `.deppy/`를 보장한다. 이미 있으면 무변경.
 /// 기존 내용은 append로 보존한다 (읽기 실패·비UTF-8이어도 덮어쓰지 않는다).
 fn ensure_exclude(root: &Path) -> anyhow::Result<()> {
-    use std::io::Write;
     // linked worktree/submodule은 `<root>/.git`이 파일이라 경로를 조립하지 않고
     // git에게 묻는다 (codex P2). info/는 공용(common) 경로라 본 레포의 exclude로
     // 해석된다. 반환이 상대 경로면 root 기준이다 (`git -C root`로 실행하므로).
-    let answered = crate::git_cli::run_git(
+    let answered = run_git_scalar(
         root,
         &["rev-parse", "--git-path", "info/exclude"],
         ROOT_TIMEOUT,
@@ -387,31 +557,235 @@ fn ensure_exclude(root: &Path) -> anyhow::Result<()> {
     } else {
         root.join(answered)
     };
-    let existing = std::fs::read(&path)
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_default();
-    if exclude_has_entry(&existing) {
-        return Ok(());
-    }
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        std::fs::create_dir_all(dir)
+            .map_err(|_| anyhow::anyhow!("worktree_exclude_create_failed"))?;
     }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
-        .open(&path)?;
-    let newline = if existing.is_empty() || existing.ends_with('\n') {
-        ""
+        .open(&path)
+        .map_err(|_| anyhow::anyhow!("worktree_exclude_open_failed"))?;
+    file.try_lock()
+        .map_err(|_| anyhow::anyhow!("worktree_exclude_lock_failed"))?;
+
+    // One locked handle owns read -> validation -> append. The advisory lock serializes other app
+    // instances; the final metadata/position check also fails closed if a non-cooperating writer
+    // grew the file after the bounded read.
+    let existing_bytes = read_bounded(&mut file, EXCLUDE_MAX_BYTES)?;
+    if exclude_has_entry(&String::from_utf8_lossy(&existing_bytes)) {
+        return Ok(());
+    }
+    let append: &[u8] = if existing_bytes.is_empty() || existing_bytes.ends_with(b"\n") {
+        EXCLUDE_APPEND
     } else {
-        "\n"
+        EXCLUDE_APPEND_WITH_SEPARATOR
     };
-    writeln!(file, "{newline}{EXCLUDE_ENTRY}")?;
-    Ok(())
+    checked_exclude_append(&mut file, existing_bytes.len(), append)
+}
+
+fn checked_exclude_append(
+    file: &mut std::fs::File,
+    expected_bytes: usize,
+    append: &[u8],
+) -> anyhow::Result<()> {
+    use std::io::{Seek as _, Write as _};
+
+    anyhow::ensure!(
+        exclude_append_fits(expected_bytes, append.len()),
+        "worktree_exclude_size_limit"
+    );
+    let metadata_bytes = usize::try_from(
+        file.metadata()
+            .map_err(|_| anyhow::anyhow!("worktree_exclude_metadata_failed"))?
+            .len(),
+    )
+    .map_err(|_| anyhow::anyhow!("worktree_exclude_size_limit"))?;
+    let end = file
+        .seek(std::io::SeekFrom::End(0))
+        .map_err(|_| anyhow::anyhow!("worktree_exclude_seek_failed"))?;
+    anyhow::ensure!(
+        metadata_bytes == expected_bytes && end == expected_bytes as u64,
+        "worktree_exclude_changed"
+    );
+    file.write_all(append)
+        .map_err(|_| anyhow::anyhow!("worktree_exclude_write_failed"))
+}
+
+fn read_bounded(mut reader: impl std::io::Read, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+    let capture_bytes = max_bytes.saturating_add(1);
+    let mut chunk = [0u8; 64 * 1024];
+    while bytes.len() < capture_bytes {
+        let remaining = capture_bytes - bytes.len();
+        let chunk_len = chunk.len();
+        let read = reader
+            .read(&mut chunk[..remaining.min(chunk_len)])
+            .map_err(|_| anyhow::anyhow!("worktree_exclude_read_failed"))?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    anyhow::ensure!(bytes.len() <= max_bytes, "worktree_exclude_size_limit");
+    Ok(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::io::{Cursor, Write as _};
+
+    #[test]
+    fn git_output_item_limit은_exact를_허용하고_plus_one은_거부한다() {
+        let line_limit = GitOutputLimit {
+            bytes: 1024,
+            items: 3,
+            delimiter: '\n',
+            kind: "test-lines",
+        };
+        assert!(validate_git_output_items("a\nb\nc\n", line_limit).is_ok());
+        assert!(validate_git_output_items("a\nb\nc\nd\n", line_limit).is_err());
+
+        let nul_limit = GitOutputLimit {
+            delimiter: '\0',
+            kind: "test-nul",
+            ..line_limit
+        };
+        assert!(validate_git_output_items("a\0b\0c\0", nul_limit).is_ok());
+        assert!(validate_git_output_items("a\0b\0c\0d\0", nul_limit).is_err());
+    }
+
+    #[test]
+    fn production_worktree_git은_명령별_byte_item_limit을_우회하지_않는다() {
+        let source = include_str!("worktree.rs");
+        let production = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("tests marker")
+            .0;
+        assert!(!production.contains("crate::git_cli::run_git("));
+        assert!(production.contains("run_git_bounded"));
+        for limit in [
+            "GIT_SCALAR_LIMIT",
+            "GIT_MUTATION_LIMIT",
+            "GIT_STATUS_LIMIT",
+            "GIT_REF_LIST_LIMIT",
+            "GIT_WORKTREE_LIST_LIMIT",
+            "GIT_INDEX_LIST_LIMIT",
+        ] {
+            assert!(production.contains(limit), "missing {limit}");
+        }
+        assert!(production.contains("validate_git_output_items"));
+        assert!(production.contains("POPULATED_SUBMODULE_MAX_ITEMS"));
+        assert!(production.contains("POPULATED_SUBMODULE_MAX_DEPTH"));
+        assert!(production.contains("POPULATED_SUBMODULE_MAX_INDEX_BYTES"));
+        assert!(production.contains("budget.reserve_candidate(nested_depth)"));
+        assert!(production.contains("budget.remaining_index_bytes()?"));
+        assert!(production.contains("budget.charge_index_bytes(listing.len())"));
+        assert!(production.contains("UNIQUE_SLUG_MAX_ATTEMPTS"));
+        assert!(production.contains("EXCLUDE_MAX_BYTES"));
+        assert!(production.contains("read_bounded(&mut file, EXCLUDE_MAX_BYTES)"));
+        assert!(production.contains("file.try_lock()"));
+        assert!(production.contains("checked_exclude_append"));
+        assert!(!production.contains("std::fs::read(&path)"));
+    }
+
+    #[test]
+    fn submodule_aggregate_budget은_count와_depth_exact만_허용한다() {
+        let mut count = PopulatedSubmoduleBudget::default();
+        for _ in 0..POPULATED_SUBMODULE_MAX_ITEMS {
+            count.reserve_candidate(1).unwrap();
+        }
+        assert_eq!(count.candidates, POPULATED_SUBMODULE_MAX_ITEMS);
+        assert!(count.reserve_candidate(1).is_err());
+
+        let mut depth = PopulatedSubmoduleBudget::default();
+        depth
+            .reserve_candidate(POPULATED_SUBMODULE_MAX_DEPTH)
+            .unwrap();
+        assert!(
+            depth
+                .reserve_candidate(POPULATED_SUBMODULE_MAX_DEPTH + 1)
+                .is_err()
+        );
+
+        let mut bytes = PopulatedSubmoduleBudget::default();
+        bytes
+            .charge_index_bytes(POPULATED_SUBMODULE_MAX_INDEX_BYTES)
+            .unwrap();
+        assert_eq!(bytes.index_bytes, POPULATED_SUBMODULE_MAX_INDEX_BYTES);
+        assert!(bytes.remaining_index_bytes().is_err());
+        assert!(bytes.charge_index_bytes(1).is_err());
+    }
+
+    #[test]
+    fn bounded_exclude_read는_exact를_허용하고_plus_one은_거부한다() {
+        let exact = read_bounded(Cursor::new(vec![b'x'; 64]), 64).unwrap();
+        assert_eq!(exact.len(), 64);
+        assert!(read_bounded(Cursor::new(vec![b'x'; 65]), 64).is_err());
+
+        let exact_existing = EXCLUDE_MAX_BYTES - EXCLUDE_APPEND.len();
+        assert!(exclude_append_fits(exact_existing, EXCLUDE_APPEND.len()));
+        assert!(!exclude_append_fits(
+            exact_existing + 1,
+            EXCLUDE_APPEND.len()
+        ));
+
+        let exact_without_newline = EXCLUDE_MAX_BYTES - EXCLUDE_APPEND_WITH_SEPARATOR.len();
+        assert!(exclude_append_fits(
+            exact_without_newline,
+            EXCLUDE_APPEND_WITH_SEPARATOR.len()
+        ));
+        assert!(!exclude_append_fits(
+            exact_without_newline + 1,
+            EXCLUDE_APPEND_WITH_SEPARATOR.len()
+        ));
+    }
+
+    #[test]
+    fn ensure_exclude는_final_size_exact를_허용하고_plus_one은_거부한다() {
+        let repo = temp_repo();
+        let path = repo.join(".git/info/exclude");
+
+        let exact_existing = EXCLUDE_MAX_BYTES - EXCLUDE_APPEND_WITH_SEPARATOR.len();
+        std::fs::write(&path, vec![b'x'; exact_existing]).unwrap();
+        ensure_exclude(&repo).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            EXCLUDE_MAX_BYTES as u64
+        );
+
+        std::fs::write(&path, vec![b'x'; exact_existing + 1]).unwrap();
+        let error = ensure_exclude(&repo).unwrap_err();
+        assert_eq!(error.to_string(), "worktree_exclude_size_limit");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            (exact_existing + 1) as u64
+        );
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn exclude_append는_bounded_read후_growth를_거부한다() {
+        let repo = temp_repo();
+        let path = repo.join(".git/info/exclude-race");
+        std::fs::write(&path, b"existing\n").unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.try_lock().unwrap();
+        let existing = read_bounded(&mut file, EXCLUDE_MAX_BYTES).unwrap();
+        file.write_all(b"concurrent\n").unwrap();
+
+        let error = checked_exclude_append(&mut file, existing.len(), EXCLUDE_APPEND).unwrap_err();
+        assert_eq!(error.to_string(), "worktree_exclude_changed");
+        assert!(!std::fs::read(&path).unwrap().ends_with(EXCLUDE_APPEND));
+        std::fs::remove_dir_all(&repo).ok();
+    }
 
     #[test]
     fn slug_stamp은_yymmdd_hhmmss_형식이다() {
@@ -423,12 +797,34 @@ mod tests {
 
     #[test]
     fn unique_slug은_충돌_시_부번을_붙인다() {
-        assert_eq!(unique_slug("wt-a", |_| false), "wt-a");
-        assert_eq!(unique_slug("wt-a", |s| s == "wt-a"), "wt-a-2");
+        assert_eq!(unique_slug("wt-a", |_| false).unwrap(), "wt-a");
+        assert_eq!(unique_slug("wt-a", |s| s == "wt-a").unwrap(), "wt-a-2");
         assert_eq!(
-            unique_slug("wt-a", |s| s == "wt-a" || s == "wt-a-2"),
+            unique_slug("wt-a", |s| s == "wt-a" || s == "wt-a-2").unwrap(),
             "wt-a-3"
         );
+    }
+
+    #[test]
+    fn unique_slug은_exact_attempt에서_성공하고_plus_one_git호출을_막는다() {
+        let exact_calls = Cell::new(0u32);
+        let slug = unique_slug("wt-a", |_| {
+            let call = exact_calls.get() + 1;
+            exact_calls.set(call);
+            call < UNIQUE_SLUG_MAX_ATTEMPTS
+        })
+        .unwrap();
+        assert_eq!(slug, format!("wt-a-{UNIQUE_SLUG_MAX_ATTEMPTS}"));
+        assert_eq!(exact_calls.get(), UNIQUE_SLUG_MAX_ATTEMPTS);
+
+        let rejected_calls = Cell::new(0u32);
+        let error = unique_slug("wt-a", |_| {
+            rejected_calls.set(rejected_calls.get() + 1);
+            true
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "worktree_slug_attempt_limit");
+        assert_eq!(rejected_calls.get(), UNIQUE_SLUG_MAX_ATTEMPTS);
     }
 
     #[test]
@@ -602,7 +998,9 @@ mod tests {
             "무시된 파일이 있으면 지워지면 안 된다: {}",
             path.display()
         );
-        assert!(format!("{err:#}").contains("정리 안 된 파일"));
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("정리 안 된 파일"));
+        assert!(!rendered.contains("secret.local"));
         std::fs::remove_dir_all(&repo).ok();
     }
 
@@ -620,7 +1018,9 @@ mod tests {
             "dirty면 지워지면 안 된다: {}",
             path.display()
         );
-        assert!(format!("{err:#}").contains("정리 안 된 파일"));
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("정리 안 된 파일"));
+        assert!(!rendered.contains("dirty.txt"));
         std::fs::remove_dir_all(&repo).ok();
     }
 
@@ -647,7 +1047,9 @@ mod tests {
     fn remove_worktree는_deppy_워크트리가_아니면_거부한다() {
         let repo = temp_repo();
         let err = remove_worktree(&repo).unwrap_err();
-        assert!(format!("{err:#}").contains("deppy 워크트리가 아님"));
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("deppy 워크트리가 아님"));
+        assert!(!rendered.contains(&repo.display().to_string()));
         std::fs::remove_dir_all(&repo).ok();
     }
 

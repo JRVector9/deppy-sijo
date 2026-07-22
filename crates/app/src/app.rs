@@ -5428,6 +5428,10 @@ fn open_connector_sensitive_url(url: &connector_contract::SensitiveInput) -> boo
 
 const APP_HOST_PATH_MAX_BYTES: usize = 32 * 1024;
 const APP_HOST_URL_MAX_BYTES: usize = 32 * 1024;
+const APP_HOST_FILE_OPERATION_MAX_ITEMS: usize = 50_000;
+const APP_HOST_FILE_OPERATION_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const APP_HOST_FILE_OPERATION_MAX_DEPTH: usize = 128;
+const APP_HOST_FILE_COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 fn is_bounded_https_url(url: &str) -> bool {
     url.len() <= APP_HOST_URL_MAX_BYTES
@@ -5948,6 +5952,7 @@ struct AppHostIoTask {
     result_rx: std::sync::mpsc::Receiver<AppHostIoCompletion>,
     handle: std::thread::JoinHandle<()>,
     fallback: AppHostIoFallback,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppHostIoTask {
@@ -5956,11 +5961,13 @@ impl AppHostIoTask {
         let fallback_on_spawn = fallback.clone();
         let fallback_on_panic = fallback.clone();
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
         let handle = std::thread::Builder::new()
             .name("app-host-io".to_owned())
             .spawn(move || {
                 let completion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_app_host_io(action)
+                    run_app_host_io(action, worker_cancel.as_ref())
                 }))
                 .unwrap_or_else(|_| fallback_on_panic.into_completion());
                 if result_tx.send(completion).is_ok() {
@@ -5972,6 +5979,7 @@ impl AppHostIoTask {
             result_rx,
             handle,
             fallback,
+            cancel,
         })
     }
 }
@@ -6175,10 +6183,87 @@ fn app_host_remove_all(path: &Path) -> std::io::Result<()> {
     }
 }
 
-fn app_host_copy_recursive(source: &Path, destination: &Path) -> std::io::Result<()> {
+#[derive(Default)]
+struct AppHostFileOperationBudget {
+    items: usize,
+    bytes: u64,
+}
+
+impl AppHostFileOperationBudget {
+    fn consume_item(&mut self, depth: usize) -> std::io::Result<()> {
+        if depth > APP_HOST_FILE_OPERATION_MAX_DEPTH {
+            return Err(std::io::Error::other("file_operation_depth_limit"));
+        }
+        self.items = self
+            .items
+            .checked_add(1)
+            .filter(|items| *items <= APP_HOST_FILE_OPERATION_MAX_ITEMS)
+            .ok_or_else(|| std::io::Error::other("file_operation_item_limit"))?;
+        Ok(())
+    }
+
+    fn consume_bytes(&mut self, bytes: u64) -> std::io::Result<()> {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .filter(|bytes| *bytes <= APP_HOST_FILE_OPERATION_MAX_BYTES)
+            .ok_or_else(|| std::io::Error::other("file_operation_byte_limit"))?;
+        Ok(())
+    }
+}
+
+fn app_host_file_operation_cancelled(
+    cancel: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<()> {
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+    } else {
+        Ok(())
+    }
+}
+
+fn app_host_validate_tree(
+    source: &Path,
+    budget: &mut AppHostFileOperationBudget,
+    cancel: &std::sync::atomic::AtomicBool,
+    depth: usize,
+) -> std::io::Result<()> {
+    app_host_file_operation_cancelled(cancel)?;
+    budget.consume_item(depth)?;
     let file_type = std::fs::symlink_metadata(source)?.file_type();
     if file_type.is_symlink() {
         let target = std::fs::read_link(source)?;
+        return budget.consume_bytes(target.as_os_str().as_encoded_bytes().len() as u64);
+    }
+    if file_type.is_dir() {
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            app_host_validate_tree(&entry.path(), budget, cancel, depth.saturating_add(1))?;
+        }
+        return Ok(());
+    }
+    if !file_type.is_file() {
+        return Err(std::io::Error::other("unsupported_file_type"));
+    }
+    budget.consume_bytes(std::fs::symlink_metadata(source)?.len())
+}
+
+fn app_host_copy_recursive(
+    source: &Path,
+    destination: &Path,
+    budget: &mut AppHostFileOperationBudget,
+    cancel: &std::sync::atomic::AtomicBool,
+    depth: usize,
+) -> std::io::Result<()> {
+    use std::io::{Read as _, Write as _};
+
+    app_host_file_operation_cancelled(cancel)?;
+    budget.consume_item(depth)?;
+    let metadata = std::fs::symlink_metadata(source)?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        let target = std::fs::read_link(source)?;
+        budget.consume_bytes(target.as_os_str().as_encoded_bytes().len() as u64)?;
         #[cfg(unix)]
         return std::os::unix::fs::symlink(target, destination);
         #[cfg(not(unix))]
@@ -6191,14 +6276,45 @@ fn app_host_copy_recursive(source: &Path, destination: &Path) -> std::io::Result
         std::fs::create_dir(destination)?;
         for entry in std::fs::read_dir(source)? {
             let entry = entry?;
-            app_host_copy_recursive(&entry.path(), &destination.join(entry.file_name()))?;
+            app_host_copy_recursive(
+                &entry.path(),
+                &destination.join(entry.file_name()),
+                budget,
+                cancel,
+                depth.saturating_add(1),
+            )?;
         }
+        std::fs::set_permissions(destination, metadata.permissions())?;
         return Ok(());
     }
-    std::fs::copy(source, destination).map(|_| ())
+    if !file_type.is_file() {
+        return Err(std::io::Error::other("unsupported_file_type"));
+    }
+    let mut input = std::fs::File::open(source)?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    let mut buffer = vec![0_u8; APP_HOST_FILE_COPY_BUFFER_BYTES];
+    loop {
+        app_host_file_operation_cancelled(cancel)?;
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        budget.consume_bytes(read as u64)?;
+        output.write_all(&buffer[..read])?;
+    }
+    output.flush()?;
+    std::fs::set_permissions(destination, metadata.permissions())
 }
 
-fn app_host_copy_into(source: &Path, destination_dir: &Path) -> Result<(), ()> {
+fn app_host_copy_into(
+    source: &Path,
+    destination_dir: &Path,
+    budget: &mut AppHostFileOperationBudget,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), ()> {
     let name = source.file_name().ok_or(())?;
     if let Ok(source_real) = std::fs::canonicalize(source)
         && destination_dir.starts_with(source_real)
@@ -6207,7 +6323,11 @@ fn app_host_copy_into(source: &Path, destination_dir: &Path) -> Result<(), ()> {
     }
     let destination = destination_dir.join(name);
     let temporary = destination_dir.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
-    if app_host_copy_recursive(source, &temporary).is_err() {
+    if app_host_copy_recursive(source, &temporary, budget, cancel, 0).is_err() {
+        let _ = app_host_remove_all(&temporary);
+        return Err(());
+    }
+    if app_host_file_operation_cancelled(cancel).is_err() {
         let _ = app_host_remove_all(&temporary);
         return Err(());
     }
@@ -6222,6 +6342,7 @@ fn app_host_move(
     root: &Path,
     source: &Path,
     destination_dir: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<(), ui::file_tree::FileTreeIoErrorCode> {
     let root =
         std::fs::canonicalize(root).map_err(|_| ui::file_tree::FileTreeIoErrorCode::OutsideRoot)?;
@@ -6245,11 +6366,21 @@ fn app_host_move(
         return Ok(());
     }
     let destination = destination_dir.join(name);
+    app_host_file_operation_cancelled(cancel)
+        .map_err(|_| ui::file_tree::FileTreeIoErrorCode::NativeFailure)?;
     match app_host_rename_no_replace(&source, &destination) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+            let mut validation = AppHostFileOperationBudget::default();
+            app_host_validate_tree(&source, &mut validation, cancel, 0)
+                .map_err(|_| ui::file_tree::FileTreeIoErrorCode::NativeFailure)?;
             let temporary = destination_dir.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
-            if app_host_copy_recursive(&source, &temporary).is_err() {
+            let mut copy_budget = AppHostFileOperationBudget::default();
+            if app_host_copy_recursive(&source, &temporary, &mut copy_budget, cancel, 0).is_err() {
+                let _ = app_host_remove_all(&temporary);
+                return Err(ui::file_tree::FileTreeIoErrorCode::NativeFailure);
+            }
+            if app_host_file_operation_cancelled(cancel).is_err() {
                 let _ = app_host_remove_all(&temporary);
                 return Err(ui::file_tree::FileTreeIoErrorCode::NativeFailure);
             }
@@ -6273,6 +6404,7 @@ fn app_host_move(
 
 fn run_file_tree_host_io(
     request: ui::file_tree::FileTreeIoRequest,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<(), ui::file_tree::FileTreeIoErrorCode> {
     use ui::file_tree::{FileTreeIoErrorCode as Error, FileTreeIoRequest as Request};
     match request {
@@ -6326,15 +6458,28 @@ fn run_file_tree_host_io(
             root,
             source,
             destination,
-        } => app_host_move(root.as_path(), source.as_path(), destination.as_path()),
+        } => app_host_move(
+            root.as_path(),
+            source.as_path(),
+            destination.as_path(),
+            cancel,
+        ),
         Request::CopyInto {
             sources,
             destination,
         } => {
             let destination =
                 std::fs::canonicalize(destination.into_path()).map_err(|_| Error::InvalidPath)?;
-            for source in sources.into_paths() {
-                app_host_copy_into(&source, &destination).map_err(|_| Error::NativeFailure)?;
+            let sources = sources.into_paths();
+            let mut validation = AppHostFileOperationBudget::default();
+            for source in &sources {
+                app_host_validate_tree(source, &mut validation, cancel, 0)
+                    .map_err(|_| Error::NativeFailure)?;
+            }
+            let mut copy_budget = AppHostFileOperationBudget::default();
+            for source in sources {
+                app_host_copy_into(&source, &destination, &mut copy_budget, cancel)
+                    .map_err(|_| Error::NativeFailure)?;
             }
             Ok(())
         }
@@ -6344,15 +6489,30 @@ fn run_file_tree_host_io(
             };
             let destination =
                 std::fs::canonicalize(destination.into_path()).map_err(|_| Error::InvalidPath)?;
+            let mut validation = AppHostFileOperationBudget::default();
+            for source in &sources {
+                app_host_validate_tree(source, &mut validation, cancel, 0)
+                    .map_err(|_| Error::NativeFailure)?;
+            }
+            let mut copy_budget = AppHostFileOperationBudget::default();
             for source in sources {
-                app_host_copy_into(&source, &destination).map_err(|_| Error::NativeFailure)?;
+                app_host_copy_into(&source, &destination, &mut copy_budget, cancel)
+                    .map_err(|_| Error::NativeFailure)?;
             }
             Ok(())
         }
         Request::Trash { target } => {
+            let mut validation = AppHostFileOperationBudget::default();
+            app_host_validate_tree(target.as_path(), &mut validation, cancel, 0)
+                .map_err(|_| Error::TrashUnavailable)?;
+            app_host_file_operation_cancelled(cancel).map_err(|_| Error::TrashUnavailable)?;
             trash::delete(target.as_path()).map_err(|_| Error::TrashUnavailable)
         }
         Request::DeletePermanently { target } => {
+            let mut validation = AppHostFileOperationBudget::default();
+            app_host_validate_tree(target.as_path(), &mut validation, cancel, 0)
+                .map_err(|_| Error::NativeFailure)?;
+            app_host_file_operation_cancelled(cancel).map_err(|_| Error::NativeFailure)?;
             app_host_remove_all(target.as_path()).map_err(|_| Error::NativeFailure)
         }
         Request::CopyFileUrls { paths } => {
@@ -6463,7 +6623,10 @@ fn run_file_tree_listing(
     ui::file_tree::FileTreeListingSnapshot::try_new(items)
 }
 
-fn run_app_host_io(action: AppHostIoAction) -> AppHostIoCompletion {
+fn run_app_host_io(
+    action: AppHostIoAction,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> AppHostIoCompletion {
     match action {
         AppHostIoAction::Workspace {
             workspace_id,
@@ -6537,7 +6700,7 @@ fn run_app_host_io(action: AppHostIoAction) -> AppHostIoCompletion {
             AppHostIoCompletion::FileTree(ui::file_tree::FileTreeIoCompletion {
                 operation,
                 generation,
-                result: run_file_tree_host_io(intent.request),
+                result: run_file_tree_host_io(intent.request, cancel),
             })
         }
         AppHostIoAction::FileTreeMaintenance(intent) => {
@@ -12663,6 +12826,8 @@ impl App {
             bench.finish();
         }
         if let Some(task) = self.app_host_io.take() {
+            task.cancel
+                .store(true, std::sync::atomic::Ordering::Release);
             let _ = task.handle.join();
         }
         // 마지막 App Server 이벤트가 만든 thread metadata를 종료 전에 한 번 더 반영한다.
@@ -15484,6 +15649,74 @@ mod tests {
         assert!(!is_bounded_https_url(&exact));
         assert!(!is_bounded_https_url("http://example.com"));
         assert!(!is_bounded_https_url("https://example.com\nsecret"));
+    }
+
+    #[test]
+    fn app_host_file_budget은_exact_item_byte_depth만_허용한다() {
+        let mut budget = AppHostFileOperationBudget::default();
+        for _ in 0..APP_HOST_FILE_OPERATION_MAX_ITEMS {
+            budget
+                .consume_item(APP_HOST_FILE_OPERATION_MAX_DEPTH)
+                .unwrap();
+        }
+        assert!(
+            budget
+                .consume_item(APP_HOST_FILE_OPERATION_MAX_DEPTH)
+                .is_err()
+        );
+
+        let mut budget = AppHostFileOperationBudget::default();
+        budget
+            .consume_bytes(APP_HOST_FILE_OPERATION_MAX_BYTES)
+            .unwrap();
+        assert!(budget.consume_bytes(1).is_err());
+
+        let mut budget = AppHostFileOperationBudget::default();
+        assert!(
+            budget
+                .consume_item(APP_HOST_FILE_OPERATION_MAX_DEPTH + 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn app_host_file_copy는_cancel이면_destination을_만들지_않는다() {
+        let root = std::env::temp_dir().join(format!(
+            "deppy-app-host-cancel-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.bin");
+        let destination = root.join("destination.bin");
+        std::fs::write(&source, vec![7_u8; APP_HOST_FILE_COPY_BUFFER_BYTES * 2]).unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let mut budget = AppHostFileOperationBudget::default();
+        assert!(app_host_copy_recursive(&source, &destination, &mut budget, &cancel, 0).is_err());
+        assert!(!destination.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn app_host_file_move는_cancel이면_source를_보존한다() {
+        let root = std::env::temp_dir().join(format!(
+            "deppy-app-host-move-cancel-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let destination_dir = root.join("destination");
+        std::fs::create_dir_all(&destination_dir).unwrap();
+        let source = root.join("source.bin");
+        std::fs::write(&source, b"bounded").unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+
+        assert_eq!(
+            app_host_move(&root, &source, &destination_dir, &cancel),
+            Err(ui::file_tree::FileTreeIoErrorCode::NativeFailure)
+        );
+        assert!(source.exists());
+        assert!(!destination_dir.join("source.bin").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -15,6 +15,9 @@
 
 use std::io::Read;
 use std::path::Path;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -22,176 +25,375 @@ use anyhow::Context;
 /// macOS CLT의 git 셔틀 — PATH 비의존.
 pub const GIT_BIN: &str = "/usr/bin/git";
 
-/// `git -C <repo> <args…>`를 실행해 stdout(UTF-8 lossy)을 돌려준다.
-/// 비정상 종료는 stderr를 담은 에러, 타임아웃은 kill 후 에러.
-pub fn run_git(repo: &Path, args: &[&str], timeout: Duration) -> anyhow::Result<String> {
-    use std::process::{Command, Stdio};
-    let mut child = Command::new(GIT_BIN)
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("{GIT_BIN} 실행 실패 (Command Line Tools 미설치?)"))?;
+/// Test/setup callers that do not need a tighter semantic ceiling still cannot retain arbitrary
+/// command output. Every production consumer uses [`run_git_bounded`] with a command-specific
+/// limit and validates item count before acting on the result.
+#[cfg(test)]
+const DEFAULT_STDOUT_MAX_BYTES: usize = 8 * 1024 * 1024;
+const STDERR_MAX_BYTES: usize = 64 * 1024;
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-    // 파이프를 즉시 비우는 리더 — 자식이 파이프 가득참으로 블록되지 않게 한다.
-    fn drain<R: Read + Send + 'static>(src: Option<R>) -> std::sync::mpsc::Receiver<Vec<u8>> {
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        if let Some(mut r) = src {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = r.read_to_end(&mut buf);
-                let _ = tx.send(buf);
-            });
-        }
-        rx
-    }
-    let out_rx = drain(child.stdout.take());
-    let err_rx = drain(child.stderr.take());
-
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait()? {
-            Some(status) => break status,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                anyhow::bail!(
-                    "git {}가 {:?} 안에 끝나지 않아 중단했습니다",
-                    args.first().unwrap_or(&""),
-                    timeout
-                );
-            }
-            None => std::thread::sleep(Duration::from_millis(20)),
-        }
-    };
-    let stdout = out_rx.recv().unwrap_or_default();
-    let stderr = err_rx.recv().unwrap_or_default();
-    if !status.success() {
-        anyhow::bail!(
-            "git {} 실패 ({status}): {}",
-            args.join(" "),
-            String::from_utf8_lossy(&stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&stdout).into_owned())
+#[derive(Debug)]
+struct BoundedCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
 }
 
-/// [`run_git`]의 stdout 상한판 — 리더가 `max_bytes`에 닿으면 읽기를 멈추고 부모가
+fn read_bounded(
+    mut reader: impl Read,
+    max_bytes: usize,
+    limit_reached: &AtomicBool,
+    retain: bool,
+) -> std::io::Result<BoundedCapture> {
+    let mut bytes = Vec::with_capacity(if retain { max_bytes.min(64 * 1024) } else { 0 });
+    let capture_bytes = max_bytes.saturating_add(1);
+    let mut observed_bytes = 0usize;
+    let mut chunk = [0u8; 64 * 1024];
+    while observed_bytes < capture_bytes {
+        let remaining = capture_bytes - observed_bytes;
+        let chunk_len = chunk.len();
+        let read = reader.read(&mut chunk[..remaining.min(chunk_len)])?;
+        if read == 0 {
+            break;
+        }
+        observed_bytes += read;
+        if retain {
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+    }
+    let truncated = observed_bytes > max_bytes;
+    if truncated {
+        if retain {
+            bytes.truncate(max_bytes);
+        }
+        limit_reached.store(true, Ordering::Release);
+    }
+    Ok(BoundedCapture { bytes, truncated })
+}
+
+struct RunningGit {
+    child: Child,
+    reaped: bool,
+    stdout_reader: Option<std::thread::JoinHandle<std::io::Result<BoundedCapture>>>,
+    stderr_reader: Option<std::thread::JoinHandle<std::io::Result<BoundedCapture>>>,
+    stdout_limit_reached: Arc<AtomicBool>,
+    stderr_limit_reached: Arc<AtomicBool>,
+    #[cfg(test)]
+    active_readers: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl RunningGit {
+    fn spawn(
+        repo: &Path,
+        args: &[&str],
+        stdout_max_bytes: usize,
+        stderr_max_bytes: usize,
+    ) -> anyhow::Result<Self> {
+        let mut command = Command::new(GIT_BIN);
+        command
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // Each command owns a process group. Timeout/output-limit cleanup therefore closes pipes
+        // inherited by helpers too, so joining the two fixed readers cannot wait on descendants.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|_| anyhow::anyhow!("git_spawn_failed"))?;
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let stdout_limit_reached = Arc::new(AtomicBool::new(false));
+        let stderr_limit_reached = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let active_readers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut running = Self {
+            child,
+            reaped: false,
+            stdout_reader: None,
+            stderr_reader: None,
+            stdout_limit_reached,
+            stderr_limit_reached,
+            #[cfg(test)]
+            active_readers,
+        };
+
+        let stdout = stdout.context("git stdout pipe missing")?;
+        let stdout_limit = Arc::clone(&running.stdout_limit_reached);
+        #[cfg(test)]
+        let stdout_active = Arc::clone(&running.active_readers);
+        running.stdout_reader = Some(
+            std::thread::Builder::new()
+                .name("git-stdout".to_owned())
+                .spawn(move || {
+                    #[cfg(test)]
+                    let _reader = TestReaderGuard::new(stdout_active);
+                    read_bounded(stdout, stdout_max_bytes, &stdout_limit, true)
+                })
+                .context("git stdout reader thread spawn failed")?,
+        );
+        let stderr = stderr.context("git stderr pipe missing")?;
+        let stderr_limit = Arc::clone(&running.stderr_limit_reached);
+        #[cfg(test)]
+        let stderr_active = Arc::clone(&running.active_readers);
+        running.stderr_reader = Some(
+            std::thread::Builder::new()
+                .name("git-stderr".to_owned())
+                .spawn(move || {
+                    #[cfg(test)]
+                    let _reader = TestReaderGuard::new(stderr_active);
+                    read_bounded(stderr, stderr_max_bytes, &stderr_limit, false)
+                })
+                .context("git stderr reader thread spawn failed")?,
+        );
+        Ok(running)
+    }
+
+    fn output_limit_reached(&self) -> bool {
+        self.stdout_limit_reached.load(Ordering::Acquire)
+            || self.stderr_limit_reached.load(Ordering::Acquire)
+    }
+
+    #[cfg(unix)]
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        // WNOWAIT observes the exit while deliberately keeping the group leader as a zombie.
+        // Its pid/pgid therefore cannot be reused before descendants are killed and pipes close.
+        // SAFETY: a zeroed siginfo_t is valid storage for waitid to initialize.
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        // SAFETY: info is valid writable storage, the id is the live child group leader pid, and
+        // the flags only observe an exited child without reaping it.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: waitid initialized info on success; si_pid == 0 is WNOHANG's no-event marker.
+        if unsafe { info.si_pid() } == 0 {
+            return Ok(None);
+        }
+        self.kill_descendants();
+        let status = self.child.wait()?;
+        self.reaped = true;
+        Ok(Some(status))
+    }
+
+    #[cfg(not(unix))]
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            self.reaped = true;
+        }
+        Ok(status)
+    }
+
+    #[cfg(unix)]
+    fn kill_descendants(&self) {
+        // SAFETY: spawn configured the child's pid as a new process-group id. ESRCH is the normal
+        // no-descendant case after a clean exit; every error is best-effort cleanup only.
+        unsafe {
+            libc::killpg(self.child.id() as libc::pid_t, libc::SIGKILL);
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn kill_descendants(&self) {}
+
+    fn kill_and_reap(&mut self) -> std::io::Result<ExitStatus> {
+        if !self.reaped {
+            self.kill_descendants();
+            let _ = self.child.kill();
+            let status = self.child.wait()?;
+            self.reaped = true;
+            Ok(status)
+        } else {
+            self.child.wait()
+        }
+    }
+
+    fn join_readers(&mut self) -> anyhow::Result<(BoundedCapture, BoundedCapture)> {
+        fn join(
+            kind: &str,
+            handle: Option<std::thread::JoinHandle<std::io::Result<BoundedCapture>>>,
+        ) -> anyhow::Result<BoundedCapture> {
+            handle
+                .context(format!("git_{kind}_reader_missing"))?
+                .join()
+                .map_err(|_| anyhow::anyhow!("git_{kind}_reader_panicked"))?
+                .map_err(|_| anyhow::anyhow!("git_{kind}_capture_failed"))
+        }
+        let stdout = join("stdout", self.stdout_reader.take())?;
+        let stderr = join("stderr", self.stderr_reader.take())?;
+        Ok((stdout, stderr))
+    }
+}
+
+impl Drop for RunningGit {
+    fn drop(&mut self) {
+        let _ = self.kill_and_reap();
+        let _ = self.join_readers();
+    }
+}
+
+struct GitExecution {
+    status: ExitStatus,
+    stdout: BoundedCapture,
+    stderr: BoundedCapture,
+    killed_for_limit: bool,
+    #[cfg(test)]
+    active_readers_after_join: usize,
+}
+
+#[cfg(test)]
+struct TestReaderGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(test)]
+impl TestReaderGuard {
+    fn new(active: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        active.fetch_add(1, Ordering::AcqRel);
+        Self(active)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestReaderGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn execute_bounded(
+    repo: &Path,
+    args: &[&str],
+    timeout: Duration,
+    stdout_max_bytes: usize,
+) -> anyhow::Result<GitExecution> {
+    let mut running = RunningGit::spawn(repo, args, stdout_max_bytes, STDERR_MAX_BYTES)?;
+    let started = Instant::now();
+    let (status, killed_for_limit) = loop {
+        if running.output_limit_reached() {
+            let status = running
+                .kill_and_reap()
+                .map_err(|_| anyhow::anyhow!("git_reap_failed"))?;
+            break (status, true);
+        }
+        match running.try_wait() {
+            Ok(Some(status)) => break (status, false),
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = running.kill_and_reap();
+                let _ = running.join_readers();
+                anyhow::bail!("git_timeout");
+            }
+            Ok(None) => std::thread::sleep(PROCESS_POLL_INTERVAL),
+            Err(error) => {
+                let _ = running.kill_and_reap();
+                let _ = running.join_readers();
+                let _ = error;
+                anyhow::bail!("git_wait_failed");
+            }
+        }
+    };
+    let (stdout, stderr) = running.join_readers()?;
+    let killed_for_limit = killed_for_limit || stdout.truncated || stderr.truncated;
+    #[cfg(test)]
+    let active_readers_after_join = running.active_readers.load(Ordering::Acquire);
+    Ok(GitExecution {
+        status,
+        stdout,
+        stderr,
+        killed_for_limit,
+        #[cfg(test)]
+        active_readers_after_join,
+    })
+}
+
+/// 테스트/fixture용 기본 상한 실행기. Production은 항상 명령별 상한을 직접 고른다.
+#[cfg(test)]
+pub fn run_git(repo: &Path, args: &[&str], timeout: Duration) -> anyhow::Result<String> {
+    run_git_bounded(repo, args, timeout, DEFAULT_STDOUT_MAX_BYTES)
+}
+
+/// Exact-output Git command with a caller-selected retained-byte ceiling. Reaching `max_bytes + 1`
+/// kills and reaps the command group and fails closed; exactly `max_bytes` is accepted.
+pub fn run_git_bounded(
+    repo: &Path,
+    args: &[&str],
+    timeout: Duration,
+    max_bytes: usize,
+) -> anyhow::Result<String> {
+    let execution = execute_bounded(repo, args, timeout, max_bytes)?;
+    if execution.stderr.truncated {
+        anyhow::bail!("git_stderr_limit");
+    }
+    if execution.stdout.truncated {
+        anyhow::bail!("git_stdout_limit");
+    }
+    if !execution.status.success() {
+        anyhow::bail!("git_command_failed");
+    }
+    Ok(String::from_utf8_lossy(&execution.stdout.bytes).into_owned())
+}
+
+/// [`run_git_bounded`]의 stdout 잘림 허용판 — 리더가 `max_bytes`에 닿으면 부모가
 /// 자식을 kill해 `(지금까지의 출력, 잘림 여부)`를 돌려준다. 전량 버퍼링 후 클립은
 /// 거대 diff에서 수백 MB를 상주시키므로 diff 수집 계열은 이 함수를 쓴다 (codex 리뷰).
 ///
-/// [`run_git`]과 달리 종료코드 1을 성공으로 본다 — diff 계열의 `--exit-code` 관례
+/// [`run_git_bounded`]와 달리 종료코드 1을 성공으로 본다 — diff 계열의 `--exit-code` 관례
 /// (`--no-index`가 이를 함축: 1 = 차이 있음)이고, git의 실제 오류는 128/129로
 /// 떨어진다. 상한 kill로 죽은 자식도 성공이다(필요한 출력은 이미 확보됨).
-/// 출력이 정확히 상한 길이로 끝나는 경계는 잘림으로 본다(오탐 1회가 무한 버퍼링보다
-/// 낫다).
+/// 출력이 정확히 상한 길이로 끝나면 온전한 결과이고, 한 바이트라도 넘을 때만 잘림이다.
 pub fn run_git_limited(
     repo: &Path,
     args: &[&str],
     timeout: Duration,
     max_bytes: usize,
 ) -> anyhow::Result<(String, bool)> {
-    use std::process::{Command, Stdio};
-    let mut child = Command::new(GIT_BIN)
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("{GIT_BIN} 실행 실패 (Command Line Tools 미설치?)"))?;
-
-    // stdout 리더 — 상한까지만 담고 즉시 (버퍼, 잘림)을 보고한다. 상한 도달 시 리더가
-    // 파이프를 닫고(자식은 다음 write에서 EPIPE) 보고를 받은 부모 루프가 kill한다.
-    let (out_tx, out_rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
-    let stdout = child.stdout.take();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let mut truncated = false;
-        if let Some(mut src) = stdout {
-            let mut chunk = [0u8; 64 * 1024];
-            loop {
-                match src.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let take = n.min(max_bytes.saturating_sub(buf.len()));
-                        buf.extend_from_slice(&chunk[..take]);
-                        if buf.len() >= max_bytes {
-                            truncated = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        let _ = out_tx.send((buf, truncated));
-    });
-    let (err_tx, err_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    if let Some(mut src) = child.stderr.take() {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = src.read_to_end(&mut buf);
-            let _ = err_tx.send(buf);
-        });
+    let execution = execute_bounded(repo, args, timeout, max_bytes)?;
+    if execution.stderr.truncated {
+        anyhow::bail!("git_stderr_limit");
     }
-
-    let deadline = Instant::now() + timeout;
-    let mut collected: Option<(Vec<u8>, bool)> = None;
-    let mut limit_killed = false;
-    let status = loop {
-        if collected.is_none()
-            && let Ok(result) = out_rx.try_recv()
-        {
-            if result.1 {
-                let _ = child.kill();
-                limit_killed = true;
-            }
-            collected = Some(result);
-        }
-        match child.try_wait()? {
-            Some(status) => break status,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                anyhow::bail!(
-                    "git {}가 {:?} 안에 끝나지 않아 중단했습니다",
-                    args.first().unwrap_or(&""),
-                    timeout
-                );
-            }
-            None => std::thread::sleep(Duration::from_millis(20)),
-        }
-    };
-    let (stdout, truncated) = match collected {
-        Some(result) => result,
-        None => out_rx.recv().unwrap_or_default(),
-    };
-    let stderr = err_rx.recv().unwrap_or_default();
-    if !status.success() && !limit_killed && status.code() != Some(1) {
-        anyhow::bail!(
-            "git {} 실패 ({status}): {}",
-            args.join(" "),
-            String::from_utf8_lossy(&stderr).trim()
-        );
+    if !execution.status.success()
+        && !execution.killed_for_limit
+        && execution.status.code() != Some(1)
+    {
+        anyhow::bail!("git_command_failed");
     }
-    Ok((String::from_utf8_lossy(&stdout).into_owned(), truncated))
+    Ok((
+        String::from_utf8_lossy(&execution.stdout.bytes).into_owned(),
+        execution.stdout.truncated,
+    ))
 }
 
 /// 세션 cwd에서 git 레포 루트를 찾는다. git 레포가 아니면 Err.
 pub fn repo_root(cwd: &Path, timeout: Duration) -> anyhow::Result<std::path::PathBuf> {
-    let out = run_git(cwd, &["rev-parse", "--show-toplevel"], timeout)?;
+    const REPO_ROOT_MAX_BYTES: usize = 32 * 1024;
+    let out = run_git_bounded(
+        cwd,
+        &["rev-parse", "--show-toplevel"],
+        timeout,
+        REPO_ROOT_MAX_BYTES,
+    )?;
     let root = out.trim();
-    anyhow::ensure!(!root.is_empty(), "git 레포가 아님: {}", cwd.display());
+    anyhow::ensure!(!root.is_empty(), "git_repo_root_invalid");
+    anyhow::ensure!(out.lines().count() == 1, "git_repo_root_invalid");
     Ok(std::path::PathBuf::from(root))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     fn temp_repo() -> std::path::PathBuf {
         // 전역 카운터 — 병렬 러너에서 nanos까지 같아도 경로가 겹치지 않는다
@@ -213,8 +415,17 @@ mod tests {
 
     #[test]
     fn run_git_성공은_stdout을_돌려준다() {
-        let out = run_git(Path::new("."), &["version"], Duration::from_secs(10)).unwrap();
+        let execution = execute_bounded(
+            Path::new("."),
+            &["version"],
+            Duration::from_secs(10),
+            DEFAULT_STDOUT_MAX_BYTES,
+        )
+        .unwrap();
+        let out = String::from_utf8_lossy(&execution.stdout.bytes);
+        assert!(execution.status.success());
         assert!(out.contains("git version"), "{out}");
+        assert_eq!(execution.active_readers_after_join, 0);
     }
 
     #[test]
@@ -225,7 +436,112 @@ mod tests {
             Duration::from_secs(10),
         )
         .unwrap_err();
-        assert!(err.to_string().contains("git"), "{err:#}");
+        assert_eq!(err.to_string(), "git_command_failed");
+        assert!(!format!("{err:#}").contains("definitely-not-a-subcommand"));
+        let execution = execute_bounded(
+            Path::new("."),
+            &["definitely-not-a-subcommand"],
+            Duration::from_secs(10),
+            DEFAULT_STDOUT_MAX_BYTES,
+        )
+        .unwrap();
+        assert!(!execution.status.success());
+        assert_eq!(execution.active_readers_after_join, 0);
+    }
+
+    #[test]
+    fn bounded_capture는_exact를_허용하고_plus_one만_자른다() {
+        let exact_flag = AtomicBool::new(false);
+        let exact = read_bounded(Cursor::new(vec![b'x'; 64]), 64, &exact_flag, true).unwrap();
+        assert_eq!(exact.bytes.len(), 64);
+        assert!(!exact.truncated);
+        assert!(!exact_flag.load(Ordering::Acquire));
+
+        let plus_one_flag = AtomicBool::new(false);
+        let plus_one = read_bounded(Cursor::new(vec![b'x'; 65]), 64, &plus_one_flag, true).unwrap();
+        assert_eq!(plus_one.bytes.len(), 64);
+        assert!(plus_one.truncated);
+        assert!(plus_one_flag.load(Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hostile_stderr는_상한에서_child_group과_reader를_회수한다() {
+        let alias =
+            "alias.hostile=!/usr/bin/yes hostile-stderr | /usr/bin/head -c 131072 >&2; exit 7";
+        let started = Instant::now();
+        let error = run_git_bounded(
+            Path::new("."),
+            &["-c", alias, "hostile"],
+            Duration::from_secs(5),
+            1024,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "git_stderr_limit");
+        assert!(!format!("{error:#}").contains("hostile-stderr"));
+        assert!(format!("{error:#}").len() <= 64);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let execution = execute_bounded(
+            Path::new("."),
+            &["-c", alias, "hostile"],
+            Duration::from_secs(5),
+            1024,
+        )
+        .unwrap();
+        assert!(execution.stderr.truncated);
+        assert_eq!(execution.active_readers_after_join, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_parent_exit은_inherited_pipe_descendant를_reap전에_정리한다() {
+        let alias = "alias.background=!/bin/sleep 5 & exit 0";
+        let started = Instant::now();
+        let execution = execute_bounded(
+            Path::new("."),
+            &["-c", alias, "background"],
+            Duration::from_secs(2),
+            1024,
+        )
+        .unwrap();
+        assert!(execution.status.success());
+        assert!(execution.stdout.bytes.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(execution.active_readers_after_join, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn running_git_drop은_child_group과_reader를_회수한다() {
+        let alias = "alias.slow=!/bin/sleep 5";
+        let started = Instant::now();
+        let running = RunningGit::spawn(
+            Path::new("."),
+            &["-c", alias, "slow"],
+            1024,
+            STDERR_MAX_BYTES,
+        )
+        .unwrap();
+        let active_readers = Arc::clone(&running.active_readers);
+        drop(running);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(active_readers.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 반복_timeout은_reader를_남기지_않는다() {
+        let alias = "alias.slow=!/bin/sleep 5";
+        for _ in 0..8 {
+            let error = run_git_bounded(
+                Path::new("."),
+                &["-c", alias, "slow"],
+                Duration::from_millis(40),
+                1024,
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), "git_timeout");
+        }
     }
 
     #[test]
@@ -285,5 +601,29 @@ mod tests {
         assert!(!truncated);
         assert!(out.contains("-left") && out.contains("+right"), "{out}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn production_source는_unbounded_capture와_result_channel을_쓰지_않는다() {
+        let source = include_str!("git_cli.rs");
+        let production = source
+            .rsplit_once("#[cfg(test)]\nmod tests")
+            .expect("tests marker")
+            .0;
+        for forbidden in [
+            "read_to_end",
+            "std::sync::mpsc::channel",
+            "std::thread::spawn(",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "production git executor contains {forbidden}"
+            );
+        }
+        assert!(production.contains("#[cfg(test)]\nconst DEFAULT_STDOUT_MAX_BYTES"));
+        assert!(production.contains("STDERR_MAX_BYTES"));
+        assert!(production.contains("libc::WNOWAIT"));
+        assert!(production.contains("kill_and_reap"));
+        assert!(production.contains("join_readers"));
     }
 }

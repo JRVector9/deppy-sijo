@@ -139,3 +139,16 @@ localhost listener is required or exercised. The broader `xtask security-scan` a
 tests outside this lane; 29 of those fail at `crates/mcp/src/http.rs`'s local `TcpListener::bind`
 with sandbox `Operation not permitted`. Re-run that combined gate in a localhost-capable runner;
 do not treat it as an ST01 storage/audit failure.
+
+## Pre-IN01 request-target aggregate
+
+- `Db::mcp_request_target_versioned` returns a redacted `McpRequestTargetRecord` from one
+  `read_connector_config` transaction/revision: server plus ordered stdio physical credential
+  locations, or server plus zero-to-two HTTP OAuth candidates.
+- Stdio parsing performs SQL shape, duplicate, item, row-byte, and aggregate-byte preflight before
+  materialization. It enforces 4,096 retained items, 1 KiB per coordinate, and 1 MiB aggregate;
+  missing, wrong-service, legacy, corrupt, and cross-owned pointers fail closed.
+- The aggregate and coordinate `Debug` implementations exclude service, username, server ID, URL,
+  metadata, and logical/physical identifiers. New errors are static marker-free messages.
+- Root verification: storage tests passed 142/142 plus doc-tests; all-target check, strict Clippy,
+  package rustfmt, and scoped diff-check passed.

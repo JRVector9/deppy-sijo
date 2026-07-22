@@ -724,10 +724,19 @@ pub struct CredentialMeta {
 }
 
 /// logical credential id가 가리키는 keyring physical slot. 실제 secret 값은 포함하지 않는다.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CredentialSecretLocation {
     pub keyring_service: String,
     pub keyring_username: String,
+}
+
+impl std::fmt::Debug for CredentialSecretLocation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CredentialSecretLocation")
+            .field("coordinate", &"REDACTED")
+            .finish()
+    }
 }
 
 /// Durable lifecycle of one exact physical keyring bundle base slot. Secret values and derived
@@ -820,8 +829,45 @@ impl std::fmt::Debug for CredentialOAuthBindingRecord {
 pub const CREDENTIAL_OAUTH_BINDING_BYTES_MAX: usize = 64 * 1024;
 pub const CREDENTIAL_SECRET_LOCATION_BYTES_MAX: usize = 1024;
 pub const CREDENTIAL_SECRET_RECORD_BYTES_MAX: usize = 1024 * 1024;
+/// Maximum credential bindings retained by one stdio MCP server. This matches the frozen
+/// Connector tools/item ceiling and cannot be raised by runtime configuration.
+pub const MCP_REQUEST_TARGET_CREDENTIAL_LIMIT_MAX: usize = 4_096;
+/// Aggregate keyring-coordinate bytes materialized for one stdio request target. Server config
+/// bytes are bounded independently by `mcp_store::MCP_SERVER_POINT_BYTES_MAX`.
+pub const MCP_REQUEST_TARGET_CREDENTIAL_BYTES_MAX: usize = 1024 * 1024;
 pub const PHYSICAL_SECRET_SLOT_RECONCILIATION_LIMIT_MAX: usize = 4_096;
 pub const PHYSICAL_SECRET_SLOT_RECONCILIATION_BYTES_MAX: usize = 1024 * 1024;
+
+/// Storage-neutral, same-snapshot preparation record for one MCP request target. The vectors are
+/// deliberately cross-shaped: stdio records contain credential locations in `env_secrets` order,
+/// while HTTP records contain zero to two OAuth candidates. Missing servers contain neither.
+#[derive(Clone, PartialEq)]
+pub struct McpRequestTargetRecord {
+    pub server: Option<mcp_store::McpServerRow>,
+    pub credential_locations: Vec<CredentialSecretLocation>,
+    pub oauth_bindings: Vec<CredentialOAuthBindingRecord>,
+}
+
+impl std::fmt::Debug for McpRequestTargetRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let transport = match self.server.as_ref().map(|server| server.kind.as_str()) {
+            None => "absent",
+            Some("stdio") => "stdio",
+            Some("http") => "http",
+            Some(_) => "invalid",
+        };
+        formatter
+            .debug_struct("McpRequestTargetRecord")
+            .field("server_present", &self.server.is_some())
+            .field("transport", &transport)
+            .field(
+                "credential_location_count",
+                &self.credential_locations.len(),
+            )
+            .field("oauth_binding_count", &self.oauth_bindings.len())
+            .finish()
+    }
+}
 
 /// workspace 한 행 (WorkspaceSidebar 표시용).
 #[derive(Debug, Clone, PartialEq)]
@@ -3087,6 +3133,413 @@ impl Db {
         self.read_connector_config(|conn| mcp_store::server_in_snapshot(conn, server_id))
     }
 
+    /// Loads one execution target from exactly one Connector revision snapshot. Stdio credential
+    /// locations are aligned with `server.env_secrets`; HTTP OAuth candidates are bounded to two.
+    /// No secret value, service DTO, or protocol runtime type crosses this storage boundary.
+    pub fn mcp_request_target_versioned(
+        &self,
+        server_id: &str,
+    ) -> anyhow::Result<ConnectorConfigRead<McpRequestTargetRecord>> {
+        self.read_connector_config(|conn| Self::mcp_request_target_in_snapshot(conn, server_id))
+    }
+
+    fn mcp_request_target_in_snapshot(
+        conn: &Connection,
+        server_id: &str,
+    ) -> anyhow::Result<McpRequestTargetRecord> {
+        anyhow::ensure!(
+            !conn.is_autocommit(),
+            "MCP request target snapshot requires a caller-owned transaction"
+        );
+
+        let row_bytes = conn
+            .query_row(
+                "SELECT length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                        length(CAST(kind AS BLOB)) +
+                        length(CAST(COALESCE(command, '') AS BLOB)) +
+                        length(CAST(COALESCE(args_json, '') AS BLOB)) +
+                        length(CAST(COALESCE(env_json, '') AS BLOB)) +
+                        length(CAST(COALESCE(env_credentials_json, '') AS BLOB)) +
+                        length(CAST(COALESCE(url, '') AS BLOB))
+                 FROM mcp_servers WHERE id = ?1",
+                [server_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|_| anyhow::anyhow!("MCP request target server preflight failed"))?;
+        let Some(row_bytes) = row_bytes else {
+            return Ok(McpRequestTargetRecord {
+                server: None,
+                credential_locations: Vec::new(),
+                oauth_bindings: Vec::new(),
+            });
+        };
+        let row_bytes = usize::try_from(row_bytes)
+            .map_err(|_| anyhow::anyhow!("MCP request target server byte count is invalid"))?;
+        anyhow::ensure!(
+            row_bytes <= mcp_store::MCP_SERVER_POINT_BYTES_MAX,
+            "MCP request target server byte limit exceeded"
+        );
+
+        let (
+            kind,
+            command_present,
+            command_nonempty,
+            url_present,
+            url_nonempty,
+            inherit_env,
+            args_valid,
+            plain_env_valid,
+            credential_env_valid,
+        ): (String, bool, bool, bool, bool, bool, bool, bool, bool) = conn
+            .query_row(
+                "SELECT kind,
+                        command IS NOT NULL,
+                        length(trim(COALESCE(command, ''))) > 0,
+                        url IS NOT NULL,
+                        length(trim(COALESCE(url, ''))) > 0,
+                        inherit_env,
+                        CASE WHEN args_json IS NULL THEN 1
+                             WHEN json_valid(args_json) = 0 THEN 0
+                             WHEN json_type(args_json) = 'array' THEN 1 ELSE 0 END,
+                        CASE WHEN env_json IS NULL THEN 1
+                             WHEN json_valid(env_json) = 0 THEN 0
+                             WHEN json_type(env_json) = 'object' THEN 1 ELSE 0 END,
+                        CASE WHEN env_credentials_json IS NULL THEN 1
+                             WHEN json_valid(env_credentials_json) = 0 THEN 0
+                             WHEN json_type(env_credentials_json) = 'object' THEN 1 ELSE 0 END
+                 FROM mcp_servers WHERE id = ?1",
+                [server_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("MCP request target server shape read failed"))?;
+        anyhow::ensure!(
+            args_valid && plain_env_valid && credential_env_valid,
+            "MCP request target server JSON shape is invalid"
+        );
+
+        let (
+            argument_count,
+            argument_text_count,
+            plain_count,
+            plain_unique_count,
+            plain_text_count,
+            credential_count,
+            credential_unique_count,
+            credential_text_count,
+        ): (i64, i64, i64, i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*)
+                       FROM json_each(COALESCE(mcp_servers.args_json, '[]'))),
+                    (SELECT COUNT(*)
+                       FROM json_each(COALESCE(mcp_servers.args_json, '[]'))
+                      WHERE type = 'text'),
+                    (SELECT COUNT(*)
+                       FROM json_each(COALESCE(mcp_servers.env_json, '{}'))),
+                    (SELECT COUNT(DISTINCT key)
+                       FROM json_each(COALESCE(mcp_servers.env_json, '{}'))),
+                    (SELECT COUNT(*)
+                       FROM json_each(COALESCE(mcp_servers.env_json, '{}'))
+                      WHERE type = 'text'),
+                    (SELECT COUNT(*)
+                       FROM json_each(COALESCE(mcp_servers.env_credentials_json, '{}'))),
+                    (SELECT COUNT(DISTINCT key)
+                       FROM json_each(COALESCE(mcp_servers.env_credentials_json, '{}'))),
+                    (SELECT COUNT(*)
+                       FROM json_each(COALESCE(mcp_servers.env_credentials_json, '{}'))
+                      WHERE type = 'text')
+                 FROM mcp_servers WHERE id = ?1",
+                [server_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("MCP request target server item preflight failed"))?;
+        let counts = [
+            argument_count,
+            argument_text_count,
+            plain_count,
+            plain_unique_count,
+            plain_text_count,
+            credential_count,
+            credential_unique_count,
+            credential_text_count,
+        ]
+        .map(|count| {
+            usize::try_from(count)
+                .map_err(|_| anyhow::anyhow!("MCP request target item count is invalid"))
+        });
+        let [
+            argument_count,
+            argument_text_count,
+            plain_count,
+            plain_unique_count,
+            plain_text_count,
+            credential_count,
+            credential_unique_count,
+            credential_text_count,
+        ] = counts;
+        let argument_count = argument_count?;
+        let argument_text_count = argument_text_count?;
+        let plain_count = plain_count?;
+        let plain_unique_count = plain_unique_count?;
+        let plain_text_count = plain_text_count?;
+        let credential_count = credential_count?;
+        let credential_unique_count = credential_unique_count?;
+        let credential_text_count = credential_text_count?;
+        anyhow::ensure!(
+            argument_count == argument_text_count
+                && plain_count == plain_unique_count
+                && plain_count == plain_text_count
+                && credential_count == credential_unique_count
+                && credential_count == credential_text_count,
+            "MCP request target contains malformed or duplicate persisted values"
+        );
+        let retained_stdio_items = argument_count
+            .checked_add(plain_count)
+            .and_then(|count| count.checked_add(credential_count))
+            .ok_or_else(|| anyhow::anyhow!("MCP request target item count overflow"))?;
+
+        match kind.as_str() {
+            "stdio" => {
+                anyhow::ensure!(
+                    command_present && command_nonempty && !url_present,
+                    "stdio MCP request target transport shape is invalid"
+                );
+                anyhow::ensure!(
+                    credential_count <= MCP_REQUEST_TARGET_CREDENTIAL_LIMIT_MAX
+                        && retained_stdio_items <= MCP_REQUEST_TARGET_CREDENTIAL_LIMIT_MAX,
+                    "MCP request target credential item limit exceeded"
+                );
+            }
+            "http" => {
+                anyhow::ensure!(
+                    !command_present
+                        && url_present
+                        && url_nonempty
+                        && inherit_env
+                        && argument_count == 0
+                        && plain_count == 0
+                        && credential_count == 0,
+                    "HTTP MCP request target transport shape is invalid"
+                );
+            }
+            _ => anyhow::bail!("MCP request target transport kind is invalid"),
+        }
+
+        let server = mcp_store::server_in_snapshot(conn, server_id)
+            .map_err(|_| anyhow::anyhow!("MCP request target server data is invalid"))?
+            .ok_or_else(|| anyhow::anyhow!("MCP request target server disappeared"))?;
+        Self::validate_mcp_request_target_server(&server, server_id)?;
+
+        match kind.as_str() {
+            "stdio" => {
+                anyhow::ensure!(
+                    server.env_secrets.len() == credential_count,
+                    "MCP request target credential count changed inside snapshot"
+                );
+                let credential_ids = server
+                    .env_secrets
+                    .iter()
+                    .map(|(_, credential_id)| credential_id.as_str())
+                    .collect::<Vec<_>>();
+                let credential_locations =
+                    Self::credential_locations_in_snapshot(conn, &credential_ids)?;
+                Ok(McpRequestTargetRecord {
+                    server: Some(server),
+                    credential_locations,
+                    oauth_bindings: Vec::new(),
+                })
+            }
+            "http" => {
+                let oauth_bindings =
+                    Self::credential_oauth_bindings_for_server_in_snapshot(conn, server_id)
+                        .map_err(|_| {
+                            anyhow::anyhow!("MCP request target OAuth bindings are invalid")
+                        })?;
+                anyhow::ensure!(
+                    oauth_bindings.len() <= 2,
+                    "MCP request target OAuth binding item limit exceeded"
+                );
+                for binding in &oauth_bindings {
+                    anyhow::ensure!(
+                        binding.keyring_service == secret::KEYRING_SERVICE,
+                        "MCP request target OAuth keyring service is invalid"
+                    );
+                }
+                Ok(McpRequestTargetRecord {
+                    server: Some(server),
+                    credential_locations: Vec::new(),
+                    oauth_bindings,
+                })
+            }
+            _ => unreachable!("transport kind was validated before materialization"),
+        }
+    }
+
+    fn validate_mcp_request_target_server(
+        server: &mcp_store::McpServerRow,
+        expected_server_id: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            server.id == expected_server_id
+                && !server.id.is_empty()
+                && !server.name.trim().is_empty()
+                && !server.id.contains('\0')
+                && !server.name.contains('\0'),
+            "MCP request target server identity is invalid"
+        );
+        mcp_store::validate_server_args_for_persistence(&server.args)
+            .map_err(|_| anyhow::anyhow!("MCP request target arguments are invalid"))?;
+        mcp_store::validate_server_env_for_persistence(&server.env_plain, &server.env_secrets)
+            .map_err(|_| anyhow::anyhow!("MCP request target environment is invalid"))?;
+        match server.kind.as_str() {
+            "stdio" => {
+                let command = server.command.as_deref().unwrap_or_default();
+                anyhow::ensure!(
+                    !command.trim().is_empty() && !command.contains('\0') && server.url.is_none(),
+                    "stdio MCP request target data is invalid"
+                );
+            }
+            "http" => {
+                let url = server.url.as_deref().unwrap_or_default();
+                anyhow::ensure!(
+                    server.command.is_none()
+                        && server.args.is_empty()
+                        && server.env_plain.is_empty()
+                        && server.env_secrets.is_empty()
+                        && server.inherit_env
+                        && !url.trim().is_empty()
+                        && !url.contains('\0'),
+                    "HTTP MCP request target data is invalid"
+                );
+            }
+            _ => anyhow::bail!("MCP request target transport kind is invalid"),
+        }
+        Ok(())
+    }
+
+    fn credential_locations_in_snapshot(
+        conn: &Connection,
+        credential_ids: &[&str],
+    ) -> anyhow::Result<Vec<CredentialSecretLocation>> {
+        anyhow::ensure!(
+            credential_ids.len() <= MCP_REQUEST_TARGET_CREDENTIAL_LIMIT_MAX,
+            "MCP request target credential item limit exceeded"
+        );
+        if credential_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let requested_json = serde_json::to_string(credential_ids)
+            .map_err(|_| anyhow::anyhow!("MCP request target credential index is invalid"))?;
+        let (requested, matched, aggregate_bytes, maximum_row_bytes): (i64, i64, i64, i64) = conn
+            .query_row(
+                "WITH requested AS (
+                     SELECT CAST(key AS INTEGER) AS ordinal, value AS credential_id
+                       FROM json_each(?1)
+                 )
+                 SELECT COUNT(*), COUNT(credentials.id),
+                        COALESCE(SUM(
+                            length(CAST(credentials.keyring_service AS BLOB)) +
+                            length(CAST(credentials.keyring_username AS BLOB))
+                        ), 0),
+                        COALESCE(MAX(
+                            length(CAST(credentials.keyring_service AS BLOB)) +
+                            length(CAST(credentials.keyring_username AS BLOB))
+                        ), 0)
+                   FROM requested
+                   LEFT JOIN credentials ON credentials.id = requested.credential_id",
+                [&requested_json],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|_| anyhow::anyhow!("MCP request target credential preflight failed"))?;
+        let requested = usize::try_from(requested)
+            .map_err(|_| anyhow::anyhow!("MCP request target credential count is invalid"))?;
+        let matched = usize::try_from(matched)
+            .map_err(|_| anyhow::anyhow!("MCP request target credential count is invalid"))?;
+        let aggregate_bytes = usize::try_from(aggregate_bytes)
+            .map_err(|_| anyhow::anyhow!("MCP request target credential bytes are invalid"))?;
+        let maximum_row_bytes = usize::try_from(maximum_row_bytes)
+            .map_err(|_| anyhow::anyhow!("MCP request target credential bytes are invalid"))?;
+        anyhow::ensure!(
+            requested == credential_ids.len() && matched == requested,
+            "MCP request target credential reference is missing"
+        );
+        anyhow::ensure!(
+            maximum_row_bytes <= CREDENTIAL_SECRET_LOCATION_BYTES_MAX,
+            "MCP request target credential row byte limit exceeded"
+        );
+        anyhow::ensure!(
+            aggregate_bytes <= MCP_REQUEST_TARGET_CREDENTIAL_BYTES_MAX,
+            "MCP request target credential aggregate byte limit exceeded"
+        );
+
+        let locations = {
+            let mut statement = conn
+                .prepare_cached(
+                    "WITH requested AS (
+                         SELECT CAST(key AS INTEGER) AS ordinal, value AS credential_id
+                           FROM json_each(?1)
+                     )
+                     SELECT credentials.keyring_service, credentials.keyring_username
+                       FROM requested
+                       JOIN credentials ON credentials.id = requested.credential_id
+                      ORDER BY requested.ordinal",
+                )
+                .map_err(|_| {
+                    anyhow::anyhow!("MCP request target credential materialization failed")
+                })?;
+            let rows = statement
+                .query_map([&requested_json], |row| {
+                    Ok(CredentialSecretLocation {
+                        keyring_service: row.get(0)?,
+                        keyring_username: row.get(1)?,
+                    })
+                })
+                .map_err(|_| {
+                    anyhow::anyhow!("MCP request target credential materialization failed")
+                })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|_| {
+                anyhow::anyhow!("MCP request target credential materialization failed")
+            })?
+        };
+        anyhow::ensure!(
+            locations.len() == credential_ids.len(),
+            "MCP request target credential materialization count mismatch"
+        );
+        for (credential_id, location) in credential_ids.iter().zip(&locations) {
+            anyhow::ensure!(
+                location.keyring_service == secret::KEYRING_SERVICE,
+                "MCP request target credential keyring service is invalid"
+            );
+            validate_owned_physical_secret_slot(credential_id, &location.keyring_username)
+                .map_err(|_| anyhow::anyhow!("MCP request target credential pointer is invalid"))?;
+        }
+        Ok(locations)
+    }
+
     pub fn insert_mcp_server(&self, row: &mcp_store::McpServerRow) -> anyhow::Result<()> {
         mcp_store::insert_server(&self.conn, row)
     }
@@ -4973,6 +5426,23 @@ mod tests {
             .unwrap();
     }
 
+    fn insert_physical_credential(db: &Db, logical_id: &str) -> secret::PhysicalSecretSlot {
+        let logical = secret::LogicalCredentialId::new(logical_id).unwrap();
+        let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        stage_slot(db, &logical, &slot);
+        db.insert_credential_with_secret_slot(&sample(logical.as_str()), slot.as_str(), None)
+            .unwrap();
+        slot
+    }
+
+    fn env_credential_json(entries: &[(String, String)]) -> String {
+        let values = entries
+            .iter()
+            .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
+            .collect::<serde_json::Map<_, _>>();
+        serde_json::Value::Object(values).to_string()
+    }
+
     #[test]
     fn connector_config_revision은_모든_가시_mutation과_versioned_read를_추적한다() {
         let mut db = Db::open_in_memory().unwrap();
@@ -5151,6 +5621,338 @@ mod tests {
             db.credential_secret_location_versioned("oversized-location")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn mcp_request_target_stdio는_credential_item과_aggregate_byte_exact_limit을_보존한다() {
+        let db = Db::open_in_memory().unwrap();
+        let logical_padding = "x".repeat(88);
+        let mut env_secrets = Vec::with_capacity(MCP_REQUEST_TARGET_CREDENTIAL_LIMIT_MAX);
+        let mut first_credential_id = None;
+        let tx = db.conn.unchecked_transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare_cached(
+                    "INSERT INTO credentials
+                       (id, provider, label, credential_kind, keyring_service, keyring_username,
+                        masked_hint, created_at, updated_at)
+                     VALUES (?1, 'oauth', 'bounded', 'oauth_token', ?2, ?3, NULL, 'now', 'now')",
+                )
+                .unwrap();
+            for index in 0..MCP_REQUEST_TARGET_CREDENTIAL_LIMIT_MAX {
+                let logical_id = format!("{index:04}-{logical_padding}");
+                assert_eq!(logical_id.len(), 93);
+                let logical = secret::LogicalCredentialId::new(logical_id.clone()).unwrap();
+                let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+                assert_eq!(secret::KEYRING_SERVICE.len() + slot.as_str().len(), 256);
+                insert
+                    .execute((logical.as_str(), secret::KEYRING_SERVICE, slot.as_str()))
+                    .unwrap();
+                first_credential_id.get_or_insert_with(|| logical_id.clone());
+                env_secrets.push((format!("KEY_{index:04}"), logical_id));
+            }
+        }
+        tx.commit().unwrap();
+        let mut server = sample_mcp_server("target-exact");
+        server.args.clear();
+        server.env_secrets = env_secrets;
+        db.insert_mcp_server(&server).unwrap();
+
+        let target = db.mcp_request_target_versioned("target-exact").unwrap();
+        let returned_server = target.value.server.as_ref().unwrap();
+        assert_eq!(
+            target.value.credential_locations.len(),
+            MCP_REQUEST_TARGET_CREDENTIAL_LIMIT_MAX
+        );
+        assert_eq!(
+            target
+                .value
+                .credential_locations
+                .iter()
+                .map(|location| {
+                    location.keyring_service.len() + location.keyring_username.len()
+                })
+                .sum::<usize>(),
+            MCP_REQUEST_TARGET_CREDENTIAL_BYTES_MAX,
+            "exact aggregate byte ceiling must be accepted"
+        );
+        for ((_, credential_id), location) in returned_server
+            .env_secrets
+            .iter()
+            .zip(&target.value.credential_locations)
+        {
+            validate_owned_physical_secret_slot(credential_id, &location.keyring_username).unwrap();
+        }
+
+        let marker = "AGGREGATE_PLUS_ONE_MARKER";
+        let invalid_service = format!("{}{marker}", secret::KEYRING_SERVICE);
+        let first_credential_id = first_credential_id.unwrap();
+        db.conn
+            .execute(
+                "UPDATE credentials SET keyring_service = ?2 WHERE id = ?1",
+                (&first_credential_id, &invalid_service),
+            )
+            .unwrap();
+        let error = db.mcp_request_target_versioned("target-exact").unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("aggregate byte limit"));
+        assert!(!rendered.contains(marker));
+
+        db.conn
+            .execute(
+                "UPDATE credentials SET keyring_service = ?2 WHERE id = ?1",
+                (&first_credential_id, secret::KEYRING_SERVICE),
+            )
+            .unwrap();
+        let mut plus_one = returned_server.env_secrets.clone();
+        plus_one.push(("KEY_PLUS_ONE".to_owned(), "missing-plus-one".to_owned()));
+        db.conn
+            .execute(
+                "UPDATE mcp_servers SET env_credentials_json = ?2 WHERE id = ?1",
+                ("target-exact", env_credential_json(&plus_one)),
+            )
+            .unwrap();
+        let error = db.mcp_request_target_versioned("target-exact").unwrap_err();
+        assert!(format!("{error:#}").contains("credential item limit"));
+    }
+
+    #[test]
+    fn mcp_request_target_stdio는_server_env_order와_single_snapshot_revision을_보존한다() {
+        let (dir, path, db_a) = file_db("mcp-request-target-snapshot");
+        let credential_ids = ["cred-order-z", "cred-order-a", "cred-order-m"];
+        let slots = credential_ids
+            .iter()
+            .map(|id| ((*id).to_owned(), insert_physical_credential(&db_a, id)))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut server = sample_mcp_server("snapshot-server");
+        server.env_secrets = vec![
+            ("Z_KEY".to_owned(), credential_ids[0].to_owned()),
+            ("A_KEY".to_owned(), credential_ids[1].to_owned()),
+            ("M_KEY".to_owned(), credential_ids[2].to_owned()),
+        ];
+        db_a.insert_mcp_server(&server).unwrap();
+
+        let tx = db_a.conn.unchecked_transaction().unwrap();
+        let stale_revision = Db::read_connector_config_revision(&tx).unwrap();
+        let first = Db::mcp_request_target_in_snapshot(&tx, "snapshot-server").unwrap();
+        let ordered_ids = first
+            .server
+            .as_ref()
+            .unwrap()
+            .env_secrets
+            .iter()
+            .map(|(_, id)| id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered_ids,
+            vec!["cred-order-a", "cred-order-m", "cred-order-z"]
+        );
+        for ((_, credential_id), location) in first
+            .server
+            .as_ref()
+            .unwrap()
+            .env_secrets
+            .iter()
+            .zip(&first.credential_locations)
+        {
+            assert_eq!(
+                location.keyring_username,
+                slots.get(credential_id).unwrap().as_str()
+            );
+        }
+
+        let db_b = Db::open(&path).unwrap();
+        let logical = secret::LogicalCredentialId::new("cred-order-a").unwrap();
+        let replacement = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        db_b.conn
+            .execute(
+                "UPDATE credentials SET keyring_username = ?2 WHERE id = ?1",
+                (logical.as_str(), replacement.as_str()),
+            )
+            .unwrap();
+        let current_revision = db_b.connector_config_revision().unwrap();
+        assert!(current_revision > stale_revision);
+
+        let stale_again = Db::mcp_request_target_in_snapshot(&tx, "snapshot-server").unwrap();
+        assert_eq!(first, stale_again);
+        assert_eq!(
+            Db::read_connector_config_revision(&tx).unwrap(),
+            stale_revision
+        );
+        tx.commit().unwrap();
+
+        let fresh = db_a
+            .mcp_request_target_versioned("snapshot-server")
+            .unwrap();
+        assert_eq!(fresh.revision, current_revision);
+        let fresh_server = fresh.value.server.as_ref().unwrap();
+        let position = fresh_server
+            .env_secrets
+            .iter()
+            .position(|(_, id)| id == logical.as_str())
+            .unwrap();
+        assert_eq!(
+            fresh.value.credential_locations[position].keyring_username,
+            replacement.as_str()
+        );
+        drop(db_b);
+        drop(db_a);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mcp_request_target_http는_zero_one_two_oauth_candidates를_같은_snapshot에서_반환한다() {
+        let db = Db::open_in_memory().unwrap();
+        let mut server = sample_mcp_server("http-target");
+        server.kind = "http".to_owned();
+        server.command = None;
+        server.args.clear();
+        server.url = Some("https://marker.example/mcp".to_owned());
+        db.insert_mcp_server(&server).unwrap();
+
+        let zero = db.mcp_request_target_versioned("http-target").unwrap();
+        assert!(zero.value.credential_locations.is_empty());
+        assert!(zero.value.oauth_bindings.is_empty());
+
+        for logical_id in ["oauth-target-a", "oauth-target-b"] {
+            let logical = secret::LogicalCredentialId::new(logical_id).unwrap();
+            let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+            stage_slot(&db, &logical, &slot);
+            db.insert_credential_with_secret_slot(
+                &sample(logical.as_str()),
+                slot.as_str(),
+                Some(r#"{"server_id":"http-target","provider_marker":"HIDDEN_OAUTH_MARKER"}"#),
+            )
+            .unwrap();
+            let target = db.mcp_request_target_versioned("http-target").unwrap();
+            assert_eq!(
+                target.value.oauth_bindings.len(),
+                if logical_id.ends_with('a') { 1 } else { 2 }
+            );
+            assert!(target.value.credential_locations.is_empty());
+            assert_eq!(target.revision, db.connector_config_revision().unwrap());
+        }
+
+        let target = db.mcp_request_target_versioned("http-target").unwrap();
+        let debug = format!("{:?}", target.value);
+        assert!(debug.contains("transport: \"http\""));
+        for marker in [
+            "http-target",
+            "marker.example",
+            "oauth-target-a",
+            "oauth-target-b",
+            "HIDDEN_OAUTH_MARKER",
+            "deppy.oauth.v1",
+        ] {
+            assert!(!debug.contains(marker));
+        }
+    }
+
+    #[test]
+    fn mcp_request_target는_malformed_duplicate_cross_shape와_coordinate를_fail_closed한다() {
+        let db = Db::open_in_memory().unwrap();
+        let slot = insert_physical_credential(&db, "coordinate-marker-credential");
+        let mut server = sample_mcp_server("error-marker-server");
+        server.env_secrets = vec![(
+            "TOKEN".to_owned(),
+            "coordinate-marker-credential".to_owned(),
+        )];
+        db.insert_mcp_server(&server).unwrap();
+
+        db.conn
+            .execute(
+                "UPDATE mcp_servers SET env_credentials_json = ?2 WHERE id = ?1",
+                (
+                    "error-marker-server",
+                    r#"{"TOKEN":"ERROR_VALUE_MARKER","TOKEN":"duplicate"}"#,
+                ),
+            )
+            .unwrap();
+        let duplicate = db
+            .mcp_request_target_versioned("error-marker-server")
+            .unwrap_err();
+        assert!(format!("{duplicate:#}").contains("malformed or duplicate"));
+        assert!(!format!("{duplicate:#}").contains("ERROR_VALUE_MARKER"));
+
+        db.conn
+            .execute(
+                "UPDATE mcp_servers SET env_credentials_json = ?2 WHERE id = ?1",
+                (
+                    "error-marker-server",
+                    r#"{"TOKEN":"BROKEN_JSON_ERROR_MARKER""#,
+                ),
+            )
+            .unwrap();
+        let malformed = db
+            .mcp_request_target_versioned("error-marker-server")
+            .unwrap_err();
+        assert!(!format!("{malformed:#}").contains("BROKEN_JSON_ERROR_MARKER"));
+
+        db.conn
+            .execute(
+                "UPDATE mcp_servers
+                    SET kind = 'http', command = 'CROSS_SHAPE_COMMAND_MARKER', args_json = NULL,
+                        env_json = NULL, env_credentials_json = NULL,
+                        url = 'https://example.invalid/mcp'
+                  WHERE id = ?1",
+                ["error-marker-server"],
+            )
+            .unwrap();
+        let cross_shape = db
+            .mcp_request_target_versioned("error-marker-server")
+            .unwrap_err();
+        assert!(format!("{cross_shape:#}").contains("transport shape"));
+        assert!(!format!("{cross_shape:#}").contains("CROSS_SHAPE_COMMAND_MARKER"));
+
+        db.conn
+            .execute(
+                "UPDATE mcp_servers
+                    SET kind = 'stdio', command = 'safe-command', url = NULL,
+                        env_credentials_json = ?2
+                  WHERE id = ?1",
+                (
+                    "error-marker-server",
+                    env_credential_json(&[(
+                        "TOKEN".to_owned(),
+                        "coordinate-marker-credential".to_owned(),
+                    )]),
+                ),
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE credentials SET keyring_service = 'RAW_SERVICE_MARKER' WHERE id = ?1",
+                ["coordinate-marker-credential"],
+            )
+            .unwrap();
+        let coordinate = db
+            .mcp_request_target_versioned("error-marker-server")
+            .unwrap_err();
+        assert!(!format!("{coordinate:#}").contains("RAW_SERVICE_MARKER"));
+        db.conn
+            .execute(
+                "UPDATE credentials SET keyring_service = ?2, keyring_username = ?3 WHERE id = ?1",
+                (
+                    "coordinate-marker-credential",
+                    secret::KEYRING_SERVICE,
+                    slot.as_str(),
+                ),
+            )
+            .unwrap();
+        assert!(
+            db.mcp_request_target_versioned("error-marker-server")
+                .is_ok(),
+            "failed read transaction must roll back and release the connection"
+        );
+
+        let location = CredentialSecretLocation {
+            keyring_service: "RAW_SERVICE_DEBUG_MARKER".to_owned(),
+            keyring_username: "RAW_USERNAME_DEBUG_MARKER".to_owned(),
+        };
+        let debug = format!("{location:?}");
+        assert!(debug.contains("REDACTED"));
+        assert!(!debug.contains("RAW_SERVICE_DEBUG_MARKER"));
+        assert!(!debug.contains("RAW_USERNAME_DEBUG_MARKER"));
     }
 
     #[test]

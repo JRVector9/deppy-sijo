@@ -6,6 +6,7 @@
 
 mod coordinator;
 mod mcp_adapter;
+mod oauth_adapter;
 mod ports;
 mod snapshot;
 
@@ -16,13 +17,16 @@ pub use coordinator::{
     SystemCoordinatorClock, SystemOperationIdFactory,
 };
 pub use mcp_adapter::ProductionConnectorMcp;
+pub use oauth_adapter::ProductionConnectorOAuth;
 pub use ports::{
     AuthorizationState, AuthorizedInvokeRequest, CancellationToken, ConnectorMcp, ConnectorOAuth,
     ConnectorRepository, ConnectorRepositoryFactory, ConnectorSecrets, CredentialResolutionRequest,
     DiscoverOutput, DiscoveredTool, HttpAuthBinding, ImportPlan, LiveToolSchema, McpRequestTarget,
     McpTransportSnapshot, OAuthAuthorizeOutput, OAuthClientRequest, OAuthCompletion,
     OAuthContinuation, OAuthCredentialUpdate, OAuthDiscovery, OAuthEventSink, OAuthFailure,
-    OAuthRecoveryTarget, OverviewData, RepositoryToolPage, ResolvedCredential, ResolvedCredentials,
-    ServiceError, StoredOAuthClient, cancel_live_mcp_connection,
+    OAuthPublishDescriptor, OAuthPublishMode, OAuthPublishResult, OAuthRecoveryTarget,
+    OAuthRefreshOutcome, OAuthRefreshRequest, Observed, OverviewData, RepositoryCas,
+    RepositoryMcpTarget, RepositoryToolPage, ResolvedCredential, ResolvedCredentials, ServiceError,
+    StoredOAuthClient, cancel_live_mcp_connection,
 };
 pub use snapshot::SnapshotReader;

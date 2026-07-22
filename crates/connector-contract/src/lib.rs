@@ -737,7 +737,7 @@ pub enum ApprovalDecision {
     DenyAlways,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerDraft {
     pub id: Option<ServerId>,
     pub name: String,
@@ -745,7 +745,19 @@ pub struct ServerDraft {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for ServerDraft {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ServerDraft")
+            .field("has_id", &self.id.is_some())
+            .field("name_bytes", &self.name.len())
+            .field("transport", &self.transport)
+            .field("enabled", &self.enabled)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TransportDraft {
     Stdio {
@@ -760,6 +772,27 @@ pub enum TransportDraft {
     },
 }
 
+impl fmt::Debug for TransportDraft {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stdio {
+                args,
+                plain_env,
+                secret_env,
+                inherit_env,
+                ..
+            } => formatter
+                .debug_struct("TransportDraft::Stdio")
+                .field("argument_count", &args.len())
+                .field("plain_env_count", &plain_env.len())
+                .field("secret_env_count", &secret_env.len())
+                .field("inherit_env", inherit_env)
+                .finish(),
+            Self::Http { .. } => formatter.write_str("TransportDraft::Http(REDACTED)"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExternalLinkKind {
@@ -768,7 +801,6 @@ pub enum ExternalLinkKind {
 
 /// A single frame may emit at most one user intent. The UI retains drafts locally and does not
 /// clone/serialize secret-bearing variants.
-#[derive(Debug)]
 pub enum ConnectorIntent {
     Activate,
     SelectServer(Option<ServerId>),
@@ -843,6 +875,104 @@ pub enum ConnectorIntent {
     DismissImportReport(OperationId),
 }
 
+impl fmt::Debug for ConnectorIntent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Activate => formatter.write_str("ConnectorIntent::Activate"),
+            Self::SelectServer(server_id) => formatter
+                .debug_struct("ConnectorIntent::SelectServer")
+                .field("selected", &server_id.is_some())
+                .finish(),
+            Self::RequestToolPage { offset, .. } => formatter
+                .debug_struct("ConnectorIntent::RequestToolPage")
+                .field("offset", offset)
+                .finish(),
+            Self::SaveServer(draft) => formatter
+                .debug_tuple("ConnectorIntent::SaveServer")
+                .field(draft)
+                .finish(),
+            Self::DeleteServer(_) => formatter.write_str("ConnectorIntent::DeleteServer"),
+            Self::Discover(_) => formatter.write_str("ConnectorIntent::Discover"),
+            Self::InvokeTool { .. } => formatter.write_str("ConnectorIntent::InvokeTool(REDACTED)"),
+            Self::Cancel(_) => formatter.write_str("ConnectorIntent::Cancel"),
+            Self::ResolveRemoteTrust {
+                config_revision,
+                accepted,
+                ..
+            } => formatter
+                .debug_struct("ConnectorIntent::ResolveRemoteTrust")
+                .field("config_revision", config_revision)
+                .field("accepted", accepted)
+                .finish(),
+            Self::BeginOAuth(_) => formatter.write_str("ConnectorIntent::BeginOAuth"),
+            Self::ResolveOAuthConsent {
+                config_revision,
+                accepted,
+                ..
+            } => formatter
+                .debug_struct("ConnectorIntent::ResolveOAuthConsent")
+                .field("config_revision", config_revision)
+                .field("accepted", accepted)
+                .finish(),
+            Self::SubmitOAuthClient {
+                config_revision,
+                client_secret,
+                workspace_hint,
+                ..
+            } => formatter
+                .debug_struct("ConnectorIntent::SubmitOAuthClient")
+                .field("config_revision", config_revision)
+                .field("has_client_secret", &!client_secret.is_empty())
+                .field("has_workspace_hint", &workspace_hint.is_some())
+                .finish(),
+            Self::SubmitSlackWorkspace {
+                config_revision, ..
+            } => formatter
+                .debug_struct("ConnectorIntent::SubmitSlackWorkspace")
+                .field("config_revision", config_revision)
+                .finish(),
+            Self::RetryOAuth(_) => formatter.write_str("ConnectorIntent::RetryOAuth"),
+            Self::ResolveOAuthRecovery { action, .. } => formatter
+                .debug_tuple("ConnectorIntent::ResolveOAuthRecovery")
+                .field(action)
+                .finish(),
+            Self::ResolveApproval { decision, .. } => formatter
+                .debug_tuple("ConnectorIntent::ResolveApproval")
+                .field(decision)
+                .finish(),
+            Self::SetPermission { rule, .. } => formatter
+                .debug_tuple("ConnectorIntent::SetPermission")
+                .field(rule)
+                .finish(),
+            Self::ConnectSlack => formatter.write_str("ConnectorIntent::ConnectSlack"),
+            Self::ChooseSlackWorkspace(_) => {
+                formatter.write_str("ConnectorIntent::ChooseSlackWorkspace")
+            }
+            Self::OpenSlackRecovery { kind, .. } => formatter
+                .debug_tuple("ConnectorIntent::OpenSlackRecovery")
+                .field(kind)
+                .finish(),
+            Self::RequestImportSource(source) => formatter
+                .debug_tuple("ConnectorIntent::RequestImportSource")
+                .field(source)
+                .finish(),
+            Self::ImportConfiguration { source, .. } => formatter
+                .debug_struct("ConnectorIntent::ImportConfiguration")
+                .field("source", source)
+                .field("contents", &"REDACTED")
+                .finish(),
+            Self::OpenExternalLink(kind) => formatter
+                .debug_tuple("ConnectorIntent::OpenExternalLink")
+                .field(kind)
+                .finish(),
+            Self::DismissResult(_) => formatter.write_str("ConnectorIntent::DismissResult"),
+            Self::DismissImportReport(_) => {
+                formatter.write_str("ConnectorIntent::DismissImportReport")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorEvent {
     pub operation_id: OperationId,
@@ -909,15 +1039,88 @@ mod tests {
     }
 
     #[test]
-    fn import_intent_never_debugs_file_contents() {
+    fn connector_intent_debug_never_exposes_user_or_provider_coordinates() {
         let intent = ConnectorIntent::ImportConfiguration {
             source: ImportSource::File,
-            display_name: Some("mcp.json".to_owned()),
+            display_name: Some("debug-import-filename-marker.json".to_owned()),
             contents: SensitiveInput::from("client_secret=do-not-log".to_owned()),
         };
         let debug = format!("{intent:?}");
         assert!(debug.contains("REDACTED"));
         assert!(!debug.contains("do-not-log"));
+        assert!(!debug.contains("debug-import-filename-marker"));
+
+        let drafts = [
+            ServerDraft {
+                id: Some(ServerId::new("debug-server-id-marker")),
+                name: "debug-server-name-marker".to_owned(),
+                transport: TransportDraft::Http {
+                    url: "https://debug-provider-url-marker.example/mcp".to_owned(),
+                },
+                enabled: true,
+            },
+            ServerDraft {
+                id: None,
+                name: "debug-stdio-name-marker".to_owned(),
+                transport: TransportDraft::Stdio {
+                    command: "debug-command-marker".to_owned(),
+                    args: vec!["debug-argument-marker".to_owned()],
+                    plain_env: vec![(
+                        "DEBUG_ENV_KEY_MARKER".to_owned(),
+                        "debug-env-value-marker".to_owned(),
+                    )],
+                    secret_env: vec![(
+                        "DEBUG_SECRET_KEY_MARKER".to_owned(),
+                        CredentialId::new("debug-credential-id-marker"),
+                    )],
+                    inherit_env: false,
+                },
+                enabled: true,
+            },
+        ];
+        let debug = format!("{:?} {:?}", drafts[0], drafts[1]);
+        for marker in [
+            "debug-server-id-marker",
+            "debug-server-name-marker",
+            "debug-provider-url-marker",
+            "debug-stdio-name-marker",
+            "debug-command-marker",
+            "debug-argument-marker",
+            "DEBUG_ENV_KEY_MARKER",
+            "debug-env-value-marker",
+            "DEBUG_SECRET_KEY_MARKER",
+            "debug-credential-id-marker",
+        ] {
+            assert!(!debug.contains(marker), "Debug leaked {marker}: {debug}");
+        }
+
+        let oauth = ConnectorIntent::SubmitOAuthClient {
+            operation_id: OperationId::new("debug-operation-id-marker"),
+            config_revision: Revision(7),
+            server_id: ServerId::new("debug-oauth-server-marker"),
+            client_id: "debug-client-id-marker".to_owned(),
+            client_secret: SensitiveInput::from("debug-client-secret-marker".to_owned()),
+            workspace_hint: Some("debug-workspace-marker".to_owned()),
+        };
+        let slack = ConnectorIntent::SubmitSlackWorkspace {
+            operation_id: OperationId::new("debug-slack-operation-marker"),
+            config_revision: Revision(8),
+            workspace: "debug-slack-workspace-marker".to_owned(),
+        };
+        let debug = format!("{oauth:?} {slack:?}");
+        for marker in [
+            "debug-operation-id-marker",
+            "debug-oauth-server-marker",
+            "debug-client-id-marker",
+            "debug-client-secret-marker",
+            "debug-workspace-marker",
+            "debug-slack-operation-marker",
+            "debug-slack-workspace-marker",
+        ] {
+            assert!(!debug.contains(marker), "Debug leaked {marker}: {debug}");
+        }
+        assert!(debug.contains("Revision(7)"));
+        assert!(debug.contains("Revision(8)"));
     }
 
     #[test]

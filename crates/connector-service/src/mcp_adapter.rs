@@ -338,6 +338,17 @@ impl ProductionConnectorMcp {
         };
         let mut connection = match connection {
             Ok(connection) => connection,
+            Err(error) if error.downcast_ref::<mcp::McpAuthRequired>().is_some() => {
+                self.state
+                    .lock()
+                    .expect("connector MCP lease lock")
+                    .active
+                    .remove(operation_id);
+                return Err(ServiceError::new(
+                    ErrorCode::AuthenticationRequired,
+                    "MCP authentication is required",
+                ));
+            }
             Err(_error) => {
                 self.state
                     .lock()
@@ -551,6 +562,13 @@ impl ConnectorMcp for ProductionConnectorMcp {
                 self.finish_available(operation_id, lease, false, false);
                 Err(cancelled_error())
             }
+            Err(error) if error.downcast_ref::<mcp::McpAuthRequired>().is_some() => {
+                self.finish_available(operation_id, lease, false, false);
+                Err(ServiceError::new(
+                    ErrorCode::AuthenticationRequired,
+                    "MCP authentication is required",
+                ))
+            }
             Err(_error) => {
                 self.finish_available(operation_id, lease, false, false);
                 Err(ServiceError::new(
@@ -593,6 +611,13 @@ impl ConnectorMcp for ProductionConnectorMcp {
                 self.finish_available(operation_id, lease, false, false);
                 Err(cancelled_error())
             }
+            Err(error) if error.downcast_ref::<mcp::McpAuthRequired>().is_some() => {
+                self.finish_available(operation_id, lease, false, false);
+                Err(ServiceError::new(
+                    ErrorCode::AuthenticationRequired,
+                    "MCP authentication is required",
+                ))
+            }
             Err(_error) => {
                 self.finish_available(operation_id, lease, false, false);
                 Err(ServiceError::new(
@@ -614,19 +639,25 @@ impl ConnectorMcp for ProductionConnectorMcp {
             .connection
             .call_tool_json(request.tool_name(), request.arguments_json());
         match result {
-            Ok(output) if !cancellation.is_cancelled() => {
+            // Once the backend returned Ok, the external call is known delivered. A cancellation
+            // observed after that point may suppress stale UI, but must never rewrite the durable
+            // tool outcome to Failed or trigger a retry.
+            Ok(output) => {
                 self.finish_available(&operation_id, lease, true, false);
                 Ok(output)
-            }
-            Ok(_) => {
-                self.finish_available(&operation_id, lease, false, false);
-                Err(cancelled_error())
             }
             Err(error) if error.downcast_ref::<mcp::McpDeliveryUnknown>().is_some() => {
                 self.finish_available(&operation_id, lease, false, false);
                 Err(ServiceError::new(
                     ErrorCode::UnknownDelivery,
                     "MCP tool call delivery is unknown and was not retried",
+                ))
+            }
+            Err(error) if error.downcast_ref::<mcp::McpAuthRequired>().is_some() => {
+                self.finish_available(&operation_id, lease, false, false);
+                Err(ServiceError::new(
+                    ErrorCode::AuthenticationRequired,
+                    "MCP authentication is required and the call was not retried",
                 ))
             }
             Err(error)
@@ -715,7 +746,6 @@ mod tests {
     struct TestSecrets {
         slot: secret::PhysicalSecretSlot,
         redaction: secret::RedactionService,
-        revision_lookups: AtomicUsize,
         keyring_resolves: AtomicUsize,
     }
 
@@ -725,25 +755,25 @@ mod tests {
             Self {
                 slot: secret::PhysicalSecretSlot::allocate(&logical),
                 redaction: secret::RedactionService::new(),
-                revision_lookups: AtomicUsize::new(0),
                 keyring_resolves: AtomicUsize::new(0),
             }
         }
     }
 
     impl ConnectorSecrets for TestSecrets {
-        fn credential_revisions(
+        fn load_stored_oauth_client(
             &self,
-            credential_ids: Vec<CredentialId>,
-        ) -> Result<Vec<CredentialResolutionRequest>, ServiceError> {
-            self.revision_lookups.fetch_add(1, Ordering::AcqRel);
-            Ok(credential_ids
-                .into_iter()
-                .map(|credential_id| CredentialResolutionRequest {
-                    credential_id,
-                    expected_physical_slot: Some(self.slot.clone()),
-                })
-                .collect())
+            _binding: &crate::HttpAuthBinding,
+        ) -> Result<Option<crate::StoredOAuthClient>, ServiceError> {
+            Ok(None)
+        }
+
+        fn exchange_oauth_refresh(
+            &self,
+            _request: crate::OAuthRefreshRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<crate::OAuthRefreshOutcome, ServiceError> {
+            Ok(crate::OAuthRefreshOutcome::ReauthorizationRequired)
         }
 
         fn resolve_credentials(
@@ -779,8 +809,7 @@ mod tests {
 
         fn stage_oauth_bundle(
             &self,
-            _logical_id: secret::LogicalCredentialId,
-            _previous_slot: Option<secret::PhysicalSecretSlot>,
+            _plan: &secret::SecretBundleStagePlan,
             _bundle: secret::SecretBundle,
         ) -> Result<secret::StagedSecretBundle, ServiceError> {
             Err(ServiceError::new(

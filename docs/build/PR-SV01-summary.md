@@ -1,5 +1,31 @@
 # PR-SV01 — Lazy Connector coordinator and latest-only snapshots
 
+## 2026-07-22 production-adapter freeze amendment
+
+The service core now includes the production MCP and OAuth adapters that were still follow-up work
+in the original summary. MCP schema discovery and an authorized call are pinned to one exact
+configuration/auth revision and one of two bounded leases; idle reaping releases the connection or
+subprocess. OAuth uses one typed, bounded continuation, a bounded token-exchange timeout, exact
+reservation transfer, and checked retained-capacity accounting. Cancellation and configuration
+invalidation remove queued dynamic browser/recovery URLs before returning. Known-delivered tool
+success remains `Succeeded` after a late UI cancellation, while an unknown delivery is never
+retried.
+
+All public OAuth port `Debug` implementations and Connector intent/draft diagnostics expose only
+low-cardinality state, booleans, counts, revisions, and `REDACTED`; raw provider/user coordinates,
+URLs, commands, environment values, operation IDs, client data, and workspace hints are excluded.
+The coordinator still performs zero thread/repository open/wake on construction and retains only
+the latest snapshot.
+
+Root verification after this amendment:
+
+- `cargo test -p connector-contract`: 8/8 plus doc-tests passed.
+- `cargo test -p connector-service -- --test-threads=1`: 61/61 plus doc-tests passed.
+- All-target check and strict Clippy passed for both crates.
+- Package rustfmt and `git diff --check` passed.
+- `check-deps` passed for 23 crates with no forbidden edge/cycle.
+- `check-boundary` passed at the unchanged 53 existing exceptions.
+
 ## Outcome
 
 `connector-service` now owns a synchronous, bounded Connector coordinator without knowing a
@@ -68,7 +94,7 @@ snapshot with a new repository connection rather than reverting to a default rev
 
 ## Verification
 
-- `cargo test -p connector-service --no-fail-fast`: 12 passed, 0 failed.
+- Original PR baseline: `cargo test -p connector-service --no-fail-fast`: 12 passed, 0 failed.
 - `cargo check -p connector-service`: passed.
 - `cargo clippy -p connector-service --all-targets -- -D warnings`: passed.
 - `cargo run -q -p xtask -- check-deps`: passed for 23 crates; forbidden edges/cycles 0.

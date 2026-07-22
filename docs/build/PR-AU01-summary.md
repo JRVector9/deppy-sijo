@@ -1,5 +1,17 @@
 # PR-AU01 — Shared Authorization and Durable Audit Lifecycle
 
+## 2026-07-22 service-state amendment
+
+The production Connector service now covers the previously deferred OAuth/remote-trust host state
+machine and the exact late-cancellation outcome rule. A stale singleton response cannot consume a
+newer continuation or its one-slot reservation. Configuration invalidation finalizes the actual
+pending singleton and revokes queued dynamic URLs. If the tool backend returned a known `Ok`, a
+later UI cancellation cannot rewrite the durable outcome away from `Succeeded`; delivery ambiguity
+remains `Unknown` and is never retried. The amended connector-service suite passes 61/61 serially.
+
+The durable external-proxy approval inbox is being tightened separately before the app cutover;
+the app must not retain its current unconditional 500-ms approval polling thread in production.
+
 ## Outcome
 
 PR-AU01 gives the GUI Connector service and `deppy-mcp-proxy` one shared authorization model and

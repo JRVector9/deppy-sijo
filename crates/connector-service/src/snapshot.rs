@@ -12,10 +12,10 @@ pub(crate) struct SnapshotCell {
 }
 
 impl SnapshotCell {
-    pub(crate) fn new(host: Arc<dyn ConnectorHost>) -> Self {
+    pub(crate) fn new(host: Arc<dyn ConnectorHost>, initial: ConnectorSnapshot) -> Self {
         Self {
             revision: AtomicU64::new(0),
-            value: Mutex::new(Arc::new(ConnectorSnapshot::default())),
+            value: Mutex::new(Arc::new(initial)),
             host,
         }
     }

@@ -19,8 +19,9 @@ use crate::ports::{
     AuthorizedInvokeRequest, CancellationToken, ConnectorMcp, ConnectorOAuth, ConnectorRepository,
     ConnectorRepositoryFactory, ConnectorSecrets, CredentialResolutionRequest, DiscoverOutput,
     LiveToolSchema, McpRequestTarget, McpTransportSnapshot, OAuthAuthorizeOutput,
-    OAuthContinuation, OAuthDiscovery, OAuthEventSink, OAuthFailure, OAuthRecoveryTarget,
-    ServiceError, StoredOAuthClient,
+    OAuthContinuation, OAuthDiscovery, OAuthEventSink, OAuthFailure, OAuthPublishDescriptor,
+    OAuthPublishMode, OAuthPublishResult, OAuthRecoveryTarget, OAuthRefreshOutcome,
+    OAuthRefreshRequest, Observed, RepositoryCas, ServiceError, StoredOAuthClient,
 };
 use crate::snapshot::{SnapshotCell, SnapshotReader};
 
@@ -98,6 +99,16 @@ impl std::fmt::Debug for HostAction {
     }
 }
 
+impl HostAction {
+    fn dynamic_operation_id(&self) -> Option<&OperationId> {
+        match self {
+            Self::OpenOAuthBrowser { operation_id, .. }
+            | Self::OpenSlackRecovery { operation_id, .. } => Some(operation_id),
+            Self::RequestImportSource { .. } | Self::OpenExternalLink { .. } => None,
+        }
+    }
+}
+
 struct HostActionQueue {
     capacity: usize,
     queue: Mutex<VecDeque<HostAction>>,
@@ -136,6 +147,20 @@ impl HostActionQueue {
 
     fn len(&self) -> usize {
         self.queue.lock().expect("connector host action lock").len()
+    }
+
+    fn remove_dynamic_for_operation(&self, operation_id: &OperationId) {
+        self.queue
+            .lock()
+            .expect("connector host action lock")
+            .retain(|action| action.dynamic_operation_id() != Some(operation_id));
+    }
+
+    fn remove_all_dynamic(&self) {
+        self.queue
+            .lock()
+            .expect("connector host action lock")
+            .retain(|action| action.dynamic_operation_id().is_none());
     }
 }
 
@@ -178,6 +203,14 @@ impl SessionTrustRegistry {
     fn retain_revision(&mut self, revision: Revision) {
         self.entries
             .retain(|entry| entry.config_revision == revision);
+    }
+
+    fn rebind_self_authored_revision(&mut self, previous: Revision, committed: Revision) {
+        for entry in &mut self.entries {
+            if entry.config_revision == previous {
+                entry.config_revision = committed;
+            }
+        }
     }
 }
 
@@ -242,6 +275,9 @@ impl CoordinatorClock for SystemCoordinatorClock {
 pub struct ConnectorCoordinatorConfig {
     pub limits: ResourceLimits,
     pub idle_ttl: Duration,
+    /// Optional bootstrap-only, transport-neutral data read through app.rs's existing Db. It is
+    /// installed without starting a worker or waking the host and is not retained twice.
+    pub initial_overview: Option<crate::OverviewData>,
     pub repository_factory: Arc<dyn ConnectorRepositoryFactory>,
     pub secrets: Arc<dyn ConnectorSecrets>,
     pub mcp: Arc<dyn ConnectorMcp>,
@@ -366,14 +402,29 @@ impl ConnectorCoordinator {
         if config.idle_ttl.is_zero() {
             return Err(DispatchError::InvalidLimits);
         }
-        let config = ConnectorCoordinatorConfig { limits, ..config };
+        let mut config = ConnectorCoordinatorConfig { limits, ..config };
+        let initial_snapshot = match config.initial_overview.take() {
+            Some(overview) => {
+                validate_overview(&overview, limits).map_err(|_| DispatchError::InvalidLimits)?;
+                ConnectorSnapshot {
+                    config_revision: overview.config_revision,
+                    slack: overview.slack,
+                    servers: Arc::from(overview.servers),
+                    ..ConnectorSnapshot::default()
+                }
+            }
+            None => ConnectorSnapshot::default(),
+        };
         let host_actions = Arc::new(HostActionQueue::new(
             config.limits.host_actions,
             Arc::clone(&config.host),
         ));
         Ok(Self {
             inner: Arc::new(Inner {
-                snapshot: Arc::new(SnapshotCell::new(Arc::clone(&config.host))),
+                snapshot: Arc::new(SnapshotCell::new(
+                    Arc::clone(&config.host),
+                    initial_snapshot,
+                )),
                 host_actions,
                 session_trust: Arc::new(Mutex::new(SessionTrustRegistry::new(
                     config.limits.session_trust_entries,
@@ -405,6 +456,19 @@ impl ConnectorCoordinator {
     }
 
     pub fn dispatch(&self, intent: ConnectorIntent) -> Result<DispatchOutcome, DispatchError> {
+        if let ConnectorIntent::Cancel(operation_id) = &intent {
+            // Cancellation is visible before the worker turn. Drop any queued dynamic URL now so
+            // the app cannot dequeue it after cancellation while the worker is still waking.
+            self.inner
+                .host_actions
+                .remove_dynamic_for_operation(operation_id);
+        }
+        let invalidates = invalidates_inflight(&intent);
+        if invalidates {
+            // Static user-requested host actions remain valid. OAuth/provider recovery URLs are
+            // bound to the old generation/config and must never escape after invalidation.
+            self.inner.host_actions.remove_all_dynamic();
+        }
         match intent {
             ConnectorIntent::RequestImportSource(source) => {
                 self.inner
@@ -442,7 +506,7 @@ impl ConnectorCoordinator {
                 {
                     cancellation.cancel();
                 }
-                let dispatch_epoch = if invalidates_inflight(&intent) {
+                let dispatch_epoch = if invalidates {
                     self.inner
                         .session_trust
                         .lock()
@@ -626,6 +690,7 @@ enum JobPayload {
     InvokeCall(Result<String, ServiceError>),
     OAuthDiscover(Result<OAuthDiscovery, ServiceError>),
     OAuthAuthorize(Result<OAuthAuthorizeOutput, ServiceError>),
+    OAuthRefresh(Result<OAuthRefreshOutcome, ServiceError>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -635,6 +700,8 @@ enum JobStage {
     InvokeCall,
     OAuthDiscover,
     OAuthAuthorize,
+    OAuthRefreshDiscover,
+    OAuthRefreshInvoke,
 }
 
 impl JobStage {
@@ -643,6 +710,8 @@ impl JobStage {
             Self::Discover => OperationKind::Discover,
             Self::InvokeSchema | Self::InvokeCall => OperationKind::Invoke,
             Self::OAuthDiscover | Self::OAuthAuthorize => OperationKind::OAuth,
+            Self::OAuthRefreshDiscover => OperationKind::Discover,
+            Self::OAuthRefreshInvoke => OperationKind::Invoke,
         }
     }
 }
@@ -688,9 +757,7 @@ struct PendingOutcome {
 }
 
 enum DeferredRemote {
-    Discover {
-        server: ServerDraft,
-    },
+    Discover,
     Invoke {
         server: ServerDraft,
         tool_id: ToolId,
@@ -702,9 +769,24 @@ enum DeferredRemote {
     },
 }
 
+enum ReservedCapacity {
+    Mcp,
+    OAuth,
+}
+
+impl ReservedCapacity {
+    fn operation_kind_matches(&self, kind: OperationKind) -> bool {
+        match self {
+            Self::Mcp => matches!(kind, OperationKind::Discover | OperationKind::Invoke),
+            Self::OAuth => kind == OperationKind::OAuth,
+        }
+    }
+}
+
 struct PendingRemote {
     prompt: RemoteTrustPrompt,
     action: DeferredRemote,
+    reservation: ReservedCapacity,
 }
 
 struct PendingOAuth {
@@ -715,6 +797,14 @@ struct PendingOAuth {
     generation: u64,
     config_revision: Revision,
     dispatch_epoch: u64,
+}
+
+enum PendingAfterRefresh {
+    Discover,
+    Invoke {
+        tool_id: ToolId,
+        arguments_json: SensitiveInput,
+    },
 }
 
 struct StoredRecoveryTarget {
@@ -802,6 +892,7 @@ struct Worker {
     pending_outcomes: HashMap<OperationId, PendingOutcome>,
     pending_remote: Option<PendingRemote>,
     pending_oauth: Option<PendingOAuth>,
+    pending_refresh: HashMap<OperationId, PendingAfterRefresh>,
     slack_recovery: Option<StoredRecoveryTarget>,
     approval_order: VecDeque<OperationId>,
     operations: Vec<OperationSummary>,
@@ -863,6 +954,7 @@ impl Worker {
             pending_outcomes: HashMap::new(),
             pending_remote: None,
             pending_oauth: None,
+            pending_refresh: HashMap::new(),
             slack_recovery: None,
             approval_order: VecDeque::new(),
             operations: Vec::new(),
@@ -970,7 +1062,11 @@ impl Worker {
     fn accept_command(&mut self, command: CommandEnvelope) {
         self.metrics.queue_depth.fetch_sub(1, Ordering::AcqRel);
         self.last_activity = self.clock.now();
+        let invalidated_pending_singletons = self.current_dispatch_epoch != command.dispatch_epoch;
         self.current_dispatch_epoch = command.dispatch_epoch;
+        if invalidated_pending_singletons {
+            self.invalidate_pending_singletons();
+        }
         self.retry_pending_outcomes();
         self.discard_cancelled_pending();
         if self.needs_initial_overview {
@@ -980,6 +1076,36 @@ impl Worker {
             }
         }
         self.handle_command(command.intent);
+    }
+
+    fn invalidate_pending_singletons(&mut self) {
+        if let Some(pending) = self.pending_remote.take() {
+            self.snapshot.remote_trust = None;
+            self.metrics.stale_results.fetch_add(1, Ordering::AcqRel);
+            self.finish_waiting_operation(
+                &pending.prompt.operation_id,
+                purpose_kind(pending.prompt.purpose),
+                OperationPhase::Cancelled,
+                Some(ErrorCode::StaleResult),
+            );
+        }
+        if let Some(pending) = self.pending_oauth.take() {
+            self.oauth.cancel(&pending.operation_id);
+            if self
+                .snapshot
+                .oauth
+                .as_ref()
+                .is_some_and(|state| state.operation_id == pending.operation_id)
+            {
+                self.snapshot.oauth = None;
+            }
+            self.metrics.stale_results.fetch_add(1, Ordering::AcqRel);
+            self.finish_oauth_operation(
+                &pending.operation_id,
+                OperationPhase::Cancelled,
+                Some(ErrorCode::StaleResult),
+            );
+        }
     }
 
     fn handle_command(&mut self, command: ConnectorIntent) {
@@ -1034,16 +1160,28 @@ impl Worker {
                 client_id,
                 client_secret,
                 workspace_hint,
-            } => self.submit_oauth(
-                operation_id,
-                config_revision,
-                StoredOAuthClient {
-                    server_id,
-                    client_id,
-                    client_secret,
-                    workspace_hint,
-                },
-            ),
+            } => {
+                let logical_id = match oauth_logical_id(&server_id) {
+                    Ok(logical_id) => logical_id,
+                    Err(error) => {
+                        self.publish_service_error(OperationKind::OAuth, error);
+                        return;
+                    }
+                };
+                self.submit_oauth(
+                    operation_id,
+                    config_revision,
+                    StoredOAuthClient {
+                        server_id,
+                        logical_id,
+                        client_id,
+                        client_secret: Some(client_secret),
+                        workspace_hint,
+                        metadata: None,
+                        manual_client: true,
+                    },
+                )
+            }
             ConnectorIntent::SubmitSlackWorkspace {
                 operation_id,
                 config_revision,
@@ -1144,7 +1282,10 @@ impl Worker {
         self.snapshot.tool_page = None;
         self.snapshot.selected_server_config = match server_id {
             Some(server_id) => match self.repository.load_server(&server_id) {
-                Ok(server) => {
+                Ok(Observed {
+                    revision,
+                    value: server,
+                }) if revision == self.snapshot.config_revision => {
                     if let Err(error) = validate_loaded_server_id(&server_id, &server) {
                         self.publish_service_error(OperationKind::SaveServer, error);
                         return;
@@ -1154,6 +1295,15 @@ impl Worker {
                         return;
                     }
                     Some(server)
+                }
+                Ok(_) => {
+                    self.reload_overview();
+                    self.publish_error(
+                        OperationKind::SaveServer,
+                        ErrorCode::StaleResult,
+                        "selected server changed while it was being loaded",
+                    );
+                    return;
                 }
                 Err(error) => {
                     self.publish_service_error(OperationKind::SaveServer, error);
@@ -1170,7 +1320,12 @@ impl Worker {
             .repository
             .load_tool_page(&server_id, offset, TOOL_PAGE_SIZE)
         {
-            Ok(page) if validate_tool_page(&page, self.limits).is_ok() => {
+            Ok(Observed {
+                revision,
+                value: page,
+            }) if revision == self.snapshot.config_revision
+                && validate_tool_page(&page, self.limits).is_ok() =>
+            {
                 self.snapshot.tool_page = Some(ToolPage {
                     server_id,
                     offset,
@@ -1178,6 +1333,14 @@ impl Worker {
                     items: Arc::from(page.items),
                 });
                 self.publish();
+            }
+            Ok(Observed { revision, .. }) if revision != self.snapshot.config_revision => {
+                self.reload_overview();
+                self.publish_error(
+                    OperationKind::Discover,
+                    ErrorCode::StaleResult,
+                    "tool page revision changed while it was being loaded",
+                );
             }
             Ok(_) => self.publish_error(
                 OperationKind::Discover,
@@ -1193,18 +1356,48 @@ impl Worker {
             self.publish_service_error(OperationKind::SaveServer, error);
             return;
         }
-        if let Err(error) = self.repository.save_server(draft) {
-            self.publish_service_error(OperationKind::SaveServer, error);
-            return;
+        match self
+            .repository
+            .save_server(self.snapshot.config_revision, draft)
+        {
+            Ok(RepositoryCas::Committed { .. }) => {}
+            Ok(RepositoryCas::Stale { .. }) => {
+                self.reload_overview();
+                self.publish_error(
+                    OperationKind::SaveServer,
+                    ErrorCode::StaleResult,
+                    "server configuration changed before save",
+                );
+                return;
+            }
+            Err(error) => {
+                self.publish_service_error(OperationKind::SaveServer, error);
+                return;
+            }
         }
         self.reload_overview();
     }
 
     fn delete_server(&mut self, server_id: ServerId) {
         self.bump_generation(&server_id);
-        if let Err(error) = self.repository.delete_server(&server_id) {
-            self.publish_service_error(OperationKind::DeleteServer, error);
-            return;
+        match self
+            .repository
+            .delete_server(self.snapshot.config_revision, &server_id)
+        {
+            Ok(RepositoryCas::Committed { .. }) => {}
+            Ok(RepositoryCas::Stale { .. }) => {
+                self.reload_overview();
+                self.publish_error(
+                    OperationKind::DeleteServer,
+                    ErrorCode::StaleResult,
+                    "server configuration changed before delete",
+                );
+                return;
+            }
+            Err(error) => {
+                self.publish_service_error(OperationKind::DeleteServer, error);
+                return;
+            }
         }
         self.reload_overview();
     }
@@ -1215,18 +1408,50 @@ impl Worker {
         tool_id: connector_contract::ToolId,
         rule: connector_contract::PermissionRule,
     ) {
-        if let Err(error) = self.repository.set_permission(&server_id, &tool_id, rule) {
-            self.publish_service_error(OperationKind::UpdatePermission, error);
-            return;
+        match self.repository.set_permission(
+            self.snapshot.config_revision,
+            &server_id,
+            &tool_id,
+            rule,
+        ) {
+            Ok(RepositoryCas::Committed { .. }) => {}
+            Ok(RepositoryCas::Stale { .. }) => {
+                self.reload_overview();
+                self.publish_error(
+                    OperationKind::UpdatePermission,
+                    ErrorCode::StaleResult,
+                    "permission changed before update",
+                );
+                return;
+            }
+            Err(error) => {
+                self.publish_service_error(OperationKind::UpdatePermission, error);
+                return;
+            }
         }
         self.reload_overview();
         self.load_tool_page(server_id, 0);
     }
 
     fn connect_slack(&mut self) {
-        if let Err(error) = self.repository.ensure_slack_server() {
-            self.publish_service_error(OperationKind::SaveServer, error);
-            return;
+        match self
+            .repository
+            .ensure_slack_server(self.snapshot.config_revision)
+        {
+            Ok(RepositoryCas::Committed { .. }) => {}
+            Ok(RepositoryCas::Stale { .. }) => {
+                self.reload_overview();
+                self.publish_error(
+                    OperationKind::SaveServer,
+                    ErrorCode::StaleResult,
+                    "connector configuration changed before Slack registration",
+                );
+                return;
+            }
+            Err(error) => {
+                self.publish_service_error(OperationKind::SaveServer, error);
+                return;
+            }
         }
         self.reload_overview();
         let Some(server_id) = self.snapshot.slack.server_id.clone() else {
@@ -1318,14 +1543,30 @@ impl Worker {
             });
         }
         let (report_items, truncated) = bound_import_report(report_items, self.limits);
-        if let Err(error) = self.repository.import_servers(plan.servers) {
-            self.publish_operation_error(
-                operation_id,
-                OperationKind::Import,
-                error.code,
-                error.message,
-            );
-            return;
+        match self
+            .repository
+            .import_servers(self.snapshot.config_revision, plan.servers)
+        {
+            Ok(RepositoryCas::Committed { .. }) => {}
+            Ok(RepositoryCas::Stale { .. }) => {
+                self.reload_overview();
+                self.publish_operation_error(
+                    operation_id,
+                    OperationKind::Import,
+                    ErrorCode::StaleResult,
+                    "connector configuration changed before import",
+                );
+                return;
+            }
+            Err(error) => {
+                self.publish_operation_error(
+                    operation_id,
+                    OperationKind::Import,
+                    error.code,
+                    error.message,
+                );
+                return;
+            }
         }
         let skipped = report_items
             .iter()
@@ -1413,9 +1654,21 @@ impl Worker {
             phase: OperationPhase::AwaitingTrust,
             error_code: None,
         });
+        let reservation = match purpose_kind(purpose) {
+            OperationKind::OAuth => {
+                self.metrics.active_oauth.fetch_add(1, Ordering::AcqRel);
+                ReservedCapacity::OAuth
+            }
+            OperationKind::Discover | OperationKind::Invoke => {
+                self.metrics.active_mcp.fetch_add(1, Ordering::AcqRel);
+                ReservedCapacity::Mcp
+            }
+            _ => unreachable!("remote trust is only used by MCP and OAuth operations"),
+        };
         self.pending_remote = Some(PendingRemote {
             prompt: prompt.clone(),
             action,
+            reservation,
         });
         self.snapshot.remote_trust = Some(prompt);
         self.transition(OperationKind::Trust, OperationPhase::AwaitingTrust, None);
@@ -1430,26 +1683,40 @@ impl Worker {
         endpoint_fingerprint: EndpointFingerprint,
         accepted: bool,
     ) {
-        let Some(pending) = self.pending_remote.take() else {
+        let Some(current) = self.pending_remote.as_ref() else {
             self.metrics.stale_results.fetch_add(1, Ordering::AcqRel);
             return;
         };
-        self.snapshot.remote_trust = None;
-        let exact = pending.prompt.operation_id == operation_id
-            && pending.prompt.config_revision == config_revision
-            && pending.prompt.endpoint_fingerprint == endpoint_fingerprint
-            && self.snapshot.config_revision == config_revision
+        let supplied_exact = current.prompt.operation_id == operation_id
+            && current.prompt.config_revision == config_revision
+            && current.prompt.endpoint_fingerprint == endpoint_fingerprint;
+        if !supplied_exact {
+            // A stale UI response cannot consume another live singleton prompt.
+            self.metrics.stale_results.fetch_add(1, Ordering::AcqRel);
+            return;
+        }
+        let current_valid = self.snapshot.config_revision == config_revision
             && self.dispatch_epoch.load(Ordering::Acquire) == self.current_dispatch_epoch;
-        if !exact {
+        if !current_valid {
+            let pending = self
+                .pending_remote
+                .take()
+                .expect("validated pending remote trust state");
+            self.snapshot.remote_trust = None;
             self.finish_waiting_operation(
-                &operation_id,
-                OperationKind::Trust,
+                &pending.prompt.operation_id,
+                purpose_kind(pending.prompt.purpose),
                 OperationPhase::Cancelled,
                 Some(ErrorCode::StaleResult),
             );
             self.metrics.stale_results.fetch_add(1, Ordering::AcqRel);
             return;
         }
+        let pending = self
+            .pending_remote
+            .take()
+            .expect("validated pending remote trust state");
+        self.snapshot.remote_trust = None;
         if !accepted {
             self.finish_waiting_operation(
                 &operation_id,
@@ -1461,7 +1728,17 @@ impl Worker {
         }
         let server_id = pending.prompt.server_id.clone();
         let server = match self.repository.load_server(&server_id) {
-            Ok(server) => server,
+            Ok(Observed { revision, value }) if revision == config_revision => value,
+            Ok(_) => {
+                self.finish_waiting_operation(
+                    &operation_id,
+                    purpose_kind(pending.prompt.purpose),
+                    OperationPhase::Cancelled,
+                    Some(ErrorCode::StaleResult),
+                );
+                self.reload_overview();
+                return;
+            }
             Err(error) => {
                 self.finish_waiting_operation(
                     &operation_id,
@@ -1491,6 +1768,20 @@ impl Worker {
             self.metrics.stale_results.fetch_add(1, Ordering::AcqRel);
             return;
         }
+        let operation_kind = purpose_kind(pending.prompt.purpose);
+        if !self.transfer_remote_trust_reservation(
+            &pending.prompt.operation_id,
+            operation_kind,
+            pending.reservation,
+        ) {
+            self.finish_waiting_operation(
+                &pending.prompt.operation_id,
+                operation_kind,
+                OperationPhase::Failed,
+                Some(ErrorCode::Internal),
+            );
+            return;
+        }
         self.session_trust
             .lock()
             .expect("connector trust registry lock")
@@ -1500,7 +1791,7 @@ impl Worker {
                 fingerprint: endpoint_fingerprint,
             });
         match pending.action {
-            DeferredRemote::Discover { .. } => {
+            DeferredRemote::Discover => {
                 self.start_discover_with_id(operation_id, server_id);
             }
             DeferredRemote::Invoke {
@@ -1514,6 +1805,43 @@ impl Worker {
         }
     }
 
+    /// Atomically transfers the capacity held while awaiting remote trust back into the normal
+    /// fresh-start path. The coordinator worker is single-threaded, so no command can interleave
+    /// between this exact release and the start path's limit check/reacquisition. Reusing the
+    /// normal path also guarantees every pre-job error and thread-spawn failure has no inherited
+    /// reservation left to leak.
+    fn transfer_remote_trust_reservation(
+        &mut self,
+        operation_id: &OperationId,
+        operation_kind: OperationKind,
+        reservation: ReservedCapacity,
+    ) -> bool {
+        if !reservation.operation_kind_matches(operation_kind) {
+            return false;
+        }
+        let Some(index) = self.operations.iter().position(|operation| {
+            &operation.id == operation_id
+                && operation.kind == operation_kind
+                && operation.phase == OperationPhase::AwaitingTrust
+        }) else {
+            return false;
+        };
+        let counter = match reservation {
+            ReservedCapacity::Mcp => &self.metrics.active_mcp,
+            ReservedCapacity::OAuth => &self.metrics.active_oauth,
+        };
+        if counter.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        self.operations.remove(index);
+        self.cancellations
+            .lock()
+            .expect("connector cancellation registry")
+            .remove(operation_id);
+        counter.fetch_sub(1, Ordering::AcqRel);
+        true
+    }
+
     fn finish_waiting_operation(
         &mut self,
         operation_id: &OperationId,
@@ -1521,8 +1849,22 @@ impl Worker {
         phase: OperationPhase,
         error_code: Option<ErrorCode>,
     ) {
+        let reserved_kind = self
+            .operations
+            .iter()
+            .find(|operation| &operation.id == operation_id)
+            .map(|operation| operation.kind);
         self.operations
             .retain(|operation| &operation.id != operation_id);
+        match reserved_kind {
+            Some(OperationKind::OAuth) => {
+                self.metrics.active_oauth.fetch_sub(1, Ordering::AcqRel);
+            }
+            Some(OperationKind::Discover | OperationKind::Invoke) => {
+                self.metrics.active_mcp.fetch_sub(1, Ordering::AcqRel);
+            }
+            _ => {}
+        }
         self.cancellations
             .lock()
             .expect("connector cancellation registry")
@@ -1541,13 +1883,25 @@ impl Worker {
             self.reject_backpressure(OperationKind::Discover);
             return;
         }
-        let server = match self.repository.load_server(&server_id) {
-            Ok(server) => server,
+        let observed_target = match self.repository.load_mcp_target(&server_id) {
+            Ok(target) if target.revision == self.snapshot.config_revision => target,
+            Ok(_) => {
+                self.reload_overview();
+                self.publish_operation_error(
+                    operation_id,
+                    OperationKind::Discover,
+                    ErrorCode::StaleResult,
+                    "connector target changed before discovery",
+                );
+                return;
+            }
             Err(error) => {
                 self.publish_service_error(OperationKind::Discover, error);
                 return;
             }
         };
+        let config_revision = observed_target.revision;
+        let server = observed_target.value.server.clone();
         if let Err(error) = validate_loaded_server_id(&server_id, &server) {
             self.publish_service_error(OperationKind::Discover, error);
             return;
@@ -1556,17 +1910,32 @@ impl Worker {
             self.publish_service_error(OperationKind::Discover, error);
             return;
         }
-        let Some(DeferredRemote::Discover { server }) = self.remote_after_trust(
+        let Some(DeferredRemote::Discover) = self.remote_after_trust(
             operation_id.clone(),
             &server,
             RemoteTrustPurpose::Discover,
-            DeferredRemote::Discover {
-                server: server.clone(),
-            },
+            DeferredRemote::Discover,
         ) else {
             return;
         };
-        let target = match self.prepare_mcp_target(server) {
+        match self.refresh_request(&observed_target.value) {
+            Ok(Some(request)) => {
+                self.spawn_oauth_refresh(
+                    operation_id,
+                    server_id,
+                    config_revision,
+                    request,
+                    PendingAfterRefresh::Discover,
+                );
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.publish_service_error(OperationKind::Discover, error);
+                return;
+            }
+        }
+        let target = match self.prepare_mcp_target(observed_target.value, config_revision) {
             Ok(target) => target,
             Err(error) => {
                 self.publish_operation_error(
@@ -1579,7 +1948,6 @@ impl Worker {
             }
         };
         let generation = self.bump_generation(&server_id);
-        let config_revision = self.snapshot.config_revision;
         let dispatch_epoch = self.current_dispatch_epoch;
         let cancellation = CancellationToken::default();
         let mcp = Arc::clone(&self.mcp);
@@ -1652,8 +2020,18 @@ impl Worker {
             self.metrics.backpressure.fetch_add(1, Ordering::AcqRel);
             return;
         }
-        let server = match self.repository.load_server(&server_id) {
-            Ok(server) => server,
+        let observed_target = match self.repository.load_mcp_target(&server_id) {
+            Ok(target) if target.revision == self.snapshot.config_revision => target,
+            Ok(_) => {
+                self.reload_overview();
+                self.publish_operation_error(
+                    operation_id,
+                    OperationKind::Invoke,
+                    ErrorCode::StaleResult,
+                    "connector target changed before invoke",
+                );
+                return;
+            }
             Err(error) => {
                 self.publish_operation_error(
                     operation_id,
@@ -1664,6 +2042,8 @@ impl Worker {
                 return;
             }
         };
+        let config_revision = observed_target.revision;
+        let server = observed_target.value.server.clone();
         if let Err(error) = validate_loaded_server_id(&server_id, &server) {
             self.publish_operation_error(
                 operation_id,
@@ -1699,7 +2079,27 @@ impl Worker {
         else {
             return;
         };
-        let target = match self.prepare_mcp_target(server.clone()) {
+        match self.refresh_request(&observed_target.value) {
+            Ok(Some(request)) => {
+                self.spawn_oauth_refresh(
+                    operation_id,
+                    server_id,
+                    config_revision,
+                    request,
+                    PendingAfterRefresh::Invoke {
+                        tool_id,
+                        arguments_json,
+                    },
+                );
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.publish_service_error(OperationKind::Invoke, error);
+                return;
+            }
+        }
+        let target = match self.prepare_mcp_target(observed_target.value, config_revision) {
             Ok(target) => target,
             Err(error) => {
                 self.publish_operation_error(
@@ -1712,7 +2112,21 @@ impl Worker {
             }
         };
         let tool_name = match self.repository.load_tool_name(&server_id, &tool_id) {
-            Ok(tool_name) if !tool_name.trim().is_empty() => tool_name,
+            Ok(Observed {
+                revision,
+                value: tool_name,
+            }) if revision == config_revision && !tool_name.trim().is_empty() => tool_name,
+            Ok(Observed { revision, .. }) if revision != config_revision => {
+                self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+                self.reload_overview();
+                self.publish_operation_error(
+                    operation_id,
+                    OperationKind::Invoke,
+                    ErrorCode::StaleResult,
+                    "tool changed while invoke was being prepared",
+                );
+                return;
+            }
             Ok(_) => {
                 self.publish_operation_error(
                     operation_id,
@@ -1733,7 +2147,6 @@ impl Worker {
             }
         };
         let generation = self.bump_generation(&server_id);
-        let config_revision = self.snapshot.config_revision;
         let dispatch_epoch = self.current_dispatch_epoch;
         let cancellation = CancellationToken::default();
         let mcp = Arc::clone(&self.mcp);
@@ -1810,9 +2223,15 @@ impl Worker {
 
     fn prepare_mcp_target(
         &mut self,
-        server: ServerDraft,
+        target: crate::ports::RepositoryMcpTarget,
+        config_revision: Revision,
     ) -> Result<McpRequestTarget, ServiceError> {
-        let server_id = server.id.as_ref().ok_or_else(|| {
+        let crate::ports::RepositoryMcpTarget {
+            server,
+            credential_revisions,
+            http_auth,
+        } = target;
+        server.id.as_ref().ok_or_else(|| {
             ServiceError::new(
                 ErrorCode::StorageUnavailable,
                 "connector server has no stable identifier",
@@ -1822,40 +2241,157 @@ impl Worker {
             TransportDraft::Stdio { secret_env, .. } => {
                 let expected_ids = secret_env
                     .iter()
-                    .map(|(_, credential_id)| credential_id.clone())
+                    .map(|(_, credential_id)| credential_id)
                     .collect::<Vec<_>>();
-                let requests = self.secrets.credential_revisions(expected_ids.clone())?;
-                if requests.len() != expected_ids.len()
-                    || requests
+                if credential_revisions.len() != expected_ids.len()
+                    || credential_revisions
                         .iter()
-                        .zip(&expected_ids)
+                        .zip(expected_ids)
                         .any(|(request, expected)| {
                             &request.credential_id != expected
                                 || request.expected_physical_slot.is_none()
                         })
+                    || http_auth.is_some()
                 {
                     return Err(ServiceError::new(
                         ErrorCode::SecretUnavailable,
-                        "credential pointer index returned a mismatched revision",
+                        "repository returned mismatched stdio credential revisions",
                     ));
                 }
-                requests
+                credential_revisions
             }
-            TransportDraft::Http { url } => self
-                .repository
-                .load_http_auth_binding(server_id, url)?
-                .map_or_else(Vec::new, |binding| {
+            TransportDraft::Http { .. } => {
+                if !credential_revisions.is_empty() {
+                    return Err(ServiceError::new(
+                        ErrorCode::SecretUnavailable,
+                        "repository returned unexpected HTTP credential revisions",
+                    ));
+                }
+                http_auth.map_or_else(Vec::new, |binding| {
                     vec![CredentialResolutionRequest {
                         credential_id: binding.credential_id,
                         expected_physical_slot: Some(binding.physical_slot),
                     }]
-                }),
+                })
+            }
         };
         Ok(McpRequestTarget {
             server,
-            config_revision: self.snapshot.config_revision,
+            config_revision,
             credential_revisions: requests,
         })
+    }
+
+    fn refresh_request(
+        &self,
+        target: &crate::RepositoryMcpTarget,
+    ) -> Result<Option<OAuthRefreshRequest>, ServiceError> {
+        let (server_id, server_url) = match (&target.server.id, &target.server.transport) {
+            (Some(server_id), TransportDraft::Http { url }) => (server_id, url),
+            _ => return Ok(None),
+        };
+        let Some(binding) = target.http_auth.as_ref() else {
+            return Ok(None);
+        };
+        let Some(metadata) = binding.oauth_metadata.as_ref() else {
+            return Ok(None);
+        };
+        metadata
+            .validate_for_binding(
+                server_id.as_str(),
+                server_url,
+                auth::StoredOAuthMetadataLimits::PRODUCTION,
+            )
+            .map_err(|_| {
+                ServiceError::new(
+                    ErrorCode::AuthenticationFailed,
+                    "stored OAuth metadata does not match the connector",
+                )
+            })?;
+        let expires_at = metadata
+            .expires_at_secs()
+            .and_then(|seconds| std::time::UNIX_EPOCH.checked_add(Duration::from_secs(seconds)));
+        if !auth::should_refresh_at(expires_at, std::time::SystemTime::now()) {
+            return Ok(None);
+        }
+        let logical_id =
+            secret::LogicalCredentialId::new(binding.credential_id.as_str()).map_err(|_| {
+                ServiceError::new(
+                    ErrorCode::SecretUnavailable,
+                    "OAuth credential identifier is invalid",
+                )
+            })?;
+        Ok(Some(OAuthRefreshRequest {
+            logical_id,
+            current_slot: binding.physical_slot.clone(),
+            metadata: metadata.clone(),
+            label: target.server.name.clone(),
+        }))
+    }
+
+    fn spawn_oauth_refresh(
+        &mut self,
+        operation_id: OperationId,
+        server_id: ServerId,
+        config_revision: Revision,
+        request: OAuthRefreshRequest,
+        resume: PendingAfterRefresh,
+    ) {
+        if self.metrics.active_oauth.load(Ordering::Acquire) >= self.limits.oauth_flows {
+            self.metrics.backpressure.fetch_add(1, Ordering::AcqRel);
+            self.publish_operation_error(
+                operation_id,
+                match resume {
+                    PendingAfterRefresh::Discover => OperationKind::Discover,
+                    PendingAfterRefresh::Invoke { .. } => OperationKind::Invoke,
+                },
+                ErrorCode::Backpressure,
+                "OAuth refresh operation limit reached",
+            );
+            return;
+        }
+        let stage = match &resume {
+            PendingAfterRefresh::Discover => JobStage::OAuthRefreshDiscover,
+            PendingAfterRefresh::Invoke { .. } => JobStage::OAuthRefreshInvoke,
+        };
+        let generation = self.bump_generation(&server_id);
+        let dispatch_epoch = self.current_dispatch_epoch;
+        let cancellation = CancellationToken::default();
+        let secrets = Arc::clone(&self.secrets);
+        let sender = self.result_sender.clone();
+        let unparker = std::thread::current();
+        let operation_for_thread = operation_id.clone();
+        let server_for_thread = server_id.clone();
+        let cancellation_for_thread = cancellation.clone();
+        let thread = std::thread::Builder::new()
+            .name("connector-oauth-refresh".to_owned())
+            .spawn(move || {
+                let payload = JobPayload::OAuthRefresh(run_backend_job(|| {
+                    secrets.exchange_oauth_refresh(request, cancellation_for_thread)
+                }));
+                let _ = sender.send(JobCompletion {
+                    operation_id: operation_for_thread,
+                    server_id: server_for_thread,
+                    generation,
+                    config_revision,
+                    dispatch_epoch,
+                    stage,
+                    payload,
+                });
+                unparker.unpark();
+            });
+        self.pending_refresh.insert(operation_id.clone(), resume);
+        if !self.insert_job(
+            operation_id.clone(),
+            server_id,
+            generation,
+            config_revision,
+            stage,
+            cancellation,
+            thread,
+        ) {
+            self.pending_refresh.remove(&operation_id);
+        }
     }
 
     fn start_oauth(&mut self, server_id: ServerId, choose_workspace: bool) {
@@ -1875,12 +2411,34 @@ impl Worker {
             self.reject_backpressure(OperationKind::OAuth);
             return;
         }
-        let server = match self.repository.load_server(&server_id) {
-            Ok(server) => server,
+        let observed_target = match self.repository.load_mcp_target(&server_id) {
+            Ok(observed) if observed.revision == self.snapshot.config_revision => observed,
+            Ok(_) => {
+                self.reload_overview();
+                self.publish_service_error(
+                    OperationKind::OAuth,
+                    ServiceError::new(
+                        ErrorCode::StaleResult,
+                        "connector target changed before OAuth discovery",
+                    ),
+                );
+                return;
+            }
             Err(error) => {
                 self.publish_service_error(OperationKind::OAuth, error);
                 return;
             }
+        };
+        let server = observed_target.value.server;
+        let stored_client = match observed_target.value.http_auth.as_ref() {
+            Some(binding) => match self.secrets.load_stored_oauth_client(binding) {
+                Ok(client) => client,
+                Err(error) => {
+                    self.publish_service_error(OperationKind::OAuth, error);
+                    return;
+                }
+            },
+            None => None,
         };
         if let Err(error) = validate_loaded_server_id(&server_id, &server) {
             self.publish_service_error(OperationKind::OAuth, error);
@@ -1905,7 +2463,13 @@ impl Worker {
         else {
             return;
         };
-        self.spawn_oauth_discovery(operation_id, server_id, server, choose_workspace);
+        self.spawn_oauth_discovery(
+            operation_id,
+            server_id,
+            server,
+            choose_workspace,
+            stored_client,
+        );
     }
 
     fn submit_oauth(
@@ -1921,7 +2485,6 @@ impl Worker {
         let Some(pending) =
             self.take_exact_pending_oauth(&operation_id, config_revision, Some(&client.server_id))
         else {
-            self.publish_stale_oauth(operation_id);
             return;
         };
         self.spawn_oauth_authorize(pending, Some(client), None);
@@ -1944,7 +2507,6 @@ impl Worker {
         }
         let Some(pending) = self.take_exact_pending_oauth(&operation_id, config_revision, None)
         else {
-            self.publish_stale_oauth(operation_id);
             return;
         };
         self.spawn_oauth_authorize(pending, None, Some(workspace));
@@ -1956,6 +2518,7 @@ impl Worker {
         server_id: ServerId,
         server: ServerDraft,
         choose_workspace: bool,
+        stored_client: Option<StoredOAuthClient>,
     ) {
         let generation = self.bump_generation(&server_id);
         let config_revision = self.snapshot.config_revision;
@@ -1975,6 +2538,7 @@ impl Worker {
                         &operation_for_thread,
                         server,
                         choose_workspace,
+                        stored_client,
                         cancellation_for_thread,
                     )
                 }));
@@ -2101,12 +2665,11 @@ impl Worker {
                 && matches!(state.phase, OAuthUiPhase::AwaitingConsent { .. })
         });
         if !exact_phase {
-            self.publish_stale_oauth(operation_id);
+            self.record_stale_oauth_intent();
             return;
         }
         let Some(pending) = self.take_exact_pending_oauth(&operation_id, config_revision, None)
         else {
-            self.publish_stale_oauth(operation_id);
             return;
         };
         if !accepted {
@@ -2127,20 +2690,41 @@ impl Worker {
         config_revision: Revision,
         server_id: Option<&ServerId>,
     ) -> Option<PendingOAuth> {
-        let pending = self.pending_oauth.take()?;
-        let exact = &pending.operation_id == operation_id
+        let Some(pending) = self.pending_oauth.as_ref() else {
+            self.record_stale_oauth_intent();
+            return None;
+        };
+        let supplied_exact = &pending.operation_id == operation_id
             && pending.config_revision == config_revision
-            && self.snapshot.config_revision == config_revision
+            && server_id.is_none_or(|server_id| server_id == &pending.server_id);
+        if !supplied_exact {
+            self.record_stale_oauth_intent();
+            return None;
+        }
+        let current_valid = self.snapshot.config_revision == config_revision
             && pending.dispatch_epoch == self.current_dispatch_epoch
             && self.dispatch_epoch.load(Ordering::Acquire) == pending.dispatch_epoch
-            && server_id.is_none_or(|server_id| server_id == &pending.server_id)
             && self
                 .generations
                 .get(&pending.server_id)
                 .copied()
                 .unwrap_or_default()
                 == pending.generation;
-        exact.then_some(pending)
+        if !current_valid {
+            let pending = self
+                .pending_oauth
+                .take()
+                .expect("validated pending OAuth state");
+            self.snapshot.oauth = None;
+            self.metrics.stale_results.fetch_add(1, Ordering::AcqRel);
+            self.finish_oauth_operation(
+                &pending.operation_id,
+                OperationPhase::Cancelled,
+                Some(ErrorCode::StaleResult),
+            );
+            return None;
+        }
+        self.pending_oauth.take()
     }
 
     fn accept_oauth_event(&mut self, event: OAuthWorkerEvent) {
@@ -2230,7 +2814,13 @@ impl Worker {
     }
 
     fn publish_stale_oauth(&mut self, operation_id: OperationId) {
-        self.pending_oauth = None;
+        if self
+            .pending_oauth
+            .as_ref()
+            .is_some_and(|pending| pending.operation_id == operation_id)
+        {
+            self.pending_oauth = None;
+        }
         if self
             .snapshot
             .oauth
@@ -2247,12 +2837,17 @@ impl Worker {
         );
     }
 
+    fn record_stale_oauth_intent(&self) {
+        self.metrics.stale_results.fetch_add(1, Ordering::AcqRel);
+    }
+
     fn finish_oauth_operation(
         &mut self,
         operation_id: &OperationId,
         phase: OperationPhase,
         error_code: Option<ErrorCode>,
     ) {
+        self.host_actions.remove_dynamic_for_operation(operation_id);
         let before = self.operations.len();
         self.operations
             .retain(|operation| &operation.id != operation_id);
@@ -2270,11 +2865,11 @@ impl Worker {
 
     fn resolve_oauth_recovery(&mut self, operation_id: OperationId, action: OAuthRecoveryAction) {
         let Some(state) = self.snapshot.oauth.as_ref() else {
-            self.publish_stale_oauth(operation_id);
+            self.record_stale_oauth_intent();
             return;
         };
         if state.operation_id != operation_id {
-            self.publish_stale_oauth(operation_id);
+            self.record_stale_oauth_intent();
             return;
         }
         let server_id = state.server_id.clone();
@@ -2339,13 +2934,29 @@ impl Worker {
             .iter_mut()
             .find(|operation| operation.id == operation_id);
         let reserve_capacity = existing_operation.is_none();
+        let transfers_mcp_to_oauth = existing_operation.as_ref().is_some_and(|operation| {
+            matches!(
+                operation.kind,
+                OperationKind::Discover | OperationKind::Invoke
+            ) && matches!(
+                stage,
+                JobStage::OAuthRefreshDiscover | JobStage::OAuthRefreshInvoke
+            )
+        });
+        if transfers_mcp_to_oauth {
+            self.metrics.active_mcp.fetch_sub(1, Ordering::AcqRel);
+            self.metrics.active_oauth.fetch_add(1, Ordering::AcqRel);
+        }
         match stage {
             JobStage::Discover | JobStage::InvokeSchema => {
                 if reserve_capacity {
                     self.metrics.active_mcp.fetch_add(1, Ordering::AcqRel);
                 }
             }
-            JobStage::OAuthDiscover | JobStage::OAuthAuthorize => {
+            JobStage::OAuthDiscover
+            | JobStage::OAuthAuthorize
+            | JobStage::OAuthRefreshDiscover
+            | JobStage::OAuthRefreshInvoke => {
                 if reserve_capacity {
                     self.metrics.active_oauth.fetch_add(1, Ordering::AcqRel);
                 }
@@ -2413,7 +3024,7 @@ impl Worker {
                 if stale {
                     self.publish_stale(JobStage::Discover);
                 } else {
-                    self.finish_discover(completion.server_id, result);
+                    self.finish_discover(completion.server_id, completion.config_revision, result);
                 }
             }
             (JobStage::InvokeSchema, JobPayload::InvokeSchema(result)) => {
@@ -2468,6 +3079,17 @@ impl Worker {
                     );
                 }
             }
+            (
+                stage @ (JobStage::OAuthRefreshDiscover | JobStage::OAuthRefreshInvoke),
+                JobPayload::OAuthRefresh(result),
+            ) => self.finish_oauth_refresh(
+                completion.operation_id,
+                completion.server_id,
+                completion.config_revision,
+                stage,
+                result,
+                stale,
+            ),
             (stage, _) => {
                 self.finish_operation_slot(&completion.operation_id, stage);
                 self.publish_operation_error(
@@ -2477,6 +3099,77 @@ impl Worker {
                     "connector job completion type mismatch",
                 );
             }
+        }
+    }
+
+    fn finish_oauth_refresh(
+        &mut self,
+        operation_id: OperationId,
+        server_id: ServerId,
+        config_revision: Revision,
+        stage: JobStage,
+        result: Result<OAuthRefreshOutcome, ServiceError>,
+        stale: bool,
+    ) {
+        let resume = self.pending_refresh.remove(&operation_id);
+        self.finish_operation_slot(&operation_id, stage);
+        let Some(resume) = resume else {
+            self.publish_operation_error(
+                operation_id,
+                stage.kind(),
+                ErrorCode::Internal,
+                "OAuth refresh continuation is missing",
+            );
+            return;
+        };
+        if stale {
+            self.publish_stale(stage);
+            return;
+        }
+        let update = match result {
+            Ok(OAuthRefreshOutcome::Refreshed(update)) => *update,
+            Ok(OAuthRefreshOutcome::ReauthorizationRequired) => {
+                self.publish_operation_error(
+                    operation_id,
+                    stage.kind(),
+                    ErrorCode::AuthenticationRequired,
+                    "OAuth reauthorization is required",
+                );
+                return;
+            }
+            Err(error) => {
+                self.publish_operation_error(operation_id, stage.kind(), error.code, error.message);
+                return;
+            }
+        };
+        let committed_revision = match self.publish_oauth_credential(
+            &server_id,
+            config_revision,
+            crate::OAuthCompletion {
+                credential: update,
+                workspace_label: None,
+                can_choose_workspace: false,
+            },
+        ) {
+            Ok(revision) => revision,
+            Err(error) => {
+                self.publish_operation_error(operation_id, stage.kind(), error.code, error.message);
+                return;
+            }
+        };
+        self.snapshot.config_revision = committed_revision;
+        self.snapshot.tool_page = None;
+        self.session_trust
+            .lock()
+            .expect("connector trust registry lock")
+            .retain_revision(committed_revision);
+        self.reload_overview();
+        match resume {
+            PendingAfterRefresh::Discover => self.start_discover_with_id(operation_id, server_id),
+            PendingAfterRefresh::Invoke {
+                tool_id,
+                arguments_json,
+            } => self.start_invoke_with_id(operation_id, server_id, tool_id, arguments_json),
         }
     }
 
@@ -2510,7 +3203,10 @@ impl Worker {
             JobStage::Discover | JobStage::InvokeSchema | JobStage::InvokeCall => {
                 self.metrics.active_mcp.fetch_sub(1, Ordering::AcqRel);
             }
-            JobStage::OAuthDiscover | JobStage::OAuthAuthorize => {
+            JobStage::OAuthDiscover
+            | JobStage::OAuthAuthorize
+            | JobStage::OAuthRefreshDiscover
+            | JobStage::OAuthRefreshInvoke => {
                 self.metrics.active_oauth.fetch_sub(1, Ordering::AcqRel);
             }
         }
@@ -2658,6 +3354,7 @@ impl Worker {
     fn finish_discover(
         &mut self,
         server_id: ServerId,
+        expected_revision: Revision,
         result: Result<DiscoverOutput, ServiceError>,
     ) {
         let output = match result {
@@ -2671,9 +3368,24 @@ impl Worker {
             self.publish_service_error(OperationKind::Discover, error);
             return;
         }
-        if let Err(error) = self.repository.replace_tools(&server_id, &output.tools) {
-            self.publish_service_error(OperationKind::Discover, error);
-            return;
+        match self
+            .repository
+            .replace_tools(expected_revision, &server_id, &output.tools)
+        {
+            Ok(RepositoryCas::Committed { .. }) => {}
+            Ok(RepositoryCas::Stale { .. }) => {
+                self.reload_overview();
+                self.publish_error(
+                    OperationKind::Discover,
+                    ErrorCode::StaleResult,
+                    "connector target changed before discovered tools were saved",
+                );
+                return;
+            }
+            Err(error) => {
+                self.publish_service_error(OperationKind::Discover, error);
+                return;
+            }
         }
         self.transition(OperationKind::Discover, OperationPhase::Succeeded, None);
         self.snapshot.tool_page = None;
@@ -2729,7 +3441,18 @@ impl Worker {
             .repository
             .load_authorization_state(&pending.server_id, &pending.tool_name)
         {
-            Ok(state) => state,
+            Ok(Observed { revision, value }) if revision == pending.config_revision => value,
+            Ok(_) => {
+                self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+                self.reload_overview();
+                self.publish_operation_error(
+                    operation_id,
+                    OperationKind::Invoke,
+                    ErrorCode::StaleResult,
+                    "authorization state changed after live schema discovery",
+                );
+                return;
+            }
             Err(error) => {
                 self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
                 self.publish_operation_error(
@@ -2820,7 +3543,7 @@ impl Worker {
     fn commit_preflight(
         &mut self,
         operation_id: OperationId,
-        pending: PendingInvocation,
+        mut pending: PendingInvocation,
         plan: audit::AuthorizationPlan,
     ) {
         if self.invocation_is_stale(&operation_id, &pending) {
@@ -2830,11 +3553,28 @@ impl Worker {
         }
         self.update_operation_phase(&operation_id, OperationPhase::AuditPreflight, None);
         self.transition(OperationKind::Invoke, OperationPhase::AuditPreflight, None);
-        let preflight = match self
-            .repository
-            .commit_authorization_preflight(plan, &pending.arguments_json)
-        {
-            Ok(preflight) => preflight,
+        let self_authored_permission_change = matches!(
+            plan.decision(),
+            audit::ToolDecision::AllowAlways | audit::ToolDecision::DenyAlways
+        );
+        let expected_revision = pending.config_revision;
+        let (committed_revision, preflight) = match self.repository.commit_authorization_preflight(
+            expected_revision,
+            plan,
+            &pending.arguments_json,
+        ) {
+            Ok(RepositoryCas::Committed { revision, value }) => (revision, value),
+            Ok(RepositoryCas::Stale { .. }) => {
+                self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+                self.reload_overview();
+                self.publish_operation_error(
+                    operation_id,
+                    OperationKind::Invoke,
+                    ErrorCode::StaleResult,
+                    "connector configuration changed before authorization preflight",
+                );
+                return;
+            }
             Err(error) => {
                 self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
                 self.publish_operation_error(
@@ -2846,6 +3586,36 @@ impl Worker {
                 return;
             }
         };
+        if committed_revision != expected_revision {
+            if !self_authored_permission_change {
+                if matches!(preflight, audit::AuthorizationPreflight::Prepared(_)) {
+                    let _ = self.persist_authorization_outcome(
+                        &operation_id,
+                        audit::AuthorizationOutcome::Failed {
+                            error_code: "unexpected_preflight_revision",
+                        },
+                    );
+                }
+                self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
+                self.publish_operation_error(
+                    operation_id,
+                    OperationKind::Invoke,
+                    ErrorCode::StaleResult,
+                    "authorization preflight changed an unexpected revision",
+                );
+                return;
+            }
+            self.session_trust
+                .lock()
+                .expect("connector trust registry lock")
+                .rebind_self_authored_revision(expected_revision, committed_revision);
+            pending.config_revision = committed_revision;
+            self.snapshot.config_revision = committed_revision;
+            self.snapshot.tool_page = None;
+            if let Some(job) = self.jobs.get_mut(&operation_id) {
+                job.config_revision = committed_revision;
+            }
+        }
         match preflight {
             audit::AuthorizationPreflight::Denied(receipt) => {
                 debug_assert_eq!(receipt.operation_id(), operation_id.as_str());
@@ -3309,24 +4079,34 @@ impl Worker {
             OAuthAuthorizeOutput::Completed(completion) => {
                 let workspace_label = completion.workspace_label.clone();
                 let can_choose_workspace = completion.can_choose_workspace;
-                if let Err(error) = self.publish_oauth_credential(completion) {
-                    self.snapshot.oauth = Some(OAuthUiState {
-                        operation_id: operation_id.clone(),
-                        server_id,
-                        server_name: "OAuth".to_owned(),
-                        config_revision,
-                        phase: OAuthUiPhase::Failed {
-                            error_code: error.code,
-                            recovery: Arc::from([OAuthRecoveryAction::Retry]),
-                        },
-                    });
-                    self.finish_oauth_operation(
-                        &operation_id,
-                        OperationPhase::Failed,
-                        Some(error.code),
-                    );
-                    return;
-                }
+                let committed_revision =
+                    match self.publish_oauth_credential(&server_id, config_revision, *completion) {
+                        Ok(revision) => revision,
+                        Err(error) => {
+                            self.snapshot.oauth = Some(OAuthUiState {
+                                operation_id: operation_id.clone(),
+                                server_id,
+                                server_name: "OAuth".to_owned(),
+                                config_revision,
+                                phase: OAuthUiPhase::Failed {
+                                    error_code: error.code,
+                                    recovery: Arc::from([OAuthRecoveryAction::Retry]),
+                                },
+                            });
+                            self.finish_oauth_operation(
+                                &operation_id,
+                                OperationPhase::Failed,
+                                Some(error.code),
+                            );
+                            return;
+                        }
+                    };
+                self.snapshot.config_revision = committed_revision;
+                self.snapshot.tool_page = None;
+                self.session_trust
+                    .lock()
+                    .expect("connector trust registry lock")
+                    .retain_revision(committed_revision);
                 self.snapshot.oauth = None;
                 self.slack_recovery = None;
                 if self.snapshot.slack.server_id.as_ref() == Some(&server_id) {
@@ -3340,8 +4120,7 @@ impl Worker {
             OAuthAuthorizeOutput::ClientInputRequired(request) => {
                 if request.workspace_hint.as_ref().is_some_and(|hint| {
                     hint.len() > self.limits.import_report_bytes || hint.contains('\0')
-                }) || request.continuation.expose_bytes().len()
-                    > self.limits.raw_mcp_response_bytes
+                }) || request.continuation.retained_bytes() > self.limits.raw_mcp_response_bytes
                 {
                     self.snapshot.oauth = None;
                     self.finish_oauth_operation(
@@ -3387,48 +4166,127 @@ impl Worker {
 
     fn publish_oauth_credential(
         &mut self,
+        server_id: &ServerId,
+        expected_revision: Revision,
         completion: crate::ports::OAuthCompletion,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<Revision, ServiceError> {
         let update = completion.credential;
-        if update.oauth_metadata_json.len() > self.limits.raw_mcp_response_bytes
-            || update.masked_hint.as_ref().is_some_and(|hint| {
-                hint.len() > self.limits.import_report_bytes || hint.contains('\0')
-            })
+        if update
+            .masked_hint
+            .as_ref()
+            .is_some_and(|hint| hint.len() > self.limits.import_report_bytes || hint.contains('\0'))
         {
             return Err(ServiceError::new(
                 ErrorCode::LimitExceeded,
                 "OAuth publish metadata limit exceeded",
             ));
         }
+        let observed_server = self.repository.load_server(server_id)?;
+        if observed_server.revision != expected_revision {
+            return Err(ServiceError::new(
+                ErrorCode::StaleResult,
+                "OAuth target changed before credential staging",
+            ));
+        }
+        let exact_url = match &observed_server.value.transport {
+            TransportDraft::Http { url } => url,
+            TransportDraft::Stdio { .. } => {
+                return Err(ServiceError::new(
+                    ErrorCode::InvalidInput,
+                    "OAuth credentials require an HTTP connector",
+                ));
+            }
+        };
+        update
+            .metadata
+            .validate_for_binding(
+                server_id.as_str(),
+                exact_url,
+                auth::StoredOAuthMetadataLimits::PRODUCTION,
+            )
+            .map_err(|_| {
+                ServiceError::new(
+                    ErrorCode::InvalidInput,
+                    "OAuth metadata does not match the connector target",
+                )
+            })?;
         let previous = self.repository.load_oauth_secret_slot(&update.logical_id)?;
-        let staged =
-            self.secrets
-                .stage_oauth_bundle(update.logical_id, previous.clone(), update.bundle)?;
-        let published = self.repository.publish_oauth_secret_slot(
-            &staged,
-            previous.as_ref(),
-            &update.oauth_metadata_json,
-            update.masked_hint.as_deref(),
-        );
-        match published {
-            Ok(true) => {
-                if let Some(previous) = previous {
-                    self.secrets.delete_oauth_bundle(&previous)?;
+        if previous.revision != expected_revision {
+            return Err(ServiceError::new(
+                ErrorCode::StaleResult,
+                "OAuth credential pointer changed before staging",
+            ));
+        }
+        let plan =
+            secret::SecretBundleStagePlan::allocate(update.logical_id, previous.value.clone())
+                .map_err(|_| {
+                    ServiceError::new(
+                        ErrorCode::SecretUnavailable,
+                        "OAuth physical slot allocation failed",
+                    )
+                })?;
+        let staged = stage_registered_oauth_bundle(
+            self.repository.as_mut(),
+            self.secrets.as_ref(),
+            &plan,
+            update.bundle,
+        )?;
+        let mode = previous
+            .value
+            .as_ref()
+            .map_or(OAuthPublishMode::FirstInsert, |slot| {
+                OAuthPublishMode::Rotation {
+                    expected_previous: slot.clone(),
                 }
-                Ok(())
+            });
+        let published = self.repository.publish_oauth_secret_slot(
+            expected_revision,
+            OAuthPublishDescriptor {
+                staged: &staged,
+                mode,
+                metadata: &update.metadata,
+                label: &update.label,
+                masked_hint: update.masked_hint.as_deref(),
+            },
+        );
+        match classify_oauth_publish(published) {
+            OAuthPublishDisposition::Committed {
+                revision,
+                previous_slot,
+            } => {
+                if previous_slot != previous.value {
+                    return Err(ServiceError::new(
+                        ErrorCode::StorageUnavailable,
+                        "OAuth publish returned a mismatched previous slot",
+                    ));
+                }
+                if let Some(previous) = previous_slot
+                    && self.secrets.delete_oauth_bundle(&previous).is_ok()
+                {
+                    let _ = self
+                        .repository
+                        .acknowledge_oauth_secret_deleted(&staged.logical_id, &previous);
+                }
+                Ok(revision)
             }
-            Ok(false) => {
-                self.secrets.delete_oauth_bundle(&staged.new_slot)?;
-                Err(ServiceError::new(
-                    ErrorCode::StaleResult,
-                    "OAuth credential pointer changed before publish",
-                ))
-            }
-            Err(error) => {
-                let _ = self.secrets.delete_oauth_bundle(&staged.new_slot);
+            OAuthPublishDisposition::DeleteStaged(error) => {
+                self.delete_staged_oauth_bundle(&staged)?;
                 Err(error)
             }
+            // A repository error may mean commit outcome is unknown. Keep the exact ledger row
+            // and keyring bundle for bounded startup reconciliation instead of risking deletion
+            // of a newly-published live credential.
+            OAuthPublishDisposition::RetainStaged(error) => Err(error),
         }
+    }
+
+    fn delete_staged_oauth_bundle(
+        &mut self,
+        staged: &secret::StagedSecretBundle,
+    ) -> Result<(), ServiceError> {
+        self.secrets.delete_oauth_bundle(&staged.new_slot)?;
+        self.repository
+            .acknowledge_oauth_secret_deleted(&staged.logical_id, &staged.new_slot)
     }
 
     fn apply_oauth_failure(
@@ -3493,6 +4351,8 @@ impl Worker {
     }
 
     fn cancel(&mut self, operation_id: OperationId) {
+        self.host_actions
+            .remove_dynamic_for_operation(&operation_id);
         if let Some((server_id, stage, cancellation)) = self
             .jobs
             .get(&operation_id)
@@ -3510,6 +4370,7 @@ impl Worker {
                 JobStage::OAuthDiscover | JobStage::OAuthAuthorize => {
                     self.oauth.cancel(&operation_id);
                 }
+                JobStage::OAuthRefreshDiscover | JobStage::OAuthRefreshInvoke => {}
             }
             self.update_operation_phase(
                 &operation_id,
@@ -3579,6 +4440,7 @@ impl Worker {
             return;
         }
         self.shutting_down = true;
+        self.host_actions.remove_all_dynamic();
         let unjoined_pending: Vec<OperationId> = self
             .pending_invocations
             .keys()
@@ -3608,6 +4470,7 @@ impl Worker {
                 JobStage::OAuthDiscover | JobStage::OAuthAuthorize => {
                     self.oauth.cancel(&operation_id);
                 }
+                JobStage::OAuthRefreshDiscover | JobStage::OAuthRefreshInvoke => {}
             }
         }
         if let Some(pending) = self.pending_remote.take() {
@@ -3981,7 +4844,11 @@ fn validate_oauth_client(
     client: &StoredOAuthClient,
     limits: ResourceLimits,
 ) -> Result<(), ServiceError> {
-    if client.client_secret.len() > limits.tool_input_bytes {
+    if client
+        .client_secret
+        .as_ref()
+        .is_some_and(|secret| secret.len() > limits.tool_input_bytes)
+    {
         return Err(ServiceError::new(
             ErrorCode::LimitExceeded,
             "OAuth secret input limit exceeded",
@@ -4000,11 +4867,22 @@ fn validate_oauth_client(
     Ok(())
 }
 
+fn oauth_logical_id(server_id: &ServerId) -> Result<secret::LogicalCredentialId, ServiceError> {
+    secret::LogicalCredentialId::new(format!("connector-oauth-{}", server_id.as_str())).map_err(
+        |_| {
+            ServiceError::new(
+                ErrorCode::LimitExceeded,
+                "connector identifier is too long for OAuth credential storage",
+            )
+        },
+    )
+}
+
 fn validate_oauth_discovery(
     discovery: &OAuthDiscovery,
     limits: ResourceLimits,
 ) -> Result<(), ServiceError> {
-    if discovery.continuation.expose_bytes().len() > limits.raw_mcp_response_bytes
+    if discovery.continuation.retained_bytes() > limits.raw_mcp_response_bytes
         || discovery.scopes.len() > limits.import_servers
     {
         return Err(ServiceError::new(
@@ -4149,6 +5027,57 @@ fn run_backend_job<T>(run: impl FnOnce() -> Result<T, ServiceError>) -> Result<T
     })
 }
 
+fn stage_registered_oauth_bundle(
+    repository: &mut dyn ConnectorRepository,
+    secrets: &dyn ConnectorSecrets,
+    plan: &secret::SecretBundleStagePlan,
+    bundle: secret::SecretBundle,
+) -> Result<secret::StagedSecretBundle, ServiceError> {
+    repository.register_oauth_secret_staging(plan)?;
+    match secrets.stage_oauth_bundle(plan, bundle) {
+        Ok(staged) => Ok(staged),
+        Err(error) => {
+            // The exact ledger row was registered before keyring I/O. Attempt immediate cleanup;
+            // if keyring deletion is uncertain, retain the row for bounded startup reconciliation.
+            if secrets.delete_oauth_bundle(plan.new_slot()).is_ok() {
+                let _ =
+                    repository.acknowledge_oauth_secret_deleted(plan.logical_id(), plan.new_slot());
+            }
+            Err(error)
+        }
+    }
+}
+
+enum OAuthPublishDisposition {
+    Committed {
+        revision: Revision,
+        previous_slot: Option<secret::PhysicalSecretSlot>,
+    },
+    DeleteStaged(ServiceError),
+    RetainStaged(ServiceError),
+}
+
+fn classify_oauth_publish(
+    result: Result<OAuthPublishResult, ServiceError>,
+) -> OAuthPublishDisposition {
+    match result {
+        Ok(OAuthPublishResult::Committed {
+            revision,
+            previous_slot,
+        }) => OAuthPublishDisposition::Committed {
+            revision,
+            previous_slot,
+        },
+        Ok(OAuthPublishResult::RevisionStale { .. } | OAuthPublishResult::PointerStale { .. }) => {
+            OAuthPublishDisposition::DeleteStaged(ServiceError::new(
+                ErrorCode::StaleResult,
+                "OAuth credential pointer changed before publish",
+            ))
+        }
+        Err(error) => OAuthPublishDisposition::RetainStaged(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4209,8 +5138,10 @@ mod tests {
         loaded_server_override: Mutex<Option<ServerDraft>>,
         outcome_failure: AtomicBool,
         preflight_input_override: Mutex<Option<Vec<u8>>>,
+        mcp_target_error_once: AtomicBool,
         authorization_ledger: audit::InMemoryAuthorizationLedger,
         oauth_slot: Mutex<Option<secret::PhysicalSecretSlot>>,
+        http_auth: Mutex<Option<crate::HttpAuthBinding>>,
         order: Arc<Mutex<Vec<&'static str>>>,
     }
 
@@ -4234,11 +5165,13 @@ mod tests {
                 loaded_server_override: Mutex::new(None),
                 outcome_failure: AtomicBool::new(false),
                 preflight_input_override: Mutex::new(None),
+                mcp_target_error_once: AtomicBool::new(false),
                 authorization_ledger: audit::InMemoryAuthorizationLedger::new(
                     "connector-service-test",
                 )
                 .expect("authorization ledger"),
                 oauth_slot: Mutex::new(None),
+                http_auth: Mutex::new(None),
                 order: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -4271,6 +5204,20 @@ mod tests {
         fn mutate(&self) -> Revision {
             Revision(self.state.config_revision.fetch_add(1, Ordering::AcqRel) + 1)
         }
+
+        fn mutate_if(&self, expected: Revision) -> RepositoryCas<()> {
+            let current = self.revision();
+            if current != expected {
+                RepositoryCas::Stale {
+                    current_revision: current,
+                }
+            } else {
+                RepositoryCas::Committed {
+                    revision: self.mutate(),
+                    value: (),
+                }
+            }
+        }
     }
 
     impl ConnectorRepository for FakeRepository {
@@ -4291,7 +5238,10 @@ mod tests {
             })
         }
 
-        fn load_server(&mut self, server_id: &ServerId) -> Result<ServerDraft, ServiceError> {
+        fn load_server(
+            &mut self,
+            server_id: &ServerId,
+        ) -> Result<Observed<ServerDraft>, ServiceError> {
             self.state.server_loads.fetch_add(1, Ordering::AcqRel);
             let loaded = self
                 .state
@@ -4300,7 +5250,56 @@ mod tests {
                 .expect("server override lock")
                 .clone()
                 .unwrap_or_else(|| server_draft(server_id.as_str()));
-            Ok(loaded)
+            Ok(Observed {
+                revision: self.revision(),
+                value: loaded,
+            })
+        }
+
+        fn load_mcp_target(
+            &mut self,
+            server_id: &ServerId,
+        ) -> Result<Observed<crate::RepositoryMcpTarget>, ServiceError> {
+            if self
+                .state
+                .mcp_target_error_once
+                .swap(false, Ordering::AcqRel)
+            {
+                return Err(ServiceError::new(
+                    ErrorCode::StorageUnavailable,
+                    "fixture MCP target read failed",
+                ));
+            }
+            let observed = self.load_server(server_id)?;
+            let credential_revisions = match &observed.value.transport {
+                TransportDraft::Stdio { secret_env, .. } => secret_env
+                    .iter()
+                    .map(|(_, credential_id)| {
+                        let logical = secret::LogicalCredentialId::new(credential_id.as_str())
+                            .map_err(|_| {
+                                ServiceError::new(
+                                    ErrorCode::SecretUnavailable,
+                                    "fixture logical credential failed",
+                                )
+                            })?;
+                        Ok(CredentialResolutionRequest {
+                            credential_id: credential_id.clone(),
+                            expected_physical_slot: Some(secret::PhysicalSecretSlot::allocate(
+                                &logical,
+                            )),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ServiceError>>()?,
+                TransportDraft::Http { .. } => Vec::new(),
+            };
+            Ok(Observed {
+                revision: observed.revision,
+                value: crate::RepositoryMcpTarget {
+                    server: observed.value,
+                    credential_revisions,
+                    http_auth: self.state.http_auth.lock().expect("HTTP auth lock").clone(),
+                },
+            })
         }
 
         fn load_tool_page(
@@ -4308,15 +5307,18 @@ mod tests {
             server_id: &ServerId,
             offset: usize,
             _limit: usize,
-        ) -> Result<crate::RepositoryToolPage, ServiceError> {
-            Ok(crate::RepositoryToolPage {
-                total: 1,
-                items: vec![ToolListItem {
-                    id: ToolId::new(format!("{}-tool", server_id.as_str())),
-                    name: format!("tool-{offset}"),
-                    description: None,
-                    permission: PermissionRule::Ask,
-                }],
+        ) -> Result<Observed<crate::RepositoryToolPage>, ServiceError> {
+            Ok(Observed {
+                revision: self.revision(),
+                value: crate::RepositoryToolPage {
+                    total: 1,
+                    items: vec![ToolListItem {
+                        id: ToolId::new(format!("{}-tool", server_id.as_str())),
+                        name: format!("tool-{offset}"),
+                        description: None,
+                        permission: PermissionRule::Ask,
+                    }],
+                },
             })
         }
 
@@ -4324,39 +5326,61 @@ mod tests {
             &mut self,
             _server_id: &ServerId,
             tool_id: &ToolId,
-        ) -> Result<String, ServiceError> {
-            Ok(tool_id.as_str().to_owned())
+        ) -> Result<Observed<String>, ServiceError> {
+            Ok(Observed {
+                revision: self.revision(),
+                value: tool_id.as_str().to_owned(),
+            })
         }
 
-        fn save_server(&mut self, _draft: ServerDraft) -> Result<Revision, ServiceError> {
-            Ok(self.mutate())
+        fn save_server(
+            &mut self,
+            expected_revision: Revision,
+            _draft: ServerDraft,
+        ) -> Result<RepositoryCas<()>, ServiceError> {
+            Ok(self.mutate_if(expected_revision))
         }
 
-        fn delete_server(&mut self, _server_id: &ServerId) -> Result<Revision, ServiceError> {
-            Ok(self.mutate())
+        fn delete_server(
+            &mut self,
+            expected_revision: Revision,
+            _server_id: &ServerId,
+        ) -> Result<RepositoryCas<()>, ServiceError> {
+            Ok(self.mutate_if(expected_revision))
         }
 
         fn replace_tools(
             &mut self,
+            expected_revision: Revision,
             _server_id: &ServerId,
             _tools: &[crate::DiscoveredTool],
-        ) -> Result<Revision, ServiceError> {
-            self.state.replacements.fetch_add(1, Ordering::AcqRel);
-            Ok(self.mutate())
+        ) -> Result<RepositoryCas<()>, ServiceError> {
+            let result = self.mutate_if(expected_revision);
+            if matches!(result, RepositoryCas::Committed { .. }) {
+                self.state.replacements.fetch_add(1, Ordering::AcqRel);
+            }
+            Ok(result)
         }
 
         fn set_permission(
             &mut self,
+            expected_revision: Revision,
             _server_id: &ServerId,
             _tool_id: &ToolId,
             _rule: PermissionRule,
-        ) -> Result<Revision, ServiceError> {
-            Ok(self.mutate())
+        ) -> Result<RepositoryCas<()>, ServiceError> {
+            Ok(self.mutate_if(expected_revision))
         }
 
-        fn ensure_slack_server(&mut self) -> Result<Revision, ServiceError> {
-            self.state.slack_ensures.fetch_add(1, Ordering::AcqRel);
-            Ok(self.mutate())
+        fn ensure_slack_server(
+            &mut self,
+            expected_revision: Revision,
+        ) -> Result<RepositoryCas<()>, ServiceError> {
+            let result = self.mutate_if(expected_revision);
+            if matches!(result, RepositoryCas::Committed { .. }) {
+                self.state.slack_ensures.fetch_add(1, Ordering::AcqRel);
+            }
+            Ok(result)
         }
 
         fn parse_import(
@@ -4374,51 +5398,112 @@ mod tests {
             })
         }
 
-        fn import_servers(&mut self, _servers: Vec<ServerDraft>) -> Result<Revision, ServiceError> {
-            self.state.imports.fetch_add(1, Ordering::AcqRel);
-            Ok(self.mutate())
+        fn import_servers(
+            &mut self,
+            expected_revision: Revision,
+            _servers: Vec<ServerDraft>,
+        ) -> Result<RepositoryCas<()>, ServiceError> {
+            let result = self.mutate_if(expected_revision);
+            if matches!(result, RepositoryCas::Committed { .. }) {
+                self.state.imports.fetch_add(1, Ordering::AcqRel);
+            }
+            Ok(result)
         }
 
         fn load_http_auth_binding(
             &mut self,
             _server_id: &ServerId,
             _exact_url: &str,
-        ) -> Result<Option<crate::ports::HttpAuthBinding>, ServiceError> {
-            Ok(None)
+        ) -> Result<Observed<Option<crate::ports::HttpAuthBinding>>, ServiceError> {
+            Ok(Observed {
+                revision: self.revision(),
+                value: None,
+            })
         }
 
         fn load_oauth_secret_slot(
             &mut self,
             _logical_id: &secret::LogicalCredentialId,
-        ) -> Result<Option<secret::PhysicalSecretSlot>, ServiceError> {
-            Ok(self
-                .state
-                .oauth_slot
+        ) -> Result<Observed<Option<secret::PhysicalSecretSlot>>, ServiceError> {
+            Ok(Observed {
+                revision: self.revision(),
+                value: self
+                    .state
+                    .oauth_slot
+                    .lock()
+                    .expect("OAuth slot lock")
+                    .clone(),
+            })
+        }
+
+        fn register_oauth_secret_staging(
+            &mut self,
+            _plan: &secret::SecretBundleStagePlan,
+        ) -> Result<(), ServiceError> {
+            self.state
+                .order
                 .lock()
-                .expect("OAuth slot lock")
-                .clone())
+                .expect("order lock")
+                .push("stage-ledger");
+            Ok(())
+        }
+
+        fn acknowledge_oauth_secret_deleted(
+            &mut self,
+            _logical_id: &secret::LogicalCredentialId,
+            _slot: &secret::PhysicalSecretSlot,
+        ) -> Result<(), ServiceError> {
+            self.state
+                .order
+                .lock()
+                .expect("order lock")
+                .push("slot-ack");
+            Ok(())
         }
 
         fn publish_oauth_secret_slot(
             &mut self,
-            staged: &secret::StagedSecretBundle,
-            expected_previous: Option<&secret::PhysicalSecretSlot>,
-            _oauth_metadata_json: &str,
-            _masked_hint: Option<&str>,
-        ) -> Result<bool, ServiceError> {
-            let mut slot = self.state.oauth_slot.lock().expect("OAuth slot lock");
-            if slot.as_ref() != expected_previous {
-                return Ok(false);
+            expected_revision: Revision,
+            descriptor: OAuthPublishDescriptor<'_>,
+        ) -> Result<OAuthPublishResult, ServiceError> {
+            let current_revision = self.revision();
+            if current_revision != expected_revision {
+                return Ok(OAuthPublishResult::RevisionStale { current_revision });
             }
-            *slot = Some(staged.new_slot.clone());
-            Ok(true)
+            let mut slot = self.state.oauth_slot.lock().expect("OAuth slot lock");
+            let expected_previous = match &descriptor.mode {
+                OAuthPublishMode::FirstInsert => None,
+                OAuthPublishMode::Rotation { expected_previous } => Some(expected_previous),
+            };
+            if slot.as_ref() != expected_previous {
+                return Ok(OAuthPublishResult::PointerStale {
+                    revision: current_revision,
+                });
+            }
+            let previous_slot = slot.clone();
+            *slot = Some(descriptor.staged.new_slot.clone());
+            drop(slot);
+            if let Some(binding) = self
+                .state
+                .http_auth
+                .lock()
+                .expect("HTTP auth lock")
+                .as_mut()
+            {
+                binding.physical_slot = descriptor.staged.new_slot.clone();
+                binding.oauth_metadata = Some(descriptor.metadata.clone());
+            }
+            Ok(OAuthPublishResult::Committed {
+                revision: self.mutate(),
+                previous_slot,
+            })
         }
 
         fn load_authorization_state(
             &mut self,
             _server_id: &ServerId,
             _tool_name: &str,
-        ) -> Result<crate::AuthorizationState, ServiceError> {
+        ) -> Result<Observed<crate::AuthorizationState>, ServiceError> {
             self.state
                 .authorization_loads
                 .fetch_add(1, Ordering::AcqRel);
@@ -4427,21 +5512,30 @@ mod tests {
                 .lock()
                 .expect("order lock")
                 .push("permission");
-            Ok(crate::AuthorizationState {
-                permission: self
-                    .state
-                    .permission
-                    .lock()
-                    .expect("permission lock")
-                    .clone(),
+            Ok(Observed {
+                revision: self.revision(),
+                value: crate::AuthorizationState {
+                    permission: self
+                        .state
+                        .permission
+                        .lock()
+                        .expect("permission lock")
+                        .clone(),
+                },
             })
         }
 
         fn commit_authorization_preflight(
             &mut self,
+            expected_revision: Revision,
             plan: audit::AuthorizationPlan,
             arguments_json: &SensitiveInput,
-        ) -> Result<audit::AuthorizationPreflight, ServiceError> {
+        ) -> Result<RepositoryCas<audit::AuthorizationPreflight>, ServiceError> {
+            if self.revision() != expected_revision {
+                return Ok(RepositoryCas::Stale {
+                    current_revision: self.revision(),
+                });
+            }
             self.state.preflights.fetch_add(1, Ordering::AcqRel);
             self.state
                 .order
@@ -4456,6 +5550,8 @@ mod tests {
                 .take()
             {
                 *self.state.permission.lock().expect("permission lock") = replacement;
+                let current_revision = self.mutate();
+                return Ok(RepositoryCas::Stale { current_revision });
             }
             if self
                 .state
@@ -4469,7 +5565,12 @@ mod tests {
                     "fixture permission changed before preflight",
                 ));
             }
-            self.state
+            let remembered = matches!(
+                plan.decision(),
+                audit::ToolDecision::AllowAlways | audit::ToolDecision::DenyAlways
+            );
+            let value = self
+                .state
                 .authorization_ledger
                 .preflight(
                     plan,
@@ -4485,7 +5586,15 @@ mod tests {
                         ErrorCode::AuditUnavailable,
                         "fixture authorization preflight failed",
                     )
-                })
+                })?;
+            Ok(RepositoryCas::Committed {
+                revision: if remembered {
+                    self.mutate()
+                } else {
+                    expected_revision
+                },
+                value,
+            })
         }
 
         fn complete_authorization(
@@ -4519,31 +5628,34 @@ mod tests {
         }
     }
 
-    struct FakeSecrets;
+    #[derive(Default)]
+    struct FakeSecrets {
+        refreshes: AtomicUsize,
+        refresh_output: Mutex<Option<crate::OAuthCredentialUpdate>>,
+    }
 
     impl ConnectorSecrets for FakeSecrets {
-        fn credential_revisions(
+        fn load_stored_oauth_client(
             &self,
-            credential_ids: Vec<connector_contract::CredentialId>,
-        ) -> Result<Vec<CredentialResolutionRequest>, ServiceError> {
-            credential_ids
-                .into_iter()
-                .map(|credential_id| {
-                    let logical = secret::LogicalCredentialId::new(credential_id.as_str())
-                        .map_err(|_| {
-                            ServiceError::new(
-                                ErrorCode::SecretUnavailable,
-                                "fixture logical credential failed",
-                            )
-                        })?;
-                    Ok(CredentialResolutionRequest {
-                        credential_id,
-                        expected_physical_slot: Some(secret::PhysicalSecretSlot::allocate(
-                            &logical,
-                        )),
-                    })
-                })
-                .collect()
+            _binding: &crate::HttpAuthBinding,
+        ) -> Result<Option<StoredOAuthClient>, ServiceError> {
+            Ok(None)
+        }
+
+        fn exchange_oauth_refresh(
+            &self,
+            _request: OAuthRefreshRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<OAuthRefreshOutcome, ServiceError> {
+            self.refreshes.fetch_add(1, Ordering::AcqRel);
+            Ok(self
+                .refresh_output
+                .lock()
+                .expect("refresh output lock")
+                .take()
+                .map_or(OAuthRefreshOutcome::ReauthorizationRequired, |update| {
+                    OAuthRefreshOutcome::Refreshed(Box::new(update))
+                }))
         }
 
         fn resolve_credentials(
@@ -4584,12 +5696,9 @@ mod tests {
 
         fn stage_oauth_bundle(
             &self,
-            logical_id: secret::LogicalCredentialId,
-            previous_slot: Option<secret::PhysicalSecretSlot>,
+            plan: &secret::SecretBundleStagePlan,
             bundle: secret::SecretBundle,
         ) -> Result<secret::StagedSecretBundle, ServiceError> {
-            let plan = secret::SecretBundleStagePlan::allocate(logical_id, previous_slot)
-                .map_err(|_| ServiceError::new(ErrorCode::Internal, "fixture stage plan failed"))?;
             let entries = secret::BundleEntryPresence {
                 access: true,
                 refresh: bundle.refresh().is_some(),
@@ -4620,6 +5729,65 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FailingStageSecrets {
+        deletes: AtomicUsize,
+    }
+
+    impl ConnectorSecrets for FailingStageSecrets {
+        fn load_stored_oauth_client(
+            &self,
+            _binding: &crate::HttpAuthBinding,
+        ) -> Result<Option<StoredOAuthClient>, ServiceError> {
+            Ok(None)
+        }
+
+        fn exchange_oauth_refresh(
+            &self,
+            _request: OAuthRefreshRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<OAuthRefreshOutcome, ServiceError> {
+            Ok(OAuthRefreshOutcome::ReauthorizationRequired)
+        }
+
+        fn resolve_credentials(
+            &self,
+            _requests: Vec<CredentialResolutionRequest>,
+        ) -> Result<crate::ResolvedCredentials, ServiceError> {
+            Err(ServiceError::new(
+                ErrorCode::SecretUnavailable,
+                "fixture credential resolution unsupported",
+            ))
+        }
+
+        fn stage_oauth_bundle(
+            &self,
+            _plan: &secret::SecretBundleStagePlan,
+            _bundle: secret::SecretBundle,
+        ) -> Result<secret::StagedSecretBundle, ServiceError> {
+            Err(ServiceError::new(
+                ErrorCode::SecretUnavailable,
+                "injected OAuth stage failure",
+            ))
+        }
+
+        fn delete_oauth_bundle(
+            &self,
+            _slot: &secret::PhysicalSecretSlot,
+        ) -> Result<(), ServiceError> {
+            self.deletes.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn sanitized_input_preview(
+            &self,
+            _arguments_json: &SensitiveInput,
+            _max_chars: usize,
+        ) -> Result<String, ServiceError> {
+            Ok("{}".to_owned())
+        }
+    }
+
     struct FakeMcp {
         gate: Arc<Gate>,
         active: AtomicUsize,
@@ -4628,10 +5796,12 @@ mod tests {
         descriptor_bytes: AtomicUsize,
         cancel_releases: AtomicBool,
         panic_on_discover: AtomicBool,
+        discover_calls: AtomicUsize,
         schema_calls: AtomicUsize,
         invoke_calls: AtomicUsize,
         schema_tool_override: Mutex<Option<ToolId>>,
         invoke_error: Mutex<Option<ServiceError>>,
+        cancel_after_success: AtomicBool,
         call_operation_ids: Mutex<Vec<String>>,
         pinned: Mutex<HashSet<OperationId>>,
         order: Arc<Mutex<Vec<&'static str>>>,
@@ -4649,10 +5819,12 @@ mod tests {
                 descriptor_bytes: AtomicUsize::new(1),
                 cancel_releases: AtomicBool::new(true),
                 panic_on_discover: AtomicBool::new(false),
+                discover_calls: AtomicUsize::new(0),
                 schema_calls: AtomicUsize::new(0),
                 invoke_calls: AtomicUsize::new(0),
                 schema_tool_override: Mutex::new(None),
                 invoke_error: Mutex::new(None),
+                cancel_after_success: AtomicBool::new(false),
                 call_operation_ids: Mutex::new(Vec::new()),
                 pinned: Mutex::new(HashSet::new()),
                 order,
@@ -4683,6 +5855,7 @@ mod tests {
             _target: McpRequestTarget,
             _cancellation: CancellationToken,
         ) -> Result<DiscoverOutput, ServiceError> {
+            self.discover_calls.fetch_add(1, Ordering::AcqRel);
             let _active = self.enter();
             if self.panic_on_discover.load(Ordering::Acquire) {
                 panic!("injected connector backend panic");
@@ -4772,6 +5945,9 @@ mod tests {
             if let Some(error) = *self.invoke_error.lock().expect("invoke error lock") {
                 return Err(error);
             }
+            if self.cancel_after_success.load(Ordering::Acquire) {
+                cancellation.cancel();
+            }
             Ok("ok".to_owned())
         }
 
@@ -4798,6 +5974,7 @@ mod tests {
 
     struct FakeOAuth {
         gate: Arc<Gate>,
+        after_callback_gate: Mutex<Option<Arc<Gate>>>,
         active: AtomicUsize,
         peak: AtomicUsize,
     }
@@ -4806,6 +5983,7 @@ mod tests {
         fn new(gate: Arc<Gate>) -> Self {
             Self {
                 gate,
+                after_callback_gate: Mutex::new(None),
                 active: AtomicUsize::new(0),
                 peak: AtomicUsize::new(0),
             }
@@ -4824,6 +6002,7 @@ mod tests {
             _operation_id: &OperationId,
             _server: ServerDraft,
             _choose_workspace: bool,
+            _stored_client: Option<StoredOAuthClient>,
             cancellation: CancellationToken,
         ) -> Result<OAuthDiscovery, ServiceError> {
             let _active = self.enter();
@@ -4864,24 +6043,60 @@ mod tests {
             events.callback_bound(SensitiveInput::from(
                 "https://auth.invalid/authorize?state=REDACTED".to_owned(),
             ))?;
+            if let Some(gate) = self
+                .after_callback_gate
+                .lock()
+                .expect("OAuth callback gate lock")
+                .clone()
+            {
+                gate.wait();
+            }
+            if cancellation.is_cancelled() {
+                return Err(ServiceError::new(
+                    ErrorCode::Cancelled,
+                    "OAuth authorization cancelled after callback",
+                ));
+            }
             let logical_id = secret::LogicalCredentialId::new("fixture-oauth")
                 .map_err(|_| ServiceError::new(ErrorCode::Internal, "fixture logical id failed"))?;
-            Ok(OAuthAuthorizeOutput::Completed(
+            Ok(OAuthAuthorizeOutput::Completed(Box::new(
                 crate::ports::OAuthCompletion {
                     credential: crate::ports::OAuthCredentialUpdate {
                         logical_id,
+                        label: "Fixture OAuth".to_owned(),
                         bundle: secret::SecretBundle::new(
                             secret::SecretString::new("fixture-access".to_owned()),
                             Some(secret::SecretString::new("fixture-refresh".to_owned())),
                             None,
                         ),
-                        oauth_metadata_json: "{}".to_owned(),
+                        metadata: auth::StoredOAuthMetadata::new(
+                            auth::StoredOAuthMetadataDraft {
+                                server_id: "oauth-server-1".to_owned(),
+                                server_url: "https://mcp.example.test/mcp".to_owned(),
+                                issuer: "https://auth.example.test/".to_owned(),
+                                authorization_endpoint: "https://auth.example.test/authorize"
+                                    .to_owned(),
+                                token_endpoint: "https://auth.example.test/token".to_owned(),
+                                oauth_resource: "https://mcp.example.test/mcp".to_owned(),
+                                client_id: "fixture-client".to_owned(),
+                                token_endpoint_auth_method: auth::TokenEndpointAuthMethod::None,
+                                manual_client: false,
+                                provider_workspace_id: None,
+                                workspace_domain: None,
+                                scopes: vec!["tools:read".to_owned()],
+                                expires_at_secs: None,
+                            },
+                            auth::StoredOAuthMetadataLimits::PRODUCTION,
+                        )
+                        .map_err(|_| {
+                            ServiceError::new(ErrorCode::Internal, "fixture OAuth metadata failed")
+                        })?,
                         masked_hint: Some("****ture".to_owned()),
                     },
                     workspace_label: workspace,
                     can_choose_workspace: true,
                 },
-            ))
+            )))
         }
 
         fn cancel(&self, _operation_id: &OperationId) {
@@ -4913,6 +6128,7 @@ mod tests {
         repo: Arc<RepoState>,
         mcp: Arc<FakeMcp>,
         oauth: Arc<FakeOAuth>,
+        secrets: Arc<FakeSecrets>,
     }
 
     #[derive(Default)]
@@ -4935,15 +6151,17 @@ mod tests {
         let repo = Arc::new(RepoState::default());
         let mcp = Arc::new(FakeMcp::new(mcp_gate, Arc::clone(&repo.order)));
         let oauth = Arc::new(FakeOAuth::new(oauth_gate));
+        let secrets = Arc::new(FakeSecrets::default());
         let host = Arc::new(FakeHost::default());
         let coordinator = ConnectorCoordinator::new(ConnectorCoordinatorConfig {
             limits: ResourceLimits::default(),
             idle_ttl: Duration::from_secs(5),
+            initial_overview: None,
             repository_factory: Arc::new(FakeFactory {
                 state: Arc::clone(&repo),
                 open_gate: Arc::clone(&open_gate),
             }),
-            secrets: Arc::new(FakeSecrets),
+            secrets: secrets.clone(),
             mcp: mcp.clone(),
             oauth: oauth.clone(),
             host,
@@ -4956,6 +6174,7 @@ mod tests {
             repo,
             mcp,
             oauth,
+            secrets,
         }
     }
 
@@ -4986,12 +6205,99 @@ mod tests {
         }
     }
 
+    fn http_server_draft(id: &str, url: &str) -> ServerDraft {
+        ServerDraft {
+            id: Some(ServerId::new(id)),
+            name: id.to_owned(),
+            transport: TransportDraft::Http {
+                url: url.to_owned(),
+            },
+            enabled: true,
+        }
+    }
+
+    fn oauth_metadata(
+        server_id: &str,
+        server_url: &str,
+        expires_at_secs: u64,
+    ) -> auth::StoredOAuthMetadata {
+        auth::StoredOAuthMetadata::new(
+            auth::StoredOAuthMetadataDraft {
+                server_id: server_id.to_owned(),
+                server_url: server_url.to_owned(),
+                issuer: "https://auth.example.test/".to_owned(),
+                authorization_endpoint: "https://auth.example.test/authorize".to_owned(),
+                token_endpoint: "https://auth.example.test/token".to_owned(),
+                oauth_resource: server_url.to_owned(),
+                client_id: "fixture-client".to_owned(),
+                token_endpoint_auth_method: auth::TokenEndpointAuthMethod::None,
+                manual_client: false,
+                provider_workspace_id: None,
+                workspace_domain: None,
+                scopes: vec!["tools:read".to_owned()],
+                expires_at_secs: Some(expires_at_secs),
+            },
+            auth::StoredOAuthMetadataLimits::PRODUCTION,
+        )
+        .unwrap()
+    }
+
     fn wait_until(mut predicate: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(3);
         while !predicate() {
             assert!(Instant::now() < deadline, "condition timed out");
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    fn wait_for_remote_trust(coordinator: &ConnectorCoordinator) -> RemoteTrustPrompt {
+        wait_until(|| coordinator.current_snapshot().remote_trust.is_some());
+        coordinator
+            .current_snapshot()
+            .remote_trust
+            .clone()
+            .expect("remote trust prompt")
+    }
+
+    fn remote_discover_fixture(server_id: &str) -> (Fixture, RemoteTrustPrompt) {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Activate)
+            .unwrap();
+        wait_until(|| fixture.coordinator.current_snapshot().config_revision == Revision(1));
+        *fixture
+            .repo
+            .loaded_server_override
+            .lock()
+            .expect("server override lock") =
+            Some(http_server_draft(server_id, "https://mcp.example.test/mcp"));
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Discover(ServerId::new(server_id)))
+            .unwrap();
+        let prompt = wait_for_remote_trust(&fixture.coordinator);
+        (fixture, prompt)
+    }
+
+    fn assert_remote_reservation_released(fixture: &Fixture) {
+        wait_until(|| {
+            fixture.coordinator.metrics().active_mcp_operations == 0
+                && fixture.coordinator.metrics().active_oauth_flows == 0
+        });
+        assert!(fixture.coordinator.current_snapshot().operations.is_empty());
+        assert!(
+            fixture
+                .coordinator
+                .current_snapshot()
+                .remote_trust
+                .is_none()
+        );
     }
 
     #[test]
@@ -5007,6 +6313,731 @@ mod tests {
         assert_eq!(fixture.coordinator.metrics().worker_starts, 0);
         assert_eq!(fixture.coordinator.metrics().worker_alive, 0);
         assert_eq!(fixture.repo.opens.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn host_action_queue_drops_dynamic_urls_but_preserves_static_user_actions() {
+        let queue = HostActionQueue::new(4, Arc::new(FakeHost::default()));
+        let dynamic_id = OperationId::new("dynamic-action");
+        queue
+            .push(HostAction::OpenExternalLink {
+                operation_id: OperationId::new("static-action"),
+                kind: ExternalLinkKind::SlackAppSettings,
+            })
+            .unwrap();
+        queue
+            .push(HostAction::OpenOAuthBrowser {
+                operation_id: dynamic_id.clone(),
+                config_revision: Revision(1),
+                url: SensitiveInput::from("https://oauth.invalid/sensitive".to_owned()),
+            })
+            .unwrap();
+        queue
+            .push(HostAction::OpenSlackRecovery {
+                operation_id: OperationId::new("other-dynamic-action"),
+                server_id: ServerId::new("slack"),
+                kind: SlackRecoveryKind::EnableMcpAccess,
+                url: Some(SensitiveInput::from(
+                    "https://slack.invalid/sensitive".to_owned(),
+                )),
+            })
+            .unwrap();
+
+        queue.remove_dynamic_for_operation(&dynamic_id);
+        assert_eq!(queue.len(), 2);
+        assert!(matches!(
+            queue.pop(),
+            Some(HostAction::OpenExternalLink { .. })
+        ));
+        queue.remove_all_dynamic();
+        assert_eq!(queue.len(), 0);
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn queued_oauth_browser_url_is_removed_before_cancel_can_be_drained() {
+        let callback_gate = Arc::new(Gate::closed());
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        *fixture
+            .oauth
+            .after_callback_gate
+            .lock()
+            .expect("OAuth callback gate lock") = Some(Arc::clone(&callback_gate));
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::BeginOAuth(ServerId::new("oauth-server-1")))
+            .unwrap();
+        wait_until(|| {
+            fixture
+                .coordinator
+                .current_snapshot()
+                .oauth
+                .as_ref()
+                .is_some_and(|state| matches!(state.phase, OAuthUiPhase::AwaitingConsent { .. }))
+        });
+        let oauth = fixture
+            .coordinator
+            .current_snapshot()
+            .oauth
+            .clone()
+            .expect("OAuth consent state");
+        let operation_id = oauth.operation_id.clone();
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::ResolveOAuthConsent {
+                operation_id: operation_id.clone(),
+                config_revision: oauth.config_revision,
+                accepted: true,
+            })
+            .unwrap();
+        wait_until(|| fixture.coordinator.host_action_depth() == 1);
+
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Cancel(operation_id))
+            .unwrap();
+        assert_eq!(fixture.coordinator.host_action_depth(), 0);
+        assert!(fixture.coordinator.try_take_host_action().is_none());
+        callback_gate.release();
+        wait_until(|| fixture.coordinator.metrics().active_oauth_flows == 0);
+        assert!(fixture.coordinator.current_snapshot().operations.is_empty());
+    }
+
+    #[test]
+    fn queued_oauth_browser_url_is_removed_before_config_invalidation_can_be_drained() {
+        let callback_gate = Arc::new(Gate::closed());
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        *fixture
+            .oauth
+            .after_callback_gate
+            .lock()
+            .expect("OAuth callback gate lock") = Some(Arc::clone(&callback_gate));
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::BeginOAuth(ServerId::new("oauth-server-1")))
+            .unwrap();
+        wait_until(|| {
+            fixture
+                .coordinator
+                .current_snapshot()
+                .oauth
+                .as_ref()
+                .is_some_and(|state| matches!(state.phase, OAuthUiPhase::AwaitingConsent { .. }))
+        });
+        let oauth = fixture
+            .coordinator
+            .current_snapshot()
+            .oauth
+            .clone()
+            .expect("OAuth consent state");
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::ResolveOAuthConsent {
+                operation_id: oauth.operation_id,
+                config_revision: oauth.config_revision,
+                accepted: true,
+            })
+            .unwrap();
+        wait_until(|| fixture.coordinator.host_action_depth() == 1);
+
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::SaveServer(server_draft("server-1")))
+            .unwrap();
+        assert_eq!(fixture.coordinator.host_action_depth(), 0);
+        assert!(fixture.coordinator.try_take_host_action().is_none());
+        callback_gate.release();
+        wait_until(|| fixture.coordinator.metrics().active_oauth_flows == 0);
+        assert!(fixture.coordinator.current_snapshot().operations.is_empty());
+    }
+
+    #[test]
+    fn seeded_overview_is_visible_without_worker_repository_open_or_wake() {
+        let repo = Arc::new(RepoState::default());
+        let host = Arc::new(FakeHost::default());
+        let coordinator = ConnectorCoordinator::new(ConnectorCoordinatorConfig {
+            limits: ResourceLimits::default(),
+            idle_ttl: Duration::from_secs(5),
+            initial_overview: Some(crate::OverviewData {
+                config_revision: Revision(41),
+                slack: SlackProjection::default(),
+                servers: vec![server_summary("seeded")],
+            }),
+            repository_factory: Arc::new(FakeFactory {
+                state: Arc::clone(&repo),
+                open_gate: Arc::new(Gate::opened()),
+            }),
+            secrets: Arc::new(FakeSecrets::default()),
+            mcp: Arc::new(FakeMcp::new(
+                Arc::new(Gate::opened()),
+                Arc::clone(&repo.order),
+            )),
+            oauth: Arc::new(FakeOAuth::new(Arc::new(Gate::opened()))),
+            host: host.clone(),
+            clock: Arc::new(SystemCoordinatorClock::default()),
+            operation_ids: Arc::new(SystemOperationIdFactory::default()),
+        })
+        .unwrap();
+
+        let snapshot = coordinator.current_snapshot();
+        assert_eq!(snapshot.config_revision, Revision(41));
+        assert_eq!(snapshot.servers.len(), 1);
+        assert_eq!(snapshot.servers[0].id, ServerId::new("seeded"));
+        assert_eq!(coordinator.metrics().worker_starts, 0);
+        assert_eq!(coordinator.metrics().worker_alive, 0);
+        assert_eq!(repo.opens.load(Ordering::Acquire), 0);
+        assert_eq!(host.wakes.load(Ordering::Acquire), 0);
+
+        coordinator.dispatch(ConnectorIntent::Activate).unwrap();
+        wait_until(|| coordinator.metrics().worker_starts == 1);
+        wait_until(|| repo.opens.load(Ordering::Acquire) == 1);
+        assert_eq!(coordinator.metrics().worker_alive, 1);
+    }
+
+    #[test]
+    fn repeated_oauth_stage_failure_deletes_exact_slot_and_acks_ledger() {
+        let state = Arc::new(RepoState::default());
+        let mut repository = FakeRepository {
+            state: Arc::clone(&state),
+        };
+        let secrets = FailingStageSecrets::default();
+        let logical_id = secret::LogicalCredentialId::new("stage-failure").unwrap();
+
+        for _ in 0..64 {
+            let plan = secret::SecretBundleStagePlan::allocate(logical_id.clone(), None).unwrap();
+            let result = stage_registered_oauth_bundle(
+                &mut repository,
+                &secrets,
+                &plan,
+                secret::SecretBundle::new(
+                    secret::SecretString::new("access".to_owned()),
+                    Some(secret::SecretString::new("refresh".to_owned())),
+                    None,
+                ),
+            );
+            assert_eq!(result.unwrap_err().code, ErrorCode::SecretUnavailable);
+            let mut order = state.order.lock().expect("order lock");
+            assert_eq!(order.as_slice(), ["stage-ledger", "slot-ack"]);
+            order.clear();
+        }
+        assert_eq!(secrets.deletes.load(Ordering::Acquire), 64);
+        assert!(state.order.lock().expect("order lock").is_empty());
+    }
+
+    #[test]
+    fn unknown_oauth_publish_outcome_retains_staged_slot_for_reconciliation() {
+        let disposition = classify_oauth_publish(Err(ServiceError::new(
+            ErrorCode::StorageUnavailable,
+            "commit acknowledgement unavailable",
+        )));
+        assert!(matches!(
+            disposition,
+            OAuthPublishDisposition::RetainStaged(ServiceError {
+                code: ErrorCode::StorageUnavailable,
+                ..
+            })
+        ));
+
+        let disposition = classify_oauth_publish(Ok(OAuthPublishResult::RevisionStale {
+            current_revision: Revision(9),
+        }));
+        assert!(matches!(
+            disposition,
+            OAuthPublishDisposition::DeleteStaged(ServiceError {
+                code: ErrorCode::StaleResult,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn known_expiry_refresh_publishes_before_any_mcp_and_resumes_at_committed_revision() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Activate)
+            .unwrap();
+        wait_until(|| fixture.coordinator.current_snapshot().config_revision == Revision(1));
+
+        let server_id = ServerId::new("refresh-server");
+        let server_url = "https://mcp.example.test/mcp";
+        *fixture
+            .repo
+            .loaded_server_override
+            .lock()
+            .expect("server override lock") =
+            Some(http_server_draft(server_id.as_str(), server_url));
+        let logical_id = secret::LogicalCredentialId::new("refresh-credential").unwrap();
+        let current_slot = secret::PhysicalSecretSlot::allocate(&logical_id);
+        *fixture.repo.oauth_slot.lock().expect("OAuth slot lock") = Some(current_slot.clone());
+        *fixture.repo.http_auth.lock().expect("HTTP auth lock") = Some(crate::HttpAuthBinding {
+            credential_id: connector_contract::CredentialId::new(logical_id.as_str()),
+            physical_slot: current_slot,
+            oauth_metadata: Some(oauth_metadata(server_id.as_str(), server_url, 0)),
+        });
+        let future_expiry = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_add(3_600);
+        *fixture
+            .secrets
+            .refresh_output
+            .lock()
+            .expect("refresh output lock") = Some(crate::OAuthCredentialUpdate {
+            logical_id,
+            label: "refresh-server".to_owned(),
+            bundle: secret::SecretBundle::new(
+                secret::SecretString::new("new-access".to_owned()),
+                Some(secret::SecretString::new("new-refresh".to_owned())),
+                None,
+            ),
+            metadata: oauth_metadata(server_id.as_str(), server_url, future_expiry),
+            masked_hint: Some("****cess".to_owned()),
+        });
+
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Discover(server_id.clone()))
+            .unwrap();
+        let first_trust = wait_for_remote_trust(&fixture.coordinator);
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::ResolveRemoteTrust {
+                operation_id: first_trust.operation_id,
+                config_revision: first_trust.config_revision,
+                endpoint_fingerprint: first_trust.endpoint_fingerprint,
+                accepted: true,
+            })
+            .unwrap();
+        wait_until(|| fixture.secrets.refreshes.load(Ordering::Acquire) == 1);
+        wait_until(|| fixture.coordinator.current_snapshot().config_revision == Revision(2));
+        assert_eq!(fixture.mcp.discover_calls.load(Ordering::Acquire), 0);
+
+        let second_trust = wait_for_remote_trust(&fixture.coordinator);
+        assert_eq!(second_trust.config_revision, Revision(2));
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::ResolveRemoteTrust {
+                operation_id: second_trust.operation_id,
+                config_revision: second_trust.config_revision,
+                endpoint_fingerprint: second_trust.endpoint_fingerprint,
+                accepted: true,
+            })
+            .unwrap();
+        wait_until(|| fixture.mcp.discover_calls.load(Ordering::Acquire) == 1);
+        assert_eq!(fixture.secrets.refreshes.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn accepted_remote_oauth_uses_its_exact_one_slot_and_releases_it() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Activate)
+            .unwrap();
+        wait_until(|| fixture.coordinator.current_snapshot().config_revision == Revision(1));
+        *fixture
+            .repo
+            .loaded_server_override
+            .lock()
+            .expect("server override lock") = Some(http_server_draft(
+            "oauth-server-1",
+            "https://mcp.example.test/mcp",
+        ));
+
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::BeginOAuth(ServerId::new("oauth-server-1")))
+            .unwrap();
+        let trust = wait_for_remote_trust(&fixture.coordinator);
+        assert_eq!(fixture.coordinator.metrics().active_oauth_flows, 1);
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::ResolveRemoteTrust {
+                operation_id: trust.operation_id,
+                config_revision: trust.config_revision,
+                endpoint_fingerprint: trust.endpoint_fingerprint,
+                accepted: true,
+            })
+            .unwrap();
+        wait_until(|| {
+            fixture
+                .coordinator
+                .current_snapshot()
+                .oauth
+                .as_ref()
+                .is_some_and(|state| matches!(state.phase, OAuthUiPhase::AwaitingConsent { .. }))
+        });
+        assert_eq!(fixture.coordinator.metrics().active_oauth_flows, 1);
+        assert_eq!(fixture.oauth.peak.load(Ordering::Acquire), 1);
+        assert_eq!(fixture.coordinator.metrics().backpressure_rejections, 0);
+
+        let oauth = fixture
+            .coordinator
+            .current_snapshot()
+            .oauth
+            .clone()
+            .expect("OAuth consent state");
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::ResolveOAuthConsent {
+                operation_id: oauth.operation_id,
+                config_revision: oauth.config_revision,
+                accepted: false,
+            })
+            .unwrap();
+        assert_remote_reservation_released(&fixture);
+    }
+
+    #[test]
+    fn accepted_remote_mcp_reuses_its_second_slot_while_one_job_is_active() {
+        let mcp_gate = Arc::new(Gate::closed());
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::clone(&mcp_gate),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Activate)
+            .unwrap();
+        wait_until(|| fixture.coordinator.current_snapshot().config_revision == Revision(1));
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Discover(ServerId::new("server-1")))
+            .unwrap();
+        wait_until(|| fixture.mcp.active.load(Ordering::Acquire) == 1);
+
+        *fixture
+            .repo
+            .loaded_server_override
+            .lock()
+            .expect("server override lock") = Some(http_server_draft(
+            "server-2",
+            "https://mcp.example.test/mcp",
+        ));
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Discover(ServerId::new("server-2")))
+            .unwrap();
+        let trust = wait_for_remote_trust(&fixture.coordinator);
+        assert_eq!(fixture.coordinator.metrics().active_mcp_operations, 2);
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::ResolveRemoteTrust {
+                operation_id: trust.operation_id,
+                config_revision: trust.config_revision,
+                endpoint_fingerprint: trust.endpoint_fingerprint,
+                accepted: true,
+            })
+            .unwrap();
+        wait_until(|| fixture.mcp.active.load(Ordering::Acquire) == 2);
+        assert_eq!(fixture.coordinator.metrics().active_mcp_operations, 2);
+        assert_eq!(fixture.coordinator.metrics().backpressure_rejections, 0);
+
+        mcp_gate.release();
+        assert_remote_reservation_released(&fixture);
+    }
+
+    #[test]
+    fn accepted_remote_pre_job_failure_releases_transferred_reservation() {
+        let (fixture, trust) = remote_discover_fixture("remote-target-failure");
+        fixture
+            .repo
+            .mcp_target_error_once
+            .store(true, Ordering::Release);
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::ResolveRemoteTrust {
+                operation_id: trust.operation_id,
+                config_revision: trust.config_revision,
+                endpoint_fingerprint: trust.endpoint_fingerprint,
+                accepted: true,
+            })
+            .unwrap();
+
+        assert_remote_reservation_released(&fixture);
+        assert_eq!(fixture.mcp.discover_calls.load(Ordering::Acquire), 0);
+        assert_eq!(
+            fixture
+                .coordinator
+                .current_snapshot()
+                .diagnostics
+                .transitions
+                .last()
+                .and_then(|transition| transition.error_code),
+            Some(ErrorCode::StorageUnavailable)
+        );
+    }
+
+    #[test]
+    fn remote_trust_stale_denied_and_cancel_each_release_exactly_once() {
+        {
+            let (fixture, trust) = remote_discover_fixture("remote-denied");
+            fixture
+                .coordinator
+                .dispatch(ConnectorIntent::ResolveRemoteTrust {
+                    operation_id: trust.operation_id.clone(),
+                    config_revision: trust.config_revision,
+                    endpoint_fingerprint: trust.endpoint_fingerprint.clone(),
+                    accepted: false,
+                })
+                .unwrap();
+            assert_remote_reservation_released(&fixture);
+            fixture
+                .coordinator
+                .dispatch(ConnectorIntent::ResolveRemoteTrust {
+                    operation_id: trust.operation_id,
+                    config_revision: trust.config_revision,
+                    endpoint_fingerprint: trust.endpoint_fingerprint,
+                    accepted: false,
+                })
+                .unwrap();
+            wait_until(|| fixture.coordinator.metrics().stale_results >= 1);
+            assert_eq!(fixture.coordinator.metrics().active_mcp_operations, 0);
+        }
+        {
+            let (fixture, trust) = remote_discover_fixture("remote-stale");
+            fixture
+                .coordinator
+                .dispatch(ConnectorIntent::ResolveRemoteTrust {
+                    operation_id: OperationId::new("wrong-remote-operation"),
+                    config_revision: trust.config_revision,
+                    endpoint_fingerprint: trust.endpoint_fingerprint.clone(),
+                    accepted: true,
+                })
+                .unwrap();
+            wait_until(|| fixture.coordinator.metrics().stale_results >= 1);
+            assert_eq!(fixture.coordinator.metrics().active_mcp_operations, 1);
+            assert_eq!(fixture.coordinator.current_snapshot().operations.len(), 1);
+            assert_eq!(
+                fixture
+                    .coordinator
+                    .current_snapshot()
+                    .remote_trust
+                    .as_ref()
+                    .map(|prompt| &prompt.operation_id),
+                Some(&trust.operation_id)
+            );
+            fixture
+                .coordinator
+                .dispatch(ConnectorIntent::ResolveRemoteTrust {
+                    operation_id: trust.operation_id,
+                    config_revision: trust.config_revision,
+                    endpoint_fingerprint: trust.endpoint_fingerprint,
+                    accepted: false,
+                })
+                .unwrap();
+            assert_remote_reservation_released(&fixture);
+        }
+        {
+            let (fixture, trust) = remote_discover_fixture("remote-cancelled");
+            fixture
+                .coordinator
+                .dispatch(ConnectorIntent::Cancel(trust.operation_id))
+                .unwrap();
+            assert_remote_reservation_released(&fixture);
+            assert_eq!(
+                fixture
+                    .coordinator
+                    .current_snapshot()
+                    .diagnostics
+                    .cancellations,
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn stale_oauth_singleton_response_does_not_consume_current_continuation() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::BeginOAuth(ServerId::new("oauth-server-1")))
+            .unwrap();
+        wait_until(|| {
+            fixture
+                .coordinator
+                .current_snapshot()
+                .oauth
+                .as_ref()
+                .is_some_and(|state| matches!(state.phase, OAuthUiPhase::AwaitingConsent { .. }))
+        });
+        let current = fixture
+            .coordinator
+            .current_snapshot()
+            .oauth
+            .clone()
+            .expect("current OAuth continuation");
+
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::ResolveOAuthConsent {
+                operation_id: OperationId::new("stale-oauth-operation"),
+                config_revision: current.config_revision,
+                accepted: false,
+            })
+            .unwrap();
+        wait_until(|| fixture.coordinator.metrics().stale_results >= 1);
+        assert_eq!(fixture.coordinator.metrics().active_oauth_flows, 1);
+        assert_eq!(fixture.coordinator.current_snapshot().operations.len(), 1);
+        assert_eq!(
+            fixture
+                .coordinator
+                .current_snapshot()
+                .oauth
+                .as_ref()
+                .map(|state| &state.operation_id),
+            Some(&current.operation_id)
+        );
+
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::ResolveOAuthConsent {
+                operation_id: current.operation_id,
+                config_revision: current.config_revision,
+                accepted: false,
+            })
+            .unwrap();
+        assert_remote_reservation_released(&fixture);
+    }
+
+    #[test]
+    fn config_invalidation_finalizes_actual_pending_singletons_without_user_response() {
+        {
+            let (fixture, _trust) = remote_discover_fixture("remote-invalidated");
+            fixture
+                .coordinator
+                .dispatch(ConnectorIntent::SaveServer(server_draft("server-1")))
+                .unwrap();
+            wait_until(|| fixture.coordinator.current_snapshot().config_revision == Revision(2));
+            assert_remote_reservation_released(&fixture);
+        }
+        {
+            let fixture = fixture(
+                Arc::new(Gate::opened()),
+                Arc::new(Gate::opened()),
+                Arc::new(Gate::opened()),
+                Arc::new(SystemCoordinatorClock::default()),
+            );
+            fixture
+                .coordinator
+                .dispatch(ConnectorIntent::BeginOAuth(ServerId::new("oauth-server-1")))
+                .unwrap();
+            wait_until(|| {
+                fixture
+                    .coordinator
+                    .current_snapshot()
+                    .oauth
+                    .as_ref()
+                    .is_some_and(|state| {
+                        matches!(state.phase, OAuthUiPhase::AwaitingConsent { .. })
+                    })
+            });
+            fixture
+                .coordinator
+                .dispatch(ConnectorIntent::SaveServer(server_draft("server-1")))
+                .unwrap();
+            wait_until(|| fixture.coordinator.current_snapshot().config_revision == Revision(2));
+            assert_remote_reservation_released(&fixture);
+            assert!(fixture.coordinator.current_snapshot().oauth.is_none());
+        }
+    }
+
+    #[test]
+    fn exact_self_authored_allow_always_revision_rebinds_only_inflight_call() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Activate)
+            .unwrap();
+        wait_until(|| fixture.coordinator.current_snapshot().config_revision == Revision(1));
+        let server_id = ServerId::new("permission-rebind");
+        *fixture
+            .repo
+            .loaded_server_override
+            .lock()
+            .expect("server override lock") = Some(http_server_draft(
+            server_id.as_str(),
+            "https://mcp.example.test/mcp",
+        ));
+
+        fixture
+            .coordinator
+            .dispatch(invoke_intent(server_id.as_str(), "tool-a", br#"{"a":1}"#))
+            .unwrap();
+        let trust = wait_for_remote_trust(&fixture.coordinator);
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::ResolveRemoteTrust {
+                operation_id: trust.operation_id,
+                config_revision: trust.config_revision,
+                endpoint_fingerprint: trust.endpoint_fingerprint,
+                accepted: true,
+            })
+            .unwrap();
+        wait_until(|| fixture.coordinator.current_snapshot().approval.is_some());
+        let operation_id = fixture
+            .coordinator
+            .current_snapshot()
+            .approval
+            .as_ref()
+            .expect("approval")
+            .operation_id
+            .clone();
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::ResolveApproval {
+                operation_id,
+                decision: ApprovalDecision::AllowAlways,
+            })
+            .unwrap();
+
+        wait_until(|| fixture.mcp.invoke_calls.load(Ordering::Acquire) == 1);
+        wait_until(|| fixture.coordinator.current_snapshot().result.is_some());
+        assert_eq!(
+            fixture.coordinator.metrics().active_mcp_operations,
+            0,
+            "snapshot={:?}",
+            fixture.coordinator.current_snapshot()
+        );
+        assert_eq!(fixture.repo.preflights.load(Ordering::Acquire), 1);
+        assert_eq!(
+            fixture.coordinator.current_snapshot().config_revision,
+            Revision(2)
+        );
     }
 
     #[test]
@@ -5288,6 +7319,41 @@ mod tests {
     }
 
     #[test]
+    fn late_cancel_after_known_ok_persists_succeeded_and_never_retries() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        enable_auto_allow(&fixture);
+        fixture
+            .mcp
+            .cancel_after_success
+            .store(true, Ordering::Release);
+
+        fixture
+            .coordinator
+            .dispatch(invoke_intent("server-1", "tool-a", br#"{"value":1}"#))
+            .unwrap();
+        wait_until(|| fixture.repo.completions.load(Ordering::Acquire) == 1);
+        wait_until(|| fixture.coordinator.metrics().active_mcp_operations == 0);
+        let operation_id = first_called_operation(&fixture);
+
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 1);
+        assert_eq!(fixture.repo.completions.load(Ordering::Acquire), 1);
+        assert_eq!(
+            fixture
+                .repo
+                .authorization_ledger
+                .lifecycle(&operation_id)
+                .unwrap(),
+            Some(audit::AuditLifecycle::Succeeded)
+        );
+        assert_eq!(fixture.coordinator.metrics().stale_results, 1);
+    }
+
+    #[test]
     fn durable_denial_never_reaches_external_call() {
         let fixture = fixture(
             Arc::new(Gate::opened()),
@@ -5341,6 +7407,38 @@ mod tests {
         *fixture.mcp.invoke_error.lock().expect("invoke error lock") = Some(ServiceError::new(
             ErrorCode::TransportFailed,
             "known tool error",
+        ));
+
+        fixture
+            .coordinator
+            .dispatch(invoke_intent("server-1", "tool-a", br#"{"value":1}"#))
+            .unwrap();
+        wait_until(|| fixture.repo.completions.load(Ordering::Acquire) == 1);
+        let operation_id = first_called_operation(&fixture);
+
+        assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            fixture
+                .repo
+                .authorization_ledger
+                .lifecycle(&operation_id)
+                .unwrap(),
+            Some(audit::AuditLifecycle::Failed)
+        );
+    }
+
+    #[test]
+    fn reactive_auth_failure_is_failed_and_backend_is_not_retried() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        enable_auto_allow(&fixture);
+        *fixture.mcp.invoke_error.lock().expect("invoke error lock") = Some(ServiceError::new(
+            ErrorCode::AuthenticationRequired,
+            "authentication required after delivery",
         ));
 
         fixture
@@ -5920,7 +8018,7 @@ mod tests {
                 .transitions
                 .last()
                 .and_then(|transition| transition.error_code),
-            Some(ErrorCode::AuditUnavailable)
+            Some(ErrorCode::StaleResult)
         );
     }
 

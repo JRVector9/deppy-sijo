@@ -36,7 +36,8 @@ pub use discovery::{
 };
 pub use flow::{
     OAuthProviderConfig, OAuthToken, PendingAuthorization, begin, begin_with_resource, complete,
-    run_flow, run_flow_with_resource, run_flow_with_resource_fixed_localhost,
+    complete_with_timeout, run_flow, run_flow_with_resource,
+    run_flow_with_resource_fixed_localhost,
 };
 pub use http::OAUTH_HTTP_RESPONSE_MAX_BYTES;
 pub use mcp_oauth::{

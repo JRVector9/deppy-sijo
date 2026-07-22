@@ -204,13 +204,27 @@ pub fn complete(
     pending: PendingAuthorization,
     params: CallbackParams,
 ) -> anyhow::Result<OAuthToken> {
+    complete_with_timeout(pending, params, Duration::from_secs(30))
+}
+
+/// [`complete`]와 동일한 authorization-code 교환을 수행하되 token endpoint의
+/// blocking HTTP 상한을 호출자가 지정한다. `timeout`은 0일 수 없으며 교환은 절대
+/// 재시도하지 않는다. CSRF state와 timeout은 모두 token endpoint 접속 전에 검증된다.
+pub fn complete_with_timeout(
+    pending: PendingAuthorization,
+    params: CallbackParams,
+    timeout: Duration,
+) -> anyhow::Result<OAuthToken> {
     if params.state != *pending.state.secret() {
         bail!("state 불일치 — CSRF 의심, authorization을 거부합니다");
+    }
+    if timeout.is_zero() {
+        bail!("OAuth token exchange timeout은 0보다 커야 합니다");
     }
     // 응답이 멎은 token endpoint에 flow가 영구히 매달리지 않게 timeout.
     // redirect 금지도 함께 강제된다 (H4 리뷰 P1) — token 응답의 302를 따라가면
     // code/PKCE verifier가 redirect 대상으로 유출될 수 있다 (CWE-918).
-    let http = crate::http::BoundedOAuthHttpClient::new(Duration::from_secs(30));
+    let http = crate::http::BoundedOAuthHttpClient::new(timeout);
     let mut request = pending
         .client
         .exchange_code(AuthorizationCode::new(params.code))
@@ -278,6 +292,8 @@ mod tests {
     use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Instant;
 
     fn config(token_url: &str) -> OAuthProviderConfig {
         OAuthProviderConfig {
@@ -383,6 +399,87 @@ mod tests {
         // state 검증을 통과했다면 교환 시도 에러가 났을 것 — 메시지로 구분)
         let message = format!("{:#}", result.unwrap_err());
         assert!(message.contains("state 불일치"), "{message}");
+    }
+
+    #[test]
+    fn zero_timeout은_token_endpoint_접속_전에_거부() {
+        crate::http::reset_http_call_count();
+        let pending = begin(
+            &config("http://127.0.0.1:9/token"),
+            "http://127.0.0.1:9/callback",
+        )
+        .unwrap();
+        let state = pending.state.secret().clone();
+
+        let result = complete_with_timeout(
+            pending,
+            CallbackParams {
+                code: "must-not-leave-process".to_owned(),
+                state,
+            },
+            Duration::ZERO,
+        );
+
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(message.contains("timeout"), "{message}");
+        assert_eq!(
+            crate::http::http_call_count(),
+            0,
+            "zero timeout must make zero token endpoint calls"
+        );
+    }
+
+    #[test]
+    fn configured_short_timeout_bounds_stalled_exchange_without_retry() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let token_url = format!(
+            "http://127.0.0.1:{}/token",
+            listener.local_addr().unwrap().port()
+        );
+        let (release_tx, release_rx) = mpsc::channel();
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_full_request(&mut stream);
+
+            // A correct short-timeout client returns first and releases this stalled response.
+            // The fallback prevents a regression from making this test wait for the 30s wrapper.
+            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            listener.set_nonblocking(true).unwrap();
+            let mut request_count = 1usize;
+            loop {
+                match listener.accept() {
+                    Ok((_stream, _)) => request_count += 1,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("stalled token endpoint accept failed: {error}"),
+                }
+            }
+            observed_tx.send((request_count, request)).unwrap();
+        });
+
+        let pending = begin(&config(&token_url), "http://127.0.0.1:9/callback").unwrap();
+        let state = pending.state.secret().clone();
+        let started = Instant::now();
+        let result = complete_with_timeout(
+            pending,
+            CallbackParams {
+                code: "single-use-auth-code".to_owned(),
+                state,
+            },
+            Duration::from_millis(75),
+        );
+        let elapsed = started.elapsed();
+        release_tx.send(()).unwrap();
+        let (request_count, request) = observed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        server.join().unwrap();
+
+        assert!(result.is_err());
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "configured short timeout was ignored: {elapsed:?}"
+        );
+        assert_eq!(request_count, 1, "authorization code exchange was retried");
+        assert!(request.contains("code=single-use-auth-code"), "{request}");
     }
 
     /// mock token endpoint로 전체 교환 검증: PKCE verifier가 요청에 실리고

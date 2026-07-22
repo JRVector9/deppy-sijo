@@ -9,6 +9,21 @@ use std::time::Duration;
 
 use oauth2::{HttpRequest, HttpResponse, SyncHttpClient};
 
+#[cfg(test)]
+thread_local! {
+    static HTTP_CALL_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_http_call_count() {
+    HTTP_CALL_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn http_call_count() -> usize {
+    HTTP_CALL_COUNT.with(std::cell::Cell::get)
+}
+
 /// Maximum authorization-code, refresh, and dynamic-registration response body size.
 pub const OAUTH_HTTP_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 
@@ -50,6 +65,9 @@ impl SyncHttpClient for BoundedOAuthHttpClient {
     type Error = BoundedOAuthHttpError;
 
     fn call(&self, request: HttpRequest) -> Result<HttpResponse, Self::Error> {
+        #[cfg(test)]
+        HTTP_CALL_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+
         let mut outgoing = match request.method().as_str() {
             "POST" => self.agent.post(&request.uri().to_string()),
             "GET" => self.agent.get(&request.uri().to_string()),

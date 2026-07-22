@@ -123,3 +123,21 @@ DAG, full workspace fmt, diff-check, and the complete secret-like persistence/lo
 The eager worker, two-second fallback, 25-ms retry, five-second empty-env restore, and direct launch
 admission are still active development tracked in the handoff; this fail-closed change is not a
 claim that the complete dotenv lifecycle gate is finished.
+
+## Lazy AgentState worker foundation
+
+The DB-neutral AgentState worker protocol is now frozen before the atomic app cutover. Construction
+creates no thread or channel; the first admitted aggregate creates one capacity-one worker and one
+backend, projections coalesce independently by section/revision, and at most eight exact
+continuations retaining 4 MiB are kept FIFO. Exact kinds cover generation-aware turn clear,
+identity-CAS binding delete, and a 16-item/512-KiB structured batch. One backend call returns one
+Arc-shared complete snapshot or one static failure for the exact operation and every same-job
+projection.
+
+Idle resources exit after 30 seconds through a lifecycle-locked final receive. Explicit
+`shutdown_drain` stops admission, discards coalescible projections, and settles the in-flight then
+queued exact work in FIFO order; unknown delivery returns one `WorkerUnavailable` completion and
+is never retried. Focused tests pass 13/13, app all-target check passes, and strict Clippy passes
+with only the expected pre-wiring dead-code lint excluded. Scoped rustfmt, diff, and forbidden-edge
+checks pass. Literal strict Clippy and removal of the legacy direct app path remain atomic cutover
+gates; this foundation is not a production dual-path completion claim.

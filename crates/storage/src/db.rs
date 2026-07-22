@@ -785,6 +785,7 @@ impl std::fmt::Debug for StructuredThreadMutation {
 #[derive(Clone, PartialEq, Eq)]
 pub struct AgentStateJob {
     pub workspace_id: String,
+    pub structured_workspace_ids: Vec<String>,
     pub binding_reconcile: Option<AgentSessionBindingReconcile>,
     pub stale_binding_deletes: Vec<AgentSessionIdentity>,
     pub turn_done_clears: Vec<AgentTurnDoneClear>,
@@ -794,8 +795,10 @@ pub struct AgentStateJob {
 
 impl AgentStateJob {
     pub fn projection(workspace_id: impl Into<String>) -> Self {
+        let workspace_id = workspace_id.into();
         Self {
-            workspace_id: workspace_id.into(),
+            structured_workspace_ids: vec![workspace_id.clone()],
+            workspace_id,
             binding_reconcile: None,
             stale_binding_deletes: Vec::new(),
             turn_done_clears: Vec::new(),
@@ -809,6 +812,10 @@ impl std::fmt::Debug for AgentStateJob {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("AgentStateJob")
+            .field(
+                "structured_workspace_count",
+                &self.structured_workspace_ids.len(),
+            )
             .field("has_binding_reconcile", &self.binding_reconcile.is_some())
             .field(
                 "stale_binding_delete_count",
@@ -929,49 +936,66 @@ const STRUCTURED_THREADS_BOUNDED_QUERY: &str = "WITH selected AS MATERIALIZED (
         AND thread.rowid = selected.rowid
       ORDER BY row_kind, favorite DESC, updated_at DESC, local_session_id";
 
-const AGENT_STATE_STRUCTURED_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
-        SELECT rowid
-          FROM structured_threads
-         WHERE workspace_id = ?1 AND (?2 = 1 OR archived = 0)
-         ORDER BY favorite DESC, updated_at DESC,
-                  substr(CAST(local_session_id AS BLOB), 1, ?4), rowid
-         LIMIT ?3
-     ), sized AS MATERIALIZED (
-        SELECT thread.*,
-               length(CAST(thread.local_session_id AS BLOB))
-               + length(CAST(thread.workspace_id AS BLOB))
-               + length(CAST(thread.thread_id AS BLOB))
-               + length(CAST(thread.title AS BLOB))
-               + length(CAST(thread.cwd AS BLOB))
-               + COALESCE(length(CAST(thread.model AS BLOB)), 0) AS row_bytes
-          FROM selected
-          JOIN structured_threads AS thread ON thread.rowid = selected.rowid
-     )
-     SELECT COUNT(*), COALESCE(SUM(CASE WHEN
-                typeof(local_session_id) != 'text'
-             OR length(CAST(local_session_id AS BLOB)) NOT BETWEEN 1 AND ?4
-             OR typeof(workspace_id) != 'text'
-             OR length(CAST(workspace_id AS BLOB)) NOT BETWEEN 1 AND ?4
-             OR typeof(thread_id) != 'text'
-             OR length(CAST(thread_id AS BLOB)) NOT BETWEEN 1 AND ?4
-             OR typeof(title) != 'text'
-             OR typeof(cwd) != 'text' OR length(CAST(cwd AS BLOB)) > ?5
-             OR typeof(model) NOT IN ('null', 'text')
-             OR (typeof(model) = 'text' AND length(CAST(model AS BLOB)) > ?6)
-             OR typeof(favorite) != 'integer' OR favorite NOT IN (0, 1)
-             OR typeof(archived) != 'integer' OR archived NOT IN (0, 1)
-             OR typeof(created_at) != 'integer' OR typeof(updated_at) != 'integer'
-             OR row_bytes > ?7 THEN 1 ELSE 0 END), 0),
-            COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
-       FROM sized";
-
-const AGENT_STATE_STRUCTURED_SELECT: &str = "SELECT local_session_id, workspace_id,
-       thread_id, title, cwd, model, favorite, archived, created_at, updated_at
-  FROM structured_threads
- WHERE workspace_id = ?1 AND (?2 = 1 OR archived = 0)
- ORDER BY favorite DESC, updated_at DESC,
-          substr(CAST(local_session_id AS BLOB), 1, ?4), rowid
- LIMIT ?3";
+fn agent_state_structured_scope_sql(workspace_count: usize, select: bool) -> String {
+    let requested = std::iter::repeat_n("(?)", workspace_count)
+        .collect::<Vec<_>>()
+        .join(",");
+    if select {
+        return format!(
+            "WITH requested(workspace_id) AS (VALUES {requested})
+             SELECT thread.local_session_id, thread.workspace_id, thread.thread_id,
+                    thread.title, thread.cwd, thread.model, thread.favorite, thread.archived,
+                    thread.created_at, thread.updated_at
+               FROM structured_threads thread
+               JOIN requested ON requested.workspace_id = thread.workspace_id
+              WHERE (? = 1 OR thread.archived = 0)
+              ORDER BY thread.favorite DESC, thread.updated_at DESC,
+                       substr(CAST(thread.workspace_id AS BLOB), 1, ?),
+                       substr(CAST(thread.local_session_id AS BLOB), 1, ?), thread.rowid
+              LIMIT ?"
+        );
+    }
+    format!(
+        "WITH requested(workspace_id) AS (VALUES {requested}),
+         selected AS MATERIALIZED (
+            SELECT thread.rowid
+              FROM structured_threads thread
+              JOIN requested ON requested.workspace_id = thread.workspace_id
+             WHERE (? = 1 OR thread.archived = 0)
+             ORDER BY thread.favorite DESC, thread.updated_at DESC,
+                      substr(CAST(thread.workspace_id AS BLOB), 1, ?),
+                      substr(CAST(thread.local_session_id AS BLOB), 1, ?), thread.rowid
+             LIMIT ?
+         ), sized AS MATERIALIZED (
+            SELECT thread.*,
+                   length(CAST(thread.local_session_id AS BLOB))
+                   + length(CAST(thread.workspace_id AS BLOB))
+                   + length(CAST(thread.thread_id AS BLOB))
+                   + length(CAST(thread.title AS BLOB))
+                   + length(CAST(thread.cwd AS BLOB))
+                   + COALESCE(length(CAST(thread.model AS BLOB)), 0) AS row_bytes
+              FROM selected
+              JOIN structured_threads AS thread ON thread.rowid = selected.rowid
+         )
+         SELECT COUNT(*), COALESCE(SUM(CASE WHEN
+                    typeof(local_session_id) != 'text'
+                 OR length(CAST(local_session_id AS BLOB)) NOT BETWEEN 1 AND ?
+                 OR typeof(workspace_id) != 'text'
+                 OR length(CAST(workspace_id AS BLOB)) NOT BETWEEN 1 AND ?
+                 OR typeof(thread_id) != 'text'
+                 OR length(CAST(thread_id AS BLOB)) NOT BETWEEN 1 AND ?
+                 OR typeof(title) != 'text'
+                 OR typeof(cwd) != 'text' OR length(CAST(cwd AS BLOB)) > ?
+                 OR typeof(model) NOT IN ('null', 'text')
+                 OR (typeof(model) = 'text' AND length(CAST(model AS BLOB)) > ?)
+                 OR typeof(favorite) != 'integer' OR favorite NOT IN (0, 1)
+                 OR typeof(archived) != 'integer' OR archived NOT IN (0, 1)
+                 OR typeof(created_at) != 'integer' OR typeof(updated_at) != 'integer'
+                 OR row_bytes > ? THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+           FROM sized"
+    )
+}
 
 fn structured_thread_id_is_valid(value: &str) -> bool {
     !value.is_empty()
@@ -1088,7 +1112,9 @@ pub const AGENT_STATE_EXACT_MUTATIONS_MAX: usize = 8;
 pub const AGENT_STATE_STRUCTURED_MUTATIONS_MAX: usize = 16;
 /// Aggregate structured-thread mutation payload retained by one job.
 pub const AGENT_STATE_STRUCTURED_MUTATION_BYTES_MAX: usize = 512 * 1024;
-/// Maximum structured rows returned for the active workspace.
+/// Maximum deduplicated workspace IDs in one structured catalog projection.
+pub const AGENT_STATE_STRUCTURED_WORKSPACE_MAX: usize = 256;
+/// Maximum structured rows returned across the requested workspace catalog.
 pub const AGENT_STATE_STRUCTURED_PROJECTION_MAX: usize = 500;
 /// Aggregate retained string bytes across every section of one worker snapshot.
 pub const AGENT_STATE_SNAPSHOT_BYTES_MAX: usize = 4 * 1024 * 1024;
@@ -1574,6 +1600,23 @@ fn validate_agent_state_job(job: &AgentStateJob) -> anyhow::Result<String> {
     let workspace_prefix = format!("{}:", job.workspace_id);
 
     let mut retained_input_bytes = job.workspace_id.len();
+    anyhow::ensure!(
+        !job.structured_workspace_ids.is_empty()
+            && job.structured_workspace_ids.len() <= AGENT_STATE_STRUCTURED_WORKSPACE_MAX,
+        AGENT_STATE_INPUT_INVALID
+    );
+    let mut structured_workspaces =
+        std::collections::HashSet::with_capacity(job.structured_workspace_ids.len());
+    for workspace_id in &job.structured_workspace_ids {
+        anyhow::ensure!(
+            bounded_id_is_valid(workspace_id)
+                && structured_workspaces.insert(workspace_id.as_str()),
+            AGENT_STATE_INPUT_INVALID
+        );
+        retained_input_bytes = retained_input_bytes
+            .checked_add(workspace_id.len())
+            .ok_or_else(|| anyhow::anyhow!(AGENT_STATE_INPUT_INVALID))?;
+    }
     if let Some(reconcile) = &job.binding_reconcile {
         anyhow::ensure!(
             reconcile.live_pane_ids.len() <= AGENT_STATE_BINDING_ROWS_MAX
@@ -5202,18 +5245,32 @@ impl Db {
             ],
             AGENT_SESSION_ROWS_MAX,
         )?;
+        let structured_preflight_sql =
+            agent_state_structured_scope_sql(job.structured_workspace_ids.len(), false);
+        let mut structured_preflight_params =
+            Vec::with_capacity(job.structured_workspace_ids.len() + 10);
+        structured_preflight_params.extend(
+            job.structured_workspace_ids
+                .iter()
+                .cloned()
+                .map(rusqlite::types::Value::Text),
+        );
+        structured_preflight_params.extend([
+            rusqlite::types::Value::Integer(job.include_archived_threads as i64),
+            rusqlite::types::Value::Integer(STRUCTURED_THREAD_ID_BYTES_MAX as i64),
+            rusqlite::types::Value::Integer(STRUCTURED_THREAD_ID_BYTES_MAX as i64),
+            rusqlite::types::Value::Integer(structured_sql_limit),
+            rusqlite::types::Value::Integer(STRUCTURED_THREAD_ID_BYTES_MAX as i64),
+            rusqlite::types::Value::Integer(STRUCTURED_THREAD_ID_BYTES_MAX as i64),
+            rusqlite::types::Value::Integer(STRUCTURED_THREAD_ID_BYTES_MAX as i64),
+            rusqlite::types::Value::Integer(STRUCTURED_THREAD_CWD_BYTES_MAX as i64),
+            rusqlite::types::Value::Integer(STRUCTURED_THREAD_MODEL_BYTES_MAX as i64),
+            rusqlite::types::Value::Integer(STRUCTURED_THREAD_ROW_BYTES_MAX as i64),
+        ]);
         let structured_probe = bounded_read_preflight(
             &tx,
-            AGENT_STATE_STRUCTURED_PREFLIGHT,
-            rusqlite::params![
-                job.workspace_id,
-                job.include_archived_threads as i64,
-                structured_sql_limit,
-                STRUCTURED_THREAD_ID_BYTES_MAX as i64,
-                STRUCTURED_THREAD_CWD_BYTES_MAX as i64,
-                STRUCTURED_THREAD_MODEL_BYTES_MAX as i64,
-                STRUCTURED_THREAD_ROW_BYTES_MAX as i64,
-            ],
+            &structured_preflight_sql,
+            rusqlite::params_from_iter(&structured_preflight_params),
             AGENT_STATE_STRUCTURED_PROJECTION_MAX,
         )?;
         let retained_bytes = [
@@ -5379,16 +5436,25 @@ impl Db {
         };
         let structured_threads = {
             let mut result = Vec::with_capacity(structured_probe.count);
+            let sql = agent_state_structured_scope_sql(job.structured_workspace_ids.len(), true);
+            let mut params = Vec::with_capacity(job.structured_workspace_ids.len() + 4);
+            params.extend(
+                job.structured_workspace_ids
+                    .iter()
+                    .cloned()
+                    .map(rusqlite::types::Value::Text),
+            );
+            params.extend([
+                rusqlite::types::Value::Integer(job.include_archived_threads as i64),
+                rusqlite::types::Value::Integer(STRUCTURED_THREAD_ID_BYTES_MAX as i64),
+                rusqlite::types::Value::Integer(STRUCTURED_THREAD_ID_BYTES_MAX as i64),
+                rusqlite::types::Value::Integer(structured_sql_limit),
+            ]);
             let mut stmt = tx
-                .prepare(AGENT_STATE_STRUCTURED_SELECT)
+                .prepare(&sql)
                 .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
             let mut rows = stmt
-                .query(rusqlite::params![
-                    job.workspace_id,
-                    job.include_archived_threads as i64,
-                    structured_sql_limit,
-                    STRUCTURED_THREAD_ID_BYTES_MAX as i64,
-                ])
+                .query(rusqlite::params_from_iter(&params))
                 .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
             while let Some(row) = rows
                 .next()
@@ -8849,6 +8915,279 @@ mod tests {
     }
 
     #[test]
+    fn agent_state_catalog는_여러_workspace를_한_snapshot으로_투영한다() {
+        let db = Db::open_in_memory().unwrap();
+        let first = db.create_workspace("agent-state-catalog-first").unwrap();
+        let second = db.create_workspace("agent-state-catalog-second").unwrap();
+        let omitted = db.create_workspace("agent-state-catalog-omitted").unwrap();
+        db.upsert_structured_thread(
+            "catalog-first",
+            &first,
+            "thread-first",
+            "first",
+            "",
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        db.upsert_structured_thread(
+            "catalog-second",
+            &second,
+            "thread-second",
+            "second",
+            "",
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        db.upsert_structured_thread(
+            "catalog-archived",
+            &second,
+            "thread-archived",
+            "archived",
+            "",
+            None,
+            false,
+            true,
+        )
+        .unwrap();
+        db.upsert_structured_thread(
+            "catalog-omitted",
+            &omitted,
+            "thread-omitted",
+            "omitted",
+            "",
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+
+        let mut job = AgentStateJob::projection(&first);
+        job.structured_workspace_ids = vec![second.clone(), first.clone()];
+        job.include_archived_threads = false;
+        let snapshot = db.apply_agent_state_job(&job).unwrap();
+        assert_eq!(
+            snapshot
+                .structured_threads
+                .iter()
+                .map(|row| (row.local_session_id.as_str(), row.workspace_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("catalog-second", second.as_str()),
+                ("catalog-first", first.as_str()),
+            ]
+        );
+
+        job.include_archived_threads = true;
+        let snapshot = db.apply_agent_state_job(&job).unwrap();
+        assert_eq!(snapshot.structured_threads.len(), 3);
+        assert!(
+            snapshot
+                .structured_threads
+                .iter()
+                .any(|row| row.local_session_id == "catalog-archived")
+        );
+        assert!(
+            snapshot
+                .structured_threads
+                .iter()
+                .all(|row| row.workspace_id != omitted)
+        );
+    }
+
+    #[test]
+    fn agent_state_catalog_workspace_scope는_1에서_256까지로_제한된다() {
+        let db = Db::open_in_memory().unwrap();
+        let active = db.create_workspace("agent-state-catalog-scope").unwrap();
+        let exact = (0..AGENT_STATE_STRUCTURED_WORKSPACE_MAX)
+            .map(|index| format!("workspace-{index}"))
+            .collect::<Vec<_>>();
+        let mut job = AgentStateJob::projection(&active);
+        job.structured_workspace_ids = exact.clone();
+        assert!(db.apply_agent_state_job(&job).is_ok());
+
+        job.structured_workspace_ids.clear();
+        assert_eq!(
+            db.apply_agent_state_job(&job).unwrap_err().to_string(),
+            AGENT_STATE_INPUT_INVALID
+        );
+
+        job.structured_workspace_ids = exact.clone();
+        job.structured_workspace_ids
+            .push("workspace-plus-one".to_owned());
+        assert_eq!(
+            db.apply_agent_state_job(&job).unwrap_err().to_string(),
+            AGENT_STATE_INPUT_INVALID
+        );
+
+        job.structured_workspace_ids = vec![exact[0].clone(), exact[0].clone()];
+        assert_eq!(
+            db.apply_agent_state_job(&job).unwrap_err().to_string(),
+            AGENT_STATE_INPUT_INVALID
+        );
+
+        job.structured_workspace_ids = vec!["workspace\ncontrol".to_owned()];
+        assert_eq!(
+            db.apply_agent_state_job(&job).unwrap_err().to_string(),
+            AGENT_STATE_INPUT_INVALID
+        );
+
+        job.structured_workspace_ids = vec!["w".repeat(BOUNDED_ID_BYTES_MAX)];
+        assert!(db.apply_agent_state_job(&job).is_ok());
+        job.structured_workspace_ids = vec!["w".repeat(BOUNDED_ID_BYTES_MAX + 1)];
+        assert_eq!(
+            db.apply_agent_state_job(&job).unwrap_err().to_string(),
+            AGENT_STATE_INPUT_INVALID
+        );
+
+        job.structured_workspace_ids = vec!["') UNION SELECT 'hostile' --".to_owned()];
+        assert!(
+            db.apply_agent_state_job(&job)
+                .unwrap()
+                .structured_threads
+                .is_empty(),
+            "workspace IDs must remain bound values rather than SQL fragments"
+        );
+    }
+
+    #[test]
+    fn agent_state_catalog의_500_row상한은_workspace합계에_적용되고_rollback한다() {
+        let db = Db::open_in_memory().unwrap();
+        let first = db
+            .create_workspace("agent-state-catalog-limit-first")
+            .unwrap();
+        let second = db
+            .create_workspace("agent-state-catalog-limit-second")
+            .unwrap();
+        for index in 0..251 {
+            db.upsert_structured_thread(
+                &format!("first-{index}"),
+                &first,
+                &format!("thread-first-{index}"),
+                "title",
+                "",
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        }
+        for index in 0..250 {
+            db.upsert_structured_thread(
+                &format!("second-{index}"),
+                &second,
+                &format!("thread-second-{index}"),
+                "title",
+                "",
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        }
+
+        let mut job = AgentStateJob::projection(&first);
+        job.structured_workspace_ids = vec![first.clone(), second.clone()];
+        job.include_archived_threads = true;
+        job.structured_mutations
+            .push(StructuredThreadMutation::SetArchived {
+                local_session_id: "first-0".to_owned(),
+                archived: true,
+            });
+        assert_eq!(
+            db.apply_agent_state_job(&job).unwrap_err().to_string(),
+            BOUNDED_READ_LIMIT_EXCEEDED
+        );
+        assert!(
+            !db.list_structured_threads(&first, true)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.local_session_id == "first-0")
+                .unwrap()
+                .archived,
+            "projection admission failure must roll back earlier exact mutations"
+        );
+
+        assert!(db.delete_structured_thread("second-249").unwrap());
+        job.structured_mutations.clear();
+        assert_eq!(
+            db.apply_agent_state_job(&job)
+                .unwrap()
+                .structured_threads
+                .len(),
+            AGENT_STATE_STRUCTURED_PROJECTION_MAX
+        );
+    }
+
+    #[test]
+    fn agent_state_catalog의_4mib상한은_workspace합계에_적용되고_rollback한다() {
+        let db = Db::open_in_memory().unwrap();
+        let first = db
+            .create_workspace("agent-state-catalog-bytes-first")
+            .unwrap();
+        let second = db
+            .create_workspace("agent-state-catalog-bytes-second")
+            .unwrap();
+        for index in 0..129 {
+            let workspace_id = if index < 65 { &first } else { &second };
+            let local_session_id = format!("catalog-byte-local-{index}");
+            let thread_id = format!("catalog-byte-thread-{index}");
+            let title_bytes = STRUCTURED_THREAD_ROW_BYTES_MAX
+                - local_session_id.len()
+                - workspace_id.len()
+                - thread_id.len();
+            db.upsert_structured_thread(
+                &local_session_id,
+                workspace_id,
+                &thread_id,
+                &"x".repeat(title_bytes),
+                "",
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        }
+
+        let mut job = AgentStateJob::projection(&first);
+        job.structured_workspace_ids = vec![first.clone(), second.clone()];
+        job.structured_mutations
+            .push(StructuredThreadMutation::SetArchived {
+                local_session_id: "catalog-byte-local-0".to_owned(),
+                archived: true,
+            });
+        assert_eq!(
+            db.apply_agent_state_job(&job).unwrap_err().to_string(),
+            BOUNDED_READ_ROW_INVALID
+        );
+        assert!(
+            !db.list_structured_threads(&first, true)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.local_session_id == "catalog-byte-local-0")
+                .unwrap()
+                .archived,
+            "aggregate byte admission failure must roll back earlier exact mutations"
+        );
+
+        assert!(
+            db.delete_structured_thread("catalog-byte-local-128")
+                .unwrap()
+        );
+        job.structured_mutations.clear();
+        assert_eq!(
+            db.apply_agent_state_job(&job)
+                .unwrap()
+                .structured_threads
+                .len(),
+            128
+        );
+    }
+
+    #[test]
     fn agent_state_binding_reconcile은_exact_256과_plus_one을_검증한다() {
         let db = Db::open_in_memory().unwrap();
         let ws = db.create_workspace("agent-state-bindings").unwrap();
@@ -8936,6 +9275,7 @@ mod tests {
         let mutation = StructuredThreadMutation::Upsert(structured.clone());
         let job = AgentStateJob {
             workspace_id: marker.to_owned(),
+            structured_workspace_ids: vec![marker.to_owned()],
             binding_reconcile: Some(reconcile.clone()),
             stale_binding_deletes: vec![identity.clone()],
             turn_done_clears: vec![clear.clone()],

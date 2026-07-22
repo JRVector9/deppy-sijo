@@ -198,3 +198,18 @@ implementations expose only variant/count/presence information; hostile-marker t
 session, path, and structured-row content. Root verification passes focused 6/6, storage 195/195
 plus doc tests, strict all-target Clippy, scoped Rust-2024 fmt/check, and diff-check. The change adds
 no schema migration, dependency, or boundary allowlist.
+
+### Authoritative multi-workspace catalog amendment
+
+`AgentStateJob` now carries 1..=256 unique bounded workspace IDs for the structured catalog. One
+bound-value CTE applies a deterministic favorite/updated/workspace/local/rowid order across the
+complete request, then preflights and materializes at most 500 rows and 4 MiB in the same IMMEDIATE
+transaction as any exact mutation. Empty, duplicate, control-bearing, 257th, oversized, and
+SQL-hostile IDs fail closed or remain literal values. Exact 500 rows and exact 4 MiB pass; both +1
+boundaries fail before materialization and roll back an earlier exact mutation.
+
+Root verification passes focused AgentState 10/10, storage 199/199 plus doc tests, all-target
+check, strict all-feature Clippy, package fmt-check, and scoped diff-check. The full security scan
+also passes with the zero-allowlist boundary and 23-crate dependency laws unchanged. An initial
+`cargo xtask security-scan` shorthand failed because this checkout defines no Cargo alias; the
+canonical `cargo run -p xtask -- security-scan` command passed without a product workaround.

@@ -5,9 +5,10 @@ mod db;
 pub use db::{
     AGENT_STATE_BINDING_ROWS_MAX, AGENT_STATE_EXACT_MUTATIONS_MAX, AGENT_STATE_SNAPSHOT_BYTES_MAX,
     AGENT_STATE_STRUCTURED_MUTATION_BYTES_MAX, AGENT_STATE_STRUCTURED_MUTATIONS_MAX,
-    AGENT_STATE_STRUCTURED_PROJECTION_MAX, ActiveAuthorizationOwner, ActivePendingApprovalOwner,
-    AgentConfigRow, AgentSessionBindingReconcile, AgentSessionIdentity, AgentSessionRow,
-    AgentStateJob, AgentStateSnapshot, AgentTurnDoneClear, ApprovalOutcome, ApprovalStatus,
+    AGENT_STATE_STRUCTURED_PROJECTION_MAX, AGENT_STATE_STRUCTURED_WORKSPACE_MAX,
+    ActiveAuthorizationOwner, ActivePendingApprovalOwner, AgentConfigRow,
+    AgentSessionBindingReconcile, AgentSessionIdentity, AgentSessionRow, AgentStateJob,
+    AgentStateSnapshot, AgentTurnDoneClear, ApprovalOutcome, ApprovalStatus,
     CREDENTIAL_OAUTH_BINDING_BYTES_MAX, CREDENTIAL_SECRET_LOCATION_BYTES_MAX,
     CREDENTIAL_SECRET_RECORD_BYTES_MAX, ConnectorConfigCas, ConnectorConfigRead,
     ConnectorConfigRevision, CredentialMeta, CredentialOAuthBindingRecord,

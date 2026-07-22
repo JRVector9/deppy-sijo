@@ -182,3 +182,19 @@ String. Root switched the app adapters to the bounded APIs and preserves the pre
 snapshot on error. Storage passes 189/189 plus doc tests, app passes 792/792 with five explicit
 ignores, and logging policy passes 15/15. App/storage all-target check, strict Clippy, zero-allowlist
 boundary, the clean dependency DAG, full workspace fmt, diff-check, and security scan pass.
+
+## Agent-state aggregate transaction
+
+Agent-state persistence and projection now have one bounded IMMEDIATE transaction seam. The job
+applies generation-aware turn acknowledgements, identity-CAS stale binding deletes, a 256-pane
+authoritative reconcile, and at most 16 structured mutations retaining at most 512 KiB. It then
+preflights hook, status, waiting, turn, binding, and structured projections before materialization;
+the complete snapshot retains at most 4 MiB. Any mutation, corrupt projection, aggregate overflow,
+or commit failure returns no snapshot and rolls the whole job back. Live but temporarily
+undetected pane bindings remain recoverable and unchanged desired bindings do not churn timestamps.
+
+The job preserves the exact 1,024-byte workspace-ID bound and rejects +1. All new public DTO Debug
+implementations expose only variant/count/presence information; hostile-marker tests cover pane,
+session, path, and structured-row content. Root verification passes focused 6/6, storage 195/195
+plus doc tests, strict all-target Clippy, scoped Rust-2024 fmt/check, and diff-check. The change adds
+no schema migration, dependency, or boundary allowlist.

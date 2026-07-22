@@ -669,7 +669,7 @@ END;
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSessionRow {
     pub pane_id: String,
     /// "claude" | "codex".
@@ -692,6 +692,162 @@ pub struct StructuredThreadRow {
     pub archived: bool,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// One persisted PTY-agent binding that may be removed only while all identity fields still
+/// match. This prevents a delayed worker job from deleting a newer binding for the same pane.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AgentSessionIdentity {
+    pub pane_id: String,
+    pub kind: String,
+    pub session_id: String,
+}
+
+impl std::fmt::Debug for AgentSessionIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentSessionIdentity")
+            .field("state", &"elided")
+            .finish()
+    }
+}
+
+/// Full desired-state input for one authoritative live-pane observation. Rows for panes that are
+/// no longer live are removed, desired bindings are upserted, and existing bindings for live but
+/// currently undetected panes are preserved for restart recovery.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AgentSessionBindingReconcile {
+    pub live_pane_ids: Vec<String>,
+    pub desired_bindings: Vec<AgentSessionRow>,
+}
+
+impl std::fmt::Debug for AgentSessionBindingReconcile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentSessionBindingReconcile")
+            .field("live_pane_count", &self.live_pane_ids.len())
+            .field("desired_binding_count", &self.desired_bindings.len())
+            .finish()
+    }
+}
+
+/// Generation-aware acknowledgement for one hook-reported completed turn.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AgentTurnDoneClear {
+    pub session_key: String,
+    pub seen_at: i64,
+}
+
+impl std::fmt::Debug for AgentTurnDoneClear {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentTurnDoneClear")
+            .field("has_generation", &true)
+            .finish()
+    }
+}
+
+/// Storage-owned structured-thread mutations accepted by [`Db::apply_agent_state_job`].
+///
+/// The batch is validated in full before SQLite is touched and is committed atomically. Debug
+/// output deliberately exposes only the variant so titles, paths, and provider identifiers do not
+/// leak into diagnostics.
+#[derive(Clone, PartialEq, Eq)]
+pub enum StructuredThreadMutation {
+    Upsert(StructuredThreadRow),
+    SetArchived {
+        local_session_id: String,
+        archived: bool,
+    },
+    Delete {
+        local_session_id: String,
+    },
+}
+
+impl std::fmt::Debug for StructuredThreadMutation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            Self::Upsert(_) => "upsert",
+            Self::SetArchived { .. } => "set_archived",
+            Self::Delete { .. } => "delete",
+        };
+        formatter
+            .debug_struct("StructuredThreadMutation")
+            .field("kind", &kind)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One capacity-one AgentStateWorker storage job. Empty mutation vectors make this a projection-
+/// only refresh; otherwise every exact mutation and the returned projection share one IMMEDIATE
+/// SQLite transaction. Callers must not retry an indeterminate delivery merely because the
+/// returned static error code is retryable at a later user/event boundary.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AgentStateJob {
+    pub workspace_id: String,
+    pub binding_reconcile: Option<AgentSessionBindingReconcile>,
+    pub stale_binding_deletes: Vec<AgentSessionIdentity>,
+    pub turn_done_clears: Vec<AgentTurnDoneClear>,
+    pub structured_mutations: Vec<StructuredThreadMutation>,
+    pub include_archived_threads: bool,
+}
+
+impl AgentStateJob {
+    pub fn projection(workspace_id: impl Into<String>) -> Self {
+        Self {
+            workspace_id: workspace_id.into(),
+            binding_reconcile: None,
+            stale_binding_deletes: Vec::new(),
+            turn_done_clears: Vec::new(),
+            structured_mutations: Vec::new(),
+            include_archived_threads: true,
+        }
+    }
+}
+
+impl std::fmt::Debug for AgentStateJob {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentStateJob")
+            .field("has_binding_reconcile", &self.binding_reconcile.is_some())
+            .field(
+                "stale_binding_delete_count",
+                &self.stale_binding_deletes.len(),
+            )
+            .field("turn_done_clear_count", &self.turn_done_clears.len())
+            .field(
+                "structured_mutation_count",
+                &self.structured_mutations.len(),
+            )
+            .field("include_archived_threads", &self.include_archived_threads)
+            .finish()
+    }
+}
+
+/// Complete-or-error bounded projection returned after an [`AgentStateJob`] commits. Every row is
+/// read from the same transaction snapshot and total retained string bytes are capped globally.
+#[derive(Clone, PartialEq)]
+pub struct AgentStateSnapshot {
+    pub hook_sessions: Vec<HookSessionRow>,
+    pub statuslines: Vec<StatuslineRow>,
+    pub waiting_sessions: Vec<(String, Option<String>)>,
+    pub turn_done_sessions: Vec<(String, i64)>,
+    pub agent_sessions: Vec<AgentSessionRow>,
+    pub structured_threads: Vec<StructuredThreadRow>,
+}
+
+impl std::fmt::Debug for AgentStateSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentStateSnapshot")
+            .field("hook_session_count", &self.hook_sessions.len())
+            .field("statusline_count", &self.statuslines.len())
+            .field("waiting_session_count", &self.waiting_sessions.len())
+            .field("turn_done_session_count", &self.turn_done_sessions.len())
+            .field("agent_session_count", &self.agent_sessions.len())
+            .field("structured_thread_count", &self.structured_threads.len())
+            .finish()
+    }
 }
 
 const STRUCTURED_THREAD_ID_BYTES_MAX: usize = 1024;
@@ -772,6 +928,50 @@ const STRUCTURED_THREADS_BOUNDED_QUERY: &str = "WITH selected AS MATERIALIZED (
         AND validation.retained_bytes BETWEEN 0 AND ?8
         AND thread.rowid = selected.rowid
       ORDER BY row_kind, favorite DESC, updated_at DESC, local_session_id";
+
+const AGENT_STATE_STRUCTURED_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
+        SELECT rowid
+          FROM structured_threads
+         WHERE workspace_id = ?1 AND (?2 = 1 OR archived = 0)
+         ORDER BY favorite DESC, updated_at DESC,
+                  substr(CAST(local_session_id AS BLOB), 1, ?4), rowid
+         LIMIT ?3
+     ), sized AS MATERIALIZED (
+        SELECT thread.*,
+               length(CAST(thread.local_session_id AS BLOB))
+               + length(CAST(thread.workspace_id AS BLOB))
+               + length(CAST(thread.thread_id AS BLOB))
+               + length(CAST(thread.title AS BLOB))
+               + length(CAST(thread.cwd AS BLOB))
+               + COALESCE(length(CAST(thread.model AS BLOB)), 0) AS row_bytes
+          FROM selected
+          JOIN structured_threads AS thread ON thread.rowid = selected.rowid
+     )
+     SELECT COUNT(*), COALESCE(SUM(CASE WHEN
+                typeof(local_session_id) != 'text'
+             OR length(CAST(local_session_id AS BLOB)) NOT BETWEEN 1 AND ?4
+             OR typeof(workspace_id) != 'text'
+             OR length(CAST(workspace_id AS BLOB)) NOT BETWEEN 1 AND ?4
+             OR typeof(thread_id) != 'text'
+             OR length(CAST(thread_id AS BLOB)) NOT BETWEEN 1 AND ?4
+             OR typeof(title) != 'text'
+             OR typeof(cwd) != 'text' OR length(CAST(cwd AS BLOB)) > ?5
+             OR typeof(model) NOT IN ('null', 'text')
+             OR (typeof(model) = 'text' AND length(CAST(model AS BLOB)) > ?6)
+             OR typeof(favorite) != 'integer' OR favorite NOT IN (0, 1)
+             OR typeof(archived) != 'integer' OR archived NOT IN (0, 1)
+             OR typeof(created_at) != 'integer' OR typeof(updated_at) != 'integer'
+             OR row_bytes > ?7 THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+       FROM sized";
+
+const AGENT_STATE_STRUCTURED_SELECT: &str = "SELECT local_session_id, workspace_id,
+       thread_id, title, cwd, model, favorite, archived, created_at, updated_at
+  FROM structured_threads
+ WHERE workspace_id = ?1 AND (?2 = 1 OR archived = 0)
+ ORDER BY favorite DESC, updated_at DESC,
+          substr(CAST(local_session_id AS BLOB), 1, ?4), rowid
+ LIMIT ?3";
 
 fn structured_thread_id_is_valid(value: &str) -> bool {
     !value.is_empty()
@@ -880,6 +1080,18 @@ const ENV_API_PROJECT_ROWS_MAX: usize = 256;
 const HOOK_PREFIX_ROWS_MAX: usize = 256;
 const WAITING_SESSION_ROWS_MAX: usize = 4_096;
 const AGENT_SESSION_ROWS_MAX: usize = 256;
+/// Maximum authoritative live panes and desired bindings accepted by one worker job.
+pub const AGENT_STATE_BINDING_ROWS_MAX: usize = AGENT_SESSION_ROWS_MAX;
+/// Exact acknowledgement/CAS continuations accepted in each category per worker job.
+pub const AGENT_STATE_EXACT_MUTATIONS_MAX: usize = 8;
+/// Maximum structured-thread mutations committed as one all-or-nothing batch.
+pub const AGENT_STATE_STRUCTURED_MUTATIONS_MAX: usize = 16;
+/// Aggregate structured-thread mutation payload retained by one job.
+pub const AGENT_STATE_STRUCTURED_MUTATION_BYTES_MAX: usize = 512 * 1024;
+/// Maximum structured rows returned for the active workspace.
+pub const AGENT_STATE_STRUCTURED_PROJECTION_MAX: usize = 500;
+/// Aggregate retained string bytes across every section of one worker snapshot.
+pub const AGENT_STATE_SNAPSHOT_BYTES_MAX: usize = 4 * 1024 * 1024;
 const ACTIVITY_PANE_ROWS_MAX: usize = 256 * 256;
 const WEB_PUSH_SUBSCRIPTION_ROWS_MAX: usize = 8;
 const WEB_PUSH_RETAINED_BYTES_MAX: usize = 64 * 1024;
@@ -890,6 +1102,9 @@ const BOUNDED_READ_QUERY_FAILED: &str = "bounded read query failed";
 const BOUNDED_WRITE_INPUT_INVALID: &str = "bounded write input invalid";
 const BOUNDED_WRITE_FAILED: &str = "bounded write failed";
 const AGENT_SESSION_CAPACITY_EXCEEDED: &str = "agent session capacity exceeded";
+const AGENT_STATE_INPUT_INVALID: &str = "agent state input invalid";
+const AGENT_STATE_PERSIST_FAILED: &str = "agent state persistence failed";
+const AGENT_STATE_SNAPSHOT_INVALID: &str = "agent state snapshot invalid";
 
 const ENV_PROFILES_BOUNDED_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
     SELECT rowid FROM env_profiles WHERE workspace_id = ?1
@@ -1159,6 +1374,7 @@ const WEB_PUSH_BOUNDED_SELECT: &str = "SELECT endpoint, p256dh, auth
 #[derive(Debug, Clone, Copy)]
 struct BoundedReadProbe {
     count: usize,
+    retained_bytes: usize,
 }
 
 fn bounded_id_is_valid(value: &str) -> bool {
@@ -1246,7 +1462,10 @@ fn bounded_read_preflight_with_budget<P: rusqlite::Params>(
             && max_row_bytes <= BOUNDED_ROW_BYTES_MAX,
         BOUNDED_READ_ROW_INVALID
     );
-    Ok(BoundedReadProbe { count })
+    Ok(BoundedReadProbe {
+        count,
+        retained_bytes,
+    })
 }
 
 fn bounded_snapshot_epoch(conn: &Connection) -> anyhow::Result<i64> {
@@ -1322,6 +1541,128 @@ fn bounded_optional_integer(row: &rusqlite::Row<'_>, index: usize) -> anyhow::Re
         rusqlite::types::ValueRef::Integer(value) => Ok(Some(value)),
         _ => anyhow::bail!(BOUNDED_READ_ROW_INVALID),
     }
+}
+
+fn agent_session_identity_input_bytes(
+    pane_id: &str,
+    kind: &str,
+    session_id: &str,
+) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        bounded_id_is_valid(pane_id)
+            && bounded_id_is_valid(session_id)
+            && !kind.is_empty()
+            && bounded_text_is_valid(kind, BOUNDED_TEXT_BYTES_MAX),
+        AGENT_STATE_INPUT_INVALID
+    );
+    bounded_input_row_bytes(&[pane_id, kind, session_id])
+        .map_err(|_| anyhow::anyhow!(AGENT_STATE_INPUT_INVALID))
+}
+
+fn agent_session_row_input_bytes(row: &AgentSessionRow) -> anyhow::Result<usize> {
+    agent_session_identity_input_bytes(&row.pane_id, &row.kind, &row.session_id)
+}
+
+fn validate_agent_state_job(job: &AgentStateJob) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        bounded_id_is_valid(&job.workspace_id)
+            && job.stale_binding_deletes.len() <= AGENT_STATE_EXACT_MUTATIONS_MAX
+            && job.turn_done_clears.len() <= AGENT_STATE_EXACT_MUTATIONS_MAX
+            && job.structured_mutations.len() <= AGENT_STATE_STRUCTURED_MUTATIONS_MAX,
+        AGENT_STATE_INPUT_INVALID
+    );
+    let workspace_prefix = format!("{}:", job.workspace_id);
+
+    let mut retained_input_bytes = job.workspace_id.len();
+    if let Some(reconcile) = &job.binding_reconcile {
+        anyhow::ensure!(
+            reconcile.live_pane_ids.len() <= AGENT_STATE_BINDING_ROWS_MAX
+                && reconcile.desired_bindings.len() <= AGENT_STATE_BINDING_ROWS_MAX,
+            AGENT_STATE_INPUT_INVALID
+        );
+        let mut live = std::collections::HashSet::with_capacity(reconcile.live_pane_ids.len());
+        for pane_id in &reconcile.live_pane_ids {
+            anyhow::ensure!(
+                bounded_id_is_valid(pane_id) && live.insert(pane_id.as_str()),
+                AGENT_STATE_INPUT_INVALID
+            );
+            retained_input_bytes = retained_input_bytes
+                .checked_add(pane_id.len())
+                .ok_or_else(|| anyhow::anyhow!(AGENT_STATE_INPUT_INVALID))?;
+        }
+        let mut desired =
+            std::collections::HashSet::with_capacity(reconcile.desired_bindings.len());
+        for row in &reconcile.desired_bindings {
+            anyhow::ensure!(
+                live.contains(row.pane_id.as_str()) && desired.insert(row.pane_id.as_str()),
+                AGENT_STATE_INPUT_INVALID
+            );
+            retained_input_bytes = retained_input_bytes
+                .checked_add(agent_session_row_input_bytes(row)?)
+                .ok_or_else(|| anyhow::anyhow!(AGENT_STATE_INPUT_INVALID))?;
+        }
+    }
+
+    for identity in &job.stale_binding_deletes {
+        retained_input_bytes = retained_input_bytes
+            .checked_add(agent_session_identity_input_bytes(
+                &identity.pane_id,
+                &identity.kind,
+                &identity.session_id,
+            )?)
+            .ok_or_else(|| anyhow::anyhow!(AGENT_STATE_INPUT_INVALID))?;
+    }
+    for clear in &job.turn_done_clears {
+        anyhow::ensure!(
+            clear.seen_at >= 0
+                && bounded_session_key_prefix(&clear.session_key)
+                    .is_ok_and(|prefix| prefix == workspace_prefix),
+            AGENT_STATE_INPUT_INVALID
+        );
+        retained_input_bytes = retained_input_bytes
+            .checked_add(clear.session_key.len())
+            .ok_or_else(|| anyhow::anyhow!(AGENT_STATE_INPUT_INVALID))?;
+    }
+
+    let mut structured_bytes = 0usize;
+    for mutation in &job.structured_mutations {
+        let mutation_bytes = match mutation {
+            StructuredThreadMutation::Upsert(row) => structured_thread_input_bytes(
+                &row.local_session_id,
+                &row.workspace_id,
+                &row.thread_id,
+                &row.title,
+                &row.cwd,
+                row.model.as_deref(),
+            )
+            .map_err(|_| anyhow::anyhow!(AGENT_STATE_INPUT_INVALID))?,
+            StructuredThreadMutation::SetArchived {
+                local_session_id, ..
+            }
+            | StructuredThreadMutation::Delete { local_session_id } => {
+                anyhow::ensure!(
+                    structured_thread_id_is_valid(local_session_id),
+                    AGENT_STATE_INPUT_INVALID
+                );
+                local_session_id.len()
+            }
+        };
+        structured_bytes = structured_bytes
+            .checked_add(mutation_bytes)
+            .ok_or_else(|| anyhow::anyhow!(AGENT_STATE_INPUT_INVALID))?;
+    }
+    anyhow::ensure!(
+        structured_bytes <= AGENT_STATE_STRUCTURED_MUTATION_BYTES_MAX,
+        AGENT_STATE_INPUT_INVALID
+    );
+    retained_input_bytes = retained_input_bytes
+        .checked_add(structured_bytes)
+        .ok_or_else(|| anyhow::anyhow!(AGENT_STATE_INPUT_INVALID))?;
+    anyhow::ensure!(
+        retained_input_bytes <= BOUNDED_RETAINED_BYTES_MAX,
+        AGENT_STATE_INPUT_INVALID
+    );
+    Ok(workspace_prefix)
 }
 
 #[derive(Clone, Copy)]
@@ -4617,6 +4958,518 @@ impl Db {
         Ok(result)
     }
 
+    /// Applies one bounded AgentStateWorker job and returns the complete post-mutation projection
+    /// from the same IMMEDIATE SQLite transaction. Projection validation happens before any output
+    /// String/Vec materialization; if a row is corrupt, a section exceeds its item limit, the
+    /// aggregate snapshot exceeds its byte limit, or commit fails, all job mutations roll back.
+    pub fn apply_agent_state_job(&self, job: &AgentStateJob) -> anyhow::Result<AgentStateSnapshot> {
+        let workspace_prefix = validate_agent_state_job(job)?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
+
+        // Exact delayed deletes must never erase a newer identity for the same pane.
+        for identity in &job.stale_binding_deletes {
+            tx.execute(
+                "DELETE FROM agent_sessions
+                  WHERE workspace_id = ?1 AND pane_id = ?2 AND kind = ?3 AND session_id = ?4",
+                rusqlite::params![
+                    job.workspace_id,
+                    identity.pane_id,
+                    identity.kind,
+                    identity.session_id,
+                ],
+            )
+            .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
+        }
+
+        // Acknowledgements are generation-aware: a newer hook update remains visible.
+        for clear in &job.turn_done_clears {
+            tx.execute(
+                "UPDATE agent_needs_input SET turn_done = 0
+                  WHERE session_key = ?1 AND updated_at <= ?2",
+                rusqlite::params![clear.session_key, clear.seen_at],
+            )
+            .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
+        }
+
+        for mutation in &job.structured_mutations {
+            match mutation {
+                StructuredThreadMutation::Upsert(row) => {
+                    tx.execute(
+                        "INSERT INTO structured_threads
+                            (local_session_id, workspace_id, thread_id, title, cwd, model,
+                             favorite, archived, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                                 CAST(strftime('%s','now') AS INTEGER),
+                                 CAST(strftime('%s','now') AS INTEGER))
+                         ON CONFLICT(local_session_id) DO UPDATE SET
+                            workspace_id = excluded.workspace_id,
+                            thread_id = excluded.thread_id,
+                            title = excluded.title,
+                            cwd = excluded.cwd,
+                            model = excluded.model,
+                            favorite = excluded.favorite,
+                            archived = excluded.archived,
+                            updated_at = CAST(strftime('%s','now') AS INTEGER)",
+                        rusqlite::params![
+                            row.local_session_id,
+                            row.workspace_id,
+                            row.thread_id,
+                            row.title,
+                            row.cwd,
+                            row.model,
+                            row.favorite as i64,
+                            row.archived as i64,
+                        ],
+                    )
+                    .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
+                }
+                StructuredThreadMutation::SetArchived {
+                    local_session_id,
+                    archived,
+                } => {
+                    tx.execute(
+                        "UPDATE structured_threads
+                            SET archived = ?2,
+                                updated_at = CAST(strftime('%s','now') AS INTEGER)
+                          WHERE local_session_id = ?1",
+                        rusqlite::params![local_session_id, *archived as i64],
+                    )
+                    .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
+                }
+                StructuredThreadMutation::Delete { local_session_id } => {
+                    tx.execute(
+                        "DELETE FROM structured_threads WHERE local_session_id = ?1",
+                        [local_session_id],
+                    )
+                    .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
+                }
+            }
+        }
+
+        if let Some(reconcile) = &job.binding_reconcile {
+            let live = reconcile
+                .live_pane_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<std::collections::HashSet<_>>();
+            let sql_limit =
+                bounded_limit_plus_one(AGENT_STATE_BINDING_ROWS_MAX, AGENT_SESSION_ROWS_MAX)
+                    .map_err(|_| anyhow::anyhow!(AGENT_STATE_INPUT_INVALID))?;
+            let probe = bounded_read_preflight(
+                &tx,
+                AGENT_SESSIONS_BOUNDED_PREFLIGHT,
+                rusqlite::params![
+                    job.workspace_id,
+                    sql_limit,
+                    BOUNDED_ID_BYTES_MAX as i64,
+                    BOUNDED_TEXT_BYTES_MAX as i64,
+                    BOUNDED_ROW_BYTES_MAX as i64,
+                ],
+                AGENT_STATE_BINDING_ROWS_MAX,
+            )?;
+            let mut existing = Vec::with_capacity(probe.count);
+            {
+                let mut stmt = tx
+                    .prepare(AGENT_SESSIONS_BOUNDED_SELECT)
+                    .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
+                let mut rows = stmt
+                    .query(rusqlite::params![
+                        job.workspace_id,
+                        sql_limit,
+                        BOUNDED_ID_BYTES_MAX as i64,
+                    ])
+                    .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
+                while let Some(row) = rows
+                    .next()
+                    .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?
+                {
+                    existing.push(AgentSessionRow {
+                        pane_id: bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?
+                            .to_owned(),
+                        kind: bounded_required_text(row, 1, BOUNDED_TEXT_BYTES_MAX, true, false)?
+                            .to_owned(),
+                        session_id: bounded_required_text(
+                            row,
+                            2,
+                            BOUNDED_ID_BYTES_MAX,
+                            true,
+                            true,
+                        )?
+                        .to_owned(),
+                    });
+                }
+            }
+            for row in existing
+                .iter()
+                .filter(|row| !live.contains(row.pane_id.as_str()))
+            {
+                tx.execute(
+                    "DELETE FROM agent_sessions
+                      WHERE workspace_id = ?1 AND pane_id = ?2 AND kind = ?3 AND session_id = ?4",
+                    rusqlite::params![job.workspace_id, row.pane_id, row.kind, row.session_id,],
+                )
+                .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
+            }
+            for row in &reconcile.desired_bindings {
+                tx.execute(
+                    "INSERT INTO agent_sessions
+                           (workspace_id, pane_id, kind, session_id, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, CAST(strftime('%s','now') AS INTEGER))
+                         ON CONFLICT(workspace_id, pane_id) DO UPDATE SET
+                           kind = excluded.kind,
+                           session_id = excluded.session_id,
+                           updated_at = excluded.updated_at
+                         WHERE agent_sessions.kind != excluded.kind
+                            OR agent_sessions.session_id != excluded.session_id",
+                    rusqlite::params![job.workspace_id, row.pane_id, row.kind, row.session_id],
+                )
+                .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
+            }
+        }
+
+        let snapshot_epoch = bounded_snapshot_epoch(&tx)?;
+        let hook_sql_limit = bounded_limit_plus_one(HOOK_PREFIX_ROWS_MAX, HOOK_PREFIX_ROWS_MAX)?;
+        let waiting_sql_limit =
+            bounded_limit_plus_one(WAITING_SESSION_ROWS_MAX, WAITING_SESSION_ROWS_MAX)?;
+        let agent_sql_limit =
+            bounded_limit_plus_one(AGENT_SESSION_ROWS_MAX, AGENT_SESSION_ROWS_MAX)?;
+        let structured_sql_limit = bounded_limit_plus_one(
+            AGENT_STATE_STRUCTURED_PROJECTION_MAX,
+            AGENT_STATE_STRUCTURED_PROJECTION_MAX,
+        )?;
+
+        // Preflight every section before materializing the first output allocation.
+        let hook_probe = bounded_read_preflight(
+            &tx,
+            HOOK_SESSIONS_PREFIX_PREFLIGHT,
+            rusqlite::params![
+                workspace_prefix,
+                hook_sql_limit,
+                BOUNDED_ID_BYTES_MAX as i64,
+                BOUNDED_TEXT_BYTES_MAX as i64,
+                BOUNDED_ROW_BYTES_MAX as i64,
+                snapshot_epoch,
+            ],
+            HOOK_PREFIX_ROWS_MAX,
+        )?;
+        let status_probe = bounded_read_preflight(
+            &tx,
+            STATUSLINES_PREFIX_PREFLIGHT,
+            rusqlite::params![
+                workspace_prefix,
+                hook_sql_limit,
+                BOUNDED_ID_BYTES_MAX as i64,
+                BOUNDED_TEXT_BYTES_MAX as i64,
+                BOUNDED_ROW_BYTES_MAX as i64,
+                snapshot_epoch,
+            ],
+            HOOK_PREFIX_ROWS_MAX,
+        )?;
+        let waiting_probe = bounded_read_preflight(
+            &tx,
+            WAITING_SESSIONS_PREFLIGHT,
+            rusqlite::params![
+                waiting_sql_limit,
+                BOUNDED_ID_BYTES_MAX as i64,
+                BOUNDED_MESSAGE_BYTES_MAX as i64,
+                BOUNDED_ROW_BYTES_MAX as i64,
+                snapshot_epoch,
+            ],
+            WAITING_SESSION_ROWS_MAX,
+        )?;
+        let turn_probe = bounded_read_preflight(
+            &tx,
+            TURN_DONE_PREFIX_PREFLIGHT,
+            rusqlite::params![
+                workspace_prefix,
+                hook_sql_limit,
+                BOUNDED_ID_BYTES_MAX as i64,
+                BOUNDED_ROW_BYTES_MAX as i64,
+                snapshot_epoch,
+            ],
+            HOOK_PREFIX_ROWS_MAX,
+        )?;
+        let agent_probe = bounded_read_preflight(
+            &tx,
+            AGENT_SESSIONS_BOUNDED_PREFLIGHT,
+            rusqlite::params![
+                job.workspace_id,
+                agent_sql_limit,
+                BOUNDED_ID_BYTES_MAX as i64,
+                BOUNDED_TEXT_BYTES_MAX as i64,
+                BOUNDED_ROW_BYTES_MAX as i64,
+            ],
+            AGENT_SESSION_ROWS_MAX,
+        )?;
+        let structured_probe = bounded_read_preflight(
+            &tx,
+            AGENT_STATE_STRUCTURED_PREFLIGHT,
+            rusqlite::params![
+                job.workspace_id,
+                job.include_archived_threads as i64,
+                structured_sql_limit,
+                STRUCTURED_THREAD_ID_BYTES_MAX as i64,
+                STRUCTURED_THREAD_CWD_BYTES_MAX as i64,
+                STRUCTURED_THREAD_MODEL_BYTES_MAX as i64,
+                STRUCTURED_THREAD_ROW_BYTES_MAX as i64,
+            ],
+            AGENT_STATE_STRUCTURED_PROJECTION_MAX,
+        )?;
+        let retained_bytes = [
+            hook_probe.retained_bytes,
+            status_probe.retained_bytes,
+            waiting_probe.retained_bytes,
+            turn_probe.retained_bytes,
+            agent_probe.retained_bytes,
+            structured_probe.retained_bytes,
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+        .ok_or_else(|| anyhow::anyhow!(AGENT_STATE_SNAPSHOT_INVALID))?;
+        anyhow::ensure!(
+            retained_bytes <= AGENT_STATE_SNAPSHOT_BYTES_MAX,
+            AGENT_STATE_SNAPSHOT_INVALID
+        );
+
+        let hook_sessions = {
+            let mut result = Vec::with_capacity(hook_probe.count);
+            let mut stmt = tx
+                .prepare(HOOK_SESSIONS_PREFIX_SELECT)
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            let mut rows = stmt
+                .query(rusqlite::params![
+                    workspace_prefix,
+                    hook_sql_limit,
+                    BOUNDED_ID_BYTES_MAX as i64,
+                    snapshot_epoch,
+                ])
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+            {
+                result.push(HookSessionRow {
+                    session_key: bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?
+                        .to_owned(),
+                    kind: bounded_required_text(row, 1, BOUNDED_TEXT_BYTES_MAX, true, false)?
+                        .to_owned(),
+                    agent_session_id: bounded_required_text(
+                        row,
+                        2,
+                        BOUNDED_ID_BYTES_MAX,
+                        true,
+                        true,
+                    )?
+                    .to_owned(),
+                    transcript_path: bounded_required_text(
+                        row,
+                        3,
+                        BOUNDED_TEXT_BYTES_MAX,
+                        false,
+                        false,
+                    )?
+                    .to_owned(),
+                });
+            }
+            result
+        };
+        let statuslines = {
+            let mut result = Vec::with_capacity(status_probe.count);
+            let mut stmt = tx
+                .prepare(STATUSLINES_PREFIX_SELECT)
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            let mut rows = stmt
+                .query(rusqlite::params![
+                    workspace_prefix,
+                    hook_sql_limit,
+                    BOUNDED_ID_BYTES_MAX as i64,
+                    snapshot_epoch,
+                ])
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+            {
+                result.push(StatuslineRow {
+                    session_key: bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?
+                        .to_owned(),
+                    effort: bounded_optional_text(row, 1, BOUNDED_TEXT_BYTES_MAX)?
+                        .map(str::to_owned),
+                    model: bounded_optional_text(row, 2, BOUNDED_TEXT_BYTES_MAX)?
+                        .map(str::to_owned),
+                    context_pct: bounded_optional_integer(row, 3)?,
+                });
+            }
+            result
+        };
+        let waiting_sessions = {
+            let mut result = Vec::with_capacity(waiting_probe.count);
+            let mut stmt = tx
+                .prepare(WAITING_SESSIONS_SELECT)
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            let mut rows = stmt
+                .query(rusqlite::params![
+                    waiting_sql_limit,
+                    BOUNDED_ID_BYTES_MAX as i64,
+                    snapshot_epoch,
+                ])
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+            {
+                result.push((
+                    bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?.to_owned(),
+                    bounded_optional_text(row, 1, BOUNDED_MESSAGE_BYTES_MAX)?.map(str::to_owned),
+                ));
+            }
+            result
+        };
+        let turn_done_sessions = {
+            let mut result = Vec::with_capacity(turn_probe.count);
+            let mut stmt = tx
+                .prepare(TURN_DONE_PREFIX_SELECT)
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            let mut rows = stmt
+                .query(rusqlite::params![
+                    workspace_prefix,
+                    hook_sql_limit,
+                    BOUNDED_ID_BYTES_MAX as i64,
+                    snapshot_epoch,
+                ])
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+            {
+                result.push((
+                    bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?.to_owned(),
+                    bounded_integer(row, 1)?,
+                ));
+            }
+            result
+        };
+        let agent_sessions = {
+            let mut result = Vec::with_capacity(agent_probe.count);
+            let mut stmt = tx
+                .prepare(AGENT_SESSIONS_BOUNDED_SELECT)
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            let mut rows = stmt
+                .query(rusqlite::params![
+                    job.workspace_id,
+                    agent_sql_limit,
+                    BOUNDED_ID_BYTES_MAX as i64,
+                ])
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+            {
+                result.push(AgentSessionRow {
+                    pane_id: bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?
+                        .to_owned(),
+                    kind: bounded_required_text(row, 1, BOUNDED_TEXT_BYTES_MAX, true, false)?
+                        .to_owned(),
+                    session_id: bounded_required_text(row, 2, BOUNDED_ID_BYTES_MAX, true, true)?
+                        .to_owned(),
+                });
+            }
+            result
+        };
+        let structured_threads = {
+            let mut result = Vec::with_capacity(structured_probe.count);
+            let mut stmt = tx
+                .prepare(AGENT_STATE_STRUCTURED_SELECT)
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            let mut rows = stmt
+                .query(rusqlite::params![
+                    job.workspace_id,
+                    job.include_archived_threads as i64,
+                    structured_sql_limit,
+                    STRUCTURED_THREAD_ID_BYTES_MAX as i64,
+                ])
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+            {
+                let local_session_id = structured_thread_required_text(
+                    row,
+                    0,
+                    STRUCTURED_THREAD_ID_BYTES_MAX,
+                    true,
+                    true,
+                    false,
+                )?;
+                let workspace_id = structured_thread_required_text(
+                    row,
+                    1,
+                    STRUCTURED_THREAD_ID_BYTES_MAX,
+                    true,
+                    true,
+                    false,
+                )?;
+                let thread_id = structured_thread_required_text(
+                    row,
+                    2,
+                    STRUCTURED_THREAD_ID_BYTES_MAX,
+                    true,
+                    true,
+                    false,
+                )?;
+                let title = structured_thread_required_text(
+                    row,
+                    3,
+                    STRUCTURED_THREAD_ROW_BYTES_MAX,
+                    false,
+                    false,
+                    false,
+                )?;
+                let cwd = structured_thread_required_text(
+                    row,
+                    4,
+                    STRUCTURED_THREAD_CWD_BYTES_MAX,
+                    false,
+                    false,
+                    true,
+                )?;
+                let model =
+                    structured_thread_optional_text(row, 5, STRUCTURED_THREAD_MODEL_BYTES_MAX)?;
+                let favorite = structured_thread_integer(row, 6)?;
+                let archived = structured_thread_integer(row, 7)?;
+                anyhow::ensure!(
+                    matches!(favorite, 0 | 1) && matches!(archived, 0 | 1),
+                    AGENT_STATE_SNAPSHOT_INVALID
+                );
+                result.push(StructuredThreadRow {
+                    local_session_id: local_session_id.to_owned(),
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    title: title.to_owned(),
+                    cwd: cwd.to_owned(),
+                    model: model.map(str::to_owned),
+                    favorite: favorite != 0,
+                    archived: archived != 0,
+                    created_at: structured_thread_integer(row, 8)?,
+                    updated_at: structured_thread_integer(row, 9)?,
+                });
+            }
+            result
+        };
+
+        tx.commit()
+            .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
+        Ok(AgentStateSnapshot {
+            hook_sessions,
+            statuslines,
+            waiting_sessions,
+            turn_done_sessions,
+            agent_sessions,
+            structured_threads,
+        })
+    }
+
     /// 구조화 Codex thread 메타데이터를 저장한다. local/thread ID는 모두 durable하며,
     /// 갱신 시 created_at은 보존하고 updated_at만 현재 시각으로 올린다.
     #[allow(clippy::too_many_arguments)]
@@ -7889,6 +8742,455 @@ mod tests {
                 .to_string(),
             STRUCTURED_THREAD_ROW_INVALID
         );
+    }
+
+    fn agent_state_structured_row(
+        workspace_id: &str,
+        index: usize,
+        title: String,
+    ) -> StructuredThreadRow {
+        StructuredThreadRow {
+            local_session_id: format!("local-{index}"),
+            workspace_id: workspace_id.to_owned(),
+            thread_id: format!("thread-{index}"),
+            title,
+            cwd: String::new(),
+            model: None,
+            favorite: false,
+            archived: false,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn agent_state_job은_mutation뒤_complete_projection을_한_transaction에서_반환한다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("agent-state-aggregate").unwrap();
+        db.upsert_agent_session(&ws, "pane-dead", "claude", "dead")
+            .unwrap();
+        db.upsert_agent_session(&ws, "pane-preserved", "claude", "preserved")
+            .unwrap();
+        db.upsert_agent_session(&ws, "pane-desired", "codex", "desired")
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE agent_sessions SET updated_at = 7
+                  WHERE workspace_id = ?1 AND pane_id = 'pane-desired'",
+                [&ws],
+            )
+            .unwrap();
+        let session_key = format!("{ws}:1");
+        db.upsert_hook_session(&session_key, "claude", "hook-id", "/tmp/transcript")
+            .unwrap();
+        db.upsert_statusline(&session_key, Some("high"), Some("model"), Some(55))
+            .unwrap();
+        db.set_agent_needs_input(&session_key, true, Some("waiting"))
+            .unwrap();
+        db.set_agent_turn_done(&session_key).unwrap();
+        let seen_at = db.list_turn_done_sessions().unwrap()[0].1;
+        db.upsert_structured_thread(
+            "local-structured",
+            &ws,
+            "thread-structured",
+            "title",
+            "/repo",
+            Some("model"),
+            false,
+            false,
+        )
+        .unwrap();
+
+        let mut job = AgentStateJob::projection(&ws);
+        job.binding_reconcile = Some(AgentSessionBindingReconcile {
+            live_pane_ids: vec!["pane-preserved".to_owned(), "pane-desired".to_owned()],
+            // Same desired identity must be a true no-op, including updated_at.
+            desired_bindings: vec![AgentSessionRow {
+                pane_id: "pane-desired".to_owned(),
+                kind: "codex".to_owned(),
+                session_id: "desired".to_owned(),
+            }],
+        });
+        job.turn_done_clears.push(AgentTurnDoneClear {
+            session_key: session_key.clone(),
+            seen_at,
+        });
+        job.structured_mutations
+            .push(StructuredThreadMutation::SetArchived {
+                local_session_id: "local-structured".to_owned(),
+                archived: true,
+            });
+        let snapshot = db.apply_agent_state_job(&job).unwrap();
+
+        assert_eq!(snapshot.hook_sessions.len(), 1);
+        assert_eq!(snapshot.statuslines.len(), 1);
+        assert!(snapshot.waiting_sessions.is_empty());
+        assert!(snapshot.turn_done_sessions.is_empty());
+        assert_eq!(
+            snapshot
+                .agent_sessions
+                .iter()
+                .map(|row| row.pane_id.as_str())
+                .collect::<std::collections::HashSet<_>>(),
+            std::collections::HashSet::from(["pane-preserved", "pane-desired"])
+        );
+        assert!(snapshot.structured_threads[0].archived);
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT updated_at FROM agent_sessions
+                      WHERE workspace_id = ?1 AND pane_id = 'pane-desired'",
+                    [&ws],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn agent_state_binding_reconcile은_exact_256과_plus_one을_검증한다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("agent-state-bindings").unwrap();
+        let live_pane_ids = (0..AGENT_STATE_BINDING_ROWS_MAX)
+            .map(|index| format!("pane-{index}"))
+            .collect::<Vec<_>>();
+        let desired_bindings = live_pane_ids
+            .iter()
+            .enumerate()
+            .map(|(index, pane_id)| AgentSessionRow {
+                pane_id: pane_id.clone(),
+                kind: "codex".to_owned(),
+                session_id: format!("session-{index}"),
+            })
+            .collect::<Vec<_>>();
+        let mut exact = AgentStateJob::projection(&ws);
+        exact.binding_reconcile = Some(AgentSessionBindingReconcile {
+            live_pane_ids: live_pane_ids.clone(),
+            desired_bindings,
+        });
+        assert_eq!(
+            db.apply_agent_state_job(&exact)
+                .unwrap()
+                .agent_sessions
+                .len(),
+            AGENT_STATE_BINDING_ROWS_MAX
+        );
+
+        let mut plus_one = AgentStateJob::projection(&ws);
+        let mut too_many = live_pane_ids;
+        too_many.push("pane-plus-one".to_owned());
+        plus_one.binding_reconcile = Some(AgentSessionBindingReconcile {
+            live_pane_ids: too_many,
+            desired_bindings: Vec::new(),
+        });
+        assert_eq!(
+            db.apply_agent_state_job(&plus_one).unwrap_err().to_string(),
+            AGENT_STATE_INPUT_INVALID
+        );
+
+        let mut control = AgentStateJob::projection(&ws);
+        control.binding_reconcile = Some(AgentSessionBindingReconcile {
+            live_pane_ids: vec!["pane\ncontrol".to_owned()],
+            desired_bindings: Vec::new(),
+        });
+        assert_eq!(
+            db.apply_agent_state_job(&control).unwrap_err().to_string(),
+            AGENT_STATE_INPUT_INVALID
+        );
+
+        let exact_workspace_id = "w".repeat(BOUNDED_ID_BYTES_MAX);
+        assert!(
+            db.apply_agent_state_job(&AgentStateJob::projection(&exact_workspace_id))
+                .is_ok()
+        );
+        assert_eq!(
+            db.apply_agent_state_job(&AgentStateJob::projection(format!("{exact_workspace_id}w")))
+                .unwrap_err()
+                .to_string(),
+            AGENT_STATE_INPUT_INVALID
+        );
+    }
+
+    #[test]
+    fn agent_state_public_dto_debug는_hostile_marker를_노출하지_않는다() {
+        let marker = "agent-state-hostile-secret-marker";
+        let identity = AgentSessionIdentity {
+            pane_id: marker.to_owned(),
+            kind: marker.to_owned(),
+            session_id: marker.to_owned(),
+        };
+        let reconcile = AgentSessionBindingReconcile {
+            live_pane_ids: vec![marker.to_owned()],
+            desired_bindings: vec![AgentSessionRow {
+                pane_id: marker.to_owned(),
+                kind: marker.to_owned(),
+                session_id: marker.to_owned(),
+            }],
+        };
+        let clear = AgentTurnDoneClear {
+            session_key: marker.to_owned(),
+            seen_at: i64::MAX,
+        };
+        let structured = agent_state_structured_row(marker, 0, marker.to_owned());
+        let mutation = StructuredThreadMutation::Upsert(structured.clone());
+        let job = AgentStateJob {
+            workspace_id: marker.to_owned(),
+            binding_reconcile: Some(reconcile.clone()),
+            stale_binding_deletes: vec![identity.clone()],
+            turn_done_clears: vec![clear.clone()],
+            structured_mutations: vec![mutation.clone()],
+            include_archived_threads: true,
+        };
+        let snapshot = AgentStateSnapshot {
+            hook_sessions: vec![HookSessionRow {
+                session_key: marker.to_owned(),
+                kind: marker.to_owned(),
+                agent_session_id: marker.to_owned(),
+                transcript_path: marker.to_owned(),
+            }],
+            statuslines: vec![StatuslineRow {
+                session_key: marker.to_owned(),
+                effort: Some(marker.to_owned()),
+                model: Some(marker.to_owned()),
+                context_pct: Some(99),
+            }],
+            waiting_sessions: vec![(marker.to_owned(), Some(marker.to_owned()))],
+            turn_done_sessions: vec![(marker.to_owned(), i64::MAX)],
+            agent_sessions: reconcile.desired_bindings.clone(),
+            structured_threads: vec![structured],
+        };
+
+        for debug in [
+            format!("{identity:?}"),
+            format!("{reconcile:?}"),
+            format!("{clear:?}"),
+            format!("{mutation:?}"),
+            format!("{job:?}"),
+            format!("{snapshot:?}"),
+        ] {
+            assert!(!debug.contains(marker), "{debug}");
+        }
+    }
+
+    #[test]
+    fn agent_state_exact_cas는_새_binding과_새_turn을_지우지_않는다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("agent-state-cas").unwrap();
+        db.upsert_agent_session(&ws, "pane", "claude", "old")
+            .unwrap();
+        db.upsert_agent_session(&ws, "pane", "codex", "new")
+            .unwrap();
+        let key = format!("{ws}:1");
+        db.set_agent_turn_done(&key).unwrap();
+        let seen_at = db.list_turn_done_sessions().unwrap()[0].1;
+
+        let mut stale = AgentStateJob::projection(&ws);
+        stale.stale_binding_deletes.push(AgentSessionIdentity {
+            pane_id: "pane".to_owned(),
+            kind: "claude".to_owned(),
+            session_id: "old".to_owned(),
+        });
+        stale.turn_done_clears.push(AgentTurnDoneClear {
+            session_key: key.clone(),
+            seen_at: seen_at - 1,
+        });
+        let snapshot = db.apply_agent_state_job(&stale).unwrap();
+        assert_eq!(snapshot.agent_sessions[0].session_id, "new");
+        assert_eq!(snapshot.turn_done_sessions, vec![(key.clone(), seen_at)]);
+
+        let mut exact = AgentStateJob::projection(&ws);
+        exact.stale_binding_deletes.push(AgentSessionIdentity {
+            pane_id: "pane".to_owned(),
+            kind: "codex".to_owned(),
+            session_id: "new".to_owned(),
+        });
+        exact.turn_done_clears.push(AgentTurnDoneClear {
+            session_key: key,
+            seen_at,
+        });
+        let snapshot = db.apply_agent_state_job(&exact).unwrap();
+        assert!(snapshot.agent_sessions.is_empty());
+        assert!(snapshot.turn_done_sessions.is_empty());
+    }
+
+    #[test]
+    fn agent_state_structured_batch는_item_byte상한과_atomic_rollback을_보장한다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db.create_workspace("agent-state-structured").unwrap();
+        let mut exact = AgentStateJob::projection(&ws);
+        for index in 0..AGENT_STATE_STRUCTURED_MUTATIONS_MAX {
+            let local = format!("local-{index}");
+            let thread = format!("thread-{index}");
+            let title_bytes =
+                STRUCTURED_THREAD_ROW_BYTES_MAX - local.len() - ws.len() - thread.len();
+            exact
+                .structured_mutations
+                .push(StructuredThreadMutation::Upsert(
+                    agent_state_structured_row(&ws, index, "x".repeat(title_bytes)),
+                ));
+        }
+        let snapshot = db.apply_agent_state_job(&exact).unwrap();
+        assert_eq!(
+            snapshot.structured_threads.len(),
+            AGENT_STATE_STRUCTURED_MUTATIONS_MAX
+        );
+
+        let mut item_plus_one = exact.clone();
+        item_plus_one
+            .structured_mutations
+            .push(StructuredThreadMutation::Delete {
+                local_session_id: "extra".to_owned(),
+            });
+        assert_eq!(
+            db.apply_agent_state_job(&item_plus_one)
+                .unwrap_err()
+                .to_string(),
+            AGENT_STATE_INPUT_INVALID
+        );
+
+        let mut byte_plus_one = exact;
+        let StructuredThreadMutation::Upsert(first) = &mut byte_plus_one.structured_mutations[0]
+        else {
+            unreachable!()
+        };
+        first.title.push('x');
+        assert_eq!(
+            db.apply_agent_state_job(&byte_plus_one)
+                .unwrap_err()
+                .to_string(),
+            AGENT_STATE_INPUT_INVALID
+        );
+
+        db.upsert_structured_thread(
+            "rollback-existing",
+            &ws,
+            "rollback-thread",
+            "title",
+            "",
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_agent_state_structured_insert
+                 BEFORE INSERT ON structured_threads
+                 WHEN NEW.local_session_id = 'explode'
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+            .unwrap();
+        let mut rollback = AgentStateJob::projection(&ws);
+        rollback
+            .structured_mutations
+            .push(StructuredThreadMutation::SetArchived {
+                local_session_id: "rollback-existing".to_owned(),
+                archived: true,
+            });
+        rollback
+            .structured_mutations
+            .push(StructuredThreadMutation::Upsert(
+                agent_state_structured_row(&ws, usize::MAX, "explode".to_owned()),
+            ));
+        let StructuredThreadMutation::Upsert(explode) =
+            rollback.structured_mutations.last_mut().unwrap()
+        else {
+            unreachable!()
+        };
+        explode.local_session_id = "explode".to_owned();
+        assert_eq!(
+            db.apply_agent_state_job(&rollback).unwrap_err().to_string(),
+            AGENT_STATE_PERSIST_FAILED
+        );
+        assert!(
+            !db.list_structured_threads(&ws, true)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.local_session_id == "rollback-existing")
+                .unwrap()
+                .archived
+        );
+
+        db.conn
+            .execute_batch(
+                "DROP TRIGGER fail_agent_state_structured_insert;
+                 CREATE TRIGGER fail_agent_state_binding_insert
+                 BEFORE INSERT ON agent_sessions
+                 WHEN NEW.pane_id = 'binding-explode'
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+            .unwrap();
+        let mut reconcile_rollback = AgentStateJob::projection(&ws);
+        reconcile_rollback
+            .structured_mutations
+            .push(StructuredThreadMutation::SetArchived {
+                local_session_id: "rollback-existing".to_owned(),
+                archived: true,
+            });
+        reconcile_rollback.binding_reconcile = Some(AgentSessionBindingReconcile {
+            live_pane_ids: vec!["binding-explode".to_owned()],
+            desired_bindings: vec![AgentSessionRow {
+                pane_id: "binding-explode".to_owned(),
+                kind: "codex".to_owned(),
+                session_id: "session".to_owned(),
+            }],
+        });
+        assert_eq!(
+            db.apply_agent_state_job(&reconcile_rollback)
+                .unwrap_err()
+                .to_string(),
+            AGENT_STATE_PERSIST_FAILED
+        );
+        assert!(
+            !db.list_structured_threads(&ws, true)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.local_session_id == "rollback-existing")
+                .unwrap()
+                .archived
+        );
+        assert!(db.list_agent_sessions(&ws).unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_state_projection_preflight실패는_앞선_mutation도_rollback한다() {
+        let db = Db::open_in_memory().unwrap();
+        let ws = db
+            .create_workspace("agent-state-projection-rollback")
+            .unwrap();
+        db.upsert_structured_thread(
+            "local-rollback",
+            &ws,
+            "thread-rollback",
+            "title",
+            "",
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let key = format!("{ws}:1");
+        db.conn
+            .execute(
+                "INSERT INTO agent_hook_sessions
+                    (session_key, kind, agent_session_id, transcript_path, updated_at)
+                 VALUES (CAST(?1 AS BLOB), 'claude', 'agent', '',
+                         CAST(strftime('%s','now') AS INTEGER))",
+                [&key],
+            )
+            .unwrap();
+        let mut job = AgentStateJob::projection(&ws);
+        job.structured_mutations
+            .push(StructuredThreadMutation::SetArchived {
+                local_session_id: "local-rollback".to_owned(),
+                archived: true,
+            });
+        assert_eq!(
+            db.apply_agent_state_job(&job).unwrap_err().to_string(),
+            BOUNDED_READ_ROW_INVALID
+        );
+        assert!(!db.list_structured_threads(&ws, true).unwrap()[0].archived);
     }
 
     #[test]

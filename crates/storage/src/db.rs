@@ -786,6 +786,9 @@ impl std::fmt::Debug for StructuredThreadMutation {
 pub struct AgentStateJob {
     pub workspace_id: String,
     pub structured_workspace_ids: Vec<String>,
+    /// Maximum retained string bytes the caller can accept in the returned snapshot. This output
+    /// budget is independent from the separately bounded retained input payload.
+    pub snapshot_bytes_max: usize,
     pub binding_reconcile: Option<AgentSessionBindingReconcile>,
     pub stale_binding_deletes: Vec<AgentSessionIdentity>,
     pub turn_done_clears: Vec<AgentTurnDoneClear>,
@@ -799,6 +802,7 @@ impl AgentStateJob {
         Self {
             structured_workspace_ids: vec![workspace_id.clone()],
             workspace_id,
+            snapshot_bytes_max: AGENT_STATE_SNAPSHOT_BYTES_MAX,
             binding_reconcile: None,
             stale_binding_deletes: Vec::new(),
             turn_done_clears: Vec::new(),
@@ -816,6 +820,7 @@ impl std::fmt::Debug for AgentStateJob {
                 "structured_workspace_count",
                 &self.structured_workspace_ids.len(),
             )
+            .field("snapshot_bytes_max", &self.snapshot_bytes_max)
             .field("has_binding_reconcile", &self.binding_reconcile.is_some())
             .field(
                 "stale_binding_delete_count",
@@ -1592,6 +1597,7 @@ fn agent_session_row_input_bytes(row: &AgentSessionRow) -> anyhow::Result<usize>
 fn validate_agent_state_job(job: &AgentStateJob) -> anyhow::Result<String> {
     anyhow::ensure!(
         bounded_id_is_valid(&job.workspace_id)
+            && (1..=AGENT_STATE_SNAPSHOT_BYTES_MAX).contains(&job.snapshot_bytes_max)
             && job.stale_binding_deletes.len() <= AGENT_STATE_EXACT_MUTATIONS_MAX
             && job.turn_done_clears.len() <= AGENT_STATE_EXACT_MUTATIONS_MAX
             && job.structured_mutations.len() <= AGENT_STATE_STRUCTURED_MUTATIONS_MAX,
@@ -5285,7 +5291,7 @@ impl Db {
         .try_fold(0usize, usize::checked_add)
         .ok_or_else(|| anyhow::anyhow!(AGENT_STATE_SNAPSHOT_INVALID))?;
         anyhow::ensure!(
-            retained_bytes <= AGENT_STATE_SNAPSHOT_BYTES_MAX,
+            retained_bytes <= job.snapshot_bytes_max,
             AGENT_STATE_SNAPSHOT_INVALID
         );
 
@@ -9185,6 +9191,86 @@ mod tests {
                 .len(),
             128
         );
+        assert_eq!(job.snapshot_bytes_max, AGENT_STATE_SNAPSHOT_BYTES_MAX);
+    }
+
+    #[test]
+    fn agent_state_snapshot_byte_ceiling은_exact_zero_plus_one과_custom_rollback을_보장한다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace_id = db
+            .create_workspace("agent-state-snapshot-byte-ceiling")
+            .unwrap();
+        let local_session_id = "snapshot-byte-local";
+        let thread_id = "snapshot-byte-thread";
+        let title = "bounded-title";
+        let cwd = "/bounded/cwd";
+        let model = "bounded-model";
+        db.upsert_structured_thread(
+            local_session_id,
+            &workspace_id,
+            thread_id,
+            title,
+            cwd,
+            Some(model),
+            false,
+            false,
+        )
+        .unwrap();
+        let retained_bytes = [
+            local_session_id.len(),
+            workspace_id.len(),
+            thread_id.len(),
+            title.len(),
+            cwd.len(),
+            model.len(),
+        ]
+        .into_iter()
+        .sum();
+
+        let mut exact = AgentStateJob::projection(&workspace_id);
+        assert_eq!(exact.snapshot_bytes_max, AGENT_STATE_SNAPSHOT_BYTES_MAX);
+        exact.snapshot_bytes_max = retained_bytes;
+        assert_eq!(
+            db.apply_agent_state_job(&exact)
+                .unwrap()
+                .structured_threads
+                .len(),
+            1
+        );
+
+        for invalid in [0, AGENT_STATE_SNAPSHOT_BYTES_MAX + 1] {
+            let mut job = AgentStateJob::projection(&workspace_id);
+            job.snapshot_bytes_max = invalid;
+            job.structured_mutations
+                .push(StructuredThreadMutation::SetArchived {
+                    local_session_id: local_session_id.to_owned(),
+                    archived: true,
+                });
+            assert_eq!(
+                db.apply_agent_state_job(&job).unwrap_err().to_string(),
+                AGENT_STATE_INPUT_INVALID
+            );
+            assert!(!db.list_structured_threads(&workspace_id, true).unwrap()[0].archived);
+        }
+
+        let mut one_byte_short = AgentStateJob::projection(&workspace_id);
+        one_byte_short.snapshot_bytes_max = retained_bytes - 1;
+        one_byte_short
+            .structured_mutations
+            .push(StructuredThreadMutation::SetArchived {
+                local_session_id: local_session_id.to_owned(),
+                archived: true,
+            });
+        assert_eq!(
+            db.apply_agent_state_job(&one_byte_short)
+                .unwrap_err()
+                .to_string(),
+            AGENT_STATE_SNAPSHOT_INVALID
+        );
+        assert!(
+            !db.list_structured_threads(&workspace_id, true).unwrap()[0].archived,
+            "custom output cap failure must roll back the exact mutation"
+        );
     }
 
     #[test]
@@ -9276,6 +9362,7 @@ mod tests {
         let job = AgentStateJob {
             workspace_id: marker.to_owned(),
             structured_workspace_ids: vec![marker.to_owned()],
+            snapshot_bytes_max: AGENT_STATE_SNAPSHOT_BYTES_MAX,
             binding_reconcile: Some(reconcile.clone()),
             stale_binding_deletes: vec![identity.clone()],
             turn_done_clears: vec![clear.clone()],

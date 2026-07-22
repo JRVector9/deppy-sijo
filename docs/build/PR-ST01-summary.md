@@ -213,3 +213,17 @@ check, strict all-feature Clippy, package fmt-check, and scoped diff-check. The 
 also passes with the zero-allowlist boundary and 23-crate dependency laws unchanged. An initial
 `cargo xtask security-scan` shorthand failed because this checkout defines no Cargo alias; the
 canonical `cargo run -p xtask -- security-scan` command passed without a product workaround.
+
+### Caller-selected snapshot output budget amendment
+
+`AgentStateJob::snapshot_bytes_max` closes the gap between committing an exact mutation and only
+then discovering that app-owned resume/project-name output would exceed the worker's 4 MiB result
+budget. Each job must request 1 byte through the existing 4 MiB hard maximum; `projection()` keeps
+4 MiB as its default. The same IMMEDIATE transaction compares all six projected sections against
+that requested ceiling before materialization or commit, while the existing separately bounded
+job input is intentionally not charged twice as output.
+
+Exact custom-byte and 4 MiB requests pass. Zero and 4 MiB+1 fail before mutation, and a
+one-byte-short custom ceiling rolls back an earlier structured exact mutation. Root independently
+reran focused AgentState 11/11 and diff-check; the lane passed storage 200/200 plus doc tests,
+all-target check, strict all-feature Clippy, package fmt, and the canonical security scan.

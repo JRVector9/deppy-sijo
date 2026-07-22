@@ -7,14 +7,34 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, bail};
 use deppy_core::{MuxPaneId, MuxTabId, MuxWindowId};
 use mux::{LayoutNode, PaneKind};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, Row, types::ValueRef};
 
-use crate::layout_json::{layout_from_json, layout_to_json};
+use crate::layout_json::{layout_from_json, layout_from_json_bounded, layout_to_json};
 
 /// sessions.status 값. 영속 컬럼은 소문자 문자열 — crash recovery의
 /// orphan 판정(running → exited)이 이 두 값을 쓴다.
 pub const SESSION_STATUS_RUNNING: &str = "running";
 pub const SESSION_STATUS_EXITED: &str = "exited";
+
+const RESTORE_MAX_TABS: usize = 64;
+const RESTORE_MAX_PANES: usize = 256;
+const RESTORE_MAX_SESSIONS: usize = 256;
+const RESTORE_MAX_ID_BYTES: usize = 1024;
+const RESTORE_MAX_CWD_BYTES: usize = 4 * 1024;
+const RESTORE_MAX_TEXT_BYTES: usize = 4 * 1024;
+const RESTORE_MAX_COMMAND_BYTES: usize = 32 * 1024;
+const RESTORE_MAX_ARG_ITEMS: usize = 256;
+const RESTORE_MAX_ARG_BYTES: usize = 32 * 1024;
+const RESTORE_MAX_ARGS_JSON_BYTES: usize = 1024 * 1024;
+const RESTORE_MAX_LAYOUT_JSON_BYTES: usize = 256 * 1024;
+const RESTORE_MAX_LAYOUT_DEPTH: usize = 64;
+const RESTORE_MAX_RETAINED_BYTES: usize = 4 * 1024 * 1024;
+
+const RESTORE_INPUT_ERROR: &str = "workspace_restore_input_invalid";
+const RESTORE_QUERY_ERROR: &str = "workspace_restore_query_failed";
+const RESTORE_ROW_ERROR: &str = "workspace_restore_row_invalid";
+const RESTORE_LIMIT_ERROR: &str = "workspace_restore_limit_exceeded";
+const RESTORE_LAYOUT_ERROR: &str = "workspace_restore_layout_invalid";
 
 /// mux_windows 한 행 + 소속 tab 전체. 복원 시 이대로 MuxWindow/MuxTab을 재구성한다.
 #[derive(Debug, Clone, PartialEq)]
@@ -62,6 +82,99 @@ pub struct SessionRow {
     pub cwd: String,
     pub status: String,
     pub last_log_offset: u64,
+}
+
+/// 한 startup snapshot에서 복원 가능한 canonical window와 그 pane들이 실제로
+/// 참조하는 session만 담는다. 반환 전에 전체 검증을 끝내므로 partial restore가 없다.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceRestore {
+    pub window: Option<WindowState>,
+    pub sessions: Vec<SessionRow>,
+}
+
+#[derive(Default)]
+struct RestoreBudget {
+    retained: usize,
+}
+
+impl RestoreBudget {
+    fn retain(&mut self, bytes: usize) -> anyhow::Result<()> {
+        self.retained = self
+            .retained
+            .checked_add(bytes)
+            .ok_or_else(|| anyhow::anyhow!(RESTORE_LIMIT_ERROR))?;
+        if self.retained > RESTORE_MAX_RETAINED_BYTES {
+            bail!(RESTORE_LIMIT_ERROR);
+        }
+        Ok(())
+    }
+}
+
+fn required_text<'row>(row: &'row Row<'_>, index: usize, max: usize) -> anyhow::Result<&'row str> {
+    match row
+        .get_ref(index)
+        .map_err(|_| anyhow::anyhow!(RESTORE_ROW_ERROR))?
+    {
+        ValueRef::Text(bytes) if bytes.len() <= max => {
+            std::str::from_utf8(bytes).map_err(|_| anyhow::anyhow!(RESTORE_ROW_ERROR))
+        }
+        _ => Err(anyhow::anyhow!(RESTORE_ROW_ERROR)),
+    }
+}
+
+fn required_id<'row>(row: &'row Row<'_>, index: usize) -> anyhow::Result<&'row str> {
+    let value = required_text(row, index, RESTORE_MAX_ID_BYTES)?;
+    if value.is_empty() || value.bytes().any(|byte| byte.is_ascii_control()) {
+        bail!(RESTORE_ROW_ERROR);
+    }
+    Ok(value)
+}
+
+fn optional_text<'row>(
+    row: &'row Row<'_>,
+    index: usize,
+    max: usize,
+) -> anyhow::Result<Option<&'row str>> {
+    match row
+        .get_ref(index)
+        .map_err(|_| anyhow::anyhow!(RESTORE_ROW_ERROR))?
+    {
+        ValueRef::Null => Ok(None),
+        ValueRef::Text(bytes) if bytes.len() <= max => std::str::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!(RESTORE_ROW_ERROR)),
+        _ => Err(anyhow::anyhow!(RESTORE_ROW_ERROR)),
+    }
+}
+
+fn required_nonnegative_integer(row: &Row<'_>, index: usize) -> anyhow::Result<u64> {
+    match row
+        .get_ref(index)
+        .map_err(|_| anyhow::anyhow!(RESTORE_ROW_ERROR))?
+    {
+        ValueRef::Integer(value) => {
+            u64::try_from(value).map_err(|_| anyhow::anyhow!(RESTORE_ROW_ERROR))
+        }
+        _ => Err(anyhow::anyhow!(RESTORE_ROW_ERROR)),
+    }
+}
+
+fn optional_nonnegative_integer(row: &Row<'_>, index: usize) -> anyhow::Result<u64> {
+    match row
+        .get_ref(index)
+        .map_err(|_| anyhow::anyhow!(RESTORE_ROW_ERROR))?
+    {
+        ValueRef::Null => Ok(0),
+        ValueRef::Integer(value) => {
+            u64::try_from(value).map_err(|_| anyhow::anyhow!(RESTORE_ROW_ERROR))
+        }
+        _ => Err(anyhow::anyhow!(RESTORE_ROW_ERROR)),
+    }
+}
+
+fn checked_owned(budget: &mut RestoreBudget, value: &str) -> anyhow::Result<String> {
+    budget.retain(value.len())?;
+    Ok(value.to_owned())
 }
 
 fn pane_kind_to_str(kind: PaneKind) -> &'static str {
@@ -348,6 +461,351 @@ fn load_panes(
         tracing::warn!(tab_id, pane_id = %orphan, "layout에 없는 pane 행 — 버림");
     }
     Ok(Some(panes))
+}
+
+struct RestoreTabDraft {
+    id: MuxTabId,
+    title: String,
+    layout: LayoutNode,
+    active_pane: Option<MuxPaneId>,
+}
+
+/// Startup용 bounded restore. 동일 read transaction의 첫 window만 선택하고 그
+/// window에 연결된 tab/pane 및 실제 참조 session만 materialize한다.
+pub fn load_workspace_restore_bounded(
+    conn: &Connection,
+    workspace_id: &str,
+) -> anyhow::Result<WorkspaceRestore> {
+    load_workspace_restore_bounded_with_hook(conn, workspace_id, || {})
+}
+
+fn load_workspace_restore_bounded_with_hook<F>(
+    conn: &Connection,
+    workspace_id: &str,
+    after_snapshot: F,
+) -> anyhow::Result<WorkspaceRestore>
+where
+    F: FnOnce(),
+{
+    if workspace_id.is_empty()
+        || workspace_id.len() > RESTORE_MAX_ID_BYTES
+        || workspace_id.bytes().any(|byte| byte.is_ascii_control())
+    {
+        bail!(RESTORE_INPUT_ERROR);
+    }
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|_| anyhow::anyhow!(RESTORE_QUERY_ERROR))?;
+    let mut budget = RestoreBudget::default();
+
+    let canonical = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT id, title, active_tab_id, workspace_id
+                 FROM mux_windows
+                 WHERE workspace_id = ?1
+                 ORDER BY created_at, id
+                 LIMIT 1",
+            )
+            .map_err(|_| anyhow::anyhow!(RESTORE_QUERY_ERROR))?;
+        let mut rows = stmt
+            .query([workspace_id])
+            .map_err(|_| anyhow::anyhow!(RESTORE_QUERY_ERROR))?;
+        let Some(row) = rows
+            .next()
+            .map_err(|_| anyhow::anyhow!(RESTORE_QUERY_ERROR))?
+        else {
+            drop(rows);
+            drop(stmt);
+            tx.commit()
+                .map_err(|_| anyhow::anyhow!(RESTORE_QUERY_ERROR))?;
+            return Ok(WorkspaceRestore {
+                window: None,
+                sessions: Vec::new(),
+            });
+        };
+        let id = required_id(row, 0)?;
+        let title = optional_text(row, 1, RESTORE_MAX_TEXT_BYTES)?;
+        let active_tab = optional_text(row, 2, RESTORE_MAX_ID_BYTES)?;
+        if active_tab.is_some_and(str::is_empty) || required_id(row, 3)? != workspace_id {
+            bail!(RESTORE_ROW_ERROR);
+        }
+        (
+            MuxWindowId(checked_owned(&mut budget, id)?),
+            title
+                .map(|value| checked_owned(&mut budget, value))
+                .transpose()?,
+            active_tab
+                .map(|value| checked_owned(&mut budget, value).map(MuxTabId))
+                .transpose()?,
+        )
+    };
+
+    // 첫 SELECT가 read snapshot을 확정한 뒤 호출된다. production은 no-op이고,
+    // test는 두 번째 connection의 commit을 끼워 넣어 snapshot 일관성을 검증한다.
+    after_snapshot();
+
+    let mut drafts = Vec::new();
+    let mut layout_pane_count = 0usize;
+    {
+        let mut stmt = tx
+            .prepare(
+                "SELECT t.id, t.title, t.tab_index, l.layout_json, l.active_pane_id,
+                        t.workspace_id, l.workspace_id
+                 FROM mux_tabs t
+                 LEFT JOIN mux_layouts l ON l.tab_id = t.id
+                 WHERE t.window_id = ?1
+                 ORDER BY t.tab_index, t.id
+                 LIMIT 65",
+            )
+            .map_err(|_| anyhow::anyhow!(RESTORE_QUERY_ERROR))?;
+        let mut rows = stmt
+            .query([canonical.0.0.as_str()])
+            .map_err(|_| anyhow::anyhow!(RESTORE_QUERY_ERROR))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|_| anyhow::anyhow!(RESTORE_QUERY_ERROR))?
+        {
+            if drafts.len() == RESTORE_MAX_TABS {
+                bail!(RESTORE_LIMIT_ERROR);
+            }
+            let id = required_id(row, 0)?;
+            let title = required_text(row, 1, RESTORE_MAX_TEXT_BYTES)?;
+            let _tab_index = required_nonnegative_integer(row, 2)?;
+            let layout_json = required_text(row, 3, RESTORE_MAX_LAYOUT_JSON_BYTES)?;
+            let active_pane = optional_text(row, 4, RESTORE_MAX_ID_BYTES)?;
+            if active_pane.is_some_and(str::is_empty)
+                || required_id(row, 5)? != workspace_id
+                || required_id(row, 6)? != workspace_id
+            {
+                bail!(RESTORE_ROW_ERROR);
+            }
+            // raw JSON 길이는 parsed LayoutNode가 보유할 pane id 총량보다 보수적인 값이다.
+            budget.retain(layout_json.len())?;
+            let layout = layout_from_json_bounded(
+                layout_json,
+                RESTORE_MAX_LAYOUT_DEPTH,
+                RESTORE_MAX_PANES,
+                RESTORE_MAX_ID_BYTES,
+            )
+            .map_err(|_| anyhow::anyhow!(RESTORE_LAYOUT_ERROR))?;
+            layout_pane_count = layout_pane_count
+                .checked_add(layout.panes().len())
+                .ok_or_else(|| anyhow::anyhow!(RESTORE_LIMIT_ERROR))?;
+            if layout_pane_count > RESTORE_MAX_PANES {
+                bail!(RESTORE_LIMIT_ERROR);
+            }
+            drafts.push(RestoreTabDraft {
+                id: MuxTabId(checked_owned(&mut budget, id)?),
+                title: checked_owned(&mut budget, title)?,
+                layout,
+                active_pane: active_pane
+                    .map(|value| checked_owned(&mut budget, value).map(MuxPaneId))
+                    .transpose()?,
+            });
+        }
+    }
+
+    let mut pane_groups = vec![Vec::new(); drafts.len()];
+    let mut referenced_sessions = HashSet::new();
+    let mut db_pane_count = 0usize;
+    {
+        let mut stmt = tx
+            .prepare(
+                "SELECT p.id, p.tab_id, p.session_id, p.title, p.pane_kind,
+                        s.id, s.cwd, p.workspace_id, s.workspace_id
+                 FROM mux_panes p
+                 JOIN mux_tabs t ON t.id = p.tab_id
+                 LEFT JOIN sessions s ON s.id = p.session_id
+                 WHERE t.window_id = ?1
+                 ORDER BY t.tab_index, p.created_at, p.id
+                 LIMIT 257",
+            )
+            .map_err(|_| anyhow::anyhow!(RESTORE_QUERY_ERROR))?;
+        let mut rows = stmt
+            .query([canonical.0.0.as_str()])
+            .map_err(|_| anyhow::anyhow!(RESTORE_QUERY_ERROR))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|_| anyhow::anyhow!(RESTORE_QUERY_ERROR))?
+        {
+            if db_pane_count == RESTORE_MAX_PANES {
+                bail!(RESTORE_LIMIT_ERROR);
+            }
+            db_pane_count += 1;
+            let id = required_id(row, 0)?;
+            let tab_id = required_id(row, 1)?;
+            let session_id = optional_text(row, 2, RESTORE_MAX_ID_BYTES)?;
+            let title = required_text(row, 3, RESTORE_MAX_TEXT_BYTES)?;
+            let pane_kind = required_text(row, 4, RESTORE_MAX_TEXT_BYTES)?;
+            let joined_session_id = optional_text(row, 5, RESTORE_MAX_ID_BYTES)?;
+            let cwd = optional_text(row, 6, RESTORE_MAX_CWD_BYTES)?;
+            if session_id.is_some_and(str::is_empty)
+                || joined_session_id.is_some_and(str::is_empty)
+                || required_id(row, 7)? != workspace_id
+                || session_id != joined_session_id
+                || (session_id.is_some()
+                    && optional_text(row, 8, RESTORE_MAX_ID_BYTES)? != Some(workspace_id))
+                || pane_kind != "terminal"
+            {
+                bail!(RESTORE_ROW_ERROR);
+            }
+            let tab_position = drafts
+                .iter()
+                .position(|draft| draft.id.0 == tab_id)
+                .ok_or_else(|| anyhow::anyhow!(RESTORE_LAYOUT_ERROR))?;
+            let session_id = session_id
+                .map(|value| checked_owned(&mut budget, value))
+                .transpose()?;
+            if let Some(value) = &session_id
+                && referenced_sessions.insert(value.clone())
+            {
+                // HashSet key is an additional retained allocation during validation.
+                budget.retain(value.len())?;
+                if referenced_sessions.len() > RESTORE_MAX_SESSIONS {
+                    bail!(RESTORE_LIMIT_ERROR);
+                }
+            }
+            pane_groups[tab_position].push(PaneState {
+                id: MuxPaneId(checked_owned(&mut budget, id)?),
+                session_id,
+                title: checked_owned(&mut budget, title)?,
+                pane_kind: PaneKind::Terminal,
+                cwd: cwd
+                    .filter(|value| !value.is_empty())
+                    .map(|value| checked_owned(&mut budget, value))
+                    .transpose()?,
+            });
+        }
+    }
+    if db_pane_count != layout_pane_count {
+        bail!(RESTORE_LAYOUT_ERROR);
+    }
+
+    let mut tabs = Vec::with_capacity(drafts.len());
+    for (draft, mut panes) in drafts.into_iter().zip(pane_groups) {
+        let layout_ids = draft.layout.panes();
+        let mut ordered = Vec::with_capacity(layout_ids.len());
+        for layout_id in layout_ids {
+            let position = panes
+                .iter()
+                .position(|pane| pane.id == layout_id)
+                .ok_or_else(|| anyhow::anyhow!(RESTORE_LAYOUT_ERROR))?;
+            ordered.push(panes.swap_remove(position));
+        }
+        if !panes.is_empty()
+            || draft
+                .active_pane
+                .as_ref()
+                .is_some_and(|active| !draft.layout.contains(active))
+        {
+            bail!(RESTORE_LAYOUT_ERROR);
+        }
+        let active_pane = draft
+            .active_pane
+            .or_else(|| ordered.first().map(|pane| pane.id.clone()));
+        tabs.push(TabState {
+            id: draft.id,
+            title: draft.title,
+            layout: draft.layout,
+            active_pane,
+            panes: ordered,
+        });
+    }
+    if canonical
+        .2
+        .as_ref()
+        .is_some_and(|active| !tabs.iter().any(|tab| tab.id == *active))
+    {
+        bail!(RESTORE_LAYOUT_ERROR);
+    }
+    let active_tab = canonical
+        .2
+        .or_else(|| tabs.first().map(|tab| tab.id.clone()));
+
+    let mut sessions = Vec::new();
+    {
+        let mut stmt = tx
+            .prepare(
+                "SELECT DISTINCT s.id, s.workspace_id, s.session_kind, s.agent_id,
+                        s.title, s.command, s.args_json, s.cwd, s.status,
+                        s.last_log_offset
+                 FROM sessions s
+                 JOIN mux_panes p ON p.session_id = s.id
+                 JOIN mux_tabs t ON t.id = p.tab_id
+                 WHERE t.window_id = ?1
+                 ORDER BY s.id
+                 LIMIT 257",
+            )
+            .map_err(|_| anyhow::anyhow!(RESTORE_QUERY_ERROR))?;
+        let mut rows = stmt
+            .query([canonical.0.0.as_str()])
+            .map_err(|_| anyhow::anyhow!(RESTORE_QUERY_ERROR))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|_| anyhow::anyhow!(RESTORE_QUERY_ERROR))?
+        {
+            if sessions.len() == RESTORE_MAX_SESSIONS {
+                bail!(RESTORE_LIMIT_ERROR);
+            }
+            let id = required_id(row, 0)?;
+            let row_workspace = required_id(row, 1)?;
+            let session_kind = required_text(row, 2, RESTORE_MAX_TEXT_BYTES)?;
+            let agent_id = optional_text(row, 3, RESTORE_MAX_ID_BYTES)?;
+            let title = required_text(row, 4, RESTORE_MAX_TEXT_BYTES)?;
+            let command = required_text(row, 5, RESTORE_MAX_COMMAND_BYTES)?;
+            let args_json = required_text(row, 6, RESTORE_MAX_ARGS_JSON_BYTES)?;
+            let cwd = required_text(row, 7, RESTORE_MAX_CWD_BYTES)?;
+            let status = required_text(row, 8, RESTORE_MAX_TEXT_BYTES)?;
+            let offset = optional_nonnegative_integer(row, 9)?;
+            if row_workspace != workspace_id
+                || agent_id.is_some_and(str::is_empty)
+                || (session_kind == "agent" && agent_id.is_none())
+                || !referenced_sessions.remove(id)
+            {
+                bail!(RESTORE_ROW_ERROR);
+            }
+            // JSON 자체 길이를 보수적 retained budget으로 사용한 뒤 파싱한다.
+            budget.retain(args_json.len())?;
+            let args: Vec<String> =
+                serde_json::from_str(args_json).map_err(|_| anyhow::anyhow!(RESTORE_ROW_ERROR))?;
+            if args.len() > RESTORE_MAX_ARG_ITEMS
+                || args.iter().any(|arg| arg.len() > RESTORE_MAX_ARG_BYTES)
+            {
+                bail!(RESTORE_LIMIT_ERROR);
+            }
+            sessions.push(SessionRow {
+                id: checked_owned(&mut budget, id)?,
+                workspace_id: checked_owned(&mut budget, row_workspace)?,
+                session_kind: checked_owned(&mut budget, session_kind)?,
+                agent_id: agent_id
+                    .map(|value| checked_owned(&mut budget, value))
+                    .transpose()?,
+                title: checked_owned(&mut budget, title)?,
+                command: checked_owned(&mut budget, command)?,
+                args,
+                cwd: checked_owned(&mut budget, cwd)?,
+                status: checked_owned(&mut budget, status)?,
+                last_log_offset: offset,
+            });
+        }
+    }
+    if !referenced_sessions.is_empty() {
+        bail!(RESTORE_ROW_ERROR);
+    }
+
+    let window = WindowState {
+        id: canonical.0,
+        title: canonical.1,
+        active_tab,
+        tabs,
+    };
+    tx.commit()
+        .map_err(|_| anyhow::anyhow!(RESTORE_QUERY_ERROR))?;
+    Ok(WorkspaceRestore {
+        window: Some(window),
+        sessions,
+    })
 }
 
 /// session metadata 저장 (§11.1). 같은 id면 갱신 — status/offset 업데이트에도 쓴다.
@@ -696,5 +1154,315 @@ pub(crate) mod tests {
         row.session_kind = "agent".into();
         // DDL CHECK: agent인데 agent_id 없음 → 거부
         assert!(upsert_session(&conn, &row).is_err());
+    }
+
+    fn balanced_layout(ids: &[MuxPaneId]) -> LayoutNode {
+        if ids.len() == 1 {
+            return LayoutNode::Pane(ids[0].clone());
+        }
+        let middle = ids.len() / 2;
+        LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(balanced_layout(&ids[..middle])),
+            second: Box::new(balanced_layout(&ids[middle..])),
+        }
+    }
+
+    fn bounded_window(tab_count: usize, panes_per_tab: usize) -> WindowState {
+        let tabs = (0..tab_count)
+            .map(|tab_index| {
+                let pane_ids = (0..panes_per_tab)
+                    .map(|_| MuxPaneId::new())
+                    .collect::<Vec<_>>();
+                TabState {
+                    id: MuxTabId::new(),
+                    title: format!("tab-{tab_index}"),
+                    layout: balanced_layout(&pane_ids),
+                    active_pane: pane_ids.first().cloned(),
+                    panes: pane_ids
+                        .into_iter()
+                        .map(|id| PaneState {
+                            id,
+                            session_id: None,
+                            title: "pane".to_owned(),
+                            pane_kind: PaneKind::Terminal,
+                            cwd: None,
+                        })
+                        .collect(),
+                }
+            })
+            .collect::<Vec<_>>();
+        WindowState {
+            id: MuxWindowId::new(),
+            title: Some("bounded".to_owned()),
+            active_tab: tabs.first().map(|tab| tab.id.clone()),
+            tabs,
+        }
+    }
+
+    #[test]
+    fn bounded_restore_empty_workspace는_빈_snapshot이다() {
+        let conn = test_conn();
+        assert_eq!(
+            load_workspace_restore_bounded(&conn, "ws-1").unwrap(),
+            WorkspaceRestore {
+                window: None,
+                sessions: Vec::new()
+            }
+        );
+    }
+
+    #[test]
+    fn bounded_restore는_control_workspace_id를_query전에_거부한다() {
+        let conn = test_conn();
+        assert_eq!(
+            load_workspace_restore_bounded(&conn, "ws\ncontrol")
+                .unwrap_err()
+                .to_string(),
+            RESTORE_INPUT_ERROR
+        );
+    }
+
+    #[test]
+    fn bounded_restore_tab_pane_exact와_plus_one() {
+        let mut conn = test_conn();
+        let mut window = bounded_window(64, 4);
+        save_window_layout(&mut conn, "ws-1", &window).unwrap();
+        let restored = load_workspace_restore_bounded(&conn, "ws-1").unwrap();
+        assert_eq!(restored.window.as_ref().unwrap().tabs.len(), 64);
+        assert_eq!(
+            restored
+                .window
+                .as_ref()
+                .unwrap()
+                .tabs
+                .iter()
+                .map(|tab| tab.panes.len())
+                .sum::<usize>(),
+            256
+        );
+
+        let extra_tab = bounded_window(1, 1).tabs.pop().unwrap();
+        window.tabs.push(extra_tab);
+        save_window_layout(&mut conn, "ws-1", &window).unwrap();
+        assert_eq!(
+            load_workspace_restore_bounded(&conn, "ws-1")
+                .unwrap_err()
+                .to_string(),
+            RESTORE_LIMIT_ERROR
+        );
+
+        window.tabs.pop();
+        let extra_pane = MuxPaneId::new();
+        let previous_layout = std::mem::replace(
+            &mut window.tabs[0].layout,
+            LayoutNode::Pane(extra_pane.clone()),
+        );
+        window.tabs[0].layout = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            ratio: 0.5,
+            first: Box::new(previous_layout),
+            second: Box::new(LayoutNode::Pane(extra_pane.clone())),
+        };
+        window.tabs[0].panes.push(PaneState {
+            id: extra_pane,
+            session_id: None,
+            title: "pane".to_owned(),
+            pane_kind: PaneKind::Terminal,
+            cwd: None,
+        });
+        save_window_layout(&mut conn, "ws-1", &window).unwrap();
+        assert_eq!(
+            load_workspace_restore_bounded(&conn, "ws-1")
+                .unwrap_err()
+                .to_string(),
+            RESTORE_LIMIT_ERROR
+        );
+    }
+
+    #[test]
+    fn bounded_restore_args_exact와_plus_one() {
+        let mut conn = test_conn();
+        let mut session = sample_session("sess-1", SESSION_STATUS_RUNNING);
+        session.args = vec!["x".to_owned(); RESTORE_MAX_ARG_ITEMS];
+        upsert_session(&conn, &session).unwrap();
+        let window = sample_window();
+        save_window_layout(&mut conn, "ws-1", &window).unwrap();
+        assert_eq!(
+            load_workspace_restore_bounded(&conn, "ws-1")
+                .unwrap()
+                .sessions[0]
+                .args
+                .len(),
+            RESTORE_MAX_ARG_ITEMS
+        );
+
+        session.args.push("overflow".to_owned());
+        upsert_session(&conn, &session).unwrap();
+        assert_eq!(
+            load_workspace_restore_bounded(&conn, "ws-1")
+                .unwrap_err()
+                .to_string(),
+            RESTORE_LIMIT_ERROR
+        );
+
+        session.args = vec!["x".repeat(RESTORE_MAX_ARG_BYTES)];
+        upsert_session(&conn, &session).unwrap();
+        assert!(load_workspace_restore_bounded(&conn, "ws-1").is_ok());
+        session.args[0].push('x');
+        upsert_session(&conn, &session).unwrap();
+        assert_eq!(
+            load_workspace_restore_bounded(&conn, "ws-1")
+                .unwrap_err()
+                .to_string(),
+            RESTORE_LIMIT_ERROR
+        );
+    }
+
+    #[test]
+    fn bounded_restore는_unreferenced_session을_보유하지_않는다() {
+        let mut conn = test_conn();
+        upsert_session(&conn, &sample_session("sess-1", SESSION_STATUS_RUNNING)).unwrap();
+        upsert_session(
+            &conn,
+            &sample_session("historical-unreferenced", SESSION_STATUS_EXITED),
+        )
+        .unwrap();
+        let window = sample_window();
+        save_window_layout(&mut conn, "ws-1", &window).unwrap();
+
+        let restored = load_workspace_restore_bounded(&conn, "ws-1").unwrap();
+        assert_eq!(restored.sessions.len(), 1);
+        assert_eq!(restored.sessions[0].id, "sess-1");
+    }
+
+    #[test]
+    fn bounded_restore는_created_at기준_canonical_window만_복원한다() {
+        let mut conn = test_conn();
+        let first = bounded_window(1, 1);
+        let second = bounded_window(1, 1);
+        save_window_layout(&mut conn, "ws-1", &first).unwrap();
+        save_window_layout(&mut conn, "ws-1", &second).unwrap();
+        conn.execute(
+            "UPDATE mux_windows SET created_at = '2020-01-01' WHERE id = ?1",
+            [&first.id.0],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE mux_windows SET created_at = '2021-01-01' WHERE id = ?1",
+            [&second.id.0],
+        )
+        .unwrap();
+
+        let restored = load_workspace_restore_bounded(&conn, "ws-1").unwrap();
+        assert_eq!(restored.window.unwrap(), first);
+        assert!(restored.sessions.is_empty());
+    }
+
+    #[test]
+    fn bounded_restore는_aggregate_retained_4mib를_넘지_않는다() {
+        let mut conn = test_conn();
+        let mut window = bounded_window(1, 5);
+        for (index, pane) in window.tabs[0].panes.iter_mut().enumerate() {
+            let session_id = format!("large-session-{index}");
+            let mut session = sample_session(&session_id, SESSION_STATUS_EXITED);
+            session.args = vec!["x".repeat(RESTORE_MAX_ARG_BYTES); 29];
+            upsert_session(&conn, &session).unwrap();
+            pane.session_id = Some(session_id);
+            pane.cwd = Some(session.cwd);
+        }
+        save_window_layout(&mut conn, "ws-1", &window).unwrap();
+
+        assert_eq!(
+            load_workspace_restore_bounded(&conn, "ws-1")
+                .unwrap_err()
+                .to_string(),
+            RESTORE_LIMIT_ERROR
+        );
+    }
+
+    #[test]
+    fn bounded_restore는_대형_또는_잘못된_sqlite_row를_할당_전에_거부한다() {
+        let mut conn = test_conn();
+        upsert_session(&conn, &sample_session("sess-1", SESSION_STATUS_RUNNING)).unwrap();
+        let window = sample_window();
+        save_window_layout(&mut conn, "ws-1", &window).unwrap();
+
+        conn.execute(
+            "UPDATE mux_tabs SET title = zeroblob(5000) WHERE id = ?1",
+            [&window.tabs[0].id.0],
+        )
+        .unwrap();
+        assert_eq!(
+            load_workspace_restore_bounded(&conn, "ws-1")
+                .unwrap_err()
+                .to_string(),
+            RESTORE_ROW_ERROR
+        );
+
+        conn.execute(
+            "UPDATE mux_tabs SET title = 'ok' WHERE id = ?1",
+            [&window.tabs[0].id.0],
+        )
+        .unwrap();
+        let huge_layout = "x".repeat(RESTORE_MAX_LAYOUT_JSON_BYTES + 1);
+        conn.execute(
+            "UPDATE mux_layouts SET layout_json = ?2 WHERE tab_id = ?1",
+            (&window.tabs[0].id.0, huge_layout),
+        )
+        .unwrap();
+        assert_eq!(
+            load_workspace_restore_bounded(&conn, "ws-1")
+                .unwrap_err()
+                .to_string(),
+            RESTORE_ROW_ERROR
+        );
+    }
+
+    #[test]
+    fn bounded_restore는_한_read_snapshot만_사용한다() {
+        let path = std::env::temp_dir().join(format!(
+            "deppy-persist-snapshot-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let mut reader = Connection::open(&path).unwrap();
+        setup_schema(&reader);
+        reader
+            .query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))
+            .unwrap();
+        upsert_session(&reader, &sample_session("sess-1", SESSION_STATUS_RUNNING)).unwrap();
+        let window = sample_window();
+        let old_title = window.tabs[0].title.clone();
+        save_window_layout(&mut reader, "ws-1", &window).unwrap();
+
+        let writer = Connection::open(&path).unwrap();
+        writer.pragma_update(None, "foreign_keys", true).unwrap();
+        writer
+            .busy_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let restored = load_workspace_restore_bounded_with_hook(&reader, "ws-1", || {
+            writer
+                .execute(
+                    "UPDATE mux_tabs SET title = 'newer' WHERE id = ?1",
+                    [&window.tabs[0].id.0],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "UPDATE sessions SET title = 'newer' WHERE id = 'sess-1'",
+                    [],
+                )
+                .unwrap();
+        })
+        .unwrap();
+        assert_eq!(restored.window.unwrap().tabs[0].title, old_title);
+        assert_eq!(restored.sessions[0].title, "셸");
+
+        drop(writer);
+        drop(reader);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
     }
 }

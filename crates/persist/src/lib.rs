@@ -13,8 +13,8 @@ pub use recovery::{
 };
 pub use repo::{
     PaneState, SESSION_STATUS_EXITED, SESSION_STATUS_RUNNING, SessionRow, TabState, WindowState,
-    load_sessions, load_window_layouts, save_window_layout, update_session_log_offset,
-    upsert_session,
+    WorkspaceRestore, load_sessions, load_window_layouts, load_workspace_restore_bounded,
+    save_window_layout, update_session_log_offset, upsert_session,
 };
 
 /// 설계문서 §11.1~11.5 스키마 그대로. 앱 마이그레이션 배열(app/storage.rs MIGRATIONS)에

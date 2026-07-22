@@ -64,16 +64,15 @@ impl PersistPipe {
         // 동시 writer(app Db·다른 workspace 워커 shutdown 정리)와 겹칠 때 SQLITE_BUSY로
         // 쓰기가 유실되지 않게 대기·재시도한다 (codex 리뷰 — 전환 시 두 워커가 같은 파일에 씀).
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        // 이전 실행의 window 행을 재사용 (없으면 새로) — tab/pane 구조는 복원 UX(PR-14)가
-        // take_saved_layout으로 소비한다.
-        let previous = persist::load_window_layouts(&conn, &config.workspace_id)
-            .ok()
-            .and_then(|windows| windows.into_iter().next());
-        let (window_id, restored_tabs, restored_active_tab) = match previous {
+        // 하나의 bounded read snapshot에서 canonical window와 그 pane이 실제 참조하는
+        // session만 복원한다. 과거 window/session 전체를 startup RAM에 보유하지 않는다.
+        let restore = persist::load_workspace_restore_bounded(&conn, &config.workspace_id)?;
+        let (window_id, restored_tabs, restored_active_tab) = match restore.window {
             Some(w) => (w.id, w.tabs, w.active_tab),
             None => (MuxWindowId::new(), Vec::new(), None),
         };
-        let restored_rows = persist::load_sessions(&conn, &config.workspace_id)?
+        let restored_rows = restore
+            .sessions
             .into_iter()
             .map(|row| (row.id.clone(), row))
             .collect();

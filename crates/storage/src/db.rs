@@ -16,6 +16,10 @@ pub const PENDING_APPROVAL_SESSION_CLEANUP_LIMIT_MAX: usize =
     mcp_store::PENDING_APPROVAL_SESSION_LIMIT_MAX;
 
 const SESSION_CLOSED_APPROVAL_ERROR_CODE: &str = "session_closed";
+const PENDING_APPROVAL_OWNER_UNAVAILABLE: &str = "pending_approval_owner_unavailable";
+const PENDING_APPROVAL_OWNER_DB_MISMATCH: &str = "pending_approval_owner_db_mismatch";
+const PENDING_APPROVAL_OWNER_FILE_BACKED_REQUIRED: &str =
+    "pending_approval_owner_file_backed_db_required";
 
 fn validate_pending_approval_session_key(session_key: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -161,6 +165,22 @@ impl ActiveAuthorizationOwner {
 impl std::fmt::Debug for ActiveAuthorizationOwner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ActiveAuthorizationOwner")
+            .field("state", &"exclusive")
+            .finish()
+    }
+}
+
+/// Lifetime-held, process-independent ownership proof for app-startup pending-approval
+/// reconciliation. The token is deliberately non-Clone and owns a dedicated OS lock that is
+/// separate from the 256 authorization-executor stripes.
+pub struct ActivePendingApprovalOwner {
+    _owner_lock: File,
+    db_identity: String,
+}
+
+impl std::fmt::Debug for ActivePendingApprovalOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActivePendingApprovalOwner")
             .field("state", &"exclusive")
             .finish()
     }
@@ -1213,6 +1233,38 @@ fn authorization_lock_dir(db_identity: &str) -> PathBuf {
     std::env::temp_dir()
         .join("deppy-authorization-locks")
         .join(hex_digest(&digest))
+}
+
+fn pending_approval_owner_lock_dir(db_identity: &str) -> PathBuf {
+    let digest = Sha256::digest(db_identity.as_bytes());
+    std::env::temp_dir()
+        .join("deppy-pending-approval-owner-locks")
+        .join(hex_digest(&digest))
+}
+
+fn open_pending_approval_owner_lock(path: &Path) -> anyhow::Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .context(PENDING_APPROVAL_OWNER_UNAVAILABLE)
+}
+
+fn acquire_pending_approval_owner_for_identity(
+    db_identity: &str,
+) -> anyhow::Result<ActivePendingApprovalOwner> {
+    let lock_dir = pending_approval_owner_lock_dir(db_identity);
+    fs::create_dir_all(&lock_dir).context(PENDING_APPROVAL_OWNER_UNAVAILABLE)?;
+    let owner_lock = open_pending_approval_owner_lock(&lock_dir.join("owner.lock"))?;
+    if fs2::FileExt::try_lock_exclusive(&owner_lock).is_err() {
+        anyhow::bail!(PENDING_APPROVAL_OWNER_UNAVAILABLE);
+    }
+    Ok(ActivePendingApprovalOwner {
+        _owner_lock: owner_lock,
+        db_identity: db_identity.to_owned(),
+    })
 }
 
 impl Db {
@@ -3351,9 +3403,35 @@ impl Db {
         mcp_store::expire_pending_approvals(&self.conn, older_than_epoch_secs, resolved_at)
     }
 
-    /// Denies bounded session-owned pending rows left by a prior app/runtime incarnation. Rows
-    /// without a runtime session key are owned by another authorization scope and remain intact.
+    /// Legacy compatibility entry point for callers not yet moved to app-held startup ownership.
+    /// Production app bootstrap must use [`Self::deny_session_scoped_pending_approvals_owned`]
+    /// after atomically acquiring [`Self::acquire_pending_approval_owner`].
     pub fn deny_session_scoped_pending_approvals(&self, resolved_at: i64) -> anyhow::Result<usize> {
+        mcp_store::deny_session_scoped_pending_approvals(&self.conn, resolved_at)
+    }
+
+    /// Non-blockingly acquires the single startup-reconciliation owner for this physical DB.
+    /// The dedicated namespace contains exactly one lock file and never shares authorization
+    /// executor stripes. Dropping the returned non-Clone token releases ownership.
+    pub fn acquire_pending_approval_owner(&self) -> anyhow::Result<ActivePendingApprovalOwner> {
+        anyhow::ensure!(
+            !self.authorization_db_identity.starts_with("memory:"),
+            PENDING_APPROVAL_OWNER_FILE_BACKED_REQUIRED
+        );
+        acquire_pending_approval_owner_for_identity(&self.authorization_db_identity)
+    }
+
+    /// Denies bounded session-owned pending rows only while the caller holds the exact physical
+    /// DB's lifetime owner. Cross-DB tokens fail before opening the reconciliation transaction.
+    pub fn deny_session_scoped_pending_approvals_owned(
+        &self,
+        owner: &ActivePendingApprovalOwner,
+        resolved_at: i64,
+    ) -> anyhow::Result<usize> {
+        anyhow::ensure!(
+            self.authorization_db_identity == owner.db_identity,
+            PENDING_APPROVAL_OWNER_DB_MISMATCH
+        );
         mcp_store::deny_session_scoped_pending_approvals(&self.conn, resolved_at)
     }
 
@@ -6676,6 +6754,155 @@ mod tests {
     }
 
     #[test]
+    fn pending_approval_owner는_physical_db별_배타적이고_drop후_해제된다() {
+        let (dir_a, path_a, db_a) = file_db("pending-owner-a");
+        let db_a_second = Db::open(&path_a).unwrap();
+        let (dir_b, _path_b, db_b) = file_db("pending-owner-b");
+        let owner_dir_a = pending_approval_owner_lock_dir(&db_a.authorization_db_identity);
+        let owner_dir_b = pending_approval_owner_lock_dir(&db_b.authorization_db_identity);
+        assert_ne!(
+            owner_dir_a,
+            authorization_lock_dir(&db_a.authorization_db_identity)
+        );
+
+        let owner_a = db_a.acquire_pending_approval_owner().unwrap();
+        let busy = db_a_second.acquire_pending_approval_owner().unwrap_err();
+        assert_eq!(busy.to_string(), PENDING_APPROVAL_OWNER_UNAVAILABLE);
+        let raw_path = path_a.to_string_lossy();
+        assert!(!format!("{busy:?}").contains(raw_path.as_ref()));
+        assert!(!format!("{busy:?}").contains(&db_a.authorization_db_identity));
+        let owner_b = db_b.acquire_pending_approval_owner().unwrap();
+        let debug = format!("{owner_a:?}");
+        assert_eq!(debug, "ActivePendingApprovalOwner { state: \"exclusive\" }");
+        assert!(!debug.contains(raw_path.as_ref()));
+        assert!(!debug.contains(&db_a.authorization_db_identity));
+
+        drop(owner_a);
+        drop(db_a_second.acquire_pending_approval_owner().unwrap());
+        for _ in 0..1024 {
+            drop(db_a.acquire_pending_approval_owner().unwrap());
+        }
+        let lock_files = fs::read_dir(&owner_dir_a)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(lock_files, [std::ffi::OsString::from("owner.lock")]);
+
+        drop(owner_b);
+        drop(db_b);
+        drop(db_a_second);
+        drop(db_a);
+        fs::remove_dir_all(owner_dir_b).unwrap();
+        fs::remove_dir_all(owner_dir_a).unwrap();
+        fs::remove_dir_all(dir_b).unwrap();
+        fs::remove_dir_all(dir_a).unwrap();
+    }
+
+    #[test]
+    fn pending_approval_owner는_file_backed_db만_허용한다() {
+        let db = Db::open_in_memory().unwrap();
+        let error = db.acquire_pending_approval_owner().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            PENDING_APPROVAL_OWNER_FILE_BACKED_REQUIRED
+        );
+        assert!(!format!("{error:?}").contains(&db.authorization_db_identity));
+    }
+
+    #[test]
+    fn pending_approval_reconciliation_owner는_db_identity에_묶이고_max에서_멱등이다() {
+        let (dir_a, _path_a, db_a) = file_db("pending-owner-max-a");
+        let (dir_b, path_b, db_b) = file_db("pending-owner-max-b");
+        let owner_dir_a = pending_approval_owner_lock_dir(&db_a.authorization_db_identity);
+        let owner_a = db_a.acquire_pending_approval_owner().unwrap();
+        let session = "315f68b6-333f-409f-a2c5-922b9eacfd7e:42";
+        let rows = (0..mcp_store::PENDING_APPROVAL_GLOBAL_LIMIT_MAX)
+            .map(|index| mcp_store::PendingApprovalInsert {
+                id: format!("owned-reconciliation-{index}"),
+                server_id: "srv".to_owned(),
+                tool_name: "tool".to_owned(),
+                arguments_preview: "{}".to_owned(),
+                schema_hash: None,
+                created_at: i64::try_from(index).unwrap(),
+                pane_id: Some(session.to_owned()),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mcp_store::insert_pending_approval_batch(&db_a.conn, &rows).unwrap(),
+            rows.len()
+        );
+        db_b.insert_pending_approval("foreign", "srv", "tool", "{}", None, 1, Some(session))
+            .unwrap();
+
+        let mismatch = db_b
+            .deny_session_scoped_pending_approvals_owned(&owner_a, 100)
+            .unwrap_err();
+        assert_eq!(mismatch.to_string(), PENDING_APPROVAL_OWNER_DB_MISMATCH);
+        let mismatch_debug = format!("{mismatch:?}");
+        assert!(!mismatch_debug.contains(path_b.to_string_lossy().as_ref()));
+        assert!(!mismatch_debug.contains(&db_a.authorization_db_identity));
+        assert!(!mismatch_debug.contains(&db_b.authorization_db_identity));
+        assert_eq!(
+            db_b.poll_approval("foreign").unwrap().status,
+            ApprovalStatus::Pending
+        );
+
+        assert_eq!(
+            db_a.deny_session_scoped_pending_approvals_owned(&owner_a, 200)
+                .unwrap(),
+            mcp_store::PENDING_APPROVAL_GLOBAL_LIMIT_MAX
+        );
+        assert_eq!(
+            db_a.deny_session_scoped_pending_approvals_owned(&owner_a, 300)
+                .unwrap(),
+            0
+        );
+
+        drop(owner_a);
+        drop(db_b);
+        drop(db_a);
+        fs::remove_dir_all(owner_dir_a).unwrap();
+        fs::remove_dir_all(dir_b).unwrap();
+        fs::remove_dir_all(dir_a).unwrap();
+    }
+
+    #[test]
+    fn owned_pending_approval_reconciliation_failure는_전체를_rollback한다() {
+        let (dir, _path, db) = file_db("pending-owner-rollback");
+        let owner_dir = pending_approval_owner_lock_dir(&db.authorization_db_identity);
+        let owner = db.acquire_pending_approval_owner().unwrap();
+        let session = "315f68b6-333f-409f-a2c5-922b9eacfd7e:43";
+        for id in ["owned-first", "owned-second"] {
+            db.insert_pending_approval(id, "srv", "tool", "{}", None, 1, Some(session))
+                .unwrap();
+        }
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_owned_reconciliation
+                 AFTER UPDATE OF status ON pending_approvals
+                 WHEN NEW.id = 'owned-second' AND NEW.status = 'denied'
+                 BEGIN SELECT RAISE(ABORT, 'injected owned reconciliation failure'); END;",
+            )
+            .unwrap();
+
+        assert!(
+            db.deny_session_scoped_pending_approvals_owned(&owner, 50)
+                .is_err()
+        );
+        for id in ["owned-first", "owned-second"] {
+            assert_eq!(
+                db.poll_approval(id).unwrap().status,
+                ApprovalStatus::Pending
+            );
+        }
+
+        drop(owner);
+        drop(db);
+        fs::remove_dir_all(owner_dir).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn authorization_owner는_live_scope를_배타화하고_drop후_same_scope만_unknown처리한다() {
         let (dir, path, db_a) = file_db("owner-recovery");
         let lock_dir = authorization_lock_dir(&db_a.authorization_db_identity);
@@ -7004,6 +7231,21 @@ mod tests {
         assert_eq!(db_a.authorization_db_identity, alias_identity);
         let lock_dir = authorization_lock_dir(&db_a.authorization_db_identity);
         assert_eq!(lock_dir, authorization_lock_dir(&alias_identity));
+        let pending_lock_dir = pending_approval_owner_lock_dir(&db_a.authorization_db_identity);
+        assert_eq!(
+            pending_lock_dir,
+            pending_approval_owner_lock_dir(&alias_identity)
+        );
+        let pending_owner =
+            acquire_pending_approval_owner_for_identity(&db_a.authorization_db_identity).unwrap();
+        assert_eq!(
+            acquire_pending_approval_owner_for_identity(&alias_identity)
+                .unwrap_err()
+                .to_string(),
+            PENDING_APPROVAL_OWNER_UNAVAILABLE
+        );
+        drop(pending_owner);
+        drop(acquire_pending_approval_owner_for_identity(&alias_identity).unwrap());
         fs::create_dir_all(&lock_dir).unwrap();
         let lock_path = lock_dir.join("stripe-000.lock");
         let first = open_lock_file(&lock_path).unwrap();
@@ -7013,6 +7255,7 @@ mod tests {
         drop(second);
         drop(first);
         drop(db_a);
+        fs::remove_dir_all(pending_lock_dir).unwrap();
         fs::remove_dir_all(lock_dir).unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
@@ -7031,6 +7274,8 @@ mod tests {
         let path = dir.join("metadata.sqlite3");
         File::create(&path).unwrap().write_all(b"old").unwrap();
         let old_identity = physical_db_identity(&path).unwrap();
+        let old_lock_dir = pending_approval_owner_lock_dir(&old_identity);
+        let old_owner = acquire_pending_approval_owner_for_identity(&old_identity).unwrap();
         let replacement = dir.join("replacement.sqlite3");
         File::create(&replacement)
             .unwrap()
@@ -7039,6 +7284,13 @@ mod tests {
         fs::rename(&replacement, &path).unwrap();
         let new_identity = physical_db_identity(&path).unwrap();
         assert_ne!(old_identity, new_identity);
+        let new_lock_dir = pending_approval_owner_lock_dir(&new_identity);
+        assert_ne!(old_lock_dir, new_lock_dir);
+        let new_owner = acquire_pending_approval_owner_for_identity(&new_identity).unwrap();
+        drop(new_owner);
+        drop(old_owner);
+        fs::remove_dir_all(new_lock_dir).unwrap();
+        fs::remove_dir_all(old_lock_dir).unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -1,5 +1,19 @@
 # PR-ST01 — Storage/Audit Transactions
 
+## 2026-07-22 pending-approval startup ownership amendment
+
+Startup reconciliation now requires a lifetime-held `ActivePendingApprovalOwner` bound to the
+exact physical database. Acquisition is nonblocking and uses one `owner.lock` in a hashed physical
+DB namespace that is completely separate from the 256 authorization-executor stripes. The token
+is non-Clone, its Debug is redacted, and cross-DB use fails before transaction entry.
+
+Tests prove same-DB exclusion, independent-DB concurrency, drop release, hardlink-alias
+competition, atomic path-replacement identity separation, cross-DB no-mutation, one-file
+cardinality after 1,024 acquisitions, sanitized errors, 256-row bounded/idempotent reconciliation,
+and injected-failure rollback. Root verification passes all 138 storage tests plus doc-tests,
+all-target check, strict Clippy, package fmt, and scoped diff-check. The unowned API remains only as
+temporary app-cutover compatibility and must be removed when IN01 adopts the owned call.
+
 ## 2026-07-22 bounded approval-inbox amendment
 
 The durable approval inbox now fails closed at 256 live rows globally and per runtime session, with

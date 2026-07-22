@@ -3,10 +3,10 @@
 
 mod db;
 pub use db::{
-    ActiveAuthorizationOwner, AgentConfigRow, AgentSessionRow, ApprovalOutcome, ApprovalStatus,
-    CREDENTIAL_OAUTH_BINDING_BYTES_MAX, CREDENTIAL_SECRET_LOCATION_BYTES_MAX,
-    CREDENTIAL_SECRET_RECORD_BYTES_MAX, ConnectorConfigCas, ConnectorConfigRead,
-    ConnectorConfigRevision, CredentialMeta, CredentialOAuthBindingRecord,
+    ActiveAuthorizationOwner, ActivePendingApprovalOwner, AgentConfigRow, AgentSessionRow,
+    ApprovalOutcome, ApprovalStatus, CREDENTIAL_OAUTH_BINDING_BYTES_MAX,
+    CREDENTIAL_SECRET_LOCATION_BYTES_MAX, CREDENTIAL_SECRET_RECORD_BYTES_MAX, ConnectorConfigCas,
+    ConnectorConfigRead, ConnectorConfigRevision, CredentialMeta, CredentialOAuthBindingRecord,
     CredentialSecretLocation, CredentialSecretRecord, Db, EnvApiProjectCount, EnvProfileRow,
     EnvValue, EnvVarRow, HookSessionRow, PENDING_APPROVAL_SESSION_CLEANUP_LIMIT_MAX,
     PENDING_APPROVAL_SESSION_KEY_BYTES_MAX, PHYSICAL_SECRET_SLOT_RECONCILIATION_BYTES_MAX,

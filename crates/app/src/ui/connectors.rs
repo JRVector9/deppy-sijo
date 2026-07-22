@@ -2708,7 +2708,18 @@ fn run_http<T>(
     spec: &HttpConnectSpec,
     run: impl Fn(&McpHttpServerConfig) -> anyhow::Result<T>,
 ) -> (Result<T, ExecFailure>, Option<RefreshUpdate>) {
-    let mut config = spec.config.clone();
+    // `McpHttpServerConfig` is intentionally non-Clone because it may own a bearer. The legacy
+    // Connector path still needs a per-request owner until IN01 deletes this module, so rebuild it
+    // explicitly and keep the secret copy visible at this one transition point.
+    let mut config = McpHttpServerConfig {
+        name: spec.config.name.clone(),
+        url: spec.config.url.clone(),
+        bearer: spec
+            .config
+            .bearer
+            .as_ref()
+            .map(|bearer| SecretString::new(bearer.expose().to_owned())),
+    };
     // keyring 해석(access/DCR secret)은 이 백그라운드 실행 스레드에서만 한다 —
     // UI 스레드가 프로세스 전역 KEYRING_SERIAL을 잡고(runtime worker와 경합,
     // 키체인 승인 다이얼로그 시 무기한) 프레임을 멈추지 않게 한다.

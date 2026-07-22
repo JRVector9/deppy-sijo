@@ -21,7 +21,10 @@ pub use limits::{
     MAX_HTTP_SENDS, MAX_RAW_MCP_RESPONSE_BYTES, MAX_TOOL_DESCRIPTOR_BYTES, MAX_TOOL_INPUT_BYTES,
     MAX_TOOLS_PER_SERVER, McpPayloadKind, enforce_json_payload, enforce_payload_bytes,
 };
-pub use manager::{LocalMcpManager, McpConnection, McpServerConfig, McpTool, PROTOCOL_VERSION};
+pub use manager::{
+    LocalMcpManager, McpCancellationHandle, McpConnection, McpServerConfig, McpStdioConnectConfig,
+    McpTool, PROTOCOL_VERSION,
+};
 pub use metrics::{McpTransportMetrics, transport_metrics};
 pub use proxy::{
     AuthorizedToolError, AuthorizedToolExecutor, AuthorizedToolOutcome, SensitiveToolInput,

@@ -15,7 +15,7 @@ use crate::limits::{
     MAX_TOOL_DESCRIPTOR_BYTES, MAX_TOOLS_PER_SERVER, McpPayloadKind, enforce_json_payload,
     serialized_json_len,
 };
-use crate::transport::StdioClient;
+use crate::transport::{StdioCancellationHandle, StdioClient};
 
 /// initialize 요청에 싣는 기준 스펙 개정판 (§1.5 — 최신 우선).
 /// VS Code도 요청에는 최신 하나만 보낸다(버전별 분기 없음) — 서버가 자기 버전으로
@@ -34,13 +34,39 @@ const MAX_TOOL_PAGES: usize = 100;
 
 /// local stdio MCP 서버 실행 스펙 (§11.4 kind='stdio' 행에 대응).
 /// scoped env secret은 spawn 직전 호출측이 해석해 env에 넣는다. Debug는 env 값을 출력하지 않는다.
-#[derive(Clone, PartialEq)]
+#[derive(PartialEq)]
 pub struct McpServerConfig {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub inherit_env: bool,
+}
+
+/// Non-Clone production stdio connect target. Secret environment values are zeroizing owners and
+/// are moved into this type exactly once; they are never represented by the legacy string-valued
+/// `McpServerConfig`.
+pub struct McpStdioConnectConfig {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub plain_env: Vec<(String, String)>,
+    pub secret_env: Vec<(String, secret::SecretString)>,
+    pub inherit_env: bool,
+}
+
+impl std::fmt::Debug for McpStdioConnectConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpStdioConnectConfig")
+            .field("name", &self.name)
+            .field("command", &"REDACTED")
+            .field("args", &format_args!("REDACTED({})", self.args.len()))
+            .field("plain_env_count", &self.plain_env.len())
+            .field("secret_env_count", &self.secret_env.len())
+            .field("inherit_env", &self.inherit_env)
+            .finish()
+    }
 }
 
 impl McpServerConfig {
@@ -65,12 +91,11 @@ impl McpServerConfig {
 
 impl std::fmt::Debug for McpServerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let env_keys: Vec<&str> = self.env.iter().map(|(key, _)| key.as_str()).collect();
         f.debug_struct("McpServerConfig")
             .field("name", &self.name)
-            .field("command", &self.command)
-            .field("args", &self.args)
-            .field("env_keys", &env_keys)
+            .field("command", &"REDACTED")
+            .field("args", &format_args!("REDACTED({})", self.args.len()))
+            .field("env_count", &self.env.len())
             .field("inherit_env", &self.inherit_env)
             .finish()
     }
@@ -108,15 +133,52 @@ impl LocalMcpManager {
     /// 서버 spawn → initialize 핸드셰이크 → initialized notification.
     /// 반환된 연결이 drop되면 서버 프로세스는 kill + reap된다.
     pub fn connect(&self, config: &McpServerConfig) -> anyhow::Result<McpConnection> {
-        let mut client = StdioClient::spawn(
+        self.connect_stdio_parts(
+            McpStdioConnectConfig {
+                name: config.name.clone(),
+                command: config.command.clone(),
+                args: config.args.clone(),
+                plain_env: config.env.clone(),
+                secret_env: Vec::new(),
+                inherit_env: config.inherit_env,
+            },
+            None,
+        )
+    }
+
+    pub fn connect_scoped(&self, config: McpStdioConnectConfig) -> anyhow::Result<McpConnection> {
+        self.connect_stdio_parts(config, None)
+    }
+
+    pub fn connect_scoped_cancellable(
+        &self,
+        config: McpStdioConnectConfig,
+        cancellation_ready: impl FnOnce(McpCancellationHandle),
+    ) -> anyhow::Result<McpConnection> {
+        self.connect_stdio_parts(config, Some(Box::new(cancellation_ready)))
+    }
+
+    fn connect_stdio_parts(
+        &self,
+        config: McpStdioConnectConfig,
+        cancellation_ready: Option<Box<dyn FnOnce(McpCancellationHandle) + '_>>,
+    ) -> anyhow::Result<McpConnection> {
+        let mut client = StdioClient::spawn_with_secret_env(
             &config.command,
             &config.args,
-            &config.env,
+            &config.plain_env,
+            &config.secret_env,
             config.inherit_env,
             &self.redaction,
             self.request_timeout,
         )
         .with_context(|| format!("MCP 서버 '{}' spawn 실패", config.name))?;
+        let cancellation = McpCancellationHandle {
+            inner: CancellationHandleKind::Stdio(client.cancellation_handle()),
+        };
+        if let Some(cancellation_ready) = cancellation_ready {
+            cancellation_ready(cancellation.clone());
+        }
 
         let initialize_result = client
             .request(
@@ -140,6 +202,7 @@ impl LocalMcpManager {
 
         Ok(McpConnection {
             client: TransportClient::Stdio(client),
+            cancellation,
             initialize_result,
             negotiated_version: negotiated,
         })
@@ -152,11 +215,30 @@ impl LocalMcpManager {
         let (client, initialize_result, negotiated) =
             HttpClient::connect(config, self.request_timeout)
                 .with_context(|| format!("MCP 서버 '{}' HTTP 연결 실패", config.name))?;
-        Ok(McpConnection {
+        Ok(Self::http_connection(client, initialize_result, negotiated))
+    }
+
+    pub fn connect_http_owned(&self, config: McpHttpServerConfig) -> anyhow::Result<McpConnection> {
+        let name = config.name.clone();
+        let (client, initialize_result, negotiated) =
+            HttpClient::connect_owned(config, self.request_timeout)
+                .with_context(|| format!("MCP 서버 '{name}' HTTP 연결 실패"))?;
+        Ok(Self::http_connection(client, initialize_result, negotiated))
+    }
+
+    fn http_connection(
+        client: HttpClient,
+        initialize_result: Value,
+        negotiated: String,
+    ) -> McpConnection {
+        McpConnection {
             client: TransportClient::Http(client),
+            cancellation: McpCancellationHandle {
+                inner: CancellationHandleKind::Http,
+            },
             initialize_result,
             negotiated_version: negotiated,
-        })
+        }
     }
 
     /// connect → tools/list → 연결 종료(kill/reap)까지 한 번에.
@@ -253,11 +335,38 @@ impl TransportClient {
     }
 }
 
+#[derive(Clone, Debug)]
+enum CancellationHandleKind {
+    Stdio(StdioCancellationHandle),
+    Http,
+}
+
+/// Cloneable cancellation capability for an active MCP request. It deliberately owns no config,
+/// bearer, response, or tool payload. Stdio cancellation can therefore kill/reap a hung process
+/// while the connection itself is mutably borrowed by another thread. Sync HTTP remains governed
+/// by its transport deadline and bounded sender permits.
+#[derive(Clone, Debug)]
+pub struct McpCancellationHandle {
+    inner: CancellationHandleKind,
+}
+
+impl McpCancellationHandle {
+    pub fn cancel(&self) {
+        match &self.inner {
+            CancellationHandleKind::Stdio(handle) => {
+                handle.cancel();
+            }
+            CancellationHandleKind::Http => {}
+        }
+    }
+}
+
 /// initialize를 마친 MCP 연결 (stdio 또는 Streamable HTTP).
 /// drop 시 stdio는 서버 프로세스를 kill + reap하고, HTTP는 세션을 DELETE한다.
 #[derive(Debug)]
 pub struct McpConnection {
     client: TransportClient,
+    cancellation: McpCancellationHandle,
     /// initialize 응답 원본 (protocolVersion / capabilities / serverInfo)
     pub initialize_result: Value,
     /// 협상된 프로토콜 버전 (H1) — HTTP transport(H2)가 이후 요청의
@@ -268,6 +377,10 @@ pub struct McpConnection {
 }
 
 impl McpConnection {
+    pub fn cancellation_handle(&self) -> McpCancellationHandle {
+        self.cancellation.clone()
+    }
+
     /// tools/list 요청 → tool 목록 (cursor 페이지네이션 포함).
     pub fn list_tools(&mut self) -> anyhow::Result<Vec<McpTool>> {
         let mut discovery = ToolDiscovery::production();
@@ -295,11 +408,24 @@ impl McpConnection {
             .request("tools/call", json!({"name": name, "arguments": arguments}))
     }
 
+    /// Service-facing byte API keeps serde and MCP wire values inside this crate. Input must be a
+    /// bounded JSON object; the returned string is capped by the transport response ceiling.
+    pub fn call_tool_json(&mut self, name: &str, arguments_json: &[u8]) -> anyhow::Result<String> {
+        crate::limits::enforce_payload_bytes(McpPayloadKind::ToolInput, arguments_json.len())?;
+        let arguments: Value = serde_json::from_slice(arguments_json)
+            .context("tools/call arguments JSON parsing failed")?;
+        let result = self.call_tool(name, arguments)?;
+        let output = serde_json::to_string(&result)?;
+        crate::limits::enforce_payload_bytes(McpPayloadKind::RawResponse, output.len())?;
+        Ok(output)
+    }
+
     /// Cancel and release transport-owned resources. Stdio cancellation closes stdin,
     /// kills the entire process group, reaps the direct child, and joins pipe threads.
     /// Sync ureq cannot be force-cancelled; its deadline returns to the caller while the
     /// bounded HTTP sender retains its permit until the socket operation exits.
     pub fn cancel(&mut self) {
+        self.cancellation.cancel();
         self.client.cancel();
     }
 
@@ -581,6 +707,10 @@ printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"%s","inputSchema":{"
             !format!("{config:?}").contains("scoped_env_tool"),
             "Debug must not expose env values"
         );
+        assert!(
+            !format!("{config:?}").contains(&config.command),
+            "Debug must not expose the command"
+        );
     }
 
     #[test]
@@ -615,6 +745,48 @@ printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"%s","inputSchema":{"
             }
             assert!(Instant::now() < deadline, "stderr 미도착: {log:?}");
             std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn cloneable_cancel_interrupts_hung_stdio_request_and_reaps_resources() {
+        let script = r#"
+read -r _init
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"mock","version":"0"}}}'
+read -r _initialized
+read -r _list
+sleep 30
+"#;
+        let manager = LocalMcpManager::new(RedactionService::new())
+            .with_request_timeout(Duration::from_secs(10));
+        let mut connection = manager.connect(&sh_config(script)).unwrap();
+        let cancellation = connection.cancellation_handle();
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let request_ready = std::sync::Arc::clone(&ready);
+        let request = std::thread::spawn(move || {
+            request_ready.wait();
+            connection.list_tools()
+        });
+
+        ready.wait();
+        std::thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        cancellation.cancel();
+        let error = request.join().unwrap().unwrap_err();
+        assert!(!format!("{error:#}").is_empty());
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let metrics = crate::transport_metrics();
+            if metrics.stdio_stdout_threads == 0
+                && metrics.stdio_stderr_threads == 0
+                && metrics.stdio_writer_threads == 0
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "stdio resources were not reaped");
+            std::thread::yield_now();
         }
     }
 

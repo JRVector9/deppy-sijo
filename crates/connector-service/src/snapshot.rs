@@ -3,16 +3,20 @@ use std::sync::{Arc, Mutex};
 
 use connector_contract::{ConnectorSnapshot, Revision};
 
+use crate::ConnectorHost;
+
 pub(crate) struct SnapshotCell {
     revision: AtomicU64,
     value: Mutex<Arc<ConnectorSnapshot>>,
+    host: Arc<dyn ConnectorHost>,
 }
 
 impl SnapshotCell {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(host: Arc<dyn ConnectorHost>) -> Self {
         Self {
             revision: AtomicU64::new(0),
             value: Mutex::new(Arc::new(ConnectorSnapshot::default())),
+            host,
         }
     }
 
@@ -29,6 +33,9 @@ impl SnapshotCell {
         next.revision = Revision(revision);
         *self.value.lock().expect("connector snapshot lock") = Arc::new(next);
         self.revision.store(revision, Ordering::Release);
+        // Wake only after the new Arc and revision are both observable. The host callback is
+        // event-driven and may coalesce repaint requests; it must never poll this cell.
+        self.host.wake();
         revision
     }
 }

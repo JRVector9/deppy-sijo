@@ -72,23 +72,9 @@ impl std::fmt::Debug for McpHttpServerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("McpHttpServerConfig")
             .field("name", &self.name)
-            .field("url", &self.url)
+            .field("url", &"REDACTED")
             .field("bearer", &self.bearer.as_ref().map(|_| "REDACTED"))
             .finish()
-    }
-}
-
-impl Clone for McpHttpServerConfig {
-    /// SecretString은 우발 복제 방지를 위해 Clone을 제공하지 않으므로 명시적으로 재포장한다.
-    fn clone(&self) -> Self {
-        Self {
-            name: self.name.clone(),
-            url: self.url.clone(),
-            bearer: self
-                .bearer
-                .as_ref()
-                .map(|bearer| SecretString::new(bearer.expose().to_owned())),
-        }
     }
 }
 
@@ -247,13 +233,13 @@ pub(crate) struct HttpClient {
 }
 
 impl std::fmt::Debug for HttpClient {
-    /// bearer(Authorization 값)는 Debug에 노출하지 않는다.
+    /// Dynamic endpoint/server/session and bearer values are never exposed to diagnostics.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpClient")
-            .field("url", &self.url.as_str())
-            .field("server_name", &self.server_name)
+            .field("url", &"REDACTED")
+            .field("server_name", &"REDACTED")
             .field("bearer", &self.bearer.as_ref().map(|_| "REDACTED"))
-            .field("session_id", &self.session_id)
+            .field("session_id_present", &self.session_id.is_some())
             .field("negotiated_version", &self.negotiated_version)
             .finish()
     }
@@ -264,6 +250,23 @@ impl HttpClient {
     /// initialized notification. 성공 시 (client, initialize 결과, 협상 버전).
     pub(crate) fn connect(
         config: &McpHttpServerConfig,
+        request_timeout: Duration,
+    ) -> anyhow::Result<(Self, Value, String)> {
+        Self::connect_owned(
+            McpHttpServerConfig {
+                name: config.name.clone(),
+                url: config.url.clone(),
+                bearer: config
+                    .bearer
+                    .as_ref()
+                    .map(|bearer| SecretString::new(bearer.expose().to_owned())),
+            },
+            request_timeout,
+        )
+    }
+
+    pub(crate) fn connect_owned(
+        config: McpHttpServerConfig,
         request_timeout: Duration,
     ) -> anyhow::Result<(Self, Value, String)> {
         let url = parse_validated_url(&config.url)?;
@@ -281,11 +284,8 @@ impl HttpClient {
         let mut client = Self {
             agent,
             url,
-            server_name: config.name.clone(),
-            bearer: config
-                .bearer
-                .as_ref()
-                .map(|bearer| SecretString::new(bearer.expose().to_owned())),
+            server_name: config.name,
+            bearer: config.bearer,
             session_id: None,
             negotiated_version: None,
             next_id: 1,
@@ -2581,11 +2581,39 @@ mod tests {
             !format!("{config:?}").contains(token),
             "config Debug에 bearer 평문 노출"
         );
+        assert!(
+            !format!("{config:?}").contains(&config.url),
+            "config Debug에 endpoint URL 노출"
+        );
 
         let error = manager().discover_tools_http(&config).unwrap_err();
         let text = format!("{error:#}");
         assert!(!text.contains(token), "에러에 bearer 평문 노출: {text}");
         assert!(text.contains("[REDACTED]"), "{text}");
+    }
+
+    #[test]
+    fn http_client_debug는_endpoint_server_session을_비노출() {
+        let raw_url = "https://private.example.invalid/mcp";
+        let raw_name = "private-server-name-42";
+        let session_id = "private-session-id-42";
+        let mut client = HttpClient {
+            agent: ureq::AgentBuilder::new().build(),
+            url: Url::parse(raw_url).unwrap(),
+            server_name: raw_name.to_owned(),
+            bearer: None,
+            session_id: Some(session_id.to_owned()),
+            negotiated_version: Some(PROTOCOL_VERSION.to_owned()),
+            next_id: 2,
+            request_timeout: Duration::from_secs(1),
+        };
+
+        let debug = format!("{client:?}");
+        assert!(!debug.contains(raw_url), "{debug}");
+        assert!(!debug.contains(raw_name), "{debug}");
+        assert!(!debug.contains(session_id), "{debug}");
+        assert!(debug.contains("session_id_present: true"), "{debug}");
+        client.session_id = None;
     }
 
     #[test]

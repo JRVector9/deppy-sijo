@@ -35,6 +35,36 @@ const VIOLATION_SNIPPET_CHARS: usize = 200;
 /// redacted stderr 로그 버퍼 — stderr thread가 채우고 stderr_log()가 읽는다.
 type SharedStderrLog = Arc<Mutex<Vec<u8>>>;
 
+/// Process ownership shared with a cloneable cancellation handle. The request thread never holds
+/// this lock while waiting for stdout, so another thread can kill and reap a hung stdio backend
+/// without first acquiring `&mut McpConnection`.
+#[derive(Clone)]
+pub(crate) struct StdioCancellationHandle {
+    process: Arc<Mutex<Option<Child>>>,
+}
+
+impl std::fmt::Debug for StdioCancellationHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("StdioCancellationHandle")
+    }
+}
+
+impl StdioCancellationHandle {
+    pub(crate) fn cancel(&self) -> Option<std::process::ExitStatus> {
+        let mut process = self.process.lock().expect("MCP stdio process lock");
+        let mut child = process.take()?;
+        kill_and_reap(&mut child)
+    }
+
+    #[cfg(test)]
+    fn is_reaped(&self) -> bool {
+        self.process
+            .lock()
+            .expect("MCP stdio process lock")
+            .is_none()
+    }
+}
+
 /// stdout reader thread → 요청자에게 전달되는 이벤트.
 /// 채널 disconnect는 EOF(서버 종료 또는 stdout 닫힘)를 뜻한다 — pty crate와 동일 규약.
 enum ReaderEvent {
@@ -71,7 +101,7 @@ struct StdioWiring {
 /// 요청은 단일 스레드(호출측)에서 순차 실행을 전제한다 — v0 discovery flow(§1.5).
 #[derive(Debug)]
 pub(crate) struct StdioClient {
-    child: Child,
+    process: Arc<Mutex<Option<Child>>>,
     stdin: Option<ChildStdin>,
     events: Option<Receiver<ReaderEvent>>,
     stdout_thread: Option<JoinHandle<()>>,
@@ -81,8 +111,6 @@ pub(crate) struct StdioClient {
     stderr_log: SharedStderrLog,
     /// 위반 발생 후 이 연결은 재사용 금지 (stdout 신뢰 불가)
     violation: Option<String>,
-    /// try_wait로 이미 reap된 child — 이후 kill/killpg 금지 (PID 재사용 위험)
-    reaped: bool,
     #[cfg(test)]
     write_drop_observer: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
@@ -90,10 +118,31 @@ pub(crate) struct StdioClient {
 impl StdioClient {
     /// MCP 서버 subprocess spawn + stdout/stderr reader thread 기동.
     /// scoped env는 여기에만 적용한다. inherit_env=false면 parent env를 지우고 명시 env만 주입한다.
+    #[cfg(test)]
     pub(crate) fn spawn(
         command: &str,
         args: &[String],
         env: &[(String, String)],
+        inherit_env: bool,
+        redaction: &RedactionService,
+        request_timeout: Duration,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_with_secret_env(
+            command,
+            args,
+            env,
+            &[],
+            inherit_env,
+            redaction,
+            request_timeout,
+        )
+    }
+
+    pub(crate) fn spawn_with_secret_env(
+        command: &str,
+        args: &[String],
+        plain_env: &[(String, String)],
+        secret_env: &[(String, secret::SecretString)],
         inherit_env: bool,
         redaction: &RedactionService,
         request_timeout: Duration,
@@ -104,10 +153,13 @@ impl StdioClient {
         }
         builder
             .args(args)
-            .envs(env.iter().map(|(key, value)| (key, value)))
+            .envs(plain_env.iter().map(|(key, value)| (key, value)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for (key, value) in secret_env {
+            builder.env(key, value.expose());
+        }
         // 자체 process group으로 분리 — command가 wrapper 셸이어도 종료 시
         // grandchild까지 killpg로 정리할 수 있게 한다 (pty crate의 killpg 관행).
         #[cfg(unix)]
@@ -119,7 +171,7 @@ impl StdioClient {
         // 들어가기 전이므로 Drop 정리가 없다 — 여기서 직접 kill + reap 한다.
         match Self::wire(&mut child, redaction) {
             Ok(wiring) => Ok(Self {
-                child,
+                process: Arc::new(Mutex::new(Some(child))),
                 stdin: Some(wiring.stdin),
                 events: Some(wiring.events),
                 stdout_thread: Some(wiring.stdout_thread),
@@ -128,7 +180,6 @@ impl StdioClient {
                 request_timeout,
                 stderr_log: wiring.stderr_log,
                 violation: None,
-                reaped: false,
                 #[cfg(test)]
                 write_drop_observer: None,
             }),
@@ -415,14 +466,15 @@ impl StdioClient {
         self.terminate();
     }
 
+    pub(crate) fn cancellation_handle(&self) -> StdioCancellationHandle {
+        StdioCancellationHandle {
+            process: Arc::clone(&self.process),
+        }
+    }
+
     fn terminate(&mut self) -> Option<std::process::ExitStatus> {
         drop(self.stdin.take());
-        let status = if self.reaped {
-            None
-        } else {
-            self.reaped = true;
-            kill_and_reap(&mut self.child)
-        };
+        let status = self.cancellation_handle().cancel();
         // A reader may be blocked on the bounded channel. Drop the receiver before
         // joining so the send fails, then wait for both pipe-owning threads to exit.
         drop(self.events.take());
@@ -457,7 +509,7 @@ impl Drop for StdioClient {
 /// spawn에서 process_group(0)으로 분리했으므로 pgid == child pid.
 /// killpg(그룹 정리) → kill → wait(reap) 순서 고정. reap 전에는 PID가
 /// 재사용되지 않으므로 이 순서에서만 killpg가 안전하다 — 호출측은 reap 이후
-/// (reaped=true) 다시 부르면 안 된다. wait 결과(exit status)를 돌려준다.
+/// 이미 공유 process slot에서 꺼낸 child에는 다시 호출하면 안 된다. wait 결과를 돌려준다.
 fn kill_and_reap(child: &mut Child) -> Option<std::process::ExitStatus> {
     #[cfg(unix)]
     unsafe {
@@ -735,12 +787,10 @@ mod tests {
     #[test]
     fn tools_call_external_cancel_after_write_is_delivery_unknown() {
         let mut client = scripted_stdio("IFS= read -r _request; sleep 30", Duration::from_secs(2));
-        let process_group = client.child.id() as libc::pid_t;
+        let cancellation = client.cancellation_handle();
         let cancel = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
-            // SAFETY: the fixture child is spawned as its own process group and remains owned by
-            // the request thread until it observes EOF and reaps it.
-            unsafe { libc::killpg(process_group, libc::SIGKILL) };
+            cancellation.cancel();
         });
 
         let error = client
@@ -813,7 +863,7 @@ mod tests {
 
         client.cancel();
 
-        assert!(client.reaped);
+        assert!(client.cancellation_handle().is_reaped());
         assert!(client.stdin.is_none());
         assert!(client.events.is_none());
         assert!(client.stdout_thread.is_none());

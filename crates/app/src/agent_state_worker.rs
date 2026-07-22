@@ -17,6 +17,8 @@ pub(crate) const AGENT_STATE_CONTINUATION_MAX: usize = 8;
 pub(crate) const AGENT_STATE_PENDING_BYTES_MAX: usize = 4 * 1024 * 1024;
 pub(crate) const AGENT_STATE_STRUCTURED_BATCH_MAX: usize = 16;
 pub(crate) const AGENT_STATE_STRUCTURED_BATCH_BYTES_MAX: usize = 512 * 1024;
+pub(crate) const AGENT_STATE_BINDING_RECONCILE_MAX: usize = 256;
+pub(crate) const AGENT_STATE_BINDING_RECONCILE_BYTES_MAX: usize = AGENT_STATE_PENDING_BYTES_MAX;
 const AGENT_STATE_SINGLE_EXACT_BYTES_MAX: usize = 32 * 1024;
 const AGENT_STATE_PROJECTION_JOB_BYTES_MAX: usize = 4 * 1024 * 1024;
 const AGENT_STATE_PROJECTION_RESULT_BYTES_MAX: usize = 4 * 1024 * 1024;
@@ -154,7 +156,14 @@ impl fmt::Debug for AgentStateRevision {
 pub(crate) enum ExactKind {
     TurnDoneClear,
     BindingDelete,
-    StructuredBatch { items: usize },
+    /// Final authoritative desired state. `items` is the greater of the live-pane and desired-row
+    /// counts, so an empty reconcile remains a meaningful exact operation that clears stale rows.
+    BindingReconcile {
+        items: usize,
+    },
+    StructuredBatch {
+        items: usize,
+    },
 }
 
 impl fmt::Debug for ExactKind {
@@ -162,6 +171,10 @@ impl fmt::Debug for ExactKind {
         match self {
             Self::TurnDoneClear => formatter.write_str("turn_done_clear"),
             Self::BindingDelete => formatter.write_str("binding_delete"),
+            Self::BindingReconcile { items } => formatter
+                .debug_struct("binding_reconcile")
+                .field("items", items)
+                .finish(),
             Self::StructuredBatch { items } => formatter
                 .debug_struct("structured_batch")
                 .field("items", items)
@@ -675,6 +688,13 @@ impl<B: AgentStateBackend> AgentStateWorker<B> {
                     return Err(StageError::ResourceLimit);
                 }
             }
+            ExactKind::BindingReconcile { items } => {
+                if items > AGENT_STATE_BINDING_RECONCILE_MAX
+                    || retained_bytes > AGENT_STATE_BINDING_RECONCILE_BYTES_MAX
+                {
+                    return Err(StageError::ResourceLimit);
+                }
+            }
             ExactKind::StructuredBatch { items } => {
                 if items == 0
                     || items > AGENT_STATE_STRUCTURED_BATCH_MAX
@@ -1033,6 +1053,7 @@ impl<B: AgentStateBackend> AgentStateWorker<B> {
         }
         self.begin_shutdown();
         let mut completions = Vec::with_capacity(self.exact_operation_ids.len());
+        let mut known_unsent_restart_used = false;
         loop {
             if self.in_flight.is_some() {
                 match self.recv_outcome_blocking() {
@@ -1064,9 +1085,13 @@ impl<B: AgentStateBackend> AgentStateWorker<B> {
             match self.admit() {
                 Ok(()) => {}
                 Err(AdmissionError::WorkerUnavailable) => {
-                    // The job is restored before this error is returned, so none of these queued
-                    // continuations has an unknown delivery. Fail them once instead of respawning
-                    // forever during process shutdown.
+                    // The job is restored before this error is returned, so delivery is known not
+                    // to have happened. Permit one fresh worker for the entire bounded shutdown
+                    // drain, then fail the remaining FIFO once rather than respawning forever.
+                    if !known_unsent_restart_used {
+                        known_unsent_restart_used = true;
+                        continue;
+                    }
                     self.drain_queued_exact_as_failed(
                         AgentStateErrorCode::WorkerUnavailable,
                         &mut completions,
@@ -1442,6 +1467,65 @@ mod tests {
                 .stage_exact(103, ExactKind::BindingDelete, oversized_binding_delete),
             Err(StageError::ResourceLimit)
         );
+
+        let reconcile_at_limit = Arc::new(TestPayload {
+            marker: "binding-reconcile-at-limit",
+            bytes: AGENT_STATE_BINDING_RECONCILE_BYTES_MAX,
+        });
+        harness
+            .worker
+            .stage_exact(
+                104,
+                ExactKind::BindingReconcile {
+                    items: AGENT_STATE_BINDING_RECONCILE_MAX,
+                },
+                reconcile_at_limit,
+            )
+            .unwrap();
+        harness.worker.admit().unwrap();
+        let mut outcome = harness.wait_outcome();
+        let exact = outcome.take_exact().unwrap();
+        assert_eq!(
+            exact.continuation().kind(),
+            ExactKind::BindingReconcile {
+                items: AGENT_STATE_BINDING_RECONCILE_MAX
+            }
+        );
+        assert_eq!(exact.result(), Ok(()));
+
+        assert_eq!(
+            harness.worker.stage_exact(
+                105,
+                ExactKind::BindingReconcile {
+                    items: AGENT_STATE_BINDING_RECONCILE_MAX + 1,
+                },
+                Harness::payload("binding-reconcile-too-many"),
+            ),
+            Err(StageError::ResourceLimit)
+        );
+        assert_eq!(
+            harness.worker.stage_exact(
+                106,
+                ExactKind::BindingReconcile { items: 0 },
+                Arc::new(TestPayload {
+                    marker: "binding-reconcile-too-large",
+                    bytes: AGENT_STATE_BINDING_RECONCILE_BYTES_MAX + 1,
+                }),
+            ),
+            Err(StageError::ResourceLimit)
+        );
+
+        harness
+            .worker
+            .stage_exact(
+                107,
+                ExactKind::BindingReconcile { items: 0 },
+                Harness::payload("binding-reconcile-empty"),
+            )
+            .unwrap();
+        harness.worker.admit().unwrap();
+        let mut outcome = harness.wait_outcome();
+        assert_eq!(outcome.take_exact().unwrap().result(), Ok(()));
     }
 
     #[test]
@@ -1513,7 +1597,8 @@ mod tests {
         for (operation_id, kind, marker) in [
             (20, ExactKind::TurnDoneClear, "first"),
             (21, ExactKind::BindingDelete, "second"),
-            (22, ExactKind::StructuredBatch { items: 1 }, "third"),
+            (22, ExactKind::BindingReconcile { items: 2 }, "third"),
+            (23, ExactKind::StructuredBatch { items: 1 }, "fourth"),
         ] {
             harness
                 .worker
@@ -1530,7 +1615,7 @@ mod tests {
                 .iter()
                 .map(|completion| completion.continuation().operation_id())
                 .collect::<Vec<_>>(),
-            [20, 21, 22]
+            [20, 21, 22, 23]
         );
         assert!(
             completions
@@ -1543,16 +1628,17 @@ mod tests {
                 ("first", AgentStateSection::BindingSync),
                 ("second", AgentStateSection::BindingSync),
                 ("third", AgentStateSection::BindingSync),
+                ("fourth", AgentStateSection::BindingSync),
             ]
         );
-        assert_eq!(harness.state.aggregate_calls.load(Ordering::Acquire), 3);
+        assert_eq!(harness.state.aggregate_calls.load(Ordering::Acquire), 4);
         assert_eq!(harness.worker.pending_exact_count(), 0);
         assert_eq!(harness.worker.pending_exact_bytes(), 0);
         assert!(!harness.worker.has_live_slot());
         assert_eq!(
             harness
                 .worker
-                .stage_exact(23, ExactKind::TurnDoneClear, Harness::payload("closed")),
+                .stage_exact(24, ExactKind::TurnDoneClear, Harness::payload("closed")),
             Err(StageError::Closed)
         );
         assert!(harness.worker.shutdown_drain().is_empty());

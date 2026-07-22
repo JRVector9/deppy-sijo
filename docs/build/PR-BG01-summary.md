@@ -142,6 +142,17 @@ with only the expected pre-wiring dead-code lint excluded. Scoped rustfmt, diff,
 checks pass. Literal strict Clippy and removal of the legacy direct app path remain atomic cutover
 gates; this foundation is not a production dual-path completion claim.
 
+The shutdown durability amendment adds authoritative `BindingReconcile { items }` exact work.
+Its item bound matches storage's maximum of 256 live/desired rows, its retained payload is capped
+at 4 MiB, and an empty reconcile is meaningful because it removes all stale bindings. Normal
+`BindingSync` remains latest-only. Shutdown drains reconcile work in FIFO order; an operation
+whose delivery is unknown is never retried, while work proven unsent may start one fresh worker
+for the entire bounded drain before remaining items settle as `WorkerUnavailable`. A repeated
+race regression exposed and closed the original channel-disconnect/handle-exit gap. Focused worker
+tests pass 13/13, including ten repeated unknown-delivery runs; check, dead-code-exempt strict
+Clippy, scoped fmt, source-law, and diff-check pass. App wiring must stage the current reconcile
+immediately before `shutdown_drain` and report every failed completion.
+
 ## Lazy dotenv worker foundation
 
 The app-independent dotenv execution primitive now constructs without a thread, channel, I/O

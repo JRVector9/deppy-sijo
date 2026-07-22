@@ -99,3 +99,22 @@ deterministic resource proxy must not be presented as measured RSS.
   does not clone them.
 - The exact-deadline idle reader is implemented for macOS/Linux/Unix. Non-Unix builds retain the
   original blocking stdin semantics and clean resources on the next request or proxy shutdown.
+
+## Event-driven approval wake amendment
+
+- Local commit `5d145fe` adds an optional `--approval-notify-socket` path. When absent, proxy
+  startup and idle behavior remain unchanged: no listener, sender socket, thread, timer, or poll.
+- A policy `Ask` emits exactly one fixed one-byte, payload-free Unix datagram only after the
+  pending approval row is durable. Malformed JSON, Allow, Deny, insert failure, and audit
+  preflight failure emit none.
+- The socket path is absolute, UTF-8, NUL-free, and at most 100 bytes. Debug and delivery errors
+  redact the path. Delivery failure immediately denies the pending operation and prevents the
+  backend call.
+- Normal proxy return atomically denies pending approvals for its exact session. App-side
+  `SessionExited` cleanup still owns crash/kill convergence and will replace the unconditional
+  500 ms GUI watcher during the app boundary cutover.
+- Root verification: proxy tests 48/48, all-target check, strict Clippy, package-scoped rustfmt,
+  and diff-check passed. The managed sandbox rejected actual Unix socket binding in both the
+  workspace and `/tmp` with `EPERM`; deterministic durable-before-wake coverage and a real
+  missing-socket fail-closed test passed, while one real send/receive smoke remains a release
+  environment gate.

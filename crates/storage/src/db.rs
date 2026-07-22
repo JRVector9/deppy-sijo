@@ -880,6 +880,9 @@ const ENV_API_PROJECT_ROWS_MAX: usize = 256;
 const HOOK_PREFIX_ROWS_MAX: usize = 256;
 const WAITING_SESSION_ROWS_MAX: usize = 4_096;
 const AGENT_SESSION_ROWS_MAX: usize = 256;
+const ACTIVITY_PANE_ROWS_MAX: usize = 256 * 256;
+const WEB_PUSH_SUBSCRIPTION_ROWS_MAX: usize = 8;
+const WEB_PUSH_RETAINED_BYTES_MAX: usize = 64 * 1024;
 const BOUNDED_READ_INPUT_INVALID: &str = "bounded read input invalid";
 const BOUNDED_READ_LIMIT_EXCEEDED: &str = "bounded read limit exceeded";
 const BOUNDED_READ_ROW_INVALID: &str = "bounded read row invalid";
@@ -1097,6 +1100,62 @@ const AGENT_SESSIONS_BOUNDED_SELECT: &str = "SELECT pane_id, kind, session_id
     FROM agent_sessions WHERE workspace_id = ?1
     ORDER BY updated_at DESC, substr(CAST(pane_id AS BLOB), 1, ?3), rowid LIMIT ?2";
 
+const ACTIVITY_PANES_BOUNDED_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
+    SELECT pane.rowid FROM mux_panes pane
+     ORDER BY substr(CAST(pane.workspace_id AS BLOB), 1, ?2),
+              substr(CAST(pane.created_at AS BLOB), 1, ?3),
+              substr(CAST(pane.id AS BLOB), 1, ?2), pane.rowid LIMIT ?1
+), sized AS MATERIALIZED (
+    SELECT pane.workspace_id, pane.id AS pane_id, pane.created_at,
+           COALESCE(NULLIF(pane.title, ''), NULLIF(session.title, ''), pane.id) AS title,
+           COALESCE(session.cwd, '') AS cwd,
+           length(CAST(pane.workspace_id AS BLOB))
+             + length(CAST(COALESCE(NULLIF(pane.title, ''),
+                                    NULLIF(session.title, ''), pane.id) AS BLOB))
+             + length(CAST(COALESCE(session.cwd, '') AS BLOB)) AS row_bytes
+      FROM selected JOIN mux_panes pane ON pane.rowid = selected.rowid
+      LEFT JOIN sessions session ON session.id = pane.session_id
+)
+SELECT COUNT(*), COALESCE(SUM(CASE WHEN
+       typeof(workspace_id) != 'text'
+       OR length(CAST(workspace_id AS BLOB)) NOT BETWEEN 1 AND ?2
+    OR typeof(pane_id) != 'text' OR length(CAST(pane_id AS BLOB)) NOT BETWEEN 1 AND ?2
+    OR typeof(created_at) != 'text' OR length(CAST(created_at AS BLOB)) > ?3
+    OR typeof(title) != 'text' OR length(CAST(title AS BLOB)) NOT BETWEEN 1 AND ?3
+    OR typeof(cwd) != 'text' OR length(CAST(cwd AS BLOB)) > ?3
+    OR row_bytes > ?4 THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
+const ACTIVITY_PANES_BOUNDED_SELECT: &str = "SELECT pane.workspace_id,
+            COALESCE(NULLIF(pane.title, ''), NULLIF(session.title, ''), pane.id),
+            COALESCE(session.cwd, '')
+       FROM mux_panes pane
+       LEFT JOIN sessions session ON session.id = pane.session_id
+      ORDER BY substr(CAST(pane.workspace_id AS BLOB), 1, ?2),
+               substr(CAST(pane.created_at AS BLOB), 1, ?3),
+               substr(CAST(pane.id AS BLOB), 1, ?2), pane.rowid LIMIT ?1";
+
+const WEB_PUSH_BOUNDED_PREFLIGHT: &str = "WITH selected AS MATERIALIZED (
+    SELECT rowid FROM web_push_subscriptions
+     ORDER BY created_at, substr(CAST(endpoint AS BLOB), 1, ?2), rowid LIMIT ?1
+), sized AS MATERIALIZED (
+    SELECT subscription.*,
+           length(CAST(subscription.endpoint AS BLOB))
+             + length(CAST(subscription.p256dh AS BLOB))
+             + length(CAST(subscription.auth AS BLOB)) AS row_bytes
+      FROM selected JOIN web_push_subscriptions subscription
+        ON subscription.rowid = selected.rowid
+)
+SELECT COUNT(*), COALESCE(SUM(CASE WHEN
+       typeof(endpoint) != 'text' OR length(CAST(endpoint AS BLOB)) NOT BETWEEN 1 AND ?2
+    OR typeof(p256dh) != 'text' OR length(CAST(p256dh AS BLOB)) NOT BETWEEN 1 AND ?3
+    OR typeof(auth) != 'text' OR length(CAST(auth AS BLOB)) NOT BETWEEN 1 AND ?3
+    OR typeof(created_at) != 'integer'
+    OR row_bytes > ?4 THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0) FROM sized";
+const WEB_PUSH_BOUNDED_SELECT: &str = "SELECT endpoint, p256dh, auth
+    FROM web_push_subscriptions
+    ORDER BY created_at, substr(CAST(endpoint AS BLOB), 1, ?2), rowid LIMIT ?1";
+
 #[derive(Debug, Clone, Copy)]
 struct BoundedReadProbe {
     count: usize,
@@ -1153,6 +1212,16 @@ fn bounded_read_preflight<P: rusqlite::Params>(
     params: P,
     limit: usize,
 ) -> anyhow::Result<BoundedReadProbe> {
+    bounded_read_preflight_with_budget(conn, sql, params, limit, BOUNDED_RETAINED_BYTES_MAX)
+}
+
+fn bounded_read_preflight_with_budget<P: rusqlite::Params>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+    limit: usize,
+    retained_bytes_max: usize,
+) -> anyhow::Result<BoundedReadProbe> {
     let raw = conn
         .query_row(sql, params, |row| {
             Ok((
@@ -1173,7 +1242,7 @@ fn bounded_read_preflight<P: rusqlite::Params>(
     anyhow::ensure!(count <= limit, BOUNDED_READ_LIMIT_EXCEEDED);
     anyhow::ensure!(
         invalid_rows == 0
-            && retained_bytes <= BOUNDED_RETAINED_BYTES_MAX
+            && retained_bytes <= retained_bytes_max
             && max_row_bytes <= BOUNDED_ROW_BYTES_MAX,
         BOUNDED_READ_ROW_INVALID
     );
@@ -3805,6 +3874,56 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Complete activity-pane snapshot with item, row, and aggregate-byte admission before any
+    /// returned String is allocated. The read transaction keeps preflight and materialization on
+    /// one SQLite snapshot; `limit + 1` detects truncation instead of returning partial UI state.
+    pub fn list_persisted_activity_panes_bounded(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, String, String)>> {
+        let sql_limit = bounded_limit_plus_one(limit, ACTIVITY_PANE_ROWS_MAX)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        let probe = bounded_read_preflight(
+            &tx,
+            ACTIVITY_PANES_BOUNDED_PREFLIGHT,
+            rusqlite::params![
+                sql_limit,
+                BOUNDED_ID_BYTES_MAX as i64,
+                BOUNDED_TEXT_BYTES_MAX as i64,
+                BOUNDED_ROW_BYTES_MAX as i64,
+            ],
+            limit,
+        )?;
+        let mut result = Vec::with_capacity(probe.count);
+        {
+            let mut stmt = tx
+                .prepare(ACTIVITY_PANES_BOUNDED_SELECT)
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            let mut rows = stmt
+                .query(rusqlite::params![
+                    sql_limit,
+                    BOUNDED_ID_BYTES_MAX as i64,
+                    BOUNDED_TEXT_BYTES_MAX as i64,
+                ])
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+            {
+                let workspace_id = bounded_required_text(row, 0, BOUNDED_ID_BYTES_MAX, true, true)?;
+                let title = bounded_required_text(row, 1, BOUNDED_TEXT_BYTES_MAX, true, false)?;
+                let cwd = bounded_required_text(row, 2, BOUNDED_TEXT_BYTES_MAX, false, false)?;
+                result.push((workspace_id.to_owned(), title.to_owned(), cwd.to_owned()));
+            }
+        }
+        tx.commit()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        Ok(result)
+    }
+
     /// 환경/API 프로젝트 목록용 집계. workspace별 profile/var와 credential을 UI에서
     /// N+1 조회하지 않도록 한 SQL snapshot으로 반환한다. key_count는 현재 UI 계약대로
     /// 해당 workspace에서 보이는(소속+전역) credential 중 dotenv profile이 참조하는
@@ -5837,6 +5956,57 @@ impl Db {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Complete web-push target snapshot. The endpoint/key material is checked by SQLite type,
+    /// per-field bytes, per-row bytes, total retained bytes, and `limit + 1` before Rust allocates
+    /// any returned String or Vec element.
+    pub fn list_web_push_subscriptions_bounded(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WebPushSubscriptionRow>> {
+        let sql_limit = bounded_limit_plus_one(limit, WEB_PUSH_SUBSCRIPTION_ROWS_MAX)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        let probe = bounded_read_preflight_with_budget(
+            &tx,
+            WEB_PUSH_BOUNDED_PREFLIGHT,
+            rusqlite::params![
+                sql_limit,
+                BOUNDED_TEXT_BYTES_MAX as i64,
+                BOUNDED_TEXT_BYTES_MAX as i64,
+                BOUNDED_ROW_BYTES_MAX as i64,
+            ],
+            limit,
+            WEB_PUSH_RETAINED_BYTES_MAX,
+        )?;
+        let mut result = Vec::with_capacity(probe.count);
+        {
+            let mut stmt = tx
+                .prepare(WEB_PUSH_BOUNDED_SELECT)
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            let mut rows = stmt
+                .query(rusqlite::params![sql_limit, BOUNDED_TEXT_BYTES_MAX as i64])
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?
+            {
+                let endpoint = bounded_required_text(row, 0, BOUNDED_TEXT_BYTES_MAX, true, false)?;
+                let p256dh = bounded_required_text(row, 1, BOUNDED_TEXT_BYTES_MAX, true, false)?;
+                let auth = bounded_required_text(row, 2, BOUNDED_TEXT_BYTES_MAX, true, false)?;
+                result.push(WebPushSubscriptionRow {
+                    endpoint: endpoint.to_owned(),
+                    p256dh: p256dh.to_owned(),
+                    auth: auth.to_owned(),
+                });
+            }
+        }
+        tx.commit()
+            .map_err(|_| anyhow::anyhow!(BOUNDED_READ_QUERY_FAILED))?;
+        Ok(result)
+    }
+
     /// 웹푸시 구독 삭제 (발송이 410 Gone/404 Not Found를 받은 죽은 구독 정리).
     pub fn delete_web_push_subscription(&self, endpoint: &str) -> anyhow::Result<()> {
         self.conn
@@ -7086,6 +7256,44 @@ mod tests {
             .unwrap()
     }
 
+    fn seed_activity_panes(db: &Db, count: usize, title: &str) -> String {
+        let workspace_id = db.create_workspace("activity-bounded").unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO mux_windows
+                   (id, workspace_id, title, active_tab_id, created_at, updated_at)
+                 VALUES ('activity-window', ?1, NULL, NULL, '2026-01-01', '2026-01-01')",
+                [&workspace_id],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO mux_tabs
+                   (id, window_id, workspace_id, title, tab_index, created_at, updated_at)
+                 VALUES ('activity-tab', 'activity-window', ?1, 'tab', 0,
+                         '2026-01-01', '2026-01-01')",
+                [&workspace_id],
+            )
+            .unwrap();
+        for index in 0..count {
+            db.conn
+                .execute(
+                    "INSERT INTO mux_panes
+                       (id, workspace_id, tab_id, session_id, title, pane_kind,
+                        created_at, updated_at)
+                     VALUES (?1, ?2, 'activity-tab', NULL, ?3, 'terminal', ?4, ?4)",
+                    (
+                        format!("activity-pane-{index:05}"),
+                        &workspace_id,
+                        title,
+                        format!("2026-01-01T00:00:{index:05}"),
+                    ),
+                )
+                .unwrap();
+        }
+        workspace_id
+    }
+
     #[test]
     fn delete_workspace는_자식env와_workspace만_지운다() {
         let mut db = Db::open_in_memory().unwrap();
@@ -7154,7 +7362,57 @@ mod tests {
         // cwd도 함께 온다 — 기본 제목("셸 N")을 프로젝트명으로 표시하는 데 쓴다.
         assert_eq!(
             db.list_persisted_activity_panes().unwrap(),
+            vec![(ws.clone(), "saved shell".to_owned(), "/".to_owned())]
+        );
+        assert_eq!(
+            db.list_persisted_activity_panes_bounded(1).unwrap(),
             vec![(ws, "saved shell".to_owned(), "/".to_owned())]
+        );
+    }
+
+    #[test]
+    fn bounded_activity_panes는_exact_limit과_plus_one을_구분한다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace_id = seed_activity_panes(&db, 3, "saved shell");
+        let rows = db.list_persisted_activity_panes_bounded(3).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| row.0 == workspace_id));
+        assert_eq!(
+            db.list_persisted_activity_panes_bounded(2)
+                .unwrap_err()
+                .to_string(),
+            BOUNDED_READ_LIMIT_EXCEEDED
+        );
+    }
+
+    #[test]
+    fn bounded_activity_panes는_corrupt_type을_materialize하지_않는다() {
+        let db = Db::open_in_memory().unwrap();
+        seed_activity_panes(&db, 1, "saved shell");
+        db.conn
+            .execute(
+                "UPDATE mux_panes SET title = CAST(x'7879' AS BLOB)
+                  WHERE id = 'activity-pane-00000'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            db.list_persisted_activity_panes_bounded(1)
+                .unwrap_err()
+                .to_string(),
+            BOUNDED_READ_ROW_INVALID
+        );
+    }
+
+    #[test]
+    fn bounded_activity_panes는_aggregate_byte_budget을_넘기지_않는다() {
+        let db = Db::open_in_memory().unwrap();
+        seed_activity_panes(&db, 1_025, &"x".repeat(BOUNDED_TEXT_BYTES_MAX));
+        assert_eq!(
+            db.list_persisted_activity_panes_bounded(1_025)
+                .unwrap_err()
+                .to_string(),
+            BOUNDED_READ_ROW_INVALID
         );
     }
 
@@ -12878,6 +13136,67 @@ mod tests {
     }
 
     #[test]
+    fn bounded_web_push는_exact_limit과_plus_one을_구분한다() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_web_push_subscription("https://push/a", "key-a", "auth-a", 10)
+            .unwrap();
+        db.upsert_web_push_subscription("https://push/b", "key-b", "auth-b", 20)
+            .unwrap();
+        assert_eq!(db.list_web_push_subscriptions_bounded(2).unwrap().len(), 2);
+        assert_eq!(
+            db.list_web_push_subscriptions_bounded(1)
+                .unwrap_err()
+                .to_string(),
+            BOUNDED_READ_LIMIT_EXCEEDED
+        );
+    }
+
+    #[test]
+    fn bounded_web_push는_corrupt_type을_materialize하지_않는다() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_web_push_subscription("https://push/a", "key-a", "auth-a", 10)
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE web_push_subscriptions SET auth = CAST(x'7879' AS BLOB)
+                  WHERE endpoint = 'https://push/a'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            db.list_web_push_subscriptions_bounded(1)
+                .unwrap_err()
+                .to_string(),
+            BOUNDED_READ_ROW_INVALID
+        );
+    }
+
+    #[test]
+    fn bounded_web_push는_aggregate_byte_budget을_넘기지_않는다() {
+        let db = Db::open_in_memory().unwrap();
+        for index in 0..WEB_PUSH_SUBSCRIPTION_ROWS_MAX {
+            let prefix = format!("endpoint-{index}-");
+            let endpoint = format!(
+                "{prefix}{}",
+                "e".repeat(BOUNDED_TEXT_BYTES_MAX - prefix.len())
+            );
+            db.upsert_web_push_subscription(
+                &endpoint,
+                &"p".repeat(BOUNDED_TEXT_BYTES_MAX),
+                &"a".repeat(BOUNDED_TEXT_BYTES_MAX),
+                index as i64,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            db.list_web_push_subscriptions_bounded(WEB_PUSH_SUBSCRIPTION_ROWS_MAX)
+                .unwrap_err()
+                .to_string(),
+            BOUNDED_READ_ROW_INVALID
+        );
+    }
+
+    #[test]
     fn connector_repository_inventory와_tool_page는_bounded_complete_snapshot을_제공한다() {
         let mut db = Db::open_in_memory().unwrap();
         db.save_mcp_server(&sample_mcp_server("srv-page-a"))
@@ -13622,6 +13941,8 @@ mod tests {
             TURN_DONE_PREFIX_PREFLIGHT,
             WAITING_SESSIONS_PREFLIGHT,
             AGENT_SESSIONS_BOUNDED_PREFLIGHT,
+            ACTIVITY_PANES_BOUNDED_PREFLIGHT,
+            WEB_PUSH_BOUNDED_PREFLIGHT,
         ] {
             assert!(preflight.contains("selected AS MATERIALIZED"));
             assert!(preflight.contains("typeof("));
@@ -13661,6 +13982,42 @@ mod tests {
             assert!(projection.contains("updated_at > ?"));
         }
         let source = include_str!("db.rs");
+        for method in [
+            "list_persisted_activity_panes_bounded",
+            "list_web_push_subscriptions_bounded",
+        ] {
+            let body = source
+                .split_once(&format!("pub fn {method}"))
+                .unwrap()
+                .1
+                .split("\n    pub fn ")
+                .next()
+                .unwrap();
+            let preflight_at = body.find("bounded_read_preflight").unwrap();
+            let vector_at = body.find("Vec::with_capacity").unwrap();
+            let materialize_at = body.find("result.push").unwrap();
+            assert!(preflight_at < vector_at);
+            assert!(
+                body[..materialize_at]
+                    .matches("bounded_required_text(")
+                    .count()
+                    >= 3
+            );
+            assert!(body.contains("unchecked_transaction"));
+            assert!(body.contains("sql_limit"));
+        }
+        for (preflight, projection) in [
+            (
+                ACTIVITY_PANES_BOUNDED_PREFLIGHT,
+                ACTIVITY_PANES_BOUNDED_SELECT,
+            ),
+            (WEB_PUSH_BOUNDED_PREFLIGHT, WEB_PUSH_BOUNDED_SELECT),
+        ] {
+            assert!(preflight.contains("ORDER BY"));
+            assert!(projection.contains("ORDER BY"));
+            assert!(preflight.contains("rowid LIMIT ?"));
+            assert!(projection.contains("rowid LIMIT ?"));
+        }
         for method in [
             "list_hook_sessions_for_prefix_bounded",
             "list_statuslines_for_prefix_bounded",

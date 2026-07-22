@@ -23,6 +23,8 @@ const ENV_PROJECT_PROJECTION_MAX: usize = 256;
 const HOOK_PREFIX_PROJECTION_MAX: usize = 256;
 const WAITING_SESSION_PROJECTION_MAX: usize = 4_096;
 const AGENT_SESSION_PROJECTION_MAX: usize = 256;
+const ACTIVITY_PANE_PROJECTION_MAX: usize =
+    ui::activity::MAX_ACTIVITY_WORKSPACES * ui::activity::MAX_ACTIVITY_ITEMS_PER_WORKSPACE;
 
 fn replace_complete_projection<T, E>(target: &mut T, projection: Result<T, E>) -> Result<(), E> {
     match projection {
@@ -4769,7 +4771,8 @@ impl web_remote::repository::WebRemoteRepository for AppWebRemoteRepository {
             "web_push_subscription_limit_invalid"
         );
         let db = self.lock()?;
-        let existing = db.list_web_push_subscriptions()?;
+        let existing = db
+            .list_web_push_subscriptions_bounded(web_remote::repository::PUSH_SUBSCRIPTION_LIMIT)?;
         anyhow::ensure!(
             existing.len() <= web_remote::repository::PUSH_SUBSCRIPTION_LIMIT,
             "web_push_subscription_inventory_oversized"
@@ -4792,8 +4795,7 @@ impl web_remote::repository::WebRemoteRepository for AppWebRemoteRepository {
             limit <= web_remote::repository::PUSH_SUBSCRIPTION_LIMIT,
             "web_push_subscription_limit_invalid"
         );
-        let rows = self.lock()?.list_web_push_subscriptions()?;
-        anyhow::ensure!(rows.len() <= limit, "web_push_subscription_limit_exceeded");
+        let rows = self.lock()?.list_web_push_subscriptions_bounded(limit)?;
         Ok(rows
             .into_iter()
             .map(|row| {
@@ -11535,8 +11537,13 @@ impl App {
                     self.env_project_rows_failed = false;
                     self.env_api_projects_cache = Some((rows, now));
                 }
-                Err(error) => {
-                    tracing::warn!("환경 프로젝트 목록 background 조회 실패: {error:#}");
+                Err(_) => {
+                    tracing::warn!(
+                        kind = "settings",
+                        phase = "environment_projection",
+                        error_code = "bounded_read_failed",
+                        "settings projection failed"
+                    );
                     self.env_project_rows_failed = true;
                     if let Some((_, computed_at)) = &mut self.env_api_projects_cache {
                         *computed_at = now;
@@ -11679,7 +11686,12 @@ impl App {
                     .collect();
                 self.workspace_anchors = anchors;
             }
-            Err(e) => tracing::warn!("bounded workspace projection 조회 실패: {e:#}"),
+            Err(_) => tracing::warn!(
+                kind = "settings",
+                phase = "workspace_projection",
+                error_code = "bounded_read_failed",
+                "settings projection failed"
+            ),
         }
         if self.settings_workspace_id.as_ref().is_some_and(|selected| {
             !self
@@ -11722,15 +11734,20 @@ impl App {
                 .list_structured_threads_bounded(&workspace.id, false, remaining)
             {
                 Ok(rows) => append_structured_thread_projection(&mut structured_threads, rows),
-                Err(error) => tracing::warn!(
-                    workspace_id = %workspace.id,
-                    "구조화 Codex thread 목록 복구 실패: {error:#}"
+                Err(_) => tracing::warn!(
+                    kind = "agent_state",
+                    phase = "structured_thread_projection",
+                    error_code = "bounded_read_failed",
+                    "agent state projection failed"
                 ),
             }
         }
         self.agent_sessions_ui
             .import_persisted_threads(structured_threads);
-        match self.db.list_persisted_activity_panes() {
+        match self
+            .db
+            .list_persisted_activity_panes_bounded(ACTIVITY_PANE_PROJECTION_MAX)
+        {
             Ok(rows) => {
                 let mut by_workspace: std::collections::HashMap<String, Vec<(String, String)>> =
                     std::collections::HashMap::new();
@@ -11742,7 +11759,12 @@ impl App {
                 }
                 self.persisted_activity_panes = by_workspace;
             }
-            Err(e) => tracing::warn!("활동 pane snapshot 조회 실패: {e:#}"),
+            Err(_) => tracing::warn!(
+                kind = "activity",
+                phase = "persisted_pane_projection",
+                error_code = "bounded_read_failed",
+                "activity projection failed"
+            ),
         }
         // 워크스페이스 목록/이름/경로가 바뀌었을 수 있다 — env/API 프로젝트 행 캐시 무효화.
         self.invalidate_env_api_projects();

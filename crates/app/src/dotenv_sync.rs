@@ -1104,7 +1104,36 @@ pub fn apply_workspace_dotenv_plan(
     workspace_id: &str,
     plan: DotenvSyncPlan,
 ) -> anyhow::Result<DotenvSyncReport> {
-    let parsed = plan.entries;
+    enum PreparedDotenvValue {
+        Plain(String),
+        Secret {
+            value: secret::SecretString,
+            _redaction_lease: secret::RedactionLease,
+        },
+    }
+
+    // Secure the complete bounded secret set before the first persistence/keyring mutation. If
+    // even one value cannot enter the rotating redaction corpus, every previously acquired lease
+    // drops here and the dotenv profile remains untouched.
+    let mut prepared = Vec::with_capacity(plan.entries.len());
+    for (key, value) in plan.entries {
+        // Secret classification must match storage validation: a value the repository refuses to
+        // persist as plain is prepared through the same redacted physical-slot path.
+        let needs_secret = is_secret_key(&key) || !repository.plain_env_value_allowed(&key, &value);
+        let value = if needs_secret {
+            let value = secret::SecretString::new(value);
+            let redaction_lease = redaction
+                .acquire_rotating(&value)
+                .map_err(|_| static_secret_error(ERROR_SECRET_REDACTION))?;
+            PreparedDotenvValue::Secret {
+                value,
+                _redaction_lease: redaction_lease,
+            }
+        } else {
+            PreparedDotenvValue::Plain(value)
+        };
+        prepared.push((key, value));
+    }
 
     // dotenv profile 찾기/생성.
     let profile_id = match repository
@@ -1123,34 +1152,21 @@ pub fn apply_workspace_dotenv_plan(
         .list_dotenv_owned_credential_ids(secret::VERSIONED_SECRET_BUNDLE_SLOT_CEILING)?;
     let mut report = DotenvSyncReport::default();
 
-    for (key, value) in &parsed {
+    for (key, value) in &prepared {
         let current = existing.iter().find(|v| &v.key == key);
-        // secret 판정은 **storage의 검증과 일치**시켜야 한다 — storage가 Plain으로 거부하는
-        // 키(DATABASE_URL/DB_URL/*_TOKEN 등)나 값을 우리가 Plain으로 저장하려다 upsert가
-        // 실패해 동기화 전체가 중단됐다(2026-07-08 실측). 우리 휴리스틱(is_secret_key)에
-        // 더해 storage가 거부하면 secret으로 저장한다.
-        let needs_secret = is_secret_key(key) || !repository.plain_env_value_allowed(key, value);
-        if needs_secret {
-            let secret = secret::SecretString::new(value.clone());
-            // This operation owns only a bounded rotating redaction lease. Long-lived consumers
-            // acquire their own execution lease when they resolve the physical slot; storing every
-            // rotated dotenv value as a permanent corpus entry would make RSS grow over time.
-            let Ok(_redaction_lease) = redaction.acquire_rotating(&secret) else {
-                warn_secret_failure("redaction", ERROR_SECRET_REDACTION);
-                continue;
-            };
-
+        if let PreparedDotenvValue::Secret { value: secret, .. } = value {
             let (credential_id, newly_created) = match current.map(|v| &v.value) {
                 Some(EnvValue::Secret { credential_id })
                     if dotenv_owned.contains(credential_id) =>
                 {
-                    match rotate_dotenv_credential(repository, secret_store, credential_id, &secret)
+                    match rotate_dotenv_credential(repository, secret_store, credential_id, secret)
                     {
                         Ok(false) => continue,
                         Ok(true) => (credential_id.clone(), None),
                         Err(error) => {
-                            warn_secret_failure("rotate", secret_error_code(&error));
-                            continue;
+                            let error_code = secret_error_code(&error);
+                            warn_secret_failure("rotate", error_code);
+                            return Err(static_secret_error(error_code));
                         }
                     }
                 }
@@ -1159,12 +1175,13 @@ pub fn apply_workspace_dotenv_plan(
                     secret_store,
                     workspace_id,
                     key,
-                    &secret,
+                    secret,
                 ) {
                     Ok(created) => (created.logical.as_str().to_owned(), Some(created)),
                     Err(error) => {
-                        warn_secret_failure("create", secret_error_code(&error));
-                        continue;
+                        let error_code = secret_error_code(&error);
+                        warn_secret_failure("create", error_code);
+                        return Err(static_secret_error(error_code));
                     }
                 },
             };
@@ -1186,7 +1203,7 @@ pub fn apply_workspace_dotenv_plan(
                 return Err(static_secret_error(ERROR_SECRET_ENV_BIND));
             }
             report.upserted += 1;
-        } else {
+        } else if let PreparedDotenvValue::Plain(value) = value {
             // plain: 값이 같으면 write 생략 (DB churn 방지).
             if matches!(current.map(|v| &v.value), Some(EnvValue::Plain(v)) if v == value) {
                 continue;
@@ -1198,8 +1215,9 @@ pub fn apply_workspace_dotenv_plan(
                     match resolve_secret_slot(repository, credential_id) {
                         Ok(slot) => Some(slot),
                         Err(error) => {
-                            warn_secret_failure("plain_replace_resolve", secret_error_code(&error));
-                            None
+                            let error_code = secret_error_code(&error);
+                            warn_secret_failure("plain_replace_resolve", error_code);
+                            return Err(static_secret_error(error_code));
                         }
                     }
                 }
@@ -1217,7 +1235,7 @@ pub fn apply_workspace_dotenv_plan(
 
     // 병합 결과에서 사라진 키 제거 (+ 이 profile 전용 credential 정리).
     for var in &existing {
-        if parsed.iter().any(|(k, _)| k == &var.key) {
+        if prepared.iter().any(|(k, _)| k == &var.key) {
             continue;
         }
         let cleanup_target = if let EnvValue::Secret { credential_id } = &var.value
@@ -1226,8 +1244,9 @@ pub fn apply_workspace_dotenv_plan(
             match resolve_secret_slot(repository, credential_id) {
                 Ok(slot) => Some(slot),
                 Err(error) => {
-                    warn_secret_failure("prune_resolve", secret_error_code(&error));
-                    None
+                    let error_code = secret_error_code(&error);
+                    warn_secret_failure("prune_resolve", error_code);
+                    return Err(static_secret_error(error_code));
                 }
             }
         } else {
@@ -2092,21 +2111,84 @@ INVALID LINE
         let workspace_id = db.create_workspace("test").unwrap();
         std::fs::write(dir.join(".env"), "API_KEY=must-not-reach-keyring\n").unwrap();
 
-        let report =
+        let error =
             sync_workspace_dotenv_for_test(&mut db, &store, &redaction, &workspace_id, &dir)
-                .unwrap()
-                .unwrap();
+                .unwrap_err();
 
-        assert_eq!(report, DotenvSyncReport::default());
+        assert_eq!(error.to_string(), ERROR_SECRET_REDACTION);
         assert!(store.entries.lock().unwrap().is_empty());
         assert!(db.list_credentials().unwrap().is_empty());
-        let profile = db
-            .list_env_profiles(&workspace_id)
-            .unwrap()
-            .into_iter()
-            .find(|profile| profile.kind == DOTENV_PROFILE_KIND)
-            .unwrap();
-        assert!(db.list_env_vars(&profile.id).unwrap().is_empty());
+        assert!(
+            db.list_env_profiles(&workspace_id)
+                .unwrap()
+                .into_iter()
+                .all(|profile| profile.kind != DOTENV_PROFILE_KIND),
+            "redaction preflight must fail before profile creation"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 두번째_secret_redaction_preflight_실패도_첫_mutation전에_전체를_거부한다() {
+        struct FixedClock;
+        impl secret::RedactionClock for FixedClock {
+            fn now(&self) -> std::time::Duration {
+                std::time::Duration::ZERO
+            }
+        }
+
+        let first_value = "first-secret-value-that-fits-exactly";
+        let probe = secret::RedactionService::with_clock(
+            secret::RedactionCorpusLimits {
+                max_items: 1_024,
+                max_bytes: 1024 * 1024,
+            },
+            std::time::Duration::from_secs(60),
+            std::sync::Arc::new(FixedClock),
+        )
+        .unwrap();
+        let first = secret::SecretString::new(first_value.to_owned());
+        let _probe_lease = probe.acquire_rotating(&first).unwrap();
+        let exact_first = probe.corpus_stats();
+        assert!(exact_first.items > 0 && exact_first.bytes > 0);
+
+        let redaction = secret::RedactionService::with_clock(
+            secret::RedactionCorpusLimits {
+                max_items: exact_first.items,
+                max_bytes: exact_first.bytes,
+            },
+            std::time::Duration::from_secs(60),
+            std::sync::Arc::new(FixedClock),
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-dotenv-redaction-preflight-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut db = Db::open(&dir.join("test.db")).unwrap();
+        let store = MemStore::new();
+        let workspace_id = db.create_workspace("test").unwrap();
+        std::fs::write(
+            dir.join(".env"),
+            format!("API_KEY_ONE={first_value}\nAPI_KEY_TWO=second-secret-value-must-overflow\n"),
+        )
+        .unwrap();
+
+        let error =
+            sync_workspace_dotenv_for_test(&mut db, &store, &redaction, &workspace_id, &dir)
+                .unwrap_err();
+
+        assert_eq!(error.to_string(), ERROR_SECRET_REDACTION);
+        assert!(store.is_empty());
+        assert!(db.list_credentials().unwrap().is_empty());
+        assert!(
+            db.list_env_profiles(&workspace_id)
+                .unwrap()
+                .into_iter()
+                .all(|profile| profile.kind != DOTENV_PROFILE_KIND)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

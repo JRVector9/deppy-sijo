@@ -107,3 +107,19 @@ boundary, the clean 23-crate dependency DAG, full rustfmt, and diff-check are gr
 development before hardware approval is limited to the separately recorded startup/action input
 seams and corrupted persisted-session admission; 30-minute and Scenario A-E measurements have not
 started.
+
+## Dotenv secret fail-closed preflight
+
+The bounded dotenv apply phase now acquires rotating redaction leases for the complete secret set
+before creating a profile or mutating persistence/keyring. Redaction, rotation, creation, and
+physical-slot resolution failures return static hard errors; they cannot be skipped while the
+overall sync reports success. Post-retirement cleanup remains recoverable only through the durable
+exact orphan ledger. Exact single-secret and second-secret-overflow regressions prove zero profile,
+credential, or keyring mutation when corpus preflight is incomplete. The integrated app suite
+passes 792/792 with five explicit ignores, logging policy 15/15, and storage 189/189 plus doc tests.
+App/storage all-target check, strict Clippy, zero-allowlist boundary, the clean 23-crate dependency
+DAG, full workspace fmt, diff-check, and the complete secret-like persistence/log scan pass.
+
+The eager worker, two-second fallback, 25-ms retry, five-second empty-env restore, and direct launch
+admission are still active development tracked in the handoff; this fail-closed change is not a
+claim that the complete dotenv lifecycle gate is finished.

@@ -173,3 +173,12 @@ preflight, stable TTL cutoff, and injected eviction rollback regressions are inc
 Root verification passes storage 183/183 plus doc tests, app 790/790 with five explicit ignores,
 logging policy 15/15, app/storage all-target checks, dependency-inclusive strict Clippy, zero-
 allowlist boundary, the 23-crate dependency DAG, full workspace fmt, and diff-check.
+
+Persisted activity panes and web-push targets now use the same allocation-before-admission rule.
+Activity is bounded to the UI's 256-workspace by 256-item product and 4 MiB retained bytes;
+web-push is bounded to 8 subscriptions and 64 KiB. Both use deterministic LIMIT+1 windows and
+reject corrupt SQLite types, oversized fields/rows, and aggregate overflow before returning a
+String. Root switched the app adapters to the bounded APIs and preserves the previous activity
+snapshot on error. Storage passes 189/189 plus doc tests, app passes 792/792 with five explicit
+ignores, and logging policy passes 15/15. App/storage all-target check, strict Clippy, zero-allowlist
+boundary, the clean dependency DAG, full workspace fmt, diff-check, and security scan pass.

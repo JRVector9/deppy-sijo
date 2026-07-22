@@ -784,7 +784,11 @@ impl std::fmt::Debug for StructuredThreadMutation {
 /// returned static error code is retryable at a later user/event boundary.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AgentStateJob {
+    /// Active workspace scope for hook, turn, and PTY binding state.
     pub workspace_id: String,
+    /// Authoritative structured-thread catalog and mutation scope. This may intentionally differ
+    /// from `workspace_id`, but every existing and replacement workspace touched by a structured
+    /// mutation must be a member of this bounded set.
     pub structured_workspace_ids: Vec<String>,
     /// Maximum retained string bytes the caller can accept in the returned snapshot. This output
     /// budget is independent from the separately bounded retained input payload.
@@ -999,6 +1003,33 @@ fn agent_state_structured_scope_sql(workspace_count: usize, select: bool) -> Str
                  OR row_bytes > ? THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
            FROM sized"
+    )
+}
+
+fn agent_state_structured_mutation_scope_sql(
+    workspace_count: usize,
+    target_count: usize,
+) -> String {
+    let workspaces = std::iter::repeat_n("(?)", workspace_count)
+        .collect::<Vec<_>>()
+        .join(",");
+    let targets = std::iter::repeat_n("(?)", target_count)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "WITH requested_workspace(workspace_id) AS (VALUES {workspaces}),
+              target(local_session_id) AS (VALUES {targets})
+         SELECT COUNT(*)
+           FROM target
+           JOIN structured_threads AS thread
+             ON thread.local_session_id = target.local_session_id
+          WHERE typeof(thread.workspace_id) != 'text'
+             OR length(CAST(thread.workspace_id AS BLOB)) NOT BETWEEN 1 AND ?
+             OR NOT EXISTS (
+                    SELECT 1
+                      FROM requested_workspace
+                     WHERE requested_workspace.workspace_id = thread.workspace_id
+                )"
     )
 }
 
@@ -1676,15 +1707,22 @@ fn validate_agent_state_job(job: &AgentStateJob) -> anyhow::Result<String> {
     let mut structured_bytes = 0usize;
     for mutation in &job.structured_mutations {
         let mutation_bytes = match mutation {
-            StructuredThreadMutation::Upsert(row) => structured_thread_input_bytes(
-                &row.local_session_id,
-                &row.workspace_id,
-                &row.thread_id,
-                &row.title,
-                &row.cwd,
-                row.model.as_deref(),
-            )
-            .map_err(|_| anyhow::anyhow!(AGENT_STATE_INPUT_INVALID))?,
+            StructuredThreadMutation::Upsert(row) => {
+                let input_bytes = structured_thread_input_bytes(
+                    &row.local_session_id,
+                    &row.workspace_id,
+                    &row.thread_id,
+                    &row.title,
+                    &row.cwd,
+                    row.model.as_deref(),
+                )
+                .map_err(|_| anyhow::anyhow!(AGENT_STATE_INPUT_INVALID))?;
+                anyhow::ensure!(
+                    structured_workspaces.contains(row.workspace_id.as_str()),
+                    AGENT_STATE_INPUT_INVALID
+                );
+                input_bytes
+            }
             StructuredThreadMutation::SetArchived {
                 local_session_id, ..
             }
@@ -1712,6 +1750,57 @@ fn validate_agent_state_job(job: &AgentStateJob) -> anyhow::Result<String> {
         AGENT_STATE_INPUT_INVALID
     );
     Ok(workspace_prefix)
+}
+
+fn validate_agent_state_structured_existing_scope(
+    tx: &rusqlite::Transaction<'_>,
+    job: &AgentStateJob,
+) -> anyhow::Result<()> {
+    let mut seen = std::collections::HashSet::with_capacity(job.structured_mutations.len());
+    let mut targets = Vec::with_capacity(job.structured_mutations.len());
+    for mutation in &job.structured_mutations {
+        let local_session_id = match mutation {
+            StructuredThreadMutation::Upsert(row) => row.local_session_id.as_str(),
+            StructuredThreadMutation::SetArchived {
+                local_session_id, ..
+            }
+            | StructuredThreadMutation::Delete { local_session_id } => local_session_id.as_str(),
+        };
+        if seen.insert(local_session_id) {
+            targets.push(local_session_id);
+        }
+    }
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    let sql = agent_state_structured_mutation_scope_sql(
+        job.structured_workspace_ids.len(),
+        targets.len(),
+    );
+    let mut params = Vec::with_capacity(job.structured_workspace_ids.len() + targets.len() + 1);
+    params.extend(
+        job.structured_workspace_ids
+            .iter()
+            .cloned()
+            .map(rusqlite::types::Value::Text),
+    );
+    params.extend(
+        targets
+            .into_iter()
+            .map(str::to_owned)
+            .map(rusqlite::types::Value::Text),
+    );
+    params.push(rusqlite::types::Value::Integer(
+        STRUCTURED_THREAD_ID_BYTES_MAX as i64,
+    ));
+    let invalid_count = tx
+        .query_row(&sql, rusqlite::params_from_iter(&params), |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
+    anyhow::ensure!(invalid_count == 0, AGENT_STATE_INPUT_INVALID);
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -5015,6 +5104,7 @@ impl Db {
         let workspace_prefix = validate_agent_state_job(job)?;
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
             .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
+        validate_agent_state_structured_existing_scope(&tx, job)?;
 
         // Exact delayed deletes must never erase a newer identity for the same pane.
         for identity in &job.stale_binding_deletes {
@@ -9056,6 +9146,169 @@ mod tests {
                 .structured_threads
                 .is_empty(),
             "workspace IDs must remain bound values rather than SQL fragments"
+        );
+    }
+
+    #[test]
+    fn agent_state_structured_mutation은_requested_catalog_scope안의_multi_workspace를_허용한다() {
+        let db = Db::open_in_memory().unwrap();
+        let active = db
+            .create_workspace("agent-state-structured-scope-active")
+            .unwrap();
+        let first = db
+            .create_workspace("agent-state-structured-scope-first")
+            .unwrap();
+        let second = db
+            .create_workspace("agent-state-structured-scope-second")
+            .unwrap();
+        db.upsert_structured_thread(
+            "scope-first-existing",
+            &first,
+            "scope-first-thread",
+            "first",
+            "",
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let session_key = format!("{active}:1");
+        db.set_agent_turn_done(&session_key).unwrap();
+        let seen_at = db.list_turn_done_sessions().unwrap()[0].1;
+
+        let mut job = AgentStateJob::projection(&active);
+        job.structured_workspace_ids = vec![first.clone(), second.clone()];
+        job.turn_done_clears.push(AgentTurnDoneClear {
+            session_key,
+            seen_at,
+        });
+        job.structured_mutations
+            .push(StructuredThreadMutation::SetArchived {
+                local_session_id: "scope-first-existing".to_owned(),
+                archived: true,
+            });
+        let mut second_row = agent_state_structured_row(&second, 0, "second".to_owned());
+        second_row.local_session_id = "scope-second-new".to_owned();
+        second_row.thread_id = "scope-second-thread".to_owned();
+        job.structured_mutations
+            .push(StructuredThreadMutation::Upsert(second_row));
+
+        let snapshot = db.apply_agent_state_job(&job).unwrap();
+        assert!(snapshot.turn_done_sessions.is_empty());
+        assert_eq!(snapshot.structured_threads.len(), 2);
+        assert!(
+            snapshot
+                .structured_threads
+                .iter()
+                .any(|row| row.local_session_id == "scope-first-existing" && row.archived)
+        );
+        assert!(
+            snapshot
+                .structured_threads
+                .iter()
+                .any(|row| row.local_session_id == "scope-second-new")
+        );
+    }
+
+    #[test]
+    fn agent_state_structured_mutation의_out_of_scope는_첫_write전에_fail_closed된다() {
+        let db = Db::open_in_memory().unwrap();
+        let active = db
+            .create_workspace("agent-state-out-of-scope-active")
+            .unwrap();
+        let requested = db
+            .create_workspace("agent-state-out-of-scope-requested")
+            .unwrap();
+        let outside = db
+            .create_workspace("agent-state-out-of-scope-outside")
+            .unwrap();
+        db.upsert_structured_thread(
+            "outside-existing",
+            &outside,
+            "outside-thread",
+            "outside",
+            "",
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        let session_key = format!("{active}:1");
+        db.set_agent_turn_done(&session_key).unwrap();
+        let seen_at = db.list_turn_done_sessions().unwrap()[0].1;
+
+        let mut new_outside = AgentStateJob::projection(&active);
+        new_outside.structured_workspace_ids = vec![requested.clone()];
+        new_outside.turn_done_clears.push(AgentTurnDoneClear {
+            session_key: session_key.clone(),
+            seen_at,
+        });
+        let mut outside_row = agent_state_structured_row(&outside, 0, "outside-new".to_owned());
+        outside_row.local_session_id = "outside-new".to_owned();
+        new_outside
+            .structured_mutations
+            .push(StructuredThreadMutation::Upsert(outside_row));
+        assert_eq!(
+            db.apply_agent_state_job(&new_outside)
+                .unwrap_err()
+                .to_string(),
+            AGENT_STATE_INPUT_INVALID
+        );
+        assert_eq!(
+            db.list_turn_done_sessions().unwrap(),
+            [(session_key.clone(), seen_at)]
+        );
+        assert!(
+            db.list_structured_threads(&outside, true)
+                .unwrap()
+                .iter()
+                .all(|row| row.local_session_id != "outside-new")
+        );
+
+        let mut existing_outside = AgentStateJob::projection(&active);
+        existing_outside.structured_workspace_ids = vec![requested.clone()];
+        existing_outside.turn_done_clears.push(AgentTurnDoneClear {
+            session_key: session_key.clone(),
+            seen_at,
+        });
+        existing_outside
+            .structured_mutations
+            .push(StructuredThreadMutation::SetArchived {
+                local_session_id: "outside-existing".to_owned(),
+                archived: true,
+            });
+        assert_eq!(
+            db.apply_agent_state_job(&existing_outside)
+                .unwrap_err()
+                .to_string(),
+            AGENT_STATE_INPUT_INVALID
+        );
+        assert_eq!(
+            db.list_turn_done_sessions().unwrap(),
+            [(session_key.clone(), seen_at)]
+        );
+        assert!(!db.list_structured_threads(&outside, true).unwrap()[0].archived);
+
+        let mut move_outside = AgentStateJob::projection(&active);
+        move_outside.structured_workspace_ids = vec![requested.clone()];
+        let mut moved_row = agent_state_structured_row(&requested, 1, "moved".to_owned());
+        moved_row.local_session_id = "outside-existing".to_owned();
+        move_outside
+            .structured_mutations
+            .push(StructuredThreadMutation::Upsert(moved_row));
+        assert_eq!(
+            db.apply_agent_state_job(&move_outside)
+                .unwrap_err()
+                .to_string(),
+            AGENT_STATE_INPUT_INVALID
+        );
+        let outside_rows = db.list_structured_threads(&outside, true).unwrap();
+        assert_eq!(outside_rows.len(), 1);
+        assert_eq!(outside_rows[0].local_session_id, "outside-existing");
+        assert!(
+            db.list_structured_threads(&requested, true)
+                .unwrap()
+                .is_empty()
         );
     }
 

@@ -1,33 +1,184 @@
 //! 벨 팝오버 「대기 중」 섹션의 PTY 입력 대기 카드 (v3.9 N3).
 //!
 //! hook이 보고한 needsInput(claude/codex의 y/n·메뉴 번호 선택 프롬프트)에 **그
-//! 워크스페이스/세션으로 이동하지 않고** 응답한다. 이 파일은 렌더 + 미리보기 캐시 +
-//! 순수 파싱/포맷 함수만 담당한다. 카드 데이터 조립(활성/warm 워크스페이스의 여러
-//! 필드에서 제목·미리보기·UUID를 모으는 일)과 실제 명령 전송은 app.rs가 한다 —
-//! 이 모듈은 leaf UI 경계(xtask check-boundary)를 지켜 DB/런타임 구체 타입을 직접
-//! 참조하지 않는다.
+//! 워크스페이스/세션으로 이동하지 않고** 응답한다. 이 파일은 immutable snapshot 렌더와
+//! bounded intent 생성만 담당한다. 카드 데이터 조립, 로그 파일 읽기, 실제 명령 전송은
+//! app.rs의 host 경계가 한다. 이 모듈은 leaf UI 경계(xtask check-boundary)를 지켜
+//! DB/스토리지/파일/스레드/런타임 구체 구현을 직접 참조하지 않는다.
 
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use runtime::{MuxSnapshot, SessionId};
 
 /// 로그 tail 읽기 상한 — 화면 한 장(80×24 기준 ~2KB)을 여유 있게 담되 UI가 부담되지
 /// 않는 선. 줄 수를 12로 늘리면서 함께 키웠다(4KB면 재그리기 반복 탓에 12줄이 안 찰 수 있다).
-const PREVIEW_TAIL_BYTES: u64 = 16_384;
+pub const LOG_PREVIEW_TAIL_BYTES: u64 = 16_384;
 /// 미리보기 줄 수 — claude/codex는 화면을 통째로 다시 그려 로그에 남기므로, tail
 /// 마지막 몇 줄은 **항상 상태줄**이다(2026-07-17 실측: 3줄일 때 `⏵⏵ auto mode on`만
 /// 보이고 정작 질문이 안 보였다). 승인 프롬프트 박스는 화면 하단이라 12줄이면
 /// 박스째 들어온다. 아래 last_lines가 빈 줄·연속 중복을 접어 실제 표시는 더 짧다.
-const PREVIEW_LINES: usize = 12;
-/// 미리보기 캐시 TTL — ui/workspace.rs의 hover_cwd(PATH_CACHE_TTL=2s)와 같은
-/// stale-while-revalidate 관례. tail은 lsof보다 무거운 파일 IO라 조금 더 넉넉히 둔다.
-const PREVIEW_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(4);
+pub const LOG_PREVIEW_LINES: usize = 12;
+pub const LOG_PREVIEW_LINE_BYTES: usize = 4 * 1024;
+pub const LOG_PREVIEW_PATH_BYTES: usize = 32 * 1024;
+const LOG_PREVIEW_CACHE_ITEMS: usize = 64;
+const LOG_PREVIEW_QUEUE_CAP: usize = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LogPreviewOperation(u64);
+
+/// App host 경계를 지나는 로그 경로. raw path는 Debug에 절대 노출하지 않는다. 경로는
+/// 생성 시 32 KiB/NUL 상한을 통과하고 Arc 하나로만 intent에 전달되어 frame별 복제를 막는다.
+pub struct LogPreviewSource {
+    path: PathBuf,
+    bytes: usize,
+}
+
+impl LogPreviewSource {
+    pub fn try_new(path: PathBuf) -> Result<Self, LogPreviewErrorCode> {
+        let display = path.to_string_lossy();
+        let bytes = display.len();
+        if display.as_bytes().contains(&0) {
+            return Err(LogPreviewErrorCode::InvalidPath);
+        }
+        if bytes == 0 || bytes > LOG_PREVIEW_PATH_BYTES {
+            return Err(LogPreviewErrorCode::PathTooLarge);
+        }
+        Ok(Self { path, bytes })
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl PartialEq for LogPreviewSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+    }
+}
+
+impl Eq for LogPreviewSource {}
+
+impl Hash for LogPreviewSource {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.path.hash(state);
+    }
+}
+
+impl std::fmt::Debug for LogPreviewSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogPreviewSource")
+            .field("path", &"REDACTED")
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+/// redacted log tail에서 만든 immutable UI snapshot. Debug는 raw line을 출력하지 않는다.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LogPreviewSnapshot {
+    lines: Arc<[Arc<str>]>,
+    bytes: usize,
+}
+
+impl LogPreviewSnapshot {
+    /// Host가 파일 끝에서 `LOG_PREVIEW_TAIL_BYTES` 이하를 읽은 뒤 호출하는 순수 변환기.
+    /// `truncated_prefix`는 seek가 0보다 컸음을 뜻하며, 그때 첫 불완전 줄을 버린다.
+    pub fn try_from_tail_bytes(
+        bytes: &[u8],
+        truncated_prefix: bool,
+    ) -> Result<Option<Self>, LogPreviewErrorCode> {
+        if bytes.len() > LOG_PREVIEW_TAIL_BYTES as usize {
+            return Err(LogPreviewErrorCode::PreviewTooLarge);
+        }
+        let text = String::from_utf8_lossy(bytes);
+        let text = if truncated_prefix {
+            text.split_once('\n').map(|(_, rest)| rest).unwrap_or("")
+        } else {
+            &text
+        };
+        let lines = bounded_last_lines(
+            text,
+            LOG_PREVIEW_LINES,
+            LOG_PREVIEW_LINE_BYTES,
+            LOG_PREVIEW_TAIL_BYTES as usize,
+        );
+        if lines.is_empty() {
+            return Ok(None);
+        }
+        let bytes = lines.iter().map(|line| line.len()).sum();
+        Ok(Some(Self {
+            lines: lines.into_iter().map(Arc::<str>::from).collect(),
+            bytes,
+        }))
+    }
+
+    pub fn lines(&self) -> &[Arc<str>] {
+        &self.lines
+    }
+}
+
+impl std::fmt::Debug for LogPreviewSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogPreviewSnapshot")
+            .field("lines", &self.lines.len())
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogPreviewErrorCode {
+    Busy,
+    InvalidPath,
+    PathTooLarge,
+    PreviewTooLarge,
+    NativeFailure,
+}
+
+/// Leaf가 반환하고 App host가 소비하는 단일 로그 읽기 intent. path/source와 raw log는
+/// Clone/Serialize하지 않으며 Debug에는 계수와 상관 ID만 남는다.
+pub struct LogPreviewIntent {
+    pub operation: LogPreviewOperation,
+    pub generation: u64,
+    pub source: Arc<LogPreviewSource>,
+}
+
+impl std::fmt::Debug for LogPreviewIntent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogPreviewIntent")
+            .field("operation", &self.operation)
+            .field("generation", &self.generation)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+pub struct LogPreviewCompletion {
+    pub operation: LogPreviewOperation,
+    pub generation: u64,
+    pub result: Result<Option<LogPreviewSnapshot>, LogPreviewErrorCode>,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct LogPreviewKey {
+    workspace_id: String,
+    session: SessionId,
+    source: Arc<LogPreviewSource>,
+}
+
+struct PendingLogPreview {
+    key: LogPreviewKey,
+    operation: LogPreviewOperation,
+    generation: u64,
+}
 
 /// 카드 하나의 표시 데이터. app.rs가 활성/warm 워크스페이스의 여러 필드(session_titles,
 /// mux 스냅샷, 메모리 summary 또는 로그 tail)에서 조립해 넘긴다.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct WaitingCard {
     pub workspace_id: String,
     pub session: SessionId,
@@ -38,9 +189,9 @@ pub struct WaitingCard {
     /// 묻는지"라 아래 tail보다 정확하다(tail은 TUI 재그리기라 상태줄이 섞인다).
     /// 문구를 안 싣는 에이전트는 None — 그 경우 tail만 보인다.
     pub headline: Option<String>,
-    /// 화면 마지막 N줄(비어있지 않은 줄만). 조회 실패/미지원이면 None — 미리보기만
-    /// 비고 카드(버튼)는 정상 동작한다(계획서 §PR-N3 폴백 규약).
-    pub preview: Option<Vec<String>>,
+    /// 미리보기를 펼쳤을 때만 host intent를 만들 수 있는 bounded source. UUID/경로를
+    /// 만들 수 없으면 None이고 카드의 답장/이동 UX는 그대로 유지한다.
+    pub preview_source: Option<Arc<LogPreviewSource>>,
 }
 
 /// 카드에서 사용자가 취한 액션. app.rs가 소비한다.
@@ -58,113 +209,100 @@ pub enum WaitingAction {
     Goto(super::notifications::AgentNotificationTarget),
 }
 
-/// 세션 로그 tail 캐시 항목.
-struct TailCacheEntry {
-    lines: Option<Vec<String>>,
-    fetched_at: std::time::Instant,
-    /// 백그라운드 재조회 진행 중 — 중복 spawn 방지 (hover_cwd의 CwdCacheEntry와 동일 역할).
-    inflight: bool,
-}
-
-/// 팝오버 PTY 카드의 렌더 상태 — 자유 입력칸 버퍼 + 로그 tail 미리보기 캐시.
-/// App이 소유하고, 팝오버가 열려 있을 때만 메서드를 호출한다(idle 비용 0 — 호출측 게이트).
+/// 팝오버 PTY 카드의 렌더 상태. 파일/스레드/channel/timer를 소유하지 않고, immutable
+/// snapshot과 capacity-1 host intent만 보관한다.
 pub struct InboxWaitingUi {
-    /// 세션 로그 tail 캐시 (key: 영속 세션 UUID = PaneSnapshot::persistent_session_id).
-    /// hover_cwd(ui/workspace.rs)와 같은 stale-while-revalidate — 백그라운드 스레드
-    /// 1회 조회 + TTL, 그동안 stale 값(있으면)을 즉시 반환한다.
-    tail_cache: Arc<Mutex<HashMap<String, TailCacheEntry>>>,
+    previews: HashMap<LogPreviewKey, Arc<LogPreviewSnapshot>>,
+    preview_intent: Option<LogPreviewIntent>,
+    pending_preview: Option<PendingLogPreview>,
+    preview_generation: u64,
+    next_preview_operation: u64,
     /// 카드별 자유 입력 버퍼 — (workspace_id, session)으로 프레임 간 유지한다.
     inputs: HashMap<(String, SessionId), String>,
     /// 미리보기를 펼쳐 둔 카드들 — 기본은 접힘(카드가 화면을 덮지 않게).
-    expanded: std::collections::HashSet<(String, SessionId)>,
+    expanded: HashSet<(String, SessionId)>,
 }
 
 impl InboxWaitingUi {
     pub fn new() -> Self {
         Self {
-            tail_cache: Arc::new(Mutex::new(HashMap::new())),
+            previews: HashMap::new(),
+            preview_intent: None,
+            pending_preview: None,
+            preview_generation: 1,
+            next_preview_operation: 1,
             inputs: HashMap::new(),
-            expanded: std::collections::HashSet::new(),
+            expanded: HashSet::new(),
         }
     }
 
-    /// 세션 로그 tail 미리보기. 캐시가 신선하거나 조회 진행 중이면 그 값을 즉시 반환하고,
-    /// 만료/부재면 백그라운드 스레드로 재조회를 걸고 stale 값(있으면)을 즉시 돌려준다.
-    /// 유효하지 않은 키·읽기 실패는 None — 호출측이 미리보기를 생략한다(카드는 정상 동작).
-    pub fn preview(
-        &mut self,
-        ctx: &egui::Context,
-        logs_root: &Path,
-        session_uuid: &str,
-    ) -> Option<Vec<String>> {
-        let mut cache = self.tail_cache.lock().expect("tail cache lock");
-        // 상한 초과 시 가장 오래된 항목부터 버린다 — 세션이 사라져도 항목이 남는 맵이라
-        // 장기 실행에서 무한 성장한다(리뷰 P2). 대기 카드는 동시 수십 개 수준이라 넉넉.
-        const TAIL_CACHE_CAP: usize = 64;
-        while cache.len() >= TAIL_CACHE_CAP {
-            let Some(oldest) = cache
-                .iter()
-                .filter(|(_, entry)| !entry.inflight)
-                .min_by_key(|(_, entry)| entry.fetched_at)
-                .map(|(key, _)| key.clone())
-            else {
-                break; // 전부 inflight — 곧 끝난다, 이번 프레임은 그냥 둔다
-            };
-            cache.remove(&oldest);
-        }
-        if let Some(entry) = cache.get(session_uuid)
-            && (entry.inflight || entry.fetched_at.elapsed() < PREVIEW_CACHE_TTL)
-        {
-            return entry.lines.clone();
-        }
-        let stale = cache
-            .get(session_uuid)
-            .and_then(|entry| entry.lines.clone());
-        // session_dir_key는 경로 탈출을 막는 방어적 검증도 겸한다(storage::logs 계약).
-        // 실패(비정상 UUID)는 캐시에 실패로 기록해 매 프레임 재시도하지 않는다.
-        let Ok(path) = storage::SessionLogWriter::session_dir_key(logs_root, session_uuid)
-            .map(|dir| dir.join("redacted.plain.txt"))
-        else {
-            cache.insert(
-                session_uuid.to_owned(),
-                TailCacheEntry {
-                    lines: None,
-                    fetched_at: std::time::Instant::now(),
-                    inflight: false,
-                },
-            );
-            return None;
+    /// App host가 실행할 단일 intent. host slot이 비어 있을 때만 take하고, admission이
+    /// 실패하면 같은 operation/generation으로 오류 completion을 돌려줘야 한다.
+    pub fn take_preview_intent(&mut self) -> Option<LogPreviewIntent> {
+        self.preview_intent.take()
+    }
+
+    /// Host 결과를 exact operation/generation으로 적용한다. source가 바뀌거나 카드가
+    /// 사라져 generation이 전진한 뒤 도착한 결과는 현재 snapshot을 건드리지 않는다.
+    pub fn complete_preview(&mut self, completion: LogPreviewCompletion) -> bool {
+        let Some(pending) = self.pending_preview.as_ref() else {
+            return false;
         };
-        cache.insert(
-            session_uuid.to_owned(),
-            TailCacheEntry {
-                lines: stale.clone(),
-                fetched_at: std::time::Instant::now(),
-                inflight: true,
-            },
+        if pending.operation != completion.operation
+            || pending.generation != completion.generation
+            || completion.generation != self.preview_generation
+        {
+            return false;
+        }
+        let pending = self.pending_preview.take().expect("exact pending checked");
+        match completion.result {
+            Ok(Some(snapshot)) => self.insert_preview(pending.key, Arc::new(snapshot)),
+            Ok(None) | Err(_) => {
+                self.previews.remove(&pending.key);
+            }
+        }
+        true
+    }
+
+    fn insert_preview(&mut self, key: LogPreviewKey, snapshot: Arc<LogPreviewSnapshot>) {
+        if !self.previews.contains_key(&key)
+            && self.previews.len() >= LOG_PREVIEW_CACHE_ITEMS
+            && let Some(evicted) = self.previews.keys().next().cloned()
+        {
+            self.previews.remove(&evicted);
+        }
+        self.previews.insert(key, snapshot);
+    }
+
+    fn queue_preview(&mut self, card: &WaitingCard) -> Result<(), LogPreviewErrorCode> {
+        debug_assert_eq!(LOG_PREVIEW_QUEUE_CAP, 1);
+        if self.preview_intent.is_some() || self.pending_preview.is_some() {
+            return Err(LogPreviewErrorCode::Busy);
+        }
+        let source = Arc::clone(
+            card.preview_source
+                .as_ref()
+                .ok_or(LogPreviewErrorCode::InvalidPath)?,
         );
-        drop(cache);
-        let shared = Arc::clone(&self.tail_cache);
-        let ctx = ctx.clone();
-        let key = session_uuid.to_owned();
-        std::thread::Builder::new()
-            .name("inbox-tail".to_owned())
-            .spawn(move || {
-                let lines = read_tail_lines(&path, PREVIEW_TAIL_BYTES, PREVIEW_LINES);
-                shared.lock().expect("tail cache lock").insert(
-                    key,
-                    TailCacheEntry {
-                        lines,
-                        fetched_at: std::time::Instant::now(),
-                        inflight: false,
-                    },
-                );
-                // 마우스가 정지 상태면 자연 repaint가 없다 — 결과 도착을 명시 요청
-                // (hover_cwd와 동일 관례).
-                ctx.request_repaint();
-            })
-            .expect("tail read thread spawn");
-        stale
+        let operation = LogPreviewOperation(self.next_preview_operation);
+        self.next_preview_operation = self.next_preview_operation.wrapping_add(1).max(1);
+        let generation = self.preview_generation;
+        let key = LogPreviewKey {
+            workspace_id: card.workspace_id.clone(),
+            session: card.session,
+            source: Arc::clone(&source),
+        };
+        self.pending_preview = Some(PendingLogPreview {
+            key,
+            operation,
+            generation,
+        });
+        self.preview_intent = Some(LogPreviewIntent {
+            operation,
+            generation,
+            source,
+        });
+        Ok(())
     }
 
     /// 팝오버 「대기 중」 섹션의 PTY 카드들을 그린다. 카드가 비어 있으면 아무것도
@@ -188,6 +326,26 @@ impl InboxWaitingUi {
         // 펼침 상태도 같은 규칙으로 정리 — 세션이 재배정되면 남의 카드가 펼쳐진 채 뜬다.
         self.expanded
             .retain(|(workspace_id, session)| alive(workspace_id, session));
+        let preview_alive = |key: &LogPreviewKey| {
+            cards.iter().any(|card| {
+                card.workspace_id == key.workspace_id
+                    && card.session == key.session
+                    && card
+                        .preview_source
+                        .as_ref()
+                        .is_some_and(|source| source == &key.source)
+            })
+        };
+        self.previews.retain(|key, _| preview_alive(key));
+        if self
+            .pending_preview
+            .as_ref()
+            .is_some_and(|pending| !preview_alive(&pending.key))
+        {
+            self.pending_preview = None;
+            self.preview_intent = None;
+            self.preview_generation = self.preview_generation.wrapping_add(1).max(1);
+        }
         if cards.is_empty() {
             return None;
         }
@@ -237,7 +395,7 @@ impl InboxWaitingUi {
         // 미리보기는 **기본 접힘** — 12줄이라 펼쳐두면 카드 하나가 화면 절반을 먹는다
         // (2026-07-17 사용자). 헤드라인이 주 정보이고, tail은 선택지 번호를 확인할 때만
         // 필요하다. 접힘 상태는 세션별로 프레임 간 유지한다.
-        if card.preview.is_some() {
+        if let Some(source) = &card.preview_source {
             let key = (card.workspace_id.clone(), card.session);
             let expanded = self.expanded.contains(&key);
             let label = if expanded {
@@ -253,10 +411,22 @@ impl InboxWaitingUi {
                     self.expanded.remove(&key);
                 } else {
                     self.expanded.insert(key);
+                    // 명시적 펼치기만 refresh를 요청한다. snapshot이 있으면 완료 전까지
+                    // stale 값으로 UX를 유지하며, host가 바쁘면 자동 polling/retry하지 않는다.
+                    let _ = self.queue_preview(card);
                 }
             }
             if expanded {
-                render_preview(ui, catalog, card.preview.as_deref());
+                let snapshot = self
+                    .previews
+                    .iter()
+                    .find(|(key, _)| {
+                        key.workspace_id == card.workspace_id
+                            && key.session == card.session
+                            && &key.source == source
+                    })
+                    .map(|(_, snapshot)| snapshot.as_ref());
+                render_preview(ui, catalog, snapshot);
             }
         }
         ui.horizontal(|ui| {
@@ -317,8 +487,15 @@ impl InboxWaitingUi {
 
 /// 미리보기 3줄 — 고정폭, 좌측 세로선(section_label과 같은 스타일의 accent bar).
 /// 없으면 폴백 문구 하나만 보인다.
-fn render_preview(ui: &mut egui::Ui, catalog: &i18n::Catalog, preview: Option<&[String]>) {
-    let Some(lines) = preview.filter(|lines| !lines.is_empty()) else {
+fn render_preview(
+    ui: &mut egui::Ui,
+    catalog: &i18n::Catalog,
+    preview: Option<&LogPreviewSnapshot>,
+) {
+    let Some(lines) = preview
+        .map(LogPreviewSnapshot::lines)
+        .filter(|lines| !lines.is_empty())
+    else {
         ui.label(
             egui::RichText::new(catalog.t("inbox.waiting.no_preview", &[]))
                 .size(10.5)
@@ -342,8 +519,13 @@ fn render_preview(ui: &mut egui::Ui, catalog: &i18n::Catalog, preview: Option<&[
                 // truncate로 시각 1줄 고정 — wrap되면 좌측 bar 높이(줄 수 × row_h)와
                 // 어긋나고, 4KB 단일 줄 tail이면 카드가 수십 행으로 폭발한다(리뷰 P3).
                 ui.add(
-                    egui::Label::new(egui::RichText::new(line).monospace().size(10.0).weak())
-                        .truncate(),
+                    egui::Label::new(
+                        egui::RichText::new(line.as_ref())
+                            .monospace()
+                            .size(10.0)
+                            .weak(),
+                    )
+                    .truncate(),
                 );
             }
         });
@@ -395,18 +577,51 @@ fn is_screen_chrome(line: &str) -> bool {
 /// **연속 중복은 접는다**: TUI가 상태줄을 주기적으로 다시 그려 같은 줄이 로그에 연달아
 /// 쌓인다(2026-07-17 실측 — `⏵⏵ auto mode on`이 반복되며 12줄을 다 먹었다). 접지 않으면
 /// 줄 수를 늘려도 상태줄만 늘어난다.
-/// 순수 함수(유닛 테스트 대상) — 파일 IO는 read_tail_lines가 감싼다.
+/// 순수 함수(유닛 테스트 대상). 실제 파일 읽기는 App host만 수행한다.
+#[cfg(test)]
 fn last_lines(text: &str, n: usize) -> Vec<String> {
+    bounded_last_lines(
+        text,
+        n,
+        LOG_PREVIEW_LINE_BYTES,
+        LOG_PREVIEW_TAIL_BYTES as usize,
+    )
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn bounded_last_lines(
+    text: &str,
+    n: usize,
+    max_line_bytes: usize,
+    max_total_bytes: usize,
+) -> Vec<String> {
     let mut lines: Vec<String> = Vec::with_capacity(n);
+    let mut total_bytes = 0usize;
     for line in text.lines().rev() {
         let trimmed = line.trim_end();
         if trimmed.trim().is_empty() || is_screen_chrome(trimmed) {
             continue;
         }
+        let remaining = max_total_bytes.saturating_sub(total_bytes);
+        let trimmed = truncate_utf8(trimmed, max_line_bytes.min(remaining));
+        if trimmed.is_empty() {
+            break;
+        }
         // 역순 순회라 "직전에 담은 것"이 로그상 바로 다음 줄 — 연속 중복 판정에 맞다.
         if lines.last().map(String::as_str) == Some(trimmed) {
             continue;
         }
+        total_bytes += trimmed.len();
         lines.push(trimmed.to_owned());
         if lines.len() == n {
             break;
@@ -416,34 +631,33 @@ fn last_lines(text: &str, n: usize) -> Vec<String> {
     lines
 }
 
-/// 파일 끝에서 최대 `max_bytes`만 읽어 마지막 `n`줄을 추출한다(백그라운드 스레드 전용 —
-/// UI 스레드에서 호출 금지). 파일 없음/읽기 실패/빈 결과는 None — 호출측이 폴백한다.
-fn read_tail_lines(path: &Path, max_bytes: u64, n: usize) -> Option<Vec<String>> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    let start = len.saturating_sub(max_bytes);
-    if start > 0 {
-        file.seek(SeekFrom::Start(start)).ok()?;
-    }
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf);
-    // 중간부터 읽었으면 첫 줄은 잘린 조각(멀티바이트 경계면 U+FFFD로 시작)이다 —
-    // 첫 개행까지 버린다(tail 관례, 리뷰 P3).
-    let text = if start > 0 {
-        text.split_once('\n').map(|(_, rest)| rest).unwrap_or("")
-    } else {
-        &text
-    };
-    let lines = last_lines(text, n);
-    (!lines.is_empty()).then_some(lines)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use runtime::{LayoutNode, MuxPaneId, MuxTabId, PaneSnapshot, TabSnapshot};
+
+    #[test]
+    fn inbox_waiting_production_source는_host_io와_polling이_없다() {
+        let source = include_str!("inbox_waiting.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        for forbidden in [
+            "std::fs",
+            "File::open",
+            ".metadata(",
+            ".read_to_end(",
+            ".seek(",
+            "std::thread",
+            "mpsc",
+            "request_repaint_after",
+            "request_repaint(",
+            "storage::",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "production inbox leaf contains forbidden host edge: {forbidden}"
+            );
+        }
+    }
 
     #[test]
     fn parse_session_key_parses_workspace_and_session() {
@@ -515,83 +729,51 @@ mod tests {
         assert_eq!(find_persistent_session_id(&mux, SessionId(1)), None);
     }
 
-    /// hover_cwd(ui/workspace.rs) 테스트와 같은 stale-while-revalidate 검증 패턴:
-    /// 1차 호출은 pending(None)이고, 백그라운드 스레드가 끝나면 캐시된 값이 온다.
     #[test]
-    fn preview_reads_tail_via_background_thread_and_caches() {
-        let dir = std::env::temp_dir().join(format!(
-            "deppy-inbox-waiting-test-{}-{}",
-            std::process::id(),
-            "preview_reads_tail"
-        ));
-        let session_uuid = "test-session-uuid";
-        let log_dir = dir.join(session_uuid);
-        std::fs::create_dir_all(&log_dir).unwrap();
-        std::fs::write(
-            log_dir.join("redacted.plain.txt"),
-            "line1\nline2\nline3\nline4\n",
-        )
-        .unwrap();
-
-        let mut ui = InboxWaitingUi::new();
-        let ctx = egui::Context::default();
-        let first = ui.preview(&ctx, &dir, session_uuid);
-        assert!(first.is_none(), "1차 호출은 아직 조회 전이라 None이어야 함");
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if let Some(lines) = ui.preview(&ctx, &dir, session_uuid) {
-                // PREVIEW_LINES=12라 4줄 파일은 전부 나온다(빈 줄만 제외).
-                assert_eq!(
-                    lines,
-                    vec![
-                        "line1".to_owned(),
-                        "line2".to_owned(),
-                        "line3".to_owned(),
-                        "line4".to_owned()
-                    ]
-                );
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "미리보기 결과가 오지 않음"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        std::fs::remove_dir_all(&dir).ok();
+    fn log_preview_snapshot은_item_line_byte_상한을_지킨다() {
+        let line = "가".repeat(LOG_PREVIEW_LINE_BYTES);
+        let raw = (0..32)
+            .map(|index| format!("{index}:{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tail = &raw.as_bytes()[raw.len() - LOG_PREVIEW_TAIL_BYTES as usize..];
+        let snapshot = LogPreviewSnapshot::try_from_tail_bytes(tail, true)
+            .unwrap()
+            .unwrap();
+        assert!(snapshot.lines().len() <= LOG_PREVIEW_LINES);
+        assert!(
+            snapshot
+                .lines()
+                .iter()
+                .all(|line| line.len() <= LOG_PREVIEW_LINE_BYTES)
+        );
+        assert!(snapshot.bytes <= LOG_PREVIEW_TAIL_BYTES as usize);
     }
 
     #[test]
-    fn preview_missing_file_resolves_to_none_without_retry_storm() {
-        let dir = std::env::temp_dir().join(format!(
-            "deppy-inbox-waiting-test-{}-{}",
-            std::process::id(),
-            "preview_missing"
-        ));
-        let mut ui = InboxWaitingUi::new();
-        let ctx = egui::Context::default();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let result = ui.preview(&ctx, &dir, "no-such-session");
-            if result.is_none() {
-                // inflight든 완료든, 파일이 없으니 결국 None으로 안정된다.
-                if !ui
-                    .tail_cache
-                    .lock()
-                    .unwrap()
-                    .get("no-such-session")
-                    .is_some_and(|entry| entry.inflight)
-                {
-                    break;
-                }
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "캐시가 안정화되지 않음"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+    fn log_preview_path와_debug는_raw_내용을_노출하지_않는다() {
+        let raw = "/private/token-like/path/redacted.plain.txt";
+        let source = LogPreviewSource::try_new(PathBuf::from(raw)).unwrap();
+        let source_debug = format!("{source:?}");
+        assert!(source_debug.contains("REDACTED"));
+        assert!(!source_debug.contains(raw));
+        assert_eq!(
+            LogPreviewSource::try_new(PathBuf::from("bad\0path")).unwrap_err(),
+            LogPreviewErrorCode::InvalidPath
+        );
+        assert_eq!(
+            LogPreviewSource::try_new(PathBuf::from("x".repeat(LOG_PREVIEW_PATH_BYTES + 1)))
+                .unwrap_err(),
+            LogPreviewErrorCode::PathTooLarge
+        );
+
+        let raw_log = "never-print-this-preview";
+        let snapshot = LogPreviewSnapshot::try_from_tail_bytes(raw_log.as_bytes(), false)
+            .unwrap()
+            .unwrap();
+        let snapshot_debug = format!("{snapshot:?}");
+        assert!(!snapshot_debug.contains(raw_log));
+        assert!(snapshot_debug.contains("lines"));
     }
 
     /// 2026-07-17 실측 회귀: claude가 상태줄을 주기적으로 다시 그려 같은 줄이 로그에
@@ -655,46 +837,18 @@ mod tests {
     }
 
     #[test]
-    fn read_tail_lines_중간_seek_시_잘린_첫_줄을_버린다() {
-        let path = std::env::temp_dir().join(format!(
-            "deppy-tail-seek-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::write(&path, "aaaa\nbbbb\ncccc\ndddd\n").unwrap();
-        // len=20, max=12 → start=8: "bb\ncccc\ndddd\n" — 첫 조각 "bb"는 버려야 한다.
+    fn log_preview_snapshot은_잘린_첫_줄을_버린다() {
+        let snapshot = LogPreviewSnapshot::try_from_tail_bytes(b"bb\ncccc\ndddd\n", true)
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            read_tail_lines(&path, 12, 3),
-            Some(vec!["cccc".to_owned(), "dddd".to_owned()])
+            snapshot
+                .lines()
+                .iter()
+                .map(|line| line.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["cccc", "dddd"]
         );
-        // 파일 전체를 읽으면(start=0) 첫 줄도 온전하다.
-        assert_eq!(
-            read_tail_lines(&path, 4096, 2),
-            Some(vec!["cccc".to_owned(), "dddd".to_owned()])
-        );
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn read_tail_lines_utf8_경계에서_잘려도_깨진_조각이_노출되지_않는다() {
-        let path = std::env::temp_dir().join(format!(
-            "deppy-tail-utf8-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        // "가나다\n라마바\n" = 20B, start=8이 '다'(6..9)의 중간에 떨어진다.
-        std::fs::write(&path, "가나다\n라마바\n").unwrap();
-        assert_eq!(
-            read_tail_lines(&path, 12, 3),
-            Some(vec!["라마바".to_owned()])
-        );
-        std::fs::remove_file(&path).ok();
     }
 
     // ── kittest 상호작용 테스트 (2026-07-17) ──
@@ -708,7 +862,16 @@ mod tests {
             workspace_name: "proj".to_owned(),
             session_title: "codex".to_owned(),
             headline: None,
-            preview: None,
+            preview_source: None,
+        }
+    }
+
+    fn card_with_preview(session: u64, path: &str) -> WaitingCard {
+        WaitingCard {
+            preview_source: Some(Arc::new(
+                LogPreviewSource::try_new(PathBuf::from(path)).unwrap(),
+            )),
+            ..card(session)
         }
     }
 
@@ -744,6 +907,69 @@ mod tests {
                 reply: "y".to_owned(),
             }]
         );
+    }
+
+    #[test]
+    fn kittest_collapsed_300_frame은_preview_host_intent가_0이다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let cards = vec![card_with_preview(7, "/bounded/redacted.plain.txt")];
+        let mut harness = waiting_harness(&catalog, &cards);
+        for _ in 0..300 {
+            harness.run();
+        }
+        assert!(harness.state_mut().0.take_preview_intent().is_none());
+        assert!(harness.state().0.pending_preview.is_none());
+    }
+
+    #[test]
+    fn preview_intent는_capacity_one이고_completion은_exact_stale_safe다() {
+        let first = card_with_preview(7, "/first/redacted.plain.txt");
+        let second = card_with_preview(8, "/second/redacted.plain.txt");
+        let mut ui = InboxWaitingUi::new();
+        ui.queue_preview(&first).unwrap();
+        assert_eq!(
+            ui.queue_preview(&second).unwrap_err(),
+            LogPreviewErrorCode::Busy
+        );
+        let intent = ui.take_preview_intent().unwrap();
+        let snapshot = LogPreviewSnapshot::try_from_tail_bytes(b"question\n1. Yes\n", false)
+            .unwrap()
+            .unwrap();
+        assert!(!ui.complete_preview(LogPreviewCompletion {
+            operation: intent.operation,
+            generation: intent.generation.wrapping_add(1),
+            result: Ok(Some(snapshot.clone())),
+        }));
+        assert!(ui.complete_preview(LogPreviewCompletion {
+            operation: intent.operation,
+            generation: intent.generation,
+            result: Ok(Some(snapshot)),
+        }));
+        assert_eq!(ui.previews.len(), 1);
+        assert!(ui.pending_preview.is_none());
+    }
+
+    #[test]
+    fn preview_source_change는_late_completion을_폐기한다() {
+        let first = card_with_preview(7, "/first/redacted.plain.txt");
+        let second = card_with_preview(7, "/second/redacted.plain.txt");
+        let mut state = InboxWaitingUi::new();
+        state.queue_preview(&first).unwrap();
+        let intent = state.take_preview_intent().unwrap();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, state: &mut InboxWaitingUi| {
+                state.render(ui, &catalog, std::slice::from_ref(&second));
+            },
+            state,
+        );
+        harness.run();
+        assert!(!harness.state_mut().complete_preview(LogPreviewCompletion {
+            operation: intent.operation,
+            generation: intent.generation,
+            result: Ok(LogPreviewSnapshot::try_from_tail_bytes(b"stale\n", false).unwrap()),
+        }));
+        assert!(harness.state().previews.is_empty());
     }
 
     #[test]

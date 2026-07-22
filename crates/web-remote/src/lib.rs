@@ -32,6 +32,7 @@ pub mod http;
 pub mod pairing;
 pub mod protocol;
 pub mod push;
+pub mod repository;
 pub mod static_srv;
 pub mod upload;
 pub mod ws_api;
@@ -62,10 +63,11 @@ pub struct ServeOptions {
     pub token: String,
     /// 허용 Host(ts.net 호스트명). None/빈 값이면 loopback 계열 Host만 허용.
     pub allowed_host: Option<String>,
-    /// 승인 대시보드용 자체 DB 경로(P2). None이면 상태 대시보드만 동작하고 승인은 빈 목록.
-    pub db_path: Option<std::path::PathBuf>,
+    /// 승인/웹푸시 persistence capability. Concrete DB and storage rows remain app-owned.
+    /// None이면 상태 대시보드만 동작하고 승인/웹푸시는 비활성이다.
+    pub repository: Option<Arc<dyn repository::WebRemoteRepository>>,
     /// 웹푸시(P4) VAPID 키. app이 keyring에서 get_or_create해 주입한다(SecretStore 접근이 app
-    /// 소유). None이거나 `db_path`가 None이면 푸시 비활성(대시보드만 동작).
+    /// 소유). None이거나 `repository`가 None이면 푸시 비활성(대시보드만 동작).
     pub vapid: Option<push::VapidKey>,
     /// 모바일 파일 첨부(P6d) 저장 디렉터리. app이 `logs_base/uploads`를 주입한다. None이면
     /// `POST /upload`가 404(업로드 비활성) — 테스트/미배선 시 안전한 기본값.
@@ -144,11 +146,10 @@ impl WebRemoteServer {
         ));
         // WS 대시보드 브리지 스레드. OFF(서버 미생성)면 이 스레드도 없다 — 리소스 0.
         let (dashboard, dashboard_thread) =
-            dashboard::DashboardHandle::spawn(options.db_path.clone());
-        // 웹푸시(P4) — VAPID 키 + DB 경로가 모두 있을 때만 발송 스레드를 띄운다. 자체 DB 연결로
-        // 구독 CRUD·승인 폴링을 하고(대시보드와 별도), 상태 알림은 대시보드 브리지가 넘긴다.
-        let push = match (options.db_path, options.vapid) {
-            (Some(path), Some(vapid)) => match push::PushManager::spawn(path, vapid) {
+            dashboard::DashboardHandle::spawn(options.repository.clone());
+        // 웹푸시(P4) — VAPID 키 + 저장소 포트가 모두 있을 때만 발송 스레드를 띄운다.
+        let push = match (options.repository, options.vapid) {
+            (Some(repository), Some(vapid)) => match push::PushManager::spawn(repository, vapid) {
                 Ok(manager) => {
                     dashboard.set_push_sink(manager.handle());
                     Some(manager)
@@ -656,12 +657,16 @@ mod tests {
     }
 
     fn start_with_db(allowed_host: Option<&str>, db_path: Option<PathBuf>) -> WebRemoteServer {
+        let repository = db_path.as_deref().map(|path| {
+            repository::StorageTestRepository::open(path)
+                as Arc<dyn repository::WebRemoteRepository>
+        });
         WebRemoteServer::serve(
             SocketAddr::from(([127, 0, 0, 1], 0)),
             ServeOptions {
                 token: TEST_TOKEN.to_owned(),
                 allowed_host: allowed_host.map(str::to_owned),
-                db_path,
+                repository,
                 vapid: None,
                 uploads_dir: None,
             },
@@ -676,7 +681,7 @@ mod tests {
             ServeOptions {
                 token: TEST_TOKEN.to_owned(),
                 allowed_host: None,
-                db_path: None,
+                repository: None,
                 vapid: None,
                 uploads_dir: Some(dir),
             },
@@ -804,7 +809,7 @@ mod tests {
             ServeOptions {
                 token: TEST_TOKEN.to_owned(),
                 allowed_host: None,
-                db_path: None,
+                repository: None,
                 vapid: None,
                 uploads_dir: None,
             },
@@ -1890,12 +1895,14 @@ mod tests {
 
     // ── P4: 웹푸시 HTTP 통합(서버 소켓 경유 — http.rs 본문 읽기 + 라우팅) ──────
     fn start_with_push(db_path: PathBuf) -> WebRemoteServer {
+        let repository = repository::StorageTestRepository::open(&db_path)
+            as Arc<dyn repository::WebRemoteRepository>;
         WebRemoteServer::serve(
             SocketAddr::from(([127, 0, 0, 1], 0)),
             ServeOptions {
                 token: TEST_TOKEN.to_owned(),
                 allowed_host: None,
-                db_path: Some(db_path),
+                repository: Some(repository),
                 vapid: Some(push::VapidKey::generate()),
                 uploads_dir: None,
             },

@@ -29,7 +29,6 @@
 //!   — 다른 기기이므로 각자 알린다.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -46,6 +45,9 @@ use secret::{SecretStore, SecretString};
 use sha2::Sha256;
 
 use crate::http::Response;
+use crate::repository::{
+    PUSH_SUBSCRIPTION_LIMIT, PushSubscriptionRecord, SubscriptionUpsert, WebRemoteRepository,
+};
 
 /// VAPID 개인키 keyring entry id. rotation 시 `-2`로 올린다 (tls_identity·pairing 관례).
 const VAPID_KEY_ID: &str = "web-push-vapid-key-1";
@@ -75,7 +77,7 @@ const SESSION_SEND_ATTEMPTS: u32 = 3;
 const MAX_NOTIFIED_SESSIONS: usize = 256;
 /// 등록 가능한 구독 수 상한(계정 전체). 개인용 1~2기기 가정 + 여유. 죽은 endpoint를 다수
 /// 등록해 발송 스레드를 HTTP_TIMEOUT×재시도×구독수만큼 붙잡는 지연을 막는다.
-const MAX_SUBSCRIPTIONS: usize = 8;
+const MAX_SUBSCRIPTIONS: usize = PUSH_SUBSCRIPTION_LIMIT;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // VAPID 키 (ES256)
@@ -478,8 +480,8 @@ struct PushInner {
 struct PushShared {
     inner: Mutex<PushInner>,
     cvar: Condvar,
-    /// 발송 스레드 전용 DB 연결(대시보드와 별도 — SQLite 다중 연결 관례). 구독 CRUD·승인 폴링.
-    db: Mutex<storage::Db>,
+    /// App-owned 저장소 포트. concrete DB/row는 이 계층에 노출되지 않는다.
+    repository: Arc<dyn WebRemoteRepository>,
     vapid: VapidKey,
     transport: Box<dyn PushTransport>,
     /// 승인 폴링 주기 — 운영은 POLL_INTERVAL. 테스트만 짧게 주입해 "다음 주기 재시도"를 빠르게
@@ -507,14 +509,23 @@ pub struct PushManager {
 }
 
 impl PushManager {
-    /// 운영용(ureq 트랜스포트) 발송 매니저를 띄운다. `db_path`로 자체 DB 연결을 연다.
-    pub fn spawn(db_path: PathBuf, vapid: VapidKey) -> anyhow::Result<Self> {
-        Self::spawn_with_transport(db_path, vapid, Box::new(UreqTransport::new()))
+    /// 운영용(ureq 트랜스포트) 발송 매니저를 app-owned 저장소 포트와 함께 띄운다.
+    pub fn spawn(
+        repository: Arc<dyn WebRemoteRepository>,
+        vapid: VapidKey,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_with_repository_and_interval(
+            repository,
+            vapid,
+            Box::new(UreqTransport::new()),
+            POLL_INTERVAL,
+        )
     }
 
     /// 트랜스포트를 주입해 띄운다(테스트: 410/실패 시뮬레이션).
+    #[cfg(test)]
     fn spawn_with_transport(
-        db_path: PathBuf,
+        db_path: std::path::PathBuf,
         vapid: VapidKey,
         transport: Box<dyn PushTransport>,
     ) -> anyhow::Result<Self> {
@@ -522,14 +533,31 @@ impl PushManager {
     }
 
     /// 트랜스포트 + 폴링 주기를 주입해 띄운다(테스트: 재시도를 5초 기다리지 않게).
+    #[cfg(test)]
     fn spawn_with_interval(
-        db_path: PathBuf,
+        db_path: std::path::PathBuf,
         vapid: VapidKey,
         transport: Box<dyn PushTransport>,
         poll_interval: Duration,
     ) -> anyhow::Result<Self> {
-        let db = storage::Db::open(&db_path).context("web-remote 웹푸시 DB 열기 실패")?;
-        let initial = db.count_web_push_subscriptions().unwrap_or(0).max(0) as usize;
+        let repository: Arc<dyn WebRemoteRepository> =
+            crate::repository::StorageTestRepository::open(&db_path);
+        Self::spawn_with_repository_and_interval(repository, vapid, transport, poll_interval)
+    }
+
+    fn spawn_with_repository_and_interval(
+        repository: Arc<dyn WebRemoteRepository>,
+        vapid: VapidKey,
+        transport: Box<dyn PushTransport>,
+        poll_interval: Duration,
+    ) -> anyhow::Result<Self> {
+        let initial = repository
+            .web_push_subscription_count()
+            .context("web-remote 웹푸시 구독 수 조회 실패")?;
+        anyhow::ensure!(
+            initial <= MAX_SUBSCRIPTIONS,
+            "web_push_subscription_limit_exceeded"
+        );
         let shared = Arc::new(PushShared {
             inner: Mutex::new(PushInner {
                 force: false,
@@ -539,7 +567,7 @@ impl PushManager {
                 notified_status: HashMap::new(),
             }),
             cvar: Condvar::new(),
-            db: Mutex::new(db),
+            repository,
             vapid,
             transport,
             poll_interval,
@@ -594,21 +622,25 @@ impl PushHandle {
             return Err(SubscribeError::BadEndpoint);
         }
         {
-            let db = self.shared.db.lock().expect("push db lock");
-            // 상한 검사는 DB 락 안에서 — 동시 등록이 상한을 넘겨 삽입하는 경쟁을 막는다.
-            // 이미 등록된 endpoint의 재등록(브라우저 키 회전)은 새 구독이 아니라 상한과 무관하다.
-            let existing = db
-                .list_web_push_subscriptions()
-                .map_err(SubscribeError::Storage)?;
-            if existing.len() >= MAX_SUBSCRIPTIONS
-                && !existing.iter().any(|row| row.endpoint == endpoint)
+            match self
+                .shared
+                .repository
+                .upsert_web_push_subscription(
+                    endpoint,
+                    p256dh,
+                    auth,
+                    unix_secs() as i64,
+                    MAX_SUBSCRIPTIONS,
+                )
+                .map_err(SubscribeError::Storage)?
             {
-                return Err(SubscribeError::TooManySubscriptions);
+                SubscriptionUpsert::Stored { total } => {
+                    self.shared.sub_count.store(total, Ordering::SeqCst);
+                }
+                SubscriptionUpsert::LimitReached => {
+                    return Err(SubscribeError::TooManySubscriptions);
+                }
             }
-            db.upsert_web_push_subscription(endpoint, p256dh, auth, unix_secs() as i64)
-                .map_err(SubscribeError::Storage)?;
-            let count = db.count_web_push_subscriptions().unwrap_or(0).max(0) as usize;
-            self.shared.sub_count.store(count, Ordering::SeqCst);
         }
         {
             let mut inner = self.shared.inner.lock().expect("push inner lock");
@@ -759,8 +791,10 @@ fn remember_status(notified: &mut HashMap<String, SessionKind>, session: &str, k
 /// 폴링에서 같은 id가 이미 알린 것으로 보여 그 승인은 영구히 알림 없이 묻힌다.
 fn poll_and_notify_approvals(shared: &Arc<PushShared>) {
     let pending = {
-        let db = shared.db.lock().expect("push db lock");
-        match db.list_pending_approvals() {
+        match shared
+            .repository
+            .list_pending_approvals(crate::repository::PENDING_APPROVAL_LIMIT)
+        {
             Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!("웹푸시 승인 폴링 실패: {e:#}");
@@ -802,15 +836,16 @@ fn poll_and_notify_approvals(shared: &Arc<PushShared>) {
 /// 시도 포기. 결과([`BroadcastOutcome`])로 호출자가 중복 억제 마킹 커밋 여부를 정한다.
 fn broadcast(shared: &Arc<PushShared>, note: &Notification) -> BroadcastOutcome {
     let subs = {
-        let db = shared.db.lock().expect("push db lock");
-        db.list_web_push_subscriptions().unwrap_or_default()
+        shared
+            .repository
+            .list_web_push_subscriptions(MAX_SUBSCRIPTIONS)
+            .unwrap_or_default()
     };
     let mut outcome = BroadcastOutcome::default();
     if subs.is_empty() {
         return outcome;
     }
     let payload = note.payload();
-    let mut changed = false;
     for sub in subs {
         // shutdown 중이면 잔여 구독 발송을 중단한다 — stop_and_join(앱 종료, UI 스레드)이
         // 구독 수 × HTTP 타임아웃만큼 기다리지 않게 한다. 남는 대기는 진행 중이던
@@ -822,13 +857,17 @@ fn broadcast(shared: &Arc<PushShared>, note: &Notification) -> BroadcastOutcome 
         match deliver(shared, &sub, payload.as_bytes()) {
             Delivery::Ok => {
                 outcome.delivered += 1;
-                let db = shared.db.lock().expect("push db lock");
-                let _ = db.touch_web_push_subscription(&sub.endpoint, unix_secs() as i64);
+                let _ = shared
+                    .repository
+                    .touch_web_push_subscription(sub.endpoint(), unix_secs() as i64);
             }
             Delivery::Gone => {
-                let db = shared.db.lock().expect("push db lock");
-                let _ = db.delete_web_push_subscription(&sub.endpoint);
-                changed = true;
+                let remaining = shared
+                    .repository
+                    .delete_web_push_subscription(sub.endpoint());
+                if let Ok(remaining) = remaining {
+                    shared.sub_count.store(remaining, Ordering::SeqCst);
+                }
                 tracing::info!("웹푸시 구독 만료(410/404) — 삭제");
             }
             Delivery::Failed => {
@@ -846,31 +885,17 @@ fn broadcast(shared: &Arc<PushShared>, note: &Notification) -> BroadcastOutcome 
             "웹푸시 전량 실패 — 중복 억제 마킹 보류(다음 주기 재시도)"
         );
     }
-    if changed {
-        let count = shared
-            .db
-            .lock()
-            .expect("push db lock")
-            .count_web_push_subscriptions()
-            .unwrap_or(0)
-            .max(0) as usize;
-        shared.sub_count.store(count, Ordering::SeqCst);
-    }
     outcome
 }
 
 /// 한 구독으로 발송한다: VAPID JWT + RFC 8291 암호화 + POST(재시도 1회). 암호화 실패는
 /// 즉시 포기(구독 데이터가 깨진 경우 — 재시도 무의미 → Broken).
-fn deliver(
-    shared: &Arc<PushShared>,
-    sub: &storage::WebPushSubscriptionRow,
-    payload: &[u8],
-) -> Delivery {
-    let Some(aud) = endpoint_origin(&sub.endpoint) else {
+fn deliver(shared: &Arc<PushShared>, sub: &PushSubscriptionRecord, payload: &[u8]) -> Delivery {
+    let Some(aud) = endpoint_origin(sub.endpoint()) else {
         tracing::warn!("웹푸시 endpoint origin 파싱 실패 — 건너뜀");
         return Delivery::Broken;
     };
-    let body = match encrypt_payload(&sub.p256dh, &sub.auth, payload) {
+    let body = match encrypt_payload(sub.p256dh(), sub.auth(), payload) {
         Ok(body) => body,
         Err(e) => {
             tracing::warn!("웹푸시 본문 암호화 실패: {e:#}");
@@ -887,7 +912,7 @@ fn deliver(
         }
         shared.sent_count.fetch_add(1, Ordering::SeqCst);
         match shared.transport.post(
-            &sub.endpoint,
+            sub.endpoint(),
             PUSH_TTL_SECS,
             PUSH_URGENCY,
             &authorization,
@@ -1135,6 +1160,7 @@ fn random_p256_scalar() -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::sync::Mutex as StdMutex;
 
     // ── RFC 8291 부록 A 고정 벡터 ────────────────────────────────────────────

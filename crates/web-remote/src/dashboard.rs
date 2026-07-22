@@ -5,8 +5,8 @@
 //!      [`RuntimeEventReceiver`]를 drain해 세션 상태·리소스 맵을 갱신한다. wake 클로저가
 //!      이 스레드를 깨우므로 **egui 프레임과 무관하게**(창이 숨겨져 리페인트가 멈춰도)
 //!      상태가 흐른다. (§14.1 Warm 알림 유지 관례)
-//!   2. **승인 DB 직행** — 웹 계층 자체 [`storage::Db`] 연결로 pending 승인을 1초 폴링하고,
-//!      Allow/Deny를 `resolve_approval`로 되쓴다. proxy↔GUI 공유 DB IPC 관례(계획 §0.2).
+//!   2. **승인 저장소 포트** — app이 주입한 [`WebRemoteRepository`]로 pending 승인을 1초
+//!      폴링하고 Allow/Deny를 되쓴다. 웹 계층은 concrete DB를 생성하거나 소유하지 않는다.
 //!
 //! 리소스 규율:
 //!   - **OFF**: 서버 미생성 → 이 스레드 없음(스레드/타이머 0).
@@ -21,7 +21,6 @@
 //! 의 wake 콜백이 네트워크 I/O에 블록되지 않도록 계층을 가른다.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
@@ -33,6 +32,7 @@ use runtime::{
 };
 
 use crate::protocol::{ApprovalView, ResourceView, ServerMsg, SessionView, WorkspaceView};
+use crate::repository::{PENDING_APPROVAL_LIMIT, PendingApprovalRecord, WebRemoteRepository};
 
 /// 승인 DB 폴링 주기 — 접속이 있을 때만 적용된다(계획 완료기준: 상태/승인 반영 ≤1s).
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -473,12 +473,10 @@ struct Published {
 struct Shared {
     inner: Mutex<Inner>,
     published: Mutex<Published>,
-    /// 승인 대시보드용 자체 DB 연결(없으면 승인 목록은 빈 채로 상태만 흐른다). inner와 별도
-    /// 락으로 두어 승인 되쓰기/폴링의 DB I/O(busy_timeout 최대 5s)가 이벤트 drain·등록이 쓰는
-    /// inner 락을 잡은 채 진행되지 않게 한다(P3 리뷰). 락 순서는 inner→db, inner→published
-    /// 중첩만 허용(역순 금지 — 교착 방지). 시청 슬롯 생멸은 watcher 전이와 원자화를 위해
-    /// inner를 쥔 채 published를 중첩 취득한다 (P5 리뷰 ②-P1).
-    db: Mutex<Option<storage::Db>>,
+    /// 승인 대시보드용 app-owned 저장소 포트(없으면 승인 목록은 빈 채로 상태만 흐른다).
+    /// 구현체가 concrete connection 직렬화를 소유한다. 브리지는 inner를 잡은 채 포트를
+    /// 호출하므로 resolve는 inner를 놓고 호출하며, 구현체는 이 브리지로 재진입하면 안 된다.
+    repository: Option<Arc<dyn WebRemoteRepository>>,
     cvar: Condvar,
     /// 인증까지 마친 라이브 대시보드 WS 수 — wake/타이머 게이트.
     connections: AtomicUsize,
@@ -512,17 +510,9 @@ impl Drop for ConnectionGuard {
 }
 
 impl DashboardHandle {
-    /// 브리지 스레드를 띄운다. `db_path`가 있으면 자체 DB 연결을 열어 승인 대시보드를
-    /// 활성화한다(열기 실패는 로그만 — 상태 대시보드는 계속). 반환된 JoinHandle은 서버가
-    /// 소유해 shutdown 시 join한다.
-    pub fn spawn(db_path: Option<PathBuf>) -> (Self, JoinHandle<()>) {
-        let db = db_path.and_then(|path| match storage::Db::open(&path) {
-            Ok(db) => Some(db),
-            Err(e) => {
-                tracing::warn!("web-remote 승인 DB 열기 실패 — 승인 대시보드 비활성: {e:#}");
-                None
-            }
-        });
+    /// 브리지 스레드를 띄운다. 저장소 포트가 있으면 승인 대시보드를 활성화한다. 반환된
+    /// JoinHandle은 서버가 소유해 shutdown 시 join한다.
+    pub fn spawn(repository: Option<Arc<dyn WebRemoteRepository>>) -> (Self, JoinHandle<()>) {
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
                 dirty: false,
@@ -542,7 +532,7 @@ impl DashboardHandle {
                 ids: IdMap::default(),
             }),
             published: Mutex::new(Published::default()),
-            db: Mutex::new(db),
+            repository,
             cvar: Condvar::new(),
             connections: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
@@ -897,10 +887,10 @@ impl DashboardHandle {
             inner.force_poll = true;
             inner.dirty = true;
         }
-        // DB 되쓰기는 전용 db 락으로(inner 미보유 — 락 순서 inner→db 준수). 그 뒤 브리지를 깨워
-        // 재폴링시켜 목록에서 사라진 걸 빠르게 반영한다(first-writer-wins — 해소된 id는 no-op).
-        if let Some(db) = self.shared.db.lock().expect("dashboard db lock").as_ref()
-            && let Err(e) = db.resolve_approval(id, allowed, remember, now)
+        // 저장소 호출은 inner 미보유 상태에서 실행한다. 그 뒤 브리지를 깨워 재폴링시켜 목록에서
+        // 사라진 걸 빠르게 반영한다(first-writer-wins — 해소된 id는 no-op).
+        if let Some(repository) = self.shared.repository.as_ref()
+            && let Err(e) = repository.resolve_approval(id, allowed, remember, now)
         {
             tracing::warn!("web-remote 승인 resolve 실패: {e:#}");
         }
@@ -1007,7 +997,7 @@ impl DashboardHandle {
 /// `ids`는 **활성 워커**의 mux에서 만들어지므로 다른 워크스페이스의 승인은 None으로
 /// 남는다 — 그게 맞다: u64는 워크스페이스마다 1부터라 남의 번호로 조회하면 엉뚱한
 /// 세션이 잡힌다(모듈 상단 앨리어싱 경고).
-fn approval_views(rows: Vec<storage::PendingApprovalRow>, ids: &IdMap) -> Vec<ApprovalView> {
+fn approval_views(rows: Vec<PendingApprovalRecord>, ids: &IdMap) -> Vec<ApprovalView> {
     rows.into_iter()
         .map(|row| {
             let session = row
@@ -1159,10 +1149,9 @@ fn run(shared: &Arc<Shared>) {
         if should_poll {
             inner.last_poll = Instant::now();
             shared.poll_count.fetch_add(1, Ordering::SeqCst);
-            // db 락을 inner 밑에 중첩 취득한다(락 순서 inner→db). resolve는 inner를 놓고서만
-            // db를 잡으므로 교착이 생기지 않는다.
-            match shared.db.lock().expect("dashboard db lock").as_ref() {
-                Some(db) => match db.list_pending_approvals() {
+            match shared.repository.as_ref() {
+                Some(repository) => match repository.list_pending_approvals(PENDING_APPROVAL_LIMIT)
+                {
                     Ok(rows) => approvals = Some(approval_views(rows, &inner.ids)),
                     Err(e) => tracing::warn!("web-remote 승인 목록 폴링 실패: {e:#}"),
                 },
@@ -1938,12 +1927,11 @@ mod tests {
             &mux_event(&[(7, "claude")]),
         );
 
-        let row = |id: &str, pane: Option<&str>| storage::PendingApprovalRow {
+        let row = |id: &str, pane: Option<&str>| PendingApprovalRecord {
             id: id.to_owned(),
             server_id: "srv".to_owned(),
             tool_name: "write_file".to_owned(),
             arguments_preview: "{}".to_owned(),
-            schema_hash: None,
             created_at: 0,
             pane_id: pane.map(str::to_owned),
         };

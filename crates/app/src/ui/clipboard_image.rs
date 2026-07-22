@@ -10,37 +10,6 @@ pub(crate) fn paste_clipboard_paths_or_image_to_paths() -> anyhow::Result<Option
     paste_clipboard_image_to_png_with(&mut clipboard).map(|path| path.map(|path| vec![path]))
 }
 
-/// 클립보드 파일/이미지 paste를 백그라운드 스레드에서 처리한다 — get_image()의 전체 RGBA
-/// 복사 + PNG 인코딩(스크린샷 기준 50~300ms)이 UI 스레드를 멈추던 딜레이 제거(2026-07-07).
-/// 결과는 채널로 오고, 완료 시 repaint를 깨워 다음 프레임에 즉시 소비된다.
-pub fn paste_clipboard_paths_or_image_background(
-    ctx: egui::Context,
-    has_text_fallback: bool,
-) -> std::sync::mpsc::Receiver<anyhow::Result<Option<Vec<PathBuf>>>> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut result = paste_clipboard_paths_or_image_to_paths();
-        // 스크린샷 직후 ⌘V 레이스: 캡처 유틸이 클립보드에 이미지를 쓰기까지 수백 ms 걸릴
-        // 수 있어 첫 ⌘V가 "빈 클립보드"로 무시됐다(2026-07-08 사용자). 파일/이미지/텍스트가
-        // 전부 없을 때만 잠깐 기다렸다 재시도한다 — 이미 Event::Paste 텍스트를 받았거나
-        // (has_text_fallback — 기다리면 그 텍스트 붙여넣기만 늦어짐, codex Low) 클립보드에
-        // 텍스트가 있으면 재시도 없이 즉시 반환.
-        let mut tries = 0;
-        while !has_text_fallback
-            && tries < 4
-            && matches!(&result, Ok(None))
-            && read_clipboard_text().is_none()
-        {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            result = paste_clipboard_paths_or_image_to_paths();
-            tries += 1;
-        }
-        let _ = tx.send(result);
-        ctx.request_repaint();
-    });
-    rx
-}
-
 /// OS 클립보드의 텍스트를 직접 읽는다(빈/부재/에러는 None). ⌘V 시 egui Event::Paste가
 /// 터미널 위젯(비 텍스트에딧)에 안 오는 경우의 fallback — claude/codex 상태창 붙여넣기(#4).
 pub fn read_clipboard_text() -> Option<String> {

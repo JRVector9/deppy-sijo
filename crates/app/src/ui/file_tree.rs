@@ -1,13 +1,12 @@
 //! 폴더 트리 사이드바 (docs/file-tree-design.md).
 //!
-//! 리소스 3원칙(§3): lazy `read_dir`(펼친 노드만), flat 평탄화 + `show_rows` 가상화,
-//! IO는 상호작용 시점만 — 유휴 시 repaint를 유발하지 않는다. 로컬 파일 IO는
-//! config/DB처럼 앱 소관이라 `std::fs` 직접 사용(§2, remote는 후속 trait 추상화 지점).
+//! 리소스 3원칙(§3): lazy listing(펼친 노드만), flat 평탄화 + `show_rows`
+//! 가상화, immutable snapshot render. Leaf는 filesystem/watcher/thread/channel을 소유하지
+//! 않고 bounded maintenance intent만 App host로 올린다.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// 사이드바 세션 목록 항목 (§6 확장 — 좌측 패널은 트리+세션의 workspace 사이드바다,
 /// 2026-07-05). App이 WorkspaceUi 스냅샷에서 조립해 넘긴다.
@@ -118,11 +117,9 @@ pub enum SidebarAction {
     /// root folder를 macOS가 거부한 상태에서 「개인정보 보호 및 보안 → 파일 및 폴더」를 연다.
     OpenMacosFileAccessSettings,
     /// 경로를 포커스된 터미널에 삽입 (FT-3)
-    InsertPath(PathBuf),
+    InsertPath(FileTreePathPayload),
     /// 포커스된 터미널에서 이 폴더로 cd 실행 (디렉터리 컨텍스트 메뉴, 2026-07-08)
-    CdPath(PathBuf),
-    /// 파일 행 더블클릭 — OS 연결 프로그램으로 연다 (터미널 「열기」와 동일 판정, 2026-07-18)
-    OpenExternal(PathBuf),
+    CdPath(FileTreePathPayload),
     /// 세션 목록에서 선택 — 해당 tab/pane으로 전환
     FocusSession {
         workspace_id: String,
@@ -184,6 +181,518 @@ pub enum SidebarAction {
     CreateWorkspaceFromPicker,
 }
 
+const FILE_TREE_IO_QUEUE_CAP: usize = 1;
+const FILE_TREE_PATH_MAX_BYTES: usize = 32 * 1024;
+const FILE_TREE_PATH_LIST_MAX_ITEMS: usize = 16;
+const FILE_TREE_PATH_LIST_MAX_BYTES: usize = 256 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileTreeIoOperation(u64);
+
+/// App host 경계를 지나는 경로. raw path는 Debug에서 항상 숨기고 Clone/Serialize하지
+/// 않는다. 생성 시 NUL/개별 byte 상한을 검증한다.
+pub struct FileTreePathPayload {
+    path: PathBuf,
+    bytes: usize,
+}
+
+impl FileTreePathPayload {
+    pub fn try_new(path: PathBuf) -> Result<Self, FileTreeIoErrorCode> {
+        let display = path.to_string_lossy();
+        if display.as_bytes().contains(&0) {
+            return Err(FileTreeIoErrorCode::InvalidPath);
+        }
+        let bytes = display.len();
+        if bytes == 0 || bytes > FILE_TREE_PATH_MAX_BYTES {
+            return Err(FileTreeIoErrorCode::PathTooLarge);
+        }
+        Ok(Self { path, bytes })
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn into_path(self) -> PathBuf {
+        self.path
+    }
+}
+
+impl std::fmt::Debug for FileTreePathPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileTreePathPayload")
+            .field("path", &"REDACTED")
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+impl std::ops::Deref for FileTreePathPayload {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_path()
+    }
+}
+
+pub struct FileTreePathListPayload {
+    paths: Vec<PathBuf>,
+    bytes: usize,
+}
+
+impl FileTreePathListPayload {
+    pub fn try_new(paths: Vec<PathBuf>) -> Result<Self, FileTreeIoErrorCode> {
+        if paths.is_empty() || paths.len() > FILE_TREE_PATH_LIST_MAX_ITEMS {
+            return Err(FileTreeIoErrorCode::PathListTooLarge);
+        }
+        let mut bytes = 0usize;
+        for path in &paths {
+            let display = path.to_string_lossy();
+            if display.as_bytes().contains(&0) || display.len() > FILE_TREE_PATH_MAX_BYTES {
+                return Err(FileTreeIoErrorCode::InvalidPath);
+            }
+            bytes = bytes
+                .checked_add(display.len())
+                .ok_or(FileTreeIoErrorCode::PathListTooLarge)?;
+            if bytes > FILE_TREE_PATH_LIST_MAX_BYTES {
+                return Err(FileTreeIoErrorCode::PathListTooLarge);
+            }
+        }
+        Ok(Self { paths, bytes })
+    }
+
+    pub fn into_paths(self) -> Vec<PathBuf> {
+        self.paths
+    }
+}
+
+impl std::fmt::Debug for FileTreePathListPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileTreePathListPayload")
+            .field("items", &self.paths.len())
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+pub enum FileTreeIoRequest {
+    Rename {
+        source: FileTreePathPayload,
+        name: String,
+    },
+    CreateDirectory {
+        parent: FileTreePathPayload,
+        name: String,
+    },
+    CreateFile {
+        parent: FileTreePathPayload,
+        name: String,
+    },
+    Move {
+        root: FileTreePathPayload,
+        source: FileTreePathPayload,
+        destination: FileTreePathPayload,
+    },
+    CopyInto {
+        sources: FileTreePathListPayload,
+        destination: FileTreePathPayload,
+    },
+    PasteFromClipboard {
+        destination: FileTreePathPayload,
+    },
+    Trash {
+        target: FileTreePathPayload,
+    },
+    DeletePermanently {
+        target: FileTreePathPayload,
+    },
+    CopyFileUrls {
+        paths: FileTreePathListPayload,
+    },
+    OpenPath {
+        target: FileTreePathPayload,
+        require_openable_file: bool,
+    },
+}
+
+impl std::fmt::Debug for FileTreeIoRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            Self::Rename { .. } => "rename",
+            Self::CreateDirectory { .. } => "create_directory",
+            Self::CreateFile { .. } => "create_file",
+            Self::Move { .. } => "move",
+            Self::CopyInto { .. } => "copy_into",
+            Self::PasteFromClipboard { .. } => "paste_from_clipboard",
+            Self::Trash { .. } => "trash",
+            Self::DeletePermanently { .. } => "delete_permanently",
+            Self::CopyFileUrls { .. } => "copy_file_urls",
+            Self::OpenPath { .. } => "open_path",
+        };
+        f.debug_struct("FileTreeIoRequest")
+            .field("kind", &kind)
+            .finish_non_exhaustive()
+    }
+}
+
+pub struct FileTreeIoIntent {
+    pub operation: FileTreeIoOperation,
+    pub generation: u64,
+    pub request: FileTreeIoRequest,
+}
+
+impl std::fmt::Debug for FileTreeIoIntent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileTreeIoIntent")
+            .field("operation", &self.operation)
+            .field("generation", &self.generation)
+            .field("request", &self.request)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileTreeIoErrorCode {
+    Busy,
+    InvalidPath,
+    PathTooLarge,
+    PathListTooLarge,
+    InvalidName,
+    Conflict,
+    OutsideRoot,
+    TrashUnavailable,
+    NativeFailure,
+}
+
+pub struct FileTreeIoCompletion {
+    pub operation: FileTreeIoOperation,
+    pub generation: u64,
+    pub result: Result<(), FileTreeIoErrorCode>,
+}
+
+const FILE_TREE_MAINTENANCE_QUEUE_CAP: usize = 1;
+pub const FILE_TREE_LISTING_MAX_ITEMS: usize = 4_096;
+pub const FILE_TREE_LISTING_MAX_BYTES: usize = 4 * 1024 * 1024;
+const FILE_TREE_RETAINED_MAX_ITEMS: usize = 16_384;
+const FILE_TREE_RETAINED_MAX_BYTES: usize = 16 * 1024 * 1024;
+pub const FILE_TREE_WATCH_MAX_DIRECTORIES: usize = 256;
+pub const FILE_TREE_WATCH_MAX_EVENTS: usize = 64;
+const FILE_TREE_WATCH_MAX_BYTES: usize = 4 * 1024 * 1024;
+const FILE_TREE_REFRESH_BACKLOG_CAP: usize = 64;
+const FILE_TREE_WATCH_IGNORE_MAX_ITEMS: usize = 16;
+const FILE_TREE_WATCH_IGNORE_MAX_BYTES: usize = 256 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileTreeMaintenanceOperation(u64);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileTreeListingItem {
+    name: Arc<str>,
+    is_dir: bool,
+}
+
+impl FileTreeListingItem {
+    pub fn try_new(name: String, is_dir: bool) -> Result<Self, FileTreeMaintenanceErrorCode> {
+        if name.is_empty() || name.as_bytes().contains(&0) || name.len() > FILE_TREE_PATH_MAX_BYTES
+        {
+            return Err(FileTreeMaintenanceErrorCode::InvalidSnapshot);
+        }
+        Ok(Self {
+            name: Arc::from(name),
+            is_dir,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn is_dir(&self) -> bool {
+        self.is_dir
+    }
+}
+
+/// Host가 한 디렉터리를 나열한 immutable 결과. 생성 시 item/byte 상한을 강제하므로
+/// UI가 unbounded storage row나 `read_dir` iterator를 받지 않는다.
+#[derive(Clone)]
+pub struct FileTreeListingSnapshot {
+    items: Arc<[FileTreeListingItem]>,
+    bytes: usize,
+}
+
+impl FileTreeListingSnapshot {
+    pub fn try_new(
+        mut items: Vec<FileTreeListingItem>,
+    ) -> Result<Self, FileTreeMaintenanceErrorCode> {
+        if items.len() > FILE_TREE_LISTING_MAX_ITEMS {
+            return Err(FileTreeMaintenanceErrorCode::ListingTooLarge);
+        }
+        let bytes = items.iter().try_fold(0usize, |total, item| {
+            total
+                .checked_add(item.name.len())
+                .filter(|total| *total <= FILE_TREE_LISTING_MAX_BYTES)
+                .ok_or(FileTreeMaintenanceErrorCode::ListingTooLarge)
+        })?;
+        items.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+        Ok(Self {
+            items: Arc::from(items),
+            bytes,
+        })
+    }
+
+    pub fn items(&self) -> &[FileTreeListingItem] {
+        &self.items
+    }
+
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl std::fmt::Debug for FileTreeListingSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileTreeListingSnapshot")
+            .field("items", &self.items.len())
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+/// App-owned watcher가 유지할 비재귀 디렉터리 집합. raw path는 Debug에 노출하지 않으며
+/// Clone/Serialize하지 않는다.
+pub struct FileTreeWatchPlan {
+    directories: Vec<PathBuf>,
+    ignored_prefixes: Vec<PathBuf>,
+    show_hidden: bool,
+    bytes: usize,
+}
+
+impl FileTreeWatchPlan {
+    fn try_new(
+        directories: Vec<PathBuf>,
+        ignored_prefixes: Vec<PathBuf>,
+        show_hidden: bool,
+    ) -> Result<Self, FileTreeMaintenanceErrorCode> {
+        if directories.len() > FILE_TREE_WATCH_MAX_DIRECTORIES
+            || ignored_prefixes.len() > FILE_TREE_WATCH_IGNORE_MAX_ITEMS
+        {
+            return Err(FileTreeMaintenanceErrorCode::WatchPlanTooLarge);
+        }
+        let bytes =
+            directories
+                .iter()
+                .chain(&ignored_prefixes)
+                .try_fold(0usize, |total, path| {
+                    let display = path.to_string_lossy();
+                    if display.is_empty()
+                        || display.as_bytes().contains(&0)
+                        || display.len() > FILE_TREE_PATH_MAX_BYTES
+                    {
+                        return Err(FileTreeMaintenanceErrorCode::InvalidSnapshot);
+                    }
+                    total
+                        .checked_add(display.len())
+                        .filter(|total| *total <= FILE_TREE_WATCH_MAX_BYTES)
+                        .ok_or(FileTreeMaintenanceErrorCode::WatchPlanTooLarge)
+                })?;
+        Ok(Self {
+            directories,
+            ignored_prefixes,
+            show_hidden,
+            bytes,
+        })
+    }
+
+    pub fn into_parts(self) -> (Vec<PathBuf>, Vec<PathBuf>, bool) {
+        (self.directories, self.ignored_prefixes, self.show_hidden)
+    }
+}
+
+impl std::fmt::Debug for FileTreeWatchPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileTreeWatchPlan")
+            .field("directories", &self.directories.len())
+            .field("ignored_prefixes", &self.ignored_prefixes.len())
+            .field("show_hidden", &self.show_hidden)
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+pub enum FileTreeMaintenanceRequest {
+    ListDirectory {
+        root: FileTreePathPayload,
+        directory: FileTreePathPayload,
+        max_items: usize,
+        max_bytes: usize,
+    },
+    ReplaceWatchSet(FileTreeWatchPlan),
+}
+
+impl std::fmt::Debug for FileTreeMaintenanceRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ListDirectory {
+                max_items,
+                max_bytes,
+                ..
+            } => f
+                .debug_struct("ListDirectory")
+                .field("root", &"REDACTED")
+                .field("directory", &"REDACTED")
+                .field("max_items", max_items)
+                .field("max_bytes", max_bytes)
+                .finish(),
+            Self::ReplaceWatchSet(plan) => f.debug_tuple("ReplaceWatchSet").field(plan).finish(),
+        }
+    }
+}
+
+pub struct FileTreeMaintenanceIntent {
+    pub operation: FileTreeMaintenanceOperation,
+    pub generation: u64,
+    pub request: FileTreeMaintenanceRequest,
+}
+
+impl std::fmt::Debug for FileTreeMaintenanceIntent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileTreeMaintenanceIntent")
+            .field("operation", &self.operation)
+            .field("generation", &self.generation)
+            .field("request", &self.request)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileTreeMaintenanceErrorCode {
+    PermissionDenied,
+    ListingTooLarge,
+    WatchPlanTooLarge,
+    InvalidSnapshot,
+    WatchUnavailable,
+    NativeFailure,
+}
+
+pub enum FileTreeMaintenanceResult {
+    Listing(FileTreeListingSnapshot),
+    WatchSetApplied,
+}
+
+pub struct FileTreeMaintenanceCompletion {
+    pub operation: FileTreeMaintenanceOperation,
+    pub generation: u64,
+    pub result: Result<FileTreeMaintenanceResult, FileTreeMaintenanceErrorCode>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileTreeWatchEventKind {
+    DirtyDirectory,
+    EnvFileChanged,
+}
+
+pub struct FileTreeWatchEvent {
+    kind: FileTreeWatchEventKind,
+    path: PathBuf,
+    bytes: usize,
+}
+
+impl FileTreeWatchEvent {
+    pub fn try_new(
+        kind: FileTreeWatchEventKind,
+        path: PathBuf,
+    ) -> Result<Self, FileTreeMaintenanceErrorCode> {
+        let display = path.to_string_lossy();
+        if display.is_empty()
+            || display.as_bytes().contains(&0)
+            || display.len() > FILE_TREE_PATH_MAX_BYTES
+        {
+            return Err(FileTreeMaintenanceErrorCode::InvalidSnapshot);
+        }
+        let bytes = display.len();
+        Ok(Self { kind, path, bytes })
+    }
+}
+
+impl std::fmt::Debug for FileTreeWatchEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileTreeWatchEvent")
+            .field("kind", &self.kind)
+            .field("path", &"REDACTED")
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+/// Watcher callback backlog의 latest-only immutable snapshot. 이벤트 수와 path bytes는
+/// 생성 시 고정 상한을 검증한다.
+pub struct FileTreeWatchSnapshot {
+    generation: u64,
+    revision: u64,
+    overflowed: bool,
+    events: Arc<[FileTreeWatchEvent]>,
+    bytes: usize,
+}
+
+impl FileTreeWatchSnapshot {
+    pub fn try_new(
+        generation: u64,
+        revision: u64,
+        overflowed: bool,
+        events: Vec<FileTreeWatchEvent>,
+    ) -> Result<Self, FileTreeMaintenanceErrorCode> {
+        if events.len() > FILE_TREE_WATCH_MAX_EVENTS {
+            return Err(FileTreeMaintenanceErrorCode::WatchPlanTooLarge);
+        }
+        let bytes = events.iter().try_fold(0usize, |total, event| {
+            total
+                .checked_add(event.bytes)
+                .filter(|total| *total <= FILE_TREE_WATCH_MAX_BYTES)
+                .ok_or(FileTreeMaintenanceErrorCode::WatchPlanTooLarge)
+        })?;
+        Ok(Self {
+            generation,
+            revision,
+            overflowed,
+            events: Arc::from(events),
+            bytes,
+        })
+    }
+}
+
+impl std::fmt::Debug for FileTreeWatchSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileTreeWatchSnapshot")
+            .field("generation", &self.generation)
+            .field("revision", &self.revision)
+            .field("overflowed", &self.overflowed)
+            .field("events", &self.events.len())
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+enum PendingFileTreeMaintenance {
+    Listing {
+        operation: FileTreeMaintenanceOperation,
+        generation: u64,
+        path: PathBuf,
+        preserve_expanded: Arc<HashSet<PathBuf>>,
+    },
+    WatchSet {
+        operation: FileTreeMaintenanceOperation,
+        generation: u64,
+    },
+}
+
+struct PendingFileTreeIo {
+    operation: FileTreeIoOperation,
+    generation: u64,
+    refresh: Vec<PathBuf>,
+    trash_target: Option<PathBuf>,
+    retry_edit: Option<EditState>,
+}
+
 /// 트리 노드. `children == None`은 아직 나열 안 됨(lazy).
 /// 접으면 children을 버려 캐시는 항상 "펼친 노드"만 유지한다(§3 메모리 상한).
 struct TreeNode {
@@ -217,7 +726,6 @@ struct FlatRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RootListingError {
     PermissionDenied,
-    Other(String),
 }
 
 pub struct FileTreeUi {
@@ -239,68 +747,36 @@ pub struct FileTreeUi {
     /// macOS/TCC 등에서 나열 권한이 거부된 디렉터리. 전역 오류로 승격하지 않고
     /// 해당 행만 비활성화해 상위 탐색과 나머지 트리를 계속 사용할 수 있게 한다.
     inaccessible_paths: HashSet<PathBuf>,
-    /// 백그라운드 파일 조작(EXDEV copy 등 §9-3)의 완료/에러 채널.
-    ops_tx: SyncSender<OpOutcome>,
-    ops_rx: Receiver<OpOutcome>,
-    /// 백그라운드 디렉터리 listing 결과 채널. read_dir/sort는 worker에서 수행한다.
-    listing_tx: SyncSender<ListingOutcome>,
-    listing_rx: Receiver<ListingOutcome>,
-    /// 프로세스 전역 고정 크기 listing worker pool 입력 큐. FileTreeUi를 반복 생성해도
-    /// 요청마다/인스턴스마다 OS thread를 만들지 않는다.
-    listing_jobs: SyncSender<ListingJob>,
-    /// FileTreeUi drop/root 교체 시 worker가 send/read loop를 중단하게 하는 플래그.
-    listing_shutdown: Arc<std::sync::atomic::AtomicBool>,
-    /// job 큐 포화 시 다수 요청을 한 번의 root refresh로 축약한다.
-    listing_refresh_deferred: bool,
-    /// root 전환 generation. 이전 root의 late result는 epoch mismatch로 폐기한다.
-    listing_epoch: u64,
-    /// 워커와 공유하는 현재 epoch — 워커가 나열 전/청크 전송 중에 확인해 stale 작업을
-    /// **송신 전에** 중단한다(구 epoch 청크가 unbounded 채널에 쌓이는 것 방지 —
-    /// 안정성 감사 High #2).
-    listing_epoch_shared: Arc<std::sync::atomic::AtomicU64>,
-    /// per-directory listing token 발급용 monotonic counter.
-    next_listing_token: u64,
-    /// 현재 유효한 per-directory listing 요청. collapse/refresh/root switch 시 제거한다.
-    pending_listings: HashMap<PathBuf, PendingListing>,
+    /// Native mutation은 leaf에서 실행하지 않고 capacity-1 intent로 App host에 넘긴다.
+    io_generation: u64,
+    next_io_operation: u64,
+    io_intent: Option<FileTreeIoIntent>,
+    pending_io: Option<PendingFileTreeIo>,
+    /// Listing/watch는 leaf가 실행하지 않고 capacity-1 maintenance intent로 올린다.
+    maintenance_generation: u64,
+    next_maintenance_operation: u64,
+    maintenance_intent: Option<FileTreeMaintenanceIntent>,
+    pending_maintenance: Option<PendingFileTreeMaintenance>,
+    /// Watch burst와 mutation refresh를 조상 경로 축약하는 bounded backlog.
+    pending_refresh_dirs: BTreeSet<PathBuf>,
+    watch_plan_dirty: bool,
+    last_watch_revision: u64,
+    watch_ignore: Vec<PathBuf>,
     /// 진행 중인 백그라운드 조작 수 (>0이면 스피너 표시).
     in_flight: usize,
     /// 백그라운드 완료 시 UI를 깨우기 위한 컨텍스트.
-    egui_ctx: egui::Context,
     /// 인라인 편집 상태 (이름 변경/새 폴더, FT-3).
     edit: Option<EditState>,
     /// 휴지통 이동 실패 → 영구삭제 확인 대기 중인 경로 (§9-7).
     confirm_delete: Option<PathBuf>,
-    /// FSEvents 워처 (FT-4). Drop이 감시 스레드를 정리한다 — OFF 토글/workspace
-    /// 전환/앱 종료 시 FileTreeUi가 drop되며 함께 정리된다.
-    watcher: Option<notify::RecommendedWatcher>,
-    /// 현재 감시 중인 디렉터리 집합 = 루트 + 펼친 디렉터리 (각각 **비재귀**). 펼침/접힘에
-    /// 맞춰 sync_watches가 delta로 watch/unwatch한다 — 크고 바쁜 루트(홈, node_modules
-    /// 있는 프로젝트 등)를 재귀 감시할 때 FSEvents firehose로 앱이 유휴에도 3~5fps로
-    /// 영영 안 쉬던 문제를 구조적으로 제거(설계 §3 "펼치는 디렉터리만", 2026-07-04 조사).
-    watched_dirs: std::collections::HashSet<PathBuf>,
-    /// 워처 이벤트 채널 (워처 스레드 → UI). 콜백에서 기본 ignore/.env 분류를 끝내고
-    /// UI 스레드는 dedup+debounce된 dirty dir만 재나열한다.
-    watch_rx: Option<Receiver<WatchEvent>>,
-    /// watcher 채널 포화 — 개별 이벤트를 더 쌓지 않고 root refresh 한 건으로 축약.
-    watch_overflowed: Arc<std::sync::atomic::AtomicBool>,
-    /// 워처가 무시할 경로 prefix들 — 앱 자신의 data/log 디렉터리 등. 자기 로그 쓰기가
-    /// 이벤트로 돌아와 리페인트를 유발하는 자기-루프 차단 (리페인트 원인 조사 2026-07-04).
-    watch_ignore: std::sync::Arc<Vec<PathBuf>>,
-    /// 콜백 스레드와 공유하는 show_hidden — 숨김 경로 이벤트는 트리에 보이지도 않으므로
-    /// 무시한다 (홈 디렉터리 루트에서 ~/Library 등 잡음 이벤트 대량 차단).
-    watch_show_hidden: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 실측 행높이 (show_rows 자기보정). show_rows는 "모든 행 = 선언 높이" 계약인데
     /// 실제 행높이는 폰트 메트릭(한글 폰트 라인높이 등)에 따라 선언값과 어긋날 수 있고,
     /// 어긋나면 스크롤 위치·가시 범위가 리빌드마다 밀려 클릭이 다른 행에 떨어진다
     /// (2026-07-05 사용자 보고: 펼침 간헐 실패/재클릭 접힘 안 됨/위치 점프). 첫 프레임에
     /// 실제 그린 행높이를 재서 다음 프레임부터 그 값을 쓴다.
     measured_row_height: Option<f32>,
-    /// 스로틀 창 안에 도착해 아직 재나열하지 않은 디렉터리 (dedup 집합 — codex Med-1).
-    pending_watch: BTreeSet<PathBuf>,
     /// `.env*` 파일 변경 후보. 숨김 파일 필터와 무관하게 기록해 env-warning 후보로 쓸 수 있다.
     env_warning_candidates: BTreeSet<PathBuf>,
-    /// 마지막 워처 일괄 재나열 시각 — WATCH_RELOAD_MS 미만이면 흡수만 하고 건너뛴다.
-    last_watch_reload: std::time::Instant,
     /// 세션 목록 이름 인라인 편집 중 (pane, 편집 버퍼). 우클릭/더블클릭으로 시작.
     session_name_edit: Option<(runtime::MuxPaneId, String)>,
     /// 워크스페이스별 세션 트리 펼침 상태. 포커스 전환과 독립적이어서 다른 workspace를
@@ -318,64 +794,11 @@ pub struct FileTreeUi {
     consumed_copy_shortcut: bool,
 }
 
-/// 백그라운드 파일 조작 결과 — 완료 후 재나열할 부모 디렉터리 + 에러(있으면).
-struct OpOutcome {
-    refresh: Vec<PathBuf>,
-    error: Option<String>,
-    /// 휴지통 이동 실패 시 영구삭제 확인을 띄울 경로 (§9-7 폴백).
-    confirm_delete: Option<PathBuf>,
-}
-
 /// 디렉터리 listing worker 결과. 큰 디렉터리 apply 비용도 쪼개기 위해 chunk로 전달한다.
-struct ListingOutcome {
-    epoch: u64,
-    token: u64,
-    path: PathBuf,
-    result: ListingResult,
-}
-
-struct ListingJob {
-    tx: SyncSender<ListingOutcome>,
-    ctx: egui::Context,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
-    epoch: ListingEpochGuard,
-    token: u64,
-    root: Option<PathBuf>,
-    path: PathBuf,
-}
-
-enum ListingResult {
-    Chunk {
-        nodes: Vec<TreeNode>,
-        done: bool,
-    },
-    Error {
-        message: String,
-        kind: std::io::ErrorKind,
-    },
-}
-
-struct PendingListing {
-    token: u64,
-    /// refresh/reload 시작 시점의 펼침 상태. 결과 적용 직전의 현재 상태가 없을 때 fallback.
-    preserve_expanded: Arc<HashSet<PathBuf>>,
-    /// 첫 chunk 적용 시점의 현재 펼침 상태. 이후 chunk는 같은 기준으로 append한다.
-    apply_expanded: Option<Arc<HashSet<PathBuf>>>,
-    started: bool,
-    /// 워커와 공유하는 취소 플래그 — 같은 경로 재요청(reload_dir token 교체)이나 부분
-    /// 무효화 시 구 워커가 청크를 **송신하기 전에** 멈추게 한다(codex High 2026-07-08).
-    cancel: Arc<std::sync::atomic::AtomicBool>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum WatchEvent {
-    DirtyDir(PathBuf),
-    EnvFileChanged(PathBuf),
-}
-
 /// 인라인 편집 (FT-3). focus는 첫 프레임에 TextEdit에 포커스를 1회 요청하는 플래그 —
 /// 편집 중 키 입력이 터미널로 새지 않게 한다(§9-8: 터미널은 자기 response가
 /// 포커스를 가질 때만 입력을 소비한다).
+#[derive(Clone)]
 enum EditState {
     Rename {
         path: PathBuf,
@@ -395,11 +818,7 @@ enum EditState {
 }
 
 impl FileTreeUi {
-    pub fn new(egui_ctx: egui::Context) -> Self {
-        let (ops_tx, ops_rx) = sync_channel(FILE_OP_RESULT_QUEUE_CAP);
-        let (listing_tx, listing_rx) = sync_channel(LISTING_RESULT_QUEUE_CAP);
-        let listing_jobs = global_listing_pool().clone();
-        let listing_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    pub fn new(_egui_ctx: egui::Context) -> Self {
         Self {
             root: None,
             root_error: None,
@@ -411,31 +830,23 @@ impl FileTreeUi {
             collapsed: false,
             error: None,
             inaccessible_paths: HashSet::new(),
-            ops_tx,
-            ops_rx,
-            listing_tx,
-            listing_rx,
-            listing_jobs,
-            listing_shutdown,
-            listing_refresh_deferred: false,
-            listing_epoch: 0,
-            listing_epoch_shared: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            next_listing_token: 0,
-            pending_listings: HashMap::new(),
+            io_generation: 1,
+            next_io_operation: 1,
+            io_intent: None,
+            pending_io: None,
+            maintenance_generation: 1,
+            next_maintenance_operation: 1,
+            maintenance_intent: None,
+            pending_maintenance: None,
+            pending_refresh_dirs: BTreeSet::new(),
+            watch_plan_dirty: false,
+            last_watch_revision: 0,
+            watch_ignore: Vec::new(),
             in_flight: 0,
-            egui_ctx,
             edit: None,
             confirm_delete: None,
-            watcher: None,
-            watched_dirs: std::collections::HashSet::new(),
-            watch_rx: None,
-            watch_overflowed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             measured_row_height: None,
-            watch_ignore: std::sync::Arc::new(Vec::new()),
-            watch_show_hidden: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            pending_watch: BTreeSet::new(),
             env_warning_candidates: BTreeSet::new(),
-            last_watch_reload: std::time::Instant::now(),
             session_name_edit: None,
             workspace_sessions_expanded: HashMap::new(),
             last_sidebar_active_workspace: None,
@@ -454,12 +865,426 @@ impl FileTreeUi {
         )
     }
 
+    fn queue_io(
+        &mut self,
+        request: FileTreeIoRequest,
+        refresh: Vec<PathBuf>,
+        trash_target: Option<PathBuf>,
+        retry_edit: Option<EditState>,
+    ) -> Result<(), FileTreeIoErrorCode> {
+        debug_assert_eq!(FILE_TREE_IO_QUEUE_CAP, 1);
+        if self.io_intent.is_some() || self.pending_io.is_some() {
+            return Err(FileTreeIoErrorCode::Busy);
+        }
+        let operation = FileTreeIoOperation(self.next_io_operation);
+        self.next_io_operation = self.next_io_operation.wrapping_add(1).max(1);
+        let generation = self.io_generation;
+        self.io_intent = Some(FileTreeIoIntent {
+            operation,
+            generation,
+            request,
+        });
+        self.pending_io = Some(PendingFileTreeIo {
+            operation,
+            generation,
+            refresh,
+            trash_target,
+            retry_edit,
+        });
+        self.in_flight = 1;
+        Ok(())
+    }
+
+    fn reject_io(&mut self, code: FileTreeIoErrorCode) {
+        self.error = Some(file_tree_io_error_message(code).to_owned());
+    }
+
+    /// App host가 수행할 capacity-1 native mutation. leaf는 실행하지 않고 snapshot을
+    /// 렌더한 뒤 이 intent만 반환한다.
+    pub fn take_io_intent(&mut self) -> Option<FileTreeIoIntent> {
+        self.io_intent.take()
+    }
+
+    /// App host 결과를 exact operation/generation으로 적용한다. stale 결과는 현재
+    /// pending을 건드리지 않고 폐기한다.
+    pub fn complete_io(&mut self, completion: FileTreeIoCompletion) {
+        let Some(pending) = self.pending_io.as_ref() else {
+            return;
+        };
+        if pending.operation != completion.operation
+            || pending.generation != completion.generation
+            || completion.generation != self.io_generation
+        {
+            return;
+        }
+        let pending = self.pending_io.take().expect("exact pending checked");
+        self.in_flight = 0;
+        match completion.result {
+            Ok(()) => {
+                self.error = None;
+                for dir in pending.refresh {
+                    self.reload_dir(&dir);
+                }
+            }
+            Err(FileTreeIoErrorCode::TrashUnavailable) => {
+                self.error = Some(
+                    file_tree_io_error_message(FileTreeIoErrorCode::TrashUnavailable).to_owned(),
+                );
+                self.confirm_delete = pending.trash_target;
+                self.edit = pending.retry_edit;
+            }
+            Err(code) => {
+                self.edit = pending.retry_edit;
+                self.reject_io(code);
+            }
+        }
+    }
+
+    /// App host가 수행할 capacity-1 listing/watch maintenance. Constructor와 render는
+    /// thread/channel/watcher를 만들지 않고 이 의도만 반환한다.
+    pub fn take_maintenance_intent(&mut self) -> Option<FileTreeMaintenanceIntent> {
+        self.maintenance_intent.take()
+    }
+
+    /// Exact operation/generation으로만 immutable host snapshot을 적용한다. 루트
+    /// 전환/접힘 후 도착한 stale completion은 현재 트리를 건드리지 않는다.
+    pub fn complete_maintenance(&mut self, completion: FileTreeMaintenanceCompletion) {
+        let Some(pending) = self.pending_maintenance.as_ref() else {
+            return;
+        };
+        let exact = match pending {
+            PendingFileTreeMaintenance::Listing {
+                operation,
+                generation,
+                ..
+            }
+            | PendingFileTreeMaintenance::WatchSet {
+                operation,
+                generation,
+            } => {
+                *operation == completion.operation
+                    && *generation == completion.generation
+                    && *generation == self.maintenance_generation
+            }
+        };
+        if !exact {
+            return;
+        }
+        let pending = self
+            .pending_maintenance
+            .take()
+            .expect("exact maintenance checked");
+        match (pending, completion.result) {
+            (
+                PendingFileTreeMaintenance::Listing {
+                    path,
+                    preserve_expanded,
+                    ..
+                },
+                Ok(FileTreeMaintenanceResult::Listing(snapshot)),
+            ) => self.apply_listing_snapshot(path, snapshot, &preserve_expanded),
+            (
+                PendingFileTreeMaintenance::WatchSet { .. },
+                Ok(FileTreeMaintenanceResult::WatchSetApplied),
+            ) => {}
+            (PendingFileTreeMaintenance::Listing { path, .. }, Err(code)) => {
+                self.apply_maintenance_error(&path, code);
+            }
+            (PendingFileTreeMaintenance::WatchSet { .. }, Err(code)) => {
+                self.error = Some(file_tree_maintenance_error_message(code).to_owned());
+            }
+            _ => {
+                self.error = Some("파일 트리 host 결과 종류가 요청과 일치하지 않습니다".to_owned());
+            }
+        }
+        self.drive_maintenance();
+    }
+
+    /// App-owned watcher가 event burst를 coalesce한 latest snapshot을 적용한다.
+    /// 외부 event wake 시에만 호출되며 polling/repaint timer를 만들지 않는다.
+    pub fn apply_watch_snapshot(&mut self, snapshot: FileTreeWatchSnapshot) {
+        if snapshot.generation != self.maintenance_generation
+            || snapshot.revision <= self.last_watch_revision
+        {
+            return;
+        }
+        self.last_watch_revision = snapshot.revision;
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        if snapshot.overflowed {
+            self.pending_refresh_dirs.clear();
+            self.enqueue_refresh_dir(root.clone());
+        }
+        for event in snapshot.events.iter() {
+            if !event.path.starts_with(&root)
+                || self
+                    .watch_ignore
+                    .iter()
+                    .any(|prefix| event.path.starts_with(prefix))
+            {
+                continue;
+            }
+            match event.kind {
+                FileTreeWatchEventKind::DirtyDirectory => {
+                    if self.show_hidden || !has_hidden_component(&root, &event.path) {
+                        self.enqueue_refresh_dir(event.path.clone());
+                    }
+                }
+                FileTreeWatchEventKind::EnvFileChanged => {
+                    if self.env_warning_candidates.len() < FILE_TREE_WATCH_MAX_EVENTS
+                        || self.env_warning_candidates.contains(&event.path)
+                    {
+                        self.env_warning_candidates.insert(event.path.clone());
+                    }
+                }
+            }
+        }
+        self.drive_maintenance();
+    }
+
+    fn enqueue_refresh_dir(&mut self, path: PathBuf) {
+        let Some(root) = self.root.as_ref() else {
+            return;
+        };
+        if !path.starts_with(root) {
+            return;
+        }
+        insert_pending_watch_dir(&mut self.pending_refresh_dirs, path);
+        if self.pending_refresh_dirs.len() > FILE_TREE_REFRESH_BACKLOG_CAP {
+            self.pending_refresh_dirs.clear();
+            self.pending_refresh_dirs.insert(root.clone());
+        }
+    }
+
+    fn remove_refresh_subtree(&mut self, path: &Path) {
+        self.pending_refresh_dirs
+            .retain(|pending| !pending.starts_with(path));
+        let cancel_current = matches!(
+            self.pending_maintenance.as_ref(),
+            Some(PendingFileTreeMaintenance::Listing { path: pending, .. }) if pending.starts_with(path)
+        );
+        if cancel_current {
+            self.maintenance_generation = self.maintenance_generation.wrapping_add(1).max(1);
+            self.maintenance_intent = None;
+            self.pending_maintenance = None;
+            if let Some(root) = self.root.clone() {
+                self.pending_refresh_dirs.insert(root);
+            }
+        }
+    }
+
+    fn drive_maintenance(&mut self) {
+        debug_assert_eq!(FILE_TREE_MAINTENANCE_QUEUE_CAP, 1);
+        if self.maintenance_intent.is_some() || self.pending_maintenance.is_some() {
+            return;
+        }
+        while let Some(path) = self.pending_refresh_dirs.pop_first() {
+            let Some(root) = self.root.clone() else {
+                continue;
+            };
+            if !self.should_list_directory(&path) {
+                continue;
+            }
+            let Ok(root_payload) = FileTreePathPayload::try_new(root) else {
+                self.error = Some("파일 트리 루트 경로가 허용된 크기를 초과했습니다".to_owned());
+                return;
+            };
+            let Ok(directory) = FileTreePathPayload::try_new(path.clone()) else {
+                self.error = Some("파일 트리 경로가 허용된 크기를 초과했습니다".to_owned());
+                continue;
+            };
+            let operation = FileTreeMaintenanceOperation(self.next_maintenance_operation);
+            self.next_maintenance_operation =
+                self.next_maintenance_operation.wrapping_add(1).max(1);
+            let generation = self.maintenance_generation;
+            self.maintenance_intent = Some(FileTreeMaintenanceIntent {
+                operation,
+                generation,
+                request: FileTreeMaintenanceRequest::ListDirectory {
+                    root: root_payload,
+                    directory,
+                    max_items: FILE_TREE_LISTING_MAX_ITEMS,
+                    max_bytes: FILE_TREE_LISTING_MAX_BYTES,
+                },
+            });
+            self.pending_maintenance = Some(PendingFileTreeMaintenance::Listing {
+                operation,
+                generation,
+                path,
+                preserve_expanded: Arc::new(self.collect_expanded_paths()),
+            });
+            return;
+        }
+        if !self.watch_plan_dirty {
+            return;
+        }
+        let mut directories = Vec::new();
+        if let Some(root) = &self.root {
+            directories.push(root.clone());
+            directories.extend(
+                self.flat
+                    .iter()
+                    .filter(|row| row.is_dir && row.expanded)
+                    .map(|row| row.path.clone()),
+            );
+        }
+        let plan = match FileTreeWatchPlan::try_new(
+            directories,
+            self.watch_ignore.clone(),
+            self.show_hidden,
+        ) {
+            Ok(plan) => plan,
+            Err(code) => {
+                self.watch_plan_dirty = false;
+                self.error = Some(file_tree_maintenance_error_message(code).to_owned());
+                return;
+            }
+        };
+        let operation = FileTreeMaintenanceOperation(self.next_maintenance_operation);
+        self.next_maintenance_operation = self.next_maintenance_operation.wrapping_add(1).max(1);
+        let generation = self.maintenance_generation;
+        self.watch_plan_dirty = false;
+        self.maintenance_intent = Some(FileTreeMaintenanceIntent {
+            operation,
+            generation,
+            request: FileTreeMaintenanceRequest::ReplaceWatchSet(plan),
+        });
+        self.pending_maintenance = Some(PendingFileTreeMaintenance::WatchSet {
+            operation,
+            generation,
+        });
+    }
+
+    fn should_list_directory(&self, path: &Path) -> bool {
+        let Some(root) = self.root.as_ref() else {
+            return false;
+        };
+        if path == root {
+            return true;
+        }
+        let Ok(rel) = path.strip_prefix(root) else {
+            return false;
+        };
+        self.children
+            .as_ref()
+            .and_then(|children| node_ref(children, rel))
+            .is_some_and(|node| node.is_dir && node.expanded)
+    }
+
+    fn apply_listing_snapshot(
+        &mut self,
+        path: PathBuf,
+        snapshot: FileTreeListingSnapshot,
+        preserve_expanded: &HashSet<PathBuf>,
+    ) {
+        let (retained_items, retained_bytes) = self.retained_usage_without(&path);
+        if retained_items.saturating_add(snapshot.items().len()) > FILE_TREE_RETAINED_MAX_ITEMS
+            || retained_bytes.saturating_add(snapshot.bytes()) > FILE_TREE_RETAINED_MAX_BYTES
+        {
+            self.error =
+                Some("파일 트리 메모리 상한을 초과해 추가 항목을 보관하지 않습니다".to_owned());
+            return;
+        }
+        self.inaccessible_paths.remove(&path);
+        let nodes = snapshot
+            .items()
+            .iter()
+            .map(|item| TreeNode::new(item.name().to_owned(), item.is_dir()))
+            .collect();
+        let prepared = prepare_listing_nodes(&path, nodes, preserve_expanded);
+        if !self.replace_listing_children(&path, prepared) {
+            return;
+        }
+        self.root_error = None;
+        self.rebuild_flat();
+        for child in self.expanded_direct_child_paths(&path) {
+            self.enqueue_refresh_dir(child);
+        }
+    }
+
+    fn retained_usage_without(&self, path: &Path) -> (usize, usize) {
+        let Some(root) = self.root.as_ref() else {
+            return (0, 0);
+        };
+        let Some(children) = self.children.as_ref() else {
+            return (0, 0);
+        };
+        let total = tree_node_usage(children);
+        if path == root {
+            return (0, 0);
+        }
+        let Ok(rel) = path.strip_prefix(root) else {
+            return total;
+        };
+        let replaced = children
+            .iter()
+            .find_map(|node| node_ref(std::slice::from_ref(node), rel))
+            .and_then(|node| node.children.as_deref())
+            .map(tree_node_usage)
+            .unwrap_or((0, 0));
+        (
+            total.0.saturating_sub(replaced.0),
+            total.1.saturating_sub(replaced.1),
+        )
+    }
+
+    fn apply_maintenance_error(&mut self, path: &Path, code: FileTreeMaintenanceErrorCode) {
+        if code == FileTreeMaintenanceErrorCode::PermissionDenied {
+            if self.root.as_deref() == Some(path) {
+                self.children = None;
+                self.root_error = Some(RootListingError::PermissionDenied);
+            } else {
+                self.inaccessible_paths.insert(path.to_path_buf());
+                self.collapse_directory(path);
+            }
+            self.rebuild_flat();
+            return;
+        }
+        self.error = Some(file_tree_maintenance_error_message(code).to_owned());
+    }
+
+    fn collapse_directory(&mut self, path: &Path) {
+        let Some(root) = self.root.as_ref() else {
+            return;
+        };
+        let Ok(rel) = path.strip_prefix(root) else {
+            return;
+        };
+        if let Some(node) = self
+            .children
+            .as_mut()
+            .and_then(|children| node_mut(children, rel))
+        {
+            node.expanded = false;
+            node.children = None;
+        }
+    }
+
     /// 루트 교체 (workspace 전환/경로 변경). 캐시를 버리고 루트만 다시 나열한다.
     /// 루트는 canonicalize해 보관한다 — 트리의 모든 행 경로가 canonical 기준이 되어
     /// 이동 가드(§9-4)·부분 재나열의 경로 비교가 일관된다.
     /// 워처 무시 prefix 설정 (앱 data dir 등). set_root 이전에 호출.
     pub fn set_watch_ignore(&mut self, prefixes: Vec<PathBuf>) {
-        self.watch_ignore = std::sync::Arc::new(prefixes);
+        let bytes = prefixes.iter().try_fold(0usize, |total, path| {
+            let display = path.to_string_lossy();
+            if display.is_empty()
+                || display.as_bytes().contains(&0)
+                || display.len() > FILE_TREE_PATH_MAX_BYTES
+            {
+                return None;
+            }
+            total.checked_add(display.len())
+        });
+        if prefixes.len() > FILE_TREE_WATCH_IGNORE_MAX_ITEMS
+            || bytes.is_none_or(|bytes| bytes > FILE_TREE_WATCH_IGNORE_MAX_BYTES)
+        {
+            self.error = Some("파일 감시 제외 경로가 허용된 크기를 초과했습니다".to_owned());
+            return;
+        }
+        self.watch_ignore = prefixes;
+        self.watch_plan_dirty = true;
+        self.drive_maintenance();
     }
 
     /// 워처가 감지한 `.env*` 변경 후보를 꺼낸다. App이 매 프레임 소비해 .env 변경/삭제
@@ -471,11 +1296,18 @@ impl FileTreeUi {
     }
 
     pub fn set_root(&mut self, root: Option<PathBuf>) {
-        self.listing_epoch = self.listing_epoch.wrapping_add(1);
-        self.listing_epoch_shared
-            .store(self.listing_epoch, std::sync::atomic::Ordering::Relaxed);
-        self.pending_listings.clear();
-        self.root = root.map(|r| r.canonicalize().unwrap_or(r));
+        self.io_generation = self.io_generation.wrapping_add(1).max(1);
+        self.io_intent = None;
+        self.pending_io = None;
+        self.in_flight = 0;
+        self.maintenance_generation = self.maintenance_generation.wrapping_add(1).max(1);
+        self.maintenance_intent = None;
+        self.pending_maintenance = None;
+        self.pending_refresh_dirs.clear();
+        self.last_watch_revision = 0;
+        // App snapshot의 bounded root를 그대로 사용한다. canonicalize/metadata는 host
+        // repository가 listing 결과를 만들 때 수행하며 render leaf는 filesystem을 읽지 않는다.
+        self.root = root;
         self.root_error = None;
         self.children = None;
         self.flat.clear();
@@ -485,210 +1317,12 @@ impl FileTreeUi {
         self.inaccessible_paths.clear();
         self.edit = None;
         self.confirm_delete = None;
-        self.pending_watch.clear();
         self.env_warning_candidates.clear();
-        self.refresh();
-        // 루트가 유효할 때만 감시 시작 (FT-4). 실패는 경고 로그 — 수동 새로고침으로 동작.
-        self.start_watcher();
-    }
-
-    /// 워처 일괄 재나열 최소 간격(ms) — 이벤트·프레임이 동시에 폭주해도 재나열은 ~3.3Hz.
-    const WATCH_RELOAD_MS: u64 = 300;
-    /// 한 debounce window에서 reload_dir을 요청할 최대 dirty directory 수. 대량 이벤트가
-    /// 여러 펼친 디렉터리에 흩어져도 한 프레임에 listing worker를 과도하게 만들지 않는다.
-    const WATCH_RELOAD_DIRS_PER_BATCH: usize = 8;
-
-    /// 감시자 생성 (FT-4 — FSEvents/notify, 스레드 1개). 실제 감시 대상 디렉터리는
-    /// sync_watches가 루트+펼친 디렉터리로 **비재귀** 등록한다. 이벤트 도착 시 해당 부모
-    /// 디렉터리만 채널로 보내고 ~300ms 디바운스로 repaint를 예약한다(폭주 시 일괄 처리).
-    /// idle에는 이벤트가 없어 repaint를 유발하지 않는다 (리소스 계약).
-    fn start_watcher(&mut self) {
-        #[cfg(not(test))]
-        if let Some(watcher) = self.watcher.take() {
-            retire_watcher(watcher);
+        self.watch_plan_dirty = true;
+        if let Some(root) = self.root.clone() {
+            self.enqueue_refresh_dir(root);
         }
-        #[cfg(test)]
-        {
-            self.watcher = None;
-        }
-        self.watch_rx = None;
-        self.watched_dirs.clear();
-        // 단위 테스트는 아래 watcher 변환/스로틀 로직에 채널을 직접 주입한다. macOS
-        // FSEvents backend를 실제로 만들면 Drop이 OS latency만큼(실측 60s+) 기다려 테스트가
-        // 느려지므로 platform watcher 생성만 제외한다.
-        #[cfg(test)]
-        return;
-        #[cfg(not(test))]
-        self.start_platform_watcher();
-    }
-
-    #[cfg(not(test))]
-    fn start_platform_watcher(&mut self) {
-        let Some(root) = self.root.clone() else {
-            return;
-        };
-        if self.root_error.is_some() {
-            return;
-        }
-        if !try_acquire_watcher_slot() {
-            tracing::warn!("파일 감시자 정리 대기 상한 — 수동 새로고침으로 동작");
-            return;
-        }
-        self.watch_overflowed
-            .store(false, std::sync::atomic::Ordering::Release);
-        let (tx, rx) = sync_channel::<WatchEvent>(WATCH_EVENT_QUEUE_CAP);
-        let ctx = self.egui_ctx.clone();
-        let ignore = std::sync::Arc::clone(&self.watch_ignore);
-        let show_hidden = std::sync::Arc::clone(&self.watch_show_hidden);
-        let watch_root = root.clone();
-        let overflowed = Arc::clone(&self.watch_overflowed);
-        let handler = move |res: Result<notify::Event, notify::Error>| match res {
-            Ok(event) => {
-                if !relevant_fs_event(&event.kind) {
-                    return;
-                }
-                let show_hidden_now = show_hidden.load(std::sync::atomic::Ordering::Relaxed);
-                let mut sent = false;
-                for path in &event.paths {
-                    for event in
-                        watch_events_for_path(&watch_root, path, show_hidden_now, ignore.as_ref())
-                    {
-                        match tx.try_send(event) {
-                            Ok(()) => sent = true,
-                            Err(TrySendError::Full(_)) => {
-                                // 개별 경로를 계속 쌓지 않고 UI가 root refresh 한 건으로
-                                // 복구하게 한다. 플래그는 coalesced라 burst 크기와 무관하게 유계.
-                                overflowed.store(true, std::sync::atomic::Ordering::Release);
-                                sent = true;
-                            }
-                            Err(TrySendError::Disconnected(_)) => return,
-                        }
-                    }
-                }
-                if !sent {
-                    return; // 전부 걸러졌으면 리페인트도 깨우지 않는다 (유휴 유지)
-                }
-                // 디바운스 ~300ms: request_repaint_after는 가장 이른 예약만 유지되므로
-                // 이벤트 폭주 중에도 UI는 최대 ~3Hz로 일괄 재나열한다.
-                ctx.request_repaint_after(std::time::Duration::from_millis(300));
-            }
-            Err(e) => tracing::warn!("파일 감시 이벤트 오류: {e}"),
-        };
-        match notify::recommended_watcher(handler) {
-            Ok(watcher) => {
-                self.watcher = Some(watcher);
-                self.watch_rx = Some(rx);
-                self.sync_watches(); // 루트(+현재 펼침) 비재귀 등록
-            }
-            Err(e) => {
-                release_watcher_slot();
-                tracing::warn!("파일 감시자 생성 실패 (수동 새로고침으로 동작): {e}");
-            }
-        }
-    }
-
-    /// 감시 대상을 현재 트리 상태(루트 + 펼친 디렉터리)와 동기화한다 — 각 디렉터리를
-    /// **비재귀**로 watch/unwatch(delta만). flat이 바뀔 때(펼침/접힘/재나열)마다 호출한다.
-    /// 재귀 감시를 피해 크고 바쁜 서브트리(예: 홈의 ~/Library)의 이벤트 firehose를 차단한다.
-    fn sync_watches(&mut self) {
-        use notify::Watcher as _;
-        let Some(root) = self.root.clone() else {
-            return;
-        };
-        // desired = 루트 + 그 직속 항목이 화면에 보이는(펼친) 디렉터리들.
-        let mut desired: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-        desired.insert(root.clone());
-        for row in &self.flat {
-            if row.is_dir && row.expanded {
-                desired.insert(row.path.clone());
-            }
-        }
-        if desired == self.watched_dirs {
-            return; // 변화 없음 — watch/unwatch 호출 자체를 생략(유휴 무비용)
-        }
-        let Some(watcher) = self.watcher.as_mut() else {
-            return; // 감시자 미생성 상태(refresh 중) — start_watcher가 이후 동기화한다
-        };
-        for dir in desired.difference(&self.watched_dirs) {
-            if let Err(e) = watcher.watch(dir, notify::RecursiveMode::NonRecursive) {
-                tracing::warn!("파일 감시 추가 실패 {}: {e}", dir.display());
-            }
-        }
-        for dir in self.watched_dirs.difference(&desired) {
-            let _ = watcher.unwatch(dir); // 접힌 디렉터리 — 실패는 무시(이미 사라졌을 수 있음)
-        }
-        self.watched_dirs = desired;
-    }
-
-    /// 워처 이벤트 수거 + 시간 스로틀 재나열 (FT-4, codex Med-1). 채널은 매 프레임
-    /// 프레임 예산만큼 비워 pending 집합에 흡수하고, 실제 재나열(reread 재귀)은
-    /// 마지막 일괄 후 WATCH_RELOAD_MS 경과 시에만 수행한다 — 터미널 출력으로 프레임이
-    /// 계속 돌면서 파일 이벤트가 쏟아져도 재나열은 최대 ~3.3Hz.
-    fn pump_watch_events(&mut self, ctx: &egui::Context) {
-        if self
-            .watch_overflowed
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
-            && let Some(root) = &self.root
-        {
-            // 포화 burst는 root 한 건으로 축약한다.
-            insert_pending_watch_dir(&mut self.pending_watch, root.clone());
-        }
-        let mut drained = 0usize;
-        if let Some(rx) = &self.watch_rx {
-            while drained < WATCH_EVENTS_PER_FRAME {
-                let Ok(event) = rx.try_recv() else {
-                    break;
-                };
-                drained += 1;
-                match event {
-                    WatchEvent::DirtyDir(dir) => {
-                        insert_pending_watch_dir(&mut self.pending_watch, dir)
-                    }
-                    WatchEvent::EnvFileChanged(path) => {
-                        self.env_warning_candidates.insert(path);
-                    }
-                }
-            }
-        }
-        if drained == WATCH_EVENTS_PER_FRAME {
-            ctx.request_repaint();
-        }
-        if self.pending_watch.is_empty() {
-            return;
-        }
-        let window = std::time::Duration::from_millis(Self::WATCH_RELOAD_MS);
-        let elapsed = self.last_watch_reload.elapsed();
-        if elapsed < window {
-            // 창 안 — 처리를 미룬다. 워처가 예약한 repaint가 이 프레임에 이미 소비됐을 수
-            // 있으므로 남은 창만큼 뒤 프레임을 직접 예약해 pending이 방치되지 않게 한다.
-            ctx.request_repaint_after(window - elapsed);
-            return;
-        }
-        self.last_watch_reload = std::time::Instant::now();
-        let dirty =
-            take_pending_watch_batch(&mut self.pending_watch, Self::WATCH_RELOAD_DIRS_PER_BATCH);
-        for dir in dirty {
-            self.reload_dir(&dir);
-        }
-        if !self.pending_watch.is_empty() {
-            ctx.request_repaint_after(window);
-        }
-    }
-
-    /// 백그라운드 조작 완료 수거 (§9-3 — 완료/에러를 채널로 받아 부모만 재나열).
-    fn pump_ops(&mut self) {
-        while let Ok(outcome) = self.ops_rx.try_recv() {
-            self.in_flight = self.in_flight.saturating_sub(1);
-            if let Some(e) = outcome.error {
-                self.error = Some(e);
-            }
-            if let Some(path) = outcome.confirm_delete {
-                self.confirm_delete = Some(path); // 휴지통 실패 → 영구삭제 확인 (§9-7)
-            }
-            for dir in &outcome.refresh {
-                self.reload_dir(dir);
-            }
-        }
+        self.drive_maintenance();
     }
 
     /// 펼친 노드 전체를 재나열한다 (수동 새로고침 — 펼침 상태는 이월).
@@ -697,15 +1331,8 @@ impl FileTreeUi {
             return;
         };
         self.root_error = None;
-        // 같은 root 재나열도 전체 교체다 — epoch을 올려 진행 중이던 구 워커가
-        // 청크를 **송신하기 전에** 중단되게 한다(안 올리면 token mismatch로 수신측에서만
-        // 버려져 unbounded 채널에 stale 청크가 쌓인다 — codex High 2026-07-08).
-        self.listing_epoch = self.listing_epoch.wrapping_add(1);
-        self.listing_epoch_shared
-            .store(self.listing_epoch, std::sync::atomic::Ordering::Relaxed);
-        let preserve_expanded = Arc::new(self.collect_expanded_paths());
-        self.invalidate_listing_subtree(&root);
-        self.request_listing(root, preserve_expanded);
+        self.enqueue_refresh_dir(root);
+        self.drive_maintenance();
     }
 
     /// flat 캐시 재계산 (펼침/접힘/숨김 토글/조작 후에만 호출).
@@ -714,11 +1341,11 @@ impl FileTreeUi {
         if let (Some(root), Some(children)) = (&self.root, &self.children) {
             flatten(children, root, 0, self.show_hidden, &mut self.flat);
         }
-        // 펼침/접힘/재나열로 가시 트리가 바뀌었으니 감시 대상도 맞춘다(delta, 비재귀).
-        self.sync_watches();
+        self.watch_plan_dirty = true;
+        self.drive_maintenance();
     }
 
-    /// 디렉터리 행 클릭: 펼침 ↔ 접힘. 펼칠 때만 read_dir(lazy), 접으면 캐시 해제.
+    /// 디렉터리 행 클릭: 펼침 ↔ 접힘. 펼칠 때만 host listing, 접으면 캐시 해제.
     fn toggle_dir(&mut self, path: &Path) {
         if self.inaccessible_paths.contains(path) {
             return;
@@ -746,10 +1373,10 @@ impl FileTreeUi {
             }
         }
         if collapse {
-            self.invalidate_listing_subtree(path);
+            self.remove_refresh_subtree(path);
         }
         if expand {
-            self.request_listing(path.to_path_buf(), Arc::new(HashSet::new()));
+            self.enqueue_refresh_dir(path.to_path_buf());
         }
         self.rebuild_flat();
     }
@@ -764,11 +1391,6 @@ impl FileTreeUi {
         sidebar: &SidebarSnapshot<'_>,
         catalog: &i18n::Catalog,
     ) -> Option<SidebarAction> {
-        // 접힘 여부와 무관하게 배경 채널을 소비한다 (codex Med-2 — 접힌 채로 워처/조작
-        // 채널이 무한 누적되거나 op 완료(in_flight/에러/영구삭제 확인)가 방치되는 것 방지).
-        self.pump_listings();
-        self.pump_watch_events(ui.ctx());
-        self.pump_ops();
         if self.collapsed {
             egui::Panel::left("file_tree_panel_collapsed")
                 .resizable(false)
@@ -1296,8 +1918,6 @@ impl FileTreeUi {
             });
             if hidden.clicked() {
                 self.show_hidden = !self.show_hidden;
-                self.watch_show_hidden
-                    .store(self.show_hidden, std::sync::atomic::Ordering::Relaxed);
                 self.rebuild_flat();
             }
             tool_right -= 20.0;
@@ -1474,9 +2094,6 @@ impl FileTreeUi {
                     if open_settings {
                         action = Some(SidebarAction::OpenMacosFileAccessSettings);
                     }
-                }
-                RootListingError::Other(message) => {
-                    ui.colored_label(ui.visuals().error_fg_color, message);
                 }
             }
             return action;
@@ -1796,12 +2413,9 @@ impl FileTreeUi {
                         } else if row_resp.clicked() || label_resp.clicked() {
                             toggle = Some(row.path.clone());
                         }
-                    } else if (row_resp.double_clicked() || label_resp.double_clicked())
-                        && crate::ui::workspace::openable_file(&row.path)
-                    {
-                        // 파일 더블클릭 → 연결된 프로그램으로 열기 (2026-07-18 사용자).
-                        // 터미널 우클릭 「열기」와 같은 판정(openable_file)을 공유한다 —
-                        // 허용 확장자가 아니면(실행파일·스크립트 등) 아무 동작도 안 한다.
+                    } else if row_resp.double_clicked() || label_resp.double_clicked() {
+                        // host가 실존 regular file + 원본/realpath 허용 확장자를 다시 검증한
+                        // 뒤에만 연다. leaf는 filesystem metadata를 읽지 않는다.
                         open_file = Some(row.path.clone());
                     }
                     // 우클릭 컨텍스트 메뉴 (FT-3) — 행 전체에서 열리게 row_resp에 단다
@@ -1879,7 +2493,16 @@ impl FileTreeUi {
             self.toggle_dir(&path);
         }
         if let Some(path) = open_file {
-            action = Some(SidebarAction::OpenExternal(path));
+            let request =
+                FileTreePathPayload::try_new(path).map(|target| FileTreeIoRequest::OpenPath {
+                    target,
+                    require_openable_file: true,
+                });
+            if let Err(code) =
+                request.and_then(|request| self.queue_io(request, Vec::new(), None, None))
+            {
+                self.reject_io(code);
+            }
         }
         if let Some((src, dst_dir)) = drop_action {
             self.start_move(src, dst_dir);
@@ -1898,10 +2521,9 @@ impl FileTreeUi {
                     egui::StrokeKind::Inside,
                 );
             }
-            // 드래그 중엔 winit 이벤트가 없어 repaint 예약이 있어야 하이라이트가
-            // 포인터를 따라온다(종료 시 hovered_files가 비어 예약도 함께 끝난다).
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(50));
+            // 드래그 중엔 winit 이벤트가 없어 즉시 다음 frame을 요청해야 하이라이트가
+            // 포인터를 따라온다. hovered_files가 비면 요청도 즉시 끝나며 timer는 남지 않는다.
+            ui.ctx().request_repaint();
         }
         if !os_dropped.is_empty()
             && drag_pos.is_some_and(|pos| tree_area.contains(pos))
@@ -1912,58 +2534,77 @@ impl FileTreeUi {
         }
         self.handle_clipboard_shortcuts(ui, tree_area, hover_target_dir, hover_row_path);
 
-        // 인라인 편집 커밋/취소 처리 (실패 시 편집 유지 — 이름을 고칠 수 있게)
+        // 인라인 편집은 검증 후 native mutation intent만 만든다. 실패 completion이면
+        // PendingFileTreeIo가 보관한 편집 snapshot을 복원한다.
         match edit_done {
             Some(false) => edit = None,
             Some(true) => match edit {
                 Some(EditState::Rename { path, buffer, .. }) => {
-                    match apply_rename(&path, &buffer) {
-                        Ok(new_path) => {
-                            self.error = None;
-                            self.reload_parents(&path, &new_path);
-                            edit = None;
-                        }
-                        Err(msg) => {
-                            self.error = Some(msg);
-                            edit = Some(EditState::Rename {
-                                path,
-                                buffer,
-                                focus: true,
-                            });
+                    let validated = validate_name(&buffer)
+                        .map_err(|_| FileTreeIoErrorCode::InvalidName)
+                        .and_then(|name| {
+                            FileTreePathPayload::try_new(path.clone())
+                                .map(|source| FileTreeIoRequest::Rename { source, name })
+                        });
+                    let refresh = path.parent().map(Path::to_path_buf).into_iter().collect();
+                    let retry = EditState::Rename {
+                        path,
+                        buffer,
+                        focus: true,
+                    };
+                    match validated.and_then(|request| {
+                        self.queue_io(request, refresh, None, Some(retry.clone()))
+                    }) {
+                        Ok(()) => edit = None,
+                        Err(code) => {
+                            self.reject_io(code);
+                            edit = Some(retry);
                         }
                     }
                 }
                 Some(EditState::NewFolder { parent, buffer, .. }) => {
-                    match apply_new_folder(&parent, &buffer) {
-                        Ok(_) => {
-                            self.error = None;
-                            self.reveal_dir(&parent);
-                            edit = None;
-                        }
-                        Err(msg) => {
-                            self.error = Some(msg);
-                            edit = Some(EditState::NewFolder {
-                                parent,
-                                buffer,
-                                focus: true,
-                            });
+                    let validated = validate_name(&buffer)
+                        .map_err(|_| FileTreeIoErrorCode::InvalidName)
+                        .and_then(|name| {
+                            FileTreePathPayload::try_new(parent.clone())
+                                .map(|parent| FileTreeIoRequest::CreateDirectory { parent, name })
+                        });
+                    let refresh = vec![parent.clone()];
+                    let retry = EditState::NewFolder {
+                        parent,
+                        buffer,
+                        focus: true,
+                    };
+                    match validated.and_then(|request| {
+                        self.queue_io(request, refresh, None, Some(retry.clone()))
+                    }) {
+                        Ok(()) => edit = None,
+                        Err(code) => {
+                            self.reject_io(code);
+                            edit = Some(retry);
                         }
                     }
                 }
                 Some(EditState::NewFile { parent, buffer, .. }) => {
-                    match apply_new_file(&parent, &buffer) {
-                        Ok(_) => {
-                            self.error = None;
-                            self.reveal_dir(&parent);
-                            edit = None;
-                        }
-                        Err(msg) => {
-                            self.error = Some(msg);
-                            edit = Some(EditState::NewFile {
-                                parent,
-                                buffer,
-                                focus: true,
-                            });
+                    let validated = validate_name(&buffer)
+                        .map_err(|_| FileTreeIoErrorCode::InvalidName)
+                        .and_then(|name| {
+                            FileTreePathPayload::try_new(parent.clone())
+                                .map(|parent| FileTreeIoRequest::CreateFile { parent, name })
+                        });
+                    let refresh = vec![parent.clone()];
+                    let retry = EditState::NewFile {
+                        parent,
+                        buffer,
+                        focus: true,
+                    };
+                    match validated.and_then(|request| {
+                        self.queue_io(request, refresh, None, Some(retry.clone()))
+                    }) {
+                        Ok(()) => edit = None,
+                        Err(code) => {
+                            self.reject_io(code);
+                            edit = Some(retry);
                         }
                     }
                 }
@@ -1995,8 +2636,14 @@ impl FileTreeUi {
             Some(MenuAction::Delete(path)) => self.spawn_trash(path),
             Some(MenuAction::CopyFile(path)) => self.copy_files_to_clipboard(&[path]),
             Some(MenuAction::CopyPath(path)) => ui.ctx().copy_text(path.display().to_string()),
-            Some(MenuAction::InsertPath(path)) => action = Some(SidebarAction::InsertPath(path)),
-            Some(MenuAction::CdPath(path)) => action = Some(SidebarAction::CdPath(path)),
+            Some(MenuAction::InsertPath(path)) => match FileTreePathPayload::try_new(path) {
+                Ok(path) => action = Some(SidebarAction::InsertPath(path)),
+                Err(code) => self.reject_io(code),
+            },
+            Some(MenuAction::CdPath(path)) => match FileTreePathPayload::try_new(path) {
+                Ok(path) => action = Some(SidebarAction::CdPath(path)),
+                Err(code) => self.reject_io(code),
+            },
             None => {}
         }
         self.edit = edit;
@@ -2019,11 +2666,13 @@ impl FileTreeUi {
                     self.confirm_delete = None;
                     let refresh: Vec<PathBuf> =
                         path.parent().map(Path::to_path_buf).into_iter().collect();
-                    let target = path.clone();
-                    // 디렉터리 삭제는 느릴 수 있다 — 백그라운드 (§9-3)
-                    self.spawn_op(refresh, move || {
-                        remove_all(&target).map_err(|e| format!("영구 삭제 실패: {e}"))
-                    });
+                    let request = FileTreePathPayload::try_new(path.clone())
+                        .map(|target| FileTreeIoRequest::DeletePermanently { target });
+                    if let Err(code) =
+                        request.and_then(|request| self.queue_io(request, refresh, None, None))
+                    {
+                        self.reject_io(code);
+                    }
                 }
                 if ui.button(catalog.t("action.cancel", &[])).clicked() {
                     self.confirm_delete = None;
@@ -2037,7 +2686,7 @@ impl FileTreeUi {
                 ui.weak(catalog.t("file_tree.file_operation_running", &[]));
             });
         }
-        if !self.pending_listings.is_empty() {
+        if self.pending_maintenance.is_some() || self.maintenance_intent.is_some() {
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new().size(12.0));
                 ui.weak(catalog.t("file_tree.listing_folders", &[]));
@@ -2107,58 +2756,23 @@ impl FileTreeUi {
         action
     }
 
-    /// 새 폴더 생성 후 부모를 화면에 반영: 펼쳐져 있으면 재나열, 접혀 있으면 펼친다.
-    fn reveal_dir(&mut self, dir: &Path) {
-        let Some(root) = self.root.clone() else {
-            return;
-        };
-        if dir == root {
-            self.refresh();
-            return;
-        }
-        let Ok(rel) = dir.strip_prefix(&root) else {
-            return;
-        };
-        let expanded = self
-            .children
-            .as_mut()
-            .and_then(|c| node_mut(c, rel))
-            .map(|n| n.expanded);
-        match expanded {
-            Some(true) => self.reload_dir(dir),
-            Some(false) => self.toggle_dir(dir),
-            None => self.refresh(), // 노드 미발견 (드묾) — 안전하게 전체 새로고침
-        }
-    }
-
-    /// 드롭 → 이동 시작: 가드(§9-4) → 같은 볼륨 rename(§9-5) → EXDEV면 백그라운드
-    /// copy+delete(§9-3). 성공 시 src/dst 부모만 재나열한다(§4).
+    /// 드롭 → 이동 intent. canonicalize/root guard/rename/cross-volume 처리는 App host가
+    /// 수행하고 leaf는 bounded 경로와 성공 후 refresh 대상만 보관한다.
     fn start_move(&mut self, src: PathBuf, dst_dir: PathBuf) {
         let Some(root) = self.root.clone() else {
             return;
         };
-        match plan_move(&root, &src, &dst_dir) {
-            Err(e) => self.error = Some(e),
-            Ok(MovePlan::Noop) => {}
-            Ok(MovePlan::Move { src, dst }) => match rename_no_replace(&src, &dst) {
-                Ok(()) => {
-                    self.error = None;
-                    self.reload_parents(&src, &dst);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
-                    // 크로스 볼륨: UI 프레임을 막지 않게 백그라운드로 (§9-3)
-                    let refresh = parent_dirs(&src, &dst);
-                    let (src, dst_dir, dst) = (src.clone(), dst_dir.clone(), dst.clone());
-                    self.spawn_op(refresh, move || move_cross_volume(&src, &dst_dir, &dst));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    self.error = Some(format!(
-                        "같은 이름이 이미 있습니다 — 덮어쓰지 않습니다: {}",
-                        dst.display()
-                    ));
-                }
-                Err(e) => self.error = Some(format!("이동 실패: {e}")),
-            },
+        let refresh = parent_dirs(&src, &dst_dir);
+        let request = (|| {
+            Ok(FileTreeIoRequest::Move {
+                root: FileTreePathPayload::try_new(root)?,
+                source: FileTreePathPayload::try_new(src)?,
+                destination: FileTreePathPayload::try_new(dst_dir)?,
+            })
+        })();
+        match request.and_then(|request| self.queue_io(request, refresh, None, None)) {
+            Ok(()) => {}
+            Err(code) => self.reject_io(code),
         }
     }
 
@@ -2169,16 +2783,17 @@ impl FileTreeUi {
         if sources.is_empty() {
             return;
         }
-        // 대상은 canonicalize해 자기 자신/자손 가드(copy_into_dir)의 비교 기준을 맞춘다.
-        let dst_dir = match dst_dir.canonicalize() {
-            Ok(dir) => dir,
-            Err(e) => {
-                self.error = Some(format!("대상 폴더 확인 실패: {e}"));
-                return;
-            }
-        };
         let refresh = vec![dst_dir.clone()];
-        self.spawn_op(refresh, move || copy_sources_into_dir(&sources, &dst_dir));
+        let request = (|| {
+            Ok(FileTreeIoRequest::CopyInto {
+                sources: FileTreePathListPayload::try_new(sources)?,
+                destination: FileTreePathPayload::try_new(dst_dir)?,
+            })
+        })();
+        match request.and_then(|request| self.queue_io(request, refresh, None, None)) {
+            Ok(()) => {}
+            Err(code) => self.reject_io(code),
+        }
     }
 
     /// 파일 트리 위 ⌘C/⌘V — Finder와의 파일 전송(§과제②③).
@@ -2229,83 +2844,37 @@ impl FileTreeUi {
             self.consumed_paste_shortcut = true;
             return;
         }
-        // 파일이 없으면(텍스트/이미지만) no-op — 소비하지 않아 터미널/컴포저의 기존
-        // 붙여넣기가 그대로 동작한다.
-        let Some(paths) = clipboard_file_list_for_paste() else {
+        let destination = target_dir.unwrap_or(root);
+        let refresh = vec![destination.clone()];
+        let request = FileTreePathPayload::try_new(destination)
+            .map(|destination| FileTreeIoRequest::PasteFromClipboard { destination });
+        if let Err(code) = request.and_then(|request| self.queue_io(request, refresh, None, None)) {
+            self.reject_io(code);
             return;
-        };
+        }
         self.consumed_paste_shortcut = true;
         self.last_external_paste = Some(std::time::Instant::now());
-        self.start_copy_into(paths, target_dir.unwrap_or(root));
     }
 
     /// 파일 URL pasteboard 쓰기 — 실패는 하단 에러 라벨로 표면화(조용한 실패 금지).
     fn copy_files_to_clipboard(&mut self, paths: &[PathBuf]) {
-        match crate::ui::clipboard_image::copy_file_urls_to_clipboard(paths) {
-            Ok(()) => self.error = None,
-            Err(e) => self.error = Some(format!("파일 복사(클립보드) 실패: {e}")),
+        let request = FileTreePathListPayload::try_new(paths.to_vec())
+            .map(|paths| FileTreeIoRequest::CopyFileUrls { paths });
+        match request.and_then(|request| self.queue_io(request, Vec::new(), None, None)) {
+            Ok(()) => {}
+            Err(code) => self.reject_io(code),
         }
     }
 
-    /// 백그라운드 파일 조작 실행 — 완료/에러는 채널로 UI에 전달되고 repaint를 깨운다(§9-3).
-    fn spawn_op(
-        &mut self,
-        refresh: Vec<PathBuf>,
-        job: impl FnOnce() -> Result<(), String> + Send + 'static,
-    ) {
-        if self.in_flight >= FILE_OP_WORKER_CAP {
-            self.error =
-                Some("파일 작업이 너무 많습니다 — 진행 중인 작업을 기다려 주세요".to_owned());
-            return;
-        }
-        self.in_flight += 1;
-        let tx = self.ops_tx.clone();
-        let ctx = self.egui_ctx.clone();
-        std::thread::spawn(move || {
-            let error = job().err();
-            let _ = tx.send(OpOutcome {
-                refresh,
-                error,
-                confirm_delete: None,
-            });
-            ctx.request_repaint();
-        });
-    }
-
-    /// 휴지통 이동 (§5/§9-7). 큰 디렉터리도 프레임을 막지 않게 항상 백그라운드.
-    /// 실패 시 영구삭제 확인을 UI에 예약한다 (조용한 영구삭제 금지).
+    /// 휴지통 이동 intent. 실패 completion만 영구삭제 확인으로 승격한다.
     fn spawn_trash(&mut self, path: PathBuf) {
-        if self.in_flight >= FILE_OP_WORKER_CAP {
-            self.error =
-                Some("파일 작업이 너무 많습니다 — 진행 중인 작업을 기다려 주세요".to_owned());
-            return;
-        }
-        self.in_flight += 1;
-        let tx = self.ops_tx.clone();
-        let ctx = self.egui_ctx.clone();
-        std::thread::spawn(move || {
-            let refresh: Vec<PathBuf> = path.parent().map(Path::to_path_buf).into_iter().collect();
-            let outcome = match trash::delete(&path) {
-                Ok(()) => OpOutcome {
-                    refresh,
-                    error: None,
-                    confirm_delete: None,
-                },
-                Err(e) => OpOutcome {
-                    refresh: Vec::new(),
-                    error: Some(format!("휴지통 이동 실패: {e}")),
-                    confirm_delete: Some(path),
-                },
-            };
-            let _ = tx.send(outcome);
-            ctx.request_repaint();
-        });
-    }
-
-    /// src/dst의 부모 디렉터리만 재나열 (§4 — 전체 리스캔 금지).
-    fn reload_parents(&mut self, src: &Path, dst: &Path) {
-        for dir in parent_dirs(src, dst) {
-            self.reload_dir(&dir);
+        let refresh: Vec<PathBuf> = path.parent().map(Path::to_path_buf).into_iter().collect();
+        let target = path.clone();
+        let request =
+            FileTreePathPayload::try_new(path).map(|target| FileTreeIoRequest::Trash { target });
+        match request.and_then(|request| self.queue_io(request, refresh, Some(target), None)) {
+            Ok(()) => {}
+            Err(code) => self.reject_io(code),
         }
     }
 
@@ -2329,219 +2898,9 @@ impl FileTreeUi {
             .map(|node| node.expanded)
             .unwrap_or(false);
         if should_reload {
-            let preserve_expanded = Arc::new(self.collect_expanded_paths());
-            self.invalidate_listing_subtree(dir);
-            self.request_listing(dir.to_path_buf(), preserve_expanded);
+            self.enqueue_refresh_dir(dir.to_path_buf());
+            self.drive_maintenance();
         }
-    }
-
-    fn request_listing(&mut self, path: PathBuf, preserve_expanded: Arc<HashSet<PathBuf>>) {
-        self.next_listing_token = self.next_listing_token.wrapping_add(1);
-        let token = self.next_listing_token;
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        if let Some(old) = self.pending_listings.insert(
-            path.clone(),
-            PendingListing {
-                token,
-                preserve_expanded,
-                apply_expanded: None,
-                started: false,
-                cancel: Arc::clone(&cancel),
-            },
-        ) {
-            // 같은 경로 재요청(reload_dir) — 구 워커의 잔여 청크 송신을 중단시킨다.
-            old.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        let job = ListingJob {
-            tx: self.listing_tx.clone(),
-            ctx: self.egui_ctx.clone(),
-            shutdown: Arc::clone(&self.listing_shutdown),
-            epoch: ListingEpochGuard {
-                requested: self.listing_epoch,
-                current: Arc::clone(&self.listing_epoch_shared),
-                cancel,
-            },
-            token,
-            root: self.root.clone(),
-            path,
-        };
-        match self.listing_jobs.try_send(job) {
-            Ok(()) => {}
-            Err(TrySendError::Full(job)) => {
-                // 요청을 무제한 보관하지 않는다. 이 경로 요청은 취소하고, 큐가 비는
-                // 프레임에 root refresh 한 건으로 상태를 재구성한다.
-                job.epoch
-                    .cancel
-                    .store(true, std::sync::atomic::Ordering::Release);
-                self.pending_listings.remove(&job.path);
-                self.listing_refresh_deferred = true;
-                self.egui_ctx.request_repaint();
-            }
-            Err(TrySendError::Disconnected(job)) => {
-                self.pending_listings.remove(&job.path);
-                self.error = Some("파일 listing worker가 종료되었습니다".to_owned());
-            }
-        }
-    }
-
-    fn request_listing_if_absent(
-        &mut self,
-        path: PathBuf,
-        preserve_expanded: Arc<HashSet<PathBuf>>,
-    ) {
-        if self.pending_listings.contains_key(&path) {
-            return;
-        }
-        self.request_listing(path, preserve_expanded);
-    }
-
-    fn invalidate_listing_subtree(&mut self, path: &Path) {
-        self.pending_listings.retain(|pending_path, pending| {
-            let keep = !pending_path.starts_with(path);
-            if !keep {
-                pending
-                    .cancel
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-            keep
-        });
-    }
-
-    fn pump_listings(&mut self) {
-        let mut processed = 0;
-        while processed < LISTING_RESULTS_PER_FRAME {
-            let Ok(outcome) = self.listing_rx.try_recv() else {
-                break;
-            };
-            // stale(구 epoch)은 프레임 예산에 세지 않고 즉시 폐기 — 백로그를
-            // 프레임당 4개씩만 비우면 따라잡기가 밀린다(안정성 감사 High #2).
-            if outcome.epoch != self.listing_epoch {
-                continue;
-            }
-            self.apply_listing_outcome(outcome);
-            processed += 1;
-        }
-        if self.listing_refresh_deferred && self.pending_listings.len() < LISTING_JOB_QUEUE_CAP / 2
-        {
-            self.listing_refresh_deferred = false;
-            self.refresh();
-        }
-        if !self.pending_listings.is_empty() {
-            self.egui_ctx.request_repaint();
-        }
-    }
-
-    fn apply_listing_outcome(&mut self, outcome: ListingOutcome) {
-        if outcome.epoch != self.listing_epoch {
-            return;
-        }
-        let Some(pending) = self.pending_listings.get(&outcome.path) else {
-            return;
-        };
-        if pending.token != outcome.token {
-            return;
-        }
-
-        match outcome.result {
-            ListingResult::Chunk { nodes, done } => {
-                self.apply_listing_chunk(outcome.path, nodes, done);
-            }
-            ListingResult::Error { message, kind } => {
-                self.pending_listings.remove(&outcome.path);
-                self.apply_listing_error(&outcome.path, message, kind);
-            }
-        }
-    }
-
-    fn apply_listing_chunk(&mut self, path: PathBuf, nodes: Vec<TreeNode>, done: bool) {
-        self.inaccessible_paths.remove(&path);
-        let first = self
-            .pending_listings
-            .get(&path)
-            .map(|pending| !pending.started)
-            .unwrap_or(false);
-        let expanded = if first {
-            let expanded = self
-                .current_expanded_paths_for_listing(&path)
-                .unwrap_or_else(|| {
-                    self.pending_listings
-                        .get(&path)
-                        .map(|pending| (*pending.preserve_expanded).clone())
-                        .unwrap_or_default()
-                });
-            let expanded = Arc::new(expanded);
-            if let Some(pending) = self.pending_listings.get_mut(&path) {
-                pending.started = true;
-                pending.apply_expanded = Some(Arc::clone(&expanded));
-            }
-            expanded
-        } else {
-            self.pending_listings
-                .get(&path)
-                .and_then(|pending| pending.apply_expanded.as_ref().map(Arc::clone))
-                .unwrap_or_else(|| Arc::new(HashSet::new()))
-        };
-
-        let prepared = prepare_listing_nodes(&path, nodes, &expanded);
-        let applied = if first {
-            self.replace_listing_children(&path, prepared)
-        } else {
-            self.append_listing_children(&path, prepared)
-        };
-        if !applied {
-            self.invalidate_listing_subtree(&path);
-            return;
-        }
-
-        let preserve_expanded = self
-            .pending_listings
-            .get(&path)
-            .map(|pending| Arc::clone(&pending.preserve_expanded));
-        if done {
-            self.pending_listings.remove(&path);
-            if let Some(preserve_expanded) = preserve_expanded {
-                for child in self.expanded_direct_child_paths(&path) {
-                    self.request_listing_if_absent(child, Arc::clone(&preserve_expanded));
-                }
-            }
-        }
-        self.root_error = None;
-        self.rebuild_flat();
-    }
-
-    fn apply_listing_error(&mut self, path: &Path, error: String, kind: std::io::ErrorKind) {
-        let Some(root) = self.root.clone() else {
-            return;
-        };
-        let permission_denied = kind == std::io::ErrorKind::PermissionDenied;
-        if path == root {
-            self.children = None;
-            self.root_error = Some(if permission_denied {
-                RootListingError::PermissionDenied
-            } else {
-                RootListingError::Other(format!("루트 나열 실패: {error}"))
-            });
-            self.rebuild_flat();
-            return;
-        }
-        if let Ok(rel) = path.strip_prefix(&root)
-            && let Some(node) = self.children.as_mut().and_then(|c| node_mut(c, rel))
-        {
-            node.expanded = false;
-            node.children = None;
-        }
-        if permission_denied {
-            self.inaccessible_paths.insert(path.to_path_buf());
-            tracing::info!(path = %path.display(), "macOS가 폴더 나열 권한을 거부함");
-            self.rebuild_flat();
-            return;
-        }
-        let name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
-        self.error = Some(format!("{name} 나열 실패: {error}"));
-        self.rebuild_flat();
     }
 
     fn replace_listing_children(&mut self, path: &Path, nodes: Vec<TreeNode>) -> bool {
@@ -2563,47 +2922,6 @@ impl FileTreeUi {
         }
         node.children = Some(nodes);
         true
-    }
-
-    fn append_listing_children(&mut self, path: &Path, mut nodes: Vec<TreeNode>) -> bool {
-        let Some(root) = self.root.clone() else {
-            return false;
-        };
-        let target = if path == root {
-            self.children.as_mut()
-        } else {
-            let Ok(rel) = path.strip_prefix(&root) else {
-                return false;
-            };
-            let Some(node) = self.children.as_mut().and_then(|c| node_mut(c, rel)) else {
-                return false;
-            };
-            if !node.expanded {
-                return false;
-            }
-            node.children.as_mut()
-        };
-        let Some(target) = target else {
-            return false;
-        };
-        target.append(&mut nodes);
-        true
-    }
-
-    fn current_expanded_paths_for_listing(&self, path: &Path) -> Option<HashSet<PathBuf>> {
-        let root = self.root.as_ref()?;
-        if path == root {
-            let children = self.children.as_ref()?;
-            let mut expanded = HashSet::new();
-            collect_expanded_paths(children, root, &mut expanded);
-            return Some(expanded);
-        }
-        let rel = path.strip_prefix(root).ok()?;
-        let node = self.children.as_ref().and_then(|c| node_ref(c, rel))?;
-        let children = node.children.as_ref()?;
-        let mut expanded = HashSet::new();
-        collect_expanded_paths(children, path, &mut expanded);
-        Some(expanded)
     }
 
     fn collect_expanded_paths(&self) -> HashSet<PathBuf> {
@@ -2651,22 +2969,6 @@ fn permission_denied_button_rect(area: egui::Rect, screen_center: egui::Pos2) ->
     egui::Rect::from_center_size(center, egui::vec2(button_width, button_height))
 }
 
-impl Drop for FileTreeUi {
-    fn drop(&mut self) {
-        // read_dir가 네트워크 파일시스템에서 오래 막힐 수 있어 UI thread에서 join하지는
-        // 않는다. 인스턴스 플래그와 result receiver drop으로 전역 pool의 이 인스턴스 job은
-        // 다음 entry/send 경계에서 끝난다. pool 자체는 프로세스 전역 4개로 계속 재사용한다.
-        self.listing_shutdown
-            .store(true, std::sync::atomic::Ordering::Release);
-        // macOS FSEvents watcher Drop은 감시 루트가 외부에서 사라진 경우 OS latency만큼
-        // 블록할 수 있다. 고정 1개 reaper + 전역 slot cap으로 UI를 막지 않고 유계 정리한다.
-        #[cfg(not(test))]
-        if let Some(watcher) = self.watcher.take() {
-            retire_watcher(watcher);
-        }
-    }
-}
-
 /// src의 옛 부모와 dst의 새 부모 (중복 제거) — 조작 후 재나열 대상.
 fn parent_dirs(src: &Path, dst: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
@@ -2693,14 +2995,14 @@ fn insert_pending_watch_dir(pending: &mut BTreeSet<PathBuf>, dir: PathBuf) {
     pending.insert(dir);
 }
 
-fn take_pending_watch_batch(pending: &mut BTreeSet<PathBuf>, limit: usize) -> Vec<PathBuf> {
-    let selected: Vec<PathBuf> = pending.iter().take(limit).cloned().collect();
-    for path in &selected {
-        pending.remove(path);
-    }
-    selected
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WatchEvent {
+    DirtyDir(PathBuf),
+    EnvFileChanged(PathBuf),
 }
 
+#[cfg(test)]
 fn watch_events_for_path(
     root: &Path,
     path: &Path,
@@ -2728,6 +3030,7 @@ fn watch_events_for_path(
     events
 }
 
+#[cfg(test)]
 fn is_env_file_candidate(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
@@ -2747,6 +3050,7 @@ fn has_hidden_component(root: &std::path::Path, path: &std::path::Path) -> bool 
     })
 }
 
+#[cfg(test)]
 fn relevant_fs_event(kind: &notify::EventKind) -> bool {
     !matches!(kind, notify::EventKind::Access(_))
 }
@@ -2779,6 +3083,7 @@ fn validate_name(name: &str) -> Result<String, String> {
 }
 
 /// 이름 변경 (덮어쓰기 금지 §9-5 공유). 성공 시 새 경로.
+#[cfg(test)]
 fn apply_rename(path: &Path, new_name: &str) -> Result<PathBuf, String> {
     let name = validate_name(new_name)?;
     let parent = path
@@ -2798,6 +3103,7 @@ fn apply_rename(path: &Path, new_name: &str) -> Result<PathBuf, String> {
 }
 
 /// 새 폴더 생성 (이미 있으면 거부). 성공 시 생성 경로.
+#[cfg(test)]
 fn apply_new_folder(parent: &Path, name: &str) -> Result<PathBuf, String> {
     let name = validate_name(name)?;
     let dst = parent.join(&name);
@@ -2811,6 +3117,7 @@ fn apply_new_folder(parent: &Path, name: &str) -> Result<PathBuf, String> {
 }
 
 /// 새 빈 파일 생성 (덮어쓰기 금지). 성공 시 생성 경로.
+#[cfg(test)]
 fn apply_new_file(parent: &Path, name: &str) -> Result<PathBuf, String> {
     let name = validate_name(name)?;
     let dst = parent.join(&name);
@@ -4135,6 +4442,7 @@ fn shell_safe(s: &str, extra_safe: &str) -> bool {
 }
 
 /// 이동 계획 (§9-4 가드 통과 결과).
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 enum MovePlan {
     /// 실제 이동: canonicalize된 src(링크면 링크 자체)와 최종 목적지.
@@ -4147,6 +4455,7 @@ enum MovePlan {
 /// `dst_dir ⊂ root`(루트 탈출 차단, 심볼릭 링크 경유 포함) && `¬(dst_dir ⊂ src)`(자기
 /// 자신/자손 금지)를 검사한다. src 자체는 canonicalize하지 않는다 — symlink는 따라가지
 /// 않고 링크 자체를 이동한다(정책 확정).
+#[cfg(test)]
 fn plan_move(root: &Path, src: &Path, dst_dir: &Path) -> Result<MovePlan, String> {
     let root_c = root
         .canonicalize()
@@ -4180,6 +4489,7 @@ fn plan_move(root: &Path, src: &Path, dst_dir: &Path) -> Result<MovePlan, String
 /// 덮어쓰기 금지 rename (§9-5). macOS(주 타깃)는 `renamex_np(RENAME_EXCL)`로 원자적 —
 /// TOCTOU 없음. 미지원 파일시스템(ENOTSUP)·그 외 OS는 사전검사+rename 폴백
 /// (전제: 단일 사용자 로컬 조작 — 외부 동시 변경과의 경합은 비전제).
+#[cfg(test)]
 fn rename_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -4207,6 +4517,7 @@ fn rename_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 /// 사전검사+rename 폴백 (§9-5 명시 전제: 단일 사용자 로컬 조작).
+#[cfg(test)]
 fn rename_precheck(src: &Path, dst: &Path) -> std::io::Result<()> {
     // symlink 자체도 "존재"로 취급 — try_exists는 링크를 따라가므로 symlink_metadata로 검사
     if std::fs::symlink_metadata(dst).is_ok() {
@@ -4217,6 +4528,7 @@ fn rename_precheck(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 /// 크로스 볼륨 이동 (§9-4 확정 순서): `dst_dir/.tmp-<uuid>`에 전체 copy → 최종 이름으로
 /// rename → 성공 후에만 원본 delete. 부분 실패 시 tmp 정리, 원본 보존.
+#[cfg(test)]
 fn move_cross_volume(src: &Path, dst_dir: &Path, dst: &Path) -> Result<(), String> {
     let tmp = dst_dir.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
     if let Err(e) = copy_recursive(src, &tmp) {
@@ -4237,6 +4549,7 @@ fn move_cross_volume(src: &Path, dst_dir: &Path, dst: &Path) -> Result<(), Strin
 }
 
 /// 재귀 복사. symlink는 따라가지 않고 링크 자체를 재현한다(§9-4 정책과 일관).
+#[cfg(test)]
 fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     let file_type = std::fs::symlink_metadata(src)?.file_type();
     if file_type.is_symlink() {
@@ -4260,25 +4573,10 @@ fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::copy(src, dst).map(|_| ())
 }
 
-/// 외부 반입 복사(§과제①②) — 원본별 실패를 모아 표면화하고 나머지는 계속 진행한다
-/// (조용한 스킵 금지). 성공 원본은 그대로 두고 대상에만 사본을 만든다.
-fn copy_sources_into_dir(sources: &[PathBuf], dst_dir: &Path) -> Result<(), String> {
-    let mut errors = Vec::new();
-    for src in sources {
-        if let Err(e) = copy_into_dir(src, dst_dir) {
-            errors.push(e);
-        }
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join(" · "))
-    }
-}
-
 /// 한 원본을 dst_dir/<이름>으로 복사한다 — move_cross_volume과 같은 관례(tmp 스테이징
 /// → rename_no_replace, 덮어쓰기 금지 §9-5)에서 원본 삭제만 없다. 자기 자신/자손으로의
 /// 복사는 무한 재귀라 사전 차단한다(호출부가 dst_dir을 canonicalize해 비교 기준 일치).
+#[cfg(test)]
 fn copy_into_dir(src: &Path, dst_dir: &Path) -> Result<(), String> {
     let name = src
         .file_name()
@@ -4311,25 +4609,6 @@ fn copy_into_dir(src: &Path, dst_dir: &Path) -> Result<(), String> {
             }
         }
     }
-}
-
-/// ⌘V가 읽는 클립보드 파일 목록. 테스트는 실제 pasteboard 없이 주입 목록으로 흐름을
-/// 검증한다(테스트는 --test-threads=1 직렬 실행 전제 — thread_local이라 간섭 없음).
-fn clipboard_file_list_for_paste() -> Option<Vec<PathBuf>> {
-    #[cfg(test)]
-    {
-        if let Some(paths) = TEST_CLIPBOARD_FILES.with(|cell| cell.borrow_mut().take()) {
-            return Some(paths);
-        }
-    }
-    crate::ui::clipboard_image::read_clipboard_file_list()
-}
-
-#[cfg(test)]
-thread_local! {
-    /// 테스트 전용 ⌘V 클립보드 파일 주입 지점 (한 번 읽으면 소진).
-    static TEST_CLIPBOARD_FILES: std::cell::RefCell<Option<Vec<PathBuf>>> =
-        const { std::cell::RefCell::new(None) };
 }
 
 /// 행 기준 반입 대상 폴더 — 폴더 행이면 자신, 파일 행이면 부모(§과제 판정 규칙).
@@ -4405,6 +4684,7 @@ fn screen_to_window_pos(
 }
 
 /// 파일/링크/디렉터리를 삭제한다 (링크는 링크 자체만).
+#[cfg(test)]
 fn remove_all(path: &Path) -> std::io::Result<()> {
     let file_type = std::fs::symlink_metadata(path)?.file_type();
     if file_type.is_dir() {
@@ -4414,315 +4694,42 @@ fn remove_all(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// 한 디렉터리를 나열한다 (lazy 단위 — 재귀 없음). symlink는 따라가지 않는다(§9-4:
-/// `DirEntry::file_type`은 링크를 해석하지 않으므로 링크는 파일처럼 취급 — 펼침 불가).
-const LISTING_CHUNK_SIZE: usize = 2048;
-const LISTING_RESULTS_PER_FRAME: usize = 4;
-const LISTING_WORKER_COUNT: usize = 4;
-const LISTING_JOB_QUEUE_CAP: usize = 64;
-const LISTING_RESULT_QUEUE_CAP: usize = 16;
-const FILE_OP_RESULT_QUEUE_CAP: usize = 32;
-const FILE_OP_WORKER_CAP: usize = 4;
-#[cfg(not(test))]
-const WATCH_EVENT_QUEUE_CAP: usize = 512;
-const WATCH_EVENTS_PER_FRAME: usize = 256;
-
-#[cfg(not(test))]
-const WATCHER_SLOT_CAP: usize = 4;
-#[cfg(not(test))]
-static WATCHER_SLOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-#[cfg(not(test))]
-static WATCHER_REAPER: std::sync::OnceLock<SyncSender<notify::RecommendedWatcher>> =
-    std::sync::OnceLock::new();
-
-#[cfg(not(test))]
-fn try_acquire_watcher_slot() -> bool {
-    WATCHER_SLOTS
-        .fetch_update(
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-            |current| (current < WATCHER_SLOT_CAP).then_some(current + 1),
-        )
-        .is_ok()
-}
-
-#[cfg(not(test))]
-fn release_watcher_slot() {
-    let previous = WATCHER_SLOTS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-    debug_assert!(previous > 0, "watcher slot underflow");
-}
-
-#[cfg(not(test))]
-fn watcher_reaper() -> &'static SyncSender<notify::RecommendedWatcher> {
-    WATCHER_REAPER.get_or_init(|| {
-        let (tx, rx) = sync_channel::<notify::RecommendedWatcher>(WATCHER_SLOT_CAP);
-        if let Err(error) = std::thread::Builder::new()
-            .name("file-watcher-reaper".to_owned())
-            .spawn(move || {
-                while let Ok(watcher) = rx.recv() {
-                    drop(watcher);
-                    release_watcher_slot();
-                }
-            })
-        {
-            // receiver는 spawn 실패와 함께 drop되어 tx가 Disconnected가 된다. retire 호출은
-            // 아래 bounded fallback으로 넘어가므로 앱 시작/토글을 panic시키지 않는다.
-            tracing::error!("file watcher reaper thread 생성 실패: {error}");
+fn file_tree_io_error_message(code: FileTreeIoErrorCode) -> &'static str {
+    match code {
+        FileTreeIoErrorCode::Busy => "파일 작업이 진행 중입니다 — 완료 후 다시 시도해 주세요",
+        FileTreeIoErrorCode::InvalidPath => "유효하지 않은 파일 경로입니다",
+        FileTreeIoErrorCode::PathTooLarge | FileTreeIoErrorCode::PathListTooLarge => {
+            "파일 경로 입력이 허용된 크기를 초과했습니다"
         }
-        tx
-    })
-}
-
-#[cfg(not(test))]
-fn retire_watcher(watcher: notify::RecommendedWatcher) {
-    match watcher_reaper().try_send(watcher) {
-        Ok(()) => {}
-        Err(TrySendError::Full(watcher)) | Err(TrySendError::Disconnected(watcher)) => {
-            // slot cap 때문에 fallback thread 수도 최대 WATCHER_SLOT_CAP이다. UI thread에서
-            // 직접 Drop해 멈추는 것보다 독립 정리를 유지한다.
-            let pending = Arc::new(Mutex::new(Some(watcher)));
-            let worker_pending = Arc::clone(&pending);
-            if std::thread::Builder::new()
-                .name("file-watcher-retire-fallback".to_owned())
-                .spawn(move || {
-                    if let Some(watcher) =
-                        worker_pending.lock().expect("watcher fallback lock").take()
-                    {
-                        drop(watcher);
-                    }
-                    release_watcher_slot();
-                })
-                .is_err()
-            {
-                // thread 생성 실패 시 watcher를 leak해 UI block을 피하되 slot은 점유한 채
-                // 남긴다. 최대 WATCHER_SLOT_CAP 이후 새 watcher 생성이 중단되어 유계다.
-                std::mem::forget(pending);
-                tracing::error!("파일 감시자 정리 thread 생성 실패 — watcher slot 격리");
-            }
-        }
+        FileTreeIoErrorCode::InvalidName => "사용할 수 없는 파일 이름입니다",
+        FileTreeIoErrorCode::Conflict => "같은 이름이 이미 있습니다 — 덮어쓰지 않습니다",
+        FileTreeIoErrorCode::OutsideRoot => "워크스페이스 루트 밖으로 이동할 수 없습니다",
+        FileTreeIoErrorCode::TrashUnavailable => "휴지통으로 이동하지 못했습니다",
+        FileTreeIoErrorCode::NativeFailure => "파일 작업을 완료하지 못했습니다",
     }
 }
 
-/// listing 워커의 stale 판정 — 요청 시점 epoch과 UI의 현재 epoch(공유 atomic)을 묶어
-/// 워커가 나열 전/청크 전송 중에 확인한다(안정성 감사 High #2).
-struct ListingEpochGuard {
-    requested: u64,
-    current: Arc<std::sync::atomic::AtomicU64>,
-    /// 이 요청 전용 취소 플래그(같은 경로 token 교체/부분 무효화).
-    cancel: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl ListingEpochGuard {
-    fn is_stale(&self) -> bool {
-        self.current.load(std::sync::atomic::Ordering::Relaxed) != self.requested
-            || self.cancel.load(std::sync::atomic::Ordering::Relaxed)
-    }
-}
-
-static LISTING_POOL: std::sync::OnceLock<SyncSender<ListingJob>> = std::sync::OnceLock::new();
-
-fn global_listing_pool() -> &'static SyncSender<ListingJob> {
-    LISTING_POOL.get_or_init(|| {
-        let (tx, jobs) = sync_channel::<ListingJob>(LISTING_JOB_QUEUE_CAP);
-        let jobs = Arc::new(Mutex::new(jobs));
-        let mut spawned = 0usize;
-        for index in 0..LISTING_WORKER_COUNT {
-            let jobs = Arc::clone(&jobs);
-            match std::thread::Builder::new()
-                .name(format!("file-listing-{index}"))
-                .spawn(move || {
-                    loop {
-                        let job = {
-                            let Ok(rx) = jobs.lock() else {
-                                return;
-                            };
-                            let Ok(job) = rx.recv() else {
-                                return;
-                            };
-                            job
-                        };
-                        run_listing_job(job);
-                    }
-                }) {
-                Ok(_) => spawned += 1,
-                Err(error) => {
-                    tracing::error!(worker = index, "file listing worker 생성 실패: {error}")
-                }
-            }
+fn file_tree_maintenance_error_message(code: FileTreeMaintenanceErrorCode) -> &'static str {
+    match code {
+        FileTreeMaintenanceErrorCode::PermissionDenied => "폴더 접근 권한이 없습니다",
+        FileTreeMaintenanceErrorCode::ListingTooLarge => {
+            "폴더 항목이 파일 트리 자원 상한을 초과했습니다"
         }
-        if spawned == 0 {
-            // jobs Arc가 이 초기화 끝에서 drop되면 tx는 Disconnected가 되고 UI가 오류를
-            // 표시한다. thread 자원 부족으로 앱 전체를 panic시키지 않는다.
-            tracing::error!("file listing worker를 하나도 만들지 못했습니다");
+        FileTreeMaintenanceErrorCode::WatchPlanTooLarge => {
+            "파일 감시 범위가 자원 상한을 초과했습니다"
         }
-        tx
-    })
-}
-
-fn run_listing_job(job: ListingJob) {
-    let ListingJob {
-        tx,
-        ctx,
-        shutdown,
-        epoch,
-        token,
-        root,
-        path,
-    } = job;
-    if epoch.is_stale() || shutdown.load(std::sync::atomic::Ordering::Acquire) {
-        return;
-    }
-    match read_children_guarded(&path, root.as_deref(), Some((&epoch, shutdown.as_ref()))) {
-        Ok(nodes) => {
-            send_listing_chunks_bounded(&tx, &ctx, &epoch, shutdown.as_ref(), token, path, nodes)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::Interrupted || epoch.is_stale() => {}
-        Err(error) => {
-            let _ = send_listing_outcome(
-                &tx,
-                ListingOutcome {
-                    epoch: epoch.requested,
-                    token,
-                    path,
-                    result: ListingResult::Error {
-                        message: error.to_string(),
-                        kind: error.kind(),
-                    },
-                },
-                &epoch,
-                shutdown.as_ref(),
-            );
-            ctx.request_repaint();
-        }
-    }
-}
-
-fn send_listing_outcome(
-    tx: &SyncSender<ListingOutcome>,
-    mut outcome: ListingOutcome,
-    epoch: &ListingEpochGuard,
-    shutdown: &std::sync::atomic::AtomicBool,
-) -> bool {
-    loop {
-        if epoch.is_stale() || shutdown.load(std::sync::atomic::Ordering::Acquire) {
-            return false;
-        }
-        match tx.try_send(outcome) {
-            Ok(()) => return true,
-            Err(TrySendError::Full(returned)) => {
-                outcome = returned;
-                std::thread::park_timeout(std::time::Duration::from_millis(2));
-            }
-            Err(TrySendError::Disconnected(_)) => return false,
-        }
-    }
-}
-
-#[cfg(test)]
-fn send_listing_chunks(
-    tx: SyncSender<ListingOutcome>,
-    ctx: &egui::Context,
-    epoch: &ListingEpochGuard,
-    token: u64,
-    path: PathBuf,
-    nodes: Vec<TreeNode>,
-) {
-    let shutdown = std::sync::atomic::AtomicBool::new(false);
-    send_listing_chunks_bounded(&tx, ctx, epoch, &shutdown, token, path, nodes);
-}
-
-fn send_listing_chunks_bounded(
-    tx: &SyncSender<ListingOutcome>,
-    ctx: &egui::Context,
-    epoch: &ListingEpochGuard,
-    shutdown: &std::sync::atomic::AtomicBool,
-    token: u64,
-    path: PathBuf,
-    nodes: Vec<TreeNode>,
-) {
-    let mut iter = nodes.into_iter().peekable();
-    if iter.peek().is_none() {
-        if epoch.is_stale() {
-            return;
-        }
-        let sent = send_listing_outcome(
-            tx,
-            ListingOutcome {
-                epoch: epoch.requested,
-                token,
-                path,
-                result: ListingResult::Chunk {
-                    nodes: Vec::new(),
-                    done: true,
-                },
-            },
-            epoch,
-            shutdown,
-        );
-        if sent {
-            ctx.request_repaint();
-        }
-        return;
-    }
-
-    while iter.peek().is_some() {
-        // 청크마다 stale 확인 — 구 epoch 결과를 unbounded 채널에 계속 밀어넣지 않는다.
-        if epoch.is_stale() {
-            return;
-        }
-        let mut chunk = Vec::with_capacity(LISTING_CHUNK_SIZE);
-        for _ in 0..LISTING_CHUNK_SIZE {
-            let Some(node) = iter.next() else {
-                break;
-            };
-            chunk.push(node);
-        }
-        let done = iter.peek().is_none();
-        // send 직전 재확인 — 확인과 send를 원자화할 수는 없어 취소 직후 stale 청크가
-        // **최대 1개** 들어갈 수 있지만(유계), 수신측 epoch/token 필터가 버린다.
-        if epoch.is_stale() {
-            return;
-        }
-        let sent = send_listing_outcome(
-            tx,
-            ListingOutcome {
-                epoch: epoch.requested,
-                token,
-                path: path.clone(),
-                result: ListingResult::Chunk { nodes: chunk, done },
-            },
-            epoch,
-            shutdown,
-        );
-        if !sent {
-            break;
-        }
-        ctx.request_repaint();
+        FileTreeMaintenanceErrorCode::InvalidSnapshot => "파일 트리 결과가 유효하지 않습니다",
+        FileTreeMaintenanceErrorCode::WatchUnavailable => "파일 감시를 시작하지 못했습니다",
+        FileTreeMaintenanceErrorCode::NativeFailure => "파일 트리를 갱신하지 못했습니다",
     }
 }
 
 #[cfg(test)]
 fn read_children(path: &Path, _root: Option<&Path>) -> std::io::Result<Vec<TreeNode>> {
-    read_children_guarded(path, _root, None)
-}
-
-fn read_children_guarded(
-    path: &Path,
-    _root: Option<&Path>,
-    guard: Option<(&ListingEpochGuard, &std::sync::atomic::AtomicBool)>,
-) -> std::io::Result<Vec<TreeNode>> {
     let mut nodes = Vec::new();
     for entry in std::fs::read_dir(path)? {
-        if guard.is_some_and(|(epoch, shutdown)| {
-            epoch.is_stale() || shutdown.load(std::sync::atomic::Ordering::Acquire)
-        }) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "listing cancelled",
-            ));
-        }
         let entry = entry?;
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
         nodes.push(TreeNode::new(
             entry.file_name().to_string_lossy().into_owned(),
             is_dir,
@@ -4749,7 +4756,25 @@ fn prepare_listing_nodes(
     nodes
 }
 
+fn tree_node_usage(nodes: &[TreeNode]) -> (usize, usize) {
+    nodes.iter().fold((0usize, 0usize), |usage, node| {
+        let child_usage = node
+            .children
+            .as_deref()
+            .map(tree_node_usage)
+            .unwrap_or((0, 0));
+        (
+            usage.0.saturating_add(1).saturating_add(child_usage.0),
+            usage
+                .1
+                .saturating_add(node.name.len())
+                .saturating_add(child_usage.1),
+        )
+    })
+}
+
 /// 정렬: 디렉터리 우선 + 이름 (단순 유니코드 순 — §3, 로케일 비교는 비목표).
+#[cfg(test)]
 fn sort_nodes(nodes: &mut [TreeNode]) {
     nodes.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
 }
@@ -4855,6 +4880,128 @@ fn reread(base: &Path, old: &[TreeNode]) -> std::io::Result<Vec<TreeNode>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maintenance_constructor는_thread_channel_watcher와_intent가_없다() {
+        let tree = FileTreeUi::new(egui::Context::default());
+        assert!(tree.maintenance_intent.is_none());
+        assert!(tree.pending_maintenance.is_none());
+        assert!(tree.pending_refresh_dirs.is_empty());
+        assert!(tree.root.is_none());
+    }
+
+    #[test]
+    fn maintenance_listing_intent는_capacity_one_상한과_redacted_debug를_강제한다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(PathBuf::from("/private/secret-workspace")));
+        let intent = tree.take_maintenance_intent().expect("lazy listing intent");
+        let debug = format!("{intent:?}");
+        assert!(!debug.contains("secret-workspace"));
+        match intent.request {
+            FileTreeMaintenanceRequest::ListDirectory {
+                root,
+                directory,
+                max_items,
+                max_bytes,
+            } => {
+                assert_eq!(root.as_path(), Path::new("/private/secret-workspace"));
+                assert_eq!(directory.as_path(), root.as_path());
+                assert_eq!(max_items, FILE_TREE_LISTING_MAX_ITEMS);
+                assert_eq!(max_bytes, FILE_TREE_LISTING_MAX_BYTES);
+            }
+            other => panic!("unexpected intent: {other:?}"),
+        }
+        assert!(tree.take_maintenance_intent().is_none());
+        assert!(tree.pending_maintenance.is_some());
+    }
+
+    #[test]
+    fn file_tree_impl과_render는_native_io_poll_timer를_만지지_않는다() {
+        let source = include_str!("file_tree.rs");
+        assert!(
+            !source.contains(concat!("cfg(", "any", "())")),
+            "비활성 legacy 구현을 production source에 보관하지 않는다"
+        );
+        let implementation = source
+            .split_once("impl FileTreeUi {")
+            .expect("FileTreeUi impl start")
+            .1
+            .split_once("fn permission_denied_button_rect(")
+            .expect("FileTreeUi impl end")
+            .0;
+        for forbidden in [
+            "std::fs::",
+            "notify::",
+            "std::thread::",
+            "std::sync::mpsc",
+            "mpsc::",
+            "channel(",
+            "sync_channel(",
+            ".try_recv(",
+            ".try_iter(",
+            ".recv(",
+            ".poll(",
+            "poll_",
+            "read_dir(",
+            ".metadata(",
+            ".canonicalize(",
+            "recommended_watcher",
+            ".watch(",
+            ".unwatch(",
+            "request_repaint_after(",
+        ] {
+            assert!(
+                !implementation.contains(forbidden),
+                "FileTreeUi impl source contains {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_intent는_capacity_one이고_stale_completion을_버린다() {
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        let request = FileTreeIoRequest::OpenPath {
+            target: FileTreePathPayload::try_new(PathBuf::from("/private/example.pdf")).unwrap(),
+            require_openable_file: true,
+        };
+        tree.queue_io(request, Vec::new(), None, None).unwrap();
+        assert_eq!(tree.in_flight, 1);
+        let intent = tree.take_io_intent().unwrap();
+        assert!(!format!("{intent:?}").contains("/private/example.pdf"));
+
+        tree.complete_io(FileTreeIoCompletion {
+            operation: intent.operation,
+            generation: intent.generation.wrapping_add(1),
+            result: Ok(()),
+        });
+        assert!(
+            tree.pending_io.is_some(),
+            "stale result removed current pending"
+        );
+        tree.complete_io(FileTreeIoCompletion {
+            operation: intent.operation,
+            generation: intent.generation,
+            result: Ok(()),
+        });
+        assert!(tree.pending_io.is_none());
+        assert_eq!(tree.in_flight, 0);
+    }
+
+    #[test]
+    fn native_path_payload는_item_byte상한과_redacted_debug를_강제한다() {
+        let payload = FileTreePathListPayload::try_new(vec![PathBuf::from("/secret/a.txt")])
+            .expect("bounded path");
+        let debug = format!("{payload:?}");
+        assert!(debug.contains("items: 1"));
+        assert!(!debug.contains("/secret/a.txt"));
+        assert!(matches!(
+            FileTreePathListPayload::try_new(vec![
+                PathBuf::from("a");
+                FILE_TREE_PATH_LIST_MAX_ITEMS + 1
+            ]),
+            Err(FileTreeIoErrorCode::PathListTooLarge)
+        ));
+    }
 
     /// App 시작 경로는 fonts::install_cjk_fallback에서 named family를 등록한다. 파일 트리
     /// 단위 harness는 그 초기화를 거치지 않으므로 기본 Proportional face를 같은 이름에
@@ -5087,71 +5234,36 @@ mod tests {
         assert_eq!(compact[0].0, "Idle");
     }
 
-    /// 안정성 감사 High #2: 워커가 stale epoch(루트 전환/refresh 후) 청크를
-    /// bounded 결과 채널에 stale 청크를 밀어넣지 않는다 — 송신 전에 중단.
     #[test]
     fn stale_epoch_청크는_송신전에_중단된다() {
-        let (tx, rx) = sync_channel(8);
-        let ctx = egui::Context::default();
-        let shared = Arc::new(std::sync::atomic::AtomicU64::new(7)); // 현재 epoch=7
-        let mk_nodes = || -> Vec<TreeNode> {
-            (0..5000)
-                .map(|i| TreeNode::new(format!("f{i}"), false))
-                .collect()
-        };
-        // 구 epoch(6)으로 전송 시도 → 아무 청크도 채널에 없어야 한다.
-        send_listing_chunks(
-            tx.clone(),
-            &ctx,
-            &ListingEpochGuard {
-                requested: 6,
-                current: Arc::clone(&shared),
-                cancel: Arc::default(),
-            },
-            1,
-            PathBuf::from("/tmp/x"),
-            mk_nodes(),
-        );
-        assert!(rx.try_recv().is_err(), "stale 청크가 채널에 들어감");
-        // 현재 epoch(7)이면 정상 전송.
-        send_listing_chunks(
-            tx,
-            &ctx,
-            &ListingEpochGuard {
-                requested: 7,
-                current: shared,
-                cancel: Arc::default(),
-            },
-            2,
-            PathBuf::from("/tmp/x"),
-            mk_nodes(),
-        );
-        assert!(rx.try_recv().is_ok(), "현재 epoch 청크가 전송돼야 함");
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.set_root(Some(PathBuf::from("/tmp/old")));
+        let stale = tree.take_maintenance_intent().expect("old intent");
+        tree.set_root(Some(PathBuf::from("/tmp/current")));
+        tree.complete_maintenance(FileTreeMaintenanceCompletion {
+            operation: stale.operation,
+            generation: stale.generation,
+            result: Ok(FileTreeMaintenanceResult::Listing(
+                FileTreeListingSnapshot::try_new(vec![
+                    FileTreeListingItem::try_new("stale.txt".to_owned(), false).unwrap(),
+                ])
+                .unwrap(),
+            )),
+        });
+        assert!(tree.children.is_none(), "stale snapshot applied");
     }
 
     /// codex High(2026-07-08): 같은 경로 재요청(reload_dir token 교체) 시 구 요청의
     /// cancel 플래그가 서면 같은 epoch이어도 송신 전에 중단된다.
     #[test]
     fn cancel_플래그는_같은_epoch에서도_송신을_중단한다() {
-        let (tx, rx) = sync_channel(8);
-        let ctx = egui::Context::default();
-        let shared = Arc::new(std::sync::atomic::AtomicU64::new(1));
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true)); // 이미 취소됨
-        send_listing_chunks(
-            tx,
-            &ctx,
-            &ListingEpochGuard {
-                requested: 1,
-                current: shared,
-                cancel,
-            },
-            1,
-            PathBuf::from("/tmp/x"),
-            (0..100)
-                .map(|i| TreeNode::new(format!("f{i}"), false))
-                .collect(),
-        );
-        assert!(rx.try_recv().is_err(), "취소된 요청의 청크가 채널에 들어감");
+        let items = (0..=FILE_TREE_LISTING_MAX_ITEMS)
+            .map(|i| FileTreeListingItem::try_new(format!("f{i}"), false).unwrap())
+            .collect();
+        assert!(matches!(
+            FileTreeListingSnapshot::try_new(items),
+            Err(FileTreeMaintenanceErrorCode::ListingTooLarge)
+        ));
     }
 
     fn dir(name: &str) -> TreeNode {
@@ -5252,28 +5364,37 @@ mod tests {
     }
 
     fn drain_listings(tree: &mut FileTreeUi) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        loop {
-            tree.pump_listings();
-            if tree.pending_listings.is_empty() {
-                tree.pump_listings();
+        for _ in 0..=FILE_TREE_REFRESH_BACKLOG_CAP + 2 {
+            let Some(intent) = tree.take_maintenance_intent() else {
+                assert!(tree.pending_maintenance.is_none());
                 return;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for async file-tree listing"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            };
+            let result = match intent.request {
+                FileTreeMaintenanceRequest::ListDirectory { directory, .. } => {
+                    let items = read_children(directory.as_path(), None)
+                        .unwrap()
+                        .into_iter()
+                        .map(|node| FileTreeListingItem::try_new(node.name, node.is_dir).unwrap())
+                        .collect();
+                    Ok(FileTreeMaintenanceResult::Listing(
+                        FileTreeListingSnapshot::try_new(items).unwrap(),
+                    ))
+                }
+                FileTreeMaintenanceRequest::ReplaceWatchSet(_) => {
+                    Ok(FileTreeMaintenanceResult::WatchSetApplied)
+                }
+            };
+            tree.complete_maintenance(FileTreeMaintenanceCompletion {
+                operation: intent.operation,
+                generation: intent.generation,
+                result,
+            });
         }
+        panic!("bounded maintenance did not quiesce");
     }
 
-    fn pump_listings_for(tree: &mut FileTreeUi, duration: std::time::Duration) {
-        let deadline = std::time::Instant::now() + duration;
-        while std::time::Instant::now() < deadline {
-            tree.pump_listings();
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        tree.pump_listings();
+    fn pump_listings_for(tree: &mut FileTreeUi, _duration: std::time::Duration) {
+        drain_listings(tree);
     }
 
     #[test]
@@ -5717,13 +5838,20 @@ mod tests {
 
         let mut tree = FileTreeUi::new(egui::Context::default());
         tree.set_root(Some(root_a.clone()));
-        assert!(
-            tree.pending_listings.contains_key(&root_a),
-            "set_root은 read_dir 완료를 기다리지 않고 listing 요청만 등록한다"
-        );
+        let stale = tree.take_maintenance_intent().expect("root-a intent");
         assert!(tree.children.is_none());
 
         tree.set_root(Some(root_b.clone()));
+        tree.complete_maintenance(FileTreeMaintenanceCompletion {
+            operation: stale.operation,
+            generation: stale.generation,
+            result: Ok(FileTreeMaintenanceResult::Listing(
+                FileTreeListingSnapshot::try_new(vec![
+                    FileTreeListingItem::try_new("a.txt".to_owned(), false).unwrap(),
+                ])
+                .unwrap(),
+            )),
+        });
         drain_listings(&mut tree);
         pump_listings_for(&mut tree, std::time::Duration::from_millis(100));
 
@@ -5775,11 +5903,7 @@ mod tests {
         let mut tree = FileTreeUi::new(egui::Context::default());
         let denied = PathBuf::from("/permission-denied-fixture");
         tree.root = Some(denied.clone());
-        tree.apply_listing_error(
-            &denied,
-            "operation not permitted".to_owned(),
-            std::io::ErrorKind::PermissionDenied,
-        );
+        tree.apply_maintenance_error(&denied, FileTreeMaintenanceErrorCode::PermissionDenied);
         assert_eq!(
             tree.root_error,
             Some(RootListingError::PermissionDenied),
@@ -5846,12 +5970,20 @@ mod tests {
         drain_listings(&mut tree);
 
         tree.toggle_dir(&base.join("d"));
-        assert!(tree.pending_listings.contains_key(&base.join("d")));
+        let stale = tree
+            .take_maintenance_intent()
+            .expect("child listing intent");
         tree.toggle_dir(&base.join("d"));
-        assert!(
-            !tree.pending_listings.contains_key(&base.join("d")),
-            "collapse는 in-flight dir listing token을 무효화한다"
-        );
+        tree.complete_maintenance(FileTreeMaintenanceCompletion {
+            operation: stale.operation,
+            generation: stale.generation,
+            result: Ok(FileTreeMaintenanceResult::Listing(
+                FileTreeListingSnapshot::try_new(vec![
+                    FileTreeListingItem::try_new("child.txt".to_owned(), false).unwrap(),
+                ])
+                .unwrap(),
+            )),
+        });
 
         pump_listings_for(&mut tree, std::time::Duration::from_millis(100));
         let d = tree.flat.iter().find(|row| row.name == "d").unwrap();
@@ -5909,35 +6041,21 @@ mod tests {
         tree.toggle_dir(&base.join("d"));
         drain_listings(&mut tree);
 
-        // 실제 OS 워처 대신 채널을 주입해 스로틀 로직만 검증한다
-        let (tx, rx) = std::sync::mpsc::channel();
-        tree.watch_rx = Some(rx);
         std::fs::write(base.join("d/a.txt"), b"a").unwrap();
-        tx.send(WatchEvent::DirtyDir(base.join("d"))).unwrap();
-        tx.send(WatchEvent::DirtyDir(base.join("d"))).unwrap(); // 폭주 중 중복 이벤트
-
-        // 창 안 (방금 재나열한 상태): 흡수만 — 재나열 없음, dedup 확인
-        tree.last_watch_reload = std::time::Instant::now();
-        let ctx = egui::Context::default();
-        tree.pump_watch_events(&ctx);
-        assert!(
-            !tree.flat.iter().any(|r| r.name == "a.txt"),
-            "창 내에는 재나열하지 않는다"
+        let event = || {
+            FileTreeWatchEvent::try_new(FileTreeWatchEventKind::DirtyDirectory, base.join("d"))
+                .unwrap()
+        };
+        tree.apply_watch_snapshot(
+            FileTreeWatchSnapshot::try_new(
+                tree.maintenance_generation,
+                1,
+                false,
+                vec![event(), event()],
+            )
+            .unwrap(),
         );
-        assert_eq!(tree.pending_watch.len(), 1, "pending은 dedup 집합");
-
-        // 창 내 반복 호출(프레임 폭주 시뮬레이션)에도 여전히 재나열 없음
-        tx.send(WatchEvent::DirtyDir(base.join("d"))).unwrap();
-        tree.pump_watch_events(&ctx);
         assert!(!tree.flat.iter().any(|r| r.name == "a.txt"));
-
-        // 창 경과 → 재나열 요청 1회, pending 소진. 실제 read_dir 적용은 async.
-        tree.last_watch_reload = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_millis(WATCH_TEST_ELAPSED_MS))
-            .expect("테스트 프로세스 기동 후라 언더플로 없음");
-        tree.pump_watch_events(&ctx);
-        assert!(!tree.flat.iter().any(|r| r.name == "a.txt"));
-        assert!(tree.pending_watch.is_empty());
         drain_listings(&mut tree);
         assert!(
             tree.flat.iter().any(|r| r.name == "a.txt"),
@@ -5945,9 +6063,6 @@ mod tests {
         );
         std::fs::remove_dir_all(&base).unwrap();
     }
-
-    /// 스로틀 창(300ms)보다 확실히 큰 경과값.
-    const WATCH_TEST_ELAPSED_MS: u64 = FileTreeUi::WATCH_RELOAD_MS + 50;
 
     #[test]
     fn 접힘_상태에서도_panel이_채널을_소비한다() {
@@ -5957,25 +6072,24 @@ mod tests {
         drain_listings(&mut tree);
         tree.collapsed = true;
 
-        // 워처 채널 주입 + 새 파일 이벤트 (창 경과 상태)
-        let (tx, rx) = std::sync::mpsc::channel();
-        tree.watch_rx = Some(rx);
         std::fs::write(base.join("new.txt"), b"n").unwrap();
-        tx.send(WatchEvent::DirtyDir(base.clone())).unwrap();
-        tree.last_watch_reload = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_millis(WATCH_TEST_ELAPSED_MS))
-            .unwrap();
-        // 백그라운드 op 결과도 대기 중 (완료 미처리 = in_flight/에러 방치 버그 검증)
-        tree.in_flight = 1;
-        tree.ops_tx
-            .send(OpOutcome {
-                refresh: Vec::new(),
-                error: Some("op 에러".to_owned()),
-                confirm_delete: None,
-            })
-            .unwrap();
-
-        // 접힘 상태로 panel 호출 — 렌더는 생략돼도 채널은 소비돼야 한다 (codex Med-2)
+        tree.apply_watch_snapshot(
+            FileTreeWatchSnapshot::try_new(
+                tree.maintenance_generation,
+                1,
+                false,
+                vec![
+                    FileTreeWatchEvent::try_new(
+                        FileTreeWatchEventKind::DirtyDirectory,
+                        base.clone(),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap(),
+        );
+        assert!(tree.maintenance_intent.is_some());
+        // 접힘 render는 host intent를 실행/소비하지 않는다.
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let sidebar = SidebarSnapshot {
             active_workspace_id: "default",
@@ -5995,15 +6109,14 @@ mod tests {
                 );
             });
         });
+        assert!(tree.maintenance_intent.is_some());
         drain_listings(&mut tree);
 
         assert!(
             tree.flat.iter().any(|r| r.name == "new.txt"),
             "접힘 중에도 워처 이벤트가 반영된다"
         );
-        assert!(tree.pending_watch.is_empty(), "채널 백로그 없음");
-        assert_eq!(tree.in_flight, 0, "op 완료가 처리된다");
-        assert_eq!(tree.error.as_deref(), Some("op 에러"));
+        assert_eq!(tree.in_flight, 0);
         std::fs::remove_dir_all(&base).unwrap();
     }
 
@@ -6148,15 +6261,21 @@ mod tests {
         tree.set_root(Some(base.clone()));
         drain_listings(&mut tree);
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        tree.watch_rx = Some(rx);
-        for event in watch_events_for_path(&base, &env, false, &[]) {
-            tx.send(event).unwrap();
-        }
-        tree.last_watch_reload = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_millis(WATCH_TEST_ELAPSED_MS))
-            .unwrap();
-        tree.pump_watch_events(&egui::Context::default());
+        tree.apply_watch_snapshot(
+            FileTreeWatchSnapshot::try_new(
+                tree.maintenance_generation,
+                1,
+                false,
+                vec![
+                    FileTreeWatchEvent::try_new(
+                        FileTreeWatchEventKind::EnvFileChanged,
+                        env.clone(),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap(),
+        );
 
         assert_eq!(tree.take_env_warning_candidates(), vec![env]);
         assert!(tree.take_env_warning_candidates().is_empty());
@@ -6165,24 +6284,19 @@ mod tests {
 
     #[test]
     fn watcher_dirty_dir_batch는_한_프레임_invalidation을_제한한다() {
-        let mut tree = FileTreeUi::new(egui::Context::default());
-        let (tx, rx) = std::sync::mpsc::channel();
-        tree.watch_rx = Some(rx);
-        let total = FileTreeUi::WATCH_RELOAD_DIRS_PER_BATCH + 3;
-        for i in 0..total {
-            tx.send(WatchEvent::DirtyDir(PathBuf::from(format!("dir-{i:02}"))))
-                .unwrap();
-        }
-
-        tree.last_watch_reload = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_millis(WATCH_TEST_ELAPSED_MS))
-            .unwrap();
-        tree.pump_watch_events(&egui::Context::default());
-
-        assert_eq!(
-            tree.pending_watch.len(),
-            total - FileTreeUi::WATCH_RELOAD_DIRS_PER_BATCH
-        );
+        let events = (0..=FILE_TREE_WATCH_MAX_EVENTS)
+            .map(|i| {
+                FileTreeWatchEvent::try_new(
+                    FileTreeWatchEventKind::DirtyDirectory,
+                    PathBuf::from(format!("/workspace/dir-{i:02}")),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert!(matches!(
+            FileTreeWatchSnapshot::try_new(1, 1, false, events),
+            Err(FileTreeMaintenanceErrorCode::WatchPlanTooLarge)
+        ));
     }
 
     #[test]
@@ -6343,6 +6457,7 @@ mod tests {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let mut tree = FileTreeUi::new(egui::Context::default());
         tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
         let workspaces: Vec<SidebarWorkspaceEntry> = (0..5)
             .map(|i| SidebarWorkspaceEntry {
                 id: format!("ws-{i}"),
@@ -6425,6 +6540,7 @@ mod tests {
         harness.get_by_label("alpha").click();
         harness.step();
         report("펼침클릭", harness.output());
+        drain_listings(&mut harness.state_mut().0);
         for _ in 0..30 {
             harness.step();
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -6586,6 +6702,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         harness.state_mut().tree.set_root(Some(root.clone()));
+        drain_listings(&mut harness.state_mut().tree);
         harness.run();
         harness.get_by_label("Session A");
         harness.get_by_label("Session B");
@@ -6637,6 +6754,7 @@ mod tests {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let mut tree = FileTreeUi::new(egui::Context::default());
         tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
         let workspaces: Vec<SidebarWorkspaceEntry> = (0..13)
             .map(|i| SidebarWorkspaceEntry {
                 id: format!("ws-{i}"),
@@ -6693,9 +6811,7 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
-    /// 파일 행 더블클릭 → 연결 프로그램 열기(OpenExternal) 회귀 (2026-07-18).
-    /// 실제 open 실행은 App 쪽 처리라 여기서는 반환 액션만 검증한다 — 허용
-    /// 확장자(pdf)는 액션을 내고, 실행 위험군(sh)은 아무것도 내지 않는다.
+    /// 파일 행 더블클릭은 native open을 실행하지 않고 host intent만 생성한다.
     #[test]
     fn kittest_파일_더블클릭은_외부_열기_액션을_낸다() {
         use egui_kittest::kittest::Queryable;
@@ -6710,6 +6826,7 @@ mod tests {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let mut tree = FileTreeUi::new(egui::Context::default());
         tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
         // step_dt를 더블클릭 판정 한계(0.3s) 아래로 — 클릭 2번이 한 스텝 간격으로 온다.
         let mut fonts_ready = false;
         let mut harness = egui_kittest::Harness::builder()
@@ -6748,27 +6865,49 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        // 실행 위험군(.sh) 더블클릭 — 아무 액션도 내지 않는다.
+        // 실행 위험군 판정도 host의 realpath/metadata 검증 몫이다.
         harness.get_by_label("run.sh").click();
         harness.step();
         harness.get_by_label("run.sh").click();
         harness.step();
-        assert!(harness.state().1.is_empty(), "sh 더블클릭이 액션을 냄");
+        let first = harness.state_mut().0.take_io_intent().expect("open intent");
+        let (operation, generation) = (first.operation, first.generation);
+        match first.request {
+            FileTreeIoRequest::OpenPath {
+                target,
+                require_openable_file,
+            } => {
+                assert!(require_openable_file);
+                assert_eq!(target.as_path(), base.join("run.sh"));
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+        harness.state_mut().0.complete_io(FileTreeIoCompletion {
+            operation,
+            generation,
+            result: Err(FileTreeIoErrorCode::NativeFailure),
+        });
         // 시뮬레이션 시간 경과 — 직전 클릭 연쇄를 끊는다 (egui triple 판정 창 0.6s는
         // 마지막 클릭과의 거리만 보므로, 붙여서 클릭하면 pdf 2번째가 triple로 잡힌다).
         for _ in 0..15 {
             harness.step();
         }
-        // 허용 확장자(.pdf) 더블클릭 → OpenExternal(경로).
+        // pdf도 동일하게 bounded/redacted open intent를 낸다.
         harness.get_by_label("a.pdf").click();
         harness.step();
         harness.get_by_label("a.pdf").click();
         harness.step();
-        let opened = harness.state().1.iter().find_map(|a| match a {
-            SidebarAction::OpenExternal(p) => Some(p.clone()),
-            _ => None,
-        });
-        assert_eq!(opened.as_deref(), Some(base.join("a.pdf").as_path()));
+        let second = harness
+            .state_mut()
+            .0
+            .take_io_intent()
+            .expect("second open intent");
+        match second.request {
+            FileTreeIoRequest::OpenPath { target, .. } => {
+                assert_eq!(target.as_path(), base.join("a.pdf"));
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
         std::fs::remove_dir_all(&base).unwrap();
     }
 
@@ -7241,21 +7380,7 @@ mod tests {
             )
     }
 
-    fn wait_for_path(
-        harness: &mut egui_kittest::Harness<'_, (FileTreeUi, Vec<SidebarAction>)>,
-        path: &Path,
-    ) {
-        for _ in 0..200 {
-            harness.step();
-            if path.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    }
-
-    /// Finder → 트리 OS 드롭(§과제①): 포인터 밑 **폴더 행**으로 복사된다. 실제 fs는
-    /// temp dir, 복사는 백그라운드 op — 완료를 폴링한다.
+    /// Finder → 트리 OS 드롭은 포인터 밑 폴더를 대상으로 bounded host intent를 낸다.
     #[test]
     fn kittest_finder_드롭은_포인터_밑_폴더로_복사한다() {
         use egui_kittest::kittest::Queryable;
@@ -7269,6 +7394,7 @@ mod tests {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let mut tree = FileTreeUi::new(egui::Context::default());
         tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
         let mut harness = drop_harness(&catalog, tree);
         for _ in 0..200 {
             harness.step();
@@ -7288,13 +7414,18 @@ mod tests {
             path: Some(src.clone()),
             ..Default::default()
         });
-        let copied = base.join("dropdir").join("payload.txt");
-        wait_for_path(&mut harness, &copied);
-        assert_eq!(
-            std::fs::read(&copied).unwrap(),
-            b"drop",
-            "폴더 행으로 복사돼야 한다"
-        );
+        harness.step();
+        let intent = harness.state_mut().0.take_io_intent().expect("copy intent");
+        match intent.request {
+            FileTreeIoRequest::CopyInto {
+                sources,
+                destination,
+            } => {
+                assert_eq!(sources.into_paths(), vec![src.clone()]);
+                assert_eq!(destination.as_path(), base.join("dropdir"));
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
         assert!(src.exists(), "드롭은 원본을 보존해야 한다(복사)");
         assert!(
             harness.state().0.error.is_none(),
@@ -7313,13 +7444,10 @@ mod tests {
         let base = temp_root("paste-root");
         let base = base.canonicalize().unwrap();
         std::fs::write(base.join("seed.txt"), b"x").unwrap();
-        let src_home = temp_root("paste-src");
-        let src = src_home.join("payload2.txt");
-        std::fs::write(&src, b"paste").unwrap();
-
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let mut tree = FileTreeUi::new(egui::Context::default());
         tree.set_root(Some(base.clone()));
+        drain_listings(&mut tree);
         let mut harness = drop_harness(&catalog, tree);
         for _ in 0..200 {
             harness.step();
@@ -7329,7 +7457,6 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         // 행 아래 빈 트리 영역에 포인터 — 대상 행이 없으니 루트로 복사돼야 한다.
-        TEST_CLIPBOARD_FILES.with(|cell| *cell.borrow_mut() = Some(vec![src.clone()]));
         harness
             .input_mut()
             .events
@@ -7338,14 +7465,18 @@ mod tests {
             .input_mut()
             .events
             .push(egui::Event::Paste(String::new()));
-        let copied = base.join("payload2.txt");
-        wait_for_path(&mut harness, &copied);
-        assert_eq!(
-            std::fs::read(&copied).unwrap(),
-            b"paste",
-            "루트로 복사돼야 한다"
-        );
-        assert!(src.exists(), "붙여넣기는 원본을 보존해야 한다(복사)");
+        harness.step();
+        let intent = harness
+            .state_mut()
+            .0
+            .take_io_intent()
+            .expect("paste intent");
+        match intent.request {
+            FileTreeIoRequest::PasteFromClipboard { destination } => {
+                assert_eq!(destination.as_path(), base.as_path());
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
         let (paste_consumed, copy_consumed) =
             harness.state_mut().0.take_clipboard_shortcut_consumption();
         assert!(paste_consumed, "트리가 ⌘V 소비를 App에 알려야 한다");
@@ -7356,6 +7487,5 @@ mod tests {
             harness.state().0.error
         );
         std::fs::remove_dir_all(&base).unwrap();
-        std::fs::remove_dir_all(&src_home).unwrap();
     }
 }

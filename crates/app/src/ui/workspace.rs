@@ -2,9 +2,9 @@
 //! Runtime Boundary(2장) 준수 — 명령 전송/이벤트 수신/스냅샷 렌더만.
 //! mux 배치는 MuxUpdated 스냅샷이 유일한 근거, active tab visible pane만 live render (14.4).
 
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use runtime::{
     LayoutNode, MuxSnapshot, RuntimeClient, RuntimeCommand, RuntimeEvent, SessionId, SessionStatus,
@@ -15,8 +15,14 @@ use terminal::{TerminalViewportSnapshot, input_mapper, renderer_egui};
 use super::format_bytes;
 use crate::config::TerminalConfig;
 
-/// 경로 해석 캐시 TTL (path_click_cache · session_cwd_cache 공통).
+/// 경로 해석 캐시 TTL. 실제 filesystem/process 조회는 App host가 수행한다.
 const PATH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+const WORKSPACE_IO_QUEUE_CAP: usize = 1;
+const WORKSPACE_PATH_MAX_BYTES: usize = 32 * 1024;
+const WORKSPACE_URL_MAX_BYTES: usize = 32 * 1024;
+const TERMINAL_CLIPBOARD_PATH_MAX_ITEMS: usize = 16;
+const TERMINAL_CLIPBOARD_PATH_MAX_BYTES: usize = 256 * 1024;
+const TERMINAL_CLIPBOARD_TEXT_MAX_BYTES: usize = 1024 * 1024;
 
 // 각 split leaf가 독립 터미널이 되는 패널형 구조. 헤더는 한 줄로 얇게 유지하고
 // PTY는 외곽 카드 여백 없이 패널 면을 채운다.
@@ -212,16 +218,6 @@ fn paint_terminal_toolbar_icon(
     }
 }
 
-/// 세션 셸 cwd 캐시 항목 — hover 경로 해석용. lsof(수십 ms)는 백그라운드 스레드가
-/// 채우고 UI 스레드는 stale 값(있으면)으로 즉시 응답한다.
-struct CwdCacheEntry {
-    cwd: Option<std::path::PathBuf>,
-    fetched_at: std::time::Instant,
-    /// 백그라운드 재해석 진행 중 — 중복 spawn을 막는다. lsof는 항상 종료하므로
-    /// 완료 기록이 반드시 이 플래그를 내린다.
-    inflight: bool,
-}
-
 pub struct WorkspaceUi {
     mux: Option<Arc<MuxSnapshot>>,
     sessions: HashMap<SessionId, SessionView>,
@@ -250,11 +246,12 @@ pub struct WorkspaceUi {
     /// 경로 해석 캐시: (세션, 단어) → 해석 결과. hover가 매 프레임 도는 경로라
     /// 같은 단어의 재해석(metadata/lsof)을 막는다. TTL PATH_CACHE_TTL.
     path_click_cache: Option<(SessionId, String, Option<PathClick>, std::time::Instant)>,
-    /// 세션별 셸 cwd 캐시 — lsof는 수십 ms라 UI 스레드에서 돌리면 hover 중 프레임이
-    /// 멈춘다. 만료 시 백그라운드 스레드가 재해석하고 그동안 stale 값을 쓴다
-    /// (stale-while-revalidate). 세션별 항목이라 분할 pane 간 hover 이동이 서로
-    /// 캐시를 밀어내지 않는다. 우리가 cd를 보낼 때 해당 세션 항목을 즉시 무효화.
-    session_cwd_cache: Arc<Mutex<HashMap<SessionId, CwdCacheEntry>>>,
+    /// UI leaf는 native I/O를 실행하지 않는다. 한 프레임은 bounded intent만 만들고
+    /// App host가 완료를 돌려준다. generation은 cwd/root가 바뀐 뒤의 늦은 결과를 막는다.
+    io_generation: u64,
+    next_io_operation: u64,
+    io_intents: VecDeque<WorkspaceIoIntent>,
+    pending_path_resolution: Option<PendingPathResolution>,
     /// 직전 폴더 클릭 (경로, 시각) — 더블클릭이 clicked를 두 번 발화시켜 같은 cd가
     /// 연속 주입되는 것을 막는다.
     last_dir_click: Option<(std::path::PathBuf, std::time::Instant)>,
@@ -323,9 +320,9 @@ pub struct WorkspaceUi {
     session_name_style: crate::config::SessionNameStyle,
     /// 세션별 에이전트 표시정보(model/effort/context — App이 병합해 set) — 3줄 행 2/3행.
     agent_info: std::collections::HashMap<SessionId, crate::agent_detect::AgentDisplay>,
-    /// 진행 중인 백그라운드 클립보드 paste(이미지 PNG 인코딩을 UI 밖으로 — 2026-07-07).
-    /// show()가 매 프레임 폴링해 완료 시 해당 세션에 삽입한다. 새 ⌘V는 이전 것을 대체.
-    paste_task: Option<PendingPaste>,
+    /// App host가 수행 중인 terminal clipboard 요청. completion은 operation/generation을
+    /// 모두 맞춘 뒤 정확히 한 번만 적용한다. 새 요청은 이전 요청을 stale로 만든다.
+    pending_paste: Option<PendingPaste>,
     error: Option<String>,
     /// 현재 error 배너가 input backpressure 경고인지 — 해소 이벤트(queued=0)가
     /// 무관한 오류(spawn 실패 등)를 지우지 않게 구분한다(codex 2026-07-09).
@@ -379,9 +376,236 @@ struct TerminalSearch {
     scroll_to_current: bool,
 }
 
-/// 백그라운드 paste 1건의 컨텍스트 — 요청 시점의 세션/모드를 캡처해 완료 시 그대로 쓴다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkspaceIoOperation(u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspacePathKind {
+    Directory,
+    OpenableFile,
+}
+
+/// Native host 경계를 지나는 경로. raw path는 Debug에 절대 노출하지 않고, 생성 시
+/// NUL/byte 상한을 검증한다. Clone/Serialize를 구현하지 않는다.
+pub struct WorkspacePathPayload {
+    path: PathBuf,
+    bytes: usize,
+}
+
+impl WorkspacePathPayload {
+    pub fn try_new(path: PathBuf) -> Result<Self, WorkspaceIoErrorCode> {
+        let display = path.to_string_lossy();
+        if display.as_bytes().contains(&0) {
+            return Err(WorkspaceIoErrorCode::InvalidPath);
+        }
+        let bytes = display.len();
+        if bytes == 0 || bytes > WORKSPACE_PATH_MAX_BYTES {
+            return Err(WorkspaceIoErrorCode::PathTooLarge);
+        }
+        Ok(Self { path, bytes })
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn into_path(self) -> PathBuf {
+        self.path
+    }
+}
+
+impl std::fmt::Debug for WorkspacePathPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkspacePathPayload")
+            .field("path", &"REDACTED")
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+/// Raw URL은 진단에 남기지 않는다. 터미널 링크는 http/https만 허용한다.
+pub struct WorkspaceUrlPayload {
+    url: String,
+    bytes: usize,
+}
+
+impl WorkspaceUrlPayload {
+    pub fn try_new(url: String) -> Result<Self, WorkspaceIoErrorCode> {
+        let bytes = url.len();
+        if bytes == 0 || bytes > WORKSPACE_URL_MAX_BYTES {
+            return Err(WorkspaceIoErrorCode::UrlTooLarge);
+        }
+        if url
+            .as_bytes()
+            .iter()
+            .any(|byte| matches!(byte, 0 | b'\r' | b'\n'))
+            || !(url.starts_with("https://") || url.starts_with("http://"))
+        {
+            return Err(WorkspaceIoErrorCode::InvalidUrl);
+        }
+        Ok(Self { url, bytes })
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.url
+    }
+}
+
+impl std::fmt::Debug for WorkspaceUrlPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkspaceUrlPayload")
+            .field("url", &"REDACTED")
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+pub enum WorkspaceIoIntent {
+    ResolvePath {
+        operation: WorkspaceIoOperation,
+        generation: u64,
+        session: SessionId,
+        pid: Option<u32>,
+        cwd: Option<WorkspacePathPayload>,
+        word: String,
+    },
+    ReadTerminalClipboard {
+        operation: WorkspaceIoOperation,
+        generation: u64,
+    },
+    OpenPath(WorkspacePathPayload),
+    OpenUrl(WorkspaceUrlPayload),
+}
+
+impl std::fmt::Debug for WorkspaceIoIntent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ResolvePath {
+                operation,
+                generation,
+                session,
+                pid,
+                cwd,
+                word,
+            } => f
+                .debug_struct("ResolvePath")
+                .field("operation", operation)
+                .field("generation", generation)
+                .field("session", session)
+                .field("pid", pid)
+                .field("cwd", cwd)
+                .field("word_bytes", &word.len())
+                .finish(),
+            Self::ReadTerminalClipboard {
+                operation,
+                generation,
+            } => f
+                .debug_struct("ReadTerminalClipboard")
+                .field("operation", operation)
+                .field("generation", generation)
+                .finish(),
+            Self::OpenPath(path) => f.debug_tuple("OpenPath").field(path).finish(),
+            Self::OpenUrl(url) => f.debug_tuple("OpenUrl").field(url).finish(),
+        }
+    }
+}
+
+pub struct WorkspacePathResolution {
+    pub kind: WorkspacePathKind,
+    pub path: WorkspacePathPayload,
+}
+
+/// Clipboard native 결과. 경로/텍스트는 생성 시 함께 상한을 검증하며 Debug는 내용 대신
+/// 계수만 노출한다. Clone/Serialize하지 않는다.
+pub struct TerminalClipboardPayload {
+    paths: Vec<PathBuf>,
+    text: Option<String>,
+    path_bytes: usize,
+}
+
+impl TerminalClipboardPayload {
+    pub fn try_new(
+        paths: Vec<PathBuf>,
+        text: Option<String>,
+    ) -> Result<Self, WorkspaceIoErrorCode> {
+        if paths.len() > TERMINAL_CLIPBOARD_PATH_MAX_ITEMS {
+            return Err(WorkspaceIoErrorCode::ClipboardTooLarge);
+        }
+        let mut path_bytes = 0usize;
+        for path in &paths {
+            let display = path.to_string_lossy();
+            if display.as_bytes().contains(&0) || display.len() > WORKSPACE_PATH_MAX_BYTES {
+                return Err(WorkspaceIoErrorCode::InvalidPath);
+            }
+            path_bytes = path_bytes
+                .checked_add(display.len())
+                .ok_or(WorkspaceIoErrorCode::ClipboardTooLarge)?;
+            if path_bytes > TERMINAL_CLIPBOARD_PATH_MAX_BYTES {
+                return Err(WorkspaceIoErrorCode::ClipboardTooLarge);
+            }
+        }
+        if text.as_ref().is_some_and(|value| {
+            value.as_bytes().contains(&0) || value.len() > TERMINAL_CLIPBOARD_TEXT_MAX_BYTES
+        }) {
+            return Err(WorkspaceIoErrorCode::ClipboardTooLarge);
+        }
+        Ok(Self {
+            paths,
+            text,
+            path_bytes,
+        })
+    }
+
+    fn into_parts(self) -> (Vec<PathBuf>, Option<String>) {
+        (self.paths, self.text)
+    }
+}
+
+impl std::fmt::Debug for TerminalClipboardPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalClipboardPayload")
+            .field("paths", &self.paths.len())
+            .field("path_bytes", &self.path_bytes)
+            .field("text_bytes", &self.text.as_ref().map_or(0, String::len))
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceIoErrorCode {
+    Busy,
+    InvalidPath,
+    PathTooLarge,
+    InvalidUrl,
+    UrlTooLarge,
+    ClipboardTooLarge,
+    NativeFailure,
+}
+
+pub enum WorkspaceIoCompletion {
+    PathResolved {
+        operation: WorkspaceIoOperation,
+        generation: u64,
+        result: Option<WorkspacePathResolution>,
+    },
+    TerminalClipboardRead {
+        operation: WorkspaceIoOperation,
+        generation: u64,
+        result: Result<TerminalClipboardPayload, WorkspaceIoErrorCode>,
+    },
+}
+
+struct PendingPathResolution {
+    operation: WorkspaceIoOperation,
+    generation: u64,
+    session: SessionId,
+    word: String,
+}
+
+/// App host paste 1건의 컨텍스트 — 요청 시점 세션/모드를 캡처해 완료 시 그대로 쓴다.
 struct PendingPaste {
-    rx: std::sync::mpsc::Receiver<anyhow::Result<Option<Vec<std::path::PathBuf>>>>,
+    operation: WorkspaceIoOperation,
+    generation: u64,
     session: SessionId,
     bracketed: bool,
     shell_kind: crate::ui::file_tree::ShellKind,
@@ -392,7 +616,7 @@ struct PendingPaste {
     requested_at: std::time::Instant,
 }
 
-/// 백그라운드 paste 결과의 수명 — 이보다 오래된 완료는 버린다.
+/// App host paste 결과의 수명 — 이보다 오래된 완료는 버린다.
 const PASTE_TASK_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 세션별 화면 캐시. hidden tab 세션의 스냅샷은 `MuxUpdated`에서 버린다.
@@ -450,7 +674,10 @@ impl WorkspaceUi {
             ui_scale: 1.0,
             session_pids: HashMap::new(),
             path_click_cache: None,
-            session_cwd_cache: Arc::new(Mutex::new(HashMap::new())),
+            io_generation: 1,
+            next_io_operation: 1,
+            io_intents: VecDeque::with_capacity(WORKSPACE_IO_QUEUE_CAP),
+            pending_path_resolution: None,
             last_dir_click: None,
             last_url_click: None,
             last_text_paste: None,
@@ -458,7 +685,7 @@ impl WorkspaceUi {
             session_cwds: std::collections::HashMap::new(),
             session_name_style: crate::config::SessionNameStyle::default(),
             agent_info: std::collections::HashMap::new(),
-            paste_task: None,
+            pending_paste: None,
             error: None,
             error_is_pressure: false,
             search: None,
@@ -484,6 +711,169 @@ impl WorkspaceUi {
     /// 단계 판정용 (B1). 세션이 없으면 false.
     pub fn any_snapshot(&self) -> bool {
         self.sessions.values().any(|view| view.snapshot.is_some())
+    }
+
+    fn next_io_operation(&mut self) -> WorkspaceIoOperation {
+        let operation = WorkspaceIoOperation(self.next_io_operation);
+        self.next_io_operation = self.next_io_operation.wrapping_add(1).max(1);
+        operation
+    }
+
+    fn queue_io_intent(&mut self, intent: WorkspaceIoIntent) -> Result<(), WorkspaceIoErrorCode> {
+        if self.io_intents.len() >= WORKSPACE_IO_QUEUE_CAP {
+            return Err(WorkspaceIoErrorCode::Busy);
+        }
+        self.io_intents.push_back(intent);
+        Ok(())
+    }
+
+    /// App host가 실행할 다음 native I/O intent. 큐는 최대 8개이며 render는 이 API로
+    /// 실행 권한만 넘긴다. 큐가 비면 idle thread/network/polling이 생기지 않는다.
+    pub fn take_io_intent(&mut self) -> Option<WorkspaceIoIntent> {
+        self.io_intents.pop_front()
+    }
+
+    /// App host 결과를 적용한다. operation/generation이 현재 pending과 정확히 일치하지
+    /// 않으면 늦은 결과로 간주해 버린다.
+    pub fn complete_io(&mut self, completion: WorkspaceIoCompletion, client: &dyn RuntimeClient) {
+        match completion {
+            WorkspaceIoCompletion::PathResolved {
+                operation,
+                generation,
+                result,
+            } => {
+                let Some(pending) = self.pending_path_resolution.as_ref() else {
+                    return;
+                };
+                if pending.operation != operation
+                    || pending.generation != generation
+                    || generation != self.io_generation
+                {
+                    return;
+                }
+                let pending = self
+                    .pending_path_resolution
+                    .take()
+                    .expect("exact pending checked");
+                let result = result.map(|resolved| match resolved.kind {
+                    WorkspacePathKind::Directory => PathClick::Dir(resolved.path.into_path()),
+                    WorkspacePathKind::OpenableFile => {
+                        PathClick::OpenFile(resolved.path.into_path())
+                    }
+                });
+                self.path_click_cache = Some((
+                    pending.session,
+                    pending.word,
+                    result,
+                    std::time::Instant::now(),
+                ));
+            }
+            WorkspaceIoCompletion::TerminalClipboardRead {
+                operation,
+                generation,
+                result,
+            } => {
+                let Some(pending) = self.pending_paste.as_ref() else {
+                    return;
+                };
+                if pending.operation != operation
+                    || pending.generation != generation
+                    || generation != self.io_generation
+                    || pending.requested_at.elapsed() > PASTE_TASK_TTL
+                {
+                    return;
+                }
+                let pending = self.pending_paste.take().expect("exact pending checked");
+                let payload = match result {
+                    Ok(payload) => payload,
+                    Err(code) => {
+                        self.error_is_pressure = false;
+                        self.error = Some(format!("terminal clipboard operation failed: {code:?}"));
+                        return;
+                    }
+                };
+                let (paths, text) = payload.into_parts();
+                let text = text
+                    .map(|value| terminal_text_paste_bytes(&value, pending.bracketed))
+                    .or(pending.text_fallback);
+                let bytes = clipboard_terminal_paste_bytes(
+                    (!paths.is_empty()).then_some(paths.as_slice()),
+                    text,
+                    pending.shell_kind,
+                    pending.bracketed,
+                );
+                if let Some(bytes) = bytes {
+                    self.send(
+                        client,
+                        RuntimeCommand::WriteInput {
+                            session: pending.session,
+                            bytes,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    fn request_terminal_clipboard(
+        &mut self,
+        session: SessionId,
+        bracketed: bool,
+        shell_kind: crate::ui::file_tree::ShellKind,
+        text_fallback: Option<Vec<u8>>,
+    ) {
+        if text_fallback
+            .as_ref()
+            .is_some_and(|text| text.len() > TERMINAL_CLIPBOARD_TEXT_MAX_BYTES)
+        {
+            self.error_is_pressure = false;
+            self.error = Some("terminal clipboard input exceeded limit".to_owned());
+            return;
+        }
+        let operation = self.next_io_operation();
+        let generation = self.io_generation;
+        if self
+            .queue_io_intent(WorkspaceIoIntent::ReadTerminalClipboard {
+                operation,
+                generation,
+            })
+            .is_err()
+        {
+            self.error_is_pressure = false;
+            self.error = Some("native operation queue is busy".to_owned());
+            return;
+        }
+        self.pending_paste = Some(PendingPaste {
+            operation,
+            generation,
+            session,
+            bracketed,
+            shell_kind,
+            text_fallback,
+            requested_at: std::time::Instant::now(),
+        });
+    }
+
+    fn request_open_path(&mut self, path: PathBuf) {
+        let intent = WorkspacePathPayload::try_new(path).map(WorkspaceIoIntent::OpenPath);
+        if intent
+            .and_then(|intent| self.queue_io_intent(intent))
+            .is_err()
+        {
+            self.error_is_pressure = false;
+            self.error = Some("native path operation rejected".to_owned());
+        }
+    }
+
+    fn request_open_url(&mut self, url: &str) {
+        let intent = WorkspaceUrlPayload::try_new(url.to_owned()).map(WorkspaceIoIntent::OpenUrl);
+        if intent
+            .and_then(|intent| self.queue_io_intent(intent))
+            .is_err()
+        {
+            self.error_is_pressure = false;
+            self.error = Some("native URL operation rejected".to_owned());
+        }
     }
 
     /// Cmd+F 등으로 focused 터미널에서 검색 바를 연다 (T3). 이미 같은 세션에 열려 있으면
@@ -755,32 +1145,20 @@ impl WorkspaceUi {
         };
     }
 
-    /// 세션 셸 pid (ResourceUsage 스냅샷 기준) — 사이드바 메뉴의 cwd 일회성 조회용.
-    pub fn session_pid(&self, session: SessionId) -> Option<u32> {
-        self.session_pids.get(&session).copied()
-    }
-
     /// 세션 → 셸 pid를 세팅한다(App이 매 프레임, ResourceUsage 스냅샷 기준).
     /// 터미널 경로 더블클릭의 상대경로 해석(lsof cwd 1회 조회)에 쓴다.
     pub fn set_session_pids(&mut self, pids: &[(SessionId, u32)]) {
-        self.session_pids.clear();
-        self.session_pids.extend(pids.iter().copied());
-        // 죽은 세션의 cwd 캐시 정리 — pid 스냅샷이 최신 live 집합이다.
-        self.session_cwd_cache
-            .lock()
-            .expect("cwd cache lock")
-            .retain(|session, _| self.session_pids.contains_key(session));
+        let next: HashMap<SessionId, u32> = pids.iter().copied().collect();
+        if self.session_pids != next {
+            self.session_pids = next;
+            self.invalidate_path_resolution();
+        }
     }
 
     /// (세션, 단어) 캐시를 거친 경로 해석. hover가 매 프레임 부르므로 같은 단어는
     /// 재해석하지 않고, 셸 cwd(lsof)는 세션별 백그라운드 캐시로 조회한다 — hover
     /// 경로는 UI 스레드에서 lsof를 직접 돌리지 않는다(프레임 스톨 방지, 2026-07-16).
-    fn resolve_path_cached(
-        &mut self,
-        ctx: &egui::Context,
-        session: SessionId,
-        word: &str,
-    ) -> Option<PathClick> {
+    fn resolve_path_cached(&mut self, session: SessionId, word: &str) -> Option<PathClick> {
         if let Some((s, w, res, at)) = &self.path_click_cache
             && *s == session
             && w == word
@@ -788,107 +1166,55 @@ impl WorkspaceUi {
         {
             return res.clone();
         }
-        let (cwd, cwd_pending) = self.hover_cwd(ctx, session);
-        let res = resolve_path_click(word, cwd.as_deref());
-        // cwd가 아직 오는 중이면 부정 결과를 굳히지 않는다 — 도착 즉시 다음 프레임에 재해석.
-        if !cwd_pending {
-            self.path_click_cache = Some((
-                session,
-                word.to_owned(),
-                res.clone(),
-                std::time::Instant::now(),
-            ));
-        }
-        res
-    }
-
-    /// hover용 셸 cwd — 캐시가 신선하면 그 값을, 만료/부재면 백그라운드 재해석을 걸고
-    /// stale 값(있으면)을 돌려준다. 반환 (cwd, pending): pending은 "값이 아직 없어
-    /// 해석 대기 중"이라는 뜻이다.
-    fn hover_cwd(
-        &mut self,
-        ctx: &egui::Context,
-        session: SessionId,
-    ) -> (Option<std::path::PathBuf>, bool) {
-        let Some(pid) = self.session_pids.get(&session).copied() else {
-            // 자원 스냅샷(pid)이 아직/원래 없으면 감지 워커의 cwd(에이전트 세션)로 폴백 —
-            // pid 지연이 hover 커서를 통째로 죽이지 않게 한다.
-            return (
-                self.session_cwds
-                    .get(&session)
-                    .map(std::path::PathBuf::from),
-                false,
-            );
-        };
-        let mut cache = self.session_cwd_cache.lock().expect("cwd cache lock");
-        if let Some(entry) = cache.get(&session)
-            && (entry.inflight || entry.fetched_at.elapsed() < PATH_CACHE_TTL)
-        {
-            return (entry.cwd.clone(), entry.cwd.is_none() && entry.inflight);
-        }
-        // 만료/부재 — 백그라운드 재해석을 걸고 stale 값으로 즉시 응답한다.
-        let stale = cache.get(&session).and_then(|entry| entry.cwd.clone());
-        cache.insert(
-            session,
-            CwdCacheEntry {
-                cwd: stale.clone(),
-                fetched_at: std::time::Instant::now(),
-                inflight: true,
-            },
-        );
-        drop(cache);
-        let shared = Arc::clone(&self.session_cwd_cache);
-        let ctx = ctx.clone();
-        std::thread::Builder::new()
-            .name("cwd-resolve".to_owned())
-            .spawn(move || {
-                let cwd = platform::process_cwd(pid);
-                shared.lock().expect("cwd cache lock").insert(
-                    session,
-                    CwdCacheEntry {
-                        cwd,
-                        fetched_at: std::time::Instant::now(),
-                        inflight: false,
-                    },
-                );
-                // 마우스가 정지 상태면 자연 repaint가 없다 — 결과가 다음 프레임에
-                // 커서/메뉴에 반영되게 명시 요청.
-                ctx.request_repaint();
+        if self
+            .pending_path_resolution
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.session == session
+                    && pending.word == word
+                    && pending.generation == self.io_generation
             })
-            .expect("cwd resolve thread spawn");
-        let pending = stale.is_none();
-        (stale, pending)
-    }
-
-    /// 클릭 실행용 신선 해석 — hover 캐시를 거치지 않고 lsof를 동기 1회 실행한다
-    /// (사용자 클릭 시점의 일회성 조회라 수십 ms를 감수 — platform::process_cwd 관례).
-    /// 결과는 hover 캐시에도 반영한다.
-    fn resolve_path_fresh(&mut self, session: SessionId, word: &str) -> Option<PathClick> {
+        {
+            return None;
+        }
+        let Ok(word) = bounded_path_word(word) else {
+            return None;
+        };
         let cwd = self
-            .session_pids
+            .session_cwds
             .get(&session)
-            .copied()
-            .and_then(platform::process_cwd);
-        self.session_cwd_cache
-            .lock()
-            .expect("cwd cache lock")
-            .insert(
-                session,
-                CwdCacheEntry {
-                    cwd: cwd.clone(),
-                    fetched_at: std::time::Instant::now(),
-                    inflight: false,
-                },
-            );
-        resolve_path_click(word, cwd.as_deref())
+            .map(PathBuf::from)
+            .map(WorkspacePathPayload::try_new)
+            .transpose()
+            .ok()
+            .flatten();
+        let operation = self.next_io_operation();
+        let pending = PendingPathResolution {
+            operation,
+            generation: self.io_generation,
+            session,
+            word: word.clone(),
+        };
+        let intent = WorkspaceIoIntent::ResolvePath {
+            operation,
+            generation: self.io_generation,
+            session,
+            pid: self.session_pids.get(&session).copied(),
+            cwd,
+            word,
+        };
+        if self.queue_io_intent(intent).is_ok() {
+            self.pending_path_resolution = Some(pending);
+        }
+        None
     }
 
-    /// cd 주입 등으로 셸 cwd가 바뀌었을 때 해당 세션의 cwd 캐시를 버린다.
-    fn invalidate_session_cwd(&self, session: SessionId) {
-        self.session_cwd_cache
-            .lock()
-            .expect("cwd cache lock")
-            .remove(&session);
+    fn invalidate_path_resolution(&mut self) {
+        self.io_generation = self.io_generation.wrapping_add(1).max(1);
+        self.path_click_cache = None;
+        self.pending_path_resolution = None;
+        self.io_intents
+            .retain(|intent| !matches!(intent, WorkspaceIoIntent::ResolvePath { .. }));
     }
 
     /// 세션별 현재 작업 폴더를 세팅한다(App이 매 프레임, 감지 워커 lsof 결과).
@@ -898,7 +1224,10 @@ impl WorkspaceUi {
         cwds: std::collections::HashMap<SessionId, String>,
         style: crate::config::SessionNameStyle,
     ) {
-        self.session_cwds = cwds;
+        if self.session_cwds != cwds {
+            self.session_cwds = cwds;
+            self.invalidate_path_resolution();
+        }
         self.session_name_style = style;
     }
 
@@ -1252,7 +1581,6 @@ impl WorkspaceUi {
         if let Some(text) = self.pending_copy.take() {
             ctx.copy_text(text);
         }
-        self.poll_paste_task(client);
     }
 
     /// 홈 대시보드가 중앙 표면을 차지한 프레임에도 런타임 이벤트와 비동기 붙여넣기
@@ -1989,14 +2317,11 @@ impl WorkspaceUi {
                         });
                         if !duplicate {
                             self.last_url_click = Some((url.to_owned(), std::time::Instant::now()));
-                            if let Err(err) = auth::open_in_browser(url) {
-                                self.error_is_pressure = false;
-                                self.error = Some(format!("{err:#}"));
-                            }
+                            self.request_open_url(url);
                         }
                     }
                 } else if matches!(
-                    self.resolve_path_cached(ui.ctx(), session, &word),
+                    self.resolve_path_cached(session, &word),
                     Some(PathClick::Dir(_))
                 ) {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -2004,11 +2329,9 @@ impl WorkspaceUi {
                     // cd까지 주입하면 안 된다 (codex 리뷰 MEDIUM). 첫 클릭은 포커스만,
                     // 포커스된 뒤의 클릭이 이동한다.
                     if output.response.clicked() && focused {
-                        // 클릭은 캐시를 거치지 않는다 — 사용자가 방금 손으로 cd를
-                        // 타이핑했으면 2s TTL 캐시가 옛 cwd 기준 경로를 줄 수 있다
-                        // (codex 리뷰 MEDIUM). hover 커서는 캐시(성능), 실행은 신선 해석.
-                        self.path_click_cache = None;
-                        if let Some(PathClick::Dir(path)) = self.resolve_path_fresh(session, &word)
+                        // 실제 경로 판정은 App host가 완료한 immutable cache만 사용한다.
+                        // cwd가 바뀌면 set_session_cwds가 pending/cache를 무효화한다.
+                        if let Some(PathClick::Dir(path)) = self.resolve_path_cached(session, &word)
                         {
                             // 더블클릭은 clicked를 두 번 발화 — 같은 경로 연속 cd를 막는다.
                             let duplicate = self.last_dir_click.as_ref().is_some_and(|(p, at)| {
@@ -2026,8 +2349,7 @@ impl WorkspaceUi {
                                 );
                                 self.send(client, RuntimeCommand::WriteInput { session, bytes });
                                 // cd로 셸 cwd가 바뀐다 — 방금 만든 해석 캐시도 무효.
-                                self.invalidate_session_cwd(session);
-                                self.path_click_cache = None;
+                                self.invalidate_path_resolution();
                             }
                         }
                     }
@@ -2113,8 +2435,9 @@ impl WorkspaceUi {
                     }
                     // egui는 이벤트 드리븐 — 포인터가 안 움직여도 매 프레임 이어가도록
                     // 예약한다. 버튼 릴리즈 시 이 분기에 안 들어와 예약이 끊긴다(idle 0).
-                    ui.ctx()
-                        .request_repaint_after(std::time::Duration::from_millis(30));
+                    // 드래그 중에만 다음 프레임을 즉시 요청한다. 입력이 끝나면 예약이
+                    // 남지 않아 idle periodic repaint가 생기지 않는다.
+                    ui.ctx().request_repaint();
                 } else {
                     self.drag_autoscroll_residual = 0.0;
                 }
@@ -2344,23 +2667,18 @@ impl WorkspaceUi {
                     self.last_text_paste = None;
                     self.last_native_paste = None;
                 } else {
-                    // 파일/이미지 판별 + PNG 인코딩은 백그라운드로(UI 딜레이 제거 — 2026-07-07).
-                    // 완료는 show()의 poll_paste_task가 소비한다. 연타 ⌘V는 최신 것으로 대체.
+                    // 파일/이미지 판별 + PNG 인코딩은 App host가 수행한다. render는
+                    // operation/generation intent만 남긴다.
                     if paste_trigger == ClipboardPasteTrigger::NativeKeyDown {
                         self.last_native_paste = Some(std::time::Instant::now());
                     }
                     let text_fallback = text_paste_bytes.take();
-                    self.paste_task = Some(PendingPaste {
-                        rx: crate::ui::clipboard_image::paste_clipboard_paths_or_image_background(
-                            ui.ctx().clone(),
-                            text_fallback.is_some(),
-                        ),
+                    self.request_terminal_clipboard(
                         session,
                         bracketed,
-                        shell_kind: self.session_shell_kind(session),
+                        self.session_shell_kind(session),
                         text_fallback,
-                        requested_at: std::time::Instant::now(),
-                    });
+                    );
                 }
             } else if let Some(bytes) = text_paste_bytes {
                 self.last_text_paste = Some(std::time::Instant::now());
@@ -2393,8 +2711,6 @@ impl WorkspaceUi {
                         delta: whole_rows,
                     },
                 );
-                ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(50));
             }
         }
 
@@ -2739,7 +3055,7 @@ impl WorkspaceUi {
                     && !text.trim().is_empty()
                     && !text.contains('\n')
                     && let Some(PathClick::OpenFile(path)) =
-                        self.resolve_path_cached(ui.ctx(), sel_session, text.trim())
+                        self.resolve_path_cached(sel_session, text.trim())
                 {
                     let name = path
                         .file_name()
@@ -2749,7 +3065,7 @@ impl WorkspaceUi {
                         .button(catalog.t("workspace.open_file", &[("name", name.as_str())]))
                         .clicked()
                     {
-                        platform::open_path(&path);
+                        self.request_open_path(path);
                         ui.close();
                     }
                     ui.separator();
@@ -2802,22 +3118,12 @@ impl WorkspaceUi {
             if let Some(paste_session) = session
                 && ui.button(catalog.t("workspace.menu.paste", &[])).clicked()
             {
-                match crate::ui::clipboard_image::read_clipboard_text() {
-                    Some(text) => {
-                        let bytes = terminal_text_paste_bytes(
-                            &text,
-                            self.session_bracketed_paste(paste_session),
-                        );
-                        self.send(
-                            client,
-                            RuntimeCommand::WriteInput {
-                                session: paste_session,
-                                bytes,
-                            },
-                        );
-                    }
-                    None => tracing::warn!("컨텍스트 메뉴 붙여넣기: 클립보드에 텍스트 없음"),
-                }
+                self.request_terminal_clipboard(
+                    paste_session,
+                    self.session_bracketed_paste(paste_session),
+                    self.session_shell_kind(paste_session),
+                    None,
+                );
                 ui.close();
             }
             if ui
@@ -2917,13 +3223,12 @@ impl WorkspaceUi {
         }
     }
 
-    /// 명령을 보냈거나 spawn 응답 대기 중이면 repaint를 예약한다 —
-    /// 느린 spawn(keyring 등)도 응답 이벤트가 올 때까지 폴링이 끊기지 않는다.
-    /// show()의 모든 return 경로에서 호출할 것.
+    /// command 전송 프레임만 한 번 더 그린다. 이후 상태 변화는 RuntimeEvent wake가
+    /// 담당하며 pending spawn을 타이머로 폴링하지 않는다.
     fn flush_command_repaint(&mut self, ctx: &egui::Context) {
-        if self.command_sent || self.pending_spawns > 0 {
+        if self.command_sent {
             self.command_sent = false;
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            ctx.request_repaint();
         }
     }
 
@@ -3146,59 +3451,6 @@ impl WorkspaceUi {
 
     pub fn session_shell_kind(&self, _session: SessionId) -> crate::ui::file_tree::ShellKind {
         self.shell_kind
-    }
-
-    /// 백그라운드 클립보드 paste 완료를 폴링해 요청 시점 세션에 삽입한다(2026-07-07).
-    /// 스레드가 끝나면 repaint를 깨우므로 유휴 중에도 다음 프레임에 소비된다.
-    fn poll_paste_task(&mut self, client: &dyn RuntimeClient) {
-        let Some(task) = &self.paste_task else { return };
-        // 만료: warm으로 물러났다 돌아온 뒤 옛 paste가 뒤늦게 꽂히는 것 방지(codex Medium).
-        if task.requested_at.elapsed() > PASTE_TASK_TTL {
-            self.paste_task = None;
-            return;
-        }
-        let result = match task.rx.try_recv() {
-            Ok(result) => result,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.paste_task = None;
-                return;
-            }
-        };
-        let task = self.paste_task.take().expect("위에서 Some 확인");
-        let bytes = match result {
-            Ok(paths) => {
-                // 이미지/파일이 없으면: egui Event::Paste 텍스트 → 클립보드 텍스트 순 fallback
-                // (터미널 위젯엔 Event::Paste가 안 올 수 있음 — #4와 동일 규칙).
-                clipboard_terminal_paste_bytes(
-                    paths.as_deref(),
-                    task.text_fallback,
-                    task.shell_kind,
-                    task.bracketed,
-                )
-                .or_else(|| {
-                    paths.is_none().then(|| {
-                        crate::ui::clipboard_image::read_clipboard_text()
-                            .map(|t| terminal_text_paste_bytes(&t, task.bracketed))
-                    })?
-                })
-            }
-            Err(e) => {
-                self.error_is_pressure = false;
-                self.error_is_pressure = false;
-                self.error = Some(format!("{e:#}"));
-                None
-            }
-        };
-        if let Some(bytes) = bytes {
-            self.send(
-                client,
-                RuntimeCommand::WriteInput {
-                    session: task.session,
-                    bytes,
-                },
-            );
-        }
     }
 
     /// 상태가 강조 대상(입력요청/작업종료)으로 **새로** 전이하면 그 세션 pane을 플래시한다.
@@ -3580,6 +3832,14 @@ fn extract_url(word: &str) -> Option<&str> {
     (trimmed.starts_with("http://") || trimmed.starts_with("https://")).then_some(trimmed)
 }
 
+fn bounded_path_word(word: &str) -> Result<String, WorkspaceIoErrorCode> {
+    let bytes = word.len();
+    if bytes == 0 || bytes > WORKSPACE_PATH_MAX_BYTES || word.as_bytes().contains(&0) {
+        return Err(WorkspaceIoErrorCode::InvalidPath);
+    }
+    Ok(word.to_owned())
+}
+
 /// 터미널 텍스트가 가리키는 파일시스템 대상 (2026-07-14 사용자 요청).
 #[derive(Debug, Clone, PartialEq)]
 enum PathClick {
@@ -3587,77 +3847,6 @@ enum PathClick {
     Dir(std::path::PathBuf),
     /// 외부 프로그램으로 여는 파일 (OPENABLE_EXTS 허용목록)
     OpenFile(std::path::PathBuf),
-}
-
-/// 더블클릭으로 외부 프로그램에 넘겨도 안전한 확장자 — 문서/이미지/미디어/아카이브.
-/// 실행파일·스크립트는 제외한다: macOS `open`은 실행 가능한 대상을 **실행**하므로
-/// 더블클릭 오조작이 코드 실행이 되면 안 된다.
-const OPENABLE_EXTS: &[&str] = &[
-    "pdf", "html", "htm", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "csv", "hwp", "txt", "md",
-    "rtf", "png", "jpg", "jpeg", "gif", "webp", "svg", "heic", "tiff", "mp4", "mov", "mp3", "wav",
-    "zip", "numbers", "pages", "key",
-];
-
-/// 연결된 프로그램으로 열어도 안전한 실존 파일인가 — OPENABLE_EXTS 허용목록을
-/// 원본과 **실체(canonical) 경로**의 확장자 양쪽으로 검사한다 ("safe.pdf"가
-/// 실행파일을 가리키는 심링크면 open이 실행해버린다 — codex 리뷰 하드닝).
-/// 터미널 경로 「열기」와 파일 트리 더블클릭(2026-07-18)이 같은 판정을 공유한다.
-pub(crate) fn openable_file(path: &Path) -> bool {
-    let ext_openable = |p: &Path| {
-        p.extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| OPENABLE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-    };
-    std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
-        && ext_openable(path)
-        && std::fs::canonicalize(path).is_ok_and(|real| ext_openable(&real))
-}
-
-/// 더블클릭된 단어를 파일시스템 경로로 해석한다. 절대(`/`)·홈(`~/`)·상대(cwd 기준)
-/// 순으로 시도하고, `path.py:33`처럼 줄번호가 붙은 꼴은 `:` 뒤를 떼고 재시도한다.
-/// 존재하지 않거나(오탈자·일반 단어) 허용 확장자가 아닌 파일이면 None — 이 함수가
-/// None이면 더블클릭은 기존 동작(단어 선택)만 한다.
-fn resolve_path_click(word: &str, cwd: Option<&Path>) -> Option<PathClick> {
-    // 꼬리는 따옴표와 문말 부호가 섞여 올 수 있어("'docs',") 통합 집합으로 벗긴다.
-    // 머리도 여는 괄호류가 붙어 올 수 있다("(docs/report.pdf)" — codex 리뷰).
-    let token = word
-        .trim_start_matches(|c: char| "\"'`([{<".contains(c))
-        .trim_end_matches(|c: char| "\"'`.,;!?)]}>".contains(c));
-    if token.is_empty() {
-        return None;
-    }
-    // "path.py:33" / "src/main.rs:12:34" → 숫자 suffix를 반복해서 벗긴 후보도 시도
-    // (Claude/컴파일러 출력 관례 — rustc는 :행:칸 두 개가 붙는다, codex 리뷰).
-    let mut candidates = vec![token];
-    let mut head = token;
-    while let Some((rest, tail)) = head.rsplit_once(':')
-        && !rest.is_empty()
-        && !tail.is_empty()
-        && tail.chars().all(|c| c.is_ascii_digit())
-    {
-        candidates.push(rest);
-        head = rest;
-    }
-    for cand in candidates {
-        let path = if let Some(rest) = cand.strip_prefix("~/") {
-            crate::paths::home_dir().map(|home| home.join(rest))
-        } else if cand.starts_with('/') {
-            Some(std::path::PathBuf::from(cand))
-        } else {
-            cwd.map(|c| c.join(cand))
-        };
-        let Some(path) = path else { continue };
-        let Ok(meta) = std::fs::metadata(&path) else {
-            continue;
-        };
-        if meta.is_dir() {
-            return Some(PathClick::Dir(path));
-        }
-        if openable_file(&path) {
-            return Some(PathClick::OpenFile(path));
-        }
-    }
-    None
 }
 
 fn word_range_at(
@@ -4081,35 +4270,45 @@ mod tests {
         }
     }
 
-    /// hover 커서 회귀 가드 — 백그라운드 cwd 해석(stale-while-revalidate) 후
-    /// 폴더 단어가 Dir로 잡혀야 한다 (2026-07-17 사용자: 커서가 안 바뀜).
+    /// hover는 filesystem을 읽지 않고 exact host completion 뒤에만 Dir를 노출한다.
     #[test]
-    fn hover_cwd는_백그라운드_해석_후_폴더를_dir로_잡는다() {
+    fn hover_path는_host_completion_후_폴더를_dir로_잡는다() {
         let mut ui = WorkspaceUi::new();
         let session = SessionId(1);
         ui.set_session_pids(&[(session, std::process::id())]);
-        let ctx = egui::Context::default();
-        // 1차 — 백그라운드 해석 시작, 아직 값 없음(pending)
-        let (first, pending) = ui.hover_cwd(&ctx, session);
-        assert!(first.is_none() && pending);
-        // 해석 완료 대기 (lsof 1회)
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let (cwd, still_pending) = ui.hover_cwd(&ctx, session);
-            if let Some(cwd) = cwd {
-                assert!(!still_pending);
-                assert_eq!(cwd, std::env::current_dir().unwrap());
-                break;
+        ui.set_session_cwds(
+            HashMap::from([(session, "/workspace".to_owned())]),
+            crate::config::SessionNameStyle::default(),
+        );
+        assert_eq!(ui.resolve_path_cached(session, "src"), None);
+        let intent = ui.take_io_intent().expect("one path intent");
+        let (operation, generation) = match intent {
+            WorkspaceIoIntent::ResolvePath {
+                operation,
+                generation,
+                session: target,
+                word,
+                ..
+            } => {
+                assert_eq!(target, session);
+                assert_eq!(word, "src");
+                (operation, generation)
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "cwd 해석 결과가 오지 않음"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        // 캐시 경유 경로 해석 — 폴더 단어("src")가 Dir이어야 hover 커서가 바뀐다
+            other => panic!("unexpected intent: {other:?}"),
+        };
+        ui.complete_io(
+            WorkspaceIoCompletion::PathResolved {
+                operation,
+                generation,
+                result: Some(WorkspacePathResolution {
+                    kind: WorkspacePathKind::Directory,
+                    path: WorkspacePathPayload::try_new(PathBuf::from("/workspace/src")).unwrap(),
+                }),
+            },
+            &RecordingRuntime::default(),
+        );
         assert!(matches!(
-            ui.resolve_path_cached(&ctx, session, "src"),
+            ui.resolve_path_cached(session, "src"),
             Some(PathClick::Dir(_))
         ));
     }
@@ -4267,54 +4466,6 @@ mod tests {
         assert_eq!(renderer_egui::selection_text(&snap, s, e), "nant-성과.pdf");
         // 공백(idx 1)은 여전히 단어가 아니다
         assert!(word_range_at(&snap, 1).is_none());
-    }
-
-    #[test]
-    fn 경로_더블클릭은_폴더와_허용_문서만_해석한다() {
-        let base = std::env::temp_dir().join(format!("deppy-pathclick-{}", std::process::id()));
-        let dir = base.join("docs");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(base.join("report.pdf"), b"x").unwrap();
-        std::fs::write(base.join("run.sh"), b"x").unwrap();
-
-        // 절대경로 폴더 → Dir
-        assert_eq!(
-            resolve_path_click(dir.to_str().unwrap(), None),
-            Some(PathClick::Dir(dir.clone()))
-        );
-        // 상대경로는 cwd 기준. 따옴표·문말 부호는 벗긴다.
-        assert_eq!(
-            resolve_path_click("'docs',", Some(&base)),
-            Some(PathClick::Dir(dir.clone()))
-        );
-        // cwd 없이 상대경로는 해석 불가
-        assert_eq!(resolve_path_click("docs", None), None);
-        // 허용 확장자 파일 → OpenFile, 줄번호 suffix 제거 (rustc의 :행:칸 이중 포함)
-        assert_eq!(
-            resolve_path_click("report.pdf:12", Some(&base)),
-            Some(PathClick::OpenFile(base.join("report.pdf")))
-        );
-        assert_eq!(
-            resolve_path_click("report.pdf:12:34", Some(&base)),
-            Some(PathClick::OpenFile(base.join("report.pdf")))
-        );
-        // 여는 괄호로 감싼 표기도 해석된다
-        assert_eq!(
-            resolve_path_click("(report.pdf)", Some(&base)),
-            Some(PathClick::OpenFile(base.join("report.pdf")))
-        );
-        // 스크립트는 열지 않는다 (open은 실행 가능 대상을 실행하므로)
-        assert_eq!(resolve_path_click("run.sh", Some(&base)), None);
-        // pdf로 위장한 심링크가 스크립트를 가리키면 열지 않는다 (canonical 확장자 검사)
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(base.join("run.sh"), base.join("fake.pdf")).unwrap();
-            assert_eq!(resolve_path_click("fake.pdf", Some(&base)), None);
-        }
-        // 존재하지 않는 일반 단어 → None (기존 더블클릭 선택만)
-        assert_eq!(resolve_path_click("hello", Some(&base)), None);
-
-        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
@@ -4860,26 +5011,47 @@ mod tests {
     }
 
     #[test]
-    fn image_clipboard_background_result는_요청_세션에_정확히_한번만_전송된다() {
+    fn terminal_clipboard_completion은_요청_세션에_정확히_한번만_전송된다() {
         use crate::ui::file_tree::ShellKind;
 
         let mut ui = WorkspaceUi::new();
         let runtime = RecordingRuntime::default();
         let session = SessionId(77);
         let paths = vec![std::path::PathBuf::from("/tmp/clipboard image.png")];
-        let (tx, rx) = std::sync::mpsc::channel();
-        ui.paste_task = Some(PendingPaste {
-            rx,
-            session,
-            bracketed: true,
-            shell_kind: ShellKind::Posix,
-            text_fallback: None,
-            requested_at: std::time::Instant::now(),
-        });
-        tx.send(Ok(Some(paths.clone()))).unwrap();
-
-        ui.poll_paste_task(&runtime);
-        ui.poll_paste_task(&runtime);
+        ui.request_terminal_clipboard(session, true, ShellKind::Posix, None);
+        let intent = ui.take_io_intent().expect("clipboard intent");
+        let (operation, generation) = match intent {
+            WorkspaceIoIntent::ReadTerminalClipboard {
+                operation,
+                generation,
+            } => (operation, generation),
+            other => panic!("unexpected intent: {other:?}"),
+        };
+        ui.complete_io(
+            WorkspaceIoCompletion::TerminalClipboardRead {
+                operation,
+                generation: generation.wrapping_add(1),
+                result: TerminalClipboardPayload::try_new(paths.clone(), None),
+            },
+            &runtime,
+        );
+        assert!(runtime.commands.lock().unwrap().is_empty());
+        ui.complete_io(
+            WorkspaceIoCompletion::TerminalClipboardRead {
+                operation,
+                generation,
+                result: TerminalClipboardPayload::try_new(paths.clone(), None),
+            },
+            &runtime,
+        );
+        ui.complete_io(
+            WorkspaceIoCompletion::TerminalClipboardRead {
+                operation,
+                generation,
+                result: TerminalClipboardPayload::try_new(paths.clone(), None),
+            },
+            &runtime,
+        );
 
         let commands = runtime.commands.lock().unwrap();
         assert_eq!(commands.len(), 1);

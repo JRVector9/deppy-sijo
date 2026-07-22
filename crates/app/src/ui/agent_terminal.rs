@@ -1009,6 +1009,56 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_home_snapshot_renders_300_frames_without_host_commands() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let feed = StatusFeedSnapshot::default();
+        let translations = crate::notice_translate::TranslationCache::default();
+        let slack = connector_contract::SlackProjection::default();
+        let context = egui::Context::default();
+        let mut home = AgentTerminalUi::new();
+
+        for _ in 0..300 {
+            let output = context.run_ui(egui::RawInput::default(), |ui| {
+                assert_eq!(
+                    home.home(
+                        ui,
+                        &feed,
+                        NoticeTranslations {
+                            cache: &translations,
+                            locale: i18n::FALLBACK_LOCALE,
+                        },
+                        &slack,
+                        &catalog,
+                    ),
+                    None
+                );
+            });
+            assert!(output.platform_output.commands.is_empty());
+        }
+    }
+
+    #[test]
+    fn production_source_has_no_host_io_or_periodic_repaint_edge() {
+        let source = include_str!("agent_terminal.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for forbidden in [
+            ["std::", "fs"].concat(),
+            ["std::", "process"].concat(),
+            ["request_repaint_", "after"].concat(),
+            ["req", "west"].concat(),
+            ["Tcp", "Stream"].concat(),
+            ["Udp", "Socket"].concat(),
+            ["clip", "board"].concat(),
+            ["r", "fd::"].concat(),
+            ["Keyring", "SecretStore"].concat(),
+        ] {
+            assert!(!source.contains(&forbidden), "forbidden edge: {forbidden}");
+        }
+    }
+
+    #[test]
     fn kittest_home_v1은_제목없이_외부업데이트와_slack만_렌더한다() {
         use egui_kittest::kittest::Queryable;
 

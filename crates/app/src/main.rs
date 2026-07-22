@@ -55,33 +55,7 @@ fn main() -> anyhow::Result<()> {
 
     let config = config::Config::load_or_create(&paths.config_dir)?;
     let config_path = config::config_path(&paths.config_dir);
-    // insecure fallback 금지(설계문서 1.4) — 등록 실패 시 credential 조작이 에러로 표면화된다
-    if let Err(e) = secret::init_platform_store() {
-        tracing::warn!("keyring store 초기화 실패 — 자격증명 기능 비활성: {e:#}");
-    }
-
-    let db_path = paths.data_dir.join("metadata.sqlite3");
-    let db = storage::Db::open(&db_path)?;
-    let workspace_id = initial_workspace_id(
-        &db,
-        config.ui.last_workspace_id.as_deref(),
-        &config.ui.closed_workspace_ids,
-    )?;
-    // 이전 실행이 비정상 종료됐다면 남은 세션을 Exited로 정리 (crash recovery).
-    // 실패는 기동 중단 — 거짓 running 상태로 복원 UI가 뜨면 안 된다 (codex 리뷰 반영)
-    let reconciled = db
-        .reconcile_orphan_sessions()
-        .map_err(|e| anyhow::anyhow!("crash recovery(세션 reconcile) 실패: {e:#}"))?;
-    if reconciled > 0 {
-        tracing::info!("이전 실행의 orphan 세션 {reconciled}건 Exited 처리");
-    }
-    // 세션 로그 베이스 (설계문서 7장: logs/<workspace_id>/<session_id>/) —
-    // workspace별 하위 디렉터리는 App이 workspace_id로 만든다 (전환 지원).
-    let logs_base = paths.data_dir.join("logs");
-    match storage::gc_session_logs(&logs_base, storage::SESSION_LOG_DISK_BUDGET_BYTES) {
-        Ok(bytes) => tracing::info!(bytes, "세션 로그 디스크 예산 적용"),
-        Err(error) => tracing::warn!("세션 로그 GC 실패 — 기동 계속: {error:#}"),
-    }
+    let data_dir = paths.data_dir.clone();
     tracing::info!(
         config_dir = %paths.config_dir.display(),
         data_dir = %paths.data_dir.display(),
@@ -145,16 +119,13 @@ fn main() -> anyhow::Result<()> {
             if let Some(bench) = &bench {
                 bench.emit_rss_stage("renderer_init");
             }
-            Ok(Box::new(app::App::new(
+            Ok(Box::new(app::App::bootstrap(
                 config,
                 config_path,
-                db,
-                workspace_id,
-                logs_base,
-                db_path,
+                data_dir,
                 cc.egui_ctx.clone(),
                 bench,
-            )))
+            )?))
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe 실행 실패: {e}"));
@@ -248,28 +219,6 @@ fn bench_paths(root: &Path) -> anyhow::Result<paths::AppPaths> {
     Ok(paths)
 }
 
-fn initial_workspace_id(
-    db: &storage::Db,
-    last_workspace_id: Option<&str>,
-    closed_workspace_ids: &std::collections::BTreeSet<String>,
-) -> anyhow::Result<String> {
-    let fallback = db.ensure_default_workspace()?;
-    let workspaces = db.list_workspaces()?;
-    if let Some(last) = last_workspace_id
-        && !closed_workspace_ids.contains(last)
-        && workspaces.iter().any(|workspace| workspace.id == last)
-    {
-        return Ok(last.to_owned());
-    }
-    Ok(workspaces
-        .iter()
-        .find(|workspace| !closed_workspace_ids.contains(&workspace.id))
-        .map(|workspace| workspace.id.clone())
-        // 모든 워크스페이스를 종료한 경우에도 앱은 런타임 기반 workspace 하나가
-        // 필요하므로 default를 내부 활성으로 두되 사이드바/Home에서는 계속 숨긴다.
-        .unwrap_or(fallback))
-}
-
 /// macOS 네이티브 메뉴바 (2026-07-05 사용자 요청) — About/설정(⌘,)/종료(⌘Q).
 /// 이벤트는 app.rs가 MenuEvent::receiver로 폴링한다 ("settings" id).
 #[cfg(target_os = "macos")]
@@ -354,54 +303,4 @@ fn init_logging(
         .with_ansi(false)
         .init();
     Ok((guard, stats))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn temp_db(tag: &str) -> (std::path::PathBuf, storage::Db) {
-        let dir =
-            std::env::temp_dir().join(format!("deppy-sijo-main-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("metadata.sqlite3");
-        let db = storage::Db::open(&path).unwrap();
-        (dir, db)
-    }
-
-    #[test]
-    fn initial_workspace_prefers_existing_last_workspace() {
-        let (dir, db) = temp_db("last-existing");
-        let _default = db.ensure_default_workspace().unwrap();
-        let last = db.create_workspace("last").unwrap();
-        assert_eq!(
-            initial_workspace_id(&db, Some(&last), &Default::default()).unwrap(),
-            last
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn initial_workspace_falls_back_when_last_workspace_is_missing() {
-        let (dir, db) = temp_db("last-missing");
-        let default = db.ensure_default_workspace().unwrap();
-        assert_eq!(
-            initial_workspace_id(&db, Some("missing"), &Default::default()).unwrap(),
-            default
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn initial_workspace_skips_persisted_closed_workspace() {
-        let (dir, db) = temp_db("last-closed");
-        let closed = db.ensure_default_workspace().unwrap();
-        let visible = db.create_workspace("visible").unwrap();
-        let closed_ids = std::collections::BTreeSet::from([closed.clone()]);
-        assert_eq!(
-            initial_workspace_id(&db, Some(&closed), &closed_ids).unwrap(),
-            visible
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
 }

@@ -16,14 +16,17 @@ use crate::agent_surface::{
     AgentProvider, AgentSurfaceId, AgentSurfaceSnapshot, AgentTransport, AgentVisualState,
 };
 use crate::codex_app_server::{
-    CodexAppServerClient, CodexAppServerEvent, CodexAppServerOptions, CodexAppServerReply,
-    CodexLlmOverride, CodexModelCatalogReply, CodexModelInfo, CodexSkillCatalogReply,
-    CodexSkillInfo, codex_llm_override_from_config, validate_llm_api_key, validate_llm_base_url,
+    CodexAppServerClient, CodexAppServerEvent, CodexAppServerReply, CodexLlmOverride,
+    CodexModelCatalogReply, CodexModelInfo, CodexSkillCatalogReply, CodexSkillInfo,
+    codex_llm_override_from_config, validate_llm_api_key, validate_llm_base_url,
 };
 use crate::config::AgentsConfig;
-use storage::StructuredThreadRow;
-
 pub const AGENT_SESSION_SENSITIVE_ITEM_MAX_BYTES: usize = 32 * 1024;
+const AGENT_SESSION_TEXT_INPUT_MAX_BYTES: usize = 1024 * 1024;
+const AGENT_SESSION_PATH_INPUT_MAX_BYTES: usize = 32 * 1024;
+const AGENT_SESSION_PERSISTED_MAX_ITEMS: usize = 500;
+const AGENT_SESSION_PERSISTED_ROW_MAX_BYTES: usize = 32 * 1024;
+const AGENT_SESSION_PERSISTED_TOTAL_MAX_BYTES: usize = 4 * 1024 * 1024;
 // This panel owns one API-key draft at a time, so it remains below the shared credential corpus
 // budget of 64 items / 1 MiB while enforcing the same 32 KiB redaction-safe item ceiling.
 
@@ -134,8 +137,19 @@ pub trait CodexAppServerHost: Send + Sync {
 }
 
 pub struct AgentSessionsFrameOutput {
+    /// Compatibility output for callers that already handle PTY requests. Rendered controller
+    /// actions produce requests only after the root executes `deferred_action` on a logic tick.
     pub requests: Vec<AgentSessionsRequest>,
     pub secret_intent: Option<AgentSessionsSecretIntent>,
+    pub deferred_action: Option<AgentSessionsDeferredAction>,
+}
+
+/// One opaque controller action produced by a render frame. The value is deliberately non-Clone
+/// and non-Serialize, so the root can retain only the latest single action instead of building a
+/// background backlog. A newer render generation makes an unexecuted action stale.
+pub struct AgentSessionsDeferredAction {
+    generation: u64,
+    action: PanelAction,
 }
 
 pub struct AgentSessionsFrameInput<'a> {
@@ -145,6 +159,22 @@ pub struct AgentSessionsFrameInput<'a> {
     pub agents_config: &'a mut AgentsConfig,
     pub secrets_snapshot: &'a AgentSessionsSecretsSnapshot,
     pub ollama_models: Option<&'a [String]>,
+}
+
+/// Storage-neutral projection of one persisted structured thread. The composition root maps its
+/// concrete repository row into this DTO before the UI controller sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSessionPersistedRow {
+    pub local_session_id: String,
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub title: String,
+    pub cwd: String,
+    pub model: Option<String>,
+    pub favorite: bool,
+    pub archived: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 struct AgentSecretRender<'a> {
@@ -157,6 +187,7 @@ impl AgentSessionsFrameOutput {
         Self {
             requests: Vec::new(),
             secret_intent: None,
+            deferred_action: None,
         }
     }
 }
@@ -306,7 +337,8 @@ pub struct AgentSessionsUi {
     focus_follow_up: bool,
     status_notices: Vec<AgentSessionStatusNotice>,
     transport_error: Option<CatalogMessage>,
-    persisted_threads: HashMap<AgentSessionId, StructuredThreadRow>,
+    persisted_threads: HashMap<AgentSessionId, AgentSessionPersistedRow>,
+    persisted_thread_bytes: usize,
     attached_threads: HashSet<AgentSessionId>,
     pending_thread_requests: Vec<PendingThreadRequest>,
     persistence_mutations: Vec<AgentSessionPersistenceMutation>,
@@ -340,6 +372,8 @@ pub struct AgentSessionsUi {
     catalog: i18n::Catalog,
     /// UI가 만든 session 오류만 원문 detail+catalog key로 보존해 locale 변경 시 재렌더한다.
     localized_session_errors: HashMap<AgentSessionId, CatalogMessage>,
+    /// Latest render generation for exact stale-action rejection.
+    frame_generation: u64,
 }
 
 impl AgentSessionsUi {
@@ -363,6 +397,7 @@ impl AgentSessionsUi {
             status_notices: Vec::new(),
             transport_error: None,
             persisted_threads: HashMap::new(),
+            persisted_thread_bytes: 0,
             attached_threads: HashSet::new(),
             pending_thread_requests: Vec::new(),
             persistence_mutations: Vec::new(),
@@ -386,6 +421,7 @@ impl AgentSessionsUi {
             catalog: i18n::Catalog::load(i18n::FALLBACK_LOCALE)
                 .expect("fallback locale catalog must load"),
             localized_session_errors: HashMap::new(),
+            frame_generation: 0,
         }
     }
 
@@ -480,7 +516,7 @@ impl AgentSessionsUi {
     /// does not spawn Codex: the one shared process is started only when the
     /// user explicitly reads or resumes a row.
     #[allow(dead_code)] // App wiring drains DB rows after this ownership phase.
-    pub fn import_persisted_threads(&mut self, rows: Vec<StructuredThreadRow>) {
+    pub fn import_persisted_threads(&mut self, rows: Vec<AgentSessionPersistedRow>) {
         for row in rows {
             let local_session_id = row.local_session_id.clone();
             let duplicate_thread = self.persisted_threads.iter().any(|(id, existing)| {
@@ -491,8 +527,9 @@ impl AgentSessionsUi {
             }
 
             let was_persisted = self.persisted_threads.contains_key(&local_session_id);
-            self.persisted_threads
-                .insert(local_session_id.clone(), row.clone());
+            if !self.store_persisted_row(row.clone()) {
+                continue;
+            }
             if let Some(session) = self
                 .sessions
                 .iter_mut()
@@ -598,7 +635,7 @@ impl AgentSessionsUi {
             self.catalog
                 .t("agent_sessions.error.delete_attached_thread", &[])
         );
-        self.persisted_threads.remove(&session_id);
+        self.remove_persisted_row(&session_id);
         self.sessions.retain(|session| session.id != session_id);
         self.localized_session_errors.remove(&session_id);
         self.pending_thread_requests
@@ -949,30 +986,22 @@ impl AgentSessionsUi {
             )),
         };
         let api_key_generation = self.api_key_generation;
-        let client = if let Some(host) = &self.app_server_host {
-            host.spawn(llm_override.clone(), ctx.clone())
-                .map_err(|error| {
-                    if matches!(llm_override, Some(CodexLlmOverride::Custom { .. })) {
-                        anyhow::anyhow!(localized_error(
-                            &self.catalog,
-                            "agent_sessions.error.api_key_load",
-                            &error,
-                        ))
-                    } else {
-                        error
-                    }
-                })?
-        } else {
-            // Tests and unintegrated hosts preserve the no-secret default path. Production injects
-            // `CodexAppServerHost` so authentication and process construction stay at the root.
-            CodexAppServerClient::spawn(
-                CodexAppServerOptions {
-                    llm_override: llm_override.clone(),
-                    ..CodexAppServerOptions::default()
-                },
-                ctx.clone(),
-            )?
-        };
+        let host = self.app_server_host.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(self.catalog.t("agent_sessions.error.no_app_server", &[]))
+        })?;
+        let client = host
+            .spawn(llm_override.clone(), ctx.clone())
+            .map_err(|error| {
+                if matches!(llm_override, Some(CodexLlmOverride::Custom { .. })) {
+                    anyhow::anyhow!(localized_error(
+                        &self.catalog,
+                        "agent_sessions.error.api_key_load",
+                        &error,
+                    ))
+                } else {
+                    error
+                }
+            })?;
         self.transport_error = None;
         self.client = Some(client);
         self.client_llm_override = llm_override;
@@ -983,7 +1012,9 @@ impl AgentSessionsUi {
     /// config → LLM 프로바이더 오버라이드 동기화 (매 프레임, PR-L2). 프로바이더는
     /// 프로세스 argv라 살아 있는 app-server에는 적용되지 않는다 — 진행 중 작업이
     /// 전혀 없으면 기존 shutdown 경로로 client를 내려 다음 실행부터 새 설정을 쓴다.
-    fn sync_llm_config(&mut self, agents_config: &AgentsConfig) {
+    /// Logic-tick synchronization for process-level provider configuration. This may shut down a
+    /// stale idle client, so the composition root must call it outside `show`.
+    pub fn sync_controller_config(&mut self, agents_config: &AgentsConfig) {
         self.llm_override = codex_llm_override_from_config(
             agents_config.codex_llm_provider.as_deref(),
             agents_config.codex_llm_base_url.as_deref(),
@@ -1004,6 +1035,19 @@ impl AgentSessionsUi {
         if self.client.is_some() && stale && idle {
             self.shutdown();
         }
+    }
+
+    /// Executes one action returned by the latest render frame. Host/process/protocol work starts
+    /// only here, never in `show`. An action superseded by another render is rejected exactly.
+    pub fn execute_deferred(
+        &mut self,
+        deferred: AgentSessionsDeferredAction,
+        ctx: &egui::Context,
+    ) -> Option<AgentSessionsRequest> {
+        if deferred.generation != self.frame_generation {
+            return None;
+        }
+        self.apply_action(deferred.action, ctx)
     }
 
     fn request_catalogs(
@@ -1124,7 +1168,9 @@ impl AgentSessionsUi {
             })
     }
 
-    fn selected_persisted_thread(&self) -> anyhow::Result<(AgentSessionId, StructuredThreadRow)> {
+    fn selected_persisted_thread(
+        &self,
+    ) -> anyhow::Result<(AgentSessionId, AgentSessionPersistedRow)> {
         let Some(AgentSurfaceId::Structured { session_id }) = self.selected_surface.as_ref() else {
             anyhow::bail!(
                 self.catalog
@@ -1220,7 +1266,7 @@ impl AgentSessionsUi {
             PendingThreadRequest::Archive { session_id, .. } => match result {
                 Ok(_) => {
                     self.attached_threads.remove(&session_id);
-                    self.persisted_threads.remove(&session_id);
+                    self.remove_persisted_row(&session_id);
                     self.sessions.retain(|session| session.id != session_id);
                     self.localized_session_errors.remove(&session_id);
                     if self.selected_session.as_deref() == Some(session_id.as_str()) {
@@ -1315,21 +1361,18 @@ impl AgentSessionsUi {
         let (created_at, updated_at) = existing
             .map(|row| (row.created_at, row.updated_at))
             .unwrap_or((0, 0));
-        self.persisted_threads.insert(
-            session_id.to_owned(),
-            StructuredThreadRow {
-                local_session_id: session_id.to_owned(),
-                workspace_id: workspace_id.clone(),
-                thread_id: thread_id.clone(),
-                title: title.clone(),
-                cwd: cwd.clone(),
-                model: session.model.clone(),
-                favorite,
-                archived,
-                created_at,
-                updated_at,
-            },
-        );
+        self.store_persisted_row(AgentSessionPersistedRow {
+            local_session_id: session_id.to_owned(),
+            workspace_id: workspace_id.clone(),
+            thread_id: thread_id.clone(),
+            title: title.clone(),
+            cwd: cwd.clone(),
+            model: session.model.clone(),
+            favorite,
+            archived,
+            created_at,
+            updated_at,
+        });
         self.persistence_mutations
             .push(AgentSessionPersistenceMutation::Upsert {
                 local_session_id: session_id.to_owned(),
@@ -1341,6 +1384,40 @@ impl AgentSessionsUi {
                 favorite,
                 archived,
             });
+    }
+
+    fn store_persisted_row(&mut self, row: AgentSessionPersistedRow) -> bool {
+        let row_bytes = persisted_row_retained_bytes(&row);
+        if row_bytes > AGENT_SESSION_PERSISTED_ROW_MAX_BYTES {
+            return false;
+        }
+        let previous_bytes = self
+            .persisted_threads
+            .get(&row.local_session_id)
+            .map_or(0, persisted_row_retained_bytes);
+        let is_replacement = self.persisted_threads.contains_key(&row.local_session_id);
+        if !is_replacement && self.persisted_threads.len() >= AGENT_SESSION_PERSISTED_MAX_ITEMS {
+            return false;
+        }
+        let next_bytes = self
+            .persisted_thread_bytes
+            .saturating_sub(previous_bytes)
+            .saturating_add(row_bytes);
+        if next_bytes > AGENT_SESSION_PERSISTED_TOTAL_MAX_BYTES {
+            return false;
+        }
+        self.persisted_thread_bytes = next_bytes;
+        self.persisted_threads
+            .insert(row.local_session_id.clone(), row);
+        true
+    }
+
+    fn remove_persisted_row(&mut self, session_id: &str) {
+        if let Some(row) = self.persisted_threads.remove(session_id) {
+            self.persisted_thread_bytes = self
+                .persisted_thread_bytes
+                .saturating_sub(persisted_row_retained_bytes(&row));
+        }
     }
 
     /// Poll continuously even when the window is closed so an active structured
@@ -1390,17 +1467,23 @@ impl AgentSessionsUi {
     ) -> AgentSessionsFrameOutput {
         let AgentSessionsFrameInput {
             workspace_id,
-            workspace_cwd,
+            mut workspace_cwd,
             pty_surfaces,
             agents_config,
             secrets_snapshot,
             ollama_models,
         } = input;
+        workspace_cwd = workspace_cwd.filter(|path| {
+            path.len() <= AGENT_SESSION_PATH_INPUT_MAX_BYTES && !path.contains('\0')
+        });
+        truncate_utf8(&mut self.new_prompt, AGENT_SESSION_TEXT_INPUT_MAX_BYTES);
+        truncate_utf8(&mut self.follow_up, AGENT_SESSION_TEXT_INPUT_MAX_BYTES);
+        truncate_utf8(&mut self.steer_input, AGENT_SESSION_TEXT_INPUT_MAX_BYTES);
+        self.frame_generation = self.frame_generation.wrapping_add(1);
+        let frame_generation = self.frame_generation;
         // 렌더 도중 self를 변경하면서도 동일 frame의 locale snapshot을 유지한다.
         let catalog = self.catalog.clone();
         let catalog = &catalog;
-        // 창이 닫혀 있어도 동기화 — App 단축키 경로의 ensure_client도 최신 설정을 쓴다.
-        self.sync_llm_config(agents_config);
         self.pty_surfaces = pty_surfaces;
         if matches!(self.selected_surface, Some(AgentSurfaceId::Pty { .. }))
             && !self
@@ -1424,7 +1507,6 @@ impl AgentSessionsUi {
         let mut text_input_ids = Vec::new();
         let mut window_open = self.open;
         let mut actions = Vec::new();
-        let mut requests = Vec::new();
         let mut secret_intent = None;
         let window_response = egui::Window::new(catalog.t("agent_sessions.title", &[]))
             .id(agents_window_id())
@@ -1472,10 +1554,13 @@ impl AgentSessionsUi {
                         )
                         .clicked()
                     {
-                        actions.push(PanelAction::RefreshCatalog {
-                            cwd: workspace_cwd.clone(),
-                            force_reload: !self.skill_catalog.is_empty(),
-                        });
+                        queue_frame_action(
+                            &mut actions,
+                            PanelAction::RefreshCatalog {
+                                cwd: workspace_cwd.clone(),
+                                force_reload: !self.skill_catalog.is_empty(),
+                            },
+                        );
                     }
                     if self.pending_model_catalog.is_some() || self.pending_skill_catalog.is_some()
                     {
@@ -1501,6 +1586,7 @@ impl AgentSessionsUi {
                         .desired_rows(3),
                 );
                 text_input_ids.push(prompt_response.id);
+                truncate_utf8(&mut self.new_prompt, AGENT_SESSION_TEXT_INPUT_MAX_BYTES);
                 if self.focus_new_prompt {
                     prompt_response.request_focus();
                     self.focus_new_prompt = false;
@@ -1514,14 +1600,17 @@ impl AgentSessionsUi {
                         )
                         .clicked()
                     {
-                        actions.push(PanelAction::Start {
-                            workspace_id: workspace_id.to_owned(),
-                            prompt: std::mem::take(&mut self.new_prompt),
-                            model: self.new_model.clone(),
-                            effort: self.new_effort.clone(),
-                            skills: self.selected_skills(),
-                            cwd: workspace_cwd.clone(),
-                        });
+                        queue_frame_action(
+                            &mut actions,
+                            PanelAction::Start {
+                                workspace_id: workspace_id.to_owned(),
+                                prompt: std::mem::take(&mut self.new_prompt),
+                                model: self.new_model.clone(),
+                                effort: self.new_effort.clone(),
+                                skills: self.selected_skills(),
+                                cwd: workspace_cwd.clone(),
+                            },
+                        );
                     }
                 });
 
@@ -1578,14 +1667,18 @@ impl AgentSessionsUi {
             Vec::new()
         };
 
-        for action in actions {
-            if let Some(request) = self.apply_action(action, ctx) {
-                requests.push(request);
-            }
-        }
+        let deferred_action =
+            actions
+                .into_iter()
+                .next()
+                .map(|action| AgentSessionsDeferredAction {
+                    generation: frame_generation,
+                    action,
+                });
         AgentSessionsFrameOutput {
-            requests,
+            requests: Vec::new(),
             secret_intent,
+            deferred_action,
         }
     }
 
@@ -2016,7 +2109,7 @@ impl AgentSessionsUi {
                 .button(catalog.t("agent_sessions.focus_terminal", &[]))
                 .clicked()
             {
-                actions.push(PanelAction::FocusPty(surface.id.clone()));
+                queue_frame_action(actions, PanelAction::FocusPty(surface.id.clone()));
             }
             if matches!(
                 surface.state,
@@ -2025,7 +2118,7 @@ impl AgentSessionsUi {
                 .button(catalog.t("agent_sessions.interrupt_ctrl_c", &[]))
                 .clicked()
             {
-                actions.push(PanelAction::InterruptPty(surface.id));
+                queue_frame_action(actions, PanelAction::InterruptPty(surface.id));
             }
         });
     }
@@ -2073,12 +2166,15 @@ impl AgentSessionsUi {
                     })
                     .collect()
             };
-            actions.push(PanelAction::UpdateTurnControls {
-                session_id: session.id.clone(),
-                model: non_empty(model),
-                effort: non_empty(effort),
-                skills,
-            });
+            queue_frame_action(
+                actions,
+                PanelAction::UpdateTurnControls {
+                    session_id: session.id.clone(),
+                    model: non_empty(model),
+                    effort: non_empty(effort),
+                    skills,
+                },
+            );
         }
     }
 
@@ -2124,14 +2220,14 @@ impl AgentSessionsUi {
                     .button(catalog.t("agent_sessions.interrupt", &[]))
                     .clicked()
             {
-                actions.push(PanelAction::Interrupt(session.id.clone()));
+                queue_frame_action(actions, PanelAction::Interrupt(session.id.clone()));
             }
             if session.status == AgentSessionStatus::Completed
                 && ui
                     .button(catalog.t("agent_sessions.acknowledge_completion", &[]))
                     .clicked()
             {
-                actions.push(PanelAction::Acknowledge(session.id.clone()));
+                queue_frame_action(actions, PanelAction::Acknowledge(session.id.clone()));
             }
         });
         ui.horizontal(|ui| {
@@ -2177,7 +2273,7 @@ impl AgentSessionsUi {
                     )
                     .clicked()
                 {
-                    actions.push(PanelAction::ResumePersisted(session.id.clone()));
+                    queue_frame_action(actions, PanelAction::ResumePersisted(session.id.clone()));
                 }
                 if ui
                     .add_enabled(
@@ -2186,7 +2282,7 @@ impl AgentSessionsUi {
                     )
                     .clicked()
                 {
-                    actions.push(PanelAction::ReadPersisted(session.id.clone()));
+                    queue_frame_action(actions, PanelAction::ReadPersisted(session.id.clone()));
                 }
                 if ui
                     .add_enabled(
@@ -2195,7 +2291,7 @@ impl AgentSessionsUi {
                     )
                     .clicked()
                 {
-                    actions.push(PanelAction::ArchivePersisted(session.id.clone()));
+                    queue_frame_action(actions, PanelAction::ArchivePersisted(session.id.clone()));
                 }
                 if ui
                     .add_enabled(
@@ -2204,7 +2300,7 @@ impl AgentSessionsUi {
                     )
                     .clicked()
                 {
-                    actions.push(PanelAction::DeletePersisted(session.id.clone()));
+                    queue_frame_action(actions, PanelAction::DeletePersisted(session.id.clone()));
                 }
                 if request_pending {
                     ui.weak(catalog.t("agent_sessions.server_waiting", &[]));
@@ -2228,6 +2324,7 @@ impl AgentSessionsUi {
                         .hint_text(catalog.t("agent_sessions.steer_hint", &[])),
                 );
                 text_input_ids.push(response.id);
+                truncate_utf8(&mut self.steer_input, AGENT_SESSION_TEXT_INPUT_MAX_BYTES);
                 if ui
                     .add_enabled(
                         !self.steer_input.trim().is_empty(),
@@ -2235,11 +2332,14 @@ impl AgentSessionsUi {
                     )
                     .clicked()
                 {
-                    actions.push(PanelAction::Steer {
-                        session_id: session.id.clone(),
-                        prompt: std::mem::take(&mut self.steer_input),
-                        skills: session.skills.clone(),
-                    });
+                    queue_frame_action(
+                        actions,
+                        PanelAction::Steer {
+                            session_id: session.id.clone(),
+                            prompt: std::mem::take(&mut self.steer_input),
+                            skills: session.skills.clone(),
+                        },
+                    );
                 }
             });
         }
@@ -2269,41 +2369,53 @@ impl AgentSessionsUi {
                         .button(catalog.t("agent_sessions.allow_once", &[]))
                         .clicked()
                     {
-                        actions.push(PanelAction::Approval {
-                            session_id: session.id.clone(),
-                            request_key: approval.request_key.clone(),
-                            decision: AgentApprovalDecision::Accept,
-                        });
+                        queue_frame_action(
+                            actions,
+                            PanelAction::Approval {
+                                session_id: session.id.clone(),
+                                request_key: approval.request_key.clone(),
+                                decision: AgentApprovalDecision::Accept,
+                            },
+                        );
                     }
                     if ui
                         .button(catalog.t("agent_sessions.allow_for_session", &[]))
                         .clicked()
                     {
-                        actions.push(PanelAction::Approval {
-                            session_id: session.id.clone(),
-                            request_key: approval.request_key.clone(),
-                            decision: AgentApprovalDecision::AcceptForSession,
-                        });
+                        queue_frame_action(
+                            actions,
+                            PanelAction::Approval {
+                                session_id: session.id.clone(),
+                                request_key: approval.request_key.clone(),
+                                decision: AgentApprovalDecision::AcceptForSession,
+                            },
+                        );
                     }
                     if ui
                         .button(catalog.t("agent_sessions.decline", &[]))
                         .clicked()
                     {
-                        actions.push(PanelAction::Approval {
-                            session_id: session.id.clone(),
-                            request_key: approval.request_key.clone(),
-                            decision: AgentApprovalDecision::Decline,
-                        });
+                        queue_frame_action(
+                            actions,
+                            PanelAction::Approval {
+                                session_id: session.id.clone(),
+                                request_key: approval.request_key.clone(),
+                                decision: AgentApprovalDecision::Decline,
+                            },
+                        );
                     }
                     if ui
                         .button(catalog.t("agent_sessions.cancel_task", &[]))
                         .clicked()
                     {
-                        actions.push(PanelAction::Approval {
-                            session_id: session.id.clone(),
-                            request_key: approval.request_key.clone(),
-                            decision: AgentApprovalDecision::Cancel,
-                        });
+                        queue_frame_action(
+                            actions,
+                            PanelAction::Approval {
+                                session_id: session.id.clone(),
+                                request_key: approval.request_key.clone(),
+                                decision: AgentApprovalDecision::Cancel,
+                            },
+                        );
                     }
                 });
             });
@@ -2414,6 +2526,7 @@ impl AgentSessionsUi {
                     .desired_rows(2),
             );
             text_input_ids.push(follow_up_response.id);
+            truncate_utf8(&mut self.follow_up, AGENT_SESSION_TEXT_INPUT_MAX_BYTES);
             if self.focus_follow_up {
                 follow_up_response.request_focus();
                 self.focus_follow_up = false;
@@ -2425,11 +2538,14 @@ impl AgentSessionsUi {
                 )
                 .clicked()
             {
-                actions.push(PanelAction::Submit {
-                    session_id: session.id,
-                    prompt: std::mem::take(&mut self.follow_up),
-                    cwd: workspace_cwd,
-                });
+                queue_frame_action(
+                    actions,
+                    PanelAction::Submit {
+                        session_id: session.id,
+                        prompt: std::mem::take(&mut self.follow_up),
+                        cwd: workspace_cwd,
+                    },
+                );
             }
         }
     }
@@ -2799,7 +2915,7 @@ impl AgentSessionsUi {
     fn activate_surface(&mut self, id: AgentSurfaceId, actions: &mut Vec<PanelAction>) {
         self.select_surface(id.clone());
         if matches!(id, AgentSurfaceId::Pty { .. }) {
-            actions.push(PanelAction::FocusPty(id));
+            queue_frame_action(actions, PanelAction::FocusPty(id));
         }
     }
 }
@@ -2874,8 +2990,14 @@ enum PanelAction {
     InterruptPty(AgentSurfaceId),
 }
 
+fn queue_frame_action(slot: &mut Vec<PanelAction>, action: PanelAction) {
+    if slot.is_empty() {
+        slot.push(action);
+    }
+}
+
 #[allow(dead_code)] // Reachable from the pending App-level history import.
-fn persisted_title(row: &StructuredThreadRow, catalog: &i18n::Catalog) -> String {
+fn persisted_title(row: &AgentSessionPersistedRow, catalog: &i18n::Catalog) -> String {
     let title = row.title.trim();
     if title.is_empty() {
         catalog.t(
@@ -2887,10 +3009,20 @@ fn persisted_title(row: &StructuredThreadRow, catalog: &i18n::Catalog) -> String
     }
 }
 
+fn persisted_row_retained_bytes(row: &AgentSessionPersistedRow) -> usize {
+    row.local_session_id
+        .len()
+        .saturating_add(row.workspace_id.len())
+        .saturating_add(row.thread_id.len())
+        .saturating_add(row.title.len())
+        .saturating_add(row.cwd.len())
+        .saturating_add(row.model.as_ref().map_or(0, String::len))
+}
+
 #[allow(dead_code)] // Reachable from the pending App-level history import.
 fn apply_persisted_metadata(
     session: &mut AgentSession,
-    row: &StructuredThreadRow,
+    row: &AgentSessionPersistedRow,
     catalog: &i18n::Catalog,
 ) {
     session.workspace_id = Some(row.workspace_id.clone());
@@ -3160,6 +3292,17 @@ fn clear_sensitive_string(value: &mut String) {
     value.clear();
 }
 
+fn truncate_utf8(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3172,8 +3315,8 @@ mod tests {
         i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap()
     }
 
-    fn persisted_row(local_session_id: &str, thread_id: &str) -> StructuredThreadRow {
-        StructuredThreadRow {
+    fn persisted_row(local_session_id: &str, thread_id: &str) -> AgentSessionPersistedRow {
+        AgentSessionPersistedRow {
             local_session_id: local_session_id.to_owned(),
             workspace_id: "ws-1".to_owned(),
             thread_id: thread_id.to_owned(),
@@ -3241,16 +3384,16 @@ mod tests {
     fn sync_llm_config는_config를_오버라이드로_반영한다() {
         let mut ui = AgentSessionsUi::new();
         // 기본: 오버라이드 없음.
-        ui.sync_llm_config(&AgentsConfig::default());
+        ui.sync_controller_config(&AgentsConfig::default());
         assert_eq!(ui.llm_override, Ok(None));
         // oss / custom 반영.
-        ui.sync_llm_config(&AgentsConfig {
+        ui.sync_controller_config(&AgentsConfig {
             codex_llm_provider: Some("oss".to_owned()),
             codex_llm_base_url: None,
             codex_llm_wire: None,
         });
         assert_eq!(ui.llm_override, Ok(Some(CodexLlmOverride::Oss)));
-        ui.sync_llm_config(&AgentsConfig {
+        ui.sync_controller_config(&AgentsConfig {
             codex_llm_provider: Some("custom".to_owned()),
             codex_llm_base_url: Some("http://localhost:11434/v1".to_owned()),
             codex_llm_wire: None,
@@ -3263,7 +3406,7 @@ mod tests {
             }))
         );
         // wire responses는 직결 경로로 반영된다 (PR-L5).
-        ui.sync_llm_config(&AgentsConfig {
+        ui.sync_controller_config(&AgentsConfig {
             codex_llm_provider: Some("custom".to_owned()),
             codex_llm_base_url: Some("http://localhost:11434/v1".to_owned()),
             codex_llm_wire: Some("responses".to_owned()),
@@ -3276,7 +3419,7 @@ mod tests {
             }))
         );
         // custom인데 base URL 없음 → Err (spawn 차단 사유 보존).
-        ui.sync_llm_config(&AgentsConfig {
+        ui.sync_controller_config(&AgentsConfig {
             codex_llm_provider: Some("custom".to_owned()),
             codex_llm_base_url: None,
             codex_llm_wire: None,
@@ -3287,7 +3430,7 @@ mod tests {
     #[test]
     fn 잘못된_llm_설정은_ensure_client가_spawn_전에_거부한다() {
         let mut ui = AgentSessionsUi::new();
-        ui.sync_llm_config(&AgentsConfig {
+        ui.sync_controller_config(&AgentsConfig {
             codex_llm_provider: Some("custom".to_owned()),
             codex_llm_base_url: None,
             codex_llm_wire: None,
@@ -3360,6 +3503,97 @@ mod tests {
     }
 
     #[test]
+    fn deferred_action_boundary_keeps_show_host_free_and_executes_once() {
+        let host = Arc::new(CountingHost::default());
+        let mut state = AgentSessionsUi::new().with_app_server_host(host.clone());
+        let snapshot = AgentSessionsSecretsSnapshot::new(7, false);
+        let mut config = AgentsConfig::default();
+        let context = egui::Context::default();
+
+        for _ in 0..300 {
+            let output = state.show(
+                &context,
+                AgentSessionsFrameInput {
+                    workspace_id: "workspace-1",
+                    workspace_cwd: Some("/repo".to_owned()),
+                    pty_surfaces: Vec::new(),
+                    agents_config: &mut config,
+                    secrets_snapshot: &snapshot,
+                    ollama_models: None,
+                },
+            );
+            assert!(output.deferred_action.is_none());
+        }
+        assert_eq!(host.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        let deferred = AgentSessionsDeferredAction {
+            generation: state.frame_generation,
+            action: PanelAction::Start {
+                workspace_id: "workspace-1".to_owned(),
+                prompt: "bounded request".to_owned(),
+                model: String::new(),
+                effort: String::new(),
+                skills: Vec::new(),
+                cwd: Some("/repo".to_owned()),
+            },
+        };
+        assert_eq!(
+            state.execute_deferred(deferred, &context),
+            Some(AgentSessionsRequest::RevealWorkspace(
+                "workspace-1".to_owned()
+            ))
+        );
+        assert_eq!(host.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn deferred_action_boundary_rejects_superseded_generation() {
+        let host = Arc::new(CountingHost::default());
+        let mut state = AgentSessionsUi::new().with_app_server_host(host.clone());
+        let deferred = AgentSessionsDeferredAction {
+            generation: state.frame_generation,
+            action: PanelAction::RefreshCatalog {
+                cwd: None,
+                force_reload: false,
+            },
+        };
+        state.frame_generation = state.frame_generation.wrapping_add(1);
+        assert_eq!(
+            state.execute_deferred(deferred, &egui::Context::default()),
+            None
+        );
+        assert_eq!(host.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn deferred_action_boundary_keeps_only_first_and_bounds_text() {
+        let mut actions = Vec::new();
+        queue_frame_action(
+            &mut actions,
+            PanelAction::FocusPty(AgentSurfaceId::Pty {
+                workspace_id: "workspace-1".to_owned(),
+                pane_id: "pane-1".to_owned(),
+                session_id: runtime::SessionId(1),
+            }),
+        );
+        queue_frame_action(
+            &mut actions,
+            PanelAction::InterruptPty(AgentSurfaceId::Pty {
+                workspace_id: "workspace-1".to_owned(),
+                pane_id: "pane-2".to_owned(),
+                session_id: runtime::SessionId(2),
+            }),
+        );
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], PanelAction::FocusPty(_)));
+
+        let mut text = format!("{}한", "x".repeat(AGENT_SESSION_TEXT_INPUT_MAX_BYTES));
+        truncate_utf8(&mut text, AGENT_SESSION_TEXT_INPUT_MAX_BYTES);
+        assert_eq!(text.len(), AGENT_SESSION_TEXT_INPUT_MAX_BYTES);
+        assert!(text.is_char_boundary(text.len()));
+    }
+
+    #[test]
     fn api_key_mutation_callbacks_advance_generation_only_after_success() {
         let mut state = AgentSessionsUi::new();
         state.api_key_pending = Some(ApiKeyMutationKind::Save);
@@ -3376,7 +3610,7 @@ mod tests {
     fn api_key_host_failure_stops_custom_client_before_spawn() {
         let host = Arc::new(CountingHost::default());
         let mut ui = AgentSessionsUi::new().with_app_server_host(host.clone());
-        ui.sync_llm_config(&AgentsConfig {
+        ui.sync_controller_config(&AgentsConfig {
             codex_llm_provider: Some("custom".to_owned()),
             codex_llm_base_url: Some("http://localhost:11434/v1".to_owned()),
             codex_llm_wire: None,
@@ -3395,11 +3629,39 @@ mod tests {
             .next()
             .unwrap();
         for forbidden in [
+            ["storage", "::"].concat(),
+            ["std::", "fs"].concat(),
+            ["std::", "process"].concat(),
+            ["request_repaint_", "after"].concat(),
+            ["req", "west"].concat(),
+            ["Tcp", "Stream"].concat(),
+            ["Udp", "Socket"].concat(),
+            ["clip", "board"].concat(),
+            ["r", "fd::"].concat(),
             ["secret::", "SecretString"].concat(),
             ["CodexLlm", "ApiKeyStore"].concat(),
             ["Keyring", "SecretStore"].concat(),
+            ["CodexAppServerClient", "::spawn"].concat(),
         ] {
             assert!(!source.contains(&forbidden), "forbidden edge: {forbidden}");
+        }
+
+        let render_source = source
+            .split("    pub fn show(")
+            .nth(1)
+            .and_then(|tail| tail.split("    fn render_agent_controls(").next())
+            .expect("show source region");
+        for forbidden in [
+            ["ensure_", "client("].concat(),
+            ["apply_", "action("].concat(),
+            ["sync_controller_", "config("].concat(),
+            ["request_repaint_", "after("].concat(),
+            ["::", "spawn("].concat(),
+        ] {
+            assert!(
+                !render_source.contains(&forbidden),
+                "render host edge: {forbidden}"
+            );
         }
     }
 
@@ -3540,6 +3802,31 @@ mod tests {
             ui.selected_surface,
             Some(AgentSurfaceId::Structured { ref session_id }) if session_id == "local-1"
         ));
+    }
+
+    #[test]
+    fn persisted_projection_is_item_and_byte_bounded() {
+        let mut ui = AgentSessionsUi::new();
+        let rows = (0..=AGENT_SESSION_PERSISTED_MAX_ITEMS)
+            .map(|index| persisted_row(&format!("local-{index}"), &format!("thread-{index}")))
+            .collect();
+        ui.import_persisted_threads(rows);
+        assert_eq!(
+            ui.persisted_threads.len(),
+            AGENT_SESSION_PERSISTED_MAX_ITEMS
+        );
+        assert_eq!(ui.sessions.len(), AGENT_SESSION_PERSISTED_MAX_ITEMS);
+        assert!(ui.persisted_thread_bytes <= AGENT_SESSION_PERSISTED_TOTAL_MAX_BYTES);
+
+        let before = ui.persisted_thread_bytes;
+        let mut oversized = persisted_row("local-0", "thread-0");
+        oversized.title = "x".repeat(AGENT_SESSION_PERSISTED_ROW_MAX_BYTES);
+        ui.import_persisted_threads(vec![oversized]);
+        assert_eq!(ui.persisted_thread_bytes, before);
+        assert_ne!(
+            ui.persisted_threads["local-0"].title.len(),
+            AGENT_SESSION_PERSISTED_ROW_MAX_BYTES
+        );
     }
 
     #[test]

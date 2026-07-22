@@ -16,7 +16,6 @@ use std::path::Path;
 use anyhow::Context;
 
 use crate::env::EnvValue;
-use crate::storage::Db;
 
 /// dotenv 자동 profile의 kind. 환경 UI에는 일반 profile처럼 보인다.
 pub const DOTENV_PROFILE_KIND: &str = "dotenv";
@@ -40,6 +39,190 @@ pub struct DotenvSyncReport {
     pub removed: usize,
 }
 
+/// Persistence projection used by dotenv orchestration. Storage rows must be mapped at the app
+/// composition root rather than crossing into this module.
+pub struct DotenvProfile {
+    pub id: String,
+    pub kind: String,
+}
+
+/// Environment variable projection used by dotenv orchestration.
+pub struct DotenvVariable {
+    pub key: String,
+    pub value: EnvValue,
+}
+
+/// Logical credential pointer resolved by the app-owned repository adapter. The physical
+/// coordinate is intentionally non-Clone/non-Serialize and never appears in Debug output.
+pub struct DotenvSecretLocation {
+    keyring_service: String,
+    physical_pointer: String,
+}
+
+impl DotenvSecretLocation {
+    pub fn new(keyring_service: String, physical_pointer: String) -> Self {
+        Self {
+            keyring_service,
+            physical_pointer,
+        }
+    }
+}
+
+impl std::fmt::Debug for DotenvSecretLocation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DotenvSecretLocation")
+            .field("coordinate", &"REDACTED")
+            .finish()
+    }
+}
+
+/// Metadata for a newly staged dotenv credential. The masked hint and workspace association are
+/// private capabilities, so this DTO is non-Clone/non-Serialize and fully redacted in Debug.
+pub struct DotenvCredentialDraft {
+    id: String,
+    provider: String,
+    label: String,
+    credential_kind: String,
+    masked_hint: Option<String>,
+    workspace_id: Option<String>,
+}
+
+impl DotenvCredentialDraft {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn credential_kind(&self) -> &str {
+        &self.credential_kind
+    }
+
+    pub fn masked_hint(&self) -> Option<&str> {
+        self.masked_hint.as_deref()
+    }
+
+    pub fn workspace_id(&self) -> Option<&str> {
+        self.workspace_id.as_deref()
+    }
+}
+
+impl std::fmt::Debug for DotenvCredentialDraft {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DotenvCredentialDraft")
+            .field("credential", &"REDACTED")
+            .finish()
+    }
+}
+
+/// App-owned persistence port for dotenv orchestration. Implementations map concrete storage rows
+/// at the composition root and must enforce the caller-provided scan limits before returning.
+pub trait DotenvRepository {
+    fn credential_secret_location(
+        &mut self,
+        credential_id: &str,
+    ) -> anyhow::Result<Option<DotenvSecretLocation>>;
+    fn acknowledge_physical_secret_slot_deleted(
+        &mut self,
+        logical_id: &str,
+        physical_slot: &str,
+    ) -> anyhow::Result<()>;
+    fn register_physical_secret_slot_staging(
+        &mut self,
+        logical_id: &str,
+        physical_slot: &str,
+    ) -> anyhow::Result<()>;
+    fn insert_credential_with_secret_slot(
+        &mut self,
+        draft: &DotenvCredentialDraft,
+        physical_slot: &str,
+    ) -> anyhow::Result<()>;
+    fn publish_credential_secret_slot_cas(
+        &mut self,
+        logical_id: &str,
+        expected_previous_pointer: &str,
+        physical_slot: &str,
+        masked_hint: Option<&str>,
+    ) -> anyhow::Result<bool>;
+    fn delete_credential_if_unused_cas(
+        &mut self,
+        logical_id: &str,
+        expected_pointer: &str,
+    ) -> anyhow::Result<bool>;
+    fn list_env_profiles(
+        &mut self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<DotenvProfile>>;
+    fn insert_env_profile(
+        &mut self,
+        workspace_id: &str,
+        name: &str,
+        kind: &str,
+    ) -> anyhow::Result<String>;
+    fn list_env_vars(
+        &mut self,
+        profile_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<DotenvVariable>>;
+    fn list_dotenv_owned_credential_ids(
+        &mut self,
+        limit: usize,
+    ) -> anyhow::Result<std::collections::HashSet<String>>;
+    fn plain_env_value_allowed(&mut self, key: &str, value: &str) -> bool;
+    fn upsert_env_var(
+        &mut self,
+        profile_id: &str,
+        key: &str,
+        value: &EnvValue,
+    ) -> anyhow::Result<()>;
+    fn delete_env_var(&mut self, profile_id: &str, key: &str) -> anyhow::Result<()>;
+    fn delete_env_profile(&mut self, profile_id: &str) -> anyhow::Result<()>;
+}
+
+const DOTENV_PROFILE_SCAN_MAX: usize = 256;
+const DOTENV_VARIABLE_SCAN_MAX: usize = 4_096;
+
+/// Bounded, storage-neutral dotenv input prepared from the workspace files.
+///
+/// Values may contain credentials, so this plan is deliberately non-Clone/non-Serialize and its
+/// Debug output reports only bounded cardinality. The worker can now distinguish source I/O and
+/// parsing failures from persistence/keyring failures without retaining raw dotenv contents.
+pub struct DotenvSyncPlan {
+    entries: Vec<(String, String)>,
+    value_bytes: usize,
+}
+
+impl std::fmt::Debug for DotenvSyncPlan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DotenvSyncPlan")
+            .field("entries", &self.entries.len())
+            .field("value_bytes", &self.value_bytes)
+            .finish()
+    }
+}
+
+impl DotenvSyncPlan {
+    #[cfg(test)]
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub fn value_bytes(&self) -> usize {
+        self.value_bytes
+    }
+}
+
 const ERROR_SECRET_LOCATION_READ: &str = "dotenv_secret_location_read_failed";
 const ERROR_SECRET_LOCATION_MISSING: &str = "dotenv_secret_location_missing";
 const ERROR_SECRET_LOCATION_SERVICE: &str = "dotenv_secret_location_service_invalid";
@@ -57,6 +240,7 @@ const ERROR_SECRET_ROTATE_PUBLISH: &str = "dotenv_secret_rotate_publish_failed";
 const ERROR_SECRET_ROTATE_STALE: &str = "dotenv_secret_rotate_stale";
 const ERROR_SECRET_DELETE_CAS: &str = "dotenv_secret_delete_cas_failed";
 const ERROR_SECRET_ENV_BIND: &str = "dotenv_secret_env_bind_failed";
+const ERROR_SECRET_REDACTION: &str = "dotenv_secret_redaction_unavailable";
 const ERROR_SECRET_INTERNAL: &str = "dotenv_secret_internal_failed";
 const ERROR_DOTENV_BYTES: &str = "dotenv_total_bytes_exceeded";
 
@@ -83,6 +267,7 @@ fn secret_error_code(error: &anyhow::Error) -> &'static str {
         ERROR_SECRET_ROTATE_STALE => ERROR_SECRET_ROTATE_STALE,
         ERROR_SECRET_DELETE_CAS => ERROR_SECRET_DELETE_CAS,
         ERROR_SECRET_ENV_BIND => ERROR_SECRET_ENV_BIND,
+        ERROR_SECRET_REDACTION => ERROR_SECRET_REDACTION,
         _ => ERROR_SECRET_INTERNAL,
     }
 }
@@ -103,8 +288,11 @@ struct ResolvedSecretSlot {
     physical: secret::PhysicalSecretSlot,
 }
 
-fn resolve_secret_slot(db: &Db, credential_id: &str) -> anyhow::Result<ResolvedSecretSlot> {
-    let location = db
+fn resolve_secret_slot(
+    repository: &mut dyn DotenvRepository,
+    credential_id: &str,
+) -> anyhow::Result<ResolvedSecretSlot> {
+    let location = repository
         .credential_secret_location(credential_id)
         .map_err(|_| static_secret_error(ERROR_SECRET_LOCATION_READ))?
         .ok_or_else(|| static_secret_error(ERROR_SECRET_LOCATION_MISSING))?;
@@ -113,7 +301,7 @@ fn resolve_secret_slot(db: &Db, credential_id: &str) -> anyhow::Result<ResolvedS
     }
     let logical = secret::LogicalCredentialId::new(credential_id.to_owned())
         .map_err(|_| static_secret_error(ERROR_SECRET_LOCATION_LOGICAL))?;
-    let physical = secret::PhysicalSecretSlot::parse(location.keyring_username)
+    let physical = secret::PhysicalSecretSlot::parse(location.physical_pointer)
         .map_err(|_| static_secret_error(ERROR_SECRET_LOCATION_PHYSICAL))?;
     if !physical.belongs_to(&logical) {
         return Err(static_secret_error(ERROR_SECRET_LOCATION_OWNER));
@@ -122,19 +310,20 @@ fn resolve_secret_slot(db: &Db, credential_id: &str) -> anyhow::Result<ResolvedS
 }
 
 fn cleanup_secret_slot(
-    db: &Db,
+    repository: &mut dyn DotenvRepository,
     secret_store: &dyn secret::SecretStore,
     slot: &ResolvedSecretSlot,
 ) -> anyhow::Result<()> {
     secret::delete_secret_bundle(secret_store, &slot.physical)
         .map_err(|_| static_secret_error(ERROR_SECRET_BUNDLE_DELETE))?;
-    db.acknowledge_physical_secret_slot_deleted(slot.logical.as_str(), slot.physical.as_str())
+    repository
+        .acknowledge_physical_secret_slot_deleted(slot.logical.as_str(), slot.physical.as_str())
         .map_err(|_| static_secret_error(ERROR_SECRET_LEDGER_ACK))?;
     Ok(())
 }
 
 fn cleanup_secret_slot_best_effort(
-    db: &Db,
+    repository: &mut dyn DotenvRepository,
     secret_store: &dyn secret::SecretStore,
     slot: &ResolvedSecretSlot,
     phase: &'static str,
@@ -145,7 +334,7 @@ fn cleanup_secret_slot_best_effort(
         warn_secret_failure(phase, ERROR_SECRET_BUNDLE_DELETE);
         return;
     }
-    if db
+    if repository
         .acknowledge_physical_secret_slot_deleted(slot.logical.as_str(), slot.physical.as_str())
         .is_err()
     {
@@ -154,7 +343,7 @@ fn cleanup_secret_slot_best_effort(
 }
 
 fn stage_access_only_secret(
-    db: &Db,
+    repository: &mut dyn DotenvRepository,
     secret_store: &dyn secret::SecretStore,
     logical: secret::LogicalCredentialId,
     previous: Option<secret::PhysicalSecretSlot>,
@@ -162,7 +351,8 @@ fn stage_access_only_secret(
 ) -> anyhow::Result<ResolvedSecretSlot> {
     let plan = secret::SecretBundleStagePlan::allocate(logical, previous)
         .map_err(|_| static_secret_error(ERROR_SECRET_STAGE_PLAN))?;
-    db.register_physical_secret_slot_staging(plan.logical_id().as_str(), plan.new_slot().as_str())
+    repository
+        .register_physical_secret_slot_staging(plan.logical_id().as_str(), plan.new_slot().as_str())
         .map_err(|_| static_secret_error(ERROR_SECRET_LEDGER_STAGE))?;
 
     let staged_slot = ResolvedSecretSlot {
@@ -176,14 +366,14 @@ fn stage_access_only_secret(
     )
     .is_err()
     {
-        cleanup_secret_slot_best_effort(db, secret_store, &staged_slot, "stage_rollback");
+        cleanup_secret_slot_best_effort(repository, secret_store, &staged_slot, "stage_rollback");
         return Err(static_secret_error(ERROR_SECRET_BUNDLE_STAGE));
     }
     Ok(staged_slot)
 }
 
 fn create_dotenv_credential(
-    db: &Db,
+    repository: &mut dyn DotenvRepository,
     secret_store: &dyn secret::SecretStore,
     workspace_id: &str,
     key: &str,
@@ -191,8 +381,8 @@ fn create_dotenv_credential(
 ) -> anyhow::Result<ResolvedSecretSlot> {
     let logical = secret::LogicalCredentialId::new(uuid::Uuid::new_v4().to_string())
         .map_err(|_| static_secret_error(ERROR_SECRET_LOCATION_LOGICAL))?;
-    let staged = stage_access_only_secret(db, secret_store, logical, None, value)?;
-    let meta = crate::storage::CredentialMeta {
+    let staged = stage_access_only_secret(repository, secret_store, logical, None, value)?;
+    let draft = DotenvCredentialDraft {
         id: staged.logical.as_str().to_owned(),
         provider: "env".to_owned(),
         label: format!("{key} (.env)"),
@@ -200,11 +390,11 @@ fn create_dotenv_credential(
         masked_hint: Some(secret::masked_hint(value.expose())),
         workspace_id: Some(workspace_id.to_owned()),
     };
-    if db
-        .insert_credential_with_secret_slot(&meta, staged.physical.as_str(), None)
+    if repository
+        .insert_credential_with_secret_slot(&draft, staged.physical.as_str())
         .is_err()
     {
-        cleanup_secret_slot_best_effort(db, secret_store, &staged, "create_rollback");
+        cleanup_secret_slot_best_effort(repository, secret_store, &staged, "create_rollback");
         return Err(static_secret_error(ERROR_SECRET_CREATE_PUBLISH));
     }
     Ok(staged)
@@ -214,12 +404,12 @@ fn create_dotenv_credential(
 /// publishing a fresh access-only bundle. Once CAS publishes the new pointer, old cleanup is
 /// best-effort because its durable orphan row is the crash-safe retry source.
 fn rotate_dotenv_credential(
-    db: &Db,
+    repository: &mut dyn DotenvRepository,
     secret_store: &dyn secret::SecretStore,
     credential_id: &str,
     value: &secret::SecretString,
 ) -> anyhow::Result<bool> {
-    let previous = resolve_secret_slot(db, credential_id)?;
+    let previous = resolve_secret_slot(repository, credential_id)?;
     if let Ok(bundle) = secret::read_secret_bundle(secret_store, &previous.physical)
         && bundle.access().expose() == value.expose()
         && bundle.refresh().is_none()
@@ -229,45 +419,44 @@ fn rotate_dotenv_credential(
     }
 
     let staged = stage_access_only_secret(
-        db,
+        repository,
         secret_store,
         previous.logical.clone(),
         Some(previous.physical.clone()),
         value,
     )?;
-    let published = match db.publish_credential_secret_slot_cas(
+    let published = match repository.publish_credential_secret_slot_cas(
         previous.logical.as_str(),
         previous.physical.as_str(),
         staged.physical.as_str(),
-        None,
         Some(&secret::masked_hint(value.expose())),
     ) {
         Ok(published) => published,
         Err(_) => {
-            cleanup_secret_slot_best_effort(db, secret_store, &staged, "rotate_rollback");
+            cleanup_secret_slot_best_effort(repository, secret_store, &staged, "rotate_rollback");
             return Err(static_secret_error(ERROR_SECRET_ROTATE_PUBLISH));
         }
     };
     if !published {
-        cleanup_secret_slot_best_effort(db, secret_store, &staged, "rotate_stale_cleanup");
+        cleanup_secret_slot_best_effort(repository, secret_store, &staged, "rotate_stale_cleanup");
         return Err(static_secret_error(ERROR_SECRET_ROTATE_STALE));
     }
-    cleanup_secret_slot_best_effort(db, secret_store, &previous, "rotate_old_cleanup");
+    cleanup_secret_slot_best_effort(repository, secret_store, &previous, "rotate_old_cleanup");
     Ok(true)
 }
 
 fn retire_dotenv_credential(
-    db: &Db,
+    repository: &mut dyn DotenvRepository,
     secret_store: &dyn secret::SecretStore,
     target: &ResolvedSecretSlot,
 ) -> anyhow::Result<bool> {
-    let deleted = db
+    let deleted = repository
         .delete_credential_if_unused_cas(target.logical.as_str(), target.physical.as_str())
         .map_err(|_| static_secret_error(ERROR_SECRET_DELETE_CAS))?;
     if !deleted {
         return Ok(false);
     }
-    cleanup_secret_slot(db, secret_store, target)?;
+    cleanup_secret_slot(repository, secret_store, target)?;
     Ok(true)
 }
 
@@ -580,13 +769,13 @@ fn ensure_env_gitignored(root: &Path) -> anyhow::Result<()> {
 /// 방지 — 다음 force 동기화가 재시도). UI가 만든 credential은 참조만 사라지고 자격증명
 /// 목록에 보존된다(remove_workspace_dotenv의 provider="env" 전용 삭제 관례와 구분).
 pub fn migrate_legacy_profiles_to_dotenv(
-    db: &mut Db,
+    repository: &mut dyn DotenvRepository,
     secret_store: &dyn secret::SecretStore,
     workspace_id: &str,
     root: &Path,
 ) -> anyhow::Result<usize> {
-    let legacy: Vec<_> = db
-        .list_env_profiles(workspace_id)?
+    let legacy: Vec<_> = repository
+        .list_env_profiles(workspace_id, DOTENV_PROFILE_SCAN_MAX)?
         .into_iter()
         .filter(|p| p.kind != DOTENV_PROFILE_KIND)
         .collect();
@@ -595,13 +784,13 @@ pub fn migrate_legacy_profiles_to_dotenv(
     }
     let mut migrated = 0usize;
     for profile in &legacy {
-        let vars = db.list_env_vars(&profile.id)?;
+        let vars = repository.list_env_vars(&profile.id, DOTENV_VARIABLE_SCAN_MAX)?;
         let mut remaining = vars.len();
         for var in &vars {
             let value = match &var.value {
                 EnvValue::Plain(v) => v.clone(),
                 EnvValue::Secret { credential_id } => {
-                    let slot = match resolve_secret_slot(db, credential_id) {
+                    let slot = match resolve_secret_slot(repository, credential_id) {
                         Ok(slot) => slot,
                         Err(error) => {
                             warn_secret_failure("legacy_resolve", secret_error_code(&error));
@@ -625,12 +814,12 @@ pub fn migrate_legacy_profiles_to_dotenv(
                 );
                 continue;
             }
-            db.delete_env_var(&profile.id, &var.key)?;
+            repository.delete_env_var(&profile.id, &var.key)?;
             migrated += 1;
             remaining -= 1;
         }
         if remaining == 0 {
-            db.delete_env_profile(&profile.id)?;
+            repository.delete_env_profile(&profile.id)?;
         }
     }
     if migrated > 0 {
@@ -643,32 +832,28 @@ pub fn migrate_legacy_profiles_to_dotenv(
 /// 변수 → 전용 credential(참조 없을 때만) → keyring → profile 순. `.env` 파일이
 /// 원본이므로 재지정 시 그대로 복구된다 — 해제했는데 키가 화면에 남는 문제 해결.
 pub fn remove_workspace_dotenv(
-    db: &mut Db,
+    repository: &mut dyn DotenvRepository,
     secret_store: &dyn secret::SecretStore,
     workspace_id: &str,
 ) -> anyhow::Result<usize> {
-    let Some(profile) = db
-        .list_env_profiles(workspace_id)?
+    let Some(profile) = repository
+        .list_env_profiles(workspace_id, DOTENV_PROFILE_SCAN_MAX)?
         .into_iter()
         .find(|p| p.kind == DOTENV_PROFILE_KIND)
     else {
         return Ok(0);
     };
-    let vars = db.list_env_vars(&profile.id)?;
+    let vars = repository.list_env_vars(&profile.id, DOTENV_VARIABLE_SCAN_MAX)?;
     // dotenv가 **직접 만든** credential(provider="env")만 삭제 후보 — 사용자가 dotenv
     // profile에 수동으로 붙인 외부 credential은 참조가 사라져도 보존한다(codex High).
-    let dotenv_owned: std::collections::HashSet<String> = db
-        .list_credential_secret_records(secret::VERSIONED_SECRET_BUNDLE_SLOT_CEILING)?
-        .into_iter()
-        .filter(|record| record.meta.provider == "env")
-        .map(|record| record.meta.id)
-        .collect();
+    let dotenv_owned = repository
+        .list_dotenv_owned_credential_ids(secret::VERSIONED_SECRET_BUNDLE_SLOT_CEILING)?;
     let mut removed = 0usize;
     for var in &vars {
         let cleanup_target = if let EnvValue::Secret { credential_id } = &var.value
             && dotenv_owned.contains(credential_id)
         {
-            match resolve_secret_slot(db, credential_id) {
+            match resolve_secret_slot(repository, credential_id) {
                 Ok(slot) => Some(slot),
                 Err(error) => {
                     warn_secret_failure("remove_resolve", secret_error_code(&error));
@@ -678,15 +863,15 @@ pub fn remove_workspace_dotenv(
         } else {
             None
         };
-        db.delete_env_var(&profile.id, &var.key)?;
+        repository.delete_env_var(&profile.id, &var.key)?;
         if let Some(target) = cleanup_target
-            && let Err(error) = retire_dotenv_credential(db, secret_store, &target)
+            && let Err(error) = retire_dotenv_credential(repository, secret_store, &target)
         {
             warn_secret_failure("remove_cleanup", secret_error_code(&error));
         }
         removed += 1;
     }
-    db.delete_env_profile(&profile.id)?;
+    repository.delete_env_profile(&profile.id)?;
     tracing::info!(removed, "프로젝트 해제 — dotenv profile 정리");
     Ok(removed)
 }
@@ -701,37 +886,55 @@ fn read_merged_dotenv(root: &Path) -> anyhow::Result<Option<Vec<(String, String)
     read_dotenv_merged_bounded(root)
 }
 
-/// workspace 루트의 dotenv 파일들(`.env` → `.env.local` 병합)을 dotenv profile로
-/// 동기화한다. 파일이 하나도 없으면 None.
-/// secret 저장이 하나라도 실패하면 그 키만 건너뛰고 계속한다(best-effort).
-pub fn sync_workspace_dotenv(
-    db: &Db,
+/// Performs only bounded dotenv source I/O + parsing and returns a redacted plan. No DB or keyring
+/// operation occurs here. A missing pair of dotenv files remains `None`, preserving the existing
+/// rule that a transient checkout difference must not erase persisted environment state.
+pub fn load_workspace_dotenv_plan(root: &Path) -> anyhow::Result<Option<DotenvSyncPlan>> {
+    let Some(entries) = read_merged_dotenv(root)? else {
+        return Ok(None);
+    };
+    let value_bytes = entries.iter().try_fold(0usize, |total, (_, value)| {
+        total
+            .checked_add(value.len())
+            .ok_or_else(|| static_secret_error(ERROR_DOTENV_BYTES))
+    })?;
+    anyhow::ensure!(
+        entries.len() <= DOTENV_ENTRIES_MAX && value_bytes <= DOTENV_TOTAL_BYTES_MAX,
+        ERROR_DOTENV_BYTES
+    );
+    Ok(Some(DotenvSyncPlan {
+        entries,
+        value_bytes,
+    }))
+}
+
+/// Applies one already bounded dotenv plan to persistence/keyring state. This phase performs no
+/// filesystem reads or writes, which gives the app worker an exact failure-injection seam and
+/// prevents a source re-read between validation and application.
+pub fn apply_workspace_dotenv_plan(
+    repository: &mut dyn DotenvRepository,
     secret_store: &dyn secret::SecretStore,
     redaction: &secret::RedactionService,
     workspace_id: &str,
-    root: &Path,
-) -> anyhow::Result<Option<DotenvSyncReport>> {
-    let Some(parsed) = read_merged_dotenv(root)? else {
-        return Ok(None); // dotenv 파일 없음 — 기존 profile은 보존
-    };
+    plan: DotenvSyncPlan,
+) -> anyhow::Result<DotenvSyncReport> {
+    let parsed = plan.entries;
 
     // dotenv profile 찾기/생성.
-    let profile_id = match db
-        .list_env_profiles(workspace_id)?
+    let profile_id = match repository
+        .list_env_profiles(workspace_id, DOTENV_PROFILE_SCAN_MAX)?
         .into_iter()
         .find(|p| p.kind == DOTENV_PROFILE_KIND)
     {
         Some(p) => p.id,
-        None => db.insert_env_profile(workspace_id, DOTENV_PROFILE_NAME, DOTENV_PROFILE_KIND)?,
+        None => {
+            repository.insert_env_profile(workspace_id, DOTENV_PROFILE_NAME, DOTENV_PROFILE_KIND)?
+        }
     };
 
-    let existing = db.list_env_vars(&profile_id)?;
-    let dotenv_owned: std::collections::HashSet<String> = db
-        .list_credential_secret_records(secret::VERSIONED_SECRET_BUNDLE_SLOT_CEILING)?
-        .into_iter()
-        .filter(|record| record.meta.provider == "env")
-        .map(|record| record.meta.id)
-        .collect();
+    let existing = repository.list_env_vars(&profile_id, DOTENV_VARIABLE_SCAN_MAX)?;
+    let dotenv_owned = repository
+        .list_dotenv_owned_credential_ids(secret::VERSIONED_SECRET_BUNDLE_SLOT_CEILING)?;
     let mut report = DotenvSyncReport::default();
 
     for (key, value) in &parsed {
@@ -740,20 +943,23 @@ pub fn sync_workspace_dotenv(
         // 키(DATABASE_URL/DB_URL/*_TOKEN 등)나 값을 우리가 Plain으로 저장하려다 upsert가
         // 실패해 동기화 전체가 중단됐다(2026-07-08 실측). 우리 휴리스틱(is_secret_key)에
         // 더해 storage가 거부하면 secret으로 저장한다.
-        let needs_secret = is_secret_key(key)
-            || Db::validate_env_var_for_persistence(key, &EnvValue::Plain(value.clone())).is_err();
+        let needs_secret = is_secret_key(key) || !repository.plain_env_value_allowed(key, value);
         if needs_secret {
             let secret = secret::SecretString::new(value.clone());
             // This operation owns only a bounded rotating redaction lease. Long-lived consumers
             // acquire their own execution lease when they resolve the physical slot; storing every
             // rotated dotenv value as a permanent corpus entry would make RSS grow over time.
-            let _redaction_lease = redaction.acquire_rotating(&secret).ok();
+            let Ok(_redaction_lease) = redaction.acquire_rotating(&secret) else {
+                warn_secret_failure("redaction", ERROR_SECRET_REDACTION);
+                continue;
+            };
 
             let (credential_id, newly_created) = match current.map(|v| &v.value) {
                 Some(EnvValue::Secret { credential_id })
                     if dotenv_owned.contains(credential_id) =>
                 {
-                    match rotate_dotenv_credential(db, secret_store, credential_id, &secret) {
+                    match rotate_dotenv_credential(repository, secret_store, credential_id, &secret)
+                    {
                         Ok(false) => continue,
                         Ok(true) => (credential_id.clone(), None),
                         Err(error) => {
@@ -762,7 +968,13 @@ pub fn sync_workspace_dotenv(
                         }
                     }
                 }
-                _ => match create_dotenv_credential(db, secret_store, workspace_id, key, &secret) {
+                _ => match create_dotenv_credential(
+                    repository,
+                    secret_store,
+                    workspace_id,
+                    key,
+                    &secret,
+                ) {
                     Ok(created) => (created.logical.as_str().to_owned(), Some(created)),
                     Err(error) => {
                         warn_secret_failure("create", secret_error_code(&error));
@@ -770,7 +982,7 @@ pub fn sync_workspace_dotenv(
                     }
                 },
             };
-            if db
+            if repository
                 .upsert_env_var(
                     &profile_id,
                     key,
@@ -781,7 +993,7 @@ pub fn sync_workspace_dotenv(
                 .is_err()
             {
                 if let Some(created) = newly_created.as_ref()
-                    && let Err(error) = retire_dotenv_credential(db, secret_store, created)
+                    && let Err(error) = retire_dotenv_credential(repository, secret_store, created)
                 {
                     warn_secret_failure("bind_rollback", secret_error_code(&error));
                 }
@@ -797,7 +1009,7 @@ pub fn sync_workspace_dotenv(
                 Some(EnvValue::Secret { credential_id })
                     if dotenv_owned.contains(credential_id) =>
                 {
-                    match resolve_secret_slot(db, credential_id) {
+                    match resolve_secret_slot(repository, credential_id) {
                         Ok(slot) => Some(slot),
                         Err(error) => {
                             warn_secret_failure("plain_replace_resolve", secret_error_code(&error));
@@ -807,9 +1019,9 @@ pub fn sync_workspace_dotenv(
                 }
                 _ => None,
             };
-            db.upsert_env_var(&profile_id, key, &EnvValue::Plain(value.clone()))?;
+            repository.upsert_env_var(&profile_id, key, &EnvValue::Plain(value.clone()))?;
             if let Some(target) = replaced_secret
-                && let Err(error) = retire_dotenv_credential(db, secret_store, &target)
+                && let Err(error) = retire_dotenv_credential(repository, secret_store, &target)
             {
                 warn_secret_failure("plain_replace_cleanup", secret_error_code(&error));
             }
@@ -825,7 +1037,7 @@ pub fn sync_workspace_dotenv(
         let cleanup_target = if let EnvValue::Secret { credential_id } = &var.value
             && dotenv_owned.contains(credential_id)
         {
-            match resolve_secret_slot(db, credential_id) {
+            match resolve_secret_slot(repository, credential_id) {
                 Ok(slot) => Some(slot),
                 Err(error) => {
                     warn_secret_failure("prune_resolve", secret_error_code(&error));
@@ -835,20 +1047,183 @@ pub fn sync_workspace_dotenv(
         } else {
             None
         };
-        db.delete_env_var(&profile_id, &var.key)?;
+        repository.delete_env_var(&profile_id, &var.key)?;
         if let Some(target) = cleanup_target
-            && let Err(error) = retire_dotenv_credential(db, secret_store, &target)
+            && let Err(error) = retire_dotenv_credential(repository, secret_store, &target)
         {
             warn_secret_failure("prune_cleanup", secret_error_code(&error));
         }
         report.removed += 1;
     }
-    Ok(Some(report))
+    Ok(report)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::Db;
+
+    impl DotenvRepository for Db {
+        fn credential_secret_location(
+            &mut self,
+            credential_id: &str,
+        ) -> anyhow::Result<Option<DotenvSecretLocation>> {
+            Db::credential_secret_location(self, credential_id).map(|location| {
+                location.map(|location| {
+                    DotenvSecretLocation::new(location.keyring_service, location.keyring_username)
+                })
+            })
+        }
+
+        fn acknowledge_physical_secret_slot_deleted(
+            &mut self,
+            logical_id: &str,
+            physical_slot: &str,
+        ) -> anyhow::Result<()> {
+            Db::acknowledge_physical_secret_slot_deleted(self, logical_id, physical_slot)
+                .map(|_| ())
+        }
+
+        fn register_physical_secret_slot_staging(
+            &mut self,
+            logical_id: &str,
+            physical_slot: &str,
+        ) -> anyhow::Result<()> {
+            Db::register_physical_secret_slot_staging(self, logical_id, physical_slot)
+        }
+
+        fn insert_credential_with_secret_slot(
+            &mut self,
+            draft: &DotenvCredentialDraft,
+            physical_slot: &str,
+        ) -> anyhow::Result<()> {
+            Db::insert_credential_with_secret_slot(
+                self,
+                &crate::storage::CredentialMeta {
+                    id: draft.id().to_owned(),
+                    provider: draft.provider().to_owned(),
+                    label: draft.label().to_owned(),
+                    credential_kind: draft.credential_kind().to_owned(),
+                    masked_hint: draft.masked_hint().map(str::to_owned),
+                    workspace_id: draft.workspace_id().map(str::to_owned),
+                },
+                physical_slot,
+                None,
+            )
+        }
+
+        fn publish_credential_secret_slot_cas(
+            &mut self,
+            logical_id: &str,
+            expected_previous_pointer: &str,
+            physical_slot: &str,
+            masked_hint: Option<&str>,
+        ) -> anyhow::Result<bool> {
+            Db::publish_credential_secret_slot_cas(
+                self,
+                logical_id,
+                expected_previous_pointer,
+                physical_slot,
+                None,
+                masked_hint,
+            )
+        }
+
+        fn delete_credential_if_unused_cas(
+            &mut self,
+            logical_id: &str,
+            expected_pointer: &str,
+        ) -> anyhow::Result<bool> {
+            Db::delete_credential_if_unused_cas(self, logical_id, expected_pointer)
+        }
+
+        fn list_env_profiles(
+            &mut self,
+            workspace_id: &str,
+            limit: usize,
+        ) -> anyhow::Result<Vec<DotenvProfile>> {
+            let rows = Db::list_env_profiles(self, workspace_id)?;
+            anyhow::ensure!(rows.len() <= limit, "dotenv profile scan limit exceeded");
+            Ok(rows
+                .into_iter()
+                .map(|row| DotenvProfile {
+                    id: row.id,
+                    kind: row.kind,
+                })
+                .collect())
+        }
+
+        fn insert_env_profile(
+            &mut self,
+            workspace_id: &str,
+            name: &str,
+            kind: &str,
+        ) -> anyhow::Result<String> {
+            Db::insert_env_profile(self, workspace_id, name, kind)
+        }
+
+        fn list_env_vars(
+            &mut self,
+            profile_id: &str,
+            limit: usize,
+        ) -> anyhow::Result<Vec<DotenvVariable>> {
+            let rows = Db::list_env_vars(self, profile_id)?;
+            anyhow::ensure!(rows.len() <= limit, "dotenv variable scan limit exceeded");
+            Ok(rows
+                .into_iter()
+                .map(|row| DotenvVariable {
+                    key: row.key,
+                    value: row.value,
+                })
+                .collect())
+        }
+
+        fn list_dotenv_owned_credential_ids(
+            &mut self,
+            limit: usize,
+        ) -> anyhow::Result<std::collections::HashSet<String>> {
+            Ok(Db::list_credential_secret_records(self, limit)?
+                .into_iter()
+                .filter(|record| record.meta.provider == "env")
+                .map(|record| record.meta.id)
+                .collect())
+        }
+
+        fn plain_env_value_allowed(&mut self, key: &str, value: &str) -> bool {
+            Db::validate_env_var_for_persistence(key, &EnvValue::Plain(value.to_owned())).is_ok()
+        }
+
+        fn upsert_env_var(
+            &mut self,
+            profile_id: &str,
+            key: &str,
+            value: &EnvValue,
+        ) -> anyhow::Result<()> {
+            Db::upsert_env_var(self, profile_id, key, value)
+        }
+
+        fn delete_env_var(&mut self, profile_id: &str, key: &str) -> anyhow::Result<()> {
+            Db::delete_env_var(self, profile_id, key)
+        }
+
+        fn delete_env_profile(&mut self, profile_id: &str) -> anyhow::Result<()> {
+            Db::delete_env_profile(self, profile_id)
+        }
+    }
+
+    fn sync_workspace_dotenv_for_test(
+        repository: &mut dyn DotenvRepository,
+        secret_store: &dyn secret::SecretStore,
+        redaction: &secret::RedactionService,
+        workspace_id: &str,
+        root: &Path,
+    ) -> anyhow::Result<Option<DotenvSyncReport>> {
+        let Some(plan) = load_workspace_dotenv_plan(root)? else {
+            return Ok(None);
+        };
+        apply_workspace_dotenv_plan(repository, secret_store, redaction, workspace_id, plan)
+            .map(Some)
+    }
 
     #[test]
     fn write_env_var는_라운드트립을_보존한다() {
@@ -1007,6 +1382,60 @@ INVALID LINE
                 ("QUOTED_COMMENT".to_owned(), "bar".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn dotenv_plan은_민감값을_debug에_노출하지_않는다() {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-dotenv-plan-redaction-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".env"), "API_TOKEN=do-not-log\nPLAIN=ok\n").unwrap();
+
+        let plan = load_workspace_dotenv_plan(&dir).unwrap().unwrap();
+        assert_eq!(plan.entry_count(), 2);
+        assert_eq!(plan.value_bytes(), "do-not-log".len() + "ok".len());
+        let debug = format!("{plan:?}");
+        assert!(debug.contains("entries: 2"), "{debug}");
+        assert!(!debug.contains("do-not-log"), "{debug}");
+        assert!(!debug.contains("API_TOKEN"), "{debug}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dotenv_contract는_concrete_storage와_keyring_구현을_노출하지_않는다() {
+        let source = include_str!("dotenv_sync.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .map(|(production, _)| production)
+            .expect("test module marker");
+        for forbidden in ["crate::storage", "storage::Db", "KeyringSecretStore"] {
+            assert!(
+                !production.contains(forbidden),
+                "forbidden edge: {forbidden}"
+            );
+        }
+
+        let location = DotenvSecretLocation::new(
+            "do-not-log-service".to_owned(),
+            "do-not-log-physical-slot".to_owned(),
+        );
+        let draft = DotenvCredentialDraft {
+            id: "do-not-log-id".to_owned(),
+            provider: "env".to_owned(),
+            label: "API_TOKEN (.env)".to_owned(),
+            credential_kind: "api_key".to_owned(),
+            masked_hint: Some("do-not-log-hint".to_owned()),
+            workspace_id: Some("do-not-log-workspace".to_owned()),
+        };
+        for debug in [format!("{location:?}"), format!("{draft:?}")] {
+            assert!(debug.contains("REDACTED"), "{debug}");
+            assert!(!debug.contains("do-not-log"), "{debug}");
+            assert!(!debug.contains("API_TOKEN"), "{debug}");
+        }
     }
 
     #[test]
@@ -1229,7 +1658,7 @@ INVALID LINE
             line!()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let db = Db::open(&dir.join("test.db")).unwrap();
+        let mut db = Db::open(&dir.join("test.db")).unwrap();
         let marker = "hostile-logical-coordinate-marker";
         db.insert_credential(&crate::storage::CredentialMeta {
             id: marker.to_owned(),
@@ -1241,7 +1670,7 @@ INVALID LINE
         })
         .unwrap();
 
-        let error = match resolve_secret_slot(&db, marker) {
+        let error = match resolve_secret_slot(&mut db, marker) {
             Ok(_) => panic!("legacy logical pointer must be rejected"),
             Err(error) => error,
         };
@@ -1255,14 +1684,14 @@ INVALID LINE
     fn sync는_생성_갱신_삭제를_수행하고_secret은_keyring으로_보낸다() {
         let dir = std::env::temp_dir().join(format!("deppy-dotenv-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let db = Db::open(&dir.join("test.db")).unwrap();
+        let mut db = Db::open(&dir.join("test.db")).unwrap();
         let store = MemStore::new();
         let redaction = secret::RedactionService::new();
         let ws = db.create_workspace("test").unwrap();
 
         // 1차: plain + secret 생성
         std::fs::write(dir.join(".env"), "PORT=3000\nAPI_KEY=sk-123\n").unwrap();
-        let report = sync_workspace_dotenv(&db, &store, &redaction, &ws, &dir)
+        let report = sync_workspace_dotenv_for_test(&mut db, &store, &redaction, &ws, &dir)
             .unwrap()
             .unwrap();
         assert_eq!(report.upserted, 2);
@@ -1289,7 +1718,7 @@ INVALID LINE
 
         // 2차: secret 값 갱신은 새 physical slot을 CAS publish하고 이전 bundle/ledger를 정리.
         std::fs::write(dir.join(".env"), "PORT=4000\nAPI_KEY=sk-456\n").unwrap();
-        let report = sync_workspace_dotenv(&db, &store, &redaction, &ws, &dir)
+        let report = sync_workspace_dotenv_for_test(&mut db, &store, &redaction, &ws, &dir)
             .unwrap()
             .unwrap();
         assert_eq!((report.upserted, report.removed), (2, 0));
@@ -1302,7 +1731,7 @@ INVALID LINE
         assert_eq!(rows[0].state, ::storage::PhysicalSecretSlotState::Published);
 
         // 동일 값 재동기화는 새 slot/DB write를 만들지 않는다.
-        let report = sync_workspace_dotenv(&db, &store, &redaction, &ws, &dir)
+        let report = sync_workspace_dotenv_for_test(&mut db, &store, &redaction, &ws, &dir)
             .unwrap()
             .unwrap();
         assert_eq!((report.upserted, report.removed), (0, 0));
@@ -1310,7 +1739,7 @@ INVALID LINE
 
         // 3차: 키 삭제 → profile 반영, credential/keyring/ledger 정리.
         std::fs::write(dir.join(".env"), "PORT=4000\n").unwrap();
-        let report = sync_workspace_dotenv(&db, &store, &redaction, &ws, &dir)
+        let report = sync_workspace_dotenv_for_test(&mut db, &store, &redaction, &ws, &dir)
             .unwrap()
             .unwrap();
         assert_eq!((report.upserted, report.removed), (0, 1));
@@ -1327,11 +1756,58 @@ INVALID LINE
         // .env 없으면 profile 보존
         std::fs::remove_file(dir.join(".env")).unwrap();
         assert!(
-            sync_workspace_dotenv(&db, &store, &redaction, &ws, &dir)
+            sync_workspace_dotenv_for_test(&mut db, &store, &redaction, &ws, &dir)
                 .unwrap()
                 .is_none()
         );
         assert_eq!(db.list_env_vars(&profile.id).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn redaction_corpus를_확보하지_못하면_secret_persistence를_실행하지_않는다() {
+        struct FixedClock;
+        impl secret::RedactionClock for FixedClock {
+            fn now(&self) -> std::time::Duration {
+                std::time::Duration::ZERO
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-dotenv-redaction-closed-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut db = Db::open(&dir.join("test.db")).unwrap();
+        let store = MemStore::new();
+        let redaction = secret::RedactionService::with_clock(
+            secret::RedactionCorpusLimits {
+                max_items: 1,
+                max_bytes: 1,
+            },
+            std::time::Duration::ZERO,
+            std::sync::Arc::new(FixedClock),
+        )
+        .unwrap();
+        let workspace_id = db.create_workspace("test").unwrap();
+        std::fs::write(dir.join(".env"), "API_KEY=must-not-reach-keyring\n").unwrap();
+
+        let report =
+            sync_workspace_dotenv_for_test(&mut db, &store, &redaction, &workspace_id, &dir)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(report, DotenvSyncReport::default());
+        assert!(store.entries.lock().unwrap().is_empty());
+        assert!(db.list_credentials().unwrap().is_empty());
+        let profile = db
+            .list_env_profiles(&workspace_id)
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.kind == DOTENV_PROFILE_KIND)
+            .unwrap();
+        assert!(db.list_env_vars(&profile.id).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1350,7 +1826,7 @@ INVALID LINE
             line!()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let db = Db::open(&dir.join("test.db")).unwrap();
+        let mut db = Db::open(&dir.join("test.db")).unwrap();
         let store = MemStore::new();
         let redaction = secret::RedactionService::with_clock(
             secret::RedactionCorpusLimits::PRODUCTION,
@@ -1367,7 +1843,7 @@ INVALID LINE
                 format!("API_KEY=rotation-secret-{generation:03}\n"),
             )
             .unwrap();
-            sync_workspace_dotenv(&db, &store, &redaction, &ws, &dir).unwrap();
+            sync_workspace_dotenv_for_test(&mut db, &store, &redaction, &ws, &dir).unwrap();
             let profile = db
                 .list_env_profiles(&ws)
                 .unwrap()
@@ -1412,13 +1888,13 @@ INVALID LINE
             line!()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let db = Db::open(&dir.join("test.db")).unwrap();
+        let mut db = Db::open(&dir.join("test.db")).unwrap();
         let store = MemStore::new();
         let redaction = secret::RedactionService::new();
         let ws = db.create_workspace("test").unwrap();
 
         std::fs::write(dir.join(".env"), "API_KEY=sk-delete-failure\n").unwrap();
-        sync_workspace_dotenv(&db, &store, &redaction, &ws, &dir).unwrap();
+        sync_workspace_dotenv_for_test(&mut db, &store, &redaction, &ws, &dir).unwrap();
         let profile = db
             .list_env_profiles(&ws)
             .unwrap()
@@ -1433,7 +1909,7 @@ INVALID LINE
 
         store.set_delete_failure(true);
         std::fs::write(dir.join(".env"), "").unwrap();
-        let report = sync_workspace_dotenv(&db, &store, &redaction, &ws, &dir)
+        let report = sync_workspace_dotenv_for_test(&mut db, &store, &redaction, &ws, &dir)
             .unwrap()
             .unwrap();
         assert_eq!(report.removed, 1);
@@ -1487,7 +1963,7 @@ INVALID LINE
         let ws = db.create_workspace("test").unwrap();
 
         std::fs::write(dir.join(".env"), "API_KEY=sk-owned\n").unwrap();
-        sync_workspace_dotenv(&db, &store, &redaction, &ws, &dir).unwrap();
+        sync_workspace_dotenv_for_test(&mut db, &store, &redaction, &ws, &dir).unwrap();
         let profile = db
             .list_env_profiles(&ws)
             .unwrap()
@@ -1661,7 +2137,7 @@ INVALID LINE
         let dir =
             std::env::temp_dir().join(format!("deppy-dotenv-merge-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let db = Db::open(&dir.join("test.db")).unwrap();
+        let mut db = Db::open(&dir.join("test.db")).unwrap();
         let store = MemStore::new();
         let redaction = secret::RedactionService::new();
         let ws = db.create_workspace("test").unwrap();
@@ -1669,7 +2145,7 @@ INVALID LINE
         // .env + .env.local — 겹치는 PORT는 .env.local이 이긴다.
         std::fs::write(dir.join(".env"), "PORT=3000\nFOO=a\n").unwrap();
         std::fs::write(dir.join(".env.local"), "PORT=5000\nBAR=b\n").unwrap();
-        let report = sync_workspace_dotenv(&db, &store, &redaction, &ws, &dir)
+        let report = sync_workspace_dotenv_for_test(&mut db, &store, &redaction, &ws, &dir)
             .unwrap()
             .unwrap();
         assert_eq!(report.upserted, 3);
@@ -1686,7 +2162,7 @@ INVALID LINE
 
         // .env.local 삭제 → PORT는 .env 값으로 복귀, BAR는 병합 결과에서 사라져 제거.
         std::fs::remove_file(dir.join(".env.local")).unwrap();
-        let report = sync_workspace_dotenv(&db, &store, &redaction, &ws, &dir)
+        let report = sync_workspace_dotenv_for_test(&mut db, &store, &redaction, &ws, &dir)
             .unwrap()
             .unwrap();
         assert_eq!((report.upserted, report.removed), (1, 1));
@@ -1705,13 +2181,13 @@ INVALID LINE
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let db = Db::open(&dir.join("test.db")).unwrap();
+        let mut db = Db::open(&dir.join("test.db")).unwrap();
         let store = MemStore::new();
         let redaction = secret::RedactionService::new();
         let ws = db.create_workspace("test").unwrap();
 
         std::fs::write(dir.join(".env.local"), "PORT=7000\n").unwrap();
-        let report = sync_workspace_dotenv(&db, &store, &redaction, &ws, &dir)
+        let report = sync_workspace_dotenv_for_test(&mut db, &store, &redaction, &ws, &dir)
             .unwrap()
             .unwrap();
         assert_eq!(report.upserted, 1);
@@ -1734,14 +2210,14 @@ INVALID LINE
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let db = Db::open(&dir.join("test.db")).unwrap();
+        let mut db = Db::open(&dir.join("test.db")).unwrap();
         let store = MemStore::new();
         let redaction = secret::RedactionService::new();
         let ws = db.create_workspace("test").unwrap();
 
         std::fs::write(dir.join(".env"), "PORT=3000\n").unwrap();
         std::fs::write(dir.join(".env.local"), "API_KEY=sk-local\n").unwrap();
-        sync_workspace_dotenv(&db, &store, &redaction, &ws, &dir).unwrap();
+        sync_workspace_dotenv_for_test(&mut db, &store, &redaction, &ws, &dir).unwrap();
         let profile = db
             .list_env_profiles(&ws)
             .unwrap()
@@ -1759,7 +2235,7 @@ INVALID LINE
             .unwrap();
 
         std::fs::write(dir.join(".env.local"), [0xff, 0xfe, b'\n']).unwrap();
-        assert!(sync_workspace_dotenv(&db, &store, &redaction, &ws, &dir).is_err());
+        assert!(sync_workspace_dotenv_for_test(&mut db, &store, &redaction, &ws, &dir).is_err());
         assert_eq!(db.list_env_vars(&profile.id).unwrap(), before);
         let slot = physical_slot_for(&db, &credential_id);
         assert_eq!(store.value(slot.as_str()).as_deref(), Some("sk-local"));
@@ -1776,7 +2252,7 @@ INVALID LINE
         std::fs::write(dir.join(".env"), first).unwrap();
         std::fs::write(dir.join(".env.local"), "#".repeat(500 * 1024)).unwrap();
         assert_eq!(
-            sync_workspace_dotenv(&db, &store, &redaction, &ws, &dir)
+            sync_workspace_dotenv_for_test(&mut db, &store, &redaction, &ws, &dir)
                 .unwrap_err()
                 .to_string(),
             ERROR_DOTENV_BYTES

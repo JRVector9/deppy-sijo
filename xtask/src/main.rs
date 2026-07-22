@@ -382,99 +382,73 @@ fn run_cargo(args: &[&str]) -> anyhow::Result<()> {
     }
 }
 
-#[derive(Clone, Copy)]
-struct BoundaryAllow {
-    path: &'static str,
-    snippet: &'static str,
-    count: usize,
-    reason: &'static str,
-}
-
 struct BoundaryRule {
     pattern: &'static str,
     label: &'static str,
-    allowed: &'static [BoundaryAllow],
 }
-
-const NO_ALLOW: &[BoundaryAllow] = &[];
 
 const BOUNDARY_RULES: &[BoundaryRule] = &[
     BoundaryRule {
         pattern: "KeyringSecretStore",
         label: "leaf UI must not name concrete keyring secret store",
-        allowed: NO_ALLOW,
     },
     BoundaryRule {
         pattern: "SecretStore",
         label: "leaf UI must not import/use direct secret store trait",
-        allowed: NO_ALLOW,
     },
     BoundaryRule {
         pattern: "set_secret(",
         label: "leaf UI must not write secrets directly",
-        allowed: NO_ALLOW,
     },
     BoundaryRule {
         pattern: "get_secret(",
         label: "leaf UI must not read secrets directly",
-        allowed: NO_ALLOW,
     },
     BoundaryRule {
         pattern: "delete_secret(",
         label: "leaf UI must not delete secrets directly",
-        allowed: NO_ALLOW,
     },
     BoundaryRule {
         pattern: "auth::store_token",
         label: "leaf UI must not store OAuth tokens directly",
-        allowed: NO_ALLOW,
     },
     BoundaryRule {
         pattern: "LocalMcpManager",
         label: "leaf UI must not execute Connector MCP transports directly",
-        allowed: NO_ALLOW,
     },
     BoundaryRule {
         pattern: "record_tool_audit",
         label: "leaf UI must not write audit records directly",
-        allowed: NO_ALLOW,
     },
     BoundaryRule {
         pattern: "db.",
         label: "leaf UI must not call the database directly",
-        allowed: NO_ALLOW,
     },
     BoundaryRule {
         pattern: "alacritty_terminal",
         label: "app UI must not depend on terminal backend implementation",
-        allowed: NO_ALLOW,
     },
     BoundaryRule {
         pattern: "portable_pty",
         label: "app UI must not depend on PTY implementation",
-        allowed: NO_ALLOW,
     },
     BoundaryRule {
         pattern: "SessionManager",
         label: "app UI must not call session manager directly",
-        allowed: NO_ALLOW,
     },
     BoundaryRule {
         pattern: "TerminalBackend",
         label: "app UI must not name terminal backend trait directly",
-        allowed: NO_ALLOW,
     },
     BoundaryRule {
         pattern: "InProcessRuntimeClient",
         label: "leaf UI must not name concrete runtime client",
-        allowed: NO_ALLOW,
     },
 ];
 
 fn check_boundary() -> anyhow::Result<()> {
     let root = workspace_root()?;
     let mut violations = Vec::new();
-    let mut allowed_seen: BTreeMap<(usize, &'static str, &'static str), usize> = BTreeMap::new();
 
     for path in rust_files_under(&root.join("crates/app/src/ui"))? {
         let rel = rel_path(&root, &path)?;
@@ -496,27 +470,8 @@ fn check_boundary() -> anyhow::Result<()> {
             if test_region_start.is_some_and(|start| line_idx >= start) {
                 break;
             }
-            for (rule_idx, rule) in BOUNDARY_RULES.iter().enumerate() {
+            for rule in BOUNDARY_RULES {
                 if !line.contains(rule.pattern) {
-                    continue;
-                }
-                if let Some(allow) = rule
-                    .allowed
-                    .iter()
-                    .find(|allow| allow.path == rel && line.contains(allow.snippet))
-                {
-                    let key = (rule_idx, allow.path, allow.snippet);
-                    let seen = allowed_seen.entry(key).or_insert(0);
-                    *seen += 1;
-                    if *seen > allow.count {
-                        violations.push(format!(
-                            "{rel}:{}: allowlist 초과: '{}' ({}) — {}",
-                            line_idx + 1,
-                            rule.pattern,
-                            rule.label,
-                            allow.reason
-                        ));
-                    }
                     continue;
                 }
                 violations.push(format!(
@@ -529,34 +484,12 @@ fn check_boundary() -> anyhow::Result<()> {
         }
     }
 
-    for (rule_idx, rule) in BOUNDARY_RULES.iter().enumerate() {
-        for allow in rule.allowed {
-            let seen = allowed_seen
-                .get(&(rule_idx, allow.path, allow.snippet))
-                .copied()
-                .unwrap_or(0);
-            if seen != allow.count {
-                violations.push(format!(
-                    "{}: allowlist drift for '{}' expected {} seen {} — {}",
-                    allow.path, allow.snippet, allow.count, seen, allow.reason
-                ));
-            }
-        }
-    }
-
     check_session_secret_boundary(&root, &mut violations)?;
     check_authorization_capability_boundary(&root, &mut violations)?;
     check_app_render_source_boundary(&root, &mut violations)?;
 
     if violations.is_empty() {
-        let explicit_exceptions: usize = BOUNDARY_RULES
-            .iter()
-            .flat_map(|rule| rule.allowed)
-            .map(|allow| allow.count)
-            .sum();
-        println!(
-            "check-boundary OK — UI leaf boundary guard passed; {explicit_exceptions} explicit UI DB/MCP/audit/secret exceptions remain"
-        );
+        println!("check-boundary OK — UI leaf boundary guard passed; zero allowlist capability");
         Ok(())
     } else {
         violations.sort();
@@ -595,6 +528,18 @@ fn check_app_render_source_boundary(
         (
             "self.refresh_workspaces(",
             "render must consume the bounded workspace projection",
+        ),
+        (
+            "self.handle_configured_shortcut(",
+            "render must not start config, runtime, or protocol shortcut effects",
+        ),
+        (
+            "self.settings_snapshot_worker.",
+            "render must stage settings jobs for logic-owned admission",
+        ),
+        (
+            "crate::fonts::",
+            "render must not read or install font files",
         ),
         (
             "request_repaint_after(",

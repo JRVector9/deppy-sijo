@@ -1,0 +1,58 @@
+# PR-BG01 summary
+
+## Scope
+
+This app-independent slice closes render-host edges in the owned Agents, Environment, Home, and
+structured Agent Sessions leaves. It adds no allowlist, runtime command, worker, timer, poller,
+network client, or dependency.
+
+## Boundary changes
+
+- `AgentsUi` and `EnvProfilesUi` retain their immutable snapshot / at-most-one-intent contracts.
+  Their production-source regressions now also reject filesystem, process, network, clipboard,
+  picker, and delayed-repaint edges.
+- Home renders the cached notice snapshot only. A 300-frame regression emits no host platform
+  command, and a source regression rejects filesystem/process/network/picker/keyring/periodic
+  repaint edges. Translation CLI discovery is outside this leaf and must be supplied as a cached
+  root snapshot.
+- `AgentSessionsUi::show` no longer synchronizes process configuration or executes controller
+  actions. It returns one opaque, non-Clone/non-Serialize/non-Debug `AgentSessionsDeferredAction`.
+  Only the first action is retained, a newer frame generation rejects stale work, and the root
+  executes it on a later logic tick through `execute_deferred`.
+- The leaf no longer has a fallback `CodexAppServerClient::spawn` path. Production construction is
+  possible only through the root-owned `CodexAppServerHost` port.
+- Concrete `storage::StructuredThreadRow` was replaced by `AgentSessionPersistedRow`. The UI
+  projection is capped at 500 rows, 32 KiB per row, and 4 MiB aggregate. Prompt/follow-up/steer
+  input is capped at 1 MiB and workspace cwd at 32 KiB with NUL rejection.
+
+## Required root integration
+
+- Retain at most one `AgentSessionsDeferredAction` in `App`; execute it at the next logic tick,
+  feed its optional `AgentSessionsRequest` to the existing handler, and then call
+  `sync_controller_config` outside render.
+- Map each concrete structured-thread storage row field-for-field into
+  `AgentSessionPersistedRow` before `import_persisted_threads`.
+- Add an xtask source gate for these four leaves using the same forbidden host/dependency patterns
+  as their test-only source regressions.
+
+## Remaining unowned blockers
+
+- `ui/inbox_waiting.rs` starts log-tail filesystem/thread work from its UI call graph.
+- `ui/diff_panel.rs` performs production metadata access.
+- `ui/workspace.rs` and `ui/file_tree.rs` still require their separate intent/host lane closeout.
+- Home translation CLI availability, root cwd validation, and cold activity-name filesystem probes
+  live outside this slice and must become event-driven snapshots.
+- One-shot deadline repaint requests may remain, but periodic status/activity polling repaint is not
+  permitted by the final gate.
+
+## Verification
+
+- Direct rustfmt `--check` for all four owned Rust files passes.
+- Scoped `git diff --check` passes.
+- The production-prefix scan finds no direct storage/filesystem/process/network/picker/keyring,
+  delayed-repaint, or concrete app-server spawn edge in the owned leaves.
+- The first focused Cargo command did not select tests because compilation stopped at the expected
+  shared-tree integration seam: `app.rs` had not yet mapped `StructuredThreadRow` to the new DTO.
+  Concurrent Workspace/FileTree and web-remote lanes also had mid-edit API/test mismatches. This is
+  not accepted as test evidence; focused tests, app check, and strict Clippy remain for root after
+  all three APIs are integrated.

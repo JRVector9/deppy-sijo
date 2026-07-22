@@ -201,6 +201,7 @@ fn parse_response(raw: &str, expected_len: usize) -> Option<Vec<String>> {
 /// 제목 배치를 백그라운드에서 번역한다. 결과는 (영속 캐시 키, 번역) 쌍 목록 —
 /// 실패 시 빈 목록(채널 닫힘)으로 끝난다. 호출측은 한 번에 하나만 띄운다.
 pub fn spawn_translate(
+    bin: PathBuf,
     keys: Vec<TranslationCacheKey>,
     language: String,
     egui_ctx: egui::Context,
@@ -209,9 +210,6 @@ pub fn spawn_translate(
     let spawned = std::thread::Builder::new()
         .name("notice-translate".into())
         .spawn(move || {
-            let Some(bin) = claude_bin() else {
-                return; // CLI 없음 — 채널 닫힘으로 종결(원문 유지)
-            };
             let titles: Vec<String> = keys.iter().map(|key| key.title().to_owned()).collect();
             let prompt = build_prompt(&titles, &language);
             match run_claude(&bin, &prompt) {

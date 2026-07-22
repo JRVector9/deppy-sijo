@@ -1,17 +1,17 @@
 //! 벨 팝오버 「대기 중」 섹션의 MCP 승인 카드 (v3.9 PR-N2,
 //! `ai_agent_workspace_v3_9_waiting_inbox_pr_plan.md`).
 //!
-//! 데이터는 `App::poll_pending_approvals`가 이미 폴링해 둔 `ApprovalsUi::pending()`을
-//! 그대로 읽는다 — 팝오버는 매 프레임 렌더되므로 이 모듈은 새 DB 조회를 하지 않는다.
-//! 승인/거부 되쓰기와 [이동→] 네비게이션은 호출측(`App::inbox_popup`)이 기존 경로
-//! (`Db::resolve_approval`, `plan_agent_notification_navigation`)로 처리한다 — 이 모듈은
-//! 렌더 + 사용자 의도([`ApprovalCardsAction`]) 산출만 한다(leaf UI가 DB를 직접 만지지
+//! 데이터는 합성 루트가 이미 만든 `ApprovalsUi::pending()` immutable snapshot을 그대로
+//! 읽는다 — 팝오버는 매 프레임 렌더되므로 이 모듈은 새 host 조회를 하지 않는다.
+//! 승인/거부 intent와 [이동→] 네비게이션은 호출측(`App::inbox_popup`)이 기존 경로
+//! (`plan_agent_notification_navigation` 등)로 처리한다 — 이 모듈은
+//! 렌더 + 사용자 의도([`ApprovalCardsAction`]) 산출만 한다(leaf UI가 host를 직접 만지지
 //! 않는다, xtask check-boundary).
 //!
 //! ## 워크스페이스/세션 해석 (① — "가지 않고 판단"이 이 PR의 핵심 요구)
-//! `PendingApprovalRow.pane_id`는 이름과 달리 `mux_panes.id`가 아니라 런타임 세션 키
+//! `PendingApprovalItem::session_key`는 런타임 세션 키
 //! (`{workspace_id}:{session_id}`)다 — `deppy_core::parse_session_key`로 파싱한다.
-//! 워크스페이스명·세션명은 **DB가 모르는 정보**라 호출측(App)이 메모리에서 해석해
+//! 워크스페이스명·세션명은 persistence가 모르는 정보라 호출측(App)이 메모리에서 해석해
 //! 넘겨준다(에이전트가 감지되면 그 이름, 아니면 셀 제목).
 //!
 //! 예전엔 mcp-store가 `pane_id = mux_panes.id` 조인으로 세션 UUID/제목을 채우려 했지만
@@ -21,9 +21,8 @@ use std::collections::HashMap;
 
 use deppy_core::parse_session_key;
 use runtime::SessionId;
-use storage::PendingApprovalRow;
 
-use super::approvals::ApprovalDecision;
+use super::approvals::{ApprovalDecision, PendingApprovalItem};
 use super::notifications::{AgentNotificationTarget, section_label};
 
 /// 팝오버에 한 번에 그리는 카드 최대 수 — 초과분은 "+N건 더"로 뭉친다(②).
@@ -36,7 +35,7 @@ const PREVIEW_CLIP_CHARS: usize = 110;
 /// 카드 섹션이 만든 사용자 액션 — 호출측(App)이 DB 되쓰기/네비게이션을 수행한다.
 #[derive(Default)]
 pub struct ApprovalCardsAction {
-    /// [승인]/[거부] 클릭 — 호출측이 `Db::resolve_approval`로 처리한다.
+    /// [승인]/[거부] 클릭 — 호출측 controller가 bounded command로 처리한다.
     pub decision: Option<ApprovalDecision>,
     /// [이동→] 클릭 — 호출측이 기존 알림 네비게이션 경로로 처리한다.
     pub goto: Option<AgentNotificationTarget>,
@@ -50,7 +49,7 @@ pub struct ApprovalCardsAction {
 pub fn render(
     ui: &mut egui::Ui,
     catalog: &i18n::Catalog,
-    pending: &[PendingApprovalRow],
+    pending: &[PendingApprovalItem],
     workspace_names: &HashMap<String, String>,
     session_titles: &HashMap<(String, SessionId), String>,
     max_cards: usize,
@@ -88,12 +87,12 @@ pub fn render(
 fn render_card(
     ui: &mut egui::Ui,
     catalog: &i18n::Catalog,
-    row: &PendingApprovalRow,
+    row: &PendingApprovalItem,
     workspace_names: &HashMap<String, String>,
     session_titles: &HashMap<(String, SessionId), String>,
     action: &mut ApprovalCardsAction,
 ) {
-    let session_key = row.pane_id.as_deref().and_then(parse_session_key);
+    let session_key = row.session_key().and_then(parse_session_key);
     let workspace_label =
         session_key.and_then(|(workspace_id, _)| workspace_names.get(workspace_id).cloned());
     // 세션 라벨은 호출측이 메모리에서 해석해 넘긴다 — DB는 이 정보를 모른다(모듈 상단
@@ -113,14 +112,14 @@ fn render_card(
             (None, None) => catalog.t("inbox.approval.unknown_session", &[]),
         };
         ui.label(egui::RichText::new(context).size(11.0).weak());
-        ui.strong(row.tool_name.as_str());
+        ui.strong(row.tool_name());
         // arguments_preview는 proxy가 이미 redact한 표시용 텍스트 — 추가 redaction
         // 불필요, 원문 조회 금지(설계 제약).
         //
         // raw JSON을 그대로 뿌리면 "무엇을 승인하는지"가 안 보인다(2026-07-17 사용자:
         // 긴 경로가 네 줄로 접히며 정작 파일명이 묻혔다). 인자별 한 줄로 펴고, 값은
         // 뒤쪽(파일명·명령 꼬리)을 남기며 줄인다 — 판단에 필요한 건 대개 뒤쪽이다.
-        for (key, value) in format_arguments(&row.arguments_preview) {
+        for (key, value) in format_arguments(row.arguments_preview()) {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 if !key.is_empty() {
@@ -155,9 +154,9 @@ fn render_card(
     ui.add_space(4.0);
 }
 
-fn decision_for(row: &PendingApprovalRow, allowed: bool) -> ApprovalDecision {
+fn decision_for(row: &PendingApprovalItem, allowed: bool) -> ApprovalDecision {
     ApprovalDecision {
-        id: row.id.clone(),
+        id: row.id().to_owned(),
         allowed,
         // 인박스 빠른 조치는 "이 도구 항상 허용" 규칙 저장을 다루지 않는다 — 그 옵션은
         // 기존 모달(approvals_ui.show)의 체크박스로 남겨둔다(요구사항 범위 밖).
@@ -212,15 +211,40 @@ fn clip_value(text: &str) -> String {
 mod tests {
     use super::*;
 
-    fn row(id: &str, pane_id: Option<&str>) -> PendingApprovalRow {
-        PendingApprovalRow {
-            id: id.to_owned(),
-            server_id: "srv".to_owned(),
-            tool_name: "read_file".to_owned(),
-            arguments_preview: "{}".to_owned(),
-            schema_hash: None,
-            created_at: 0,
-            pane_id: pane_id.map(str::to_owned),
+    fn row(id: &str, session_key: Option<&str>) -> PendingApprovalItem {
+        PendingApprovalItem::try_new(
+            id.to_owned(),
+            "srv".to_owned(),
+            "read_file".to_owned(),
+            "{}".to_owned(),
+            session_key.map(str::to_owned),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn inbox_approval_leaf_production_source에는_host_boundary가_없다() {
+        let production = include_str!("inbox_approvals.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for forbidden in [
+            ["storage", "::"].concat(),
+            ["mcp_", "store::"].concat(),
+            ["Db", "::"].concat(),
+            ["audit", "::"].concat(),
+            ["secret", "::"].concat(),
+            ["PendingApproval", "Row"].concat(),
+            ["std::", "fs"].concat(),
+            ["std::", "process"].concat(),
+            ["std::", "thread"].concat(),
+            ["request_repaint", "("].concat(),
+        ] {
+            assert!(
+                !production.contains(&forbidden),
+                "approval inbox leaf contains forbidden host edge: {forbidden}"
+            );
         }
     }
 
@@ -370,7 +394,7 @@ mod tests {
     /// 클릭된 decision들을 프레임 너머로 수집하는 하네스.
     fn decision_harness<'a>(
         catalog: &'a i18n::Catalog,
-        rows: &'a [PendingApprovalRow],
+        rows: &'a [PendingApprovalItem],
         names: &'a HashMap<String, String>,
     ) -> egui_kittest::Harness<'a, Vec<ApprovalDecision>> {
         egui_kittest::Harness::new_ui_state(

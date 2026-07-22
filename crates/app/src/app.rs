@@ -18,8 +18,184 @@ const APPROVAL_SPAWN_DEADLINE: std::time::Duration = std::time::Duration::from_s
 const APPROVAL_DENIAL_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
 struct ApprovalSnapshot {
-    rows: Vec<storage::PendingApprovalRow>,
-    remote_urls: std::collections::HashMap<String, String>,
+    rows: Vec<ui::approvals::PendingApprovalItem>,
+}
+
+/// Composition-root adapter for dotenv persistence. The orchestration module receives only its
+/// bounded storage-neutral port; concrete rows and the production `Db` stay in app.rs.
+struct AppDotenvRepository<'a>(&'a mut Db);
+
+impl crate::dotenv_sync::DotenvRepository for AppDotenvRepository<'_> {
+    fn credential_secret_location(
+        &mut self,
+        credential_id: &str,
+    ) -> anyhow::Result<Option<crate::dotenv_sync::DotenvSecretLocation>> {
+        Db::credential_secret_location(self.0, credential_id).map(|value| {
+            value.map(|location| {
+                crate::dotenv_sync::DotenvSecretLocation::new(
+                    location.keyring_service,
+                    location.keyring_username,
+                )
+            })
+        })
+    }
+
+    fn acknowledge_physical_secret_slot_deleted(
+        &mut self,
+        logical_id: &str,
+        physical_slot: &str,
+    ) -> anyhow::Result<()> {
+        Db::acknowledge_physical_secret_slot_deleted(self.0, logical_id, physical_slot).map(|_| ())
+    }
+
+    fn register_physical_secret_slot_staging(
+        &mut self,
+        logical_id: &str,
+        physical_slot: &str,
+    ) -> anyhow::Result<()> {
+        Db::register_physical_secret_slot_staging(self.0, logical_id, physical_slot)
+    }
+
+    fn insert_credential_with_secret_slot(
+        &mut self,
+        draft: &crate::dotenv_sync::DotenvCredentialDraft,
+        physical_slot: &str,
+    ) -> anyhow::Result<()> {
+        Db::insert_credential_with_secret_slot(
+            self.0,
+            &crate::storage::CredentialMeta {
+                id: draft.id().to_owned(),
+                provider: draft.provider().to_owned(),
+                label: draft.label().to_owned(),
+                credential_kind: draft.credential_kind().to_owned(),
+                masked_hint: draft.masked_hint().map(str::to_owned),
+                workspace_id: draft.workspace_id().map(str::to_owned),
+            },
+            physical_slot,
+            None,
+        )
+    }
+
+    fn publish_credential_secret_slot_cas(
+        &mut self,
+        logical_id: &str,
+        expected_previous_pointer: &str,
+        physical_slot: &str,
+        masked_hint: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        Db::publish_credential_secret_slot_cas(
+            self.0,
+            logical_id,
+            expected_previous_pointer,
+            physical_slot,
+            None,
+            masked_hint,
+        )
+    }
+
+    fn delete_credential_if_unused_cas(
+        &mut self,
+        logical_id: &str,
+        expected_pointer: &str,
+    ) -> anyhow::Result<bool> {
+        Db::delete_credential_if_unused_cas(self.0, logical_id, expected_pointer)
+    }
+
+    fn list_env_profiles(
+        &mut self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::dotenv_sync::DotenvProfile>> {
+        let rows = Db::list_env_profiles(self.0, workspace_id)?;
+        anyhow::ensure!(rows.len() <= limit, "dotenv_profile_scan_limit");
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::dotenv_sync::DotenvProfile {
+                id: row.id,
+                kind: row.kind,
+            })
+            .collect())
+    }
+
+    fn insert_env_profile(
+        &mut self,
+        workspace_id: &str,
+        name: &str,
+        kind: &str,
+    ) -> anyhow::Result<String> {
+        Db::insert_env_profile(self.0, workspace_id, name, kind)
+    }
+
+    fn list_env_vars(
+        &mut self,
+        profile_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::dotenv_sync::DotenvVariable>> {
+        let rows = Db::list_env_vars(self.0, profile_id)?;
+        anyhow::ensure!(rows.len() <= limit, "dotenv_variable_scan_limit");
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::dotenv_sync::DotenvVariable {
+                key: row.key,
+                value: row.value,
+            })
+            .collect())
+    }
+
+    fn list_dotenv_owned_credential_ids(
+        &mut self,
+        limit: usize,
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        let rows = Db::list_credentials(self.0)?;
+        anyhow::ensure!(rows.len() <= limit, "dotenv_credential_scan_limit");
+        Ok(rows
+            .into_iter()
+            .filter(|row| row.provider == "env")
+            .map(|row| row.id)
+            .collect())
+    }
+
+    fn plain_env_value_allowed(&mut self, key: &str, value: &str) -> bool {
+        Db::validate_env_var_for_persistence(key, &crate::env::EnvValue::Plain(value.to_owned()))
+            .is_ok()
+    }
+
+    fn upsert_env_var(
+        &mut self,
+        profile_id: &str,
+        key: &str,
+        value: &crate::env::EnvValue,
+    ) -> anyhow::Result<()> {
+        Db::upsert_env_var(self.0, profile_id, key, value)
+    }
+
+    fn delete_env_var(&mut self, profile_id: &str, key: &str) -> anyhow::Result<()> {
+        Db::delete_env_var(self.0, profile_id, key)
+    }
+
+    fn delete_env_profile(&mut self, profile_id: &str) -> anyhow::Result<()> {
+        Db::delete_env_profile(self.0, profile_id)
+    }
+}
+
+fn sync_workspace_dotenv_at_root(
+    db: &mut Db,
+    secret_store: &dyn secret::SecretStore,
+    redaction: &secret::RedactionService,
+    workspace_id: &str,
+    root: &Path,
+) -> anyhow::Result<Option<crate::dotenv_sync::DotenvSyncReport>> {
+    let Some(plan) = crate::dotenv_sync::load_workspace_dotenv_plan(root)? else {
+        return Ok(None);
+    };
+    crate::dotenv_sync::apply_workspace_dotenv_plan(
+        &mut AppDotenvRepository(db),
+        secret_store,
+        redaction,
+        workspace_id,
+        plan,
+    )
+    .map(Some)
 }
 
 enum ApprovalWorkerCommand {
@@ -560,18 +736,20 @@ impl DotenvSyncWorker {
                             // DB-전용 profile 변수를 .env로 이전한다(.env 일원화 E1).
                             // 2초 주기 폴링의 fast-path에는 DB 조회를 더하지 않는다.
                             if job.force
-                                && let Err(e) =
+                                && let Err(e) = {
+                                    let mut repository = AppDotenvRepository(db);
                                     crate::dotenv_sync::migrate_legacy_profiles_to_dotenv(
-                                        db,
+                                        &mut repository,
                                         &KeyringSecretStore,
                                         &job.workspace_id,
                                         root,
                                     )
+                                }
                             {
                                 tracing::warn!("레거시 env profile 이전 실패: {e:#}");
                             }
-                            crate::dotenv_sync::sync_workspace_dotenv(
-                                &*db,
+                            sync_workspace_dotenv_at_root(
+                                db,
                                 &KeyringSecretStore,
                                 &redaction,
                                 &job.workspace_id,
@@ -1450,13 +1628,16 @@ fn execute_settings_job(
                 .as_deref()
                 .context("settings_dotenv_root_missing")
                 .and_then(|root| {
-                    crate::dotenv_sync::migrate_legacy_profiles_to_dotenv(
-                        db,
-                        &KeyringSecretStore,
-                        &workspace_id,
-                        root,
-                    )?;
-                    crate::dotenv_sync::sync_workspace_dotenv(
+                    {
+                        let mut repository = AppDotenvRepository(db);
+                        crate::dotenv_sync::migrate_legacy_profiles_to_dotenv(
+                            &mut repository,
+                            &KeyringSecretStore,
+                            &workspace_id,
+                            root,
+                        )?;
+                    }
+                    sync_workspace_dotenv_at_root(
                         db,
                         &KeyringSecretStore,
                         redaction,
@@ -1482,15 +1663,15 @@ fn execute_settings_job(
                     anchor.map(|value| value.1),
                 )
                 .map_err(|_| SettingsErrorCode::ProjectPath);
-            if result.is_ok()
-                && path_string.trim().is_empty()
-                && crate::dotenv_sync::remove_workspace_dotenv(
-                    db,
+            if result.is_ok() && path_string.trim().is_empty() && {
+                let mut repository = AppDotenvRepository(db);
+                crate::dotenv_sync::remove_workspace_dotenv(
+                    &mut repository,
                     &KeyringSecretStore,
                     &workspace_id,
                 )
                 .is_err()
-            {
+            } {
                 tracing::warn!(
                     kind = "settings",
                     phase = "dotenv_cleanup",
@@ -1763,10 +1944,6 @@ impl SettingsSnapshotWorker {
         }
     }
 
-    fn try_request(&mut self, job: SettingsJob) -> bool {
-        self.try_request_recover(job).is_ok()
-    }
-
     fn try_request_recover(&mut self, job: SettingsJob) -> Result<(), Box<SettingsJob>> {
         self.reap_finished();
         if self.pending_result.is_some() {
@@ -1942,7 +2119,7 @@ fn load_approval_snapshot(db: &Db) -> anyhow::Result<ApprovalSnapshot> {
     } else {
         db.mcp_server_inventory(mcp_store::MCP_SERVER_INVENTORY_LIMIT_MAX)?
     };
-    let remote_urls = inventory
+    let remote_urls: std::collections::HashMap<String, Arc<str>> = inventory
         .into_iter()
         .filter(|server| server.kind == "http")
         .filter(|server| {
@@ -1950,12 +2127,25 @@ fn load_approval_snapshot(db: &Db) -> anyhow::Result<ApprovalSnapshot> {
                 .iter()
                 .any(|approval| approval.server_id == server.id)
         })
-        .filter_map(|server| Some((server.id, server.url?)))
+        .filter_map(|server| Some((server.id, Arc::from(server.url?))))
         .collect();
-    Ok(ApprovalSnapshot {
-        rows: page.rows,
-        remote_urls,
-    })
+    let rows = page
+        .rows
+        .into_iter()
+        .map(|row| {
+            let remote_url = remote_urls.get(&row.server_id).cloned();
+            ui::approvals::PendingApprovalItem::try_new(
+                row.id,
+                row.server_id,
+                row.tool_name,
+                row.arguments_preview,
+                row.pane_id,
+                remote_url,
+            )
+            .map_err(|_| anyhow::anyhow!("approval_snapshot_invalid_projection"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(ApprovalSnapshot { rows })
 }
 
 #[cfg(unix)]
@@ -4488,6 +4678,131 @@ struct WebRemoteState {
     token: String,
 }
 
+/// Optional web-remote persistence adapter. The concrete SQLite handle is constructed only from
+/// the composition root and shared by dashboard/push through the storage-neutral port. Each
+/// method releases the mutex before the caller performs network I/O.
+struct AppWebRemoteRepository {
+    db: std::sync::Mutex<Db>,
+}
+
+impl AppWebRemoteRepository {
+    fn open(path: &Path) -> anyhow::Result<Self> {
+        Ok(Self {
+            db: std::sync::Mutex::new(Db::open(path)?),
+        })
+    }
+
+    fn lock(&self) -> anyhow::Result<std::sync::MutexGuard<'_, Db>> {
+        self.db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("web_remote_repository_lock_failed"))
+    }
+}
+
+impl web_remote::repository::WebRemoteRepository for AppWebRemoteRepository {
+    fn list_pending_approvals(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<web_remote::repository::PendingApprovalRecord>> {
+        anyhow::ensure!(
+            limit <= web_remote::repository::PENDING_APPROVAL_LIMIT,
+            "web_remote_pending_limit_exceeded"
+        );
+        Ok(self
+            .lock()?
+            .list_pending_approvals_bounded(limit)?
+            .rows
+            .into_iter()
+            .map(|row| web_remote::repository::PendingApprovalRecord {
+                id: row.id,
+                server_id: row.server_id,
+                tool_name: row.tool_name,
+                arguments_preview: row.arguments_preview,
+                created_at: row.created_at,
+                pane_id: row.pane_id,
+            })
+            .collect())
+    }
+
+    fn resolve_approval(
+        &self,
+        id: &str,
+        allowed: bool,
+        remember: bool,
+        resolved_at: i64,
+    ) -> anyhow::Result<()> {
+        self.lock()?
+            .resolve_approval(id, allowed, remember, resolved_at)
+    }
+
+    fn web_push_subscription_count(&self) -> anyhow::Result<usize> {
+        usize::try_from(self.lock()?.count_web_push_subscriptions()?)
+            .map_err(|_| anyhow::anyhow!("web_push_subscription_count_invalid"))
+    }
+
+    fn upsert_web_push_subscription(
+        &self,
+        endpoint: &str,
+        p256dh: &str,
+        auth: &str,
+        created_at: i64,
+        limit: usize,
+    ) -> anyhow::Result<web_remote::repository::SubscriptionUpsert> {
+        anyhow::ensure!(
+            limit <= web_remote::repository::PUSH_SUBSCRIPTION_LIMIT,
+            "web_push_subscription_limit_invalid"
+        );
+        let db = self.lock()?;
+        let existing = db.list_web_push_subscriptions()?;
+        anyhow::ensure!(
+            existing.len() <= web_remote::repository::PUSH_SUBSCRIPTION_LIMIT,
+            "web_push_subscription_inventory_oversized"
+        );
+        if existing.len() >= limit && !existing.iter().any(|row| row.endpoint == endpoint) {
+            return Ok(web_remote::repository::SubscriptionUpsert::LimitReached);
+        }
+        db.upsert_web_push_subscription(endpoint, p256dh, auth, created_at)?;
+        let total = usize::try_from(db.count_web_push_subscriptions()?)
+            .map_err(|_| anyhow::anyhow!("web_push_subscription_count_invalid"))?;
+        anyhow::ensure!(total <= limit, "web_push_subscription_limit_exceeded");
+        Ok(web_remote::repository::SubscriptionUpsert::Stored { total })
+    }
+
+    fn list_web_push_subscriptions(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<web_remote::repository::PushSubscriptionRecord>> {
+        anyhow::ensure!(
+            limit <= web_remote::repository::PUSH_SUBSCRIPTION_LIMIT,
+            "web_push_subscription_limit_invalid"
+        );
+        let rows = self.lock()?.list_web_push_subscriptions()?;
+        anyhow::ensure!(rows.len() <= limit, "web_push_subscription_limit_exceeded");
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                web_remote::repository::PushSubscriptionRecord::new(
+                    row.endpoint,
+                    row.p256dh,
+                    row.auth,
+                )
+            })
+            .collect())
+    }
+
+    fn touch_web_push_subscription(&self, endpoint: &str, last_ok_at: i64) -> anyhow::Result<()> {
+        self.lock()?
+            .touch_web_push_subscription(endpoint, last_ok_at)
+    }
+
+    fn delete_web_push_subscription(&self, endpoint: &str) -> anyhow::Result<usize> {
+        let db = self.lock()?;
+        db.delete_web_push_subscription(endpoint)?;
+        usize::try_from(db.count_web_push_subscriptions()?)
+            .map_err(|_| anyhow::anyhow!("web_push_subscription_count_invalid"))
+    }
+}
+
 /// 세션 알림(완료/입력대기) 주목 상태 — 레일 폭(6px)·1회 펄스 추적 (2026-07-07).
 struct SessionAlert {
     status: runtime::SessionStatus,
@@ -4597,6 +4912,9 @@ pub struct App {
     /// Agents/Environment leaf가 읽는 immutable snapshot과 mutation intent를 전담한다.
     /// 첫 설정 요청에서만 thread/SQLite connection을 만들고 30초 idle이면 둘 다 회수한다.
     settings_snapshot_worker: SettingsSnapshotWorker,
+    /// Render/logic producers stage at most one settings job; worker spawn/send/join happens only
+    /// from logic on the next tick.
+    pending_settings_job: Option<SettingsJob>,
     settings_snapshot_generation: u64,
     settings_snapshot_revision: u64,
     settings_snapshot_pending: bool,
@@ -4612,6 +4930,9 @@ pub struct App {
     agents_ui: ui::agents::AgentsUi,
     /// PTY와 분리된 Codex App Server structured session controller.
     agent_sessions_ui: ui::agent_sessions::AgentSessionsUi,
+    /// Render가 반환한 controller action 한 건. 다음 logic tick에서만 실행해 process와
+    /// protocol I/O가 render call graph에 들어오지 않게 한다.
+    pending_agent_sessions_action: Option<ui::agent_sessions::AgentSessionsDeferredAction>,
     /// 세션 cwd 레포의 git 변경분 리뷰 패널 (사이드바 「변경 보기」).
     diff_panel_ui: ui::diff_panel::DiffPanelUi,
     /// DB mutation은 controller projection과 분리돼 실패할 수 있다. 성공할 때까지 FIFO로
@@ -4623,6 +4944,11 @@ pub struct App {
     connector_coordinator: connector_service::ConnectorCoordinator,
     connector_snapshot_reader: connector_service::SnapshotReader,
     connector_ui: connector_ui::ConnectorUi,
+    /// Connector render가 반환한 intent 한 건. 최초 service start/DB open은 다음 logic tick.
+    pending_connector_dispatch: Option<(
+        connector_contract::ConnectorIntent,
+        Option<connector_service::InvocationContext>,
+    )>,
     /// App-owned single-flight file/dialog/browser task. `None` until a host action is emitted;
     /// there is no host thread/channel/poll/timer while unused. Connector와 Composer native
     /// picker가 이 한 슬롯을 공유해 동시에 둘 이상의 dialog/process를 만들지 않는다.
@@ -4630,6 +4956,13 @@ pub struct App {
     /// Render가 반환한 native-host intent. 다음 logic tick에서만 host task로 넘기며
     /// latest-only 한 건만 보존한다.
     pending_app_host_action: Option<AppHostIoAction>,
+    pending_file_tree_maintenance: Option<ui::file_tree::FileTreeMaintenanceIntent>,
+    file_tree_watcher: Option<AppFileTreeWatcher>,
+    /// Settings가 반환한 lifecycle action 한 건. 다음 logic tick에서만 실행한다.
+    pending_app_controller_action: Option<AppControllerAction>,
+    /// 설정 전체 변경과 단순 config 저장은 각각 latest-only bit로 합쳐 backlog를 막는다.
+    pending_settings_config_apply: bool,
+    pending_config_save: bool,
     /// Send events publish one Arc-backed bounded history snapshot. Only the latest snapshot needs
     /// persistence, so a busy host task retains one replacement rather than a write queue.
     pending_composer_history: Option<Arc<[Arc<str>]>>,
@@ -4647,9 +4980,9 @@ pub struct App {
     activity_rows_cache: Option<(std::time::Instant, Vec<ui::activity::ActivityWorkspaceRow>)>,
     /// 홈 업데이트 피드 수신(Claude/OpenAI 상태 5분, 공지/HF/Grok 4시간) + 최신
     /// 스냅샷. provider별 조회 실패(None)면 마지막 성공값을 유지한다.
-    status_feed_rx: std::sync::mpsc::Receiver<crate::status_feed::StatusFeedSnapshot>,
+    status_feed_rx: crate::status_feed::StatusFeedReceiver,
     /// 수동 갱신(홈 「AI 공지」 ⟳ 버튼) — 워커를 즉시 깨워 상태+공지 재조회.
-    status_feed_refresh: std::sync::mpsc::Sender<()>,
+    status_feed_refresh: crate::status_feed::StatusFeedRefresh,
     status_feed: crate::status_feed::StatusFeedSnapshot,
     /// Home을 마지막으로 본 시점의 provider별 공지 ID와 현재 신규 공지 배지 수.
     /// 별도 작은 JSON으로 영속해 앱 재시작 때 기존 공지가 다시 새 알림이 되지 않는다.
@@ -4663,6 +4996,9 @@ pub struct App {
     notice_translate_rx: Option<
         std::sync::mpsc::Receiver<Vec<(crate::notice_translate::TranslationCacheKey, String)>>,
     >,
+    /// 실제 번역 수요가 처음 생길 때 한 번만 CLI 경로를 해석한다. 바깥 Option은
+    /// 해석 여부, 안쪽 Option은 설치 여부라 공지 미사용 idle stat은 0이다.
+    notice_translate_bin: Option<Option<PathBuf>>,
     /// ollama 모델 감지 (PR-L3) — Agents 창에서 OSS 프로바이더 선택 시 1회 감지해
     /// 새 작업 폼의 모델 후보로 보여준다. None=미감지/실패(표시 안 함).
     ollama_models: Option<Vec<String>>,
@@ -4831,6 +5167,9 @@ pub struct App {
     serve_state: Option<crate::tailscale::ServeState>,
     /// known_hosts 표시 캐시 (settings 열 때 lazily 로드, 닫으면 None으로 리셋해 재로드).
     known_hosts_cache: Option<Vec<(String, String)>>,
+    /// Agents render가 읽는 검증 완료 cwd. key가 바뀔 때만 logic에서 metadata를 확인한다.
+    agent_workspace_cwd_key: Option<(String, String)>,
+    agent_workspace_cwd: Option<String>,
     /// 폴더 트리 사이드바 (file-tree-design §6). OFF면 None — Panel 미생성 + 상태 drop(리소스 0).
     file_tree: Option<ui::file_tree::FileTreeUi>,
 }
@@ -4927,6 +5266,26 @@ fn resolve_settings_workspace_id(
         })
         .map(str::to_owned)
         .or_else(|| workspaces.first().map(|workspace| workspace.id.clone()))
+}
+
+fn initial_workspace_id(
+    db: &Db,
+    last_workspace_id: Option<&str>,
+    closed_workspace_ids: &std::collections::BTreeSet<String>,
+) -> anyhow::Result<String> {
+    let fallback = db.ensure_default_workspace()?;
+    let workspaces = db.list_workspaces()?;
+    if let Some(last) = last_workspace_id
+        && !closed_workspace_ids.contains(last)
+        && workspaces.iter().any(|workspace| workspace.id == last)
+    {
+        return Ok(last.to_owned());
+    }
+    Ok(workspaces
+        .iter()
+        .find(|workspace| !closed_workspace_ids.contains(&workspace.id))
+        .map(|workspace| workspace.id.clone())
+        .unwrap_or(fallback))
 }
 
 /// Environment & API 목록 안에서만 설정 context를 결정한다. sidebar visibility와
@@ -5072,6 +5431,14 @@ fn is_bounded_https_url(url: &str) -> bool {
 
 enum AppHostIoAction {
     Connector(connector_service::HostAction),
+    Workspace {
+        workspace_id: String,
+        intent: ui::workspace::WorkspaceIoIntent,
+    },
+    FileTree(ui::file_tree::FileTreeIoIntent),
+    FileTreeMaintenance(ui::file_tree::FileTreeMaintenanceIntent),
+    InboxPreview(ui::inbox_waiting::LogPreviewIntent),
+    Diff(ui::diff_panel::DiffIoIntent),
     ComposerContextFile(ui::composer::ContextFileRequest),
     ComposerClipboard(ui::composer::ClipboardAttachmentRequest),
     PersistComposerHistory {
@@ -5079,7 +5446,26 @@ enum AppHostIoAction {
         history: Arc<[Arc<str>]>,
     },
     FolderPicker(FolderPickerPurpose),
+    OpenPath(PathBuf),
     ExternalHttpsUrl(String),
+}
+
+/// Root-owned lifecycle mutations emitted by Settings. The UI keeps at most one action and
+/// `logic()` executes it on the next tick, so render never opens files/keyring/listeners/processes.
+enum AppControllerAction {
+    OpenFileAccessSettings,
+    DetectEnvSessionBanner { cwd: String },
+    CreateWorktree { workspace_id: String, cwd: String },
+    RemoveWorktree { workspace_id: String, cwd: String },
+    RemoteStart,
+    RemoteStop,
+    ForgetKnownHost(String),
+    WebStart,
+    WebStop,
+    RotateWebToken,
+    DetectHostname,
+    CheckServe,
+    ConfigureServe,
 }
 
 #[derive(Clone)]
@@ -5091,6 +5477,14 @@ enum FolderPickerPurpose {
 
 enum AppHostIoCompletion {
     Dispatch(connector_contract::ConnectorIntent),
+    Workspace {
+        workspace_id: String,
+        completion: ui::workspace::WorkspaceIoCompletion,
+    },
+    FileTree(ui::file_tree::FileTreeIoCompletion),
+    FileTreeMaintenance(ui::file_tree::FileTreeMaintenanceCompletion),
+    InboxPreview(ui::inbox_waiting::LogPreviewCompletion),
+    Diff(ui::diff_panel::DiffIoCompletion),
     ComposerContextFile {
         request: ui::composer::ContextFileRequest,
         selected_path: Option<PathBuf>,
@@ -5115,6 +5509,32 @@ enum AppHostIoFallback {
         source: connector_contract::ImportSource,
     },
     Cancel(connector_contract::OperationId),
+    WorkspacePath {
+        workspace_id: String,
+        operation: ui::workspace::WorkspaceIoOperation,
+        generation: u64,
+    },
+    WorkspaceClipboard {
+        workspace_id: String,
+        operation: ui::workspace::WorkspaceIoOperation,
+        generation: u64,
+    },
+    FileTree {
+        operation: ui::file_tree::FileTreeIoOperation,
+        generation: u64,
+    },
+    FileTreeMaintenance {
+        operation: ui::file_tree::FileTreeMaintenanceOperation,
+        generation: u64,
+    },
+    InboxPreview {
+        operation: ui::inbox_waiting::LogPreviewOperation,
+        generation: u64,
+    },
+    Diff {
+        operation: ui::diff_panel::DiffIoOperation,
+        generation: u64,
+    },
     ComposerContextFile(ui::composer::ContextFileRequest),
     ComposerClipboard(ui::composer::ClipboardAttachmentRequest),
     ComposerHistory,
@@ -5139,12 +5559,55 @@ impl AppHostIoFallback {
             AppHostIoAction::Connector(connector_service::HostAction::OpenExternalLink {
                 ..
             }) => Self::None,
+            AppHostIoAction::Workspace {
+                workspace_id,
+                intent:
+                    ui::workspace::WorkspaceIoIntent::ResolvePath {
+                        operation,
+                        generation,
+                        ..
+                    },
+            } => Self::WorkspacePath {
+                workspace_id: workspace_id.clone(),
+                operation: *operation,
+                generation: *generation,
+            },
+            AppHostIoAction::Workspace {
+                workspace_id,
+                intent:
+                    ui::workspace::WorkspaceIoIntent::ReadTerminalClipboard {
+                        operation,
+                        generation,
+                    },
+            } => Self::WorkspaceClipboard {
+                workspace_id: workspace_id.clone(),
+                operation: *operation,
+                generation: *generation,
+            },
+            AppHostIoAction::Workspace { .. } => Self::None,
+            AppHostIoAction::FileTree(intent) => Self::FileTree {
+                operation: intent.operation,
+                generation: intent.generation,
+            },
+            AppHostIoAction::FileTreeMaintenance(intent) => Self::FileTreeMaintenance {
+                operation: intent.operation,
+                generation: intent.generation,
+            },
+            AppHostIoAction::InboxPreview(intent) => Self::InboxPreview {
+                operation: intent.operation,
+                generation: intent.generation,
+            },
+            AppHostIoAction::Diff(intent) => Self::Diff {
+                operation: intent.operation,
+                generation: intent.generation,
+            },
             AppHostIoAction::ComposerContextFile(request) => {
                 Self::ComposerContextFile(request.clone())
             }
             AppHostIoAction::ComposerClipboard(request) => Self::ComposerClipboard(request.clone()),
             AppHostIoAction::PersistComposerHistory { .. } => Self::ComposerHistory,
             AppHostIoAction::FolderPicker(purpose) => Self::FolderPicker(purpose.clone()),
+            AppHostIoAction::OpenPath(_) => Self::None,
             AppHostIoAction::ExternalHttpsUrl(_) => Self::None,
         }
     }
@@ -5164,6 +5627,64 @@ impl AppHostIoFallback {
             Self::Cancel(operation_id) => AppHostIoCompletion::Dispatch(
                 connector_contract::ConnectorIntent::Cancel(operation_id),
             ),
+            Self::WorkspacePath {
+                workspace_id,
+                operation,
+                generation,
+            } => AppHostIoCompletion::Workspace {
+                workspace_id,
+                completion: ui::workspace::WorkspaceIoCompletion::PathResolved {
+                    operation,
+                    generation,
+                    result: None,
+                },
+            },
+            Self::WorkspaceClipboard {
+                workspace_id,
+                operation,
+                generation,
+            } => AppHostIoCompletion::Workspace {
+                workspace_id,
+                completion: ui::workspace::WorkspaceIoCompletion::TerminalClipboardRead {
+                    operation,
+                    generation,
+                    result: Err(ui::workspace::WorkspaceIoErrorCode::NativeFailure),
+                },
+            },
+            Self::FileTree {
+                operation,
+                generation,
+            } => AppHostIoCompletion::FileTree(ui::file_tree::FileTreeIoCompletion {
+                operation,
+                generation,
+                result: Err(ui::file_tree::FileTreeIoErrorCode::NativeFailure),
+            }),
+            Self::FileTreeMaintenance {
+                operation,
+                generation,
+            } => AppHostIoCompletion::FileTreeMaintenance(
+                ui::file_tree::FileTreeMaintenanceCompletion {
+                    operation,
+                    generation,
+                    result: Err(ui::file_tree::FileTreeMaintenanceErrorCode::NativeFailure),
+                },
+            ),
+            Self::InboxPreview {
+                operation,
+                generation,
+            } => AppHostIoCompletion::InboxPreview(ui::inbox_waiting::LogPreviewCompletion {
+                operation,
+                generation,
+                result: Err(ui::inbox_waiting::LogPreviewErrorCode::NativeFailure),
+            }),
+            Self::Diff {
+                operation,
+                generation,
+            } => AppHostIoCompletion::Diff(ui::diff_panel::DiffIoCompletion {
+                operation,
+                generation,
+                result: Err(ui::diff_panel::DiffIoErrorCode::CollectionFailed),
+            }),
             Self::ComposerContextFile(request) => AppHostIoCompletion::ComposerContextFile {
                 request,
                 selected_path: None,
@@ -5180,6 +5701,204 @@ impl AppHostIoFallback {
             Self::None => AppHostIoCompletion::ExternalLinkFailed,
         }
     }
+}
+
+#[derive(Default)]
+struct PendingFileTreeWatchEvents {
+    paths: Vec<PathBuf>,
+    overflowed: bool,
+}
+
+struct AppFileTreeWatcher {
+    watcher: notify::RecommendedWatcher,
+    watched: std::collections::HashSet<PathBuf>,
+    pending: Arc<std::sync::Mutex<PendingFileTreeWatchEvents>>,
+    generation: u64,
+    revision: u64,
+    root: PathBuf,
+    ignored_prefixes: Vec<PathBuf>,
+    show_hidden: bool,
+}
+
+impl AppFileTreeWatcher {
+    fn new(ctx: egui::Context) -> Result<Self, ui::file_tree::FileTreeMaintenanceErrorCode> {
+        let pending = Arc::new(std::sync::Mutex::new(PendingFileTreeWatchEvents::default()));
+        let callback_pending = Arc::clone(&pending);
+        let watcher =
+            notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
+                let mut pending = callback_pending
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                match event {
+                    Ok(event) if !matches!(event.kind, notify::EventKind::Access(_)) => {
+                        let mut changed = false;
+                        for path in event.paths {
+                            let bytes = path.as_os_str().as_encoded_bytes().len();
+                            if bytes == 0 || bytes > APP_HOST_PATH_MAX_BYTES {
+                                pending.overflowed = true;
+                                changed = true;
+                                continue;
+                            }
+                            if pending.paths.iter().any(|existing| existing == &path) {
+                                continue;
+                            }
+                            if pending.paths.len() >= ui::file_tree::FILE_TREE_WATCH_MAX_EVENTS {
+                                pending.overflowed = true;
+                                changed = true;
+                                break;
+                            }
+                            pending.paths.push(path);
+                            changed = true;
+                        }
+                        drop(pending);
+                        if changed {
+                            ctx.request_repaint();
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        pending.overflowed = true;
+                        drop(pending);
+                        ctx.request_repaint();
+                    }
+                }
+            })
+            .map_err(|_| ui::file_tree::FileTreeMaintenanceErrorCode::WatchUnavailable)?;
+        Ok(Self {
+            watcher,
+            watched: std::collections::HashSet::new(),
+            pending,
+            generation: 0,
+            revision: 0,
+            root: PathBuf::new(),
+            ignored_prefixes: Vec::new(),
+            show_hidden: false,
+        })
+    }
+
+    fn replace(
+        &mut self,
+        generation: u64,
+        directories: Vec<PathBuf>,
+        ignored_prefixes: Vec<PathBuf>,
+        show_hidden: bool,
+    ) -> Result<(), ui::file_tree::FileTreeMaintenanceErrorCode> {
+        use notify::Watcher as _;
+
+        let Some(root) = directories.first().cloned() else {
+            return Err(ui::file_tree::FileTreeMaintenanceErrorCode::InvalidSnapshot);
+        };
+        if directories.len() > ui::file_tree::FILE_TREE_WATCH_MAX_DIRECTORIES
+            || directories
+                .iter()
+                .any(|directory| !directory.starts_with(&root))
+        {
+            return Err(ui::file_tree::FileTreeMaintenanceErrorCode::WatchPlanTooLarge);
+        }
+        let desired = directories
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        for directory in desired.difference(&self.watched) {
+            self.watcher
+                .watch(directory, notify::RecursiveMode::NonRecursive)
+                .map_err(|_| ui::file_tree::FileTreeMaintenanceErrorCode::WatchUnavailable)?;
+        }
+        for directory in self.watched.difference(&desired) {
+            let _ = self.watcher.unwatch(directory);
+        }
+        self.watched = desired;
+        self.generation = generation;
+        self.root = root;
+        self.ignored_prefixes = ignored_prefixes;
+        self.show_hidden = show_hidden;
+        *self
+            .pending
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = PendingFileTreeWatchEvents::default();
+        Ok(())
+    }
+
+    fn take_snapshot(
+        &mut self,
+    ) -> Result<
+        Option<ui::file_tree::FileTreeWatchSnapshot>,
+        ui::file_tree::FileTreeMaintenanceErrorCode,
+    > {
+        let PendingFileTreeWatchEvents {
+            paths,
+            mut overflowed,
+        } = std::mem::take(
+            &mut *self
+                .pending
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        );
+        if paths.is_empty() && !overflowed {
+            return Ok(None);
+        }
+        let mut events = Vec::with_capacity(ui::file_tree::FILE_TREE_WATCH_MAX_EVENTS);
+        for path in paths {
+            if !path.starts_with(&self.root)
+                || self
+                    .ignored_prefixes
+                    .iter()
+                    .any(|prefix| path.starts_with(prefix))
+            {
+                continue;
+            }
+            let env_file = app_file_tree_env_candidate(&path);
+            if !self.show_hidden && app_file_tree_hidden_component(&self.root, &path) && !env_file {
+                continue;
+            }
+            if env_file {
+                if events.len() >= ui::file_tree::FILE_TREE_WATCH_MAX_EVENTS {
+                    overflowed = true;
+                    break;
+                }
+                events.push(ui::file_tree::FileTreeWatchEvent::try_new(
+                    ui::file_tree::FileTreeWatchEventKind::EnvFileChanged,
+                    path.clone(),
+                )?);
+            }
+            if let Some(parent) = path.parent() {
+                if events.len() >= ui::file_tree::FILE_TREE_WATCH_MAX_EVENTS {
+                    overflowed = true;
+                    break;
+                }
+                events.push(ui::file_tree::FileTreeWatchEvent::try_new(
+                    ui::file_tree::FileTreeWatchEventKind::DirtyDirectory,
+                    parent.to_path_buf(),
+                )?);
+            }
+        }
+        self.revision = self.revision.wrapping_add(1).max(1);
+        ui::file_tree::FileTreeWatchSnapshot::try_new(
+            self.generation,
+            self.revision,
+            overflowed,
+            events,
+        )
+        .map(Some)
+    }
+}
+
+fn app_file_tree_env_candidate(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name == ".env"
+                || name == ".envrc"
+                || name.starts_with(".env.")
+                || name.starts_with(".env-")
+        })
+}
+
+fn app_file_tree_hidden_component(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root).is_ok_and(|relative| {
+        relative.components().any(|component| {
+            matches!(component, std::path::Component::Normal(name) if name.to_string_lossy().starts_with('.'))
+        })
+    })
 }
 
 struct AppHostIoTask {
@@ -5291,8 +6010,528 @@ fn read_composer_clipboard_paths() -> Option<Vec<PathBuf>> {
     })
 }
 
+const APP_HOST_OPENABLE_EXTS: &[&str] = &[
+    "pdf", "html", "htm", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "csv", "hwp", "txt", "md",
+    "rtf", "png", "jpg", "jpeg", "gif", "webp", "svg", "heic", "tiff", "mp4", "mov", "mp3", "wav",
+    "zip", "numbers", "pages", "key",
+];
+
+fn app_host_openable_file(path: &Path) -> bool {
+    let allowed_extension = |candidate: &Path| {
+        candidate
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                APP_HOST_OPENABLE_EXTS.contains(&extension.to_ascii_lowercase().as_str())
+            })
+    };
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
+        && allowed_extension(path)
+        && std::fs::canonicalize(path).is_ok_and(|real| allowed_extension(&real))
+}
+
+fn resolve_workspace_host_path(
+    word: &str,
+    cwd: Option<&Path>,
+) -> Option<ui::workspace::WorkspacePathResolution> {
+    if word.is_empty() || word.len() > APP_HOST_PATH_MAX_BYTES || word.as_bytes().contains(&0) {
+        return None;
+    }
+    let token = word
+        .trim_start_matches(|character: char| "\"'`([{<".contains(character))
+        .trim_end_matches(|character: char| "\"'`.,;!?)]}>".contains(character));
+    if token.is_empty() {
+        return None;
+    }
+    let mut candidates = vec![token];
+    let mut head = token;
+    while let Some((rest, tail)) = head.rsplit_once(':')
+        && !rest.is_empty()
+        && !tail.is_empty()
+        && tail.chars().all(|character| character.is_ascii_digit())
+    {
+        candidates.push(rest);
+        head = rest;
+    }
+    for candidate in candidates {
+        let path = if let Some(rest) = candidate.strip_prefix("~/") {
+            crate::paths::home_dir().map(|home| home.join(rest))
+        } else if candidate.starts_with('/') {
+            Some(PathBuf::from(candidate))
+        } else {
+            cwd.map(|root| root.join(candidate))
+        }?;
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let kind = if metadata.is_dir() {
+            ui::workspace::WorkspacePathKind::Directory
+        } else if app_host_openable_file(&path) {
+            ui::workspace::WorkspacePathKind::OpenableFile
+        } else {
+            continue;
+        };
+        let path = ui::workspace::WorkspacePathPayload::try_new(path).ok()?;
+        return Some(ui::workspace::WorkspacePathResolution { kind, path });
+    }
+    None
+}
+
+fn app_host_open_path_reaped(path: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    const OPENER: &str = "open";
+    #[cfg(not(target_os = "macos"))]
+    const OPENER: &str = "xdg-open";
+    std::process::Command::new(OPENER)
+        .arg(path)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn app_host_valid_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name == name.trim()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\', '\0'])
+        && name.len() <= APP_HOST_PATH_MAX_BYTES
+}
+
+fn app_host_rename_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let to_c_string = |path: &Path| {
+            std::ffi::CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+        };
+        let source = to_c_string(source)?;
+        let destination = to_c_string(destination)?;
+        let result =
+            unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ENOTSUP) {
+            return Err(error);
+        }
+    }
+    if std::fs::symlink_metadata(destination).is_ok() {
+        return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+    }
+    std::fs::rename(source, destination)
+}
+
+fn app_host_remove_all(path: &Path) -> std::io::Result<()> {
+    let file_type = std::fs::symlink_metadata(path)?.file_type();
+    if file_type.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
+fn app_host_copy_recursive(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let file_type = std::fs::symlink_metadata(source)?.file_type();
+    if file_type.is_symlink() {
+        let target = std::fs::read_link(source)?;
+        #[cfg(unix)]
+        return std::os::unix::fs::symlink(target, destination);
+        #[cfg(not(unix))]
+        {
+            let _ = target;
+            return Err(std::io::Error::other("symlink_copy_unsupported"));
+        }
+    }
+    if file_type.is_dir() {
+        std::fs::create_dir(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            app_host_copy_recursive(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+    std::fs::copy(source, destination).map(|_| ())
+}
+
+fn app_host_copy_into(source: &Path, destination_dir: &Path) -> Result<(), ()> {
+    let name = source.file_name().ok_or(())?;
+    if let Ok(source_real) = std::fs::canonicalize(source)
+        && destination_dir.starts_with(source_real)
+    {
+        return Err(());
+    }
+    let destination = destination_dir.join(name);
+    let temporary = destination_dir.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
+    if app_host_copy_recursive(source, &temporary).is_err() {
+        let _ = app_host_remove_all(&temporary);
+        return Err(());
+    }
+    if app_host_rename_no_replace(&temporary, &destination).is_err() {
+        let _ = app_host_remove_all(&temporary);
+        return Err(());
+    }
+    Ok(())
+}
+
+fn app_host_move(
+    root: &Path,
+    source: &Path,
+    destination_dir: &Path,
+) -> Result<(), ui::file_tree::FileTreeIoErrorCode> {
+    let root =
+        std::fs::canonicalize(root).map_err(|_| ui::file_tree::FileTreeIoErrorCode::OutsideRoot)?;
+    let destination_dir = std::fs::canonicalize(destination_dir)
+        .map_err(|_| ui::file_tree::FileTreeIoErrorCode::OutsideRoot)?;
+    let name = source
+        .file_name()
+        .ok_or(ui::file_tree::FileTreeIoErrorCode::InvalidPath)?;
+    let source_parent = source
+        .parent()
+        .and_then(|parent| std::fs::canonicalize(parent).ok())
+        .ok_or(ui::file_tree::FileTreeIoErrorCode::InvalidPath)?;
+    let source = source_parent.join(name);
+    if !source.starts_with(&root)
+        || !destination_dir.starts_with(&root)
+        || destination_dir.starts_with(&source)
+    {
+        return Err(ui::file_tree::FileTreeIoErrorCode::OutsideRoot);
+    }
+    if source_parent == destination_dir {
+        return Ok(());
+    }
+    let destination = destination_dir.join(name);
+    match app_host_rename_no_replace(&source, &destination) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+            let temporary = destination_dir.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
+            if app_host_copy_recursive(&source, &temporary).is_err() {
+                let _ = app_host_remove_all(&temporary);
+                return Err(ui::file_tree::FileTreeIoErrorCode::NativeFailure);
+            }
+            if let Err(error) = app_host_rename_no_replace(&temporary, &destination) {
+                let _ = app_host_remove_all(&temporary);
+                return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    ui::file_tree::FileTreeIoErrorCode::Conflict
+                } else {
+                    ui::file_tree::FileTreeIoErrorCode::NativeFailure
+                });
+            }
+            app_host_remove_all(&source)
+                .map_err(|_| ui::file_tree::FileTreeIoErrorCode::NativeFailure)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(ui::file_tree::FileTreeIoErrorCode::Conflict)
+        }
+        Err(_) => Err(ui::file_tree::FileTreeIoErrorCode::NativeFailure),
+    }
+}
+
+fn run_file_tree_host_io(
+    request: ui::file_tree::FileTreeIoRequest,
+) -> Result<(), ui::file_tree::FileTreeIoErrorCode> {
+    use ui::file_tree::{FileTreeIoErrorCode as Error, FileTreeIoRequest as Request};
+    match request {
+        Request::Rename { source, name } => {
+            if !app_host_valid_file_name(&name) {
+                return Err(Error::InvalidName);
+            }
+            let source = source.into_path();
+            let destination = source.parent().ok_or(Error::InvalidPath)?.join(name);
+            if destination == source {
+                return Ok(());
+            }
+            app_host_rename_no_replace(&source, &destination).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    Error::Conflict
+                } else {
+                    Error::NativeFailure
+                }
+            })
+        }
+        Request::CreateDirectory { parent, name } => {
+            if !app_host_valid_file_name(&name) {
+                return Err(Error::InvalidName);
+            }
+            std::fs::create_dir(parent.into_path().join(name)).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    Error::Conflict
+                } else {
+                    Error::NativeFailure
+                }
+            })
+        }
+        Request::CreateFile { parent, name } => {
+            if !app_host_valid_file_name(&name) {
+                return Err(Error::InvalidName);
+            }
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(parent.into_path().join(name))
+                .map(|_| ())
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        Error::Conflict
+                    } else {
+                        Error::NativeFailure
+                    }
+                })
+        }
+        Request::Move {
+            root,
+            source,
+            destination,
+        } => app_host_move(root.as_path(), source.as_path(), destination.as_path()),
+        Request::CopyInto {
+            sources,
+            destination,
+        } => {
+            let destination =
+                std::fs::canonicalize(destination.into_path()).map_err(|_| Error::InvalidPath)?;
+            for source in sources.into_paths() {
+                app_host_copy_into(&source, &destination).map_err(|_| Error::NativeFailure)?;
+            }
+            Ok(())
+        }
+        Request::PasteFromClipboard { destination } => {
+            let Some(sources) = ui::clipboard_image::read_clipboard_file_list() else {
+                return Ok(());
+            };
+            let destination =
+                std::fs::canonicalize(destination.into_path()).map_err(|_| Error::InvalidPath)?;
+            for source in sources {
+                app_host_copy_into(&source, &destination).map_err(|_| Error::NativeFailure)?;
+            }
+            Ok(())
+        }
+        Request::Trash { target } => {
+            trash::delete(target.as_path()).map_err(|_| Error::TrashUnavailable)
+        }
+        Request::DeletePermanently { target } => {
+            app_host_remove_all(target.as_path()).map_err(|_| Error::NativeFailure)
+        }
+        Request::CopyFileUrls { paths } => {
+            ui::clipboard_image::copy_file_urls_to_clipboard(&paths.into_paths())
+                .map_err(|_| Error::NativeFailure)
+        }
+        Request::OpenPath {
+            target,
+            require_openable_file,
+        } => {
+            if require_openable_file && !app_host_openable_file(target.as_path()) {
+                return Err(Error::InvalidPath);
+            }
+            app_host_open_path_reaped(target.as_path())
+                .then_some(())
+                .ok_or(Error::NativeFailure)
+        }
+    }
+}
+
+fn read_inbox_log_preview(
+    source: &ui::inbox_waiting::LogPreviewSource,
+) -> Result<Option<ui::inbox_waiting::LogPreviewSnapshot>, ui::inbox_waiting::LogPreviewErrorCode> {
+    use std::io::{Read as _, Seek as _};
+
+    let mut file = std::fs::File::open(source.as_path())
+        .map_err(|_| ui::inbox_waiting::LogPreviewErrorCode::NativeFailure)?;
+    let length = file
+        .metadata()
+        .map_err(|_| ui::inbox_waiting::LogPreviewErrorCode::NativeFailure)?
+        .len();
+    let start = length.saturating_sub(ui::inbox_waiting::LOG_PREVIEW_TAIL_BYTES);
+    file.seek(std::io::SeekFrom::Start(start))
+        .map_err(|_| ui::inbox_waiting::LogPreviewErrorCode::NativeFailure)?;
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(length.saturating_sub(start))
+            .unwrap_or(ui::inbox_waiting::LOG_PREVIEW_TAIL_BYTES as usize),
+    );
+    file.take(ui::inbox_waiting::LOG_PREVIEW_TAIL_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ui::inbox_waiting::LogPreviewErrorCode::NativeFailure)?;
+    ui::inbox_waiting::LogPreviewSnapshot::try_from_tail_bytes(&bytes, start > 0)
+}
+
+fn run_file_tree_listing(
+    root: &Path,
+    directory: &Path,
+    max_items: usize,
+    max_bytes: usize,
+) -> Result<ui::file_tree::FileTreeListingSnapshot, ui::file_tree::FileTreeMaintenanceErrorCode> {
+    use ui::file_tree::FileTreeMaintenanceErrorCode as Error;
+
+    if max_items == 0
+        || max_items > ui::file_tree::FILE_TREE_LISTING_MAX_ITEMS
+        || max_bytes == 0
+        || max_bytes > ui::file_tree::FILE_TREE_LISTING_MAX_BYTES
+    {
+        return Err(Error::ListingTooLarge);
+    }
+    let canonical_root = std::fs::canonicalize(root).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            Error::PermissionDenied
+        } else {
+            Error::NativeFailure
+        }
+    })?;
+    let canonical_directory = std::fs::canonicalize(directory).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            Error::PermissionDenied
+        } else {
+            Error::NativeFailure
+        }
+    })?;
+    if !canonical_directory.starts_with(&canonical_root) || !canonical_directory.is_dir() {
+        return Err(Error::InvalidSnapshot);
+    }
+    let entries = std::fs::read_dir(&canonical_directory).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            Error::PermissionDenied
+        } else {
+            Error::NativeFailure
+        }
+    })?;
+    let mut items = Vec::with_capacity(max_items.min(256));
+    let mut bytes = 0usize;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                Error::PermissionDenied
+            } else {
+                Error::NativeFailure
+            }
+        })?;
+        if items.len() >= max_items {
+            return Err(Error::ListingTooLarge);
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        bytes = bytes
+            .checked_add(name.len())
+            .filter(|bytes| *bytes <= max_bytes)
+            .ok_or(Error::ListingTooLarge)?;
+        let is_dir = entry
+            .file_type()
+            .map_err(|_| Error::NativeFailure)?
+            .is_dir();
+        items.push(ui::file_tree::FileTreeListingItem::try_new(name, is_dir)?);
+    }
+    ui::file_tree::FileTreeListingSnapshot::try_new(items)
+}
+
 fn run_app_host_io(action: AppHostIoAction) -> AppHostIoCompletion {
     match action {
+        AppHostIoAction::Workspace {
+            workspace_id,
+            intent:
+                ui::workspace::WorkspaceIoIntent::ResolvePath {
+                    operation,
+                    generation,
+                    pid,
+                    cwd,
+                    word,
+                    ..
+                },
+        } => {
+            let cwd = cwd
+                .map(ui::workspace::WorkspacePathPayload::into_path)
+                .or_else(|| pid.and_then(platform::process_cwd));
+            AppHostIoCompletion::Workspace {
+                workspace_id,
+                completion: ui::workspace::WorkspaceIoCompletion::PathResolved {
+                    operation,
+                    generation,
+                    result: resolve_workspace_host_path(&word, cwd.as_deref()),
+                },
+            }
+        }
+        AppHostIoAction::Workspace {
+            workspace_id,
+            intent:
+                ui::workspace::WorkspaceIoIntent::ReadTerminalClipboard {
+                    operation,
+                    generation,
+                },
+        } => {
+            let paths = ui::clipboard_image::paste_clipboard_paths_or_image_to_paths()
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let text = ui::clipboard_image::read_clipboard_text();
+            AppHostIoCompletion::Workspace {
+                workspace_id,
+                completion: ui::workspace::WorkspaceIoCompletion::TerminalClipboardRead {
+                    operation,
+                    generation,
+                    result: ui::workspace::TerminalClipboardPayload::try_new(paths, text),
+                },
+            }
+        }
+        AppHostIoAction::Workspace {
+            intent: ui::workspace::WorkspaceIoIntent::OpenPath(path),
+            ..
+        } => {
+            if app_host_open_path_reaped(path.as_path()) {
+                AppHostIoCompletion::Complete
+            } else {
+                AppHostIoCompletion::ExternalLinkFailed
+            }
+        }
+        AppHostIoAction::Workspace {
+            intent: ui::workspace::WorkspaceIoIntent::OpenUrl(url),
+            ..
+        } => {
+            if auth::open_in_browser_reaped(url.as_str()).is_ok() {
+                AppHostIoCompletion::Complete
+            } else {
+                AppHostIoCompletion::ExternalLinkFailed
+            }
+        }
+        AppHostIoAction::FileTree(intent) => {
+            let operation = intent.operation;
+            let generation = intent.generation;
+            AppHostIoCompletion::FileTree(ui::file_tree::FileTreeIoCompletion {
+                operation,
+                generation,
+                result: run_file_tree_host_io(intent.request),
+            })
+        }
+        AppHostIoAction::FileTreeMaintenance(intent) => {
+            let operation = intent.operation;
+            let generation = intent.generation;
+            let result = match intent.request {
+                ui::file_tree::FileTreeMaintenanceRequest::ListDirectory {
+                    root,
+                    directory,
+                    max_items,
+                    max_bytes,
+                } => {
+                    run_file_tree_listing(root.as_path(), directory.as_path(), max_items, max_bytes)
+                        .map(ui::file_tree::FileTreeMaintenanceResult::Listing)
+                }
+                ui::file_tree::FileTreeMaintenanceRequest::ReplaceWatchSet(_) => {
+                    Err(ui::file_tree::FileTreeMaintenanceErrorCode::NativeFailure)
+                }
+            };
+            AppHostIoCompletion::FileTreeMaintenance(ui::file_tree::FileTreeMaintenanceCompletion {
+                operation,
+                generation,
+                result,
+            })
+        }
+        AppHostIoAction::InboxPreview(intent) => {
+            let operation = intent.operation;
+            let generation = intent.generation;
+            AppHostIoCompletion::InboxPreview(ui::inbox_waiting::LogPreviewCompletion {
+                operation,
+                generation,
+                result: read_inbox_log_preview(&intent.source),
+            })
+        }
+        AppHostIoAction::Diff(intent) => {
+            AppHostIoCompletion::Diff(ui::diff_panel::execute_io(intent))
+        }
         AppHostIoAction::PersistComposerHistory { path, history } => {
             if write_composer_history(&path, &history) {
                 AppHostIoCompletion::Complete
@@ -5305,6 +6544,15 @@ fn run_app_host_io(action: AppHostIoAction) -> AppHostIoCompletion {
             payload: read_composer_clipboard_paths()
                 .and_then(|paths| ui::composer::ClipboardAttachmentPayload::try_new(paths).ok()),
         },
+        AppHostIoAction::OpenPath(path) => {
+            if path.as_os_str().as_encoded_bytes().len() <= APP_HOST_PATH_MAX_BYTES
+                && app_host_open_path_reaped(&path)
+            {
+                AppHostIoCompletion::Complete
+            } else {
+                AppHostIoCompletion::ExternalLinkFailed
+            }
+        }
         AppHostIoAction::ExternalHttpsUrl(url) => {
             if is_bounded_https_url(&url) && auth::open_in_browser_reaped(&url).is_ok() {
                 AppHostIoCompletion::Complete
@@ -5426,6 +6674,41 @@ impl App {
                     tracing::warn!("Connector host completion dispatch failed");
                 }
             }
+            AppHostIoCompletion::Workspace {
+                workspace_id,
+                completion,
+            } => {
+                let runtime = if self.active.id == workspace_id {
+                    Some(&mut self.active)
+                } else {
+                    self.warm.get_mut(&workspace_id)
+                };
+                if let Some(runtime) = runtime {
+                    runtime
+                        .workspace_ui
+                        .complete_io(completion, &runtime.runtime);
+                }
+            }
+            AppHostIoCompletion::FileTree(completion) => {
+                if let Some(tree) = self.file_tree.as_mut() {
+                    tree.complete_io(completion);
+                }
+            }
+            AppHostIoCompletion::FileTreeMaintenance(completion) => {
+                if let Some(tree) = self.file_tree.as_mut() {
+                    tree.complete_maintenance(completion);
+                    self.egui_ctx.request_repaint();
+                }
+            }
+            AppHostIoCompletion::InboxPreview(completion) => {
+                if self.inbox_waiting_ui.complete_preview(completion) {
+                    self.egui_ctx.request_repaint();
+                }
+            }
+            AppHostIoCompletion::Diff(completion) => {
+                self.diff_panel_ui.complete_io(completion);
+                self.egui_ctx.request_repaint();
+            }
             AppHostIoCompletion::ComposerContextFile {
                 request,
                 selected_path,
@@ -5472,6 +6755,83 @@ impl App {
         }
     }
 
+    fn poll_file_tree_maintenance(&mut self, ctx: &egui::Context) {
+        let Some(tree) = self.file_tree.as_mut() else {
+            self.pending_file_tree_maintenance = None;
+            self.file_tree_watcher = None;
+            return;
+        };
+        if let Some(watcher) = self.file_tree_watcher.as_mut() {
+            match watcher.take_snapshot() {
+                Ok(Some(snapshot)) => {
+                    tree.apply_watch_snapshot(snapshot);
+                    ctx.request_repaint();
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    self.file_tree_watcher = None;
+                    tracing::warn!(
+                        kind = "file_tree",
+                        phase = "watch",
+                        error_code = "snapshot_invalid",
+                        "file tree watch snapshot invalid"
+                    );
+                }
+            }
+        }
+        if self.pending_file_tree_maintenance.is_none() {
+            self.pending_file_tree_maintenance = tree.take_maintenance_intent();
+        }
+        let is_watch_plan = self
+            .pending_file_tree_maintenance
+            .as_ref()
+            .is_some_and(|intent| {
+                matches!(
+                    intent.request,
+                    ui::file_tree::FileTreeMaintenanceRequest::ReplaceWatchSet(_)
+                )
+            });
+        if !is_watch_plan {
+            return;
+        }
+        let intent = self
+            .pending_file_tree_maintenance
+            .take()
+            .expect("watch plan checked");
+        let operation = intent.operation;
+        let generation = intent.generation;
+        let ui::file_tree::FileTreeMaintenanceRequest::ReplaceWatchSet(plan) = intent.request
+        else {
+            unreachable!("watch plan checked")
+        };
+        let (directories, ignored_prefixes, show_hidden) = plan.into_parts();
+        let result = if directories.is_empty() {
+            self.file_tree_watcher = None;
+            Ok(ui::file_tree::FileTreeMaintenanceResult::WatchSetApplied)
+        } else {
+            if self.file_tree_watcher.is_none() {
+                self.file_tree_watcher = AppFileTreeWatcher::new(ctx.clone()).ok();
+            }
+            match self.file_tree_watcher.as_mut() {
+                Some(watcher) => watcher
+                    .replace(generation, directories, ignored_prefixes, show_hidden)
+                    .map(|()| ui::file_tree::FileTreeMaintenanceResult::WatchSetApplied),
+                None => Err(ui::file_tree::FileTreeMaintenanceErrorCode::WatchUnavailable),
+            }
+        };
+        if result.is_err() {
+            self.file_tree_watcher = None;
+        }
+        if let Some(tree) = self.file_tree.as_mut() {
+            tree.complete_maintenance(ui::file_tree::FileTreeMaintenanceCompletion {
+                operation,
+                generation,
+                result,
+            });
+        }
+        ctx.request_repaint();
+    }
+
     fn poll_app_host_io(&mut self, ctx: &egui::Context) {
         let completed =
             self.app_host_io
@@ -5495,19 +6855,48 @@ impl App {
         if !self.try_apply_pending_folder_picker_completion() {
             return;
         }
-        let action = self
-            .connector_coordinator
-            .try_take_host_action()
-            .map(AppHostIoAction::Connector)
-            .or_else(|| self.pending_app_host_action.take())
-            .or_else(|| {
-                self.pending_composer_history.take().map(|history| {
-                    AppHostIoAction::PersistComposerHistory {
-                        path: self.composer_history_path.clone(),
-                        history,
-                    }
+        let action =
+            self.connector_coordinator
+                .try_take_host_action()
+                .map(AppHostIoAction::Connector)
+                .or_else(|| self.pending_app_host_action.take())
+                .or_else(|| {
+                    self.active.workspace_ui.take_io_intent().map(|intent| {
+                        AppHostIoAction::Workspace {
+                            workspace_id: self.active.id.clone(),
+                            intent,
+                        }
+                    })
                 })
-            });
+                .or_else(|| {
+                    self.file_tree
+                        .as_mut()
+                        .and_then(ui::file_tree::FileTreeUi::take_io_intent)
+                        .map(AppHostIoAction::FileTree)
+                })
+                .or_else(|| {
+                    self.pending_file_tree_maintenance
+                        .take()
+                        .map(AppHostIoAction::FileTreeMaintenance)
+                })
+                .or_else(|| {
+                    self.inbox_waiting_ui
+                        .take_preview_intent()
+                        .map(AppHostIoAction::InboxPreview)
+                })
+                .or_else(|| {
+                    self.diff_panel_ui
+                        .take_io_intent()
+                        .map(AppHostIoAction::Diff)
+                })
+                .or_else(|| {
+                    self.pending_composer_history.take().map(|history| {
+                        AppHostIoAction::PersistComposerHistory {
+                            path: self.composer_history_path.clone(),
+                            history,
+                        }
+                    })
+                });
         let Some(action) = action else {
             return;
         };
@@ -5555,8 +6944,60 @@ impl App {
         }
     }
 
+    /// Production composition root. Paths/config are prepared by `main`; concrete storage,
+    /// keyring-backed services, crash recovery, and all adapters are constructed only here.
+    pub fn bootstrap(
+        config: Config,
+        config_path: PathBuf,
+        data_dir: PathBuf,
+        egui_ctx: egui::Context,
+        bench: Option<crate::bench::Bench>,
+    ) -> anyhow::Result<Self> {
+        if secret::init_platform_store().is_err() {
+            tracing::warn!(
+                kind = "secret_store",
+                phase = "initialize",
+                error_code = "platform_store_unavailable",
+                "keyring store unavailable"
+            );
+        }
+        let db_path = data_dir.join("metadata.sqlite3");
+        let db = Db::open(&db_path)?;
+        let workspace_id = initial_workspace_id(
+            &db,
+            config.ui.last_workspace_id.as_deref(),
+            &config.ui.closed_workspace_ids,
+        )?;
+        let reconciled = db
+            .reconcile_orphan_sessions()
+            .map_err(|error| anyhow::anyhow!("session_crash_reconciliation_failed: {error:#}"))?;
+        if reconciled > 0 {
+            tracing::info!(count = reconciled, "orphan sessions reconciled");
+        }
+        let logs_base = data_dir.join("logs");
+        match storage::gc_session_logs(&logs_base, storage::SESSION_LOG_DISK_BUDGET_BYTES) {
+            Ok(bytes) => tracing::info!(bytes, "session log budget applied"),
+            Err(_) => tracing::warn!(
+                kind = "session_log",
+                phase = "gc",
+                error_code = "session_log_gc_failed",
+                "session log GC failed"
+            ),
+        }
+        Ok(Self::new(
+            config,
+            config_path,
+            db,
+            workspace_id,
+            logs_base,
+            db_path,
+            egui_ctx,
+            bench,
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    fn new(
         mut config: Config,
         config_path: PathBuf,
         db: Db,
@@ -5796,6 +7237,7 @@ impl App {
             env_secret_reveal_worker,
             env_secret_generation: 0,
             settings_snapshot_worker,
+            pending_settings_job: None,
             settings_snapshot_generation: 0,
             settings_snapshot_revision: 0,
             settings_snapshot_pending: false,
@@ -5818,14 +7260,21 @@ impl App {
                 .with_app_server_host(Arc::new(AppCodexAppServerHost {
                     secret_store: KeyringSecretStore,
                 })),
+            pending_agent_sessions_action: None,
             diff_panel_ui: ui::diff_panel::DiffPanelUi::new(),
             agent_persistence_queue: Vec::new(),
             agent_persistence_retry_at: None,
             connector_coordinator,
             connector_snapshot_reader,
             connector_ui: connector_ui::ConnectorUi::new(&i18n),
+            pending_connector_dispatch: None,
             app_host_io: None,
             pending_app_host_action: None,
+            pending_file_tree_maintenance: None,
+            file_tree_watcher: None,
+            pending_app_controller_action: None,
+            pending_settings_config_apply: false,
+            pending_config_save: false,
             pending_composer_history: None,
             pending_folder_picker_completion: None,
             credentials_ui: ui::credentials::CredentialsUi::new(),
@@ -5842,6 +7291,7 @@ impl App {
             notice_translation_cache,
             notice_translation_cache_path,
             notice_translate_rx: None,
+            notice_translate_bin: None,
             ollama_models: None,
             ollama_detect_done: false,
             ollama_detect_rx: None,
@@ -5915,6 +7365,8 @@ impl App {
             serve_rx: None,
             serve_state: None,
             known_hosts_cache: None,
+            agent_workspace_cwd_key: None,
+            agent_workspace_cwd: None,
             file_tree: None,
         };
         app.prune_resolved_approvals();
@@ -6684,12 +8136,8 @@ impl App {
 
     /// 세션의 현재 작업 폴더 — 감지 워커 캐시 우선, 없으면 pid로 일회성 lsof 조회
     /// (사용자 클릭 시점의 1회 조회라 스폰 비용 감수 — platform::process_cwd 관례).
-    fn session_cwd_lookup(&self, session: runtime::SessionId) -> Option<String> {
-        if let Some(cwd) = self.session_cwds.get(&session) {
-            return Some(cwd.clone());
-        }
-        let pid = self.active.workspace_ui.session_pid(session)?;
-        platform::process_cwd(pid).map(|path| path.to_string_lossy().into_owned())
+    fn cached_session_cwd(&self, session: runtime::SessionId) -> Option<String> {
+        self.session_cwds.get(&session).cloned()
     }
 
     /// shim PATH env — hook 토글 ON이고 shim이 설치돼 있으면 셸 PATH 앞에 주입한다.
@@ -6828,14 +8276,16 @@ impl App {
         let addr =
             std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, self.config.web.port));
         let hostname = self.config.web.ts_hostname.trim();
+        let repository: Arc<dyn web_remote::repository::WebRemoteRepository> =
+            Arc::new(AppWebRemoteRepository::open(&self.db_path)?);
         let server = web_remote::WebRemoteServer::serve(
             addr,
             web_remote::ServeOptions {
                 token: token.clone(),
                 allowed_host: (!hostname.is_empty()).then(|| hostname.to_owned()),
-                // 승인 대시보드는 자체 Db 연결로 직행(프록시↔GUI 공유 DB IPC 관례, 계획 §0.2).
-                db_path: Some(self.db_path.clone()),
-                // 웹푸시 발송(P4)도 db_path로 자체 연결을 연다(구독 저장·승인 폴링).
+                // app-owned adapter 한 개를 Dashboard와 Push가 공유한다. web-remote는
+                // concrete Db를 생성하거나 storage row를 contract에 노출하지 않는다.
+                repository: Some(repository),
                 vapid,
                 // 모바일 파일 첨부(P6d) — 세션에 묶이지 않는 평면 디렉터리라 workspace별
                 // logs_root가 아닌 logs_base 바로 아래에 둔다(remote/ 분리와 같은 이유).
@@ -7112,6 +8562,373 @@ impl App {
             Err(e) => {
                 tracing::warn!("known_hosts 읽기 실패: {e:#}");
                 Vec::new()
+            }
+        }
+    }
+
+    fn apply_settings_config(&mut self, ctx: &egui::Context) {
+        self.config.i18n.locale = i18n::normalize_locale(&self.config.i18n.locale);
+        if self.i18n.locale() != self.config.i18n.locale {
+            self.i18n = load_catalog(&self.config.i18n.locale);
+            self.agent_sessions_ui.set_catalog(&self.i18n);
+            self.connector_ui.set_catalog(&self.i18n);
+        }
+        ctx.set_theme(self.config.ui.theme.to_egui());
+        self.sync_agent_hooks();
+        self.broadcast_terminal_cache_policy();
+        if self.config.ui.file_tree_enabled != self.file_tree.is_some() {
+            self.file_tree = self
+                .config
+                .ui
+                .file_tree_enabled
+                .then(|| self.make_file_tree());
+        }
+        if self.config.save(&self.config_path).is_err() {
+            tracing::warn!(
+                kind = "config",
+                phase = "save",
+                error_code = "config_save_failed",
+                "config save failed"
+            );
+            self.remote_error = Some("설정 저장 실패".to_owned());
+        }
+    }
+
+    /// Settings render가 만든 bounded lifecycle intent와 worker 결과를 non-render 단계에서
+    /// 처리한다. 설정을 열지 않았고 intent/result가 없으면 파일/키링/프로세스 작업은 0이다.
+    fn poll_app_controller(&mut self, ctx: &egui::Context) {
+        if self.pending_settings_config_apply {
+            self.pending_settings_config_apply = false;
+            self.pending_config_save = false;
+            self.apply_settings_config(ctx);
+        } else if self.pending_config_save {
+            self.pending_config_save = false;
+            if self.config.save(&self.config_path).is_err() {
+                tracing::warn!(
+                    kind = "config",
+                    phase = "save",
+                    error_code = "config_save_failed",
+                    "config save failed"
+                );
+            }
+        }
+
+        if let Some(action) = self.pending_app_controller_action.take() {
+            match action {
+                AppControllerAction::OpenFileAccessSettings => {
+                    platform::open_file_access_settings();
+                }
+                AppControllerAction::DetectEnvSessionBanner { cwd } => {
+                    self.env_session_banner = self.detect_session_cwd_banner(&cwd);
+                }
+                AppControllerAction::CreateWorktree { workspace_id, cwd } => {
+                    if self.worktree_rx.is_none() {
+                        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+                        self.worktree_rx = Some((workspace_id, result_rx));
+                        let wake = ctx.clone();
+                        let spawned = std::thread::Builder::new()
+                            .name("worktree-create".to_owned())
+                            .spawn(move || {
+                                let result = crate::worktree::create_worktree(Path::new(&cwd));
+                                let _ = result_tx.send(result);
+                                wake.request_repaint();
+                            });
+                        if spawned.is_err() {
+                            self.worktree_rx = None;
+                            tracing::warn!(
+                                kind = "worktree",
+                                phase = "create",
+                                error_code = "worker_spawn_failed",
+                                "worktree worker spawn failed"
+                            );
+                        }
+                    }
+                }
+                AppControllerAction::RemoveWorktree { workspace_id, cwd } => {
+                    if self.worktree_remove_rx.is_none() {
+                        const SESSION_PID_MAX: usize = 256;
+                        let session_pids = std::iter::once(&self.active)
+                            .chain(self.warm.values())
+                            .flat_map(|runtime| {
+                                runtime.session_resource_usage.iter().filter_map(|usage| {
+                                    usage
+                                        .pid
+                                        .map(|pid| (runtime.id.clone(), usage.session, pid))
+                                })
+                            })
+                            .take(SESSION_PID_MAX + 1)
+                            .collect::<Vec<_>>();
+                        if session_pids.len() > SESSION_PID_MAX {
+                            tracing::warn!(
+                                kind = "worktree",
+                                phase = "remove",
+                                error_code = "session_limit",
+                                "worktree session limit exceeded"
+                            );
+                            return;
+                        }
+                        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+                        self.worktree_remove_rx = Some((workspace_id, result_rx));
+                        let wake = ctx.clone();
+                        let spawned = std::thread::Builder::new()
+                            .name("worktree-remove".to_owned())
+                            .spawn(move || {
+                                let result = crate::worktree::remove_worktree(Path::new(&cwd)).map(
+                                    |(root, branch)| {
+                                        let hits = session_pids
+                                            .into_iter()
+                                            .filter(|(_, _, pid)| {
+                                                platform::process_cwd(*pid)
+                                                    .is_some_and(|path| path.starts_with(&root))
+                                            })
+                                            .map(|(workspace, session, _)| (workspace, session))
+                                            .collect();
+                                        (root, branch, hits)
+                                    },
+                                );
+                                let _ = result_tx.send(result);
+                                wake.request_repaint();
+                            });
+                        if spawned.is_err() {
+                            self.worktree_remove_rx = None;
+                            tracing::warn!(
+                                kind = "worktree",
+                                phase = "remove",
+                                error_code = "worker_spawn_failed",
+                                "worktree worker spawn failed"
+                            );
+                        }
+                    }
+                }
+                AppControllerAction::RemoteStart => self.remote_enable(),
+                AppControllerAction::RemoteStop => self.remote_disable(),
+                AppControllerAction::ForgetKnownHost(host) => {
+                    let path = self.known_hosts_path();
+                    if runtime::known_hosts::KnownHosts::load(&path)
+                        .and_then(|mut known_hosts| known_hosts.forget(&host))
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            kind = "known_hosts",
+                            phase = "forget",
+                            error_code = "known_hosts_update_failed",
+                            "known_hosts update failed"
+                        );
+                    }
+                    self.known_hosts_cache = Some(self.load_known_hosts());
+                }
+                AppControllerAction::WebStart => self.web_enable(),
+                AppControllerAction::WebStop => self.web_disable(),
+                AppControllerAction::RotateWebToken => self.web_rotate_token(),
+                AppControllerAction::DetectHostname => {
+                    if self.ts_detect_rx.is_none() {
+                        self.ts_detect_overwrite = true;
+                        self.ts_detect_rx = Some(crate::tailscale::spawn_detect(ctx.clone()));
+                    }
+                }
+                AppControllerAction::CheckServe => {
+                    if self.serve_rx.is_none()
+                        && let Some(port) =
+                            self.web.as_ref().map(|web| web.server.local_addr().port())
+                    {
+                        self.serve_rx =
+                            Some(crate::tailscale::spawn_serve_check(ctx.clone(), port));
+                    }
+                }
+                AppControllerAction::ConfigureServe => {
+                    if self.serve_rx.is_none()
+                        && let Some(port) =
+                            self.web.as_ref().map(|web| web.server.local_addr().port())
+                    {
+                        self.serve_rx =
+                            Some(crate::tailscale::spawn_serve_configure(ctx.clone(), port));
+                    }
+                }
+            }
+        }
+
+        if self.settings_open && self.known_hosts_cache.is_none() {
+            self.known_hosts_cache = Some(self.load_known_hosts());
+        }
+        if let Some(rx) = &self.ts_detect_rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    if let crate::tailscale::Detected::Hostname(host) = &result
+                        && (self.ts_detect_overwrite
+                            || self.config.web.ts_hostname.trim().is_empty())
+                        && self.config.web.ts_hostname.trim() != host
+                    {
+                        self.config.web.ts_hostname = host.clone();
+                        self.pending_config_save = true;
+                    }
+                    self.ts_detected = Some(result);
+                    self.ts_detect_rx = None;
+                    self.ts_detect_overwrite = false;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.ts_detected = Some(crate::tailscale::Detected::CliNotFound);
+                    self.ts_detect_rx = None;
+                    self.ts_detect_overwrite = false;
+                }
+            }
+        } else if self.settings_open
+            && self.settings_category == ui::settings::Category::MobileWeb
+            && self.config.web.ts_hostname.trim().is_empty()
+            && self.ts_detected.is_none()
+        {
+            self.ts_detect_rx = Some(crate::tailscale::spawn_detect(ctx.clone()));
+        }
+        if let Some(rx) = &self.serve_rx {
+            match rx.try_recv() {
+                Ok(state) => {
+                    self.serve_state = Some(state);
+                    self.serve_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.serve_state = Some(crate::tailscale::ServeState::Unknown);
+                    self.serve_rx = None;
+                }
+            }
+        } else if self.settings_open
+            && self.settings_category == ui::settings::Category::MobileWeb
+            && self.serve_state.is_none()
+            && let Some(port) = self.web.as_ref().map(|web| web.server.local_addr().port())
+        {
+            self.serve_rx = Some(crate::tailscale::spawn_serve_check(ctx.clone(), port));
+        }
+        if !self.settings_open {
+            self.known_hosts_cache = None;
+        }
+    }
+
+    fn poll_worktree_jobs(&mut self) {
+        let text = self.i18n.clone();
+        if let Some((requested_workspace, receiver)) = &self.worktree_rx {
+            let same_workspace = *requested_workspace == self.active.id;
+            let spawn_busy = self.active.workspace_ui.pending_spawns() > 0;
+            match crate::worktree::spawn_decision(same_workspace, spawn_busy) {
+                crate::worktree::SpawnDecision::Defer => {}
+                decision => match receiver.try_recv() {
+                    Ok(Ok(path)) => {
+                        self.worktree_rx = None;
+                        if decision == crate::worktree::SpawnDecision::Spawn {
+                            self.reveal_active_workspace_for_new_session();
+                            self.active.workspace_ui.spawn_shell_at(
+                                &self.active.runtime,
+                                self.config.terminal.scrollback_lines as usize,
+                                Some(path.to_string_lossy().into_owned()),
+                            );
+                        } else {
+                            platform::notify(&text.t("worktree.created_elsewhere", &[]), "");
+                        }
+                    }
+                    Ok(Err(_)) => {
+                        self.worktree_rx = None;
+                        tracing::warn!(
+                            kind = "worktree",
+                            phase = "create",
+                            error_code = "create_failed",
+                            "worktree create failed"
+                        );
+                        platform::notify(&text.t("worktree.create_failed", &[]), "");
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.worktree_rx = None;
+                        tracing::warn!(
+                            kind = "worktree",
+                            phase = "create",
+                            error_code = "worker_disconnected",
+                            "worktree worker disconnected"
+                        );
+                    }
+                },
+            }
+        }
+
+        if let Some((requested_workspace, receiver)) = &self.worktree_remove_rx {
+            match receiver.try_recv() {
+                Ok(Ok((root, branch, hits))) => {
+                    let mut targets: Vec<(String, runtime::MuxPaneId)> = Vec::new();
+                    for (workspace_id, session) in &hits {
+                        let workspace_ui = if *workspace_id == self.active.id {
+                            Some(&self.active.workspace_ui)
+                        } else {
+                            self.warm
+                                .get(workspace_id)
+                                .map(|runtime| &runtime.workspace_ui)
+                        };
+                        let Some(pane) =
+                            workspace_ui.and_then(|workspace| workspace.pane_for_session(*session))
+                        else {
+                            continue;
+                        };
+                        if !targets
+                            .iter()
+                            .any(|(workspace, target)| workspace == workspace_id && *target == pane)
+                        {
+                            targets.push((workspace_id.clone(), pane));
+                        }
+                    }
+                    for (session, cwd) in &self.session_cwds {
+                        if !Path::new(cwd).starts_with(&root) {
+                            continue;
+                        }
+                        let Some(pane) = self.active.workspace_ui.pane_for_session(*session) else {
+                            continue;
+                        };
+                        if !targets.iter().any(|(workspace, target)| {
+                            *workspace == self.active.id && *target == pane
+                        }) {
+                            targets.push((self.active.id.clone(), pane));
+                        }
+                    }
+                    for (workspace_id, pane) in targets {
+                        if workspace_id == self.active.id {
+                            self.active
+                                .workspace_ui
+                                .close_pane_now(&self.active.runtime, pane);
+                        } else if let Some(runtime) = self.warm.get_mut(&workspace_id) {
+                            runtime.workspace_ui.close_pane_now(&runtime.runtime, pane);
+                        }
+                    }
+                    let branch_note = (branch == crate::worktree::BranchCleanup::PreservedUnmerged)
+                        .then(|| text.t("worktree.branch_preserved", &[]));
+                    if *requested_workspace == self.active.id {
+                        platform::notify(
+                            &text.t("worktree.removed", &[]),
+                            branch_note.as_deref().unwrap_or(""),
+                        );
+                    } else {
+                        platform::notify(
+                            &text.t("worktree.removed_elsewhere", &[]),
+                            branch_note.as_deref().unwrap_or(""),
+                        );
+                    }
+                    self.worktree_remove_rx = None;
+                }
+                Ok(Err(_)) => {
+                    self.worktree_remove_rx = None;
+                    tracing::warn!(
+                        kind = "worktree",
+                        phase = "remove",
+                        error_code = "remove_failed",
+                        "worktree remove failed"
+                    );
+                    platform::notify(&text.t("worktree.remove_failed", &[]), "");
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.worktree_remove_rx = None;
+                    tracing::warn!(
+                        kind = "worktree",
+                        phase = "remove",
+                        error_code = "worker_disconnected",
+                        "worktree worker disconnected"
+                    );
+                }
             }
         }
     }
@@ -8292,8 +10109,8 @@ impl App {
     /// T1: pane 우클릭 → 환경설정 진입 시점에 focused 세션 cwd를 감지해 배너 상태를
     /// 만든다. cwd가 없거나 폴더가 아니면 None. 비교는 canonicalize 기준
     /// (macOS `/var`↔`/private/var`, 심링크 등)으로 하되 실패 시 원경로로 폴백.
-    fn detect_session_cwd_banner(&self) -> Option<EnvSessionCwdBanner> {
-        let cwd = std::path::PathBuf::from(self.focused_session_cwd()?);
+    fn detect_session_cwd_banner(&self, cwd: &str) -> Option<EnvSessionCwdBanner> {
+        let cwd = PathBuf::from(cwd);
         if !cwd.is_dir() {
             return None;
         }
@@ -8410,6 +10227,7 @@ impl App {
     }
 
     fn invalidate_env_profile_ui(&mut self) {
+        self.pending_settings_job = None;
         self.env_profiles_ui.invalidate_cache();
         self.agents_ui.invalidate_snapshot_selection();
         self.settings_snapshot_generation = self.settings_snapshot_generation.wrapping_add(1);
@@ -8470,6 +10288,9 @@ impl App {
         if self.settings_snapshot_pending {
             return;
         }
+        if self.pending_settings_job.is_some() {
+            return;
+        }
         if self.settings_snapshot_generation == 0 {
             self.settings_snapshot_generation = 1;
         }
@@ -8482,11 +10303,10 @@ impl App {
             action: SettingsJobAction::Load,
         };
         let operation = SettingsOperationKey::for_job(&job);
-        if self.settings_snapshot_worker.try_request(job) {
-            self.settings_snapshot_workspace_id = Some(workspace_id.to_owned());
-            self.settings_snapshot_pending = true;
-            self.settings_pending_operation = Some(operation);
-        }
+        self.pending_settings_job = Some(job);
+        self.settings_snapshot_workspace_id = Some(workspace_id.to_owned());
+        self.settings_snapshot_pending = true;
+        self.settings_pending_operation = Some(operation);
     }
 
     fn queue_settings_action(
@@ -8496,6 +10316,7 @@ impl App {
         action: SettingsJobAction,
     ) -> bool {
         if self.settings_snapshot_pending
+            || self.pending_settings_job.is_some()
             || self.settings_snapshot_workspace_id.as_deref() != Some(workspace_id)
         {
             return false;
@@ -8509,13 +10330,10 @@ impl App {
             action,
         };
         let operation = SettingsOperationKey::for_job(&job);
-        if self.settings_snapshot_worker.try_request(job) {
-            self.settings_snapshot_pending = true;
-            self.settings_pending_operation = Some(operation);
-            true
-        } else {
-            false
-        }
+        self.pending_settings_job = Some(job);
+        self.settings_snapshot_pending = true;
+        self.settings_pending_operation = Some(operation);
+        true
     }
 
     fn queue_global_settings_action(
@@ -8523,7 +10341,7 @@ impl App {
         workspace_id: &str,
         action: SettingsJobAction,
     ) -> bool {
-        if self.settings_snapshot_pending {
+        if self.settings_snapshot_pending || self.pending_settings_job.is_some() {
             return false;
         }
         if self.settings_snapshot_generation == 0 {
@@ -8538,12 +10356,18 @@ impl App {
             action,
         };
         let operation = SettingsOperationKey::for_job(&job);
-        if self.settings_snapshot_worker.try_request(job) {
-            self.settings_snapshot_pending = true;
-            self.settings_pending_operation = Some(operation);
-            true
-        } else {
-            false
+        self.pending_settings_job = Some(job);
+        self.settings_snapshot_pending = true;
+        self.settings_pending_operation = Some(operation);
+        true
+    }
+
+    fn poll_settings_job_admission(&mut self) {
+        let Some(job) = self.pending_settings_job.take() else {
+            return;
+        };
+        if let Err(job) = self.settings_snapshot_worker.try_request_recover(job) {
+            self.pending_settings_job = Some(*job);
         }
     }
 
@@ -9394,7 +11218,20 @@ impl App {
         let mut structured_threads = Vec::new();
         for workspace in &self.workspaces {
             match self.db.list_structured_threads(&workspace.id, false) {
-                Ok(mut rows) => structured_threads.append(&mut rows),
+                Ok(rows) => structured_threads.extend(rows.into_iter().map(|row| {
+                    ui::agent_sessions::AgentSessionPersistedRow {
+                        local_session_id: row.local_session_id,
+                        workspace_id: row.workspace_id,
+                        thread_id: row.thread_id,
+                        title: row.title,
+                        cwd: row.cwd,
+                        model: row.model,
+                        favorite: row.favorite,
+                        archived: row.archived,
+                        created_at: row.created_at,
+                        updated_at: row.updated_at,
+                    }
+                })),
                 Err(error) => tracing::warn!(
                     workspace_id = %workspace.id,
                     "구조화 Codex thread 목록 복구 실패: {error:#}"
@@ -9536,14 +11373,54 @@ impl App {
         })
         .filter(|key| !translation_cache.contains_key(key))
         .collect();
-        if pending.is_empty() || crate::notice_translate::claude_bin().is_none() {
+        if pending.is_empty() {
             return;
         }
+        let bin = match &self.notice_translate_bin {
+            Some(Some(bin)) => bin.clone(),
+            Some(None) => return,
+            None => {
+                let resolved = crate::notice_translate::claude_bin();
+                self.notice_translate_bin = Some(resolved.clone());
+                let Some(bin) = resolved else {
+                    return;
+                };
+                bin
+            }
+        };
         self.notice_translate_rx = Some(crate::notice_translate::spawn_translate(
+            bin,
             pending,
             language.to_owned(),
             ctx.clone(),
         ));
+    }
+
+    /// Agents에 넘길 cwd는 active workspace/path가 바뀔 때만 파일시스템에서 검증한다.
+    /// render는 이 immutable projection만 읽는다.
+    fn refresh_agent_workspace_cwd(&mut self) {
+        let candidate = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == self.active.id)
+            .filter(|workspace| !workspace.path.trim().is_empty());
+        let unchanged = match (&self.agent_workspace_cwd_key, candidate) {
+            (Some((workspace_id, path)), Some(workspace)) => {
+                workspace_id == &workspace.id && path == &workspace.path
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if unchanged {
+            return;
+        }
+        self.agent_workspace_cwd = candidate.and_then(|workspace| {
+            std::path::Path::new(&workspace.path)
+                .is_dir()
+                .then(|| workspace.path.clone())
+        });
+        self.agent_workspace_cwd_key =
+            candidate.map(|workspace| (workspace.id.clone(), workspace.path.clone()));
     }
 
     /// ollama 모델 감지 펌프 (PR-L3) — Agents 창이 열려 있고 OSS 프로바이더가 선택된
@@ -9874,23 +11751,32 @@ impl App {
         // SQLite/MCP inventory reads are completed by the listener worker. The frame path only
         // swaps this bounded, sanitized snapshot and derives notifications from it.
         for row in &snapshot.rows {
-            if !self.approval_notified.contains(&row.id)
+            if !self.approval_notified.contains(row.id())
                 && let Some((workspace_id, session)) = row
-                    .pane_id
-                    .as_deref()
+                    .session_key()
                     .and_then(ui::inbox_waiting::parse_session_key)
             {
                 self.notifications_ui.on_mcp_approval(
                     &workspace_id,
                     session,
-                    &row.tool_name,
+                    row.tool_name(),
                     &self.i18n,
                 );
             }
         }
-        self.approval_notified = snapshot.rows.iter().map(|row| row.id.clone()).collect();
-        self.approvals_ui
-            .set_pending(snapshot.rows, snapshot.remote_urls);
+        self.approval_notified = snapshot
+            .rows
+            .iter()
+            .map(|row| row.id().to_owned())
+            .collect();
+        if self.approvals_ui.set_pending(snapshot.rows).is_err() {
+            tracing::warn!(
+                kind = "approval",
+                phase = "snapshot_apply",
+                error_code = "invalid_projection",
+                "approval snapshot rejected"
+            );
+        }
     }
 
     /// 벨 팝오버(대기 인박스 + 최근 알림)의 고정 Id — 단축키(⌘⇧U) 토글이 같은 팝오버를
@@ -9962,12 +11848,13 @@ impl App {
             .workspace_ui
             .mux()
             .and_then(|mux| ui::inbox_waiting::find_persistent_session_id(mux, session));
-        // rt(= self.active/self.warm 대여)는 여기서 끝난다 — 아래 미리보기 조회가
-        // self.inbox_waiting_ui를 가변 대여하므로 순서를 나눴다.
-        let preview = uuid.and_then(|uuid| {
+        let preview_source = uuid.and_then(|uuid| {
             let logs_root = self.logs_base.join(ws_id);
-            self.inbox_waiting_ui
-                .preview(&self.egui_ctx, &logs_root, &uuid)
+            ::storage::SessionLogWriter::session_dir_key(&logs_root, &uuid)
+                .ok()
+                .map(|directory| directory.join("redacted.plain.txt"))
+                .and_then(|path| ui::inbox_waiting::LogPreviewSource::try_new(path).ok())
+                .map(Arc::new)
         });
         Some(ui::inbox_waiting::WaitingCard {
             workspace_id: ws_id.to_owned(),
@@ -9975,7 +11862,7 @@ impl App {
             workspace_name,
             session_title,
             headline,
-            preview,
+            preview_source,
         })
     }
 
@@ -10031,12 +11918,7 @@ impl App {
         let composer_session = self.active.workspace_ui.focused_session();
         let composer_agent = composer_session
             .and_then(|session| self.active.workspace_ui.agent_provider_for(session));
-        let composer_root = self
-            .workspaces
-            .iter()
-            .find(|w| w.id == self.active.id)
-            .map(|w| std::path::PathBuf::from(&w.path))
-            .filter(|path| path.is_dir());
+        let composer_root = self.agent_workspace_cwd.as_deref().map(PathBuf::from);
         let composer_workspace_id = self.active.id.clone();
         let composer_action = {
             // 도크 배경은 패널색(테마 파생) — 카드가 살짝 떠 보이도록 여백을 준다.
@@ -10458,6 +12340,52 @@ impl App {
         }
     }
 
+    /// Applies visual configuration outside the render pass. Font installation can read font
+    /// files, so keeping the change detector in `logic` is part of the leaf render-I/O boundary.
+    fn apply_pending_visual_settings(&mut self, ctx: &egui::Context) {
+        let theme_dark = ctx.global_style().visuals.dark_mode;
+        if theme_dark != self.last_theme_dark {
+            self.last_theme_dark = theme_dark;
+            self.active.workspace_ui.clear_render_caches();
+            for runtime in self.warm.values_mut() {
+                runtime.workspace_ui.clear_render_caches();
+            }
+            ctx.request_repaint();
+        }
+
+        if font_settings_changed(
+            &self.config,
+            &self.last_ui_font,
+            &self.last_mono_font,
+            &self.last_mono_weight,
+        ) {
+            self.last_ui_font = self.config.ui.ui_font.clone();
+            self.last_mono_font = self.config.terminal.mono_font.clone();
+            self.last_mono_weight = self.config.terminal.mono_weight.clone();
+            crate::fonts::install_cjk_fallback(
+                ctx,
+                self.config.ui.ui_font.as_deref(),
+                &self.config.terminal.mono_font,
+                &self.config.terminal.mono_weight,
+            );
+            self.active.workspace_ui.clear_render_caches();
+            for runtime in self.warm.values_mut() {
+                runtime.workspace_ui.clear_render_caches();
+            }
+            ctx.request_repaint();
+        }
+
+        if (self.config.ui.ui_scale - self.last_ui_scale).abs() > f32::EPSILON {
+            self.last_ui_scale = self.config.ui.ui_scale;
+            ctx.set_zoom_factor(self.config.ui.ui_scale);
+            self.active.workspace_ui.clear_render_caches();
+            for runtime in self.warm.values_mut() {
+                runtime.workspace_ui.clear_render_caches();
+            }
+            ctx.request_repaint();
+        }
+    }
+
     /// eframe renderer feature와 무관한 공통 종료 경로. `App::on_exit` 시그니처만
     /// `glow` feature에 따라 달라지므로 실제 정리는 여기 한 번만 유지한다.
     fn shutdown_on_exit(&mut self) {
@@ -10536,11 +12464,39 @@ impl eframe::App for App {
     // 스킵 판단에 쓰는 바로 그 신호(minimized OR occluded — macOS는 occluded로 갱신되어
     // minimized 미갱신 문제를 피한다). None(미보고)이면 안전하게 Active 유지.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Shortcut handling may persist config, switch runtimes, or start protocol/process work.
+        // Consume egui input here so none of those effects are reachable from the render pass.
+        self.handle_configured_shortcut(ctx);
         // 파일/SQLite/keyring은 worker에서 끝났고, 여기서는 최신 epoch 결과만 짧게 적용한다.
         self.poll_dotenv_sync();
         // Legacy 2s fallback is kept out of ui(): it may inspect the workspace anchor and only
         // schedules the bounded dotenv worker when the deadline is reached.
         self.poll_dotenv_change();
+        if let Some((intent, subject)) = self.pending_connector_dispatch.take() {
+            let result = match subject {
+                Some(subject) => self
+                    .connector_coordinator
+                    .dispatch_for_subject(intent, subject),
+                None => self.connector_coordinator.dispatch(intent),
+            };
+            if result.is_err() {
+                tracing::warn!(
+                    kind = "connector",
+                    phase = "dispatch",
+                    error_code = "worker_unavailable",
+                    "Connector intent dispatch failed"
+                );
+            }
+        }
+        // Render가 만든 controller action은 다음 logic tick에서 한 건만 실행한다. Client
+        // process 생성과 JSON-RPC 요청은 이 경계 안에서만 시작된다.
+        if let Some(action) = self.pending_agent_sessions_action.take() {
+            self.agent_sessions_ui
+                .sync_controller_config(&self.config.agents);
+            if let Some(request) = self.agent_sessions_ui.execute_deferred(action, ctx) {
+                self.handle_agent_sessions_request(request);
+            }
+        }
         // 창이 숨겨져도 App Server JSON-RPC 이벤트를 드레인해 structured session 상태를 최신화한다.
         self.agent_sessions_ui.poll();
         self.persist_agent_session_mutations();
@@ -10562,9 +12518,43 @@ impl eframe::App for App {
         self.poll_env_secret_reveals();
         // 설정 창이 닫혀도 bounded result sender를 막지 않게 최신 settings 결과를 drain한다.
         self.poll_settings_outcomes();
+        self.poll_settings_job_admission();
+        self.poll_file_tree_maintenance(ctx);
         // Settings completion을 먼저 drain해야 folder-result backpressure가 같은 wake에서
         // 해제된다. Host task는 그 뒤 한 건만 적용/시작한다.
         self.poll_app_host_io(ctx);
+        self.poll_app_controller(ctx);
+        self.apply_pending_visual_settings(ctx);
+        self.poll_worktree_jobs();
+        self.refresh_agent_workspace_cwd();
+        // 외부 feed/번역/로컬 모델 worker 채널과 그에 따른 캐시 파일/CLI 작업은 render
+        // 밖에서만 처리한다. 데이터가 없으면 try_recv와 조건 확인 외 추가 자원은 없다.
+        let mut status_feed_received = false;
+        while let Ok(snapshot) = self.status_feed_rx.try_recv() {
+            status_feed_received = true;
+            if snapshot.claude.is_some() {
+                self.status_feed.claude = snapshot.claude;
+            }
+            if snapshot.openai.is_some() {
+                self.status_feed.openai = snapshot.openai;
+            }
+            if snapshot.github.is_some() {
+                self.status_feed.github = snapshot.github;
+            }
+            if snapshot.hugging_face.is_some() {
+                self.status_feed.hugging_face = snapshot.hugging_face;
+            }
+            if snapshot.grok.is_some() {
+                self.status_feed.grok = snapshot.grok;
+            }
+        }
+        if status_feed_received {
+            let home_visible =
+                self.agent_terminal_ui.view() == ui::agent_terminal::AgentTerminalView::Home;
+            self.sync_home_notice_badge(home_visible, ctx);
+        }
+        self.pump_notice_translations(ctx);
+        self.pump_ollama_detect(ctx);
         // Listener readiness, latest-only snapshots, launch correlation, and session-scoped
         // cleanup are all event-driven. No timer/repaint is scheduled while the hub is absent.
         self.poll_approval_wake();
@@ -10806,56 +12796,10 @@ impl eframe::App for App {
             bench.frame_begin(ui.ctx());
         }
         let text = self.i18n.clone();
-        self.handle_configured_shortcut(ui.ctx());
         let mut unread_before = 0;
         // 벨 팝오버의 최근 알림 클릭 — 설정→알림(notif_click)과 같은 네비게이션 경로로
         // 아래에서 함께 처리한다.
         let mut inbox_click = None;
-        // 실효 테마(다크 여부)가 바뀌면 터미널 렌더 캐시를 비운다 — stale galley로 글자가
-        // 깨진 채 남던 문제(#7). 설정에서의 명시 변경과 System 테마의 OS 레벨 전환(raw
-        // input system_theme, config_changed 안 거침, codex 지적)을 모두 여기서 커버한다.
-        let theme_dark = ui.ctx().global_style().visuals.dark_mode;
-        if theme_dark != self.last_theme_dark {
-            self.last_theme_dark = theme_dark;
-            self.active.workspace_ui.clear_render_caches();
-            for rt in self.warm.values_mut() {
-                rt.workspace_ui.clear_render_caches();
-            }
-            ui.ctx().request_repaint();
-        }
-        // UI 폰트/터미널 모노(가족·굵기) 설정 변경 hot reload — 폰트 재등록 + 렌더 캐시 무효화.
-        if font_settings_changed(
-            &self.config,
-            &self.last_ui_font,
-            &self.last_mono_font,
-            &self.last_mono_weight,
-        ) {
-            self.last_ui_font = self.config.ui.ui_font.clone();
-            self.last_mono_font = self.config.terminal.mono_font.clone();
-            self.last_mono_weight = self.config.terminal.mono_weight.clone();
-            crate::fonts::install_cjk_fallback(
-                ui.ctx(),
-                self.config.ui.ui_font.as_deref(),
-                &self.config.terminal.mono_font,
-                &self.config.terminal.mono_weight,
-            );
-            self.active.workspace_ui.clear_render_caches();
-            for rt in self.warm.values_mut() {
-                rt.workspace_ui.clear_render_caches();
-            }
-            ui.ctx().request_repaint();
-        }
-        // UI 배율 변경 hot reload — egui zoom_factor로 UI 전체 확대/축소(터미널은 아래
-        // set_ui_scale 역보정으로 크기 유지). 셀 크기가 변하니 렌더 캐시도 무효화.
-        if (self.config.ui.ui_scale - self.last_ui_scale).abs() > f32::EPSILON {
-            self.last_ui_scale = self.config.ui.ui_scale;
-            ui.ctx().set_zoom_factor(self.config.ui.ui_scale);
-            self.active.workspace_ui.clear_render_caches();
-            for rt in self.warm.values_mut() {
-                rt.workspace_ui.clear_render_caches();
-            }
-            ui.ctx().request_repaint();
-        }
         // 타이틀바 통합 바: 패널 기본 inner_margin(8)을 없애 상단 경계에 붙이고 좌측
         // 여백을 제거한다(#67 사용자). 항목은 신호등과 38pt 브랜드 바 안에서
         // 맞춰 세로 중앙 정렬.
@@ -11128,34 +13072,6 @@ impl eframe::App for App {
             .iter()
             .filter(|server| server.enabled)
             .count();
-        // AI 서비스 상태 스냅샷 수신 — provider별 실패(None)는 마지막 성공값 유지
-        // (일시적 네트워크 오류로 점등이 회색으로 깜빡이지 않게).
-        let mut status_feed_received = false;
-        while let Ok(snapshot) = self.status_feed_rx.try_recv() {
-            status_feed_received = true;
-            if snapshot.claude.is_some() {
-                self.status_feed.claude = snapshot.claude;
-            }
-            if snapshot.openai.is_some() {
-                self.status_feed.openai = snapshot.openai;
-            }
-            if snapshot.github.is_some() {
-                self.status_feed.github = snapshot.github;
-            }
-            if snapshot.hugging_face.is_some() {
-                self.status_feed.hugging_face = snapshot.hugging_face;
-            }
-            if snapshot.grok.is_some() {
-                self.status_feed.grok = snapshot.grok;
-            }
-        }
-        if status_feed_received {
-            let home_visible =
-                self.agent_terminal_ui.view() == ui::agent_terminal::AgentTerminalView::Home;
-            self.sync_home_notice_badge(home_visible, ui.ctx());
-        }
-        self.pump_notice_translations(ui.ctx());
-        self.pump_ollama_detect(ui.ctx());
         egui::Panel::bottom("agent_terminal_status_bar")
             .resizable(false)
             .exact_size(26.0)
@@ -11238,7 +13154,11 @@ impl eframe::App for App {
                     self.agent_sessions_ui.open();
                 }
                 Some(ui::file_tree::SidebarAction::OpenMacosFileAccessSettings) => {
-                    platform::open_file_access_settings();
+                    if self.pending_app_controller_action.is_none() {
+                        self.pending_app_controller_action =
+                            Some(AppControllerAction::OpenFileAccessSettings);
+                        ui.ctx().request_repaint();
+                    }
                 }
                 // "터미널에 경로 삽입" (FT-3): 포커스된 pane의 세션에 WriteInput —
                 // 파일 트리의 유일한 runtime 접점 (§6).
@@ -11348,18 +13268,18 @@ impl eframe::App for App {
                 }
                 // 세션 폴더 열기/경로 복사 — cwd는 감지 캐시 우선, 없으면 일회성 lsof.
                 Some(ui::file_tree::SidebarAction::OpenSessionFolder { session }) => {
-                    match self.session_cwd_lookup(session) {
-                        Some(cwd) => platform::open_path(std::path::Path::new(&cwd)),
-                        None => tracing::warn!("세션 cwd 미확인 — Finder 열기 생략"),
+                    if self.pending_app_host_action.is_none()
+                        && let Some(cwd) = self.cached_session_cwd(session)
+                        && cwd.len() <= APP_HOST_PATH_MAX_BYTES
+                        && !cwd.as_bytes().contains(&0)
+                    {
+                        self.pending_app_host_action =
+                            Some(AppHostIoAction::OpenPath(PathBuf::from(cwd)));
+                        ui.ctx().request_repaint();
                     }
                 }
-                // 파일 트리 파일 행 더블클릭 — 연결된 기본 프로그램으로 연다
-                // (안전 판정은 사이드바 쪽 openable_file에서 완료, 2026-07-18).
-                Some(ui::file_tree::SidebarAction::OpenExternal(path)) => {
-                    platform::open_path(&path);
-                }
                 Some(ui::file_tree::SidebarAction::CopySessionPath { session }) => {
-                    match self.session_cwd_lookup(session) {
+                    match self.cached_session_cwd(session) {
                         Some(cwd) => ui.ctx().copy_text(cwd),
                         None => tracing::warn!("세션 cwd 미확인 — 경로 복사 생략"),
                     }
@@ -11369,7 +13289,7 @@ impl eframe::App for App {
                 // 제목은 인박스와 같은 관례로 해석 — "세션 #2"보다 "SKRT · Claude"가
                 // 무엇의 변경분인지 바로 판단된다(2026-07-18 사용자: 가독성 개선 요청).
                 Some(ui::file_tree::SidebarAction::ShowDiff { session }) => {
-                    let cwd = self.session_cwd_lookup(session);
+                    let cwd = self.cached_session_cwd(session);
                     let ws_name = self
                         .workspaces
                         .iter()
@@ -11396,31 +13316,17 @@ impl eframe::App for App {
                     if self.worktree_rx.is_some() {
                         // 동시 생성은 채널이 1개라 받지 않는다 — 완료 후 다시.
                         tracing::info!("워크트리 생성이 이미 진행 중 — 요청 무시");
-                    } else {
-                        match self.session_cwd_lookup(session) {
-                            Some(cwd) => {
-                                let (tx, rx) = std::sync::mpsc::channel();
-                                // 요청 시점 워크스페이스 캡처 — 완료 시 전환 여부 판정용.
-                                self.worktree_rx = Some((self.active.id.clone(), rx));
-                                let ctx = ui.ctx().clone();
-                                std::thread::spawn(move || {
-                                    let result = crate::worktree::create_worktree(
-                                        std::path::Path::new(&cwd),
-                                    );
-                                    let _ = tx.send(result);
-                                    ctx.request_repaint();
-                                });
-                            }
-                            None => {
-                                // 메뉴는 cwd 캐시가 있어야 보이므로 여기는 레이스뿐 —
-                                // 그래도 조용한 실패 금지(사용자가 클릭했다).
-                                tracing::warn!("세션 cwd 미확인 — 워크트리 생성 생략");
-                                platform::notify(
-                                    &text.t("worktree.create_failed", &[]),
-                                    &text.t("worktree.no_cwd", &[]),
-                                );
-                            }
-                        }
+                    } else if self.pending_app_controller_action.is_none()
+                        && let Some(cwd) = self.cached_session_cwd(session)
+                        && cwd.len() <= APP_HOST_PATH_MAX_BYTES
+                        && !cwd.as_bytes().contains(&0)
+                    {
+                        self.pending_app_controller_action =
+                            Some(AppControllerAction::CreateWorktree {
+                                workspace_id: self.active.id.clone(),
+                                cwd,
+                            });
+                        ui.ctx().request_repaint();
                     }
                 }
                 // 워크트리 삭제 — dirty/무시 파일 거부와 서브모듈·브랜치 처리는
@@ -11428,63 +13334,22 @@ impl eframe::App for App {
                 Some(ui::file_tree::SidebarAction::RemoveWorktree { session }) => {
                     if self.worktree_remove_rx.is_some() {
                         tracing::info!("워크트리 삭제가 이미 진행 중 — 요청 무시");
-                    } else {
-                        match self.session_cwd_lookup(session) {
-                            Some(cwd) => {
-                                // 삭제 성공 후 pane 정리용 (workspace id, 세션, 셸 pid)
-                                // 스냅샷 — 활성+warm 전부. warm 세션은 cwd 캐시가 없어
-                                // (감지 워커 입력이 활성 pid뿐 — session_cwds는 활성
-                                // 전용) 백그라운드 스레드가 삭제 성공 후 pid→cwd를
-                                // lsof로 실측한다. session_resource_usage는 warm도
-                                // record_activity_events가 drain마다 갱신해 살아 있다.
-                                let session_pids: Vec<(String, runtime::SessionId, u32)> =
-                                    std::iter::once(&self.active)
-                                        .chain(self.warm.values())
-                                        .flat_map(|rt| {
-                                            rt.session_resource_usage.iter().filter_map(|usage| {
-                                                usage
-                                                    .pid
-                                                    .map(|pid| (rt.id.clone(), usage.session, pid))
-                                            })
-                                        })
-                                        .collect();
-                                let (tx, rx) = std::sync::mpsc::channel();
-                                self.worktree_remove_rx = Some((self.active.id.clone(), rx));
-                                let ctx = ui.ctx().clone();
-                                std::thread::spawn(move || {
-                                    let result = crate::worktree::remove_worktree(
-                                        std::path::Path::new(&cwd),
-                                    )
-                                    .map(|(root, branch)| {
-                                        // 지운 루트 하위 cwd였던 세션 실측 — lsof는
-                                        // 삭제 성공 후에만(실패면 닫을 것도 없다).
-                                        let hits: Vec<(String, runtime::SessionId)> = session_pids
-                                            .into_iter()
-                                            .filter(|(_, _, pid)| {
-                                                platform::process_cwd(*pid)
-                                                    .is_some_and(|p| p.starts_with(&root))
-                                            })
-                                            .map(|(ws, session, _)| (ws, session))
-                                            .collect();
-                                        (root, branch, hits)
-                                    });
-                                    let _ = tx.send(result);
-                                    ctx.request_repaint();
-                                });
-                            }
-                            None => {
-                                tracing::warn!("세션 cwd 미확인 — 워크트리 삭제 생략");
-                                platform::notify(
-                                    &text.t("worktree.remove_failed", &[]),
-                                    &text.t("worktree.no_cwd", &[]),
-                                );
-                            }
-                        }
+                    } else if self.pending_app_controller_action.is_none()
+                        && let Some(cwd) = self.cached_session_cwd(session)
+                        && cwd.len() <= APP_HOST_PATH_MAX_BYTES
+                        && !cwd.as_bytes().contains(&0)
+                    {
+                        self.pending_app_controller_action =
+                            Some(AppControllerAction::RemoveWorktree {
+                                workspace_id: self.active.id.clone(),
+                                cwd,
+                            });
+                        ui.ctx().request_repaint();
                     }
                 }
                 // 같은 폴더에서 새 셸 — cwd 미확인이면 일반 새 셸로 폴백.
                 Some(ui::file_tree::SidebarAction::NewShellSameFolder { session }) => {
-                    let cwd = self.session_cwd_lookup(session);
+                    let cwd = self.cached_session_cwd(session);
                     self.reveal_active_workspace_for_new_session();
                     self.active.workspace_ui.spawn_shell_at(
                         &self.active.runtime,
@@ -11554,159 +13419,7 @@ impl eframe::App for App {
             }
         }
 
-        // 워크트리 생성 완료 수령 (PR-W) — 성공이면 그 폴더에서 새 셸을 연다(cd 주입은
-        // spawn_shell_at → ShellSpawned 경로). 사이드바가 꺼져도 진행돼야 하므로
-        // dispatch 블록 밖에서 폴링한다 (완료 스레드가 repaint를 예약 — ts_detect 관례).
-        if let Some((requested_ws, rx)) = &self.worktree_rx {
-            let same_workspace = *requested_ws == self.active.id;
-            // pending_spawn_cd는 다음 ShellSpawned가 소비한다 — 응답 대기 spawn이 있으면
-            // cd가 그 셸에 붙으므로 보류. 0이면 다음 ShellSpawned는 반드시 우리 spawn이다
-            // (spawn_shell_at이 슬롯을 덮어쓰고, 명령/이벤트는 순서 보존).
-            let spawn_busy = self.active.workspace_ui.pending_spawns() > 0;
-            match crate::worktree::spawn_decision(same_workspace, spawn_busy) {
-                crate::worktree::SpawnDecision::Defer => {
-                    // 결과는 1칸 채널에 남는다. Pending spawn 해소 runtime event가
-                    // repaint를 깨우므로 별도 timer polling은 필요 없다.
-                }
-                decision => match rx.try_recv() {
-                    Ok(Ok(path)) => {
-                        self.worktree_rx = None;
-                        if decision == crate::worktree::SpawnDecision::Spawn {
-                            self.reveal_active_workspace_for_new_session();
-                            self.active.workspace_ui.spawn_shell_at(
-                                &self.active.runtime,
-                                self.config.terminal.scrollback_lines as usize,
-                                Some(path.to_string_lossy().into_owned()),
-                            );
-                        } else {
-                            // 워크스페이스 전환됨(NotifyOnly) — 비활성 워크스페이스로의
-                            // warm 원격 스폰은 이 PR 범위 밖. 스폰 없이 정직하게 알린다.
-                            tracing::info!(
-                                "워크스페이스 전환 — 워크트리만 생성: {}",
-                                path.display()
-                            );
-                            platform::notify(
-                                &text.t("worktree.created_elsewhere", &[]),
-                                &path.display().to_string(),
-                            );
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        // 레포 아님·git 거부·CLT 없음 등 — 조용한 실패 금지, OS 알림 1줄.
-                        self.worktree_rx = None;
-                        tracing::warn!("워크트리 생성 실패: {e:#}");
-                        let detail = format!("{e:#}");
-                        platform::notify(
-                            &text.t("worktree.create_failed", &[]),
-                            detail.lines().next().unwrap_or_default(),
-                        );
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        // 결과 없이 끊김 = 워커 스레드 panic — 로그로 종결.
-                        self.worktree_rx = None;
-                        tracing::warn!("워크트리 생성 스레드가 결과 없이 종료");
-                    }
-                },
-            }
-        }
-
-        // 워크트리 삭제 완료 수령 — 성공하면 그 루트 하위 cwd를 쓰던 세션의 pane을
-        // 전부 확인 없이 닫는다(같은 폴더에서 새 셀로 만든 형제 pane, 하위 폴더로
-        // cd한 pane 포함 — codex P2: 지운 cwd 문자열과 정확히 같은 세션만 닫으면
-        // 하위 폴더에 있던 pane이 죽은 채 남는다). 대상은 두 경로의 합집합:
-        // ① 요청 시점 pid 스냅샷의 lsof 실측(hits) — 활성·warm 모두 커버하고,
-        //    삭제 중 워크스페이스가 전환됐어도 workspace id로 지금 위치(활성/warm)를
-        //    찾아 닫는다(과거 "활성만" 한계 해소, 2026-07-18 후속).
-        // ② 활성 cwd 캐시(session_cwds) — 요청 이후 감지된 활성 세션 보강(기존 경로).
-        // 남는 한계: warm으로 있는 동안 새로 생긴 pane은 mux 스냅샷이 backgrounded
-        // 시점에 얼어 있어 pane_for_session이 못 찾는다 — 재활성 replay 후 죽은
-        // 셸로 드러날 뿐 잘못 닫히지는 않는다(스냅샷 기반이라 안전 실패 쪽).
-        if let Some((requested_ws, rx)) = &self.worktree_remove_rx {
-            match rx.try_recv() {
-                Ok(Ok((root, branch, hits))) => {
-                    // (workspace id, pane)으로 모아 중복 제거 — 같은 세션이 ①·②
-                    // 양쪽에 잡혀도 ClosePane을 두 번 보내지 않는다.
-                    let mut targets: Vec<(String, runtime::MuxPaneId)> = Vec::new();
-                    for (ws_id, session) in &hits {
-                        let workspace_ui = if *ws_id == self.active.id {
-                            Some(&self.active.workspace_ui)
-                        } else {
-                            self.warm.get(ws_id).map(|rt| &rt.workspace_ui)
-                        };
-                        let Some(pane) = workspace_ui.and_then(|w| w.pane_for_session(*session))
-                        else {
-                            continue;
-                        };
-                        if !targets.iter().any(|(w, p)| w == ws_id && *p == pane) {
-                            targets.push((ws_id.clone(), pane));
-                        }
-                    }
-                    for (session, cwd) in &self.session_cwds {
-                        if !std::path::Path::new(cwd).starts_with(&root) {
-                            continue;
-                        }
-                        let Some(pane) = self.active.workspace_ui.pane_for_session(*session) else {
-                            continue;
-                        };
-                        if !targets
-                            .iter()
-                            .any(|(w, p)| *w == self.active.id && *p == pane)
-                        {
-                            targets.push((self.active.id.clone(), pane));
-                        }
-                    }
-                    for (ws_id, pane) in targets {
-                        if ws_id == self.active.id {
-                            self.active
-                                .workspace_ui
-                                .close_pane_now(&self.active.runtime, pane);
-                        } else if let Some(rt) = self.warm.get_mut(&ws_id) {
-                            // warm도 같은 WorkspaceRuntime — 살아 있는 워커 핸들로
-                            // ClosePane을 보내면 결과 이벤트는 pending_events에 쌓여
-                            // 재활성 replay 때 반영된다(렌더만 안 할 뿐 정리는 즉시).
-                            rt.workspace_ui.close_pane_now(&rt.runtime, pane);
-                        }
-                    }
-                    // 브랜치가 보존됐으면(미병합 커밋) 알림 본문에 명시 — 조용히
-                    // 남겨두면 "왜 브랜치가 남았지"가 된다.
-                    let branch_note = (branch == crate::worktree::BranchCleanup::PreservedUnmerged)
-                        .then(|| text.t("worktree.branch_preserved", &[]));
-                    if *requested_ws == self.active.id {
-                        platform::notify(
-                            &text.t("worktree.removed", &[]),
-                            branch_note.as_deref().unwrap_or(""),
-                        );
-                    } else {
-                        let root_display = root.display().to_string();
-                        tracing::info!("다른 워크스페이스의 워크트리 삭제됨: {root_display}");
-                        let body = match &branch_note {
-                            Some(note) => format!("{root_display} — {note}"),
-                            None => root_display,
-                        };
-                        platform::notify(&text.t("worktree.removed_elsewhere", &[]), &body);
-                    }
-                    self.worktree_remove_rx = None;
-                }
-                Ok(Err(e)) => {
-                    // dirty/미병합/무시된 파일 등 git·자체 검사의 거부 사유를 그대로
-                    // 알린다 — 조용한 실패 금지.
-                    tracing::warn!("워크트리 삭제 실패: {e:#}");
-                    let detail = format!("{e:#}");
-                    platform::notify(
-                        &text.t("worktree.remove_failed", &[]),
-                        detail.lines().next().unwrap_or_default(),
-                    );
-                    self.worktree_remove_rx = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    tracing::warn!("워크트리 삭제 스레드가 결과 없이 종료");
-                    self.worktree_remove_rx = None;
-                }
-            }
-        }
-
+        // Worktree job completions are drained by logic(); render only emits bounded actions.
         // ── 관리/모니터 패널 부수효과 (매 프레임 — 통합 설정 창 표시 여부와 무관) ──
         let events = std::mem::take(&mut self.active.pending_events);
         let central_view = self.agent_terminal_ui.view();
@@ -11782,15 +13495,8 @@ impl eframe::App for App {
         if self.active.workspace_ui.take_terminal_focus_claimed() {
             self.agent_sessions_ui.surrender_text_focus(ui.ctx());
         }
-        // 활성 프로젝트 루트를 Codex thread/start / turn/start의 cwd로 넘긴다. 경로가
-        // 비어 있거나 사라졌으면 생략해 App Server의 현재 작업 폴더를 존중한다.
-        let agent_workspace_cwd = self
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.id == self.active.id)
-            .map(|workspace| workspace.path.clone())
-            .filter(|path| !path.trim().is_empty())
-            .filter(|path| std::path::Path::new(path).is_dir());
+        // logic에서 workspace/path 변경 때만 검증한 immutable cwd projection을 넘긴다.
+        let agent_workspace_cwd = self.agent_workspace_cwd.clone();
         let active_workspace_id = self.active.id.clone();
         // Agents 창의 LLM 프로바이더 설정은 config 소유(App) — 창이 바꾸면 저장한다 (PR-L2).
         let agents_config_before = self.config.agents.clone();
@@ -11806,13 +13512,17 @@ impl eframe::App for App {
                 ollama_models: self.ollama_models.as_deref(),
             },
         );
-        if self.config.agents != agents_config_before
-            && let Err(e) = self.config.save(&self.config_path)
-        {
-            tracing::warn!("에이전트 LLM 프로바이더 설정 저장 실패: {e:#}");
+        if self.config.agents != agents_config_before {
+            self.pending_config_save = true;
+            ui.ctx().request_repaint();
         }
         for request in agent_output.requests {
             self.handle_agent_sessions_request(request);
+        }
+        if let Some(action) = agent_output.deferred_action {
+            // logic()이 매 render 전에 기존 slot을 비운다. 예외적으로 남아 있어도 latest-only
+            // 교체해 backlog를 만들지 않는다; generation mismatch가 stale 실행을 막는다.
+            self.pending_agent_sessions_action = Some(action);
         }
         if let Some(intent) = agent_output.secret_intent {
             let current_revision = self.agent_sessions_secrets_snapshot.revision();
@@ -11853,14 +13563,22 @@ impl eframe::App for App {
             // T1: 우클릭 진입 시에만 focused 세션 cwd를 감지 — env 페이지 상단에
             // "새 프로젝트로 등록"/"이 폴더를 프로젝트 폴더로 지정" 배너를 띄운다.
             // App-owned workspace projection과 비교하므로 render-time DB refresh가 없다.
-            self.env_session_banner = self.detect_session_cwd_banner();
+            if self.pending_app_controller_action.is_none()
+                && let Some(cwd) = self.focused_session_cwd()
+                && cwd.len() <= APP_HOST_PATH_MAX_BYTES
+                && !cwd.as_bytes().contains(&0)
+            {
+                self.pending_app_controller_action =
+                    Some(AppControllerAction::DetectEnvSessionBanner { cwd });
+                ui.ctx().request_repaint();
+            }
         }
         // pane 우클릭 → 세션 폴더 동선 (2026-07-18): 파일 트리 이동은 사이드바 트리의
         // set_root(브레드크럼·'..'과 같은 탐색 메커니즘), Finder는 사이드바
         // OpenSessionFolder와 같은 경로. cwd 미확인 시 경고 로그(사이드바 관례).
         match self.active.workspace_ui.take_session_folder_request() {
             Some(ui::workspace::SessionFolderRequest::RevealInTree(session)) => {
-                match self.session_cwd_lookup(session) {
+                match self.cached_session_cwd(session) {
                     Some(cwd) => match self.file_tree.as_mut() {
                         Some(tree) => tree.set_root(Some(std::path::PathBuf::from(cwd))),
                         None => tracing::info!("파일 트리 OFF — 트리 이동 생략"),
@@ -11869,9 +13587,14 @@ impl eframe::App for App {
                 }
             }
             Some(ui::workspace::SessionFolderRequest::OpenInFinder(session)) => {
-                match self.session_cwd_lookup(session) {
-                    Some(cwd) => platform::open_path(std::path::Path::new(&cwd)),
-                    None => tracing::warn!("세션 cwd 미확인 — Finder 열기 생략"),
+                if self.pending_app_host_action.is_none()
+                    && let Some(cwd) = self.cached_session_cwd(session)
+                    && cwd.len() <= APP_HOST_PATH_MAX_BYTES
+                    && !cwd.as_bytes().contains(&0)
+                {
+                    self.pending_app_host_action =
+                        Some(AppHostIoAction::OpenPath(PathBuf::from(cwd)));
+                    ui.ctx().request_repaint();
                 }
             }
             None => {}
@@ -12159,11 +13882,6 @@ impl eframe::App for App {
             }
         }
 
-        // known_hosts는 settings 열 때 lazily 로드한다 (닫으면 아래서 None으로 리셋 → 재로드).
-        if self.settings_open && self.known_hosts_cache.is_none() {
-            let kh = self.load_known_hosts();
-            self.known_hosts_cache = Some(kh);
-        }
         // env/API 프로젝트 행: Environment 카테고리를 보고 있을 때만 (캐시 만료 시) 재계산.
         // 다른 카테고리 프레임에는 마지막 캐시를 그대로 넘긴다 — category가 show() 안에서
         // 갱신되므로(activity_rows 주석 참조) 탭 전환 프레임에 빈 목록이 번쩍이지 않게.
@@ -12239,62 +13957,6 @@ impl eframe::App for App {
                 known_hosts: self.known_hosts_cache.as_deref().unwrap_or(&[]),
             }
         };
-        // ts.net 호스트명 자동 감지: 결과 수령 → 설정 반영. MobileWeb 페이지를 처음 열었고
-        // 호스트명이 비어 있으면 1회 자동 시도한다 (상주 폴링 없음 — 완료 스레드가 repaint).
-        if let Some(rx) = &self.ts_detect_rx {
-            match rx.try_recv() {
-                Ok(result) => {
-                    if let crate::tailscale::Detected::Hostname(host) = &result
-                        && (self.ts_detect_overwrite
-                            || self.config.web.ts_hostname.trim().is_empty())
-                        && self.config.web.ts_hostname.trim() != host
-                    {
-                        self.config.web.ts_hostname = host.clone();
-                        if let Err(e) = self.config.save(&self.config_path) {
-                            tracing::warn!("config 저장 실패: {e:#}");
-                            self.web_error = Some(format!("설정 저장 실패: {e:#}"));
-                        }
-                    }
-                    self.ts_detected = Some(result);
-                    self.ts_detect_rx = None;
-                    self.ts_detect_overwrite = false;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // 스레드 생성 실패 등 — 시도 종료로 처리 (CLI 미발견과 동일 안내).
-                    self.ts_detected = Some(crate::tailscale::Detected::CliNotFound);
-                    self.ts_detect_rx = None;
-                    self.ts_detect_overwrite = false;
-                }
-            }
-        } else if self.settings_open
-            && self.settings_category == ui::settings::Category::MobileWeb
-            && self.config.web.ts_hostname.trim().is_empty()
-            && self.ts_detected.is_none()
-        {
-            self.ts_detect_rx = Some(crate::tailscale::spawn_detect(ui.ctx().clone()));
-        }
-        // serve 온보딩(O1): 결과 수령 → 상태 반영. 모바일 웹 설정 페이지를 열었고 서버가
-        // 켜져 있으면 1회 자동 진단한다(상주 폴링 없음 — 스레드가 완료 시 repaint).
-        if let Some(rx) = &self.serve_rx {
-            match rx.try_recv() {
-                Ok(state) => {
-                    self.serve_state = Some(state);
-                    self.serve_rx = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.serve_state = Some(crate::tailscale::ServeState::Unknown);
-                    self.serve_rx = None;
-                }
-            }
-        } else if self.settings_open
-            && self.settings_category == ui::settings::Category::MobileWeb
-            && self.serve_state.is_none()
-            && let Some(port) = self.web.as_ref().map(|w| w.server.local_addr().port())
-        {
-            self.serve_rx = Some(crate::tailscale::spawn_serve_check(ui.ctx().clone(), port));
-        }
         // 모바일 웹(PWA) 뷰모델 — remote_view와 동일 규칙 (v3.3 P1).
         let web_view = {
             let (running, addr, url) = match &self.web {
@@ -12711,21 +14373,21 @@ impl eframe::App for App {
             },
         );
         if let Some(intent) = connector_intent {
-            let result = if matches!(
+            let subject = if matches!(
                 intent,
                 connector_contract::ConnectorIntent::InvokeTool { .. }
             ) {
                 connector_service::InvocationContext::for_workspace(wsid.clone())
-                    .map_err(|_| connector_service::DispatchError::WorkerUnavailable)
-                    .and_then(|subject| {
-                        self.connector_coordinator
-                            .dispatch_for_subject(intent, subject)
-                    })
+                    .ok()
+                    .map(Some)
             } else {
-                self.connector_coordinator.dispatch(intent)
+                Some(None)
             };
-            if result.is_err() {
-                tracing::warn!("Connector intent dispatch failed");
+            if self.pending_connector_dispatch.is_none()
+                && let Some(subject) = subject
+            {
+                self.pending_connector_dispatch = Some((intent, subject));
+                ui.ctx().request_repaint();
             }
         }
         // T1: 설정 창이 닫히면 세션 폴더 배너를 버린다 — 다음 우클릭 진입에서 재감지.
@@ -12861,9 +14523,8 @@ impl eframe::App for App {
         // 관리/모니터 액션 처리 (클로저 밖 — self 전체 &mut 필요한 것들)
         if env_live_reload_toggle != self.config.ui.env_live_reload {
             self.config.ui.env_live_reload = env_live_reload_toggle;
-            if let Err(e) = self.config.save(&self.config_path) {
-                tracing::warn!("env 라이브 반영 설정 저장 실패: {e:#}");
-            }
+            self.pending_config_save = true;
+            ui.ctx().request_repaint();
             // 다음 동기화가 세션 기본 env(활성 조건)를 갱신한다 — 새 셸부터 적용.
             self.sync_dotenv_env();
         }
@@ -12958,14 +14619,9 @@ impl eframe::App for App {
                         &close_id,
                         self.settings_workspace_id.as_deref(),
                     );
-                    if !was_hidden
-                        && self.config.ui.hidden_env_project_ids.contains(&close_id)
-                        && let Err(error) = self.config.save(&self.config_path)
-                    {
-                        tracing::warn!(
-                            workspace_id = %close_id,
-                            "Environment 프로젝트 닫기 상태 저장 실패: {error:#}"
-                        );
+                    if !was_hidden && self.config.ui.hidden_env_project_ids.contains(&close_id) {
+                        self.pending_config_save = true;
+                        ui.ctx().request_repaint();
                     }
                     self.invalidate_env_profile_ui();
                     self.env_project_close_confirm = None;
@@ -13030,77 +14686,29 @@ impl eframe::App for App {
             }
         }
         if out.config_changed {
-            self.config.i18n.locale = i18n::normalize_locale(&self.config.i18n.locale);
-            if self.i18n.locale() != self.config.i18n.locale {
-                self.i18n = load_catalog(&self.config.i18n.locale);
-                self.agent_sessions_ui.set_catalog(&self.i18n);
-                self.connector_ui.set_catalog(&self.i18n);
-            }
-            // hot reload: 테마는 즉시 적용 (터미널 캐시 clear는 ui() 상단의 실효 테마
-            // 감지가 다음 프레임에 처리 — System 전환까지 한 경로로 커버).
-            ui.ctx().set_theme(self.config.ui.theme.to_egui());
-            // 에이전트 상태 hook 토글(agent_status_hooks) 반영 — 설치/해제.
-            self.sync_agent_hooks();
-            // 터미널 캐시 정책(exited cap/예산) — 활성+warm 워커에 live 반영 (§14.3 확장).
-            self.broadcast_terminal_cache_policy();
-            // 폴더 트리 hot toggle (§6): OFF → 상태 drop(리소스 0), ON → 즉시 생성
-            if self.config.ui.file_tree_enabled != self.file_tree.is_some() {
-                self.file_tree = self
-                    .config
-                    .ui
-                    .file_tree_enabled
-                    .then(|| self.make_file_tree());
-            }
-            if let Err(e) = self.config.save(&self.config_path) {
-                tracing::warn!("config 저장 실패: {e:#}");
-                // remote 포트 등은 접근 표면에 영향 — 저장 실패를 UI에도 남긴다 (codex xhigh Low).
-                self.remote_error = Some(format!("설정 저장 실패: {e:#}"));
-            }
+            self.pending_settings_config_apply = true;
+            ui.ctx().request_repaint();
         }
-        match out.remote_action {
-            ui::settings::RemoteAction::Start => self.remote_enable(),
-            ui::settings::RemoteAction::Stop => self.remote_disable(),
-            ui::settings::RemoteAction::Forget(host) => {
-                let path = self.known_hosts_path();
-                match runtime::known_hosts::KnownHosts::load(&path)
-                    .and_then(|mut kh| kh.forget(&host))
-                {
-                    Ok(()) => {}
-                    Err(e) => tracing::warn!("known_hosts forget 실패: {e:#}"),
-                }
-                self.known_hosts_cache = Some(self.load_known_hosts());
+        let controller_action = match out.remote_action {
+            ui::settings::RemoteAction::Start => Some(AppControllerAction::RemoteStart),
+            ui::settings::RemoteAction::Stop => Some(AppControllerAction::RemoteStop),
+            ui::settings::RemoteAction::Forget(host)
+                if host.len() <= APP_HOST_PATH_MAX_BYTES && !host.contains('\0') =>
+            {
+                Some(AppControllerAction::ForgetKnownHost(host))
             }
-            ui::settings::RemoteAction::None => {}
-        }
-        match out.web_action {
-            ui::settings::WebRemoteAction::Start => self.web_enable(),
-            ui::settings::WebRemoteAction::Stop => self.web_disable(),
-            ui::settings::WebRemoteAction::RotateToken => self.web_rotate_token(),
+            ui::settings::RemoteAction::Forget(_) | ui::settings::RemoteAction::None => None,
+        };
+        let controller_action = controller_action.or_else(|| match out.web_action {
+            ui::settings::WebRemoteAction::Start => Some(AppControllerAction::WebStart),
+            ui::settings::WebRemoteAction::Stop => Some(AppControllerAction::WebStop),
+            ui::settings::WebRemoteAction::RotateToken => Some(AppControllerAction::RotateWebToken),
             ui::settings::WebRemoteAction::DetectHostname => {
-                // 수동 감지 — 기존 값 덮어쓰기 허용. 이미 진행 중이면 무시.
-                if self.ts_detect_rx.is_none() {
-                    self.ts_detect_overwrite = true;
-                    self.ts_detect_rx = Some(crate::tailscale::spawn_detect(ui.ctx().clone()));
-                }
+                Some(AppControllerAction::DetectHostname)
             }
-            // serve 온보딩 (O1) — CLI 실행은 이 버튼 경로에서만(자동 실행 금지).
-            ui::settings::WebRemoteAction::CheckServe => {
-                if self.serve_rx.is_none()
-                    && let Some(port) = self.web.as_ref().map(|w| w.server.local_addr().port())
-                {
-                    self.serve_rx =
-                        Some(crate::tailscale::spawn_serve_check(ui.ctx().clone(), port));
-                }
-            }
+            ui::settings::WebRemoteAction::CheckServe => Some(AppControllerAction::CheckServe),
             ui::settings::WebRemoteAction::ConfigureServe => {
-                if self.serve_rx.is_none()
-                    && let Some(port) = self.web.as_ref().map(|w| w.server.local_addr().port())
-                {
-                    self.serve_rx = Some(crate::tailscale::spawn_serve_configure(
-                        ui.ctx().clone(),
-                        port,
-                    ));
-                }
+                Some(AppControllerAction::ConfigureServe)
             }
             ui::settings::WebRemoteAction::OpenApproveUrl(url) => {
                 // tailnet 관리 콘솔 승인은 app-owned host worker에서만 연다. Render는
@@ -13109,13 +14717,19 @@ impl eframe::App for App {
                     self.pending_app_host_action = Some(AppHostIoAction::ExternalHttpsUrl(url));
                     ui.ctx().request_repaint();
                 }
+                None
             }
-            ui::settings::WebRemoteAction::None => {}
+            ui::settings::WebRemoteAction::None => None,
+        });
+        if self.pending_app_controller_action.is_none()
+            && let Some(action) = controller_action
+        {
+            self.pending_app_controller_action = Some(action);
+            ui.ctx().request_repaint();
         }
         // settings가 닫혔으면 표시 상태를 리셋 — 다음에 열 때 known_hosts를 fresh 로드하고
         // 토큰은 다시 마스킹한다. QR 텍스처도 반환한다(다시 열면 재생성).
         if !self.settings_open {
-            self.known_hosts_cache = None;
             self.remote_reveal_token = false;
             self.web_reveal_url = false;
             self.web_qr = None;
@@ -14175,6 +15789,48 @@ mod tests {
         let _ = std::fs::remove_file(sqlite_sidecar(path, "-shm"));
     }
 
+    #[test]
+    fn initial_workspace_prefers_existing_last_workspace() {
+        let path = temp_db_path("initial-workspace-existing");
+        let db = Db::open(&path).unwrap();
+        let _default = db.ensure_default_workspace().unwrap();
+        let last = db.create_workspace("last").unwrap();
+        assert_eq!(
+            initial_workspace_id(&db, Some(&last), &Default::default()).unwrap(),
+            last
+        );
+        drop(db);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn initial_workspace_falls_back_when_last_workspace_is_missing() {
+        let path = temp_db_path("initial-workspace-missing");
+        let db = Db::open(&path).unwrap();
+        let default = db.ensure_default_workspace().unwrap();
+        assert_eq!(
+            initial_workspace_id(&db, Some("missing"), &Default::default()).unwrap(),
+            default
+        );
+        drop(db);
+        remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn initial_workspace_skips_persisted_closed_workspace() {
+        let path = temp_db_path("initial-workspace-closed");
+        let db = Db::open(&path).unwrap();
+        let closed = db.ensure_default_workspace().unwrap();
+        let visible = db.create_workspace("visible").unwrap();
+        let closed_ids = std::collections::BTreeSet::from([closed.clone()]);
+        assert_eq!(
+            initial_workspace_id(&db, Some(&closed), &closed_ids).unwrap(),
+            visible
+        );
+        drop(db);
+        remove_sqlite_files(&path);
+    }
+
     struct MemSecretStore(Mutex<HashMap<String, String>>);
 
     impl MemSecretStore {
@@ -14478,7 +16134,7 @@ h:1 EE:FF
         };
 
         assert_eq!(snapshot.rows.len(), 1);
-        assert_eq!(snapshot.rows[0].id, "req-1");
+        assert_eq!(snapshot.rows[0].id(), "req-1");
         hub.enqueue(ApprovalWorkerCommand::Resolve {
             id: "req-1".to_owned(),
             allowed: false,

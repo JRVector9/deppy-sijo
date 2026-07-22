@@ -141,3 +141,19 @@ is never retried. Focused tests pass 13/13, app all-target check passes, and str
 with only the expected pre-wiring dead-code lint excluded. Scoped rustfmt, diff, and forbidden-edge
 checks pass. Literal strict Clippy and removal of the legacy direct app path remain atomic cutover
 gates; this foundation is not a production dual-path completion claim.
+
+## Lazy dotenv worker foundation
+
+The app-independent dotenv execution primitive now constructs without a thread, channel, I/O
+resource, timer, or repaint. Its first accepted operation starts one standard worker, opens the
+caller resource only after dequeue, and reuses it until a lifecycle-locked 30-second idle exit.
+Pending state is latest-one; exact continuations are FIFO and capped at eight. Duplicate
+outstanding operation IDs are rejected, channels retain one wake/result, stale generation and
+revision outcomes are explicit, and the completion wake runs only after result publication.
+
+Drop closes and joins the worker; factory, execution, panic, thread-spawn, duplicate, capacity, and
+stale failures are static low-cardinality codes. Focused/full dotenv tests pass 11/11 and 39/39,
+app all-target check passes, and strict Clippy passes with only expected pre-wiring dead code
+excluded. Scoped rustfmt and diff-check pass. The eager app worker, timer fallbacks, and ungated
+launch paths remain the atomic root cutover and literal strict-Clippy gate; no production dual path
+is claimed by this foundation.

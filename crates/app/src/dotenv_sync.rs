@@ -1263,10 +1263,1100 @@ pub fn apply_workspace_dotenv_plan(
     Ok(report)
 }
 
+/// Default inactivity window after which the dotenv worker drops its resources and exits.
+///
+/// The timeout is observed only while the bounded request queues are empty. It is a lifecycle
+/// deadline, not a polling or retry interval.
+pub const DOTENV_WORKER_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Exact protocol continuations retained by one dotenv worker.
+pub const DOTENV_WORKER_CONTINUATION_MAX: usize = 8;
+
+/// Correlates a dotenv operation without retaining workspace, path, or secret-bearing data.
+///
+/// Generation and revision are checked together before an outcome may be applied. Operation IDs
+/// are returned separately for trace correlation. Debug output deliberately hides all three
+/// high-cardinality values.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct DotenvWorkerCorrelation {
+    generation: u64,
+    revision: u64,
+    operation_id: u64,
+}
+
+impl DotenvWorkerCorrelation {
+    pub fn new(generation: u64, revision: u64, operation_id: u64) -> Self {
+        Self {
+            generation,
+            revision,
+            operation_id,
+        }
+    }
+
+    pub fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub fn revision(self) -> u64 {
+        self.revision
+    }
+
+    pub fn operation_id(self) -> u64 {
+        self.operation_id
+    }
+
+    pub fn is_current(self, generation: u64, revision: u64) -> bool {
+        self.generation == generation && self.revision == revision
+    }
+}
+
+impl std::fmt::Debug for DotenvWorkerCorrelation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DotenvWorkerCorrelation")
+            .field("correlation", &"REDACTED")
+            .finish()
+    }
+}
+
+/// Static, low-cardinality failure codes crossing the worker boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DotenvWorkerErrorCode {
+    ResourceOpenFailed,
+    ExecuteFailed,
+    WorkerPanicked,
+    ThreadSpawnFailed,
+    ContinuationLimit,
+    DuplicateOperation,
+    StaleOutcome,
+}
+
+impl std::fmt::Display for DotenvWorkerErrorCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ResourceOpenFailed => "dotenv_worker_resource_open_failed",
+            Self::ExecuteFailed => "dotenv_worker_execute_failed",
+            Self::WorkerPanicked => "dotenv_worker_panicked",
+            Self::ThreadSpawnFailed => "dotenv_worker_thread_spawn_failed",
+            Self::ContinuationLimit => "dotenv_worker_continuation_limit",
+            Self::DuplicateOperation => "dotenv_worker_duplicate_operation",
+            Self::StaleOutcome => "dotenv_worker_stale_outcome",
+        })
+    }
+}
+
+impl std::error::Error for DotenvWorkerErrorCode {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DotenvWorkerRequestKind {
+    State,
+    Continuation,
+}
+
+struct DotenvWorkerEnvelope<J> {
+    sequence: u64,
+    kind: DotenvWorkerRequestKind,
+    correlation: DotenvWorkerCorrelation,
+    payload: J,
+}
+
+/// A state request displaced before execution by a newer state request.
+///
+/// Returning ownership lets callers explicitly discard or reconcile a secret-bearing payload;
+/// Debug never formats that payload or its correlation.
+pub struct ReplacedDotenvState<J> {
+    correlation: DotenvWorkerCorrelation,
+    payload: J,
+}
+
+impl<J> ReplacedDotenvState<J> {
+    pub fn correlation(&self) -> DotenvWorkerCorrelation {
+        self.correlation
+    }
+
+    pub fn into_payload(self) -> J {
+        self.payload
+    }
+}
+
+impl<J> std::fmt::Debug for ReplacedDotenvState<J> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReplacedDotenvState")
+            .field("payload", &"REDACTED")
+            .finish()
+    }
+}
+
+/// Submission failure that returns ownership of the rejected payload.
+pub struct DotenvWorkerSubmitError<J> {
+    code: DotenvWorkerErrorCode,
+    correlation: DotenvWorkerCorrelation,
+    payload: J,
+}
+
+impl<J> DotenvWorkerSubmitError<J> {
+    pub fn code(&self) -> DotenvWorkerErrorCode {
+        self.code
+    }
+
+    pub fn correlation(&self) -> DotenvWorkerCorrelation {
+        self.correlation
+    }
+
+    pub fn into_payload(self) -> J {
+        self.payload
+    }
+}
+
+impl<J> std::fmt::Debug for DotenvWorkerSubmitError<J> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DotenvWorkerSubmitError")
+            .field("code", &self.code)
+            .field("payload", &"REDACTED")
+            .finish()
+    }
+}
+
+/// One bounded worker outcome. Payload Debug and correlation values never cross diagnostics.
+pub struct DotenvWorkerOutcome<O> {
+    kind: DotenvWorkerRequestKind,
+    correlation: DotenvWorkerCorrelation,
+    result: Result<O, DotenvWorkerErrorCode>,
+}
+
+impl<O> DotenvWorkerOutcome<O> {
+    pub fn correlation(&self) -> DotenvWorkerCorrelation {
+        self.correlation
+    }
+
+    pub fn operation_id(&self) -> u64 {
+        self.correlation.operation_id()
+    }
+
+    pub fn is_continuation(&self) -> bool {
+        self.kind == DotenvWorkerRequestKind::Continuation
+    }
+
+    /// Rejects stale generation/revision results before exposing their payload to application
+    /// code. The rejected outcome is dropped in this method.
+    pub fn into_current(
+        self,
+        generation: u64,
+        revision: u64,
+    ) -> Result<Self, DotenvWorkerErrorCode> {
+        if self.correlation.is_current(generation, revision) {
+            Ok(self)
+        } else {
+            Err(DotenvWorkerErrorCode::StaleOutcome)
+        }
+    }
+
+    pub fn into_result(self) -> Result<O, DotenvWorkerErrorCode> {
+        self.result
+    }
+}
+
+impl<O> std::fmt::Debug for DotenvWorkerOutcome<O> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DotenvWorkerOutcome")
+            .field("kind", &self.kind)
+            .field("result", &self.result.as_ref().err())
+            .field("payload", &"REDACTED")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DotenvWorkerLifecycle {
+    Running,
+    Stopping,
+    Exited,
+}
+
+struct DotenvWorkerThreadState<J> {
+    lifecycle: DotenvWorkerLifecycle,
+    state: Option<DotenvWorkerEnvelope<J>>,
+    continuations: std::collections::VecDeque<DotenvWorkerEnvelope<J>>,
+}
+
+impl<J> DotenvWorkerThreadState<J> {
+    fn new() -> Self {
+        Self {
+            lifecycle: DotenvWorkerLifecycle::Running,
+            state: None,
+            continuations: std::collections::VecDeque::with_capacity(
+                DOTENV_WORKER_CONTINUATION_MAX,
+            ),
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        self.state.is_some() || !self.continuations.is_empty()
+    }
+
+    fn take_next(&mut self) -> Option<DotenvWorkerEnvelope<J>> {
+        match (self.state.as_ref(), self.continuations.front()) {
+            (Some(state), Some(continuation)) if state.sequence < continuation.sequence => {
+                self.state.take()
+            }
+            (Some(_), Some(_)) | (None, Some(_)) => self.continuations.pop_front(),
+            (Some(_), None) => self.state.take(),
+            (None, None) => None,
+        }
+    }
+}
+
+struct DotenvWorkerExitGuard<J> {
+    state: std::sync::Arc<std::sync::Mutex<DotenvWorkerThreadState<J>>>,
+}
+
+impl<J> Drop for DotenvWorkerExitGuard<J> {
+    fn drop(&mut self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .lifecycle = DotenvWorkerLifecycle::Exited;
+    }
+}
+
+struct DotenvWorkerSlot<J, O> {
+    wake_tx: Option<std::sync::mpsc::SyncSender<()>>,
+    result_rx: Option<std::sync::mpsc::Receiver<DotenvWorkerOutcome<O>>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    state: std::sync::Arc<std::sync::Mutex<DotenvWorkerThreadState<J>>>,
+}
+
+type DotenvResourceFactory<R> =
+    dyn Fn() -> Result<R, DotenvWorkerErrorCode> + Send + Sync + 'static;
+type DotenvJobExecutor<J, O, R> =
+    dyn Fn(&mut R, J) -> Result<O, DotenvWorkerErrorCode> + Send + Sync + 'static;
+type DotenvCompletionWake = dyn Fn() + Send + Sync + 'static;
+
+/// Lazy, bounded, app-independent execution primitive for dotenv freshness work.
+///
+/// Construction only stores closure ports: it creates no thread, channel, persistence handle,
+/// keyring handle, timer, or repaint. The first accepted request spawns one standard thread. That
+/// thread opens `R` only after taking its first request, reuses it while active, and drops it on a
+/// lifecycle-locked idle exit. There is one latest-only pending state slot, eight exact FIFO
+/// continuations, a one-item wake channel, and a one-item result channel. The caller-provided wake
+/// callback runs once only after an outcome enters the result channel; construction and idle exit
+/// never invoke it.
+pub struct LazyDotenvWorker<J: Send + 'static, O: Send + 'static, R: Send + 'static> {
+    idle_ttl: std::time::Duration,
+    factory: std::sync::Arc<DotenvResourceFactory<R>>,
+    execute: std::sync::Arc<DotenvJobExecutor<J, O, R>>,
+    wake: std::sync::Arc<DotenvCompletionWake>,
+    slot: Option<DotenvWorkerSlot<J, O>>,
+    retired: std::collections::VecDeque<DotenvWorkerOutcome<O>>,
+    next_sequence: u64,
+    continuation_operations: std::collections::HashSet<u64>,
+}
+
+impl<J: Send + 'static, O: Send + 'static, R: Send + 'static> LazyDotenvWorker<J, O, R> {
+    pub fn new(
+        factory: impl Fn() -> Result<R, DotenvWorkerErrorCode> + Send + Sync + 'static,
+        execute: impl Fn(&mut R, J) -> Result<O, DotenvWorkerErrorCode> + Send + Sync + 'static,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_idle_ttl(DOTENV_WORKER_IDLE_TTL, factory, execute, wake)
+    }
+
+    /// Constructor seam for deterministic lifecycle tests. Production callers use [`Self::new`].
+    pub fn with_idle_ttl(
+        idle_ttl: std::time::Duration,
+        factory: impl Fn() -> Result<R, DotenvWorkerErrorCode> + Send + Sync + 'static,
+        execute: impl Fn(&mut R, J) -> Result<O, DotenvWorkerErrorCode> + Send + Sync + 'static,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            idle_ttl,
+            factory: std::sync::Arc::new(factory),
+            execute: std::sync::Arc::new(execute),
+            wake: std::sync::Arc::new(wake),
+            slot: None,
+            retired: std::collections::VecDeque::with_capacity(DOTENV_WORKER_CONTINUATION_MAX + 1),
+            next_sequence: 0,
+            continuation_operations: std::collections::HashSet::with_capacity(
+                DOTENV_WORKER_CONTINUATION_MAX,
+            ),
+        }
+    }
+
+    /// Replaces only a not-yet-started state request. An executing request is never cancelled or
+    /// retried. The displaced payload is returned to the caller.
+    pub fn request_state(
+        &mut self,
+        correlation: DotenvWorkerCorrelation,
+        payload: J,
+    ) -> Result<Option<ReplacedDotenvState<J>>, DotenvWorkerSubmitError<J>> {
+        let envelope = self.envelope(DotenvWorkerRequestKind::State, correlation, payload);
+        self.submit(envelope).map(|replaced| {
+            replaced.map(|replaced| ReplacedDotenvState {
+                correlation: replaced.correlation,
+                payload: replaced.payload,
+            })
+        })
+    }
+
+    /// Enqueues one exact continuation or returns its payload when the eight-operation aggregate
+    /// admission limit is full. Accepted continuations are never replaced by later requests.
+    pub fn request_continuation(
+        &mut self,
+        correlation: DotenvWorkerCorrelation,
+        payload: J,
+    ) -> Result<(), DotenvWorkerSubmitError<J>> {
+        if self
+            .continuation_operations
+            .contains(&correlation.operation_id())
+        {
+            return Err(DotenvWorkerSubmitError {
+                code: DotenvWorkerErrorCode::DuplicateOperation,
+                correlation,
+                payload,
+            });
+        }
+        if self.continuation_operations.len() >= DOTENV_WORKER_CONTINUATION_MAX {
+            return Err(DotenvWorkerSubmitError {
+                code: DotenvWorkerErrorCode::ContinuationLimit,
+                correlation,
+                payload,
+            });
+        }
+        let envelope = self.envelope(DotenvWorkerRequestKind::Continuation, correlation, payload);
+        self.submit(envelope)?;
+        self.continuation_operations
+            .insert(correlation.operation_id());
+        Ok(())
+    }
+
+    /// Returns at most one result and never waits. Retired idle-thread results are drained before
+    /// results from a restarted thread.
+    pub fn try_recv(&mut self) -> Option<DotenvWorkerOutcome<O>> {
+        if let Some(outcome) = self.retired.pop_front() {
+            self.complete_outstanding(&outcome);
+            return Some(outcome);
+        }
+
+        let received = self.slot.as_ref().and_then(|slot| {
+            slot.result_rx
+                .as_ref()
+                .and_then(|results| results.try_recv().ok())
+        });
+        if let Some(outcome) = received {
+            self.complete_outstanding(&outcome);
+            return Some(outcome);
+        }
+
+        if self.slot_exited() {
+            self.retire_exited_slot();
+            if let Some(outcome) = self.retired.pop_front() {
+                self.complete_outstanding(&outcome);
+                return Some(outcome);
+            }
+        }
+        None
+    }
+
+    pub fn is_thread_running(&self) -> bool {
+        self.slot.as_ref().is_some_and(|slot| {
+            slot.state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .lifecycle
+                == DotenvWorkerLifecycle::Running
+        })
+    }
+
+    pub fn continuation_outstanding(&self) -> usize {
+        self.continuation_operations.len()
+    }
+
+    fn envelope(
+        &mut self,
+        kind: DotenvWorkerRequestKind,
+        correlation: DotenvWorkerCorrelation,
+        payload: J,
+    ) -> DotenvWorkerEnvelope<J> {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        DotenvWorkerEnvelope {
+            sequence,
+            kind,
+            correlation,
+            payload,
+        }
+    }
+
+    fn submit(
+        &mut self,
+        mut envelope: DotenvWorkerEnvelope<J>,
+    ) -> Result<Option<DotenvWorkerEnvelope<J>>, DotenvWorkerSubmitError<J>> {
+        loop {
+            if self.slot.is_none()
+                && let Err(code) = self.spawn_slot()
+            {
+                return Err(DotenvWorkerSubmitError {
+                    code,
+                    correlation: envelope.correlation,
+                    payload: envelope.payload,
+                });
+            }
+
+            let Some(slot) = self.slot.as_ref() else {
+                unreachable!("spawn_slot installs a slot on success")
+            };
+            let mut state = slot
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if state.lifecycle != DotenvWorkerLifecycle::Running {
+                drop(state);
+                self.retire_exited_slot();
+                continue;
+            }
+
+            let submitted_kind = envelope.kind;
+            let replaced = match submitted_kind {
+                DotenvWorkerRequestKind::State => state.state.replace(envelope),
+                DotenvWorkerRequestKind::Continuation => {
+                    state.continuations.push_back(envelope);
+                    None
+                }
+            };
+            match slot
+                .wake_tx
+                .as_ref()
+                .expect("running slot wake sender")
+                .try_send(())
+            {
+                Ok(()) | Err(std::sync::mpsc::TrySendError::Full(())) => return Ok(replaced),
+                Err(std::sync::mpsc::TrySendError::Disconnected(())) => {
+                    state.lifecycle = DotenvWorkerLifecycle::Exited;
+                    envelope = match submitted_kind {
+                        DotenvWorkerRequestKind::State => {
+                            let submitted = state.state.take().expect("submitted state");
+                            state.state = replaced;
+                            submitted
+                        }
+                        DotenvWorkerRequestKind::Continuation => state
+                            .continuations
+                            .pop_back()
+                            .expect("submitted continuation"),
+                    };
+                    drop(state);
+                    self.retire_exited_slot();
+                }
+            }
+        }
+    }
+
+    fn spawn_slot(&mut self) -> Result<(), DotenvWorkerErrorCode> {
+        let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<DotenvWorkerOutcome<O>>(1);
+        let state = std::sync::Arc::new(std::sync::Mutex::new(DotenvWorkerThreadState::new()));
+        let thread_state = std::sync::Arc::clone(&state);
+        let factory = std::sync::Arc::clone(&self.factory);
+        let execute = std::sync::Arc::clone(&self.execute);
+        let wake = std::sync::Arc::clone(&self.wake);
+        let idle_ttl = self.idle_ttl;
+        let handle = std::thread::Builder::new()
+            .name("dotenv-sync-lazy".to_owned())
+            .spawn(move || {
+                run_lazy_dotenv_worker(
+                    thread_state,
+                    wake_rx,
+                    result_tx,
+                    idle_ttl,
+                    factory,
+                    execute,
+                    wake,
+                );
+            })
+            .map_err(|_| DotenvWorkerErrorCode::ThreadSpawnFailed)?;
+        self.slot = Some(DotenvWorkerSlot {
+            wake_tx: Some(wake_tx),
+            result_rx: Some(result_rx),
+            handle: Some(handle),
+            state,
+        });
+        Ok(())
+    }
+
+    fn slot_exited(&self) -> bool {
+        self.slot.as_ref().is_some_and(|slot| {
+            slot.state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .lifecycle
+                == DotenvWorkerLifecycle::Exited
+        })
+    }
+
+    fn retire_exited_slot(&mut self) {
+        let Some(mut slot) = self.slot.take() else {
+            return;
+        };
+        let lifecycle = slot
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .lifecycle;
+        if lifecycle == DotenvWorkerLifecycle::Running {
+            self.slot = Some(slot);
+            return;
+        }
+        slot.wake_tx.take();
+        if let Some(handle) = slot.handle.take() {
+            let _ = handle.join();
+        }
+        if let Some(results) = slot.result_rx.take() {
+            while let Ok(outcome) = results.try_recv() {
+                self.retain_retired(outcome);
+            }
+        }
+    }
+
+    fn retain_retired(&mut self, outcome: DotenvWorkerOutcome<O>) {
+        if outcome.kind == DotenvWorkerRequestKind::State
+            && let Some(index) = self
+                .retired
+                .iter()
+                .position(|existing| existing.kind == DotenvWorkerRequestKind::State)
+        {
+            self.retired.remove(index);
+        }
+        self.retired.push_back(outcome);
+    }
+
+    fn complete_outstanding(&mut self, outcome: &DotenvWorkerOutcome<O>) {
+        if outcome.kind == DotenvWorkerRequestKind::Continuation {
+            self.continuation_operations
+                .remove(&outcome.correlation.operation_id());
+        }
+    }
+}
+
+impl<J: Send + 'static, O: Send + 'static, R: Send + 'static> Drop for LazyDotenvWorker<J, O, R> {
+    fn drop(&mut self) {
+        let Some(mut slot) = self.slot.take() else {
+            return;
+        };
+        {
+            let mut state = slot
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            state.lifecycle = DotenvWorkerLifecycle::Stopping;
+            state.state = None;
+            state.continuations.clear();
+        }
+        // Close both sides before joining. In particular, dropping the result receiver releases a
+        // worker blocked on the one-item result bound.
+        slot.wake_tx.take();
+        slot.result_rx.take();
+        if let Some(handle) = slot.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn run_lazy_dotenv_worker<J: Send + 'static, O: Send + 'static, R: Send + 'static>(
+    state: std::sync::Arc<std::sync::Mutex<DotenvWorkerThreadState<J>>>,
+    wake_rx: std::sync::mpsc::Receiver<()>,
+    result_tx: std::sync::mpsc::SyncSender<DotenvWorkerOutcome<O>>,
+    idle_ttl: std::time::Duration,
+    factory: std::sync::Arc<DotenvResourceFactory<R>>,
+    execute: std::sync::Arc<DotenvJobExecutor<J, O, R>>,
+    wake: std::sync::Arc<DotenvCompletionWake>,
+) {
+    let _exit = DotenvWorkerExitGuard {
+        state: std::sync::Arc::clone(&state),
+    };
+    let mut resource = None;
+    loop {
+        let next = {
+            let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+            if state.lifecycle != DotenvWorkerLifecycle::Running {
+                return;
+            }
+            state.take_next()
+        };
+        if let Some(request) = next {
+            let result = if resource.is_none() {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| factory())) {
+                    Ok(Ok(opened)) => {
+                        resource = Some(opened);
+                        None
+                    }
+                    Ok(Err(code)) => Some(Err(code)),
+                    Err(_) => Some(Err(DotenvWorkerErrorCode::WorkerPanicked)),
+                }
+            } else {
+                None
+            };
+            let result = result.unwrap_or_else(|| {
+                let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    execute(
+                        resource.as_mut().expect("resource initialized"),
+                        request.payload,
+                    )
+                }));
+                match execution {
+                    Ok(result) => result,
+                    Err(_) => {
+                        resource.take();
+                        Err(DotenvWorkerErrorCode::WorkerPanicked)
+                    }
+                }
+            });
+            if result_tx
+                .send(DotenvWorkerOutcome {
+                    kind: request.kind,
+                    correlation: request.correlation,
+                    result,
+                })
+                .is_err()
+            {
+                return;
+            }
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wake()));
+            continue;
+        }
+
+        match wake_rx.recv_timeout(idle_ttl) {
+            Ok(()) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // The final non-blocking receive and the lifecycle transition share the exact
+                // mutex used by submission. A sender either queues before this check and is seen,
+                // or observes Exited and restarts a new worker; no accepted request is stranded.
+                let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+                match wake_rx.try_recv() {
+                    Ok(()) => continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                    Err(std::sync::mpsc::TryRecvError::Empty) if state.has_pending() => continue,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        state.lifecycle = DotenvWorkerLifecycle::Exited;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use storage::Db;
+
+    fn recv_worker_outcome<J: Send + 'static, O: Send + 'static, R: Send + 'static>(
+        worker: &mut LazyDotenvWorker<J, O, R>,
+    ) -> DotenvWorkerOutcome<O> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(outcome) = worker.try_recv() {
+                return outcome;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dotenv worker outcome timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !condition() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dotenv worker condition timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn lazy_worker_생성은_thread_factory_execute를_시작하지_않는다() {
+        let factory_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let execute_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wake_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory_counter = std::sync::Arc::clone(&factory_calls);
+        let execute_counter = std::sync::Arc::clone(&execute_calls);
+        let wake_counter = std::sync::Arc::clone(&wake_calls);
+        let worker = LazyDotenvWorker::<u64, u64, ()>::new(
+            move || {
+                factory_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+            move |_: &mut (), value| {
+                execute_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(value)
+            },
+            move || {
+                wake_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        );
+
+        assert!(!worker.is_thread_running());
+        assert_eq!(factory_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(execute_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(wake_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn lazy_worker_첫_request만_thread와_resource를_연다() {
+        let factory_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let execute_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wake_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory_counter = std::sync::Arc::clone(&factory_calls);
+        let execute_counter = std::sync::Arc::clone(&execute_calls);
+        let wake_counter = std::sync::Arc::clone(&wake_calls);
+        let mut worker = LazyDotenvWorker::new(
+            move || {
+                factory_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+            move |_: &mut (), value: u64| {
+                execute_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(value + 1)
+            },
+            move || {
+                wake_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        );
+
+        assert!(
+            worker
+                .request_state(DotenvWorkerCorrelation::new(4, 7, 11), 40)
+                .unwrap()
+                .is_none()
+        );
+        let outcome = recv_worker_outcome(&mut worker).into_current(4, 7).unwrap();
+        assert_eq!(outcome.operation_id(), 11);
+        assert_eq!(outcome.into_result(), Ok(41));
+        assert_eq!(factory_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(execute_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(wake_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn lazy_worker_state_backlog는_최신_한건으로_교체된다() {
+        let gate = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let execute_gate = std::sync::Arc::clone(&gate);
+        let execute_started = std::sync::Arc::clone(&started);
+        let mut worker = LazyDotenvWorker::new(
+            || Ok(()),
+            move |_: &mut (), value: u64| {
+                if value == 1 {
+                    execute_started.store(true, std::sync::atomic::Ordering::Release);
+                    let (lock, ready) = &*execute_gate;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = ready.wait(released).unwrap();
+                    }
+                }
+                Ok(value)
+            },
+            || {},
+        );
+
+        worker
+            .request_state(DotenvWorkerCorrelation::new(1, 1, 1), 1)
+            .unwrap();
+        wait_until(|| started.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            worker
+                .request_state(DotenvWorkerCorrelation::new(1, 2, 2), 2)
+                .unwrap()
+                .is_none()
+        );
+        let replaced = worker
+            .request_state(DotenvWorkerCorrelation::new(1, 3, 3), 3)
+            .unwrap()
+            .expect("second pending state is replaced");
+        assert_eq!(replaced.correlation().operation_id(), 2);
+        assert_eq!(replaced.into_payload(), 2);
+        {
+            let (lock, ready) = &*gate;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+
+        let first = recv_worker_outcome(&mut worker);
+        let latest = recv_worker_outcome(&mut worker);
+        assert_eq!(first.operation_id(), 1);
+        assert_eq!(first.into_result(), Ok(1));
+        assert_eq!(latest.operation_id(), 3);
+        assert_eq!(latest.into_result(), Ok(3));
+        assert!(worker.try_recv().is_none());
+    }
+
+    #[test]
+    fn lazy_worker_continuation은_정확히_여덟건까지만_fifo로_보존한다() {
+        let gate = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let execute_gate = std::sync::Arc::clone(&gate);
+        let execute_started = std::sync::Arc::clone(&started);
+        let mut worker = LazyDotenvWorker::new(
+            || Ok(()),
+            move |_: &mut (), value: u64| {
+                if value == 0 {
+                    execute_started.store(true, std::sync::atomic::Ordering::Release);
+                    let (lock, ready) = &*execute_gate;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = ready.wait(released).unwrap();
+                    }
+                }
+                Ok(value)
+            },
+            || {},
+        );
+
+        worker
+            .request_continuation(DotenvWorkerCorrelation::new(1, 1, 1), 0)
+            .unwrap();
+        wait_until(|| started.load(std::sync::atomic::Ordering::Acquire));
+        let duplicate = worker
+            .request_continuation(DotenvWorkerCorrelation::new(u64::MAX, u64::MAX, 1), 9_999)
+            .unwrap_err();
+        assert_eq!(duplicate.code(), DotenvWorkerErrorCode::DuplicateOperation);
+        assert_eq!(duplicate.into_payload(), 9_999);
+        for value in 1..DOTENV_WORKER_CONTINUATION_MAX as u64 {
+            worker
+                .request_continuation(DotenvWorkerCorrelation::new(1, 1, value + 1), value)
+                .unwrap();
+        }
+        let rejected = worker
+            .request_continuation(DotenvWorkerCorrelation::new(1, 1, 99), 99)
+            .unwrap_err();
+        assert_eq!(rejected.code(), DotenvWorkerErrorCode::ContinuationLimit);
+        assert_eq!(rejected.correlation().operation_id(), 99);
+        assert_eq!(rejected.into_payload(), 99);
+        assert_eq!(
+            worker.continuation_outstanding(),
+            DOTENV_WORKER_CONTINUATION_MAX
+        );
+        {
+            let (lock, ready) = &*gate;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+
+        for value in 0..DOTENV_WORKER_CONTINUATION_MAX as u64 {
+            let outcome = recv_worker_outcome(&mut worker);
+            assert!(outcome.is_continuation());
+            assert_eq!(outcome.operation_id(), value + 1);
+            assert_eq!(outcome.into_result(), Ok(value));
+        }
+        assert_eq!(worker.continuation_outstanding(), 0);
+
+        // The ID reservation is exact to outstanding work, so explicit caller-managed reuse is
+        // admitted only after the previous outcome has been consumed.
+        worker
+            .request_continuation(DotenvWorkerCorrelation::new(2, 2, 1), 42)
+            .unwrap();
+        let reused = recv_worker_outcome(&mut worker);
+        assert_eq!(reused.operation_id(), 1);
+        assert_eq!(reused.into_result(), Ok(42));
+        assert_eq!(worker.continuation_outstanding(), 0);
+    }
+
+    #[test]
+    fn lazy_worker_idle_ttl은_resource를_회수하고_다음_request에서_재시작한다() {
+        let factory_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory_counter = std::sync::Arc::clone(&factory_calls);
+        let mut worker = LazyDotenvWorker::with_idle_ttl(
+            std::time::Duration::from_millis(10),
+            move || {
+                factory_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+            |_: &mut (), value: u64| Ok(value),
+            || {},
+        );
+
+        worker
+            .request_state(DotenvWorkerCorrelation::new(1, 1, 1), 1)
+            .unwrap();
+        assert_eq!(recv_worker_outcome(&mut worker).into_result(), Ok(1));
+        wait_until(|| !worker.is_thread_running());
+        worker
+            .request_state(DotenvWorkerCorrelation::new(1, 2, 2), 2)
+            .unwrap();
+        assert_eq!(recv_worker_outcome(&mut worker).into_result(), Ok(2));
+        assert_eq!(factory_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn lazy_worker_timeout과_request경합에도_accepted_job을_잃지_않는다() {
+        let mut worker = LazyDotenvWorker::with_idle_ttl(
+            std::time::Duration::from_millis(2),
+            || Ok(()),
+            |_: &mut (), value: u64| Ok(value),
+            || {},
+        );
+
+        for operation in 0..64 {
+            if operation > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            worker
+                .request_state(
+                    DotenvWorkerCorrelation::new(1, operation, operation),
+                    operation,
+                )
+                .unwrap();
+            let outcome = recv_worker_outcome(&mut worker);
+            assert_eq!(outcome.operation_id(), operation);
+            assert_eq!(outcome.into_result(), Ok(operation));
+        }
+    }
+
+    #[test]
+    fn lazy_worker_drop은_channel을_닫고_thread_resource_drop까지_join한다() {
+        struct DropProbe(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resource_drops = std::sync::Arc::clone(&drops);
+        let mut worker = LazyDotenvWorker::new(
+            move || Ok(DropProbe(std::sync::Arc::clone(&resource_drops))),
+            |_: &mut DropProbe, value: u64| Ok(value),
+            || {},
+        );
+        worker
+            .request_state(DotenvWorkerCorrelation::new(1, 1, 1), 1)
+            .unwrap();
+        assert_eq!(recv_worker_outcome(&mut worker).into_result(), Ok(1));
+        drop(worker);
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn lazy_worker_stale_generation_revision은_payload를_노출하지_않고_거부한다() {
+        let mut worker =
+            LazyDotenvWorker::new(|| Ok(()), |_: &mut (), value: u64| Ok(value), || {});
+        worker
+            .request_state(DotenvWorkerCorrelation::new(7, 11, 13), 17)
+            .unwrap();
+        let stale = recv_worker_outcome(&mut worker);
+        assert_eq!(
+            stale.into_current(7, 12).unwrap_err(),
+            DotenvWorkerErrorCode::StaleOutcome
+        );
+
+        worker
+            .request_state(DotenvWorkerCorrelation::new(7, 12, 14), 19)
+            .unwrap();
+        let current = recv_worker_outcome(&mut worker)
+            .into_current(7, 12)
+            .unwrap();
+        assert_eq!(current.into_result(), Ok(19));
+    }
+
+    #[test]
+    fn lazy_worker_debug는_correlation과_payload를_항상_redact한다() {
+        let correlation = DotenvWorkerCorrelation::new(31_337, 41_337, 51_337);
+        let correlation_debug = format!("{correlation:?}");
+        for forbidden in ["31337", "41337", "51337"] {
+            assert!(
+                !correlation_debug.contains(forbidden),
+                "{correlation_debug}"
+            );
+        }
+
+        let replaced = ReplacedDotenvState {
+            correlation,
+            payload: "super-secret-replaced".to_owned(),
+        };
+        let rejected = DotenvWorkerSubmitError {
+            code: DotenvWorkerErrorCode::ContinuationLimit,
+            correlation,
+            payload: "super-secret-rejected".to_owned(),
+        };
+        let outcome = DotenvWorkerOutcome {
+            kind: DotenvWorkerRequestKind::Continuation,
+            correlation,
+            result: Ok("super-secret-outcome".to_owned()),
+        };
+        for (debug, forbidden) in [
+            (format!("{replaced:?}"), "super-secret-replaced"),
+            (format!("{rejected:?}"), "super-secret-rejected"),
+            (format!("{outcome:?}"), "super-secret-outcome"),
+        ] {
+            assert!(!debug.contains(forbidden), "{debug}");
+            assert!(debug.contains("REDACTED"), "{debug}");
+        }
+    }
+
+    #[test]
+    fn lazy_worker_resource_failure는_timer_retry하지_않는다() {
+        let factory_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let execute_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory_counter = std::sync::Arc::clone(&factory_calls);
+        let execute_counter = std::sync::Arc::clone(&execute_calls);
+        let mut worker = LazyDotenvWorker::with_idle_ttl(
+            std::time::Duration::from_millis(5),
+            move || -> Result<(), DotenvWorkerErrorCode> {
+                factory_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(DotenvWorkerErrorCode::ResourceOpenFailed)
+            },
+            move |_: &mut (), value: u64| {
+                execute_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(value)
+            },
+            || {},
+        );
+        worker
+            .request_state(DotenvWorkerCorrelation::new(1, 1, 1), 1)
+            .unwrap();
+        assert_eq!(
+            recv_worker_outcome(&mut worker).into_result(),
+            Err(DotenvWorkerErrorCode::ResourceOpenFailed)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(factory_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(execute_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn lazy_worker_source는_app_runtime_io_repaint_dependency가_없다() {
+        let source = include_str!("dotenv_sync.rs");
+        let worker_source = source
+            .split_once("pub const DOTENV_WORKER_IDLE_TTL")
+            .unwrap()
+            .1
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .unwrap()
+            .0;
+        for forbidden in [
+            "Db::open",
+            "KeyringSecretStore",
+            "RuntimeCommand",
+            "request_repaint",
+            "tokio::",
+            "std::fs::",
+        ] {
+            assert!(!worker_source.contains(forbidden), "forbidden: {forbidden}");
+        }
+        assert_eq!(worker_source.matches("sync_channel::<()>(1)").count(), 1);
+        assert_eq!(
+            worker_source
+                .matches("sync_channel::<DotenvWorkerOutcome<O>>(1)")
+                .count(),
+            1
+        );
+    }
 
     impl DotenvRepository for Db {
         fn credential_secret_location(

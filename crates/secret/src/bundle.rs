@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use anyhow::Context;
 use uuid::Uuid;
 
-use crate::{SecretStore, SecretString, hex};
+use crate::{SecretStore, SecretString, VERSIONED_SECRET_BUNDLE_SLOT_CEILING, hex};
 
 const SLOT_PREFIX: &str = "deppy.oauth.v1.";
 const REFRESH_SUFFIX: &str = ".refresh";
@@ -399,7 +399,7 @@ pub fn list_secret_bundle_slots(
     store: &dyn SecretStore,
     logical_id: Option<&LogicalCredentialId>,
 ) -> anyhow::Result<Vec<PhysicalSecretSlot>> {
-    let entries = store.list_secret_ids(SLOT_PREFIX)?;
+    let entries = store.list_secret_ids_bounded(SLOT_PREFIX)?;
     let mut slots = BTreeSet::new();
     for entry in entries {
         let base = entry
@@ -410,6 +410,10 @@ pub fn list_secret_bundle_slots(
             continue;
         };
         if logical_id.is_none_or(|logical| slot.belongs_to(logical)) {
+            anyhow::ensure!(
+                slots.contains(&slot) || slots.len() < VERSIONED_SECRET_BUNDLE_SLOT_CEILING,
+                "versioned secret bundle inventory exceeds fixed slot ceiling"
+            );
             slots.insert(slot);
         }
     }
@@ -422,6 +426,10 @@ pub fn reconcile_orphan_secret_slots(
     store: &dyn SecretStore,
     referenced: &BTreeSet<PhysicalSecretSlot>,
 ) -> anyhow::Result<ReconcileSecretSlotsResult> {
+    anyhow::ensure!(
+        referenced.len() <= VERSIONED_SECRET_BUNDLE_SLOT_CEILING,
+        "referenced secret bundle inventory exceeds fixed slot ceiling"
+    );
     let slots = list_secret_bundle_slots(store, None)?;
     let mut result = ReconcileSecretSlotsResult {
         slots_seen: slots.len(),
@@ -450,6 +458,7 @@ mod tests {
         entries: Mutex<HashMap<String, String>>,
         fail_on: Mutex<Option<String>>,
         fail_after_write_on: Mutex<Option<String>>,
+        delete_calls: Mutex<usize>,
     }
 
     impl MemStore {
@@ -459,6 +468,21 @@ mod tests {
 
         fn fail_after_write_on(&self, id: String) {
             *self.fail_after_write_on.lock().unwrap() = Some(id);
+        }
+
+        fn insert_inventory_id(&self, id: String) {
+            self.entries
+                .lock()
+                .unwrap()
+                .insert(id, "inventory-value".to_owned());
+        }
+
+        fn entry_count(&self) -> usize {
+            self.entries.lock().unwrap().len()
+        }
+
+        fn delete_call_count(&self) -> usize {
+            *self.delete_calls.lock().unwrap()
         }
     }
 
@@ -488,6 +512,7 @@ mod tests {
         }
 
         fn delete_secret(&self, id: &str) -> anyhow::Result<()> {
+            *self.delete_calls.lock().unwrap() += 1;
             self.entries.lock().unwrap().remove(id);
             Ok(())
         }
@@ -646,5 +671,94 @@ mod tests {
         }
         assert_eq!(list_secret_bundle_slots(&store, None).unwrap().len(), 1);
         assert_eq!(store.entries.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn bounded_slot_inventory_accepts_zero_and_exact_slot_and_entry_ceilings() {
+        let empty = MemStore::default();
+        assert!(list_secret_bundle_slots(&empty, None).unwrap().is_empty());
+        let reconciled = reconcile_orphan_secret_slots(&empty, &BTreeSet::new()).unwrap();
+        assert_eq!(reconciled, ReconcileSecretSlotsResult::default());
+
+        let store = MemStore::default();
+        for version in 1..=VERSIONED_SECRET_BUNDLE_SLOT_CEILING {
+            let physical = slot(version as u128);
+            store.insert_inventory_id(physical.as_str().to_owned());
+            store.insert_inventory_id(physical.refresh_entry_id());
+            store.insert_inventory_id(physical.dcr_entry_id());
+        }
+        assert_eq!(
+            store.entry_count(),
+            crate::SECRET_PREFIX_ENTRY_PROBE_CEILING - 1
+        );
+        assert_eq!(
+            list_secret_bundle_slots(&store, None).unwrap().len(),
+            VERSIONED_SECRET_BUNDLE_SLOT_CEILING
+        );
+    }
+
+    #[test]
+    fn slot_limit_plus_one_fails_without_retaining_the_extra_slot() {
+        let store = MemStore::default();
+        for version in 1..=VERSIONED_SECRET_BUNDLE_SLOT_CEILING + 1 {
+            store.insert_inventory_id(slot(version as u128).as_str().to_owned());
+        }
+        let error = list_secret_bundle_slots(&store, None).unwrap_err();
+        assert!(error.to_string().contains("fixed slot ceiling"));
+    }
+
+    #[test]
+    fn malformed_prefix_flood_at_entry_limit_is_bounded_and_ignored() {
+        let store = MemStore::default();
+        for index in 0..crate::SECRET_PREFIX_ENTRY_PROBE_CEILING - 1 {
+            store.insert_inventory_id(format!("{SLOT_PREFIX}malformed-{index}"));
+        }
+        assert_eq!(
+            store.entry_count(),
+            crate::SECRET_PREFIX_ENTRY_PROBE_CEILING - 1
+        );
+        assert!(list_secret_bundle_slots(&store, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn bundle_suffix_duplicates_and_malformed_double_suffixes_collapse_to_one_slot() {
+        let store = MemStore::default();
+        let physical = slot(5000);
+        store.insert_inventory_id(physical.as_str().to_owned());
+        store.insert_inventory_id(physical.refresh_entry_id());
+        store.insert_inventory_id(physical.dcr_entry_id());
+        store.insert_inventory_id(format!(
+            "{}{}{}",
+            physical.as_str(),
+            REFRESH_SUFFIX,
+            REFRESH_SUFFIX
+        ));
+        store.insert_inventory_id(format!("{}{}{}", physical.as_str(), DCR_SUFFIX, DCR_SUFFIX));
+        assert_eq!(list_secret_bundle_slots(&store, None).unwrap(), [physical]);
+    }
+
+    #[test]
+    fn reconciliation_fails_closed_before_delete_when_prefix_probe_overflows() {
+        let store = MemStore::default();
+        for index in 0..crate::SECRET_PREFIX_ENTRY_PROBE_CEILING {
+            store.insert_inventory_id(format!("{SLOT_PREFIX}malformed-overflow-{index}"));
+        }
+        let before = store.entry_count();
+        assert!(reconcile_orphan_secret_slots(&store, &BTreeSet::new()).is_err());
+        assert_eq!(store.delete_call_count(), 0);
+        assert_eq!(store.entry_count(), before);
+    }
+
+    #[test]
+    fn reconciliation_rejects_oversized_referenced_set_before_inventory_or_delete() {
+        let store = MemStore::default();
+        let orphan = slot(9000);
+        store.insert_inventory_id(orphan.as_str().to_owned());
+        let referenced = (1..=VERSIONED_SECRET_BUNDLE_SLOT_CEILING + 1)
+            .map(|version| slot(version as u128))
+            .collect::<BTreeSet<_>>();
+        assert!(reconcile_orphan_secret_slots(&store, &referenced).is_err());
+        assert_eq!(store.delete_call_count(), 0);
+        assert_eq!(store.entry_count(), 1);
     }
 }

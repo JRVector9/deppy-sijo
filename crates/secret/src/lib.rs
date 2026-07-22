@@ -19,6 +19,14 @@ use anyhow::Context;
 /// keyring 좌표: service는 앱 번들 ID 고정, username은 credential id.
 pub const KEYRING_SERVICE: &str = "app.vector9.deppy-sijo";
 
+/// Maximum number of distinct versioned OAuth bundle slots retained by one inventory pass.
+/// This is a compile-time production ceiling; callers cannot raise it at runtime.
+pub const VERSIONED_SECRET_BUNDLE_SLOT_CEILING: usize = 4_096;
+/// One slot has at most access/refresh/DCR entries. The extra entry is retained only long enough
+/// to prove overflow and fail closed.
+pub const SECRET_PREFIX_ENTRY_PROBE_CEILING: usize = VERSIONED_SECRET_BUNDLE_SLOT_CEILING * 3 + 1;
+const SECRET_PREFIX_ENTRY_LIMIT: usize = SECRET_PREFIX_ENTRY_PROBE_CEILING - 1;
+
 /// secret 평문 래퍼. Debug 출력은 항상 REDACTED (설계문서 PR-02 완료 기준).
 /// Serialize/Display를 구현하지 않아 config/SQLite/log로의 우발적 유출을 컴파일 단계에서 막는다.
 pub struct SecretString(String);
@@ -85,6 +93,33 @@ pub trait SecretStore: Send + Sync {
     fn list_secret_ids(&self, _prefix: &str) -> anyhow::Result<Vec<String>> {
         anyhow::bail!("secret store does not support entry enumeration")
     }
+
+    /// Returns a sorted, deduplicated prefix inventory under the fixed production ceiling.
+    ///
+    /// The default preserves compatibility with stores that only implement `list_secret_ids`.
+    /// Such legacy implementations may allocate their source `Vec` before this method can reject
+    /// it; production keyring storage overrides this method and bounds the retained filtered
+    /// inventory at the earliest iterator stage exposed by `keyring-core`.
+    fn list_secret_ids_bounded(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        let ids = self.list_secret_ids(prefix)?;
+        collect_bounded_secret_ids(ids)
+    }
+}
+
+fn collect_bounded_secret_ids(
+    ids: impl IntoIterator<Item = String>,
+) -> anyhow::Result<Vec<String>> {
+    let mut ids = ids
+        .into_iter()
+        .take(SECRET_PREFIX_ENTRY_PROBE_CEILING)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        ids.len() <= SECRET_PREFIX_ENTRY_LIMIT,
+        "secret entry inventory exceeds fixed prefix ceiling"
+    );
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
 }
 
 /// keyring-core 기본 store 기반 구현. 사용 전 플랫폼 store가
@@ -140,18 +175,23 @@ impl SecretStore for KeyringSecretStore {
     }
 
     fn list_secret_ids(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.list_secret_ids_bounded(prefix)
+    }
+
+    fn list_secret_ids_bounded(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
         let _serial = KEYRING_SERIAL.lock().expect("keyring serial lock");
         let spec = std::collections::HashMap::from([("service", KEYRING_SERVICE)]);
-        let mut users = keyring_core::Entry::search(&spec)
+        // `Entry::search` returns a platform-owned Vec, so its source allocation cannot be bounded
+        // without a streaming keyring-core API. From the first iterator stage available to us,
+        // nonmatching service/prefix rows are dropped immediately and only limit+1 matching
+        // usernames are retained. The +1 probe proves overflow without retaining the full flood.
+        let matching_users = keyring_core::Entry::search(&spec)
             .context("keyring entry inventory 조회 실패")?
             .into_iter()
             .filter_map(|entry| entry.get_specifiers())
             .filter_map(|(service, user)| (service == KEYRING_SERVICE).then_some(user))
-            .filter(|user| user.starts_with(prefix))
-            .collect::<Vec<_>>();
-        users.sort();
-        users.dedup();
-        Ok(users)
+            .filter(|user| user.starts_with(prefix));
+        collect_bounded_secret_ids(matching_users)
     }
 }
 
@@ -181,6 +221,8 @@ pub fn init_platform_store() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     fn init_mock_store() {
@@ -248,5 +290,30 @@ mod tests {
             .delete_secret("deppy.oauth.v1.test.inventory")
             .unwrap();
         store.delete_secret("legacy-credential").unwrap();
+    }
+
+    #[test]
+    fn bounded_inventory_accepts_zero_and_exact_fixed_limit() {
+        assert!(
+            collect_bounded_secret_ids(std::iter::empty())
+                .unwrap()
+                .is_empty()
+        );
+        let exact = collect_bounded_secret_ids(
+            (0..SECRET_PREFIX_ENTRY_LIMIT).map(|index| format!("slot-{index:05}")),
+        )
+        .unwrap();
+        assert_eq!(exact.len(), SECRET_PREFIX_ENTRY_LIMIT);
+    }
+
+    #[test]
+    fn bounded_inventory_probes_only_limit_plus_one_then_fails_closed() {
+        let consumed = Cell::new(0usize);
+        let flood = (0..SECRET_PREFIX_ENTRY_PROBE_CEILING + 100).map(|index| {
+            consumed.set(consumed.get() + 1);
+            format!("slot-{index:05}")
+        });
+        assert!(collect_bounded_secret_ids(flood).is_err());
+        assert_eq!(consumed.get(), SECRET_PREFIX_ENTRY_PROBE_CEILING);
     }
 }

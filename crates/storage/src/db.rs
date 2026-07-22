@@ -2663,37 +2663,100 @@ impl Db {
         redaction: &secret::RedactionService,
     ) -> anyhow::Result<audit::AuthorizationPreflight> {
         audit::validate_tool_input(input_json.as_bytes())?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let preflight = Self::commit_authorization_preflight_in_transaction(
+            &self.authorization_db_identity,
+            &tx,
+            owner,
+            plan,
+            input_json,
+            redaction,
+        )?;
+        tx.commit()
+            .context("authorization permission/audit preflight commit 실패")?;
+        Ok(preflight)
+    }
+
+    /// Global-config CAS variant used after live schema validation. Acquiring IMMEDIATE before
+    /// reading the revision prevents another process from changing server/tool/credential state
+    /// between the revision proof, exact permission check, remembered decision, and audit row.
+    pub fn commit_authorization_preflight_revision_cas(
+        &self,
+        expected_revision: ConnectorConfigRevision,
+        owner: &ActiveAuthorizationOwner,
+        plan: audit::AuthorizationPlan,
+        input_json: &str,
+        redaction: &secret::RedactionService,
+    ) -> anyhow::Result<ConnectorConfigCas<audit::AuthorizationPreflight>> {
+        audit::validate_tool_input(input_json.as_bytes())?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let current_revision = Self::read_connector_config_revision(&tx)?;
+        if current_revision != expected_revision {
+            tx.commit()
+                .context("stale authorization revision CAS transaction 실패")?;
+            return Ok(ConnectorConfigCas::Stale { current_revision });
+        }
+        let preflight = Self::commit_authorization_preflight_in_transaction(
+            &self.authorization_db_identity,
+            &tx,
+            owner,
+            plan,
+            input_json,
+            redaction,
+        )?;
+        let revision = Self::read_connector_config_revision(&tx)?;
         anyhow::ensure!(
-            self.authorization_db_identity == owner.db_identity,
+            revision >= current_revision,
+            "authorization preflight 중 Connector config revision이 감소했습니다"
+        );
+        tx.commit()
+            .context("authorization revision CAS preflight commit 실패")?;
+        Ok(ConnectorConfigCas::Committed {
+            revision,
+            value: preflight,
+        })
+    }
+
+    fn commit_authorization_preflight_in_transaction(
+        authorization_db_identity: &str,
+        conn: &Connection,
+        owner: &ActiveAuthorizationOwner,
+        plan: audit::AuthorizationPlan,
+        input_json: &str,
+        redaction: &secret::RedactionService,
+    ) -> anyhow::Result<audit::AuthorizationPreflight> {
+        anyhow::ensure!(
+            !conn.is_autocommit(),
+            "authorization preflight는 caller-owned transaction이 필요합니다"
+        );
+        anyhow::ensure!(
+            authorization_db_identity == owner.db_identity,
             "authorization owner가 다른 DB에 속합니다"
         );
-        let current_permission = match mcp_store::permission_rule_in_snapshot(
-            &tx,
-            plan.server_id(),
-            plan.tool_name(),
-        )? {
-            Some(row) => audit::PermissionFingerprint::Persisted {
-                rule: audit::PermissionRule::from_persisted(&row.rule)
-                    .ok_or_else(|| anyhow::anyhow!("invalid persisted permission rule"))?,
-                approved_schema_hash: row.approved_schema_hash,
-            },
-            None => audit::PermissionFingerprint::Absent,
-        };
+        let current_permission =
+            match mcp_store::permission_rule_in_snapshot(conn, plan.server_id(), plan.tool_name())?
+            {
+                Some(row) => audit::PermissionFingerprint::Persisted {
+                    rule: audit::PermissionRule::from_persisted(&row.rule)
+                        .ok_or_else(|| anyhow::anyhow!("invalid persisted permission rule"))?,
+                    approved_schema_hash: row.approved_schema_hash,
+                },
+                None => audit::PermissionFingerprint::Absent,
+            };
         anyhow::ensure!(
             &current_permission == plan.expected_permission(),
             "permission changed after authorization evaluation"
         );
         match plan.decision() {
             audit::ToolDecision::AllowAlways => mcp_store::upsert_permission_rule(
-                &tx,
+                conn,
                 plan.server_id(),
                 plan.tool_name(),
                 audit::PermissionRule::Allow.as_str(),
                 Some(plan.live_schema_hash()),
             )?,
             audit::ToolDecision::DenyAlways => mcp_store::upsert_permission_rule(
-                &tx,
+                conn,
                 plan.server_id(),
                 plan.tool_name(),
                 audit::PermissionRule::Deny.as_str(),
@@ -2701,17 +2764,14 @@ impl Db {
             )?,
             _ => {}
         }
-        let preflight = audit::prepare_owned_authorization_preflight(
-            &tx,
+        audit::prepare_owned_authorization_preflight(
+            conn,
             plan,
             input_json,
             redaction,
             owner.scope(),
             &owner.run_id,
-        )?;
-        tx.commit()
-            .context("authorization permission/audit preflight commit 실패")?;
-        Ok(preflight)
+        )
     }
 
     pub fn complete_authorization_outcome(
@@ -4872,6 +4932,187 @@ mod tests {
         drop(db);
         fs::remove_dir_all(lock_dir).unwrap();
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn authorization_revision_cas는_other_writer의_server_tool_credential변경을_거부한다() {
+        let (dir, path, db_a) = file_db("authorization-config-stale");
+        let lock_dir = authorization_lock_dir(&db_a.authorization_db_identity);
+        let mut db_b = Db::open(&path).unwrap();
+        db_b.insert_mcp_server(&sample_mcp_server("target"))
+            .unwrap();
+        let owner = db_a
+            .acquire_authorization_owner("gui:config-stale")
+            .unwrap();
+
+        for (operation, mutate) in [
+            ("operation-stale-server", "server"),
+            ("operation-stale-tool", "tool"),
+            ("operation-stale-credential", "credential"),
+        ] {
+            let expected = db_a.connector_config_revision().unwrap();
+            match mutate {
+                "server" => db_b
+                    .insert_mcp_server(&sample_mcp_server("other-server"))
+                    .unwrap(),
+                "tool" => db_b
+                    .replace_mcp_tools(
+                        "target",
+                        &[sample_mcp_tool("target", "tool-id", "tool-name")],
+                    )
+                    .unwrap(),
+                "credential" => db_b.insert_credential(&sample("other-credential")).unwrap(),
+                _ => unreachable!(),
+            }
+            let current_revision = db_b.connector_config_revision().unwrap();
+            assert!(current_revision > expected);
+            let result = db_a
+                .commit_authorization_preflight_revision_cas(
+                    expected,
+                    &owner,
+                    authorization_plan(
+                        operation,
+                        "target",
+                        "tool-name",
+                        audit::ApprovalDecision::AllowOnce,
+                    ),
+                    "{}",
+                    &secret::RedactionService::new(),
+                )
+                .unwrap();
+            match result {
+                ConnectorConfigCas::Stale {
+                    current_revision: actual,
+                } => assert_eq!(actual, current_revision),
+                ConnectorConfigCas::Committed { .. } => {
+                    panic!("stale authorization unexpectedly committed")
+                }
+            }
+            assert_eq!(db_a.tool_audit_lifecycle(operation).unwrap(), None);
+            assert!(
+                db_a.permission_rule("target", "tool-name")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        drop(owner);
+        drop(db_a);
+        drop(db_b);
+        fs::remove_dir_all(lock_dir).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn remembered_authorization은_permission과_audit의_committed_revision을_반환한다() {
+        for (label, decision, expected_rule) in [
+            ("allow", audit::ApprovalDecision::AllowAlways, "allow"),
+            ("deny", audit::ApprovalDecision::DenyAlways, "deny"),
+        ] {
+            let (dir, _path, db) = file_db(&format!("authorization-revision-{label}"));
+            let lock_dir = authorization_lock_dir(&db.authorization_db_identity);
+            let owner = db
+                .acquire_authorization_owner(&format!("gui:revision:{label}"))
+                .unwrap();
+            let expected = db.connector_config_revision().unwrap();
+            let operation = format!("operation-revision-{label}");
+            let (revision, preflight) = committed(
+                db.commit_authorization_preflight_revision_cas(
+                    expected,
+                    &owner,
+                    authorization_plan(&operation, "server", "tool", decision),
+                    "{}",
+                    &secret::RedactionService::new(),
+                )
+                .unwrap(),
+            );
+            assert!(revision > expected);
+            assert_eq!(db.connector_config_revision().unwrap(), revision);
+            assert_eq!(
+                db.permission_rule("server", "tool").unwrap().unwrap().rule,
+                expected_rule
+            );
+            match preflight {
+                audit::AuthorizationPreflight::Prepared(grant) => db
+                    .complete_authorization_outcome(
+                        &owner,
+                        grant.operation_id(),
+                        audit::AuthorizationOutcome::Succeeded,
+                    )
+                    .unwrap(),
+                audit::AuthorizationPreflight::Denied(receipt) => {
+                    assert_eq!(receipt.operation_id(), operation)
+                }
+            }
+
+            drop(owner);
+            drop(db);
+            fs::remove_dir_all(lock_dir).unwrap();
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn authorization_revision_cas_failure는_permission_audit_revision을_rollback한다() {
+        for failure in ["audit", "revision", "overflow"] {
+            let (dir, _path, db) = file_db(&format!("authorization-revision-fail-{failure}"));
+            let lock_dir = authorization_lock_dir(&db.authorization_db_identity);
+            let owner = db
+                .acquire_authorization_owner(&format!("gui:revision-fail:{failure}"))
+                .unwrap();
+            match failure {
+                "audit" => db
+                    .conn
+                    .execute_batch(
+                        "CREATE TRIGGER fail_revision_cas_audit
+                         BEFORE INSERT ON tool_audit_logs
+                         BEGIN SELECT RAISE(ABORT, 'injected audit failure'); END;",
+                    )
+                    .unwrap(),
+                "revision" => db
+                    .conn
+                    .execute_batch(
+                        "CREATE TRIGGER fail_revision_cas_revision
+                         BEFORE UPDATE ON connector_config_state
+                         BEGIN SELECT RAISE(ABORT, 'injected revision failure'); END;",
+                    )
+                    .unwrap(),
+                "overflow" => {
+                    db.conn
+                        .execute(
+                            "UPDATE connector_config_state SET revision = ?1 WHERE singleton = 1",
+                            [i64::MAX],
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let expected = db.connector_config_revision().unwrap();
+            let operation = format!("operation-revision-fail-{failure}");
+            assert!(
+                db.commit_authorization_preflight_revision_cas(
+                    expected,
+                    &owner,
+                    authorization_plan(
+                        &operation,
+                        "server",
+                        "tool",
+                        audit::ApprovalDecision::AllowAlways,
+                    ),
+                    "{}",
+                    &secret::RedactionService::new(),
+                )
+                .is_err()
+            );
+            assert_eq!(db.connector_config_revision().unwrap(), expected);
+            assert!(db.permission_rule("server", "tool").unwrap().is_none());
+            assert_eq!(db.tool_audit_lifecycle(&operation).unwrap(), None);
+
+            drop(owner);
+            drop(db);
+            fs::remove_dir_all(lock_dir).unwrap();
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]

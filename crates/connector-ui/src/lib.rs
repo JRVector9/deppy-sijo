@@ -1,15 +1,18 @@
 //! Pure Connector snapshot renderer.
 //!
 //! The renderer consumes immutable [`contract::ConnectorSnapshot`] values and returns at most one
-//! [`contract::ConnectorIntent`] per frame. It never opens files, talks to a service, starts work,
-//! or retains snapshot history. Only unfinished form/modal drafts live in this crate.
+//! [`contract::ConnectorIntent`] per frame. It performs no file, URL, service, thread, channel, or
+//! runtime I/O. Only user-authored drafts and a revision-keyed display cache live here.
 
 use std::mem;
 
 use connector_contract::{
     ApprovalDecision, ApprovalPrompt, ConnectionState, ConnectorIntent, ConnectorSnapshot,
-    OAuthClientPrompt, OperationId, PermissionRule, SensitiveInput, ServerDraft, ServerId,
-    ServerSummary, SlackStatus, ToolListItem, ToolPage, TransportDraft, TransportKind,
+    ErrorCode, ExternalLinkKind, ImportOutcome, ImportReport, ImportSource, ImportSourceRequest,
+    OAuthRecoveryAction, OAuthUiPhase, OAuthUiState, OperationKind, OperationPhase,
+    OperationSummary, PermissionRule, RemoteTrustPrompt, RemoteTrustPurpose, ResourceLimits,
+    Revision, SensitiveInput, ServerDraft, ServerId, ServerSummary, SlackRecoveryKind, SlackStatus,
+    ToolListItem, ToolPage, TransportDraft, TransportKind,
 };
 use egui::{Button, ComboBox, Label, ScrollArea, TextEdit, Ui};
 use i18n::Catalog;
@@ -20,70 +23,95 @@ const SERVER_ROW_HEIGHT: f32 = 30.0;
 const SERVER_LIST_HEIGHT: f32 = 180.0;
 const TOOL_ROW_HEIGHT: f32 = 58.0;
 const TOOL_LIST_HEIGHT: f32 = TOOL_ROW_HEIGHT * 6.0;
-const SLACK_APP_SETTINGS_URL: &str = "https://api.slack.com/apps";
+const IMPORT_ROW_HEIGHT: f32 = 30.0;
+const IMPORT_LIST_HEIGHT: f32 = IMPORT_ROW_HEIGHT * 6.0;
+const OPERATION_ROW_HEIGHT: f32 = 30.0;
+const OPERATION_LIST_HEIGHT: f32 = OPERATION_ROW_HEIGHT * 5.0;
+const OAUTH_SCOPE_ROW_HEIGHT: f32 = 24.0;
+const OAUTH_SCOPE_LIST_HEIGHT: f32 = OAUTH_SCOPE_ROW_HEIGHT * 5.0;
 
-/// Stateful UI shell. State is limited to user-authored drafts and confirmation modals.
+/// Stateful UI shell. State is limited to unfinished user drafts and derived display strings.
 pub struct ConnectorUi {
     labels: Labels,
+    prepared: PreparedDisplayCache,
     add_server: Option<ServerFormDraft>,
     invoke: Option<InvokeDraft>,
     oauth_client: Option<OAuthClientDraft>,
     delete_server: Option<DeleteServerDraft>,
+    paste_input: String,
+}
+
+impl std::fmt::Debug for ConnectorUi {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ConnectorUi(REDACTED)")
+    }
+}
+
+impl Drop for ConnectorUi {
+    fn drop(&mut self) {
+        zero_string(&mut self.paste_input);
+    }
 }
 
 impl ConnectorUi {
     pub fn new(catalog: &Catalog) -> Self {
         Self {
             labels: Labels::new(catalog),
+            prepared: PreparedDisplayCache::default(),
             add_server: None,
             invoke: None,
             oauth_client: None,
             delete_server: None,
+            paste_input: String::new(),
         }
     }
 
     /// Refreshes cached translations after an application locale change.
-    ///
-    /// Translations are intentionally cached outside the render path. Existing user drafts stay
-    /// intact when the locale changes.
+    /// Existing user drafts stay intact; derived strings rebuild once on the next snapshot render.
     pub fn set_catalog(&mut self, catalog: &Catalog) {
         self.labels = Labels::new(catalog);
+        self.prepared.invalidate();
     }
 
     /// Renders one frame from an immutable snapshot and returns at most one intent.
     #[must_use]
     pub fn render(&mut self, ui: &mut Ui, snapshot: &ConnectorSnapshot) -> Option<ConnectorIntent> {
-        if self.oauth_client.is_none()
-            && let Some(prompt) = snapshot.oauth_client_prompt.as_ref()
-        {
-            self.oauth_client = Some(OAuthClientDraft::from_prompt(prompt));
-        }
+        sync_oauth_client_draft(&mut self.oauth_client, snapshot.oauth.as_ref());
+        self.prepared.prepare(snapshot);
+
         let mut intent = None;
-        let has_modal = self.add_server.is_some()
+        let has_service_modal = snapshot.remote_trust.is_some()
+            || snapshot.oauth.is_some()
+            || snapshot.approval.is_some();
+        let has_local_modal = self.add_server.is_some()
             || self.invoke.is_some()
             || self.oauth_client.is_some()
-            || self.delete_server.is_some()
-            || snapshot.approval.is_some();
+            || self.delete_server.is_some();
 
-        ui.add_enabled_ui(!has_modal, |ui| {
+        ui.add_enabled_ui(!(has_service_modal || has_local_modal), |ui| {
             render_main(
                 ui,
                 snapshot,
+                &self.prepared,
                 &self.labels,
                 &mut self.add_server,
                 &mut self.invoke,
-                &mut self.oauth_client,
                 &mut self.delete_server,
+                &mut self.paste_input,
                 &mut intent,
             );
         });
 
         render_add_server_modal(ui, &self.labels, &mut self.add_server, &mut intent);
         render_invoke_modal(ui, &self.labels, &mut self.invoke, &mut intent);
-        render_oauth_modal(ui, &self.labels, &mut self.oauth_client, &mut intent);
         render_delete_modal(ui, &self.labels, &mut self.delete_server, &mut intent);
+
         if let Some(approval) = snapshot.approval.as_ref() {
             render_approval_modal(ui, &self.labels, approval, &mut intent);
+        } else if let Some(prompt) = snapshot.remote_trust.as_ref() {
+            render_remote_trust_modal(ui, &self.labels, prompt, &mut intent);
+        } else if let Some(oauth) = snapshot.oauth.as_ref() {
+            render_oauth_modal(ui, &self.labels, oauth, &mut self.oauth_client, &mut intent);
         }
 
         intent
@@ -94,27 +122,35 @@ impl ConnectorUi {
 fn render_main(
     ui: &mut Ui,
     snapshot: &ConnectorSnapshot,
+    prepared: &PreparedDisplayCache,
     labels: &Labels,
     add_server: &mut Option<ServerFormDraft>,
     invoke: &mut Option<InvokeDraft>,
-    oauth_client: &mut Option<OAuthClientDraft>,
     delete_server: &mut Option<DeleteServerDraft>,
+    paste_input: &mut String,
     intent: &mut Option<ConnectorIntent>,
 ) {
     ui.heading(&labels.title);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui.button(&labels.add_server).clicked() {
             *add_server = Some(ServerFormDraft::default());
         }
         if ui.button(&labels.import_file).clicked() {
-            offer_intent(intent, ConnectorIntent::RequestImportPicker);
+            offer_intent(
+                intent,
+                ConnectorIntent::RequestImportSource(ImportSourceRequest::FilePicker),
+            );
+        }
+        if ui.button(&labels.import_claude).clicked() {
+            offer_intent(
+                intent,
+                ConnectorIntent::RequestImportSource(ImportSourceRequest::ClaudeDesktop),
+            );
         }
         if ui.button(&labels.open_slack_settings).clicked() {
             offer_intent(
                 intent,
-                ConnectorIntent::OpenExternalUrl {
-                    url: SLACK_APP_SETTINGS_URL.to_owned(),
-                },
+                ConnectorIntent::OpenExternalLink(ExternalLinkKind::SlackAppSettings),
             );
         }
         if ui.button(&labels.refresh).clicked() {
@@ -122,9 +158,9 @@ fn render_main(
         }
     });
 
-    render_slack_summary(ui, snapshot, labels, intent);
+    render_slack_summary(ui, snapshot, prepared, labels, intent);
     ui.separator();
-    render_server_overview(ui, snapshot, labels, intent);
+    render_server_overview(ui, snapshot, prepared, labels, intent);
 
     let selected = snapshot
         .selected_server
@@ -139,15 +175,28 @@ fn render_main(
         render_selected_server(
             ui,
             snapshot,
+            prepared,
             server,
             selected_config,
             labels,
             add_server,
             invoke,
-            oauth_client,
             delete_server,
             intent,
         );
+    }
+
+    ui.separator();
+    render_import_controls(ui, labels, paste_input, intent);
+
+    if let Some(report) = snapshot.import_report.as_ref() {
+        ui.separator();
+        render_import_report(ui, report, prepared, labels, intent);
+    }
+
+    if !snapshot.operations.is_empty() {
+        ui.separator();
+        render_operations(ui, snapshot, prepared, labels, intent);
     }
 
     if let Some(result) = snapshot.result.as_ref() {
@@ -174,35 +223,66 @@ fn render_main(
 fn render_slack_summary(
     ui: &mut Ui,
     snapshot: &ConnectorSnapshot,
+    prepared: &PreparedDisplayCache,
     labels: &Labels,
     intent: &mut Option<ConnectorIntent>,
 ) {
-    let status = match snapshot.slack_status {
-        SlackStatus::NotConfigured => &labels.not_configured,
-        SlackStatus::Ready => &labels.ready,
-        SlackStatus::Checking => &labels.checking,
-        SlackStatus::NeedsAuthorization => &labels.needs_authorization,
-        SlackStatus::Connected => &labels.connected,
-        SlackStatus::Failed => &labels.failed,
-    };
-    ui.horizontal(|ui| {
-        ui.strong("Slack");
-        ui.label(status);
-        if snapshot.slack_tool_count > 0 {
-            ui.label(snapshot.slack_tool_count.to_string());
-            ui.label(&labels.tools);
-        }
-        if snapshot.slack_status == SlackStatus::NotConfigured
-            && ui.button(&labels.configure).clicked()
-        {
-            offer_intent(intent, ConnectorIntent::EnsureSlackServer);
-        }
+    let slack = &snapshot.slack;
+    ui.group(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Slack");
+            ui.label(slack_status_label(slack.status, labels));
+            if slack.tool_count > 0 {
+                ui.label(&prepared.slack_tool_count);
+                ui.label(&labels.tools);
+            }
+            if let Some(workspace) = slack.workspace_label.as_deref() {
+                ui.label(&labels.workspace);
+                ui.strong(workspace);
+            }
+
+            if slack_connect_enabled(slack.status) && ui.button(&labels.connect_slack).clicked() {
+                offer_intent(intent, ConnectorIntent::ConnectSlack);
+            }
+
+            if slack.can_choose_workspace
+                && let Some(server_id) = slack.server_id.as_ref()
+                && ui.button(&labels.choose_workspace).clicked()
+            {
+                offer_intent(
+                    intent,
+                    ConnectorIntent::ChooseSlackWorkspace(server_id.clone()),
+                );
+            }
+
+            if let Some(kind) = slack.recovery {
+                if let Some(server_id) = slack.server_id.as_ref() {
+                    if ui.button(slack_recovery_label(kind, labels)).clicked() {
+                        offer_intent(
+                            intent,
+                            ConnectorIntent::OpenSlackRecovery {
+                                server_id: server_id.clone(),
+                                kind,
+                            },
+                        );
+                    }
+                } else if kind == SlackRecoveryKind::ConfigureApp
+                    && ui.button(&labels.open_slack_settings).clicked()
+                {
+                    offer_intent(
+                        intent,
+                        ConnectorIntent::OpenExternalLink(ExternalLinkKind::SlackAppSettings),
+                    );
+                }
+            }
+        });
     });
 }
 
 fn render_server_overview(
     ui: &mut Ui,
     snapshot: &ConnectorSnapshot,
+    prepared: &PreparedDisplayCache,
     labels: &Labels,
     intent: &mut Option<ConnectorIntent>,
 ) {
@@ -215,7 +295,8 @@ fn render_server_overview(
         .id_salt("connector_server_overview")
         .max_height(SERVER_LIST_HEIGHT)
         .show_rows(ui, SERVER_ROW_HEIGHT, snapshot.servers.len(), |ui, rows| {
-            for server in &snapshot.servers[rows] {
+            for index in rows {
+                let server = &snapshot.servers[index];
                 let selected = snapshot.selected_server.as_ref() == Some(&server.id);
                 ui.horizontal(|ui| {
                     let response = ui.add_sized(
@@ -229,7 +310,7 @@ fn render_server_overview(
                         );
                     }
                     ui.label(connection_label(server.connection, labels));
-                    ui.label(server.tool_count.to_string());
+                    ui.label(&prepared.server_tool_counts[index]);
                     ui.label(&labels.tools);
                 });
             }
@@ -240,16 +321,16 @@ fn render_server_overview(
 fn render_selected_server(
     ui: &mut Ui,
     snapshot: &ConnectorSnapshot,
+    prepared: &PreparedDisplayCache,
     server: &ServerSummary,
     selected_config: Option<&ServerDraft>,
     labels: &Labels,
     server_form: &mut Option<ServerFormDraft>,
     invoke: &mut Option<InvokeDraft>,
-    oauth_client: &mut Option<OAuthClientDraft>,
     delete_server: &mut Option<DeleteServerDraft>,
     intent: &mut Option<ConnectorIntent>,
 ) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.heading(&server.name);
         ui.label(transport_label(server.transport, labels));
         if ui.button(&labels.discover).clicked() {
@@ -262,9 +343,6 @@ fn render_selected_server(
         }
         if ui.button(&labels.authorize).clicked() {
             offer_intent(intent, ConnectorIntent::BeginOAuth(server.id.clone()));
-        }
-        if ui.button(&labels.oauth_client).clicked() {
-            *oauth_client = Some(OAuthClientDraft::new(server));
         }
         if ui.button(&labels.delete).clicked() {
             *delete_server = Some(DeleteServerDraft {
@@ -279,7 +357,7 @@ fn render_selected_server(
         .as_ref()
         .filter(|page| page.server_id == server.id);
     if let Some(page) = matching_page {
-        render_tool_page(ui, page, labels, invoke, intent);
+        render_tool_page(ui, page, &prepared.tool_total, labels, invoke, intent);
     } else {
         ui.weak(&labels.tools_not_loaded);
         if ui.button(&labels.load_tools).clicked() {
@@ -297,13 +375,14 @@ fn render_selected_server(
 fn render_tool_page(
     ui: &mut Ui,
     page: &ToolPage,
+    total_label: &str,
     labels: &Labels,
     invoke: &mut Option<InvokeDraft>,
     intent: &mut Option<ConnectorIntent>,
 ) {
     ui.horizontal(|ui| {
         ui.strong(&labels.tools);
-        ui.label(page.total.to_string());
+        ui.label(total_label);
     });
 
     let items: &[ToolListItem] = page.items.as_ref();
@@ -392,6 +471,126 @@ fn render_tool_row(
     );
 }
 
+fn render_import_controls(
+    ui: &mut Ui,
+    labels: &Labels,
+    paste_input: &mut String,
+    intent: &mut Option<ConnectorIntent>,
+) {
+    ui.strong(&labels.import_title);
+    ui.add(
+        TextEdit::multiline(paste_input)
+            .desired_rows(3)
+            .char_limit(ResourceLimits::PRODUCTION_CEILING.import_input_bytes)
+            .hint_text(r#"{"mcpServers":{"name":{"command":"..."}}}"#),
+    );
+    truncate_utf8(
+        paste_input,
+        ResourceLimits::PRODUCTION_CEILING.import_input_bytes,
+    );
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(
+                !paste_input.trim().is_empty(),
+                Button::new(&labels.import_paste),
+            )
+            .clicked()
+        {
+            offer_intent(
+                intent,
+                ConnectorIntent::ImportConfiguration {
+                    source: ImportSource::Paste,
+                    display_name: None,
+                    contents: SensitiveInput::from(mem::take(paste_input)),
+                },
+            );
+        }
+        if ui.button(&labels.import_file).clicked() {
+            offer_intent(
+                intent,
+                ConnectorIntent::RequestImportSource(ImportSourceRequest::FilePicker),
+            );
+        }
+        if ui.button(&labels.import_claude).clicked() {
+            offer_intent(
+                intent,
+                ConnectorIntent::RequestImportSource(ImportSourceRequest::ClaudeDesktop),
+            );
+        }
+    });
+}
+
+fn render_import_report(
+    ui: &mut Ui,
+    report: &ImportReport,
+    prepared: &PreparedDisplayCache,
+    labels: &Labels,
+    intent: &mut Option<ConnectorIntent>,
+) {
+    ui.strong(&labels.import_report);
+    ui.label(&prepared.import_summary);
+    ScrollArea::vertical()
+        .id_salt(("connector_import_report", report.operation_id.as_str()))
+        .max_height(IMPORT_LIST_HEIGHT)
+        .show_rows(ui, IMPORT_ROW_HEIGHT, report.items.len(), |ui, rows| {
+            for index in rows {
+                record_rendered_import_row();
+                let item = &report.items[index];
+                ui.horizontal(|ui| {
+                    ui.strong(&item.name);
+                    ui.label(import_outcome_label(item.outcome, labels));
+                    if let Some(code) = item.error_code {
+                        ui.label(error_code_label(code));
+                    }
+                    if item.omitted_secret_env_count > 0 {
+                        ui.label(&prepared.import_omitted_counts[index]);
+                        ui.label(&labels.secret_env_omitted);
+                    }
+                });
+            }
+        });
+    if report.truncated {
+        ui.weak(&labels.truncated);
+    }
+    if ui.button(&labels.close_import_report).clicked() {
+        offer_intent(
+            intent,
+            ConnectorIntent::DismissImportReport(report.operation_id.clone()),
+        );
+    }
+}
+
+fn render_operations(
+    ui: &mut Ui,
+    snapshot: &ConnectorSnapshot,
+    prepared: &PreparedDisplayCache,
+    labels: &Labels,
+    intent: &mut Option<ConnectorIntent>,
+) {
+    ui.strong(&labels.operations);
+    ScrollArea::vertical()
+        .id_salt("connector_operations")
+        .max_height(OPERATION_LIST_HEIGHT)
+        .show_rows(
+            ui,
+            OPERATION_ROW_HEIGHT,
+            snapshot.operations.len(),
+            |ui, rows| {
+                for index in rows {
+                    let operation = &snapshot.operations[index];
+                    ui.horizontal(|ui| {
+                        ui.label(&prepared.operation_labels[index]);
+                        if operation_is_cancellable(operation)
+                            && ui.button(&labels.cancel_operation).clicked()
+                        {
+                            offer_intent(intent, ConnectorIntent::Cancel(operation.id.clone()));
+                        }
+                    });
+                }
+            },
+        );
+}
+
 fn render_add_server_modal(
     ui: &mut Ui,
     labels: &Labels,
@@ -468,7 +667,12 @@ fn render_invoke_modal(
             ui.add(
                 TextEdit::multiline(&mut current.arguments_json)
                     .code_editor()
+                    .char_limit(ResourceLimits::PRODUCTION_CEILING.tool_input_bytes)
                     .desired_rows(8),
+            );
+            truncate_utf8(
+                &mut current.arguments_json,
+                ResourceLimits::PRODUCTION_CEILING.tool_input_bytes,
             );
             ui.horizontal(|ui| {
                 close = ui.button(&labels.cancel).clicked();
@@ -485,59 +689,6 @@ fn render_invoke_modal(
                 server_id: current.server_id.clone(),
                 tool_id: current.tool_id.clone(),
                 arguments_json: SensitiveInput::from(mem::take(&mut current.arguments_json)),
-            },
-        );
-    }
-}
-
-fn render_oauth_modal(
-    ui: &mut Ui,
-    labels: &Labels,
-    draft: &mut Option<OAuthClientDraft>,
-    intent: &mut Option<ConnectorIntent>,
-) {
-    let Some(current) = draft.as_mut() else {
-        return;
-    };
-    let mut close = false;
-    let mut submit = false;
-    egui::Window::new(&labels.oauth_client)
-        .id(egui::Id::new("connector_oauth_client"))
-        .collapsible(false)
-        .show(ui.ctx(), |ui| {
-            ui.strong(&current.server_name);
-            ui.label(&labels.client_id);
-            ui.add(TextEdit::singleline(&mut current.client_id));
-            ui.label(&labels.client_secret);
-            ui.add(TextEdit::singleline(&mut current.client_secret).password(true));
-            ui.label(&labels.workspace_hint);
-            ui.add(TextEdit::singleline(&mut current.workspace_hint));
-            ui.horizontal(|ui| {
-                close = ui.button(&labels.cancel).clicked();
-                submit = ui
-                    .add_enabled(
-                        !current.client_id.trim().is_empty(),
-                        Button::new(&labels.save),
-                    )
-                    .clicked();
-            });
-        });
-    if close {
-        if let Some(operation_id) = current.operation_id.clone() {
-            offer_intent(intent, ConnectorIntent::Cancel(operation_id));
-        }
-        *draft = None;
-    } else if submit {
-        let mut current = draft.take().expect("draft exists while submitting OAuth");
-        let workspace_hint = trimmed_owned(mem::take(&mut current.workspace_hint));
-        offer_intent(
-            intent,
-            ConnectorIntent::SubmitOAuthClient {
-                operation_id: current.operation_id.clone(),
-                server_id: current.server_id.clone(),
-                client_id: mem::take(&mut current.client_id),
-                client_secret: SensitiveInput::from(mem::take(&mut current.client_secret)),
-                workspace_hint,
             },
         );
     }
@@ -592,7 +743,7 @@ fn render_approval_modal(
                 .show(ui, |ui| {
                     ui.monospace(&approval.arguments_preview);
                 });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 for (decision, label) in [
                     (ApprovalDecision::AllowOnce, labels.allow_once.as_str()),
                     (ApprovalDecision::AllowAlways, labels.allow_always.as_str()),
@@ -613,15 +764,300 @@ fn render_approval_modal(
         });
 }
 
+fn render_remote_trust_modal(
+    ui: &mut Ui,
+    labels: &Labels,
+    prompt: &RemoteTrustPrompt,
+    intent: &mut Option<ConnectorIntent>,
+) {
+    egui::Window::new(&labels.remote_trust)
+        .id(egui::Id::new("connector_remote_trust"))
+        .collapsible(false)
+        .resizable(false)
+        .show(ui.ctx(), |ui| {
+            ui.strong(&prompt.server_name);
+            ui.label(remote_trust_purpose_label(prompt.purpose, labels));
+            ui.monospace(prompt.display_endpoint.as_str());
+            ui.horizontal(|ui| {
+                if ui.button(&labels.trust_continue).clicked() {
+                    offer_intent(intent, remote_trust_intent(prompt, true));
+                }
+                if ui.button(&labels.deny_trust).clicked() {
+                    offer_intent(intent, remote_trust_intent(prompt, false));
+                }
+            });
+        });
+}
+
+fn remote_trust_intent(prompt: &RemoteTrustPrompt, accepted: bool) -> ConnectorIntent {
+    ConnectorIntent::ResolveRemoteTrust {
+        operation_id: prompt.operation_id.clone(),
+        config_revision: prompt.config_revision,
+        endpoint_fingerprint: prompt.endpoint_fingerprint.clone(),
+        accepted,
+    }
+}
+
+fn render_oauth_modal(
+    ui: &mut Ui,
+    labels: &Labels,
+    oauth: &OAuthUiState,
+    client_draft: &mut Option<OAuthClientDraft>,
+    intent: &mut Option<ConnectorIntent>,
+) {
+    egui::Window::new(&labels.oauth_title)
+        .id(egui::Id::new("connector_oauth"))
+        .collapsible(false)
+        .resizable(false)
+        .show(ui.ctx(), |ui| {
+            ui.strong(&oauth.server_name);
+            match &oauth.phase {
+                OAuthUiPhase::DiscoveringAuth => {
+                    render_waiting(ui, &labels.oauth_discovering);
+                    render_oauth_cancel(ui, labels, oauth, intent);
+                }
+                OAuthUiPhase::AwaitingConsent {
+                    authority,
+                    resource,
+                    scopes,
+                } => {
+                    ui.label(&labels.oauth_consent);
+                    ui.label(&labels.authority);
+                    ui.monospace(authority.as_str());
+                    ui.label(&labels.resource);
+                    ui.monospace(resource.as_str());
+                    if !scopes.is_empty() {
+                        ui.label(&labels.scopes);
+                        ScrollArea::vertical()
+                            .id_salt(("connector_oauth_scopes", oauth.operation_id.as_str()))
+                            .max_height(OAUTH_SCOPE_LIST_HEIGHT)
+                            .show_rows(ui, OAUTH_SCOPE_ROW_HEIGHT, scopes.len(), |ui, rows| {
+                                for scope in &scopes[rows] {
+                                    ui.monospace(scope);
+                                }
+                            });
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button(&labels.oauth_continue).clicked() {
+                            offer_intent(
+                                intent,
+                                ConnectorIntent::ResolveOAuthConsent {
+                                    operation_id: oauth.operation_id.clone(),
+                                    config_revision: oauth.config_revision,
+                                    accepted: true,
+                                },
+                            );
+                        }
+                        if ui.button(&labels.oauth_deny).clicked() {
+                            offer_intent(
+                                intent,
+                                ConnectorIntent::ResolveOAuthConsent {
+                                    operation_id: oauth.operation_id.clone(),
+                                    config_revision: oauth.config_revision,
+                                    accepted: false,
+                                },
+                            );
+                        }
+                    });
+                }
+                OAuthUiPhase::AwaitingClient {
+                    reason,
+                    workspace_hint,
+                } => {
+                    ui.label(error_code_label(*reason));
+                    if let Some(hint) = workspace_hint.as_deref() {
+                        ui.weak(hint);
+                    }
+                    render_oauth_client_form(ui, labels, oauth, client_draft, intent);
+                }
+                OAuthUiPhase::PreparingCallback => {
+                    render_waiting(ui, &labels.oauth_preparing_callback);
+                    render_oauth_cancel(ui, labels, oauth, intent);
+                }
+                OAuthUiPhase::BrowserReady => {
+                    render_waiting(ui, &labels.oauth_browser_ready);
+                    ui.weak(&labels.oauth_browser_host_action);
+                    render_oauth_cancel(ui, labels, oauth, intent);
+                }
+                OAuthUiPhase::AwaitingCallback => {
+                    render_waiting(ui, &labels.oauth_waiting_callback);
+                    render_oauth_cancel(ui, labels, oauth, intent);
+                }
+                OAuthUiPhase::Failed {
+                    error_code,
+                    recovery,
+                } => {
+                    ui.colored_label(ui.visuals().error_fg_color, error_code_label(*error_code));
+                    ui.horizontal_wrapped(|ui| {
+                        for action in recovery.iter().copied() {
+                            if ui.button(oauth_recovery_label(action, labels)).clicked() {
+                                offer_intent(
+                                    intent,
+                                    ConnectorIntent::ResolveOAuthRecovery {
+                                        operation_id: oauth.operation_id.clone(),
+                                        action,
+                                    },
+                                );
+                            }
+                        }
+                        if ui.button(&labels.close).clicked() {
+                            offer_intent(
+                                intent,
+                                ConnectorIntent::Cancel(oauth.operation_id.clone()),
+                            );
+                        }
+                    });
+                }
+            }
+        });
+}
+
+fn render_oauth_client_form(
+    ui: &mut Ui,
+    labels: &Labels,
+    oauth: &OAuthUiState,
+    draft: &mut Option<OAuthClientDraft>,
+    intent: &mut Option<ConnectorIntent>,
+) {
+    let Some(current) = draft.as_mut() else {
+        ui.label(&labels.oauth_client_unavailable);
+        return;
+    };
+    ui.label(&labels.client_id);
+    ui.add(
+        TextEdit::singleline(&mut current.client_id)
+            .char_limit(ResourceLimits::PRODUCTION_CEILING.import_input_bytes / 2),
+    );
+    ui.label(&labels.client_secret);
+    ui.add(
+        TextEdit::singleline(&mut current.client_secret)
+            .password(true)
+            .char_limit(ResourceLimits::PRODUCTION_CEILING.tool_input_bytes),
+    );
+    ui.label(&labels.workspace_hint);
+    ui.add(
+        TextEdit::singleline(&mut current.workspace_hint)
+            .char_limit(ResourceLimits::PRODUCTION_CEILING.import_input_bytes / 2),
+    );
+    truncate_utf8(
+        &mut current.client_id,
+        ResourceLimits::PRODUCTION_CEILING.import_input_bytes / 2,
+    );
+    truncate_utf8(
+        &mut current.client_secret,
+        ResourceLimits::PRODUCTION_CEILING.tool_input_bytes,
+    );
+    truncate_utf8(
+        &mut current.workspace_hint,
+        ResourceLimits::PRODUCTION_CEILING.import_input_bytes / 2,
+    );
+    let can_submit = !current.client_id.trim().is_empty();
+    let mut submit = false;
+    let mut cancel = false;
+    ui.horizontal(|ui| {
+        submit = ui
+            .add_enabled(can_submit, Button::new(&labels.save_client))
+            .clicked();
+        cancel = ui.button(&labels.cancel).clicked();
+    });
+    if submit {
+        let mut submitted = draft.take().expect("OAuth client draft exists");
+        let workspace_hint = if submitted.workspace_hint.trim().is_empty() {
+            zero_string(&mut submitted.workspace_hint);
+            None
+        } else {
+            Some(mem::take(&mut submitted.workspace_hint))
+        };
+        offer_intent(
+            intent,
+            ConnectorIntent::SubmitOAuthClient {
+                operation_id: submitted.operation_id.clone(),
+                config_revision: submitted.config_revision,
+                server_id: submitted.server_id.clone(),
+                client_id: mem::take(&mut submitted.client_id),
+                client_secret: SensitiveInput::from(mem::take(&mut submitted.client_secret)),
+                workspace_hint,
+            },
+        );
+    } else if cancel {
+        offer_intent(intent, ConnectorIntent::Cancel(oauth.operation_id.clone()));
+        *draft = None;
+    }
+}
+
+fn render_waiting(ui: &mut Ui, text: &str) {
+    ui.horizontal(|ui| {
+        ui.spinner();
+        ui.label(text);
+    });
+}
+
+fn render_oauth_cancel(
+    ui: &mut Ui,
+    labels: &Labels,
+    oauth: &OAuthUiState,
+    intent: &mut Option<ConnectorIntent>,
+) {
+    if ui.button(&labels.cancel).clicked() {
+        offer_intent(intent, ConnectorIntent::Cancel(oauth.operation_id.clone()));
+    }
+}
+
+fn sync_oauth_client_draft(draft: &mut Option<OAuthClientDraft>, oauth: Option<&OAuthUiState>) {
+    let Some(oauth) = oauth else {
+        *draft = None;
+        return;
+    };
+    let OAuthUiPhase::AwaitingClient { .. } = &oauth.phase else {
+        *draft = None;
+        return;
+    };
+    let matches = draft.as_ref().is_some_and(|current| {
+        current.operation_id == oauth.operation_id
+            && current.config_revision == oauth.config_revision
+            && current.server_id == oauth.server_id
+    });
+    if !matches {
+        *draft = Some(OAuthClientDraft::from_state(oauth));
+    }
+}
+
 fn offer_intent(slot: &mut Option<ConnectorIntent>, intent: ConnectorIntent) {
     if slot.is_none() {
         *slot = Some(intent);
     }
 }
 
-fn trimmed_owned(value: String) -> Option<String> {
-    let trimmed = value.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+fn truncate_utf8(value: &mut String, maximum_bytes: usize) {
+    if value.len() <= maximum_bytes {
+        return;
+    }
+    let mut end = maximum_bytes;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value.truncate(end);
+}
+
+fn slack_connect_enabled(status: SlackStatus) -> bool {
+    matches!(
+        status,
+        SlackStatus::NotConfigured
+            | SlackStatus::Ready
+            | SlackStatus::NeedsAuthorization
+            | SlackStatus::Failed
+    )
+}
+
+fn operation_is_cancellable(operation: &OperationSummary) -> bool {
+    !matches!(
+        operation.phase,
+        OperationPhase::Succeeded
+            | OperationPhase::Failed
+            | OperationPhase::Unknown
+            | OperationPhase::Denied
+            | OperationPhase::Cancelled
+    )
 }
 
 fn connection_label(state: ConnectionState, labels: &Labels) -> &str {
@@ -632,6 +1068,25 @@ fn connection_label(state: ConnectionState, labels: &Labels) -> &str {
         ConnectionState::NeedsAuthorization => &labels.needs_authorization,
         ConnectionState::Connected => &labels.connected,
         ConnectionState::Failed => &labels.failed,
+    }
+}
+
+fn slack_status_label(status: SlackStatus, labels: &Labels) -> &str {
+    match status {
+        SlackStatus::NotConfigured => &labels.not_configured,
+        SlackStatus::Ready => &labels.ready,
+        SlackStatus::Checking => &labels.checking,
+        SlackStatus::NeedsAuthorization => &labels.needs_authorization,
+        SlackStatus::Connected => &labels.connected,
+        SlackStatus::Failed => &labels.failed,
+    }
+}
+
+fn slack_recovery_label(kind: SlackRecoveryKind, labels: &Labels) -> &str {
+    match kind {
+        SlackRecoveryKind::ConfigureApp => &labels.configure_slack_app,
+        SlackRecoveryKind::EnableMcpAccess => &labels.enable_slack_mcp,
+        SlackRecoveryKind::RetryAuthorization => &labels.retry_authorization,
     }
 }
 
@@ -655,6 +1110,162 @@ fn approval_reason_label<'a>(approval: &ApprovalPrompt, labels: &'a Labels) -> &
         connector_contract::ApprovalReason::AskRule => &labels.approval_ask,
         connector_contract::ApprovalReason::FirstUse => &labels.approval_first_use,
         connector_contract::ApprovalReason::SchemaChanged => &labels.approval_schema_changed,
+    }
+}
+
+fn remote_trust_purpose_label(purpose: RemoteTrustPurpose, labels: &Labels) -> &str {
+    match purpose {
+        RemoteTrustPurpose::Discover => &labels.trust_discover,
+        RemoteTrustPurpose::Invoke => &labels.trust_invoke,
+        RemoteTrustPurpose::OAuth => &labels.trust_oauth,
+    }
+}
+
+fn import_outcome_label(outcome: ImportOutcome, labels: &Labels) -> &str {
+    match outcome {
+        ImportOutcome::Added => &labels.import_added,
+        ImportOutcome::SkippedDuplicate => &labels.import_duplicate,
+        ImportOutcome::SkippedUnsupported => &labels.import_unsupported,
+        ImportOutcome::Failed => &labels.import_failed,
+    }
+}
+
+fn oauth_recovery_label(action: OAuthRecoveryAction, labels: &Labels) -> &str {
+    match action {
+        OAuthRecoveryAction::Retry => &labels.retry_oauth,
+        OAuthRecoveryAction::ChooseWorkspace => &labels.choose_workspace,
+        OAuthRecoveryAction::OpenSlackMcpSettings => &labels.enable_slack_mcp,
+    }
+}
+
+fn operation_kind_label(kind: OperationKind) -> &'static str {
+    match kind {
+        OperationKind::Trust => "Trust",
+        OperationKind::Discover => "Discover",
+        OperationKind::Invoke => "Tool call",
+        OperationKind::OAuth => "OAuth",
+        OperationKind::Import => "Import",
+        OperationKind::SaveServer => "Save server",
+        OperationKind::DeleteServer => "Delete server",
+        OperationKind::UpdatePermission => "Permission",
+    }
+}
+
+fn operation_phase_label(phase: OperationPhase) -> &'static str {
+    match phase {
+        OperationPhase::Queued => "Queued",
+        OperationPhase::Validating => "Validating",
+        OperationPhase::AwaitingTrust => "Awaiting trust",
+        OperationPhase::DiscoveringSchema => "Discovering schema",
+        OperationPhase::DiscoveringAuth => "Discovering authorization",
+        OperationPhase::AwaitingConsent => "Awaiting consent",
+        OperationPhase::AwaitingClient => "Awaiting client",
+        OperationPhase::PreparingCallback => "Preparing callback",
+        OperationPhase::BrowserReady => "Browser ready",
+        OperationPhase::AwaitingCallback => "Awaiting callback",
+        OperationPhase::Authorizing => "Authorizing",
+        OperationPhase::AuditPreflight => "Audit preflight",
+        OperationPhase::Calling => "Calling",
+        OperationPhase::Persisting => "Persisting",
+        OperationPhase::Succeeded => "Succeeded",
+        OperationPhase::Failed => "Failed",
+        OperationPhase::Unknown => "Delivery unknown",
+        OperationPhase::Denied => "Denied",
+        OperationPhase::Cancelled => "Cancelled",
+    }
+}
+
+fn error_code_label(code: ErrorCode) -> &'static str {
+    match code {
+        ErrorCode::InvalidInput => "Invalid input",
+        ErrorCode::InvalidUrl => "Invalid URL",
+        ErrorCode::LimitExceeded => "Resource limit exceeded",
+        ErrorCode::Backpressure => "Too many pending operations",
+        ErrorCode::StorageUnavailable => "Storage unavailable",
+        ErrorCode::SecretUnavailable => "Credential unavailable",
+        ErrorCode::TrustDenied => "Remote trust denied",
+        ErrorCode::HostUnavailable => "Host action unavailable",
+        ErrorCode::PermissionDenied => "Permission denied",
+        ErrorCode::AuditUnavailable => "Audit unavailable",
+        ErrorCode::AuthenticationRequired => "Authentication required",
+        ErrorCode::AuthenticationFailed => "Authentication failed",
+        ErrorCode::OAuthCallbackFailed => "OAuth callback failed",
+        ErrorCode::NetworkTimeout => "Network timeout",
+        ErrorCode::TransportFailed => "Transport failed",
+        ErrorCode::ProtocolViolation => "Protocol violation",
+        ErrorCode::StaleResult => "Stale result discarded",
+        ErrorCode::Cancelled => "Cancelled",
+        ErrorCode::UnknownDelivery => "Delivery status unknown; not retried",
+        ErrorCode::Internal => "Internal error",
+    }
+}
+
+#[derive(Default)]
+struct PreparedDisplayCache {
+    revision: Option<Revision>,
+    slack_tool_count: String,
+    server_tool_counts: Vec<String>,
+    tool_total: String,
+    import_summary: String,
+    import_omitted_counts: Vec<String>,
+    operation_labels: Vec<String>,
+    rebuild_count: usize,
+}
+
+impl PreparedDisplayCache {
+    fn invalidate(&mut self) {
+        self.revision = None;
+    }
+
+    fn prepare(&mut self, snapshot: &ConnectorSnapshot) {
+        if self.revision == Some(snapshot.revision) {
+            return;
+        }
+        self.revision = Some(snapshot.revision);
+        self.rebuild_count = self.rebuild_count.saturating_add(1);
+
+        self.slack_tool_count = snapshot.slack.tool_count.to_string();
+        self.server_tool_counts.clear();
+        self.server_tool_counts.extend(
+            snapshot
+                .servers
+                .iter()
+                .map(|server| server.tool_count.to_string()),
+        );
+        self.tool_total = snapshot
+            .tool_page
+            .as_ref()
+            .map_or_else(String::new, |page| page.total.to_string());
+
+        self.import_summary.clear();
+        self.import_omitted_counts.clear();
+        if let Some(report) = snapshot.import_report.as_ref() {
+            self.import_summary = format!(
+                "{} added · {} skipped · {} failed",
+                report.added, report.skipped, report.failed
+            );
+            self.import_omitted_counts.extend(
+                report
+                    .items
+                    .iter()
+                    .map(|item| item.omitted_secret_env_count.to_string()),
+            );
+        }
+
+        self.operation_labels.clear();
+        self.operation_labels
+            .extend(snapshot.operations.iter().map(|operation| {
+                let mut label = format!(
+                    "{} · {}",
+                    operation_kind_label(operation.kind),
+                    operation_phase_label(operation.phase)
+                );
+                if let Some(code) = operation.error_code {
+                    label.push_str(" · ");
+                    label.push_str(error_code_label(code));
+                }
+                label
+            }));
     }
 }
 
@@ -787,6 +1398,12 @@ struct InvokeDraft {
     arguments_json: String,
 }
 
+impl std::fmt::Debug for InvokeDraft {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("InvokeDraft(REDACTED)")
+    }
+}
+
 impl Drop for InvokeDraft {
     fn drop(&mut self) {
         zero_string(&mut self.arguments_json);
@@ -794,41 +1411,38 @@ impl Drop for InvokeDraft {
 }
 
 struct OAuthClientDraft {
-    operation_id: Option<OperationId>,
+    operation_id: connector_contract::OperationId,
+    config_revision: Revision,
     server_id: ServerId,
-    server_name: String,
     client_id: String,
     client_secret: String,
     workspace_hint: String,
 }
 
+impl std::fmt::Debug for OAuthClientDraft {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OAuthClientDraft(REDACTED)")
+    }
+}
+
 impl OAuthClientDraft {
-    fn new(server: &ServerSummary) -> Self {
+    fn from_state(oauth: &OAuthUiState) -> Self {
         Self {
-            operation_id: None,
-            server_id: server.id.clone(),
-            server_name: server.name.clone(),
+            operation_id: oauth.operation_id.clone(),
+            config_revision: oauth.config_revision,
+            server_id: oauth.server_id.clone(),
             client_id: String::new(),
             client_secret: String::new(),
             workspace_hint: String::new(),
-        }
-    }
-
-    fn from_prompt(prompt: &OAuthClientPrompt) -> Self {
-        Self {
-            operation_id: Some(prompt.operation_id.clone()),
-            server_id: prompt.server_id.clone(),
-            server_name: prompt.server_name.clone(),
-            client_id: String::new(),
-            client_secret: String::new(),
-            workspace_hint: prompt.workspace_hint.clone().unwrap_or_default(),
         }
     }
 }
 
 impl Drop for OAuthClientDraft {
     fn drop(&mut self) {
+        zero_string(&mut self.client_id);
         zero_string(&mut self.client_secret);
+        zero_string(&mut self.workspace_hint);
     }
 }
 
@@ -849,9 +1463,24 @@ fn zero_string(value: &mut String) {
 struct Labels {
     title: String,
     add_server: String,
+    import_title: String,
+    import_paste: String,
     import_file: String,
+    import_claude: String,
+    import_report: String,
+    close_import_report: String,
+    import_added: String,
+    import_duplicate: String,
+    import_unsupported: String,
+    import_failed: String,
+    secret_env_omitted: String,
     open_slack_settings: String,
-    configure: String,
+    connect_slack: String,
+    choose_workspace: String,
+    configure_slack_app: String,
+    enable_slack_mcp: String,
+    retry_authorization: String,
+    workspace: String,
     refresh: String,
     empty: String,
     ready: String,
@@ -866,7 +1495,6 @@ struct Labels {
     discover: String,
     edit: String,
     authorize: String,
-    oauth_client: String,
     delete: String,
     tools_not_loaded: String,
     load_tools: String,
@@ -891,6 +1519,7 @@ struct Labels {
     client_id: String,
     client_secret: String,
     workspace_hint: String,
+    save_client: String,
     approval_needed: String,
     approval_ask: String,
     approval_first_use: String,
@@ -899,6 +1528,28 @@ struct Labels {
     allow_always: String,
     deny_once: String,
     deny_always: String,
+    remote_trust: String,
+    trust_continue: String,
+    deny_trust: String,
+    trust_discover: String,
+    trust_invoke: String,
+    trust_oauth: String,
+    oauth_title: String,
+    oauth_discovering: String,
+    oauth_consent: String,
+    oauth_continue: String,
+    oauth_deny: String,
+    oauth_preparing_callback: String,
+    oauth_browser_ready: String,
+    oauth_browser_host_action: String,
+    oauth_waiting_callback: String,
+    oauth_client_unavailable: String,
+    authority: String,
+    resource: String,
+    scopes: String,
+    retry_oauth: String,
+    operations: String,
+    cancel_operation: String,
 }
 
 impl Labels {
@@ -906,9 +1557,24 @@ impl Labels {
         Self {
             title: catalog.t("connectors.local_mcp", &[]),
             add_server: catalog.t("connectors.add_mcp", &[]),
+            import_title: catalog.t("connectors.import_title", &[]),
+            import_paste: "Import pasted JSON".to_owned(),
             import_file: catalog.t("connectors.import_file", &[]),
+            import_claude: catalog.t("connectors.import_claude_desktop", &[]),
+            import_report: "Import report".to_owned(),
+            close_import_report: "Close import report".to_owned(),
+            import_added: "Added".to_owned(),
+            import_duplicate: "Skipped: duplicate".to_owned(),
+            import_unsupported: "Skipped: unsupported".to_owned(),
+            import_failed: "Failed".to_owned(),
+            secret_env_omitted: "secret environment entries omitted".to_owned(),
             open_slack_settings: catalog.t("connectors.slack.open_app_settings", &[]),
-            configure: "Set up Slack".to_owned(),
+            connect_slack: "Connect Slack".to_owned(),
+            choose_workspace: "Choose another workspace".to_owned(),
+            configure_slack_app: "Configure Slack app".to_owned(),
+            enable_slack_mcp: "Enable Slack MCP access".to_owned(),
+            retry_authorization: "Retry Slack authorization".to_owned(),
+            workspace: "Workspace:".to_owned(),
             refresh: "Refresh".to_owned(),
             empty: catalog.t("connectors.empty_mcp", &[]),
             ready: catalog.t("connectors.slack.ready", &[]),
@@ -923,7 +1589,6 @@ impl Labels {
             discover: catalog.t("connectors.test", &[]),
             edit: "Edit".to_owned(),
             authorize: catalog.t("connectors.approve_browser", &[]),
-            oauth_client: catalog.t("connectors.oauth_flow_title", &[]),
             delete: catalog.t("action.delete", &[]),
             tools_not_loaded: catalog.t("connectors.unchecked", &[]),
             load_tools: "Load tools".to_owned(),
@@ -948,6 +1613,7 @@ impl Labels {
             client_id: catalog.t("connectors.client_id", &[]),
             client_secret: catalog.t("connectors.client_secret", &[]),
             workspace_hint: catalog.t("connectors.slack.workspace_address", &[]),
+            save_client: "Save client and continue".to_owned(),
             approval_needed: catalog.t("connectors.approval_needed", &[("reason", "")]),
             approval_ask: catalog.t("connectors.approval.ask_rule", &[]),
             approval_first_use: catalog.t("connectors.approval.first_use", &[]),
@@ -956,6 +1622,29 @@ impl Labels {
             allow_always: catalog.t("connectors.allow_always", &[]),
             deny_once: catalog.t("connectors.deny_once", &[]),
             deny_always: catalog.t("connectors.deny_always", &[]),
+            remote_trust: "Trust remote endpoint".to_owned(),
+            trust_continue: "Trust and continue".to_owned(),
+            deny_trust: "Deny remote endpoint".to_owned(),
+            trust_discover: "This endpoint will receive a schema discovery request.".to_owned(),
+            trust_invoke: "This endpoint will receive tool arguments.".to_owned(),
+            trust_oauth: "This endpoint will begin OAuth discovery.".to_owned(),
+            oauth_title: catalog.t("connectors.oauth_flow_title", &[]),
+            oauth_discovering: "Discovering authorization".to_owned(),
+            oauth_consent: "Review the authorization authority before continuing.".to_owned(),
+            oauth_continue: "Continue to authorization".to_owned(),
+            oauth_deny: "Deny authorization".to_owned(),
+            oauth_preparing_callback: "Preparing local OAuth callback".to_owned(),
+            oauth_browser_ready: "Authorization browser is ready".to_owned(),
+            oauth_browser_host_action: "The app host is opening the approved authorization URL."
+                .to_owned(),
+            oauth_waiting_callback: "Waiting for OAuth callback".to_owned(),
+            oauth_client_unavailable: "OAuth client input is unavailable.".to_owned(),
+            authority: "Authorization authority".to_owned(),
+            resource: "Resource".to_owned(),
+            scopes: "Requested scopes".to_owned(),
+            retry_oauth: "Retry OAuth".to_owned(),
+            operations: "Active operations".to_owned(),
+            cancel_operation: "Cancel operation".to_owned(),
         }
     }
 }
@@ -963,6 +1652,7 @@ impl Labels {
 #[cfg(test)]
 thread_local! {
     static RENDERED_TOOL_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RENDERED_IMPORT_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[inline]
@@ -971,17 +1661,32 @@ fn record_rendered_tool_row() {
     RENDERED_TOOL_ROWS.with(|count| count.set(count.get().saturating_add(1)));
 }
 
+#[inline]
+fn record_rendered_import_row() {
+    #[cfg(test)]
+    RENDERED_IMPORT_ROWS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use connector_contract::{
-        ConnectorSnapshot, OAuthClientPrompt, OperationId, PermissionRule, Revision, ServerDraft,
-        ServerId, ServerSummary, SlackStatus, ToolId, ToolListItem, ToolPage, TransportDraft,
-        TransportKind,
+        EndpointDisplay, EndpointFingerprint, ImportReportItem, OperationId, SlackProjection,
+        ToolId,
     };
 
     use super::*;
+
+    fn raw_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 720.0),
+            )),
+            ..Default::default()
+        }
+    }
 
     fn snapshot_with_tools(tool_count: usize) -> ConnectorSnapshot {
         let server_id = ServerId::new("server-1");
@@ -997,8 +1702,11 @@ mod tests {
         ConnectorSnapshot {
             revision: Revision(7),
             config_revision: Revision(3),
-            slack_status: SlackStatus::Connected,
-            slack_tool_count: 4,
+            slack: SlackProjection {
+                status: SlackStatus::Connected,
+                tool_count: 4,
+                ..SlackProjection::default()
+            },
             servers: Arc::from([ServerSummary {
                 id: server_id.clone(),
                 name: "Fake server".to_owned(),
@@ -1019,13 +1727,13 @@ mod tests {
         }
     }
 
-    fn raw_input() -> egui::RawInput {
-        egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(900.0, 720.0),
-            )),
-            ..Default::default()
+    fn oauth_state(phase: OAuthUiPhase) -> OAuthUiState {
+        OAuthUiState {
+            operation_id: OperationId::new("oauth-op-1"),
+            server_id: ServerId::new("server-1"),
+            server_name: "Slack".to_owned(),
+            config_revision: Revision(9),
+            phase,
         }
     }
 
@@ -1064,32 +1772,246 @@ mod tests {
         emitted
     }
 
-    #[test]
-    fn headless_snapshot_exposes_accessible_server_and_tool_labels() {
+    fn accessible_labels(snapshot: &ConnectorSnapshot) -> Vec<String> {
         let context = egui::Context::default();
         context.enable_accesskit();
         let catalog = Catalog::load("en-US").unwrap();
         let mut connector_ui = ConnectorUi::new(&catalog);
-        let snapshot = snapshot_with_tools(16);
-
         let output = context.run_ui(raw_input(), |ui| {
-            assert!(connector_ui.render(ui, &snapshot).is_none());
+            assert!(connector_ui.render(ui, snapshot).is_none());
         });
-        let update = output
+        output
             .platform_output
             .accesskit_update
-            .expect("AccessKit output");
-        let accessible_text: Vec<&str> = update
+            .expect("AccessKit output")
             .nodes
             .iter()
-            .filter_map(|(_, node)| node.label().or_else(|| node.value()))
-            .collect();
+            .filter_map(|(_, node)| node.label().or_else(|| node.value()).map(str::to_owned))
+            .collect()
+    }
 
-        assert!(accessible_text.contains(&"Fake server"));
-        assert!(accessible_text.contains(&"Accessible tool 0"));
-        assert!(accessible_text.contains(&"Call"));
-        assert!(accessible_text.contains(&"From JSON file..."));
-        assert!(accessible_text.contains(&"Open Slack app settings"));
+    #[test]
+    fn remote_trust_accept_and_deny_preserve_all_correlations() {
+        let fingerprint = EndpointFingerprint::parse("a".repeat(64)).unwrap();
+        let snapshot = ConnectorSnapshot {
+            revision: Revision(1),
+            remote_trust: Some(RemoteTrustPrompt {
+                operation_id: OperationId::new("trust-op"),
+                server_id: ServerId::new("remote"),
+                server_name: "Remote".to_owned(),
+                purpose: RemoteTrustPurpose::Invoke,
+                display_endpoint: EndpointDisplay::new("https://example.test/mcp"),
+                endpoint_fingerprint: fingerprint.clone(),
+                config_revision: Revision(4),
+            }),
+            ..ConnectorSnapshot::default()
+        };
+        let catalog = Catalog::load("en-US").unwrap();
+        let mut ui = ConnectorUi::new(&catalog);
+        let accepted = activate_accessible_label(&mut ui, &snapshot, "Trust and continue");
+        assert!(matches!(
+            accepted,
+            Some(ConnectorIntent::ResolveRemoteTrust {
+                operation_id,
+                config_revision: Revision(4),
+                endpoint_fingerprint,
+                accepted: true,
+            }) if operation_id.as_str() == "trust-op" && endpoint_fingerprint == fingerprint
+        ));
+
+        let mut ui = ConnectorUi::new(&catalog);
+        assert!(matches!(
+            activate_accessible_label(&mut ui, &snapshot, "Deny remote endpoint"),
+            Some(ConnectorIntent::ResolveRemoteTrust {
+                operation_id,
+                config_revision: Revision(4),
+                accepted: false,
+                ..
+            }) if operation_id.as_str() == "trust-op"
+        ));
+    }
+
+    #[test]
+    fn oauth_consent_and_client_submission_are_operation_and_config_bound() {
+        let consent = ConnectorSnapshot {
+            revision: Revision(2),
+            oauth: Some(oauth_state(OAuthUiPhase::AwaitingConsent {
+                authority: EndpointDisplay::new("https://auth.example.test"),
+                resource: EndpointDisplay::new("https://mcp.example.test"),
+                scopes: Arc::from(["tools.read".to_owned(), "tools.call".to_owned()]),
+            })),
+            ..ConnectorSnapshot::default()
+        };
+        let catalog = Catalog::load("en-US").unwrap();
+        let mut ui = ConnectorUi::new(&catalog);
+        assert!(matches!(
+            activate_accessible_label(&mut ui, &consent, "Continue to authorization"),
+            Some(ConnectorIntent::ResolveOAuthConsent {
+                operation_id,
+                config_revision: Revision(9),
+                accepted: true,
+            }) if operation_id.as_str() == "oauth-op-1"
+        ));
+
+        let awaiting_client = ConnectorSnapshot {
+            revision: Revision(3),
+            oauth: Some(oauth_state(OAuthUiPhase::AwaitingClient {
+                reason: ErrorCode::AuthenticationRequired,
+                workspace_hint: Some("example.slack.com".to_owned()),
+            })),
+            ..ConnectorSnapshot::default()
+        };
+        let mut ui = ConnectorUi::new(&catalog);
+        let _ = egui::Context::default().run_ui(raw_input(), |egui_ui| {
+            assert!(ui.render(egui_ui, &awaiting_client).is_none());
+        });
+        let draft = ui.oauth_client.as_mut().expect("client draft");
+        draft.client_id = "client-id".to_owned();
+        draft.client_secret = "client-secret".to_owned();
+        draft.workspace_hint = "example.slack.com".to_owned();
+        let submitted =
+            activate_accessible_label(&mut ui, &awaiting_client, "Save client and continue");
+        match submitted {
+            Some(ConnectorIntent::SubmitOAuthClient {
+                operation_id,
+                config_revision,
+                server_id,
+                client_id,
+                client_secret,
+                workspace_hint,
+            }) => {
+                assert_eq!(operation_id.as_str(), "oauth-op-1");
+                assert_eq!(config_revision, Revision(9));
+                assert_eq!(server_id.as_str(), "server-1");
+                assert_eq!(client_id, "client-id");
+                assert_eq!(client_secret.expose_bytes(), b"client-secret");
+                assert_eq!(workspace_hint.as_deref(), Some("example.slack.com"));
+            }
+            other => panic!("unexpected intent: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oauth_browser_callback_failure_and_recovery_are_rendered_without_raw_url_intents() {
+        for (phase, visible) in [
+            (OAuthUiPhase::DiscoveringAuth, "Discovering authorization"),
+            (
+                OAuthUiPhase::PreparingCallback,
+                "Preparing local OAuth callback",
+            ),
+            (OAuthUiPhase::BrowserReady, "Authorization browser is ready"),
+            (OAuthUiPhase::AwaitingCallback, "Waiting for OAuth callback"),
+        ] {
+            let snapshot = ConnectorSnapshot {
+                revision: Revision(5),
+                oauth: Some(oauth_state(phase)),
+                ..ConnectorSnapshot::default()
+            };
+            assert!(
+                accessible_labels(&snapshot)
+                    .iter()
+                    .any(|label| label == visible)
+            );
+        }
+
+        let failed = ConnectorSnapshot {
+            revision: Revision(6),
+            oauth: Some(oauth_state(OAuthUiPhase::Failed {
+                error_code: ErrorCode::OAuthCallbackFailed,
+                recovery: Arc::from([
+                    OAuthRecoveryAction::Retry,
+                    OAuthRecoveryAction::ChooseWorkspace,
+                    OAuthRecoveryAction::OpenSlackMcpSettings,
+                ]),
+            })),
+            ..ConnectorSnapshot::default()
+        };
+        let catalog = Catalog::load("en-US").unwrap();
+        let mut ui = ConnectorUi::new(&catalog);
+        assert!(matches!(
+            activate_accessible_label(&mut ui, &failed, "Retry OAuth"),
+            Some(ConnectorIntent::ResolveOAuthRecovery {
+                operation_id,
+                action: OAuthRecoveryAction::Retry,
+            }) if operation_id.as_str() == "oauth-op-1"
+        ));
+    }
+
+    #[test]
+    fn slack_projection_emits_connect_workspace_and_typed_recovery_intents() {
+        let catalog = Catalog::load("en-US").unwrap();
+        let mut ui = ConnectorUi::new(&catalog);
+        assert!(matches!(
+            activate_accessible_label(&mut ui, &ConnectorSnapshot::default(), "Connect Slack"),
+            Some(ConnectorIntent::ConnectSlack)
+        ));
+
+        let connected = ConnectorSnapshot {
+            revision: Revision(2),
+            slack: SlackProjection {
+                server_id: Some(ServerId::new("slack")),
+                status: SlackStatus::Connected,
+                tool_count: 12,
+                workspace_label: Some("example.slack.com".to_owned()),
+                can_choose_workspace: true,
+                recovery: Some(SlackRecoveryKind::EnableMcpAccess),
+            },
+            ..ConnectorSnapshot::default()
+        };
+        let mut ui = ConnectorUi::new(&catalog);
+        assert!(matches!(
+            activate_accessible_label(&mut ui, &connected, "Choose another workspace"),
+            Some(ConnectorIntent::ChooseSlackWorkspace(server_id))
+                if server_id.as_str() == "slack"
+        ));
+        let mut ui = ConnectorUi::new(&catalog);
+        assert!(matches!(
+            activate_accessible_label(&mut ui, &connected, "Enable Slack MCP access"),
+            Some(ConnectorIntent::OpenSlackRecovery {
+                server_id,
+                kind: SlackRecoveryKind::EnableMcpAccess,
+            }) if server_id.as_str() == "slack"
+        ));
+    }
+
+    #[test]
+    fn paste_moves_sensitive_input_and_file_claude_and_links_are_typed_intents() {
+        let catalog = Catalog::load("en-US").unwrap();
+        let snapshot = ConnectorSnapshot::default();
+        let mut ui = ConnectorUi::new(&catalog);
+        ui.paste_input = "{\"mcpServers\":{}}".to_owned();
+        match activate_accessible_label(&mut ui, &snapshot, "Import pasted JSON") {
+            Some(ConnectorIntent::ImportConfiguration {
+                source: ImportSource::Paste,
+                display_name: None,
+                contents,
+            }) => assert_eq!(contents.expose_bytes(), b"{\"mcpServers\":{}}"),
+            other => panic!("unexpected intent: {other:?}"),
+        }
+        assert!(ui.paste_input.is_empty());
+
+        let mut ui = ConnectorUi::new(&catalog);
+        assert!(matches!(
+            activate_accessible_label(&mut ui, &snapshot, "From JSON file..."),
+            Some(ConnectorIntent::RequestImportSource(
+                ImportSourceRequest::FilePicker
+            ))
+        ));
+        let mut ui = ConnectorUi::new(&catalog);
+        let import_claude_label = ui.labels.import_claude.clone();
+        assert!(matches!(
+            activate_accessible_label(&mut ui, &snapshot, &import_claude_label),
+            Some(ConnectorIntent::RequestImportSource(
+                ImportSourceRequest::ClaudeDesktop
+            ))
+        ));
+        let mut ui = ConnectorUi::new(&catalog);
+        assert!(matches!(
+            activate_accessible_label(&mut ui, &snapshot, "Open Slack app settings"),
+            Some(ConnectorIntent::OpenExternalLink(
+                ExternalLinkKind::SlackAppSettings
+            ))
+        ));
     }
 
     #[test]
@@ -1097,131 +2019,189 @@ mod tests {
         RENDERED_TOOL_ROWS.with(|count| count.set(0));
         let context = egui::Context::default();
         let catalog = Catalog::load("en-US").unwrap();
-        let mut connector_ui = ConnectorUi::new(&catalog);
+        let mut ui = ConnectorUi::new(&catalog);
         let snapshot = snapshot_with_tools(4_096);
-        let page_items = snapshot.tool_page.as_ref().unwrap().items.clone();
+        let page_items = &snapshot.tool_page.as_ref().unwrap().items;
+        let pointer = Arc::as_ptr(page_items);
 
-        let _ = context.run_ui(raw_input(), |ui| {
-            assert!(connector_ui.render(ui, &snapshot).is_none());
+        let _ = context.run_ui(raw_input(), |egui_ui| {
+            assert!(ui.render(egui_ui, &snapshot).is_none());
         });
 
         let rendered = RENDERED_TOOL_ROWS.with(std::cell::Cell::get);
         let maximum_visible_with_overscan = (TOOL_LIST_HEIGHT / TOOL_ROW_HEIGHT) as usize + 2;
         assert!(rendered > 0);
-        assert!(
-            rendered <= maximum_visible_with_overscan,
-            "rendered {rendered} rows from a 4096-row fixture"
+        assert!(rendered <= maximum_visible_with_overscan);
+        assert_eq!(
+            pointer,
+            Arc::as_ptr(&snapshot.tool_page.as_ref().unwrap().items)
         );
-        assert!(Arc::ptr_eq(
-            &page_items,
-            &snapshot.tool_page.as_ref().unwrap().items
-        ));
     }
 
     #[test]
-    fn unmatched_tool_page_is_not_rendered_for_selected_server() {
-        RENDERED_TOOL_ROWS.with(|count| count.set(0));
-        let context = egui::Context::default();
-        let catalog = Catalog::load("en-US").unwrap();
-        let mut connector_ui = ConnectorUi::new(&catalog);
-        let mut snapshot = snapshot_with_tools(32);
-        snapshot.tool_page.as_mut().unwrap().server_id = ServerId::new("different-server");
-
-        let _ = context.run_ui(raw_input(), |ui| {
-            assert!(connector_ui.render(ui, &snapshot).is_none());
-        });
-        assert_eq!(RENDERED_TOOL_ROWS.with(std::cell::Cell::get), 0);
-    }
-
-    #[test]
-    fn file_picker_and_external_url_are_intents_not_platform_commands() {
-        let catalog = Catalog::load("en-US").unwrap();
-        let snapshot = ConnectorSnapshot::default();
-        let mut connector_ui = ConnectorUi::new(&catalog);
-        assert!(matches!(
-            activate_accessible_label(&mut connector_ui, &snapshot, "From JSON file..."),
-            Some(ConnectorIntent::RequestImportPicker)
-        ));
-
-        let mut connector_ui = ConnectorUi::new(&catalog);
-        let intent =
-            activate_accessible_label(&mut connector_ui, &snapshot, "Open Slack app settings");
-        assert!(matches!(
-            intent,
-            Some(ConnectorIntent::OpenExternalUrl { url })
-                if url == SLACK_APP_SETTINGS_URL
-        ));
-    }
-
-    #[test]
-    fn unconfigured_slack_emits_the_same_intent_boundary() {
-        let catalog = Catalog::load("en-US").unwrap();
-        let snapshot = ConnectorSnapshot::default();
-        let mut connector_ui = ConnectorUi::new(&catalog);
-        assert!(matches!(
-            activate_accessible_label(&mut connector_ui, &snapshot, "Set up Slack"),
-            Some(ConnectorIntent::EnsureSlackServer)
-        ));
-    }
-
-    #[test]
-    fn oauth_prompt_cancel_preserves_operation_correlation() {
-        let catalog = Catalog::load("en-US").unwrap();
+    fn two_hundred_fifty_six_import_rows_are_virtualized() {
+        RENDERED_IMPORT_ROWS.with(|count| count.set(0));
+        let items: Arc<[ImportReportItem]> = (0..256)
+            .map(|index| ImportReportItem {
+                name: format!("server-{index}"),
+                outcome: ImportOutcome::Added,
+                error_code: None,
+                omitted_secret_env_count: 0,
+            })
+            .collect::<Vec<_>>()
+            .into();
         let snapshot = ConnectorSnapshot {
-            oauth_client_prompt: Some(OAuthClientPrompt {
-                operation_id: OperationId::new("oauth-op-1"),
-                server_id: ServerId::new("server-1"),
-                server_name: "Slack".to_owned(),
-                workspace_hint: Some("example.slack.com".to_owned()),
-                reason: Some("manual_client_required".to_owned()),
+            revision: Revision(10),
+            import_report: Some(ImportReport {
+                operation_id: OperationId::new("import-op"),
+                source: ImportSource::File,
+                added: 256,
+                skipped: 0,
+                failed: 0,
+                items,
+                truncated: false,
             }),
             ..ConnectorSnapshot::default()
         };
-        let mut connector_ui = ConnectorUi::new(&catalog);
+        let context = egui::Context::default();
+        let catalog = Catalog::load("en-US").unwrap();
+        let mut ui = ConnectorUi::new(&catalog);
+        let _ = context.run_ui(raw_input(), |egui_ui| {
+            assert!(ui.render(egui_ui, &snapshot).is_none());
+        });
+        let rendered = RENDERED_IMPORT_ROWS.with(std::cell::Cell::get);
+        let maximum_visible_with_overscan = (IMPORT_LIST_HEIGHT / IMPORT_ROW_HEIGHT) as usize + 2;
+        assert!(rendered > 0);
+        assert!(rendered <= maximum_visible_with_overscan);
+    }
+
+    #[test]
+    fn operations_are_visible_and_unknown_delivery_never_offers_retry_or_cancel() {
+        let snapshot = ConnectorSnapshot {
+            revision: Revision(11),
+            operations: Arc::from([
+                OperationSummary {
+                    id: OperationId::new("running"),
+                    server_id: ServerId::new("server"),
+                    kind: OperationKind::Invoke,
+                    phase: OperationPhase::Calling,
+                    error_code: None,
+                },
+                OperationSummary {
+                    id: OperationId::new("unknown"),
+                    server_id: ServerId::new("server"),
+                    kind: OperationKind::Invoke,
+                    phase: OperationPhase::Unknown,
+                    error_code: Some(ErrorCode::UnknownDelivery),
+                },
+            ]),
+            ..ConnectorSnapshot::default()
+        };
+        let labels = accessible_labels(&snapshot);
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("Delivery unknown"))
+        );
+        assert!(!labels.iter().any(|label| label.contains("Retry")));
+
+        let catalog = Catalog::load("en-US").unwrap();
+        let mut ui = ConnectorUi::new(&catalog);
         assert!(matches!(
-            activate_accessible_label(&mut connector_ui, &snapshot, "Cancel"),
+            activate_accessible_label(&mut ui, &snapshot, "Cancel operation"),
+            Some(ConnectorIntent::Cancel(operation_id)) if operation_id.as_str() == "running"
+        ));
+    }
+
+    #[test]
+    fn identical_revision_three_hundred_frames_do_not_rebuild_display_cache() {
+        let snapshot = ConnectorSnapshot::default();
+        let context = egui::Context::default();
+        let catalog = Catalog::load("en-US").unwrap();
+        let mut ui = ConnectorUi::new(&catalog);
+        let _ = context.run_ui(raw_input(), |egui_ui| {
+            assert!(ui.render(egui_ui, &snapshot).is_none());
+        });
+        assert_eq!(ui.prepared.rebuild_count, 1);
+
+        for _ in 0..300 {
+            let _ = context.run_ui(raw_input(), |egui_ui| {
+                assert!(ui.render(egui_ui, &snapshot).is_none());
+            });
+        }
+        assert_eq!(ui.prepared.rebuild_count, 1);
+    }
+
+    #[test]
+    fn secret_bearing_drafts_have_redacted_debug_and_owned_buffers_are_wipeable() {
+        let invoke = InvokeDraft {
+            server_id: ServerId::new("server"),
+            tool_id: ToolId::new("tool"),
+            tool_name: "tool".to_owned(),
+            arguments_json: "{\"token\":\"invoke-secret\"}".to_owned(),
+        };
+        assert_eq!(format!("{invoke:?}"), "InvokeDraft(REDACTED)");
+
+        let oauth = oauth_state(OAuthUiPhase::AwaitingClient {
+            reason: ErrorCode::AuthenticationRequired,
+            workspace_hint: None,
+        });
+        let mut client = OAuthClientDraft::from_state(&oauth);
+        client.client_id = "private-client".to_owned();
+        client.client_secret = "oauth-secret".to_owned();
+        client.workspace_hint = "private-workspace".to_owned();
+        assert_eq!(format!("{client:?}"), "OAuthClientDraft(REDACTED)");
+
+        let catalog = Catalog::load("en-US").unwrap();
+        let mut ui = ConnectorUi::new(&catalog);
+        ui.paste_input = "client_secret=paste-secret".to_owned();
+        assert_eq!(format!("{ui:?}"), "ConnectorUi(REDACTED)");
+
+        let mut owned = "wipe-me".to_owned();
+        zero_string(&mut owned);
+        assert!(owned.as_bytes().iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn tool_and_oauth_drafts_move_or_drop_sensitive_buffers_on_user_action() {
+        let catalog = Catalog::load("en-US").unwrap();
+        let snapshot = ConnectorSnapshot::default();
+        let mut ui = ConnectorUi::new(&catalog);
+        ui.invoke = Some(InvokeDraft {
+            server_id: ServerId::new("server"),
+            tool_id: ToolId::new("tool"),
+            tool_name: "tool".to_owned(),
+            arguments_json: "{\"token\":\"move-once\"}".to_owned(),
+        });
+        let invoke_label = ui.labels.invoke.clone();
+        match activate_accessible_label(&mut ui, &snapshot, &invoke_label) {
+            Some(ConnectorIntent::InvokeTool { arguments_json, .. }) => {
+                assert_eq!(arguments_json.expose_bytes(), b"{\"token\":\"move-once\"}");
+            }
+            other => panic!("unexpected intent: {other:?}"),
+        }
+        assert!(ui.invoke.is_none());
+
+        let awaiting_client = ConnectorSnapshot {
+            revision: Revision(15),
+            oauth: Some(oauth_state(OAuthUiPhase::AwaitingClient {
+                reason: ErrorCode::AuthenticationRequired,
+                workspace_hint: None,
+            })),
+            ..ConnectorSnapshot::default()
+        };
+        let mut ui = ConnectorUi::new(&catalog);
+        let _ = egui::Context::default().run_ui(raw_input(), |egui_ui| {
+            assert!(ui.render(egui_ui, &awaiting_client).is_none());
+        });
+        ui.oauth_client.as_mut().unwrap().client_secret = "drop-on-cancel".to_owned();
+        let cancel_label = ui.labels.cancel.clone();
+        assert!(matches!(
+            activate_accessible_label(&mut ui, &awaiting_client, &cancel_label),
             Some(ConnectorIntent::Cancel(operation_id))
                 if operation_id.as_str() == "oauth-op-1"
         ));
-    }
-
-    #[test]
-    fn selected_server_requests_its_tool_page_only_after_explicit_action() {
-        let catalog = Catalog::load("en-US").unwrap();
-        let mut connector_ui = ConnectorUi::new(&catalog);
-        let mut snapshot = snapshot_with_tools(16);
-        snapshot.tool_page = None;
-
-        let intent = activate_accessible_label(&mut connector_ui, &snapshot, "Load tools");
-        assert!(matches!(
-            intent,
-            Some(ConnectorIntent::RequestToolPage { server_id, offset: 0 })
-                if server_id.as_str() == "server-1"
-        ));
-    }
-
-    #[test]
-    fn renderer_returns_only_one_intent_slot() {
-        let mut intent = None;
-        offer_intent(&mut intent, ConnectorIntent::Activate);
-        offer_intent(&mut intent, ConnectorIntent::RequestImportPicker);
-        assert!(matches!(intent, Some(ConnectorIntent::Activate)));
-    }
-
-    #[test]
-    fn stdio_form_allocates_arguments_only_when_saved() {
-        let draft = ServerFormDraft {
-            name: "local".to_owned(),
-            transport: FormTransport::Stdio,
-            command: "example".to_owned(),
-            arguments: "--one\n\n --two ".to_owned(),
-            ..ServerFormDraft::default()
-        };
-        let saved = draft.into_contract();
-        let TransportDraft::Stdio { args, .. } = saved.transport else {
-            panic!("expected stdio draft");
-        };
-        assert_eq!(args, ["--one", "--two"]);
+        assert!(ui.oauth_client.is_none());
     }
 
     #[test]

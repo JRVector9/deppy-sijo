@@ -1,0 +1,34 @@
+# Pending installation at `.github/workflows/bg01-deterministic.yml` by credentials with the
+# GitHub `workflow` scope. Kept outside `.github/workflows` so the source/gate checkpoint can be
+# pushed by the current least-privilege OAuth credential.
+name: BG01 deterministic gate
+
+on:
+  pull_request:
+  push:
+    branches: [main, codex/connector-refactor]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bg01-deterministic-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deterministic:
+    name: Boundary, security, failure, and regression gates
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Restore Cargo build cache
+        uses: Swatinem/rust-cache@v2
+      - name: Run BG01 deterministic gate
+        run: cargo run --locked -p xtask -- bg01-deterministic-gate

@@ -24,13 +24,17 @@
 //! `cargo run -p xtask -- i18n-check`
 //!   필수 locale key completeness, fallback, CJK path, layout smoke tests를 실행한다.
 //!
-//! Cargo.toml의 `path = "../<dir>"` 로컬 의존만 본다(외부 crate는 무관). crate 식별은
+//! `cargo run -p xtask -- bg01-deterministic-gate`
+//!   하드웨어 실측과 실제 외부 계정 smoke를 제외한 BG01 production gate를 한 번에 실행한다.
+//!
+//! Cargo metadata가 해석한 모든 workspace-local 의존을 본다(외부 crate는 무관). crate 식별은
 //! 디렉터리명 기준(예: crates/core의 패키지명은 deppy-core지만 여기선 "core").
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
+use quote::ToTokens as _;
 
 /// 금지 의존 edge (from → to, 디렉터리명 기준). 아직 존재하지 않는 crate가 규칙에
 /// 있어도 된다 — 생기는 순간부터 검사된다 (v2.8 §3.3/§5.2를 코드화).
@@ -108,10 +112,46 @@ fn main() -> anyhow::Result<()> {
         "perf-smoke" => perf_smoke(),
         "od01-failure-matrix" => od01_failure_matrix(),
         "i18n-check" => i18n_check(),
+        "bg01-deterministic-gate" => bg01_deterministic_gate(),
         other => bail!(
-            "알 수 없는 명령 '{other}' — 사용법: cargo run -p xtask -- check-deps|check-boundary|smoke-db-migrations|security-scan|perf-smoke|od01-failure-matrix|i18n-check"
+            "알 수 없는 명령 '{other}' — 사용법: cargo run -p xtask -- check-deps|check-boundary|smoke-db-migrations|security-scan|perf-smoke|od01-failure-matrix|i18n-check|bg01-deterministic-gate"
         ),
     }
+}
+
+fn bg01_deterministic_gate() -> anyhow::Result<()> {
+    // Keep this fail-fast and deterministic. Wall-clock soak, hardware frame/RSS measurements,
+    // trusted signing, and real external-account smoke are explicit release gates outside CI.
+    check_boundary()?;
+    check_deps()?;
+    run_cargo(&["fmt", "--all", "--", "--check"])?;
+    run_cargo(&["check", "--workspace", "--all-targets", "--locked"])?;
+    run_cargo(&[
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings",
+    ])?;
+    smoke_db_migrations()?;
+    security_scan()?;
+    perf_smoke()?;
+    od01_failure_matrix()?;
+    i18n_check()?;
+    run_cargo(&[
+        "test",
+        "--workspace",
+        "--no-fail-fast",
+        "--locked",
+        "--",
+        "--test-threads=1",
+    ])?;
+    println!(
+        "bg01-deterministic-gate OK — structural, security, failure, performance smoke, and workspace regressions"
+    );
+    Ok(())
 }
 
 fn smoke_db_migrations() -> anyhow::Result<()> {
@@ -450,6 +490,25 @@ const BOUNDARY_RULES: &[BoundaryRule] = &[
     },
 ];
 
+const LEAF_SEMANTIC_RULES: &[BoundaryRule] = &[
+    BoundaryRule {
+        pattern: "storage::",
+        label: "leaf UI must not access the storage crate",
+    },
+    BoundaryRule {
+        pattern: "mcp::",
+        label: "leaf UI must not access the MCP transport crate",
+    },
+    BoundaryRule {
+        pattern: "audit::",
+        label: "leaf UI must not access the audit crate",
+    },
+    BoundaryRule {
+        pattern: "secret::",
+        label: "leaf UI must not access the secret crate",
+    },
+];
+
 fn check_boundary() -> anyhow::Result<()> {
     let root = workspace_root()?;
     let mut violations = Vec::new();
@@ -486,6 +545,7 @@ fn check_boundary() -> anyhow::Result<()> {
                 ));
             }
         }
+        check_leaf_semantic_boundary(&rel, &content, &mut violations)?;
     }
 
     check_session_secret_boundary(&root, &mut violations)?;
@@ -506,6 +566,64 @@ fn check_boundary() -> anyhow::Result<()> {
     }
 }
 
+fn check_leaf_semantic_boundary(
+    rel: &str,
+    source: &str,
+    violations: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    let syntax = syn::parse_file(source).with_context(|| format!("{rel} Rust syntax 파싱 실패"))?;
+    for item in syntax.items {
+        let compact = item
+            .into_token_stream()
+            .to_string()
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        if top_level_item_is_test_only(&compact) {
+            continue;
+        }
+        for rule in LEAF_SEMANTIC_RULES {
+            if compact.contains(rule.pattern) {
+                violations.push(format!(
+                    "{rel}: production syntax boundary violation: '{}' ({})",
+                    rule.pattern, rule.label
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn top_level_item_is_test_only(compact_tokens: &str) -> bool {
+    let mut remaining = compact_tokens;
+    while let Some(attributes) = remaining.strip_prefix("#[") {
+        let mut depth = 1usize;
+        let mut end = None;
+        for (index, character) in attributes.char_indices() {
+            match character {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else {
+            return false;
+        };
+        let attribute = &attributes[..end];
+        if attribute == "cfg(test)" {
+            return true;
+        }
+        remaining = &attributes[end + 1..];
+    }
+    false
+}
+
 fn check_app_composition_root_boundary(
     root: &Path,
     violations: &mut Vec<String>,
@@ -517,53 +635,67 @@ fn check_app_composition_root_boundary(
         }
         let rel = rel_path(root, &path)?;
         let source = std::fs::read_to_string(&path).with_context(|| format!("{rel} 읽기 실패"))?;
-        let test_region_start = source
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| *line == "#[cfg(test)]")
-            .map(|(idx, _)| idx)
-            .last();
-        const FORBIDDEN: &[(&str, &str)] = &[
-            (
-                "Db::open(",
-                "production concrete database construction belongs in app.rs",
-            ),
-            (
-                "use storage::Db",
-                "production concrete database ownership belongs in app.rs",
-            ),
-            (
-                "storage::Db",
-                "production concrete database ownership belongs in app.rs",
-            ),
-            (
-                "crate::storage",
-                "app-local concrete storage re-export shims are forbidden",
-            ),
-            (
-                "KeyringSecretStore",
-                "production concrete keyring ownership belongs in app.rs",
-            ),
-        ];
-        for (line_idx, line) in source.lines().enumerate() {
-            if test_region_start.is_some_and(|start| line_idx >= start) {
-                break;
-            }
-            for (pattern, reason) in FORBIDDEN {
-                if line.contains(pattern) {
-                    violations.push(format!(
-                        "{rel}:{}: composition-root violation: '{pattern}' ({reason})",
-                        line_idx + 1
-                    ));
-                }
-            }
-        }
+        check_app_composition_source(&rel, &source, violations)?;
     }
     if root.join("crates/app/src/storage.rs").exists() {
         violations.push(
             "crates/app/src/storage.rs: app-local concrete storage re-export shim is forbidden"
                 .to_owned(),
         );
+    }
+    Ok(())
+}
+
+fn check_app_composition_source(
+    rel: &str,
+    source: &str,
+    violations: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    const FORBIDDEN: &[(&str, &str)] = &[
+        (
+            "Db::open(",
+            "production concrete database construction belongs in app.rs",
+        ),
+        (
+            "use storage::Db",
+            "production concrete database ownership belongs in app.rs",
+        ),
+        (
+            "storage::Db",
+            "production concrete database ownership belongs in app.rs",
+        ),
+        (
+            "crate::storage",
+            "app-local concrete storage re-export shims are forbidden",
+        ),
+        (
+            "KeyringSecretStore",
+            "production concrete keyring ownership belongs in app.rs",
+        ),
+    ];
+    let syntax = syn::parse_file(source)
+        .with_context(|| format!("{rel} composition-root syntax parsing failed"))?;
+    for item in syntax.items {
+        let compact = item
+            .into_token_stream()
+            .to_string()
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        if top_level_item_is_test_only(&compact) {
+            continue;
+        }
+        for (pattern, reason) in FORBIDDEN {
+            let compact_pattern = pattern
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>();
+            if compact.contains(&compact_pattern) {
+                violations.push(format!(
+                    "{rel}: production syntax composition-root violation: '{pattern}' ({reason})"
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -893,60 +1025,99 @@ fn direct_dependency_names(crate_name: &str) -> anyhow::Result<Vec<String>> {
     Ok(dependencies)
 }
 
-/// crates/*/Cargo.toml + xtask에서 로컬 path 의존을 추출한다 (dev-dependencies 포함 —
-/// dev 경유 순환도 금지). 반환: 디렉터리명 → 의존 디렉터리명 목록.
+/// Cargo가 실제로 해석한 workspace metadata에서 로컬 의존을 추출한다. 직접 `path`와
+/// `{ workspace = true }`, dev/build/target dependency를 모두 포함하므로 manifest 표기법으로
+/// 금지 edge나 순환 검사를 우회할 수 없다. 반환: 디렉터리명 → 의존 디렉터리명 목록.
 fn local_dep_graph() -> anyhow::Result<BTreeMap<String, Vec<String>>> {
     let root = workspace_root()?;
-    let mut graph = BTreeMap::new();
-    let mut dirs: Vec<std::path::PathBuf> = std::fs::read_dir(root.join("crates"))
-        .context("crates/ 디렉터리 읽기 실패")?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.join("Cargo.toml").is_file())
-        .collect();
-    dirs.push(root.join("xtask"));
-
-    for dir in dirs {
+    let output = std::process::Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1", "--locked"])
+        .current_dir(&root)
+        .output()
+        .context("cargo metadata 실행 실패")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "cargo metadata 실패: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("cargo metadata JSON 파싱 실패")?;
+    let workspace_members = metadata["workspace_members"]
+        .as_array()
+        .context("cargo metadata workspace_members 없음")?
+        .iter()
+        .map(|member| {
+            member
+                .as_str()
+                .context("cargo metadata workspace member가 문자열이 아님")
+        })
+        .collect::<anyhow::Result<std::collections::BTreeSet<_>>>()?;
+    let packages = metadata["packages"]
+        .as_array()
+        .context("cargo metadata packages 없음")?;
+    let mut workspace_paths = BTreeMap::<PathBuf, String>::new();
+    for package in packages {
+        let id = package["id"]
+            .as_str()
+            .context("cargo metadata package id 없음")?;
+        if !workspace_members.contains(id) {
+            continue;
+        }
+        let manifest = PathBuf::from(
+            package["manifest_path"]
+                .as_str()
+                .context("cargo metadata manifest_path 없음")?,
+        );
+        let dir = manifest
+            .parent()
+            .context("workspace manifest parent 없음")?;
         let name = dir
             .file_name()
-            .and_then(|n| n.to_str())
-            .context("crate 디렉터리명 없음")?
+            .and_then(|value| value.to_str())
+            .context("workspace crate 디렉터리명 없음")?
             .to_owned();
-        let manifest = std::fs::read_to_string(dir.join("Cargo.toml"))
-            .with_context(|| format!("{name}/Cargo.toml 읽기 실패"))?;
-        // 의존 섹션([dependencies]/[dev-]/[build-]/target.*.dependencies) 안의,
-        // `../`로 시작하는 path만 edge로 본다 — `[[bin]] path = "src/main.rs"` 같은
-        // 비의존 라인 오탐 방지 (codex 리뷰).
-        let mut in_deps_section = false;
-        let mut deps = Vec::new();
-        for line in manifest.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with('[') {
-                in_deps_section = trimmed.contains("dependencies");
-                continue;
-            }
-            if !in_deps_section {
-                continue;
-            }
-            let Some((_, rest)) = trimmed.split_once("path") else {
+        workspace_paths.insert(dir.to_path_buf(), name);
+    }
+
+    let mut graph = workspace_paths
+        .values()
+        .cloned()
+        .map(|name| (name, Vec::new()))
+        .collect::<BTreeMap<_, _>>();
+    for package in packages {
+        let id = package["id"]
+            .as_str()
+            .context("cargo metadata package id 없음")?;
+        if !workspace_members.contains(id) {
+            continue;
+        }
+        let manifest = PathBuf::from(
+            package["manifest_path"]
+                .as_str()
+                .context("cargo metadata manifest_path 없음")?,
+        );
+        let package_dir = manifest
+            .parent()
+            .context("workspace manifest parent 없음")?;
+        let package_name = workspace_paths
+            .get(package_dir)
+            .context("workspace package directory mapping 없음")?;
+        let dependencies = package["dependencies"]
+            .as_array()
+            .context("cargo metadata dependencies 없음")?;
+        let edges = graph
+            .get_mut(package_name)
+            .context("workspace graph package 없음")?;
+        for dependency in dependencies {
+            let Some(path) = dependency["path"].as_str().map(PathBuf::from) else {
                 continue;
             };
-            let Some(rest) = rest.trim_start().strip_prefix('=') else {
-                continue;
-            };
-            let Some(rest) = rest.trim_start().strip_prefix('"') else {
-                continue;
-            };
-            let Some(target) = rest.split('"').next() else {
-                continue;
-            };
-            if !target.starts_with("../") {
-                continue;
-            }
-            if let Some(dep_dir) = Path::new(target).file_name().and_then(|n| n.to_str()) {
-                deps.push(dep_dir.to_owned());
+            if let Some(target) = workspace_paths.get(&path) {
+                edges.push(target.clone());
             }
         }
-        graph.insert(name, deps);
+        edges.sort();
+        edges.dedup();
     }
     Ok(graph)
 }
@@ -975,6 +1146,35 @@ mod tests {
     }
 
     #[test]
+    fn leaf_semantic_boundary는_test_item을제외하고뒤production도검사한다() {
+        let source = r#"
+#[cfg(test)]
+mod tests {
+    fn fixture() { let _ = storage::Db::open("test"); }
+}
+
+fn production_after_tests() {
+    let _ = storage::Db::open("production");
+}
+"#;
+        let mut violations = Vec::new();
+        check_leaf_semantic_boundary("fixture.rs", source, &mut violations).unwrap();
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("storage::"));
+
+        let tests_only = r#"
+/// Test module documentation.
+#[cfg(test)]
+mod tests {
+    fn fixture() { let _ = secret::KeyringSecretStore; }
+}
+"#;
+        violations.clear();
+        check_leaf_semantic_boundary("fixture.rs", tests_only, &mut violations).unwrap();
+        assert!(violations.is_empty());
+    }
+
+    #[test]
     fn production_app_concrete_stores는_app_rs에만_존재한다() {
         let root = workspace_root().unwrap();
         let mut violations = Vec::new();
@@ -983,11 +1183,37 @@ mod tests {
     }
 
     #[test]
+    fn composition_root_scan은_test_item을제외하고뒤production도검사한다() {
+        let source = r#"
+#[cfg(test)]
+mod tests {
+    fn fixture() { let _ = storage::Db::open("test"); }
+}
+
+fn production_after_tests() {
+    let _ = storage::Db::open("production");
+}
+"#;
+        let mut violations = Vec::new();
+        check_app_composition_source("fixture.rs", source, &mut violations).unwrap();
+        assert_eq!(violations.len(), 2);
+        assert!(
+            violations
+                .iter()
+                .all(|violation| violation.contains("production"))
+        );
+    }
+
+    #[test]
     fn 로컬_의존_그래프가_기대_edge를_담는다() {
         let graph = local_dep_graph().unwrap();
         // 실재하는 대표 edge 몇 개로 파서가 동작함을 고정
         assert!(graph["storage"].contains(&"mcp".to_owned()) || !graph["storage"].is_empty());
         assert!(graph["runtime"].contains(&"mux".to_owned()));
+        assert!(
+            graph["app"].contains(&"i18n".to_owned()),
+            "workspace-inherited local dependency must be present"
+        );
         assert!(graph.contains_key("xtask"));
     }
 

@@ -3947,6 +3947,10 @@ impl Worker {
         };
         self.approval_order.retain(|queued| queued != &operation_id);
         self.refresh_approval_snapshot();
+        // Approval resolution is an externally visible state transition of its own. Publish the
+        // removal before preflight can block or fail, so the UI cannot retain a stale prompt and a
+        // repeated resolve remains a fail-closed no-op while the audit write settles.
+        self.publish();
         if self.invocation_is_stale(&operation_id, &pending) {
             self.finish_operation_slot(&operation_id, JobStage::InvokeSchema);
             self.publish_stale(JobStage::InvokeSchema);
@@ -9523,6 +9527,7 @@ mod tests {
                 decision: ApprovalDecision::AllowOnce,
             })
             .unwrap();
+        wait_until(|| fixture.coordinator.current_snapshot().approval.is_none());
         wait_until(|| fixture.coordinator.metrics().active_mcp_operations == 0);
         assert_eq!(fixture.repo.preflights.load(Ordering::Acquire), 1);
         assert_eq!(fixture.mcp.invoke_calls.load(Ordering::Acquire), 0);

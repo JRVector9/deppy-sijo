@@ -46,10 +46,12 @@ timer, poller, or dependency.
 - Xtask composition-root/current-tree boundary suite: 9/9; strict Clippy passes.
 - `check-boundary`: zero allowlist capability.
 - `check-deps`: 23 crates, no forbidden edge or cycle.
-- Final app all-target check, strict Clippy, rustfmt, and diff-check will be recorded after the three
-  current shared-tree lanes freeze; this summary does not count the concurrent mid-edit run.
+- Final app all-target check, literal strict Clippy, full rustfmt, and diff-check passed at the
+  bounded AgentState cutover checkpoint. The subsequent CR01 source audit found no remaining
+  composition-root blocker, and the semantic gate now scans production items even after test-only
+  modules.
 
-## Remaining gate
+## Independent proxy composition root
 
 The independent `mcp-proxy` binary has its own composition root. Its sole concrete keyring
 construction is now in proxy `main.rs`; `BackendSession` receives an injected secret-store port and

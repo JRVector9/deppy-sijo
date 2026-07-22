@@ -246,3 +246,20 @@ before product behavior. The run also exposed a stale committed dotenv source-la
 still named the deleted synchronous resume helper. It now inspects `apply_resume_probe_results` and
 requires the completion-time dotenv source-stamp and shell-only guards around the tracked WriteInput
 process exception; the corrected integration test passes 5/5 and literal strict Clippy passes again.
+
+## Deterministic gate hardening
+
+The local dependency graph now comes from Cargo metadata rather than hand-parsing direct `path =
+"../..."` syntax, so workspace-inherited, target, build, and development dependencies cannot bypass
+the forbidden-edge or cycle checks. Leaf and composition-root scans parse complete Rust files and
+exclude only explicit test-only top-level items; production items appearing after a test module are
+still checked. There remains no boundary allowlist.
+
+`bg01-deterministic-gate` is the single fail-fast entry point for formatting, workspace all-target
+check, literal strict Clippy, migration smoke, security scan, exact performance smoke, the complete
+failure-injection matrix, i18n, and the serialized full-workspace regression run. The macOS CI
+workflow definition is preserved under `docs/build` because the current least-privilege GitHub OAuth
+credential cannot update `.github/workflows`; installing it there remains a credentialed BG01 action.
+Hardware Scenario A–E, wall-clock
+RSS/thread/socket slope, trusted Apple signing, and real external-account smoke deliberately remain
+separate release approvals rather than being reported as deterministic CI evidence.

@@ -30,6 +30,38 @@ const OPERATION_LIST_HEIGHT: f32 = OPERATION_ROW_HEIGHT * 5.0;
 const OAUTH_SCOPE_ROW_HEIGHT: f32 = 24.0;
 const OAUTH_SCOPE_LIST_HEIGHT: f32 = OAUTH_SCOPE_ROW_HEIGHT * 5.0;
 
+/// Pure UI presets: selecting one only copies static text into the unfinished add form.
+/// The filesystem root remains an explicit placeholder so this leaf never reads HOME or the
+/// filesystem while rendering.
+struct StdioPreset {
+    name: &'static str,
+    command: &'static str,
+    arguments: &'static str,
+}
+
+const STDIO_PRESETS: &[StdioPreset] = &[
+    StdioPreset {
+        name: "filesystem",
+        command: "npx",
+        arguments: "-y\n@modelcontextprotocol/server-filesystem\n/absolute/path/to/allowed/directory",
+    },
+    StdioPreset {
+        name: "memory",
+        command: "npx",
+        arguments: "-y\n@modelcontextprotocol/server-memory",
+    },
+    StdioPreset {
+        name: "fetch",
+        command: "uvx",
+        arguments: "mcp-server-fetch",
+    },
+    StdioPreset {
+        name: "everything",
+        command: "npx",
+        arguments: "-y\n@modelcontextprotocol/server-everything",
+    },
+];
+
 /// Stateful UI shell. State is limited to unfinished user drafts and derived display strings.
 pub struct ConnectorUi {
     labels: Labels,
@@ -71,6 +103,18 @@ impl ConnectorUi {
     pub fn set_catalog(&mut self, catalog: &Catalog) {
         self.labels = Labels::new(catalog);
         self.prepared.invalidate();
+    }
+
+    /// Removes every secret-bearing unfinished UI draft without disturbing non-sensitive add,
+    /// delete, selection, translation, or prepared-display state.
+    ///
+    /// Call this when the Connector surface becomes hidden or its owning workspace changes.
+    /// Service-owned operations are cancelled separately through [`ConnectorIntent::Cancel`].
+    pub fn clear_sensitive_drafts(&mut self) {
+        self.invoke = None;
+        self.oauth_client = None;
+        let mut paste_input = mem::take(&mut self.paste_input);
+        zero_string(&mut paste_input);
     }
 
     /// Renders one frame from an immutable snapshot and returns at most one intent.
@@ -625,6 +669,20 @@ fn render_add_server_modal(
                     ui.add(TextEdit::singleline(&mut current.url).hint_text("https://"));
                 }
                 FormTransport::Stdio => {
+                    if current.id.is_none() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(&labels.presets);
+                            for preset in STDIO_PRESETS {
+                                if ui
+                                    .small_button(preset.name)
+                                    .on_hover_text(&labels.preset_hint)
+                                    .clicked()
+                                {
+                                    current.apply_preset(preset);
+                                }
+                            }
+                        });
+                    }
                     ui.label(&labels.command);
                     ui.add(TextEdit::singleline(&mut current.command));
                     ui.label(&labels.arguments);
@@ -957,13 +1015,19 @@ fn render_oauth_client_form(
     let can_submit = !current.client_id.trim().is_empty();
     let mut submit = false;
     let mut cancel = false;
+    let open_slack_settings = ui.button(&labels.open_slack_settings).clicked();
     ui.horizontal(|ui| {
         submit = ui
             .add_enabled(can_submit, Button::new(&labels.save_client))
             .clicked();
         cancel = ui.button(&labels.cancel).clicked();
     });
-    if submit {
+    if open_slack_settings {
+        offer_intent(
+            intent,
+            ConnectorIntent::OpenExternalLink(ExternalLinkKind::SlackAppSettings),
+        );
+    } else if submit {
         let mut submitted = draft.take().expect("OAuth client draft exists");
         let workspace_hint = if submitted.workspace_hint.trim().is_empty() {
             zero_string(&mut submitted.workspace_hint);
@@ -1333,6 +1397,17 @@ impl Default for ServerFormDraft {
 }
 
 impl ServerFormDraft {
+    fn apply_preset(&mut self, preset: &StdioPreset) {
+        self.transport = FormTransport::Stdio;
+        self.name.clear();
+        self.name.push_str(preset.name);
+        self.command.clear();
+        self.command.push_str(preset.command);
+        self.arguments.clear();
+        self.arguments.push_str(preset.arguments);
+        self.url.clear();
+    }
+
     fn from_contract(config: &ServerDraft) -> Self {
         let (transport, url, command, arguments, plain_env, secret_env, inherit_env) =
             match &config.transport {
@@ -1532,6 +1607,8 @@ struct Labels {
     url: String,
     command: String,
     arguments: String,
+    presets: String,
+    preset_hint: String,
     enabled: String,
     cancel: String,
     save: String,
@@ -1675,6 +1752,8 @@ impl Labels {
             url: "URL".to_owned(),
             command: catalog.t("common.command", &[]),
             arguments: catalog.t("connectors.args_note", &[]),
+            presets: catalog.t("connectors.presets", &[]),
+            preset_hint: catalog.t("connectors.preset_hint", &[]),
             enabled: catalog.t("connector.status.enabled", &[]),
             cancel: catalog.t("action.cancel", &[]),
             save: catalog.t("action.save", &[]),
@@ -1938,6 +2017,8 @@ mod tests {
         "connector.action.load_tools",
         "connector.action.save_client_continue",
         "connector.action.cancel_operation",
+        "connectors.presets",
+        "connectors.preset_hint",
         "connector.status.failed",
         "connector.status.disabled",
         "connector.status.truncated",
@@ -2197,6 +2278,27 @@ mod tests {
             }
             other => panic!("unexpected intent: {other:?}"),
         }
+
+        let mut link_ui = ConnectorUi::new(&catalog);
+        let _ = egui::Context::default().run_ui(raw_input(), |egui_ui| {
+            assert!(link_ui.render(egui_ui, &awaiting_client).is_none());
+        });
+        let link_draft = link_ui.oauth_client.as_mut().expect("client draft");
+        link_draft.client_id = "kept-client-id".to_owned();
+        link_draft.client_secret = "kept-client-secret".to_owned();
+        let open_slack_settings = catalog.t("connectors.slack.open_app_settings", &[]);
+        assert!(matches!(
+            activate_accessible_label(&mut link_ui, &awaiting_client, &open_slack_settings),
+            Some(ConnectorIntent::OpenExternalLink(
+                ExternalLinkKind::SlackAppSettings
+            ))
+        ));
+        let link_draft = link_ui
+            .oauth_client
+            .as_ref()
+            .expect("preserved client draft");
+        assert_eq!(link_draft.client_id, "kept-client-id");
+        assert_eq!(link_draft.client_secret, "kept-client-secret");
     }
 
     #[test]
@@ -2477,6 +2579,78 @@ mod tests {
         let mut owned = "wipe-me".to_owned();
         zero_string(&mut owned);
         assert!(owned.as_bytes().iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn clear_sensitive_drafts_preserves_non_sensitive_ui_state() {
+        let catalog = Catalog::load("en-US").unwrap();
+        let mut ui = ConnectorUi::new(&catalog);
+        ui.prepared.revision = Some(Revision(31));
+        ui.add_server = Some(ServerFormDraft {
+            name: "preserved-add-draft".to_owned(),
+            ..ServerFormDraft::default()
+        });
+        ui.delete_server = Some(DeleteServerDraft {
+            server_id: ServerId::new("preserved-server"),
+            server_name: "Preserved server".to_owned(),
+        });
+        ui.invoke = Some(InvokeDraft {
+            server_id: ServerId::new("server"),
+            tool_id: ToolId::new("tool"),
+            tool_name: "tool".to_owned(),
+            arguments_json: "{\"token\":\"invoke-secret\"}".to_owned(),
+        });
+        let oauth = oauth_state(OAuthUiPhase::AwaitingClient {
+            reason: ErrorCode::AuthenticationRequired,
+            workspace_hint: None,
+        });
+        let mut oauth_client = OAuthClientDraft::from_state(&oauth);
+        oauth_client.client_secret = "oauth-secret".to_owned();
+        ui.oauth_client = Some(oauth_client);
+        ui.paste_input = "client_secret=paste-secret".to_owned();
+
+        ui.clear_sensitive_drafts();
+
+        assert!(ui.invoke.is_none());
+        assert!(ui.oauth_client.is_none());
+        assert!(ui.paste_input.is_empty());
+        assert_eq!(ui.paste_input.capacity(), 0);
+        assert_eq!(ui.prepared.revision, Some(Revision(31)));
+        assert_eq!(
+            ui.add_server.as_ref().map(|draft| draft.name.as_str()),
+            Some("preserved-add-draft")
+        );
+        assert_eq!(
+            ui.delete_server
+                .as_ref()
+                .map(|draft| draft.server_id.as_str()),
+            Some("preserved-server")
+        );
+    }
+
+    #[test]
+    fn stdio_presets_fill_only_the_local_add_draft() {
+        let catalog = Catalog::load("en-US").unwrap();
+        let mut ui = ConnectorUi::new(&catalog);
+        ui.add_server = Some(ServerFormDraft {
+            transport: FormTransport::Stdio,
+            ..ServerFormDraft::default()
+        });
+
+        assert!(
+            activate_accessible_label(&mut ui, &ConnectorSnapshot::default(), "filesystem")
+                .is_none()
+        );
+
+        let draft = ui.add_server.as_ref().expect("preserved add draft");
+        assert_eq!(draft.name, "filesystem");
+        assert_eq!(draft.command, "npx");
+        assert_eq!(
+            draft.arguments,
+            "-y\n@modelcontextprotocol/server-filesystem\n/absolute/path/to/allowed/directory"
+        );
+        assert_eq!(draft.transport, FormTransport::Stdio);
+        assert!(draft.id.is_none());
     }
 
     #[test]

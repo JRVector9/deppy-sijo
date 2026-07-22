@@ -1,5 +1,26 @@
 # PR-UI01 — Pure Connector UI and virtualization
 
+## 2026-07-22 cutover-parity amendment
+
+`ConnectorUi::clear_sensitive_drafts` now wipes and frees invocation arguments, OAuth client data,
+and the paste/import buffer while preserving non-sensitive add/delete/selection/catalog/display
+state. Service-owned operations remain separately cancellable, so a workspace change can clear UI
+secret RAM without rebuilding the entire surface or silently cancelling unrelated work.
+
+The manual OAuth client modal emits the existing typed Slack app-settings intent without consuming
+its draft. Four stdio presets are pure static UI data and copy into a new add draft only; they read
+no HOME/environment/filesystem state, create no worker, perform no I/O, and do not overwrite hidden
+bindings on an existing server edit. The filesystem preset deliberately retains an explicit path
+placeholder for the app/user to resolve.
+
+Root verification after the amendment:
+
+- `cargo test -p connector-ui`: 16/16 plus doc-tests passed.
+- All-target check and strict Clippy passed.
+- Package rustfmt and `git diff --check` passed.
+- Dependency and boundary gates passed with no forbidden edge/cycle and the unchanged 53 existing
+  exceptions.
+
 ## Outcome
 
 `connector-ui` is now a pure renderer over `connector-contract` snapshots. It emits at most one
@@ -53,7 +74,7 @@ Seven no-network `egui::Context::run_ui` tests cover:
 
 ## Verification
 
-- `cargo test -p connector-ui`: 7 passed, 0 failed; doc-tests 0 failed.
+- Original PR baseline: `cargo test -p connector-ui`: 7 passed, 0 failed; doc-tests 0 failed.
 - `cargo check -p connector-ui`: passed.
 - `cargo clippy -p connector-ui --all-targets -- -D warnings`: passed.
 - `cargo run -q -p xtask -- check-deps`: passed for 23 crates; forbidden edge/cycle count 0.

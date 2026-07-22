@@ -7,6 +7,26 @@ use sha2::{Digest as _, Sha256};
 
 const RESOLVED_APPROVAL_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 
+/// Runtime-generated approval session keys are `{workspace UUID}:{u64}`: at most 36 + 1 + 20
+/// bytes. Validate this borrowed input before opening a transaction or binding it to SQLite.
+pub const PENDING_APPROVAL_SESSION_KEY_BYTES_MAX: usize = 57;
+/// One session exit may resolve only this many pending approvals in one bounded transaction.
+pub const PENDING_APPROVAL_SESSION_CLEANUP_LIMIT_MAX: usize = 256;
+
+const SESSION_CLOSED_APPROVAL_ERROR_CODE: &str = "session_closed";
+
+fn validate_pending_approval_session_key(session_key: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !session_key.is_empty() && session_key.len() <= PENDING_APPROVAL_SESSION_KEY_BYTES_MAX,
+        "pending approval session key byte length invalid"
+    );
+    anyhow::ensure!(
+        deppy_core::parse_session_key(session_key).is_some(),
+        "pending approval session key invalid"
+    );
+    Ok(())
+}
+
 /// env 값. secret은 평문 대신 credentials.id만 참조한다 (설계문서 6.3).
 /// 평문 해석은 spawn 직전(PR-09)에만 일어난다.
 #[derive(Clone, PartialEq)]
@@ -161,6 +181,7 @@ impl std::fmt::Debug for ActiveAuthorizationOwner {
 /// 26: authorization scope/run ownership columns (PR-AU01).
 /// 27: durable Connector config revision + mutation triggers (PR-IN01 prerequisite).
 /// 28: exact physical secret-slot lifecycle ledger (PR-SC01 prerequisite).
+/// 29: exact pending-approval session cleanup index (event-driven session exit).
 /// 4~6은 각 crate가 소유한 DDL 상수를 그대로 붙인다 (스키마 정의는 한 곳에서만).
 pub(crate) const MIGRATIONS: &[&str] = &[
     "
@@ -580,6 +601,14 @@ WHERE keyring_username LIKE 'deppy.oauth.v1.%'
   AND length(CAST(keyring_username AS BLOB)) BETWEEN 1 AND 255
   AND instr(id, char(0)) = 0
   AND instr(keyring_username, char(0)) = 0;
+",
+    // v29: session exit cleanup addresses the runtime session key stored in pane_id. A partial
+    // index keeps the exact lookup independent of the retained 30-day resolved corpus, and rows
+    // leave the index automatically when their lifecycle becomes terminal.
+    "
+CREATE INDEX idx_pending_approvals_session_pending
+    ON pending_approvals(pane_id)
+    WHERE status = 'pending';
 ",
 ];
 
@@ -3071,6 +3100,58 @@ impl Db {
         mcp_store::expire_pending_approvals(&self.conn, older_than_epoch_secs, resolved_at)
     }
 
+    /// Ends pending approvals owned by one exact runtime session. The static
+    /// `session_closed` reason is represented durably by the terminal `denied` state and
+    /// `resolved_at`; no caller-controlled reason or identifier is persisted or logged.
+    ///
+    /// The candidate probe and update share one IMMEDIATE transaction. More than 256 candidates
+    /// fails closed without changing any row, resolved approvals remain first-writer-wins, and a
+    /// repeated cleanup returns zero.
+    pub fn deny_pending_approvals_for_session(
+        &self,
+        session_key: &str,
+        resolved_at: i64,
+    ) -> anyhow::Result<usize> {
+        validate_pending_approval_session_key(session_key)?;
+
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .context(SESSION_CLOSED_APPROVAL_ERROR_CODE)?;
+        let probe_limit = i64::try_from(PENDING_APPROVAL_SESSION_CLEANUP_LIMIT_MAX + 1)
+            .context(SESSION_CLOSED_APPROVAL_ERROR_CODE)?;
+        let candidate_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM (
+                     SELECT 1 FROM pending_approvals
+                     WHERE pane_id = ?1 AND status = 'pending'
+                     LIMIT ?2
+                 )",
+                (session_key, probe_limit),
+                |row| row.get(0),
+            )
+            .context(SESSION_CLOSED_APPROVAL_ERROR_CODE)?;
+        let candidate_count =
+            usize::try_from(candidate_count).context(SESSION_CLOSED_APPROVAL_ERROR_CODE)?;
+        anyhow::ensure!(
+            candidate_count <= PENDING_APPROVAL_SESSION_CLEANUP_LIMIT_MAX,
+            SESSION_CLOSED_APPROVAL_ERROR_CODE
+        );
+
+        let affected = tx
+            .execute(
+                "UPDATE pending_approvals
+                 SET status = 'denied', remember = 0, resolved_at = ?2
+                 WHERE pane_id = ?1 AND status = 'pending'",
+                (session_key, resolved_at),
+            )
+            .context(SESSION_CLOSED_APPROVAL_ERROR_CODE)?;
+        anyhow::ensure!(
+            affected == candidate_count,
+            SESSION_CLOSED_APPROVAL_ERROR_CODE
+        );
+        tx.commit().context(SESSION_CLOSED_APPROVAL_ERROR_CODE)?;
+        Ok(affected)
+    }
+
     pub fn prune_resolved_approvals(
         &self,
         resolved_before_epoch_secs: i64,
@@ -4148,6 +4229,214 @@ mod tests {
         );
         // 멱등: 재호출은 더 이상 pending이 없어 0
         assert_eq!(db.expire_pending_approvals(500, 700).unwrap(), 0);
+    }
+
+    #[test]
+    fn session_cleanup은_exact_pending만_denied로_하고_멱등이다() {
+        let db = Db::open_in_memory().unwrap();
+        let session = "315f68b6-333f-409f-a2c5-922b9eacfd7e:2";
+        let other_session = "315f68b6-333f-409f-a2c5-922b9eacfd7e:3";
+        for id in ["session-a", "session-b", "already-allowed"] {
+            db.insert_pending_approval(id, "srv", "tool", "{}", None, 100, Some(session))
+                .unwrap();
+        }
+        db.insert_pending_approval(
+            "other-session",
+            "srv",
+            "tool",
+            "{}",
+            None,
+            100,
+            Some(other_session),
+        )
+        .unwrap();
+        db.resolve_approval("already-allowed", true, true, 150)
+            .unwrap();
+
+        assert_eq!(
+            db.deny_pending_approvals_for_session(session, 200).unwrap(),
+            2
+        );
+        assert_eq!(
+            db.deny_pending_approvals_for_session(session, 300).unwrap(),
+            0
+        );
+        for id in ["session-a", "session-b"] {
+            assert_eq!(db.poll_approval(id).unwrap().status, ApprovalStatus::Denied);
+            let (remember, resolved_at): (i64, Option<i64>) = db
+                .conn
+                .query_row(
+                    "SELECT remember, resolved_at FROM pending_approvals WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((remember, resolved_at), (0, Some(200)));
+        }
+        assert_eq!(
+            db.poll_approval("other-session").unwrap().status,
+            ApprovalStatus::Pending
+        );
+        assert_eq!(
+            db.poll_approval("already-allowed").unwrap(),
+            ApprovalOutcome {
+                status: ApprovalStatus::Allowed,
+                remember: true,
+            }
+        );
+        let allowed_resolved_at: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT resolved_at FROM pending_approvals WHERE id = 'already-allowed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(allowed_resolved_at, Some(150));
+    }
+
+    #[test]
+    fn session_cleanup은_없는_exact_session에서_zero다() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(
+            db.deny_pending_approvals_for_session("315f68b6-333f-409f-a2c5-922b9eacfd7e:404", 200,)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn session_cleanup_failure는_모든_pending을_rollback한다() {
+        let db = Db::open_in_memory().unwrap();
+        let session = "315f68b6-333f-409f-a2c5-922b9eacfd7e:5";
+        for id in ["cleanup-first", "cleanup-second"] {
+            db.insert_pending_approval(id, "srv", "tool", "{}", None, 100, Some(session))
+                .unwrap();
+        }
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_session_cleanup
+                 AFTER UPDATE OF status ON pending_approvals
+                 WHEN NEW.id = 'cleanup-second' AND NEW.status = 'denied'
+                 BEGIN SELECT RAISE(ABORT, 'injected session cleanup failure'); END;",
+            )
+            .unwrap();
+
+        assert!(db.deny_pending_approvals_for_session(session, 200).is_err());
+        for id in ["cleanup-first", "cleanup-second"] {
+            assert_eq!(
+                db.poll_approval(id).unwrap().status,
+                ApprovalStatus::Pending
+            );
+            let resolved_at: Option<i64> = db
+                .conn
+                .query_row(
+                    "SELECT resolved_at FROM pending_approvals WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(resolved_at, None);
+        }
+    }
+
+    #[test]
+    fn session_cleanup은_restart후에도_terminal_state를_보존한다() {
+        let (dir, path, db) = file_db("session-approval-cleanup");
+        let session = "315f68b6-333f-409f-a2c5-922b9eacfd7e:6";
+        db.insert_pending_approval(
+            "restart-cleanup",
+            "srv",
+            "tool",
+            "{}",
+            None,
+            100,
+            Some(session),
+        )
+        .unwrap();
+        assert_eq!(
+            db.deny_pending_approvals_for_session(session, 200).unwrap(),
+            1
+        );
+        drop(db);
+
+        let reopened = Db::open(&path).unwrap();
+        assert_eq!(
+            reopened.poll_approval("restart-cleanup").unwrap().status,
+            ApprovalStatus::Denied
+        );
+        let resolved_at: Option<i64> = reopened
+            .conn
+            .query_row(
+                "SELECT resolved_at FROM pending_approvals WHERE id = 'restart-cleanup'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolved_at, Some(200));
+        assert_eq!(
+            reopened
+                .deny_pending_approvals_for_session(session, 300)
+                .unwrap(),
+            0
+        );
+        drop(reopened);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn session_cleanup은_key와_candidate_count를_선할당없이_제한한다() {
+        let db = Db::open_in_memory().unwrap();
+        let exact_max = "00000000-0000-0000-0000-000000000000:18446744073709551615";
+        assert_eq!(exact_max.len(), PENDING_APPROVAL_SESSION_KEY_BYTES_MAX);
+        assert_eq!(
+            db.deny_pending_approvals_for_session(exact_max, 200)
+                .unwrap(),
+            0
+        );
+
+        let oversized = format!("{exact_max}0");
+        let error = db
+            .deny_pending_approvals_for_session(&oversized, 200)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "pending approval session key byte length invalid"
+        );
+        assert!(
+            db.deny_pending_approvals_for_session("not-a-session-key", 200)
+                .is_err()
+        );
+
+        for index in 0..=PENDING_APPROVAL_SESSION_CLEANUP_LIMIT_MAX {
+            db.insert_pending_approval(
+                &format!("bounded-cleanup-{index}"),
+                "srv",
+                "tool",
+                "{}",
+                None,
+                100,
+                Some(exact_max),
+            )
+            .unwrap();
+        }
+        let error = db
+            .deny_pending_approvals_for_session(exact_max, 200)
+            .unwrap_err();
+        assert_eq!(error.to_string(), SESSION_CLOSED_APPROVAL_ERROR_CODE);
+        let pending_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_approvals
+                 WHERE pane_id = ?1 AND status = 'pending'",
+                [exact_max],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pending_count,
+            i64::try_from(PENDING_APPROVAL_SESSION_CLEANUP_LIMIT_MAX + 1).unwrap()
+        );
     }
 
     #[test]
@@ -6438,6 +6727,53 @@ mod tests {
         assert_eq!(Db::read_user_version(&db.conn).unwrap(), MIGRATIONS.len());
         drop(db);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn v28에서_v29_session_pending_index로_업그레이드된다() {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-mig-28to29-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite3");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..28] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 28).unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(Db::read_user_version(&db.conn).unwrap(), MIGRATIONS.len());
+        let index_sql: String = db
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_pending_approvals_session_pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index_sql.contains("ON pending_approvals(pane_id)"));
+        assert!(index_sql.contains("WHERE status = 'pending'"));
+
+        let query_plan: String = db
+            .conn
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT 1 FROM pending_approvals
+                 WHERE pane_id = ?1 AND status = 'pending'
+                 LIMIT ?2",
+                ("315f68b6-333f-409f-a2c5-922b9eacfd7e:2", 257_i64),
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(query_plan.contains("idx_pending_approvals_session_pending"));
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

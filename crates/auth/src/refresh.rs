@@ -6,6 +6,7 @@
 //! 루프 + Sequencer로 암묵 해결).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -22,6 +23,14 @@ use crate::{OAuthToken, refresh_entry_id, store_token};
 
 /// 만료 전 선제 refresh 마진 (VS Code DynamicAuthProvider와 동일한 5분).
 pub const REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
+/// Maximum number of distinct credential refreshes that may be in flight at once. Completed
+/// cohorts are evicted, so historical credential IDs never accumulate in the coordinator.
+pub const REFRESH_COORDINATOR_ACTIVE_ID_LIMIT: usize = 256;
+/// A credential ID is retained only while its refresh cohort is active. This matches the durable
+/// logical credential ID contract and prevents one active entry from consuming unbounded memory.
+pub const REFRESH_COORDINATOR_ID_BYTES_MAX: usize = 96;
+pub const REFRESH_COORDINATOR_RETAINED_ID_BYTES_MAX: usize =
+    REFRESH_COORDINATOR_ACTIVE_ID_LIMIT * REFRESH_COORDINATOR_ID_BYTES_MAX;
 
 /// 지금 refresh해야 하는가 — 만료 5분 전부터 true.
 /// 만료 시각(credentials 메타데이터, 비밀 아님)을 모르면 선제 갱신하지 않는다 —
@@ -42,22 +51,56 @@ pub fn should_refresh_at(expires_at: Option<SystemTime>, now: SystemTime) -> boo
 /// 슬롯 mutex를 잡은 호출만 네트워크로 나간다. 대기 중 다른 호출이 끝냈으면
 /// (완료 시각이 내 진입 이후) 재발사하지 않고 결과를 공유받는다 — 회전된
 /// refresh token 재사용(AS의 replay 감지 → grant 통째 폐기)을 막는다.
-#[derive(Default)]
 pub struct RefreshCoordinator {
-    slots: Mutex<HashMap<String, Arc<Slot>>>,
+    slots: Mutex<RefreshSlots>,
+    rejected_ids: AtomicU64,
 }
 
 #[derive(Default)]
+struct RefreshSlots {
+    entries: HashMap<Arc<str>, Arc<Slot>>,
+    retained_id_bytes: usize,
+}
+
 struct Slot {
+    coordination_id: Arc<str>,
     /// (완료 시각, 공유용 결과 요약) — 토큰 평문은 공유하지 않는다 (keyring 재조회로 충분).
     last: Mutex<Option<(Instant, SharedOutcome)>>,
 }
 
-#[derive(Clone)]
 enum SharedOutcome {
     Refreshed,
-    ReauthorizationRequired(String),
-    Failed(String),
+    ReauthorizationRequired,
+    Failed,
+}
+
+/// Low-cardinality resource counters. No credential ID, endpoint, token, or provider error is
+/// retained or exposed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RefreshCoordinatorStats {
+    pub active_ids: usize,
+    pub retained_id_bytes: usize,
+    pub rejected_ids: u64,
+}
+
+struct SlotLease<'a> {
+    coordinator: &'a RefreshCoordinator,
+    slot: Arc<Slot>,
+}
+
+impl Drop for SlotLease<'_> {
+    fn drop(&mut self) {
+        self.coordinator.evict_if_idle(&self.slot);
+    }
+}
+
+impl Default for RefreshCoordinator {
+    fn default() -> Self {
+        Self {
+            slots: Mutex::new(RefreshSlots::default()),
+            rejected_ids: AtomicU64::new(0),
+        }
+    }
 }
 
 impl RefreshCoordinator {
@@ -65,9 +108,74 @@ impl RefreshCoordinator {
         Self::default()
     }
 
-    fn slot(&self, credential_id: &str) -> Arc<Slot> {
-        let mut slots = self.slots.lock().expect("refresh slots lock");
-        Arc::clone(slots.entry(credential_id.to_owned()).or_default())
+    pub fn stats(&self) -> RefreshCoordinatorStats {
+        let slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        RefreshCoordinatorStats {
+            active_ids: slots.entries.len(),
+            retained_id_bytes: slots.retained_id_bytes,
+            rejected_ids: self.rejected_ids.load(Ordering::Relaxed),
+        }
+    }
+
+    fn slot(&self, coordination_id: &str) -> anyhow::Result<SlotLease<'_>> {
+        if coordination_id.is_empty() || coordination_id.len() > REFRESH_COORDINATOR_ID_BYTES_MAX {
+            self.rejected_ids.fetch_add(1, Ordering::Relaxed);
+            anyhow::bail!("OAuth refresh coordination ID is outside the fixed byte limit");
+        }
+
+        let mut slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(slot) = slots.entries.get(coordination_id) {
+            return Ok(SlotLease {
+                coordinator: self,
+                slot: Arc::clone(slot),
+            });
+        }
+        if slots.entries.len() >= REFRESH_COORDINATOR_ACTIVE_ID_LIMIT
+            || slots
+                .retained_id_bytes
+                .saturating_add(coordination_id.len())
+                > REFRESH_COORDINATOR_RETAINED_ID_BYTES_MAX
+        {
+            self.rejected_ids.fetch_add(1, Ordering::Relaxed);
+            anyhow::bail!("OAuth refresh coordinator active-ID capacity is exhausted");
+        }
+
+        let coordination_id: Arc<str> = Arc::from(coordination_id);
+        let slot = Arc::new(Slot {
+            coordination_id: Arc::clone(&coordination_id),
+            last: Mutex::new(None),
+        });
+        slots.retained_id_bytes += coordination_id.len();
+        slots.entries.insert(coordination_id, Arc::clone(&slot));
+        Ok(SlotLease {
+            coordinator: self,
+            slot,
+        })
+    }
+
+    fn evict_if_idle(&self, slot: &Arc<Slot>) {
+        let mut slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let is_current = slots
+            .entries
+            .get(slot.coordination_id.as_ref())
+            .is_some_and(|current| Arc::ptr_eq(current, slot));
+        // One reference belongs to the map and one to this final lease. A concurrent entrant clones
+        // the Arc while holding the same map lock, so it cannot race with this removal.
+        if is_current && Arc::strong_count(slot) == 2 {
+            slots.entries.remove(slot.coordination_id.as_ref());
+            slots.retained_id_bytes = slots
+                .retained_id_bytes
+                .saturating_sub(slot.coordination_id.len());
+        }
     }
 }
 
@@ -196,34 +304,57 @@ fn coordinate_refresh(
     coordination_id: &str,
     refresh: impl FnOnce() -> anyhow::Result<RefreshOutcome>,
 ) -> anyhow::Result<RefreshOutcome> {
-    let slot = coordinator.slot(coordination_id);
+    // Capture intent before acquiring the cohort Arc. A caller may be descheduled immediately after
+    // cloning an existing slot; using a later timestamp would make it miss the leader completion
+    // and incorrectly launch a second refresh with the same rotating grant.
     let entered = Instant::now();
+    let lease = coordinator.slot(coordination_id)?;
+    coordinate_refresh_with_lease(lease, entered, refresh)
+}
+
+fn coordinate_refresh_with_lease(
+    lease: SlotLease<'_>,
+    entered: Instant,
+    refresh: impl FnOnce() -> anyhow::Result<RefreshOutcome>,
+) -> anyhow::Result<RefreshOutcome> {
     // 선행 refresh가 진행 중이면 여기서 대기한다 (single-flight)
-    let mut last = slot.last.lock().expect("refresh slot lock");
+    let mut last = lease
+        .slot
+        .last
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((finished_at, shared)) = last.as_ref()
         && *finished_at >= entered
     {
         // 내가 기다리는 동안 선행 호출이 끝냈다 — 재발사하지 않고 결과 공유
         return match shared {
             SharedOutcome::Refreshed => Ok(RefreshOutcome::AlreadyRefreshed),
-            SharedOutcome::ReauthorizationRequired(reason) => {
-                Ok(RefreshOutcome::ReauthorizationRequired {
-                    reason: reason.clone(),
-                })
-            }
-            SharedOutcome::Failed(message) => Err(anyhow::anyhow!("선행 refresh 실패: {message}")),
+            SharedOutcome::ReauthorizationRequired => Ok(RefreshOutcome::ReauthorizationRequired {
+                reason: "OAuth refresh was rejected".to_owned(),
+            }),
+            SharedOutcome::Failed => Err(anyhow::anyhow!("a concurrent OAuth refresh failed")),
         };
     }
-    let result = refresh();
-    let shared = match &result {
-        Ok(RefreshOutcome::ReauthorizationRequired { reason }) => {
-            SharedOutcome::ReauthorizationRequired(reason.clone())
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(refresh));
+    match result {
+        Ok(result) => {
+            let shared = match &result {
+                Ok(RefreshOutcome::ReauthorizationRequired { .. }) => {
+                    SharedOutcome::ReauthorizationRequired
+                }
+                Ok(_) => SharedOutcome::Refreshed,
+                Err(_) => SharedOutcome::Failed,
+            };
+            *last = Some((Instant::now(), shared));
+            drop(last);
+            result
         }
-        Ok(_) => SharedOutcome::Refreshed,
-        Err(e) => SharedOutcome::Failed(format!("{e:#}")),
-    };
-    *last = Some((Instant::now(), shared));
-    result
+        Err(payload) => {
+            *last = Some((Instant::now(), SharedOutcome::Failed));
+            drop(last);
+            std::panic::resume_unwind(payload)
+        }
+    }
 }
 
 fn do_refresh_legacy(
@@ -657,6 +788,8 @@ mod tests {
             "{outcomes:?}"
         );
         assert_eq!(store.value("cred").as_deref(), Some("new-at"));
+        assert_eq!(coordinator.stats().active_ids, 0);
+        assert_eq!(coordinator.stats().retained_id_bytes, 0);
     }
 
     #[test]
@@ -758,6 +891,216 @@ mod tests {
             store.value(physical.as_str()).as_deref(),
             Some("existing-access-token")
         );
+        assert_eq!(coordinator.stats().active_ids, 0);
+        assert_eq!(coordinator.stats().retained_id_bytes, 0);
+    }
+
+    #[test]
+    fn 만개의_distinct_sequential_refresh는_state를_남기지_않는다() {
+        let coordinator = RefreshCoordinator::new();
+        for generation in 0..10_000 {
+            let outcome =
+                coordinate_refresh(&coordinator, &format!("logical-{generation}"), || {
+                    Ok(RefreshOutcome::AlreadyRefreshed)
+                })
+                .unwrap();
+            assert!(matches!(outcome, RefreshOutcome::AlreadyRefreshed));
+        }
+        assert_eq!(coordinator.stats(), RefreshCoordinatorStats::default());
+    }
+
+    #[test]
+    fn active_id_상한은_257번째_work를_실행하기_전에_거부한다() {
+        let coordinator = RefreshCoordinator::new();
+        let leases = (0..REFRESH_COORDINATOR_ACTIVE_ID_LIMIT)
+            .map(|id| coordinator.slot(&format!("active-{id}")))
+            .collect::<anyhow::Result<Vec<_>>>()
+            .unwrap();
+        let stats = coordinator.stats();
+        assert_eq!(stats.active_ids, REFRESH_COORDINATOR_ACTIVE_ID_LIMIT);
+        assert!(stats.retained_id_bytes <= REFRESH_COORDINATOR_RETAINED_ID_BYTES_MAX);
+
+        let calls = AtomicUsize::new(0);
+        let rejected = coordinate_refresh(&coordinator, "overflow", || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(RefreshOutcome::AlreadyRefreshed)
+        });
+        assert!(rejected.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "rejected work ran");
+        assert_eq!(coordinator.stats().rejected_ids, 1);
+
+        drop(leases);
+        let stats = coordinator.stats();
+        assert_eq!(stats.active_ids, 0);
+        assert_eq!(stats.retained_id_bytes, 0);
+    }
+
+    #[test]
+    fn oversized_id는_work를_실행하기_전에_거부한다() {
+        let coordinator = RefreshCoordinator::new();
+        let calls = AtomicUsize::new(0);
+        let exact = "x".repeat(REFRESH_COORDINATOR_ID_BYTES_MAX);
+        let exact_lease = coordinator.slot(&exact).unwrap();
+        assert_eq!(coordinator.stats().retained_id_bytes, exact.len());
+        drop(exact_lease);
+        assert_eq!(coordinator.stats().active_ids, 0);
+
+        let oversized = "x".repeat(REFRESH_COORDINATOR_ID_BYTES_MAX + 1);
+        let result = coordinate_refresh(&coordinator, &oversized, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(RefreshOutcome::AlreadyRefreshed)
+        });
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            coordinator.stats(),
+            RefreshCoordinatorStats {
+                rejected_ids: 1,
+                ..RefreshCoordinatorStats::default()
+            }
+        );
+    }
+
+    #[test]
+    fn refresh_failure와_panic은_slot을_evict하고_detail을_보존하지_않는다() {
+        let coordinator = RefreshCoordinator::new();
+        let failure =
+            coordinate_refresh(&coordinator, "failed", || anyhow::bail!("injected failure"));
+        assert!(failure.is_err());
+        assert_eq!(coordinator.stats().active_ids, 0);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = coordinate_refresh(&coordinator, "panicked", || {
+                panic!("injected refresh panic")
+            });
+        }));
+        assert!(panic.is_err());
+        assert_eq!(coordinator.stats().active_ids, 0);
+        assert_eq!(coordinator.stats().retained_id_bytes, 0);
+
+        let retry = coordinate_refresh(&coordinator, "panicked", || {
+            Ok(RefreshOutcome::AlreadyRefreshed)
+        })
+        .unwrap();
+        assert!(matches!(retry, RefreshOutcome::AlreadyRefreshed));
+        assert_eq!(coordinator.stats().active_ids, 0);
+    }
+
+    #[test]
+    fn 같은_id_waiter는_winner_결과를_공유한_뒤_slot을_제거한다() {
+        use std::sync::{Barrier, mpsc};
+
+        let coordinator = Arc::new(RefreshCoordinator::new());
+        let winner_started = Arc::new(Barrier::new(2));
+        let winner_release = Arc::new(Barrier::new(2));
+        let winner = {
+            let coordinator = Arc::clone(&coordinator);
+            let winner_started = Arc::clone(&winner_started);
+            let winner_release = Arc::clone(&winner_release);
+            std::thread::spawn(move || {
+                coordinate_refresh(&coordinator, "shared", || {
+                    winner_started.wait();
+                    winner_release.wait();
+                    Ok(RefreshOutcome::Refreshed(OAuthToken {
+                        access_token: SecretString::new("winner-access".to_owned()),
+                        refresh_token: None,
+                        expires_in_secs: None,
+                        provider_workspace_id: None,
+                    }))
+                })
+            })
+        };
+        winner_started.wait();
+
+        let (waiter_tx, waiter_rx) = mpsc::channel();
+        let waiter = {
+            let coordinator = Arc::clone(&coordinator);
+            std::thread::spawn(move || {
+                let outcome = coordinate_refresh(&coordinator, "shared", || {
+                    panic!("waiter must not run refresh work")
+                });
+                waiter_tx.send(outcome).unwrap();
+            })
+        };
+
+        // Prove that the waiter acquired the same slot before allowing the winner to finish.
+        loop {
+            let slots = coordinator
+                .slots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let references = slots.entries.get("shared").map_or(0, Arc::strong_count);
+            drop(slots);
+            if references >= 3 {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        winner_release.wait();
+
+        assert!(matches!(
+            winner.join().unwrap().unwrap(),
+            RefreshOutcome::Refreshed(_)
+        ));
+        assert!(matches!(
+            waiter_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap(),
+            RefreshOutcome::AlreadyRefreshed
+        ));
+        waiter.join().unwrap();
+        assert_eq!(coordinator.stats().active_ids, 0);
+        assert_eq!(coordinator.stats().retained_id_bytes, 0);
+    }
+
+    #[test]
+    fn slot_arc_획득_뒤_deschedule된_waiter도_leader_결과를_공유한다() {
+        use std::sync::Barrier;
+
+        let coordinator = Arc::new(RefreshCoordinator::new());
+        let leader_started = Arc::new(Barrier::new(2));
+        let leader_release = Arc::new(Barrier::new(2));
+        let leader = {
+            let coordinator = Arc::clone(&coordinator);
+            let leader_started = Arc::clone(&leader_started);
+            let leader_release = Arc::clone(&leader_release);
+            std::thread::spawn(move || {
+                coordinate_refresh(&coordinator, "descheduled", || {
+                    leader_started.wait();
+                    leader_release.wait();
+                    Ok(RefreshOutcome::Refreshed(OAuthToken {
+                        access_token: SecretString::new("leader-access".to_owned()),
+                        refresh_token: None,
+                        expires_in_secs: None,
+                        provider_workspace_id: None,
+                    }))
+                })
+            })
+        };
+        leader_started.wait();
+
+        // This is the exact production ordering around slot acquisition. Holding the lease while
+        // the leader finishes deterministically models a waiter descheduled after cloning the Arc.
+        let entered = Instant::now();
+        let waiter_lease = coordinator.slot("descheduled").unwrap();
+        leader_release.wait();
+        assert!(matches!(
+            leader.join().unwrap().unwrap(),
+            RefreshOutcome::Refreshed(_)
+        ));
+        assert_eq!(coordinator.stats().active_ids, 1);
+
+        let waiter_work = AtomicUsize::new(0);
+        let outcome = coordinate_refresh_with_lease(waiter_lease, entered, || {
+            waiter_work.fetch_add(1, Ordering::SeqCst);
+            Ok(RefreshOutcome::AlreadyRefreshed)
+        })
+        .unwrap();
+        assert!(matches!(outcome, RefreshOutcome::AlreadyRefreshed));
+        assert_eq!(waiter_work.load(Ordering::SeqCst), 0);
+        assert_eq!(coordinator.stats().active_ids, 0);
+        assert_eq!(coordinator.stats().retained_id_bytes, 0);
     }
 
     #[test]

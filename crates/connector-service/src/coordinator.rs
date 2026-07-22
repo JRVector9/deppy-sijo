@@ -60,38 +60,23 @@ pub enum HostAction {
 impl std::fmt::Debug for HostAction {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::RequestImportSource {
-                operation_id,
-                source,
-            } => formatter
+            Self::RequestImportSource { source, .. } => formatter
                 .debug_struct("RequestImportSource")
-                .field("operation_id", operation_id)
                 .field("source", source)
                 .finish(),
-            Self::OpenExternalLink { operation_id, kind } => formatter
+            Self::OpenExternalLink { kind, .. } => formatter
                 .debug_struct("OpenExternalLink")
-                .field("operation_id", operation_id)
                 .field("kind", kind)
                 .finish(),
             Self::OpenOAuthBrowser {
-                operation_id,
-                config_revision,
-                ..
+                config_revision, ..
             } => formatter
                 .debug_struct("OpenOAuthBrowser")
-                .field("operation_id", operation_id)
                 .field("config_revision", config_revision)
                 .field("url", &"REDACTED")
                 .finish(),
-            Self::OpenSlackRecovery {
-                operation_id,
-                server_id,
-                kind,
-                ..
-            } => formatter
+            Self::OpenSlackRecovery { kind, .. } => formatter
                 .debug_struct("OpenSlackRecovery")
-                .field("operation_id", operation_id)
-                .field("server_id", server_id)
                 .field("kind", kind)
                 .field("url", &"REDACTED")
                 .finish(),
@@ -161,6 +146,82 @@ impl HostActionQueue {
             .lock()
             .expect("connector host action lock")
             .retain(|action| action.dynamic_operation_id().is_none());
+    }
+
+    fn remove_import_for_operation(&self, operation_id: &OperationId) {
+        self.queue
+            .lock()
+            .expect("connector host action lock")
+            .retain(|action| {
+                !matches!(
+                    action,
+                    HostAction::RequestImportSource {
+                        operation_id: queued,
+                        ..
+                    } if queued == operation_id
+                )
+            });
+    }
+}
+
+struct PendingHostImport {
+    operation_id: OperationId,
+    source: ImportSourceRequest,
+}
+
+#[derive(Default)]
+struct PendingHostImportSlot {
+    pending: Mutex<Option<PendingHostImport>>,
+}
+
+impl PendingHostImportSlot {
+    fn reserve(
+        &self,
+        operation_id: OperationId,
+        source: ImportSourceRequest,
+    ) -> Result<(), DispatchError> {
+        let mut pending = self.pending.lock().expect("pending host import lock");
+        if pending.is_some() {
+            return Err(DispatchError::Backpressure);
+        }
+        *pending = Some(PendingHostImport {
+            operation_id,
+            source,
+        });
+        Ok(())
+    }
+
+    fn take_matching(&self, operation_id: &OperationId, source: ImportSource) -> bool {
+        let mut pending = self.pending.lock().expect("pending host import lock");
+        let matches = pending.as_ref().is_some_and(|pending| {
+            &pending.operation_id == operation_id
+                && import_source_matches_request(source, pending.source)
+        });
+        if matches {
+            pending.take();
+        }
+        matches
+    }
+
+    fn cancel(&self, operation_id: &OperationId) -> bool {
+        let mut pending = self.pending.lock().expect("pending host import lock");
+        if pending
+            .as_ref()
+            .is_some_and(|pending| &pending.operation_id == operation_id)
+        {
+            pending.take();
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    fn is_pending(&self) -> bool {
+        self.pending
+            .lock()
+            .expect("pending host import lock")
+            .is_some()
     }
 }
 
@@ -297,6 +358,7 @@ pub enum DispatchError {
     Backpressure,
     WorkerUnavailable,
     InvalidLimits,
+    StaleHostAction,
 }
 
 impl std::fmt::Display for DispatchError {
@@ -305,6 +367,7 @@ impl std::fmt::Display for DispatchError {
             Self::Backpressure => f.write_str("connector command queue is full"),
             Self::WorkerUnavailable => f.write_str("connector worker is unavailable"),
             Self::InvalidLimits => f.write_str("connector resource limits are invalid"),
+            Self::StaleHostAction => f.write_str("connector host action is stale"),
         }
     }
 }
@@ -374,6 +437,7 @@ struct Inner {
     dispatch_epoch: Arc<AtomicU64>,
     cancellations: Arc<Mutex<HashMap<OperationId, CancellationToken>>>,
     host_actions: Arc<HostActionQueue>,
+    pending_host_import: PendingHostImportSlot,
     session_trust: Arc<Mutex<SessionTrustRegistry>>,
 }
 
@@ -426,6 +490,7 @@ impl ConnectorCoordinator {
                     initial_snapshot,
                 )),
                 host_actions,
+                pending_host_import: PendingHostImportSlot::default(),
                 session_trust: Arc::new(Mutex::new(SessionTrustRegistry::new(
                     config.limits.session_trust_entries,
                 ))),
@@ -457,11 +522,43 @@ impl ConnectorCoordinator {
 
     pub fn dispatch(&self, intent: ConnectorIntent) -> Result<DispatchOutcome, DispatchError> {
         if let ConnectorIntent::Cancel(operation_id) = &intent {
+            if self.inner.pending_host_import.cancel(operation_id) {
+                self.inner
+                    .host_actions
+                    .remove_import_for_operation(operation_id);
+                return Ok(DispatchOutcome::Queued);
+            }
             // Cancellation is visible before the worker turn. Drop any queued dynamic URL now so
             // the app cannot dequeue it after cancellation while the worker is still waking.
             self.inner
                 .host_actions
                 .remove_dynamic_for_operation(operation_id);
+        }
+        if matches!(
+            &intent,
+            ConnectorIntent::ImportConfiguration {
+                source: ImportSource::File | ImportSource::ClaudeDesktop,
+                ..
+            }
+        ) {
+            return Err(DispatchError::StaleHostAction);
+        }
+        if let ConnectorIntent::CompleteImportSource {
+            operation_id,
+            source,
+            ..
+        }
+        | ConnectorIntent::FailImportSource {
+            operation_id,
+            source,
+            ..
+        } = &intent
+            && !self
+                .inner
+                .pending_host_import
+                .take_matching(operation_id, *source)
+        {
+            return Err(DispatchError::StaleHostAction);
         }
         let invalidates = invalidates_inflight(&intent);
         if invalidates {
@@ -471,13 +568,20 @@ impl ConnectorCoordinator {
         }
         match intent {
             ConnectorIntent::RequestImportSource(source) => {
+                let operation_id = self.inner.config.operation_ids.next_id();
+                self.inner
+                    .pending_host_import
+                    .reserve(operation_id.clone(), source)?;
                 self.inner
                     .host_actions
                     .push(HostAction::RequestImportSource {
-                        operation_id: self.inner.config.operation_ids.next_id(),
+                        operation_id: operation_id.clone(),
                         source,
                     })
-                    .map_err(|_| DispatchError::Backpressure)?;
+                    .map_err(|_| {
+                        self.inner.pending_host_import.cancel(&operation_id);
+                        DispatchError::Backpressure
+                    })?;
                 return Ok(DispatchOutcome::Queued);
             }
             ConnectorIntent::OpenExternalLink(kind) => {
@@ -1205,7 +1309,23 @@ impl Worker {
                 source,
                 display_name,
                 contents,
-            } => self.import_configuration(source, display_name, contents),
+            } => self.import_configuration(None, source, display_name, contents),
+            ConnectorIntent::CompleteImportSource {
+                operation_id,
+                source,
+                display_name,
+                contents,
+            } => self.import_configuration(Some(operation_id), source, display_name, contents),
+            ConnectorIntent::FailImportSource {
+                operation_id,
+                error_code,
+                ..
+            } => self.publish_operation_error(
+                operation_id,
+                OperationKind::Import,
+                error_code,
+                "import source host operation failed",
+            ),
             ConnectorIntent::DismissResult(operation_id) => {
                 if self
                     .snapshot
@@ -1467,11 +1587,12 @@ impl Worker {
 
     fn import_configuration(
         &mut self,
+        operation_id: Option<OperationId>,
         source: ImportSource,
         display_name: Option<String>,
         contents: connector_contract::SensitiveInput,
     ) {
-        let operation_id = self.new_operation_id();
+        let operation_id = operation_id.unwrap_or_else(|| self.new_operation_id());
         if contents.len() > self.limits.import_input_bytes {
             self.publish_operation_error(
                 operation_id,
@@ -4638,6 +4759,18 @@ fn invalidates_inflight(intent: &ConnectorIntent) -> bool {
             | ConnectorIntent::SetPermission { .. }
             | ConnectorIntent::ConnectSlack
             | ConnectorIntent::ImportConfiguration { .. }
+            | ConnectorIntent::CompleteImportSource { .. }
+    )
+}
+
+fn import_source_matches_request(source: ImportSource, request: ImportSourceRequest) -> bool {
+    matches!(
+        (source, request),
+        (ImportSource::File, ImportSourceRequest::FilePicker)
+            | (
+                ImportSource::ClaudeDesktop,
+                ImportSourceRequest::ClaudeDesktop
+            )
     )
 }
 
@@ -6319,6 +6452,24 @@ mod tests {
     fn host_action_queue_drops_dynamic_urls_but_preserves_static_user_actions() {
         let queue = HostActionQueue::new(4, Arc::new(FakeHost::default()));
         let dynamic_id = OperationId::new("dynamic-action");
+        let debug = format!(
+            "{:?}",
+            HostAction::OpenSlackRecovery {
+                operation_id: OperationId::new("debug-host-operation-marker"),
+                server_id: ServerId::new("debug-host-server-marker"),
+                kind: SlackRecoveryKind::EnableMcpAccess,
+                url: Some(SensitiveInput::from(
+                    "https://debug-host-url-marker.invalid".to_owned(),
+                )),
+            }
+        );
+        for marker in [
+            "debug-host-operation-marker",
+            "debug-host-server-marker",
+            "debug-host-url-marker",
+        ] {
+            assert!(!debug.contains(marker), "HostAction Debug leaked {marker}");
+        }
         queue
             .push(HostAction::OpenExternalLink {
                 operation_id: OperationId::new("static-action"),
@@ -7221,6 +7372,26 @@ mod tests {
             tool_id: ToolId::new(tool_id),
             arguments_json: SensitiveInput::new(input.to_vec()),
         }
+    }
+
+    fn request_import_operation(
+        coordinator: &ConnectorCoordinator,
+        request: ImportSourceRequest,
+    ) -> OperationId {
+        coordinator
+            .dispatch(ConnectorIntent::RequestImportSource(request))
+            .unwrap();
+        let HostAction::RequestImportSource {
+            operation_id,
+            source,
+        } = coordinator
+            .try_take_host_action()
+            .expect("import host action")
+        else {
+            panic!("unexpected host action")
+        };
+        assert_eq!(source, request);
+        operation_id
     }
 
     fn enable_auto_allow(fixture: &Fixture) {
@@ -8277,6 +8448,98 @@ mod tests {
     }
 
     #[test]
+    fn host_import_is_single_exact_cancelable_and_double_completion_safe() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        let operation_id =
+            request_import_operation(&fixture.coordinator, ImportSourceRequest::FilePicker);
+        assert!(fixture.coordinator.inner.pending_host_import.is_pending());
+        assert_eq!(
+            fixture
+                .coordinator
+                .dispatch(ConnectorIntent::RequestImportSource(
+                    ImportSourceRequest::ClaudeDesktop
+                )),
+            Err(DispatchError::Backpressure)
+        );
+        assert_eq!(fixture.coordinator.metrics().worker_starts, 0);
+
+        assert_eq!(
+            fixture
+                .coordinator
+                .dispatch(ConnectorIntent::CompleteImportSource {
+                    operation_id: OperationId::new("wrong-host-operation"),
+                    source: ImportSource::File,
+                    display_name: None,
+                    contents: SensitiveInput::new(b"ignored".to_vec()),
+                }),
+            Err(DispatchError::StaleHostAction)
+        );
+        assert_eq!(
+            fixture
+                .coordinator
+                .dispatch(ConnectorIntent::FailImportSource {
+                    operation_id: operation_id.clone(),
+                    source: ImportSource::ClaudeDesktop,
+                    error_code: ErrorCode::HostUnavailable,
+                }),
+            Err(DispatchError::StaleHostAction)
+        );
+        assert!(fixture.coordinator.inner.pending_host_import.is_pending());
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Cancel(operation_id))
+            .unwrap();
+        assert!(!fixture.coordinator.inner.pending_host_import.is_pending());
+        assert_eq!(fixture.coordinator.metrics().worker_starts, 0);
+
+        assert_eq!(
+            fixture
+                .coordinator
+                .dispatch(ConnectorIntent::ImportConfiguration {
+                    source: ImportSource::File,
+                    display_name: None,
+                    contents: SensitiveInput::new(b"bypass".to_vec()),
+                }),
+            Err(DispatchError::StaleHostAction)
+        );
+        let failed_operation =
+            request_import_operation(&fixture.coordinator, ImportSourceRequest::ClaudeDesktop);
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::FailImportSource {
+                operation_id: failed_operation.clone(),
+                source: ImportSource::ClaudeDesktop,
+                error_code: ErrorCode::HostUnavailable,
+            })
+            .unwrap();
+        wait_until(|| {
+            fixture
+                .coordinator
+                .current_snapshot()
+                .result
+                .as_ref()
+                .is_some_and(|result| result.operation_id == failed_operation)
+        });
+        assert_eq!(fixture.repo.parses.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.repo.imports.load(Ordering::Acquire), 0);
+        assert_eq!(
+            fixture
+                .coordinator
+                .dispatch(ConnectorIntent::FailImportSource {
+                    operation_id: failed_operation,
+                    source: ImportSource::ClaudeDesktop,
+                    error_code: ErrorCode::HostUnavailable,
+                }),
+            Err(DispatchError::StaleHostAction)
+        );
+    }
+
+    #[test]
     fn import_bytes_and_server_count_are_bounded_before_persistence() {
         let fixture = fixture(
             Arc::new(Gate::opened()),
@@ -8284,9 +8547,12 @@ mod tests {
             Arc::new(Gate::opened()),
             Arc::new(SystemCoordinatorClock::default()),
         );
+        let oversized_operation =
+            request_import_operation(&fixture.coordinator, ImportSourceRequest::FilePicker);
         fixture
             .coordinator
-            .dispatch(ConnectorIntent::ImportConfiguration {
+            .dispatch(ConnectorIntent::CompleteImportSource {
+                operation_id: oversized_operation.clone(),
                 source: ImportSource::File,
                 display_name: Some("too-large.json".to_owned()),
                 contents: SensitiveInput::new(vec![
@@ -8306,6 +8572,15 @@ mod tests {
                 .iter()
                 .any(|transition| transition.error_code == Some(ErrorCode::LimitExceeded))
         });
+        assert_eq!(
+            fixture
+                .coordinator
+                .current_snapshot()
+                .result
+                .as_ref()
+                .map(|result| &result.operation_id),
+            Some(&oversized_operation)
+        );
         assert_eq!(fixture.repo.parses.load(Ordering::Acquire), 0);
         assert_eq!(fixture.repo.imports.load(Ordering::Acquire), 0);
 
@@ -8313,9 +8588,12 @@ mod tests {
             .repo
             .import_server_count
             .store(257, Ordering::Release);
+        let many_operation =
+            request_import_operation(&fixture.coordinator, ImportSourceRequest::FilePicker);
         fixture
             .coordinator
-            .dispatch(ConnectorIntent::ImportConfiguration {
+            .dispatch(ConnectorIntent::CompleteImportSource {
+                operation_id: many_operation,
                 source: ImportSource::File,
                 display_name: Some("many.json".to_owned()),
                 contents: SensitiveInput::new(b"fixture".to_vec()),

@@ -26,6 +26,14 @@ Root verification after this amendment:
 - `check-deps` passed for 23 crates with no forbidden edge/cycle.
 - `check-boundary` passed at the unchanged 53 existing exceptions.
 
+The app-host import continuation is now exact and bounded as well. Paste remains a direct
+`ImportConfiguration`; file-picker and Claude Desktop requests reserve one outstanding host slot
+and return an operation ID. Only a matching source plus that exact ID may complete or fail the
+request. Cancel clears it without publishing an error, while stale, mismatched, direct-file bypass,
+and double completion fail before worker/repository start. Success and low-cardinality host failure
+reuse the original operation ID in the snapshot. Host action `Debug` omits operation/server IDs and
+dynamic URLs. The amended connector-service suite passes 62/62 serially.
+
 ## Outcome
 
 `connector-service` now owns a synchronous, bounded Connector coordinator without knowing a

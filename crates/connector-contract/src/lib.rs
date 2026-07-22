@@ -863,12 +863,26 @@ pub enum ConnectorIntent {
         kind: SlackRecoveryKind,
     },
     RequestImportSource(ImportSourceRequest),
-    /// App-owned file picker/read path re-enters the same intent dispatcher with bounded bytes.
-    /// The service validates the byte/item ceilings before parsing or persistence.
+    /// Paste is already owned by this process and does not need an app-host continuation.
     ImportConfiguration {
         source: ImportSource,
         display_name: Option<String>,
         contents: SensitiveInput,
+    },
+    /// Completes one exact app-host file/read request with bounded bytes. The coordinator rejects
+    /// stale, mismatched, or duplicate operation IDs before starting its worker.
+    CompleteImportSource {
+        operation_id: OperationId,
+        source: ImportSource,
+        display_name: Option<String>,
+        contents: SensitiveInput,
+    },
+    /// Completes one exact app-host request without provider/user text. Cancelling a picker uses
+    /// `Cancel(operation_id)` and deliberately publishes no error.
+    FailImportSource {
+        operation_id: OperationId,
+        source: ImportSource,
+        error_code: ErrorCode,
     },
     OpenExternalLink(ExternalLinkKind),
     DismissResult(OperationId),
@@ -960,6 +974,18 @@ impl fmt::Debug for ConnectorIntent {
                 .debug_struct("ConnectorIntent::ImportConfiguration")
                 .field("source", source)
                 .field("contents", &"REDACTED")
+                .finish(),
+            Self::CompleteImportSource { source, .. } => formatter
+                .debug_struct("ConnectorIntent::CompleteImportSource")
+                .field("source", source)
+                .field("contents", &"REDACTED")
+                .finish(),
+            Self::FailImportSource {
+                source, error_code, ..
+            } => formatter
+                .debug_struct("ConnectorIntent::FailImportSource")
+                .field("source", source)
+                .field("error_code", error_code)
                 .finish(),
             Self::OpenExternalLink(kind) => formatter
                 .debug_tuple("ConnectorIntent::OpenExternalLink")
@@ -1121,6 +1147,28 @@ mod tests {
         }
         assert!(debug.contains("Revision(7)"));
         assert!(debug.contains("Revision(8)"));
+
+        let complete = ConnectorIntent::CompleteImportSource {
+            operation_id: OperationId::new("debug-import-operation-marker"),
+            source: ImportSource::File,
+            display_name: Some("debug-complete-filename-marker".to_owned()),
+            contents: SensitiveInput::from("debug-complete-content-marker".to_owned()),
+        };
+        let failed = ConnectorIntent::FailImportSource {
+            operation_id: OperationId::new("debug-failed-operation-marker"),
+            source: ImportSource::ClaudeDesktop,
+            error_code: ErrorCode::HostUnavailable,
+        };
+        let debug = format!("{complete:?} {failed:?}");
+        for marker in [
+            "debug-import-operation-marker",
+            "debug-complete-filename-marker",
+            "debug-complete-content-marker",
+            "debug-failed-operation-marker",
+        ] {
+            assert!(!debug.contains(marker), "Debug leaked {marker}: {debug}");
+        }
+        assert!(debug.contains("HostUnavailable"));
     }
 
     #[test]

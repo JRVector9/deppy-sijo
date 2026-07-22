@@ -42,6 +42,9 @@ qrcode = { workspace = true }
 rfd = "0.15"
 audit = { path = "../audit" }
 auth = { path = "../auth" }
+connector-contract = { path = "../connector-contract" }
+connector-service = { path = "../connector-service" }
+connector-ui = { path = "../connector-ui" }
 deppy-core = { path = "../core" }
 mcp = { path = "../mcp" }
 mcp-store = { path = "../mcp-store" }

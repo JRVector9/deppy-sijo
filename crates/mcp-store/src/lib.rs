@@ -1352,6 +1352,104 @@ pub fn ensure_server_by_url_in_transaction(
     Ok(row.clone())
 }
 
+/// Ensures exactly one enabled server for a canonical URL.
+///
+/// Unlike [`ensure_server_by_url_in_transaction`], this reconnect-oriented variant turns an
+/// existing disabled row back on. The duplicate probe is bounded to two rows and completes before
+/// any mutation, so historical duplicate canonical rows fail closed without partially enabling a
+/// selected winner.
+pub fn ensure_enabled_server_by_url(
+    conn: &mut Connection,
+    row: &McpServerRow,
+) -> anyhow::Result<McpServerRow> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let ensured = ensure_enabled_server_by_url_in_transaction(&tx, row)?;
+    tx.commit()
+        .context("enabled MCP server 멱등 등록 commit 실패")?;
+    Ok(ensured)
+}
+
+/// Transaction-inner reconnect variant of [`ensure_enabled_server_by_url`].
+pub fn ensure_enabled_server_by_url_in_transaction(
+    conn: &Connection,
+    row: &McpServerRow,
+) -> anyhow::Result<McpServerRow> {
+    anyhow::ensure!(
+        !conn.is_autocommit(),
+        "enabled MCP server 멱등 등록은 caller-owned transaction이 필요합니다"
+    );
+    let url = row
+        .url
+        .as_deref()
+        .context("enabled 멱등 URL 등록에는 URL이 필요합니다")?;
+    validate_server_args_for_persistence(&row.args)?;
+    validate_server_env_for_persistence(&row.env_plain, &row.env_secrets)?;
+    let canonical = canonical_url(url);
+    anyhow::ensure!(
+        !canonical.is_empty(),
+        "enabled 멱등 등록 URL이 비어 있습니다"
+    );
+
+    // LIMIT 2 is sufficient to prove uniqueness while bounding work and avoiding materializing
+    // any text before the aggregate byte preflight succeeds.
+    let (matches, maximum_bytes): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(MAX(point_bytes), 0)
+         FROM (
+             SELECT length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                    length(CAST(kind AS BLOB)) +
+                    length(CAST(COALESCE(command, '') AS BLOB)) +
+                    length(CAST(COALESCE(args_json, '') AS BLOB)) +
+                    length(CAST(COALESCE(env_json, '') AS BLOB)) +
+                    length(CAST(COALESCE(env_credentials_json, '') AS BLOB)) +
+                    length(CAST(COALESCE(url, '') AS BLOB)) AS point_bytes
+             FROM mcp_servers
+             WHERE rtrim(trim(url), '/') = ?1
+             ORDER BY created_at, id
+             LIMIT 2
+         )",
+        [canonical],
+        |result| Ok((result.get(0)?, result.get(1)?)),
+    )?;
+    let matches = usize::try_from(matches).context("canonical MCP server count 변환 실패")?;
+    anyhow::ensure!(
+        matches <= 1,
+        "duplicate canonical MCP servers prevent reconnect"
+    );
+    let maximum_bytes =
+        usize::try_from(maximum_bytes).context("canonical MCP server bytes 변환 실패")?;
+    anyhow::ensure!(
+        maximum_bytes <= MCP_SERVER_POINT_BYTES_MAX,
+        "MCP canonical server point byte 상한을 초과했습니다"
+    );
+
+    if matches == 0 {
+        insert_server(conn, row)?;
+        return Ok(row.clone());
+    }
+
+    let existing_id: String = conn.query_row(
+        "SELECT id FROM mcp_servers
+         WHERE rtrim(trim(url), '/') = ?1
+         ORDER BY created_at, id
+         LIMIT 1",
+        [canonical],
+        |result| result.get(0),
+    )?;
+    let mut existing = server_in_snapshot(conn, &existing_id)?
+        .context("same-snapshot canonical MCP server가 byte preflight 후 사라졌습니다")?;
+    if !existing.enabled {
+        let affected = conn.execute(
+            "UPDATE mcp_servers
+             SET enabled = 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE id = ?1 AND enabled = 0",
+            [&existing_id],
+        )?;
+        anyhow::ensure!(affected == 1, "canonical MCP server enable 대상 수 불일치");
+        existing.enabled = true;
+    }
+    Ok(existing)
+}
+
 /// import에서 선택된 서버 전체를 all-or-nothing으로 저장한다. 모든 행의 secret-like
 /// validation을 transaction 전에 끝내며, ID 충돌/trigger/commit 실패 시 일부 서버가
 /// 남지 않는다.
@@ -2227,6 +2325,59 @@ mod tests {
 
         assert_eq!(first.id, second.id);
         assert_eq!(list_servers(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn canonical_url_reconnect는_기존_disabled_row를_동일_transaction에서_enable한다() {
+        let mut conn = test_conn();
+        let mut slack = sample_server();
+        slack.kind = "http".to_owned();
+        slack.command = None;
+        slack.args.clear();
+        slack.url = Some("https://mcp.slack.com/mcp/".to_owned());
+        slack.enabled = false;
+        insert_server(&conn, &slack).unwrap();
+
+        let mut reconnect = slack.clone();
+        reconnect.id = "must-not-be-inserted".to_owned();
+        reconnect.name = "replacement-name-must-not-win".to_owned();
+        reconnect.url = Some(" https://mcp.slack.com/mcp ".to_owned());
+        reconnect.enabled = true;
+        let enabled = ensure_enabled_server_by_url(&mut conn, &reconnect).unwrap();
+
+        assert_eq!(enabled.id, slack.id);
+        assert_eq!(enabled.name, slack.name);
+        assert!(enabled.enabled);
+        let rows = list_servers(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, slack.id);
+        assert!(rows[0].enabled);
+    }
+
+    #[test]
+    fn canonical_url_reconnect는_duplicate를_fail_closed하고_disabled_row를_변경하지_않는다() {
+        let mut conn = test_conn();
+        let mut first = sample_server();
+        first.kind = "http".to_owned();
+        first.command = None;
+        first.args.clear();
+        first.url = Some("https://mcp.slack.com/mcp/".to_owned());
+        first.enabled = false;
+        insert_server(&conn, &first).unwrap();
+        let mut second = first.clone();
+        second.id = "duplicate-slack".to_owned();
+        second.url = Some(" https://mcp.slack.com/mcp ".to_owned());
+        insert_server(&conn, &second).unwrap();
+
+        let mut reconnect = first.clone();
+        reconnect.id = "must-not-be-inserted".to_owned();
+        reconnect.enabled = true;
+        assert!(ensure_enabled_server_by_url(&mut conn, &reconnect).is_err());
+
+        let rows = list_servers(&conn).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| !row.enabled));
+        assert!(rows.iter().all(|row| row.id != reconnect.id));
     }
 
     #[test]

@@ -51,10 +51,16 @@ a pid-bearing zero sample twice in this environment; the B00b diff does not touc
 that test. No production skip or workaround was added. Agent evidence includes an earlier 128-test
 full pass and an 84-test socket-independent pass.
 
-## Remaining app integration
+## App integration closeout
 
-`app.rs` still owns the sequential production cutover: compose `AppRuntimeSecretResolver` against
-the published physical-slot pointer, construct one `InProcessRuntimeHostFactory`, switch workspace
-runtimes to `Box<dyn RuntimeHost>`, and use exact `AgentSpawnResolved` IDs for lazy proxy approval
-listener leases. Public compatibility constructors remain until that cutover and must not become a
-second long-lived production path.
+`app.rs` owns one shared `AppRuntimeSecretResolver` and `InProcessRuntimeHostFactory` for workspace
+and remote runtimes. The resolver lazily owns one mutex-protected SQLite connection, validates the
+published service and physical-slot owner, and never falls back to a logical keyring username.
+`InProcessRuntimeHostFactory::create_client(RuntimeHostConfig)` is the single concrete-client seam
+required by the existing workspace/remote owners; the object-safe factory delegates to the same
+path. Production direct-keyring constructors are test-only, and app no longer sends `SeedRedaction`.
+
+Every launch resolves its complete secret set and acquires one checked execution lease before any
+process spawn. The lease remains owned by SessionId until kill/close/archive/shutdown; failure to
+resolve or reserve redaction capacity produces zero spawn. Factory tests pass 3/3, runtime secret
+tests 6/6, the full runtime library 140/140, and runtime check/strict Clippy/fmt/diff gates pass.

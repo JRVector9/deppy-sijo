@@ -10,13 +10,20 @@
 //! 런타임/저장소 구체 타입을 직접 만지지 않는다.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::agent_surface::AgentProvider;
 use crate::config::ComposerSendKey;
+use connector_contract::{ConnectorSnapshot, ServerId, ServerSummary, ToolPage};
 
-/// 히스토리 상한 — 초과분은 오래된 것부터 버린다.
-const MAX_HISTORY: usize = 100;
+/// App-owned history persistence에 넘기는 snapshot 상한. Send 이벤트에서만 새 snapshot을
+/// 만들고 stable frame에는 clone/allocation이 없다.
+pub const COMPOSER_HISTORY_MAX_ITEMS: usize = 100;
+pub const COMPOSER_HISTORY_MAX_BYTES: usize = 1024 * 1024;
+pub const COMPOSER_PROMPT_MAX_BYTES: usize = 1024 * 1024;
+/// JSON string escaping은 한 input byte를 최악 6 bytes(`\u00XX`)로 확장한다.
+pub const COMPOSER_HISTORY_FILE_MAX_BYTES: usize = COMPOSER_HISTORY_MAX_BYTES * 6 + 1024;
 /// 펼침 상태 텍스트 영역 상한(줄) — 넘으면 내부 스크롤.
 const MAX_TEXT_ROWS: usize = 8;
 /// 펼침 상태 최소 줄 수 — 빈 버퍼여도 여러 줄 컴포저로 보이게.
@@ -27,6 +34,19 @@ const ANIM_SECONDS: f32 = 0.16;
 /// web-remote P6a `encode_input`과 동일한 붙여넣기 판정 임계값.
 const INPUT_PASTE_THRESHOLD: usize = 512;
 
+/// Connector overview/tool-page 상한과 맞춘 composer projection 한계. 이 leaf는 전체
+/// 서버×도구 catalog를 materialize하지 않고 보이는 서버와 단일 page만 순회한다.
+const MCP_SERVER_LIMIT: usize = 256;
+const MCP_TOOL_PAGE_LIMIT: usize = 256;
+const MCP_SERVER_ROW_HEIGHT: f32 = 26.0;
+const MCP_SERVER_LIST_HEIGHT: f32 = MCP_SERVER_ROW_HEIGHT * 4.0;
+const MCP_TOOL_ROW_HEIGHT: f32 = 28.0;
+const MCP_TOOL_LIST_HEIGHT: f32 = MCP_TOOL_ROW_HEIGHT * 6.0;
+const CONTEXT_FILE_PATH_MAX_BYTES: usize = 32 * 1024;
+const CONTEXT_FILE_WORKSPACE_MAX_BYTES: usize = 4 * 1024;
+pub const COMPOSER_ATTACHMENT_MAX_ITEMS: usize = 16;
+pub const COMPOSER_ATTACHMENT_MAX_BYTES: usize = 256 * 1024;
+
 /// 모델 후보 — PTY 에이전트에는 외부 모델 제어 프로토콜이 없으므로 **슬래시 커맨드
 /// 텍스트 삽입** 방식이다(사용자가 검토 후 전송). CLI가 받는 대표 이름의 하드코딩 목록.
 const CLAUDE_MODELS: &[&str] = &["opus", "sonnet", "haiku"];
@@ -35,8 +55,134 @@ const CODEX_MODELS: &[&str] = &["gpt-5.5-codex", "gpt-5.5", "gpt-5.6-sol"];
 /// 컴포저가 App에 돌려주는 액션. 실제 전송(인코딩 + WriteInput)은 App이 한다.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ComposerAction {
-    /// 전송 키/버튼 — 이 프롬프트를 포커스 세션에 주입해 달라는 요청.
-    Send(String),
+    /// 전송과 bounded history snapshot 영속화를 App에 요청한다. Snapshot은 UI와 Arc로
+    /// 공유하므로 action 생성 시 전체 history를 다시 clone하지 않는다.
+    Send(ComposerSubmission),
+    /// Connector service의 bounded tool page를 비동기로 요청한다. Leaf는 DB/service를
+    /// 호출하지 않고 App composition root가 이 값을 Connector intent로 변환한다.
+    RequestMcpToolPage { server_id: ServerId, offset: usize },
+    /// Native picker/file access는 App host가 수행한다. Request는 root가 나중에 동일 값을
+    /// `complete_context_file`로 돌려주는 bounded, non-sensitive continuation identity다.
+    RequestContextFile(ContextFileRequest),
+    /// Clipboard/image materialization은 App host가 수행한다. Leaf는 placeholder와
+    /// latest-only continuation identity만 보관한다.
+    RequestClipboardAttachment(ClipboardAttachmentRequest),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ComposerSubmission {
+    prompt: std::sync::Arc<str>,
+    history: std::sync::Arc<[std::sync::Arc<str>]>,
+}
+
+impl std::fmt::Debug for ComposerSubmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ComposerSubmission")
+            .field("prompt_bytes", &self.prompt.len())
+            .field("history_items", &self.history.len())
+            .field("history_bytes", &history_bytes(&self.history))
+            .finish()
+    }
+}
+
+impl ComposerSubmission {
+    #[cfg(test)]
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
+    #[cfg(test)]
+    pub fn history(&self) -> &[std::sync::Arc<str>] {
+        &self.history
+    }
+
+    pub fn into_parts(self) -> (std::sync::Arc<str>, std::sync::Arc<[std::sync::Arc<str>]>) {
+        (self.prompt, self.history)
+    }
+}
+
+/// 한 번의 composer context-file continuation. Clone/Debug 가능한 값은 request identity,
+/// workspace/root와 placeholder coordinate뿐이며 선택된 raw path는 포함하지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextFileRequest {
+    request_id: u64,
+    target: AttachTarget,
+}
+
+/// Clipboard/image host continuation. Raw clipboard bytes/paths are deliberately absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardAttachmentRequest {
+    request_id: u64,
+    target: AttachTarget,
+}
+
+impl ClipboardAttachmentRequest {
+    #[cfg(test)]
+    fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    #[cfg(test)]
+    fn token(&self) -> &str {
+        &self.target.token
+    }
+}
+
+/// App host worker가 raw clipboard/file 결과를 bounded continuation으로 축소한 뒤 UI로
+/// 전달하는 payload. Debug는 raw path를 절대 노출하지 않는다.
+pub struct ClipboardAttachmentPayload {
+    paths: Vec<PathBuf>,
+    total_bytes: usize,
+}
+
+impl std::fmt::Debug for ClipboardAttachmentPayload {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClipboardAttachmentPayload")
+            .field("items", &self.paths.len())
+            .field("bytes", &self.total_bytes)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardAttachmentErrorCode {
+    Empty,
+    ResourceLimit,
+}
+
+impl ClipboardAttachmentPayload {
+    pub fn try_new(paths: Vec<PathBuf>) -> Result<Self, ClipboardAttachmentErrorCode> {
+        if paths.is_empty() {
+            return Err(ClipboardAttachmentErrorCode::Empty);
+        }
+        let Some(total_bytes) = attachment_path_bytes(&paths) else {
+            return Err(ClipboardAttachmentErrorCode::ResourceLimit);
+        };
+        Ok(Self { paths, total_bytes })
+    }
+}
+
+impl ContextFileRequest {
+    #[cfg(test)]
+    fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    #[cfg(test)]
+    fn workspace_id(&self) -> &str {
+        &self.target.workspace_id
+    }
+
+    pub fn workspace_root(&self) -> Option<&Path> {
+        self.target.workspace_root.as_deref()
+    }
+
+    #[cfg(test)]
+    fn token(&self) -> &str {
+        &self.target.token
+    }
 }
 
 /// 렌더에 필요한 프레임 데이터 (App이 채워 넘긴다 — 경계상 평면 값만).
@@ -53,13 +199,26 @@ pub struct ComposerContext<'a> {
     /// 설정에서 조회). 하드코딩하면 리바인드 시 열기는 새 키, 닫기는 옛 키가 된다
     /// (codex P2). None(비활성)이면 접힘 단축키도 없다.
     pub collapse_shortcut: Option<egui::KeyboardShortcut>,
+    /// App-owned latest-only Connector snapshot. Composer는 enabled server 요약과 정확히
+    /// 한 tool page만 읽고, storage/service 구체 타입은 보지 않는다.
+    pub connector_snapshot: &'a ConnectorSnapshot,
 }
 
-/// 첨부(클립보드/드롭) 백그라운드 태스크 결과 채널.
-type AttachReceiver = std::sync::mpsc::Receiver<anyhow::Result<Option<Vec<PathBuf>>>>;
+struct ToolbarOutput {
+    send_clicked: bool,
+    action: Option<ComposerAction>,
+}
+
+struct ToolbarInput<'a> {
+    egui_ctx: &'a egui::Context,
+    text_id: egui::Id,
+    buffer: &'a mut String,
+    may_emit_action: bool,
+}
 
 /// 첨부 태스크 시작 시점의 대상 스냅샷 — 완료가 워크스페이스 전환 **뒤에** 와도
 /// 시작 시점의 드래프트에 삽입하기 위해 캡처한다(codex P2 — 엉뚱한 드래프트 오염 방지).
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AttachTarget {
     workspace_id: String,
     workspace_root: Option<PathBuf>,
@@ -73,12 +232,6 @@ struct AttachTarget {
     padding: (bool, bool),
 }
 
-/// 진행 중인 클립보드 첨부 태스크.
-struct PendingAttach {
-    rx: AttachReceiver,
-    target: AttachTarget,
-}
-
 /// 하단 도크 컴포저 상태. App이 소유하고 매 프레임 `render`를 호출한다.
 pub struct ComposerUi {
     /// 워크스페이스별 드래프트 — 전환해도 초안이 유지된다.
@@ -87,8 +240,9 @@ pub struct ComposerUi {
     expanded: bool,
     /// ⌘J(전역 단축키) → 다음 렌더에서 펼침 + 포커스 요청.
     focus_requested: bool,
-    /// 보낸 프롬프트(오래된 것 → 최신). 시작 시 파일에서 1회 로드, 전송 시 저장.
-    history: Vec<String>,
+    /// 보낸 프롬프트(오래된 것 → 최신). 시작 시 파일에서 1회 로드하고, 전송 시에는
+    /// App-owned persistence intent와 Arc snapshot만 만든다(leaf 파일 쓰기 없음).
+    history: std::sync::Arc<[std::sync::Arc<str>]>,
     /// 히스토리 탐색 위치 — None이면 미탐색.
     history_pos: Option<usize>,
     /// 다음 show 후 커서를 이 문자 인덱스로 — recall/삽입은 TextEdit 상태 저장 뒤에
@@ -110,10 +264,9 @@ pub struct ComposerUi {
     pending_surrender: Option<(egui::Id, f64, egui::Key)>,
     /// 마지막으로 렌더한 워크스페이스 — 전환 감지용(히스토리 탐색 리셋, codex P3).
     last_workspace: Option<String>,
-    /// 히스토리 영속 파일 (jsonl — 한 줄 = JSON 문자열 하나).
-    history_path: PathBuf,
-    /// 클립보드 이미지/파일 첨부 백그라운드 태스크 (터미널과 동일 인프라 재사용).
-    attach_task: Option<PendingAttach>,
+    /// Clipboard/image host continuation. Worker/channel/filesystem은 App이 소유하며 leaf는
+    /// latest request 하나만 보관한다.
+    pending_attachment: Option<ClipboardAttachmentRequest>,
     /// 첨부 플레이스홀더 토큰 단조 카운터 — 대체된 옛 태스크의 토큰과 구별한다.
     attach_seq: u64,
     /// **비활성** 워크스페이스 드래프트의 토큰 치환이 예약한 캐럿/선택 보정(워크스페이스
@@ -122,13 +275,13 @@ pub struct ComposerUi {
     /// 시점(sync_workspace)에 적용하는 것이 안전하다(codex P1 — 치환이 길이를 바꿔
     /// 캐럿이 경로 안에 박히는 문제).
     pending_caret: HashMap<String, (usize, usize)>,
-    /// MCP 서버별 도구 이름 (서버명, 도구들) — App이 펼침 시 1회 채운다(경계: 평면 값만).
-    /// (서버명, [(도구명, 설명)]). 설명은 서버가 등록한 것을 그대로 보여준다 —
-    /// 사용자가 "이거 눌러도 뭐가 되는지 모르겠다"고 한 것(2026-07-18)에 대한 답:
-    /// 고르기 전에 뭘 하는 도구인지 hover로 보여준다.
-    mcp_tools: Vec<(String, Vec<(String, String)>)>,
-    /// 이번 펼침에서 MCP 목록을 이미 받았다 — 접히면 리셋해 다음 펼침에 재조회.
-    mcp_loaded: bool,
+    /// Composer 전용 로컬 선택. 실제 도구는 보관하지 않고 최신 Connector snapshot의
+    /// matching ToolPage만 빌려 렌더한다.
+    mcp_selected_server: Option<ServerId>,
+    /// Native picker continuation은 정확히 하나만 보관한다. 새 요청은 옛 token을 먼저
+    /// 제거하고 대체하므로 queue/RAM이 증가하지 않는다.
+    pending_context_file: Option<ContextFileRequest>,
+    context_file_seq: u64,
 }
 
 impl ComposerUi {
@@ -138,17 +291,17 @@ impl ComposerUi {
             buffers: HashMap::new(),
             expanded: false,
             focus_requested: false,
-            history: load_history(&history_path),
+            history: load_history(&history_path).into(),
             history_pos: None,
             pending_cursor: None,
             pending_surrender: None,
             last_workspace: None,
-            history_path,
-            attach_task: None,
+            pending_attachment: None,
             attach_seq: 0,
             pending_caret: HashMap::new(),
-            mcp_tools: Vec::new(),
-            mcp_loaded: false,
+            mcp_selected_server: None,
+            pending_context_file: None,
+            context_file_seq: 0,
         }
     }
 
@@ -157,15 +310,95 @@ impl ComposerUi {
         self.focus_requested = true;
     }
 
-    /// App이 MCP 목록을 채워야 하는가 — 펼침 상태에서 아직 못 받았을 때만 true
-    /// (프레임 경로 저장소 조회를 펼침당 1회로 제한).
-    pub fn mcp_refresh_needed(&self) -> bool {
-        self.expanded && !self.mcp_loaded
+    /// App host가 native picker를 완료한 뒤 결과를 돌려주는 continuation seam.
+    ///
+    /// 정확히 현재 pending request만 소비하므로 대체된 picker의 늦은 결과는 무시한다.
+    /// 선택 경로는 이 호출 동안만 존재하고, bounded @mention으로 변환된 뒤 보관하지
+    /// 않는다. 취소/과대 경로는 빈 치환으로 처리해 placeholder와 삽입 패딩을 걷는다.
+    pub fn complete_context_file(
+        &mut self,
+        egui_ctx: &egui::Context,
+        request: ContextFileRequest,
+        selected_path: Option<PathBuf>,
+        active_workspace: &str,
+    ) -> bool {
+        if self.pending_context_file.as_ref() != Some(&request) {
+            return false;
+        }
+        self.pending_context_file = None;
+
+        let replacement = selected_path
+            .filter(|path| path.as_os_str().as_encoded_bytes().len() <= CONTEXT_FILE_PATH_MAX_BYTES)
+            .map_or_else(String::new, |path| {
+                mention_path(request.target.workspace_root.as_deref(), &path)
+            });
+        if request.target.workspace_id == active_workspace {
+            let Some(mut active_buffer) = self.buffers.remove(active_workspace) else {
+                return false;
+            };
+            let resolved = self.resolve_attach(
+                egui_ctx,
+                &request.target,
+                &replacement,
+                active_workspace,
+                &mut active_buffer,
+            );
+            self.buffers
+                .insert(active_workspace.to_owned(), active_buffer);
+            resolved
+        } else {
+            let mut unused_active_buffer = String::new();
+            self.resolve_attach(
+                egui_ctx,
+                &request.target,
+                &replacement,
+                active_workspace,
+                &mut unused_active_buffer,
+            )
+        }
     }
 
-    pub fn set_mcp_tools(&mut self, tools: Vec<(String, Vec<(String, String)>)>) {
-        self.mcp_tools = tools;
-        self.mcp_loaded = true;
+    /// App host가 clipboard/image 변환을 완료한 뒤 bounded path 결과를 돌려준다.
+    /// 현재 latest request와 정확히 일치하지 않는 늦은 결과는 path materialization 전에
+    /// 버린다. 취소/실패/limit 초과는 placeholder 제거로 fail-closed 처리한다.
+    pub fn complete_clipboard_attachment(
+        &mut self,
+        egui_ctx: &egui::Context,
+        request: ClipboardAttachmentRequest,
+        payload: Option<ClipboardAttachmentPayload>,
+        active_workspace: &str,
+    ) -> bool {
+        if self.pending_attachment.as_ref() != Some(&request) {
+            return false;
+        }
+        self.pending_attachment = None;
+        let replacement = payload.map_or_else(String::new, |payload| {
+            joined_mentions(request.target.workspace_root.as_deref(), &payload.paths)
+        });
+        if request.target.workspace_id == active_workspace {
+            let Some(mut active_buffer) = self.buffers.remove(active_workspace) else {
+                return false;
+            };
+            let resolved = self.resolve_attach(
+                egui_ctx,
+                &request.target,
+                &replacement,
+                active_workspace,
+                &mut active_buffer,
+            );
+            self.buffers
+                .insert(active_workspace.to_owned(), active_buffer);
+            resolved
+        } else {
+            let mut unused_active_buffer = String::new();
+            self.resolve_attach(
+                egui_ctx,
+                &request.target,
+                &replacement,
+                active_workspace,
+                &mut unused_active_buffer,
+            )
+        }
     }
 
     /// 컴포저 TextEdit의 egui Id — 워크스페이스별 상태(커서 등) 분리.
@@ -216,6 +449,7 @@ impl ComposerUi {
 
         // ── 키 가로채기 (TextEdit이 그려지기 전에 소비 여부를 판단) ──
         let mut send_requested = false;
+        let mut action = None;
         if had_focus {
             let send_modifiers = match ctx.send_key {
                 ComposerSendKey::Enter => egui::Modifiers::NONE,
@@ -254,14 +488,14 @@ impl ComposerUi {
                 send_requested = true;
             }
             self.intercept_history_keys(&egui_ctx, text_id, buffer);
-            self.start_attach_if_requested(&egui_ctx, ctx, buffer);
+            if action.is_none() {
+                action = self.start_attach_if_requested(&egui_ctx, ctx, buffer);
+            }
         }
-        self.poll_attach_task(&egui_ctx, ctx.workspace_id, buffer);
 
         // ── 전송 판정 (빈 내용/세션 없음이면 무시 — Enter는 이미 소비돼 개행도 안 된다) ──
         // 키 경유 전송은 TextEdit을 그리기 전에 처리해 비워진 버퍼가 이번 프레임에 보인다.
-        let mut action = None;
-        if send_requested {
+        if send_requested && action.is_none() {
             action = self.try_submit(buffer, ctx.can_send, ctx.workspace_id);
             send_requested = false;
         }
@@ -330,8 +564,20 @@ impl ComposerUi {
                 .inner;
             if self.expanded {
                 ui.add_space(6.0);
-                if self.toolbar(ui, catalog, ctx, &egui_ctx, text_id, buffer) {
-                    send_requested = true;
+                let toolbar = self.toolbar(
+                    ui,
+                    catalog,
+                    ctx,
+                    ToolbarInput {
+                        egui_ctx: &egui_ctx,
+                        text_id,
+                        buffer,
+                        may_emit_action: action.is_none(),
+                    },
+                );
+                send_requested |= toolbar.send_clicked;
+                if action.is_none() {
+                    action = toolbar.action;
                 }
             }
             output
@@ -390,13 +636,9 @@ impl ComposerUi {
         });
         if self.expanded && clicked_outside && !egui_ctx.any_popup_open() {
             self.expanded = false;
-            self.mcp_loaded = false;
             if output.response.has_focus() {
                 egui_ctx.memory_mut(|memory| memory.surrender_focus(text_id));
             }
-        }
-        if !self.expanded {
-            self.mcp_loaded = false;
         }
         // 애니메이션 중에는 매 프레임 다시 그린다.
         if (text_h - row_h * target_rows as f32).abs() > 0.5 {
@@ -405,30 +647,41 @@ impl ComposerUi {
         action
     }
 
-    /// 전송 시도 — 빈 내용/세션 없음은 무시. 성공 시 버퍼를 비우고 히스토리에 기록한다.
+    /// 전송 시도 — 빈 내용/세션 없음/limit 초과는 무시한다. 성공 시 bounded history
+    /// snapshot을 갱신하고 App-owned 전송+영속화 intent 하나로 반환한다.
     fn try_submit(
         &mut self,
         buffer: &mut String,
         can_send: bool,
         workspace_id: &str,
     ) -> Option<ComposerAction> {
-        if !can_send || buffer.trim().is_empty() || self.attach_pending_in(workspace_id, buffer) {
+        if !can_send
+            || buffer.trim().is_empty()
+            || buffer.len() > COMPOSER_PROMPT_MAX_BYTES
+            || self.attach_pending_in(workspace_id, buffer)
+        {
             return None;
         }
-        let prompt = std::mem::take(buffer);
-        push_history(&mut self.history, prompt.clone());
-        save_history(&self.history_path, &self.history);
+        let prompt: std::sync::Arc<str> = std::mem::take(buffer).into();
+        let mut history = self.history.iter().cloned().collect::<Vec<_>>();
+        push_history(&mut history, std::sync::Arc::clone(&prompt));
+        self.history = history.into();
         self.history_pos = None;
-        Some(ComposerAction::Send(prompt))
+        Some(ComposerAction::Send(ComposerSubmission {
+            prompt,
+            history: std::sync::Arc::clone(&self.history),
+        }))
     }
 
-    /// 이 버퍼에 **진행 중 태스크의 토큰**이 남아 있는가 — 이 상태로 전송하면 리터럴
-    /// `⟦attach-N⟧`이 PTY로 가고 완료된 이미지는 버려진다(codex P1 — 전송 차단 조건).
+    /// 이 버퍼에 **진행 중 작업의 토큰**이 남아 있는가 — 이 상태로 전송하면 리터럴
+    /// placeholder가 PTY로 간다(codex P1 — 전송 차단 조건).
     /// 정확한 판정(현재 태스크의 토큰 포함 여부)이라 사용자가 토큰을 지웠거나(취소)
     /// 히스토리 recall로 토큰 없는 버퍼가 되면 전송이 자연 허용된다.
     fn attach_pending_in(&self, workspace_id: &str, buffer: &str) -> bool {
-        self.attach_task.as_ref().is_some_and(|task| {
-            task.target.workspace_id == workspace_id && buffer.contains(&task.target.token)
+        self.pending_attachment.as_ref().is_some_and(|request| {
+            request.target.workspace_id == workspace_id && buffer.contains(&request.target.token)
+        }) || self.pending_context_file.as_ref().is_some_and(|request| {
+            request.target.workspace_id == workspace_id && buffer.contains(&request.target.token)
         })
     }
 
@@ -458,7 +711,7 @@ impl ComposerUi {
                 Some(pos) => pos - 1,
             };
             self.history_pos = Some(next);
-            *buffer = self.history[next].clone();
+            *buffer = self.history[next].to_string();
             self.pending_cursor = Some(buffer.chars().count());
         }
         if browsing
@@ -468,7 +721,7 @@ impl ComposerUi {
             match self.history_pos {
                 Some(pos) if pos + 1 < self.history.len() => {
                     self.history_pos = Some(pos + 1);
-                    *buffer = self.history[pos + 1].clone();
+                    *buffer = self.history[pos + 1].to_string();
                     self.pending_cursor = Some(buffer.chars().count());
                 }
                 _ => {
@@ -498,7 +751,7 @@ impl ComposerUi {
         }
     }
 
-    /// 이미지-only 클립보드 붙여넣기 감지 → 첨부 태스크 기동.
+    /// 이미지-only 클립보드 붙여넣기 감지 → App-owned materialization intent 반환.
     ///
     /// macOS: egui-winit이 ⌘V를 이벤트 없이 소비하므로(Event::Paste도 Key도 없음)
     /// AppKit native monitor의 기록으로만 감지된다 — 터미널(workspace)과 같은 원천.
@@ -511,61 +764,49 @@ impl ComposerUi {
         egui_ctx: &egui::Context,
         ctx: &ComposerContext<'_>,
         buffer: &mut String,
-    ) {
+    ) -> Option<ComposerAction> {
         let native_paste = crate::native_key_monitor::drain().clipboard_paste;
         let shortcut_paste = egui_ctx.input(|i| i.events.iter().any(is_attach_paste_shortcut));
         if !(native_paste || shortcut_paste) {
-            return;
+            return None;
         }
         // 텍스트 paste(Event::Paste)가 같은 프레임에 있으면 TextEdit 기본 붙여넣기가
         // 처리한다 — 스크린샷 등 이미지/파일 클립보드만 백그라운드로 경로화한다.
         let has_text_paste =
             egui_ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))));
         if has_text_paste {
-            return;
+            return None;
         }
-        self.begin_attach(
-            egui_ctx,
-            crate::ui::clipboard_image::paste_clipboard_paths_or_image_background(
-                egui_ctx.clone(),
-                false,
-            ),
-            ctx.workspace_id,
-            ctx.workspace_root,
-            buffer,
-        );
+        self.begin_attachment_request(egui_ctx, ctx.workspace_id, ctx.workspace_root, buffer)
+            .map(ComposerAction::RequestClipboardAttachment)
     }
 
-    /// 첨부 태스크 등록 — 그 시점 커서에 플레이스홀더 토큰을 **동기로 삽입**하고
-    /// 태스크에는 (워크스페이스, 토큰)을 캡처한다. 완료는 토큰 문자열 치환이므로
+    /// 첨부 continuation 등록 — 그 시점 커서에 플레이스홀더 토큰을 **동기로 삽입**하고
+    /// request에는 (워크스페이스, 토큰)을 캡처한다. 완료는 토큰 문자열 치환이므로
     /// 변환 중 타이핑/전환에도 위치가 낡지 않는다(codex P2 — AttachTarget 주석).
     ///
-    /// 진행 중이던 태스크는 **최신 것으로 대체**한다. 터미널 paste 경로와 동일 관례
-    /// (ui/workspace.rs PendingPaste: "연타 ⌘V는 최신 것으로 대체") — 조용히 버리면
-    /// 워커가 느릴 때 두 번째 ⌘V가 유실된다(codex P2). 옛 토큰 제거를 **먼저** 하고
+    /// 진행 중이던 request는 **최신 것으로 대체**한다. 옛 토큰 제거를 **먼저** 하고
     /// 그 다음(제거로 시프트된) 캐럿을 읽어 새 토큰을 삽입한다 — 제거 전에 캡처한
     /// 커서 인덱스는 제거로 낡는다(codex P2).
-    fn begin_attach(
+    fn begin_attachment_request(
         &mut self,
         egui_ctx: &egui::Context,
-        rx: AttachReceiver,
         workspace_id: &str,
         workspace_root: Option<&Path>,
         buffer: &mut String,
-    ) {
-        if let Some(old) = self.attach_task.take() {
-            // 결과가 채널에 **이미 도착**했는데 아직 poll 전이면 그 결과부터 반영한다 —
-            // 무조건 빈 치환으로 버리면 완성된 첨부가 유실된다(codex P2, 터미널 paste
-            // 경로의 "처리 후 새 제스처" 순서 관례 미러). 진행 중(Empty)/워커 사망
-            // (Disconnected)이면 기존 관례대로 토큰만 걷고 최신 제스처로 대체한다.
-            // 캐럿 리베이스 포함(resolve_attach) — 활성이면 즉시 반영된다.
-            let replacement = match old.rx.try_recv() {
-                Ok(result) => attach_replacement(&old.target, result),
-                Err(_) => String::new(),
-            };
-            self.resolve_attach(egui_ctx, &old.target, &replacement, workspace_id, buffer);
+    ) -> Option<ClipboardAttachmentRequest> {
+        if workspace_id.is_empty()
+            || workspace_id.len() > CONTEXT_FILE_WORKSPACE_MAX_BYTES
+            || workspace_root.is_some_and(|root| {
+                root.as_os_str().as_encoded_bytes().len() > CONTEXT_FILE_PATH_MAX_BYTES
+            })
+        {
+            return None;
         }
-        self.attach_seq += 1;
+        if let Some(old) = self.pending_attachment.take() {
+            let _ = self.resolve_attach(egui_ctx, &old.target, "", workspace_id, buffer);
+        }
+        self.attach_seq = self.attach_seq.wrapping_add(1).max(1);
         let token = attach_token(self.attach_seq);
         // 캐럿 소스로 쓴 예약은 소진한다(take) — 남겨두면 post-show에 옛 인덱스(토큰
         // 앞/안)가 지금 저장할 캐럿을 덮는다.
@@ -579,45 +820,59 @@ impl ComposerUi {
         // 이벤트가 한 입력 프레임에 배치되면 예약으로는 그 프레임의 텍스트가 옛 캐럿
         // (토큰 앞/안)에 들어가고 예약 인덱스도 토큰 안을 가리키게 된다.
         store_caret_now(egui_ctx, Self::text_id(workspace_id), inserted.cursor);
-        self.attach_task = Some(PendingAttach {
-            rx,
+        let request = ClipboardAttachmentRequest {
+            request_id: self.attach_seq,
             target: AttachTarget {
                 workspace_id: workspace_id.to_owned(),
                 workspace_root: workspace_root.map(Path::to_path_buf),
                 token,
                 padding: (inserted.leading_space, inserted.trailing_space),
             },
-        });
+        };
+        self.pending_attachment = Some(request.clone());
+        Some(request)
     }
 
-    /// 첨부 태스크 완료 폴링 — 결과(@멘션)로 플레이스홀더 토큰을 치환한다.
-    /// 실패/이미지 아님/워커 사망도 토큰은 반드시 제거한다(빈 치환).
-    fn poll_attach_task(
+    /// Native picker를 시작하기 위한 순수 intent를 만든다. 파일 picker/thread/channel/I/O는
+    /// 이 leaf에서 만들지 않는다. 이전 요청은 exact token/padding removal로 먼저 취소하고
+    /// 새 요청 하나만 보관한다(latest-only backlog 1).
+    fn begin_context_file_request(
         &mut self,
         egui_ctx: &egui::Context,
-        active_workspace: &str,
-        active_buffer: &mut String,
-    ) {
-        let Some(task) = &self.attach_task else {
-            return;
+        workspace_id: &str,
+        workspace_root: Option<&Path>,
+        buffer: &mut String,
+    ) -> Option<(ContextFileRequest, usize)> {
+        if workspace_id.is_empty()
+            || workspace_id.len() > CONTEXT_FILE_WORKSPACE_MAX_BYTES
+            || workspace_root.is_some_and(|root| {
+                root.as_os_str().as_encoded_bytes().len() > CONTEXT_FILE_PATH_MAX_BYTES
+            })
+        {
+            return None;
+        }
+
+        if let Some(old) = self.pending_context_file.take() {
+            let _ = self.resolve_attach(egui_ctx, &old.target, "", workspace_id, buffer);
+        }
+        self.context_file_seq = self.context_file_seq.wrapping_add(1).max(1);
+        let token = context_file_token(self.context_file_seq);
+        let cursor = self
+            .pending_cursor
+            .take()
+            .or_else(|| cursor_char_index(egui_ctx, Self::text_id(workspace_id)));
+        let inserted = insert_snippet(buffer, cursor, &token);
+        let request = ContextFileRequest {
+            request_id: self.context_file_seq,
+            target: AttachTarget {
+                workspace_id: workspace_id.to_owned(),
+                workspace_root: workspace_root.map(Path::to_path_buf),
+                token,
+                padding: (inserted.leading_space, inserted.trailing_space),
+            },
         };
-        let result = match task.rx.try_recv() {
-            Ok(result) => Some(result),
-            Err(std::sync::mpsc::TryRecvError::Empty) => return,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
-        };
-        let task = self.attach_task.take().expect("위에서 Some 확인");
-        let replacement = match result {
-            Some(result) => attach_replacement(&task.target, result),
-            None => String::new(),
-        };
-        self.resolve_attach(
-            egui_ctx,
-            &task.target,
-            &replacement,
-            active_workspace,
-            active_buffer,
-        );
+        self.pending_context_file = Some(request.clone());
+        Some((request, inserted.cursor))
     }
 
     /// 첨부 종결 — **태스크 시작 시점의 워크스페이스** 드래프트에서 토큰을 결과로
@@ -636,7 +891,7 @@ impl ComposerUi {
         replacement: &str,
         active_workspace: &str,
         active_buffer: &mut String,
-    ) {
+    ) -> bool {
         let is_active = target.workspace_id == active_workspace;
         let replaced = {
             let draft = if is_active {
@@ -644,12 +899,12 @@ impl ComposerUi {
             } else if let Some(draft) = self.buffers.get_mut(&target.workspace_id) {
                 draft
             } else {
-                return; // 드래프트 자체가 사라짐(워크스페이스 소멸 등) — 폐기
+                return false; // 드래프트 자체가 사라짐(워크스페이스 소멸 등) — 폐기
             };
             let Some((pattern, byte_start)) =
                 find_token_pattern(draft, &target.token, replacement, target.padding)
             else {
-                return; // 사용자가 토큰을 지움 — 취소
+                return false; // 사용자가 토큰을 지움 — 취소
             };
             let replace_start = draft[..byte_start].chars().count();
             let pattern_chars = pattern.chars().count();
@@ -683,6 +938,7 @@ impl ComposerUi {
                 (rebase(primary), rebase(secondary)),
             );
         }
+        true
     }
 
     /// OS 파일 드롭 — 포인터가 도크 위에 있을 때만 받아 @멘션으로 삽입한다.
@@ -709,9 +965,10 @@ impl ComposerUi {
                 .dropped_files
                 .iter()
                 .filter_map(|file| file.path.clone())
+                .take(COMPOSER_ATTACHMENT_MAX_ITEMS + 1)
                 .collect()
         });
-        if dropped.is_empty() {
+        if attachment_path_bytes(&dropped).is_none() {
             return;
         }
         // 여러 파일은 합쳐 1회 삽입(순서 보존 — 첨부 완료 치환과 동일 규칙).
@@ -731,27 +988,36 @@ impl ComposerUi {
         ui: &mut egui::Ui,
         catalog: &i18n::Catalog,
         ctx: &ComposerContext<'_>,
-        egui_ctx: &egui::Context,
-        text_id: egui::Id,
-        buffer: &mut String,
-    ) -> bool {
+        input: ToolbarInput<'_>,
+    ) -> ToolbarOutput {
+        let ToolbarInput {
+            egui_ctx,
+            text_id,
+            buffer,
+            may_emit_action,
+        } = input;
         let mut send_clicked = false;
-        // 삽입 후 커서 예약 — 팝업 클로저가 &self.mcp_tools를 빌리는 동안 self를 다시
-        // 빌릴 수 없어 로컬에 모았다가 마지막에 반영한다.
+        let mut action = None;
+        // 삽입 후 커서 예약 — 팝업 클로저 안에서는 TextEditState를 바로 갱신하지 않고
+        // 로컬에 모았다가 마지막에 반영한다.
         let mut inserted_cursor: Option<usize> = None;
         ui.horizontal(|ui| {
-            // ① 컨텍스트 파일 — 네이티브 파일 피커(rfd, 프로젝트 폴더 선택과 동일 관례)
-            //    → 워크스페이스 루트 기준 @상대경로(claude @멘션 규약).
+            // ① 컨텍스트 파일 — bounded placeholder + intent만 반환한다. Native picker와
+            //    선택 경로는 App host가 소유하고 complete_context_file로 돌려준다.
             if ui
                 .small_button("@")
                 .on_hover_text(catalog.t("composer.context_hint", &[]))
                 .clicked()
-                && let Some(path) = rfd::FileDialog::new().pick_file()
+                && may_emit_action
+                && let Some((request, cursor)) = self.begin_context_file_request(
+                    egui_ctx,
+                    ctx.workspace_id,
+                    ctx.workspace_root,
+                    buffer,
+                )
             {
-                let cursor = cursor_char_index(egui_ctx, text_id);
-                inserted_cursor = Some(
-                    insert_snippet(buffer, cursor, &mention_path(ctx.workspace_root, &path)).cursor,
-                );
+                inserted_cursor = Some(cursor);
+                action = Some(ComposerAction::RequestContextFile(request));
             }
             // ② 모델 — 감지된 에이전트의 후보를 `/model <이름>`으로 버퍼 맨 앞에 삽입.
             if let Some(agent) = ctx.agent {
@@ -770,45 +1036,14 @@ impl ComposerUi {
                     }
                 });
             }
-            // ③ MCP 도구 — 설명을 hover로 보여주고, 커서 위치에 실행 지시 문장으로 삽입.
-            let resp = ui
-                .small_button("MCP")
-                .on_hover_text(catalog.t("composer.tools_hint", &[]));
-            egui::Popup::menu(&resp).show(|ui| {
-                // 서버는 등록됐어도 도구가 아직 발견(discover)되지 않은 경우가 흔하다
-                // (Connector Center 미연결) — `mcp_tools`가 그런 서버로만 차 있으면
-                // is_empty()는 false라 안내가 안 뜨고 팝업이 설명 없이 텅 빈다
-                // (2026-07-18 사용자 회귀). 실제 도구 총합으로 판정한다.
-                let has_any_tool = self.mcp_tools.iter().any(|(_, tools)| !tools.is_empty());
-                if !has_any_tool {
-                    ui.weak(catalog.t("composer.tools_empty", &[]));
-                }
-                for (server, tools) in &self.mcp_tools {
-                    for (tool, description) in tools {
-                        // 도구 이름만 맨몸으로 삽입하면 에이전트가 명령으로도 함수
-                        // 호출로도 못 읽는다("directory_tree" 자체는 아무 의미가 없다,
-                        // 2026-07-17 사용자 실사용 확인). 자연어 지시문으로 감싸 삽입한다.
-                        let btn = ui.button(format!("{server} · {tool}"));
-                        let btn = if description.is_empty() {
-                            btn
-                        } else {
-                            btn.on_hover_text(description)
-                        };
-                        if btn.clicked() {
-                            let cursor = cursor_char_index(egui_ctx, text_id);
-                            // locale 파일 파싱이 값의 앞뒤 공백을 trim하므로(i18n
-                            // parse_locale_file) 이어 쓸 공백은 여기서 직접 붙인다 —
-                            // insert_snippet의 trailing_space 보정은 커서 뒤에 이미
-                            // 텍스트가 있을 때만 동작해 빈 버퍼(가장 흔한 경우)엔 안 붙는다.
-                            let phrase = format!(
-                                "{} ",
-                                catalog.t("composer.mcp_insert_template", &[("tool", tool)])
-                            );
-                            inserted_cursor = Some(insert_snippet(buffer, cursor, &phrase).cursor);
-                        }
-                    }
-                }
-            });
+            // ③ MCP 도구 — Connector latest-only snapshot에서 enabled server와 정확히 한
+            // bounded page만 읽는다. 필요한 page는 intent로 반환해 App이 비동기 dispatch한다.
+            if let Some(request) =
+                self.mcp_picker(ui, catalog, ctx, text_id, buffer, &mut inserted_cursor)
+                && action.is_none()
+            {
+                action = Some(request);
+            }
             // 우측: 전송 버튼 + 전송 키 힌트. 첨부 변환 중(토큰 pending)엔 전송을 막고
             // 사유를 힌트로 보인다 — try_submit과 같은 조건(codex P1).
             let attach_pending = self.attach_pending_in(ctx.workspace_id, buffer);
@@ -840,9 +1075,214 @@ impl ComposerUi {
         if inserted_cursor.is_some() {
             self.pending_cursor = inserted_cursor;
         }
-        send_clicked
+        ToolbarOutput {
+            send_clicked,
+            action,
+        }
+    }
+
+    fn mcp_picker(
+        &mut self,
+        ui: &mut egui::Ui,
+        catalog: &i18n::Catalog,
+        ctx: &ComposerContext<'_>,
+        text_id: egui::Id,
+        buffer: &mut String,
+        inserted_cursor: &mut Option<usize>,
+    ) -> Option<ComposerAction> {
+        let egui_ctx = ui.ctx().clone();
+        let snapshot = ctx.connector_snapshot;
+        let enabled_count = enabled_server_count(snapshot);
+        let mut selected = self
+            .mcp_selected_server
+            .clone()
+            .filter(|server_id| enabled_server(snapshot, server_id).is_some())
+            .or_else(|| enabled_server_at(snapshot, 0).map(|server| server.id.clone()));
+
+        let response = ui
+            .small_button("MCP")
+            .on_hover_text(catalog.t("composer.tools_hint", &[]));
+        let popup_id = egui::Popup::default_response_id(&response);
+        let was_open = egui::Popup::is_id_open(ui.ctx(), popup_id);
+        let mut request = None;
+        if response.clicked()
+            && !was_open
+            && let Some(server) = selected
+                .as_ref()
+                .and_then(|server_id| enabled_server(snapshot, server_id))
+            && server.tool_count > 0
+            && matching_tool_page(snapshot, &server.id).is_none()
+        {
+            request = Some(ComposerAction::RequestMcpToolPage {
+                server_id: server.id.clone(),
+                offset: 0,
+            });
+        }
+
+        egui::Popup::menu(&response).width(320.0).show(|ui| {
+            if enabled_count == 0 {
+                ui.weak(catalog.t("composer.tools_empty", &[]));
+                return;
+            }
+
+            egui::ScrollArea::vertical()
+                .id_salt(("composer_mcp_servers", ctx.workspace_id))
+                .max_height(MCP_SERVER_LIST_HEIGHT)
+                .show_rows(ui, MCP_SERVER_ROW_HEIGHT, enabled_count, |ui, rows| {
+                    for index in rows {
+                        let Some(server) = enabled_server_at(snapshot, index) else {
+                            continue;
+                        };
+                        let is_selected = selected.as_ref() == Some(&server.id);
+                        if ui
+                            .add_sized(
+                                [ui.available_width(), MCP_SERVER_ROW_HEIGHT],
+                                egui::Button::selectable(is_selected, &server.name),
+                            )
+                            .clicked()
+                        {
+                            selected = Some(server.id.clone());
+                            if server.tool_count > 0 {
+                                request = Some(ComposerAction::RequestMcpToolPage {
+                                    server_id: server.id.clone(),
+                                    offset: 0,
+                                });
+                            }
+                        }
+                    }
+                });
+            ui.separator();
+
+            let Some(server) = selected
+                .as_ref()
+                .and_then(|server_id| enabled_server(snapshot, server_id))
+            else {
+                ui.weak(catalog.t("composer.tools_empty", &[]));
+                return;
+            };
+            if server.tool_count == 0 {
+                ui.weak(catalog.t("composer.tools_empty", &[]));
+                return;
+            }
+            let Some(page) = matching_tool_page(snapshot, &server.id) else {
+                // 요청은 popup open/selection 이벤트가 정확히 한 번 생성한다. 결과를
+                // 기다리는 stable frame은 저장소를 poll하거나 intent를 반복하지 않는다.
+                ui.weak("…");
+                return;
+            };
+
+            let item_count = page.items.len().min(MCP_TOOL_PAGE_LIMIT);
+            egui::ScrollArea::vertical()
+                .id_salt((
+                    "composer_mcp_tools",
+                    ctx.workspace_id,
+                    server.id.as_str(),
+                    page.offset,
+                ))
+                .max_height(MCP_TOOL_LIST_HEIGHT)
+                .show_rows(ui, MCP_TOOL_ROW_HEIGHT, item_count, |ui, rows| {
+                    for tool in &page.items[rows] {
+                        record_mcp_tool_row_rendered();
+                        // 도구 이름만 맨몸으로 삽입하면 에이전트가 명령으로도 함수
+                        // 호출로도 못 읽으므로 기존 자연어 지시문 계약을 유지한다.
+                        let button = ui.button(format!("{} · {}", server.name, tool.name));
+                        let button = match tool.description.as_deref() {
+                            Some(description) if !description.is_empty() => {
+                                button.on_hover_text(description)
+                            }
+                            _ => button,
+                        };
+                        if button.clicked() {
+                            let cursor = cursor_char_index(&egui_ctx, text_id);
+                            let phrase = format!(
+                                "{} ",
+                                catalog.t(
+                                    "composer.mcp_insert_template",
+                                    &[("tool", tool.name.as_str())],
+                                )
+                            );
+                            *inserted_cursor = Some(insert_snippet(buffer, cursor, &phrase).cursor);
+                        }
+                    }
+                });
+
+            let total = page
+                .total
+                .min(connector_contract::ResourceLimits::PRODUCTION_CEILING.tools_per_server);
+            let loaded_end = page.offset.saturating_add(item_count).min(total);
+            ui.horizontal(|ui| {
+                if page.offset > 0 && ui.small_button("‹").clicked() {
+                    request = Some(ComposerAction::RequestMcpToolPage {
+                        server_id: server.id.clone(),
+                        offset: page.offset.saturating_sub(MCP_TOOL_PAGE_LIMIT),
+                    });
+                }
+                ui.weak(format!("{loaded_end}/{total}"));
+                if loaded_end < total && ui.small_button("›").clicked() {
+                    request = Some(ComposerAction::RequestMcpToolPage {
+                        server_id: server.id.clone(),
+                        offset: loaded_end,
+                    });
+                }
+            });
+        });
+
+        self.mcp_selected_server = selected;
+        request
     }
 }
+
+fn enabled_server_count(snapshot: &ConnectorSnapshot) -> usize {
+    snapshot
+        .servers
+        .iter()
+        .filter(|server| server.enabled)
+        .take(MCP_SERVER_LIMIT)
+        .count()
+}
+
+fn enabled_server_at(snapshot: &ConnectorSnapshot, index: usize) -> Option<&ServerSummary> {
+    (index < MCP_SERVER_LIMIT)
+        .then(|| {
+            snapshot
+                .servers
+                .iter()
+                .filter(|server| server.enabled)
+                .nth(index)
+        })
+        .flatten()
+}
+
+fn enabled_server<'a>(
+    snapshot: &'a ConnectorSnapshot,
+    server_id: &ServerId,
+) -> Option<&'a ServerSummary> {
+    snapshot
+        .servers
+        .iter()
+        .filter(|server| server.enabled)
+        .take(MCP_SERVER_LIMIT)
+        .find(|server| &server.id == server_id)
+}
+
+fn matching_tool_page<'a>(
+    snapshot: &'a ConnectorSnapshot,
+    server_id: &ServerId,
+) -> Option<&'a ToolPage> {
+    snapshot
+        .tool_page
+        .as_ref()
+        .filter(|page| &page.server_id == server_id)
+}
+
+fn record_mcp_tool_row_rendered() {
+    #[cfg(test)]
+    MCP_TOOL_ROWS_RENDERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+static MCP_TOOL_ROWS_RENDERED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// 정확히 이 (modifiers, key) 조합의 key-down만 소비한다. egui `consume_key`의
 /// `matches_logically`는 여분 Shift/Alt를 무시해 Shift+Enter(개행)가 Enter(전송)로도
@@ -946,20 +1386,10 @@ fn attach_token(seq: u64) -> String {
     format!("⟦attach-{seq}⟧")
 }
 
-/// 워커 결과 → 토큰 치환 문자열. 실패/이미지 아님은 빈 문자열(= 토큰 제거).
-/// poll(정규 완료)과 begin(대체 직전 drain — codex P2)이 공유한다.
-fn attach_replacement(
-    target: &AttachTarget,
-    result: anyhow::Result<Option<Vec<PathBuf>>>,
-) -> String {
-    match result {
-        Ok(Some(paths)) => joined_mentions(target.workspace_root.as_deref(), &paths),
-        Ok(None) => String::new(),
-        Err(e) => {
-            tracing::warn!("컴포저 클립보드 첨부 실패: {e:#}");
-            String::new()
-        }
-    }
+/// Native context picker의 latest-only continuation anchor. Monotonic identity를 토큰에도
+/// 넣어 대체된 picker의 늦은 완료가 새 요청 자리에 적용될 수 없게 한다.
+fn context_file_token(seq: u64) -> String {
+    format!("⟦context-file-{seq}⟧")
 }
 
 /// 캐럿(선택 없음)을 TextEditState에 **즉시** 기록한다 — show 전에 버퍼를 바꾸는
@@ -1072,11 +1502,28 @@ fn rebase_caret(
 /// 여러 파일 경로를 공백으로 이어 **한 스니펫**으로 — 같은 커서에 파일별로 반복
 /// 삽입하면 역순이 되므로(codex P3) 호출측은 이걸 1회 삽입한다. 순서 보존.
 fn joined_mentions(root: Option<&Path>, paths: &[PathBuf]) -> String {
-    paths
-        .iter()
-        .map(|path| mention_path(root, path))
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut joined = String::new();
+    for path in paths {
+        if !joined.is_empty() {
+            joined.push(' ');
+        }
+        joined.push_str(&mention_path(root, path));
+    }
+    joined
+}
+
+fn attachment_path_bytes(paths: &[PathBuf]) -> Option<usize> {
+    if paths.is_empty() || paths.len() > COMPOSER_ATTACHMENT_MAX_ITEMS {
+        return None;
+    }
+    let total = paths.iter().try_fold(0usize, |total, path| {
+        let bytes = path.as_os_str().as_encoded_bytes().len();
+        if bytes > CONTEXT_FILE_PATH_MAX_BYTES {
+            return None;
+        }
+        total.checked_add(bytes)
+    })?;
+    (total <= COMPOSER_ATTACHMENT_MAX_BYTES).then_some(total)
 }
 
 /// 비-macOS 이미지 첨부 트리거 — 터미널(ui/workspace.rs is_clipboard_paste_shortcut)의
@@ -1114,35 +1561,52 @@ fn cursor_line_info(text: &str, cursor_chars: usize) -> (bool, bool) {
     (on_first, on_last)
 }
 
-/// 히스토리에 추가 — **연속 중복은 접고** 상한(100)을 넘으면 오래된 것부터 버린다.
-fn push_history(history: &mut Vec<String>, entry: String) {
+fn history_bytes(history: &[std::sync::Arc<str>]) -> usize {
+    history.iter().map(|entry| entry.len()).sum()
+}
+
+/// 히스토리에 추가 — 연속 중복은 접고 item/aggregate 상한을 넘으면 오래된 것부터
+/// 버린다. 호출은 load 또는 Send 이벤트에만 있고 stable frame에서는 실행되지 않는다.
+fn push_history(history: &mut Vec<std::sync::Arc<str>>, entry: std::sync::Arc<str>) {
+    if entry.len() > COMPOSER_PROMPT_MAX_BYTES {
+        return;
+    }
     if history.last() == Some(&entry) {
         return;
     }
     history.push(entry);
-    if history.len() > MAX_HISTORY {
-        let overflow = history.len() - MAX_HISTORY;
-        history.drain(..overflow);
+    while history.len() > COMPOSER_HISTORY_MAX_ITEMS
+        || history_bytes(history) > COMPOSER_HISTORY_MAX_BYTES
+    {
+        history.remove(0);
     }
 }
 
 /// 히스토리 로드(시작 시 1회) — jsonl 한 줄 = JSON 문자열 하나. 깨진 줄은 건너뛴다.
-fn load_history(path: &Path) -> Vec<String> {
-    let Ok(content) = std::fs::read_to_string(path) else {
+fn load_history(path: &Path) -> Vec<std::sync::Arc<str>> {
+    let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();
     };
+    let mut content = String::new();
+    if file
+        .take((COMPOSER_HISTORY_FILE_MAX_BYTES + 1) as u64)
+        .read_to_string(&mut content)
+        .is_err()
+        || content.len() > COMPOSER_HISTORY_FILE_MAX_BYTES
+    {
+        return Vec::new();
+    }
     let mut history = Vec::new();
     for line in content.lines() {
         if let Ok(entry) = serde_json::from_str::<String>(line) {
-            push_history(&mut history, entry);
+            push_history(&mut history, entry.into());
         }
     }
     history
 }
 
-/// 히스토리 저장(전송 시 1회) — 100건 상한의 작은 파일이라 동기 write 허용(계획 확정).
-/// 실패는 경고만 — 프롬프트 전송 자체를 막지 않는다.
-fn save_history(path: &Path, history: &[String]) {
+#[cfg(test)]
+fn save_history(path: &Path, history: &[std::sync::Arc<str>]) {
     let mut out = String::new();
     for entry in history {
         if let Ok(line) = serde_json::to_string(entry) {
@@ -1258,6 +1722,24 @@ pub fn plan_composer_input(
 mod tests {
     use super::*;
 
+    fn arc_str(value: &str) -> std::sync::Arc<str> {
+        std::sync::Arc::from(value)
+    }
+
+    fn assert_single_send(actions: &[ComposerAction], expected: &str) {
+        assert_eq!(actions.len(), 1, "expected one Send action: {actions:?}");
+        let ComposerAction::Send(submission) = &actions[0] else {
+            panic!("expected Send action: {:?}", actions[0]);
+        };
+        assert_eq!(submission.prompt(), expected);
+        assert_eq!(
+            submission.history().last().map(AsRef::as_ref),
+            Some(expected)
+        );
+        assert!(submission.history().len() <= COMPOSER_HISTORY_MAX_ITEMS);
+        assert!(history_bytes(submission.history()) <= COMPOSER_HISTORY_MAX_BYTES);
+    }
+
     // ── 순수 함수 유닛 테스트 ──
 
     #[test]
@@ -1331,19 +1813,47 @@ mod tests {
     #[test]
     fn push_history_는_연속_중복을_접고_상한을_지킨다() {
         let mut history = Vec::new();
-        push_history(&mut history, "a".to_owned());
-        push_history(&mut history, "a".to_owned()); // 연속 중복 — 접힘
-        push_history(&mut history, "b".to_owned());
-        push_history(&mut history, "a".to_owned()); // 떨어진 중복 — 유지
-        assert_eq!(history, vec!["a", "b", "a"]);
+        push_history(&mut history, arc_str("a"));
+        push_history(&mut history, arc_str("a")); // 연속 중복 — 접힘
+        push_history(&mut history, arc_str("b"));
+        push_history(&mut history, arc_str("a")); // 떨어진 중복 — 유지
+        assert_eq!(
+            history.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+            vec!["a", "b", "a"]
+        );
 
         let mut full = Vec::new();
         for i in 0..150 {
-            push_history(&mut full, format!("prompt-{i}"));
+            push_history(&mut full, format!("prompt-{i}").into());
         }
-        assert_eq!(full.len(), MAX_HISTORY);
-        assert_eq!(full.first().map(String::as_str), Some("prompt-50"));
-        assert_eq!(full.last().map(String::as_str), Some("prompt-149"));
+        assert_eq!(full.len(), COMPOSER_HISTORY_MAX_ITEMS);
+        assert_eq!(full.first().map(AsRef::as_ref), Some("prompt-50"));
+        assert_eq!(full.last().map(AsRef::as_ref), Some("prompt-149"));
+
+        let mut bytes_bounded = Vec::new();
+        push_history(&mut bytes_bounded, "x".repeat(600 * 1024).into());
+        push_history(&mut bytes_bounded, "y".repeat(600 * 1024).into());
+        assert_eq!(bytes_bounded.len(), 1);
+        assert!(history_bytes(&bytes_bounded) <= COMPOSER_HISTORY_MAX_BYTES);
+    }
+
+    #[test]
+    fn send는_bounded_arc_history_snapshot을_공유하고_file을_쓰지_않는다() {
+        let path = test_history_path("send-history-intent");
+        std::fs::remove_file(&path).ok();
+        let mut ui = ComposerUi::new(path.clone());
+        let mut buffer = "hello".to_owned();
+        let action = ui.try_submit(&mut buffer, true, TEST_WS).unwrap();
+        let ComposerAction::Send(submission) = action else {
+            panic!("expected Send");
+        };
+        assert_eq!(submission.prompt(), "hello");
+        assert!(std::sync::Arc::ptr_eq(&submission.history, &ui.history));
+        assert!(!path.exists(), "leaf Send는 history file을 쓰지 않는다");
+
+        let mut oversized = "x".repeat(COMPOSER_PROMPT_MAX_BYTES + 1);
+        assert!(ui.try_submit(&mut oversized, true, TEST_WS).is_none());
+        assert_eq!(oversized.len(), COMPOSER_PROMPT_MAX_BYTES + 1);
     }
 
     #[test]
@@ -1354,8 +1864,8 @@ mod tests {
         ));
         // 여러 줄 프롬프트도 jsonl(JSON 문자열 이스케이프)로 한 줄에 보존된다.
         let history = vec![
-            "한 줄 프롬프트".to_owned(),
-            "여러 줄\n프롬프트\n\t탭 포함".to_owned(),
+            arc_str("한 줄 프롬프트"),
+            arc_str("여러 줄\n프롬프트\n\t탭 포함"),
         ];
         save_history(&path, &history);
         assert_eq!(load_history(&path), history);
@@ -1369,7 +1879,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::write(&path, "\"ok\"\nnot-json\n\"also ok\"\n").unwrap();
-        assert_eq!(load_history(&path), vec!["ok", "also ok"]);
+        assert_eq!(load_history(&path), vec![arc_str("ok"), arc_str("also ok")]);
         std::fs::remove_file(&path).ok();
     }
 
@@ -1452,6 +1962,29 @@ mod tests {
         assert_eq!(joined_mentions(None, &paths), "/x/1.png /x/2.png");
     }
 
+    #[test]
+    fn 첨부_path_payload는_item과_byte_상한을_지킨다() {
+        let exact = (0..COMPOSER_ATTACHMENT_MAX_ITEMS)
+            .map(|index| PathBuf::from(format!("/x/{index}.png")))
+            .collect::<Vec<_>>();
+        assert_eq!(attachment_path_bytes(&exact), Some(134));
+        assert!(ClipboardAttachmentPayload::try_new(exact).is_ok());
+
+        let over_items = (0..=COMPOSER_ATTACHMENT_MAX_ITEMS)
+            .map(|index| PathBuf::from(format!("/x/{index}.png")))
+            .collect::<Vec<_>>();
+        assert_eq!(attachment_path_bytes(&over_items), None);
+        assert_eq!(attachment_path_bytes(&[]), None);
+        assert_eq!(
+            attachment_path_bytes(&[PathBuf::from("x".repeat(CONTEXT_FILE_PATH_MAX_BYTES + 1),)]),
+            None
+        );
+        let over_bytes = (0..COMPOSER_ATTACHMENT_MAX_ITEMS)
+            .map(|_| PathBuf::from("x".repeat(20 * 1024)))
+            .collect::<Vec<_>>();
+        assert_eq!(attachment_path_bytes(&over_bytes), None);
+    }
+
     /// 터미널(ui/workspace.rs is_clipboard_paste_shortcut) 테스트와 같은 cfg 분기 검증:
     /// 비-macOS는 Ctrl+Shift+V press가 첨부 트리거, macOS는 native monitor가 주 경로.
     #[test]
@@ -1481,6 +2014,22 @@ mod tests {
         assert!(!is_attach_paste_shortcut(&key(true, false, true)));
     }
 
+    fn complete_attachment_for_draft(
+        ui: &mut ComposerUi,
+        egui_ctx: &egui::Context,
+        request: ClipboardAttachmentRequest,
+        paths: Option<Vec<PathBuf>>,
+        draft: &mut String,
+    ) -> bool {
+        let workspace_id = request.target.workspace_id.clone();
+        let payload = paths.and_then(|paths| ClipboardAttachmentPayload::try_new(paths).ok());
+        ui.buffers
+            .insert(workspace_id.clone(), std::mem::take(draft));
+        let completed = ui.complete_clipboard_attachment(egui_ctx, request, payload, &workspace_id);
+        *draft = ui.buffers.remove(&workspace_id).unwrap_or_default();
+        completed
+    }
+
     /// codex P2 회귀: 변환이 도는 동안 사용자가 타이핑해도 완료 결과는 **토큰 자리**에
     /// 들어간다 — 커서 인덱스 앵커였다면 옛 위치에 삽입돼 입력 순서가 섞였다.
     #[test]
@@ -1489,9 +2038,10 @@ mod tests {
         let path = test_history_path("attach-token-typing");
         let mut ui = ComposerUi::new(path.clone());
         let mut active = String::new();
-        let (tx, rx) = std::sync::mpsc::channel();
-        ui.begin_attach(&egui_ctx, rx, TEST_WS, None, &mut active);
-        let token = ui.attach_task.as_ref().unwrap().target.token.clone();
+        let request = ui
+            .begin_attachment_request(&egui_ctx, TEST_WS, None, &mut active)
+            .unwrap();
+        let token = request.target.token.clone();
         assert_eq!(active, token, "토큰이 동기로 삽입돼야 한다");
         // codex P2(7차): 삽입 캐럿은 예약이 아니라 **즉시** TextEditState에 — 같은
         // 프레임에 배치된 Text 이벤트가 토큰 뒤에서 시작해야 한다.
@@ -1503,11 +2053,15 @@ mod tests {
         assert_eq!(ui.pending_cursor, None, "post-show 예약을 남기지 않는다");
         // 변환 중 사용자 입력 — 토큰 앞뒤로 타이핑.
         active = format!("before {active} after");
-        tx.send(Ok(Some(vec![PathBuf::from("/x/shot.png")])))
-            .unwrap();
-        ui.poll_attach_task(&egui_ctx, TEST_WS, &mut active);
+        assert!(complete_attachment_for_draft(
+            &mut ui,
+            &egui_ctx,
+            request,
+            Some(vec![PathBuf::from("/x/shot.png")]),
+            &mut active,
+        ));
         assert_eq!(active, "before /x/shot.png after");
-        assert!(ui.attach_task.is_none());
+        assert!(ui.pending_attachment.is_none());
         std::fs::remove_file(&path).ok();
     }
 
@@ -1521,14 +2075,19 @@ mod tests {
         let path = test_history_path("attach-caret-rebase");
         let mut ui = ComposerUi::new(path.clone());
         let mut active = String::new();
-        let (tx, rx) = std::sync::mpsc::channel();
-        ui.begin_attach(&egui_ctx, rx, TEST_WS, None, &mut active);
+        let request = ui
+            .begin_attachment_request(&egui_ctx, TEST_WS, None, &mut active)
+            .unwrap();
         // 사용자가 토큰 **뒤에** 타이핑, 캐럿은 끝.
         active.push_str(" tail");
         ui.pending_cursor = Some(active.chars().count());
-        tx.send(Ok(Some(vec![PathBuf::from("/x/shot.png")])))
-            .unwrap();
-        ui.poll_attach_task(&egui_ctx, TEST_WS, &mut active);
+        assert!(complete_attachment_for_draft(
+            &mut ui,
+            &egui_ctx,
+            request,
+            Some(vec![PathBuf::from("/x/shot.png")]),
+            &mut active,
+        ));
         assert_eq!(active, "/x/shot.png tail");
         assert_eq!(
             cursor_char_index(&egui_ctx, ComposerUi::text_id(TEST_WS)),
@@ -1542,29 +2101,34 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// codex P2 회귀(4차): 첫 워커의 결과가 채널에 도착했지만 아직 poll 전일 때 두 번째
-    /// 제스처가 오면, 완료된 결과를 먼저 반영하고 나서 새 첨부를 시작한다 — 무조건
-    /// 대체하면 완성된 첨부가 유실된다.
+    /// App host의 늦은 첫 결과는 새 continuation 자리에 적용되면 안 된다.
     #[test]
-    fn 완료된_첨부는_교체_직전에_먼저_반영된다() {
+    fn 새_첨부가_이전_요청을_대체하고_stale_completion은_무시된다() {
         let egui_ctx = egui::Context::default();
-        let path = test_history_path("attach-drain-before-replace");
+        let path = test_history_path("attach-stale-replace");
         let mut ui = ComposerUi::new(path.clone());
         let mut active = String::new();
-        let (tx1, rx1) = std::sync::mpsc::channel();
-        ui.begin_attach(&egui_ctx, rx1, TEST_WS, None, &mut active);
-        // 첫 워커 완료 — 아직 poll 전.
-        tx1.send(Ok(Some(vec![PathBuf::from("/x/first.png")])))
+        let old = ui
+            .begin_attachment_request(&egui_ctx, TEST_WS, None, &mut active)
             .unwrap();
-        // 두 번째 제스처 → drain 후 새 토큰.
-        let (_tx2, rx2) = std::sync::mpsc::channel();
-        ui.begin_attach(&egui_ctx, rx2, TEST_WS, None, &mut active);
-        let new_token = ui.attach_task.as_ref().unwrap().target.token.clone();
-        assert_eq!(
-            active,
-            format!("/x/first.png {new_token}"),
-            "완료된 첫 첨부는 유실되지 않고 새 토큰이 그 뒤(캐럿)에 삽입돼야 한다"
-        );
+        let old_token = old.target.token.clone();
+        let new = ui
+            .begin_attachment_request(&egui_ctx, TEST_WS, None, &mut active)
+            .unwrap();
+        assert_ne!(old.request_id(), new.request_id());
+        assert!(!active.contains(&old_token));
+        assert_eq!(active, new.token());
+
+        ui.buffers.insert(TEST_WS.to_owned(), active);
+        assert!(!ui.complete_clipboard_attachment(
+            &egui_ctx,
+            old,
+            Some(ClipboardAttachmentPayload::try_new(vec![PathBuf::from("/x/stale.png")]).unwrap()),
+            TEST_WS,
+        ));
+        assert_eq!(ui.buffers[TEST_WS], new.token());
+        assert!(ui.complete_clipboard_attachment(&egui_ctx, new, None, TEST_WS));
+        assert!(ui.buffers[TEST_WS].is_empty());
         std::fs::remove_file(&path).ok();
     }
 
@@ -1587,9 +2151,10 @@ mod tests {
         let mut ui = ComposerUi::new(path.clone());
         // ws-a가 활성일 때 첨부 시작 (드래프트에 이미 내용).
         let mut draft_a = "a-draft".to_owned();
-        let (tx, rx) = std::sync::mpsc::channel();
-        ui.begin_attach(&egui_ctx, rx, "ws-a", None, &mut draft_a);
-        let token = ui.attach_task.as_ref().unwrap().target.token.clone();
+        let request = ui
+            .begin_attachment_request(&egui_ctx, "ws-a", None, &mut draft_a)
+            .unwrap();
+        let token = request.target.token.clone();
         assert_eq!(draft_a, format!("a-draft {token}"));
         // ws-a의 TextEdit 캐럿(끝) — 실제로는 위젯이 매 프레임 저장한다.
         let caret_a = draft_a.chars().count();
@@ -1604,10 +2169,13 @@ mod tests {
         // 전환: render()가 하듯 ws-a 드래프트는 맵으로 돌아가고 ws-b가 활성이 된다.
         ui.buffers.insert("ws-a".to_owned(), draft_a);
         ui.sync_workspace(&egui_ctx, "ws-b");
-        let mut active_b = "b-draft".to_owned();
-        tx.send(Ok(Some(vec![PathBuf::from("/x/shot.png")])))
-            .unwrap();
-        ui.poll_attach_task(&egui_ctx, "ws-b", &mut active_b);
+        let active_b = "b-draft".to_owned();
+        assert!(ui.complete_clipboard_attachment(
+            &egui_ctx,
+            request,
+            Some(ClipboardAttachmentPayload::try_new(vec![PathBuf::from("/x/shot.png")]).unwrap()),
+            "ws-b",
+        ));
         assert_eq!(active_b, "b-draft", "활성(ws-b) 버퍼는 무접촉이어야 한다");
         assert_eq!(
             ui.buffers.get("ws-a").unwrap(),
@@ -1637,19 +2205,30 @@ mod tests {
         let mut ui = ComposerUi::new(path.clone());
         // 취소: 토큰 삭제 후 완료 도착 → 폐기.
         let mut active = String::new();
-        let (tx, rx) = std::sync::mpsc::channel();
-        ui.begin_attach(&egui_ctx, rx, TEST_WS, None, &mut active);
-        active.clear(); // 사용자가 토큰을 지움
-        tx.send(Ok(Some(vec![PathBuf::from("/x/shot.png")])))
+        let request = ui
+            .begin_attachment_request(&egui_ctx, TEST_WS, None, &mut active)
             .unwrap();
-        ui.poll_attach_task(&egui_ctx, TEST_WS, &mut active);
+        active.clear(); // 사용자가 토큰을 지움
+        assert!(!complete_attachment_for_draft(
+            &mut ui,
+            &egui_ctx,
+            request,
+            Some(vec![PathBuf::from("/x/shot.png")]),
+            &mut active,
+        ));
         assert!(active.is_empty(), "토큰이 없으면 결과를 조용히 버린다");
         // 실패(이미지/파일 아님): 토큰 제거.
-        let (tx, rx) = std::sync::mpsc::channel();
-        ui.begin_attach(&egui_ctx, rx, TEST_WS, None, &mut active);
+        let request = ui
+            .begin_attachment_request(&egui_ctx, TEST_WS, None, &mut active)
+            .unwrap();
         assert!(!active.is_empty());
-        tx.send(Ok(None)).unwrap();
-        ui.poll_attach_task(&egui_ctx, TEST_WS, &mut active);
+        assert!(complete_attachment_for_draft(
+            &mut ui,
+            &egui_ctx,
+            request,
+            None,
+            &mut active,
+        ));
         assert!(active.is_empty(), "실패해도 플레이스홀더를 남기지 않는다");
         std::fs::remove_file(&path).ok();
     }
@@ -1665,15 +2244,21 @@ mod tests {
         // 들여쓰기 2칸 끝에 커서 — 삽입은 패딩 없이 붙는다.
         let mut active = "line\n  ".to_owned();
         ui.pending_cursor = Some(active.chars().count());
-        let (tx, rx) = std::sync::mpsc::channel();
-        ui.begin_attach(&egui_ctx, rx, TEST_WS, None, &mut active);
+        let request = ui
+            .begin_attachment_request(&egui_ctx, TEST_WS, None, &mut active)
+            .unwrap();
         assert_eq!(
-            ui.attach_task.as_ref().unwrap().target.padding,
+            request.target.padding,
             (false, false),
             "기존 공백 옆 삽입은 패딩을 기록하지 않는다"
         );
-        tx.send(Ok(None)).unwrap(); // 이미지/파일 아님 — 실패 제거
-        ui.poll_attach_task(&egui_ctx, TEST_WS, &mut active);
+        assert!(complete_attachment_for_draft(
+            &mut ui,
+            &egui_ctx,
+            request,
+            None,
+            &mut active,
+        ));
         assert_eq!(active, "line\n  ", "사용자 들여쓰기가 그대로 보존돼야 한다");
         std::fs::remove_file(&path).ok();
     }
@@ -1762,15 +2347,21 @@ mod tests {
         let path = test_history_path("attach-selection");
         let mut ui = ComposerUi::new(path.clone());
         let mut active = String::new();
-        let (tx, rx) = std::sync::mpsc::channel();
-        ui.begin_attach(&egui_ctx, rx, TEST_WS, None, &mut active);
+        let request = ui
+            .begin_attachment_request(&egui_ctx, TEST_WS, None, &mut active)
+            .unwrap();
         // 사용자가 앞에 타이핑 + "ello"를 역방향 선택(primary=1 < secondary=5).
         active = format!("hello {active}");
         ui.pending_cursor = None; // 예약은 전 프레임에 이미 적용된 상태를 시뮬레이션
         let text_id = ComposerUi::text_id(TEST_WS);
         store_caret_range_now(&egui_ctx, text_id, 1, 5);
-        tx.send(Ok(Some(vec![PathBuf::from("/x/a.png")]))).unwrap();
-        ui.poll_attach_task(&egui_ctx, TEST_WS, &mut active);
+        assert!(complete_attachment_for_draft(
+            &mut ui,
+            &egui_ctx,
+            request,
+            Some(vec![PathBuf::from("/x/a.png")]),
+            &mut active,
+        ));
         assert_eq!(active, "hello /x/a.png");
         assert_eq!(
             stored_char_range(&egui_ctx, text_id),
@@ -1791,15 +2382,17 @@ mod tests {
         // 중간 위치 삽입 시나리오 — 캐럿이 "fix|"(3) 지점.
         let mut active = "fix bug".to_owned();
         ui.pending_cursor = Some(3);
-        let (_tx_old, rx_old) = std::sync::mpsc::channel();
-        ui.begin_attach(&egui_ctx, rx_old, TEST_WS, None, &mut active);
-        let old_token = ui.attach_task.as_ref().unwrap().target.token.clone();
+        let old = ui
+            .begin_attachment_request(&egui_ctx, TEST_WS, None, &mut active)
+            .unwrap();
+        let old_token = old.target.token.clone();
         assert_eq!(active, format!("fix {old_token} bug"));
         // 워커가 느린 동안의 두 번째 ⌘V — 조용히 버리지 않고 최신 것으로 대체
         // (터미널 PendingPaste 관례, codex P2).
-        let (_tx_new, rx_new) = std::sync::mpsc::channel();
-        ui.begin_attach(&egui_ctx, rx_new, TEST_WS, None, &mut active);
-        let new_token = ui.attach_task.as_ref().unwrap().target.token.clone();
+        let new = ui
+            .begin_attachment_request(&egui_ctx, TEST_WS, None, &mut active)
+            .unwrap();
+        let new_token = new.target.token.clone();
         assert_ne!(old_token, new_token);
         assert!(
             !active.contains(&old_token),
@@ -1854,11 +2447,18 @@ mod tests {
         ))
     }
 
+    type ComposerHarnessState = (
+        ComposerUi,
+        Vec<ComposerAction>,
+        connector_contract::ConnectorSnapshot,
+        Option<PathBuf>,
+    );
+
     fn composer_harness<'a>(
         catalog: &'a i18n::Catalog,
         send_key: ComposerSendKey,
         history_path: PathBuf,
-    ) -> egui_kittest::Harness<'a, (ComposerUi, Vec<ComposerAction>)> {
+    ) -> egui_kittest::Harness<'a, ComposerHarnessState> {
         composer_harness_with_collapse(catalog, send_key, history_path, cmd_j())
     }
 
@@ -1867,26 +2467,32 @@ mod tests {
         send_key: ComposerSendKey,
         history_path: PathBuf,
         collapse_shortcut: Option<egui::KeyboardShortcut>,
-    ) -> egui_kittest::Harness<'a, (ComposerUi, Vec<ComposerAction>)> {
+    ) -> egui_kittest::Harness<'a, ComposerHarnessState> {
         egui_kittest::Harness::new_ui_state(
-            move |ui, (widget, captured): &mut (ComposerUi, Vec<ComposerAction>)| {
+            move |ui, (widget, captured, connector_snapshot, workspace_root): &mut ComposerHarnessState| {
                 let ctx = ComposerContext {
                     workspace_id: TEST_WS,
                     send_key,
                     can_send: true,
                     agent: None,
-                    workspace_root: None,
+                    workspace_root: workspace_root.as_deref(),
                     collapse_shortcut,
+                    connector_snapshot,
                 };
                 if let Some(action) = widget.render(ui, catalog, &ctx) {
                     captured.push(action);
                 }
             },
-            (ComposerUi::new(history_path), Vec::new()),
+            (
+                ComposerUi::new(history_path),
+                Vec::new(),
+                connector_contract::ConnectorSnapshot::default(),
+                None,
+            ),
         )
     }
 
-    fn buffer_of(harness: &egui_kittest::Harness<'_, (ComposerUi, Vec<ComposerAction>)>) -> String {
+    fn buffer_of(harness: &egui_kittest::Harness<'_, ComposerHarnessState>) -> String {
         harness
             .state()
             .0
@@ -1896,7 +2502,7 @@ mod tests {
             .unwrap_or_default()
     }
 
-    fn focus_composer(harness: &mut egui_kittest::Harness<'_, (ComposerUi, Vec<ComposerAction>)>) {
+    fn focus_composer(harness: &mut egui_kittest::Harness<'_, ComposerHarnessState>) {
         use egui_kittest::kittest::Queryable;
         harness
             .get_by_role(egui::accesskit::Role::MultilineTextInput)
@@ -1917,16 +2523,15 @@ mod tests {
         harness.run();
         harness.key_press(egui::Key::Enter);
         harness.run();
-        assert_eq!(
-            harness.state().1,
-            vec![ComposerAction::Send("hello agent".to_owned())]
-        );
+        assert_single_send(&harness.state().1, "hello agent");
         assert!(
             buffer_of(&harness).is_empty(),
             "전송 후 버퍼가 비워져야 한다"
         );
-        // 전송된 프롬프트는 히스토리에 영속된다.
-        assert_eq!(load_history(&path), vec!["hello agent".to_owned()]);
+        assert!(
+            !path.exists(),
+            "Send render 경로는 history 파일을 생성/기록하면 안 된다"
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -1956,15 +2561,17 @@ mod tests {
         let path = test_history_path("attach-pending-enter");
         let mut harness = composer_harness(&catalog, ComposerSendKey::Enter, path.clone());
         focus_composer(&mut harness);
-        // pending 태스크 구성 — 클립보드 IO 없이 채널을 직접 쥔다.
-        let (tx, rx) = std::sync::mpsc::channel();
-        {
+        // pending continuation 구성 — clipboard/file IO 없이 request만 만든다.
+        let request = {
             let side_ctx = egui::Context::default();
             let ui = &mut harness.state_mut().0;
             let mut buffer = ui.buffers.remove(TEST_WS).unwrap_or_default();
-            ui.begin_attach(&side_ctx, rx, TEST_WS, None, &mut buffer);
+            let request = ui
+                .begin_attachment_request(&side_ctx, TEST_WS, None, &mut buffer)
+                .unwrap();
             ui.buffers.insert(TEST_WS.to_owned(), buffer);
-        }
+            request
+        };
         harness.run();
         harness.key_press(egui::Key::Enter);
         harness.run();
@@ -1977,16 +2584,17 @@ mod tests {
             "차단된 전송이 버퍼(토큰)를 지우면 안 된다"
         );
         // 완료 → 토큰 치환 → 전송 허용 복귀.
-        tx.send(Ok(Some(vec![PathBuf::from("/x/shot.png")])))
-            .unwrap();
-        harness.run();
+        let egui_ctx = harness.ctx.clone();
+        assert!(harness.state_mut().0.complete_clipboard_attachment(
+            &egui_ctx,
+            request,
+            Some(ClipboardAttachmentPayload::try_new(vec![PathBuf::from("/x/shot.png")]).unwrap()),
+            TEST_WS,
+        ));
         assert_eq!(buffer_of(&harness), "/x/shot.png");
         harness.key_press(egui::Key::Enter);
         harness.run();
-        assert_eq!(
-            harness.state().1,
-            vec![ComposerAction::Send("/x/shot.png".to_owned())]
-        );
+        assert_single_send(&harness.state().1, "/x/shot.png");
         std::fs::remove_file(&path).ok();
     }
 
@@ -2026,10 +2634,7 @@ mod tests {
         assert_eq!(buffer_of(&harness), "a\n");
         harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Enter);
         harness.run();
-        assert_eq!(
-            harness.state().1,
-            vec![ComposerAction::Send("a\n".to_owned())]
-        );
+        assert_single_send(&harness.state().1, "a\n");
         std::fs::remove_file(&path).ok();
     }
 
@@ -2168,11 +2773,7 @@ mod tests {
         harness.run();
         harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Enter);
         harness.run();
-        assert_eq!(
-            harness.state().1,
-            vec![ComposerAction::Send("hello".to_owned())],
-            "⌘Enter는 접힘이 아니라 전송이어야 한다"
-        );
+        assert_single_send(&harness.state().1, "hello");
         assert!(
             harness.state().0.expanded,
             "전송이 우선했으므로 접히지 않아야 한다"
@@ -2184,7 +2785,7 @@ mod tests {
     fn kittest_히스토리_위아래_탐색() {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let path = test_history_path("history-nav");
-        save_history(&path, &["one".to_owned(), "two".to_owned()]);
+        save_history(&path, &[arc_str("one"), arc_str("two")]);
         let mut harness = composer_harness(&catalog, ComposerSendKey::Enter, path.clone());
         focus_composer(&mut harness);
         // 빈 버퍼에서 ↑ → 최신("two") → ↑ → 이전("one").
@@ -2217,23 +2818,17 @@ mod tests {
         // 붙여넣기 제스처 시뮬레이션: begin_attach를 harness ctx로 직접 호출(macOS 테스트
         // 러너에선 native monitor/Ctrl+Shift+V 트리거를 이벤트로 주입할 수 없다) —
         // 토큰 삽입 + 캐럿 즉시 저장까지가 "그 프레임 show 전" 상태다.
-        let (_tx, rx) = std::sync::mpsc::channel();
         let harness_ctx = harness.ctx.clone();
-        {
+        let request = {
             let ui = &mut harness.state_mut().0;
             let mut buffer = ui.buffers.remove(TEST_WS).unwrap_or_default();
-            ui.begin_attach(&harness_ctx, rx, TEST_WS, None, &mut buffer);
+            let request = ui
+                .begin_attachment_request(&harness_ctx, TEST_WS, None, &mut buffer)
+                .unwrap();
             ui.buffers.insert(TEST_WS.to_owned(), buffer);
-        }
-        let token = harness
-            .state()
-            .0
-            .attach_task
-            .as_ref()
-            .unwrap()
-            .target
-            .token
-            .clone();
+            request
+        };
+        let token = request.target.token.clone();
         // 같은 입력 프레임에 배치된 Text 이벤트 — 정확히 1프레임만 돌린다.
         harness
             .input_mut()
@@ -2274,32 +2869,348 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// 2026-07-18 사용자 회귀: 서버는 등록됐지만 도구가 아직 발견(discover)되지 않은
-    /// 상태(Connector Center 미연결)가 실사용 DB에 흔하다 — 사용자 DB 실측: 4서버 중
-    /// 2개(도구 0개). `mcp_tools`는 서버 목록이라 이 경우 `is_empty()`가 false를 반환해
-    /// "MCP 도구 없음" 안내가 안 뜬다. **전 서버가 0개**면(신규 설치 등) 메뉴가 설명
-    /// 없이 완전히 빈 채로 뜬다 — 사용자가 "이거 동작하는 게 맞나" 확신을 못 한다.
+    fn mcp_server(id: &str, name: &str, tool_count: usize) -> connector_contract::ServerSummary {
+        connector_contract::ServerSummary {
+            id: connector_contract::ServerId::new(id),
+            name: name.to_owned(),
+            transport: connector_contract::TransportKind::Stdio,
+            enabled: true,
+            connection: connector_contract::ConnectionState::Idle,
+            tool_count,
+            error_code: None,
+        }
+    }
+
+    fn mcp_tool(index: usize, name: &str) -> connector_contract::ToolListItem {
+        connector_contract::ToolListItem {
+            id: connector_contract::ToolId::new(format!("tool-{index}")),
+            name: name.to_owned(),
+            description: Some(format!("description-{index}")),
+            permission: connector_contract::PermissionRule::Ask,
+        }
+    }
+
+    fn mcp_snapshot(
+        servers: Vec<connector_contract::ServerSummary>,
+        page: Option<connector_contract::ToolPage>,
+    ) -> connector_contract::ConnectorSnapshot {
+        connector_contract::ConnectorSnapshot {
+            config_revision: connector_contract::Revision(1),
+            servers: servers.into(),
+            tool_page: page,
+            ..connector_contract::ConnectorSnapshot::default()
+        }
+    }
+
+    fn expand_composer(harness: &mut egui_kittest::Harness<'_, ComposerHarnessState>) {
+        harness.state_mut().0.request_focus();
+        harness.run();
+        harness.run();
+    }
+
+    fn context_file_request(action: &ComposerAction) -> ContextFileRequest {
+        match action {
+            ComposerAction::RequestContextFile(request) => request.clone(),
+            other => panic!("expected context-file request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kittest_context_file_click은_placeholder와_intent만_만든다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let path = test_history_path("context-file-intent");
+        let mut harness = composer_harness(&catalog, ComposerSendKey::Enter, path.clone());
+        harness.state_mut().3 = Some(PathBuf::from("/project"));
+        expand_composer(&mut harness);
+        harness.get_by_label("@").click();
+        harness.run();
+
+        assert_eq!(harness.state().1.len(), 1, "click당 action은 하나뿐이다");
+        let request = context_file_request(&harness.state().1[0]);
+        assert_eq!(request.workspace_id(), TEST_WS);
+        assert_eq!(request.workspace_root(), Some(Path::new("/project")));
+        assert_eq!(request.request_id(), 1);
+        assert_eq!(buffer_of(&harness), request.token());
+        assert_eq!(harness.state().0.pending_context_file, Some(request));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn kittest_context_file_completion은_그사이_타이핑을_보존한다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let path = test_history_path("context-file-typing");
+        let mut harness = composer_harness(&catalog, ComposerSendKey::Enter, path.clone());
+        harness.state_mut().3 = Some(PathBuf::from("/project"));
+        expand_composer(&mut harness);
+        harness.get_by_label("@").click();
+        harness.run();
+        let request = context_file_request(&harness.state().1[0]);
+
+        harness
+            .get_by_role(egui::accesskit::Role::MultilineTextInput)
+            .type_text(" tail");
+        harness.run();
+        let egui_ctx = harness.ctx.clone();
+        assert!(harness.state_mut().0.complete_context_file(
+            &egui_ctx,
+            request,
+            Some(PathBuf::from("/project/src/main.rs")),
+            TEST_WS,
+        ));
+        assert_eq!(buffer_of(&harness), "@src/main.rs tail");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn kittest_context_file_completion은_요청시점_workspace에_적용한다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let path = test_history_path("context-file-workspace-switch");
+        let mut harness = composer_harness(&catalog, ComposerSendKey::Enter, path.clone());
+        harness.state_mut().3 = Some(PathBuf::from("/project"));
+        expand_composer(&mut harness);
+        harness.get_by_label("@").click();
+        harness.run();
+        let request = context_file_request(&harness.state().1[0]);
+        harness
+            .state_mut()
+            .0
+            .buffers
+            .insert("ws-b".to_owned(), "other draft".to_owned());
+
+        let egui_ctx = harness.ctx.clone();
+        assert!(harness.state_mut().0.complete_context_file(
+            &egui_ctx,
+            request,
+            Some(PathBuf::from("/project/README.md")),
+            "ws-b",
+        ));
+        assert_eq!(buffer_of(&harness), "@README.md");
+        assert_eq!(harness.state().0.buffers["ws-b"], "other draft");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn kittest_context_file_cancel은_삽입_padding까지_정확히_제거한다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let path = test_history_path("context-file-cancel-padding");
+        let mut harness = composer_harness(&catalog, ComposerSendKey::Enter, path.clone());
+        expand_composer(&mut harness);
+        harness
+            .get_by_role(egui::accesskit::Role::MultilineTextInput)
+            .type_text("left");
+        harness.run();
+        harness.get_by_label("@").click();
+        harness.run();
+        let request = context_file_request(&harness.state().1[0]);
+        assert_eq!(buffer_of(&harness), format!("left {}", request.token()));
+
+        let egui_ctx = harness.ctx.clone();
+        assert!(
+            harness
+                .state_mut()
+                .0
+                .complete_context_file(&egui_ctx, request, None, TEST_WS,)
+        );
+        assert_eq!(buffer_of(&harness), "left");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn kittest_context_file_new_request가_old를_대체하고_stale_completion은_무시한다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let path = test_history_path("context-file-stale");
+        let mut harness = composer_harness(&catalog, ComposerSendKey::Enter, path.clone());
+        expand_composer(&mut harness);
+        harness.get_by_label("@").click();
+        harness.run();
+        let old = context_file_request(&harness.state().1[0]);
+        harness.get_by_label("@").click();
+        harness.run();
+        let new = context_file_request(&harness.state().1[1]);
+        assert_ne!(old.request_id(), new.request_id());
+        assert!(!buffer_of(&harness).contains(old.token()));
+        assert_eq!(buffer_of(&harness), new.token());
+
+        let before = buffer_of(&harness);
+        let egui_ctx = harness.ctx.clone();
+        assert!(!harness.state_mut().0.complete_context_file(
+            &egui_ctx,
+            old,
+            Some(PathBuf::from("/stale")),
+            TEST_WS,
+        ));
+        assert_eq!(buffer_of(&harness), before);
+        assert!(
+            harness
+                .state_mut()
+                .0
+                .complete_context_file(&egui_ctx, new, None, TEST_WS,)
+        );
+        assert!(buffer_of(&harness).is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 2026-07-18 사용자 회귀: 서버는 등록됐지만 도구가 아직 발견되지 않은 상태가 흔하다.
+    /// overview의 tool_count가 0이면 저장소 요청 없이 명시적 빈 상태를 보여준다.
     #[test]
     fn kittest_mcp_도구가_0개인_서버만_있으면_안내문구가_뜬다() {
         use egui_kittest::kittest::Queryable;
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let path = test_history_path("mcp-empty-servers");
         let mut harness = composer_harness(&catalog, ComposerSendKey::Enter, path.clone());
-        // 서버는 있지만(빈 Vec 아님) 전부 도구 0개 — 실사용 DB의 "111"/"깃헙" 상태.
-        harness.state_mut().0.set_mcp_tools(vec![
-            ("111".to_owned(), vec![]),
-            ("깃헙".to_owned(), vec![]),
-        ]);
-        harness.state_mut().0.request_focus();
-        harness.run();
-        harness.run();
+        harness.state_mut().2 = mcp_snapshot(
+            vec![mcp_server("111", "111", 0), mcp_server("github", "깃헙", 0)],
+            None,
+        );
+        expand_composer(&mut harness);
         harness.get_by_label("MCP").click();
         harness.run();
         assert!(
             harness
                 .query_by_label(&catalog.t("composer.tools_empty", &[]))
                 .is_some(),
-            "도구 0개 서버만 있으면 안내 문구가 보여야 한다 — 지금은 빈 팝업만 뜬다"
+            "도구 0개 서버만 있으면 안내 문구가 보여야 한다"
+        );
+        assert!(
+            harness.state().1.is_empty(),
+            "빈 서버는 page를 요청하지 않는다"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn kittest_mcp는_상호작용_전에는_page를_요청하지_않는다() {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let path = test_history_path("mcp-lazy");
+        let mut harness = composer_harness(&catalog, ComposerSendKey::Enter, path.clone());
+        harness.state_mut().2 = mcp_snapshot(vec![mcp_server("a", "server-a", 1)], None);
+        expand_composer(&mut harness);
+        for _ in 0..300 {
+            harness.run();
+        }
+        assert!(harness.state().1.is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn kittest_mcp_popup과_서버선택은_각각_page를_한번만_요청한다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let path = test_history_path("mcp-page-intent");
+        let mut harness = composer_harness(&catalog, ComposerSendKey::Enter, path.clone());
+        harness.state_mut().2 = mcp_snapshot(
+            vec![
+                mcp_server("a", "server-a", 1),
+                mcp_server("b", "server-b", 1),
+            ],
+            None,
+        );
+        expand_composer(&mut harness);
+        harness.get_by_label("MCP").click();
+        harness.run();
+        assert_eq!(
+            harness.state().1,
+            vec![ComposerAction::RequestMcpToolPage {
+                server_id: connector_contract::ServerId::new("a"),
+                offset: 0,
+            }]
+        );
+        for _ in 0..3 {
+            harness.run();
+        }
+        assert_eq!(
+            harness.state().1.len(),
+            1,
+            "stable frame은 요청을 반복하지 않는다"
+        );
+
+        harness.state_mut().1.clear();
+        harness.get_by_label("server-b").click();
+        harness.run();
+        assert_eq!(
+            harness.state().1,
+            vec![ComposerAction::RequestMcpToolPage {
+                server_id: connector_contract::ServerId::new("b"),
+                offset: 0,
+            }]
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn kittest_mcp_mismatched_page는_렌더하지_않는다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let path = test_history_path("mcp-mismatched-page");
+        let mut harness = composer_harness(&catalog, ComposerSendKey::Enter, path.clone());
+        harness.state_mut().2 = mcp_snapshot(
+            vec![
+                mcp_server("a", "server-a", 1),
+                mcp_server("b", "server-b", 1),
+            ],
+            Some(connector_contract::ToolPage {
+                server_id: connector_contract::ServerId::new("b"),
+                offset: 0,
+                total: 1,
+                items: vec![mcp_tool(0, "foreign-tool")].into(),
+            }),
+        );
+        expand_composer(&mut harness);
+        harness.get_by_label("MCP").click();
+        harness.run();
+        assert!(harness.query_by_label("server-b · foreign-tool").is_none());
+        assert_eq!(
+            harness.state().1,
+            vec![ComposerAction::RequestMcpToolPage {
+                server_id: connector_contract::ServerId::new("a"),
+                offset: 0,
+            }]
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn kittest_mcp_4096_total은_256_page중_visible_row만_렌더한다() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let path = test_history_path("mcp-virtualized-page");
+        let mut harness = composer_harness(&catalog, ComposerSendKey::Enter, path.clone());
+        let tools = (0..MCP_TOOL_PAGE_LIMIT)
+            .map(|index| mcp_tool(index, &format!("tool-{index}")))
+            .collect::<Vec<_>>();
+        harness.state_mut().2 = mcp_snapshot(
+            vec![mcp_server("a", "server-a", 4_096)],
+            Some(connector_contract::ToolPage {
+                server_id: connector_contract::ServerId::new("a"),
+                offset: 0,
+                total: 4_096,
+                items: tools.into(),
+            }),
+        );
+        expand_composer(&mut harness);
+        MCP_TOOL_ROWS_RENDERED.store(0, std::sync::atomic::Ordering::Relaxed);
+        harness.get_by_label("MCP").click();
+        harness.run();
+        let rendered = MCP_TOOL_ROWS_RENDERED.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(rendered > 0);
+        assert!(
+            rendered < MCP_TOOL_PAGE_LIMIT,
+            "virtualized popup rendered {rendered}/{} rows",
+            MCP_TOOL_PAGE_LIMIT
+        );
+        harness.get_by_label("›").click();
+        harness.run();
+        assert_eq!(
+            harness.state().1,
+            vec![ComposerAction::RequestMcpToolPage {
+                server_id: connector_contract::ServerId::new("a"),
+                offset: MCP_TOOL_PAGE_LIMIT,
+            }]
         );
         std::fs::remove_file(&path).ok();
     }
@@ -2310,14 +3221,19 @@ mod tests {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let path = test_history_path("mcp-insert");
         let mut harness = composer_harness(&catalog, ComposerSendKey::Enter, path.clone());
-        harness.state_mut().0.set_mcp_tools(vec![(
-            "srv".to_owned(),
-            vec![("mytool".to_owned(), "설명 텍스트".to_owned())],
-        )]);
+        let mut tool = mcp_tool(0, "mytool");
+        tool.description = Some("설명 텍스트".to_owned());
+        harness.state_mut().2 = mcp_snapshot(
+            vec![mcp_server("srv", "srv", 1)],
+            Some(connector_contract::ToolPage {
+                server_id: connector_contract::ServerId::new("srv"),
+                offset: 0,
+                total: 1,
+                items: vec![tool].into(),
+            }),
+        );
         // 펼침(툴바 노출) — ⌘J 경로와 동일.
-        harness.state_mut().0.request_focus();
-        harness.run();
-        harness.run();
+        expand_composer(&mut harness);
         harness.get_by_label("MCP").click();
         harness.run();
         harness.get_by_label("srv · mytool").click();

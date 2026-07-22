@@ -879,6 +879,41 @@ pub struct WorkspaceRow {
     pub created_at: String,
 }
 
+/// Stable filesystem identity for a workspace folder. The pair is deliberately all-or-nothing:
+/// a partial `(dev, ino)` value cannot prove that a moved path still names the same directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkspaceFolderAnchor {
+    pub dev: i64,
+    pub ino: i64,
+}
+
+/// Complete, bounded workspace projection for settings/sidebar snapshots. Unlike the legacy
+/// `WorkspaceRow`, this includes the folder identity needed to detect moved paths without a
+/// per-workspace follow-up query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsWorkspaceProjectionRow {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub created_at: String,
+    pub folder_anchor: Option<WorkspaceFolderAnchor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceFindOrCreateResult {
+    pub row: SettingsWorkspaceProjectionRow,
+    pub created: bool,
+}
+
+/// Result of an atomic moved-folder compare-and-swap. `Stale` means either the persisted
+/// path/anchor no longer matches the caller's snapshot or the new filesystem identity is not the
+/// same folder. In every stale case storage performs no mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceMovedPathUpdate {
+    Updated,
+    Stale,
+}
+
 /// 권한 규칙/승인 IPC 타입은 mcp-store 소유(v2.8) — 기존 storage:: 경로 호환을 위해 재수출.
 pub use mcp_store::{ApprovalOutcome, ApprovalStatus, PendingApprovalRow, PermissionRuleRow};
 
@@ -933,6 +968,195 @@ pub struct AgentConfigRow {
     /// MCP config 주입 플래그 이름 커스텀 (migration 11). None/빈값이면 기본 `--mcp-config`.
     /// 플래그 이름만 — 경로는 항상 다음 arg로 붙는다 (`--flag=path` 규약은 후속 과제).
     pub mcp_config_flag: Option<String>,
+}
+
+/// Storage-owned hard ceilings for the settings snapshot/launch read path. Callers may project
+/// these rows into smaller UI snapshots, but cannot accidentally request an unbounded inventory.
+pub const SETTINGS_AGENT_LIMIT_MAX: usize = 1_024;
+pub const SETTINGS_ENV_PROFILE_LIMIT_MAX: usize = 256;
+pub const SETTINGS_ENV_VAR_LIMIT_MAX: usize = 4_096;
+pub const SETTINGS_CREDENTIAL_LIMIT_MAX: usize = 4_096;
+pub const SETTINGS_ENABLED_MCP_SERVER_LIMIT_MAX: usize = 256;
+pub const SETTINGS_WORKSPACE_LIMIT_MAX: usize = SETTINGS_ENV_PROFILE_LIMIT_MAX;
+pub const SETTINGS_SNAPSHOT_BYTES_MAX: usize = 4 * 1024 * 1024;
+pub const SETTINGS_ROW_BYTES_MAX: usize = 1024 * 1024;
+pub const SETTINGS_AGENT_ARGS_LIMIT_MAX: usize = 256;
+pub const SETTINGS_AGENT_ARGS_BYTES_MAX: usize = 64 * 1024;
+
+/// Lightweight MCP backend row for the Agents settings snapshot. Execution configuration and
+/// transport secrets are deliberately absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsMcpServerRow {
+    pub id: String,
+    pub name: String,
+}
+
+/// One workspace-owned env row. Including the profile id lets the app build both dotenv and
+/// legacy projections without issuing an N+1 query per profile.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsWorkspaceEnvVarRow {
+    pub profile_id: String,
+    pub key: String,
+    pub value: EnvValue,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsAgentsSnapshotRows {
+    pub agents: Vec<AgentConfigRow>,
+    pub profiles: Vec<EnvProfileRow>,
+    pub enabled_mcp_servers: Vec<SettingsMcpServerRow>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsEnvironmentSnapshotRows {
+    pub credentials: Vec<CredentialMeta>,
+    pub profiles: Vec<EnvProfileRow>,
+    pub env_vars: Vec<SettingsWorkspaceEnvVarRow>,
+}
+
+/// Same-snapshot inputs needed to launch one saved agent. `profile` remains `None` when the
+/// requested profile is absent or belongs to another workspace; callers must fail closed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsAgentLaunchRows {
+    pub agent: Option<AgentConfigRow>,
+    pub profile: Option<EnvProfileRow>,
+    pub env_vars: Vec<EnvVarRow>,
+    pub mcp_backend_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SettingsReadProbe {
+    count: usize,
+    retained_bytes: usize,
+}
+
+fn settings_sql_probe_limit(limit: usize, error_code: &str) -> anyhow::Result<i64> {
+    let probe = limit
+        .checked_add(1)
+        .with_context(|| format!("{error_code}_limit_overflow"))?;
+    i64::try_from(probe).with_context(|| format!("{error_code}_limit_conversion"))
+}
+
+fn settings_read_probe<P: rusqlite::Params>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+    item_limit: usize,
+    retained_bytes_limit: usize,
+    row_bytes_limit: usize,
+    error_code: &str,
+) -> anyhow::Result<SettingsReadProbe> {
+    let (count, retained_bytes, max_row_bytes): (i64, i64, i64) =
+        conn.query_row(sql, params, |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    let count = usize::try_from(count).with_context(|| format!("{error_code}_count_invalid"))?;
+    let retained_bytes =
+        usize::try_from(retained_bytes).with_context(|| format!("{error_code}_bytes_invalid"))?;
+    let max_row_bytes = usize::try_from(max_row_bytes)
+        .with_context(|| format!("{error_code}_row_bytes_invalid"))?;
+    anyhow::ensure!(count <= item_limit, "{error_code}_item_limit");
+    anyhow::ensure!(
+        max_row_bytes <= row_bytes_limit,
+        "{error_code}_row_bytes_limit"
+    );
+    anyhow::ensure!(
+        retained_bytes <= retained_bytes_limit,
+        "{error_code}_retained_bytes_limit"
+    );
+    Ok(SettingsReadProbe {
+        count,
+        retained_bytes,
+    })
+}
+
+type PersistedWorkspaceProjection = (String, String, String, String, Option<i64>, Option<i64>);
+
+fn settings_workspace_projection_from_persisted(
+    persisted: PersistedWorkspaceProjection,
+) -> anyhow::Result<SettingsWorkspaceProjectionRow> {
+    let (id, name, path, created_at, path_dev, path_ino) = persisted;
+    let folder_anchor = match (path_dev, path_ino) {
+        (Some(dev), Some(ino)) => Some(WorkspaceFolderAnchor { dev, ino }),
+        (None, None) => None,
+        _ => anyhow::bail!("settings_workspace_projection_anchor_invalid"),
+    };
+    Ok(SettingsWorkspaceProjectionRow {
+        id,
+        name,
+        path,
+        created_at,
+        folder_anchor,
+    })
+}
+
+fn validate_workspace_text_input(value: &str, field: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        value.len() <= SETTINGS_ROW_BYTES_MAX,
+        "settings_workspace_{field}_bytes_limit"
+    );
+    Ok(())
+}
+
+type PersistedAgentConfigRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+    Option<String>,
+    Option<String>,
+);
+
+fn settings_agent_config_from_persisted(
+    row: PersistedAgentConfigRow,
+) -> anyhow::Result<AgentConfigRow> {
+    let (
+        id,
+        name,
+        command,
+        args_json,
+        waiting_regex,
+        approval_regex,
+        error_regex,
+        done_regex,
+        mcp_proxy_enabled,
+        mcp_proxy_server_id,
+        mcp_config_flag,
+    ) = row;
+    let args: Vec<String> =
+        serde_json::from_str(&args_json).context("settings_agent_args_json_invalid")?;
+    anyhow::ensure!(
+        args.len() <= SETTINGS_AGENT_ARGS_LIMIT_MAX,
+        "settings_agent_args_item_limit"
+    );
+    let args_bytes = args
+        .iter()
+        .map(String::len)
+        .try_fold(0usize, usize::checked_add)
+        .context("settings_agent_args_bytes_overflow")?;
+    anyhow::ensure!(
+        args_bytes <= SETTINGS_AGENT_ARGS_BYTES_MAX,
+        "settings_agent_args_bytes_limit"
+    );
+    validate_args_for_persistence(&args, "agent args")?;
+    Ok(AgentConfigRow {
+        id,
+        name,
+        command,
+        args,
+        waiting_regex: waiting_regex.filter(|value| !value.is_empty()),
+        approval_regex: approval_regex.filter(|value| !value.is_empty()),
+        error_regex: error_regex.filter(|value| !value.is_empty()),
+        done_regex: done_regex.filter(|value| !value.is_empty()),
+        mcp_proxy_enabled: mcp_proxy_enabled != 0,
+        mcp_proxy_server_id: mcp_proxy_server_id.filter(|value| !value.is_empty()),
+        mcp_config_flag: mcp_config_flag.filter(|value| !value.is_empty()),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2590,6 +2814,248 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Complete-or-error workspace projection from one SQLite snapshot. The `limit + 1` count,
+    /// aggregate byte size, and maximum row size are checked in SQL before any workspace TEXT is
+    /// materialized in Rust.
+    pub fn settings_workspace_projection_rows(
+        &self,
+    ) -> anyhow::Result<Vec<SettingsWorkspaceProjectionRow>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let sql_limit = settings_sql_probe_limit(
+            SETTINGS_WORKSPACE_LIMIT_MAX,
+            "settings_workspace_projection",
+        )?;
+        let probe = settings_read_probe(
+            &tx,
+            "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+             FROM (
+                 SELECT length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                        length(CAST(path AS BLOB)) + length(CAST(created_at AS BLOB)) +
+                        length(CAST(COALESCE(path_dev, '') AS BLOB)) +
+                        length(CAST(COALESCE(path_ino, '') AS BLOB)) AS row_bytes
+                 FROM workspaces ORDER BY created_at, id LIMIT ?1
+             )",
+            [sql_limit],
+            SETTINGS_WORKSPACE_LIMIT_MAX,
+            SETTINGS_SNAPSHOT_BYTES_MAX,
+            SETTINGS_ROW_BYTES_MAX,
+            "settings_workspace_projection",
+        )?;
+        let invalid_anchors: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(CASE
+                        WHEN (path_dev IS NULL) <> (path_ino IS NULL) THEN 1 ELSE 0 END), 0)
+             FROM (
+                 SELECT path_dev, path_ino
+                 FROM workspaces ORDER BY created_at, id LIMIT ?1
+             )",
+            [sql_limit],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            invalid_anchors == 0,
+            "settings_workspace_projection_anchor_invalid"
+        );
+        let mut stmt = tx.prepare(
+            "SELECT id, name, path, created_at, path_dev, path_ino
+             FROM workspaces ORDER BY created_at, id LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([sql_limit], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?;
+        let mut projection = Vec::with_capacity(probe.count);
+        for row in rows {
+            projection.push(settings_workspace_projection_from_persisted(row?)?);
+        }
+        drop(stmt);
+        anyhow::ensure!(
+            projection.len() == probe.count,
+            "settings_workspace_projection_snapshot_changed"
+        );
+        tx.commit()?;
+        Ok(projection)
+    }
+
+    /// Finds one workspace by exact path or atomically creates its name, path, and folder anchor.
+    /// The transaction reads no more than two matching rows and fails closed before materializing
+    /// either row when duplicate paths already exist.
+    pub fn find_or_create_workspace_by_exact_path(
+        &self,
+        name: &str,
+        path: &str,
+        folder_anchor: WorkspaceFolderAnchor,
+    ) -> anyhow::Result<WorkspaceFindOrCreateResult> {
+        validate_workspace_text_input(name, "name")?;
+        validate_workspace_text_input(path, "path")?;
+        let input_bytes = name
+            .len()
+            .checked_add(path.len())
+            .context("settings_workspace_find_or_create_bytes_overflow")?;
+        anyhow::ensure!(
+            input_bytes <= SETTINGS_ROW_BYTES_MAX,
+            "settings_workspace_find_or_create_row_bytes_limit"
+        );
+
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let existing_probe = settings_read_probe(
+            &tx,
+            "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+             FROM (
+                 SELECT length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                        length(CAST(path AS BLOB)) + length(CAST(created_at AS BLOB)) +
+                        length(CAST(COALESCE(path_dev, '') AS BLOB)) +
+                        length(CAST(COALESCE(path_ino, '') AS BLOB)) AS row_bytes
+                 FROM workspaces WHERE path = ?1 ORDER BY created_at, id LIMIT 2
+             )",
+            [path],
+            2,
+            SETTINGS_SNAPSHOT_BYTES_MAX,
+            SETTINGS_ROW_BYTES_MAX,
+            "settings_workspace_exact_path",
+        )?;
+        anyhow::ensure!(
+            existing_probe.count < 2,
+            "settings_workspace_exact_path_duplicate"
+        );
+        if existing_probe.count == 1 {
+            let persisted = tx.query_row(
+                "SELECT id, name, path, created_at, path_dev, path_ino
+                 FROM workspaces WHERE path = ?1 ORDER BY created_at, id LIMIT 1",
+                [path],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )?;
+            let row = settings_workspace_projection_from_persisted(persisted)?;
+            tx.commit()?;
+            return Ok(WorkspaceFindOrCreateResult {
+                row,
+                created: false,
+            });
+        }
+
+        let id = uuid::Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO workspaces
+                (id, name, path, created_at, updated_at, path_dev, path_ino)
+             VALUES (?1, ?2, ?3,
+                strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?4, ?5)",
+            (&id, name, path, folder_anchor.dev, folder_anchor.ino),
+        )?;
+        let inserted_probe = settings_read_probe(
+            &tx,
+            "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+             FROM (
+                 SELECT length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                        length(CAST(path AS BLOB)) + length(CAST(created_at AS BLOB)) +
+                        length(CAST(COALESCE(path_dev, '') AS BLOB)) +
+                        length(CAST(COALESCE(path_ino, '') AS BLOB)) AS row_bytes
+                 FROM workspaces WHERE id = ?1 LIMIT 2
+             )",
+            [&id],
+            1,
+            SETTINGS_SNAPSHOT_BYTES_MAX,
+            SETTINGS_ROW_BYTES_MAX,
+            "settings_workspace_created",
+        )?;
+        anyhow::ensure!(
+            inserted_probe.count == 1,
+            "settings_workspace_created_missing"
+        );
+        let persisted = tx.query_row(
+            "SELECT id, name, path, created_at, path_dev, path_ino
+             FROM workspaces WHERE id = ?1",
+            [&id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        let row = settings_workspace_projection_from_persisted(persisted)?;
+        tx.commit()?;
+        Ok(WorkspaceFindOrCreateResult { row, created: true })
+    }
+
+    /// Atomically accepts a moved path only while the old path and persisted folder identity still
+    /// equal the caller's snapshot. The caller-supplied filesystem identity for `new_path` must
+    /// prove it is the same folder; otherwise this returns `Stale` without opening a transaction.
+    pub fn update_workspace_moved_path_cas(
+        &self,
+        workspace_id: &str,
+        expected_old_path: &str,
+        expected_stored_anchor: WorkspaceFolderAnchor,
+        new_path: &str,
+        new_filesystem_anchor: WorkspaceFolderAnchor,
+    ) -> anyhow::Result<WorkspaceMovedPathUpdate> {
+        validate_workspace_text_input(workspace_id, "id")?;
+        validate_workspace_text_input(expected_old_path, "expected_path")?;
+        validate_workspace_text_input(new_path, "new_path")?;
+        if new_filesystem_anchor != expected_stored_anchor {
+            return Ok(WorkspaceMovedPathUpdate::Stale);
+        }
+
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let affected = tx.execute(
+            "UPDATE workspaces
+             SET path = ?5, path_dev = ?6, path_ino = ?7,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE id = ?1 AND path = ?2 AND path_dev = ?3 AND path_ino = ?4",
+            rusqlite::params![
+                workspace_id,
+                expected_old_path,
+                expected_stored_anchor.dev,
+                expected_stored_anchor.ino,
+                new_path,
+                new_filesystem_anchor.dev,
+                new_filesystem_anchor.ino,
+            ],
+        )?;
+        if affected == 0 {
+            tx.commit()?;
+            return Ok(WorkspaceMovedPathUpdate::Stale);
+        }
+        anyhow::ensure!(affected == 1, "settings_workspace_moved_path_multiple_rows");
+        let probe = settings_read_probe(
+            &tx,
+            "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+             FROM (
+                 SELECT length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                        length(CAST(path AS BLOB)) + length(CAST(created_at AS BLOB)) +
+                        length(CAST(COALESCE(path_dev, '') AS BLOB)) +
+                        length(CAST(COALESCE(path_ino, '') AS BLOB)) AS row_bytes
+                 FROM workspaces WHERE id = ?1 LIMIT 2
+             )",
+            [workspace_id],
+            1,
+            SETTINGS_SNAPSHOT_BYTES_MAX,
+            SETTINGS_ROW_BYTES_MAX,
+            "settings_workspace_moved_path",
+        )?;
+        anyhow::ensure!(probe.count == 1, "settings_workspace_moved_path_missing");
+        tx.commit()?;
+        Ok(WorkspaceMovedPathUpdate::Updated)
+    }
+
     /// 런타임이 없는(또는 warm) 워크스페이스의 활동 화면에 쓸 영속 pane snapshot —
     /// (workspace_id, 제목, 세션 cwd). `sessions` 전체는 닫힌 과거 이력도 남으므로,
     /// 현재 복원 레이아웃에 연결된 `mux_panes`만 읽는다. 한 쿼리로 모든 workspace를
@@ -3012,6 +3478,85 @@ impl Db {
             .with_context(|| format!("workspace 경로 저장 실패: {id}"))?;
         anyhow::ensure!(affected == 1, "workspace 없음: {id}");
         Ok(())
+    }
+
+    /// Atomically replaces one exact workspace's project path and optional filesystem anchor.
+    /// The anchor is all-or-nothing: a partial `(dev, ino)` pair is rejected before SQLite is
+    /// touched. The complete row is re-read under the same IMMEDIATE transaction and checked
+    /// against the settings projection bounds before commit, so an oversized postcondition rolls
+    /// the path and anchor back together.
+    pub fn set_workspace_path_and_anchor(
+        &self,
+        workspace_id: &str,
+        path: &str,
+        path_dev: Option<i64>,
+        path_ino: Option<i64>,
+    ) -> anyhow::Result<SettingsWorkspaceProjectionRow> {
+        validate_workspace_text_input(workspace_id, "id")?;
+        validate_workspace_text_input(path, "path")?;
+        anyhow::ensure!(
+            path_dev.is_some() == path_ino.is_some(),
+            "settings_workspace_path_anchor_partial"
+        );
+        let input_bytes = workspace_id
+            .len()
+            .checked_add(path.len())
+            .context("settings_workspace_path_input_bytes_overflow")?;
+        anyhow::ensure!(
+            input_bytes <= SETTINGS_ROW_BYTES_MAX,
+            "settings_workspace_path_input_row_bytes_limit"
+        );
+
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let affected = tx
+            .execute(
+                "UPDATE workspaces
+                 SET path = ?2, path_dev = ?3, path_ino = ?4,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE id = ?1",
+                (workspace_id, path, path_dev, path_ino),
+            )
+            .with_context(|| format!("workspace project path update failed: {workspace_id}"))?;
+        anyhow::ensure!(affected == 1, "settings_workspace_path_exact_id_missing");
+
+        let probe = settings_read_probe(
+            &tx,
+            "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+             FROM (
+                 SELECT length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                        length(CAST(path AS BLOB)) + length(CAST(created_at AS BLOB)) +
+                        length(CAST(COALESCE(path_dev, '') AS BLOB)) +
+                        length(CAST(COALESCE(path_ino, '') AS BLOB)) AS row_bytes
+                 FROM workspaces WHERE id = ?1 LIMIT 2
+             )",
+            [workspace_id],
+            1,
+            SETTINGS_SNAPSHOT_BYTES_MAX,
+            SETTINGS_ROW_BYTES_MAX,
+            "settings_workspace_path_postcondition",
+        )?;
+        anyhow::ensure!(
+            probe.count == 1,
+            "settings_workspace_path_postcondition_missing"
+        );
+        let persisted = tx.query_row(
+            "SELECT id, name, path, created_at, path_dev, path_ino
+             FROM workspaces WHERE id = ?1",
+            [workspace_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        let projection = settings_workspace_projection_from_persisted(persisted)?;
+        tx.commit()?;
+        Ok(projection)
     }
 
     /// workspace의 프로젝트 경로. 없는 id는 None, 미설정은 Some("").
@@ -3621,6 +4166,18 @@ impl Db {
     ) -> anyhow::Result<ConnectorConfigCas<mcp_store::McpServerRow>> {
         self.write_connector_config_cas(expected, |conn| {
             mcp_store::ensure_server_by_url_in_transaction(conn, row)
+        })
+    }
+
+    /// Canonical-URL reconnect path. Exactly one existing row is re-enabled in the same expected-
+    /// revision transaction; historical duplicate canonical rows fail before any mutation.
+    pub fn ensure_enabled_mcp_server_by_url_revision_cas(
+        &mut self,
+        expected: ConnectorConfigRevision,
+        row: &mcp_store::McpServerRow,
+    ) -> anyhow::Result<ConnectorConfigCas<mcp_store::McpServerRow>> {
+        self.write_connector_config_cas(expected, |conn| {
+            mcp_store::ensure_enabled_server_by_url_in_transaction(conn, row)
         })
     }
 
@@ -4384,6 +4941,560 @@ impl Db {
             );
         }
         Ok(())
+    }
+
+    fn settings_agent_args_inventory_preflight(
+        conn: &Connection,
+        sql_limit: i64,
+    ) -> anyhow::Result<()> {
+        let (max_json_bytes, max_args, invalid_rows): (i64, i64, i64) = conn.query_row(
+            "SELECT COALESCE(MAX(length(CAST(args_json AS BLOB))), 0),
+                    COALESCE(MAX(CASE
+                        WHEN json_valid(args_json) = 1 AND json_type(args_json) = 'array'
+                        THEN json_array_length(args_json) ELSE 0 END), 0),
+                    COALESCE(SUM(CASE
+                        WHEN json_valid(args_json) = 1 AND json_type(args_json) = 'array'
+                        THEN 0 ELSE 1 END), 0)
+             FROM (
+                 SELECT args_json FROM agent_configs WHERE deleted_at IS NULL
+                 ORDER BY created_at, id LIMIT ?1
+             )",
+            [sql_limit],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let max_json_bytes =
+            usize::try_from(max_json_bytes).context("settings_agent_args_json_bytes_invalid")?;
+        let max_args = usize::try_from(max_args).context("settings_agent_args_count_invalid")?;
+        anyhow::ensure!(
+            max_json_bytes <= SETTINGS_AGENT_ARGS_BYTES_MAX,
+            "settings_agent_args_json_bytes_limit"
+        );
+        anyhow::ensure!(
+            max_args <= SETTINGS_AGENT_ARGS_LIMIT_MAX,
+            "settings_agent_args_item_limit"
+        );
+        anyhow::ensure!(invalid_rows == 0, "settings_agent_args_json_invalid");
+        Ok(())
+    }
+
+    fn settings_agent_configs_in_snapshot(
+        conn: &Connection,
+        sql_limit: i64,
+        capacity: usize,
+    ) -> anyhow::Result<Vec<AgentConfigRow>> {
+        let mut stmt = conn.prepare(
+            "SELECT id, name, command, args_json,
+                    waiting_regex, approval_regex, error_regex, done_regex,
+                    mcp_proxy_enabled, mcp_proxy_server_id, mcp_config_flag
+             FROM agent_configs WHERE deleted_at IS NULL
+             ORDER BY created_at, id LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([sql_limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+            ))
+        })?;
+        let mut agents = Vec::with_capacity(capacity);
+        for row in rows {
+            agents.push(settings_agent_config_from_persisted(row?)?);
+        }
+        Ok(agents)
+    }
+
+    fn settings_agent_args_point_preflight(
+        conn: &Connection,
+        agent_id: &str,
+    ) -> anyhow::Result<()> {
+        let Some((json_bytes, args_count, valid_array)) = conn
+            .query_row(
+                "SELECT length(CAST(args_json AS BLOB)),
+                        CASE
+                            WHEN json_valid(args_json) = 1 AND json_type(args_json) = 'array'
+                            THEN json_array_length(args_json) ELSE 0 END,
+                        CASE
+                            WHEN json_valid(args_json) = 1 AND json_type(args_json) = 'array'
+                            THEN 1 ELSE 0 END
+                 FROM agent_configs WHERE id = ?1 AND deleted_at IS NULL",
+                [agent_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            return Ok(());
+        };
+        let json_bytes =
+            usize::try_from(json_bytes).context("settings_agent_launch_args_json_bytes_invalid")?;
+        let args_count =
+            usize::try_from(args_count).context("settings_agent_launch_args_count_invalid")?;
+        anyhow::ensure!(
+            json_bytes <= SETTINGS_AGENT_ARGS_BYTES_MAX,
+            "settings_agent_launch_args_json_bytes_limit"
+        );
+        anyhow::ensure!(
+            args_count <= SETTINGS_AGENT_ARGS_LIMIT_MAX,
+            "settings_agent_launch_args_item_limit"
+        );
+        anyhow::ensure!(valid_array == 1, "settings_agent_launch_args_json_invalid");
+        Ok(())
+    }
+
+    /// Complete-or-error Agents settings snapshot from one SQLite read transaction. Every count,
+    /// row size, aggregate size, and args JSON shape is checked before any TEXT reaches Rust.
+    pub fn settings_agents_snapshot_rows(
+        &self,
+        workspace_id: &str,
+    ) -> anyhow::Result<SettingsAgentsSnapshotRows> {
+        let tx = self.conn.unchecked_transaction()?;
+        let agent_limit =
+            settings_sql_probe_limit(SETTINGS_AGENT_LIMIT_MAX, "settings_agents_snapshot")?;
+        let profile_limit = settings_sql_probe_limit(
+            SETTINGS_ENV_PROFILE_LIMIT_MAX,
+            "settings_agent_profiles_snapshot",
+        )?;
+        let backend_limit = settings_sql_probe_limit(
+            SETTINGS_ENABLED_MCP_SERVER_LIMIT_MAX,
+            "settings_agent_backends_snapshot",
+        )?;
+        let agent_probe = settings_read_probe(
+            &tx,
+            "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+             FROM (
+                 SELECT length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                        length(CAST(command AS BLOB)) + length(CAST(args_json AS BLOB)) +
+                        length(CAST(COALESCE(waiting_regex, '') AS BLOB)) +
+                        length(CAST(COALESCE(approval_regex, '') AS BLOB)) +
+                        length(CAST(COALESCE(error_regex, '') AS BLOB)) +
+                        length(CAST(COALESCE(done_regex, '') AS BLOB)) +
+                        length(CAST(COALESCE(mcp_proxy_server_id, '') AS BLOB)) +
+                        length(CAST(COALESCE(mcp_config_flag, '') AS BLOB)) AS row_bytes
+                 FROM agent_configs WHERE deleted_at IS NULL
+                 ORDER BY created_at, id LIMIT ?1
+             )",
+            [agent_limit],
+            SETTINGS_AGENT_LIMIT_MAX,
+            SETTINGS_SNAPSHOT_BYTES_MAX,
+            SETTINGS_ROW_BYTES_MAX,
+            "settings_agents_snapshot",
+        )?;
+        Self::settings_agent_args_inventory_preflight(&tx, agent_limit)?;
+        let profile_probe = settings_read_probe(
+            &tx,
+            "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+             FROM (
+                 SELECT length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                        length(CAST(kind AS BLOB)) AS row_bytes
+                 FROM env_profiles WHERE workspace_id = ?1
+                 ORDER BY created_at, id LIMIT ?2
+             )",
+            rusqlite::params![workspace_id, profile_limit],
+            SETTINGS_ENV_PROFILE_LIMIT_MAX,
+            SETTINGS_SNAPSHOT_BYTES_MAX,
+            SETTINGS_ROW_BYTES_MAX,
+            "settings_agent_profiles_snapshot",
+        )?;
+        let backend_probe = settings_read_probe(
+            &tx,
+            "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+             FROM (
+                 SELECT length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) AS row_bytes
+                 FROM mcp_servers WHERE enabled != 0
+                 ORDER BY created_at, id LIMIT ?1
+             )",
+            [backend_limit],
+            SETTINGS_ENABLED_MCP_SERVER_LIMIT_MAX,
+            SETTINGS_SNAPSHOT_BYTES_MAX,
+            SETTINGS_ROW_BYTES_MAX,
+            "settings_agent_backends_snapshot",
+        )?;
+        let retained_bytes = agent_probe
+            .retained_bytes
+            .checked_add(profile_probe.retained_bytes)
+            .and_then(|bytes| bytes.checked_add(backend_probe.retained_bytes))
+            .context("settings_agents_snapshot_bytes_overflow")?;
+        anyhow::ensure!(
+            retained_bytes <= SETTINGS_SNAPSHOT_BYTES_MAX,
+            "settings_agents_snapshot_retained_bytes_limit"
+        );
+
+        let agents = Self::settings_agent_configs_in_snapshot(&tx, agent_limit, agent_probe.count)?;
+        let profiles = {
+            let mut stmt = tx.prepare(
+                "SELECT id, name, kind, is_production FROM env_profiles
+                 WHERE workspace_id = ?1 ORDER BY created_at, id LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![workspace_id, profile_limit], |row| {
+                Ok(EnvProfileRow {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    kind: row.get(2)?,
+                    is_production: row.get(3)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let enabled_mcp_servers = {
+            let mut stmt = tx.prepare(
+                "SELECT id, name FROM mcp_servers WHERE enabled != 0
+                 ORDER BY created_at, id LIMIT ?1",
+            )?;
+            let rows = stmt.query_map([backend_limit], |row| {
+                Ok(SettingsMcpServerRow {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        tx.commit()
+            .context("settings agents snapshot transaction commit failed")?;
+        Ok(SettingsAgentsSnapshotRows {
+            agents,
+            profiles,
+            enabled_mcp_servers,
+        })
+    }
+
+    /// Complete-or-error Environment settings snapshot. The workspace env join removes the old
+    /// per-profile N+1 read while keeping credentials, profiles, and vars in one stable snapshot.
+    pub fn settings_environment_snapshot_rows(
+        &self,
+        workspace_id: &str,
+    ) -> anyhow::Result<SettingsEnvironmentSnapshotRows> {
+        let tx = self.conn.unchecked_transaction()?;
+        let credential_limit = settings_sql_probe_limit(
+            SETTINGS_CREDENTIAL_LIMIT_MAX,
+            "settings_credentials_snapshot",
+        )?;
+        let profile_limit = settings_sql_probe_limit(
+            SETTINGS_ENV_PROFILE_LIMIT_MAX,
+            "settings_env_profiles_snapshot",
+        )?;
+        let env_var_limit =
+            settings_sql_probe_limit(SETTINGS_ENV_VAR_LIMIT_MAX, "settings_env_vars_snapshot")?;
+        let credential_probe = settings_read_probe(
+            &tx,
+            "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+             FROM (
+                 SELECT length(CAST(id AS BLOB)) + length(CAST(provider AS BLOB)) +
+                        length(CAST(label AS BLOB)) + length(CAST(credential_kind AS BLOB)) +
+                        length(CAST(COALESCE(masked_hint, '') AS BLOB)) +
+                        length(CAST(COALESCE(workspace_id, '') AS BLOB)) AS row_bytes
+                 FROM credentials WHERE workspace_id IS NULL OR workspace_id = ?1
+                 ORDER BY created_at, id LIMIT ?2
+             )",
+            rusqlite::params![workspace_id, credential_limit],
+            SETTINGS_CREDENTIAL_LIMIT_MAX,
+            SETTINGS_SNAPSHOT_BYTES_MAX,
+            SETTINGS_ROW_BYTES_MAX,
+            "settings_credentials_snapshot",
+        )?;
+        let profile_probe = settings_read_probe(
+            &tx,
+            "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+             FROM (
+                 SELECT length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                        length(CAST(kind AS BLOB)) AS row_bytes
+                 FROM env_profiles WHERE workspace_id = ?1
+                 ORDER BY created_at, id LIMIT ?2
+             )",
+            rusqlite::params![workspace_id, profile_limit],
+            SETTINGS_ENV_PROFILE_LIMIT_MAX,
+            SETTINGS_SNAPSHOT_BYTES_MAX,
+            SETTINGS_ROW_BYTES_MAX,
+            "settings_env_profiles_snapshot",
+        )?;
+        let env_var_probe = settings_read_probe(
+            &tx,
+            "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+             FROM (
+                 SELECT length(CAST(p.id AS BLOB)) + length(CAST(v.key AS BLOB)) +
+                        length(CAST(v.kind AS BLOB)) +
+                        length(CAST(COALESCE(v.plain_value, '') AS BLOB)) +
+                        length(CAST(COALESCE(v.credential_id, '') AS BLOB)) AS row_bytes
+                 FROM env_vars v JOIN env_profiles p ON p.id = v.profile_id
+                 WHERE p.workspace_id = ?1 ORDER BY p.created_at, p.id, v.key LIMIT ?2
+             )",
+            rusqlite::params![workspace_id, env_var_limit],
+            SETTINGS_ENV_VAR_LIMIT_MAX,
+            SETTINGS_SNAPSHOT_BYTES_MAX,
+            SETTINGS_ROW_BYTES_MAX,
+            "settings_env_vars_snapshot",
+        )?;
+        let retained_bytes = credential_probe
+            .retained_bytes
+            .checked_add(profile_probe.retained_bytes)
+            .and_then(|bytes| bytes.checked_add(env_var_probe.retained_bytes))
+            .context("settings_environment_snapshot_bytes_overflow")?;
+        anyhow::ensure!(
+            retained_bytes <= SETTINGS_SNAPSHOT_BYTES_MAX,
+            "settings_environment_snapshot_retained_bytes_limit"
+        );
+
+        let credentials = {
+            let mut stmt = tx.prepare(
+                "SELECT id, provider, label, credential_kind, masked_hint, workspace_id
+                 FROM credentials WHERE workspace_id IS NULL OR workspace_id = ?1
+                 ORDER BY created_at, id LIMIT ?2",
+            )?;
+            let rows =
+                stmt.query_map(rusqlite::params![workspace_id, credential_limit], |row| {
+                    Ok(CredentialMeta {
+                        id: row.get(0)?,
+                        provider: row.get(1)?,
+                        label: row.get(2)?,
+                        credential_kind: row.get(3)?,
+                        masked_hint: row.get(4)?,
+                        workspace_id: row.get(5)?,
+                    })
+                })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let profiles = {
+            let mut stmt = tx.prepare(
+                "SELECT id, name, kind, is_production FROM env_profiles
+                 WHERE workspace_id = ?1 ORDER BY created_at, id LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![workspace_id, profile_limit], |row| {
+                Ok(EnvProfileRow {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    kind: row.get(2)?,
+                    is_production: row.get(3)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let env_vars = {
+            let mut stmt = tx.prepare(
+                "SELECT p.id, v.key, v.kind, v.plain_value, v.credential_id
+                 FROM env_vars v JOIN env_profiles p ON p.id = v.profile_id
+                 WHERE p.workspace_id = ?1 ORDER BY p.created_at, p.id, v.key LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![workspace_id, env_var_limit], |row| {
+                let kind: String = row.get(2)?;
+                let value = if kind == "secret" {
+                    EnvValue::Secret {
+                        credential_id: row.get(4)?,
+                    }
+                } else {
+                    EnvValue::Plain(row.get::<_, Option<String>>(3)?.unwrap_or_default())
+                };
+                Ok(SettingsWorkspaceEnvVarRow {
+                    profile_id: row.get(0)?,
+                    key: row.get(1)?,
+                    value,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        tx.commit()
+            .context("settings environment snapshot transaction commit failed")?;
+        Ok(SettingsEnvironmentSnapshotRows {
+            credentials,
+            profiles,
+            env_vars,
+        })
+    }
+
+    /// Bounded point/child read for one agent launch. Agent JSON, optional workspace profile, and
+    /// all profile vars share one read transaction; a stale/cross-workspace profile yields no vars.
+    pub fn settings_agent_launch_rows(
+        &self,
+        workspace_id: &str,
+        agent_id: &str,
+        profile_id: Option<&str>,
+    ) -> anyhow::Result<SettingsAgentLaunchRows> {
+        let tx = self.conn.unchecked_transaction()?;
+        let agent_sql_limit = settings_sql_probe_limit(1, "settings_agent_launch")?;
+        let agent_probe = settings_read_probe(
+            &tx,
+            "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+             FROM (
+                 SELECT length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                        length(CAST(command AS BLOB)) + length(CAST(args_json AS BLOB)) +
+                        length(CAST(COALESCE(waiting_regex, '') AS BLOB)) +
+                        length(CAST(COALESCE(approval_regex, '') AS BLOB)) +
+                        length(CAST(COALESCE(error_regex, '') AS BLOB)) +
+                        length(CAST(COALESCE(done_regex, '') AS BLOB)) +
+                        length(CAST(COALESCE(mcp_proxy_server_id, '') AS BLOB)) +
+                        length(CAST(COALESCE(mcp_config_flag, '') AS BLOB)) AS row_bytes
+                 FROM agent_configs WHERE id = ?1 AND deleted_at IS NULL LIMIT ?2
+             )",
+            rusqlite::params![agent_id, agent_sql_limit],
+            1,
+            SETTINGS_SNAPSHOT_BYTES_MAX,
+            SETTINGS_ROW_BYTES_MAX,
+            "settings_agent_launch",
+        )?;
+        Self::settings_agent_args_point_preflight(&tx, agent_id)?;
+
+        let profile_sql_limit = settings_sql_probe_limit(1, "settings_agent_launch_profile")?;
+        let env_var_sql_limit =
+            settings_sql_probe_limit(SETTINGS_ENV_VAR_LIMIT_MAX, "settings_agent_launch_env")?;
+        let (profile_probe, env_var_probe) = if let Some(profile_id) = profile_id {
+            let profile_probe = settings_read_probe(
+                &tx,
+                "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+                 FROM (
+                     SELECT length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                            length(CAST(kind AS BLOB)) AS row_bytes
+                     FROM env_profiles WHERE id = ?1 AND workspace_id = ?2 LIMIT ?3
+                 )",
+                rusqlite::params![profile_id, workspace_id, profile_sql_limit],
+                1,
+                SETTINGS_SNAPSHOT_BYTES_MAX,
+                SETTINGS_ROW_BYTES_MAX,
+                "settings_agent_launch_profile",
+            )?;
+            let env_var_probe = settings_read_probe(
+                &tx,
+                "SELECT COUNT(*), COALESCE(SUM(row_bytes), 0), COALESCE(MAX(row_bytes), 0)
+                 FROM (
+                     SELECT length(CAST(v.key AS BLOB)) + length(CAST(v.kind AS BLOB)) +
+                            length(CAST(COALESCE(v.plain_value, '') AS BLOB)) +
+                            length(CAST(COALESCE(v.credential_id, '') AS BLOB)) AS row_bytes
+                     FROM env_vars v JOIN env_profiles p ON p.id = v.profile_id
+                     WHERE p.id = ?1 AND p.workspace_id = ?2 ORDER BY v.key LIMIT ?3
+                 )",
+                rusqlite::params![profile_id, workspace_id, env_var_sql_limit],
+                SETTINGS_ENV_VAR_LIMIT_MAX,
+                SETTINGS_SNAPSHOT_BYTES_MAX,
+                SETTINGS_ROW_BYTES_MAX,
+                "settings_agent_launch_env",
+            )?;
+            (profile_probe, env_var_probe)
+        } else {
+            (
+                SettingsReadProbe {
+                    count: 0,
+                    retained_bytes: 0,
+                },
+                SettingsReadProbe {
+                    count: 0,
+                    retained_bytes: 0,
+                },
+            )
+        };
+        let retained_bytes = agent_probe
+            .retained_bytes
+            .checked_add(profile_probe.retained_bytes)
+            .and_then(|bytes| bytes.checked_add(env_var_probe.retained_bytes))
+            .context("settings_agent_launch_bytes_overflow")?;
+        anyhow::ensure!(
+            retained_bytes <= SETTINGS_SNAPSHOT_BYTES_MAX,
+            "settings_agent_launch_retained_bytes_limit"
+        );
+
+        let agent = tx
+            .query_row(
+                "SELECT id, name, command, args_json,
+                        waiting_regex, approval_regex, error_regex, done_regex,
+                        mcp_proxy_enabled, mcp_proxy_server_id, mcp_config_flag
+                 FROM agent_configs WHERE id = ?1 AND deleted_at IS NULL",
+                [agent_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(settings_agent_config_from_persisted)
+            .transpose()?;
+        let profile = if let Some(profile_id) = profile_id {
+            tx.query_row(
+                "SELECT id, name, kind, is_production FROM env_profiles
+                 WHERE id = ?1 AND workspace_id = ?2",
+                [profile_id, workspace_id],
+                |row| {
+                    Ok(EnvProfileRow {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        kind: row.get(2)?,
+                        is_production: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?
+        } else {
+            None
+        };
+        let env_vars = if let Some(profile_id) = profile_id
+            && profile.is_some()
+        {
+            let mut stmt = tx.prepare(
+                "SELECT v.key, v.kind, v.plain_value, v.credential_id
+                 FROM env_vars v JOIN env_profiles p ON p.id = v.profile_id
+                 WHERE p.id = ?1 AND p.workspace_id = ?2 ORDER BY v.key LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![profile_id, workspace_id, env_var_sql_limit],
+                |row| {
+                    let kind: String = row.get(1)?;
+                    let value = if kind == "secret" {
+                        EnvValue::Secret {
+                            credential_id: row.get(3)?,
+                        }
+                    } else {
+                        EnvValue::Plain(row.get::<_, Option<String>>(2)?.unwrap_or_default())
+                    };
+                    Ok(EnvVarRow {
+                        key: row.get(0)?,
+                        value,
+                    })
+                },
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+        let mcp_backend_enabled = if let Some(server_id) = agent
+            .as_ref()
+            .filter(|agent| agent.mcp_proxy_enabled)
+            .and_then(|agent| agent.mcp_proxy_server_id.as_deref())
+        {
+            tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM mcp_servers WHERE id = ?1 AND enabled != 0)",
+                [server_id],
+                |row| row.get::<_, bool>(0),
+            )?
+        } else {
+            false
+        };
+        tx.commit()
+            .context("settings agent launch transaction commit failed")?;
+        Ok(SettingsAgentLaunchRows {
+            agent,
+            profile,
+            env_vars,
+            mcp_backend_enabled,
+        })
     }
 
     /// agent config 등록 (설계문서 PR-09/12). args는 array로만 저장한다 (완료 기준).
@@ -5370,6 +6481,370 @@ mod tests {
         assert_eq!(db.workspace_path("nope").unwrap(), None);
     }
 
+    #[test]
+    fn workspace_path_anchor_atomic은_exact_id의_pair만_갱신하고_partial을_거부한다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace_id = db.create_workspace("atomic path").unwrap();
+
+        let projection = db
+            .set_workspace_path_and_anchor(&workspace_id, "/project", Some(11), Some(22))
+            .unwrap();
+        assert_eq!(projection.id, workspace_id);
+        assert_eq!(projection.path, "/project");
+        assert_eq!(
+            projection.folder_anchor,
+            Some(WorkspaceFolderAnchor { dev: 11, ino: 22 })
+        );
+
+        for (dev, ino) in [(Some(33), None), (None, Some(44))] {
+            let error = db
+                .set_workspace_path_and_anchor(&workspace_id, "/partial", dev, ino)
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("settings_workspace_path_anchor_partial"));
+        }
+        assert_eq!(
+            db.workspace_path(&workspace_id).unwrap().as_deref(),
+            Some("/project")
+        );
+        assert_eq!(db.workspace_anchor(&workspace_id).unwrap(), Some((11, 22)));
+
+        let cleared = db
+            .set_workspace_path_and_anchor(&workspace_id, "/without-anchor", None, None)
+            .unwrap();
+        assert_eq!(cleared.path, "/without-anchor");
+        assert_eq!(cleared.folder_anchor, None);
+        assert!(
+            db.set_workspace_path_and_anchor("missing", "/must-not-exist", None, None)
+                .unwrap_err()
+                .to_string()
+                .contains("settings_workspace_path_exact_id_missing")
+        );
+    }
+
+    #[test]
+    fn workspace_path_anchor_atomic은_injected_failure에서_path와_anchor를_rollback한다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace_id = db.create_workspace("rollback path").unwrap();
+        db.set_workspace_path_and_anchor(&workspace_id, "/old", Some(101), Some(202))
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_workspace_path_anchor
+                 AFTER UPDATE OF path, path_dev, path_ino ON workspaces
+                 WHEN NEW.path = '/injected-failure'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected workspace path/anchor failure');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(
+            db.set_workspace_path_and_anchor(
+                &workspace_id,
+                "/injected-failure",
+                Some(303),
+                Some(404),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            db.workspace_path(&workspace_id).unwrap().as_deref(),
+            Some("/old")
+        );
+        assert_eq!(
+            db.workspace_anchor(&workspace_id).unwrap(),
+            Some((101, 202))
+        );
+    }
+
+    #[test]
+    fn workspace_path_anchor_atomic은_oversized_postcondition을_commit전에_rollback한다() {
+        let db = Db::open_in_memory().unwrap();
+        let oversized_name = "x".repeat(SETTINGS_ROW_BYTES_MAX);
+        db.conn
+            .execute(
+                "INSERT INTO workspaces
+                    (id, name, path, created_at, updated_at, path_dev, path_ino)
+                 VALUES ('oversized-workspace', ?1, '/old', '', '', 7, 9)",
+                [&oversized_name],
+            )
+            .unwrap();
+
+        let error = db
+            .set_workspace_path_and_anchor("oversized-workspace", "/new", Some(10), Some(12))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("settings_workspace_path_postcondition_row_bytes_limit")
+        );
+        assert_eq!(
+            db.workspace_path("oversized-workspace").unwrap().as_deref(),
+            Some("/old")
+        );
+        assert_eq!(
+            db.workspace_anchor("oversized-workspace").unwrap(),
+            Some((7, 9))
+        );
+    }
+
+    #[test]
+    fn settings_workspace_projection은_256행_exact를_허용하고_plus_one을_거부한다() {
+        let db = Db::open_in_memory().unwrap();
+        db.conn
+            .execute(
+                "WITH RECURSIVE seq(n) AS (
+                     SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n < ?1
+                 )
+                 INSERT INTO workspaces
+                    (id, name, path, created_at, updated_at, path_dev, path_ino)
+                 SELECT printf('workspace-%03d', n), 'workspace', printf('/workspace/%03d', n),
+                        printf('%08d', n), printf('%08d', n), 7, 9 FROM seq",
+                [i64::try_from(SETTINGS_WORKSPACE_LIMIT_MAX - 1).unwrap()],
+            )
+            .unwrap();
+
+        let rows = db.settings_workspace_projection_rows().unwrap();
+        assert_eq!(rows.len(), SETTINGS_WORKSPACE_LIMIT_MAX);
+        assert_eq!(
+            rows[0].folder_anchor,
+            Some(WorkspaceFolderAnchor { dev: 7, ino: 9 })
+        );
+
+        db.conn
+            .execute(
+                "INSERT INTO workspaces
+                    (id, name, path, created_at, updated_at, path_dev, path_ino)
+                 VALUES ('workspace-over-limit', 'workspace', '/workspace/over-limit',
+                         '99999999', '99999999', 7, 9)",
+                [],
+            )
+            .unwrap();
+        let error = db.settings_workspace_projection_rows().unwrap_err();
+        assert!(
+            format!("{error:#}").contains("settings_workspace_projection_item_limit"),
+            "limit + 1 count must fail before row materialization: {error:#}"
+        );
+    }
+
+    #[test]
+    fn settings_workspace_projection은_row와_aggregate_byte_exact_plus_one을_강제한다() {
+        let row_db = Db::open_in_memory().unwrap();
+        let exact_row_name = "x".repeat(SETTINGS_ROW_BYTES_MAX - 1);
+        row_db
+            .conn
+            .execute(
+                "INSERT INTO workspaces
+                    (id, name, path, created_at, updated_at, path_dev, path_ino)
+                 VALUES ('r', ?1, '', '', '', NULL, NULL)",
+                [&exact_row_name],
+            )
+            .unwrap();
+        assert_eq!(
+            row_db.settings_workspace_projection_rows().unwrap().len(),
+            1
+        );
+        row_db
+            .conn
+            .execute(
+                "UPDATE workspaces SET name = name || 'x' WHERE id = 'r'",
+                [],
+            )
+            .unwrap();
+        let row_error = row_db.settings_workspace_projection_rows().unwrap_err();
+        assert!(format!("{row_error:#}").contains("settings_workspace_projection_row_bytes_limit"));
+
+        let aggregate_db = Db::open_in_memory().unwrap();
+        let exact_row_name = "y".repeat(SETTINGS_ROW_BYTES_MAX - 1);
+        for id in ["a", "b", "c", "d"] {
+            aggregate_db
+                .conn
+                .execute(
+                    "INSERT INTO workspaces
+                        (id, name, path, created_at, updated_at, path_dev, path_ino)
+                     VALUES (?1, ?2, '', '', '', NULL, NULL)",
+                    (id, &exact_row_name),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            aggregate_db
+                .settings_workspace_projection_rows()
+                .unwrap()
+                .len(),
+            4
+        );
+        aggregate_db
+            .conn
+            .execute(
+                "INSERT INTO workspaces
+                    (id, name, path, created_at, updated_at, path_dev, path_ino)
+                 VALUES ('e', '', '', '', '', NULL, NULL)",
+                [],
+            )
+            .unwrap();
+        let aggregate_error = aggregate_db
+            .settings_workspace_projection_rows()
+            .unwrap_err();
+        assert!(
+            format!("{aggregate_error:#}")
+                .contains("settings_workspace_projection_retained_bytes_limit")
+        );
+    }
+
+    #[test]
+    fn workspace_find_or_create_exact_path는_name_path_anchor를_한번에_생성하고_재사용한다() {
+        let db = Db::open_in_memory().unwrap();
+        let anchor = WorkspaceFolderAnchor { dev: 11, ino: 22 };
+        let created = db
+            .find_or_create_workspace_by_exact_path("project", "/project", anchor)
+            .unwrap();
+        assert!(created.created);
+        assert_eq!(created.row.name, "project");
+        assert_eq!(created.row.path, "/project");
+        assert_eq!(created.row.folder_anchor, Some(anchor));
+
+        let reused = db
+            .find_or_create_workspace_by_exact_path(
+                "ignored-new-name",
+                "/project",
+                WorkspaceFolderAnchor { dev: 33, ino: 44 },
+            )
+            .unwrap();
+        assert!(!reused.created);
+        assert_eq!(reused.row.id, created.row.id);
+        assert_eq!(reused.row.name, "project");
+        assert_eq!(reused.row.folder_anchor, Some(anchor));
+        assert_eq!(db.list_workspaces().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn workspace_find_or_create_exact_path는_duplicate를_fail_closed한다() {
+        let db = Db::open_in_memory().unwrap();
+        for id in ["duplicate-a", "duplicate-b", "duplicate-c"] {
+            db.conn
+                .execute(
+                    "INSERT INTO workspaces
+                        (id, name, path, created_at, updated_at, path_dev, path_ino)
+                     VALUES (?1, ?1, '/duplicate', ?1, ?1, 1, 2)",
+                    [id],
+                )
+                .unwrap();
+        }
+        let error = db
+            .find_or_create_workspace_by_exact_path(
+                "must-not-exist",
+                "/duplicate",
+                WorkspaceFolderAnchor { dev: 1, ino: 2 },
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("settings_workspace_exact_path_duplicate"));
+        assert_eq!(db.list_workspaces().unwrap().len(), 3);
+        assert!(
+            db.list_workspaces()
+                .unwrap()
+                .iter()
+                .all(|row| row.name != "must-not-exist")
+        );
+    }
+
+    #[test]
+    fn workspace_find_or_create_exact_path는_insert_failure를_rollback한다() {
+        let db = Db::open_in_memory().unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_workspace_insert
+                 BEFORE INSERT ON workspaces
+                 WHEN NEW.path = '/injected-failure'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected workspace insert failure');
+                 END;",
+            )
+            .unwrap();
+        assert!(
+            db.find_or_create_workspace_by_exact_path(
+                "rollback",
+                "/injected-failure",
+                WorkspaceFolderAnchor { dev: 1, ino: 2 },
+            )
+            .is_err()
+        );
+        assert!(db.list_workspaces().unwrap().is_empty());
+    }
+
+    #[test]
+    fn workspace_moved_path_cas는_path와_anchor_stale에_무변경이고_match만_갱신한다() {
+        let db = Db::open_in_memory().unwrap();
+        let anchor = WorkspaceFolderAnchor { dev: 101, ino: 202 };
+        let workspace = db
+            .find_or_create_workspace_by_exact_path("project", "/old", anchor)
+            .unwrap()
+            .row;
+
+        assert_eq!(
+            db.update_workspace_moved_path_cas(
+                &workspace.id,
+                "/old",
+                anchor,
+                "/wrong-folder",
+                WorkspaceFolderAnchor { dev: 101, ino: 303 },
+            )
+            .unwrap(),
+            WorkspaceMovedPathUpdate::Stale
+        );
+        assert_eq!(
+            db.workspace_path(&workspace.id).unwrap().as_deref(),
+            Some("/old")
+        );
+        assert_eq!(
+            db.workspace_anchor(&workspace.id).unwrap(),
+            Some((101, 202))
+        );
+
+        assert_eq!(
+            db.update_workspace_moved_path_cas(&workspace.id, "/stale", anchor, "/new", anchor)
+                .unwrap(),
+            WorkspaceMovedPathUpdate::Stale
+        );
+        assert_eq!(
+            db.update_workspace_moved_path_cas(
+                &workspace.id,
+                "/old",
+                WorkspaceFolderAnchor { dev: 101, ino: 404 },
+                "/new",
+                WorkspaceFolderAnchor { dev: 101, ino: 404 },
+            )
+            .unwrap(),
+            WorkspaceMovedPathUpdate::Stale
+        );
+        assert_eq!(
+            db.workspace_path(&workspace.id).unwrap().as_deref(),
+            Some("/old")
+        );
+
+        assert_eq!(
+            db.update_workspace_moved_path_cas(&workspace.id, "/old", anchor, "/new", anchor)
+                .unwrap(),
+            WorkspaceMovedPathUpdate::Updated
+        );
+        assert_eq!(
+            db.workspace_path(&workspace.id).unwrap().as_deref(),
+            Some("/new")
+        );
+        assert_eq!(
+            db.workspace_anchor(&workspace.id).unwrap(),
+            Some((101, 202))
+        );
+
+        assert_eq!(
+            db.update_workspace_moved_path_cas(&workspace.id, "/old", anchor, "/late", anchor)
+                .unwrap(),
+            WorkspaceMovedPathUpdate::Stale
+        );
+        assert_eq!(
+            db.workspace_path(&workspace.id).unwrap().as_deref(),
+            Some("/new")
+        );
+    }
+
     fn sample(id: &str) -> CredentialMeta {
         CredentialMeta {
             id: id.into(),
@@ -5506,6 +6981,75 @@ mod tests {
         let permission = db.permission_rule_versioned("srv", "tool-name").unwrap();
         assert_eq!(permission.revision, after_permission);
         assert_eq!(permission.value.unwrap().rule, "allow");
+    }
+
+    #[test]
+    fn slack_reconnect_revision_cas는_stale을_거부하고_disabled_row를_원자적으로_enable한다() {
+        let mut db = Db::open_in_memory().unwrap();
+        let initial = db.connector_config_revision().unwrap();
+        let mut slack = sample_mcp_server("slack-disabled");
+        slack.kind = "http".to_owned();
+        slack.command = None;
+        slack.args.clear();
+        slack.url = Some("https://mcp.slack.com/mcp/".to_owned());
+        slack.enabled = false;
+        let (disabled_revision, _) =
+            committed(db.save_mcp_server_revision_cas(initial, &slack).unwrap());
+
+        let mut reconnect = slack.clone();
+        reconnect.id = "must-not-be-inserted".to_owned();
+        reconnect.url = Some(" https://mcp.slack.com/mcp ".to_owned());
+        reconnect.enabled = true;
+        assert_eq!(
+            db.ensure_enabled_mcp_server_by_url_revision_cas(initial, &reconnect)
+                .unwrap(),
+            ConnectorConfigCas::Stale {
+                current_revision: disabled_revision,
+            }
+        );
+        assert!(!db.mcp_server("slack-disabled").unwrap().unwrap().enabled);
+
+        let (enabled_revision, enabled) = committed(
+            db.ensure_enabled_mcp_server_by_url_revision_cas(disabled_revision, &reconnect)
+                .unwrap(),
+        );
+        assert!(enabled_revision > disabled_revision);
+        assert_eq!(enabled.id, "slack-disabled");
+        assert!(enabled.enabled);
+        let rows = db.list_mcp_servers().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "slack-disabled");
+        assert!(rows[0].enabled);
+    }
+
+    #[test]
+    fn slack_reconnect_revision_cas는_duplicate_canonical_rows를_변경_전에_fail_closed한다() {
+        let mut db = Db::open_in_memory().unwrap();
+        let mut first = sample_mcp_server("slack-duplicate-a");
+        first.kind = "http".to_owned();
+        first.command = None;
+        first.args.clear();
+        first.url = Some("https://mcp.slack.com/mcp/".to_owned());
+        first.enabled = false;
+        db.save_mcp_server(&first).unwrap();
+        let mut second = first.clone();
+        second.id = "slack-duplicate-b".to_owned();
+        second.url = Some(" https://mcp.slack.com/mcp ".to_owned());
+        db.save_mcp_server(&second).unwrap();
+        let expected = db.connector_config_revision().unwrap();
+
+        let mut reconnect = first.clone();
+        reconnect.id = "must-not-be-inserted".to_owned();
+        reconnect.enabled = true;
+        assert!(
+            db.ensure_enabled_mcp_server_by_url_revision_cas(expected, &reconnect)
+                .is_err()
+        );
+        assert_eq!(db.connector_config_revision().unwrap(), expected);
+        let rows = db.list_mcp_servers().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| !row.enabled));
+        assert!(rows.iter().all(|row| row.id != reconnect.id));
     }
 
     #[test]
@@ -8866,6 +10410,322 @@ mod tests {
         db.ensure_default_workspace().unwrap();
         drop(db);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn settings_bounded_snapshots는_workspace_rows만_한_snapshot으로_반환한다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace = db.create_workspace("settings").unwrap();
+        let other_workspace = db.create_workspace("other").unwrap();
+        let profile = db
+            .insert_env_profile(&workspace, "dotenv", "dotenv")
+            .unwrap();
+        let other_profile = db
+            .insert_env_profile(&other_workspace, "other", "custom")
+            .unwrap();
+        db.upsert_env_var(&profile, "PLAIN", &EnvValue::Plain("value".to_owned()))
+            .unwrap();
+        db.upsert_env_var(
+            &other_profile,
+            "OTHER",
+            &EnvValue::Plain("not-visible".to_owned()),
+        )
+        .unwrap();
+        db.insert_credential(&CredentialMeta {
+            id: "credential-visible".to_owned(),
+            provider: "custom".to_owned(),
+            label: "visible".to_owned(),
+            credential_kind: "api_key".to_owned(),
+            masked_hint: Some("••••".to_owned()),
+            workspace_id: Some(workspace.clone()),
+        })
+        .unwrap();
+        db.insert_mcp_server(&mcp_store::McpServerRow {
+            id: "server-enabled".to_owned(),
+            name: "enabled".to_owned(),
+            kind: "stdio".to_owned(),
+            command: Some("true".to_owned()),
+            args: Vec::new(),
+            env_plain: Vec::new(),
+            env_secrets: Vec::new(),
+            inherit_env: true,
+            url: None,
+            enabled: true,
+        })
+        .unwrap();
+        db.insert_mcp_server(&mcp_store::McpServerRow {
+            id: "server-disabled".to_owned(),
+            name: "disabled".to_owned(),
+            kind: "stdio".to_owned(),
+            command: Some("false".to_owned()),
+            args: Vec::new(),
+            env_plain: Vec::new(),
+            env_secrets: Vec::new(),
+            inherit_env: true,
+            url: None,
+            enabled: false,
+        })
+        .unwrap();
+        let agent_id = db
+            .insert_agent_config(
+                "agent",
+                "true",
+                &["--version".to_owned()],
+                None,
+                None,
+                None,
+                None,
+                true,
+                Some("server-enabled"),
+                None,
+            )
+            .unwrap();
+
+        let agents = db.settings_agents_snapshot_rows(&workspace).unwrap();
+        assert_eq!(agents.agents.len(), 1);
+        assert_eq!(agents.profiles.len(), 1);
+        assert_eq!(agents.enabled_mcp_servers.len(), 1);
+        assert_eq!(agents.enabled_mcp_servers[0].id, "server-enabled");
+        let environment = db.settings_environment_snapshot_rows(&workspace).unwrap();
+        assert_eq!(environment.credentials.len(), 1);
+        assert_eq!(environment.profiles.len(), 1);
+        assert_eq!(environment.env_vars.len(), 1);
+        assert_eq!(environment.env_vars[0].profile_id, profile);
+
+        let launch = db
+            .settings_agent_launch_rows(&workspace, &agent_id, Some(&profile))
+            .unwrap();
+        assert_eq!(
+            launch.agent.as_ref().map(|agent| agent.id.as_str()),
+            Some(agent_id.as_str())
+        );
+        assert_eq!(
+            launch.profile.as_ref().map(|row| row.id.as_str()),
+            Some(profile.as_str())
+        );
+        assert_eq!(launch.env_vars.len(), 1);
+        assert!(launch.mcp_backend_enabled);
+        let cross_workspace = db
+            .settings_agent_launch_rows(&workspace, &agent_id, Some(&other_profile))
+            .unwrap();
+        assert!(cross_workspace.profile.is_none());
+        assert!(cross_workspace.env_vars.is_empty());
+    }
+
+    #[test]
+    fn settings_agent_snapshot는_max_plus_one을_json_materialize전에_거부한다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace = db.create_workspace("settings").unwrap();
+        let last = SETTINGS_AGENT_LIMIT_MAX;
+        db.conn
+            .execute(
+                "WITH RECURSIVE seq(n) AS (
+                     SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n < ?1
+                 )
+                 INSERT INTO agent_configs
+                    (id, name, command, args_json, waiting_regex, approval_regex, error_regex,
+                     done_regex, mcp_proxy_enabled, mcp_proxy_server_id, mcp_config_flag,
+                     created_at, updated_at)
+                 SELECT printf('bounded-agent-%04d', n), 'agent', 'true',
+                        CASE WHEN n = 0 THEN '{not-json' ELSE '[]' END,
+                        NULL, NULL, NULL, NULL, 0, NULL, NULL,
+                        printf('%08d', n), printf('%08d', n)
+                 FROM seq",
+                [i64::try_from(last).unwrap()],
+            )
+            .unwrap();
+
+        let error = db.settings_agents_snapshot_rows(&workspace).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("settings_agents_snapshot_item_limit"),
+            "count preflight must win before malformed JSON parsing: {error:#}"
+        );
+    }
+
+    #[test]
+    fn settings_agent_snapshot는_oversized_json을_parse전에_거부한다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace = db.create_workspace("settings").unwrap();
+        let oversized = "x".repeat(SETTINGS_AGENT_ARGS_BYTES_MAX + 1);
+        db.conn
+            .execute(
+                "INSERT INTO agent_configs
+                    (id, name, command, args_json, waiting_regex, approval_regex, error_regex,
+                     done_regex, mcp_proxy_enabled, mcp_proxy_server_id, mcp_config_flag,
+                     created_at, updated_at)
+                 VALUES ('oversized-agent', 'agent', 'true', ?1, NULL, NULL, NULL, NULL,
+                         0, NULL, NULL, '', '')",
+                [&oversized],
+            )
+            .unwrap();
+
+        let error = db.settings_agents_snapshot_rows(&workspace).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("settings_agent_args_json_bytes_limit"),
+            "SQL byte preflight must win before malformed JSON parsing: {error:#}"
+        );
+        let launch_error = db
+            .settings_agent_launch_rows(&workspace, "oversized-agent", None)
+            .unwrap_err();
+        assert!(
+            format!("{launch_error:#}").contains("settings_agent_launch_args_json_bytes_limit"),
+            "launch point read must apply the same pre-materialization gate: {launch_error:#}"
+        );
+    }
+
+    #[test]
+    fn settings_environment_snapshot는_env_max_plus_one을_materialize전에_거부한다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace = db.create_workspace("settings").unwrap();
+        let profile = db
+            .insert_env_profile(&workspace, "dotenv", "dotenv")
+            .unwrap();
+        let last = SETTINGS_ENV_VAR_LIMIT_MAX;
+        db.conn
+            .execute(
+                "WITH RECURSIVE seq(n) AS (
+                     SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n < ?2
+                 )
+                 INSERT INTO env_vars
+                    (id, profile_id, key, kind, plain_value, credential_id, created_at, updated_at)
+                 SELECT printf('bounded-env-%05d', n), ?1, printf('KEY_%05d', n),
+                        'plain', 'value', NULL, printf('%08d', n), printf('%08d', n)
+                 FROM seq",
+                rusqlite::params![profile, i64::try_from(last).unwrap()],
+            )
+            .unwrap();
+
+        let error = db
+            .settings_environment_snapshot_rows(&workspace)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("settings_env_vars_snapshot_item_limit"),
+            "env cap+1 must fail before Vec/String materialization: {error:#}"
+        );
+        let launch_error = db
+            .settings_agent_launch_rows(&workspace, "missing-agent", Some(&profile))
+            .unwrap_err();
+        assert!(
+            format!("{launch_error:#}").contains("settings_agent_launch_env_item_limit"),
+            "launch env cap+1 must fail before Vec/String materialization: {launch_error:#}"
+        );
+    }
+
+    #[test]
+    fn settings_snapshot는_profile_credential_backend_cap_plus_one을_거부한다() {
+        let backend_db = Db::open_in_memory().unwrap();
+        let backend_workspace = backend_db.create_workspace("backend").unwrap();
+        backend_db
+            .conn
+            .execute(
+                "WITH RECURSIVE seq(n) AS (
+                     SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n < ?1
+                 )
+                 INSERT INTO mcp_servers
+                    (id, name, kind, command, args_json, url, enabled, created_at, updated_at)
+                 SELECT printf('bounded-server-%04d', n), 'server', 'stdio', 'true', '[]',
+                        NULL, 1, printf('%08d', n), printf('%08d', n) FROM seq",
+                [i64::try_from(SETTINGS_ENABLED_MCP_SERVER_LIMIT_MAX).unwrap()],
+            )
+            .unwrap();
+        let backend_error = backend_db
+            .settings_agents_snapshot_rows(&backend_workspace)
+            .unwrap_err();
+        assert!(
+            format!("{backend_error:#}").contains("settings_agent_backends_snapshot_item_limit")
+        );
+
+        let profile_db = Db::open_in_memory().unwrap();
+        let profile_workspace = profile_db.create_workspace("profiles").unwrap();
+        profile_db
+            .conn
+            .execute(
+                "WITH RECURSIVE seq(n) AS (
+                     SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n < ?2
+                 )
+                 INSERT INTO env_profiles
+                    (id, workspace_id, name, kind, is_production, created_at, updated_at)
+                 SELECT printf('bounded-profile-%04d', n), ?1, 'profile', 'custom', 0,
+                        printf('%08d', n), printf('%08d', n) FROM seq",
+                rusqlite::params![
+                    profile_workspace,
+                    i64::try_from(SETTINGS_ENV_PROFILE_LIMIT_MAX).unwrap()
+                ],
+            )
+            .unwrap();
+        let profile_error = profile_db
+            .settings_environment_snapshot_rows(&profile_workspace)
+            .unwrap_err();
+        assert!(format!("{profile_error:#}").contains("settings_env_profiles_snapshot_item_limit"));
+
+        let credential_db = Db::open_in_memory().unwrap();
+        let credential_workspace = credential_db.create_workspace("credentials").unwrap();
+        credential_db
+            .conn
+            .execute(
+                "WITH RECURSIVE seq(n) AS (
+                     SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n < ?2
+                 )
+                 INSERT INTO credentials
+                    (id, provider, label, credential_kind, keyring_service, keyring_username,
+                     masked_hint, created_at, updated_at, workspace_id)
+                 SELECT printf('bounded-credential-%05d', n), 'custom', 'credential', 'api_key',
+                        'app.vector9.deppy-sijo', printf('slot-%05d', n), NULL,
+                        printf('%08d', n), printf('%08d', n), ?1 FROM seq",
+                rusqlite::params![
+                    credential_workspace,
+                    i64::try_from(SETTINGS_CREDENTIAL_LIMIT_MAX).unwrap()
+                ],
+            )
+            .unwrap();
+        let credential_error = credential_db
+            .settings_environment_snapshot_rows(&credential_workspace)
+            .unwrap_err();
+        assert!(
+            format!("{credential_error:#}").contains("settings_credentials_snapshot_item_limit")
+        );
+    }
+
+    #[test]
+    fn settings_agents_snapshot는_category합산_byte_cap을_materialize전에_거부한다() {
+        let db = Db::open_in_memory().unwrap();
+        let workspace = db.create_workspace("aggregate").unwrap();
+        let large = "x".repeat(700 * 1024);
+        for index in 0..3 {
+            db.conn
+                .execute(
+                    "INSERT INTO agent_configs
+                        (id, name, command, args_json, waiting_regex, approval_regex, error_regex,
+                         done_regex, mcp_proxy_enabled, mcp_proxy_server_id, mcp_config_flag,
+                         created_at, updated_at)
+                     VALUES (?1, ?2, 'true', '[]', NULL, NULL, NULL, NULL, 0, NULL, NULL, ?3, ?3)",
+                    (
+                        format!("aggregate-agent-{index}"),
+                        &large,
+                        format!("{index:08}"),
+                    ),
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO env_profiles
+                        (id, workspace_id, name, kind, is_production, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'custom', 0, ?4, ?4)",
+                    (
+                        format!("aggregate-profile-{index}"),
+                        &workspace,
+                        &large,
+                        format!("{index:08}"),
+                    ),
+                )
+                .unwrap();
+        }
+
+        let error = db.settings_agents_snapshot_rows(&workspace).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("settings_agents_snapshot_retained_bytes_limit"),
+            "combined categories must fail before any large Rust String is read: {error:#}"
+        );
     }
 
     #[test]

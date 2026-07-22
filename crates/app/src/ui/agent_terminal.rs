@@ -92,7 +92,7 @@ impl AgentTerminalUi {
         ui: &mut egui::Ui,
         feed: &StatusFeedSnapshot,
         translations: NoticeTranslations<'_>,
-        slack_status: super::connectors::SlackMcpStatus,
+        slack: &connector_contract::SlackProjection,
         catalog: &i18n::Catalog,
     ) -> Option<HomeAction> {
         let mut action = None;
@@ -117,7 +117,7 @@ impl AgentTerminalUi {
                                 ) {
                                     action = Some(HomeAction::RefreshNotices);
                                 }
-                                if connections_panel(&mut columns[1], slack_status, catalog) {
+                                if connections_panel(&mut columns[1], slack, catalog) {
                                     action = Some(HomeAction::Connectors);
                                 }
                             });
@@ -132,7 +132,7 @@ impl AgentTerminalUi {
                                 action = Some(HomeAction::RefreshNotices);
                             }
                             ui.add_space(12.0);
-                            if connections_panel(ui, slack_status, catalog) {
+                            if connections_panel(ui, slack, catalog) {
                                 action = Some(HomeAction::Connectors);
                             }
                         }
@@ -376,7 +376,7 @@ impl AgentTerminalUi {
 
 fn connections_panel(
     ui: &mut egui::Ui,
-    slack_status: super::connectors::SlackMcpStatus,
+    slack: &connector_contract::SlackProjection,
     catalog: &i18n::Catalog,
 ) -> bool {
     let mut manage_clicked = false;
@@ -403,37 +403,37 @@ fn connections_panel(
             crate::ui::hairline(ui);
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                super::connectors::slack_mark(ui);
+                slack_mark(ui);
                 ui.vertical(|ui| {
                     ui.label(egui::RichText::new("Slack").strong());
                     ui.weak(catalog.t("home.connections.slack_detail", &[]));
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let (label, color) = match slack_status {
-                        super::connectors::SlackMcpStatus::NotConfigured => (
+                    let (label, color) = match slack.status {
+                        connector_contract::SlackStatus::NotConfigured => (
                             catalog.t("home.connections.not_connected", &[]),
                             ui.visuals().weak_text_color(),
                         ),
-                        super::connectors::SlackMcpStatus::Ready => (
+                        connector_contract::SlackStatus::Ready => (
                             catalog.t("connectors.slack.ready", &[]),
                             egui::Color32::from_rgb(0x4c, 0xa8, 0xdf),
                         ),
-                        super::connectors::SlackMcpStatus::Checking => (
+                        connector_contract::SlackStatus::Checking => (
                             catalog.t("connectors.checking", &[]),
                             egui::Color32::from_rgb(0x4c, 0xa8, 0xdf),
                         ),
-                        super::connectors::SlackMcpStatus::NeedsAuth => (
+                        connector_contract::SlackStatus::NeedsAuthorization => (
                             catalog.t("connectors.needs_auth", &[]),
                             egui::Color32::from_rgb(0xe7, 0x9a, 0x3b),
                         ),
-                        super::connectors::SlackMcpStatus::Connected { tools } => (
+                        connector_contract::SlackStatus::Connected => (
                             catalog.t(
                                 "connectors.connected_tools",
-                                &[("count", &tools.to_string())],
+                                &[("count", &slack.tool_count.to_string())],
                             ),
                             egui::Color32::from_rgb(0x55, 0xc8, 0x79),
                         ),
-                        super::connectors::SlackMcpStatus::Failed => (
+                        connector_contract::SlackStatus::Failed => (
                             catalog.t("home.connections.failed", &[]),
                             egui::Color32::from_rgb(0xed, 0x5b, 0x61),
                         ),
@@ -444,6 +444,33 @@ fn connections_panel(
             });
         });
     manage_clicked
+}
+
+fn slack_mark(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, 3.0, egui::Color32::from_rgb(0xf2, 0xf2, 0xf4));
+    let center = rect.center();
+    for (offset, color) in [
+        (
+            egui::vec2(-4.0, -4.0),
+            egui::Color32::from_rgb(0x36, 0xc5, 0xf0),
+        ),
+        (
+            egui::vec2(4.0, -4.0),
+            egui::Color32::from_rgb(0x2e, 0xb6, 0x7d),
+        ),
+        (
+            egui::vec2(-4.0, 4.0),
+            egui::Color32::from_rgb(0xec, 0xb2, 0x2e),
+        ),
+        (
+            egui::vec2(4.0, 4.0),
+            egui::Color32::from_rgb(0xe0, 0x1e, 0x5a),
+        ),
+    ] {
+        ui.painter().circle_filled(center + offset, 3.2, color);
+    }
 }
 
 /// 홈 공지 카드 1장 — 상태 페이지 인시던트 1건.
@@ -997,7 +1024,7 @@ mod tests {
                         cache: &translations,
                         locale: i18n::FALLBACK_LOCALE,
                     },
-                    super::super::connectors::SlackMcpStatus::NotConfigured,
+                    &connector_contract::SlackProjection::default(),
                     &catalog,
                 ) {
                     actions.push(action);
@@ -1081,7 +1108,7 @@ mod tests {
                         cache: &translations,
                         locale: i18n::FALLBACK_LOCALE,
                     },
-                    super::super::connectors::SlackMcpStatus::NotConfigured,
+                    &connector_contract::SlackProjection::default(),
                     &catalog,
                 );
             },

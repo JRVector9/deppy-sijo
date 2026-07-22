@@ -7,7 +7,7 @@
 //!
 //! `cargo run -p xtask -- check-boundary`
 //!   app leaf UI가 secret/MCP/audit/storage side effect를 직접 갖지 않도록 검사한다.
-//!   남아 있는 connector/agent/env DB 호출은 파일+snippet+개수 allowlist로 고정한다.
+//!   production leaf UI 경계 예외는 허용하지 않는다.
 //!
 //! `cargo run -p xtask -- smoke-db-migrations`
 //!   storage migration smoke tests를 실행한다.
@@ -137,10 +137,13 @@ fn security_scan() -> anyhow::Result<()> {
 }
 
 fn perf_smoke() -> anyhow::Result<()> {
-    run_cargo(&["test", "-p", "deppy-sijo", "perf"])?;
-    run_cargo(&["test", "-p", "runtime", "backpressure"])?;
-    run_cargo(&["test", "-p", "runtime", "hidden"])?;
-    println!("perf-smoke OK");
+    for case in PERF_SMOKE_TESTS {
+        run_exact_test(case)?;
+    }
+    println!(
+        "perf-smoke OK — {} exact smoke tests",
+        PERF_SMOKE_TESTS.len()
+    );
     Ok(())
 }
 
@@ -150,6 +153,54 @@ struct FailureMatrixCase {
     package: &'static str,
     exact_test: &'static str,
 }
+
+const PERF_SMOKE_TESTS: &[FailureMatrixCase] = &[
+    FailureMatrixCase {
+        point: "AppP95",
+        package: "deppy-sijo",
+        exact_test: "perf::tests::p95_계산",
+    },
+    FailureMatrixCase {
+        point: "AppPercentile",
+        package: "deppy-sijo",
+        exact_test: "perf::tests::percentile_분위",
+    },
+    FailureMatrixCase {
+        point: "AppHarnessShape",
+        package: "deppy-sijo",
+        exact_test: "perf::tests::하네스_명령_구성",
+    },
+    FailureMatrixCase {
+        point: "RuntimeOutboundCoalescing",
+        package: "runtime",
+        exact_test: "remote::tests::outbound_queue는_viewport를_coalesce하고_status_lifecycle을_보존",
+    },
+    FailureMatrixCase {
+        point: "RuntimeOutboundOverflow",
+        package: "runtime",
+        exact_test: "remote::tests::outbound_queue는_durable_overflow를_silent_drop하지_않는다",
+    },
+    FailureMatrixCase {
+        point: "RuntimeReceiverCap",
+        package: "runtime",
+        exact_test: "remote::tests::receiver_drain은_durable_cap에서_멈춘다",
+    },
+    FailureMatrixCase {
+        point: "RuntimeReceiverFilter",
+        package: "runtime",
+        exact_test: "remote::tests::receiver_drain은_additive_local_events를_wire에서_필터링한다",
+    },
+    FailureMatrixCase {
+        point: "RuntimeHiddenStatus",
+        package: "runtime",
+        exact_test: "in_process::tests::status_화면_패턴_hidden에서_snapshot_없이_감지",
+    },
+    FailureMatrixCase {
+        point: "RuntimeHiddenRemoteLease",
+        package: "runtime",
+        exact_test: "in_process::tests::원격_시청_lease는_hidden_세션_viewport를_흐르게_하고_해제시_멈춘다",
+    },
+];
 
 const OD01_FAILURE_MATRIX: &[FailureMatrixCase] = &[
     FailureMatrixCase {
@@ -347,328 +398,6 @@ struct BoundaryRule {
 
 const NO_ALLOW: &[BoundaryAllow] = &[];
 
-const LOCAL_MCP_MANAGER_ALLOW: &[BoundaryAllow] = &[
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        // H5: McpAuthRequired(401 챌린지 downcast) 추가 후 rustfmt가 import를 줄바꿈 (2026-07-11)
-        snippet: "LocalMcpManager, McpAuthRequired, McpHttpServerConfig",
-        count: 1,
-        reason: "PR-B00 deferred connector MCP runtime boundary",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "let manager = LocalMcpManager::new(self.redaction.clone());",
-        count: 1,
-        reason: "PR-B00 deferred connector MCP discover/prepare/call execution",
-    },
-    // H5: 백그라운드 실행 컨텍스트(ExecContext)가 manager를 1회 생성해 소유
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "manager: LocalMcpManager::new(self.redaction.clone()),",
-        count: 1,
-        reason: "H5 connector ExecContext manager construction",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "manager: LocalMcpManager,",
-        count: 1,
-        reason: "H5 connector ExecContext manager field",
-    },
-    // H5: 401 사다리(run_oauth_ladder)가 manager를 인자로 받는 시그니처
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "manager: &LocalMcpManager,",
-        count: 1,
-        reason: "H5 connector OAuth ladder signature",
-    },
-];
-
-const RECORD_TOOL_AUDIT_ALLOW: &[BoundaryAllow] = &[BoundaryAllow {
-    path: "crates/app/src/ui/connectors.rs",
-    snippet: "if let Err(e) = db.record_tool_audit(&record, &self.redaction, None) {",
-    count: 1,
-    reason: "PR-B00 deferred connector audit storage boundary",
-}];
-
-// H5: http Bearer/refresh 경로가 secret store를 leaf UI에서 직접 참조한다. auth의
-// refresh_access_token(store: &dyn SecretStore)와 백그라운드 실행 모델이 커넥터가
-// SecretStore를 보유하도록 강제한다 — deferred 경계로 명시. (더 특정한 secret_store:
-// 스니펫을 store: 앞에 둬 substring 충돌을 피한다.)
-const SECRET_STORE_ALLOW: &[BoundaryAllow] = &[
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "use secret::{RedactionService, SecretStore, SecretString};",
-        count: 1,
-        reason: "H5 connector Bearer/refresh secret store boundary",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "secret_store: Arc<dyn SecretStore>,",
-        count: 2,
-        reason: "H5 connector secret store handle (UI + import dialog)",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "store: Arc<dyn SecretStore>,",
-        count: 1,
-        reason: "H5 connector ExecContext secret store handle",
-    },
-];
-
-// H5: 저장된 access/DCR secret을 붙여 Bearer/refresh를 해석한다 (deferred 경계).
-const GET_SECRET_ALLOW: &[BoundaryAllow] = &[
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: ".get_secret(&auth::dcr_secret_entry_id(&credential_id))",
-        count: 1,
-        reason: "H5 connector DCR client_secret read (stored-client)",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "match cx.store.get_secret(&auth_state.credential_id) {",
-        count: 1,
-        reason: "H5 connector single-flight refresh re-read",
-    },
-    // Bearer/DCR 해석은 run_http(백그라운드 실행 스레드)로 이동 — UI 스레드가
-    // KEYRING_SERIAL을 잡지 않는다 (2026-07-16). 파일은 같아 예외로 남는다.
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "let access = cx.store.get_secret(&binding.credential_id).ok();",
-        count: 1,
-        reason: "H5 connector access token attach (run_http background)",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: ".get_secret(&auth::dcr_secret_entry_id(&binding.credential_id))",
-        count: 1,
-        reason: "H5 connector DCR client_secret read (run_http background)",
-    },
-];
-
-const DB_CALL_ALLOW: &[BoundaryAllow] = &[
-    BoundaryAllow {
-        path: "crates/app/src/ui/agents.rs",
-        snippet: "None => match db.list_agent_configs() {",
-        count: 1,
-        reason: "existing agent settings storage UI exception",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/agents.rs",
-        snippet: "let profiles = db.list_env_profiles(workspace_id).unwrap_or_default();",
-        count: 1,
-        reason: "existing agent settings storage UI exception",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/agents.rs",
-        snippet: "if let Err(e) = db.delete_agent_config(&id) {",
-        count: 1,
-        reason: "existing agent settings storage UI exception",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/agents.rs",
-        snippet: "db.list_mcp_servers().unwrap_or_default()",
-        count: 1,
-        reason: "existing agent settings storage UI exception",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/agents.rs",
-        snippet: "match db.insert_agent_config(",
-        count: 1,
-        reason: "existing agent settings storage UI exception",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/agents.rs",
-        snippet: "for var in db.list_env_vars(profile_id)? {",
-        count: 1,
-        reason: "existing agent settings storage UI exception",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/agents.rs",
-        snippet: "if !db.list_mcp_servers()?.iter().any(|s| &s.id == server_id) {",
-        count: 1,
-        reason: "existing agent settings storage UI exception",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "match db.list_permission_rules() {",
-        count: 1,
-        reason: "PR-B00 deferred connector storage boundary",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "None => match db.list_mcp_servers() {",
-        count: 1,
-        reason: "PR-B00 deferred connector storage boundary",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        // 가져오기(run_import)의 이름 중복 검사용 조회 (2026-07-11)
-        snippet: "let mut existing: std::collections::HashSet<String> = match db.list_mcp_servers()",
-        count: 1,
-        reason: "PR-B00 deferred connector storage boundary",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "if let Err(e) = db.insert_credential(&meta) {",
-        count: 1,
-        reason: "PR-B00 deferred connector OAuth metadata storage boundary",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        // tools_cached 미스 시에만 조회 (2026-07-16 매 프레임 N+1 제거) +
-        // HomeV1 Slack 상태 조회 slack_status/slack_status_for_server 2곳이
-        // 동일 패턴을 재사용 (a5d1d1e, 2026-07-20)
-        snippet: "None => match db.list_mcp_tools(&server.id) {",
-        count: 3,
-        reason: "PR-B00 deferred connector storage boundary",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        // HomeV1 Slack 연결 상태 표시 (slack_status, a5d1d1e, 2026-07-20)
-        snippet: "let Ok(servers) = db.list_mcp_servers() else {",
-        count: 1,
-        reason: "PR-B00 deferred connector storage boundary",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        // HomeV1 Slack 커넥터 멱등 등록 (ensure_slack_server, a5d1d1e, 2026-07-20)
-        snippet: "db.insert_mcp_server(&row)?;",
-        count: 1,
-        reason: "PR-B00 deferred connector storage boundary",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "if let Err(e) = db.delete_permission_rule(&server.id, &tool.name) {",
-        count: 1,
-        reason: "PR-B00 deferred connector permission storage boundary",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "if let Err(e) = db.upsert_permission_rule(",
-        count: 1,
-        reason: "PR-B00 deferred connector permission storage boundary",
-    },
-    // H3 url 편집 시점 훅(save_url_edit): Allow 규칙 초기화 + 도구 캐시 무효화 + url 갱신
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "let rules = db.list_permission_rules().context(\"권한 규칙 조회 실패\")?;",
-        count: 1,
-        reason: "H3 connector url-edit trust reset boundary",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "db.delete_permission_rule(&rule.server_id, &rule.tool_name)",
-        count: 1,
-        reason: "H3 connector url-edit trust reset boundary",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "db.replace_mcp_tools(server_id, &[])",
-        count: 1,
-        reason: "H3 connector url-edit tools cache invalidation boundary",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "db.update_mcp_server_url(server_id, new_url)?;",
-        count: 1,
-        reason: "H3 connector url-edit storage boundary",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "if let Err(e) = db.record_tool_audit(&record, &self.redaction, None) {",
-        count: 1,
-        reason: "PR-B00 deferred connector audit storage boundary",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        // H5: OAuth 사다리 성공 시 tools 영속 (store_ladder_success — 기존 `match` 호출부는
-        // drain_results로 이동해 &outcome.server_id로 갱신됨, 2026-07-11)
-        snippet: "db.replace_mcp_tools(&server_id, &rows)",
-        count: 1,
-        reason: "PR-B00 deferred connector MCP tools storage boundary",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "match db.replace_mcp_tools(&outcome.server_id, &rows) {",
-        count: 1,
-        reason: "H5 connector drain tools persistence boundary",
-    },
-    // H5: OAuth 바인딩 메타(oauth_json) 읽기/쓰기 — 비밀 아님, credentials.oauth_json
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "db.set_credential_oauth_json(&credential_id, &json)",
-        count: 2,
-        reason: "H5 connector OAuth binding metadata write (ladder + refresh)",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "db.list_credential_oauth_json()",
-        count: 2,
-        reason: "H5 connector OAuth binding lookup (bind + refresh persist)",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        snippet: "let current = db.list_mcp_servers().ok().and_then(|rows| {",
-        count: 1,
-        reason: "H5 connector stale-URL discard boundary",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/connectors.rs",
-        // 수동 추가 폼(add_server) + 가져오기 공용 등록(import_insert — stdio/http, H3) 두 경로
-        snippet: "match db.insert_mcp_server(&row) {",
-        count: 2,
-        reason: "PR-B00 deferred connector MCP server storage boundary",
-    },
-    // env_profiles: dead 비-compact contents() 삭제(PR-ENV-D)로 compact 경로의 실제
-    // 스니펫으로 재등록(2026-07-09). 예외 수는 삭제 전과 동일 범주(기존 storage UI 예외).
-    // .env 일원화(E1, eb2bbe4)로 DB 전용 profile 생성/수정 경로가 사라져 insert/upsert
-    // 예외를 제거하고, 대신 **레거시 이전 전용** 조회/삭제 경로를 등록한다(2026-07-14).
-    // 레거시 이전이 끝나 해당 UI가 삭제되면 아래 3개(list/delete)도 함께 지운다.
-    BoundaryAllow {
-        path: "crates/app/src/ui/env_profiles.rs",
-        snippet: "let p = db.list_env_profiles(workspace_id)?;",
-        count: 1,
-        reason: "existing env profile storage UI exception",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/env_profiles.rs",
-        snippet: "let c = db.list_credentials_for_workspace(workspace_id)?;",
-        count: 1,
-        reason: "existing env profile storage UI exception",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/env_profiles.rs",
-        snippet: "let v = db.list_env_vars(&profile_id)?;",
-        count: 1,
-        reason: "existing env profile storage UI exception",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/env_profiles.rs",
-        snippet: "db.delete_env_var(&profile_id, &key)?;",
-        count: 1,
-        reason: "existing env profile storage UI exception",
-    },
-    // 아래 3개: 레거시 env profile 이전 UI (E1) 전용 — 이전 완료 후 UI와 함께 제거 대상.
-    BoundaryAllow {
-        path: "crates/app/src/ui/env_profiles.rs",
-        snippet: "for var in db.list_env_vars(&profile.id)? {",
-        count: 1,
-        reason: "legacy env profile migration UI (E1) — remove with the migration UI",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/env_profiles.rs",
-        snippet: "if db.list_env_vars(&profile_id)?.is_empty() {",
-        count: 1,
-        reason: "legacy env profile migration UI (E1) — remove with the migration UI",
-    },
-    BoundaryAllow {
-        path: "crates/app/src/ui/env_profiles.rs",
-        snippet: "db.delete_env_profile(&profile_id)?;",
-        count: 1,
-        reason: "legacy env profile migration UI (E1) — remove with the migration UI",
-    },
-];
-
 const BOUNDARY_RULES: &[BoundaryRule] = &[
     BoundaryRule {
         pattern: "KeyringSecretStore",
@@ -678,7 +407,7 @@ const BOUNDARY_RULES: &[BoundaryRule] = &[
     BoundaryRule {
         pattern: "SecretStore",
         label: "leaf UI must not import/use direct secret store trait",
-        allowed: SECRET_STORE_ALLOW,
+        allowed: NO_ALLOW,
     },
     BoundaryRule {
         pattern: "set_secret(",
@@ -688,7 +417,7 @@ const BOUNDARY_RULES: &[BoundaryRule] = &[
     BoundaryRule {
         pattern: "get_secret(",
         label: "leaf UI must not read secrets directly",
-        allowed: GET_SECRET_ALLOW,
+        allowed: NO_ALLOW,
     },
     BoundaryRule {
         pattern: "delete_secret(",
@@ -702,18 +431,18 @@ const BOUNDARY_RULES: &[BoundaryRule] = &[
     },
     BoundaryRule {
         pattern: "LocalMcpManager",
-        label: "connector-local MCP execution is a deferred boundary exception",
-        allowed: LOCAL_MCP_MANAGER_ALLOW,
+        label: "leaf UI must not execute Connector MCP transports directly",
+        allowed: NO_ALLOW,
     },
     BoundaryRule {
         pattern: "record_tool_audit",
-        label: "connector audit writes are a deferred boundary exception",
-        allowed: RECORD_TOOL_AUDIT_ALLOW,
+        label: "leaf UI must not write audit records directly",
+        allowed: NO_ALLOW,
     },
     BoundaryRule {
         pattern: "db.",
-        label: "leaf UI direct DB calls require explicit boundary exception",
-        allowed: DB_CALL_ALLOW,
+        label: "leaf UI must not call the database directly",
+        allowed: NO_ALLOW,
     },
     BoundaryRule {
         pattern: "alacritty_terminal",
@@ -817,14 +546,12 @@ fn check_boundary() -> anyhow::Result<()> {
 
     check_session_secret_boundary(&root, &mut violations)?;
     check_authorization_capability_boundary(&root, &mut violations)?;
+    check_app_render_source_boundary(&root, &mut violations)?;
 
     if violations.is_empty() {
-        let explicit_exceptions: usize = DB_CALL_ALLOW
+        let explicit_exceptions: usize = BOUNDARY_RULES
             .iter()
-            .chain(LOCAL_MCP_MANAGER_ALLOW)
-            .chain(RECORD_TOOL_AUDIT_ALLOW)
-            .chain(SECRET_STORE_ALLOW)
-            .chain(GET_SECRET_ALLOW)
+            .flat_map(|rule| rule.allowed)
             .map(|allow| allow.count)
             .sum();
         println!(
@@ -839,6 +566,49 @@ fn check_boundary() -> anyhow::Result<()> {
         }
         bail!("check-boundary 실패: {}건", violations.len());
     }
+}
+
+fn check_app_render_source_boundary(
+    root: &Path,
+    violations: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    let rel = "crates/app/src/app.rs";
+    let source = std::fs::read_to_string(root.join(rel)).context("app.rs 읽기 실패")?;
+    let (_, ui_tail) = source
+        .split_once("fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {")
+        .context("eframe::App::ui 시작을 찾지 못했습니다")?;
+    let (ui_body, _) = ui_tail
+        .split_once("\n}\n\n/// Instant →")
+        .context("eframe::App::ui 끝을 찾지 못했습니다")?;
+    const FORBIDDEN: &[(&str, &str)] = &[
+        ("self.db.", "render must not call Db directly"),
+        (
+            "KeyringSecretStore",
+            "render must not access concrete keyring",
+        ),
+        ("rfd::", "render must return native-dialog intents"),
+        ("std::fs::", "render must not perform filesystem I/O"),
+        (
+            "std::process::Command",
+            "render must not spawn subprocesses",
+        ),
+        (
+            "self.refresh_workspaces(",
+            "render must consume the bounded workspace projection",
+        ),
+        (
+            "request_repaint_after(",
+            "render must not install polling repaint timers",
+        ),
+    ];
+    for (pattern, reason) in FORBIDDEN {
+        if ui_body.contains(pattern) {
+            violations.push(format!(
+                "{rel}: App::ui direct source violation: '{pattern}' ({reason})"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn check_authorization_capability_boundary(

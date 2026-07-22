@@ -1,30 +1,181 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
 use runtime::{InProcessRuntimeClient, RuntimeCommandSink, RuntimeEventReceiver};
 
 use crate::config::Config;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 
 use crate::storage::Db;
 use crate::ui;
-use mcp_store::PendingApprovalRow;
 use secret::KeyringSecretStore;
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct ApprovalPendingSignature(Vec<String>);
+const APPROVAL_WAKE_MARKER: u8 = 1;
+const APPROVAL_CONTROL_MARKER: u8 = 2;
+const APPROVAL_COMMAND_CAP: usize = 8;
+const APPROVAL_LAUNCH_CAP: usize = 8;
+const APPROVAL_SPAWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+const APPROVAL_DENIAL_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
-impl ApprovalPendingSignature {
-    fn from_rows(rows: &[PendingApprovalRow]) -> Self {
-        Self(rows.iter().map(|row| row.id.clone()).collect())
-    }
+struct ApprovalSnapshot {
+    rows: Vec<storage::PendingApprovalRow>,
+    remote_urls: std::collections::HashMap<String, String>,
 }
 
-struct ApprovalWatcher {
-    stop_tx: Option<std::sync::mpsc::Sender<()>>,
-    handle: Option<std::thread::JoinHandle<()>>,
+enum ApprovalWorkerCommand {
+    Resolve {
+        id: String,
+        allowed: bool,
+        remember: bool,
+        resolved_at: i64,
+    },
+    DenySession {
+        workspace_id: String,
+        session: runtime::SessionId,
+        resolved_at: i64,
+    },
+    DenyAllOwned {
+        resolved_at: i64,
+    },
+}
+
+enum ApprovalWorkerResult {
+    Resolved,
+    SessionDenied {
+        workspace_id: String,
+        session: runtime::SessionId,
+        succeeded: bool,
+    },
+    AllDenied {
+        succeeded: bool,
+    },
+    Failed,
+}
+
+struct ApprovalListenerSlot {
+    command_tx: std::sync::mpsc::SyncSender<ApprovalWorkerCommand>,
+    ready_rx: std::sync::mpsc::Receiver<Result<ApprovalListenerReady, ApprovalWakeErrorCode>>,
+    result_rx: std::sync::mpsc::Receiver<ApprovalWorkerResult>,
+    handle: std::thread::JoinHandle<()>,
+    socket_path: Option<PathBuf>,
+    #[cfg(unix)]
+    control_socket: Option<std::os::unix::net::UnixDatagram>,
+    stop_requested: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct ApprovalListenerReady {
+    socket_path: PathBuf,
+    #[cfg(unix)]
+    control_socket: std::os::unix::net::UnixDatagram,
+}
+
+#[cfg(unix)]
+struct ApprovalListenerContext {
+    db_path: PathBuf,
+    socket_path: PathBuf,
+    commands: std::sync::mpsc::Receiver<ApprovalWorkerCommand>,
+    ready: std::sync::mpsc::SyncSender<Result<ApprovalListenerReady, ApprovalWakeErrorCode>>,
+    results: std::sync::mpsc::SyncSender<ApprovalWorkerResult>,
+    snapshot: Arc<std::sync::Mutex<Option<ApprovalSnapshot>>>,
+    ctx: egui::Context,
+    stop_requested: Arc<std::sync::atomic::AtomicBool>,
+    pending_owner: Arc<storage::ActivePendingApprovalOwner>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalWakeErrorCode {
+    #[cfg(not(unix))]
+    Unsupported,
+    Start,
+    Storage,
+    Bind,
+    Backpressure,
+    Delivery,
+}
+
+struct ApprovalWakeHub {
+    db_path: PathBuf,
+    ctx: egui::Context,
+    snapshot: Arc<std::sync::Mutex<Option<ApprovalSnapshot>>>,
+    slot: Option<ApprovalListenerSlot>,
+    deferred: std::collections::VecDeque<ApprovalWorkerCommand>,
+    inflight: usize,
+    pending_owner: Arc<storage::ActivePendingApprovalOwner>,
+}
+
+struct PendingProxyLaunch {
+    generation: u64,
+    workspace_id: String,
+    prepared: PreparedAgentLaunch,
+}
+
+struct ApprovalLaunchTicket {
+    id: u64,
+    workspace_id: String,
+    agent_config_id: String,
+    state: ApprovalLaunchTicketState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApprovalLaunchTicketState {
+    Preparing { deadline: std::time::Instant },
+    SpawnSent,
+}
+
+#[derive(Default)]
+struct ApprovalLaunchTracker {
+    next_id: u64,
+    pending: std::collections::VecDeque<ApprovalLaunchTicket>,
+    live: std::collections::HashMap<(String, runtime::SessionId), u64>,
+    exited: std::collections::HashSet<(String, runtime::SessionId)>,
+    denying: std::collections::HashSet<(String, runtime::SessionId)>,
+    denial_retries: std::collections::HashMap<(String, runtime::SessionId), ApprovalDenialRetry>,
+}
+
+struct ApprovalDenialRetry {
+    failures: u8,
+    retry_at: std::time::Instant,
+}
+
+#[derive(Default)]
+struct ApprovalGlobalReconcile {
+    required: bool,
+    queued: bool,
+    failures: u8,
+    retry_at: Option<std::time::Instant>,
+}
+
+impl ApprovalGlobalReconcile {
+    fn request(&mut self) {
+        self.required = true;
+    }
+
+    fn is_due(&self, now: std::time::Instant) -> bool {
+        self.required && !self.queued && self.retry_at.is_none_or(|retry_at| retry_at <= now)
+    }
+
+    fn mark_queued(&mut self) {
+        self.queued = true;
+        self.retry_at = None;
+    }
+
+    fn finish(&mut self, succeeded: bool, now: std::time::Instant) -> Option<std::time::Duration> {
+        self.queued = false;
+        if succeeded {
+            self.required = false;
+            self.failures = 0;
+            self.retry_at = None;
+            None
+        } else {
+            self.required = true;
+            self.failures = self.failures.saturating_add(1);
+            let shift = u32::from(self.failures.saturating_sub(1).min(6));
+            let delay =
+                std::time::Duration::from_secs(1u64 << shift).min(APPROVAL_DENIAL_RETRY_MAX);
+            self.retry_at = Some(now + delay);
+            Some(delay)
+        }
+    }
 }
 
 struct EnvProjectRowsJob {
@@ -44,13 +195,29 @@ struct EnvProjectRowsWorker {
 
 struct EnvSecretRevealJob {
     generation: u64,
-    credential_id: String,
+    target: EnvSecretRevealTarget,
 }
 
 struct EnvSecretRevealOutcome {
     generation: u64,
-    credential_id: String,
-    value: anyhow::Result<String>,
+    target: EnvSecretRevealTarget,
+    value: anyhow::Result<secret::SecretString>,
+}
+
+enum EnvSecretRevealTarget {
+    EnvRow {
+        profile_id: String,
+        key: String,
+        credential_id: String,
+    },
+}
+
+impl EnvSecretRevealTarget {
+    fn credential_id(&self) -> &str {
+        match self {
+            Self::EnvRow { credential_id, .. } => credential_id,
+        }
+    }
 }
 
 struct EnvSecretRevealWorker {
@@ -87,6 +254,236 @@ struct DotenvSyncOutcome {
 struct DotenvSyncWorker {
     tx: std::sync::mpsc::SyncSender<DotenvSyncJob>,
     rx: std::sync::mpsc::Receiver<DotenvSyncOutcome>,
+}
+
+const SETTINGS_WORKER_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+struct SettingsSnapshotWorker {
+    db_path: PathBuf,
+    redaction: secret::RedactionService,
+    ctx: egui::Context,
+    slot: Option<SettingsWorkerSlot>,
+    pending_result: Option<SettingsOutcome>,
+}
+
+struct SettingsWorkerSlot {
+    tx: std::sync::mpsc::SyncSender<SettingsJob>,
+    rx: std::sync::mpsc::Receiver<SettingsOutcome>,
+    handle: std::thread::JoinHandle<()>,
+    lifecycle: Arc<std::sync::Mutex<SettingsWorkerLifecycle>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettingsWorkerLifecycle {
+    Running,
+    Exited,
+}
+
+enum SettingsTrySendError {
+    Full(Box<SettingsJob>),
+    Disconnected(Box<SettingsJob>),
+}
+
+struct SettingsWorkerExitGuard(Arc<std::sync::Mutex<SettingsWorkerLifecycle>>);
+
+impl Drop for SettingsWorkerExitGuard {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap_or_else(|poison| poison.into_inner()) =
+            SettingsWorkerLifecycle::Exited;
+    }
+}
+
+struct SettingsJob {
+    generation: u64,
+    revision: u64,
+    workspace_id: String,
+    project_root: Option<PathBuf>,
+    action: SettingsJobAction,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkspaceMutationPurpose {
+    SelectInSettings,
+    SwitchRuntime,
+}
+
+enum SettingsJobAction {
+    Load,
+    AddCredential {
+        credential: ui::credentials::NewCredential,
+    },
+    DeleteCredential {
+        credential_id: String,
+    },
+    RevealCredential {
+        credential_id: String,
+    },
+    ScanOrphanCredentials,
+    PurgeOrphanCredentials {
+        credential_ids: Vec<String>,
+    },
+    SaveCodexLlmApiKey {
+        value: secret::SecretString,
+    },
+    DeleteCodexLlmApiKey,
+    RegisterAgent(ui::agents::AgentRegistration),
+    DeleteAgent {
+        agent_id: String,
+    },
+    PrepareAgentLaunch {
+        agent_id: String,
+        profile_id: Option<String>,
+        runtime_workspace_id: String,
+    },
+    FinalizeProxyAgentLaunch {
+        prepared: Box<PreparedAgentLaunch>,
+        approval_notify_socket: PathBuf,
+    },
+    DeleteLegacyVar {
+        profile_id: String,
+        key: String,
+    },
+    WriteDotenv {
+        key: String,
+        value: Option<String>,
+    },
+    ResyncDotenv,
+    SetProjectPath {
+        path: PathBuf,
+    },
+    RenameWorkspace {
+        name: String,
+    },
+    FindOrCreateWorkspace {
+        name: String,
+        path: PathBuf,
+        purpose: WorkspaceMutationPurpose,
+    },
+    AcceptMovedWorkspacePath {
+        expected_old_path: String,
+        expected_anchor: storage::WorkspaceFolderAnchor,
+        new_path: PathBuf,
+    },
+}
+
+struct SettingsOutcome {
+    generation: u64,
+    revision: u64,
+    workspace_id: String,
+    kind: SettingsOutcomeKind,
+    snapshots: Option<SettingsSnapshots>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SettingsOperationKey {
+    generation: u64,
+    revision: u64,
+    workspace_id: String,
+}
+
+impl SettingsOperationKey {
+    fn for_job(job: &SettingsJob) -> Self {
+        Self {
+            generation: job.generation,
+            revision: job.revision,
+            workspace_id: job.workspace_id.clone(),
+        }
+    }
+
+    fn matches_outcome(&self, outcome: &SettingsOutcome) -> bool {
+        self.generation == outcome.generation
+            && self.revision == outcome.revision
+            && self.workspace_id == outcome.workspace_id
+    }
+}
+
+enum SettingsOutcomeKind {
+    Loaded,
+    CredentialAdded(Result<(), SettingsErrorCode>),
+    CredentialDeleted {
+        credential_id: String,
+        result: Result<(), SettingsErrorCode>,
+    },
+    CredentialRevealed {
+        credential_id: String,
+        result: Result<ui::credentials::RevealedCredential, SettingsErrorCode>,
+    },
+    OrphanCredentialsScanned(Result<Vec<String>, SettingsErrorCode>),
+    OrphanCredentialsPurged {
+        purged: usize,
+        remaining: usize,
+        result: Result<(), SettingsErrorCode>,
+    },
+    CodexLlmApiKeySaved(Result<(), SettingsErrorCode>),
+    CodexLlmApiKeyDeleted(Result<(), SettingsErrorCode>),
+    AgentRegistered(Result<(), SettingsErrorCode>),
+    AgentDeleted(Result<(), SettingsErrorCode>),
+    AgentLaunchPrepared(Result<PreparedAgentLaunch, SettingsErrorCode>),
+    AgentLaunchFinalized {
+        ticket_id: Option<u64>,
+        result: Result<PreparedAgentLaunch, SettingsErrorCode>,
+    },
+    LegacyVarDeleted(Result<(), SettingsErrorCode>),
+    DotenvWritten(Result<(), SettingsErrorCode>),
+    DotenvResynced(Result<(), SettingsErrorCode>),
+    ProjectPathSet(Result<storage::SettingsWorkspaceProjectionRow, SettingsErrorCode>),
+    WorkspaceRenamed {
+        name: String,
+        result: Result<(), SettingsErrorCode>,
+    },
+    WorkspaceFoundOrCreated {
+        purpose: WorkspaceMutationPurpose,
+        result: Result<storage::WorkspaceFindOrCreateResult, SettingsErrorCode>,
+    },
+    WorkspaceMovedPathAccepted {
+        new_path: PathBuf,
+        result: Result<storage::WorkspaceMovedPathUpdate, SettingsErrorCode>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsErrorCode {
+    CredentialAdd,
+    CredentialDelete,
+    CredentialReveal,
+    OrphanScan,
+    OrphanPurge,
+    ApiKeySave,
+    ApiKeyDelete,
+    Registration,
+    Delete,
+    Launch,
+    LegacyDelete,
+    DotenvWrite,
+    DotenvSync,
+    ProjectPath,
+    WorkspaceMutation,
+}
+
+struct SettingsSnapshots {
+    agents: ui::agents::AgentsSnapshot,
+    env: ui::env_profiles::EnvProfilesSnapshot,
+    credentials: ui::credentials::CredentialsSnapshot,
+}
+
+struct PreparedAgentLaunch {
+    runtime_workspace_id: String,
+    agent_config_id: String,
+    command: String,
+    args: Vec<String>,
+    env_plain: Vec<(String, String)>,
+    env_secrets: Vec<(String, String)>,
+    waiting_regex: Option<String>,
+    approval_regex: Option<String>,
+    error_regex: Option<String>,
+    done_regex: Option<String>,
+    proxy: Option<PreparedProxyLaunch>,
+    approval_ticket: Option<u64>,
+}
+
+struct PreparedProxyLaunch {
+    server_id: String,
+    config_flag: String,
 }
 
 fn dotenv_state_for_root(root: Option<&std::path::Path>) -> DotenvState {
@@ -228,21 +625,1235 @@ impl DotenvSyncWorker {
     }
 }
 
+fn mcp_proxy_bin() -> anyhow::Result<String> {
+    let exe = std::env::current_exe().context("현재 실행 파일 경로 조회 실패")?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("실행 파일 디렉터리를 알 수 없습니다"))?;
+    let candidate = dir.join(format!("deppy-mcp-proxy{}", std::env::consts::EXE_SUFFIX));
+    anyhow::ensure!(candidate.is_file(), "mcp_proxy_binary_missing");
+    Ok(candidate.to_string_lossy().into_owned())
+}
+
+fn write_mcp_proxy_config(
+    proxy_bin: &str,
+    db_path: &std::path::Path,
+    agent_id: &str,
+    server_id: &str,
+    approval_notify_socket: &std::path::Path,
+) -> anyhow::Result<PathBuf> {
+    let data_dir = db_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("mcp_proxy_config_parent_missing"))?;
+    let dir = data_dir.join("mcp-proxy-configs");
+    std::fs::create_dir_all(&dir).context("mcp_proxy_config_directory_create_failed")?;
+    let path = dir.join(format!("{agent_id}.mcp.json"));
+    let args = vec![
+        "--db".to_owned(),
+        db_path.to_string_lossy().into_owned(),
+        "--server".to_owned(),
+        server_id.to_owned(),
+        "--approval-notify-socket".to_owned(),
+        approval_notify_socket.to_string_lossy().into_owned(),
+    ];
+    let content = serde_json::to_vec_pretty(&serde_json::json!({
+        "mcpServers": {
+            "deppy-proxy": {
+                "command": proxy_bin,
+                "args": args,
+            }
+        }
+    }))
+    .context("mcp_proxy_config_serialize_failed")?;
+    deppy_core::fs::atomic_write(&path, &content)
+        .context("mcp_proxy_config_atomic_write_failed")?;
+    Ok(path)
+}
+
+fn settings_agent_args_summary(args: &[String]) -> ui::agents::AgentArgsSummary {
+    let bytes = args
+        .iter()
+        .map(String::len)
+        .try_fold(0usize, usize::checked_add);
+    if args.len() > ui::agents::AGENT_ARGS_MAX_ITEMS
+        || bytes.is_none_or(|bytes| bytes > ui::agents::AGENT_ARGS_MAX_BYTES)
+        || Db::validate_agent_args_for_persistence(args).is_err()
+    {
+        ui::agents::AgentArgsSummary::redacted()
+    } else {
+        ui::agents::AgentArgsSummary::visible(args.join(" "))
+    }
+}
+
+fn load_agents_snapshot(db: &Db, revision: u64, workspace_id: &str) -> ui::agents::AgentsSnapshot {
+    let loaded = (|| -> anyhow::Result<_> {
+        let rows = db.settings_agents_snapshot_rows(workspace_id)?;
+        let agents = rows
+            .agents
+            .into_iter()
+            .map(|row| {
+                let summary = settings_agent_args_summary(&row.args);
+                ui::agents::AgentListItem::new(row.id, row.name, row.command, summary)
+            })
+            .collect();
+        let profiles = rows
+            .profiles
+            .into_iter()
+            .map(|row| ui::agents::AgentProfileItem::new(row.id, row.name, row.is_production))
+            .collect();
+        let backends = rows
+            .enabled_mcp_servers
+            .into_iter()
+            .map(|row| ui::agents::AgentBackendItem::new(row.id, row.name))
+            .collect();
+        ui::agents::AgentsSnapshot::try_new(revision, agents, profiles, backends)
+            .map_err(Into::into)
+    })();
+    loaded.unwrap_or_else(|_| ui::agents::AgentsSnapshot::unavailable(revision))
+}
+
+fn load_environment_snapshots(
+    db: &Db,
+    revision: u64,
+    workspace_id: &str,
+    project_root_configured: bool,
+) -> (
+    ui::env_profiles::EnvProfilesSnapshot,
+    ui::credentials::CredentialsSnapshot,
+) {
+    let loaded = (|| -> anyhow::Result<_> {
+        let rows = db.settings_environment_snapshot_rows(workspace_id)?;
+        let credential_ids = rows
+            .credentials
+            .iter()
+            .map(|credential| credential.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let profiles = rows.profiles;
+        let legacy_profile_count = profiles
+            .iter()
+            .filter(|profile| profile.kind != crate::dotenv_sync::DOTENV_PROFILE_KIND)
+            .count();
+        let dotenv_profile_id = profiles
+            .iter()
+            .find(|profile| profile.kind == crate::dotenv_sync::DOTENV_PROFILE_KIND)
+            .map(|profile| profile.id.clone());
+        let mut dotenv_vars = Vec::new();
+        let mut legacy_vars = Vec::new();
+        let dotenv_profile_ids = profiles
+            .iter()
+            .filter(|profile| profile.kind == crate::dotenv_sync::DOTENV_PROFILE_KIND)
+            .map(|profile| profile.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let dotenv_referenced_credentials = rows
+            .env_vars
+            .iter()
+            .filter(|row| dotenv_profile_ids.contains(&row.profile_id))
+            .filter_map(|row| match &row.value {
+                crate::env::EnvValue::Secret { credential_id } => Some(credential_id.clone()),
+                crate::env::EnvValue::Plain(_) => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let credentials = rows
+            .credentials
+            .into_iter()
+            .filter(|credential| !dotenv_referenced_credentials.contains(&credential.id))
+            .map(|credential| {
+                ui::credentials::CredentialListItem::new(
+                    credential.id,
+                    credential.provider,
+                    credential.label,
+                    credential.credential_kind,
+                    credential.masked_hint,
+                )
+            })
+            .collect();
+        for row in rows.env_vars {
+            let has_os_override = std::env::var_os(&row.key).is_some();
+            let view = match row.value {
+                crate::env::EnvValue::Plain(value) => {
+                    ui::env_profiles::EnvValueView::plain(value, has_os_override)
+                }
+                crate::env::EnvValue::Secret { credential_id } => {
+                    let available = credential_ids.contains(&credential_id);
+                    ui::env_profiles::EnvValueView::secret(
+                        credential_id,
+                        available,
+                        has_os_override,
+                    )
+                }
+            };
+            let target = if dotenv_profile_ids.contains(&row.profile_id) {
+                &mut dotenv_vars
+            } else {
+                &mut legacy_vars
+            };
+            target.push(ui::env_profiles::EnvVarItem::new(
+                row.profile_id,
+                row.key,
+                view,
+            ));
+        }
+        let env = ui::env_profiles::EnvProfilesSnapshot::try_new(
+            revision,
+            workspace_id,
+            project_root_configured,
+            dotenv_profile_id,
+            legacy_profile_count,
+            dotenv_vars,
+            legacy_vars,
+        )
+        .map_err(anyhow::Error::from)?;
+        let credentials = ui::credentials::CredentialsSnapshot::try_new(revision, credentials)
+            .map_err(anyhow::Error::from)?;
+        Ok((env, credentials))
+    })();
+    loaded.unwrap_or_else(|_| {
+        (
+            ui::env_profiles::EnvProfilesSnapshot::unavailable(
+                revision,
+                workspace_id,
+                project_root_configured,
+            ),
+            ui::credentials::CredentialsSnapshot::unavailable(revision),
+        )
+    })
+}
+
+fn load_settings_snapshots(
+    db: &Db,
+    revision: u64,
+    workspace_id: &str,
+    project_root_configured: bool,
+) -> SettingsSnapshots {
+    let (env, credentials) =
+        load_environment_snapshots(db, revision, workspace_id, project_root_configured);
+    SettingsSnapshots {
+        agents: load_agents_snapshot(db, revision, workspace_id),
+        env,
+        credentials,
+    }
+}
+
+fn validate_settings_registration(
+    registration: &ui::agents::AgentRegistration,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !registration.name.trim().is_empty() && registration.name.len() <= 4 * 1024,
+        "settings_agent_name_invalid"
+    );
+    anyhow::ensure!(
+        !registration.command.trim().is_empty() && registration.command.len() <= 4 * 1024,
+        "settings_agent_command_invalid"
+    );
+    anyhow::ensure!(
+        registration.args.len() <= ui::agents::AGENT_ARGS_MAX_ITEMS,
+        "settings_agent_args_item_limit"
+    );
+    let arg_bytes = registration
+        .args
+        .iter()
+        .map(String::len)
+        .try_fold(0usize, usize::checked_add)
+        .context("settings_agent_args_byte_overflow")?;
+    anyhow::ensure!(
+        arg_bytes <= ui::agents::AGENT_ARGS_MAX_BYTES,
+        "settings_agent_args_byte_limit"
+    );
+    Db::validate_agent_args_for_persistence(&registration.args)?;
+    for pattern in [
+        &registration.waiting_regex,
+        &registration.approval_regex,
+        &registration.error_regex,
+        &registration.done_regex,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        anyhow::ensure!(pattern.len() <= 4 * 1024, "settings_agent_regex_limit");
+        regex::Regex::new(pattern).context("settings_agent_regex_invalid")?;
+    }
+    if let Some(flag) = registration.mcp_config_flag.as_deref() {
+        anyhow::ensure!(
+            flag.starts_with('-') && !flag.contains(char::is_whitespace) && flag.len() <= 256,
+            "settings_agent_mcp_flag_invalid"
+        );
+    }
+    anyhow::ensure!(
+        !registration.mcp_proxy_enabled || registration.mcp_proxy_server_id.is_some(),
+        "settings_agent_mcp_backend_missing"
+    );
+    Ok(())
+}
+
+fn prepare_agent_launch(
+    db: &Db,
+    workspace_id: &str,
+    agent_id: &str,
+    profile_id: Option<&str>,
+    runtime_workspace_id: String,
+) -> anyhow::Result<PreparedAgentLaunch> {
+    let rows = db.settings_agent_launch_rows(workspace_id, agent_id, profile_id)?;
+    let agent = rows.agent.context("settings_agent_missing")?;
+    let arg_bytes = agent
+        .args
+        .iter()
+        .map(String::len)
+        .try_fold(0usize, usize::checked_add)
+        .context("settings_agent_args_byte_overflow")?;
+    anyhow::ensure!(
+        agent.args.len() <= ui::agents::AGENT_ARGS_MAX_ITEMS
+            && arg_bytes <= ui::agents::AGENT_ARGS_MAX_BYTES,
+        "settings_agent_args_limit"
+    );
+    Db::validate_agent_args_for_persistence(&agent.args)?;
+
+    let mut env_plain = Vec::new();
+    let mut env_secrets = Vec::new();
+    if profile_id.is_some() {
+        anyhow::ensure!(rows.profile.is_some(), "settings_profile_not_owned");
+        for var in rows.env_vars {
+            match var.value {
+                crate::env::EnvValue::Plain(value) => env_plain.push((var.key, value)),
+                crate::env::EnvValue::Secret { credential_id } => {
+                    env_secrets.push((var.key, credential_id));
+                }
+            }
+        }
+    }
+
+    let proxy = if agent.mcp_proxy_enabled {
+        let server_id = agent
+            .mcp_proxy_server_id
+            .as_deref()
+            .context("settings_agent_mcp_backend_missing")?;
+        anyhow::ensure!(
+            rows.mcp_backend_enabled,
+            "settings_agent_mcp_backend_unavailable"
+        );
+        let flag = agent.mcp_config_flag.as_deref().unwrap_or("--mcp-config");
+        anyhow::ensure!(
+            flag.starts_with('-') && !flag.contains(char::is_whitespace) && flag.len() <= 256,
+            "settings_agent_mcp_flag_invalid"
+        );
+        Some(PreparedProxyLaunch {
+            server_id: server_id.to_owned(),
+            config_flag: flag.to_owned(),
+        })
+    } else {
+        None
+    };
+
+    Ok(PreparedAgentLaunch {
+        runtime_workspace_id,
+        agent_config_id: agent.id,
+        command: agent.command,
+        args: agent.args,
+        env_plain,
+        env_secrets,
+        waiting_regex: agent.waiting_regex,
+        approval_regex: agent.approval_regex,
+        error_regex: agent.error_regex,
+        done_regex: agent.done_regex,
+        proxy,
+        approval_ticket: None,
+    })
+}
+
+fn finalize_proxy_agent_launch(
+    mut prepared: PreparedAgentLaunch,
+    db_path: &std::path::Path,
+    approval_notify_socket: &std::path::Path,
+) -> anyhow::Result<PreparedAgentLaunch> {
+    let proxy = prepared
+        .proxy
+        .take()
+        .context("settings_proxy_finalize_without_plan")?;
+    let proxy_bin = mcp_proxy_bin()?;
+    let path = write_mcp_proxy_config(
+        &proxy_bin,
+        db_path,
+        &prepared.agent_config_id,
+        &proxy.server_id,
+        approval_notify_socket,
+    )?;
+    prepared.args.push(proxy.config_flag);
+    prepared.args.push(path.to_string_lossy().into_owned());
+    Ok(prepared)
+}
+
+fn add_settings_credential(
+    db: &Db,
+    store: &dyn secret::SecretStore,
+    workspace_id: &str,
+    credential: ui::credentials::NewCredential,
+) -> anyhow::Result<()> {
+    let (provider, label, credential_kind, input) = credential.into_parts();
+    let access = secret::SecretString::new(input.into_inner());
+    let logical = secret::LogicalCredentialId::new(uuid::Uuid::new_v4().to_string())?;
+    let plan = secret::SecretBundleStagePlan::allocate(logical.clone(), None)?;
+    db.register_physical_secret_slot_staging(logical.as_str(), plan.new_slot().as_str())?;
+    if let Err(error) = secret::stage_secret_bundle(
+        store,
+        &plan,
+        secret::SecretBundleRef::new(&access, None, None),
+    ) {
+        if secret::inspect_secret_bundle(store, plan.new_slot()).is_ok_and(|state| state.is_empty())
+        {
+            let _ = db.acknowledge_physical_secret_slot_deleted(
+                logical.as_str(),
+                plan.new_slot().as_str(),
+            );
+        }
+        return Err(error);
+    }
+    let meta = crate::storage::CredentialMeta {
+        id: logical.as_str().to_owned(),
+        provider,
+        label,
+        credential_kind,
+        masked_hint: Some(secret::masked_hint(access.expose())),
+        workspace_id: Some(workspace_id.to_owned()),
+    };
+    // A commit error has an indeterminate outcome. Keep the exact staged bundle and ledger row;
+    // startup reconciliation decides from durable state and never guesses by deleting it here.
+    db.insert_credential_with_secret_slot(&meta, plan.new_slot().as_str(), None)
+}
+
+fn settings_credential_slot(
+    db: &Db,
+    credential_id: &str,
+) -> anyhow::Result<(secret::LogicalCredentialId, secret::PhysicalSecretSlot)> {
+    let logical = secret::LogicalCredentialId::new(credential_id.to_owned())?;
+    let location = db
+        .credential_secret_location(credential_id)?
+        .context("settings_credential_missing")?;
+    anyhow::ensure!(
+        location.keyring_service == secret::KEYRING_SERVICE,
+        "settings_credential_service_invalid"
+    );
+    let slot = secret::PhysicalSecretSlot::parse(location.keyring_username)?;
+    anyhow::ensure!(
+        slot.belongs_to(&logical),
+        "settings_credential_slot_owner_invalid"
+    );
+    Ok((logical, slot))
+}
+
+fn delete_settings_credential(
+    db: &Db,
+    store: &dyn secret::SecretStore,
+    credential_id: &str,
+) -> anyhow::Result<()> {
+    let (logical, slot) = settings_credential_slot(db, credential_id)?;
+    anyhow::ensure!(
+        db.delete_credential_if_unused_cas(logical.as_str(), slot.as_str())?,
+        "settings_credential_delete_stale_or_in_use"
+    );
+    // Metadata deletion atomically marks the exact slot Orphan. Cleanup failure is recoverable and
+    // must not turn the already-committed delete into a stale UI row or an unsafe automatic retry.
+    if secret::delete_secret_bundle(store, &slot).is_ok() {
+        let _ = db.acknowledge_physical_secret_slot_deleted(logical.as_str(), slot.as_str())?;
+    } else {
+        tracing::warn!(
+            kind = "credential",
+            phase = "cleanup",
+            error_code = "deferred",
+            "credential physical slot cleanup deferred"
+        );
+    }
+    Ok(())
+}
+
+fn reveal_settings_credential(
+    db: &Db,
+    store: &dyn secret::SecretStore,
+    credential_id: &str,
+) -> anyhow::Result<ui::credentials::RevealedCredential> {
+    let (_, slot) = settings_credential_slot(db, credential_id)?;
+    let (access, _, _) = secret::read_secret_bundle(store, &slot)?.into_parts();
+    ui::credentials::RevealedCredential::new(credential_id, access.expose().to_owned())
+        .map_err(Into::into)
+}
+
+fn scan_orphan_settings_credentials(
+    db: &Db,
+    store: &dyn secret::SecretStore,
+) -> anyhow::Result<Vec<String>> {
+    let known = db
+        .list_credential_secret_records(secret::VERSIONED_SECRET_BUNDLE_SLOT_CEILING)?
+        .into_iter()
+        .map(|record| record.meta.id)
+        .collect::<std::collections::HashSet<_>>();
+    let mut orphans = store
+        .list_secret_ids_bounded("")?
+        .into_iter()
+        .filter(|account| uuid_base(account).is_some_and(|base| !known.contains(base)))
+        .collect::<Vec<_>>();
+    orphans.sort();
+    orphans.dedup();
+    Ok(orphans)
+}
+
+fn purge_orphan_settings_credentials(
+    store: &dyn secret::SecretStore,
+    credential_ids: &[String],
+) -> anyhow::Result<(usize, usize)> {
+    let bytes = credential_ids
+        .iter()
+        .map(String::len)
+        .try_fold(0usize, usize::checked_add)
+        .context("settings_orphan_credential_bytes_overflow")?;
+    anyhow::ensure!(
+        credential_ids.len() <= 1_024 && bytes <= 1024 * 1024,
+        "settings_orphan_credential_limit"
+    );
+    let mut purged = 0usize;
+    for credential_id in credential_ids {
+        anyhow::ensure!(
+            uuid_base(credential_id).is_some(),
+            "settings_orphan_credential_invalid"
+        );
+        if store.delete_secret(credential_id).is_ok() {
+            purged = purged.saturating_add(1);
+        }
+    }
+    Ok((purged, credential_ids.len().saturating_sub(purged)))
+}
+
+fn delete_legacy_secret_bundle(
+    store: &dyn secret::SecretStore,
+    logical_id: &str,
+) -> anyhow::Result<()> {
+    store.delete_secret(logical_id)?;
+    store.delete_secret(&auth::refresh_entry_id(logical_id))?;
+    store.delete_secret(&auth::dcr_secret_entry_id(logical_id))?;
+    Ok(())
+}
+
+fn reconcile_physical_secret_ledger(
+    db: &Db,
+    store: &dyn secret::SecretStore,
+) -> anyhow::Result<()> {
+    let rows =
+        db.physical_secret_slots_for_reconciliation(secret::VERSIONED_SECRET_BUNDLE_SLOT_CEILING)?;
+    for row in rows {
+        let logical = secret::LogicalCredentialId::new(row.logical_credential_id)?;
+        let slot = secret::PhysicalSecretSlot::parse(row.physical_slot)?;
+        anyhow::ensure!(
+            slot.belongs_to(&logical),
+            "startup_secret_slot_owner_invalid"
+        );
+        match row.state {
+            storage::PhysicalSecretSlotState::Staging
+            | storage::PhysicalSecretSlotState::Orphan => {
+                secret::delete_secret_bundle(store, &slot)?;
+                let _ =
+                    db.acknowledge_physical_secret_slot_deleted(logical.as_str(), slot.as_str())?;
+            }
+            storage::PhysicalSecretSlotState::Published => {
+                if let Some(legacy) = row.legacy_cleanup_username {
+                    anyhow::ensure!(
+                        legacy == logical.as_str(),
+                        "startup_legacy_cleanup_owner_invalid"
+                    );
+                    delete_legacy_secret_bundle(store, &legacy)?;
+                    let _ = db.acknowledge_legacy_secret_source_deleted(
+                        logical.as_str(),
+                        slot.as_str(),
+                        &legacy,
+                    )?;
+                }
+                anyhow::ensure!(
+                    secret::inspect_secret_bundle(store, &slot)?.access,
+                    "startup_published_secret_missing"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn migrate_legacy_secret_pointers(db: &Db, store: &dyn secret::SecretStore) -> anyhow::Result<()> {
+    let records =
+        db.list_credential_secret_records(secret::VERSIONED_SECRET_BUNDLE_SLOT_CEILING)?;
+    for record in records {
+        anyhow::ensure!(
+            record.keyring_service == secret::KEYRING_SERVICE,
+            "startup_credential_service_invalid"
+        );
+        let logical = secret::LogicalCredentialId::new(record.meta.id.clone())?;
+        if record.keyring_username != logical.as_str() {
+            let physical = secret::PhysicalSecretSlot::parse(record.keyring_username)?;
+            anyhow::ensure!(
+                physical.belongs_to(&logical),
+                "startup_credential_slot_owner_invalid"
+            );
+            continue;
+        }
+
+        let access = store
+            .get_secret(logical.as_str())
+            .map_err(|_| anyhow::anyhow!("startup_legacy_access_read_failed"))?;
+        let refresh_id = auth::refresh_entry_id(logical.as_str());
+        let refresh = store
+            .has_secret(&refresh_id)
+            .map_err(|_| anyhow::anyhow!("startup_legacy_refresh_probe_failed"))?
+            .then(|| store.get_secret(&refresh_id))
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("startup_legacy_refresh_read_failed"))?;
+        let dcr_id = auth::dcr_secret_entry_id(logical.as_str());
+        let dcr = store
+            .has_secret(&dcr_id)
+            .map_err(|_| anyhow::anyhow!("startup_legacy_dcr_probe_failed"))?
+            .then(|| store.get_secret(&dcr_id))
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("startup_legacy_dcr_read_failed"))?;
+        let plan = secret::SecretBundleStagePlan::allocate(logical.clone(), None)?;
+        db.register_physical_secret_slot_staging(logical.as_str(), plan.new_slot().as_str())?;
+        if let Err(error) = secret::stage_secret_bundle(
+            store,
+            &plan,
+            secret::SecretBundleRef::new(&access, refresh.as_ref(), dcr.as_ref()),
+        ) {
+            if secret::inspect_secret_bundle(store, plan.new_slot())
+                .is_ok_and(|state| state.is_empty())
+            {
+                let _ = db.acknowledge_physical_secret_slot_deleted(
+                    logical.as_str(),
+                    plan.new_slot().as_str(),
+                );
+            }
+            return Err(error);
+        }
+        let published = db.publish_legacy_credential_secret_slot_cas(
+            logical.as_str(),
+            logical.as_str(),
+            plan.new_slot().as_str(),
+            record.oauth_json.as_deref(),
+            record.meta.masked_hint.as_deref(),
+        )?;
+        if published {
+            delete_legacy_secret_bundle(store, logical.as_str())?;
+            let _ = db.acknowledge_legacy_secret_source_deleted(
+                logical.as_str(),
+                plan.new_slot().as_str(),
+                logical.as_str(),
+            )?;
+        } else {
+            secret::delete_secret_bundle(store, plan.new_slot())?;
+            let _ = db.acknowledge_physical_secret_slot_deleted(
+                logical.as_str(),
+                plan.new_slot().as_str(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn reconcile_and_migrate_startup_secrets(
+    db: &Db,
+    store: &dyn secret::SecretStore,
+) -> anyhow::Result<()> {
+    reconcile_physical_secret_ledger(db, store)?;
+    migrate_legacy_secret_pointers(db, store)?;
+    reconcile_physical_secret_ledger(db, store)?;
+    let published = db
+        .physical_secret_slots_for_reconciliation(secret::VERSIONED_SECRET_BUNDLE_SLOT_CEILING)?
+        .into_iter()
+        .map(|row| {
+            anyhow::ensure!(
+                row.state == storage::PhysicalSecretSlotState::Published
+                    && row.legacy_cleanup_username.is_none(),
+                "startup_secret_ledger_not_converged"
+            );
+            Ok((row.logical_credential_id, row.physical_slot))
+        })
+        .collect::<anyhow::Result<std::collections::HashSet<_>>>()?;
+    for record in db.list_credential_secret_records(secret::VERSIONED_SECRET_BUNDLE_SLOT_CEILING)? {
+        anyhow::ensure!(
+            record.keyring_service == secret::KEYRING_SERVICE
+                && record.keyring_username != record.meta.id,
+            "startup_logical_secret_pointer_remaining"
+        );
+        let logical = secret::LogicalCredentialId::new(record.meta.id)?;
+        let slot = secret::PhysicalSecretSlot::parse(record.keyring_username)?;
+        anyhow::ensure!(
+            slot.belongs_to(&logical),
+            "startup_final_secret_slot_owner_invalid"
+        );
+        anyhow::ensure!(
+            published.contains(&(logical.as_str().to_owned(), slot.as_str().to_owned())),
+            "startup_published_secret_ledger_missing"
+        );
+    }
+    Ok(())
+}
+
+fn execute_settings_job(
+    db: &mut Db,
+    db_path: &std::path::Path,
+    redaction: &secret::RedactionService,
+    job: SettingsJob,
+) -> SettingsOutcome {
+    let SettingsJob {
+        generation,
+        revision,
+        workspace_id,
+        mut project_root,
+        action,
+    } = job;
+    let mut refresh = false;
+    let kind = match action {
+        SettingsJobAction::Load => SettingsOutcomeKind::Loaded,
+        SettingsJobAction::AddCredential { credential } => {
+            let result =
+                add_settings_credential(db, &KeyringSecretStore, &workspace_id, credential)
+                    .map_err(|_| SettingsErrorCode::CredentialAdd);
+            refresh = result.is_ok();
+            SettingsOutcomeKind::CredentialAdded(result)
+        }
+        SettingsJobAction::DeleteCredential { credential_id } => {
+            let result = delete_settings_credential(db, &KeyringSecretStore, &credential_id)
+                .map_err(|_| SettingsErrorCode::CredentialDelete);
+            refresh = result.is_ok();
+            SettingsOutcomeKind::CredentialDeleted {
+                credential_id,
+                result,
+            }
+        }
+        SettingsJobAction::RevealCredential { credential_id } => {
+            let result = reveal_settings_credential(db, &KeyringSecretStore, &credential_id)
+                .map_err(|_| SettingsErrorCode::CredentialReveal);
+            SettingsOutcomeKind::CredentialRevealed {
+                credential_id,
+                result,
+            }
+        }
+        SettingsJobAction::ScanOrphanCredentials => SettingsOutcomeKind::OrphanCredentialsScanned(
+            scan_orphan_settings_credentials(db, &KeyringSecretStore)
+                .map_err(|_| SettingsErrorCode::OrphanScan),
+        ),
+        SettingsJobAction::PurgeOrphanCredentials { credential_ids } => {
+            let result = purge_orphan_settings_credentials(&KeyringSecretStore, &credential_ids)
+                .map_err(|_| SettingsErrorCode::OrphanPurge);
+            let (purged, remaining) = result
+                .as_ref()
+                .copied()
+                .unwrap_or((0, credential_ids.len()));
+            SettingsOutcomeKind::OrphanCredentialsPurged {
+                purged,
+                remaining,
+                result: result.map(|_| ()),
+            }
+        }
+        SettingsJobAction::SaveCodexLlmApiKey { value } => {
+            let result = crate::codex_app_server::validate_llm_api_key(value.expose())
+                .and_then(|_| {
+                    secret::SecretStore::set_secret(
+                        &KeyringSecretStore,
+                        CODEX_LLM_API_KEY_ENTRY_ID,
+                        &value,
+                    )
+                })
+                .map_err(|_| SettingsErrorCode::ApiKeySave);
+            SettingsOutcomeKind::CodexLlmApiKeySaved(result)
+        }
+        SettingsJobAction::DeleteCodexLlmApiKey => SettingsOutcomeKind::CodexLlmApiKeyDeleted(
+            secret::SecretStore::delete_secret(&KeyringSecretStore, CODEX_LLM_API_KEY_ENTRY_ID)
+                .map_err(|_| SettingsErrorCode::ApiKeyDelete),
+        ),
+        SettingsJobAction::RegisterAgent(registration) => {
+            let result = validate_settings_registration(&registration)
+                .and_then(|()| {
+                    db.insert_agent_config(
+                        registration.name.trim(),
+                        registration.command.trim(),
+                        &registration.args,
+                        registration.waiting_regex.as_deref(),
+                        registration.approval_regex.as_deref(),
+                        registration.error_regex.as_deref(),
+                        registration.done_regex.as_deref(),
+                        registration.mcp_proxy_enabled,
+                        registration.mcp_proxy_server_id.as_deref(),
+                        registration.mcp_config_flag.as_deref(),
+                    )
+                    .map(|_| ())
+                })
+                .map_err(|_| SettingsErrorCode::Registration);
+            refresh = result.is_ok();
+            SettingsOutcomeKind::AgentRegistered(result)
+        }
+        SettingsJobAction::DeleteAgent { agent_id } => {
+            let result = db
+                .delete_agent_config(&agent_id)
+                .map_err(|_| SettingsErrorCode::Delete);
+            refresh = result.is_ok();
+            SettingsOutcomeKind::AgentDeleted(result)
+        }
+        SettingsJobAction::PrepareAgentLaunch {
+            agent_id,
+            profile_id,
+            runtime_workspace_id,
+        } => SettingsOutcomeKind::AgentLaunchPrepared(
+            prepare_agent_launch(
+                db,
+                &workspace_id,
+                &agent_id,
+                profile_id.as_deref(),
+                runtime_workspace_id,
+            )
+            .map_err(|_| SettingsErrorCode::Launch),
+        ),
+        SettingsJobAction::FinalizeProxyAgentLaunch {
+            prepared,
+            approval_notify_socket,
+        } => {
+            let ticket_id = prepared.approval_ticket;
+            SettingsOutcomeKind::AgentLaunchFinalized {
+                ticket_id,
+                result: finalize_proxy_agent_launch(*prepared, db_path, &approval_notify_socket)
+                    .map_err(|_| SettingsErrorCode::Launch),
+            }
+        }
+        SettingsJobAction::DeleteLegacyVar { profile_id, key } => {
+            let result = (|| -> anyhow::Result<()> {
+                let profiles = db.list_env_profiles(&workspace_id)?;
+                let profile = profiles
+                    .iter()
+                    .find(|profile| profile.id == profile_id)
+                    .context("settings_legacy_profile_not_owned")?;
+                anyhow::ensure!(
+                    profile.kind != crate::dotenv_sync::DOTENV_PROFILE_KIND,
+                    "settings_dotenv_delete_wrong_path"
+                );
+                db.delete_env_var(&profile_id, &key)?;
+                if db.list_env_vars(&profile_id)?.is_empty() {
+                    db.delete_env_profile(&profile_id)?;
+                }
+                Ok(())
+            })()
+            .map_err(|_| SettingsErrorCode::LegacyDelete);
+            refresh = result.is_ok();
+            SettingsOutcomeKind::LegacyVarDeleted(result)
+        }
+        SettingsJobAction::WriteDotenv { key, value } => {
+            let result = project_root
+                .as_deref()
+                .context("settings_dotenv_root_missing")
+                .and_then(|root| crate::dotenv_sync::write_env_var(root, &key, value.as_deref()))
+                .map_err(|_| SettingsErrorCode::DotenvWrite);
+            refresh = result.is_ok();
+            SettingsOutcomeKind::DotenvWritten(result)
+        }
+        SettingsJobAction::ResyncDotenv => {
+            let result = project_root
+                .as_deref()
+                .context("settings_dotenv_root_missing")
+                .and_then(|root| {
+                    crate::dotenv_sync::migrate_legacy_profiles_to_dotenv(
+                        db,
+                        &KeyringSecretStore,
+                        &workspace_id,
+                        root,
+                    )?;
+                    crate::dotenv_sync::sync_workspace_dotenv(
+                        db,
+                        &KeyringSecretStore,
+                        redaction,
+                        &workspace_id,
+                        root,
+                    )?;
+                    Ok(())
+                })
+                .map_err(|_| SettingsErrorCode::DotenvSync);
+            refresh = result.is_ok();
+            SettingsOutcomeKind::DotenvResynced(result)
+        }
+        SettingsJobAction::SetProjectPath { path } => {
+            let path_string = path.to_string_lossy().into_owned();
+            let anchor = (!path_string.trim().is_empty())
+                .then(|| App::folder_anchor(&path_string))
+                .flatten();
+            let result = db
+                .set_workspace_path_and_anchor(
+                    &workspace_id,
+                    &path_string,
+                    anchor.map(|value| value.0),
+                    anchor.map(|value| value.1),
+                )
+                .map_err(|_| SettingsErrorCode::ProjectPath);
+            if result.is_ok()
+                && path_string.trim().is_empty()
+                && crate::dotenv_sync::remove_workspace_dotenv(
+                    db,
+                    &KeyringSecretStore,
+                    &workspace_id,
+                )
+                .is_err()
+            {
+                tracing::warn!(
+                    kind = "settings",
+                    phase = "dotenv_cleanup",
+                    error_code = "dotenv_cleanup_failed",
+                    "workspace dotenv cleanup failed after path detach"
+                );
+            }
+            if result.is_ok() {
+                project_root = path.is_dir().then_some(path.clone());
+                refresh = true;
+            }
+            SettingsOutcomeKind::ProjectPathSet(result)
+        }
+        SettingsJobAction::RenameWorkspace { name } => {
+            let result = db
+                .rename_workspace(&workspace_id, name.trim())
+                .map_err(|_| SettingsErrorCode::WorkspaceMutation);
+            SettingsOutcomeKind::WorkspaceRenamed { name, result }
+        }
+        SettingsJobAction::FindOrCreateWorkspace {
+            name,
+            path,
+            purpose,
+        } => {
+            let result = (|| {
+                let path_string = path.to_string_lossy().into_owned();
+                let (dev, ino) = App::folder_anchor(&path_string)
+                    .context("settings_workspace_folder_anchor_missing")?;
+                db.find_or_create_workspace_by_exact_path(
+                    &name,
+                    &path_string,
+                    storage::WorkspaceFolderAnchor { dev, ino },
+                )
+            })()
+            .map_err(|_| SettingsErrorCode::WorkspaceMutation);
+            SettingsOutcomeKind::WorkspaceFoundOrCreated { purpose, result }
+        }
+        SettingsJobAction::AcceptMovedWorkspacePath {
+            expected_old_path,
+            expected_anchor,
+            new_path,
+        } => {
+            let result = (|| {
+                let new_path_string = new_path.to_string_lossy().into_owned();
+                let (dev, ino) = App::folder_anchor(&new_path_string)
+                    .context("settings_workspace_moved_anchor_missing")?;
+                db.update_workspace_moved_path_cas(
+                    &workspace_id,
+                    &expected_old_path,
+                    expected_anchor,
+                    &new_path_string,
+                    storage::WorkspaceFolderAnchor { dev, ino },
+                )
+            })()
+            .map_err(|_| SettingsErrorCode::WorkspaceMutation);
+            SettingsOutcomeKind::WorkspaceMovedPathAccepted { new_path, result }
+        }
+    };
+    let snapshots = (refresh || matches!(kind, SettingsOutcomeKind::Loaded))
+        .then(|| load_settings_snapshots(db, revision, &workspace_id, project_root.is_some()));
+    SettingsOutcome {
+        generation,
+        revision,
+        workspace_id,
+        kind,
+        snapshots,
+    }
+}
+
+fn settings_open_failed_outcome(job: SettingsJob) -> SettingsOutcome {
+    let kind = match job.action {
+        SettingsJobAction::Load => SettingsOutcomeKind::Loaded,
+        SettingsJobAction::AddCredential { .. } => {
+            SettingsOutcomeKind::CredentialAdded(Err(SettingsErrorCode::CredentialAdd))
+        }
+        SettingsJobAction::DeleteCredential { credential_id } => {
+            SettingsOutcomeKind::CredentialDeleted {
+                credential_id,
+                result: Err(SettingsErrorCode::CredentialDelete),
+            }
+        }
+        SettingsJobAction::RevealCredential { credential_id } => {
+            SettingsOutcomeKind::CredentialRevealed {
+                credential_id,
+                result: Err(SettingsErrorCode::CredentialReveal),
+            }
+        }
+        SettingsJobAction::ScanOrphanCredentials => {
+            SettingsOutcomeKind::OrphanCredentialsScanned(Err(SettingsErrorCode::OrphanScan))
+        }
+        SettingsJobAction::PurgeOrphanCredentials { credential_ids } => {
+            SettingsOutcomeKind::OrphanCredentialsPurged {
+                purged: 0,
+                remaining: credential_ids.len(),
+                result: Err(SettingsErrorCode::OrphanPurge),
+            }
+        }
+        SettingsJobAction::SaveCodexLlmApiKey { .. } => {
+            SettingsOutcomeKind::CodexLlmApiKeySaved(Err(SettingsErrorCode::ApiKeySave))
+        }
+        SettingsJobAction::DeleteCodexLlmApiKey => {
+            SettingsOutcomeKind::CodexLlmApiKeyDeleted(Err(SettingsErrorCode::ApiKeyDelete))
+        }
+        SettingsJobAction::RegisterAgent(_) => {
+            SettingsOutcomeKind::AgentRegistered(Err(SettingsErrorCode::Registration))
+        }
+        SettingsJobAction::DeleteAgent { .. } => {
+            SettingsOutcomeKind::AgentDeleted(Err(SettingsErrorCode::Delete))
+        }
+        SettingsJobAction::PrepareAgentLaunch { .. } => {
+            SettingsOutcomeKind::AgentLaunchPrepared(Err(SettingsErrorCode::Launch))
+        }
+        SettingsJobAction::FinalizeProxyAgentLaunch { prepared, .. } => {
+            SettingsOutcomeKind::AgentLaunchFinalized {
+                ticket_id: prepared.approval_ticket,
+                result: Err(SettingsErrorCode::Launch),
+            }
+        }
+        SettingsJobAction::DeleteLegacyVar { .. } => {
+            SettingsOutcomeKind::LegacyVarDeleted(Err(SettingsErrorCode::LegacyDelete))
+        }
+        SettingsJobAction::WriteDotenv { .. } => {
+            SettingsOutcomeKind::DotenvWritten(Err(SettingsErrorCode::DotenvWrite))
+        }
+        SettingsJobAction::ResyncDotenv => {
+            SettingsOutcomeKind::DotenvResynced(Err(SettingsErrorCode::DotenvSync))
+        }
+        SettingsJobAction::SetProjectPath { .. } => {
+            SettingsOutcomeKind::ProjectPathSet(Err(SettingsErrorCode::ProjectPath))
+        }
+        SettingsJobAction::RenameWorkspace { name } => SettingsOutcomeKind::WorkspaceRenamed {
+            name,
+            result: Err(SettingsErrorCode::WorkspaceMutation),
+        },
+        SettingsJobAction::FindOrCreateWorkspace { purpose, .. } => {
+            SettingsOutcomeKind::WorkspaceFoundOrCreated {
+                purpose,
+                result: Err(SettingsErrorCode::WorkspaceMutation),
+            }
+        }
+        SettingsJobAction::AcceptMovedWorkspacePath { new_path, .. } => {
+            SettingsOutcomeKind::WorkspaceMovedPathAccepted {
+                new_path,
+                result: Err(SettingsErrorCode::WorkspaceMutation),
+            }
+        }
+    };
+    SettingsOutcome {
+        generation: job.generation,
+        revision: job.revision,
+        workspace_id: job.workspace_id,
+        kind,
+        snapshots: None,
+    }
+}
+
+impl SettingsSnapshotWorker {
+    fn new(db_path: PathBuf, redaction: secret::RedactionService, ctx: egui::Context) -> Self {
+        Self {
+            db_path,
+            redaction,
+            ctx,
+            slot: None,
+            pending_result: None,
+        }
+    }
+
+    fn spawn_slot(&self) -> SettingsWorkerSlot {
+        self.spawn_slot_with_idle_ttl(SETTINGS_WORKER_IDLE_TTL)
+    }
+
+    fn spawn_slot_with_idle_ttl(&self, idle_ttl: std::time::Duration) -> SettingsWorkerSlot {
+        let (tx, jobs) = std::sync::mpsc::sync_channel::<SettingsJob>(1);
+        let (results, rx) = std::sync::mpsc::sync_channel::<SettingsOutcome>(1);
+        let db_path = self.db_path.clone();
+        let redaction = self.redaction.clone();
+        let ctx = self.ctx.clone();
+        let lifecycle = Arc::new(std::sync::Mutex::new(SettingsWorkerLifecycle::Running));
+        let thread_lifecycle = Arc::clone(&lifecycle);
+        let handle = std::thread::Builder::new()
+            .name("settings-snapshot".to_owned())
+            .spawn(move || {
+                let _exit_guard = SettingsWorkerExitGuard(Arc::clone(&thread_lifecycle));
+                let mut db = None;
+                loop {
+                    let job = match jobs.recv_timeout(idle_ttl) {
+                        Ok(job) => job,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            // Coordinate the final empty check with `try_send_to_slot`. If a
+                            // sender won the lifecycle lock after recv_timeout fired, its job is
+                            // observed here; otherwise Exited is published before any later send
+                            // can report success.
+                            let mut lifecycle = thread_lifecycle
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner());
+                            match jobs.try_recv() {
+                                Ok(job) => {
+                                    drop(lifecycle);
+                                    job
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty)
+                                | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    *lifecycle = SettingsWorkerLifecycle::Exited;
+                                    return;
+                                }
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    };
+                    let db = match &mut db {
+                        Some(db) => db,
+                        slot @ None => match Db::open(&db_path) {
+                            Ok(opened) => slot.insert(opened),
+                            Err(_) => {
+                                let outcome = settings_open_failed_outcome(job);
+                                if results.send(outcome).is_err() {
+                                    return;
+                                }
+                                ctx.request_repaint();
+                                continue;
+                            }
+                        },
+                    };
+                    let outcome = execute_settings_job(db, &db_path, &redaction, job);
+                    if results.send(outcome).is_err() {
+                        return;
+                    }
+                    ctx.request_repaint();
+                }
+            })
+            .expect("settings snapshot worker thread spawn");
+        SettingsWorkerSlot {
+            tx,
+            rx,
+            handle,
+            lifecycle,
+        }
+    }
+
+    fn try_send_to_slot(
+        slot: &SettingsWorkerSlot,
+        job: SettingsJob,
+    ) -> Result<(), SettingsTrySendError> {
+        let lifecycle = slot
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if *lifecycle == SettingsWorkerLifecycle::Exited {
+            return Err(SettingsTrySendError::Disconnected(Box::new(job)));
+        }
+        slot.tx.try_send(job).map_err(|error| match error {
+            std::sync::mpsc::TrySendError::Full(job) => SettingsTrySendError::Full(Box::new(job)),
+            std::sync::mpsc::TrySendError::Disconnected(job) => {
+                SettingsTrySendError::Disconnected(Box::new(job))
+            }
+        })
+    }
+
+    fn reap_finished(&mut self) {
+        if self
+            .slot
+            .as_ref()
+            .is_some_and(|slot| slot.handle.is_finished())
+            && let Some(slot) = self.slot.take()
+        {
+            if self.pending_result.is_none() {
+                self.pending_result = slot.rx.try_recv().ok();
+            }
+            let _ = slot.handle.join();
+        }
+    }
+
+    fn try_request(&mut self, job: SettingsJob) -> bool {
+        self.try_request_recover(job).is_ok()
+    }
+
+    fn try_request_recover(&mut self, job: SettingsJob) -> Result<(), Box<SettingsJob>> {
+        self.reap_finished();
+        if self.pending_result.is_some() {
+            return Err(Box::new(job));
+        }
+        if self.slot.is_none() {
+            self.slot = Some(self.spawn_slot());
+        }
+        let Some(slot) = self.slot.as_ref() else {
+            return Err(Box::new(job));
+        };
+        match Self::try_send_to_slot(slot, job) {
+            Ok(()) => Ok(()),
+            Err(SettingsTrySendError::Full(job)) => Err(job),
+            Err(SettingsTrySendError::Disconnected(job)) => {
+                if let Some(slot) = self.slot.take() {
+                    let _ = slot.handle.join();
+                }
+                let slot = self.spawn_slot();
+                let sent = Self::try_send_to_slot(&slot, *job);
+                self.slot = Some(slot);
+                match sent {
+                    Ok(()) => Ok(()),
+                    Err(SettingsTrySendError::Full(job))
+                    | Err(SettingsTrySendError::Disconnected(job)) => Err(job),
+                }
+            }
+        }
+    }
+
+    fn try_recv(&mut self) -> Option<SettingsOutcome> {
+        if let Some(outcome) = self.pending_result.take() {
+            return Some(outcome);
+        }
+        if let Ok(outcome) = self.slot.as_ref()?.rx.try_recv() {
+            return Some(outcome);
+        }
+        self.reap_finished();
+        self.pending_result.take()
+    }
+}
+
+impl Drop for SettingsSnapshotWorker {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            drop(slot.tx);
+            drop(slot.rx);
+            let _ = slot.handle.join();
+        }
+    }
+}
+
 impl EnvSecretRevealWorker {
-    fn spawn(ctx: egui::Context) -> Self {
+    fn spawn(db_path: PathBuf, ctx: egui::Context) -> Self {
         let (tx, jobs) = std::sync::mpsc::sync_channel::<EnvSecretRevealJob>(64);
         let (results, rx) = std::sync::mpsc::sync_channel::<EnvSecretRevealOutcome>(64);
         std::thread::Builder::new()
             .name("env-secret-reveal".to_owned())
             .spawn(move || {
+                let mut db = None;
                 while let Ok(job) = jobs.recv() {
-                    let value =
-                        secret::SecretStore::get_secret(&KeyringSecretStore, &job.credential_id)
-                            .map(|secret| secret.expose().to_owned());
+                    let value = (|| -> anyhow::Result<secret::SecretString> {
+                        let db = match &mut db {
+                            Some(db) => db,
+                            slot @ None => slot.insert(Db::open(&db_path)?),
+                        };
+                        let location = db
+                            .credential_secret_location(job.target.credential_id())?
+                            .context("credential_secret_location_missing")?;
+                        anyhow::ensure!(
+                            location.keyring_service == secret::KEYRING_SERVICE,
+                            "credential_secret_service_mismatch"
+                        );
+                        let secret = secret::SecretStore::get_secret(
+                            &KeyringSecretStore,
+                            &location.keyring_username,
+                        )?;
+                        anyhow::ensure!(
+                            secret.expose().len() <= ui::env_profiles::ENV_REVEALED_VALUE_MAX_BYTES,
+                            "env_secret_value_limit"
+                        );
+                        Ok(secret)
+                    })();
                     if results
                         .send(EnvSecretRevealOutcome {
                             generation: job.generation,
-                            credential_id: job.credential_id,
+                            target: job.target,
                             value,
                         })
                         .is_err()
@@ -323,63 +1934,641 @@ impl EnvProjectRowsWorker {
     }
 }
 
-impl ApprovalWatcher {
-    fn spawn(
+fn load_approval_snapshot(db: &Db) -> anyhow::Result<ApprovalSnapshot> {
+    let page = db.list_pending_approvals_bounded(mcp_store::PENDING_APPROVAL_LIST_LIMIT_MAX)?;
+    anyhow::ensure!(!page.has_more, "approval_snapshot_item_limit");
+    let inventory = if page.rows.is_empty() {
+        Vec::new()
+    } else {
+        db.mcp_server_inventory(mcp_store::MCP_SERVER_INVENTORY_LIMIT_MAX)?
+    };
+    let remote_urls = inventory
+        .into_iter()
+        .filter(|server| server.kind == "http")
+        .filter(|server| {
+            page.rows
+                .iter()
+                .any(|approval| approval.server_id == server.id)
+        })
+        .filter_map(|server| Some((server.id, server.url?)))
+        .collect();
+    Ok(ApprovalSnapshot {
+        rows: page.rows,
+        remote_urls,
+    })
+}
+
+#[cfg(unix)]
+fn signal_approval_listener(
+    socket: &std::os::unix::net::UnixDatagram,
+) -> Result<(), ApprovalWakeErrorCode> {
+    let sent = socket
+        .send(&[APPROVAL_CONTROL_MARKER])
+        .map_err(|_| ApprovalWakeErrorCode::Delivery)?;
+    (sent == 1)
+        .then_some(())
+        .ok_or(ApprovalWakeErrorCode::Delivery)
+}
+
+#[cfg(not(unix))]
+fn signal_approval_listener(_ready: &ApprovalListenerReady) -> Result<(), ApprovalWakeErrorCode> {
+    Err(ApprovalWakeErrorCode::Unsupported)
+}
+
+#[cfg(unix)]
+fn approval_listener_main(listener: ApprovalListenerContext) {
+    use std::sync::atomic::Ordering;
+
+    let ApprovalListenerContext {
+        db_path,
+        socket_path,
+        commands,
+        ready,
+        results,
+        snapshot,
+        ctx,
+        stop_requested,
+        pending_owner,
+    } = listener;
+
+    if stop_requested.load(Ordering::Acquire) {
+        let _ = ready.send(Err(ApprovalWakeErrorCode::Start));
+        return;
+    }
+    let db = match Db::open(&db_path) {
+        Ok(db) => db,
+        Err(_) => {
+            let _ = ready.send(Err(ApprovalWakeErrorCode::Storage));
+            return;
+        }
+    };
+    let socket = match std::os::unix::net::UnixDatagram::bind(&socket_path) {
+        Ok(socket) => socket,
+        Err(_) => {
+            let _ = ready.send(Err(ApprovalWakeErrorCode::Bind));
+            return;
+        }
+    };
+    if stop_requested.load(Ordering::Acquire) {
+        drop(socket);
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = ready.send(Err(ApprovalWakeErrorCode::Start));
+        return;
+    }
+    let control_socket = match std::os::unix::net::UnixDatagram::unbound().and_then(|control| {
+        control.connect(&socket_path)?;
+        Ok(control)
+    }) {
+        Ok(control) => control,
+        Err(_) => {
+            drop(socket);
+            let _ = std::fs::remove_file(&socket_path);
+            let _ = ready.send(Err(ApprovalWakeErrorCode::Bind));
+            return;
+        }
+    };
+    if ready
+        .send(Ok(ApprovalListenerReady {
+            socket_path: socket_path.clone(),
+            control_socket,
+        }))
+        .is_err()
+    {
+        let _ = std::fs::remove_file(&socket_path);
+        return;
+    }
+    ctx.request_repaint();
+
+    let publish = |db: &Db| -> bool {
+        let next = match load_approval_snapshot(db) {
+            Ok(next) => next,
+            Err(_) => return false,
+        };
+        let mut guard = snapshot.lock().unwrap_or_else(|poison| poison.into_inner());
+        *guard = Some(next);
+        drop(guard);
+        ctx.request_repaint();
+        true
+    };
+    let _ = publish(&db);
+
+    let mut byte = [0u8; 1];
+    'listen: loop {
+        let received = match socket.recv(&mut byte) {
+            Ok(1) => byte[0],
+            Ok(_) => continue,
+            Err(_) => break,
+        };
+        if stop_requested.load(Ordering::Acquire) {
+            break;
+        }
+        let mut proxy_wake = received == APPROVAL_WAKE_MARKER;
+        let mut control_wake = received == APPROVAL_CONTROL_MARKER;
+        if socket.set_nonblocking(true).is_ok() {
+            loop {
+                match socket.recv(&mut byte) {
+                    Ok(1) => {
+                        proxy_wake |= byte[0] == APPROVAL_WAKE_MARKER;
+                        control_wake |= byte[0] == APPROVAL_CONTROL_MARKER;
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break 'listen,
+                }
+            }
+            let _ = socket.set_nonblocking(false);
+        }
+
+        let mut refresh = proxy_wake;
+        if control_wake {
+            loop {
+                if stop_requested.load(Ordering::Acquire) {
+                    break 'listen;
+                }
+                match commands.try_recv() {
+                    Ok(ApprovalWorkerCommand::Resolve {
+                        id,
+                        allowed,
+                        remember,
+                        resolved_at,
+                    }) => {
+                        let succeeded = db
+                            .resolve_approval(&id, allowed, remember, resolved_at)
+                            .is_ok();
+                        let _ = results.send(if succeeded {
+                            ApprovalWorkerResult::Resolved
+                        } else {
+                            ApprovalWorkerResult::Failed
+                        });
+                        refresh = true;
+                    }
+                    Ok(ApprovalWorkerCommand::DenySession {
+                        workspace_id,
+                        session,
+                        resolved_at,
+                    }) => {
+                        let key = format!("{workspace_id}:{}", session.0);
+                        let succeeded = db
+                            .deny_pending_approvals_for_session(&key, resolved_at)
+                            .is_ok();
+                        let _ = results.send(ApprovalWorkerResult::SessionDenied {
+                            workspace_id,
+                            session,
+                            succeeded,
+                        });
+                        refresh = true;
+                    }
+                    Ok(ApprovalWorkerCommand::DenyAllOwned { resolved_at }) => {
+                        let succeeded = db
+                            .deny_session_scoped_pending_approvals_owned(
+                                pending_owner.as_ref(),
+                                resolved_at,
+                            )
+                            .is_ok();
+                        let _ = results.send(ApprovalWorkerResult::AllDenied { succeeded });
+                        refresh = true;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'listen,
+                }
+            }
+        }
+        if refresh {
+            let _ = publish(&db);
+        }
+    }
+    drop(socket);
+    let _ = std::fs::remove_file(&socket_path);
+}
+
+impl ApprovalWakeHub {
+    fn new(
         db_path: PathBuf,
         ctx: egui::Context,
-        poll_requested: Arc<AtomicBool>,
-        interval: std::time::Duration,
+        pending_owner: Arc<storage::ActivePendingApprovalOwner>,
     ) -> Self {
-        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
-        let handle = std::thread::Builder::new()
-            .name("approval-watcher".to_owned())
-            .spawn(move || {
-                let db = match Db::open(&db_path) {
-                    Ok(db) => db,
-                    Err(e) => {
-                        tracing::warn!("approval watcher DB 열기 실패: {e:#}");
-                        return;
-                    }
-                };
-                let mut last = ApprovalPendingSignature::default();
-                loop {
-                    match stop_rx.recv_timeout(interval) {
-                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    }
-                    match db.list_pending_approvals() {
-                        Ok(rows) => {
-                            let next = ApprovalPendingSignature::from_rows(&rows);
-                            if next != last {
-                                last = next;
-                                poll_requested.store(true, Ordering::Release);
-                                ctx.request_repaint();
-                            }
-                        }
-                        Err(e) => tracing::warn!("approval watcher 조회 실패: {e:#}"),
+        Self {
+            db_path,
+            ctx,
+            snapshot: Arc::new(std::sync::Mutex::new(None)),
+            slot: None,
+            deferred: std::collections::VecDeque::new(),
+            inflight: 0,
+            pending_owner,
+        }
+    }
+
+    fn ensure_started(&mut self) -> Result<(), ApprovalWakeErrorCode> {
+        if self.slot.is_some() {
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        return Err(ApprovalWakeErrorCode::Unsupported);
+        #[cfg(unix)]
+        {
+            let socket_name = format!(
+                "deppy-appr-{}-{}.sock",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            );
+            let mut socket_path = std::env::temp_dir().join(&socket_name);
+            if socket_path.to_string_lossy().len() > 100 {
+                // macOS TMPDIR is commonly a long /var/folders path and sockaddr_un is only
+                // 104 bytes. The literal /tmp alias keeps the kernel-visible address bounded.
+                socket_path = PathBuf::from("/tmp").join(socket_name);
+            }
+            let bytes = socket_path
+                .to_str()
+                .ok_or(ApprovalWakeErrorCode::Start)?
+                .len();
+            if bytes == 0 || bytes > 100 || socket_path.exists() {
+                return Err(ApprovalWakeErrorCode::Start);
+            }
+            let (command_tx, commands) =
+                std::sync::mpsc::sync_channel::<ApprovalWorkerCommand>(APPROVAL_COMMAND_CAP);
+            let (ready, ready_rx) = std::sync::mpsc::sync_channel(1);
+            let (results, result_rx) =
+                std::sync::mpsc::sync_channel::<ApprovalWorkerResult>(APPROVAL_COMMAND_CAP);
+            let db_path = self.db_path.clone();
+            let snapshot = Arc::clone(&self.snapshot);
+            let ctx = self.ctx.clone();
+            let thread_path = socket_path.clone();
+            let stop_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let thread_stop_requested = Arc::clone(&stop_requested);
+            let pending_owner = Arc::clone(&self.pending_owner);
+            let handle = std::thread::Builder::new()
+                .name("approval-wake".to_owned())
+                .spawn(move || {
+                    approval_listener_main(ApprovalListenerContext {
+                        db_path,
+                        socket_path: thread_path,
+                        commands,
+                        ready,
+                        results,
+                        snapshot,
+                        ctx,
+                        stop_requested: thread_stop_requested,
+                        pending_owner,
+                    });
+                })
+                .map_err(|_| ApprovalWakeErrorCode::Start)?;
+            self.slot = Some(ApprovalListenerSlot {
+                command_tx,
+                ready_rx,
+                result_rx,
+                handle,
+                socket_path: None,
+                control_socket: None,
+                stop_requested,
+            });
+            Ok(())
+        }
+    }
+
+    fn poll_ready(&mut self) -> Result<Option<PathBuf>, ApprovalWakeErrorCode> {
+        let Some(slot) = self.slot.as_mut() else {
+            return Ok(None);
+        };
+        if slot.socket_path.is_none() {
+            match slot.ready_rx.try_recv() {
+                Ok(Ok(ready)) => {
+                    slot.socket_path = Some(ready.socket_path.clone());
+                    #[cfg(unix)]
+                    {
+                        slot.control_socket = Some(ready.control_socket);
                     }
                 }
-            })
-            .expect("approval watcher thread spawn");
-        Self {
-            stop_tx: Some(stop_tx),
-            handle: Some(handle),
+                Ok(Err(error)) => return Err(error),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(None),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(ApprovalWakeErrorCode::Start);
+                }
+            }
         }
+        let path = slot
+            .socket_path
+            .clone()
+            .ok_or(ApprovalWakeErrorCode::Start)?;
+        let mut sent = false;
+        while let Some(command) = self.deferred.pop_front() {
+            match slot.command_tx.try_send(command) {
+                Ok(()) => sent = true,
+                Err(std::sync::mpsc::TrySendError::Full(command)) => {
+                    self.deferred.push_front(command);
+                    break;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(command)) => {
+                    self.deferred.push_front(command);
+                    return Err(ApprovalWakeErrorCode::Start);
+                }
+            }
+        }
+        if sent {
+            #[cfg(unix)]
+            signal_approval_listener(
+                slot.control_socket
+                    .as_ref()
+                    .ok_or(ApprovalWakeErrorCode::Start)?,
+            )?;
+            #[cfg(not(unix))]
+            return Err(ApprovalWakeErrorCode::Unsupported);
+        }
+        Ok(Some(path))
+    }
+
+    fn enqueue(&mut self, command: ApprovalWorkerCommand) -> Result<(), ApprovalWakeErrorCode> {
+        self.ensure_started()?;
+        let expects_result = matches!(
+            &command,
+            ApprovalWorkerCommand::Resolve { .. }
+                | ApprovalWorkerCommand::DenySession { .. }
+                | ApprovalWorkerCommand::DenyAllOwned { .. }
+        );
+        if expects_result && self.inflight >= APPROVAL_COMMAND_CAP {
+            return Err(ApprovalWakeErrorCode::Backpressure);
+        }
+        let Some(slot) = self.slot.as_ref() else {
+            return Err(ApprovalWakeErrorCode::Start);
+        };
+        if let Some(path) = slot.socket_path.as_deref() {
+            slot.command_tx
+                .try_send(command)
+                .map_err(|_| ApprovalWakeErrorCode::Backpressure)?;
+            if expects_result {
+                self.inflight += 1;
+            }
+            let delivered = {
+                #[cfg(unix)]
+                {
+                    let _ = path;
+                    slot.control_socket
+                        .as_ref()
+                        .ok_or(ApprovalWakeErrorCode::Start)
+                        .and_then(signal_approval_listener)
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = path;
+                    Err(ApprovalWakeErrorCode::Unsupported)
+                }
+            };
+            if delivered.is_err() {
+                // Ownership has already crossed the command channel. Stop the dead listener so
+                // the queued idempotent approval mutation is either completed once or dropped
+                // before the caller may retry it through a fresh listener.
+                self.stop();
+                return Err(ApprovalWakeErrorCode::Delivery);
+            }
+        } else if self.deferred.len() < APPROVAL_COMMAND_CAP {
+            self.deferred.push_back(command);
+            if expects_result {
+                self.inflight += 1;
+            }
+        } else {
+            return Err(ApprovalWakeErrorCode::Backpressure);
+        }
+        Ok(())
+    }
+
+    fn take_snapshot(&self) -> Option<ApprovalSnapshot> {
+        self.snapshot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+    }
+
+    fn drain_results(&mut self) -> Vec<ApprovalWorkerResult> {
+        let Some(slot) = self.slot.as_ref() else {
+            return Vec::new();
+        };
+        let results = slot.result_rx.try_iter().collect::<Vec<_>>();
+        self.inflight = self.inflight.saturating_sub(results.len());
+        results
+    }
+
+    fn is_idle(&self) -> bool {
+        self.inflight == 0 && self.deferred.is_empty()
     }
 
     fn stop(&mut self) {
-        if let Some(stop_tx) = self.stop_tx.take() {
-            let _ = stop_tx.send(());
+        let Some(mut slot) = self.slot.take() else {
+            self.deferred.clear();
+            self.inflight = 0;
+            return;
+        };
+        // Publish stop before opening result capacity. The listener checks this flag before every
+        // queued command, so after the drain it can emit at most its one currently executing
+        // result and cannot refill the bounded queue behind the join.
+        slot.stop_requested
+            .store(true, std::sync::atomic::Ordering::Release);
+        for _ in slot.result_rx.try_iter() {}
+        if slot.socket_path.is_none()
+            && let Ok(Ok(ready)) = slot
+                .ready_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+        {
+            slot.socket_path = Some(ready.socket_path);
+            #[cfg(unix)]
+            {
+                slot.control_socket = Some(ready.control_socket);
+            }
         }
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+        #[cfg(unix)]
+        if let Some(control) = slot.control_socket.as_ref() {
+            let _ = signal_approval_listener(control);
         }
+        drop(slot.command_tx);
+        let _ = slot.handle.join();
+        self.deferred.clear();
+        self.inflight = 0;
     }
 }
 
-impl Drop for ApprovalWatcher {
+impl Drop for ApprovalWakeHub {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+impl ApprovalLaunchTracker {
+    fn reserve(
+        &mut self,
+        workspace_id: String,
+        agent_config_id: String,
+        now: std::time::Instant,
+    ) -> Result<u64, ApprovalWakeErrorCode> {
+        if self.pending.len().saturating_add(self.live.len()) >= APPROVAL_LAUNCH_CAP {
+            return Err(ApprovalWakeErrorCode::Backpressure);
+        }
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let id = self.next_id;
+        self.pending.push_back(ApprovalLaunchTicket {
+            id,
+            workspace_id,
+            agent_config_id,
+            state: ApprovalLaunchTicketState::Preparing {
+                deadline: now + APPROVAL_SPAWN_DEADLINE,
+            },
+        });
+        Ok(id)
+    }
+
+    fn cancel(&mut self, ticket_id: u64) {
+        self.pending.retain(|ticket| ticket.id != ticket_id);
+    }
+
+    fn mark_spawn_sent(&mut self, ticket_id: u64, now: std::time::Instant) -> bool {
+        let Some(ticket) = self
+            .pending
+            .iter_mut()
+            .find(|ticket| ticket.id == ticket_id)
+        else {
+            return false;
+        };
+        match ticket.state {
+            ApprovalLaunchTicketState::Preparing { deadline } if now < deadline => {
+                ticket.state = ApprovalLaunchTicketState::SpawnSent;
+                true
+            }
+            ApprovalLaunchTicketState::Preparing { .. } | ApprovalLaunchTicketState::SpawnSent => {
+                false
+            }
+        }
+    }
+
+    fn correlate(
+        &mut self,
+        workspace_id: &str,
+        agent_config_id: &str,
+        session: Option<runtime::SessionId>,
+    ) -> bool {
+        let Some(position) = self.pending.iter().position(|ticket| {
+            ticket.workspace_id == workspace_id
+                && ticket.agent_config_id == agent_config_id
+                && ticket.state == ApprovalLaunchTicketState::SpawnSent
+        }) else {
+            return false;
+        };
+        let ticket = self
+            .pending
+            .remove(position)
+            .expect("approval ticket position checked");
+        if let Some(session) = session {
+            self.live
+                .insert((workspace_id.to_owned(), session), ticket.id);
+        }
+        true
+    }
+
+    fn expire(&mut self, now: std::time::Instant) -> Vec<u64> {
+        let mut expired = Vec::new();
+        self.pending.retain(|ticket| {
+            if matches!(
+                ticket.state,
+                ApprovalLaunchTicketState::Preparing { deadline } if deadline <= now
+            ) {
+                expired.push(ticket.id);
+                false
+            } else {
+                true
+            }
+        });
+        expired
+    }
+
+    fn observe_session_exit(&mut self, workspace_id: &str, session: runtime::SessionId) -> bool {
+        let key = (workspace_id.to_owned(), session);
+        if self.live.contains_key(&key) {
+            self.exited.insert(key)
+        } else {
+            false
+        }
+    }
+
+    fn pending_denials(&self, now: std::time::Instant) -> Vec<(String, runtime::SessionId)> {
+        self.exited
+            .iter()
+            .filter(|key| {
+                !self.denying.contains(*key)
+                    && self
+                        .denial_retries
+                        .get(*key)
+                        .is_none_or(|retry| retry.retry_at <= now)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn mark_deny_queued(&mut self, workspace_id: &str, session: runtime::SessionId) {
+        self.denying.insert((workspace_id.to_owned(), session));
+    }
+
+    fn finish_session(
+        &mut self,
+        workspace_id: &str,
+        session: runtime::SessionId,
+        succeeded: bool,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        let key = (workspace_id.to_owned(), session);
+        self.denying.remove(&key);
+        if succeeded {
+            self.denial_retries.remove(&key);
+            self.exited.remove(&key);
+            self.live.remove(&key);
+            None
+        } else if self.live.contains_key(&key) && self.exited.contains(&key) {
+            let retry = self
+                .denial_retries
+                .entry(key)
+                .or_insert(ApprovalDenialRetry {
+                    failures: 0,
+                    retry_at: now,
+                });
+            retry.failures = retry.failures.saturating_add(1);
+            let shift = u32::from(retry.failures.saturating_sub(1).min(6));
+            let delay =
+                std::time::Duration::from_secs(1u64 << shift).min(APPROVAL_DENIAL_RETRY_MAX);
+            retry.retry_at = now + delay;
+            Some(delay)
+        } else {
+            self.denial_retries.remove(&key);
+            None
+        }
+    }
+
+    fn close_workspace(&mut self, workspace_id: &str) -> usize {
+        let mut canceled = 0usize;
+        self.pending.retain(|ticket| {
+            if ticket.workspace_id == workspace_id {
+                canceled = canceled.saturating_add(1);
+                false
+            } else {
+                true
+            }
+        });
+        let live = self
+            .live
+            .keys()
+            .filter(|(candidate, _)| candidate == workspace_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in live {
+            self.exited.insert(key);
+        }
+        canceled
+    }
+
+    fn clear_fail_closed(&mut self) {
+        self.pending.clear();
+        self.live.clear();
+        self.exited.clear();
+        self.denying.clear();
+        self.denial_retries.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty() && self.live.is_empty()
     }
 }
 
@@ -387,172 +2576,93 @@ impl Drop for ApprovalWatcher {
 /// config에는 키도 존재 플래그도 저장하지 않는다 — keyring 존재 여부가 단일 진실.
 const CODEX_LLM_API_KEY_ENTRY_ID: &str = "codex-llm-custom-api-key";
 
-/// Agents 창 custom LLM API 키의 keyring 어댑터 (PR-L4) — leaf UI 대신 secret_store를
-/// 만진다 (AppCredentialService와 동일한 check-boundary 관례).
-struct AppCodexLlmApiKeyStore {
+/// Composition-root host for authenticated Codex App Server construction. The leaf owns neither
+/// a concrete keyring type nor the secret-bearing process options.
+struct AppCodexAppServerHost {
     secret_store: KeyringSecretStore,
 }
 
-impl ui::agent_sessions::CodexLlmApiKeyStore for AppCodexLlmApiKeyStore {
-    fn save(&self, key: &secret::SecretString) -> anyhow::Result<()> {
-        secret::SecretStore::set_secret(&self.secret_store, CODEX_LLM_API_KEY_ENTRY_ID, key)
+impl ui::agent_sessions::CodexAppServerHost for AppCodexAppServerHost {
+    fn spawn(
+        &self,
+        llm_override: Option<crate::codex_app_server::CodexLlmOverride>,
+        ctx: egui::Context,
+    ) -> anyhow::Result<crate::codex_app_server::CodexAppServerClient> {
+        let llm_api_key =
+            if matches!(
+                llm_override,
+                Some(crate::codex_app_server::CodexLlmOverride::Custom { .. })
+            ) && secret::SecretStore::has_secret(&self.secret_store, CODEX_LLM_API_KEY_ENTRY_ID)?
+            {
+                Some(secret::SecretStore::get_secret(
+                    &self.secret_store,
+                    CODEX_LLM_API_KEY_ENTRY_ID,
+                )?)
+            } else {
+                None
+            };
+        crate::codex_app_server::CodexAppServerClient::spawn(
+            crate::codex_app_server::CodexAppServerOptions {
+                llm_override,
+                llm_api_key,
+                ..crate::codex_app_server::CodexAppServerOptions::default()
+            },
+            ctx,
+        )
     }
+}
 
-    fn delete(&self) -> anyhow::Result<()> {
-        secret::SecretStore::delete_secret(&self.secret_store, CODEX_LLM_API_KEY_ENTRY_ID)
-    }
+/// Production runtime port: logical metadata IDs are resolved through the current SQLite pointer
+/// to one validated physical keyring slot. There is deliberately no logical-ID fallback.
+struct AppRuntimeSecretResolver {
+    db_path: PathBuf,
+    db: std::sync::Mutex<Option<Db>>,
+    secret_store: KeyringSecretStore,
+}
 
-    fn exists(&self) -> anyhow::Result<bool> {
-        secret::SecretStore::has_secret(&self.secret_store, CODEX_LLM_API_KEY_ENTRY_ID)
-    }
-
-    fn load(&self) -> anyhow::Result<Option<secret::SecretString>> {
-        // "없음"과 "오류"를 구별한다 (has_secret 관례) — 없으면 키 없이 spawn,
-        // 조회 오류면 UI 쪽에서 spawn을 중단한다 (fail-closed).
-        if !secret::SecretStore::has_secret(&self.secret_store, CODEX_LLM_API_KEY_ENTRY_ID)? {
-            return Ok(None);
+impl AppRuntimeSecretResolver {
+    fn new(db_path: PathBuf) -> Self {
+        Self {
+            db_path,
+            db: std::sync::Mutex::new(None),
+            secret_store: KeyringSecretStore,
         }
-        Ok(Some(secret::SecretStore::get_secret(
-            &self.secret_store,
-            CODEX_LLM_API_KEY_ENTRY_ID,
-        )?))
     }
 }
 
-struct AppCredentialService<'a> {
-    db: &'a Db,
-    secret_store: &'a dyn secret::SecretStore,
-    redaction: &'a secret::RedactionService,
-    /// 현재 workspace — 목록은 소속+전역, 새 credential은 이 workspace 소속(#2, v19).
-    workspace_id: &'a str,
-}
-
-impl ui::credentials::CredentialService for AppCredentialService<'_> {
-    fn list_credentials(&self) -> anyhow::Result<Vec<ui::credentials::CredentialListItem>> {
-        // .env 자동 동기화로 생긴(=env var가 참조하는) credential은 환경 변수 표에 이미
-        // 마스킹으로 나온다 — 'API 키' 표에 또 나오면 같은 데이터가 두 번 세어져 혼란
-        // (사용자 2026-07-09: 23env/23key 중복). 수동 등록/커넥터용만 남긴다.
-        let referenced = self.db.env_referenced_credential_ids()?;
-        Ok(self
+impl runtime::RuntimeSecretResolver for AppRuntimeSecretResolver {
+    fn resolve(&self, logical_credential_id: &str) -> anyhow::Result<runtime::RuntimeSecret> {
+        let logical = secret::LogicalCredentialId::new(logical_credential_id.to_owned())
+            .map_err(|_| anyhow::anyhow!("runtime_secret_logical_id_invalid"))?;
+        let mut db = self
             .db
-            .list_credentials_for_workspace(self.workspace_id)?
-            .into_iter()
-            .filter(|meta| !referenced.contains(&meta.id))
-            .map(|meta| ui::credentials::CredentialListItem {
-                id: meta.id,
-                provider: meta.provider,
-                label: meta.label,
-                credential_kind: meta.credential_kind,
-                masked_hint: meta.masked_hint,
-            })
-            .collect())
-    }
-
-    fn add_credential(&self, credential: ui::credentials::NewCredential) -> anyhow::Result<()> {
-        let secret = secret::SecretString::new(credential.secret);
-        // 새 credential은 즉시 로그 redaction 대상이다. JSON service account 형태도
-        // 필드 단위로 등록해 후속 session/MCP output에서 마스킹된다.
-        self.redaction.register(&secret);
-        self.redaction.register_json_fields(&secret);
-        let id = uuid::Uuid::new_v4().to_string();
-        self.secret_store.set_secret(&id, &secret)?;
-        let meta = crate::storage::CredentialMeta {
-            id: id.clone(),
-            provider: credential.provider,
-            label: credential.label,
-            credential_kind: credential.credential_kind,
-            masked_hint: Some(secret::masked_hint(secret.expose())),
-            // 환경 UI에서 추가한 키는 현재 프로젝트 소속(#2).
-            workspace_id: Some(self.workspace_id.to_owned()),
-        };
-        if let Err(e) = self.db.insert_credential(&meta) {
-            if let Err(rollback) = self.secret_store.delete_secret(&id) {
-                tracing::warn!(credential_id = %id, "rollback 실패 — 고아 keyring entry: {rollback:#}");
-            }
-            return Err(e);
-        }
-        tracing::info!(credential_id = %id, "credential 추가");
-        Ok(())
-    }
-
-    fn delete_credential(&self, id: &str) -> anyhow::Result<()> {
-        // 순서 근거:
-        // 1) 참조 검사 — 참조 중이면 아무것도 건드리지 않는다.
-        // 2) keyring 삭제 먼저 — 실패하면 metadata가 남아 사용자가 재시도할 수 있다.
-        // 3) 조건부 DB 삭제 — 참조 race가 생기면 행이 남고, secret은 이미 지워진다.
-        if self.db.credential_in_use(id)? {
-            anyhow::bail!("env var가 참조 중인 credential입니다 — 해당 변수를 먼저 삭제하세요");
-        }
-        self.secret_store.delete_secret(id)?;
-        self.secret_store
-            .delete_secret(&auth::refresh_entry_id(id))?;
-        // DCR client_secret entry도 함께 정리 (H4 리뷰 P2 — `{id}.dcr` 고아 방지)
-        self.secret_store
-            .delete_secret(&auth::dcr_secret_entry_id(id))?;
-        if !self.db.delete_credential_if_unused(id)? {
-            anyhow::bail!(
-                "삭제 중 env var 참조가 생겼습니다 — secret은 지워졌으니 변수 정리 후 다시 삭제하세요"
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runtime_secret_repository_lock_failed"))?;
+        if db.is_none() {
+            *db = Some(
+                Db::open(&self.db_path)
+                    .map_err(|_| anyhow::anyhow!("runtime_secret_repository_open_failed"))?,
             );
         }
-        tracing::info!(credential_id = %id, "credential 삭제");
-        Ok(())
-    }
-
-    fn orphan_credentials(&self) -> anyhow::Result<Vec<String>> {
-        #[cfg(target_os = "macos")]
-        {
-            let mut known: std::collections::HashSet<String> = self
-                .db
-                .list_credentials()?
-                .into_iter()
-                .map(|c| c.id)
-                .collect();
-            // MCP env 참조도 live — metadata 없이 keyring만 있는 사용 중 secret 보호
-            // (codex Med).
-            known.extend(self.db.mcp_referenced_credential_ids()?);
-            let mut orphans: Vec<String> = scan_keychain_accounts()?
-                .into_iter()
-                .filter(|acct| {
-                    // UUID(또는 uuid.refresh)만 후보 — base가 DB에 없으면 고아.
-                    uuid_base(acct).is_some_and(|base| !known.contains(base))
-                })
-                .collect();
-            orphans.sort();
-            orphans.dedup();
-            Ok(orphans)
-        }
-        #[cfg(not(target_os = "macos"))]
-        Ok(Vec::new())
-    }
-
-    fn purge_orphan_credentials(&self, ids: &[String]) -> anyhow::Result<usize> {
-        let mut purged = 0usize;
-        for id in ids {
-            // keyring API 대신 security CLI로 삭제(2026-07-10): 고아는 구 서명 시절
-            // 생성이라 partition 불일치로 keyring 접근마다 키체인 암호를 물었다
-            // ('항상 허용'도 유지 안 됨). CLI 삭제는 이 검사를 거치지 않아 무프롬프트.
-            #[cfg(target_os = "macos")]
-            let ok = std::process::Command::new("/usr/bin/security")
-                .args([
-                    "delete-generic-password",
-                    "-s",
-                    secret::KEYRING_SERVICE,
-                    "-a",
-                    id,
-                ])
-                .output()
-                .map(|out| out.status.success())
-                .unwrap_or(false);
-            #[cfg(not(target_os = "macos"))]
-            let ok = self.secret_store.delete_secret(id).is_ok();
-            if ok {
-                purged += 1;
-            } else {
-                tracing::warn!(account = %id, "고아 keyring 삭제 실패");
-            }
-        }
-        tracing::info!(purged, "고아 keyring 항목 정리");
-        Ok(purged)
+        let location = db
+            .as_ref()
+            .expect("runtime secret repository initialized")
+            .credential_secret_location(logical.as_str())
+            .map_err(|_| anyhow::anyhow!("runtime_secret_pointer_read_failed"))?
+            .ok_or_else(|| anyhow::anyhow!("runtime_secret_pointer_missing"))?;
+        anyhow::ensure!(
+            location.keyring_service == secret::KEYRING_SERVICE,
+            "runtime_secret_service_invalid"
+        );
+        let slot = secret::PhysicalSecretSlot::parse(location.keyring_username)
+            .map_err(|_| anyhow::anyhow!("runtime_secret_slot_invalid"))?;
+        anyhow::ensure!(
+            slot.belongs_to(&logical),
+            "runtime_secret_slot_owner_invalid"
+        );
+        let value = secret::SecretStore::get_secret(&self.secret_store, slot.as_str())
+            .map_err(|_| anyhow::anyhow!("runtime_secret_read_failed"))?;
+        Ok(runtime::RuntimeSecret::new(value.into_string()))
     }
 }
 
@@ -703,19 +2813,15 @@ fn render_env_api_project_header(
             .on_hover_text(hover_text);
         // E3 ④: 경로는 타이핑이 아니라 Finder로만 지정한다 — 오타/존재하지 않는 경로로
         // 워크스페이스가 유령이 되는 입력 경로 제거. 클릭 = 폴더 선택 다이얼로그.
-        if response.clicked()
-            && !project_id.is_empty()
-            && let Some(dir) = rfd::FileDialog::new().pick_folder()
-        {
-            *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(dir));
+        if response.clicked() && !project_id.is_empty() {
+            *env_action = Some(ui::env_profiles::EnvAction::ChooseProjectFolder);
         }
         response.context_menu(|ui| {
             if ui
                 .button(catalog.t("env.project_folder.choose", &[]))
                 .clicked()
-                && let Some(dir) = rfd::FileDialog::new().pick_folder()
             {
-                *env_action = Some(ui::env_profiles::EnvAction::SetProjectPath(dir));
+                *env_action = Some(ui::env_profiles::EnvAction::ChooseProjectFolder);
                 ui.close();
             }
             if !path.is_empty()
@@ -743,39 +2849,6 @@ fn render_env_api_project_header(
     );
 }
 
-/// keyring 고아 항목 스캔/정리 (macOS security CLI) — 삭제된 env profile/credential이
-/// 남긴 keyring 잔여(실측 48개, 2026-07-08) 청소. **UUID 형태의 계정만** 후보로 삼아
-/// 앱의 시스템 키(remote-tls-* 등)는 건드리지 않는다.
-#[cfg(target_os = "macos")]
-fn scan_keychain_accounts() -> anyhow::Result<Vec<String>> {
-    let out = std::process::Command::new("/usr/bin/security")
-        .arg("dump-keychain")
-        .output()?;
-    anyhow::ensure!(out.status.success(), "security dump-keychain 실패");
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut accounts = Vec::new();
-    let mut acct: Option<String> = None;
-    let mut svce_match = false;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.starts_with("class:") {
-            if svce_match && let Some(a) = acct.take() {
-                accounts.push(a);
-            }
-            acct = None;
-            svce_match = false;
-        } else if let Some(rest) = line.strip_prefix("\"acct\"<blob>=\"") {
-            acct = rest.strip_suffix('\"').map(str::to_owned);
-        } else if line.contains("\"svce\"<blob>=\"") && line.contains(secret::KEYRING_SERVICE) {
-            svce_match = true;
-        }
-    }
-    if svce_match && let Some(a) = acct.take() {
-        accounts.push(a);
-    }
-    Ok(accounts)
-}
-
 /// UUID v4 형태(8-4-4-4-12 hex)인가 — credential id 규약. `.refresh`/`.dcr`
 /// 접미(OAuth refresh token / DCR client_secret entry — H4 규약)는 벗겨 판정.
 fn uuid_base(account: &str) -> Option<&str> {
@@ -799,90 +2872,1420 @@ fn uuid_base(account: &str) -> Option<&str> {
     Some(base)
 }
 
-struct AppOAuthCredentialStore<'a> {
-    secret_store: &'a dyn secret::SecretStore,
-    redaction: &'a secret::RedactionService,
+const CONNECTOR_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+const CONNECTOR_OAUTH_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const CONNECTOR_OAUTH_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+const SLACK_MCP_URL: &str = "https://mcp.slack.com/mcp";
+
+fn connector_service_error(
+    code: connector_contract::ErrorCode,
+    message: &'static str,
+) -> connector_service::ServiceError {
+    connector_service::ServiceError::new(code, message)
 }
 
-impl ui::connectors::OAuthCredentialStore for AppOAuthCredentialStore<'_> {
-    fn store_oauth_token(
+fn connector_storage_revision(
+    revision: connector_contract::Revision,
+) -> Result<storage::ConnectorConfigRevision, connector_service::ServiceError> {
+    storage::ConnectorConfigRevision::try_from_u64(revision.0).map_err(|_| {
+        connector_service_error(
+            connector_contract::ErrorCode::StorageUnavailable,
+            "connector revision is invalid",
+        )
+    })
+}
+
+fn connector_revision(revision: storage::ConnectorConfigRevision) -> connector_contract::Revision {
+    connector_contract::Revision(revision.get())
+}
+
+fn connector_repository_cas<T, U>(
+    value: storage::ConnectorConfigCas<T>,
+    map: impl FnOnce(T) -> U,
+) -> connector_service::RepositoryCas<U> {
+    match value {
+        storage::ConnectorConfigCas::Committed { revision, value } => {
+            connector_service::RepositoryCas::Committed {
+                revision: connector_revision(revision),
+                value: map(value),
+            }
+        }
+        storage::ConnectorConfigCas::Stale { current_revision } => {
+            connector_service::RepositoryCas::Stale {
+                current_revision: connector_revision(current_revision),
+            }
+        }
+    }
+}
+
+fn connector_transport_kind(
+    kind: &str,
+) -> Result<connector_contract::TransportKind, connector_service::ServiceError> {
+    match kind {
+        "stdio" => Ok(connector_contract::TransportKind::Stdio),
+        "http" => Ok(connector_contract::TransportKind::Http),
+        _ => Err(connector_service_error(
+            connector_contract::ErrorCode::StorageUnavailable,
+            "stored connector transport is invalid",
+        )),
+    }
+}
+
+fn connector_server_draft(
+    row: mcp_store::McpServerRow,
+) -> Result<connector_contract::ServerDraft, connector_service::ServiceError> {
+    let id = connector_contract::ServerId::new(row.id);
+    let transport = match row.kind.as_str() {
+        "stdio" => connector_contract::TransportDraft::Stdio {
+            command: row.command.ok_or_else(|| {
+                connector_service_error(
+                    connector_contract::ErrorCode::StorageUnavailable,
+                    "stored stdio connector command is missing",
+                )
+            })?,
+            args: row.args,
+            plain_env: row.env_plain,
+            secret_env: row
+                .env_secrets
+                .into_iter()
+                .map(|(key, credential)| (key, connector_contract::CredentialId::new(credential)))
+                .collect(),
+            inherit_env: row.inherit_env,
+        },
+        "http" => connector_contract::TransportDraft::Http {
+            url: row.url.ok_or_else(|| {
+                connector_service_error(
+                    connector_contract::ErrorCode::StorageUnavailable,
+                    "stored HTTP connector URL is missing",
+                )
+            })?,
+        },
+        _ => {
+            return Err(connector_service_error(
+                connector_contract::ErrorCode::StorageUnavailable,
+                "stored connector transport is invalid",
+            ));
+        }
+    };
+    Ok(connector_contract::ServerDraft {
+        id: Some(id),
+        name: row.name,
+        transport,
+        enabled: row.enabled,
+    })
+}
+
+fn connector_server_row(
+    draft: connector_contract::ServerDraft,
+) -> Result<mcp_store::McpServerRow, connector_service::ServiceError> {
+    let id = draft
+        .id
+        .map(String::from)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let (kind, command, args, env_plain, env_secrets, inherit_env, url) = match draft.transport {
+        connector_contract::TransportDraft::Stdio {
+            command,
+            args,
+            plain_env,
+            secret_env,
+            inherit_env,
+        } => (
+            "stdio".to_owned(),
+            Some(command),
+            args,
+            plain_env,
+            secret_env
+                .into_iter()
+                .map(|(key, credential)| (key, String::from(credential)))
+                .collect(),
+            inherit_env,
+            None,
+        ),
+        connector_contract::TransportDraft::Http { url } => (
+            "http".to_owned(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            Some(url),
+        ),
+    };
+    let row = mcp_store::McpServerRow {
+        id,
+        name: draft.name,
+        kind,
+        command,
+        args,
+        env_plain,
+        env_secrets,
+        inherit_env,
+        url,
+        enabled: draft.enabled,
+    };
+    mcp_store::validate_server_env_for_persistence(&row.env_plain, &row.env_secrets).map_err(
+        |_| {
+            connector_service_error(
+                connector_contract::ErrorCode::InvalidInput,
+                "connector environment is invalid",
+            )
+        },
+    )?;
+    Ok(row)
+}
+
+fn connector_permission(
+    rule: Option<&mcp_store::PermissionRuleRow>,
+) -> Result<connector_contract::PermissionRule, connector_service::ServiceError> {
+    match rule.map(|rule| rule.rule.as_str()) {
+        None | Some("ask") => Ok(connector_contract::PermissionRule::Ask),
+        Some("allow") => Ok(connector_contract::PermissionRule::Allow),
+        Some("deny") => Ok(connector_contract::PermissionRule::Deny),
+        Some(_) => Err(connector_service_error(
+            connector_contract::ErrorCode::StorageUnavailable,
+            "stored connector permission is invalid",
+        )),
+    }
+}
+
+fn connector_slack_projection(
+    rows: &[mcp_store::McpServerInventoryRow],
+) -> connector_contract::SlackProjection {
+    let mut matching = rows.iter().filter(|row| {
+        row.kind == "http"
+            && row
+                .url
+                .as_deref()
+                .is_some_and(|url| url.trim().trim_end_matches('/') == SLACK_MCP_URL)
+    });
+    let Some(row) = matching.next() else {
+        return connector_contract::SlackProjection::default();
+    };
+    if matching.next().is_some() {
+        return connector_contract::SlackProjection {
+            server_id: None,
+            status: connector_contract::SlackStatus::Failed,
+            tool_count: 0,
+            workspace_label: None,
+            can_choose_workspace: false,
+            recovery: None,
+        };
+    }
+    connector_contract::SlackProjection {
+        server_id: Some(connector_contract::ServerId::new(row.id.clone())),
+        status: if !row.enabled {
+            connector_contract::SlackStatus::NotConfigured
+        } else if row.tool_count == 0 {
+            connector_contract::SlackStatus::Ready
+        } else {
+            connector_contract::SlackStatus::Connected
+        },
+        tool_count: row.tool_count,
+        workspace_label: None,
+        can_choose_workspace: row.enabled,
+        recovery: None,
+    }
+}
+
+struct AppConnectorRepositoryFactory {
+    db_path: PathBuf,
+    redaction: secret::RedactionService,
+}
+
+impl connector_service::ConnectorRepositoryFactory for AppConnectorRepositoryFactory {
+    fn open(
         &self,
-        token: &auth::OAuthToken,
-    ) -> anyhow::Result<ui::connectors::StoredOAuthCredential> {
-        let id = uuid::Uuid::new_v4().to_string();
-        self.update_oauth_token(&id, token)?;
-        Ok(ui::connectors::StoredOAuthCredential {
-            id,
-            masked_hint: secret::masked_hint(token.access_token.expose()),
+    ) -> Result<Box<dyn connector_service::ConnectorRepository>, connector_service::ServiceError>
+    {
+        let db = Db::open(&self.db_path).map_err(|_| {
+            connector_service_error(
+                connector_contract::ErrorCode::StorageUnavailable,
+                "connector repository open failed",
+            )
+        })?;
+        let authorization_owner = db.acquire_authorization_owner("gui").map_err(|_| {
+            connector_service_error(
+                connector_contract::ErrorCode::AuditUnavailable,
+                "connector authorization owner is unavailable",
+            )
+        })?;
+        Ok(Box::new(AppConnectorRepository {
+            db,
+            redaction: self.redaction.clone(),
+            authorization_owner: Some(authorization_owner),
+        }))
+    }
+}
+
+struct AppConnectorRepository {
+    db: Db,
+    redaction: secret::RedactionService,
+    authorization_owner: Option<storage::ActiveAuthorizationOwner>,
+}
+
+impl AppConnectorRepository {
+    fn overview_from(
+        read: storage::ConnectorConfigRead<Vec<mcp_store::McpServerInventoryRow>>,
+    ) -> Result<connector_service::OverviewData, connector_service::ServiceError> {
+        let slack = connector_slack_projection(&read.value);
+        let servers = read
+            .value
+            .into_iter()
+            .map(|row| {
+                Ok(connector_contract::ServerSummary {
+                    id: connector_contract::ServerId::new(row.id),
+                    name: row.name,
+                    transport: connector_transport_kind(&row.kind)?,
+                    enabled: row.enabled,
+                    connection: if !row.enabled {
+                        connector_contract::ConnectionState::Disabled
+                    } else if row.tool_count == 0 {
+                        connector_contract::ConnectionState::Idle
+                    } else {
+                        connector_contract::ConnectionState::Connected
+                    },
+                    tool_count: row.tool_count,
+                    error_code: None,
+                })
+            })
+            .collect::<Result<Vec<_>, connector_service::ServiceError>>()?;
+        Ok(connector_service::OverviewData {
+            config_revision: connector_revision(read.revision),
+            slack,
+            servers,
         })
     }
 
-    /// 재승인(H5) — 기존 credential id 아래 토큰 재저장 (env 참조 유지).
-    fn update_oauth_token(&self, id: &str, token: &auth::OAuthToken) -> anyhow::Result<()> {
-        auth::store_token(self.secret_store, id, token)?;
-        self.redaction.register(&token.access_token);
-        if let Some(refresh) = &token.refresh_token {
-            self.redaction.register(refresh);
+    fn oauth_binding(
+        record: storage::CredentialOAuthBindingRecord,
+        server_id: &connector_contract::ServerId,
+        exact_url: &str,
+    ) -> Result<connector_service::HttpAuthBinding, connector_service::ServiceError> {
+        if record.keyring_service != secret::KEYRING_SERVICE {
+            return Err(connector_service_error(
+                connector_contract::ErrorCode::SecretUnavailable,
+                "connector OAuth keyring service is invalid",
+            ));
         }
-        Ok(())
+        let logical =
+            secret::LogicalCredentialId::new(record.logical_id.clone()).map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::SecretUnavailable,
+                    "connector OAuth credential identifier is invalid",
+                )
+            })?;
+        let physical =
+            secret::PhysicalSecretSlot::parse(record.physical_pointer).map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::SecretUnavailable,
+                    "connector OAuth physical slot is invalid",
+                )
+            })?;
+        if !physical.belongs_to(&logical) {
+            return Err(connector_service_error(
+                connector_contract::ErrorCode::SecretUnavailable,
+                "connector OAuth physical slot owner is invalid",
+            ));
+        }
+        let metadata = auth::StoredOAuthMetadata::from_json_bounded(
+            record.oauth_metadata_json.as_bytes(),
+            server_id.as_str(),
+            exact_url,
+            auth::StoredOAuthMetadataLimits::PRODUCTION,
+        )
+        .map_err(|_| {
+            connector_service_error(
+                connector_contract::ErrorCode::StorageUnavailable,
+                "connector OAuth metadata is invalid",
+            )
+        })?;
+        Ok(connector_service::HttpAuthBinding {
+            credential_id: connector_contract::CredentialId::new(record.logical_id),
+            physical_slot: physical,
+            oauth_metadata: Some(metadata),
+        })
+    }
+}
+
+impl connector_service::ConnectorRepository for AppConnectorRepository {
+    fn load_overview(
+        &mut self,
+    ) -> Result<connector_service::OverviewData, connector_service::ServiceError> {
+        let read = self
+            .db
+            .mcp_server_inventory_versioned(
+                connector_contract::ResourceLimits::PRODUCTION_CEILING.import_servers,
+            )
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::StorageUnavailable,
+                    "connector overview load failed",
+                )
+            })?;
+        Self::overview_from(read)
     }
 
-    /// DCR client_secret keyring 관리 (H5) — Some이면 `{id}.dcr` 저장, None이면 정리.
-    fn set_dcr_secret(
-        &self,
-        id: &str,
-        secret: Option<&secret::SecretString>,
-    ) -> anyhow::Result<()> {
-        let entry = auth::dcr_secret_entry_id(id);
-        match secret {
-            Some(secret) => {
-                self.secret_store.set_secret(&entry, secret)?;
-                self.redaction.register(secret);
-            }
-            None => {
-                // entry가 없어도 정리 성공으로 취급 (재등록으로 secret이 사라진 경우)
-                if let Err(e) = self.secret_store.delete_secret(&entry) {
-                    tracing::debug!("DCR secret entry 정리 생략: {e:#}");
+    fn load_server(
+        &mut self,
+        server_id: &connector_contract::ServerId,
+    ) -> Result<
+        connector_service::Observed<connector_contract::ServerDraft>,
+        connector_service::ServiceError,
+    > {
+        let read = self
+            .db
+            .mcp_server_versioned(server_id.as_str())
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::StorageUnavailable,
+                    "connector server load failed",
+                )
+            })?;
+        let row = read.value.ok_or_else(|| {
+            connector_service_error(
+                connector_contract::ErrorCode::StorageUnavailable,
+                "connector server is unavailable",
+            )
+        })?;
+        Ok(connector_service::Observed {
+            revision: connector_revision(read.revision),
+            value: connector_server_draft(row)?,
+        })
+    }
+
+    fn load_mcp_target(
+        &mut self,
+        server_id: &connector_contract::ServerId,
+    ) -> Result<
+        connector_service::Observed<connector_service::RepositoryMcpTarget>,
+        connector_service::ServiceError,
+    > {
+        let read = self
+            .db
+            .mcp_request_target_versioned(server_id.as_str())
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::StorageUnavailable,
+                    "connector execution target load failed",
+                )
+            })?;
+        let row = read.value.server.ok_or_else(|| {
+            connector_service_error(
+                connector_contract::ErrorCode::StorageUnavailable,
+                "connector execution target is unavailable",
+            )
+        })?;
+        let exact_url = row.url.clone();
+        let server = connector_server_draft(row)?;
+        let credential_ids = match &server.transport {
+            connector_contract::TransportDraft::Stdio { secret_env, .. } => secret_env
+                .iter()
+                .map(|(_, credential_id)| credential_id.clone())
+                .collect::<Vec<_>>(),
+            connector_contract::TransportDraft::Http { .. } => Vec::new(),
+        };
+        if credential_ids.len() != read.value.credential_locations.len() {
+            return Err(connector_service_error(
+                connector_contract::ErrorCode::StorageUnavailable,
+                "connector credential binding count is invalid",
+            ));
+        }
+        let credential_revisions = credential_ids
+            .into_iter()
+            .zip(read.value.credential_locations)
+            .map(|(credential_id, location)| {
+                if location.keyring_service != secret::KEYRING_SERVICE {
+                    return Err(connector_service_error(
+                        connector_contract::ErrorCode::SecretUnavailable,
+                        "connector credential keyring service is invalid",
+                    ));
                 }
+                let logical =
+                    secret::LogicalCredentialId::new(credential_id.as_str()).map_err(|_| {
+                        connector_service_error(
+                            connector_contract::ErrorCode::SecretUnavailable,
+                            "connector credential identifier is invalid",
+                        )
+                    })?;
+                let physical = secret::PhysicalSecretSlot::parse(location.keyring_username)
+                    .map_err(|_| {
+                        connector_service_error(
+                            connector_contract::ErrorCode::SecretUnavailable,
+                            "connector credential physical slot is invalid",
+                        )
+                    })?;
+                if !physical.belongs_to(&logical) {
+                    return Err(connector_service_error(
+                        connector_contract::ErrorCode::SecretUnavailable,
+                        "connector credential physical slot owner is invalid",
+                    ));
+                }
+                Ok(connector_service::CredentialResolutionRequest {
+                    credential_id,
+                    expected_physical_slot: Some(physical),
+                })
+            })
+            .collect::<Result<Vec<_>, connector_service::ServiceError>>()?;
+        let http_auth = match read.value.oauth_bindings.as_slice() {
+            [] => None,
+            [binding] => {
+                let exact_url = exact_url.as_deref().ok_or_else(|| {
+                    connector_service_error(
+                        connector_contract::ErrorCode::StorageUnavailable,
+                        "connector OAuth binding has no exact URL",
+                    )
+                })?;
+                Some(Self::oauth_binding(binding.clone(), server_id, exact_url)?)
+            }
+            _ => {
+                return Err(connector_service_error(
+                    connector_contract::ErrorCode::StorageUnavailable,
+                    "connector OAuth binding is ambiguous",
+                ));
+            }
+        };
+        Ok(connector_service::Observed {
+            revision: connector_revision(read.revision),
+            value: connector_service::RepositoryMcpTarget {
+                server,
+                credential_revisions,
+                http_auth,
+            },
+        })
+    }
+
+    fn load_tool_page(
+        &mut self,
+        server_id: &connector_contract::ServerId,
+        offset: usize,
+        limit: usize,
+    ) -> Result<
+        connector_service::Observed<connector_service::RepositoryToolPage>,
+        connector_service::ServiceError,
+    > {
+        let read = self
+            .db
+            .mcp_tool_page_versioned(server_id.as_str(), offset, limit)
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::StorageUnavailable,
+                    "connector tool page load failed",
+                )
+            })?;
+        let items = read
+            .value
+            .rows
+            .into_iter()
+            .map(|row| {
+                Ok(connector_contract::ToolListItem {
+                    id: connector_contract::ToolId::new(row.id),
+                    name: row.name,
+                    description: row.description,
+                    permission: connector_permission(row.permission.as_ref())?,
+                })
+            })
+            .collect::<Result<Vec<_>, connector_service::ServiceError>>()?;
+        Ok(connector_service::Observed {
+            revision: connector_revision(read.revision),
+            value: connector_service::RepositoryToolPage {
+                total: read.value.total,
+                items,
+            },
+        })
+    }
+
+    fn load_tool_name(
+        &mut self,
+        server_id: &connector_contract::ServerId,
+        tool_id: &connector_contract::ToolId,
+    ) -> Result<connector_service::Observed<String>, connector_service::ServiceError> {
+        let read = self
+            .db
+            .mcp_tool_name_versioned(server_id.as_str(), tool_id.as_str())
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::StorageUnavailable,
+                    "connector tool name load failed",
+                )
+            })?;
+        Ok(connector_service::Observed {
+            revision: connector_revision(read.revision),
+            value: read.value.ok_or_else(|| {
+                connector_service_error(
+                    connector_contract::ErrorCode::StorageUnavailable,
+                    "connector tool is unavailable",
+                )
+            })?,
+        })
+    }
+
+    fn save_server(
+        &mut self,
+        expected_revision: connector_contract::Revision,
+        draft: connector_contract::ServerDraft,
+    ) -> Result<connector_service::RepositoryCas<()>, connector_service::ServiceError> {
+        let expected = connector_storage_revision(expected_revision)?;
+        let row = connector_server_row(draft)?;
+        self.db
+            .save_mcp_server_revision_cas(expected, &row)
+            .map(|value| connector_repository_cas(value, |_| ()))
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::StorageUnavailable,
+                    "connector server save failed",
+                )
+            })
+    }
+
+    fn delete_server(
+        &mut self,
+        expected_revision: connector_contract::Revision,
+        server_id: &connector_contract::ServerId,
+    ) -> Result<connector_service::RepositoryCas<()>, connector_service::ServiceError> {
+        let expected = connector_storage_revision(expected_revision)?;
+        let resolved_at = unix_now_secs_i64();
+        self.db
+            .delete_mcp_server_revision_cas(expected, server_id.as_str(), resolved_at)
+            .map(|value| connector_repository_cas(value, |_| ()))
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::StorageUnavailable,
+                    "connector server delete failed",
+                )
+            })
+    }
+
+    fn replace_tools(
+        &mut self,
+        expected_revision: connector_contract::Revision,
+        server_id: &connector_contract::ServerId,
+        tools: &[connector_service::DiscoveredTool],
+    ) -> Result<connector_service::RepositoryCas<()>, connector_service::ServiceError> {
+        let expected = connector_storage_revision(expected_revision)?;
+        let rows = tools
+            .iter()
+            .map(|tool| mcp_store::McpToolRow {
+                id: tool.id.as_str().to_owned(),
+                server_id: server_id.as_str().to_owned(),
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                input_schema_json: None,
+                trust_level: "unknown".to_owned(),
+                schema_hash: None,
+            })
+            .collect::<Vec<_>>();
+        self.db
+            .replace_mcp_tools_revision_cas(expected, server_id.as_str(), &rows)
+            .map(|value| connector_repository_cas(value, |()| ()))
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::StorageUnavailable,
+                    "connector tools replacement failed",
+                )
+            })
+    }
+
+    fn set_permission(
+        &mut self,
+        expected_revision: connector_contract::Revision,
+        server_id: &connector_contract::ServerId,
+        tool_id: &connector_contract::ToolId,
+        rule: connector_contract::PermissionRule,
+    ) -> Result<connector_service::RepositoryCas<()>, connector_service::ServiceError> {
+        let expected = connector_storage_revision(expected_revision)?;
+        let persisted = match rule {
+            connector_contract::PermissionRule::Ask => "ask",
+            connector_contract::PermissionRule::Allow => "allow",
+            connector_contract::PermissionRule::Deny => "deny",
+        };
+        self.db
+            .set_permission_by_tool_id_revision_cas(
+                expected,
+                server_id.as_str(),
+                tool_id.as_str(),
+                persisted,
+                None,
+            )
+            .map(|value| connector_repository_cas(value, |()| ()))
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::StorageUnavailable,
+                    "connector permission update failed",
+                )
+            })
+    }
+
+    fn ensure_slack_server(
+        &mut self,
+        expected_revision: connector_contract::Revision,
+    ) -> Result<connector_service::RepositoryCas<()>, connector_service::ServiceError> {
+        let expected = connector_storage_revision(expected_revision)?;
+        let row = mcp_store::McpServerRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "Slack".to_owned(),
+            kind: "http".to_owned(),
+            command: None,
+            args: Vec::new(),
+            env_plain: Vec::new(),
+            env_secrets: Vec::new(),
+            inherit_env: true,
+            url: Some(SLACK_MCP_URL.to_owned()),
+            enabled: true,
+        };
+        self.db
+            .ensure_enabled_mcp_server_by_url_revision_cas(expected, &row)
+            .map(|value| connector_repository_cas(value, |_| ()))
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::StorageUnavailable,
+                    "Slack connector registration failed",
+                )
+            })
+    }
+
+    fn parse_import(
+        &mut self,
+        _source_name: &str,
+        bytes: &[u8],
+    ) -> Result<connector_service::ImportPlan, connector_service::ServiceError> {
+        let text = std::str::from_utf8(bytes).map_err(|_| {
+            connector_service_error(
+                connector_contract::ErrorCode::InvalidInput,
+                "connector import is not UTF-8",
+            )
+        })?;
+        let parsed = crate::mcp_import::parse_mcp_servers_json_bounded(
+            text,
+            connector_contract::ResourceLimits::PRODUCTION_CEILING.import_servers,
+        )
+        .map_err(|_| {
+            connector_service_error(
+                connector_contract::ErrorCode::InvalidInput,
+                "connector import JSON is invalid or exceeds the server limit",
+            )
+        })?;
+        let existing = self
+            .db
+            .mcp_server_inventory(
+                connector_contract::ResourceLimits::PRODUCTION_CEILING.import_servers,
+            )
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::StorageUnavailable,
+                    "connector import inventory failed",
+                )
+            })?
+            .into_iter()
+            .map(|row| row.name)
+            .collect::<std::collections::HashSet<_>>();
+        let mut names = existing;
+        let mut candidates = Vec::new();
+        let mut report = Vec::new();
+        for server in parsed.servers {
+            if !names.insert(server.name.clone()) {
+                report.push(connector_contract::ImportReportItem {
+                    name: server.name,
+                    outcome: connector_contract::ImportOutcome::SkippedDuplicate,
+                    error_code: None,
+                    omitted_secret_env_count: server.skipped_env.len(),
+                });
+                continue;
+            }
+            candidates.push(connector_service::ImportCandidate {
+                draft: connector_contract::ServerDraft {
+                    id: Some(connector_contract::ServerId::new(
+                        uuid::Uuid::new_v4().to_string(),
+                    )),
+                    name: server.name,
+                    transport: connector_contract::TransportDraft::Stdio {
+                        command: server.command,
+                        args: server.args,
+                        plain_env: server.env_plain,
+                        secret_env: Vec::new(),
+                        inherit_env: true,
+                    },
+                    enabled: true,
+                },
+                omitted_secret_env_count: server.skipped_env.len(),
+            });
+        }
+        for server in parsed.http_servers {
+            if !names.insert(server.name.clone()) {
+                report.push(connector_contract::ImportReportItem {
+                    name: server.name,
+                    outcome: connector_contract::ImportOutcome::SkippedDuplicate,
+                    error_code: None,
+                    omitted_secret_env_count: 0,
+                });
+                continue;
+            }
+            if mcp::validate_mcp_url(&server.url).is_err() {
+                report.push(connector_contract::ImportReportItem {
+                    name: server.name,
+                    outcome: connector_contract::ImportOutcome::Failed,
+                    error_code: Some(connector_contract::ErrorCode::InvalidInput),
+                    omitted_secret_env_count: 0,
+                });
+                continue;
+            }
+            candidates.push(connector_service::ImportCandidate {
+                draft: connector_contract::ServerDraft {
+                    id: Some(connector_contract::ServerId::new(
+                        uuid::Uuid::new_v4().to_string(),
+                    )),
+                    name: server.name,
+                    transport: connector_contract::TransportDraft::Http { url: server.url },
+                    enabled: true,
+                },
+                omitted_secret_env_count: 0,
+            });
+        }
+        for skipped in parsed.skipped {
+            report.push(connector_contract::ImportReportItem {
+                name: skipped.name,
+                outcome: connector_contract::ImportOutcome::SkippedUnsupported,
+                error_code: match skipped.reason {
+                    crate::mcp_import::SkipReason::Invalid(_) => {
+                        Some(connector_contract::ErrorCode::InvalidInput)
+                    }
+                    crate::mcp_import::SkipReason::LegacySse
+                    | crate::mcp_import::SkipReason::MissingCommand
+                    | crate::mcp_import::SkipReason::MissingUrl => None,
+                },
+                omitted_secret_env_count: 0,
+            });
+        }
+        Ok(connector_service::ImportPlan { candidates, report })
+    }
+
+    fn import_servers(
+        &mut self,
+        expected_revision: connector_contract::Revision,
+        servers: Vec<connector_contract::ServerDraft>,
+    ) -> Result<connector_service::RepositoryCas<()>, connector_service::ServiceError> {
+        let expected = connector_storage_revision(expected_revision)?;
+        let rows = servers
+            .into_iter()
+            .map(connector_server_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.db
+            .insert_mcp_servers_batch_revision_cas(expected, &rows)
+            .map(|value| connector_repository_cas(value, |_| ()))
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::StorageUnavailable,
+                    "connector import commit failed",
+                )
+            })
+    }
+
+    fn load_http_auth_binding(
+        &mut self,
+        server_id: &connector_contract::ServerId,
+        exact_url: &str,
+    ) -> Result<
+        connector_service::Observed<Option<connector_service::HttpAuthBinding>>,
+        connector_service::ServiceError,
+    > {
+        let read = self
+            .db
+            .credential_oauth_bindings_for_server_versioned(server_id.as_str())
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::StorageUnavailable,
+                    "connector OAuth binding load failed",
+                )
+            })?;
+        let value = match read.value.as_slice() {
+            [] => None,
+            [binding] => Some(Self::oauth_binding(binding.clone(), server_id, exact_url)?),
+            _ => {
+                return Err(connector_service_error(
+                    connector_contract::ErrorCode::StorageUnavailable,
+                    "connector OAuth binding is ambiguous",
+                ));
+            }
+        };
+        Ok(connector_service::Observed {
+            revision: connector_revision(read.revision),
+            value,
+        })
+    }
+
+    fn load_oauth_secret_slot(
+        &mut self,
+        logical_id: &secret::LogicalCredentialId,
+    ) -> Result<
+        connector_service::Observed<Option<secret::PhysicalSecretSlot>>,
+        connector_service::ServiceError,
+    > {
+        let read = self
+            .db
+            .credential_secret_location_versioned(logical_id.as_str())
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::StorageUnavailable,
+                    "connector OAuth slot load failed",
+                )
+            })?;
+        let value = read
+            .value
+            .map(|location| {
+                if location.keyring_service != secret::KEYRING_SERVICE {
+                    return Err(connector_service_error(
+                        connector_contract::ErrorCode::SecretUnavailable,
+                        "connector OAuth slot service is invalid",
+                    ));
+                }
+                let slot =
+                    secret::PhysicalSecretSlot::parse(location.keyring_username).map_err(|_| {
+                        connector_service_error(
+                            connector_contract::ErrorCode::SecretUnavailable,
+                            "connector OAuth slot is invalid",
+                        )
+                    })?;
+                if !slot.belongs_to(logical_id) {
+                    return Err(connector_service_error(
+                        connector_contract::ErrorCode::SecretUnavailable,
+                        "connector OAuth slot owner is invalid",
+                    ));
+                }
+                Ok(slot)
+            })
+            .transpose()?;
+        Ok(connector_service::Observed {
+            revision: connector_revision(read.revision),
+            value,
+        })
+    }
+
+    fn register_oauth_secret_staging(
+        &mut self,
+        plan: &secret::SecretBundleStagePlan,
+    ) -> Result<(), connector_service::ServiceError> {
+        self.db
+            .register_physical_secret_slot_staging(
+                plan.logical_id().as_str(),
+                plan.new_slot().as_str(),
+            )
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::StorageUnavailable,
+                    "connector OAuth staging registration failed",
+                )
+            })
+    }
+
+    fn acknowledge_oauth_secret_deleted(
+        &mut self,
+        logical_id: &secret::LogicalCredentialId,
+        slot: &secret::PhysicalSecretSlot,
+    ) -> Result<(), connector_service::ServiceError> {
+        self.db
+            .acknowledge_physical_secret_slot_deleted(logical_id.as_str(), slot.as_str())
+            .map(|_| ())
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::StorageUnavailable,
+                    "connector OAuth cleanup acknowledgement failed",
+                )
+            })
+    }
+
+    fn publish_oauth_secret_slot(
+        &mut self,
+        expected_revision: connector_contract::Revision,
+        descriptor: connector_service::OAuthPublishDescriptor<'_>,
+    ) -> Result<connector_service::OAuthPublishResult, connector_service::ServiceError> {
+        let expected = connector_storage_revision(expected_revision)?;
+        let logical_id = descriptor.staged.logical_id.as_str();
+        let exact_url = descriptor.metadata.server_url();
+        let metadata = descriptor
+            .metadata
+            .to_json_bounded(
+                descriptor.metadata.server_id(),
+                exact_url,
+                auth::StoredOAuthMetadataLimits::PRODUCTION,
+            )
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::InvalidInput,
+                    "connector OAuth metadata serialization failed",
+                )
+            })?;
+        if matches!(
+            descriptor.mode,
+            connector_service::OAuthPublishMode::FirstInsert
+        ) {
+            let meta = storage::CredentialMeta {
+                id: logical_id.to_owned(),
+                provider: "oauth".to_owned(),
+                label: descriptor.label.to_owned(),
+                credential_kind: "oauth".to_owned(),
+                masked_hint: descriptor.masked_hint.map(str::to_owned),
+                workspace_id: None,
+            };
+            let result = self
+                .db
+                .insert_credential_with_secret_slot_revision_cas(
+                    expected,
+                    &meta,
+                    descriptor.staged.new_slot.as_str(),
+                    Some(&metadata),
+                )
+                .map_err(|_| {
+                    connector_service_error(
+                        connector_contract::ErrorCode::StorageUnavailable,
+                        "connector OAuth publish failed",
+                    )
+                })?;
+            return Ok(match result {
+                storage::ConnectorConfigCas::Stale { current_revision } => {
+                    connector_service::OAuthPublishResult::RevisionStale {
+                        current_revision: connector_revision(current_revision),
+                    }
+                }
+                storage::ConnectorConfigCas::Committed {
+                    revision,
+                    value: (),
+                } => connector_service::OAuthPublishResult::Committed {
+                    revision: connector_revision(revision),
+                    previous_slot: None,
+                },
+            });
+        }
+        let connector_service::OAuthPublishMode::Rotation { expected_previous } = descriptor.mode
+        else {
+            unreachable!("first insert returned above")
+        };
+        let result = self
+            .db
+            .publish_credential_secret_slot_revision_cas(
+                expected,
+                logical_id,
+                expected_previous.as_str(),
+                descriptor.staged.new_slot.as_str(),
+                Some(&metadata),
+                descriptor.masked_hint,
+            )
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::StorageUnavailable,
+                    "connector OAuth publish failed",
+                )
+            })?;
+        match result {
+            storage::ConnectorConfigCas::Stale { current_revision } => {
+                Ok(connector_service::OAuthPublishResult::RevisionStale {
+                    current_revision: connector_revision(current_revision),
+                })
+            }
+            storage::ConnectorConfigCas::Committed {
+                revision,
+                value: false,
+            } => Ok(connector_service::OAuthPublishResult::PointerStale {
+                revision: connector_revision(revision),
+            }),
+            storage::ConnectorConfigCas::Committed {
+                revision,
+                value: true,
+            } => Ok(connector_service::OAuthPublishResult::Committed {
+                revision: connector_revision(revision),
+                previous_slot: Some(expected_previous),
+            }),
+        }
+    }
+
+    fn load_authorization_state(
+        &mut self,
+        server_id: &connector_contract::ServerId,
+        tool_name: &str,
+    ) -> Result<
+        connector_service::Observed<connector_service::AuthorizationState>,
+        connector_service::ServiceError,
+    > {
+        let read = self
+            .db
+            .permission_rule_versioned(server_id.as_str(), tool_name)
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::StorageUnavailable,
+                    "connector authorization state load failed",
+                )
+            })?;
+        let permission = match read.value {
+            None => audit::PermissionFingerprint::Absent,
+            Some(row) => audit::PermissionFingerprint::Persisted {
+                rule: audit::PermissionRule::from_persisted(&row.rule).ok_or_else(|| {
+                    connector_service_error(
+                        connector_contract::ErrorCode::StorageUnavailable,
+                        "stored connector authorization rule is invalid",
+                    )
+                })?,
+                approved_schema_hash: row.approved_schema_hash,
+            },
+        };
+        Ok(connector_service::Observed {
+            revision: connector_revision(read.revision),
+            value: connector_service::AuthorizationState { permission },
+        })
+    }
+
+    fn commit_authorization_preflight(
+        &mut self,
+        expected_revision: connector_contract::Revision,
+        plan: audit::AuthorizationPlan,
+        arguments_json: &connector_contract::SensitiveInput,
+    ) -> Result<
+        connector_service::RepositoryCas<audit::AuthorizationPreflight>,
+        connector_service::ServiceError,
+    > {
+        let expected = connector_storage_revision(expected_revision)?;
+        let input = std::str::from_utf8(arguments_json.expose_bytes()).map_err(|_| {
+            connector_service_error(
+                connector_contract::ErrorCode::InvalidInput,
+                "connector tool input is not UTF-8 JSON",
+            )
+        })?;
+        let owner = self.authorization_owner.as_ref().ok_or_else(|| {
+            connector_service_error(
+                connector_contract::ErrorCode::AuditUnavailable,
+                "connector authorization owner is unavailable",
+            )
+        })?;
+        self.db
+            .commit_authorization_preflight_revision_cas(
+                expected,
+                owner,
+                plan,
+                input,
+                &self.redaction,
+            )
+            .map(|value| connector_repository_cas(value, |value| value))
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::AuditUnavailable,
+                    "connector authorization preflight failed",
+                )
+            })
+    }
+
+    fn complete_authorization(
+        &mut self,
+        operation_id: &connector_contract::OperationId,
+        outcome: audit::AuthorizationOutcome,
+    ) -> Result<(), connector_service::ServiceError> {
+        let owner = self.authorization_owner.as_ref().ok_or_else(|| {
+            connector_service_error(
+                connector_contract::ErrorCode::AuditUnavailable,
+                "connector authorization owner is unavailable",
+            )
+        })?;
+        self.db
+            .complete_authorization_outcome(owner, operation_id.as_str(), outcome)
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::AuditUnavailable,
+                    "connector authorization outcome failed",
+                )
+            })
+    }
+
+    fn shutdown(&mut self) -> Result<(), connector_service::ServiceError> {
+        let Some(owner) = self.authorization_owner.take() else {
+            return Ok(());
+        };
+        self.db
+            .close_authorization_owner(owner)
+            .map(|_| ())
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::AuditUnavailable,
+                    "connector authorization shutdown failed",
+                )
+            })
+    }
+}
+
+fn unix_now_secs_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or(i64::MAX)
+}
+
+fn unix_now_secs_u64() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+struct AppConnectorSecrets {
+    secret_store: KeyringSecretStore,
+    redaction: secret::RedactionService,
+}
+
+impl AppConnectorSecrets {
+    fn metadata_after_refresh(
+        metadata: &auth::StoredOAuthMetadata,
+        expires_in_secs: Option<u64>,
+    ) -> Result<auth::StoredOAuthMetadata, connector_service::ServiceError> {
+        auth::StoredOAuthMetadata::new(
+            auth::StoredOAuthMetadataDraft {
+                server_id: metadata.server_id().to_owned(),
+                server_url: metadata.server_url().to_owned(),
+                issuer: metadata.issuer().to_owned(),
+                authorization_endpoint: metadata.authorization_endpoint().to_owned(),
+                token_endpoint: metadata.token_endpoint().to_owned(),
+                oauth_resource: metadata.oauth_resource().to_owned(),
+                client_id: metadata.client_id().to_owned(),
+                token_endpoint_auth_method: metadata.token_endpoint_auth_method(),
+                manual_client: metadata.manual_client(),
+                provider_workspace_id: metadata.provider_workspace_id().map(str::to_owned),
+                workspace_domain: metadata.workspace_domain().map(str::to_owned),
+                scopes: metadata.scopes().to_vec(),
+                expires_at_secs: expires_in_secs
+                    .map(|seconds| unix_now_secs_u64().saturating_add(seconds)),
+            },
+            auth::StoredOAuthMetadataLimits::PRODUCTION,
+        )
+        .map_err(|_| {
+            connector_service_error(
+                connector_contract::ErrorCode::AuthenticationFailed,
+                "refreshed connector OAuth metadata is invalid",
+            )
+        })
+    }
+}
+
+impl connector_service::ConnectorSecrets for AppConnectorSecrets {
+    fn load_stored_oauth_client(
+        &self,
+        binding: &connector_service::HttpAuthBinding,
+    ) -> Result<Option<connector_service::StoredOAuthClient>, connector_service::ServiceError> {
+        let Some(metadata) = binding.oauth_metadata.as_ref() else {
+            return Ok(None);
+        };
+        let logical =
+            secret::LogicalCredentialId::new(binding.credential_id.as_str()).map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::SecretUnavailable,
+                    "connector OAuth credential identifier is invalid",
+                )
+            })?;
+        if !binding.physical_slot.belongs_to(&logical) {
+            return Err(connector_service_error(
+                connector_contract::ErrorCode::SecretUnavailable,
+                "connector OAuth slot owner is invalid",
+            ));
+        }
+        let bundle = secret::read_secret_bundle(&self.secret_store, &binding.physical_slot)
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::SecretUnavailable,
+                    "connector OAuth bundle load failed",
+                )
+            })?;
+        let (_, _, dcr) = bundle.into_parts();
+        Ok(Some(connector_service::StoredOAuthClient {
+            server_id: connector_contract::ServerId::new(metadata.server_id().to_owned()),
+            logical_id: logical,
+            client_id: metadata.client_id().to_owned(),
+            client_secret: dcr
+                .map(|value| connector_contract::SensitiveInput::from(value.into_string())),
+            workspace_hint: metadata.workspace_domain().map(str::to_owned),
+            metadata: Some(metadata.clone()),
+            manual_client: metadata.manual_client(),
+        }))
+    }
+
+    fn exchange_oauth_refresh(
+        &self,
+        request: connector_service::OAuthRefreshRequest,
+        cancellation: connector_service::CancellationToken,
+    ) -> Result<connector_service::OAuthRefreshOutcome, connector_service::ServiceError> {
+        if cancellation.is_cancelled() {
+            return Err(connector_service_error(
+                connector_contract::ErrorCode::Cancelled,
+                "connector OAuth refresh was cancelled",
+            ));
+        }
+        let bundle = secret::read_secret_bundle(&self.secret_store, &request.current_slot)
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::SecretUnavailable,
+                    "connector OAuth refresh bundle load failed",
+                )
+            })?;
+        let (_, refresh, dcr) = bundle.into_parts();
+        let Some(refresh) = refresh else {
+            return Ok(connector_service::OAuthRefreshOutcome::ReauthorizationRequired);
+        };
+        let params = auth::RefreshParams {
+            token_url: request.metadata.token_endpoint().to_owned(),
+            client_id: request.metadata.client_id().to_owned(),
+            client_secret: dcr,
+            client_secret_post: request
+                .metadata
+                .token_endpoint_auth_method()
+                .uses_client_secret(),
+            resource: Some(request.metadata.oauth_resource().to_owned()),
+        };
+        let outcome =
+            auth::exchange_refresh_token_once(CONNECTOR_OAUTH_HTTP_TIMEOUT, refresh, &params)
+                .map_err(|_| {
+                    connector_service_error(
+                        connector_contract::ErrorCode::AuthenticationFailed,
+                        "connector OAuth refresh failed",
+                    )
+                })?;
+        if cancellation.is_cancelled() {
+            return Err(connector_service_error(
+                connector_contract::ErrorCode::Cancelled,
+                "connector OAuth refresh was cancelled",
+            ));
+        }
+        match outcome {
+            auth::RefreshOutcome::Refreshed(token) => {
+                let metadata =
+                    Self::metadata_after_refresh(&request.metadata, token.expires_in_secs)?;
+                let dcr = params.client_secret;
+                Ok(connector_service::OAuthRefreshOutcome::Refreshed(Box::new(
+                    connector_service::OAuthCredentialUpdate {
+                        logical_id: request.logical_id,
+                        label: request.label,
+                        masked_hint: Some(secret::masked_hint(token.access_token.expose())),
+                        bundle: secret::SecretBundle::new(
+                            token.access_token,
+                            token.refresh_token,
+                            dcr,
+                        ),
+                        metadata,
+                    },
+                )))
+            }
+            auth::RefreshOutcome::ReauthorizationRequired { .. }
+            | auth::RefreshOutcome::AlreadyRefreshed => {
+                Ok(connector_service::OAuthRefreshOutcome::ReauthorizationRequired)
             }
         }
-        Ok(())
     }
 
-    fn delete_oauth_token(&self, id: &str) -> anyhow::Result<()> {
-        self.secret_store.delete_secret(id)?;
-        self.secret_store
-            .delete_secret(&auth::refresh_entry_id(id))?;
-        // DCR client_secret entry도 함께 정리 (H4 리뷰 P2)
-        self.secret_store
-            .delete_secret(&auth::dcr_secret_entry_id(id))?;
-        Ok(())
-    }
-}
-
-struct AppMcpScopedEnvResolver<'a> {
-    secret_store: &'a dyn secret::SecretStore,
-    redaction: &'a secret::RedactionService,
-}
-
-impl ui::connectors::McpScopedEnvResolver for AppMcpScopedEnvResolver<'_> {
-    fn resolve_mcp_env(
+    fn resolve_credentials(
         &self,
-        env_plain: &[(String, String)],
-        env_secrets: &[(String, String)],
-    ) -> anyhow::Result<Vec<(String, String)>> {
-        mcp_store::validate_server_env_for_persistence(env_plain, env_secrets)?;
-        let mut env = env_plain.to_vec();
-        for (key, credential_id) in env_secrets {
-            let secret = self
-                .secret_store
-                .get_secret(credential_id)
-                .map_err(|e| anyhow::anyhow!("MCP env '{}' credential 조회 실패: {e:#}", key))?;
-            self.redaction.register(&secret);
-            self.redaction.register_json_fields(&secret);
-            env.push((key.clone(), secret.expose().to_owned()));
+        requests: Vec<connector_service::CredentialResolutionRequest>,
+    ) -> Result<connector_service::ResolvedCredentials, connector_service::ServiceError> {
+        if requests.is_empty() {
+            return Ok(connector_service::ResolvedCredentials::empty());
         }
-        Ok(env)
+        let mut values = Vec::with_capacity(requests.len());
+        for request in &requests {
+            let logical = secret::LogicalCredentialId::new(request.credential_id.as_str())
+                .map_err(|_| {
+                    connector_service_error(
+                        connector_contract::ErrorCode::SecretUnavailable,
+                        "connector credential identifier is invalid",
+                    )
+                })?;
+            let slot = request.expected_physical_slot.as_ref().ok_or_else(|| {
+                connector_service_error(
+                    connector_contract::ErrorCode::SecretUnavailable,
+                    "connector credential physical slot is missing",
+                )
+            })?;
+            if !slot.belongs_to(&logical) {
+                return Err(connector_service_error(
+                    connector_contract::ErrorCode::SecretUnavailable,
+                    "connector credential physical slot owner is invalid",
+                ));
+            }
+            values.push(
+                secret::SecretStore::get_secret(&self.secret_store, slot.as_str()).map_err(
+                    |_| {
+                        connector_service_error(
+                            connector_contract::ErrorCode::SecretUnavailable,
+                            "connector credential load failed",
+                        )
+                    },
+                )?,
+            );
+        }
+        let refs = values.iter().collect::<Vec<_>>();
+        let redaction = self
+            .redaction
+            .acquire_json_execution_lease(&refs)
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::SecretUnavailable,
+                    "connector redaction lease is unavailable",
+                )
+            })?;
+        let entries = requests
+            .into_iter()
+            .zip(values)
+            .map(|(request, value)| {
+                connector_service::ResolvedCredential::new(
+                    request.credential_id,
+                    request
+                        .expected_physical_slot
+                        .expect("validated physical slot"),
+                    value,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        connector_service::ResolvedCredentials::new(entries, redaction)
+    }
+
+    fn stage_oauth_bundle(
+        &self,
+        plan: &secret::SecretBundleStagePlan,
+        bundle: secret::SecretBundle,
+    ) -> Result<secret::StagedSecretBundle, connector_service::ServiceError> {
+        secret::stage_secret_bundle(&self.secret_store, plan, bundle.as_ref()).map_err(|_| {
+            connector_service_error(
+                connector_contract::ErrorCode::SecretUnavailable,
+                "connector OAuth bundle staging failed",
+            )
+        })
+    }
+
+    fn delete_oauth_bundle(
+        &self,
+        slot: &secret::PhysicalSecretSlot,
+    ) -> Result<(), connector_service::ServiceError> {
+        secret::delete_secret_bundle(&self.secret_store, slot)
+            .map(|_| ())
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::SecretUnavailable,
+                    "connector OAuth bundle cleanup failed",
+                )
+            })
+    }
+
+    fn sanitized_input_preview(
+        &self,
+        arguments_json: &connector_contract::SensitiveInput,
+        max_chars: usize,
+    ) -> Result<String, connector_service::ServiceError> {
+        audit::sanitized_input_preview(arguments_json.expose_bytes(), &self.redaction, max_chars)
+            .map_err(|_| {
+                connector_service_error(
+                    connector_contract::ErrorCode::InvalidInput,
+                    "connector input preview failed",
+                )
+            })
+    }
+}
+
+struct AppConnectorHost {
+    ctx: egui::Context,
+}
+
+impl connector_service::ConnectorHost for AppConnectorHost {
+    fn wake(&self) {
+        self.ctx.request_repaint();
     }
 }
 
@@ -1191,9 +4594,19 @@ pub struct App {
     env_project_rows_failed: bool,
     env_secret_reveal_worker: EnvSecretRevealWorker,
     env_secret_generation: u64,
-    env_secret_cache: std::collections::HashMap<String, String>,
-    env_secret_pending: std::collections::HashSet<String>,
-    env_secret_failures: std::collections::HashSet<String>,
+    /// Agents/Environment leaf가 읽는 immutable snapshot과 mutation intent를 전담한다.
+    /// 첫 설정 요청에서만 thread/SQLite connection을 만들고 30초 idle이면 둘 다 회수한다.
+    settings_snapshot_worker: SettingsSnapshotWorker,
+    settings_snapshot_generation: u64,
+    settings_snapshot_revision: u64,
+    settings_snapshot_pending: bool,
+    settings_pending_operation: Option<SettingsOperationKey>,
+    settings_snapshot_retry_at: Option<std::time::Instant>,
+    settings_snapshot_workspace_id: Option<String>,
+    agents_snapshot: ui::agents::AgentsSnapshot,
+    env_profiles_snapshot: ui::env_profiles::EnvProfilesSnapshot,
+    credentials_snapshot: ui::credentials::CredentialsSnapshot,
+    agent_sessions_secrets_snapshot: ui::agent_sessions::AgentSessionsSecretsSnapshot,
     db: Db,
     secret_store: KeyringSecretStore,
     agents_ui: ui::agents::AgentsUi,
@@ -1205,12 +4618,24 @@ pub struct App {
     /// 보존해 새 thread가 복구 불가능해지거나 archive가 재시작 후 되살아나는 것을 막는다.
     agent_persistence_queue: Vec<ui::agent_sessions::AgentSessionPersistenceMutation>,
     agent_persistence_retry_at: Option<std::time::Instant>,
-    connectors_ui: ui::connectors::ConnectorsUi,
-    /// OAuth refresh single-flight 조율자 (H5) — 프로세스 단일 인스턴스의 원본.
-    /// 현재 소비자는 connectors_ui뿐이지만, 후속 소비자(P2 web 브리지 등)도 반드시
-    /// 이 인스턴스의 Arc 클론을 받아야 single-flight가 성립한다 (H4 규약).
-    #[allow(dead_code)]
-    refresh_coordinator: Arc<auth::RefreshCoordinator>,
+    /// Lazy Connector service + latest-only render snapshot. Construction performs no DB open,
+    /// thread, process, network request, polling, or scheduled repaint.
+    connector_coordinator: connector_service::ConnectorCoordinator,
+    connector_snapshot_reader: connector_service::SnapshotReader,
+    connector_ui: connector_ui::ConnectorUi,
+    /// App-owned single-flight file/dialog/browser task. `None` until a host action is emitted;
+    /// there is no host thread/channel/poll/timer while unused. Connector와 Composer native
+    /// picker가 이 한 슬롯을 공유해 동시에 둘 이상의 dialog/process를 만들지 않는다.
+    app_host_io: Option<AppHostIoTask>,
+    /// Render가 반환한 native-host intent. 다음 logic tick에서만 host task로 넘기며
+    /// latest-only 한 건만 보존한다.
+    pending_app_host_action: Option<AppHostIoAction>,
+    /// Send events publish one Arc-backed bounded history snapshot. Only the latest snapshot needs
+    /// persistence, so a busy host task retains one replacement rather than a write queue.
+    pending_composer_history: Option<Arc<[Arc<str>]>>,
+    /// 폴더 선택 결과를 settings queue가 빌 때까지 한 건만 보존한다. 선택 결과를 적용하기
+    /// 전에는 다음 host action을 시작하지 않아 raw path/backlog가 늘지 않는다.
+    pending_folder_picker_completion: Option<(FolderPickerPurpose, PathBuf)>,
     credentials_ui: ui::credentials::CredentialsUi,
     env_profiles_ui: ui::env_profiles::EnvProfilesUi,
     activity_ui: ui::activity::ActivityUi,
@@ -1220,9 +4645,6 @@ pub struct App {
     /// 전 워크스페이스 × 세션의 String/Vec 재조립을 피한다. 리소스 샘플 주기(2s)보다
     /// 짧아 표시 신선도는 유지된다.
     activity_rows_cache: Option<(std::time::Instant, Vec<ui::activity::ActivityWorkspaceRow>)>,
-    /// 하단 상태바 「MCP N」용 활성 MCP 서버 수 캐시 — 매 프레임 DB 조회 금지
-    /// (30s TTL — 커넥터 변경은 다음 갱신에 반영되면 충분한 준정적 값).
-    mcp_count_cache: Option<(std::time::Instant, usize)>,
     /// 홈 업데이트 피드 수신(Claude/OpenAI 상태 5분, 공지/HF/Grok 4시간) + 최신
     /// 스냅샷. provider별 조회 실패(None)면 마지막 성공값을 유지한다.
     status_feed_rx: std::sync::mpsc::Receiver<crate::status_feed::StatusFeedSnapshot>,
@@ -1254,15 +4676,19 @@ pub struct App {
     inbox_waiting_ui: ui::inbox_waiting::InboxWaitingUi,
     /// 하단 도크 프롬프트 컴포저 (2026-07-17) — 워크스페이스별 드래프트 + 영속 히스토리.
     composer: ui::composer::ComposerUi,
+    composer_history_path: PathBuf,
     /// agent-proxy 승인 팝업 (option 1.5). proxy가 DB에 쓴 pending 행을 폴링해 표시한다.
     approvals_ui: ui::approvals::ApprovalsUi,
     /// 이미 알림을 발화한 pending 승인 id — 폴링마다 재발화하지 않기 위한 기억.
     /// 매 폴링에서 현재 pending 집합으로 통째 교체되므로 성장하지 않는다.
     approval_notified: std::collections::HashSet<String>,
-    /// watcher가 pending approval 목록 변화를 감지하면 logic()이 한 번만 DB를 읽게 하는 플래그.
-    approval_poll_requested: Arc<AtomicBool>,
-    /// 외부 proxy가 DB에 쓴 pending approval 변화를 감지해 UI를 깨운다.
-    approval_watcher: ApprovalWatcher,
+    /// 같은 physical DB의 startup pending reconciliation을 다른 app instance와 직렬화한다.
+    _pending_approval_owner: Arc<storage::ActivePendingApprovalOwner>,
+    /// proxy launch/approval decision이 있을 때만 존재하는 event-driven DB/socket worker.
+    approval_wake_hub: ApprovalWakeHub,
+    approval_launch_tracker: ApprovalLaunchTracker,
+    approval_global_reconcile: ApprovalGlobalReconcile,
+    pending_proxy_launches: std::collections::VecDeque<PendingProxyLaunch>,
     /// 마지막 오프스크린 창 위치 보정 시각 (쿨다운용)
     last_offscreen_fix: std::time::Instant,
     /// 시작 시 창을 주 화면으로 1회 이동했다 (centered의 macOS 좌표 문제 우회)
@@ -1281,8 +4707,11 @@ pub struct App {
     egui_ctx: egui::Context,
     db_path: PathBuf,
     logs_base: PathBuf,
-    redaction: secret::RedactionService,
+    runtime_host_factory: Arc<runtime::InProcessRuntimeHostFactory>,
     workspaces: Vec<crate::storage::WorkspaceRow>,
+    /// Bounded workspace projection의 all-or-nothing filesystem identity. Render/rename
+    /// detection은 path/anchor를 per-workspace로 다시 조회하지 않는다.
+    workspace_anchors: std::collections::HashMap<String, storage::WorkspaceFolderAnchor>,
     /// 런타임이 없는 workspace도 활동 화면에 복원 대상 pane을 표시하기 위한 DB snapshot.
     /// refresh_workspaces에서 한 쿼리로 갱신한다.
     /// 워크스페이스별 영속 pane snapshot — (raw 제목, 세션 cwd). cwd는 기본 제목
@@ -1603,7 +5032,529 @@ fn auto_resume_decision(
     }
 }
 
+fn read_connector_import_file(
+    path: &std::path::Path,
+) -> Result<Vec<u8>, connector_contract::ErrorCode> {
+    let limit = connector_contract::ResourceLimits::PRODUCTION_CEILING.import_input_bytes;
+    let file =
+        std::fs::File::open(path).map_err(|_| connector_contract::ErrorCode::StorageUnavailable)?;
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+    let mut bounded = std::io::Read::take(
+        file,
+        u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1),
+    );
+    std::io::Read::read_to_end(&mut bounded, &mut bytes)
+        .map_err(|_| connector_contract::ErrorCode::StorageUnavailable)?;
+    if bytes.len() > limit {
+        return Err(connector_contract::ErrorCode::LimitExceeded);
+    }
+    Ok(bytes)
+}
+
+fn open_connector_sensitive_url(url: &connector_contract::SensitiveInput) -> bool {
+    let Ok(url) = std::str::from_utf8(url.expose_bytes()) else {
+        return false;
+    };
+    if !is_bounded_https_url(url) {
+        return false;
+    }
+    auth::open_in_browser_reaped(url).is_ok()
+}
+
+const APP_HOST_PATH_MAX_BYTES: usize = 32 * 1024;
+const APP_HOST_URL_MAX_BYTES: usize = 32 * 1024;
+
+fn is_bounded_https_url(url: &str) -> bool {
+    url.len() <= APP_HOST_URL_MAX_BYTES
+        && !url.contains(['\0', '\r', '\n'])
+        && url.starts_with("https://")
+}
+
+enum AppHostIoAction {
+    Connector(connector_service::HostAction),
+    ComposerContextFile(ui::composer::ContextFileRequest),
+    ComposerClipboard(ui::composer::ClipboardAttachmentRequest),
+    PersistComposerHistory {
+        path: PathBuf,
+        history: Arc<[Arc<str>]>,
+    },
+    FolderPicker(FolderPickerPurpose),
+    ExternalHttpsUrl(String),
+}
+
+#[derive(Clone)]
+enum FolderPickerPurpose {
+    SwitchWorkspace,
+    SelectWorkspaceInSettings,
+    SetProjectPath { workspace_id: String },
+}
+
+enum AppHostIoCompletion {
+    Dispatch(connector_contract::ConnectorIntent),
+    ComposerContextFile {
+        request: ui::composer::ContextFileRequest,
+        selected_path: Option<PathBuf>,
+    },
+    ComposerClipboard {
+        request: ui::composer::ClipboardAttachmentRequest,
+        payload: Option<ui::composer::ClipboardAttachmentPayload>,
+    },
+    ComposerHistoryWriteFailed,
+    FolderPicker {
+        purpose: FolderPickerPurpose,
+        selected_path: Option<PathBuf>,
+    },
+    Complete,
+    ExternalLinkFailed,
+}
+
+#[derive(Clone)]
+enum AppHostIoFallback {
+    Import {
+        operation_id: connector_contract::OperationId,
+        source: connector_contract::ImportSource,
+    },
+    Cancel(connector_contract::OperationId),
+    ComposerContextFile(ui::composer::ContextFileRequest),
+    ComposerClipboard(ui::composer::ClipboardAttachmentRequest),
+    ComposerHistory,
+    FolderPicker(FolderPickerPurpose),
+    None,
+}
+
+impl AppHostIoFallback {
+    fn for_action(action: &AppHostIoAction) -> Self {
+        match action {
+            AppHostIoAction::Connector(connector_service::HostAction::RequestImportSource {
+                operation_id,
+                source,
+            }) => Self::Import {
+                operation_id: operation_id.clone(),
+                source: connector_import_source(*source),
+            },
+            AppHostIoAction::Connector(
+                connector_service::HostAction::OpenOAuthBrowser { operation_id, .. }
+                | connector_service::HostAction::OpenSlackRecovery { operation_id, .. },
+            ) => Self::Cancel(operation_id.clone()),
+            AppHostIoAction::Connector(connector_service::HostAction::OpenExternalLink {
+                ..
+            }) => Self::None,
+            AppHostIoAction::ComposerContextFile(request) => {
+                Self::ComposerContextFile(request.clone())
+            }
+            AppHostIoAction::ComposerClipboard(request) => Self::ComposerClipboard(request.clone()),
+            AppHostIoAction::PersistComposerHistory { .. } => Self::ComposerHistory,
+            AppHostIoAction::FolderPicker(purpose) => Self::FolderPicker(purpose.clone()),
+            AppHostIoAction::ExternalHttpsUrl(_) => Self::None,
+        }
+    }
+
+    fn into_completion(self) -> AppHostIoCompletion {
+        match self {
+            Self::Import {
+                operation_id,
+                source,
+            } => AppHostIoCompletion::Dispatch(
+                connector_contract::ConnectorIntent::FailImportSource {
+                    operation_id,
+                    source,
+                    error_code: connector_contract::ErrorCode::HostUnavailable,
+                },
+            ),
+            Self::Cancel(operation_id) => AppHostIoCompletion::Dispatch(
+                connector_contract::ConnectorIntent::Cancel(operation_id),
+            ),
+            Self::ComposerContextFile(request) => AppHostIoCompletion::ComposerContextFile {
+                request,
+                selected_path: None,
+            },
+            Self::ComposerClipboard(request) => AppHostIoCompletion::ComposerClipboard {
+                request,
+                payload: None,
+            },
+            Self::ComposerHistory => AppHostIoCompletion::ComposerHistoryWriteFailed,
+            Self::FolderPicker(purpose) => AppHostIoCompletion::FolderPicker {
+                purpose,
+                selected_path: None,
+            },
+            Self::None => AppHostIoCompletion::ExternalLinkFailed,
+        }
+    }
+}
+
+struct AppHostIoTask {
+    result_rx: std::sync::mpsc::Receiver<AppHostIoCompletion>,
+    handle: std::thread::JoinHandle<()>,
+    fallback: AppHostIoFallback,
+}
+
+impl AppHostIoTask {
+    fn spawn(action: AppHostIoAction, ctx: egui::Context) -> Result<Self, AppHostIoFallback> {
+        let fallback = AppHostIoFallback::for_action(&action);
+        let fallback_on_spawn = fallback.clone();
+        let fallback_on_panic = fallback.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let handle = std::thread::Builder::new()
+            .name("app-host-io".to_owned())
+            .spawn(move || {
+                let completion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_app_host_io(action)
+                }))
+                .unwrap_or_else(|_| fallback_on_panic.into_completion());
+                if result_tx.send(completion).is_ok() {
+                    ctx.request_repaint();
+                }
+            })
+            .map_err(|_| fallback_on_spawn)?;
+        Ok(Self {
+            result_rx,
+            handle,
+            fallback,
+        })
+    }
+}
+
+fn connector_import_source(
+    source: connector_contract::ImportSourceRequest,
+) -> connector_contract::ImportSource {
+    match source {
+        connector_contract::ImportSourceRequest::FilePicker => {
+            connector_contract::ImportSource::File
+        }
+        connector_contract::ImportSourceRequest::ClaudeDesktop => {
+            connector_contract::ImportSource::ClaudeDesktop
+        }
+    }
+}
+
+fn workspace_name_for_path(path: &Path, style: crate::config::SessionNameStyle) -> String {
+    let path_text = path.to_string_lossy();
+    crate::agent_detect::project_display_name(&path_text, style)
+        .or_else(|| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "workspace".to_owned())
+}
+
+fn write_composer_history(path: &Path, history: &[Arc<str>]) -> bool {
+    if history.len() > ui::composer::COMPOSER_HISTORY_MAX_ITEMS
+        || history.iter().map(|entry| entry.len()).sum::<usize>()
+            > ui::composer::COMPOSER_HISTORY_MAX_BYTES
+    {
+        return false;
+    }
+    let mut bytes = Vec::with_capacity(ui::composer::COMPOSER_HISTORY_MAX_BYTES.min(64 * 1024));
+    for entry in history {
+        if serde_json::to_writer(&mut bytes, entry).is_err() {
+            return false;
+        }
+        bytes.push(b'\n');
+        if bytes.len() > ui::composer::COMPOSER_HISTORY_FILE_MAX_BYTES {
+            return false;
+        }
+    }
+    let mut temp_name = path.as_os_str().to_owned();
+    temp_name.push(".tmp");
+    let temp_path = PathBuf::from(temp_name);
+    if std::fs::write(&temp_path, bytes).is_err() {
+        return false;
+    }
+    if std::fs::rename(&temp_path, path).is_err() {
+        let _ = std::fs::remove_file(temp_path);
+        return false;
+    }
+    true
+}
+
+fn read_composer_clipboard_paths() -> Option<Vec<PathBuf>> {
+    let mut result = ui::clipboard_image::paste_clipboard_paths_or_image_to_paths();
+    let mut retries = 0;
+    while retries < 4
+        && matches!(&result, Ok(None))
+        && ui::clipboard_image::read_clipboard_text().is_none()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        result = ui::clipboard_image::paste_clipboard_paths_or_image_to_paths();
+        retries += 1;
+    }
+    result.ok().flatten().filter(|paths| {
+        paths.len() <= ui::composer::COMPOSER_ATTACHMENT_MAX_ITEMS
+            && paths
+                .iter()
+                .all(|path| path.as_os_str().as_encoded_bytes().len() <= APP_HOST_PATH_MAX_BYTES)
+            && paths
+                .iter()
+                .map(|path| path.as_os_str().as_encoded_bytes().len())
+                .sum::<usize>()
+                <= ui::composer::COMPOSER_ATTACHMENT_MAX_BYTES
+    })
+}
+
+fn run_app_host_io(action: AppHostIoAction) -> AppHostIoCompletion {
+    match action {
+        AppHostIoAction::PersistComposerHistory { path, history } => {
+            if write_composer_history(&path, &history) {
+                AppHostIoCompletion::Complete
+            } else {
+                AppHostIoCompletion::ComposerHistoryWriteFailed
+            }
+        }
+        AppHostIoAction::ComposerClipboard(request) => AppHostIoCompletion::ComposerClipboard {
+            request,
+            payload: read_composer_clipboard_paths()
+                .and_then(|paths| ui::composer::ClipboardAttachmentPayload::try_new(paths).ok()),
+        },
+        AppHostIoAction::ExternalHttpsUrl(url) => {
+            if is_bounded_https_url(&url) && auth::open_in_browser_reaped(&url).is_ok() {
+                AppHostIoCompletion::Complete
+            } else {
+                AppHostIoCompletion::ExternalLinkFailed
+            }
+        }
+        AppHostIoAction::FolderPicker(purpose) => AppHostIoCompletion::FolderPicker {
+            purpose,
+            selected_path: rfd::FileDialog::new().pick_folder(),
+        },
+        AppHostIoAction::ComposerContextFile(request) => {
+            let mut dialog = rfd::FileDialog::new();
+            if let Some(root) = request.workspace_root() {
+                dialog = dialog.set_directory(root);
+            }
+            AppHostIoCompletion::ComposerContextFile {
+                request,
+                selected_path: dialog.pick_file(),
+            }
+        }
+        AppHostIoAction::Connector(connector_service::HostAction::RequestImportSource {
+            operation_id,
+            source,
+        }) => {
+            let path = match source {
+                connector_contract::ImportSourceRequest::FilePicker => {
+                    rfd::FileDialog::new().pick_file()
+                }
+                connector_contract::ImportSourceRequest::ClaudeDesktop => {
+                    directories::BaseDirs::new().map(|dirs| {
+                        dirs.config_dir()
+                            .join("Claude")
+                            .join("claude_desktop_config.json")
+                    })
+                }
+            };
+            let Some(path) = path else {
+                return AppHostIoCompletion::Dispatch(connector_contract::ConnectorIntent::Cancel(
+                    operation_id,
+                ));
+            };
+            let source = connector_import_source(source);
+            let display_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned());
+            let intent = match read_connector_import_file(&path) {
+                Ok(contents) => connector_contract::ConnectorIntent::CompleteImportSource {
+                    operation_id,
+                    source,
+                    display_name,
+                    contents: connector_contract::SensitiveInput::new(contents),
+                },
+                Err(error_code) => connector_contract::ConnectorIntent::FailImportSource {
+                    operation_id,
+                    source,
+                    error_code,
+                },
+            };
+            AppHostIoCompletion::Dispatch(intent)
+        }
+        AppHostIoAction::Connector(connector_service::HostAction::OpenExternalLink {
+            kind,
+            ..
+        }) => {
+            let url = match kind {
+                connector_contract::ExternalLinkKind::SlackAppSettings => {
+                    "https://api.slack.com/apps"
+                }
+            };
+            if auth::open_in_browser_reaped(url).is_ok() {
+                AppHostIoCompletion::Complete
+            } else {
+                AppHostIoCompletion::ExternalLinkFailed
+            }
+        }
+        AppHostIoAction::Connector(connector_service::HostAction::OpenOAuthBrowser {
+            operation_id,
+            url,
+            ..
+        }) => {
+            if open_connector_sensitive_url(&url) {
+                AppHostIoCompletion::Complete
+            } else {
+                AppHostIoCompletion::Dispatch(connector_contract::ConnectorIntent::Cancel(
+                    operation_id,
+                ))
+            }
+        }
+        AppHostIoAction::Connector(connector_service::HostAction::OpenSlackRecovery {
+            operation_id,
+            kind,
+            url,
+            ..
+        }) => {
+            let opened = match url.as_ref() {
+                Some(url) => open_connector_sensitive_url(url),
+                None if matches!(kind, connector_contract::SlackRecoveryKind::ConfigureApp) => {
+                    auth::open_in_browser_reaped("https://api.slack.com/apps").is_ok()
+                }
+                None => false,
+            };
+            if opened {
+                AppHostIoCompletion::Complete
+            } else {
+                AppHostIoCompletion::Dispatch(connector_contract::ConnectorIntent::Cancel(
+                    operation_id,
+                ))
+            }
+        }
+    }
+}
+
 impl App {
+    fn apply_app_host_completion(&mut self, completion: AppHostIoCompletion) {
+        match completion {
+            AppHostIoCompletion::Dispatch(intent) => {
+                if self.connector_coordinator.dispatch(intent).is_err() {
+                    tracing::warn!("Connector host completion dispatch failed");
+                }
+            }
+            AppHostIoCompletion::ComposerContextFile {
+                request,
+                selected_path,
+            } => {
+                let active_workspace = self.active.id.clone();
+                let _ = self.composer.complete_context_file(
+                    &self.egui_ctx,
+                    request,
+                    selected_path,
+                    &active_workspace,
+                );
+            }
+            AppHostIoCompletion::ComposerClipboard { request, payload } => {
+                let active_workspace = self.active.id.clone();
+                let _ = self.composer.complete_clipboard_attachment(
+                    &self.egui_ctx,
+                    request,
+                    payload,
+                    &active_workspace,
+                );
+            }
+            AppHostIoCompletion::ComposerHistoryWriteFailed => {
+                tracing::warn!(
+                    kind = "composer_history",
+                    phase = "write",
+                    error_code = "history_write_failed",
+                    "composer history persistence failed"
+                );
+            }
+            AppHostIoCompletion::FolderPicker {
+                purpose,
+                selected_path,
+            } => {
+                if let Some(path) = selected_path.filter(|path| {
+                    path.as_os_str().as_encoded_bytes().len() <= APP_HOST_PATH_MAX_BYTES
+                }) {
+                    self.pending_folder_picker_completion = Some((purpose, path));
+                }
+            }
+            AppHostIoCompletion::Complete => {}
+            AppHostIoCompletion::ExternalLinkFailed => {
+                tracing::warn!("Connector external link open failed");
+            }
+        }
+    }
+
+    fn poll_app_host_io(&mut self, ctx: &egui::Context) {
+        let completed =
+            self.app_host_io
+                .as_ref()
+                .and_then(|task| match task.result_rx.try_recv() {
+                    Ok(completion) => Some(Some(completion)),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(None),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                });
+        if let Some(completion) = completed {
+            let task = self.app_host_io.take().expect("host task exists");
+            let fallback = task.fallback;
+            let _ = task.handle.join();
+            self.apply_app_host_completion(
+                completion.unwrap_or_else(|| fallback.into_completion()),
+            );
+        }
+        if self.app_host_io.is_some() {
+            return;
+        }
+        if !self.try_apply_pending_folder_picker_completion() {
+            return;
+        }
+        let action = self
+            .connector_coordinator
+            .try_take_host_action()
+            .map(AppHostIoAction::Connector)
+            .or_else(|| self.pending_app_host_action.take())
+            .or_else(|| {
+                self.pending_composer_history.take().map(|history| {
+                    AppHostIoAction::PersistComposerHistory {
+                        path: self.composer_history_path.clone(),
+                        history,
+                    }
+                })
+            });
+        let Some(action) = action else {
+            return;
+        };
+        match AppHostIoTask::spawn(action, ctx.clone()) {
+            Ok(task) => self.app_host_io = Some(task),
+            Err(fallback) => {
+                self.apply_app_host_completion(fallback.into_completion());
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    fn try_apply_pending_folder_picker_completion(&mut self) -> bool {
+        let Some((purpose, path)) = self.pending_folder_picker_completion.take() else {
+            return true;
+        };
+        let retry_purpose = purpose.clone();
+        let request_workspace = match &purpose {
+            FolderPickerPurpose::SetProjectPath { workspace_id } => workspace_id.clone(),
+            FolderPickerPurpose::SwitchWorkspace
+            | FolderPickerPurpose::SelectWorkspaceInSettings => self.active.id.clone(),
+        };
+        let action = match purpose {
+            FolderPickerPurpose::SetProjectPath { .. } => {
+                SettingsJobAction::SetProjectPath { path: path.clone() }
+            }
+            FolderPickerPurpose::SwitchWorkspace => SettingsJobAction::FindOrCreateWorkspace {
+                name: workspace_name_for_path(&path, self.config.ui.session_name_style),
+                path: path.clone(),
+                purpose: WorkspaceMutationPurpose::SwitchRuntime,
+            },
+            FolderPickerPurpose::SelectWorkspaceInSettings => {
+                SettingsJobAction::FindOrCreateWorkspace {
+                    name: workspace_name_for_path(&path, self.config.ui.session_name_style),
+                    path: path.clone(),
+                    purpose: WorkspaceMutationPurpose::SelectInSettings,
+                }
+            }
+        };
+        if self.queue_global_settings_action(&request_workspace, action) {
+            true
+        } else {
+            self.pending_folder_picker_completion = Some((retry_purpose, path));
+            false
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         mut config: Config,
@@ -1628,19 +5579,38 @@ impl App {
         }
         let redaction = secret::RedactionService::new();
         let i18n = load_catalog(&config.i18n.locale);
+        // Complete crash reconciliation and one-time logical→physical migration before any
+        // runtime, dotenv, Connector, or settings worker can resolve a credential.
+        reconcile_and_migrate_startup_secrets(&db, &KeyringSecretStore)
+            .expect("physical secret startup reconciliation failed");
+        let pending_approval_owner = Arc::new(
+            db.acquire_pending_approval_owner()
+                .expect("pending approval owner acquire failed"),
+        );
+        db.deny_session_scoped_pending_approvals_owned(
+            pending_approval_owner.as_ref(),
+            deppy_core::time::unix_secs_i64(),
+        )
+        .expect("pending approval startup reconciliation failed");
+        let initial_approval_snapshot =
+            load_approval_snapshot(&db).expect("initial approval snapshot load failed");
         // shim을 make_runtime 전에 설치한다 — 첫 셸부터 PATH에 shim이 얹히도록.
         if config.ui.agent_status_hooks
-            && let Ok(bin) = crate::ui::agents::mcp_proxy_bin()
+            && let Ok(bin) = mcp_proxy_bin()
             && let Err(e) = crate::agent_shim::install(&db_path, &bin)
         {
             tracing::warn!("agent shim 설치 실패: {e:#}");
         }
+        let runtime_host_factory = Arc::new(runtime::InProcessRuntimeHostFactory::new(
+            Arc::new(AppRuntimeSecretResolver::new(db_path.clone())),
+            redaction.clone(),
+        ));
         let active = Self::make_runtime(
             &config,
             &logs_base,
             &workspace_id,
             &db_path,
-            &redaction,
+            runtime_host_factory.as_ref(),
             &db,
             &egui_ctx,
         );
@@ -1667,25 +5637,73 @@ impl App {
             }
         }
 
-        // OAuth refresh single-flight 조율자 (H5) — **프로세스 단일 인스턴스**를 App이
-        // 보관하고 소비자(connectors, 후속 P2 web 브리지 등)는 Arc 클론을 공유한다.
-        // 인스턴스가 갈라지면 동시 도구 호출의 refresh 중복 발사(회전 refresh token
-        // 재사용 → AS replay 감지로 grant 폐기)를 막지 못한다 (H4 규약).
-        let refresh_coordinator = Arc::new(auth::RefreshCoordinator::new());
+        let connector_initial_overview = AppConnectorRepository::overview_from(
+            db.mcp_server_inventory_versioned(
+                connector_contract::ResourceLimits::PRODUCTION_CEILING.import_servers,
+            )
+            .expect("initial Connector overview load failed"),
+        )
+        .expect("initial Connector overview validation failed");
+        let connector_host: Arc<dyn connector_service::ConnectorHost> =
+            Arc::new(AppConnectorHost {
+                ctx: egui_ctx.clone(),
+            });
+        let connector_secrets: Arc<dyn connector_service::ConnectorSecrets> =
+            Arc::new(AppConnectorSecrets {
+                secret_store: KeyringSecretStore,
+                redaction: redaction.clone(),
+            });
+        let connector_mcp: Arc<dyn connector_service::ConnectorMcp> = Arc::new(
+            connector_service::ProductionConnectorMcp::new(
+                mcp::LocalMcpManager::new(redaction.clone()),
+                Arc::clone(&connector_secrets),
+                CONNECTOR_IDLE_TTL,
+                connector_contract::ResourceLimits::PRODUCTION_CEILING.backend_leases,
+            )
+            .expect("Connector MCP adapter configuration is valid"),
+        );
+        let connector_oauth: Arc<dyn connector_service::ConnectorOAuth> = Arc::new(
+            connector_service::ProductionConnectorOAuth::new(
+                CONNECTOR_OAUTH_HTTP_TIMEOUT,
+                CONNECTOR_OAUTH_CALLBACK_TIMEOUT,
+                mcp::PROTOCOL_VERSION,
+            )
+            .expect("Connector OAuth adapter configuration is valid"),
+        );
+        let connector_coordinator = connector_service::ConnectorCoordinator::new(
+            connector_service::ConnectorCoordinatorConfig {
+                limits: connector_contract::ResourceLimits::PRODUCTION_CEILING,
+                idle_ttl: CONNECTOR_IDLE_TTL,
+                initial_overview: Some(connector_initial_overview),
+                repository_factory: Arc::new(AppConnectorRepositoryFactory {
+                    db_path: db_path.clone(),
+                    redaction: redaction.clone(),
+                }),
+                secrets: connector_secrets,
+                mcp: connector_mcp,
+                oauth: connector_oauth,
+                host: connector_host,
+                clock: Arc::new(connector_service::SystemCoordinatorClock::default()),
+                operation_ids: Arc::new(connector_service::SystemOperationIdFactory::default()),
+            },
+        )
+        .expect("Connector coordinator limits are valid");
+        let connector_snapshot_reader = connector_coordinator.snapshot_reader();
 
-        let approval_poll_requested = Arc::new(AtomicBool::new(false));
-        let approval_watcher = ApprovalWatcher::spawn(
+        let approval_wake_hub = ApprovalWakeHub::new(
             db_path.clone(),
             egui_ctx.clone(),
-            approval_poll_requested.clone(),
-            std::time::Duration::from_millis(Self::APPROVAL_POLL_MS),
+            Arc::clone(&pending_approval_owner),
         );
         // agent 감지 백그라운드 워커 (ps/lsof/transcript 스캔을 UI 스레드 밖에서, codex #3).
         let (agent_detect_worker, agent_detect_input, agent_detect_rx) =
             crate::agent_detect_worker::AgentDetectWorker::spawn(egui_ctx.clone());
         let env_project_rows_worker =
             EnvProjectRowsWorker::spawn(db_path.clone(), egui_ctx.clone());
-        let env_secret_reveal_worker = EnvSecretRevealWorker::spawn(egui_ctx.clone());
+        let env_secret_reveal_worker =
+            EnvSecretRevealWorker::spawn(db_path.clone(), egui_ctx.clone());
+        let settings_snapshot_worker =
+            SettingsSnapshotWorker::new(db_path.clone(), redaction.clone(), egui_ctx.clone());
         let dotenv_sync_worker =
             DotenvSyncWorker::spawn(db_path.clone(), redaction.clone(), egui_ctx.clone());
         let status_feed_rx_channel = crate::status_feed::spawn(egui_ctx.clone());
@@ -1693,6 +5711,10 @@ impl App {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("notice_translations.json");
+        let composer_history_path = db_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("composer_history.jsonl");
         let notice_translation_cache =
             match crate::notice_translate::TranslationCache::load(&notice_translation_cache_path) {
                 Ok(cache) => cache,
@@ -1726,6 +5748,13 @@ impl App {
         let last_ui_font = config.ui.ui_font.clone();
         let last_mono_font = config.terminal.mono_font.clone();
         let last_mono_weight = config.terminal.mono_weight.clone();
+        let agent_sessions_secrets_snapshot = match secret::SecretStore::has_secret(
+            &KeyringSecretStore,
+            CODEX_LLM_API_KEY_ENTRY_ID,
+        ) {
+            Ok(present) => ui::agent_sessions::AgentSessionsSecretsSnapshot::new(0, present),
+            Err(_) => ui::agent_sessions::AgentSessionsSecretsSnapshot::unavailable(0),
+        };
         let mut app = Self {
             config,
             config_path,
@@ -1766,32 +5795,44 @@ impl App {
             env_project_rows_failed: false,
             env_secret_reveal_worker,
             env_secret_generation: 0,
-            env_secret_cache: std::collections::HashMap::new(),
-            env_secret_pending: std::collections::HashSet::new(),
-            env_secret_failures: std::collections::HashSet::new(),
+            settings_snapshot_worker,
+            settings_snapshot_generation: 0,
+            settings_snapshot_revision: 0,
+            settings_snapshot_pending: false,
+            settings_pending_operation: None,
+            settings_snapshot_retry_at: None,
+            settings_snapshot_workspace_id: None,
+            agents_snapshot: ui::agents::AgentsSnapshot::unavailable(0),
+            env_profiles_snapshot: ui::env_profiles::EnvProfilesSnapshot::unavailable(
+                0,
+                workspace_id.clone(),
+                false,
+            ),
+            credentials_snapshot: ui::credentials::CredentialsSnapshot::unavailable(0),
+            agent_sessions_secrets_snapshot,
             db,
             secret_store: KeyringSecretStore,
             agents_ui: ui::agents::AgentsUi::new(),
             agent_sessions_ui: ui::agent_sessions::AgentSessionsUi::new()
                 .with_catalog(&i18n)
-                .with_api_key_store(Arc::new(AppCodexLlmApiKeyStore {
+                .with_app_server_host(Arc::new(AppCodexAppServerHost {
                     secret_store: KeyringSecretStore,
                 })),
             diff_panel_ui: ui::diff_panel::DiffPanelUi::new(),
             agent_persistence_queue: Vec::new(),
             agent_persistence_retry_at: None,
-            connectors_ui: ui::connectors::ConnectorsUi::new(
-                redaction.clone(),
-                Arc::new(KeyringSecretStore),
-                Arc::clone(&refresh_coordinator),
-            ),
-            refresh_coordinator,
+            connector_coordinator,
+            connector_snapshot_reader,
+            connector_ui: connector_ui::ConnectorUi::new(&i18n),
+            app_host_io: None,
+            pending_app_host_action: None,
+            pending_composer_history: None,
+            pending_folder_picker_completion: None,
             credentials_ui: ui::credentials::CredentialsUi::new(),
             env_profiles_ui: ui::env_profiles::EnvProfilesUi::new(),
             activity_ui: ui::activity::ActivityUi::new(),
             agent_terminal_ui: ui::agent_terminal::AgentTerminalUi::new(),
             activity_rows_cache: None,
-            mcp_count_cache: None,
             status_feed_rx: status_feed_rx_channel.0,
             status_feed_refresh: status_feed_rx_channel.1,
             status_feed: crate::status_feed::StatusFeedSnapshot::default(),
@@ -1808,16 +5849,15 @@ impl App {
             notifications_ui: ui::notifications::NotificationsUi::new(),
             inbox_waiting_ui: ui::inbox_waiting::InboxWaitingUi::new(),
             // 히스토리 파일은 앱 데이터 디렉터리(= 메타데이터 파일과 같은 폴더) 아래.
-            composer: ui::composer::ComposerUi::new(
-                db_path
-                    .parent()
-                    .unwrap_or_else(|| std::path::Path::new("."))
-                    .join("composer_history.jsonl"),
-            ),
+            composer: ui::composer::ComposerUi::new(composer_history_path.clone()),
+            composer_history_path,
             approvals_ui: ui::approvals::ApprovalsUi::new(),
             approval_notified: std::collections::HashSet::new(),
-            approval_poll_requested,
-            approval_watcher,
+            _pending_approval_owner: pending_approval_owner,
+            approval_wake_hub,
+            approval_launch_tracker: ApprovalLaunchTracker::default(),
+            approval_global_reconcile: ApprovalGlobalReconcile::default(),
+            pending_proxy_launches: std::collections::VecDeque::new(),
             last_offscreen_fix: std::time::Instant::now(),
             startup_positioned: false,
             active,
@@ -1829,8 +5869,9 @@ impl App {
             egui_ctx,
             db_path,
             logs_base,
-            redaction,
+            runtime_host_factory,
             workspaces: Vec::new(),
+            workspace_anchors: std::collections::HashMap::new(),
             persisted_activity_panes: std::collections::HashMap::new(),
             agent_activity: std::collections::HashMap::new(),
             agent_bindings: std::collections::HashMap::new(),
@@ -1881,7 +5922,7 @@ impl App {
         if let Err(e) = app.db.prune_agent_hook_state() {
             tracing::warn!("hook 상태 정리 실패: {e:#}");
         }
-        app.poll_pending_approvals();
+        app.apply_approval_snapshot(initial_approval_snapshot);
         // 파일 트리 헤더(workspace 이름) 표시용 — 시작 시 1회 로드
         app.refresh_workspaces();
         if app.config.ui.file_tree_enabled {
@@ -1924,8 +5965,6 @@ impl App {
     /// 계속 보호하고, 단일 저CPU 셸 리더만 남은 경우에만 fresh 셸 복원 전제로 내린다.
     const WARM_AUTO_SUSPEND_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
-    /// 승인 watcher 폴링 간격(ms). frame 예약은 하지 않고, pending 상태 변화 때만 UI를 깨운다.
-    const APPROVAL_POLL_MS: u64 = 500;
     const RESOLVED_APPROVAL_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 
     /// 한 workspace의 런타임 워커를 만든다: 생성 → wake 구독 → 저장 layout 복원 →
@@ -1936,7 +5975,7 @@ impl App {
         logs_base: &std::path::Path,
         workspace_id: &str,
         db_path: &std::path::Path,
-        redaction: &secret::RedactionService,
+        runtime_host_factory: &runtime::InProcessRuntimeHostFactory,
         db: &Db,
         egui_ctx: &egui::Context,
     ) -> WorkspaceRuntime {
@@ -1950,25 +5989,23 @@ impl App {
             .flatten()
             .map(PathBuf::from)
             .filter(|p| p.is_dir());
-        let runtime = InProcessRuntimeClient::new(
-            config.performance.output_batch_ms,
-            Arc::new(KeyringSecretStore),
-            logs_root,
-            redaction.clone(),
-            Some(runtime::PersistConfig {
-                db_path: db_path.to_path_buf(),
-                workspace_id: workspace_id.to_owned(),
-            }),
-            shell_cwd.clone(),
-            Self::shim_shell_env(config),
-        );
+        let runtime = runtime_host_factory
+            .create_client(runtime::RuntimeHostConfig {
+                output_batch_ms: config.performance.output_batch_ms,
+                logs_root,
+                persist: Some(runtime::PersistConfig {
+                    db_path: db_path.to_path_buf(),
+                    workspace_id: workspace_id.to_owned(),
+                }),
+                cwd: shell_cwd.clone(),
+                extra_env: Self::shim_shell_env(config),
+            })
+            .expect("runtime worker thread 생성");
         // 상태 이벤트 도착 시 UI를 깨운다 (§14.1 Warm 알림 유지). subscribe→restore 순서
         // 를 코드로 보장하려 subscribe 직후 복원 명령을 보낸다.
         let runtime_events = Self::subscribe_runtime_events(&runtime, egui_ctx);
         // RestoreWorkspace는 background dotenv 결과를 적용한 뒤 보낸다. `.env`/keychain I/O를
         // UI thread에서 수행하지 않으면서도 복원된 첫 셸부터 올바른 기본 env를 받게 한다.
-        // 저장된 credential을 로그 redaction 대상으로 시드 (값 resolve는 worker에서)
-        Self::seed_redaction(&runtime, db);
         WorkspaceRuntime {
             id: workspace_id.to_owned(),
             runtime,
@@ -2117,6 +6154,7 @@ impl App {
         }
         self.join_pending_shutdown(delete_id);
         if let Some(mut runtime) = self.warm.remove(delete_id) {
+            self.close_approval_workspace(delete_id);
             runtime.runtime.shutdown();
         }
         self.warm_order.retain(|id| id != delete_id);
@@ -2142,30 +6180,6 @@ impl App {
             // handle_events()에서 스냅샷이 반영된 뒤 그려지므로 settle 프레임이 필요 없다.
             move || ctx.request_repaint_after(std::time::Duration::from_millis(1))
         }))
-    }
-
-    /// 저장된 credential id를 worker의 로그 redaction 대상으로 시드한다 (값 resolve는 worker).
-    /// 활성 workspace worker와 remote 전용 worker가 공유하는 시드 로직.
-    fn seed_redaction(runtime: &InProcessRuntimeClient, db: &Db) {
-        match db.list_credentials() {
-            Ok(credentials) => {
-                let mut ids: Vec<String> = Vec::with_capacity(credentials.len());
-                for c in credentials {
-                    if c.credential_kind == "oauth_token" {
-                        ids.push(auth::refresh_entry_id(&c.id));
-                    }
-                    ids.push(c.id);
-                }
-                if !ids.is_empty()
-                    && let Err(e) = runtime.send_command(runtime::RuntimeCommand::SeedRedaction {
-                        credential_ids: ids,
-                    })
-                {
-                    tracing::warn!("redaction 시드 전송 실패: {e:#}");
-                }
-            }
-            Err(e) => tracing::warn!("credential 목록 조회 실패 (redaction 시드 생략): {e:#}"),
-        }
     }
 
     /// 에이전트 감지 워커의 입력 갱신 + 결과 드레인 — ui()가 아닌 logic()에서 돈다.
@@ -2702,7 +6716,7 @@ impl App {
             crate::agent_hooks::uninstall_claude()?;
             crate::agent_hooks::uninstall_codex()?;
             if self.config.ui.agent_status_hooks {
-                let bin = crate::ui::agents::mcp_proxy_bin()?;
+                let bin = mcp_proxy_bin()?;
                 crate::agent_shim::install(&self.db_path, &bin)?;
             } else {
                 crate::agent_shim::remove()?;
@@ -2739,16 +6753,15 @@ impl App {
             runtime::tls_identity::get_or_create_identity(&self.secret_store, &self.cert_path())?;
         let fingerprint = identity.fingerprint();
         // 전용 원격 worker — logs는 logs_base/remote/ 하위(활성 workspace 로그와 분리).
-        let worker = InProcessRuntimeClient::new(
-            self.config.performance.output_batch_ms,
-            Arc::new(KeyringSecretStore),
-            self.logs_base.join("remote"),
-            self.redaction.clone(),
-            None,       // 원격 세션은 영속하지 않는다
-            None,       // 원격은 workspace 폴더 개념 없음 — cwd 상속
-            Vec::new(), // 원격 셸엔 shim 미주입
-        );
-        Self::seed_redaction(&worker, &self.db);
+        let worker = self
+            .runtime_host_factory
+            .create_client(runtime::RuntimeHostConfig {
+                output_batch_ms: self.config.performance.output_batch_ms,
+                logs_root: self.logs_base.join("remote"),
+                persist: None,
+                cwd: None,
+                extra_env: Vec::new(),
+            })?;
         let addr =
             std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, self.config.remote.port));
         // loopback 전용(allow_non_loopback=false) — 비-loopback 개방은 후속 UI(C-4 가드 유지).
@@ -3251,12 +7264,13 @@ impl App {
                     &self.logs_base,
                     target_id,
                     &self.db_path,
-                    &self.redaction,
+                    self.runtime_host_factory.as_ref(),
                     &self.db,
                     &self.egui_ctx,
                 )
             }
         };
+        let resumed_pending_agents = std::mem::take(&mut new_active.pending_agent_spawns);
         // UI 상태는 리셋하지 않는다 — warm 재사용이면 그동안 누적된 pending_events(=lifecycle
         // 이벤트 포함)를 그대로 ui()가 처리해 exit/status 상태를 재구성해야 하고, workspace_ui는
         // 마지막 active 상태 + 아래 Active 재emit(전체 mux 스냅샷)으로 최신화된다. (새 워커는
@@ -3305,7 +7319,8 @@ impl App {
         if let Some(old_rt) = self.warm.get_mut(&old_id) {
             old_rt.pending_agent_spawns += pending_agents;
         }
-        self.connectors_ui.clear_invoke();
+        self.agents_ui.restore_pending(resumed_pending_agents);
+        self.connector_ui.clear_sensitive_drafts();
         // 파일 트리 루트를 새 workspace path로 갱신 (FT-1)
         self.config.ui.last_workspace_id = Some(target_id.to_owned());
         if let Err(e) = self.config.save(&self.config_path) {
@@ -3681,10 +7696,15 @@ impl App {
             // 마지막으로 큐에 남은 이벤트를 처리해 방금 끝난 background 작업의 완료/오류
             // 알림을 놓치지 않는다 (codex 리뷰 — 축출 시 receiver drop으로 유실되던 것).
             let events = rt.events.drain();
-            if rt.events.take_overflowed() {
+            let approval_events_overflowed = rt.events.take_overflowed();
+            if approval_events_overflowed {
                 self.runtime_stream_warning = true;
             }
             Self::record_activity_events(&mut rt, &events);
+            self.observe_approval_runtime_events(workspace_id, &events);
+            if approval_events_overflowed {
+                self.fail_closed_approval_event_overflow();
+            }
             let agent_providers = rt.workspace_ui.agent_providers();
             Self::process_ws_notifications(
                 &mut self.notifications_ui,
@@ -3706,7 +7726,9 @@ impl App {
                 );
                 // drain한 lifecycle 이벤트를 replay 큐에 보존 — 버리면 재활성 시
                 // exit/status 상태가 UI에 재구성되지 않는다 (codex Medium).
-                rt.pending_events.extend(events);
+                rt.pending_events.extend(events.into_iter().filter(|event| {
+                    !matches!(event, runtime::RuntimeEvent::AgentSpawnResolved { .. })
+                }));
                 self.warm.insert(workspace_id.to_owned(), rt);
                 self.warm_order.push(workspace_id.to_owned());
                 return;
@@ -3810,6 +7832,7 @@ impl App {
                 for pane in panes {
                     rt.workspace_ui.close_pane_now(&rt.runtime, pane);
                 }
+                self.close_approval_workspace(workspace_id);
                 rt.runtime.shutdown();
             }
             self.warm_order.retain(|id| id != workspace_id);
@@ -3874,47 +7897,18 @@ impl App {
         self.request_dotenv_sync(true);
     }
 
-    /// 설정 창에서 선택한 비활성 workspace의 `.env`를 DB/keyring에 명시적으로 동기화한다.
-    /// 활성 workspace는 기존 bounded worker 경로를 사용해 runtime 기본 env까지 갱신한다.
-    /// 비활성 workspace에는 runtime이 없으므로 명시적 저장/새로고침 동작에서만 동기로
-    /// 반영하고, sidebar visibility나 active runtime은 절대 변경하지 않는다.
-    fn sync_settings_workspace_dotenv(&mut self, workspace_id: &str) {
+    /// 설정 창에서 선택한 workspace의 `.env` 동기화를 bounded worker에 제출한다.
+    /// 활성 workspace는 runtime 기본 env 갱신까지 수행하는 기존 dotenv worker를 쓰고,
+    /// 비활성 workspace는 Settings worker가 DB/keyring/file I/O를 전담한다.
+    fn sync_settings_workspace_dotenv(&mut self, workspace_id: &str) -> bool {
         if workspace_id == self.active.id {
             self.sync_dotenv_env();
-            return;
+            return true;
         }
         let Some(root) = self.workspace_tree_root(workspace_id) else {
-            return;
+            return false;
         };
-        if let Err(error) = crate::dotenv_sync::migrate_legacy_profiles_to_dotenv(
-            &mut self.db,
-            &self.secret_store,
-            workspace_id,
-            &root,
-        ) {
-            tracing::warn!(
-                workspace_id,
-                "설정 workspace 레거시 env 이전 실패: {error:#}"
-            );
-        }
-        match crate::dotenv_sync::sync_workspace_dotenv(
-            &self.db,
-            &self.secret_store,
-            &self.redaction,
-            workspace_id,
-            &root,
-        ) {
-            Ok(Some(report)) => tracing::info!(
-                workspace_id,
-                upserted = report.upserted,
-                removed = report.removed,
-                "설정 workspace .env 동기화"
-            ),
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(workspace_id, "설정 workspace .env 동기화 실패: {error:#}");
-            }
-        }
+        self.queue_settings_action(workspace_id, Some(root), SettingsJobAction::ResyncDotenv)
     }
 
     fn request_dotenv_sync(&mut self, force: bool) {
@@ -4167,22 +8161,37 @@ impl App {
     }
 
     /// 지정 workspace의 프로젝트 폴더 앵커(dev,ino)를 현재 경로 기준으로 저장한다.
-    fn save_workspace_anchor_for(&self, workspace_id: &str) {
+    fn save_workspace_anchor_for(&mut self, workspace_id: &str) {
         let anchor = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .map(|workspace| workspace.path.as_str())
+            .filter(|path| !path.trim().is_empty())
+            .and_then(Self::folder_anchor);
+        if self
             .db
-            .workspace_path(workspace_id)
-            .ok()
-            .flatten()
-            .filter(|p| !p.trim().is_empty())
-            .and_then(|p| Self::folder_anchor(&p));
-        let _ =
-            self.db
-                .set_workspace_anchor(workspace_id, anchor.map(|a| a.0), anchor.map(|a| a.1));
+            .set_workspace_anchor(workspace_id, anchor.map(|a| a.0), anchor.map(|a| a.1))
+            .is_ok()
+        {
+            match anchor {
+                Some((dev, ino)) => {
+                    self.workspace_anchors.insert(
+                        workspace_id.to_owned(),
+                        storage::WorkspaceFolderAnchor { dev, ino },
+                    );
+                }
+                None => {
+                    self.workspace_anchors.remove(workspace_id);
+                }
+            }
+        }
     }
 
     /// 활성 workspace의 프로젝트 폴더 앵커(dev,ino)를 저장한다.
-    fn save_workspace_anchor(&self) {
-        self.save_workspace_anchor_for(&self.active.id);
+    fn save_workspace_anchor(&mut self) {
+        let workspace_id = self.active.id.clone();
+        self.save_workspace_anchor_for(&workspace_id);
     }
 
     /// 프로젝트 폴더 rename/이동 감지(2s 폴링). 저장된 경로가 stale(사라짐)이고, 세션 cwd 중
@@ -4194,15 +8203,18 @@ impl App {
         }
         let ws = self.active.id.clone();
         let Some(path) = self
-            .db
-            .workspace_path(&ws)
-            .ok()
-            .flatten()
-            .filter(|p| !p.trim().is_empty())
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == ws)
+            .map(|workspace| workspace.path.clone())
+            .filter(|path| !path.trim().is_empty())
         else {
             return; // 폴더 미설정 — 감지 대상 아님
         };
-        let anchor = self.db.workspace_anchor(&ws).ok().flatten();
+        let anchor = self
+            .workspace_anchors
+            .get(&ws)
+            .map(|anchor| (anchor.dev, anchor.ino));
         let current = Self::folder_anchor(&path); // path가 유효 디렉터리면 그 (dev,ino)
         // 정상 상태 판정: path가 유효하고 앵커가 없거나(backfill) 앵커와 inode가 일치.
         if let Some(cur) = current {
@@ -4253,15 +8265,13 @@ impl App {
         self.request_dotenv_sync(false);
     }
 
-    /// 지정 workspace의 프로젝트 루트 (path 미설정/조회 실패 → None).
+    /// 지정 workspace의 프로젝트 루트. App이 이미 소유한 immutable workspace projection을
+    /// 사용해 render/action 경로에서 SQLite를 다시 조회하지 않는다.
     fn workspace_tree_root(&self, workspace_id: &str) -> Option<PathBuf> {
-        match self.db.workspace_path(workspace_id) {
-            Ok(path) => Self::workspace_path_to_tree_root(path),
-            Err(e) => {
-                tracing::warn!(workspace_id, "workspace 경로 조회 실패: {e:#}");
-                None
-            }
-        }
+        self.workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .and_then(|workspace| Self::workspace_path_to_tree_root(Some(workspace.path.clone())))
     }
 
     /// 활성 workspace의 트리 루트 (path 미설정/조회 실패 → None → 안내 표시 §9-2).
@@ -4327,6 +8337,71 @@ impl App {
         }
     }
 
+    fn upsert_workspace_projection(&mut self, row: storage::SettingsWorkspaceProjectionRow) {
+        let anchor = row.folder_anchor;
+        let workspace = crate::storage::WorkspaceRow {
+            id: row.id,
+            name: row.name,
+            path: row.path,
+            created_at: row.created_at,
+        };
+        match self
+            .workspaces
+            .iter_mut()
+            .find(|existing| existing.id == workspace.id)
+        {
+            Some(existing) => *existing = workspace.clone(),
+            None => self.workspaces.push(workspace.clone()),
+        }
+        self.workspaces.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then(left.id.cmp(&right.id))
+        });
+        match anchor {
+            Some(anchor) => {
+                self.workspace_anchors.insert(workspace.id, anchor);
+            }
+            None => {
+                self.workspace_anchors.remove(&workspace.id);
+            }
+        }
+        self.invalidate_env_api_projects();
+    }
+
+    fn update_workspace_projection_name(&mut self, workspace_id: &str, name: String) {
+        if let Some(workspace) = self
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+        {
+            workspace.name = name;
+        }
+        self.invalidate_env_api_projects();
+    }
+
+    fn update_workspace_projection_path(&mut self, workspace_id: &str, path: &Path) {
+        if let Some(workspace) = self
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+        {
+            workspace.path = path.to_string_lossy().into_owned();
+        }
+        match Self::folder_anchor(&path.to_string_lossy()) {
+            Some((dev, ino)) => {
+                self.workspace_anchors.insert(
+                    workspace_id.to_owned(),
+                    storage::WorkspaceFolderAnchor { dev, ino },
+                );
+            }
+            None => {
+                self.workspace_anchors.remove(workspace_id);
+            }
+        }
+        self.invalidate_env_api_projects();
+    }
+
     fn invalidate_env_api_projects(&mut self) {
         self.env_api_projects_cache = None;
         self.env_project_rows_generation = self.env_project_rows_generation.wrapping_add(1);
@@ -4336,12 +8411,752 @@ impl App {
 
     fn invalidate_env_profile_ui(&mut self) {
         self.env_profiles_ui.invalidate_cache();
-        self.agents_ui.invalidate_profiles_cache();
+        self.agents_ui.invalidate_snapshot_selection();
+        self.settings_snapshot_generation = self.settings_snapshot_generation.wrapping_add(1);
+        self.settings_snapshot_pending = false;
+        self.settings_pending_operation = None;
+        self.settings_snapshot_retry_at = None;
+        self.settings_snapshot_workspace_id = None;
+        self.agents_snapshot =
+            ui::agents::AgentsSnapshot::unavailable(self.settings_snapshot_revision);
+        let workspace_id = self
+            .settings_workspace_id
+            .as_deref()
+            .unwrap_or(&self.active.id)
+            .to_owned();
+        self.env_profiles_snapshot = ui::env_profiles::EnvProfilesSnapshot::unavailable(
+            self.settings_snapshot_revision,
+            workspace_id,
+            false,
+        );
+        self.credentials_snapshot =
+            ui::credentials::CredentialsSnapshot::unavailable(self.settings_snapshot_revision);
         self.credentials_ui.clear_revealed_secrets();
         self.env_secret_generation = self.env_secret_generation.wrapping_add(1);
-        self.env_secret_cache.clear();
-        self.env_secret_pending.clear();
-        self.env_secret_failures.clear();
+    }
+
+    fn request_settings_snapshot_if_needed(
+        &mut self,
+        workspace_id: &str,
+        project_root: Option<PathBuf>,
+    ) {
+        let now = std::time::Instant::now();
+        if self.settings_snapshot_workspace_id.as_deref() == Some(workspace_id) {
+            match self.settings_snapshot_retry_at {
+                Some(retry_at) if retry_at <= now && !self.settings_snapshot_pending => {
+                    self.settings_snapshot_retry_at = None;
+                }
+                _ => return,
+            }
+        }
+        if self.settings_snapshot_workspace_id.is_some() {
+            self.settings_snapshot_generation = self.settings_snapshot_generation.wrapping_add(1);
+            self.settings_snapshot_pending = false;
+            self.settings_pending_operation = None;
+            self.settings_snapshot_retry_at = None;
+            self.settings_snapshot_workspace_id = None;
+            self.agents_ui.invalidate_snapshot_selection();
+            self.env_profiles_ui.invalidate_cache();
+            self.agents_snapshot =
+                ui::agents::AgentsSnapshot::unavailable(self.settings_snapshot_revision);
+            self.env_profiles_snapshot = ui::env_profiles::EnvProfilesSnapshot::unavailable(
+                self.settings_snapshot_revision,
+                workspace_id,
+                project_root.is_some(),
+            );
+            self.credentials_snapshot =
+                ui::credentials::CredentialsSnapshot::unavailable(self.settings_snapshot_revision);
+        }
+        if self.settings_snapshot_pending {
+            return;
+        }
+        if self.settings_snapshot_generation == 0 {
+            self.settings_snapshot_generation = 1;
+        }
+        self.settings_snapshot_revision = self.settings_snapshot_revision.wrapping_add(1);
+        let job = SettingsJob {
+            generation: self.settings_snapshot_generation,
+            revision: self.settings_snapshot_revision,
+            workspace_id: workspace_id.to_owned(),
+            project_root,
+            action: SettingsJobAction::Load,
+        };
+        let operation = SettingsOperationKey::for_job(&job);
+        if self.settings_snapshot_worker.try_request(job) {
+            self.settings_snapshot_workspace_id = Some(workspace_id.to_owned());
+            self.settings_snapshot_pending = true;
+            self.settings_pending_operation = Some(operation);
+        }
+    }
+
+    fn queue_settings_action(
+        &mut self,
+        workspace_id: &str,
+        project_root: Option<PathBuf>,
+        action: SettingsJobAction,
+    ) -> bool {
+        if self.settings_snapshot_pending
+            || self.settings_snapshot_workspace_id.as_deref() != Some(workspace_id)
+        {
+            return false;
+        }
+        self.settings_snapshot_revision = self.settings_snapshot_revision.wrapping_add(1);
+        let job = SettingsJob {
+            generation: self.settings_snapshot_generation,
+            revision: self.settings_snapshot_revision,
+            workspace_id: workspace_id.to_owned(),
+            project_root,
+            action,
+        };
+        let operation = SettingsOperationKey::for_job(&job);
+        if self.settings_snapshot_worker.try_request(job) {
+            self.settings_snapshot_pending = true;
+            self.settings_pending_operation = Some(operation);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn queue_global_settings_action(
+        &mut self,
+        workspace_id: &str,
+        action: SettingsJobAction,
+    ) -> bool {
+        if self.settings_snapshot_pending {
+            return false;
+        }
+        if self.settings_snapshot_generation == 0 {
+            self.settings_snapshot_generation = 1;
+        }
+        self.settings_snapshot_revision = self.settings_snapshot_revision.wrapping_add(1);
+        let job = SettingsJob {
+            generation: self.settings_snapshot_generation,
+            revision: self.settings_snapshot_revision,
+            workspace_id: workspace_id.to_owned(),
+            project_root: None,
+            action,
+        };
+        let operation = SettingsOperationKey::for_job(&job);
+        if self.settings_snapshot_worker.try_request(job) {
+            self.settings_snapshot_pending = true;
+            self.settings_pending_operation = Some(operation);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn send_prepared_agent_launch(&mut self, prepared: PreparedAgentLaunch) {
+        let ticket_id = prepared.approval_ticket;
+        if prepared.runtime_workspace_id != self.active.id || prepared.proxy.is_some() {
+            if let Some(ticket_id) = ticket_id {
+                self.approval_launch_tracker.cancel(ticket_id);
+            }
+            self.agents_ui
+                .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
+            return;
+        }
+        if let Some(ticket_id) = ticket_id
+            && !self
+                .approval_launch_tracker
+                .mark_spawn_sent(ticket_id, std::time::Instant::now())
+        {
+            // A preparing ticket may expire while filesystem/config finalization is blocked.
+            // Never turn that stale completion into an untracked live proxy process.
+            self.agents_ui
+                .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
+            return;
+        }
+        let sent = self
+            .active
+            .runtime
+            .send_command(runtime::RuntimeCommand::SpawnAgent {
+                agent_config_id: Some(prepared.agent_config_id),
+                cols: 80,
+                rows: 24,
+                scrollback_lines: self.config.terminal.scrollback_lines as usize,
+                command: prepared.command,
+                args: prepared.args,
+                env_plain: prepared.env_plain,
+                env_secrets: prepared.env_secrets,
+                waiting_regex: prepared.waiting_regex,
+                approval_regex: prepared.approval_regex,
+                error_regex: prepared.error_regex,
+                done_regex: prepared.done_regex,
+            });
+        if sent.is_ok() {
+            self.agents_ui.mark_launch_accepted();
+            self.reveal_active_workspace_for_new_session();
+        } else {
+            if let Some(ticket_id) = ticket_id {
+                self.approval_launch_tracker.cancel(ticket_id);
+            }
+            self.agents_ui
+                .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
+        }
+    }
+
+    fn stage_prepared_proxy_launch(
+        &mut self,
+        generation: u64,
+        settings_workspace_id: String,
+        mut prepared: PreparedAgentLaunch,
+    ) {
+        let now = std::time::Instant::now();
+        let ticket_id = match self.approval_launch_tracker.reserve(
+            prepared.runtime_workspace_id.clone(),
+            prepared.agent_config_id.clone(),
+            now,
+        ) {
+            Ok(ticket_id) => ticket_id,
+            Err(_) => {
+                self.agents_ui
+                    .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
+                return;
+            }
+        };
+        prepared.approval_ticket = Some(ticket_id);
+        if self.approval_wake_hub.ensure_started().is_err() {
+            self.approval_launch_tracker.cancel(ticket_id);
+            self.agents_ui
+                .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
+            return;
+        }
+        self.pending_proxy_launches.push_back(PendingProxyLaunch {
+            generation,
+            workspace_id: settings_workspace_id,
+            prepared,
+        });
+        self.egui_ctx.request_repaint_after(APPROVAL_SPAWN_DEADLINE);
+    }
+
+    fn observe_approval_runtime_events(
+        &mut self,
+        workspace_id: &str,
+        events: &[runtime::RuntimeEvent],
+    ) {
+        let mut changed = false;
+        for event in events {
+            match event {
+                runtime::RuntimeEvent::AgentSpawnResolved {
+                    agent_config_id,
+                    session,
+                } => {
+                    changed |= self.approval_launch_tracker.correlate(
+                        workspace_id,
+                        agent_config_id.as_str(),
+                        *session,
+                    );
+                }
+                runtime::RuntimeEvent::SessionExited { session, .. } => {
+                    changed |= self
+                        .approval_launch_tracker
+                        .observe_session_exit(workspace_id, *session);
+                }
+                _ => {}
+            }
+        }
+        if changed {
+            self.egui_ctx.request_repaint();
+        }
+    }
+
+    fn fail_pending_proxy_launches(&mut self) {
+        let mut failed = false;
+        while let Some(launch) = self.pending_proxy_launches.pop_front() {
+            if let Some(ticket_id) = launch.prepared.approval_ticket {
+                self.approval_launch_tracker.cancel(ticket_id);
+            }
+            failed = true;
+        }
+        if failed {
+            self.agents_ui
+                .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
+        }
+    }
+
+    fn fail_closed_approval_event_overflow(&mut self) {
+        if self.approval_launch_tracker.is_empty() && self.pending_proxy_launches.is_empty() {
+            return;
+        }
+        self.fail_pending_proxy_launches();
+        self.approval_launch_tracker.clear_fail_closed();
+        let _ = self.agents_ui.take_pending();
+        self.active.pending_agent_spawns = 0;
+        for runtime in self.warm.values_mut() {
+            runtime.pending_agent_spawns = 0;
+        }
+        self.agents_ui
+            .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
+        self.approval_global_reconcile.request();
+        self.queue_global_approval_reconcile_if_due();
+    }
+
+    fn queue_global_approval_reconcile_if_due(&mut self) {
+        let now = std::time::Instant::now();
+        if !self.approval_global_reconcile.is_due(now) {
+            return;
+        }
+        match self
+            .approval_wake_hub
+            .enqueue(ApprovalWorkerCommand::DenyAllOwned {
+                resolved_at: deppy_core::time::unix_secs_i64(),
+            }) {
+            Ok(()) => self.approval_global_reconcile.mark_queued(),
+            Err(_) => {
+                if let Some(delay) = self.approval_global_reconcile.finish(false, now) {
+                    self.egui_ctx.request_repaint_after(delay);
+                }
+            }
+        }
+    }
+
+    fn close_approval_workspace(&mut self, workspace_id: &str) {
+        let canceled = self.approval_launch_tracker.close_workspace(workspace_id);
+        self.pending_proxy_launches
+            .retain(|launch| launch.prepared.runtime_workspace_id != workspace_id);
+        if canceled > 0 {
+            self.agents_ui
+                .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
+        }
+        if !self
+            .approval_launch_tracker
+            .pending_denials(std::time::Instant::now())
+            .is_empty()
+        {
+            self.egui_ctx.request_repaint();
+        }
+    }
+
+    fn poll_approval_wake(&mut self) {
+        let ready_path = match self.approval_wake_hub.poll_ready() {
+            Ok(path) => path,
+            Err(_) => {
+                self.fail_pending_proxy_launches();
+                self.approval_wake_hub.stop();
+                if self.approval_global_reconcile.required
+                    && let Some(delay) = self
+                        .approval_global_reconcile
+                        .finish(false, std::time::Instant::now())
+                {
+                    self.egui_ctx.request_repaint_after(delay);
+                }
+                tracing::warn!(
+                    kind = "approval",
+                    phase = "listener",
+                    error_code = "unavailable",
+                    "승인 listener를 사용할 수 없어 proxy launch를 중단"
+                );
+                return;
+            }
+        };
+
+        if let Some(snapshot) = self.approval_wake_hub.take_snapshot() {
+            self.apply_approval_snapshot(snapshot);
+        }
+        for result in self.approval_wake_hub.drain_results() {
+            match result {
+                ApprovalWorkerResult::Resolved => {}
+                ApprovalWorkerResult::SessionDenied {
+                    workspace_id,
+                    session,
+                    succeeded,
+                } => {
+                    if let Some(delay) = self.approval_launch_tracker.finish_session(
+                        &workspace_id,
+                        session,
+                        succeeded,
+                        std::time::Instant::now(),
+                    ) {
+                        self.egui_ctx.request_repaint_after(delay);
+                    }
+                }
+                ApprovalWorkerResult::AllDenied { succeeded } => {
+                    if let Some(delay) = self
+                        .approval_global_reconcile
+                        .finish(succeeded, std::time::Instant::now())
+                    {
+                        self.egui_ctx.request_repaint_after(delay);
+                    }
+                }
+                ApprovalWorkerResult::Failed => tracing::warn!(
+                    kind = "approval",
+                    phase = "worker",
+                    error_code = "operation_failed",
+                    "승인 worker 작업 실패"
+                ),
+            }
+        }
+
+        self.queue_global_approval_reconcile_if_due();
+
+        let expired = self
+            .approval_launch_tracker
+            .expire(std::time::Instant::now());
+        if !expired.is_empty() {
+            self.pending_proxy_launches.retain(|launch| {
+                launch
+                    .prepared
+                    .approval_ticket
+                    .is_none_or(|ticket_id| !expired.contains(&ticket_id))
+            });
+            self.agents_ui
+                .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
+        }
+
+        for (workspace_id, session) in self
+            .approval_launch_tracker
+            .pending_denials(std::time::Instant::now())
+        {
+            if self
+                .approval_wake_hub
+                .enqueue(ApprovalWorkerCommand::DenySession {
+                    workspace_id: workspace_id.clone(),
+                    session,
+                    resolved_at: deppy_core::time::unix_secs_i64(),
+                })
+                .is_ok()
+            {
+                self.approval_launch_tracker
+                    .mark_deny_queued(&workspace_id, session);
+            }
+        }
+
+        if let Some(socket_path) = ready_path
+            && !self.settings_snapshot_pending
+            && let Some(launch) = self.pending_proxy_launches.pop_front()
+        {
+            let stale = launch.generation != self.settings_snapshot_generation
+                || self.settings_snapshot_workspace_id.as_deref()
+                    != Some(launch.workspace_id.as_str())
+                || launch.prepared.runtime_workspace_id != self.active.id;
+            if stale {
+                if let Some(ticket_id) = launch.prepared.approval_ticket {
+                    self.approval_launch_tracker.cancel(ticket_id);
+                }
+                self.agents_ui
+                    .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
+            } else {
+                self.settings_snapshot_revision = self.settings_snapshot_revision.wrapping_add(1);
+                let job = SettingsJob {
+                    generation: launch.generation,
+                    revision: self.settings_snapshot_revision,
+                    workspace_id: launch.workspace_id.clone(),
+                    project_root: None,
+                    action: SettingsJobAction::FinalizeProxyAgentLaunch {
+                        prepared: Box::new(launch.prepared),
+                        approval_notify_socket: socket_path,
+                    },
+                };
+                let operation = SettingsOperationKey::for_job(&job);
+                match self.settings_snapshot_worker.try_request_recover(job) {
+                    Ok(()) => {
+                        self.settings_snapshot_pending = true;
+                        self.settings_pending_operation = Some(operation);
+                    }
+                    Err(job) => {
+                        let job = *job;
+                        if let SettingsJobAction::FinalizeProxyAgentLaunch { prepared, .. } =
+                            job.action
+                        {
+                            self.pending_proxy_launches.push_front(PendingProxyLaunch {
+                                generation: job.generation,
+                                workspace_id: job.workspace_id,
+                                prepared: *prepared,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        if self.pending_proxy_launches.is_empty()
+            && self.approval_launch_tracker.is_empty()
+            && !self.approval_global_reconcile.required
+            && self.approval_wake_hub.is_idle()
+        {
+            self.approval_wake_hub.stop();
+        }
+    }
+
+    fn poll_settings_outcomes(&mut self) {
+        while let Some(outcome) = self.settings_snapshot_worker.try_recv() {
+            let projection_current = outcome.generation == self.settings_snapshot_generation
+                && self.settings_snapshot_workspace_id.as_deref()
+                    == Some(outcome.workspace_id.as_str());
+            if self
+                .settings_pending_operation
+                .as_ref()
+                .is_some_and(|operation| operation.matches_outcome(&outcome))
+            {
+                self.settings_snapshot_pending = false;
+                self.settings_pending_operation = None;
+            }
+            let is_load = matches!(&outcome.kind, SettingsOutcomeKind::Loaded);
+            if projection_current {
+                if let Some(snapshots) = outcome.snapshots {
+                    self.agents_snapshot = snapshots.agents;
+                    self.env_profiles_snapshot = snapshots.env;
+                    self.credentials_snapshot = snapshots.credentials;
+                    if is_load {
+                        self.settings_snapshot_retry_at = None;
+                    }
+                } else if is_load {
+                    self.agents_snapshot =
+                        ui::agents::AgentsSnapshot::unavailable(outcome.revision);
+                    self.env_profiles_snapshot = ui::env_profiles::EnvProfilesSnapshot::unavailable(
+                        outcome.revision,
+                        outcome.workspace_id.as_str(),
+                        false,
+                    );
+                    self.credentials_snapshot =
+                        ui::credentials::CredentialsSnapshot::unavailable(outcome.revision);
+                    let delay = std::time::Duration::from_secs(1);
+                    self.settings_snapshot_retry_at = Some(std::time::Instant::now() + delay);
+                    self.egui_ctx.request_repaint_after(delay);
+                }
+            }
+            match outcome.kind {
+                SettingsOutcomeKind::Loaded => {}
+                SettingsOutcomeKind::CredentialAdded(result) => match result {
+                    Ok(()) => {
+                        self.credentials_ui.add_succeeded();
+                        self.invalidate_env_api_projects();
+                    }
+                    Err(_) => self
+                        .credentials_ui
+                        .report_error(ui::credentials::CredentialsUiErrorCode::AddFailed),
+                },
+                SettingsOutcomeKind::CredentialDeleted {
+                    credential_id,
+                    result,
+                } => match result {
+                    Ok(()) => {
+                        self.credentials_ui.delete_succeeded(&credential_id);
+                        self.invalidate_env_api_projects();
+                    }
+                    Err(_) => self
+                        .credentials_ui
+                        .report_error(ui::credentials::CredentialsUiErrorCode::DeleteFailed),
+                },
+                SettingsOutcomeKind::CredentialRevealed {
+                    credential_id,
+                    result,
+                } => match result {
+                    Ok(revealed) => {
+                        let _ = self.credentials_ui.accept_revealed(revealed);
+                    }
+                    Err(_) => self.credentials_ui.reject_reveal(&credential_id),
+                },
+                SettingsOutcomeKind::OrphanCredentialsScanned(result) => match result {
+                    Ok(ids) => {
+                        let _ = self.credentials_ui.accept_orphan_scan(ids);
+                    }
+                    Err(_) => self
+                        .credentials_ui
+                        .report_error(ui::credentials::CredentialsUiErrorCode::OrphanScanFailed),
+                },
+                SettingsOutcomeKind::OrphanCredentialsPurged {
+                    purged,
+                    remaining,
+                    result,
+                } => {
+                    if result.is_ok() {
+                        self.credentials_ui
+                            .orphan_purge_succeeded(purged, remaining);
+                    } else {
+                        self.credentials_ui.report_error(
+                            ui::credentials::CredentialsUiErrorCode::OrphanPurgeFailed,
+                        );
+                    }
+                }
+                SettingsOutcomeKind::CodexLlmApiKeySaved(result) => {
+                    if result.is_ok() {
+                        let revision = self
+                            .agent_sessions_secrets_snapshot
+                            .revision()
+                            .wrapping_add(1);
+                        self.agent_sessions_secrets_snapshot =
+                            ui::agent_sessions::AgentSessionsSecretsSnapshot::new(revision, true);
+                        self.agent_sessions_ui.api_key_save_succeeded();
+                    } else {
+                        self.agent_sessions_ui.report_api_key_error(
+                            ui::agent_sessions::AgentSessionsSecretErrorCode::SaveFailed,
+                        );
+                    }
+                }
+                SettingsOutcomeKind::CodexLlmApiKeyDeleted(result) => {
+                    if result.is_ok() {
+                        let revision = self
+                            .agent_sessions_secrets_snapshot
+                            .revision()
+                            .wrapping_add(1);
+                        self.agent_sessions_secrets_snapshot =
+                            ui::agent_sessions::AgentSessionsSecretsSnapshot::new(revision, false);
+                        self.agent_sessions_ui.api_key_delete_succeeded();
+                    } else {
+                        self.agent_sessions_ui.report_api_key_error(
+                            ui::agent_sessions::AgentSessionsSecretErrorCode::DeleteFailed,
+                        );
+                    }
+                }
+                SettingsOutcomeKind::AgentRegistered(result) => match result {
+                    Ok(()) => self.agents_ui.registration_succeeded(),
+                    Err(_) => self
+                        .agents_ui
+                        .report_error(ui::agents::AgentsUiErrorCode::RegistrationFailed),
+                },
+                SettingsOutcomeKind::AgentDeleted(result) => {
+                    if result.is_err() {
+                        self.agents_ui
+                            .report_error(ui::agents::AgentsUiErrorCode::DeleteFailed);
+                    }
+                }
+                SettingsOutcomeKind::AgentLaunchPrepared(result) => match result {
+                    Ok(prepared) => {
+                        if prepared.proxy.is_some() {
+                            self.stage_prepared_proxy_launch(
+                                outcome.generation,
+                                outcome.workspace_id,
+                                prepared,
+                            );
+                        } else {
+                            self.send_prepared_agent_launch(prepared);
+                        }
+                    }
+                    Err(_) => self
+                        .agents_ui
+                        .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed),
+                },
+                SettingsOutcomeKind::AgentLaunchFinalized { ticket_id, result } => match result {
+                    Ok(prepared) => self.send_prepared_agent_launch(prepared),
+                    Err(_) => {
+                        if let Some(ticket_id) = ticket_id {
+                            self.approval_launch_tracker.cancel(ticket_id);
+                        }
+                        self.agents_ui
+                            .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
+                    }
+                },
+                SettingsOutcomeKind::LegacyVarDeleted(result) => {
+                    if result.is_err() {
+                        self.env_profiles_ui
+                            .report_error(ui::env_profiles::EnvUiErrorCode::LegacyDeleteFailed);
+                    } else {
+                        self.invalidate_env_api_projects();
+                    }
+                }
+                SettingsOutcomeKind::DotenvWritten(result) => {
+                    if result.is_err() {
+                        self.env_profiles_ui
+                            .report_error(ui::env_profiles::EnvUiErrorCode::SnapshotUnavailable);
+                    } else {
+                        self.sync_settings_workspace_dotenv(&outcome.workspace_id);
+                        self.invalidate_env_api_projects();
+                    }
+                }
+                SettingsOutcomeKind::DotenvResynced(result) => {
+                    if result.is_err() {
+                        self.env_profiles_ui
+                            .report_error(ui::env_profiles::EnvUiErrorCode::SnapshotUnavailable);
+                    } else {
+                        self.credentials_ui.invalidate_cache();
+                        self.invalidate_env_api_projects();
+                    }
+                }
+                SettingsOutcomeKind::ProjectPathSet(result) => {
+                    let Ok(row) = result else {
+                        self.env_profiles_ui
+                            .report_error(ui::env_profiles::EnvUiErrorCode::SnapshotUnavailable);
+                        continue;
+                    };
+                    let path = PathBuf::from(&row.path);
+                    self.upsert_workspace_projection(row);
+                    self.dismissed_renames.remove(&outcome.workspace_id);
+                    self.sync_settings_workspace_dotenv(&outcome.workspace_id);
+                    if outcome.workspace_id == self.active.id {
+                        let cwd = path.is_dir().then_some(path.clone());
+                        let _ = self
+                            .active
+                            .runtime
+                            .send_command(runtime::RuntimeCommand::SetShellCwd(cwd));
+                        self.refresh_file_tree_root();
+                    }
+                    self.credentials_ui.invalidate_cache();
+                    self.invalidate_env_api_projects();
+                }
+                SettingsOutcomeKind::WorkspaceRenamed { name, result } => {
+                    if result.is_ok() {
+                        self.update_workspace_projection_name(&outcome.workspace_id, name);
+                    } else {
+                        tracing::warn!(
+                            workspace = %outcome.workspace_id,
+                            "workspace rename worker failed"
+                        );
+                    }
+                }
+                SettingsOutcomeKind::WorkspaceFoundOrCreated { purpose, result } => {
+                    let Ok(result) = result else {
+                        tracing::warn!("workspace find-or-create worker failed");
+                        continue;
+                    };
+                    let workspace_id = result.row.id.clone();
+                    let created = result.created;
+                    self.upsert_workspace_projection(result.row);
+                    match purpose {
+                        WorkspaceMutationPurpose::SelectInSettings => {
+                            self.config.ui.hidden_env_project_ids.remove(&workspace_id);
+                            if created {
+                                self.closed_workspaces
+                                    .insert(workspace_id.clone(), ClosedWorkspaceState::Persisted);
+                                self.config
+                                    .ui
+                                    .closed_workspace_ids
+                                    .insert(workspace_id.clone());
+                            }
+                            self.settings_workspace_id = Some(workspace_id);
+                            if let Err(error) = self.config.save(&self.config_path) {
+                                tracing::warn!("settings workspace state save failed: {error:#}");
+                            }
+                            self.invalidate_env_profile_ui();
+                        }
+                        WorkspaceMutationPurpose::SwitchRuntime => {
+                            self.reveal_closed_workspace(&workspace_id);
+                            if workspace_id != self.active.id {
+                                self.switch_workspace(&workspace_id);
+                            }
+                            if created {
+                                self.sync_dotenv_env();
+                                self.active.workspace_ui.spawn_shell(
+                                    &self.active.runtime,
+                                    self.config.terminal.scrollback_lines as usize,
+                                );
+                            }
+                        }
+                    }
+                }
+                SettingsOutcomeKind::WorkspaceMovedPathAccepted { new_path, result } => {
+                    if !matches!(result, Ok(storage::WorkspaceMovedPathUpdate::Updated)) {
+                        tracing::info!("workspace moved-path confirmation became stale");
+                        self.workspace_rename_prompt = None;
+                        continue;
+                    }
+                    self.update_workspace_projection_path(&outcome.workspace_id, &new_path);
+                    self.dismissed_renames.remove(&outcome.workspace_id);
+                    self.sync_settings_workspace_dotenv(&outcome.workspace_id);
+                    if outcome.workspace_id == self.active.id {
+                        let cwd = new_path.is_dir().then_some(new_path);
+                        let _ = self
+                            .active
+                            .runtime
+                            .send_command(runtime::RuntimeCommand::SetShellCwd(cwd));
+                        self.refresh_file_tree_root();
+                    }
+                    self.workspace_rename_prompt = None;
+                }
+            }
+        }
     }
 
     fn poll_env_secret_reveals(&mut self) {
@@ -4349,19 +9164,26 @@ impl App {
             if outcome.generation != self.env_secret_generation {
                 continue;
             }
-            self.env_secret_pending.remove(&outcome.credential_id);
-            match outcome.value {
-                Ok(value) => {
-                    self.env_secret_failures.remove(&outcome.credential_id);
-                    self.env_secret_cache.insert(outcome.credential_id, value);
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        credential_id = outcome.credential_id,
-                        "환경 secret background 조회 실패: {error:#}"
-                    );
-                    self.env_secret_failures.insert(outcome.credential_id);
-                }
+            match outcome.target {
+                EnvSecretRevealTarget::EnvRow {
+                    profile_id,
+                    key,
+                    credential_id: _,
+                } => match outcome.value {
+                    Ok(value) => {
+                        match ui::env_profiles::RevealedEnvValue::new(
+                            profile_id.clone(),
+                            key.clone(),
+                            value.expose().to_owned(),
+                        ) {
+                            Ok(revealed) => {
+                                let _ = self.env_profiles_ui.accept_revealed(revealed);
+                            }
+                            Err(_) => self.env_profiles_ui.reject_reveal(&profile_id, &key),
+                        }
+                    }
+                    Err(_) => self.env_profiles_ui.reject_reveal(&profile_id, &key),
+                },
             }
         }
     }
@@ -4519,9 +9341,26 @@ impl App {
     }
 
     fn refresh_workspaces(&mut self) {
-        match self.db.list_workspaces() {
-            Ok(list) => self.workspaces = list,
-            Err(e) => tracing::warn!("workspace 목록 조회 실패: {e:#}"),
+        match self.db.settings_workspace_projection_rows() {
+            Ok(list) => {
+                let mut anchors = std::collections::HashMap::with_capacity(list.len());
+                self.workspaces = list
+                    .into_iter()
+                    .map(|row| {
+                        if let Some(anchor) = row.folder_anchor {
+                            anchors.insert(row.id.clone(), anchor);
+                        }
+                        crate::storage::WorkspaceRow {
+                            id: row.id,
+                            name: row.name,
+                            path: row.path,
+                            created_at: row.created_at,
+                        }
+                    })
+                    .collect();
+                self.workspace_anchors = anchors;
+            }
+            Err(e) => tracing::warn!("bounded workspace projection 조회 실패: {e:#}"),
         }
         if self.settings_workspace_id.as_ref().is_some_and(|selected| {
             !self
@@ -5023,70 +9862,35 @@ impl App {
             }
             // live 세션 추적 (suspend 보호)
             rt.live.observe(event);
-            // 이관받은 agent spawn 대기 해소 (성공/실패 어느 쪽이든 응답 도착)
-            if matches!(
-                event,
-                runtime::RuntimeEvent::AgentSpawned { .. }
-                    | runtime::RuntimeEvent::SpawnFailed {
-                        kind: runtime::SpawnKind::Agent,
-                        ..
-                    }
-            ) {
+            // 이관받은 agent spawn 대기 해소. Legacy AgentSpawned/SpawnFailed와 정확히
+            // 한 쌍인 correlation event만 세어 두 이벤트를 중복 소비하지 않는다.
+            if matches!(event, runtime::RuntimeEvent::AgentSpawnResolved { .. }) {
                 rt.pending_agent_spawns = rt.pending_agent_spawns.saturating_sub(1);
             }
         }
     }
 
-    fn poll_pending_approvals(&mut self) {
-        match self.db.list_pending_approvals() {
-            Ok(rows) => {
-                // 새로 나타난 pending은 알림으로도 얹는다(OS 알림 + 목록·뱃지) — 승인
-                // 행은 터미널에 아무것도 출력하지 않아 기존 상태 감지 경로로는 어떤
-                // 알림도 나가지 않는다(리뷰 P2: 벨을 안 보면 proxy 타임아웃까지 방치).
-                for row in &rows {
-                    if !self.approval_notified.contains(&row.id)
-                        && let Some((ws, session)) = row
-                            .pane_id
-                            .as_deref()
-                            .and_then(ui::inbox_waiting::parse_session_key)
-                    {
-                        self.notifications_ui.on_mcp_approval(
-                            &ws,
-                            session,
-                            &row.tool_name,
-                            &self.i18n,
-                        );
-                    }
-                }
-                self.approval_notified = rows.iter().map(|row| row.id.clone()).collect();
-                let remote_urls = self.approval_remote_urls(&rows);
-                self.approvals_ui.set_pending(rows, remote_urls);
-            }
-            Err(e) => tracing::warn!("승인 목록 조회 실패: {e:#}"),
-        }
-    }
-
-    /// pending 승인에 표시할 http 서버 원격 url (server_id → url).
-    /// proxy 경유 경로는 Connector Center 신뢰 모달을 거치지 않으므로 첫 Ask 승인이
-    /// 원격 전송 고지를 겸한다 (H3 리뷰 P1). pending이 없으면 조회하지 않는다.
-    fn approval_remote_urls(
-        &self,
-        rows: &[storage::PendingApprovalRow],
-    ) -> std::collections::HashMap<String, String> {
-        if rows.is_empty() {
-            return Default::default();
-        }
-        match self.db.list_mcp_servers() {
-            Ok(servers) => servers
-                .into_iter()
-                .filter(|server| server.kind == "http")
-                .filter_map(|server| Some((server.id, server.url?)))
-                .collect(),
-            Err(e) => {
-                tracing::warn!("승인 고지용 MCP 서버 조회 실패: {e:#}");
-                Default::default()
+    fn apply_approval_snapshot(&mut self, snapshot: ApprovalSnapshot) {
+        // SQLite/MCP inventory reads are completed by the listener worker. The frame path only
+        // swaps this bounded, sanitized snapshot and derives notifications from it.
+        for row in &snapshot.rows {
+            if !self.approval_notified.contains(&row.id)
+                && let Some((workspace_id, session)) = row
+                    .pane_id
+                    .as_deref()
+                    .and_then(ui::inbox_waiting::parse_session_key)
+            {
+                self.notifications_ui.on_mcp_approval(
+                    &workspace_id,
+                    session,
+                    &row.tool_name,
+                    &self.i18n,
+                );
             }
         }
+        self.approval_notified = snapshot.rows.iter().map(|row| row.id.clone()).collect();
+        self.approvals_ui
+            .set_pending(snapshot.rows, snapshot.remote_urls);
     }
 
     /// 벨 팝오버(대기 인박스 + 최근 알림)의 고정 Id — 단축키(⌘⇧U) 토글이 같은 팝오버를
@@ -5184,13 +9988,10 @@ impl App {
         session: runtime::SessionId,
         reply: &str,
     ) {
-        let key = format!("{workspace_id}:{}", session.0);
         let still_waiting = self
-            .db
-            .list_waiting_sessions()
-            .unwrap_or_default()
+            .global_waiting
             .iter()
-            .any(|(k, _)| k == &key);
+            .any(|(ws, waiting_session, _)| ws == workspace_id && *waiting_session == session);
         if !still_waiting {
             // 대기가 이미 해소됨 — 조용히 무시한다. 다음 refresh_needs_input이 카드
             // 목록을 갱신한다.
@@ -5225,31 +10026,8 @@ impl App {
     /// 하단 도크 컴포저 렌더 (2026-07-17) — CentralPanel보다 먼저 호출해야 터미널
     /// 영역이 자동으로 줄어든다(통합 도크 — 팝업/오버레이 금지 사양). 설정 OFF면
     /// 호출측이 아예 부르지 않는다(Panel 미생성 — 리소스 0).
-    /// MCP 목록은 펼침당 1회만 조회한다(프레임 경로 저장소 조회 방지).
+    /// MCP 목록은 Connector의 bounded immutable overview/단일 tool page만 읽는다.
     fn render_composer_dock(&mut self, ui: &mut egui::Ui, text: &i18n::Catalog) {
-        if self.composer.mcp_refresh_needed() {
-            let tools = match self.db.list_mcp_servers() {
-                Ok(servers) => servers
-                    .into_iter()
-                    .filter(|server| server.enabled)
-                    .map(|server| {
-                        let tools = self
-                            .db
-                            .list_mcp_tools(&server.id)
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|tool| (tool.name, tool.description.unwrap_or_default()))
-                            .collect();
-                        (server.name, tools)
-                    })
-                    .collect(),
-                Err(e) => {
-                    tracing::warn!("컴포저 MCP 목록 조회 실패: {e:#}");
-                    Vec::new()
-                }
-            };
-            self.composer.set_mcp_tools(tools);
-        }
         let composer_session = self.active.workspace_ui.focused_session();
         let composer_agent = composer_session
             .and_then(|session| self.active.workspace_ui.agent_provider_for(session));
@@ -5279,6 +10057,7 @@ impl App {
                 // 접힘 단축키 = FocusComposer의 유효 바인딩 + dispatcher와 같은 충돌
                 // 억제 — 리바인드/비활성/충돌을 열기와 동일 규칙으로 반영한다(codex P2).
                 collapse_shortcut: composer_collapse_shortcut(&self.config.shortcuts),
+                connector_snapshot: self.connector_snapshot_reader.snapshot(),
             };
             egui::Panel::bottom("composer_dock")
                 .resizable(false)
@@ -5287,8 +10066,56 @@ impl App {
                 .show(ui, |ui| composer.render(ui, text, &composer_ctx))
                 .inner
         };
-        if let Some(ui::composer::ComposerAction::Send(prompt)) = composer_action {
-            self.send_composer_prompt(&prompt);
+        match composer_action {
+            Some(ui::composer::ComposerAction::Send(submission)) => {
+                let (prompt, history) = submission.into_parts();
+                self.send_composer_prompt(&prompt);
+                self.pending_composer_history = Some(history);
+                ui.ctx().request_repaint();
+            }
+            Some(ui::composer::ComposerAction::RequestMcpToolPage { server_id, offset }) => {
+                if self
+                    .connector_coordinator
+                    .dispatch(connector_contract::ConnectorIntent::RequestToolPage {
+                        server_id,
+                        offset,
+                    })
+                    .is_err()
+                {
+                    tracing::warn!("Composer Connector tool-page request dispatch failed");
+                }
+            }
+            Some(ui::composer::ComposerAction::RequestContextFile(request)) => {
+                if self.pending_app_host_action.is_none() {
+                    self.pending_app_host_action =
+                        Some(AppHostIoAction::ComposerContextFile(request));
+                    ui.ctx().request_repaint();
+                } else {
+                    let active_workspace = self.active.id.clone();
+                    let _ = self.composer.complete_context_file(
+                        &self.egui_ctx,
+                        request,
+                        None,
+                        &active_workspace,
+                    );
+                }
+            }
+            Some(ui::composer::ComposerAction::RequestClipboardAttachment(request)) => {
+                if self.pending_app_host_action.is_none() {
+                    self.pending_app_host_action =
+                        Some(AppHostIoAction::ComposerClipboard(request));
+                    ui.ctx().request_repaint();
+                } else {
+                    let active_workspace = self.active.id.clone();
+                    let _ = self.composer.complete_clipboard_attachment(
+                        &self.egui_ctx,
+                        request,
+                        None,
+                        &active_workspace,
+                    );
+                }
+            }
+            None => {}
         }
     }
 
@@ -5380,25 +10207,29 @@ impl App {
         }
     }
 
-    /// 승인/거부 결정 되쓰기 — 기존 모달 경로(approvals_ui.show 처리부)와 동일한
-    /// resolve_approval 호출. first-writer-wins라 모달·인박스 어느 쪽으로 먼저 처리해도
-    /// 정합. 워크스페이스 전환 없이 그 자리에서 처리되는 것이 인박스의 존재 이유.
-    /// 팝오버·작업함 페이지 공용.
+    /// 승인/거부 결정은 listener의 bounded command queue로만 전달한다. DB write와 후속
+    /// snapshot materialization은 같은 worker connection에서 순서대로 실행된다.
     fn apply_inbox_approval_decision(&mut self, decision: Option<ui::approvals::ApprovalDecision>) {
         let Some(decision) = decision else {
             return;
         };
-        let now = deppy_core::time::unix_secs_i64();
-        if let Err(e) =
-            self.db
-                .resolve_approval(&decision.id, decision.allowed, decision.remember, now)
+        if self
+            .approval_wake_hub
+            .enqueue(ApprovalWorkerCommand::Resolve {
+                id: decision.id,
+                allowed: decision.allowed,
+                remember: decision.remember,
+                resolved_at: deppy_core::time::unix_secs_i64(),
+            })
+            .is_err()
         {
-            tracing::warn!("승인 해소 실패(인박스): {e:#}");
+            tracing::warn!(
+                kind = "approval",
+                phase = "resolve_enqueue",
+                error_code = "unavailable",
+                "승인 해소 요청 전달 실패"
+            );
         }
-        self.prune_resolved_approvals();
-        // 해소 직후 목록을 갱신해 카드가 바로 사라지게 한다(다음 폴링을 기다리지 않음).
-        self.poll_pending_approvals();
-        self.egui_ctx.request_repaint();
     }
 
     /// 벨 팝오버 본문 (v3.9 N1). 설정 창과 독립 — 밖을 클릭하면 닫힌다.
@@ -5461,8 +10292,8 @@ impl App {
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         // ── 대기 중 섹션 (처리하면 사라지는 액션 큐) ──
-                        // MCP 승인 카드 — 이미 폴링된 목록만 읽는다(App::poll_pending_approvals가
-                        // approval-watcher 신호로 채운다) — 새 DB 조회 없음.
+                        // MCP 승인 카드 — listener worker가 만든 immutable snapshot만 읽는다.
+                        // render 경로에는 DB 조회가 없다.
                         let approval_action = ui::inbox_approvals::render(
                             ui,
                             text,
@@ -5501,7 +10332,6 @@ impl App {
         if open_full {
             self.settings_category = ui::settings::Category::Notifications;
             self.settings_open = true;
-            self.refresh_workspaces();
             egui::Popup::close_id(&self.egui_ctx, Self::inbox_popup_id());
         }
         // [N3] 카드 액션 처리 — Popup::show 클로저 밖에서 한다(클로저 내부 빌림 단순화).
@@ -5636,6 +10466,9 @@ impl App {
         if let Some(bench) = self.bench.as_mut() {
             bench.finish();
         }
+        if let Some(task) = self.app_host_io.take() {
+            let _ = task.handle.join();
+        }
         // 마지막 App Server 이벤트가 만든 thread metadata를 종료 전에 한 번 더 반영한다.
         // 평상시 실패분도 FIFO queue에 남아 있으므로 retry deadline과 무관하게 flush한다.
         self.agent_sessions_ui.poll();
@@ -5644,7 +10477,23 @@ impl App {
         self.agent_sessions_ui.shutdown();
         // shutdown join 중 도착한 마지막 thread/start/resume 결과도 controller가 drain한다.
         self.persist_agent_session_mutations_with_policy(true);
-        self.approval_watcher.stop();
+        self.fail_pending_proxy_launches();
+        if self
+            .db
+            .deny_session_scoped_pending_approvals_owned(
+                self._pending_approval_owner.as_ref(),
+                deppy_core::time::unix_secs_i64(),
+            )
+            .is_err()
+        {
+            tracing::warn!(
+                kind = "approval",
+                phase = "shutdown_reconcile",
+                error_code = "storage_failed",
+                "종료 중 pending approval 정리 실패"
+            );
+        }
+        self.approval_wake_hub.stop();
         // 웹서버(모바일 PWA)를 runtime보다 먼저 정지 — 브리지가 쥔 command_sink가
         // worker 채널을 살려둔 채 join을 기다리는 순환을 끊는다 (P5 리뷰 P1 종료 데드락;
         // runtime shutdown 플래그가 근본 방어이고 이 순서는 이중 방어 + 접속 정리).
@@ -5689,6 +10538,9 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 파일/SQLite/keyring은 worker에서 끝났고, 여기서는 최신 epoch 결과만 짧게 적용한다.
         self.poll_dotenv_sync();
+        // Legacy 2s fallback is kept out of ui(): it may inspect the workspace anchor and only
+        // schedules the bounded dotenv worker when the deadline is reached.
+        self.poll_dotenv_change();
         // 창이 숨겨져도 App Server JSON-RPC 이벤트를 드레인해 structured session 상태를 최신화한다.
         self.agent_sessions_ui.poll();
         self.persist_agent_session_mutations();
@@ -5708,6 +10560,14 @@ impl eframe::App for App {
         // 설정이 닫혀도 stale generation 결과를 계속 버려 worker의 bounded 결과 큐가
         // 평문 secret을 붙잡은 채 막히지 않게 한다.
         self.poll_env_secret_reveals();
+        // 설정 창이 닫혀도 bounded result sender를 막지 않게 최신 settings 결과를 drain한다.
+        self.poll_settings_outcomes();
+        // Settings completion을 먼저 drain해야 folder-result backpressure가 같은 wake에서
+        // 해제된다. Host task는 그 뒤 한 건만 적용/시작한다.
+        self.poll_app_host_io(ctx);
+        // Listener readiness, latest-only snapshots, launch correlation, and session-scoped
+        // cleanup are all event-driven. No timer/repaint is scheduled while the hub is absent.
+        self.poll_approval_wake();
 
         // macOS 네이티브 메뉴 이벤트 (main.rs install_macos_menu)
         #[cfg(target_os = "macos")]
@@ -5767,6 +10627,8 @@ impl eframe::App for App {
         // 재활성 시 종료된 pane이 실행 중으로 보인다, codex 리뷰). 재활성 시 fresh가 아닌
         // 이 누적분을 그대로 ui()가 처리해 상태를 재구성한다. 렌더/알림은 활성만.
         let mut runtime_stream_overflowed = false;
+        let mut approval_events_overflowed = false;
+        let mut approval_runtime_events = Vec::new();
         for rt in self.warm.values_mut() {
             let events = rt.events.drain();
             // active와 동일 — 예산 초과 backlog는 wake가 이미 소진돼 직접 예약해야 한다.
@@ -5775,10 +10637,24 @@ impl eframe::App for App {
             }
             if rt.events.take_overflowed() {
                 runtime_stream_overflowed = true;
+                approval_events_overflowed = true;
                 rt.event_overflow_pending = true;
             }
             if !events.is_empty() {
                 Self::record_activity_events(rt, &events);
+                approval_runtime_events.extend(
+                    events
+                        .iter()
+                        .filter(|event| {
+                            matches!(
+                                event,
+                                runtime::RuntimeEvent::AgentSpawnResolved { .. }
+                                    | runtime::RuntimeEvent::SessionExited { .. }
+                            )
+                        })
+                        .cloned()
+                        .map(|event| (rt.id.clone(), event)),
+                );
                 let agent_providers = rt.workspace_ui.agent_providers();
                 // warm workspace도 알림은 만든다 (background 완료/승인 통지) — (ws, session)로
                 // 식별해 워커 간 SessionId 충돌을 피한다. 렌더용으로는 pending에 누적.
@@ -5790,7 +10666,9 @@ impl eframe::App for App {
                     &agent_providers,
                     &self.i18n,
                 );
-                rt.pending_events.extend(events);
+                rt.pending_events.extend(events.into_iter().filter(|event| {
+                    !matches!(event, runtime::RuntimeEvent::AgentSpawnResolved { .. })
+                }));
                 // MuxUpdated는 매번 전체 스냅샷이라 오래된 건 최신에 완전히 대체된다.
                 // chatty한 warm 워커가 pending_events를 무한 누적하지 않도록 최신 하나만
                 // 남기고 합친다 (lifecycle은 순서 보존, Viewport는 세션별 최신본 — replay 정확성).
@@ -5804,6 +10682,9 @@ impl eframe::App for App {
                 // worker를 깨우지 않는다.
             }
         }
+        for (workspace_id, event) in approval_runtime_events {
+            self.observe_approval_runtime_events(&workspace_id, std::slice::from_ref(&event));
+        }
         self.runtime_stream_warning |= runtime_stream_overflowed;
         self.evict_idle_warm(std::time::Instant::now());
 
@@ -5813,6 +10694,17 @@ impl eframe::App for App {
         let new_events = self.active.events.drain();
         if !new_events.is_empty() {
             Self::record_activity_events(&mut self.active, &new_events);
+            for event in &new_events {
+                if let runtime::RuntimeEvent::AgentSpawnResolved { session, .. } = event {
+                    if session.is_some() {
+                        self.agents_ui.observe_launch_succeeded();
+                    } else {
+                        self.agents_ui.observe_launch_failed();
+                    }
+                }
+            }
+            let active_id = self.active.id.clone();
+            self.observe_approval_runtime_events(&active_id, &new_events);
             let agent_providers = self.active.workspace_ui.agent_providers();
             Self::process_ws_notifications(
                 &mut self.notifications_ui,
@@ -5822,7 +10714,11 @@ impl eframe::App for App {
                 &agent_providers,
                 &self.i18n,
             );
-            self.active.pending_events.extend(new_events);
+            self.active
+                .pending_events
+                .extend(new_events.into_iter().filter(|event| {
+                    !matches!(event, runtime::RuntimeEvent::AgentSpawnResolved { .. })
+                }));
             // 창이 숨겨져(render_active=false) ui()가 스킵되면 active의 pending도 warm처럼
             // 무한 누적된다 — 동일하게 coalesce로 유계화한다. 보일 때는 ui()가 매 프레임
             // take()로 소비해 자라지 않으므로 coalesce가 불필요하다.
@@ -5843,7 +10739,11 @@ impl eframe::App for App {
         }
         if self.active.events.take_overflowed() {
             self.runtime_stream_warning = true;
+            approval_events_overflowed = true;
             self.active.event_overflow_pending = true;
+        }
+        if approval_events_overflowed {
+            self.fail_closed_approval_event_overflow();
         }
         if self.active.event_overflow_pending && self.active.events.durable_backlog_exhausted() {
             self.active.events = Self::subscribe_runtime_events(&self.active.runtime, ctx);
@@ -5870,10 +10770,6 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
-        if self.approval_poll_requested.swap(false, Ordering::AcqRel) {
-            self.poll_pending_approvals();
-        }
-
         // 폰 미러 진입(I1b-2) — 웹 스레드가 큐에 넣은 워크스페이스 전환 요청을 처리한다.
         // ui()가 아닌 여기(logic)에서 — 데스크탑 창이 숨겨져도(폰 전용 사용) 전환돼야 한다.
         self.drain_web_switch_requests();
@@ -5882,6 +10778,17 @@ impl eframe::App for App {
         // 에이전트 감지 워커 입력 갱신 + 결과 드레인 — ui()가 아닌 여기(logic)에서 해야
         // hidden/minimized로 ui()가 스킵돼도 결과 채널이 누적되지 않는다(codex 리뷰).
         self.poll_agent_detect();
+
+        // Connector worker가 wake한 latest-only immutable snapshot은 non-render logic에서만
+        // 교체한다. UI는 아래 ui()에서 Arc projection을 읽을 뿐 DB/MCP를 호출하지 않는다.
+        let previous_connector_config_revision =
+            self.connector_snapshot_reader.snapshot().config_revision;
+        if self.connector_snapshot_reader.refresh()
+            && self.connector_snapshot_reader.snapshot().config_revision
+                != previous_connector_config_revision
+        {
+            self.invalidate_env_profile_ui();
+        }
 
         // 폰 대시보드가 볼 워크스페이스 스냅샷(전체 + 해석된 세션 이름) 동기화.
         // ui()가 아닌 logic()에서 — 창이 숨겨져도 폰에는 최신 구성이 보여야 한다.
@@ -5916,8 +10823,6 @@ impl eframe::App for App {
             }
             ui.ctx().request_repaint();
         }
-        // .env 변경 폴링 fallback (사이드바 OFF 대비 — 2s 스로틀).
-        self.poll_dotenv_change();
         // UI 폰트/터미널 모노(가족·굵기) 설정 변경 hot reload — 폰트 재등록 + 렌더 캐시 무효화.
         if font_settings_changed(
             &self.config,
@@ -6004,9 +10909,6 @@ impl eframe::App for App {
                             let sel = self.settings_open;
                             if tbtn(ui, text.t("top.settings", &[]), sel) {
                                 self.settings_open = !sel;
-                                if self.settings_open {
-                                    self.refresh_workspaces();
-                                }
                             }
                             let unread = self.notifications_ui.unread();
                             unread_before = unread;
@@ -6211,30 +11113,21 @@ impl eframe::App for App {
         // 사이드바보다 먼저 선언해야 좌측 도크 아래까지 창 전체 폭을 차지한다.
         const ACTIVITY_ROWS_TTL: std::time::Duration = std::time::Duration::from_millis(500);
         let (activity_rows_stamp, activity_rows) = match self.activity_rows_cache.take() {
-            Some((at, rows)) if at.elapsed() <= ACTIVITY_ROWS_TTL => {
-                // 만료 시점 리프레시 예약 — 이벤트가 TTL 안에 몰리고 그 뒤 프레임이
-                // 없으면 stale 표시가 다음 무관한 wake까지 남는다(codex P2). 캐시를
-                // 새로 지은 프레임은 예약하지 않으므로 자가 반복 repaint 루프는 없다.
-                ui.ctx()
-                    .request_repaint_after(ACTIVITY_ROWS_TTL.saturating_sub(at.elapsed()));
-                (at, rows)
-            }
+            // Runtime/resource/status workers already wake on a changed snapshot. No timer is
+            // needed merely to expire this allocation cache: the next real event/frame rebuilds
+            // it if stale, while an idle terminal schedules no periodic repaint.
+            Some((at, rows)) if at.elapsed() <= ACTIVITY_ROWS_TTL => (at, rows),
             _ => (std::time::Instant::now(), self.activity_rows()),
         };
         let waiting_count = self.approvals_ui.pending().len() + self.global_waiting.len();
-        // 활성 MCP 서버 수 — 30s TTL 캐시 (하단 상태바 「MCP N」, 2026-07-18 사용자).
-        let mcp_count = match self.mcp_count_cache {
-            Some((at, count)) if at.elapsed() <= std::time::Duration::from_secs(30) => count,
-            _ => {
-                let count = self
-                    .db
-                    .list_mcp_servers()
-                    .map(|servers| servers.iter().filter(|server| server.enabled).count())
-                    .unwrap_or(0);
-                self.mcp_count_cache = Some((std::time::Instant::now(), count));
-                count
-            }
-        };
+        // 상태바도 Home/Connector와 동일한 immutable overview snapshot을 사용한다.
+        let mcp_count = self
+            .connector_snapshot_reader
+            .snapshot()
+            .servers
+            .iter()
+            .filter(|server| server.enabled)
+            .count();
         // AI 서비스 상태 스냅샷 수신 — provider별 실패(None)는 마지막 성공값 유지
         // (일시적 네트워크 오류로 점등이 회색으로 깜빡이지 않게).
         let mut status_feed_received = false;
@@ -6283,7 +11176,6 @@ impl eframe::App for App {
 
         // 새 워크스페이스로 만들 폴더 — 사이드바 빈 상태 CTA와 설정 화면 양쪽이 채우고,
         // 프레임 끝의 공통 생성/전환 흐름이 소비한다(선언을 사이드바 dispatch보다 앞에).
-        let mut ws_create: Option<std::path::PathBuf> = None;
         if self.file_tree.is_some() {
             let sidebar_action = self
                 .file_tree
@@ -6649,14 +11541,15 @@ impl eframe::App for App {
                         .to_owned();
                     self.ws_rename_edit = Some((workspace_id, alias));
                 }
-                Some(ui::file_tree::SidebarAction::CreateWorkspaceFromPicker) => {
-                    // 빈 상태 CTA — rfd는 App에서 연다(UI leaf 금지 관례). 선택한 폴더는
-                    // 기존 ws_create 흐름(같은 경로면 그 워크스페이스로 전환, 아니면
-                    // 생성 후 전환)을 그대로 탄다.
-                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                        ws_create = Some(dir);
-                    }
+                Some(ui::file_tree::SidebarAction::CreateWorkspaceFromPicker)
+                    if self.pending_app_host_action.is_none() =>
+                {
+                    self.pending_app_host_action = Some(AppHostIoAction::FolderPicker(
+                        FolderPickerPurpose::SwitchWorkspace,
+                    ));
+                    ui.ctx().request_repaint();
                 }
+                Some(ui::file_tree::SidebarAction::CreateWorkspaceFromPicker) => {}
                 None => {}
             }
         }
@@ -6672,9 +11565,8 @@ impl eframe::App for App {
             let spawn_busy = self.active.workspace_ui.pending_spawns() > 0;
             match crate::worktree::spawn_decision(same_workspace, spawn_busy) {
                 crate::worktree::SpawnDecision::Defer => {
-                    // 결과를 채널에 남겨두는 1칸 대기 큐 — 다음 프레임에 재판정.
-                    ui.ctx()
-                        .request_repaint_after(std::time::Duration::from_millis(50));
+                    // 결과는 1칸 채널에 남는다. Pending spawn 해소 runtime event가
+                    // repaint를 깨우므로 별도 timer polling은 필요 없다.
                 }
                 decision => match rx.try_recv() {
                     Ok(Ok(path)) => {
@@ -6816,48 +11708,15 @@ impl eframe::App for App {
         }
 
         // ── 관리/모니터 패널 부수효과 (매 프레임 — 통합 설정 창 표시 여부와 무관) ──
-        // 렌더는 통합 설정 창 클로저(아래)에서. 여기선 창이 닫혀 있어도 돌아야 하는
-        // 부수효과만: agent 실행 응답 추적, OAuth 결과 drain(→credential 추가 시 캐시 무효화).
         let events = std::mem::take(&mut self.active.pending_events);
-        self.agents_ui
-            .observe_launch_events(&events, ui.ctx(), &text);
-        // 커넥터 백그라운드 결과(tools/call·MCP invoke·OAuth)는 창 표시와 무관하게 매 프레임 소화.
-        self.connectors_ui.drain_results(&mut self.db);
-        self.connectors_ui.drain_invoke(&self.db);
-        let credential_added = {
-            let oauth_store = AppOAuthCredentialStore {
-                secret_store: &self.secret_store,
-                redaction: &self.redaction,
-            };
-            self.connectors_ui
-                .drain_oauth(ui.ctx(), &mut self.db, &oauth_store)
-        };
-        if credential_added {
-            self.credentials_ui.invalidate_cache();
-            // env 뷰의 시크릿 콤보/마스킹도 새 credential을 봐야 한다(PR-ENV-C 배선).
-            self.invalidate_env_profile_ui();
-            ui.ctx().request_repaint();
-        }
         let central_view = self.agent_terminal_ui.view();
         let home_visible = central_view == ui::agent_terminal::AgentTerminalView::Home;
         let inbox_visible = central_view == ui::agent_terminal::AgentTerminalView::Inbox;
-        let slack_status = if home_visible {
-            self.connectors_ui.slack_status(&self.db)
-        } else {
-            ui::connectors::SlackMcpStatus::NotConfigured
-        };
         // 홈/작업함이 중앙을 차지해도 활성 워크스페이스 이벤트는 계속 소화한다.
         if home_visible || inbox_visible {
             self.active
                 .workspace_ui
                 .update_hidden(ui.ctx(), &self.active.runtime, &events, &text);
-        }
-        if inbox_visible {
-            // 최근 알림의 상대시간("방금 전"/"N분 전")이 경계를 넘어도 갱신되게 —
-            // 페이지가 보일 때만 30s 주기 repaint(codex P3). 페이지를 닫으면 예약이
-            // 끊겨 유휴 비용-0 계약 유지.
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_secs(30));
         }
 
         // 컴포저는 터미널 표면에만 붙는다. 홈/작업함은 전체 폭 페이지가 중앙 영역을 쓴다.
@@ -6885,7 +11744,7 @@ impl eframe::App for App {
                             cache: &self.notice_translation_cache,
                             locale: &self.config.i18n.locale,
                         },
-                        slack_status,
+                        &self.connector_snapshot_reader.snapshot().slack,
                         &text,
                     );
                 } else if inbox_visible {
@@ -6936,21 +11795,54 @@ impl eframe::App for App {
         // Agents 창의 LLM 프로바이더 설정은 config 소유(App) — 창이 바꾸면 저장한다 (PR-L2).
         let agents_config_before = self.config.agents.clone();
         self.agent_sessions_ui.set_catalog(&text);
-        let agent_requests = self.agent_sessions_ui.show(
+        let agent_output = self.agent_sessions_ui.show(
             ui.ctx(),
-            &active_workspace_id,
-            agent_workspace_cwd,
-            pty_agent_surfaces,
-            &mut self.config.agents,
-            self.ollama_models.as_deref(),
+            ui::agent_sessions::AgentSessionsFrameInput {
+                workspace_id: &active_workspace_id,
+                workspace_cwd: agent_workspace_cwd,
+                pty_surfaces: pty_agent_surfaces,
+                agents_config: &mut self.config.agents,
+                secrets_snapshot: &self.agent_sessions_secrets_snapshot,
+                ollama_models: self.ollama_models.as_deref(),
+            },
         );
         if self.config.agents != agents_config_before
             && let Err(e) = self.config.save(&self.config_path)
         {
             tracing::warn!("에이전트 LLM 프로바이더 설정 저장 실패: {e:#}");
         }
-        for request in agent_requests {
+        for request in agent_output.requests {
             self.handle_agent_sessions_request(request);
+        }
+        if let Some(intent) = agent_output.secret_intent {
+            let current_revision = self.agent_sessions_secrets_snapshot.revision();
+            let action = match intent {
+                ui::agent_sessions::AgentSessionsSecretIntent::SaveApiKey { revision, input }
+                    if revision == current_revision =>
+                {
+                    Some(SettingsJobAction::SaveCodexLlmApiKey {
+                        value: secret::SecretString::new(input.into_inner()),
+                    })
+                }
+                ui::agent_sessions::AgentSessionsSecretIntent::DeleteApiKey { revision }
+                    if revision == current_revision =>
+                {
+                    Some(SettingsJobAction::DeleteCodexLlmApiKey)
+                }
+                _ => {
+                    self.agent_sessions_ui.report_api_key_error(
+                        ui::agent_sessions::AgentSessionsSecretErrorCode::SnapshotUnavailable,
+                    );
+                    None
+                }
+            };
+            if let Some(action) = action
+                && !self.queue_global_settings_action(&active_workspace_id, action)
+            {
+                self.agent_sessions_ui.report_api_key_error(
+                    ui::agent_sessions::AgentSessionsSecretErrorCode::SnapshotUnavailable,
+                );
+            }
         }
         // 「변경 보기」 diff 패널 — 매 프레임 렌더 + 백그라운드 수집 결과 poll.
         self.diff_panel_ui.show(ui.ctx(), &text);
@@ -6958,10 +11850,9 @@ impl eframe::App for App {
         if self.active.workspace_ui.take_open_environment() {
             self.settings_category = ui::settings::Category::Environment;
             self.settings_open = true;
-            self.refresh_workspaces();
             // T1: 우클릭 진입 시에만 focused 세션 cwd를 감지 — env 페이지 상단에
             // "새 프로젝트로 등록"/"이 폴더를 프로젝트 폴더로 지정" 배너를 띄운다.
-            // refresh_workspaces 이후에 감지해 최신 workspace path 목록과 비교한다.
+            // App-owned workspace projection과 비교하므로 render-time DB refresh가 없다.
             self.env_session_banner = self.detect_session_cwd_banner();
         }
         // pane 우클릭 → 세션 폴더 동선 (2026-07-18): 파일 트리 이동은 사이드바 트리의
@@ -7121,7 +12012,6 @@ impl eframe::App for App {
                             .find(|id| *id != close_id && !self.closed_workspaces.contains_key(id));
                         if let Some(id) = fallback {
                             self.switch_workspace(&id);
-                            self.refresh_workspaces();
                         }
                     }
                 }
@@ -7191,19 +12081,18 @@ impl eframe::App for App {
                         let next = buf.trim();
                         // 별칭이 그대로면 DB 쓰기 생략(churn 방지). 실패는 로그 + OS 알림
                         // 으로 표면화한다 — 조용한 실패 금지.
-                        if next != current_alias {
-                            if let Err(e) = self.db.rename_workspace(&rename_id, next) {
-                                tracing::warn!(
-                                    workspace = %rename_id,
-                                    "워크스페이스 이름 저장 실패: {e:#}"
-                                );
-                                platform::notify(
-                                    &text.t("workspace.rename_ws.failed", &[]),
-                                    &format!("{e:#}"),
-                                );
-                            } else {
-                                self.refresh_workspaces();
-                            }
+                        if next != current_alias
+                            && !self.queue_global_settings_action(
+                                &rename_id,
+                                SettingsJobAction::RenameWorkspace {
+                                    name: next.to_owned(),
+                                },
+                            )
+                        {
+                            platform::notify(
+                                &text.t("workspace.rename_ws.failed", &[]),
+                                "workspace settings worker unavailable",
+                            );
                         }
                     }
                     Some(false) => {}
@@ -7242,34 +12131,25 @@ impl eframe::App for App {
                 });
             match decision {
                 Some(true) => {
-                    // 커밋 직전 재검증(codex Low): 프롬프트가 열린 사이 상태가 변했을 수 있다 —
-                    // ①DB 경로가 여전히 old인지 ②new 폴더의 inode가 저장 앵커와 같은지.
-                    let db_path = self.db.workspace_path(&self.active.id).ok().flatten();
-                    let stored = self.db.workspace_anchor(&self.active.id).ok().flatten();
-                    let valid = db_path.as_deref() == Some(old.as_str())
-                        && stored.is_some()
-                        && Self::folder_anchor(&new) == stored;
-                    if valid {
-                        // 새 경로로 갱신 + 앵커/env/셸 cwd 재구성 (SetProjectPath와 동일 흐름).
-                        if let Err(e) = self.db.set_workspace_path(&self.active.id, &new) {
-                            tracing::warn!("폴더 이동 경로 갱신 실패: {e:#}");
-                        } else {
-                            self.save_workspace_anchor();
-                            self.sync_dotenv_env();
-                            let cwd = std::path::PathBuf::from(&new);
-                            let cwd = cwd.is_dir().then_some(cwd);
-                            let _ = self
-                                .active
-                                .runtime
-                                .send_command(runtime::RuntimeCommand::SetShellCwd(cwd.clone()));
-                            // 표시명은 path에서 파생(E3) — 별도 갱신 불필요.
-                            self.refresh_file_tree_root();
-                            self.refresh_workspaces();
-                        }
-                    } else {
-                        tracing::info!("폴더 이동 프롬프트 stale — 갱신 취소");
+                    let workspace_id = self.active.id.clone();
+                    let queued = self
+                        .workspace_anchors
+                        .get(&workspace_id)
+                        .copied()
+                        .is_some_and(|expected_anchor| {
+                            self.queue_global_settings_action(
+                                &workspace_id,
+                                SettingsJobAction::AcceptMovedWorkspacePath {
+                                    expected_old_path: old.clone(),
+                                    expected_anchor,
+                                    new_path: std::path::PathBuf::from(&new),
+                                },
+                            )
+                        });
+                    if !queued {
+                        tracing::info!("폴더 이동 프롬프트 stale 또는 worker unavailable");
+                        self.workspace_rename_prompt = None;
                     }
-                    self.workspace_rename_prompt = None;
                 }
                 Some(false) => {
                     self.dismissed_renames.insert(self.active.id.clone());
@@ -7309,6 +12189,35 @@ impl eframe::App for App {
             self.invalidate_env_profile_ui();
         }
         self.settings_was_open = self.settings_open;
+        // Settings snapshot worker 요청은 아래 RemoteView가 self 일부를 빌리기 전에 끝낸다.
+        // render closure는 이 시점에 준비된 immutable snapshot만 읽는다.
+        if self.settings_open
+            && matches!(
+                self.settings_category,
+                ui::settings::Category::Environment | ui::settings::Category::Agents
+            )
+        {
+            let active_id = self.active.id.clone();
+            let selected = if self.settings_category == ui::settings::Category::Environment {
+                resolve_settings_env_project_id(
+                    &env_api_projects,
+                    None,
+                    self.settings_workspace_id.as_deref(),
+                    &active_id,
+                )
+                .unwrap_or(active_id)
+            } else {
+                resolve_settings_workspace_id(
+                    &self.workspaces,
+                    None,
+                    self.settings_workspace_id.as_deref(),
+                    &active_id,
+                )
+                .unwrap_or(active_id)
+            };
+            let project_root = self.workspace_tree_root(&selected);
+            self.request_settings_snapshot_if_needed(&selected, project_root);
+        }
         // Remote 뷰모델을 현재 상태에서 구성 (UI는 서버를 직접 만지지 않는다 — disjoint 필드 차용).
         let remote_view = {
             let (running, addr, fp, token) = match &self.remote {
@@ -7465,7 +12374,6 @@ impl eframe::App for App {
         } else {
             Vec::new()
         };
-        let term_cfg = self.config.terminal.clone();
         let wsid = self.active.id.clone();
         let is_environment = self.settings_category == ui::settings::Category::Environment;
         let settings_env_wsid = is_environment
@@ -7506,23 +12414,25 @@ impl eframe::App for App {
                 .cloned()
         });
         // 환경변수 편집 게이트(E1 ⑤): 프로젝트 폴더가 지정된 워크스페이스만 .env 편집 허용.
-        let env_project_root = settings_env_wsid
-            .as_deref()
-            .and_then(|settings_id| self.workspace_tree_root(settings_id));
+        let env_project_root = settings_env_api_project.as_ref().and_then(|project| {
+            (!project.path.trim().is_empty() && !project.path_missing)
+                .then(|| PathBuf::from(&project.path))
+        });
         let env_project_rows_loading =
             self.env_api_projects_cache.is_none() && self.env_project_rows_pending;
         let env_project_rows_failed = self.env_project_rows_failed;
-        let db_path = self.db_path.clone();
         let mut activity_action = None;
         let mut notif_click = None;
         let mut settings_workspace_select: Option<String> = None;
-        let mut settings_ws_create: Option<std::path::PathBuf> = None;
+        let mut settings_ws_create: Option<PathBuf> = None;
+        let mut settings_folder_picker_requested = false;
         // Environment 프로젝트 닫기 확인 결정 — 설정 목록 숨김만 클로저 밖에서 처리한다.
         let mut env_project_close_decision: Option<bool> = None;
         let mut workspace_rename: Option<String> = None;
         let mut env_action: Option<ui::env_profiles::EnvAction> = None;
-        let mut credentials_changed = false;
-        let mut legacy_agent_started = false;
+        let mut agents_intent: Option<ui::agents::AgentsIntent> = None;
+        let mut credentials_intent: Option<ui::credentials::CredentialsIntent> = None;
+        let mut connector_intent: Option<connector_contract::ConnectorIntent> = None;
         // .env 라이브 반영 토글(E5 ⑨) — 클로저 안에서 편집하고 밖에서 저장/적용.
         let mut env_live_reload_toggle = self.config.ui.env_live_reload;
         // #3 워크스페이스 이름 편집 캡처 (클로저 밖에서 db/refresh 처리 — self 전체 &mut).
@@ -7545,19 +12455,9 @@ impl eframe::App for App {
                     // C::Credentials는 settings.rs가 Environment로 리다이렉트 — 분기 불필요
                     // (자격증명 UI는 Environment 뷰의 API 키 섹션으로 통합, 2026-07-09).
                     C::Connectors => {
-                        let ctx = ui.ctx().clone();
-                        let resolver = AppMcpScopedEnvResolver {
-                            secret_store: &self.secret_store,
-                            redaction: &self.redaction,
-                        };
-                        self.connectors_ui.contents(
-                            ui,
-                            &ctx,
-                            &mut self.db,
-                            &wsid,
-                            &resolver,
-                            &text,
-                        );
+                        connector_intent = self
+                            .connector_ui
+                            .render(ui, self.connector_snapshot_reader.snapshot());
                     }
                     C::Environment => {
                         // 이 화면은 참조 목업처럼 전용 monospace grid를 사용한다.
@@ -7649,9 +12549,7 @@ impl eframe::App for App {
                                     settings_workspace_select = Some(id);
                                 }
                                 ui::env_project_list::EnvProjectListAction::AddRequested => {
-                                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                                        settings_ws_create = Some(dir);
-                                    }
+                                    settings_folder_picker_requested = true;
                                 }
                                 ui::env_project_list::EnvProjectListAction::CloseRequested(id) => {
                                     // Environment 목록에서만 닫는 확인 모달. workspace DB,
@@ -7723,67 +12621,22 @@ impl eframe::App for App {
                                                     );
                                                 }
 
-                                                // env/API의 ○ reveal은 같은 bounded background
-                                                // keyring worker를 공유한다. callback은 캐시 hit을
-                                                // 넘기거나 요청을 enqueue할 뿐 UI thread I/O가 없다.
-                                                let generation = self.env_secret_generation;
-                                                let cache = &mut self.env_secret_cache;
-                                                let failures = &self.env_secret_failures;
-                                                let pending = &mut self.env_secret_pending;
-                                                let worker = &self.env_secret_reveal_worker;
-                                                let mut reveal = |credential_id: &str| {
-                                                    if let Some(value) = cache.remove(credential_id)
-                                                    {
-                                                        return Some(value);
-                                                    }
-                                                    if failures.contains(credential_id) {
-                                                        return None;
-                                                    }
-                                                    if pending.insert(credential_id.to_owned())
-                                                        && !worker.try_request(EnvSecretRevealJob {
-                                                            generation,
-                                                            credential_id: credential_id.to_owned(),
-                                                        })
-                                                    {
-                                                        pending.remove(credential_id);
-                                                    }
-                                                    None
-                                                };
-                                                match self.env_profiles_ui.contents_compact(
-                                                    ui,
-                                                    &mut self.db,
-                                                    &settings_wsid,
-                                                    env_project_root.as_deref(),
-                                                    &mut reveal,
-                                                    &text,
-                                                ) {
-                                                    Ok(a) => {
-                                                        if a.is_some() {
-                                                            env_action = a;
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        ui.colored_label(
-                                                            ui.visuals().error_fg_color,
-                                                            format!("{e:#}"),
-                                                        );
-                                                    }
+                                                if let Some(action) =
+                                                    self.env_profiles_ui.contents_compact(
+                                                        ui,
+                                                        &self.env_profiles_snapshot,
+                                                        &text,
+                                                    )
+                                                {
+                                                    env_action = Some(action);
                                                 }
 
-                                                let svc = AppCredentialService {
-                                                    db: &self.db,
-                                                    secret_store: &self.secret_store,
-                                                    redaction: &self.redaction,
-                                                    workspace_id: &settings_wsid,
-                                                };
-                                                if self.credentials_ui.contents_compact(
-                                                    ui,
-                                                    &svc,
-                                                    &mut reveal,
-                                                    &text,
-                                                ) {
-                                                    credentials_changed = true;
-                                                }
+                                                credentials_intent =
+                                                    self.credentials_ui.contents_compact(
+                                                        ui,
+                                                        &self.credentials_snapshot,
+                                                        &text,
+                                                    );
 
                                                 // .env 라이브 반영 토글(E5 ⑨ — 옵트인).
                                                 ui.add_space(14.0);
@@ -7792,19 +12645,6 @@ impl eframe::App for App {
                                                     text.t("env.live_reload", &[]),
                                                 )
                                                 .on_hover_text(text.t("env.live_reload_hint", &[]));
-
-                                                if !self.env_secret_pending.is_empty() {
-                                                    ui.horizontal(|ui| {
-                                                        ui.add(egui::Spinner::new().size(12.0));
-                                                        ui.weak(text.t("env.secret.loading", &[]));
-                                                    });
-                                                }
-                                                if !self.env_secret_failures.is_empty() {
-                                                    ui.colored_label(
-                                                        ui.visuals().error_fg_color,
-                                                        text.t("env.secret.load_failed", &[]),
-                                                    );
-                                                }
                                             });
                                     });
                             });
@@ -7834,15 +12674,7 @@ impl eframe::App for App {
                         }
                     }
                     C::Agents => {
-                        legacy_agent_started |= self.agents_ui.contents(
-                            ui,
-                            &self.db,
-                            &wsid,
-                            &term_cfg,
-                            &self.active.runtime,
-                            &db_path,
-                            &text,
-                        );
+                        agents_intent = self.agents_ui.contents(ui, &self.agents_snapshot, &text);
                     }
                     C::Workspaces => {
                         // 설정 전용 선택 목록. 여기서 workspace를 눌러도 sidebar 숨김 상태,
@@ -7854,9 +12686,8 @@ impl eframe::App for App {
                             .button(text.t("workspace.manager.new", &[]))
                             .on_hover_text(text.t("workspace.manager.new_hint", &[]))
                             .clicked()
-                            && let Some(dir) = rfd::FileDialog::new().pick_folder()
                         {
-                            settings_ws_create = Some(dir);
+                            settings_folder_picker_requested = true;
                         }
                         ui.add_space(6.0);
                         for ws in &self.workspaces {
@@ -7879,75 +12710,40 @@ impl eframe::App for App {
                 }
             },
         );
-        if self.connectors_ui.take_server_list_changed() {
-            self.mcp_count_cache = None;
+        if let Some(intent) = connector_intent {
+            let result = if matches!(
+                intent,
+                connector_contract::ConnectorIntent::InvokeTool { .. }
+            ) {
+                connector_service::InvocationContext::for_workspace(wsid.clone())
+                    .map_err(|_| connector_service::DispatchError::WorkerUnavailable)
+                    .and_then(|subject| {
+                        self.connector_coordinator
+                            .dispatch_for_subject(intent, subject)
+                    })
+            } else {
+                self.connector_coordinator.dispatch(intent)
+            };
+            if result.is_err() {
+                tracing::warn!("Connector intent dispatch failed");
+            }
         }
         // T1: 설정 창이 닫히면 세션 폴더 배너를 버린다 — 다음 우클릭 진입에서 재감지.
         if !self.settings_open {
             self.env_session_banner = None;
         }
-        // 설정 안의 선택/생성은 sidebar runtime 전환 경로와 완전히 분리한다. 기존 숨김
-        // workspace 선택은 숨김 표식을 그대로 두고, 새로 만든 항목도 설정에서만 관리할 수
-        // 있도록 숨김 상태로 시작한다. sidebar에는 사용자가 명시적으로 열 때만 나타난다.
-        if let Some(dir) = settings_ws_create {
-            let path_str = dir.to_string_lossy().into_owned();
-            if let Some(existing_id) = self
-                .workspaces
-                .iter()
-                .find(|workspace| {
-                    self.db
-                        .workspace_path(&workspace.id)
-                        .ok()
-                        .flatten()
-                        .as_deref()
-                        == Some(path_str.as_str())
-                })
-                .map(|workspace| workspace.id.clone())
-            {
-                if self.config.ui.hidden_env_project_ids.remove(&existing_id)
-                    && let Err(error) = self.config.save(&self.config_path)
-                {
-                    tracing::warn!(
-                        workspace_id = %existing_id,
-                        "Environment 프로젝트 복원 상태 저장 실패: {error:#}"
-                    );
-                }
-                settings_workspace_select = Some(existing_id);
-            } else {
-                let name = crate::agent_detect::project_display_name(
-                    &path_str,
-                    self.config.ui.session_name_style,
-                )
-                .or_else(|| {
-                    dir.file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                })
-                .unwrap_or_else(|| "workspace".to_owned());
-                match self.db.create_workspace(&name) {
-                    Ok(new_id) => {
-                        if let Err(error) = self.db.set_workspace_path(&new_id, &path_str) {
-                            tracing::warn!(
-                                workspace_id = %new_id,
-                                "설정 workspace 경로 저장 실패: {error:#}"
-                            );
-                        } else {
-                            self.save_workspace_anchor_for(&new_id);
-                            self.closed_workspaces
-                                .insert(new_id.clone(), ClosedWorkspaceState::Persisted);
-                            self.config.ui.closed_workspace_ids.insert(new_id.clone());
-                            if let Err(error) = self.config.save(&self.config_path) {
-                                tracing::warn!(
-                                    workspace_id = %new_id,
-                                    "설정 전용 workspace 숨김 상태 저장 실패: {error:#}"
-                                );
-                            }
-                            settings_workspace_select = Some(new_id);
-                            self.refresh_workspaces();
-                        }
-                    }
-                    Err(error) => tracing::warn!("설정 workspace 생성 실패: {error:#}"),
-                }
-            }
+        if settings_folder_picker_requested && self.pending_app_host_action.is_none() {
+            self.pending_app_host_action = Some(AppHostIoAction::FolderPicker(
+                FolderPickerPurpose::SelectWorkspaceInSettings,
+            ));
+            ui.ctx().request_repaint();
+        }
+        if let Some(path) = settings_ws_create
+            && path.as_os_str().as_encoded_bytes().len() <= APP_HOST_PATH_MAX_BYTES
+        {
+            self.pending_folder_picker_completion =
+                Some((FolderPickerPurpose::SelectWorkspaceInSettings, path));
+            ui.ctx().request_repaint();
         }
         if let Some(workspace_id) = settings_workspace_select
             && let Some(selected) = resolve_settings_workspace_id(
@@ -7960,8 +12756,107 @@ impl eframe::App for App {
             self.settings_workspace_id = Some(selected);
             self.invalidate_env_profile_ui();
         }
-        if legacy_agent_started {
-            self.reveal_active_workspace_for_new_session();
+        if let Some(intent) = agents_intent {
+            let current_revision = self.agents_snapshot.revision();
+            let registration_intent = matches!(&intent, ui::agents::AgentsIntent::Register { .. });
+            let action = match intent {
+                ui::agents::AgentsIntent::Register {
+                    revision,
+                    registration,
+                } if revision == current_revision => {
+                    Some(SettingsJobAction::RegisterAgent(registration))
+                }
+                ui::agents::AgentsIntent::Delete { revision, agent_id }
+                    if revision == current_revision =>
+                {
+                    Some(SettingsJobAction::DeleteAgent { agent_id })
+                }
+                ui::agents::AgentsIntent::Run {
+                    revision,
+                    agent_id,
+                    profile_id,
+                } if revision == current_revision => Some(SettingsJobAction::PrepareAgentLaunch {
+                    agent_id,
+                    profile_id,
+                    runtime_workspace_id: self.active.id.clone(),
+                }),
+                _ => {
+                    self.agents_ui.report_error(if registration_intent {
+                        ui::agents::AgentsUiErrorCode::RegistrationFailed
+                    } else {
+                        ui::agents::AgentsUiErrorCode::SnapshotUnavailable
+                    });
+                    None
+                }
+            };
+            if let Some(action) = action
+                && !self.queue_settings_action(&settings_wsid, env_project_root.clone(), action)
+            {
+                self.agents_ui.report_error(if registration_intent {
+                    ui::agents::AgentsUiErrorCode::RegistrationFailed
+                } else {
+                    ui::agents::AgentsUiErrorCode::SnapshotUnavailable
+                });
+            }
+        }
+        if let Some(intent) = credentials_intent {
+            let current_revision = self.credentials_snapshot.revision();
+            let failure = match &intent {
+                ui::credentials::CredentialsIntent::Add { .. } => {
+                    ui::credentials::CredentialsUiErrorCode::AddFailed
+                }
+                ui::credentials::CredentialsIntent::Delete { .. } => {
+                    ui::credentials::CredentialsUiErrorCode::DeleteFailed
+                }
+                ui::credentials::CredentialsIntent::Reveal { .. } => {
+                    ui::credentials::CredentialsUiErrorCode::RevealFailed
+                }
+                ui::credentials::CredentialsIntent::ScanOrphans { .. } => {
+                    ui::credentials::CredentialsUiErrorCode::OrphanScanFailed
+                }
+                ui::credentials::CredentialsIntent::PurgeOrphans { .. } => {
+                    ui::credentials::CredentialsUiErrorCode::OrphanPurgeFailed
+                }
+            };
+            let action = match intent {
+                ui::credentials::CredentialsIntent::Add {
+                    revision,
+                    credential,
+                } if revision == current_revision => {
+                    Some(SettingsJobAction::AddCredential { credential })
+                }
+                ui::credentials::CredentialsIntent::Delete {
+                    revision,
+                    credential_id,
+                } if revision == current_revision => {
+                    Some(SettingsJobAction::DeleteCredential { credential_id })
+                }
+                ui::credentials::CredentialsIntent::Reveal {
+                    revision,
+                    credential_id,
+                } if revision == current_revision => {
+                    Some(SettingsJobAction::RevealCredential { credential_id })
+                }
+                ui::credentials::CredentialsIntent::ScanOrphans { revision }
+                    if revision == current_revision =>
+                {
+                    Some(SettingsJobAction::ScanOrphanCredentials)
+                }
+                ui::credentials::CredentialsIntent::PurgeOrphans {
+                    revision,
+                    credential_ids,
+                } if revision == current_revision => {
+                    Some(SettingsJobAction::PurgeOrphanCredentials { credential_ids })
+                }
+                _ => None,
+            };
+            if action.is_none()
+                || !action.is_some_and(|action| {
+                    self.queue_settings_action(&settings_wsid, env_project_root.clone(), action)
+                })
+            {
+                self.credentials_ui.report_error(failure);
+            }
         }
         // 관리/모니터 액션 처리 (클로저 밖 — self 전체 &mut 필요한 것들)
         if env_live_reload_toggle != self.config.ui.env_live_reload {
@@ -7972,74 +12867,83 @@ impl eframe::App for App {
             // 다음 동기화가 세션 기본 env(활성 조건)를 갱신한다 — 새 셸부터 적용.
             self.sync_dotenv_env();
         }
-        if credentials_changed {
-            self.invalidate_env_profile_ui();
-            self.invalidate_env_api_projects();
-        }
         if let Some(name) = workspace_rename {
             // E3: name 컬럼은 별칭 — 빈 값 허용(별칭 해제, 폴더명만 표시).
-            let name = name.trim();
-            if let Err(e) = self.db.rename_workspace(&settings_wsid, name) {
-                tracing::warn!("워크스페이스 이름 저장 실패: {e:#}");
-            } else {
-                self.refresh_workspaces();
+            if !self.queue_global_settings_action(
+                &settings_wsid,
+                SettingsJobAction::RenameWorkspace {
+                    name: name.trim().to_owned(),
+                },
+            ) {
+                tracing::warn!("workspace rename worker unavailable");
             }
         }
-        // 환경 메뉴에서 프로젝트 폴더 설정 → workspace path 저장 + .env 재동기화 + 파일트리 루트.
-        if let Some(ui::env_profiles::EnvAction::DotenvWrite { key, value }) = &env_action {
-            // 7·8번(2026-07-10): UI 편집을 .env 파일에 라인 단위 반영 → 즉시 재동기화.
-            if let Some(root) = self.active_tree_root() {
-                if let Err(e) = crate::dotenv_sync::write_env_var(&root, key, value.as_deref()) {
-                    tracing::warn!(".env 기록 실패: {e:#}");
-                } else {
-                    self.sync_settings_workspace_dotenv(&settings_wsid);
-                    self.invalidate_env_profile_ui();
-                    self.invalidate_env_api_projects();
-                }
-            }
-        }
-        if let Some(ui::env_profiles::EnvAction::Resync) = env_action {
-            // 리프레시(4번): .env 계열 재스캔 + UI/카운트 캐시 무효화.
-            self.sync_settings_workspace_dotenv(&settings_wsid);
-            self.invalidate_env_profile_ui();
-            self.credentials_ui.invalidate_cache();
-            self.invalidate_env_api_projects();
-        }
-        if let Some(ui::env_profiles::EnvAction::SetProjectPath(path)) = env_action {
-            let path_str = path.to_string_lossy().into_owned();
-            if let Err(e) = self.db.set_workspace_path(&settings_wsid, &path_str) {
-                tracing::warn!("프로젝트 폴더 저장 실패: {e:#}");
-            } else {
-                if path_str.trim().is_empty() {
-                    // 해제(2026-07-10): dotenv profile/변수/전용 credential 정리 —
-                    // 해제했는데 관련 키가 화면·주입에 남지 않게. .env가 원본이라 안전.
-                    if let Err(e) = crate::dotenv_sync::remove_workspace_dotenv(
-                        &mut self.db,
-                        &self.secret_store,
-                        &settings_wsid,
-                    ) {
-                        tracing::warn!("dotenv 정리 실패: {e:#}");
+        // Leaf는 snapshot만 읽고 intent를 하나 반환한다. 파일 picker·DB·keyring·파일 쓰기는
+        // 모두 render closure가 끝난 뒤 bounded worker/action 경계에서 처리한다.
+        if let Some(action) = env_action {
+            let action = match action {
+                ui::env_profiles::EnvAction::ChooseProjectFolder => {
+                    if self.pending_app_host_action.is_none() {
+                        self.pending_app_host_action = Some(AppHostIoAction::FolderPicker(
+                            FolderPickerPurpose::SetProjectPath {
+                                workspace_id: settings_wsid.clone(),
+                            },
+                        ));
+                        ui.ctx().request_repaint();
                     }
-                    self.invalidate_env_profile_ui();
-                    self.credentials_ui.invalidate_cache();
-                    self.invalidate_env_api_projects();
+                    None
                 }
-                self.save_workspace_anchor_for(&settings_wsid); // rename 복구용 (dev,ino) 앵커
-                self.dismissed_renames.remove(&settings_wsid);
-                self.sync_settings_workspace_dotenv(&settings_wsid);
-                // 설정 대상이 실제 active와 같을 때만 runtime/file-tree에 반영한다. 비활성
-                // settings selection은 sidebar focus/runtime을 건드리지 않는다.
-                if settings_wsid == self.active.id {
-                    let new_cwd = std::path::PathBuf::from(&path_str);
-                    let cwd = (new_cwd.is_dir()).then_some(new_cwd);
-                    let _ = self
-                        .active
-                        .runtime
-                        .send_command(runtime::RuntimeCommand::SetShellCwd(cwd));
-                    self.refresh_file_tree_root();
+                action => Some(action),
+            };
+            if let Some(action) = action {
+                let queued = match action {
+                    ui::env_profiles::EnvAction::Resync => {
+                        self.sync_settings_workspace_dotenv(&settings_wsid)
+                    }
+                    ui::env_profiles::EnvAction::RevealSecret {
+                        profile_id,
+                        key,
+                        reveal_handle,
+                    } => {
+                        let queued =
+                            self.env_secret_reveal_worker
+                                .try_request(EnvSecretRevealJob {
+                                    generation: self.env_secret_generation,
+                                    target: EnvSecretRevealTarget::EnvRow {
+                                        profile_id: profile_id.clone(),
+                                        key: key.clone(),
+                                        credential_id: reveal_handle,
+                                    },
+                                });
+                        if !queued {
+                            self.env_profiles_ui.reject_reveal(&profile_id, &key);
+                        }
+                        queued
+                    }
+                    ui::env_profiles::EnvAction::DotenvWrite { key, value } => self
+                        .queue_settings_action(
+                            &settings_wsid,
+                            env_project_root.clone(),
+                            SettingsJobAction::WriteDotenv { key, value },
+                        ),
+                    ui::env_profiles::EnvAction::DeleteLegacyVar { profile_id, key } => self
+                        .queue_settings_action(
+                            &settings_wsid,
+                            env_project_root.clone(),
+                            SettingsJobAction::DeleteLegacyVar { profile_id, key },
+                        ),
+                    ui::env_profiles::EnvAction::SetProjectPath(path) => self
+                        .queue_settings_action(
+                            &settings_wsid,
+                            env_project_root.clone(),
+                            SettingsJobAction::SetProjectPath { path },
+                        ),
+                    ui::env_profiles::EnvAction::ChooseProjectFolder => true,
+                };
+                if !queued {
+                    self.env_profiles_ui
+                        .report_error(ui::env_profiles::EnvUiErrorCode::SnapshotUnavailable);
                 }
-                // 표시명은 workspace_display_name이 path에서 파생한다(E3) — 별도 갱신 불필요.
-                self.refresh_workspaces();
             }
         }
         // Environment 프로젝트 닫기는 설정 목록의 영속 숨김 상태만 바꾼다. workspace
@@ -8068,71 +12972,6 @@ impl eframe::App for App {
                 }
                 Some(false) => self.env_project_close_confirm = None,
                 None => {}
-            }
-        }
-        // 새 워크스페이스 생성(B안) — 폴더명으로 만들고 path/앵커 저장 후 즉시 전환.
-        // 전환(switch_workspace → make_runtime)이 DB의 path/.env를 읽으므로 저장이 먼저다.
-        let mut ws_switch: Option<String> = None;
-        let mut ws_created = false;
-        if let Some(dir) = ws_create {
-            let path_str = dir.to_string_lossy().into_owned();
-            // 같은 폴더의 워크스페이스가 이미 있으면 새로 만들지 않고 그리로 전환
-            // (중복 생성 방지 — path unique 제약이 없다, codex Medium).
-            if let Some(existing) = self.workspaces.iter().find(|ws| {
-                self.db.workspace_path(&ws.id).ok().flatten().as_deref() == Some(path_str.as_str())
-            }) {
-                ws_switch = Some(existing.id.clone());
-            } else {
-                let name = crate::agent_detect::project_display_name(
-                    &path_str,
-                    self.config.ui.session_name_style,
-                )
-                .or_else(|| dir.file_name().map(|n| n.to_string_lossy().into_owned()))
-                .unwrap_or_else(|| "workspace".to_owned());
-                match self.db.create_workspace(&name) {
-                    Ok(new_id) => {
-                        if let Err(e) = self.db.set_workspace_path(&new_id, &path_str) {
-                            // path 없는 워크스페이스로 전환하면 복원/.env가 엉뚱한 루트
-                            // 기준으로 시작한다 — 전환하지 않는다(codex Low).
-                            tracing::warn!("새 워크스페이스 경로 저장 실패 — 전환 취소: {e:#}");
-                        } else {
-                            let anchor = Self::folder_anchor(&path_str);
-                            let _ = self.db.set_workspace_anchor(
-                                &new_id,
-                                anchor.map(|a| a.0),
-                                anchor.map(|a| a.1),
-                            );
-                            ws_switch = Some(new_id);
-                            ws_created = true;
-                        }
-                    }
-                    Err(e) => tracing::warn!("워크스페이스 생성 실패: {e:#}"),
-                }
-            }
-        }
-        // 같은 폴더 재선택 등으로 대상이 **이미 활성**이면 아래 filter가 전환을 걸러
-        // switch_workspace의 숨김 해제가 안 돈다 — 여기서 명시적으로 해제해 종료로
-        // 숨긴 활성 워크스페이스도 목록에 복귀시킨다.
-        if let Some(id) = &ws_switch {
-            self.reveal_closed_workspace(id);
-        }
-        if let Some(id) = ws_switch.filter(|id| *id != self.active.id) {
-            let switched_new = ws_created;
-            {
-                self.switch_workspace(&id);
-                self.refresh_workspaces();
-            }
-            // 새로 만든 워크스페이스면 .env를 즉시 동기화 — 2s 폴링을 기다리지 않고
-            // 첫 셸부터 그 폴더의 env를 받게 한다(B안).
-            if switched_new {
-                self.sync_dotenv_env();
-                // 새 워크스페이스는 빈 채로 두지 않고 세션 하나를 바로 연다
-                // (2026-07-18 사용자) — 전환 직후 활성이 새 워크스페이스라 그 셸이
-                // 해당 폴더에서 뜬다.
-                self.active.workspace_ui.spawn_shell(
-                    &self.active.runtime,
-                    self.config.terminal.scrollback_lines as usize,
-                );
             }
         }
         match activity_action {
@@ -8170,7 +13009,6 @@ impl eframe::App for App {
                         session,
                     } => {
                         self.switch_workspace(&workspace_id);
-                        self.refresh_workspaces();
                         self.pending_focus = Some((workspace_id, session));
                     }
                     AgentNotificationNavigation::OpenStructured {
@@ -8179,7 +13017,6 @@ impl eframe::App for App {
                     } => {
                         if let Some(workspace_id) = switch_workspace {
                             self.switch_workspace(&workspace_id);
-                            self.refresh_workspaces();
                         }
                         self.agent_sessions_ui.open_session(&session_id);
                     }
@@ -8189,8 +13026,7 @@ impl eframe::App for App {
                 self.settings_open = false;
                 ui.ctx()
                     .send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
-                ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(50));
+                ui.ctx().request_repaint();
             }
         }
         if out.config_changed {
@@ -8198,6 +13034,7 @@ impl eframe::App for App {
             if self.i18n.locale() != self.config.i18n.locale {
                 self.i18n = load_catalog(&self.config.i18n.locale);
                 self.agent_sessions_ui.set_catalog(&self.i18n);
+                self.connector_ui.set_catalog(&self.i18n);
             }
             // hot reload: 테마는 즉시 적용 (터미널 캐시 clear는 ui() 상단의 실효 테마
             // 감지가 다음 프레임에 처리 — System 전환까지 한 경로로 커버).
@@ -8266,8 +13103,12 @@ impl eframe::App for App {
                 }
             }
             ui::settings::WebRemoteAction::OpenApproveUrl(url) => {
-                // tailnet 관리 콘솔 승인 — 앱이 대신할 수 없는 유일한 단계.
-                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                // tailnet 관리 콘솔 승인은 app-owned host worker에서만 연다. Render는
+                // bounded URL intent 한 건만 보존하고 subprocess를 직접 만들지 않는다.
+                if self.pending_app_host_action.is_none() && is_bounded_https_url(&url) {
+                    self.pending_app_host_action = Some(AppHostIoAction::ExternalHttpsUrl(url));
+                    ui.ctx().request_repaint();
+                }
             }
             ui::settings::WebRemoteAction::None => {}
         }
@@ -8680,6 +13521,132 @@ mod tests {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+
+    fn slack_inventory_row(
+        id: &str,
+        enabled: bool,
+        tool_count: usize,
+    ) -> mcp_store::McpServerInventoryRow {
+        mcp_store::McpServerInventoryRow {
+            id: id.to_owned(),
+            name: "Slack".to_owned(),
+            kind: "http".to_owned(),
+            url: Some(SLACK_MCP_URL.to_owned()),
+            enabled,
+            tool_count,
+        }
+    }
+
+    #[test]
+    fn slack_projection은_duplicate_canonical_rows를_fail_closed한다() {
+        let projection = connector_slack_projection(&[
+            slack_inventory_row("slack-a", true, 1),
+            slack_inventory_row("slack-b", true, 2),
+        ]);
+
+        assert_eq!(projection.status, connector_contract::SlackStatus::Failed);
+        assert_eq!(projection.server_id, None);
+        assert_eq!(projection.tool_count, 0);
+        assert!(!projection.can_choose_workspace);
+    }
+
+    #[test]
+    fn slack_projection은_single_canonical_row만_exposes한다() {
+        let projection = connector_slack_projection(&[slack_inventory_row("slack-a", true, 2)]);
+
+        assert_eq!(
+            projection.status,
+            connector_contract::SlackStatus::Connected
+        );
+        assert_eq!(
+            projection.server_id.as_ref().map(|id| id.as_str()),
+            Some("slack-a")
+        );
+        assert_eq!(projection.tool_count, 2);
+        assert!(projection.can_choose_workspace);
+    }
+
+    #[test]
+    fn connector_import_file은_exact_byte_ceiling만_허용한다() {
+        let path = temp_db_path("connector-import-byte-ceiling");
+        let limit = connector_contract::ResourceLimits::PRODUCTION_CEILING.import_input_bytes;
+        std::fs::write(&path, vec![b'x'; limit]).unwrap();
+        assert_eq!(read_connector_import_file(&path).unwrap().len(), limit);
+
+        std::fs::write(&path, vec![b'x'; limit + 1]).unwrap();
+        assert_eq!(
+            read_connector_import_file(&path).unwrap_err(),
+            connector_contract::ErrorCode::LimitExceeded
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn connector_host_worker_failure는_exact_import를_fail_closed한다() {
+        let operation_id = connector_contract::OperationId::new("import-op");
+        let action = connector_service::HostAction::RequestImportSource {
+            operation_id: operation_id.clone(),
+            source: connector_contract::ImportSourceRequest::ClaudeDesktop,
+        };
+        let completion =
+            AppHostIoFallback::for_action(&AppHostIoAction::Connector(action)).into_completion();
+
+        assert!(matches!(
+            completion,
+            AppHostIoCompletion::Dispatch(
+                connector_contract::ConnectorIntent::FailImportSource {
+                    operation_id: failed_operation,
+                    source: connector_contract::ImportSource::ClaudeDesktop,
+                    error_code: connector_contract::ErrorCode::HostUnavailable,
+                }
+            ) if failed_operation == operation_id
+        ));
+    }
+
+    #[test]
+    fn app_host_folder_picker_failure는_빈_completion으로_닫힌다() {
+        let completion = AppHostIoFallback::for_action(&AppHostIoAction::FolderPicker(
+            FolderPickerPurpose::SelectWorkspaceInSettings,
+        ))
+        .into_completion();
+
+        assert!(matches!(
+            completion,
+            AppHostIoCompletion::FolderPicker {
+                purpose: FolderPickerPurpose::SelectWorkspaceInSettings,
+                selected_path: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn app_host_https_url은_exact_bound와_scheme을_강제한다() {
+        let mut exact = "https://".to_owned();
+        exact.push_str(&"a".repeat(APP_HOST_URL_MAX_BYTES - exact.len()));
+        assert!(is_bounded_https_url(&exact));
+        exact.push('a');
+        assert!(!is_bounded_https_url(&exact));
+        assert!(!is_bounded_https_url("http://example.com"));
+        assert!(!is_bounded_https_url("https://example.com\nsecret"));
+    }
+
+    #[test]
+    fn app_host_composer_history는_bounded_atomic_jsonl을_쓴다() {
+        let path = temp_db_path("composer-history").with_extension("jsonl");
+        let history: Arc<[Arc<str>]> =
+            vec![Arc::<str>::from("one"), Arc::<str>::from("two")].into();
+        assert!(write_composer_history(&path, &history));
+        let lines = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(lines, "\"one\"\n\"two\"\n");
+
+        let oversized: Arc<[Arc<str>]> = (0..=ui::composer::COMPOSER_HISTORY_MAX_ITEMS)
+            .map(|index| Arc::<str>::from(index.to_string()))
+            .collect::<Vec<_>>()
+            .into();
+        assert!(!write_composer_history(&path, &oversized));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), lines);
+        std::fs::remove_file(path).unwrap();
+    }
 
     /// codex P2 회귀: FocusComposer 바인딩이 다른 액션과 충돌하면 dispatcher가 열기를
     /// 억제하므로 접힘 단축키도 함께 없어져야 한다(비대칭 방지).
@@ -9251,66 +14218,106 @@ mod tests {
     }
 
     #[test]
-    fn credentials_service_add_delete_owns_db_and_secret_side_effects() {
-        let path = temp_db_path("credentials-service");
+    fn physical_credential_delete_commits_metadata_before_exact_bundle_cleanup() {
+        let path = temp_db_path("physical-credential-delete");
         let db = storage::Db::open(&path).unwrap();
         let store = MemSecretStore::new();
-        let redaction = secret::RedactionService::new();
-        let service = AppCredentialService {
-            db: &db,
-            secret_store: &store,
-            redaction: &redaction,
-            workspace_id: "ws-test",
-        };
-
-        ui::credentials::CredentialService::add_credential(
-            &service,
-            ui::credentials::NewCredential {
-                provider: "test".to_owned(),
-                label: "unit".to_owned(),
-                credential_kind: "api_key".to_owned(),
-                secret: "sk-test-boundary-secret".to_owned(),
-            },
+        let logical = secret::LogicalCredentialId::new(uuid::Uuid::new_v4().to_string()).unwrap();
+        let plan = secret::SecretBundleStagePlan::allocate(logical.clone(), None).unwrap();
+        db.register_physical_secret_slot_staging(logical.as_str(), plan.new_slot().as_str())
+            .unwrap();
+        let access = secret::SecretString::new("sk-test-boundary-secret".to_owned());
+        secret::stage_secret_bundle(
+            &store,
+            &plan,
+            secret::SecretBundleRef::new(&access, None, None),
         )
         .unwrap();
+        let meta = crate::storage::CredentialMeta {
+            id: logical.as_str().to_owned(),
+            provider: "test".to_owned(),
+            label: "unit".to_owned(),
+            credential_kind: "api_key".to_owned(),
+            masked_hint: Some(secret::masked_hint(access.expose())),
+            workspace_id: Some("ws-test".to_owned()),
+        };
+        db.insert_credential_with_secret_slot(&meta, plan.new_slot().as_str(), None)
+            .unwrap();
 
         let rows = db.list_credentials().unwrap();
         assert_eq!(rows.len(), 1);
-        assert!(store.contains(&rows[0].id));
+        assert!(store.contains(plan.new_slot().as_str()));
 
-        ui::credentials::CredentialService::delete_credential(&service, &rows[0].id).unwrap();
+        delete_settings_credential(&db, &store, logical.as_str()).unwrap();
         assert!(db.list_credentials().unwrap().is_empty());
-        assert!(!store.contains(&rows[0].id));
+        assert!(!store.contains(plan.new_slot().as_str()));
+        assert!(
+            db.physical_secret_slots_for_reconciliation(1)
+                .unwrap()
+                .is_empty()
+        );
 
         drop(db);
         remove_sqlite_files(&path);
     }
 
     #[test]
-    fn connectors_oauth_secret_adapter_stores_access_and_refresh_tokens() {
+    fn startup_secret_migration_is_physical_complete_and_idempotent() {
+        let path = temp_db_path("startup-secret-migration");
+        let db = storage::Db::open(&path).unwrap();
         let store = MemSecretStore::new();
-        let redaction = secret::RedactionService::new();
-        let service = AppOAuthCredentialStore {
-            secret_store: &store,
-            redaction: &redaction,
-        };
-        let token = auth::OAuthToken {
-            access_token: secret::SecretString::new("access-token-secret".to_owned()),
-            refresh_token: Some(secret::SecretString::new("refresh-token-secret".to_owned())),
-            expires_in_secs: Some(3600),
-            provider_workspace_id: None,
-        };
+        let logical_id = uuid::Uuid::new_v4().to_string();
+        let access = secret::SecretString::new("legacy-access-secret".to_owned());
+        let refresh = secret::SecretString::new("legacy-refresh-secret".to_owned());
+        let dcr = secret::SecretString::new("legacy-dcr-secret".to_owned());
+        secret::SecretStore::set_secret(&store, &logical_id, &access).unwrap();
+        secret::SecretStore::set_secret(&store, &auth::refresh_entry_id(&logical_id), &refresh)
+            .unwrap();
+        secret::SecretStore::set_secret(&store, &auth::dcr_secret_entry_id(&logical_id), &dcr)
+            .unwrap();
+        db.insert_credential(&crate::storage::CredentialMeta {
+            id: logical_id.clone(),
+            provider: "legacy".to_owned(),
+            label: "migration".to_owned(),
+            credential_kind: "oauth_token".to_owned(),
+            masked_hint: Some(secret::masked_hint(access.expose())),
+            workspace_id: None,
+        })
+        .unwrap();
 
-        let stored =
-            ui::connectors::OAuthCredentialStore::store_oauth_token(&service, &token).unwrap();
+        reconcile_and_migrate_startup_secrets(&db, &store).unwrap();
+        let location = db.credential_secret_location(&logical_id).unwrap().unwrap();
+        let logical = secret::LogicalCredentialId::new(logical_id.clone()).unwrap();
+        let physical = secret::PhysicalSecretSlot::parse(location.keyring_username).unwrap();
+        assert!(physical.belongs_to(&logical));
+        assert!(store.contains(physical.as_str()));
+        assert!(store.contains(&physical.refresh_entry_id()));
+        assert!(store.contains(&physical.dcr_entry_id()));
+        assert!(!store.contains(&logical_id));
+        assert!(!store.contains(&auth::refresh_entry_id(&logical_id)));
+        assert!(!store.contains(&auth::dcr_secret_entry_id(&logical_id)));
+        let ledger = db.physical_secret_slots_for_reconciliation(1).unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].state, storage::PhysicalSecretSlotState::Published);
+        assert!(ledger[0].legacy_cleanup_username.is_none());
 
-        assert!(store.contains(&stored.id));
-        assert!(store.contains(&auth::refresh_entry_id(&stored.id)));
-        assert_eq!(stored.masked_hint, "****cret");
+        reconcile_and_migrate_startup_secrets(&db, &store).unwrap();
+        assert_eq!(
+            db.credential_secret_location(&logical_id)
+                .unwrap()
+                .unwrap()
+                .keyring_username,
+            physical.as_str()
+        );
+        assert_eq!(
+            db.physical_secret_slots_for_reconciliation(1)
+                .unwrap()
+                .len(),
+            1
+        );
 
-        ui::connectors::OAuthCredentialStore::delete_oauth_token(&service, &stored.id).unwrap();
-        assert!(!store.contains(&stored.id));
-        assert!(!store.contains(&auth::refresh_entry_id(&stored.id)));
+        drop(db);
+        remove_sqlite_files(&path);
     }
 
     #[test]
@@ -9358,57 +14365,558 @@ h:1 EE:FF
     }
 
     #[test]
-    fn approval_watcher_empty_db는_repaint를_예약하지_않는다() {
-        let path = temp_db_path("approval-empty");
-        let db = storage::Db::open(&path).unwrap();
+    fn approval_wake_hub는_생성만으로_thread나_repaint를_만들지_않는다() {
+        let path = temp_db_path("approval-lazy");
         let ctx = egui::Context::default();
         let (tx, rx) = std::sync::mpsc::channel();
         ctx.set_request_repaint_callback(move |info| {
             let _ = tx.send(info.delay);
         });
-        let poll_requested = Arc::new(AtomicBool::new(false));
-        let mut watcher = ApprovalWatcher::spawn(
-            path.clone(),
-            ctx,
-            poll_requested.clone(),
-            std::time::Duration::from_millis(20),
-        );
 
-        std::thread::sleep(std::time::Duration::from_millis(90));
-
+        let db = storage::Db::open(&path).unwrap();
+        let owner = Arc::new(db.acquire_pending_approval_owner().unwrap());
+        let hub = ApprovalWakeHub::new(path, ctx, owner);
+        assert!(hub.slot.is_none());
+        assert!(hub.is_idle());
         assert!(rx.try_recv().is_err());
-        assert!(!poll_requested.load(Ordering::Acquire));
-        watcher.stop();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approval_wake_hub는_ready_race중_stop도_즉시_join한다() {
+        let path = temp_db_path("approval-stop-race");
+        let db = storage::Db::open(&path).unwrap();
+        let owner = Arc::new(db.acquire_pending_approval_owner().unwrap());
+        let mut hub = ApprovalWakeHub::new(path.clone(), egui::Context::default(), owner);
+        hub.ensure_started().unwrap();
+        let started = std::time::Instant::now();
+        hub.stop();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        drop(db);
+        remove_sqlite_files(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approval_wake_hub는_published_socket이_unlink돼도_stop한다() {
+        let path = temp_db_path("approval-stop-unlinked");
+        let db = storage::Db::open(&path).unwrap();
+        let owner = Arc::new(db.acquire_pending_approval_owner().unwrap());
+        let mut hub = ApprovalWakeHub::new(path.clone(), egui::Context::default(), owner);
+        hub.ensure_started().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let socket_path = loop {
+            if let Some(path) = hub.poll_ready().unwrap() {
+                break path;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        std::fs::remove_file(&socket_path).unwrap();
+        let started = std::time::Instant::now();
+        hub.stop();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        drop(db);
+        remove_sqlite_files(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approval_wake_hub는_datagram_후에만_bounded_snapshot을_발행한다() {
+        let path = temp_db_path("approval-wake");
+        let db = storage::Db::open(&path).unwrap();
+        let owner = Arc::new(db.acquire_pending_approval_owner().unwrap());
+        let ctx = egui::Context::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        ctx.set_request_repaint_callback(move |info| {
+            let _ = tx.send(info.delay);
+        });
+        let mut hub = ApprovalWakeHub::new(path.clone(), ctx, owner);
+        hub.ensure_started().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let socket_path = loop {
+            if let Some(path) = hub.poll_ready().unwrap() {
+                break path;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "listener ready timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        while hub.take_snapshot().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "initial snapshot timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        while rx.try_recv().is_ok() {}
+
+        db.insert_pending_approval("req-1", "srv", "tool", "{}", None, 100, None)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(hub.take_snapshot().is_none());
+        assert!(rx.try_recv().is_err());
+
+        let socket = std::os::unix::net::UnixDatagram::unbound().unwrap();
+        assert_eq!(
+            socket
+                .send_to(&[APPROVAL_WAKE_MARKER], &socket_path)
+                .unwrap(),
+            1
+        );
+        let snapshot = loop {
+            if let Some(snapshot) = hub.take_snapshot() {
+                break snapshot;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "wake snapshot timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+
+        assert_eq!(snapshot.rows.len(), 1);
+        assert_eq!(snapshot.rows[0].id, "req-1");
+        hub.enqueue(ApprovalWorkerCommand::Resolve {
+            id: "req-1".to_owned(),
+            allowed: false,
+            remember: false,
+            resolved_at: 101,
+        })
+        .unwrap();
+        let mut resolved = false;
+        loop {
+            let _ = hub.poll_ready().unwrap();
+            resolved |= hub
+                .drain_results()
+                .into_iter()
+                .any(|result| matches!(result, ApprovalWorkerResult::Resolved));
+            if hub
+                .take_snapshot()
+                .is_some_and(|snapshot| snapshot.rows.is_empty())
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resolve snapshot timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if !resolved {
+            resolved = hub
+                .drain_results()
+                .into_iter()
+                .any(|result| matches!(result, ApprovalWorkerResult::Resolved));
+        }
+        assert!(resolved);
+        assert!(hub.is_idle());
+        hub.stop();
+        assert!(!socket_path.exists());
+        drop(db);
+        remove_sqlite_files(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approval_wake_hub는_outstanding_8개를_넘지않고_full_result에서도_stop한다() {
+        let path = temp_db_path("approval-result-cap");
+        let db = storage::Db::open(&path).unwrap();
+        let owner = Arc::new(db.acquire_pending_approval_owner().unwrap());
+        let mut hub = ApprovalWakeHub::new(path.clone(), egui::Context::default(), owner);
+        hub.ensure_started().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while hub.poll_ready().unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for index in 0..APPROVAL_COMMAND_CAP {
+            hub.enqueue(ApprovalWorkerCommand::Resolve {
+                id: format!("missing-{index}"),
+                allowed: false,
+                remember: false,
+                resolved_at: 100,
+            })
+            .unwrap();
+        }
+        assert_eq!(hub.inflight, APPROVAL_COMMAND_CAP);
+        assert_eq!(
+            hub.enqueue(ApprovalWorkerCommand::Resolve {
+                id: "overflow".to_owned(),
+                allowed: false,
+                remember: false,
+                resolved_at: 100,
+            }),
+            Err(ApprovalWakeErrorCode::Backpressure)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let started = std::time::Instant::now();
+        hub.stop();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
         drop(db);
         remove_sqlite_files(&path);
     }
 
     #[test]
-    fn approval_watcher_pending_삽입시_ui를_깨운다() {
-        let path = temp_db_path("approval-pending");
-        let db = storage::Db::open(&path).unwrap();
-        let ctx = egui::Context::default();
-        let (tx, rx) = std::sync::mpsc::channel();
-        ctx.set_request_repaint_callback(move |info| {
-            let _ = tx.send(info.delay);
-        });
-        let poll_requested = Arc::new(AtomicBool::new(false));
-        let mut watcher = ApprovalWatcher::spawn(
-            path.clone(),
-            ctx,
-            poll_requested.clone(),
-            std::time::Duration::from_millis(20),
+    fn approval_launch_tracker는_same_config_fifo와_session_cleanup을_보존한다() {
+        let now = std::time::Instant::now();
+        let mut tracker = ApprovalLaunchTracker::default();
+        let first = tracker
+            .reserve("ws".to_owned(), "agent".to_owned(), now)
+            .unwrap();
+        let second = tracker
+            .reserve("ws".to_owned(), "agent".to_owned(), now)
+            .unwrap();
+        assert!(tracker.mark_spawn_sent(first, now));
+        assert!(tracker.correlate("ws", "agent", Some(runtime::SessionId(41))));
+        assert_eq!(
+            tracker.live.get(&("ws".to_owned(), runtime::SessionId(41))),
+            Some(&first)
+        );
+        assert_eq!(
+            tracker.pending.front().map(|ticket| ticket.id),
+            Some(second)
         );
 
-        db.insert_pending_approval("req-1", "srv", "tool", "{}", None, 100, None)
-            .unwrap();
+        assert!(tracker.observe_session_exit("ws", runtime::SessionId(41)));
+        assert_eq!(
+            tracker.pending_denials(now),
+            vec![("ws".to_owned(), runtime::SessionId(41))]
+        );
+        tracker.mark_deny_queued("ws", runtime::SessionId(41));
+        assert!(tracker.pending_denials(now).is_empty());
+        assert_eq!(
+            tracker.finish_session("ws", runtime::SessionId(41), true, now),
+            None
+        );
+        assert!(
+            !tracker
+                .live
+                .contains_key(&("ws".to_owned(), runtime::SessionId(41)))
+        );
+    }
 
-        let delay = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
-        assert_eq!(delay, std::time::Duration::ZERO);
-        assert!(poll_requested.load(Ordering::Acquire));
-        watcher.stop();
+    #[test]
+    fn approval_launch_tracker는_8개_cap과_deadline을_강제한다() {
+        let now = std::time::Instant::now();
+        let mut tracker = ApprovalLaunchTracker::default();
+        for index in 0..APPROVAL_LAUNCH_CAP {
+            tracker
+                .reserve("ws".to_owned(), format!("agent-{index}"), now)
+                .unwrap();
+        }
+        assert_eq!(
+            tracker.reserve("ws".to_owned(), "overflow".to_owned(), now),
+            Err(ApprovalWakeErrorCode::Backpressure)
+        );
+        let expired = tracker.expire(now + APPROVAL_SPAWN_DEADLINE);
+        assert_eq!(expired.len(), APPROVAL_LAUNCH_CAP);
+        assert!(tracker.is_empty());
+    }
+
+    #[test]
+    fn approval_launch_tracker는_spawn_sent_ticket을_deadline후에도_상관시킨다() {
+        let now = std::time::Instant::now();
+        let mut tracker = ApprovalLaunchTracker::default();
+        let ticket = tracker
+            .reserve("ws".to_owned(), "agent".to_owned(), now)
+            .unwrap();
+        assert!(tracker.mark_spawn_sent(ticket, now));
+        assert!(
+            tracker
+                .expire(now + APPROVAL_SPAWN_DEADLINE + std::time::Duration::from_secs(1))
+                .is_empty()
+        );
+        assert!(tracker.correlate("ws", "agent", Some(runtime::SessionId(42))));
+        assert_eq!(
+            tracker.live.get(&("ws".to_owned(), runtime::SessionId(42))),
+            Some(&ticket)
+        );
+    }
+
+    #[test]
+    fn approval_launch_tracker는_denial실패를_bounded_backoff한다() {
+        let now = std::time::Instant::now();
+        let mut tracker = ApprovalLaunchTracker::default();
+        let ticket = tracker
+            .reserve("ws".to_owned(), "agent".to_owned(), now)
+            .unwrap();
+        assert!(tracker.mark_spawn_sent(ticket, now));
+        assert!(tracker.correlate("ws", "agent", Some(runtime::SessionId(43))));
+        assert!(tracker.observe_session_exit("ws", runtime::SessionId(43)));
+        tracker.mark_deny_queued("ws", runtime::SessionId(43));
+        assert_eq!(
+            tracker.finish_session("ws", runtime::SessionId(43), false, now),
+            Some(std::time::Duration::from_secs(1))
+        );
+        for _ in 0..300 {
+            assert!(tracker.pending_denials(now).is_empty());
+        }
+        assert_eq!(
+            tracker.pending_denials(now + std::time::Duration::from_secs(1)),
+            vec![("ws".to_owned(), runtime::SessionId(43))]
+        );
+        assert_eq!(tracker.denial_retries.len(), 1);
+        assert_eq!(tracker.live.len(), 1);
+    }
+
+    #[test]
+    fn settings_snapshot_worker는_요청전까지_thread를_만들지_않는다() {
+        let path = temp_db_path("settings-lazy");
+        let ctx = egui::Context::default();
+        let worker = SettingsSnapshotWorker::new(path, secret::RedactionService::new(), ctx);
+        assert!(worker.slot.is_none());
+    }
+
+    #[test]
+    fn settings_snapshot_worker는_idle_exit_race와_queued_result를_유실하지_않는다() {
+        let path = temp_db_path("settings-idle-race");
+        let db = storage::Db::open(&path).unwrap();
+        let workspace_id = db.create_workspace("workspace").unwrap();
         drop(db);
+        let mut worker = SettingsSnapshotWorker::new(
+            path.clone(),
+            secret::RedactionService::new(),
+            egui::Context::default(),
+        );
+
+        for index in 0..24u64 {
+            let slot = worker.spawn_slot_with_idle_ttl(std::time::Duration::from_millis(2));
+            if index % 2 == 1 {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let job = SettingsJob {
+                generation: 1,
+                revision: index + 1,
+                workspace_id: workspace_id.clone(),
+                project_root: None,
+                action: SettingsJobAction::Load,
+            };
+            let accepted = match SettingsSnapshotWorker::try_send_to_slot(&slot, job) {
+                Ok(()) => true,
+                Err(SettingsTrySendError::Disconnected(_)) => false,
+                Err(SettingsTrySendError::Full(_)) => panic!("fresh slot queue was full"),
+            };
+            let SettingsWorkerSlot {
+                tx,
+                rx,
+                handle,
+                lifecycle,
+            } = slot;
+            if accepted {
+                let outcome = rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("accepted settings job must produce one result");
+                assert_eq!(outcome.revision, index + 1);
+            }
+            drop(tx);
+            drop(rx);
+            handle.join().unwrap();
+            assert_eq!(
+                *lifecycle
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()),
+                SettingsWorkerLifecycle::Exited
+            );
+        }
+
+        let slot = worker.spawn_slot_with_idle_ttl(std::time::Duration::from_millis(2));
+        assert!(
+            SettingsSnapshotWorker::try_send_to_slot(
+                &slot,
+                SettingsJob {
+                    generation: 1,
+                    revision: 99,
+                    workspace_id,
+                    project_root: None,
+                    action: SettingsJobAction::Load,
+                },
+            )
+            .is_ok()
+        );
+        worker.slot = Some(slot);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert_eq!(worker.try_recv().map(|outcome| outcome.revision), Some(99));
         remove_sqlite_files(&path);
+    }
+
+    #[test]
+    fn settings_workspace_find_or_create는_exact_path를_재사용한다() {
+        let db_path = temp_db_path("settings-workspace-find-create");
+        let workspace_path = temp_db_path("settings-workspace-directory").with_extension("dir");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+        let mut db = storage::Db::open(&db_path).unwrap();
+        let request_workspace = db.create_workspace("request").unwrap();
+
+        let first = execute_settings_job(
+            &mut db,
+            &db_path,
+            &secret::RedactionService::new(),
+            SettingsJob {
+                generation: 1,
+                revision: 1,
+                workspace_id: request_workspace.clone(),
+                project_root: None,
+                action: SettingsJobAction::FindOrCreateWorkspace {
+                    name: "project".to_owned(),
+                    path: workspace_path.clone(),
+                    purpose: WorkspaceMutationPurpose::SwitchRuntime,
+                },
+            },
+        );
+        let first_id = match first.kind {
+            SettingsOutcomeKind::WorkspaceFoundOrCreated {
+                purpose: WorkspaceMutationPurpose::SwitchRuntime,
+                result: Ok(result),
+            } => {
+                assert!(result.created);
+                result.row.id
+            }
+            _ => panic!("unexpected first workspace outcome"),
+        };
+
+        let second = execute_settings_job(
+            &mut db,
+            &db_path,
+            &secret::RedactionService::new(),
+            SettingsJob {
+                generation: 1,
+                revision: 2,
+                workspace_id: request_workspace,
+                project_root: None,
+                action: SettingsJobAction::FindOrCreateWorkspace {
+                    name: "ignored".to_owned(),
+                    path: workspace_path.clone(),
+                    purpose: WorkspaceMutationPurpose::SelectInSettings,
+                },
+            },
+        );
+        match second.kind {
+            SettingsOutcomeKind::WorkspaceFoundOrCreated {
+                purpose: WorkspaceMutationPurpose::SelectInSettings,
+                result: Ok(result),
+            } => {
+                assert!(!result.created);
+                assert_eq!(result.row.id, first_id);
+            }
+            _ => panic!("unexpected second workspace outcome"),
+        }
+
+        drop(db);
+        remove_sqlite_files(&db_path);
+        std::fs::remove_dir_all(workspace_path).unwrap();
+    }
+
+    #[test]
+    fn settings_project_path는_committed_projection을_반환한다() {
+        let db_path = temp_db_path("settings-project-path");
+        let project_path = temp_db_path("settings-project-path-directory").with_extension("dir");
+        std::fs::create_dir_all(&project_path).unwrap();
+        let mut db = storage::Db::open(&db_path).unwrap();
+        let workspace_id = db.create_workspace("workspace").unwrap();
+
+        let outcome = execute_settings_job(
+            &mut db,
+            &db_path,
+            &secret::RedactionService::new(),
+            SettingsJob {
+                generation: 1,
+                revision: 1,
+                workspace_id: workspace_id.clone(),
+                project_root: None,
+                action: SettingsJobAction::SetProjectPath {
+                    path: project_path.clone(),
+                },
+            },
+        );
+        match outcome.kind {
+            SettingsOutcomeKind::ProjectPathSet(Ok(row)) => {
+                assert_eq!(row.id, workspace_id);
+                assert_eq!(row.path, project_path.to_string_lossy());
+                assert!(row.folder_anchor.is_some());
+            }
+            _ => panic!("unexpected project path outcome"),
+        }
+
+        drop(db);
+        remove_sqlite_files(&db_path);
+        std::fs::remove_dir_all(project_path).unwrap();
+    }
+
+    #[test]
+    fn settings_inactive_dotenv_resync는_worker_job에서_영속한다() {
+        let db_path = temp_db_path("settings-inactive-dotenv");
+        let project_path = temp_db_path("settings-inactive-dotenv-directory").with_extension("dir");
+        std::fs::create_dir_all(&project_path).unwrap();
+        std::fs::write(project_path.join(".env"), "PLAIN_VALUE=hello\n").unwrap();
+        let mut db = storage::Db::open(&db_path).unwrap();
+        let workspace_id = db.create_workspace("workspace").unwrap();
+
+        let outcome = execute_settings_job(
+            &mut db,
+            &db_path,
+            &secret::RedactionService::new(),
+            SettingsJob {
+                generation: 1,
+                revision: 1,
+                workspace_id: workspace_id.clone(),
+                project_root: Some(project_path.clone()),
+                action: SettingsJobAction::ResyncDotenv,
+            },
+        );
+        assert!(matches!(
+            outcome.kind,
+            SettingsOutcomeKind::DotenvResynced(Ok(()))
+        ));
+        let profile = db
+            .list_env_profiles(&workspace_id)
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.kind == crate::dotenv_sync::DOTENV_PROFILE_KIND)
+            .unwrap();
+        assert!(db.list_env_vars(&profile.id).unwrap().iter().any(|row| {
+            row.key == "PLAIN_VALUE" && row.value == crate::env::EnvValue::Plain("hello".to_owned())
+        }));
+
+        drop(db);
+        remove_sqlite_files(&db_path);
+        std::fs::remove_dir_all(project_path).unwrap();
+    }
+
+    #[test]
+    fn proxy_config는_ready_listener_socket을_항상_포함한다() {
+        let root = std::env::temp_dir().join(format!(
+            "deppy-proxy-config-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("data.sqlite3");
+        let socket_path = PathBuf::from("/tmp/deppy-approval-test.sock");
+        let config_path = write_mcp_proxy_config(
+            "/tmp/deppy-mcp-proxy",
+            &db_path,
+            "agent-1",
+            "server-1",
+            &socket_path,
+        )
+        .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();
+        let args = value["mcpServers"]["deppy-proxy"]["args"]
+            .as_array()
+            .unwrap();
+        let notify_position = args
+            .iter()
+            .position(|value| value == "--approval-notify-socket")
+            .unwrap();
+        assert_eq!(
+            args[notify_position + 1],
+            socket_path.to_string_lossy().as_ref()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

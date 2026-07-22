@@ -74,7 +74,7 @@ pub trait RuntimeHostFactory: Send + Sync {
 }
 
 /// Production in-process factory. Holding this value is side-effect free; the
-/// existing single runtime worker is started only by `create`.
+/// existing single runtime worker is started only by `create_client`/`create`.
 pub struct InProcessRuntimeHostFactory {
     resolver: Arc<dyn RuntimeSecretResolver>,
     redaction: secret::RedactionService,
@@ -90,21 +90,30 @@ impl InProcessRuntimeHostFactory {
             redaction,
         }
     }
+
+    /// Concrete-client integration seam for existing runtime owners such as the remote server.
+    /// It intentionally shares all construction logic with [`RuntimeHostFactory::create`], so app
+    /// composition cannot drift back to a secret-store-based constructor while the surrounding
+    /// concrete ownership is cut over separately.
+    pub fn create_client(
+        &self,
+        config: RuntimeHostConfig,
+    ) -> anyhow::Result<crate::InProcessRuntimeClient> {
+        crate::InProcessRuntimeClient::try_new_with_resolver(
+            config.output_batch_ms,
+            Arc::clone(&self.resolver),
+            config.logs_root,
+            self.redaction.clone(),
+            config.persist,
+            config.cwd,
+            config.extra_env,
+        )
+    }
 }
 
 impl RuntimeHostFactory for InProcessRuntimeHostFactory {
     fn create(&self, config: RuntimeHostConfig) -> anyhow::Result<Box<dyn RuntimeHost>> {
-        Ok(Box::new(
-            crate::InProcessRuntimeClient::try_new_with_resolver(
-                config.output_batch_ms,
-                Arc::clone(&self.resolver),
-                config.logs_root,
-                self.redaction.clone(),
-                config.persist,
-                config.cwd,
-                config.extra_env,
-            )?,
-        ))
+        Ok(Box::new(self.create_client(config)?))
     }
 }
 
@@ -151,7 +160,7 @@ mod tests {
         assert_eq!(resolver.0.load(Ordering::Relaxed), 0);
 
         let mut host = factory
-            .create(RuntimeHostConfig {
+            .create_client(RuntimeHostConfig {
                 output_batch_ms: 5,
                 logs_root: std::env::temp_dir()
                     .join(format!("deppy-runtime-host-test-{}", std::process::id())),

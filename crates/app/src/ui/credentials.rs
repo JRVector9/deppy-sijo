@@ -1,54 +1,316 @@
-#[derive(Debug, Clone, PartialEq)]
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+pub const CREDENTIAL_SNAPSHOT_MAX_ITEMS: usize = 1_024;
+pub const CREDENTIAL_SNAPSHOT_MAX_BYTES: usize = 4 * 1024 * 1024;
+pub const CREDENTIAL_SENSITIVE_MAX_ITEMS: usize = 64;
+pub const CREDENTIAL_SENSITIVE_ITEM_MAX_BYTES: usize = 32 * 1024;
+pub const CREDENTIAL_SENSITIVE_MAX_BYTES: usize = 1024 * 1024;
+
+const CREDENTIAL_ORPHAN_MAX_ITEMS: usize = 1_024;
+const CREDENTIAL_ORPHAN_MAX_BYTES: usize = 1024 * 1024;
+const CREDENTIAL_TEXT_INPUT_MAX_BYTES: usize = 4 * 1024;
+const CREDENTIAL_ROW_HEIGHT: f32 = 30.0;
+const CREDENTIAL_LIST_MAX_HEIGHT: f32 = 360.0;
+const MASKED_SECRET: &str = "••••••••••••••••";
+
+/// Immutable UI-only credential metadata. Secret plaintext is never part of a snapshot row.
+/// Deliberately non-Clone so a render cannot accidentally duplicate an entire snapshot.
 pub struct CredentialListItem {
-    pub id: String,
-    pub provider: String,
-    pub label: String,
-    pub credential_kind: String,
-    pub masked_hint: Option<String>,
+    id: Arc<str>,
+    provider: Arc<str>,
+    label: Arc<str>,
+    credential_kind: Arc<str>,
+    masked_hint: Option<Arc<str>>,
+}
+
+impl CredentialListItem {
+    pub fn new(
+        id: impl Into<Arc<str>>,
+        provider: impl Into<Arc<str>>,
+        label: impl Into<Arc<str>>,
+        credential_kind: impl Into<Arc<str>>,
+        masked_hint: Option<impl Into<Arc<str>>>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            provider: provider.into(),
+            label: label.into(),
+            credential_kind: credential_kind.into(),
+            masked_hint: masked_hint.map(Into::into),
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn credential_kind(&self) -> &str {
+        &self.credential_kind
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.id.len()
+            + self.provider.len()
+            + self.label.len()
+            + self.credential_kind.len()
+            + self.masked_hint.as_ref().map_or(0, |hint| hint.len())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialSnapshotError {
+    TooManyItems,
+    ByteBudgetExceeded,
+}
+
+impl std::fmt::Display for CredentialSnapshotError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::TooManyItems => "credential_snapshot_item_limit",
+            Self::ByteBudgetExceeded => "credential_snapshot_byte_limit",
+        })
+    }
+}
+
+impl std::error::Error for CredentialSnapshotError {}
+
+/// Bounded immutable render input. The composition root replaces it only when revision changes.
+pub struct CredentialsSnapshot {
+    revision: u64,
+    available: bool,
+    items: Arc<[CredentialListItem]>,
+}
+
+impl CredentialsSnapshot {
+    pub fn try_new(
+        revision: u64,
+        items: Vec<CredentialListItem>,
+    ) -> Result<Self, CredentialSnapshotError> {
+        if items.len() > CREDENTIAL_SNAPSHOT_MAX_ITEMS {
+            return Err(CredentialSnapshotError::TooManyItems);
+        }
+        let retained_bytes = items
+            .iter()
+            .map(CredentialListItem::retained_bytes)
+            .try_fold(0usize, usize::checked_add)
+            .ok_or(CredentialSnapshotError::ByteBudgetExceeded)?;
+        if retained_bytes > CREDENTIAL_SNAPSHOT_MAX_BYTES {
+            return Err(CredentialSnapshotError::ByteBudgetExceeded);
+        }
+        Ok(Self {
+            revision,
+            available: true,
+            items: items.into(),
+        })
+    }
+
+    pub fn unavailable(revision: u64) -> Self {
+        Self {
+            revision,
+            available: false,
+            items: Arc::from([]),
+        }
+    }
+
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub const fn is_available(&self) -> bool {
+        self.available
+    }
+
+    pub fn items(&self) -> &[CredentialListItem] {
+        &self.items
+    }
+}
+
+/// Secret-bearing input crossing from UI to the composition root. It cannot be cloned or
+/// serialized, Debug is always redacted, and its allocation is overwritten on drop.
+pub struct SensitiveInput(String);
+
+impl SensitiveInput {
+    pub fn try_new(mut value: String) -> Result<Self, CredentialSensitiveError> {
+        if value.len() > CREDENTIAL_SENSITIVE_ITEM_MAX_BYTES {
+            clear_sensitive_string(&mut value);
+            return Err(CredentialSensitiveError::ItemTooLarge);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn into_inner(mut self) -> String {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl std::fmt::Debug for SensitiveInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SensitiveInput([REDACTED])")
+    }
+}
+
+impl Drop for SensitiveInput {
+    fn drop(&mut self) {
+        clear_sensitive_string(&mut self.0);
+    }
 }
 
 pub struct NewCredential {
-    pub provider: String,
-    pub label: String,
-    pub credential_kind: String,
-    pub secret: String,
+    provider: String,
+    label: String,
+    credential_kind: String,
+    secret: SensitiveInput,
 }
 
-pub trait CredentialService {
-    fn list_credentials(&self) -> anyhow::Result<Vec<CredentialListItem>>;
-    fn add_credential(&self, credential: NewCredential) -> anyhow::Result<()>;
-    fn delete_credential(&self, id: &str) -> anyhow::Result<()>;
-    /// keyring에 남았지만 DB credentials가 모르는 항목(id 목록) — 고아 스캔.
-    fn orphan_credentials(&self) -> anyhow::Result<Vec<String>> {
-        Ok(Vec::new())
-    }
-    /// 고아 항목 삭제 — 지운 개수 반환.
-    fn purge_orphan_credentials(&self, ids: &[String]) -> anyhow::Result<usize> {
-        let _ = ids;
-        Ok(0)
+impl NewCredential {
+    pub fn into_parts(self) -> (String, String, String, SensitiveInput) {
+        (self.provider, self.label, self.credential_kind, self.secret)
     }
 }
 
-/// 자격증명 관리 창 상태. secret 입력값은 추가 즉시 비운다.
+/// Plaintext reveal delivery from a root-owned worker. It has the same ownership rules as input.
+pub struct RevealedCredential {
+    credential_id: String,
+    value: SensitiveDisplay,
+}
+
+impl RevealedCredential {
+    pub fn new(
+        credential_id: impl Into<String>,
+        mut value: String,
+    ) -> Result<Self, CredentialSensitiveError> {
+        if value.len() > CREDENTIAL_SENSITIVE_ITEM_MAX_BYTES {
+            clear_sensitive_string(&mut value);
+            return Err(CredentialSensitiveError::ItemTooLarge);
+        }
+        Ok(Self {
+            credential_id: credential_id.into(),
+            value: SensitiveDisplay(value),
+        })
+    }
+}
+
+struct SensitiveDisplay(String);
+
+impl SensitiveDisplay {
+    fn expose(&self) -> &str {
+        &self.0
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl Drop for SensitiveDisplay {
+    fn drop(&mut self) {
+        clear_sensitive_string(&mut self.0);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialSensitiveError {
+    ItemTooLarge,
+    CorpusFull,
+    OrphanListTooLarge,
+}
+
+impl std::fmt::Display for CredentialSensitiveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ItemTooLarge => "credential_sensitive_item_limit",
+            Self::CorpusFull => "credential_sensitive_corpus_limit",
+            Self::OrphanListTooLarge => "credential_orphan_list_limit",
+        })
+    }
+}
+
+impl std::error::Error for CredentialSensitiveError {}
+
+/// One render emits at most one intent. Secret variants deliberately have no Clone/Serialize.
+pub enum CredentialsIntent {
+    Add {
+        revision: u64,
+        credential: NewCredential,
+    },
+    Delete {
+        revision: u64,
+        credential_id: String,
+    },
+    Reveal {
+        revision: u64,
+        credential_id: String,
+    },
+    ScanOrphans {
+        revision: u64,
+    },
+    PurgeOrphans {
+        revision: u64,
+        credential_ids: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialsUiErrorCode {
+    SnapshotUnavailable,
+    DraftLimitExceeded,
+    AddFailed,
+    DeleteFailed,
+    RevealFailed,
+    RevealCapacityExceeded,
+    OrphanScanFailed,
+    OrphanPurgeFailed,
+}
+
+impl CredentialsUiErrorCode {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::SnapshotUnavailable => "Credential 목록을 불러오지 못했습니다.",
+            Self::DraftLimitExceeded => "입력 크기 상한을 초과했습니다.",
+            Self::AddFailed => "Credential 저장에 실패했습니다.",
+            Self::DeleteFailed => "Credential 삭제에 실패했습니다.",
+            Self::RevealFailed => "Secret 값을 불러오지 못했습니다.",
+            Self::RevealCapacityExceeded => "동시에 표시할 수 있는 secret 상한을 초과했습니다.",
+            Self::OrphanScanFailed => "고아 credential 검색에 실패했습니다.",
+            Self::OrphanPurgeFailed => "고아 credential 정리에 실패했습니다.",
+        }
+    }
+}
+
+enum OrphanStatus {
+    NoneFound,
+    Purged { purged: usize, remaining: usize },
+}
+
+/// Credential settings draft and bounded reveal state. All external work belongs to App.
 pub struct CredentialsUi {
     provider: String,
     label: String,
     kind: &'static str,
     secret_input: String,
-    error: Option<String>,
-    /// '+ 추가' 클릭 시에만 인라인 추가 폼을 펼친다(스크린샷: 기본은 표만 — P2).
+    secret_input_overflowed: bool,
+    error: Option<CredentialsUiErrorCode>,
     show_add_form: bool,
-    /// 고아 keyring 정리 흐름 상태 — None=대기, Some(목록)=발견(확인 대기).
-    /// 삭제 확인 대기 (id, 표시명) — ×를 눌러도 바로 지우지 않고 모달로 묻는다.
     delete_confirm: Option<(String, String)>,
-    orphan_candidates: Option<Vec<String>>,
-    /// 마지막 정리 결과 메시지(정리 개수/없음).
-    orphan_status: Option<String>,
-    cached: Option<Vec<CredentialListItem>>,
-    /// API 비밀키는 기본 마스킹한다. 사용자가 ○를 누른 항목만 background keyring
-    /// worker 결과를 이 UI가 소유하며, 화면/목록 무효화 때 즉시 폐기한다.
-    reveal_requested: std::collections::HashSet<String>,
-    revealed: std::collections::HashMap<String, String>,
+    orphan_candidates: Option<Arc<[Arc<str>]>>,
+    orphan_status: Option<OrphanStatus>,
+    orphan_scan_pending: bool,
+    orphan_purge_pending: bool,
+    add_pending: bool,
+    delete_pending: HashSet<String>,
+    reveal_pending: HashSet<String>,
+    revealed: HashMap<String, SensitiveDisplay>,
+    revealed_bytes: usize,
+    snapshot_revision: Option<u64>,
 }
 
 impl CredentialsUi {
@@ -58,84 +320,153 @@ impl CredentialsUi {
             label: String::new(),
             kind: "api_key",
             secret_input: String::new(),
+            secret_input_overflowed: false,
             error: None,
             show_add_form: false,
             delete_confirm: None,
             orphan_candidates: None,
             orphan_status: None,
-            cached: None,
-            reveal_requested: std::collections::HashSet::new(),
-            revealed: std::collections::HashMap::new(),
+            orphan_scan_pending: false,
+            orphan_purge_pending: false,
+            add_pending: false,
+            delete_pending: HashSet::new(),
+            reveal_pending: HashSet::new(),
+            revealed: HashMap::new(),
+            revealed_bytes: 0,
+            snapshot_revision: None,
         }
     }
 
-    /// 다른 창(커넥터)이 credential을 추가했을 때 목록 캐시를 버린다.
     pub fn invalidate_cache(&mut self) {
-        self.cached = None;
+        self.snapshot_revision = None;
         self.clear_revealed_secrets();
     }
 
-    /// 설정 닫기/워크스페이스 전환에서 목록 메타 캐시는 유지하면서 평문만 즉시 폐기한다.
     pub fn clear_revealed_secrets(&mut self) {
-        self.reveal_requested.clear();
+        self.reveal_pending.clear();
         self.revealed.clear();
+        self.revealed_bytes = 0;
     }
 
-    /// 비-compact 버전 — settings.rs가 Credentials→Environment로 리다이렉트해 실제 도달 불가.
-    /// 반환: 이 프레임에 credential 목록이 **변경**(추가/삭제 성공)됐는가 — App이 true면
-    /// EnvProfilesUi 캐시를 무효화한다(PR-ENV-C 배선: env 시크릿 콤보/마스킹 stale 방지).
+    pub fn add_succeeded(&mut self) {
+        self.provider.clear();
+        self.label.clear();
+        self.add_pending = false;
+        self.error = None;
+    }
+
+    pub fn delete_succeeded(&mut self, credential_id: &str) {
+        self.delete_pending.remove(credential_id);
+        self.remove_revealed(credential_id);
+        self.error = None;
+    }
+
+    pub fn report_error(&mut self, code: CredentialsUiErrorCode) {
+        match code {
+            CredentialsUiErrorCode::AddFailed => self.add_pending = false,
+            CredentialsUiErrorCode::DeleteFailed => self.delete_pending.clear(),
+            CredentialsUiErrorCode::OrphanScanFailed => self.orphan_scan_pending = false,
+            CredentialsUiErrorCode::OrphanPurgeFailed => self.orphan_purge_pending = false,
+            _ => {}
+        }
+        self.error = Some(code);
+    }
+
+    pub fn accept_revealed(
+        &mut self,
+        revealed: RevealedCredential,
+    ) -> Result<(), CredentialSensitiveError> {
+        let RevealedCredential {
+            credential_id,
+            value,
+        } = revealed;
+        let previous = self
+            .revealed
+            .get(&credential_id)
+            .map_or(0, SensitiveDisplay::len);
+        let next_bytes = self
+            .revealed_bytes
+            .saturating_sub(previous)
+            .saturating_add(value.len());
+        if (self.revealed.len() >= CREDENTIAL_SENSITIVE_MAX_ITEMS
+            && !self.revealed.contains_key(&credential_id))
+            || next_bytes > CREDENTIAL_SENSITIVE_MAX_BYTES
+        {
+            self.reveal_pending.remove(&credential_id);
+            self.error = Some(CredentialsUiErrorCode::RevealCapacityExceeded);
+            return Err(CredentialSensitiveError::CorpusFull);
+        }
+        self.revealed_bytes = next_bytes;
+        self.revealed.insert(credential_id.clone(), value);
+        self.reveal_pending.remove(&credential_id);
+        self.error = None;
+        Ok(())
+    }
+
+    pub fn reject_reveal(&mut self, credential_id: &str) {
+        self.reveal_pending.remove(credential_id);
+        self.error = Some(CredentialsUiErrorCode::RevealFailed);
+    }
+
+    pub fn accept_orphan_scan(
+        &mut self,
+        credential_ids: Vec<String>,
+    ) -> Result<(), CredentialSensitiveError> {
+        let bytes = credential_ids
+            .iter()
+            .map(String::len)
+            .try_fold(0usize, usize::checked_add)
+            .ok_or(CredentialSensitiveError::OrphanListTooLarge)?;
+        if credential_ids.len() > CREDENTIAL_ORPHAN_MAX_ITEMS || bytes > CREDENTIAL_ORPHAN_MAX_BYTES
+        {
+            self.orphan_scan_pending = false;
+            self.error = Some(CredentialsUiErrorCode::OrphanScanFailed);
+            return Err(CredentialSensitiveError::OrphanListTooLarge);
+        }
+        self.orphan_scan_pending = false;
+        self.orphan_status = credential_ids.is_empty().then_some(OrphanStatus::NoneFound);
+        self.orphan_candidates = (!credential_ids.is_empty()).then(|| {
+            credential_ids
+                .into_iter()
+                .map(Arc::<str>::from)
+                .collect::<Vec<_>>()
+                .into()
+        });
+        self.error = None;
+        Ok(())
+    }
+
+    pub fn orphan_purge_succeeded(&mut self, purged: usize, remaining: usize) {
+        self.orphan_candidates = None;
+        self.orphan_purge_pending = false;
+        self.orphan_status = Some(OrphanStatus::Purged { purged, remaining });
+        self.error = None;
+    }
+
+    /// Pure render path: immutable snapshot in, at most one intent out.
     pub fn contents_compact(
         &mut self,
         ui: &mut egui::Ui,
-        credentials: &dyn CredentialService,
-        reveal_secret: &mut dyn FnMut(&str) -> Option<String>,
+        snapshot: &CredentialsSnapshot,
         catalog: &i18n::Catalog,
-    ) -> bool {
-        let mut changed = false;
-        let list = match &self.cached {
-            Some(list) => list.clone(),
-            None => match credentials.list_credentials() {
-                Ok(list) => {
-                    self.cached = Some(list.clone());
-                    list
-                }
-                Err(e) => {
-                    ui.colored_label(
-                        ui.visuals().error_fg_color,
-                        catalog.t("common.list_failed", &[("message", &format!("{e:#}"))]),
-                    );
-                    return false;
-                }
-            },
-        };
-
-        self.reveal_requested
-            .retain(|id| list.iter().any(|item| item.id == *id));
-        self.revealed
-            .retain(|id, _| list.iter().any(|item| item.id == *id));
-        for meta in &list {
-            if self.reveal_requested.contains(&meta.id)
-                && !self.revealed.contains_key(&meta.id)
-                && let Some(secret) = reveal_secret(&meta.id)
-            {
-                self.revealed.insert(meta.id.clone(), secret);
-            }
+    ) -> Option<CredentialsIntent> {
+        self.sync_snapshot(snapshot);
+        let mut intent = None;
+        if !snapshot.is_available() {
+            self.error = Some(CredentialsUiErrorCode::SnapshotUnavailable);
         }
 
-        // EnvVarTable의 CSS margin-bottom: 2px. SectionHeader 자체가 상단 10px
-        // padding을 포함하므로 여기서 다시 10px을 더하지 않는다.
         ui.add_space(2.0);
         let add_label = format!("+ {}", catalog.t("action.add", &[]));
         if super::section_header(
             ui,
             &catalog.t("credentials.api_keys", &[]),
-            Some(list.len()),
+            Some(snapshot.items().len()),
             Some(&add_label),
         ) {
-            // 토글(P2) — 스크린샷은 기본 표만, 폼은 '+ 추가'를 눌렀을 때만.
             self.show_add_form = !self.show_add_form;
             if self.show_add_form {
-                ui.memory_mut(|mem| mem.request_focus(credential_provider_input_id()));
+                ui.memory_mut(|memory| memory.request_focus(credential_provider_input_id()));
             }
         }
         credentials_table_header(
@@ -147,220 +478,325 @@ impl CredentialsUi {
                 catalog.t("credentials.secret", &[]),
             ],
         );
-        let mut delete_id: Option<(String, String)> = None;
-        for meta in &list {
-            let row = credential_table_row(ui, meta, self.revealed.get(&meta.id), catalog);
-            if row.delete {
-                let name = if meta.label.is_empty() {
-                    meta.provider.clone()
-                } else {
-                    meta.label.clone()
-                };
-                delete_id = Some((meta.id.clone(), name));
-            }
-            if row.toggle_reveal {
-                if self.reveal_requested.remove(&meta.id) {
-                    self.revealed.remove(&meta.id);
-                } else {
-                    self.reveal_requested.insert(meta.id.clone());
-                }
-            }
+        self.render_rows(ui, snapshot, catalog, &mut intent);
+        self.render_delete_confirmation(ui.ctx(), snapshot.revision(), catalog, &mut intent);
+        if self.show_add_form {
+            self.render_add_form(ui, snapshot, catalog, &mut intent);
         }
-        if list.is_empty() {
+        self.render_orphan_controls(ui, snapshot, catalog, &mut intent);
+        if let Some(error) = self.error {
+            ui.colored_label(ui.visuals().error_fg_color, error.message());
+        }
+        intent
+    }
+
+    fn sync_snapshot(&mut self, snapshot: &CredentialsSnapshot) {
+        if self.snapshot_revision == Some(snapshot.revision()) {
+            return;
+        }
+        self.snapshot_revision = Some(snapshot.revision());
+        let live = snapshot
+            .items()
+            .iter()
+            .map(CredentialListItem::id)
+            .collect::<HashSet<_>>();
+        self.reveal_pending.retain(|id| live.contains(id.as_str()));
+        self.delete_pending.retain(|id| live.contains(id.as_str()));
+        let removed = self
+            .revealed
+            .extract_if(|id, _| !live.contains(id.as_str()))
+            .map(|(_, value)| value.len())
+            .sum::<usize>();
+        self.revealed_bytes = self.revealed_bytes.saturating_sub(removed);
+        if self
+            .delete_confirm
+            .as_ref()
+            .is_some_and(|(id, _)| !live.contains(id.as_str()))
+        {
+            self.delete_confirm = None;
+        }
+    }
+
+    fn render_rows(
+        &mut self,
+        ui: &mut egui::Ui,
+        snapshot: &CredentialsSnapshot,
+        catalog: &i18n::Catalog,
+        intent: &mut Option<CredentialsIntent>,
+    ) {
+        egui::ScrollArea::vertical()
+            .id_salt("credentials_bounded_rows")
+            .max_height(CREDENTIAL_LIST_MAX_HEIGHT)
+            .show_rows(
+                ui,
+                CREDENTIAL_ROW_HEIGHT,
+                snapshot.items().len(),
+                |ui, range| {
+                    for meta in &snapshot.items()[range] {
+                        let row = credential_table_row(
+                            ui,
+                            meta,
+                            self.revealed.get(meta.id()).map(SensitiveDisplay::expose),
+                            self.reveal_pending.contains(meta.id()),
+                            catalog,
+                        );
+                        if row.delete {
+                            let name = if meta.label().is_empty() {
+                                meta.provider()
+                            } else {
+                                meta.label()
+                            };
+                            self.delete_confirm = Some((meta.id().to_owned(), name.to_owned()));
+                        } else if row.toggle_reveal {
+                            if self.revealed.contains_key(meta.id()) {
+                                self.remove_revealed(meta.id());
+                            } else if !self.reveal_pending.contains(meta.id()) && intent.is_none() {
+                                if self.revealed.len() >= CREDENTIAL_SENSITIVE_MAX_ITEMS {
+                                    self.error =
+                                        Some(CredentialsUiErrorCode::RevealCapacityExceeded);
+                                } else {
+                                    self.reveal_pending.insert(meta.id().to_owned());
+                                    *intent = Some(CredentialsIntent::Reveal {
+                                        revision: snapshot.revision(),
+                                        credential_id: meta.id().to_owned(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                },
+            );
+        if snapshot.items().is_empty() {
             ui.label(
                 egui::RichText::new(catalog.t("credentials.empty", &[]))
                     .size(13.0)
                     .weak(),
             );
         }
-        if let Some(pending) = delete_id {
-            self.delete_confirm = Some(pending);
-        }
-        // 삭제 확인 모달(사용자 2026-07-10 #1) — 키체인 시크릿도 함께 지워지므로 확인 필수.
-        if let Some((del_id, del_name)) = self.delete_confirm.clone() {
-            let mut decision: Option<bool> = None;
-            egui::Window::new(catalog.t("credentials.delete_confirm.title", &[]))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ui.ctx(), |ui| {
-                    ui.label(catalog.t("credentials.delete_confirm.body", &[("name", &del_name)]));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button(catalog.t("action.delete", &[])).clicked() {
-                            decision = Some(true);
-                        }
-                        if ui.button(catalog.t("action.cancel", &[])).clicked() {
-                            decision = Some(false);
-                        }
-                    });
-                });
-            match decision {
-                Some(true) => {
-                    match self.delete(credentials, &del_id) {
-                        Ok(()) => {
-                            changed = true;
-                            self.reveal_requested.remove(&del_id);
-                            self.revealed.remove(&del_id);
-                            self.error = None;
-                        }
-                        Err(e) => self.error = Some(format!("{e:#}")),
-                    }
-                    self.delete_confirm = None;
-                }
-                Some(false) => self.delete_confirm = None,
-                None => {}
-            }
-        }
+    }
 
-        if self.show_add_form {
-            ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.provider)
-                        .id_source(credential_provider_input_id())
-                        .hint_text(catalog.t("credentials.provider", &[]))
-                        .desired_width(120.0),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.label)
-                        .hint_text(catalog.t("credentials.label", &[]))
-                        .desired_width(160.0),
-                );
-                for kind in ["api_key", "token"] {
-                    ui.selectable_value(&mut self.kind, kind, kind);
+    fn render_delete_confirmation(
+        &mut self,
+        ctx: &egui::Context,
+        revision: u64,
+        catalog: &i18n::Catalog,
+        intent: &mut Option<CredentialsIntent>,
+    ) {
+        let Some((_, name)) = self.delete_confirm.as_ref() else {
+            return;
+        };
+        let mut decision = None;
+        egui::Window::new(catalog.t("credentials.delete_confirm.title", &[]))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(catalog.t("credentials.delete_confirm.body", &[("name", name)]));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(catalog.t("action.delete", &[])).clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button(catalog.t("action.cancel", &[])).clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        match decision {
+            Some(true) if intent.is_none() => {
+                let (credential_id, _) = self.delete_confirm.take().expect("pending checked");
+                self.delete_pending.insert(credential_id.clone());
+                *intent = Some(CredentialsIntent::Delete {
+                    revision,
+                    credential_id,
+                });
+            }
+            Some(false) => self.delete_confirm = None,
+            _ => {}
+        }
+    }
+
+    fn render_add_form(
+        &mut self,
+        ui: &mut egui::Ui,
+        snapshot: &CredentialsSnapshot,
+        catalog: &i18n::Catalog,
+        intent: &mut Option<CredentialsIntent>,
+    ) {
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.provider)
+                    .id_source(credential_provider_input_id())
+                    .hint_text(catalog.t("credentials.provider", &[]))
+                    .desired_width(120.0),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.label)
+                    .hint_text(catalog.t("credentials.label", &[]))
+                    .desired_width(160.0),
+            );
+            for kind in ["api_key", "token"] {
+                ui.selectable_value(&mut self.kind, kind, kind);
+            }
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.secret_input)
+                    .password(true)
+                    .hint_text(catalog.t("credentials.secret", &[]))
+                    .desired_width(220.0),
+            );
+            truncate_utf8(&mut self.provider, CREDENTIAL_TEXT_INPUT_MAX_BYTES);
+            truncate_utf8(&mut self.label, CREDENTIAL_TEXT_INPUT_MAX_BYTES);
+            if self.secret_input.len() > CREDENTIAL_SENSITIVE_ITEM_MAX_BYTES {
+                clear_sensitive_string(&mut self.secret_input);
+                self.secret_input_overflowed = true;
+                self.error = Some(CredentialsUiErrorCode::DraftLimitExceeded);
+            } else if response.changed() {
+                self.secret_input_overflowed = false;
+            }
+            let filled = !self.provider.trim().is_empty()
+                && !self.label.trim().is_empty()
+                && !self.secret_input.is_empty()
+                && !self.secret_input_overflowed
+                && !self.add_pending
+                && snapshot.is_available();
+            if ui
+                .add_enabled(filled, egui::Button::new(catalog.t("action.add", &[])))
+                .clicked()
+                && intent.is_none()
+            {
+                let secret = std::mem::take(&mut self.secret_input);
+                match SensitiveInput::try_new(secret) {
+                    Ok(secret) => {
+                        self.add_pending = true;
+                        self.error = None;
+                        *intent = Some(CredentialsIntent::Add {
+                            revision: snapshot.revision(),
+                            credential: NewCredential {
+                                provider: self.provider.trim().to_owned(),
+                                label: self.label.trim().to_owned(),
+                                credential_kind: self.kind.to_owned(),
+                                secret,
+                            },
+                        });
+                    }
+                    Err(_) => {
+                        self.error = Some(CredentialsUiErrorCode::DraftLimitExceeded);
+                    }
                 }
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.secret_input)
-                        .password(true)
-                        .hint_text(catalog.t("credentials.secret", &[]))
-                        .desired_width(220.0),
+            }
+        });
+    }
+
+    fn render_orphan_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        snapshot: &CredentialsSnapshot,
+        catalog: &i18n::Catalog,
+        intent: &mut Option<CredentialsIntent>,
+    ) {
+        if !self.show_add_form && self.orphan_candidates.is_none() && self.orphan_status.is_none() {
+            return;
+        }
+        ui.add_space(12.0);
+        if let Some(candidates) = self.orphan_candidates.as_ref() {
+            let mut purge = false;
+            let mut cancel = false;
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(catalog.t(
+                        "credentials.purge_found",
+                        &[("count", &candidates.len().to_string())],
+                    ))
+                    .size(12.0)
+                    .color(ui.visuals().warn_fg_color),
                 );
-                let filled = !self.provider.trim().is_empty()
-                    && !self.label.trim().is_empty()
-                    && !self.secret_input.is_empty();
-                if ui
-                    .add_enabled(filled, egui::Button::new(catalog.t("action.add", &[])))
-                    .clicked()
-                {
-                    match self.add(credentials) {
-                        Ok(()) => {
-                            changed = true;
-                            self.error = None;
+                purge = ui
+                    .add_enabled(
+                        !self.orphan_purge_pending,
+                        egui::Button::new(catalog.t("credentials.purge_go", &[])).small(),
+                    )
+                    .clicked();
+                cancel = ui.small_button(catalog.t("action.cancel", &[])).clicked();
+            });
+            if purge && intent.is_none() {
+                let credential_ids = candidates.iter().map(ToString::to_string).collect();
+                self.orphan_purge_pending = true;
+                *intent = Some(CredentialsIntent::PurgeOrphans {
+                    revision: snapshot.revision(),
+                    credential_ids,
+                });
+            } else if cancel {
+                self.orphan_candidates = None;
+            }
+        } else {
+            ui.horizontal(|ui| {
+                let link = ui.add_enabled(
+                    !self.orphan_scan_pending,
+                    egui::Label::new(
+                        egui::RichText::new(catalog.t("credentials.purge_orphans", &[]))
+                            .size(12.0)
+                            .color(ui.visuals().weak_text_color()),
+                    )
+                    .sense(egui::Sense::click()),
+                );
+                if link.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if link.clicked() && intent.is_none() {
+                    self.orphan_scan_pending = true;
+                    *intent = Some(CredentialsIntent::ScanOrphans {
+                        revision: snapshot.revision(),
+                    });
+                }
+                if let Some(status) = &self.orphan_status {
+                    match status {
+                        OrphanStatus::NoneFound => {
+                            ui.label(
+                                egui::RichText::new(catalog.t("credentials.purge_none", &[]))
+                                    .size(12.0)
+                                    .weak(),
+                            );
                         }
-                        Err(e) => self.error = Some(format!("{e:#}")),
+                        OrphanStatus::Purged { purged, remaining } => {
+                            let done = catalog
+                                .t("credentials.purge_done", &[("count", &purged.to_string())]);
+                            let tail = catalog.t(
+                                "credentials.purge_remaining",
+                                &[("count", &remaining.to_string())],
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("{done} · {tail}"))
+                                    .size(12.0)
+                                    .weak(),
+                            );
+                        }
                     }
                 }
             });
         }
-
-        // 기본 표에서는 목업에 없는 관리 링크를 숨긴다. '+ 추가' 폼을 연 경우에만
-        // 고아 keyring 정리 진입점을 함께 노출해 기존 관리 기능은 보존한다.
-        if self.show_add_form || self.orphan_candidates.is_some() || self.orphan_status.is_some() {
-            ui.add_space(12.0);
-            match self.orphan_candidates.clone() {
-                None => {
-                    ui.horizontal(|ui| {
-                        let link = ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(catalog.t("credentials.purge_orphans", &[]))
-                                    .size(12.0)
-                                    .color(ui.visuals().weak_text_color()),
-                            )
-                            .sense(egui::Sense::click()),
-                        );
-                        if link.hovered() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        }
-                        if link.clicked() {
-                            match credentials.orphan_credentials() {
-                                Ok(list) if list.is_empty() => {
-                                    self.orphan_status =
-                                        Some(catalog.t("credentials.purge_none", &[]));
-                                }
-                                Ok(list) => {
-                                    self.orphan_status = None;
-                                    self.orphan_candidates = Some(list);
-                                }
-                                Err(e) => self.orphan_status = Some(format!("{e:#}")),
-                            }
-                        }
-                        if let Some(status) = &self.orphan_status {
-                            ui.label(egui::RichText::new(status).size(12.0).weak());
-                        }
-                    });
-                }
-                Some(list) => {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(catalog.t(
-                                "credentials.purge_found",
-                                &[("count", &list.len().to_string())],
-                            ))
-                            .size(12.0)
-                            .color(ui.visuals().warn_fg_color),
-                        );
-                        if ui
-                            .small_button(catalog.t("credentials.purge_go", &[]))
-                            .clicked()
-                        {
-                            match credentials.purge_orphan_credentials(&list) {
-                                Ok(n) => {
-                                    // 정리 직후 재스캔 — 남은 고아 수까지 표시(2026-07-10:
-                                    // '정리됨'만 남고 0 확인이 안 되던 문제).
-                                    let done = catalog
-                                        .t("credentials.purge_done", &[("count", &n.to_string())]);
-                                    // 재스캔 실패를 '남은 0'으로 오표시하지 않는다(codex Med).
-                                    let tail = match credentials.orphan_credentials() {
-                                        Ok(l) => catalog.t(
-                                            "credentials.purge_remaining",
-                                            &[("count", &l.len().to_string())],
-                                        ),
-                                        Err(e) => format!("{e:#}"),
-                                    };
-                                    self.orphan_status = Some(format!("{done} · {tail}"));
-                                }
-                                Err(e) => self.orphan_status = Some(format!("{e:#}")),
-                            }
-                            self.orphan_candidates = None;
-                        }
-                        if ui.small_button(catalog.t("action.cancel", &[])).clicked() {
-                            self.orphan_candidates = None;
-                        }
-                    });
-                }
-            }
-        }
-
-        if let Some(error) = &self.error {
-            ui.colored_label(ui.visuals().error_fg_color, error);
-        }
-        changed
     }
 
-    fn add(&mut self, credentials: &dyn CredentialService) -> anyhow::Result<()> {
-        let request = NewCredential {
-            provider: self.provider.trim().to_owned(),
-            label: self.label.trim().to_owned(),
-            credential_kind: self.kind.to_owned(),
-            // 입력 평문은 service boundary로 옮기고 입력창은 즉시 비운다.
-            secret: std::mem::take(&mut self.secret_input),
-        };
-        credentials.add_credential(request)?;
-        self.provider.clear();
-        self.label.clear();
-        self.cached = None;
-        Ok(())
-    }
-
-    fn delete(&mut self, credentials: &dyn CredentialService, id: &str) -> anyhow::Result<()> {
-        credentials.delete_credential(id)?;
-        self.cached = None;
-        Ok(())
+    fn remove_revealed(&mut self, credential_id: &str) {
+        self.reveal_pending.remove(credential_id);
+        if let Some(value) = self.revealed.remove(credential_id) {
+            self.revealed_bytes = self.revealed_bytes.saturating_sub(value.len());
+        }
     }
 }
 
-/// "+ 추가" 헤더 버튼 클릭 시 포커스를 옮길 provider 입력창의 고정 Id.
+impl Default for CredentialsUi {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for CredentialsUi {
+    fn drop(&mut self) {
+        clear_sensitive_string(&mut self.secret_input);
+    }
+}
+
 fn credential_provider_input_id() -> egui::Id {
     egui::Id::new("credentials_provider_input")
 }
@@ -368,13 +804,13 @@ fn credential_provider_input_id() -> egui::Id {
 fn credentials_table_header(ui: &mut egui::Ui, columns: &[String]) {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
-    let cols = credential_columns(rect);
+    let column_rects = credential_columns(rect);
     let painter = ui.painter();
     let color = ui.visuals().weak_text_color();
     let font = egui::FontId::monospace(12.0);
-    for (idx, column) in columns.iter().enumerate() {
+    for (index, column) in columns.iter().enumerate() {
         painter.text(
-            egui::pos2(cols[idx].left(), rect.center().y),
+            egui::pos2(column_rects[index].left(), rect.center().y),
             egui::Align2::LEFT_CENTER,
             column,
             font.clone(),
@@ -392,39 +828,39 @@ struct CredentialRowResponse {
 fn credential_table_row(
     ui: &mut egui::Ui,
     meta: &CredentialListItem,
-    revealed_secret: Option<&String>,
+    revealed_secret: Option<&str>,
+    reveal_pending: bool,
     catalog: &i18n::Catalog,
 ) -> CredentialRowResponse {
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), CREDENTIAL_ROW_HEIGHT),
+        egui::Sense::hover(),
+    );
     if response.hovered() {
         ui.painter()
             .rect_filled(rect, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
     }
-    let cols = credential_columns(rect);
+    let columns = credential_columns(rect);
     let painter = ui.painter();
     let y = rect.center().y;
-    painter.with_clip_rect(cols[0]).text(
-        egui::pos2(cols[0].left() + 2.0, y),
-        egui::Align2::LEFT_CENTER,
-        &meta.provider,
-        egui::FontId::monospace(14.0),
-        credential_secondary_text(ui),
-    );
-    painter.with_clip_rect(cols[1]).text(
-        egui::pos2(cols[1].left() + 2.0, y),
-        egui::Align2::LEFT_CENTER,
-        &meta.label,
-        egui::FontId::monospace(14.0),
-        ui.visuals().text_color(),
-    );
-    if let Some(badge_width) = credential_kind_badge_width(&meta.credential_kind, cols[2].width()) {
-        let badge = egui::Rect::from_min_size(
-            egui::pos2(cols[2].left() + 4.0, y - 12.0),
-            egui::vec2(badge_width, 24.0),
+    for (column, text, color) in [
+        (0, meta.provider(), credential_secondary_text(ui)),
+        (1, meta.label(), ui.visuals().text_color()),
+    ] {
+        painter.with_clip_rect(columns[column]).text(
+            egui::pos2(columns[column].left() + 2.0, y),
+            egui::Align2::LEFT_CENTER,
+            text,
+            egui::FontId::monospace(14.0),
+            color,
         );
-        // 종류 뱃지(P5, 스크린샷): token = accent 채움+대비 글자, api_key 등 = 1px outline.
-        let filled = meta.credential_kind == "token";
+    }
+    if let Some(width) = credential_kind_badge_width(meta.credential_kind(), columns[2].width()) {
+        let badge = egui::Rect::from_min_size(
+            egui::pos2(columns[2].left() + 4.0, y - 12.0),
+            egui::vec2(width, 24.0),
+        );
+        let filled = meta.credential_kind() == "token";
         if filled {
             painter.rect_filled(badge, 0.0, ui.visuals().selection.bg_fill);
         } else {
@@ -435,42 +871,39 @@ fn credential_table_row(
                 egui::StrokeKind::Inside,
             );
         }
-        let badge_text_color = if filled {
-            egui::Color32::WHITE
-        } else {
-            ui.visuals().weak_text_color()
-        };
-        painter.with_clip_rect(cols[2]).text(
+        painter.with_clip_rect(columns[2]).text(
             egui::pos2(badge.left() + 5.0, badge.center().y),
             egui::Align2::LEFT_CENTER,
-            &meta.credential_kind,
+            meta.credential_kind(),
             egui::FontId::monospace(12.0),
-            badge_text_color,
+            if filled {
+                egui::Color32::WHITE
+            } else {
+                ui.visuals().weak_text_color()
+            },
         );
     }
-    let reveal_center = egui::pos2(cols[3].right() - 9.0, y);
+
+    let reveal_center = egui::pos2(columns[3].right() - 9.0, y);
     let reveal_rect = egui::Rect::from_center_size(reveal_center, egui::vec2(18.0, 16.0));
     let secret_clip = egui::Rect::from_min_max(
-        cols[3].min,
+        columns[3].min,
         egui::pos2(
-            (reveal_rect.left() - 2.0).max(cols[3].left()),
-            cols[3].bottom(),
+            (reveal_rect.left() - 2.0).max(columns[3].left()),
+            columns[3].bottom(),
         ),
     );
     painter.with_clip_rect(secret_clip).text(
-        egui::pos2(cols[3].left() + 2.0, y),
+        egui::pos2(columns[3].left() + 2.0, y),
         egui::Align2::LEFT_CENTER,
-        revealed_secret
-            .map(String::as_str)
-            .unwrap_or("••••••••••••••••"),
+        revealed_secret.unwrap_or(MASKED_SECRET),
         egui::FontId::monospace(14.0),
         ui.visuals().text_color(),
     );
-
     let reveal = ui
         .interact(
             reveal_rect,
-            ui.id().with(("credential_reveal", &meta.id)),
+            ui.id().with(("credential_reveal", meta.id())),
             egui::Sense::click(),
         )
         .on_hover_text(if revealed_secret.is_some() {
@@ -489,7 +922,9 @@ fn credential_table_row(
     painter.text(
         reveal_center,
         egui::Align2::CENTER_CENTER,
-        if revealed_secret.is_some() {
+        if reveal_pending {
+            "…"
+        } else if revealed_secret.is_some() {
             "●"
         } else {
             "○"
@@ -502,11 +937,11 @@ fn credential_table_row(
         },
     );
 
-    let delete_rect = egui::Rect::from_center_size(cols[4].center(), egui::vec2(22.0, 18.0));
+    let delete_rect = egui::Rect::from_center_size(columns[4].center(), egui::vec2(22.0, 18.0));
     let delete = ui
         .interact(
             delete_rect,
-            ui.id().with(("credential_delete", &meta.id)),
+            ui.id().with(("credential_delete", meta.id())),
             egui::Sense::click(),
         )
         .on_hover_text(catalog.t("action.delete", &[]));
@@ -518,17 +953,15 @@ fn credential_table_row(
     } else {
         egui::Color32::TRANSPARENT
     };
-    let fill = if hovered {
-        ui.visuals().error_fg_color
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-    let text = if hovered {
-        ui.visuals().window_fill
-    } else {
-        ui.visuals().weak_text_color()
-    };
-    painter.rect_filled(delete_rect, 0.0, fill);
+    painter.rect_filled(
+        delete_rect,
+        0.0,
+        if hovered {
+            ui.visuals().error_fg_color
+        } else {
+            egui::Color32::TRANSPARENT
+        },
+    );
     painter.rect_stroke(
         delete_rect,
         0.0,
@@ -540,7 +973,11 @@ fn credential_table_row(
         egui::Align2::CENTER_CENTER,
         "×",
         egui::FontId::monospace(12.0),
-        text,
+        if hovered {
+            ui.visuals().window_fill
+        } else {
+            ui.visuals().weak_text_color()
+        },
     );
     super::hairline_row(ui, rect.top());
     super::hairline_row(ui, rect.bottom());
@@ -552,18 +989,19 @@ fn credential_table_row(
 
 fn credential_columns(rect: egui::Rect) -> [egui::Rect; 5] {
     const GAP: f32 = 4.0;
-    const PROVIDER_W: f32 = 80.0;
-    const KIND_W: f32 = 56.0;
-    const ACTION_W: f32 = 24.0;
-    let flexible = ((rect.width() - PROVIDER_W - KIND_W - ACTION_W - GAP * 4.0).max(0.0)) / 2.0;
-    let provider = egui::Rect::from_min_size(rect.min, egui::vec2(PROVIDER_W, rect.height()));
+    const PROVIDER_WIDTH: f32 = 80.0;
+    const KIND_WIDTH: f32 = 56.0;
+    const ACTION_WIDTH: f32 = 24.0;
+    let flexible =
+        ((rect.width() - PROVIDER_WIDTH - KIND_WIDTH - ACTION_WIDTH - GAP * 4.0).max(0.0)) / 2.0;
+    let provider = egui::Rect::from_min_size(rect.min, egui::vec2(PROVIDER_WIDTH, rect.height()));
     let label = egui::Rect::from_min_size(
         egui::pos2(provider.right() + GAP, rect.top()),
         egui::vec2(flexible, rect.height()),
     );
     let kind = egui::Rect::from_min_size(
         egui::pos2(label.right() + GAP, rect.top()),
-        egui::vec2(KIND_W, rect.height()),
+        egui::vec2(KIND_WIDTH, rect.height()),
     );
     let secret = egui::Rect::from_min_size(
         egui::pos2(kind.right() + GAP, rect.top()),
@@ -571,7 +1009,7 @@ fn credential_columns(rect: egui::Rect) -> [egui::Rect; 5] {
     );
     let delete = egui::Rect::from_min_size(
         egui::pos2(secret.right() + GAP, rect.top()),
-        egui::vec2(ACTION_W, rect.height()),
+        egui::vec2(ACTION_WIDTH, rect.height()),
     );
     [provider, label, kind, secret, delete]
 }
@@ -593,21 +1031,126 @@ fn credential_kind_badge_width(kind: &str, column_width: f32) -> Option<f32> {
     Some(desired.min(max))
 }
 
+fn truncate_utf8(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+}
+
+fn clear_sensitive_string(value: &mut String) {
+    // SAFETY: caller exclusively owns this String and only overwrites initialized bytes.
+    for byte in unsafe { value.as_mut_vec() } {
+        // SAFETY: `byte` is exclusively borrowed from the owned allocation.
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    value.clear();
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{credential_columns, credential_kind_badge_width};
+    use std::cell::Cell;
 
-    #[test]
-    fn credential_badge_width는_좁은_컬럼에서_panic하지_않는다() {
-        assert_eq!(credential_kind_badge_width("api_key", -8.0), None);
-        assert_eq!(credential_kind_badge_width("api_key", 0.0), None);
-        assert_eq!(credential_kind_badge_width("api_key", 14.0), None);
-        assert_eq!(credential_kind_badge_width("api_key", f32::NAN), None);
-        assert_eq!(credential_kind_badge_width("api_key", 22.0), Some(14.0));
+    use super::*;
+
+    struct FakePort {
+        calls: Cell<usize>,
+    }
+
+    impl FakePort {
+        fn snapshot(&self, count: usize) -> CredentialsSnapshot {
+            self.calls.set(self.calls.get() + 1);
+            let items = (0..count)
+                .map(|index| {
+                    CredentialListItem::new(
+                        format!("id-{index}"),
+                        "provider",
+                        format!("credential-{index}"),
+                        "api_key",
+                        None::<String>,
+                    )
+                })
+                .collect();
+            CredentialsSnapshot::try_new(9, items).unwrap()
+        }
     }
 
     #[test]
-    fn credential_columns는_참조_grid_폭을_유지한다() {
+    fn unchanged_snapshot_renders_300_frames_without_port_calls() {
+        let port = FakePort {
+            calls: Cell::new(0),
+        };
+        let snapshot = port.snapshot(32);
+        let calls = port.calls.get();
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let context = egui::Context::default();
+        let mut state = CredentialsUi::new();
+        for _ in 0..300 {
+            let output = context.run_ui(egui::RawInput::default(), |ui| {
+                assert!(state.contents_compact(ui, &snapshot, &catalog).is_none());
+            });
+            assert!(output.platform_output.commands.is_empty());
+        }
+        assert_eq!(port.calls.get(), calls);
+    }
+
+    #[test]
+    fn large_list_is_bounded_and_virtualized() {
+        let port = FakePort {
+            calls: Cell::new(0),
+        };
+        let snapshot = port.snapshot(CREDENTIAL_SNAPSHOT_MAX_ITEMS);
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let context = egui::Context::default();
+        let mut state = CredentialsUi::new();
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            assert!(state.contents_compact(ui, &snapshot, &catalog).is_none());
+        });
+        assert!(output.shapes.len() < CREDENTIAL_SNAPSHOT_MAX_ITEMS);
+
+        let over = (0..=CREDENTIAL_SNAPSHOT_MAX_ITEMS)
+            .map(|index| {
+                CredentialListItem::new(format!("id-{index}"), "p", "l", "api_key", None::<String>)
+            })
+            .collect();
+        assert!(matches!(
+            CredentialsSnapshot::try_new(1, over),
+            Err(CredentialSnapshotError::TooManyItems)
+        ));
+    }
+
+    #[test]
+    fn sensitive_input_and_reveal_are_redacted_and_bounded() {
+        let sensitive = SensitiveInput::try_new("super-secret".to_owned()).unwrap();
+        assert_eq!(format!("{sensitive:?}"), "SensitiveInput([REDACTED])");
+        assert!(!format!("{sensitive:?}").contains("super-secret"));
+        assert!(SensitiveInput::try_new("x".repeat(CREDENTIAL_SENSITIVE_ITEM_MAX_BYTES)).is_ok());
+        assert!(matches!(
+            SensitiveInput::try_new("x".repeat(CREDENTIAL_SENSITIVE_ITEM_MAX_BYTES + 1)),
+            Err(CredentialSensitiveError::ItemTooLarge)
+        ));
+
+        let mut state = CredentialsUi::new();
+        for index in 0..CREDENTIAL_SENSITIVE_MAX_ITEMS {
+            state
+                .accept_revealed(
+                    RevealedCredential::new(format!("id-{index}"), "x".to_owned()).unwrap(),
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            state.accept_revealed(RevealedCredential::new("overflow", "x".to_owned()).unwrap()),
+            Err(CredentialSensitiveError::CorpusFull)
+        ));
+    }
+
+    #[test]
+    fn credential_columns_keep_reference_grid_width() {
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(841.0, 30.0));
         let columns = credential_columns(rect);
         assert_eq!(columns[0].width(), 80.0);
@@ -616,5 +1159,31 @@ mod tests {
         assert_eq!(columns[3].width(), 332.5);
         assert_eq!(columns[4].width(), 24.0);
         assert_eq!(columns[4].right(), rect.right());
+    }
+
+    #[test]
+    fn production_source_has_no_service_storage_or_secret_edge() {
+        let source = include_str!("credentials.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for forbidden in [
+            ["Credential", "Service"].concat(),
+            ["crate::", "storage"].concat(),
+            ["secret::", "SecretString"].concat(),
+            ["Keyring", "SecretStore"].concat(),
+            ["std::", "fs"].concat(),
+            ["r", "fd::"].concat(),
+        ] {
+            assert!(!source.contains(&forbidden), "forbidden edge: {forbidden}");
+        }
+        assert!(source.contains("show_rows"));
+    }
+
+    #[test]
+    fn badge_width_is_safe_for_narrow_columns() {
+        assert_eq!(credential_kind_badge_width("api_key", -8.0), None);
+        assert_eq!(credential_kind_badge_width("api_key", f32::NAN), None);
+        assert_eq!(credential_kind_badge_width("api_key", 22.0), Some(14.0));
     }
 }

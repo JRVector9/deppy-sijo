@@ -70,9 +70,23 @@ struct RawServer {
 
 /// `{"mcpServers": {...}}` / `{"servers": {...}}` wrapper 또는
 /// name→spec 맨 객체를 받아들인다 (README·설정 파일에서 그대로 복사 가능하게).
+#[cfg(test)]
 pub fn parse_mcp_servers_json(text: &str) -> anyhow::Result<ImportParse> {
+    parse_mcp_servers_json_bounded(text, usize::MAX)
+}
+
+/// 입력 byte ceiling을 적용한 호출자가 서버 항목을 materialize하기 전에 item ceiling도
+/// 강제하는 production parser.
+pub fn parse_mcp_servers_json_bounded(
+    text: &str,
+    max_servers: usize,
+) -> anyhow::Result<ImportParse> {
     let root: Value = serde_json::from_str(text.trim()).context("JSON 파싱 실패")?;
     let map = server_map(&root)?;
+    anyhow::ensure!(
+        map.len() <= max_servers,
+        "MCP 서버 항목이 상한({max_servers})을 초과했습니다"
+    );
 
     let mut parse = ImportParse::default();
     for (name, value) in map {
@@ -325,5 +339,20 @@ mod tests {
         assert!(parse_mcp_servers_json("{not json").is_err());
         assert!(parse_mcp_servers_json(r#"{"foo": "bar"}"#).is_err());
         assert!(parse_mcp_servers_json("[]").is_err());
+    }
+
+    #[test]
+    fn bounded_parser는_item_ceiling_초과를_materialize_전에_거부() {
+        let mut text = String::from(r#"{"mcpServers":{"#);
+        for index in 0..=256 {
+            if index > 0 {
+                text.push(',');
+            }
+            use std::fmt::Write as _;
+            write!(&mut text, r#""server-{index}":{{"command":"mcp"}}"#).unwrap();
+        }
+        text.push_str("}}");
+
+        assert!(parse_mcp_servers_json_bounded(&text, 256).is_err());
     }
 }

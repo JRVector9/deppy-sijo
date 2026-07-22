@@ -12,6 +12,7 @@ const REPLACEMENT: &[u8] = b"[REDACTED]";
 /// 치환 오탐을 피하기 위한 최소 등록 길이 (이보다 짧은 값은 힌트 수준)
 const MIN_SECRET_LEN: usize = 6;
 const DEFAULT_GRACE: Duration = Duration::from_secs(30);
+const MAX_JSON_DEPTH: usize = 64;
 
 #[cfg(test)]
 thread_local! {
@@ -62,6 +63,9 @@ pub enum RedactionCapacityError {
     SecretTooLarge { length: usize, maximum: usize },
     ItemLimit { requested: usize, maximum: usize },
     ByteLimit { requested: usize, maximum: usize },
+    JsonDepthLimit { requested: usize, maximum: usize },
+    JsonStringLimit { requested: usize, maximum: usize },
+    InvalidStructuredJson,
     LegacyRegistrationFailed,
 }
 
@@ -90,6 +94,21 @@ impl std::fmt::Display for RedactionCapacityError {
                     f,
                     "redaction corpus needs {requested} bytes (maximum {maximum})"
                 )
+            }
+            Self::JsonDepthLimit { requested, maximum } => {
+                write!(
+                    f,
+                    "secret JSON nesting depth {requested} exceeds maximum {maximum}"
+                )
+            }
+            Self::JsonStringLimit { requested, maximum } => {
+                write!(
+                    f,
+                    "secret JSON contains {requested} strings (maximum {maximum})"
+                )
+            }
+            Self::InvalidStructuredJson => {
+                f.write_str("structured secret is not valid bounded JSON")
             }
             Self::LegacyRegistrationFailed => {
                 f.write_str("a legacy redaction registration failed closed")
@@ -307,28 +326,81 @@ impl RedactionService {
             if !seen_secrets.insert(secret.expose()) {
                 continue;
             }
-            for variant in self.variants_for(secret, true)? {
-                if variants.contains(&variant) {
-                    continue;
+            self.append_variants(secret, &mut variants, &mut variant_bytes)?;
+        }
+        self.acquire_prepared_variants(variants)
+    }
+
+    /// Acquires one checked, rotating lease for the complete secret inputs and every nested JSON
+    /// string value they contain.
+    ///
+    /// A secret beginning with an object, array, or JSON string marker is treated as structured
+    /// input and must be valid JSON within the fixed nesting and corpus-derived item limits. Other
+    /// inputs have exactly the same behavior as [`Self::acquire_execution_lease`]. Parsing,
+    /// variant expansion, deduplication, and capacity checks all finish before the corpus lock is
+    /// mutated, so callers can fail closed with no partial registration.
+    pub fn acquire_json_execution_lease(
+        &self,
+        secrets: &[&SecretString],
+    ) -> Result<RedactionLease, RedactionCapacityError> {
+        if secrets.is_empty() {
+            return Err(RedactionCapacityError::NoSecrets);
+        }
+
+        let mut variants = BTreeSet::new();
+        let mut variant_bytes = 0usize;
+        let mut seen_secrets = BTreeSet::new();
+        for secret in secrets {
+            if !seen_secrets.insert(secret.expose()) {
+                continue;
+            }
+            self.append_variants(secret, &mut variants, &mut variant_bytes)?;
+            if let Some(nested) =
+                extract_bounded_json_string_values(secret.expose(), self.inner.limits.max_items)?
+            {
+                for nested_secret in &nested {
+                    self.append_variants(nested_secret, &mut variants, &mut variant_bytes)?;
                 }
-                let requested_items = variants.len().saturating_add(1);
-                if requested_items > self.inner.limits.max_items {
-                    return Err(RedactionCapacityError::ItemLimit {
-                        requested: requested_items,
-                        maximum: self.inner.limits.max_items,
-                    });
-                }
-                let requested_bytes = variant_bytes.saturating_add(variant.len());
-                if requested_bytes > self.inner.limits.max_bytes {
-                    return Err(RedactionCapacityError::ByteLimit {
-                        requested: requested_bytes,
-                        maximum: self.inner.limits.max_bytes,
-                    });
-                }
-                variant_bytes = requested_bytes;
-                variants.insert(variant);
             }
         }
+
+        self.acquire_prepared_variants(variants)
+    }
+
+    fn append_variants(
+        &self,
+        secret: &SecretString,
+        variants: &mut BTreeSet<PatternBytes>,
+        variant_bytes: &mut usize,
+    ) -> Result<(), RedactionCapacityError> {
+        for variant in self.variants_for(secret, true)? {
+            if variants.contains(&variant) {
+                continue;
+            }
+            let requested_items = variants.len().saturating_add(1);
+            if requested_items > self.inner.limits.max_items {
+                return Err(RedactionCapacityError::ItemLimit {
+                    requested: requested_items,
+                    maximum: self.inner.limits.max_items,
+                });
+            }
+            let requested_bytes = variant_bytes.saturating_add(variant.len());
+            if requested_bytes > self.inner.limits.max_bytes {
+                return Err(RedactionCapacityError::ByteLimit {
+                    requested: requested_bytes,
+                    maximum: self.inner.limits.max_bytes,
+                });
+            }
+            *variant_bytes = requested_bytes;
+            variants.insert(variant);
+        }
+        Ok(())
+    }
+
+    fn acquire_prepared_variants(
+        &self,
+        variants: BTreeSet<PatternBytes>,
+    ) -> Result<RedactionLease, RedactionCapacityError> {
         let now = self.inner.clock.now();
         let mut patterns = self.inner.patterns.lock().expect("redaction patterns lock");
         patterns.prune(now);
@@ -496,6 +568,335 @@ impl RedactionService {
             service: self.clone(),
             carry: Vec::new(),
         }
+    }
+}
+
+fn extract_bounded_json_string_values(
+    input: &str,
+    max_strings: usize,
+) -> Result<Option<Vec<SecretString>>, RedactionCapacityError> {
+    let Some(first) = input.bytes().find(|byte| !byte.is_ascii_whitespace()) else {
+        return Ok(None);
+    };
+    if !matches!(first, b'{' | b'[' | b'"') {
+        return Ok(None);
+    }
+
+    let mut parser = BoundedJsonParser {
+        input: input.as_bytes(),
+        position: 0,
+        max_strings,
+        string_count: 0,
+        values: Vec::new(),
+    };
+    parser.parse_document()?;
+    Ok(Some(parser.values))
+}
+
+struct BoundedJsonParser<'a> {
+    input: &'a [u8],
+    position: usize,
+    max_strings: usize,
+    string_count: usize,
+    values: Vec<SecretString>,
+}
+
+impl BoundedJsonParser<'_> {
+    fn parse_document(&mut self) -> Result<(), RedactionCapacityError> {
+        self.skip_whitespace();
+        self.parse_value(0)?;
+        self.skip_whitespace();
+        if self.position == self.input.len() {
+            Ok(())
+        } else {
+            Err(RedactionCapacityError::InvalidStructuredJson)
+        }
+    }
+
+    fn parse_value(&mut self, depth: usize) -> Result<(), RedactionCapacityError> {
+        self.skip_whitespace();
+        match self.input.get(self.position).copied() {
+            Some(b'{') => self.parse_object(depth.saturating_add(1)),
+            Some(b'[') => self.parse_array(depth.saturating_add(1)),
+            Some(b'"') => {
+                if let Some(value) = self.parse_string(true)? {
+                    self.values.push(value);
+                }
+                Ok(())
+            }
+            Some(b't') => self.consume_literal(b"true"),
+            Some(b'f') => self.consume_literal(b"false"),
+            Some(b'n') => self.consume_literal(b"null"),
+            Some(b'-' | b'0'..=b'9') => self.parse_number(),
+            _ => Err(RedactionCapacityError::InvalidStructuredJson),
+        }
+    }
+
+    fn parse_object(&mut self, depth: usize) -> Result<(), RedactionCapacityError> {
+        self.ensure_depth(depth)?;
+        self.position = self.position.saturating_add(1);
+        self.skip_whitespace();
+        if self.consume_byte(b'}') {
+            return Ok(());
+        }
+
+        loop {
+            if self.input.get(self.position) != Some(&b'"') {
+                return Err(RedactionCapacityError::InvalidStructuredJson);
+            }
+            self.parse_string(false)?;
+            self.skip_whitespace();
+            if !self.consume_byte(b':') {
+                return Err(RedactionCapacityError::InvalidStructuredJson);
+            }
+            self.parse_value(depth)?;
+            self.skip_whitespace();
+            if self.consume_byte(b'}') {
+                return Ok(());
+            }
+            if !self.consume_byte(b',') {
+                return Err(RedactionCapacityError::InvalidStructuredJson);
+            }
+            self.skip_whitespace();
+        }
+    }
+
+    fn parse_array(&mut self, depth: usize) -> Result<(), RedactionCapacityError> {
+        self.ensure_depth(depth)?;
+        self.position = self.position.saturating_add(1);
+        self.skip_whitespace();
+        if self.consume_byte(b']') {
+            return Ok(());
+        }
+
+        loop {
+            self.parse_value(depth)?;
+            self.skip_whitespace();
+            if self.consume_byte(b']') {
+                return Ok(());
+            }
+            if !self.consume_byte(b',') {
+                return Err(RedactionCapacityError::InvalidStructuredJson);
+            }
+            self.skip_whitespace();
+        }
+    }
+
+    fn parse_string(
+        &mut self,
+        capture: bool,
+    ) -> Result<Option<SecretString>, RedactionCapacityError> {
+        if !self.consume_byte(b'"') {
+            return Err(RedactionCapacityError::InvalidStructuredJson);
+        }
+        self.string_count = self.string_count.saturating_add(1);
+        if self.string_count > self.max_strings {
+            return Err(RedactionCapacityError::JsonStringLimit {
+                requested: self.string_count,
+                maximum: self.max_strings,
+            });
+        }
+
+        let mut output = capture.then(ZeroizingBytes::default);
+        loop {
+            let Some(byte) = self.input.get(self.position).copied() else {
+                return Err(RedactionCapacityError::InvalidStructuredJson);
+            };
+            self.position = self.position.saturating_add(1);
+            match byte {
+                b'"' => return Ok(output.map(ZeroizingBytes::into_secret)),
+                0x00..=0x1f => return Err(RedactionCapacityError::InvalidStructuredJson),
+                b'\\' => {
+                    let Some(escaped) = self.input.get(self.position).copied() else {
+                        return Err(RedactionCapacityError::InvalidStructuredJson);
+                    };
+                    self.position = self.position.saturating_add(1);
+                    match escaped {
+                        b'"' | b'\\' | b'/' => {
+                            if let Some(output) = &mut output {
+                                output.0.push(escaped);
+                            }
+                        }
+                        b'b' => push_if_captured(&mut output, b'\x08'),
+                        b'f' => push_if_captured(&mut output, b'\x0c'),
+                        b'n' => push_if_captured(&mut output, b'\n'),
+                        b'r' => push_if_captured(&mut output, b'\r'),
+                        b't' => push_if_captured(&mut output, b'\t'),
+                        b'u' => {
+                            let scalar = self.parse_unicode_scalar()?;
+                            if let Some(output) = &mut output {
+                                output.push_scalar(scalar);
+                            }
+                        }
+                        _ => return Err(RedactionCapacityError::InvalidStructuredJson),
+                    }
+                }
+                _ => {
+                    if let Some(output) = &mut output {
+                        output.0.push(byte);
+                    }
+                }
+            }
+        }
+    }
+
+    fn parse_unicode_scalar(&mut self) -> Result<char, RedactionCapacityError> {
+        let high = self.parse_hex_quad()?;
+        let scalar = if (0xd800..=0xdbff).contains(&high) {
+            if self
+                .input
+                .get(self.position..self.position.saturating_add(2))
+                != Some(b"\\u")
+            {
+                return Err(RedactionCapacityError::InvalidStructuredJson);
+            }
+            self.position = self.position.saturating_add(2);
+            let low = self.parse_hex_quad()?;
+            if !(0xdc00..=0xdfff).contains(&low) {
+                return Err(RedactionCapacityError::InvalidStructuredJson);
+            }
+            0x1_0000 + ((u32::from(high) - 0xd800) << 10) + (u32::from(low) - 0xdc00)
+        } else if (0xdc00..=0xdfff).contains(&high) {
+            return Err(RedactionCapacityError::InvalidStructuredJson);
+        } else {
+            u32::from(high)
+        };
+        char::from_u32(scalar).ok_or(RedactionCapacityError::InvalidStructuredJson)
+    }
+
+    fn parse_hex_quad(&mut self) -> Result<u16, RedactionCapacityError> {
+        let mut value = 0u16;
+        for _ in 0..4 {
+            let Some(byte) = self.input.get(self.position).copied() else {
+                return Err(RedactionCapacityError::InvalidStructuredJson);
+            };
+            self.position = self.position.saturating_add(1);
+            let digit = match byte {
+                b'0'..=b'9' => u16::from(byte - b'0'),
+                b'a'..=b'f' => u16::from(byte - b'a') + 10,
+                b'A'..=b'F' => u16::from(byte - b'A') + 10,
+                _ => return Err(RedactionCapacityError::InvalidStructuredJson),
+            };
+            value = (value << 4) | digit;
+        }
+        Ok(value)
+    }
+
+    fn parse_number(&mut self) -> Result<(), RedactionCapacityError> {
+        self.consume_byte(b'-');
+        match self.input.get(self.position).copied() {
+            Some(b'0') => self.position = self.position.saturating_add(1),
+            Some(b'1'..=b'9') => {
+                self.position = self.position.saturating_add(1);
+                self.consume_digits();
+            }
+            _ => return Err(RedactionCapacityError::InvalidStructuredJson),
+        }
+        if self.consume_byte(b'.') && !self.consume_one_or_more_digits() {
+            return Err(RedactionCapacityError::InvalidStructuredJson);
+        }
+        if matches!(self.input.get(self.position), Some(b'e' | b'E')) {
+            self.position = self.position.saturating_add(1);
+            if matches!(self.input.get(self.position), Some(b'+' | b'-')) {
+                self.position = self.position.saturating_add(1);
+            }
+            if !self.consume_one_or_more_digits() {
+                return Err(RedactionCapacityError::InvalidStructuredJson);
+            }
+        }
+        Ok(())
+    }
+
+    fn consume_digits(&mut self) {
+        while matches!(self.input.get(self.position), Some(b'0'..=b'9')) {
+            self.position = self.position.saturating_add(1);
+        }
+    }
+
+    fn consume_one_or_more_digits(&mut self) -> bool {
+        let start = self.position;
+        self.consume_digits();
+        self.position > start
+    }
+
+    fn consume_literal(&mut self, literal: &[u8]) -> Result<(), RedactionCapacityError> {
+        if self
+            .input
+            .get(self.position..self.position.saturating_add(literal.len()))
+            == Some(literal)
+        {
+            self.position = self.position.saturating_add(literal.len());
+            Ok(())
+        } else {
+            Err(RedactionCapacityError::InvalidStructuredJson)
+        }
+    }
+
+    fn ensure_depth(&self, depth: usize) -> Result<(), RedactionCapacityError> {
+        if depth > MAX_JSON_DEPTH {
+            Err(RedactionCapacityError::JsonDepthLimit {
+                requested: depth,
+                maximum: MAX_JSON_DEPTH,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn consume_byte(&mut self, expected: u8) -> bool {
+        if self.input.get(self.position) == Some(&expected) {
+            self.position = self.position.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while matches!(
+            self.input.get(self.position),
+            Some(b' ' | b'\n' | b'\r' | b'\t')
+        ) {
+            self.position = self.position.saturating_add(1);
+        }
+    }
+}
+
+#[derive(Default)]
+struct ZeroizingBytes(Vec<u8>);
+
+impl ZeroizingBytes {
+    fn push_scalar(&mut self, scalar: char) {
+        let mut encoded = [0u8; 4];
+        self.0
+            .extend_from_slice(scalar.encode_utf8(&mut encoded).as_bytes());
+        for byte in &mut encoded {
+            // SAFETY: `byte` is exclusively borrowed from the stack buffer.
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+    }
+
+    fn into_secret(mut self) -> SecretString {
+        let bytes = std::mem::take(&mut self.0);
+        // SAFETY: raw bytes come from an input `str`; escape substitutions are ASCII or a valid
+        // Unicode scalar encoded by `char::encode_utf8`.
+        SecretString::new(unsafe { String::from_utf8_unchecked(bytes) })
+    }
+}
+
+impl Drop for ZeroizingBytes {
+    fn drop(&mut self) {
+        for byte in &mut self.0 {
+            // SAFETY: `byte` is exclusively borrowed from the owned allocation.
+            unsafe { std::ptr::write_volatile(byte, 0) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn push_if_captured(output: &mut Option<ZeroizingBytes>, byte: u8) {
+    if let Some(output) = output {
+        output.0.push(byte);
     }
 }
 
@@ -1211,6 +1612,140 @@ mod tests {
             b"rotating-secret-value"
         );
         assert_eq!(service.corpus_stats(), baseline);
+    }
+
+    #[test]
+    fn json_execution_lease_redacts_nested_values_then_releases_them_after_grace() {
+        let (service, clock) = bounded_service(512, 512 * 1024, Duration::from_secs(10));
+        let blob = SecretString::new(
+            r#"{"access_token":"nested-access-token","credentials":{"private_key":"nested-private-key"},"scopes":["nested-scope-value"],"escaped":"escaped-secret-\u2603","active":true,"generation":3}"#
+                .to_owned(),
+        );
+
+        let lease = service.acquire_json_execution_lease(&[&blob]).unwrap();
+        let active = service.corpus_stats();
+        assert_eq!(active.active_leases, 1);
+        assert_eq!(active.permanent_items, 0);
+
+        let mut redactor = service.stream_redactor();
+        let output = redact_all(
+            &mut redactor,
+            &[
+                "nested-access-token nested-private-key nested-scope-value escaped-secret-☃"
+                    .as_bytes(),
+            ],
+        );
+        assert_eq!(
+            output, b"[REDACTED] [REDACTED] [REDACTED] [REDACTED]",
+            "every nested string value must share the operation lease"
+        );
+
+        drop(lease);
+        clock.advance(Duration::from_secs(9));
+        let mut within_grace = service.stream_redactor();
+        assert_eq!(
+            redact_all(&mut within_grace, &[b"nested-private-key"]),
+            REPLACEMENT
+        );
+
+        clock.advance(Duration::from_secs(2));
+        let mut after_grace = service.stream_redactor();
+        assert_eq!(
+            redact_all(&mut after_grace, &[b"nested-private-key"]),
+            b"nested-private-key"
+        );
+        assert_eq!(service.corpus_stats(), RedactionCorpusStats::default());
+    }
+
+    #[test]
+    fn hostile_json_is_rejected_atomically_before_corpus_growth() {
+        let (small_service, _) = bounded_service(128, 4_096, Duration::ZERO);
+        let oversized = SecretString::new(format!(
+            r#"{{"access_token":"{}"}}"#,
+            "oversized-secret-value".repeat(8)
+        ));
+        assert!(matches!(
+            small_service.acquire_json_execution_lease(&[&oversized]),
+            Err(RedactionCapacityError::SecretTooLarge { .. })
+        ));
+        assert_eq!(
+            small_service.corpus_stats(),
+            RedactionCorpusStats::default()
+        );
+
+        let (deep_service, _) = bounded_service(512, 1024 * 1024, Duration::ZERO);
+        let deeply_nested = SecretString::new(format!(
+            "{}\"deep-secret-value\"{}",
+            "[".repeat(MAX_JSON_DEPTH + 1),
+            "]".repeat(MAX_JSON_DEPTH + 1)
+        ));
+        assert!(matches!(
+            deep_service.acquire_json_execution_lease(&[&deeply_nested]),
+            Err(RedactionCapacityError::JsonDepthLimit {
+                requested,
+                maximum: MAX_JSON_DEPTH,
+            }) if requested == MAX_JSON_DEPTH + 1
+        ));
+        assert_eq!(deep_service.corpus_stats(), RedactionCorpusStats::default());
+
+        let (flood_service, _) = bounded_service(32, 256 * 1024, Duration::ZERO);
+        let flooded = SecretString::new(format!(
+            "[{}]",
+            std::iter::repeat_n("\"repeated-nested-secret\"", 40)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        assert!(matches!(
+            flood_service.acquire_json_execution_lease(&[&flooded]),
+            Err(RedactionCapacityError::JsonStringLimit {
+                requested: 33,
+                maximum: 32,
+            })
+        ));
+        assert_eq!(
+            flood_service.corpus_stats(),
+            RedactionCorpusStats::default()
+        );
+
+        let (invalid_service, _) = bounded_service(128, 256 * 1024, Duration::ZERO);
+        let invalid =
+            SecretString::new(r#"{"token":"already-decoded-secret","invalid":]}"#.to_owned());
+        assert!(matches!(
+            invalid_service.acquire_json_execution_lease(&[&invalid]),
+            Err(RedactionCapacityError::InvalidStructuredJson)
+        ));
+        assert_eq!(
+            invalid_service.corpus_stats(),
+            RedactionCorpusStats::default()
+        );
+    }
+
+    #[test]
+    fn non_json_checked_lease_matches_normal_execution_lease() {
+        let (normal_service, _) = bounded_service(256, 256 * 1024, Duration::ZERO);
+        let (json_service, _) = bounded_service(256, 256 * 1024, Duration::ZERO);
+        let secret = SecretString::new("ordinary-non-json-secret".to_owned());
+
+        let normal_lease = normal_service.acquire_execution_lease(&[&secret]).unwrap();
+        let json_lease = json_service
+            .acquire_json_execution_lease(&[&secret])
+            .unwrap();
+        assert_eq!(normal_service.corpus_stats(), json_service.corpus_stats());
+
+        let mut normal_redactor = normal_service.stream_redactor();
+        let mut json_redactor = json_service.stream_redactor();
+        assert_eq!(
+            redact_all(&mut normal_redactor, &[secret.expose().as_bytes()]),
+            redact_all(&mut json_redactor, &[secret.expose().as_bytes()])
+        );
+
+        drop(normal_lease);
+        drop(json_lease);
+        assert_eq!(
+            normal_service.corpus_stats(),
+            RedactionCorpusStats::default()
+        );
+        assert_eq!(json_service.corpus_stats(), RedactionCorpusStats::default());
     }
 
     #[test]

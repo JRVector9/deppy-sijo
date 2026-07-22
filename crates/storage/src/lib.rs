@@ -13,7 +13,8 @@ pub use db::{
     PENDING_APPROVAL_SESSION_CLEANUP_LIMIT_MAX, PENDING_APPROVAL_SESSION_KEY_BYTES_MAX,
     PHYSICAL_SECRET_SLOT_RECONCILIATION_BYTES_MAX, PHYSICAL_SECRET_SLOT_RECONCILIATION_LIMIT_MAX,
     PendingApprovalRow, PermissionRuleRow, PhysicalSecretSlotLedgerRow, PhysicalSecretSlotState,
-    StatuslineRow, StructuredThreadRow, WebPushSubscriptionRow, WorkspaceRow,
+    SettingsWorkspaceProjectionRow, StatuslineRow, StructuredThreadRow, WebPushSubscriptionRow,
+    WorkspaceFindOrCreateResult, WorkspaceFolderAnchor, WorkspaceMovedPathUpdate, WorkspaceRow,
 };
 pub use mcp_store::{
     MCP_PERMISSION_POINT_BYTES_MAX, MCP_SERVER_INVENTORY_BYTES_MAX, MCP_SERVER_INVENTORY_LIMIT_MAX,

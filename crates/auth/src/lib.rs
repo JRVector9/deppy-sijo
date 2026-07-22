@@ -24,7 +24,7 @@ mod slack;
 mod test_support;
 mod www_authenticate;
 
-pub use browser::open_in_browser;
+pub use browser::{open_in_browser, open_in_browser_reaped};
 pub use callback::{
     CallbackBindError, CallbackParams, FIXED_CALLBACK_BIND_ATTEMPTS,
     FIXED_CALLBACK_BIND_RETRY_DELAY, FIXED_CALLBACK_PORT, LocalhostCallbackServer,

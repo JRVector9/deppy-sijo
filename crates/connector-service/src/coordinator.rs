@@ -5703,6 +5703,10 @@ mod tests {
             *self.open.lock().expect("gate lock") = true;
             self.changed.notify_all();
         }
+
+        fn close(&self) {
+            *self.open.lock().expect("gate lock") = false;
+        }
     }
 
     struct RepoState {
@@ -6838,6 +6842,48 @@ mod tests {
         secrets: Arc<FakeSecrets>,
     }
 
+    const SOAK_CHECKPOINT_CAP: usize = 901;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct QuiescentCheckpoint {
+        command_queue_depth: usize,
+        active_mcp_operations: usize,
+        active_oauth_flows: usize,
+        host_backlog: usize,
+        live_repositories: usize,
+        worker_threads: usize,
+        mcp_job_threads: usize,
+        mcp_leases: usize,
+        cancellation_entries: usize,
+        operation_entries: usize,
+        generation_entries: usize,
+        diagnostic_transitions: usize,
+        retained_finished_worker_handles: usize,
+    }
+
+    struct SoakCheckpoints {
+        total: usize,
+        retained: VecDeque<QuiescentCheckpoint>,
+    }
+
+    impl SoakCheckpoints {
+        fn new() -> Self {
+            Self {
+                total: 0,
+                retained: VecDeque::with_capacity(SOAK_CHECKPOINT_CAP),
+            }
+        }
+
+        fn push(&mut self, checkpoint: QuiescentCheckpoint) {
+            self.total = self.total.saturating_add(1);
+            if self.retained.len() == SOAK_CHECKPOINT_CAP {
+                self.retained.pop_front();
+            }
+            self.retained.push_back(checkpoint);
+            assert!(self.retained.len() <= SOAK_CHECKPOINT_CAP);
+        }
+    }
+
     #[derive(Default)]
     struct FakeHost {
         wakes: AtomicUsize,
@@ -6980,6 +7026,132 @@ mod tests {
         }
     }
 
+    fn worker_thread_shape(coordinator: &ConnectorCoordinator) -> (usize, usize) {
+        let worker = coordinator
+            .inner
+            .worker
+            .lock()
+            .expect("connector worker lock");
+        match worker.as_ref() {
+            Some(slot) if slot.thread.is_finished() => (0, 1),
+            Some(_) => (1, 0),
+            None => (0, 0),
+        }
+    }
+
+    fn quiescent_checkpoint(fixture: &Fixture) -> QuiescentCheckpoint {
+        let metrics = fixture.coordinator.metrics();
+        let (worker_threads, retained_finished_worker_handles) =
+            worker_thread_shape(&fixture.coordinator);
+        let opens = fixture.repo.opens.load(Ordering::Acquire);
+        let shutdowns = fixture.repo.shutdowns.load(Ordering::Acquire);
+        let snapshot = fixture.coordinator.current_snapshot();
+        QuiescentCheckpoint {
+            command_queue_depth: metrics.command_queue_depth,
+            active_mcp_operations: metrics.active_mcp_operations,
+            active_oauth_flows: metrics.active_oauth_flows,
+            host_backlog: fixture.coordinator.host_action_depth(),
+            live_repositories: opens.saturating_sub(shutdowns),
+            worker_threads,
+            mcp_job_threads: fixture.mcp.active.load(Ordering::Acquire),
+            mcp_leases: fixture.mcp.active_leases(),
+            cancellation_entries: fixture
+                .coordinator
+                .inner
+                .cancellations
+                .lock()
+                .expect("connector cancellation registry")
+                .len(),
+            operation_entries: snapshot.operations.len(),
+            generation_entries: metrics.generation_entries,
+            diagnostic_transitions: snapshot.diagnostics.transitions.len(),
+            retained_finished_worker_handles,
+        }
+    }
+
+    fn wait_for_quiescent_checkpoint(fixture: &Fixture) -> QuiescentCheckpoint {
+        wait_until(|| {
+            let checkpoint = quiescent_checkpoint(fixture);
+            checkpoint.command_queue_depth == 0
+                && checkpoint.active_mcp_operations == 0
+                && checkpoint.active_oauth_flows == 0
+                && checkpoint.host_backlog == 0
+                && checkpoint.live_repositories == 0
+                && checkpoint.worker_threads == 0
+                && checkpoint.mcp_job_threads == 0
+                && checkpoint.mcp_leases == 0
+                && checkpoint.cancellation_entries == 0
+                && checkpoint.operation_entries == 0
+        });
+        let checkpoint = quiescent_checkpoint(fixture);
+        assert_eq!(checkpoint.command_queue_depth, 0);
+        assert_eq!(checkpoint.active_mcp_operations, 0);
+        assert_eq!(checkpoint.active_oauth_flows, 0);
+        assert_eq!(checkpoint.host_backlog, 0);
+        assert_eq!(checkpoint.live_repositories, 0);
+        assert_eq!(checkpoint.worker_threads, 0);
+        assert_eq!(checkpoint.mcp_job_threads, 0);
+        assert_eq!(checkpoint.mcp_leases, 0);
+        assert_eq!(checkpoint.cancellation_entries, 0);
+        assert_eq!(checkpoint.operation_entries, 0);
+        assert!(checkpoint.generation_entries <= 1);
+        assert!(
+            checkpoint.diagnostic_transitions <= ResourceLimits::default().diagnostic_transitions
+        );
+        assert!(checkpoint.retained_finished_worker_handles <= 1);
+        assert_eq!(
+            fixture.repo.opens.load(Ordering::Acquire),
+            fixture.repo.shutdowns.load(Ordering::Acquire)
+        );
+        checkpoint
+    }
+
+    fn run_cancel_soak(cycles: usize) -> SoakCheckpoints {
+        assert!(cycles > 0);
+        let mcp_gate = Arc::new(Gate::closed());
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::clone(&mcp_gate),
+            Arc::new(Gate::opened()),
+            Arc::new(FakeClock::default()),
+        );
+        let mut checkpoints = SoakCheckpoints::new();
+        checkpoints.push(quiescent_checkpoint(&fixture));
+
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Activate)
+            .unwrap();
+        checkpoints.push(wait_for_quiescent_checkpoint(&fixture));
+
+        for _ in 0..cycles {
+            mcp_gate.close();
+            fixture
+                .coordinator
+                .dispatch(ConnectorIntent::Discover(ServerId::new("server-1")))
+                .unwrap();
+            wait_until(|| {
+                fixture.coordinator.metrics().active_mcp_operations == 1
+                    && !fixture.coordinator.current_snapshot().operations.is_empty()
+            });
+            let operation_id = fixture.coordinator.current_snapshot().operations[0]
+                .id
+                .clone();
+            fixture
+                .coordinator
+                .dispatch(ConnectorIntent::Cancel(operation_id))
+                .unwrap();
+            checkpoints.push(wait_for_quiescent_checkpoint(&fixture));
+        }
+
+        assert_eq!(checkpoints.total, cycles + 2);
+        assert_eq!(
+            checkpoints.retained.len(),
+            (cycles + 2).min(SOAK_CHECKPOINT_CAP)
+        );
+        checkpoints
+    }
+
     fn wait_for_remote_trust(coordinator: &ConnectorCoordinator) -> RemoteTrustPrompt {
         wait_until(|| coordinator.current_snapshot().remote_trust.is_some());
         coordinator
@@ -7056,6 +7228,39 @@ mod tests {
         assert_eq!(fixture.coordinator.metrics().worker_starts, 0);
         assert_eq!(fixture.coordinator.metrics().worker_alive, 0);
         assert_eq!(fixture.repo.opens.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn repeated_discover_cancel_returns_every_service_resource_to_quiescence() {
+        let checkpoints = run_cancel_soak(24);
+        assert_eq!(checkpoints.total, 26);
+        assert_eq!(checkpoints.retained.len(), 26);
+        assert!(checkpoints.retained.iter().skip(1).all(|checkpoint| {
+            checkpoint.command_queue_depth == 0
+                && checkpoint.active_mcp_operations == 0
+                && checkpoint.active_oauth_flows == 0
+                && checkpoint.host_backlog == 0
+                && checkpoint.live_repositories == 0
+                && checkpoint.worker_threads == 0
+                && checkpoint.mcp_job_threads == 0
+                && checkpoint.mcp_leases == 0
+                && checkpoint.cancellation_entries == 0
+                && checkpoint.operation_entries == 0
+        }));
+    }
+
+    #[test]
+    #[ignore = "set DEPPY_CONNECTOR_SOAK_CYCLES and run this exact test explicitly"]
+    fn env_connector_discover_cancel_soak_is_bounded_at_every_checkpoint() {
+        let cycles = std::env::var("DEPPY_CONNECTOR_SOAK_CYCLES")
+            .expect("DEPPY_CONNECTOR_SOAK_CYCLES is required for the ignored soak")
+            .parse::<usize>()
+            .expect("DEPPY_CONNECTOR_SOAK_CYCLES must be a positive integer");
+        assert!((1..=100_000).contains(&cycles));
+
+        let checkpoints = run_cancel_soak(cycles);
+        assert_eq!(checkpoints.total, cycles + 2);
+        assert!(checkpoints.retained.len() <= SOAK_CHECKPOINT_CAP);
     }
 
     #[test]

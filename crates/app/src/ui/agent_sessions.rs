@@ -21,19 +21,159 @@ use crate::codex_app_server::{
     CodexSkillInfo, codex_llm_override_from_config, validate_llm_api_key, validate_llm_base_url,
 };
 use crate::config::AgentsConfig;
-use secret::SecretString;
 use storage::StructuredThreadRow;
 
-/// custom LLM 프로바이더 API 키의 저장 경계 (PR-L4) — leaf UI는 keyring을 직접 만지지
-/// 않는다 (check-boundary 관례). App이 고정 entry id의 keyring 어댑터로 구현해 주입한다.
-/// config에는 키도 존재 플래그도 두지 않는다 — keyring 존재 여부가 단일 진실.
-pub trait CodexLlmApiKeyStore: Send + Sync {
-    fn save(&self, key: &SecretString) -> anyhow::Result<()>;
-    fn delete(&self) -> anyhow::Result<()>;
-    /// 저장된 키 존재 여부 — UI 상태 표시용 (렌더 캐시 뒤에서만 호출).
-    fn exists(&self) -> anyhow::Result<bool>;
-    /// spawn 직전 env 주입에서만 호출한다 (secret 크레이트 get 관례). 없으면 None.
-    fn load(&self) -> anyhow::Result<Option<SecretString>>;
+pub const AGENT_SESSION_SENSITIVE_ITEM_MAX_BYTES: usize = 32 * 1024;
+// This panel owns one API-key draft at a time, so it remains below the shared credential corpus
+// budget of 64 items / 1 MiB while enforcing the same 32 KiB redaction-safe item ceiling.
+
+/// Root-provided presence metadata for custom-provider authentication. No secret plaintext is
+/// retained in this snapshot and render never probes an external store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentSessionsSecretsSnapshot {
+    revision: u64,
+    available: bool,
+    controls_enabled: bool,
+    api_key_present: bool,
+}
+
+impl AgentSessionsSecretsSnapshot {
+    pub const fn new(revision: u64, api_key_present: bool) -> Self {
+        Self {
+            revision,
+            available: true,
+            controls_enabled: true,
+            api_key_present,
+        }
+    }
+
+    pub const fn unavailable(revision: u64) -> Self {
+        Self {
+            revision,
+            available: false,
+            controls_enabled: true,
+            api_key_present: false,
+        }
+    }
+
+    pub const fn revision(self) -> u64 {
+        self.revision
+    }
+
+    pub const fn is_available(self) -> bool {
+        self.available
+    }
+
+    pub const fn controls_enabled(self) -> bool {
+        self.controls_enabled
+    }
+
+    pub const fn api_key_present(self) -> bool {
+        self.api_key_present
+    }
+}
+
+/// Secret-bearing UI input. It is non-Clone/non-Serialize, Debug is always redacted, and the
+/// owned allocation is overwritten on drop.
+pub struct SensitiveInput(String);
+
+impl SensitiveInput {
+    pub fn try_api_key(mut value: String) -> anyhow::Result<Self> {
+        if value.len() > AGENT_SESSION_SENSITIVE_ITEM_MAX_BYTES {
+            clear_sensitive_string(&mut value);
+            anyhow::bail!("agent_session_sensitive_item_limit");
+        }
+        match validate_llm_api_key(&value) {
+            Ok(validated) => {
+                clear_sensitive_string(&mut value);
+                Ok(Self(validated))
+            }
+            Err(error) => {
+                clear_sensitive_string(&mut value);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn into_inner(mut self) -> String {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl std::fmt::Debug for SensitiveInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SensitiveInput([REDACTED])")
+    }
+}
+
+impl Drop for SensitiveInput {
+    fn drop(&mut self) {
+        clear_sensitive_string(&mut self.0);
+    }
+}
+
+/// Root handles these intents after the render frame. No variant implements Clone or Serialize.
+pub enum AgentSessionsSecretIntent {
+    SaveApiKey {
+        revision: u64,
+        input: SensitiveInput,
+    },
+    DeleteApiKey {
+        revision: u64,
+    },
+}
+
+/// Production host adapter. The root resolves authentication and owns process construction, so
+/// this leaf never names or loads a concrete secret type.
+pub trait CodexAppServerHost: Send + Sync {
+    fn spawn(
+        &self,
+        llm_override: Option<CodexLlmOverride>,
+        ctx: egui::Context,
+    ) -> anyhow::Result<CodexAppServerClient>;
+}
+
+pub struct AgentSessionsFrameOutput {
+    pub requests: Vec<AgentSessionsRequest>,
+    pub secret_intent: Option<AgentSessionsSecretIntent>,
+}
+
+pub struct AgentSessionsFrameInput<'a> {
+    pub workspace_id: &'a str,
+    pub workspace_cwd: Option<String>,
+    pub pty_surfaces: Vec<AgentSurfaceSnapshot>,
+    pub agents_config: &'a mut AgentsConfig,
+    pub secrets_snapshot: &'a AgentSessionsSecretsSnapshot,
+    pub ollama_models: Option<&'a [String]>,
+}
+
+struct AgentSecretRender<'a> {
+    snapshot: &'a AgentSessionsSecretsSnapshot,
+    intent: &'a mut Option<AgentSessionsSecretIntent>,
+}
+
+impl AgentSessionsFrameOutput {
+    fn empty() -> Self {
+        Self {
+            requests: Vec::new(),
+            secret_intent: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentSessionsSecretErrorCode {
+    SnapshotUnavailable,
+    InputLimitExceeded,
+    InvalidInput,
+    SaveFailed,
+    DeleteFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiKeyMutationKind {
+    Save,
+    Delete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,14 +322,14 @@ pub struct AgentSessionsUi {
     llm_override: Result<Option<CodexLlmOverride>, String>,
     /// 현재 client가 spawn될 때 적용한 오버라이드 — 설정 변경 시 유휴 재시작 판단용.
     client_llm_override: Option<CodexLlmOverride>,
-    /// custom LLM API 키 저장소 (PR-L4). App이 keyring 어댑터를 주입한다.
-    /// None(테스트/미주입)이면 키 UI를 렌더하지 않고 spawn도 키 없이 진행한다.
-    api_key_store: Option<Arc<dyn CodexLlmApiKeyStore>>,
+    /// Production app-server/process host. The composition root resolves authentication.
+    app_server_host: Option<Arc<dyn CodexAppServerHost>>,
     /// API 키 입력 버퍼 (password 렌더). 저장 성공 시 즉시 비운다.
     api_key_input: String,
-    /// keyring 존재 여부 캐시 — 매 프레임 keychain 조회 방지. None = 미확인(다음 렌더에서 조회).
-    api_key_present: Option<bool>,
-    api_key_error: Option<CatalogMessage>,
+    api_key_input_overflowed: bool,
+    api_key_pending: Option<ApiKeyMutationKind>,
+    api_key_error: Option<AgentSessionsSecretErrorCode>,
+    api_key_snapshot_revision: Option<u64>,
     /// 키 저장/삭제 세대. client가 spawn 시 기록한 세대와 다르고 유휴면
     /// sync_llm_config가 재시작해 다음 spawn부터 새 키를 반영한다.
     api_key_generation: u64,
@@ -235,10 +375,12 @@ impl AgentSessionsUi {
             text_input_ids: Vec::new(),
             llm_override: Ok(None),
             client_llm_override: None,
-            api_key_store: None,
+            app_server_host: None,
             api_key_input: String::new(),
-            api_key_present: None,
+            api_key_input_overflowed: false,
+            api_key_pending: None,
             api_key_error: None,
+            api_key_snapshot_revision: None,
             api_key_generation: 0,
             client_api_key_generation: 0,
             catalog: i18n::Catalog::load(i18n::FALLBACK_LOCALE)
@@ -247,10 +389,27 @@ impl AgentSessionsUi {
         }
     }
 
-    /// App 배선용 — custom LLM API 키 keyring 어댑터를 주입한다 (PR-L4).
-    pub fn with_api_key_store(mut self, store: Arc<dyn CodexLlmApiKeyStore>) -> Self {
-        self.api_key_store = Some(store);
+    /// App wiring: inject the root-owned process/authentication host.
+    pub fn with_app_server_host(mut self, host: Arc<dyn CodexAppServerHost>) -> Self {
+        self.app_server_host = Some(host);
         self
+    }
+
+    pub fn api_key_save_succeeded(&mut self) {
+        self.api_key_pending = None;
+        self.api_key_error = None;
+        self.api_key_generation = self.api_key_generation.saturating_add(1);
+    }
+
+    pub fn api_key_delete_succeeded(&mut self) {
+        self.api_key_pending = None;
+        self.api_key_error = None;
+        self.api_key_generation = self.api_key_generation.saturating_add(1);
+    }
+
+    pub fn report_api_key_error(&mut self, code: AgentSessionsSecretErrorCode) {
+        self.api_key_pending = None;
+        self.api_key_error = Some(code);
     }
 
     /// App 생성·locale hot reload 시 비동기 poll보다 먼저 현재 catalog를 주입한다.
@@ -789,28 +948,31 @@ impl AgentSessionsUi {
                 &[("error", message)],
             )),
         };
-        // custom + 저장된 키가 있으면 spawn 직전에만 keyring에서 읽는다 (PR-L4,
-        // secret 크레이트 get 관례). 로드 실패는 키 없이 조용히 진행하지 않고 중단 —
-        // 인증 실패로 늦게 표면화되는 것보다 명확하다.
-        let llm_api_key = match (&llm_override, &self.api_key_store) {
-            (Some(CodexLlmOverride::Custom { .. }), Some(store)) => {
-                store.load().map_err(|error| {
-                    anyhow::anyhow!(localized_error(
-                        &self.catalog,
-                        "agent_sessions.error.api_key_load",
-                        &error,
-                    ))
-                })?
-            }
-            _ => None,
-        };
         let api_key_generation = self.api_key_generation;
-        let options = CodexAppServerOptions {
-            llm_override: llm_override.clone(),
-            llm_api_key,
-            ..CodexAppServerOptions::default()
+        let client = if let Some(host) = &self.app_server_host {
+            host.spawn(llm_override.clone(), ctx.clone())
+                .map_err(|error| {
+                    if matches!(llm_override, Some(CodexLlmOverride::Custom { .. })) {
+                        anyhow::anyhow!(localized_error(
+                            &self.catalog,
+                            "agent_sessions.error.api_key_load",
+                            &error,
+                        ))
+                    } else {
+                        error
+                    }
+                })?
+        } else {
+            // Tests and unintegrated hosts preserve the no-secret default path. Production injects
+            // `CodexAppServerHost` so authentication and process construction stay at the root.
+            CodexAppServerClient::spawn(
+                CodexAppServerOptions {
+                    llm_override: llm_override.clone(),
+                    ..CodexAppServerOptions::default()
+                },
+                ctx.clone(),
+            )?
         };
-        let client = CodexAppServerClient::spawn(options, ctx.clone())?;
         self.transport_error = None;
         self.client = Some(client);
         self.client_llm_override = llm_override;
@@ -1224,12 +1386,16 @@ impl AgentSessionsUi {
     pub fn show(
         &mut self,
         ctx: &egui::Context,
-        workspace_id: &str,
-        workspace_cwd: Option<String>,
-        pty_surfaces: Vec<AgentSurfaceSnapshot>,
-        agents_config: &mut AgentsConfig,
-        ollama_models: Option<&[String]>,
-    ) -> Vec<AgentSessionsRequest> {
+        input: AgentSessionsFrameInput<'_>,
+    ) -> AgentSessionsFrameOutput {
+        let AgentSessionsFrameInput {
+            workspace_id,
+            workspace_cwd,
+            pty_surfaces,
+            agents_config,
+            secrets_snapshot,
+            ollama_models,
+        } = input;
         // 렌더 도중 self를 변경하면서도 동일 frame의 locale snapshot을 유지한다.
         let catalog = self.catalog.clone();
         let catalog = &catalog;
@@ -1248,7 +1414,7 @@ impl AgentSessionsUi {
         if !self.open {
             self.surrender_text_focus(ctx);
             self.text_input_ids.clear();
-            return Vec::new();
+            return AgentSessionsFrameOutput::empty();
         }
 
         let focused_before = ctx.memory(|memory| memory.focused());
@@ -1259,6 +1425,7 @@ impl AgentSessionsUi {
         let mut window_open = self.open;
         let mut actions = Vec::new();
         let mut requests = Vec::new();
+        let mut secret_intent = None;
         let window_response = egui::Window::new(catalog.t("agent_sessions.title", &[]))
             .id(agents_window_id())
             .open(&mut window_open)
@@ -1319,6 +1486,10 @@ impl AgentSessionsUi {
                     ui,
                     &mut text_input_ids,
                     agents_config,
+                    AgentSecretRender {
+                        snapshot: secrets_snapshot,
+                        intent: &mut secret_intent,
+                    },
                     ollama_models,
                     catalog,
                 );
@@ -1412,7 +1583,10 @@ impl AgentSessionsUi {
                 requests.push(request);
             }
         }
-        requests
+        AgentSessionsFrameOutput {
+            requests,
+            secret_intent,
+        }
     }
 
     fn render_agent_controls(
@@ -1420,6 +1594,7 @@ impl AgentSessionsUi {
         ui: &mut egui::Ui,
         text_input_ids: &mut Vec<egui::Id>,
         agents_config: &mut AgentsConfig,
+        secrets: AgentSecretRender<'_>,
         ollama_models: Option<&[String]>,
         catalog: &i18n::Catalog,
     ) {
@@ -1504,6 +1679,7 @@ impl AgentSessionsUi {
             ui,
             text_input_ids,
             agents_config,
+            secrets,
             ollama_models,
             catalog,
         );
@@ -1546,6 +1722,7 @@ impl AgentSessionsUi {
         ui: &mut egui::Ui,
         text_input_ids: &mut Vec<egui::Id>,
         agents_config: &mut AgentsConfig,
+        secrets: AgentSecretRender<'_>,
         ollama_models: Option<&[String]>,
         catalog: &i18n::Catalog,
     ) {
@@ -1618,7 +1795,13 @@ impl AgentSessionsUi {
                         }
                     });
             });
-            self.render_llm_api_key_controls(ui, text_input_ids, catalog);
+            self.render_llm_api_key_controls(
+                ui,
+                text_input_ids,
+                secrets.snapshot,
+                secrets.intent,
+                catalog,
+            );
         }
         // OSS 선택 시 감지된 ollama 모델을 클릭 후보로 (PR-L3 — local_llm 감지 배선.
         // 커스텀은 사용자 지시로 검색 없이 입력값 그대로 쓴다, 2026-07-18).
@@ -1658,34 +1841,33 @@ impl AgentSessionsUi {
         }
     }
 
-    /// custom 프로바이더 API 키 (PR-L4). 키는 keyring에만 저장한다 — config/argv에
-    /// 남기지 않고, spawn 시 자식 프로세스 env로만 전달된다.
+    /// Custom-provider authentication controls. The immutable snapshot is the only render input;
+    /// save/delete are returned as intents for the composition root.
     fn render_llm_api_key_controls(
         &mut self,
         ui: &mut egui::Ui,
         text_input_ids: &mut Vec<egui::Id>,
+        snapshot: &AgentSessionsSecretsSnapshot,
+        intent: &mut Option<AgentSessionsSecretIntent>,
         catalog: &i18n::Catalog,
     ) {
-        // 저장소 미주입(테스트 등)이면 키 UI를 렌더하지 않는다.
-        let Some(store) = self.api_key_store.clone() else {
+        if !snapshot.controls_enabled() {
             return;
-        };
-        // keyring 존재 확인은 캐시 미스에서 한 번만 — 매 프레임 keychain 조회 방지.
-        if self.api_key_present.is_none() {
-            match store.exists() {
-                Ok(present) => self.api_key_present = Some(present),
-                Err(error) => {
-                    self.api_key_present = Some(false);
-                    self.api_key_error = Some(CatalogMessage::Error {
-                        key: "agent_sessions.api_key_check_failed",
-                        detail: format!("{error:#}"),
-                    });
-                }
+        }
+        if self.api_key_snapshot_revision != Some(snapshot.revision()) {
+            self.api_key_snapshot_revision = Some(snapshot.revision());
+            if snapshot.is_available()
+                && self.api_key_error == Some(AgentSessionsSecretErrorCode::SnapshotUnavailable)
+            {
+                self.api_key_error = None;
             }
+        }
+        if !snapshot.is_available() {
+            self.api_key_error = Some(AgentSessionsSecretErrorCode::SnapshotUnavailable);
         }
         ui.horizontal_wrapped(|ui| {
             ui.label(catalog.t("agent_sessions.api_key", &[]));
-            let hint = if self.api_key_present == Some(true) {
+            let hint = if snapshot.api_key_present() {
                 catalog.t("agent_sessions.api_key_replace_hint", &[])
             } else {
                 catalog.t("agent_sessions.api_key_optional_hint", &[])
@@ -1697,66 +1879,63 @@ impl AgentSessionsUi {
                     .hint_text(hint),
             );
             text_input_ids.push(response.id);
-            let has_input = !self.api_key_input.trim().is_empty();
+            if self.api_key_input.len() > AGENT_SESSION_SENSITIVE_ITEM_MAX_BYTES {
+                clear_sensitive_string(&mut self.api_key_input);
+                self.api_key_input_overflowed = true;
+                self.api_key_error = Some(AgentSessionsSecretErrorCode::InputLimitExceeded);
+            } else if response.changed() {
+                self.api_key_input_overflowed = false;
+            }
+            let has_input = !self.api_key_input.trim().is_empty()
+                && !self.api_key_input_overflowed
+                && self.api_key_pending.is_none()
+                && snapshot.is_available();
             if ui
                 .add_enabled(has_input, egui::Button::new(catalog.t("action.save", &[])))
                 .clicked()
+                && intent.is_none()
             {
-                self.save_api_key(store.as_ref());
+                let input = std::mem::take(&mut self.api_key_input);
+                match SensitiveInput::try_api_key(input) {
+                    Ok(input) => {
+                        self.api_key_pending = Some(ApiKeyMutationKind::Save);
+                        self.api_key_error = None;
+                        *intent = Some(AgentSessionsSecretIntent::SaveApiKey {
+                            revision: snapshot.revision(),
+                            input,
+                        });
+                    }
+                    Err(_) => {
+                        self.api_key_error = Some(AgentSessionsSecretErrorCode::InvalidInput);
+                    }
+                }
             }
-            if self.api_key_present == Some(true)
-                && ui.button(catalog.t("action.delete", &[])).clicked()
+            if snapshot.api_key_present()
+                && ui
+                    .add_enabled(
+                        self.api_key_pending.is_none() && snapshot.is_available(),
+                        egui::Button::new(catalog.t("action.delete", &[])),
+                    )
+                    .clicked()
+                && intent.is_none()
             {
-                self.delete_api_key(store.as_ref());
+                self.api_key_pending = Some(ApiKeyMutationKind::Delete);
+                self.api_key_error = None;
+                *intent = Some(AgentSessionsSecretIntent::DeleteApiKey {
+                    revision: snapshot.revision(),
+                });
             }
         });
         if let Some(error) = &self.api_key_error {
-            ui.colored_label(ui.visuals().warn_fg_color, error.render(catalog));
-        } else if self.api_key_present == Some(true) {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                api_key_error_message(*error, catalog),
+            );
+        } else if snapshot.api_key_present() {
             ui.weak(catalog.t("agent_sessions.api_key_stored", &[]));
         }
-    }
-
-    /// 입력 버퍼의 키를 검증해 keyring에 저장한다. 성공 시 버퍼를 즉시 비운다.
-    fn save_api_key(&mut self, store: &dyn CodexLlmApiKeyStore) {
-        // env 값으로 주입되지만 붙여넣기 개행/제어문자는 인증 실패로 이어진다 — 입력 거부.
-        let key = match validate_llm_api_key(&self.api_key_input) {
-            Ok(key) => key,
-            Err(error) => {
-                self.api_key_error = Some(CatalogMessage::raw(format!("{error:#}")));
-                return;
-            }
-        };
-        match store.save(&SecretString::new(key)) {
-            Ok(()) => {
-                self.api_key_input.clear();
-                self.api_key_present = Some(true);
-                self.api_key_error = None;
-                // 유휴 client는 sync_llm_config가 내렸다가 다음 spawn에 새 키를 쓴다.
-                self.api_key_generation += 1;
-            }
-            Err(error) => {
-                self.api_key_error = Some(CatalogMessage::Error {
-                    key: "agent_sessions.api_key_save_failed",
-                    detail: format!("{error:#}"),
-                });
-            }
-        }
-    }
-
-    fn delete_api_key(&mut self, store: &dyn CodexLlmApiKeyStore) {
-        match store.delete() {
-            Ok(()) => {
-                self.api_key_present = Some(false);
-                self.api_key_error = None;
-                self.api_key_generation += 1;
-            }
-            Err(error) => {
-                self.api_key_error = Some(CatalogMessage::Error {
-                    key: "agent_sessions.api_key_delete_failed",
-                    detail: format!("{error:#}"),
-                });
-            }
+        if self.api_key_pending.is_some() {
+            ui.weak(catalog.t("agent_sessions.catalog_waiting", &[]));
         }
     }
 
@@ -2625,6 +2804,12 @@ impl AgentSessionsUi {
     }
 }
 
+impl Drop for AgentSessionsUi {
+    fn drop(&mut self) {
+        clear_sensitive_string(&mut self.api_key_input);
+    }
+}
+
 fn agent_focus_to_surrender(
     focused: Option<egui::Id>,
     agent_input_ids: &[egui::Id],
@@ -2943,6 +3128,38 @@ fn status_color(status: AgentSessionStatus) -> egui::Color32 {
     ))
 }
 
+fn api_key_error_message(code: AgentSessionsSecretErrorCode, catalog: &i18n::Catalog) -> String {
+    let (key, detail) = match code {
+        AgentSessionsSecretErrorCode::SnapshotUnavailable => (
+            "agent_sessions.api_key_check_failed",
+            "snapshot_unavailable",
+        ),
+        AgentSessionsSecretErrorCode::InputLimitExceeded => {
+            ("agent_sessions.api_key_save_failed", "input_limit")
+        }
+        AgentSessionsSecretErrorCode::InvalidInput => {
+            ("agent_sessions.api_key_save_failed", "invalid_input")
+        }
+        AgentSessionsSecretErrorCode::SaveFailed => {
+            ("agent_sessions.api_key_save_failed", "save_failed")
+        }
+        AgentSessionsSecretErrorCode::DeleteFailed => {
+            ("agent_sessions.api_key_delete_failed", "delete_failed")
+        }
+    };
+    catalog.t(key, &[("error", detail)])
+}
+
+fn clear_sensitive_string(value: &mut String) {
+    // SAFETY: caller exclusively owns this String and only overwrites initialized bytes.
+    for byte in unsafe { value.as_mut_vec() } {
+        // SAFETY: `byte` is exclusively borrowed from the owned allocation.
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    value.clear();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3081,73 +3298,84 @@ mod tests {
         assert!(ui.client.is_none());
     }
 
-    /// 실제 keyring을 만지지 않는 인메모리 API 키 저장소 (MemSecretStore 관례).
     #[derive(Default)]
-    struct MemApiKeyStore {
-        key: std::sync::Mutex<Option<String>>,
-        fail_load: bool,
+    struct CountingHost {
+        calls: std::sync::atomic::AtomicUsize,
     }
 
-    impl CodexLlmApiKeyStore for MemApiKeyStore {
-        fn save(&self, key: &SecretString) -> anyhow::Result<()> {
-            *self.key.lock().unwrap() = Some(key.expose().to_owned());
-            Ok(())
-        }
-        fn delete(&self) -> anyhow::Result<()> {
-            *self.key.lock().unwrap() = None;
-            Ok(())
-        }
-        fn exists(&self) -> anyhow::Result<bool> {
-            Ok(self.key.lock().unwrap().is_some())
-        }
-        fn load(&self) -> anyhow::Result<Option<SecretString>> {
-            anyhow::ensure!(!self.fail_load, "keyring 조회 실패 (테스트)");
-            Ok(self.key.lock().unwrap().clone().map(SecretString::new))
+    impl CodexAppServerHost for CountingHost {
+        fn spawn(
+            &self,
+            _llm_override: Option<CodexLlmOverride>,
+            _ctx: egui::Context,
+        ) -> anyhow::Result<CodexAppServerClient> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            anyhow::bail!("host load failed")
         }
     }
 
     #[test]
-    fn api_key_저장은_trim_후_어댑터에_쓰고_버퍼를_비운다() {
-        let store = Arc::new(MemApiKeyStore::default());
-        let mut ui = AgentSessionsUi::new().with_api_key_store(store.clone());
-        ui.api_key_input = "  sk-test-123  ".to_owned();
-        ui.save_api_key(store.as_ref());
-        assert_eq!(store.key.lock().unwrap().as_deref(), Some("sk-test-123"));
-        assert!(ui.api_key_input.is_empty());
-        assert_eq!(ui.api_key_present, Some(true));
-        assert_eq!(ui.api_key_error, None);
-        assert_eq!(ui.api_key_generation, 1);
-
-        ui.delete_api_key(store.as_ref());
-        assert_eq!(*store.key.lock().unwrap(), None);
-        assert_eq!(ui.api_key_present, Some(false));
-        assert_eq!(ui.api_key_generation, 2);
-    }
-
-    #[test]
-    fn api_key_공백_제어문자는_저장을_거부한다() {
-        let store = Arc::new(MemApiKeyStore::default());
-        let mut ui = AgentSessionsUi::new().with_api_key_store(store.clone());
+    fn sensitive_api_key_is_trimmed_redacted_and_bounded() {
+        let input = SensitiveInput::try_api_key("  sk-test-123  ".to_owned()).unwrap();
+        assert_eq!(format!("{input:?}"), "SensitiveInput([REDACTED])");
+        assert!(!format!("{input:?}").contains("sk-test-123"));
+        let mut plain = input.into_inner();
+        assert_eq!(plain, "sk-test-123");
+        clear_sensitive_string(&mut plain);
+        assert!(
+            SensitiveInput::try_api_key("x".repeat(AGENT_SESSION_SENSITIVE_ITEM_MAX_BYTES)).is_ok()
+        );
+        assert!(
+            SensitiveInput::try_api_key("x".repeat(AGENT_SESSION_SENSITIVE_ITEM_MAX_BYTES + 1))
+                .is_err()
+        );
         for bad in ["", "   ", "sk a", "sk\nb"] {
-            ui.api_key_input = bad.to_owned();
-            ui.save_api_key(store.as_ref());
-            assert_eq!(
-                *store.key.lock().unwrap(),
-                None,
-                "{bad:?}는 거부되어야 한다"
-            );
-            assert!(ui.api_key_error.is_some());
-            assert_eq!(ui.api_key_generation, 0);
+            assert!(SensitiveInput::try_api_key(bad.to_owned()).is_err());
         }
     }
 
     #[test]
-    fn api_key_로드_실패는_ensure_client가_spawn_전에_중단한다() {
-        let store = Arc::new(MemApiKeyStore {
-            fail_load: true,
-            ..Default::default()
-        });
-        let mut ui = AgentSessionsUi::new().with_api_key_store(store);
+    fn unchanged_secret_snapshot_renders_300_frames_without_host_calls() {
+        let host = Arc::new(CountingHost::default());
+        let mut state = AgentSessionsUi::new().with_app_server_host(host.clone());
+        let snapshot = AgentSessionsSecretsSnapshot::new(7, true);
+        let catalog = catalog();
+        let context = egui::Context::default();
+        for _ in 0..300 {
+            let _ = context.run_ui(egui::RawInput::default(), |ui| {
+                let mut text_input_ids = Vec::new();
+                let mut intent = None;
+                state.render_llm_api_key_controls(
+                    ui,
+                    &mut text_input_ids,
+                    &snapshot,
+                    &mut intent,
+                    &catalog,
+                );
+                assert!(intent.is_none());
+            });
+        }
+        assert_eq!(host.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn api_key_mutation_callbacks_advance_generation_only_after_success() {
+        let mut state = AgentSessionsUi::new();
+        state.api_key_pending = Some(ApiKeyMutationKind::Save);
+        state.api_key_save_succeeded();
+        assert_eq!(state.api_key_generation, 1);
+        assert_eq!(state.api_key_pending, None);
+        state.api_key_pending = Some(ApiKeyMutationKind::Delete);
+        state.api_key_delete_succeeded();
+        assert_eq!(state.api_key_generation, 2);
+        assert_eq!(state.api_key_pending, None);
+    }
+
+    #[test]
+    fn api_key_host_failure_stops_custom_client_before_spawn() {
+        let host = Arc::new(CountingHost::default());
+        let mut ui = AgentSessionsUi::new().with_app_server_host(host.clone());
         ui.sync_llm_config(&AgentsConfig {
             codex_llm_provider: Some("custom".to_owned()),
             codex_llm_base_url: Some("http://localhost:11434/v1".to_owned()),
@@ -3157,6 +3385,22 @@ mod tests {
         let error = ui.ensure_client(&ctx).unwrap_err();
         assert!(format!("{error:#}").contains("Failed to load the LLM API key"));
         assert!(ui.client.is_none());
+        assert_eq!(host.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn production_source_has_no_concrete_secret_or_store_edge() {
+        let source = include_str!("agent_sessions.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for forbidden in [
+            ["secret::", "SecretString"].concat(),
+            ["CodexLlm", "ApiKeyStore"].concat(),
+            ["Keyring", "SecretStore"].concat(),
+        ] {
+            assert!(!source.contains(&forbidden), "forbidden edge: {forbidden}");
+        }
     }
 
     #[test]

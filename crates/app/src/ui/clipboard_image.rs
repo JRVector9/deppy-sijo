@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-fn paste_clipboard_paths_or_image_to_paths() -> anyhow::Result<Option<Vec<PathBuf>>> {
+pub(crate) fn paste_clipboard_paths_or_image_to_paths() -> anyhow::Result<Option<Vec<PathBuf>>> {
     let mut clipboard = arboard::Clipboard::new().context("clipboard 열기 실패")?;
     if let Some(paths) = clipboard_file_list(&mut clipboard)? {
         return Ok(Some(paths));

@@ -1949,6 +1949,76 @@ mod tests {
         assert_eq!(session.stats().idle_evictions, 2);
     }
 
+    #[test]
+    fn 반복_reuse_ttl_unknown_cycle은_현재_resource를_baseline으로_복귀한다() {
+        const CYCLES: usize = 32;
+        const UNKNOWN_INTERVAL: usize = 8;
+        let idle_ttl = Duration::from_millis(5);
+        let (session, clock, resources) = fake_session(idle_ttl);
+        let backend = BackendClient::new("srv".to_owned(), stdio_config("one"), session.clone());
+        let mut unknowns = 0;
+
+        for cycle in 1..=CYCLES {
+            let connects_before = resources.connects.load(Ordering::SeqCst);
+            let calls_before = resources.calls.load(Ordering::SeqCst);
+            backend.list_tools().unwrap();
+            backend.call_tool("echo", serde_json::json!({})).unwrap();
+            assert_eq!(
+                resources.connects.load(Ordering::SeqCst),
+                connects_before + 1,
+                "cycle={cycle}"
+            );
+            assert_eq!(
+                resources.calls.load(Ordering::SeqCst),
+                calls_before + 1,
+                "cycle={cycle}"
+            );
+            assert_eq!(session.stats().active_leases, 1, "cycle={cycle}");
+            assert_eq!(resources.live.load(Ordering::SeqCst), 1, "cycle={cycle}");
+
+            clock.advance(idle_ttl);
+            assert_eq!(session.reap_expired(), 1, "cycle={cycle}");
+            assert_eq!(session.stats().active_leases, 0, "cycle={cycle}");
+            assert_eq!(resources.live.load(Ordering::SeqCst), 0, "cycle={cycle}");
+            assert!(session.next_expiry().is_none(), "cycle={cycle}");
+
+            if cycle % UNKNOWN_INTERVAL == 0 {
+                unknowns += 1;
+                let connects_before = resources.connects.load(Ordering::SeqCst);
+                let calls_before = resources.calls.load(Ordering::SeqCst);
+                let error = backend
+                    .call_tool("echo", serde_json::json!({"mode":"unknown"}))
+                    .unwrap_err();
+                assert!(
+                    error.downcast_ref::<McpDeliveryUnknown>().is_some(),
+                    "cycle={cycle}: {error:#}"
+                );
+                assert_eq!(
+                    resources.connects.load(Ordering::SeqCst),
+                    connects_before + 1,
+                    "unknown call was automatically retried at cycle={cycle}"
+                );
+                assert_eq!(
+                    resources.calls.load(Ordering::SeqCst),
+                    calls_before + 1,
+                    "unknown call was automatically retried at cycle={cycle}"
+                );
+                assert_eq!(session.stats().active_leases, 0, "cycle={cycle}");
+                assert_eq!(resources.live.load(Ordering::SeqCst), 0, "cycle={cycle}");
+                assert!(session.next_expiry().is_none(), "cycle={cycle}");
+            }
+        }
+
+        let stats = session.stats();
+        assert_eq!(stats.cold_connects, (CYCLES + unknowns) as u64);
+        assert_eq!(stats.warm_reuses, CYCLES as u64);
+        assert_eq!(stats.idle_evictions, CYCLES as u64);
+        assert_eq!(stats.delivery_unknown, unknowns as u64);
+        assert_eq!(stats.poisoned_connections, unknowns as u64);
+        assert_eq!(stats.active_leases, 0);
+        assert_eq!(stats.peak_leases, 1);
+    }
+
     #[cfg(unix)]
     fn process_rss_kib(pid: u32) -> Option<u64> {
         let output = std::process::Command::new("ps")
@@ -1967,6 +2037,215 @@ mod tests {
         let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
         result == 0
             || std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
+    }
+
+    #[cfg(unix)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct ActiveTransportSnapshot {
+        active_threads: usize,
+        stdio_stdout_threads: usize,
+        stdio_stderr_threads: usize,
+        stdio_writer_threads: usize,
+        http_sender_threads: usize,
+        http_progress_threads: usize,
+        active_http_send_permits: usize,
+        pending_http_reaper_queue: usize,
+    }
+
+    #[cfg(unix)]
+    fn active_transport_snapshot() -> ActiveTransportSnapshot {
+        let metrics = mcp::transport_metrics();
+        ActiveTransportSnapshot {
+            active_threads: metrics.active_threads,
+            stdio_stdout_threads: metrics.stdio_stdout_threads,
+            stdio_stderr_threads: metrics.stdio_stderr_threads,
+            stdio_writer_threads: metrics.stdio_writer_threads,
+            http_sender_threads: metrics.http_sender_threads,
+            http_progress_threads: metrics.http_progress_threads,
+            active_http_send_permits: metrics.active_http_send_permits,
+            pending_http_reaper_queue: metrics.reaper_pending_http_senders,
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_transport_returns_to(baseline: ActiveTransportSnapshot, checkpoint: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let current = active_transport_snapshot();
+            if current == baseline {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "transport resources did not return to baseline at checkpoint={checkpoint}: baseline={baseline:?}, current={current:?}"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "env-gated OD01 stdio session soak"]
+    fn od01_env_stdio_session_soak은_모든_cycle_boundary에서_baseline을_회복한다() {
+        const ENABLE_ENV: &str = "DEPPY_MCP_PROXY_SESSION_SOAK";
+        const CHECKPOINTS_ENV: &str = "DEPPY_MCP_PROXY_SESSION_SOAK_CHECKPOINTS";
+        const DEFAULT_CHECKPOINTS: usize = 91;
+        const MAX_CHECKPOINTS: usize = 901;
+
+        if std::env::var(ENABLE_ENV).as_deref() != Ok("1") {
+            eprintln!("set {ENABLE_ENV}=1 to run the ignored OD01 stdio session soak");
+            return;
+        }
+        let checkpoints = std::env::var(CHECKPOINTS_ENV)
+            .ok()
+            .map(|raw| {
+                raw.parse::<usize>()
+                    .unwrap_or_else(|_| panic!("{CHECKPOINTS_ENV} must be an integer"))
+            })
+            .unwrap_or(DEFAULT_CHECKPOINTS);
+        assert!(
+            (3..=MAX_CHECKPOINTS).contains(&checkpoints),
+            "{CHECKPOINTS_ENV} must be between 3 and {MAX_CHECKPOINTS}"
+        );
+        let cycles = checkpoints - 1;
+        let sequence = PATH_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+        let fixture_dir = std::env::temp_dir().join(format!(
+            "deppy-od01-proxy-stdio-soak-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        let pid_file = fixture_dir.join("backend.pid");
+        let unknown_marker = fixture_dir.join("unknown.marker");
+        let unknown_calls = fixture_dir.join("unknown-calls.log");
+        let script = format!(
+            r#"echo $$ > '{}'
+IFS= read -r _init
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-11-25","capabilities":{{}},"serverInfo":{{"name":"od01-soak","version":"1"}}}}}}'
+IFS= read -r _initialized
+IFS= read -r _list
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[{{"name":"echo","inputSchema":{{"type":"object"}}}}]}}}}'
+IFS= read -r _call
+if [ -f '{}' ]; then
+  printf '%s\n' unknown >> '{}'
+  exit 0
+fi
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"content":[{{"type":"text","text":"warm"}}],"isError":false}}}}'
+IFS= read -r _until_cancel
+"#,
+            pid_file.display(),
+            unknown_marker.display(),
+            unknown_calls.display()
+        );
+        let idle_ttl = Duration::from_millis(10);
+        let redaction = secret::RedactionService::new();
+        let (db_dir, db) = test_session_db("od01-stdio-soak");
+        let session = BackendSession::production(
+            LocalMcpManager::new(redaction.clone()).with_request_timeout(Duration::from_secs(5)),
+            Arc::clone(&db),
+            redaction,
+            idle_ttl,
+        );
+        let backend = BackendClient::new(
+            "stdio-soak".to_owned(),
+            BackendConfig::Stdio(StdioBackendConfig {
+                name: "od01-soak".to_owned(),
+                command: "/bin/sh".to_owned(),
+                args: vec!["-c".to_owned(), script],
+                env_plain: Vec::new(),
+                env_credentials: Vec::new(),
+                inherit_env: true,
+            }),
+            session.clone(),
+        );
+        let baseline = active_transport_snapshot();
+        assert_eq!(session.stats().active_leases, 0);
+        assert!(session.next_expiry().is_none());
+        let started = Instant::now();
+
+        for cycle in 1..=cycles {
+            let is_unknown_cycle = cycle == cycles;
+            if is_unknown_cycle {
+                std::fs::write(&unknown_marker, b"unknown\n").unwrap();
+            }
+            let stats_before = session.stats();
+            let tools = backend.list_tools().unwrap();
+            assert_eq!(tools.len(), 1, "cycle={cycle}");
+            assert_eq!(
+                session.stats().cold_connects,
+                stats_before.cold_connects + 1
+            );
+            assert_eq!(session.stats().active_leases, 1, "cycle={cycle}");
+            let pid = std::fs::read_to_string(&pid_file)
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap();
+            assert!(process_exists(pid), "cycle={cycle}, pid={pid}");
+
+            if is_unknown_cycle {
+                let error = backend
+                    .call_tool("echo", serde_json::json!({"cycle": cycle}))
+                    .unwrap_err();
+                assert!(
+                    error.downcast_ref::<McpDeliveryUnknown>().is_some(),
+                    "cycle={cycle}: {error:#}"
+                );
+                assert_eq!(
+                    session.stats().cold_connects,
+                    stats_before.cold_connects + 1,
+                    "unknown delivery was automatically retried"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&unknown_calls).unwrap(),
+                    "unknown\n",
+                    "unknown delivery reached the backend more than once"
+                );
+                assert_eq!(session.stats().delivery_unknown, 1);
+                assert_eq!(session.stats().active_leases, 0);
+                assert!(session.next_expiry().is_none());
+            } else {
+                let result = backend
+                    .call_tool("echo", serde_json::json!({"cycle": cycle}))
+                    .unwrap();
+                assert_eq!(
+                    result.pointer("/content/0/text").and_then(Value::as_str),
+                    Some("warm")
+                );
+                assert_eq!(session.stats().warm_reuses, cycle as u64);
+                std::thread::sleep(idle_ttl + Duration::from_millis(10));
+                assert_eq!(session.reap_expired(), 1, "cycle={cycle}");
+                assert_eq!(session.stats().active_leases, 0, "cycle={cycle}");
+                assert!(session.next_expiry().is_none(), "cycle={cycle}");
+            }
+
+            assert!(!process_exists(pid), "cycle={cycle}, pid={pid}");
+            assert_transport_returns_to(baseline, cycle + 1);
+        }
+
+        let stats = session.stats();
+        assert_eq!(stats.cold_connects, cycles as u64);
+        assert_eq!(stats.warm_reuses, cycles as u64);
+        assert_eq!(stats.idle_evictions, (cycles - 1) as u64);
+        assert_eq!(stats.delivery_unknown, 1);
+        assert_eq!(stats.active_leases, 0);
+        assert_eq!(stats.peak_leases, 1);
+        assert_eq!(active_transport_snapshot(), baseline);
+        eprintln!(
+            "OD01 stdio session soak: checkpoints={checkpoints} cycles={cycles} elapsed={:?} cold={} warm={} idle_evictions={} unknown={} active_leases={} transport={:?}",
+            started.elapsed(),
+            stats.cold_connects,
+            stats.warm_reuses,
+            stats.idle_evictions,
+            stats.delivery_unknown,
+            stats.active_leases,
+            active_transport_snapshot()
+        );
+
+        drop(backend);
+        drop(session);
+        drop(db);
+        std::fs::remove_dir_all(db_dir).unwrap();
+        std::fs::remove_dir_all(fixture_dir).unwrap();
     }
 
     #[cfg(unix)]

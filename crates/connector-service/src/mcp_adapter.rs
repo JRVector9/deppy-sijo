@@ -739,6 +739,7 @@ fn cancelled_error() -> ServiceError {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use connector_contract::{CredentialId, SensitiveInput};
@@ -870,6 +871,72 @@ mod tests {
 
     fn manager(redaction: secret::RedactionService) -> mcp::LocalMcpManager {
         mcp::LocalMcpManager::new(redaction).with_request_timeout(Duration::from_secs(3))
+    }
+
+    const STDIO_SOAK_CHECKPOINT_CAP: usize = 901;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct StdioQuiescentCheckpoint {
+        available_leases: usize,
+        pinned_leases: usize,
+        active_leases: usize,
+        transport_threads: usize,
+        stdout_threads: usize,
+        stderr_threads: usize,
+        writer_threads: usize,
+        redaction_leases: usize,
+        live_fixture_processes: usize,
+    }
+
+    fn process_is_alive(pid: u32) -> bool {
+        Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn fixture_process_ids(output: &DiscoverOutput) -> (u32, u32) {
+        let marker = output.tools[0]
+            .name
+            .strip_prefix("pid-")
+            .expect("fixture process marker");
+        let mut fields = marker.split('-');
+        let shell = fields
+            .next()
+            .expect("fixture shell pid")
+            .parse::<u32>()
+            .expect("numeric fixture shell pid");
+        let sleeper = fields
+            .next()
+            .expect("fixture sleeper pid")
+            .parse::<u32>()
+            .expect("numeric fixture sleeper pid");
+        assert!(fields.next().is_none());
+        (shell, sleeper)
+    }
+
+    fn stdio_quiescent_checkpoint(
+        adapter: &ProductionConnectorMcp,
+        redaction: &secret::RedactionService,
+        process_ids: (u32, u32),
+    ) -> StdioQuiescentCheckpoint {
+        let state = adapter.state.lock().expect("connector MCP lease lock");
+        let transport = mcp::transport_metrics();
+        StdioQuiescentCheckpoint {
+            available_leases: state.available.len(),
+            pinned_leases: state.pinned.len(),
+            active_leases: state.active.len(),
+            transport_threads: transport.active_threads,
+            stdout_threads: transport.stdio_stdout_threads,
+            stderr_threads: transport.stdio_stderr_threads,
+            writer_threads: transport.stdio_writer_threads,
+            redaction_leases: redaction.corpus_stats().active_leases,
+            live_fixture_processes: usize::from(process_is_alive(process_ids.0))
+                + usize::from(process_is_alive(process_ids.1)),
+        }
     }
 
     #[test]
@@ -1077,5 +1144,76 @@ sleep 30
         adapter.cancel(&first);
         adapter.cancel(&second);
         assert_eq!(adapter.active_leases(), 0);
+    }
+
+    #[test]
+    #[ignore = "set DEPPY_CONNECTOR_STDIO_SOAK_CYCLES and run this exact test explicitly"]
+    fn env_local_stdio_reap_soak_returns_threads_processes_and_leases_to_baseline() {
+        let cycles = std::env::var("DEPPY_CONNECTOR_STDIO_SOAK_CYCLES")
+            .expect("DEPPY_CONNECTOR_STDIO_SOAK_CYCLES is required for the ignored soak")
+            .parse::<usize>()
+            .expect("DEPPY_CONNECTOR_STDIO_SOAK_CYCLES must be a positive integer");
+        assert!((1..=100_000).contains(&cycles));
+
+        let script = r#"
+session=$$
+sleep 30 &
+sleeper=$!
+read -r _init
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"fixture","version":"0"}}}'
+read -r _initialized
+read -r _list
+printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"pid-%s-%s","inputSchema":{}}]}}\n' "$session" "$sleeper"
+wait "$sleeper"
+"#;
+        let credential_id = CredentialId::new("unused-stdio-soak-credential");
+        let secrets = Arc::new(TestSecrets::new(&credential_id));
+        let adapter = ProductionConnectorMcp::new(
+            manager(secrets.redaction.clone()),
+            secrets.clone(),
+            Duration::from_nanos(1),
+            1,
+        )
+        .unwrap();
+        let baseline = mcp::transport_metrics();
+        let mut checkpoints = VecDeque::with_capacity(STDIO_SOAK_CHECKPOINT_CAP);
+
+        for cycle in 0..cycles {
+            let output = adapter
+                .discover(
+                    &OperationId::new(format!("stdio-soak-{cycle}")),
+                    stdio_target(script, None),
+                    CancellationToken::default(),
+                )
+                .unwrap();
+            let process_ids = fixture_process_ids(&output);
+            assert!(process_is_alive(process_ids.0));
+            assert!(process_is_alive(process_ids.1));
+            let active = mcp::transport_metrics();
+            assert!(active.active_threads >= baseline.active_threads + 2);
+            assert!(active.stdio_stdout_threads > baseline.stdio_stdout_threads);
+            assert!(active.stdio_stderr_threads > baseline.stdio_stderr_threads);
+            assert_eq!(adapter.active_leases(), 1);
+
+            adapter.reap_idle_leases();
+            let checkpoint = stdio_quiescent_checkpoint(&adapter, &secrets.redaction, process_ids);
+            assert_eq!(checkpoint.available_leases, 0);
+            assert_eq!(checkpoint.pinned_leases, 0);
+            assert_eq!(checkpoint.active_leases, 0);
+            assert_eq!(checkpoint.transport_threads, baseline.active_threads);
+            assert_eq!(checkpoint.stdout_threads, baseline.stdio_stdout_threads);
+            assert_eq!(checkpoint.stderr_threads, baseline.stdio_stderr_threads);
+            assert_eq!(checkpoint.writer_threads, baseline.stdio_writer_threads);
+            assert_eq!(checkpoint.redaction_leases, 0);
+            assert_eq!(checkpoint.live_fixture_processes, 0);
+
+            if checkpoints.len() == STDIO_SOAK_CHECKPOINT_CAP {
+                checkpoints.pop_front();
+            }
+            checkpoints.push_back(checkpoint);
+            assert!(checkpoints.len() <= STDIO_SOAK_CHECKPOINT_CAP);
+        }
+
+        assert_eq!(checkpoints.len(), cycles.min(STDIO_SOAK_CHECKPOINT_CAP));
     }
 }

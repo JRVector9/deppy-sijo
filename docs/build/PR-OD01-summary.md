@@ -1,5 +1,16 @@
 # PR-OD01 — Bounded Diagnostics and Soak Gates
 
+## Exact performance smoke selection
+
+`xtask perf-smoke` no longer relies on substring filters that can select zero tests and still
+return success. It runs nine exact tests and requires each command to report exactly one pass. The
+matrix covers app percentile/harness shape, runtime durable outbound overflow, viewport
+coalescing, receiver cap/filtering, and both hidden-session status/remote-view leases.
+
+`cargo run -q -p xtask -- perf-smoke` executed 9/9 exact tests successfully. These deterministic
+checks are smoke evidence, not a substitute for the release Scenario A-E hardware
+CPU/RSS/frame-p95 gate.
+
 ## Bounded secret-like scanner
 
 The `secret` crate now exports a std-only scanner for diagnostic and log artifacts. One scan
@@ -100,8 +111,34 @@ from HTTP and stdio traces. Root verification passes both exact tests, MCP all-t
 Clippy, package rustfmt, and scoped diff-check. The first root HTTP invocation used an unqualified
 name with `--exact` and selected zero tests; the fully qualified test was rerun and passed 1/1.
 
+## Count-bounded service and proxy soak gates
+
+Connector-service now has a deterministic 24-cycle discover/cancel regression plus explicit
+ignored env-count coordinator and local-stdio soaks. At every retained checkpoint it requires the
+command queue, MCP/OAuth jobs, host backlog, live repository, worker/job threads, leases,
+cancellation and operation registries to return to zero; generation is at most one and diagnostic
+transitions remain capped at 64. Checkpoint retention is latest-only with a hard cap of 901. The
+local-stdio soak also requires the shell and its sleeping grandchild to be reaped and internal
+stdout/stderr/writer/redaction counters to return to baseline.
+
+The normal connector-service suite passes 78 tests with two ignored env soaks. A 900-cycle
+coordinator run completed in 4.60 seconds with 901 checkpoints retained; a 902-cycle stdio run
+completed in 7.96 seconds with the same cap. The first attempted exact filter selected zero tests,
+an initial test helper used a nonexistent redaction accessor, and strict Clippy rejected a
+non-minimal comparison; all three were corrected and are not counted as passing evidence.
+
+MCP proxy now has a deterministic 32-cycle reuse/TTL/Unknown-delivery regression and an ignored
+env-count soak. It proves warm reuse, idle eviction, poison-only reconnect semantics, zero active
+lease/session/expiry state at boundaries, and no automatic retry after Unknown delivery. The
+session suite passes 19 tests with one ignored soak. The maximum 900-cycle run completed in 26.46
+seconds with 901 retained checkpoints, cold 900, warm 900, evictions 899, Unknown 1, and zero active
+lease/thread/permit/HTTP-reaper queue. An initial wrong binary target selected no tests and the
+first small-soak expectation used incorrect warm-count semantics; both were corrected before the
+accepted runs.
+
 ## Remaining OD01 scope
 
-The env-only RSS/thread/socket/queue slope soak harness remains for the final OD01 cutover. The
-completed slices add no production timer, polling loop, network, process, or retained source/sample
-backlog.
+The count-bounded soaks do not sample process RSS or OS socket inventories. A 30-minute wall-clock
+RSS/thread/socket/queue slope run and release Scenario A-E hardware CPU/RSS/frame-p95 comparison
+remain final production gates. The completed slices add no production timer, polling loop,
+network, process, or retained source/sample backlog.

@@ -6,7 +6,6 @@ pub mod agents;
 pub mod approvals;
 pub mod clipboard_image;
 pub mod composer;
-pub mod connectors;
 pub mod credentials;
 pub mod diff_panel;
 pub mod env_profiles;

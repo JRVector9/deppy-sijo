@@ -10,7 +10,9 @@ use mux::{FocusManager, MuxPane, MuxSnapshot, MuxTab, MuxWindow, PaneSnapshot, T
 use std::path::PathBuf;
 
 use pty::CommandSpec;
-use secret::{RedactionService, SecretStore, StreamRedactor};
+#[cfg(test)]
+use secret::SecretStore;
+use secret::{RedactionLease, RedactionService, StreamRedactor};
 use session::{Session, StatusDetector, StatusPatterns};
 use storage::SessionLogWriter;
 use terminal::{TERMINAL_GLOBAL_CACHE_BUDGET_BYTES, TerminalCacheClass, TerminalCacheEvent};
@@ -102,8 +104,10 @@ pub struct InProcessRuntimeClient {
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
+#[cfg(test)]
 struct SecretStoreResolver(Arc<dyn SecretStore>);
 
+#[cfg(test)]
 impl RuntimeSecretResolver for SecretStoreResolver {
     fn resolve(&self, logical_credential_id: &str) -> anyhow::Result<RuntimeSecret> {
         self.0
@@ -119,6 +123,7 @@ impl InProcessRuntimeClient {
     /// `secret_store`: SpawnAgent의 secret env를 spawn 직전에 resolve할 때만 사용 (6.3).
     /// `logs_root`: 세션별 redacted 로그 디렉터리 (7장). `redaction`: 공유 레지스트리 —
     /// UI(credential 저장)와 worker(spawn 주입)가 같은 인스턴스에 등록한다.
+    #[cfg(test)]
     pub fn new(
         output_batch_ms: u64,
         secret_store: Arc<dyn SecretStore>,
@@ -145,6 +150,7 @@ impl InProcessRuntimeClient {
     }
 
     /// 테스트용: 셸 대신 임의 명령을 spawn한다.
+    #[cfg(test)]
     pub fn with_shell(
         output_batch_ms: u64,
         secret_store: Arc<dyn SecretStore>,
@@ -241,6 +247,8 @@ impl InProcessRuntimeClient {
                         .unwrap_or_default(),
                     next_id: 1,
                     sessions: std::collections::HashMap::new(),
+                    session_redaction_leases: std::collections::HashMap::new(),
+                    seed_redaction_lease: None,
                     logs: std::collections::HashMap::new(),
                     detectors: std::collections::HashMap::new(),
                     status_overrides: std::collections::HashMap::new(),
@@ -502,6 +510,7 @@ const FINAL_DRAIN_MAX_BYTES: usize = 2 * 1024 * 1024;
 const FINAL_DRAIN_MAX_PUMPS: usize = 32;
 const SHELL_TITLE_ID: &str = "workspace.spawn.shell";
 const AGENT_TITLE_ID: &str = "workspace.spawn.agent";
+type PreparedSecretEnv = (Vec<(String, String)>, Vec<RedactionLease>);
 
 struct Worker {
     command_rx: Receiver<RuntimeCommand>,
@@ -517,6 +526,13 @@ struct Worker {
     next_id: u64,
     /// 다중 세션 (PR-08 Session Runtime). 세션 로직은 session crate 소관.
     sessions: std::collections::HashMap<SessionId, Session>,
+    /// Checked redaction leases are retained for exactly as long as their live/readable session.
+    /// A session may need more than one lease when restored dotenv values supplement the resolved
+    /// default credential set. Removal/archive drops the complete set and starts grace expiry.
+    session_redaction_leases: std::collections::HashMap<SessionId, Vec<RedactionLease>>,
+    /// Wire compatibility for `SeedRedaction`: one latest-only checked lease replaces the legacy
+    /// permanent corpus registration. Production composition no longer sends this command.
+    seed_redaction_lease: Option<RedactionLease>,
     /// spawn 직전 secret resolve 전용 (6.3). worker 단일 스레드 접근 (1.4).
     secret_resolver: Arc<dyn RuntimeSecretResolver>,
     /// 세션별 redacted 로그 (7장). raw 평문 로그는 만들지 않는다.
@@ -739,6 +755,92 @@ impl MuxState {
 }
 
 impl Worker {
+    /// Resolve one launch's complete logical-id set before any plaintext is moved into a process
+    /// environment. Redaction registration is one checked atomic lease: a missing secret, unsafe
+    /// legacy corpus, short value, or capacity failure leaves no partial lease and must block the
+    /// launch.
+    fn resolve_secret_set(
+        &self,
+        logical_ids: Vec<String>,
+    ) -> anyhow::Result<(Vec<RuntimeSecret>, Option<RedactionLease>)> {
+        let mut resolved = Vec::with_capacity(logical_ids.len());
+        for logical_id in logical_ids {
+            resolved.push(self.secret_resolver.resolve(&logical_id)?);
+        }
+        if resolved.is_empty() {
+            return Ok((resolved, None));
+        }
+        self.redaction.ensure_safe()?;
+        let secret_refs = resolved
+            .iter()
+            .map(RuntimeSecret::as_secret_string)
+            .collect::<Vec<_>>();
+        let lease = self.redaction.acquire_execution_lease(&secret_refs)?;
+        Ok((resolved, Some(lease)))
+    }
+
+    fn resolve_secret_env(
+        &self,
+        entries: Vec<(String, String)>,
+    ) -> anyhow::Result<PreparedSecretEnv> {
+        let mut keys = Vec::with_capacity(entries.len());
+        let mut logical_ids = Vec::with_capacity(entries.len());
+        for (key, logical_id) in entries {
+            keys.push(key);
+            logical_ids.push(logical_id);
+        }
+        let (resolved, lease) = self.resolve_secret_set(logical_ids)?;
+        let env = keys
+            .into_iter()
+            .zip(resolved)
+            .map(|(key, value)| (key, value.into_string()))
+            .collect();
+        Ok((env, lease.into_iter().collect()))
+    }
+
+    /// Restored dotenv values are already plaintext, but secret-like keys still participate in a
+    /// checked lease before spawn. The temporary wrappers zeroize their duplicate buffers after
+    /// the corpus has accepted the complete set.
+    fn acquire_dotenv_redaction_lease(
+        &self,
+        dotenv: &[(String, String)],
+    ) -> anyhow::Result<Option<RedactionLease>> {
+        let secrets = dotenv
+            .iter()
+            .filter(|(key, _)| crate::dotenv::is_secret_key(key))
+            .map(|(_, value)| {
+                RuntimeSecret::from_secret_string(secret::SecretString::new(value.clone()))
+            })
+            .collect::<Vec<_>>();
+        if secrets.is_empty() {
+            return Ok(None);
+        }
+        self.redaction.ensure_safe()?;
+        let refs = secrets
+            .iter()
+            .map(RuntimeSecret::as_secret_string)
+            .collect::<Vec<_>>();
+        self.redaction
+            .acquire_execution_lease(&refs)
+            .map(Some)
+            .map_err(Into::into)
+    }
+
+    fn retain_session_redaction_leases(&mut self, session: SessionId, leases: Vec<RedactionLease>) {
+        if !leases.is_empty() {
+            let replaced = self.session_redaction_leases.insert(session, leases);
+            debug_assert!(
+                replaced.is_none(),
+                "session ids are monotonic within one worker"
+            );
+        }
+    }
+
+    fn remove_session(&mut self, session: SessionId) -> Option<Session> {
+        self.session_redaction_leases.remove(&session);
+        self.sessions.remove(&session)
+    }
+
     fn spawn_session(
         id: SessionId,
         kind: session::SessionKind,
@@ -1047,16 +1149,27 @@ impl Worker {
                 }
                 let id = SessionId(self.next_id);
                 self.next_id += 1;
+                let (spec, leases) = match self.shell_with_session(id) {
+                    Ok(prepared) => prepared,
+                    Err(_) => {
+                        self.emit(RuntimeEvent::SpawnFailed {
+                            kind: SpawnKind::Shell,
+                            message: MessagePayload::new("runtime.spawn_failed.shell_secret"),
+                        });
+                        return;
+                    }
+                };
                 match Self::spawn_session(
                     id,
                     session::SessionKind::Shell,
-                    &self.shell_with_session(id), // 테스트 주입 가능해야 하므로 default_shell 헬퍼 대신 spec 직접
+                    &spec, // 테스트 주입 가능해야 하므로 default_shell 헬퍼 대신 spec 직접
                     cols,
                     rows,
                     scrollback_lines,
                 ) {
                     Ok(new_session) => {
                         self.sessions.insert(id, new_session);
+                        self.retain_session_redaction_leases(id, leases);
                         // 셸도 status detector 설치 — regex 패턴은 없지만 idle heuristic
                         // (3단)이 Running/Idle을 감지해 레일에 상태가 반영된다(#2). agent와
                         // 달리 셸엔 감지 regex가 없어 그동안 상태가 아예 안 났다.
@@ -1133,34 +1246,22 @@ impl Worker {
                     self.emit_agent_spawn_resolved(correlation_id, None);
                     return;
                 }
-                // secret은 여기(spawn 직전)에서만 resolve된다 — PR-09 완료 기준.
-                // 실패 시 아무것도 spawn하지 않는다 (부분 주입 금지).
                 let mut env = env_plain;
-                let mut resolve_failed = false;
-                for (key, credential_id) in env_secrets {
-                    match self.secret_resolver.resolve(&credential_id) {
-                        Ok(value) => {
-                            // 주입되는 secret은 로그 redaction 대상으로 등록 (6.3/7장)
-                            self.redaction.register(value.as_secret_string());
-                            env.push((key, value.into_string()));
-                        }
-                        Err(_) => {
-                            // App adapters may include physical keyring coordinates in
-                            // their error chain. Never cross that detail into runtime
-                            // events, diagnostics, or logs.
-                            resolve_failed = true;
-                            break;
-                        }
+                // Resolve the complete set and acquire one checked redaction lease before any
+                // plaintext reaches the process environment. Adapter/keyring coordinates never
+                // cross into events or diagnostics on failure.
+                let (secret_env, redaction_leases) = match self.resolve_secret_env(env_secrets) {
+                    Ok(prepared) => prepared,
+                    Err(_) => {
+                        self.emit(RuntimeEvent::SpawnFailed {
+                            kind: SpawnKind::Agent,
+                            message: MessagePayload::new("runtime.spawn_failed.agent_secret"),
+                        });
+                        self.emit_agent_spawn_resolved(correlation_id, None);
+                        return;
                     }
-                }
-                if resolve_failed {
-                    self.emit(RuntimeEvent::SpawnFailed {
-                        kind: SpawnKind::Agent,
-                        message: MessagePayload::new("runtime.spawn_failed.agent_secret"),
-                    });
-                    self.emit_agent_spawn_resolved(correlation_id, None);
-                    return;
-                }
+                };
+                env.extend(secret_env);
                 let id = SessionId(self.next_id);
                 self.next_id += 1;
                 // 앱이 직접 띄운 에이전트에도 needsInput hook 키를 주입한다(셸과 동일 —
@@ -1183,6 +1284,7 @@ impl Worker {
                 ) {
                     Ok(new_session) => {
                         self.sessions.insert(id, new_session);
+                        self.retain_session_redaction_leases(id, redaction_leases);
                         let patterns = StatusPatterns::compile(
                             waiting_regex.as_deref(),
                             approval_regex.as_deref(),
@@ -1387,32 +1489,19 @@ impl Worker {
                 }
             }
             RuntimeCommand::SeedRedaction { credential_ids } => {
-                // 기존 저장 credential을 로그 redaction 대상으로 등록 (7장).
-                // resolve는 worker 단일 스레드에서만 (1.4) — UI는 id만 넘긴다 (2.1).
-                let mut resolve_failures = 0usize;
-                for id in credential_ids {
-                    match self.secret_resolver.resolve(&id) {
-                        Ok(value) => {
-                            self.redaction.register(value.as_secret_string());
-                            // OAuth 토큰처럼 JSON blob으로 저장된 credential은
-                            // 개별 필드(access/refresh token)도 등록 (PR-18)
-                            self.redaction
-                                .register_json_fields(value.as_secret_string());
-                        }
-                        Err(_) => resolve_failures = resolve_failures.saturating_add(1),
+                // Wire compatibility only. Replace one latest-only checked lease instead of
+                // permanently growing the corpus; production composition no longer sends seeds.
+                match self.resolve_secret_set(credential_ids) {
+                    Ok((_resolved, lease)) => self.seed_redaction_lease = lease,
+                    Err(_) => {
+                        tracing::warn!("redaction seed rejected");
                     }
-                }
-                if resolve_failures > 0 {
-                    tracing::warn!(
-                        failures = resolve_failures,
-                        "redaction seed secret resolution failed"
-                    );
                 }
             }
             RuntimeCommand::KillSession { session } => {
                 self.final_drain(session);
                 // Session drop → PtySession Drop이 process group 정리를 보장한다
-                self.sessions.remove(&session);
+                self.remove_session(session);
                 self.exited_order.retain(|s| *s != session);
                 self.hidden_scrollback.remove(&session);
                 self.remote_viewing.remove(&session);
@@ -1691,30 +1780,19 @@ impl Worker {
             })
     }
 
-    fn shell_with_session(&self, id: SessionId) -> CommandSpec {
+    fn shell_with_session(
+        &self,
+        id: SessionId,
+    ) -> anyhow::Result<(CommandSpec, Vec<RedactionLease>)> {
         let mut spec = self.shell.clone();
         spec.env
             .push(("DEPPY_SESSION_ID".to_owned(), self.session_key(id)));
-        // 워크스페이스 기본 env(.env 자동 주입). secret은 여기(spawn 직전)에서만 resolve.
-        // 셸은 에이전트와 달리 spawn 실패보다 부분 주입이 낫다 — 실패 키는 건너뛰고 경고.
+        // 워크스페이스 기본 env(.env 자동 주입). The complete secret set is resolved and
+        // protected before spawn; partial injection would silently change command semantics.
         spec.env.extend(self.default_env_plain.iter().cloned());
-        let mut resolve_failures = 0usize;
-        for (key, credential_id) in &self.default_env_secrets {
-            match self.secret_resolver.resolve(credential_id) {
-                Ok(value) => {
-                    self.redaction.register(value.as_secret_string());
-                    spec.env.push((key.clone(), value.into_string()));
-                }
-                Err(_) => resolve_failures = resolve_failures.saturating_add(1),
-            }
-        }
-        if resolve_failures > 0 {
-            tracing::warn!(
-                failures = resolve_failures,
-                "default env secret resolution failed; entries skipped"
-            );
-        }
-        spec
+        let (secret_env, leases) = self.resolve_secret_env(self.default_env_secrets.clone())?;
+        spec.env.extend(secret_env);
+        Ok((spec, leases))
     }
 
     fn attach_in_new_tab(&mut self, session: SessionId, title_prefix: &str) {
@@ -1812,6 +1890,15 @@ impl Worker {
         self.mux.tabs.insert(restored.id.clone(), restored);
     }
 
+    /// Bounded dotenv projection for restored panes. Any missing/invalid/over-limit input is an
+    /// empty fail-closed projection; restoration never applies a partial first-file result.
+    fn restored_dotenv(dir: &std::path::Path) -> Vec<(String, String)> {
+        match crate::dotenv::read_dotenv_merged_bounded(dir) {
+            Ok(Some(dotenv)) => dotenv,
+            Ok(None) | Err(_) => Vec::new(),
+        }
+    }
+
     /// 저장된 pane 하나에 fresh 셸을 spawn해 attach한다. spawn 실패 시에도 pane
     /// 자체는 만든다(session_id 없이) — 기존 "세션을 잃은 pane" 모델과 동일하게
     /// layout/tab 구조는 살아있게 한다.
@@ -1834,7 +1921,14 @@ impl Worker {
         // A안(2026-07-08): pane별 마지막 작업 폴더로 복원 — 저장 cwd가 유효 디렉터리면
         // 그 폴더에서 셸을 띄우고, 그 폴더의 .env도 이 pane에만 주입한다(pane별 프로젝트).
         // 무효/미기록이면 워크스페이스 cwd(기존 동작)로 폴백.
-        let mut spec = self.shell_with_session(id);
+        let (mut spec, mut redaction_leases) = match self.shell_with_session(id) {
+            Ok(prepared) => prepared,
+            Err(_) => {
+                tracing::warn!(pane_id = %pane_state.id.0, "복원 중 셸 secret 준비 실패");
+                self.mux.panes.insert(pane_state.id.clone(), pane);
+                return;
+            }
+        };
         let restored_cwd = pane_state
             .cwd
             .as_deref()
@@ -1842,19 +1936,18 @@ impl Worker {
             .filter(|p| p.is_dir());
         if let Some(dir) = &restored_cwd {
             spec.cwd = Some(dir.clone());
-            let dotenv = dir.join(".env");
-            if let Ok(content) = std::fs::read_to_string(&dotenv) {
-                for (key, value) in crate::dotenv::parse_dotenv(&content) {
-                    // 워크스페이스 기본 env보다 뒤에 붙어 pane 폴더 값이 이긴다
-                    // (PTY env 적용은 순차라 마지막 값 승리). secret 값은 로그에
-                    // 새지 않게 redaction에 등록.
-                    if crate::dotenv::is_secret_key(&key) {
-                        self.redaction
-                            .register(&secret::SecretString::new(value.clone()));
-                    }
-                    spec.env.push((key, value));
+            let dotenv = Self::restored_dotenv(dir);
+            match self.acquire_dotenv_redaction_lease(&dotenv) {
+                Ok(Some(lease)) => redaction_leases.push(lease),
+                Ok(None) => {}
+                Err(_) => {
+                    tracing::warn!(pane_id = %pane_state.id.0, "복원 중 dotenv redaction 준비 실패");
+                    self.mux.panes.insert(pane_state.id.clone(), pane);
+                    return;
                 }
             }
+            // 워크스페이스 기본 env보다 뒤에 붙어 pane 폴더 값이 이긴다.
+            spec.env.extend(dotenv);
         }
         let spawn_cwd = Self::spawn_cwd_string(&spec.cwd);
         let (restore_cols, restore_rows) = pane_state
@@ -1875,6 +1968,7 @@ impl Worker {
                     Self::replay_saved_ansi(&self.logs_root, persistent_id, &mut new_session);
                 }
                 self.sessions.insert(id, new_session);
+                self.retain_session_redaction_leases(id, redaction_leases);
                 // 복원된 셸도 status detector 설치 — 없으면 상태 감지가 아예 안 됐다
                 // (셸 135가 복원 셸이라 built-in 프롬프트 감지도 무동작, #92/#93).
                 self.detectors.insert(
@@ -2000,16 +2094,27 @@ impl Worker {
         };
         let id = SessionId(self.next_id);
         self.next_id += 1;
+        let (spec, redaction_leases) = match self.shell_with_session(id) {
+            Ok(prepared) => prepared,
+            Err(_) => {
+                self.emit(RuntimeEvent::SpawnFailed {
+                    kind: SpawnKind::Shell,
+                    message: MessagePayload::new("runtime.spawn_failed.shell_secret"),
+                });
+                return;
+            }
+        };
         match Self::spawn_session(
             id,
             session::SessionKind::Shell,
-            &self.shell_with_session(id),
+            &spec,
             80,
             24,
             scrollback_lines,
         ) {
             Ok(new_session) => {
                 self.sessions.insert(id, new_session);
+                self.retain_session_redaction_leases(id, redaction_leases);
                 // 분할로 만든 셸도 status detector 설치 (감지 누락 방지, #92/#93).
                 self.detectors.insert(
                     id,
@@ -2044,7 +2149,7 @@ impl Worker {
                 if !split_ok {
                     // 방어: split 실패 시 고아 pane/세션을 남기지 않는다
                     self.mux.panes.remove(&pane_id);
-                    self.sessions.remove(&id);
+                    self.remove_session(id);
                     self.status_overrides.remove(&id);
                     self.close_session_log(id, "killed", None);
                     self.emit(RuntimeEvent::SpawnFailed {
@@ -2079,7 +2184,7 @@ impl Worker {
             .and_then(|pane| pane.session_id)
         {
             self.final_drain(session);
-            self.sessions.remove(&session);
+            self.remove_session(session);
             self.exited_order.retain(|s| *s != session);
             self.hidden_scrollback.remove(&session);
             self.remote_viewing.remove(&session);
@@ -2112,7 +2217,7 @@ impl Worker {
                 && let Some(session) = pane.session_id
             {
                 self.final_drain(session);
-                self.sessions.remove(&session);
+                self.remove_session(session);
                 self.exited_order.retain(|s| *s != session);
                 self.hidden_scrollback.remove(&session);
                 self.remote_viewing.remove(&session);
@@ -2557,7 +2662,7 @@ impl Worker {
                 self.archived.insert(session, entry);
                 self.trim_archived_budget();
             }
-            self.sessions.remove(&session);
+            self.remove_session(session);
             self.exited_order.retain(|s| *s != session);
             self.hidden_scrollback.remove(&session);
             if !restorable {
@@ -2946,6 +3051,26 @@ mod tests {
         }
     }
 
+    struct CompleteSetResolver {
+        calls: Mutex<Vec<String>>,
+        unsafe_id: Option<&'static str>,
+    }
+
+    impl RuntimeSecretResolver for CompleteSetResolver {
+        fn resolve(&self, logical_credential_id: &str) -> anyhow::Result<RuntimeSecret> {
+            self.calls
+                .lock()
+                .expect("resolver calls lock")
+                .push(logical_credential_id.to_owned());
+            let value = if self.unsafe_id == Some(logical_credential_id) {
+                "x"
+            } else {
+                "runtime-secret-value"
+            };
+            Ok(RuntimeSecret::new(value.to_owned()))
+        }
+    }
+
     #[test]
     fn runtime_cache_share_accepts_values_below_global_32mib_minimum() {
         assert_eq!(clamp_runtime_cache_budget_bytes(0), 1024 * 1024);
@@ -2957,6 +3082,46 @@ mod tests {
             clamp_runtime_cache_budget_bytes(usize::MAX),
             2048 * 1024 * 1024
         );
+    }
+
+    #[test]
+    fn pane_restore_dotenv_accepts_exact_limits_and_rejects_over_limit_without_partial_env() {
+        fn padded(entry: &str, target_bytes: usize) -> String {
+            assert!(entry.len() <= target_bytes);
+            let mut content = entry.to_owned();
+            content.push_str(&"#".repeat(target_bytes - entry.len()));
+            content
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-pane-dotenv-limits-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let half = crate::dotenv::DOTENV_TOTAL_BYTES_MAX / 2;
+        std::fs::write(dir.join(".env"), padded("PORT=3000\n", half)).unwrap();
+        std::fs::write(dir.join(".env.local"), padded("PORT=4000\n", half)).unwrap();
+        assert_eq!(
+            Worker::restored_dotenv(&dir),
+            vec![("PORT".to_owned(), "4000".to_owned())]
+        );
+
+        std::fs::write(dir.join(".env.local"), padded("PORT=4000\n", half + 1)).unwrap();
+        assert!(Worker::restored_dotenv(&dir).is_empty());
+
+        std::fs::write(
+            dir.join(".env"),
+            "A=1\n".repeat(crate::dotenv::DOTENV_ENTRIES_MAX / 2),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(".env.local"),
+            "A=2\n".repeat(crate::dotenv::DOTENV_ENTRIES_MAX / 2 + 1),
+        )
+        .unwrap();
+        assert!(Worker::restored_dotenv(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn test_store() -> Arc<dyn SecretStore> {
@@ -3933,6 +4098,130 @@ mod tests {
             }
             _ => None,
         });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn factory_resolves_complete_secret_set_before_spawn_and_fails_closed_on_redaction_rejection() {
+        let resolver = Arc::new(CompleteSetResolver {
+            calls: Mutex::new(Vec::new()),
+            unsafe_id: Some("logical-too-short"),
+        });
+        let redaction = RedactionService::new();
+        let factory = crate::InProcessRuntimeHostFactory::new(resolver.clone(), redaction.clone());
+        let mut host = crate::RuntimeHostFactory::create(
+            &factory,
+            crate::RuntimeHostConfig {
+                output_batch_ms: 5,
+                logs_root: test_logs_root("factory-secret-set-fail-closed"),
+                persist: None,
+                cwd: None,
+                extra_env: Vec::new(),
+            },
+        )
+        .unwrap();
+        let mut probe = Probe::new(host.subscribe_with_wake(Arc::new(|| {})));
+
+        host.submit(RuntimeCommand::SpawnAgent {
+            agent_config_id: None,
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 100,
+            command: "/bin/sh".to_owned(),
+            args: vec!["-c".to_owned(), "sleep 30".to_owned()],
+            env_plain: Vec::new(),
+            env_secrets: vec![
+                ("SAFE".to_owned(), "logical-safe".to_owned()),
+                ("UNSAFE".to_owned(), "logical-too-short".to_owned()),
+            ],
+            waiting_regex: None,
+            approval_regex: None,
+            error_regex: None,
+            done_regex: None,
+        })
+        .unwrap();
+
+        let message = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::SpawnFailed {
+                kind: SpawnKind::Agent,
+                message,
+            } => Some(message.clone()),
+            _ => None,
+        });
+        assert_eq!(message.message_id, "runtime.spawn_failed.agent_secret");
+        assert!(message.args.is_empty());
+        assert!(message.diagnostic.is_none());
+        assert_eq!(
+            *resolver.calls.lock().expect("resolver calls lock"),
+            vec!["logical-safe", "logical-too-short"]
+        );
+        assert_eq!(redaction.corpus_stats().active_leases, 0);
+        assert!(
+            !probe
+                .seen
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::AgentSpawned { .. }))
+        );
+        host.shutdown();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn factory_retains_checked_redaction_lease_for_session_lifetime() {
+        let resolver = Arc::new(CompleteSetResolver {
+            calls: Mutex::new(Vec::new()),
+            unsafe_id: None,
+        });
+        let redaction = RedactionService::new();
+        let factory = crate::InProcessRuntimeHostFactory::new(resolver, redaction.clone());
+        let mut host = crate::RuntimeHostFactory::create(
+            &factory,
+            crate::RuntimeHostConfig {
+                output_batch_ms: 5,
+                logs_root: test_logs_root("factory-secret-session-lease"),
+                persist: None,
+                cwd: None,
+                extra_env: Vec::new(),
+            },
+        )
+        .unwrap();
+        let mut probe = Probe::new(host.subscribe_with_wake(Arc::new(|| {})));
+
+        host.submit(RuntimeCommand::SpawnAgent {
+            agent_config_id: None,
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 100,
+            command: "/bin/sh".to_owned(),
+            args: vec!["-c".to_owned(), "sleep 30".to_owned()],
+            env_plain: Vec::new(),
+            env_secrets: vec![
+                ("ONE".to_owned(), "logical-one".to_owned()),
+                ("TWO".to_owned(), "logical-two".to_owned()),
+            ],
+            waiting_regex: None,
+            approval_regex: None,
+            error_regex: None,
+            done_regex: None,
+        })
+        .unwrap();
+        let session = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::AgentSpawned { session } => Some(*session),
+            _ => None,
+        });
+        assert_eq!(redaction.corpus_stats().active_leases, 1);
+
+        host.submit(RuntimeCommand::KillSession { session })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while redaction.corpus_stats().active_leases != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "session redaction lease was not released"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        host.shutdown();
     }
 
     #[test]

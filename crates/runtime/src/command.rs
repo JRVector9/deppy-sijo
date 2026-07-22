@@ -1,25 +1,627 @@
 pub use deppy_core::{MuxPaneId, MuxTabId, SessionId};
 pub use mux::SplitDirection;
 
+pub(crate) const RUNTIME_SESSION_CAP: usize = 256;
+pub(crate) const RUNTIME_COMMAND_QUEUE_BYTES_MAX: usize = 8 * 1024 * 1024;
+const TERMINAL_DIMENSION_MAX: u16 = 500;
+const TERMINAL_CELL_COUNT_MAX: u32 = 65_536;
+const SCROLLBACK_LINES_MAX: usize = 100_000;
+const COMMAND_BYTES_MAX: usize = 32 * 1024;
+const ARG_ITEMS_MAX: usize = 256;
+const ARG_BYTES_MAX: usize = 32 * 1024;
+const ARG_AGGREGATE_BYTES_MAX: usize = 1024 * 1024;
+const ENV_ITEMS_MAX: usize = 256;
+const ENV_KEY_BYTES_MAX: usize = 1024;
+const ENV_VALUE_BYTES_MAX: usize = 32 * 1024;
+const ENV_AGGREGATE_BYTES_MAX: usize = 1024 * 1024;
+const REGEX_BYTES_MAX: usize = 64 * 1024;
+const REGEX_AGGREGATE_BYTES_MAX: usize = 256 * 1024;
+const PATH_BYTES_MAX: usize = 4 * 1024;
+const PANE_TITLE_BYTES_MAX: usize = 4 * 1024;
+const MUX_ID_BYTES_MAX: usize = 1024;
+const SPLIT_PATH_ITEMS_MAX: usize = 64;
+const SEARCH_QUERY_BYTES_MAX: usize = 64 * 1024;
+const SEED_CREDENTIAL_ITEMS_MAX: usize = 256;
+const SEED_CREDENTIAL_ID_BYTES_MAX: usize = 1024;
+const WRITE_INPUT_BYTES_MAX: usize = 4 * 1024 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RuntimeAdmissionError(&'static str);
+
+impl std::fmt::Debug for RuntimeAdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("RuntimeAdmissionError")
+            .field(&self.0)
+            .finish()
+    }
+}
+
+impl std::fmt::Display for RuntimeAdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for RuntimeAdmissionError {}
+
+fn admission_error(code: &'static str) -> RuntimeAdmissionError {
+    RuntimeAdmissionError(code)
+}
+
 /// Opaque launch correlation ids are bounded before entering the final host
 /// queue. Current UUID producers fit comfortably while future adapters retain
 /// room for namespaced ids without making durable event queues attacker-sized.
 pub const AGENT_CONFIG_ID_MAX_BYTES: usize = 128;
 
 pub(crate) fn agent_config_id_is_valid(id: &str) -> bool {
-    !id.is_empty() && id.len() <= AGENT_CONFIG_ID_MAX_BYTES && !id.as_bytes().contains(&0)
+    bounded_identifier(id, AGENT_CONFIG_ID_MAX_BYTES)
 }
 
-pub(crate) fn validate_host_command(command: &RuntimeCommand) -> anyhow::Result<()> {
-    if let RuntimeCommand::SpawnAgent {
-        agent_config_id: Some(id),
-        ..
-    } = command
-        && !agent_config_id_is_valid(id)
-    {
-        anyhow::bail!(
-            "agent_config_id must be 1..={AGENT_CONFIG_ID_MAX_BYTES} bytes and contain no NUL"
-        );
+fn bounded_identifier(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+}
+
+fn bounded_nul_free(value: &str, max_bytes: usize, require_nonempty: bool) -> bool {
+    value.len() <= max_bytes
+        && (!require_nonempty || !value.is_empty())
+        && !value.as_bytes().contains(&0)
+}
+
+fn dimensions_are_valid(cols: u16, rows: u16) -> bool {
+    (1..=TERMINAL_DIMENSION_MAX).contains(&cols)
+        && (1..=TERMINAL_DIMENSION_MAX).contains(&rows)
+        && u32::from(cols)
+            .checked_mul(u32::from(rows))
+            .is_some_and(|cells| cells <= TERMINAL_CELL_COUNT_MAX)
+}
+
+fn validate_args(args: &[String]) -> Result<(), RuntimeAdmissionError> {
+    if args.len() > ARG_ITEMS_MAX {
+        return Err(admission_error("runtime_command_args_items_invalid"));
+    }
+    let mut retained_bytes = 0usize;
+    for arg in args {
+        if !bounded_nul_free(arg, ARG_BYTES_MAX, false) {
+            return Err(admission_error("runtime_command_arg_invalid"));
+        }
+        retained_bytes = retained_bytes
+            .checked_add(arg.len())
+            .ok_or_else(|| admission_error("runtime_command_args_bytes_invalid"))?;
+        if retained_bytes > ARG_AGGREGATE_BYTES_MAX {
+            return Err(admission_error("runtime_command_args_bytes_invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_env_key(key: &str) -> bool {
+    bounded_identifier(key, ENV_KEY_BYTES_MAX) && !key.as_bytes().contains(&b'=')
+}
+
+pub(crate) fn validate_runtime_identifier(
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), RuntimeAdmissionError> {
+    if !bounded_identifier(value, max_bytes) {
+        return Err(admission_error("runtime_identifier_invalid"));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_env_entries(
+    plain: &[(String, String)],
+    secrets: &[(String, String)],
+) -> Result<(), RuntimeAdmissionError> {
+    validate_env_entries_with_base(&[], plain, secrets)
+}
+
+pub(crate) fn validate_env_entries_with_base(
+    base_plain: &[(String, String)],
+    plain: &[(String, String)],
+    secrets: &[(String, String)],
+) -> Result<(), RuntimeAdmissionError> {
+    let item_count = base_plain
+        .len()
+        .checked_add(plain.len())
+        .and_then(|items| items.checked_add(secrets.len()))
+        .ok_or_else(|| admission_error("runtime_env_items_invalid"))?;
+    if item_count > ENV_ITEMS_MAX {
+        return Err(admission_error("runtime_env_items_invalid"));
+    }
+    let mut retained_bytes = 0usize;
+    for (key, value) in base_plain.iter().chain(plain) {
+        if !validate_env_key(key) || !bounded_nul_free(value, ENV_VALUE_BYTES_MAX, false) {
+            return Err(admission_error("runtime_env_plain_invalid"));
+        }
+        retained_bytes = retained_bytes
+            .checked_add(key.len())
+            .and_then(|bytes| bytes.checked_add(value.len()))
+            .ok_or_else(|| admission_error("runtime_env_bytes_invalid"))?;
+        if retained_bytes > ENV_AGGREGATE_BYTES_MAX {
+            return Err(admission_error("runtime_env_bytes_invalid"));
+        }
+    }
+    for (key, credential_id) in secrets {
+        if !validate_env_key(key)
+            || !bounded_identifier(credential_id, SEED_CREDENTIAL_ID_BYTES_MAX)
+        {
+            return Err(admission_error("runtime_env_secret_invalid"));
+        }
+        retained_bytes = retained_bytes
+            .checked_add(key.len())
+            .and_then(|bytes| bytes.checked_add(credential_id.len()))
+            .ok_or_else(|| admission_error("runtime_env_bytes_invalid"))?;
+        if retained_bytes > ENV_AGGREGATE_BYTES_MAX {
+            return Err(admission_error("runtime_env_bytes_invalid"));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_runtime_path(path: &std::path::Path) -> Result<(), RuntimeAdmissionError> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    if bytes.is_empty() || bytes.len() > PATH_BYTES_MAX || bytes.contains(&0) {
+        return Err(admission_error("runtime_path_invalid"));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_launch_spec(
+    program: &str,
+    args: &[String],
+    env: &[(String, String)],
+    cwd: Option<&std::path::Path>,
+) -> Result<(), RuntimeAdmissionError> {
+    if !bounded_nul_free(program, COMMAND_BYTES_MAX, true) {
+        return Err(admission_error("runtime_command_program_invalid"));
+    }
+    validate_args(args)?;
+    validate_env_entries(env, &[])?;
+    if let Some(cwd) = cwd {
+        validate_runtime_path(cwd)?;
+    }
+    Ok(())
+}
+
+/// Launch specs reserve exactly one runtime-owned environment slot outside the external 256-item
+/// admission budget. This keeps an exact-limit caller valid after `DEPPY_SESSION_ID` injection,
+/// while still bounding and validating the internal key/value before process creation.
+pub(crate) fn validate_launch_spec_with_internal_env(
+    program: &str,
+    args: &[String],
+    env: &[(String, String)],
+    cwd: Option<&std::path::Path>,
+    internal_key: &str,
+) -> Result<(), RuntimeAdmissionError> {
+    if !bounded_nul_free(program, COMMAND_BYTES_MAX, true) {
+        return Err(admission_error("runtime_command_program_invalid"));
+    }
+    validate_args(args)?;
+
+    let mut external_items = 0usize;
+    let mut external_bytes = 0usize;
+    let mut internal_items = 0usize;
+    for (key, value) in env {
+        if !validate_env_key(key) || !bounded_nul_free(value, ENV_VALUE_BYTES_MAX, false) {
+            return Err(admission_error("runtime_env_plain_invalid"));
+        }
+        if key == internal_key {
+            internal_items = internal_items
+                .checked_add(1)
+                .ok_or_else(|| admission_error("runtime_internal_env_invalid"))?;
+            continue;
+        }
+        external_items = external_items
+            .checked_add(1)
+            .ok_or_else(|| admission_error("runtime_env_items_invalid"))?;
+        external_bytes = external_bytes
+            .checked_add(key.len())
+            .and_then(|bytes| bytes.checked_add(value.len()))
+            .ok_or_else(|| admission_error("runtime_env_bytes_invalid"))?;
+    }
+    if internal_items != 1 || external_items > ENV_ITEMS_MAX {
+        return Err(admission_error("runtime_internal_env_invalid"));
+    }
+    if external_bytes > ENV_AGGREGATE_BYTES_MAX {
+        return Err(admission_error("runtime_env_bytes_invalid"));
+    }
+    if let Some(cwd) = cwd {
+        validate_runtime_path(cwd)?;
+    }
+    Ok(())
+}
+
+fn validate_regexes(regexes: [Option<&str>; 4]) -> Result<(), RuntimeAdmissionError> {
+    let mut retained_bytes = 0usize;
+    for regex in regexes.into_iter().flatten() {
+        if regex.len() > REGEX_BYTES_MAX {
+            return Err(admission_error("runtime_command_regex_invalid"));
+        }
+        retained_bytes = retained_bytes
+            .checked_add(regex.len())
+            .ok_or_else(|| admission_error("runtime_command_regex_bytes_invalid"))?;
+        if retained_bytes > REGEX_AGGREGATE_BYTES_MAX {
+            return Err(admission_error("runtime_command_regex_bytes_invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn retained_add(total: &mut usize, bytes: usize) -> Result<(), RuntimeAdmissionError> {
+    *total = total
+        .checked_add(bytes)
+        .ok_or_else(|| admission_error("runtime_command_retained_bytes_invalid"))?;
+    Ok(())
+}
+
+fn retained_string(total: &mut usize, value: &String) -> Result<(), RuntimeAdmissionError> {
+    retained_add(total, value.capacity())
+}
+
+fn retained_strings(total: &mut usize, values: &Vec<String>) -> Result<(), RuntimeAdmissionError> {
+    retained_add(
+        total,
+        values
+            .capacity()
+            .checked_mul(std::mem::size_of::<String>())
+            .ok_or_else(|| admission_error("runtime_command_retained_bytes_invalid"))?,
+    )?;
+    for value in values {
+        retained_string(total, value)?;
+    }
+    Ok(())
+}
+
+fn retained_env(
+    total: &mut usize,
+    values: &Vec<(String, String)>,
+) -> Result<(), RuntimeAdmissionError> {
+    retained_add(
+        total,
+        values
+            .capacity()
+            .checked_mul(std::mem::size_of::<(String, String)>())
+            .ok_or_else(|| admission_error("runtime_command_retained_bytes_invalid"))?,
+    )?;
+    for (key, value) in values {
+        retained_string(total, key)?;
+        retained_string(total, value)?;
+    }
+    Ok(())
+}
+
+fn retained_optional_string(
+    total: &mut usize,
+    value: &Option<String>,
+) -> Result<(), RuntimeAdmissionError> {
+    if let Some(value) = value {
+        retained_string(total, value)?;
+    }
+    Ok(())
+}
+
+/// Actual heap retained while a command waits in the internal bounded queue. Capacity, rather
+/// than length, is charged so a short value with an attacker-sized spare allocation cannot evade
+/// the queue byte budget. The public/wire command remains unchanged.
+pub(crate) fn runtime_command_retained_bytes(
+    command: &RuntimeCommand,
+) -> Result<usize, RuntimeAdmissionError> {
+    let mut total = std::mem::size_of::<RuntimeCommand>();
+    match command {
+        RuntimeCommand::SpawnAgent {
+            agent_config_id,
+            command,
+            args,
+            env_plain,
+            env_secrets,
+            waiting_regex,
+            approval_regex,
+            error_regex,
+            done_regex,
+            ..
+        } => {
+            retained_optional_string(&mut total, agent_config_id)?;
+            retained_string(&mut total, command)?;
+            retained_strings(&mut total, args)?;
+            retained_env(&mut total, env_plain)?;
+            retained_env(&mut total, env_secrets)?;
+            for regex in [waiting_regex, approval_regex, error_regex, done_regex] {
+                retained_optional_string(&mut total, regex)?;
+            }
+        }
+        RuntimeCommand::WriteInput { bytes, .. } => retained_add(&mut total, bytes.capacity())?,
+        RuntimeCommand::SeedRedaction { credential_ids } => {
+            retained_strings(&mut total, credential_ids)?;
+        }
+        RuntimeCommand::SplitPane { pane, .. }
+        | RuntimeCommand::ClosePane { pane }
+        | RuntimeCommand::FocusPane { pane } => retained_string(&mut total, &pane.0)?,
+        RuntimeCommand::CloseTab { tab } | RuntimeCommand::SelectTab { tab } => {
+            retained_string(&mut total, &tab.0)?;
+        }
+        RuntimeCommand::ResizeSplit { tab, path, .. } => {
+            retained_string(&mut total, &tab.0)?;
+            retained_add(&mut total, path.capacity())?;
+        }
+        RuntimeCommand::RenamePane { pane, title } => {
+            retained_string(&mut total, &pane.0)?;
+            retained_string(&mut total, title)?;
+        }
+        RuntimeCommand::SetSessionDefaultEnv {
+            env_plain,
+            env_secrets,
+        } => {
+            retained_env(&mut total, env_plain)?;
+            retained_env(&mut total, env_secrets)?;
+        }
+        RuntimeCommand::SetShellCwd(cwd) => {
+            if let Some(cwd) = cwd {
+                retained_add(&mut total, cwd.capacity())?;
+            }
+        }
+        RuntimeCommand::UpdateSessionCwd { cwd, .. }
+        | RuntimeCommand::SearchScrollback { query: cwd, .. } => {
+            retained_string(&mut total, cwd)?;
+        }
+        RuntimeCommand::SpawnShell { .. }
+        | RuntimeCommand::Resize { .. }
+        | RuntimeCommand::Scroll { .. }
+        | RuntimeCommand::KillSession { .. }
+        | RuntimeCommand::RestoreWorkspace
+        | RuntimeCommand::SetWorkspaceState(_)
+        | RuntimeCommand::SetUserStatusOverride { .. }
+        | RuntimeCommand::SetTerminalCachePolicy { .. }
+        | RuntimeCommand::SetRemoteViewing { .. }
+        | RuntimeCommand::ScrollToBottom { .. }
+        | RuntimeCommand::ScrollToPrompt { .. }
+        | RuntimeCommand::ExtractLastOutput { .. } => {}
+    }
+    Ok(total)
+}
+
+fn canonicalize_string(value: &mut String) {
+    *value = std::mem::take(value).into_boxed_str().into_string();
+}
+
+fn canonicalize_strings(values: &mut Vec<String>) {
+    for value in values.iter_mut() {
+        canonicalize_string(value);
+    }
+    *values = std::mem::take(values).into_boxed_slice().into_vec();
+}
+
+fn canonicalize_env(values: &mut Vec<(String, String)>) {
+    for (key, value) in values.iter_mut() {
+        canonicalize_string(key);
+        canonicalize_string(value);
+    }
+    *values = std::mem::take(values).into_boxed_slice().into_vec();
+}
+
+fn canonicalize_optional_string(value: &mut Option<String>) {
+    if let Some(value) = value {
+        canonicalize_string(value);
+    }
+}
+
+fn canonicalize_mux_pane_id(id: &mut MuxPaneId) {
+    canonicalize_string(&mut id.0);
+}
+
+fn canonicalize_mux_tab_id(id: &mut MuxTabId) {
+    canonicalize_string(&mut id.0);
+}
+
+/// Values that leave the queue and may move into worker state, persistence rows, or durable
+/// events are rebuilt with length-bound backing allocations. Validation must run first; this is
+/// capacity canonicalization only and does not alter command semantics or wire representation.
+pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
+    match command {
+        RuntimeCommand::SpawnAgent {
+            agent_config_id,
+            command,
+            args,
+            env_plain,
+            env_secrets,
+            waiting_regex,
+            approval_regex,
+            error_regex,
+            done_regex,
+            ..
+        } => {
+            canonicalize_optional_string(agent_config_id);
+            canonicalize_string(command);
+            canonicalize_strings(args);
+            canonicalize_env(env_plain);
+            canonicalize_env(env_secrets);
+            for regex in [waiting_regex, approval_regex, error_regex, done_regex] {
+                canonicalize_optional_string(regex);
+            }
+        }
+        RuntimeCommand::WriteInput { bytes, .. } => {
+            *bytes = std::mem::take(bytes).into_boxed_slice().into_vec();
+        }
+        RuntimeCommand::SeedRedaction { credential_ids } => {
+            canonicalize_strings(credential_ids);
+        }
+        RuntimeCommand::SplitPane { pane, .. }
+        | RuntimeCommand::ClosePane { pane }
+        | RuntimeCommand::FocusPane { pane } => canonicalize_mux_pane_id(pane),
+        RuntimeCommand::CloseTab { tab } | RuntimeCommand::SelectTab { tab } => {
+            canonicalize_mux_tab_id(tab);
+        }
+        RuntimeCommand::ResizeSplit { tab, path, .. } => {
+            canonicalize_mux_tab_id(tab);
+            *path = std::mem::take(path).into_boxed_slice().into_vec();
+        }
+        RuntimeCommand::RenamePane { pane, title } => {
+            canonicalize_mux_pane_id(pane);
+            canonicalize_string(title);
+        }
+        RuntimeCommand::SetSessionDefaultEnv {
+            env_plain,
+            env_secrets,
+        } => {
+            canonicalize_env(env_plain);
+            canonicalize_env(env_secrets);
+        }
+        RuntimeCommand::SetShellCwd(cwd) => {
+            if let Some(cwd) = cwd {
+                *cwd = std::mem::take(cwd).into_boxed_path().into_path_buf();
+            }
+        }
+        RuntimeCommand::UpdateSessionCwd { cwd, .. }
+        | RuntimeCommand::SearchScrollback { query: cwd, .. } => canonicalize_string(cwd),
+        RuntimeCommand::SpawnShell { .. }
+        | RuntimeCommand::Resize { .. }
+        | RuntimeCommand::Scroll { .. }
+        | RuntimeCommand::KillSession { .. }
+        | RuntimeCommand::RestoreWorkspace
+        | RuntimeCommand::SetWorkspaceState(_)
+        | RuntimeCommand::SetUserStatusOverride { .. }
+        | RuntimeCommand::SetTerminalCachePolicy { .. }
+        | RuntimeCommand::SetRemoteViewing { .. }
+        | RuntimeCommand::ScrollToBottom { .. }
+        | RuntimeCommand::ScrollToPrompt { .. }
+        | RuntimeCommand::ExtractLastOutput { .. } => {}
+    }
+}
+
+fn mux_pane_id_is_valid(id: &MuxPaneId) -> bool {
+    bounded_identifier(&id.0, MUX_ID_BYTES_MAX)
+}
+
+fn mux_tab_id_is_valid(id: &MuxTabId) -> bool {
+    bounded_identifier(&id.0, MUX_ID_BYTES_MAX)
+}
+
+pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), RuntimeAdmissionError> {
+    match command {
+        RuntimeCommand::SpawnShell {
+            cols,
+            rows,
+            scrollback_lines,
+        } => {
+            if !dimensions_are_valid(*cols, *rows) || *scrollback_lines > SCROLLBACK_LINES_MAX {
+                return Err(admission_error("runtime_command_spawn_shell_invalid"));
+            }
+        }
+        RuntimeCommand::SpawnAgent {
+            cols,
+            rows,
+            scrollback_lines,
+            agent_config_id,
+            command,
+            args,
+            env_plain,
+            env_secrets,
+            waiting_regex,
+            approval_regex,
+            error_regex,
+            done_regex,
+        } => {
+            if !dimensions_are_valid(*cols, *rows)
+                || *scrollback_lines > SCROLLBACK_LINES_MAX
+                || agent_config_id
+                    .as_deref()
+                    .is_some_and(|id| !agent_config_id_is_valid(id))
+                || !bounded_nul_free(command, COMMAND_BYTES_MAX, true)
+            {
+                return Err(admission_error("runtime_command_spawn_agent_invalid"));
+            }
+            validate_args(args)?;
+            validate_env_entries(env_plain, env_secrets)?;
+            validate_regexes([
+                waiting_regex.as_deref(),
+                approval_regex.as_deref(),
+                error_regex.as_deref(),
+                done_regex.as_deref(),
+            ])?;
+        }
+        RuntimeCommand::WriteInput { bytes, .. } => {
+            if bytes.len() > WRITE_INPUT_BYTES_MAX {
+                return Err(admission_error("runtime_command_input_invalid"));
+            }
+        }
+        RuntimeCommand::Resize { cols, rows, .. } => {
+            if !dimensions_are_valid(*cols, *rows) {
+                return Err(admission_error("runtime_command_resize_invalid"));
+            }
+        }
+        RuntimeCommand::SeedRedaction { credential_ids } => {
+            if credential_ids.len() > SEED_CREDENTIAL_ITEMS_MAX
+                || credential_ids
+                    .iter()
+                    .any(|id| !bounded_identifier(id, SEED_CREDENTIAL_ID_BYTES_MAX))
+            {
+                return Err(admission_error("runtime_command_seed_invalid"));
+            }
+        }
+        RuntimeCommand::SplitPane {
+            pane,
+            scrollback_lines,
+            ..
+        } => {
+            if !mux_pane_id_is_valid(pane) || *scrollback_lines > SCROLLBACK_LINES_MAX {
+                return Err(admission_error("runtime_command_split_invalid"));
+            }
+        }
+        RuntimeCommand::ResizeSplit {
+            tab, path, ratio, ..
+        } => {
+            if !mux_tab_id_is_valid(tab)
+                || path.len() > SPLIT_PATH_ITEMS_MAX
+                || !ratio.is_finite()
+                || !(0.0..=1.0).contains(ratio)
+            {
+                return Err(admission_error("runtime_command_resize_split_invalid"));
+            }
+        }
+        RuntimeCommand::RenamePane { pane, title } => {
+            if !mux_pane_id_is_valid(pane) || !bounded_nul_free(title, PANE_TITLE_BYTES_MAX, false)
+            {
+                return Err(admission_error("runtime_command_pane_title_invalid"));
+            }
+        }
+        RuntimeCommand::ClosePane { pane } | RuntimeCommand::FocusPane { pane } => {
+            if !mux_pane_id_is_valid(pane) {
+                return Err(admission_error("runtime_command_pane_id_invalid"));
+            }
+        }
+        RuntimeCommand::CloseTab { tab } | RuntimeCommand::SelectTab { tab } => {
+            if !mux_tab_id_is_valid(tab) {
+                return Err(admission_error("runtime_command_tab_id_invalid"));
+            }
+        }
+        RuntimeCommand::SetSessionDefaultEnv {
+            env_plain,
+            env_secrets,
+        } => validate_env_entries(env_plain, env_secrets)?,
+        RuntimeCommand::SetShellCwd(Some(cwd)) => validate_runtime_path(cwd)?,
+        RuntimeCommand::UpdateSessionCwd { cwd, .. } => {
+            if !bounded_nul_free(cwd, PATH_BYTES_MAX, true) {
+                return Err(admission_error("runtime_path_invalid"));
+            }
+        }
+        RuntimeCommand::SearchScrollback { query, .. } => {
+            if query.len() > SEARCH_QUERY_BYTES_MAX {
+                return Err(admission_error("runtime_command_search_invalid"));
+            }
+        }
+        RuntimeCommand::Scroll { .. }
+        | RuntimeCommand::KillSession { .. }
+        | RuntimeCommand::RestoreWorkspace
+        | RuntimeCommand::SetWorkspaceState(_)
+        | RuntimeCommand::SetUserStatusOverride { .. }
+        | RuntimeCommand::SetShellCwd(None)
+        | RuntimeCommand::SetTerminalCachePolicy { .. }
+        | RuntimeCommand::SetRemoteViewing { .. }
+        | RuntimeCommand::ScrollToBottom { .. }
+        | RuntimeCommand::ScrollToPrompt { .. }
+        | RuntimeCommand::ExtractLastOutput { .. } => {}
     }
     Ok(())
 }
@@ -234,7 +836,7 @@ impl std::fmt::Debug for RuntimeCommand {
                 .field("rows", rows)
                 .field("scrollback_lines", scrollback_lines)
                 .field("agent_config_id_set", &agent_config_id.is_some())
-                .field("command", command)
+                .field("command_len", &command.len())
                 .field("args_count", &args.len())
                 .field("env_plain_count", &env_plain.len())
                 .field("env_secret_count", &env_secrets.len())
@@ -336,7 +938,7 @@ impl std::fmt::Debug for RuntimeCommand {
             RuntimeCommand::ResizeSplit { tab, path, ratio } => f
                 .debug_struct("ResizeSplit")
                 .field("tab", tab)
-                .field("path", path)
+                .field("path_len", &path.len())
                 .field("ratio", ratio)
                 .finish(),
             RuntimeCommand::SetUserStatusOverride { session, override_ } => f
@@ -347,7 +949,7 @@ impl std::fmt::Debug for RuntimeCommand {
             RuntimeCommand::RenamePane { pane, title } => f
                 .debug_struct("RenamePane")
                 .field("pane", pane)
-                .field("title", title)
+                .field("title_len", &title.len())
                 .finish(),
             RuntimeCommand::SetRemoteViewing {
                 session,
@@ -378,6 +980,23 @@ impl std::fmt::Debug for RuntimeCommand {
 mod tests {
     use super::*;
 
+    fn valid_agent_command() -> RuntimeCommand {
+        RuntimeCommand::SpawnAgent {
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 100,
+            agent_config_id: Some("agent-id".to_owned()),
+            command: "x".to_owned(),
+            args: Vec::new(),
+            env_plain: Vec::new(),
+            env_secrets: Vec::new(),
+            waiting_regex: None,
+            approval_regex: None,
+            error_regex: None,
+            done_regex: None,
+        }
+    }
+
     #[test]
     fn runtime_command_debug는_spawn_agent와_input_payload를_숨긴다() {
         let command = RuntimeCommand::SpawnAgent {
@@ -385,7 +1004,7 @@ mod tests {
             rows: 40,
             scrollback_lines: 10_000,
             agent_config_id: Some("agent-secret-id".to_owned()),
-            command: "/bin/sh".to_owned(),
+            command: "command-debug-never-log".to_owned(),
             args: vec!["--token".to_owned(), "sk-debug-never-log".to_owned()],
             env_plain: vec![("API_KEY".to_owned(), "plain-debug-never-log".to_owned())],
             env_secrets: vec![("SECRET".to_owned(), "cred-debug-never-log".to_owned())],
@@ -406,6 +1025,7 @@ mod tests {
 
         for forbidden in [
             "agent-secret-id",
+            "command-debug-never-log",
             "sk-debug-never-log",
             "plain-debug-never-log",
             "cred-debug-never-log",
@@ -469,5 +1089,487 @@ mod tests {
         assert!(validate_host_command(&command_with(String::new())).is_err());
         assert!(validate_host_command(&command_with("a".repeat(129))).is_err());
         assert!(validate_host_command(&command_with("a\0b".to_owned())).is_err());
+        assert!(validate_host_command(&command_with("a\nb".to_owned())).is_err());
+    }
+
+    #[test]
+    fn command_admission_accepts_exact_scalar_limits_and_rejects_plus_one() {
+        assert!(
+            validate_host_command(&RuntimeCommand::SpawnShell {
+                cols: 256,
+                rows: 256,
+                scrollback_lines: SCROLLBACK_LINES_MAX,
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_host_command(&RuntimeCommand::SpawnShell {
+                cols: TERMINAL_DIMENSION_MAX,
+                rows: 100,
+                scrollback_lines: 0,
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_host_command(&RuntimeCommand::SpawnShell {
+                cols: 100,
+                rows: TERMINAL_DIMENSION_MAX,
+                scrollback_lines: 0,
+            })
+            .is_ok()
+        );
+        for invalid in [
+            RuntimeCommand::SpawnShell {
+                cols: 0,
+                rows: 1,
+                scrollback_lines: 0,
+            },
+            RuntimeCommand::SpawnShell {
+                cols: TERMINAL_DIMENSION_MAX + 1,
+                rows: 1,
+                scrollback_lines: 0,
+            },
+            RuntimeCommand::SpawnShell {
+                cols: 1,
+                rows: 1,
+                scrollback_lines: SCROLLBACK_LINES_MAX + 1,
+            },
+            RuntimeCommand::SpawnShell {
+                cols: 257,
+                rows: 256,
+                scrollback_lines: 0,
+            },
+        ] {
+            assert!(validate_host_command(&invalid).is_err());
+        }
+
+        let mut agent = valid_agent_command();
+        if let RuntimeCommand::SpawnAgent { command, .. } = &mut agent {
+            *command = "x".repeat(COMMAND_BYTES_MAX);
+        }
+        assert!(validate_host_command(&agent).is_ok());
+        if let RuntimeCommand::SpawnAgent { command, .. } = &mut agent {
+            command.push('x');
+        }
+        assert!(validate_host_command(&agent).is_err());
+        if let RuntimeCommand::SpawnAgent { command, .. } = &mut agent {
+            command.clear();
+        }
+        assert!(validate_host_command(&agent).is_err());
+
+        let exact_path = std::path::PathBuf::from("x".repeat(PATH_BYTES_MAX));
+        assert!(validate_host_command(&RuntimeCommand::SetShellCwd(Some(exact_path))).is_ok());
+        assert!(
+            validate_host_command(&RuntimeCommand::SetShellCwd(Some(
+                std::path::PathBuf::from("x".repeat(PATH_BYTES_MAX + 1)),
+            )))
+            .is_err()
+        );
+        assert!(
+            validate_host_command(&RuntimeCommand::SetShellCwd(Some(
+                std::path::PathBuf::new(),
+            )))
+            .is_err()
+        );
+
+        assert!(
+            validate_host_command(&RuntimeCommand::RenamePane {
+                pane: MuxPaneId::new(),
+                title: "x".repeat(PANE_TITLE_BYTES_MAX),
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_host_command(&RuntimeCommand::RenamePane {
+                pane: MuxPaneId::new(),
+                title: "x".repeat(PANE_TITLE_BYTES_MAX + 1),
+            })
+            .is_err()
+        );
+
+        assert!(
+            validate_host_command(&RuntimeCommand::ResizeSplit {
+                tab: MuxTabId::new(),
+                path: vec![0; SPLIT_PATH_ITEMS_MAX],
+                ratio: 1.0,
+            })
+            .is_ok()
+        );
+        for (path, ratio) in [
+            (vec![0; SPLIT_PATH_ITEMS_MAX + 1], 0.5),
+            (Vec::new(), f32::NAN),
+            (Vec::new(), 1.01),
+        ] {
+            assert!(
+                validate_host_command(&RuntimeCommand::ResizeSplit {
+                    tab: MuxTabId::new(),
+                    path,
+                    ratio,
+                })
+                .is_err()
+            );
+        }
+
+        assert!(
+            validate_host_command(&RuntimeCommand::SearchScrollback {
+                session: SessionId(1),
+                query: "x".repeat(SEARCH_QUERY_BYTES_MAX),
+                max_matches: 1,
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_host_command(&RuntimeCommand::SearchScrollback {
+                session: SessionId(1),
+                query: "x".repeat(SEARCH_QUERY_BYTES_MAX + 1),
+                max_matches: 1,
+            })
+            .is_err()
+        );
+
+        assert!(
+            validate_host_command(&RuntimeCommand::WriteInput {
+                session: SessionId(1),
+                bytes: vec![0; WRITE_INPUT_BYTES_MAX],
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_host_command(&RuntimeCommand::WriteInput {
+                session: SessionId(1),
+                bytes: vec![0; WRITE_INPUT_BYTES_MAX + 1],
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn command_admission_bounds_args_env_regex_and_seed_aggregates() {
+        let mut agent = valid_agent_command();
+        if let RuntimeCommand::SpawnAgent { args, .. } = &mut agent {
+            *args = vec!["x".repeat(ARG_BYTES_MAX); ARG_AGGREGATE_BYTES_MAX / ARG_BYTES_MAX];
+        }
+        assert!(validate_host_command(&agent).is_ok());
+        if let RuntimeCommand::SpawnAgent { args, .. } = &mut agent {
+            args.push("x".to_owned());
+        }
+        assert!(validate_host_command(&agent).is_err());
+        if let RuntimeCommand::SpawnAgent { args, .. } = &mut agent {
+            *args = vec![String::new(); ARG_ITEMS_MAX];
+        }
+        assert!(validate_host_command(&agent).is_ok());
+        if let RuntimeCommand::SpawnAgent { args, .. } = &mut agent {
+            args.push(String::new());
+        }
+        assert!(validate_host_command(&agent).is_err());
+        if let RuntimeCommand::SpawnAgent { args, .. } = &mut agent {
+            *args = vec!["x".repeat(ARG_BYTES_MAX + 1)];
+        }
+        assert!(validate_host_command(&agent).is_err());
+
+        if let RuntimeCommand::SpawnAgent {
+            args, env_plain, ..
+        } = &mut agent
+        {
+            args.clear();
+            *env_plain = vec![("K".to_owned(), String::new()); ENV_ITEMS_MAX];
+        }
+        assert!(validate_host_command(&agent).is_ok());
+        if let RuntimeCommand::SpawnAgent { env_plain, .. } = &mut agent {
+            env_plain.push(("K".to_owned(), String::new()));
+        }
+        assert!(validate_host_command(&agent).is_err());
+        if let RuntimeCommand::SpawnAgent { env_plain, .. } = &mut agent {
+            *env_plain = (0..31)
+                .map(|_| ("K".to_owned(), "x".repeat(ENV_VALUE_BYTES_MAX)))
+                .chain(std::iter::once((
+                    "K".to_owned(),
+                    "x".repeat(ENV_AGGREGATE_BYTES_MAX - 32 - 31 * ENV_VALUE_BYTES_MAX),
+                )))
+                .collect();
+        }
+        assert!(validate_host_command(&agent).is_ok());
+        if let RuntimeCommand::SpawnAgent { env_plain, .. } = &mut agent {
+            env_plain.last_mut().unwrap().1.push('x');
+        }
+        assert!(validate_host_command(&agent).is_err());
+        if let RuntimeCommand::SpawnAgent { env_plain, .. } = &mut agent {
+            *env_plain = vec![("K".repeat(ENV_KEY_BYTES_MAX), String::new())];
+        }
+        assert!(validate_host_command(&agent).is_ok());
+        if let RuntimeCommand::SpawnAgent { env_plain, .. } = &mut agent {
+            env_plain[0].0.push('K');
+        }
+        assert!(validate_host_command(&agent).is_err());
+        if let RuntimeCommand::SpawnAgent { env_plain, .. } = &mut agent {
+            *env_plain = vec![("BAD=KEY".to_owned(), String::new())];
+        }
+        assert!(validate_host_command(&agent).is_err());
+
+        if let RuntimeCommand::SpawnAgent {
+            env_plain,
+            env_secrets,
+            ..
+        } = &mut agent
+        {
+            env_plain.clear();
+            *env_secrets = vec![(
+                "SECRET".to_owned(),
+                "x".repeat(SEED_CREDENTIAL_ID_BYTES_MAX),
+            )];
+        }
+        assert!(validate_host_command(&agent).is_ok());
+        if let RuntimeCommand::SpawnAgent { env_secrets, .. } = &mut agent {
+            env_secrets[0].1.push('x');
+        }
+        assert!(validate_host_command(&agent).is_err());
+        if let RuntimeCommand::SpawnAgent { env_secrets, .. } = &mut agent {
+            env_secrets[0].1 = "bad\nid".to_owned();
+        }
+        assert!(validate_host_command(&agent).is_err());
+
+        if let RuntimeCommand::SpawnAgent {
+            env_secrets,
+            waiting_regex,
+            approval_regex,
+            error_regex,
+            done_regex,
+            ..
+        } = &mut agent
+        {
+            env_secrets.clear();
+            *waiting_regex = Some("x".repeat(REGEX_BYTES_MAX));
+            *approval_regex = Some("x".repeat(REGEX_BYTES_MAX));
+            *error_regex = Some("x".repeat(REGEX_BYTES_MAX));
+            *done_regex = Some("x".repeat(REGEX_BYTES_MAX));
+        }
+        assert!(validate_host_command(&agent).is_ok());
+        if let RuntimeCommand::SpawnAgent { done_regex, .. } = &mut agent {
+            done_regex.as_mut().unwrap().push('x');
+        }
+        assert!(validate_host_command(&agent).is_err());
+
+        assert!(
+            validate_host_command(&RuntimeCommand::SeedRedaction {
+                credential_ids: vec![
+                    "x".repeat(SEED_CREDENTIAL_ID_BYTES_MAX);
+                    SEED_CREDENTIAL_ITEMS_MAX
+                ],
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_host_command(&RuntimeCommand::SeedRedaction {
+                credential_ids: vec!["x".to_owned(); SEED_CREDENTIAL_ITEMS_MAX + 1],
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn internal_env_slot_preserves_exact_external_limit() {
+        let mut env = vec![("K".to_owned(), String::new()); ENV_ITEMS_MAX];
+        env.push(("DEPPY_SESSION_ID".to_owned(), "workspace:1".to_owned()));
+        assert!(
+            validate_launch_spec_with_internal_env("x", &[], &env, None, "DEPPY_SESSION_ID",)
+                .is_ok()
+        );
+        env.insert(0, ("EXTRA".to_owned(), String::new()));
+        assert!(
+            validate_launch_spec_with_internal_env("x", &[], &env, None, "DEPPY_SESSION_ID",)
+                .is_err()
+        );
+        env.pop();
+        env.push(("DEPPY_SESSION_ID".to_owned(), "duplicate".to_owned()));
+        assert!(
+            validate_launch_spec_with_internal_env("x", &[], &env, None, "DEPPY_SESSION_ID",)
+                .is_err()
+        );
+    }
+
+    fn mux_id_commands(id: &str) -> Vec<RuntimeCommand> {
+        let pane = || MuxPaneId(id.to_owned());
+        let tab = || MuxTabId(id.to_owned());
+        vec![
+            RuntimeCommand::SplitPane {
+                pane: pane(),
+                direction: SplitDirection::Horizontal,
+                scrollback_lines: 0,
+            },
+            RuntimeCommand::ClosePane { pane: pane() },
+            RuntimeCommand::FocusPane { pane: pane() },
+            RuntimeCommand::RenamePane {
+                pane: pane(),
+                title: String::new(),
+            },
+            RuntimeCommand::CloseTab { tab: tab() },
+            RuntimeCommand::SelectTab { tab: tab() },
+            RuntimeCommand::ResizeSplit {
+                tab: tab(),
+                path: Vec::new(),
+                ratio: 0.5,
+            },
+        ]
+    }
+
+    #[test]
+    fn every_mux_id_variant_accepts_exact_and_rejects_plus_one_or_control() {
+        for command in mux_id_commands(&"x".repeat(MUX_ID_BYTES_MAX)) {
+            assert!(validate_host_command(&command).is_ok(), "{command:?}");
+        }
+        for invalid in [
+            String::new(),
+            "x".repeat(MUX_ID_BYTES_MAX + 1),
+            "bad\nid".to_owned(),
+            "bad\0id".to_owned(),
+        ] {
+            for command in mux_id_commands(&invalid) {
+                assert!(validate_host_command(&command).is_err(), "{command:?}");
+            }
+        }
+    }
+
+    fn spare_string(value: &str, capacity: usize) -> String {
+        let mut output = String::with_capacity(capacity);
+        output.push_str(value);
+        output
+    }
+
+    #[test]
+    fn canonicalization_removes_spare_capacity_before_long_lived_storage() {
+        let mut agent = RuntimeCommand::SpawnAgent {
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 0,
+            agent_config_id: Some(spare_string("agent-id", 64 * 1024)),
+            command: spare_string("command", 64 * 1024),
+            args: vec![spare_string("arg", 64 * 1024)],
+            env_plain: vec![(
+                spare_string("KEY", 64 * 1024),
+                spare_string("value", 64 * 1024),
+            )],
+            env_secrets: Vec::new(),
+            waiting_regex: Some(spare_string("waiting", 64 * 1024)),
+            approval_regex: None,
+            error_regex: None,
+            done_regex: None,
+        };
+        assert!(validate_host_command(&agent).is_ok());
+        canonicalize_host_command(&mut agent);
+        let RuntimeCommand::SpawnAgent {
+            agent_config_id,
+            command,
+            args,
+            env_plain,
+            waiting_regex,
+            ..
+        } = &agent
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            agent_config_id.as_ref().unwrap().capacity(),
+            "agent-id".len()
+        );
+        assert_eq!(command.capacity(), command.len());
+        assert_eq!(args.capacity(), args.len());
+        assert_eq!(args[0].capacity(), args[0].len());
+        assert_eq!(env_plain.capacity(), env_plain.len());
+        assert_eq!(env_plain[0].0.capacity(), env_plain[0].0.len());
+        assert_eq!(env_plain[0].1.capacity(), env_plain[0].1.len());
+        assert_eq!(
+            waiting_regex.as_ref().unwrap().capacity(),
+            waiting_regex.as_ref().unwrap().len()
+        );
+
+        let mut defaults = Vec::with_capacity(4_096);
+        defaults.push((
+            spare_string("KEY", 64 * 1024),
+            spare_string("value", 64 * 1024),
+        ));
+        let mut command = RuntimeCommand::SetSessionDefaultEnv {
+            env_plain: defaults,
+            env_secrets: Vec::with_capacity(4_096),
+        };
+        canonicalize_host_command(&mut command);
+        let RuntimeCommand::SetSessionDefaultEnv {
+            env_plain,
+            env_secrets,
+        } = command
+        else {
+            unreachable!()
+        };
+        assert_eq!(env_plain.capacity(), env_plain.len());
+        assert_eq!(env_plain[0].0.capacity(), env_plain[0].0.len());
+        assert_eq!(env_plain[0].1.capacity(), env_plain[0].1.len());
+        assert_eq!(env_secrets.capacity(), 0);
+
+        let mut cwd = std::path::PathBuf::with_capacity(64 * 1024);
+        cwd.push("cwd");
+        let mut command = RuntimeCommand::SetShellCwd(Some(cwd));
+        canonicalize_host_command(&mut command);
+        let RuntimeCommand::SetShellCwd(Some(cwd)) = command else {
+            unreachable!()
+        };
+        assert_eq!(cwd.capacity(), cwd.as_os_str().as_encoded_bytes().len());
+    }
+
+    #[test]
+    fn runtime_command_variant_order_is_source_locked() {
+        let source = include_str!("command.rs");
+        let body = source
+            .split_once("pub enum RuntimeCommand {")
+            .unwrap()
+            .1
+            .split_once("\n}\n\nimpl std::fmt::Debug for RuntimeCommand")
+            .unwrap()
+            .0;
+        let actual = body
+            .lines()
+            .filter_map(|line| {
+                let line = line.strip_prefix("    ")?;
+                if line.starts_with([' ', '/']) {
+                    return None;
+                }
+                let name = line
+                    .split(|character: char| !character.is_ascii_alphanumeric())
+                    .next()?;
+                name.chars()
+                    .next()
+                    .is_some_and(char::is_uppercase)
+                    .then_some(name)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            [
+                "SpawnShell",
+                "SpawnAgent",
+                "WriteInput",
+                "Resize",
+                "Scroll",
+                "KillSession",
+                "SeedRedaction",
+                "SplitPane",
+                "ClosePane",
+                "CloseTab",
+                "SelectTab",
+                "FocusPane",
+                "RestoreWorkspace",
+                "SetWorkspaceState",
+                "ResizeSplit",
+                "SetUserStatusOverride",
+                "RenamePane",
+                "SetSessionDefaultEnv",
+                "SetShellCwd",
+                "UpdateSessionCwd",
+                "SetTerminalCachePolicy",
+                "SetRemoteViewing",
+                "SearchScrollback",
+                "ScrollToBottom",
+                "ScrollToPrompt",
+                "ExtractLastOutput",
+            ]
+        );
     }
 }

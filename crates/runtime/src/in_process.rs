@@ -21,7 +21,9 @@ use crate::client::{
     LOCAL_EVENT_QUEUE_CAP, RuntimeClient, RuntimeCommandSink, RuntimeEventReceiver,
     RuntimeEventStream,
 };
-use crate::command::{RuntimeCommand, SessionId};
+use crate::command::{
+    RUNTIME_COMMAND_QUEUE_BYTES_MAX, RUNTIME_SESSION_CAP, RuntimeCommand, SessionId,
+};
 use crate::event::{AgentConfigCorrelationId, MessagePayload, RuntimeEvent, SpawnKind};
 use crate::host::{
     RuntimeCommandDispatcher, RuntimeHost, RuntimeSecret, RuntimeSecretResolver, RuntimeWake,
@@ -92,7 +94,8 @@ fn enqueue_durable_event(
 
 pub struct InProcessRuntimeClient {
     /// shutdown 시 None — drop되면 worker가 Disconnected로 종료한다
-    command_tx: Option<SyncSender<RuntimeCommand>>,
+    command_tx: Option<SyncSender<QueuedRuntimeCommand>>,
+    command_budget: Arc<RuntimeCommandQueueBudget>,
     subscribers: Arc<Mutex<Vec<Subscriber>>>,
     worker: Option<std::thread::JoinHandle<()>>,
     /// command 송신과 PTY 출력 도착이 timeout을 기다리지 않고 worker를 깨우는 핸들.
@@ -181,6 +184,13 @@ impl InProcessRuntimeClient {
         cwd: Option<PathBuf>,
         extra_env: Vec<(String, String)>,
     ) -> anyhow::Result<Self> {
+        crate::host::validate_runtime_worker_config(
+            output_batch_ms,
+            &logs_root,
+            persist.as_ref(),
+            cwd.as_deref(),
+            &extra_env,
+        )?;
         let mut shell = pty::default_shell();
         shell.cwd = cwd;
         shell.env.extend(extra_env);
@@ -202,6 +212,19 @@ impl InProcessRuntimeClient {
         shell: CommandSpec,
         persist: Option<crate::persistence::PersistConfig>,
     ) -> anyhow::Result<Self> {
+        crate::host::validate_runtime_worker_config(
+            output_batch_ms,
+            &logs_root,
+            persist.as_ref(),
+            shell.cwd.as_deref(),
+            &shell.env,
+        )?;
+        crate::command::validate_launch_spec(
+            &shell.program,
+            &shell.args,
+            &shell.env,
+            shell.cwd.as_deref(),
+        )?;
         // 세션 id(u64)는 실행마다 1부터 다시 시작한다 — 이전 실행 로그에
         // append되지 않도록 실행(run) 단위 하위 디렉터리로 격리한다.
         // (영속 세션 id 도입은 PR-14)
@@ -211,6 +234,7 @@ impl InProcessRuntimeClient {
         let seq = RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let run_logs_root = logs_root.join(format!("run-{run_ms}-{}-{seq}", std::process::id()));
         let (command_tx, command_rx) = sync_channel(IN_PROCESS_CMD_QUEUE_CAP);
+        let command_budget = Arc::new(RuntimeCommandQueueBudget::default());
         let subscribers: Arc<Mutex<Vec<Subscriber>>> = Arc::default();
         let worker_subscribers = Arc::clone(&subscribers);
         let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -222,8 +246,8 @@ impl InProcessRuntimeClient {
                     persist.as_ref().and_then(
                         |config| match crate::persistence::PersistPipe::open(config) {
                             Ok(pipe) => Some(pipe),
-                            Err(e) => {
-                                tracing::warn!("세션 영속 비활성 (DB 열기 실패): {e:#}");
+                            Err(error) => {
+                                trace_runtime_failure("persist_open", "persist_open_failed", error);
                                 None
                             }
                         },
@@ -278,10 +302,11 @@ impl InProcessRuntimeClient {
                 }
                 .run();
             })
-            .map_err(|error| anyhow::anyhow!("runtime worker thread 생성 실패: {error}"))?;
+            .map_err(|_| anyhow::anyhow!("runtime_worker_thread_spawn_failed"))?;
         let worker_thread = Some(worker.thread().clone());
         Ok(Self {
             command_tx: Some(command_tx),
+            command_budget,
             subscribers,
             worker: Some(worker),
             worker_thread,
@@ -294,14 +319,30 @@ impl InProcessRuntimeClient {
     /// try_send가 실패하고 경고 로그만 남는다 — 호출측은 fire-and-forget.
     pub fn command_sink(&self) -> Option<Arc<dyn Fn(RuntimeCommand) + Send + Sync>> {
         let tx = self.command_tx.as_ref()?.clone();
+        let command_budget = Arc::clone(&self.command_budget);
         let worker_thread = self.worker_thread.clone();
-        Some(Arc::new(move |command| match tx.try_send(command) {
-            Ok(()) => {
-                if let Some(worker_thread) = &worker_thread {
-                    worker_thread.unpark();
+        Some(Arc::new(move |command| {
+            let queued = match prepare_queued_command(command, &command_budget) {
+                Ok(queued) => queued,
+                Err(_) => {
+                    tracing::warn!(
+                        error_code = "runtime_command_invalid",
+                        "web→runtime 명령 거부"
+                    );
+                    return;
                 }
+            };
+            match tx.try_send(queued) {
+                Ok(()) => {
+                    if let Some(worker_thread) = &worker_thread {
+                        worker_thread.unpark();
+                    }
+                }
+                Err(_) => tracing::warn!(
+                    error_code = "runtime_command_enqueue_failed",
+                    "web→runtime 명령 전송 실패"
+                ),
             }
-            Err(e) => tracing::warn!("web→runtime 명령 전송 실패: {e}"),
         }))
     }
 
@@ -334,10 +375,11 @@ impl Drop for InProcessRuntimeClient {
 
 impl RuntimeCommandSink for InProcessRuntimeClient {
     fn send_command(&self, command: RuntimeCommand) -> anyhow::Result<()> {
+        let queued = prepare_queued_command(command, &self.command_budget)?;
         let Some(tx) = self.command_tx.as_ref() else {
             anyhow::bail!("runtime worker가 종료됨");
         };
-        match tx.try_send(command) {
+        match tx.try_send(queued) {
             Ok(()) => {
                 if let Some(worker_thread) = &self.worker_thread {
                     worker_thread.unpark();
@@ -440,16 +482,16 @@ impl RuntimeClient for InProcessRuntimeClient {}
 
 impl RuntimeHost for InProcessRuntimeClient {
     fn submit(&self, command: RuntimeCommand) -> anyhow::Result<()> {
-        crate::command::validate_host_command(&command)?;
         RuntimeCommandSink::send_command(self, command)
     }
 
     fn command_dispatcher(&self) -> Option<RuntimeCommandDispatcher> {
         let tx = self.command_tx.as_ref()?.clone();
+        let command_budget = Arc::clone(&self.command_budget);
         let worker_thread = self.worker_thread.clone();
         Some(Arc::new(move |command| {
-            crate::command::validate_host_command(&command)?;
-            match tx.try_send(command) {
+            let queued = prepare_queued_command(command, &command_budget)?;
+            match tx.try_send(queued) {
                 Ok(()) => {
                     if let Some(worker_thread) = &worker_thread {
                         worker_thread.unpark();
@@ -503,6 +545,9 @@ fn clamp_runtime_cache_budget_bytes(bytes: usize) -> usize {
 /// 압축 아카이브 총 바이트 예산 — 초과 시 오래된 아카이브부터 제거 (LRU).
 /// 개당 압축 ANSI ~수십 KB라 넉넉한 개수를 담는다.
 const ARCHIVED_SCROLLBACK_BUDGET_BYTES: usize = 16 * 1024 * 1024;
+/// Disk archive format's existing uncompressed ceiling is 32MiB. Memory archives use the same
+/// ceiling so an entry that is valid on disk cannot become unrestorable after LRU promotion.
+const MAX_ARCHIVED_SCROLLBACK_RESTORE_BYTES: usize = 32 * 1024 * 1024;
 /// Local runtime command queue cap. Commands are ordered and cannot be coalesced
 /// safely in the transport boundary, so overflow is surfaced to the caller.
 const IN_PROCESS_CMD_QUEUE_CAP: usize = 1024;
@@ -512,8 +557,102 @@ const SHELL_TITLE_ID: &str = "workspace.spawn.shell";
 const AGENT_TITLE_ID: &str = "workspace.spawn.agent";
 type PreparedSecretEnv = (Vec<(String, String)>, Vec<RedactionLease>);
 
+fn trace_runtime_failure<E>(phase: &'static str, error_code: &'static str, _source: E) {
+    tracing::warn!(
+        kind = "runtime",
+        phase,
+        error_code,
+        "runtime operation failed"
+    );
+}
+
+fn sanitized_spawn_failure(message_id: &'static str, error_code: &'static str) -> MessagePayload {
+    MessagePayload::new(message_id)
+        .arg("error_code", error_code)
+        .diagnostic(error_code)
+}
+
+#[derive(Default)]
+struct RuntimeCommandQueueBudget {
+    retained_bytes: std::sync::atomic::AtomicUsize,
+}
+
+impl RuntimeCommandQueueBudget {
+    fn reserve(
+        self: &Arc<Self>,
+        retained_bytes: usize,
+    ) -> anyhow::Result<RuntimeCommandQueueReservation> {
+        let reserved = self.retained_bytes.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |current| {
+                current
+                    .checked_add(retained_bytes)
+                    .filter(|next| *next <= RUNTIME_COMMAND_QUEUE_BYTES_MAX)
+            },
+        );
+        if reserved.is_err() {
+            anyhow::bail!("runtime_command_queue_bytes_exceeded");
+        }
+        Ok(RuntimeCommandQueueReservation {
+            budget: Arc::clone(self),
+            retained_bytes,
+        })
+    }
+
+    #[cfg(test)]
+    fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+struct RuntimeCommandQueueReservation {
+    budget: Arc<RuntimeCommandQueueBudget>,
+    retained_bytes: usize,
+}
+
+impl Drop for RuntimeCommandQueueReservation {
+    fn drop(&mut self) {
+        let previous = self
+            .budget
+            .retained_bytes
+            .fetch_sub(self.retained_bytes, std::sync::atomic::Ordering::AcqRel);
+        debug_assert!(previous >= self.retained_bytes);
+    }
+}
+
+struct QueuedRuntimeCommand {
+    command: RuntimeCommand,
+    reservation: RuntimeCommandQueueReservation,
+}
+
+impl QueuedRuntimeCommand {
+    fn into_command(self) -> RuntimeCommand {
+        let Self {
+            command,
+            reservation,
+        } = self;
+        drop(reservation);
+        command
+    }
+}
+
+fn prepare_queued_command(
+    command: RuntimeCommand,
+    budget: &Arc<RuntimeCommandQueueBudget>,
+) -> anyhow::Result<QueuedRuntimeCommand> {
+    crate::command::validate_host_command(&command)?;
+    let retained_bytes = crate::command::runtime_command_retained_bytes(&command)?;
+    let reservation = budget.reserve(retained_bytes)?;
+    Ok(QueuedRuntimeCommand {
+        command,
+        reservation,
+    })
+}
+
 struct Worker {
-    command_rx: Receiver<RuntimeCommand>,
+    command_rx: Receiver<QueuedRuntimeCommand>,
     subscribers: Arc<Mutex<Vec<Subscriber>>>,
     batch: Duration,
     shell: CommandSpec,
@@ -628,6 +767,55 @@ struct ArchivedScrollback {
     exit_code: Option<u32>,
     /// zlib 압축된 스타일 보존 ANSI 덤프
     compressed: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveInflateError {
+    OutputLimit,
+    InvalidStream,
+}
+
+fn inflate_archived_bounded(
+    compressed: &[u8],
+    max_bytes: usize,
+) -> Result<Vec<u8>, ArchiveInflateError> {
+    use std::io::Read as _;
+
+    if max_bytes > MAX_ARCHIVED_SCROLLBACK_RESTORE_BYTES {
+        return Err(ArchiveInflateError::OutputLimit);
+    }
+    let mut decoder = flate2::read::ZlibDecoder::new(compressed);
+    let mut dump = Vec::with_capacity(compressed.len().min(max_bytes));
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        let remaining = max_bytes.saturating_sub(dump.len());
+        if remaining == 0 {
+            let mut overflow = [0_u8; 1];
+            match decoder.read(&mut overflow) {
+                Ok(0) => return Ok(dump),
+                Ok(_) => {
+                    dump.clear();
+                    dump.shrink_to_fit();
+                    return Err(ArchiveInflateError::OutputLimit);
+                }
+                Err(_) => {
+                    dump.clear();
+                    dump.shrink_to_fit();
+                    return Err(ArchiveInflateError::InvalidStream);
+                }
+            }
+        }
+        let read_cap = remaining.min(chunk.len());
+        match decoder.read(&mut chunk[..read_cap]) {
+            Ok(0) => return Ok(dump),
+            Ok(read) => dump.extend_from_slice(&chunk[..read]),
+            Err(_) => {
+                dump.clear();
+                dump.shrink_to_fit();
+                return Err(ArchiveInflateError::InvalidStream);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -755,6 +943,53 @@ impl MuxState {
 }
 
 impl Worker {
+    fn session_capacity_available(&self) -> bool {
+        self.sessions.len() < RUNTIME_SESSION_CAP
+    }
+
+    fn reject_invalid_command(&self, command: &RuntimeCommand) {
+        match command {
+            RuntimeCommand::SpawnAgent {
+                agent_config_id, ..
+            } => {
+                let correlation_id = agent_config_id
+                    .as_ref()
+                    .filter(|id| crate::command::agent_config_id_is_valid(id))
+                    .cloned()
+                    .map(AgentConfigCorrelationId::from_validated);
+                self.emit(RuntimeEvent::SpawnFailed {
+                    kind: SpawnKind::Agent,
+                    message: MessagePayload::new("runtime.spawn_failed.invalid_command"),
+                });
+                self.emit_agent_spawn_resolved(correlation_id, None);
+            }
+            RuntimeCommand::SpawnShell { .. } | RuntimeCommand::SplitPane { .. } => {
+                self.emit(RuntimeEvent::SpawnFailed {
+                    kind: SpawnKind::Shell,
+                    message: MessagePayload::new("runtime.spawn_failed.invalid_command"),
+                });
+            }
+            _ => tracing::warn!(
+                error_code = "runtime_command_invalid",
+                "runtime worker 명령 거부"
+            ),
+        }
+    }
+
+    fn reject_session_capacity(
+        &self,
+        kind: SpawnKind,
+        correlation_id: Option<AgentConfigCorrelationId>,
+    ) {
+        self.emit(RuntimeEvent::SpawnFailed {
+            kind,
+            message: MessagePayload::new("runtime.spawn_failed.session_limit"),
+        });
+        if matches!(kind, SpawnKind::Agent) {
+            self.emit_agent_spawn_resolved(correlation_id, None);
+        }
+    }
+
     /// Resolve one launch's complete logical-id set before any plaintext is moved into a process
     /// environment. Redaction registration is one checked atomic lease: a missing secret, unsafe
     /// legacy corpus, short value, or capacity failure leaves no partial lease and must block the
@@ -849,6 +1084,18 @@ impl Worker {
         rows: u16,
         scrollback_lines: usize,
     ) -> anyhow::Result<Session> {
+        crate::command::validate_host_command(&RuntimeCommand::SpawnShell {
+            cols,
+            rows,
+            scrollback_lines,
+        })?;
+        crate::command::validate_launch_spec_with_internal_env(
+            &spec.program,
+            &spec.args,
+            &spec.env,
+            spec.cwd.as_deref(),
+            "DEPPY_SESSION_ID",
+        )?;
         let worker_thread = std::thread::current();
         let output_wake: pty::PtyOutputWake = Arc::new(move || worker_thread.unpark());
         Session::spawn_with_spec_and_output_wake(
@@ -888,7 +1135,7 @@ impl Worker {
             while handled < COMMAND_BURST_CAP {
                 match self.command_rx.try_recv() {
                     Ok(command) => {
-                        self.handle_command(command);
+                        self.handle_command(command.into_command());
                         handled += 1;
                     }
                     Err(TryRecvError::Empty) => break,
@@ -909,7 +1156,7 @@ impl Worker {
                 // (codex P2). cap은 평시 PTY pump 공정성용이고, 종료 시엔 더 이상
                 // 새 명령이 들어오지 않아 큐가 유한하므로 전량 드레인이 안전하다.
                 while let Ok(command) = self.command_rx.try_recv() {
-                    self.handle_command(command);
+                    self.handle_command(command.into_command());
                 }
                 // 기존 recv_timeout 루프처럼 마지막 command batch 뒤 한 번은 pump해
                 // command 직후 도착한 PTY tail과 status/persistence를 반영하고 종료한다.
@@ -950,8 +1197,8 @@ impl Worker {
             for session in &all_sessions {
                 pipe.session_exited(*session);
             }
-            if let Err(e) = pipe.flush_async_writes() {
-                tracing::warn!("세션 영속 batch flush 실패 (shutdown): {e:#}");
+            if let Err(error) = pipe.flush_async_writes() {
+                trace_runtime_failure("persist_shutdown_flush", "persist_flush_failed", error);
             }
         }
         // 스크롤백 아카이브 flush (PR-A1): 미기록 exited + suspend로 죽는 running
@@ -1131,7 +1378,12 @@ impl Worker {
         }
     }
 
-    fn handle_command(&mut self, command: RuntimeCommand) {
+    fn handle_command(&mut self, mut command: RuntimeCommand) {
+        if crate::command::validate_host_command(&command).is_err() {
+            self.reject_invalid_command(&command);
+            return;
+        }
+        crate::command::canonicalize_host_command(&mut command);
         match command {
             RuntimeCommand::SpawnShell {
                 cols,
@@ -1145,6 +1397,10 @@ impl Worker {
                         kind: SpawnKind::Shell,
                         message: MessagePayload::new("runtime.spawn_failed.suspended"),
                     });
+                    return;
+                }
+                if !self.session_capacity_available() {
+                    self.reject_session_capacity(SpawnKind::Shell, None);
                     return;
                 }
                 let id = SessionId(self.next_id);
@@ -1198,12 +1454,16 @@ impl Worker {
                         self.emit(RuntimeEvent::ShellSpawned { session: id });
                         self.push_watched_viewports();
                     }
-                    Err(e) => self.emit(RuntimeEvent::SpawnFailed {
-                        kind: SpawnKind::Shell,
-                        message: MessagePayload::new("runtime.spawn_failed.shell")
-                            .arg("error", format!("{e:#}"))
-                            .diagnostic(format!("{e:#}")),
-                    }),
+                    Err(error) => {
+                        trace_runtime_failure("spawn_shell", "pty_spawn_failed", error);
+                        self.emit(RuntimeEvent::SpawnFailed {
+                            kind: SpawnKind::Shell,
+                            message: sanitized_spawn_failure(
+                                "runtime.spawn_failed.shell",
+                                "pty_spawn_failed",
+                            ),
+                        });
+                    }
                 }
             }
             RuntimeCommand::SpawnAgent {
@@ -1220,21 +1480,6 @@ impl Worker {
                 error_regex,
                 done_regex,
             } => {
-                if agent_config_id
-                    .as_deref()
-                    .is_some_and(|id| !crate::command::agent_config_id_is_valid(id))
-                {
-                    // Legacy/direct and remote clients can bypass RuntimeHost's
-                    // synchronous validation. Fail before secret lookup or
-                    // process spawn and never reflect the invalid id.
-                    self.emit(RuntimeEvent::SpawnFailed {
-                        kind: SpawnKind::Agent,
-                        message: MessagePayload::new(
-                            "runtime.spawn_failed.invalid_agent_config_id",
-                        ),
-                    });
-                    return;
-                }
                 let correlation_id = agent_config_id
                     .as_ref()
                     .map(|id| AgentConfigCorrelationId::from_validated(id.clone()));
@@ -1244,6 +1489,10 @@ impl Worker {
                         message: MessagePayload::new("runtime.spawn_failed.suspended"),
                     });
                     self.emit_agent_spawn_resolved(correlation_id, None);
+                    return;
+                }
+                if !self.session_capacity_available() {
+                    self.reject_session_capacity(SpawnKind::Agent, correlation_id);
                     return;
                 }
                 let mut env = env_plain;
@@ -1318,12 +1567,14 @@ impl Worker {
                         self.emit_agent_spawn_resolved(correlation_id, Some(id));
                         self.push_watched_viewports();
                     }
-                    Err(e) => {
+                    Err(error) => {
+                        trace_runtime_failure("spawn_agent", "pty_spawn_failed", error);
                         self.emit(RuntimeEvent::SpawnFailed {
                             kind: SpawnKind::Agent,
-                            message: MessagePayload::new("runtime.spawn_failed.agent")
-                                .arg("error", format!("{e:#}"))
-                                .diagnostic(format!("{e:#}")),
+                            message: sanitized_spawn_failure(
+                                "runtime.spawn_failed.agent",
+                                "pty_spawn_failed",
+                            ),
                         });
                         self.emit_agent_spawn_resolved(correlation_id, None);
                     }
@@ -1629,7 +1880,9 @@ impl Worker {
                     },
                 );
             }
-            Err(e) => tracing::warn!("세션 로그 열기 실패: {e:#}"),
+            Err(error) => {
+                trace_runtime_failure("session_log_open", "session_log_open_failed", error);
+            }
         }
     }
 
@@ -1642,14 +1895,14 @@ impl Worker {
             Ok(Some(size)) => return size,
             Ok(None) => {}
             Err(error) => {
-                tracing::warn!(persistent_id, "저장 터미널 크기 무시: {error:#}");
+                trace_runtime_failure("terminal_size_load", "terminal_size_load_failed", error)
             }
         }
 
         let path = match SessionLogWriter::ansi_path(logs_root, persistent_id) {
             Ok(path) => path,
             Err(error) => {
-                tracing::warn!(persistent_id, "복원 ANSI 로그 경로 거부: {error:#}");
+                trace_runtime_failure("ansi_path", "ansi_path_rejected", error);
                 return (DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS);
             }
         };
@@ -1663,7 +1916,11 @@ impl Worker {
                 (DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS)
             }
             Err(error) => {
-                tracing::warn!(persistent_id, path = %path.display(), "복원 터미널 너비 탐색 실패: {error}");
+                tracing::warn!(
+                    persistent_id,
+                    error_code = %io_error_code(&error),
+                    "복원 터미널 너비 탐색 실패"
+                );
                 (DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS)
             }
         }
@@ -1680,12 +1937,7 @@ impl Worker {
         if let Err(error) =
             SessionLogWriter::save_terminal_size(&self.logs_root, persistent_id, cols, rows)
         {
-            tracing::warn!(
-                persistent_id,
-                cols,
-                rows,
-                "터미널 크기 영속 실패: {error:#}"
-            );
+            trace_runtime_failure("terminal_size_save", "terminal_size_save_failed", error);
         }
     }
 
@@ -1707,33 +1959,53 @@ impl Worker {
     ) {
         let path = match SessionLogWriter::ansi_path(logs_root, persistent_id) {
             Ok(path) => path,
-            Err(e) => {
-                tracing::warn!(persistent_id, "복원 ANSI 로그 경로 거부: {e:#}");
+            Err(_) => {
+                tracing::warn!(
+                    persistent_id,
+                    error_code = "ansi_replay_path_rejected",
+                    "복원 ANSI 로그 경로 거부"
+                );
                 return;
             }
         };
-        let mut file = match std::fs::File::open(&path) {
-            Ok(file) => file,
+        let (mut file, snapshot_len) = match open_regular_snapshot(&path) {
+            Ok(opened) => opened,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
             Err(e) => {
-                tracing::warn!(persistent_id, path = %path.display(), "복원 ANSI 로그 열기 실패: {e}");
+                tracing::warn!(persistent_id, error_code = %io_error_code(&e), "복원 ANSI 로그 열기 실패");
                 return;
             }
         };
-        let replay_start = match seek_ansi_replay_tail(&mut file, MAX_ANSI_REPLAY_BYTES) {
+        // Storage compacts this file to the same 16MiB ceiling. Reject a hostile replacement
+        // instead of making the ANSI boundary scanner traverse attacker-controlled excess bytes.
+        if snapshot_len > MAX_ANSI_REPLAY_BYTES {
+            tracing::warn!(
+                persistent_id,
+                error_code = "ansi_replay_file_too_large",
+                "복원 ANSI 로그 거부"
+            );
+            return;
+        }
+        let replay_start = match seek_ansi_replay_tail(
+            &mut file,
+            snapshot_len,
+            MAX_ANSI_REPLAY_BYTES,
+        ) {
             Ok(start) => start,
             Err(e) => {
-                tracing::warn!(persistent_id, path = %path.display(), "복원 ANSI tail 탐색 실패: {e}");
+                tracing::warn!(persistent_id, error_code = %io_error_code(&e), "복원 ANSI tail 탐색 실패");
                 return;
             }
         };
-        match session.replay_ansi(&mut file) {
-            Ok(bytes) => {
+        let expected_bytes = snapshot_len.saturating_sub(replay_start);
+        let mut snapshot = std::io::Read::take(&mut file, expected_bytes);
+        match session.replay_ansi(&mut snapshot) {
+            Ok(bytes) if snapshot.limit() == 0 => {
                 if bytes > 0
                     && finish_boundary
                     && let Err(error) = session.finish_ansi_replay()
                 {
-                    tracing::warn!(persistent_id, "ANSI 복원 경계 초기화 실패: {error:#}");
+                    trace_runtime_failure("ansi_replay_finish", "ansi_replay_finish_failed", error);
                 }
                 tracing::info!(
                     persistent_id,
@@ -1742,7 +2014,16 @@ impl Worker {
                     "이전 ANSI scrollback 복원"
                 );
             }
-            Err(e) => tracing::warn!(persistent_id, "이전 ANSI scrollback 복원 실패: {e:#}"),
+            Ok(_) => tracing::warn!(
+                persistent_id,
+                error_code = "ansi_replay_short_read",
+                "이전 ANSI scrollback 복원 실패"
+            ),
+            Err(_) => tracing::warn!(
+                persistent_id,
+                error_code = "ansi_replay_read_failed",
+                "이전 ANSI scrollback 복원 실패"
+            ),
         }
     }
 
@@ -1784,6 +2065,11 @@ impl Worker {
         &self,
         id: SessionId,
     ) -> anyhow::Result<(CommandSpec, Vec<RedactionLease>)> {
+        crate::command::validate_env_entries_with_base(
+            &self.shell.env,
+            &self.default_env_plain,
+            &self.default_env_secrets,
+        )?;
         let mut spec = self.shell.clone();
         spec.env
             .push(("DEPPY_SESSION_ID".to_owned(), self.session_key(id)));
@@ -1905,6 +2191,12 @@ impl Worker {
     /// agent였던 pane은 respawn 대신 열람 전용 복원(PR-A2) — agent 재실행 금지는
     /// persistence 헤더의 안전 요구사항이고, 결과 화면 보존이 목적이다.
     fn restore_pane(&mut self, pane_state: &persist::PaneState) {
+        if !self.session_capacity_available() {
+            let pane = MuxPane::new(pane_state.id.clone(), pane_state.title.clone());
+            self.mux.panes.insert(pane_state.id.clone(), pane);
+            tracing::warn!(error_code = "runtime_session_limit", "복원 세션 상한 도달");
+            return;
+        }
         if let Some(persistent_id) = pane_state.session_id.as_deref() {
             let was_agent = self
                 .persist
@@ -1932,6 +2224,7 @@ impl Worker {
         let restored_cwd = pane_state
             .cwd
             .as_deref()
+            .filter(|cwd| crate::command::validate_runtime_path(std::path::Path::new(cwd)).is_ok())
             .map(std::path::PathBuf::from)
             .filter(|p| p.is_dir());
         if let Some(dir) = &restored_cwd {
@@ -2003,8 +2296,8 @@ impl Worker {
                 }
                 self.open_session_log(id);
             }
-            Err(e) => {
-                tracing::warn!(pane_id = %pane_state.id.0, "복원 중 셸 spawn 실패: {e:#}");
+            Err(error) => {
+                trace_runtime_failure("restore_shell_spawn", "pty_spawn_failed", error);
             }
         }
         self.mux.panes.insert(pane_state.id.clone(), pane);
@@ -2032,6 +2325,15 @@ impl Worker {
         let archived = match storage::scrollback_archive::open(&self.logs_root, persistent_id) {
             Ok(Some(mut stream)) => {
                 let meta = stream.meta;
+                if crate::command::validate_host_command(&RuntimeCommand::SpawnShell {
+                    cols: meta.cols,
+                    rows: meta.rows,
+                    scrollback_lines: meta.scrollback_lines as usize,
+                })
+                .is_err()
+                {
+                    return false;
+                }
                 let session = Session::restore_archived(
                     id,
                     archive_kind_from_u8(meta.kind),
@@ -2092,6 +2394,10 @@ impl Worker {
             });
             return;
         };
+        if !self.session_capacity_available() {
+            self.reject_session_capacity(SpawnKind::Shell, None);
+            return;
+        }
         let id = SessionId(self.next_id);
         self.next_id += 1;
         let (spec, redaction_leases) = match self.shell_with_session(id) {
@@ -2163,12 +2469,16 @@ impl Worker {
                 self.emit(RuntimeEvent::ShellSpawned { session: id });
                 self.push_watched_viewports();
             }
-            Err(e) => self.emit(RuntimeEvent::SpawnFailed {
-                kind: SpawnKind::Shell,
-                message: MessagePayload::new("runtime.spawn_failed.shell")
-                    .arg("error", format!("{e:#}"))
-                    .diagnostic(format!("{e:#}")),
-            }),
+            Err(error) => {
+                trace_runtime_failure("split_shell_spawn", "pty_spawn_failed", error);
+                self.emit(RuntimeEvent::SpawnFailed {
+                    kind: SpawnKind::Shell,
+                    message: sanitized_spawn_failure(
+                        "runtime.spawn_failed.shell",
+                        "pty_spawn_failed",
+                    ),
+                });
+            }
         }
     }
 
@@ -2250,7 +2560,11 @@ impl Worker {
                     let redacted = log.redactor.redact_chunk(chunk);
                     match log.append_redacted_output(&redacted) {
                         Ok(offset) => latest_offset = Some(offset),
-                        Err(e) => tracing::warn!("세션 로그 최종 기록 실패: {e:#}"),
+                        Err(error) => trace_runtime_failure(
+                            "session_log_final_append",
+                            "session_log_append_failed",
+                            error,
+                        ),
                     }
                 }
             });
@@ -2383,7 +2697,11 @@ impl Worker {
                     let redacted = log.redactor.redact_chunk(chunk);
                     match log.append_redacted_output(&redacted) {
                         Ok(offset) => log_offsets.push((active_id, offset)),
-                        Err(e) => tracing::warn!("세션 로그 기록 실패: {e:#}"),
+                        Err(error) => trace_runtime_failure(
+                            "session_log_append",
+                            "session_log_append_failed",
+                            error,
+                        ),
                     }
                 }
                 if let Some(detector) = detector.as_mut() {
@@ -2692,6 +3010,9 @@ impl Worker {
     /// 직렬화 미지원 백엔드(예: experimental ghostty)는 None.
     fn make_archive_entry(&self, live: &Session) -> Option<ArchivedScrollback> {
         let dump = live.serialize_scrollback()?;
+        if dump.len() > MAX_ARCHIVED_SCROLLBACK_RESTORE_BYTES {
+            return None;
+        }
         let footprint = live.cache_footprint();
         let exit_code = match live.lifecycle() {
             session::SessionLifecycle::Exited { exit_code } => exit_code,
@@ -2771,7 +3092,11 @@ impl Worker {
                 self.archived_on_disk.insert(session);
                 self.account_archive_write(written_len);
             }
-            Err(e) => tracing::warn!(session = session.0, "scrollback 아카이브 기록 실패: {e:#}"),
+            Err(error) => trace_runtime_failure(
+                "scrollback_archive_write",
+                "scrollback_archive_write_failed",
+                error,
+            ),
         }
     }
 
@@ -2784,9 +3109,13 @@ impl Worker {
         if archive_cache_needs_gc(self.archive_disk_bytes, written_len, budget) {
             match storage::scrollback_archive::gc(&self.logs_root, budget) {
                 Ok(total) => self.archive_disk_bytes = total,
-                Err(e) => {
+                Err(error) => {
                     // 스캔 실패 — 기록한 만큼은 반영해 undercount를 막는다 (다음 기록에서 재시도).
-                    tracing::warn!("scrollback 아카이브 GC 실패: {e:#}");
+                    trace_runtime_failure(
+                        "scrollback_archive_gc",
+                        "scrollback_archive_gc_failed",
+                        error,
+                    );
                     self.archive_disk_bytes = self.archive_disk_bytes.saturating_add(written_len);
                 }
             }
@@ -2799,11 +3128,18 @@ impl Worker {
     /// 메모리 아카이브 우선, 예산 축출로 내려갔으면 디스크 아카이브 폴백 (PR-A1).
     /// 복원된 세션은 다시 exited LRU의 최신 자리로 들어간다.
     fn inflate_archived(&mut self, session: SessionId) {
+        if !self.session_capacity_available() {
+            tracing::warn!(
+                error_code = "runtime_session_limit",
+                "아카이브 세션 복원 거부"
+            );
+            return;
+        }
         if let Some(entry) = self.archived.remove(&session) {
             self.archived_order.retain(|s| *s != session);
-            let mut dump = Vec::new();
-            let mut decoder = flate2::read::ZlibDecoder::new(entry.compressed.as_slice());
-            if std::io::Read::read_to_end(&mut decoder, &mut dump).is_ok() {
+            if let Ok(dump) =
+                inflate_archived_bounded(&entry.compressed, MAX_ARCHIVED_SCROLLBACK_RESTORE_BYTES)
+            {
                 self.insert_restored_session(
                     session,
                     entry.kind,
@@ -2834,6 +3170,19 @@ impl Worker {
         match storage::scrollback_archive::open(&self.logs_root, &key) {
             Ok(Some(mut stream)) => {
                 let meta = stream.meta;
+                if crate::command::validate_host_command(&RuntimeCommand::SpawnShell {
+                    cols: meta.cols,
+                    rows: meta.rows,
+                    scrollback_lines: meta.scrollback_lines as usize,
+                })
+                .is_err()
+                {
+                    tracing::warn!(
+                        error_code = "runtime_archive_meta_invalid",
+                        "디스크 아카이브 복원 거부"
+                    );
+                    return;
+                }
                 let restored = Session::restore_archived(
                     session,
                     archive_kind_from_u8(meta.kind),
@@ -2854,7 +3203,11 @@ impl Worker {
             Ok(None) => {
                 self.archived_on_disk.remove(&session);
             }
-            Err(e) => tracing::warn!(session = session.0, "디스크 아카이브 읽기 실패: {e:#}"),
+            Err(error) => trace_runtime_failure(
+                "scrollback_archive_open",
+                "scrollback_archive_open_failed",
+                error,
+            ),
         }
     }
 
@@ -2870,6 +3223,16 @@ impl Worker {
         exit_code: Option<u32>,
         dump: &[u8],
     ) {
+        if !self.session_capacity_available()
+            || crate::command::validate_host_command(&RuntimeCommand::SpawnShell {
+                cols,
+                rows,
+                scrollback_lines,
+            })
+            .is_err()
+        {
+            return;
+        }
         let mut reader = dump;
         let restored = Session::restore_archived(
             session,
@@ -2885,6 +3248,9 @@ impl Worker {
 
     /// 복원된 열람 전용 세션을 세션 테이블 + exited LRU에 편입한다.
     fn adopt_restored_session(&mut self, session: SessionId, restored: Session) {
+        if !self.session_capacity_available() {
+            return;
+        }
         self.sessions.insert(session, restored);
         self.exited_order.push_back(session);
     }
@@ -2923,15 +3289,82 @@ fn title_suffix(title: &str) -> Option<u64> {
 /// zsh ZLE의 기본 PROMPT_EOL_MARK redraw는 `%`를 역상으로 그린 뒤 정확히
 /// `COLUMNS - 1`개의 공백을 출력하고 CR로 되돌아온다. 이 raw ANSI 패턴의 가장
 /// 마지막 항목으로 `terminal.size` 도입 전 로그의 최종 열 수를 복구한다.
-fn infer_zsh_terminal_cols(path: &std::path::Path, max_bytes: u64) -> std::io::Result<Option<u16>> {
-    use std::io::{Read as _, Seek as _};
+fn io_error_code(error: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind;
 
-    let mut file = std::fs::File::open(path)?;
-    let len = file.metadata()?.len();
-    let start = len.saturating_sub(max_bytes);
-    file.seek(std::io::SeekFrom::Start(start))?;
-    let mut tail = Vec::with_capacity(usize::try_from(len - start).unwrap_or(0));
-    file.read_to_end(&mut tail)?;
+    match error.kind() {
+        ErrorKind::NotFound => "not_found",
+        ErrorKind::PermissionDenied => "permission_denied",
+        ErrorKind::InvalidData | ErrorKind::InvalidInput => "invalid_input",
+        ErrorKind::UnexpectedEof => "short_read",
+        _ => "io_failed",
+    }
+}
+
+fn bounded_input_error(code: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, code)
+}
+
+fn open_regular_snapshot(path: &std::path::Path) -> std::io::Result<(std::fs::File, u64)> {
+    let path_metadata = std::fs::symlink_metadata(path)?;
+    if !path_metadata.file_type().is_file() {
+        return Err(bounded_input_error("terminal_restore_not_regular"));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let file_metadata = file.metadata()?;
+    if !file_metadata.file_type().is_file() {
+        return Err(bounded_input_error("terminal_restore_not_regular"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if path_metadata.dev() != file_metadata.dev() || path_metadata.ino() != file_metadata.ino()
+        {
+            return Err(bounded_input_error("terminal_restore_replaced"));
+        }
+    }
+    Ok((file, file_metadata.len()))
+}
+
+fn read_tail_snapshot<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    snapshot_len: u64,
+    max_bytes: u64,
+) -> std::io::Result<Vec<u8>> {
+    let retained = snapshot_len.min(max_bytes);
+    let retained = usize::try_from(retained)
+        .map_err(|_| bounded_input_error("terminal_tail_limit_invalid"))?;
+    let start = snapshot_len.saturating_sub(max_bytes);
+    reader.seek(std::io::SeekFrom::Start(start))?;
+    let mut tail = vec![0_u8; retained];
+    reader.read_exact(&mut tail)?;
+    Ok(tail)
+}
+
+fn infer_zsh_terminal_cols(path: &std::path::Path, max_bytes: u64) -> std::io::Result<Option<u16>> {
+    if max_bytes > MAX_ANSI_GEOMETRY_SCAN_BYTES {
+        return Err(bounded_input_error("terminal_tail_limit_invalid"));
+    }
+    let (mut file, snapshot_len) = open_regular_snapshot(path)?;
+    let tail = read_tail_snapshot(&mut file, snapshot_len, max_bytes)?;
+    if file.metadata()?.len() < snapshot_len {
+        return Err(bounded_input_error("terminal_tail_shrank"));
+    }
     Ok(infer_zsh_terminal_cols_from_bytes(&tail))
 }
 
@@ -2967,14 +3400,25 @@ fn infer_zsh_terminal_cols_from_bytes(bytes: &[u8]) -> Option<u16> {
 
 /// ANSI tail cutoff를 UTF-8/escape 경계에 맞추고 ground-state newline 뒤를 우선한다.
 /// full-screen TUI처럼 LF 없이 CR/CSI만 쓰는 구간도 안전한 다음 경계부터 복원한다.
-fn seek_ansi_replay_tail(file: &mut std::fs::File, max_bytes: u64) -> std::io::Result<u64> {
-    let len = file.metadata()?.len();
-    if len <= max_bytes {
+fn seek_ansi_replay_tail(
+    file: &mut std::fs::File,
+    snapshot_len: u64,
+    max_bytes: u64,
+) -> std::io::Result<u64> {
+    if max_bytes > MAX_ANSI_REPLAY_BYTES {
+        return Err(bounded_input_error("ansi_replay_limit_invalid"));
+    }
+    if snapshot_len <= max_bytes {
         std::io::Seek::seek(file, std::io::SeekFrom::Start(0))?;
         return Ok(0);
     }
-    let cutoff = len.saturating_sub(max_bytes);
-    storage::seek_ansi_tail_boundary(file, cutoff, true)
+    let cutoff = snapshot_len.saturating_sub(max_bytes);
+    let start = storage::seek_ansi_tail_boundary_snapshot(file, cutoff, snapshot_len, true)?;
+    if start > snapshot_len || file.metadata()?.len() < snapshot_len {
+        return Err(bounded_input_error("ansi_replay_snapshot_changed"));
+    }
+    std::io::Seek::seek(file, std::io::SeekFrom::Start(start))?;
+    Ok(start)
 }
 
 /// exit 순서(오래된 것이 앞)에서 cap 초과분을 archive(backend drop) 대상으로 돌려준다
@@ -3032,6 +3476,208 @@ mod tests {
     use super::*;
     use crate::command::{SplitDirection, WorkspaceRuntimeState};
     use std::time::Instant;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber as TracingSubscriber};
+
+    #[derive(Clone)]
+    struct TraceCapture {
+        fields: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl TracingSubscriber for TraceCapture {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            event.record(&mut TraceVisitor {
+                fields: Arc::clone(&self.fields),
+            });
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    struct TraceVisitor {
+        fields: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Visit for TraceVisitor {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.fields
+                .lock()
+                .unwrap()
+                .push(format!("{}={value}", field.name()));
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .lock()
+                .unwrap()
+                .push(format!("{}={value:?}", field.name()));
+        }
+    }
+
+    fn zlib_bytes(input: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(input).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn memory_archive_inflate_accepts_exact_cap_and_rejects_plus_one() {
+        let exact = vec![b'x'; 4 * 1024];
+        assert_eq!(
+            inflate_archived_bounded(&zlib_bytes(&exact), exact.len()).unwrap(),
+            exact
+        );
+
+        let plus_one = vec![b'y'; 4 * 1024 + 1];
+        assert_eq!(
+            inflate_archived_bounded(&zlib_bytes(&plus_one), 4 * 1024),
+            Err(ArchiveInflateError::OutputLimit)
+        );
+        assert_eq!(
+            inflate_archived_bounded(&zlib_bytes(b""), MAX_ARCHIVED_SCROLLBACK_RESTORE_BYTES + 1),
+            Err(ArchiveInflateError::OutputLimit)
+        );
+    }
+
+    #[test]
+    fn failed_memory_archive_inflate_retains_no_partial_state() {
+        let oversized = zlib_bytes(&vec![b'z'; 1025]);
+        for _ in 0..128 {
+            assert_eq!(
+                inflate_archived_bounded(&oversized, 1024),
+                Err(ArchiveInflateError::OutputLimit)
+            );
+        }
+        assert_eq!(
+            inflate_archived_bounded(b"not-zlib", 1024),
+            Err(ArchiveInflateError::InvalidStream)
+        );
+        assert_eq!(
+            inflate_archived_bounded(&zlib_bytes(b"healthy"), 1024).unwrap(),
+            b"healthy"
+        );
+    }
+
+    #[test]
+    fn terminal_tail_snapshot_ignores_append_and_rejects_short_read() {
+        let snapshot = b"old-snapshot";
+        let mut grown = snapshot.to_vec();
+        grown.extend_from_slice(b"-concurrent-append");
+        let mut reader = std::io::Cursor::new(grown);
+        assert_eq!(
+            read_tail_snapshot(&mut reader, snapshot.len() as u64, 8).unwrap(),
+            &snapshot[snapshot.len() - 8..]
+        );
+
+        let mut short = std::io::Cursor::new(b"short".as_slice());
+        assert!(read_tail_snapshot(&mut short, 6, 6).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_restore_rejects_symlink_and_nonregular_input() {
+        use std::os::unix::fs::symlink;
+
+        let dir =
+            std::env::temp_dir().join(format!("deppy-runtime-tail-input-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.ansi");
+        let link = dir.join("link.ansi");
+        std::fs::write(&target, b"safe").unwrap();
+        let _ = std::fs::remove_file(&link);
+        symlink(&target, &link).unwrap();
+
+        assert!(infer_zsh_terminal_cols(&link, 4).is_err());
+        assert!(infer_zsh_terminal_cols(&dir, 4).is_err());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn terminal_restore_production_reads_remain_bounded() {
+        let production = include_str!("in_process.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        assert!(
+            !production.contains("read_to_end"),
+            "production terminal restore must not read to EOF into a growing Vec"
+        );
+        assert!(
+            production.contains("std::io::Read::take(&mut file, expected_bytes)"),
+            "ANSI replay must remain bounded to one metadata snapshot"
+        );
+        assert!(
+            production.contains("MAX_ARCHIVED_SCROLLBACK_RESTORE_BYTES"),
+            "memory archive restore must retain an explicit decompressed-byte ceiling"
+        );
+        #[cfg(unix)]
+        assert!(
+            production.contains("libc::O_NOFOLLOW | libc::O_NONBLOCK"),
+            "terminal restore must prevent symlink/FIFO swaps at open"
+        );
+    }
+
+    #[test]
+    fn runtime_failure_trace_uses_only_static_low_cardinality_fields() {
+        const MARKER: &str = "HOSTILE_RUNTIME_ERROR_PATH_COMMAND_MARKER";
+        let fields = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = TraceCapture {
+            fields: Arc::clone(&fields),
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            trace_runtime_failure("spawn_agent", "pty_spawn_failed", anyhow::anyhow!(MARKER));
+        });
+
+        let captured = fields.lock().unwrap().join("\n");
+        assert!(captured.contains("kind=runtime"), "{captured}");
+        assert!(captured.contains("phase=spawn_agent"), "{captured}");
+        assert!(
+            captured.contains("error_code=pty_spawn_failed"),
+            "{captured}"
+        );
+        assert!(!captured.contains(MARKER), "{captured}");
+    }
+
+    #[test]
+    fn production_runtime_diagnostics_never_format_raw_error_chains() {
+        let production = include_str!("in_process.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        for forbidden in [
+            "{e}",
+            "{e:#}",
+            "{error}",
+            "{error:#}",
+            ".arg(\"error\"",
+            ".arg(\"path\"",
+            ".arg(\"command\"",
+            ".diagnostic(format!",
+        ] {
+            assert!(!production.contains(forbidden), "found {forbidden}");
+        }
+        assert!(production.contains("trace_runtime_failure"));
+        assert!(production.contains("sanitized_spawn_failure"));
+    }
 
     struct RecordingResolver {
         calls: Mutex<Vec<String>>,
@@ -3069,6 +3715,234 @@ mod tests {
             };
             Ok(RuntimeSecret::new(value.to_owned()))
         }
+    }
+
+    fn admission_worker(
+        resolver: Arc<dyn RuntimeSecretResolver>,
+        name: &str,
+    ) -> (Worker, std::sync::mpsc::Receiver<RuntimeEvent>) {
+        let (_command_tx, command_rx) = sync_channel(1);
+        let (event_tx, event_rx) = sync_channel(16);
+        let subscribers = Arc::new(Mutex::new(vec![Subscriber {
+            events: event_tx,
+            overflowed: Arc::default(),
+            viewports: Arc::default(),
+            input_pressures: Arc::default(),
+            resource_usage: Arc::default(),
+            wake: None,
+            render_bound: false,
+        }]));
+        let logs_root = test_logs_root(name);
+        (
+            Worker {
+                command_rx,
+                subscribers,
+                batch: Duration::from_millis(5),
+                shell: spec("/bin/true", &[]),
+                default_env_plain: Vec::new(),
+                default_env_secrets: Vec::new(),
+                workspace_id: "workspace".to_owned(),
+                next_id: 1,
+                sessions: std::collections::HashMap::new(),
+                session_redaction_leases: std::collections::HashMap::new(),
+                seed_redaction_lease: None,
+                secret_resolver: resolver,
+                logs: std::collections::HashMap::new(),
+                detectors: std::collections::HashMap::new(),
+                status_overrides: std::collections::HashMap::new(),
+                run_logs_root: logs_root.join("run"),
+                logs_root,
+                redaction: RedactionService::new(),
+                mux: MuxState::new(),
+                tab_counter: 0,
+                persist: None,
+                exited_order: std::collections::VecDeque::new(),
+                max_exited_backends: DEFAULT_MAX_EXITED_BACKENDS,
+                cache_budget_bytes: TERMINAL_GLOBAL_CACHE_BUDGET_BYTES,
+                archived: std::collections::HashMap::new(),
+                archived_order: std::collections::VecDeque::new(),
+                archived_on_disk: std::collections::HashSet::new(),
+                archive_disk_bytes: 0,
+                hidden_scrollback: std::collections::HashSet::new(),
+                render_active: true,
+                suspended: false,
+                resource_monitor: ProcessResourceMonitor::new(
+                    ProcessResourceMonitorConfig::default(),
+                ),
+                pressured_sessions: std::collections::HashSet::new(),
+                remote_viewing: std::collections::HashMap::new(),
+                shutdown_requested: Arc::default(),
+            },
+            event_rx,
+        )
+    }
+
+    fn correlated_agent_command() -> RuntimeCommand {
+        RuntimeCommand::SpawnAgent {
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 100,
+            agent_config_id: Some("agent-correlation".to_owned()),
+            command: "/bin/true".to_owned(),
+            args: Vec::new(),
+            env_plain: Vec::new(),
+            env_secrets: vec![("TOKEN".to_owned(), "credential".to_owned())],
+            waiting_regex: None,
+            approval_regex: None,
+            error_regex: None,
+            done_regex: None,
+        }
+    }
+
+    #[test]
+    fn worker_defensively_rejects_invalid_agent_and_resolves_correlation_without_secret() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: Some("runtime-secret-value".to_owned()),
+        });
+        let (mut worker, event_rx) = admission_worker(resolver.clone(), "invalid-worker-command");
+        let mut command = correlated_agent_command();
+        let RuntimeCommand::SpawnAgent {
+            command: program, ..
+        } = &mut command
+        else {
+            unreachable!()
+        };
+        *program = "x".repeat(32 * 1024 + 1);
+
+        worker.handle_command(command);
+
+        assert!(resolver.calls.lock().unwrap().is_empty());
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SpawnFailed {
+                kind: SpawnKind::Agent,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::AgentSpawnResolved {
+                agent_config_id,
+                session: None,
+            } if agent_config_id.as_str() == "agent-correlation"
+        )));
+    }
+
+    #[test]
+    fn session_257_is_rejected_before_id_secret_or_spawn() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: Some("runtime-secret-value".to_owned()),
+        });
+        let (mut worker, event_rx) = admission_worker(resolver.clone(), "session-cap");
+        for raw_id in 1..=RUNTIME_SESSION_CAP {
+            let id = SessionId(raw_id as u64);
+            let mut empty = std::io::empty();
+            worker.sessions.insert(
+                id,
+                Session::restore_archived(
+                    id,
+                    session::SessionKind::Shell,
+                    1,
+                    1,
+                    0,
+                    Some(0),
+                    &mut empty,
+                ),
+            );
+        }
+        let next_id = worker.next_id;
+
+        for _ in 0..3 {
+            worker.handle_command(correlated_agent_command());
+        }
+
+        assert_eq!(worker.sessions.len(), RUNTIME_SESSION_CAP);
+        assert_eq!(worker.next_id, next_id);
+        assert!(resolver.calls.lock().unwrap().is_empty());
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    RuntimeEvent::AgentSpawnResolved { session: None, .. }
+                ))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn pane_title_storage_canonicalizes_256_huge_spare_allocations() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _event_rx) = admission_worker(resolver, "pane-title-capacity");
+        worker.subscribers.lock().unwrap().clear();
+
+        for index in 0..RUNTIME_SESSION_CAP {
+            let pane = MuxPaneId(format!("pane-{index}"));
+            worker
+                .mux
+                .panes
+                .insert(pane.clone(), MuxPane::new(pane.clone(), String::new()));
+            let mut title = String::with_capacity(64 * 1024);
+            title.push_str(&"x".repeat(4 * 1024));
+            worker.handle_command(RuntimeCommand::RenamePane { pane, title });
+        }
+
+        let retained = worker
+            .mux
+            .panes
+            .values()
+            .map(|pane| pane.title.capacity())
+            .sum::<usize>();
+        assert!(retained <= RUNTIME_SESSION_CAP * 4 * 1024);
+    }
+
+    #[test]
+    fn default_env_and_cwd_are_canonicalized_before_worker_storage() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, _event_rx) = admission_worker(resolver, "worker-state-capacity");
+        let mut env_plain = Vec::with_capacity(4_096);
+        let mut key = String::with_capacity(64 * 1024);
+        key.push_str("KEY");
+        let mut value = String::with_capacity(64 * 1024);
+        value.push_str("value");
+        env_plain.push((key, value));
+        worker.handle_command(RuntimeCommand::SetSessionDefaultEnv {
+            env_plain,
+            env_secrets: Vec::with_capacity(4_096),
+        });
+        assert_eq!(
+            worker.default_env_plain.capacity(),
+            worker.default_env_plain.len()
+        );
+        assert_eq!(
+            worker.default_env_plain[0].0.capacity(),
+            worker.default_env_plain[0].0.len()
+        );
+        assert_eq!(
+            worker.default_env_plain[0].1.capacity(),
+            worker.default_env_plain[0].1.len()
+        );
+        assert_eq!(worker.default_env_secrets.capacity(), 0);
+
+        let mut cwd = PathBuf::with_capacity(64 * 1024);
+        cwd.push("cwd");
+        worker.handle_command(RuntimeCommand::SetShellCwd(Some(cwd)));
+        let stored = worker.shell.cwd.as_ref().unwrap();
+        assert_eq!(
+            stored.capacity(),
+            stored.as_os_str().as_encoded_bytes().len()
+        );
     }
 
     #[test]
@@ -3271,9 +4145,11 @@ mod tests {
 
     #[test]
     fn in_process_command_queue_full은_err로_surface된다() {
-        let (tx, _rx) = sync_channel(1);
+        let (tx, rx) = sync_channel(1);
+        let command_budget = Arc::new(RuntimeCommandQueueBudget::default());
         let client = InProcessRuntimeClient {
             command_tx: Some(tx),
+            command_budget: Arc::clone(&command_budget),
             subscribers: Arc::default(),
             worker: None,
             worker_thread: None,
@@ -3284,12 +4160,129 @@ mod tests {
                 WorkspaceRuntimeState::Active,
             ))
             .unwrap();
+        let retained_after_first = command_budget.retained_bytes();
         let err = client
             .send_command(RuntimeCommand::SetWorkspaceState(
                 WorkspaceRuntimeState::Warm,
             ))
             .unwrap_err();
         assert!(err.to_string().contains("명령 큐 가득참"));
+        assert_eq!(command_budget.retained_bytes(), retained_after_first);
+        drop(rx);
+        assert_eq!(command_budget.retained_bytes(), 0);
+    }
+
+    #[test]
+    fn command_queue_byte_budget_accepts_exact_rejects_repeated_plus_one_and_recovers() {
+        let budget = Arc::new(RuntimeCommandQueueBudget::default());
+        let exact = budget.reserve(RUNTIME_COMMAND_QUEUE_BYTES_MAX).unwrap();
+        assert_eq!(budget.retained_bytes(), RUNTIME_COMMAND_QUEUE_BYTES_MAX);
+        for _ in 0..128 {
+            assert!(budget.reserve(1).is_err());
+            assert_eq!(budget.retained_bytes(), RUNTIME_COMMAND_QUEUE_BYTES_MAX);
+        }
+        drop(exact);
+        assert_eq!(budget.retained_bytes(), 0);
+
+        let command_overhead = std::mem::size_of::<RuntimeCommand>();
+        let payload_bytes = RUNTIME_COMMAND_QUEUE_BYTES_MAX / 2 - command_overhead;
+        let first = prepare_queued_command(
+            RuntimeCommand::WriteInput {
+                session: SessionId(1),
+                bytes: vec![0; payload_bytes],
+            },
+            &budget,
+        )
+        .unwrap();
+        let second = prepare_queued_command(
+            RuntimeCommand::WriteInput {
+                session: SessionId(1),
+                bytes: vec![0; payload_bytes],
+            },
+            &budget,
+        )
+        .unwrap();
+        assert_eq!(budget.retained_bytes(), RUNTIME_COMMAND_QUEUE_BYTES_MAX);
+        assert!(
+            prepare_queued_command(
+                RuntimeCommand::SetWorkspaceState(WorkspaceRuntimeState::Active),
+                &budget,
+            )
+            .is_err()
+        );
+        drop(first);
+        let recovered = prepare_queued_command(
+            RuntimeCommand::SetWorkspaceState(WorkspaceRuntimeState::Active),
+            &budget,
+        )
+        .unwrap();
+        drop(second);
+        drop(recovered);
+        assert_eq!(budget.retained_bytes(), 0);
+
+        let received = prepare_queued_command(
+            RuntimeCommand::SetWorkspaceState(WorkspaceRuntimeState::Warm),
+            &budget,
+        )
+        .unwrap();
+        assert!(budget.retained_bytes() > 0);
+        let command = received.into_command();
+        assert_eq!(budget.retained_bytes(), 0);
+        drop(command);
+    }
+
+    #[test]
+    fn every_runtime_sender_uses_the_shared_nonclone_byte_reservation() {
+        let production = include_str!("in_process.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        assert_eq!(
+            production.matches("prepare_queued_command(command").count(),
+            3
+        );
+        assert!(!production.contains("try_send(command)"));
+        assert!(!production.contains("#[derive(Clone)]\nstruct QueuedRuntimeCommand"));
+        assert!(production.contains("command.into_command()"));
+        let worker_handler = production.split("fn handle_command").nth(1).unwrap();
+        let validation = worker_handler
+            .find("validate_host_command(&command)")
+            .unwrap();
+        let canonicalization = worker_handler
+            .find("canonicalize_host_command(&mut command)")
+            .unwrap();
+        let dispatch = worker_handler.find("match command").unwrap();
+        assert!(validation < canonicalization && canonicalization < dispatch);
+    }
+
+    #[test]
+    fn command_sink_rejects_invalid_agent_before_queue_or_secret_resolution() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: Some("runtime-secret-value".to_owned()),
+        });
+        let mut client = InProcessRuntimeClient::try_new_with_resolver(
+            5,
+            resolver.clone(),
+            test_logs_root("invalid-command-sink"),
+            RedactionService::new(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        let mut invalid = correlated_agent_command();
+        let RuntimeCommand::SpawnAgent { command, .. } = &mut invalid else {
+            unreachable!()
+        };
+        *command = "x".repeat(32 * 1024 + 1);
+
+        client.command_sink().unwrap()(invalid);
+        std::thread::sleep(Duration::from_millis(25));
+
+        assert!(resolver.calls.lock().unwrap().is_empty());
+        assert_eq!(client.command_budget.retained_bytes(), 0);
+        client.shutdown();
     }
 
     /// 수신한 이벤트를 버리지 않고 모아두는 테스트 헬퍼 —
@@ -3344,7 +4337,7 @@ mod tests {
         // wake 배선이 없으면 marker는 2초 batch timeout 뒤에야 보인다. reader의
         // unpark가 연결되어 있으면 child의 150ms sleep 직후 도착해야 한다.
         let client = InProcessRuntimeClient::with_shell(
-            2_000,
+            1_000,
             test_store(),
             test_logs_root("output-wake-latency"),
             RedactionService::new(),
@@ -4027,12 +5020,13 @@ mod tests {
 
     #[test]
     fn spawn_실패_이벤트() {
+        const MARKER: &str = "HOSTILE_SPAWN_PATH_COMMAND_MARKER";
         let client = InProcessRuntimeClient::with_shell(
             5,
             test_store(),
             test_logs_root("nofail"),
             RedactionService::new(),
-            spec("/nonexistent-deppy-test-cmd", &[]),
+            spec(MARKER, &[]),
             None,
         );
         let mut probe = Probe::new(client.subscribe());
@@ -4043,13 +5037,17 @@ mod tests {
                 scrollback_lines: 100,
             })
             .unwrap();
-        probe.wait_for(Duration::from_secs(15), |e| match e {
+        let message = probe.wait_for(Duration::from_secs(15), |e| match e {
             RuntimeEvent::SpawnFailed {
                 kind: SpawnKind::Shell,
-                ..
-            } => Some(()),
+                message,
+            } => Some(message.clone()),
             _ => None,
         });
+        assert_eq!(message.message_id, "runtime.spawn_failed.shell");
+        assert_eq!(message.arg_value("error_code"), Some("pty_spawn_failed"));
+        assert_eq!(message.diagnostic.as_deref(), Some("pty_spawn_failed"));
+        assert!(!format!("{message:?}").contains(MARKER));
     }
 
     #[test]
@@ -4409,7 +5407,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_legacy_spawn_fails_without_correlation_or_secret_resolution() {
+    fn invalid_legacy_spawn_is_rejected_before_enqueue_or_secret_resolution() {
         let resolver = Arc::new(RecordingResolver {
             calls: Mutex::new(Vec::new()),
             value: Some("must-not-resolve".to_owned()),
@@ -4423,8 +5421,8 @@ mod tests {
             None,
         )
         .unwrap();
-        let mut probe = Probe::new(client.subscribe());
-        client
+        let events = client.subscribe();
+        let error = client
             .send_command(RuntimeCommand::SpawnAgent {
                 agent_config_id: Some(String::new()),
                 cols: 80,
@@ -4439,16 +5437,8 @@ mod tests {
                 error_regex: None,
                 done_regex: None,
             })
-            .unwrap();
-        probe.wait_for(Duration::from_secs(15), |event| match event {
-            RuntimeEvent::SpawnFailed { kind, message }
-                if *kind == SpawnKind::Agent
-                    && message.message_id == "runtime.spawn_failed.invalid_agent_config_id" =>
-            {
-                Some(())
-            }
-            _ => None,
-        });
+            .unwrap_err();
+        assert_eq!(error.to_string(), "runtime_command_spawn_agent_invalid");
         assert!(
             resolver
                 .calls
@@ -4456,7 +5446,7 @@ mod tests {
                 .expect("resolver calls lock")
                 .is_empty()
         );
-        assert!(!probe.seen.iter().any(|event| matches!(
+        assert!(!events.drain().iter().any(|event| matches!(
             event,
             RuntimeEvent::AgentSpawned { .. } | RuntimeEvent::AgentSpawnResolved { .. }
         )));
@@ -4744,42 +5734,25 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
-    fn oversized_input은_pressure_event로_surface된다() {
-        let client = InProcessRuntimeClient::with_shell(
+    fn oversized_input_is_rejected_before_the_pty_queue() {
+        let mut client = InProcessRuntimeClient::with_shell(
             5,
             test_store(),
             test_logs_root("input-pressure"),
             RedactionService::new(),
-            spec("/bin/cat", &[]),
+            pty::default_shell(),
             None,
         );
-        let mut probe = Probe::new(client.subscribe());
-        client
-            .send_command(RuntimeCommand::SpawnShell {
-                cols: 80,
-                rows: 24,
-                scrollback_lines: 100,
-            })
-            .unwrap();
-        let session = probe.wait_for(Duration::from_secs(15), |event| match event {
-            RuntimeEvent::ShellSpawned { session } => Some(*session),
-            _ => None,
-        });
-        client
-            .send_command(RuntimeCommand::WriteInput {
-                session,
-                bytes: vec![b'x'; pty::PtyInputQueuePolicy::default().max_bytes + 1],
-            })
-            .unwrap();
-        let pressure = probe.wait_for(Duration::from_secs(15), |event| match event {
-            RuntimeEvent::PtyInputPressure {
-                session: pressure_session,
-                pressure,
-            } if *pressure_session == session => Some(pressure.clone()),
-            _ => None,
-        });
-        assert_eq!(pressure.reason, pty::PtyInputRejectReason::PayloadTooLarge);
+        assert!(
+            client
+                .send_command(RuntimeCommand::WriteInput {
+                    session: SessionId(1),
+                    bytes: vec![b'x'; pty::PtyInputQueuePolicy::default().max_bytes + 1],
+                })
+                .is_err()
+        );
+        assert_eq!(client.command_budget.retained_bytes(), 0);
+        client.shutdown();
     }
 
     #[test]
@@ -4790,7 +5763,7 @@ mod tests {
             test_store(),
             test_logs_root("input-pressure-coalesce"),
             RedactionService::new(),
-            spec("/bin/cat", &[]),
+            spec("/bin/sh", &["-c", "sleep 30"]),
             None,
         );
         let rx = client.subscribe();
@@ -4807,14 +5780,22 @@ mod tests {
             _ => None,
         });
         probe.seen.clear();
-        let oversized = vec![b'x'; pty::PtyInputQueuePolicy::default().max_bytes + 1];
+        let saturated = vec![b'x'; pty::PtyInputQueuePolicy::default().max_bytes];
+        client
+            .send_command(RuntimeCommand::WriteInput {
+                session,
+                bytes: saturated.clone(),
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
         for _ in 0..8 {
             client
                 .send_command(RuntimeCommand::WriteInput {
                     session,
-                    bytes: oversized.clone(),
+                    bytes: saturated.clone(),
                 })
                 .unwrap();
+            std::thread::sleep(Duration::from_millis(20));
         }
         std::thread::sleep(Duration::from_millis(100));
         let events = probe.rx.drain();
@@ -6206,7 +7187,9 @@ mod tests {
         std::fs::write(&path, &data).unwrap();
 
         let mut file = std::fs::File::open(&path).unwrap();
-        let start = super::seek_ansi_replay_tail(&mut file, recent.len() as u64 + 8).unwrap();
+        let snapshot_len = file.metadata().unwrap().len();
+        let start =
+            super::seek_ansi_replay_tail(&mut file, snapshot_len, recent.len() as u64 + 8).unwrap();
         assert!(start > 0);
         let mut restored = Vec::new();
         file.read_to_end(&mut restored).unwrap();
@@ -6216,7 +7199,11 @@ mod tests {
         // full-screen TUI처럼 LF가 없는 giant 구간도 최근 tail은 보존한다.
         std::fs::write(&path, vec![b'x'; 128]).unwrap();
         let mut file = std::fs::File::open(&path).unwrap();
-        assert_eq!(super::seek_ansi_replay_tail(&mut file, 16).unwrap(), 112);
+        let snapshot_len = file.metadata().unwrap().len();
+        assert_eq!(
+            super::seek_ansi_replay_tail(&mut file, snapshot_len, 16).unwrap(),
+            112
+        );
         let mut restored = Vec::new();
         file.read_to_end(&mut restored).unwrap();
         assert_eq!(restored, vec![b'x'; 16]);
@@ -6230,8 +7217,14 @@ mod tests {
             .position(|window| window == b"VISIBLE")
             .unwrap();
         let mut file = std::fs::File::open(&path).unwrap();
+        let snapshot_len = file.metadata().unwrap().len();
         assert_eq!(
-            super::seek_ansi_replay_tail(&mut file, (data.len() - requested_start) as u64).unwrap(),
+            super::seek_ansi_replay_tail(
+                &mut file,
+                snapshot_len,
+                (data.len() - requested_start) as u64,
+            )
+            .unwrap(),
             visible_start as u64
         );
         let mut restored = Vec::new();
@@ -6242,8 +7235,13 @@ mod tests {
         std::fs::write(&path, data).unwrap();
         let requested_start = "old".len() + 1;
         let mut file = std::fs::File::open(&path).unwrap();
-        let start =
-            super::seek_ansi_replay_tail(&mut file, (data.len() - requested_start) as u64).unwrap();
+        let snapshot_len = file.metadata().unwrap().len();
+        let start = super::seek_ansi_replay_tail(
+            &mut file,
+            snapshot_len,
+            (data.len() - requested_start) as u64,
+        )
+        .unwrap();
         assert_eq!(start, "old한".len() as u64);
         let mut restored = Vec::new();
         file.read_to_end(&mut restored).unwrap();

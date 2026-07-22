@@ -4,9 +4,14 @@
 mod input_queue;
 mod process_identity;
 
+use std::collections::VecDeque;
+#[cfg(not(unix))]
 use std::io::{Read, Write};
-use std::sync::Arc;
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
+use std::sync::{Arc, Condvar, Mutex};
+
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use anyhow::Context;
 
@@ -18,6 +23,182 @@ pub use process_identity::{ProcessIdentity, ProcessIdentitySource};
 /// PTY reader가 새 출력 chunk를 채널에 넣은 직후 호출하는 coalescible wake callback.
 /// 런타임은 이를 worker thread `unpark`에 연결해 타이머 폴링 지연 없이 출력에 반응한다.
 pub type PtyOutputWake = Arc<dyn Fn() + Send + Sync>;
+
+const PTY_OUTPUT_QUEUE_CAPACITY: usize = 64;
+
+struct PtyOutputQueueState {
+    chunks: VecDeque<Vec<u8>>,
+    sender_closed: bool,
+    receiver_closed: bool,
+    cancelled: bool,
+    discard: bool,
+}
+
+struct PtyOutputQueue {
+    state: Mutex<PtyOutputQueueState>,
+    readable: Condvar,
+    writable: Condvar,
+}
+
+impl PtyOutputQueue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(PtyOutputQueueState {
+                chunks: VecDeque::with_capacity(PTY_OUTPUT_QUEUE_CAPACITY),
+                sender_closed: false,
+                receiver_closed: false,
+                cancelled: false,
+                discard: false,
+            }),
+            readable: Condvar::new(),
+            writable: Condvar::new(),
+        }
+    }
+
+    fn cancel(&self) {
+        let mut state = self.state.lock().expect("PTY output queue mutex");
+        state.cancelled = true;
+        state.chunks.clear();
+        self.readable.notify_all();
+        self.writable.notify_all();
+    }
+
+    /// Windows ConPTY close may synchronously wait for its output pipe to be drained. Disconnect
+    /// the public receiver and release bounded capacity while keeping the reader worker alive as a
+    /// zero-retention drain until ClosePseudoConsole returns.
+    #[cfg(any(windows, test))]
+    fn begin_discard(&self) {
+        let mut state = self.state.lock().expect("PTY output queue mutex");
+        state.discard = true;
+        state.chunks.clear();
+        self.readable.notify_all();
+        self.writable.notify_all();
+    }
+}
+
+struct PtyOutputSender {
+    queue: Arc<PtyOutputQueue>,
+}
+
+impl PtyOutputSender {
+    /// Bounded, lossless producer wait. Capacity is returned by the receiver with a Condvar
+    /// notification; teardown cancellation also wakes this wait without a timer or polling loop.
+    fn send(&self, chunk: Vec<u8>) -> Result<bool, Vec<u8>> {
+        let mut state = self.queue.state.lock().expect("PTY output queue mutex");
+        while state.chunks.len() == PTY_OUTPUT_QUEUE_CAPACITY
+            && !state.receiver_closed
+            && !state.cancelled
+            && !state.discard
+        {
+            state = self
+                .queue
+                .writable
+                .wait(state)
+                .expect("PTY output queue mutex");
+        }
+        if state.cancelled {
+            return Err(chunk);
+        }
+        if state.discard {
+            return Ok(false);
+        }
+        if state.receiver_closed {
+            return Err(chunk);
+        }
+        state.chunks.push_back(chunk);
+        self.queue.readable.notify_one();
+        Ok(true)
+    }
+}
+
+impl Drop for PtyOutputSender {
+    fn drop(&mut self) {
+        let mut state = self.queue.state.lock().expect("PTY output queue mutex");
+        state.sender_closed = true;
+        self.queue.readable.notify_all();
+    }
+}
+
+/// Bounded PTY output receiver. It intentionally exposes only the receive operations used by the
+/// session pump and tests, keeping the portable-pty and queue implementation inside this crate.
+pub struct PtyOutputReceiver {
+    queue: Arc<PtyOutputQueue>,
+}
+
+impl PtyOutputReceiver {
+    /// Permanently disconnected receiver for restored/read-only sessions that have no live PTY.
+    pub fn disconnected() -> Self {
+        let (sender, receiver, _) = pty_output_channel();
+        drop(sender);
+        receiver
+    }
+
+    pub fn try_recv(&self) -> Result<Vec<u8>, TryRecvError> {
+        let mut state = self.queue.state.lock().expect("PTY output queue mutex");
+        if let Some(chunk) = state.chunks.pop_front() {
+            self.queue.writable.notify_one();
+            return Ok(chunk);
+        }
+        if state.sender_closed || state.cancelled || state.discard {
+            Err(TryRecvError::Disconnected)
+        } else {
+            Err(TryRecvError::Empty)
+        }
+    }
+
+    pub fn recv_timeout(&self, timeout: std::time::Duration) -> Result<Vec<u8>, RecvTimeoutError> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = self.queue.state.lock().expect("PTY output queue mutex");
+        loop {
+            if let Some(chunk) = state.chunks.pop_front() {
+                self.queue.writable.notify_one();
+                return Ok(chunk);
+            }
+            if state.sender_closed || state.cancelled || state.discard {
+                return Err(RecvTimeoutError::Disconnected);
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(RecvTimeoutError::Timeout);
+            }
+            let (next, wait) = self
+                .queue
+                .readable
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .expect("PTY output queue mutex");
+            state = next;
+            if wait.timed_out() && state.chunks.is_empty() {
+                return if state.sender_closed || state.cancelled || state.discard {
+                    Err(RecvTimeoutError::Disconnected)
+                } else {
+                    Err(RecvTimeoutError::Timeout)
+                };
+            }
+        }
+    }
+}
+
+impl Drop for PtyOutputReceiver {
+    fn drop(&mut self) {
+        let mut state = self.queue.state.lock().expect("PTY output queue mutex");
+        state.receiver_closed = true;
+        state.chunks.clear();
+        self.queue.writable.notify_all();
+    }
+}
+
+fn pty_output_channel() -> (PtyOutputSender, PtyOutputReceiver, Arc<PtyOutputQueue>) {
+    let queue = Arc::new(PtyOutputQueue::new());
+    (
+        PtyOutputSender {
+            queue: Arc::clone(&queue),
+        },
+        PtyOutputReceiver {
+            queue: Arc::clone(&queue),
+        },
+        queue,
+    )
+}
 
 /// 실행할 프로그램. portable-pty CommandBuilder를 노출하지 않기 위한 최소 스펙.
 /// env 값에 secret 평문이 올 수 있다 — 절대 로그에 찍지 말 것 (Debug 미구현 이유).
@@ -54,7 +235,7 @@ pub trait PtyBackend {
 pub trait PtySession: Send {
     /// dedicated reader thread가 채우는 출력 채널. 최초 1회만 Some.
     /// 채널 disconnect는 EOF(프로세스 종료 또는 PTY 닫힘)를 뜻한다.
-    fn take_output(&mut self) -> Option<Receiver<Vec<u8>>>;
+    fn take_output(&mut self) -> Option<PtyOutputReceiver>;
     fn process_identity(&self) -> ProcessIdentity;
     fn write_input(&mut self, bytes: &[u8]) -> anyhow::Result<PtyInputEnqueueResult>;
     /// 입력 큐가 비었는가 — backpressure 해소 이벤트 판정용(2026-07-09).
@@ -66,6 +247,60 @@ pub trait PtySession: Send {
 
 pub struct PortablePtyBackend;
 
+#[cfg(test)]
+#[derive(Default)]
+struct TestWorkerLiveness {
+    readers: std::sync::atomic::AtomicUsize,
+    writers: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TestWorkerSpawnFailure {
+    None,
+    Reader,
+    Writer,
+}
+
+#[cfg(test)]
+enum TestWorkerKind {
+    Reader,
+    Writer,
+}
+
+#[cfg(test)]
+struct TestWorkerGuard {
+    liveness: Option<Arc<TestWorkerLiveness>>,
+    kind: TestWorkerKind,
+}
+
+#[cfg(test)]
+impl TestWorkerGuard {
+    fn new(liveness: Option<Arc<TestWorkerLiveness>>, kind: TestWorkerKind) -> Self {
+        if let Some(liveness) = &liveness {
+            let counter = match kind {
+                TestWorkerKind::Reader => &liveness.readers,
+                TestWorkerKind::Writer => &liveness.writers,
+            };
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Self { liveness, kind }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestWorkerGuard {
+    fn drop(&mut self) {
+        if let Some(liveness) = &self.liveness {
+            let counter = match self.kind {
+                TestWorkerKind::Reader => &liveness.readers,
+                TestWorkerKind::Writer => &liveness.writers,
+            };
+            counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
 impl PortablePtyBackend {
     /// 출력 도착 wake가 필요한 런타임용 spawn. 일반 소비자는 [`PtyBackend::spawn`]을 써도 된다.
     pub fn spawn_with_output_wake(
@@ -75,7 +310,16 @@ impl PortablePtyBackend {
         rows: u16,
         output_wake: PtyOutputWake,
     ) -> anyhow::Result<Box<dyn PtySession>> {
-        self.spawn_impl(cmd, cols, rows, Some(output_wake))
+        self.spawn_impl(
+            cmd,
+            cols,
+            rows,
+            Some(output_wake),
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            TestWorkerSpawnFailure::None,
+        )
     }
 
     fn spawn_impl(
@@ -84,6 +328,8 @@ impl PortablePtyBackend {
         cols: u16,
         rows: u16,
         output_wake: Option<PtyOutputWake>,
+        #[cfg(test)] worker_liveness: Option<Arc<TestWorkerLiveness>>,
+        #[cfg(test)] worker_spawn_failure: TestWorkerSpawnFailure,
     ) -> anyhow::Result<Box<dyn PtySession>> {
         let pair = portable_pty::native_pty_system()
             .openpty(pty_size(cols, rows))
@@ -136,100 +382,681 @@ impl PortablePtyBackend {
         if let Some(cwd) = &cmd.cwd {
             builder.cwd(cwd);
         }
+        #[cfg(windows)]
+        let session = spawn_windows_session(
+            pair.master,
+            pair.slave,
+            builder,
+            &cmd.program,
+            output_wake,
+            #[cfg(test)]
+            worker_liveness,
+            #[cfg(test)]
+            worker_spawn_failure,
+        )?;
+
+        #[cfg(not(windows))]
         let child = pair
             .slave
             .spawn_command(builder)
             .with_context(|| format!("셸 실행 실패: {}", cmd.program))?;
         // 설계문서 1.2 리스크 3: slave가 master보다 오래 살면 handle 파괴가
         // 비결정적 — spawn 직후 즉시 drop한다.
+        #[cfg(not(windows))]
         drop(pair.slave);
 
-        // 여기부터 실패하면 child가 orphan으로 남는다 — 실패 경로에서 정리 (codex P2)
-        let mut child = child;
-        let mut reader = match pair.master.try_clone_reader() {
-            Ok(reader) => reader,
-            Err(e) => {
-                kill_and_reap_bounded(&mut child);
-                return Err(e).context("PTY reader 생성 실패");
-            }
-        };
-        let mut writer = match pair.master.take_writer() {
-            Ok(writer) => writer,
-            Err(e) => {
-                kill_and_reap_bounded(&mut child);
-                return Err(e).context("PTY writer 생성 실패");
-            }
-        };
+        // 여기부터 실패하면 child가 orphan으로 남는다 — 플랫폼 worker 구성도 child와
+        // 이미 시작한 thread를 모두 동기 정리한 뒤 오류를 반환한다.
+        #[cfg(unix)]
+        let session = spawn_unix_session(
+            pair.master,
+            child,
+            output_wake,
+            #[cfg(test)]
+            worker_liveness,
+            #[cfg(test)]
+            worker_spawn_failure,
+        )?;
+        #[cfg(all(not(unix), not(windows)))]
+        let session = spawn_other_session(
+            pair.master,
+            child,
+            output_wake,
+            #[cfg(test)]
+            worker_liveness,
+            #[cfg(test)]
+            worker_spawn_failure,
+        )?;
+        Ok(Box::new(session))
+    }
+}
 
-        // bounded 채널: 소비가 느리면 reader thread가 send에서 블록 → PTY 버퍼가
-        // 차고 child가 write에서 멈추는 표준 backpressure. 무한 메모리 증가 방지.
-        let (tx, rx) = sync_channel(64);
-        let reader_thread =
-            std::thread::Builder::new()
-                .name("pty-reader".into())
-                .spawn(move || {
-                    let mut buf = [0u8; 8192];
-                    loop {
-                        match reader.read(&mut buf) {
-                            Ok(0) | Err(_) => break, // EOF → 채널 drop으로 종료 전파
-                            Ok(n) => {
-                                if tx.send(buf[..n].to_vec()).is_err() {
-                                    break; // 수신측이 사라짐
-                                }
-                                // send 뒤 호출해야 worker가 깨났을 때 chunk가 반드시 보인다.
-                                // Thread::unpark 토큰은 자연스럽게 1개로 합쳐져 출력 폭주에도
-                                // wake queue나 메모리가 늘지 않는다.
+type MasterPtyBox = Box<dyn portable_pty::MasterPty + Send>;
+#[cfg(windows)]
+type SlavePtyBox = Box<dyn portable_pty::SlavePty + Send>;
+type ChildPtyBox = Box<dyn portable_pty::Child + Send + Sync>;
+
+#[cfg(unix)]
+fn spawn_unix_session(
+    master: MasterPtyBox,
+    mut child: ChildPtyBox,
+    output_wake: Option<PtyOutputWake>,
+    #[cfg(test)] worker_liveness: Option<Arc<TestWorkerLiveness>>,
+    #[cfg(test)] worker_spawn_failure: TestWorkerSpawnFailure,
+) -> anyhow::Result<PortablePtySession> {
+    let process_group = master.process_group_leader();
+    let io = (|| -> anyhow::Result<_> {
+        let raw_fd = master
+            .as_raw_fd()
+            .context("PTY master raw descriptor 없음")?;
+        let reader = duplicate_nonblocking_fd(raw_fd).context("PTY reader descriptor 생성 실패")?;
+        let writer = duplicate_nonblocking_fd(raw_fd).context("PTY writer descriptor 생성 실패")?;
+        let (reader_cancel_read, reader_cancel_write) =
+            cancellation_pipe().context("PTY reader cancellation pipe 생성 실패")?;
+        let (writer_cancel_read, writer_cancel_write) =
+            cancellation_pipe().context("PTY writer cancellation pipe 생성 실패")?;
+        Ok((
+            reader,
+            writer,
+            reader_cancel_read,
+            reader_cancel_write,
+            writer_cancel_read,
+            writer_cancel_write,
+        ))
+    })();
+    let (
+        reader,
+        writer,
+        reader_cancel_read,
+        reader_cancel_write,
+        writer_cancel_read,
+        writer_cancel_write,
+    ) = match io {
+        Ok(io) => io,
+        Err(error) => {
+            drop(master);
+            kill_and_reap_bounded(&mut child);
+            return Err(error);
+        }
+    };
+
+    let (output_tx, output_rx, output_queue) = pty_output_channel();
+    #[cfg(test)]
+    let reader_liveness = worker_liveness.clone();
+    let reader_spawn = || {
+        std::thread::Builder::new()
+            .name("pty-reader".into())
+            .spawn(move || {
+                #[cfg(test)]
+                let _live = TestWorkerGuard::new(reader_liveness, TestWorkerKind::Reader);
+                unix_reader_loop(reader, reader_cancel_read, output_tx, output_wake);
+            })
+    };
+    #[cfg(test)]
+    let reader_thread = if worker_spawn_failure == TestWorkerSpawnFailure::Reader {
+        Err(std::io::Error::other("injected PTY reader spawn failure"))
+    } else {
+        reader_spawn()
+    };
+    #[cfg(not(test))]
+    let reader_thread = reader_spawn();
+    let reader_thread = match reader_thread {
+        Ok(thread) => thread,
+        Err(error) => {
+            drop(master);
+            kill_and_reap_bounded(&mut child);
+            return Err(error).context("PTY reader thread 생성 실패");
+        }
+    };
+
+    let input_policy = PtyInputQueuePolicy::default();
+    let input_queue = input_queue::PtyInputQueueState::new(input_policy);
+    let writer_queue = input_queue.clone();
+    let (input_tx, input_rx) = sync_channel::<Vec<u8>>(input_policy.max_messages.max(1));
+    #[cfg(test)]
+    let writer_liveness = worker_liveness;
+    let writer_spawn = || {
+        std::thread::Builder::new()
+            .name("pty-writer".into())
+            .spawn(move || {
+                #[cfg(test)]
+                let _live = TestWorkerGuard::new(writer_liveness, TestWorkerKind::Writer);
+                unix_writer_loop(writer, writer_cancel_read, input_rx, writer_queue);
+            })
+    };
+    #[cfg(test)]
+    let writer_thread = if worker_spawn_failure == TestWorkerSpawnFailure::Writer {
+        Err(std::io::Error::other("injected PTY writer spawn failure"))
+    } else {
+        writer_spawn()
+    };
+    #[cfg(not(test))]
+    let writer_thread = writer_spawn();
+    let writer_thread = match writer_thread {
+        Ok(thread) => thread,
+        Err(error) => {
+            drop(input_tx);
+            output_queue.cancel();
+            signal_cancellation(&reader_cancel_write);
+            signal_cancellation(&writer_cancel_write);
+            drop(master);
+            kill_and_reap_bounded(&mut child);
+            join_worker(Some(reader_thread), "reader");
+            return Err(error).context("PTY writer thread 생성 실패");
+        }
+    };
+
+    Ok(PortablePtySession {
+        master: Some(master),
+        input_tx: Some(input_tx),
+        input_queue,
+        child,
+        output: Some(output_rx),
+        output_queue,
+        reader_thread: Some(reader_thread),
+        writer_thread: Some(writer_thread),
+        reader_cancel: Some(reader_cancel_write),
+        writer_cancel: Some(writer_cancel_write),
+        process_group,
+    })
+}
+
+#[cfg(windows)]
+fn spawn_windows_session(
+    master: MasterPtyBox,
+    slave: SlavePtyBox,
+    builder: portable_pty::CommandBuilder,
+    program: &str,
+    output_wake: Option<PtyOutputWake>,
+    #[cfg(test)] worker_liveness: Option<Arc<TestWorkerLiveness>>,
+    #[cfg(test)] worker_spawn_failure: TestWorkerSpawnFailure,
+) -> anyhow::Result<PortablePtySession> {
+    // Establish the output drain before attaching a child. On pre-24H2 Windows,
+    // ClosePseudoConsole can block until its output pipe is drained; once a child exists every
+    // subsequent failure path must therefore retain this reader through the HPCON close.
+    let mut reader = master.try_clone_reader().context("PTY reader 생성 실패")?;
+    let (output_tx, output_rx, output_queue) = pty_output_channel();
+    #[cfg(test)]
+    let reader_liveness = worker_liveness.clone();
+    let reader_spawn = || {
+        std::thread::Builder::new()
+            .name("pty-reader".into())
+            .spawn(move || {
+                #[cfg(test)]
+                let _live = TestWorkerGuard::new(reader_liveness, TestWorkerKind::Reader);
+                let mut buf = [0u8; 8192];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => match output_tx.send(buf[..n].to_vec()) {
+                            Ok(true) => {
                                 if let Some(wake) = &output_wake {
                                     wake();
                                 }
                             }
-                        }
+                            Ok(false) => {}
+                            Err(_) => break,
+                        },
                     }
-                });
-        if let Err(e) = reader_thread {
-            kill_and_reap_bounded(&mut child);
-            return Err(e).context("PTY reader thread 생성 실패");
+                }
+            })
+    };
+    #[cfg(test)]
+    let reader_thread = if worker_spawn_failure == TestWorkerSpawnFailure::Reader {
+        Err(std::io::Error::other("injected PTY reader spawn failure"))
+    } else {
+        reader_spawn()
+    };
+    #[cfg(not(test))]
+    let reader_thread = reader_spawn();
+    let reader_thread = match reader_thread {
+        Ok(thread) => thread,
+        Err(error) => {
+            // No child was attached, so ClosePseudoConsole has no client/output drain dependency.
+            drop(slave);
+            drop(master);
+            return Err(error).context("PTY reader thread 생성 실패");
         }
+    };
 
-        // 입력 전용 writer thread — write_input은 try_send만 하고 즉시 리턴.
-        // byte/message budget으로 무한 누적을 막되 writer thread가 blocking write를
-        // 소유하므로 runtime worker와 reader backpressure가 맞물린 deadlock은 피한다.
-        let input_policy = PtyInputQueuePolicy::default();
-        let input_queue = input_queue::PtyInputQueueState::new(input_policy);
-        let writer_queue = input_queue.clone();
-        let (input_tx, input_rx) = sync_channel::<Vec<u8>>(input_policy.max_messages.max(1));
-        let writer_thread =
-            std::thread::Builder::new()
-                .name("pty-writer".into())
-                .spawn(move || {
-                    for bytes in input_rx {
-                        let len = bytes.len();
-                        if writer
-                            .write_all(&bytes)
-                            .and_then(|()| writer.flush())
-                            .is_err()
-                        {
-                            // PTY가 닫힘 — 세션 종료 경로가 곧 정리한다
-                            tracing::debug!("PTY 입력 쓰기 실패 — writer 종료");
-                            writer_queue.complete(len);
-                            break;
-                        }
+    let mut child = match slave.spawn_command(builder) {
+        Ok(child) => child,
+        Err(error) => {
+            drop(slave);
+            output_queue.begin_discard();
+            drop(master);
+            output_queue.cancel();
+            cancel_windows_synchronous_io(&reader_thread);
+            join_worker(Some(reader_thread), "reader");
+            return Err(error).with_context(|| format!("셸 실행 실패: {program}"));
+        }
+    };
+    drop(slave);
+
+    let mut writer = match master.take_writer() {
+        Ok(writer) => writer,
+        Err(error) => {
+            output_queue.begin_discard();
+            kill_and_reap_bounded(&mut child);
+            drop(master);
+            output_queue.cancel();
+            cancel_windows_synchronous_io(&reader_thread);
+            join_worker(Some(reader_thread), "reader");
+            return Err(error).context("PTY writer 생성 실패");
+        }
+    };
+
+    let input_policy = PtyInputQueuePolicy::default();
+    let input_queue = input_queue::PtyInputQueueState::new(input_policy);
+    let writer_queue = input_queue.clone();
+    let (input_tx, input_rx) = sync_channel::<Vec<u8>>(input_policy.max_messages.max(1));
+    #[cfg(test)]
+    let writer_liveness = worker_liveness;
+    let writer_spawn = || {
+        std::thread::Builder::new()
+            .name("pty-writer".into())
+            .spawn(move || {
+                #[cfg(test)]
+                let _live = TestWorkerGuard::new(writer_liveness, TestWorkerKind::Writer);
+                for bytes in input_rx {
+                    let len = bytes.len();
+                    if writer
+                        .write_all(&bytes)
+                        .and_then(|()| writer.flush())
+                        .is_err()
+                    {
+                        tracing::debug!("PTY 입력 쓰기 실패 — writer 종료");
                         writer_queue.complete(len);
+                        break;
                     }
-                    writer_queue.close();
-                });
-        if let Err(e) = writer_thread {
+                    writer_queue.complete(len);
+                }
+                writer_queue.close();
+            })
+    };
+    #[cfg(test)]
+    let writer_thread = if worker_spawn_failure == TestWorkerSpawnFailure::Writer {
+        Err(std::io::Error::other("injected PTY writer spawn failure"))
+    } else {
+        writer_spawn()
+    };
+    #[cfg(not(test))]
+    let writer_thread = writer_spawn();
+    let writer_thread = match writer_thread {
+        Ok(thread) => thread,
+        Err(error) => {
+            drop(input_tx);
+            output_queue.begin_discard();
             kill_and_reap_bounded(&mut child);
-            return Err(e).context("PTY writer thread 생성 실패");
+            drop(master);
+            output_queue.cancel();
+            cancel_windows_synchronous_io(&reader_thread);
+            join_worker(Some(reader_thread), "reader");
+            return Err(error).context("PTY writer thread 생성 실패");
         }
+    };
 
-        Ok(Box::new(PortablePtySession {
-            master: pair.master,
-            input_tx: Some(input_tx),
-            input_queue,
-            child,
-            output: Some(rx),
-        }))
+    Ok(PortablePtySession {
+        master: Some(master),
+        input_tx: Some(input_tx),
+        input_queue,
+        child,
+        output: Some(output_rx),
+        output_queue,
+        reader_thread: Some(reader_thread),
+        writer_thread: Some(writer_thread),
+    })
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn spawn_other_session(
+    master: MasterPtyBox,
+    mut child: ChildPtyBox,
+    output_wake: Option<PtyOutputWake>,
+    #[cfg(test)] worker_liveness: Option<Arc<TestWorkerLiveness>>,
+    #[cfg(test)] worker_spawn_failure: TestWorkerSpawnFailure,
+) -> anyhow::Result<PortablePtySession> {
+    let mut reader = match master.try_clone_reader() {
+        Ok(reader) => reader,
+        Err(error) => {
+            drop(master);
+            kill_and_reap_bounded(&mut child);
+            return Err(error).context("PTY reader 생성 실패");
+        }
+    };
+    let mut writer = match master.take_writer() {
+        Ok(writer) => writer,
+        Err(error) => {
+            drop(master);
+            kill_and_reap_bounded(&mut child);
+            return Err(error).context("PTY writer 생성 실패");
+        }
+    };
+
+    let (output_tx, output_rx, output_queue) = pty_output_channel();
+    #[cfg(test)]
+    let reader_liveness = worker_liveness.clone();
+    let reader_spawn = || {
+        std::thread::Builder::new()
+            .name("pty-reader".into())
+            .spawn(move || {
+                #[cfg(test)]
+                let _live = TestWorkerGuard::new(reader_liveness, TestWorkerKind::Reader);
+                let mut buf = [0u8; 8192];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => match output_tx.send(buf[..n].to_vec()) {
+                            Ok(true) => {
+                                if let Some(wake) = &output_wake {
+                                    wake();
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(_) => break,
+                        },
+                    }
+                }
+            })
+    };
+    #[cfg(test)]
+    let reader_thread = if worker_spawn_failure == TestWorkerSpawnFailure::Reader {
+        Err(std::io::Error::other("injected PTY reader spawn failure"))
+    } else {
+        reader_spawn()
+    };
+    #[cfg(not(test))]
+    let reader_thread = reader_spawn();
+    let reader_thread = match reader_thread {
+        Ok(thread) => thread,
+        Err(error) => {
+            drop(master);
+            kill_and_reap_bounded(&mut child);
+            return Err(error).context("PTY reader thread 생성 실패");
+        }
+    };
+
+    let input_policy = PtyInputQueuePolicy::default();
+    let input_queue = input_queue::PtyInputQueueState::new(input_policy);
+    let writer_queue = input_queue.clone();
+    let (input_tx, input_rx) = sync_channel::<Vec<u8>>(input_policy.max_messages.max(1));
+    #[cfg(test)]
+    let writer_liveness = worker_liveness;
+    let writer_spawn = || {
+        std::thread::Builder::new()
+            .name("pty-writer".into())
+            .spawn(move || {
+                #[cfg(test)]
+                let _live = TestWorkerGuard::new(writer_liveness, TestWorkerKind::Writer);
+                for bytes in input_rx {
+                    let len = bytes.len();
+                    if writer
+                        .write_all(&bytes)
+                        .and_then(|()| writer.flush())
+                        .is_err()
+                    {
+                        tracing::debug!("PTY 입력 쓰기 실패 — writer 종료");
+                        writer_queue.complete(len);
+                        break;
+                    }
+                    writer_queue.complete(len);
+                }
+                writer_queue.close();
+            })
+    };
+    #[cfg(test)]
+    let writer_thread = if worker_spawn_failure == TestWorkerSpawnFailure::Writer {
+        Err(std::io::Error::other("injected PTY writer spawn failure"))
+    } else {
+        writer_spawn()
+    };
+    #[cfg(not(test))]
+    let writer_thread = writer_spawn();
+    let writer_thread = match writer_thread {
+        Ok(thread) => thread,
+        Err(error) => {
+            drop(input_tx);
+            output_queue.cancel();
+            drop(master);
+            kill_and_reap_bounded(&mut child);
+            #[cfg(windows)]
+            cancel_windows_synchronous_io(&reader_thread);
+            join_worker(Some(reader_thread), "reader");
+            return Err(error).context("PTY writer thread 생성 실패");
+        }
+    };
+
+    Ok(PortablePtySession {
+        master: Some(master),
+        input_tx: Some(input_tx),
+        input_queue,
+        child,
+        output: Some(output_rx),
+        output_queue,
+        reader_thread: Some(reader_thread),
+        writer_thread: Some(writer_thread),
+    })
+}
+
+#[cfg(unix)]
+fn duplicate_nonblocking_fd(fd: RawFd) -> std::io::Result<OwnedFd> {
+    // F_DUPFD_CLOEXEC creates an independently owned descriptor while preserving the PTY's shared
+    // open-file description. O_NONBLOCK therefore applies consistently to both worker duplicates;
+    // the retained master is used only for metadata/resize and is never read or written directly.
+    let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicated == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fcntl returned a new owned descriptor and this is its sole owner.
+    let duplicated = unsafe { OwnedFd::from_raw_fd(duplicated) };
+    set_nonblocking(duplicated.as_raw_fd())?;
+    Ok(duplicated)
+}
+
+#[cfg(unix)]
+fn cancellation_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let mut descriptors = [-1; 2];
+    if unsafe { libc::pipe(descriptors.as_mut_ptr()) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a successful pipe call initialized two distinct owned descriptors.
+    let read = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+    // SAFETY: as above; ownership of the write endpoint is independent.
+    let write = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+    set_close_on_exec(read.as_raw_fd())?;
+    set_close_on_exec(write.as_raw_fd())?;
+    set_nonblocking(read.as_raw_fd())?;
+    set_nonblocking(write.as_raw_fd())?;
+    Ok((read, write))
+}
+
+#[cfg(unix)]
+fn set_close_on_exec(fd: RawFd) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn signal_cancellation(fd: &OwnedFd) {
+    let byte = [1u8];
+    loop {
+        let written = unsafe { libc::write(fd.as_raw_fd(), byte.as_ptr().cast(), byte.len()) };
+        if written >= 0 {
+            return;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            // A full pipe already represents a pending cancellation signal; a closed pipe means
+            // the worker has already exited. Neither case requires a retry or a diagnostic.
+            return;
+        }
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_fd_or_cancel(fd: RawFd, events: libc::c_short, cancel: RawFd) -> std::io::Result<bool> {
+    let mut descriptors = [
+        libc::pollfd {
+            fd: cancel,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        },
+    ];
+    loop {
+        let result = unsafe {
+            libc::poll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as libc::nfds_t,
+                -1,
+            )
+        };
+        if result >= 0 {
+            let cancel_events = descriptors[0].revents;
+            if cancel_events & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+            {
+                return Ok(false);
+            }
+            return Ok(descriptors[1].revents
+                & (events | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
+                != 0);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unix_reader_loop(
+    reader: OwnedFd,
+    cancel: OwnedFd,
+    output: PtyOutputSender,
+    output_wake: Option<PtyOutputWake>,
+) {
+    let mut buf = [0u8; 8192];
+    while let Ok(true) = wait_for_fd_or_cancel(reader.as_raw_fd(), libc::POLLIN, cancel.as_raw_fd())
+    {
+        let count = unsafe { libc::read(reader.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        if count > 0 {
+            match output.send(buf[..count as usize].to_vec()) {
+                Ok(true) => {
+                    if let Some(wake) = &output_wake {
+                        wake();
+                    }
+                }
+                Ok(false) => {}
+                Err(_) => break,
+            }
+            continue;
+        }
+        if count == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+        ) {
+            continue;
+        }
+        break;
+    }
+}
+
+#[cfg(unix)]
+fn unix_writer_loop(
+    writer: OwnedFd,
+    cancel: OwnedFd,
+    input: std::sync::mpsc::Receiver<Vec<u8>>,
+    queue: input_queue::PtyInputQueueState,
+) {
+    'messages: for bytes in &input {
+        let len = bytes.len();
+        let mut written = 0usize;
+        while written < len {
+            match wait_for_fd_or_cancel(writer.as_raw_fd(), libc::POLLOUT, cancel.as_raw_fd()) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => {
+                    queue.complete(len);
+                    break 'messages;
+                }
+            }
+            let count = unsafe {
+                libc::write(
+                    writer.as_raw_fd(),
+                    bytes[written..].as_ptr().cast(),
+                    len - written,
+                )
+            };
+            if count > 0 {
+                written += count as usize;
+                continue;
+            }
+            if count == 0 {
+                queue.complete(len);
+                break 'messages;
+            }
+            let error = std::io::Error::last_os_error();
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+            ) {
+                continue;
+            }
+            tracing::debug!("PTY 입력 쓰기 실패 — writer 종료");
+            queue.complete(len);
+            break 'messages;
+        }
+        if written == len {
+            queue.complete(len);
+        }
+    }
+    // Cancellation happens only after the sole sender is dropped. Release any accepted messages
+    // that the writer did not consume so post-kill pressure cannot retain stale accounting.
+    for bytes in input.try_iter() {
+        queue.complete(bytes.len());
+    }
+    queue.close();
+}
+
+fn join_worker(thread: Option<std::thread::JoinHandle<()>>, kind: &'static str) {
+    if thread.is_some_and(|thread| thread.join().is_err()) {
+        tracing::warn!(kind, "PTY worker thread panic during teardown");
+    }
+}
+
+#[cfg(windows)]
+fn cancel_windows_synchronous_io(thread: &std::thread::JoinHandle<()>) {
+    use std::os::windows::thread::JoinHandleExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CancelSynchronousIo(thread: *mut std::ffi::c_void) -> i32;
+    }
+
+    // SAFETY: as_raw_handle returns the live OS thread handle owned by JoinHandle. It remains valid
+    // through this call and the following join. ERROR_NOT_FOUND only means the worker is no longer
+    // blocked in synchronous ReadFile/WriteFile, which is already the desired state.
+    unsafe {
+        CancelSynchronousIo(thread.as_raw_handle());
     }
 }
 
@@ -297,15 +1124,104 @@ fn macos_utf8_locale() -> &'static str {
 }
 
 struct PortablePtySession {
-    // resize용으로만 유지. reader/writer는 이미 분리해서 보관한다.
-    master: Box<dyn portable_pty::MasterPty + Send>,
+    // resize용으로만 유지. teardown은 worker join 전에 take/drop해 blocking platform I/O도
+    // 닫는다.
+    master: Option<MasterPtyBox>,
     /// 입력은 writer 전용 스레드가 쓴다 — worker가 blocking write에 매달리지 않는다.
     /// (출력 폭주로 child의 stdout이 막힌 상태에서 worker가 대량 paste를
     /// 동기 write하면 reader(backpressure)와 맞물려 full-duplex deadlock — codex P1)
     input_tx: Option<SyncSender<Vec<u8>>>,
     input_queue: input_queue::PtyInputQueueState,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
-    output: Option<Receiver<Vec<u8>>>,
+    child: ChildPtyBox,
+    output: Option<PtyOutputReceiver>,
+    output_queue: Arc<PtyOutputQueue>,
+    reader_thread: Option<std::thread::JoinHandle<()>>,
+    writer_thread: Option<std::thread::JoinHandle<()>>,
+    #[cfg(unix)]
+    reader_cancel: Option<OwnedFd>,
+    #[cfg(unix)]
+    writer_cancel: Option<OwnedFd>,
+    #[cfg(unix)]
+    process_group: Option<libc::pid_t>,
+}
+
+impl PortablePtySession {
+    /// Stop both workers without timers. The output queue cancellation covers a reader waiting for
+    /// bounded capacity even when its receiver has been moved to the session crate; Unix self-pipes
+    /// cover workers waiting in poll, and dropping the master closes the platform PTY itself.
+    #[cfg(unix)]
+    fn stop_unix_worker_io(&mut self) {
+        drop(self.input_tx.take());
+        drop(self.output.take());
+        self.output_queue.cancel();
+        if let Some(cancel) = self.reader_cancel.as_ref() {
+            signal_cancellation(cancel);
+        }
+        if let Some(cancel) = self.writer_cancel.as_ref() {
+            signal_cancellation(cancel);
+        }
+        drop(self.master.take());
+    }
+
+    #[cfg(unix)]
+    fn join_unix_workers(&mut self) {
+        join_worker(self.reader_thread.take(), "reader");
+        join_worker(self.writer_thread.take(), "writer");
+        drop(self.reader_cancel.take());
+        drop(self.writer_cancel.take());
+    }
+
+    #[cfg(windows)]
+    fn begin_windows_output_drain(&mut self) {
+        drop(self.input_tx.take());
+        drop(self.output.take());
+        self.output_queue.begin_discard();
+    }
+
+    #[cfg(windows)]
+    fn cancel_and_join_windows_writer_after_master_close(&mut self) {
+        if let Some(thread) = self.writer_thread.as_ref() {
+            cancel_windows_synchronous_io(thread);
+        }
+        join_worker(self.writer_thread.take(), "writer");
+    }
+
+    #[cfg(windows)]
+    fn close_windows_master_while_reader_drains(&mut self) {
+        drop(self.master.take());
+    }
+
+    #[cfg(windows)]
+    fn cancel_and_join_windows_reader_after_master_close(&mut self) {
+        self.output_queue.cancel();
+        if let Some(thread) = self.reader_thread.as_ref() {
+            cancel_windows_synchronous_io(thread);
+        }
+        join_worker(self.reader_thread.take(), "reader");
+    }
+
+    #[cfg(all(not(unix), not(windows)))]
+    fn stop_other_workers(&mut self) {
+        drop(self.input_tx.take());
+        drop(self.output.take());
+        self.output_queue.cancel();
+        drop(self.master.take());
+        join_worker(self.reader_thread.take(), "reader");
+        join_worker(self.writer_thread.take(), "writer");
+    }
+
+    #[cfg(unix)]
+    fn signal_process_group(&self, signal: libc::c_int) {
+        if let Some(pgid) = self.process_group {
+            unsafe { libc::killpg(pgid, signal) };
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_group_alive(&self) -> bool {
+        self.process_group
+            .is_some_and(|pgid| unsafe { libc::killpg(pgid, 0) } == 0)
+    }
 }
 
 /// kill 후 reap을 폴링으로 — kill이 실패해도(권한/플랫폼 문제) 무한 wait에
@@ -313,6 +1229,19 @@ struct PortablePtySession {
 /// 제한 시간 내에 reap하지 못하면 leak을 감수하고 로그만 남긴다.
 fn kill_and_reap_bounded(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
     let _ = child.kill();
+    reap_child_bounded(child);
+}
+
+#[cfg(any(windows, test))]
+fn kill_once_and_reap_bounded(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+) -> anyhow::Result<()> {
+    let result = child.kill().context("프로세스 kill 실패");
+    reap_child_bounded(child);
+    result
+}
+
+fn reap_child_bounded(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         match child.try_wait() {
@@ -344,7 +1273,16 @@ impl PtyBackend for PortablePtyBackend {
         cols: u16,
         rows: u16,
     ) -> anyhow::Result<Box<dyn PtySession>> {
-        self.spawn_impl(cmd, cols, rows, None)
+        self.spawn_impl(
+            cmd,
+            cols,
+            rows,
+            None,
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            TestWorkerSpawnFailure::None,
+        )
     }
 }
 
@@ -352,56 +1290,67 @@ impl Drop for PortablePtySession {
     /// 세션을 버릴 때 PTY에 붙은 프로세스를 정리한다.
     /// reader thread는 프로세스 종료(EOF) 또는 수신측 drop 후 send 실패로 끝난다.
     fn drop(&mut self) {
-        // 터미널 종료 규약: foreground process group에 SIGHUP —
-        // 셸이 kill되어도 살아남는 grandchild job까지 정리 대상에 포함.
-        #[cfg(unix)]
-        let pgid = self.master.process_group_leader();
-        #[cfg(unix)]
-        if let Some(pgid) = pgid {
-            unsafe { libc::killpg(pgid, libc::SIGHUP) };
+        #[cfg(windows)]
+        {
+            // ClosePseudoConsole on Windows before 11 24H2 may synchronously wait for output pipe
+            // drain. Keep the reader alive in discard mode until the HPCON close returns. Cancel
+            // workers only after the close, when the ConPTY input peer is permanently closed and a
+            // writer cannot race from the cancelled WriteFile into another blocking WriteFile.
+            self.begin_windows_output_drain();
+            kill_and_reap_bounded(&mut self.child);
+            self.close_windows_master_while_reader_drains();
+            self.cancel_and_join_windows_writer_after_master_close();
+            self.cancel_and_join_windows_reader_after_master_close();
+            return;
         }
-        // kill 실패해도 무한 wait에 매달리지 않는다 (bounded reap — codex P1)
-        kill_and_reap_bounded(&mut self.child);
-        // 제품 정책(안정성 감사 Med #3, 2026-07-08): pane/세션 닫기 = 프로세스 트리 정리.
-        // SIGHUP을 무시한 자손(nohup류)이 남지 않게 process group에 SIGTERM → 짧은
-        // 유예 → SIGKILL로 에스컬레이션한다. pgid 재사용 오발 위험은 Drop 직후 수백 ms
-        // 내 재확인이라 극소. 유예는 200ms로 짧게 — Drop이 UI/worker 스레드에서 불린다.
+
         #[cfg(unix)]
-        if let Some(pgid) = pgid {
-            let group_alive = || unsafe { libc::killpg(pgid, 0) } == 0;
-            if group_alive() {
-                unsafe { libc::killpg(pgid, libc::SIGTERM) };
+        {
+            // Deterministic I/O cancellation comes first. In particular, this wakes a writer
+            // blocked on a full PTY even if an escaped descendant still owns the slave endpoint.
+            self.stop_unix_worker_io();
+            // 터미널 종료 규약: foreground process group에 SIGHUP —
+            // 셸이 kill되어도 살아남는 grandchild job까지 정리 대상에 포함.
+            self.signal_process_group(libc::SIGHUP);
+            // kill 실패해도 무한 wait에 매달리지 않는다 (bounded reap — codex P1)
+            kill_and_reap_bounded(&mut self.child);
+            // 제품 정책(안정성 감사 Med #3, 2026-07-08): pane/세션 닫기 = 프로세스 트리 정리.
+            // SIGHUP을 무시한 자손(nohup류)이 남지 않게 process group에 SIGTERM → 짧은
+            // 유예 → SIGKILL로 에스컬레이션한다. pgid 재사용 오발 위험은 Drop 직후 수백 ms
+            // 내 재확인이라 극소. 유예는 200ms로 짧게 — Drop이 UI/worker 스레드에서 불린다.
+            if let Some(pgid) = self.process_group
+                && self.process_group_alive()
+            {
+                self.signal_process_group(libc::SIGTERM);
                 let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
-                while group_alive() && std::time::Instant::now() < deadline {
+                while self.process_group_alive() && std::time::Instant::now() < deadline {
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
-                if group_alive() {
+                if self.process_group_alive() {
                     tracing::info!(pgid, "SIGTERM 후에도 자손 생존 — SIGKILL 에스컬레이션");
-                    unsafe { libc::killpg(pgid, libc::SIGKILL) };
+                    self.signal_process_group(libc::SIGKILL);
                 }
             }
+            self.join_unix_workers();
         }
-        // teardown 계약: input_tx drop → writer thread 종료(채널 닫힘),
-        // output Receiver drop(필드) → send 블록된 reader thread가 Err로 풀림,
-        // reader의 read 블록은 child 종료의 EOF로 풀린다. thread join은 하지
-        // 않는다 — SIGHUP을 무시한 grandchild가 slave를 쥐고 있으면 read가
-        // 안 끝날 수 있어, join이 오히려 Drop을 영구 블록시킨다 (detach가 안전).
-        drop(self.input_tx.take());
+
+        #[cfg(all(not(unix), not(windows)))]
+        {
+            self.stop_other_workers();
+            kill_and_reap_bounded(&mut self.child);
+        }
     }
 }
 
 impl PtySession for PortablePtySession {
-    fn take_output(&mut self) -> Option<Receiver<Vec<u8>>> {
+    fn take_output(&mut self) -> Option<PtyOutputReceiver> {
         self.output.take()
     }
 
     fn process_identity(&self) -> ProcessIdentity {
         let pid = self.child.process_id();
         #[cfg(unix)]
-        let process_group = self
-            .master
-            .process_group_leader()
-            .and_then(|pgid| u32::try_from(pgid).ok());
+        let process_group = self.process_group.and_then(|pgid| u32::try_from(pgid).ok());
         #[cfg(not(unix))]
         let process_group = None;
         let source = if pid.is_some() || process_group.is_some() {
@@ -443,6 +1392,8 @@ impl PtySession for PortablePtySession {
     fn resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()> {
         // 0 크기는 PTY/터미널 계층에서 의미가 없다 — 경계에서 clamp (codex P3)
         self.master
+            .as_ref()
+            .context("PTY session closed")?
             .resize(pty_size(cols.max(1), rows.max(1)))
             .context("PTY resize 실패")
     }
@@ -456,19 +1407,41 @@ impl PtySession for PortablePtySession {
     }
 
     fn kill(&mut self) -> anyhow::Result<()> {
-        // Drop과 같은 규약: process group에 SIGHUP까지 — grandchild job 포함
-        // (reap은 try_exit_code/Drop 경로가 담당. codex P2)
         #[cfg(unix)]
-        if let Some(pgid) = self.master.process_group_leader() {
-            unsafe { libc::killpg(pgid, libc::SIGHUP) };
+        {
+            // Drop과 같은 규약: process group에 SIGHUP까지 — grandchild job 포함
+            // (reap은 try_exit_code/Drop 경로가 담당. codex P2)
+            self.signal_process_group(libc::SIGHUP);
+            self.stop_unix_worker_io();
+            let result = self.child.kill().context("프로세스 kill 실패");
+            self.join_unix_workers();
+            result
         }
-        self.child.kill().context("프로세스 kill 실패")
+
+        #[cfg(windows)]
+        {
+            self.begin_windows_output_drain();
+            // Terminate and observe completion before ClosePseudoConsole; otherwise the pre-24H2
+            // close can wait for an attached client even while output is being drained.
+            let kill_result = kill_once_and_reap_bounded(&mut self.child);
+            self.close_windows_master_while_reader_drains();
+            self.cancel_and_join_windows_writer_after_master_close();
+            self.cancel_and_join_windows_reader_after_master_close();
+            kill_result
+        }
+
+        #[cfg(all(not(unix), not(windows)))]
+        {
+            self.stop_other_workers();
+            self.child.kill().context("프로세스 kill 실패")
+        }
     }
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
     fn spawn(program: &str, args: &[&str]) -> Box<dyn PtySession> {
@@ -484,6 +1457,304 @@ mod tests {
                 24,
             )
             .unwrap()
+    }
+
+    fn spawn_tracked(
+        program: &str,
+        args: &[&str],
+        liveness: Arc<TestWorkerLiveness>,
+        failure: TestWorkerSpawnFailure,
+    ) -> anyhow::Result<Box<dyn PtySession>> {
+        PortablePtyBackend.spawn_impl(
+            &CommandSpec {
+                program: program.into(),
+                args: args.iter().map(|argument| (*argument).into()).collect(),
+                env: Vec::new(),
+                cwd: None,
+            },
+            80,
+            24,
+            None,
+            Some(liveness),
+            failure,
+        )
+    }
+
+    fn wait_for_workers(liveness: &TestWorkerLiveness) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (
+            liveness.readers.load(Ordering::SeqCst),
+            liveness.writers.load(Ordering::SeqCst),
+        ) != (1, 1)
+        {
+            assert!(Instant::now() < deadline, "PTY workers did not start");
+            std::thread::yield_now();
+        }
+    }
+
+    fn assert_no_workers(liveness: &TestWorkerLiveness) {
+        assert_eq!(liveness.readers.load(Ordering::SeqCst), 0);
+        assert_eq!(liveness.writers.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn bounded_output_wait는_receiver_capacity와_cancel로만_깨어난다() {
+        let (sender, receiver, _control) = pty_output_channel();
+        for byte in 0..PTY_OUTPUT_QUEUE_CAPACITY {
+            sender.send(vec![byte as u8]).unwrap();
+        }
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let producer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            sender.send(vec![255])
+        });
+        started_rx.recv().unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), vec![0]);
+        assert!(producer.join().unwrap().is_ok());
+
+        let (sender, _receiver, control) = pty_output_channel();
+        for byte in 0..PTY_OUTPUT_QUEUE_CAPACITY {
+            sender.send(vec![byte as u8]).unwrap();
+        }
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let producer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            sender.send(vec![255])
+        });
+        started_rx.recv().unwrap();
+        control.cancel();
+        assert!(producer.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn windows_discard_mode는_full_sender를_깨우고_추가_output을_보관하지_않는다() {
+        let (sender, receiver, control) = pty_output_channel();
+        for byte in 0..PTY_OUTPUT_QUEUE_CAPACITY {
+            assert!(sender.send(vec![byte as u8]).unwrap());
+        }
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let producer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let first = sender.send(vec![254]);
+            let second = sender.send(vec![255]);
+            (first, second)
+        });
+        started_rx.recv().unwrap();
+        control.begin_discard();
+        let (first, second) = producer.join().unwrap();
+        assert!(!first.unwrap());
+        assert!(!second.unwrap());
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Disconnected));
+        control.cancel();
+    }
+
+    #[test]
+    fn 반복_kill과_drop은_worker를_남기지_않는다() {
+        for _ in 0..12 {
+            let liveness = Arc::new(TestWorkerLiveness::default());
+            let mut session = spawn_tracked(
+                "/bin/cat",
+                &[],
+                Arc::clone(&liveness),
+                TestWorkerSpawnFailure::None,
+            )
+            .unwrap();
+            let _output = session.take_output().unwrap();
+            wait_for_workers(&liveness);
+            assert!(
+                session
+                    .write_input(b"bounded teardown\r")
+                    .unwrap()
+                    .is_accepted()
+            );
+            session.kill().unwrap();
+            assert_no_workers(&liveness);
+            drop(session);
+            assert_no_workers(&liveness);
+        }
+    }
+
+    #[test]
+    fn full_pty에_막힌_writer도_cancel후_join된다() {
+        let liveness = Arc::new(TestWorkerLiveness::default());
+        let mut session = spawn_tracked(
+            "/bin/sh",
+            &["-c", "trap '' HUP TERM; sleep 300"],
+            Arc::clone(&liveness),
+            TestWorkerSpawnFailure::None,
+        )
+        .unwrap();
+        let _output = session.take_output().unwrap();
+        wait_for_workers(&liveness);
+        let payload = vec![b'x'; PtyInputQueuePolicy::default().max_bytes];
+        assert!(session.write_input(&payload).unwrap().is_accepted());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.input_queue_idle() {
+            assert!(
+                Instant::now() < deadline,
+                "writer queue never became active"
+            );
+            std::thread::yield_now();
+        }
+        let started = Instant::now();
+        session.kill().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_no_workers(&liveness);
+    }
+
+    #[test]
+    fn writer_thread_spawn_실패는_이미_시작한_reader를_join한다() {
+        let liveness = Arc::new(TestWorkerLiveness::default());
+        let result = spawn_tracked(
+            "/bin/sleep",
+            &["300"],
+            Arc::clone(&liveness),
+            TestWorkerSpawnFailure::Writer,
+        );
+        assert!(result.is_err());
+        assert_no_workers(&liveness);
+    }
+
+    #[derive(Debug)]
+    struct FailingKillChild {
+        kill_calls: Arc<std::sync::atomic::AtomicUsize>,
+        wait_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[derive(Debug)]
+    struct FailingKiller;
+
+    impl portable_pty::ChildKiller for FailingKiller {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("injected child kill failure"))
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(Self)
+        }
+    }
+
+    impl portable_pty::ChildKiller for FailingKillChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.kill_calls.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("injected child kill failure"))
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(FailingKiller)
+        }
+    }
+
+    impl portable_pty::Child for FailingKillChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            self.wait_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(portable_pty::ExitStatus::with_exit_code(1)))
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            Ok(portable_pty::ExitStatus::with_exit_code(1))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    #[test]
+    fn explicit_kill은_한번만_시도하고_실패해도_reap후_원래_error를_반환한다() {
+        let kill_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wait_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut child: ChildPtyBox = Box::new(FailingKillChild {
+            kill_calls: Arc::clone(&kill_calls),
+            wait_calls: Arc::clone(&wait_calls),
+        });
+        let error = kill_once_and_reap_bounded(&mut child).unwrap_err();
+        assert!(error.to_string().contains("프로세스 kill 실패"));
+        assert_eq!(kill_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(wait_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn worker_teardown_source_law는_joinhandle과_event_cancel을_강제한다() {
+        fn assert_order(source: &str, needles: &[&str]) {
+            let mut remainder = source;
+            for needle in needles {
+                let position = remainder
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("missing ordered source token: {needle}"));
+                remainder = &remainder[position + needle.len()..];
+            }
+        }
+
+        let source = include_str!("lib.rs");
+        assert!(source.contains("reader_thread: Option<std::thread::JoinHandle<()>>"));
+        assert!(source.contains("writer_thread: Option<std::thread::JoinHandle<()>>"));
+        assert!(source.contains("libc::poll("));
+
+        let windows_spawn_start = source.find("fn spawn_windows_session(").unwrap();
+        let windows_spawn_end = source[windows_spawn_start..]
+            .find("fn spawn_other_session(")
+            .map(|offset| windows_spawn_start + offset)
+            .unwrap();
+        assert_order(
+            &source[windows_spawn_start..windows_spawn_end],
+            &[
+                ".try_clone_reader()",
+                ".spawn(move ||",
+                "slave.spawn_command(builder)",
+                "master.take_writer()",
+            ],
+        );
+
+        let drop_start = source.find("impl Drop for PortablePtySession").unwrap();
+        let drop_end = source[drop_start..]
+            .find("impl PtySession for PortablePtySession")
+            .map(|offset| drop_start + offset)
+            .unwrap();
+        assert_order(
+            &source[drop_start..drop_end],
+            &[
+                "self.begin_windows_output_drain();",
+                "kill_and_reap_bounded(&mut self.child);",
+                "self.close_windows_master_while_reader_drains();",
+                "self.cancel_and_join_windows_writer_after_master_close();",
+                "self.cancel_and_join_windows_reader_after_master_close();",
+                "self.stop_unix_worker_io();",
+                "self.join_unix_workers();",
+            ],
+        );
+
+        let kill_needle = ["    fn ki", "ll(&mut self)"].concat();
+        let kill_start = source.rfind(&kill_needle).unwrap();
+        assert_order(
+            &source[kill_start..],
+            &[
+                "self.stop_unix_worker_io();",
+                "self.join_unix_workers();",
+                "self.begin_windows_output_drain();",
+                "let kill_result = kill_once_and_reap_bounded(&mut self.child);",
+                "self.close_windows_master_while_reader_drains();",
+                "self.cancel_and_join_windows_writer_after_master_close();",
+                "self.cancel_and_join_windows_reader_after_master_close();",
+                "kill_result",
+            ],
+        );
+        let forbidden_pre_close_join = ["join_windows_writer_", "before_master_close"].concat();
+        assert!(!source.contains(&forbidden_pre_close_join));
+
+        let helper_start = source.find("fn kill_once_and_reap_bounded(").unwrap();
+        let helper_end = source[helper_start..]
+            .find("fn reap_child_bounded(")
+            .map(|offset| helper_start + offset)
+            .unwrap();
+        assert_order(
+            &source[helper_start..helper_end],
+            &[
+                "let result = child.kill().context(",
+                "reap_child_bounded(child);",
+                "result",
+            ],
+        );
     }
 
     /// 제품 정책(감사 Med #3): 세션 drop = 프로세스 트리 정리. HUP/TERM을 무시하는
@@ -503,7 +1774,15 @@ mod tests {
             "( trap '' HUP TERM; sleep 300 ) & echo $! > {}; sleep 300",
             pidfile.display()
         );
-        let session = spawn("/bin/sh", &["-c", &script]);
+        let liveness = Arc::new(TestWorkerLiveness::default());
+        let session = spawn_tracked(
+            "/bin/sh",
+            &["-c", &script],
+            Arc::clone(&liveness),
+            TestWorkerSpawnFailure::None,
+        )
+        .unwrap();
+        wait_for_workers(&liveness);
         // 자손 pid 파일이 생길 때까지 대기
         let deadline = Instant::now() + Duration::from_secs(10);
         let orphan_pid: i32 = loop {
@@ -521,6 +1800,7 @@ mod tests {
             "자손이 살아있어야 시작"
         );
         drop(session);
+        assert_no_workers(&liveness);
         // SIGKILL 에스컬레이션 후 자손 소멸 확인 (reap은 init이 하므로 kill(pid,0) 폴링).
         // zombie 동안 kill(pid,0)이 성공할 수 있으나 macOS launchd는 orphan을 즉시
         // reap하므로 5s 데드라인 내 소멸을 기대한다(codex Low — 수용).
@@ -675,7 +1955,7 @@ mod tests {
     }
 
     /// 채널이 닫힐 때까지 출력을 모은다 (timeout 포함).
-    fn collect_output(rx: &Receiver<Vec<u8>>, timeout: Duration) -> Vec<u8> {
+    fn collect_output(rx: &PtyOutputReceiver, timeout: Duration) -> Vec<u8> {
         let deadline = Instant::now() + timeout;
         let mut out = Vec::new();
         while Instant::now() < deadline {

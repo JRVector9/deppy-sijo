@@ -204,3 +204,25 @@ logging policy passes 15/15, and app/xtask all-target check, strict Clippy, xtas
 allowlist boundary, the 23-crate dependency DAG, full rustfmt, and diff-check pass. Hardware-duration
 measurement remains deferred until the remaining startup/action input seams are structurally
 bounded.
+
+## Runtime admission and PTY lifecycle closeout
+
+The in-process runtime now applies one shared 1,024-item/8-MiB queue budget and validates every
+command before all enqueue paths and again before dispatch. Sessions stop at 256, terminal grids
+at 65,536 cells, and launch, environment, path, regex, identifier, and input payloads have fixed
+item/byte aggregates. Dynamic payloads are rebuilt with length-bounded backing before they can
+enter mux, cwd, environment, persistence, or event state. Runtime failures expose only static
+kind/phase/error-code fields. RuntimeCommand variants, ordering, and wire bytes are unchanged.
+
+PTY output uses a lossless 64-by-8-KiB bounded queue whose cancellation wakes both blocked
+producer and consumer. Unix uses cancellable nonblocking duplicated master descriptors and joins
+both workers. Windows drains ConPTY output through master/HPCON close, then cancels and joins the
+writer and reader; explicit kill attempts exactly once, bounded-reaps even on failure, completes
+all teardown, and only then returns the remembered static-context error. No detached reaper,
+polling timer, or async runtime was added.
+
+Runtime passes 189/189 plus doc tests, all-target check, runtime-only strict Clippy, scoped fmt,
+and raw-diagnostic scans. PTY passes 28/28 and session 50/50 plus doc tests, combined all-target
+check, strict Clippy, scoped fmt, and diff-check. Dependency-inclusive strict gates are rerun by
+root after the concurrently edited storage lane freezes; Windows compilation/runtime remains a CI
+gate because the local Windows target is unavailable.

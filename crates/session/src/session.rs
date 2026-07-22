@@ -1,10 +1,10 @@
 use std::io::Read;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::TryRecvError;
 
 use deppy_core::SessionId;
 use pty::{
     CommandSpec, PortablePtyBackend, ProcessIdentity, PtyBackend, PtyInputEnqueueResult,
-    PtyOutputWake, PtySession,
+    PtyOutputReceiver, PtyOutputWake, PtySession,
 };
 use terminal::{
     CellRange, TerminalBackend, TerminalCacheClass, TerminalCacheEvent, TerminalCacheFootprint,
@@ -51,7 +51,7 @@ pub struct Session {
     /// Exited 후 None — backend는 scrollback 열람을 위해 유지
     pty: Option<Box<dyn PtySession>>,
     process_identity: ProcessIdentity,
-    output: Receiver<Vec<u8>>,
+    output: PtyOutputReceiver,
     /// 백엔드 선택은 terminal::new_default_backend (기본 alacritty,
     /// ghostty-backend feature + DEPPY_TERM_BACKEND=ghostty면 libghostty — A/B 실측용).
     backend: Box<dyn TerminalBackend>,
@@ -155,7 +155,7 @@ impl Session {
         exit_code: Option<u32>,
         ansi_dump: &mut impl Read,
     ) -> Self {
-        let (_tx, output) = std::sync::mpsc::channel();
+        let output = PtyOutputReceiver::disconnected();
         let mut backend = terminal::new_default_backend(cols, rows, scrollback_lines);
         let mut buffer = [0u8; 64 * 1024];
         loop {

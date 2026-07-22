@@ -53,6 +53,38 @@ pub struct RuntimeHostConfig {
     pub extra_env: Vec<(String, String)>,
 }
 
+pub(crate) fn validate_runtime_worker_config(
+    output_batch_ms: u64,
+    logs_root: &std::path::Path,
+    persist: Option<&PersistConfig>,
+    cwd: Option<&std::path::Path>,
+    extra_env: &[(String, String)],
+) -> anyhow::Result<()> {
+    if !(1..=1_000).contains(&output_batch_ms) {
+        anyhow::bail!("runtime_output_batch_invalid");
+    }
+    crate::command::validate_runtime_path(logs_root)?;
+    if let Some(cwd) = cwd {
+        crate::command::validate_runtime_path(cwd)?;
+    }
+    crate::command::validate_env_entries(extra_env, &[])?;
+    if let Some(persist) = persist {
+        crate::command::validate_runtime_path(&persist.db_path)?;
+        crate::command::validate_runtime_identifier(&persist.workspace_id, 1024)?;
+    }
+    Ok(())
+}
+
+fn validate_runtime_host_config(config: &RuntimeHostConfig) -> anyhow::Result<()> {
+    validate_runtime_worker_config(
+        config.output_batch_ms,
+        &config.logs_root,
+        config.persist.as_ref(),
+        config.cwd.as_deref(),
+        &config.extra_env,
+    )
+}
+
 pub type RuntimeWake = Arc<dyn Fn() + Send + Sync>;
 pub type RuntimeCommandDispatcher = Arc<dyn Fn(RuntimeCommand) -> anyhow::Result<()> + Send + Sync>;
 
@@ -99,6 +131,7 @@ impl InProcessRuntimeHostFactory {
         &self,
         config: RuntimeHostConfig,
     ) -> anyhow::Result<crate::InProcessRuntimeClient> {
+        validate_runtime_host_config(&config)?;
         crate::InProcessRuntimeClient::try_new_with_resolver(
             config.output_batch_ms,
             Arc::clone(&self.resolver),
@@ -129,6 +162,59 @@ mod tests {
             self.0.fetch_add(1, Ordering::Relaxed);
             Ok(RuntimeSecret::new("not-used".to_owned()))
         }
+    }
+
+    fn valid_host_config() -> RuntimeHostConfig {
+        RuntimeHostConfig {
+            output_batch_ms: 5,
+            logs_root: std::path::PathBuf::from("logs"),
+            persist: None,
+            cwd: None,
+            extra_env: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn host_config_is_fully_bounded_before_worker_construction() {
+        for batch in [1, 1_000] {
+            let mut config = valid_host_config();
+            config.output_batch_ms = batch;
+            assert!(validate_runtime_host_config(&config).is_ok());
+        }
+        for batch in [0, 1_001] {
+            let mut config = valid_host_config();
+            config.output_batch_ms = batch;
+            assert!(validate_runtime_host_config(&config).is_err());
+        }
+
+        let mut config = valid_host_config();
+        config.logs_root = std::path::PathBuf::new();
+        assert!(validate_runtime_host_config(&config).is_err());
+        config = valid_host_config();
+        config.cwd = Some(std::path::PathBuf::new());
+        assert!(validate_runtime_host_config(&config).is_err());
+
+        config = valid_host_config();
+        config.extra_env = vec![("K".to_owned(), String::new()); 256];
+        assert!(validate_runtime_host_config(&config).is_ok());
+        config.extra_env.push(("K".to_owned(), String::new()));
+        assert!(validate_runtime_host_config(&config).is_err());
+        config.extra_env = vec![("BAD=KEY".to_owned(), String::new())];
+        assert!(validate_runtime_host_config(&config).is_err());
+
+        config = valid_host_config();
+        config.persist = Some(PersistConfig {
+            db_path: std::path::PathBuf::from("db.sqlite"),
+            workspace_id: "w".repeat(1_024),
+        });
+        assert!(validate_runtime_host_config(&config).is_ok());
+        config.persist.as_mut().unwrap().workspace_id.push('w');
+        assert!(validate_runtime_host_config(&config).is_err());
+        config.persist.as_mut().unwrap().workspace_id = "bad\nid".to_owned();
+        assert!(validate_runtime_host_config(&config).is_err());
+        config.persist.as_mut().unwrap().workspace_id = "workspace".to_owned();
+        config.persist.as_mut().unwrap().db_path = std::path::PathBuf::new();
+        assert!(validate_runtime_host_config(&config).is_err());
     }
 
     #[test]

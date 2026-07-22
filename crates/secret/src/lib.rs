@@ -1,4 +1,5 @@
 mod bundle;
+mod diagnostic_scan;
 pub mod hex;
 mod redaction;
 pub mod token;
@@ -8,6 +9,10 @@ pub use bundle::{
     ReconcileSecretSlotsResult, SecretBundle, SecretBundleRef, SecretBundleStagePlan,
     StagedSecretBundle, delete_secret_bundle, inspect_secret_bundle, list_secret_bundle_slots,
     read_secret_bundle, reconcile_orphan_secret_slots, stage_secret_bundle,
+};
+pub use diagnostic_scan::{
+    DIAGNOSTIC_SCAN_MAX_FINDINGS, DIAGNOSTIC_SCAN_MAX_INPUT_BYTES, DiagnosticFindingCount,
+    DiagnosticFindingKind, DiagnosticScanReport, scan_diagnostic_bytes,
 };
 pub use redaction::{
     RedactionCapacityError, RedactionClock, RedactionCorpusLimits, RedactionCorpusStats,

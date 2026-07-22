@@ -77,7 +77,7 @@ impl ConnectorUi {
     #[must_use]
     pub fn render(&mut self, ui: &mut Ui, snapshot: &ConnectorSnapshot) -> Option<ConnectorIntent> {
         sync_oauth_client_draft(&mut self.oauth_client, snapshot.oauth.as_ref());
-        self.prepared.prepare(snapshot);
+        self.prepared.prepare(snapshot, &self.labels);
 
         let mut intent = None;
         let has_service_modal = snapshot.remote_trust.is_some()
@@ -230,7 +230,7 @@ fn render_slack_summary(
     let slack = &snapshot.slack;
     ui.group(|ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.strong("Slack");
+            ui.strong(&labels.slack_name);
             ui.label(slack_status_label(slack.status, labels));
             if slack.tool_count > 0 {
                 ui.label(&prepared.slack_tool_count);
@@ -540,7 +540,7 @@ fn render_import_report(
                     ui.strong(&item.name);
                     ui.label(import_outcome_label(item.outcome, labels));
                     if let Some(code) = item.error_code {
-                        ui.label(error_code_label(code));
+                        ui.label(error_code_label(code, labels));
                     }
                     if item.omitted_secret_env_count > 0 {
                         ui.label(&prepared.import_omitted_counts[index]);
@@ -864,7 +864,7 @@ fn render_oauth_modal(
                     reason,
                     workspace_hint,
                 } => {
-                    ui.label(error_code_label(*reason));
+                    ui.label(error_code_label(*reason, labels));
                     if let Some(hint) = workspace_hint.as_deref() {
                         ui.weak(hint);
                     }
@@ -887,7 +887,10 @@ fn render_oauth_modal(
                     error_code,
                     recovery,
                 } => {
-                    ui.colored_label(ui.visuals().error_fg_color, error_code_label(*error_code));
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        error_code_label(*error_code, labels),
+                    );
                     ui.horizontal_wrapped(|ui| {
                         for action in recovery.iter().copied() {
                             if ui.button(oauth_recovery_label(action, labels)).clicked() {
@@ -1138,65 +1141,65 @@ fn oauth_recovery_label(action: OAuthRecoveryAction, labels: &Labels) -> &str {
     }
 }
 
-fn operation_kind_label(kind: OperationKind) -> &'static str {
+fn operation_kind_label(kind: OperationKind, labels: &Labels) -> &str {
     match kind {
-        OperationKind::Trust => "Trust",
-        OperationKind::Discover => "Discover",
-        OperationKind::Invoke => "Tool call",
-        OperationKind::OAuth => "OAuth",
-        OperationKind::Import => "Import",
-        OperationKind::SaveServer => "Save server",
-        OperationKind::DeleteServer => "Delete server",
-        OperationKind::UpdatePermission => "Permission",
+        OperationKind::Trust => &labels.operation_trust,
+        OperationKind::Discover => &labels.operation_discover,
+        OperationKind::Invoke => &labels.operation_invoke,
+        OperationKind::OAuth => &labels.operation_oauth,
+        OperationKind::Import => &labels.operation_import,
+        OperationKind::SaveServer => &labels.operation_save_server,
+        OperationKind::DeleteServer => &labels.operation_delete_server,
+        OperationKind::UpdatePermission => &labels.operation_update_permission,
     }
 }
 
-fn operation_phase_label(phase: OperationPhase) -> &'static str {
+fn operation_phase_label(phase: OperationPhase, labels: &Labels) -> &str {
     match phase {
-        OperationPhase::Queued => "Queued",
-        OperationPhase::Validating => "Validating",
-        OperationPhase::AwaitingTrust => "Awaiting trust",
-        OperationPhase::DiscoveringSchema => "Discovering schema",
-        OperationPhase::DiscoveringAuth => "Discovering authorization",
-        OperationPhase::AwaitingConsent => "Awaiting consent",
-        OperationPhase::AwaitingClient => "Awaiting client",
-        OperationPhase::PreparingCallback => "Preparing callback",
-        OperationPhase::BrowserReady => "Browser ready",
-        OperationPhase::AwaitingCallback => "Awaiting callback",
-        OperationPhase::Authorizing => "Authorizing",
-        OperationPhase::AuditPreflight => "Audit preflight",
-        OperationPhase::Calling => "Calling",
-        OperationPhase::Persisting => "Persisting",
-        OperationPhase::Succeeded => "Succeeded",
-        OperationPhase::Failed => "Failed",
-        OperationPhase::Unknown => "Delivery unknown",
-        OperationPhase::Denied => "Denied",
-        OperationPhase::Cancelled => "Cancelled",
+        OperationPhase::Queued => &labels.phase_queued,
+        OperationPhase::Validating => &labels.phase_validating,
+        OperationPhase::AwaitingTrust => &labels.phase_awaiting_trust,
+        OperationPhase::DiscoveringSchema => &labels.phase_discovering_schema,
+        OperationPhase::DiscoveringAuth => &labels.phase_discovering_auth,
+        OperationPhase::AwaitingConsent => &labels.phase_awaiting_consent,
+        OperationPhase::AwaitingClient => &labels.phase_awaiting_client,
+        OperationPhase::PreparingCallback => &labels.phase_preparing_callback,
+        OperationPhase::BrowserReady => &labels.phase_browser_ready,
+        OperationPhase::AwaitingCallback => &labels.phase_awaiting_callback,
+        OperationPhase::Authorizing => &labels.phase_authorizing,
+        OperationPhase::AuditPreflight => &labels.phase_audit_preflight,
+        OperationPhase::Calling => &labels.phase_calling,
+        OperationPhase::Persisting => &labels.phase_persisting,
+        OperationPhase::Succeeded => &labels.phase_succeeded,
+        OperationPhase::Failed => &labels.phase_failed,
+        OperationPhase::Unknown => &labels.phase_unknown,
+        OperationPhase::Denied => &labels.phase_denied,
+        OperationPhase::Cancelled => &labels.phase_cancelled,
     }
 }
 
-fn error_code_label(code: ErrorCode) -> &'static str {
+fn error_code_label(code: ErrorCode, labels: &Labels) -> &str {
     match code {
-        ErrorCode::InvalidInput => "Invalid input",
-        ErrorCode::InvalidUrl => "Invalid URL",
-        ErrorCode::LimitExceeded => "Resource limit exceeded",
-        ErrorCode::Backpressure => "Too many pending operations",
-        ErrorCode::StorageUnavailable => "Storage unavailable",
-        ErrorCode::SecretUnavailable => "Credential unavailable",
-        ErrorCode::TrustDenied => "Remote trust denied",
-        ErrorCode::HostUnavailable => "Host action unavailable",
-        ErrorCode::PermissionDenied => "Permission denied",
-        ErrorCode::AuditUnavailable => "Audit unavailable",
-        ErrorCode::AuthenticationRequired => "Authentication required",
-        ErrorCode::AuthenticationFailed => "Authentication failed",
-        ErrorCode::OAuthCallbackFailed => "OAuth callback failed",
-        ErrorCode::NetworkTimeout => "Network timeout",
-        ErrorCode::TransportFailed => "Transport failed",
-        ErrorCode::ProtocolViolation => "Protocol violation",
-        ErrorCode::StaleResult => "Stale result discarded",
-        ErrorCode::Cancelled => "Cancelled",
-        ErrorCode::UnknownDelivery => "Delivery status unknown; not retried",
-        ErrorCode::Internal => "Internal error",
+        ErrorCode::InvalidInput => &labels.error_invalid_input,
+        ErrorCode::InvalidUrl => &labels.error_invalid_url,
+        ErrorCode::LimitExceeded => &labels.error_limit_exceeded,
+        ErrorCode::Backpressure => &labels.error_backpressure,
+        ErrorCode::StorageUnavailable => &labels.error_storage_unavailable,
+        ErrorCode::SecretUnavailable => &labels.error_secret_unavailable,
+        ErrorCode::TrustDenied => &labels.error_trust_denied,
+        ErrorCode::HostUnavailable => &labels.error_host_unavailable,
+        ErrorCode::PermissionDenied => &labels.error_permission_denied,
+        ErrorCode::AuditUnavailable => &labels.error_audit_unavailable,
+        ErrorCode::AuthenticationRequired => &labels.error_authentication_required,
+        ErrorCode::AuthenticationFailed => &labels.error_authentication_failed,
+        ErrorCode::OAuthCallbackFailed => &labels.error_oauth_callback_failed,
+        ErrorCode::NetworkTimeout => &labels.error_network_timeout,
+        ErrorCode::TransportFailed => &labels.error_transport_failed,
+        ErrorCode::ProtocolViolation => &labels.error_protocol_violation,
+        ErrorCode::StaleResult => &labels.error_stale_result,
+        ErrorCode::Cancelled => &labels.error_cancelled,
+        ErrorCode::UnknownDelivery => &labels.error_unknown_delivery,
+        ErrorCode::Internal => &labels.error_internal,
     }
 }
 
@@ -1217,7 +1220,7 @@ impl PreparedDisplayCache {
         self.revision = None;
     }
 
-    fn prepare(&mut self, snapshot: &ConnectorSnapshot) {
+    fn prepare(&mut self, snapshot: &ConnectorSnapshot, labels: &Labels) {
         if self.revision == Some(snapshot.revision) {
             return;
         }
@@ -1240,9 +1243,16 @@ impl PreparedDisplayCache {
         self.import_summary.clear();
         self.import_omitted_counts.clear();
         if let Some(report) = snapshot.import_report.as_ref() {
-            self.import_summary = format!(
-                "{} added · {} skipped · {} failed",
-                report.added, report.skipped, report.failed
+            let added = report.added.to_string();
+            let skipped = report.skipped.to_string();
+            let failed = report.failed.to_string();
+            self.import_summary = interpolate_label(
+                &labels.import_summary_template,
+                &[
+                    ("added", &added),
+                    ("skipped", &skipped),
+                    ("failed", &failed),
+                ],
             );
             self.import_omitted_counts.extend(
                 report
@@ -1257,16 +1267,24 @@ impl PreparedDisplayCache {
             .extend(snapshot.operations.iter().map(|operation| {
                 let mut label = format!(
                     "{} · {}",
-                    operation_kind_label(operation.kind),
-                    operation_phase_label(operation.phase)
+                    operation_kind_label(operation.kind, labels),
+                    operation_phase_label(operation.phase, labels)
                 );
                 if let Some(code) = operation.error_code {
                     label.push_str(" · ");
-                    label.push_str(error_code_label(code));
+                    label.push_str(error_code_label(code, labels));
                 }
                 label
             }));
     }
+}
+
+fn interpolate_label(template: &str, args: &[(&str, &str)]) -> String {
+    let mut rendered = template.to_owned();
+    for (name, value) in args {
+        rendered = rendered.replace(&format!("{{{name}}}"), value);
+    }
+    rendered
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1474,7 +1492,9 @@ struct Labels {
     import_unsupported: String,
     import_failed: String,
     secret_env_omitted: String,
+    import_summary_template: String,
     open_slack_settings: String,
+    slack_name: String,
     connect_slack: String,
     choose_workspace: String,
     configure_slack_app: String,
@@ -1550,6 +1570,53 @@ struct Labels {
     retry_oauth: String,
     operations: String,
     cancel_operation: String,
+    operation_trust: String,
+    operation_discover: String,
+    operation_invoke: String,
+    operation_oauth: String,
+    operation_import: String,
+    operation_save_server: String,
+    operation_delete_server: String,
+    operation_update_permission: String,
+    phase_queued: String,
+    phase_validating: String,
+    phase_awaiting_trust: String,
+    phase_discovering_schema: String,
+    phase_discovering_auth: String,
+    phase_awaiting_consent: String,
+    phase_awaiting_client: String,
+    phase_preparing_callback: String,
+    phase_browser_ready: String,
+    phase_awaiting_callback: String,
+    phase_authorizing: String,
+    phase_audit_preflight: String,
+    phase_calling: String,
+    phase_persisting: String,
+    phase_succeeded: String,
+    phase_failed: String,
+    phase_unknown: String,
+    phase_denied: String,
+    phase_cancelled: String,
+    error_invalid_input: String,
+    error_invalid_url: String,
+    error_limit_exceeded: String,
+    error_backpressure: String,
+    error_storage_unavailable: String,
+    error_secret_unavailable: String,
+    error_trust_denied: String,
+    error_host_unavailable: String,
+    error_permission_denied: String,
+    error_audit_unavailable: String,
+    error_authentication_required: String,
+    error_authentication_failed: String,
+    error_oauth_callback_failed: String,
+    error_network_timeout: String,
+    error_transport_failed: String,
+    error_protocol_violation: String,
+    error_stale_result: String,
+    error_cancelled: String,
+    error_unknown_delivery: String,
+    error_internal: String,
 }
 
 impl Labels {
@@ -1558,47 +1625,49 @@ impl Labels {
             title: catalog.t("connectors.local_mcp", &[]),
             add_server: catalog.t("connectors.add_mcp", &[]),
             import_title: catalog.t("connectors.import_title", &[]),
-            import_paste: "Import pasted JSON".to_owned(),
+            import_paste: catalog.t("connector.import.paste", &[]),
             import_file: catalog.t("connectors.import_file", &[]),
             import_claude: catalog.t("connectors.import_claude_desktop", &[]),
-            import_report: "Import report".to_owned(),
-            close_import_report: "Close import report".to_owned(),
-            import_added: "Added".to_owned(),
-            import_duplicate: "Skipped: duplicate".to_owned(),
-            import_unsupported: "Skipped: unsupported".to_owned(),
-            import_failed: "Failed".to_owned(),
-            secret_env_omitted: "secret environment entries omitted".to_owned(),
+            import_report: catalog.t("connector.import.report_title", &[]),
+            close_import_report: catalog.t("connector.import.close_report", &[]),
+            import_added: catalog.t("connector.import.outcome.added", &[]),
+            import_duplicate: catalog.t("connector.import.outcome.skipped_duplicate", &[]),
+            import_unsupported: catalog.t("connector.import.outcome.skipped_unsupported", &[]),
+            import_failed: catalog.t("connector.import.outcome.failed", &[]),
+            secret_env_omitted: catalog.t("connector.import.secret_env_omitted", &[]),
+            import_summary_template: catalog.t("connector.import.summary", &[]),
             open_slack_settings: catalog.t("connectors.slack.open_app_settings", &[]),
-            connect_slack: "Connect Slack".to_owned(),
-            choose_workspace: "Choose another workspace".to_owned(),
-            configure_slack_app: "Configure Slack app".to_owned(),
-            enable_slack_mcp: "Enable Slack MCP access".to_owned(),
-            retry_authorization: "Retry Slack authorization".to_owned(),
-            workspace: "Workspace:".to_owned(),
-            refresh: "Refresh".to_owned(),
+            slack_name: catalog.t("connector.slack.name", &[]),
+            connect_slack: catalog.t("connector.slack.connect", &[]),
+            choose_workspace: catalog.t("connector.slack.choose_workspace", &[]),
+            configure_slack_app: catalog.t("connector.slack.configure_app", &[]),
+            enable_slack_mcp: catalog.t("connector.slack.enable_mcp", &[]),
+            retry_authorization: catalog.t("connector.slack.retry_authorization", &[]),
+            workspace: catalog.t("connector.slack.workspace_label", &[]),
+            refresh: catalog.t("connector.action.refresh", &[]),
             empty: catalog.t("connectors.empty_mcp", &[]),
             ready: catalog.t("connectors.slack.ready", &[]),
             not_configured: catalog.t("connectors.empty_mcp", &[]),
             checking: catalog.t("connectors.checking", &[]),
             needs_authorization: catalog.t("connectors.needs_auth", &[]),
             connected: catalog.t("connectors.connected", &[]),
-            failed: catalog.t("connectors.failed", &[("message", "")]),
-            disabled: "Disabled".to_owned(),
+            failed: catalog.t("connector.status.failed", &[]),
+            disabled: catalog.t("connector.status.disabled", &[]),
             unchecked: catalog.t("connectors.unchecked", &[]),
-            tools: "Tools".to_owned(),
+            tools: catalog.t("connector.tools.label", &[]),
             discover: catalog.t("connectors.test", &[]),
-            edit: "Edit".to_owned(),
+            edit: catalog.t("connector.action.edit", &[]),
             authorize: catalog.t("connectors.approve_browser", &[]),
             delete: catalog.t("action.delete", &[]),
             tools_not_loaded: catalog.t("connectors.unchecked", &[]),
-            load_tools: "Load tools".to_owned(),
+            load_tools: catalog.t("connector.action.load_tools", &[]),
             load_more: catalog.t("inbox.view_all", &[]),
             invoke: catalog.t("connectors.invoke", &[]),
             rule_ask: catalog.t("connectors.approval.ask_rule", &[]),
             rule_allow: catalog.t("connectors.rule_allow", &[]),
             rule_deny: catalog.t("connectors.rule_deny", &[]),
             result: catalog.t("connectors.result", &[]),
-            truncated: "Truncated".to_owned(),
+            truncated: catalog.t("connector.status.truncated", &[]),
             close: catalog.t("action.close", &[]),
             name: catalog.t("common.name", &[]),
             http: "HTTP".to_owned(),
@@ -1606,14 +1675,14 @@ impl Labels {
             url: "URL".to_owned(),
             command: catalog.t("common.command", &[]),
             arguments: catalog.t("connectors.args_note", &[]),
-            enabled: "Enabled".to_owned(),
+            enabled: catalog.t("connector.status.enabled", &[]),
             cancel: catalog.t("action.cancel", &[]),
             save: catalog.t("action.save", &[]),
             arguments_json: catalog.t("connectors.arguments_json", &[]),
             client_id: catalog.t("connectors.client_id", &[]),
             client_secret: catalog.t("connectors.client_secret", &[]),
             workspace_hint: catalog.t("connectors.slack.workspace_address", &[]),
-            save_client: "Save client and continue".to_owned(),
+            save_client: catalog.t("connector.action.save_client_continue", &[]),
             approval_needed: catalog.t("connectors.approval_needed", &[("reason", "")]),
             approval_ask: catalog.t("connectors.approval.ask_rule", &[]),
             approval_first_use: catalog.t("connectors.approval.first_use", &[]),
@@ -1622,29 +1691,79 @@ impl Labels {
             allow_always: catalog.t("connectors.allow_always", &[]),
             deny_once: catalog.t("connectors.deny_once", &[]),
             deny_always: catalog.t("connectors.deny_always", &[]),
-            remote_trust: "Trust remote endpoint".to_owned(),
-            trust_continue: "Trust and continue".to_owned(),
-            deny_trust: "Deny remote endpoint".to_owned(),
-            trust_discover: "This endpoint will receive a schema discovery request.".to_owned(),
-            trust_invoke: "This endpoint will receive tool arguments.".to_owned(),
-            trust_oauth: "This endpoint will begin OAuth discovery.".to_owned(),
+            remote_trust: catalog.t("connector.trust.title", &[]),
+            trust_continue: catalog.t("connector.trust.continue", &[]),
+            deny_trust: catalog.t("connector.trust.deny", &[]),
+            trust_discover: catalog.t("connector.trust.purpose.discover", &[]),
+            trust_invoke: catalog.t("connector.trust.purpose.invoke", &[]),
+            trust_oauth: catalog.t("connector.trust.purpose.oauth", &[]),
             oauth_title: catalog.t("connectors.oauth_flow_title", &[]),
-            oauth_discovering: "Discovering authorization".to_owned(),
-            oauth_consent: "Review the authorization authority before continuing.".to_owned(),
-            oauth_continue: "Continue to authorization".to_owned(),
-            oauth_deny: "Deny authorization".to_owned(),
-            oauth_preparing_callback: "Preparing local OAuth callback".to_owned(),
-            oauth_browser_ready: "Authorization browser is ready".to_owned(),
-            oauth_browser_host_action: "The app host is opening the approved authorization URL."
-                .to_owned(),
-            oauth_waiting_callback: "Waiting for OAuth callback".to_owned(),
-            oauth_client_unavailable: "OAuth client input is unavailable.".to_owned(),
-            authority: "Authorization authority".to_owned(),
-            resource: "Resource".to_owned(),
-            scopes: "Requested scopes".to_owned(),
-            retry_oauth: "Retry OAuth".to_owned(),
-            operations: "Active operations".to_owned(),
-            cancel_operation: "Cancel operation".to_owned(),
+            oauth_discovering: catalog.t("connector.oauth.discovering", &[]),
+            oauth_consent: catalog.t("connector.oauth.consent", &[]),
+            oauth_continue: catalog.t("connector.oauth.continue", &[]),
+            oauth_deny: catalog.t("connector.oauth.deny", &[]),
+            oauth_preparing_callback: catalog.t("connector.oauth.preparing_callback", &[]),
+            oauth_browser_ready: catalog.t("connector.oauth.browser_ready", &[]),
+            oauth_browser_host_action: catalog.t("connector.oauth.browser_host_action", &[]),
+            oauth_waiting_callback: catalog.t("connector.oauth.waiting_callback", &[]),
+            oauth_client_unavailable: catalog.t("connector.oauth.client_unavailable", &[]),
+            authority: catalog.t("connector.oauth.authority", &[]),
+            resource: catalog.t("connector.oauth.resource", &[]),
+            scopes: catalog.t("connector.oauth.scopes", &[]),
+            retry_oauth: catalog.t("connector.oauth.retry", &[]),
+            operations: catalog.t("connector.operations.title", &[]),
+            cancel_operation: catalog.t("connector.action.cancel_operation", &[]),
+            operation_trust: catalog.t("connector.operation.kind.trust", &[]),
+            operation_discover: catalog.t("connector.operation.kind.discover", &[]),
+            operation_invoke: catalog.t("connector.operation.kind.invoke", &[]),
+            operation_oauth: catalog.t("connector.operation.kind.oauth", &[]),
+            operation_import: catalog.t("connector.operation.kind.import", &[]),
+            operation_save_server: catalog.t("connector.operation.kind.save_server", &[]),
+            operation_delete_server: catalog.t("connector.operation.kind.delete_server", &[]),
+            operation_update_permission: catalog
+                .t("connector.operation.kind.update_permission", &[]),
+            phase_queued: catalog.t("connector.operation.phase.queued", &[]),
+            phase_validating: catalog.t("connector.operation.phase.validating", &[]),
+            phase_awaiting_trust: catalog.t("connector.operation.phase.awaiting_trust", &[]),
+            phase_discovering_schema: catalog
+                .t("connector.operation.phase.discovering_schema", &[]),
+            phase_discovering_auth: catalog.t("connector.operation.phase.discovering_auth", &[]),
+            phase_awaiting_consent: catalog.t("connector.operation.phase.awaiting_consent", &[]),
+            phase_awaiting_client: catalog.t("connector.operation.phase.awaiting_client", &[]),
+            phase_preparing_callback: catalog
+                .t("connector.operation.phase.preparing_callback", &[]),
+            phase_browser_ready: catalog.t("connector.operation.phase.browser_ready", &[]),
+            phase_awaiting_callback: catalog.t("connector.operation.phase.awaiting_callback", &[]),
+            phase_authorizing: catalog.t("connector.operation.phase.authorizing", &[]),
+            phase_audit_preflight: catalog.t("connector.operation.phase.audit_preflight", &[]),
+            phase_calling: catalog.t("connector.operation.phase.calling", &[]),
+            phase_persisting: catalog.t("connector.operation.phase.persisting", &[]),
+            phase_succeeded: catalog.t("connector.operation.phase.succeeded", &[]),
+            phase_failed: catalog.t("connector.operation.phase.failed", &[]),
+            phase_unknown: catalog.t("connector.operation.phase.unknown", &[]),
+            phase_denied: catalog.t("connector.operation.phase.denied", &[]),
+            phase_cancelled: catalog.t("connector.operation.phase.cancelled", &[]),
+            error_invalid_input: catalog.t("connector.error.invalid_input", &[]),
+            error_invalid_url: catalog.t("connector.error.invalid_url", &[]),
+            error_limit_exceeded: catalog.t("connector.error.limit_exceeded", &[]),
+            error_backpressure: catalog.t("connector.error.backpressure", &[]),
+            error_storage_unavailable: catalog.t("connector.error.storage_unavailable", &[]),
+            error_secret_unavailable: catalog.t("connector.error.secret_unavailable", &[]),
+            error_trust_denied: catalog.t("connector.error.trust_denied", &[]),
+            error_host_unavailable: catalog.t("connector.error.host_unavailable", &[]),
+            error_permission_denied: catalog.t("connector.error.permission_denied", &[]),
+            error_audit_unavailable: catalog.t("connector.error.audit_unavailable", &[]),
+            error_authentication_required: catalog
+                .t("connector.error.authentication_required", &[]),
+            error_authentication_failed: catalog.t("connector.error.authentication_failed", &[]),
+            error_oauth_callback_failed: catalog.t("connector.error.oauth_callback_failed", &[]),
+            error_network_timeout: catalog.t("connector.error.network_timeout", &[]),
+            error_transport_failed: catalog.t("connector.error.transport_failed", &[]),
+            error_protocol_violation: catalog.t("connector.error.protocol_violation", &[]),
+            error_stale_result: catalog.t("connector.error.stale_result", &[]),
+            error_cancelled: catalog.t("connector.error.cancelled", &[]),
+            error_unknown_delivery: catalog.t("connector.error.unknown_delivery", &[]),
+            error_internal: catalog.t("connector.error.internal", &[]),
         }
     }
 }
@@ -1773,10 +1892,17 @@ mod tests {
     }
 
     fn accessible_labels(snapshot: &ConnectorSnapshot) -> Vec<String> {
+        let catalog = Catalog::load("en-US").unwrap();
+        accessible_labels_with_catalog(snapshot, &catalog)
+    }
+
+    fn accessible_labels_with_catalog(
+        snapshot: &ConnectorSnapshot,
+        catalog: &Catalog,
+    ) -> Vec<String> {
         let context = egui::Context::default();
         context.enable_accesskit();
-        let catalog = Catalog::load("en-US").unwrap();
-        let mut connector_ui = ConnectorUi::new(&catalog);
+        let mut connector_ui = ConnectorUi::new(catalog);
         let output = context.run_ui(raw_input(), |ui| {
             assert!(connector_ui.render(ui, snapshot).is_none());
         });
@@ -1788,6 +1914,185 @@ mod tests {
             .iter()
             .filter_map(|(_, node)| node.label().or_else(|| node.value()).map(str::to_owned))
             .collect()
+    }
+
+    const CONNECTOR_CATALOG_KEYS: &[&str] = &[
+        "connector.import.paste",
+        "connector.import.report_title",
+        "connector.import.close_report",
+        "connector.import.outcome.added",
+        "connector.import.outcome.skipped_duplicate",
+        "connector.import.outcome.skipped_unsupported",
+        "connector.import.outcome.failed",
+        "connector.import.secret_env_omitted",
+        "connector.import.summary",
+        "connector.slack.name",
+        "connector.slack.connect",
+        "connector.slack.choose_workspace",
+        "connector.slack.configure_app",
+        "connector.slack.enable_mcp",
+        "connector.slack.retry_authorization",
+        "connector.slack.workspace_label",
+        "connector.action.refresh",
+        "connector.action.edit",
+        "connector.action.load_tools",
+        "connector.action.save_client_continue",
+        "connector.action.cancel_operation",
+        "connector.status.failed",
+        "connector.status.disabled",
+        "connector.status.truncated",
+        "connector.status.enabled",
+        "connector.tools.label",
+        "connector.trust.title",
+        "connector.trust.continue",
+        "connector.trust.deny",
+        "connector.trust.purpose.discover",
+        "connector.trust.purpose.invoke",
+        "connector.trust.purpose.oauth",
+        "connector.oauth.discovering",
+        "connector.oauth.consent",
+        "connector.oauth.continue",
+        "connector.oauth.deny",
+        "connector.oauth.preparing_callback",
+        "connector.oauth.browser_ready",
+        "connector.oauth.browser_host_action",
+        "connector.oauth.waiting_callback",
+        "connector.oauth.client_unavailable",
+        "connector.oauth.authority",
+        "connector.oauth.resource",
+        "connector.oauth.scopes",
+        "connector.oauth.retry",
+        "connector.operations.title",
+        "connector.operation.kind.trust",
+        "connector.operation.kind.discover",
+        "connector.operation.kind.invoke",
+        "connector.operation.kind.oauth",
+        "connector.operation.kind.import",
+        "connector.operation.kind.save_server",
+        "connector.operation.kind.delete_server",
+        "connector.operation.kind.update_permission",
+        "connector.operation.phase.queued",
+        "connector.operation.phase.validating",
+        "connector.operation.phase.awaiting_trust",
+        "connector.operation.phase.discovering_schema",
+        "connector.operation.phase.discovering_auth",
+        "connector.operation.phase.awaiting_consent",
+        "connector.operation.phase.awaiting_client",
+        "connector.operation.phase.preparing_callback",
+        "connector.operation.phase.browser_ready",
+        "connector.operation.phase.awaiting_callback",
+        "connector.operation.phase.authorizing",
+        "connector.operation.phase.audit_preflight",
+        "connector.operation.phase.calling",
+        "connector.operation.phase.persisting",
+        "connector.operation.phase.succeeded",
+        "connector.operation.phase.failed",
+        "connector.operation.phase.unknown",
+        "connector.operation.phase.denied",
+        "connector.operation.phase.cancelled",
+        "connector.error.invalid_input",
+        "connector.error.invalid_url",
+        "connector.error.limit_exceeded",
+        "connector.error.backpressure",
+        "connector.error.storage_unavailable",
+        "connector.error.secret_unavailable",
+        "connector.error.trust_denied",
+        "connector.error.host_unavailable",
+        "connector.error.permission_denied",
+        "connector.error.audit_unavailable",
+        "connector.error.authentication_required",
+        "connector.error.authentication_failed",
+        "connector.error.oauth_callback_failed",
+        "connector.error.network_timeout",
+        "connector.error.transport_failed",
+        "connector.error.protocol_violation",
+        "connector.error.stale_result",
+        "connector.error.cancelled",
+        "connector.error.unknown_delivery",
+        "connector.error.internal",
+    ];
+
+    #[test]
+    fn connector_catalog_keys_resolve_in_every_bundled_locale() {
+        for locale in ["en-US", "ja-JP", "zh-Hans", "zh-Hant", "ko-KR"] {
+            let catalog = Catalog::load(locale).unwrap();
+            for key in CONNECTOR_CATALOG_KEYS {
+                let rendered = catalog.t(key, &[]);
+                assert_ne!(rendered, *key, "{locale} is missing {key}");
+                assert!(
+                    !rendered.is_empty(),
+                    "{locale} has an empty value for {key}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_english_catalog_values_render_without_legacy_english_prose() {
+        let catalog = Catalog::load("ko-KR").unwrap();
+        let fingerprint = EndpointFingerprint::parse("b".repeat(64)).unwrap();
+        let trust_snapshot = ConnectorSnapshot {
+            revision: Revision(20),
+            remote_trust: Some(RemoteTrustPrompt {
+                operation_id: OperationId::new("localized-trust"),
+                server_id: ServerId::new("localized-server"),
+                server_name: "Localized server".to_owned(),
+                purpose: RemoteTrustPurpose::Invoke,
+                display_endpoint: EndpointDisplay::new("https://example.test/mcp"),
+                endpoint_fingerprint: fingerprint,
+                config_revision: Revision(4),
+            }),
+            ..ConnectorSnapshot::default()
+        };
+        let trust_labels = accessible_labels_with_catalog(&trust_snapshot, &catalog);
+        let expected_trust = catalog.t("connector.trust.continue", &[]);
+        assert!(trust_labels.iter().any(|label| label == &expected_trust));
+        assert!(
+            !trust_labels
+                .iter()
+                .any(|label| label == "Trust and continue")
+        );
+
+        let report_snapshot = ConnectorSnapshot {
+            revision: Revision(21),
+            import_report: Some(ImportReport {
+                operation_id: OperationId::new("localized-import"),
+                source: ImportSource::Paste,
+                added: 2,
+                skipped: 3,
+                failed: 1,
+                items: Arc::from([]),
+                truncated: false,
+            }),
+            operations: Arc::from([OperationSummary {
+                id: OperationId::new("localized-operation"),
+                server_id: ServerId::new("localized-server"),
+                kind: OperationKind::Invoke,
+                phase: OperationPhase::Unknown,
+                error_code: Some(ErrorCode::UnknownDelivery),
+            }]),
+            ..ConnectorSnapshot::default()
+        };
+        let labels = accessible_labels_with_catalog(&report_snapshot, &catalog);
+        let expected_summary = catalog.t(
+            "connector.import.summary",
+            &[("added", "2"), ("skipped", "3"), ("failed", "1")],
+        );
+        let expected_operation = format!(
+            "{} · {} · {}",
+            catalog.t("connector.operation.kind.invoke", &[]),
+            catalog.t("connector.operation.phase.unknown", &[]),
+            catalog.t("connector.error.unknown_delivery", &[]),
+        );
+        assert!(labels.iter().any(|label| label == &expected_summary));
+        assert!(labels.iter().any(|label| label == &expected_operation));
+        for legacy in [
+            "2 added · 3 skipped · 1 failed",
+            "Tool call · Delivery unknown",
+            "Delivery status unknown; not retried",
+        ] {
+            assert!(!labels.iter().any(|label| label.contains(legacy)));
+        }
     }
 
     #[test]
@@ -1808,7 +2113,8 @@ mod tests {
         };
         let catalog = Catalog::load("en-US").unwrap();
         let mut ui = ConnectorUi::new(&catalog);
-        let accepted = activate_accessible_label(&mut ui, &snapshot, "Trust and continue");
+        let trust_continue = catalog.t("connector.trust.continue", &[]);
+        let accepted = activate_accessible_label(&mut ui, &snapshot, &trust_continue);
         assert!(matches!(
             accepted,
             Some(ConnectorIntent::ResolveRemoteTrust {
@@ -1820,8 +2126,9 @@ mod tests {
         ));
 
         let mut ui = ConnectorUi::new(&catalog);
+        let trust_deny = catalog.t("connector.trust.deny", &[]);
         assert!(matches!(
-            activate_accessible_label(&mut ui, &snapshot, "Deny remote endpoint"),
+            activate_accessible_label(&mut ui, &snapshot, &trust_deny),
             Some(ConnectorIntent::ResolveRemoteTrust {
                 operation_id,
                 config_revision: Revision(4),
@@ -1844,8 +2151,9 @@ mod tests {
         };
         let catalog = Catalog::load("en-US").unwrap();
         let mut ui = ConnectorUi::new(&catalog);
+        let oauth_continue = catalog.t("connector.oauth.continue", &[]);
         assert!(matches!(
-            activate_accessible_label(&mut ui, &consent, "Continue to authorization"),
+            activate_accessible_label(&mut ui, &consent, &oauth_continue),
             Some(ConnectorIntent::ResolveOAuthConsent {
                 operation_id,
                 config_revision: Revision(9),
@@ -1869,8 +2177,8 @@ mod tests {
         draft.client_id = "client-id".to_owned();
         draft.client_secret = "client-secret".to_owned();
         draft.workspace_hint = "example.slack.com".to_owned();
-        let submitted =
-            activate_accessible_label(&mut ui, &awaiting_client, "Save client and continue");
+        let save_client = catalog.t("connector.action.save_client_continue", &[]);
+        let submitted = activate_accessible_label(&mut ui, &awaiting_client, &save_client);
         match submitted {
             Some(ConnectorIntent::SubmitOAuthClient {
                 operation_id,
@@ -1893,24 +2201,29 @@ mod tests {
 
     #[test]
     fn oauth_browser_callback_failure_and_recovery_are_rendered_without_raw_url_intents() {
-        for (phase, visible) in [
-            (OAuthUiPhase::DiscoveringAuth, "Discovering authorization"),
+        let catalog = Catalog::load("en-US").unwrap();
+        for (phase, key) in [
+            (OAuthUiPhase::DiscoveringAuth, "connector.oauth.discovering"),
             (
                 OAuthUiPhase::PreparingCallback,
-                "Preparing local OAuth callback",
+                "connector.oauth.preparing_callback",
             ),
-            (OAuthUiPhase::BrowserReady, "Authorization browser is ready"),
-            (OAuthUiPhase::AwaitingCallback, "Waiting for OAuth callback"),
+            (OAuthUiPhase::BrowserReady, "connector.oauth.browser_ready"),
+            (
+                OAuthUiPhase::AwaitingCallback,
+                "connector.oauth.waiting_callback",
+            ),
         ] {
             let snapshot = ConnectorSnapshot {
                 revision: Revision(5),
                 oauth: Some(oauth_state(phase)),
                 ..ConnectorSnapshot::default()
             };
+            let expected = catalog.t(key, &[]);
             assert!(
                 accessible_labels(&snapshot)
                     .iter()
-                    .any(|label| label == visible)
+                    .any(|label| label == &expected)
             );
         }
 
@@ -1926,10 +2239,10 @@ mod tests {
             })),
             ..ConnectorSnapshot::default()
         };
-        let catalog = Catalog::load("en-US").unwrap();
         let mut ui = ConnectorUi::new(&catalog);
+        let retry_oauth = catalog.t("connector.oauth.retry", &[]);
         assert!(matches!(
-            activate_accessible_label(&mut ui, &failed, "Retry OAuth"),
+            activate_accessible_label(&mut ui, &failed, &retry_oauth),
             Some(ConnectorIntent::ResolveOAuthRecovery {
                 operation_id,
                 action: OAuthRecoveryAction::Retry,
@@ -1941,8 +2254,9 @@ mod tests {
     fn slack_projection_emits_connect_workspace_and_typed_recovery_intents() {
         let catalog = Catalog::load("en-US").unwrap();
         let mut ui = ConnectorUi::new(&catalog);
+        let connect_slack = catalog.t("connector.slack.connect", &[]);
         assert!(matches!(
-            activate_accessible_label(&mut ui, &ConnectorSnapshot::default(), "Connect Slack"),
+            activate_accessible_label(&mut ui, &ConnectorSnapshot::default(), &connect_slack),
             Some(ConnectorIntent::ConnectSlack)
         ));
 
@@ -1959,14 +2273,16 @@ mod tests {
             ..ConnectorSnapshot::default()
         };
         let mut ui = ConnectorUi::new(&catalog);
+        let choose_workspace = catalog.t("connector.slack.choose_workspace", &[]);
         assert!(matches!(
-            activate_accessible_label(&mut ui, &connected, "Choose another workspace"),
+            activate_accessible_label(&mut ui, &connected, &choose_workspace),
             Some(ConnectorIntent::ChooseSlackWorkspace(server_id))
                 if server_id.as_str() == "slack"
         ));
         let mut ui = ConnectorUi::new(&catalog);
+        let enable_mcp = catalog.t("connector.slack.enable_mcp", &[]);
         assert!(matches!(
-            activate_accessible_label(&mut ui, &connected, "Enable Slack MCP access"),
+            activate_accessible_label(&mut ui, &connected, &enable_mcp),
             Some(ConnectorIntent::OpenSlackRecovery {
                 server_id,
                 kind: SlackRecoveryKind::EnableMcpAccess,
@@ -1980,7 +2296,8 @@ mod tests {
         let snapshot = ConnectorSnapshot::default();
         let mut ui = ConnectorUi::new(&catalog);
         ui.paste_input = "{\"mcpServers\":{}}".to_owned();
-        match activate_accessible_label(&mut ui, &snapshot, "Import pasted JSON") {
+        let import_paste = catalog.t("connector.import.paste", &[]);
+        match activate_accessible_label(&mut ui, &snapshot, &import_paste) {
             Some(ConnectorIntent::ImportConfiguration {
                 source: ImportSource::Paste,
                 display_name: None,
@@ -1991,8 +2308,9 @@ mod tests {
         assert!(ui.paste_input.is_empty());
 
         let mut ui = ConnectorUi::new(&catalog);
+        let import_file = catalog.t("connectors.import_file", &[]);
         assert!(matches!(
-            activate_accessible_label(&mut ui, &snapshot, "From JSON file..."),
+            activate_accessible_label(&mut ui, &snapshot, &import_file),
             Some(ConnectorIntent::RequestImportSource(
                 ImportSourceRequest::FilePicker
             ))
@@ -2006,8 +2324,9 @@ mod tests {
             ))
         ));
         let mut ui = ConnectorUi::new(&catalog);
+        let open_slack_settings = catalog.t("connectors.slack.open_app_settings", &[]);
         assert!(matches!(
-            activate_accessible_label(&mut ui, &snapshot, "Open Slack app settings"),
+            activate_accessible_label(&mut ui, &snapshot, &open_slack_settings),
             Some(ConnectorIntent::OpenExternalLink(
                 ExternalLinkKind::SlackAppSettings
             ))
@@ -2098,17 +2417,15 @@ mod tests {
             ..ConnectorSnapshot::default()
         };
         let labels = accessible_labels(&snapshot);
-        assert!(
-            labels
-                .iter()
-                .any(|label| label.contains("Delivery unknown"))
-        );
+        let catalog = Catalog::load("en-US").unwrap();
+        let unknown = catalog.t("connector.operation.phase.unknown", &[]);
+        assert!(labels.iter().any(|label| label.contains(&unknown)));
         assert!(!labels.iter().any(|label| label.contains("Retry")));
 
-        let catalog = Catalog::load("en-US").unwrap();
         let mut ui = ConnectorUi::new(&catalog);
+        let cancel_operation = catalog.t("connector.action.cancel_operation", &[]);
         assert!(matches!(
-            activate_accessible_label(&mut ui, &snapshot, "Cancel operation"),
+            activate_accessible_label(&mut ui, &snapshot, &cancel_operation),
             Some(ConnectorIntent::Cancel(operation_id)) if operation_id.as_str() == "running"
         ));
     }

@@ -29,16 +29,39 @@ const SECRET_PREFIX_ENTRY_LIMIT: usize = SECRET_PREFIX_ENTRY_PROBE_CEILING - 1;
 
 /// secret 평문 래퍼. Debug 출력은 항상 REDACTED (설계문서 PR-02 완료 기준).
 /// Serialize/Display를 구현하지 않아 config/SQLite/log로의 우발적 유출을 컴파일 단계에서 막는다.
-pub struct SecretString(String);
+pub struct SecretString(
+    String,
+    #[cfg(test)] Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+);
 
 impl SecretString {
     pub fn new(value: String) -> Self {
-        Self(value)
+        Self(
+            value,
+            #[cfg(test)]
+            None,
+        )
     }
 
     /// 평문 접근. keyring 저장/env 주입 등 명시적 사용처에서만 호출한다.
     pub fn expose(&self) -> &str {
         &self.0
+    }
+
+    /// Consumes the zeroizing wrapper and transfers its plaintext `String` allocation without a
+    /// copy.
+    ///
+    /// The caller assumes responsibility for the plaintext's lifetime after this call. Keep it as
+    /// short as possible and move it promptly into the next zeroizing owner; an ordinary `String`
+    /// does not overwrite its allocation when dropped. The consumed wrapper drops with an empty
+    /// buffer and therefore cannot erase the transferred allocation.
+    pub fn into_string(mut self) -> String {
+        std::mem::take(&mut self.0)
+    }
+
+    #[cfg(test)]
+    fn observe_zeroized_drop(&mut self, observer: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.1 = Some(observer);
     }
 }
 
@@ -56,6 +79,13 @@ impl Drop for SecretString {
             unsafe { std::ptr::write_volatile(byte, 0) };
         }
         std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(test)]
+        if let Some(observer) = &self.1 {
+            observer.store(
+                self.0.as_bytes().iter().all(|byte| *byte == 0),
+                std::sync::atomic::Ordering::Release,
+            );
+        }
     }
 }
 
@@ -237,6 +267,32 @@ mod tests {
     fn debug_출력은_redacted() {
         let secret = SecretString::new("sk-live-abcdef123456".into());
         assert_eq!(format!("{secret:?}"), "SecretString(REDACTED)");
+    }
+
+    #[test]
+    fn into_string은_평문_allocation을_복사없이_호출자에게_이전한다() {
+        let marker = "unique-secret-allocation-marker-4f63f32e";
+        let mut plaintext = String::with_capacity(256);
+        plaintext.push_str(marker);
+        let allocation = plaintext.as_ptr();
+        let capacity = plaintext.capacity();
+
+        let transferred = SecretString::new(plaintext).into_string();
+
+        assert_eq!(transferred, marker);
+        assert_eq!(transferred.as_ptr(), allocation);
+        assert_eq!(transferred.capacity(), capacity);
+    }
+
+    #[test]
+    fn secret_string_drop은_평문_buffer를_계속_zeroize한다() {
+        let zeroized = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut secret = SecretString::new("drop-zeroization-marker".to_owned());
+        secret.observe_zeroized_drop(std::sync::Arc::clone(&zeroized));
+
+        drop(secret);
+
+        assert!(zeroized.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]

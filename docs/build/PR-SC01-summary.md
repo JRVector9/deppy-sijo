@@ -1,5 +1,14 @@
 # PR-SC01 — Versioned Secret Slots and Bounded Redaction
 
+## 2026-07-22 consuming secret-transfer amendment
+
+`SecretString::into_string` transfers the existing plaintext allocation with `mem::take`, avoiding
+the compatibility adapter's extra plaintext clone while making the caller responsible for moving
+the value promptly into another zeroizing owner. `SecretString` remains non-Clone, non-Serialize,
+and redacted in Debug. Pointer/capacity preservation and the actual volatile Drop-zeroization path
+are regression-tested. Root verification passes secret 46/46 plus doc-tests, check, strict Clippy,
+package fmt, and diff-check.
+
 ## Outcome
 
 PR-SC01 adds the typed keyring and redaction primitives required for the atomic Connector cutover.

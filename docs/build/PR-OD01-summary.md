@@ -20,9 +20,24 @@ token prefixes, and private-key PEM markers while excluding placeholders and emb
   and an assertion that rejected the allowed low-cardinality category name. All were corrected
   before root verification.
 
+## Deterministic failure matrix
+
+`cargo run -q -p xtask -- od01-failure-matrix` now parses the frozen contract's ten
+`FailurePoint` variants and requires an exact one-to-one mapping to deterministic package tests.
+Duplicate, missing, or unknown mappings fail before test execution. Each cargo invocation uses the
+fully qualified test name with `--exact --test-threads=1`, and xtask also rejects a successful
+process that did not report exactly one selected passing test.
+
+The matrix covers repository rollback before commit and after permission mutation/audit prepare,
+secret bundle write rollback, secret pointer-swap rollback, audit-preflight call-zero, MCP
+pre-send rejection, post-send Unknown delivery, bounded HTTP timeout/reaper behavior, worker-panic
+capacity release, and authorization-owner crash/failure recovery. Root ran all ten entries
+successfully. Xtask passes 8/8 plus all-target check, strict Clippy, fmt, and diff-check. The gate is
+test-only and adds zero production runtime work or failure-injection switch.
+
 ## Remaining OD01 scope
 
-The low-cardinality transition ring, app log days/bytes retention and GC, failpoint matrix,
+The low-cardinality transition-ring boundary regression, app log days/bytes retention and GC,
 diagnostic scan integration, and RSS/thread/socket/queue slope soak harness remain for the final
-OD01 cutover. This scanner adds no thread, timer, polling, network, process, or retained source
-buffer by itself.
+OD01 cutover. The scanner and failure matrix add no production thread, timer, polling, network,
+process, or retained source buffer.

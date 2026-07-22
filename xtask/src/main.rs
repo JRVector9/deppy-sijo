@@ -18,6 +18,9 @@
 //! `cargo run -p xtask -- perf-smoke`
 //!   현재 자동화 가능한 performance/backpressure smoke tests를 실행한다.
 //!
+//! `cargo run -p xtask -- od01-failure-matrix`
+//!   Connector failure taxonomy 전체를 deterministic exact test에 1:1로 연결한다.
+//!
 //! `cargo run -p xtask -- i18n-check`
 //!   필수 locale key completeness, fallback, CJK path, layout smoke tests를 실행한다.
 //!
@@ -103,9 +106,10 @@ fn main() -> anyhow::Result<()> {
         "smoke-db-migrations" => smoke_db_migrations(),
         "security-scan" => security_scan(),
         "perf-smoke" => perf_smoke(),
+        "od01-failure-matrix" => od01_failure_matrix(),
         "i18n-check" => i18n_check(),
         other => bail!(
-            "알 수 없는 명령 '{other}' — 사용법: cargo run -p xtask -- check-deps|check-boundary|smoke-db-migrations|security-scan|perf-smoke|i18n-check"
+            "알 수 없는 명령 '{other}' — 사용법: cargo run -p xtask -- check-deps|check-boundary|smoke-db-migrations|security-scan|perf-smoke|od01-failure-matrix|i18n-check"
         ),
     }
 }
@@ -137,6 +141,160 @@ fn perf_smoke() -> anyhow::Result<()> {
     run_cargo(&["test", "-p", "runtime", "backpressure"])?;
     run_cargo(&["test", "-p", "runtime", "hidden"])?;
     println!("perf-smoke OK");
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FailureMatrixCase {
+    point: &'static str,
+    package: &'static str,
+    exact_test: &'static str,
+}
+
+const OD01_FAILURE_MATRIX: &[FailureMatrixCase] = &[
+    FailureMatrixCase {
+        point: "RepositoryBeforeCommit",
+        package: "storage",
+        exact_test: "db::tests::server_delete_failure는_pending_permission_tool_server를_모두_rollback한다",
+    },
+    FailureMatrixCase {
+        point: "RepositoryAfterPreparedAudit",
+        package: "storage",
+        exact_test: "db::tests::allow_always_permission과_audit은_같이_rollback된다",
+    },
+    FailureMatrixCase {
+        point: "SecretWrite",
+        package: "secret",
+        exact_test: "bundle::tests::stage_failure_rolls_back_every_entry_written_in_new_slot",
+    },
+    FailureMatrixCase {
+        point: "SecretPointerSwap",
+        package: "storage",
+        exact_test: "db::tests::oauth_secret_slot_publish_실패는_pointer와_metadata를_rollback한다",
+    },
+    FailureMatrixCase {
+        point: "AuditPreflightCommit",
+        package: "connector-service",
+        exact_test: "coordinator::tests::approval_preflight_failure_and_double_resolve_never_call",
+    },
+    FailureMatrixCase {
+        point: "McpBeforeSend",
+        package: "mcp",
+        exact_test: "manager::tests::call_tool_큰_payload는_stdio_write전에_거부",
+    },
+    FailureMatrixCase {
+        point: "McpAfterSendUnknown",
+        package: "mcp",
+        exact_test: "transport::tests::tools_call_partial_write_or_eof_is_delivery_unknown",
+    },
+    FailureMatrixCase {
+        point: "HttpTimeout",
+        package: "mcp",
+        exact_test: "http::tests::timed_out_http_senders_keep_permits_and_reaper_is_bounded",
+    },
+    FailureMatrixCase {
+        point: "WorkerPanic",
+        package: "connector-service",
+        exact_test: "coordinator::tests::backend_panic_completes_and_releases_operation_capacity",
+    },
+    FailureMatrixCase {
+        point: "ProcessCrash",
+        package: "storage",
+        exact_test: "db::tests::authorization_owner_graceful_close와_실패_fallback은_scope_run에_격리된다",
+    },
+];
+
+fn od01_failure_matrix() -> anyhow::Result<()> {
+    let root = workspace_root()?;
+    let expected = failure_point_variants(&root)?;
+    validate_failure_matrix(&expected, OD01_FAILURE_MATRIX)?;
+    for case in OD01_FAILURE_MATRIX {
+        run_exact_test(case)?;
+    }
+    println!(
+        "od01-failure-matrix OK — {} failure points, exact deterministic tests",
+        OD01_FAILURE_MATRIX.len()
+    );
+    Ok(())
+}
+
+fn failure_point_variants(root: &Path) -> anyhow::Result<Vec<String>> {
+    let path = root.join("crates/connector-contract/src/lib.rs");
+    let source =
+        std::fs::read_to_string(&path).with_context(|| format!("{} 읽기 실패", path.display()))?;
+    let body = source
+        .split_once("pub enum FailurePoint {")
+        .map(|(_, tail)| tail)
+        .and_then(|tail| tail.split_once('}').map(|(body, _)| body))
+        .context("connector-contract FailurePoint enum을 찾지 못했습니다")?;
+    let variants = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("//"))
+        .map(|line| line.trim_end_matches(',').to_owned())
+        .collect::<Vec<_>>();
+    anyhow::ensure!(!variants.is_empty(), "FailurePoint variant가 비어 있습니다");
+    Ok(variants)
+}
+
+fn validate_failure_matrix(expected: &[String], cases: &[FailureMatrixCase]) -> anyhow::Result<()> {
+    let mut counts = BTreeMap::<&str, usize>::new();
+    for case in cases {
+        *counts.entry(case.point).or_default() += 1;
+    }
+    let duplicates = counts
+        .iter()
+        .filter_map(|(point, count)| (*count > 1).then_some(*point))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(duplicates.is_empty(), "failure matrix 중복: {duplicates:?}");
+
+    let expected = expected.iter().map(String::as_str).collect::<Vec<_>>();
+    let missing = expected
+        .iter()
+        .copied()
+        .filter(|point| !counts.contains_key(point))
+        .collect::<Vec<_>>();
+    let unknown = counts
+        .keys()
+        .copied()
+        .filter(|point| !expected.contains(point))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        missing.is_empty() && unknown.is_empty() && cases.len() == expected.len(),
+        "failure matrix 불일치: missing={missing:?}, unknown={unknown:?}"
+    );
+    Ok(())
+}
+
+fn run_exact_test(case: &FailureMatrixCase) -> anyhow::Result<()> {
+    let root = workspace_root()?;
+    let output = std::process::Command::new("cargo")
+        .args([
+            "test",
+            "-p",
+            case.package,
+            case.exact_test,
+            "--",
+            "--exact",
+            "--test-threads=1",
+        ])
+        .current_dir(root)
+        .output()
+        .with_context(|| format!("{} failure test 실행 실패", case.point))?;
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    anyhow::ensure!(
+        output.status.success(),
+        "{} failure test 실패: {}",
+        case.point,
+        output.status
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    anyhow::ensure!(
+        stdout.contains("test result: ok. 1 passed;"),
+        "{} failure test가 정확히 1개 선택되지 않았습니다",
+        case.point
+    );
     Ok(())
 }
 
@@ -1017,6 +1175,39 @@ mod tests {
             expected.sort();
             assert_eq!(actual, expected, "{crate_name}");
         }
+    }
+
+    #[test]
+    fn od01_failure_matrix는_contract_variant와_exact_one_to_one이다() {
+        let root = workspace_root().unwrap();
+        let variants = failure_point_variants(&root).unwrap();
+        validate_failure_matrix(&variants, OD01_FAILURE_MATRIX).unwrap();
+        assert_eq!(variants.len(), 10);
+    }
+
+    #[test]
+    fn od01_failure_matrix는_missing_duplicate_unknown을_거부한다() {
+        const DUPLICATE: &[FailureMatrixCase] = &[
+            FailureMatrixCase {
+                point: "Only",
+                package: "fixture",
+                exact_test: "fixture::one",
+            },
+            FailureMatrixCase {
+                point: "Only",
+                package: "fixture",
+                exact_test: "fixture::two",
+            },
+        ];
+        const UNKNOWN: &[FailureMatrixCase] = &[FailureMatrixCase {
+            point: "Unexpected",
+            package: "fixture",
+            exact_test: "fixture::one",
+        }];
+        let expected = vec!["Only".to_owned(), "Missing".to_owned()];
+        assert!(validate_failure_matrix(&expected, DUPLICATE).is_err());
+        assert!(validate_failure_matrix(&expected, UNKNOWN).is_err());
+        assert!(validate_failure_matrix(&expected, &OD01_FAILURE_MATRIX[..1]).is_err());
     }
 
     #[test]

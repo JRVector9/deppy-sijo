@@ -160,6 +160,7 @@ impl std::fmt::Debug for ActiveAuthorizationOwner {
 /// 25: tool audit operation lifecycle (PR-ST01).
 /// 26: authorization scope/run ownership columns (PR-AU01).
 /// 27: durable Connector config revision + mutation triggers (PR-IN01 prerequisite).
+/// 28: exact physical secret-slot lifecycle ledger (PR-SC01 prerequisite).
 /// 4~6은 각 crate가 소유한 DDL 상수를 그대로 붙인다 (스키마 정의는 한 곳에서만).
 pub(crate) const MIGRATIONS: &[&str] = &[
     "
@@ -528,6 +529,58 @@ BEGIN
     SELECT CASE WHEN changes() != 1 THEN RAISE(ABORT, 'connector config revision missing') END;
 END;
 ",
+    // v28: durable exact-slot ownership replaces platform-wide keyring enumeration. This table
+    // stores only logical/physical identifiers and lifecycle state, never a secret value. It has
+    // deliberately no Connector revision trigger: staging and deletion acknowledgement are
+    // housekeeping; credential pointer publication remains the config-visible trigger source.
+    "
+CREATE TABLE physical_secret_slot_ledger (
+    physical_slot TEXT PRIMARY KEY,
+    logical_credential_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('staging', 'published', 'orphan')),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    CHECK (length(CAST(logical_credential_id AS BLOB)) BETWEEN 1 AND 96),
+    CHECK (length(CAST(physical_slot AS BLOB)) BETWEEN 1 AND 255),
+    CHECK (instr(logical_credential_id, char(0)) = 0),
+    CHECK (instr(physical_slot, char(0)) = 0)
+);
+
+CREATE UNIQUE INDEX idx_physical_secret_slot_one_published
+    ON physical_secret_slot_ledger(logical_credential_id)
+    WHERE state = 'published';
+CREATE INDEX idx_physical_secret_slot_reconcile
+    ON physical_secret_slot_ledger(state, created_at, physical_slot);
+CREATE INDEX idx_credentials_keyring_username ON credentials(keyring_username);
+
+CREATE TRIGGER physical_secret_slot_identity_immutable
+BEFORE UPDATE OF physical_slot, logical_credential_id ON physical_secret_slot_ledger
+BEGIN
+    SELECT RAISE(ABORT, 'physical secret slot identity is immutable');
+END;
+CREATE TRIGGER physical_secret_slot_valid_transition
+BEFORE UPDATE OF state ON physical_secret_slot_ledger
+WHEN NOT (
+    (OLD.state = 'staging' AND NEW.state IN ('published', 'orphan'))
+    OR (OLD.state = 'published' AND NEW.state = 'orphan')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid physical secret slot lifecycle transition');
+END;
+
+INSERT INTO physical_secret_slot_ledger
+    (physical_slot, logical_credential_id, state, created_at, updated_at)
+SELECT keyring_username, id, 'published',
+       CAST(strftime('%s','now') AS INTEGER), CAST(strftime('%s','now') AS INTEGER)
+FROM credentials
+WHERE keyring_username LIKE 'deppy.oauth.v1.%'
+  AND keyring_username != id
+  AND keyring_service = 'app.vector9.deppy-sijo'
+  AND length(CAST(id AS BLOB)) BETWEEN 1 AND 96
+  AND length(CAST(keyring_username AS BLOB)) BETWEEN 1 AND 255
+  AND instr(id, char(0)) = 0
+  AND instr(keyring_username, char(0)) = 0;
+",
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -592,6 +645,52 @@ pub struct CredentialSecretLocation {
     pub keyring_username: String,
 }
 
+/// Durable lifecycle of one exact physical keyring bundle base slot. Secret values and derived
+/// refresh/DCR entry contents never enter storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhysicalSecretSlotState {
+    Staging,
+    Published,
+    Orphan,
+}
+
+impl PhysicalSecretSlotState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Staging => "staging",
+            Self::Published => "published",
+            Self::Orphan => "orphan",
+        }
+    }
+
+    fn from_persisted(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "staging" => Ok(Self::Staging),
+            "published" => Ok(Self::Published),
+            "orphan" => Ok(Self::Orphan),
+            _ => anyhow::bail!("알 수 없는 physical secret slot state"),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct PhysicalSecretSlotLedgerRow {
+    pub logical_credential_id: String,
+    pub physical_slot: String,
+    pub state: PhysicalSecretSlotState,
+}
+
+impl std::fmt::Debug for PhysicalSecretSlotLedgerRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PhysicalSecretSlotLedgerRow")
+            .field("logical_credential_id", &"REDACTED")
+            .field("physical_slot", &"REDACTED")
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
 /// Bootstrap/migration view of one credential and its logical-to-physical keyring pointer.
 /// Secret values are never loaded into this DTO. The pointer remains a string because pre-IN01
 /// databases can still contain the legacy logical credential id in `keyring_username`.
@@ -628,6 +727,9 @@ impl std::fmt::Debug for CredentialOAuthBindingRecord {
 
 pub const CREDENTIAL_OAUTH_BINDING_BYTES_MAX: usize = 64 * 1024;
 pub const CREDENTIAL_SECRET_LOCATION_BYTES_MAX: usize = 1024;
+pub const CREDENTIAL_SECRET_RECORD_BYTES_MAX: usize = 1024 * 1024;
+pub const PHYSICAL_SECRET_SLOT_RECONCILIATION_LIMIT_MAX: usize = 4_096;
+pub const PHYSICAL_SECRET_SLOT_RECONCILIATION_BYTES_MAX: usize = 1024 * 1024;
 
 /// workspace 한 행 (WorkspaceSidebar 표시용).
 #[derive(Debug, Clone, PartialEq)]
@@ -916,6 +1018,18 @@ fn looks_like_token_literal(value: &str) -> bool {
 }
 
 fn validate_owned_physical_secret_slot(logical_id: &str, slot: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !logical_id.is_empty() && logical_id.len() <= 96,
+        "logical credential id byte 길이가 유효하지 않습니다"
+    );
+    anyhow::ensure!(
+        !slot.is_empty() && slot.len() <= 255,
+        "physical secret slot byte 길이가 유효하지 않습니다"
+    );
+    anyhow::ensure!(
+        !logical_id.contains('\0') && !slot.contains('\0'),
+        "credential/physical slot identifier에 NUL을 허용하지 않습니다"
+    );
     let logical_id = secret::LogicalCredentialId::new(logical_id.to_owned())
         .context("logical credential id 검증 실패")?;
     let slot = secret::PhysicalSecretSlot::parse(slot.to_owned())
@@ -928,6 +1042,10 @@ fn validate_owned_physical_secret_slot(logical_id: &str, slot: &str) -> anyhow::
 }
 
 fn validate_oauth_metadata_json(json: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        json.len() <= CREDENTIAL_OAUTH_BINDING_BYTES_MAX,
+        "OAuth metadata JSON byte 상한을 초과했습니다"
+    );
     let value: serde_json::Value =
         serde_json::from_str(json).context("OAuth metadata JSON 검증 실패")?;
     anyhow::ensure!(
@@ -1086,6 +1204,397 @@ impl Db {
         Ok(ConnectorConfigCas::Committed { revision, value })
     }
 
+    fn physical_secret_slot_ledger_state(
+        conn: &Connection,
+        physical_slot: &str,
+    ) -> anyhow::Result<Option<(String, PhysicalSecretSlotState)>> {
+        let row = conn
+            .query_row(
+                "SELECT logical_credential_id, state
+                 FROM physical_secret_slot_ledger WHERE physical_slot = ?1",
+                [physical_slot],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        row.map(|(logical_id, state)| {
+            validate_owned_physical_secret_slot(&logical_id, physical_slot)?;
+            Ok((logical_id, PhysicalSecretSlotState::from_persisted(&state)?))
+        })
+        .transpose()
+    }
+
+    fn require_physical_secret_slot_state(
+        conn: &Connection,
+        logical_id: &str,
+        physical_slot: &str,
+        expected: PhysicalSecretSlotState,
+    ) -> anyhow::Result<()> {
+        let (stored_logical_id, state) =
+            Self::physical_secret_slot_ledger_state(conn, physical_slot)?
+                .with_context(|| format!("physical secret slot ledger row 없음: {logical_id}"))?;
+        anyhow::ensure!(
+            stored_logical_id == logical_id,
+            "physical secret slot ledger owner 불일치"
+        );
+        anyhow::ensure!(
+            state == expected,
+            "physical secret slot lifecycle state 불일치"
+        );
+        Ok(())
+    }
+
+    fn transition_physical_secret_slot_state(
+        conn: &Connection,
+        logical_id: &str,
+        physical_slot: &str,
+        from: PhysicalSecretSlotState,
+        to: PhysicalSecretSlotState,
+    ) -> anyhow::Result<()> {
+        let affected = conn.execute(
+            "UPDATE physical_secret_slot_ledger
+             SET state = ?4, updated_at = CAST(strftime('%s','now') AS INTEGER)
+             WHERE physical_slot = ?1 AND logical_credential_id = ?2 AND state = ?3",
+            (physical_slot, logical_id, from.as_str(), to.as_str()),
+        )?;
+        anyhow::ensure!(
+            affected == 1,
+            "physical secret slot state transition 대상 불일치"
+        );
+        Ok(())
+    }
+
+    fn ensure_physical_secret_slot_ledger_capacity(
+        conn: &Connection,
+        logical_id: &str,
+        physical_slot: &str,
+    ) -> anyhow::Result<()> {
+        let (row_count, row_bytes): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(
+                        length(CAST(physical_slot AS BLOB)) +
+                        length(CAST(logical_credential_id AS BLOB)) +
+                        length(CAST(state AS BLOB))
+                    ), 0)
+             FROM physical_secret_slot_ledger",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let row_count =
+            usize::try_from(row_count).context("physical secret slot count 변환 실패")?;
+        let row_bytes =
+            usize::try_from(row_bytes).context("physical secret slot bytes 변환 실패")?;
+        anyhow::ensure!(
+            row_count < PHYSICAL_SECRET_SLOT_RECONCILIATION_LIMIT_MAX,
+            "physical secret slot ledger item capacity 초과"
+        );
+        let added_bytes = logical_id
+            .len()
+            .checked_add(physical_slot.len())
+            .and_then(|bytes| bytes.checked_add(PhysicalSecretSlotState::Staging.as_str().len()))
+            .context("physical secret slot ledger byte 계산 overflow")?;
+        let next_bytes = row_bytes
+            .checked_add(added_bytes)
+            .context("physical secret slot ledger byte capacity overflow")?;
+        anyhow::ensure!(
+            next_bytes <= PHYSICAL_SECRET_SLOT_RECONCILIATION_BYTES_MAX,
+            "physical secret slot ledger byte capacity 초과"
+        );
+        Ok(())
+    }
+
+    fn orphan_published_physical_slot_if_versioned(
+        conn: &Connection,
+        logical_id: &str,
+        physical_slot: &str,
+    ) -> anyhow::Result<()> {
+        if physical_slot == logical_id {
+            // Pre-ledger logical-id pointer. There is no exact physical bundle to enumerate.
+            return Ok(());
+        }
+        validate_owned_physical_secret_slot(logical_id, physical_slot)?;
+        Self::transition_physical_secret_slot_state(
+            conn,
+            logical_id,
+            physical_slot,
+            PhysicalSecretSlotState::Published,
+            PhysicalSecretSlotState::Orphan,
+        )
+    }
+
+    fn insert_credential_with_secret_slot_in_transaction(
+        conn: &Connection,
+        meta: &CredentialMeta,
+        physical_slot: &str,
+        oauth_json: Option<&str>,
+    ) -> anyhow::Result<()> {
+        Self::require_physical_secret_slot_state(
+            conn,
+            &meta.id,
+            physical_slot,
+            PhysicalSecretSlotState::Staging,
+        )?;
+        conn.execute(
+            "INSERT INTO credentials
+               (id, provider, label, credential_kind,
+                keyring_service, keyring_username, masked_hint, workspace_id, oauth_json,
+                created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            (
+                &meta.id,
+                &meta.provider,
+                &meta.label,
+                &meta.credential_kind,
+                secret::KEYRING_SERVICE,
+                physical_slot,
+                &meta.masked_hint,
+                &meta.workspace_id,
+                oauth_json,
+            ),
+        )
+        .with_context(|| format!("physical-slot credential 저장 실패: {}", meta.id))?;
+        Self::transition_physical_secret_slot_state(
+            conn,
+            &meta.id,
+            physical_slot,
+            PhysicalSecretSlotState::Staging,
+            PhysicalSecretSlotState::Published,
+        )
+    }
+
+    fn publish_credential_secret_slot_in_transaction(
+        conn: &Connection,
+        logical_id: &str,
+        expected_previous_pointer: &str,
+        physical_slot: &str,
+        oauth_json: Option<&str>,
+        masked_hint: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        Self::require_physical_secret_slot_state(
+            conn,
+            logical_id,
+            physical_slot,
+            PhysicalSecretSlotState::Staging,
+        )?;
+        let current_pointer = conn
+            .query_row(
+                "SELECT keyring_username FROM credentials WHERE id = ?1",
+                [logical_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if current_pointer.as_deref() != Some(expected_previous_pointer) {
+            Self::transition_physical_secret_slot_state(
+                conn,
+                logical_id,
+                physical_slot,
+                PhysicalSecretSlotState::Staging,
+                PhysicalSecretSlotState::Orphan,
+            )?;
+            return Ok(false);
+        }
+        Self::orphan_published_physical_slot_if_versioned(
+            conn,
+            logical_id,
+            expected_previous_pointer,
+        )?;
+        let affected = conn
+            .execute(
+                "UPDATE credentials
+                 SET keyring_username = ?3, oauth_json = ?4, masked_hint = ?5,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE id = ?1 AND keyring_username = ?2",
+                (
+                    logical_id,
+                    expected_previous_pointer,
+                    physical_slot,
+                    oauth_json,
+                    masked_hint,
+                ),
+            )
+            .with_context(|| format!("credential secret slot CAS publish 실패: {logical_id}"))?;
+        anyhow::ensure!(
+            affected == 1,
+            "credential pointer가 transaction 안에서 변경됐습니다"
+        );
+        Self::transition_physical_secret_slot_state(
+            conn,
+            logical_id,
+            physical_slot,
+            PhysicalSecretSlotState::Staging,
+            PhysicalSecretSlotState::Published,
+        )?;
+        Ok(true)
+    }
+
+    /// Register the exact bundle base slot before any keyring entry is written. Re-registering
+    /// the same still-staging row is idempotent; published/orphan reuse is rejected.
+    pub fn register_physical_secret_slot_staging(
+        &self,
+        logical_id: &str,
+        physical_slot: &str,
+    ) -> anyhow::Result<()> {
+        validate_owned_physical_secret_slot(logical_id, physical_slot)?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if let Some((stored_logical_id, state)) =
+            Self::physical_secret_slot_ledger_state(&tx, physical_slot)?
+        {
+            anyhow::ensure!(
+                stored_logical_id == logical_id,
+                "physical secret slot owner 불일치"
+            );
+            anyhow::ensure!(
+                state == PhysicalSecretSlotState::Staging,
+                "published/orphan physical secret slot은 재사용할 수 없습니다"
+            );
+        } else {
+            Self::ensure_physical_secret_slot_ledger_capacity(&tx, logical_id, physical_slot)?;
+            tx.execute(
+                "INSERT INTO physical_secret_slot_ledger
+                   (physical_slot, logical_credential_id, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'staging', CAST(strftime('%s','now') AS INTEGER),
+                         CAST(strftime('%s','now') AS INTEGER))",
+                (physical_slot, logical_id),
+            )?;
+        }
+        tx.commit()
+            .context("physical secret slot staging 등록 commit 실패")
+    }
+
+    /// Acknowledge that an exact staging/orphan keyring bundle is absent or was deleted. Published
+    /// slots are never acknowledged away because they are still a live credential capability.
+    pub fn acknowledge_physical_secret_slot_deleted(
+        &self,
+        logical_id: &str,
+        physical_slot: &str,
+    ) -> anyhow::Result<bool> {
+        validate_owned_physical_secret_slot(logical_id, physical_slot)?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let Some((stored_logical_id, state)) =
+            Self::physical_secret_slot_ledger_state(&tx, physical_slot)?
+        else {
+            tx.commit()?;
+            return Ok(false);
+        };
+        anyhow::ensure!(
+            stored_logical_id == logical_id,
+            "physical secret slot owner 불일치"
+        );
+        anyhow::ensure!(
+            matches!(
+                state,
+                PhysicalSecretSlotState::Staging | PhysicalSecretSlotState::Orphan
+            ),
+            "published physical secret slot 삭제 acknowledgement를 거부합니다"
+        );
+        let deleted = tx.execute(
+            "DELETE FROM physical_secret_slot_ledger
+             WHERE physical_slot = ?1 AND logical_credential_id = ?2 AND state = ?3",
+            (physical_slot, logical_id, state.as_str()),
+        )?;
+        anyhow::ensure!(
+            deleted == 1,
+            "physical secret slot acknowledgement 대상 불일치"
+        );
+        tx.commit()
+            .context("physical secret slot acknowledgement commit 실패")?;
+        Ok(true)
+    }
+
+    /// Complete-or-error bounded startup inventory. The caller performs exact keyring get/delete
+    /// operations for these slots; platform-wide keyring enumeration is unnecessary.
+    pub fn physical_secret_slots_for_reconciliation(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<PhysicalSecretSlotLedgerRow>> {
+        anyhow::ensure!(
+            limit <= PHYSICAL_SECRET_SLOT_RECONCILIATION_LIMIT_MAX,
+            "physical secret slot reconciliation item limit 초과"
+        );
+        let probe = limit
+            .checked_add(1)
+            .context("physical secret slot limit overflow")?;
+        let sql_limit = i64::try_from(probe).context("physical secret slot LIMIT 변환 실패")?;
+        let tx = self.conn.unchecked_transaction()?;
+        let (row_count, row_bytes): (i64, i64) = tx.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(
+                        length(CAST(physical_slot AS BLOB)) +
+                        length(CAST(logical_credential_id AS BLOB)) +
+                        length(CAST(state AS BLOB))
+                    ), 0)
+             FROM (
+                 SELECT physical_slot, logical_credential_id, state
+                 FROM physical_secret_slot_ledger
+                 ORDER BY created_at, physical_slot LIMIT ?1
+             )",
+            [sql_limit],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let row_count =
+            usize::try_from(row_count).context("physical secret slot count 변환 실패")?;
+        let row_bytes =
+            usize::try_from(row_bytes).context("physical secret slot bytes 변환 실패")?;
+        anyhow::ensure!(
+            row_count <= limit,
+            "physical secret slot reconciliation limit 초과"
+        );
+        anyhow::ensure!(
+            row_bytes <= PHYSICAL_SECRET_SLOT_RECONCILIATION_BYTES_MAX,
+            "physical secret slot reconciliation byte budget 초과"
+        );
+        let rows = {
+            let mut statement = tx.prepare(
+                "SELECT ledger.physical_slot, ledger.logical_credential_id, ledger.state,
+                        (SELECT COUNT(*) FROM credentials c
+                         WHERE c.keyring_username = ledger.physical_slot),
+                        (SELECT COUNT(*) FROM credentials c
+                         WHERE c.id = ledger.logical_credential_id
+                           AND c.keyring_username = ledger.physical_slot)
+                 FROM physical_secret_slot_ledger ledger
+                 ORDER BY ledger.created_at, ledger.physical_slot LIMIT ?1",
+            )?;
+            let mapped = statement.query_map([sql_limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?;
+            let mut rows = Vec::with_capacity(row_count);
+            for row in mapped {
+                let (physical_slot, logical_credential_id, state, any_refs, exact_refs) = row?;
+                validate_owned_physical_secret_slot(&logical_credential_id, &physical_slot)?;
+                let state = PhysicalSecretSlotState::from_persisted(&state)?;
+                match state {
+                    PhysicalSecretSlotState::Published => anyhow::ensure!(
+                        any_refs == 1 && exact_refs == 1,
+                        "published physical secret slot credential reference 불일치"
+                    ),
+                    PhysicalSecretSlotState::Staging | PhysicalSecretSlotState::Orphan => {
+                        anyhow::ensure!(
+                            any_refs == 0 && exact_refs == 0,
+                            "non-published physical secret slot이 credential에 참조됩니다"
+                        );
+                    }
+                }
+                rows.push(PhysicalSecretSlotLedgerRow {
+                    logical_credential_id,
+                    physical_slot,
+                    state,
+                });
+            }
+            rows
+        };
+        anyhow::ensure!(
+            rows.len() == row_count,
+            "physical secret slot same-snapshot count 불일치"
+        );
+        tx.commit()
+            .context("physical secret slot reconciliation read commit 실패")?;
+        Ok(rows)
+    }
+
     /// credential metadata 추가. created_at/updated_at은 SQLite가 UTC로 기록한다.
     ///
     /// 이 기존 생성 경로는 IN01 migration/cutover 전까지 logical id 자체를 keyring username에
@@ -1129,28 +1638,36 @@ impl Db {
         if let Some(json) = oauth_json {
             validate_oauth_metadata_json(json)?;
         }
-        self.conn
-            .execute(
-                "INSERT INTO credentials
-                   (id, provider, label, credential_kind,
-                    keyring_service, keyring_username, masked_hint, workspace_id, oauth_json,
-                    created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
-                    strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-                (
-                    &meta.id,
-                    &meta.provider,
-                    &meta.label,
-                    &meta.credential_kind,
-                    secret::KEYRING_SERVICE,
-                    physical_slot,
-                    &meta.masked_hint,
-                    &meta.workspace_id,
-                    oauth_json,
-                ),
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        Self::insert_credential_with_secret_slot_in_transaction(
+            &tx,
+            meta,
+            physical_slot,
+            oauth_json,
+        )?;
+        tx.commit()
+            .context("physical-slot credential/ledger publish commit 실패")
+    }
+
+    pub fn insert_credential_with_secret_slot_revision_cas(
+        &mut self,
+        expected_revision: ConnectorConfigRevision,
+        meta: &CredentialMeta,
+        physical_slot: &str,
+        oauth_json: Option<&str>,
+    ) -> anyhow::Result<ConnectorConfigCas<()>> {
+        validate_owned_physical_secret_slot(&meta.id, physical_slot)?;
+        if let Some(json) = oauth_json {
+            validate_oauth_metadata_json(json)?;
+        }
+        self.write_connector_config_cas(expected_revision, |conn| {
+            Self::insert_credential_with_secret_slot_in_transaction(
+                conn,
+                meta,
+                physical_slot,
+                oauth_json,
             )
-            .with_context(|| format!("physical-slot credential 저장 실패: {}", meta.id))?;
-        Ok(())
+        })
     }
 
     pub fn list_credentials(&self) -> anyhow::Result<Vec<CredentialMeta>> {
@@ -1183,31 +1700,70 @@ impl Db {
             .context("credential secret record limit overflow")?;
         let fetch_limit = i64::try_from(fetch_limit)
             .context("credential secret record limit exceeds SQLite range")?;
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT id, provider, label, credential_kind, masked_hint, workspace_id,
-                    keyring_service, keyring_username, oauth_json
-             FROM credentials ORDER BY created_at, id LIMIT ?1",
+        let tx = self.conn.unchecked_transaction()?;
+        let (row_count, row_bytes): (i64, i64) = tx.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(
+                        length(CAST(id AS BLOB)) +
+                        length(CAST(provider AS BLOB)) +
+                        length(CAST(label AS BLOB)) +
+                        length(CAST(credential_kind AS BLOB)) +
+                        COALESCE(length(CAST(masked_hint AS BLOB)), 0) +
+                        COALESCE(length(CAST(workspace_id AS BLOB)), 0) +
+                        length(CAST(keyring_service AS BLOB)) +
+                        length(CAST(keyring_username AS BLOB)) +
+                        COALESCE(length(CAST(oauth_json AS BLOB)), 0)
+                    ), 0)
+             FROM (
+                 SELECT id, provider, label, credential_kind, masked_hint, workspace_id,
+                        keyring_service, keyring_username, oauth_json
+                 FROM credentials ORDER BY created_at, id LIMIT ?1
+             )",
+            [fetch_limit],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let rows = stmt.query_map([fetch_limit], |row| {
-            Ok(CredentialSecretRecord {
-                meta: CredentialMeta {
-                    id: row.get(0)?,
-                    provider: row.get(1)?,
-                    label: row.get(2)?,
-                    credential_kind: row.get(3)?,
-                    masked_hint: row.get(4)?,
-                    workspace_id: row.get(5)?,
-                },
-                keyring_service: row.get(6)?,
-                keyring_username: row.get(7)?,
-                oauth_json: row.get(8)?,
-            })
-        })?;
-        let records = rows.collect::<Result<Vec<_>, _>>()?;
+        let row_count =
+            usize::try_from(row_count).context("credential secret record count 변환 실패")?;
+        let row_bytes =
+            usize::try_from(row_bytes).context("credential secret record bytes 변환 실패")?;
         anyhow::ensure!(
-            records.len() <= limit,
+            row_count <= limit,
             "credential secret record limit exceeded: limit={limit}"
         );
+        anyhow::ensure!(
+            row_bytes <= CREDENTIAL_SECRET_RECORD_BYTES_MAX,
+            "credential secret record byte 상한을 초과했습니다"
+        );
+        let exact_limit =
+            i64::try_from(row_count).context("credential secret record count SQLite 변환 실패")?;
+        let records = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT id, provider, label, credential_kind, masked_hint, workspace_id,
+                        keyring_service, keyring_username, oauth_json
+                 FROM credentials ORDER BY created_at, id LIMIT ?1",
+            )?;
+            let rows = stmt.query_map([exact_limit], |row| {
+                Ok(CredentialSecretRecord {
+                    meta: CredentialMeta {
+                        id: row.get(0)?,
+                        provider: row.get(1)?,
+                        label: row.get(2)?,
+                        credential_kind: row.get(3)?,
+                        masked_hint: row.get(4)?,
+                        workspace_id: row.get(5)?,
+                    },
+                    keyring_service: row.get(6)?,
+                    keyring_username: row.get(7)?,
+                    oauth_json: row.get(8)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        anyhow::ensure!(
+            records.len() == row_count,
+            "credential secret record same-snapshot count 불일치"
+        );
+        tx.commit()
+            .context("credential secret record snapshot commit 실패")?;
         Ok(records)
     }
 
@@ -1238,6 +1794,7 @@ impl Db {
     /// OAuth 연계 메타데이터(JSON, 비밀 아님 — v20)를 갱신한다 (PR-H5).
     /// 값 스키마는 앱(connectors)의 OAuthConnection 직렬화가 소유한다.
     pub fn set_credential_oauth_json(&self, id: &str, json: &str) -> anyhow::Result<()> {
+        validate_oauth_metadata_json(json)?;
         let affected = self
             .conn
             .execute(
@@ -1253,7 +1810,8 @@ impl Db {
 
     /// 새 access/refresh/DCR bundle이 이미 기록된 physical slot을 OAuth metadata와 함께
     /// 한 transaction으로 publish한다. 이 함수는 secret 값을 받거나 저장하지 않는다.
-    /// 호출자는 commit 성공 후에만 이전 slot을 지우고, 실패 시 새 orphan slot을 정리한다.
+    /// 성공 시 이전 published slot은 같은 transaction에서 orphan이 된다. 호출자는 commit
+    /// 이후 그 exact bundle만 keyring에서 지우고 acknowledgement API로 ledger를 정리한다.
     pub fn rotate_credential_secret_slot(
         &self,
         id: &str,
@@ -1265,25 +1823,32 @@ impl Db {
         // transaction. A staged slot for another logical credential can never be published.
         validate_owned_physical_secret_slot(id, physical_slot)?;
         validate_oauth_metadata_json(oauth_json)?;
-        let tx = self.conn.unchecked_transaction()?;
-        let affected = tx
-            .execute(
-                "UPDATE credentials
-                 SET keyring_username = ?2, oauth_json = ?3, masked_hint = ?4,
-                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-                 WHERE id = ?1",
-                (id, physical_slot, oauth_json, masked_hint),
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let current_pointer: String = tx
+            .query_row(
+                "SELECT keyring_username FROM credentials WHERE id = ?1",
+                [id],
+                |row| row.get(0),
             )
-            .with_context(|| format!("credential secret slot publish 실패: {id}"))?;
-        anyhow::ensure!(affected == 1, "credential 없음: {id}");
+            .with_context(|| format!("credential 없음: {id}"))?;
+        let published = Self::publish_credential_secret_slot_in_transaction(
+            &tx,
+            id,
+            &current_pointer,
+            physical_slot,
+            Some(oauth_json),
+            masked_hint,
+        )?;
+        anyhow::ensure!(published, "credential pointer publish 대상 없음: {id}");
         tx.commit()
-            .context("credential secret slot/metadata commit 실패")
+            .context("credential secret slot/metadata/ledger commit 실패")
     }
 
     /// Compare-and-swap publishes an already-staged physical slot together with its optional
     /// OAuth metadata and masked hint. The update occurs only while the stored pointer exactly
-    /// matches `expected_previous_pointer`; stale or missing rows return `false` without changing
-    /// any column. `None` writes SQL NULL, preserving the non-OAuth representation.
+    /// matches `expected_previous_pointer`; stale or missing rows return `false` after moving the
+    /// new staged slot to orphan, without changing Connector revision or credential columns.
+    /// `None` writes SQL NULL, preserving the non-OAuth representation.
     pub fn publish_credential_secret_slot_cas(
         &self,
         logical_id: &str,
@@ -1296,32 +1861,24 @@ impl Db {
         if let Some(json) = oauth_json {
             validate_oauth_metadata_json(json)?;
         }
-        let affected = self
-            .conn
-            .execute(
-                "UPDATE credentials
-                 SET keyring_username = ?3, oauth_json = ?4, masked_hint = ?5,
-                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-                 WHERE id = ?1 AND keyring_username = ?2",
-                (
-                    logical_id,
-                    expected_previous_pointer,
-                    physical_slot,
-                    oauth_json,
-                    masked_hint,
-                ),
-            )
-            .with_context(|| format!("credential secret slot CAS publish 실패: {logical_id}"))?;
-        anyhow::ensure!(
-            affected <= 1,
-            "credential secret slot CAS가 여러 행을 변경했습니다"
-        );
-        Ok(affected == 1)
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let published = Self::publish_credential_secret_slot_in_transaction(
+            &tx,
+            logical_id,
+            expected_previous_pointer,
+            physical_slot,
+            oauth_json,
+            masked_hint,
+        )?;
+        tx.commit()
+            .context("credential secret slot CAS/ledger commit 실패")?;
+        Ok(published)
     }
 
     /// Expected-config-revision CAS wrapped around the physical-pointer CAS. A stale config
-    /// writer never evaluates the pointer mutation; a stale physical pointer commits a no-op at
-    /// the unchanged revision and returns `value=false`.
+    /// writer never evaluates the pointer mutation and leaves staging intact. When the global
+    /// revision matches but the physical pointer is stale, the new slot becomes orphan at the
+    /// unchanged revision and returns `value=false`.
     pub fn publish_credential_secret_slot_revision_cas(
         &mut self,
         expected_revision: ConnectorConfigRevision,
@@ -1336,28 +1893,14 @@ impl Db {
             validate_oauth_metadata_json(json)?;
         }
         self.write_connector_config_cas(expected_revision, |conn| {
-            let affected = conn
-                .execute(
-                    "UPDATE credentials
-                     SET keyring_username = ?3, oauth_json = ?4, masked_hint = ?5,
-                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-                     WHERE id = ?1 AND keyring_username = ?2",
-                    (
-                        logical_id,
-                        expected_previous_pointer,
-                        physical_slot,
-                        oauth_json,
-                        masked_hint,
-                    ),
-                )
-                .with_context(|| {
-                    format!("credential secret slot revision CAS publish 실패: {logical_id}")
-                })?;
-            anyhow::ensure!(
-                affected <= 1,
-                "credential secret slot revision CAS가 여러 행을 변경했습니다"
-            );
-            Ok(affected == 1)
+            Self::publish_credential_secret_slot_in_transaction(
+                conn,
+                logical_id,
+                expected_previous_pointer,
+                physical_slot,
+                oauth_json,
+                masked_hint,
+            )
         })
     }
 
@@ -1526,8 +2069,15 @@ impl Db {
     /// "확인 후 삭제 사이에 참조가 생기는" TOCTOU를 없앤다 (codex 리뷰).
     /// 지웠으면 true, 참조 중이거나 없는 id면 false.
     pub fn delete_credential_if_unused(&self, id: &str) -> anyhow::Result<bool> {
-        let affected = self
-            .conn
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let pointer = tx
+            .query_row(
+                "SELECT keyring_username FROM credentials WHERE id = ?1",
+                [id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let affected = tx
             .execute(
                 "DELETE FROM credentials WHERE id = ?1
                    AND NOT EXISTS (SELECT 1 FROM env_vars WHERE credential_id = ?1)
@@ -1539,6 +2089,12 @@ impl Db {
                 [id],
             )
             .with_context(|| format!("credential 삭제 실패: {id}"))?;
+        if affected == 1 {
+            let pointer = pointer.context("삭제된 credential pointer snapshot 없음")?;
+            Self::orphan_published_physical_slot_if_versioned(&tx, id, &pointer)?;
+        }
+        tx.commit()
+            .context("credential delete/slot orphan commit 실패")?;
         Ok(affected == 1)
     }
 
@@ -1550,8 +2106,8 @@ impl Db {
         id: &str,
         expected_pointer: &str,
     ) -> anyhow::Result<bool> {
-        let affected = self
-            .conn
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let affected = tx
             .execute(
                 "DELETE FROM credentials WHERE id = ?1 AND keyring_username = ?2
                    AND NOT EXISTS (SELECT 1 FROM env_vars WHERE credential_id = ?1)
@@ -1563,6 +2119,11 @@ impl Db {
                 (id, expected_pointer),
             )
             .with_context(|| format!("credential expected-pointer 삭제 실패: {id}"))?;
+        if affected == 1 {
+            Self::orphan_published_physical_slot_if_versioned(&tx, id, expected_pointer)?;
+        }
+        tx.commit()
+            .context("credential expected-pointer delete/slot orphan commit 실패")?;
         Ok(affected == 1)
     }
 
@@ -3705,6 +4266,15 @@ mod tests {
         }
     }
 
+    fn stage_slot(
+        db: &Db,
+        logical_id: &secret::LogicalCredentialId,
+        slot: &secret::PhysicalSecretSlot,
+    ) {
+        db.register_physical_secret_slot_staging(logical_id.as_str(), slot.as_str())
+            .unwrap();
+    }
+
     #[test]
     fn connector_config_revision은_모든_가시_mutation과_versioned_read를_추적한다() {
         let mut db = Db::open_in_memory().unwrap();
@@ -3937,6 +4507,7 @@ mod tests {
         let before = db.connector_config_revision().unwrap();
         let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
         let oauth_json = r#"{"server_id":"server"}"#;
+        stage_slot(&db, &logical, &slot);
 
         let (published, changed) = committed(
             db.publish_credential_secret_slot_revision_cas(
@@ -3963,12 +4534,15 @@ mod tests {
         assert_eq!(binding.value.len(), 1);
         assert_eq!(binding.value[0].physical_pointer, slot.as_str());
 
+        let stale_candidate =
+            secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        stage_slot(&db, &logical, &stale_candidate);
         let (unchanged, changed) = committed(
             db.publish_credential_secret_slot_revision_cas(
                 published,
                 logical.as_str(),
                 "stale-pointer",
-                slot.as_str(),
+                stale_candidate.as_str(),
                 Some(oauth_json),
                 Some("masked"),
             )
@@ -4049,6 +4623,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let logical = secret::LogicalCredentialId::new("cred-delete-cas").unwrap();
         let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        stage_slot(&db, &logical, &slot);
         db.insert_credential_with_secret_slot(&sample(logical.as_str()), slot.as_str(), None)
             .unwrap();
 
@@ -4100,6 +4675,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let logical = secret::LogicalCredentialId::new("cred-delete-mcp").unwrap();
         let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        stage_slot(&db, &logical, &slot);
         db.insert_credential_with_secret_slot(&sample(logical.as_str()), slot.as_str(), None)
             .unwrap();
         let mut server = sample_mcp_server("srv-delete-ref");
@@ -4147,6 +4723,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let other = secret::LogicalCredentialId::new("cred-binding-other").unwrap();
         let other_slot = secret::PhysicalSecretSlot::with_version(&other, uuid::Uuid::new_v4());
+        stage_slot(&db, &other, &other_slot);
         db.insert_credential_with_secret_slot(
             &sample(other.as_str()),
             other_slot.as_str(),
@@ -4161,6 +4738,7 @@ mod tests {
 
         let logical = secret::LogicalCredentialId::new("cred-binding-target").unwrap();
         let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        stage_slot(&db, &logical, &slot);
         let metadata = r#"{"server_id":"server-target","server_url":"https://stored.example/mcp","token_endpoint_auth_method":"client_secret_post"}"#;
         db.insert_credential_with_secret_slot(
             &sample(logical.as_str()),
@@ -4190,6 +4768,7 @@ mod tests {
         for id in ["cred-binding-a", "cred-binding-b", "cred-binding-c"] {
             let logical = secret::LogicalCredentialId::new(id).unwrap();
             let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+            stage_slot(&db, &logical, &slot);
             db.insert_credential_with_secret_slot(
                 &sample(logical.as_str()),
                 slot.as_str(),
@@ -4237,13 +4816,43 @@ mod tests {
             "nonsecret_padding": padding,
         })
         .to_string();
-        db.set_credential_oauth_json("cred-binding-oversized", &metadata)
+        assert!(
+            db.set_credential_oauth_json("cred-binding-oversized", &metadata)
+                .is_err(),
+            "legacy metadata write must enforce the point-read byte ceiling"
+        );
+        assert!(db.list_credential_oauth_json().unwrap().is_empty());
+        db.conn
+            .execute(
+                "UPDATE credentials SET oauth_json = ?2 WHERE id = ?1",
+                ("cred-binding-oversized", &metadata),
+            )
             .unwrap();
 
         assert!(
             db.credential_oauth_bindings_for_server("server-oversized")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn oauth_metadata_json은_exact_byte_limit을_accept하고_plus_one을_preparse_reject한다() {
+        fn metadata_with_len(target: usize) -> String {
+            const PREFIX: &str = "{\"padding\":\"";
+            const SUFFIX: &str = "\"}";
+            format!(
+                "{PREFIX}{}{SUFFIX}",
+                "x".repeat(target - PREFIX.len() - SUFFIX.len())
+            )
+        }
+
+        let exact = metadata_with_len(CREDENTIAL_OAUTH_BINDING_BYTES_MAX);
+        assert_eq!(exact.len(), CREDENTIAL_OAUTH_BINDING_BYTES_MAX);
+        validate_oauth_metadata_json(&exact).unwrap();
+
+        let plus_one = metadata_with_len(CREDENTIAL_OAUTH_BINDING_BYTES_MAX + 1);
+        assert_eq!(plus_one.len(), CREDENTIAL_OAUTH_BINDING_BYTES_MAX + 1);
+        assert!(validate_oauth_metadata_json(&plus_one).is_err());
     }
 
     #[test]
@@ -4275,10 +4884,48 @@ mod tests {
     }
 
     #[test]
+    fn credential_secret_record_scan은_sql_byte_preflight와_corrupt_text를_fail_closed한다() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_credential(&sample("cred-record-oversized"))
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE credentials SET label = ?2 WHERE id = ?1",
+                (
+                    "cred-record-oversized",
+                    "x".repeat(CREDENTIAL_SECRET_RECORD_BYTES_MAX + 1),
+                ),
+            )
+            .unwrap();
+        assert!(
+            db.list_credential_secret_records(1).is_err(),
+            "oversized legacy row must fail before String materialization"
+        );
+
+        let db = Db::open_in_memory().unwrap();
+        db.insert_credential(&sample("cred-record-corrupt"))
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE credentials SET label = ?2 WHERE id = ?1",
+                (
+                    "cred-record-corrupt",
+                    rusqlite::types::Value::Blob(vec![0x80]),
+                ),
+            )
+            .unwrap();
+        assert!(
+            db.list_credential_secret_records(1).is_err(),
+            "non-TEXT legacy metadata must fail closed"
+        );
+    }
+
+    #[test]
     fn physical_slot_credential_insert는_owned_pointer와_nullable_metadata만_publish한다() {
         let db = Db::open_in_memory().unwrap();
         let plain = secret::LogicalCredentialId::new("cred-plain").unwrap();
         let plain_slot = secret::PhysicalSecretSlot::with_version(&plain, uuid::Uuid::new_v4());
+        stage_slot(&db, &plain, &plain_slot);
         db.insert_credential_with_secret_slot(&sample(plain.as_str()), plain_slot.as_str(), None)
             .unwrap();
         let plain_record = credential_secret_record(&db, plain.as_str());
@@ -4289,6 +4936,7 @@ mod tests {
 
         let oauth = secret::LogicalCredentialId::new("cred-oauth-new").unwrap();
         let oauth_slot = secret::PhysicalSecretSlot::with_version(&oauth, uuid::Uuid::new_v4());
+        stage_slot(&db, &oauth, &oauth_slot);
         db.insert_credential_with_secret_slot(
             &sample(oauth.as_str()),
             oauth_slot.as_str(),
@@ -4300,6 +4948,223 @@ mod tests {
         assert_eq!(
             oauth_record.oauth_json.as_deref(),
             Some(r#"{"server_id":"srv-1","client_id":"cid-1"}"#)
+        );
+    }
+
+    #[test]
+    fn physical_slot_ledger는_crash_windows_restart와_exact_ack를_보존한다() {
+        let (dir, path, db) = file_db("physical-slot-ledger-restart");
+        let logical = secret::LogicalCredentialId::new("ledger-restart").unwrap();
+        let missing = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        let initial_revision = db.connector_config_revision().unwrap();
+
+        // Crash before or after the keyring write has the same durable staging identity. An exact
+        // missing-keyring acknowledgement removes it without invalidating Connector snapshots.
+        stage_slot(&db, &logical, &missing);
+        assert_eq!(db.connector_config_revision().unwrap(), initial_revision);
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(
+            db.physical_secret_slots_for_reconciliation(1).unwrap(),
+            vec![PhysicalSecretSlotLedgerRow {
+                logical_credential_id: logical.as_str().to_owned(),
+                physical_slot: missing.as_str().to_owned(),
+                state: PhysicalSecretSlotState::Staging,
+            }]
+        );
+        assert!(
+            db.acknowledge_physical_secret_slot_deleted(logical.as_str(), missing.as_str())
+                .unwrap()
+        );
+        assert_eq!(db.connector_config_revision().unwrap(), initial_revision);
+
+        let first = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        stage_slot(&db, &logical, &first);
+        db.insert_credential_with_secret_slot(&sample(logical.as_str()), first.as_str(), None)
+            .unwrap();
+        let after_first_publish = db.connector_config_revision().unwrap();
+        assert!(after_first_publish > initial_revision);
+        assert!(
+            db.acknowledge_physical_secret_slot_deleted(logical.as_str(), first.as_str())
+                .is_err(),
+            "missing live keyring capability must remain published/fail-closed"
+        );
+
+        let second = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        stage_slot(&db, &logical, &second);
+        db.rotate_credential_secret_slot(
+            logical.as_str(),
+            second.as_str(),
+            r#"{"server_id":"server"}"#,
+            None,
+        )
+        .unwrap();
+        let after_rotation = db.connector_config_revision().unwrap();
+        assert!(after_rotation > after_first_publish);
+        drop(db);
+
+        let db = Db::open(&path).unwrap();
+        let rows = db.physical_secret_slots_for_reconciliation(2).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.physical_slot == first.as_str())
+                .unwrap()
+                .state,
+            PhysicalSecretSlotState::Orphan
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.physical_slot == second.as_str())
+                .unwrap()
+                .state,
+            PhysicalSecretSlotState::Published
+        );
+        assert!(
+            db.acknowledge_physical_secret_slot_deleted(logical.as_str(), first.as_str())
+                .unwrap()
+        );
+        assert!(
+            !db.acknowledge_physical_secret_slot_deleted(logical.as_str(), first.as_str())
+                .unwrap()
+        );
+        assert_eq!(db.connector_config_revision().unwrap(), after_rotation);
+        assert!(
+            db.delete_credential_if_unused_cas(logical.as_str(), second.as_str())
+                .unwrap()
+        );
+        let after_delete = db.connector_config_revision().unwrap();
+        assert!(after_delete > after_rotation);
+        assert_eq!(
+            db.physical_secret_slots_for_reconciliation(1).unwrap()[0].state,
+            PhysicalSecretSlotState::Orphan
+        );
+        assert!(
+            db.acknowledge_physical_secret_slot_deleted(logical.as_str(), second.as_str())
+                .unwrap()
+        );
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn first_publish_revision_cas는_other_writer_stale에서_staging을_보존한다() {
+        let (dir, path, mut db_a) = file_db("physical-slot-first-publish-stale");
+        let db_b = Db::open(&path).unwrap();
+        let logical = secret::LogicalCredentialId::new("ledger-first-stale").unwrap();
+        let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        stage_slot(&db_a, &logical, &slot);
+        let expected = db_a.connector_config_revision().unwrap();
+        db_b.insert_credential(&sample("other-writer-credential"))
+            .unwrap();
+        let current_revision = db_b.connector_config_revision().unwrap();
+        let result = db_a
+            .insert_credential_with_secret_slot_revision_cas(
+                expected,
+                &sample(logical.as_str()),
+                slot.as_str(),
+                Some(r#"{"server_id":"server"}"#),
+            )
+            .unwrap();
+        match result {
+            ConnectorConfigCas::Stale {
+                current_revision: actual,
+            } => assert_eq!(actual, current_revision),
+            ConnectorConfigCas::Committed { .. } => panic!("stale first publish committed"),
+        }
+        assert!(
+            db_a.credential_secret_location(logical.as_str())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            db_a.physical_secret_slots_for_reconciliation(1).unwrap()[0].state,
+            PhysicalSecretSlotState::Staging
+        );
+
+        let (published_revision, ()) = committed(
+            db_a.insert_credential_with_secret_slot_revision_cas(
+                current_revision,
+                &sample(logical.as_str()),
+                slot.as_str(),
+                Some(r#"{"server_id":"server"}"#),
+            )
+            .unwrap(),
+        );
+        assert!(published_revision > current_revision);
+        assert_eq!(
+            db_a.physical_secret_slots_for_reconciliation(1).unwrap()[0].state,
+            PhysicalSecretSlotState::Published
+        );
+
+        drop(db_a);
+        drop(db_b);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn physical_slot_publish_failure는_ledger_pointer_revision을_전부_rollback한다() {
+        let mut db = Db::open_in_memory().unwrap();
+        let logical = secret::LogicalCredentialId::new("ledger-publish-rollback").unwrap();
+        let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        stage_slot(&db, &logical, &slot);
+        let expected = db.connector_config_revision().unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_first_slot_publish
+                 BEFORE UPDATE ON physical_secret_slot_ledger
+                 WHEN OLD.state = 'staging' AND NEW.state = 'published'
+                 BEGIN SELECT RAISE(ABORT, 'injected ledger publish failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            db.insert_credential_with_secret_slot_revision_cas(
+                expected,
+                &sample(logical.as_str()),
+                slot.as_str(),
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(db.connector_config_revision().unwrap(), expected);
+        assert!(
+            db.credential_secret_location(logical.as_str())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            db.physical_secret_slots_for_reconciliation(1).unwrap()[0].state,
+            PhysicalSecretSlotState::Staging
+        );
+
+        db.conn
+            .execute_batch("DROP TRIGGER fail_first_slot_publish;")
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE connector_config_state SET revision = ?1 WHERE singleton = 1",
+                [i64::MAX],
+            )
+            .unwrap();
+        let maximum = db.connector_config_revision().unwrap();
+        assert!(
+            db.insert_credential_with_secret_slot_revision_cas(
+                maximum,
+                &sample(logical.as_str()),
+                slot.as_str(),
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(db.connector_config_revision().unwrap(), maximum);
+        assert!(
+            db.credential_secret_location(logical.as_str())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            db.physical_secret_slots_for_reconciliation(1).unwrap()[0].state,
+            PhysicalSecretSlotState::Staging
         );
     }
 
@@ -4328,6 +5193,249 @@ mod tests {
     }
 
     #[test]
+    fn physical_slot_validation은_oversized_borrowed_ids를_allocation전에_reject한다() {
+        let logical = secret::LogicalCredentialId::new("bounded-owner").unwrap();
+        let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        let oversized_logical = "l".repeat(97);
+        let oversized_slot = "s".repeat(256);
+
+        assert!(validate_owned_physical_secret_slot(&oversized_logical, slot.as_str()).is_err());
+        assert!(validate_owned_physical_secret_slot(logical.as_str(), &oversized_slot).is_err());
+    }
+
+    #[test]
+    fn physical_slot_ledger는_cross_owner_corrupt_state와_id_limits를_fail_closed한다() {
+        let db = Db::open_in_memory().unwrap();
+        let logical = secret::LogicalCredentialId::new("ledger-owner").unwrap();
+        let other = secret::LogicalCredentialId::new("ledger-other").unwrap();
+        let other_slot = secret::PhysicalSecretSlot::with_version(&other, uuid::Uuid::new_v4());
+        assert!(
+            db.register_physical_secret_slot_staging(logical.as_str(), other_slot.as_str())
+                .is_err()
+        );
+        assert!(
+            db.register_physical_secret_slot_staging("ledger\0owner", other_slot.as_str())
+                .is_err()
+        );
+        assert!(
+            db.conn
+                .execute(
+                    "INSERT INTO physical_secret_slot_ledger
+                       (physical_slot, logical_credential_id, state, created_at, updated_at)
+                     VALUES ('invalid-state-slot', 'ledger-owner', 'broken', 1, 1)",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            db.conn
+                .execute(
+                    "INSERT INTO physical_secret_slot_ledger
+                       (physical_slot, logical_credential_id, state, created_at, updated_at)
+                     VALUES (?1, 'ledger-owner', 'staging', 1, 1)",
+                    ["x".repeat(256)],
+                )
+                .is_err()
+        );
+        db.conn
+            .execute(
+                "INSERT INTO physical_secret_slot_ledger
+                   (physical_slot, logical_credential_id, state, created_at, updated_at)
+                 VALUES ('malformed-but-bounded', 'ledger-owner', 'staging', 1, 1)",
+                [],
+            )
+            .unwrap();
+        assert!(db.physical_secret_slots_for_reconciliation(1).is_err());
+    }
+
+    #[test]
+    fn physical_slot_reconciliation은_item_plus_one과_byte_budget을_preflight한다() {
+        let db = Db::open_in_memory().unwrap();
+        let tx = db.conn.unchecked_transaction().unwrap();
+        for index in 0..=PHYSICAL_SECRET_SLOT_RECONCILIATION_LIMIT_MAX {
+            let logical =
+                secret::LogicalCredentialId::new(format!("ledger-item-{index:04}")).unwrap();
+            let slot = secret::PhysicalSecretSlot::with_version(
+                &logical,
+                uuid::Uuid::from_u128(u128::try_from(index + 1).unwrap()),
+            );
+            tx.execute(
+                "INSERT INTO physical_secret_slot_ledger
+                   (physical_slot, logical_credential_id, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'staging', ?3, ?3)",
+                (
+                    slot.as_str(),
+                    logical.as_str(),
+                    i64::try_from(index).unwrap(),
+                ),
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        assert!(
+            db.physical_secret_slots_for_reconciliation(
+                PHYSICAL_SECRET_SLOT_RECONCILIATION_LIMIT_MAX
+            )
+            .is_err()
+        );
+        assert!(
+            db.physical_secret_slots_for_reconciliation(
+                PHYSICAL_SECRET_SLOT_RECONCILIATION_LIMIT_MAX + 1
+            )
+            .is_err()
+        );
+        let overflow_logical = secret::LogicalCredentialId::new("ledger-item-overflow").unwrap();
+        let overflow_slot =
+            secret::PhysicalSecretSlot::with_version(&overflow_logical, uuid::Uuid::new_v4());
+        assert!(
+            db.register_physical_secret_slot_staging(
+                overflow_logical.as_str(),
+                overflow_slot.as_str()
+            )
+            .is_err(),
+            "write path must not grow an already-over-limit ledger"
+        );
+
+        let db = Db::open_in_memory().unwrap();
+        let tx = db.conn.unchecked_transaction().unwrap();
+        for index in 0..3_100usize {
+            let suffix = format!("{index:04}");
+            let logical = secret::LogicalCredentialId::new(format!(
+                "{}{}",
+                "x".repeat(96 - suffix.len()),
+                suffix
+            ))
+            .unwrap();
+            let slot = secret::PhysicalSecretSlot::with_version(
+                &logical,
+                uuid::Uuid::from_u128(u128::try_from(index + 1).unwrap()),
+            );
+            tx.execute(
+                "INSERT INTO physical_secret_slot_ledger
+                   (physical_slot, logical_credential_id, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'staging', ?3, ?3)",
+                (
+                    slot.as_str(),
+                    logical.as_str(),
+                    i64::try_from(index).unwrap(),
+                ),
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        assert!(
+            db.physical_secret_slots_for_reconciliation(
+                PHYSICAL_SECRET_SLOT_RECONCILIATION_LIMIT_MAX
+            )
+            .is_err(),
+            "rows below the item ceiling must still obey the byte budget"
+        );
+        let overflow_logical = secret::LogicalCredentialId::new("ledger-byte-overflow").unwrap();
+        let overflow_slot =
+            secret::PhysicalSecretSlot::with_version(&overflow_logical, uuid::Uuid::new_v4());
+        assert!(
+            db.register_physical_secret_slot_staging(
+                overflow_logical.as_str(),
+                overflow_slot.as_str()
+            )
+            .is_err(),
+            "write path must enforce the same byte budget as startup reconciliation"
+        );
+    }
+
+    #[test]
+    fn v27_physical_pointer는_v28_ledger에_published로_backfill되고_restart된다() {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-ledger-backfill-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite3");
+        let logical = secret::LogicalCredentialId::new("ledger-backfill").unwrap();
+        let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..27] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO credentials
+                   (id, provider, label, credential_kind, keyring_service, keyring_username,
+                    masked_hint, workspace_id, oauth_json, created_at, updated_at)
+                 VALUES (?1, 'test', 'test', 'oauth', ?2, ?3, NULL, NULL, NULL, 'now', 'now')",
+                (logical.as_str(), secret::KEYRING_SERVICE, slot.as_str()),
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 27).unwrap();
+        }
+        for _ in 0..2 {
+            let db = Db::open(&path).unwrap();
+            assert_eq!(
+                db.physical_secret_slots_for_reconciliation(1).unwrap(),
+                vec![PhysicalSecretSlotLedgerRow {
+                    logical_credential_id: logical.as_str().to_owned(),
+                    physical_slot: slot.as_str().to_owned(),
+                    state: PhysicalSecretSlotState::Published,
+                }]
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn v28_backfill은_duplicate_physical_slot_collision을_fail_closed한다() {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-ledger-corrupt-backfill-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite3");
+        let owner = secret::LogicalCredentialId::new("ledger-collision-owner").unwrap();
+        let other = secret::LogicalCredentialId::new("ledger-collision-other").unwrap();
+        let slot = secret::PhysicalSecretSlot::with_version(&owner, uuid::Uuid::new_v4());
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..27] {
+                conn.execute_batch(sql).unwrap();
+            }
+            for logical_id in [owner.as_str(), other.as_str()] {
+                conn.execute(
+                    "INSERT INTO credentials
+                       (id, provider, label, credential_kind, keyring_service, keyring_username,
+                        masked_hint, workspace_id, oauth_json, created_at, updated_at)
+                     VALUES (?1, 'test', 'test', 'oauth', ?2, ?3,
+                             NULL, NULL, NULL, 'now', 'now')",
+                    (logical_id, secret::KEYRING_SERVICE, slot.as_str()),
+                )
+                .unwrap();
+            }
+            conn.pragma_update(None, "user_version", 27).unwrap();
+        }
+
+        assert!(
+            Db::open(&path).is_err(),
+            "duplicate exact slot ownership must abort migration instead of skipping a row"
+        );
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(Db::read_user_version(&conn).unwrap(), 27);
+        let ledger_exists: i64 = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = 'physical_secret_slot_ledger'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ledger_exists, 0, "failed migration must roll back its DDL");
+        drop(conn);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn physical_slot_cas는_success후_stale_expected를_noop처리한다() {
         let db = Db::open_in_memory().unwrap();
         let logical = secret::LogicalCredentialId::new("cred-cas").unwrap();
@@ -4335,6 +5443,7 @@ mod tests {
         let stale_candidate =
             secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
         db.insert_credential(&sample(logical.as_str())).unwrap();
+        stage_slot(&db, &logical, &first);
 
         assert!(
             db.publish_credential_secret_slot_cas(
@@ -4351,6 +5460,8 @@ mod tests {
         assert_eq!(published.oauth_json, None);
         assert_eq!(published.meta.masked_hint.as_deref(), Some("…1111"));
 
+        stage_slot(&db, &logical, &stale_candidate);
+        let revision_before_stale = db.connector_config_revision().unwrap();
         assert!(
             !db.publish_credential_secret_slot_cas(
                 logical.as_str(),
@@ -4362,6 +5473,25 @@ mod tests {
             .unwrap()
         );
         assert_eq!(credential_secret_record(&db, logical.as_str()), published);
+        assert_eq!(
+            db.connector_config_revision().unwrap(),
+            revision_before_stale
+        );
+        let rows = db.physical_secret_slots_for_reconciliation(2).unwrap();
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.physical_slot == first.as_str())
+                .unwrap()
+                .state,
+            PhysicalSecretSlotState::Published
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.physical_slot == stale_candidate.as_str())
+                .unwrap()
+                .state,
+            PhysicalSecretSlotState::Orphan
+        );
     }
 
     #[test]
@@ -4372,6 +5502,7 @@ mod tests {
         let current = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
         let next = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
         let other_slot = secret::PhysicalSecretSlot::with_version(&other, uuid::Uuid::new_v4());
+        stage_slot(&db, &logical, &current);
         db.insert_credential_with_secret_slot(
             &sample(logical.as_str()),
             current.as_str(),
@@ -4405,6 +5536,7 @@ mod tests {
                  BEGIN SELECT RAISE(ABORT, 'injected CAS failure'); END;",
             )
             .unwrap();
+        stage_slot(&db, &logical, &next);
         assert!(
             db.publish_credential_secret_slot_cas(
                 logical.as_str(),
@@ -4416,6 +5548,21 @@ mod tests {
             .is_err()
         );
         assert_eq!(credential_secret_record(&db, logical.as_str()), before);
+        let rows = db.physical_secret_slots_for_reconciliation(2).unwrap();
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.physical_slot == current.as_str())
+                .unwrap()
+                .state,
+            PhysicalSecretSlotState::Published
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.physical_slot == next.as_str())
+                .unwrap()
+                .state,
+            PhysicalSecretSlotState::Staging
+        );
     }
 
     #[test]
@@ -4424,6 +5571,7 @@ mod tests {
         let logical = secret::LogicalCredentialId::new("cred-oauth").unwrap();
         let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
         db.insert_credential(&sample(logical.as_str())).unwrap();
+        stage_slot(&db, &logical, &slot);
         db.rotate_credential_secret_slot(
             logical.as_str(),
             slot.as_str(),
@@ -4484,6 +5632,7 @@ mod tests {
         db.insert_credential(&sample(logical.as_str())).unwrap();
         db.set_credential_oauth_json(logical.as_str(), r#"{"server_id":"old"}"#)
             .unwrap();
+        stage_slot(&db, &logical, &slot);
         db.conn
             .execute_batch(
                 "CREATE TRIGGER fail_slot_publish AFTER UPDATE OF keyring_username ON credentials
@@ -4519,6 +5668,7 @@ mod tests {
         let logical = secret::LogicalCredentialId::new("cred-oauth").unwrap();
         let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
         db.insert_credential(&sample(logical.as_str())).unwrap();
+        stage_slot(&db, &logical, &slot);
         assert!(
             db.rotate_credential_secret_slot(
                 logical.as_str(),

@@ -17,6 +17,7 @@ mod fonts;
 mod git_cli;
 mod llm_proxy;
 mod local_llm;
+mod logging;
 mod mcp_import;
 mod native_key_monitor;
 mod notice_translate;
@@ -45,7 +46,7 @@ fn main() -> anyhow::Result<()> {
         None => paths::AppPaths::init()?,
     };
     // guard가 drop되면 파일 로그 flush가 끊기므로 main 끝까지 유지한다.
-    let _log_guard = init_logging(&paths);
+    let (_log_guard, _log_stats) = init_logging(&paths)?;
     // 중복 실행 방지 lock (설계문서 PR-14 crash recovery). config 로드/생성보다
     // 먼저 잡는다 — 두 인스턴스의 config I/O 경쟁도 이 lock이 보호한다 (codex 리뷰).
     // drop 시 자동 해제되므로 main 끝까지 살려 둔다.
@@ -334,9 +335,17 @@ pub fn disable_egui_debug_warnings(ctx: &egui::Context) {
     ctx.all_styles_mut(|style| style.debug.warn_if_rect_changes_id = false);
 }
 
-fn init_logging(paths: &paths::AppPaths) -> tracing_appender::non_blocking::WorkerGuard {
-    let file_appender = tracing_appender::rolling::daily(&paths.log_dir, "app.log");
-    let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+fn init_logging(
+    paths: &paths::AppPaths,
+) -> Result<
+    (
+        tracing_appender::non_blocking::WorkerGuard,
+        logging::AppLogStats,
+    ),
+    logging::AppLogError,
+> {
+    let (sink, stats) = logging::open_app_log_sink(&paths.log_dir)?;
+    let (file_writer, guard) = logging::spawn_non_blocking_app_logger(sink);
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -344,7 +353,7 @@ fn init_logging(paths: &paths::AppPaths) -> tracing_appender::non_blocking::Work
         .with_writer(file_writer)
         .with_ansi(false)
         .init();
-    guard
+    Ok((guard, stats))
 }
 
 #[cfg(test)]

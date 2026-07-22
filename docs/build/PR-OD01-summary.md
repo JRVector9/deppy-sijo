@@ -50,8 +50,29 @@ Connector 70/70 and the 84-test socket-independent runtime suite, plus all-targe
 Clippy, fmt, and scoped diff-check. No timer, thread, polling loop, or retained sample backlog was
 added.
 
+## Bounded sanitized app logger
+
+Production startup now atomically replaces the legacy uncapped `rolling::daily` plus default
+128,000-line nonblocking queue with one bounded sink and exactly one tracing worker. The queue is
+lossy at 1,024 complete lines so diagnostics cannot backpressure terminal work or retain an
+unbounded corpus. There is no old/new dual logger.
+
+The worker bounds each formatted line at 64 KiB, the active UTC-day file at 8 MiB, all managed app
+logs at 32 MiB, and retention at seven UTC days with at most 32 managed candidates. Every complete
+line is checked by the bounded secret-like scanner; unsafe, truncated, oversized, or crash-partial
+input is replaced by a fixed low-cardinality record and the original bytes are not persisted.
+Existing active files are bounded-scanned at startup/day rollover, unsafe files are truncated,
+and incomplete tails are cut to the last newline. Strict managed filenames, no-follow opens, and
+symlink/nonregular checks prevent the GC from following or deleting unmanaged targets.
+
+Rotation and oldest-first GC run only at construction, an observed day transition, or size
+pressure. Opening the sink creates no worker/timer/poller; the explicit constructor creates the
+same single worker used by tracing. Root verification passes 14 in-module plus 15 integration
+policy tests, app all-target check, strict Clippy, fmt, and scoped diff-check. Errors, Debug, and
+stats expose only static codes and counts, never paths, source lines, or raw I/O errors.
+
 ## Remaining OD01 scope
 
-App log days/bytes retention and GC, diagnostic scan integration, and the env-only
-RSS/thread/socket/queue slope soak harness remain for the final OD01 cutover. The completed slices
-add no production timer, polling loop, network, process, or retained source/sample backlog.
+The env-only RSS/thread/socket/queue slope soak harness and remaining raw tracing-field
+sanitization remain for the final OD01 cutover. The completed slices add no production timer,
+polling loop, network, process, or retained source/sample backlog.

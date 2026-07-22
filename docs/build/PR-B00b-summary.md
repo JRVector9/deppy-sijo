@@ -40,6 +40,11 @@ failure class and never expose raw adapter errors or logical/physical keyring co
 - Strict runtime all-target Clippy, package rustfmt, runtime/app scoped diff-check, dependency law,
   and the unchanged 53-exception boundary gate pass.
 
+The resource-monitor hot path now performs its two-second due check before materializing session
+targets. A fake-time regression proves `300 × zero collection → exact due × one → 300 × zero`
+while preserving the immediate first sample and existing events/wire. Root reran the updated
+84-test socket-independent runtime suite successfully.
+
 The root full run executed all 130 runtime tests: 102 passed, while 27 existing remote fixtures
 were denied at loopback bind with sandbox `EPERM`. The pre-existing process-resource test observed
 a pid-bearing zero sample twice in this environment; the B00b diff does not touch the sampler or

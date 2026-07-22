@@ -7787,6 +7787,99 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_transition_ring_evicts_the_65th_oldest_without_payload_retention() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        let raw_marker = "raw-diagnostic-payload-marker-".repeat(128);
+        let mut invalid_server = server_draft(&raw_marker);
+        let TransportDraft::Stdio { command, .. } = &mut invalid_server.transport else {
+            panic!("fixture server must use stdio")
+        };
+        command.clear();
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::SaveServer(invalid_server))
+            .unwrap();
+        wait_until(|| {
+            fixture
+                .coordinator
+                .current_snapshot()
+                .diagnostics
+                .transitions
+                .len()
+                == 1
+        });
+        assert_eq!(
+            fixture
+                .coordinator
+                .current_snapshot()
+                .diagnostics
+                .transitions[0],
+            DiagnosticTransition {
+                kind: OperationKind::SaveServer,
+                phase: OperationPhase::Failed,
+                error_code: Some(ErrorCode::InvalidInput),
+            }
+        );
+
+        for index in 0..63 {
+            let previous_revision = fixture.coordinator.current_snapshot().revision;
+            let raw_input = format!(r#""{raw_marker}-{index}""#);
+            fixture
+                .coordinator
+                .dispatch(invoke_intent(
+                    &raw_marker,
+                    &raw_marker,
+                    raw_input.as_bytes(),
+                ))
+                .unwrap();
+            wait_until(|| fixture.coordinator.current_snapshot().revision > previous_revision);
+        }
+        let at_capacity = fixture.coordinator.current_snapshot();
+        assert_eq!(at_capacity.diagnostics.transitions.len(), 64);
+        assert_eq!(
+            at_capacity.diagnostics.transitions[0].kind,
+            OperationKind::SaveServer
+        );
+
+        let previous_revision = at_capacity.revision;
+        let raw_input = format!(r#""{raw_marker}-63""#);
+        fixture
+            .coordinator
+            .dispatch(invoke_intent(
+                &raw_marker,
+                &raw_marker,
+                raw_input.as_bytes(),
+            ))
+            .unwrap();
+        wait_until(|| fixture.coordinator.current_snapshot().revision > previous_revision);
+
+        let after_eviction = fixture.coordinator.current_snapshot();
+        let expected = DiagnosticTransition {
+            kind: OperationKind::Invoke,
+            phase: OperationPhase::Failed,
+            error_code: Some(ErrorCode::InvalidInput),
+        };
+        assert_eq!(after_eviction.diagnostics.transitions.len(), 64);
+        assert!(
+            after_eviction
+                .diagnostics
+                .transitions
+                .iter()
+                .all(|transition| transition == &expected)
+        );
+        let debug = format!("{:?}", after_eviction.diagnostics.transitions);
+        assert!(
+            !debug.contains(&raw_marker),
+            "diagnostic ring retained a raw identifier or payload"
+        );
+    }
+
+    #[test]
     fn malformed_scalar_and_array_inputs_stop_before_all_authorization_work() {
         let fixture = fixture(
             Arc::new(Gate::opened()),

@@ -82,12 +82,26 @@ impl ProcessResourceMonitor {
             .map(|(snapshot, _)| snapshot)
     }
 
+    /// Cheap, side-effect-free cadence check for callers that would otherwise allocate or inspect
+    /// session targets on every worker pump.
+    pub fn is_due(&self, now: Instant) -> bool {
+        now >= self.next_sample
+    }
+
     pub fn sample_if_due_with_sessions(
         &mut self,
         targets: &[SessionResourceTarget],
     ) -> Option<(ProcessResourceSnapshot, Vec<SessionResourceUsage>)> {
         let now = Instant::now();
-        if now < self.next_sample {
+        self.sample_if_due_with_sessions_at(now, targets)
+    }
+
+    pub(crate) fn sample_if_due_with_sessions_at(
+        &mut self,
+        now: Instant,
+        targets: &[SessionResourceTarget],
+    ) -> Option<(ProcessResourceSnapshot, Vec<SessionResourceUsage>)> {
+        if !self.is_due(now) {
             return None;
         }
         self.next_sample = now + self.config.sample_interval;

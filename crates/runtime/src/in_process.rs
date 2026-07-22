@@ -3,7 +3,7 @@
 
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use deppy_core::{MuxPaneId, MuxTabId};
 use mux::{FocusManager, MuxPane, MuxSnapshot, MuxTab, MuxWindow, PaneSnapshot, TabSnapshot};
@@ -573,6 +573,14 @@ struct Worker {
     shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
+fn collect_resource_targets_if_due(
+    monitor: &ProcessResourceMonitor,
+    now: Instant,
+    collect: impl FnOnce() -> Vec<SessionResourceTarget>,
+) -> Option<Vec<SessionResourceTarget>> {
+    monitor.is_due(now).then(collect)
+}
+
 /// SessionKind ↔ 아카이브 헤더 kind 바이트 (0=shell, 1=agent).
 fn archive_kind_to_u8(kind: session::SessionKind) -> u8 {
     match kind {
@@ -959,16 +967,21 @@ impl Worker {
     }
 
     fn pump_resource_monitor(&mut self) {
-        let targets: Vec<_> = self
-            .sessions
-            .values()
-            .map(|session| SessionResourceTarget {
-                session: session.id(),
-                identity: session.process_identity(),
-            })
-            .collect();
-        if let Some((snapshot, session_usage)) =
-            self.resource_monitor.sample_if_due_with_sessions(&targets)
+        let now = Instant::now();
+        let Some(targets) = collect_resource_targets_if_due(&self.resource_monitor, now, || {
+            self.sessions
+                .values()
+                .map(|session| SessionResourceTarget {
+                    session: session.id(),
+                    identity: session.process_identity(),
+                })
+                .collect()
+        }) else {
+            return;
+        };
+        if let Some((snapshot, session_usage)) = self
+            .resource_monitor
+            .sample_if_due_with_sessions_at(now, &targets)
         {
             self.emit(RuntimeEvent::ResourceUsage {
                 snapshot,
@@ -3003,6 +3016,54 @@ mod tests {
             &mut wakes,
         ));
         assert!(overflowed.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    /// 유휴 worker pump가 session target `Vec`를 만들지 않고 정확한 2초 샘플 경계에서만
+    /// collection closure를 한 번 호출하는지 가짜 시각과 호출 카운터로 고정한다.
+    #[test]
+    fn resource_targets_are_collected_only_once_at_each_exact_due_deadline() {
+        let interval = Duration::from_secs(2);
+        let mut monitor = ProcessResourceMonitor::new(ProcessResourceMonitorConfig {
+            sample_interval: interval,
+            high_cpu_percent: f32::MAX,
+            high_rss_bytes: u64::MAX,
+        });
+        let start = Instant::now();
+        let collections = std::cell::Cell::new(0usize);
+        let collect = || {
+            collections.set(collections.get() + 1);
+            Vec::with_capacity(1)
+        };
+
+        // Construction preserves the existing immediate first sample and CPU-baseline semantics.
+        let first_targets = collect_resource_targets_if_due(&monitor, start, collect)
+            .expect("first resource sample must be immediately due");
+        let (first, _) = monitor
+            .sample_if_due_with_sessions_at(start, &first_targets)
+            .expect("first resource sample must emit");
+        assert!(first.cpu_percent.is_none());
+
+        collections.set(0);
+        let just_before_due = start + interval - Duration::from_nanos(1);
+        for _ in 0..300 {
+            assert!(collect_resource_targets_if_due(&monitor, just_before_due, collect).is_none());
+        }
+        assert_eq!(collections.get(), 0);
+
+        let exact_due = start + interval;
+        let due_targets = collect_resource_targets_if_due(&monitor, exact_due, collect)
+            .expect("exact resource deadline must be due");
+        assert_eq!(collections.get(), 1);
+        let _ = monitor.sample_if_due_with_sessions_at(exact_due, &due_targets);
+
+        collections.set(0);
+        let just_before_next_due = exact_due + interval - Duration::from_nanos(1);
+        for _ in 0..300 {
+            assert!(
+                collect_resource_targets_if_due(&monitor, just_before_next_due, collect).is_none()
+            );
+        }
+        assert_eq!(collections.get(), 0);
     }
 
     /// 안정성 감사 High #1: 주기 ResourceUsage가 느린(드레인 안 하는) 구독자 채널에

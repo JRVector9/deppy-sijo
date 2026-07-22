@@ -91,3 +91,19 @@ strict app/xtask, zero-allowlist, dependency, fmt, and diff gates are green. The
 development blocker from the preceding paragraph is now latest-only agent-detection delivery plus
 bounded detector process/file inputs; long-duration and Scenario A-E measurements remain deferred
 until that code freezes.
+
+## Agent detection/session closeout update
+
+Latest-only agent detection, bounded process/filesystem capture, and bounded retained structured
+session state are now integrated. Empty detection input parks without backend I/O or repaint,
+stalled UI consumption retains at most one outcome, and production ps/lsof/transcript discovery
+has explicit time/item/byte/depth limits with process-group cleanup. Session table rendering borrows
+cached rows and no longer clones whole sessions; retained items, approvals, files, nested values,
+diagnostics, and total projection bytes are capped and secret-bearing event types are non-Clone.
+
+The full app suite now passes 752 tests with five explicit real-resource ignores and logging policy
+passes 15/15. App/xtask all-target check, strict Clippy `-D warnings`, xtask 9/9, zero-allowlist
+boundary, the clean 23-crate dependency DAG, full rustfmt, and diff-check are green. Remaining
+development before hardware approval is limited to the separately recorded startup/action input
+seams and corrupted persisted-session admission; 30-minute and Scenario A-E measurements have not
+started.

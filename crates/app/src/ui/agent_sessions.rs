@@ -1327,30 +1327,31 @@ impl AgentSessionsUi {
     }
 
     fn queue_thread_upsert(&mut self, session_id: &str, force: bool) {
-        let Some(session) = self
+        let Some((workspace_id, thread_id, title, cwd, model)) = self
             .sessions
             .iter()
             .find(|session| session.id == session_id)
-            .cloned()
-        else {
-            return;
-        };
-        let (Some(workspace_id), Some(thread_id)) =
-            (session.workspace_id.clone(), session.thread_id.clone())
+            .and_then(|session| {
+                Some((
+                    session.workspace_id.clone()?,
+                    session.thread_id.clone()?,
+                    one_line_title(&session.prompt, &self.catalog),
+                    session.cwd.clone().unwrap_or_default(),
+                    session.model.clone(),
+                ))
+            })
         else {
             return;
         };
         let existing = self.persisted_threads.get(session_id);
         let favorite = existing.is_some_and(|row| row.favorite);
         let archived = existing.is_some_and(|row| row.archived);
-        let title = one_line_title(&session.prompt, &self.catalog);
-        let cwd = session.cwd.clone().unwrap_or_default();
         let unchanged = existing.is_some_and(|row| {
             row.workspace_id == workspace_id
                 && row.thread_id == thread_id
                 && row.title == title
                 && row.cwd == cwd
-                && row.model == session.model
+                && row.model == model
                 && row.favorite == favorite
                 && row.archived == archived
         });
@@ -1367,7 +1368,7 @@ impl AgentSessionsUi {
             thread_id: thread_id.clone(),
             title: title.clone(),
             cwd: cwd.clone(),
-            model: session.model.clone(),
+            model: model.clone(),
             favorite,
             archived,
             created_at,
@@ -1380,7 +1381,7 @@ impl AgentSessionsUi {
                 thread_id,
                 title,
                 cwd,
-                model: session.model,
+                model,
                 favorite,
                 archived,
             });
@@ -1625,15 +1626,16 @@ impl AgentSessionsUi {
                     }
                     Some(surface) => {
                         render_selected_surface_header(ui, &surface, catalog);
-                        if let Some(session) = self.selected_session_snapshot() {
+                        if let Some((session_index, session)) = self.take_selected_session() {
                             self.render_session(
                                 ui,
-                                session,
+                                &session,
                                 workspace_cwd.clone(),
                                 &mut actions,
                                 &mut text_input_ids,
                                 catalog,
                             );
+                            self.restore_session(session_index, session);
                         }
                     }
                     None => {
@@ -2178,19 +2180,25 @@ impl AgentSessionsUi {
         }
     }
 
-    fn selected_session_snapshot(&self) -> Option<AgentSession> {
-        self.selected_session.as_ref().and_then(|id| {
-            self.sessions
-                .iter()
-                .find(|session| &session.id == id)
-                .cloned()
-        })
+    fn take_selected_session(&mut self) -> Option<(usize, AgentSession)> {
+        let selected = self.selected_session.as_ref()?;
+        let index = self
+            .sessions
+            .iter()
+            .position(|session| &session.id == selected)?;
+        Some((index, self.sessions.swap_remove(index)))
+    }
+
+    fn restore_session(&mut self, index: usize, session: AgentSession) {
+        self.sessions.push(session);
+        let last = self.sessions.len() - 1;
+        self.sessions.swap(index, last);
     }
 
     fn render_session(
         &mut self,
         ui: &mut egui::Ui,
-        session: AgentSession,
+        session: &AgentSession,
         workspace_cwd: Option<String>,
         actions: &mut Vec<PanelAction>,
         text_input_ids: &mut Vec<egui::Id>,
@@ -2262,7 +2270,7 @@ impl AgentSessionsUi {
             });
         }
         if session.thread_id.is_some() {
-            self.render_session_turn_controls(ui, &session, actions, text_input_ids, catalog);
+            self.render_session_turn_controls(ui, session, actions, text_input_ids, catalog);
         }
         if is_persisted {
             ui.horizontal(|ui| {
@@ -2440,7 +2448,7 @@ impl AgentSessionsUi {
                         ui.strong(catalog.t("agent_sessions.column.result", &[]));
                         ui.end_row();
                         for row in rows {
-                            let item_id = row.item_id;
+                            let item_id = row.item_id.clone();
                             let selected = self.selected_item.as_deref() == Some(item_id.as_str());
                             let state_response = ui.add_sized(
                                 [90.0, 20.0],
@@ -2456,19 +2464,19 @@ impl AgentSessionsUi {
                             );
                             let subject_response = ui.add_sized(
                                 [230.0, 20.0],
-                                egui::Label::new(row.subject)
+                                egui::Label::new(&row.subject)
                                     .sense(egui::Sense::click())
                                     .truncate(),
                             );
                             let location_response = ui.add_sized(
                                 [160.0, 20.0],
-                                egui::Label::new(row.location)
+                                egui::Label::new(&row.location)
                                     .sense(egui::Sense::click())
                                     .truncate(),
                             );
                             let outcome_response = ui.add_sized(
                                 [220.0, 20.0],
-                                egui::Label::new(row.outcome)
+                                egui::Label::new(&row.outcome)
                                     .sense(egui::Sense::click())
                                     .truncate(),
                             );
@@ -2541,7 +2549,7 @@ impl AgentSessionsUi {
                 queue_frame_action(
                     actions,
                     PanelAction::Submit {
-                        session_id: session.id,
+                        session_id: session.id.clone(),
                         prompt: std::mem::take(&mut self.follow_up),
                         cwd: workspace_cwd,
                     },
@@ -4272,7 +4280,7 @@ mod tests {
         assert_eq!(ui.sessions[0].status, AgentSessionStatus::Completed);
         assert_eq!(
             ui.sessions[0].error.as_deref(),
-            Some("stale expectedTurnId")
+            Some("control_error:stale_turn")
         );
         assert!(ui.drain_status_notices().is_empty());
     }

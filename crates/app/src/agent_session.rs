@@ -5,6 +5,7 @@
 //! thread/turn/item stream is already structured and safe to render as rows.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use serde_json::Value;
 
@@ -138,15 +139,26 @@ impl AgentItemKind {
 
 /// A file change announced by Codex. `diff` is retained for the details pane,
 /// but table rows only show the path/kind summary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct AgentFileChange {
     pub path: String,
     pub kind: String,
     pub diff: Option<String>,
 }
 
+impl fmt::Debug for AgentFileChange {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentFileChange")
+            .field("path_bytes", &self.path.len())
+            .field("kind_bytes", &self.kind.len())
+            .field("diff_bytes", &self.diff.as_ref().map(String::len))
+            .finish()
+    }
+}
+
 /// Provider-neutral representation of a streamed agent item.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct AgentItem {
     pub id: String,
     pub kind: AgentItemKind,
@@ -158,12 +170,32 @@ pub struct AgentItem {
     pub files: Vec<AgentFileChange>,
 }
 
+impl fmt::Debug for AgentItem {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentItem")
+            .field("id_bytes", &self.id.len())
+            .field("kind", &self.kind)
+            .field("status_present", &self.status.is_some())
+            .field("summary_bytes", &self.summary.len())
+            .field("location_present", &self.location.is_some())
+            .field("detail_present", &self.detail.is_some())
+            .field("output_bytes", &self.output.len())
+            .field("file_count", &self.files.len())
+            .finish()
+    }
+}
+
 impl AgentItem {
     /// Convert the common Codex `ThreadItem` tagged union into the durable view
     /// model. Unknown future item kinds remain visible rather than causing a
     /// session to fail.
     pub fn from_codex(value: &Value) -> Option<Self> {
-        let id = value.get("id")?.as_str()?.to_owned();
+        let id = value.get("id")?.as_str()?;
+        if !valid_identifier(id) {
+            return None;
+        }
+        let id = id.to_owned();
         let wire_type = value
             .get("type")
             .and_then(Value::as_str)
@@ -171,13 +203,13 @@ impl AgentItem {
         let status = value
             .get("status")
             .and_then(Value::as_str)
-            .map(str::to_owned);
+            .map(|status| bounded_copy(status, MAX_STATUS_BYTES));
 
         let mut item = Self {
             id,
             kind: AgentItemKind::Other,
             status,
-            summary: wire_type.to_owned(),
+            summary: bounded_copy(wire_type, MAX_STATUS_BYTES),
             location: None,
             detail: None,
             output: String::new(),
@@ -195,7 +227,7 @@ impl AgentItem {
                 item.location = value
                     .get("phase")
                     .and_then(Value::as_str)
-                    .map(str::to_owned);
+                    .map(|phase| bounded_copy(phase, MAX_STATUS_BYTES));
             }
             "plan" => {
                 item.kind = AgentItemKind::Plan;
@@ -209,7 +241,10 @@ impl AgentItem {
             "commandExecution" => {
                 item.kind = AgentItemKind::CommandExecution;
                 item.summary = text_from(value.get("command"));
-                item.location = value.get("cwd").and_then(Value::as_str).map(str::to_owned);
+                item.location = value
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(|cwd| bounded_copy(cwd, MAX_PATH_BYTES));
                 item.output = text_from(value.get("aggregatedOutput"));
                 item.detail = command_detail(value);
             }
@@ -223,18 +258,25 @@ impl AgentItem {
                 };
                 item.location = file_location(&item.files);
                 item.detail = file_kinds(&item.files);
-                item.output = item
+                for diff in item
                     .files
                     .iter()
                     .filter_map(|change| change.diff.as_deref())
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
+                {
+                    if !item.output.is_empty() {
+                        append_limited(&mut item.output, "\n\n");
+                    }
+                    append_limited(&mut item.output, diff);
+                }
             }
             "mcpToolCall" => {
                 item.kind = AgentItemKind::McpToolCall;
                 let server = value.get("server").and_then(Value::as_str).unwrap_or("MCP");
                 let tool = value.get("tool").and_then(Value::as_str).unwrap_or("tool");
-                item.summary = format!("{server} · {tool}");
+                item.summary.clear();
+                append_limited(&mut item.summary, server);
+                append_limited(&mut item.summary, " · ");
+                append_limited(&mut item.summary, tool);
                 item.output = text_from(value.get("result"));
                 item.detail = value
                     .get("error")
@@ -272,6 +314,7 @@ impl AgentItem {
         for change in &mut item.files {
             change.diff = change.diff.take().map(limit_text);
         }
+        item.enforce_retained_limit();
         Some(item)
     }
 
@@ -282,11 +325,75 @@ impl AgentItem {
             _ => append_limited(&mut self.summary, delta),
         }
     }
+
+    fn enforce_retained_limit(&mut self) {
+        self.status = self
+            .status
+            .take()
+            .map(|status| bounded_owned(status, MAX_STATUS_BYTES));
+        self.summary = bounded_owned(std::mem::take(&mut self.summary), MAX_ITEM_TEXT_BYTES);
+        self.location = self
+            .location
+            .take()
+            .map(|location| bounded_owned(location, MAX_PATH_BYTES));
+        self.detail = self
+            .detail
+            .take()
+            .map(|detail| bounded_owned(detail, MAX_ITEM_TEXT_BYTES));
+        self.output = bounded_owned(std::mem::take(&mut self.output), MAX_ITEM_TEXT_BYTES);
+        self.files.truncate(MAX_FILE_CHANGES_PER_ITEM);
+        for file in &mut self.files {
+            file.path = bounded_owned(std::mem::take(&mut file.path), MAX_PATH_BYTES);
+            file.kind = bounded_owned(std::mem::take(&mut file.kind), MAX_STATUS_BYTES);
+            file.diff = file
+                .diff
+                .take()
+                .map(|diff| bounded_owned(diff, MAX_ITEM_TEXT_BYTES));
+        }
+
+        let mut retained = self.retained_bytes_without_files();
+        let mut keep = 0;
+        for file in &mut self.files {
+            let fixed = file.path.len().saturating_add(file.kind.len());
+            if retained.saturating_add(fixed) > MAX_ITEM_RETAINED_BYTES {
+                break;
+            }
+            retained = retained.saturating_add(fixed);
+            if let Some(diff) = &mut file.diff {
+                let available = MAX_ITEM_RETAINED_BYTES.saturating_sub(retained);
+                *diff = bounded_owned(std::mem::take(diff), available.min(MAX_ITEM_TEXT_BYTES));
+                retained = retained.saturating_add(diff.len());
+            }
+            keep += 1;
+        }
+        self.files.truncate(keep);
+    }
+
+    fn retained_bytes_without_files(&self) -> usize {
+        self.id
+            .len()
+            .saturating_add(self.status.as_ref().map_or(0, String::len))
+            .saturating_add(self.summary.len())
+            .saturating_add(self.location.as_ref().map_or(0, String::len))
+            .saturating_add(self.detail.as_ref().map_or(0, String::len))
+            .saturating_add(self.output.len())
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.files
+            .iter()
+            .fold(self.retained_bytes_without_files(), |bytes, file| {
+                bytes
+                    .saturating_add(file.path.len())
+                    .saturating_add(file.kind.len())
+                    .saturating_add(file.diff.as_ref().map_or(0, String::len))
+            })
+    }
 }
 
 /// A server request which must be explicitly answered by the user. The raw
 /// JSON-RPC ID remains in the transport; the UI only handles the opaque key.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct AgentApproval {
     pub request_key: String,
     pub kind: AgentApprovalKind,
@@ -296,6 +403,22 @@ pub struct AgentApproval {
     pub reason: Option<String>,
     pub command: Option<String>,
     pub cwd: Option<String>,
+}
+
+impl fmt::Debug for AgentApproval {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentApproval")
+            .field("request_key_bytes", &self.request_key.len())
+            .field("kind", &self.kind)
+            .field("thread_id_bytes", &self.thread_id.len())
+            .field("turn_id_bytes", &self.turn_id.len())
+            .field("item_id_bytes", &self.item_id.len())
+            .field("reason", &self.reason.as_ref().map(|_| "[REDACTED]"))
+            .field("command", &self.command.as_ref().map(|_| "[REDACTED]"))
+            .field("cwd", &self.cwd.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,8 +446,31 @@ impl AgentApprovalDecision {
     }
 }
 
+impl AgentApproval {
+    fn enforce_limits(&mut self) -> bool {
+        if !valid_identifier(&self.request_key)
+            || !valid_identifier(&self.thread_id)
+            || !valid_identifier(&self.turn_id)
+            || !valid_identifier(&self.item_id)
+        {
+            return false;
+        }
+        self.reason
+            .as_ref()
+            .is_none_or(|reason| reason.len() <= MAX_ITEM_TEXT_BYTES)
+            && self
+                .command
+                .as_ref()
+                .is_none_or(|command| command.len() <= MAX_ITEM_TEXT_BYTES)
+            && self
+                .cwd
+                .as_ref()
+                .is_none_or(|cwd| cwd.len() <= MAX_PATH_BYTES)
+    }
+}
+
 /// Normalized event emitted by a structured agent transport.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub enum AgentSessionEvent {
     ConnectionReady,
     ThreadStarted {
@@ -366,16 +512,85 @@ pub enum AgentSessionEvent {
     Stopped,
 }
 
+impl fmt::Debug for AgentSessionEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ConnectionReady => formatter.write_str("ConnectionReady"),
+            Self::ThreadStarted { thread_id } => formatter
+                .debug_struct("ThreadStarted")
+                .field("thread_id_bytes", &thread_id.len())
+                .finish(),
+            Self::ThreadStatusChanged { status } => formatter
+                .debug_struct("ThreadStatusChanged")
+                .field("status", status)
+                .finish(),
+            Self::TurnStarted { turn_id } => formatter
+                .debug_struct("TurnStarted")
+                .field("turn_id_bytes", &turn_id.len())
+                .finish(),
+            Self::ItemStarted { item } => formatter
+                .debug_struct("ItemStarted")
+                .field("item", item)
+                .finish(),
+            Self::ItemDelta { item_id, delta } => formatter
+                .debug_struct("ItemDelta")
+                .field("item_id_bytes", &item_id.len())
+                .field("delta", &format_args!("[REDACTED; {} bytes]", delta.len()))
+                .finish(),
+            Self::ItemCompleted { item } => formatter
+                .debug_struct("ItemCompleted")
+                .field("item", item)
+                .finish(),
+            Self::ApprovalRequested { approval } => formatter
+                .debug_struct("ApprovalRequested")
+                .field("approval", approval)
+                .finish(),
+            Self::ApprovalResolved { request_key } => formatter
+                .debug_struct("ApprovalResolved")
+                .field("request_key_bytes", &request_key.len())
+                .finish(),
+            Self::TurnCompleted { status } => formatter
+                .debug_struct("TurnCompleted")
+                .field("status_bytes", &status.len())
+                .finish(),
+            Self::ControlError { message } => formatter
+                .debug_struct("ControlError")
+                .field(
+                    "message",
+                    &format_args!("[REDACTED; {} bytes]", message.len()),
+                )
+                .finish(),
+            Self::Failed { message } => formatter
+                .debug_struct("Failed")
+                .field(
+                    "message",
+                    &format_args!("[REDACTED; {} bytes]", message.len()),
+                )
+                .finish(),
+            Self::Stopped => formatter.write_str("Stopped"),
+        }
+    }
+}
+
 /// Stable `UserInput::Skill` reference accepted by `turn/start` and
 /// `turn/steer`. Keep only the protocol identity fields in session state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AgentSkillSelection {
     pub name: String,
     pub path: String,
 }
 
+impl fmt::Debug for AgentSkillSelection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentSkillSelection")
+            .field("name_bytes", &self.name.len())
+            .field("path", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// The stable UI-facing state of a structured agent conversation.
-#[derive(Debug, Clone)]
 pub struct AgentSession {
     pub id: AgentSessionId,
     /// Workspace that owned this structured thread when it was created or
@@ -402,15 +617,49 @@ pub struct AgentSession {
     pub approvals: Vec<AgentApproval>,
     pub error: Option<String>,
     item_indices: HashMap<String, usize>,
+    table_rows: Vec<AgentTableRow>,
+    retained_item_bytes: usize,
+    retained_table_bytes: usize,
+}
+
+impl fmt::Debug for AgentSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentSession")
+            .field("id_bytes", &self.id.len())
+            .field("workspace_id_present", &self.workspace_id.is_some())
+            .field(
+                "prompt",
+                &format_args!("[REDACTED; {} bytes]", self.prompt.len()),
+            )
+            .field("cwd", &self.cwd.as_ref().map(|_| "[REDACTED]"))
+            .field("model_present", &self.model.is_some())
+            .field("effort_present", &self.effort.is_some())
+            .field("skill_count", &self.skills.len())
+            .field("thread_id_present", &self.thread_id.is_some())
+            .field("turn_id_present", &self.turn_id.is_some())
+            .field("thread_status", &self.thread_status)
+            .field("status", &self.status)
+            .field("item_count", &self.items.len())
+            .field("approval_count", &self.approvals.len())
+            .field("error_present", &self.error.is_some())
+            .field("retained_item_bytes", &self.retained_item_bytes)
+            .field("retained_table_bytes", &self.retained_table_bytes)
+            .finish()
+    }
 }
 
 impl AgentSession {
     pub fn new(id: AgentSessionId, prompt: String, cwd: Option<String>) -> Self {
+        assert!(
+            valid_identifier(&id),
+            "AgentSessionId must be a non-empty identifier of at most 1 KiB"
+        );
         Self {
             id,
             workspace_id: None,
-            prompt,
-            cwd,
+            prompt: bounded_owned(prompt, MAX_PROMPT_BYTES),
+            cwd: cwd.map(|cwd| bounded_owned(cwd, MAX_PATH_BYTES)),
             model: None,
             effort: None,
             skills: Vec::new(),
@@ -422,10 +671,15 @@ impl AgentSession {
             approvals: Vec::new(),
             error: None,
             item_indices: HashMap::new(),
+            table_rows: Vec::new(),
+            retained_item_bytes: 0,
+            retained_table_bytes: 0,
         }
     }
 
     pub fn apply(&mut self, event: AgentSessionEvent) {
+        self.enforce_metadata_limits();
+        let previous_status = self.status;
         match event {
             AgentSessionEvent::ConnectionReady => {
                 if self.status == AgentSessionStatus::Starting {
@@ -433,6 +687,12 @@ impl AgentSession {
                 }
             }
             AgentSessionEvent::ThreadStarted { thread_id } => {
+                if !valid_identifier(&thread_id) {
+                    self.error = Some("protocol_error:thread_identifier".to_owned());
+                    self.status = AgentSessionStatus::Failed;
+                    self.refresh_fallback_row_states();
+                    return;
+                }
                 self.thread_id = Some(thread_id);
                 // A delayed duplicate `thread/started` notification must not
                 // regress an already active turn back to the ready state.
@@ -448,6 +708,12 @@ impl AgentSession {
                 self.apply_thread_status(status);
             }
             AgentSessionEvent::TurnStarted { turn_id } => {
+                if !valid_identifier(&turn_id) {
+                    self.error = Some("protocol_error:turn_identifier".to_owned());
+                    self.status = AgentSessionStatus::Failed;
+                    self.refresh_fallback_row_states();
+                    return;
+                }
                 self.turn_id = Some(turn_id);
                 // The previous idle status is stale as soon as a new turn is
                 // accepted; the next thread/status notification will replace it.
@@ -456,6 +722,10 @@ impl AgentSession {
                 self.status = AgentSessionStatus::Running;
             }
             AgentSessionEvent::ItemStarted { mut item } => {
+                if !valid_identifier(&item.id) {
+                    return;
+                }
+                item.enforce_retained_limit();
                 item.status.get_or_insert_with(|| "inProgress".to_owned());
                 self.upsert_item(item, false);
                 if !self.status.is_terminal() {
@@ -463,27 +733,55 @@ impl AgentSession {
                 }
             }
             AgentSessionEvent::ItemDelta { item_id, delta } => {
-                if let Some(&index) = self.item_indices.get(&item_id) {
+                if valid_identifier(&item_id)
+                    && let Some(&index) = self.item_indices.get(&item_id)
+                {
+                    let before = self.items[index].retained_bytes();
                     self.items[index].append_delta(&delta);
+                    let after = self.items[index].retained_bytes();
+                    self.retained_item_bytes = self
+                        .retained_item_bytes
+                        .saturating_sub(before)
+                        .saturating_add(after);
+                    self.refresh_table_row(index);
+                    self.enforce_session_item_limits();
                 }
             }
             AgentSessionEvent::ItemCompleted { mut item } => {
+                if !valid_identifier(&item.id) {
+                    return;
+                }
+                item.enforce_retained_limit();
                 item.status.get_or_insert_with(|| "completed".to_owned());
                 self.upsert_item(item, true);
             }
-            AgentSessionEvent::ApprovalRequested { approval } => {
-                if !self
+            AgentSessionEvent::ApprovalRequested { mut approval } => {
+                if !approval.enforce_limits() {
+                    self.error = Some("protocol_error:approval_projection".to_owned());
+                    self.status = AgentSessionStatus::Failed;
+                    self.refresh_fallback_row_states();
+                    return;
+                }
+                if let Some(index) = self
                     .approvals
                     .iter()
-                    .any(|pending| pending.request_key == approval.request_key)
+                    .position(|pending| pending.request_key == approval.request_key)
                 {
-                    self.approvals.push(approval);
+                    self.approvals[index] = approval;
+                } else {
+                    if self.approvals.len() == MAX_PENDING_APPROVALS {
+                        self.error = Some("resource_limit:pending_approvals".to_owned());
+                    } else {
+                        self.approvals.push(approval);
+                    }
                 }
                 self.status = AgentSessionStatus::AwaitingApproval;
             }
             AgentSessionEvent::ApprovalResolved { request_key } => {
-                self.approvals
-                    .retain(|approval| approval.request_key != request_key);
+                if valid_identifier(&request_key) {
+                    self.approvals
+                        .retain(|approval| approval.request_key != request_key);
+                }
                 if self.approvals.is_empty() && !self.status.is_terminal() {
                     self.apply_running_fallback();
                 }
@@ -498,10 +796,10 @@ impl AgentSession {
                 };
             }
             AgentSessionEvent::ControlError { message } => {
-                self.error = Some(limit_text(message));
+                self.error = Some(sanitize_diagnostic(&message, "control_error"));
             }
             AgentSessionEvent::Failed { message } => {
-                self.error = Some(limit_text(message));
+                self.error = Some(sanitize_diagnostic(&message, "agent_session_failed"));
                 self.status = AgentSessionStatus::Failed;
             }
             AgentSessionEvent::Stopped => {
@@ -509,6 +807,9 @@ impl AgentSession {
                     self.status = AgentSessionStatus::Stopped;
                 }
             }
+        }
+        if self.status != previous_status {
+            self.refresh_fallback_row_states();
         }
     }
 
@@ -525,27 +826,36 @@ impl AgentSession {
             .get("id")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("thread 응답에 thread.id가 없습니다"))?;
+        anyhow::ensure!(
+            valid_identifier(thread_id),
+            "protocol_error:thread_identifier"
+        );
         if let Some(expected) = self.thread_id.as_deref() {
             anyhow::ensure!(
                 expected == thread_id,
-                "thread 응답 ID 불일치: expected {expected}, got {thread_id}"
+                "protocol_error:stale_thread_snapshot"
             );
         }
 
         self.thread_id = Some(thread_id.to_owned());
         if let Some(cwd) = thread.get("cwd").and_then(Value::as_str) {
-            self.cwd = Some(cwd.to_owned());
+            self.cwd = Some(bounded_copy(cwd, MAX_PATH_BYTES));
         }
         if let Some(model) = thread.get("model").and_then(Value::as_str) {
-            self.model = Some(model.to_owned());
+            self.model = Some(bounded_copy(model, MAX_MODEL_BYTES));
         }
 
         self.items.clear();
         self.item_indices.clear();
+        self.table_rows.clear();
+        self.retained_item_bytes = 0;
+        self.retained_table_bytes = 0;
         self.turn_id = None;
         if let Some(turns) = thread.get("turns").and_then(Value::as_array) {
             for turn in turns {
-                if let Some(turn_id) = turn.get("id").and_then(Value::as_str) {
+                if let Some(turn_id) = turn.get("id").and_then(Value::as_str)
+                    && valid_identifier(turn_id)
+                {
                     self.turn_id = Some(turn_id.to_owned());
                 }
                 for item in turn
@@ -571,30 +881,14 @@ impl AgentSession {
         ) {
             self.status = AgentSessionStatus::Ready;
         }
+        self.refresh_fallback_row_states();
         Ok(())
     }
 
     /// Compact rows for the agent-result table. Unlike terminal text, all cells
     /// originate in typed App Server items and are safe to present structurally.
-    pub fn table_rows(&self) -> Vec<AgentTableRow> {
-        self.items
-            .iter()
-            .map(|item| AgentTableRow {
-                item_id: item.id.clone(),
-                state: item
-                    .status
-                    .clone()
-                    .unwrap_or_else(|| self.status.label().to_owned()),
-                kind: item.kind.label().to_owned(),
-                subject: one_line(&item.summary, 180),
-                location: item
-                    .location
-                    .as_deref()
-                    .map(|value| one_line(value, 96))
-                    .unwrap_or_else(|| "—".to_owned()),
-                outcome: item_outcome(item),
-            })
-            .collect()
+    pub fn table_rows(&self) -> &[AgentTableRow] {
+        &self.table_rows
     }
 
     /// Consume the green completed latch after the user opens the session.
@@ -614,23 +908,129 @@ impl AgentSession {
 
     fn upsert_item(&mut self, item: AgentItem, preserve_live_text: bool) {
         if let Some(&index) = self.item_indices.get(&item.id) {
-            let old = &self.items[index];
             let mut item = item;
+            let old_bytes = self.items[index].retained_bytes();
             // `item/completed` is authoritative, but older server versions can
             // omit a field that was delivered via deltas. Keep that text rather
             // than showing a blank completed row.
             if preserve_live_text && item.summary.is_empty() {
-                item.summary = old.summary.clone();
+                item.summary = std::mem::take(&mut self.items[index].summary);
             }
             if preserve_live_text && item.output.is_empty() {
-                item.output = old.output.clone();
+                item.output = std::mem::take(&mut self.items[index].output);
             }
+            item.enforce_retained_limit();
+            let new_bytes = item.retained_bytes();
             self.items[index] = item;
+            self.retained_item_bytes = self
+                .retained_item_bytes
+                .saturating_sub(old_bytes)
+                .saturating_add(new_bytes);
+            self.refresh_table_row(index);
+            self.enforce_session_item_limits();
             return;
         }
         let index = self.items.len();
         self.item_indices.insert(item.id.clone(), index);
+        self.retained_item_bytes = self
+            .retained_item_bytes
+            .saturating_add(item.retained_bytes());
+        let row = project_table_row(&item, self.status);
+        self.retained_table_bytes = self
+            .retained_table_bytes
+            .saturating_add(table_row_retained_bytes(&row));
+        self.table_rows.push(row);
         self.items.push(item);
+        self.enforce_session_item_limits();
+    }
+
+    fn refresh_table_row(&mut self, index: usize) {
+        if let Some(item) = self.items.get(index) {
+            let old_bytes = table_row_retained_bytes(&self.table_rows[index]);
+            let row = project_table_row(item, self.status);
+            let new_bytes = table_row_retained_bytes(&row);
+            self.table_rows[index] = row;
+            self.retained_table_bytes = self
+                .retained_table_bytes
+                .saturating_sub(old_bytes)
+                .saturating_add(new_bytes);
+        }
+    }
+
+    fn refresh_fallback_row_states(&mut self) {
+        let mut retained_table_bytes = self.retained_table_bytes;
+        for (item, row) in self.items.iter().zip(&mut self.table_rows) {
+            if item.status.is_none() {
+                let old_bytes = row.state.len();
+                row.state = self.status.label().to_owned();
+                retained_table_bytes = retained_table_bytes
+                    .saturating_sub(old_bytes)
+                    .saturating_add(row.state.len());
+            }
+        }
+        self.retained_table_bytes = retained_table_bytes;
+    }
+
+    fn enforce_session_item_limits(&mut self) {
+        let mut remove = self.items.len().saturating_sub(MAX_SESSION_ITEMS);
+        let mut retained = self
+            .retained_item_bytes
+            .saturating_add(self.retained_table_bytes);
+        for index in 0..remove {
+            retained = retained
+                .saturating_sub(self.items[index].retained_bytes())
+                .saturating_sub(table_row_retained_bytes(&self.table_rows[index]));
+        }
+        while retained > MAX_SESSION_RETAINED_BYTES && remove < self.items.len() {
+            retained = retained
+                .saturating_sub(self.items[remove].retained_bytes())
+                .saturating_sub(table_row_retained_bytes(&self.table_rows[remove]));
+            remove += 1;
+        }
+        if remove == 0 {
+            return;
+        }
+
+        let removed_bytes = self.items[..remove].iter().fold(0usize, |bytes, item| {
+            bytes.saturating_add(item.retained_bytes())
+        });
+        let removed_table_bytes = table_rows_retained_bytes(&self.table_rows[..remove]);
+        self.items.drain(..remove);
+        self.table_rows.drain(..remove);
+        self.retained_item_bytes = self.retained_item_bytes.saturating_sub(removed_bytes);
+        self.retained_table_bytes = self
+            .retained_table_bytes
+            .saturating_sub(removed_table_bytes);
+        self.rebuild_item_indices();
+    }
+
+    fn rebuild_item_indices(&mut self) {
+        self.item_indices.clear();
+        self.item_indices.reserve(self.items.len());
+        for (index, item) in self.items.iter().enumerate() {
+            self.item_indices.insert(item.id.clone(), index);
+        }
+    }
+
+    fn enforce_metadata_limits(&mut self) {
+        self.prompt = bounded_owned(std::mem::take(&mut self.prompt), MAX_PROMPT_BYTES);
+        self.cwd = self
+            .cwd
+            .take()
+            .map(|cwd| bounded_owned(cwd, MAX_PATH_BYTES));
+        self.model = self
+            .model
+            .take()
+            .map(|model| bounded_owned(model, MAX_MODEL_BYTES));
+        self.effort = self
+            .effort
+            .take()
+            .map(|effort| bounded_owned(effort, MAX_STATUS_BYTES));
+        self.skills.truncate(MAX_SESSION_SKILLS);
+        for skill in &mut self.skills {
+            skill.name = bounded_owned(std::mem::take(&mut skill.name), MAX_IDENTIFIER_BYTES);
+            skill.path = bounded_owned(std::mem::take(&mut skill.path), MAX_PATH_BYTES);
+        }
     }
 
     fn apply_thread_status(&mut self, status: AgentThreadStatus) {
@@ -689,7 +1089,7 @@ impl AgentSession {
 }
 
 /// One table row rendered by the native workspace agent panel.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct AgentTableRow {
     pub item_id: String,
     pub state: String,
@@ -699,44 +1099,152 @@ pub struct AgentTableRow {
     pub outcome: String,
 }
 
-const MAX_ITEM_TEXT_CHARS: usize = 48 * 1024;
+impl fmt::Debug for AgentTableRow {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentTableRow")
+            .field("item_id_bytes", &self.item_id.len())
+            .field("state_bytes", &self.state.len())
+            .field("kind", &self.kind)
+            .field("subject_bytes", &self.subject.len())
+            .field("location_present", &(self.location != "—"))
+            .field("outcome_present", &(self.outcome != "—"))
+            .finish()
+    }
+}
+
+const MAX_IDENTIFIER_BYTES: usize = 1024;
+const MAX_STATUS_BYTES: usize = 128;
+const MAX_MODEL_BYTES: usize = 1024;
+const MAX_PATH_BYTES: usize = 4 * 1024;
+const MAX_PROMPT_BYTES: usize = 256 * 1024;
+const MAX_ITEM_TEXT_BYTES: usize = 48 * 1024;
+const MAX_ITEM_RETAINED_BYTES: usize = 256 * 1024;
+const MAX_FILE_CHANGES_PER_ITEM: usize = 256;
+const MAX_NESTED_PROJECTION_ITEMS: usize = 4096;
+const MAX_PROJECTION_DEPTH: usize = 64;
+const MAX_SESSION_ITEMS: usize = 4096;
+const MAX_SESSION_SKILLS: usize = 64;
+const MAX_PENDING_APPROVALS: usize = 32;
+const MAX_SESSION_RETAINED_BYTES: usize = 8 * 1024 * 1024;
+const TRUNCATION_MARKER: &str = "… [truncated]";
+
+fn valid_identifier(value: &str) -> bool {
+    !value.is_empty() && value.len() <= MAX_IDENTIFIER_BYTES && !value.as_bytes().contains(&0)
+}
 
 fn append_limited(target: &mut String, delta: &str) {
-    if target.chars().count() >= MAX_ITEM_TEXT_CHARS {
+    if target.len() >= MAX_ITEM_TEXT_BYTES {
         return;
     }
-    target.push_str(delta);
-    *target = limit_text(std::mem::take(target));
+    let remaining = MAX_ITEM_TEXT_BYTES - target.len();
+    if delta.len() <= remaining {
+        target.push_str(delta);
+        return;
+    }
+    append_truncated(target, delta, remaining);
 }
 
 fn limit_text(text: String) -> String {
-    let mut indices = text.char_indices();
-    let Some((cut, _)) = indices.nth(MAX_ITEM_TEXT_CHARS) else {
-        return text;
-    };
-    format!("{}\n… output truncated", &text[..cut])
+    bounded_owned(text, MAX_ITEM_TEXT_BYTES)
+}
+
+fn bounded_owned(text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        text
+    } else {
+        bounded_copy(&text, max_bytes)
+    }
+}
+
+fn bounded_copy(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let mut bounded = String::with_capacity(max_bytes);
+    append_truncated(&mut bounded, text, max_bytes);
+    bounded
+}
+
+fn append_truncated(target: &mut String, text: &str, available: usize) {
+    if available == 0 {
+        return;
+    }
+    let marker_bytes = TRUNCATION_MARKER.len().min(available);
+    let prefix_budget = available.saturating_sub(marker_bytes);
+    let prefix_end = floor_char_boundary(text, prefix_budget);
+    target.push_str(&text[..prefix_end]);
+    if marker_bytes == TRUNCATION_MARKER.len() {
+        target.push_str(TRUNCATION_MARKER);
+    } else {
+        let marker_end = floor_char_boundary(TRUNCATION_MARKER, marker_bytes);
+        target.push_str(&TRUNCATION_MARKER[..marker_end]);
+    }
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 fn text_from(value: Option<&Value>) -> String {
     let Some(value) = value else {
         return String::new();
     };
+    let mut text = String::new();
+    let mut items = 0;
+    append_value_text(&mut text, value, 0, &mut items);
+    text
+}
+
+fn append_value_text(target: &mut String, value: &Value, depth: usize, items: &mut usize) {
+    if target.len() >= MAX_ITEM_TEXT_BYTES {
+        return;
+    }
+    if depth >= MAX_PROJECTION_DEPTH || *items >= MAX_NESTED_PROJECTION_ITEMS {
+        append_limited(target, "[projection omitted]");
+        return;
+    }
+    *items = items.saturating_add(1);
     match value {
-        Value::String(text) => text.clone(),
-        Value::Array(values) => values
-            .iter()
-            .map(|value| {
-                value
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| text_from(Some(value)))
-            })
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Value::Null => String::new(),
-        value => serde_json::to_string(value).unwrap_or_default(),
+        Value::Null => {}
+        Value::Bool(value) => append_limited(target, if *value { "true" } else { "false" }),
+        Value::Number(value) => append_limited(target, &value.to_string()),
+        Value::String(value) => append_limited(target, value),
+        Value::Array(values) => {
+            for value in values.iter().take(MAX_NESTED_PROJECTION_ITEMS) {
+                let value = value.get("text").unwrap_or(value);
+                let before = target.len();
+                append_value_text(target, value, depth + 1, items);
+                if target.len() > before && target.len() < MAX_ITEM_TEXT_BYTES {
+                    append_limited(target, "\n");
+                }
+                if *items >= MAX_NESTED_PROJECTION_ITEMS {
+                    break;
+                }
+            }
+            if target.ends_with('\n') {
+                target.pop();
+            }
+        }
+        Value::Object(values) => {
+            append_limited(target, "{");
+            for (index, (key, value)) in values.iter().enumerate() {
+                if index != 0 {
+                    append_limited(target, ", ");
+                }
+                append_limited(target, key);
+                append_limited(target, ": ");
+                append_value_text(target, value, depth + 1, items);
+                if *items >= MAX_NESTED_PROJECTION_ITEMS {
+                    break;
+                }
+            }
+            append_limited(target, "}");
+        }
     }
 }
 
@@ -746,86 +1254,199 @@ fn text_from_optional(value: Option<&Value>) -> Option<String> {
 }
 
 fn command_detail(value: &Value) -> Option<String> {
-    let mut details = Vec::new();
-    if let Some(code) = value.get("exitCode").and_then(Value::as_i64) {
-        details.push(format!("exit {code}"));
+    let code = value.get("exitCode").and_then(Value::as_i64);
+    let duration = value.get("durationMs").and_then(Value::as_u64);
+    match (code, duration) {
+        (Some(code), Some(duration)) => Some(format!("exit {code} · {duration} ms")),
+        (Some(code), None) => Some(format!("exit {code}")),
+        (None, Some(duration)) => Some(format!("{duration} ms")),
+        (None, None) => None,
     }
-    if let Some(duration) = value.get("durationMs").and_then(Value::as_u64) {
-        details.push(format!("{duration} ms"));
-    }
-    (!details.is_empty()).then(|| details.join(" · "))
 }
 
 fn file_changes(value: &Value) -> Vec<AgentFileChange> {
-    value
+    let mut files = Vec::new();
+    let mut retained = 0usize;
+    for change in value
         .get("changes")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|change| {
-            Some(AgentFileChange {
-                path: change.get("path")?.as_str()?.to_owned(),
-                kind: change
-                    .get("kind")
-                    .and_then(Value::as_str)
-                    .unwrap_or("changed")
-                    .to_owned(),
-                diff: change
-                    .get("diff")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            })
-        })
-        .collect()
+        .take(MAX_FILE_CHANGES_PER_ITEM)
+    {
+        let Some(path) = change.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let path = bounded_copy(path, MAX_PATH_BYTES);
+        let kind = bounded_copy(
+            change
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("changed"),
+            MAX_STATUS_BYTES,
+        );
+        let fixed = path.len().saturating_add(kind.len());
+        if retained.saturating_add(fixed) > MAX_ITEM_RETAINED_BYTES {
+            break;
+        }
+        retained = retained.saturating_add(fixed);
+        let diff = change.get("diff").and_then(Value::as_str).map(|diff| {
+            let available = MAX_ITEM_RETAINED_BYTES.saturating_sub(retained);
+            let diff = bounded_copy(diff, available.min(MAX_ITEM_TEXT_BYTES));
+            retained = retained.saturating_add(diff.len());
+            diff
+        });
+        files.push(AgentFileChange { path, kind, diff });
+        if retained == MAX_ITEM_RETAINED_BYTES {
+            break;
+        }
+    }
+    files
 }
 
 fn file_location(files: &[AgentFileChange]) -> Option<String> {
     (!files.is_empty()).then(|| {
-        let mut paths = files
-            .iter()
-            .take(3)
-            .map(|change| change.path.as_str())
-            .collect::<Vec<_>>();
-        if files.len() > paths.len() {
-            paths.push("…");
+        let mut location = String::new();
+        for (index, change) in files.iter().take(3).enumerate() {
+            if index != 0 {
+                location.push_str(", ");
+            }
+            location.push_str(&change.path);
         }
-        paths.join(", ")
+        if files.len() > 3 {
+            location.push_str(", …");
+        }
+        location
     })
 }
 
 fn file_kinds(files: &[AgentFileChange]) -> Option<String> {
     (!files.is_empty()).then(|| {
-        files
-            .iter()
-            .take(3)
-            .map(|change| format!("{} {}", change.kind, change.path))
-            .collect::<Vec<_>>()
-            .join(" · ")
+        let mut kinds = String::new();
+        for (index, change) in files.iter().take(3).enumerate() {
+            if index != 0 {
+                kinds.push_str(" · ");
+            }
+            kinds.push_str(&change.kind);
+            kinds.push(' ');
+            kinds.push_str(&change.path);
+        }
+        kinds
     })
 }
 
 fn one_line(text: &str, max_chars: usize) -> String {
-    let condensed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut indices = condensed.char_indices();
-    let Some((cut, _)) = indices.nth(max_chars) else {
-        return condensed;
-    };
-    format!("{}…", &condensed[..cut])
+    let mut condensed = String::with_capacity(text.len().min(max_chars.saturating_mul(4)));
+    let mut pending_space = false;
+    let mut chars = 0;
+    let mut truncated = false;
+    for character in text.chars() {
+        if character.is_whitespace() {
+            pending_space = !condensed.is_empty();
+            continue;
+        }
+        if pending_space {
+            if chars == max_chars {
+                truncated = true;
+                break;
+            }
+            condensed.push(' ');
+            chars += 1;
+            pending_space = false;
+        }
+        if chars == max_chars {
+            truncated = true;
+            break;
+        }
+        condensed.push(character);
+        chars += 1;
+    }
+    if truncated {
+        condensed.push('…');
+    }
+    condensed
 }
 
 fn item_outcome(item: &AgentItem) -> String {
-    let mut parts = Vec::new();
-    if let Some(detail) = item.detail.as_deref().filter(|detail| !detail.is_empty()) {
-        parts.push(one_line(detail, 80));
+    match (
+        item.detail.as_deref().filter(|detail| !detail.is_empty()),
+        (!item.output.is_empty()).then_some(item.output.as_str()),
+    ) {
+        (Some(detail), Some(output)) => {
+            format!("{} · {}", one_line(detail, 80), one_line(output, 100))
+        }
+        (Some(detail), None) => one_line(detail, 80),
+        (None, Some(output)) => one_line(output, 100),
+        (None, None) => "—".to_owned(),
     }
-    if !item.output.is_empty() {
-        parts.push(one_line(&item.output, 100));
+}
+
+fn project_table_row(item: &AgentItem, session_status: AgentSessionStatus) -> AgentTableRow {
+    AgentTableRow {
+        item_id: item.id.clone(),
+        state: item
+            .status
+            .clone()
+            .unwrap_or_else(|| session_status.label().to_owned()),
+        kind: item.kind.label().to_owned(),
+        subject: one_line(&item.summary, 180),
+        location: item
+            .location
+            .as_deref()
+            .map(|value| one_line(value, 96))
+            .unwrap_or_else(|| "—".to_owned()),
+        outcome: item_outcome(item),
     }
-    if parts.is_empty() {
-        "—".to_owned()
-    } else {
-        parts.join(" · ")
+}
+
+fn table_row_retained_bytes(row: &AgentTableRow) -> usize {
+    row.item_id
+        .len()
+        .saturating_add(row.state.len())
+        .saturating_add(row.kind.len())
+        .saturating_add(row.subject.len())
+        .saturating_add(row.location.len())
+        .saturating_add(row.outcome.len())
+}
+
+fn table_rows_retained_bytes(rows: &[AgentTableRow]) -> usize {
+    rows.iter().fold(0usize, |bytes, row| {
+        bytes.saturating_add(table_row_retained_bytes(row))
+    })
+}
+
+fn sanitize_diagnostic(message: &str, fallback: &'static str) -> String {
+    if message.contains("stale expectedTurnId") {
+        return "control_error:stale_turn".to_owned();
     }
+    if matches!(
+        message,
+        "protocol_error:invalid_json"
+            | "protocol_error:rpc_error"
+            | "protocol_error:thread_resume_response"
+            | "protocol_error:unknown_message"
+            | "protocol_error:unsupported_request"
+            | "resource_backpressure:command_queue_full"
+            | "resource_backpressure:event_queue_full"
+            | "resource_backpressure:identifier_bytes"
+            | "resource_backpressure:request_limit"
+            | "resource_backpressure:session_limit"
+            | "resource_limit:command_items"
+            | "resource_limit:command_too_large"
+            | "resource_limit:identifier"
+            | "resource_limit:item_projection"
+            | "resource_limit:model_catalog_items"
+            | "resource_limit:model_effort_items"
+            | "resource_limit:skill_catalog_items"
+            | "resource_limit:skill_groups"
+            | "resource_limit:thread_identifier"
+            | "resource_limit:thread_list_items"
+            | "resource_limit:thread_result_items"
+            | "resource_limit:turn_identifier"
+    ) {
+        return message.to_owned();
+    }
+    fallback.to_owned()
 }
 
 #[cfg(test)]
@@ -1126,6 +1747,335 @@ mod tests {
         });
 
         assert_eq!(session.status, AgentSessionStatus::Completed);
-        assert_eq!(session.error.as_deref(), Some("stale expectedTurnId"));
+        assert_eq!(session.error.as_deref(), Some("control_error:stale_turn"));
+    }
+
+    #[test]
+    fn identifier_and_utf8_text_limits_accept_exact_and_bound_plus_one() {
+        let exact_id = "i".repeat(MAX_IDENTIFIER_BYTES);
+        assert!(
+            AgentItem::from_codex(&json!({
+                "id": exact_id,
+                "type": "agentMessage",
+                "text": "ok"
+            }))
+            .is_some()
+        );
+        assert!(
+            AgentItem::from_codex(&json!({
+                "id": "i".repeat(MAX_IDENTIFIER_BYTES + 1),
+                "type": "agentMessage",
+                "text": "ok"
+            }))
+            .is_none()
+        );
+
+        let exact_text = "x".repeat(MAX_ITEM_TEXT_BYTES);
+        assert_eq!(bounded_copy(&exact_text, MAX_ITEM_TEXT_BYTES), exact_text);
+        let plus_one = bounded_copy(&"x".repeat(MAX_ITEM_TEXT_BYTES + 1), MAX_ITEM_TEXT_BYTES);
+        assert!(plus_one.len() <= MAX_ITEM_TEXT_BYTES);
+        assert!(plus_one.ends_with(TRUNCATION_MARKER));
+
+        let unicode = bounded_copy(&"가".repeat(MAX_ITEM_TEXT_BYTES), MAX_ITEM_TEXT_BYTES);
+        assert!(unicode.len() <= MAX_ITEM_TEXT_BYTES);
+        assert!(unicode.is_char_boundary(unicode.len()));
+    }
+
+    #[test]
+    fn file_and_nested_projections_are_bounded() {
+        let item = AgentItem::from_codex(&json!({
+            "id": "files",
+            "type": "fileChange",
+            "changes": (0..=MAX_FILE_CHANGES_PER_ITEM)
+                .map(|index| json!({
+                    "path": format!("/repo/{index}"),
+                    "kind": "update",
+                    "diff": "x".repeat(MAX_ITEM_TEXT_BYTES)
+                }))
+                .collect::<Vec<_>>()
+        }))
+        .unwrap();
+        assert!(item.files.len() <= MAX_FILE_CHANGES_PER_ITEM);
+        assert!(item.retained_bytes() <= MAX_ITEM_RETAINED_BYTES);
+
+        let mut nested = json!("leaf");
+        for _ in 0..=MAX_PROJECTION_DEPTH {
+            nested = json!({"next": nested});
+        }
+        let projected = text_from(Some(&nested));
+        assert!(projected.len() <= MAX_ITEM_TEXT_BYTES);
+        assert!(projected.contains("[projection omitted]"));
+    }
+
+    #[test]
+    fn item_eviction_keeps_indices_and_cached_rows_consistent() {
+        let mut session = AgentSession::new("local-1".to_owned(), "bounded".to_owned(), None);
+        for index in 0..=MAX_SESSION_ITEMS {
+            session.apply(AgentSessionEvent::ItemCompleted {
+                item: AgentItem::from_codex(&json!({
+                    "id": format!("item-{index}"),
+                    "type": "agentMessage",
+                    "text": format!("answer-{index}")
+                }))
+                .unwrap(),
+            });
+        }
+
+        assert_eq!(session.items.len(), MAX_SESSION_ITEMS);
+        assert_eq!(session.table_rows().len(), MAX_SESSION_ITEMS);
+        assert!(!session.item_indices.contains_key("item-0"));
+        assert_eq!(session.item_indices.get("item-1"), Some(&0));
+
+        session.apply(AgentSessionEvent::ItemDelta {
+            item_id: format!("item-{MAX_SESSION_ITEMS}"),
+            delta: " updated".to_owned(),
+        });
+        let index = session.item_indices[&format!("item-{MAX_SESSION_ITEMS}")];
+        assert!(session.items[index].summary.ends_with(" updated"));
+        assert!(session.table_rows()[index].subject.ends_with(" updated"));
+    }
+
+    #[test]
+    fn repeated_updates_replace_without_retention_growth() {
+        let mut session = AgentSession::new("local-1".to_owned(), "bounded".to_owned(), None);
+        for index in 0..1000 {
+            session.apply(AgentSessionEvent::ItemCompleted {
+                item: AgentItem::from_codex(&json!({
+                    "id": "same-item",
+                    "type": "agentMessage",
+                    "text": format!("answer-{index}")
+                }))
+                .unwrap(),
+            });
+            session.apply(AgentSessionEvent::ApprovalRequested {
+                approval: AgentApproval {
+                    request_key: "same-approval".to_owned(),
+                    kind: AgentApprovalKind::CommandExecution,
+                    thread_id: "thread-1".to_owned(),
+                    turn_id: "turn-1".to_owned(),
+                    item_id: "same-item".to_owned(),
+                    reason: Some(format!("reason-{index}")),
+                    command: Some(format!("command-{index}")),
+                    cwd: Some("/repo".to_owned()),
+                },
+            });
+        }
+
+        assert_eq!(session.items.len(), 1);
+        assert_eq!(session.item_indices.len(), 1);
+        assert_eq!(session.table_rows().len(), 1);
+        assert_eq!(session.approvals.len(), 1);
+        assert_eq!(session.approvals[0].command.as_deref(), Some("command-999"));
+        assert!(
+            session.retained_item_bytes + session.retained_table_bytes
+                <= MAX_SESSION_RETAINED_BYTES
+        );
+        assert_eq!(
+            session.retained_table_bytes,
+            table_rows_retained_bytes(session.table_rows())
+        );
+    }
+
+    #[test]
+    fn session_byte_budget_includes_cached_rows() {
+        let mut session = AgentSession::new("local-1".to_owned(), "bounded".to_owned(), None);
+        for index in 0..256 {
+            session.apply(AgentSessionEvent::ItemCompleted {
+                item: AgentItem::from_codex(&json!({
+                    "id": format!("large-{index}"),
+                    "type": "agentMessage",
+                    "text": "x".repeat(MAX_ITEM_TEXT_BYTES)
+                }))
+                .unwrap(),
+            });
+        }
+        let combined = session
+            .retained_item_bytes
+            .saturating_add(session.retained_table_bytes);
+        assert!(combined <= MAX_SESSION_RETAINED_BYTES);
+        assert_eq!(
+            session.retained_table_bytes,
+            table_rows_retained_bytes(session.table_rows())
+        );
+        assert!(session.items.len() < 256);
+        assert_eq!(session.items.len(), session.item_indices.len());
+        assert_eq!(session.items.len(), session.table_rows().len());
+    }
+
+    #[test]
+    fn stale_snapshot_is_rejected_without_raw_identifiers_or_state_change() {
+        let mut session = AgentSession::new("local-1".to_owned(), "bounded".to_owned(), None);
+        session.thread_id = Some("expected-secret-id".to_owned());
+        session.apply(AgentSessionEvent::ItemCompleted {
+            item: AgentItem::from_codex(&json!({
+                "id": "existing",
+                "type": "agentMessage",
+                "text": "keep"
+            }))
+            .unwrap(),
+        });
+
+        let error = session
+            .load_thread_snapshot(&json!({
+                "thread": {
+                    "id": "hostile-secret-id",
+                    "turns": []
+                }
+            }))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "protocol_error:stale_thread_snapshot");
+        assert_eq!(session.thread_id.as_deref(), Some("expected-secret-id"));
+        assert_eq!(session.items.len(), 1);
+    }
+
+    #[test]
+    fn debug_and_diagnostics_redact_hostile_content() {
+        let secret = "Bearer super-secret-token";
+        let approval = AgentApproval {
+            request_key: "request-1".to_owned(),
+            kind: AgentApprovalKind::CommandExecution,
+            thread_id: "thread-1".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            item_id: "item-1".to_owned(),
+            reason: Some(secret.to_owned()),
+            command: Some(format!("curl -H '{secret}'")),
+            cwd: Some("/secret/workspace".to_owned()),
+        };
+        let debug = format!("{approval:?}");
+        assert!(!debug.contains(secret));
+        assert!(!debug.contains("/secret/workspace"));
+        assert!(debug.contains("[REDACTED]"));
+
+        let event = AgentSessionEvent::ControlError {
+            message: secret.to_owned(),
+        };
+        assert!(!format!("{event:?}").contains(secret));
+
+        let mut session = AgentSession::new("local-1".to_owned(), secret.to_owned(), None);
+        session.apply(event);
+        assert_eq!(session.error.as_deref(), Some("control_error"));
+        assert!(!format!("{session:?}").contains(secret));
+    }
+
+    #[test]
+    fn approval_count_is_capped_at_transport_limit() {
+        let mut session = AgentSession::new("local-1".to_owned(), "bounded".to_owned(), None);
+        for index in 0..=MAX_PENDING_APPROVALS {
+            session.apply(AgentSessionEvent::ApprovalRequested {
+                approval: AgentApproval {
+                    request_key: format!("request-{index}"),
+                    kind: AgentApprovalKind::CommandExecution,
+                    thread_id: "thread-1".to_owned(),
+                    turn_id: "turn-1".to_owned(),
+                    item_id: format!("item-{index}"),
+                    reason: None,
+                    command: None,
+                    cwd: None,
+                },
+            });
+        }
+        assert_eq!(session.approvals.len(), MAX_PENDING_APPROVALS);
+        assert_eq!(
+            session.error.as_deref(),
+            Some("resource_limit:pending_approvals")
+        );
+    }
+
+    #[test]
+    fn approval_display_fields_accept_exact_and_fail_closed_at_plus_one() {
+        let mut exact = AgentSession::new("local-1".to_owned(), "bounded".to_owned(), None);
+        exact.apply(AgentSessionEvent::ApprovalRequested {
+            approval: AgentApproval {
+                request_key: "request-exact".to_owned(),
+                kind: AgentApprovalKind::CommandExecution,
+                thread_id: "thread-1".to_owned(),
+                turn_id: "turn-1".to_owned(),
+                item_id: "item-1".to_owned(),
+                reason: None,
+                command: Some("x".repeat(MAX_ITEM_TEXT_BYTES)),
+                cwd: None,
+            },
+        });
+        assert_eq!(exact.approvals.len(), 1);
+        assert_eq!(
+            exact.approvals[0].command.as_ref().map(String::len),
+            Some(MAX_ITEM_TEXT_BYTES)
+        );
+
+        let mut oversized = AgentSession::new("local-2".to_owned(), "bounded".to_owned(), None);
+        oversized.apply(AgentSessionEvent::ApprovalRequested {
+            approval: AgentApproval {
+                request_key: "request-oversized".to_owned(),
+                kind: AgentApprovalKind::CommandExecution,
+                thread_id: "thread-1".to_owned(),
+                turn_id: "turn-1".to_owned(),
+                item_id: "item-1".to_owned(),
+                reason: None,
+                command: Some("x".repeat(MAX_ITEM_TEXT_BYTES + 1)),
+                cwd: None,
+            },
+        });
+        assert!(oversized.approvals.is_empty());
+        assert_eq!(oversized.status, AgentSessionStatus::Failed);
+        assert_eq!(
+            oversized.error.as_deref(),
+            Some("protocol_error:approval_projection")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "AgentSessionId must be a non-empty identifier")]
+    fn oversized_session_identity_is_rejected_instead_of_truncated() {
+        let _ = AgentSession::new(
+            "i".repeat(MAX_IDENTIFIER_BYTES + 1),
+            "bounded".to_owned(),
+            None,
+        );
+    }
+
+    #[test]
+    fn cached_table_rows_are_stable_between_render_reads() {
+        let mut session = AgentSession::new("local-1".to_owned(), "bounded".to_owned(), None);
+        session.apply(AgentSessionEvent::ItemCompleted {
+            item: AgentItem::from_codex(&json!({
+                "id": "item-1",
+                "type": "agentMessage",
+                "text": "answer"
+            }))
+            .unwrap(),
+        });
+        let first = session.table_rows().as_ptr();
+        for _ in 0..300 {
+            assert_eq!(session.table_rows().as_ptr(), first);
+        }
+    }
+
+    #[test]
+    fn source_laws_prevent_projection_allocation_amplifiers() {
+        let source = include_str!("agent_session.rs");
+        let collect_join = ["collect::<Vec<_>>()", "\n            ", ".join"].concat();
+        assert!(!source.contains(&collect_join));
+        assert!(source.contains("pub fn table_rows(&self) -> &[AgentTableRow]"));
+        assert!(source.contains("MAX_SESSION_RETAINED_BYTES"));
+        assert!(source.contains("MAX_PROJECTION_DEPTH"));
+
+        for declaration in [
+            "pub struct AgentFileChange",
+            "pub struct AgentItem",
+            "pub struct AgentApproval",
+            "pub enum AgentSessionEvent",
+        ] {
+            let line = source
+                .lines()
+                .position(|line| line.contains(declaration))
+                .unwrap();
+            let derive = source.lines().nth(line.saturating_sub(1)).unwrap();
+            assert!(derive.trim_start().starts_with("#[derive("));
+            assert!(
+                !derive.contains("Clone"),
+                "{declaration} must stay non-Clone"
+            );
+        }
     }
 }

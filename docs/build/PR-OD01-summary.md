@@ -177,3 +177,30 @@ passes 15/15. App and xtask all-target check, strict Clippy with `-D warnings`, 
 zero-allowlist boundary, the 23-crate dependency DAG, full rustfmt, and diff-check pass. No
 30-minute or Scenario A-E measurement was performed; latest-only agent-detection delivery remains
 development work before the final hardware gate.
+
+## Agent detection and retained-session resource closeout
+
+Agent detection now publishes one immutable, Arc-backed generation snapshot and retains only one
+latest outcome. Identical inputs neither clone the override map nor wake the worker; empty input
+parks indefinitely with detector I/O and repaint at zero. Stale generations are discarded, and
+partial activity updates preserve the latest full binding/cwd/info projection without building an
+event backlog. Input and output maps are capped at 256 admitted sessions.
+
+The detector's ps/lsof boundary uses a three-second bounded process-group runner with explicit
+stdout/stderr byte caps, fixed 128-KiB reader stacks, and kill/reap/join cleanup on timeout,
+overflow, and inherited-descendant-pipe paths. Process rows, commands, descendant walks, candidate
+counts, lsof invocations, recursive transcript discovery, paths, identifiers, and transcript-head
+reads all have exact item/byte/depth ceilings and fail closed on hostile or invalid input.
+
+Structured session projection is bounded at 4,096 retained items, 32 approvals, 64 identity-only
+skills, and 8 MiB including cached rows. Per-ID, text, item, file-change, nested-value, and depth
+limits are enforced before retention. Table rows are cached and borrowed, repeated updates replace
+in place, and oldest eviction rebuilds bounded indices. Secret-bearing session/event/approval/file
+types are non-Clone with redacted Debug; stale diagnostics use low-cardinality codes.
+
+Focused evidence is detector input 20/20 with one real-process ignore, latest-only worker 10/10,
+and session projection 24/24. The integrated app suite passes 752 tests with five explicit ignores,
+logging policy passes 15/15, and app/xtask all-target check, strict Clippy, xtask 9/9, zero-
+allowlist boundary, the 23-crate dependency DAG, full rustfmt, and diff-check pass. Hardware-duration
+measurement remains deferred until the remaining startup/action input seams are structurally
+bounded.

@@ -1,13 +1,14 @@
 //! agent_detect의 무거운 I/O(ps/lsof/transcript 스캔)를 UI 스레드 밖 전용 스레드에서
-//! 돌린다(codex #3: UI hitch 제거). 2-tier 타이머(바인딩 2.5s / 활동 1.5s)를 스레드가
-//! 자체 관리하고, 결과를 mpsc로 앱에 던진 뒤 ctx.request_repaint로 깨운다. 입력(세션 pid
-//! 목록 + epoch)은 Arc<Mutex>로 최신 스냅샷 하나만 공유한다(이벤트 큐 아님 — 항상 최신
-//! 1개). epoch로 워크스페이스 전환 시 stale 결과를 폐기한다. 스레드/Drop 패턴은
-//! ApprovalWatcher를 따른다.
+//! 돌린다(codex #3: UI hitch 제거). 입력은 generation이 붙은 최신 스냅샷 하나,
+//! 결과는 기다리는 소비자가 없어도 누적되지 않는 capacity-one 교체 슬롯 하나만
+//! 유지한다. 빈 세션 입력에서는 condvar에 무기한 park하여 subprocess/파일 I/O와
+//! repaint를 모두 발생시키지 않는다. epoch+generation 검증으로 입력 변경 중 완료된
+//! stale 연산은 publish 전에 폐기한다.
 
 use std::collections::HashMap;
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use runtime::SessionId;
@@ -22,6 +23,10 @@ const ACTIVITY_INTERVAL: Duration = Duration::from_millis(1500);
 /// (2026-07-14 가림 프로파일: 숨김 CPU의 최대 단일 항목이 detect의 ps 스폰이었다).
 /// 알림은 runtime worker의 status detector(출력 regex) 경로라 영향 없다.
 const HIDDEN_INTERVAL_MULT: u32 = 4;
+/// runtime의 실제 pane 상한보다 넉넉하지만 유한한 방어선. 입력과 모든 결과
+/// map에 동일하게 적용해 장기 실행에서 항목 수가 세션 수를 넘어 증가하지 않게 한다.
+pub const MAX_DETECT_SESSIONS: usize = 256;
+const WORKER_SPAWN_ERROR: &str = "agent_detect_worker_spawn_failed";
 
 /// tier 주기 — 숨김이면 4배로 늘린다 (바인딩 2.5s→10s, 활동 1.5s→6s).
 fn tier_intervals(hidden: bool) -> (Duration, Duration) {
@@ -35,20 +40,167 @@ fn tier_intervals(hidden: bool) -> (Duration, Duration) {
     }
 }
 
-/// App → 스레드 입력: (epoch, 활성 세션 pid 목록, hook 오버라이드, 창 숨김 여부).
-/// 최신 값 하나만 의미 있다.
-pub type DetectInput = Arc<
-    Mutex<(
-        u64,
-        Vec<(SessionId, u32)>,
-        HashMap<SessionId, AgentBinding>,
-        bool,
-    )>,
->;
+type InputSnapshot = (
+    u64,
+    Vec<(SessionId, u32)>,
+    HashMap<SessionId, AgentBinding>,
+    bool,
+);
+
+struct VersionedInput {
+    generation: u64,
+    snapshot: InputSnapshot,
+}
+
+struct DetectInputState {
+    current: Arc<VersionedInput>,
+    stopping: bool,
+}
+
+struct DetectInputShared {
+    state: Mutex<DetectInputState>,
+    changed: Condvar,
+}
+
+/// 유저 경로/세션 ID를 노출하지 않는 정적 입력 거부 코드.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectInputError {
+    SessionLimit,
+    OverrideLimit,
+    WorkerUnavailable,
+}
+
+/// App → 스레드 capacity-one 입력. 동일한 스냅샷은 매 frame publish해도
+/// allocation/clone/wake를 발생시키지 않는다.
+#[derive(Clone)]
+pub struct DetectInput {
+    shared: Arc<DetectInputShared>,
+}
+
+impl DetectInput {
+    fn new() -> Self {
+        Self {
+            shared: Arc::new(DetectInputShared {
+                state: Mutex::new(DetectInputState {
+                    current: Arc::new(VersionedInput {
+                        generation: 0,
+                        snapshot: (0, Vec::new(), HashMap::new(), false),
+                    }),
+                    stopping: false,
+                }),
+                changed: Condvar::new(),
+            }),
+        }
+    }
+
+    /// 최신 입력을 교체한다. `overrides`는 기존 값과 다를 때만 clone된다.
+    /// cap 초과 시 예전 입력을 계속 실행하지 않고 빈 스냅샷으로 fail-closed한다.
+    pub fn publish(
+        &self,
+        epoch: u64,
+        sessions: Vec<(SessionId, u32)>,
+        overrides: &HashMap<SessionId, AgentBinding>,
+        hidden: bool,
+    ) -> Result<(), DetectInputError> {
+        let limit_error = if sessions.len() > MAX_DETECT_SESSIONS {
+            Some(DetectInputError::SessionLimit)
+        } else if overrides.len() > MAX_DETECT_SESSIONS {
+            Some(DetectInputError::OverrideLimit)
+        } else {
+            None
+        };
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| DetectInputError::WorkerUnavailable)?;
+        if state.stopping {
+            return Err(DetectInputError::WorkerUnavailable);
+        }
+        let unchanged = if limit_error.is_some() {
+            state.current.snapshot.0 == epoch
+                && state.current.snapshot.1.is_empty()
+                && state.current.snapshot.2.is_empty()
+                && state.current.snapshot.3 == hidden
+        } else {
+            state.current.snapshot.0 == epoch
+                && state.current.snapshot.1 == sessions
+                && state.current.snapshot.2 == *overrides
+                && state.current.snapshot.3 == hidden
+        };
+        if !unchanged {
+            let next = if limit_error.is_some() {
+                (epoch, Vec::new(), HashMap::new(), hidden)
+            } else {
+                (epoch, sessions, overrides.clone(), hidden)
+            };
+            state.current = Arc::new(VersionedInput {
+                generation: state.current.generation.wrapping_add(1),
+                snapshot: next,
+            });
+            self.shared.changed.notify_one();
+        }
+        match limit_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn current(&self) -> Option<Arc<VersionedInput>> {
+        self.shared
+            .state
+            .lock()
+            .ok()
+            .filter(|state| !state.stopping)
+            .map(|state| state.current.clone())
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.shared
+            .state
+            .lock()
+            .is_ok_and(|state| !state.stopping && state.current.generation == generation)
+    }
+
+    fn wait_for_change(&self, generation: u64, timeout: Option<Duration>) -> bool {
+        let Ok(state) = self.shared.state.lock() else {
+            return false;
+        };
+        if state.stopping || state.current.generation != generation {
+            return !state.stopping;
+        }
+        match timeout {
+            Some(timeout) => self
+                .shared
+                .changed
+                .wait_timeout_while(state, timeout, |state| {
+                    !state.stopping && state.current.generation == generation
+                })
+                .is_ok_and(|(state, _)| !state.stopping),
+            None => self
+                .shared
+                .changed
+                .wait_while(state, |state| {
+                    !state.stopping && state.current.generation == generation
+                })
+                .is_ok_and(|state| !state.stopping),
+        }
+    }
+
+    fn stop(&self) {
+        if let Ok(mut state) = self.shared.state.lock() {
+            state.stopping = true;
+            self.shared.changed.notify_all();
+        }
+    }
+}
 
 /// 스레드 → App 결과. bindings는 바인딩 tier에서만 Some(활동 tier는 None), activity는 매번.
+#[derive(PartialEq, Eq)]
 pub struct DetectOutcome {
     pub epoch: u64,
+    /// 입력 snapshot generation. worker에서 publish 전 freshness를 검증한 값이다.
+    pub generation: u64,
     pub bindings: Option<HashMap<SessionId, AgentBinding>>,
     pub activity: HashMap<SessionId, AgentActivity>,
     /// 세션별 현재 작업 폴더(바인딩 tier에서만, 한 번의 lsof). 행 폴더명 + 워크스페이스명.
@@ -57,9 +209,196 @@ pub struct DetectOutcome {
     pub agent_info: Option<HashMap<SessionId, AgentDisplay>>,
 }
 
+struct MailboxState {
+    latest: Option<Arc<DetectOutcome>>,
+    sequence: u64,
+    closed: bool,
+    consumer_alive: bool,
+}
+
+struct OutcomeMailbox {
+    state: Mutex<MailboxState>,
+    available: Condvar,
+}
+
+enum PublishResult {
+    Changed,
+    Unchanged,
+    Closed,
+}
+
+impl OutcomeMailbox {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(MailboxState {
+                latest: None,
+                sequence: 0,
+                closed: false,
+                consumer_alive: true,
+            }),
+            available: Condvar::new(),
+        })
+    }
+
+    fn publish(&self, outcome: DetectOutcome) -> PublishResult {
+        let Ok(mut state) = self.state.lock() else {
+            return PublishResult::Closed;
+        };
+        if state.closed || !state.consumer_alive {
+            return PublishResult::Closed;
+        }
+        let mut outcome = outcome;
+        if let Some(current) = state.latest.as_ref() {
+            if current.generation > outcome.generation {
+                return PublishResult::Unchanged;
+            }
+            // 활동 tier의 partial 결과가 소비되지 않은 binding/cwd/info를
+            // 지우지 않도록 동일 snapshot에서는 완전한 스냅샷으로 merge한다.
+            if current.epoch == outcome.epoch && current.generation == outcome.generation {
+                let changed = current.activity != outcome.activity
+                    || outcome
+                        .bindings
+                        .as_ref()
+                        .is_some_and(|value| current.bindings.as_ref() != Some(value))
+                    || outcome
+                        .session_cwds
+                        .as_ref()
+                        .is_some_and(|value| current.session_cwds.as_ref() != Some(value))
+                    || outcome
+                        .agent_info
+                        .as_ref()
+                        .is_some_and(|value| current.agent_info.as_ref() != Some(value));
+                if !changed {
+                    return PublishResult::Unchanged;
+                }
+                if outcome.bindings.is_none() {
+                    outcome.bindings.clone_from(&current.bindings);
+                }
+                if outcome.session_cwds.is_none() {
+                    outcome.session_cwds.clone_from(&current.session_cwds);
+                }
+                if outcome.agent_info.is_none() {
+                    outcome.agent_info.clone_from(&current.agent_info);
+                }
+            }
+            if current.as_ref() == &outcome {
+                return PublishResult::Unchanged;
+            }
+        }
+        state.latest = Some(Arc::new(outcome));
+        state.sequence = state.sequence.wrapping_add(1);
+        self.available.notify_one();
+        PublishResult::Changed
+    }
+
+    fn close(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closed = true;
+            self.available.notify_all();
+        }
+    }
+}
+
+/// capacity-one 결과 수신기. `try_recv`는 std mpsc receiver와 동일한 폴링
+/// 형태를 제공하지만 저장은 항상 최신 결과 하나뿐이다.
+pub struct DetectOutcomeReceiver {
+    mailbox: Arc<OutcomeMailbox>,
+    seen_sequence: AtomicU64,
+}
+
+impl DetectOutcomeReceiver {
+    pub fn try_recv(&self) -> Result<Arc<DetectOutcome>, std::sync::mpsc::TryRecvError> {
+        let Ok(state) = self.mailbox.state.lock() else {
+            return Err(std::sync::mpsc::TryRecvError::Disconnected);
+        };
+        if state.sequence != self.seen_sequence.load(Ordering::Relaxed) {
+            self.seen_sequence.store(state.sequence, Ordering::Relaxed);
+            Ok(Arc::clone(
+                state
+                    .latest
+                    .as_ref()
+                    .expect("agent_detect_mailbox_sequence_without_value"),
+            ))
+        } else if state.closed {
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        } else {
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        }
+    }
+
+    #[cfg(test)]
+    fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Arc<DetectOutcome>, std::sync::mpsc::RecvTimeoutError> {
+        let Ok(state) = self.mailbox.state.lock() else {
+            return Err(std::sync::mpsc::RecvTimeoutError::Disconnected);
+        };
+        let seen = self.seen_sequence.load(Ordering::Relaxed);
+        let Ok((state, _)) = self
+            .mailbox
+            .available
+            .wait_timeout_while(state, timeout, |state| {
+                state.sequence == seen && !state.closed
+            })
+        else {
+            return Err(std::sync::mpsc::RecvTimeoutError::Disconnected);
+        };
+        if state.sequence != seen {
+            self.seen_sequence.store(state.sequence, Ordering::Relaxed);
+            Ok(Arc::clone(
+                state
+                    .latest
+                    .as_ref()
+                    .expect("agent_detect_mailbox_sequence_without_value"),
+            ))
+        } else if state.closed {
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        } else {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        }
+    }
+}
+
+impl Drop for DetectOutcomeReceiver {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.mailbox.state.lock() {
+            state.consumer_alive = false;
+            self.mailbox.available.notify_all();
+        }
+    }
+}
+
 pub struct AgentDetectWorker {
-    stop_tx: Option<mpsc::Sender<()>>,
+    input: DetectInput,
     handle: Option<std::thread::JoinHandle<()>>,
+}
+
+struct BindingPass {
+    bindings: HashMap<SessionId, AgentBinding>,
+    activity: HashMap<SessionId, AgentActivity>,
+    session_cwds: HashMap<SessionId, String>,
+    agent_info: HashMap<SessionId, AgentDisplay>,
+}
+
+trait DetectionBackend: Send + 'static {
+    fn reset(&mut self);
+
+    fn binding_pass(
+        &mut self,
+        sessions: &[(SessionId, u32)],
+        overrides: &HashMap<SessionId, AgentBinding>,
+    ) -> BindingPass;
+
+    fn activity_pass(
+        &mut self,
+        bindings: &HashMap<SessionId, AgentBinding>,
+    ) -> HashMap<SessionId, AgentActivity>;
+}
+
+#[derive(Default)]
+struct ProductionBackend {
+    cache: agent_detect::BindingCache,
 }
 
 fn compute_activity(
@@ -99,111 +438,237 @@ fn compute_activity_and_info(
     (activity, info)
 }
 
+impl DetectionBackend for ProductionBackend {
+    fn reset(&mut self) {
+        self.cache = agent_detect::BindingCache::default();
+    }
+
+    fn binding_pass(
+        &mut self,
+        sessions: &[(SessionId, u32)],
+        overrides: &HashMap<SessionId, AgentBinding>,
+    ) -> BindingPass {
+        let bindings = agent_detect::detect_cached(sessions, overrides, &mut self.cache);
+        let (activity, agent_info) = compute_activity_and_info(&bindings);
+        let pids: Vec<u32> = sessions.iter().map(|(_, pid)| *pid).collect();
+        let cwd_by_pid = agent_detect::session_cwds(&pids);
+        let session_cwds = sessions
+            .iter()
+            .filter_map(|(sid, pid)| cwd_by_pid.get(pid).map(|cwd| (*sid, cwd.clone())))
+            .collect();
+        BindingPass {
+            bindings,
+            activity,
+            session_cwds,
+            agent_info,
+        }
+    }
+
+    fn activity_pass(
+        &mut self,
+        bindings: &HashMap<SessionId, AgentBinding>,
+    ) -> HashMap<SessionId, AgentActivity> {
+        compute_activity(bindings)
+    }
+}
+
+fn bound_pass(mut pass: BindingPass, sessions: &[(SessionId, u32)]) -> BindingPass {
+    let admitted: HashSet<_> = sessions
+        .iter()
+        .take(MAX_DETECT_SESSIONS)
+        .map(|(sid, _)| *sid)
+        .collect();
+    pass.bindings.retain(|sid, _| admitted.contains(sid));
+    pass.activity.retain(|sid, _| admitted.contains(sid));
+    pass.session_cwds.retain(|sid, _| admitted.contains(sid));
+    pass.agent_info.retain(|sid, _| admitted.contains(sid));
+    pass
+}
+
+fn bound_activity(
+    mut activity: HashMap<SessionId, AgentActivity>,
+    bindings: &HashMap<SessionId, AgentBinding>,
+) -> HashMap<SessionId, AgentActivity> {
+    activity.retain(|sid, _| bindings.contains_key(sid));
+    activity
+}
+
+fn publish_outcome(mailbox: &OutcomeMailbox, ctx: &egui::Context, outcome: DetectOutcome) -> bool {
+    match mailbox.publish(outcome) {
+        PublishResult::Changed => {
+            ctx.request_repaint();
+            true
+        }
+        PublishResult::Unchanged => true,
+        PublishResult::Closed => false,
+    }
+}
+
+fn run_worker<B: DetectionBackend>(
+    input: DetectInput,
+    mailbox: Arc<OutcomeMailbox>,
+    ctx: egui::Context,
+    mut backend: B,
+) {
+    struct CloseMailbox(Arc<OutcomeMailbox>);
+    impl Drop for CloseMailbox {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+    let _close = CloseMailbox(Arc::clone(&mailbox));
+    let mut bindings: HashMap<SessionId, AgentBinding> = HashMap::new();
+    let mut last_epoch = 0u64;
+    let mut accepted_generation = None;
+    let mut had_sessions = false;
+    let mut last_binding = Instant::now();
+    let mut last_activity = Instant::now();
+
+    while let Some(versioned) = input.current() {
+        let generation = versioned.generation;
+        let (epoch, sessions, overrides, hidden) = &versioned.snapshot;
+
+        if sessions.is_empty() {
+            if had_sessions {
+                backend.reset();
+                bindings.clear();
+                had_sessions = false;
+                accepted_generation = Some(generation);
+                if input.is_current(generation)
+                    && !publish_outcome(
+                        &mailbox,
+                        &ctx,
+                        DetectOutcome {
+                            epoch: *epoch,
+                            generation,
+                            bindings: Some(HashMap::new()),
+                            activity: HashMap::new(),
+                            session_cwds: Some(HashMap::new()),
+                            agent_info: Some(HashMap::new()),
+                        },
+                    )
+                {
+                    break;
+                }
+            }
+            // 빈 입력은 timeout이 없다. publish/stop만 이 condvar를 깨운다.
+            if !input.wait_for_change(generation, None) {
+                break;
+            }
+            continue;
+        }
+
+        had_sessions = true;
+        if *epoch != last_epoch {
+            last_epoch = *epoch;
+            backend.reset();
+            bindings.clear();
+            accepted_generation = None;
+        }
+        let (binding_interval, activity_interval) = tier_intervals(*hidden);
+        let input_changed = accepted_generation != Some(generation);
+        let binding_due = input_changed || last_binding.elapsed() >= binding_interval;
+        let activity_due = !bindings.is_empty() && last_activity.elapsed() >= activity_interval;
+
+        if binding_due {
+            let pass = bound_pass(backend.binding_pass(sessions, overrides), sessions);
+            if !input.is_current(generation) {
+                // stale 연산이 cache를 오염시켰을 수 있으므로 다음 generation에서 재구성.
+                backend.reset();
+                accepted_generation = None;
+                continue;
+            }
+            last_binding = Instant::now();
+            last_activity = last_binding;
+            accepted_generation = Some(generation);
+            bindings = pass.bindings;
+            if !publish_outcome(
+                &mailbox,
+                &ctx,
+                DetectOutcome {
+                    epoch: *epoch,
+                    generation,
+                    bindings: Some(bindings.clone()),
+                    activity: pass.activity,
+                    session_cwds: Some(pass.session_cwds),
+                    agent_info: Some(pass.agent_info),
+                },
+            ) {
+                break;
+            }
+            continue;
+        }
+
+        if activity_due {
+            let activity = bound_activity(backend.activity_pass(&bindings), &bindings);
+            if !input.is_current(generation) {
+                continue;
+            }
+            last_activity = Instant::now();
+            if !publish_outcome(
+                &mailbox,
+                &ctx,
+                DetectOutcome {
+                    epoch: *epoch,
+                    generation,
+                    bindings: None,
+                    activity,
+                    session_cwds: None,
+                    agent_info: None,
+                },
+            ) {
+                break;
+            }
+            continue;
+        }
+
+        let binding_wait = binding_interval.saturating_sub(last_binding.elapsed());
+        let activity_wait = if bindings.is_empty() {
+            binding_wait
+        } else {
+            activity_interval.saturating_sub(last_activity.elapsed())
+        };
+        if !input.wait_for_change(generation, Some(binding_wait.min(activity_wait))) {
+            break;
+        }
+    }
+}
+
 impl AgentDetectWorker {
-    /// 전용 스레드를 띄운다. 입력 핸들과 결과 수신 채널을 함께 돌려준다.
-    pub fn spawn(ctx: egui::Context) -> (Self, DetectInput, mpsc::Receiver<DetectOutcome>) {
-        let input: DetectInput = Arc::new(Mutex::new((0, Vec::new(), HashMap::new(), false)));
-        let (out_tx, out_rx) = mpsc::channel();
-        let (stop_tx, stop_rx) = mpsc::channel();
-        let input2 = input.clone();
+    /// 전용 스레드를 띄운다. 입력·결과는 모두 latest-only이며 누적 큐가 없다.
+    pub fn spawn(ctx: egui::Context) -> (Self, DetectInput, DetectOutcomeReceiver) {
+        Self::spawn_with_backend(ctx, ProductionBackend::default())
+    }
+
+    fn spawn_with_backend<B: DetectionBackend>(
+        ctx: egui::Context,
+        backend: B,
+    ) -> (Self, DetectInput, DetectOutcomeReceiver) {
+        let input = DetectInput::new();
+        let mailbox = OutcomeMailbox::new();
+        let worker_input = input.clone();
+        let worker_mailbox = Arc::clone(&mailbox);
         let handle = std::thread::Builder::new()
             .name("agent-detect".to_owned())
-            .spawn(move || {
-                let mut last_binding = Instant::now();
-                let mut last_activity = Instant::now();
-                let mut bindings: HashMap<SessionId, AgentBinding> = HashMap::new();
-                let mut cache = agent_detect::BindingCache::default();
-                let mut last_epoch = 0u64;
-                let mut hidden = false;
-                loop {
-                    // 다음 만기까지 잔다. 활동 tier는 바인딩이 있을 때만 (없으면 바인딩 tier만).
-                    // 숨김이면 주기가 4배지만 대기 슬라이스는 BINDING_INTERVAL로 자른다 —
-                    // 복귀(hidden=false) 후 최대 한 슬라이스 안에 elapsed가 정상 주기를
-                    // 넘어 있으므로 즉시 따라잡는다 (별도 전이 처리 불필요).
-                    let (binding_interval, activity_interval) = tier_intervals(hidden);
-                    let binding_wait = binding_interval.saturating_sub(last_binding.elapsed());
-                    let activity_wait = if bindings.is_empty() {
-                        Duration::from_secs(3600)
-                    } else {
-                        activity_interval.saturating_sub(last_activity.elapsed())
-                    };
-                    let wait = binding_wait
-                        .min(activity_wait)
-                        .clamp(Duration::from_millis(50), BINDING_INTERVAL);
-                    match stop_rx.recv_timeout(wait) {
-                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    }
-                    let (epoch, sessions, overrides, now_hidden) = input2.lock().unwrap().clone();
-                    hidden = now_hidden;
-                    let (binding_interval, activity_interval) = tier_intervals(hidden);
-                    // 워크스페이스 전환(epoch 변경) 시 캐시를 비운다 — SessionId가 워커마다
-                    // 1부터라 캐시가 다른 워크스페이스 세션과 충돌하는 것을 막는다.
-                    if epoch != last_epoch {
-                        last_epoch = epoch;
-                        cache = agent_detect::BindingCache::default();
-                        bindings.clear();
-                    }
-                    if last_binding.elapsed() >= binding_interval {
-                        last_binding = Instant::now();
-                        last_activity = Instant::now();
-                        bindings = agent_detect::detect_cached(&sessions, &overrides, &mut cache);
-                        // transcript 1-pass로 activity + 표시정보(model/effort/context).
-                        let (activity, agent_info) = compute_activity_and_info(&bindings);
-                        // 세션별 현재 작업 폴더 — 한 번의 lsof(행 폴더명 + 워크스페이스명).
-                        let pids: Vec<u32> = sessions.iter().map(|(_, p)| *p).collect();
-                        let cwd_by_pid = agent_detect::session_cwds(&pids);
-                        let session_cwds = sessions
-                            .iter()
-                            .filter_map(|(sid, pid)| cwd_by_pid.get(pid).map(|c| (*sid, c.clone())))
-                            .collect();
-                        let sent = out_tx.send(DetectOutcome {
-                            epoch,
-                            bindings: Some(bindings.clone()),
-                            activity,
-                            session_cwds: Some(session_cwds),
-                            agent_info: Some(agent_info),
-                        });
-                        if sent.is_err() {
-                            break; // 수신측(App) drop → 종료
-                        }
-                        ctx.request_repaint();
-                    } else if !bindings.is_empty() && last_activity.elapsed() >= activity_interval {
-                        last_activity = Instant::now();
-                        let activity = compute_activity(&bindings);
-                        if out_tx
-                            .send(DetectOutcome {
-                                epoch,
-                                bindings: None,
-                                activity,
-                                session_cwds: None,
-                                agent_info: None,
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                        ctx.request_repaint();
-                    }
-                }
-            })
-            .expect("agent detect thread spawn");
+            .spawn(move || run_worker(worker_input, worker_mailbox, ctx, backend))
+            .expect(WORKER_SPAWN_ERROR);
         (
             Self {
-                stop_tx: Some(stop_tx),
+                input: input.clone(),
                 handle: Some(handle),
             },
             input,
-            out_rx,
+            DetectOutcomeReceiver {
+                mailbox,
+                seen_sequence: AtomicU64::new(0),
+            },
         )
     }
 }
 
 impl Drop for AgentDetectWorker {
     fn drop(&mut self) {
-        if let Some(tx) = self.stop_tx.take() {
-            let _ = tx.send(());
-        }
+        self.input.stop();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -213,6 +678,103 @@ impl Drop for AgentDetectWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::mpsc;
+
+    use crate::agent_detect::AgentKind;
+
+    fn binding(session: SessionId) -> AgentBinding {
+        AgentBinding {
+            kind: AgentKind::Codex,
+            session_id: format!("session-{}", session.0),
+            transcript: PathBuf::from("fixture.jsonl"),
+        }
+    }
+
+    fn complete_outcome(epoch: u64, generation: u64, state: AgentActivity) -> DetectOutcome {
+        let session = SessionId(1);
+        DetectOutcome {
+            epoch,
+            generation,
+            bindings: Some(HashMap::from([(session, binding(session))])),
+            activity: HashMap::from([(session, state)]),
+            session_cwds: Some(HashMap::from([(session, "/fixture".to_owned())])),
+            agent_info: Some(HashMap::from([(
+                session,
+                AgentDisplay {
+                    kind: AgentKind::Codex,
+                    model: Some("fixture-model".to_owned()),
+                    effort: None,
+                    context_pct: Some(50),
+                    last_agent_summary: None,
+                },
+            )])),
+        }
+    }
+
+    fn receiver(mailbox: Arc<OutcomeMailbox>) -> DetectOutcomeReceiver {
+        DetectOutcomeReceiver {
+            mailbox,
+            seen_sequence: AtomicU64::new(0),
+        }
+    }
+
+    struct TestBackend {
+        calls: Arc<AtomicUsize>,
+        started: Option<mpsc::Sender<()>>,
+        first_release: Option<Arc<(Mutex<bool>, Condvar)>>,
+    }
+
+    impl DetectionBackend for TestBackend {
+        fn reset(&mut self) {}
+
+        fn binding_pass(
+            &mut self,
+            sessions: &[(SessionId, u32)],
+            _overrides: &HashMap<SessionId, AgentBinding>,
+        ) -> BindingPass {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if call == 0 {
+                if let Some(started) = self.started.take() {
+                    let _ = started.send(());
+                }
+                if let Some(release) = self.first_release.take() {
+                    let (lock, changed) = &*release;
+                    let mut released = lock.lock().expect("test_release_lock");
+                    while !*released {
+                        released = changed.wait(released).expect("test_release_wait");
+                    }
+                }
+            }
+            let bindings: HashMap<_, _> = sessions
+                .iter()
+                .map(|(session, _)| (*session, binding(*session)))
+                .collect();
+            BindingPass {
+                activity: bindings
+                    .keys()
+                    .map(|session| (*session, AgentActivity::Idle))
+                    .collect(),
+                session_cwds: bindings
+                    .keys()
+                    .map(|session| (*session, "/fixture".to_owned()))
+                    .collect(),
+                agent_info: HashMap::new(),
+                bindings,
+            }
+        }
+
+        fn activity_pass(
+            &mut self,
+            bindings: &HashMap<SessionId, AgentBinding>,
+        ) -> HashMap<SessionId, AgentActivity> {
+            bindings
+                .keys()
+                .map(|session| (*session, AgentActivity::Idle))
+                .collect()
+        }
+    }
 
     #[test]
     fn 숨김이면_두_tier_주기가_4배로_늘고_보이면_원래대로다() {
@@ -226,5 +788,245 @@ mod tests {
         // 대기 슬라이스 상한(BINDING_INTERVAL)보다 길어야 슬라이스 분할이 의미 있다 —
         // 복귀 시 elapsed가 이미 정상 주기를 넘어 있어 즉시 따라잡는 전제.
         assert!(b > BINDING_INTERVAL);
+    }
+
+    #[test]
+    fn 입력_세션_상한_정확히_256은_허용하고_257은_빈_스냅샷으로_거부한다() {
+        let input = DetectInput::new();
+        let exact: Vec<_> = (0..MAX_DETECT_SESSIONS)
+            .map(|index| (SessionId(index as u64 + 1), index as u32 + 10))
+            .collect();
+        assert_eq!(
+            input.publish(7, exact.clone(), &HashMap::new(), false),
+            Ok(())
+        );
+        let accepted = input.current().expect("accepted input");
+        assert_eq!(accepted.snapshot.1.len(), MAX_DETECT_SESSIONS);
+
+        let over: Vec<_> = (0..=MAX_DETECT_SESSIONS)
+            .map(|index| (SessionId(index as u64 + 1), index as u32 + 10))
+            .collect();
+        assert_eq!(
+            input.publish(7, over, &HashMap::new(), false),
+            Err(DetectInputError::SessionLimit)
+        );
+        let rejected = input.current().expect("fail closed input");
+        assert!(rejected.snapshot.1.is_empty());
+        assert!(rejected.snapshot.2.is_empty());
+    }
+
+    #[test]
+    fn 동일_입력은_generation과_arc를_교체하지_않는다() {
+        let input = DetectInput::new();
+        let sessions = vec![(SessionId(1), 10)];
+        let overrides = HashMap::from([(SessionId(1), binding(SessionId(1)))]);
+        input
+            .publish(3, sessions.clone(), &overrides, false)
+            .expect("first publish");
+        let first = input.current().expect("first input");
+        input
+            .publish(3, sessions, &overrides, false)
+            .expect("same publish");
+        let second = input.current().expect("second input");
+        assert_eq!(first.generation, second.generation);
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn 결과_슬롯은_cap_1을_넘으면_최신값만_남긴다() {
+        let mailbox = OutcomeMailbox::new();
+        let receiver = receiver(Arc::clone(&mailbox));
+        for generation in 1..=32 {
+            assert!(!matches!(
+                mailbox.publish(complete_outcome(1, generation, AgentActivity::Idle)),
+                PublishResult::Closed
+            ));
+        }
+        let latest = receiver.try_recv().expect("latest outcome");
+        assert_eq!(latest.generation, 32);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn 활동_partial은_미소비_full_결과를_보존하고_변경이_없으면_wake하지_않는다() {
+        let mailbox = OutcomeMailbox::new();
+        let receiver = receiver(Arc::clone(&mailbox));
+        assert!(matches!(
+            mailbox.publish(complete_outcome(1, 1, AgentActivity::Idle)),
+            PublishResult::Changed
+        ));
+        let partial = DetectOutcome {
+            epoch: 1,
+            generation: 1,
+            bindings: None,
+            activity: HashMap::from([(SessionId(1), AgentActivity::Working)]),
+            session_cwds: None,
+            agent_info: None,
+        };
+        assert!(matches!(mailbox.publish(partial), PublishResult::Changed));
+        let merged = receiver.try_recv().expect("merged outcome");
+        assert_eq!(merged.activity[&SessionId(1)], AgentActivity::Working);
+        assert!(merged.bindings.is_some());
+        assert!(merged.session_cwds.is_some());
+        assert!(merged.agent_info.is_some());
+
+        let unchanged = DetectOutcome {
+            epoch: 1,
+            generation: 1,
+            bindings: None,
+            activity: HashMap::from([(SessionId(1), AgentActivity::Working)]),
+            session_cwds: None,
+            agent_info: None,
+        };
+        assert!(matches!(
+            mailbox.publish(unchanged),
+            PublishResult::Unchanged
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn 빈_입력에서_backend을_한_번도_호출하지_않고_shutdown한다() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (worker, _input, _receiver) = AgentDetectWorker::spawn_with_backend(
+            egui::Context::default(),
+            TestBackend {
+                calls: Arc::clone(&calls),
+                started: None,
+                first_release: None,
+            },
+        );
+        drop(worker);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn 소비자가_멈춰도_worker_shutdown은_결과_전송에_막히지_않는다() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (worker, input, receiver) = AgentDetectWorker::spawn_with_backend(
+            egui::Context::default(),
+            TestBackend {
+                calls: Arc::clone(&calls),
+                started: Some(started_tx),
+                first_release: None,
+            },
+        );
+        input
+            .publish(1, vec![(SessionId(1), 10)], &HashMap::new(), false)
+            .expect("publish session");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("backend started");
+        let state = receiver.mailbox.state.lock().expect("mailbox lock");
+        let (state, _) = receiver
+            .mailbox
+            .available
+            .wait_timeout_while(state, Duration::from_secs(1), |state| {
+                state.latest.is_none()
+            })
+            .expect("mailbox wait");
+        assert!(state.latest.is_some());
+        drop(state);
+        drop(worker);
+        let outcome = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("retained outcome");
+        assert_eq!(outcome.epoch, 1);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn 연산_중_바뀐_generation의_stale_결과는_폐기한다() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (worker, input, receiver) = AgentDetectWorker::spawn_with_backend(
+            egui::Context::default(),
+            TestBackend {
+                calls: Arc::clone(&calls),
+                started: Some(started_tx),
+                first_release: Some(Arc::clone(&release)),
+            },
+        );
+        input
+            .publish(1, vec![(SessionId(1), 10)], &HashMap::new(), false)
+            .expect("first generation");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first pass started");
+        input
+            .publish(2, vec![(SessionId(2), 20)], &HashMap::new(), false)
+            .expect("second generation");
+        {
+            let (lock, changed) = &*release;
+            *lock.lock().expect("release lock") = true;
+            changed.notify_one();
+        }
+        let outcome = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("fresh outcome");
+        assert_eq!(outcome.epoch, 2);
+        assert_eq!(outcome.generation, 2);
+        assert!(
+            outcome
+                .bindings
+                .as_ref()
+                .is_some_and(|bindings| bindings.contains_key(&SessionId(2)))
+        );
+        assert!(calls.load(AtomicOrdering::SeqCst) >= 2);
+        drop(worker);
+    }
+
+    #[test]
+    fn backend이_cap_초과_map을_반환해도_입력_세션으로_제한한다() {
+        let sessions: Vec<_> = (0..MAX_DETECT_SESSIONS)
+            .map(|index| (SessionId(index as u64 + 1), index as u32 + 10))
+            .collect();
+        let extra = SessionId(MAX_DETECT_SESSIONS as u64 + 1);
+        let mut bindings: HashMap<_, _> = sessions
+            .iter()
+            .map(|(session, _)| (*session, binding(*session)))
+            .collect();
+        bindings.insert(extra, binding(extra));
+        let pass = bound_pass(
+            BindingPass {
+                activity: bindings
+                    .keys()
+                    .map(|session| (*session, AgentActivity::Idle))
+                    .collect(),
+                session_cwds: bindings
+                    .keys()
+                    .map(|session| (*session, "/fixture".to_owned()))
+                    .collect(),
+                agent_info: HashMap::new(),
+                bindings,
+            },
+            &sessions,
+        );
+        assert_eq!(pass.bindings.len(), MAX_DETECT_SESSIONS);
+        assert_eq!(pass.activity.len(), MAX_DETECT_SESSIONS);
+        assert_eq!(pass.session_cwds.len(), MAX_DETECT_SESSIONS);
+        assert!(!pass.bindings.contains_key(&extra));
+    }
+
+    #[test]
+    fn production_source는_무제한_결과_채널과_동적_진단을_사용하지_않는다() {
+        let source = include_str!("agent_detect_worker.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production source");
+        assert!(!production.contains("mpsc::channel()"));
+        assert!(!production.contains("send(DetectOutcome"));
+        assert!(!production.contains("eprintln!"));
+        assert!(!production.contains("tracing::"));
+        assert!(production.contains(WORKER_SPAWN_ERROR));
     }
 }

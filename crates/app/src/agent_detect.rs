@@ -7,12 +7,39 @@
 //!
 //! ps 트리 순회는 resource_monitor와 같은 `ps -axo` 방식을 따른다(재사용 패턴).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use runtime::SessionId;
 
 use crate::agent_transcript;
+
+const MAX_SESSIONS: usize = 256;
+const MAX_PROCESS_ROWS: usize = 16_384;
+const MAX_DESCENDANTS_PER_SESSION: usize = 1_024;
+const MAX_AGENT_CANDIDATES_PER_SESSION: usize = 8;
+const MAX_LSOF_CALLS_PER_DETECTION: usize = 64;
+const MAX_PROCESS_COMMAND_BYTES: usize = 16 * 1024;
+const MAX_SESSION_ID_BYTES: usize = 256;
+const MAX_PATH_BYTES: usize = 4 * 1024;
+const MAX_PS_STDOUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_LSOF_STDOUT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CLI_STDERR_BYTES: usize = 64 * 1024;
+const MAX_TRANSCRIPT_HEAD_BYTES: usize = 512 * 1024;
+const MAX_TRANSCRIPT_LINE_BYTES: usize = 64 * 1024;
+const MAX_TRANSCRIPT_HEAD_LINES: usize = 50;
+const MAX_SCAN_FILES: usize = 4_096;
+const MAX_SCAN_ENTRIES: usize = 16_384;
+const MAX_DIRECTORY_ENTRIES: usize = 4_096;
+const MAX_SCAN_DEPTH: usize = 8;
+const PROCESS_TIMEOUT: Duration = Duration::from_secs(3);
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const PIPE_READER_STACK_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
@@ -21,11 +48,22 @@ pub enum AgentKind {
 }
 
 /// 세션에 바인딩된 에이전트 — transcript 경로까지 확정된 상태.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AgentBinding {
     pub kind: AgentKind,
     pub session_id: String,
     pub transcript: PathBuf,
+}
+
+impl std::fmt::Debug for AgentBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentBinding")
+            .field("kind", &self.kind)
+            .field("session_id", &"REDACTED")
+            .field("transcript", &"REDACTED")
+            .finish()
+    }
 }
 
 struct ProcRow {
@@ -45,13 +83,30 @@ pub struct BindingCache {
     entries: HashMap<SessionId, (AgentBinding, u32, bool)>,
 }
 
+#[derive(Default)]
+struct DetectionBudget {
+    lsof_calls: usize,
+}
+
+impl DetectionBudget {
+    fn consume_lsof(&mut self) -> Option<()> {
+        self.lsof_calls = self.lsof_calls.checked_add(1)?;
+        (self.lsof_calls <= MAX_LSOF_CALLS_PER_DETECTION).then_some(())
+    }
+}
+
 /// 캐시를 활용한 detect. `cache`는 호출측(워커 스레드)이 소유·유지한다.
 pub fn detect_cached(
     sessions: &[(SessionId, u32)],
     overrides: &HashMap<SessionId, AgentBinding>,
     cache: &mut BindingCache,
 ) -> HashMap<SessionId, AgentBinding> {
+    if sessions.len() > MAX_SESSIONS {
+        cache.entries.clear();
+        return HashMap::new();
+    }
     let rows = process_rows();
+    let mut budget = DetectionBudget::default();
     let mut out = HashMap::new();
     for (sid, shell_pid) in sessions {
         // hook(SessionStart 등)이 보고한 바인딩이 있으면 그것이 결정적이다. 단 같은 pane에서
@@ -59,6 +114,7 @@ pub fn detect_cached(
         // 기록과 일치할 때만 사용한다. 종류가 다르면 오래된 hook을 무시하고 아래 탐색으로
         // 현재 에이전트를 다시 바인딩한다(2026-07-20 실증).
         if let Some(b) = overrides.get(sid)
+            && valid_binding(b)
             && let Some(owner) = find_agent_pid(*shell_pid, &rows, b.kind)
         {
             cache.entries.insert(*sid, (b.clone(), owner, true));
@@ -76,7 +132,7 @@ pub fn detect_cached(
             {
                 if !det
                     && binding.kind == AgentKind::Codex
-                    && let Some(t) = codex_open_rollout(owner_pid)
+                    && let Some(t) = codex_open_rollout(owner_pid, &mut budget)
                     && let Some(id) = t
                         .file_name()
                         .and_then(|n| n.to_str())
@@ -98,7 +154,7 @@ pub fn detect_cached(
             continue;
         }
         // 미스/종료 → 전체 탐색 후 캐시 갱신.
-        if let Some((binding, owner_pid, det)) = find_agent(*shell_pid, &rows) {
+        if let Some((binding, owner_pid, det)) = find_agent(*shell_pid, &rows, &mut budget) {
             cache
                 .entries
                 .insert(*sid, (binding.clone(), owner_pid, det));
@@ -108,13 +164,16 @@ pub fn detect_cached(
         }
     }
     // 더는 존재하지 않는 세션의 캐시 항목 정리(누수 방지).
-    let alive: std::collections::HashSet<SessionId> = sessions.iter().map(|(s, _)| *s).collect();
+    let alive: HashSet<SessionId> = sessions.iter().map(|(s, _)| *s).collect();
     cache.entries.retain(|sid, _| alive.contains(sid));
     out
 }
 
 /// 바인딩된 transcript를 파싱해 전체 상태(활동 + 표시 정보)를 읽는다. 파싱은 한 번만.
 pub fn agent_state(binding: &AgentBinding) -> Option<agent_transcript::TranscriptState> {
+    if !valid_binding(binding) {
+        return None;
+    }
     match binding.kind {
         AgentKind::Claude => agent_transcript::parse_claude(&binding.transcript),
         AgentKind::Codex => agent_transcript::parse_codex(&binding.transcript),
@@ -128,7 +187,7 @@ pub fn activity(binding: &AgentBinding) -> Option<agent_transcript::AgentActivit
 
 /// 3줄 세션 행 2행 표시 정보 (2026-07-08). kind는 바인딩에서, model/effort/context는
 /// transcript(codex 전부 / claude는 model만 — effort/context는 statusLine→DB)에서.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AgentDisplay {
     pub kind: AgentKind,
     pub model: Option<String>,
@@ -136,6 +195,22 @@ pub struct AgentDisplay {
     pub context_pct: Option<u8>,
     /// transcript의 최신 에이전트 응답/진행 메시지 — 사이드바 작업 설명용.
     pub last_agent_summary: Option<String>,
+}
+
+impl std::fmt::Debug for AgentDisplay {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentDisplay")
+            .field("kind", &self.kind)
+            .field("model_present", &self.model.is_some())
+            .field("effort_present", &self.effort.is_some())
+            .field("context_pct", &self.context_pct)
+            .field(
+                "last_agent_summary",
+                &self.last_agent_summary.as_ref().map(|_| "REDACTED"),
+            )
+            .finish()
+    }
 }
 
 /// 셸 pid의 자손 중 claude/codex를 찾아 transcript까지 바인딩한다. 캐시 생존 확인용으로
@@ -160,17 +235,27 @@ fn agent_pid_matches_kind(owner_pid: u32, expected: AgentKind, rows: &[ProcRow])
         .is_some_and(|(kind, _)| kind == expected)
 }
 
-fn find_agent(shell_pid: u32, rows: &[ProcRow]) -> Option<(AgentBinding, u32, bool)> {
+fn find_agent(
+    shell_pid: u32,
+    rows: &[ProcRow],
+    budget: &mut DetectionBudget,
+) -> Option<(AgentBinding, u32, bool)> {
     let descendants = descendant_pids(shell_pid, rows);
     // 한 셸에 에이전트가 여럿일 수 있다(^Z 중단 후 재실행 등, 2026-07-07 실증: codex 2개).
     // 선택 기준: ①결정적(argv/lsof) 바인딩이 휴리스틱(cwd)보다 우선 — 휴리스틱 mtime이
     // 더 최신이어도 오바인딩일 수 있다(실증: fresh codex가 resume 세션으로 오바인딩).
     // ②같은 등급 안에선 transcript mtime 최신(활성 대화가 append 중인 쪽).
     let mut best: Option<(AgentBinding, u32, bool, Option<std::time::SystemTime>)> = None;
+    let mut candidates = 0usize;
     for row in rows.iter().filter(|r| descendants.contains(&r.pid)) {
-        if let Some((kind, sid_hint)) = classify(&row.command)
-            && let Some((b, det)) = bind_transcript(kind, sid_hint, row.pid)
-        {
+        if let Some((kind, sid_hint)) = classify(&row.command) {
+            candidates = candidates.checked_add(1)?;
+            if candidates > MAX_AGENT_CANDIDATES_PER_SESSION {
+                return None;
+            }
+            let Some((b, det)) = bind_transcript(kind, sid_hint, row.pid, budget) else {
+                continue;
+            };
             let mtime = std::fs::metadata(&b.transcript)
                 .and_then(|m| m.modified())
                 .ok();
@@ -212,13 +297,69 @@ fn claude_session_id(command: &str) -> Option<String> {
     let mut it = command.split_whitespace();
     while let Some(tok) = it.next() {
         if tok == "--session-id" {
-            return it.next().map(str::to_owned);
+            return it
+                .next()
+                .filter(|value| valid_session_id(value))
+                .map(str::to_owned);
         }
         if let Some(v) = tok.strip_prefix("--session-id=") {
-            return Some(v.to_owned());
+            return valid_session_id(v).then(|| v.to_owned());
         }
     }
     None
+}
+
+fn valid_session_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_SESSION_ID_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn valid_absolute_path(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_PATH_BYTES
+        && !value.as_bytes().contains(&0)
+        && Path::new(value).is_absolute()
+        && !Path::new(value).components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+}
+
+fn valid_transcript_path(kind: AgentKind, path: &Path) -> bool {
+    let Some(path_text) = path.to_str() else {
+        return false;
+    };
+    if !valid_absolute_path(path_text) || path.extension().is_none_or(|ext| ext != "jsonl") {
+        return false;
+    }
+    let Some(home) = crate::paths::home_dir() else {
+        return false;
+    };
+    let root = match kind {
+        AgentKind::Claude => home.join(".claude/projects"),
+        AgentKind::Codex => home.join(".codex/sessions"),
+    };
+    let Ok(root) = std::fs::canonicalize(root) else {
+        return false;
+    };
+    let Ok(path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    path.starts_with(root)
+        && path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+        && path.is_file()
+}
+
+fn valid_binding(binding: &AgentBinding) -> bool {
+    valid_session_id(&binding.session_id)
+        && valid_transcript_path(binding.kind, &binding.transcript)
 }
 
 /// 감지된 에이전트를 실제 transcript 파일로 확정한다. 두 번째 반환값 = 결정적 여부:
@@ -229,6 +370,7 @@ fn bind_transcript(
     kind: AgentKind,
     sid_hint: Option<String>,
     pid: u32,
+    budget: &mut DetectionBudget,
 ) -> Option<(AgentBinding, bool)> {
     match kind {
         AgentKind::Claude => {
@@ -248,7 +390,7 @@ fn bind_transcript(
             // 프로젝트 디렉터리(~/.claude/projects/<escaped-cwd>/)에서 최신 mtime transcript.
             // 이게 없으면 상태가 느린 화면 regex로만 잡혀 딜레이가 났다. 같은 cwd에 claude
             // 2개면 최신 대화 쪽으로 모일 수 있는 한계는 codex cwd fallback과 동일.
-            let cwd = process_cwd(pid)?;
+            let cwd = process_cwd(pid, budget)?;
             let (session_id, transcript) = find_claude_transcript_by_cwd(&cwd)?;
             Some((
                 AgentBinding {
@@ -263,7 +405,7 @@ fn bind_transcript(
             // 1순위: 프로세스가 append 중인 rollout을 lsof로 직접 획득 — 결정적(스캔·상한·
             // cwd 매칭 불필요, resume된 옛 파일·같은 cwd 다중 세션도 정확). codex는 rollout을
             // write 모드로 열어둔다(2026-07-07 실증: 07/03 파일을 resume 중인 프로세스에서 확인).
-            if let Some(transcript) = codex_open_rollout(pid)
+            if let Some(transcript) = codex_open_rollout(pid, budget)
                 && let Some(session_id) = transcript
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -280,7 +422,7 @@ fn bind_transcript(
             }
             // fallback: cwd 매칭 스캔 — 휴리스틱. codex는 rollout을 항상 열어두지 않아
             // (실증: idle fresh 세션은 닫혀 있음) lsof가 자주 miss라 필요하다.
-            let cwd = process_cwd(pid)?;
+            let cwd = process_cwd(pid, budget)?;
             let (session_id, transcript) = find_codex_transcript(&cwd)?;
             Some((
                 AgentBinding {
@@ -297,7 +439,7 @@ fn bind_transcript(
 /// 저장된 (kind, session_id)로 transcript 파일을 찾는다 — 복원 resume 전에 대상이 아직
 /// 존재하는지 확인해, 이미 지워진 세션에 `--resume`을 던지지 않게 한다.
 ///
-/// codex 확인은 `~/.codex/sessions` 재귀 스캔(최대 4096 stat)이라, 복원 pass가
+/// codex 확인은 `~/.codex/sessions` 재귀 스캔(최대 16,384 entries/4,096 files)이라, 복원 pass가
 /// pane마다 반복하지 않게 스캔 결과를 finder 수명 동안 1회만 수집해 재사용한다 —
 /// 호출측(UI 스레드)이 pane 수 × 스캔 비용을 물지 않는다.
 #[derive(Default)]
@@ -311,13 +453,16 @@ impl TranscriptFinder {
     }
 
     pub fn find(&mut self, kind: AgentKind, session_id: &str) -> Option<PathBuf> {
+        if !valid_session_id(session_id) {
+            return None;
+        }
         match kind {
             AgentKind::Claude => find_claude_transcript(session_id),
             AgentKind::Codex => {
                 let files = self.codex_files.get_or_insert_with(|| {
                     let mut files = Vec::new();
                     if let Some(home) = crate::paths::home_dir() {
-                        collect_jsonl(&home.join(".codex/sessions"), &mut files);
+                        let _ = collect_jsonl(&home.join(".codex/sessions"), &mut files);
                     }
                     files
                 });
@@ -326,7 +471,9 @@ impl TranscriptFinder {
                     .find(|p| {
                         p.file_name()
                             .and_then(|n| n.to_str())
-                            .is_some_and(|n| n.contains(session_id))
+                            .and_then(agent_transcript::codex_session_id)
+                            .as_deref()
+                            == Some(session_id)
                     })
                     .cloned()
             }
@@ -339,22 +486,57 @@ impl TranscriptFinder {
 /// 폴더와 달랐다). codex rollout은 1행 session_meta payload.cwd, claude는 초반 행들에
 /// "cwd" 필드. 파싱 실패 줄은 건너뛴다.
 pub fn transcript_cwd(path: &std::path::Path) -> Option<String> {
-    use std::io::BufRead;
+    if std::fs::symlink_metadata(path)
+        .ok()?
+        .file_type()
+        .is_symlink()
+    {
+        return None;
+    }
     let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
-    for line in reader.lines().take(50).map_while(Result::ok) {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+    let mut reader = std::io::BufReader::new(file);
+    let mut observed_bytes = 0usize;
+    for _ in 0..MAX_TRANSCRIPT_HEAD_LINES {
+        let line = read_line_bounded(&mut reader, MAX_TRANSCRIPT_LINE_BYTES).ok()??;
+        observed_bytes = observed_bytes.checked_add(line.len())?;
+        if observed_bytes > MAX_TRANSCRIPT_HEAD_BYTES {
+            return None;
+        }
+        let Ok(line) = std::str::from_utf8(&line) else {
+            return None;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
         if let Some(cwd) = v
             .get("cwd")
             .and_then(|x| x.as_str())
             .or_else(|| v.pointer("/payload/cwd").and_then(|x| x.as_str()))
+            .filter(|cwd| valid_absolute_path(cwd))
         {
             return Some(cwd.to_owned());
         }
     }
     None
+}
+
+fn read_line_bounded(
+    reader: &mut impl std::io::BufRead,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, ()> {
+    let hard_limit = max_bytes.checked_add(1).ok_or(())?;
+    let mut line = Vec::with_capacity(max_bytes.min(8 * 1024));
+    let read = reader
+        .take(hard_limit as u64)
+        .read_until(b'\n', &mut line)
+        .map_err(|_| ())?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if line.len() > max_bytes {
+        return Err(());
+    }
+    Ok(Some(line))
 }
 
 /// "claude"/"codex" 문자열 → AgentKind.
@@ -377,13 +559,20 @@ fn claude_project_dir_escape(cwd: &str) -> String {
 /// cwd 기준으로 claude transcript를 찾는다 — 그 cwd의 프로젝트 디렉터리에서 최신 mtime
 /// jsonl(활성 대화가 append 중인 것). 파일명(stem) = 세션ID.
 fn find_claude_transcript_by_cwd(cwd: &str) -> Option<(String, PathBuf)> {
+    if !valid_absolute_path(cwd) {
+        return None;
+    }
     let dir = crate::paths::home_dir()?
         .join(".claude/projects")
         .join(claude_project_dir_escape(cwd));
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    for e in std::fs::read_dir(dir).ok()?.flatten() {
+    let mut entries = std::fs::read_dir(dir).ok()?;
+    for _ in 0..MAX_DIRECTORY_ENTRIES {
+        let Some(e) = entries.next() else { break };
+        let Ok(e) = e else { return None };
         let p = e.path();
-        if p.extension().is_some_and(|x| x == "jsonl")
+        if e.file_type().ok().is_some_and(|kind| kind.is_file())
+            && p.extension().is_some_and(|x| x == "jsonl")
             && let Ok(meta) = e.metadata()
             && let Ok(mtime) = meta.modified()
             && best.as_ref().is_none_or(|(bm, _)| mtime > *bm)
@@ -391,65 +580,124 @@ fn find_claude_transcript_by_cwd(cwd: &str) -> Option<(String, PathBuf)> {
             best = Some((mtime, p));
         }
     }
+    if entries.next().is_some() {
+        return None;
+    }
     let (_, p) = best?;
-    let sid = p.file_stem()?.to_str()?.to_owned();
+    let sid = p.file_stem()?.to_str()?;
+    if !valid_session_id(sid) {
+        return None;
+    }
+    let sid = sid.to_owned();
     Some((sid, p))
 }
 
 /// 세션ID로 claude transcript를 찾는다 (`~/.claude/projects/*/<sid>.jsonl`).
 fn find_claude_transcript(session_id: &str) -> Option<PathBuf> {
+    if !valid_session_id(session_id) {
+        return None;
+    }
     let projects = crate::paths::home_dir()?.join(".claude/projects");
-    for proj in std::fs::read_dir(projects).ok()?.flatten() {
+    let mut entries = std::fs::read_dir(projects).ok()?;
+    for _ in 0..MAX_DIRECTORY_ENTRIES {
+        let Some(proj) = entries.next() else {
+            break;
+        };
+        let Ok(proj) = proj else { return None };
+        if !proj.file_type().ok().is_some_and(|kind| kind.is_dir()) {
+            continue;
+        }
         let candidate = proj.path().join(format!("{session_id}.jsonl"));
-        if candidate.is_file() {
+        if std::fs::symlink_metadata(&candidate)
+            .ok()
+            .is_some_and(|meta| meta.file_type().is_file())
+        {
             return Some(candidate);
         }
+    }
+    if entries.next().is_some() {
+        return None;
     }
     None
 }
 
 /// cwd로 codex rollout을 찾는다 — session_meta.cwd가 일치하는 것 중 가장 최근.
 fn find_codex_transcript(cwd: &str) -> Option<(String, PathBuf)> {
+    if !valid_absolute_path(cwd) {
+        return None;
+    }
     let root = crate::paths::home_dir()?.join(".codex/sessions");
     let mut files = Vec::new();
-    collect_jsonl(&root, &mut files);
-    files.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+    if !collect_jsonl(&root, &mut files) {
+        return None;
+    }
+    files.sort_by_cached_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
     for p in files.iter().rev().take(64) {
-        if let Some(state) = agent_transcript::parse_codex(p)
-            && state.cwd.as_deref() == Some(cwd)
+        if transcript_cwd(p).as_deref() == Some(cwd)
+            && let Some(session_id) = p
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(agent_transcript::codex_session_id)
         {
-            return Some((state.session_id, p.clone()));
+            return Some((session_id, p.clone()));
         }
     }
     None
 }
 
-fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
-    collect_jsonl_bounded(dir, out, 0);
+fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) -> bool {
+    let mut budget = ScanBudget::default();
+    if collect_jsonl_bounded(dir, out, 0, &mut budget) {
+        true
+    } else {
+        out.clear();
+        false
+    }
+}
+
+#[derive(Default)]
+struct ScanBudget {
+    entries: usize,
 }
 
 /// 재귀 스캔에 상한을 둔다(codex 리뷰): ①심링크 미추적(루프·외부 거대 디렉터리 방지),
-/// ②depth 상한, ③파일 수 상한. resume 존재확인이 UI 스레드에서도 부르므로 무한 재귀/대량
-/// 스캔으로 인한 freeze를 막는다.
+/// ②depth 상한, ③operation 전체 디렉터리 항목/파일 수 상한. resume 존재확인이 UI
+/// 스레드에서도 부르므로 무한 재귀/대량 스캔으로 인한 freeze를 막는다.
 ///
 /// **역순(최신 먼저) 순회**: ~/.codex/sessions는 YYYY/MM/DD 구조 + rollout-<타임스탬프> 파일명
 /// 이라 이름 역순 = 시간 역순. 상한에 걸리면 '오래된 쪽'이 잘려야 한다 — 정순 순회는 rollout이
 /// 상한(4096)을 넘는 순간 최신 세션이 누락돼 codex 감지가 죽었다(2026-07-07 실증: 7,447개).
-fn collect_jsonl_bounded(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
-    const MAX_DEPTH: usize = 8;
-    const MAX_FILES: usize = 4096;
-    if depth > MAX_DEPTH || out.len() >= MAX_FILES {
-        return;
+fn collect_jsonl_bounded(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    depth: usize,
+    budget: &mut ScanBudget,
+) -> bool {
+    if depth > MAX_SCAN_DEPTH || out.len() >= MAX_SCAN_FILES || budget.entries >= MAX_SCAN_ENTRIES {
+        return false;
     }
     let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
+        return false;
     };
     // 이름 역순 정렬 — read_dir 순서는 비보장이라 명시 정렬해야 "최신 먼저"가 성립한다.
-    let mut entries: Vec<_> = rd.flatten().collect();
+    let mut entries = Vec::with_capacity(MAX_DIRECTORY_ENTRIES.min(256));
+    let mut directory_entries = 0usize;
+    for entry in rd {
+        directory_entries = match directory_entries.checked_add(1) {
+            Some(entries) if entries <= MAX_DIRECTORY_ENTRIES => entries,
+            _ => return false,
+        };
+        budget.entries = match budget.entries.checked_add(1) {
+            Some(entries) if entries <= MAX_SCAN_ENTRIES => entries,
+            _ => return false,
+        };
+        let Ok(entry) = entry else { return false };
+        entries.push(entry);
+    }
     entries.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
     for e in entries {
-        if out.len() >= MAX_FILES {
-            break;
+        if out.len() >= MAX_SCAN_FILES {
+            return false;
         }
         // file_type()는 심링크를 따라가지 않는다(Path::is_dir과 달리) — 심링크는 스킵.
         let Ok(ft) = e.file_type() else {
@@ -460,30 +708,346 @@ fn collect_jsonl_bounded(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
         }
         let p = e.path();
         if ft.is_dir() {
-            collect_jsonl_bounded(&p, out, depth + 1);
+            if !collect_jsonl_bounded(&p, out, depth + 1, budget) {
+                return false;
+            }
         } else if p.extension().is_some_and(|x| x == "jsonl") {
             out.push(p);
         }
     }
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandError {
+    SpawnFailed,
+    PipeUnavailable,
+    ReaderSpawnFailed,
+    ReadFailed,
+    OutputTooLarge,
+    WaitFailed,
+    TimedOut,
+    ReaderPanicked,
+    CommandFailed,
+    InvalidUtf8,
+}
+
+struct BoundedCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn read_bounded(
+    mut reader: impl Read,
+    max_bytes: usize,
+    limit_reached: &AtomicBool,
+    retain: bool,
+) -> Result<BoundedCapture, CommandError> {
+    let hard_limit = max_bytes
+        .checked_add(1)
+        .ok_or(CommandError::OutputTooLarge)?;
+    let mut bytes = Vec::with_capacity(if retain { max_bytes.min(64 * 1024) } else { 0 });
+    let mut observed = 0usize;
+    let mut chunk = [0u8; 64 * 1024];
+    while observed < hard_limit {
+        let remaining = hard_limit - observed;
+        let read_len = remaining.min(chunk.len());
+        let count = reader
+            .read(&mut chunk[..read_len])
+            .map_err(|_| CommandError::ReadFailed)?;
+        if count == 0 {
+            break;
+        }
+        observed += count;
+        if retain {
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+    }
+    let truncated = observed > max_bytes;
+    if truncated {
+        if retain {
+            bytes.truncate(max_bytes);
+        }
+        limit_reached.store(true, Ordering::Release);
+    }
+    Ok(BoundedCapture { bytes, truncated })
+}
+
+#[cfg(test)]
+static ACTIVE_COMMAND_READERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+struct ActiveCommandReader;
+
+#[cfg(test)]
+impl ActiveCommandReader {
+    fn enter() -> Self {
+        ACTIVE_COMMAND_READERS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ActiveCommandReader {
+    fn drop(&mut self) {
+        ACTIVE_COMMAND_READERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct RunningCommand {
+    child: Child,
+    reaped: bool,
+    stdout_reader: Option<std::thread::JoinHandle<Result<BoundedCapture, CommandError>>>,
+    stderr_reader: Option<std::thread::JoinHandle<Result<BoundedCapture, CommandError>>>,
+    output_limit_reached: Arc<AtomicBool>,
+}
+
+impl RunningCommand {
+    fn spawn(
+        program: &Path,
+        args: &[&str],
+        stdout_max_bytes: usize,
+        stderr_max_bytes: usize,
+    ) -> Result<Self, CommandError> {
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
+        let mut child = command.spawn().map_err(|_| CommandError::SpawnFailed)?;
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let _ = kill_and_reap_command(&mut child);
+                return Err(CommandError::PipeUnavailable);
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                drop(stdout);
+                let _ = kill_and_reap_command(&mut child);
+                return Err(CommandError::PipeUnavailable);
+            }
+        };
+        let output_limit_reached = Arc::new(AtomicBool::new(false));
+        let stdout_limit = Arc::clone(&output_limit_reached);
+        let stdout_reader = match std::thread::Builder::new()
+            .name("agent-detect-stdout".to_owned())
+            .stack_size(PIPE_READER_STACK_BYTES)
+            .spawn(move || {
+                #[cfg(test)]
+                let _active = ActiveCommandReader::enter();
+                read_bounded(stdout, stdout_max_bytes, &stdout_limit, true)
+            }) {
+            Ok(reader) => reader,
+            Err(_) => {
+                drop(stderr);
+                let _ = kill_and_reap_command(&mut child);
+                return Err(CommandError::ReaderSpawnFailed);
+            }
+        };
+        let stderr_limit = Arc::clone(&output_limit_reached);
+        let stderr_reader = match std::thread::Builder::new()
+            .name("agent-detect-stderr".to_owned())
+            .stack_size(PIPE_READER_STACK_BYTES)
+            .spawn(move || {
+                #[cfg(test)]
+                let _active = ActiveCommandReader::enter();
+                read_bounded(stderr, stderr_max_bytes, &stderr_limit, false)
+            }) {
+            Ok(reader) => reader,
+            Err(_) => {
+                let _ = kill_and_reap_command(&mut child);
+                let _ = stdout_reader.join();
+                return Err(CommandError::ReaderSpawnFailed);
+            }
+        };
+        Ok(Self {
+            child,
+            reaped: false,
+            stdout_reader: Some(stdout_reader),
+            stderr_reader: Some(stderr_reader),
+            output_limit_reached,
+        })
+    }
+
+    fn output_limit_reached(&self) -> bool {
+        self.output_limit_reached.load(Ordering::Acquire)
+    }
+
+    #[cfg(unix)]
+    fn try_wait(&mut self) -> Result<Option<ExitStatus>, CommandError> {
+        // WNOWAIT holds the group leader pid until descendants have been killed. This prevents
+        // pgid reuse between observing parent exit and closing inherited stdout/stderr pipes.
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result != 0 {
+            return Err(CommandError::WaitFailed);
+        }
+        if unsafe { info.si_pid() } == 0 {
+            return Ok(None);
+        }
+        self.kill_group();
+        let status = self.child.wait().map_err(|_| CommandError::WaitFailed)?;
+        self.reaped = true;
+        Ok(Some(status))
+    }
+
+    #[cfg(not(unix))]
+    fn try_wait(&mut self) -> Result<Option<ExitStatus>, CommandError> {
+        let status = self
+            .child
+            .try_wait()
+            .map_err(|_| CommandError::WaitFailed)?;
+        if status.is_some() {
+            self.reaped = true;
+        }
+        Ok(status)
+    }
+
+    #[cfg(unix)]
+    fn kill_group(&self) {
+        unsafe {
+            libc::killpg(self.child.id() as libc::pid_t, libc::SIGKILL);
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn kill_group(&self) {}
+
+    fn kill_and_reap(&mut self) -> Result<(), CommandError> {
+        if !self.reaped {
+            self.kill_group();
+            let _ = self.child.kill();
+            self.child.wait().map_err(|_| CommandError::WaitFailed)?;
+            self.reaped = true;
+        }
+        Ok(())
+    }
+
+    fn join_readers(&mut self) -> Result<(BoundedCapture, BoundedCapture), CommandError> {
+        fn join(
+            reader: Option<std::thread::JoinHandle<Result<BoundedCapture, CommandError>>>,
+        ) -> Result<BoundedCapture, CommandError> {
+            reader
+                .ok_or(CommandError::PipeUnavailable)?
+                .join()
+                .map_err(|_| CommandError::ReaderPanicked)?
+        }
+        let stdout = join(self.stdout_reader.take())?;
+        let stderr = join(self.stderr_reader.take())?;
+        Ok((stdout, stderr))
+    }
+}
+
+impl Drop for RunningCommand {
+    fn drop(&mut self) {
+        let _ = self.kill_and_reap();
+        let _ = self.join_readers();
+    }
+}
+
+fn kill_and_reap_command(child: &mut Child) -> Result<(), CommandError> {
+    #[cfg(unix)]
+    unsafe {
+        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+    }
+    let _ = child.kill();
+    child.wait().map_err(|_| CommandError::WaitFailed)?;
+    Ok(())
+}
+
+fn run_command_bounded(
+    program: &Path,
+    args: &[&str],
+    stdout_max_bytes: usize,
+) -> Result<String, CommandError> {
+    run_command_bounded_with_timeout(program, args, stdout_max_bytes, PROCESS_TIMEOUT)
+}
+
+fn run_command_bounded_with_timeout(
+    program: &Path,
+    args: &[&str],
+    stdout_max_bytes: usize,
+    timeout: Duration,
+) -> Result<String, CommandError> {
+    let mut running = RunningCommand::spawn(program, args, stdout_max_bytes, MAX_CLI_STDERR_BYTES)?;
+    let started = Instant::now();
+    let status = loop {
+        if running.output_limit_reached() {
+            let _ = running.kill_and_reap();
+            let _ = running.join_readers();
+            return Err(CommandError::OutputTooLarge);
+        }
+        match running.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = running.kill_and_reap();
+                let _ = running.join_readers();
+                return Err(CommandError::TimedOut);
+            }
+            Ok(None) => std::thread::sleep(PROCESS_POLL_INTERVAL.min(timeout)),
+            Err(error) => {
+                let _ = running.kill_and_reap();
+                let _ = running.join_readers();
+                return Err(error);
+            }
+        }
+    };
+    let (stdout, stderr) = running.join_readers()?;
+    if stdout.truncated || stderr.truncated {
+        return Err(CommandError::OutputTooLarge);
+    }
+    if !status.success() {
+        return Err(CommandError::CommandFailed);
+    }
+    String::from_utf8(stdout.bytes).map_err(|_| CommandError::InvalidUtf8)
 }
 
 /// codex 프로세스가 열어둔 rollout(.jsonl) 파일 — `lsof -p <pid>`의 열린 파일 중
 /// `~/.codex/sessions/**.jsonl`. 있으면 그게 곧 이 프로세스의 transcript(결정적).
 #[cfg(unix)]
-fn codex_open_rollout(pid: u32) -> Option<PathBuf> {
-    let out = std::process::Command::new("lsof")
-        .args(["-a", "-p", &pid.to_string(), "-Fn"])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
+fn codex_open_rollout(pid: u32, budget: &mut DetectionBudget) -> Option<PathBuf> {
+    budget.consume_lsof()?;
+    let pid = pid.to_string();
+    let out = run_command_bounded(
+        Path::new("lsof"),
+        &["-a", "-p", &pid, "-Fn"],
+        MAX_LSOF_STDOUT_BYTES,
+    )
+    .ok()?;
+    let logical_root = crate::paths::home_dir()?.join(".codex/sessions");
+    let canonical_root = std::fs::canonicalize(&logical_root).ok()?;
+    out.lines()
         .filter_map(|l| l.strip_prefix('n'))
-        .find(|p| p.contains("/.codex/sessions/") && p.ends_with(".jsonl"))
+        .filter(|path| valid_absolute_path(path))
+        .map(Path::new)
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+                && (path.starts_with(&logical_root) || path.starts_with(&canonical_root))
+        })
+        .find(|path| valid_transcript_path(AgentKind::Codex, path))
         .map(PathBuf::from)
 }
 
 #[cfg(not(unix))]
-fn codex_open_rollout(_pid: u32) -> Option<PathBuf> {
+fn codex_open_rollout(_pid: u32, _budget: &mut DetectionBudget) -> Option<PathBuf> {
     None
 }
 
@@ -493,7 +1057,11 @@ fn codex_open_rollout(_pid: u32) -> Option<PathBuf> {
 #[cfg(unix)]
 pub(crate) fn session_cwds(pids: &[u32]) -> HashMap<u32, String> {
     let mut out = HashMap::new();
-    if pids.is_empty() {
+    if pids.is_empty() || pids.len() > MAX_SESSIONS || pids.contains(&0) {
+        return out;
+    }
+    let unique: HashSet<u32> = pids.iter().copied().collect();
+    if unique.len() != pids.len() {
         return out;
     }
     let list = pids
@@ -501,17 +1069,20 @@ pub(crate) fn session_cwds(pids: &[u32]) -> HashMap<u32, String> {
         .map(u32::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    let output = std::process::Command::new("lsof")
-        .args(["-a", "-d", "cwd", "-p", &list, "-Fpn"])
-        .output();
+    let output = run_command_bounded(
+        Path::new("lsof"),
+        &["-a", "-d", "cwd", "-p", &list, "-Fpn"],
+        MAX_LSOF_STDOUT_BYTES,
+    );
     let Ok(output) = output else { return out };
     // -Fpn: 'p<pid>' 라인 뒤에 그 프로세스의 'n<경로>' 라인이 온다.
     let mut cur: Option<u32> = None;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
+    for line in output.lines() {
         if let Some(pid) = line.strip_prefix('p') {
-            cur = pid.parse().ok();
+            cur = pid.parse().ok().filter(|pid| unique.contains(pid));
         } else if let Some(path) = line.strip_prefix('n')
             && let Some(pid) = cur
+            && valid_absolute_path(path)
         {
             out.insert(pid, path.to_owned());
         }
@@ -533,10 +1104,10 @@ pub(crate) fn project_display_name(
     cwd: &str,
     style: crate::config::SessionNameStyle,
 ) -> Option<String> {
-    let path = std::path::Path::new(cwd);
-    if !path.is_absolute() {
+    if !valid_absolute_path(cwd) {
         return None;
     }
+    let path = std::path::Path::new(cwd);
     // 홈 루트는 특별 취급 — 폴더명("jr" 등) 대신 "~".
     if crate::paths::home_dir().is_some_and(|home| path == home) {
         return Some("~".to_owned());
@@ -560,20 +1131,31 @@ pub(crate) fn project_display_name(
     path.file_name().map(|n| n.to_string_lossy().into_owned())
 }
 
-/// 프로세스의 cwd — platform::process_cwd(lsof) 공용 구현을 쓴다.
-fn process_cwd(pid: u32) -> Option<String> {
-    Some(platform::process_cwd(pid)?.to_string_lossy().into_owned())
+/// 프로세스의 cwd — 감지 pass의 lsof 호출 예산을 공유한다.
+fn process_cwd(pid: u32, budget: &mut DetectionBudget) -> Option<String> {
+    budget.consume_lsof()?;
+    session_cwds(&[pid]).remove(&pid)
 }
 
 /// 셸 pid의 모든 자손 pid 집합 (resource_monitor와 동일한 BFS).
 fn descendant_pids(root_pid: u32, rows: &[ProcRow]) -> std::collections::HashSet<u32> {
-    let mut wanted = std::collections::HashSet::from([root_pid]);
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for row in rows {
-            if row.ppid.is_some_and(|ppid| wanted.contains(&ppid)) && wanted.insert(row.pid) {
-                changed = true;
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for row in rows.iter().take(MAX_PROCESS_ROWS) {
+        if let Some(parent) = row.ppid {
+            children.entry(parent).or_default().push(row.pid);
+        }
+    }
+    let mut wanted = HashSet::from([root_pid]);
+    let mut pending = VecDeque::from([root_pid]);
+    while let Some(parent) = pending.pop_front() {
+        if let Some(child_pids) = children.get(&parent) {
+            for &pid in child_pids {
+                if wanted.len() >= MAX_DESCENDANTS_PER_SESSION {
+                    return HashSet::new();
+                }
+                if wanted.insert(pid) {
+                    pending.push_back(pid);
+                }
             }
         }
     }
@@ -582,19 +1164,28 @@ fn descendant_pids(root_pid: u32, rows: &[ProcRow]) -> std::collections::HashSet
 
 #[cfg(unix)]
 fn process_rows() -> Vec<ProcRow> {
-    let output = std::process::Command::new("ps")
-        .args(["-axo", "pid=,ppid=,command="])
-        .output();
+    let output = run_command_bounded(
+        Path::new("ps"),
+        &["-axo", "pid=,ppid=,command="],
+        MAX_PS_STDOUT_BYTES,
+    );
     let Ok(output) = output else {
         return Vec::new();
     };
-    if !output.status.success() {
+    let mut rows = Vec::with_capacity(MAX_PROCESS_ROWS.min(1_024));
+    for line in output.lines() {
+        if rows.len() >= MAX_PROCESS_ROWS {
+            return Vec::new();
+        }
+        let Some(row) = parse_ps_line(line) else {
+            return Vec::new();
+        };
+        rows.push(row);
+    }
+    if rows.is_empty() && !output.is_empty() {
         return Vec::new();
     }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(parse_ps_line)
-        .collect()
+    rows
 }
 
 #[cfg(not(unix))]
@@ -605,18 +1196,257 @@ fn process_rows() -> Vec<ProcRow> {
 /// `ps -axo pid=,ppid=,command=` 한 줄: "pid ppid command with spaces".
 /// pid/ppid는 우측정렬이라 공백이 여러 칸일 수 있어 whitespace run으로 자른다.
 fn parse_ps_line(line: &str) -> Option<ProcRow> {
+    if line.len() > MAX_PROCESS_COMMAND_BYTES.saturating_add(32) {
+        return None;
+    }
     let line = line.trim_start();
     let (pid_str, rest) = line.split_once(char::is_whitespace)?;
     let (ppid_str, rest) = rest.trim_start().split_once(char::is_whitespace)?;
     let pid = pid_str.parse().ok()?;
-    let ppid = ppid_str.parse().ok();
-    let command = rest.trim_start().to_owned();
+    if pid == 0 {
+        return None;
+    }
+    let ppid = Some(ppid_str.parse().ok()?);
+    let command = rest.trim_start();
+    if command.is_empty() || command.len() > MAX_PROCESS_COMMAND_BYTES {
+        return None;
+    }
+    let command = command.to_owned();
     Some(ProcRow { pid, ppid, command })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static COMMAND_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn temp_dir(label: &str) -> PathBuf {
+        static SEQUENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "deppy-agent-detect-{label}-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn bounded_capture_accepts_exact_and_rejects_plus_one() {
+        let exact_limit = AtomicBool::new(false);
+        let exact =
+            read_bounded(std::io::Cursor::new(vec![b'x'; 64]), 64, &exact_limit, true).unwrap();
+        assert_eq!(exact.bytes.len(), 64);
+        assert!(!exact.truncated);
+        assert!(!exact_limit.load(Ordering::Acquire));
+
+        let plus_one_limit = AtomicBool::new(false);
+        let plus_one = read_bounded(
+            std::io::Cursor::new(vec![b'x'; 65]),
+            64,
+            &plus_one_limit,
+            true,
+        )
+        .unwrap();
+        assert_eq!(plus_one.bytes.len(), 64);
+        assert!(plus_one.truncated);
+        assert!(plus_one_limit.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn bounded_line_accepts_exact_and_rejects_plus_one() {
+        let mut exact = std::io::BufReader::new(std::io::Cursor::new(vec![b'x'; 64]));
+        assert_eq!(
+            read_line_bounded(&mut exact, 64).unwrap().unwrap().len(),
+            64
+        );
+
+        let mut plus_one = std::io::BufReader::new(std::io::Cursor::new(vec![b'x'; 65]));
+        assert_eq!(read_line_bounded(&mut plus_one, 64), Err(()));
+    }
+
+    #[test]
+    fn hostile_identifiers_commands_and_debug_are_fail_closed() {
+        assert!(!valid_session_id("../../secrets"));
+        assert!(!valid_session_id(&"a".repeat(MAX_SESSION_ID_BYTES + 1)));
+        assert!(valid_session_id(&"a".repeat(MAX_SESSION_ID_BYTES)));
+        assert!(!valid_absolute_path("/tmp/../private/secret"));
+        assert!(!valid_absolute_path(&format!(
+            "/{}",
+            "x".repeat(MAX_PATH_BYTES + 1)
+        )));
+        assert!(
+            parse_ps_line(&format!(
+                "1 0 {}",
+                "x".repeat(MAX_PROCESS_COMMAND_BYTES + 1)
+            ))
+            .is_none()
+        );
+
+        let binding = AgentBinding {
+            kind: AgentKind::Codex,
+            session_id: "private-session".to_owned(),
+            transcript: PathBuf::from("/private/transcript.jsonl"),
+        };
+        let debug = format!("{binding:?}");
+        assert!(debug.contains("REDACTED"));
+        assert!(!debug.contains("private-session"));
+        assert!(!debug.contains("/private/transcript.jsonl"));
+    }
+
+    #[test]
+    fn transcript_head_rejects_oversized_and_hostile_cwd() {
+        let root = temp_dir("transcript-head");
+        let transcript = root.join("transcript.jsonl");
+        std::fs::write(&transcript, vec![b'x'; MAX_TRANSCRIPT_LINE_BYTES + 1]).unwrap();
+        assert_eq!(transcript_cwd(&transcript), None);
+
+        std::fs::write(&transcript, b"{\"cwd\":\"/tmp/../private\"}\n").unwrap();
+        assert_eq!(transcript_cwd(&transcript), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recursive_scan_budget_is_operation_wide_exact_then_plus_one() {
+        let root = temp_dir("scan-budget");
+        std::fs::write(root.join("rollout.jsonl"), b"{}\n").unwrap();
+
+        let mut exact_out = Vec::new();
+        let mut exact_budget = ScanBudget {
+            entries: MAX_SCAN_ENTRIES - 1,
+        };
+        assert!(collect_jsonl_bounded(
+            &root,
+            &mut exact_out,
+            0,
+            &mut exact_budget
+        ));
+        assert_eq!(exact_budget.entries, MAX_SCAN_ENTRIES);
+        assert_eq!(exact_out.len(), 1);
+
+        let mut plus_one_out = Vec::new();
+        let mut plus_one_budget = ScanBudget {
+            entries: MAX_SCAN_ENTRIES,
+        };
+        assert!(!collect_jsonl_bounded(
+            &root,
+            &mut plus_one_out,
+            0,
+            &mut plus_one_budget
+        ));
+        assert!(plus_one_out.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lsof_budget_accepts_exact_and_rejects_plus_one() {
+        let mut budget = DetectionBudget {
+            lsof_calls: MAX_LSOF_CALLS_PER_DETECTION - 1,
+        };
+        assert_eq!(budget.consume_lsof(), Some(()));
+        assert_eq!(budget.consume_lsof(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_timeout_kills_descendant_and_joins_readers() {
+        let _guard = COMMAND_TEST_LOCK.lock().unwrap();
+        let started = Instant::now();
+        let result = run_command_bounded_with_timeout(
+            Path::new("/bin/sh"),
+            &["-c", "sleep 5"],
+            64,
+            Duration::from_millis(50),
+        );
+        assert_eq!(result, Err(CommandError::TimedOut));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(ACTIVE_COMMAND_READERS.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_parent_with_descendant_pipe_does_not_block() {
+        let _guard = COMMAND_TEST_LOCK.lock().unwrap();
+        let started = Instant::now();
+        let result = run_command_bounded_with_timeout(
+            Path::new("/bin/sh"),
+            &["-c", "(sleep 5) & printf ok"],
+            64,
+            Duration::from_secs(1),
+        );
+        assert_eq!(result.as_deref(), Ok("ok"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(ACTIVE_COMMAND_READERS.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repeated_bounded_commands_leave_no_reader_growth() {
+        let _guard = COMMAND_TEST_LOCK.lock().unwrap();
+        for _ in 0..16 {
+            assert_eq!(
+                run_command_bounded_with_timeout(
+                    Path::new("/usr/bin/printf"),
+                    &["ok"],
+                    2,
+                    Duration::from_secs(1)
+                )
+                .as_deref(),
+                Ok("ok")
+            );
+            assert_eq!(ACTIVE_COMMAND_READERS.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_output_plus_one_fails_and_joins_readers() {
+        let _guard = COMMAND_TEST_LOCK.lock().unwrap();
+        let exact = "x".repeat(64);
+        assert_eq!(
+            run_command_bounded_with_timeout(
+                Path::new("/usr/bin/printf"),
+                &[&exact],
+                64,
+                Duration::from_secs(1)
+            )
+            .as_deref(),
+            Ok(exact.as_str())
+        );
+        let plus_one = "x".repeat(65);
+        assert_eq!(
+            run_command_bounded_with_timeout(
+                Path::new("/usr/bin/printf"),
+                &[&plus_one],
+                64,
+                Duration::from_secs(1)
+            ),
+            Err(CommandError::OutputTooLarge)
+        );
+        assert_eq!(ACTIVE_COMMAND_READERS.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn production_source_has_no_unbounded_capture_or_raw_diagnostics() {
+        let production = include_str!("agent_detect.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        for forbidden in [
+            ".output()",
+            "read_to_end",
+            "String::from_utf8_lossy",
+            "tracing::",
+            "eprintln!",
+            "println!",
+        ] {
+            assert!(!production.contains(forbidden), "found {forbidden}");
+        }
+        assert_eq!(production.matches("Command::new").count(), 1);
+        assert!(production.contains("libc::WNOWAIT"));
+        assert!(production.contains("process_group(0)"));
+    }
 
     #[test]
     fn project_display_name은_스타일에_따라_폴더명_또는_레포명() {
@@ -771,19 +1601,14 @@ mod tests {
     #[ignore]
     fn smoke_detect_real() {
         let rows = process_rows();
+        let mut budget = DetectionBudget::default();
         println!("ps rows: {}", rows.len());
         let mut found = 0;
         for row in &rows {
             if let Some((kind, sid)) = classify(&row.command)
-                && let Some((b, det)) = bind_transcript(kind, sid, row.pid)
+                && let Some((b, det)) = bind_transcript(kind, sid, row.pid, &mut budget)
             {
-                println!(
-                    "  {:?} pid={} det={det} sid={}… → {}",
-                    b.kind,
-                    row.pid,
-                    &b.session_id[..b.session_id.len().min(16)],
-                    b.transcript.display()
-                );
+                println!("  {:?} det={det}", b.kind);
                 found += 1;
             }
         }

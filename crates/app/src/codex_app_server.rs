@@ -221,7 +221,7 @@ fn codex_app_server_args(
 /// Events are either tied to one local agent session or describe the transport
 /// itself. The UI can preserve a finished session when the shared connection
 /// later fails.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum CodexAppServerEvent {
     Session {
         session_id: AgentSessionId,

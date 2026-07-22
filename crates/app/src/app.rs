@@ -5072,8 +5072,8 @@ pub struct App {
     agent_detect_worker: crate::agent_detect_worker::AgentDetectWorker,
     /// 워커 입력(활성 세션 pid 목록 + epoch) — 매 프레임 최신값 write-through.
     agent_detect_input: crate::agent_detect_worker::DetectInput,
-    /// 워커 결과 수신 채널.
-    agent_detect_rx: std::sync::mpsc::Receiver<crate::agent_detect_worker::DetectOutcome>,
+    /// 워커의 capacity-one 최신 결과 수신기.
+    agent_detect_rx: crate::agent_detect_worker::DetectOutcomeReceiver,
     /// 워크스페이스 전환마다 증가 — 스레드가 실어 보낸 stale 결과를 폐기하는 데 쓴다.
     agent_detect_epoch: u64,
     /// hook 바인딩 DB 조회 스로틀(1s) — poll_agent_detect는 매 프레임 돌아 매번 쿼리하면
@@ -7898,33 +7898,30 @@ impl App {
                 })
                 .collect();
         }
-        if let Ok(mut input) = self.agent_detect_input.lock() {
-            *input = (
-                self.agent_detect_epoch,
-                sessions,
-                self.hook_overrides.clone(),
-                // 창 숨김(가림/최소화) — detect 스레드가 ps/lsof/transcript 폴링을 완화한다.
-                !self.active.render_active,
-            );
-        }
-        // 결과를 논블로킹 드레인 — 최신 것만 취한다(epoch 불일치=전환 잔여는 폐기).
+        let _ = self.agent_detect_input.publish(
+            self.agent_detect_epoch,
+            sessions,
+            &self.hook_overrides,
+            // 창 숨김(가림/최소화) — detect 스레드가 ps/lsof/transcript 폴링을 완화한다.
+            !self.active.render_active,
+        );
+        // capacity-one 결과를 논블로킹 소비한다(epoch 불일치=전환 잔여는 폐기).
         let mut latest_bindings = None;
         let mut latest_activity = None;
         let mut latest_cwds = None;
         let mut latest_info = None;
-        while let Ok(outcome) = self.agent_detect_rx.try_recv() {
-            if outcome.epoch != self.agent_detect_epoch {
-                continue;
-            }
-            latest_activity = Some(outcome.activity);
+        if let Ok(outcome) = self.agent_detect_rx.try_recv()
+            && outcome.epoch == self.agent_detect_epoch
+        {
+            latest_activity = Some(outcome.activity.clone());
             if outcome.bindings.is_some() {
-                latest_bindings = outcome.bindings;
+                latest_bindings = outcome.bindings.clone();
             }
             if outcome.session_cwds.is_some() {
-                latest_cwds = outcome.session_cwds;
+                latest_cwds = outcome.session_cwds.clone();
             }
             if outcome.agent_info.is_some() {
-                latest_info = outcome.agent_info;
+                latest_info = outcome.agent_info.clone();
             }
         }
         if let Some(info) = latest_info {

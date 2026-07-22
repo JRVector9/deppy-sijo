@@ -2,7 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest as _, Sha256};
 
 const RESOLVED_APPROVAL_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
@@ -366,6 +366,31 @@ pub struct CredentialSecretRecord {
     pub keyring_username: String,
     pub oauth_json: Option<String>,
 }
+
+/// One candidate OAuth binding selected by `oauth_json.server_id`. Values are nonsecret durable
+/// metadata and a keyring coordinate only; the secret bundle is never loaded. The raw metadata is
+/// preserved so the app adapter can validate endpoint/auth-method binding fail-closed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CredentialOAuthBindingRecord {
+    pub logical_id: String,
+    pub keyring_service: String,
+    pub physical_pointer: String,
+    pub oauth_metadata_json: String,
+}
+
+impl std::fmt::Debug for CredentialOAuthBindingRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CredentialOAuthBindingRecord")
+            .field("logical_id", &"REDACTED")
+            .field("keyring_service", &self.keyring_service)
+            .field("physical_pointer", &"REDACTED")
+            .field("oauth_metadata_json", &"REDACTED")
+            .finish()
+    }
+}
+
+pub const CREDENTIAL_OAUTH_BINDING_BYTES_MAX: usize = 64 * 1024;
 
 /// workspace 한 행 (WorkspaceSidebar 표시용).
 #[derive(Debug, Clone, PartialEq)]
@@ -1036,6 +1061,77 @@ impl Db {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Bounded point lookup for OAuth HTTP auth binding. The JSON expression intentionally fails
+    /// on corrupt metadata, and `LIMIT 2` lets the app distinguish exactly-one from duplicate
+    /// bindings without ever materializing the full OAuth credential list.
+    pub fn credential_oauth_bindings_for_server(
+        &self,
+        server_id: &str,
+    ) -> anyhow::Result<Vec<CredentialOAuthBindingRecord>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let (candidate_count, candidate_bytes): (i64, i64) = tx.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(
+                        length(CAST(id AS BLOB)) +
+                        length(CAST(keyring_service AS BLOB)) +
+                        length(CAST(keyring_username AS BLOB)) +
+                        length(CAST(oauth_json AS BLOB))
+                    ), 0)
+             FROM (
+                 SELECT id, keyring_service, keyring_username, oauth_json
+                 FROM credentials
+                 WHERE oauth_json IS NOT NULL
+                   AND json_extract(oauth_json, '$.server_id') = ?1
+                 ORDER BY created_at, id
+                 LIMIT 2
+             )",
+            [server_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let candidate_count =
+            usize::try_from(candidate_count).context("OAuth binding count 변환 실패")?;
+        let candidate_bytes =
+            usize::try_from(candidate_bytes).context("OAuth binding bytes 변환 실패")?;
+        anyhow::ensure!(candidate_count <= 2, "OAuth binding lookup 상한 위반");
+        anyhow::ensure!(
+            candidate_bytes <= CREDENTIAL_OAUTH_BINDING_BYTES_MAX,
+            "OAuth binding metadata byte 상한을 초과했습니다"
+        );
+        let candidates = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT id, keyring_service, keyring_username, oauth_json
+                 FROM credentials
+                 WHERE oauth_json IS NOT NULL
+                   AND json_extract(oauth_json, '$.server_id') = ?1
+                 ORDER BY created_at, id
+                 LIMIT 2",
+            )?;
+            let rows = stmt.query_map([server_id], |row| {
+                Ok(CredentialOAuthBindingRecord {
+                    logical_id: row.get(0)?,
+                    keyring_service: row.get(1)?,
+                    physical_pointer: row.get(2)?,
+                    oauth_metadata_json: row.get(3)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        anyhow::ensure!(
+            candidates.len() == candidate_count,
+            "OAuth binding same-snapshot count 불일치"
+        );
+        for candidate in &candidates {
+            validate_oauth_metadata_json(&candidate.oauth_metadata_json)?;
+            validate_owned_physical_secret_slot(
+                &candidate.logical_id,
+                &candidate.physical_pointer,
+            )?;
+        }
+        tx.commit()
+            .context("OAuth binding point lookup transaction 실패")?;
+        Ok(candidates)
+    }
+
     /// 참조가 없을 때만 metadata 행을 지운다 — 확인과 삭제를 한 문장으로 묶어
     /// "확인 후 삭제 사이에 참조가 생기는" TOCTOU를 없앤다 (codex 리뷰).
     /// 지웠으면 true, 참조 중이거나 없는 id면 false.
@@ -1053,6 +1149,30 @@ impl Db {
                 [id],
             )
             .with_context(|| format!("credential 삭제 실패: {id}"))?;
+        Ok(affected == 1)
+    }
+
+    /// Delete credential metadata only when no live env/MCP reference exists and the physical
+    /// pointer still equals the caller's expected value. The single conditional DELETE closes the
+    /// delete-vs-rotation race: stale cleanup is a harmless no-op and cannot remove a newer slot.
+    pub fn delete_credential_if_unused_cas(
+        &self,
+        id: &str,
+        expected_pointer: &str,
+    ) -> anyhow::Result<bool> {
+        let affected = self
+            .conn
+            .execute(
+                "DELETE FROM credentials WHERE id = ?1 AND keyring_username = ?2
+                   AND NOT EXISTS (SELECT 1 FROM env_vars WHERE credential_id = ?1)
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM mcp_servers, json_each(COALESCE(mcp_servers.env_credentials_json, '{}'))
+                       WHERE json_each.value = ?1
+                   )",
+                (id, expected_pointer),
+            )
+            .with_context(|| format!("credential expected-pointer 삭제 실패: {id}"))?;
         Ok(affected == 1)
     }
 
@@ -1664,12 +1784,54 @@ impl Db {
         mcp_store::list_servers(&self.conn)
     }
 
+    /// Connector overview용 complete-or-error bounded inventory. SQL performs a `limit + 1`
+    /// count/byte probe first, then materializes at most `limit` lightweight summary rows.
+    pub fn mcp_server_inventory(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<mcp_store::McpServerInventoryRow>> {
+        mcp_store::server_inventory(&self.conn, limit)
+    }
+
     pub fn mcp_server(&self, server_id: &str) -> anyhow::Result<Option<mcp_store::McpServerRow>> {
         mcp_store::server(&self.conn, server_id)
     }
 
     pub fn insert_mcp_server(&self, row: &mcp_store::McpServerRow) -> anyhow::Result<()> {
         mcp_store::insert_server(&self.conn, row)
+    }
+
+    /// Full transactional server save used by the Connector repository adapter.
+    pub fn save_mcp_server(
+        &mut self,
+        row: &mcp_store::McpServerRow,
+    ) -> anyhow::Result<mcp_store::McpServerSaveOutcome> {
+        mcp_store::save_server(&mut self.conn, row)
+    }
+
+    /// Reject active agent-proxy references and delete the server plus live MCP metadata in one
+    /// IMMEDIATE transaction. Durable audit history intentionally remains untouched.
+    pub fn delete_mcp_server(&mut self, server_id: &str, resolved_at: i64) -> anyhow::Result<bool> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let referenced = tx
+            .query_row(
+                "SELECT 1 FROM agent_configs
+                 WHERE deleted_at IS NULL AND mcp_proxy_server_id = ?1
+                 LIMIT 1",
+                [server_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        anyhow::ensure!(
+            !referenced,
+            "활성 agent proxy가 참조 중인 MCP server는 삭제할 수 없습니다: {server_id}"
+        );
+        let deleted = mcp_store::delete_server_in_transaction(&tx, server_id, resolved_at)?;
+        tx.commit().context("MCP server 삭제 commit 실패")?;
+        Ok(deleted)
     }
 
     /// canonical URL 기준 멱등 등록. built-in provider(Slack 등)의 중복 행을 막는다.
@@ -1706,6 +1868,16 @@ impl Db {
     /// 저장된 tool 목록 (도구 실행 UI용).
     pub fn list_mcp_tools(&self, server_id: &str) -> anyhow::Result<Vec<mcp_store::McpToolRow>> {
         mcp_store::list_tools_for_server(&self.conn, server_id)
+    }
+
+    /// Same-snapshot bounded tool page with permission rows joined in one page query.
+    pub fn mcp_tool_page(
+        &self,
+        server_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<mcp_store::McpToolPage> {
+        mcp_store::tool_page(&self.conn, server_id, offset, limit)
     }
 
     /// 저장된 tool 권한 규칙 전체 (앱 시작 시 PermissionPolicy로 로드).
@@ -2897,6 +3069,33 @@ mod tests {
         }
     }
 
+    fn sample_mcp_server(id: &str) -> mcp_store::McpServerRow {
+        mcp_store::McpServerRow {
+            id: id.to_owned(),
+            name: format!("server-{id}"),
+            kind: "stdio".to_owned(),
+            command: Some("safe-command".to_owned()),
+            args: vec!["--safe".to_owned()],
+            env_plain: Vec::new(),
+            env_secrets: Vec::new(),
+            inherit_env: true,
+            url: None,
+            enabled: true,
+        }
+    }
+
+    fn sample_mcp_tool(server_id: &str, id: &str, name: &str) -> mcp_store::McpToolRow {
+        mcp_store::McpToolRow {
+            id: id.to_owned(),
+            server_id: server_id.to_owned(),
+            name: name.to_owned(),
+            description: None,
+            input_schema_json: Some(r#"{"type":"object"}"#.to_owned()),
+            trust_level: "unknown".to_owned(),
+            schema_hash: Some(format!("hash-{name}")),
+        }
+    }
+
     fn credential_secret_record(db: &Db, id: &str) -> CredentialSecretRecord {
         db.list_credential_secret_records(32)
             .unwrap()
@@ -2963,6 +3162,76 @@ mod tests {
     }
 
     #[test]
+    fn credential_expected_pointer_delete는_stale과_reference를_noop처리하고_failure를_rollback한다()
+     {
+        let db = Db::open_in_memory().unwrap();
+        let logical = secret::LogicalCredentialId::new("cred-delete-cas").unwrap();
+        let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        db.insert_credential_with_secret_slot(&sample(logical.as_str()), slot.as_str(), None)
+            .unwrap();
+
+        assert!(
+            !db.delete_credential_if_unused_cas(logical.as_str(), "stale-pointer")
+                .unwrap()
+        );
+        let workspace = db.ensure_default_workspace().unwrap();
+        let profile = db.insert_env_profile(&workspace, "local", "local").unwrap();
+        db.upsert_env_var(
+            &profile,
+            "TOKEN",
+            &EnvValue::Secret {
+                credential_id: logical.as_str().to_owned(),
+            },
+        )
+        .unwrap();
+        assert!(
+            !db.delete_credential_if_unused_cas(logical.as_str(), slot.as_str())
+                .unwrap()
+        );
+        db.delete_env_var(&profile, "TOKEN").unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_credential_expected_delete BEFORE DELETE ON credentials
+                 BEGIN SELECT RAISE(ABORT, 'injected credential delete failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            db.delete_credential_if_unused_cas(logical.as_str(), slot.as_str())
+                .is_err()
+        );
+        assert_eq!(
+            credential_secret_record(&db, logical.as_str()).keyring_username,
+            slot.as_str()
+        );
+        db.conn
+            .execute_batch("DROP TRIGGER fail_credential_expected_delete;")
+            .unwrap();
+        assert!(
+            db.delete_credential_if_unused_cas(logical.as_str(), slot.as_str())
+                .unwrap()
+        );
+        assert!(db.list_credential_secret_records(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn credential_expected_pointer_delete는_mcp_secret_reference도_거부한다() {
+        let db = Db::open_in_memory().unwrap();
+        let logical = secret::LogicalCredentialId::new("cred-delete-mcp").unwrap();
+        let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        db.insert_credential_with_secret_slot(&sample(logical.as_str()), slot.as_str(), None)
+            .unwrap();
+        let mut server = sample_mcp_server("srv-delete-ref");
+        server.env_secrets = vec![("TOKEN".to_owned(), logical.as_str().to_owned())];
+        db.insert_mcp_server(&server).unwrap();
+
+        assert!(
+            !db.delete_credential_if_unused_cas(logical.as_str(), slot.as_str())
+                .unwrap()
+        );
+        assert_eq!(db.list_credential_secret_records(1).unwrap().len(), 1);
+    }
+
+    #[test]
     fn credential_oauth_메타는_json으로_왕복된다() {
         // PR-H5 (v20): oauth_json은 비밀 아닌 연계 메타데이터만 담는다
         let db = Db::open_in_memory().unwrap();
@@ -2989,6 +3258,110 @@ mod tests {
         );
         // 없는 credential은 에러
         assert!(db.set_credential_oauth_json("cred-missing", "{}").is_err());
+    }
+
+    #[test]
+    fn oauth_server_binding_lookup은_exact_zero와_one을_구분하고_raw_metadata를_보존한다() {
+        let db = Db::open_in_memory().unwrap();
+        let other = secret::LogicalCredentialId::new("cred-binding-other").unwrap();
+        let other_slot = secret::PhysicalSecretSlot::with_version(&other, uuid::Uuid::new_v4());
+        db.insert_credential_with_secret_slot(
+            &sample(other.as_str()),
+            other_slot.as_str(),
+            Some(r#"{"server_id":"server-other"}"#),
+        )
+        .unwrap();
+        assert!(
+            db.credential_oauth_bindings_for_server("server-target")
+                .unwrap()
+                .is_empty()
+        );
+
+        let logical = secret::LogicalCredentialId::new("cred-binding-target").unwrap();
+        let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+        let metadata = r#"{"server_id":"server-target","server_url":"https://stored.example/mcp","token_endpoint_auth_method":"client_secret_post"}"#;
+        db.insert_credential_with_secret_slot(
+            &sample(logical.as_str()),
+            slot.as_str(),
+            Some(metadata),
+        )
+        .unwrap();
+
+        let records = db
+            .credential_oauth_bindings_for_server("server-target")
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].logical_id, logical.as_str());
+        assert_eq!(records[0].keyring_service, secret::KEYRING_SERVICE);
+        assert_eq!(records[0].physical_pointer, slot.as_str());
+        assert_eq!(records[0].oauth_metadata_json, metadata);
+        let debug = format!("{:?}", records[0]);
+        assert!(!debug.contains(logical.as_str()));
+        assert!(!debug.contains(slot.as_str()));
+        assert!(!debug.contains("stored.example"));
+        assert!(debug.contains("REDACTED"));
+    }
+
+    #[test]
+    fn oauth_server_binding_lookup은_duplicate를_limit_two로_노출한다() {
+        let db = Db::open_in_memory().unwrap();
+        for id in ["cred-binding-a", "cred-binding-b", "cred-binding-c"] {
+            let logical = secret::LogicalCredentialId::new(id).unwrap();
+            let slot = secret::PhysicalSecretSlot::with_version(&logical, uuid::Uuid::new_v4());
+            db.insert_credential_with_secret_slot(
+                &sample(logical.as_str()),
+                slot.as_str(),
+                Some(r#"{"server_id":"server-duplicate"}"#),
+            )
+            .unwrap();
+        }
+
+        let records = db
+            .credential_oauth_bindings_for_server("server-duplicate")
+            .unwrap();
+        assert_eq!(
+            records.len(),
+            2,
+            "+1 probe must expose ambiguity without full allocation"
+        );
+    }
+
+    #[test]
+    fn oauth_server_binding_lookup은_corrupt_json을_fail_closed한다() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_credential(&sample("cred-binding-corrupt"))
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE credentials SET oauth_json = '{\"server_id\":' WHERE id = ?1",
+                ["cred-binding-corrupt"],
+            )
+            .unwrap();
+
+        assert!(
+            db.credential_oauth_bindings_for_server("server-target")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn oauth_server_binding_lookup은_sql_byte_preflight를_강제한다() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_credential(&sample("cred-binding-oversized"))
+            .unwrap();
+        let padding = "x".repeat(CREDENTIAL_OAUTH_BINDING_BYTES_MAX + 1);
+        let metadata = serde_json::json!({
+            "server_id": "server-oversized",
+            "nonsecret_padding": padding,
+        })
+        .to_string();
+        db.set_credential_oauth_json("cred-binding-oversized", &metadata)
+            .unwrap();
+
+        assert!(
+            db.credential_oauth_bindings_for_server("server-oversized")
+                .is_err()
+        );
     }
 
     #[test]
@@ -4512,6 +4885,159 @@ mod tests {
         assert_eq!(
             db.list_web_push_subscriptions().unwrap()[0].endpoint,
             "https://push/y"
+        );
+    }
+
+    #[test]
+    fn connector_repository_inventory와_tool_page는_bounded_complete_snapshot을_제공한다() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.save_mcp_server(&sample_mcp_server("srv-page-a"))
+            .unwrap();
+        db.save_mcp_server(&sample_mcp_server("srv-page-b"))
+            .unwrap();
+        assert_eq!(db.mcp_server_inventory(2).unwrap().len(), 2);
+        assert!(db.mcp_server_inventory(1).is_err());
+
+        db.replace_mcp_tools(
+            "srv-page-a",
+            &[
+                sample_mcp_tool("srv-page-a", "tool-b", "bravo"),
+                sample_mcp_tool("srv-page-a", "tool-a", "alpha"),
+            ],
+        )
+        .unwrap();
+        db.upsert_permission_rule("srv-page-a", "bravo", "deny", None)
+            .unwrap();
+        let page = db.mcp_tool_page("srv-page-a", 0, 1).unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].name, "alpha");
+        assert!(page.rows[0].permission.is_none());
+        let second = db.mcp_tool_page("srv-page-a", 1, 1).unwrap();
+        assert_eq!(second.rows[0].permission.as_ref().unwrap().rule, "deny");
+    }
+
+    #[test]
+    fn server_delete는_active_agent_reference를_거부하고_audit을_보존한다() {
+        let mut db = Db::open_in_memory().unwrap();
+        let server_id = "srv-delete";
+        db.insert_mcp_server(&sample_mcp_server(server_id)).unwrap();
+        db.replace_mcp_tools(
+            server_id,
+            &[sample_mcp_tool(server_id, "tool-read", "read")],
+        )
+        .unwrap();
+        db.upsert_permission_rule(server_id, "read", "allow", Some("hash-read"))
+            .unwrap();
+        db.insert_pending_approval("approval-delete", server_id, "read", "{}", None, 1, None)
+            .unwrap();
+        let audit_id = db
+            .record_tool_audit(
+                &audit::AuditRecord {
+                    workspace_id: None,
+                    session_id: None,
+                    server_id: Some(server_id),
+                    tool_name: "read",
+                    input_json: "{}",
+                    decision: audit::ToolDecision::AllowOnce,
+                },
+                &secret::RedactionService::new(),
+                None,
+            )
+            .unwrap();
+        let agent_id = db
+            .insert_agent_config(
+                "proxy-user",
+                "safe-command",
+                &[],
+                None,
+                None,
+                None,
+                None,
+                true,
+                Some(server_id),
+                None,
+            )
+            .unwrap();
+
+        assert!(db.delete_mcp_server(server_id, 10).is_err());
+        assert!(db.mcp_server(server_id).unwrap().is_some());
+        assert_eq!(db.list_mcp_tools(server_id).unwrap().len(), 1);
+        assert_eq!(
+            db.permission_rule(server_id, "read").unwrap().unwrap().rule,
+            "allow"
+        );
+        assert_eq!(
+            db.poll_approval("approval-delete").unwrap().status,
+            ApprovalStatus::Pending
+        );
+
+        db.delete_agent_config(&agent_id).unwrap();
+        assert!(db.delete_mcp_server(server_id, 20).unwrap());
+        assert!(db.mcp_server(server_id).unwrap().is_none());
+        assert!(db.list_mcp_tools(server_id).unwrap().is_empty());
+        assert!(db.permission_rule(server_id, "read").unwrap().is_none());
+        assert_eq!(
+            db.poll_approval("approval-delete").unwrap(),
+            ApprovalOutcome {
+                status: ApprovalStatus::Denied,
+                remember: false,
+            }
+        );
+        let audit_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tool_audit_logs WHERE id = ?1 AND server_id = ?2",
+                (&audit_id, server_id),
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            audit_count, 1,
+            "durable audit history must survive server deletion"
+        );
+    }
+
+    #[test]
+    fn server_delete_failure는_pending_permission_tool_server를_모두_rollback한다() {
+        let mut db = Db::open_in_memory().unwrap();
+        let server_id = "srv-delete-fail";
+        db.insert_mcp_server(&sample_mcp_server(server_id)).unwrap();
+        let tool = sample_mcp_tool(server_id, "tool-read-fail", "read");
+        db.replace_mcp_tools(server_id, std::slice::from_ref(&tool))
+            .unwrap();
+        db.upsert_permission_rule(server_id, "read", "allow", Some("hash-read"))
+            .unwrap();
+        db.insert_pending_approval(
+            "approval-delete-fail",
+            server_id,
+            "read",
+            "{}",
+            None,
+            1,
+            None,
+        )
+        .unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_storage_server_delete BEFORE DELETE ON mcp_tools
+                 BEGIN SELECT RAISE(ABORT, 'injected storage server delete failure'); END;",
+            )
+            .unwrap();
+
+        assert!(db.delete_mcp_server(server_id, 10).is_err());
+        assert_eq!(
+            db.mcp_server(server_id).unwrap(),
+            Some(sample_mcp_server(server_id))
+        );
+        assert_eq!(db.list_mcp_tools(server_id).unwrap(), vec![tool]);
+        assert_eq!(
+            db.permission_rule(server_id, "read").unwrap().unwrap().rule,
+            "allow"
+        );
+        assert_eq!(
+            db.poll_approval("approval-delete-fail").unwrap().status,
+            ApprovalStatus::Pending
         );
     }
 

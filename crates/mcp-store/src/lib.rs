@@ -426,6 +426,94 @@ pub struct McpToolRow {
     pub schema_hash: Option<String>,
 }
 
+/// Lightweight overview row. Transport arguments/environment are loaded only for a selected
+/// server, preventing overview snapshots from retaining execution configuration.
+#[derive(Clone, PartialEq, Eq)]
+pub struct McpServerInventoryRow {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub url: Option<String>,
+    pub enabled: bool,
+    pub tool_count: usize,
+}
+
+impl std::fmt::Debug for McpServerInventoryRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpServerInventoryRow")
+            .field("identity", &"REDACTED")
+            .field("kind", &self.kind)
+            .field("url", &self.url.as_ref().map(|_| "REDACTED"))
+            .field("enabled", &self.enabled)
+            .field("tool_count", &self.tool_count)
+            .finish()
+    }
+}
+
+/// One bounded tool summary with the persisted permission, when present. Schema/trust fields are
+/// deliberately absent: live schema is loaded only on invoke.
+#[derive(Clone, PartialEq)]
+pub struct McpToolPageRow {
+    pub id: String,
+    pub server_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub permission: Option<PermissionRuleRow>,
+}
+
+impl std::fmt::Debug for McpToolPageRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpToolPageRow")
+            .field("identity", &"REDACTED")
+            .field(
+                "description",
+                &self.description.as_ref().map(|_| "REDACTED"),
+            )
+            .field("has_permission", &self.permission.is_some())
+            .finish()
+    }
+}
+
+/// Same-read-transaction tool count and one ordered page. `rows` never exceeds
+/// [`MCP_TOOL_PAGE_LIMIT_MAX`].
+#[derive(Clone, PartialEq)]
+pub struct McpToolPage {
+    pub total: usize,
+    pub rows: Vec<McpToolPageRow>,
+}
+
+impl std::fmt::Debug for McpToolPage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpToolPage")
+            .field("total", &self.total)
+            .field("row_count", &self.rows.len())
+            .finish()
+    }
+}
+
+/// Repository-level ceiling. Callers may choose a lower page size but cannot raise this at
+/// runtime, preventing accidental full-list allocation in UI snapshot preparation.
+pub const MCP_TOOL_PAGE_LIMIT_MAX: usize = 256;
+
+/// Fixed storage-side allocation ceilings. Connector runtime limits may lower these values but
+/// cannot raise them. SQL byte preflights run before text values are materialized.
+pub const MCP_TOOL_PAGE_BYTES_MAX: usize = 8 * 1024 * 1024;
+
+/// Connector overview inventory ceiling. The +1 probe detects overflow without materializing the
+/// complete legacy server table.
+pub const MCP_SERVER_INVENTORY_LIMIT_MAX: usize = 256;
+pub const MCP_SERVER_INVENTORY_BYTES_MAX: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpServerSaveOutcome {
+    Inserted,
+    Updated { transport_changed: bool },
+    Unchanged,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SecretLikeArgsReason {
     ArgFlag,
@@ -700,6 +788,80 @@ pub fn insert_server(conn: &Connection, row: &McpServerRow) -> anyhow::Result<()
     Ok(())
 }
 
+/// Insert or fully update one server in an IMMEDIATE transaction. A transport change invalidates
+/// cached tools and Allow grants atomically, while Deny grants remain a safe restriction. Display
+/// name/enabled-only edits preserve transport-derived state, and semantic no-ops perform no write.
+pub fn save_server(
+    conn: &mut Connection,
+    row: &McpServerRow,
+) -> anyhow::Result<McpServerSaveOutcome> {
+    validate_server_args_for_persistence(&row.args)
+        .with_context(|| format!("mcp_server args validation 실패: {}", row.name))?;
+    validate_server_env_for_persistence(&row.env_plain, &row.env_secrets)
+        .with_context(|| format!("mcp_server env validation 실패: {}", row.name))?;
+    let args_json = serde_json::to_string(&row.args)?;
+    let env_json = env_pairs_json(&row.env_plain)?;
+    let env_credentials_json = env_pairs_json(&row.env_secrets)?;
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let Some(current) = server(&tx, &row.id)? else {
+        insert_server(&tx, row)?;
+        tx.commit().context("MCP server insert commit 실패")?;
+        return Ok(McpServerSaveOutcome::Inserted);
+    };
+
+    let current_env_json = env_pairs_json(&current.env_plain)?;
+    let current_env_credentials_json = env_pairs_json(&current.env_secrets)?;
+    let transport_changed = current.kind != row.kind
+        || current.command != row.command
+        || current.args != row.args
+        || current_env_json != env_json
+        || current_env_credentials_json != env_credentials_json
+        || current.inherit_env != row.inherit_env
+        || current.url != row.url;
+    let unchanged =
+        !transport_changed && current.name == row.name && current.enabled == row.enabled;
+    if unchanged {
+        tx.commit().context("MCP server no-op transaction 실패")?;
+        return Ok(McpServerSaveOutcome::Unchanged);
+    }
+
+    let affected = tx
+        .execute(
+            "UPDATE mcp_servers
+             SET name = ?2, kind = ?3, command = ?4, args_json = ?5,
+                 env_json = ?6, env_credentials_json = ?7, inherit_env = ?8,
+                 url = ?9, enabled = ?10,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE id = ?1",
+            (
+                &row.id,
+                &row.name,
+                &row.kind,
+                &row.command,
+                &args_json,
+                &env_json,
+                &env_credentials_json,
+                row.inherit_env,
+                &row.url,
+                row.enabled,
+            ),
+        )
+        .with_context(|| format!("mcp_server 전체 갱신 실패: {}", row.id))?;
+    anyhow::ensure!(affected == 1, "mcp_server 전체 갱신 대상 없음: {}", row.id);
+    if transport_changed {
+        tx.execute(
+            "DELETE FROM tool_permission_rules WHERE server_id = ?1 AND rule = 'allow'",
+            [&row.id],
+        )
+        .with_context(|| format!("mcp_server Allow 권한 초기화 실패: {}", row.id))?;
+        tx.execute("DELETE FROM mcp_tools WHERE server_id = ?1", [&row.id])
+            .with_context(|| format!("mcp_server tool cache 초기화 실패: {}", row.id))?;
+    }
+    tx.commit().context("MCP server 전체 갱신 commit 실패")?;
+    Ok(McpServerSaveOutcome::Updated { transport_changed })
+}
+
 /// http 서버의 URL과 그 URL에 묶인 신뢰 상태를 한 transaction으로 갱신한다.
 /// 허용 규칙은 Ask(행 없음)로 되돌리고 tool cache를 비운다. Deny 규칙은 새 endpoint에도
 /// 권한을 넓히지 않는 안전한 제약이므로 보존한다. 같은 URL이면 아무 것도 지우지 않는다.
@@ -753,12 +915,33 @@ pub fn ensure_server_by_url(
     anyhow::ensure!(!canonical.is_empty(), "멱등 등록 URL이 비어 있습니다");
 
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let existing = list_servers(&tx)?.into_iter().find(|server| {
-        server
-            .url
-            .as_deref()
-            .is_some_and(|url| canonical_url(url) == canonical)
-    });
+    let existing = tx
+        .query_row(
+            "SELECT id, name, kind, command, args_json, env_json, env_credentials_json,
+                    inherit_env, url, enabled
+             FROM mcp_servers
+             WHERE rtrim(trim(url), '/') = ?1
+             ORDER BY created_at, id
+             LIMIT 1",
+            [canonical],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, bool>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, bool>(9)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(parse_server_row)
+        .transpose()?;
     if let Some(existing) = existing {
         tx.commit()?;
         return Ok(existing);
@@ -814,6 +997,86 @@ pub fn list_servers(conn: &Connection) -> anyhow::Result<Vec<McpServerRow>> {
     for row in rows {
         servers.push(parse_server_row(row?)?);
     }
+    Ok(servers)
+}
+
+/// Connector-facing bounded inventory. Reads at most `limit + 1` rows and fails closed when the
+/// requested snapshot cannot represent the complete inventory. The legacy unbounded list remains
+/// available only for callers that have not yet cut over.
+pub fn server_inventory(
+    conn: &Connection,
+    limit: usize,
+) -> anyhow::Result<Vec<McpServerInventoryRow>> {
+    anyhow::ensure!(limit > 0, "MCP server inventory limit은 0보다 커야 합니다");
+    anyhow::ensure!(
+        limit <= MCP_SERVER_INVENTORY_LIMIT_MAX,
+        "MCP server inventory limit이 상한을 초과했습니다"
+    );
+    let probe = limit
+        .checked_add(1)
+        .context("MCP server inventory +1 overflow")?;
+    let sql_limit = i64::try_from(probe).context("MCP server inventory LIMIT 변환 실패")?;
+    let tx = conn.unchecked_transaction()?;
+    let (probe_count, inventory_bytes): (i64, i64) = tx.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(
+                    length(CAST(id AS BLOB)) + length(CAST(name AS BLOB)) +
+                    length(CAST(kind AS BLOB)) + length(CAST(COALESCE(url, '') AS BLOB))
+                ), 0)
+         FROM (
+             SELECT id, name, kind, url
+             FROM mcp_servers ORDER BY created_at, id LIMIT ?1
+         )",
+        [sql_limit],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let probe_count = usize::try_from(probe_count).context("MCP server count 변환 실패")?;
+    let inventory_bytes =
+        usize::try_from(inventory_bytes).context("MCP server inventory bytes 변환 실패")?;
+    anyhow::ensure!(
+        probe_count <= limit,
+        "MCP server inventory가 상한 {limit}개를 초과했습니다"
+    );
+    anyhow::ensure!(
+        inventory_bytes <= MCP_SERVER_INVENTORY_BYTES_MAX,
+        "MCP server inventory byte 상한을 초과했습니다"
+    );
+    let servers = {
+        let mut stmt = tx.prepare(
+            "SELECT s.id, s.name, s.kind, s.url, s.enabled, COUNT(t.id)
+             FROM mcp_servers s
+             LEFT JOIN mcp_tools t ON t.server_id = s.id
+             GROUP BY s.id
+             ORDER BY s.created_at, s.id
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([sql_limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, bool>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        let mut servers = Vec::with_capacity(probe_count);
+        for row in rows {
+            let (id, name, kind, url, enabled, tool_count) = row?;
+            servers.push(McpServerInventoryRow {
+                id,
+                name,
+                kind,
+                url,
+                enabled,
+                tool_count: usize::try_from(tool_count)
+                    .context("MCP server tool count 변환 실패")?,
+            });
+        }
+        servers
+    };
+    tx.commit()
+        .context("MCP server inventory read transaction 실패")?;
     Ok(servers)
 }
 
@@ -994,6 +1257,136 @@ pub fn list_tools_for_server(
     Ok(tools)
 }
 
+/// Count and read one ordered tool page inside the same read transaction. Permission is joined in
+/// the page query, avoiding both an all-tools allocation and per-row permission lookups.
+pub fn tool_page(
+    conn: &Connection,
+    server_id: &str,
+    offset: usize,
+    limit: usize,
+) -> anyhow::Result<McpToolPage> {
+    anyhow::ensure!(limit > 0, "MCP tool page limit은 0보다 커야 합니다");
+    anyhow::ensure!(
+        limit <= MCP_TOOL_PAGE_LIMIT_MAX,
+        "MCP tool page limit이 상한을 초과했습니다"
+    );
+    let sql_offset = i64::try_from(offset).context("MCP tool page OFFSET 변환 실패")?;
+    let sql_limit = i64::try_from(limit).context("MCP tool page LIMIT 변환 실패")?;
+    let tx = conn.unchecked_transaction()?;
+    let count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM mcp_tools WHERE server_id = ?1",
+        [server_id],
+        |row| row.get(0),
+    )?;
+    let total = usize::try_from(count).context("MCP tool count 변환 실패")?;
+    let page_bytes: i64 = tx.query_row(
+        "SELECT COALESCE(SUM(
+                    length(CAST(t.id AS BLOB)) + length(CAST(t.server_id AS BLOB)) +
+                    length(CAST(t.name AS BLOB)) +
+                    length(CAST(COALESCE(t.description, '') AS BLOB)) +
+                    length(CAST(COALESCE(p.server_id, '') AS BLOB)) +
+                    length(CAST(COALESCE(p.tool_name, '') AS BLOB)) +
+                    length(CAST(COALESCE(p.rule, '') AS BLOB)) +
+                    length(CAST(COALESCE(p.approved_schema_hash, '') AS BLOB))
+                ), 0)
+         FROM (
+             SELECT id, server_id, name, description
+             FROM mcp_tools
+             WHERE server_id = ?1
+             ORDER BY name, id
+             LIMIT ?2 OFFSET ?3
+         ) t
+         LEFT JOIN tool_permission_rules p
+           ON p.server_id = t.server_id AND p.tool_name = t.name",
+        (server_id, sql_limit, sql_offset),
+        |row| row.get(0),
+    )?;
+    let page_bytes = usize::try_from(page_bytes).context("MCP tool page bytes 변환 실패")?;
+    anyhow::ensure!(
+        page_bytes <= MCP_TOOL_PAGE_BYTES_MAX,
+        "MCP tool page byte 상한을 초과했습니다"
+    );
+    let rows = {
+        let mut stmt = tx.prepare(
+            "SELECT t.id, t.server_id, t.name, t.description,
+                    p.server_id, p.tool_name, p.rule, p.approved_schema_hash
+             FROM mcp_tools t
+             LEFT JOIN tool_permission_rules p
+               ON p.server_id = t.server_id AND p.tool_name = t.name
+             WHERE t.server_id = ?1
+             ORDER BY t.name, t.id
+             LIMIT ?2 OFFSET ?3",
+        )?;
+        let mapped = stmt.query_map((server_id, sql_limit, sql_offset), |row| {
+            let permission_server_id = row.get::<_, Option<String>>(4)?;
+            let permission = if let Some(server_id) = permission_server_id {
+                Some(PermissionRuleRow {
+                    server_id,
+                    tool_name: row.get(5)?,
+                    rule: row.get(6)?,
+                    approved_schema_hash: row.get(7)?,
+                })
+            } else {
+                None
+            };
+            Ok(McpToolPageRow {
+                id: row.get(0)?,
+                server_id: row.get(1)?,
+                name: row.get(2)?,
+                description: row.get(3)?,
+                permission,
+            })
+        })?;
+        mapped.collect::<Result<Vec<_>, _>>()?
+    };
+    tx.commit().context("MCP tool page read transaction 실패")?;
+    Ok(McpToolPage { total, rows })
+}
+
+/// Delete one server and all live execution metadata from a caller-owned transaction. Durable
+/// audit history is intentionally outside this crate and is never deleted. The storage facade must
+/// first reject active agent-proxy references in the same transaction.
+pub fn delete_server_in_transaction(
+    conn: &Connection,
+    server_id: &str,
+    resolved_at: i64,
+) -> anyhow::Result<bool> {
+    anyhow::ensure!(
+        !conn.is_autocommit(),
+        "MCP server 삭제는 caller-owned transaction이 필요합니다"
+    );
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM mcp_servers WHERE id = ?1",
+            [server_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !exists {
+        return Ok(false);
+    }
+    conn.execute(
+        "UPDATE pending_approvals
+         SET status = 'denied', remember = 0, resolved_at = ?2
+         WHERE server_id = ?1 AND status = 'pending'",
+        (server_id, resolved_at),
+    )
+    .with_context(|| format!("MCP server pending approval 종료 실패: {server_id}"))?;
+    conn.execute(
+        "DELETE FROM tool_permission_rules WHERE server_id = ?1",
+        [server_id],
+    )
+    .with_context(|| format!("MCP server permission 삭제 실패: {server_id}"))?;
+    conn.execute("DELETE FROM mcp_tools WHERE server_id = ?1", [server_id])
+        .with_context(|| format!("MCP server tool 삭제 실패: {server_id}"))?;
+    let deleted = conn
+        .execute("DELETE FROM mcp_servers WHERE id = ?1", [server_id])
+        .with_context(|| format!("MCP server 삭제 실패: {server_id}"))?;
+    anyhow::ensure!(deleted == 1, "MCP server 삭제 대상 수 불일치: {server_id}");
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1033,12 +1426,156 @@ mod tests {
         }
     }
 
+    fn sample_tool(id: &str, name: &str) -> McpToolRow {
+        McpToolRow {
+            id: id.to_owned(),
+            server_id: "srv-1".to_owned(),
+            name: name.to_owned(),
+            description: Some(format!("{name} description")),
+            input_schema_json: Some(r#"{"type":"object"}"#.to_owned()),
+            trust_level: "unknown".to_owned(),
+            schema_hash: Some(format!("hash-{name}")),
+        }
+    }
+
     #[test]
     fn server_insert_list_roundtrip() {
         let conn = test_conn();
         let server = sample_server();
         insert_server(&conn, &server).unwrap();
         assert_eq!(list_servers(&conn).unwrap(), vec![server]);
+    }
+
+    #[test]
+    fn full_server_save는_noop과_display_edit를_구분하고_transport_change만_신뢰를_초기화한다() {
+        let mut conn = test_conn();
+        let original = sample_server();
+        assert_eq!(
+            save_server(&mut conn, &original).unwrap(),
+            McpServerSaveOutcome::Inserted
+        );
+        upsert_permission_rule(&conn, "srv-1", "read", "allow", Some("hash-read")).unwrap();
+        upsert_permission_rule(&conn, "srv-1", "delete", "deny", None).unwrap();
+        insert_tool(&conn, &sample_tool("tool-read", "read")).unwrap();
+
+        assert_eq!(
+            save_server(&mut conn, &original).unwrap(),
+            McpServerSaveOutcome::Unchanged
+        );
+        assert_eq!(list_permission_rules(&conn).unwrap().len(), 2);
+        assert_eq!(list_tools_for_server(&conn, "srv-1").unwrap().len(), 1);
+
+        let mut display_edit = original.clone();
+        display_edit.name = "renamed".to_owned();
+        display_edit.enabled = false;
+        assert_eq!(
+            save_server(&mut conn, &display_edit).unwrap(),
+            McpServerSaveOutcome::Updated {
+                transport_changed: false
+            }
+        );
+        assert_eq!(list_permission_rules(&conn).unwrap().len(), 2);
+        assert_eq!(list_tools_for_server(&conn, "srv-1").unwrap().len(), 1);
+
+        let mut transport_edit = display_edit.clone();
+        transport_edit.command = Some("new-command".to_owned());
+        transport_edit.args = vec!["--safe".to_owned()];
+        transport_edit.env_plain = vec![
+            ("Z_SAFE".to_owned(), "2".to_owned()),
+            ("A_SAFE".to_owned(), "1".to_owned()),
+        ];
+        assert_eq!(
+            save_server(&mut conn, &transport_edit).unwrap(),
+            McpServerSaveOutcome::Updated {
+                transport_changed: true
+            }
+        );
+        let mut persisted = transport_edit.clone();
+        persisted.env_plain.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(server(&conn, "srv-1").unwrap(), Some(persisted));
+        assert_eq!(
+            save_server(&mut conn, &transport_edit).unwrap(),
+            McpServerSaveOutcome::Unchanged,
+            "canonical env ordering must not produce a false transport change"
+        );
+        assert!(list_tools_for_server(&conn, "srv-1").unwrap().is_empty());
+        assert_eq!(
+            list_permission_rules(&conn).unwrap(),
+            vec![PermissionRuleRow {
+                server_id: "srv-1".to_owned(),
+                tool_name: "delete".to_owned(),
+                rule: "deny".to_owned(),
+                approved_schema_hash: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn full_server_save_중간실패는_row와_permission과_tools를_모두_rollback한다() {
+        let mut conn = test_conn();
+        let original = sample_server();
+        insert_server(&conn, &original).unwrap();
+        upsert_permission_rule(&conn, "srv-1", "read", "allow", Some("hash")).unwrap();
+        let tool = sample_tool("tool-read", "read");
+        insert_tool(&conn, &tool).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_full_save_tool_clear BEFORE DELETE ON mcp_tools
+             BEGIN SELECT RAISE(ABORT, 'injected full save failure'); END;",
+        )
+        .unwrap();
+        let mut changed = original.clone();
+        changed.command = Some("changed".to_owned());
+
+        assert!(save_server(&mut conn, &changed).is_err());
+        assert_eq!(server(&conn, "srv-1").unwrap(), Some(original));
+        assert_eq!(list_permission_rules(&conn).unwrap().len(), 1);
+        assert_eq!(list_tools_for_server(&conn, "srv-1").unwrap(), vec![tool]);
+    }
+
+    #[test]
+    fn full_server_save는_validation_실패시_기존_row를_수정하지_않는다() {
+        let mut conn = test_conn();
+        let original = sample_server();
+        insert_server(&conn, &original).unwrap();
+        let mut invalid = original.clone();
+        invalid.args = vec!["--token".to_owned(), "sk-never-persist-this".to_owned()];
+
+        assert!(save_server(&mut conn, &invalid).is_err());
+        assert_eq!(server(&conn, "srv-1").unwrap(), Some(original));
+    }
+
+    #[test]
+    fn server_inventory는_exact_limit을_허용하고_plus_one을_감지한다() {
+        let mut conn = test_conn();
+        let mut first = sample_server();
+        first.id = "srv-a".to_owned();
+        let mut second = sample_server();
+        second.id = "srv-b".to_owned();
+        save_server(&mut conn, &first).unwrap();
+        save_server(&mut conn, &second).unwrap();
+        let mut tool = sample_tool("tool-a", "read");
+        tool.server_id = "srv-a".to_owned();
+        insert_tool(&conn, &tool).unwrap();
+
+        let inventory = server_inventory(&conn, 2).unwrap();
+        assert_eq!(inventory.len(), 2);
+        assert_eq!(inventory[0].id, "srv-a");
+        assert_eq!(inventory[0].tool_count, 1);
+        assert_eq!(inventory[1].tool_count, 0);
+        assert!(!format!("{:?}", inventory[0]).contains("srv-a"));
+        assert!(server_inventory(&conn, 1).is_err());
+        assert!(server_inventory(&conn, 0).is_err());
+        assert!(server_inventory(&conn, MCP_SERVER_INVENTORY_LIMIT_MAX + 1).is_err());
+    }
+
+    #[test]
+    fn server_inventory는_sql_byte_preflight로_oversized_row를_거부한다() {
+        let conn = test_conn();
+        let mut server = sample_server();
+        server.name = "x".repeat(MCP_SERVER_INVENTORY_BYTES_MAX + 1);
+        insert_server(&conn, &server).unwrap();
+
+        assert!(server_inventory(&conn, 1).is_err());
     }
 
     #[test]
@@ -1130,6 +1667,34 @@ mod tests {
 
         assert_eq!(first.id, second.id);
         assert_eq!(list_servers(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn canonical_url_멱등등록은_큰_inventory를_materialize하지_않고_point_lookup한다() {
+        let mut conn = test_conn();
+        for index in 0..=MCP_SERVER_INVENTORY_LIMIT_MAX {
+            let mut server = sample_server();
+            server.id = format!("local-{index:03}");
+            server.name = server.id.clone();
+            insert_server(&conn, &server).unwrap();
+        }
+        assert!(server_inventory(&conn, MCP_SERVER_INVENTORY_LIMIT_MAX).is_err());
+
+        let mut slack = sample_server();
+        slack.id = "slack".to_owned();
+        slack.kind = "http".to_owned();
+        slack.command = None;
+        slack.args.clear();
+        slack.url = Some("https://mcp.slack.com/mcp/".to_owned());
+        insert_server(&conn, &slack).unwrap();
+        let mut duplicate = slack.clone();
+        duplicate.id = "slack-duplicate".to_owned();
+        duplicate.url = Some(" https://mcp.slack.com/mcp ".to_owned());
+
+        assert_eq!(
+            ensure_server_by_url(&mut conn, &duplicate).unwrap().id,
+            "slack"
+        );
     }
 
     #[test]
@@ -1436,6 +2001,119 @@ mod tests {
         insert_tool(&conn, &tool).unwrap();
         assert_eq!(list_tools_for_server(&conn, "srv-1").unwrap(), vec![tool]);
         assert!(list_tools_for_server(&conn, "srv-2").unwrap().is_empty());
+    }
+
+    #[test]
+    fn tool_page는_same_snapshot_total과_ordered_permission_join을_bounded로_반환한다() {
+        let conn = test_conn();
+        insert_server(&conn, &sample_server()).unwrap();
+        for (id, name) in [("t-c", "charlie"), ("t-a", "alpha"), ("t-b", "bravo")] {
+            insert_tool(&conn, &sample_tool(id, name)).unwrap();
+        }
+        upsert_permission_rule(&conn, "srv-1", "bravo", "allow", Some("hash-bravo")).unwrap();
+
+        let page = tool_page(&conn, "srv-1", 1, 2).unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(page.rows.len(), 2);
+        assert_eq!(page.rows[0].name, "bravo");
+        assert_eq!(page.rows[0].permission.as_ref().unwrap().rule, "allow");
+        assert_eq!(page.rows[1].name, "charlie");
+        assert!(page.rows[1].permission.is_none());
+        let debug = format!("{page:?}");
+        assert!(!debug.contains("bravo"));
+        assert!(!debug.contains("description"));
+
+        assert!(tool_page(&conn, "srv-1", 0, 0).is_err());
+        assert!(tool_page(&conn, "srv-1", 0, MCP_TOOL_PAGE_LIMIT_MAX + 1).is_err());
+        assert!(tool_page(&conn, "srv-1", usize::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn tool_page_hard_cap은_total과_rows상한을_분리한다() {
+        let conn = test_conn();
+        insert_server(&conn, &sample_server()).unwrap();
+        for index in 0..=MCP_TOOL_PAGE_LIMIT_MAX {
+            insert_tool(
+                &conn,
+                &sample_tool(&format!("tool-{index:03}"), &format!("name-{index:03}")),
+            )
+            .unwrap();
+        }
+
+        let page = tool_page(&conn, "srv-1", 0, MCP_TOOL_PAGE_LIMIT_MAX).unwrap();
+        assert_eq!(page.total, MCP_TOOL_PAGE_LIMIT_MAX + 1);
+        assert_eq!(page.rows.len(), MCP_TOOL_PAGE_LIMIT_MAX);
+    }
+
+    #[test]
+    fn tool_page는_schema를_읽지않고_summary_byte_preflight를_강제한다() {
+        let conn = test_conn();
+        insert_server(&conn, &sample_server()).unwrap();
+        let mut oversized = sample_tool("tool-oversized", "read");
+        oversized.description = Some("x".repeat(MCP_TOOL_PAGE_BYTES_MAX + 1));
+        oversized.input_schema_json = Some("schema-must-not-enter-page".to_owned());
+        insert_tool(&conn, &oversized).unwrap();
+
+        assert!(tool_page(&conn, "srv-1", 0, 1).is_err());
+    }
+
+    #[test]
+    fn transactional_server_delete는_pending을_deny하고_live_metadata를_정리한다() {
+        let mut conn = test_conn();
+        insert_server(&conn, &sample_server()).unwrap();
+        insert_tool(&conn, &sample_tool("tool-read", "read")).unwrap();
+        upsert_permission_rule(&conn, "srv-1", "read", "allow", Some("hash")).unwrap();
+        insert_pending_approval(&conn, "approval", "srv-1", "read", "{}", None, 1, None).unwrap();
+
+        assert!(delete_server_in_transaction(&conn, "srv-1", 10).is_err());
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert!(delete_server_in_transaction(&tx, "srv-1", 10).unwrap());
+            tx.commit().unwrap();
+        }
+
+        assert!(server(&conn, "srv-1").unwrap().is_none());
+        assert!(list_tools_for_server(&conn, "srv-1").unwrap().is_empty());
+        assert!(list_permission_rules(&conn).unwrap().is_empty());
+        assert_eq!(
+            poll_approval(&conn, "approval").unwrap(),
+            ApprovalOutcome {
+                status: ApprovalStatus::Denied,
+                remember: false,
+            }
+        );
+    }
+
+    #[test]
+    fn transactional_server_delete_중간실패는_pending과모든metadata를_rollback한다() {
+        let mut conn = test_conn();
+        let server_row = sample_server();
+        let tool = sample_tool("tool-read", "read");
+        insert_server(&conn, &server_row).unwrap();
+        insert_tool(&conn, &tool).unwrap();
+        upsert_permission_rule(&conn, "srv-1", "read", "allow", Some("hash")).unwrap();
+        insert_pending_approval(&conn, "approval", "srv-1", "read", "{}", None, 1, None).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_server_tool_delete BEFORE DELETE ON mcp_tools
+             BEGIN SELECT RAISE(ABORT, 'injected server delete failure'); END;",
+        )
+        .unwrap();
+
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert!(delete_server_in_transaction(&tx, "srv-1", 10).is_err());
+        }
+        assert_eq!(server(&conn, "srv-1").unwrap(), Some(server_row));
+        assert_eq!(list_tools_for_server(&conn, "srv-1").unwrap(), vec![tool]);
+        assert_eq!(list_permission_rules(&conn).unwrap().len(), 1);
+        assert_eq!(
+            poll_approval(&conn, "approval").unwrap().status,
+            ApprovalStatus::Pending
+        );
     }
 
     #[test]

@@ -4,11 +4,16 @@
 mod db;
 pub use db::{
     ActiveAuthorizationOwner, AgentConfigRow, AgentSessionRow, ApprovalOutcome, ApprovalStatus,
-    CredentialMeta, CredentialSecretRecord, Db, EnvApiProjectCount, EnvProfileRow, EnvValue,
-    EnvVarRow, HookSessionRow, PendingApprovalRow, PermissionRuleRow, StatuslineRow,
-    StructuredThreadRow, WebPushSubscriptionRow, WorkspaceRow,
+    CREDENTIAL_OAUTH_BINDING_BYTES_MAX, CredentialMeta, CredentialOAuthBindingRecord,
+    CredentialSecretRecord, Db, EnvApiProjectCount, EnvProfileRow, EnvValue, EnvVarRow,
+    HookSessionRow, PendingApprovalRow, PermissionRuleRow, StatuslineRow, StructuredThreadRow,
+    WebPushSubscriptionRow, WorkspaceRow,
 };
-pub use mcp_store::PendingApprovalInsert;
+pub use mcp_store::{
+    MCP_SERVER_INVENTORY_BYTES_MAX, MCP_SERVER_INVENTORY_LIMIT_MAX, MCP_TOOL_PAGE_BYTES_MAX,
+    MCP_TOOL_PAGE_LIMIT_MAX, McpServerInventoryRow, McpServerSaveOutcome, McpToolPage,
+    McpToolPageRow, PendingApprovalInsert,
+};
 
 mod logs;
 

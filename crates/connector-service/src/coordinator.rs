@@ -11,8 +11,8 @@ use connector_contract::{
     ImportOutcome, ImportReport, ImportReportItem, ImportSource, ImportSourceRequest,
     OAuthRecoveryAction, OAuthUiPhase, OAuthUiState, OperationId, OperationKind, OperationPhase,
     OperationResult, OperationSummary, RemoteTrustPrompt, RemoteTrustPurpose, ResourceLimits,
-    Revision, SensitiveInput, ServerDraft, ServerId, SlackRecoveryKind, ToolId, ToolPage,
-    TransportDraft,
+    Revision, SensitiveInput, ServerDraft, ServerId, SlackProjection, SlackRecoveryKind,
+    SlackStatus, ToolId, ToolPage, TransportDraft,
 };
 
 use crate::ports::{
@@ -942,6 +942,26 @@ struct StoredRecoveryTarget {
     url: Option<SensitiveInput>,
 }
 
+enum SlackOverlayState {
+    Transient(SlackStatus),
+    Failed {
+        recovery: Option<SlackRecoveryKind>,
+    },
+    Completed {
+        workspace_label: Option<String>,
+        can_choose_workspace: bool,
+    },
+}
+
+struct SlackProjectionOverlay {
+    operation_id: OperationId,
+    server_id: ServerId,
+    generation: u64,
+    config_revision: Revision,
+    dispatch_epoch: u64,
+    state: SlackOverlayState,
+}
+
 struct OAuthWorkerEvent {
     operation_id: OperationId,
     server_id: ServerId,
@@ -1021,6 +1041,8 @@ struct Worker {
     pending_remote: Option<PendingRemote>,
     pending_oauth: Option<PendingOAuth>,
     pending_refresh: HashMap<OperationId, PendingAfterRefresh>,
+    durable_slack: SlackProjection,
+    slack_overlay: Option<SlackProjectionOverlay>,
     slack_recovery: Option<StoredRecoveryTarget>,
     approval_order: VecDeque<OperationId>,
     operations: Vec<OperationSummary>,
@@ -1052,6 +1074,7 @@ impl Worker {
         let (oauth_event_sender, oauth_events) = sync_channel(limits.oauth_flows);
         let last_activity = clock.now();
         let snapshot = (*snapshot_cell.current()).clone();
+        let durable_slack = snapshot.slack.clone();
         let needs_initial_overview = snapshot.revision == Revision::ZERO;
         Self {
             commands,
@@ -1083,6 +1106,8 @@ impl Worker {
             pending_remote: None,
             pending_oauth: None,
             pending_refresh: HashMap::new(),
+            durable_slack,
+            slack_overlay: None,
             slack_recovery: None,
             approval_order: VecDeque::new(),
             operations: Vec::new(),
@@ -1402,7 +1427,7 @@ impl Worker {
                 }
                 let previous_revision = self.snapshot.config_revision;
                 self.snapshot.config_revision = overview.config_revision;
-                self.snapshot.slack = overview.slack;
+                self.durable_slack = overview.slack;
                 self.snapshot.servers = Arc::from(overview.servers);
                 if previous_revision != self.snapshot.config_revision {
                     self.session_trust
@@ -1431,6 +1456,128 @@ impl Worker {
                 self.publish();
             }
             Err(error) => self.publish_service_error(OperationKind::SaveServer, error),
+        }
+    }
+
+    fn set_slack_overlay(
+        &mut self,
+        operation_id: OperationId,
+        server_id: ServerId,
+        generation: u64,
+        config_revision: Revision,
+        dispatch_epoch: u64,
+        state: SlackOverlayState,
+    ) {
+        if self.durable_slack.server_id.as_ref() != Some(&server_id) {
+            return;
+        }
+        self.slack_overlay = Some(SlackProjectionOverlay {
+            operation_id,
+            server_id,
+            generation,
+            config_revision,
+            dispatch_epoch,
+            state,
+        });
+    }
+
+    fn clear_slack_overlay_for(&mut self, operation_id: &OperationId) {
+        if self
+            .slack_overlay
+            .as_ref()
+            .is_some_and(|overlay| &overlay.operation_id == operation_id)
+        {
+            self.slack_overlay = None;
+            if self
+                .slack_recovery
+                .as_ref()
+                .is_some_and(|target| &target.operation_id == operation_id)
+            {
+                self.slack_recovery = None;
+            }
+        }
+    }
+
+    fn slack_overlay_is_current(&self, overlay: &SlackProjectionOverlay) -> bool {
+        let common = self.durable_slack.server_id.as_ref() == Some(&overlay.server_id)
+            && self.snapshot.config_revision == overlay.config_revision
+            && self.current_dispatch_epoch == overlay.dispatch_epoch
+            && self.dispatch_epoch.load(Ordering::Acquire) == overlay.dispatch_epoch
+            && self
+                .generations
+                .get(&overlay.server_id)
+                .copied()
+                .unwrap_or_default()
+                == overlay.generation;
+        if !common {
+            return false;
+        }
+        match overlay.state {
+            SlackOverlayState::Transient(_) => {
+                self.jobs.get(&overlay.operation_id).is_some_and(|job| {
+                    matches!(
+                        job.stage,
+                        JobStage::OAuthDiscover | JobStage::OAuthAuthorize
+                    ) && job.server_id == overlay.server_id
+                        && job.generation == overlay.generation
+                        && job.config_revision == overlay.config_revision
+                        && job.dispatch_epoch == overlay.dispatch_epoch
+                        && !job.cancellation.is_cancelled()
+                }) || self.pending_oauth.as_ref().is_some_and(|pending| {
+                    pending.operation_id == overlay.operation_id
+                        && pending.server_id == overlay.server_id
+                        && pending.generation == overlay.generation
+                        && pending.config_revision == overlay.config_revision
+                        && pending.dispatch_epoch == overlay.dispatch_epoch
+                }) || self.snapshot.oauth.as_ref().is_some_and(|oauth| {
+                    oauth.operation_id == overlay.operation_id
+                        && oauth.server_id == overlay.server_id
+                        && oauth.config_revision == overlay.config_revision
+                })
+            }
+            SlackOverlayState::Failed { .. } | SlackOverlayState::Completed { .. } => true,
+        }
+    }
+
+    fn apply_slack_projection(&mut self) {
+        let valid = self
+            .slack_overlay
+            .as_ref()
+            .is_some_and(|overlay| self.slack_overlay_is_current(overlay));
+        if self.slack_overlay.is_some() && !valid {
+            let stale_operation = self
+                .slack_overlay
+                .take()
+                .map(|overlay| overlay.operation_id);
+            if stale_operation.as_ref().is_some_and(|operation_id| {
+                self.slack_recovery
+                    .as_ref()
+                    .is_some_and(|target| &target.operation_id == operation_id)
+            }) {
+                self.slack_recovery = None;
+            }
+        }
+        self.snapshot.slack = self.durable_slack.clone();
+        let Some(overlay) = self.slack_overlay.as_ref() else {
+            return;
+        };
+        match &overlay.state {
+            SlackOverlayState::Transient(status) => {
+                self.snapshot.slack.status = *status;
+                self.snapshot.slack.recovery = None;
+            }
+            SlackOverlayState::Failed { recovery } => {
+                self.snapshot.slack.status = SlackStatus::Failed;
+                self.snapshot.slack.recovery = *recovery;
+            }
+            SlackOverlayState::Completed {
+                workspace_label,
+                can_choose_workspace,
+            } => {
+                self.snapshot.slack.workspace_label = workspace_label.clone();
+                self.snapshot.slack.can_choose_workspace = *can_choose_workspace;
+                self.snapshot.slack.recovery = None;
+            }
         }
     }
 
@@ -1663,7 +1810,7 @@ impl Worker {
                 return;
             }
         };
-        if plan.servers.len() > self.limits.import_servers {
+        if plan.candidates.len() > self.limits.import_servers {
             self.publish_operation_error(
                 operation_id,
                 OperationKind::Import,
@@ -1672,7 +1819,7 @@ impl Worker {
             );
             return;
         }
-        if let Err(error) = validate_server_drafts(&plan.servers, self.limits) {
+        if let Err(error) = validate_import_candidates(&plan.candidates, self.limits) {
             self.publish_operation_error(
                 operation_id,
                 OperationKind::Import,
@@ -1681,7 +1828,9 @@ impl Worker {
             );
             return;
         }
-        if let Err(error) = validate_import_report_items(&plan.report, self.limits) {
+        if let Err(error) =
+            validate_complete_import_report(&plan.report, &plan.candidates, self.limits)
+        {
             self.publish_operation_error(
                 operation_id,
                 OperationKind::Import,
@@ -1691,23 +1840,33 @@ impl Worker {
             return;
         }
         let mut report_items = plan.report;
-        let added_servers = plan.servers.len();
-        for server in &plan.servers {
+        let candidate_report_start = report_items.len();
+        let candidate_count = plan.candidates.len();
+        for candidate in &plan.candidates {
             report_items.push(ImportReportItem {
-                name: server.name.clone(),
+                name: candidate.draft.name.clone(),
                 outcome: ImportOutcome::Added,
                 error_code: None,
-                omitted_secret_env_count: 0,
+                omitted_secret_env_count: candidate.omitted_secret_env_count,
             });
         }
-        let (report_items, truncated) = bound_import_report(report_items, self.limits);
+        let servers = plan
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.draft)
+            .collect();
         match self
             .repository
-            .import_servers(self.snapshot.config_revision, plan.servers)
+            .import_servers(self.snapshot.config_revision, servers)
         {
             Ok(RepositoryCas::Committed { .. }) => {}
             Ok(RepositoryCas::Stale { .. }) => {
+                mark_import_candidates_failed(
+                    &mut report_items[candidate_report_start..],
+                    ErrorCode::StaleResult,
+                );
                 self.reload_overview();
+                self.set_import_report(operation_id.clone(), source, 0, report_items);
                 self.publish_operation_error(
                     operation_id,
                     OperationKind::Import,
@@ -1717,6 +1876,11 @@ impl Worker {
                 return;
             }
             Err(error) => {
+                mark_import_candidates_failed(
+                    &mut report_items[candidate_report_start..],
+                    error.code,
+                );
+                self.set_import_report(operation_id.clone(), source, 0, report_items);
                 self.publish_operation_error(
                     operation_id,
                     OperationKind::Import,
@@ -1726,7 +1890,19 @@ impl Worker {
                 return;
             }
         }
-        let skipped = report_items
+        self.set_import_report(operation_id, source, candidate_count, report_items);
+        self.transition(OperationKind::Import, OperationPhase::Succeeded, None);
+        self.reload_overview();
+    }
+
+    fn set_import_report(
+        &mut self,
+        operation_id: OperationId,
+        source: ImportSource,
+        added: usize,
+        items: Vec<ImportReportItem>,
+    ) {
+        let skipped = items
             .iter()
             .filter(|item| {
                 matches!(
@@ -1735,21 +1911,19 @@ impl Worker {
                 )
             })
             .count();
-        let failed = report_items
+        let failed = items
             .iter()
             .filter(|item| item.outcome == ImportOutcome::Failed)
             .count();
         self.snapshot.import_report = Some(ImportReport {
             operation_id,
             source,
-            added: added_servers,
+            added,
             skipped,
             failed,
-            items: Arc::from(report_items),
-            truncated,
+            items: Arc::from(items),
+            truncated: false,
         });
-        self.transition(OperationKind::Import, OperationPhase::Succeeded, None);
-        self.reload_overview();
     }
 
     fn remote_after_trust(
@@ -2730,15 +2904,25 @@ impl Worker {
                 });
                 unparker.unpark();
             });
-        let _ = self.insert_job(
-            operation_id,
-            server_id,
+        if self.insert_job(
+            operation_id.clone(),
+            server_id.clone(),
             generation,
             config_revision,
             JobStage::OAuthDiscover,
             cancellation,
             thread,
-        );
+        ) {
+            self.set_slack_overlay(
+                operation_id,
+                server_id,
+                generation,
+                config_revision,
+                dispatch_epoch,
+                SlackOverlayState::Transient(SlackStatus::Checking),
+            );
+            self.publish();
+        }
     }
 
     fn spawn_oauth_authorize(
@@ -2819,15 +3003,25 @@ impl Worker {
                 });
                 unparker.unpark();
             });
-        let _ = self.insert_job(
-            operation_id,
-            server_id,
+        if self.insert_job(
+            operation_id.clone(),
+            server_id.clone(),
             generation,
             config_revision,
             JobStage::OAuthAuthorize,
             cancellation,
             thread,
-        );
+        ) {
+            self.set_slack_overlay(
+                operation_id,
+                server_id,
+                generation,
+                config_revision,
+                dispatch_epoch,
+                SlackOverlayState::Transient(SlackStatus::NeedsAuthorization),
+            );
+            self.publish();
+        }
     }
 
     fn resolve_oauth_consent(
@@ -2851,6 +3045,7 @@ impl Worker {
         };
         if !accepted {
             self.snapshot.oauth = None;
+            self.clear_slack_overlay_for(&operation_id);
             self.finish_oauth_operation(
                 &operation_id,
                 OperationPhase::Denied,
@@ -3024,6 +3219,9 @@ impl Worker {
         phase: OperationPhase,
         error_code: Option<ErrorCode>,
     ) {
+        if matches!(phase, OperationPhase::Cancelled | OperationPhase::Denied) {
+            self.clear_slack_overlay_for(operation_id);
+        }
         self.host_actions.remove_dynamic_for_operation(operation_id);
         let before = self.operations.len();
         self.operations
@@ -3060,18 +3258,35 @@ impl Worker {
     }
 
     fn open_slack_recovery(&mut self, server_id: ServerId, kind: SlackRecoveryKind) {
-        let Some(target) = self.slack_recovery.take() else {
+        let exact = self
+            .slack_recovery
+            .as_ref()
+            .is_some_and(|target| target.server_id == server_id && target.kind == kind);
+        if !exact {
+            if self.slack_recovery.is_some() {
+                self.metrics.stale_results.fetch_add(1, Ordering::AcqRel);
+                return;
+            }
             self.publish_error(
                 OperationKind::OAuth,
                 ErrorCode::HostUnavailable,
                 "Slack recovery action is unavailable",
             );
             return;
-        };
-        if target.server_id != server_id || target.kind != kind {
-            self.metrics.stale_results.fetch_add(1, Ordering::AcqRel);
-            return;
         }
+        let target = self
+            .slack_recovery
+            .take()
+            .expect("validated Slack recovery target");
+        if let Some(overlay) = self
+            .slack_overlay
+            .as_mut()
+            .filter(|overlay| overlay.operation_id == target.operation_id)
+            && let SlackOverlayState::Failed { recovery } = &mut overlay.state
+        {
+            *recovery = None;
+        }
+        self.publish();
         if let Err(error) = self.host_actions.push(HostAction::OpenSlackRecovery {
             operation_id: target.operation_id,
             server_id,
@@ -3218,7 +3433,14 @@ impl Worker {
             }
             (JobStage::OAuthDiscover, JobPayload::OAuthDiscover(result)) => {
                 if stale {
-                    self.snapshot.oauth = None;
+                    if self
+                        .snapshot
+                        .oauth
+                        .as_ref()
+                        .is_some_and(|state| state.operation_id == completion.operation_id)
+                    {
+                        self.snapshot.oauth = None;
+                    }
                     self.finish_oauth_operation(
                         &completion.operation_id,
                         OperationPhase::Cancelled,
@@ -3238,7 +3460,14 @@ impl Worker {
             }
             (JobStage::OAuthAuthorize, JobPayload::OAuthAuthorize(result)) => {
                 if stale {
-                    self.snapshot.oauth = None;
+                    if self
+                        .snapshot
+                        .oauth
+                        .as_ref()
+                        .is_some_and(|state| state.operation_id == completion.operation_id)
+                    {
+                        self.snapshot.oauth = None;
+                    }
                     self.finish_oauth_operation(
                         &completion.operation_id,
                         OperationPhase::Cancelled,
@@ -4200,7 +4429,7 @@ impl Worker {
             Err(error) => {
                 self.snapshot.oauth = Some(OAuthUiState {
                     operation_id: operation_id.clone(),
-                    server_id,
+                    server_id: server_id.clone(),
                     server_name: "OAuth".to_owned(),
                     config_revision,
                     phase: OAuthUiPhase::Failed {
@@ -4208,6 +4437,14 @@ impl Worker {
                         recovery: Arc::from([OAuthRecoveryAction::Retry]),
                     },
                 });
+                self.set_slack_overlay(
+                    operation_id.clone(),
+                    server_id,
+                    generation,
+                    config_revision,
+                    dispatch_epoch,
+                    SlackOverlayState::Failed { recovery: None },
+                );
                 self.finish_oauth_operation(
                     &operation_id,
                     OperationPhase::Failed,
@@ -4218,6 +4455,14 @@ impl Worker {
         };
         if let Err(error) = validate_oauth_discovery(&discovery, self.limits) {
             self.snapshot.oauth = None;
+            self.set_slack_overlay(
+                operation_id.clone(),
+                server_id,
+                generation,
+                config_revision,
+                dispatch_epoch,
+                SlackOverlayState::Failed { recovery: None },
+            );
             self.finish_oauth_operation(&operation_id, OperationPhase::Failed, Some(error.code));
             return;
         }
@@ -4241,7 +4486,7 @@ impl Worker {
         });
         self.snapshot.oauth = Some(OAuthUiState {
             operation_id: operation_id.clone(),
-            server_id,
+            server_id: server_id.clone(),
             server_name,
             config_revision,
             phase: OAuthUiPhase::AwaitingConsent {
@@ -4250,6 +4495,14 @@ impl Worker {
                 scopes,
             },
         });
+        self.set_slack_overlay(
+            operation_id.clone(),
+            server_id,
+            generation,
+            config_revision,
+            dispatch_epoch,
+            SlackOverlayState::Transient(SlackStatus::NeedsAuthorization),
+        );
         self.update_operation_phase(&operation_id, OperationPhase::AwaitingConsent, None);
         self.transition(OperationKind::OAuth, OperationPhase::AwaitingConsent, None);
         self.publish();
@@ -4279,13 +4532,29 @@ impl Worker {
             OAuthAuthorizeOutput::Completed(completion) => {
                 let workspace_label = completion.workspace_label.clone();
                 let can_choose_workspace = completion.can_choose_workspace;
+                if workspace_label.as_ref().is_some_and(|label| {
+                    label.len() > self.limits.import_report_bytes || label.contains('\0')
+                }) {
+                    self.apply_oauth_failure(
+                        operation_id,
+                        server_id,
+                        generation,
+                        config_revision,
+                        dispatch_epoch,
+                        OAuthFailure {
+                            error_code: ErrorCode::LimitExceeded,
+                            recovery: Vec::new(),
+                        },
+                    );
+                    return;
+                }
                 let committed_revision =
                     match self.publish_oauth_credential(&server_id, config_revision, *completion) {
                         Ok(revision) => revision,
                         Err(error) => {
                             self.snapshot.oauth = Some(OAuthUiState {
                                 operation_id: operation_id.clone(),
-                                server_id,
+                                server_id: server_id.clone(),
                                 server_name: "OAuth".to_owned(),
                                 config_revision,
                                 phase: OAuthUiPhase::Failed {
@@ -4293,6 +4562,14 @@ impl Worker {
                                     recovery: Arc::from([OAuthRecoveryAction::Retry]),
                                 },
                             });
+                            self.set_slack_overlay(
+                                operation_id.clone(),
+                                server_id,
+                                generation,
+                                config_revision,
+                                dispatch_epoch,
+                                SlackOverlayState::Failed { recovery: None },
+                            );
                             self.finish_oauth_operation(
                                 &operation_id,
                                 OperationPhase::Failed,
@@ -4309,11 +4586,17 @@ impl Worker {
                     .retain_revision(committed_revision);
                 self.snapshot.oauth = None;
                 self.slack_recovery = None;
-                if self.snapshot.slack.server_id.as_ref() == Some(&server_id) {
-                    self.snapshot.slack.workspace_label = workspace_label;
-                    self.snapshot.slack.can_choose_workspace = can_choose_workspace;
-                    self.snapshot.slack.recovery = None;
-                }
+                self.set_slack_overlay(
+                    operation_id.clone(),
+                    server_id,
+                    generation,
+                    committed_revision,
+                    dispatch_epoch,
+                    SlackOverlayState::Completed {
+                        workspace_label,
+                        can_choose_workspace,
+                    },
+                );
                 self.finish_oauth_operation(&operation_id, OperationPhase::Succeeded, None);
                 self.reload_overview();
             }
@@ -4346,7 +4629,7 @@ impl Worker {
                 });
                 self.snapshot.oauth = Some(OAuthUiState {
                     operation_id: operation_id.clone(),
-                    server_id,
+                    server_id: server_id.clone(),
                     server_name,
                     config_revision,
                     phase: OAuthUiPhase::AwaitingClient {
@@ -4354,12 +4637,27 @@ impl Worker {
                         workspace_hint: request.workspace_hint,
                     },
                 });
+                self.set_slack_overlay(
+                    operation_id.clone(),
+                    server_id,
+                    generation,
+                    config_revision,
+                    dispatch_epoch,
+                    SlackOverlayState::Transient(SlackStatus::NeedsAuthorization),
+                );
                 self.update_operation_phase(&operation_id, OperationPhase::AwaitingClient, None);
                 self.transition(OperationKind::OAuth, OperationPhase::AwaitingClient, None);
                 self.publish();
             }
             OAuthAuthorizeOutput::Failed(failure) => {
-                self.apply_oauth_failure(operation_id, server_id, config_revision, failure);
+                self.apply_oauth_failure(
+                    operation_id,
+                    server_id,
+                    generation,
+                    config_revision,
+                    dispatch_epoch,
+                    failure,
+                );
             }
         }
     }
@@ -4493,10 +4791,13 @@ impl Worker {
         &mut self,
         operation_id: OperationId,
         server_id: ServerId,
+        generation: u64,
         config_revision: Revision,
+        dispatch_epoch: u64,
         failure: OAuthFailure,
     ) {
         let mut recovery_actions = Vec::new();
+        let mut slack_recovery_kind = None;
         self.slack_recovery = None;
         for target in failure.recovery.into_iter().take(4) {
             if target
@@ -4519,7 +4820,7 @@ impl Worker {
                     kind: target.kind,
                     url: target.url,
                 });
-                self.snapshot.slack.recovery = Some(target.kind);
+                slack_recovery_kind = Some(target.kind);
             }
             if !recovery_actions.contains(&action) {
                 recovery_actions.push(action);
@@ -4535,7 +4836,7 @@ impl Worker {
             .map_or_else(|| "OAuth".to_owned(), |state| state.server_name.clone());
         self.snapshot.oauth = Some(OAuthUiState {
             operation_id: operation_id.clone(),
-            server_id,
+            server_id: server_id.clone(),
             server_name,
             config_revision,
             phase: OAuthUiPhase::Failed {
@@ -4543,6 +4844,16 @@ impl Worker {
                 recovery: Arc::from(recovery_actions),
             },
         });
+        self.set_slack_overlay(
+            operation_id.clone(),
+            server_id,
+            generation,
+            config_revision,
+            dispatch_epoch,
+            SlackOverlayState::Failed {
+                recovery: slack_recovery_kind,
+            },
+        );
         self.finish_oauth_operation(
             &operation_id,
             OperationPhase::Failed,
@@ -4563,6 +4874,9 @@ impl Worker {
                 self.remove_pending_invocation(&operation_id);
             }
             self.bump_generation(&server_id);
+            if matches!(stage, JobStage::OAuthDiscover | JobStage::OAuthAuthorize) {
+                self.clear_slack_overlay_for(&operation_id);
+            }
             match stage {
                 JobStage::Discover | JobStage::InvokeSchema | JobStage::InvokeCall => {
                     self.mcp.cancel(&operation_id);
@@ -4744,6 +5058,10 @@ impl Worker {
     }
 
     fn publish(&mut self) {
+        // Every publication revalidates the one bounded transient projection. This makes
+        // generation/config/dispatch invalidation immediate even when the triggering command
+        // does not reload the durable overview.
+        self.apply_slack_projection();
         self.snapshot.operations = Arc::from(self.operations.clone());
         self.snapshot.diagnostics = DiagnosticsSnapshot {
             command_queue_depth: self.metrics.queue_depth.load(Ordering::Acquire),
@@ -4943,16 +5261,41 @@ fn validate_tool_page(
     Ok(())
 }
 
-fn validate_server_drafts(
-    drafts: &[ServerDraft],
+fn validate_import_candidates(
+    candidates: &[crate::ImportCandidate],
     limits: ResourceLimits,
 ) -> Result<(), ServiceError> {
     let mut bytes = 0usize;
     let mut items = 0usize;
-    for draft in drafts {
-        let (draft_bytes, draft_items) = server_draft_size(draft)?;
+    let mut omitted_secret_env_count = 0usize;
+    for candidate in candidates {
+        validate_server_draft(&candidate.draft, limits)?;
+        if candidate.omitted_secret_env_count > limits.tools_per_server {
+            return Err(ServiceError::new(
+                ErrorCode::LimitExceeded,
+                "import omitted-secret count limit exceeded",
+            ));
+        }
+        omitted_secret_env_count =
+            checked_add(omitted_secret_env_count, candidate.omitted_secret_env_count)?;
+        let (draft_bytes, draft_items) = server_draft_size(&candidate.draft)?;
         bytes = add_bounded(bytes, draft_bytes, limits.import_input_bytes)?;
         items = add_bounded(items, draft_items, limits.tools_per_server)?;
+    }
+    let omitted_ceiling = limits
+        .import_servers
+        .checked_mul(limits.tools_per_server)
+        .ok_or_else(|| {
+            ServiceError::new(
+                ErrorCode::LimitExceeded,
+                "import omitted-secret count overflow",
+            )
+        })?;
+    if omitted_secret_env_count > omitted_ceiling {
+        return Err(ServiceError::new(
+            ErrorCode::LimitExceeded,
+            "import omitted-secret count limit exceeded",
+        ));
     }
     Ok(())
 }
@@ -5157,28 +5500,57 @@ fn validate_import_report_items(
     Ok(())
 }
 
-fn bound_import_report(
-    items: Vec<ImportReportItem>,
+fn validate_complete_import_report(
+    parser_items: &[ImportReportItem],
+    candidates: &[crate::ImportCandidate],
     limits: ResourceLimits,
-) -> (Vec<ImportReportItem>, bool) {
-    let original_len = items.len();
-    let mut retained = Vec::with_capacity(original_len.min(limits.import_report_items));
-    let mut bytes = 0usize;
-    for item in items {
-        let Some(next_bytes) = bytes
-            .checked_add(item.name.len())
-            .and_then(|n| n.checked_add(32))
-        else {
-            return (retained, true);
-        };
-        if retained.len() >= limits.import_report_items || next_bytes > limits.import_report_bytes {
-            return (retained, true);
-        }
-        bytes = next_bytes;
-        retained.push(item);
+) -> Result<(), ServiceError> {
+    validate_import_report_items(parser_items, limits)?;
+    if parser_items
+        .iter()
+        .any(|item| item.outcome == ImportOutcome::Added)
+    {
+        return Err(ServiceError::new(
+            ErrorCode::InvalidInput,
+            "import parser report contains a persisted outcome",
+        ));
     }
-    let truncated = retained.len() < original_len;
-    (retained, truncated)
+    let total_items = parser_items
+        .len()
+        .checked_add(candidates.len())
+        .ok_or_else(|| {
+            ServiceError::new(
+                ErrorCode::LimitExceeded,
+                "import report item count overflow",
+            )
+        })?;
+    if total_items > limits.import_report_items {
+        return Err(ServiceError::new(
+            ErrorCode::LimitExceeded,
+            "import report item limit exceeded",
+        ));
+    }
+    let mut bytes = 0usize;
+    for item in parser_items {
+        bytes = add_bounded(bytes, item.name.len(), limits.import_report_bytes)?;
+        bytes = add_bounded(bytes, 32, limits.import_report_bytes)?;
+    }
+    for candidate in candidates {
+        bytes = add_bounded(
+            bytes,
+            candidate.draft.name.len(),
+            limits.import_report_bytes,
+        )?;
+        bytes = add_bounded(bytes, 32, limits.import_report_bytes)?;
+    }
+    Ok(())
+}
+
+fn mark_import_candidates_failed(items: &mut [ImportReportItem], error_code: ErrorCode) {
+    for item in items {
+        item.outcome = ImportOutcome::Failed;
+        item.error_code = Some(error_code);
+    }
 }
 
 fn purpose_kind(purpose: RemoteTrustPurpose) -> OperationKind {
@@ -5341,6 +5713,11 @@ mod tests {
         slack_ensures: AtomicUsize,
         config_revision: AtomicU64,
         import_server_count: AtomicUsize,
+        import_omitted_secret_counts: Mutex<Vec<usize>>,
+        import_parser_report: Mutex<Vec<ImportReportItem>>,
+        import_stale_once: AtomicBool,
+        import_error_once: AtomicBool,
+        imported_server_names: Mutex<Vec<String>>,
         server_loads: AtomicUsize,
         authorization_loads: AtomicUsize,
         preflights: AtomicUsize,
@@ -5357,6 +5734,7 @@ mod tests {
         authorization_ledger: audit::InMemoryAuthorizationLedger,
         oauth_slot: Mutex<Option<secret::PhysicalSecretSlot>>,
         http_auth: Mutex<Option<crate::HttpAuthBinding>>,
+        slack_projection_override: Mutex<Option<SlackProjection>>,
         order: Arc<Mutex<Vec<&'static str>>>,
     }
 
@@ -5370,6 +5748,11 @@ mod tests {
                 slack_ensures: AtomicUsize::new(0),
                 config_revision: AtomicU64::new(1),
                 import_server_count: AtomicUsize::new(1),
+                import_omitted_secret_counts: Mutex::new(Vec::new()),
+                import_parser_report: Mutex::new(Vec::new()),
+                import_stale_once: AtomicBool::new(false),
+                import_error_once: AtomicBool::new(false),
+                imported_server_names: Mutex::new(Vec::new()),
                 server_loads: AtomicUsize::new(0),
                 authorization_loads: AtomicUsize::new(0),
                 preflights: AtomicUsize::new(0),
@@ -5389,6 +5772,7 @@ mod tests {
                 .expect("authorization ledger"),
                 oauth_slot: Mutex::new(None),
                 http_auth: Mutex::new(None),
+                slack_projection_override: Mutex::new(None),
                 order: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -5439,9 +5823,13 @@ mod tests {
 
     impl ConnectorRepository for FakeRepository {
         fn load_overview(&mut self) -> Result<crate::OverviewData, ServiceError> {
-            Ok(crate::OverviewData {
-                config_revision: self.revision(),
-                slack: SlackProjection {
+            let slack = self
+                .state
+                .slack_projection_override
+                .lock()
+                .expect("Slack projection override lock")
+                .clone()
+                .unwrap_or_else(|| SlackProjection {
                     server_id: (self.state.slack_ensures.load(Ordering::Acquire) != 0)
                         .then(|| ServerId::new("server-1")),
                     status: if self.state.slack_ensures.load(Ordering::Acquire) == 0 {
@@ -5450,8 +5838,17 @@ mod tests {
                         SlackStatus::Ready
                     },
                     ..SlackProjection::default()
-                },
-                servers: vec![server_summary("server-1"), server_summary("server-2")],
+                });
+            let mut servers = vec![server_summary("server-1"), server_summary("server-2")];
+            if let Some(slack_server_id) = slack.server_id.as_ref()
+                && !servers.iter().any(|server| server.id == *slack_server_id)
+            {
+                servers.push(server_summary(slack_server_id.as_str()));
+            }
+            Ok(crate::OverviewData {
+                config_revision: self.revision(),
+                slack,
+                servers,
             })
         }
 
@@ -5606,23 +6003,61 @@ mod tests {
             _bytes: &[u8],
         ) -> Result<crate::ImportPlan, ServiceError> {
             self.state.parses.fetch_add(1, Ordering::AcqRel);
-            let count = self.state.import_server_count.load(Ordering::Acquire);
+            let omitted_counts = self
+                .state
+                .import_omitted_secret_counts
+                .lock()
+                .expect("import omitted counts lock")
+                .clone();
+            let count = if omitted_counts.is_empty() {
+                self.state.import_server_count.load(Ordering::Acquire)
+            } else {
+                omitted_counts.len()
+            };
             Ok(crate::ImportPlan {
-                servers: (0..count)
-                    .map(|index| server_draft(&format!("import-{index}")))
+                candidates: (0..count)
+                    .map(|index| crate::ImportCandidate {
+                        draft: server_draft(&format!("import-{index}")),
+                        omitted_secret_env_count: omitted_counts
+                            .get(index)
+                            .copied()
+                            .unwrap_or_default(),
+                    })
                     .collect(),
-                report: Vec::new(),
+                report: self
+                    .state
+                    .import_parser_report
+                    .lock()
+                    .expect("import parser report lock")
+                    .clone(),
             })
         }
 
         fn import_servers(
             &mut self,
             expected_revision: Revision,
-            _servers: Vec<ServerDraft>,
+            servers: Vec<ServerDraft>,
         ) -> Result<RepositoryCas<()>, ServiceError> {
+            if self.state.import_error_once.swap(false, Ordering::AcqRel) {
+                return Err(ServiceError::new(
+                    ErrorCode::StorageUnavailable,
+                    "fixture import transaction failed",
+                ));
+            }
+            if self.state.import_stale_once.swap(false, Ordering::AcqRel) {
+                return Ok(RepositoryCas::Stale {
+                    current_revision: self.mutate(),
+                });
+            }
             let result = self.mutate_if(expected_revision);
             if matches!(result, RepositoryCas::Committed { .. }) {
                 self.state.imports.fetch_add(1, Ordering::AcqRel);
+                *self
+                    .state
+                    .imported_server_names
+                    .lock()
+                    .expect("imported server names lock") =
+                    servers.into_iter().map(|server| server.name).collect();
             }
             Ok(result)
         }
@@ -6226,6 +6661,8 @@ mod tests {
     struct FakeOAuth {
         gate: Arc<Gate>,
         after_callback_gate: Mutex<Option<Arc<Gate>>>,
+        choose_workspace_requested: AtomicBool,
+        fail_authorize_with_recovery: AtomicBool,
         active: AtomicUsize,
         peak: AtomicUsize,
     }
@@ -6235,6 +6672,8 @@ mod tests {
             Self {
                 gate,
                 after_callback_gate: Mutex::new(None),
+                choose_workspace_requested: AtomicBool::new(false),
+                fail_authorize_with_recovery: AtomicBool::new(false),
                 active: AtomicUsize::new(0),
                 peak: AtomicUsize::new(0),
             }
@@ -6252,11 +6691,13 @@ mod tests {
             &self,
             _operation_id: &OperationId,
             _server: ServerDraft,
-            _choose_workspace: bool,
+            choose_workspace: bool,
             _stored_client: Option<StoredOAuthClient>,
             cancellation: CancellationToken,
         ) -> Result<OAuthDiscovery, ServiceError> {
             let _active = self.enter();
+            self.choose_workspace_requested
+                .store(choose_workspace, Ordering::Release);
             self.gate.wait();
             if cancellation.is_cancelled() {
                 return Err(ServiceError::new(
@@ -6290,6 +6731,17 @@ mod tests {
                     ErrorCode::Cancelled,
                     "OAuth authorization cancelled",
                 ));
+            }
+            if self.fail_authorize_with_recovery.load(Ordering::Acquire) {
+                return Ok(OAuthAuthorizeOutput::Failed(OAuthFailure {
+                    error_code: ErrorCode::AuthenticationFailed,
+                    recovery: vec![OAuthRecoveryTarget {
+                        kind: SlackRecoveryKind::EnableMcpAccess,
+                        url: Some(SensitiveInput::from(
+                            "https://slack.invalid/mcp-settings".to_owned(),
+                        )),
+                    }],
+                }));
             }
             events.callback_bound(SensitiveInput::from(
                 "https://auth.invalid/authorize?state=REDACTED".to_owned(),
@@ -6344,7 +6796,11 @@ mod tests {
                         })?,
                         masked_hint: Some("****ture".to_owned()),
                     },
-                    workspace_label: workspace,
+                    workspace_label: workspace.or_else(|| {
+                        self.choose_workspace_requested
+                            .load(Ordering::Acquire)
+                            .then(|| "fixture-workspace".to_owned())
+                    }),
                     can_choose_workspace: true,
                 },
             )))
@@ -6467,6 +6923,29 @@ mod tests {
         }
     }
 
+    fn configure_slack_fixture(fixture: &Fixture, status: SlackStatus) {
+        *fixture
+            .repo
+            .loaded_server_override
+            .lock()
+            .expect("server override lock") = Some(http_server_draft(
+            "oauth-server-1",
+            "https://mcp.example.test/mcp",
+        ));
+        *fixture
+            .repo
+            .slack_projection_override
+            .lock()
+            .expect("Slack projection override lock") = Some(SlackProjection {
+            server_id: Some(ServerId::new("oauth-server-1")),
+            status,
+            tool_count: 0,
+            workspace_label: None,
+            can_choose_workspace: false,
+            recovery: None,
+        });
+    }
+
     fn oauth_metadata(
         server_id: &str,
         server_url: &str,
@@ -6508,6 +6987,19 @@ mod tests {
             .remote_trust
             .clone()
             .expect("remote trust prompt")
+    }
+
+    fn accept_pending_remote_trust(fixture: &Fixture) {
+        let trust = wait_for_remote_trust(&fixture.coordinator);
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::ResolveRemoteTrust {
+                operation_id: trust.operation_id,
+                config_revision: trust.config_revision,
+                endpoint_fingerprint: trust.endpoint_fingerprint,
+                accepted: true,
+            })
+            .unwrap();
     }
 
     fn remote_discover_fixture(server_id: &str) -> (Fixture, RemoteTrustPrompt) {
@@ -7333,6 +7825,252 @@ mod tests {
             assert_remote_reservation_released(&fixture);
             assert!(fixture.coordinator.current_snapshot().oauth.is_none());
         }
+    }
+
+    #[test]
+    fn slack_transient_survives_unrelated_reload_and_cancel_restores_durable_state() {
+        let oauth_gate = Arc::new(Gate::closed());
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::clone(&oauth_gate),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        configure_slack_fixture(&fixture, SlackStatus::Ready);
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::BeginOAuth(ServerId::new("oauth-server-1")))
+            .unwrap();
+        accept_pending_remote_trust(&fixture);
+        wait_until(|| fixture.coordinator.current_snapshot().slack.status == SlackStatus::Checking);
+        let operation_id = fixture
+            .coordinator
+            .current_snapshot()
+            .operations
+            .iter()
+            .find(|operation| operation.kind == OperationKind::OAuth)
+            .expect("active OAuth operation")
+            .id
+            .clone();
+        let before_reload = fixture.coordinator.current_snapshot().revision;
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Activate)
+            .unwrap();
+        wait_until(|| fixture.coordinator.current_snapshot().revision != before_reload);
+        assert_eq!(
+            fixture.coordinator.current_snapshot().slack.status,
+            SlackStatus::Checking
+        );
+
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Cancel(operation_id))
+            .unwrap();
+        wait_until(|| {
+            fixture.coordinator.current_snapshot().slack.status == SlackStatus::Ready
+                && fixture.coordinator.metrics().active_oauth_flows == 0
+        });
+        assert!(fixture.coordinator.current_snapshot().oauth.is_none());
+    }
+
+    #[test]
+    fn slack_workspace_choice_survives_completion_reload_while_durable_status_wins() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        configure_slack_fixture(&fixture, SlackStatus::Connected);
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::ChooseSlackWorkspace(ServerId::new(
+                "oauth-server-1",
+            )))
+            .unwrap();
+        accept_pending_remote_trust(&fixture);
+        wait_until(|| {
+            fixture
+                .coordinator
+                .current_snapshot()
+                .oauth
+                .as_ref()
+                .is_some_and(|state| matches!(state.phase, OAuthUiPhase::AwaitingConsent { .. }))
+        });
+        let oauth = fixture
+            .coordinator
+            .current_snapshot()
+            .oauth
+            .clone()
+            .expect("OAuth consent");
+        assert_eq!(
+            fixture.coordinator.current_snapshot().slack.status,
+            SlackStatus::NeedsAuthorization
+        );
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::ResolveOAuthConsent {
+                operation_id: oauth.operation_id,
+                config_revision: oauth.config_revision,
+                accepted: true,
+            })
+            .unwrap();
+        wait_until(|| {
+            let snapshot = fixture.coordinator.current_snapshot();
+            snapshot.config_revision == Revision(2)
+                && snapshot.oauth.is_none()
+                && fixture.coordinator.metrics().active_oauth_flows == 0
+        });
+        let completed = fixture.coordinator.current_snapshot();
+        assert_eq!(completed.slack.status, SlackStatus::Connected);
+        assert_eq!(
+            completed.slack.workspace_label.as_deref(),
+            Some("fixture-workspace")
+        );
+        assert!(completed.slack.can_choose_workspace);
+
+        let before_reload = completed.revision;
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Activate)
+            .unwrap();
+        wait_until(|| fixture.coordinator.current_snapshot().revision != before_reload);
+        let reloaded = fixture.coordinator.current_snapshot();
+        assert_eq!(reloaded.slack.status, SlackStatus::Connected);
+        assert_eq!(
+            reloaded.slack.workspace_label.as_deref(),
+            Some("fixture-workspace")
+        );
+        assert!(reloaded.slack.can_choose_workspace);
+    }
+
+    #[test]
+    fn slack_config_invalidation_clears_transient_and_stale_result_cannot_restore_it() {
+        let oauth_gate = Arc::new(Gate::closed());
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::clone(&oauth_gate),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        configure_slack_fixture(&fixture, SlackStatus::Ready);
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::BeginOAuth(ServerId::new("oauth-server-1")))
+            .unwrap();
+        accept_pending_remote_trust(&fixture);
+        wait_until(|| fixture.coordinator.current_snapshot().slack.status == SlackStatus::Checking);
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::SaveServer(server_draft("server-1")))
+            .unwrap();
+        wait_until(|| {
+            let snapshot = fixture.coordinator.current_snapshot();
+            snapshot.config_revision == Revision(2) && snapshot.slack.status == SlackStatus::Ready
+        });
+
+        oauth_gate.release();
+        wait_until(|| fixture.coordinator.metrics().active_oauth_flows == 0);
+        let after_stale_completion = fixture.coordinator.current_snapshot();
+        assert_eq!(after_stale_completion.slack.status, SlackStatus::Ready);
+        assert!(after_stale_completion.oauth.is_none());
+        assert!(after_stale_completion.slack.workspace_label.is_none());
+    }
+
+    #[test]
+    fn slack_failure_and_recovery_survive_reload_and_consume_exact_url_once() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        configure_slack_fixture(&fixture, SlackStatus::Ready);
+        fixture
+            .oauth
+            .fail_authorize_with_recovery
+            .store(true, Ordering::Release);
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::BeginOAuth(ServerId::new("oauth-server-1")))
+            .unwrap();
+        accept_pending_remote_trust(&fixture);
+        wait_until(|| {
+            fixture
+                .coordinator
+                .current_snapshot()
+                .oauth
+                .as_ref()
+                .is_some_and(|state| matches!(state.phase, OAuthUiPhase::AwaitingConsent { .. }))
+        });
+        let oauth = fixture
+            .coordinator
+            .current_snapshot()
+            .oauth
+            .clone()
+            .expect("OAuth consent");
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::ResolveOAuthConsent {
+                operation_id: oauth.operation_id,
+                config_revision: oauth.config_revision,
+                accepted: true,
+            })
+            .unwrap();
+        wait_until(|| {
+            let slack = &fixture.coordinator.current_snapshot().slack;
+            slack.status == SlackStatus::Failed
+                && slack.recovery == Some(SlackRecoveryKind::EnableMcpAccess)
+                && fixture.coordinator.metrics().active_oauth_flows == 0
+        });
+        let before_reload = fixture.coordinator.current_snapshot().revision;
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Activate)
+            .unwrap();
+        wait_until(|| fixture.coordinator.current_snapshot().revision != before_reload);
+        assert_eq!(
+            fixture.coordinator.current_snapshot().slack.recovery,
+            Some(SlackRecoveryKind::EnableMcpAccess)
+        );
+
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::OpenSlackRecovery {
+                server_id: ServerId::new("oauth-server-1"),
+                kind: SlackRecoveryKind::ConfigureApp,
+            })
+            .unwrap();
+        assert_eq!(fixture.coordinator.host_action_depth(), 0);
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::OpenSlackRecovery {
+                server_id: ServerId::new("oauth-server-1"),
+                kind: SlackRecoveryKind::EnableMcpAccess,
+            })
+            .unwrap();
+        wait_until(|| fixture.coordinator.host_action_depth() == 1);
+        assert_eq!(fixture.coordinator.current_snapshot().slack.recovery, None);
+        match fixture
+            .coordinator
+            .try_take_host_action()
+            .expect("Slack recovery action")
+        {
+            HostAction::OpenSlackRecovery { url, .. } => assert_eq!(
+                url.expect("Slack recovery URL").expose_bytes(),
+                b"https://slack.invalid/mcp-settings"
+            ),
+            other => panic!("unexpected host action: {other:?}"),
+        }
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::OpenSlackRecovery {
+                server_id: ServerId::new("oauth-server-1"),
+                kind: SlackRecoveryKind::EnableMcpAccess,
+            })
+            .unwrap();
+        assert_eq!(fixture.coordinator.host_action_depth(), 0);
     }
 
     #[test]
@@ -9070,6 +9808,235 @@ mod tests {
             .unwrap();
         wait_until(|| fixture.repo.parses.load(Ordering::Acquire) == 1);
         wait_until(|| fixture.coordinator.current_snapshot().revision.0 >= 2);
+        assert_eq!(fixture.repo.imports.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn mixed_import_report_preserves_omitted_secret_counts_after_commit() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        *fixture
+            .repo
+            .import_omitted_secret_counts
+            .lock()
+            .expect("import omitted counts lock") = vec![0, 2, 7];
+        *fixture
+            .repo
+            .import_parser_report
+            .lock()
+            .expect("import parser report lock") = vec![
+            ImportReportItem {
+                name: "duplicate".to_owned(),
+                outcome: ImportOutcome::SkippedDuplicate,
+                error_code: None,
+                omitted_secret_env_count: 1,
+            },
+            ImportReportItem {
+                name: "unsupported".to_owned(),
+                outcome: ImportOutcome::SkippedUnsupported,
+                error_code: Some(ErrorCode::InvalidInput),
+                omitted_secret_env_count: 3,
+            },
+        ];
+
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::ImportConfiguration {
+                source: ImportSource::Paste,
+                display_name: None,
+                contents: SensitiveInput::new(b"fixture".to_vec()),
+            })
+            .unwrap();
+        wait_until(|| fixture.repo.imports.load(Ordering::Acquire) == 1);
+        let snapshot = fixture.coordinator.current_snapshot();
+        let report = snapshot.import_report.as_ref().expect("import report");
+        assert_eq!((report.added, report.skipped, report.failed), (3, 2, 0));
+        assert!(!report.truncated);
+        assert_eq!(
+            report
+                .items
+                .iter()
+                .map(|item| (item.outcome, item.omitted_secret_env_count))
+                .collect::<Vec<_>>(),
+            vec![
+                (ImportOutcome::SkippedDuplicate, 1),
+                (ImportOutcome::SkippedUnsupported, 3),
+                (ImportOutcome::Added, 0),
+                (ImportOutcome::Added, 2),
+                (ImportOutcome::Added, 7),
+            ]
+        );
+        assert_eq!(
+            *fixture
+                .repo
+                .imported_server_names
+                .lock()
+                .expect("imported server names lock"),
+            vec!["import-0", "import-1", "import-2"]
+        );
+    }
+
+    #[test]
+    fn stale_and_failed_imports_preserve_candidate_counts_without_added_rows() {
+        for (stale, expected_code) in [
+            (true, ErrorCode::StaleResult),
+            (false, ErrorCode::StorageUnavailable),
+        ] {
+            let fixture = fixture(
+                Arc::new(Gate::opened()),
+                Arc::new(Gate::opened()),
+                Arc::new(Gate::opened()),
+                Arc::new(SystemCoordinatorClock::default()),
+            );
+            *fixture
+                .repo
+                .import_omitted_secret_counts
+                .lock()
+                .expect("import omitted counts lock") = vec![2, 5];
+            *fixture
+                .repo
+                .import_parser_report
+                .lock()
+                .expect("import parser report lock") = vec![ImportReportItem {
+                name: "duplicate".to_owned(),
+                outcome: ImportOutcome::SkippedDuplicate,
+                error_code: None,
+                omitted_secret_env_count: 1,
+            }];
+            if stale {
+                fixture
+                    .repo
+                    .import_stale_once
+                    .store(true, Ordering::Release);
+            } else {
+                fixture
+                    .repo
+                    .import_error_once
+                    .store(true, Ordering::Release);
+            }
+            fixture
+                .coordinator
+                .dispatch(ConnectorIntent::ImportConfiguration {
+                    source: ImportSource::Paste,
+                    display_name: None,
+                    contents: SensitiveInput::new(b"fixture".to_vec()),
+                })
+                .unwrap();
+            wait_until(|| {
+                fixture
+                    .coordinator
+                    .current_snapshot()
+                    .import_report
+                    .is_some()
+            });
+            let snapshot = fixture.coordinator.current_snapshot();
+            let report = snapshot.import_report.as_ref().expect("import report");
+            assert_eq!((report.added, report.skipped, report.failed), (0, 1, 2));
+            assert_eq!(
+                report
+                    .items
+                    .iter()
+                    .map(|item| (item.outcome, item.error_code, item.omitted_secret_env_count))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (ImportOutcome::SkippedDuplicate, None, 1),
+                    (ImportOutcome::Failed, Some(expected_code), 2),
+                    (ImportOutcome::Failed, Some(expected_code), 5),
+                ]
+            );
+            assert_eq!(fixture.repo.imports.load(Ordering::Acquire), 0);
+            assert!(
+                fixture
+                    .repo
+                    .imported_server_names
+                    .lock()
+                    .expect("imported server names lock")
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn import_omission_and_combined_report_limits_fail_before_persistence() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        *fixture
+            .repo
+            .import_omitted_secret_counts
+            .lock()
+            .expect("import omitted counts lock") =
+            vec![ResourceLimits::default().tools_per_server + 1];
+        let dispatch_import = || {
+            fixture
+                .coordinator
+                .dispatch(ConnectorIntent::ImportConfiguration {
+                    source: ImportSource::Paste,
+                    display_name: None,
+                    contents: SensitiveInput::new(b"fixture".to_vec()),
+                })
+                .unwrap();
+        };
+        dispatch_import();
+        wait_until(|| fixture.repo.parses.load(Ordering::Acquire) == 1);
+        wait_until(|| {
+            fixture
+                .coordinator
+                .current_snapshot()
+                .diagnostics
+                .transitions
+                .last()
+                .is_some_and(|transition| {
+                    transition.kind == OperationKind::Import
+                        && transition.error_code == Some(ErrorCode::LimitExceeded)
+                })
+        });
+        assert_eq!(fixture.repo.imports.load(Ordering::Acquire), 0);
+
+        fixture
+            .repo
+            .import_omitted_secret_counts
+            .lock()
+            .expect("import omitted counts lock")
+            .clear();
+        *fixture
+            .repo
+            .import_parser_report
+            .lock()
+            .expect("import parser report lock") = (0..ResourceLimits::default()
+            .import_report_items)
+            .map(|index| ImportReportItem {
+                name: format!("skipped-{index}"),
+                outcome: ImportOutcome::SkippedUnsupported,
+                error_code: Some(ErrorCode::InvalidInput),
+                omitted_secret_env_count: 0,
+            })
+            .collect();
+        dispatch_import();
+        wait_until(|| fixture.repo.parses.load(Ordering::Acquire) == 2);
+        wait_until(|| fixture.coordinator.current_snapshot().revision.0 >= 3);
+        assert_eq!(fixture.repo.imports.load(Ordering::Acquire), 0);
+
+        *fixture
+            .repo
+            .import_parser_report
+            .lock()
+            .expect("import parser report lock") = vec![ImportReportItem {
+            name: "x".repeat(ResourceLimits::default().import_report_bytes - 32),
+            outcome: ImportOutcome::SkippedUnsupported,
+            error_code: Some(ErrorCode::InvalidInput),
+            omitted_secret_env_count: 0,
+        }];
+        dispatch_import();
+        wait_until(|| fixture.repo.parses.load(Ordering::Acquire) == 3);
+        wait_until(|| fixture.coordinator.current_snapshot().revision.0 >= 4);
         assert_eq!(fixture.repo.imports.load(Ordering::Acquire), 0);
     }
 

@@ -145,3 +145,22 @@ passes. No production workaround or cross-lane edit was introduced.
   machine and maps delivery-unknown outcomes to durable `Unknown` without retry.
 - Real-hardware release Scenario A-E CPU/RSS/frame-p95 and 30-minute slope approval remain BG01
   rollout gates; this PR supplies deterministic resource bounds, not hardware performance claims.
+
+## Pre-IN01 import and Slack projection parity
+
+- `ImportPlan` now contains non-serializable `ImportCandidate` values carrying each persistable
+  draft and its exact omitted-secret count. Parser reports may contain only skipped, unsupported,
+  or failed rows; fabricating an `Added` row is rejected.
+- Candidate count, draft item/byte totals, omitted-secret totals, and the complete parser-plus-
+  candidate report item/byte budget are validated before persistence. Commit reports exact Added
+  counts; stale/storage failure converts candidate rows to Failed without losing omission counts.
+- The worker retains one durable Slack projection plus one optional overlay bound to the exact
+  operation, server, generation, configuration revision, and dispatch epoch. Transient/failure/
+  completion state survives unrelated reloads but is removed by exact cancel or invalidation, and
+  stale results cannot clear or restore a newer operation.
+- The overlay adds no queue, history, timer, poller, thread, or network path. Workspace labels are
+  bounded and NUL-checked before credential publication.
+- Root verification: connector-service tests passed 77/77 plus doc-tests; all-target check, strict
+  Clippy, package rustfmt, scoped diff-check, and dependency law passed. Boundary passed at 53
+  before the concurrent SB01 lane intentionally removed seven agents.rs call sites; that separate
+  allowlist drift is not caused by this service diff and must be finalized with SB01.

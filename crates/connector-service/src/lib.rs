@@ -21,12 +21,13 @@ pub use oauth_adapter::ProductionConnectorOAuth;
 pub use ports::{
     AuthorizationState, AuthorizedInvokeRequest, CancellationToken, ConnectorMcp, ConnectorOAuth,
     ConnectorRepository, ConnectorRepositoryFactory, ConnectorSecrets, CredentialResolutionRequest,
-    DiscoverOutput, DiscoveredTool, HttpAuthBinding, ImportPlan, InvocationContext, LiveToolSchema,
-    McpRequestTarget, McpTransportSnapshot, OAuthAuthorizeOutput, OAuthClientRequest,
-    OAuthCompletion, OAuthContinuation, OAuthCredentialUpdate, OAuthDiscovery, OAuthEventSink,
-    OAuthFailure, OAuthPublishDescriptor, OAuthPublishMode, OAuthPublishResult,
-    OAuthRecoveryTarget, OAuthRefreshOutcome, OAuthRefreshRequest, Observed, OverviewData,
-    RepositoryCas, RepositoryMcpTarget, RepositoryToolPage, ResolvedCredential,
-    ResolvedCredentials, ServiceError, StoredOAuthClient, cancel_live_mcp_connection,
+    DiscoverOutput, DiscoveredTool, HttpAuthBinding, ImportCandidate, ImportPlan,
+    InvocationContext, LiveToolSchema, McpRequestTarget, McpTransportSnapshot,
+    OAuthAuthorizeOutput, OAuthClientRequest, OAuthCompletion, OAuthContinuation,
+    OAuthCredentialUpdate, OAuthDiscovery, OAuthEventSink, OAuthFailure, OAuthPublishDescriptor,
+    OAuthPublishMode, OAuthPublishResult, OAuthRecoveryTarget, OAuthRefreshOutcome,
+    OAuthRefreshRequest, Observed, OverviewData, RepositoryCas, RepositoryMcpTarget,
+    RepositoryToolPage, ResolvedCredential, ResolvedCredentials, ServiceError, StoredOAuthClient,
+    cancel_live_mcp_connection,
 };
 pub use snapshot::SnapshotReader;

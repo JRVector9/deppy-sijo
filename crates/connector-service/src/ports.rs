@@ -321,8 +321,14 @@ pub struct RepositoryToolPage {
 }
 
 #[derive(Debug)]
+pub struct ImportCandidate {
+    pub draft: ServerDraft,
+    pub omitted_secret_env_count: usize,
+}
+
+#[derive(Debug)]
 pub struct ImportPlan {
-    pub servers: Vec<ServerDraft>,
+    pub candidates: Vec<ImportCandidate>,
     /// Sanitized parser outcomes for skipped/unsupported entries. Successfully committed
     /// candidates are appended by the coordinator as `Added` outcomes.
     pub report: Vec<ImportReportItem>,

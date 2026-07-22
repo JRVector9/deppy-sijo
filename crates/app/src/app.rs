@@ -417,12 +417,12 @@ struct EnvSecretRevealWorker {
 type DotenvState = (bool, Option<std::time::SystemTime>);
 
 struct DotenvSyncJob {
-    generation: u64,
-    revision: u64,
     workspace_id: String,
     root: Option<PathBuf>,
+    runtime_instance: u64,
     previous_state: Option<DotenvState>,
     force: bool,
+    migrate_legacy: bool,
 }
 
 struct DotenvSyncPayload {
@@ -432,18 +432,66 @@ struct DotenvSyncPayload {
 }
 
 struct DotenvSyncOutcome {
-    generation: u64,
-    revision: u64,
     workspace_id: String,
     root: Option<PathBuf>,
+    runtime_instance: u64,
     baseline: DotenvState,
-    result: anyhow::Result<Option<DotenvSyncPayload>>,
+    payload: Option<DotenvSyncPayload>,
 }
 
-struct DotenvSyncWorker {
-    tx: std::sync::mpsc::SyncSender<DotenvSyncJob>,
-    rx: std::sync::mpsc::Receiver<DotenvSyncOutcome>,
+enum PendingDotenvContinuation {
+    WorkspaceProtocol {
+        operation: ui::workspace::WorkspaceProtocolOperation,
+        generation: u64,
+        command: runtime::RuntimeCommand,
+    },
+    RuntimeCommand(runtime::RuntimeCommand),
+    AgentLaunch {
+        command: runtime::RuntimeCommand,
+        approval_ticket: Option<u64>,
+    },
 }
+
+struct PendingDotenvOperation {
+    correlation: crate::dotenv_sync::DotenvWorkerCorrelation,
+    workspace_id: String,
+    root: Option<PathBuf>,
+    runtime_instance: u64,
+    retained_bytes: usize,
+    continuation: PendingDotenvContinuation,
+}
+
+fn prepare_dotenv_continuation_retention(
+    continuation: &mut PendingDotenvContinuation,
+) -> Result<usize, runtime::RuntimeCommandPreparationErrorCode> {
+    match continuation {
+        PendingDotenvContinuation::WorkspaceProtocol { command, .. }
+        | PendingDotenvContinuation::RuntimeCommand(command)
+        | PendingDotenvContinuation::AgentLaunch { command, .. } => {
+            runtime::prepare_runtime_command_for_retention(command)
+                .map(runtime::RuntimeCommandRetention::retained_bytes)
+        }
+    }
+}
+
+fn runtime_command_requires_dotenv(command: &runtime::RuntimeCommand) -> bool {
+    matches!(
+        command,
+        runtime::RuntimeCommand::SpawnShell { .. }
+            | runtime::RuntimeCommand::SpawnAgent { .. }
+            | runtime::RuntimeCommand::SplitPane { .. }
+            | runtime::RuntimeCommand::RestoreWorkspace
+    )
+}
+
+struct AppDotenvResource {
+    db_path: PathBuf,
+    db: Option<Db>,
+    redaction: secret::RedactionService,
+}
+
+type DotenvSyncWorker =
+    crate::dotenv_sync::LazyDotenvWorker<DotenvSyncJob, DotenvSyncOutcome, AppDotenvResource>;
 
 const SETTINGS_WORKER_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -720,100 +768,102 @@ fn load_dotenv_default_env(db: &Db, workspace_id: &str) -> anyhow::Result<(EnvPa
     Ok((env_plain, env_secrets))
 }
 
-impl DotenvSyncWorker {
-    fn spawn(db_path: PathBuf, redaction: secret::RedactionService, ctx: egui::Context) -> Self {
-        // App은 한 번에 하나만 제출하고 추가 요청은 최신 1건으로 축약한다. 채널도 hard cap을
-        // 둬 느린 외장/네트워크 볼륨이나 keychain이 UI 메모리 증가로 번지지 않게 한다.
-        let (tx, jobs) = std::sync::mpsc::sync_channel::<DotenvSyncJob>(1);
-        let (results, rx) = std::sync::mpsc::sync_channel::<DotenvSyncOutcome>(1);
-        std::thread::Builder::new()
-            .name("dotenv-sync".to_owned())
-            .spawn(move || {
-                // 연결은 최초 필요 시 한 번 열어 재사용한다 (EnvProjectRowsWorker 관례) —
-                // job마다 열면 PRAGMA/마이그레이션 버전 점검이 매번 반복된다. 열기 실패는
-                // 캐시하지 않아 다음 job이 재시도한다.
-                let mut cached_db: Option<Db> = None;
-                while let Ok(job) = jobs.recv() {
-                    // 기준점은 파일을 읽기 직전에 worker에서 캡처한다. 읽는 도중 파일이 다시
-                    // 바뀌면 이 옛 기준점과 다음 점검이 달라져 안전하게 한 번 더 동기화된다.
-                    let baseline = dotenv_state_for_root(job.root.as_deref());
-                    let result = if !job.force && job.previous_state == Some(baseline) {
-                        Ok(None)
-                    } else if let Some(root) = job.root.as_deref() {
-                        match &mut cached_db {
-                            Some(db) => Ok(db),
-                            slot @ None => Db::open(&db_path).map(|db| slot.insert(db)),
-                        }
-                        .and_then(|db| {
-                            // force 동기화(시작·경로 지정·수동 리프레시)에서만 레거시
-                            // DB-전용 profile 변수를 .env로 이전한다(.env 일원화 E1).
-                            // 2초 주기 폴링의 fast-path에는 DB 조회를 더하지 않는다.
-                            if job.force
-                                && let Err(e) = {
-                                    let mut repository = AppDotenvRepository(db);
-                                    crate::dotenv_sync::migrate_legacy_profiles_to_dotenv(
-                                        &mut repository,
-                                        &KeyringSecretStore,
-                                        &job.workspace_id,
-                                        root,
-                                    )
-                                }
-                            {
-                                tracing::warn!("레거시 env profile 이전 실패: {e:#}");
-                            }
-                            sync_workspace_dotenv_at_root(
-                                db,
-                                &KeyringSecretStore,
-                                &redaction,
-                                &job.workspace_id,
-                                root,
-                            )
-                            .and_then(|report| {
-                                let (env_plain, env_secrets) = if report.is_some() {
-                                    load_dotenv_default_env(&*db, &job.workspace_id)?
-                                } else {
-                                    (Vec::new(), Vec::new())
-                                };
-                                Ok(Some(DotenvSyncPayload {
-                                    report,
-                                    env_plain,
-                                    env_secrets,
-                                }))
-                            })
-                        })
-                    } else {
-                        Ok(Some(DotenvSyncPayload {
-                            report: None,
-                            env_plain: Vec::new(),
-                            env_secrets: Vec::new(),
-                        }))
-                    };
-                    if results
-                        .send(DotenvSyncOutcome {
-                            generation: job.generation,
-                            revision: job.revision,
-                            workspace_id: job.workspace_id,
-                            root: job.root,
-                            baseline,
-                            result,
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                    ctx.request_repaint();
-                }
+fn execute_dotenv_sync_job(
+    resource: &mut AppDotenvResource,
+    job: DotenvSyncJob,
+) -> Result<DotenvSyncOutcome, crate::dotenv_sync::DotenvWorkerErrorCode> {
+    // Capture the source immediately before reading. A change during the read differs from the
+    // next event-driven request and cannot make an old result current.
+    let baseline = dotenv_state_for_root(job.root.as_deref());
+    let mut execute = || -> anyhow::Result<Option<DotenvSyncPayload>> {
+        if !job.force && job.previous_state == Some(baseline) {
+            return Ok(None);
+        }
+        let Some(root) = job.root.as_deref() else {
+            return Ok(Some(DotenvSyncPayload {
+                report: None,
+                env_plain: Vec::new(),
+                env_secrets: Vec::new(),
+            }));
+        };
+        let db = match &mut resource.db {
+            Some(db) => db,
+            slot @ None => slot.insert(Db::open(&resource.db_path)?),
+        };
+        if job.migrate_legacy {
+            let mut repository = AppDotenvRepository(db);
+            crate::dotenv_sync::migrate_legacy_profiles_to_dotenv(
+                &mut repository,
+                &KeyringSecretStore,
+                &job.workspace_id,
+                root,
+            )?;
+        }
+        let report = sync_workspace_dotenv_at_root(
+            db,
+            &KeyringSecretStore,
+            &resource.redaction,
+            &job.workspace_id,
+            root,
+        )?;
+        let (env_plain, env_secrets) = if report.is_some() {
+            load_dotenv_default_env(db, &job.workspace_id)?
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        Ok(Some(DotenvSyncPayload {
+            report,
+            env_plain,
+            env_secrets,
+        }))
+    };
+    match execute() {
+        Ok(payload) if dotenv_state_for_root(job.root.as_deref()) == baseline => {
+            Ok(DotenvSyncOutcome {
+                workspace_id: job.workspace_id,
+                root: job.root,
+                runtime_instance: job.runtime_instance,
+                baseline,
+                payload,
             })
-            .expect("dotenv sync worker thread spawn");
-        Self { tx, rx }
+        }
+        Err(_) => {
+            tracing::warn!(
+                kind = "dotenv",
+                phase = "synchronize",
+                error_code = "execute_failed",
+                "dotenv synchronization failed"
+            );
+            Err(crate::dotenv_sync::DotenvWorkerErrorCode::ExecuteFailed)
+        }
+        Ok(_) => {
+            tracing::warn!(
+                kind = "dotenv",
+                phase = "source_verify",
+                error_code = "source_changed",
+                "dotenv source changed during synchronization"
+            );
+            Err(crate::dotenv_sync::DotenvWorkerErrorCode::ExecuteFailed)
+        }
     }
+}
 
-    fn try_request(
-        &self,
-        job: DotenvSyncJob,
-    ) -> Result<(), std::sync::mpsc::TrySendError<DotenvSyncJob>> {
-        self.tx.try_send(job)
-    }
+fn new_dotenv_sync_worker(
+    db_path: PathBuf,
+    redaction: secret::RedactionService,
+    ctx: egui::Context,
+) -> DotenvSyncWorker {
+    crate::dotenv_sync::LazyDotenvWorker::new(
+        move || {
+            Ok(AppDotenvResource {
+                db_path: db_path.clone(),
+                db: None,
+                redaction: redaction.clone(),
+            })
+        },
+        execute_dotenv_sync_job,
+        move || ctx.request_repaint(),
+    )
 }
 
 fn mcp_proxy_bin() -> anyhow::Result<String> {
@@ -4501,6 +4551,11 @@ impl connector_service::ConnectorHost for AppConnectorHost {
 /// 활성 workspace는 렌더되고, (후속) warm workspace는 이벤트만 드레인된다.
 struct WorkspaceRuntime {
     id: String,
+    /// Monotonic identity for one concrete worker lifetime. Workspace IDs can be reused after a
+    /// suspend/recreate, so async freshness checks must never key only by workspace ID.
+    runtime_instance: u64,
+    /// Source stamp whose default env was accepted by this exact runtime lifetime.
+    dotenv_state: Option<DotenvState>,
     runtime: InProcessRuntimeClient,
     events: RuntimeEventReceiver,
     workspace_ui: ui::workspace::WorkspaceUi,
@@ -4526,6 +4581,10 @@ struct WorkspaceRuntime {
         runtime::SessionId,
         (runtime::PtyInputPressure, std::time::Instant),
     >,
+    /// Source stamp inherited by each concrete shell process at creation. Updating runtime
+    /// defaults does not retroactively mutate an existing shell environment, so programmatic
+    /// resume may use WriteInput only while this exact session stamp is still current.
+    session_dotenv_states: std::collections::HashMap<runtime::SessionId, DotenvState>,
     /// Warm으로 내려간 시각. 일정 시간 이후 자동 Suspended(워커 shutdown)로 내린다.
     backgrounded_at: Option<std::time::Instant>,
     /// live 세션 추적 (suspend 보호 — 이벤트 스트림에서 갱신).
@@ -4535,9 +4594,6 @@ struct WorkspaceRuntime {
     /// 응답(AgentSpawned/SpawnFailed) 대기 중인 agent spawn 수 — 전환 시 전역
     /// AgentsUi에서 이관받는다 (agent spawn 직후 전환 race의 live 판정).
     pending_agent_spawns: u32,
-    /// 새 runtime은 background dotenv 결과를 먼저 적용한 뒤 RestoreWorkspace를 보낸다.
-    /// 느린 볼륨/keychain 때문에 복원이 영원히 막히지 않도록 logic에서 timeout fallback한다.
-    restore_pending_since: Option<std::time::Instant>,
     /// durable 구독 overflow 뒤 이미 큐에 들어온 이벤트를 budget 단위로 끝까지 적용한 다음
     /// fresh receiver로 재구독하기 위한 상태.
     event_overflow_pending: bool,
@@ -4865,9 +4921,6 @@ pub struct App {
     last_mono_weight: String,
     /// UI 배율 변경 감지용(zoom_factor 재적용 트리거). 첫 프레임 적용을 위해 sentinel로 시작.
     last_ui_scale: f32,
-    /// .env mtime 폴링(2s) — 사이드바 OFF면 워처가 없어 .env 변경/삭제 신호가 안 오므로
-    /// (존재여부, mtime) 변화를 직접 감지해 재동기화한다(codex — stale secret 주입 방지).
-    last_dotenv_check: std::time::Instant,
     last_dotenv_state: Option<DotenvState>,
     dotenv_sync_worker: DotenvSyncWorker,
     /// 활성 workspace/root가 바뀔 때 증가한다. 옛 worker 결과가 새 workspace runtime에
@@ -4876,11 +4929,14 @@ pub struct App {
     /// 같은 workspace/root에서도 watcher/manual 변경이 들어오면 증가해 실행 중이던 옛
     /// 파일 snapshot 결과를 폐기한다. 주기적 unchanged poll은 증가시키지 않는다.
     dotenv_sync_revision: u64,
-    dotenv_sync_context: Option<(String, Option<PathBuf>)>,
-    dotenv_sync_pending: bool,
-    dotenv_sync_worker_failed: bool,
-    /// worker가 느린 동안 들어온 watcher/poll 요청은 최신 한 건으로 합친다.
-    dotenv_sync_deferred: Option<DotenvSyncJob>,
+    /// Worker correlation only. Never reused while the process is alive.
+    dotenv_next_operation_id: u64,
+    dotenv_sync_context: Option<(String, Option<PathBuf>, u64)>,
+    /// Runtime commands are retained exactly once here; worker jobs contain only freshness scope.
+    /// The worker independently caps accepted continuations at the same fixed eight operations.
+    dotenv_pending_operations: std::collections::HashMap<u64, PendingDotenvOperation>,
+    /// Checked retained heap bytes across the same exact launch commands.
+    dotenv_pending_bytes: usize,
     /// 프로젝트 폴더 rename 복구 확인 모달 — Some((old, new))이면 표시(2026-07-08).
     workspace_rename_prompt: Option<(String, String)>,
     /// Environment & API 프로젝트 닫기 확인 대기 — sidebar/DB 삭제와 무관하다.
@@ -5055,9 +5111,14 @@ pub struct App {
     frame_stats: crate::perf::FrameStats,
     /// 렌더러 A/B 실측 드라이버 (B1) — env 미설정이면 None이고 모든 훅이 no-op이다.
     bench: Option<crate::bench::Bench>,
+    /// PR-21 hidden load harness. Retains only the next bounded fixture index; each concrete
+    /// command goes through the same exact dotenv continuation as production launches.
+    perf_harness_next: Option<usize>,
     i18n: i18n::Catalog,
     /// 현재 활성(렌더되는) workspace의 런타임 상태.
     active: WorkspaceRuntime,
+    /// Next concrete runtime identity; zero is never issued.
+    next_runtime_instance: u64,
     /// warm workspace들 (전환으로 물러났지만 워커는 계속 실행 — §14.1 Warm). 이벤트는
     /// drain만 하고(채널 backup 방지) 렌더/알림은 안 한다. 재활성 시 즉시 복귀.
     warm: std::collections::HashMap<String, WorkspaceRuntime>,
@@ -7311,33 +7372,12 @@ impl App {
             &config,
             &logs_base,
             &workspace_id,
+            1,
             &db_path,
             runtime_host_factory.as_ref(),
             &db,
             &egui_ctx,
         );
-        // PR-21 부하 하네스 (env로만 활성): hidden 10개 시나리오 자동 구성 (기본 workspace만)
-        if crate::perf::harness_enabled() {
-            for i in 0..crate::perf::HARNESS_SESSIONS {
-                let (command, args) = crate::perf::harness_command(i);
-                let _ = active
-                    .runtime
-                    .send_command(runtime::RuntimeCommand::SpawnAgent {
-                        agent_config_id: None,
-                        cols: 120,
-                        rows: 40,
-                        scrollback_lines: config.terminal.scrollback_lines as usize,
-                        command,
-                        args,
-                        env_plain: Vec::new(),
-                        env_secrets: Vec::new(),
-                        waiting_regex: None,
-                        approval_regex: None,
-                        error_regex: None,
-                        done_regex: None,
-                    });
-            }
-        }
 
         let connector_initial_overview = AppConnectorRepository::overview_from(
             db.mcp_server_inventory_versioned(
@@ -7407,7 +7447,7 @@ impl App {
         let settings_snapshot_worker =
             SettingsSnapshotWorker::new(db_path.clone(), redaction.clone(), egui_ctx.clone());
         let dotenv_sync_worker =
-            DotenvSyncWorker::spawn(db_path.clone(), redaction.clone(), egui_ctx.clone());
+            new_dotenv_sync_worker(db_path.clone(), redaction.clone(), egui_ctx.clone());
         let status_feed_rx_channel = crate::status_feed::spawn(egui_ctx.clone());
         let notice_translation_cache_path = db_path
             .parent()
@@ -7465,15 +7505,16 @@ impl App {
             last_mono_font,
             last_mono_weight,
             last_ui_scale: -1.0,
-            last_dotenv_check: std::time::Instant::now(),
             last_dotenv_state: None,
             dotenv_sync_worker,
             dotenv_sync_generation: 0,
             dotenv_sync_revision: 0,
+            dotenv_next_operation_id: 0,
             dotenv_sync_context: None,
-            dotenv_sync_pending: false,
-            dotenv_sync_worker_failed: false,
-            dotenv_sync_deferred: None,
+            dotenv_pending_operations: std::collections::HashMap::with_capacity(
+                crate::dotenv_sync::DOTENV_WORKER_CONTINUATION_MAX,
+            ),
+            dotenv_pending_bytes: 0,
             workspace_rename_prompt: None,
             env_project_close_confirm: None,
             ws_close_confirm: None,
@@ -7574,10 +7615,12 @@ impl App {
             last_offscreen_fix: std::time::Instant::now(),
             startup_positioned: false,
             active,
+            next_runtime_instance: 2,
             warm: std::collections::HashMap::new(),
             warm_order: Vec::new(),
             frame_stats: crate::perf::FrameStats::new(),
             bench,
+            perf_harness_next: crate::perf::harness_enabled().then_some(0),
             i18n,
             egui_ctx,
             db_path,
@@ -7645,8 +7688,16 @@ impl App {
         }
         // 에이전트 상태 hook 전역 설치/해제 (설정 토글에 따라, best-effort).
         app.sync_agent_hooks();
-        // .env → 환경 profile 동기화 + 새 셸 기본 env 주입 (2026-07-07).
-        app.sync_dotenv_env();
+        // The first process-capable restore is an exact dotenv continuation. Construction alone
+        // does not bypass source/keyring verification or fall back to an empty environment.
+        if app
+            .persisted_activity_panes
+            .get(&app.active.id)
+            .is_some_and(|panes| !panes.is_empty())
+        {
+            let initial_runtime_instance = app.active.runtime_instance;
+            app.stage_runtime_restore(initial_runtime_instance);
+        }
         // 시작 시 config가 remote를 켜 뒀으면 best-effort로 기동한다 (실패는 log + settings 표시,
         // config는 그대로 두어 다음 실행에 재시도). 자동 시작은 config 저장을 유발하지 않는다.
         if app.config.remote.tls_enabled {
@@ -7689,6 +7740,7 @@ impl App {
         config: &Config,
         logs_base: &std::path::Path,
         workspace_id: &str,
+        runtime_instance: u64,
         db_path: &std::path::Path,
         runtime_host_factory: &runtime::InProcessRuntimeHostFactory,
         db: &Db,
@@ -7723,6 +7775,8 @@ impl App {
         // UI thread에서 수행하지 않으면서도 복원된 첫 셸부터 올바른 기본 env를 받게 한다.
         WorkspaceRuntime {
             id: workspace_id.to_owned(),
+            runtime_instance,
+            dotenv_state: None,
             runtime,
             events: runtime_events,
             workspace_ui: ui::workspace::WorkspaceUi::new(),
@@ -7733,11 +7787,11 @@ impl App {
             session_resource_usage: Vec::new(),
             input_pressure: None,
             session_input_pressure: std::collections::HashMap::new(),
+            session_dotenv_states: std::collections::HashMap::new(),
             backgrounded_at: None,
             live: LiveSessionTracker::default(),
             created: std::time::Instant::now(),
             pending_agent_spawns: 0,
-            restore_pending_since: Some(std::time::Instant::now()),
             event_overflow_pending: false,
             event_resync_pending: false,
         }
@@ -7776,6 +7830,51 @@ impl App {
             }
         }
         self.bench = Some(bench);
+    }
+
+    fn pump_perf_harness(&mut self) {
+        let Some(index) = self.perf_harness_next else {
+            return;
+        };
+        if index >= crate::perf::HARNESS_SESSIONS {
+            self.perf_harness_next = None;
+            return;
+        }
+        if !self.dotenv_pending_operations.is_empty() {
+            return;
+        }
+        let (command, args) = crate::perf::harness_command(index);
+        let command = runtime::RuntimeCommand::SpawnAgent {
+            agent_config_id: None,
+            cols: 120,
+            rows: 40,
+            scrollback_lines: self.config.terminal.scrollback_lines as usize,
+            command,
+            args,
+            env_plain: Vec::new(),
+            env_secrets: Vec::new(),
+            waiting_regex: None,
+            approval_regex: None,
+            error_regex: None,
+            done_regex: None,
+        };
+        if self
+            .stage_dotenv_continuation(
+                self.active.runtime_instance,
+                PendingDotenvContinuation::RuntimeCommand(command),
+            )
+            .is_ok()
+        {
+            self.perf_harness_next = Some(index + 1);
+        } else {
+            self.perf_harness_next = None;
+            tracing::warn!(
+                kind = "perf_harness",
+                phase = "launch_admission",
+                error_code = "backpressure",
+                "performance harness launch failed closed"
+            );
+        }
     }
 
     fn bench_setup(&mut self, bench: &mut crate::bench::Bench) {
@@ -7835,23 +7934,34 @@ impl App {
             return;
         };
         let started = std::time::Instant::now();
-        let _ = self
-            .active
-            .runtime
-            .send_command(runtime::RuntimeCommand::SpawnAgent {
-                agent_config_id: None,
-                cols: 120,
-                rows: 40,
-                scrollback_lines: self.config.terminal.scrollback_lines as usize,
-                command,
-                args,
-                env_plain: Vec::new(),
-                env_secrets: Vec::new(),
-                waiting_regex: None,
-                approval_regex: None,
-                error_regex: None,
-                done_regex: None,
-            });
+        let command = runtime::RuntimeCommand::SpawnAgent {
+            agent_config_id: None,
+            cols: 120,
+            rows: 40,
+            scrollback_lines: self.config.terminal.scrollback_lines as usize,
+            command,
+            args,
+            env_plain: Vec::new(),
+            env_secrets: Vec::new(),
+            waiting_regex: None,
+            approval_regex: None,
+            error_regex: None,
+            done_regex: None,
+        };
+        if self
+            .stage_dotenv_continuation(
+                self.active.runtime_instance,
+                PendingDotenvContinuation::RuntimeCommand(command),
+            )
+            .is_err()
+        {
+            tracing::warn!(
+                kind = "benchmark",
+                phase = "launch_admission",
+                error_code = "backpressure",
+                "benchmark launch failed closed"
+            );
+        }
         bench.emit_ws_step("spawn_send", elapsed_ms(started));
     }
 
@@ -8031,6 +8141,9 @@ impl App {
             self.active
                 .workspace_ui
                 .set_session_cwds(self.session_cwds.clone(), self.config.ui.session_name_style);
+            // Rename recovery is driven by a fresh detector projection. There is no periodic
+            // filesystem stat or repaint when session cwd state is idle.
+            self.detect_workspace_folder_rename();
             // 포커스 세션 cwd → 워크스페이스 이름(현재 작업 폴더/프로젝트명).
             if let Some(cwd) = self
                 .active
@@ -8406,6 +8519,16 @@ impl App {
         else {
             return false;
         };
+        let source_state = dotenv_state_for_root(self.active_tree_root().as_deref());
+        if self.active.session_dotenv_states.get(&session) != Some(&source_state) {
+            tracing::warn!(
+                kind = "agent_resume",
+                phase = "source_verify",
+                error_code = "stale_session_env",
+                "agent resume into a stale shell environment was rejected"
+            );
+            return false;
+        }
         // 대상 transcript가 아직 존재하는지 확인 — 지워진 세션에 --resume 안 던짐.
         let kind = crate::agent_detect::kind_from_str(&saved_kind);
         let transcript = kind.and_then(|k| finder.find(k, &saved_sid));
@@ -8966,7 +9089,23 @@ impl App {
                 if let runtime::RuntimeCommand::WriteInput { session, .. } = &command {
                     self.active.workspace_ui.clear_selection(*session);
                 }
-                if self.active.runtime.send_command(command).is_err() {
+                if runtime_command_requires_dotenv(&command) {
+                    let runtime_instance = self.active.runtime_instance;
+                    if self
+                        .stage_dotenv_continuation(
+                            runtime_instance,
+                            PendingDotenvContinuation::RuntimeCommand(command),
+                        )
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            kind = "dotenv",
+                            phase = "runtime_admission",
+                            error_code = "backpressure",
+                            "dotenv-gated runtime command was rejected"
+                        );
+                    }
+                } else if self.active.runtime.send_command(command).is_err() {
                     tracing::warn!(
                         kind = "workspace",
                         phase = "runtime_command",
@@ -9044,13 +9183,45 @@ impl App {
         }
     }
 
-    fn drain_workspace_protocol_intents(runtime: &mut WorkspaceRuntime) {
-        while let Some(intent) = runtime.workspace_ui.take_protocol_intent() {
+    fn drain_workspace_protocol_intents(&mut self, runtime_instance: u64) {
+        while let Some(intent) = self
+            .runtime_by_instance_mut(runtime_instance)
+            .and_then(|runtime| runtime.workspace_ui.take_protocol_intent())
+        {
             let operation = intent.operation();
             let generation = intent.generation();
+            let command = intent.into_command();
+            if runtime_command_requires_dotenv(&command) {
+                let continuation = PendingDotenvContinuation::WorkspaceProtocol {
+                    operation,
+                    generation,
+                    command,
+                };
+                if let Err(continuation) =
+                    self.stage_dotenv_continuation(runtime_instance, continuation)
+                    && let PendingDotenvContinuation::WorkspaceProtocol {
+                        operation,
+                        generation,
+                        ..
+                    } = *continuation
+                    && let Some(runtime) = self.runtime_by_instance_mut(runtime_instance)
+                {
+                    runtime.workspace_ui.complete_protocol(
+                        ui::workspace::WorkspaceProtocolCompletion {
+                            operation,
+                            generation,
+                            result: Err(ui::workspace::WorkspaceProtocolErrorCode::Busy),
+                        },
+                    );
+                }
+                continue;
+            }
+            let Some(runtime) = self.runtime_by_instance_mut(runtime_instance) else {
+                continue;
+            };
             let result = runtime
                 .runtime
-                .send_command(intent.into_command())
+                .send_command(command)
                 .map_err(|_| ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed);
             runtime
                 .workspace_ui
@@ -9063,9 +9234,34 @@ impl App {
     }
 
     fn poll_workspace_protocol_intents(&mut self) {
-        Self::drain_workspace_protocol_intents(&mut self.active);
-        for runtime in self.warm.values_mut() {
-            Self::drain_workspace_protocol_intents(runtime);
+        let mut runtime_instances = Vec::with_capacity(1 + self.warm.len());
+        runtime_instances.push(self.active.runtime_instance);
+        runtime_instances.extend(self.warm.values().map(|runtime| runtime.runtime_instance));
+        for runtime_instance in runtime_instances {
+            self.drain_workspace_protocol_intents(runtime_instance);
+        }
+    }
+
+    fn drain_closing_workspace_protocol_intents(runtime: &mut WorkspaceRuntime) {
+        while let Some(intent) = runtime.workspace_ui.take_protocol_intent() {
+            let operation = intent.operation();
+            let generation = intent.generation();
+            let command = intent.into_command();
+            let result = if runtime_command_requires_dotenv(&command) {
+                Err(ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed)
+            } else {
+                runtime
+                    .runtime
+                    .send_command(command)
+                    .map_err(|_| ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed)
+            };
+            runtime
+                .workspace_ui
+                .complete_protocol(ui::workspace::WorkspaceProtocolCompletion {
+                    operation,
+                    generation,
+                    result,
+                });
         }
     }
 
@@ -9363,8 +9559,12 @@ impl App {
             }
         }
 
-        if let Some((requested_workspace, receiver)) = &self.worktree_remove_rx {
-            match receiver.try_recv() {
+        let worktree_remove_result = self
+            .worktree_remove_rx
+            .as_ref()
+            .map(|(workspace, receiver)| (workspace.clone(), receiver.try_recv()));
+        if let Some((requested_workspace, result)) = worktree_remove_result {
+            match result {
                 Ok(Ok((root, branch, hits))) => {
                     let mut targets: Vec<(String, runtime::MuxPaneId)> = Vec::new();
                     for (workspace_id, session) in &hits {
@@ -9402,18 +9602,25 @@ impl App {
                     }
                     for (workspace_id, pane) in targets {
                         if workspace_id == self.active.id {
-                            Self::drain_workspace_protocol_intents(&mut self.active);
+                            let runtime_instance = self.active.runtime_instance;
+                            self.drain_workspace_protocol_intents(runtime_instance);
                             self.active.workspace_ui.close_pane_now(pane);
-                            Self::drain_workspace_protocol_intents(&mut self.active);
-                        } else if let Some(runtime) = self.warm.get_mut(&workspace_id) {
-                            Self::drain_workspace_protocol_intents(runtime);
-                            runtime.workspace_ui.close_pane_now(pane);
-                            Self::drain_workspace_protocol_intents(runtime);
+                            self.drain_workspace_protocol_intents(runtime_instance);
+                        } else if let Some(runtime_instance) = self
+                            .warm
+                            .get(&workspace_id)
+                            .map(|runtime| runtime.runtime_instance)
+                        {
+                            self.drain_workspace_protocol_intents(runtime_instance);
+                            if let Some(runtime) = self.warm.get_mut(&workspace_id) {
+                                runtime.workspace_ui.close_pane_now(pane);
+                            }
+                            self.drain_workspace_protocol_intents(runtime_instance);
                         }
                     }
                     let branch_note = (branch == crate::worktree::BranchCleanup::PreservedUnmerged)
                         .then(|| text.t("worktree.branch_preserved", &[]));
-                    if *requested_workspace == self.active.id {
+                    if requested_workspace == self.active.id {
                         platform::notify(
                             &text.t("worktree.removed", &[]),
                             branch_note.as_deref().unwrap_or(""),
@@ -9583,24 +9790,34 @@ impl App {
         self.join_pending_shutdown(target_id);
 
         // 대상 준비: warm 풀에 있으면 재사용, 없으면 새 워커.
-        let mut new_active = match self.warm.remove(target_id) {
+        let persisted_restore_exists = self
+            .persisted_activity_panes
+            .get(target_id)
+            .is_some_and(|panes| !panes.is_empty());
+        let (mut new_active, needs_restore) = match self.warm.remove(target_id) {
             Some(rt) => {
                 self.warm_order.retain(|id| id != target_id);
-                rt
+                (rt, false)
             }
             None => {
                 // 새 워커는 SessionId를 1부터 다시 시작한다 — 이 workspace의 옛 워커
                 // lifetime에서 남은 알림을 지운다. 안 그러면 재사용된 SessionId의 완료
                 // 알림이 옛 항목과 dup으로 취급돼 안 뜬다 (codex 리뷰).
                 self.notifications_ui.prune_workspace(target_id);
-                Self::make_runtime(
-                    &self.config,
-                    &self.logs_base,
-                    target_id,
-                    &self.db_path,
-                    self.runtime_host_factory.as_ref(),
-                    &self.db,
-                    &self.egui_ctx,
+                let runtime_instance = self.next_runtime_instance;
+                self.next_runtime_instance = self.next_runtime_instance.wrapping_add(1).max(1);
+                (
+                    Self::make_runtime(
+                        &self.config,
+                        &self.logs_base,
+                        target_id,
+                        runtime_instance,
+                        &self.db_path,
+                        self.runtime_host_factory.as_ref(),
+                        &self.db,
+                        &self.egui_ctx,
+                    ),
+                    persisted_restore_exists,
                 )
             }
         };
@@ -9661,9 +9878,9 @@ impl App {
             tracing::warn!("마지막 workspace 저장 실패: {e:#}");
         }
         self.refresh_file_tree_root();
-        // 새 workspace의 .env → 환경 profile 동기화 + 기본 env 주입 (2026-07-07).
-        // 폴링 기준점도 내부에서 새 root 기준으로 다시 잡힌다.
-        self.sync_dotenv_env();
+        if needs_restore {
+            self.stage_runtime_restore(self.active.runtime_instance);
+        }
         self.egui_ctx.request_repaint();
 
         self.evict_warm();
@@ -10111,9 +10328,10 @@ impl App {
                 ),
             );
             for pane in panes {
-                Self::drain_workspace_protocol_intents(&mut self.active);
+                let runtime_instance = self.active.runtime_instance;
+                self.drain_workspace_protocol_intents(runtime_instance);
                 self.active.workspace_ui.close_pane_now(pane);
-                Self::drain_workspace_protocol_intents(&mut self.active);
+                self.drain_workspace_protocol_intents(runtime_instance);
             }
         } else if self.warm.contains_key(workspace_id) {
             // warm 종료는 runtime shutdown까지 동기로 끝난다 — 죽어가는 pane 추적 불필요.
@@ -10143,9 +10361,9 @@ impl App {
                     "워크스페이스 종료 — warm pane 정리 후 runtime shutdown"
                 );
                 for pane in panes {
-                    Self::drain_workspace_protocol_intents(&mut rt);
+                    Self::drain_closing_workspace_protocol_intents(&mut rt);
                     rt.workspace_ui.close_pane_now(pane);
-                    Self::drain_workspace_protocol_intents(&mut rt);
+                    Self::drain_closing_workspace_protocol_intents(&mut rt);
                 }
                 self.close_approval_workspace(workspace_id);
                 rt.runtime.shutdown();
@@ -10212,6 +10430,25 @@ impl App {
         self.request_dotenv_sync(true);
     }
 
+    fn stage_runtime_restore(&mut self, runtime_instance: u64) {
+        if self
+            .stage_dotenv_continuation(
+                runtime_instance,
+                PendingDotenvContinuation::RuntimeCommand(
+                    runtime::RuntimeCommand::RestoreWorkspace,
+                ),
+            )
+            .is_err()
+        {
+            tracing::warn!(
+                kind = "workspace",
+                phase = "restore_admission",
+                error_code = "backpressure",
+                "workspace restore failed closed"
+            );
+        }
+    }
+
     /// 설정 창에서 선택한 workspace의 `.env` 동기화를 bounded worker에 제출한다.
     /// 활성 workspace는 runtime 기본 env 갱신까지 수행하는 기존 dotenv worker를 쓰고,
     /// 비활성 workspace는 Settings worker가 DB/keyring/file I/O를 전담한다.
@@ -10227,185 +10464,416 @@ impl App {
     }
 
     fn request_dotenv_sync(&mut self, force: bool) {
-        if self.dotenv_sync_worker_failed {
-            return;
-        }
         let workspace_id = self.active.id.clone();
         let root = self.active_tree_root();
-        let context = (workspace_id.clone(), root.clone());
+        let runtime_instance = self.active.runtime_instance;
+        let context = (workspace_id.clone(), root.clone(), runtime_instance);
         let context_changed = self.dotenv_sync_context.as_ref() != Some(&context);
         if context_changed {
             self.dotenv_sync_generation = self.dotenv_sync_generation.wrapping_add(1);
             self.dotenv_sync_context = Some(context);
             self.last_dotenv_state = None;
-            // 이전 context의 대기 요청은 최신 workspace/root 요청으로 교체한다. 이미 실행 중인
-            // 결과는 generation 검사에서 폐기된다.
-            self.dotenv_sync_deferred = None;
         }
         if force || context_changed {
             self.dotenv_sync_revision = self.dotenv_sync_revision.wrapping_add(1);
         }
+        self.dotenv_next_operation_id = self.dotenv_next_operation_id.wrapping_add(1);
+        let correlation = crate::dotenv_sync::DotenvWorkerCorrelation::new(
+            self.dotenv_sync_generation,
+            self.dotenv_sync_revision,
+            self.dotenv_next_operation_id,
+        );
         let job = DotenvSyncJob {
-            generation: self.dotenv_sync_generation,
-            revision: self.dotenv_sync_revision,
             workspace_id,
             root,
+            runtime_instance,
             previous_state: self.last_dotenv_state,
             force,
+            migrate_legacy: force,
         };
-        if self.dotenv_sync_pending {
-            if let Some(deferred) = self.dotenv_sync_deferred.as_mut()
-                && deferred.generation == job.generation
-            {
-                deferred.force |= job.force;
-                deferred.previous_state = job.previous_state;
-                deferred.revision = job.revision;
-            } else {
-                self.dotenv_sync_deferred = Some(job);
-            }
-            return;
+        if let Err(error) = self.dotenv_sync_worker.request_state(correlation, job) {
+            tracing::warn!(
+                kind = "dotenv",
+                phase = "admission",
+                error_code = %error.code(),
+                "dotenv synchronization admission failed"
+            );
+            self.last_dotenv_state = None;
         }
-        self.dispatch_dotenv_sync(job);
     }
 
-    fn dispatch_dotenv_sync(&mut self, mut job: DotenvSyncJob) {
-        if job.generation != self.dotenv_sync_generation
-            || job.revision != self.dotenv_sync_revision
+    fn stage_dotenv_continuation(
+        &mut self,
+        runtime_instance: u64,
+        mut continuation: PendingDotenvContinuation,
+    ) -> Result<(), Box<PendingDotenvContinuation>> {
+        if self.dotenv_pending_operations.len()
+            >= crate::dotenv_sync::DOTENV_WORKER_CONTINUATION_MAX
         {
+            return Err(Box::new(continuation));
+        }
+        let Ok(retained_bytes) = prepare_dotenv_continuation_retention(&mut continuation) else {
+            return Err(Box::new(continuation));
+        };
+        let Ok(pending_bytes) = runtime::checked_runtime_command_retention_total(
+            self.dotenv_pending_bytes,
+            retained_bytes,
+        ) else {
+            return Err(Box::new(continuation));
+        };
+        let Some((workspace_id, previous_state)) = self
+            .runtime_by_instance(runtime_instance)
+            .map(|runtime| (runtime.id.clone(), runtime.dotenv_state))
+        else {
+            return Err(Box::new(continuation));
+        };
+        let migrate_legacy = matches!(
+            &continuation,
+            PendingDotenvContinuation::RuntimeCommand(runtime::RuntimeCommand::RestoreWorkspace)
+        );
+        let root = self.workspace_tree_root(&workspace_id);
+        self.dotenv_next_operation_id = self.dotenv_next_operation_id.wrapping_add(1).max(1);
+        let operation_id = self.dotenv_next_operation_id;
+        if self.dotenv_pending_operations.contains_key(&operation_id) {
+            return Err(Box::new(continuation));
+        }
+        let correlation = crate::dotenv_sync::DotenvWorkerCorrelation::new(
+            runtime_instance,
+            operation_id,
+            operation_id,
+        );
+        self.dotenv_pending_operations.insert(
+            operation_id,
+            PendingDotenvOperation {
+                correlation,
+                workspace_id: workspace_id.clone(),
+                root: root.clone(),
+                runtime_instance,
+                retained_bytes,
+                continuation,
+            },
+        );
+        self.dotenv_pending_bytes = pending_bytes;
+        let job = DotenvSyncJob {
+            workspace_id,
+            root,
+            runtime_instance,
+            previous_state,
+            force: false,
+            migrate_legacy,
+        };
+        if let Err(error) = self
+            .dotenv_sync_worker
+            .request_continuation(correlation, job)
+        {
+            tracing::warn!(
+                kind = "dotenv",
+                phase = "continuation_admission",
+                error_code = %error.code(),
+                "dotenv launch admission failed"
+            );
+            let pending = self
+                .dotenv_pending_operations
+                .remove(&operation_id)
+                .expect("pending dotenv operation inserted above");
+            self.dotenv_pending_bytes = self
+                .dotenv_pending_bytes
+                .checked_sub(pending.retained_bytes)
+                .expect("dotenv pending byte ledger is balanced");
+            return Err(Box::new(pending.continuation));
+        }
+        Ok(())
+    }
+
+    fn runtime_by_instance(&self, runtime_instance: u64) -> Option<&WorkspaceRuntime> {
+        if self.active.runtime_instance == runtime_instance {
+            return Some(&self.active);
+        }
+        self.warm
+            .values()
+            .find(|runtime| runtime.runtime_instance == runtime_instance)
+    }
+
+    fn runtime_by_instance_mut(&mut self, runtime_instance: u64) -> Option<&mut WorkspaceRuntime> {
+        if self.active.runtime_instance == runtime_instance {
+            return Some(&mut self.active);
+        }
+        self.warm
+            .values_mut()
+            .find(|runtime| runtime.runtime_instance == runtime_instance)
+    }
+
+    fn finish_dotenv_continuation(
+        &mut self,
+        pending: PendingDotenvOperation,
+        outcome: Result<DotenvSyncOutcome, crate::dotenv_sync::DotenvWorkerErrorCode>,
+    ) {
+        let current_root = self.workspace_tree_root(&pending.workspace_id);
+        let outcome = outcome.ok().filter(|outcome| {
+            outcome.workspace_id == pending.workspace_id
+                && outcome.root == pending.root
+                && outcome.runtime_instance == pending.runtime_instance
+                && current_root == pending.root
+                && dotenv_state_for_root(pending.root.as_deref()) == outcome.baseline
+        });
+        let is_agent_launch = matches!(
+            pending.continuation,
+            PendingDotenvContinuation::AgentLaunch { .. }
+        );
+        let agent_ticket = match &pending.continuation {
+            PendingDotenvContinuation::AgentLaunch {
+                approval_ticket, ..
+            } => *approval_ticket,
+            _ => None,
+        };
+        let Some(outcome) = outcome else {
+            if let PendingDotenvContinuation::WorkspaceProtocol {
+                operation,
+                generation,
+                ..
+            } = pending.continuation
+                && let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance)
+            {
+                runtime.workspace_ui.complete_protocol(
+                    ui::workspace::WorkspaceProtocolCompletion {
+                        operation,
+                        generation,
+                        result: Err(ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed),
+                    },
+                );
+            }
+            if let Some(ticket_id) = agent_ticket {
+                self.approval_launch_tracker.cancel(ticket_id);
+            }
+            if is_agent_launch {
+                self.agents_ui
+                    .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
+            }
+            tracing::warn!(
+                kind = "dotenv",
+                phase = "continuation",
+                error_code = "source_unavailable",
+                "dotenv-gated launch failed closed"
+            );
+            return;
+        };
+        let baseline = outcome.baseline;
+        let mut payload = outcome.payload;
+        if let Some(ticket_id) = agent_ticket
+            && !self
+                .approval_launch_tracker
+                .mark_spawn_sent(ticket_id, std::time::Instant::now())
+        {
+            self.agents_ui
+                .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
+            tracing::warn!(
+                kind = "agent",
+                phase = "spawn_admission",
+                error_code = "stale_ticket",
+                "agent launch ticket expired before delivery"
+            );
             return;
         }
-        job.previous_state = self.last_dotenv_state;
-        match self.dotenv_sync_worker.try_request(job) {
-            Ok(()) => self.dotenv_sync_pending = true,
-            Err(std::sync::mpsc::TrySendError::Full(job)) => {
-                // 정상 경로에서는 pending=true일 때만 찬다. 방어적으로 최신 한 건만 보존한다.
-                self.dotenv_sync_deferred = Some(job);
-                self.egui_ctx
-                    .request_repaint_after(std::time::Duration::from_millis(25));
+        let live_reload = self.config.ui.env_live_reload;
+        let cache_policy = self.terminal_cache_policy_command();
+        if let Some(payload) = &mut payload {
+            if let Some(report) = payload.report.take()
+                && report.upserted + report.removed > 0
+            {
+                tracing::info!(
+                    upserted = report.upserted,
+                    removed = report.removed,
+                    "dotenv launch synchronization"
+                );
             }
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                self.dotenv_sync_worker_failed = true;
-                self.dotenv_sync_deferred = None;
-                tracing::warn!("dotenv background worker 연결 종료");
+            if live_reload && let Some(root) = pending.root.as_deref() {
+                payload
+                    .env_plain
+                    .push(("DEPPY_ENV_LIVE_RELOAD".to_owned(), "1".to_owned()));
+                payload
+                    .env_plain
+                    .push(("DEPPY_PROJECT_ROOT".to_owned(), root.display().to_string()));
             }
+        }
+        let Some(runtime) = self.runtime_by_instance_mut(pending.runtime_instance) else {
+            if let Some(ticket_id) = agent_ticket {
+                self.approval_launch_tracker.cancel(ticket_id);
+            }
+            if is_agent_launch {
+                self.agents_ui
+                    .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
+            }
+            tracing::warn!(
+                kind = "dotenv",
+                phase = "continuation",
+                error_code = "stale_runtime",
+                "dotenv launch target became stale"
+            );
+            return;
+        };
+        let env_delivered = match payload {
+            Some(payload) => runtime
+                .runtime
+                .send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
+                    env_plain: payload.env_plain,
+                    env_secrets: payload.env_secrets,
+                })
+                .is_ok(),
+            None => true,
+        };
+        if env_delivered {
+            runtime.dotenv_state = Some(baseline);
+        }
+        let policy_delivered = env_delivered && runtime.runtime.send_command(cache_policy).is_ok();
+        let delivered = match pending.continuation {
+            PendingDotenvContinuation::WorkspaceProtocol {
+                operation,
+                generation,
+                command,
+            } => {
+                let delivered = policy_delivered && runtime.runtime.send_command(command).is_ok();
+                runtime.workspace_ui.complete_protocol(
+                    ui::workspace::WorkspaceProtocolCompletion {
+                        operation,
+                        generation,
+                        result: delivered
+                            .then_some(())
+                            .ok_or(ui::workspace::WorkspaceProtocolErrorCode::DeliveryFailed),
+                    },
+                );
+                delivered
+            }
+            PendingDotenvContinuation::RuntimeCommand(command)
+            | PendingDotenvContinuation::AgentLaunch { command, .. } => {
+                policy_delivered && runtime.runtime.send_command(command).is_ok()
+            }
+        };
+        if delivered {
+            self.invalidate_env_profile_ui();
+            self.credentials_ui.invalidate_cache();
+            self.invalidate_env_api_projects();
+            if is_agent_launch {
+                self.agents_ui.mark_launch_accepted();
+                self.reveal_active_workspace_for_new_session();
+            }
+        } else {
+            if let Some(ticket_id) = agent_ticket {
+                self.approval_launch_tracker.cancel(ticket_id);
+            }
+            if is_agent_launch {
+                self.agents_ui
+                    .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
+            }
+            tracing::warn!(
+                kind = "dotenv",
+                phase = "continuation",
+                error_code = "delivery_failed",
+                "dotenv-gated launch failed closed"
+            );
         }
     }
 
     fn poll_dotenv_sync(&mut self) {
-        while let Ok(outcome) = self.dotenv_sync_worker.rx.try_recv() {
-            self.dotenv_sync_pending = false;
-            let current = self.dotenv_sync_context.as_ref().is_some_and(|context| {
-                outcome.generation == self.dotenv_sync_generation
-                    && outcome.revision == self.dotenv_sync_revision
-                    && context.0 == outcome.workspace_id
-                    && context.1 == outcome.root
-                    && self.active.id == outcome.workspace_id
-            });
-            if current {
-                self.last_dotenv_state = Some(outcome.baseline);
-                let mut restore_ready = true;
-                match outcome.result {
-                    Ok(None) => {
-                        // 첫 복원 요청은 force라 보통 도달하지 않는다. worker 재시작/호출 순서가
-                        // 달라져도 stale 기본 env 없이 복원하도록 빈 값 명령을 선행한다.
-                        if self.active.restore_pending_since.is_some() {
-                            restore_ready = self
-                                .active
-                                .runtime
-                                .send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
-                                    env_plain: Vec::new(),
-                                    env_secrets: Vec::new(),
-                                })
-                                .is_ok();
-                        }
-                    }
-                    Ok(Some(payload)) => {
-                        if let Some(report) = payload.report
-                            && report.upserted + report.removed > 0
-                        {
-                            tracing::info!(
-                                upserted = report.upserted,
-                                removed = report.removed,
-                                ".env → 환경 profile 동기화"
-                            );
-                        }
-                        // .env 라이브 반영(E5 ⑨) 활성 조건 — 새 셸의 precmd 훅이 이
-                        // 두 값으로 깨어난다. 토글/경로 변경이 다음 동기화에 반영된다.
-                        let mut env_plain = payload.env_plain;
-                        if self.config.ui.env_live_reload
-                            && let Some(root) = outcome.root.as_deref()
-                        {
-                            env_plain.push(("DEPPY_ENV_LIVE_RELOAD".to_owned(), "1".to_owned()));
-                            env_plain.push((
-                                "DEPPY_PROJECT_ROOT".to_owned(),
-                                root.display().to_string(),
-                            ));
-                        }
-                        restore_ready = self
-                            .active
-                            .runtime
-                            .send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
-                                env_plain,
-                                env_secrets: payload.env_secrets,
-                            })
-                            .is_ok();
-                        self.invalidate_env_profile_ui();
-                        self.credentials_ui.invalidate_cache();
-                        self.invalidate_env_api_projects();
-                    }
-                    Err(error) => {
-                        tracing::warn!(".env background 동기화 실패: {error:#}");
-                        // transient I/O/keyring/DB 오류는 다음 2초 점검에서 반드시 재시도한다.
-                        self.last_dotenv_state = None;
-                        // 읽지 못한 secret을 이전 workspace/default env에서 계속 주입하는 것보다
-                        // 새 셸의 기본 env를 비우는 쪽이 보안상 안전하다.
-                        restore_ready = self
-                            .active
-                            .runtime
-                            .send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
-                                env_plain: Vec::new(),
-                                env_secrets: Vec::new(),
-                            })
-                            .is_ok();
-                        self.invalidate_env_profile_ui();
-                        self.credentials_ui.invalidate_cache();
-                        self.invalidate_env_api_projects();
-                    }
-                }
-                if !restore_ready {
-                    // runtime command queue가 잠시 찼다면 동일 baseline을 완료로 확정하지
-                    // 않는다. 다음 점검이 기본 env 전송을 다시 시도한다.
+        while let Some(worker_outcome) = self.dotenv_sync_worker.try_recv() {
+            if worker_outcome.is_continuation() {
+                let operation_id = worker_outcome.operation_id();
+                let Some(pending) = self.dotenv_pending_operations.remove(&operation_id) else {
+                    continue;
+                };
+                self.dotenv_pending_bytes = self
+                    .dotenv_pending_bytes
+                    .checked_sub(pending.retained_bytes)
+                    .expect("dotenv pending byte ledger is balanced");
+                let result = worker_outcome
+                    .into_current(
+                        pending.correlation.generation(),
+                        pending.correlation.revision(),
+                    )
+                    .and_then(|outcome| outcome.into_result());
+                self.finish_dotenv_continuation(pending, result);
+                continue;
+            }
+            let Ok(worker_outcome) =
+                worker_outcome.into_current(self.dotenv_sync_generation, self.dotenv_sync_revision)
+            else {
+                continue;
+            };
+            let outcome = match worker_outcome.into_result() {
+                Ok(outcome) => outcome,
+                Err(error) => {
                     self.last_dotenv_state = None;
+                    tracing::warn!(
+                        kind = "dotenv",
+                        phase = "completion",
+                        error_code = %error,
+                        "dotenv synchronization failed closed"
+                    );
+                    continue;
                 }
-                if restore_ready {
-                    self.complete_active_restore();
+            };
+            let current = self.dotenv_sync_context.as_ref().is_some_and(|context| {
+                context.0 == outcome.workspace_id
+                    && context.1 == outcome.root
+                    && context.2 == outcome.runtime_instance
+                    && self.active.id == outcome.workspace_id
+                    && self.active.runtime_instance == outcome.runtime_instance
+            });
+            if !current {
+                continue;
+            }
+            if dotenv_state_for_root(outcome.root.as_deref()) != outcome.baseline {
+                self.last_dotenv_state = None;
+                tracing::warn!(
+                    kind = "dotenv",
+                    phase = "completion_verify",
+                    error_code = "source_changed",
+                    "stale dotenv synchronization result discarded"
+                );
+                continue;
+            }
+            self.last_dotenv_state = Some(outcome.baseline);
+            match outcome.payload {
+                None => {}
+                Some(payload) => {
+                    if let Some(report) = payload.report
+                        && report.upserted + report.removed > 0
+                    {
+                        tracing::info!(
+                            upserted = report.upserted,
+                            removed = report.removed,
+                            ".env → 환경 profile 동기화"
+                        );
+                    }
+                    // .env 라이브 반영(E5 ⑨) 활성 조건 — 새 셸의 precmd 훅이 이
+                    // 두 값으로 깨어난다. 토글/경로 변경이 다음 동기화에 반영된다.
+                    let mut env_plain = payload.env_plain;
+                    if self.config.ui.env_live_reload
+                        && let Some(root) = outcome.root.as_deref()
+                    {
+                        env_plain.push(("DEPPY_ENV_LIVE_RELOAD".to_owned(), "1".to_owned()));
+                        env_plain
+                            .push(("DEPPY_PROJECT_ROOT".to_owned(), root.display().to_string()));
+                    }
+                    let env_ready = self
+                        .active
+                        .runtime
+                        .send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
+                            env_plain,
+                            env_secrets: payload.env_secrets,
+                        })
+                        .is_ok();
+                    self.invalidate_env_profile_ui();
+                    self.credentials_ui.invalidate_cache();
+                    self.invalidate_env_api_projects();
+                    if env_ready {
+                        self.active.dotenv_state = Some(outcome.baseline);
+                    } else {
+                        // Never acknowledge the source stamp until the exact runtime instance has
+                        // accepted its default environment.
+                        self.last_dotenv_state = None;
+                    }
                 }
             }
-        }
-        if !self.dotenv_sync_pending
-            && let Some(job) = self.dotenv_sync_deferred.take()
-        {
-            self.dispatch_dotenv_sync(job);
-        }
-    }
-
-    fn complete_active_restore(&mut self) {
-        if self.active.restore_pending_since.is_none() {
-            return;
-        }
-        // 복원 전에 캐시 정책부터 — 복원된 exited 세션들이 첫 tick에 설정값 기준으로
-        // archive되도록 (§14.3 확장).
-        let _ = self
-            .active
-            .runtime
-            .send_command(self.terminal_cache_policy_command());
-        match self
-            .active
-            .runtime
-            .send_command(runtime::RuntimeCommand::RestoreWorkspace)
-        {
-            Ok(()) => self.active.restore_pending_since = None,
-            Err(error) => tracing::warn!("workspace 복원 명령 전송 지연: {error:#}"),
         }
     }
 
@@ -10428,32 +10896,6 @@ impl App {
         let _ = self.active.runtime.send_command(command.clone());
         for rt in self.warm.values() {
             let _ = rt.runtime.send_command(command.clone());
-        }
-    }
-
-    fn poll_restore_timeout(&mut self) {
-        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-        let Some(started) = self.active.restore_pending_since else {
-            return;
-        };
-        let elapsed = started.elapsed();
-        if elapsed < TIMEOUT {
-            self.egui_ctx.request_repaint_after(TIMEOUT - elapsed);
-            return;
-        }
-        // 외장 볼륨/keychain이 멈춰도 앱 복원이 영구 대기하지 않는다. 빈 기본 env가 먼저
-        // 들어간 경우에만 Restore를 보내며, 늦게 도착한 동기화 결과는 이후 새 셸에 적용된다.
-        if self
-            .active
-            .runtime
-            .send_command(runtime::RuntimeCommand::SetSessionDefaultEnv {
-                env_plain: Vec::new(),
-                env_secrets: Vec::new(),
-            })
-            .is_ok()
-        {
-            tracing::warn!("dotenv background 동기화 timeout — 빈 env로 workspace 복원");
-            self.complete_active_restore();
         }
     }
 
@@ -10509,7 +10951,8 @@ impl App {
         self.save_workspace_anchor_for(&workspace_id);
     }
 
-    /// 프로젝트 폴더 rename/이동 감지(2s 폴링). 저장된 경로가 stale(사라짐)이고, 세션 cwd 중
+    /// 프로젝트 폴더 rename/이동 감지. 새 session-cwd projection이 도착했을 때만 실행한다.
+    /// 저장된 경로가 stale(사라짐)이고, 세션 cwd 중
     /// 저장된 앵커(dev,ino)와 일치하는 폴더가 있으면 → 그 폴더가 이동된 새 경로다. 확인 모달로
     /// 제안한다(사용자 요청 2026-07-08). 앵커 없으면(구 워크스페이스) 유효 경로일 때 backfill.
     fn detect_workspace_folder_rename(&mut self) {
@@ -10565,19 +11008,6 @@ impl App {
                 return;
             }
         }
-    }
-
-    /// .env (존재여부, mtime)을 2초 간격으로 폴링해 변화 시 재동기화한다 — 사이드바 OFF로
-    /// 워처가 없을 때의 fallback(codex). stat도 worker에서 수행하고, 변화가 없으면 DB/keyring
-    /// 작업을 생략한다. 워처 경로와 중복 실행돼도 요청은 최신 한 건으로 축약된다.
-    fn poll_dotenv_change(&mut self) {
-        if self.last_dotenv_check.elapsed() < std::time::Duration::from_secs(2) {
-            return;
-        }
-        self.last_dotenv_check = std::time::Instant::now();
-        // 프로젝트 폴더 rename/이동 감지도 같은 2s 주기로 (앵커 backfill 포함).
-        self.detect_workspace_folder_rename();
-        self.request_dotenv_sync(false);
     }
 
     /// 지정 workspace의 프로젝트 루트. App이 이미 소유한 immutable workspace projection을
@@ -10879,38 +11309,31 @@ impl App {
                 .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
             return;
         }
-        if let Some(ticket_id) = ticket_id
-            && !self
-                .approval_launch_tracker
-                .mark_spawn_sent(ticket_id, std::time::Instant::now())
+        let command = runtime::RuntimeCommand::SpawnAgent {
+            agent_config_id: Some(prepared.agent_config_id),
+            cols: 80,
+            rows: 24,
+            scrollback_lines: self.config.terminal.scrollback_lines as usize,
+            command: prepared.command,
+            args: prepared.args,
+            env_plain: prepared.env_plain,
+            env_secrets: prepared.env_secrets,
+            waiting_regex: prepared.waiting_regex,
+            approval_regex: prepared.approval_regex,
+            error_regex: prepared.error_regex,
+            done_regex: prepared.done_regex,
+        };
+        let runtime_instance = self.active.runtime_instance;
+        if self
+            .stage_dotenv_continuation(
+                runtime_instance,
+                PendingDotenvContinuation::AgentLaunch {
+                    command,
+                    approval_ticket: ticket_id,
+                },
+            )
+            .is_err()
         {
-            // A preparing ticket may expire while filesystem/config finalization is blocked.
-            // Never turn that stale completion into an untracked live proxy process.
-            self.agents_ui
-                .report_error(ui::agents::AgentsUiErrorCode::LaunchFailed);
-            return;
-        }
-        let sent = self
-            .active
-            .runtime
-            .send_command(runtime::RuntimeCommand::SpawnAgent {
-                agent_config_id: Some(prepared.agent_config_id),
-                cols: 80,
-                rows: 24,
-                scrollback_lines: self.config.terminal.scrollback_lines as usize,
-                command: prepared.command,
-                args: prepared.args,
-                env_plain: prepared.env_plain,
-                env_secrets: prepared.env_secrets,
-                waiting_regex: prepared.waiting_regex,
-                approval_regex: prepared.approval_regex,
-                error_regex: prepared.error_regex,
-                done_regex: prepared.done_regex,
-            });
-        if sent.is_ok() {
-            self.agents_ui.mark_launch_accepted();
-            self.reveal_active_workspace_for_new_session();
-        } else {
             if let Some(ticket_id) = ticket_id {
                 self.approval_launch_tracker.cancel(ticket_id);
             }
@@ -11449,7 +11872,6 @@ impl App {
                                 self.switch_workspace(&workspace_id);
                             }
                             if created {
-                                self.sync_dotenv_env();
                                 self.active
                                     .workspace_ui
                                     .spawn_shell(self.config.terminal.scrollback_lines as usize);
@@ -12260,6 +12682,21 @@ impl App {
 
     fn record_activity_events(rt: &mut WorkspaceRuntime, events: &[runtime::RuntimeEvent]) {
         for event in events {
+            if let runtime::RuntimeEvent::MuxUpdated { snapshot } = event {
+                let present: std::collections::HashSet<runtime::SessionId> = snapshot
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .filter_map(|pane| pane.session_id)
+                    .collect();
+                rt.session_dotenv_states
+                    .retain(|session, _| present.contains(session));
+                if let Some(state) = rt.dotenv_state {
+                    for session in present {
+                        rt.session_dotenv_states.entry(session).or_insert(state);
+                    }
+                }
+            }
             if let runtime::RuntimeEvent::ResourceUsage {
                 snapshot,
                 session_usage,
@@ -12288,6 +12725,7 @@ impl App {
             // 남은 세션들 중 최신으로 재계산 — exit한 세션의 신호가 TTL까지 남지 않게(codex).
             if let runtime::RuntimeEvent::SessionExited { session, .. } = event {
                 rt.session_input_pressure.remove(session);
+                rt.session_dotenv_states.remove(session);
                 rt.input_pressure = rt
                     .session_input_pressure
                     .values()
@@ -13034,9 +13472,7 @@ impl eframe::App for App {
         self.handle_configured_shortcut(ctx);
         // 파일/SQLite/keyring은 worker에서 끝났고, 여기서는 최신 epoch 결과만 짧게 적용한다.
         self.poll_dotenv_sync();
-        // Legacy 2s fallback is kept out of ui(): it may inspect the workspace anchor and only
-        // schedules the bounded dotenv worker when the deadline is reached.
-        self.poll_dotenv_change();
+        self.pump_perf_harness();
         if let Some((intent, subject)) = self.pending_connector_dispatch.take() {
             let result = match subject {
                 Some(subject) => self
@@ -13077,7 +13513,6 @@ impl eframe::App for App {
         let structured_alive = self.agent_sessions_ui.session_ids();
         self.notifications_ui
             .retain_structured_sessions(&structured_alive);
-        self.poll_restore_timeout();
         // 설정이 닫혀도 stale generation 결과를 계속 버려 worker의 bounded 결과 큐가
         // 평문 secret을 붙잡은 채 막히지 않게 한다.
         self.poll_env_secret_reveals();
